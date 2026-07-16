@@ -3337,8 +3337,10 @@ console.log('── P17 欠品リスク ──');
   insSr.run('sr-ok-item', '余裕あり', 1000, 70, 300);                           // 100日分
   insSr.run('sr-soon-item', '納期未確定・切迫', 50, 70, 300);                    // 5日分 → soon14日以内 → high
   insSr.run('sr-undated-item', '納期未確定・遠い', 500, 70, 300);                // 50日分 → soon超 → attention (回答督促)
-  insSr.run('sr-over-item', '遅延中・在庫豊富', 5000, 70, 300);                  // 500日分 → 欠品なし+遅延 → attention
+  insSr.run('sr-over-item', '遅延中・在庫豊富', 5000, 70, 300);                  // 500日分 → 欠品なし+遅延 → ok+督促フラグ (2軸)
   insSr.run('sr-nodemand-item', '販売なし', 5, 0, 0);
+  insSr.run('sr-split-item', '分納分割', 1000, 70, 300);                         // 分納30個のみ日付つき・残50は納期不明
+  insSr.run('sr-reqover-item', '希望納期超過・回答未着', 5000, 70, 300);          // 希望納期past=遅延ではなく未回答扱い
 
   const issueSr = async (items) => {
     const rr = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3359,6 +3361,28 @@ console.log('── P17 欠品リスク ──');
   oid = await issueSr([{ code: 'sr-over-item', qty: 40 }, { code: 'sr-nodemand-item', qty: 10 }]);
   await setPromised(oid, 'sr-over-item', jstD(-1)); // 昨日=予定日超過
   await setPromised(oid, 'sr-nodemand-item', jstD(30));
+  // 分納分割: 発注100→入荷20→残80のうち分納予定30個 (jstD(5)) のみ日付つき、残50は納期不明
+  oid = await issueSr([{ code: 'sr-split-item', qty: 100 }]);
+  {
+    const it = db.prepare('SELECT id FROM po_order_items WHERE order_id=? AND product_key=?').get(oid, 'sr-split-item');
+    r = await j('/api/items/' + it.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'receipt', qty: 20, remainder: { action: 'await_delivery', nextExpectedDate: jstD(5), nextExpectedQty: 30 } }) });
+    ok(r.status === 200 && r.body.ok && r.body.remaining === 80, 'P17 fixture: 分納予定30/残80');
+  }
+  // 希望納期が過去 (回答なし): NE移行取込で requested_date を過去日にする (issued後のrequestedは不変のため)
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9300', 'テスト様', 'sr-reqover-item', '希望納期超過', '', 25, 25, '2026/1/10', '', '通常', '0', '0', '2026/1/5', '0001', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 希望納期過去の移行PO');
+  }
 
   r = await j('/api/shortage-risk');
   ok(r.body.ok && r.body.settings.w7 === 0.5 && r.body.settings.soonDays === 14 && r.body.today === jstD(0), 'P17 API: 既定しきい値+JST今日', r.body.settings);
@@ -3386,18 +3410,35 @@ console.log('── P17 欠品リスク ──');
   ok(und && und.risk === 'attention' && und.reason.includes('納期を確定') && und.undatedQty === 60,
     'P17: 納期未確定+遠い → attention (ノイズ化させない)', und && und.risk);
 
-  // 🟡 attention: 遅延中 (予定日超過はシミュレーション除外)
+  // 2軸分離: 遅延中でも予測評価は ok のまま、督促は needsFollowup 軸で拾う
   const over = item('sr-over-item');
-  ok(over && over.risk === 'attention' && over.flags.overdue === true && over.overdueQty === 40 && !over.stockoutDate,
-    'P17: 予定日超過 → attention+overdueフラグ (在庫推移からは除外)', over && over.flags);
+  ok(over && over.risk === 'ok' && over.needsFollowup === true && over.flags.overdue === true && over.overdueQty === 40 && !over.stockoutDate,
+    'P17: 予定日超過 → risk=ok × needsFollowup=true (2軸分離)', over && { r: over.risk, f: over.flags });
   ok(over.reason.includes('予定日超過'), 'P17: 遅延の理由文', over.reason);
 
-  // 販売なし / データ異常
+  // 分納分割: 30個のみ日付つき・残50は納期不明 (表示partsも同じ内訳、全量を分納予定と誤表示しない)
+  const spl = item('sr-split-item');
+  ok(spl && spl.undatedQty === 50 && spl.arrivals.length === 1 && spl.arrivals[0].qty === 30 && spl.arrivals[0].date === jstD(5),
+    'P17: 分納分割 (30=日付つき/50=納期不明)', spl && { u: spl.undatedQty, a: spl.arrivals });
+  const splLine = spl.lines.find(l => l.remaining === 80);
+  ok(splLine && splLine.parts.length === 2 && splLine.parts[0].qty === 30 && splLine.parts[0].disp.kind === 'dated'
+    && splLine.parts[1].qty === 50 && splLine.parts[1].disp.kind === 'undated',
+    'P17: 表示partsが分納分割を反映 (残80=30予定+50不明)', splLine && splLine.parts);
+
+  // 希望納期の過去日 = 遅延ではなく「回答未着のまま希望日超過」(overdueフラグは立てない)
+  const reqo = item('sr-reqover-item');
+  ok(reqo && reqo.risk === 'ok' && reqo.needsFollowup === true && reqo.flags.overdue === false
+    && reqo.requestedOverdueQty === 25 && reqo.flags.requested_date_only === true,
+    'P17: 希望納期超過 → overdueではなく回答督促 (requestedOverdueQty)', reqo && { f: reqo.flags, q: reqo.requestedOverdueQty });
+  ok(reqo.reason.includes('希望納期を経過'), 'P17: 希望納期超過の理由文', reqo.reason);
+
+  // 販売なし / データ異常 (フラグがあっても risk 軸は純粋)
   const nd = item('sr-nodemand-item');
   ok(nd && nd.risk === 'no_demand', 'P17: 日販0 → no_demand');
   const sup2 = r.body.suppliers.find(s => s.code === '2');
   const unk = sup2 && sup2.items.find(x => x.code === 'not-in-pml-item');
   ok(unk && unk.risk === 'unknown' && unk.pmlMissing === true, 'P17: PML行なし → unknown (データ異常のみ)', unk && unk.risk);
+  ok(typeof r.body.summary.followup === 'number' && r.body.summary.followup >= 2, 'P17: summaryに督促対象数', r.body.summary);
 
   // しきい値PATCH: 範囲外/非整数/空は400、正常は200+監査ログ
   const patchSr = body => j('/api/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -3411,12 +3452,22 @@ console.log('── P17 欠品リスク ──');
   ok(r.status === 200 && r.body.ok && r.body.settings.unansweredDays === 0, 'P17設定: 未回答督促=0日に変更');
   ok(db.prepare("SELECT COUNT(*) n FROM po_audit_log WHERE action='setting_change' AND resource='setting:shortage_unanswered_days'").get().n >= 1,
     'P17設定: 変更が監査ログに残る (old/new)');
-  // 未回答督促0日 → 発注直後の未回答にもフラグが立つ
+  // 未回答督促0日 → 発注直後の未回答にもフラグが立つ (needsFollowup も連動)
   r = await j('/api/shortage-risk');
   const und2 = r.body.suppliers.find(s => s.code === '1').items.find(x => x.code === 'sr-undated-item');
-  ok(und2 && und2.flags.unanswered === true && und2.unansweredQty === 60, 'P17: 未回答フラグ (0日設定で即時)', und2 && und2.flags);
+  ok(und2 && und2.flags.unanswered === true && und2.unansweredQty === 60 && und2.needsFollowup === true,
+    'P17: 未回答フラグ (0日設定で即時)', und2 && und2.flags);
   r = await patchSr({ unansweredDays: 7 });
   ok(r.status === 200, 'P17設定: 既定に復元');
+  // setSetting 自体の検証 (routerを経由しない書込でも不正値は入らない)
+  {
+    let thr = null;
+    try { db.prepare("INSERT OR REPLACE INTO po_settings (key, value, effective_at) VALUES ('shortage_horizon_days','14.5',datetime('now'))").run(); } catch (e) { thr = e.message; }
+    // DB直書きは防げない (アプリ層検証) が、読込側が既定値へフォールバックする
+    r = await j('/api/shortage-risk');
+    ok(r.body.settings.horizonDays === 90, 'P17設定: 不正保存値 (14.5) は読込時に既定へフォールバック', r.body.settings.horizonDays);
+    db.prepare("DELETE FROM po_settings WHERE key='shortage_horizon_days'").run();
+  }
 
   // 画面配信
   const srHtml = await (await fetch(base + '/shortage-risk')).text();

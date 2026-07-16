@@ -56,8 +56,18 @@ const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_t
   'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
   'email_issuer_name',   // 発注書CSVの「発行担当者」列
-  // P17 欠品リスクのしきい値 (数値範囲の検証は shortage-risk.js の validateShortageSetting をrouterが先に通す)
+  // P17 欠品リスクのしきい値 (数値範囲は下の SHORTAGE_SETTING_RULES で setSetting 自体が検証する)
   'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
+
+// P17 欠品リスク設定の許容範囲 (検証の単一ソース。shortage-risk.js が名前→キー変換して共用、
+// setSetting 自体も検証するので router を経由しない書込でも不正値は入らない — Codex P17-R1 Medium)
+export const SHORTAGE_SETTING_RULES = {
+  shortage_w7: { min: 0, max: 1, int: false },
+  shortage_margin_days: { min: 0, max: 30, int: true },
+  shortage_unanswered_days: { min: 0, max: 60, int: true },
+  shortage_horizon_days: { min: 14, max: 365, int: true },
+  shortage_soon_days: { min: 1, max: 90, int: true },
+};
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -83,6 +93,13 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
     if (/[\r\n\0]/.test(String(value))) throw new Error('発行担当者名に改行は使えません');
     value = String(value).trim();
     if (value.length > 50) throw new Error('発行担当者名が長すぎます (50文字まで)');
+  }
+  const sr = SHORTAGE_SETTING_RULES[key];
+  if (sr) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < sr.min || n > sr.max || (sr.int && !Number.isInteger(n))) {
+      throw new Error(`${key} は ${sr.min}〜${sr.max}${sr.int ? ' の整数' : ''} で指定してください: ${value}`);
+    }
   }
   const db = getDB();
   db.transaction(() => {

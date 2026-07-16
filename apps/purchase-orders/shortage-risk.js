@@ -26,19 +26,13 @@
  *    (no_demand や unknown の商品でも遅延・未回答があれば督促対象として落とさない)
  */
 import { getDB, normProductCode, normSupplierCode } from './db.js';
-import { getSetting, jstToday, listBackorders } from './ledger.js';
+import { getSetting, jstToday, listBackorders, SHORTAGE_SETTING_RULES } from './ledger.js';
 import { loadPmlMerged } from './logic.js';
 
 export const SHORTAGE_DEFAULTS = { w7: 0.5, marginDays: 3, unansweredDays: 7, horizonDays: 90, soonDays: 14 };
-// 設定の許容範囲 (PATCH と setSetting の両方で検証)
-export const SHORTAGE_RANGES = {
-  w7: { min: 0, max: 1, int: false },
-  marginDays: { min: 0, max: 30, int: true },
-  unansweredDays: { min: 0, max: 60, int: true },
-  horizonDays: { min: 14, max: 365, int: true },
-  soonDays: { min: 1, max: 90, int: true },
-};
 const SETTING_KEYS = { w7: 'shortage_w7', marginDays: 'shortage_margin_days', unansweredDays: 'shortage_unanswered_days', horizonDays: 'shortage_horizon_days', soonDays: 'shortage_soon_days' };
+// 設定の許容範囲 — 検証の単一ソースは ledger.js の SHORTAGE_SETTING_RULES (setSetting自体も同じ規則で検証する)
+export const SHORTAGE_RANGES = Object.fromEntries(Object.entries(SETTING_KEYS).map(([name, key]) => [name, SHORTAGE_SETTING_RULES[key]]));
 
 export function validateShortageSetting(name, value) {
   const r = SHORTAGE_RANGES[name];
@@ -58,7 +52,8 @@ export function shortageSettings() {
     if (raw != null) {
       const n = Number(raw);
       const r = SHORTAGE_RANGES[name];
-      if (Number.isFinite(n) && n >= r.min && n <= r.max) v = n; // 不正保存値は既定にフォールバック (fail-soft)
+      // 不正保存値 (範囲外・非整数) は既定にフォールバック (fail-soft。書込側検証 setSetting の防御と二重)
+      if (Number.isFinite(n) && n >= r.min && n <= r.max && (!r.int || Number.isInteger(n))) v = n;
     }
     out[name] = v;
   }
@@ -111,26 +106,32 @@ export function computeShortageRisk() {
   for (const it of items) {
     for (const supCode of Object.keys(it.bySupplier)) {
       let g = supplierMap.get(supCode);
-      if (!g) g = supplierMap.set(supCode, { code: supCode, name: it.bySupplier[supCode].supplierName, items: [], counts: { high: 0, attention: 0, no_demand: 0, unknown: 0, ok: 0 } }).get(supCode);
+      if (!g) g = supplierMap.set(supCode, { code: supCode, name: it.bySupplier[supCode].supplierName, items: [], counts: { high: 0, attention: 0, no_demand: 0, unknown: 0, ok: 0, followup: 0 } }).get(supCode);
       g.items.push({ ...it, lines: it.bySupplier[supCode].lines, bySupplier: undefined });
       g.counts[it.risk] = (g.counts[it.risk] || 0) + 1;
+      if (it.needsFollowup) g.counts.followup++;
     }
   }
   const RISK_ORDER = { high: 0, attention: 1, unknown: 2, no_demand: 3, ok: 4 };
   const suppliers = [...supplierMap.values()];
   for (const g of suppliers) {
+    // 督促対象 (needsFollowup) はリスク分類に関わらず前に出す (2軸: 予測評価×督促)
     g.items.sort((a, b) => (RISK_ORDER[a.risk] - RISK_ORDER[b.risk])
+      || (Number(b.needsFollowup) - Number(a.needsFollowup))
       || String(a.stockoutDate || '9999').localeCompare(String(b.stockoutDate || '9999'))
       || a.code.localeCompare(b.code));
   }
-  suppliers.sort((a, b) => (b.counts.high - a.counts.high) || (b.counts.attention - a.counts.attention) || a.name.localeCompare(b.name));
+  suppliers.sort((a, b) => (b.counts.high - a.counts.high) || (b.counts.followup - a.counts.followup)
+    || (b.counts.attention - a.counts.attention) || a.name.localeCompare(b.name));
 
-  const summary = { high: 0, attention: 0, no_demand: 0, unknown: 0, ok: 0 };
-  for (const it of items) summary[it.risk]++;
+  const summary = { high: 0, attention: 0, no_demand: 0, unknown: 0, ok: 0, followup: 0 };
+  for (const it of items) { summary[it.risk]++; if (it.needsFollowup) summary.followup++; }
 
-  // データ基準時刻 (Codex設計相談: 在庫・販売の basis を常時表示。>2日で stale 警告)
+  // データ基準時刻 (Codex設計相談: 在庫・販売の basis を常時表示。>2日で stale 警告)。
+  // as_of_date が不正形式で diffDays が NaN になるケースも stale 扱い (NaN>2 は false、Codex R1 Low)
   const asOfDate = pml.pub ? pml.pub.as_of_date : null;
-  const stale = !asOfDate || diffDays(asOfDate, today) > 2;
+  const ageDays = asOfDate ? diffDays(String(asOfDate), today) : NaN;
+  const stale = !Number.isFinite(ageDays) || ageDays > 2;
   return {
     today, settings, summary, suppliers,
     dataBasis: {
@@ -140,17 +141,25 @@ export function computeShortageRisk() {
   };
 }
 
+/** UTC ISO時刻 → JST業務日付 (issuedAt の日数判定用。UTC素通しsliceはJST 0-9時で1日ずれる) */
+function jstYmd(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return null;
+  return new Date(t + 9 * 3600000).toISOString().slice(0, 10);
+}
+
 function computeProductRisk(p, pmlRow, today, settings) {
   const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
   const flags = { overdue: false, unanswered: false, undated: false, requested_date_only: false };
-  let overdueQty = 0, undatedQty = 0, unansweredQty = 0, oldestUnansweredDays = 0;
+  let overdueQty = 0, undatedQty = 0, requestedOverdueQty = 0, unansweredQty = 0, oldestUnansweredDays = 0;
   const arrivals = []; // { date, qty, source }
-  const lines = [];    // 表示用明細 (PO横断)
+  const lines = [];    // 表示用明細 (PO横断)。数量の内訳は parts (シミュレーションの解釈と1:1)
   let totalRemaining = 0;
 
   for (const { o, i } of p.lines) {
     totalRemaining += i.remaining_qty;
-    // 予定入荷の分解 (分納予定は next_expected_qty 分だけ日付つき、残りは納期不明)
+    // 予定入荷の分解 (分納予定は next_expected_qty 分だけ日付つき、残りは納期不明)。
+    // 表示・督促コピーにも同じ分解 (parts) を出す — 「残100を全量7/20予定」と誤表示しない (Codex R1 High)
     let datedQty = i.remaining_qty, restQty = 0, date = null, source = null;
     if (i.remainder_disposition === 'awaiting_delivery' && i.next_expected_date) {
       date = i.next_expected_date; source = 'next';
@@ -159,24 +168,34 @@ function computeProductRisk(p, pmlRow, today, settings) {
     } else if (i.promised_date) { date = i.promised_date; source = 'promised'; }
     else if (i.requested_date) { date = i.requested_date; source = 'requested'; }
 
-    let disp; // 表示用の期日解釈
+    const parts = [];
     if (!date) {
       undatedQty += datedQty + restQty;
-      disp = { kind: 'undated' };
+      parts.push({ qty: datedQty + restQty, disp: { kind: 'undated' } });
     } else if (date < today) {
-      overdueQty += datedQty; undatedQty += restQty;
-      flags.overdue = true;
-      disp = { kind: 'overdue', date, source };
+      // 過去日は source で意味が違う (Codex R1 High): 回答納期/分納予定の超過=遅延中、
+      // 希望納期の超過=回答が来ないまま希望日を過ぎた (未回答の一種。仕入先は約束していない)
+      if (source === 'requested') {
+        requestedOverdueQty += datedQty;
+        flags.requested_date_only = true; // 過去日になっても「希望納期ベース」の性質は維持
+      } else {
+        overdueQty += datedQty;
+        flags.overdue = true;
+      }
+      if (restQty > 0) undatedQty += restQty;
+      parts.push({ qty: datedQty, disp: { kind: 'overdue', date, source } });
+      if (restQty > 0) parts.push({ qty: restQty, disp: { kind: 'undated' } });
     } else {
       arrivals.push({ date, qty: datedQty, source });
-      undatedQty += restQty;
+      if (restQty > 0) undatedQty += restQty;
       if (source === 'requested') flags.requested_date_only = true;
-      disp = { kind: 'dated', date, source };
+      parts.push({ qty: datedQty, disp: { kind: 'dated', date, source } });
+      if (restQty > 0) parts.push({ qty: restQty, disp: { kind: 'undated' } });
     }
-    // 納期未回答 (回答納期なし) — 発注から unansweredDays 経過で督促フラグ
+    // 納期未回答 (回答納期なし) — 発注から unansweredDays 経過で督促フラグ。日数はJST業務日付で判定
     if (!i.promised_date) {
       unansweredQty += i.remaining_qty;
-      const issuedYmd = o.issuedAt ? String(o.issuedAt).slice(0, 10) : today; // issuedAtはUTC ISOだが日単位判定の誤差は±1日で許容 (v1)
+      const issuedYmd = (o.issuedAt && jstYmd(o.issuedAt)) || today;
       oldestUnansweredDays = Math.max(oldestUnansweredDays, diffDays(issuedYmd, today));
     }
     lines.push({
@@ -185,11 +204,13 @@ function computeProductRisk(p, pmlRow, today, settings) {
       issuedAt: o.issuedAt, remaining: i.remaining_qty, vendorCode: i.vendor_code || null,
       requestedDate: i.requested_date || null, promisedDate: i.promised_date || null,
       nextExpectedDate: i.next_expected_date || null, nextExpectedQty: i.next_expected_qty || null,
-      unanswered: !i.promised_date, disp,
+      unanswered: !i.promised_date, parts,
     });
   }
   if (undatedQty > 0) flags.undated = true;
   if (unansweredQty > 0 && oldestUnansweredDays >= settings.unansweredDays) flags.unanswered = true;
+  // 督促対象か (リスク分類と独立の軸、Codex R1 High)。unknown/no_demand の商品も遅延・未回答なら督促に載る
+  const needsFollowup = flags.overdue || flags.unanswered || requestedOverdueQty > 0;
 
   // 仕入先ごとの表示明細 (商品が複数仕入先の注残を持つ稀ケースは両方に出す)
   const bySupplier = {};
@@ -200,13 +221,13 @@ function computeProductRisk(p, pmlRow, today, settings) {
 
   const base = {
     key: p.key, code: p.code, name: p.name, totalRemaining,
-    overdueQty, undatedQty, unansweredQty, oldestUnansweredDays,
-    flags, bySupplier, arrivals: arrivals.slice().sort((a, b) => a.date.localeCompare(b.date)),
+    overdueQty, undatedQty, requestedOverdueQty, unansweredQty, oldestUnansweredDays,
+    flags, needsFollowup, bySupplier, arrivals: arrivals.slice().sort((a, b) => a.date.localeCompare(b.date)),
   };
 
-  // unknown = PML行なし (データ異常のみ。督促フラグは維持される)
+  // unknown = PML行なし (データ異常のみ)。リスク軸は unknown のまま、督促は needsFollowup 軸で拾う (2軸分離)
   if (!pmlRow) {
-    return { ...base, risk: flags.overdue || flags.unanswered ? 'attention' : 'unknown', pmlMissing: true,
+    return { ...base, risk: 'unknown', pmlMissing: true,
       stock: null, dailySales: null, stockoutDate: null, marginDays: null,
       reason: 'PMLに商品が見つかりません (商品コード改廃?)' + procurementText(base, settings) };
   }
@@ -218,7 +239,7 @@ function computeProductRisk(p, pmlRow, today, settings) {
   const dailySales = d7 * settings.w7 + d30 * (1 - settings.w7);
 
   if (dailySales <= 0) {
-    return { ...base, risk: flags.overdue || flags.unanswered ? 'attention' : 'no_demand',
+    return { ...base, risk: 'no_demand',
       stock, dailySales: 0, stockoutDate: null, marginDays: null,
       reason: '販売実績なし (日販0) — 欠品予測の対象外' + procurementText(base, settings) };
   }
@@ -229,9 +250,11 @@ function computeProductRisk(p, pmlRow, today, settings) {
   // shortageDays は「最初の欠品ウィンドウ」(欠品開始→次の入荷で回復するまで) のみ数える。
   // 入荷後に販売で再び在庫が尽きる分は今回の注残の問題ではなく発注提案 (要発注) の領分
   let level = stock;
-  let stockoutDate = null, shortageDays = 0, maxDeficit = 0, recovered = false, preArrivalMin = null;
+  // 現在庫が既に0以下なら欠品予測=今日 (合意仕様。当日入荷で回復してもこの事実は消さない — Codex R1 Medium)
+  let stockoutDate = stock <= 0 ? today : null, shortageDays = 0, maxDeficit = 0, recovered = false, preArrivalMin = null;
   let firstWindowClosed = false;
-  for (let t = 0; t <= settings.horizonDays; t++) {
+  // horizonDays=90 なら t=0 (今日) 〜 t=89 の90日間を評価 (t<=horizon だと91日になる、Codex R1 Medium)
+  for (let t = 0; t < settings.horizonDays; t++) {
     const date = t === 0 ? today : addDays(today, t);
     if (arrivalByDate.has(date)) {
       if (preArrivalMin == null || level < preArrivalMin) preArrivalMin = level; // 入荷直前の最小在庫 (余裕の測定点)
@@ -274,10 +297,8 @@ function computeProductRisk(p, pmlRow, today, settings) {
   } else if (marginDays != null && marginDays <= settings.marginDays) {
     risk = 'high';
     reason = `入荷直前の在庫余裕が約${marginDays}日分 (しきい値${settings.marginDays}日以下) — 入荷遅れで欠品`;
-  } else if (flags.overdue || flags.unanswered) {
-    risk = 'attention';
-    reason = `在庫${stock.toLocaleString('ja-JP')}≒${stockDays}日分で当面の欠品リスクは低い`;
   } else {
+    // risk軸は予測評価のみ (遅延・未回答の督促は needsFollowup 軸で拾う — 2軸分離、Codex R1 High)
     risk = 'ok';
     reason = marginDays != null
       ? `欠品見込みなし (入荷前の余裕 約${marginDays}日)`
@@ -297,6 +318,7 @@ function computeProductRisk(p, pmlRow, today, settings) {
 function procurementText(base, settings) {
   const parts = [];
   if (base.overdueQty > 0) parts.push(`注残${base.overdueQty.toLocaleString('ja-JP')}個が予定日超過 (遅延中)`);
+  if (base.requestedOverdueQty > 0) parts.push(`注残${base.requestedOverdueQty.toLocaleString('ja-JP')}個が希望納期を経過も回答未着 → 回答督促`);
   if (base.unansweredQty > 0) {
     parts.push(`注残${base.unansweredQty.toLocaleString('ja-JP')}個が納期未回答` +
       (base.oldestUnansweredDays >= settings.unansweredDays ? ` (発注から${base.oldestUnansweredDays}日) → 回答督促` : ''));

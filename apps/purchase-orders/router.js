@@ -751,9 +751,12 @@ router.patch('/api/shortage-risk/settings', (req, res) => {
       updates[name] = validateShortageSetting(name, body[name]);
     }
     if (!Object.keys(updates).length) return res.status(400).json({ ok: false, error: '変更する設定がありません' });
-    for (const [name, v] of Object.entries(updates)) {
-      setSetting(shortageSettingKey(name), String(v), { actor: actorOf(req), reason: '欠品リスクしきい値の変更' });
-    }
+    // 複数キーを単一トランザクションで保存 (部分適用を防ぐ。setSetting内のtransactionはsavepointとして入れ子になる)
+    getDB().transaction(() => {
+      for (const [name, v] of Object.entries(updates)) {
+        setSetting(shortageSettingKey(name), String(v), { actor: actorOf(req), reason: '欠品リスクしきい値の変更' });
+      }
+    })();
     res.json({ ok: true, settings: shortageSettings(), defaults: SHORTAGE_DEFAULTS });
   }
   catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -5398,10 +5401,12 @@ function load() {
     render();
     // 商品検索の入力が残っていれば再評価 (DATA読込前に入力したケース)
     if (document.getElementById('boQ').value.trim()) renderProd();
-    // 他ページ (欠品リスク等) からの #po-<id> リンクで該当POを開く (初回読込時のみ)
+    // 他ページ (欠品リスク等) からの #po-<id> リンクで該当POを開く (初回読込時のみ)。
+    // idは数字のみ許可 (任意文字列を querySelector に渡さない、Codex P17-R1 Low)
     if (!HASH_JUMPED && location.hash.indexOf('#po-') === 0) {
       HASH_JUMPED = true;
-      jumpToOrder(location.hash.slice(4));
+      var hashId = location.hash.slice(4);
+      if (/^\\d+$/.test(hashId)) jumpToOrder(hashId);
     }
   }).catch(function(e) {
     if (seq !== LOAD_SEQ) return;
@@ -6538,12 +6543,21 @@ function riskBadge(risk) {
   if (risk === 'unknown') return '<span class="badge" style="background:#fce7f3;color:#9d174d">データ異常</span>';
   return '<span class="badge" style="background:#dcfce7;color:#15803d">OK</span>';
 }
-// 明細の期日表示 (シミュレーションの解釈と同じ言葉で出す)
-function dispText(l) {
-  if (l.disp.kind === 'overdue') return '<span style="color:#b91c1c">予定日超過 ' + fmtMd(l.disp.date) + '</span>';
-  if (l.disp.kind === 'undated') return '<span style="color:#a16207">納期不明' + (l.unanswered ? ' (未回答)' : '') + '</span>';
-  var src = l.disp.source === 'next' ? '分納予定' : l.disp.source === 'promised' ? '回答納期' : '希望納期 (未回答)';
-  return src + ' ' + fmtMd(l.disp.date);
+// 数量partの期日表示 (シミュレーションの解釈と1:1。分納分割は「30個=分納予定7/20、70個=納期不明」と内訳で出す)
+function partText(p, unanswered) {
+  var d = p.disp;
+  if (d.kind === 'overdue') {
+    // 回答納期/分納予定の超過=遅延、希望納期の超過=回答が来ないまま希望日を過ぎた (別物、Codex R1 High)
+    return d.source === 'requested'
+      ? '<span style="color:#a16207">希望納期 ' + fmtMd(d.date) + ' 超過 (回答未着)</span>'
+      : '<span style="color:#b91c1c">予定日超過 ' + fmtMd(d.date) + '</span>';
+  }
+  if (d.kind === 'undated') return '<span style="color:#a16207">納期不明' + (unanswered ? ' (未回答)' : '') + '</span>';
+  var src = d.source === 'next' ? '分納予定' : d.source === 'promised' ? '回答納期' : '希望納期 (未回答)';
+  return src + ' ' + fmtMd(d.date);
+}
+function lineText(l) {
+  return l.parts.map(function(p){ return p.qty.toLocaleString('ja-JP') + '個=' + partText(p, l.unanswered); }).join('、');
 }
 function flagBadges(it) {
   var h = '';
@@ -6556,9 +6570,9 @@ function flagBadges(it) {
 
 function itemRows(it) {
   var boLines = it.lines.map(function(l) {
-    return '<div style="white-space:nowrap">' +
+    return '<div>' +
       '<a href="/apps/purchase-orders/backorders#po-' + l.orderId + '" title="発注残でこのPOを開く">' + esc(l.poNumber) + '</a> ' +
-      '<b>' + l.remaining.toLocaleString('ja-JP') + '</b>個 — ' + dispText(l) + '</div>';
+      '残<b>' + l.remaining.toLocaleString('ja-JP') + '</b>個 (' + lineText(l) + ')</div>';
   }).join('');
   var stockCell = it.stock == null ? '—'
     : it.stock.toLocaleString('ja-JP') + (it.stockDays != null && it.dailySales > 0 ? ' <span class="muted">(≒' + it.stockDays + '日分)</span>' : '');
@@ -6574,10 +6588,13 @@ function itemRows(it) {
     '<tr><td colspan="5" class="muted" style="font-size:11.5px;padding-top:0;border-top:none">' + esc(it.reason) + '</td></tr>';
 }
 
+// 主一覧・督促コピーの対象 = 欠品リスク (high/attention) または督促フラグあり (2軸、Codex R1 High)
+function isMain(it) { return it.risk === 'high' || it.risk === 'attention' || it.needsFollowup; }
+
 function render() {
   var s = DATA.summary;
   document.getElementById('srSummary').textContent =
-    '🔴 欠品リスク ' + s.high + ' / 🟡 要督促 ' + s.attention + ' / 販売なし ' + s.no_demand + ' / データ異常 ' + s.unknown + ' / OK ' + s.ok +
+    '🔴 欠品リスク ' + s.high + ' / 🟡 注意 ' + s.attention + ' / 📞 督促対象 ' + s.followup + ' / 販売なし ' + s.no_demand + ' / データ異常 ' + s.unknown + ' / OK ' + s.ok +
     ' (対象=オープン注残のある商品、' + DATA.today + ' 時点)';
   // データ基準 (在庫・販売のスナップショット時刻。古ければ警告)
   var b = DATA.dataBasis;
@@ -6596,10 +6613,10 @@ function render() {
   var h = '';
   if (!DATA.suppliers.length) h = '<div class="muted">オープンな注残がありません 🎉</div>';
   DATA.suppliers.forEach(function(g) {
-    var main = g.items.filter(function(it){ return it.risk === 'high' || it.risk === 'attention'; });
-    var rest = g.items.filter(function(it){ return it.risk !== 'high' && it.risk !== 'attention'; });
+    var main = g.items.filter(isMain);
+    var rest = g.items.filter(function(it){ return !isMain(it); });
     h += '<div class="sec"><h2>🏭 ' + esc(g.name) +
-      ' <span class="muted" style="font-weight:normal;font-size:12px">🔴' + (g.counts.high || 0) + ' 🟡' + (g.counts.attention || 0) + ' / 全' + g.items.length + '商品</span>' +
+      ' <span class="muted" style="font-weight:normal;font-size:12px">🔴' + (g.counts.high || 0) + ' 🟡' + (g.counts.attention || 0) + ' 📞' + (g.counts.followup || 0) + ' / 全' + g.items.length + '商品</span>' +
       (main.length ? ' <button class="pri sm" data-copy="' + esc(g.code) + '" title="この仕入先向けの督促文面 (台帳の事実+参考予測) をクリップボードにコピー">📋 督促リストをコピー</button>' : '') +
       '</h2><div class="bd">';
     if (main.length) {
@@ -6626,18 +6643,25 @@ function buildCopyText(g) {
   L.push('いつもお世話になっております。B-Faith株式会社です。');
   L.push('以下の発注分について、納期のご確認・ご回答をお願いいたします (' + DATA.today + ' 時点の弊社発注台帳より)。');
   g.items.forEach(function(it) {
-    if (it.risk !== 'high' && it.risk !== 'attention') return;
+    if (!isMain(it)) return;
     L.push('');
     var vendor = null;
     it.lines.forEach(function(l){ if (!vendor && l.vendorCode) vendor = l.vendorCode; });
     L.push('■ ' + esc0(it.name || it.code) + (vendor ? ' (貴社管理番号: ' + esc0(vendor) + ')' : ' (' + esc0(it.code) + ')'));
     it.lines.forEach(function(l) {
-      var st;
-      if (l.disp.kind === 'overdue') st = 'ご回答いただいた納期 ' + fmtMd(l.disp.date) + ' を過ぎております。状況をお知らせください';
-      else if (l.disp.kind === 'undated') st = l.unanswered ? '納期のご回答が未着です。ご回答をお願いいたします' : '納期未定です';
-      else if (l.disp.source === 'requested') st = '希望納期 ' + fmtMd(l.disp.date) + ' (ご回答未着のため、可否のご回答をお願いいたします)';
-      else st = (l.disp.source === 'next' ? '分納予定' : '回答納期') + ' ' + fmtMd(l.disp.date);
-      L.push('・発注書 ' + esc0(l.poNumber) + ' : 残 ' + l.remaining.toLocaleString('ja-JP') + '個 — ' + st);
+      // 数量partごとに台帳上の事実を書く (分納分割を全量と誤記しない / 希望納期超過を「ご回答納期の超過」と誤記しない、Codex R1 High)
+      var segs = l.parts.map(function(p) {
+        var q = p.qty.toLocaleString('ja-JP') + '個';
+        if (p.disp.kind === 'overdue') {
+          return p.disp.source === 'requested'
+            ? q + ': 希望納期 ' + fmtMd(p.disp.date) + ' を過ぎましたがご回答が未着です'
+            : q + ': ご回答いただいた納期 ' + fmtMd(p.disp.date) + ' を過ぎております。状況をお知らせください';
+        }
+        if (p.disp.kind === 'undated') return q + ': 納期のご回答が未着です。ご回答をお願いいたします';
+        if (p.disp.source === 'requested') return q + ': 希望納期 ' + fmtMd(p.disp.date) + ' (ご回答未着のため可否のご回答をお願いいたします)';
+        return q + ': ' + (p.disp.source === 'next' ? '分納予定' : 'ご回答納期') + ' ' + fmtMd(p.disp.date);
+      });
+      L.push('・発注書 ' + esc0(l.poNumber) + ' : 残 ' + l.remaining.toLocaleString('ja-JP') + '個 — ' + segs.join(' / '));
     });
     if (it.stockoutDate) {
       L.push('（参考: 現在の販売ペースでは ' + fmtMd(it.stockoutDate) + ' 頃に在庫切れが見込まれます。可能でしたら納期の前倒しをご検討ください）');
