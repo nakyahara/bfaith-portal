@@ -34,6 +34,7 @@ import {
 } from './email.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
+import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -733,6 +734,32 @@ router.get('/api/backorders/supplier-csv', (req, res) => {
     res.send(iconv.encode(csvText, 'cp932'));
   }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── P17: 欠品リスク (要件v8 F-4、v1=簡易目安の参考表示) ───
+router.get('/api/shortage-risk', (req, res) => {
+  try { res.json({ ok: true, ...computeShortageRisk() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// しきい値の更新 (範囲検証→setSetting。setSetting が old/new+actor を監査ログに残す)
+router.patch('/api/shortage-risk/settings', (req, res) => {
+  try {
+    const body = req.body || {};
+    const updates = {};
+    for (const name of ['w7', 'marginDays', 'unansweredDays', 'horizonDays', 'soonDays']) {
+      if (body[name] === undefined) continue;
+      updates[name] = validateShortageSetting(name, body[name]);
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ ok: false, error: '変更する設定がありません' });
+    // 複数キーを単一トランザクションで保存 (部分適用を防ぐ。setSetting内のtransactionはsavepointとして入れ子になる)
+    getDB().transaction(() => {
+      for (const [name, v] of Object.entries(updates)) {
+        setSetting(shortageSettingKey(name), String(v), { actor: actorOf(req), reason: '欠品リスクしきい値の変更' });
+      }
+    })();
+    res.json({ ok: true, settings: shortageSettings(), defaults: SHORTAGE_DEFAULTS });
+  }
+  catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // NE発注残CSVの初期取込 (移行PO作成)。commit='1' 以外はプレビューのみ (書込なし)。
@@ -2866,6 +2893,7 @@ function pageShell(title, active, body, script) {
   <nav class="tabs">
     ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
     ${tab('/apps/purchase-orders/backorders', '発注残', 'backorders')}
+    ${tab('/apps/purchase-orders/shortage-risk', '⚠️欠品リスク', 'shortage-risk')}
     ${tab('/apps/purchase-orders/inbound-plan', '入荷予定', 'inbound-plan')}
     ${tab('/apps/purchase-orders/inbound', '入庫消込', 'inbound')}
     ${tab('/apps/purchase-orders/products', '全商品情報', 'products')}
@@ -5316,6 +5344,7 @@ var API = '/apps/purchase-orders/api';
 var DATA = null, VIEW = 'attention', OPENED = {};
 var SEL = {}; // 一括メール送信の選択状態 (orderId → true)
 var SUP_SEL = null; // 🏭 仕入先別ビューで選択中の仕入先コード (null=仕入先一覧)
+var HASH_JUMPED = false; // #po-<id> リンクの初回ジャンプ済みフラグ
 var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
@@ -5372,6 +5401,13 @@ function load() {
     render();
     // 商品検索の入力が残っていれば再評価 (DATA読込前に入力したケース)
     if (document.getElementById('boQ').value.trim()) renderProd();
+    // 他ページ (欠品リスク等) からの #po-<id> リンクで該当POを開く (初回読込時のみ)。
+    // idは数字のみ許可 (任意文字列を querySelector に渡さない、Codex P17-R1 Low)
+    if (!HASH_JUMPED && location.hash.indexOf('#po-') === 0) {
+      HASH_JUMPED = true;
+      var hashId = location.hash.slice(4);
+      if (/^\\d+$/.test(hashId)) jumpToOrder(hashId);
+    }
   }).catch(function(e) {
     if (seq !== LOAD_SEQ) return;
     document.getElementById('boList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
@@ -6473,6 +6509,238 @@ document.getElementById('neImpFile').addEventListener('change', function(){
 });
 load();`;
   res.send(pageShell('発注補助 — 発注残', 'backorders', body, script));
+});
+
+// ─── 画面: 欠品リスク (P17) ───
+router.get('/shortage-risk', (req, res) => {
+  const body = `
+    <h2 class="page">⚠️ 欠品リスク <span class="muted" style="font-size:12px">注残はあるが納期が先・未回答・遅延で欠品しそうな商品 (仕入先督促の材料)。<b>簡易目安の参考表示</b>であり精密予測ではありません</span></h2>
+    <div id="srBasis"></div>
+    <details class="sec" style="margin-bottom:10px"><summary style="cursor:pointer;padding:8px 12px">⚙ しきい値設定</summary>
+      <div class="bd" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+        <label class="muted" title="加重日販 = 7日販売/7×この重み + 30日販売/30×(1−重み)">7日販売の重み <input type="number" id="srW7" min="0" max="1" step="0.1"></label>
+        <label class="muted" title="欠品しなくても、入荷直前の在庫余裕がこの日数以下なら🔴扱い">余裕しきい値 <input type="number" id="srMargin" min="0" max="30" step="1">日</label>
+        <label class="muted" title="納期未回答のまま発注からこの日数が経過したら🟡回答督促">未回答督促 <input type="number" id="srUnans" min="0" max="60" step="1">日</label>
+        <label class="muted" title="在庫推移をシミュレーションする日数">予測期間 <input type="number" id="srHorizon" min="14" max="365" step="1">日</label>
+        <label class="muted" title="入荷予定が未確定でも、欠品予測日がこの日数以内なら🔴 (それ以降は🟡納期確定の督促)">至急しきい値 <input type="number" id="srSoon" min="1" max="90" step="1">日</label>
+        <button class="pri" id="srSave">保存</button>
+        <button class="ghost" id="srReset" title="5項目を既定値 (0.5 / 3日 / 7日 / 90日 / 14日) に戻して保存">既定値に戻す</button>
+        <span class="muted" style="font-size:11px">変更は監査ログに記録されます</span>
+      </div>
+    </details>
+    <div id="srSummary" class="muted" style="margin:6px 0"></div>
+    <div id="srList">読み込み中…</div>`;
+  const script = `
+var API = '/apps/purchase-orders/api';
+var DATA = null;
+function fmtMd(ymd) { return ymd ? Number(ymd.slice(5, 7)) + '/' + Number(ymd.slice(8, 10)) : '—'; }
+function getJson(url) { return fetch(url).then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status }; }); }); }
+
+function riskBadge(risk) {
+  if (risk === 'high') return '<span class="badge" style="background:#fee2e2;color:#b91c1c">🔴 欠品リスク</span>';
+  if (risk === 'attention') return '<span class="badge" style="background:#fef9c3;color:#a16207">🟡 要督促</span>';
+  if (risk === 'no_demand') return '<span class="badge" style="background:#e2e8f0;color:#475569">販売なし</span>';
+  if (risk === 'unknown') return '<span class="badge" style="background:#fce7f3;color:#9d174d">データ異常</span>';
+  return '<span class="badge" style="background:#dcfce7;color:#15803d">OK</span>';
+}
+// 数量partの期日表示 (シミュレーションの解釈と1:1。分納分割は「30個=分納予定7/20、70個=納期不明」と内訳で出す)
+function partText(p, unanswered) {
+  var d = p.disp;
+  if (d.kind === 'overdue') {
+    // 回答納期/分納予定の超過=遅延、希望納期の超過=回答が来ないまま希望日を過ぎた (別物、Codex R1 High)
+    return d.source === 'requested'
+      ? '<span style="color:#a16207">希望納期 ' + fmtMd(d.date) + ' 超過 (回答未着)</span>'
+      : '<span style="color:#b91c1c">予定日超過 ' + fmtMd(d.date) + '</span>';
+  }
+  if (d.kind === 'undated') return '<span style="color:#a16207">納期不明' + (unanswered ? ' (未回答)' : '') + '</span>';
+  var src = d.source === 'next' ? '分納予定' : d.source === 'promised' ? '回答納期' : '希望納期 (未回答)';
+  return src + ' ' + fmtMd(d.date);
+}
+function lineText(l) {
+  return l.parts.map(function(p){ return p.qty.toLocaleString('ja-JP') + '個=' + partText(p, l.unanswered); }).join('、');
+}
+function flagBadges(it) {
+  var h = '';
+  if (it.flags.overdue) h += ' <span class="badge" style="background:#fee2e2;color:#b91c1c" title="予定日を過ぎても入荷していない注残があります">遅延中</span>';
+  if (it.flags.unanswered) h += ' <span class="badge" style="background:#fef9c3;color:#a16207" title="納期未回答のまま日数が経過しています">未回答</span>';
+  if (it.flags.undated) h += ' <span class="badge" style="background:#e2e8f0;color:#475569" title="納期不明の数量は在庫推移の計算に入れていません">納期不明あり</span>';
+  if (it.flags.requested_date_only) h += ' <span class="badge" style="background:#e0e7ff;color:#4338ca" title="回答納期がなく、希望納期どおり入荷する楽観仮定で計算しています">希望納期ベース</span>';
+  return h;
+}
+
+function itemRows(it) {
+  var boLines = it.lines.map(function(l) {
+    return '<div>' +
+      '<a href="/apps/purchase-orders/backorders#po-' + l.orderId + '" title="発注残でこのPOを開く">' + esc(l.poNumber) + '</a> ' +
+      '残<b>' + l.remaining.toLocaleString('ja-JP') + '</b>個 (' + lineText(l) + ')</div>';
+  }).join('');
+  var stockCell = it.stock == null ? '—'
+    : it.stock.toLocaleString('ja-JP') + (it.stockDays != null && it.dailySales > 0 ? ' <span class="muted">(≒' + it.stockDays + '日分)</span>' : '');
+  var judge = riskBadge(it.risk) + (it.stockoutDate ? ' <b style="color:#b91c1c">' + fmtMd(it.stockoutDate) + '</b> 欠品見込み'
+    : it.marginDays != null ? ' <span class="muted">余裕' + it.marginDays + '日</span>' : '');
+  return '<tr>' +
+    '<td><b>' + esc(it.code) + '</b><div class="muted" style="font-size:11px">' + esc(it.name) + '</div>' + flagBadges(it) + '</td>' +
+    '<td class="r">' + stockCell + '</td>' +
+    '<td class="r">' + (it.dailySales == null ? '—' : it.dailySales) + '</td>' +
+    '<td>' + judge + '</td>' +
+    '<td>' + boLines + '</td>' +
+    '</tr>' +
+    '<tr><td colspan="5" class="muted" style="font-size:11.5px;padding-top:0;border-top:none">' + esc(it.reason) + '</td></tr>';
+}
+
+// 主一覧・督促コピーの対象 = 欠品リスク (high/attention) または督促フラグあり (2軸、Codex R1 High)
+function isMain(it) { return it.risk === 'high' || it.risk === 'attention' || it.needsFollowup; }
+
+function render() {
+  var s = DATA.summary;
+  document.getElementById('srSummary').textContent =
+    '🔴 欠品リスク ' + s.high + ' / 🟡 注意 ' + s.attention + ' / 📞 督促対象 ' + s.followup + ' / 販売なし ' + s.no_demand + ' / データ異常 ' + s.unknown + ' / OK ' + s.ok +
+    ' (対象=オープン注残のある商品、' + DATA.today + ' 時点)';
+  // データ基準 (在庫・販売のスナップショット時刻。古ければ警告)
+  var b = DATA.dataBasis;
+  var basis = 'データ基準: PML ' + (b.pmlAsOfDate ? esc(b.pmlAsOfDate) : '不明') +
+    (b.overlay ? ' + 日中CSV (' + esc(b.overlay.source || '') + (b.overlay.applied ? '' : '・朝同期より古いため未適用') + ')' : '');
+  document.getElementById('srBasis').innerHTML = b.stale
+    ? '<div class="warn">⚠️ ' + basis + ' — 2日以上古いデータです。判定は参考程度にしてください</div>'
+    : '<div class="muted" style="font-size:12px">' + basis + '</div>';
+  // しきい値
+  document.getElementById('srW7').value = DATA.settings.w7;
+  document.getElementById('srMargin').value = DATA.settings.marginDays;
+  document.getElementById('srUnans').value = DATA.settings.unansweredDays;
+  document.getElementById('srHorizon').value = DATA.settings.horizonDays;
+  document.getElementById('srSoon').value = DATA.settings.soonDays;
+
+  var h = '';
+  if (!DATA.suppliers.length) h = '<div class="muted">オープンな注残がありません 🎉</div>';
+  DATA.suppliers.forEach(function(g) {
+    var main = g.items.filter(isMain);
+    var rest = g.items.filter(function(it){ return !isMain(it); });
+    h += '<div class="sec"><h2>🏭 ' + esc(g.name) +
+      ' <span class="muted" style="font-weight:normal;font-size:12px">🔴' + (g.counts.high || 0) + ' 🟡' + (g.counts.attention || 0) + ' 📞' + (g.counts.followup || 0) + ' / 全' + g.items.length + '商品</span>' +
+      (main.length ? ' <button class="pri sm" data-copy="' + esc(g.code) + '" title="この仕入先向けの督促文面 (台帳の事実+参考予測) をクリップボードにコピー">📋 督促リストをコピー</button>' : '') +
+      '</h2><div class="bd">';
+    if (main.length) {
+      h += '<table class="t"><tr><th>商品</th><th class="r">現在庫</th><th class="r">加重日販</th><th>判定</th><th>注残 (PO別)</th></tr>' +
+        main.map(itemRows).join('') + '</table>';
+    } else {
+      h += '<div class="muted">督促が必要な商品はありません</div>';
+    }
+    if (rest.length) {
+      h += '<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">その他 ' + rest.length + '商品 (OK / 販売なし / データ異常)</summary>' +
+        '<table class="t" style="margin-top:6px"><tr><th>商品</th><th class="r">現在庫</th><th class="r">加重日販</th><th>判定</th><th>注残 (PO別)</th></tr>' +
+        rest.map(itemRows).join('') + '</table></details>';
+    }
+    h += '</div></div>';
+  });
+  document.getElementById('srList').innerHTML = h;
+}
+
+// 督促コピー文面: 台帳上の事実と参考予測を分離し、断定しない (Codex設計相談 2026-07-16)
+function buildCopyText(g) {
+  var L = [];
+  L.push(esc0(g.name) + ' 様');
+  L.push('');
+  L.push('いつもお世話になっております。B-Faith株式会社です。');
+  L.push('以下の発注分について、納期のご確認・ご回答をお願いいたします (' + DATA.today + ' 時点の弊社発注台帳より)。');
+  g.items.forEach(function(it) {
+    if (!isMain(it)) return;
+    L.push('');
+    var vendor = null;
+    it.lines.forEach(function(l){ if (!vendor && l.vendorCode) vendor = l.vendorCode; });
+    L.push('■ ' + esc0(it.name || it.code) + (vendor ? ' (貴社管理番号: ' + esc0(vendor) + ')' : ' (' + esc0(it.code) + ')'));
+    it.lines.forEach(function(l) {
+      // 数量partごとに台帳上の事実を書く (分納分割を全量と誤記しない / 希望納期超過を「ご回答納期の超過」と誤記しない、Codex R1 High)
+      var segs = l.parts.map(function(p) {
+        var q = p.qty.toLocaleString('ja-JP') + '個';
+        if (p.disp.kind === 'overdue') {
+          return p.disp.source === 'requested'
+            ? q + ': 希望納期 ' + fmtMd(p.disp.date) + ' を過ぎましたがご回答が未着です'
+            : q + ': ご回答いただいた納期 ' + fmtMd(p.disp.date) + ' を過ぎております。状況をお知らせください';
+        }
+        if (p.disp.kind === 'undated') return q + ': 納期のご回答が未着です。ご回答をお願いいたします';
+        if (p.disp.source === 'requested') return q + ': 希望納期 ' + fmtMd(p.disp.date) + ' (ご回答未着のため可否のご回答をお願いいたします)';
+        return q + ': ' + (p.disp.source === 'next' ? '分納予定' : 'ご回答納期') + ' ' + fmtMd(p.disp.date);
+      });
+      L.push('・発注書 ' + esc0(l.poNumber) + ' : 残 ' + l.remaining.toLocaleString('ja-JP') + '個 — ' + segs.join(' / '));
+    });
+    if (it.stockoutDate) {
+      L.push('（参考: 現在の販売ペースでは ' + fmtMd(it.stockoutDate) + ' 頃に在庫切れが見込まれます。可能でしたら納期の前倒しをご検討ください）');
+    }
+  });
+  L.push('');
+  L.push('お手数をおかけしますが、よろしくお願いいたします。');
+  return L.join('\\n');
+}
+function esc0(s) { return s == null ? '' : String(s); } // コピーはプレーンテキスト (HTMLエスケープ不要)
+
+function copyText(text, btn) {
+  var done = function(){ toast('督促リストをコピーしました (メール等に貼り付けてください)'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(function(){ fallbackCopy(text); done(); });
+  } else { fallbackCopy(text); done(); }
+}
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  ta.remove();
+}
+
+document.addEventListener('click', function(ev) {
+  var t = ev.target;
+  var code = t.getAttribute && t.getAttribute('data-copy');
+  if (!code || !DATA) return;
+  var g = null;
+  DATA.suppliers.forEach(function(x){ if (x.code === code) g = x; });
+  if (g) copyText(buildCopyText(g), t);
+});
+
+document.getElementById('srSave').addEventListener('click', function() { saveSettings(false); });
+document.getElementById('srReset').addEventListener('click', function() {
+  if (!confirm('しきい値5項目を既定値 (7日重み0.5 / 余裕3日 / 未回答7日 / 予測90日 / 至急14日) に戻しますか?')) return;
+  saveSettings(true);
+});
+function saveSettings(reset) {
+  var body;
+  if (reset) {
+    body = { w7: 0.5, marginDays: 3, unansweredDays: 7, horizonDays: 90, soonDays: 14 };
+  } else {
+    // 空欄は Number('')=0 に化けるため送信前に拒否 (Codex R2 Medium)
+    var ids = { w7: 'srW7', marginDays: 'srMargin', unansweredDays: 'srUnans', horizonDays: 'srHorizon', soonDays: 'srSoon' };
+    body = {};
+    for (var name in ids) {
+      var v = document.getElementById(ids[name]).value;
+      if (String(v).trim() === '') { toast('空欄の項目があります。数値を入力してください'); return; }
+      body[name] = Number(v);
+    }
+  }
+  fetch(API + '/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast('しきい値を保存しました。再計算します');
+      load();
+    })
+    .catch(function(e){ toast('通信エラー: ' + e.message); });
+}
+
+function load() {
+  getJson(API + '/shortage-risk').then(function(j) {
+    if (!j.ok) {
+      document.getElementById('srList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+      return;
+    }
+    DATA = j;
+    render();
+  }).catch(function(e) {
+    document.getElementById('srList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+  });
+}
+load();
+`;
+  res.send(pageShell('発注補助 — 欠品リスク', 'shortage-risk', body, script));
 });
 
 router.get('/orders', (req, res) => {

@@ -3325,10 +3325,202 @@ console.log('── 🏷️ バーコードラベル管理 ──');
   ok(adHtml9.includes('zoneBarcode') && adHtml9.includes('loadBarcode') && adHtml9.includes('data-grp="barcode"'), 'barcode: adminに🏷️タブ+CSV取込UI');
 }
 
+// ═══ P17 欠品リスク (加重日販+在庫推移シミュレーション+2軸分類+しきい値) ═══
+console.log('── P17 欠品リスク ──');
+{
+  const jstD = n => new Date(Date.now() + 9 * 3600000 + n * 86400000).toISOString().slice(0, 10);
+  const insSr = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
+    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+    VALUES ('run_test', ?, ?, '0001', '取扱中', 2, ?, 0, ?, ?, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01')`);
+  // 加重日販は全て 70/7×0.5 + 300/30×0.5 = 10/日
+  insSr.run('sr-high-item', '欠品ハイ (入荷が間に合わない)', 20, 70, 300);      // 2日分 → 欠品、入荷は10日後
+  insSr.run('sr-ok-item', '余裕あり', 1000, 70, 300);                           // 100日分
+  insSr.run('sr-soon-item', '納期未確定・切迫', 50, 70, 300);                    // 5日分 → soon14日以内 → high
+  insSr.run('sr-undated-item', '納期未確定・遠い', 500, 70, 300);                // 50日分 → soon超 → attention (回答督促)
+  insSr.run('sr-over-item', '遅延中・在庫豊富', 5000, 70, 300);                  // 500日分 → 欠品なし+遅延 → ok+督促フラグ (2軸)
+  insSr.run('sr-nodemand-item', '販売なし', 5, 0, 0);
+  insSr.run('sr-split-item', '分納分割', 1000, 70, 300);                         // 分納30個のみ日付つき・残50は納期不明
+  insSr.run('sr-reqover-item', '希望納期超過・回答未着', 5000, 70, 300);          // 希望納期past=遅延ではなく未回答扱い
+  insSr.run('sr-multi-item', '複数仕入先スコープ', 5000, 70, 300);                // 仕入先1=遅延 / 仕入先2=クリーン
+
+  const issueSr = async (items) => {
+    const rr = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }) });
+    ok(rr.status === 200 && rr.body.ok, `P17 fixture発注 (${items.map(x => x.code).join(',')})`);
+    return rr.body.id;
+  };
+  const setPromised = async (orderId, code, date) => {
+    const it = db.prepare('SELECT id FROM po_order_items WHERE order_id=? AND product_key=?').get(orderId, code);
+    const rr = await j('/api/items/' + it.id + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ promisedDate: date }) });
+    ok(rr.status === 200 && rr.body.ok, `P17 回答納期セット (${code}=${date})`);
+  };
+  let oid = await issueSr([{ code: 'sr-high-item', qty: 100 }, { code: 'sr-ok-item', qty: 50 }]);
+  await setPromised(oid, 'sr-high-item', jstD(10));
+  await setPromised(oid, 'sr-ok-item', jstD(5));
+  await issueSr([{ code: 'sr-soon-item', qty: 80 }, { code: 'sr-undated-item', qty: 60 }]); // 納期なし
+  oid = await issueSr([{ code: 'sr-over-item', qty: 40 }, { code: 'sr-nodemand-item', qty: 10 }]);
+  await setPromised(oid, 'sr-over-item', jstD(-1)); // 昨日=予定日超過
+  await setPromised(oid, 'sr-nodemand-item', jstD(30));
+  // 分納分割: 発注100→入荷20→残80のうち分納予定30個 (jstD(5)) のみ日付つき、残50は納期不明
+  oid = await issueSr([{ code: 'sr-split-item', qty: 100 }]);
+  {
+    const it = db.prepare('SELECT id FROM po_order_items WHERE order_id=? AND product_key=?').get(oid, 'sr-split-item');
+    r = await j('/api/items/' + it.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'receipt', qty: 20, remainder: { action: 'await_delivery', nextExpectedDate: jstD(5), nextExpectedQty: 30 } }) });
+    ok(r.status === 200 && r.body.ok && r.body.remaining === 80, 'P17 fixture: 分納予定30/残80');
+  }
+  // 希望納期が過去 (回答なし): NE移行取込で requested_date を過去日にする (issued後のrequestedは不変のため)
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9300', 'テスト様', 'sr-reqover-item', '希望納期超過', '', 25, 25, '2026/1/10', '', '通常', '0', '0', '2026/1/5', '0001', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 希望納期過去の移行PO');
+  }
+  // 複数仕入先: 仕入先1のPOは予定日超過、仕入先2のPO (NE移行) はクリーン → 督促は仕入先スコープで分離
+  oid = await issueSr([{ code: 'sr-multi-item', qty: 30 }]);
+  await setPromised(oid, 'sr-multi-item', jstD(-2));
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9301', 'テスト様', 'sr-multi-item', '複数仕入先', '', 20, 20, '', '', '通常', '0', '0', '2026/7/1', '0002', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 仕入先2の移行PO (クリーン)');
+  }
+
+  r = await j('/api/shortage-risk');
+  ok(r.body.ok && r.body.settings.w7 === 0.5 && r.body.settings.soonDays === 14 && r.body.today === jstD(0), 'P17 API: 既定しきい値+JST今日', r.body.settings);
+  ok(r.body.dataBasis && r.body.dataBasis.pmlAsOfDate && r.body.dataBasis.stale === false, 'P17 API: データ基準 (PML as_of、stale=false)', r.body.dataBasis);
+  const sup1 = r.body.suppliers.find(s => s.code === '1');
+  const item = c => sup1.items.find(x => x.code === c);
+
+  // 🔴 high: 入荷を織り込んでも欠品 (t=1で在庫0、+100は10日後 → 9日間欠品)
+  const hi = item('sr-high-item');
+  ok(hi && hi.risk === 'high' && hi.stockoutDate === jstD(1) && hi.shortageDays === 9 && hi.recovered === true,
+    'P17: 入荷が間に合わない → high (欠品日/9日間/回復)', hi && { d: hi.stockoutDate, s: hi.shortageDays });
+  ok(hi.reason.includes('在庫切れ見込み') && hi.reason.includes('100個') && hi.reason.includes('9日間'), 'P17: 理由文 (次回入荷+欠品日数)', hi.reason);
+  ok(hi.dailySales === 10 && hi.stock === 20, 'P17: 加重日販=10 (70/7×0.5+300/30×0.5)');
+
+  // OK: 余裕95日 (入荷直前 950÷10)
+  const okI = item('sr-ok-item');
+  ok(okI && okI.risk === 'ok' && okI.marginDays === 95, 'P17: 余裕あり → ok (margin95日)', okI && okI.marginDays);
+
+  // 🔴 high: 納期未確定でも切迫 (5日分 ≤ soon14)
+  const soon = item('sr-soon-item');
+  ok(soon && soon.risk === 'high' && soon.reason.includes('至急'), 'P17: 納期未確定+切迫 → high (至急督促)', soon && soon.reason);
+
+  // 🟡 attention: 納期未確定だが50日分 (soon超) → 回答督促
+  const und = item('sr-undated-item');
+  ok(und && und.risk === 'attention' && und.reason.includes('納期を確定') && und.undatedQty === 60,
+    'P17: 納期未確定+遠い → attention (ノイズ化させない)', und && und.risk);
+
+  // 2軸分離: 遅延中でも予測評価は ok のまま、督促は needsFollowup 軸で拾う
+  const over = item('sr-over-item');
+  ok(over && over.risk === 'ok' && over.needsFollowup === true && over.flags.overdue === true && over.overdueQty === 40 && !over.stockoutDate,
+    'P17: 予定日超過 → risk=ok × needsFollowup=true (2軸分離)', over && { r: over.risk, f: over.flags });
+  ok(over.reason.includes('予定日超過'), 'P17: 遅延の理由文', over.reason);
+
+  // 分納分割: 30個のみ日付つき・残50は納期不明 (表示partsも同じ内訳、全量を分納予定と誤表示しない)
+  const spl = item('sr-split-item');
+  ok(spl && spl.undatedQty === 50 && spl.arrivals.length === 1 && spl.arrivals[0].qty === 30 && spl.arrivals[0].date === jstD(5),
+    'P17: 分納分割 (30=日付つき/50=納期不明)', spl && { u: spl.undatedQty, a: spl.arrivals });
+  const splLine = spl.lines.find(l => l.remaining === 80);
+  ok(splLine && splLine.parts.length === 2 && splLine.parts[0].qty === 30 && splLine.parts[0].disp.kind === 'dated'
+    && splLine.parts[1].qty === 50 && splLine.parts[1].disp.kind === 'undated',
+    'P17: 表示partsが分納分割を反映 (残80=30予定+50不明)', splLine && splLine.parts);
+
+  // 希望納期の過去日 = 遅延ではなく「回答未着のまま希望日超過」(overdueフラグは立てない)
+  const reqo = item('sr-reqover-item');
+  ok(reqo && reqo.risk === 'ok' && reqo.needsFollowup === true && reqo.flags.overdue === false
+    && reqo.requestedOverdueQty === 25 && reqo.flags.requested_date_only === true,
+    'P17: 希望納期超過 → overdueではなく回答督促 (requestedOverdueQty)', reqo && { f: reqo.flags, q: reqo.requestedOverdueQty });
+  ok(reqo.reason.includes('希望納期を経過'), 'P17: 希望納期超過の理由文', reqo.reason);
+
+  // 仕入先スコープ: 同一商品でも督促の数量・フラグ・文面は各仕入先の明細だけで再集計 (Codex R2 High)
+  const multi1 = item('sr-multi-item');
+  ok(multi1 && multi1.needsFollowup === true && multi1.overdueQty === 30 && multi1.reason.includes('予定日超過'),
+    'P17: 複数仕入先 — 仕入先1スコープは遅延30個で督促対象', multi1 && { f: multi1.needsFollowup, q: multi1.overdueQty });
+  const multi2 = r.body.suppliers.find(s => s.code === '2').items.find(x => x.code === 'sr-multi-item');
+  ok(multi2 && multi2.needsFollowup === false && multi2.overdueQty === 0 && !multi2.reason.includes('予定日超過')
+    && multi2.lines.length === 1 && multi2.lines[0].poNumber === '9301',
+    'P17: 複数仕入先 — 仕入先2スコープに他仕入先の遅延が混ざらない', multi2 && { f: multi2.needsFollowup, q: multi2.overdueQty, n: multi2.lines.length });
+  ok(multi1.risk === multi2.risk && multi1.stockoutDate === multi2.stockoutDate,
+    'P17: 複数仕入先 — 予測評価 (risk/欠品予測) は商品単位で共通');
+
+  // 販売なし / データ異常 (フラグがあっても risk 軸は純粋)
+  const nd = item('sr-nodemand-item');
+  ok(nd && nd.risk === 'no_demand', 'P17: 日販0 → no_demand');
+  const sup2 = r.body.suppliers.find(s => s.code === '2');
+  const unk = sup2 && sup2.items.find(x => x.code === 'not-in-pml-item');
+  ok(unk && unk.risk === 'unknown' && unk.pmlMissing === true, 'P17: PML行なし → unknown (データ異常のみ)', unk && unk.risk);
+  ok(typeof r.body.summary.followup === 'number' && r.body.summary.followup >= 2, 'P17: summaryに督促対象数', r.body.summary);
+
+  // しきい値PATCH: 範囲外/非整数/空は400、正常は200+監査ログ
+  const patchSr = body => j('/api/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  r = await patchSr({ w7: 1.5 });
+  ok(r.status === 400 && r.body.error.includes('w7'), 'P17設定: w7範囲外は400');
+  r = await patchSr({ marginDays: 2.5 });
+  ok(r.status === 400 && r.body.error.includes('整数'), 'P17設定: 非整数は400');
+  r = await patchSr({});
+  ok(r.status === 400, 'P17設定: 空は400');
+  // null/空文字/文字列数値は Number() で通さず型で拒否 (Codex R2 Medium / R3 Low)
+  r = await patchSr({ w7: null });
+  ok(r.status === 400, 'P17設定: null は400');
+  r = await patchSr({ w7: '' });
+  ok(r.status === 400, 'P17設定: 空文字は400');
+  r = await patchSr({ w7: '0.5' });
+  ok(r.status === 400, 'P17設定: 文字列数値は400 (JSON numberのみ)');
+  r = await patchSr({ unansweredDays: 0 });
+  ok(r.status === 200 && r.body.ok && r.body.settings.unansweredDays === 0, 'P17設定: 未回答督促=0日に変更');
+  ok(db.prepare("SELECT COUNT(*) n FROM po_audit_log WHERE action='setting_change' AND resource='setting:shortage_unanswered_days'").get().n >= 1,
+    'P17設定: 変更が監査ログに残る (old/new)');
+  // 未回答督促0日 → 発注直後の未回答にもフラグが立つ (needsFollowup も連動)
+  r = await j('/api/shortage-risk');
+  const und2 = r.body.suppliers.find(s => s.code === '1').items.find(x => x.code === 'sr-undated-item');
+  ok(und2 && und2.flags.unanswered === true && und2.unansweredQty === 60 && und2.needsFollowup === true,
+    'P17: 未回答フラグ (0日設定で即時)', und2 && und2.flags);
+  r = await patchSr({ unansweredDays: 7 });
+  ok(r.status === 200, 'P17設定: 既定に復元');
+  // setSetting 自体の検証 (routerを経由しない書込でも不正値は入らない)
+  {
+    let thr = null;
+    try { db.prepare("INSERT OR REPLACE INTO po_settings (key, value, effective_at) VALUES ('shortage_horizon_days','14.5',datetime('now'))").run(); } catch (e) { thr = e.message; }
+    // DB直書きは防げない (アプリ層検証) が、読込側が既定値へフォールバックする
+    r = await j('/api/shortage-risk');
+    ok(r.body.settings.horizonDays === 90, 'P17設定: 不正保存値 (14.5) は読込時に既定へフォールバック', r.body.settings.horizonDays);
+    db.prepare("DELETE FROM po_settings WHERE key='shortage_horizon_days'").run();
+  }
+
+  // 画面配信
+  const srHtml = await (await fetch(base + '/shortage-risk')).text();
+  ok(srHtml.includes('欠品リスク') && srHtml.includes('srW7') && srHtml.includes('srSoon') && srHtml.includes('既定値に戻す'),
+    '/shortage-risk しきい値設定UI (5項目+既定に戻す)');
+  ok(srHtml.includes('data-copy') && srHtml.includes('督促リストをコピー') && srHtml.includes('buildCopyText') && srHtml.includes('参考:'),
+    '/shortage-risk 督促コピー (台帳の事実+参考予測の分離文面)');
+  ok(srHtml.includes('#po-') && srHtml.includes('dataBasis'), '/shortage-risk POリンク+データ基準表示');
+  const boHtmlSr = await (await fetch(base + '/backorders')).text();
+  ok(boHtmlSr.includes('HASH_JUMPED') && boHtmlSr.includes('#po-'), '/backorders #po-<id> ハッシュジャンプ対応');
+  const navHtml = await (await fetch(base + '/')).text();
+  ok(navHtml.includes('/apps/purchase-orders/shortage-risk'), 'navに欠品リスクタブ');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
-  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/inbound-plan', '/backorders']) {
+  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/inbound-plan', '/backorders', '/shortage-risk']) {
     const html = await (await fetch(base + p)).text();
     const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
     let err = null;
