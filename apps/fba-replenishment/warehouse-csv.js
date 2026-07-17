@@ -14,7 +14,12 @@ import { parseCsv, decodeCsvBuffer } from './picking-csv.js';
  */
 export function parseWarehouseCsv(buffer) {
   const { text, encoding } = decodeCsvBuffer(buffer);
-  const rows = parseCsv(text).filter(r => r.some(c => c && c.trim() !== ''));
+  let rows;
+  try {
+    rows = parseCsv(text, { strict: true }).filter(r => r.some(c => c && c.trim() !== ''));
+  } catch (e) {
+    return { error: `CSVの引用符が壊れています (${e.message})。ファイルを確認してください` };
+  }
   if (rows.length < 2) return { error: 'CSVが空です (ヘッダ+データ行が必要)' };
 
   const headers = rows[0].map(h => h.trim());
@@ -29,11 +34,24 @@ export function parseWarehouseCsv(buffer) {
       `ロジザードの在庫CSVか、文字コードが正しいか確認してください (判定: ${encoding})` };
   }
 
-  // 数値セル: "1,234" のカンマ区切りを許容し、整数以外は不正行扱い
+  // 数値セル: "1,234" のカンマ区切りのみ許容 (指数表記・16進等のJS Number構文は不可)、整数以外は不正行扱い
   const toInt = (s) => {
     if (s === '' || s == null) return null;
-    const n = Number(String(s).replace(/,/g, '').trim());
-    return Number.isInteger(n) ? n : NaN;
+    const t = String(s).replace(/,/g, '').trim();
+    if (!/^-?\d+$/.test(t)) return NaN;
+    const n = Number(t);
+    return Number.isSafeInteger(n) ? n : NaN;
+  };
+
+  // 有効期限の表記ゆれを正規化 (YYYYMMDD / YYYY/M/D → YYYY-MM-DD)。
+  // 期限制限は文字列一致+辞書順比較のため、形式を揃えないと同一期限の合算と最短期限選択が誤る
+  const normalizeExpiry = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return '';
+    if (/^\d{8}$/.test(t)) return `${t.slice(0,4)}-${t.slice(4,6)}-${t.slice(6,8)}`;
+    const m = t.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/);
+    if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+    return t; // 未知形式はそのまま (同一ファイル内で一貫していれば合算は成立)
   };
 
   const items = [];
@@ -75,7 +93,7 @@ export function parseWarehouseCsv(buffer) {
       quantity: qty,
       reserved: reserved,
       available_qty: qty - reserved,
-      expiry_date: obj['有効期限'] || '',
+      expiry_date: normalizeExpiry(obj['有効期限']),
       lot_no: obj['ロット'] || '',
       barcode: obj['バーコード'] || '',
       is_y_location: (block === 'YYY' || location.toUpperCase().startsWith('Y')) ? 1 : 0,
@@ -90,9 +108,9 @@ export function parseWarehouseCsv(buffer) {
     return { error: `有効な行が0件です (不正行${invalidRows.length}件)。ファイル内容を確認してください` };
   }
   const total = items.length + invalidRows.length;
-  if (invalidRows.length / total > 0.1) {
+  if (invalidRows.length / total > 0.1 || invalidRows.length > 50) {
     const samples = invalidRows.slice(0, 5).map(r => `${r.line}行目: ${r.reason}`).join(' / ');
-    return { error: `不正行が${invalidRows.length}/${total}件 (10%超) のため中止しました。例: ${samples}` };
+    return { error: `不正行が${invalidRows.length}/${total}件 (10%超または50件超) のため中止しました。例: ${samples}` };
   }
   return { items, invalidRows };
 }

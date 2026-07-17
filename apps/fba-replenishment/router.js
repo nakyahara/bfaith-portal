@@ -103,7 +103,8 @@ async function callMiniPC(path, { method = 'GET', body, timeout = 60000, retry }
 }
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+// メモリ保持のため上限必須 (デコード候補生成でバッファの数倍を消費する)。実CSVは数MB程度
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 // DB初期化
 let dbReady = false;
@@ -341,15 +342,20 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
     if (parsed.error) return res.status(400).json({ error: parsed.error });
     const { items, invalidRows } = parsed;
 
-    // 商品数急減ガード: ユニーク商品ID数が前回の半分未満なら誤ファイル疑いで確認を要求 (force=1で強行)
+    // 商品数急減ガード: ユニーク商品ID数が前回の半分未満なら誤ファイル疑いで確認を要求。
+    // 強行 (force=1) は「確認した時点のprevUnique」の一致を要求し、確認〜再送の間に
+    // 別のアップロードでDBが変わっていた場合は再度409にする (古い確認での上書き競合を防止)
     const prevUnique = getWarehouseUniqueProductCount();
     const newUnique = new Set(items.map(i => i.logizard_code.trim().toLowerCase())).size;
-    if (prevUnique >= 20 && newUnique < prevUnique * 0.5 && req.body?.force !== '1') {
-      return res.status(409).json({
-        needs_confirm: true,
-        prevUnique, newUnique,
-        error: `登録商品数が前回${prevUnique}商品 → 今回${newUnique}商品に急減しています。誤ったファイルの可能性があります`,
-      });
+    if (prevUnique >= 20 && newUnique < prevUnique * 0.5) {
+      const forced = req.body?.force === '1' && Number(req.body?.force_prev_unique) === prevUnique;
+      if (!forced) {
+        return res.status(409).json({
+          needs_confirm: true,
+          prevUnique, newUnique,
+          error: `登録商品数が前回${prevUnique}商品 → 今回${newUnique}商品に急減しています。誤ったファイルの可能性があります`,
+        });
+      }
     }
 
     const count = replaceWarehouseInventory(items);
@@ -1713,5 +1719,13 @@ router.get('/picking-prep/print/:id', (req, res) => {
 function safeJsonParse(s, fallback) {
   try { return s ? JSON.parse(s) : fallback; } catch { return fallback; }
 }
+
+// multer のサイズ超過等をJSONで返す (既定だとHTMLエラーページになりフロントのd.errorが拾えない)
+router.use((err, req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'ファイルが大きすぎます (上限20MB)。正しいCSVか確認してください' });
+  }
+  next(err);
+});
 
 export default router;

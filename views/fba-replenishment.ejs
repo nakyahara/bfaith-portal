@@ -901,18 +901,21 @@
       log(`CSVアップロード中: ${file.name}`);
 
       try {
-        const doUpload = async (force) => {
+        const doUpload = async (forcePrevUnique) => {
           const form = new FormData();
           form.append('csv', file);
-          if (force) form.append('force', '1');
+          if (forcePrevUnique != null) {
+            form.append('force', '1');
+            form.append('force_prev_unique', String(forcePrevUnique)); // 確認時点の値。サーバ側で再検証される
+          }
           const res = await fetch(`${BASE}/api/warehouse/upload`, { method: 'POST', body: form });
           return res.json();
         };
-        let d = await doUpload(false);
-        if (d.needs_confirm) {
+        let d = await doUpload(null);
+        while (d.needs_confirm) {
           const ok = confirm(`⚠️ ${d.error}\n\n本当にこのファイルで倉庫在庫を上書きしますか？\n（キャンセルすると既存データは変更されません）`);
           if (!ok) { log('キャンセルしました (倉庫在庫は変更されていません)'); input.value = ''; return; }
-          d = await doUpload(true);
+          d = await doUpload(d.prevUnique);
         }
         if (d.error) { log('エラー: ' + d.error); return; }
         const s = d.summary || {};
@@ -1018,7 +1021,7 @@
           + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.unmapped_skus || [], 200)}</div></details>`);
       }
       if (dq.invalid_mapping_count > 0) {
-        parts.push(`・【重要】<b>マッピング不正 (セット構成パース不能): ${dq.invalid_mapping_count}件</b> — セット計算が単品扱いになっています`
+        parts.push(`・【重要】<b>マッピング不正 (セット構成が不正): ${dq.invalid_mapping_count}件</b> — 誤数量防止のため該当SKUの推奨を停止中。スプシのセット構成を修正してください`
           + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.invalid_mappings || [], 50)}</div></details>`);
       }
       if (dq.planning_missing_count > 0) {
@@ -2636,9 +2639,7 @@ Step10: アラート判定
 
         let warehouseQty = 0;
         let yQty = 0;
-        const comps = mapping.set_components
-          ? (typeof mapping.set_components === 'string' ? JSON.parse(mapping.set_components) : mapping.set_components)
-          : null;
+        const comps = normalizeComponents(mapping.set_components); // 不正JSON 1件でタブ全体が止まらないよう隔離
 
         if (comps && comps.length > 0) {
           let minSets = Infinity;
@@ -2858,15 +2859,9 @@ Step10: アラート判定
       let addedCount = 0;
       let alreadyCount = 0;
       for (const sku of newCheckedSkus) {
-        // 既に納品推奨にあるか確認
+        // 既に納品推奨にあるか確認 (isInShipment と同じ基準)
         const existing = recData.find(r => r.amazon_sku === sku);
-        const existsInManual = manualItems.find(m => m.amazon_sku === sku);
-
-        if (existing && existing.recommended_qty > 0) {
-          alreadyCount++;
-          continue;
-        }
-        if (existsInManual) {
+        if (isInShipment(existing) || manualItems.find(m => m.amazon_sku === sku)) {
           alreadyCount++;
           continue;
         }
@@ -2875,8 +2870,6 @@ Step10: アラート判定
         const newProd = newProductData.find(r => r.amazon_sku === sku);
 
         if (existing) {
-          existing.recommended_qty = 0;
-          existing.adjusted_qty = 0;
           existing._manual = true;
           existing._fromNewProduct = true;
           addedCount++;

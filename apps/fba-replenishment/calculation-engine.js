@@ -89,15 +89,24 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
     if (!mapping) { unmappedSkus.push(sku); continue; } // マッピングがないSKUはスキップ (meta で警告)
 
-    // --- set_components をSKU単位で安全にパース (不正JSON 1件で全SKUの生成が止まらないよう隔離) ---
+    // --- set_components をSKU単位で安全にパース+構造検証 (不正1件で全SKUの生成が止まらないよう隔離) ---
+    // 不正な場合は「単品扱いで計算続行」ではなく当該SKUの推奨を停止する (誤った数量提示より安全側)
     let components = null;
+    let invalidMapping = false;
     if (mapping.set_components) {
       try {
         components = typeof mapping.set_components === 'string'
           ? JSON.parse(mapping.set_components) : mapping.set_components;
         if (!Array.isArray(components)) throw new Error('配列ではありません');
+        for (const c of components) {
+          if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim()) throw new Error('構成品のne_codeが不正');
+          const q = Number(c.qty ?? 1);
+          if (!Number.isSafeInteger(q) || q < 1) throw new Error(`構成品qtyが不正 (${c.qty})`);
+          c.qty = q; // "2" 等の文字列数値を正規化
+        }
       } catch (e) {
         components = null;
+        invalidMapping = true;
         invalidMappingSkus.push({ sku, reason: `set_componentsが不正: ${e.message}` });
       }
     }
@@ -220,7 +229,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     // --- 送れる数 ---
     // stockState が revivable_long_oos / dead_candidate の SKU は推奨数ゼロ固定 (FBA欠品タブで別扱い)
     let recommendedQty;
-    if (stockState === 'revivable_long_oos' || stockState === 'dead_candidate') {
+    if (invalidMapping) {
+      recommendedQty = 0; // セット構成不正: 単品扱いの誤数量を出さず推奨停止 (マスタ修正を促す)
+    } else if (stockState === 'revivable_long_oos' || stockState === 'dead_candidate') {
       recommendedQty = 0;
     } else {
       recommendedQty = Math.min(boundedNeeded, warehouseAvailable);
@@ -357,6 +368,10 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
 
+    if (invalidMapping) {
+      alerts.push({ type: 'invalid_mapping', level: 3, message: 'セット構成(set_components)が不正のため推奨停止 (スプシ修正要)' });
+    }
+
     // 期限管理SKUに期限なしロケの在庫がある場合はデータ不備警告（FBA同梱不可のため送れない）
     if (undatedLocQty > 0) {
       alerts.push({
@@ -384,7 +399,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}${hasExpiryManagement && !skippedByMinDays && dailySales > 0 && rawRecommendedQty > 0 && rawRecommendedQty / dailySales < minShipmentDays ? ` (${(rawRecommendedQty / dailySales).toFixed(1)}日分 < ${minShipmentDays}日だが期限管理商品のためフィルター無効)` : ''}`,
-        `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限在庫' + expirySameQty + '個 → 推奨数を' + expirySameQty + '個に制限' : '制限なし(期限データなし or 同一期限)'}`,
+        `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限で送れるのは' + expirySameQty + '個(セット品はセット数) → 推奨数を' + expirySameQty + 'に制限' : '制限なし(期限データなし or 同一期限)'}`,
         `[Step8] 補正: ${expiryLimited ? 'スキップ(有効期限制限済み → ' + adjustedQty + '個をそのまま送る)' : rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
         `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
@@ -398,6 +413,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       ne_code: mapping.ne_code || '',
       is_set: mapping.is_set ? true : false,
       set_components: components || null,
+      invalid_mapping: invalidMapping,
 
       // SKU状態分類 (タブ振り分け用)
       stock_state: stockState,

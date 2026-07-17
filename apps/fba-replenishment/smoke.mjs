@@ -76,6 +76,27 @@ console.log('--- P0-1: 倉庫CSVパース+検証 ---');
   const r = parseWarehouseCsv(Buffer.from(csv, 'utf8'));
   assert(!r.error && r.items?.[0]?.quantity === 1234, 'カンマ区切り数値を1234として取込', r.error);
 }
+{
+  // JS Number構文 (指数・16進) は不正行扱い
+  const rows = ['商品ID,商品名,在庫数'];
+  for (let i = 0; i < 20; i++) rows.push(`ok${i},正常,10`);
+  rows.push('bad1,指数,1e6');
+  const r = parseWarehouseCsv(Buffer.from(rows.join('\n'), 'utf8'));
+  assert(!r.error && r.items?.length === 20 && r.invalidRows?.length === 1, '指数表記1e6は不正行扱い', r.error);
+}
+{
+  // 閉じない引用符 → 全体エラー
+  const csv = '商品ID,商品名,在庫数\nabc4,"壊れた引用符,10\nabc5,次の行,20\n';
+  const r = parseWarehouseCsv(Buffer.from(csv, 'utf8'));
+  assert(!!r.error, '閉じない引用符は全体エラーで中止');
+}
+{
+  // 有効期限の表記ゆれ正規化
+  const csv = '商品ID,商品名,在庫数,有効期限\na1,商品,10,20270101\na2,商品,10,2027/1/1\na3,商品,10,2027-01-01\n';
+  const r = parseWarehouseCsv(Buffer.from(csv, 'utf8'));
+  const exps = (r.items || []).map(i => i.expiry_date);
+  assert(exps.every(e => e === '2027-01-01'), `有効期限をYYYY-MM-DDに正規化 (実際${JSON.stringify(exps)})`);
+}
 
 // ===== P0-2/P0-3: 計算エンジン =====
 console.log('--- P0-2/P0-3: セット品期限換算 + data_quality ---');
@@ -89,12 +110,15 @@ db.upsertSkuMappings([
   { amazon_sku: 'plain-b', product_name: '単品B', ne_code: 'plainb', logizard_code: 'plainb' },
   // set_components が不正JSON (文字列を渡すと '"...ではない..."' が保存され配列にならない)
   { amazon_sku: 'BROKEN-C', product_name: '構成不正', ne_code: 'brokenc', logizard_code: 'brokenc', set_components: 'this is not an array' },
+  // 構成品qtyが負数 → 構造検証で推奨停止
+  { amazon_sku: 'NEGQTY-D', product_name: 'qty不正', ne_code: 'comp1', logizard_code: 'comp1', is_set: true, set_components: [{ ne_code: 'comp1', qty: -2 }] },
 ]);
 
 db.saveRestockLatest([
   { amazon_sku: 'SET-A', product_name: '2+1セット', fba_available: 0, units_sold_30d: 60, amazon_recommended_qty: null },
   { amazon_sku: 'plain-b', product_name: '単品B', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null },
   { amazon_sku: 'BROKEN-C', product_name: '構成不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
+  { amazon_sku: 'NEGQTY-D', product_name: 'qty不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
   { amazon_sku: 'UNMAPPED-SKU', product_name: '未マッピング', fba_available: 0, units_sold_30d: 10, amazon_recommended_qty: null },
 ]);
 
@@ -111,8 +135,16 @@ db.replaceWarehouseInventory([
 const { generateRecommendations } = await import('./calculation-engine.js');
 const result = generateRecommendations(false, null);
 
-assert(Array.isArray(result.items) && result.items.length === 3,
+assert(Array.isArray(result.items) && result.items.length === 4,
   `不正set_componentsがあっても全SKU生成が止まらない (items=${result.items?.length})`);
+
+// 構成不正SKUは推奨停止 (単品扱いの誤数量を出さない)
+for (const sku of ['BROKEN-C', 'NEGQTY-D']) {
+  const item = result.items.find(i => i.amazon_sku === sku);
+  assert(item?.invalid_mapping === true && item?.recommended_qty === 0,
+    `${sku}: 構成不正は推奨停止 (invalid_mapping=${item?.invalid_mapping}, rec=${item?.recommended_qty})`);
+  assert((item?.alerts || []).some(a => a.type === 'invalid_mapping'), `${sku}: 推奨停止アラートが付く`);
+}
 
 const setA = result.items.find(i => i.amazon_sku === 'SET-A');
 assert(!!setA, 'SET-A が生成される');
@@ -138,9 +170,9 @@ for (const i of result.items) {
 const dq = result.data_quality;
 assert(dq?.unmapped_count === 1 && dq?.unmapped_skus?.[0] === 'UNMAPPED-SKU',
   `未マッピングSKUがmetaで返る (実際${JSON.stringify(dq?.unmapped_skus)})`);
-assert(dq?.invalid_mapping_count === 1 && dq?.invalid_mappings?.[0]?.sku === 'BROKEN-C',
+assert(dq?.invalid_mapping_count === 2 && dq?.invalid_mappings?.some(m => m.sku === 'BROKEN-C') && dq?.invalid_mappings?.some(m => m.sku === 'NEGQTY-D'),
   `set_components不正がmetaで返る (実際${JSON.stringify(dq?.invalid_mappings)})`);
-assert(dq?.planning_missing_count === 4, `PLANNING欠落件数 (期待4, 実際${dq?.planning_missing_count})`);
+assert(dq?.planning_missing_count === 5, `PLANNING欠落件数 (期待5, 実際${dq?.planning_missing_count})`);
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail > 0 ? 1 : 0;
