@@ -197,6 +197,7 @@
     <div class="section" id="recSection" style="display:none;">
       <!-- 健全性バナー (準備中データ欠損 / 前回と一律 などを警告) -->
       <div id="healthBanner" style="display:none;margin-bottom:10px;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.6;"></div>
+      <div id="dqBanner" style="display:none;margin-bottom:10px;padding:10px 14px;border-radius:6px;font-size:13px;line-height:1.6;"></div>
       <!-- タブ切り替え -->
       <div style="display:flex;gap:0;margin-bottom:0;">
         <button class="tab-btn active" id="tabShip" onclick="switchTab('ship')">納品推奨</button>
@@ -325,7 +326,7 @@
             <div class="value" id="stockoutAlreadyCount" style="color:#d97706;font-size:20px;">-</div>
           </div>
           <div class="stat" style="border-left:4px solid #7c3aed; background:#f5f3ff;">
-            <div class="label">FBA欠品 表示中</div>
+            <div class="label">FBA欠品 全件</div>
             <div class="value" id="stockoutTotalCount" style="color:#7c3aed;font-size:20px;">-</div>
             <div style="font-size:10px;color:#888;">※在庫なしは「発注推奨(在庫0)」タブへ</div>
           </div>
@@ -347,12 +348,12 @@
 
         <div style="margin-bottom:8px; display:flex; gap:16px; align-items:center; flex-wrap:wrap; padding:6px 10px; background:#f9fafb; border-radius:6px;">
           <span style="font-size:12px; color:#666;">状態絞り込み:</span>
-          <label><input type="radio" name="stockoutStateFilter" value="all" checked onchange="filterStockoutList()"> 全て</label>
-          <label><input type="radio" name="stockoutStateFilter" value="recent" onchange="filterStockoutList()"> 直近欠品のみ (30日販売>0)</label>
-          <label><input type="radio" name="stockoutStateFilter" value="long" onchange="filterStockoutList()"> 長期欠品のみ (Amazon推奨ベース)</label>
-          <label><input type="radio" name="stockoutStateFilter" value="dead" onchange="filterStockoutList()"> 廃番候補</label>
+          <label><input type="radio" name="stockoutStateFilter" value="all" checked onchange="onStockoutStateFilterChange()"> 全て</label>
+          <label><input type="radio" name="stockoutStateFilter" value="recent" onchange="onStockoutStateFilterChange()"> 直近欠品のみ (30日販売>0)</label>
+          <label><input type="radio" name="stockoutStateFilter" value="long" onchange="onStockoutStateFilterChange()"> 長期欠品のみ (Amazon推奨ベース)</label>
+          <label><input type="radio" name="stockoutStateFilter" value="dead" onchange="onStockoutStateFilterChange()"> 廃番候補</label>
           <span style="margin-left:8px; font-size:12px; color:#666;">Amazon推奨数 ≥</span>
-          <input type="number" id="stockoutMinAmazonReco" value="11" min="0" style="width:60px; padding:4px; border:1px solid #d1d5db; border-radius:4px; font-size:13px;" oninput="filterStockoutList()">
+          <input type="number" id="stockoutMinAmazonReco" value="0" min="0" style="width:60px; padding:4px; border:1px solid #d1d5db; border-radius:4px; font-size:13px;" oninput="filterStockoutList()">
         </div>
 
         <div class="table-wrap" style="max-height:calc(100vh - 280px);">
@@ -652,9 +653,21 @@
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
+    // set_components の正規化 (総点検 A-2): /api/sku-mappings はJSON文字列で返すため、
+    // 手動追加・ドラフト復元経路で生文字列のまま格納すると comps.map がTypeErrorになり表全体が固まる。
+    // 格納時は必ずこれを通し、表示側 (renderComponentCell) にも防御ガードを置く。
+    function normalizeComponents(v) {
+      if (!v) return null;
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string') {
+        try { const a = JSON.parse(v); return Array.isArray(a) ? a : null; } catch { return null; }
+      }
+      return null;
+    }
+
     // 構成列のHTML生成
     function renderComponentCell(r) {
-      const comps = r.set_components;
+      const comps = normalizeComponents(r.set_components);
       if (!comps || comps.length === 0) {
         // componentsなし → NE商品コードだけ表示
         return `<td class="comp-cell">${r.ne_code || '-'}</td>`;
@@ -884,16 +897,29 @@
         if (!ok) { input.value = ''; return; }
       }
 
-      const form = new FormData();
-      form.append('csv', input.files[0]);
-      log(`CSVアップロード中: ${input.files[0].name}`);
+      const file = input.files[0];
+      log(`CSVアップロード中: ${file.name}`);
 
       try {
-        const res = await fetch(`${BASE}/api/warehouse/upload`, { method: 'POST', body: form });
-        const d = await res.json();
+        const doUpload = async (force) => {
+          const form = new FormData();
+          form.append('csv', file);
+          if (force) form.append('force', '1');
+          const res = await fetch(`${BASE}/api/warehouse/upload`, { method: 'POST', body: form });
+          return res.json();
+        };
+        let d = await doUpload(false);
+        if (d.needs_confirm) {
+          const ok = confirm(`⚠️ ${d.error}\n\n本当にこのファイルで倉庫在庫を上書きしますか？\n（キャンセルすると既存データは変更されません）`);
+          if (!ok) { log('キャンセルしました (倉庫在庫は変更されていません)'); input.value = ''; return; }
+          d = await doUpload(true);
+        }
         if (d.error) { log('エラー: ' + d.error); return; }
         const s = d.summary || {};
         log(`完了! ${d.count}行取込 / ${s.uniqueProducts || '?'}商品 / 倉庫在庫: ${s.totalQty || '?'}個 / Yロケ(施設): ${s.yLocationProducts || 0}商品 ${s.yLocationQty || 0}個`);
+        if (s.skippedRows > 0) {
+          log(`⚠️ 不正行を${s.skippedRows}件スキップしました: ${(s.skippedSamples || []).join(' / ')}`);
+        }
         completeStep(2);
       } catch (e) { log('エラー: ' + e.message); }
       input.value = '';
@@ -936,6 +962,7 @@
         manualItems = [];
         log(`完了! 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU / 合計${d.recommended_units}個`);
         renderHealthBanner(d.health);
+        renderDataQualityBanner(d.data_quality);
         document.getElementById('recSection').style.display = '';
         updateRecSummary();
         filterRecList();
@@ -969,6 +996,39 @@
         + ' / 推奨SKU ' + health.recommended_sku_count
         + (health.prev_overlap_rate != null ? ' / 前回一致率 ' + (health.prev_overlap_rate * 100).toFixed(0) + '%' : '') + '</div>';
       el.innerHTML = head + '<br>' + lines + meta;
+      el.style.display = '';
+    }
+
+    // データ欠損バナー (総点検 P0-3): 未マッピングSKU等の silent skip を可視化。
+    // ここに出るSKUは納品推奨・FBA欠品のどのタブにも表示されない=納品漏れの最大経路。
+    function renderDataQualityBanner(dq) {
+      const el = document.getElementById('dqBanner');
+      if (!el) return;
+      if (!dq || (!dq.unmapped_count && !dq.invalid_mapping_count && !dq.planning_missing_count)) {
+        el.style.display = 'none'; el.innerHTML = ''; return;
+      }
+      const e = (s) => (typeof esc === 'function' ? esc(String(s)) : String(s));
+      const skuList = (skus, limit) => {
+        const shown = skus.slice(0, limit).map(s => e(typeof s === 'string' ? s : `${s.sku} (${s.reason})`)).join(', ');
+        return shown + (skus.length > limit ? ` …他${skus.length - limit}件` : '');
+      };
+      const parts = [];
+      if (dq.unmapped_count > 0) {
+        parts.push(`・【重要】<b>SKUマッピング未登録: ${dq.unmapped_count}件</b> — このSKUはどのタブにも表示されません (納品漏れの恐れ)。スプシに登録して同期してください`
+          + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.unmapped_skus || [], 200)}</div></details>`);
+      }
+      if (dq.invalid_mapping_count > 0) {
+        parts.push(`・【重要】<b>マッピング不正 (セット構成パース不能): ${dq.invalid_mapping_count}件</b> — セット計算が単品扱いになっています`
+          + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.invalid_mappings || [], 50)}</div></details>`);
+      }
+      if (dq.planning_missing_count > 0) {
+        parts.push(`・【注意】PLANNINGレポート欠落: ${dq.planning_missing_count}件 — 販売数が0扱いになり推奨が過小になる可能性`);
+      }
+      const crit = dq.unmapped_count > 0 || dq.invalid_mapping_count > 0;
+      el.style.background = crit ? '#fdecea' : '#fff8e1';
+      el.style.border = crit ? '1px solid #e57373' : '1px solid #ffd54f';
+      el.style.color = crit ? '#c0392b' : '#8a6d00';
+      el.innerHTML = '📉 <b>データ欠損があります (計算は欠損分を除いて成功)</b><br>' + parts.join('<br>');
       el.style.display = '';
     }
 
@@ -1164,7 +1224,7 @@
           alerts: [],
           is_today: true,
           _manual: true,
-          set_components: mapping?.set_components || null,
+          set_components: normalizeComponents(mapping?.set_components),
         };
         manualItems.push(item);
         msgEl.textContent = mapping
@@ -2033,6 +2093,15 @@ Step10: アラート判定
       } catch(e) { /* ignore */ }
     }
 
+    // 「納品推奨済み」判定の一元化 (総点検 A-1/D-2): recommended_qty>0 だけでなく
+    // 手動追加/FBA欠品からの追加フラグ (_manual/_fromStockout) と manualItems も見る。
+    // ※ この判定の重複が「追加しても送り漏れのまま」の原因だったため、必ずこの関数を使うこと。
+    function isInShipment(item) {
+      if (!item) return false;
+      if (item.recommended_qty > 0 || item._manual || item._fromStockout) return true;
+      return !!manualItems.find(m => m.amazon_sku === item.amazon_sku);
+    }
+
     async function updateStockoutList() {
       // 非表示リストを先に読み込む
       await loadStockoutHidden();
@@ -2046,13 +2115,13 @@ Step10: アラート判定
         // 一度も実FBA在庫/入荷が無いSKUは「新規商品」側で扱う。FBA欠品(=切らした品)には出さない。
         // (everStocked 読込前なら従来挙動を維持して取りこぼさない)
         if (everStockedLoaded && !everStockedSet.has(normCode(r.amazon_sku))) return false;
-        const isAlready = r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku);
+        const isAlready = isInShipment(r);
         const hasWarehouse = (r.warehouse_raw || 0) > 0;
         return isAlready || hasWarehouse;
       }).map(r => {
         // ステータス判定
         let stockout_status, stockout_status_num;
-        if (r.recommended_qty > 0 || manualItems.find(m => m.amazon_sku === r.amazon_sku)) {
+        if (isInShipment(r)) {
           stockout_status = 'already'; // 納品推奨済み
           stockout_status_num = 2;
         } else {
@@ -2063,22 +2132,31 @@ Step10: アラート判定
         return { ...r, stockout_status, stockout_status_num, is_hidden };
       });
 
-      // タブカウント（非表示を除いた数）
+      // タブカウント（非表示を除いた「送り漏れ(未推奨)」件数のみ。推奨済みを含めると減らないバッジになる）
       const visibleData = stockoutData.filter(r => !r.is_hidden);
+      const sendableCount = visibleData.filter(r => r.stockout_status === 'sendable').length;
       const countEl = document.getElementById('stockoutTabCount');
-      if (visibleData.length > 0) {
-        countEl.textContent = visibleData.length;
+      if (sendableCount > 0) {
+        countEl.textContent = sendableCount;
         countEl.style.display = '';
       } else {
         countEl.style.display = 'none';
       }
 
       // サマリー（非表示を除いた数）
-      const sendableCount = visibleData.filter(r => r.stockout_status === 'sendable').length;
       document.getElementById('stockoutTotalCount').textContent = visibleData.length + ' SKU';
       document.getElementById('stockoutSendableCount').textContent = sendableCount + ' SKU';
       document.getElementById('stockoutAlreadyCount').textContent = visibleData.filter(r => r.stockout_status === 'already').length + ' SKU';
 
+      filterStockoutList();
+    }
+
+    // 状態絞り込み変更時: 「長期欠品のみ」はAmazon推奨ベースの分類のため閾値11を初期提案し、
+    // それ以外では0(全件)に戻す。従来は全分類に≥11が常時適用され送り漏れの見逃しに直結していた (総点検 D-1)
+    function onStockoutStateFilterChange() {
+      const stateMode = document.querySelector('input[name="stockoutStateFilter"]:checked')?.value || 'all';
+      const minInput = document.getElementById('stockoutMinAmazonReco');
+      if (minInput) minInput.value = stateMode === 'long' ? '11' : '0';
       filterStockoutList();
     }
 
@@ -2117,7 +2195,11 @@ Step10: アラート判定
         );
       }
       renderStockoutList(filtered);
-      document.getElementById('stockoutFilterCount').textContent = `表示: ${filtered.length} 件`;
+      // 表示件数は常に全件と並記 (フィルタで隠れている件数が分かるように。カード件数=全件との乖離対策)
+      const allCount = stockoutData.filter(r => showHidden || !r.is_hidden).length;
+      const hiddenByFilter = allCount - filtered.length;
+      document.getElementById('stockoutFilterCount').textContent =
+        `表示: ${filtered.length} 件 / 全体: ${allCount} 件` + (hiddenByFilter > 0 ? ` (フィルタで${hiddenByFilter}件 非表示)` : '');
       syncSnapshotSearch(searchQuery);
     }
 
@@ -2479,61 +2561,18 @@ Step10: アラート判定
       let addedCount = 0;
       let alreadyCount = 0;
       for (const sku of stockoutCheckedSkus) {
-        // 既に納品推奨にあるか確認
+        // 既に納品推奨にあるか確認 (isInShipment と同じ基準)
         const existing = recData.find(r => r.amazon_sku === sku);
-        const existsInManual = manualItems.find(m => m.amazon_sku === sku);
-
-        if (existing && existing.recommended_qty > 0) {
+        if (isInShipment(existing) || manualItems.find(m => m.amazon_sku === sku)) {
           alreadyCount++;
           continue;
         }
-        if (existsInManual) {
-          alreadyCount++;
-          continue;
-        }
-
-        if (existing) {
-          // recDataに存在するが推奨数0 → 推奨数0のまま手動追加扱いにする
-          existing.recommended_qty = 0;
-          existing.adjusted_qty = 0;
-          existing._manual = true;
-          existing._fromStockout = true;
-          addedCount++;
-        } else {
-          // recDataにない場合 — stockoutDataから商品情報を取得
-          const soItem = stockoutData.find(s => s.amazon_sku === sku);
-          const snap = snapshotData.find(s => s.amazon_sku === sku);
-          const item = {
-            amazon_sku: sku,
-            asin: soItem?.asin || snap?.asin || '',
-            product_name: soItem?.product_name || snap?.product_name || '(FBA欠品から追加)',
-            ne_code: soItem?.ne_code || '',
-            fnsku: soItem?.fnsku || '',
-            fba_available: soItem?.fba_available ?? 0,
-            fba_inbound_working: soItem?.fba_inbound_working ?? 0,
-            fba_inbound_working_source: soItem?.fba_inbound_working_source || '',
-            effective_fba_stock: soItem?.effective_fba_stock ?? 0,
-            days_of_supply: soItem?.days_of_supply ?? 0,
-            reorder_point: soItem?.reorder_point ?? '-',
-            raw_needed: soItem?.raw_needed ?? '-',
-            target_days: soItem?.target_days ?? '-',
-            units_sold_7d: soItem?.units_sold_7d ?? 0,
-            units_sold_30d: soItem?.units_sold_30d ?? 0,
-            non_fba_sales_7d: soItem?.non_fba_sales_7d ?? 0,
-            non_fba_sales_30d: soItem?.non_fba_sales_30d ?? 0,
-            warehouse_raw: soItem?.warehouse_raw ?? 0,
-            warehouse_available: soItem?.warehouse_available ?? 0,
-            recommended_qty: 0,
-            adjusted_qty: 0,
-            urgency_score: soItem?.urgency_score ?? 0,
-            alerts: soItem?.alerts || [],
-            set_components: soItem?.set_components || null,
-            _manual: true,
-            _fromStockout: true,
-          };
-          manualItems.push(item);
-          addedCount++;
-        }
+        // stockoutData は recData のサブセットなので existing は必ず見つかる (見つからなければスキップ)
+        if (!existing) continue;
+        // 推奨数0のまま手動追加扱いにする (数量は納品推奨タブで入力)
+        existing._manual = true;
+        existing._fromStockout = true;
+        addedCount++;
       }
 
       // チェックをクリア
@@ -2848,7 +2887,7 @@ Step10: アラート判定
             product_name: newProd?.product_name || '(新規商品から追加)',
             ne_code: newProd?.ne_code || '',
             fnsku: newProd?.fnsku || '',
-            set_components: newProd?.set_components || null,
+            set_components: normalizeComponents(newProd?.set_components),
             is_set: newProd?.is_set || false,
             fba_available: newProd?.fba_available ?? '-',
             fba_inbound_working: newProd?.fba_inbound_working ?? 0,
@@ -3474,6 +3513,7 @@ Step10: アラート判定
         recData = d.items || [];
         recMeta = d;
         manualItems = [];
+        renderDataQualityBanner(d.data_quality);
       } catch(e) { log('エラー: ' + e.message); return; }
 
       // ドラフトを読み込み
@@ -3517,7 +3557,7 @@ Step10: アラート判定
               product_name: mapping?.product_name || snap?.product_name || '(ドラフトから復元)',
               ne_code: mapping?.ne_code || '',
               fnsku: mapping?.fnsku || '',
-              set_components: mapping?.set_components || null,
+              set_components: normalizeComponents(mapping?.set_components),
               is_set: mapping?.is_set ? true : false,
               fba_available: snap?.fba_available ?? '-',
               fba_inbound_working: snap?.fba_inbound_working ?? 0,
@@ -4070,6 +4110,7 @@ Step10: アラート判定
               recData = d.items || [];
               recMeta = d;
               manualItems = [];
+              renderDataQualityBanner(d.data_quality);
               log(`自動生成完了: 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU`);
               document.getElementById('recSection').style.display = '';
               updateRecSummary();
