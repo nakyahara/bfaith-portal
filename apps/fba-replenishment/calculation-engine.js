@@ -43,8 +43,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   // 部分成功の可視化 (総点検 P0-3): silent skip をやめて meta で件数+SKU一覧を返す
   // 未マッピングSKU (restock にあるが sku_mapping 不在)。大半はバリエーション登録専用など
   // 意図的に使っていないSKUなので、稼働実績で2つに分ける:
-  //   active   = 販売実績/FBA在庫/入荷中のいずれかあり → マッピング漏れ=本物の納品漏れ候補 (要対応)
-  //   inactive = 実績ゼロ → 未使用SKUとみなし静かに件数だけ出す (警告にしない)
+  //   active   = 販売/FBA在庫/入荷中/Amazon推奨/他CH販売 のいずれかあり → マッピング漏れ=納品漏れ候補 (要対応・警告)
+  //   inactive = 全シグナルが実績なし → 推奨対象外。件数と一覧は静かに出すが警告にはしない
+  // ※ inactive は「未使用SKU」と断定はできない (レポート欠損でも0になる) ため、表示は事実のみに留める
   const unmappedActive = [];
   const unmappedInactive = [];
   const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
@@ -90,9 +91,15 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
   // 準備中数量 (Inbound API) を norm キー化 (総点検 B-4)。exact-case 参照だと case 差で override が落ち、
   // 2026-06-30型「準備中欠損→二重推奨」が再発する。未マッピング判定でも同じ値を使う。
+  // 正規化で衝突した場合 (ABC と abc が両方ある等) は後勝ちにせず最大値を採用する
+  // (小さい方を採ると準備中を過小評価し、二重推奨に戻るため)。
   const inboundWorkingNormMap = {};
   if (inboundWorkingOverride) {
-    for (const k of Object.keys(inboundWorkingOverride)) inboundWorkingNormMap[normCode(k)] = inboundWorkingOverride[k];
+    for (const k of Object.keys(inboundWorkingOverride)) {
+      const nk = normCode(k);
+      const v = Number(inboundWorkingOverride[k]) || 0; // null/非数は0扱い (入力契約は数値)
+      inboundWorkingNormMap[nk] = nk in inboundWorkingNormMap ? Math.max(inboundWorkingNormMap[nk], v) : v;
+    }
   }
   const lookupInboundWorking = (sku) => inboundWorkingNormMap[normCode(sku)];
 

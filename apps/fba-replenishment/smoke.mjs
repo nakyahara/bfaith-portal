@@ -151,8 +151,10 @@ db.replaceWarehouseInventory([
 ]);
 
 const { generateRecommendations } = await import('./calculation-engine.js');
-// inboundWorkingOverride = Inbound API のリアルタイム準備中。キーはあえて大文字違いにして norm 参照を検証 (B-4)
-const result = generateRecommendations(false, { 'unmapped-apiwork': 7 });
+// inboundWorkingOverride = Inbound API のリアルタイム準備中。B-4検証のためキーの case をあえて崩す:
+//  - 'unmapped-apiwork' : 未マッピング判定側の case 差
+//  - 'PLAIN-B' / 'plain-b' : 本体推奨計算の case 差 + 正規化衝突 (最大値=12が採用されるべき)
+const result = generateRecommendations(false, { 'unmapped-apiwork': 7, 'PLAIN-B': 12, 'plain-b': 0 });
 
 assert(Array.isArray(result.items) && result.items.length === 4,
   `不正set_componentsがあっても全SKU生成が止まらない (items=${result.items?.length})`);
@@ -177,8 +179,10 @@ if (setA) {
 }
 
 const plainB = result.items.find(i => i.amazon_sku === 'plain-b');
-assert(plainB?.recommended_qty === 30 && plainB?.adjusted_qty === 30,
-  `単品の推奨は従来どおり (期待30/30, 実際${plainB?.recommended_qty}/${plainB?.adjusted_qty})`);
+// B-4: 本体の推奨計算でも override を case 非依存で参照し、正規化衝突は最大値を採用 (過小評価=二重推奨を防ぐ)
+assert(plainB?.fba_inbound_working === 12 && plainB?.fba_inbound_working_source === 'API',
+  `本体計算もoverrideをcase非依存+衝突は最大値で参照 (期待12/API, 実際${plainB?.fba_inbound_working}/${plainB?.fba_inbound_working_source})`);
+assert(plainB?.effective_fba_stock === 12, `準備中が実質FBA在庫に乗る (期待12, 実際${plainB?.effective_fba_stock})`);
 
 for (const i of result.items) {
   if (typeof i.adjusted_qty === 'number' && typeof i.warehouse_available === 'number') {

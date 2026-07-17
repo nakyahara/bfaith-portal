@@ -1052,7 +1052,8 @@
       if (quietEl) {
         const quiet = [];
         if (dq?.unmapped_inactive_count > 0) {
-          quiet.push(`計算対象外: SKUマッピング未登録 ${dq.unmapped_inactive_count}件 (販売・在庫とも0 = バリエーション登録専用等とみなし推奨対象外)`
+          // 「未使用SKU」と断定しない: 実績が全て0なのはデータ欠損の可能性もあるため、事実だけ書く
+          quiet.push(`計算対象外: SKUマッピング未登録 ${dq.unmapped_inactive_count}件 (販売・在庫・入荷・Amazon推奨・他CH販売すべて実績なし → 推奨対象外)`
             + details('SKU一覧', skuList(dq.unmapped_inactive_skus || [], 300)));
         }
         if (dq?.planning_missing_count > 0) {
