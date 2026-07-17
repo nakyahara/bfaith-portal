@@ -178,6 +178,15 @@ async function main() {
       if (!orderInfo[f]) fail(`orderInfo ${oid}: ${f} が空 (5/8-10 同型 regression の疑い)`);
     }
 
+    // キャンセル注文 (OrderStatus=4) は Yahoo 側で Quantity が 0 にゼロ化されるため verify 対象外
+    // (2026-07-17 実測: b-faith01-10280090 で Quantity=0/UnitPrice=898。regression ではなく実データ)
+    const orderStatus = (orderInfo.OrderStatus && typeof orderInfo.OrderStatus === 'object')
+      ? orderInfo.OrderStatus._ : orderInfo.OrderStatus;
+    if (String(orderStatus) === '4') {
+      console.log(`[smoke-yahoo-proxy] ⚠️  ${oid} はキャンセル注文 (OrderStatus=4) のため verify をスキップ`);
+      continue;
+    }
+
     // 明細
     let items = orderInfo.Item || orderInfo.Items?.Item || [];
     if (!Array.isArray(items)) items = [items];
