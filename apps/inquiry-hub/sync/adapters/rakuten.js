@@ -108,6 +108,23 @@ export function mapInquiry(row, expectedShopId = null) {
 }
 
 /**
+ * env から transport 設定を解決する (ランナー/cron 共用)。
+ * 楽天キーがあれば direct、なければ miniPC passthrough (warehouse)、どちらも無ければ null。
+ */
+export function resolveRakutenTransportFromEnv(env = process.env) {
+  if (env.RAKUTEN_SERVICE_SECRET && env.RAKUTEN_LICENSE_KEY) {
+    return { transport: 'direct', serviceSecret: env.RAKUTEN_SERVICE_SECRET, licenseKey: env.RAKUTEN_LICENSE_KEY };
+  }
+  if (env.WAREHOUSE_URL && env.WAREHOUSE_SERVICE_TOKEN && env.CF_ACCESS_CLIENT_ID && env.CF_ACCESS_CLIENT_SECRET) {
+    return {
+      transport: 'warehouse', warehouseUrl: env.WAREHOUSE_URL, serviceToken: env.WAREHOUSE_SERVICE_TOKEN,
+      cfClientId: env.CF_ACCESS_CLIENT_ID, cfClientSecret: env.CF_ACCESS_CLIENT_SECRET,
+    };
+  }
+  return null;
+}
+
+/**
  * @param {object} cfg
  *   transport?: 'direct' (既定) | 'warehouse'
  *     direct    — RMS を直接叩く。serviceSecret / licenseKey 必須 (miniPC上での実行・契約テスト用)

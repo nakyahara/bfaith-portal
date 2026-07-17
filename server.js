@@ -22,6 +22,7 @@ import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
+import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -1346,6 +1347,9 @@ app.listen(PORT, () => {
 
   // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
   startRysCron();
+
+  // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
+  startInquiryHubSyncCron();
 });
 
 process.on('SIGTERM', () => {
