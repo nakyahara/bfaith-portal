@@ -148,9 +148,36 @@ async function passNotice(page) {
   }
 }
 
+// ─── ログイン回数の上限 (1プロセスあたり) ───
+// 2026-07-17 実障害: 楽天側の利用規制でログイン直後にセッションが失効し続け、
+// セクションごとの ensureRmsLogin が1回の実行で11回ログイン (= 規制を悪化させる燃料)。
+// 正常時はセッションが持続するので1回で足りる。上限超過は「ログインしても維持できない
+// 状態」であり、以降は再ログインせず即エラーにする (手動DLフォールバックへ)。
+// env は厳格に検証: 不正値 (NaN/0以下) で上限が無効化されると連打防止が破られる (Codex R1)
+const MAX_LOGINS_PER_RUN = (() => {
+  const raw = process.env.RMS_MAX_LOGINS_PER_RUN;
+  if (raw === undefined || raw === '') return 3;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 20) {
+    console.warn(`[login] RMS_MAX_LOGINS_PER_RUN=${raw} は不正 (1〜20の整数) → 既定3を使用`);
+    return 3;
+  }
+  return n;
+})();
+let loginCount = 0;
+
+/** 2FA/セッション不安定など「リトライ・再ログインで直らない」認証系エラーか (exit 3 契約用) */
+export function isAuthBlocked(message) {
+  return /^(2FA_REQUIRED|RMS_SESSION_UNSTABLE)/.test(String(message));
+}
+
 /** R-Login → 楽天会員 → RMS のログイン列を実行。2FA要求時は throw。 */
 async function runLogin(page) {
-  console.log('[login] RMSログイン開始');
+  if (loginCount >= MAX_LOGINS_PER_RUN) {
+    throw new Error(`RMS_SESSION_UNSTABLE: ログイン試行が上限${MAX_LOGINS_PER_RUN}回に達した (ログインしてもセッションが維持されない = 楽天側の利用規制/障害の可能性)。ログイン連打を避けるため以降は再ログインせず中止 — 必要分は手動DLで incoming/ へ`);
+  }
+  loginCount++;
+  console.log(`[login] RMSログイン開始 (${loginCount}/${MAX_LOGINS_PER_RUN}回目)`);
   await gotoSafe(page, RMS_LOGIN_URL);
 
   // R-Login (共通ID版=ボタン「楽天会員ログインへ」/旧版=「ログイン」の両対応)
@@ -257,7 +284,9 @@ export async function ensureRmsLogin(page) {
   await settleRedirects(page);
   await passNotice(page);
   if (!(await looksLoggedIn(page))) {
-    throw new Error(`ログイン確認できず: ${page.url()}`);
+    // ログイン手順は完走したのにRMSに入れない = 資格情報エラー/楽天側の利用規制/画面変更の
+    // いずれかで、いずれも自動リトライでは直らない → blocked (exit 3) に分類 (Codex R2 High)
+    throw new Error(`RMS_SESSION_UNSTABLE: ログイン手順は完走したがRMSに入れない: ${page.url()} (資格情報エラー/楽天側の利用規制/画面変更の可能性。自動リトライ対象外 — 手動DLで incoming/ へ)`);
   }
   console.log(`[login] メインメニュー到達(再) host=${safeHost(page.url())}`);
 }
