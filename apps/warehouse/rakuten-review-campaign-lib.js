@@ -258,22 +258,26 @@ export function planCampaigns(db, opts = {}) {
       }
       counts.rescheduled++;
     }
-    // planned クーポンの期限も発送基準に追従 (awaiting_contact で投稿日基準の保守値だった行に
-    // 後から contact が届いたら、規約上限=発送+21日へ付け替える。scheduled_at は検知基準のまま)
+    // planned クーポンの期限も発送基準に追従 (awaiting_contact/awaiting_shipping で投稿日基準の
+    // 保守値だった行に後から発送情報が届いたら、規約上限=発送+21日へ付け替える)。
+    // その際 scheduled_at が過去なら次の12:00 JST へ再設定する (Codex C1-R4 Medium:
+    // 送信可能になったのが正午以降だと過去予定のまま即 ready になり、vendor の
+    // 「日次12時台」意味論とずれる。vendor なら次のバッチ=翌12時台に送る)
     const plannedCoupons = db.prepare(`
-      SELECT a.id, a.expires_at, c.shipping_datetime
+      SELECT a.id, a.scheduled_at, a.expires_at, c.shipping_datetime
         FROM rakuten_campaign_actions a
         JOIN rakuten_order_contacts c ON c.order_number = a.order_number
        WHERE a.action_type = 'coupon' AND a.status = 'planned' AND c.shipping_datetime IS NOT NULL
     `).all();
     const reExpireStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions SET expires_at = ?, updated_at = ?
+      UPDATE rakuten_campaign_actions SET expires_at = ?, scheduled_at = ?, updated_at = ?
        WHERE id = ? AND status = 'planned'
     `);
     for (const a of plannedCoupons) {
       const sched = followScheduleFor(a.shipping_datetime);
       if (sched && sched.expiresAt !== a.expires_at) {
-        reExpireStmt.run(sched.expiresAt, now, a.id);
+        const newScheduledAt = a.scheduled_at <= now ? nextNoonJstAfter(now) : a.scheduled_at;
+        reExpireStmt.run(sched.expiresAt, newScheduledAt, now, a.id);
         counts.rescheduled++;
       }
     }
@@ -303,7 +307,8 @@ export function planCampaigns(db, opts = {}) {
     // NOT EXISTS = epoch判定は注文単位 (Codex C1-R1 High: epoch前レビューがある注文に
     // epoch後の2件目が来ると、vendor付与済み注文へ自作が二重付与する候補を作ってしまう)
     for (const rv of newCoupons) {
-      // 期限は発送基準 (規約の3週間)。contacts が無い注文は投稿日時基準の保守値 (どうせ no_contact で抑止)
+      // 期限は発送基準 (規約の3週間)。contacts が無い注文は投稿日時基準の保守値
+      // (awaiting_contact で待機し、contact 到着時に 2' で発送基準へ付け替わる)
       const base = rv.shipping_datetime
         ? followScheduleFor(rv.shipping_datetime)
         : { expiresAt: (() => {

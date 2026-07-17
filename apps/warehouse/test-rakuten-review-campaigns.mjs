@@ -220,10 +220,13 @@ console.log('=== 5. クーポン: 新規plan ===');
     order_progress: 700,
     contact_delete_at: '2099-01-01T00:00:00.000Z',
   }]);
-  planCampaigns(db, { nowIso: '2026-07-20T02:00:00.000Z' });
+  planCampaigns(db, { nowIso: '2026-07-20T02:00:00.000Z' }); // 11:00 JST
   const aLate = getAction(oNoContact, 'coupon');
-  check('contact到着で ready に昇格 (永久欠落しない — Codex C1-R2 High)', aLate.status === 'ready');
+  check('contact到着: 過去予定は次の12:00 JSTへ再設定 (即readyにしない — Codex C1-R4)',
+    aLate.status === 'planned' && aLate.scheduled_at === '2026-07-20T03:00:00.000Z', `${aLate.status} ${aLate.scheduled_at}`);
   check('期限は発送基準21日に付け替え', aLate.expires_at === '2026-07-31T14:59:59.000Z', aLate.expires_at);
+  planCampaigns(db, { nowIso: '2026-07-20T03:30:00.000Z' }); // 12:30 JST
+  check('再設定後の正午到来で ready (永久欠落しない — Codex C1-R2 High)', getAction(oNoContact, 'coupon').status === 'ready');
 }
 
 console.log('=== 6. クーポン: 引き金レビュー全削除で取消 ===');
@@ -317,11 +320,15 @@ console.log('=== 8b. R3: 発送未確認クーポン / ready後の再発送・�
   check('ready後の再発送で planned に差し戻し+新予定 (7/25正午)', aReship.status === 'planned' && aReship.scheduled_at === '2026-07-25T03:00:00.000Z');
   check('差し戻しで ready_at はクリア (無効になった would-send)', aReship.ready_at === null && aReship.status_reason === 'rescheduled');
 
-  // 発送確認後に昇格+期限付け替え
+  // 発送確認後: 期限付け替え+過去予定は次の正午へ→その正午で昇格
   db.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-07-20T12:00:00+09:00' WHERE order_number = ?`).run(oNoShipCoupon);
-  planCampaigns(db, { nowIso: '2026-07-21T06:00:00.000Z' });
+  planCampaigns(db, { nowIso: '2026-07-21T06:00:00.000Z' }); // 15:00 JST
   const a2 = getAction(oNoShipCoupon, 'coupon');
-  check('発送確認後に ready + 期限=発送基準21日', a2.status === 'ready' && a2.expires_at === '2026-08-10T14:59:59.000Z', `${a2.status} ${a2.expires_at}`);
+  check('発送確認後 (正午以降): 期限=発送基準21日+予定=翌12:00 JSTで即readyにしない',
+    a2.status === 'planned' && a2.scheduled_at === '2026-07-22T03:00:00.000Z' && a2.expires_at === '2026-08-10T14:59:59.000Z',
+    `${a2.status} ${a2.scheduled_at} ${a2.expires_at}`);
+  planCampaigns(db, { nowIso: '2026-07-22T03:30:00.000Z' });
+  check('翌正午到来で ready', getAction(oNoShipCoupon, 'coupon').status === 'ready');
 
   // ready 後の後着レビュー → suppressed (ready_at は突合記録として保持)
   insertReview(db, { orderNumber: oLateReview, firstSeenAt: '2026-07-21T07:00:00.000Z' });
