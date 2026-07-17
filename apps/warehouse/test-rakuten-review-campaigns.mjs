@@ -132,8 +132,12 @@ console.log('=== 3. フォロー: 遷移 (レビュー到来→抑止 / 期限�
   const c2 = planCampaigns(db, { nowIso: '2026-07-18T03:00:00.000Z' }); // 正午JST
   const aDue = getAction(oDue, 'follow');
   check('予定時刻到来で ready + ready_at 記録', aDue.status === 'ready' && aDue.ready_at === '2026-07-18T03:00:00.000Z' && c2.promotedReady === 1);
-  planCampaigns(db, { nowIso: '2026-09-01T00:00:00.000Z' });
-  check('shadow では ready のまま滞留 (claimed/sent に進まない)', getAction(oDue, 'follow').status === 'ready');
+  planCampaigns(db, { nowIso: '2026-07-25T00:00:00.000Z' });
+  check('期限内は ready のまま滞留 (claimed/sent に進まない)', getAction(oDue, 'follow').status === 'ready');
+  planCampaigns(db, { nowIso: '2026-09-01T00:00:00.000Z' }); // 期限 (発送7/8+21日) 超過
+  const aDueLate = getAction(oDue, 'follow');
+  check('ready のまま期限超過で expired(expired_after_ready)', aDueLate.status === 'expired' && aDueLate.status_reason === 'expired_after_ready');
+  check('expired後も ready_at は突合記録として保持', aDueLate.ready_at === '2026-07-18T03:00:00.000Z');
 
   // 期限超過→expired
   const oExp = makeContact({ shippingIso: '2026-07-10T12:00:00+09:00' });
@@ -184,6 +188,10 @@ console.log('=== 5. クーポン: 新規plan ===');
   check('trigger_review_url=最古の投稿 (ショップレビュー7/16)', a.trigger_review_url?.includes('/item/') === false || a.trigger_review_url != null);
   check('expires=発送基準21日', a.expires_at === '2026-07-31T14:59:59.000Z');
   check('epoch前レビューは action を作らない', !getAction(oBackfill, 'coupon'));
+  // epoch判定は注文単位 (Codex C1-R1 High): epoch前レビューがある注文にepoch後の2件目が来ても作らない
+  insertReview(db, { orderNumber: oBackfill, firstSeenAt: '2026-07-17T01:10:00.000Z', reviewType: 'shop' });
+  planCampaigns(db, { nowIso: '2026-07-17T01:20:00.000Z' });
+  check('epoch前レビューのある注文はepoch後の2件目でも作らない (vendor付与済み二重防止)', !getAction(oBackfill, 'coupon'));
   check('contactなしは suppressed(no_contact)', getAction(oNoContact, 'coupon')?.status_reason === 'no_contact');
   check('注文番号なしレビューは対象外', db.prepare(
     `SELECT COUNT(*) n FROM rakuten_campaign_actions WHERE order_number IS NULL OR order_number = ''`).get().n === 0);
@@ -236,7 +244,19 @@ console.log('=== 8. shadow 不変条件・PII・冪等性 ===');
   check('ownership は全件 vendor (shadow)', own.length === 1 && own[0] === 'vendor');
   const ownN = db.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership`).get().n;
   const actionOrders = db.prepare(`SELECT COUNT(DISTINCT order_number) n FROM rakuten_campaign_actions`).get().n;
-  check('action のある注文は全て ownership に記録', ownN === actionOrders, `own=${ownN} actions=${actionOrders}`);
+  check('action のある注文は全て ownership に記録', ownN >= actionOrders, `own=${ownN} actions=${actionOrders}`);
+  check('未発送 (action未作成) の注文も ownership=vendor に記録 (cutover時のself誤判定防止)',
+    db.prepare(`SELECT owner FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(oUnshipped)?.owner === 'vendor');
+
+  // delivery_attempts の action 単位 at-most-once (UNIQUE(action_id))
+  const anyAction = db.prepare(`SELECT id FROM rakuten_campaign_actions LIMIT 1`).get();
+  db.prepare(`INSERT INTO rakuten_campaign_delivery_attempts (action_id, message_id, attempted_at, outcome) VALUES (?, 'm1', '2026-07-20T00:00:00Z', 'accepted')`).run(anyAction.id);
+  let dupAttemptBlocked = false;
+  try {
+    db.prepare(`INSERT INTO rakuten_campaign_delivery_attempts (action_id, message_id, attempted_at, outcome) VALUES (?, 'm2', '2026-07-20T00:01:00Z', 'accepted')`).run(anyAction.id);
+  } catch { dupAttemptBlocked = true; }
+  check('同一actionへの2回目の送信試行はDB制約で拒否 (at-most-once)', dupAttemptBlocked);
+  db.prepare(`DELETE FROM rakuten_campaign_delivery_attempts`).run(); // 後続の「空」チェックのため掃除
 
   const dump = JSON.stringify(db.prepare(`SELECT * FROM rakuten_campaign_actions`).all());
   check('campaign_actions に平文メールが無い', !dump.includes('@anshin.rakuten.co.jp'));

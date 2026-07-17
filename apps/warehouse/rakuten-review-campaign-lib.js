@@ -103,16 +103,25 @@ export function ensureCampaignTables(db) {
     expires_at         TEXT NOT NULL,
     ready_at           TEXT,
     claim_token        TEXT,
+    claimed_at         TEXT,
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
   )`);
+  // PR-C4 の必須不変条件 (Codex C1-R1): ready→claimed は「条件付きUPDATE+変更行数=1確認」の
+  // CAS で行い、claim と同一トランザクションで ①expires_at > now ②contact 未purge・復号可能
+  // ③suppression 未登録 ④coupon は有効レビュー残存 ⑤ownership owner='self' を再評価すること。
+  // ready_at は「観測時刻」であり送信予定時刻ではない (planner は朝実行のため正午予定の action は
+  // 翌朝 ready になる)。PR-C2 の日次突合は scheduled_at の JST 暦日で集計すること
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_status_sched ON rakuten_campaign_actions(status, scheduled_at)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_order ON rakuten_campaign_actions(order_number)`);
 
-  // 送信試行ログ (PR-C4 で書く。message_id UNIQUE = at-most-once の証跡)
+  // 送信試行ログ (PR-C4 で書く)。UNIQUE(action_id) = action単位の at-most-once を
+  // DB制約で強制する (Codex C1-R1 High: message_id UNIQUE だけでは同一actionに別message_idで
+  // 何度でも試行できてしまう)。明確なrejectも自動再送しない=「重複より取りこぼしを選ぶ」。
+  // 再送が本当に必要なときは人が action を cancelled にして新 action を明示的に作る
   db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_delivery_attempts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    action_id    INTEGER NOT NULL REFERENCES rakuten_campaign_actions(id),
+    action_id    INTEGER NOT NULL UNIQUE REFERENCES rakuten_campaign_actions(id),
     message_id   TEXT NOT NULL UNIQUE,
     attempted_at TEXT NOT NULL,
     outcome      TEXT NOT NULL CHECK (outcome IN ('accepted','rejected','ambiguous')),
@@ -245,8 +254,14 @@ export function planCampaigns(db, opts = {}) {
                ON a.order_number = r.order_number AND a.action_type = 'coupon'
        WHERE r.order_number IS NOT NULL AND r.order_number != ''
          AND r.is_deleted = 0 AND r.first_seen_at >= ? AND a.id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM fact_rakuten_reviews old
+            WHERE old.order_number = r.order_number AND old.first_seen_at < ?
+         )
        GROUP BY r.order_number
-    `).all(epoch);
+    `).all(epoch, epoch);
+    // NOT EXISTS = epoch判定は注文単位 (Codex C1-R1 High: epoch前レビューがある注文に
+    // epoch後の2件目が来ると、vendor付与済み注文へ自作が二重付与する候補を作ってしまう)
     for (const rv of newCoupons) {
       // 期限は発送基準 (規約の3週間)。contacts が無い注文は投稿日時基準の保守値 (どうせ no_contact で抑止)
       const base = rv.shipping_datetime
@@ -302,6 +317,15 @@ export function planCampaigns(db, opts = {}) {
       counts.expired++;
     }
 
+    // ── 4c'. ready のまま期限超過 → expired (ready_at は突合の記録として保持) ──
+    // Codex C1-R1 Medium: ready を終端にしない。PR-C4 の送信キューに期限切れが残らないようにする
+    const readyExpired = db.prepare(`
+      UPDATE rakuten_campaign_actions
+         SET status = 'expired', status_reason = 'expired_after_ready', updated_at = ?
+       WHERE status = 'ready' AND expires_at <= ?
+    `).run(now, now);
+    counts.expired += readyExpired.changes;
+
     // ── 4d. planned で送信予定時刻到来 → 適格性を再評価して ready (shadow では「送ったはず」の記録) ──
     // ready_at が shadow 突合 (PR-C2) の would-send 時刻になる。shadow 中は ready のまま滞留し、
     // PR-C4 の送信ゲート (owner='self' + 期限内) だけが ready → claimed に進める
@@ -320,13 +344,20 @@ export function planCampaigns(db, opts = {}) {
       if (status === 'ready') counts.promotedReady++; else counts.suppressed++;
     }
 
-    // ── 5. ownership (shadow 中に action を作った注文は vendor 担当として記録) ──
-    const r = db.prepare(`
+    // ── 5. ownership (shadow 中に観測した注文は全て vendor 担当として記録) ──
+    // action の有無ではなく contacts (=shadow中に受注APIで見えた全注文) を母集合にする
+    // (Codex C1-R1 Medium: 未発送などで action 未作成の注文が cutover 時に self 扱いされ
+    // vendor と二重送信になる穴を塞ぐ)。action だけあって contacts が無い注文 (no_contact) も合流。
+    // PR-C4 の送信ゲートは「ownership 行が無い注文 = 送らない (fail-closed)」とすること
+    const r1 = db.prepare(`
       INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-      SELECT DISTINCT a.order_number, 'vendor', 'shadow', ?
-        FROM rakuten_campaign_actions a
+      SELECT c.order_number, 'vendor', 'shadow', ? FROM rakuten_order_contacts c
     `).run(now);
-    counts.ownershipInserted = r.changes;
+    const r2 = db.prepare(`
+      INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
+      SELECT DISTINCT a.order_number, 'vendor', 'shadow', ? FROM rakuten_campaign_actions a
+    `).run(now);
+    counts.ownershipInserted = r1.changes + r2.changes;
   });
   tx();
   return counts;
