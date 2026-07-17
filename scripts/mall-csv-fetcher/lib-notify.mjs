@@ -121,7 +121,11 @@ export function buildErrorReport({ mall, outcomes = [], failures = [], logPath =
   L.push('[AI調査ガイド]');
   L.push(`- host: ${os.hostname()} / 実行ログ(DOMダンプ・[date]候補・[poll]履歴行入り): ${logPath || '(なし)'}`);
   if (repro) L.push(`- 再現: ${repro}`);
-  L.push('- 切り分け: FORM_VERIFY=画面DOM変化(ログの[DOM:reports-form-*]を確認) / HISTORY_TIMEOUT=生成遅延or履歴表記変化([poll]行を確認、RPP_LOOSE_MATCH=1で緩和可) / 2FA_REQUIRED=信頼端末切れ(MANUAL=1で手動再ログイン+信頼端末登録)');
+  L.push('- 切り分け: FORM_VERIFY=画面DOM変化(ログの[DOM:reports-form-*]を確認) / HISTORY_TIMEOUT=生成遅延or履歴表記変化([poll]行を確認、RPP_LOOSE_MATCH=1で緩和可) / 2FA_REQUIRED=信頼端末切れ(MANUAL=1で手動再ログイン+信頼端末登録) / RMS_SESSION_UNSTABLE=ログインしてもセッション即失効(楽天側の利用規制/障害。連打防止で中止)');
   L.push('- 無停止手順: 管理画面から手動DL→incoming/ に置くだけ (次回daily-syncが取込)');
+  // fetch-all の初回パスから呼ばれた場合はリトライ予告 (受け手が慌てて手動DLしないように)
+  if (process.env.MALL_FETCH_WILL_RETRY) {
+    L.push(`- ♻️ 約${process.env.MALL_FETCH_WILL_RETRY}分後に fetch-all が自動リトライします (2FA_REQUIRED/env不備は対象外)。回復すれば「リトライで回復」を通知`);
+  }
   return L.join('\n');
 }

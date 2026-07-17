@@ -274,7 +274,7 @@ async function main() {
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/qoo10-login-spike.mjs → 本ID/PW+reCAPTCHA+サブIDで手動ログイン (「✅storageState保存」を確認)'
         : 'node scripts/mall-csv-fetcher/qoo10-data-download.mjs',
     }), 'qoo10-data');
-    process.exitCode = 1;
+    process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});

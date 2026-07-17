@@ -541,7 +541,7 @@ async function main() {
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs → 手動ログイン+「信頼できる端末」登録 (14日ごと)'
         : 'node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs',
     }), 'rakuten-rpp');
-    process.exitCode = 1;
+    process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');

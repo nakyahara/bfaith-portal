@@ -170,8 +170,16 @@ rakuten-data-download.mjs
 
 ### 運用ガードレール (fetch-all / 取込に内蔵)
 
-- **多重起動ロック**: `logs/fetch-all.lock`。実行中に再起動されてもスキップ (exit 0)。3時間超の
+- **多重起動ロック**: `logs/fetch-all.lock`。実行中に再起動されてもスキップ (exit 0)。6時間超の
   stale lock は前回クラッシュの残骸とみなして破棄続行。
+- **自動リトライ** (2026-07-17 実障害の教訓): 失敗モールは約25分後に1回だけ再実行
+  (`MALL_FETCH_RETRY_DELAY_MS` で変更、0で無効)。回復したらGChatに「♻️ リトライで回復」を通知。
+  子スクリプトの exit code 契約: **0=成功 / 1=業務エラー(リトライ対象) / 2=env不備 /
+  3=手動対応必須 (2FA_REQUIRED等。リトライしない = blocked の明示)**。
+- **RMSログイン連打の防止**: ログインしてもセッションが即失効する状態 (楽天側の利用規制/障害)
+  では、1プロセスあたりのログイン試行を上限3回 (`RMS_MAX_LOGINS_PER_RUN`) で打ち切り
+  `RMS_SESSION_UNSTABLE` エラーにする。2026-07-17 に「セクションごとに再ログイン→1回の実行で
+  11回ログイン」が実発生し、利用規制を悪化させる燃料になったため。
 - **取得鮮度ウォッチドッグ**: daily-sync 内の取込 (import-rakuten-ads-rpp.js) が毎朝
   `report_fetch_log` の最終記録を検分し、**48時間超なら「fetch-all停止の疑い」をGChat通知**
   (Task Scheduler 自体が死んだ場合の無音停止を検知する独立監視)。fetch_log が空 = 移設前は警告しない。

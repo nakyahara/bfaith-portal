@@ -629,7 +629,7 @@ async function main() {
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/aupay-login-spike.mjs → メール暗証番号を入力して端末記憶を再登録'
         : 'node scripts/mall-csv-fetcher/aupay-data-download.mjs',
     }), 'aupay-data');
-    process.exitCode = 1;
+    process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');
