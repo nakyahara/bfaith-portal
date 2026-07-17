@@ -12,6 +12,7 @@ import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats, dedupeKeyFor,
   jstDateOf, jstNoonUtcIso, nextNoonJstAfter, followScheduleFor, postedAtToUtcIso,
+  recordVendorDaily, recordVendorDailyBatch, shadowComparisonReport, isValidJstDate,
 } from './rakuten-review-campaign-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey,
@@ -342,6 +343,18 @@ console.log('=== 8b. R3: 発送未確認クーポン / ready後の再発送・�
   planCampaigns(db, { nowIso: '2026-07-21T09:00:00.000Z' });
   check('ready後のレビュー全削除で cancelled(review_deleted)', getAction(oCancelReady, 'coupon').status === 'cancelled');
 
+  // ready 後の発送日「過去方向」訂正 → scheduled_at は凍結 (集計日を動かさない)、期限のみ追従
+  const oFreeze = makeContact({ shippingIso: '2026-07-09T12:00:00+09:00' }); // scheduled=7/19正午 (過去)
+  planCampaigns(db, { nowIso: '2026-07-21T09:30:00.000Z' }); // 作成+同run内で due→ready
+  const aFz0 = getAction(oFreeze, 'follow');
+  check('過去予定の新規followは同runでready', aFz0.status === 'ready' && aFz0.scheduled_at === '2026-07-19T03:00:00.000Z');
+  db.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-07-08T12:00:00+09:00' WHERE order_number = ?`).run(oFreeze);
+  planCampaigns(db, { nowIso: '2026-07-21T10:00:00.000Z' });
+  const aFz = getAction(oFreeze, 'follow');
+  check('ready後の過去方向訂正で scheduled_at 凍結 (報告済み集計日を動かさない — Codex C2-R1 High)',
+    aFz.status === 'ready' && aFz.scheduled_at === '2026-07-19T03:00:00.000Z', `${aFz.status} ${aFz.scheduled_at}`);
+  check('期限だけは実態に追従 (発送7/8+21日)', aFz.expires_at === '2026-07-29T14:59:59.000Z', aFz.expires_at);
+
   const s = campaignStats(db, '2026-07-21T09:00:00.000Z');
   check('stats: dueOverdue / dueNext24h が分離されている', Number.isInteger(s.dueOverdue) && Number.isInteger(s.dueNext24h));
 }
@@ -369,6 +382,78 @@ console.log('=== 9. cutover-aware ownership + FK強制 ===');
                 VALUES (999999, 'orphan', '2026-08-10T00:00:00Z', 'accepted')`).run();
   } catch { orphanBlocked = true; }
   check('存在しない action への attempt は FK 違反で拒否', orphanBlocked);
+}
+
+console.log('=== 10. PR-C2: vendor実績記録+shadow突合レポート ===');
+{
+  // 独立DBで固定フィクスチャ (前セクションのノイズと分離)
+  const db2 = new Database(path.join(tmp, 'warehouse2.db'));
+  db2.pragma('foreign_keys = ON');
+  ensureRakutenReviewTables(db2);
+  ensureContactTables(db2);
+  ensureCampaignTables(db2);
+  const ins = db2.prepare(`
+    INSERT INTO rakuten_campaign_actions (
+      action_type, dedupe_key, order_number, status, status_reason, template_version,
+      scheduled_at, expires_at, ready_at, created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const noon18 = '2026-07-18T03:00:00.000Z', noon19 = '2026-07-19T03:00:00.000Z', noon20 = '2026-07-20T03:00:00.000Z';
+  const exp = '2026-08-01T00:00:00.000Z', t0 = '2026-07-17T00:00:00.000Z';
+  ins.run('follow', 'k1', 'O1', 'ready', null, 'follow:v1', noon18, exp, '2026-07-19T00:00:00.000Z', t0, t0);
+  ins.run('follow', 'k2', 'O2', 'suppressed', 'review_exists', 'follow:v1', noon18, exp, '2026-07-19T00:00:00.000Z', t0, t0); // ready後に抑止=would-sendに含む
+  ins.run('coupon', 'k3', 'O3', 'planned', 'awaiting_contact', 'coupon:v1:either', noon18, exp, null, t0, t0);   // 説明材料
+  ins.run('coupon', 'k4', 'O4', 'ready', null, 'coupon:v1:either', noon19, exp, '2026-07-20T00:00:00.000Z', t0, t0);
+  ins.run('follow', 'k5', 'O5', 'ready', null, 'follow:v1', noon20, exp, '2026-07-21T00:00:00.000Z', t0, t0);   // 期間外
+
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'follow', count: 3, nowIso: t0 });
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'coupon', count: 1, nowIso: t0 });
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'coupon', count: 2, nowIso: t0 }); // 訂正転記
+
+  const rep = shadowComparisonReport(db2, { fromJst: '2026-07-18', toJst: '2026-07-19' });
+  const d18 = rep.days.find((d) => d.date_jst === '2026-07-18');
+  const d19 = rep.days.find((d) => d.date_jst === '2026-07-19');
+  check('7/18 follow: vendor=3 / shadow=2 (ready後suppressedも含む) / 差=-1',
+    d18.follow_vendor === 3 && d18.follow_shadow === 2 && d18.follow_diff === -1, JSON.stringify(d18));
+  check('7/18 coupon: vendor=2 (訂正UPSERTが効く) / shadow=0 / 差=-2',
+    d18.coupon_vendor === 2 && d18.coupon_shadow === 0 && d18.coupon_diff === -2, JSON.stringify(d18));
+  check('7/19 coupon: vendor未転記=null / shadow=1 / 差=null',
+    d19.coupon_vendor === null && d19.coupon_shadow === 1 && d19.coupon_diff === null, JSON.stringify(d19));
+  check('期間外 (7/20予定) の would-send は含まれない', !rep.days.find((d) => d.date_jst === '2026-07-20'));
+  check('説明材料: coupon planned(awaiting_contact) が期間内内訳に出る',
+    rep.reasons.some((r) => r.action_type === 'coupon' && r.status === 'planned' && r.reason === 'awaiting_contact' && r.n === 1),
+    JSON.stringify(rep.reasons));
+
+  let badDate = false, badType = false, badCount = false, badRange = false;
+  try { recordVendorDaily(db2, { dateJst: '2026/07/18', actionType: 'follow', count: 1 }); } catch { badDate = true; }
+  try { recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'mail', count: 1 }); } catch { badType = true; }
+  try { recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'follow', count: -1 }); } catch { badCount = true; }
+  try { shadowComparisonReport(db2, { fromJst: '2026-07-19', toJst: '2026-07-18' }); } catch { badRange = true; }
+  check('不正入力は全て fail-fast (日付/種別/件数/期間)', badDate && badType && badCount && badRange);
+
+  const dump = JSON.stringify(rep);
+  check('レポートに注文番号が含まれない (件数のみ)', !dump.includes('O1') && !dump.includes('O4'));
+
+  // 期間内の全暦日を生成 (転記漏れ日と両方ゼロの日を区別できる — Codex C2-R1 Medium)
+  const rep2 = shadowComparisonReport(db2, { fromJst: '2026-07-17', toJst: '2026-07-19' });
+  check('データのない日も行が出る (vendor=null/shadow=0)',
+    rep2.days.length === 3 && rep2.days[0].date_jst === '2026-07-17'
+    && rep2.days[0].follow_vendor === null && rep2.days[0].follow_shadow === 0, JSON.stringify(rep2.days[0]));
+
+  check('isValidJstDate: 実在暦日のみ受理', isValidJstDate('2026-02-28') && !isValidJstDate('2026-02-30') && !isValidJstDate('2026-13-01'));
+  let badCal = false, tooLong = false, batchFail = false;
+  try { recordVendorDaily(db2, { dateJst: '2026-02-30', actionType: 'follow', count: 1 }); } catch { badCal = true; }
+  try { shadowComparisonReport(db2, { fromJst: '2026-01-01', toJst: '2026-07-01' }); } catch { tooLong = true; }
+  check('実在しない暦日は拒否 / 92日超の期間は拒否', badCal && tooLong);
+  try {
+    recordVendorDailyBatch(db2, [
+      { dateJst: '2026-07-20', actionType: 'follow', count: 5 },
+      { dateJst: '2026-07-20', actionType: 'coupon', count: -1 },
+    ]);
+  } catch { batchFail = true; }
+  check('batch転記: 1件不正で全体ロールバック (部分更新なし)',
+    batchFail && db2.prepare(`SELECT COUNT(*) n FROM rakuten_vendor_send_daily WHERE date_jst = '2026-07-20'`).get().n === 0);
+  db2.close();
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
