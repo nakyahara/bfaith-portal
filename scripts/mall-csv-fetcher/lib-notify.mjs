@@ -126,7 +126,7 @@ export function buildErrorReport({ mall, outcomes = [], failures = [], logPath =
   // fetch-all の初回パスから呼ばれた場合はリトライ予告 (受け手が慌てて手動DLしないように)。
   // ただし blocked系 (2FA/セッション不安定/env不備) だけの通知には載せない — リトライされないのに
   // 「待てば直る」と誤読させる矛盾を防ぐ (Codex R1)
-  const BLOCKED_RE = /2FA_REQUIRED|RMS_SESSION_UNSTABLE|ENV_MISSING/;
+  const BLOCKED_RE = /2FA_REQUIRED|RMS_SESSION_UNSTABLE|AUTH_FAILED|ENV_MISSING/;
   const hasRetryable = failures.some((f) => !BLOCKED_RE.test(`${f.reportType || ''} ${f.error || ''}`));
   if (process.env.MALL_FETCH_WILL_RETRY && hasRetryable) {
     L.push(`- ♻️ 業務エラー分は約${process.env.MALL_FETCH_WILL_RETRY}分後に fetch-all が自動リトライします (回復すれば「リトライで回復」を通知。2FA_REQUIRED/RMS_SESSION_UNSTABLE/env不備は対象外)`);

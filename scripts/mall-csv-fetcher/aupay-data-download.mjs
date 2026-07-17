@@ -617,19 +617,24 @@ async function main() {
     }
   } catch (err) {
     const is2fa = String(err.message).startsWith('2FA_REQUIRED');
+    // AUTH_FAILED = ID/PW拒否・アカウントロックの疑い → 自動リトライ(再ログイン)はロックを
+    // 悪化させるため blocked (Codex R3 High)。AUTH_VERIFY は画面変更/一過性も含むので exit 1 のまま
+    const isAuthFailed = String(err.message).startsWith('AUTH_FAILED');
     console.error(`\n⚠️ ${err.message}`);
     await snap(page, 'error');
     await sendGChat(buildErrorReport({
       mall: 'aupay', outcomes, logPath: runLog.logPath,
       failures: [{
-        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : 'adata(共通処理)',
+        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : isAuthFailed ? 'AUTH_FAILED (全レポート停止)' : 'adata(共通処理)',
         error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'adata_error.png'),
       }],
       repro: is2fa
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/aupay-login-spike.mjs → メール暗証番号を入力して端末記憶を再登録'
-        : 'node scripts/mall-csv-fetcher/aupay-data-download.mjs',
+        : isAuthFailed
+          ? 'ID/PW拒否またはロックの疑い → WOW!マネージャーに手動ログインして確認 (自動リトライはしない)'
+          : 'node scripts/mall-csv-fetcher/aupay-data-download.mjs',
     }), 'aupay-data');
-    process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
+    process.exitCode = (is2fa || isAuthFailed) ? 3 : 1; // 3=手動対応必須/blocked (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');
