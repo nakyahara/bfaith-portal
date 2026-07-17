@@ -119,7 +119,14 @@ db.saveRestockLatest([
   { amazon_sku: 'plain-b', product_name: '単品B', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null },
   { amazon_sku: 'BROKEN-C', product_name: '構成不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
   { amazon_sku: 'NEGQTY-D', product_name: 'qty不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
-  { amazon_sku: 'UNMAPPED-SKU', product_name: '未マッピング', fba_available: 0, units_sold_30d: 10, amazon_recommended_qty: null },
+  // 未マッピング×実績あり (30日販売10) → active = 本物の納品漏れ候補 → 警告対象
+  { amazon_sku: 'UNMAPPED-SOLD', product_name: '未マッピング(売れてる)', fba_available: 0, units_sold_30d: 10, amazon_recommended_qty: null },
+  // 未マッピング×FBA在庫あり → active
+  { amazon_sku: 'UNMAPPED-STOCK', product_name: '未マッピング(在庫あり)', fba_available: 5, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×入荷中のみ → active
+  { amazon_sku: 'UNMAPPED-INBOUND', product_name: '未マッピング(入荷中)', fba_available: 0, fba_inbound_shipped: 3, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×実績ゼロ → inactive = バリエーション登録専用等。警告にせず静かに件数表示
+  { amazon_sku: 'UNMAPPED-VARIATION', product_name: '未マッピング(未使用)', fba_available: 0, units_sold_30d: 0, amazon_recommended_qty: null },
 ]);
 
 db.replaceWarehouseInventory([
@@ -168,11 +175,18 @@ for (const i of result.items) {
 }
 
 const dq = result.data_quality;
-assert(dq?.unmapped_count === 1 && dq?.unmapped_skus?.[0] === 'UNMAPPED-SKU',
-  `未マッピングSKUがmetaで返る (実際${JSON.stringify(dq?.unmapped_skus)})`);
+// 未マッピングは稼働実績で仕分け: active=要対応 (警告バナー) / inactive=未使用SKU (静かな情報表示)
+const activeSkus = (dq?.unmapped_active || []).map(u => u.sku).sort();
+assert(dq?.unmapped_active_count === 3 &&
+  JSON.stringify(activeSkus) === JSON.stringify(['UNMAPPED-INBOUND', 'UNMAPPED-SOLD', 'UNMAPPED-STOCK']),
+  `未マッピング×実績あり(販売/在庫/入荷中)のみactive (実際${JSON.stringify(activeSkus)})`);
+assert(dq?.unmapped_inactive_count === 1 && dq?.unmapped_inactive_skus?.[0] === 'UNMAPPED-VARIATION',
+  `未マッピング×実績ゼロはinactive=警告にしない (実際${JSON.stringify(dq?.unmapped_inactive_skus)})`);
+assert(dq?.unmapped_active?.[0]?.units_sold_30d !== undefined,
+  'active側は判断材料 (30日販売/FBA在庫/入荷中) を持つ');
 assert(dq?.invalid_mapping_count === 2 && dq?.invalid_mappings?.some(m => m.sku === 'BROKEN-C') && dq?.invalid_mappings?.some(m => m.sku === 'NEGQTY-D'),
   `set_components不正がmetaで返る (実際${JSON.stringify(dq?.invalid_mappings)})`);
-assert(dq?.planning_missing_count === 5, `PLANNING欠落件数 (期待5, 実際${dq?.planning_missing_count})`);
+assert(dq?.planning_missing_count === 8, `PLANNING欠落件数 (期待8=restock全行, 実際${dq?.planning_missing_count})`);
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail > 0 ? 1 : 0;

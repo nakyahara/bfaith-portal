@@ -41,7 +41,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
   // RESTOCK が空 (初回 or 取得失敗) の場合は旧 daily_snapshots にフォールバック (移行期間の保険)
   // 部分成功の可視化 (総点検 P0-3): silent skip をやめて meta で件数+SKU一覧を返す
-  const unmappedSkus = [];        // restock にあるが sku_mapping 不在 → 全タブから消えていたSKU
+  // 未マッピングSKU (restock にあるが sku_mapping 不在)。大半はバリエーション登録専用など
+  // 意図的に使っていないSKUなので、稼働実績で2つに分ける:
+  //   active   = 販売実績/FBA在庫/入荷中のいずれかあり → マッピング漏れ=本物の納品漏れ候補 (要対応)
+  //   inactive = 実績ゼロ → 未使用SKUとみなし静かに件数だけ出す (警告にしない)
+  const unmappedActive = [];
+  const unmappedInactive = [];
   const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
   const planningMissingSkus = []; // PLANNING レポート欠落 (販売数0扱いになる)
 
@@ -87,7 +92,19 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   for (const snap of snapshots) {
     const sku = snap.amazon_sku;
     const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
-    if (!mapping) { unmappedSkus.push(sku); continue; } // マッピングがないSKUはスキップ (meta で警告)
+    if (!mapping) {
+      // マッピングがないSKUは計算不能なのでスキップ。ただし黙って消すと納品漏れになるため meta に残す。
+      // 稼働実績の有無で仕分け (実績ゼロ=バリエーション登録専用等の未使用SKU → 警告にしない)
+      const inbound = (snap.fba_inbound_working || 0) + (snap.fba_inbound_shipped || 0) + (snap.fba_inbound_received || 0);
+      const sold30d = snap.units_sold_30d || 0;
+      const fbaQty = snap.fba_available || 0;
+      if (sold30d > 0 || fbaQty > 0 || inbound > 0) {
+        unmappedActive.push({ sku, units_sold_30d: sold30d, fba_available: fbaQty, fba_inbound: inbound });
+      } else {
+        unmappedInactive.push(sku);
+      }
+      continue;
+    }
 
     // --- set_components をSKU単位で安全にパース+構造検証 (不正1件で全SKUの生成が止まらないよう隔離) ---
     // 不正な場合は「単品扱いで計算続行」ではなく当該SKUの推奨を停止する (誤った数量提示より安全側)
@@ -507,11 +524,14 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     recommended_skus: recommendedItems.length,
     recommended_units: recommendedItems.reduce((s, i) => s + i.recommended_qty, 0),
     errors: [],
-    // 部分成功の可視化 (総点検 P0-3): 「ゼロ件成功」と「データ欠損付き成功」を区別できるようにする
+    // 部分成功の可視化 (総点検 P0-3): 「ゼロ件成功」と「データ欠損付き成功」を区別できるようにする。
+    // 未マッピングは active (実績あり=要対応) と inactive (未使用SKU=情報のみ) に分離
     data_quality: {
       data_source: dataSource,
-      unmapped_count: unmappedSkus.length,
-      unmapped_skus: unmappedSkus,
+      unmapped_active_count: unmappedActive.length,
+      unmapped_active: unmappedActive,
+      unmapped_inactive_count: unmappedInactive.length,
+      unmapped_inactive_skus: unmappedInactive,
       invalid_mapping_count: invalidMappingSkus.length,
       invalid_mappings: invalidMappingSkus,
       planning_missing_count: planningMissingSkus.length,

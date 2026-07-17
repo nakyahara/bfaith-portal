@@ -243,6 +243,9 @@
         </div>
       </div>
 
+      <!-- 対象外SKUの内訳 (未使用SKU等。警告ではない情報表示なので目立たせない) -->
+      <div id="dqQuiet" style="display:none;margin-bottom:8px;font-size:11px;color:#9ca3af;line-height:1.5;"></div>
+
       <!-- 選択アクション -->
       <div style="margin-bottom:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-primary" onclick="checkAllRed()" style="background:#dc2626; padding:6px 14px; font-size:13px;">🔴 緊急を全選択</button>
@@ -1002,37 +1005,65 @@
       el.style.display = '';
     }
 
-    // データ欠損バナー (総点検 P0-3): 未マッピングSKU等の silent skip を可視化。
-    // ここに出るSKUは納品推奨・FBA欠品のどのタブにも表示されない=納品漏れの最大経路。
+    // データ欠損の可視化 (総点検 P0-3)。計算対象から外れたSKUを黙って消さないための表示。
+    // 2段階に分ける:
+    //   dqBanner (色付き警告) = 対応が要るものだけ。未マッピングでも販売/在庫実績があるSKU (=本物の納品漏れ候補) と
+    //                           セット構成不正 (=推奨停止中)。ゼロなら出さない。
+    //   dqQuiet  (グレー小文字) = 実績ゼロの未マッピングSKU (バリエーション登録専用など運用上の想定内) と
+    //                           PLANNING欠落。件数だけ静かに置き、一覧は折りたたみ。
     function renderDataQualityBanner(dq) {
       const el = document.getElementById('dqBanner');
-      if (!el) return;
-      if (!dq || (!dq.unmapped_count && !dq.invalid_mapping_count && !dq.planning_missing_count)) {
-        el.style.display = 'none'; el.innerHTML = ''; return;
-      }
+      const quietEl = document.getElementById('dqQuiet');
       const e = (s) => (typeof esc === 'function' ? esc(String(s)) : String(s));
-      const skuList = (skus, limit) => {
-        const shown = skus.slice(0, limit).map(s => e(typeof s === 'string' ? s : `${s.sku} (${s.reason})`)).join(', ');
+      const skuList = (skus, limit, fmt) => {
+        const shown = skus.slice(0, limit).map(s => e(fmt ? fmt(s) : s)).join(', ');
         return shown + (skus.length > limit ? ` …他${skus.length - limit}件` : '');
       };
-      const parts = [];
-      if (dq.unmapped_count > 0) {
-        parts.push(`・【重要】<b>SKUマッピング未登録: ${dq.unmapped_count}件</b> — このSKUはどのタブにも表示されません (納品漏れの恐れ)。スプシに登録して同期してください`
-          + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.unmapped_skus || [], 200)}</div></details>`);
+      const details = (label, body) =>
+        `<details style="margin-left:1em;"><summary style="cursor:pointer;">${label}</summary>`
+        + `<div style="font-size:11px;word-break:break-all;">${body}</div></details>`;
+
+      // --- 色付き警告 (要対応のみ) ---
+      if (el) {
+        const parts = [];
+        if (dq?.unmapped_active_count > 0) {
+          parts.push(`・【重要】<b>販売/在庫があるのにSKUマッピング未登録: ${dq.unmapped_active_count}件</b>`
+            + ` — 実績があるのにどのタブにも出ません (納品漏れの恐れ)。スプシに登録して同期してください`
+            + details('SKU一覧を表示', skuList(dq.unmapped_active || [], 200,
+                s => `${s.sku} (30日販売${s.units_sold_30d}/FBA在庫${s.fba_available}/入荷中${s.fba_inbound})`)));
+        }
+        if (dq?.invalid_mapping_count > 0) {
+          parts.push(`・【重要】<b>セット構成が不正: ${dq.invalid_mapping_count}件</b> — 誤数量防止のため該当SKUの推奨を停止中。スプシのセット構成を修正してください`
+            + details('SKU一覧を表示', skuList(dq.invalid_mappings || [], 50, s => `${s.sku} (${s.reason})`)));
+        }
+        if (parts.length === 0) {
+          el.style.display = 'none'; el.innerHTML = '';
+        } else {
+          el.style.background = '#fdecea';
+          el.style.border = '1px solid #e57373';
+          el.style.color = '#c0392b';
+          el.innerHTML = '📉 <b>要対応のデータ欠損があります (計算は欠損分を除いて成功)</b><br>' + parts.join('<br>');
+          el.style.display = '';
+        }
       }
-      if (dq.invalid_mapping_count > 0) {
-        parts.push(`・【重要】<b>マッピング不正 (セット構成が不正): ${dq.invalid_mapping_count}件</b> — 誤数量防止のため該当SKUの推奨を停止中。スプシのセット構成を修正してください`
-          + `<details style="margin-left:1em;"><summary style="cursor:pointer;">SKU一覧を表示</summary><div style="font-size:11px;word-break:break-all;">${skuList(dq.invalid_mappings || [], 50)}</div></details>`);
+
+      // --- 静かな情報表示 (未使用SKU等。警告にしない) ---
+      if (quietEl) {
+        const quiet = [];
+        if (dq?.unmapped_inactive_count > 0) {
+          quiet.push(`計算対象外: SKUマッピング未登録 ${dq.unmapped_inactive_count}件 (販売・在庫とも0 = バリエーション登録専用等とみなし推奨対象外)`
+            + details('SKU一覧', skuList(dq.unmapped_inactive_skus || [], 300)));
+        }
+        if (dq?.planning_missing_count > 0) {
+          quiet.push(`PLANNINGレポート欠落: ${dq.planning_missing_count}件 (7日販売等の補助データなし)`);
+        }
+        if (quiet.length === 0) {
+          quietEl.style.display = 'none'; quietEl.innerHTML = '';
+        } else {
+          quietEl.innerHTML = quiet.join('<br>');
+          quietEl.style.display = '';
+        }
       }
-      if (dq.planning_missing_count > 0) {
-        parts.push(`・【注意】PLANNINGレポート欠落: ${dq.planning_missing_count}件 — 販売数が0扱いになり推奨が過小になる可能性`);
-      }
-      const crit = dq.unmapped_count > 0 || dq.invalid_mapping_count > 0;
-      el.style.background = crit ? '#fdecea' : '#fff8e1';
-      el.style.border = crit ? '1px solid #e57373' : '1px solid #ffd54f';
-      el.style.color = crit ? '#c0392b' : '#8a6d00';
-      el.innerHTML = '📉 <b>データ欠損があります (計算は欠損分を除いて成功)</b><br>' + parts.join('<br>');
-      el.style.display = '';
     }
 
     // 選択管理
