@@ -2653,6 +2653,12 @@ Step10: アラート判定
         let warehouseQty = 0;
         let yQty = 0;
         const comps = normalizeComponents(mapping.set_components); // 不正JSON 1件でタブ全体が止まらないよう隔離
+        // 構成不正判定 (エンジンと同基準)。新規商品はrecDataに居ないため、ここでフラグを持たないと追加拒否をすり抜ける
+        const invalidMapping = !!(mapping.set_components && (
+          !comps ||
+          (mapping.is_set && comps.length === 0) ||
+          comps.some(c => !c || typeof c.ne_code !== 'string' || !c.ne_code.trim() || !(Number.isSafeInteger(Number(c.qty ?? 1)) && Number(c.qty ?? 1) >= 1))
+        ));
 
         if (comps && comps.length > 0) {
           let minSets = Infinity;
@@ -2677,6 +2683,7 @@ Step10: アラート判定
           ne_code: mapping.ne_code || '',
           set_components: comps,
           is_set: mapping.is_set ? true : false,
+          invalid_mapping: invalidMapping,
           warehouse_qty: warehouseQty,
           warehouse_available: warehouseQty,
           y_qty: yQty,
@@ -2871,17 +2878,18 @@ Step10: アラート判定
 
       let addedCount = 0;
       let alreadyCount = 0;
+      let invalidCount = 0;
       for (const sku of newCheckedSkus) {
+        // 新規商品データから情報を取得
+        const newProd = newProductData.find(r => r.amazon_sku === sku);
         // 既に納品推奨にあるか確認 (isInShipment と同じ基準)
         const existing = recData.find(r => r.amazon_sku === sku);
-        if (existing?.invalid_mapping) continue; // 構成不正: 推奨停止の迂回を防ぐ
+        // 構成不正: 推奨停止の迂回を防ぐ (recData非掲載の新規SKUは newProd 側のフラグで判定)
+        if (existing?.invalid_mapping || newProd?.invalid_mapping) { invalidCount++; continue; }
         if (isInShipment(existing) || manualItems.find(m => m.amazon_sku === sku)) {
           alreadyCount++;
           continue;
         }
-
-        // 新規商品データから情報を取得
-        const newProd = newProductData.find(r => r.amazon_sku === sku);
 
         if (existing) {
           existing._manual = true;
@@ -2929,6 +2937,7 @@ Step10: アラート判定
       let msg = '';
       if (addedCount > 0) msg += `${addedCount}件を納品推奨に追加しました（数量0 → 手動入力してください）`;
       if (alreadyCount > 0) msg += `${alreadyCount > 0 && addedCount > 0 ? '、' : ''}${alreadyCount}件は既に納品推奨済みです`;
+      if (invalidCount > 0) msg += `${msg ? '、' : ''}${invalidCount}件はセット構成が不正のため追加できません（スプシ修正→同期してください）`;
       msgEl.textContent = msg;
       msgEl.style.color = addedCount > 0 ? '#16a34a' : '#d97706';
 
