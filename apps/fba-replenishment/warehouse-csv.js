@@ -34,12 +34,13 @@ export function parseWarehouseCsv(buffer) {
       `ロジザードの在庫CSVか、文字コードが正しいか確認してください (判定: ${encoding})` };
   }
 
-  // 数値セル: "1,234" のカンマ区切りのみ許容 (指数表記・16進等のJS Number構文は不可)、整数以外は不正行扱い
+  // 数値セル: 素の整数か正しい3桁カンマ区切り ("1,234") のみ許容。
+  // 指数・16進等のJS Number構文や "12,34" のような崩れた桁区切りは不正行扱い
   const toInt = (s) => {
     if (s === '' || s == null) return null;
-    const t = String(s).replace(/,/g, '').trim();
-    if (!/^-?\d+$/.test(t)) return NaN;
-    const n = Number(t);
+    const t = String(s).trim();
+    if (!/^-?\d+$/.test(t) && !/^-?\d{1,3}(,\d{3})+$/.test(t)) return NaN;
+    const n = Number(t.replace(/,/g, ''));
     return Number.isSafeInteger(n) ? n : NaN;
   };
 

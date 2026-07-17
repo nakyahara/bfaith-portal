@@ -1176,6 +1176,11 @@
       // 既存データから探す（recData + manualItems）
       const existing = recData.find(r => r.amazon_sku === sku);
       const existingManual = manualItems.find(m => m.amazon_sku === sku);
+      if (existing?.invalid_mapping) {
+        msgEl.textContent = `${sku} はセット構成が不正のため追加できません（スプシ修正→同期→再計算してください）`;
+        msgEl.style.color = '#dc2626';
+        return;
+      }
       if (existing) {
         existing.recommended_qty = qty;
         existing.adjusted_qty = qty;
@@ -2124,7 +2129,10 @@ Step10: アラート判定
       }).map(r => {
         // ステータス判定
         let stockout_status, stockout_status_num;
-        if (isInShipment(r)) {
+        if (r.invalid_mapping) {
+          stockout_status = 'invalid'; // セット構成不正 → 推奨停止中 (追加不可、スプシ修正が先)
+          stockout_status_num = 3;
+        } else if (isInShipment(r)) {
           stockout_status = 'already'; // 納品推奨済み
           stockout_status_num = 2;
         } else {
@@ -2239,6 +2247,8 @@ Step10: アラート判定
         let statusHtml;
         if (isHidden) {
           statusHtml = '<span class="stockout-badge" style="background:#e5e7eb;color:#6b7280;">非表示</span>';
+        } else if (r.stockout_status === 'invalid') {
+          statusHtml = '<span class="stockout-badge" style="background:#fecaca;color:#991b1b;">構成不正 (推奨停止)</span>';
         } else if (isAlready) {
           statusHtml = '<span class="stockout-badge stockout-already">納品推奨済み ✓</span>';
         } else if (isSendable) {
@@ -2563,9 +2573,11 @@ Step10: アラート判定
 
       let addedCount = 0;
       let alreadyCount = 0;
+      let invalidCount = 0;
       for (const sku of stockoutCheckedSkus) {
         // 既に納品推奨にあるか確認 (isInShipment と同じ基準)
         const existing = recData.find(r => r.amazon_sku === sku);
+        if (existing?.invalid_mapping) { invalidCount++; continue; } // 構成不正: 推奨停止の迂回を防ぐ
         if (isInShipment(existing) || manualItems.find(m => m.amazon_sku === sku)) {
           alreadyCount++;
           continue;
@@ -2585,6 +2597,7 @@ Step10: アラート判定
       let msg = '';
       if (addedCount > 0) msg += `${addedCount}件を納品推奨に追加しました（数量0 → 手動入力してください）`;
       if (alreadyCount > 0) msg += `${alreadyCount > 0 && addedCount > 0 ? '、' : ''}${alreadyCount}件は既に納品推奨済みです`;
+      if (invalidCount > 0) msg += `${msg ? '、' : ''}${invalidCount}件はセット構成が不正のため追加できません（スプシ修正→同期→再計算してください）`;
       msgEl.textContent = msg;
       msgEl.style.color = addedCount > 0 ? '#16a34a' : '#d97706';
 
@@ -2861,6 +2874,7 @@ Step10: アラート判定
       for (const sku of newCheckedSkus) {
         // 既に納品推奨にあるか確認 (isInShipment と同じ基準)
         const existing = recData.find(r => r.amazon_sku === sku);
+        if (existing?.invalid_mapping) continue; // 構成不正: 推奨停止の迂回を防ぐ
         if (isInShipment(existing) || manualItems.find(m => m.amazon_sku === sku)) {
           alreadyCount++;
           continue;

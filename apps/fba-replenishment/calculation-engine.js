@@ -98,7 +98,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
         components = typeof mapping.set_components === 'string'
           ? JSON.parse(mapping.set_components) : mapping.set_components;
         if (!Array.isArray(components)) throw new Error('配列ではありません');
-        for (const c of components) {
+        if (components.length === 0 && mapping.is_set) throw new Error('セット品なのに構成が空');
+        if (components.length === 0) components = null; // 非セットの空配列は「構成なし」と同義 (単品フォールバック)
+        for (const c of components || []) {
           if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim()) throw new Error('構成品のne_codeが不正');
           const q = Number(c.qty ?? 1);
           if (!Number.isSafeInteger(q) || q < 1) throw new Error(`構成品qtyが不正 (${c.qty})`);
