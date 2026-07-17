@@ -16,7 +16,7 @@
 // ⚠️ 本番 DATA_DIR は /data (Render)。/var/data ではない
 import { initInquiryHubDB, getDB } from '../db.js';
 import { runSync } from '../sync/engine.js';
-import { createRakutenAdapter, DEEP_LOOKBACK_DAYS } from '../sync/adapters/rakuten.js';
+import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAYS } from '../sync/adapters/rakuten.js';
 
 const args = process.argv.slice(2);
 const argOf = f => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : null; };
@@ -51,23 +51,15 @@ async function main() {
     console.log(r.changes ? `shops に楽天店舗を作成: ${shopName} (${accountId})` : `既存: account_identifier=${accountId} (変更なし)`);
   }
 
-  // transport 自動判別: 楽天キーがあれば direct、なければ miniPC passthrough (warehouse)
-  const { RAKUTEN_SERVICE_SECRET, RAKUTEN_LICENSE_KEY,
-    WAREHOUSE_URL, WAREHOUSE_SERVICE_TOKEN, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET } = process.env;
-  let transportCfg;
-  if (RAKUTEN_SERVICE_SECRET && RAKUTEN_LICENSE_KEY) {
-    transportCfg = { transport: 'direct', serviceSecret: RAKUTEN_SERVICE_SECRET, licenseKey: RAKUTEN_LICENSE_KEY };
-    console.log('transport=direct (RMS直接)');
-  } else if (WAREHOUSE_URL && WAREHOUSE_SERVICE_TOKEN && CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET) {
-    transportCfg = { transport: 'warehouse', warehouseUrl: WAREHOUSE_URL, serviceToken: WAREHOUSE_SERVICE_TOKEN,
-      cfClientId: CF_ACCESS_CLIENT_ID, cfClientSecret: CF_ACCESS_CLIENT_SECRET };
-    console.log('transport=warehouse (miniPC passthrough 経由)');
-  } else {
+  // transport 自動判別: 楽天キーがあれば direct、なければ miniPC passthrough (warehouse)。cron と共用ロジック
+  const transportCfg = resolveRakutenTransportFromEnv();
+  if (!transportCfg) {
     console.error('FATAL: 認証情報がありません。以下のどちらかを設定してください:');
     console.error('  direct:    RAKUTEN_SERVICE_SECRET + RAKUTEN_LICENSE_KEY');
     console.error('  warehouse: WAREHOUSE_URL + WAREHOUSE_SERVICE_TOKEN + CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET');
     return 2;
   }
+  console.log(transportCfg.transport === 'direct' ? 'transport=direct (RMS直接)' : 'transport=warehouse (miniPC passthrough 経由)');
 
   const shops = db.prepare(`SELECT * FROM shops
     WHERE channel_type = 'rakuten' AND is_active = 1 AND executor = 'server'`).all();

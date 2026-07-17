@@ -18,7 +18,9 @@ process.env.DATA_DIR = workDir;
 // 動的 import する (静的 import だと本番 DATA_DIR 誤指定時に実DBへ書いてしまう。Codex R2 high)
 const { initInquiryHubDB, getDB } = await import('./db.js');
 const { runSync } = await import('./sync/engine.js');
-const { createRakutenAdapter, mapInquiry, toJstNaive, DEFAULT_LOOKBACK_DAYS } = await import('./sync/adapters/rakuten.js');
+const { createRakutenAdapter, mapInquiry, toJstNaive, resolveRakutenTransportFromEnv, DEFAULT_LOOKBACK_DAYS } = await import('./sync/adapters/rakuten.js');
+const { runInquiryHubSyncTick, startInquiryHubSyncCron, cronMinutesMayCollide,
+  DEFAULT_SYNC_CRON, DEFAULT_DEEP_CRON } = await import('./sync/cron.js');
 
 initInquiryHubDB();
 const db = getDB();
@@ -279,6 +281,40 @@ console.log('6. エンジン結合');
     db.prepare('SELECT sent_at FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = ?').get(inq.id, 'q').sent_at));
   check('JST→UTC変換が正しい (10:00+09:00 → 01:00Z)',
     db.prepare('SELECT sent_at FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = ?').get(inq.id, 'q').sent_at === '2026-07-15T01:00:00Z');
+}
+
+// ─── 7. transport解決 + cron ───
+console.log('7. transport解決 + cron');
+{
+  const direct = resolveRakutenTransportFromEnv({ RAKUTEN_SERVICE_SECRET: 's', RAKUTEN_LICENSE_KEY: 'k' });
+  check('env解決: 楽天キーあり → direct', direct?.transport === 'direct');
+  const wh = resolveRakutenTransportFromEnv({
+    WAREHOUSE_URL: 'https://wh.example.com', WAREHOUSE_SERVICE_TOKEN: 't',
+    CF_ACCESS_CLIENT_ID: 'i', CF_ACCESS_CLIENT_SECRET: 'c',
+  });
+  check('env解決: WAREHOUSE一式 → warehouse', wh?.transport === 'warehouse');
+  check('env解決: どちらも無し → null', resolveRakutenTransportFromEnv({}) === null);
+  check('env解決: WAREHOUSE不揃い → null', resolveRakutenTransportFromEnv({ WAREHOUSE_URL: 'x', WAREHOUSE_SERVICE_TOKEN: 't' }) === null);
+
+  delete process.env.INQUIRY_HUB_SYNC_CRON_ENABLED;
+  check('cron: flag未設定はスケジュールしない (Dark Launch)', startInquiryHubSyncCron() === null);
+  // 既定のsyncとdeepが同じ分に発火しない (同時発火だとtickRunningガードでdeepがスキップされる。Codex high)
+  check('cron: 既定式は分衝突しない', cronMinutesMayCollide(DEFAULT_SYNC_CRON, DEFAULT_DEEP_CRON) === false,
+    `sync=${DEFAULT_SYNC_CRON} deep=${DEFAULT_DEEP_CRON}`);
+  check('cron: 衝突検出が機能する (15分グリッド上のdeepを検出)', cronMinutesMayCollide('*/15 * * * *', '15 20 * * *') === true);
+  check('cron: 判定不能な式は警告しない', cronMinutesMayCollide('1-5 * * * *', '3 * * * *') === false);
+
+  // tick を adapterFactory (モック) で駆動: cron経路 → runSync → 取り込みまで通る
+  const tickData = [row({ inquiryNumber: 'tick-1', regDate: '2026-07-17T10:00:00+09:00' })];
+  const tickR = await runInquiryHubSyncTick({
+    adapterFactory: () => ({ async fetchNew() { return { inquiries: tickData.map(r2 => mapInquiry(r2)) }; } }),
+  });
+  check('tick: 全rakuten店舗を同期し結果を返す', Array.isArray(tickR.results) && tickR.results.length >= 1 && tickR.results.every(r2 => r2.ok));
+  check('tick: 新規1件が入る', tickR.results.some(r2 => r2.stats?.newInquiries === 1), JSON.stringify(tickR));
+  const tickR2 = await runInquiryHubSyncTick({
+    adapterFactory: () => ({ async fetchNew() { return { inquiries: tickData.map(r2 => mapInquiry(r2)) }; } }),
+  });
+  check('tick: 2回目は冪等 (新規0)', tickR2.results.every(r2 => r2.ok && r2.stats.newInquiries === 0));
 }
 
 // ガードの自己検証: DBが一時サブディレクトリ「のみ」に作られていること (ベース直下に漏れたら即FAIL)
