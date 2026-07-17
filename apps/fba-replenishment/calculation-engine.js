@@ -84,6 +84,17 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const nonFbaMax60dList = getAllNonFbaMax60d();
   const nonFbaMax60dMap = {};
   for (const r of nonFbaMax60dList) nonFbaMax60dMap[r.amazon_sku] = r;
+  // 未マッピング判定でも参照するので norm キー版も用意 (mirror小文字 vs レポート元ケース差の吸収)
+  const nonFbaMax60dNormMap = {};
+  for (const r of nonFbaMax60dList) nonFbaMax60dNormMap[normCode(r.amazon_sku)] = r;
+
+  // 準備中数量 (Inbound API) を norm キー化 (総点検 B-4)。exact-case 参照だと case 差で override が落ち、
+  // 2026-06-30型「準備中欠損→二重推奨」が再発する。未マッピング判定でも同じ値を使う。
+  const inboundWorkingNormMap = {};
+  if (inboundWorkingOverride) {
+    for (const k of Object.keys(inboundWorkingOverride)) inboundWorkingNormMap[normCode(k)] = inboundWorkingOverride[k];
+  }
+  const lookupInboundWorking = (sku) => inboundWorkingNormMap[normCode(sku)];
 
   const snapshotDate = snapshots[0]?.snapshot_date || new Date().toISOString().slice(0, 10);
   const oosAmazonRecoThreshold = parseInt(settings.oos_amazon_reco_threshold || 11);
@@ -94,12 +105,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
     if (!mapping) {
       // マッピングがないSKUは計算不能なのでスキップ。ただし黙って消すと納品漏れになるため meta に残す。
-      // 稼働実績の有無で仕分け (実績ゼロ=バリエーション登録専用等の未使用SKU → 警告にしない)
-      const inbound = (snap.fba_inbound_working || 0) + (snap.fba_inbound_shipped || 0) + (snap.fba_inbound_received || 0);
+      // 稼働実績の有無で仕分け (実績ゼロ=バリエーション登録専用等の未使用SKU → 警告にしない)。
+      // 「実績」は片側だけ見ると取りこぼすため、生きているSKUを示す全シグナルを見る:
+      //   FBA販売 / FBA在庫 / 入荷中 (準備中はAPI優先=通常計算と同じ基準) / Amazon推奨 / 他CH販売
+      const workingOverride = lookupInboundWorking(sku);
+      const working = workingOverride !== undefined ? (workingOverride || 0) : (snap.fba_inbound_working || 0);
+      const inbound = working + (snap.fba_inbound_shipped || 0) + (snap.fba_inbound_received || 0);
       const sold30d = snap.units_sold_30d || 0;
       const fbaQty = snap.fba_available || 0;
-      if (sold30d > 0 || fbaQty > 0 || inbound > 0) {
-        unmappedActive.push({ sku, units_sold_30d: sold30d, fba_available: fbaQty, fba_inbound: inbound });
+      const amazonReco = snap.amazon_recommended_qty; // null=未取得
+      const nonFba30d = nonFbaMax60dNormMap[normCode(sku)]?.max_30d || 0; // 他CHのみ販売のSKUを拾う
+      if (sold30d > 0 || fbaQty > 0 || inbound > 0 || (typeof amazonReco === 'number' && amazonReco > 0) || nonFba30d > 0) {
+        unmappedActive.push({
+          sku, units_sold_30d: sold30d, fba_available: fbaQty, fba_inbound: inbound,
+          amazon_recommended_qty: amazonReco ?? null, non_fba_sales_30d: nonFba30d,
+        });
       } else {
         unmappedInactive.push(sku);
       }
@@ -150,10 +170,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // inboundWorking: Inbound API のリアルタイムデータを信頼。
     // レポート側の Working 列は信頼しない (0 のことが多く、遅延・残骸を含むため)
+    // 参照は norm キー (総点検 B-4: exact-case だと case 差で override が落ち二重推奨に戻る)
     let inboundWorking;
     let workingSource; // デバッグ用: データソース
-    if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
-      inboundWorking = inboundWorkingOverride[sku];
+    const workingOverrideVal = lookupInboundWorking(sku);
+    if (workingOverrideVal !== undefined) {
+      inboundWorking = workingOverrideVal;
       workingSource = 'API';
     } else {
       // API失敗時: レポートの working を参考値として使う (通常商品のみ)

@@ -1030,7 +1030,8 @@
           parts.push(`・【重要】<b>販売/在庫があるのにSKUマッピング未登録: ${dq.unmapped_active_count}件</b>`
             + ` — 実績があるのにどのタブにも出ません (納品漏れの恐れ)。スプシに登録して同期してください`
             + details('SKU一覧を表示', skuList(dq.unmapped_active || [], 200,
-                s => `${s.sku} (30日販売${s.units_sold_30d}/FBA在庫${s.fba_available}/入荷中${s.fba_inbound})`)));
+                s => `${s.sku} (30日販売${s.units_sold_30d}/FBA在庫${s.fba_available}/入荷中${s.fba_inbound}`
+                   + `/Amazon推奨${s.amazon_recommended_qty ?? '-'}/他CH30日${s.non_fba_sales_30d ?? 0})`)));
         }
         if (dq?.invalid_mapping_count > 0) {
           parts.push(`・【重要】<b>セット構成が不正: ${dq.invalid_mapping_count}件</b> — 誤数量防止のため該当SKUの推奨を停止中。スプシのセット構成を修正してください`
@@ -4153,11 +4154,12 @@ Step10: アラート判定
             log('データが存在するため自動で推奨リスト生成中...');
             const res = await fetch(`${BASE}/api/recommendations?debug=1`);
             const d = await res.json();
+            // データ欠損の表示は items の有無に関わらず行う (全SKUが未マッピングで items=0 のときこそ出したい)
+            if (!d.error) renderDataQualityBanner(d.data_quality);
             if (!d.error && d.items && d.items.length > 0) {
               recData = d.items || [];
               recMeta = d;
               manualItems = [];
-              renderDataQualityBanner(d.data_quality);
               log(`自動生成完了: 全${d.total_skus}SKU / 推奨${d.recommended_skus}SKU`);
               document.getElementById('recSection').style.display = '';
               updateRecSummary();
