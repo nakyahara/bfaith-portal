@@ -25,7 +25,7 @@ import { mkdir, copyFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { openContext, ensureRmsLogin, safeHost, assertLoginEnv } from './lib-rakuten-login.mjs';
+import { openContext, ensureRmsLogin, safeHost, assertLoginEnv, isAuthBlocked } from './lib-rakuten-login.mjs';
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -275,7 +275,7 @@ async function main() {
         await logFetch({ report_type: 'rreview_csv', period_from: win.from, period_to: win.to, status: 'error', message: e.message });
         outcomes.push({ spec: 'review', ym: label, status: 'error' });
         failures.push({ reportType: 'rreview_csv', ym: label, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rreview_${win.from}_error.png`) });
-        if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+        if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
         if (!backfill) break;
         // バックフィルは1窓の失敗で残りを止めない (欠けた月は再実行で埋める)
       }
@@ -294,19 +294,22 @@ async function main() {
     }
   } catch (err) {
     const is2fa = String(err.message).startsWith('2FA_REQUIRED');
+    const isUnstable = String(err.message).startsWith('RMS_SESSION_UNSTABLE');
     console.error(`\n⚠️ ${err.message}`);
     await snap(page, 'error');
     await sendGChat(buildErrorReport({
       mall: 'rakuten-review', outcomes, logPath: runLog.logPath,
       failures: [{
-        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : 'rreview(共通処理)',
+        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : isUnstable ? 'RMS_SESSION_UNSTABLE (全レポート停止)' : 'rreview(共通処理)',
         error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'rreview_error.png'),
       }],
       repro: is2fa
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs → 手動ログイン+「信頼できる端末」登録 (14日ごと)'
-        : 'node scripts/mall-csv-fetcher/rakuten-review-download.mjs',
+        : isUnstable
+          ? '楽天側の利用規制/障害の可能性 → ログイン連打を避けて当日は手動DL。回復確認は翌朝の自動実行'
+          : 'node scripts/mall-csv-fetcher/rakuten-review-download.mjs',
     }), 'rakuten-review');
-    process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
+    process.exitCode = (is2fa || isUnstable) ? 3 : 1; // 3=手動対応必須/blocked (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');

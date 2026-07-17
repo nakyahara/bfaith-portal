@@ -153,8 +153,23 @@ async function passNotice(page) {
 // セクションごとの ensureRmsLogin が1回の実行で11回ログイン (= 規制を悪化させる燃料)。
 // 正常時はセッションが持続するので1回で足りる。上限超過は「ログインしても維持できない
 // 状態」であり、以降は再ログインせず即エラーにする (手動DLフォールバックへ)。
-const MAX_LOGINS_PER_RUN = Number(process.env.RMS_MAX_LOGINS_PER_RUN || 3);
+// env は厳格に検証: 不正値 (NaN/0以下) で上限が無効化されると連打防止が破られる (Codex R1)
+const MAX_LOGINS_PER_RUN = (() => {
+  const raw = process.env.RMS_MAX_LOGINS_PER_RUN;
+  if (raw === undefined || raw === '') return 3;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 20) {
+    console.warn(`[login] RMS_MAX_LOGINS_PER_RUN=${raw} は不正 (1〜20の整数) → 既定3を使用`);
+    return 3;
+  }
+  return n;
+})();
 let loginCount = 0;
+
+/** 2FA/セッション不安定など「リトライ・再ログインで直らない」認証系エラーか (exit 3 契約用) */
+export function isAuthBlocked(message) {
+  return /^(2FA_REQUIRED|RMS_SESSION_UNSTABLE)/.test(String(message));
+}
 
 /** R-Login → 楽天会員 → RMS のログイン列を実行。2FA要求時は throw。 */
 async function runLogin(page) {

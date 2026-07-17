@@ -120,10 +120,19 @@ const FETCHERS = process.env.MALL_FETCHERS_JSON
   : DEFAULT_FETCHERS;
 
 // リトライまでの待ち時間。25分 = 一過性のRMS側不調 (実測: 2026-07-17は5:31〜5:37の間
-// 全滅→5:38に成功例) を跨ぎつつ、7:00 の daily-sync 取込前に完了できる長さ
-const RETRY_DELAY_MS = process.env.MALL_FETCH_RETRY_DELAY_MS !== undefined
-  ? Number(process.env.MALL_FETCH_RETRY_DELAY_MS)
-  : 25 * 60 * 1000;
+// 全滅→5:38に成功例) を跨ぎつつ、7:00 の daily-sync 取込前に完了できる長さ。
+// 不正値は既定に倒す (NaNで即時リトライ/タイマー異常になるのを防ぐ — Codex R1)
+const RETRY_DELAY_MS = (() => {
+  const DEFAULT = 25 * 60 * 1000;
+  const raw = process.env.MALL_FETCH_RETRY_DELAY_MS;
+  if (raw === undefined || raw === '') return DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 2 * 60 * 60 * 1000) {
+    console.warn(`[retry] MALL_FETCH_RETRY_DELAY_MS=${raw} は不正 (0〜7200000の整数ms) → 既定25分を使用`);
+    return DEFAULT;
+  }
+  return n;
+})();
 
 /** 子スクリプトを1回実行して結果を返す */
 function runFetcher(f, extraEnv = {}) {
