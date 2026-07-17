@@ -156,6 +156,17 @@ export function ensureCampaignTables(db) {
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`);
+
+  // vendor (らくらくーぽん) の日次送信実績 (PR-C2)。管理画面「メール配信履歴」の日次件数を
+  // 中原さんが手で転記する (宛先単位のエクスポートは vendor 画面に存在しない)。件数のみ=PIIなし
+  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_vendor_send_daily (
+    date_jst    TEXT NOT NULL CHECK (date_jst GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    action_type TEXT NOT NULL CHECK (action_type IN ('follow','coupon')),
+    sent_count  INTEGER NOT NULL CHECK (sent_count >= 0),
+    source      TEXT NOT NULL DEFAULT 'manual',
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY (date_jst, action_type)
+  )`);
 }
 
 // ─── planner 本体 (1回の実行 = 1トランザクション) ───
@@ -466,6 +477,84 @@ export function planCampaigns(db, opts = {}) {
   });
   tx();
   return counts;
+}
+
+// ─── PR-C2: vendor 実績記録と shadow 突合 ───
+/** vendor 日次送信件数の記録 (UPSERT。訂正転記を許す) */
+export function recordVendorDaily(db, { dateJst, actionType, count, source = 'manual', nowIso = new Date().toISOString() }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateJst))) throw new Error(`VENDOR_RECORD: 日付が不正 (${dateJst})`);
+  if (!['follow', 'coupon'].includes(actionType)) throw new Error(`VENDOR_RECORD: action_type が不正 (${actionType})`);
+  const n = Number(count);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`VENDOR_RECORD: 件数が不正 (${count})`);
+  db.prepare(`
+    INSERT INTO rakuten_vendor_send_daily (date_jst, action_type, sent_count, source, recorded_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(date_jst, action_type) DO UPDATE SET
+      sent_count = excluded.sent_count, source = excluded.source, recorded_at = excluded.recorded_at
+  `).run(dateJst, actionType, n, String(source), nowIso);
+}
+
+/**
+ * shadow 突合レポート (PR-C2)。日付 (JST) × action_type ごとに
+ * vendor 実績件数 vs shadow would-send 件数を並べる。
+ *
+ * shadow would-send の定義: ready_at IS NOT NULL の action を **scheduled_at の JST 暦日**で集計
+ * (ready_at は planner の観測時刻で送信予定時刻ではない — planner は朝実行のため正午予定の
+ * action は翌朝 ready になる。vendor は当日12時台に送るので比較軸は scheduled_at)。
+ * 後から suppressed/expired になった action も「その時点では送ったはず」なので含める。
+ * PII なし (件数のみ)。
+ */
+export function shadowComparisonReport(db, { fromJst, toJst }) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromJst) || !/^\d{4}-\d{2}-\d{2}$/.test(toJst) || fromJst > toJst) {
+    throw new Error(`REPORT: 期間が不正 (${fromJst}..${toJst})`);
+  }
+  const vendorRows = db.prepare(`
+    SELECT date_jst, action_type, sent_count FROM rakuten_vendor_send_daily
+     WHERE date_jst >= ? AND date_jst <= ?
+  `).all(fromJst, toJst);
+  // scheduled_at は UTC ISO → JST 暦日は JS 側で変換 (SQLite の日付関数に依存しない)
+  const shadowRows = db.prepare(`
+    SELECT action_type, scheduled_at FROM rakuten_campaign_actions WHERE ready_at IS NOT NULL
+  `).all();
+  const days = new Map(); // date_jst → {follow:{vendor,shadow}, coupon:{vendor,shadow}}
+  const dayOf = (d) => {
+    if (!days.has(d)) days.set(d, { follow: { vendor: null, shadow: 0 }, coupon: { vendor: null, shadow: 0 } });
+    return days.get(d);
+  };
+  for (const r of shadowRows) {
+    const d = jstDateOf(r.scheduled_at);
+    if (d && d >= fromJst && d <= toJst) dayOf(d)[r.action_type].shadow++;
+  }
+  for (const r of vendorRows) dayOf(r.date_jst)[r.action_type].vendor = r.sent_count;
+
+  // 差分の説明材料: 期間内に予定があったのに would-send にならなかった action の状態×理由の内訳
+  // (scheduled_at の JST 期間絞りが必要なため JS 側で集計)
+  const nonReady = db.prepare(`
+    SELECT action_type, status, COALESCE(status_reason, '') AS reason, scheduled_at
+      FROM rakuten_campaign_actions WHERE ready_at IS NULL
+  `).all();
+  const reasonMap = new Map();
+  for (const r of nonReady) {
+    const d = jstDateOf(r.scheduled_at);
+    if (!d || d < fromJst || d > toJst) continue;
+    const key = `${r.action_type}|${r.status}|${r.reason}`;
+    reasonMap.set(key, (reasonMap.get(key) || 0) + 1);
+  }
+  const reasonRows = [...reasonMap.entries()]
+    .map(([k, n]) => { const [action_type, status, reason] = k.split('|'); return { action_type, status, reason, n }; })
+    .sort((a, b) => a.action_type.localeCompare(b.action_type) || b.n - a.n);
+
+  const dayRows = [...days.entries()]
+    .filter(([d]) => d >= fromJst && d <= toJst)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date_jst, v]) => ({
+      date_jst,
+      follow_vendor: v.follow.vendor, follow_shadow: v.follow.shadow,
+      follow_diff: v.follow.vendor == null ? null : v.follow.shadow - v.follow.vendor,
+      coupon_vendor: v.coupon.vendor, coupon_shadow: v.coupon.shadow,
+      coupon_diff: v.coupon.vendor == null ? null : v.coupon.shadow - v.coupon.vendor,
+    }));
+  return { fromJst, toJst, days: dayRows, reasons: reasonRows };
 }
 
 /** 状態サマリ (CLI stats 用。PII なし) */

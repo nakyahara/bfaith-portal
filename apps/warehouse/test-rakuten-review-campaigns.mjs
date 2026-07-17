@@ -12,6 +12,7 @@ import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats, dedupeKeyFor,
   jstDateOf, jstNoonUtcIso, nextNoonJstAfter, followScheduleFor, postedAtToUtcIso,
+  recordVendorDaily, shadowComparisonReport,
 } from './rakuten-review-campaign-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey,
@@ -369,6 +370,58 @@ console.log('=== 9. cutover-aware ownership + FK強制 ===');
                 VALUES (999999, 'orphan', '2026-08-10T00:00:00Z', 'accepted')`).run();
   } catch { orphanBlocked = true; }
   check('存在しない action への attempt は FK 違反で拒否', orphanBlocked);
+}
+
+console.log('=== 10. PR-C2: vendor実績記録+shadow突合レポート ===');
+{
+  // 独立DBで固定フィクスチャ (前セクションのノイズと分離)
+  const db2 = new Database(path.join(tmp, 'warehouse2.db'));
+  db2.pragma('foreign_keys = ON');
+  ensureRakutenReviewTables(db2);
+  ensureContactTables(db2);
+  ensureCampaignTables(db2);
+  const ins = db2.prepare(`
+    INSERT INTO rakuten_campaign_actions (
+      action_type, dedupe_key, order_number, status, status_reason, template_version,
+      scheduled_at, expires_at, ready_at, created_at, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const noon18 = '2026-07-18T03:00:00.000Z', noon19 = '2026-07-19T03:00:00.000Z', noon20 = '2026-07-20T03:00:00.000Z';
+  const exp = '2026-08-01T00:00:00.000Z', t0 = '2026-07-17T00:00:00.000Z';
+  ins.run('follow', 'k1', 'O1', 'ready', null, 'follow:v1', noon18, exp, '2026-07-19T00:00:00.000Z', t0, t0);
+  ins.run('follow', 'k2', 'O2', 'suppressed', 'review_exists', 'follow:v1', noon18, exp, '2026-07-19T00:00:00.000Z', t0, t0); // ready後に抑止=would-sendに含む
+  ins.run('coupon', 'k3', 'O3', 'planned', 'awaiting_contact', 'coupon:v1:either', noon18, exp, null, t0, t0);   // 説明材料
+  ins.run('coupon', 'k4', 'O4', 'ready', null, 'coupon:v1:either', noon19, exp, '2026-07-20T00:00:00.000Z', t0, t0);
+  ins.run('follow', 'k5', 'O5', 'ready', null, 'follow:v1', noon20, exp, '2026-07-21T00:00:00.000Z', t0, t0);   // 期間外
+
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'follow', count: 3, nowIso: t0 });
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'coupon', count: 1, nowIso: t0 });
+  recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'coupon', count: 2, nowIso: t0 }); // 訂正転記
+
+  const rep = shadowComparisonReport(db2, { fromJst: '2026-07-18', toJst: '2026-07-19' });
+  const d18 = rep.days.find((d) => d.date_jst === '2026-07-18');
+  const d19 = rep.days.find((d) => d.date_jst === '2026-07-19');
+  check('7/18 follow: vendor=3 / shadow=2 (ready後suppressedも含む) / 差=-1',
+    d18.follow_vendor === 3 && d18.follow_shadow === 2 && d18.follow_diff === -1, JSON.stringify(d18));
+  check('7/18 coupon: vendor=2 (訂正UPSERTが効く) / shadow=0 / 差=-2',
+    d18.coupon_vendor === 2 && d18.coupon_shadow === 0 && d18.coupon_diff === -2, JSON.stringify(d18));
+  check('7/19 coupon: vendor未転記=null / shadow=1 / 差=null',
+    d19.coupon_vendor === null && d19.coupon_shadow === 1 && d19.coupon_diff === null, JSON.stringify(d19));
+  check('期間外 (7/20予定) の would-send は含まれない', !rep.days.find((d) => d.date_jst === '2026-07-20'));
+  check('説明材料: coupon planned(awaiting_contact) が期間内内訳に出る',
+    rep.reasons.some((r) => r.action_type === 'coupon' && r.status === 'planned' && r.reason === 'awaiting_contact' && r.n === 1),
+    JSON.stringify(rep.reasons));
+
+  let badDate = false, badType = false, badCount = false, badRange = false;
+  try { recordVendorDaily(db2, { dateJst: '2026/07/18', actionType: 'follow', count: 1 }); } catch { badDate = true; }
+  try { recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'mail', count: 1 }); } catch { badType = true; }
+  try { recordVendorDaily(db2, { dateJst: '2026-07-18', actionType: 'follow', count: -1 }); } catch { badCount = true; }
+  try { shadowComparisonReport(db2, { fromJst: '2026-07-19', toJst: '2026-07-18' }); } catch { badRange = true; }
+  check('不正入力は全て fail-fast (日付/種別/件数/期間)', badDate && badType && badCount && badRange);
+
+  const dump = JSON.stringify(rep);
+  check('レポートに注文番号が含まれない (件数のみ)', !dump.includes('O1') && !dump.includes('O4'));
+  db2.close();
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
