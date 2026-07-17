@@ -1,15 +1,17 @@
 // 楽天 受信同期の手動/cron実行ランナー (Step 2)
 //
-// 使い方:
-//   DATA_DIR=/data RAKUTEN_SERVICE_SECRET=... RAKUTEN_LICENSE_KEY=... \
-//     node apps/inquiry-hub/scripts/run-sync-rakuten.mjs [--deep] [--repair] [--backfill-days N] [--lookback-days N]
+// 使い方 (transportは環境変数から自動判別):
+//   Render (楽天キーを置かない設計原則 → miniPC passthrough 経由。WAREHOUSE_URL等はRYS/mercariで設定済み):
+//     DATA_DIR=/data node apps/inquiry-hub/scripts/run-sync-rakuten.mjs [--deep] [--repair] [--backfill-days N] [--lookback-days N]
+//   miniPC/直接 (RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY がある環境):
+//     DATA_DIR=... RAKUTEN_SERVICE_SECRET=... RAKUTEN_LICENSE_KEY=... node ...
 // 初回セットアップ (shops に楽天店舗行が無い場合のみ):
 //   ... run-sync-rakuten.mjs --create-shop <楽天shopId> <店舗名>
 //
 // --deep            : lookback を365日に広げて再照合 (60日より古い問い合わせへの追い返信を補完。日次想定)
 // --lookback-days N : lookback 幅の明示指定 (--deep より優先。365日超の追い返信を拾いたい場合等)
 // --repair          : エンジンの修復同期 (直近3日を強制再照合。§8.1)
-// ⚠️ 認証情報は環境変数の1組のみ = 楽天1店舗運用が前提。複数店舗にする場合は店舗ごとの
+// ⚠️ 認証情報は環境の1組のみ = 楽天1店舗運用が前提。複数店舗にする場合は店舗ごとの
 //    認証情報管理 (shops拡張) が必要 (レスポンスshopId照合はアダプターが行う)
 // ⚠️ 本番 DATA_DIR は /data (Render)。/var/data ではない
 import { initInquiryHubDB, getDB } from '../db.js';
@@ -49,9 +51,21 @@ async function main() {
     console.log(r.changes ? `shops に楽天店舗を作成: ${shopName} (${accountId})` : `既存: account_identifier=${accountId} (変更なし)`);
   }
 
-  const { RAKUTEN_SERVICE_SECRET, RAKUTEN_LICENSE_KEY } = process.env;
-  if (!RAKUTEN_SERVICE_SECRET || !RAKUTEN_LICENSE_KEY) {
-    console.error('FATAL: RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY を指定してください');
+  // transport 自動判別: 楽天キーがあれば direct、なければ miniPC passthrough (warehouse)
+  const { RAKUTEN_SERVICE_SECRET, RAKUTEN_LICENSE_KEY,
+    WAREHOUSE_URL, WAREHOUSE_SERVICE_TOKEN, CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET } = process.env;
+  let transportCfg;
+  if (RAKUTEN_SERVICE_SECRET && RAKUTEN_LICENSE_KEY) {
+    transportCfg = { transport: 'direct', serviceSecret: RAKUTEN_SERVICE_SECRET, licenseKey: RAKUTEN_LICENSE_KEY };
+    console.log('transport=direct (RMS直接)');
+  } else if (WAREHOUSE_URL && WAREHOUSE_SERVICE_TOKEN && CF_ACCESS_CLIENT_ID && CF_ACCESS_CLIENT_SECRET) {
+    transportCfg = { transport: 'warehouse', warehouseUrl: WAREHOUSE_URL, serviceToken: WAREHOUSE_SERVICE_TOKEN,
+      cfClientId: CF_ACCESS_CLIENT_ID, cfClientSecret: CF_ACCESS_CLIENT_SECRET };
+    console.log('transport=warehouse (miniPC passthrough 経由)');
+  } else {
+    console.error('FATAL: 認証情報がありません。以下のどちらかを設定してください:');
+    console.error('  direct:    RAKUTEN_SERVICE_SECRET + RAKUTEN_LICENSE_KEY');
+    console.error('  warehouse: WAREHOUSE_URL + WAREHOUSE_SERVICE_TOKEN + CF_ACCESS_CLIENT_ID + CF_ACCESS_CLIENT_SECRET');
     return 2;
   }
 
@@ -73,8 +87,7 @@ async function main() {
   for (const shop of shops) {
     // 店舗ごとにアダプター生成: レスポンス shopId と account_identifier を照合し他店舗データの混入を防ぐ
     const adapter = createRakutenAdapter({
-      serviceSecret: RAKUTEN_SERVICE_SECRET,
-      licenseKey: RAKUTEN_LICENSE_KEY,
+      ...transportCfg,
       expectedShopId: shop.account_identifier,
       ...(lookbackDays != null ? { lookbackDays }
         : args.includes('--deep') ? { lookbackDays: DEEP_LOOKBACK_DAYS } : {}),

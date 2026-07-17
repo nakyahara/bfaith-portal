@@ -206,6 +206,35 @@ console.log('5. 失敗系');
   try { createRakutenAdapter({ sleepMs: 0 }); } catch (e) { eCred = e; }
   check('認証情報なしは生成時に throw', eCred !== null);
 
+  // warehouse transport: URL/ヘッダの組立 (Renderに楽天キーを置かない設計原則)
+  const fWh = (() => {
+    const calls = [];
+    const fn = async (url, opts) => {
+      calls.push({ url, headers: opts.headers });
+      return { status: 200, json: async () => pageBody([]), text: async () => '' };
+    };
+    fn.calls = calls;
+    return fn;
+  })();
+  const adWh = createRakutenAdapter({
+    transport: 'warehouse', warehouseUrl: 'https://wh.example.com/', serviceToken: 'tok',
+    cfClientId: 'cfid', cfClientSecret: 'cfsec', sleepMs: 0, fetchImpl: fWh,
+  });
+  await adWh.fetchNew({ sinceIso: '2026-07-17T02:00:00Z', untilIso: '2026-07-17T03:00:00Z' });
+  check('warehouse: passthrough URLを叩く (末尾スラッシュ吸収)',
+    fWh.calls[0].url.startsWith('https://wh.example.com/service-api/rakuten-rms/inquiries?fromDate='), fWh.calls[0].url);
+  check('warehouse: CF Access + Bearerヘッダ',
+    fWh.calls[0].headers['CF-Access-Client-Id'] === 'cfid'
+    && fWh.calls[0].headers['CF-Access-Client-Secret'] === 'cfsec'
+    && fWh.calls[0].headers.Authorization === 'Bearer tok');
+  check('warehouse: 楽天キーなしで生成できる', true);
+  let eWhCfg = null;
+  try { createRakutenAdapter({ transport: 'warehouse', warehouseUrl: 'x', sleepMs: 0 }); } catch (e) { eWhCfg = e; }
+  check('warehouse: 設定不足は生成時に throw', eWhCfg !== null);
+  let eBadTransport = null;
+  try { createRakutenAdapter({ transport: 'nope', sleepMs: 0 }); } catch (e) { eBadTransport = e; }
+  check('未知transportは生成時に throw', eBadTransport !== null);
+
   // タイムアウト (AbortSignal.timeout 発火) は fetch_failed に分類される
   const timeoutErr = new Error('The operation was aborted due to timeout');
   timeoutErr.name = 'TimeoutError';

@@ -265,6 +265,29 @@ router.post('/items/details-bulk', rateLimitMiddleware('rakuten'), async (req, r
 });
 
 // ==========================================
+// 問い合わせ管理API (inquirymng-api) — inquiry-hub 受信同期で使用
+// ==========================================
+// 設計原則: Render に楽天キーを置かない (rakuten-rms-proxy.js と同じ)。
+// inquiry-hub (Render) はこの passthrough を Cloudflare Tunnel + サービストークン経由で叩く。
+// ⚠️ read-only のみ。返信・既読化・完了化などの変更系 passthrough は意図的に作らない
+//    (送信系は Step 4 で outbox worker と一体で設計する。無条件 passthrough は事故のもと)
+
+router.get('/inquiries', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    // パラメータは許可リスト方式 (任意パス注入をさせない)
+    const params = new URLSearchParams();
+    for (const k of ['fromDate', 'toDate', 'limit', 'page', 'noMerchantReply']) {
+      if (req.query[k] != null) params.set(k, String(req.query[k]));
+    }
+    const result = await rakutenRequest({ path: `/es/1.0/inquirymng-api/inquiries?${params.toString()}` });
+    // RMS のレスポンスをステータスごと素通し (アダプター側が形を検証する)
+    res.status(result.status).json(result.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// ==========================================
 // ステータス
 // ==========================================
 
