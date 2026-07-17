@@ -10,12 +10,13 @@
  *   - 多重起動防止: プロセス内 tickRunning ガード + エンジンの sync_state リース (BEGIN IMMEDIATE) の二段
  *   - 3連続失敗で GChat 通知 (GCHAT_WEBHOOK。未設定なら stdout のみ。fail-soft)
  *
- * 現状は楽天チャネルのみ。Yahoo!/Gmail アダプター追加時にこの tick へ組み込む。
+ * 対応チャネル: 楽天 (miniPC passthrough経由) / Yahoo! (VPSプロキシ経由)。Gmail は追加時にこの tick へ組み込む。
  */
 import cron from 'node-cron';
 import { getDB } from '../db.js';
 import { runSync } from './engine.js';
 import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAYS } from './adapters/rakuten.js';
+import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DAYS } from './adapters/yahoo.js';
 import { sendGChatMessage } from '../../profit-analysis/gchat-client.js';
 
 export const DEFAULT_SYNC_CRON = '*/15 * * * *';
@@ -76,25 +77,42 @@ export async function runInquiryHubSyncTick(opts = {}) {
   tickRunning = true;
   const t0 = Date.now();
   try {
-    const transportCfg = resolveRakutenTransportFromEnv();
-    if (!transportCfg && !adapterFactory) {
-      console.warn('[inquiry-hub-cron] 楽天 transport の env が未設定のためスキップ (RAKUTEN_* か WAREHOUSE_URL 一式が必要)');
-      return { skipped: 'no_transport' };
-    }
+    // チャネルごとの transport 解決。env 未設定のチャネルはスキップ (別チャネルの同期は止めない)
+    const transports = {
+      rakuten: resolveRakutenTransportFromEnv(),
+      yahoo: resolveYahooTransportFromEnv(),
+    };
     const db = getDB();
     const shops = db.prepare(`SELECT * FROM shops
-      WHERE channel_type = 'rakuten' AND is_active = 1 AND executor = 'server'`).all();
+      WHERE channel_type IN ('rakuten', 'yahoo') AND is_active = 1 AND executor = 'server'`).all();
     if (shops.length === 0) return { skipped: 'no_shops' };
+
+    const buildAdapter = (shop) => {
+      const transportCfg = transports[shop.channel_type];
+      if (!transportCfg) return null;
+      if (shop.channel_type === 'rakuten') {
+        return createRakutenAdapter({
+          ...transportCfg,
+          expectedShopId: shop.account_identifier,
+          ...(deep ? { lookbackDays: DEEP_LOOKBACK_DAYS } : {}),
+        });
+      }
+      return createYahooAdapter({
+        ...transportCfg,
+        ...(deep ? { listLookbackDays: DEEP_LIST_LOOKBACK_DAYS } : {}),
+      });
+    };
 
     const results = [];
     for (const shop of shops) {
       const adapter = adapterFactory
-        ? adapterFactory(shop, transportCfg, deep)
-        : createRakutenAdapter({
-            ...transportCfg,
-            expectedShopId: shop.account_identifier,
-            ...(deep ? { lookbackDays: DEEP_LOOKBACK_DAYS } : {}),
-          });
+        ? adapterFactory(shop, transports[shop.channel_type], deep)
+        : buildAdapter(shop);
+      if (!adapter) {
+        console.warn(`[inquiry-hub-cron] SKIP ${shop.shop_name} (${shop.channel_type}): transport env 未設定`);
+        results.push({ shopId: shop.id, shop: shop.shop_name, skipped: 'no_transport' });
+        continue;
+      }
       const r = await runSync(shop.id, adapter);
       results.push({ shopId: shop.id, shop: shop.shop_name, ...r });
       if (r.ok) {
