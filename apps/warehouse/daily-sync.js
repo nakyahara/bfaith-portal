@@ -620,6 +620,15 @@ async function main() {
     );
     results.push({ name: '楽天レビューcontacts 取得', ...reviewContactsResult });
 
+    // === 楽天レビュー campaign planner shadow (mall-csv-fetcher P2 PR-C1、らくらくーぽん置換) ===
+    // 「らくらくーぽんなら何をいつ送るか」を rakuten_campaign_actions に記録するだけ (送信ゼロ)。
+    // contacts が古くても plan 自体は安全なため取得失敗時も実行する (材料が減るだけ)
+    const campaignPlanResult = runScript(
+      `apps/warehouse/plan-rakuten-review-campaigns.js plan --data-dir ${DATA_DIR_ARG}`,
+      '楽天レビュー campaign plan (shadow)', 600000
+    );
+    results.push({ name: '楽天レビュー campaign plan (shadow)', ...campaignPlanResult });
+
     // === Yahoo!ストクリ統計CSV 取込 + mirror sync (mall-csv-fetcher P1-Y) ===
     // 自動DL (yahoo-data-download.mjs、fetch-all 05:30) が incoming/yahoo-data/ に置いた
     // CSVを取り込む。対象0件は正常。--days 110 = 全体分析の一括100日レンジをカバー
