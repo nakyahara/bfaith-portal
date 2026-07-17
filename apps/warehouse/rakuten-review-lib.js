@@ -45,11 +45,18 @@ export function ensureRakutenReviewTables(db) {
     first_seen_at TEXT NOT NULL,
     last_seen_at  TEXT NOT NULL,
     is_deleted    INTEGER NOT NULL DEFAULT 0,
+    miss_count    INTEGER NOT NULL DEFAULT 0,
     source_file   TEXT,
     import_id     INTEGER,
     imported_at   TEXT NOT NULL,
     updated_at    TEXT NOT NULL
   )`);
+  // miss_count / last_missed_on は PR-B で後付け (PR-A で作成済みの本番テーブル向け冪等 migration)
+  {
+    const cols = db.prepare(`PRAGMA table_info(fact_rakuten_reviews)`).all().map(c => c.name);
+    if (!cols.includes('miss_count')) db.exec(`ALTER TABLE fact_rakuten_reviews ADD COLUMN miss_count INTEGER NOT NULL DEFAULT 0`);
+    if (!cols.includes('last_missed_on')) db.exec(`ALTER TABLE fact_rakuten_reviews ADD COLUMN last_missed_on TEXT`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_frr_date ON fact_rakuten_reviews(date_jst)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_frr_order ON fact_rakuten_reviews(order_number)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_frr_item ON fact_rakuten_reviews(item_id, date_jst)`);
@@ -213,13 +220,28 @@ export function hashReviewContent(rec) {
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 24);
 }
 
+/** ファイル名の要求窓マーカー `_d<from>_<to>_` を読む (downloaderの命名契約。無ければ null) */
+export function parseWindowMarker(name) {
+  const m = String(name).match(/_d(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})[_.]/);
+  if (!m) return null;
+  const [, from, to] = m;
+  if (from > to) return null;
+  return { from, to };
+}
+
 // ─── 取込 (1ファイル = 1トランザクション) ───
 /**
  * @returns {status:'ok'|'duplicate'|'error', results:[...], newLowRatings:[...]}
  *   newLowRatings = 今回のファイルで「新規に現れた」★2以下 (GChat通知用、本文は含めない)
+ *
+ * 削除検知 (PR-B、Codex R2#3): ファイル名に要求窓マーカーがある場合、
+ * 「窓内の既存レビューがCSVに現れない」を不在1回と数え、**2回連続不在で is_deleted=1**
+ * (1回の欠けはCSV出力揺れの誤検知防止)。再出現したら miss_count リセット+is_deleted 解除
+ * (fact は実態への自己修復を優先。フォロー/クーポンを削除で再開しない判断は PR-C の planner 側で行う)。
+ * 窓マーカーが無いファイル (手動DL等) では削除検知しない。
  */
-export function importReviewFile(db, { name, buffer, sha256, source = 'incoming' }) {
-  const now = new Date().toISOString();
+export function importReviewFile(db, { name, buffer, sha256, source = 'incoming', nowIso = null }) {
+  const now = nowIso || new Date().toISOString(); // nowIso はテスト用の時刻注入 (同日ガードの検証)
 
   const dup = db.prepare(`
     SELECT id FROM raw_rakuten_review_import_log WHERE file_sha256 = ? AND status = 'ok'
@@ -259,14 +281,18 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
       rating = @rating, posted_at = @posted_at, date_jst = @date_jst,
       title = @title, body = @body, flag = @flag, order_number = @order_number,
       todo_flag = @todo_flag, source_hash = @source_hash,
-      last_seen_at = @now, is_deleted = 0, source_file = @source_file,
+      last_seen_at = @now, is_deleted = 0, miss_count = 0, source_file = @source_file,
       import_id = @import_id, updated_at = @now
     WHERE review_url = @review_url
   `);
-  const touchStmt = db.prepare(`UPDATE fact_rakuten_reviews SET last_seen_at = ?, is_deleted = 0 WHERE review_url = ?`);
+  const touchStmt = db.prepare(`UPDATE fact_rakuten_reviews SET last_seen_at = ?, is_deleted = 0, miss_count = 0 WHERE review_url = ?`);
   const revisionStmt = db.prepare(`
     INSERT OR IGNORE INTO fact_rakuten_review_revisions (review_url, observed_at, source_hash, rating, posted_at, is_deleted)
     VALUES (?, ?, ?, ?, ?, 0)
+  `);
+  const deletedRevisionStmt = db.prepare(`
+    INSERT OR IGNORE INTO fact_rakuten_review_revisions (review_url, observed_at, source_hash, rating, posted_at, is_deleted)
+    VALUES (?, ?, ?, ?, ?, 1)
   `);
   const logStmt = db.prepare(`
     INSERT INTO raw_rakuten_review_import_log (
@@ -281,8 +307,17 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
     VALUES (?, ?, ?, ?, ?, ?)
   `);
 
+  const missStmt = db.prepare(`UPDATE fact_rakuten_reviews SET miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_url = ?`);
+  const markDeletedStmt = db.prepare(`UPDATE fact_rakuten_reviews SET is_deleted = 1, miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_url = ?`);
+  const activeInWindowStmt = db.prepare(`
+    SELECT review_url, miss_count, last_missed_on, rating, posted_at, source_hash
+    FROM fact_rakuten_reviews
+    WHERE date_jst >= ? AND date_jst <= ? AND is_deleted = 0
+  `);
+  const windowMarker = parseWindowMarker(name);
+
   const newLowRatings = [];
-  let inserted = 0, updated = 0, unchanged = 0;
+  let inserted = 0, updated = 0, unchanged = 0, missed = 0, deleted = 0;
   const tx = db.transaction(() => {
     const logInfo = logStmt.run(
       now, source, name, sha256, prepared.dateFrom, prepared.dateTo,
@@ -322,6 +357,29 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
         unchanged++;
       }
     }
+    // 削除検知: 要求窓の中にいるはずの既存レビューがCSVに現れない → 不在カウント。
+    // 今回のファイルで見えた行は上の UPSERT で miss_count=0 に戻っている。
+    // ガード (Codex R1): ①0件CSVでは判定しない (検索不調の空CSVで窓内全件を
+    // 不在扱いにする事故防止。0件窓は downloader がそもそもファイルを作らない)
+    // ②同じ日の複数ファイル (日次窓+バックフィル月窓の重複等) では不在を1回しか数えない
+    // = 「2回連続不在」は必ず2日以上にまたがる独立観測になる
+    if (windowMarker && prepared.records.length > 0) {
+      const today = now.slice(0, 10);
+      const seen = new Set(prepared.records.map(r => r.review_url));
+      for (const row of activeInWindowStmt.all(windowMarker.from, windowMarker.to)) {
+        if (seen.has(row.review_url)) continue;
+        if (row.last_missed_on === today) continue; // 同日二重カウント防止
+        if (row.miss_count + 1 >= 2) {
+          markDeletedStmt.run(today, now, row.review_url);
+          deletedRevisionStmt.run(row.review_url, now, row.source_hash, row.rating, row.posted_at);
+          deleted++;
+        } else {
+          missStmt.run(today, now, row.review_url);
+          missed++;
+        }
+      }
+    }
+
     db.prepare(`UPDATE raw_rakuten_review_import_log SET inserted = ?, updated = ? WHERE id = ?`)
       .run(inserted, updated, importId);
   });
@@ -340,7 +398,7 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
     status: 'ok',
     results: [{
       file: name, ok: true, label: prepared.label, rows: prepared.records.length,
-      inserted, updated, unchanged,
+      inserted, updated, unchanged, missed, deleted,
       date_from: prepared.dateFrom, date_to: prepared.dateTo,
       warnings: prepared.warnings,
     }],
