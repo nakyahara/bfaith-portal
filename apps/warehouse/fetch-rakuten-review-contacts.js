@@ -83,6 +83,9 @@ async function runFetch() {
 
   if (orderNumbers.length === 0) {
     console.log('[contacts] 対象注文なし (正常終了)');
+    // purge は注文の有無と独立に毎回実行 (0件の日が続くと期限切れ暗号文が残る — Codex R2 High)
+    const purged0 = purgeExpiredContacts(db);
+    if (purged0 > 0) console.log(`[contacts] purge: 期限超過 ${purged0}件の暗号文を削除`);
     return { fetched: 0, inserted: 0, updated: 0, skipped: 0 };
   }
 
