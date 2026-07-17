@@ -21,6 +21,9 @@ import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { runSync, listSyncStatus } from './sync/engine.js';
+import { buildAdapterForShop } from './sync/cron.js';
+import { listOutboxIssues, resolveUnknown, cancelJob } from './outbox.js';
 
 const router = Router();
 
@@ -794,6 +797,191 @@ router.post('/api/qa/:id(\\d+)/delete', (req, res) => {
   res.json({ ok: true });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// ⚙️ 運用管理画面 (設計書§7.1 #6 同期・エラー管理 + #4 送信結果不明の解決)
+// ═══════════════════════════════════════════════════════════════
+
+const OUTBOX_STATUS_LABELS = {
+  unknown: { label: '❓結果不明', style: 'background:#fef3c7;color:#92400e' },
+  needs_review: { label: '⏸️要確認 (新着競合)', style: 'background:#e0e7ff;color:#3730a3' },
+  failed: { label: '❌送信失敗', style: 'background:#fee2e2;color:#b91c1c' },
+  pending: { label: '⏳送信待ち', style: 'background:#f1f5f9;color:#475569' },
+};
+
+router.get('/admin', (req, res) => {
+  const db = getDB();
+  const syncRows = listSyncStatus();
+  const nowMs = Date.now();
+
+  const authBadge = (s) => {
+    const warnDays = s.auth_expires_at ? Math.floor((Date.parse(s.auth_expires_at) - nowMs) / 86400000) : null;
+    if (s.authentication_status !== 'ok') return `<span class="badge" style="background:#fee2e2;color:#b91c1c">認証: ${he(s.authentication_status)}</span>`;
+    if (warnDays != null && warnDays <= 30) return `<span class="badge" style="background:#fef3c7;color:#92400e">認証期限 残${warnDays}日</span>`;
+    return `<span class="badge" style="background:#dcfce7;color:#166534">認証OK</span>`;
+  };
+  const syncTrs = syncRows.map(s => {
+    const failing = (s.consecutive_failures || 0) >= 3;
+    const syncing = s.lease_until && Date.parse(s.lease_until) > nowMs;
+    return `
+    <tr${failing ? ' style="background:#fef2f2"' : ''}>
+      <td>${chBadge(s.channel_type)}<div class="sub">${he(s.shop_name)}</div></td>
+      <td>${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}</td>
+      <td class="nowrap">${fmtJst(s.last_synced_at)}${syncing ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">同期中…</span>' : ''}</td>
+      <td class="nowrap">${fmtJst(s.committed_until)}</td>
+      <td>${failing ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">連続失敗 ${s.consecutive_failures}回</span>` : (s.consecutive_failures || 0) > 0 ? `${s.consecutive_failures}回` : '—'}
+        ${s.last_error ? `<div class="sub" title="${he(s.last_error)}">${he(String(s.last_error).slice(0, 80))}</div>` : ''}</td>
+      <td>${s.open_errors > 0 ? `<span class="badge" style="background:#fef3c7;color:#92400e">${s.open_errors}件</span>` : '—'}</td>
+      <td class="nowrap">
+        <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, false, this)">▶ 今すぐ同期</button>
+        <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, true, this)" title="365日分を再照合 (数分かかることがあります)">🔎 deep</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const errRows = db.prepare(`SELECT e.*, s.shop_name, s.channel_type FROM sync_errors e
+    LEFT JOIN shops s ON s.id = e.shop_id
+    WHERE e.resolved = 0 ORDER BY e.id DESC LIMIT 20`).all();
+  const errTrs = errRows.map(e => `
+    <tr>
+      <td class="nowrap">${fmtJst(e.created_at)}</td>
+      <td>${e.channel_type ? chBadge(e.channel_type) : ''} ${he(e.shop_name || '')}</td>
+      <td><span class="badge" style="background:#f1f5f9;color:#475569">${he(e.error_type)}</span></td>
+      <td style="overflow-wrap:anywhere">${he(String(e.error_detail || '').slice(0, 300))}</td>
+      <td class="nowrap"><button onclick="resolveSyncError(${e.id}, this)">解決済みにする</button></td>
+    </tr>`).join('');
+
+  const issues = listOutboxIssues();
+  const issueTrs = issues.map(o => {
+    const meta = OUTBOX_STATUS_LABELS[o.status] || { label: o.status, style: '' };
+    const ops = o.status === 'unknown'
+      ? `<button class="pri" onclick="resolveOutbox(${o.id}, 'confirmed_sent', this)">✅送信済みだった</button>
+         <button onclick="resolveOutbox(${o.id}, 'confirmed_not_sent', this)">↩️未送信だった</button>
+         <button onclick="resolveOutbox(${o.id}, 'abandoned', this)">🚫対応断念</button>`
+      : (o.status === 'needs_review' || o.status === 'pending')
+        ? `<button onclick="cancelOutbox(${o.id}, this)">🚫取消</button>`
+        : '<span class="sub">再送は詳細画面から新しい返信として (Step 3)</span>';
+    return `
+    <tr>
+      <td><span class="badge" style="${meta.style}">${he(meta.label)}</span><div class="sub">${fmtJst(o.created_at)}</div></td>
+      <td>${chBadge(o.inquiry_channel)}<div class="sub">${he(o.shop_name)}</div></td>
+      <td><a href="/apps/inquiry-hub/inquiries/${o.inquiry_id}">${he(o.subject || '(件名なし)')}</a>
+        <div class="sub">${he(o.customer_name || '')} ・ 作成: ${he(o.created_by || '—')}</div></td>
+      <td style="overflow-wrap:anywhere"><div class="sub">${he(String(o.body_text || '').slice(0, 120))}${String(o.body_text || '').length > 120 ? '…' : ''}</div>
+        ${o.error_detail ? `<div class="sub" style="color:#b91c1c">${he(String(o.error_detail).slice(0, 150))}</div>` : ''}</td>
+      <td class="nowrap ops">${ops}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🔄 受信同期の状態 <span class="sub">(cron: 15分間隔 + 深掘り 毎朝5:37。手動実行してもcronと衝突しません)</span></div>
+    <table>
+      <thead><tr><th>チャネル/店舗</th><th>認証</th><th>最終同期</th><th>取り込み済み時刻</th><th>連続失敗</th><th>未解決エラー</th><th>手動同期</th></tr></thead>
+      <tbody>${syncTrs || '<tr><td colspan="7" class="empty">アクティブな店舗がありません</td></tr>'}</tbody>
+    </table>
+  </div>
+  ${errRows.length ? `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">⚠️ 未解決の同期エラー (直近20件)</div>
+    <table>
+      <thead><tr><th>発生</th><th>店舗</th><th>種別</th><th>内容</th><th></th></tr></thead>
+      <tbody>${errTrs}</tbody>
+    </table>
+  </div>` : ''}
+  <div class="card">
+    <div class="card-title">📮 送信の要対応 <span class="sub">(結果不明は自動再送しません。モール管理画面で実際の送信有無を確認してから選択してください)</span></div>
+    <table>
+      <thead><tr><th>状態</th><th>チャネル/店舗</th><th>問い合わせ</th><th>本文/エラー</th><th>操作</th></tr></thead>
+      <tbody>${issueTrs || '<tr><td colspan="5" class="empty">要対応の送信ジョブはありません</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+async function post(url, data) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+  const j = await r.json().catch(function(){ return {}; });
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+async function manualSync(shopId, deep, btn) {
+  btn.disabled = true; var old = btn.textContent; btn.textContent = '同期中…';
+  try {
+    var r = await post('/apps/inquiry-hub/api/admin/sync/' + shopId, { deep: deep });
+    if (r.skipped === 'lease') toast('別の同期が実行中です。少し待ってから再実行してください');
+    else if (r.ok) { toast('同期完了: 新規' + r.stats.newInquiries + '件 / 新着メッセージ' + r.stats.newMessages + '件'); setTimeout(function(){ location.reload(); }, 1200); }
+    else toast('同期失敗: ' + (r.error || '不明なエラー'));
+  } catch (e) { toast('同期失敗: ' + e.message); }
+  btn.disabled = false; btn.textContent = old;
+}
+async function resolveOutbox(id, resolution, btn) {
+  var confirms = {
+    confirmed_sent: 'モール/メールの管理画面で「実際に送信されている」ことを確認しましたか?\\n(会話履歴に送信済みとして記録されます)',
+    confirmed_not_sent: 'モール/メールの管理画面で「送信されていない」ことを確認しましたか?\\n(未送信=失敗として確定し、再送できるようになります)',
+    abandoned: '対応を断念しますか? この操作は取り消せず、再送ボタンも出なくなります',
+  };
+  if (!confirm(confirms[resolution])) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/outbox/' + id + '/resolve', { resolution: resolution }); toast('解決を記録しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function cancelOutbox(id, btn) {
+  if (!confirm('この送信ジョブを取消しますか? (送り直す場合は詳細画面から新しい返信を作成します)')) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/outbox/' + id + '/cancel', {}); toast('取消しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function resolveSyncError(id, btn) {
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/sync-errors/' + id + '/resolve', {}); toast('解決済みにしました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}`;
+  res.send(pageShell('問い合わせ管理 — 運用管理', 'admin', body, script));
+});
+
+// 手動同期 (運用管理画面の▶ボタン)。cronとの多重起動はエンジンのリースが防ぐ (skipped:'lease')
+router.post('/api/admin/sync/:shopId(\\d+)', async (req, res) => {
+  const db = getDB();
+  const shop = db.prepare("SELECT * FROM shops WHERE id = ? AND is_active = 1 AND executor = 'server'").get(Number(req.params.shopId));
+  if (!shop) return res.status(404).json({ error: '店舗が見つかりません' });
+  const deep = !!(req.body || {}).deep;
+  const adapter = buildAdapterForShop(shop, { deep });
+  if (!adapter) return res.status(503).json({ error: `${shop.channel_type} の同期用環境変数が未設定です` });
+  try {
+    console.log(`[inquiry-hub] 手動同期 ${shop.shop_name}${deep ? ' (deep)' : ''} by ${actorOf(req)}`);
+    const r = await runSync(shop.id, adapter);
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/admin/outbox/:id(\\d+)/resolve', (req, res) => {
+  const resolution = String((req.body || {}).resolution || '');
+  if (!['confirmed_sent', 'confirmed_not_sent', 'abandoned'].includes(resolution)) {
+    return res.status(400).json({ error: '不正な resolution です' });
+  }
+  try {
+    res.json({ ok: true, ...resolveUnknown(Number(req.params.id), resolution, actorOf(req)) });
+  } catch (e) {
+    res.status(409).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/admin/outbox/:id(\\d+)/cancel', (req, res) => {
+  try {
+    res.json({ ok: true, ...cancelJob(Number(req.params.id), actorOf(req)) });
+  } catch (e) {
+    res.status(409).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/admin/sync-errors/:id(\\d+)/resolve', (req, res) => {
+  const r = getDB().prepare(`UPDATE sync_errors SET resolved = 1, resolved_at = ${NOW_SQL} WHERE id = ? AND resolved = 0`)
+    .run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: '対象のエラーがありません (解決済みの可能性)' });
+  res.json({ ok: true });
+});
+
 // ─── ページシェル ───
 const CSS = `
 * { box-sizing: border-box; }
@@ -883,6 +1071,11 @@ details.tpl summary:hover { background: #f8fafc; border-radius: 8px; }
 @media (max-width: 700px) { .edit-grid { grid-template-columns: 1fr; } }
 .qa-q { background: #fef9c3; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
 .qa-a { background: #dcfce7; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
+/* 運用管理画面 */
+.card-title { padding: 12px 14px; font-weight: 700; border-bottom: 1px solid #e2e8f0; }
+.card-title .sub { font-weight: normal; }
+td.ops { white-space: normal; }
+td.ops button { margin: 2px 4px 2px 0; }
 `;
 
 function pageShell(title, active, body, script) {
@@ -897,6 +1090,7 @@ function pageShell(title, active, body, script) {
     ${tab('/apps/inquiry-hub', '📨', '問い合わせ一覧', 'list')}
     ${tab('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates')}
     ${tab('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa')}
+    ${tab('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin')}
   </nav>
   <a href="/" class="back">← ポータルに戻る</a>
 </header>

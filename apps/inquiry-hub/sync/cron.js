@@ -28,6 +28,31 @@ const FAILURE_NOTIFY_AT = 3;             // 設計§8.1: 3連続失敗で通知
 
 let tickRunning = false;
 
+/**
+ * 店舗1件分の同期アダプターを env の transport 設定から生成する (cron tick / 運用管理画面の手動同期で共用)。
+ * transport env が未設定のチャネルは null (呼び元でスキップ表示)
+ */
+export function buildAdapterForShop(shop, { deep = false } = {}) {
+  if (shop.channel_type === 'rakuten') {
+    const t = resolveRakutenTransportFromEnv();
+    if (!t) return null;
+    return createRakutenAdapter({
+      ...t,
+      expectedShopId: shop.account_identifier,
+      ...(deep ? { lookbackDays: DEEP_LOOKBACK_DAYS } : {}),
+    });
+  }
+  if (shop.channel_type === 'yahoo') {
+    const t = resolveYahooTransportFromEnv();
+    if (!t) return null;
+    return createYahooAdapter({
+      ...t,
+      ...(deep ? { listLookbackDays: DEEP_LIST_LOOKBACK_DAYS } : {}),
+    });
+  }
+  return null; // email は Step 3 (Gmailアダプター) で追加
+}
+
 /** cron式の分フィールドを展開 ('*', '*\/N', '数値', カンマ区切り のみ対応。それ以外は null=判定不能) */
 function minuteSet(expr) {
   const field = String(expr).trim().split(/\s+/)[0];
@@ -87,27 +112,11 @@ export async function runInquiryHubSyncTick(opts = {}) {
       WHERE channel_type IN ('rakuten', 'yahoo') AND is_active = 1 AND executor = 'server'`).all();
     if (shops.length === 0) return { skipped: 'no_shops' };
 
-    const buildAdapter = (shop) => {
-      const transportCfg = transports[shop.channel_type];
-      if (!transportCfg) return null;
-      if (shop.channel_type === 'rakuten') {
-        return createRakutenAdapter({
-          ...transportCfg,
-          expectedShopId: shop.account_identifier,
-          ...(deep ? { lookbackDays: DEEP_LOOKBACK_DAYS } : {}),
-        });
-      }
-      return createYahooAdapter({
-        ...transportCfg,
-        ...(deep ? { listLookbackDays: DEEP_LIST_LOOKBACK_DAYS } : {}),
-      });
-    };
-
     const results = [];
     for (const shop of shops) {
       const adapter = adapterFactory
         ? adapterFactory(shop, transports[shop.channel_type], deep)
-        : buildAdapter(shop);
+        : buildAdapterForShop(shop, { deep });
       if (!adapter) {
         console.warn(`[inquiry-hub-cron] SKIP ${shop.shop_name} (${shop.channel_type}): transport env 未設定`);
         results.push({ shopId: shop.id, shop: shop.shop_name, skipped: 'no_transport' });

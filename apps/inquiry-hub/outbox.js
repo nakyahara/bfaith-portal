@@ -277,14 +277,15 @@ export function cancelJob(outboxId, cancelledBy) {
   return tx.immediate();
 }
 
-/** 送信結果不明/保留/失敗の一覧 (画面§7.1#4用)。resolution確定済み (終端) は載せない */
+/** 送信結果不明/保留/失敗の一覧 (画面§7.1#4用)。resolution確定済み (終端) は載せない。
+ * pending も含める (運用者が送信前に止められるように。Codexレビュー反映) */
 export function listOutboxIssues() {
   const db = getDB();
   return db.prepare(`SELECT o.*, i.subject, i.customer_name, i.channel_type AS inquiry_channel, s.shop_name
     FROM outbox_replies o
     JOIN inquiries i ON i.id = o.inquiry_id
     JOIN shops s ON s.id = i.shop_id
-    WHERE o.status = 'needs_review'
+    WHERE o.status IN ('pending', 'needs_review')
        OR (o.status IN ('unknown', 'failed') AND o.resolution IS NULL)
     ORDER BY o.created_at DESC, o.id DESC LIMIT 200`).all();
 }

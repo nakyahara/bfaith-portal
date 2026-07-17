@@ -264,7 +264,7 @@ export async function runSync(shopId, adapter, opts = {}) {
 export function listSyncStatus() {
   const db = getDB();
   return db.prepare(`SELECT s.id AS shop_id, s.channel_type, s.shop_name, s.authentication_status,
-      s.last_synced_at, st.committed_until, st.lease_until, st.last_error, st.consecutive_failures,
+      s.auth_expires_at, s.last_synced_at, st.committed_until, st.lease_until, st.last_error, st.consecutive_failures,
       (SELECT COUNT(*) FROM sync_errors e WHERE e.shop_id = s.id AND e.resolved = 0) AS open_errors
     FROM shops s LEFT JOIN sync_state st ON st.shop_id = s.id
     WHERE s.is_active = 1 ORDER BY s.channel_type, s.shop_name`).all();
