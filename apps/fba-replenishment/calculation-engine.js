@@ -41,7 +41,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
   // RESTOCK が空 (初回 or 取得失敗) の場合は旧 daily_snapshots にフォールバック (移行期間の保険)
   // 部分成功の可視化 (総点検 P0-3): silent skip をやめて meta で件数+SKU一覧を返す
-  const unmappedSkus = [];        // restock にあるが sku_mapping 不在 → 全タブから消えていたSKU
+  // 未マッピングSKU (restock にあるが sku_mapping 不在)。大半はバリエーション登録専用など
+  // 意図的に使っていないSKUなので、稼働実績で2つに分ける:
+  //   active   = 販売/FBA在庫/入荷中/Amazon推奨/他CH販売 のいずれかあり → マッピング漏れ=納品漏れ候補 (要対応・警告)
+  //   inactive = 全シグナルが実績なし → 推奨対象外。件数と一覧は静かに出すが警告にはしない
+  // ※ inactive は「未使用SKU」と断定はできない (レポート欠損でも0になる) ため、表示は事実のみに留める
+  const unmappedActive = [];
+  const unmappedInactive = [];
   const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
   const planningMissingSkus = []; // PLANNING レポート欠落 (販売数0扱いになる)
 
@@ -79,6 +85,23 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const nonFbaMax60dList = getAllNonFbaMax60d();
   const nonFbaMax60dMap = {};
   for (const r of nonFbaMax60dList) nonFbaMax60dMap[r.amazon_sku] = r;
+  // 未マッピング判定でも参照するので norm キー版も用意 (mirror小文字 vs レポート元ケース差の吸収)
+  const nonFbaMax60dNormMap = {};
+  for (const r of nonFbaMax60dList) nonFbaMax60dNormMap[normCode(r.amazon_sku)] = r;
+
+  // 準備中数量 (Inbound API) を norm キー化 (総点検 B-4)。exact-case 参照だと case 差で override が落ち、
+  // 2026-06-30型「準備中欠損→二重推奨」が再発する。未マッピング判定でも同じ値を使う。
+  // 正規化で衝突した場合 (ABC と abc が両方ある等) は後勝ちにせず最大値を採用する
+  // (小さい方を採ると準備中を過小評価し、二重推奨に戻るため)。
+  const inboundWorkingNormMap = {};
+  if (inboundWorkingOverride) {
+    for (const k of Object.keys(inboundWorkingOverride)) {
+      const nk = normCode(k);
+      const v = Number(inboundWorkingOverride[k]) || 0; // null/非数は0扱い (入力契約は数値)
+      inboundWorkingNormMap[nk] = nk in inboundWorkingNormMap ? Math.max(inboundWorkingNormMap[nk], v) : v;
+    }
+  }
+  const lookupInboundWorking = (sku) => inboundWorkingNormMap[normCode(sku)];
 
   const snapshotDate = snapshots[0]?.snapshot_date || new Date().toISOString().slice(0, 10);
   const oosAmazonRecoThreshold = parseInt(settings.oos_amazon_reco_threshold || 11);
@@ -87,7 +110,28 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   for (const snap of snapshots) {
     const sku = snap.amazon_sku;
     const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
-    if (!mapping) { unmappedSkus.push(sku); continue; } // マッピングがないSKUはスキップ (meta で警告)
+    if (!mapping) {
+      // マッピングがないSKUは計算不能なのでスキップ。ただし黙って消すと納品漏れになるため meta に残す。
+      // 稼働実績の有無で仕分け (実績ゼロ=バリエーション登録専用等の未使用SKU → 警告にしない)。
+      // 「実績」は片側だけ見ると取りこぼすため、生きているSKUを示す全シグナルを見る:
+      //   FBA販売 / FBA在庫 / 入荷中 (準備中はAPI優先=通常計算と同じ基準) / Amazon推奨 / 他CH販売
+      const workingOverride = lookupInboundWorking(sku);
+      const working = workingOverride !== undefined ? (workingOverride || 0) : (snap.fba_inbound_working || 0);
+      const inbound = working + (snap.fba_inbound_shipped || 0) + (snap.fba_inbound_received || 0);
+      const sold30d = snap.units_sold_30d || 0;
+      const fbaQty = snap.fba_available || 0;
+      const amazonReco = snap.amazon_recommended_qty; // null=未取得
+      const nonFba30d = nonFbaMax60dNormMap[normCode(sku)]?.max_30d || 0; // 他CHのみ販売のSKUを拾う
+      if (sold30d > 0 || fbaQty > 0 || inbound > 0 || (typeof amazonReco === 'number' && amazonReco > 0) || nonFba30d > 0) {
+        unmappedActive.push({
+          sku, units_sold_30d: sold30d, fba_available: fbaQty, fba_inbound: inbound,
+          amazon_recommended_qty: amazonReco ?? null, non_fba_sales_30d: nonFba30d,
+        });
+      } else {
+        unmappedInactive.push(sku);
+      }
+      continue;
+    }
 
     // --- set_components をSKU単位で安全にパース+構造検証 (不正1件で全SKUの生成が止まらないよう隔離) ---
     // 不正な場合は「単品扱いで計算続行」ではなく当該SKUの推奨を停止する (誤った数量提示より安全側)
@@ -133,10 +177,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // inboundWorking: Inbound API のリアルタイムデータを信頼。
     // レポート側の Working 列は信頼しない (0 のことが多く、遅延・残骸を含むため)
+    // 参照は norm キー (総点検 B-4: exact-case だと case 差で override が落ち二重推奨に戻る)
     let inboundWorking;
     let workingSource; // デバッグ用: データソース
-    if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
-      inboundWorking = inboundWorkingOverride[sku];
+    const workingOverrideVal = lookupInboundWorking(sku);
+    if (workingOverrideVal !== undefined) {
+      inboundWorking = workingOverrideVal;
       workingSource = 'API';
     } else {
       // API失敗時: レポートの working を参考値として使う (通常商品のみ)
@@ -507,11 +553,14 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     recommended_skus: recommendedItems.length,
     recommended_units: recommendedItems.reduce((s, i) => s + i.recommended_qty, 0),
     errors: [],
-    // 部分成功の可視化 (総点検 P0-3): 「ゼロ件成功」と「データ欠損付き成功」を区別できるようにする
+    // 部分成功の可視化 (総点検 P0-3): 「ゼロ件成功」と「データ欠損付き成功」を区別できるようにする。
+    // 未マッピングは active (実績あり=要対応) と inactive (未使用SKU=情報のみ) に分離
     data_quality: {
       data_source: dataSource,
-      unmapped_count: unmappedSkus.length,
-      unmapped_skus: unmappedSkus,
+      unmapped_active_count: unmappedActive.length,
+      unmapped_active: unmappedActive,
+      unmapped_inactive_count: unmappedInactive.length,
+      unmapped_inactive_skus: unmappedInactive,
       invalid_mapping_count: invalidMappingSkus.length,
       invalid_mappings: invalidMappingSkus,
       planning_missing_count: planningMissingSkus.length,

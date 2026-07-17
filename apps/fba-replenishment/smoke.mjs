@@ -119,7 +119,25 @@ db.saveRestockLatest([
   { amazon_sku: 'plain-b', product_name: '単品B', fba_available: 0, units_sold_30d: 90, amazon_recommended_qty: null },
   { amazon_sku: 'BROKEN-C', product_name: '構成不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
   { amazon_sku: 'NEGQTY-D', product_name: 'qty不正', fba_available: 0, units_sold_30d: 30, amazon_recommended_qty: null },
-  { amazon_sku: 'UNMAPPED-SKU', product_name: '未マッピング', fba_available: 0, units_sold_30d: 10, amazon_recommended_qty: null },
+  // 未マッピング×実績あり (30日販売10) → active = 本物の納品漏れ候補 → 警告対象
+  { amazon_sku: 'UNMAPPED-SOLD', product_name: '未マッピング(売れてる)', fba_available: 0, units_sold_30d: 10, amazon_recommended_qty: null },
+  // 未マッピング×FBA在庫あり → active
+  { amazon_sku: 'UNMAPPED-STOCK', product_name: '未マッピング(在庫あり)', fba_available: 5, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×入荷中のみ → active
+  { amazon_sku: 'UNMAPPED-INBOUND', product_name: '未マッピング(入荷中)', fba_available: 0, fba_inbound_shipped: 3, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×Amazon推奨あり (生きている出品) → active
+  { amazon_sku: 'UNMAPPED-RECO', product_name: '未マッピング(Amazon推奨)', fba_available: 0, units_sold_30d: 0, amazon_recommended_qty: 20 },
+  // 未マッピング×他CHのみ販売 (FBA実績ゼロ) → active。Amazon投入漏れの検知経路
+  { amazon_sku: 'UNMAPPED-NONFBA', product_name: '未マッピング(他CHで販売中)', fba_available: 0, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×準備中がAPI側にだけある (レポートWorking=0) → active。RESTOCKだけ見ると取りこぼす
+  { amazon_sku: 'UNMAPPED-APIWORK', product_name: '未マッピング(API準備中)', fba_available: 0, fba_inbound_working: 0, units_sold_30d: 0, amazon_recommended_qty: null },
+  // 未マッピング×実績ゼロ → inactive = バリエーション登録専用等。警告にせず静かに件数表示
+  { amazon_sku: 'UNMAPPED-VARIATION', product_name: '未マッピング(未使用)', fba_available: 0, units_sold_30d: 0, amazon_recommended_qty: null },
+]);
+
+// 他CH売上スナップショット (sku_mapping とは別テーブル → 未マッピングSKUでも実績を引ける)
+db.saveNonFbaSalesSnapshot([
+  { amazon_sku: 'UNMAPPED-NONFBA', non_fba_sales_7d: 5, non_fba_sales_30d: 25 },
 ]);
 
 db.replaceWarehouseInventory([
@@ -133,7 +151,10 @@ db.replaceWarehouseInventory([
 ]);
 
 const { generateRecommendations } = await import('./calculation-engine.js');
-const result = generateRecommendations(false, null);
+// inboundWorkingOverride = Inbound API のリアルタイム準備中。B-4検証のためキーの case をあえて崩す:
+//  - 'unmapped-apiwork' : 未マッピング判定側の case 差
+//  - 'PLAIN-B' / 'plain-b' : 本体推奨計算の case 差 + 正規化衝突 (最大値=12が採用されるべき)
+const result = generateRecommendations(false, { 'unmapped-apiwork': 7, 'PLAIN-B': 12, 'plain-b': 0 });
 
 assert(Array.isArray(result.items) && result.items.length === 4,
   `不正set_componentsがあっても全SKU生成が止まらない (items=${result.items?.length})`);
@@ -158,8 +179,10 @@ if (setA) {
 }
 
 const plainB = result.items.find(i => i.amazon_sku === 'plain-b');
-assert(plainB?.recommended_qty === 30 && plainB?.adjusted_qty === 30,
-  `単品の推奨は従来どおり (期待30/30, 実際${plainB?.recommended_qty}/${plainB?.adjusted_qty})`);
+// B-4: 本体の推奨計算でも override を case 非依存で参照し、正規化衝突は最大値を採用 (過小評価=二重推奨を防ぐ)
+assert(plainB?.fba_inbound_working === 12 && plainB?.fba_inbound_working_source === 'API',
+  `本体計算もoverrideをcase非依存+衝突は最大値で参照 (期待12/API, 実際${plainB?.fba_inbound_working}/${plainB?.fba_inbound_working_source})`);
+assert(plainB?.effective_fba_stock === 12, `準備中が実質FBA在庫に乗る (期待12, 実際${plainB?.effective_fba_stock})`);
 
 for (const i of result.items) {
   if (typeof i.adjusted_qty === 'number' && typeof i.warehouse_available === 'number') {
@@ -168,11 +191,24 @@ for (const i of result.items) {
 }
 
 const dq = result.data_quality;
-assert(dq?.unmapped_count === 1 && dq?.unmapped_skus?.[0] === 'UNMAPPED-SKU',
-  `未マッピングSKUがmetaで返る (実際${JSON.stringify(dq?.unmapped_skus)})`);
+// 未マッピングは稼働実績で仕分け: active=要対応 (警告バナー) / inactive=未使用SKU (静かな情報表示)
+const activeSkus = (dq?.unmapped_active || []).map(u => u.sku).sort();
+const expectedActive = ['UNMAPPED-APIWORK', 'UNMAPPED-INBOUND', 'UNMAPPED-NONFBA', 'UNMAPPED-RECO', 'UNMAPPED-SOLD', 'UNMAPPED-STOCK'];
+assert(dq?.unmapped_active_count === 6 && JSON.stringify(activeSkus) === JSON.stringify(expectedActive),
+  `未マッピング×実績あり(販売/在庫/入荷中/Amazon推奨/他CH)のみactive (実際${JSON.stringify(activeSkus)})`);
+assert(dq?.unmapped_inactive_count === 1 && dq?.unmapped_inactive_skus?.[0] === 'UNMAPPED-VARIATION',
+  `未マッピング×実績ゼロはinactive=警告にしない (実際${JSON.stringify(dq?.unmapped_inactive_skus)})`);
+assert(dq?.unmapped_active?.[0]?.units_sold_30d !== undefined,
+  'active側は判断材料 (30日販売/FBA在庫/入荷中) を持つ');
+// B-4: override は case 差があっても効く (レポートWorking=0でもAPI側7個を拾ってactive)
+const apiWork = dq?.unmapped_active?.find(u => u.sku === 'UNMAPPED-APIWORK');
+assert(apiWork?.fba_inbound === 7, `準備中はAPI値をcase非依存で参照 (期待7, 実際${apiWork?.fba_inbound})`);
+// 他CH販売のみのSKUも実績として拾う (Amazon投入漏れの検知経路)
+const nonFba = dq?.unmapped_active?.find(u => u.sku === 'UNMAPPED-NONFBA');
+assert(nonFba?.non_fba_sales_30d === 25, `他CH30日販売をactive判定に使う (期待25, 実際${nonFba?.non_fba_sales_30d})`);
 assert(dq?.invalid_mapping_count === 2 && dq?.invalid_mappings?.some(m => m.sku === 'BROKEN-C') && dq?.invalid_mappings?.some(m => m.sku === 'NEGQTY-D'),
   `set_components不正がmetaで返る (実際${JSON.stringify(dq?.invalid_mappings)})`);
-assert(dq?.planning_missing_count === 5, `PLANNING欠落件数 (期待5, 実際${dq?.planning_missing_count})`);
+assert(dq?.planning_missing_count === 11, `PLANNING欠落件数 (期待11=restock全行, 実際${dq?.planning_missing_count})`);
 
 console.log(`\n結果: ${pass} PASS / ${fail} FAIL`);
 process.exitCode = fail > 0 ? 1 : 0;
