@@ -28,6 +28,7 @@ function check(name, cond, detail = '') {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rrcampaign-smoke-'));
 const db = new Database(path.join(tmp, 'warehouse.db'));
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON'); // CLI と同条件 (attempts/grants の REFERENCES を強制)
 ensureRakutenReviewTables(db);
 ensureContactTables(db);
 ensureCampaignTables(db);
@@ -108,7 +109,9 @@ addSuppression(db, 'stop@anshin.rakuten.co.jp', 'test', keys);
   check('expires=発送21日後', a.expires_at === '2026-08-05T14:59:59.000Z');
   check('dedupe_key が契約どおり', a.dedupe_key === dedupeKeyFor('follow', oFresh));
   check('レビュー済み注文は suppressed(review_exists)', getAction(oReviewed, 'follow')?.status === 'suppressed' && getAction(oReviewed, 'follow')?.status_reason === 'review_exists');
-  check('メールなしは suppressed(no_email)', getAction(oNoEmail, 'follow')?.status_reason === 'no_email');
+  const aNoEmail = getAction(oNoEmail, 'follow');
+  check('メールなしは planned(awaiting_email) で待機 (終端抑止しない=後続fetchで補完可能)',
+    aNoEmail?.status === 'planned' && aNoEmail?.status_reason === 'awaiting_email');
   check('配信停止済みは suppressed(suppression_list)', getAction(oSuppressed, 'follow')?.status_reason === 'suppression_list');
   check('発送21日超は expired(expired_before_plan)', getAction(oOld, 'follow')?.status === 'expired');
   check('未発送は action を作らない', !getAction(oUnshipped, 'follow'));
@@ -192,7 +195,9 @@ console.log('=== 5. クーポン: 新規plan ===');
   insertReview(db, { orderNumber: oBackfill, firstSeenAt: '2026-07-17T01:10:00.000Z', reviewType: 'shop' });
   planCampaigns(db, { nowIso: '2026-07-17T01:20:00.000Z' });
   check('epoch前レビューのある注文はepoch後の2件目でも作らない (vendor付与済み二重防止)', !getAction(oBackfill, 'coupon'));
-  check('contactなしは suppressed(no_contact)', getAction(oNoContact, 'coupon')?.status_reason === 'no_contact');
+  const aNoContact = getAction(oNoContact, 'coupon');
+  check('contactなしは planned(awaiting_contact) で待機 (終端抑止しない)',
+    aNoContact?.status === 'planned' && aNoContact?.status_reason === 'awaiting_contact');
   check('注文番号なしレビューは対象外', db.prepare(
     `SELECT COUNT(*) n FROM rakuten_campaign_actions WHERE order_number IS NULL OR order_number = ''`).get().n === 0);
 
@@ -203,6 +208,22 @@ console.log('=== 5. クーポン: 新規plan ===');
   const c3 = planCampaigns(db, { nowIso: '2026-07-20T01:00:00.000Z' });
   check('レビュー編集で action が増えない (dedupe_key)', db.prepare(
     `SELECT COUNT(*) n FROM rakuten_campaign_actions WHERE order_number = ? AND action_type = 'coupon'`).get(oCoupon).n === 1 && c3.couponInserted === 0);
+
+  // awaiting_contact に後から contact が届いたら: 期限が発送基準に付け替わり、予定時刻超過なら ready
+  upsertContacts(db, [{
+    order_number: oNoContact,
+    order_key_hmac: hmacOrderKey(oNoContact, keys),
+    masked_email_enc: encryptEmail('late@anshin.rakuten.co.jp', keys, oNoContact),
+    masked_email_hash: hmacEmail('late@anshin.rakuten.co.jp', keys),
+    order_datetime: '2026-07-05T10:00:00+09:00',
+    shipping_datetime: '2026-07-10T12:00:00+09:00',
+    order_progress: 700,
+    contact_delete_at: '2099-01-01T00:00:00.000Z',
+  }]);
+  planCampaigns(db, { nowIso: '2026-07-20T02:00:00.000Z' });
+  const aLate = getAction(oNoContact, 'coupon');
+  check('contact到着で ready に昇格 (永久欠落しない — Codex C1-R2 High)', aLate.status === 'ready');
+  check('期限は発送基準21日に付け替え', aLate.expires_at === '2026-07-31T14:59:59.000Z', aLate.expires_at);
 }
 
 console.log('=== 6. クーポン: 引き金レビュー全削除で取消 ===');
@@ -269,6 +290,31 @@ console.log('=== 8. shadow 不変条件・PII・冪等性 ===');
   const s = campaignStats(db, '2026-07-20T01:00:00.000Z');
   check('stats: epoch が固定されている', s.epoch === EPOCH, s.epoch);
   check('stats: byStatus が返る', Array.isArray(s.byStatus) && s.byStatus.length > 0);
+}
+
+console.log('=== 9. cutover-aware ownership + FK強制 ===');
+{
+  // shadow期に決まった vendor は cutover 後も覆らない
+  const preRow = db.prepare(`SELECT owner FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(oFresh);
+  db.prepare(`INSERT INTO rakuten_campaign_meta (key, value) VALUES ('cutover_at', '2026-08-01T03:00:00.000Z')`).run();
+  const oPreShip = makeContact({ shippingIso: '2026-07-25T12:00:00+09:00' });  // cutover前発送
+  const oPostShip = makeContact({ shippingIso: '2026-08-05T12:00:00+09:00' }); // cutover後発送
+  const oNoShip = makeContact({ shippingIso: null });                          // 未発送=判定不能
+  planCampaigns(db, { nowIso: '2026-08-10T00:00:00.000Z' });
+  const own = (o) => db.prepare(`SELECT owner, reason FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(o);
+  check('cutover前発送は vendor', own(oPreShip)?.owner === 'vendor' && own(oPreShip)?.reason === 'cutover_shipping');
+  check('cutover後発送は self', own(oPostShip)?.owner === 'self');
+  check('未発送は ownership 行を作らない (送信ゲートは fail-closed)', !own(oNoShip));
+  check('shadow期の vendor 判定は覆らない (INSERT OR IGNORE)',
+    db.prepare(`SELECT owner FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(oFresh)?.owner === preRow?.owner);
+
+  // FK: 存在しない action への attempt は拒否 (PRAGMA foreign_keys = ON 前提)
+  let orphanBlocked = false;
+  try {
+    db.prepare(`INSERT INTO rakuten_campaign_delivery_attempts (action_id, message_id, attempted_at, outcome)
+                VALUES (999999, 'orphan', '2026-08-10T00:00:00Z', 'accepted')`).run();
+  } catch { orphanBlocked = true; }
+  check('存在しない action への attempt は FK 違反で拒否', orphanBlocked);
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);

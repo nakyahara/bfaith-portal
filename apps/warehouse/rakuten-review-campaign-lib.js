@@ -118,7 +118,10 @@ export function ensureCampaignTables(db) {
   // 送信試行ログ (PR-C4 で書く)。UNIQUE(action_id) = action単位の at-most-once を
   // DB制約で強制する (Codex C1-R1 High: message_id UNIQUE だけでは同一actionに別message_idで
   // 何度でも試行できてしまう)。明確なrejectも自動再送しない=「重複より取りこぼしを選ぶ」。
-  // 再送が本当に必要なときは人が action を cancelled にして新 action を明示的に作る
+  // 再送が本当に必要なときは人が action を cancelled にして新 action を明示的に作る。
+  // 予約契約 (Codex C1-R2 Medium): attempt 行は SMTP 呼び出しの「前」に claim と同一
+  // トランザクションで outcome='ambiguous' として予約 commit し、送信後に accepted/rejected へ
+  // 更新する。送信後 INSERT だと「SMTP受付成功→DB記録前にクラッシュ」の窓で再送できてしまう
   db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_delivery_attempts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     action_id    INTEGER NOT NULL UNIQUE REFERENCES rakuten_campaign_actions(id),
@@ -205,11 +208,13 @@ export function planCampaigns(db, opts = {}) {
     for (const c of newFollows) {
       const sched = followScheduleFor(c.shipping_datetime);
       if (!sched) continue; // 発送日時が壊れている行は次回に回す (contacts 側で正規化済みのため実質起きない)
+      // no_email は終端抑止にしない (Codex C1-R2 High: 後続の contacts 再取得で補完され得るため
+      // planned(awaiting_email) のまま毎回再評価し、期限到達だけが expired にする)
       let status = 'planned', reason = null;
       if (c.has_review) { status = 'suppressed'; reason = 'review_exists'; }        // レビュー済ならフォロー停止
-      else if (!c.masked_email_enc) { status = 'suppressed'; reason = 'no_email'; }
       else if (c.is_suppressed) { status = 'suppressed'; reason = 'suppression_list'; }
       else if (now >= sched.expiresAt) { status = 'expired'; reason = 'expired_before_plan'; } // 発送21日超の古い注文
+      else if (!c.masked_email_enc) { reason = 'awaiting_email'; }
       const r = insertStmt.run({
         action_type: 'follow', dedupe_key: dedupeKeyFor('follow', c.order_number),
         order_number: c.order_number, trigger_review_url: null,
@@ -234,6 +239,25 @@ export function planCampaigns(db, opts = {}) {
       const sched = followScheduleFor(a.shipping_datetime);
       if (sched && (sched.scheduledAt !== a.scheduled_at || sched.expiresAt !== a.expires_at)) {
         reschedStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id);
+        counts.rescheduled++;
+      }
+    }
+    // planned クーポンの期限も発送基準に追従 (awaiting_contact で投稿日基準の保守値だった行に
+    // 後から contact が届いたら、規約上限=発送+21日へ付け替える。scheduled_at は検知基準のまま)
+    const plannedCoupons = db.prepare(`
+      SELECT a.id, a.expires_at, c.shipping_datetime
+        FROM rakuten_campaign_actions a
+        JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+       WHERE a.action_type = 'coupon' AND a.status = 'planned' AND c.shipping_datetime IS NOT NULL
+    `).all();
+    const reExpireStmt = db.prepare(`
+      UPDATE rakuten_campaign_actions SET expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'planned'
+    `);
+    for (const a of plannedCoupons) {
+      const sched = followScheduleFor(a.shipping_datetime);
+      if (sched && sched.expiresAt !== a.expires_at) {
+        reExpireStmt.run(sched.expiresAt, now, a.id);
         counts.rescheduled++;
       }
     }
@@ -271,11 +295,14 @@ export function planCampaigns(db, opts = {}) {
             return p ? new Date(Date.parse(p) + EXPIRES_AFTER_SHIP_DAYS * DAY_MS).toISOString() : now;
           })() };
       const scheduledAt = nextNoonJstAfter(now); // 検知次第 → 次の12:00 JST (らくらくーぽんの日次12時台に対応)
+      // no_contact / no_email は終端抑止にしない (Codex C1-R2 High: contacts 取得失敗や
+      // レビュー取込との時間差で contact が翌日以降に届くケースで、注文単位 dedupe のため
+      // action を作り直せず永久欠落する)。planned のまま毎回再評価し、期限だけが expired にする
       let status = 'planned', reason = null;
-      if (!rv.has_contact) { status = 'suppressed'; reason = 'no_contact'; }
-      else if (!rv.masked_email_enc) { status = 'suppressed'; reason = 'no_email'; }
-      else if (rv.is_suppressed) { status = 'suppressed'; reason = 'suppression_list'; }
+      if (rv.is_suppressed) { status = 'suppressed'; reason = 'suppression_list'; }
       else if (now >= base.expiresAt) { status = 'expired'; reason = 'expired_before_plan'; }
+      else if (!rv.has_contact) { reason = 'awaiting_contact'; }
+      else if (!rv.masked_email_enc) { reason = 'awaiting_email'; }
       const r = insertStmt.run({
         action_type: 'coupon', dedupe_key: dedupeKeyFor('coupon', rv.order_number),
         order_number: rv.order_number, trigger_review_url: rv.trigger_url,
@@ -330,34 +357,80 @@ export function planCampaigns(db, opts = {}) {
     // ready_at が shadow 突合 (PR-C2) の would-send 時刻になる。shadow 中は ready のまま滞留し、
     // PR-C4 の送信ゲート (owner='self' + 期限内) だけが ready → claimed に進める
     const dueRows = db.prepare(`
-      SELECT a.id, a.action_type, c.masked_email_enc, c.masked_email_hash, c.purged_at,
+      SELECT a.id, a.action_type, a.status_reason,
+             c.order_number IS NOT NULL AS has_contact,
+             c.masked_email_enc, c.masked_email_hash, c.purged_at,
              EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
         FROM rakuten_campaign_actions a
         LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
        WHERE a.status = 'planned' AND a.scheduled_at <= ?
     `).all(now);
     for (const a of dueRows) {
-      let status = 'ready', reason = null, readyAt = now;
-      if (!a.masked_email_enc) { status = 'suppressed'; reason = a.purged_at ? 'contact_purged' : 'no_email'; readyAt = null; }
-      else if (a.is_suppressed) { status = 'suppressed'; reason = 'suppression_list'; readyAt = null; }
-      setStatusStmt.run({ id: a.id, status, reason, ready_at: readyAt, now });
-      if (status === 'ready') counts.promotedReady++; else counts.suppressed++;
+      // contact 未着・メール未着はここで確定させない (planned のまま毎回再評価、期限=4c が終端)。
+      // purge 済みだけは復帰しないので終端抑止
+      if (a.purged_at) {
+        setStatusStmt.run({ id: a.id, status: 'suppressed', reason: 'contact_purged', ready_at: null, now });
+        counts.suppressed++;
+        continue;
+      }
+      if (!a.has_contact || !a.masked_email_enc) continue;
+      if (a.is_suppressed) {
+        setStatusStmt.run({ id: a.id, status: 'suppressed', reason: 'suppression_list', ready_at: null, now });
+        counts.suppressed++;
+        continue;
+      }
+      setStatusStmt.run({ id: a.id, status: 'ready', reason: null, ready_at: now, now });
+      counts.promotedReady++;
     }
 
-    // ── 5. ownership (shadow 中に観測した注文は全て vendor 担当として記録) ──
-    // action の有無ではなく contacts (=shadow中に受注APIで見えた全注文) を母集合にする
-    // (Codex C1-R1 Medium: 未発送などで action 未作成の注文が cutover 時に self 扱いされ
-    // vendor と二重送信になる穴を塞ぐ)。action だけあって contacts が無い注文 (no_contact) も合流。
-    // PR-C4 の送信ゲートは「ownership 行が無い注文 = 送らない (fail-closed)」とすること
-    const r1 = db.prepare(`
-      INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-      SELECT c.order_number, 'vendor', 'shadow', ? FROM rakuten_order_contacts c
-    `).run(now);
-    const r2 = db.prepare(`
-      INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-      SELECT DISTINCT a.order_number, 'vendor', 'shadow', ? FROM rakuten_campaign_actions a
-    `).run(now);
-    counts.ownershipInserted = r1.changes + r2.changes;
+    // ── 5. ownership ──
+    // 母集合は contacts (=受注APIで見えた全注文) ∪ action のある注文 (Codex C1-R1 Medium:
+    // 未発送などで action 未作成の注文が cutover 時に self 扱いされる穴を塞ぐ)。
+    // cutover-aware (Codex C1-R2 High: 無条件 vendor だと cutover 後の新規注文まで先取りされ
+    // self に切り替えられない):
+    //   - cutover_at 未設定 (shadow 期) = 全注文 vendor
+    //   - cutover_at 設定後 = 最終発送が cutover 後の注文だけ self (設計C4「cutover後に
+    //     最終発送された注文だけ自作対象」)。未発送は判定不能 → 行を作らない
+    // INSERT OR IGNORE のため一度決めた owner は覆らない (境界注文は vendor のまま =
+    // 重複より取りこぼしを選ぶ)。PR-C4 の送信ゲートは「ownership 行が無い or owner != 'self'
+    // = 送らない (fail-closed)」とすること。cutover_at は PR-C5 の cutover 手順だけが設定する
+    const cutoverAt = db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'cutover_at'`).get()?.value || null;
+    if (!cutoverAt) {
+      const r1 = db.prepare(`
+        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
+        SELECT c.order_number, 'vendor', 'shadow', ? FROM rakuten_order_contacts c
+      `).run(now);
+      const r2 = db.prepare(`
+        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
+        SELECT DISTINCT a.order_number, 'vendor', 'shadow', ? FROM rakuten_campaign_actions a
+      `).run(now);
+      counts.ownershipInserted = r1.changes + r2.changes;
+    } else {
+      // shipping_datetime は '+09:00' 表記、cutover_at は UTC ISO のため文字列比較不可 → epoch 比較
+      const cutT = Date.parse(cutoverAt);
+      const ownStmt = db.prepare(`
+        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      const shipped = db.prepare(`
+        SELECT order_number, shipping_datetime FROM rakuten_order_contacts WHERE shipping_datetime IS NOT NULL
+      `).all();
+      for (const c of shipped) {
+        const t = Date.parse(c.shipping_datetime);
+        if (!Number.isFinite(t)) continue;
+        counts.ownershipInserted += ownStmt.run(
+          c.order_number, t > cutT ? 'self' : 'vendor', 'cutover_shipping', now).changes;
+      }
+      // action があるのに contacts が無い注文 (no_contact 経路の古い注文) は安全側で vendor
+      const orphans = db.prepare(`
+        SELECT DISTINCT a.order_number FROM rakuten_campaign_actions a
+          LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+         WHERE c.order_number IS NULL
+      `).all();
+      for (const o of orphans) {
+        counts.ownershipInserted += ownStmt.run(o.order_number, 'vendor', 'cutover_no_contact', now).changes;
+      }
+    }
   });
   tx();
   return counts;

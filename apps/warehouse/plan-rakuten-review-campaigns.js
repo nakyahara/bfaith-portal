@@ -33,6 +33,9 @@ if (!fs.existsSync(dbPath)) { console.error(`FATAL: warehouse.db not found at ${
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
+// attempts/grants の REFERENCES を実際に強制する (SQLite は接続ごとに有効化が必要 — Codex C1-R2)。
+// PR-C4 の sender 接続でも必ず有効化すること
+db.pragma('foreign_keys = ON');
 // planner は contacts / reviews を読むため、初回実行順に依らず全テーブルを冪等に確保する
 ensureRakutenReviewTables(db);
 ensureContactTables(db);
