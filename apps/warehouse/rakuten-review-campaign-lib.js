@@ -116,6 +116,9 @@ export function ensureCampaignTables(db) {
   // 翌朝 ready になる)。PR-C2 の日次突合は scheduled_at の JST 暦日で集計すること
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_status_sched ON rakuten_campaign_actions(status, scheduled_at)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_order ON rakuten_campaign_actions(order_number)`);
+  // 突合レポートの scheduled_at 単独範囲検索用 (Codex C2-R2 Medium: (status,scheduled_at) では
+  // status 無指定の集計が全件走査になる)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_sched ON rakuten_campaign_actions(scheduled_at)`);
 
   // 送信試行ログ (PR-C4 で書く)。UNIQUE(action_id) = action単位の at-most-once を
   // DB制約で強制する (Codex C1-R1 High: message_id UNIQUE だけでは同一actionに別message_idで
