@@ -39,7 +39,8 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // ─── 多重起動ロック (Task Scheduler + 手動実行の同時起動で同一ブラウザプロファイルを
 // 2プロセスが触るとプロファイル破損/2FA誤検知の恐れ — Codex R1 Medium) ───
 const LOCK_PATH = join(LOG_DIR, 'fetch-all.lock');
-const LOCK_STALE_MS = 6 * 60 * 60 * 1000; // 全モール合計timeout+リトライ待ち25分+リトライ分より長め。超過は前回クラッシュの残骸とみなす
+// stale閾値は実行時間の理論上限から算出 (固定値だと設定次第で「生存中のlockを残骸扱い」
+// して同一ブラウザプロファイルを並行利用し得る — Codex R2 High)。定義は FETCHERS の後方
 function acquireLock() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -133,6 +134,10 @@ const RETRY_DELAY_MS = (() => {
   }
   return n;
 })();
+
+// 実行時間の理論上限 = 全モールtimeout合計×2パス + リトライ待ち + 余裕1時間。
+// これより古いlockだけを前回クラッシュの残骸とみなす
+const LOCK_STALE_MS = FETCHERS.reduce((s, f) => s + f.timeoutMs, 0) * 2 + RETRY_DELAY_MS + 60 * 60 * 1000;
 
 /** 子スクリプトを1回実行して結果を返す */
 function runFetcher(f, extraEnv = {}) {

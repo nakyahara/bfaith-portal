@@ -284,7 +284,9 @@ export async function ensureRmsLogin(page) {
   await settleRedirects(page);
   await passNotice(page);
   if (!(await looksLoggedIn(page))) {
-    throw new Error(`ログイン確認できず: ${page.url()}`);
+    // ログイン手順は完走したのにRMSに入れない = 資格情報エラー/楽天側の利用規制/画面変更の
+    // いずれかで、いずれも自動リトライでは直らない → blocked (exit 3) に分類 (Codex R2 High)
+    throw new Error(`RMS_SESSION_UNSTABLE: ログイン手順は完走したがRMSに入れない: ${page.url()} (資格情報エラー/楽天側の利用規制/画面変更の可能性。自動リトライ対象外 — 手動DLで incoming/ へ)`);
   }
   console.log(`[login] メインメニュー到達(再) host=${safeHost(page.url())}`);
 }
