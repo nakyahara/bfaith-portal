@@ -109,41 +109,70 @@ export function mapInquiry(row, expectedShopId = null) {
 
 /**
  * @param {object} cfg
- *   serviceSecret, licenseKey: RMS認証 (必須)
+ *   transport?: 'direct' (既定) | 'warehouse'
+ *     direct    — RMS を直接叩く。serviceSecret / licenseKey 必須 (miniPC上での実行・契約テスト用)
+ *     warehouse — miniPC bfaith-portal の /service-api/rakuten-rms/inquiries passthrough を
+ *                 Cloudflare Tunnel 経由で叩く (Render用。設計原則: Renderに楽天キーを置かない)。
+ *                 warehouseUrl / serviceToken / cfClientId / cfClientSecret 必須
  *   expectedShopId?: レスポンス row.shopId との照合値 (店舗混入防止。運用では必須推奨)
  *   lookbackDays?: regDate 再照合幅 (既定60。--deep 時は365等を渡す)
- *   requestTimeoutMs?: リクエスト単位のタイムアウト (既定30秒。無応答での同期リース越え滞留防止)
+ *   requestTimeoutMs?: リクエスト単位のタイムアウト (既定90秒。miniPC側の直列キュー待ちを見込む)
  *   fetchImpl?: fetch 差し替え (テスト用)
  *   sleepMs?: リクエスト間隔 (既定1100。テストでは0)
  *   maxPages?: ページ数上限 (超過は throw。既定60)
  */
 export function createRakutenAdapter(cfg = {}) {
   const { serviceSecret, licenseKey, expectedShopId = null } = cfg;
-  if (!serviceSecret || !licenseKey) {
-    throw new Error('createRakutenAdapter: serviceSecret / licenseKey は必須です (env RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY)');
+  const transport = cfg.transport ?? 'direct';
+  let listUrlBase, buildHeaders;
+  if (transport === 'direct') {
+    if (!serviceSecret || !licenseKey) {
+      throw new Error('createRakutenAdapter: transport=direct には serviceSecret / licenseKey が必須です (env RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY)');
+    }
+    const auth = 'ESA ' + Buffer.from(`${serviceSecret}:${licenseKey}`).toString('base64');
+    listUrlBase = `${BASE}/inquiries`;
+    buildHeaders = () => ({ Authorization: auth });
+  } else if (transport === 'warehouse') {
+    const { warehouseUrl, serviceToken, cfClientId, cfClientSecret } = cfg;
+    if (!warehouseUrl || !serviceToken || !cfClientId || !cfClientSecret) {
+      throw new Error('createRakutenAdapter: transport=warehouse には warehouseUrl / serviceToken / cfClientId / cfClientSecret が必須です (env WAREHOUSE_URL / WAREHOUSE_SERVICE_TOKEN / CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET)');
+    }
+    listUrlBase = `${warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiries`;
+    buildHeaders = () => ({
+      'CF-Access-Client-Id': cfClientId,
+      'CF-Access-Client-Secret': cfClientSecret,
+      Authorization: `Bearer ${serviceToken}`,
+    });
+  } else {
+    throw new Error(`createRakutenAdapter: 未知のtransport '${transport}'`);
   }
   const lookbackDays = cfg.lookbackDays ?? DEFAULT_LOOKBACK_DAYS;
   const fetchImpl = cfg.fetchImpl ?? fetch;
   const sleepMs = cfg.sleepMs ?? 1100;
   const maxPages = cfg.maxPages ?? DEFAULT_MAX_PAGES;
-  const requestTimeoutMs = cfg.requestTimeoutMs ?? 30000;
-  const auth = 'ESA ' + Buffer.from(`${serviceSecret}:${licenseKey}`).toString('base64');
+  // warehouse 経由は miniPC 側 rakutenRequest の直列キュー+リトライ (最大4試行) を挟むため長めに取る
+  const requestTimeoutMs = cfg.requestTimeoutMs ?? 90000;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  // エラー本文は構造化フィールドだけをログに残す (問い合わせ本文等の露出防止。Codex R1)
+  // エラー本文は構造化フィールドだけをログに残す (問い合わせ本文等の露出防止。Codex R1)。
+  // RMS直: {error:{code,message,targets}} / warehouse passthrough失敗: {ok,error,message} の両形に対応
   const errorHead = async res => {
     const text = await res.text().catch(() => '');
     try {
       const j = JSON.parse(text);
-      return JSON.stringify({ code: j?.error?.code, message: j?.error?.message, targets: j?.error?.targets }).slice(0, 300);
+      return JSON.stringify({
+        code: j?.error?.code ?? (typeof j?.error === 'string' ? j.error : undefined),
+        message: j?.error?.message ?? j?.message,
+        targets: j?.error?.targets,
+      }).slice(0, 300);
     } catch { return text.slice(0, 120); }
   };
 
   async function getListPage(fromDate, toDate, page) {
-    const url = `${BASE}/inquiries?fromDate=${encodeURIComponent(fromDate)}&toDate=${encodeURIComponent(toDate)}&limit=${PAGE_LIMIT}&page=${page}`;
+    const url = `${listUrlBase}?fromDate=${encodeURIComponent(fromDate)}&toDate=${encodeURIComponent(toDate)}&limit=${PAGE_LIMIT}&page=${page}`;
     let res;
     try {
-      res = await fetchImpl(url, { headers: { Authorization: auth }, signal: AbortSignal.timeout(requestTimeoutMs) });
+      res = await fetchImpl(url, { headers: buildHeaders(), signal: AbortSignal.timeout(requestTimeoutMs) });
     } catch (err) {
       const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
       const e = new Error(timedOut
