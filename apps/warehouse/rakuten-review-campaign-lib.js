@@ -107,9 +107,11 @@ export function ensureCampaignTables(db) {
     created_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
   )`);
-  // PR-C4 の必須不変条件 (Codex C1-R1): ready→claimed は「条件付きUPDATE+変更行数=1確認」の
+  // PR-C4 の必須不変条件 (Codex C1-R1/R3): ready→claimed は「条件付きUPDATE+変更行数=1確認」の
   // CAS で行い、claim と同一トランザクションで ①expires_at > now ②contact 未purge・復号可能
-  // ③suppression 未登録 ④coupon は有効レビュー残存 ⑤ownership owner='self' を再評価すること。
+  // ③suppression 未登録 ④follow はレビュー不存在 (削除済み含む) / coupon は有効レビュー残存
+  // ⑤発送済み (shipping_datetime あり) かつ scheduled_at が現在の発送日から再計算した値と一致
+  // ⑥ownership owner='self' を再評価すること。
   // ready_at は「観測時刻」であり送信予定時刻ではない (planner は朝実行のため正午予定の action は
   // 翌朝 ready になる)。PR-C2 の日次突合は scheduled_at の JST 暦日で集計すること
   db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_status_sched ON rakuten_campaign_actions(status, scheduled_at)`);
@@ -224,23 +226,37 @@ export function planCampaigns(db, opts = {}) {
       if (r.changes > 0) counts.followInserted++;
     }
 
-    // ── 2. planned フォローの再スケジュール (再発送等で最終発送日が変わった場合に追従) ──
-    const planned = db.prepare(`
-      SELECT a.id, a.scheduled_at, a.expires_at, c.shipping_datetime
+    // ── 2. フォローの再スケジュール (再発送等で最終発送日が変わった場合に追従) ──
+    // ready も対象 (Codex C1-R3 High: 旧発送日基準で ready になった直後に再発送されると
+    // 旧 scheduled/expires のまま残り、再発送10日後より前の送信や誤った期限切れになる)。
+    // 再計算後の予定が未来なら planned へ差し戻す (その ready は再発送で無効になった would-send
+    // のため ready_at も消す)
+    const followRows = db.prepare(`
+      SELECT a.id, a.status, a.scheduled_at, a.expires_at, c.shipping_datetime
         FROM rakuten_campaign_actions a
         JOIN rakuten_order_contacts c ON c.order_number = a.order_number
-       WHERE a.action_type = 'follow' AND a.status = 'planned' AND c.shipping_datetime IS NOT NULL
+       WHERE a.action_type = 'follow' AND a.status IN ('planned','ready')
+         AND c.shipping_datetime IS NOT NULL
     `).all();
     const reschedStmt = db.prepare(`
       UPDATE rakuten_campaign_actions SET scheduled_at = ?, expires_at = ?, updated_at = ?
-       WHERE id = ? AND status = 'planned'
+       WHERE id = ? AND status = ?
     `);
-    for (const a of planned) {
+    const demoteStmt = db.prepare(`
+      UPDATE rakuten_campaign_actions
+         SET scheduled_at = ?, expires_at = ?, status = 'planned', status_reason = 'rescheduled',
+             ready_at = NULL, updated_at = ?
+       WHERE id = ? AND status = 'ready'
+    `);
+    for (const a of followRows) {
       const sched = followScheduleFor(a.shipping_datetime);
-      if (sched && (sched.scheduledAt !== a.scheduled_at || sched.expiresAt !== a.expires_at)) {
-        reschedStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id);
-        counts.rescheduled++;
+      if (!sched || (sched.scheduledAt === a.scheduled_at && sched.expiresAt === a.expires_at)) continue;
+      if (a.status === 'ready' && sched.scheduledAt > now) {
+        demoteStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id);
+      } else {
+        reschedStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id, a.status);
       }
+      counts.rescheduled++;
     }
     // planned クーポンの期限も発送基準に追従 (awaiting_contact で投稿日基準の保守値だった行に
     // 後から contact が届いたら、規約上限=発送+21日へ付け替える。scheduled_at は検知基準のまま)
@@ -303,6 +319,7 @@ export function planCampaigns(db, opts = {}) {
       else if (now >= base.expiresAt) { status = 'expired'; reason = 'expired_before_plan'; }
       else if (!rv.has_contact) { reason = 'awaiting_contact'; }
       else if (!rv.masked_email_enc) { reason = 'awaiting_email'; }
+      else if (!rv.shipping_datetime) { reason = 'awaiting_shipping'; } // 発送確認が取れるまで昇格しない
       const r = insertStmt.run({
         action_type: 'coupon', dedupe_key: dedupeKeyFor('coupon', rv.order_number),
         order_number: rv.order_number, trigger_review_url: rv.trigger_url,
@@ -312,26 +329,32 @@ export function planCampaigns(db, opts = {}) {
       if (r.changes > 0) counts.couponInserted++;
     }
 
-    // ── 4a. planned フォロー: レビューが来たら停止 (削除済み含む。削除で再開しない=復帰遷移なし) ──
+    // ── 4a. フォロー: レビューが来たら停止 (削除済み含む。削除で再開しない=復帰遷移なし) ──
+    // 未claimの ready も対象 (Codex C1-R3 High: 取込遅延でレビューなしとして ready になった後に
+    // レビューが到着するケース)。ready_at は突合記録として保持する
+    const preSendStmt = db.prepare(`
+      UPDATE rakuten_campaign_actions SET status = @status, status_reason = @reason, updated_at = @now
+       WHERE id = @id AND status IN ('planned','ready')
+    `);
     const followSuppress = db.prepare(`
       SELECT a.id FROM rakuten_campaign_actions a
-       WHERE a.action_type = 'follow' AND a.status = 'planned'
+       WHERE a.action_type = 'follow' AND a.status IN ('planned','ready')
          AND EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = a.order_number)
     `).all();
     for (const a of followSuppress) {
-      setStatusStmt.run({ id: a.id, status: 'suppressed', reason: 'review_exists', ready_at: null, now });
+      preSendStmt.run({ id: a.id, status: 'suppressed', reason: 'review_exists', now });
       counts.suppressed++;
     }
 
-    // ── 4b. planned クーポン: 引き金レビューが全削除されたら取消 (送信前のみ。sent後は関知しない) ──
+    // ── 4b. クーポン: 引き金レビューが全削除されたら取消 (送信前=planned/ready のみ。sent後は関知しない) ──
     const couponCancel = db.prepare(`
       SELECT a.id FROM rakuten_campaign_actions a
-       WHERE a.action_type = 'coupon' AND a.status = 'planned'
+       WHERE a.action_type = 'coupon' AND a.status IN ('planned','ready')
          AND NOT EXISTS(SELECT 1 FROM fact_rakuten_reviews r
                          WHERE r.order_number = a.order_number AND r.is_deleted = 0)
     `).all();
     for (const a of couponCancel) {
-      setStatusStmt.run({ id: a.id, status: 'cancelled', reason: 'review_deleted', ready_at: null, now });
+      preSendStmt.run({ id: a.id, status: 'cancelled', reason: 'review_deleted', now });
       counts.cancelled++;
     }
 
@@ -359,7 +382,7 @@ export function planCampaigns(db, opts = {}) {
     const dueRows = db.prepare(`
       SELECT a.id, a.action_type, a.status_reason,
              c.order_number IS NOT NULL AS has_contact,
-             c.masked_email_enc, c.masked_email_hash, c.purged_at,
+             c.shipping_datetime, c.masked_email_enc, c.masked_email_hash, c.purged_at,
              EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
         FROM rakuten_campaign_actions a
         LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
@@ -374,6 +397,10 @@ export function planCampaigns(db, opts = {}) {
         continue;
       }
       if (!a.has_contact || !a.masked_email_enc) continue;
+      // クーポンは発送確認が取れるまで昇格させない (Codex C1-R3 High: 未発送のまま ready にすると
+      // 「発送後3週間以内」の前提となる発送実績なしで PR-C4 の送信対象になる。
+      // 発送日時が入れば同run内の期限付け替え (2') を経て次の評価で昇格する)
+      if (a.action_type === 'coupon' && !a.shipping_datetime) continue;
       if (a.is_suppressed) {
         setStatusStmt.run({ id: a.id, status: 'suppressed', reason: 'suppression_list', ready_at: null, now });
         counts.suppressed++;
@@ -444,13 +471,18 @@ export function campaignStats(db, nowIso = new Date().toISOString()) {
      GROUP BY action_type, status, reason
      ORDER BY action_type, status, reason
   `).all();
-  const due24h = db.prepare(`
+  // overdue (予定超過で待機=awaiting_* が大半) と今後24時間を分けて数える (Codex C1-R3 Low)
+  const dueOverdue = db.prepare(`
     SELECT COUNT(*) AS n FROM rakuten_campaign_actions
      WHERE status = 'planned' AND scheduled_at <= ?
-  `).get(new Date(Date.parse(nowIso) + DAY_MS).toISOString()).n;
+  `).get(nowIso).n;
+  const dueNext24h = db.prepare(`
+    SELECT COUNT(*) AS n FROM rakuten_campaign_actions
+     WHERE status = 'planned' AND scheduled_at > ? AND scheduled_at <= ?
+  `).get(nowIso, new Date(Date.parse(nowIso) + DAY_MS).toISOString()).n;
   const readyTodayJst = db.prepare(`
     SELECT COUNT(*) AS n FROM rakuten_campaign_actions WHERE status = 'ready' AND ready_at >= ?
   `).get(new Date(Date.parse(`${jstDateOf(nowIso)}T00:00:00+09:00`)).toISOString()).n;
   const epoch = db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'coupon_epoch'`).get()?.value || null;
-  return { byStatus, due24h, readyTodayJst, epoch };
+  return { byStatus, dueOverdue, dueNext24h, readyTodayJst, epoch };
 }

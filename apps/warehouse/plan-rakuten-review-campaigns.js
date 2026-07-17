@@ -50,7 +50,7 @@ try {
   } else if (mode === 'stats') {
     const s = campaignStats(db);
     console.log(`coupon_epoch: ${s.epoch || '(未設定=plan未実行)'}`);
-    console.log(`24時間以内に送信予定 (planned): ${s.due24h}件 / 本日(JST) ready昇格: ${s.readyTodayJst}件`);
+    console.log(`予定超過で待機中 (planned): ${s.dueOverdue}件 / 今後24時間の送信予定 (planned): ${s.dueNext24h}件 / 本日(JST) ready昇格: ${s.readyTodayJst}件`);
     for (const row of s.byStatus) {
       console.log(`  ${row.action_type} ${row.status}${row.reason ? ` (${row.reason})` : ''}: ${row.n}件`);
     }

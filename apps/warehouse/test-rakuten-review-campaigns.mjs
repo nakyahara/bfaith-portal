@@ -292,6 +292,53 @@ console.log('=== 8. shadow 不変条件・PII・冪等性 ===');
   check('stats: byStatus が返る', Array.isArray(s.byStatus) && s.byStatus.length > 0);
 }
 
+console.log('=== 8b. R3: 発送未確認クーポン / ready後の再発送・後着レビュー・削除 ===');
+{
+  const oNoShipCoupon = makeContact({ shippingIso: null });
+  insertReview(db, { orderNumber: oNoShipCoupon, firstSeenAt: '2026-07-21T00:00:00.000Z' });
+  const oReship = makeContact({ shippingIso: '2026-07-11T12:00:00+09:00' });     // scheduled=7/21正午
+  const oLateReview = makeContact({ shippingIso: '2026-07-11T12:00:00+09:00' }); // scheduled=7/21正午
+  const oCancelReady = makeContact({ shippingIso: '2026-07-19T12:00:00+09:00' });
+  insertReview(db, { orderNumber: oCancelReady, firstSeenAt: '2026-07-21T00:00:00.000Z' });
+
+  planCampaigns(db, { nowIso: '2026-07-21T00:30:00.000Z' }); // 09:30 JST
+  const a1 = getAction(oNoShipCoupon, 'coupon');
+  check('contactあり発送未確認のクーポンは planned(awaiting_shipping)', a1.status === 'planned' && a1.status_reason === 'awaiting_shipping');
+
+  planCampaigns(db, { nowIso: '2026-07-21T05:00:00.000Z' }); // 14:00 JST (正午過ぎ)
+  check('正午を過ぎても発送未確認なら昇格しない (規約=発送後3週間の前提)', getAction(oNoShipCoupon, 'coupon').status === 'planned');
+  check('比較対象: 発送済みフォローは ready になっている', getAction(oReship, 'follow').status === 'ready');
+  check('比較対象: 発送済みクーポンは ready になっている', getAction(oCancelReady, 'coupon').status === 'ready');
+
+  // ready 後の再発送 → 予定が未来になるなら planned に差し戻し
+  db.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-07-15T12:00:00+09:00' WHERE order_number = ?`).run(oReship);
+  planCampaigns(db, { nowIso: '2026-07-21T05:30:00.000Z' });
+  const aReship = getAction(oReship, 'follow');
+  check('ready後の再発送で planned に差し戻し+新予定 (7/25正午)', aReship.status === 'planned' && aReship.scheduled_at === '2026-07-25T03:00:00.000Z');
+  check('差し戻しで ready_at はクリア (無効になった would-send)', aReship.ready_at === null && aReship.status_reason === 'rescheduled');
+
+  // 発送確認後に昇格+期限付け替え
+  db.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-07-20T12:00:00+09:00' WHERE order_number = ?`).run(oNoShipCoupon);
+  planCampaigns(db, { nowIso: '2026-07-21T06:00:00.000Z' });
+  const a2 = getAction(oNoShipCoupon, 'coupon');
+  check('発送確認後に ready + 期限=発送基準21日', a2.status === 'ready' && a2.expires_at === '2026-08-10T14:59:59.000Z', `${a2.status} ${a2.expires_at}`);
+
+  // ready 後の後着レビュー → suppressed (ready_at は突合記録として保持)
+  insertReview(db, { orderNumber: oLateReview, firstSeenAt: '2026-07-21T07:00:00.000Z' });
+  planCampaigns(db, { nowIso: '2026-07-21T08:00:00.000Z' });
+  const aLateRv = getAction(oLateReview, 'follow');
+  check('ready後の後着レビューで suppressed(review_exists)', aLateRv.status === 'suppressed' && aLateRv.status_reason === 'review_exists');
+  check('suppressed でも ready_at は保持 (突合記録)', aLateRv.ready_at !== null);
+
+  // ready 後のレビュー全削除 → cancelled
+  db.prepare(`UPDATE fact_rakuten_reviews SET is_deleted = 1 WHERE order_number = ?`).run(oCancelReady);
+  planCampaigns(db, { nowIso: '2026-07-21T09:00:00.000Z' });
+  check('ready後のレビュー全削除で cancelled(review_deleted)', getAction(oCancelReady, 'coupon').status === 'cancelled');
+
+  const s = campaignStats(db, '2026-07-21T09:00:00.000Z');
+  check('stats: dueOverdue / dueNext24h が分離されている', Number.isInteger(s.dueOverdue) && Number.isInteger(s.dueNext24h));
+}
+
 console.log('=== 9. cutover-aware ownership + FK強制 ===');
 {
   // shadow期に決まった vendor は cutover 後も覆らない
