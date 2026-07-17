@@ -12,7 +12,7 @@ import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats, dedupeKeyFor,
   jstDateOf, jstNoonUtcIso, nextNoonJstAfter, followScheduleFor, postedAtToUtcIso,
-  recordVendorDaily, shadowComparisonReport,
+  recordVendorDaily, recordVendorDailyBatch, shadowComparisonReport, isValidJstDate,
 } from './rakuten-review-campaign-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey,
@@ -343,6 +343,18 @@ console.log('=== 8b. R3: 発送未確認クーポン / ready後の再発送・�
   planCampaigns(db, { nowIso: '2026-07-21T09:00:00.000Z' });
   check('ready後のレビュー全削除で cancelled(review_deleted)', getAction(oCancelReady, 'coupon').status === 'cancelled');
 
+  // ready 後の発送日「過去方向」訂正 → scheduled_at は凍結 (集計日を動かさない)、期限のみ追従
+  const oFreeze = makeContact({ shippingIso: '2026-07-09T12:00:00+09:00' }); // scheduled=7/19正午 (過去)
+  planCampaigns(db, { nowIso: '2026-07-21T09:30:00.000Z' }); // 作成+同run内で due→ready
+  const aFz0 = getAction(oFreeze, 'follow');
+  check('過去予定の新規followは同runでready', aFz0.status === 'ready' && aFz0.scheduled_at === '2026-07-19T03:00:00.000Z');
+  db.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-07-08T12:00:00+09:00' WHERE order_number = ?`).run(oFreeze);
+  planCampaigns(db, { nowIso: '2026-07-21T10:00:00.000Z' });
+  const aFz = getAction(oFreeze, 'follow');
+  check('ready後の過去方向訂正で scheduled_at 凍結 (報告済み集計日を動かさない — Codex C2-R1 High)',
+    aFz.status === 'ready' && aFz.scheduled_at === '2026-07-19T03:00:00.000Z', `${aFz.status} ${aFz.scheduled_at}`);
+  check('期限だけは実態に追従 (発送7/8+21日)', aFz.expires_at === '2026-07-29T14:59:59.000Z', aFz.expires_at);
+
   const s = campaignStats(db, '2026-07-21T09:00:00.000Z');
   check('stats: dueOverdue / dueNext24h が分離されている', Number.isInteger(s.dueOverdue) && Number.isInteger(s.dueNext24h));
 }
@@ -421,6 +433,26 @@ console.log('=== 10. PR-C2: vendor実績記録+shadow突合レポート ===');
 
   const dump = JSON.stringify(rep);
   check('レポートに注文番号が含まれない (件数のみ)', !dump.includes('O1') && !dump.includes('O4'));
+
+  // 期間内の全暦日を生成 (転記漏れ日と両方ゼロの日を区別できる — Codex C2-R1 Medium)
+  const rep2 = shadowComparisonReport(db2, { fromJst: '2026-07-17', toJst: '2026-07-19' });
+  check('データのない日も行が出る (vendor=null/shadow=0)',
+    rep2.days.length === 3 && rep2.days[0].date_jst === '2026-07-17'
+    && rep2.days[0].follow_vendor === null && rep2.days[0].follow_shadow === 0, JSON.stringify(rep2.days[0]));
+
+  check('isValidJstDate: 実在暦日のみ受理', isValidJstDate('2026-02-28') && !isValidJstDate('2026-02-30') && !isValidJstDate('2026-13-01'));
+  let badCal = false, tooLong = false, batchFail = false;
+  try { recordVendorDaily(db2, { dateJst: '2026-02-30', actionType: 'follow', count: 1 }); } catch { badCal = true; }
+  try { shadowComparisonReport(db2, { fromJst: '2026-01-01', toJst: '2026-07-01' }); } catch { tooLong = true; }
+  check('実在しない暦日は拒否 / 92日超の期間は拒否', badCal && tooLong);
+  try {
+    recordVendorDailyBatch(db2, [
+      { dateJst: '2026-07-20', actionType: 'follow', count: 5 },
+      { dateJst: '2026-07-20', actionType: 'coupon', count: -1 },
+    ]);
+  } catch { batchFail = true; }
+  check('batch転記: 1件不正で全体ロールバック (部分更新なし)',
+    batchFail && db2.prepare(`SELECT COUNT(*) n FROM rakuten_vendor_send_daily WHERE date_jst = '2026-07-20'`).get().n === 0);
   db2.close();
 }
 

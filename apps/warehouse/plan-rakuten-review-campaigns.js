@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats,
-  recordVendorDaily, shadowComparisonReport, jstDateOf,
+  recordVendorDailyBatch, shadowComparisonReport, jstDateOf, REPORT_MAX_DAYS,
 } from './rakuten-review-campaign-lib.js';
 import { ensureContactTables } from './rakuten-review-contacts-lib.js';
 import { ensureRakutenReviewTables } from './rakuten-review-lib.js';
@@ -69,18 +69,32 @@ try {
       console.error('FATAL: vendor --date YYYY-MM-DD と --follow N / --coupon N の少なくとも一方が必要');
       process.exitCode = 2;
     } else {
-      if (follow != null) recordVendorDaily(db, { dateJst: date, actionType: 'follow', count: Number(follow) });
-      if (coupon != null) recordVendorDaily(db, { dateJst: date, actionType: 'coupon', count: Number(coupon) });
+      // 2項目は単一トランザクションで転記 (片方だけ保存される部分更新を防ぐ — Codex C2-R1 High)
+      const entries = [];
+      if (follow != null) entries.push({ dateJst: date, actionType: 'follow', count: Number(follow) });
+      if (coupon != null) entries.push({ dateJst: date, actionType: 'coupon', count: Number(coupon) });
+      recordVendorDailyBatch(db, entries);
       console.log(`[campaign] vendor実績を記録: ${date} follow=${follow ?? '(変更なし)'} coupon=${coupon ?? '(変更なし)'}`);
     }
   } else if (mode === 'report') {
     const todayJst = jstDateOf(new Date().toISOString());
     let from = getArg('--from'), to = getArg('--to');
+    if ((from == null) !== (to == null)) {
+      // 片方だけの指定を黙って捨てない (Codex C2-R1 Medium)
+      console.error('FATAL: --from と --to は両方指定してください (片方だけは不可)');
+      process.exitCode = 2;
+      throw Object.assign(new Error('usage'), { silent: true });
+    }
     if (!from || !to) {
-      const days = Math.min(Math.max(parseInt(getArg('--days'), 10) || 14, 1), 92);
+      const daysRaw = getArg('--days');
+      if (daysRaw != null && (!/^\d+$/.test(daysRaw) || +daysRaw < 1 || +daysRaw > REPORT_MAX_DAYS)) {
+        console.error(`FATAL: --days は 1〜${REPORT_MAX_DAYS} の整数で指定してください (指定値: ${daysRaw})`);
+        process.exitCode = 2;
+        throw Object.assign(new Error('usage'), { silent: true });
+      }
+      const days = daysRaw != null ? +daysRaw : 14;
       to = todayJst;
-      from = new Date(Date.parse(`${todayJst}T00:00:00+09:00`) - (days - 1) * 86400000).toISOString();
-      from = jstDateOf(from);
+      from = jstDateOf(new Date(Date.parse(`${todayJst}T00:00:00+09:00`) - (days - 1) * 86400000).toISOString());
     }
     const rep = shadowComparisonReport(db, { fromJst: from, toJst: to });
     console.log(`=== shadow突合レポート ${rep.fromJst} 〜 ${rep.toJst} (JST) ===`);
@@ -102,8 +116,10 @@ try {
     process.exitCode = 2;
   }
 } catch (e) {
-  console.error(`FATAL: ${e.message}`);
-  process.exitCode = 1;
+  if (!e.silent) { // silent=usage エラー (メッセージ・exitCode=2 は throw 前に設定済み)
+    console.error(`FATAL: ${e.message}`);
+    process.exitCode = 1;
+  }
 } finally {
   db.close();
 }

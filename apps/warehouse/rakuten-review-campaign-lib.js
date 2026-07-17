@@ -259,11 +259,24 @@ export function planCampaigns(db, opts = {}) {
              ready_at = NULL, updated_at = ?
        WHERE id = ? AND status = 'ready'
     `);
+    const readyExpireOnlyStmt = db.prepare(`
+      UPDATE rakuten_campaign_actions SET expires_at = ?, updated_at = ?
+       WHERE id = ? AND status = 'ready'
+    `);
     for (const a of followRows) {
       const sched = followScheduleFor(a.shipping_datetime);
       if (!sched || (sched.scheduledAt === a.scheduled_at && sched.expiresAt === a.expires_at)) continue;
-      if (a.status === 'ready' && sched.scheduledAt > now) {
-        demoteStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id);
+      if (a.status === 'ready') {
+        if (sched.scheduledAt > now) {
+          demoteStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id); // 予定が未来に動く=would-send無効→planned差し戻し
+        } else if (sched.expiresAt !== a.expires_at) {
+          // 予定が過去のままの訂正では scheduled_at を書き換えない (Codex C2-R1 High:
+          // ready後に集計日を動かすと、報告済みのwould-send日次件数が遡及変動して
+          // cutover判断の時系列が壊れる)。期限だけ実態に追従させる
+          readyExpireOnlyStmt.run(sched.expiresAt, now, a.id);
+        } else {
+          continue;
+        }
       } else {
         reschedStmt.run(sched.scheduledAt, sched.expiresAt, now, a.id, a.status);
       }
@@ -480,9 +493,15 @@ export function planCampaigns(db, opts = {}) {
 }
 
 // ─── PR-C2: vendor 実績記録と shadow 突合 ───
-/** vendor 日次送信件数の記録 (UPSERT。訂正転記を許す) */
+/** 実在する暦日か (書式+round-trip 検証。'2026-02-30' 等を弾く — Codex C2-R1 Medium) */
+export function isValidJstDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s))) return false;
+  return jstDateOf(`${s}T00:00:00+09:00`) === s;
+}
+
+/** vendor 日次送信件数の記録 (UPSERT。訂正転記を許す。recorded_at=最終転記時刻の仕様) */
 export function recordVendorDaily(db, { dateJst, actionType, count, source = 'manual', nowIso = new Date().toISOString() }) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(dateJst))) throw new Error(`VENDOR_RECORD: 日付が不正 (${dateJst})`);
+  if (!isValidJstDate(dateJst)) throw new Error(`VENDOR_RECORD: 日付が不正 (${dateJst})`);
   if (!['follow', 'coupon'].includes(actionType)) throw new Error(`VENDOR_RECORD: action_type が不正 (${actionType})`);
   const n = Number(count);
   if (!Number.isInteger(n) || n < 0) throw new Error(`VENDOR_RECORD: 件数が不正 (${count})`);
@@ -492,6 +511,15 @@ export function recordVendorDaily(db, { dateJst, actionType, count, source = 'ma
     ON CONFLICT(date_jst, action_type) DO UPDATE SET
       sent_count = excluded.sent_count, source = excluded.source, recorded_at = excluded.recorded_at
   `).run(dateJst, actionType, n, String(source), nowIso);
+}
+
+/** 複数エントリの原子的転記 (CLI 用 — Codex C2-R1 High: follow だけ保存されて coupon が
+ *  失敗する部分更新を防ぐ。1件でも不正なら全体をロールバック) */
+export function recordVendorDailyBatch(db, entries, nowIso = new Date().toISOString()) {
+  const tx = db.transaction(() => {
+    for (const e of entries) recordVendorDaily(db, { ...e, nowIso });
+  });
+  tx();
 }
 
 /**
@@ -504,48 +532,58 @@ export function recordVendorDaily(db, { dateJst, actionType, count, source = 'ma
  * 後から suppressed/expired になった action も「その時点では送ったはず」なので含める。
  * PII なし (件数のみ)。
  */
+export const REPORT_MAX_DAYS = 92;
+
 export function shadowComparisonReport(db, { fromJst, toJst }) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromJst) || !/^\d{4}-\d{2}-\d{2}$/.test(toJst) || fromJst > toJst) {
+  if (!isValidJstDate(fromJst) || !isValidJstDate(toJst) || fromJst > toJst) {
     throw new Error(`REPORT: 期間が不正 (${fromJst}..${toJst})`);
+  }
+  const fromMs = Date.parse(`${fromJst}T00:00:00+09:00`);
+  const toMsEx = Date.parse(`${toJst}T00:00:00+09:00`) + DAY_MS; // 終端排他 (JST翌日0時)
+  const rangeDays = Math.round((toMsEx - fromMs) / DAY_MS);
+  if (rangeDays > REPORT_MAX_DAYS) throw new Error(`REPORT: 期間が長すぎる (${rangeDays}日 > ${REPORT_MAX_DAYS}日)`);
+
+  // 期間内の全暦日を先に生成 (Codex C2-R1 Medium: 「両方ゼロの日」と「転記漏れの日」を
+  // 区別できるようにする。vendor 未転記=null、shadow は 0 起点)
+  const days = new Map(); // date_jst → {follow:{vendor,shadow}, coupon:{vendor,shadow}}
+  for (let t = fromMs; t < toMsEx; t += DAY_MS) {
+    days.set(jstDateOf(new Date(t).toISOString()), {
+      follow: { vendor: null, shadow: 0 }, coupon: { vendor: null, shadow: 0 },
+    });
+  }
+
+  // scheduled_at は UTC ISO (toISOString 生成で形式が揃っている) → SQL の文字列範囲で絞る
+  // (Codex C2-R1 Medium: 全件スキャンを避ける)。JST 暦日への変換は JS 側
+  const fromUtc = new Date(fromMs).toISOString();
+  const toUtcEx = new Date(toMsEx).toISOString();
+  const shadowRows = db.prepare(`
+    SELECT action_type, scheduled_at FROM rakuten_campaign_actions
+     WHERE ready_at IS NOT NULL AND scheduled_at >= ? AND scheduled_at < ?
+  `).all(fromUtc, toUtcEx);
+  for (const r of shadowRows) {
+    const d = jstDateOf(r.scheduled_at);
+    if (days.has(d)) days.get(d)[r.action_type].shadow++;
   }
   const vendorRows = db.prepare(`
     SELECT date_jst, action_type, sent_count FROM rakuten_vendor_send_daily
      WHERE date_jst >= ? AND date_jst <= ?
   `).all(fromJst, toJst);
-  // scheduled_at は UTC ISO → JST 暦日は JS 側で変換 (SQLite の日付関数に依存しない)
-  const shadowRows = db.prepare(`
-    SELECT action_type, scheduled_at FROM rakuten_campaign_actions WHERE ready_at IS NOT NULL
-  `).all();
-  const days = new Map(); // date_jst → {follow:{vendor,shadow}, coupon:{vendor,shadow}}
-  const dayOf = (d) => {
-    if (!days.has(d)) days.set(d, { follow: { vendor: null, shadow: 0 }, coupon: { vendor: null, shadow: 0 } });
-    return days.get(d);
-  };
-  for (const r of shadowRows) {
-    const d = jstDateOf(r.scheduled_at);
-    if (d && d >= fromJst && d <= toJst) dayOf(d)[r.action_type].shadow++;
+  for (const r of vendorRows) {
+    if (days.has(r.date_jst)) days.get(r.date_jst)[r.action_type].vendor = r.sent_count;
   }
-  for (const r of vendorRows) dayOf(r.date_jst)[r.action_type].vendor = r.sent_count;
 
   // 差分の説明材料: 期間内に予定があったのに would-send にならなかった action の状態×理由の内訳
-  // (scheduled_at の JST 期間絞りが必要なため JS 側で集計)
   const nonReady = db.prepare(`
-    SELECT action_type, status, COALESCE(status_reason, '') AS reason, scheduled_at
-      FROM rakuten_campaign_actions WHERE ready_at IS NULL
-  `).all();
-  const reasonMap = new Map();
-  for (const r of nonReady) {
-    const d = jstDateOf(r.scheduled_at);
-    if (!d || d < fromJst || d > toJst) continue;
-    const key = `${r.action_type}|${r.status}|${r.reason}`;
-    reasonMap.set(key, (reasonMap.get(key) || 0) + 1);
-  }
-  const reasonRows = [...reasonMap.entries()]
-    .map(([k, n]) => { const [action_type, status, reason] = k.split('|'); return { action_type, status, reason, n }; })
+    SELECT action_type, status, COALESCE(status_reason, '') AS reason, COUNT(*) AS n
+      FROM rakuten_campaign_actions
+     WHERE ready_at IS NULL AND scheduled_at >= ? AND scheduled_at < ?
+     GROUP BY action_type, status, reason
+  `).all(fromUtc, toUtcEx);
+  const reasonRows = nonReady
+    .map((r) => ({ action_type: r.action_type, status: r.status, reason: r.reason, n: r.n }))
     .sort((a, b) => a.action_type.localeCompare(b.action_type) || b.n - a.n);
 
   const dayRows = [...days.entries()]
-    .filter(([d]) => d >= fromJst && d <= toJst)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date_jst, v]) => ({
       date_jst,
