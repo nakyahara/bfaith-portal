@@ -1500,6 +1500,12 @@ export function getWarehouseSummary() {
   `);
 }
 
+// 倉庫在庫の登録商品数 (ユニーク商品ID数)。CSVアップロード時の急減ガード用。
+export function getWarehouseUniqueProductCount() {
+  const row = queryOne(`SELECT COUNT(DISTINCT LOWER(TRIM(logizard_code))) as cnt FROM warehouse_inventory`);
+  return row?.cnt || 0;
+}
+
 export function getSettings() {
   const rows = queryAll('SELECT key, value FROM settings');
   const obj = {};

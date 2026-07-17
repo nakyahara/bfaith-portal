@@ -6,7 +6,7 @@ import multer from 'multer';
 import cron from 'node-cron';
 import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapshots, getAllSnapshotSkus, getSettings, updateSetting,
          getSkuMappings, getSkuExceptions, upsertSkuException, deleteSkuException,
-         getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary,
+         getWarehouseInventory, replaceWarehouseInventory, getWarehouseSummary, getWarehouseUniqueProductCount,
          getShipmentPlans, getShipmentPlanItems, getDailySnapshots,
          getStockoutHidden, hideStockoutSku, unhideStockoutSku, hideStockoutSkuBulk,
          getNewProductHidden, hideNewProductSkuBulk, unhideNewProductSku,
@@ -22,6 +22,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun,
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
+import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
 import { uploadCsvToDrive } from './drive-upload.js';
 import { annotatePickingPdf } from './annotate-pdf.js';
@@ -102,7 +103,8 @@ async function callMiniPC(path, { method = 'GET', body, timeout = 60000, retry }
 }
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+// メモリ保持のため上限必須 (デコード候補生成でバッファの数倍を消費する)。実CSVは数MB程度
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 // DB初期化
 let dbReady = false;
@@ -336,55 +338,24 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'CSVファイルが必要です' });
 
   try {
-    // Shift_JIS対応
-    const iconv = (await import('iconv-lite')).default;
-    let text;
-    try {
-      text = iconv.decode(req.file.buffer, 'Shift_JIS');
-    } catch {
-      text = req.file.buffer.toString('utf-8');
-    }
+    const parsed = parseWarehouseCsv(req.file.buffer);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    const { items, invalidRows } = parsed;
 
-    const lines = text.split('\n').filter(l => l.trim());
-    if (lines.length < 2) return res.status(400).json({ error: 'CSVが空です' });
-
-    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-    const items = [];
-
-    for (let i = 1; i < lines.length; i++) {
-      const cols = lines[i].split(',').map(c => c.trim().replace(/"/g, ''));
-      const obj = {};
-      headers.forEach((h, j) => { obj[h] = cols[j] || ''; });
-
-      // ロジザードCSV実データ列名に対応
-      const block = obj['ブロック略称'] || '';
-      const location = obj['ロケ'] || obj['ロケーション'] || '';
-      const qty = parseInt(obj['在庫数(引当数を含む)'] || obj['在庫数'] || 0);
-      const reserved = parseInt(obj['引当数'] || 0);
-
-      // 最終入荷日: YYYYMMDD → YYYY-MM-DD に正規化
-      const rawNyuka = obj['最終入荷日'] || '';
-      const lastArrivalDate = rawNyuka.length === 8
-        ? `${rawNyuka.slice(0,4)}-${rawNyuka.slice(4,6)}-${rawNyuka.slice(6,8)}`
-        : rawNyuka;
-
-      items.push({
-        logizard_code: obj['商品ID'] || obj['商品コード'] || '',
-        product_name: obj['商品名'] || '',
-        location: location,
-        block: block,
-        quantity: qty,
-        reserved: reserved,
-        available_qty: qty - reserved,
-        expiry_date: obj['有効期限'] || '',
-        lot_no: obj['ロット'] || '',
-        barcode: obj['バーコード'] || '',
-        is_y_location: (block === 'YYY' || location.toUpperCase().startsWith('Y')) ? 1 : 0,
-        last_arrival_date: lastArrivalDate,
-        location_biz_type: obj['ロケ業務区分'] || '',
-        block_alloc_order: parseInt(obj['ブロック引当順'] || 9999),
-        biz_priority: obj['指定した業態を優先して取り置く'] || '',
-      });
+    // 商品数急減ガード: ユニーク商品ID数が前回の半分未満なら誤ファイル疑いで確認を要求。
+    // 強行 (force=1) は「確認した時点のprevUnique」の一致を要求し、確認〜再送の間に
+    // 別のアップロードでDBが変わっていた場合は再度409にする (古い確認での上書き競合を防止)
+    const prevUnique = getWarehouseUniqueProductCount();
+    const newUnique = new Set(items.map(i => i.logizard_code.trim().toLowerCase())).size;
+    if (prevUnique >= 20 && newUnique < prevUnique * 0.5) {
+      const forced = req.body?.force === '1' && Number(req.body?.force_prev_unique) === prevUnique;
+      if (!forced) {
+        return res.status(409).json({
+          needs_confirm: true,
+          prevUnique, newUnique,
+          error: `登録商品数が前回${prevUnique}商品 → 今回${newUnique}商品に急減しています。誤ったファイルの可能性があります`,
+        });
+      }
     }
 
     const count = replaceWarehouseInventory(items);
@@ -403,6 +374,8 @@ router.post('/api/warehouse/upload', upload.single('csv'), async (req, res) => {
         totalQty,
         yLocationProducts: new Set(yItems.map(i => i.logizard_code)).size,
         yLocationQty: yQty,
+        skippedRows: invalidRows.length,
+        skippedSamples: invalidRows.slice(0, 5).map(r => `${r.line}行目: ${r.reason}`),
       }
     });
   } catch (e) {
@@ -1746,5 +1719,13 @@ router.get('/picking-prep/print/:id', (req, res) => {
 function safeJsonParse(s, fallback) {
   try { return s ? JSON.parse(s) : fallback; } catch { return fallback; }
 }
+
+// multer のサイズ超過等をJSONで返す (既定だとHTMLエラーページになりフロントのd.errorが拾えない)
+router.use((err, req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'ファイルが大きすぎます (上限20MB)。正しいCSVか確認してください' });
+  }
+  next(err);
+});
 
 export default router;

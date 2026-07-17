@@ -12,7 +12,9 @@
 import iconv from 'iconv-lite';
 
 // RFC4180 パーサ。CRLF/LF 混在・引用内改行・"" エスケープに対応。
-export function parseCsv(text) {
+// opts.strict: true の場合、EOF 時に引用符が閉じていなければ throw
+// (壊れた引用符で複数行が1フィールドに吸収されたまま取り込むのを防ぐ。既定は従来互換で許容)
+export function parseCsv(text, opts = {}) {
   const rows = [];
   let row = [], field = '', inQuotes = false, i = 0;
   const n = text.length;
@@ -33,6 +35,9 @@ export function parseCsv(text) {
   }
   // 末尾フィールド/行 (最終行に改行が無い場合)
   if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  if (opts.strict && inQuotes) {
+    throw new Error(`引用符が閉じないままEOFに達しました (行${rows.length + 1}付近)`);
+  }
   return rows;
 }
 
@@ -46,6 +51,14 @@ export function decodeCsvBuffer(buffer) {
   if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
     return { text: buffer.slice(3).toString('utf8'), encoding: 'utf-8-bom' };
   }
+  // 厳密UTF-8判定: バイト列が妥当なUTF-8ならUTF-8を優先する。
+  // (スコアリングだけだと、正しいUTF-8日本語をCP932でデコードした結果が「日本語風文字が多く
+  //  置換文字なし」になるケースでCP932が勝ち、ヘッダ文字化け→誤拒否につながるため)
+  // CP932の日本語バイト列はほぼ必ずUTF-8として不正なので、fatalデコードが通れば安全にUTF-8と断定できる。
+  try {
+    const strictText = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    return { text: strictText, encoding: 'utf-8' };
+  } catch { /* 不正なUTF-8 → 従来のスコアリングにフォールバック */ }
   const candidates = [
     { enc: 'utf-8', text: buffer.toString('utf8') },
     { enc: 'cp932', text: iconv.decode(buffer, 'Shift_JIS') },
