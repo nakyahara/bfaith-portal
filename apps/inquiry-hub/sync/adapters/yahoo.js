@@ -152,6 +152,19 @@ export function createYahooAdapter(cfg = {}) {
   return {
     channelType: 'yahoo',
 
+    /**
+     * 認証状態の取得 (任意メソッド。cron/手動同期が shops.auth_expires_at の自動更新に使う)。
+     * VPSプロキシの /yahoo/health が refresh token の失効日時を返す
+     * (YConnect refresh token は28日で失効し月次再認可が必要 → 期限を画面で見える化する)
+     */
+    async getAuthStatus() {
+      const j = await proxyGet('/yahoo/health', {}, 'health');
+      return {
+        ok: !!j?.hasTokens,
+        authExpiresAt: j?.refreshTokenExpiresAt || null,
+      };
+    },
+
     /** sync/engine.js 契約。部分成功は返さない (途中失敗は全体 throw) */
     async fetchNew({ sinceIso, untilIso }) {
       requests = 0;
