@@ -1186,7 +1186,7 @@ $('#dlgOk').onclick = async () => {
   }catch(e){ alert('確定エラー: '+e.message); }
 };
 
-// ── 出力 (MeltLine 導入前=手動に落とす / 導入後=そのまま の2ボタン) ──
+// ── CSV出力 (ロジザードへ渡す Shift-JIS) ──
 // 旧形式ボタン (premeltline=1、MeltLine導入前の手動矯正出力) は 2026-07-18 中原さん指示で撤去。
 // API 側の ?premeltline=1 は残してあり、必要になれば URL 直叩きで旧形式を出力できる。
 $('#btnExportPost').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
