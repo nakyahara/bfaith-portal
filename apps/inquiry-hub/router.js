@@ -25,6 +25,7 @@ import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templa
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
+import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv } from './mail-rules.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
 // ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
@@ -877,6 +878,205 @@ router.post('/api/qa/:id(\\d+)/delete', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// 📧 メールルール画面 (メールチャネルのノイズ除去。メールディーラー振り分け設定の移行先)
+// ═══════════════════════════════════════════════════════════════
+
+const RULE_FIELD_LABELS = { from: 'From', to: 'To', reply_to: 'Reply-To', subject: '件名', body: '本文' };
+const RULE_OP_LABELS = {
+  contains: 'を含む', not_contains: 'を含まない', equals: 'と一致', not_equals: 'と一致しない',
+  starts_with: 'で始まる', ends_with: 'で終わる',
+};
+const RULE_ACTION_LABELS = {
+  skip: { label: '🗑️取り込まない', style: 'background:#fee2e2;color:#b91c1c' },
+  import_done: { label: '✅取込+完了扱い', style: 'background:#dcfce7;color:#166534' },
+};
+
+router.get('/mail-rules', (req, res) => {
+  const rules = listMailRules();
+  const fmtConds = (r) => {
+    let conds;
+    try { conds = JSON.parse(r.conditions_json); } catch { return '(解析不能)'; }
+    const glue = r.match_mode === 'any' ? ' または ' : ' かつ ';
+    return conds.map(c => `${RULE_FIELD_LABELS[c.field] || c.field}が「${he(c.value)}」${RULE_OP_LABELS[c.op] || c.op}`).join(glue);
+  };
+  const trs = rules.map(r => {
+    const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
+    return `
+    <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
+      <td class="nowrap">${r.priority}</td>
+      <td>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
+      <td style="overflow-wrap:anywhere">${fmtConds(r)}</td>
+      <td><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
+      <td class="nowrap ops">
+        <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
+        <button onclick="deleteRule(${r.id}, this)">削除</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const fieldOpts = Object.entries(RULE_FIELD_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+  const opOpts = Object.entries(RULE_OP_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+  const body = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">📥 メールディーラー「振り分けの設定」CSVの取込
+      <span class="sub">(ゴミ箱/削除ルール→「取り込まない」、対応完了ルール→「取込+完了扱い」として移行。フォルダ振り分けのみのルールは対象外)</span></div>
+    <div style="padding:12px 14px">
+      <input type="file" id="csvFile" accept=".csv">
+      <span class="sub">Shift-JIS/UTF-8 自動判定。まず内容を確認してから取込を実行します。再取込は同じ条件IDを上書き (手動追加分には触りません)</span>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🧪 ルールのテスト <span class="sub">(実際のメールを想定してどのルールに当たるか確認)</span></div>
+    <div style="padding:12px 14px" class="edit-grid">
+      <label>From <input type="text" id="tFrom" placeholder="例: no-reply@rakuten.co.jp"></label>
+      <label>件名 <input type="text" id="tSubject" placeholder="例: ご注文ありがとうございます"></label>
+      <label>Reply-To <input type="text" id="tReplyTo"></label>
+      <label>本文 (任意) <input type="text" id="tBody"></label>
+    </div>
+    <div style="padding:0 14px 12px"><button class="pri" onclick="testRule(this)">判定する</button> <span id="testResult" class="sub"></span></div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">➕ ルールを手動追加</div>
+    <div style="padding:12px 14px">
+      <div class="edit-grid">
+        <label>名称 (任意) <input type="text" id="nName"></label>
+        <label>優先度 (小さいほど先に評価) <input type="number" id="nPriority" value="50"></label>
+      </div>
+      ${[1, 2, 3].map(n => `
+      <div class="row" style="margin-bottom:6px">
+        <select id="nField${n}">${n > 1 ? '<option value="">(条件なし)</option>' : ''}${fieldOpts}</select>
+        <input type="text" id="nValue${n}" placeholder="文字列">
+        <select id="nOp${n}">${opOpts}</select>
+      </div>`).join('')}
+      <div class="row" style="align-items:center">
+        <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
+        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option></select>
+        <button class="pri" onclick="addRule(this)">追加</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">📜 ルール一覧 (${rules.length}件・優先度順に先勝ち)
+      <input type="search" id="ruleFilter" placeholder="絞り込み" style="margin-left:12px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-weight:normal"></div>
+    <table>
+      <thead><tr><th>優先度</th><th>名称</th><th>条件</th><th>アクション</th><th>操作</th></tr></thead>
+      <tbody id="ruleRows">${trs || '<tr><td colspan="5" class="empty">ルールがありません (CSVを取り込むか手動追加してください)</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+async function post(url, data) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+  const j = await r.json().catch(function(){ return {}; });
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+document.getElementById('csvFile').addEventListener('change', function() {
+  var f = this.files[0]; this.value = '';
+  if (!f) return;
+  if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで)'); return; }
+  f.arrayBuffer().then(function(buf) {
+    var text = new TextDecoder('utf-8').decode(buf);
+    if (text.indexOf('条件ID') < 0) text = new TextDecoder('shift-jis').decode(buf);
+    if (text.indexOf('条件ID') < 0) { toast('振り分け設定のエクスポートCSVではないようです'); return; }
+    post('/apps/inquiry-hub/api/mail-rules/import', { csv: text, apply: false }).then(function(r) {
+      var msg = '取込プレビュー:\\n・取り込まない(ノイズ除去): ' + r.toSkip + '件\\n・取込+完了扱い: ' + r.toImportDone + '件\\n・対象外(フォルダ振り分け等): ' + r.notTarget + '件\\n・移行不能(複合条件等): ' + r.unsupported.length + '件';
+      if (r.unsupported.length) msg += '\\n\\n移行不能の例:\\n' + r.unsupported.slice(0, 5).map(function(u){ return '  #' + u.condId + ' ' + (u.name || '') + ' — ' + u.reason; }).join('\\n');
+      msg += '\\n\\n取込を実行しますか?';
+      if (!confirm(msg)) return;
+      post('/apps/inquiry-hub/api/mail-rules/import', { csv: text, apply: true }).then(function(r2) {
+        alert('取込完了: 新規' + r2.applied + '件 / 更新' + r2.updated + '件');
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    }).catch(function(e) { toast('解析失敗: ' + e.message); });
+  });
+});
+async function toggleRule(id, active, btn) {
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/mail-rules/' + id + '/toggle', { active: !!active }); location.reload(); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function deleteRule(id, btn) {
+  if (!confirm('このルールを削除しますか? (物理削除。CSV再取込で復活します)')) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/mail-rules/' + id + '/delete', {}); location.reload(); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function testRule(btn) {
+  btn.disabled = true;
+  try {
+    var r = await post('/apps/inquiry-hub/api/mail-rules/test', {
+      from: document.getElementById('tFrom').value, subject: document.getElementById('tSubject').value,
+      reply_to: document.getElementById('tReplyTo').value, body: document.getElementById('tBody').value,
+    });
+    document.getElementById('testResult').textContent = r.match
+      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (r.match.action === 'skip' ? '🗑️取り込まない' : '✅取込+完了扱い')
+      : '→ どのルールにも一致しない = 通常どおり問い合わせとして取り込む';
+  } catch (e) { toast('失敗: ' + e.message); }
+  btn.disabled = false;
+}
+async function addRule(btn) {
+  var conditions = [];
+  for (var n = 1; n <= 3; n++) {
+    var field = document.getElementById('nField' + n).value;
+    var value = document.getElementById('nValue' + n).value.trim();
+    if (!field || !value) continue;
+    conditions.push({ field: field, op: document.getElementById('nOp' + n).value, value: value });
+  }
+  if (!conditions.length) { toast('条件を1つ以上入力してください'); return; }
+  btn.disabled = true;
+  try {
+    await post('/apps/inquiry-hub/api/mail-rules', {
+      name: document.getElementById('nName').value, priority: Number(document.getElementById('nPriority').value),
+      matchMode: document.getElementById('nMode').value, action: document.getElementById('nAction').value,
+      conditions: conditions,
+    });
+    toast('追加しました'); setTimeout(function(){ location.reload(); }, 700);
+  } catch (e) { toast('追加失敗: ' + e.message); btn.disabled = false; }
+}
+document.getElementById('ruleFilter').addEventListener('input', function() {
+  var q = this.value.trim().toLowerCase();
+  document.querySelectorAll('#ruleRows tr').forEach(function(tr) {
+    tr.style.display = !q || (tr.dataset.search || '').indexOf(q) >= 0 ? '' : 'none';
+  });
+});`;
+  res.send(pageShell('問い合わせ管理 — メールルール', 'mailrules', body, script));
+});
+
+router.post('/api/mail-rules', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority) }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importMailDealerRulesCsv(csv, { apply: !!(req.body || {}).apply })); }
+  catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/test', (req, res) => {
+  const b = req.body || {};
+  const match = evaluateMailRules({
+    from: String(b.from || ''), to: String(b.to || ''), reply_to: String(b.reply_to || ''),
+    subject: String(b.subject || ''), body: String(b.body || ''),
+  });
+  res.json({ ok: true, match });
+});
+
+router.post('/api/mail-rules/:id(\\d+)/toggle', (req, res) => {
+  try { setMailRuleActive(Number(req.params.id), !!(req.body || {}).active); res.json({ ok: true }); }
+  catch (e) { res.status(404).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/:id(\\d+)/delete', (req, res) => {
+  try { deleteMailRule(Number(req.params.id)); res.json({ ok: true }); }
+  catch (e) { res.status(404).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ⚙️ 運用管理画面 (設計書§7.1 #6 同期・エラー管理 + #4 送信結果不明の解決)
 // ═══════════════════════════════════════════════════════════════
 
@@ -1206,6 +1406,7 @@ function pageShell(title, active, body, script) {
     ${tab('/apps/inquiry-hub', '📨', '問い合わせ一覧', 'list')}
     ${tab('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates')}
     ${tab('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa')}
+    ${tab('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules')}
     ${tab('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin')}
   </nav>
   <a href="/" class="back">← ポータルに戻る</a>
