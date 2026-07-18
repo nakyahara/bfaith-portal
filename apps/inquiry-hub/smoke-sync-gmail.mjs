@@ -94,6 +94,25 @@ console.log('2. mapThread');
   mapThread(thread, { ruleEvaluator: (m) => { evalArg = m; return null; } });
   check('ルール評価は最初の顧客メッセージ (from/subject/body)', evalArg.from === 'customer@gmail.com' && evalArg.subject === '在庫はありますか' && evalArg.body === '本文です');
 
+  // Googleグループ (info@) のDMARC From書き換えの復元 (2026-07-18 実測パターン)
+  const groupMsg = (over = {}) => {
+    const g = gmailMsg({ id: 'gm1', from: `"'出品者向け通知' via 会社のお問い合わせ" <info@b-faith.biz>`, subject: '注文確定のお知らせ' });
+    g.payload.headers.push(...(over.extraHeaders || []));
+    return { id: 'th-g', messages: [g] };
+  };
+  const gr = mapThread(groupMsg({ extraHeaders: [{ name: 'X-Original-Sender', value: 'auto-confirm@amazon.co.jp' }] }), noRule);
+  check('グループ書き換え: X-Original-Senderで元差出人に復元 → customer/incoming',
+    gr.messages[0].senderType === 'customer' && gr.messages[0].isIncoming === 1 && gr.customerIdentifier === 'auto-confirm@amazon.co.jp');
+  check('グループ書き換え: 表示名からvia以降を除去', gr.customerName === '出品者向け通知');
+  const gr2 = mapThread(groupMsg({ extraHeaders: [{ name: 'Reply-To', value: 'buyer@example.com' }] }), noRule);
+  check('X-Original-Sender無し+via表記はReply-Toで復元', gr2.messages[0].isIncoming === 1 && gr2.customerIdentifier === 'buyer@example.com');
+  const gr3 = mapThread({ id: 'th-s', messages: [gmailMsg({ id: 'gs1', from: '雑貨イズム <info@b-faith.biz>' })] }, noRule);
+  check('書き換え痕跡なしのinfo@発信はshopのまま', gr3.messages[0].senderType === 'shop');
+  // ルール評価も復元後のFromで行われる (skipルールが元差出人ドメインで効く)
+  let grEval = null;
+  mapThread(groupMsg({ extraHeaders: [{ name: 'X-Original-Sender', value: 'auto-confirm@amazon.co.jp' }] }), { ruleEvaluator: (m) => { grEval = m; return null; } });
+  check('ルール評価は復元後のFrom', grEval.from === 'auto-confirm@amazon.co.jp');
+
   let eBad = null;
   try { mapThread({ id: 'x', messages: [] }, noRule); } catch (e) { eBad = e; }
   check('空スレッドは contract_violation', eBad?.errorType === 'contract_violation');

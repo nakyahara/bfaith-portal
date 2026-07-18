@@ -101,7 +101,23 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
   }
   const mapped = msgs.map(m => {
     const payload = m.payload || {};
-    const from = parseFromHeader(headerOf(payload, 'From'));
+    let from = parseFromHeader(headerOf(payload, 'From'));
+    // Googleグループ (info@b-faith.biz) のDMARC書き換え対策 (2026-07-18実測):
+    // 厳格DMARCの送信元 (Amazon等) は From が「'元差出人' via グループ名 <info@b-faith.biz>」に
+    // 書き換えられる。そのまま判定すると自社ドメイン=店舗側メッセージと誤判定するため、
+    // グループが残す X-Original-Sender (無ければ Reply-To) から元の差出人を復元する
+    const looksRewritten = from.mailbox && from.mailbox.endsWith('@' + OWN_DOMAIN)
+      && (headerOf(payload, 'X-Original-Sender') || / via /i.test(headerOf(payload, 'From')));
+    if (looksRewritten) {
+      const orig = parseFromHeader(headerOf(payload, 'X-Original-Sender'));
+      const fallback = parseFromHeader(headerOf(payload, 'Reply-To'));
+      const eff = orig.mailbox ? orig : fallback;
+      if (eff.mailbox) {
+        // 表示名は「'元差出人' via グループ名」の via 以降を落とす
+        const cleanName = (from.name || '').replace(/\s*via\s.+$/i, '').replace(/^'(.*)'$/, '$1').trim();
+        from = { name: eff.name || cleanName || null, mailbox: eff.mailbox };
+      }
+    }
     const fromDomain = from.mailbox ? from.mailbox.slice(from.mailbox.indexOf('@') + 1) : '';
     const isShop = fromDomain === OWN_DOMAIN;
     const { text, html, attachments } = walkPayload(payload);
