@@ -2696,6 +2696,7 @@ document.querySelectorAll('[data-trk-drive-import]').forEach(btn => {
   btn.onclick = async () => {
     const source = btn.dataset.trkDriveImport;
     const statusId = TRK_DRIVE_STATUS_IDS[source];
+    if(!statusId){ alert(`Drive取込のstatus表示先が未登録です: ${source} (TRK_DRIVE_STATUS_IDS に追加してください)`); return; }
     btn.disabled = true;
     $('#'+statusId).textContent = 'Driveから取得中…';
     try{
