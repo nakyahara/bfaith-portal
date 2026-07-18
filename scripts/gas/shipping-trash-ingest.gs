@@ -139,8 +139,11 @@ function verifyIngestResponse_(resp, sentCount) {
 
 /**
  * 納品書PDF→一時Docs変換→テキスト抽出→伝票ごとにパース。
+ * 完全抽出の判定 (呼び出し側で削除拒否に使う):
+ *  - 各ブロックの distinct SP番号がちょうど1件 (0件=見出しはあるが番号欠落、
+ *    2件以上=「納品書」見出しのOCR欠けで2伝票が1ブロックに融合 — Codex R2 high)
+ *  - PDF全文の distinct SP番号数 === 抽出伝票数 (ブロック分割自体の欠陥検知)
  * @returns {{ blockCount: number, slips: Array<{slipNo,mgmtNo,mallOrderNo}> }}
- *   blockCount と slips.length の差 = 出荷伝票NOを抽出できなかったブロック数 (呼び出し側で削除拒否)
  */
 function extractSlipsFromPdf_(pdfFile) {
   var tempDoc = Drive.Files.copy(
@@ -159,15 +162,25 @@ function extractSlipsFromPdf_(pdfFile) {
   var blocks = text.split(/納品書/).slice(1);
   var slips = [];
   blocks.forEach(function (block) {
-    var slipNo = (block.match(/SP\d{8,14}/) || [""])[0];
-    if (!slipNo) return; // ブロック数との差分として呼び出し側が検知する
+    var found = distinct_(block.match(/SP\d{8,14}/g) || []);
+    if (found.length !== 1) return; // 0件 or 融合ブロック → 差分として呼び出し側が検知
     slips.push({
-      slipNo: slipNo,
+      slipNo: found[0],
       mgmtNo: extractMgmtNo_(block),
       mallOrderNo: extractMallOrderNo_(block),
     });
   });
-  return { blockCount: blocks.length, slips: slips };
+  // 全文の distinct SP番号数と突合。分割やブロック判定の欠陥で取りこぼした伝票を検知する
+  var allSlipNos = distinct_(text.match(/SP\d{8,14}/g) || []);
+  var effectiveBlockCount = Math.max(blocks.length, allSlipNos.length);
+  return { blockCount: effectiveBlockCount, slips: slips };
+}
+
+function distinct_(arr) {
+  var seen = {};
+  var out = [];
+  arr.forEach(function (v) { if (!seen[v]) { seen[v] = true; out.push(v); } });
+  return out;
 }
 
 /**

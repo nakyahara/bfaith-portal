@@ -71,6 +71,11 @@ const r3 = ingestFolderSlips({ ...basePayload, runId: 'r3', rows: [
 expectEq(r3.conflicts.length, 1, 'conflict 件数');
 expectEq(r3.conflicts[0]?.slip_no, 'SP00110324384', 'conflict slip_no');
 expectEq(r3.ignored, 1, 'null側 idempotent');
+// 既存NULL・新規非NULL → append-only では保存できない新情報なので conflict (Codex R2 medium)
+const r3b = ingestFolderSlips({ ...basePayload, runId: 'r3b', rows: [
+  { slip_no: 'SP00110324384', mgmt_no: '1498337', mall_order_no: 'AES111-1111111-1111111' },
+] });
+expectEq(r3b.conflicts.length, 1, '既存NULL→新規非NULL conflict');
 
 // ── Test 4: append-only trigger ──
 try {

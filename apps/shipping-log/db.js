@@ -67,12 +67,14 @@ function requireSchema() {
 }
 
 /**
- * 既存行との業務内容比較。mgmt_no / mall_order_no が「双方非NULLで異なる」ときのみ conflict。
- * (再送時に抽出ヒューリスティクスが null を返すケースは idempotent 扱い — append-only のため
- *  既存値を正とし、上書きも 409 もしない)
+ * 既存行との業務内容比較。conflict になるのは:
+ *  - 双方非NULLで値が異なる (別内容の再送)
+ *  - 既存NULL・新規非NULL (append-only のため正しい新情報を保存できない → 409 で
+ *    削除を止め人手確認へ。黙って捨てると恒久欠損になる — Codex R2 medium)
+ * 既存非NULL・新規NULL (再送時の抽出劣化) のみ idempotent 扱いで既存値を正とする。
  */
 function isConflict(existing, row) {
-  const differs = (a, b) => a != null && b != null && a !== b;
+  const differs = (a, b) => (a != null && b != null && a !== b) || (a == null && b != null);
   return differs(existing.mgmt_no, row.mgmt_no) || differs(existing.mall_order_no, row.mall_order_no);
 }
 
