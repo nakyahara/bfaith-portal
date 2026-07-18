@@ -147,6 +147,17 @@ export async function runInquiryHubSyncTick(opts = {}) {
 
     const results = [];
     for (const shop of shops) {
+      // メールは初回バックフィルを cron にやらせない (2026-07-18 実測: d.nakahara箱は30日で2万通超
+      // → 既定30日バックフィルが毎tickページ上限で失敗し、手動初回同期ともリースを取り合う)。
+      // committed_until が付くまで (=初回を run-sync-gmail.mjs で明示実行するまで) はスキップ
+      if (shop.channel_type === 'email') {
+        const st = db.prepare('SELECT committed_until FROM sync_state WHERE shop_id = ?').get(shop.id);
+        if (!st?.committed_until) {
+          console.log(`[inquiry-hub-cron] SKIP ${shop.shop_name}: メールの初回同期は run-sync-gmail.mjs で実行してください (--backfill-days指定)`);
+          results.push({ shopId: shop.id, shop: shop.shop_name, skipped: 'initial_backfill_required' });
+          continue;
+        }
+      }
       const adapter = adapterFactory
         ? adapterFactory(shop, transports[shop.channel_type], deep)
         : buildAdapterForShop(shop, { deep });

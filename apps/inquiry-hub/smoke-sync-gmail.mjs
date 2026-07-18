@@ -182,6 +182,31 @@ function mockFetch(handler) {
   try { await createGmailAdapter({ ...CRED, fetchImpl: fMany, maxListPages: 3 }).fetchNew({ sinceIso: new Date(NOW_MS - 1e5).toISOString(), untilIso: new Date(NOW_MS).toISOString() }); }
   catch (e) { eMany = e; }
   check('maxListPages超過は window_too_large', eMany?.errorType === 'window_too_large');
+
+  // 並列取得: 多数スレッドでも全件取得+途中失敗で全体throw
+  const manyThreads = {};
+  for (let i = 0; i < 23; i++) manyThreads['tp-' + i] = { id: 'tp-' + i, messages: [gmailMsg({ id: 'pm' + i, from: `c${i}@gmail.com` })] };
+  const fPar = mockFetch((url) => {
+    if (url.includes('/messages?')) return { body: { messages: Object.keys(manyThreads).map(t => ({ id: 'x' + t, threadId: t })) } };
+    return { body: manyThreads[url.match(/threads\/([^?]+)/)[1]] };
+  });
+  const rPar = await createGmailAdapter({ ...CRED, fetchImpl: fPar, concurrency: 5 }).fetchNew({ sinceIso: new Date(NOW_MS - 1e5).toISOString(), untilIso: new Date(NOW_MS).toISOString() });
+  check('並列取得で全23スレッド取得', rPar.inquiries.length === 23);
+  // レートリミッターは全ワーカー共有 (並列でも最小間隔×リクエスト数の時間がかかる)
+  const t0 = Date.now();
+  await createGmailAdapter({ ...CRED, sleepMs: 30, fetchImpl: fPar, concurrency: 5 }).fetchNew({ sinceIso: new Date(NOW_MS - 1e5).toISOString(), untilIso: new Date(NOW_MS).toISOString() });
+  const elapsed = Date.now() - t0;
+  check('共有レートリミッター (24req×30ms間隔 ≥ 600ms)', elapsed >= 600, `elapsed=${elapsed}ms`);
+  const fParFail = mockFetch((url) => {
+    if (url.includes('/messages?')) return { body: { messages: Object.keys(manyThreads).map(t => ({ id: 'x' + t, threadId: t })) } };
+    const tid = url.match(/threads\/([^?]+)/)[1];
+    if (tid === 'tp-11') return { status: 500, body: { error: { message: 'boom' } } };
+    return { body: manyThreads[tid] };
+  });
+  let ePar = null;
+  try { await createGmailAdapter({ ...CRED, fetchImpl: fParFail, concurrency: 5 }).fetchNew({ sinceIso: new Date(NOW_MS - 1e5).toISOString(), untilIso: new Date(NOW_MS).toISOString() }); }
+  catch (e) { ePar = e; }
+  check('並列中の1件失敗で全体throw (部分成功なし)', ePar?.errorType === 'fetch_failed');
 }
 
 // ─── 4. エンジン結合 (mail_rules 実物 + runSync) ───
