@@ -76,17 +76,25 @@ try {
           notePendingAmbiguous(db, month, `結果不明 (${String(e.message).slice(0, 120)})。coupon.search で確認要`);
           throw new Error(`発行結果が不明 (${e.message})。台帳は pending のまま。RMS/coupon.search で実発行有無を確認してから手動解決 (自動再発行はしない)`);
         }
+        // 予約解放は「明確な業務エラー (4xx + systemStatus NG or エラーコードあり) = 未発行確定」に限定。
+        // それ以外 (5xx / 解釈不能 / **OK なのに couponCode・pcGetUrl 欠落** — Codex C3-R2 High:
+        // 発行済みでURLだけ取れなかった可能性がある) は全て結果不明として pending に滞留させる
+        const clearFailure = !r.ok && r.http >= 400 && r.http < 500
+          && (r.systemStatus === 'NG' || r.errors.length > 0);
         if (r.ok && r.couponCode && r.pcGetUrl) {
-          markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl });
+          const marked = markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl });
+          if (!marked) {
+            // 発行は成功しているのに台帳確定に失敗 (並行変更等)。復旧用にフル値を note へ (Codex C3-R2 Medium)
+            notePendingAmbiguous(db, month, `発行成功済みだが台帳確定失敗。code=${r.couponCode} url=${r.pcGetUrl}`);
+            throw new Error(`発行は成功したが台帳確定に失敗 (${month})。台帳の note にフル値を記録済み — 手動で status/coupon_code を確認・修正して`);
+          }
           console.log(`[coupon] ✅発行成功: code=${maskCode(r.couponCode)} url=${maskUrl(r.pcGetUrl)} (フル値は台帳に記録済み)`);
-        } else if (r.http >= 500 || r.systemStatus == null) {
-          // 5xx・解釈不能レスポンス = 発行済みか不明 → pending を残す
-          notePendingAmbiguous(db, month, `結果不明 (HTTP ${r.http} ${r.message || ''})。coupon.search で確認要`);
-          throw new Error(`発行結果が不明 (HTTP ${r.http})。台帳は pending のまま。確認後に手動解決を`);
-        } else {
-          // 明確な拒否 (4xx + エラーコード) = 未発行が確定 → 予約解放
+        } else if (clearFailure) {
           releaseReservation(db, month);
           throw new Error(`発行失敗 (未発行確定・予約解放): HTTP ${r.http} / ${r.systemStatus} ${r.message} / ${r.errors.map((e) => `${e.code}:${e.message}`).join(', ') || '(詳細なし)'}`);
+        } else {
+          notePendingAmbiguous(db, month, `結果不明 (HTTP ${r.http} ${r.message || ''} code=${r.couponCode || '-'})。coupon.search で確認要`);
+          throw new Error(`発行結果が不明 (HTTP ${r.http}、ok=${r.ok}、code=${r.couponCode ? 'あり' : 'なし'})。台帳は pending のまま。coupon.search で実発行有無を確認してから手動解決を`);
         }
       }
     }
@@ -114,19 +122,30 @@ try {
     const found = await searchCouponByCode(issued.couponCode);
     const hitOk = found.ok && found.allCount === 1; // couponCode は requests エコーに常に出るため allCount で判定
     console.log(`[test-cycle] 検索: ${hitOk ? 'OK (allCount=1)' : `NG (allCount=${found.allCount}, ${found.message})`}`);
-    // 検索NGでもクリーンアップの削除は必ず試みる
+    // 検索NGでもクリーンアップの削除は必ず試みる。
+    // 削除に失敗した場合だけは手動掃除のためフルのクーポンコードを表示する
+    // (Codex C3-R2 Medium: マスクだけだと削除対象を特定できない。非公開・issueCount 1・短期の
+    // テストクーポンのため、失敗時の運用者向け表示に限りマスク例外とする)
     console.log('[test-cycle] 3/3 削除...');
     const delBuilt = buildDeleteXml(issued.couponCode);
     if (!delBuilt.ok) throw new Error(delBuilt.errors.join(' / '));
-    const del = await deleteCoupon(delBuilt.xml);
-    const delOk = del.ok;
-    if (!delOk) console.error(`[test-cycle] 削除失敗: ${del.errors.map((e) => `${e.code}:${e.message}`).join(', ') || del.message}。RMS画面から手動削除が必要 (code先頭=${maskCode(issued.couponCode)})`);
+    let delOk = false;
+    try {
+      const del = await deleteCoupon(delBuilt.xml);
+      delOk = del.ok;
+      if (!delOk) console.error(`[test-cycle] 削除失敗: ${del.errors.map((e) => `${e.code}:${e.message}`).join(', ') || del.message}`);
+    } catch (e) {
+      console.error(`[test-cycle] 削除呼び出しエラー: ${e.message}`);
+    }
+    if (!delOk) {
+      console.error(`[test-cycle] ⚠️手動削除が必要: RMSクーポン管理画面で couponCode=${issued.couponCode} を削除して (テスト用・非公開・利用上限1)`);
+    }
     const gone = await searchCouponByCode(issued.couponCode);
     const goneOk = gone.ok && gone.allCount === 0;
     console.log(`[test-cycle] 消滅確認: ${goneOk ? '✅ (allCount=0)' : `NG (allCount=${gone.allCount})`}`);
     // 偽陽性防止 (Codex C3-R1 Medium): 全工程OKのときだけ成功終了
     if (!(hitOk && delOk && goneOk)) {
-      throw new Error(`フルサイクル不成立 (検索=${hitOk} 削除=${delOk} 消滅=${goneOk})`);
+      throw new Error(`フルサイクル不成立 (検索=${hitOk} 削除=${delOk} 消滅=${goneOk})${!goneOk ? ` — 残存クーポン couponCode=${issued.couponCode} を手動削除して` : ''}`);
     }
     console.log('[test-cycle] ✅ 発行→検索→削除のフルサイクル成功');
   } else if (mode === 'status') {
