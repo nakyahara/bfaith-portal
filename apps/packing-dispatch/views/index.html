@@ -331,6 +331,8 @@
         取込方法はどちらか一方でOK。<b>通常は「📥 Driveから取込」ボタンを押すだけ</b> (Driveに置かれた最新CSVを自動取得。取得元の更新日時がボタン下に出ます)。
         Driveが使えない時だけ、PCにダウンロードしたCSVを「手動アップロード」で取り込んでください。
       </div>
+      <!-- 行見出し th は全体CSS (sticky/head背景) を inline で打ち消して通常セル見た目にする -->
+      <div style="overflow-x:auto">
       <table>
         <thead>
           <tr>
@@ -342,43 +344,44 @@
         </thead>
         <tbody>
           <tr>
-            <td>ヤマト B2 (ネコポス・発払い)</td>
+            <th scope="row" style="position:static; background:#fff; font-weight:normal">ヤマト B2 (ネコポス・発払い)</th>
             <td>
               <button data-trk-drive-import="yamato_b2" style="background:#1a73e8; border-color:#1a73e8">📥 Driveから取込</button>
               <div id="trkDriveInfoYamato" class="muted" style="margin-top:4px"></div>
             </td>
             <td>
-              <input type="file" id="trkFileYamato" accept=".csv" />
+              <input type="file" id="trkFileYamato" accept=".csv" aria-label="ヤマト B2 (ネコポス・発払い) のCSVファイルを選択" />
               <button class="sub" data-trk-import="yamato_b2">取込</button>
             </td>
             <td style="white-space:normal; min-width:220px"><span id="trkStatusYamato" class="muted"></span></td>
           </tr>
           <tr>
-            <td>ヤマト B2 (50サイズ専用)</td>
+            <th scope="row" style="position:static; background:#fff; font-weight:normal">ヤマト B2 (50サイズ専用)</th>
             <td>
               <button data-trk-drive-import="yamato_b2_50" style="background:#1a73e8; border-color:#1a73e8">📥 Driveから取込</button>
               <div id="trkDriveInfoYamato50" class="muted" style="margin-top:4px"></div>
             </td>
             <td>
-              <input type="file" id="trkFileYamato50" accept=".csv" />
+              <input type="file" id="trkFileYamato50" accept=".csv" aria-label="ヤマト B2 (50サイズ専用) のCSVファイルを選択" />
               <button class="sub" data-trk-import="yamato_b2_50">取込</button>
             </td>
             <td style="white-space:normal; min-width:220px"><span id="trkStatusYamato50" class="muted"></span></td>
           </tr>
           <tr>
-            <td>ゆうパケットパフ</td>
+            <th scope="row" style="position:static; background:#fff; font-weight:normal">ゆうパケットパフ</th>
             <td>
               <button data-trk-drive-import="yupacketpuff" style="background:#1a73e8; border-color:#1a73e8">📥 Driveから取込</button>
               <div id="trkDriveInfoYupacketpuff" class="muted" style="margin-top:4px"></div>
             </td>
             <td>
-              <input type="file" id="trkFileYupacketpuff" accept=".csv" />
+              <input type="file" id="trkFileYupacketpuff" accept=".csv" aria-label="ゆうパケットパフのCSVファイルを選択" />
               <button class="sub" data-trk-import="yupacketpuff">取込</button>
             </td>
             <td style="white-space:normal; min-width:220px"><span id="trkStatusYupacketpuff" class="muted"></span></td>
           </tr>
         </tbody>
       </table>
+      </div>
       <div id="trkImportResult"></div>
     </div>
 
