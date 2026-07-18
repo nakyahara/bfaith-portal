@@ -29,6 +29,7 @@ import {
 } from './service.js';
 import crypto from 'node:crypto';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
+import { getDriveCsvInfo, downloadDriveCsv } from './drive-fetch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -44,6 +45,16 @@ function requireAdmin(req, res) {
 }
 function handle(res, fn) {
   try { res.json({ ok: true, result: fn() }); }
+  catch (e) {
+    if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message, detail: e.detail });
+    if (e.code === 'CONFLICT') return res.status(409).json({ ok: false, error: 'conflict', message: e.message });
+    console.error('[packing]', e.message);
+    res.status(500).json({ ok: false, error: 'server_error', message: e.message });
+  }
+}
+// Drive 直接取込など await が必要な処理用 (エラー変換は handle と同一)
+async function handleAsync(res, fn) {
+  try { res.json({ ok: true, result: await fn() }); }
   catch (e) {
     if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message, detail: e.detail });
     if (e.code === 'CONFLICT') return res.status(409).json({ ok: false, error: 'conflict', message: e.message });
@@ -205,6 +216,22 @@ router.post('/api/tracking/import', upload.single('file'), (req, res) => handle(
   const source = (req.body && req.body.source) || req.query.source;
   if (!source) { const e = new Error('source パラメータが必要です'); e.code = 'VALIDATION'; throw e; }
   return importTrackingCsv({ source, buffer: req.file.buffer, filename: req.file.originalname }, currentUser(req));
+}));
+
+// ── Google Drive 直接取込 (ヤマトB2 発行済データCSV、2026-07-18 中原さん指示) ──
+// ファイル metadata (更新日時表示用)。source: yamato_b2 | yamato_b2_50
+router.get('/api/tracking/drive-file-info', (req, res) => handleAsync(res, () =>
+  getDriveCsvInfo(req.query.source)));
+
+// Drive からDLして通常の取込と同じ経路へ (file_hash 重複検出もそのまま効く)
+// body: { source: 'yamato_b2' | 'yamato_b2_50' }
+router.post('/api/tracking/import-from-drive', (req, res) => handleAsync(res, async () => {
+  const source = (req.body && req.body.source) || req.query.source;
+  if (!source) { const e = new Error('source パラメータが必要です'); e.code = 'VALIDATION'; throw e; }
+  const dl = await downloadDriveCsv(source);
+  const result = importTrackingCsv({ source, buffer: dl.buffer, filename: dl.filename }, currentUser(req));
+  // 取込元ファイルの更新日時を結果に添える (UI で「いつのファイルを取り込んだか」を示す)
+  return { ...result, drive_file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst } };
 }));
 
 // 手動入力 (レターパック / 定形外)

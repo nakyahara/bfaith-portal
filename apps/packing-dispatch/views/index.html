@@ -331,12 +331,16 @@
         <label class="muted" style="min-width:240px">ヤマト B2 (ネコポス・発払い)
           <input type="file" id="trkFileYamato" accept=".csv" /></label>
         <button class="sub" data-trk-import="yamato_b2">取込</button>
+        <button class="sub" data-trk-drive-import="yamato_b2" style="background:#1a73e8; border-color:#1a73e8; color:white">📥 Driveから取込</button>
+        <span id="trkDriveInfoYamato" class="muted"></span>
         <span id="trkStatusYamato" class="muted"></span>
       </div>
       <div class="row">
         <label class="muted" style="min-width:240px">ヤマト B2 (50サイズ専用)
           <input type="file" id="trkFileYamato50" accept=".csv" /></label>
         <button class="sub" data-trk-import="yamato_b2_50">取込</button>
+        <button class="sub" data-trk-drive-import="yamato_b2_50" style="background:#1a73e8; border-color:#1a73e8; color:white">📥 Driveから取込</button>
+        <span id="trkDriveInfoYamato50" class="muted"></span>
         <span id="trkStatusYamato50" class="muted"></span>
       </div>
       <div class="row">
@@ -2663,6 +2667,49 @@ document.querySelectorAll('[data-trk-import]').forEach(btn => {
   };
 });
 
+// ── Google Drive 直接取込 (ヤマトB2 発行済データCSV、2026-07-18 中原さん指示) ──
+// B2クラウドから自動DLされたCSVがDriveの固定フォルダに置かれる運用。手動DL→アップロードを省く。
+const TRK_DRIVE_INFO_IDS = { yamato_b2: 'trkDriveInfoYamato', yamato_b2_50: 'trkDriveInfoYamato50' };
+function trkSetDriveInfo(source, text, tooltip){
+  const el = $('#' + (TRK_DRIVE_INFO_IDS[source] || ''));
+  if(!el) return;
+  el.textContent = text;
+  el.title = tooltip || '';
+}
+function loadDriveFileInfo(){
+  Object.keys(TRK_DRIVE_INFO_IDS).forEach(source => {
+    trkSetDriveInfo(source, 'Drive更新日時: 確認中…');
+    api('api/tracking/drive-file-info?source=' + source)
+      .then(info => trkSetDriveInfo(source, `Drive更新日時: ${info.modified_time_jst || '不明'}`, info.filename))
+      .catch(e => trkSetDriveInfo(source, 'Drive: 取得エラー', e.message));
+  });
+}
+document.querySelectorAll('[data-trk-drive-import]').forEach(btn => {
+  btn.onclick = async () => {
+    const source = btn.dataset.trkDriveImport;
+    const statusId = source==='yamato_b2' ? 'trkStatusYamato' : 'trkStatusYamato50';
+    btn.disabled = true;
+    $('#'+statusId).textContent = 'Driveから取得中…';
+    try{
+      const res = await api('api/tracking/import-from-drive', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ source }),
+      });
+      const df = res.drive_file;
+      if(df && df.modified_time_jst) trkSetDriveInfo(source, `Drive更新日時: ${df.modified_time_jst}`, df.filename);
+      if(res.duplicate){
+        $('#'+statusId).textContent = '重複: このファイルは既に取込済み'
+          + (df && df.modified_time_jst ? ` (Drive更新 ${df.modified_time_jst})` : '');
+      } else {
+        $('#'+statusId).textContent = `取込完了: 全${res.row_count} / 紐付け${res.matched_count} / 未マッチ${res.unmatched_count} / 競合${res.conflict_count}`
+          + (res.method_corrected_count > 0 ? ` / 配送方法矯正${res.method_corrected_count}` : '');
+        renderTrkImportResult(res);
+      }
+      await loadTrackingAll();
+    }catch(e){ $('#'+statusId).textContent = 'エラー: ' + e.message; }
+    finally{ btn.disabled = false; }
+  };
+});
+
 function renderTrkImportResult(res){
   const box = $('#trkImportResult');
   if(!res) { box.innerHTML=''; return; }
@@ -2732,7 +2779,7 @@ $('#trkFilterStatus').onchange = loadTrackingList;
 $('#trkFilterSource').onchange = loadTrackingList;
 $('#trkFilterShop').onchange = loadTrackingList;
 $('#trkQuery').addEventListener('keydown', (e) => { if(e.key==='Enter') loadTrackingList(); });
-$('#btnTrackingReload').onclick = loadTrackingAll;
+$('#btnTrackingReload').onclick = () => { loadTrackingAll(); loadDriveFileInfo(); };
 
 // スコープ切替 (本日 / 過去履歴、Phase 1 UI 再設計)
 function trkSetScope(scope){
@@ -2756,7 +2803,7 @@ $('#btnTrkImportsReload').onclick = loadTrkImports;
 document.querySelector('.tab[data-tab=tracking]').addEventListener('click', () => {
   // Codex R1 Critical: #trackingSummary は削除済 → #trkMainContent 基準に変更。
   // 初期は loadTrackingAll() で読み込まれるが、毎回タブクリック時にリロードしたい場合は無条件呼び出しでも OK
-  if(!TRK_LOADED_ONCE) { TRK_LOADED_ONCE = true; loadTrackingAll(); }
+  if(!TRK_LOADED_ONCE) { TRK_LOADED_ONCE = true; loadTrackingAll(); loadDriveFileInfo(); }
 });
 
 (async () => { await loadOptions(); initCondSelects(); initAssortFilters(); loadBatches(); loadMe(); })();
