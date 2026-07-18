@@ -285,6 +285,23 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_qa_category ON qa_entries(category)');
 
   // AIジョブ (キュー。inquiriesのカラムではなく独立テーブル。処理系はStep 7)
+  // メール取込ルール (メールチャネルのノイズ除去。メールディーラー振り分け設定の移行先)
+  // action: skip=取り込まない / import_done=取り込んで対応完了扱い (通常取込はルール不要の既定動作)
+  db.exec(`CREATE TABLE IF NOT EXISTS mail_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    priority INTEGER NOT NULL DEFAULT 100,       -- 小さいほど先に評価 (先勝ち)
+    name TEXT,
+    match_mode TEXT NOT NULL DEFAULT 'all' CHECK(match_mode IN ('all','any')),
+    conditions_json TEXT NOT NULL,               -- [{field: from|to|reply_to|subject|body, op: contains|not_contains|equals|not_equals|starts_with|ends_with, value}]
+    action TEXT NOT NULL CHECK(action IN ('skip','import_done')),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    external_key TEXT,                           -- メールディーラー条件ID (再取込の冪等キー。手動追加はNULL)
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_rules_external
+    ON mail_rules(external_key) WHERE external_key IS NOT NULL`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS ai_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
