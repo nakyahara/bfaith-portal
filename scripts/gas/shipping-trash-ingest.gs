@@ -86,8 +86,10 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
       var incomplete = [];
       invoices.forEach(function (inv) {
         var ex = extractSlipsFromPdf_(inv);
-        if (ex.blockCount !== ex.slips.length) {
-          incomplete.push(inv.getName() + " (" + ex.slips.length + "/" + ex.blockCount + "伝票)");
+        // 完全性: 全文の伝票番号数 = マージ後の伝票数、かつ複数伝票が融合したブロックが無いこと
+        if (ex.slips.length !== ex.expected || ex.fusionBlocks > 0) {
+          incomplete.push(inv.getName() + " (抽出" + ex.slips.length + "/全文" + ex.expected +
+                          (ex.fusionBlocks > 0 ? "、融合ブロック" + ex.fusionBlocks : "") + ")");
         }
         ex.slips.forEach(function (s) {
           rows.push({ slip_no: s.slipNo, mgmt_no: s.mgmtNo, mall_order_no: s.mallOrderNo, source_file: inv.getName() });
@@ -99,8 +101,8 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
       } else if (rows.length === 0) {
         failReason = "納品書から伝票番号を1件も抽出できず";
       } else if (slipNos.length !== rows.length) {
-        // 別々の伝票のSP番号をOCRが同一値に誤認すると ignored に化けて記録が欠落するため削除不可
-        failReason = "伝票番号の重複検出 (" + rows.length + "行中" + slipNos.length + "種、OCR誤認の可能性)";
+        // ファイル内はマージ済みなので、ここに来るのは複数の納品書PDF間の重複 (再印刷など)
+        failReason = "複数ファイル間で伝票番号の重複検出 (" + rows.length + "行中" + slipNos.length + "種)";
       }
     }
 
@@ -239,12 +241,11 @@ function verifyIngestResponse_(resp, sentCount, folderName) {
 }
 
 /**
- * 納品書PDF→一時Docs変換→テキスト抽出→伝票ごとにパース。
+ * 納品書PDF→一時Docs変換→テキスト抽出→伝票ごとにパース (同一伝票の複数ブロックはマージ)。
  * 完全抽出の判定 (呼び出し側で削除拒否に使う):
- *  - 各ブロックの distinct SP番号がちょうど1件 (0件=見出しはあるが番号欠落、
- *    2件以上=「納品書」見出しのOCR欠けで2伝票が1ブロックに融合)
- *  - PDF全文の distinct SP番号数 === 抽出伝票数 (ブロック分割自体の欠陥検知)
- * @returns {{ blockCount: number, slips: Array<{slipNo,mgmtNo,mallOrderNo}> }}
+ *  - fusionBlocks === 0 (1ブロックに複数伝票のSPが混ざる=「納品書」見出しのOCR欠け)
+ *  - slips.length === expected (PDF全文の distinct SP番号数と一致)
+ * @returns {{ expected: number, fusionBlocks: number, slips: Array<{slipNo,mgmtNo,mallOrderNo}> }}
  */
 function extractSlipsFromPdf_(pdfFile) {
   var tempDoc = Drive.Files.copy(
@@ -259,33 +260,38 @@ function extractSlipsFromPdf_(pdfFile) {
     Drive.Files.remove(tempDoc.id, { supportsAllDrives: true });
   }
 
+  // OCR変換ではレイアウト都合で1伝票が複数ブロックに割れる (「納品書」の語が
+  // 伝票あたり2回出る等、2026-07-18 DRY-RUN実測)。同一SP番号のブロックはマージし、
+  // フィールドは全断片から候補を集めて「distinct 1件のときのみ採用」とする。
   var blocks = text.split(/納品書/).slice(1);
-  var slips = [];
+  var bySlip = {};   // slipNo -> { mgmt: {候補}, mall: {候補} }
+  var order = [];    // 出現順維持
+  var fusionBlocks = 0;
   blocks.forEach(function (block) {
     var found = distinct_(block.match(/SP\d{8,14}/g) || []);
-    if (found.length !== 1) return; // 0件 or 融合ブロック → 差分として呼び出し側が検知
-    slips.push({
-      slipNo: found[0],
-      mgmtNo: extractMgmtNo_(block),
-      mallOrderNo: extractMallOrderNo_(block),
-    });
+    if (found.length === 0) return;               // SPを含まない断片は無視 (レイアウト分割の余り)
+    if (found.length > 1) { fusionBlocks++; return; } // 複数伝票が融合したブロック → 呼び出し側で削除拒否
+    var slipNo = found[0];
+    if (!bySlip[slipNo]) { bySlip[slipNo] = { mgmt: {}, mall: {} }; order.push(slipNo); }
+    // 管理番号候補 (単独で現れる7桁数字)。断片をまたいで distinct 収集
+    (block.match(/(?:^|\s)\d{7}(?=\s|$)/gm) || []).forEach(function (v) { bySlip[slipNo].mgmt[v.trim()] = true; });
+    var mall = extractMallOrderNo_(block);
+    if (mall) bySlip[slipNo].mall[mall] = true;
   });
+  var slips = order.map(function (slipNo) {
+    var mg = Object.keys(bySlip[slipNo].mgmt);
+    var ml = Object.keys(bySlip[slipNo].mall);
+    // 候補が複数=曖昧なら null (誤った番号を恒久保存するより欠損を選ぶ。
+    // slip_no があれば後段でロジザード/NEから復元可能)
+    return {
+      slipNo: slipNo,
+      mgmtNo: mg.length === 1 ? mg[0] : null,
+      mallOrderNo: ml.length === 1 ? ml[0] : null,
+    };
+  });
+  // 全文の distinct SP番号数が「この納品書に存在する伝票数」の正。マージ後と一致しなければ不完全
   var allSlipNos = distinct_(text.match(/SP\d{8,14}/g) || []);
-  var effectiveBlockCount = Math.max(blocks.length, allSlipNos.length);
-  return { blockCount: effectiveBlockCount, slips: slips };
-}
-
-/**
- * 管理番号 (NE伝票番号、現行7桁): ブロック内の「単独で現れる7桁数字」の distinct 候補が
- * ちょうど1つのときのみ採用。曖昧なら null (誤った番号を恒久保存するより欠損を選ぶ。
- * slip_no があれば後段でロジザード/NEから復元可能)。
- */
-function extractMgmtNo_(block) {
-  var m = block.match(/(?:^|\s)\d{7}(?=\s|$)/gm) || [];
-  var distinct = {};
-  m.forEach(function (s) { distinct[s.trim()] = true; });
-  var keys = Object.keys(distinct);
-  return keys.length === 1 ? keys[0] : null;
+  return { expected: allSlipNos.length, fusionBlocks: fusionBlocks, slips: slips };
 }
 
 /** モール注文番号: Amazon (AES prefix) / 楽天形式。他モールは dry-run で実物確認して追加する */
