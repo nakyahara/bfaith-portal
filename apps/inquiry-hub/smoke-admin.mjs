@@ -117,6 +117,49 @@ console.log('3. 送信要対応');
   check('pending → cancelled', db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(jobP.id).status === 'cancelled');
 }
 
+// ─── 3b. 認証期限の手動登録 ───
+console.log('3b. 認証期限の手動登録');
+{
+  const rBad = await jpost(`/api/admin/shops/${rkShop}/auth-expiry`, { date: '2026/10/01' });
+  check('不正な日付形式は400', rBad.status === 400);
+  const rSet = await jpost(`/api/admin/shops/${rkShop}/auth-expiry`, { date: '2026-10-01' });
+  check('期限の登録が成功', rSet.status === 200);
+  check('JST当日終わり (UTC 15:00) で保存', db.prepare('SELECT auth_expires_at FROM shops WHERE id = ?').get(rkShop).auth_expires_at === '2026-10-01T15:00:00Z');
+  const html = await (await fetch(base + '/admin')).text();
+  check('画面に期限が表示される (楽天は編集フォームあり)', html.includes('期限 2026-10-02 00:00') && html.includes(`exp-${rkShop}`));
+  check('Yahoo行は自動更新の注記 (編集フォームなし)', html.includes('再認可時に自動更新') && !html.includes(`exp-${expShop}`));
+  const rClear = await jpost(`/api/admin/shops/${rkShop}/auth-expiry`, { date: '' });
+  check('空指定で解除', rClear.status === 200 && db.prepare('SELECT auth_expires_at FROM shops WHERE id = ?').get(rkShop).auth_expires_at === null);
+  const r404 = await jpost('/api/admin/shops/99999/auth-expiry', { date: '2026-10-01' });
+  check('存在しない店舗は404', r404.status === 404);
+}
+
+// ─── 3c. 認証状態の自動更新 (getAuthStatus持ちアダプター) ───
+console.log('3c. 認証状態の自動更新');
+{
+  const { refreshShopAuthStatus } = await import('./sync/cron.js');
+  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(expShop);
+  const a = await refreshShopAuthStatus(shop, {
+    async getAuthStatus() { return { ok: true, authExpiresAt: '2026-07-31T01:44:58.209Z' }; },
+  });
+  check('getAuthStatusの結果を返す', a?.ok === true);
+  const row = db.prepare('SELECT auth_expires_at, authentication_status FROM shops WHERE id = ?').get(expShop);
+  check('auth_expires_at が正準形式で自動更新', row.auth_expires_at === '2026-07-31T01:44:58Z');
+  check('authentication_status=ok', row.authentication_status === 'ok');
+  const aNg = await refreshShopAuthStatus(shop, {
+    async getAuthStatus() { return { ok: false, authExpiresAt: null }; },
+  });
+  check('トークン無しは status=error (期限は保持)', aNg?.ok === false
+    && db.prepare('SELECT authentication_status, auth_expires_at FROM shops WHERE id = ?').get(expShop).authentication_status === 'error'
+    && db.prepare('SELECT auth_expires_at FROM shops WHERE id = ?').get(expShop).auth_expires_at === '2026-07-31T01:44:58Z');
+  const aNone = await refreshShopAuthStatus(shop, {});
+  check('getAuthStatus無しアダプターはno-op', aNone === null);
+  const aThrow = await refreshShopAuthStatus(shop, {
+    async getAuthStatus() { throw new Error('boom'); },
+  });
+  check('取得失敗はfail-soft (null)', aThrow === null);
+}
+
 // ─── 4. 同期エラーの解決 ───
 console.log('4. 同期エラー解決');
 {

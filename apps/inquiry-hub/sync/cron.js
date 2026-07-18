@@ -75,6 +75,31 @@ export function cronMinutesMayCollide(exprA, exprB) {
   return false;
 }
 
+/**
+ * アダプターが getAuthStatus を持つ場合、shops.auth_expires_at / authentication_status を自動更新する
+ * (Yahoo!: VPSプロキシの/healthがrefresh token失効日時を返す → 運用管理画面の期限警告に反映)。
+ * 失敗しても同期結果には影響させない (fail-soft)
+ */
+export async function refreshShopAuthStatus(shop, adapter) {
+  if (typeof adapter?.getAuthStatus !== 'function') return null;
+  try {
+    const a = await adapter.getAuthStatus();
+    if (!a) return null;
+    const db = getDB();
+    db.prepare(`UPDATE shops SET
+        auth_expires_at = COALESCE(?, auth_expires_at),
+        authentication_status = ?,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+      WHERE id = ?`)
+      .run(a.authExpiresAt ? new Date(Date.parse(a.authExpiresAt)).toISOString().replace(/\.\d{3}Z$/, 'Z') : null,
+        a.ok ? 'ok' : 'error', shop.id);
+    return a;
+  } catch (e) {
+    console.warn(`[inquiry-hub-cron] 認証状態の取得失敗 (fail-soft) ${shop.shop_name}: ${e?.message || e}`);
+    return null;
+  }
+}
+
 /** 3連続失敗になった「ちょうどその回」だけ通知する (スパム防止)。失敗しても飲み込む */
 async function maybeNotifyFailure(shop, consecutiveFailures, errorDetail) {
   if (consecutiveFailures !== FAILURE_NOTIFY_AT) return;
@@ -124,6 +149,7 @@ export async function runInquiryHubSyncTick(opts = {}) {
       }
       const r = await runSync(shop.id, adapter);
       results.push({ shopId: shop.id, shop: shop.shop_name, ...r });
+      await refreshShopAuthStatus(shop, adapter);
       if (r.ok) {
         console.log(`[inquiry-hub-cron] OK ${shop.shop_name}${deep ? ' (deep)' : ''} ` +
           `新規${r.stats.newInquiries} 新着msg${r.stats.newMessages} 再オープン${r.stats.reopened} (${Date.now() - t0}ms)`);

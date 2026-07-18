@@ -22,7 +22,7 @@ import { getDB, logActivity } from './db.js';
 import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
-import { buildAdapterForShop } from './sync/cron.js';
+import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob } from './outbox.js';
 
 const router = Router();
@@ -822,10 +822,18 @@ router.get('/admin', (req, res) => {
   const syncTrs = syncRows.map(s => {
     const failing = (s.consecutive_failures || 0) >= 3;
     const syncing = s.lease_until && Date.parse(s.lease_until) > nowMs;
+    // 期限の手動登録フォーム (Yahoo!は同期時に自動更新されるため表示のみ)
+    const expiryDateVal = s.auth_expires_at ? new Date(Date.parse(s.auth_expires_at) + 9 * 3600000).toISOString().slice(0, 10) : '';
+    const expiryEdit = s.channel_type === 'yahoo'
+      ? '<div class="sub">(再認可時に自動更新)</div>'
+      : `<div class="sub expiry-edit">
+           <input type="date" id="exp-${s.shop_id}" value="${he(expiryDateVal)}">
+           <button onclick="saveAuthExpiry(${s.shop_id}, this)">保存</button>
+         </div>`;
     return `
     <tr${failing ? ' style="background:#fef2f2"' : ''}>
       <td>${chBadge(s.channel_type)}<div class="sub">${he(s.shop_name)}</div></td>
-      <td>${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}</td>
+      <td>${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}${expiryEdit}</td>
       <td class="nowrap">${fmtJst(s.last_synced_at)}${syncing ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">同期中…</span>' : ''}</td>
       <td class="nowrap">${fmtJst(s.committed_until)}</td>
       <td>${failing ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">連続失敗 ${s.consecutive_failures}回</span>` : (s.consecutive_failures || 0) > 0 ? `${s.consecutive_failures}回` : '—'}
@@ -934,6 +942,12 @@ async function resolveSyncError(id, btn) {
   btn.disabled = true;
   try { await post('/apps/inquiry-hub/api/admin/sync-errors/' + id + '/resolve', {}); toast('解決済みにしました'); setTimeout(function(){ location.reload(); }, 800); }
   catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function saveAuthExpiry(shopId, btn) {
+  var date = document.getElementById('exp-' + shopId).value;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/shops/' + shopId + '/auth-expiry', { date: date }); toast(date ? '認証期限を保存しました' : '認証期限を解除しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
 }`;
   res.send(pageShell('問い合わせ管理 — 運用管理', 'admin', body, script));
 });
@@ -949,6 +963,7 @@ router.post('/api/admin/sync/:shopId(\\d+)', async (req, res) => {
   try {
     console.log(`[inquiry-hub] 手動同期 ${shop.shop_name}${deep ? ' (deep)' : ''} by ${actorOf(req)}`);
     const r = await runSync(shop.id, adapter);
+    await refreshShopAuthStatus(shop, adapter); // Yahoo!は認証期限も自動反映 (fail-soft)
     res.json(r);
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e).slice(0, 300) });
@@ -973,6 +988,22 @@ router.post('/api/admin/outbox/:id(\\d+)/cancel', (req, res) => {
   } catch (e) {
     res.status(409).json({ error: String(e?.message || e).slice(0, 300) });
   }
+});
+
+// 認証期限の手動登録 (楽天licenseKey等、APIから取得できないもの用。Yahoo!は同期時に自動更新される)
+router.post('/api/admin/shops/:id(\\d+)/auth-expiry', (req, res) => {
+  const db = getDB();
+  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(Number(req.params.id));
+  if (!shop) return res.status(404).json({ error: '店舗が見つかりません' });
+  const date = String((req.body || {}).date || '').trim();
+  if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date)))) {
+    return res.status(400).json({ error: '日付は YYYY-MM-DD 形式の実在する日付で指定してください (空で解除)' });
+  }
+  // 日付のみの入力はJSTの当日終わりまで有効とみなす (UTC 15:00 = JST 24:00)
+  const iso = date ? `${date}T15:00:00Z` : null;
+  db.prepare(`UPDATE shops SET auth_expires_at = ?, updated_at = ${NOW_SQL} WHERE id = ?`).run(iso, shop.id);
+  console.log(`[inquiry-hub] 認証期限を${date ? date + 'に設定' : '解除'}: ${shop.shop_name} by ${actorOf(req)}`);
+  res.json({ ok: true, auth_expires_at: iso });
 });
 
 router.post('/api/admin/sync-errors/:id(\\d+)/resolve', (req, res) => {
@@ -1076,6 +1107,9 @@ details.tpl summary:hover { background: #f8fafc; border-radius: 8px; }
 .card-title .sub { font-weight: normal; }
 td.ops { white-space: normal; }
 td.ops button { margin: 2px 4px 2px 0; }
+.expiry-edit { display: flex; gap: 4px; margin-top: 4px; align-items: center; }
+.expiry-edit input[type=date] { padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
+.expiry-edit button { padding: 3px 10px; font-size: 12px; }
 `;
 
 function pageShell(title, active, body, script) {
