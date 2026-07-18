@@ -29,7 +29,7 @@ import {
 } from './service.js';
 import crypto from 'node:crypto';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
-import { getDriveCsvInfo, downloadDriveCsv } from './drive-fetch.js';
+import { getDriveCsvInfoAll, downloadDriveCsv } from './drive-fetch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -219,9 +219,9 @@ router.post('/api/tracking/import', upload.single('file'), (req, res) => handle(
 }));
 
 // ── Google Drive 直接取込 (ヤマトB2 発行済データCSV、2026-07-18 中原さん指示) ──
-// ファイル metadata (更新日時表示用)。source: yamato_b2 | yamato_b2_50
+// 全対象の metadata (更新日時表示用) を 1 リクエストで返す。60 秒キャッシュ (drive-fetch.js)。
 router.get('/api/tracking/drive-file-info', (req, res) => handleAsync(res, () =>
-  getDriveCsvInfo(req.query.source)));
+  getDriveCsvInfoAll()));
 
 // Drive からDLして通常の取込と同じ経路へ (file_hash 重複検出もそのまま効く)
 // body: { source: 'yamato_b2' | 'yamato_b2_50' }

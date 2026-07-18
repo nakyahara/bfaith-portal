@@ -2676,13 +2676,18 @@ function trkSetDriveInfo(source, text, tooltip){
   el.textContent = text;
   el.title = tooltip || '';
 }
-function loadDriveFileInfo(){
-  Object.keys(TRK_DRIVE_INFO_IDS).forEach(source => {
-    trkSetDriveInfo(source, 'Drive更新日時: 確認中…');
-    api('api/tracking/drive-file-info?source=' + source)
-      .then(info => trkSetDriveInfo(source, `Drive更新日時: ${info.modified_time_jst || '不明'}`, info.filename))
-      .catch(e => trkSetDriveInfo(source, 'Drive: 取得エラー', e.message));
-  });
+async function loadDriveFileInfo(){
+  Object.keys(TRK_DRIVE_INFO_IDS).forEach(source => trkSetDriveInfo(source, 'Drive更新日時: 確認中…'));
+  try{
+    const all = await api('api/tracking/drive-file-info'); // 全 source まとめて1リクエスト (60秒キャッシュ)
+    Object.keys(TRK_DRIVE_INFO_IDS).forEach(source => {
+      const info = all[source];
+      if(info && info.ok) trkSetDriveInfo(source, `Drive更新日時: ${info.modified_time_jst || '不明'}`, info.filename);
+      else trkSetDriveInfo(source, 'Drive: 取得エラー', (info && info.message) || '');
+    });
+  }catch(e){
+    Object.keys(TRK_DRIVE_INFO_IDS).forEach(source => trkSetDriveInfo(source, 'Drive: 取得エラー', e.message));
+  }
 }
 document.querySelectorAll('[data-trk-drive-import]').forEach(btn => {
   btn.onclick = async () => {

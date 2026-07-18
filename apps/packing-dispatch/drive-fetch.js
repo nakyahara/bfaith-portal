@@ -12,6 +12,10 @@
 import { google } from 'googleapis';
 
 const TIMEOUT = 20000; // Drive応答が遅くても処理全体を待たせない (drive-upload.js と同じ方針)
+// 手動アップロード経路の multer 上限 (router.js の 20MB) と揃える。Drive経由だけ無制限に
+// メモリへ読み込まないための防御 (Codex R1 High)。
+const MAX_CSV_BYTES = 20 * 1024 * 1024;
+const INFO_CACHE_TTL_MS = 60 * 1000; // 更新日時表示は 60 秒キャッシュ (表示用ポーリングで Drive API を叩き過ぎない)
 
 // source → 取得先。フォルダID/ファイル名は運用固定 (2026-07-18 中原さん指定)。env で差し替え可。
 const DRIVE_SOURCES = {
@@ -27,6 +31,8 @@ const DRIVE_SOURCES = {
   },
 };
 
+export const DRIVE_IMPORT_SOURCES = Object.keys(DRIVE_SOURCES);
+
 function vErr(message, detail) {
   const e = new Error(message);
   e.code = 'VALIDATION';
@@ -40,7 +46,11 @@ function getSourceConfig(source) {
   return cfg;
 }
 
+// Drive クライアントはプロセス内で使い回す (毎リクエストの認証クライアント再生成を避ける、Codex R1 Medium)。
+// GOOGLE_SERVICE_ACCOUNT_KEY は起動時のみ読む運用 (env は再起動で反映) なのでキャッシュ無効化は不要。
+let _cached = null;
 function getDriveClient() {
+  if (_cached) return _cached;
   const keyBase64 = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
   if (!keyBase64) throw new Error('GOOGLE_SERVICE_ACCOUNT_KEY が未設定です (Render の env を確認してください)');
   const keyJson = JSON.parse(Buffer.from(keyBase64, 'base64').toString('utf-8'));
@@ -48,7 +58,8 @@ function getDriveClient() {
     credentials: keyJson,
     scopes: ['https://www.googleapis.com/auth/drive.readonly'],
   });
-  return { drive: google.drive({ version: 'v3', auth }), serviceAccountEmail: keyJson.client_email || null };
+  _cached = { drive: google.drive({ version: 'v3', auth }), serviceAccountEmail: keyJson.client_email || null };
+  return _cached;
 }
 
 // Drive の RFC3339 UTC を「YYYY-MM-DD HH:mm」JST 表記へ (toISOString は UTC のままなので +9h を自前計算)
@@ -111,18 +122,63 @@ async function findDriveFile(source) {
   };
 }
 
-/** ファイル metadata のみ (UI の「更新日時」表示用)。 */
-export async function getDriveCsvInfo(source) {
-  return findDriveFile(source);
+// ── 更新日時表示用 metadata (60 秒キャッシュ) ──
+const _infoCache = new Map(); // source → { at: epoch_ms, info }
+
+async function getInfoCached(source) {
+  const hit = _infoCache.get(source);
+  if (hit && Date.now() - hit.at < INFO_CACHE_TTL_MS) return hit.info;
+  const info = await findDriveFile(source);
+  _infoCache.set(source, { at: Date.now(), info });
+  return info;
 }
 
-/** CSV 本体をダウンロードして Buffer で返す (エンコーディングは importTrackingCsv 側の parser が判定)。 */
+/**
+ * 全 source の metadata をまとめて返す (UI の「更新日時」表示用、1 リクエストで完結)。
+ * 個別失敗は他 source を巻き込まない ({ ok:false, message } で返す)。
+ */
+export async function getDriveCsvInfoAll() {
+  const entries = await Promise.all(DRIVE_IMPORT_SOURCES.map(async (source) => {
+    try {
+      return [source, { ok: true, ...(await getInfoCached(source)) }];
+    } catch (e) {
+      return [source, { ok: false, message: e.message }];
+    }
+  }));
+  return Object.fromEntries(entries);
+}
+
+/**
+ * CSV 本体をダウンロードして Buffer で返す (エンコーディングは importTrackingCsv 側の parser が判定)。
+ * DL 後に modifiedTime を再確認し、DL 中にファイルが差し替わっていたら 1 回だけ取り直す
+ * (表示する更新日時と取り込んだ中身の世代を一致させる、Codex R1 Medium)。
+ */
 export async function downloadDriveCsv(source) {
-  const info = await findDriveFile(source);
   const { drive } = getDriveClient();
-  const res = await drive.files.get(
-    { fileId: info.file_id, alt: 'media', supportsAllDrives: true },
-    { responseType: 'arraybuffer', timeout: TIMEOUT }
-  );
-  return { ...info, buffer: Buffer.from(res.data) };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const info = await findDriveFile(source);
+    if (info.size != null && info.size > MAX_CSV_BYTES) {
+      throw vErr(`ファイルが大きすぎます (${Math.round(info.size / 1024 / 1024)}MB > 上限20MB)。対象ファイルが正しいか確認してください。`);
+    }
+    const res = await drive.files.get(
+      { fileId: info.file_id, alt: 'media', supportsAllDrives: true },
+      { responseType: 'arraybuffer', timeout: TIMEOUT }
+    );
+    const buffer = Buffer.from(res.data);
+    if (buffer.length > MAX_CSV_BYTES) {
+      throw vErr(`ファイルが大きすぎます (${Math.round(buffer.length / 1024 / 1024)}MB > 上限20MB)。対象ファイルが正しいか確認してください。`);
+    }
+    // DL 中の差し替え検知: 再度 metadata を見て modifiedTime が変わっていなければ採用
+    const after = await drive.files.get(
+      { fileId: info.file_id, fields: 'modifiedTime', supportsAllDrives: true },
+      { timeout: TIMEOUT }
+    ).catch(() => null);
+    const afterTime = after && after.data && after.data.modifiedTime;
+    if (!afterTime || afterTime === info.modified_time) {
+      _infoCache.set(source, { at: Date.now(), info }); // 表示キャッシュも取込時点に更新
+      return { ...info, buffer };
+    }
+    // 差し替わっていた → ループ先頭から取り直し (次周は新しい方を取る)
+  }
+  throw new Error('Drive ファイルが更新中のようです。少し待ってからもう一度お試しください。');
 }
