@@ -52,6 +52,8 @@ function sleep(ms) {
  * @param {string} opts.path - 例: /es/2.0/items/search?cursorMark=*
  * @param {'GET'|'POST'} [opts.method='GET']
  * @param {any} [opts.body] - POST 時の JSON body
+ * @param {string} [opts.rawBody] - JSON化せずそのまま送る生ボディ (XML API 用。
+ *   Content-Type は headers で指定する。クーポンAPI 1.0 は application/xml — PR-C3 実測)
  * @param {object} [opts.headers] - 追加ヘッダー
  * @param {number} [opts.timeoutMs=60000]
  * @param {number} [opts.maxAttempts=4] - 初回 + retry 含む総試行回数
@@ -68,6 +70,7 @@ async function doRakutenRequest({
   path,
   method = 'GET',
   body,
+  rawBody,
   headers = {},
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
@@ -91,6 +94,7 @@ async function doRakutenRequest({
     ...(body !== undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}),
     ...headers,
   };
+  const requestBody = rawBody !== undefined ? rawBody : (body !== undefined ? JSON.stringify(body) : undefined);
 
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -100,7 +104,7 @@ async function doRakutenRequest({
       const response = await fetch(url, {
         method,
         headers: finalHeaders,
-        body: body !== undefined ? JSON.stringify(body) : undefined,
+        body: requestBody,
         signal: AbortSignal.timeout(timeoutMs),
       });
 
