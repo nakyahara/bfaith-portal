@@ -103,7 +103,7 @@ function processFolder_(folder, base, token, runId, dryRun) {
       payload: JSON.stringify(payload),
       muteHttpExceptions: true,
     });
-    var verdict = verifyIngestResponse_(resp, rows.length);
+    var verdict = verifyIngestResponse_(resp, rows.length, folder.getName());
     if (!verdict.ok) {
       result.status = "error: " + verdict.reason;
       return result; // 消さない (再送はサーバ側で冪等)
@@ -129,8 +129,13 @@ function processFolder_(folder, base, token, runId, dryRun) {
   return result;
 }
 
-/** ingest レスポンス検証。200 + ok:true + 件数一致のみ削除許可 (Codex R1 medium #6) */
-function verifyIngestResponse_(resp, sentCount) {
+/**
+ * ingest レスポンス検証。削除許可の条件 (Codex R1 medium #6 + R4 high):
+ *  - HTTP 200 + ok:true + total===sent + inserted+ignored===sent
+ *  - すべての ignored が「同一フォルダからの再送」であること。別フォルダ由来の ignored は
+ *    過去取込済み伝票への OCR 誤認の疑いがあるため削除見送り
+ */
+function verifyIngestResponse_(resp, sentCount, folderName) {
   var code = resp.getResponseCode();
   var text = resp.getContentText();
   if (code !== 200) return { ok: false, reason: "ingest HTTP " + code + " " + text.slice(0, 200) };
@@ -141,6 +146,11 @@ function verifyIngestResponse_(resp, sentCount) {
   if (body.total !== sentCount || (body.inserted + body.ignored) !== sentCount) {
     return { ok: false, reason: "ingest 件数不一致 sent=" + sentCount + " total=" + body.total +
                                 " inserted=" + body.inserted + " ignored=" + body.ignored };
+  }
+  var foreign = (body.ignored_details || []).filter(function (d) { return d.folder_name !== folderName; });
+  if (foreign.length > 0 || (body.ignored > 0 && !body.ignored_details)) {
+    var names = foreign.map(function (d) { return d.slip_no + "(既存:" + d.folder_name + ")"; }).join(", ");
+    return { ok: false, reason: "ignored に別フォルダ由来あり (OCR誤認の疑い): " + (names || "詳細なし") };
   }
   return { ok: true };
 }

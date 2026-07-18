@@ -59,6 +59,15 @@ const r2 = ingestFolderSlips({ ...basePayload, runId: '20260719-181600', shipDat
 expectEq(r2.inserted, 0, '日跨ぎ再送 inserted');
 expectEq(r2.ignored, 2, '日跨ぎ再送 ignored');
 expectEq(r2.conflicts.length, 0, '日跨ぎ再送 conflicts');
+// ignored_details に既存行の出所 (同一フォルダ再送と判別できる情報) が返る (Codex R4)
+expectEq(r2.ignored_details.length, 2, '日跨ぎ再送 ignored_details 件数');
+expectEq(r2.ignored_details[0]?.folder_name, '出荷_01', 'ignored_details 出所フォルダ');
+// 別フォルダから同じ slip_no を送る (OCR誤認シナリオ) → ignored だが出所が異なる
+const rX = ingestFolderSlips({ ...basePayload, runId: 'rX', folderName: '出荷_09', rows: [
+  { slip_no: 'SP00110324384', mgmt_no: null },
+] });
+expectEq(rX.ignored, 1, '別フォルダ誤認 ignored');
+expectEq(rX.ignored_details[0]?.folder_name, '出荷_01', '別フォルダ誤認の出所 (GAS側で削除見送り判定に使う)');
 // 初回の ship_date が保持されている (append-only)
 expectEq(db.prepare(`SELECT ship_date FROM sl_shipping_slips WHERE slip_no='SP00110324384'`).get().ship_date,
   '2026-07-18', '初回 ship_date 保持');

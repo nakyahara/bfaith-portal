@@ -83,7 +83,12 @@ function isConflict(existing, row) {
  * INSERT-first + PK 違反 catch でレース耐性 (mis-shipment の insertSingleMisShipment と同型)。
  * @param {{ runId: string, folderName: string, shipDate: string, extractedAt: string|null,
  *           rows: Array<{ slip_no: string, mgmt_no?: string|null, mall_order_no?: string|null, source_file?: string|null }> }} p
- * @returns {{ inserted: number, ignored: number, conflicts: Array<{ slip_no: string, existing_mgmt_no: string|null, existing_mall_order_no: string|null }> }}
+ * ignored_details には既存行の出所 (folder_name/ship_date/source_file) を返す。GAS はこれで
+ * 「同一フォルダの再送」かを検証し、別フォルダ由来の ignored (= 過去取込済み伝票への
+ * OCR 誤認の疑い) があれば削除を見送る (Codex R4 high)。
+ * @returns {{ inserted: number, ignored: number,
+ *             ignored_details: Array<{ slip_no: string, folder_name: string|null, ship_date: string|null, source_file: string|null }>,
+ *             conflicts: Array<{ slip_no: string, existing_mgmt_no: string|null, existing_mall_order_no: string|null }> }}
  */
 export function ingestFolderSlips(p) {
   const db = requireSchema();
@@ -93,11 +98,12 @@ export function ingestFolderSlips(p) {
       (slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, extracted_at, received_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const selectStmt = db.prepare('SELECT slip_no, mgmt_no, mall_order_no FROM sl_shipping_slips WHERE slip_no = ?');
+  const selectStmt = db.prepare(
+    'SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file FROM sl_shipping_slips WHERE slip_no = ?');
 
   const tx = db.transaction((rows) => {
     let inserted = 0;
-    let ignored = 0;
+    const ignoredDetails = [];
     const conflicts = [];
     for (const r of rows) {
       try {
@@ -113,7 +119,13 @@ export function ingestFolderSlips(p) {
           if (existing && isConflict(existing, r)) {
             conflicts.push({ slip_no: r.slip_no, existing_mgmt_no: existing.mgmt_no, existing_mall_order_no: existing.mall_order_no });
           } else {
-            ignored++; // 再送 (内容一致 or 新規側が null) → 冪等
+            // 再送 (内容一致 or 新規側が null) → 冪等。出所を返して GAS 側で再送妥当性を検証させる
+            ignoredDetails.push({
+              slip_no: r.slip_no,
+              folder_name: existing ? existing.folder_name : null,
+              ship_date: existing ? existing.ship_date : null,
+              source_file: existing ? existing.source_file : null,
+            });
           }
         } else {
           throw e;
@@ -122,7 +134,7 @@ export function ingestFolderSlips(p) {
     }
     // conflict があってもここまでの INSERT は有効のままにする (append-only の事実は残す)。
     // GAS には 409 が返り、フォルダは削除されないので人間が調査できる。
-    return { inserted, ignored, conflicts };
+    return { inserted, ignored: ignoredDetails.length, ignored_details: ignoredDetails, conflicts };
   });
   return tx(p.rows);
 }

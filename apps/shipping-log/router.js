@@ -123,12 +123,13 @@ function handle(res, fn) {
 // 既存行と内容が食い違う伝票があれば 409 (削除させず人間の調査に回す)。
 router.post('/ingest', requireIngestKey, (req, res) => handle(res, () => {
   const p = validateBody(req.body);
-  const { inserted, ignored, conflicts } = ingestFolderSlips(p);
+  const { inserted, ignored, ignored_details, conflicts } = ingestFolderSlips(p);
   if (conflicts.length > 0) {
     console.warn('[shipping-log] ingest conflicts', { folder: p.folderName, conflicts });
     return res.status(409).json({ ok: false, error: 'conflict', inserted, ignored, conflicts, total: p.rows.length });
   }
-  res.json({ ok: true, inserted, ignored, total: p.rows.length });
+  // ignored_details: 既存行の出所。GAS は「同一フォルダの再送」以外の ignored があれば削除を見送る
+  res.json({ ok: true, inserted, ignored, ignored_details, total: p.rows.length });
 }));
 
 // 動作確認・突合ジョブ用: 直近の取込行 (read-only token)
