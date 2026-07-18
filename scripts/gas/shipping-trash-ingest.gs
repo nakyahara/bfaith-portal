@@ -79,6 +79,14 @@ function processFolder_(folder, base, token, runId, dryRun) {
       result.status = "error: 納品書から伝票番号を1件も抽出できず";
       return result; // 消さない
     }
+    // フォルダ全体で slip_no が一意であること (Codex R3 high: 別伝票のSP番号を
+    // OCRが同一に誤認すると、サーバ側で ignored に化けて記録が欠落したまま削除される)
+    var slipNos = distinct_(rows.map(function (r) { return r.slip_no; }));
+    if (slipNos.length !== rows.length) {
+      result.status = "error: 伝票番号の重複検出 (" + rows.length + "行中" + slipNos.length +
+                      "種、OCR誤認の可能性) → 削除見送り";
+      return result; // 消さない
+    }
 
     // ── 送信 (200 + body 検証。ステータスだけでは信頼しない) ──
     var payload = {
