@@ -20,6 +20,7 @@ import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observ
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
+import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
@@ -1345,6 +1346,8 @@ app.listen(PORT, () => {
 
   // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
   startInventoryNotificationJob();
+  // 低粗利商品アラート (粗利率10%割れ、MARGIN_ALERT_ENABLED=true で起動、JST 10:00)
+  startMarginAlertJob();
   // biz-ops-overview 売上サマリ GChat 通知 (在庫と独立メッセージ、SALES_NOTIFY_ENABLED=true で起動)
   startSalesNotificationJob();
 
