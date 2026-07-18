@@ -29,6 +29,14 @@ const DRIVE_SOURCES = {
     folderId: process.env.PD_DRIVE_FOLDER_YAMATO_B2_50 || '1F_DWgsFs16002cLUK7_7o_GmM5_CDY31',
     filename: process.env.PD_DRIVE_FILE_YAMATO_B2_50 || '50サイズ31項目4項目_発行済データ.csv',
   },
+  yupacketpuff: {
+    label: 'ゆうパケットパフ',
+    // ファイル名末尾のタイムスタンプは初回出力時のもので固定 (ゆうプリRが同名上書き更新する運用を実機確認済み 2026-07-18)。
+    // 「＿」(全角) と「_」(半角) が混在している点に注意 — Drive 上の実ファイル名そのまま。
+    folderId: process.env.PD_DRIVE_FOLDER_YUPACKETPUFF || '1V-4iZWnmi9E2Bi90a2JlTUzqsL3V_Nsu',
+    filename: process.env.PD_DRIVE_FILE_YUPACKETPUFF || 'ゆうプリR出荷履歴＿2項目3項目_20250714102302.csv',
+    notFoundHint: 'ゆうプリRからのDLが済んでいるか確認してください。',
+  },
 };
 
 export const DRIVE_IMPORT_SOURCES = Object.keys(DRIVE_SOURCES);
@@ -109,7 +117,7 @@ async function findDriveFile(source) {
 
   const file = list.data.files && list.data.files[0];
   if (!file) {
-    throw vErr(`Drive フォルダに「${cfg.filename}」が見つかりません (${cfg.label})。B2クラウドからのDLが済んでいるか確認してください。`);
+    throw vErr(`Drive フォルダに「${cfg.filename}」が見つかりません (${cfg.label})。${cfg.notFoundHint || 'B2クラウドからのDLが済んでいるか確認してください。'}`);
   }
   return {
     source,

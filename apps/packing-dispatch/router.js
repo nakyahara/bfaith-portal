@@ -224,7 +224,7 @@ router.get('/api/tracking/drive-file-info', (req, res) => handleAsync(res, () =>
   getDriveCsvInfoAll()));
 
 // Drive からDLして通常の取込と同じ経路へ (file_hash 重複検出もそのまま効く)
-// body: { source: 'yamato_b2' | 'yamato_b2_50' }
+// body: { source: 'yamato_b2' | 'yamato_b2_50' | 'yupacketpuff' }
 router.post('/api/tracking/import-from-drive', (req, res) => handleAsync(res, async () => {
   const source = (req.body && req.body.source) || req.query.source;
   if (!source) { const e = new Error('source パラメータが必要です'); e.code = 'VALIDATION'; throw e; }

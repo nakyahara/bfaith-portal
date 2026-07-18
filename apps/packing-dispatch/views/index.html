@@ -347,6 +347,8 @@
         <label class="muted" style="min-width:240px">ゆうパケットパフ
           <input type="file" id="trkFileYupacketpuff" accept=".csv" /></label>
         <button class="sub" data-trk-import="yupacketpuff">取込</button>
+        <button class="sub" data-trk-drive-import="yupacketpuff" style="background:#1a73e8; border-color:#1a73e8; color:white">📥 Driveから取込</button>
+        <span id="trkDriveInfoYupacketpuff" class="muted"></span>
         <span id="trkStatusYupacketpuff" class="muted"></span>
       </div>
       <div id="trkImportResult"></div>
@@ -2667,9 +2669,10 @@ document.querySelectorAll('[data-trk-import]').forEach(btn => {
   };
 });
 
-// ── Google Drive 直接取込 (ヤマトB2 発行済データCSV、2026-07-18 中原さん指示) ──
-// B2クラウドから自動DLされたCSVがDriveの固定フォルダに置かれる運用。手動DL→アップロードを省く。
-const TRK_DRIVE_INFO_IDS = { yamato_b2: 'trkDriveInfoYamato', yamato_b2_50: 'trkDriveInfoYamato50' };
+// ── Google Drive 直接取込 (ヤマトB2 発行済データ + ゆうプリR出荷履歴 CSV、2026-07-18 中原さん指示) ──
+// キャリアツールから自動DLされたCSVがDriveの固定フォルダに置かれる運用。手動DL→アップロードを省く。
+const TRK_DRIVE_INFO_IDS = { yamato_b2: 'trkDriveInfoYamato', yamato_b2_50: 'trkDriveInfoYamato50', yupacketpuff: 'trkDriveInfoYupacketpuff' };
+const TRK_DRIVE_STATUS_IDS = { yamato_b2: 'trkStatusYamato', yamato_b2_50: 'trkStatusYamato50', yupacketpuff: 'trkStatusYupacketpuff' };
 function trkSetDriveInfo(source, text, tooltip){
   const el = $('#' + (TRK_DRIVE_INFO_IDS[source] || ''));
   if(!el) return;
@@ -2692,7 +2695,7 @@ async function loadDriveFileInfo(){
 document.querySelectorAll('[data-trk-drive-import]').forEach(btn => {
   btn.onclick = async () => {
     const source = btn.dataset.trkDriveImport;
-    const statusId = source==='yamato_b2' ? 'trkStatusYamato' : 'trkStatusYamato50';
+    const statusId = TRK_DRIVE_STATUS_IDS[source];
     btn.disabled = true;
     $('#'+statusId).textContent = 'Driveから取得中…';
     try{
