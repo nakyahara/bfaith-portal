@@ -124,8 +124,7 @@
         <span id="filterCount" class="muted"></span>
         <span style="flex:1"></span>
         <span id="exportHint" class="muted"></span>
-        <button id="btnExportPre" class="sub" title="MeltLine になっている明細を手動出荷に切り替えて出力します（2026年6月1日のMeltLine導入前の旧形式。通常は使いません）">CSV出力（旧形式: MeltLine→手動）</button>
-        <button id="btnExportPost" style="background:#2e7d32; border-color:#2e7d32" title="MeltLine はそのまま MeltLine で出力します（2026年6月1日のMeltLine導入後の通常運用）">📤 CSV出力してロジザードへ（通常）</button>
+        <button id="btnExportPost" style="background:#2e7d32; border-color:#2e7d32" title="MeltLine はそのまま MeltLine で出力します">📤 CSV出力してロジザードへ</button>
       </div>
       <div class="scroll">
         <table>
@@ -593,8 +592,7 @@
         <li>サマリが出る → 「要判断 ◯件」を確認</li>
         <li>伝票一覧から <span class="badge b-warn">要判断</span> の行をクリックして、ダイアログで配送方法・梱包機を選んで「確定」</li>
         <li><b>要判断が0件になったら</b>、CSV出力ボタンが押せるようになる</li>
-        <li>「<b>📤 CSV出力してロジザードへ（通常）</b>」を押してCSVをダウンロード (MeltLineはそのままMeltLineで出力)。
-          隣の「CSV出力（旧形式: MeltLine→手動）」は2026年6月1日のMeltLine導入前の形式で、MeltLine判定の行を「手動出荷」に矯正して出力します。<b>通常は使いません</b></li>
+        <li>「<b>📤 CSV出力してロジザードへ</b>」を押してCSVをダウンロード</li>
         <li>ダウンロードしたCSVをロジザードに取り込む</li>
       </ol>
       <div class="note"><b>ヒント</b>: 「取込済みデータを再表示」のドロップダウンで、過去48時間以内の取込バッチを再表示できます。途中で画面を閉じても作業を続行可能。</div>
@@ -638,7 +636,7 @@
       <h3>4-2. 沖縄県×ネコポスの手動出荷化 (2026-05-31〜)</h3>
       <p>沖縄県宛のネコポス伝票は、CSV出力時に<b>梱包機マーカーだけ「手動出荷」に書き換えて</b>出力します(配送方法はネコポスのまま)。</p>
       <div class="warn"><b>理由</b>: 沖縄の航空便は液体類が別管理対象です。ヤマトの端末で送り状QRを読んだときに「沖縄エラー」が表示される運用ですが、梱包機(pasline/meltline)で出すと送り状にQRが付かないため端末でエラーが出ません。手動出荷扱いにすることで、送り状経由で必ずエラー検知できるようにしています。</div>
-      <p>この処理は画面では「ネコポス + 梱包機〇〇」の表示のままですが、出力時に自動で書き換わります(2つのCSV出力ボタンの両方で適用)。</p>
+      <p>この処理は画面では「ネコポス + 梱包機〇〇」の表示のままですが、CSV出力時に自動で書き換わります。</p>
 
       <h3>4-3. LINEギフトは必ず手動出荷</h3>
       <p>ショップ名「LINE ギフト」の伝票は、配送方法を何にしても梱包機は「手動出荷」固定です。</p>
@@ -1069,7 +1067,7 @@ function renderSummary(s){
 }
 function updateExportBtn(pending){
   const dis = pending>0;
-  $('#btnExportPre').disabled = dis; $('#btnExportPost').disabled = dis;
+  $('#btnExportPost').disabled = dis;
   $('#exportHint').textContent = dis ? `要判断 ${pending} 件を確定してから出力` : '';
 }
 
@@ -1189,7 +1187,8 @@ $('#dlgOk').onclick = async () => {
 };
 
 // ── 出力 (MeltLine 導入前=手動に落とす / 導入後=そのまま の2ボタン) ──
-$('#btnExportPre').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}?premeltline=1`; };
+// 旧形式ボタン (premeltline=1、MeltLine導入前の手動矯正出力) は 2026-07-18 中原さん指示で撤去。
+// API 側の ?premeltline=1 は残してあり、必要になれば URL 直叩きで旧形式を出力できる。
 $('#btnExportPost').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
 
 // ── 商品マスタ ──
