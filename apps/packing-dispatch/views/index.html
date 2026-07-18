@@ -91,7 +91,11 @@
     </div>
     <div class="card">
       <div class="row">
-        <input type="file" id="csvFile" accept=".csv" />
+        <strong>Step 1: NEの受注CSVを取り込む</strong>
+        <span class="muted">NextEngineで吐き出した受注CSV (Shift-JIS・93列) をそのまま選んでください</span>
+      </div>
+      <div class="row">
+        <input type="file" id="csvFile" accept=".csv" aria-label="NextEngineの受注CSVファイルを選択" />
         <button id="btnUpload">アップロードして判定</button>
         <span id="upStatus" class="muted"></span>
       </div>
@@ -105,7 +109,10 @@
     </div>
     <div class="card" id="ordersCard" style="display:none">
       <div class="row">
-        <strong>伝票一覧</strong>
+        <strong>Step 2: 要判断を確定 → Step 3: CSV出力</strong>
+        <span class="muted"><span class="badge b-warn">要判断</span> の行をクリックして配送方法・梱包機を確定。全部確定するとCSV出力ボタンが押せます</span>
+      </div>
+      <div class="row">
         <label class="muted">状態 <select id="filterStatus">
           <option value="">すべて</option>
           <option value="要判断">要判断のみ</option>
@@ -117,8 +124,8 @@
         <span id="filterCount" class="muted"></span>
         <span style="flex:1"></span>
         <span id="exportHint" class="muted"></span>
-        <button id="btnExportPre" class="sub" title="MeltLine になっている明細を手動出荷に切り替えて出力します（6月1日のMeltLine導入前用）">CSV出力（〜5/31 MeltLine→手動）</button>
-        <button id="btnExportPost" class="sub" title="MeltLine はそのまま MeltLine で出力します（6月1日のMeltLine導入後用）">CSV出力（6/1〜 MeltLineそのまま）</button>
+        <button id="btnExportPre" class="sub" title="MeltLine になっている明細を手動出荷に切り替えて出力します（2026年6月1日のMeltLine導入前の旧形式。通常は使いません）">CSV出力（旧形式: MeltLine→手動）</button>
+        <button id="btnExportPost" style="background:#2e7d32; border-color:#2e7d32" title="MeltLine はそのまま MeltLine で出力します（2026年6月1日のMeltLine導入後の通常運用）">📤 CSV出力してロジザードへ（通常）</button>
       </div>
       <div class="scroll">
         <table>
@@ -145,6 +152,10 @@
       <div class="muted">初回のみ。投入済みの場合は実行されません（手動編集の上書き防止）。</div>
     </div>
     <div class="card">
+      <div class="row">
+        <strong>ルールを登録・編集</strong>
+        <span class="muted">商品コードを入れて「読み込み」(未登録なら新規作成)、または商品名で検索して選択 → 下のフォームで数量帯ごとに設定して保存</span>
+      </div>
       <div class="row">
         <input id="mProduct" placeholder="商品コード" size="20" />
         <button id="btnLoadRules" class="sub">読み込み</button>
@@ -200,7 +211,7 @@
       </div>
       <div class="muted">
         <b>Step 1</b>: PR #231 より前にアプリで出力したバッチを pd_shipment_tracking に補填 (INSERT-only、既存行は完全保護)。<br/>
-        <b>Step 2</b>: 既に取込済の B2 / ゆうパケットポストファン CSV を再投入できるよう、直近 24h の取込履歴を削除 (file_hash 解放)。<br/>
+        <b>Step 2</b>: 既に取込済の B2 / ゆうパケットパフ CSV を再投入できるよう、直近 24h の取込履歴を削除 (file_hash 解放)。<br/>
         <b>Step 3</b>: 通常の追跡番号取込タブから B2 CSV を再アップロード → backfill で追加された 285 件に追跡番号紐付け。
       </div>
       <div class="row" style="margin-top:8px">
@@ -270,6 +281,10 @@
     </div>
     <div class="card">
       <div class="row">
+        <strong>学習済みの組合せを検索</strong>
+        <span class="muted">「梱包したら入らなかった」等、過去に確定した組合せの配送方法・梱包機をここで直せます (次回以降の自動判定に反映)</span>
+      </div>
+      <div class="row">
         <input id="aQuery" placeholder="注文番号 / 受注番号 / 商品コード" size="32" />
         <label>配送方法 <select id="aSm"><option value="">（指定なし）</option></select></label>
         <label>梱包機 <select id="aPm"><option value="">（指定なし）</option></select></label>
@@ -307,6 +322,10 @@
 
   <!-- ───── 追跡番号 / NE反映 (Phase 1 UI 再設計、2026-06-07、状態駆動 + 本日デフォルト) ───── -->
   <section class="panel" id="panel-tracking">
+    <div class="help-bar">
+      💡 この画面の使い方: <b>① キャリアCSVを取込</b> (追跡番号が伝票に自動で紐付く) → <b>② 定形外を反映</b> → <b>③ レターパックは追跡番号を手入力</b> → <b>④ NE 手動反映用エクスポート</b>で NextEngine に反映。
+      <a href="#" data-jump="ch8">📖 詳しい手順を見る</a>
+    </div>
 
     <!-- スコープ切替 (本日 / 過去履歴) -->
     <div class="row" style="margin-bottom:8px">
@@ -324,7 +343,7 @@
     <!-- CSV 取込: 「自動 (Driveから)」と「手動アップロード」を列で分け、初見でも取込方法が2通りあると分かるようにする -->
     <div class="card">
       <div class="row">
-        <strong>キャリア CSV 取込</strong>
+        <strong>① キャリア CSV 取込</strong>
         <span class="muted">同じファイルは重複取込を自動検出</span>
       </div>
       <div class="muted" style="margin-bottom:8px">
@@ -388,7 +407,7 @@
     <!-- 定形外一覧 (本日アップロード分): チェックボックス + 一括「定形外を反映する」ボタン -->
     <div class="card" id="trkTeikeigaiCard" style="display:none">
       <div class="row">
-        <strong>📫 定形外 (本日アップロード分)</strong>
+        <strong>② 📫 定形外を反映 (本日アップロード分)</strong>
         <span id="trkTeikeigaiSummary" class="muted"></span>
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkTeikeigaiReload">再読込</button>
@@ -415,7 +434,7 @@
     <!-- レターパック一覧 (本日アップロード分、業務フロー順序: 定形外の次、未割当アラートの上、2026-06-07 中原さん指示) -->
     <div class="card" id="trkLetterpackCard" style="display:none">
       <div class="row">
-        <strong>📮 レターパック (本日アップロード分)</strong>
+        <strong>③ 📮 レターパック 追跡番号を手入力 (本日アップロード分)</strong>
         <span id="trkLetterpackSummary" class="muted"></span>
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkLetterpackReload">再読込</button>
@@ -482,7 +501,7 @@
     <!-- NE 手動反映用エクスポート (2026-06-07 中原さん指示で追跡番号一覧の下に移動 + 対象を linked + ready 両方に拡張) -->
     <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
       <div class="row">
-        <strong>📤 NE 手動反映用エクスポート (紐付け済)</strong>
+        <strong>④ 📤 NE 手動反映用エクスポート (紐付け済)</strong>
         <span id="trkReadyExportSummary" class="muted"></span>
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkReadyExportReload">再読込</button>
@@ -538,16 +557,17 @@
   <!-- ───── マニュアル ───── -->
   <section class="panel" id="panel-manual">
     <div class="card">
-      <p class="muted" style="margin:0">最終更新: 2026-05-31 / 本番URL: <code>/apps/packing-dispatch/</code></p>
+      <p class="muted" style="margin:0">最終更新: 2026-07-18 / 本番URL: <code>/apps/packing-dispatch/</code></p>
       <div class="toc">
         <b>目次</b>
         <a href="#" data-jump="ch1">1. 3分でわかるこのアプリ</a>
-        <a href="#" data-jump="ch2">2. 毎日の作業手順</a>
+        <a href="#" data-jump="ch2">2. 毎日の作業手順 (取込・判定)</a>
         <a href="#" data-jump="ch3">3. 「要判断」が出たときの見方</a>
         <a href="#" data-jump="ch4">4. 特例ルール (沖縄/北海道/LINEギフト/AES)</a>
         <a href="#" data-jump="ch5">5. よくある質問 (FAQ)</a>
         <a href="#" data-jump="ch6">6. トラブルシューティング</a>
         <a href="#" data-jump="ch7">7. 管理者向け付録</a>
+        <a href="#" data-jump="ch8">8. 追跡番号 / NE反映タブの手順</a>
       </div>
 
       <h2 id="ch1">1. 3分でわかるこのアプリ</h2>
@@ -573,12 +593,8 @@
         <li>サマリが出る → 「要判断 ◯件」を確認</li>
         <li>伝票一覧から <span class="badge b-warn">要判断</span> の行をクリックして、ダイアログで配送方法・梱包機を選んで「確定」</li>
         <li><b>要判断が0件になったら</b>、CSV出力ボタンが押せるようになる</li>
-        <li>下記のいずれかを押してCSVをダウンロード:
-          <ul>
-            <li><b>CSV出力(〜5/31 MeltLine→手動)</b>: 6月1日のMeltLine本稼働前。MeltLine判定された行は出力時に「手動出荷」に矯正される</li>
-            <li><b>CSV出力(6/1〜 MeltLineそのまま)</b>: 6月1日以降。MeltLineはそのままMeltLineで出力</li>
-          </ul>
-        </li>
+        <li>「<b>📤 CSV出力してロジザードへ（通常）</b>」を押してCSVをダウンロード (MeltLineはそのままMeltLineで出力)。
+          隣の「CSV出力（旧形式: MeltLine→手動）」は2026年6月1日のMeltLine導入前の形式で、MeltLine判定の行を「手動出荷」に矯正して出力します。<b>通常は使いません</b></li>
         <li>ダウンロードしたCSVをロジザードに取り込む</li>
       </ol>
       <div class="note"><b>ヒント</b>: 「取込済みデータを再表示」のドロップダウンで、過去48時間以内の取込バッチを再表示できます。途中で画面を閉じても作業を続行可能。</div>
@@ -741,6 +757,17 @@
 
       <h3>7-9. 引き継ぎ書</h3>
       <p>技術仕様の詳細(DBスキーマ・連動列・コード構成等)は引き継ぎ書を参照: <code>g:/共有ドライブ/AI_reference/システム設計/梱包機振り分け配送方法判定アプリ_引き継ぎ.md</code></p>
+
+      <h2 id="ch8">8. 追跡番号 / NE反映タブの手順</h2>
+      <p>出荷後に、キャリア (ヤマトB2クラウド / ゆうプリR) が発行した<b>追跡番号を伝票に紐付けて、NextEngine に反映する</b>ための画面です。画面のカードは上から作業順に並んでいます。</p>
+      <ol>
+        <li><b>① キャリアCSV取込</b>: 通常は各行の「<b>📥 Driveから取込</b>」ボタンを押すだけです。キャリアソフトが出力してDriveに置かれた最新CSVを自動取得し、追跡番号が伝票に紐付きます (取得元ファイルの更新日時がボタンの下に表示されるので、出荷処理後の時刻になっているか確認)。Driveが使えない時だけ、PCにダウンロードしたCSVを手動アップロードしてください。同じファイルの二重取込は自動で検出されます。</li>
+        <li><b>② 定形外を反映</b>: 定形外郵便は追跡番号が無いためキャリアCSVに出ません。一覧を確認して「<b>✅ すべて反映する</b>」でまとめて反映します。</li>
+        <li><b>③ レターパック</b>: 各行の入力欄に追跡番号を手入力して保存します。サイズ超過等で配送方法を変えたい場合は「配送方法変更」ボタンから。</li>
+        <li><b>④ NE 手動反映用エクスポート</b>: <b>Step 1</b> = 配送方法を1つ選んで「NE 受注番号をコピー」→ NextEngine で一括検索して配送方法を変更 (⚠️必ず配送方法ごとに)。<b>Step 2</b> = 「受注番号+追跡番号 CSV ダウンロード」→ NextEngine の追跡番号CSVインポートに流す (こちらは配送方法混在OK)。</li>
+      </ol>
+      <div class="note"><b>「Drive: 取得エラー」が出たら</b>: Driveフォルダがサービスアカウントに共有されていない可能性があります。管理者に「対象フォルダをサービスアカウントに閲覧者共有」を依頼してください (エラー詳細は <code>/apps/packing-dispatch/api/tracking/drive-file-info</code> をブラウザで開くと確認できます)。</div>
+      <div class="note"><b>「重複: このファイルは既に取込済み」と出たら</b>: 同じ内容のCSVを既に取り込んでいます。Drive更新日時が古いままの場合は、キャリアソフト側のDL/出力がまだ実行されていないか確認してください。</div>
     </div>
   </section>
 </main>
@@ -1744,7 +1771,7 @@ async function runDeleteRecentImports(dryRun){
   const btn = dryRun ? $('#btnDelImportsDry') : $('#btnDelImportsRun');
   const hours = parseInt($('#delImportsHours').value, 10) || 24;
   if(!dryRun){
-    if(!confirm(`直近 ${hours} 時間の追跡番号取込履歴 (B2 / ゆうパケットポストファン) を削除し、同じ CSV を再投入可能にします。実行しますか?`)) return;
+    if(!confirm(`直近 ${hours} 時間の追跡番号取込履歴 (B2 / ゆうパケットパフ) を削除し、同じ CSV を再投入可能にします。実行しますか?`)) return;
     if(!confirm('もう一度確認: 取込履歴 + 該当する配送方法変更ログ (90日 TTL 分のみ) も削除されます。永続集計件数 (pd_tracking_import の カウント) は失われます。実行しますか?')) return;
   }
   btn.disabled = true;
