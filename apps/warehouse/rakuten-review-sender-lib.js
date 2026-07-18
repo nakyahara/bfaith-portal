@@ -58,18 +58,21 @@ export function classifySendError(e) {
   return { kind: 'unknown', code: null };
 }
 
-/**
- * 送信候補の選定 (claim はしない)。ready かつ送信ゲート①〜⑦を満たす action を返す。
- * @returns { eligible: [...], skipped: [{id, action_type, reason}] }
- */
-export function selectEligibleActions(db, { nowIso = new Date().toISOString(), limit = 5 } = {}) {
-  const month = jstDateOf(nowIso).slice(0, 7);
-  const monthlyCoupon = getRegisteredCoupon(db, month);
-  const couponUsable = !!(monthlyCoupon && monthlyCoupon.status === 'issued'
-    && monthlyCoupon.pc_get_url && Date.parse(monthlyCoupon.coupon_end) > Date.parse(nowIso));
+/** 月次クーポンの利用可否 (獲得URLは楽天ドメインの https のみ許可 — Codex C4-R1 Medium:
+ *  台帳の誤登録で楽天外リンクがメールに載る事故を claim 前ゲートで遮断) */
+export function couponUsableCheck(monthlyCoupon, nowIso) {
+  if (!monthlyCoupon || monthlyCoupon.status !== 'issued' || !monthlyCoupon.pc_get_url) return false;
+  if (!(Date.parse(monthlyCoupon.coupon_end) > Date.parse(nowIso))) return false;
+  try {
+    const u = new URL(monthlyCoupon.pc_get_url);
+    return u.protocol === 'https:' && u.hostname === 'coupon.rakuten.co.jp';
+  } catch {
+    return false;
+  }
+}
 
-  const rows = db.prepare(`
-    SELECT a.id, a.action_type, a.dedupe_key, a.order_number, a.scheduled_at, a.expires_at,
+const GATE_SQL = `
+    SELECT a.id, a.action_type, a.dedupe_key, a.order_number, a.scheduled_at, a.expires_at, a.status,
            c.masked_email_enc, c.masked_email_hash, c.purged_at, c.shipping_datetime,
            o.owner,
            EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed,
@@ -78,7 +81,34 @@ export function selectEligibleActions(db, { nowIso = new Date().toISOString(), l
            EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = a.order_number AND r.is_deleted = 0 AND r.rating <= 2) AS has_low_active_review
       FROM rakuten_campaign_actions a
       LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
-      LEFT JOIN rakuten_order_campaign_ownership o ON o.order_number = a.order_number
+      LEFT JOIN rakuten_order_campaign_ownership o ON o.order_number = a.order_number`;
+
+/** ゲート判定 (select 時と claim 時で同一ロジックを共有)。@returns null=通過 / 理由文字列 */
+export function gateReason(a, { nowIso, couponUsable }) {
+  if (a.status !== 'ready') return 'not_ready';
+  if (!(a.scheduled_at <= nowIso && a.expires_at > nowIso)) return 'out_of_window';
+  if (a.owner !== 'self') return 'not_self_ownership'; // 行なし (null) も vendor も送らない (fail-closed)
+  if (a.purged_at || !a.masked_email_enc) return 'contact_unavailable';
+  if (a.is_suppressed) return 'suppressed';
+  if (a.action_type === 'follow' && a.has_review_any) return 'review_exists';
+  if (!a.shipping_datetime) return 'not_shipped';
+  if (a.action_type === 'follow'
+    && followScheduleFor(a.shipping_datetime)?.scheduledAt !== a.scheduled_at) return 'schedule_stale';
+  if (a.action_type === 'coupon' && !a.has_active_review) return 'review_deleted';
+  if (a.action_type === 'coupon' && !couponUsable) return 'no_monthly_coupon';
+  return null;
+}
+
+/**
+ * 送信候補の選定 (claim はしない)。ready かつ送信ゲート①〜⑦を満たす action を返す。
+ * @returns { eligible: [...], skipped: [{id, action_type, reason}] }
+ */
+export function selectEligibleActions(db, { nowIso = new Date().toISOString(), limit = 5 } = {}) {
+  const month = jstDateOf(nowIso).slice(0, 7);
+  const monthlyCoupon = getRegisteredCoupon(db, month);
+  const couponUsable = couponUsableCheck(monthlyCoupon, nowIso);
+
+  const rows = db.prepare(`${GATE_SQL}
      WHERE a.status = 'ready' AND a.scheduled_at <= ? AND a.expires_at > ?
      ORDER BY a.scheduled_at, a.id
   `).all(nowIso, nowIso);
@@ -86,45 +116,66 @@ export function selectEligibleActions(db, { nowIso = new Date().toISOString(), l
   const eligible = [], skipped = [];
   for (const a of rows) {
     if (eligible.length >= limit) break;
-    let reason = null;
-    if (a.owner !== 'self') reason = 'not_self_ownership'; // 行なし (null) も vendor も送らない
-    else if (a.purged_at || !a.masked_email_enc) reason = 'contact_unavailable';
-    else if (a.is_suppressed) reason = 'suppressed';
-    else if (a.action_type === 'follow' && a.has_review_any) reason = 'review_exists';
-    else if (!a.shipping_datetime) reason = 'not_shipped';
-    else if (a.action_type === 'follow'
-      && followScheduleFor(a.shipping_datetime)?.scheduledAt !== a.scheduled_at) reason = 'schedule_stale';
-    else if (a.action_type === 'coupon' && !a.has_active_review) reason = 'review_deleted';
-    else if (a.action_type === 'coupon' && !couponUsable) reason = 'no_monthly_coupon';
+    const reason = gateReason(a, { nowIso, couponUsable });
     if (reason) { skipped.push({ id: a.id, action_type: a.action_type, reason }); continue; }
     eligible.push({ ...a, monthlyCoupon: a.action_type === 'coupon' ? monthlyCoupon : null });
   }
   return { eligible, skipped, monthlyCouponReady: couponUsable };
 }
 
-/** claim (CAS) + attempt 予約を単一トランザクションで。@returns messageId | null (=claim負け) */
-export function claimAction(db, action, nowIso = new Date().toISOString()) {
-  const messageId = messageIdFor(action.id, action.dedupe_key);
+/**
+ * ゲート付き claim: 単一トランザクション内で全ゲートを再評価してから ready→claimed + attempt 予約
+ * (Codex C4-R1 High: select と claim の間に ownership/suppression/レビュー/purge/発送日が
+ * 変わる TOCTOU を、書きロック (immediate tx) 内の再検証で塞ぐ)。
+ * @returns { messageId, fresh } | { gateFailed: reason } | { claimLost: true }
+ */
+export function claimActionGuarded(db, actionId, nowIso = new Date().toISOString()) {
   const claimToken = crypto.randomBytes(8).toString('hex');
   const tx = db.transaction(() => {
+    const a = db.prepare(`${GATE_SQL} WHERE a.id = ?`).get(actionId);
+    if (!a) throw Object.assign(new Error('gone'), { gateFailed: 'not_found' });
+    const month = jstDateOf(nowIso).slice(0, 7);
+    const monthlyCoupon = a.action_type === 'coupon' ? getRegisteredCoupon(db, month) : null;
+    const couponUsable = a.action_type === 'coupon' ? couponUsableCheck(monthlyCoupon, nowIso) : true;
+    const reason = gateReason(a, { nowIso, couponUsable });
+    if (reason) throw Object.assign(new Error(reason), { gateFailed: reason });
+    const messageId = messageIdFor(a.id, a.dedupe_key);
     const r = db.prepare(`
       UPDATE rakuten_campaign_actions
          SET status = 'claimed', claim_token = ?, claimed_at = ?, updated_at = ?
        WHERE id = ? AND status = 'ready'
-    `).run(claimToken, nowIso, nowIso, action.id);
+    `).run(claimToken, nowIso, nowIso, a.id);
     if (r.changes !== 1) throw Object.assign(new Error('claim race lost'), { claimLost: true });
     db.prepare(`
       INSERT INTO rakuten_campaign_delivery_attempts (action_id, message_id, attempted_at, outcome)
       VALUES (?, ?, ?, 'ambiguous')
-    `).run(action.id, messageId, nowIso);
+    `).run(a.id, messageId, nowIso);
+    return { messageId, fresh: { ...a, monthlyCoupon } };
   });
   try {
-    tx.immediate();
-    return messageId;
+    return tx.immediate();
   } catch (e) {
-    if (e.claimLost || /UNIQUE/i.test(String(e.message))) return null; // 既にattempt済み=絶対に送らない
+    if (e.gateFailed) return { gateFailed: e.gateFailed };
+    if (e.claimLost || /UNIQUE/i.test(String(e.message))) return { claimLost: true }; // attempt既存=絶対に送らない
     throw e;
   }
+}
+
+/**
+ * claimed のまま残留した action の回収 (Codex C4-R1 High: claim commit 後のクラッシュは
+ * SMTP 実行有無を断定できない → ambiguous に収束させ、人が確認するまで送信を始めない)。
+ * @returns 回収件数
+ */
+export function recoverStaleClaims(db, nowIso = new Date().toISOString()) {
+  const tx = db.transaction(() => {
+    const rows = db.prepare(`SELECT id FROM rakuten_campaign_actions WHERE status = 'claimed'`).all();
+    for (const { id } of rows) {
+      db.prepare(`UPDATE rakuten_campaign_delivery_attempts SET note = 'stale_claim_recovered' WHERE action_id = ? AND note IS NULL`).run(id);
+      db.prepare(`UPDATE rakuten_campaign_actions SET status = 'ambiguous', status_reason = 'stale_claim', updated_at = ? WHERE id = ? AND status = 'claimed'`).run(nowIso, id);
+    }
+    return rows.length;
+  });
+  return tx.immediate();
 }
 
 /** 送信結果の確定 (claimed → sent / failed_safe) */
@@ -173,8 +224,15 @@ export function buildMailForAction(action, nowIso = new Date().toISOString()) {
  * @returns { sent, failedSafe, ambiguous, skipped, claimLost, details } (宛先・注文番号は含まない)
  */
 export async function processReadyActions(db, { keys, sendFn, nowIso = new Date().toISOString(), limit = 5 }) {
+  // claimed 残留の回収が先 (あれば送信を始めない — 人の確認が先)
+  const staleRecovered = recoverStaleClaims(db, nowIso);
+  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: 0, claimLost: 0, gateFailed: 0, staleRecovered, details: [] };
+  if (staleRecovered > 0) {
+    out.details.push({ result: 'stale_claims_recovered', count: staleRecovered });
+    return out;
+  }
   const { eligible, skipped } = selectEligibleActions(db, { nowIso, limit });
-  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: skipped.length, claimLost: 0, details: [] };
+  out.skipped = skipped.length;
   for (const action of eligible) {
     // 復号は claim 前 (復号できないものを claim して枯らさない)。宛先は変数スコープ外に出さない
     let to;
@@ -185,22 +243,25 @@ export async function processReadyActions(db, { keys, sendFn, nowIso = new Date(
       out.details.push({ id: action.id, result: 'skip', reason: 'contact_undecryptable' });
       continue;
     }
-    const mail = buildMailForAction(action, nowIso);
-    const messageId = claimAction(db, action, nowIso);
-    if (!messageId) { out.claimLost++; out.details.push({ id: action.id, result: 'claim_lost' }); continue; }
+    // claim は tx 内で全ゲート再評価 (TOCTOU 防止)。文面は tx 内の最新スナップショットから生成
+    const claim = claimActionGuarded(db, action.id, nowIso);
+    if (claim.gateFailed) { out.gateFailed++; out.details.push({ id: action.id, result: 'gate_failed', reason: claim.gateFailed }); continue; }
+    if (claim.claimLost) { out.claimLost++; out.details.push({ id: action.id, result: 'claim_lost' }); continue; }
+    const mail = buildMailForAction(claim.fresh, nowIso);
     try {
-      await sendFn({ to, from: `"${SHOP_NAME}" <${FROM_ADDRESS}>`, subject: mail.subject, text: mail.text, messageId });
-      finalizeAttempt(db, { actionId: action.id, outcome: 'accepted', smtpCode: 250, nowIso });
+      await sendFn({ to, from: `"${SHOP_NAME}" <${FROM_ADDRESS}>`, subject: mail.subject, text: mail.text, messageId: claim.messageId });
+      // note には固定分類のみ (SMTPエラー原文は宛先が混入し得るため保存しない — Codex C4-R1 Medium)
+      finalizeAttempt(db, { actionId: action.id, outcome: 'accepted', smtpCode: null, nowIso });
       out.sent++;
       out.details.push({ id: action.id, result: 'sent', type: action.action_type });
     } catch (e) {
       const cls = classifySendError(e);
       if (cls.kind === 'rejected') {
-        finalizeAttempt(db, { actionId: action.id, outcome: 'rejected', smtpCode: cls.code, note: String(e.message).slice(0, 120), nowIso });
+        finalizeAttempt(db, { actionId: action.id, outcome: 'rejected', smtpCode: cls.code, note: 'smtp_rejected', nowIso });
         out.failedSafe++;
         out.details.push({ id: action.id, result: 'failed_safe', code: cls.code });
       } else {
-        markAmbiguous(db, { actionId: action.id, note: String(e.message).slice(0, 120), nowIso });
+        markAmbiguous(db, { actionId: action.id, note: 'smtp_unknown', nowIso });
         out.ambiguous++;
         out.details.push({ id: action.id, result: 'ambiguous' });
         break; // 結果不明は即中断 — 続行しない (設計: 自動再送禁止・人に確認)

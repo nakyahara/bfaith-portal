@@ -50,19 +50,30 @@ function openDb() {
   return db;
 }
 
-async function notifyAmbiguous(count) {
+/** ambiguous 系の人手確認依頼。通知は安全機構の一部 (Codex C4-R1 Medium) — 失敗を握り潰さず
+ *  stderr に明示する (本処理は既に exitCode 1 の経路でのみ呼ばれる)。@returns 通知成功か */
+async function notifyOperator(text) {
   const webhook = (process.env.GCHAT_WEBHOOK_MALL_FETCH || process.env.GCHAT_WEBHOOK || '').trim();
-  if (!webhook) return;
+  if (!webhook) {
+    console.error('[notify] ⚠️GCHAT_WEBHOOK_MALL_FETCH 未設定のため GChat 通知できません (このログが唯一の通知です)');
+    return false;
+  }
   try {
-    await fetch(webhook, {
+    const res = await fetch(webhook, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-      body: JSON.stringify({
-        text: `⚠️ 楽天レビューメール送信で結果不明 (ambiguous) ${count}件。自動再送はしません。miniPCで delivery_attempts と実際の到達を確認してください`,
-      }),
+      body: JSON.stringify({ text }),
       signal: AbortSignal.timeout(10000),
     });
-  } catch { /* 通知失敗は本処理を止めない */ }
+    if (!res.ok) {
+      console.error(`[notify] ⚠️GChat 通知失敗 (HTTP ${res.status})。このログが唯一の通知です`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error(`[notify] ⚠️GChat 通知失敗 (${e.message})。このログが唯一の通知です`);
+    return false;
+  }
 }
 
 try {
@@ -71,7 +82,9 @@ try {
     try {
       const { eligible, skipped, monthlyCouponReady } = selectEligibleActions(db, { limit: 1000 });
       const ready = db.prepare(`SELECT action_type, COUNT(*) n FROM rakuten_campaign_actions WHERE status = 'ready' GROUP BY action_type`).all();
+      const claimed = db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_actions WHERE status = 'claimed'`).get().n;
       console.log(`[send-plan] ready 総数: ${ready.map((r) => `${r.action_type}=${r.n}`).join(' / ') || '0'}`);
+      if (claimed > 0) console.log(`[send-plan] ⚠️claimed 残留 ${claimed}件 (前回クラッシュの疑い。次回 send 冒頭で ambiguous に回収されます)`);
       console.log(`[send-plan] 今すぐ送信可能 (全ゲート通過): ${eligible.length}件`);
       const reasons = new Map();
       for (const s of skipped) reasons.set(s.reason, (reasons.get(s.reason) || 0) + 1);
@@ -122,11 +135,17 @@ try {
         sendFn: ({ to, from, subject, text, messageId }) =>
           transport.sendMail({ from, to, subject, text, messageId }),
       });
-      console.log(`[send] 送信 ${result.sent} / 明確な失敗 ${result.failedSafe} / 結果不明 ${result.ambiguous} / skip ${result.skipped} / claim競り負け ${result.claimLost}`);
-      if (result.ambiguous > 0) {
-        await notifyAmbiguous(result.ambiguous);
-        console.error('[send] ⚠️結果不明が発生したため中断しました。実際の到達を確認するまで再実行しないでください');
+      if (result.staleRecovered > 0) {
+        await notifyOperator(`⚠️ 楽天レビューメール: 前回クラッシュの claimed 残留 ${result.staleRecovered}件を ambiguous に回収しました。実際の到達を確認するまで送信は開始しません (今回の送信は 0件で中断)`);
+        console.error(`[send] ⚠️claimed 残留 ${result.staleRecovered}件を回収。到達確認が済むまで送信しません`);
         process.exitCode = 1;
+      } else {
+        console.log(`[send] 送信 ${result.sent} / 明確な失敗 ${result.failedSafe} / 結果不明 ${result.ambiguous} / skip ${result.skipped} / ゲート再評価落ち ${result.gateFailed} / claim競り負け ${result.claimLost}`);
+        if (result.ambiguous > 0) {
+          await notifyOperator(`⚠️ 楽天レビューメール送信で結果不明 (ambiguous) ${result.ambiguous}件。自動再送はしません。miniPCで delivery_attempts と実際の到達を確認してください`);
+          console.error('[send] ⚠️結果不明が発生したため中断しました。実際の到達を確認するまで再実行しないでください');
+          process.exitCode = 1;
+        }
       }
     } finally {
       transport.close();

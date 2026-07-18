@@ -13,7 +13,8 @@ import {
   messageIdFor, SHOP_NAME,
 } from './rakuten-review-mail-lib.js';
 import {
-  classifySendError, selectEligibleActions, claimAction, processReadyActions,
+  classifySendError, selectEligibleActions, claimActionGuarded, processReadyActions,
+  recoverStaleClaims, couponUsableCheck, finalizeAttempt,
 } from './rakuten-review-sender-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey, upsertContacts, addSuppression,
@@ -225,6 +226,58 @@ console.log('=== 4. 送信処理 (偽SMTP注入) ===');
   // PII: 結果オブジェクトに宛先・注文番号が含まれない
   const dump = JSON.stringify([r1, r3, r4, r5, r6]);
   check('結果サマリにメールアドレス・注文番号なし', !dump.includes('@anshin') && !dump.includes('373343-'));
+
+  // note は固定分類のみ (SMTPエラー原文=宛先混入リスクを保存しない)
+  check('failed_safe の note は固定値 smtp_rejected', db.prepare(`
+    SELECT d.note FROM rakuten_campaign_delivery_attempts d JOIN rakuten_campaign_actions a ON a.id = d.action_id
+     WHERE a.status = 'failed_safe'`).get().note === 'smtp_rejected');
+  check('ambiguous の note は固定値 smtp_unknown', db.prepare(`
+    SELECT d.note FROM rakuten_campaign_delivery_attempts d JOIN rakuten_campaign_actions a ON a.id = d.action_id
+     WHERE a.status = 'ambiguous'`).get().note === 'smtp_unknown');
+  check('成功時の smtp_code は null (実応答を偽装しない)', db.prepare(`
+    SELECT d.smtp_code FROM rakuten_campaign_delivery_attempts d JOIN rakuten_campaign_actions a ON a.id = d.action_id
+     WHERE a.status = 'sent' LIMIT 1`).get().smtp_code === null);
+}
+
+console.log('=== 5. R1対応: TOCTOU / claimed残留回収 / クーポンURL検証 ===');
+{
+  // TOCTOU: select 通過後に ownership が vendor に変わったら claim 内の再評価で弾く
+  const toc = makeOrder({});
+  const tocId = makeAction({ orderNumber: toc.orderNumber });
+  const sel = selectEligibleActions(db, { nowIso: NOW, limit: 100 });
+  check('前提: TOCTOU対象が eligible', sel.eligible.some((e) => e.id === tocId));
+  db.prepare(`UPDATE rakuten_order_campaign_ownership SET owner = 'vendor' WHERE order_number = ?`).run(toc.orderNumber);
+  const denied = claimActionGuarded(db, tocId, NOW);
+  check('claim内再評価で拒否 (gateFailed=not_self_ownership)', denied.gateFailed === 'not_self_ownership');
+  check('action は ready のまま・attempt 予約なし',
+    db.prepare(`SELECT status FROM rakuten_campaign_actions WHERE id = ?`).get(tocId).status === 'ready'
+    && db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_delivery_attempts WHERE action_id = ?`).get(tocId).n === 0);
+  db.prepare(`UPDATE rakuten_order_campaign_ownership SET owner = 'self' WHERE order_number = ?`).run(toc.orderNumber);
+  const granted = claimActionGuarded(db, tocId, NOW);
+  check('条件復帰後は claim 成功 (messageId+最新スナップショット)', !!granted.messageId && granted.fresh.id === tocId);
+  finalizeAttempt(db, { actionId: tocId, outcome: 'accepted', nowIso: NOW });
+
+  // claimed 残留の回収: 送信を開始せず ambiguous に収束
+  const fresh = makeOrder({});
+  const freshId = makeAction({ orderNumber: fresh.orderNumber });
+  const stale = makeOrder({});
+  const staleId = makeAction({ orderNumber: stale.orderNumber });
+  const c = claimActionGuarded(db, staleId, NOW); // claim したままクラッシュした体
+  check('前提: claimed 作成', !!c.messageId);
+  const sentMails2 = [];
+  const rRec = await processReadyActions(db, { keys, sendFn: async (m) => { sentMails2.push(m); }, nowIso: NOW, limit: 100 });
+  check('claimed 残留を ambiguous に回収し、送信は開始しない', rRec.staleRecovered === 1 && rRec.sent === 0 && sentMails2.length === 0
+    && db.prepare(`SELECT status, status_reason FROM rakuten_campaign_actions WHERE id = ?`).get(staleId).status === 'ambiguous'
+    && db.prepare(`SELECT note FROM rakuten_campaign_delivery_attempts WHERE action_id = ?`).get(staleId).note === 'stale_claim_recovered');
+  check('回収後の再実行で通常送信が再開', (await processReadyActions(db, { keys, sendFn: async (m) => { sentMails2.push(m); }, nowIso: NOW, limit: 100 })).sent >= 1
+    && db.prepare(`SELECT status FROM rakuten_campaign_actions WHERE id = ?`).get(freshId).status === 'sent');
+
+  // クーポンURL検証 (楽天ドメイン https のみ)
+  check('couponUsableCheck: 楽天以外・http は拒否',
+    couponUsableCheck({ status: 'issued', pc_get_url: 'https://evil.example.com/x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
+    && couponUsableCheck({ status: 'issued', pc_get_url: 'http://coupon.rakuten.co.jp/getCoupon?getkey=x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
+    && couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === true);
+  check('recoverStaleClaims: claimed なしなら 0', recoverStaleClaims(db, NOW) === 0);
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
