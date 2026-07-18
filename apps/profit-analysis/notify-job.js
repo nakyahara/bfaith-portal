@@ -32,7 +32,7 @@ const JST_WEEKDAYS = ['日', '月', '火', '水', '木', '金', '土'];
  *   1万未満:    「7,500円」
  *   負値も対応: 「-75万円」
  */
-function fmtYen(n) {
+export function fmtYen(n) {
   const v = Math.round(Number(n) || 0);
   const sign = v < 0 ? '-' : '';
   const abs = Math.abs(v);
