@@ -17,13 +17,21 @@
  * 外部API同期 (Step 2)・返信送信 (Step 3〜5)・ロック (Step 6)・AI (Step 7) は未実装。
  * external_status / 最終同期日時 は表示のみ (同期実装前は seed 値がそのまま出る)。
  */
+import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
-import { listOutboxIssues, resolveUnknown, cancelJob } from './outbox.js';
+import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
+
+// 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
+// ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
+const replyEditorEnabled = () => {
+  const v = process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
+  return v === 'true' || v === '1';
+};
 
 const router = Router();
 
@@ -48,6 +56,7 @@ const stBadge = st => badge(STATUSES[st], null) || he(st);
 const ACTION_LABELS = {
   status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
   attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
+  reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
 };
 function fmtLogValue(key, v) {
   switch (key) {
@@ -178,6 +187,35 @@ router.get('/inquiries/:id', (req, res) => {
       ${draft.notes ? `<div class="sub">注意: ${he(draft.notes)}</div>` : ''}
     </div>` : '';
 
+  // ─── 返信エディタ (Dark Launch。設計書§7.1#3) ───
+  // 送信ジョブは作成時点では pending。送信ワーカー (Step 3〜) が拾うまで実送信されない
+  const outboxJobs = getDB().prepare(
+    'SELECT * FROM outbox_replies WHERE inquiry_id = ? ORDER BY id DESC LIMIT 10').all(inq.id);
+  const activeJob = outboxJobs.find(o => ['pending', 'sending', 'needs_review'].includes(o.status)
+    || (o.status === 'unknown' && !o.resolution));
+  const jobBadge = o => {
+    const meta = OUTBOX_STATUS_LABELS[o.status] || { label: o.status, style: 'background:#f1f5f9;color:#475569' };
+    return `<span class="badge" style="${meta.style}">${he(meta.label)}</span>`;
+  };
+  const outboxHtml = outboxJobs.length ? `
+    <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
+    ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>
+      <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span></div>`).join('')}` : '';
+  const replyPanel = replyEditorEnabled() ? `
+      <div class="panel">
+        <h3>✉️ 返信を作成</h3>
+        <div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">
+          ⚠️ 送信ワーカーは準備中です。作成した返信ジョブはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>
+        ${outboxHtml}
+        ${activeJob
+          ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
+          : `<textarea id="replyBody" rows="6" placeholder="返信本文 (テンプレートは📄タブからコピーして貼り付け)"></textarea>
+        <div class="row" style="margin-top:8px; justify-content:flex-end">
+          <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
+        </div>`}
+      </div>` : `
+      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>`;
+
   const body = `
   <div class="detail-head">
     <a href="/apps/inquiry-hub">← 一覧に戻る</a>
@@ -186,7 +224,7 @@ router.get('/inquiries/:id', (req, res) => {
   <div class="detail-grid">
     <div class="thread">
       ${msgHtml || '<div class="empty">メッセージがありません</div>'}
-      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>
+      ${replyPanel}
     </div>
     <div class="side">
       <div class="panel">
@@ -268,6 +306,22 @@ router.get('/inquiries/:id', (req, res) => {
     btn.disabled = true;
     post('/notes', { body: body }).then(function() { location.reload(); })
       .catch(function(e) { btn.disabled = false; toast('追加失敗: ' + e.message); });
+  });
+  // 返信ジョブ作成 (Dark Launch時のみボタンが存在)。操作IDはページ描画時にサーバーが採番
+  // → 同じ画面からの再送信 (リトライ) は冪等、新しい返信はリロード後の新IDで作成
+  var REPLY_OP_ID = ${JSON.stringify(crypto.randomUUID())};
+  var REPLY_BASE_REV = ${Number(inq.conversation_rev) || 0};
+  var REPLY_CH = ${JSON.stringify((CHANNELS[inq.channel_type] || {}).label || inq.channel_type).replace(/</g, '\\u003c')};
+  var replyBtn = document.getElementById('replyBtn');
+  if (replyBtn) replyBtn.addEventListener('click', function() {
+    var body = document.getElementById('replyBody').value.trim();
+    if (!body) { toast('本文が空です'); return; }
+    var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
+    if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客\\n\\n' + preview)) return;
+    replyBtn.disabled = true;
+    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV })
+      .then(function(r) { toast(r.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました'); setTimeout(function(){ location.reload(); }, 900); })
+      .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
 
   res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, 'list', body, script));
@@ -357,6 +411,31 @@ router.post('/api/inquiries/:id/ai-flag', (req, res) => {
     getDB().prepare(`UPDATE inquiries SET ai_needed = ?, updated_at = ${NOW_SQL} WHERE id = ?`).run(v, inq.id);
   });
   res.json({ ok: true });
+});
+
+// 返信ジョブ作成 (Dark Launch。設計書§7.1#3 / §8.3)。実際の送信は送信ワーカー (Step 3〜) が担う
+router.post('/api/inquiries/:id/reply', (req, res) => {
+  if (!replyEditorEnabled()) return res.status(403).json({ error: '返信機能は現在無効です (INQUIRY_HUB_REPLY_EDITOR_ENABLED)' });
+  const inq = loadInquiry(req, res); if (!inq) return;
+  const body = String((req.body || {}).body || '').trim();
+  const opId = String((req.body || {}).clientOperationId || '');
+  const baseRev = Number((req.body || {}).baseConversationRev);
+  if (!body) return res.status(400).json({ error: '本文が空です' });
+  if (body.length > 10000) return res.status(400).json({ error: '本文が長すぎます (10000文字まで)' });
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(opId)) {
+    return res.status(400).json({ error: '不正な操作IDです (画面を再読み込みしてください)' });
+  }
+  if (!Number.isInteger(baseRev)) return res.status(400).json({ error: '不正なリクエストです (baseConversationRev)' });
+  try {
+    const r = createReplyJob({
+      inquiryId: inq.id, channelType: inq.channel_type, bodyText: body,
+      createdBy: actorOf(req), clientOperationId: opId, baseConversationRev: baseRev,
+    });
+    if (r.conflict) return res.status(409).json({ error: r.conflict });
+    res.json({ ok: true, id: r.id, duplicate: !r.created });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
 });
 
 router.post('/api/inquiries/:id/notes', (req, res) => {
@@ -806,6 +885,9 @@ const OUTBOX_STATUS_LABELS = {
   needs_review: { label: '⏸️要確認 (新着競合)', style: 'background:#e0e7ff;color:#3730a3' },
   failed: { label: '❌送信失敗', style: 'background:#fee2e2;color:#b91c1c' },
   pending: { label: '⏳送信待ち', style: 'background:#f1f5f9;color:#475569' },
+  sending: { label: '📤送信中', style: 'background:#dbeafe;color:#1d4ed8' },
+  sent: { label: '✅送信済み', style: 'background:#dcfce7;color:#166534' },
+  cancelled: { label: '🚫取消済み', style: 'background:#f1f5f9;color:#64748b' },
 };
 
 router.get('/admin', (req, res) => {

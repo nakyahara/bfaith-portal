@@ -173,6 +173,50 @@ console.log('4. 同期エラー解決');
   check('解決後は要対応リストから消える', !html.includes('❓結果不明') && !html.includes('接続失敗'));
 }
 
+// ─── 5. 返信エディタ (Dark Launch) ───
+console.log('5. 返信エディタ');
+{
+  const { randomUUID } = await import('crypto');
+  // フラグOFF (既定): UIも APIも無効
+  delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
+  const htmlOff = await (await fetch(base + `/inquiries/${inq}`)).text();
+  check('フラグOFF: エディタ非表示 (プレースホルダのみ)', !htmlOff.includes('id="replyBody"') && htmlOff.includes('返信機能は Step 3 以降で実装'));
+  const rOff = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: 1 });
+  check('フラグOFF: APIは403', rOff.status === 403);
+
+  // フラグON
+  process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED = 'true';
+  const htmlOn = await (await fetch(base + `/inquiries/${inq}`)).text();
+  check('フラグON: エディタ表示+ワーカー未稼働の警告', htmlOn.includes('id="replyBody"') && htmlOn.includes('送信ワーカーは準備中'));
+  check('送信ジョブ履歴が表示される (failedになったジョブ)', htmlOn.includes('❌送信失敗'));
+
+  const rEmpty = await jpost(`/api/inquiries/${inq}/reply`, { body: '  ', clientOperationId: randomUUID(), baseConversationRev: 1 });
+  check('空本文は400', rEmpty.status === 400);
+  const rBadOp = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: 'not-a-uuid', baseConversationRev: 1 });
+  check('不正な操作IDは400', rBadOp.status === 400);
+  const rTooLong = await jpost(`/api/inquiries/${inq}/reply`, { body: 'あ'.repeat(10001), clientOperationId: randomUUID(), baseConversationRev: 1 });
+  check('10000字超は400', rTooLong.status === 400);
+  const rBadRevType = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: '1.5' });
+  check('非整数のbaseConversationRevは400', rBadRevType.status === 400);
+  const rBadRev = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: 99 });
+  check('rev不一致 (新着競合) は409', rBadRev.status === 409);
+
+  const opId = randomUUID();
+  const rOk = await jpost(`/api/inquiries/${inq}/reply`, { body: 'ご返金いたします', clientOperationId: opId, baseConversationRev: 1 });
+  const jOk = await rOk.json();
+  check('返信ジョブ作成が成功', rOk.status === 200 && jOk.ok === true && !jOk.duplicate);
+  const jobRow = db.prepare('SELECT status, body_text, created_by FROM outbox_replies WHERE id = ?').get(jOk.id);
+  check('pending で作成される (ワーカー稼働まで送信されない)', jobRow.status === 'pending' && jobRow.body_text === 'ご返金いたします');
+  const rDup = await jpost(`/api/inquiries/${inq}/reply`, { body: 'ご返金いたします', clientOperationId: opId, baseConversationRev: 1 });
+  check('同一操作IDの再POSTは冪等 (duplicate)', rDup.status === 200 && (await rDup.json()).duplicate === true);
+  const rSecond = await jpost(`/api/inquiries/${inq}/reply`, { body: '別の返信', clientOperationId: randomUUID(), baseConversationRev: 1 });
+  check('未決着ジョブがある間は新規作成409 (1問い合わせ1送信)', rSecond.status === 409);
+  const htmlActive = await (await fetch(base + `/inquiries/${inq}`)).text();
+  check('未決着ジョブ中はフォームの代わりに案内表示', htmlActive.includes('未決着の送信ジョブ') && !htmlActive.includes('id="replyBody"'));
+  check('運用管理の要対応に⏳送信待ちで出る', (await (await fetch(base + '/admin')).text()).includes('⏳送信待ち'));
+  delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
+}
+
 check('DBは一時サブディレクトリのみに作成 (ベース直下に漏れない)',
   fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
 
