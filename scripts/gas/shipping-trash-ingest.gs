@@ -79,6 +79,16 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
     var invoices = files.filter(function (f) {
       return /納品書/.test(f.getName()) && f.getMimeType() === "application/pdf";
     });
+    // 同名・同サイズの納品書PDFは同一内容の複製 (過去の変換ジャンク・二重アップロード) と
+    // みなし1つに絞る (2026-07-18: Drive APIがv3だった時期の実行が元と同名のPDFコピーを
+    // 残しており、全バッチが「2ファイル×同一伝票」で重複検出になった)
+    var seenInvoiceKey = {};
+    invoices = invoices.filter(function (f) {
+      var k = f.getName() + "::" + f.getSize();
+      if (seenInvoiceKey[k]) return false;
+      seenInvoiceKey[k] = true;
+      return true;
+    });
     var rows = [];
     if (invoices.length === 0) {
       failReason = "納品書PDFなし(誤配置?)";
