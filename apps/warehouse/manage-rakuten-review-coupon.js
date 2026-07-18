@@ -82,11 +82,23 @@ try {
         const clearFailure = !r.ok && r.http >= 400 && r.http < 500
           && (r.systemStatus === 'NG' || r.errors.length > 0);
         if (r.ok && r.couponCode && r.pcGetUrl) {
-          const marked = markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl });
+          // markIssued は false 返却 (0行更新) も throw (UNIQUE違反・I/O障害) もあり得る。
+          // どちらでも発行済みのフル値を失わない (Codex C3-R2 Medium + C3-R3 High)。
+          // note 書き込み自体も失敗し得るため、最後の手段としてコンソールにフル値を出す
+          let marked = false, markError = null;
+          try {
+            marked = markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl });
+          } catch (e) {
+            markError = e;
+          }
           if (!marked) {
-            // 発行は成功しているのに台帳確定に失敗 (並行変更等)。復旧用にフル値を note へ (Codex C3-R2 Medium)
-            notePendingAmbiguous(db, month, `発行成功済みだが台帳確定失敗。code=${r.couponCode} url=${r.pcGetUrl}`);
-            throw new Error(`発行は成功したが台帳確定に失敗 (${month})。台帳の note にフル値を記録済み — 手動で status/coupon_code を確認・修正して`);
+            const recovery = `発行成功済みだが台帳確定失敗${markError ? ` (${String(markError.message).slice(0, 80)})` : ''}。code=${r.couponCode} url=${r.pcGetUrl}`;
+            try {
+              notePendingAmbiguous(db, month, recovery);
+            } catch {
+              console.error(`[coupon] ⚠️台帳への復旧情報記録も失敗。手動控え用フル値: month=${month} code=${r.couponCode} url=${r.pcGetUrl}`);
+            }
+            throw new Error(`発行は成功したが台帳確定に失敗 (${month}${markError ? `: ${markError.message}` : ''})。復旧情報は台帳 note (または上記コンソール出力) — 手動で status/coupon_code を確認・修正して`);
           }
           console.log(`[coupon] ✅発行成功: code=${maskCode(r.couponCode)} url=${maskUrl(r.pcGetUrl)} (フル値は台帳に記録済み)`);
         } else if (clearFailure) {
