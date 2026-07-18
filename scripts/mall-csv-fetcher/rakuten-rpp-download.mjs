@@ -505,6 +505,11 @@ async function main() {
             error: e.message, url: page.url(), screenshot,
           });
           if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+          // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+          // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+          if (/app_login_error|system_error/.test(page.url())) {
+            throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+          }
           break; // 同レポートの他の月も同じ原因で落ちる可能性大 → 無駄打ちしない (別レポートは試す)
         }
       }

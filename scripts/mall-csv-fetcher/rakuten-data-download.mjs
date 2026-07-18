@@ -501,6 +501,11 @@ async function main() {
         outcomes.push({ spec: 'item', ym: dateIso, status: 'error' });
         failures.push({ reportType: 'rdata_item_daily', ym: dateIso, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_item_${dateIso}_error.png`) });
         if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+        // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+        // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+        if (/app_login_error|system_error/.test(page.url())) {
+          throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+        }
         break; // 同レポートの残り日も同原因の可能性大 (店舗日次は試す)
       }
     }
@@ -516,6 +521,11 @@ async function main() {
         outcomes.push({ spec: 'store', ym: month.ym, status: 'error' });
         failures.push({ reportType: 'rdata_store_daily', ym: month.ym, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_store_${month.ym}_error.png`) });
         if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+        // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+        // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+        if (/app_login_error|system_error/.test(page.url())) {
+          throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+        }
         break;
       }
     }
@@ -552,6 +562,11 @@ async function main() {
           outcomes.push({ spec: spec.key, ym: ymLabel, status: 'error' });
           failures.push({ reportType: spec.reportType, ym: ymLabel, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_${spec.key}_${ymLabel}_error.png`) });
           if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+          // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+          // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+          if (/app_login_error|system_error/.test(page.url())) {
+            throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+          }
           break; // 同種の残り期間はスキップ (他種は続行)
         }
       }
