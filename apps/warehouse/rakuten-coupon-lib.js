@@ -159,13 +159,14 @@ function monthStartJst(month, addMonths = 0) {
  * 月次クーポン (対象月の月初〜翌々月末) のパラメータ。
  * couponStartDate は API 制約 (now+60分〜now+30日) に収まるよう調整:
  *   - 月初がまだ先 → 月初 00:00 JST (30日超先ならエラー)
- *   - 月初を過ぎている (当月途中の発行) → now+61分 (分単位切り上げ)
+ *   - 月初を過ぎている (当月途中の発行) → now+90分 (分単位切り上げ。
+ *     Codex C3-R1 Medium: 61分だとキュー待ち・タイムアウトで送信時に60分条件を割り得る)
  */
 export function monthlyCouponParams(month, nowIso = new Date().toISOString()) {
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month))) throw new Error(`月の指定が不正 (${month}、YYYY-MM)`);
   const nowMs = Date.parse(nowIso);
   const monthStartMs = Date.parse(`${monthStartJst(month)}T00:00:00+09:00`);
-  const minStartMs = nowMs + 61 * 60000;
+  const minStartMs = nowMs + 90 * 60000;
   if (monthStartMs > nowMs + 30 * DAY_MS) {
     throw new Error(`couponStartDate は30日先まで (対象月 ${month} の月初が遠すぎる)。発行は月初の30日前以降に`);
   }
@@ -186,14 +187,21 @@ export function monthlyCouponParams(month, nowIso = new Date().toISOString()) {
 }
 
 // ─── 台帳 (C4 のメール文面が獲得URLを参照する正本) ───
+// at-most-once 発行の予約方式 (Codex C3-R1 Critical/High):
+//   ① reserveMonth = 月行を status='pending' で原子的に INSERT (PK衝突=他プロセスが予約/発行済み→中止)
+//   ② API 呼び出し (リトライなし — 非冪等 POST を自動再送すると多重発行する)
+//   ③ 成功 → markIssued / 明確な失敗 → releaseReservation / 結果不明 (timeout等)
+//      → pending を残して人が coupon.search で確認 (自動再発行させない)
 export function ensureCouponRegistry(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_coupons (
     month        TEXT PRIMARY KEY CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'),
-    coupon_code  TEXT NOT NULL UNIQUE,
-    pc_get_url   TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('pending','issued')),
+    coupon_code  TEXT UNIQUE,
+    pc_get_url   TEXT,
     coupon_start TEXT NOT NULL,
     coupon_end   TEXT NOT NULL,
-    issued_at    TEXT NOT NULL,
+    reserved_at  TEXT NOT NULL,
+    issued_at    TEXT,
     note         TEXT
   )`);
 }
@@ -202,25 +210,54 @@ export function getRegisteredCoupon(db, month) {
   return db.prepare(`SELECT * FROM rakuten_campaign_coupons WHERE month = ?`).get(month) || null;
 }
 
-/** 発行成功後の台帳記録。同月の二重発行は PK が拒否 (上書きしない — 事故時は手動で行削除が明示操作) */
-export function recordIssuedCoupon(db, { month, couponCode, pcGetUrl, couponStart, couponEnd, nowIso = new Date().toISOString(), note = null }) {
-  db.prepare(`
-    INSERT INTO rakuten_campaign_coupons (month, coupon_code, pc_get_url, coupon_start, coupon_end, issued_at, note)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(month, couponCode, pcGetUrl, couponStart, couponEnd, nowIso, note);
+/** 発行予約 (原子的)。@returns true=予約成功 / false=既に行がある (pending含む) */
+export function reserveMonth(db, { month, couponStart, couponEnd, nowIso = new Date().toISOString() }) {
+  try {
+    db.prepare(`
+      INSERT INTO rakuten_campaign_coupons (month, status, coupon_start, coupon_end, reserved_at)
+      VALUES (?, 'pending', ?, ?, ?)
+    `).run(month, couponStart, couponEnd, nowIso);
+    return true;
+  } catch (e) {
+    if (/UNIQUE|PRIMARY/i.test(String(e.message))) return false;
+    throw e;
+  }
+}
+
+/** 発行成功の確定 (pending → issued)。@returns 更新できたか */
+export function markIssued(db, { month, couponCode, pcGetUrl, nowIso = new Date().toISOString() }) {
+  const r = db.prepare(`
+    UPDATE rakuten_campaign_coupons
+       SET status = 'issued', coupon_code = ?, pc_get_url = ?, issued_at = ?
+     WHERE month = ? AND status = 'pending'
+  `).run(couponCode, pcGetUrl, nowIso, month);
+  return r.changes === 1;
+}
+
+/** 明確な失敗時の予約解放 (結果不明のときは呼ばない — pending を残して人が確認) */
+export function releaseReservation(db, month) {
+  return db.prepare(`DELETE FROM rakuten_campaign_coupons WHERE month = ? AND status = 'pending'`).run(month).changes;
+}
+
+/** 結果不明 (timeout等) の注記 (pending は残す) */
+export function notePendingAmbiguous(db, month, note) {
+  db.prepare(`UPDATE rakuten_campaign_coupons SET note = ? WHERE month = ? AND status = 'pending'`).run(note, month);
 }
 
 // ─── API 呼び出し (rakuten-client の直列キューに乗せる) ───
-async function callCouponApi(path, xml) {
+// maxAttempts: 発行/削除は 1 (Codex C3-R1 Critical: 非冪等 POST の自動リトライは
+// タイムアウト時点で楽天側発行済みでも再送し多重発行する)。search (GET) のみリトライ許可
+async function callCouponApi(path, xml, maxAttempts) {
   const r = await rakutenRequest({
     path, method: xml ? 'POST' : 'GET', rawBody: xml,
     headers: xml ? { 'Content-Type': 'application/xml; charset=utf-8' } : {},
     timeoutMs: 30000,
+    maxAttempts,
   });
   const parsed = parseCouponResult(typeof r.data === 'string' ? r.data : JSON.stringify(r.data));
   return { http: r.status, ...parsed };
 }
 
-export const issueCoupon = (xml) => callCouponApi('/es/1.0/coupon/issue', xml);
-export const deleteCoupon = (xml) => callCouponApi('/es/1.0/coupon/delete', xml);
-export const searchCouponByCode = (code) => callCouponApi(`/es/1.0/coupon/search?couponCode=${encodeURIComponent(code)}`);
+export const issueCoupon = (xml) => callCouponApi('/es/1.0/coupon/issue', xml, 1);
+export const deleteCoupon = (xml) => callCouponApi('/es/1.0/coupon/delete', xml, 1);
+export const searchCouponByCode = (code) => callCouponApi(`/es/1.0/coupon/search?couponCode=${encodeURIComponent(code)}`, undefined, 4);

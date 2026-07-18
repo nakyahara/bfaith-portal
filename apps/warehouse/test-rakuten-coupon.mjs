@@ -9,7 +9,8 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import {
   MONTHLY_COUPON_DEFAULTS, xmlEscape, buildIssueXml, buildDeleteXml, parseCouponResult,
-  monthlyCouponParams, ensureCouponRegistry, getRegisteredCoupon, recordIssuedCoupon,
+  monthlyCouponParams, ensureCouponRegistry, getRegisteredCoupon,
+  reserveMonth, markIssued, releaseReservation, notePendingAmbiguous,
   maskCode, maskUrl,
 } from './rakuten-coupon-lib.js';
 
@@ -108,9 +109,9 @@ console.log('=== 4. 月次パラメータ計算 (JST壁時計) ===');
   // うるう年 (2027-12 → 2028-02-29)
   const leap = monthlyCouponParams('2027-12', '2027-11-25T00:00:00.000Z');
   check('うるう年: 終了=2028-02-29', leap.couponEndDate === '2028-02-29T23:59:59+09:00');
-  // 当月途中の発行 → 開始=now+61分 (API制約: 最短60分後)
+  // 当月途中の発行 → 開始=now+90分 (API制約60分+送信までのマージン — Codex C3-R1 Medium)
   const mid = monthlyCouponParams('2026-07', '2026-07-18T03:00:00.000Z'); // 12:00 JST
-  check('当月途中: 開始=now+61分 (13:01 JST)', mid.couponStartDate === '2026-07-18T13:01:00+09:00', mid.couponStartDate);
+  check('当月途中: 開始=now+90分 (13:30 JST)', mid.couponStartDate === '2026-07-18T13:30:00+09:00', mid.couponStartDate);
   check('当月途中でも終了は翌々月末', mid.couponEndDate === '2026-09-30T23:59:59+09:00');
   // 30日超先はエラー
   let farErr = false;
@@ -127,28 +128,38 @@ console.log('=== 4. 月次パラメータ計算 (JST壁時計) ===');
   check('monthlyCouponParams → buildIssueXml が ok', buildIssueXml(p).ok);
 }
 
-console.log('=== 5. 台帳 (rakuten_campaign_coupons) ===');
+console.log('=== 5. 台帳 (予約方式 = at-most-once 発行) ===');
 {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'rcoupon-smoke-'));
   const db = new Database(path.join(tmp, 'warehouse.db'));
   ensureCouponRegistry(db);
   ensureCouponRegistry(db); // 冪等
   check('未発行は null', getRegisteredCoupon(db, '2026-08') === null);
-  recordIssuedCoupon(db, {
+
+  const res = { month: '2026-08', couponStart: '2026-08-01T00:00:00+09:00', couponEnd: '2026-10-31T23:59:59+09:00', nowIso: '2026-07-25T00:00:00.000Z' };
+  check('予約成功 (pending 行が原子的に立つ)', reserveMonth(db, res) === true && getRegisteredCoupon(db, '2026-08').status === 'pending');
+  check('同月の二重予約は false (API前にレースを遮断 — Codex C3-R1 High)', reserveMonth(db, res) === false);
+  check('発行確定 (pending→issued)', markIssued(db, {
     month: '2026-08', couponCode: 'TEST-CODE-0001', pcGetUrl: 'https://coupon.rakuten.co.jp/getCoupon?getkey=abc&rt=',
-    couponStart: '2026-08-01T00:00:00+09:00', couponEnd: '2026-10-31T23:59:59+09:00', nowIso: '2026-07-25T00:00:00.000Z',
-  });
+  }) === true);
   const row = getRegisteredCoupon(db, '2026-08');
-  check('記録した行が読める (フル値保存)', row?.coupon_code === 'TEST-CODE-0001' && row?.pc_get_url.includes('getkey=abc'));
-  let dup = false;
-  try {
-    recordIssuedCoupon(db, { month: '2026-08', couponCode: 'TEST-CODE-0002', pcGetUrl: 'x', couponStart: 'a', couponEnd: 'b' });
-  } catch { dup = true; }
-  check('同月の二重記録は PK が拒否 (二重発行防止)', dup);
+  check('issued 行にフル値保存', row.status === 'issued' && row.coupon_code === 'TEST-CODE-0001' && row.pc_get_url.includes('getkey=abc'));
+  check('issued への markIssued 再実行は false (状態機械)', markIssued(db, { month: '2026-08', couponCode: 'X', pcGetUrl: 'y' }) === false);
+  check('issued は releaseReservation で消えない (pending のみ解放)', releaseReservation(db, '2026-08') === 0 && getRegisteredCoupon(db, '2026-08') !== null);
+
+  // 明確な失敗 → 解放で再試行可能に
+  reserveMonth(db, { ...res, month: '2026-09' });
+  check('明確な失敗時は解放→再予約できる', releaseReservation(db, '2026-09') === 1 && reserveMonth(db, { ...res, month: '2026-09' }) === true);
+  // 結果不明 → note を残して pending 維持
+  notePendingAmbiguous(db, '2026-09', '結果不明 (timeout)。coupon.search で確認要');
+  const amb = getRegisteredCoupon(db, '2026-09');
+  check('結果不明は pending+note で滞留 (自動再発行させない)', amb.status === 'pending' && /結果不明/.test(amb.note));
+
+  let dupCode = false;
+  try { markIssued(db, { month: '2026-09', couponCode: 'TEST-CODE-0001', pcGetUrl: 'z' }); } catch { dupCode = true; }
+  check('coupon_code は月跨ぎでも UNIQUE', dupCode);
   let badMonth = false;
-  try {
-    recordIssuedCoupon(db, { month: '202608', couponCode: 'TEST-CODE-0003', pcGetUrl: 'x', couponStart: 'a', couponEnd: 'b' });
-  } catch { badMonth = true; }
+  try { reserveMonth(db, { ...res, month: '202608' }); } catch { badMonth = true; }
   check('month 形式は CHECK 制約で拒否', badMonth);
   db.close();
   fs.rmSync(tmp, { recursive: true, force: true });

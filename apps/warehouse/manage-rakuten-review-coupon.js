@@ -24,7 +24,7 @@ import fs from 'node:fs';
 import Database from 'better-sqlite3';
 import {
   MONTHLY_COUPON_DEFAULTS, buildIssueXml, buildDeleteXml, monthlyCouponParams,
-  ensureCouponRegistry, getRegisteredCoupon, recordIssuedCoupon,
+  ensureCouponRegistry, getRegisteredCoupon, reserveMonth, markIssued, releaseReservation, notePendingAmbiguous,
   issueCoupon, deleteCoupon, searchCouponByCode, maskCode, maskUrl,
 } from './rakuten-coupon-lib.js';
 
@@ -54,24 +54,40 @@ try {
       if (!built.ok) throw new Error(`パラメータ検証NG: ${built.errors.join(' / ')}`);
       const existing = getRegisteredCoupon(db, month);
       console.log(`[coupon] 対象月 ${month}: 開始 ${params.couponStartDate} / 終了 ${params.couponEndDate}`);
-      console.log(`[coupon] 台帳: ${existing ? `発行済み (code=${maskCode(existing.coupon_code)}, issued_at=${existing.issued_at})` : '未発行'}`);
+      console.log(`[coupon] 台帳: ${existing ? `${existing.status} (code=${maskCode(existing.coupon_code)}, reserved_at=${existing.reserved_at})` : '未発行'}`);
       if (!hasFlag('--live')) {
-        console.log('[coupon] dry-run (APIは呼んでいない)。送信予定XML:');
+        console.log('[coupon] dry-run (APIは呼んでいない。台帳テーブルの CREATE IF NOT EXISTS のみ実行)。送信予定XML:');
         console.log(built.xml.replace(/^/gm, '  '));
         console.log('[coupon] 実発行は --live を付ける');
       } else if (existing) {
-        console.error(`FATAL: ${month} は台帳に発行済み。再発行するなら RMS でクーポン削除+台帳行の手動削除を先に (二重発行防止)`);
+        console.error(existing.status === 'pending'
+          ? `FATAL: ${month} は pending (前回の結果不明)。coupon.search で実発行有無を確認し、台帳を手動解決してから (note: ${existing.note || '-'})`
+          : `FATAL: ${month} は発行済み。再発行するなら RMS でクーポン削除+台帳行の手動削除を先に (二重発行防止)`);
         process.exitCode = 1;
       } else {
-        const r = await issueCoupon(built.xml);
-        if (!r.ok || !r.couponCode || !r.pcGetUrl) {
-          throw new Error(`発行失敗: HTTP ${r.http} / ${r.systemStatus} ${r.message} / ${r.errors.map((e) => `${e.code}:${e.message}`).join(', ') || '(詳細なし)'}`);
+        // 予約 → API (リトライなし) → 確定/解放。結果不明は pending を残して停止 (多重発行防止)
+        if (!reserveMonth(db, { month, couponStart: params.couponStartDate, couponEnd: params.couponEndDate })) {
+          throw new Error(`${month} は他プロセスが予約済み (台帳を確認)`);
         }
-        recordIssuedCoupon(db, {
-          month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl,
-          couponStart: params.couponStartDate, couponEnd: params.couponEndDate,
-        });
-        console.log(`[coupon] ✅発行成功: code=${maskCode(r.couponCode)} url=${maskUrl(r.pcGetUrl)} (フル値は台帳に記録済み)`);
+        let r;
+        try {
+          r = await issueCoupon(built.xml);
+        } catch (e) {
+          notePendingAmbiguous(db, month, `結果不明 (${String(e.message).slice(0, 120)})。coupon.search で確認要`);
+          throw new Error(`発行結果が不明 (${e.message})。台帳は pending のまま。RMS/coupon.search で実発行有無を確認してから手動解決 (自動再発行はしない)`);
+        }
+        if (r.ok && r.couponCode && r.pcGetUrl) {
+          markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl });
+          console.log(`[coupon] ✅発行成功: code=${maskCode(r.couponCode)} url=${maskUrl(r.pcGetUrl)} (フル値は台帳に記録済み)`);
+        } else if (r.http >= 500 || r.systemStatus == null) {
+          // 5xx・解釈不能レスポンス = 発行済みか不明 → pending を残す
+          notePendingAmbiguous(db, month, `結果不明 (HTTP ${r.http} ${r.message || ''})。coupon.search で確認要`);
+          throw new Error(`発行結果が不明 (HTTP ${r.http})。台帳は pending のまま。確認後に手動解決を`);
+        } else {
+          // 明確な拒否 (4xx + エラーコード) = 未発行が確定 → 予約解放
+          releaseReservation(db, month);
+          throw new Error(`発行失敗 (未発行確定・予約解放): HTTP ${r.http} / ${r.systemStatus} ${r.message} / ${r.errors.map((e) => `${e.code}:${e.message}`).join(', ') || '(詳細なし)'}`);
+        }
       }
     }
   } else if (mode === 'test-cycle') {
@@ -96,22 +112,28 @@ try {
     console.log(`[test-cycle] 発行OK: ${maskCode(issued.couponCode)}`);
     console.log('[test-cycle] 2/3 検索確認...');
     const found = await searchCouponByCode(issued.couponCode);
-    const hit = found.allCount === 1; // couponCode は requests エコーに常に出るため allCount で判定
-    console.log(`[test-cycle] 検索: ${hit ? 'OK (allCount=1)' : `NG (allCount=${found.allCount}, ${found.message})`}`);
+    const hitOk = found.ok && found.allCount === 1; // couponCode は requests エコーに常に出るため allCount で判定
+    console.log(`[test-cycle] 検索: ${hitOk ? 'OK (allCount=1)' : `NG (allCount=${found.allCount}, ${found.message})`}`);
+    // 検索NGでもクリーンアップの削除は必ず試みる
     console.log('[test-cycle] 3/3 削除...');
     const delBuilt = buildDeleteXml(issued.couponCode);
     if (!delBuilt.ok) throw new Error(delBuilt.errors.join(' / '));
     const del = await deleteCoupon(delBuilt.xml);
-    if (!del.ok) throw new Error(`削除失敗: ${del.errors.map((e) => `${e.code}:${e.message}`).join(', ') || del.message}。RMS画面から手動削除が必要 (code先頭=${maskCode(issued.couponCode)})`);
+    const delOk = del.ok;
+    if (!delOk) console.error(`[test-cycle] 削除失敗: ${del.errors.map((e) => `${e.code}:${e.message}`).join(', ') || del.message}。RMS画面から手動削除が必要 (code先頭=${maskCode(issued.couponCode)})`);
     const gone = await searchCouponByCode(issued.couponCode);
-    const cleaned = gone.allCount === 0;
-    console.log(`[test-cycle] 削除OK・消滅確認: ${cleaned ? '✅ (allCount=0)' : `⚠️検索にまだ出る (allCount=${gone.allCount})`}`);
+    const goneOk = gone.ok && gone.allCount === 0;
+    console.log(`[test-cycle] 消滅確認: ${goneOk ? '✅ (allCount=0)' : `NG (allCount=${gone.allCount})`}`);
+    // 偽陽性防止 (Codex C3-R1 Medium): 全工程OKのときだけ成功終了
+    if (!(hitOk && delOk && goneOk)) {
+      throw new Error(`フルサイクル不成立 (検索=${hitOk} 削除=${delOk} 消滅=${goneOk})`);
+    }
     console.log('[test-cycle] ✅ 発行→検索→削除のフルサイクル成功');
   } else if (mode === 'status') {
-    const rows = db.prepare(`SELECT month, coupon_code, coupon_start, coupon_end, issued_at FROM rakuten_campaign_coupons ORDER BY month`).all();
+    const rows = db.prepare(`SELECT month, status, coupon_code, coupon_start, coupon_end, issued_at, note FROM rakuten_campaign_coupons ORDER BY month`).all();
     if (rows.length === 0) console.log('台帳: 発行記録なし');
     for (const r of rows) {
-      console.log(`${r.month}: code=${maskCode(r.coupon_code)} 期間=${r.coupon_start}〜${r.coupon_end} 発行=${r.issued_at}`);
+      console.log(`${r.month}: [${r.status}] code=${maskCode(r.coupon_code)} 期間=${r.coupon_start}〜${r.coupon_end} 発行=${r.issued_at || '-'}${r.note ? ` ⚠️${r.note}` : ''}`);
     }
   } else {
     console.error(`FATAL: unknown mode '${mode ?? '(なし)'}' (issue-monthly / test-cycle / status)`);
