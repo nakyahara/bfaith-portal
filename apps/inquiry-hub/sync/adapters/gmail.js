@@ -173,6 +173,7 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
  *   fetchImpl?: fetch 差し替え (テスト用)
  *   sleepMs?: リクエスト間隔 (既定120ms。Gmailのquotaは十分広い)
  *   maxListPages?: 一覧ページ上限 (既定200)
+ *   concurrency?: スレッド取得の並列数 (既定5。quota 250units/s に対し余裕圏内)
  *   ruleEvaluator?: メールルール評価の差し替え (テスト用)
  */
 export function createGmailAdapter(cfg = {}) {
@@ -184,6 +185,7 @@ export function createGmailAdapter(cfg = {}) {
   const sleepMs = cfg.sleepMs ?? 120;
   const requestTimeoutMs = cfg.requestTimeoutMs ?? 30000;
   const maxListPages = cfg.maxListPages ?? DEFAULT_MAX_LIST_PAGES;
+  const concurrency = cfg.concurrency ?? 5;
   const ruleEvaluator = cfg.ruleEvaluator ?? evaluateMailRules;
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -213,9 +215,19 @@ export function createGmailAdapter(cfg = {}) {
     return tokenCache.token;
   }
 
+  // 全ワーカー共有のスロット式レートリミッター (最小間隔 sleepMs)。
+  // 並列ワーカーごとの個別sleepだと concurrency×レートでquota超過し得る (Codexレビュー反映):
+  // 既定 120ms間隔 ≈ 8.3req/s ≈ 83units/s (threads.get=10units) で上限250units/sに対し余裕
+  let nextSlotAt = 0;
+  async function throttle() {
+    const now = Date.now();
+    const slot = Math.max(now, nextSlotAt);
+    nextSlotAt = slot + sleepMs;
+    if (slot > now) await sleep(slot - now);
+  }
   let requests = 0;
   async function apiGet(pathAndQuery, label) {
-    if (requests > 0) await sleep(sleepMs);
+    if (requests > 0) await throttle();
     requests++;
     const token = await accessToken();
     let res;
@@ -287,15 +299,26 @@ export function createGmailAdapter(cfg = {}) {
         if (!pageToken) break;
       }
 
-      // 2. スレッド全量取得 → メールルール適用込みで契約形へ
+      // 2. スレッド全量取得 → メールルール適用込みで契約形へ。
+      // 並列取得 (既定5)。Gmail quota は 250units/s・threads.get=10units なので5並列は余裕圏内。
+      // ノイズ量実測 (2026-07-18: 3日で2,700+スレッド) に対して逐次+120msでは10分リースを超えるため
+      const ids = [...threadIds];
       const inquiries = [];
       let skipped = 0;
-      for (const tid of threadIds) {
-        const t = await apiGet(`threads/${encodeURIComponent(tid)}?format=full`, `thread ${tid.slice(0, 10)}…`);
-        const item = mapThread(t, { ruleEvaluator });
-        if (item) inquiries.push(item);
-        else skipped++;
-      }
+      let cursor = 0;
+      const worker = async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= ids.length) return;
+          const tid = ids[i];
+          const t = await apiGet(`threads/${encodeURIComponent(tid)}?format=full`, `thread ${String(tid).slice(0, 10)}…`);
+          const item = mapThread(t, { ruleEvaluator });
+          if (item) inquiries.push(item);
+          else skipped++;
+        }
+      };
+      // 1本でも失敗したら全体throw (契約どおり部分成功を返さない)。Promise.allで最初のrejectを伝播
+      await Promise.all(Array.from({ length: Math.min(concurrency, ids.length || 1) }, () => worker()));
       if (skipped > 0) console.log(`[gmail-adapter] メールルールで ${skipped} スレッドをスキップ (ノイズ除去)`);
       return { inquiries };
     },
