@@ -3,11 +3,13 @@
  *
  * 検証内容:
  * Test 1: ensureSchema で sl_shipping_slips + trigger が作成される
- * Test 2: ingestFolderSlips が INSERT し、同一 payload の再送は全件 ignored (冪等)
- * Test 3: append-only trigger — UPDATE / DELETE が RAISE(ABORT) で拒否される
- * Test 4: HTTP 認証 — env 未設定 503 / token 無し 401 / 不一致 403 / 一致 200 (fail-closed)
- * Test 5: バリデーション — rows 空 400、ship_date 形式不正 400、slip_no 欠落 400
- * Test 6: GET /recent が取込済み行を返す
+ * Test 2: ingestFolderSlips が INSERT し、再送 (別run・別日=日跨ぎ) は ignored (slip_no 冪等)
+ * Test 3: 内容不一致 (mgmt_no が双方非NULLで異なる) は conflict、新規側 null は idempotent
+ * Test 4: append-only trigger — UPDATE / DELETE が RAISE(ABORT) で拒否される
+ * Test 5: HTTP 認証 — env 未設定 503 / token 無し 401 / 不一致 403 / 一致 200 (fail-closed)
+ * Test 6: バリデーション — rows 空 / ship_date 形式・実在日 / slip_no 形式 → 400
+ * Test 7: conflict 時に HTTP 409 + conflicts 明細
+ * Test 8: GET /recent は MIRROR_READ_TOKEN (x-read-token)。未設定503 / 不一致401 / 一致200
  *
  * 実行: node scripts/test-shipping-log.mjs
  */
@@ -41,21 +43,36 @@ table ? ok('sl_shipping_slips 作成') : fail('sl_shipping_slips 未作成');
 const triggers = db.prepare(`SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'trg_sl_slips%'`).all();
 expectEq(triggers.length, 2, 'append-only trigger 数');
 
-// ── Test 2: 取込 + 冪等再送 ──
-const payload = {
+// ── Test 2: 取込 + 冪等再送 (日跨ぎ含む) ──
+const basePayload = {
   runId: '20260718-181600', folderName: '出荷_01', shipDate: '2026-07-18', extractedAt: '2026-07-18 18:16:00',
   rows: [
     { slip_no: 'SP00110324384', mgmt_no: '1498337', mall_order_no: null, source_file: '納品書_1.pdf' },
     { slip_no: 'SP00110324772', mgmt_no: '1498416', mall_order_no: 'AES250-3936214-7150201', source_file: '納品書_1.pdf' },
   ],
 };
-const r1 = ingestFolderSlips(payload);
+const r1 = ingestFolderSlips(basePayload);
 expectEq(r1.inserted, 2, '初回 inserted');
-const r2 = ingestFolderSlips({ ...payload, runId: '20260718-190000' }); // 再実行 (別run) でも業務キーで冪等
-expectEq(r2.inserted, 0, '再送 inserted');
-expectEq(r2.ignored, 2, '再送 ignored');
+expectEq(r1.conflicts.length, 0, '初回 conflicts');
+// 翌日再実行 (削除失敗→翌日再送シナリオ): ship_date が変わっても slip_no で冪等
+const r2 = ingestFolderSlips({ ...basePayload, runId: '20260719-181600', shipDate: '2026-07-19' });
+expectEq(r2.inserted, 0, '日跨ぎ再送 inserted');
+expectEq(r2.ignored, 2, '日跨ぎ再送 ignored');
+expectEq(r2.conflicts.length, 0, '日跨ぎ再送 conflicts');
+// 初回の ship_date が保持されている (append-only)
+expectEq(db.prepare(`SELECT ship_date FROM sl_shipping_slips WHERE slip_no='SP00110324384'`).get().ship_date,
+  '2026-07-18', '初回 ship_date 保持');
 
-// ── Test 3: append-only trigger ──
+// ── Test 3: conflict 判定 ──
+const r3 = ingestFolderSlips({ ...basePayload, runId: 'r3', rows: [
+  { slip_no: 'SP00110324384', mgmt_no: '9999999' },          // 内容不一致 → conflict
+  { slip_no: 'SP00110324772', mgmt_no: null },               // 新規側 null → idempotent
+] });
+expectEq(r3.conflicts.length, 1, 'conflict 件数');
+expectEq(r3.conflicts[0]?.slip_no, 'SP00110324384', 'conflict slip_no');
+expectEq(r3.ignored, 1, 'null側 idempotent');
+
+// ── Test 4: append-only trigger ──
 try {
   db.prepare(`UPDATE sl_shipping_slips SET mgmt_no='x' WHERE slip_no='SP00110324384'`).run();
   fail('UPDATE が通ってしまった');
@@ -65,7 +82,7 @@ try {
   fail('DELETE が通ってしまった');
 } catch (e) { /(DELETE forbidden)/.test(e.message) ? ok('DELETE 拒否') : fail(`DELETE 拒否だが想定外メッセージ: ${e.message}`); }
 
-// ── Test 4-6: HTTP 層 ──
+// ── Test 5-8: HTTP 層 ──
 const app = express();
 app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
 const server = app.listen(0, '127.0.0.1');
@@ -80,6 +97,7 @@ async function post(pathName, body, token) {
 }
 
 const TOKEN = 'test-token-shipping-log';
+const READ_TOKEN = 'test-read-token';
 const httpPayload = {
   run_id: '20260718-181600', folder: '出荷_02', ship_date: '2026-07-18',
   rows: [{ slip_no: 'SP00110399999', mgmt_no: '1498999' }],
@@ -93,15 +111,32 @@ expectEq((await post('/ingest', httpPayload, 'wrong-token-xxxxxxxxxxxx')).status
 const okRes = await post('/ingest', httpPayload, TOKEN);
 expectEq(okRes.status, 200, 'token 一致 → 200');
 expectEq(okRes.body.inserted, 1, 'HTTP経由 inserted');
+expectEq(okRes.body.total, 1, 'HTTP経由 total');
 
+// バリデーション
 expectEq((await post('/ingest', { ...httpPayload, rows: [] }, TOKEN)).status, 400, 'rows 空 → 400');
 expectEq((await post('/ingest', { ...httpPayload, ship_date: '2026/07/18' }, TOKEN)).status, 400, 'ship_date 形式不正 → 400');
+expectEq((await post('/ingest', { ...httpPayload, ship_date: '2026-02-31' }, TOKEN)).status, 400, 'ship_date 実在しない日 → 400');
 expectEq((await post('/ingest', { ...httpPayload, rows: [{ mgmt_no: '1' }] }, TOKEN)).status, 400, 'slip_no 欠落 → 400');
+expectEq((await post('/ingest', { ...httpPayload, rows: [{ slip_no: 'INVALID123' }] }, TOKEN)).status, 400, 'slip_no 形式不正 → 400');
 
-const recentRes = await fetch(`${base}/recent?limit=10`, { headers: { authorization: `Bearer ${TOKEN}` } });
+// conflict → 409
+const conflictRes = await post('/ingest', { ...httpPayload, run_id: 'r-conflict',
+  rows: [{ slip_no: 'SP00110399999', mgmt_no: '7777777' }] }, TOKEN);
+expectEq(conflictRes.status, 409, '内容不一致 → 409');
+expectEq(conflictRes.body.conflicts?.length, 1, '409 conflicts 明細');
+
+// GET /recent は read token (x-read-token)
+delete process.env.MIRROR_READ_TOKEN;
+expectEq((await fetch(`${base}/recent`)).status, 503, 'read token env 未設定 → 503');
+process.env.MIRROR_READ_TOKEN = READ_TOKEN;
+expectEq((await fetch(`${base}/recent`, { headers: { 'x-read-token': 'wrong' } })).status, 401, 'read token 不一致 → 401');
+const recentRes = await fetch(`${base}/recent?limit=10`, { headers: { 'x-read-token': READ_TOKEN } });
 const recentBody = await recentRes.json();
 expectEq(recentRes.status, 200, 'GET /recent → 200');
 expectEq(recentBody.rows.length, 3, 'recent 行数');
+// ingest token では /recent は読めない (権限分離)
+expectEq((await fetch(`${base}/recent`, { headers: { authorization: `Bearer ${TOKEN}` } })).status, 401, 'ingest token では recent 不可');
 
 // DB層 recentSlips も確認
 expectEq(recentSlips(10).length, 3, 'recentSlips 行数');

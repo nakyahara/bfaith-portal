@@ -8,9 +8,9 @@
  *
  * 設計:
  *  - warehouse-mirror.db 同居 (packing-dispatch と同じ per-app fail-soft スキーマ方式)
- *  - PK は業務キー (ship_date, folder_name, slip_no)。GAS の再送・同日再実行は
- *    INSERT OR IGNORE で冪等に吸収する。run_id は provenance 列として保持
- *    (mart 系の run_id 先頭 PK 規約はswap用途のため、ここでは再送冪等性を優先)
+ *  - PK は slip_no 単独 (ロジザード出荷伝票NO は全社一意)。GAS の再送は日をまたいでも
+ *    冪等: 同一 slip_no + 業務内容一致 → ignored、内容不一致 → conflict (409、削除させない)。
+ *    (Codex R1 high #2/#3: INSERT OR IGNORE の黙殺と ship_date 入り PK の日跨ぎ非冪等を廃止)
  *  - append-only: UPDATE/DELETE は trigger で RAISE(ABORT)
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
@@ -26,18 +26,17 @@ export function ensureSchema() {
   try {
     db.exec(`
       CREATE TABLE IF NOT EXISTS sl_shipping_slips (
-        ship_date TEXT NOT NULL,          -- 出荷日 (JST, YYYY-MM-DD)
+        slip_no TEXT PRIMARY KEY,         -- 出荷伝票NO (ロジザード SPxxxxxxxxxxx、全社一意)
+        ship_date TEXT NOT NULL,          -- 出荷日 (JST, YYYY-MM-DD。初回取込時の値を保持)
         folder_name TEXT NOT NULL,        -- 出荷_XX (バッチ)
-        slip_no TEXT NOT NULL,            -- 出荷伝票NO (ロジザード SPxxxxxxxxxxx)
-        mgmt_no TEXT,                     -- 管理番号 (NE伝票番号)
+        mgmt_no TEXT,                     -- 管理番号 (NE伝票番号。抽出できた場合のみ)
         mall_order_no TEXT,               -- モール注文番号 (Amazon: AESxxx-... 等、抽出できた場合のみ)
         source_file TEXT,                 -- 抽出元 納品書PDF ファイル名
         run_id TEXT NOT NULL,             -- GAS 実行ID (provenance)
         extracted_at TEXT,                -- GAS 側抽出時刻 (JST文字列)
-        received_at TEXT NOT NULL,        -- サーバ受信時刻 (UTC ISO)
-        PRIMARY KEY (ship_date, folder_name, slip_no)
+        received_at TEXT NOT NULL         -- サーバ受信時刻 (UTC ISO)
       );
-      CREATE INDEX IF NOT EXISTS idx_sl_slips_slip_no ON sl_shipping_slips(slip_no);
+      CREATE INDEX IF NOT EXISTS idx_sl_slips_ship_date ON sl_shipping_slips(ship_date);
       CREATE INDEX IF NOT EXISTS idx_sl_slips_mgmt_no ON sl_shipping_slips(mgmt_no);
       CREATE INDEX IF NOT EXISTS idx_sl_slips_mall_order ON sl_shipping_slips(mall_order_no);
       CREATE TRIGGER IF NOT EXISTS trg_sl_slips_no_update
@@ -57,54 +56,83 @@ export function ensureSchema() {
   return db;
 }
 
-/**
- * 1フォルダ分の伝票行を冪等 INSERT する。
- * @param {{ runId: string, folderName: string, shipDate: string, extractedAt: string|null,
- *           rows: Array<{ slip_no: string, mgmt_no?: string, mall_order_no?: string, source_file?: string }> }} p
- * @returns {{ inserted: number, ignored: number }}
- */
-export function ingestFolderSlips(p) {
+function requireSchema() {
   const db = ensureSchema();
   if (schemaError) {
     const err = new Error('shipping-log schema unavailable');
     err.code = 'SCHEMA_UNAVAILABLE';
     throw err;
   }
+  return db;
+}
+
+/**
+ * 既存行との業務内容比較。mgmt_no / mall_order_no が「双方非NULLで異なる」ときのみ conflict。
+ * (再送時に抽出ヒューリスティクスが null を返すケースは idempotent 扱い — append-only のため
+ *  既存値を正とし、上書きも 409 もしない)
+ */
+function isConflict(existing, row) {
+  const differs = (a, b) => a != null && b != null && a !== b;
+  return differs(existing.mgmt_no, row.mgmt_no) || differs(existing.mall_order_no, row.mall_order_no);
+}
+
+/**
+ * 1フォルダ分の伝票行を冪等 INSERT する。
+ * INSERT-first + PK 違反 catch でレース耐性 (mis-shipment の insertSingleMisShipment と同型)。
+ * @param {{ runId: string, folderName: string, shipDate: string, extractedAt: string|null,
+ *           rows: Array<{ slip_no: string, mgmt_no?: string|null, mall_order_no?: string|null, source_file?: string|null }> }} p
+ * @returns {{ inserted: number, ignored: number, conflicts: Array<{ slip_no: string, existing_mgmt_no: string|null, existing_mall_order_no: string|null }> }}
+ */
+export function ingestFolderSlips(p) {
+  const db = requireSchema();
   const receivedAt = new Date().toISOString();
-  const stmt = db.prepare(`
-    INSERT OR IGNORE INTO sl_shipping_slips
-      (ship_date, folder_name, slip_no, mgmt_no, mall_order_no, source_file, run_id, extracted_at, received_at)
+  const insertStmt = db.prepare(`
+    INSERT INTO sl_shipping_slips
+      (slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, extracted_at, received_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const selectStmt = db.prepare('SELECT slip_no, mgmt_no, mall_order_no FROM sl_shipping_slips WHERE slip_no = ?');
+
   const tx = db.transaction((rows) => {
     let inserted = 0;
+    let ignored = 0;
+    const conflicts = [];
     for (const r of rows) {
-      const info = stmt.run(
-        p.shipDate, p.folderName, r.slip_no,
-        r.mgmt_no || null, r.mall_order_no || null, r.source_file || null,
-        p.runId, p.extractedAt || null, receivedAt
-      );
-      inserted += info.changes;
+      try {
+        insertStmt.run(
+          r.slip_no, p.shipDate, p.folderName,
+          r.mgmt_no || null, r.mall_order_no || null, r.source_file || null,
+          p.runId, p.extractedAt || null, receivedAt
+        );
+        inserted++;
+      } catch (e) {
+        if (e && String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
+          const existing = selectStmt.get(r.slip_no);
+          if (existing && isConflict(existing, r)) {
+            conflicts.push({ slip_no: r.slip_no, existing_mgmt_no: existing.mgmt_no, existing_mall_order_no: existing.mall_order_no });
+          } else {
+            ignored++; // 再送 (内容一致 or 新規側が null) → 冪等
+          }
+        } else {
+          throw e;
+        }
+      }
     }
-    return inserted;
+    // conflict があってもここまでの INSERT は有効のままにする (append-only の事実は残す)。
+    // GAS には 409 が返り、フォルダは削除されないので人間が調査できる。
+    return { inserted, ignored, conflicts };
   });
-  const inserted = tx(p.rows);
-  return { inserted, ignored: p.rows.length - inserted };
+  return tx(p.rows);
 }
 
 /** 直近の伝票行 (動作確認・突合ジョブ用) */
 export function recentSlips(limit) {
-  const db = ensureSchema();
-  if (schemaError) {
-    const err = new Error('shipping-log schema unavailable');
-    err.code = 'SCHEMA_UNAVAILABLE';
-    throw err;
-  }
+  const db = requireSchema();
   const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
   return db.prepare(`
-    SELECT ship_date, folder_name, slip_no, mgmt_no, mall_order_no, source_file, run_id, received_at
+    SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, received_at
     FROM sl_shipping_slips
-    ORDER BY received_at DESC, folder_name, slip_no
+    ORDER BY received_at DESC, slip_no
     LIMIT ?
   `).all(n);
 }
