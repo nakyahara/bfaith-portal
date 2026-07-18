@@ -256,7 +256,15 @@ function extractSlipsFromPdf_(pdfFile) {
   try {
     text = DocumentApp.openById(tempDoc.id).getBody().getText();
   } finally {
-    Drive.Files.remove(tempDoc.id, { supportsAllDrives: true });
+    // 後片付けは「ゴミ箱行き」にする。files.delete (完全削除) は共有ドライブでは
+    // 管理者権限が必要で、コンテンツ管理者だと File not found 相当で拒否される (2026-07-18 実測)。
+    // ゴミ箱なら作成者権限で可能、30日で自動消滅する。
+    try {
+      DriveApp.getFileById(tempDoc.id).setTrashed(true);
+    } catch (e) {
+      // 万一ゴミ箱行きも失敗しても抽出は続行 (_tmp_ 名の一時Docが残るだけで実害なし)
+      Logger.log("一時Docのゴミ箱移動失敗: " + tempDoc.id + " " + e.message);
+    }
   }
 
   var blocks = text.split(/納品書/).slice(1);
