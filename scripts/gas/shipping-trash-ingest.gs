@@ -135,10 +135,16 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
     return result;
   }
   if (!failReason) {
-    var trashFailed = trashFiles_(files, quarantine, runId, result.name);
-    result.status = trashFailed.length === 0
-      ? "ok: " + result.slips + "伝票送信→" + files.length + "ファイル削除"
-      : "warn: 送信済みだが削除失敗→隔離: " + trashFailed.join(", ");
+    var t = trashFiles_(files, quarantine, runId, result.name);
+    if (t.quarantined.length === 0 && t.left.length === 0) {
+      result.status = "ok: " + result.slips + "伝票送信→" + files.length + "ファイル削除";
+    } else {
+      // 送信済みなのでデータは安全。ファイルの行き先を正確に報告する (隔離済みと残置は別物)
+      var parts = [];
+      if (t.quarantined.length > 0) parts.push("隔離: " + t.quarantined.join(", "));
+      if (t.left.length > 0) parts.push("★フォルダに残置 (要手動削除): " + t.left.join(", "));
+      result.status = "warn: 送信済みだが削除失敗 → " + parts.join(" / ");
+    }
   } else if (quarantine) {
     var movedInfo = moveAllToQuarantine_(files, quarantine, runId, result.name);
     result.status = "error: " + failReason + " → " + movedInfo;
@@ -149,21 +155,26 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
   return result;
 }
 
-/** 成功バッチのゴミ箱移動。失敗したファイルは隔離へ退避 (フォルダに残さない) */
+/**
+ * 成功バッチのゴミ箱移動。ゴミ箱に入らないファイルは隔離へ退避を試みる。
+ * @returns {{ quarantined: string[], left: string[] }} 隔離できたもの / フォルダに残ってしまったもの
+ */
 function trashFiles_(files, quarantine, runId, batchName) {
-  var failed = [];
+  var quarantined = [];
+  var left = [];
   var sub = null;
   files.forEach(function (f) {
-    try { f.setTrashed(true); }
-    catch (e) {
-      failed.push(f.getName());
-      try {
-        if (!sub && quarantine) sub = getOrCreateSubFolder_(quarantine, runId + "_" + batchName);
-        if (sub) f.moveTo(sub);
-      } catch (e2) { /* 移動も失敗 → 残置 (通知で検知) */ }
+    try { f.setTrashed(true); return; }
+    catch (e) { /* 次で隔離を試みる */ }
+    try {
+      if (!sub && quarantine) sub = getOrCreateSubFolder_(quarantine, runId + "_" + batchName);
+      if (sub) { f.moveTo(sub); quarantined.push(f.getName()); }
+      else left.push(f.getName()); // 隔離リトライ中 (quarantine=null) は隔離サブに残る
+    } catch (e2) {
+      left.push(f.getName()); // 両方失敗 → 元フォルダに残置 (通知で要手動対応と明示)
     }
   });
-  return failed;
+  return { quarantined: quarantined, left: left };
 }
 
 /** 失敗バッチの全ファイルを _要確認/<runId>_<出荷_XX>/ へ移動 */
