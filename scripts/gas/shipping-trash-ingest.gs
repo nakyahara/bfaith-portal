@@ -5,132 +5,204 @@
  *   1. 納品書PDF → Docs 変換でテキスト抽出し、伝票ごとに
  *      出荷伝票NO (SPxxx) / 管理番号 / モール注文番号 をパース
  *   2. Render (bfaith-portal) の POST /apps/shipping-log/api/ingest へ送信
- *   3. ★送信が完全に成功したフォルダのみ★ ファイルをゴミ箱へ移動
- *      (部分抽出・送信失敗・conflict のフォルダはファイルを残して GChat に通知)
+ *   3. 完全成功 → ファイルをゴミ箱へ / 失敗 → ルート直下の「_要確認」へ隔離移動
+ *
+ * ★出荷_XX フォルダは毎晩必ず空になる★ (成功=ゴミ箱、失敗=隔離)。
+ * 失敗分を作業フォルダに残すと翌朝の出荷作業と混ざって混乱するため、
+ * 隔離フォルダ _要確認/<実行ID>_<出荷_XX>/ に退避し GChat に通知する。
+ * 隔離分は毎回の実行冒頭で自動リトライし (取込は冪等)、成功したら片付ける。
  *
  * 削除してよい条件 (すべて満たすこと):
- *   - 納品書の全ブロックから出荷伝票NOが抽出できた (部分抽出は削除しない)
- *   - HTTP 200 かつ body.ok === true かつ inserted + ignored === total === 送信行数
+ *   - 納品書の全ブロックから出荷伝票NOが抽出できた (部分抽出・伝票融合・番号重複は不可)
+ *   - HTTP 200 + body.ok===true + inserted+ignored===total===送信行数
+ *   - ignored がすべて同一フォルダからの再送 (別フォルダ由来=OCR誤認の疑いは不可)
  *
  * 事前設定 (スクリプトプロパティ):
  *   SHIPPING_INGEST_BASE : 例 https://bfaith-portal.onrender.com/apps/shipping-log/api
  *   SHIPPING_INGEST_TOKEN: Render env SHIPPING_LOG_INGEST_TOKEN と同じ値
- *   DRY_RUN              : "1" なら抽出+送信のみ、ファイルは削除しない (動作確認用)
+ *   DRY_RUN              : "1" なら抽出+送信のみ、ファイル移動・削除しない (動作確認用)
  *   SHIPPING_GCHAT_WEBHOOK: 通知先 webhook URL (任意)
  * 事前設定 (サービス): 「Drive API」(v2) を追加しておくこと
  *
  * サーバ側契約: apps/shipping-log/router.js (Bearer fail-closed、slip_no PK で冪等、
- * 内容不一致は 409)。再実行・日跨ぎ再送は slip_no で重複排除されるため安全。
+ * 内容不一致は 409)。再実行・日跨ぎ再送・隔離リトライは slip_no で重複排除されるため安全。
  */
 var ROOT_FOLDER_ID = "110ONn2xHzfEG5HPt1DRy4P64zv2hpGjh";
+var QUARANTINE_NAME = "_要確認";
+var SHIP_FOLDER_RE = /^出荷_\d+$/;
+var QUARANTINE_SUB_RE = /^(\d{8})-\d{6}_(出荷_\d+)$/; // <yyyyMMdd-HHmmss>_<出荷_XX>
 
 function trashAllFilesInFolder() {
   var props = PropertiesService.getScriptProperties();
-  var base = props.getProperty("SHIPPING_INGEST_BASE");
-  var token = props.getProperty("SHIPPING_INGEST_TOKEN");
-  var dryRun = props.getProperty("DRY_RUN") === "1";
-  if (!base || !token) throw new Error("SHIPPING_INGEST_BASE / SHIPPING_INGEST_TOKEN が未設定です");
+  var cfg = {
+    base: props.getProperty("SHIPPING_INGEST_BASE"),
+    token: props.getProperty("SHIPPING_INGEST_TOKEN"),
+    dryRun: props.getProperty("DRY_RUN") === "1",
+  };
+  if (!cfg.base || !cfg.token) throw new Error("SHIPPING_INGEST_BASE / SHIPPING_INGEST_TOKEN が未設定です");
 
   var runId = Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyyMMdd-HHmmss");
+  var root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  var quarantine = getOrCreateSubFolder_(root, QUARANTINE_NAME);
   var results = [];
-  var subFolders = DriveApp.getFolderById(ROOT_FOLDER_ID).getFolders();
+
+  // 1) 前回までの隔離分をリトライ (冪等なので再送しても安全)
+  retryQuarantine_(quarantine, cfg, results);
+
+  // 2) 当日分: 出荷_XX のみ処理 (_要確認 等は対象外)
+  var subFolders = root.getFolders();
   while (subFolders.hasNext()) {
     var folder = subFolders.next();
-    var r = processFolder_(folder, base, token, runId, dryRun);
+    if (!SHIP_FOLDER_RE.test(folder.getName())) continue;
+    var r = processBatch_(folder, folder.getName(), todayJst_(), cfg, quarantine, runId);
     if (r) results.push(r);
   }
-  notifyResult_(results, runId, dryRun);
+  notifyResult_(results, runId, cfg.dryRun);
 }
 
-/** 1フォルダ分: 抽出→POST→(完全成功のときのみ)ゴミ箱。結果オブジェクトを返す */
-function processFolder_(folder, base, token, runId, dryRun) {
+/**
+ * 1バッチ分: 抽出→POST→成功はゴミ箱 / 失敗は隔離へ移動。
+ * @param {Folder} folder 実ファイルのあるフォルダ (出荷_XX or 隔離サブフォルダ)
+ * @param {string} batchName 業務上のフォルダ名 (出荷_XX。隔離リトライ時は元の名前)
+ * @param {string} shipDate YYYY-MM-DD (隔離リトライ時は隔離時の日付)
+ * @param {Folder|null} quarantine 失敗時の隔離先ルート (隔離リトライ時は null=移動済みなので何もしない)
+ */
+function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
   var files = [];
   var it = folder.getFiles();
   while (it.hasNext()) files.push(it.next());
   if (files.length === 0) return null; // 未使用フォルダ
 
-  var result = { name: folder.getName(), files: files.length, slips: 0, status: "" };
+  var result = { name: batchName, files: files.length, slips: 0, status: "" };
+  var failReason = null;
   try {
     var invoices = files.filter(function (f) {
       return /納品書/.test(f.getName()) && f.getMimeType() === "application/pdf";
     });
-    if (invoices.length === 0) {
-      result.status = "skip: 納品書PDFなし(誤配置?)";
-      return result; // 消さずに残す
-    }
-
-    // ── 抽出 (完全性チェック付き: ブロック数 = 抽出伝票数 でなければ削除しない) ──
     var rows = [];
-    var incomplete = [];
-    invoices.forEach(function (inv) {
-      var ex = extractSlipsFromPdf_(inv);
-      if (ex.blockCount !== ex.slips.length) {
-        incomplete.push(inv.getName() + " (" + ex.slips.length + "/" + ex.blockCount + "伝票)");
-      }
-      ex.slips.forEach(function (s) {
-        rows.push({ slip_no: s.slipNo, mgmt_no: s.mgmtNo, mall_order_no: s.mallOrderNo, source_file: inv.getName() });
-      });
-    });
-    if (incomplete.length > 0) {
-      result.status = "error: 部分抽出 " + incomplete.join(", ") + " → 削除見送り";
-      return result; // 消さない
-    }
-    if (rows.length === 0) {
-      result.status = "error: 納品書から伝票番号を1件も抽出できず";
-      return result; // 消さない
-    }
-    // フォルダ全体で slip_no が一意であること (Codex R3 high: 別伝票のSP番号を
-    // OCRが同一に誤認すると、サーバ側で ignored に化けて記録が欠落したまま削除される)
-    var slipNos = distinct_(rows.map(function (r) { return r.slip_no; }));
-    if (slipNos.length !== rows.length) {
-      result.status = "error: 伝票番号の重複検出 (" + rows.length + "行中" + slipNos.length +
-                      "種、OCR誤認の可能性) → 削除見送り";
-      return result; // 消さない
-    }
-
-    // ── 送信 (200 + body 検証。ステータスだけでは信頼しない) ──
-    var payload = {
-      run_id: runId,
-      folder: folder.getName(),
-      ship_date: Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy-MM-dd"),
-      extracted_at: Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss"),
-      rows: rows,
-    };
-    var resp = UrlFetchApp.fetch(base + "/ingest", {
-      method: "post",
-      contentType: "application/json",
-      headers: { Authorization: "Bearer " + token },
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true,
-    });
-    var verdict = verifyIngestResponse_(resp, rows.length, folder.getName());
-    if (!verdict.ok) {
-      result.status = "error: " + verdict.reason;
-      return result; // 消さない (再送はサーバ側で冪等)
-    }
-    result.slips = rows.length;
-
-    // ── 削除 (個別に成否を記録。途中失敗は残置扱いで通知) ──
-    if (dryRun) {
-      result.status = "dry-run: " + rows.length + "伝票送信、削除せず";
+    if (invoices.length === 0) {
+      failReason = "納品書PDFなし(誤配置?)";
     } else {
-      var trashFailed = [];
-      files.forEach(function (f) {
-        try { f.setTrashed(true); }
-        catch (e) { trashFailed.push(f.getName()); }
+      var incomplete = [];
+      invoices.forEach(function (inv) {
+        var ex = extractSlipsFromPdf_(inv);
+        if (ex.blockCount !== ex.slips.length) {
+          incomplete.push(inv.getName() + " (" + ex.slips.length + "/" + ex.blockCount + "伝票)");
+        }
+        ex.slips.forEach(function (s) {
+          rows.push({ slip_no: s.slipNo, mgmt_no: s.mgmtNo, mall_order_no: s.mallOrderNo, source_file: inv.getName() });
+        });
       });
-      result.status = trashFailed.length === 0
-        ? "ok: " + rows.length + "伝票送信→" + files.length + "ファイル削除"
-        : "warn: 送信済みだが削除失敗あり → 残置: " + trashFailed.join(", ");
+      var slipNos = distinct_(rows.map(function (r) { return r.slip_no; }));
+      if (incomplete.length > 0) {
+        failReason = "部分抽出 " + incomplete.join(", ");
+      } else if (rows.length === 0) {
+        failReason = "納品書から伝票番号を1件も抽出できず";
+      } else if (slipNos.length !== rows.length) {
+        // 別々の伝票のSP番号をOCRが同一値に誤認すると ignored に化けて記録が欠落するため削除不可
+        failReason = "伝票番号の重複検出 (" + rows.length + "行中" + slipNos.length + "種、OCR誤認の可能性)";
+      }
+    }
+
+    if (!failReason) {
+      var payload = {
+        run_id: runId,
+        folder: batchName,
+        ship_date: shipDate,
+        extracted_at: Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss"),
+        rows: rows,
+      };
+      var resp = UrlFetchApp.fetch(cfg.base + "/ingest", {
+        method: "post",
+        contentType: "application/json",
+        headers: { Authorization: "Bearer " + cfg.token },
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true,
+      });
+      var verdict = verifyIngestResponse_(resp, rows.length, batchName);
+      if (!verdict.ok) failReason = verdict.reason;
+      else result.slips = rows.length;
     }
   } catch (e) {
-    result.status = "error: " + e.message; // 消さずに残す
+    failReason = e.message;
+  }
+
+  // ── 後始末: 出荷_XX を必ず空にする (成功=ゴミ箱 / 失敗=隔離移動)。DRY_RUN は何もしない ──
+  if (cfg.dryRun) {
+    result.status = failReason
+      ? "dry-run NG: " + failReason + " (本番なら隔離)"
+      : "dry-run OK: " + result.slips + "伝票送信 (本番なら削除)";
+    return result;
+  }
+  if (!failReason) {
+    var trashFailed = trashFiles_(files, quarantine, runId, result.name);
+    result.status = trashFailed.length === 0
+      ? "ok: " + result.slips + "伝票送信→" + files.length + "ファイル削除"
+      : "warn: 送信済みだが削除失敗→隔離: " + trashFailed.join(", ");
+  } else if (quarantine) {
+    var movedInfo = moveAllToQuarantine_(files, quarantine, runId, result.name);
+    result.status = "error: " + failReason + " → " + movedInfo;
+  } else {
+    // 隔離リトライ中の失敗: すでに隔離内なのでそのまま残す
+    result.status = "error(隔離継続): " + failReason;
   }
   return result;
 }
 
+/** 成功バッチのゴミ箱移動。失敗したファイルは隔離へ退避 (フォルダに残さない) */
+function trashFiles_(files, quarantine, runId, batchName) {
+  var failed = [];
+  var sub = null;
+  files.forEach(function (f) {
+    try { f.setTrashed(true); }
+    catch (e) {
+      failed.push(f.getName());
+      try {
+        if (!sub && quarantine) sub = getOrCreateSubFolder_(quarantine, runId + "_" + batchName);
+        if (sub) f.moveTo(sub);
+      } catch (e2) { /* 移動も失敗 → 残置 (通知で検知) */ }
+    }
+  });
+  return failed;
+}
+
+/** 失敗バッチの全ファイルを _要確認/<runId>_<出荷_XX>/ へ移動 */
+function moveAllToQuarantine_(files, quarantine, runId, batchName) {
+  var sub = getOrCreateSubFolder_(quarantine, runId + "_" + batchName);
+  var moved = 0;
+  var left = [];
+  files.forEach(function (f) {
+    try { f.moveTo(sub); moved++; }
+    catch (e) { left.push(f.getName()); }
+  });
+  return left.length === 0
+    ? "隔離へ" + moved + "ファイル移動 (フォルダは空)"
+    : "隔離移動失敗あり→フォルダに残置: " + left.join(", ");
+}
+
+/** 隔離フォルダの各バッチを再処理。成功したらファイルをゴミ箱に入れサブフォルダも片付ける */
+function retryQuarantine_(quarantine, cfg, results) {
+  var subs = quarantine.getFolders();
+  while (subs.hasNext()) {
+    var sub = subs.next();
+    var m = QUARANTINE_SUB_RE.exec(sub.getName());
+    if (!m) continue; // 人間が置いた別物には触らない
+    var shipDate = m[1].slice(0, 4) + "-" + m[1].slice(4, 6) + "-" + m[1].slice(6, 8);
+    var r = processBatch_(sub, m[2], shipDate, cfg, null, // quarantine=null: 失敗してもここに留める
+      Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyyMMdd-HHmmss"));
+    if (r) {
+      r.name = "隔離リトライ:" + sub.getName();
+      results.push(r);
+      // 成功して空になったサブフォルダは片付ける (DRY_RUN 時は残す)
+      if (!cfg.dryRun && /^ok:/.test(r.status) && !sub.getFiles().hasNext()) {
+        try { sub.setTrashed(true); } catch (e) { /* 残っても実害なし */ }
+      }
+    }
+  }
+}
+
 /**
- * ingest レスポンス検証。削除許可の条件 (Codex R1 medium #6 + R4 high):
+ * ingest レスポンス検証。削除許可の条件:
  *  - HTTP 200 + ok:true + total===sent + inserted+ignored===sent
  *  - すべての ignored が「同一フォルダからの再送」であること。別フォルダ由来の ignored は
  *    過去取込済み伝票への OCR 誤認の疑いがあるため削除見送り
@@ -159,7 +231,7 @@ function verifyIngestResponse_(resp, sentCount, folderName) {
  * 納品書PDF→一時Docs変換→テキスト抽出→伝票ごとにパース。
  * 完全抽出の判定 (呼び出し側で削除拒否に使う):
  *  - 各ブロックの distinct SP番号がちょうど1件 (0件=見出しはあるが番号欠落、
- *    2件以上=「納品書」見出しのOCR欠けで2伝票が1ブロックに融合 — Codex R2 high)
+ *    2件以上=「納品書」見出しのOCR欠けで2伝票が1ブロックに融合)
  *  - PDF全文の distinct SP番号数 === 抽出伝票数 (ブロック分割自体の欠陥検知)
  * @returns {{ blockCount: number, slips: Array<{slipNo,mgmtNo,mallOrderNo}> }}
  */
@@ -176,7 +248,6 @@ function extractSlipsFromPdf_(pdfFile) {
     Drive.Files.remove(tempDoc.id, { supportsAllDrives: true });
   }
 
-  // 「納品書」で伝票単位にブロック分割し、出荷伝票NO (SPxxx) をアンカーに抽出
   var blocks = text.split(/納品書/).slice(1);
   var slips = [];
   blocks.forEach(function (block) {
@@ -188,23 +259,15 @@ function extractSlipsFromPdf_(pdfFile) {
       mallOrderNo: extractMallOrderNo_(block),
     });
   });
-  // 全文の distinct SP番号数と突合。分割やブロック判定の欠陥で取りこぼした伝票を検知する
   var allSlipNos = distinct_(text.match(/SP\d{8,14}/g) || []);
   var effectiveBlockCount = Math.max(blocks.length, allSlipNos.length);
   return { blockCount: effectiveBlockCount, slips: slips };
 }
 
-function distinct_(arr) {
-  var seen = {};
-  var out = [];
-  arr.forEach(function (v) { if (!seen[v]) { seen[v] = true; out.push(v); } });
-  return out;
-}
-
 /**
  * 管理番号 (NE伝票番号、現行7桁): ブロック内の「単独で現れる7桁数字」の distinct 候補が
  * ちょうど1つのときのみ採用。曖昧なら null (誤った番号を恒久保存するより欠損を選ぶ。
- * slip_no があれば後段でロジザード/NEから復元可能)。(Codex R1 high #4)
+ * slip_no があれば後段でロジザード/NEから復元可能)。
  */
 function extractMgmtNo_(block) {
   var m = block.match(/(?:^|\s)\d{7}(?=\s|$)/gm) || [];
@@ -221,13 +284,29 @@ function extractMallOrderNo_(block) {
   return m ? m[0] : null;
 }
 
+function getOrCreateSubFolder_(parent, name) {
+  var it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+function todayJst_() {
+  return Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy-MM-dd");
+}
+
+function distinct_(arr) {
+  var seen = {};
+  var out = [];
+  arr.forEach(function (v) { if (!seen[v]) { seen[v] = true; out.push(v); } });
+  return out;
+}
+
 function notifyResult_(results, runId, dryRun) {
-  var errors = results.filter(function (r) { return /^(error|skip|warn)/.test(r.status); });
+  var errors = results.filter(function (r) { return /^(error|warn|dry-run NG)/.test(r.status); });
   var totalSlips = results.reduce(function (a, r) { return a + r.slips; }, 0);
   var lines = ["*出荷ファイル吸い上げ " + (dryRun ? "[DRY-RUN] " : "") + runId + "*",
                "処理: " + results.length + "フォルダ / 送信: " + totalSlips + "伝票"];
   if (errors.length > 0) {
-    lines.push("⚠️ 要確認 (ファイル残置あり):");
+    lines.push("⚠️ 要確認 (" + QUARANTINE_NAME + " フォルダを確認):");
     errors.forEach(function (r) { lines.push("・" + r.name + " → " + r.status); });
   }
   var webhook = PropertiesService.getScriptProperties().getProperty("SHIPPING_GCHAT_WEBHOOK");
