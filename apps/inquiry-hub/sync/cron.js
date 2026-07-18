@@ -17,6 +17,7 @@ import { getDB } from '../db.js';
 import { runSync } from './engine.js';
 import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAYS } from './adapters/rakuten.js';
 import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DAYS } from './adapters/yahoo.js';
+import { createGmailAdapter, resolveGmailTransportFromEnv } from './adapters/gmail.js';
 import { sendGChatMessage } from '../../profit-analysis/gchat-client.js';
 
 export const DEFAULT_SYNC_CRON = '*/15 * * * *';
@@ -50,7 +51,13 @@ export function buildAdapterForShop(shop, { deep = false } = {}) {
       ...(deep ? { listLookbackDays: DEEP_LIST_LOOKBACK_DAYS } : {}),
     });
   }
-  return null; // email は Step 3 (Gmailアダプター) で追加
+  if (shop.channel_type === 'email') {
+    const t = resolveGmailTransportFromEnv();
+    if (!t) return null;
+    // Gmail は after: がメッセージ受信日時で効くため deep (lookback) 補正は不要
+    return createGmailAdapter(t);
+  }
+  return null;
 }
 
 /** cron式の分フィールドを展開 ('*', '*\/N', '数値', カンマ区切り のみ対応。それ以外は null=判定不能) */
@@ -131,10 +138,11 @@ export async function runInquiryHubSyncTick(opts = {}) {
     const transports = {
       rakuten: resolveRakutenTransportFromEnv(),
       yahoo: resolveYahooTransportFromEnv(),
+      email: resolveGmailTransportFromEnv(),
     };
     const db = getDB();
     const shops = db.prepare(`SELECT * FROM shops
-      WHERE channel_type IN ('rakuten', 'yahoo') AND is_active = 1 AND executor = 'server'`).all();
+      WHERE channel_type IN ('rakuten', 'yahoo', 'email') AND is_active = 1 AND executor = 'server'`).all();
     if (shops.length === 0) return { skipped: 'no_shops' };
 
     const results = [];

@@ -12,6 +12,8 @@
  *       customerName?, customerIdentifier?, subject?,
  *       orderNumber?, productCode?, productName?,
  *       externalStatus?, externalIsRead?,        // モール側状態 (表示専用カラムへ)
+ *       initialInternalStatus?,                  // 'done' のみ許可。新規作成時だけ適用 (メールルール
+ *                                                //   import_done用。既存チケットの状態は変えない)
  *       receivedAt,                              // 必須 (新規作成時に使用)
  *       messages: [{
  *         externalMessageId?,                    // 無ければ syntheticMessageId() で決定的に採番
@@ -96,13 +98,18 @@ function ingestInquiry(db, shop, item, nowIso) {
   const extRead = item.externalIsRead == null ? null : (item.externalIsRead ? 1 : 0);
 
   if (!inq) {
+    // initialInternalStatus: 'done' のみ (メールルール import_done = 自動配信等を取り込みつつ完了扱い)。
+    // 適用は新規作成時のみで、以後の顧客新着では通常どおり done → open に再オープンされる
+    const initDone = item.initialInternalStatus === 'done';
     const r = db.prepare(`INSERT INTO inquiries (
         channel_type, shop_id, external_inquiry_id, customer_name, customer_identifier, subject,
+        internal_status, is_unread, completed_at,
         external_status, external_is_read, last_external_synced_at,
         order_number, product_code, product_name, received_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(shop.channel_type, shop.id, item.externalInquiryId,
         item.customerName ?? null, item.customerIdentifier ?? null, item.subject ?? null,
+        initDone ? 'done' : 'open', initDone ? 0 : 1, initDone ? nowIso : null,
         extStatus, extRead, nowIso,
         item.orderNumber ?? null, item.productCode ?? null, item.productName ?? null,
         toUtcIso(item.receivedAt));
@@ -172,7 +179,11 @@ function ingestInquiry(db, shop, item, nowIso) {
     db.prepare('UPDATE ai_drafts SET is_stale = 1 WHERE inquiry_id = ? AND is_stale = 0').run(inq.id);
   }
   if (stats.newCustomerMessages > 0) {
-    db.prepare('UPDATE inquiries SET is_unread = 1 WHERE id = ?').run(inq.id);
+    // initialInternalStatus='done' で作った直後は未読化しない (自動配信を静かに取り込む)。
+    // 既存チケットへの顧客新着は従来どおり未読化+再オープン
+    if (!(stats.newInquiry && item.initialInternalStatus === 'done')) {
+      db.prepare('UPDATE inquiries SET is_unread = 1 WHERE id = ?').run(inq.id);
+    }
     // internal_status を同期が触るのはこの1パターンのみ: 顧客新着で done → open (再問い合わせ。§8.1)
     if (inq.internal_status === 'done' && !stats.newInquiry) {
       db.prepare("UPDATE inquiries SET internal_status = 'open', completed_at = NULL WHERE id = ? AND internal_status = 'done'").run(inq.id);
