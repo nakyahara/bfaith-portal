@@ -254,21 +254,36 @@ console.log('=== 5. R1対応: TOCTOU / claimed残留回収 / クーポンURL検�
     && db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_delivery_attempts WHERE action_id = ?`).get(tocId).n === 0);
   db.prepare(`UPDATE rakuten_order_campaign_ownership SET owner = 'self' WHERE order_number = ?`).run(toc.orderNumber);
   const granted = claimActionGuarded(db, tocId, NOW);
-  check('条件復帰後は claim 成功 (messageId+最新スナップショット)', !!granted.messageId && granted.fresh.id === tocId);
-  finalizeAttempt(db, { actionId: tocId, outcome: 'accepted', nowIso: NOW });
+  check('条件復帰後は claim 成功 (messageId+claimToken+最新スナップショット)', !!granted.messageId && !!granted.claimToken && granted.fresh.id === tocId);
+  check('claimToken 照合つき finalize が成功', finalizeAttempt(db, { actionId: tocId, outcome: 'accepted', claimToken: granted.claimToken, nowIso: NOW }) === true);
 
-  // claimed 残留の回収: 送信を開始せず ambiguous に収束
+  // リース内の claimed (別プロセス送信中の想定) → 回収せず・送信も開始しない
   const fresh = makeOrder({});
   const freshId = makeAction({ orderNumber: fresh.orderNumber });
+  const inflight = makeOrder({});
+  const inflightId = makeAction({ orderNumber: inflight.orderNumber });
+  const cIn = claimActionGuarded(db, inflightId, NOW); // たった今 claim された体
+  const sentMails2 = [];
+  const rIn = await processReadyActions(db, { keys, sendFn: async (m) => { sentMails2.push(m); }, nowIso: NOW, limit: 100 });
+  check('リース内 claimed は横取りしない+送信も開始しない (Codex C4-R2 High)',
+    rIn.staleRecovered === 0 && rIn.inFlight === 1 && rIn.sent === 0 && sentMails2.length === 0
+    && db.prepare(`SELECT status FROM rakuten_campaign_actions WHERE id = ?`).get(inflightId).status === 'claimed');
+  // 横取りされなかった claim は本来のプロセスが確定できる
+  check('本来のプロセスは token で確定できる', finalizeAttempt(db, { actionId: inflightId, outcome: 'accepted', claimToken: cIn.claimToken, nowIso: NOW }) === true);
+
+  // リース切れ claimed の回収: 送信を開始せず ambiguous に収束
   const stale = makeOrder({});
   const staleId = makeAction({ orderNumber: stale.orderNumber });
-  const c = claimActionGuarded(db, staleId, NOW); // claim したままクラッシュした体
-  check('前提: claimed 作成', !!c.messageId);
-  const sentMails2 = [];
+  const PAST = new Date(Date.parse(NOW) - 20 * 60000).toISOString(); // リース(15分)超過
+  const cStale = claimActionGuarded(db, staleId, PAST);
+  check('前提: リース切れ claimed 作成', !!cStale.messageId);
   const rRec = await processReadyActions(db, { keys, sendFn: async (m) => { sentMails2.push(m); }, nowIso: NOW, limit: 100 });
-  check('claimed 残留を ambiguous に回収し、送信は開始しない', rRec.staleRecovered === 1 && rRec.sent === 0 && sentMails2.length === 0
+  check('リース切れ claimed を ambiguous に回収し、送信は開始しない', rRec.staleRecovered === 1 && rRec.sent === 0 && sentMails2.length === 0
     && db.prepare(`SELECT status, status_reason FROM rakuten_campaign_actions WHERE id = ?`).get(staleId).status === 'ambiguous'
     && db.prepare(`SELECT note FROM rakuten_campaign_delivery_attempts WHERE action_id = ?`).get(staleId).note === 'stale_claim_recovered');
+  check('回収後 token で finalize しようとしても false (横取り後の上書き防止)',
+    finalizeAttempt(db, { actionId: staleId, outcome: 'accepted', claimToken: cStale.claimToken, nowIso: NOW }) === false
+    && db.prepare(`SELECT status FROM rakuten_campaign_actions WHERE id = ?`).get(staleId).status === 'ambiguous');
   check('回収後の再実行で通常送信が再開', (await processReadyActions(db, { keys, sendFn: async (m) => { sentMails2.push(m); }, nowIso: NOW, limit: 100 })).sent >= 1
     && db.prepare(`SELECT status FROM rakuten_campaign_actions WHERE id = ?`).get(freshId).status === 'sent');
 
@@ -277,7 +292,8 @@ console.log('=== 5. R1対応: TOCTOU / claimed残留回収 / クーポンURL検�
     couponUsableCheck({ status: 'issued', pc_get_url: 'https://evil.example.com/x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
     && couponUsableCheck({ status: 'issued', pc_get_url: 'http://coupon.rakuten.co.jp/getCoupon?getkey=x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
     && couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === true);
-  check('recoverStaleClaims: claimed なしなら 0', recoverStaleClaims(db, NOW) === 0);
+  const rEmpty = recoverStaleClaims(db, NOW);
+  check('recoverStaleClaims: claimed なしなら 0/0', rEmpty.recovered === 0 && rEmpty.inFlight === 0);
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);

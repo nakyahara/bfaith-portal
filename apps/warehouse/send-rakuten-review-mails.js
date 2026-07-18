@@ -136,11 +136,18 @@ try {
           transport.sendMail({ from, to, subject, text, messageId }),
       });
       if (result.staleRecovered > 0) {
-        await notifyOperator(`⚠️ 楽天レビューメール: 前回クラッシュの claimed 残留 ${result.staleRecovered}件を ambiguous に回収しました。実際の到達を確認するまで送信は開始しません (今回の送信は 0件で中断)`);
+        await notifyOperator(`⚠️ 楽天レビューメール: リース切れの claimed 残留 ${result.staleRecovered}件を ambiguous に回収しました。実際の到達を確認するまで送信は開始しません (今回の送信は 0件で中断)`);
         console.error(`[send] ⚠️claimed 残留 ${result.staleRecovered}件を回収。到達確認が済むまで送信しません`);
+        process.exitCode = 1;
+      } else if (result.inFlight > 0) {
+        console.error(`[send] ⚠️リース内の claimed が ${result.inFlight}件あります (別の send が実行中の可能性)。今回は送信しません`);
         process.exitCode = 1;
       } else {
         console.log(`[send] 送信 ${result.sent} / 明確な失敗 ${result.failedSafe} / 結果不明 ${result.ambiguous} / skip ${result.skipped} / ゲート再評価落ち ${result.gateFailed} / claim競り負け ${result.claimLost}`);
+        if (result.finalizeConflict > 0) {
+          console.error(`[send] ⚠️確定競合 ${result.finalizeConflict}件 (送信後に claim を失った=別プロセスの介入痕跡)。delivery_attempts を確認してください`);
+          process.exitCode = 1;
+        }
         if (result.ambiguous > 0) {
           await notifyOperator(`⚠️ 楽天レビューメール送信で結果不明 (ambiguous) ${result.ambiguous}件。自動再送はしません。miniPCで delivery_attempts と実際の到達を確認してください`);
           console.error('[send] ⚠️結果不明が発生したため中断しました。実際の到達を確認するまで再実行しないでください');

@@ -150,7 +150,7 @@ export function claimActionGuarded(db, actionId, nowIso = new Date().toISOString
       INSERT INTO rakuten_campaign_delivery_attempts (action_id, message_id, attempted_at, outcome)
       VALUES (?, ?, ?, 'ambiguous')
     `).run(a.id, messageId, nowIso);
-    return { messageId, fresh: { ...a, monthlyCoupon } };
+    return { messageId, claimToken, fresh: { ...a, monthlyCoupon } };
   });
   try {
     return tx.immediate();
@@ -161,51 +161,64 @@ export function claimActionGuarded(db, actionId, nowIso = new Date().toISOString
   }
 }
 
+/** claimed のリース時間。これを超えた claimed だけを残留とみなす (Codex C4-R2 High:
+ *  リース無しだと SMTP 送信中の正常な claim を並行プロセスが横取りしてしまう。
+ *  SMTP の各タイムアウトは 20〜30 秒 → 15 分は十分な余裕) */
+export const STALE_CLAIM_LEASE_MS = 15 * 60 * 1000;
+
 /**
- * claimed のまま残留した action の回収 (Codex C4-R1 High: claim commit 後のクラッシュは
+ * リース切れ claimed の回収 (Codex C4-R1 High: claim commit 後のクラッシュは
  * SMTP 実行有無を断定できない → ambiguous に収束させ、人が確認するまで送信を始めない)。
- * @returns 回収件数
+ * @returns { recovered, inFlight } — inFlight = リース内の claimed (回収しない。別プロセス送信中の可能性)
  */
-export function recoverStaleClaims(db, nowIso = new Date().toISOString()) {
+export function recoverStaleClaims(db, nowIso = new Date().toISOString(), leaseMs = STALE_CLAIM_LEASE_MS) {
+  const cutoff = new Date(Date.parse(nowIso) - leaseMs).toISOString();
   const tx = db.transaction(() => {
-    const rows = db.prepare(`SELECT id FROM rakuten_campaign_actions WHERE status = 'claimed'`).all();
-    for (const { id } of rows) {
+    const stale = db.prepare(`SELECT id FROM rakuten_campaign_actions WHERE status = 'claimed' AND claimed_at <= ?`).all(cutoff);
+    for (const { id } of stale) {
       db.prepare(`UPDATE rakuten_campaign_delivery_attempts SET note = 'stale_claim_recovered' WHERE action_id = ? AND note IS NULL`).run(id);
       db.prepare(`UPDATE rakuten_campaign_actions SET status = 'ambiguous', status_reason = 'stale_claim', updated_at = ? WHERE id = ? AND status = 'claimed'`).run(nowIso, id);
     }
-    return rows.length;
+    const inFlight = db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_actions WHERE status = 'claimed'`).get().n;
+    return { recovered: stale.length, inFlight };
   });
   return tx.immediate();
 }
 
-/** 送信結果の確定 (claimed → sent / failed_safe) */
-export function finalizeAttempt(db, { actionId, outcome, smtpCode = null, note = null, nowIso = new Date().toISOString() }) {
+/** 送信結果の確定 (claimed → sent / failed_safe)。claimToken を照合し、リース回収などで
+ *  claim を失っていたら何も書かない (Codex C4-R2 High: 横取り後の上書きで矛盾状態を作らない)。
+ *  @returns true=確定できた / false=claim を失っていた (attempt も触らない) */
+export function finalizeAttempt(db, { actionId, outcome, claimToken = null, smtpCode = null, note = null, nowIso = new Date().toISOString() }) {
   const status = outcome === 'accepted' ? 'sent' : 'failed_safe';
   const tx = db.transaction(() => {
+    const r = db.prepare(`
+      UPDATE rakuten_campaign_actions SET status = ?, status_reason = NULL, updated_at = ?
+       WHERE id = ? AND status = 'claimed' AND (? IS NULL OR claim_token = ?)
+    `).run(status, nowIso, actionId, claimToken, claimToken);
+    if (r.changes !== 1) return false;
     db.prepare(`
       UPDATE rakuten_campaign_delivery_attempts SET outcome = ?, smtp_code = ?, note = ?
        WHERE action_id = ?
     `).run(outcome, smtpCode != null ? String(smtpCode) : null, note ? String(note).slice(0, 120) : null, actionId);
-    db.prepare(`
-      UPDATE rakuten_campaign_actions SET status = ?, status_reason = NULL, updated_at = ?
-       WHERE id = ? AND status = 'claimed'
-    `).run(status, nowIso, actionId);
+    return true;
   });
-  tx.immediate();
+  return tx.immediate();
 }
 
-/** 結果不明の確定 (claimed → ambiguous、attempt は ambiguous のまま note のみ) */
-export function markAmbiguous(db, { actionId, note = null, nowIso = new Date().toISOString() }) {
+/** 結果不明の確定 (claimed → ambiguous、attempt は ambiguous のまま note のみ)。claimToken 照合つき */
+export function markAmbiguous(db, { actionId, claimToken = null, note = null, nowIso = new Date().toISOString() }) {
   const tx = db.transaction(() => {
+    const r = db.prepare(`
+      UPDATE rakuten_campaign_actions SET status = 'ambiguous', status_reason = 'smtp_unknown', updated_at = ?
+       WHERE id = ? AND status = 'claimed' AND (? IS NULL OR claim_token = ?)
+    `).run(nowIso, actionId, claimToken, claimToken);
+    if (r.changes !== 1) return false;
     db.prepare(`
       UPDATE rakuten_campaign_delivery_attempts SET note = ? WHERE action_id = ?
     `).run(note ? String(note).slice(0, 120) : null, actionId);
-    db.prepare(`
-      UPDATE rakuten_campaign_actions SET status = 'ambiguous', status_reason = 'smtp_unknown', updated_at = ?
-       WHERE id = ? AND status = 'claimed'
-    `).run(nowIso, actionId);
+    return true;
   });
-  tx.immediate();
+  return tx.immediate();
 }
 
 /** action → メール本文 (宛先はここでは扱わない) */
@@ -224,44 +237,48 @@ export function buildMailForAction(action, nowIso = new Date().toISOString()) {
  * @returns { sent, failedSafe, ambiguous, skipped, claimLost, details } (宛先・注文番号は含まない)
  */
 export async function processReadyActions(db, { keys, sendFn, nowIso = new Date().toISOString(), limit = 5 }) {
-  // claimed 残留の回収が先 (あれば送信を始めない — 人の確認が先)
-  const staleRecovered = recoverStaleClaims(db, nowIso);
-  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: 0, claimLost: 0, gateFailed: 0, staleRecovered, details: [] };
-  if (staleRecovered > 0) {
-    out.details.push({ result: 'stale_claims_recovered', count: staleRecovered });
+  // リース切れ claimed の回収が先 (あれば送信を始めない — 人の確認が先)。
+  // リース内の claimed (別プロセスが送信中の可能性) がある場合も開始しない (単一運転を前提とした保険)
+  const { recovered: staleRecovered, inFlight } = recoverStaleClaims(db, nowIso);
+  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: 0, claimLost: 0, gateFailed: 0, finalizeConflict: 0, staleRecovered, inFlight, details: [] };
+  if (staleRecovered > 0 || inFlight > 0) {
+    out.details.push({ result: staleRecovered > 0 ? 'stale_claims_recovered' : 'in_flight_claims_present', count: staleRecovered || inFlight });
     return out;
   }
   const { eligible, skipped } = selectEligibleActions(db, { nowIso, limit });
   out.skipped = skipped.length;
   for (const action of eligible) {
-    // 復号は claim 前 (復号できないものを claim して枯らさない)。宛先は変数スコープ外に出さない
-    let to;
-    try {
-      to = decryptEmail(action.masked_email_enc, keys, action.order_number);
-    } catch {
-      out.skipped++;
-      out.details.push({ id: action.id, result: 'skip', reason: 'contact_undecryptable' });
-      continue;
-    }
-    // claim は tx 内で全ゲート再評価 (TOCTOU 防止)。文面は tx 内の最新スナップショットから生成
+    // claim は tx 内で全ゲート再評価 (TOCTOU 防止)。文面・宛先とも tx 内の最新スナップショットを使う
     const claim = claimActionGuarded(db, action.id, nowIso);
     if (claim.gateFailed) { out.gateFailed++; out.details.push({ id: action.id, result: 'gate_failed', reason: claim.gateFailed }); continue; }
     if (claim.claimLost) { out.claimLost++; out.details.push({ id: action.id, result: 'claim_lost' }); continue; }
+    // 復号は claim 後に fresh スナップショットから (Codex C4-R2 Medium: select 時の暗号文を使うと
+    // 直前の contacts 同期で更新された宛先とズレる)。失敗=SMTP未実行が確定 → failed_safe に明示収束
+    let to;
+    try {
+      to = decryptEmail(claim.fresh.masked_email_enc, keys, action.order_number);
+    } catch {
+      finalizeAttempt(db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, note: 'contact_undecryptable', nowIso });
+      out.failedSafe++;
+      out.details.push({ id: action.id, result: 'failed_safe', reason: 'contact_undecryptable' });
+      continue;
+    }
     const mail = buildMailForAction(claim.fresh, nowIso);
     try {
       await sendFn({ to, from: `"${SHOP_NAME}" <${FROM_ADDRESS}>`, subject: mail.subject, text: mail.text, messageId: claim.messageId });
       // note には固定分類のみ (SMTPエラー原文は宛先が混入し得るため保存しない — Codex C4-R1 Medium)
-      finalizeAttempt(db, { actionId: action.id, outcome: 'accepted', smtpCode: null, nowIso });
-      out.sent++;
-      out.details.push({ id: action.id, result: 'sent', type: action.action_type });
+      const ok = finalizeAttempt(db, { actionId: action.id, outcome: 'accepted', claimToken: claim.claimToken, smtpCode: null, nowIso });
+      if (ok) { out.sent++; out.details.push({ id: action.id, result: 'sent', type: action.action_type }); }
+      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); }
     } catch (e) {
       const cls = classifySendError(e);
       if (cls.kind === 'rejected') {
-        finalizeAttempt(db, { actionId: action.id, outcome: 'rejected', smtpCode: cls.code, note: 'smtp_rejected', nowIso });
-        out.failedSafe++;
-        out.details.push({ id: action.id, result: 'failed_safe', code: cls.code });
+        const ok = finalizeAttempt(db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, smtpCode: cls.code, note: 'smtp_rejected', nowIso });
+        if (ok) { out.failedSafe++; out.details.push({ id: action.id, result: 'failed_safe', code: cls.code }); }
+        else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); }
       } else {
-        markAmbiguous(db, { actionId: action.id, note: 'smtp_unknown', nowIso });
+        const ok = markAmbiguous(db, { actionId: action.id, claimToken: claim.claimToken, note: 'smtp_unknown', nowIso });
+        if (!ok) out.finalizeConflict++;
         out.ambiguous++;
         out.details.push({ id: action.id, result: 'ambiguous' });
         break; // 結果不明は即中断 — 続行しない (設計: 自動再送禁止・人に確認)
