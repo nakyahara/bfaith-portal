@@ -168,13 +168,11 @@ export async function downloadDriveCsv(source) {
     if (buffer.length > MAX_CSV_BYTES) {
       throw vErr(`ファイルが大きすぎます (${Math.round(buffer.length / 1024 / 1024)}MB > 上限20MB)。対象ファイルが正しいか確認してください。`);
     }
-    // DL 中の差し替え検知: 再度 metadata を見て modifiedTime が変わっていなければ採用
-    const after = await drive.files.get(
-      { fileId: info.file_id, fields: 'modifiedTime', supportsAllDrives: true },
-      { timeout: TIMEOUT }
-    ).catch(() => null);
-    const afterTime = after && after.data && after.data.modifiedTime;
-    if (!afterTime || afterTime === info.modified_time) {
+    // DL 中の差し替え検知: 同名検索をやり直し、file_id と modifiedTime の両方が一致した時だけ採用。
+    // 「削除→同名再アップロード」は file_id が変わるため、旧IDの modifiedTime 確認では検知できない
+    // (Codex R2 High)。再確認の検索自体が失敗したら throw されエラー扱い (成功扱いにしない、fail-closed)。
+    const after = await findDriveFile(source);
+    if (after.file_id === info.file_id && after.modified_time === info.modified_time) {
       _infoCache.set(source, { at: Date.now(), info }); // 表示キャッシュも取込時点に更新
       return { ...info, buffer };
     }
