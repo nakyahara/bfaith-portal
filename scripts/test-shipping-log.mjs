@@ -16,6 +16,10 @@
  * Test 12: GET /recent-picking / GET /export (read token + 範囲検証)
  * Test 13: GAS parsePickingText_ — 実物OCRテキスト (2026-07-19 出荷_01) で総合計抽出、
  *          連結トークンの一意分割検算、曖昧・形式外は throw
+ * Test 14: GAS dedupeByContent_ — md5一致のみ複製扱い、md5不明は除外しない
+ * Test 15: Notion担当者 (notion-staff.js) — buildStaffRows の設定検証 fail-closed /
+ *          正規化 / 重複タイブレーク、upsertStaffRows の COALESCE 保持、
+ *          POST /sync-staff / GET /staff-props / GET /recent-staff の認証と状態
  *
  * 実行: node scripts/test-shipping-log.mjs
  */
@@ -278,6 +282,98 @@ const mkFile = (id, name) => ({ getId: () => id, getName: () => name, getSize: (
 expectEq(dedupe([mkFile('id1', 'a.pdf'), mkFile('id2', 'a.pdf')]).length, 1, '同名同md5 → 1つに集約');
 expectEq(dedupe([mkFile('id1', 'a.pdf'), mkFile('id3', 'a.pdf')]).length, 2, '同名同サイズ異md5 → 両方残す');
 expectEq(dedupe([mkFile('id1', 'a.pdf'), mkFile('id4', 'a.pdf')]).length, 2, 'md5不明 → 複製扱いしない');
+
+// ── Test 15: Notion担当者スナップショット ──
+const { buildStaffRows, normalizeBatchNo } = await import('../apps/shipping-log/notion-staff.js');
+const { upsertStaffRows, recentStaff: recentStaffFn } = await import('../apps/shipping-log/db.js');
+
+expectEq(normalizeBatchNo('出荷_01'), '出荷_01', 'batch正規化 そのまま');
+expectEq(normalizeBatchNo('1'), '出荷_01', 'batch正規化 数字のみ');
+expectEq(normalizeBatchNo('出荷12'), '出荷_12', 'batch正規化 アンダースコアなし');
+expectEq(normalizeBatchNo('メモ'), null, 'batch正規化 数字なし→null');
+expectEq(normalizeBatchNo('棚卸 1'), null, 'batch正規化 無関係接頭辞→null');
+expectEq(normalizeBatchNo('返品_02'), null, 'batch正規化 別業務カード→null');
+expectEq(normalizeBatchNo('0'), null, 'batch正規化 0→null');
+
+const mkPage = (id, edited, props) => ({ id, last_edited_time: edited, properties: props });
+const pTitle = (s) => ({ type: 'title', title: [{ plain_text: s }] });
+const pPeople = (names) => ({ type: 'people', people: names.map((n) => ({ name: n })) });
+const pDate = (d) => ({ type: 'date', date: d ? { start: d } : null });
+const cfgBase = { propBatch: '出荷No', propPacker: '梱包', propPicker: null, propDate: null, propStatus: null };
+
+// 設定不備は fail-closed
+expectEq(!!buildStaffRows([mkPage('p1', '', { 出荷No: pTitle('1') })], { ...cfgBase, propPacker: null }, '2026-07-19').skipped,
+  true, 'PACKER未設定 → skipped');
+expectEq(!!buildStaffRows([mkPage('p1', '', { 出荷No: pTitle('1') })], { ...cfgBase, propPacker: 'タイプミス' }, '2026-07-19').skipped,
+  true, 'プロパティ不存在 → skipped');
+// 正常系 (日付プロパティなし = カード使い回し運用 → 当日割当)
+const staffBuilt = buildStaffRows([
+  mkPage('p1', '2026-07-19T09:00:00Z', { 出荷No: pTitle('1'), 梱包: pPeople(['山田']) }),
+  mkPage('p2', '2026-07-19T09:00:00Z', { 出荷No: pTitle('02'), 梱包: pPeople(['佐藤', '鈴木']) }),
+  mkPage('p3', '2026-07-19T09:00:00Z', { 出荷No: pTitle('メモ'), 梱包: pPeople([]) }),
+], cfgBase, '2026-07-19');
+expectEq(staffBuilt.rows?.length, 2, 'staff rows 件数');
+expectEq(staffBuilt.noBatch, 1, 'staff 出荷No不明カウント');
+expectEq(staffBuilt.rows?.find((r) => r.batch_no === '出荷_02')?.packer, '佐藤、鈴木', 'people 複数名連結');
+// 日付プロパティなし + 同一バッチ重複 = 日別カードDBの疑い → skipped
+expectEq(!!buildStaffRows([
+  mkPage('p1', '2026-07-19T09:00:00Z', { 出荷No: pTitle('1'), 梱包: pPeople(['山田']) }),
+  mkPage('p2', '2026-07-19T10:00:00Z', { 出荷No: pTitle('01'), 梱包: pPeople(['佐藤']) }),
+], cfgBase, '2026-07-19').skipped, true, 'DATE未設定+重複 → skipped');
+// DATE設定時: 日付ありは重複を最終更新でタイブレーク、日付なしカードは除外
+const cfgDate = { ...cfgBase, propDate: '作業日' };
+const datedBuilt = buildStaffRows([
+  mkPage('p1', '2026-07-19T09:00:00Z', { 出荷No: pTitle('1'), 梱包: pPeople(['山田']), 作業日: pDate('2026-07-18') }),
+  mkPage('p2', '2026-07-19T10:00:00Z', { 出荷No: pTitle('1'), 梱包: pPeople(['佐藤']), 作業日: pDate('2026-07-18') }),
+  mkPage('p3', '2026-07-19T10:00:00Z', { 出荷No: pTitle('2'), 梱包: pPeople(['田中']), 作業日: pDate(null) }),
+], cfgDate, '2026-07-19');
+expectEq(datedBuilt.rows?.length, 1, 'DATE設定 rows 件数');
+expectEq(datedBuilt.rows?.[0]?.packer, '佐藤', '重複は最終更新が新しい方を採用');
+expectEq(datedBuilt.noDate, 1, '日付なしカードは除外カウント');
+
+// upsert: COALESCE で取得済み担当者を NULL で潰さない
+upsertStaffRows([{ work_date: '2026-07-19', batch_no: '出荷_01', packer: '山田', picker: null,
+  card_status: null, notion_page_id: 'p1', props_summary: '{}' }]);
+upsertStaffRows([{ work_date: '2026-07-19', batch_no: '出荷_01', packer: null, picker: '鈴木',
+  card_status: null, notion_page_id: 'p1', props_summary: '{}' }]);
+const staffRow = db.prepare(`SELECT packer, picker FROM sl_batch_staff WHERE batch_no='出荷_01'`).get();
+expectEq(staffRow.packer, '山田', 'COALESCE packer保持');
+expectEq(staffRow.picker, '鈴木', 'COALESCE picker追記');
+// 日別カード運用 (preserveNonNull=false): 作業日単位の置換 = 空欄訂正・カード削除も反映
+upsertStaffRows([{ work_date: '2026-07-19', batch_no: '出荷_01', packer: null, picker: null,
+  card_status: null, notion_page_id: 'p1', props_summary: '{}' }], { preserveNonNull: false });
+expectEq(db.prepare(`SELECT packer FROM sl_batch_staff WHERE work_date='2026-07-19' AND batch_no='出荷_01'`).get().packer,
+  null, '日別カード運用は空欄訂正を反映');
+upsertStaffRows([{ work_date: '2026-07-20', batch_no: '出荷_05', packer: 'A', picker: null,
+  card_status: null, notion_page_id: 'p5', props_summary: '{}' }], { preserveNonNull: false });
+upsertStaffRows([{ work_date: '2026-07-20', batch_no: '出荷_06', packer: 'B', picker: null,
+  card_status: null, notion_page_id: 'p6', props_summary: '{}' }], { preserveNonNull: false });
+expectEq(db.prepare(`SELECT COUNT(*) c FROM sl_batch_staff WHERE work_date='2026-07-20'`).get().c,
+  1, '日別カード運用は作業日単位で置換 (消えたカードの行が残らない)');
+// 突合VIEW: 7/18伝票はstaff無し(null)、staffは7/19なのでJOINされない→dateを合わせて確認
+upsertStaffRows([{ work_date: '2026-07-18', batch_no: '出荷_01', packer: '中村', picker: null,
+  card_status: null, notion_page_id: 'p9', props_summary: '{}' }]);
+const joined = db.prepare(`SELECT packer FROM v_sl_slips_staff WHERE slip_no='SP00110324384'`).get();
+expectEq(joined.packer, '中村', 'v_sl_slips_staff 伝票×担当者JOIN');
+// 日別カード置換 (7/19・7/20) は取得結果に無い過去日 (7/18) に触らない
+upsertStaffRows([{ work_date: '2026-07-20', batch_no: '出荷_06', packer: 'B', picker: null,
+  card_status: null, notion_page_id: 'p6', props_summary: '{}' }], { preserveNonNull: false });
+expectEq(db.prepare(`SELECT COUNT(*) c FROM sl_batch_staff WHERE work_date='2026-07-18'`).get().c,
+  1, '取得結果に無い過去日は保持 (アーカイブされても履歴は残る)');
+
+// HTTP: 認証と状態
+delete process.env.NOTION_TOKEN;
+expectEq((await post('/sync-staff', {}, null)).status, 401, 'sync-staff token 無し → 401');
+const syncRes = await post('/sync-staff', {}, TOKEN);
+expectEq(syncRes.status, 200, 'sync-staff (NOTION_TOKEN未設定) → 200');
+expectEq(!!syncRes.body.skipped, true, 'sync-staff skipped 明示');
+expectEq((await fetch(`${base}/staff-props`)).status, 401, 'staff-props token 無し → 401');
+expectEq((await fetch(`${base}/staff-props`, { headers: { 'x-read-token': READ_TOKEN } })).status, 503,
+  'staff-props (NOTION_TOKEN未設定) → 503');
+const rs = await fetch(`${base}/recent-staff?limit=10`, { headers: { 'x-read-token': READ_TOKEN } });
+expectEq(rs.status, 200, 'GET /recent-staff → 200');
+expectEq((await rs.json()).rows.length, 3, 'recent-staff 行数');
+expectEq(recentStaffFn(10).length, 3, 'recentStaff 行数');
 
 await new Promise((r) => server.close(r));
 try { db.close(); } catch { /* teardown */ }

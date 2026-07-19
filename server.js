@@ -24,6 +24,7 @@ import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js'
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
+import { startShippingStaffCron } from './apps/shipping-log/notion-staff.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -1356,6 +1357,10 @@ app.listen(PORT, () => {
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
+
+  // 出荷カード担当者スナップショット (Notion→sl_batch_staff、毎日19:30 JST。
+  // SHIPPING_STAFF_CRON_ENABLED=true で起動、Dark Launch)
+  startShippingStaffCron();
 });
 
 process.on('SIGTERM', () => {

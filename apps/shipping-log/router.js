@@ -14,7 +14,8 @@
  */
 import express from 'express';
 import crypto from 'node:crypto';
-import { ingestFolderSlips, ingestPickingBatches, exportRange, recentSlips, recentPicking, getSchemaError } from './db.js';
+import { ingestFolderSlips, ingestPickingBatches, exportRange, recentSlips, recentPicking, recentStaff, getSchemaError } from './db.js';
+import { runStaffSync, fetchStaffProps } from './notion-staff.js';
 
 const router = express.Router();
 
@@ -202,7 +203,35 @@ router.get('/recent-picking', requireReadToken, (req, res) => handle(res, () => 
   res.json({ ok: true, rows: recentPicking(req.query.limit) });
 }));
 
-// miniPC daily-sync 吸い上げ用: ship_date 範囲 export (read-only token)。
+function handleAsync(res, fn) {
+  fn().catch((e) => {
+    if (e.code === 'SCHEMA_UNAVAILABLE') {
+      return res.status(503).json({ ok: false, error: 'schema_unavailable', init_error: getSchemaError() });
+    }
+    console.error('[shipping-log]', e.message);
+    res.status(500).json({ ok: false, error: 'server_error', message: e.message });
+  });
+}
+
+// Notion出荷カード担当者同期の手動実行 (初回セットアップ・検証用。cron と同処理・多重起動ガードあり)
+router.post('/sync-staff', requireIngestKey, (req, res) => handleAsync(res, async () => {
+  const r = await runStaffSync();
+  res.status(r.ok ? 200 : 409).json(r); // ok:false は already_running のみ
+}));
+
+// 初回マッピング用: NotionDBのプロパティ構成とサンプルカードを表示 (書き込みなし)
+router.get('/staff-props', requireReadToken, (req, res) => handleAsync(res, async () => {
+  const r = await fetchStaffProps();
+  res.status(r.ok ? 200 : 503).json(r); // ok:false は NOTION_TOKEN 未設定
+}));
+
+// 動作確認用: 直近の担当者スナップショット (read-only token)
+router.get('/recent-staff', requireReadToken, (req, res) => handle(res, () => {
+  res.json({ ok: true, rows: recentStaff(req.query.limit) });
+}));
+
+// 分析用途の範囲取得 (read-only token)。伝票+ピッキング+担当者はすべて mirror 同居なので
+// 通常は SQL (v_sl_slips_staff) で足りるが、外部から検証したい時用に残す。
 // 範囲は最大31日 (1日~700伝票 × 31日でも数MB程度。それ以上は複数回に分けて呼ぶ)
 const MAX_EXPORT_DAYS = 31;
 router.get('/export', requireReadToken, (req, res) => handle(res, () => {

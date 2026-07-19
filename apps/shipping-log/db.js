@@ -72,6 +72,29 @@ export function ensureSchema() {
       CREATE TRIGGER IF NOT EXISTS trg_sl_picking_no_delete
         BEFORE DELETE ON sl_picking_batches
         BEGIN SELECT RAISE(ABORT, 'sl_picking_batches is append-only (DELETE forbidden)'); END;
+
+      -- Notion出荷カードの担当者スナップショット (作業日×バッチ)。
+      -- Notion側の状態のミラーなので append-only にはしない (伝票と性格が違う)。
+      -- 更新方針は upsertStaffRows 参照 (使い回しカード=COALESCE保護 / 日別カード=作業日単位置換)
+      CREATE TABLE IF NOT EXISTS sl_batch_staff (
+        work_date TEXT NOT NULL,          -- 作業日 (JST。sl_shipping_slips.ship_date と JOIN)
+        batch_no TEXT NOT NULL,           -- 出荷_XX に正規化 (folder_name と JOIN)
+        packer TEXT,                      -- 梱包担当者 (複数は「、」区切り)
+        picker TEXT,                      -- ピッキング担当者 (任意)
+        card_status TEXT,                 -- カードのステータス (任意)
+        notion_page_id TEXT,
+        props_summary TEXT,               -- プロパティ要約JSON (マッピング調整・デバッグ用)
+        synced_at TEXT NOT NULL,
+        PRIMARY KEY (work_date, batch_no)
+      );
+
+      -- 突合ビュー: どの伝票を誰が梱包したか (伝票 × 担当者スナップショット)
+      CREATE VIEW IF NOT EXISTS v_sl_slips_staff AS
+      SELECT s.slip_no, s.ship_date, s.folder_name, s.mgmt_no, s.mall_order_no,
+             st.packer, st.picker, st.card_status
+      FROM sl_shipping_slips s
+      LEFT JOIN sl_batch_staff st
+        ON st.work_date = s.ship_date AND st.batch_no = s.folder_name;
     `);
     schemaReady = true;
     schemaError = null;
@@ -256,6 +279,66 @@ export function recentSlips(limit) {
     SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, received_at
     FROM sl_shipping_slips
     ORDER BY received_at DESC, slip_no
+    LIMIT ?
+  `).all(n);
+}
+
+/**
+ * Notion出荷カードの担当者スナップショットを upsert する (notion-staff.js 専用)。
+ *
+ * preserveNonNull (既定 true) = 使い回しカード運用 (日付プロパティなし) 用:
+ *   COALESCE upsert で「一度取れた値を後続の NULL で潰さない」(夕方の同期後にカードが
+ *   翌日用にリセットされても取得済みの実績を保持する)。
+ * preserveNonNull=false = 日別カード運用 (作業日プロパティ明示) 用:
+ *   カードがその日の正なので、取得できた作業日ごとに delete→insert で置換する
+ *   (空欄への訂正・出荷No/日付の付け替え・カード削除もミラーに反映される — Codex medium ×2)。
+ *   取得結果に現れない過去の作業日は触らない = カードがアーカイブされても履歴は残る。
+ * @param {Array<{ work_date: string, batch_no: string, packer: string|null, picker: string|null,
+ *                 card_status: string|null, notion_page_id: string, props_summary: string }>} rows
+ * @returns {number} 書き込み行数
+ */
+export function upsertStaffRows(rows, { preserveNonNull = true } = {}) {
+  const db = requireSchema();
+  const now = new Date().toISOString();
+  const insertSql = `
+    INSERT INTO sl_batch_staff
+      (work_date, batch_no, packer, picker, card_status, notion_page_id, props_summary, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+  const stmt = preserveNonNull
+    ? db.prepare(`${insertSql}
+        ON CONFLICT(work_date, batch_no) DO UPDATE SET
+          packer = COALESCE(excluded.packer, packer),
+          picker = COALESCE(excluded.picker, picker),
+          card_status = COALESCE(excluded.card_status, card_status),
+          notion_page_id = excluded.notion_page_id,
+          props_summary = excluded.props_summary,
+          synced_at = excluded.synced_at`)
+    : db.prepare(insertSql);
+  const deleteByDate = db.prepare('DELETE FROM sl_batch_staff WHERE work_date = ?');
+
+  const tx = db.transaction((rs) => {
+    if (!preserveNonNull) {
+      for (const d of new Set(rs.map((r) => r.work_date))) deleteByDate.run(d);
+    }
+    let n = 0;
+    for (const r of rs) {
+      stmt.run(r.work_date, r.batch_no, r.packer, r.picker, r.card_status,
+        r.notion_page_id, r.props_summary, now);
+      n++;
+    }
+    return n;
+  });
+  return tx(rows);
+}
+
+/** 直近の担当者スナップショット (動作確認用) */
+export function recentStaff(limit) {
+  const db = requireSchema();
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return db.prepare(`
+    SELECT work_date, batch_no, packer, picker, card_status, notion_page_id, synced_at
+    FROM sl_batch_staff
+    ORDER BY work_date DESC, batch_no
     LIMIT ?
   `).all(n);
 }
