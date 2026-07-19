@@ -467,7 +467,7 @@ export function releaseExport(batch_id) {
 // 生成 (再試行安全) と 確定 (一度きり) を分離する (Codex High①②: CAS後の取りこぼし/二重投入防止)。
 // lineRows も返し、commit 側で再クエリせず同じスナップショットで tracking 登録できるようにする。
 export function buildExportCsv(batch_id, opts = {}) {
-  const downgradeMeltline = !!opts.downgradeMeltline; // MeltLine 導入前: meltline を手動出荷に落として出力
+  // ※ 旧 opts.downgradeMeltline (MeltLine 導入前形式) は撤去済 (2026-07-19)。MeltLine 本番稼働済のため常に通常形式で出力。
   const db = ensureSchema();
   const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!b) throw vErr('バッチが見つかりません');
@@ -485,7 +485,6 @@ export function buildExportCsv(batch_id, opts = {}) {
     const raw = JSON.parse(l.raw_cols);
     if (l.shipping_method_code && l.shipping_method_code !== 'aes') {
       let pm = l.packing_machine_code;
-      if (downgradeMeltline && pm === 'meltline') pm = 'manual'; // MeltLine 導入前は手動出荷で出す
       if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
       // 沖縄県宛 × ネコポス は梱包機マーカーを「手動出荷」に矯正。
       // 航空便の液体規制は、ヤマト端末で送り状QRを読んだときに「沖縄エラー」で別管理導線へ

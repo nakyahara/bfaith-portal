@@ -132,6 +132,10 @@
         </span>
         <span id="exportResult" style="font-size:12px; margin-left:8px"></span>
       </div>
+      <!-- Drive が使えないとき用の控えめな手動DL (2026-07-19 中原さん指示で目立たなく) -->
+      <div style="margin-top:4px; font-size:12px">
+        <a href="#" id="lnkExportManualDl" class="muted" style="text-decoration:underline; color:#888">⬇ Google Driveが使えないとき: CSVをPCに手動ダウンロード</a>
+      </div>
       <div class="scroll">
         <table>
           <thead><tr><th>状態</th><th></th><th>店舗</th><th>注文番号</th><th>種別</th><th>都道府県</th><th>商品</th><th>配送方法</th><th>梱包機</th><th>理由</th></tr></thead>
@@ -532,6 +536,10 @@
         <span id="trkAllCsvStatus" class="muted"></span>
       </div>
       <div id="trkAllCsvResult" class="muted" style="margin-top:6px"></div>
+      <!-- Drive が使えないとき用の控えめな手動DL (2026-07-19 中原さん指示で目立たなく) -->
+      <div style="margin-top:6px; font-size:12px">
+        <a href="#" id="lnkTrkAllCsvManualDl" class="muted" style="text-decoration:underline; color:#888">⬇ Google Driveが使えないとき: CSVをPCに手動ダウンロード</a>
+      </div>
     </div>
 
     <!-- 📊 配送方法変更ログ (中原さん 2026-06-04 指示) -->
@@ -1225,19 +1233,54 @@ $('#btnExportPost').onclick = async () => {
     const res = j.result;
     const act = res.drive && res.drive.action === 'created' ? '新規作成' : '上書き保存';
     const fname = (res.drive && res.drive.filename) || 'logi_dispatch.csv';
-    out.innerHTML = `<span style="color:#2e7d32">✅ Driveに保存しました（${fname} / ${res.rowCount}件）</span>`
-      + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 フォルダを開く</a>` : '');
-    alert(`✅ Google Drive に保存しました\n\n`
+    const where = res.folderName ? `Google Drive の共有フォルダ「${esc(res.folderName)}」` : 'Google Drive';
+    out.innerHTML = `<span style="color:#2e7d32">✅ ${where} に保存しました（${esc(fname)} / ${res.rowCount}件）</span>`
+      + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 保存先フォルダを開く</a>` : '');
+    alert(`✅ ${res.folderName ? 'Google Drive の「' + res.folderName + '」フォルダ' : 'Google Drive'} に保存しました\n\n`
       + `ファイル: ${fname}（${act}）\n件数: ${res.rowCount}件\n\n`
-      + `このファイルをロジザードに取り込んでください。`);
+      + `このファイルをロジザードに取り込んでください。\n（PC にはダウンロードされていません）`);
     // 出力済み(exported)になったので状態を再表示
     try{ const s = await api(`api/batch/${encodeURIComponent(BATCH)}`); renderSummary(s); await loadOrders(); }catch(_){}
   }catch(e){
     // Drive保存に失敗 → バッチは未出力のまま。もう一度押せば再実行できる。
     out.innerHTML = `<span style="color:#c62828">エラー: ${esc(e.message)}（未出力のままです。もう一度押せます）</span>`;
-    alert('CSV出力エラー: ' + e.message + '\n\nバッチは未出力のままです。少し待ってもう一度お試しください。');
+    alert('CSV出力エラー: ' + e.message + '\n\nバッチは未出力のままです。少し待ってもう一度お試しください。'
+      + '\n\nGoogle Drive が使えない場合は、下の「⬇ CSVをPCに手動ダウンロード」から出力できます。');
   }finally{
     btn.disabled = false; btn.textContent = orig;
+  }
+};
+
+// メインCSV出力の手動ダウンロード (Google Drive が使えないとき用の控えめな導線)。
+// Drive 保存と同じ「build→commit」を行い exported 化 + tracking 登録まで確定した上で、Drive へは上げず
+// CSV を PC に保存する (⑤ 追跡番号タブに伝票が出るよう、状態確定は Drive 保存と揃える)。
+$('#lnkExportManualDl').onclick = async (e) => {
+  e.preventDefault();
+  if(!BATCH) return;
+  const out = $('#exportResult'), lnk = $('#lnkExportManualDl');
+  if(lnk.dataset.busy === '1') return;
+  if(!confirm('Google Drive を使わず、CSVを PC にダウンロードします。\n（出力は確定し「出力済み」になります。ロジザードにはこのファイルを取り込んでください）\n\nよろしいですか?')) return;
+  lnk.dataset.busy = '1';
+  const origText = lnk.textContent; lnk.textContent = '⏳ ダウンロード生成中…';
+  out.innerHTML = '';
+  try{
+    const r = await fetch(API_BASE + `api/export/${encodeURIComponent(BATCH)}/download`, { method:'POST' });
+    const j = await r.json().catch(() => ({ ok:false, message:'通信エラー' }));
+    if(!j.ok) throw new Error(j.message || j.error || 'エラー');
+    const res = j.result;
+    if(res.csvBase64) downloadBase64Csv(res.csvBase64, res.filename || 'logi_dispatch.csv');
+    const fn = res.filename || 'logi_dispatch.csv';
+    out.innerHTML = `<span style="color:#2e7d32">✅ ダウンロードを開始しました（${esc(fn)} / ${res.rowCount}件）。ブラウザのダウンロード一覧を確認し、ロジザードに取り込んでください。</span>`;
+    alert(`✅ CSVのダウンロードを開始しました\n\nファイル: ${fn}\n件数: ${res.rowCount}件\n\n`
+      + `ブラウザのダウンロード一覧に出ているか確認してください。\nもし保存されていなければ、もう一度このリンクを押せば同じ内容を再取得できます。\n\nこのファイルをロジザードに取り込んでください。`);
+    try{ const s = await api(`api/batch/${encodeURIComponent(BATCH)}`); renderSummary(s); await loadOrders(); }catch(_){}
+  }catch(err){
+    // commit 済みでも応答だけ失われた可能性があるので「未出力」と断定しない。
+    // この経路は冪等 (exported なら同一CSVを再生成) なので、もう一度押せば安全に再取得できる。
+    out.innerHTML = `<span style="color:#c62828">エラー: ${esc(err.message)}（状態を確認できません。もう一度押すと同じCSVを再取得できます）</span>`;
+    alert('手動ダウンロードエラー: ' + err.message + '\n\n状態を確認できませんでした。もう一度このリンクを押すと、同じ内容のCSVを再取得できます。');
+  }finally{
+    lnk.dataset.busy = '0'; lnk.textContent = origText;
   }
 };
 
@@ -2494,10 +2537,14 @@ $('#btnTrkAllCsvDownload').onclick = async () => {
     if(res.status === 'saved'){
       const act = res.drive && res.drive.action === 'created' ? '新規作成' : '上書き保存';
       const fname = (res.drive && res.drive.filename) || 'ne-tracking.csv';
-      result.innerHTML = `<span style="color:#2e7d32">✅ Driveに保存しました（${fname} / ${res.count}件）</span>`
-        + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 フォルダを開く</a>` : '');
-      alert(`✅ Google Drive に保存しました\n\nファイル: ${fname}（${act}）\n件数: ${res.count}件\n\n`
-        + `このファイルを NextEngine の追跡番号CSVインポートに取り込んでください。`);
+      // どこに保存されたかを画面に明示 (初見の人向け): フォルダ名 + ファイル名 + 開くリンク。
+      const where = res.folderName ? `Google Drive の共有フォルダ「${esc(res.folderName)}」` : 'Google Drive';
+      result.innerHTML = `<span style="color:#2e7d32">✅ ${where} に保存しました（${esc(fname)} / ${res.count}件）</span>`
+        + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 保存先フォルダを開く</a>` : '')
+        + `<br><span class="muted">※ PC にはダウンロードされません（Drive に直接保存）。</span>`;
+      alert(`✅ ${res.folderName ? 'Google Drive の「' + res.folderName + '」フォルダ' : 'Google Drive'} に保存しました\n\n`
+        + `ファイル: ${fname}（${act}）\n件数: ${res.count}件\n\n`
+        + `このファイルを NextEngine の追跡番号CSVインポートに取り込んでください。\n（PC にはダウンロードされていません）`);
     } else if(res.status === 'empty'){
       result.innerHTML = `<span style="color:#c62828">⚠️ 出力対象が 0 件のため保存しませんでした</span>`;
       alert('⚠️ 追跡番号ありの伝票が 0 件のため、Driveには保存しませんでした。');
@@ -2509,11 +2556,12 @@ $('#btnTrkAllCsvDownload').onclick = async () => {
         + `Drive には保存していません。最新の件数に更新したので、もう一度内容を確認して保存してください。`);
       loadTrkReadyExport();
     } else {
-      // Drive 保存失敗 (SA未共有など) → fail-safe で PC にダウンロード
+      // Drive 保存失敗 (SA未共有など) → fail-safe で PC へダウンロード
       if(res.csvBase64) downloadBase64Csv(res.csvBase64, res.filename || 'ne-tracking.csv');
-      result.innerHTML = `<span style="color:#c62828">⚠️ Drive保存に失敗したため PC にダウンロードしました（${res.count}件）</span>`;
+      result.innerHTML = `<span style="color:#c62828">⚠️ Drive保存に失敗したため、代わりに CSV のダウンロードを開始しました（${res.count}件）。ブラウザのダウンロード一覧を確認してください。</span>`;
       alert('⚠️ Google Drive への保存に失敗しました。\n\n' + (res.message || '')
-        + '\n\n代わりに CSV を PC にダウンロードしました。（保存先フォルダに サービスアカウントが「コンテンツ管理者」で共有されているか確認してください）');
+        + '\n\n代わりに CSV のダウンロードを開始しました。ブラウザのダウンロード一覧を確認してください。'
+        + '\n（保存先フォルダに サービスアカウントが「コンテンツ管理者」で共有されているか確認してください）');
     }
   }catch(e){
     result.innerHTML = `<span style="color:#c62828">エラー: ${esc(e.message)}</span>`;
@@ -2521,6 +2569,29 @@ $('#btnTrkAllCsvDownload').onclick = async () => {
   }finally{
     btn.disabled = false; btn.textContent = orig;
   }
+};
+
+// ⑤ 手動ダウンロード (Google Drive が使えないとき用の控えめな導線)。
+// tracking CSV は読み取り生成のみ (状態を変えない) なので、GET でそのまま PC へ落とす。
+// scope / 件数のガードは Drive 保存ボタンと同じ (確認範囲と出力範囲を一致させる)。
+$('#lnkTrkAllCsvManualDl').onclick = (e) => {
+  e.preventDefault();
+  const status = $('#trkAllCsvStatus');
+  status.style.color = ''; status.textContent = '';
+  const { count, scope } = TRK_ALL_CSV;
+  if(scope !== TRK_SCOPE){
+    status.style.color = '#c0392b';
+    status.textContent = '⚠️ 出力範囲を読込中です。数秒後にもう一度お試しください';
+    return;
+  }
+  if(count === 0){
+    status.style.color = '#c0392b';
+    status.textContent = '⚠️ CSV に出力できる追跡番号ありの伝票がありません';
+    return;
+  }
+  const scopeText = scope !== 'today' ? '過去全期間' : '本日分';
+  if(!confirm(`${scopeText}の「追跡番号あり ${count} 件」を PC にダウンロードします。\n（Google Drive には保存しません）`)) return;
+  location.href = API_BASE + 'api/tracking/ready/csv?method=all&scope=' + scope;
 };
 
 // 定形外: 全選択 / 全解除

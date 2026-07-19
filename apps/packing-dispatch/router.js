@@ -206,6 +206,7 @@ router.post('/api/export/:id/to-drive', (req, res) => handleAsync(res, () =>
       const up = await uploadCsvToDrive(built.buffer, PD_DRIVE_EXPORT_FILE, PD_DRIVE_EXPORT_FOLDER);
       commitExport(batchId, currentUser(req), { lineRows: built.lineRows, rowCount: built.rowCount });
       return { status: 'saved', rowCount: built.rowCount,
+        folderName: up.folderName || null,
         folderUrl: `https://drive.google.com/drive/folders/${PD_DRIVE_EXPORT_FOLDER}`,
         drive: { action: up.action, fileId: up.fileId, filename: PD_DRIVE_EXPORT_FILE } };
     } catch (e) {
@@ -214,18 +215,69 @@ router.post('/api/export/:id/to-drive', (req, res) => handleAsync(res, () =>
     }
   })));
 
-// 出力 (Shift-JIS)。premeltline=1 で MeltLine を手動出荷に落として出力 (MeltLine 導入前用)。
+// ── Google Drive が使えないとき用の手動ダウンロード (staff、2026-07-19 中原さん指示) ──
+// Drive 一本化の抜け穴にしないため UI では控えめに置くが、機能としては to-drive と同じ
+// 「beginExport→buildExportCsv→commitExport」を行い、exported 化 + tracking 登録まで正しく確定する
+// (これを怠ると ⑤ 追跡番号タブに伝票が出てこない)。Drive へは上げず CSV を base64 で返し、フロントで PC 保存する。
+// admin GET /api/export/:id と違い staff から呼べる (障害時の詰み防止) が、通常運用は Drive 保存が主。
+router.post('/api/export/:id/download', (req, res) => handleAsync(res, () =>
+  withExportDriveLock(async () => {
+    const batchId = req.params.id;
+    // 出力は常に通常形式 (premeltline は全経路で撤去済 2026-07-19)。出力形式のブレが無くなるので、
+    // exported 後の再取得は 48h 以内なら運用上ほぼ同一内容になる (厳密なバイト一致は非保証)。
+    const summary = batchSummary(batchId);
+    if (!summary) { const e = new Error('バッチが見つかりません'); e.code = 'VALIDATION'; throw e; }
+    const mkFilename = (n) => `logi_dispatch_${n}rows.csv`;
+    // Codex High: commitExport 後に DL が失敗すると「exported なのに手元に無い」で詰む。
+    // 冪等回復のため、既に exported なら再確定せず CSV を再生成して返す (状態は変えない)。
+    // これで DL 失敗後にもう一度リンクを押せば再取得できる (詰み防止)。
+    // ※ CSV スナップショットは保存しない: 生成CSVには顧客住所等のPIIが含まれ、これを別途永続化すると
+    //   本アプリのPII最小化 (PIIは import_line.raw_cols のみ・TTL purge) を崩すため。再生成でも
+    //   1件ごとの判定 (配送方法/梱包機) は import_line に凍結済で、変動し得るのは静的な配送方法マスタ
+    //   (pd_shipping_method) のみ → 48h の再取得窓では運用上ほぼ同一 (厳密なバイト一致は非保証・リスク受容)。
+    if (summary.batch.status === 'exported') {
+      // exported 分岐は beginExport を通らないため TTL チェックを明示 (Codex High):
+      // purge は常時ではないので、期限切れバッチが残っている間に 48h 超で PII 入り CSV を再取得させない。
+      if (summary.batch.expires_at && summary.batch.expires_at < new Date().toISOString()) {
+        const e = new Error('このバッチは期限切れ(48h超)です。再度CSVをアップロードしてください'); e.code = 'VALIDATION'; throw e;
+      }
+      const built = buildExportCsv(batchId, {});
+      return { status: 'downloaded', already_exported: true, rowCount: built.rowCount,
+        filename: mkFilename(built.rowCount), csvBase64: Buffer.from(built.buffer).toString('base64') };
+    }
+    beginExport(batchId); // 未判断あり/期限切れ/世代逆転はここで弾かれる (Drive保存と同じガード)
+    try {
+      const built = buildExportCsv(batchId, {});
+      commitExport(batchId, currentUser(req), { lineRows: built.lineRows, rowCount: built.rowCount });
+      return { status: 'downloaded', rowCount: built.rowCount,
+        filename: mkFilename(built.rowCount), csvBase64: Buffer.from(built.buffer).toString('base64') };
+    } catch (e) {
+      releaseExport(batchId); // 未出力状態へ戻して再実行可能に (best-effort)
+      throw e;
+    }
+  })));
+
+// 出力 (Shift-JIS)。旧ブラウザ直DL経路 (admin 限定)。
 // ⚠️ 通常運用の出力先は Drive 固定 (POST /api/export/:id/to-drive) に一本化済み。
 //    この旧DL経路は「Drive一本化を迂回して exported 化するだけ (Drive未保存)」の抜け穴になり得るため
-//    admin 限定にする (Codex High④)。緊急時の premeltline 直DL用に経路自体は残す。
-//    to-drive と同じ withExportDriveLock で直列化し、出力処理の競合を防ぐ。
+//    admin 限定にする (Codex High④)。to-drive と同じ withExportDriveLock で直列化し、競合を防ぐ。
+//    ※ premeltline (MeltLine 導入前形式) は撤去済 (2026-07-19 中原さん確定): MeltLine 本番稼働済で
+//      今使うと MeltLine 品を手動出荷に落とす誤出力になり、手動DLの冪等再取得も崩すため。常に通常形式。
 router.get('/api/export/:id', (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const premeltline = req.query.premeltline === '1';
-  withExportDriveLock(async () =>
-    exportCsv(req.params.id, currentUser(req), { downgradeMeltline: premeltline })
-  ).then(({ buffer, rowCount }) => {
-    const fname = `logi_dispatch_${premeltline ? 'premelt_' : ''}${rowCount}rows.csv`;
+  const batchId = req.params.id;
+  withExportDriveLock(async () => {
+    // Codex High: 直接 exportCsv だと beginExport の TTL・最新世代チェックを迂回し、
+    //   期限切れ/旧世代バッチも exported 化できてしまう。to-drive / download と同じく beginExport を通す。
+    beginExport(batchId);
+    try {
+      return exportCsv(batchId, currentUser(req), {});
+    } catch (e) {
+      releaseExport(batchId); // 未出力状態へ戻す (best-effort)
+      throw e;
+    }
+  }).then(({ buffer, rowCount }) => {
+    const fname = `logi_dispatch_${rowCount}rows.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
     res.send(buffer);
@@ -464,6 +516,7 @@ router.post('/api/tracking/ready/csv/to-drive', (req, res) => handleAsync(res, (
         { scope, count, action: up.action, file_id: up.fileId, filename: PD_TRK_DRIVE_FILE }, currentUser(req));
       if (!audited) console.error('[packing] tracking csv to-drive: 監査ログ書込み失敗 (Drive保存は成功)', { file_id: up.fileId, count, scope });
       return { status: 'saved', count, audited,
+        folderName: up.folderName || null,
         folderUrl: `https://drive.google.com/drive/folders/${PD_TRK_DRIVE_FOLDER}`,
         drive: { action: up.action, fileId: up.fileId, filename: PD_TRK_DRIVE_FILE } };
     } catch (e) {
