@@ -1007,7 +1007,8 @@ async function main() {
       tokenWarnings.push('🔴 Yahoo トークン未初期化 → 認可が必要！');
     }
   } catch (e) {
-    tokenWarnings.push(`⚠️ Yahoo プロキシ接続失敗: ${e.message.slice(0, 100)}`);
+    // プロキシ死は「トークン期限を確認できない」ではなく「Yahoo取得系が全滅+期限警告も沈黙」なので urgent (🔴) 扱い
+    tokenWarnings.push(`🔴 Yahoo プロキシ接続失敗 (取得系全滅・期限確認不能): ${e.message.slice(0, 100)}`);
   }
 
   // NE（ネクストエンジン） — ne-tokens.jsonの更新日から判定（2日以内に更新必要）
