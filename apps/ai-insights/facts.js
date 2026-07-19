@@ -68,7 +68,7 @@ function roundYen(v) {
  * scope 全体が完了に見えてしまう)。run 単位で「全 chunk が到着済みかつ applied 済み」の
  * 完了 run に属する chunk のみを対象にする (Codexレビュー2巡目 high 対応)。
  */
-function coveredDaysForEntity(db, entity, days) {
+export function coveredDaysForEntity(db, entity, days) {
   const first = days[0];
   const last = days[days.length - 1];
   const rows = db.prepare(`

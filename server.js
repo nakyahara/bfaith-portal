@@ -61,6 +61,7 @@ import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
+import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -1367,6 +1368,8 @@ app.listen(PORT, () => {
   startMarginAlertJob();
   // biz-ops-overview 売上サマリ GChat 通知 (在庫と独立メッセージ、SALES_NOTIFY_ENABLED=true で起動)
   startSalesNotificationJob();
+  // ai-insights 月次締めリマインダー+確定後変更検知 (AI_INSIGHTS_NOTIFY_ENABLED=true で起動、JST 10:00)
+  startAiInsightsNotifyJob();
 
   // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
   startRysCron();

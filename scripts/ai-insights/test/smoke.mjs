@@ -70,6 +70,39 @@ function baseInput() {
   };
 }
 
+function baseMonthlyInput(closingOverride = {}) {
+  return {
+    meta: {
+      report_type: 'monthly', month_ym: '2026-06', period_start: '2026-06-01', period_end: '2026-07-01',
+      period_label: '2026-06月次', generated_at: new Date().toISOString(),
+      data_as_of: '2026-07-15', input_schema_version: '1.0',
+    },
+    closing: {
+      year_month: '2026-06', status: 'open', declare_seq: 0, declared_at: null,
+      mf_synced_after_declare: false, provisional_state: null, final_state: null,
+      needs_correction: false, ...closingOverride,
+    },
+    coverage: [],
+    constraints: { generation: 'allowed', data_quality_status: 'normal', mf_reliability: 'provisional', prohibited_topic_areas: [] },
+    facts: {
+      pl: {
+        this_month: { sales_yen: 15000, gross_profit_yen: 10000, gross_profit_pct: 50, operating_income_yen: 10000 },
+        prev_month: { sales_yen: 10000 },
+        last_year_same_month: null,
+        reliability: '暫定',
+      },
+      mall_sales: [{ mall: 'rakuten', sales_yen: 15000, mom_pct: 50 }],
+      fy: [],
+      anomaly_signals: [],
+    },
+    events: { entries: [] },
+    budget: { available: false, entries: [], budget_revision_id: null },
+    previous_open_topics: [{ topic_id: 'tp_prev_1', title: '前回論点', category: 'sales', status: 'open', public_id: 'MO-202605-f' }],
+    recent_reports: [],
+    pl_hash: 'plhash-test',
+  };
+}
+
 const server = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (d) => { raw += d; });
@@ -81,12 +114,23 @@ const server = http.createServer((req, res) => {
 
     if (url === '/api/ai-insights/report-input') {
       state.authSeen.read = req.headers['x-read-token'];
-      return json(200, state.inputOverride || baseInput());
+      const isMonthly = /type=monthly/.test(req.url);
+      return json(200, isMonthly
+        ? (state.monthlyInput || baseMonthlyInput())
+        : (state.inputOverride || baseInput()));
     }
     if (url === '/api/ai-insights/service/jobs/claim') {
       state.authSeen.bearer = req.headers.authorization;
       if (state.claimResult) return json(200, state.claimResult);
-      return json(200, { result: 'claimed', job: { job_id: 'jb_smoke_1', report_type: 'weekly', period_start: PS, period_end: '2026-07-13', edition: 'final' } });
+      const ed = body?.edition === 'correction-next' ? 'correction-1' : (body?.edition || 'final');
+      return json(200, {
+        result: 'claimed',
+        job: {
+          job_id: 'jb_smoke_1', report_type: body?.report_type || 'weekly',
+          period_start: body?.period_start || PS, period_end: body?.period_end || '2026-07-13',
+          edition: ed,
+        },
+      });
     }
     if (/^\/api\/ai-insights\/service\/jobs\/[^/]+\/report$/.test(url)) {
       return json(200, { ok: true, report_id: 'rp_smoke_1', public_id: 'WK-20260706-f' });
@@ -135,8 +179,30 @@ function reset() {
   state.calls = [];
   state.webhookTexts = [];
   state.inputOverride = null;
+  state.monthlyInput = null;
   state.claimResult = null;
   state.postedFail = false;
+}
+const MONTHLY_RUNNER = path.join(TEST_DIR, '..', 'run-monthly-report.js');
+function runMonthly(extraEnv = {}, extraArgs = []) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [MONTHLY_RUNNER, '--month=2026-06', ...extraArgs], {
+      env: {
+        ...process.env,
+        PORTAL_BASE_URL: `http://127.0.0.1:${port}`,
+        AI_READ_TOKEN: 'tok-read', AI_INSIGHT_SERVICE_TOKEN: 'tok-service',
+        GCHAT_WEBHOOK_URL: `http://127.0.0.1:${port}/webhook`,
+        CLAUDE_CMD: `node ${FAKE_CLAUDE}`, CLAUDE_RETRY_BASE_MS: '10', CLAUDE_TIMEOUT_MS: '20000',
+        AI_RUNNER_NOW: '2026-07-15T09:00:00+09:00', // 15日 (10日以降)
+        FAKE_MODE: 'ok',
+        ...extraEnv,
+      },
+    });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    child.on('close', (code) => resolve({ code, out }));
+  });
 }
 const calledPaths = () => state.calls.map((c) => c.path.replace(/jb_[a-z0-9_]+/i, ':job'));
 
@@ -337,6 +403,70 @@ console.log('\n■ reconciliation_required');
   const { code, out } = await runRunner({ FAKE_MODE: 'ok' });
   ok(code === 0 && out.includes('[NOTIFY:status=reconciliation_required]'), '照合待ちは何もしない', out.slice(-200));
   ok(state.webhookTexts.length === 0, 'webhook 投稿なし (自動再投稿禁止)', state.webhookTexts);
+}
+
+// ═══ 8. 月次 runner (PR-3) ═══
+console.log('\n■ 月次: 状態機械の判定');
+{
+  // 10日前 → skip
+  reset();
+  let r = await runMonthly({ AI_RUNNER_NOW: '2026-07-05T09:00:00+09:00' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=skip_before_10th]'), '10日前 → skip', r.out.slice(-200));
+  ok(!calledPaths().some((p) => p.includes('/claim')), '10日前は claim しない', calledPaths());
+
+  // 10日以降・未宣言 → 暫定版
+  reset();
+  r = await runMonthly();
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=ok]'), '暫定版 生成→投稿', r.out.slice(-300));
+  let claimCall = state.calls.find((c) => c.path.endsWith('/claim'));
+  ok(claimCall.body.edition === 'provisional' && claimCall.body.period_start === '2026-06-01', 'claim edition=provisional', claimCall.body);
+  ok(!('declare_seq' in claimCall.body), '暫定版は declare_seq を送らない', claimCall.body);
+  let reportCall = state.calls.find((c) => c.path.endsWith('/report'));
+  ok(reportCall.body.pl_hash === 'plhash-test', 'pl_hash をサーバに渡す (確定後変更検知の基準)', reportCall.body.pl_hash);
+  let text = state.webhookTexts[0] || '';
+  ok(text.startsWith('*📊 AI経営レポート（月次・暫定）*'), 'ヘッダー = 月次・暫定', text.split('\n')[0]);
+
+  // 暫定版発行済み・未宣言 → 宣言待ち skip
+  reset();
+  state.monthlyInput = baseMonthlyInput({ provisional_state: 'posted' });
+  r = await runMonthly();
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=skip_waiting_declare]'), '暫定済み → 宣言待ち', r.out.slice(-200));
+
+  // 宣言済み・MF同期待ち → retry
+  reset();
+  state.monthlyInput = baseMonthlyInput({ status: 'declared', mf_synced_after_declare: false });
+  r = await runMonthly();
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=retry_later_mf]'), '宣言後MF同期待ち → retry', r.out.slice(-200));
+  ok(!calledPaths().some((p) => p.includes('/claim')), 'MF同期前は claim しない', calledPaths());
+
+  // 宣言済み・MF同期済み → 確定版
+  reset();
+  state.monthlyInput = baseMonthlyInput({ status: 'declared', declare_seq: 1, mf_synced_after_declare: true });
+  r = await runMonthly();
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=ok]'), '確定版 生成→投稿', r.out.slice(-300));
+  claimCall = state.calls.find((c) => c.path.endsWith('/claim'));
+  ok(claimCall.body.edition === 'final', 'claim edition=final', claimCall.body);
+  ok(claimCall.body.declare_seq === 1, 'final claim は宣言番号を固定して送る', claimCall.body);
+  text = state.webhookTexts[0] || '';
+  ok(text.startsWith('*📊 AI経営レポート（月次・確定）*'), 'ヘッダー = 月次・確定', text.split('\n')[0]);
+
+  // 再宣言後 → 訂正版 (correction-next → correction-1)
+  reset();
+  state.monthlyInput = baseMonthlyInput({
+    status: 'declared', mf_synced_after_declare: true, needs_correction: true, final_state: 'posted',
+  });
+  r = await runMonthly();
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=ok]'), '訂正版 生成→投稿', r.out.slice(-300));
+  claimCall = state.calls.find((c) => c.path.endsWith('/claim'));
+  ok(claimCall.body.edition === 'correction-next', 'claim edition=correction-next', claimCall.body);
+  text = state.webhookTexts[0] || '';
+  ok(text.startsWith('*📊 AI経営レポート（月次・訂正1）*'), 'ヘッダー = 月次・訂正1 (採番反映)', text.split('\n')[0]);
+
+  // dry-run (サーバ書き込みなし)
+  reset();
+  r = await runMonthly({}, ['--dry-run']);
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=dry_run]') && r.out.includes('GChat本文プレビュー'), '月次 dry-run', r.out.slice(-200));
+  ok(!calledPaths().some((p) => p.includes('/service/')), 'dry-run はサーバ書き込みなし', calledPaths());
 }
 
 server.close();
