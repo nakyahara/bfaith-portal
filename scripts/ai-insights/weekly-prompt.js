@@ -105,13 +105,13 @@ function factsNumberSet(input) {
   return set;
 }
 
-function assertEvidenceNumbers(topic, numberSet, idx) {
+function assertEvidenceNumbers(topic, numberSet, label) {
   const text = String(topic.evidence || '').replace(/[,，]/g, '');
   for (const m of text.matchAll(/\d+(?:\.\d+)?/g)) {
     const tok = m[0];
     if (tok.replace('.', '').length < 2) continue; // 1桁 (「3個」等) は許容
     if (!numberSet.has(tok) && !(tok.includes('.') && numberSet.has(tok.split('.')[0]))) {
-      throw new Error(`topic[${idx}].evidence に facts に無い数値 "${tok}" (数字創作の疑い)`);
+      throw new Error(`${label} に facts に無い数値 "${tok}" (数字創作の疑い)`);
     }
   }
 }
@@ -127,15 +127,27 @@ export function validateOutput(raw, input) {
   if (topicsIn.length > 3) throw new Error(`too many topics: ${topicsIn.length}`);
   const badMalls = prohibitedMalls(input);
   const numberSet = factsNumberSet(input);
+  const companyBanned = (input.constraints?.prohibited_topic_areas || [])
+    .some((p) => p.area === 'company_totals');
+
+  // 機械検査 (summary / title / evidence 共通): 禁止モール言及・全社集計・数字創作
+  const checkText = (text, label) => {
+    const probe = String(text || '').toLowerCase();
+    for (const mall of badMalls) {
+      if (probe.includes(mall)) throw new Error(`${label} が禁止領域モール "${mall}" に言及`);
+    }
+    if (companyBanned && /全社|会社全体|合計売上/.test(String(text || ''))) {
+      throw new Error(`${label} が禁止された全社集計に言及 (company_totals 禁止)`);
+    }
+  };
+  checkText(summary, 'summary');
+  assertEvidenceNumbers({ evidence: summary }, numberSet, 'summary');
+
   const topics = topicsIn.map((t, i) => {
     const title = String(t?.title ?? '').trim();
     if (!title) throw new Error(`topic[${i}].title missing`);
-    // 禁止領域の機械検査: 禁止モール名が title/evidence に出たら違反
-    const probe = `${title} ${t?.evidence ?? ''}`.toLowerCase();
-    for (const mall of badMalls) {
-      if (probe.includes(mall)) throw new Error(`topic[${i}] が禁止領域モール "${mall}" に言及`);
-    }
-    assertEvidenceNumbers({ evidence: t?.evidence }, numberSet, i);
+    checkText(`${title} ${t?.evidence ?? ''}`, `topic[${i}]`);
+    assertEvidenceNumbers({ evidence: t?.evidence }, numberSet, `topic[${i}].evidence`);
     return {
       title: cap(title, CAPS.title),
       category: TOPIC_CATEGORIES.includes(t?.category) ? t.category : 'other',

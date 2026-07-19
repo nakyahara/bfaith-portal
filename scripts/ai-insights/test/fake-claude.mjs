@@ -26,9 +26,21 @@ if (mode === 'prohibited' || mode === 'invented') {
 }
 
 // プロンプトに前回論点の topic_id が含まれていれば topic_updates に使う (フィルタ検証用)
+if (mode === 'badsummary') {
+  // topics は正常だが summary が禁止された全社集計に言及 → summary 検査で棄却されるべき
+  process.stdout.write(JSON.stringify({
+    type: 'result', subtype: 'success', is_error: false,
+    result: JSON.stringify({
+      summary: '全社売上は15,500円と好調でした。',
+      topics: [], topic_updates: [], data_notes: '',
+    }),
+  }));
+  process.exit(0);
+}
+
 const topicIdMatch = stdin.match(/topic_id=(tp_[a-zA-Z0-9_]+)/);
 const result = {
-  summary: '楽天が前週比+50%と好調でした。全社売上は15,500円です。',
+  summary: '楽天が前週比+50%と好調でした。詳細は論点参照。',
   topics: [
     {
       title: '楽天売上が前週比+50%',

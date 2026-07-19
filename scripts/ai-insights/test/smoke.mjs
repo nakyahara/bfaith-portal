@@ -165,6 +165,7 @@ console.log('\n■ 正常系 (claude 生成 → 投稿)');
   ok(text.includes('(WK-20260706-f)'), 'public_id 埋め込み', text.slice(-80));
   ok(text.includes('論点1: 楽天売上が前週比+50%'), '論点タイトル', null);
   ok(text.includes('対応: ') && text.includes('中原さん / 金曜まで'), '対応: 誰/いつまで', null);
+  ok(!text.includes('全社'), '正常系でも禁止された全社集計は本文に出ない', text);
   ok(text.length <= 3500, '3500字以内', text.length);
   const postedCall = state.calls.find((c) => c.path.endsWith('/posted'));
   ok(postedCall.body.gchat_message_id === 'spaces/x/messages/smoke-1', 'message ID 保存', postedCall.body);
@@ -206,6 +207,10 @@ console.log('\n■ AI出力の機械検査 (禁止モール言及 / 数字創作
   r = await runRunner({ FAKE_MODE: 'invented' });
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い数字 → 棄却 → fallback', r.out.slice(-300));
   ok(r.out.includes('数字創作の疑い'), '違反理由がログに出る', null);
+  reset();
+  r = await runRunner({ FAKE_MODE: 'badsummary' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'summary の全社集計言及 → 棄却 → fallback', r.out.slice(-300));
+  ok(r.out.includes('全社集計に言及'), 'summary 検査の違反理由がログに出る', null);
 }
 
 // ═══ 3c. webhook成功後の /posted 失敗 → 成否不明扱い (二重投稿させない) ═══
