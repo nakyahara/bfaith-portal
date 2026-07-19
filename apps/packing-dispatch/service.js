@@ -467,7 +467,7 @@ export function releaseExport(batch_id) {
 // 生成 (再試行安全) と 確定 (一度きり) を分離する (Codex High①②: CAS後の取りこぼし/二重投入防止)。
 // lineRows も返し、commit 側で再クエリせず同じスナップショットで tracking 登録できるようにする。
 export function buildExportCsv(batch_id, opts = {}) {
-  const downgradeMeltline = !!opts.downgradeMeltline; // MeltLine 導入前: meltline を手動出荷に落として出力
+  // ※ 旧 opts.downgradeMeltline (MeltLine 導入前形式) は撤去済 (2026-07-19)。MeltLine 本番稼働済のため常に通常形式で出力。
   const db = ensureSchema();
   const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!b) throw vErr('バッチが見つかりません');
@@ -485,7 +485,6 @@ export function buildExportCsv(batch_id, opts = {}) {
     const raw = JSON.parse(l.raw_cols);
     if (l.shipping_method_code && l.shipping_method_code !== 'aes') {
       let pm = l.packing_machine_code;
-      if (downgradeMeltline && pm === 'meltline') pm = 'manual'; // MeltLine 導入前は手動出荷で出す
       if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
       // 沖縄県宛 × ネコポス は梱包機マーカーを「手動出荷」に矯正。
       // 航空便の液体規制は、ヤマト端末で送り状QRを読んだときに「沖縄エラー」で別管理導線へ
@@ -982,11 +981,20 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
   return { registered, syncedSkipped, candidates: byUketsuke.size };
 }
 
+// best-effort。書込めたら true、失敗したら false を返す (呼び出し側が監査有無を判定できるように)。
 function audit(action, target, detail, who) {
   try {
     getMirrorDB().prepare(`INSERT INTO pd_audit_log (ts,who,action,target,detail) VALUES (?,?,?,?,?)`)
       .run(utcIsoNow(), who || null, action, target || null, detail ? JSON.stringify(detail) : null);
-  } catch (e) { console.error('[packing] audit', e.message); }
+    return true;
+  } catch (e) { console.error('[packing] audit', e.message); return false; }
+}
+
+// ⑤ 追跡番号CSVの Drive 保存の監査ログ (router から呼ぶ)。状態遷移(CAS)が無い経路なので、
+// 誰が・いつ・どの範囲(scope)・何件・Drive のどのファイルに保存したかを追跡できるよう別途記録する。
+// Drive 上書きは取消不能なので保存自体は失敗させず、監査の成否を bool で返して呼び出し側に判断を委ねる (Codex High)。
+export function auditTrackingCsvDriveSave(detail, user) {
+  return audit('tracking_csv_drive_save', null, detail, user);
 }
 
 // ───────────────────────── マスタ② CRUD (区間連続性検証) ─────────────────────────

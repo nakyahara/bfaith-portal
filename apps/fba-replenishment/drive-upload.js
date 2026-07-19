@@ -47,12 +47,14 @@ export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 't
   // 保存先フォルダが属する共有ドライブIDを取得し、検索を当該ドライブ内に限定する。
   // corpora=allDrives は incompleteSearch を返し得て、既存を見落とし重複作成する恐れがあるため避ける (Codex Medium)。
   let driveId = null;
+  let folderName = null; // 保存先フォルダ名 (UI に「どこに保存したか」を出すため。取得できなければ null)
   try {
     const meta = await drive.files.get(
-      { fileId: folderId, fields: 'id, driveId', supportsAllDrives: true },
+      { fileId: folderId, fields: 'id, name, driveId', supportsAllDrives: true },
       { timeout: TIMEOUT }
     );
     driveId = meta.data.driveId || null;
+    folderName = meta.data.name || null;
   } catch (e) {
     const email = getServiceAccountEmail();
     throw new Error(
@@ -81,14 +83,14 @@ export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 't
   if (existing) {
     // 既存ファイルの中身だけ差し替え (fileId/共有設定は維持)
     await drive.files.update({ fileId: existing.id, media, supportsAllDrives: true }, { timeout: TIMEOUT });
-    return { action: 'updated', fileId: existing.id };
+    return { action: 'updated', fileId: existing.id, folderName };
   }
 
   const created = await drive.files.create(
     { requestBody: { name: filename, parents: [folderId] }, media, fields: 'id', supportsAllDrives: true },
     { timeout: TIMEOUT }
   );
-  return { action: 'created', fileId: created.data.id };
+  return { action: 'created', fileId: created.data.id, folderName };
 }
 
 /**
