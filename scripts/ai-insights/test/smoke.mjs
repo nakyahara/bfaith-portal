@@ -78,7 +78,7 @@ function baseMonthlyInput(closingOverride = {}) {
       data_as_of: '2026-07-15', input_schema_version: '1.0',
     },
     closing: {
-      year_month: '2026-06', status: 'open', declared_at: null,
+      year_month: '2026-06', status: 'open', declare_seq: 0, declared_at: null,
       mf_synced_after_declare: false, provisional_state: null, final_state: null,
       needs_correction: false, ...closingOverride,
     },
@@ -420,6 +420,7 @@ console.log('\n■ 月次: 状態機械の判定');
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=ok]'), '暫定版 生成→投稿', r.out.slice(-300));
   let claimCall = state.calls.find((c) => c.path.endsWith('/claim'));
   ok(claimCall.body.edition === 'provisional' && claimCall.body.period_start === '2026-06-01', 'claim edition=provisional', claimCall.body);
+  ok(!('declare_seq' in claimCall.body), '暫定版は declare_seq を送らない', claimCall.body);
   let reportCall = state.calls.find((c) => c.path.endsWith('/report'));
   ok(reportCall.body.pl_hash === 'plhash-test', 'pl_hash をサーバに渡す (確定後変更検知の基準)', reportCall.body.pl_hash);
   let text = state.webhookTexts[0] || '';
@@ -440,11 +441,12 @@ console.log('\n■ 月次: 状態機械の判定');
 
   // 宣言済み・MF同期済み → 確定版
   reset();
-  state.monthlyInput = baseMonthlyInput({ status: 'declared', mf_synced_after_declare: true });
+  state.monthlyInput = baseMonthlyInput({ status: 'declared', declare_seq: 1, mf_synced_after_declare: true });
   r = await runMonthly();
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=ok]'), '確定版 生成→投稿', r.out.slice(-300));
   claimCall = state.calls.find((c) => c.path.endsWith('/claim'));
   ok(claimCall.body.edition === 'final', 'claim edition=final', claimCall.body);
+  ok(claimCall.body.declare_seq === 1, 'final claim は宣言番号を固定して送る', claimCall.body);
   text = state.webhookTexts[0] || '';
   ok(text.startsWith('*📊 AI経営レポート（月次・確定）*'), 'ヘッダー = 月次・確定', text.split('\n')[0]);
 

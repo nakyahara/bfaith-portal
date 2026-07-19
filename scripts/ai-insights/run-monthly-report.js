@@ -93,11 +93,22 @@ async function main() {
     edition = 'provisional';
   }
 
-  // ── claim ──
-  const claim = await serviceCall(cfg, '/jobs/claim', {
-    report_type: 'monthly', period_start: input.meta.period_start, period_end: input.meta.period_end,
-    edition, claimed_by: RUNNER_ID,
-  });
+  // ── claim (final/correction は宣言番号を固定 → 生成中の再宣言を誤って確定扱いしない) ──
+  let claim;
+  try {
+    claim = await serviceCall(cfg, '/jobs/claim', {
+      report_type: 'monthly', period_start: input.meta.period_start, period_end: input.meta.period_end,
+      edition, claimed_by: RUNNER_ID,
+      declare_seq: edition === 'provisional' ? undefined : closing.declare_seq,
+    });
+  } catch (e) {
+    if (e.status === 409) {
+      // 宣言状態が入力取得後に変わった (再オープン等)。翌日の実行で追従する
+      notify('skip', `claim見送り: ${e.body?.error || e.message}`);
+      return 0;
+    }
+    throw e;
+  }
   if (claim.result === 'already_posted') { notify('skip', `${claim.job.edition} 投稿済み`); return 0; }
   if (claim.result === 'busy') { notify('skip_busy', '別プロセスが実行中'); return 0; }
   if (claim.result === 'reconciliation_required') {
@@ -133,15 +144,29 @@ async function main() {
       body = buildMonthlyFallbackBody(input);
       mode = 'fallback';
     }
-    const saved = await serviceCall(cfg, `/jobs/${jobId}/report`, {
-      generation_mode: mode, body_json: body, topics: body.topics,
-      topic_updates: body.topic_updates,
-      input_hash: stableInputHash(input), data_as_of: input.meta?.data_as_of,
-      data_quality_status: input.constraints?.data_quality_status || null,
-      prompt_version: MONTHLY_PROMPT_VERSION, input_schema_version: INPUT_SCHEMA_VERSION,
-      budget_revision_id: input.budget?.budget_revision_id || null,
-      pl_hash: input.pl_hash || null, // 確定後変更検知の基準 (final/correction 時にサーバが保存)
-    });
+    let saved;
+    try {
+      saved = await serviceCall(cfg, `/jobs/${jobId}/report`, {
+        generation_mode: mode, body_json: body, topics: body.topics,
+        topic_updates: body.topic_updates,
+        input_hash: stableInputHash(input), data_as_of: input.meta?.data_as_of,
+        data_quality_status: input.constraints?.data_quality_status || null,
+        prompt_version: MONTHLY_PROMPT_VERSION, input_schema_version: INPUT_SCHEMA_VERSION,
+        budget_revision_id: input.budget?.budget_revision_id || null,
+        pl_hash: input.pl_hash || null, // 確定後変更検知の基準 (final/correction 時にサーバが保存)
+      });
+    } catch (e) {
+      if (e.body?.error_class === 'stale_declare_seq') {
+        // 生成中に再オープン→再宣言された。旧生成は破棄し翌日の実行で追従する
+        stopHeartbeat();
+        await serviceCall(cfg, `/jobs/${jobId}/failed`, {
+          error_class: 'stale_declare_seq', error_detail: '生成中に宣言が進んだため破棄',
+        }).catch(() => {});
+        notify('skip', '生成中に再宣言 → 旧生成を破棄 (翌日追従)');
+        return 0;
+      }
+      throw e;
+    }
     await serviceCall(cfg, `/jobs/${jobId}/posting`);
     const text = buildGChatMessage(body, input, saved.public_id, {
       editionLabel: editionLabel(actualEdition), detailUrl: `${cfg.base}/apps/ai-insights`,

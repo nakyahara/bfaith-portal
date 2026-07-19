@@ -468,6 +468,34 @@ console.log('\n■ 月次 report-input + 締め宣言');
   ok(r.body.closing.needs_correction === true, '再宣言後は needs_correction', r.body.closing);
   r = await post('/api/ai-insights/service/jobs/claim', { ...MKEY, edition: 'correction-next' }, SVC);
   ok(r.status === 200 && r.body.job.edition === 'correction-1', '月次 correction-next 採番', r.body?.job);
+  ok(r.body.job.declare_seq === 2, 'correction は宣言番号に紐付く', r.body?.job);
+
+  // 同じ宣言からの correction-next 再要求 → 既存 correction-1 を再利用 (増殖しない)
+  r = await post('/api/ai-insights/service/jobs/claim', { ...MKEY, edition: 'correction-next' }, SVC);
+  ok(r.body.result === 'busy' && r.body.job.edition === 'correction-1',
+    '同一宣言の correction-next → 既存jobを再利用 (busy、correction-2を作らない)', r.body);
+
+  // 生成中に再オープン→再宣言 → 旧生成の保存は stale として 409
+  const corrJob = db.prepare(`
+    SELECT job_id FROM ai_report_jobs WHERE edition = 'correction-1' AND period_start = '2026-06-01'
+  `).get();
+  r = await post('/apps/ai-insights/api/closing/2026-06/reopen', {});
+  ok(r.status === 200, '(生成中に) 再オープン', r);
+  r = await post('/apps/ai-insights/api/closing/2026-06/declare', {});
+  ok(r.status === 200, '(生成中に) 再宣言 (seq=3)', r);
+  r = await post(`/api/ai-insights/service/jobs/${corrJob.job_id}/report`, {
+    generation_mode: 'claude', body_json: { summary: '旧宣言の生成' }, topics: [], pl_hash: 'stale',
+  }, SVC);
+  ok(r.status === 409 && r.body.error_class === 'stale_declare_seq',
+    '旧宣言の生成保存 → 409 stale (確定扱いしない)', r.body);
+  const closingAfterStale = db.prepare("SELECT final_pl_hash FROM ai_monthly_closing WHERE year_month='2026-06'").get();
+  ok(closingAfterStale.final_pl_hash === 'plhash-final-1', 'stale 保存で closing が汚れない', closingAfterStale);
+
+  // 未宣言月の final claim は拒否
+  r = await post('/api/ai-insights/service/jobs/claim', {
+    report_type: 'monthly', period_start: '2026-05-01', period_end: '2026-06-01', edition: 'final', claimed_by: 'smoke',
+  }, SVC);
+  ok(r.status === 409, '未宣言月の final claim → 409', r);
 
   const settings = await j('/apps/ai-insights/api/settings');
   ok(Array.isArray(settings.body.closing) && settings.body.closing.length === 3, 'settings に月次締め3ヶ月', settings.body.closing?.length);

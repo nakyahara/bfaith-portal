@@ -191,6 +191,13 @@ export function initAiInsightsTables(db) {
   for (const stmt of SCHEMA_STATEMENTS) {
     db.prepare(stmt).run();
   }
+  // PR-3 追加列 (PR-1 で本番作成済みのテーブルへの追加は ALTER で冪等に)
+  // declare_seq: 月次ジョブが「どの宣言に対する生成か」を固定する (生成中の再オープン/再宣言を
+  // 誤って確定扱いしないため。Codex PR-3 レビュー high 対応)
+  const jobCols = db.prepare('PRAGMA table_info(ai_report_jobs)').all().map((c) => c.name);
+  if (!jobCols.includes('declare_seq')) {
+    db.prepare('ALTER TABLE ai_report_jobs ADD COLUMN declare_seq INTEGER').run();
+  }
   const seedStmt = db.prepare(`
     INSERT OR IGNORE INTO ai_expected_sources
       (source_id, source_kind, unit, requirement, valid_from, updated_by, updated_at)

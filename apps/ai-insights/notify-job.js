@@ -31,28 +31,42 @@ export async function runClosingChecks(db, { today, post }) {
   ).run(ym, now);
   const row = db.prepare('SELECT * FROM ai_monthly_closing WHERE year_month = ?').get(ym);
 
-  const mark = (col) => db.prepare(
-    `UPDATE ai_monthly_closing SET ${col} = ?, updated_at = ? WHERE year_month = ?`
-  ).run(now, now, ym);
+  // 送信権を条件付き UPDATE で「先に」原子的に獲得してから投稿する (Codex PR-3 high 対応):
+  // 重複稼働インスタンス・「投稿後マーク前のクラッシュ」でも二重送信しない。
+  // 投稿に失敗したらベストエフォートでマーカーを戻す (戻せない場合は「送られない」側に倒す
+  // = 二重送信より安全。リマインダーは15/20日の二段構えでカバー)
+  const claimAndPost = async (col, kind, text, extraWhere = '') => {
+    const claimed = db.prepare(
+      `UPDATE ai_monthly_closing SET ${col} = ?, updated_at = ?
+       WHERE year_month = ? AND ${col} IS NULL ${extraWhere}`
+    ).run(now, now, ym);
+    if (claimed.changes !== 1) return false;
+    try {
+      await post(text);
+      sent.push(kind);
+      return true;
+    } catch (e) {
+      db.prepare(`UPDATE ai_monthly_closing SET ${col} = NULL, updated_at = ? WHERE year_month = ?`)
+        .run(nowIso(), ym);
+      throw e;
+    }
+  };
 
-  // ── 未宣言リマインダー (15日 / 20日) ──
+  // ── 未宣言リマインダー (15日 / 20日の二段。各1回) ──
+  // 15日窓 (15〜19日) を全部逃した場合は 20日通知に集約する (同時に2通は出さない=狼少年防止)
   if (row.status === 'open' || row.status === 'reopened') {
     if (day >= 20 && !row.reminder_20_sent_at) {
-      await post([
+      await claimAndPost('reminder_20_sent_at', 'reminder_20', [
         `*🔔 ${ym} 月次締めリマインダー (2回目)*`,
         `20日を過ぎましたが ${ym} の締め宣言がまだです。`,
         'MFの仕訳入力が終わっていたら、⚙️「AI経営レポート設定」画面で確定宣言をお願いします。',
         '宣言があるまで月次レポートは暫定版のままです。',
       ].join('\n'));
-      mark('reminder_20_sent_at');
-      sent.push('reminder_20');
     } else if (day >= 15 && day < 20 && !row.reminder_15_sent_at) {
-      await post([
+      await claimAndPost('reminder_15_sent_at', 'reminder_15', [
         `*🔔 ${ym} 月次締めリマインダー*`,
         `${ym} の締め宣言がまだです。MFの仕訳入力完了後、⚙️「AI経営レポート設定」画面で確定宣言をすると、確定版の月次レポートが発行されます。`,
       ].join('\n'));
-      mark('reminder_15_sent_at');
-      sent.push('reminder_15');
     }
   }
 
@@ -63,13 +77,11 @@ export async function runClosingChecks(db, { today, post }) {
     `).get();
     const declaredPlus7 = new Date(new Date(row.declared_at).getTime() + 7 * 86400000).toISOString();
     if (now > declaredPlus7 && (!latestSync?.s || latestSync.s <= row.declared_at)) {
-      await post([
+      await claimAndPost('sync_stall_notified_at', 'sync_stall', [
         `*⚠️ ${ym} 確定版が発行できません*`,
         `締め宣言 (${row.declared_at.slice(0, 10)}) から7日以上、MF同期が成功していません。`,
         'miniPC の daily-sync / MF publish の状態を確認してください。',
       ].join('\n'));
-      mark('sync_stall_notified_at');
-      sent.push('sync_stall');
     }
   }
 
@@ -77,14 +89,12 @@ export async function runClosingChecks(db, { today, post }) {
   if (row.final_report_id && row.final_pl_hash && !row.change_notified_at && row.status === 'declared') {
     const currentHash = computeMonthPlHash(db, ym);
     if (currentHash && currentHash !== row.final_pl_hash) {
-      await post([
+      await claimAndPost('change_notified_at', 'post_final_change', [
         `*⚠️ ${ym} 確定後にMF会計データが変更されています*`,
         '確定版レポート発行後、対象月のPLに変化を検知しました (過年度仕訳の追加・修正の可能性)。',
         '内容を確認し、レポートを作り直す場合は ⚙️画面で再オープン → 再宣言してください (訂正版が発行されます)。',
         '自動では再発行しません。',
       ].join('\n'));
-      mark('change_notified_at');
-      sent.push('post_final_change');
     }
   }
   return sent;

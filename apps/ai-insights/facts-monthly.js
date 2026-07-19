@@ -376,6 +376,7 @@ export function buildMonthlyReportInput(db, opts = {}) {
   const closing = {
     year_month: ym,
     status: closingRow.status,
+    declare_seq: closingRow.declare_seq ?? 0, // runner が claim に添付し、生成をこの宣言に固定する
     declared_at: closingRow.declared_at || null,
     // 確定版は「宣言後に成功した MF 同期」のスナップショットで作る (要件 §6)
     mf_synced_after_declare: Boolean(
