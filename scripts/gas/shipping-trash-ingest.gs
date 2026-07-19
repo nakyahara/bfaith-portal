@@ -248,39 +248,19 @@ function ingestPickingLists_(pickingFilesAll, batchName, shipDate, cfg, runId) {
 /**
  * トータルピッキングリストのOCRテキストから総合計・ページ内合計を抽出する。
  *
- * OCRの癖 (2026-07-19 実測): 「総合計」の値Tと「ページ内合計」の値pが各ページで
- * 連結トークン「Tp」として出る (例: 総合計67・各ページ35/31/1 → "6735","6731","671")。
- * → 全ページ共通の prefix P で、suffix (ページ内合計) の総和が P に一致する分割を探す。
- *   解が一意でなければ throw (誤った合計を保存するより隔離→人手確認を選ぶ)。
+ * GAS の Docs 変換 OCR の実出力 (2026-07-19 実測) は「総合計\n67\nページ内合計\n35」の
+ * ようにラベル直後に値が分離して並ぶ。この形式のみを受理し、
+ * 全ページの総合計が同値・ページ内合計の総和が総合計に一致する検算を必須とする。
+ * 検算が合わない/形式が想定外なら throw → 呼び出し側でPDF隔離+GChat通知
+ * (誤った合計を保存するより人手確認を選ぶ。全文の数字走査によるフォールバックは
+ * 無関係な数字が偶然検算を通る偽解リスクがあるため置かない — Codex high ×2)。
  * @returns {{ totalQty: number, pages: number, pageTotals: number[], workDate: string|null, printedAt: string|null }}
  */
 function parsePickingText_(text) {
   var pages = (text.match(/ページ内合計/g) || []).length;
   if (pages === 0) throw new Error("ピッキングリスト形式でない (『ページ内合計』が見つからない)");
 
-  var tokens = text.match(/\d+/g) || [];
-  var byPrefix = {}; // P (総合計候補) -> [ページ内合計候補,...]
-  tokens.forEach(function (t) {
-    // 合計トークンは 総合計(≤4桁) + ページ内合計(≤4桁) の連結。長いトークン (JAN等) は対象外。
-    // 先頭0は総合計にもページ内合計にも現れないので棄却 (ロケーション断片 "003" 等を排除)
-    if (t.length < 2 || t.length > 8 || t.charAt(0) === "0") return;
-    for (var pl = 1; pl < t.length && pl <= 4; pl++) {
-      var s = t.slice(pl);
-      if (s.charAt(0) === "0") continue;
-      var P = t.slice(0, pl);
-      (byPrefix[P] = byPrefix[P] || []).push(parseInt(s, 10));
-    }
-  });
-  var solutions = [];
-  Object.keys(byPrefix).forEach(function (P) {
-    var sufs = byPrefix[P];
-    if (sufs.length !== pages) return;             // 合計トークンはページ数と同数のはず
-    var sum = sufs.reduce(function (a, b) { return a + b; }, 0);
-    if (sum === parseInt(P, 10)) solutions.push({ total: parseInt(P, 10), pageTotals: sufs });
-  });
-  if (solutions.length !== 1) {
-    throw new Error("ピッキング総合計を特定できず (検算が通る分割が" + solutions.length + "通り、" + pages + "ページ)");
-  }
+  var totals = extractLabelAdjacentTotals_(text, pages);
 
   // 出力日時 (日付+時刻の並び)。作業日は最頻出の日付を採用 (賞味期限等の紛れ込み対策)、
   // タイなら null (参考値なので誤値より欠損を選ぶ)
@@ -296,12 +276,48 @@ function parsePickingText_(text) {
   var workDate = best && !tie ? best.replace(/\//g, "-") : null;
 
   return {
-    totalQty: solutions[0].total,
+    totalQty: totals.total,
     pages: pages,
-    pageTotals: solutions[0].pageTotals,
+    pageTotals: totals.pageTotals,
     workDate: workDate,
     printedAt: printedAt,
   };
+}
+
+var PICKING_MAX_TOTAL = 99999; // サーバ側 MAX_TOTAL_QTY と同じ上限
+
+/**
+ * ラベル直後の数値抽出。各ページに「総合計 <T>」「ページ内合計 <p>」が1組ずつ
+ * 出る前提で、T が全ページ同値・Σp === T のときのみ採用、それ以外はすべて throw。
+ * 値は改行を挟むことがある ([\s　]*)。数値は純粋な数字トークンのみ受理し、
+ * 直後にカンマや数字が続く形 (「6,7」等の想定外OCR) は不成立扱い
+ * (Codex high: カンマ除去の寛容さが偽解を作る)。
+ */
+function extractLabelAdjacentTotals_(text, pages) {
+  var grand = matchLabelNumbers_(text, /総合計[\s　]*(\d+)(?![\d,.])/g);
+  var pageTotals = matchLabelNumbers_(text, /ページ内合計[\s　]*(\d+)(?![\d,.])/g);
+  var reason = null;
+  if (grand.length !== pages || pageTotals.length !== pages) {
+    reason = "ラベル直後の数値件数が不一致 (総合計" + grand.length + "件・ページ内合計" + pageTotals.length + "件・" + pages + "ページ。OCR形式が想定外の可能性)";
+  } else {
+    var total = grand[0];
+    for (var i = 1; i < grand.length; i++) {
+      if (grand[i] !== total) { reason = "総合計がページ間で不一致 (" + grand.join(",") + ")"; break; }
+    }
+    var sum = pageTotals.reduce(function (a, b) { return a + b; }, 0);
+    if (!reason && (total < 1 || total > PICKING_MAX_TOTAL || sum !== total)) {
+      reason = "検算不一致 (総合計" + total + " vs ページ内合計の和" + sum + ")";
+    }
+  }
+  if (reason) throw new Error("ピッキング総合計を特定できず (" + reason + ")");
+  return { total: grand[0], pageTotals: pageTotals };
+}
+
+function matchLabelNumbers_(text, re) {
+  var out = [];
+  var m;
+  while ((m = re.exec(text)) !== null) out.push(parseInt(m[1], 10));
+  return out;
 }
 
 /** 動作確認用: 指定フォルダ (省略時 出荷_01) のピッキングリストを抽出してログに出す。削除・送信しない */
