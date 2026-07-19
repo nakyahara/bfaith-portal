@@ -17,8 +17,17 @@
  *   SHIPPING_NOTION_PROP_PACKER : 梱包担当者プロパティ名 (必須。people 想定)
  *   SHIPPING_NOTION_PROP_PICKER : ピッキング担当者プロパティ名 (任意)
  *   SHIPPING_NOTION_PROP_DATE   : 作業日プロパティ名 (任意。未設定=カード使い回し運用と
- *                                 みなし JST当日 を割り当てる。日別カードDBなら必須)
+ *                                 みなし JST当日 を割り当てる。日別カードDBなら必須。
+ *                                 created_time 型も可 — UTC→JST変換して日付化する)
  *   SHIPPING_NOTION_PROP_STATUS : ステータスプロパティ名 (任意)
+ *   SHIPPING_STAFF_LOOKBACK_DAYS: 取得窓 (created_time基準、default 7日。日別カードが
+ *                                 蓄積するDBを全件走査しないため)
+ *
+ * 実DB確認済み (2026-07-19、integration「Claude Code」で読み取り実証):
+ *   DB「スタッフ用デイリー業務」= 日別カード (毎日20枚前後、出荷_XXごと1枚)。推奨env:
+ *   BATCH=名前 (title、「出荷_18」「出荷_1　パフ済」形式。select「出荷No」は入力率5割で不採用) /
+ *   PACKER=梱包担当者 (select) / PICKER=ピッキング担当者 (select) /
+ *   DATE=作成日時 (created_time) / STATUS=ステータス (select)
  *   SHIPPING_STAFF_CRON_ENABLED : 'true'|'1' で日次 cron 起動 (Dark Launch、default OFF)
  *   SHIPPING_STAFF_CRON         : cron 式 (default '30 19 * * *' = 毎日19:30 JST。
  *                                 GAS 18:16 の後、カードが翌日用にリセットされる前)
@@ -64,13 +73,35 @@ async function notionFetch(pathname, options = {}, attempt = 1) {
   return JSON.parse(text);
 }
 
-async function notionQueryAll(dbId) {
+/**
+ * 取得窓の起点: 「JST暦日で lookbackDays 日分」の最古日 00:00 JST を UTC ISO で返す。
+ * 現在時刻から引くだけだと境界日が時刻で分断され、作業日単位の置換 (delete→insert) が
+ * 境界日の朝分を削って部分集合で上書きしてしまう (Codex high)。
+ */
+export function lookbackSinceIso(lookbackDays, now = new Date()) {
+  const oldestJstDate = toJstDate(new Date(now.getTime() - (lookbackDays - 1) * 24 * 60 * 60 * 1000));
+  return new Date(Date.parse(`${oldestJstDate}T00:00:00+09:00`)).toISOString();
+}
+
+/**
+ * カード取得。直近 lookbackDays 日 (created_time 基準、JST暦日単位) に絞る —
+ * スタッフ用デイリー業務DBは日別カードが毎日20枚前後追加され累計3,000枚超
+ * (2026-07-19実測) のため、全件走査は毎晩30リクエスト超+増え続ける。
+ * 担当者の追記・訂正は数日内なので直近窓で十分
+ * (置換も取得できた作業日単位なので過去の履歴は壊れない)。
+ */
+async function notionQueryAll(dbId, lookbackDays) {
+  const since = lookbackSinceIso(lookbackDays);
   const pages = [];
   let cursor;
   do {
     const body = await notionFetch(`/databases/${dbId}/query`, {
       method: 'POST',
-      body: JSON.stringify({ page_size: 100, ...(cursor ? { start_cursor: cursor } : {}) }),
+      body: JSON.stringify({
+        page_size: 100,
+        filter: { timestamp: 'created_time', created_time: { on_or_after: since } },
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
     });
     pages.push(...body.results);
     cursor = body.has_more ? body.next_cursor : undefined;
@@ -94,6 +125,8 @@ export function plainValue(prop) {
     case 'people': return prop.people.map((p) => p.name || p.id).join('、') || null;
     case 'date': return prop.date ? prop.date.start : null;
     case 'checkbox': return String(prop.checkbox);
+    case 'created_time': return prop.created_time || null;
+    case 'last_edited_time': return prop.last_edited_time || null;
     default: return null;
   }
 }
@@ -109,13 +142,15 @@ export function summarizeProps(properties) {
 }
 
 /**
- * 出荷No表記ゆれ (「1」「01」「出荷_01」「出荷01」) → 「出荷_01」に正規化。
- * 受理は「出荷」接頭辞つき or 数字のみ、1〜99 に限定 (Codex medium: 「末尾に数字」の
- * 緩い受理だと「棚卸 1」「返品_02」等の無関係カードがバッチとして混入する)
+ * 出荷No表記ゆれ → 「出荷_01」に正規化。受理は 1〜99 で:
+ *  - 「出荷」接頭辞つき: 出荷_1 / 出荷01 / 「出荷_1　パフ済」のような後ろメモつき (実DBに存在)
+ *  - 数字のみ (完全一致): 1 / 01
+ * 「棚卸 1」「返品_02」「緊急在庫」等の無関係カードは受理しない (Codex medium)
  */
 export function normalizeBatchNo(raw) {
   if (raw == null) return null;
-  const m = String(raw).trim().match(/^(?:出荷[_＿]?)?(\d{1,2})$/);
+  const s = String(raw).trim();
+  const m = s.match(/^出荷[_＿]?(\d{1,2})(?:[\s　].*)?$/) || s.match(/^(\d{1,2})$/);
   if (!m) return null;
   const n = Number(m[1]);
   if (n < 1) return null;
@@ -169,10 +204,17 @@ export function buildStaffRows(pages, cfg, defaultWorkDate) {
     const batchNo = normalizeBatchNo(plainValue(props[cfg.propBatch]));
     if (!batchNo) { noBatch++; continue; }
     // DATE設定時: 日付が空・不正なカードはフォールバックさせず除外。
-    // DATE未設定時のみ「カード使い回し運用」とみなし JST当日 を割り当てる
-    const workDate = cfg.propDate
-      ? String(plainValue(props[cfg.propDate]) || '').slice(0, 10)
-      : defaultWorkDate;
+    // DATE未設定時のみ「カード使い回し運用」とみなし JST当日 を割り当てる。
+    // created_time/last_edited_time 型 (スタッフ用デイリー業務DBの「作成日時」等) は
+    // UTC ISO なので JST に変換してから日付化 (slice だと朝9時前作成が前日にずれる)
+    let workDate = defaultWorkDate;
+    if (cfg.propDate) {
+      const dp = props[cfg.propDate];
+      const v = plainValue(dp);
+      workDate = (dp?.type === 'created_time' || dp?.type === 'last_edited_time')
+        ? (v ? toJstDate(new Date(v)) : '')
+        : String(v || '').slice(0, 10);
+    }
     if (!isRealDate(workDate)) { noDate++; continue; }
     const key = `${workDate}::${batchNo}`;
     const prev = byKey.get(key);
@@ -218,7 +260,8 @@ export async function runStaffSync() {
       return { ok: true, skipped: 'NOTION_TOKEN 未設定' };
     }
     const dbId = process.env.SHIPPING_NOTION_DB_ID || DEFAULT_DB_ID;
-    const pages = await notionQueryAll(dbId);
+    const lookbackDays = Math.min(Math.max(parseInt(process.env.SHIPPING_STAFF_LOOKBACK_DAYS, 10) || 7, 1), 60);
+    const pages = await notionQueryAll(dbId, lookbackDays);
     const built = buildStaffRows(pages, envConfig(), toJstDate(new Date()));
     if (built.skipped) {
       console.warn(`[shipping-staff] スキップ: ${built.skipped}`);

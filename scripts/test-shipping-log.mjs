@@ -284,7 +284,14 @@ expectEq(dedupe([mkFile('id1', 'a.pdf'), mkFile('id3', 'a.pdf')]).length, 2, '�
 expectEq(dedupe([mkFile('id1', 'a.pdf'), mkFile('id4', 'a.pdf')]).length, 2, 'md5不明 → 複製扱いしない');
 
 // ── Test 15: Notion担当者スナップショット ──
-const { buildStaffRows, normalizeBatchNo } = await import('../apps/shipping-log/notion-staff.js');
+const { buildStaffRows, normalizeBatchNo, lookbackSinceIso } = await import('../apps/shipping-log/notion-staff.js');
+
+// 取得窓はJST暦日の00:00起点 (境界日の部分取得→置換欠損を防ぐ)。
+// 19:30 JST (=10:30 UTC) 実行・7日窓 → 最古対象日=7/13 (JST) の00:00 = 7/12 15:00 UTC
+expectEq(lookbackSinceIso(7, new Date('2026-07-19T10:30:00Z')), '2026-07-12T15:00:00.000Z',
+  'lookback窓はJST暦日00:00起点');
+expectEq(lookbackSinceIso(1, new Date('2026-07-19T10:30:00Z')), '2026-07-18T15:00:00.000Z',
+  'lookback=1は当日JST 00:00から');
 const { upsertStaffRows, recentStaff: recentStaffFn } = await import('../apps/shipping-log/db.js');
 
 expectEq(normalizeBatchNo('出荷_01'), '出荷_01', 'batch正規化 そのまま');
@@ -294,6 +301,10 @@ expectEq(normalizeBatchNo('メモ'), null, 'batch正規化 数字なし→null')
 expectEq(normalizeBatchNo('棚卸 1'), null, 'batch正規化 無関係接頭辞→null');
 expectEq(normalizeBatchNo('返品_02'), null, 'batch正規化 別業務カード→null');
 expectEq(normalizeBatchNo('0'), null, 'batch正規化 0→null');
+// 実DB (スタッフ用デイリー業務) で観測した表記
+expectEq(normalizeBatchNo('出荷_1　パフ済'), '出荷_01', 'batch正規化 後ろメモつき (実DB)');
+expectEq(normalizeBatchNo('緊急在庫'), null, 'batch正規化 緊急在庫カード→null');
+expectEq(normalizeBatchNo('I will. ありがとうございました。'), null, 'batch正規化 チャット様テキスト→null');
 
 const mkPage = (id, edited, props) => ({ id, last_edited_time: edited, properties: props });
 const pTitle = (s) => ({ type: 'title', title: [{ plain_text: s }] });
@@ -330,6 +341,16 @@ const datedBuilt = buildStaffRows([
 expectEq(datedBuilt.rows?.length, 1, 'DATE設定 rows 件数');
 expectEq(datedBuilt.rows?.[0]?.packer, '佐藤', '重複は最終更新が新しい方を採用');
 expectEq(datedBuilt.noDate, 1, '日付なしカードは除外カウント');
+// created_time 型の作業日 (実DB「作成日時」): UTC→JST変換。7/18 23:30 UTC = 7/19 08:30 JST
+const pSelect = (s) => ({ type: 'select', select: s ? { name: s } : null });
+const pCreated = (iso) => ({ type: 'created_time', created_time: iso });
+const createdBuilt = buildStaffRows([
+  mkPage('p1', '2026-07-19T09:00:00Z', { 名前: pTitle('出荷_1　パフ済'), 梱包担当者: pSelect('星'), 作成日時: pCreated('2026-07-18T23:30:00.000Z') }),
+], { propBatch: '名前', propPacker: '梱包担当者', propPicker: null, propDate: '作成日時', propStatus: null }, '2026-07-19');
+expectEq(createdBuilt.rows?.length, 1, 'created_time DATE rows 件数');
+expectEq(createdBuilt.rows?.[0]?.work_date, '2026-07-19', 'created_time はJST変換 (UTC 7/18 23:30→JST 7/19)');
+expectEq(createdBuilt.rows?.[0]?.batch_no, '出荷_01', '実DB表記の名前→batch正規化');
+expectEq(createdBuilt.rows?.[0]?.packer, '星', 'select型の梱包担当者');
 
 // upsert: COALESCE で取得済み担当者を NULL で潰さない
 upsertStaffRows([{ work_date: '2026-07-19', batch_no: '出荷_01', packer: '山田', picker: null,
