@@ -60,6 +60,7 @@ import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
+import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -281,6 +282,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
     // /apps/mirror/api/sync* も同様に API key 認証前 body parse を避ける。
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
+    // /api/ai-insights/service/* は AI_INSIGHT_SERVICE_TOKEN 認証後に専用 parser (2MB) が走る。
+    if (normalizedPath.startsWith('/api/ai-insights/service')) return next();
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
@@ -740,6 +743,15 @@ const apps = [
     category: 'support',
   },
   {
+    id: 'ai-insights',
+    name: 'AI経営レポート設定',
+    description: 'AI経営アドバイス定期配信 (週次・月次) の予算・イベントメモ・配信状態管理。レポートはGChat経営インサイトスペースへ投稿',
+    icon: '🤖',
+    path: '/apps/ai-insights',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'supplier-sales',
     name: '仕入れ先 売れ筋共有',
     description: '全モール(Amazon・楽天 ほか)の販売実績を仕入先別に集計し、ログイン不要の共有URLを発行。原価非開示・販売数/売上のみ',
@@ -1150,6 +1162,10 @@ app.use('/apps/qoo10-analytics', (err, req, res, next) => {
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
+// AI経営レポート (apps/ai-insights): ⚙️設定画面は session、/api/ai-insights はトークン認証
+// (report-input=AI_READ_TOKEN read-only / service=AI_INSIGHT_SERVICE_TOKEN。いずれも fail-closed)
+app.use('/api/ai-insights', aiInsightsApiRouter);
+app.use('/apps/ai-insights', requireAppAccess('ai-insights'), express.json({ limit: '256kb' }), aiInsightsRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);

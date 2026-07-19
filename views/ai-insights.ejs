@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI経営レポート設定 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    body { background: #f5f7fa; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 16px 20px; }
+    .header-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; flex-wrap: wrap; gap: 12px; }
+    .header-row h2 { margin: 0; }
+    .back-link { font-size: 13px; color: #2563eb; text-decoration: none; }
+    .back-link:hover { text-decoration: underline; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .card h3 { margin: 0 0 10px 0; font-size: 15px; color: #111; }
+    .card .hint { font-size: 12px; color: #6b7280; margin: 4px 0 10px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: right; }
+    th { background: #f9fafb; color: #374151; font-weight: 600; text-align: center; }
+    td.l, th.l { text-align: left; }
+    input[type="text"], input[type="date"], input[type="number"], select {
+      padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+    input.budget-cell { width: 110px; text-align: right; }
+    input.budget-cell.changed { background: #fef9c3; }
+    button.primary { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
+    button.primary:hover { background: #1d4ed8; }
+    button.ghost { background: #fff; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+    button.danger { background: #dc2626; color: #fff; border: none; border-radius: 6px; padding: 6px 12px; font-size: 12px; cursor: pointer; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge-red { background: #fee2e2; color: #b91c1c; }
+    .badge-green { background: #d1fae5; color: #065f46; }
+    .badge-gray { background: #f3f4f6; color: #4b5563; }
+    .badge-yellow { background: #fef3c7; color: #92400e; }
+    .recon-card { border: 2px solid #dc2626; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .toolbar .spacer { flex: 1; }
+    #toast { position: fixed; bottom: 20px; right: 20px; background: #111; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; display: none; z-index: 50; }
+    .note-warn { font-size: 12px; color: #92400e; background: #fef3c7; border-radius: 6px; padding: 6px 10px; margin-top: 8px; }
+    .event-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+    .event-form input[type="text"] { flex: 1; min-width: 240px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header-row">
+    <h2>⚙️ AI経営レポート設定</h2>
+    <a class="back-link" href="/">← ポータルトップ</a>
+  </div>
+  <p class="hint" style="font-size:12px;color:#6b7280;margin-top:-8px;">
+    AI経営アドバイス定期配信 (週次・月次) の予算・イベントメモ・配信状態を管理します。
+    予算が未入力の月は、レポートは前年比・トレンドのみで論点を立てます (予算差には言及しません)。
+  </p>
+
+  <!-- 要対応 (reconciliation_required) -->
+  <div class="card recon-card" id="recon-card" style="display:none;">
+    <h3>🚨 投稿確認が必要なレポート</h3>
+    <p class="hint">投稿処理中に中断したため、GChat に届いたか不明です。経営インサイトスペースで
+      <b>レポートID (例: WK-20260713-f)</b> を検索し、投稿の有無を確認してから選んでください。
+      <b>自動再投稿はされません。</b></p>
+    <div id="recon-list"></div>
+  </div>
+
+  <!-- 予算 -->
+  <div class="card">
+    <h3>📋 年度予算 (全社・月次)</h3>
+    <p class="hint">
+      金額は<b>円</b> (整数)。空欄 = 未設定 (0 とは区別されます)。粗利率は保存しません (粗利額÷売上で自動導出)。
+      保存は追記型 (revision) で、過去の値は履歴として残ります。
+    </p>
+    <div class="toolbar">
+      <label>対象年: <select id="budget-year"></select></label>
+      <span class="spacer"></span>
+      <label>前年実績 ×
+        <input type="number" id="prefill-factor" value="1.05" step="0.01" style="width:70px;"> 倍
+      </label>
+      <button class="ghost" id="btn-prefill">空欄にプリフィル</button>
+      <button class="primary" id="btn-save-budget">保存</button>
+    </div>
+    <div style="overflow-x:auto;">
+      <table id="budget-table"></table>
+    </div>
+    <div id="budget-preview" class="hint" style="margin-top:8px;"></div>
+    <div class="note-warn">⚠️ 単位は「円」です (千円ではありません)。保存前に年間合計プレビューで桁を確認してください。</div>
+  </div>
+
+  <!-- イベントメモ -->
+  <div class="card">
+    <h3>📝 イベントメモ (セール・値上げ・障害など)</h3>
+    <p class="hint">「いつ・何をしたか」を1行で記録すると、AIが売上変化の解釈に使います (因果は仮説として扱われます)。</p>
+    <div class="event-form">
+      <input type="date" id="ev-date">
+      <span>〜</span>
+      <input type="date" id="ev-end" title="期間イベントの終了日 (単日なら空欄)">
+      <select id="ev-tag">
+        <option value="">タグなし</option>
+        <option value="sale">セール</option>
+        <option value="price">価格</option>
+        <option value="ad">広告</option>
+        <option value="incident">障害</option>
+        <option value="procure">仕入</option>
+        <option value="other">その他</option>
+      </select>
+      <select id="ev-scope">
+        <option value="all">全社</option>
+        <option value="amazon">Amazon</option>
+        <option value="rakuten">楽天</option>
+        <option value="yahoo">Yahoo</option>
+        <option value="aupay">au PAY</option>
+        <option value="linegift">LINEギフト</option>
+        <option value="qoo10">Qoo10</option>
+      </select>
+      <input type="text" id="ev-desc" maxlength="300" placeholder="例: 楽天スーパーセール参加 (主力30品 10%オフ)">
+      <button class="primary" id="btn-add-event">追加</button>
+    </div>
+    <table id="events-table"></table>
+  </div>
+
+  <!-- 実行履歴 -->
+  <div class="card">
+    <h3>📮 レポート実行履歴</h3>
+    <table id="jobs-table"></table>
+  </div>
+
+  <!-- データソース -->
+  <div class="card">
+    <h3>🔌 期待データソース (充足判定の基準)</h3>
+    <p class="hint">モールの休止・取得停止時は valid_to を設定すると充足判定から外れます (現状は閲覧のみ。変更は開発側へ)。</p>
+    <table id="sources-table"></table>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const METRICS = [
+  { key: 'sales', label: '売上高' },
+  { key: 'gross_profit', label: '粗利額' },
+  { key: 'operating_income', label: '営業利益' },
+  { key: 'cash_eom', label: '月末現預金' },
+  { key: 'inventory_value', label: '在庫金額' },
+];
+const JOB_STATUS_BADGE = {
+  posted: ['badge-green', '投稿済'], pending: ['badge-gray', '待機'],
+  generating: ['badge-yellow', '生成中'], generated: ['badge-yellow', '生成済'],
+  posting: ['badge-yellow', '投稿中'], failed: ['badge-red', '失敗'],
+  reconciliation_required: ['badge-red', '要照合'],
+};
+let settings = null;
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+function fmtYen(v) {
+  if (v == null || v === '') return '';
+  return Number(v).toLocaleString('ja-JP');
+}
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
+  return body;
+}
+
+// ── 予算 ──
+function currentYear() { return document.getElementById('budget-year').value; }
+
+function renderBudgetTable() {
+  const year = currentYear();
+  const byKey = {};
+  for (const r of settings.budget) byKey[r.year_month + ':' + r.metric] = r;
+  const months = Array.from({ length: 12 }, (_, i) => year + '-' + String(i + 1).padStart(2, '0'));
+  let html = '<tr><th class="l">月</th>' + METRICS.map((m) => '<th>' + m.label + '</th>').join('') + '<th>粗利率</th></tr>';
+  for (const ym of months) {
+    html += '<tr><td class="l">' + ym + '</td>';
+    for (const m of METRICS) {
+      const cur = byKey[ym + ':' + m.key];
+      const v = cur ? cur.value_yen : '';
+      html += '<td><input class="budget-cell" data-ym="' + ym + '" data-metric="' + m.key + '"' +
+        ' data-orig="' + esc(v) + '" value="' + esc(v === '' ? '' : fmtYen(v)) + '"></td>';
+    }
+    html += '<td class="margin-cell" data-ym="' + ym + '">—</td></tr>';
+  }
+  document.getElementById('budget-table').innerHTML = html;
+  document.querySelectorAll('.budget-cell').forEach((inp) => {
+    inp.addEventListener('input', onBudgetCellChange);
+    inp.addEventListener('blur', () => {
+      const n = parseCell(inp);
+      inp.value = n == null ? '' : fmtYen(n);
+    });
+  });
+  updateBudgetDerived();
+}
+
+function parseCell(inp) {
+  const raw = inp.value.replace(/[,，\s]/g, '');
+  if (raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.round(n) : NaN;
+}
+
+function onBudgetCellChange(e) {
+  const inp = e.target;
+  const n = parseCell(inp);
+  const orig = inp.dataset.orig === '' ? null : Number(inp.dataset.orig);
+  const changed = (n == null ? null : n) !== orig && !(n == null && orig == null);
+  inp.classList.toggle('changed', changed && !Number.isNaN(n));
+  updateBudgetDerived();
+}
+
+function updateBudgetDerived() {
+  const cells = {};
+  document.querySelectorAll('.budget-cell').forEach((inp) => {
+    const n = parseCell(inp);
+    if (n != null && !Number.isNaN(n)) cells[inp.dataset.ym + ':' + inp.dataset.metric] = n;
+  });
+  document.querySelectorAll('.margin-cell').forEach((td) => {
+    const s = cells[td.dataset.ym + ':sales'];
+    const g = cells[td.dataset.ym + ':gross_profit'];
+    td.textContent = (s > 0 && g != null) ? (g / s * 100).toFixed(1) + '%' : '—';
+  });
+  const totals = METRICS.slice(0, 3).map((m) => {
+    let sum = 0, cnt = 0;
+    for (const [k, v] of Object.entries(cells)) {
+      if (k.endsWith(':' + m.key)) { sum += v; cnt++; }
+    }
+    return m.label + ': ' + fmtYen(sum) + '円 (' + cnt + 'ヶ月分)';
+  });
+  document.getElementById('budget-preview').textContent = '年間合計プレビュー — ' + totals.join(' / ');
+}
+
+async function saveBudget() {
+  const entries = [];
+  let invalid = null;
+  document.querySelectorAll('.budget-cell').forEach((inp) => {
+    const n = parseCell(inp);
+    if (Number.isNaN(n)) { invalid = inp.dataset.ym + ' ' + inp.dataset.metric; return; }
+    const orig = inp.dataset.orig === '' ? null : Number(inp.dataset.orig);
+    if (n != null && n !== orig) {
+      entries.push({ year_month: inp.dataset.ym, metric: inp.dataset.metric, value_yen: n });
+    }
+  });
+  if (invalid) return toast('数値として読めない欄があります: ' + invalid);
+  if (entries.length === 0) return toast('変更はありません');
+  if (!confirm(entries.length + ' 件の予算を保存します。単位は「円」です。よろしいですか？')) return;
+  try {
+    const r = await api('/apps/ai-insights/api/budget', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries, reason: '⚙️画面から入力' }),
+    });
+    toast('保存しました (新規 ' + r.saved + ' / 変更なし ' + r.unchanged + ')');
+    await load();
+  } catch (e) { toast('保存失敗: ' + e.message); }
+}
+
+async function prefillBudget() {
+  const year = currentYear();
+  const factor = Number(document.getElementById('prefill-factor').value);
+  if (!Number.isFinite(factor) || factor <= 0 || factor > 10) return toast('係数が不正です');
+  try {
+    const prev = String(Number(year) - 1);
+    const r = await api('/apps/ai-insights/api/budget/actuals?year=' + prev);
+    const byYm = {};
+    for (const a of r.actuals) byYm[a.year_month.slice(5)] = a;
+    let filled = 0;
+    document.querySelectorAll('.budget-cell').forEach((inp) => {
+      if (parseCell(inp) != null) return; // 入力済みの欄は触らない
+      const a = byYm[inp.dataset.ym.slice(5)];
+      if (!a) return;
+      const base = a[inp.dataset.metric];
+      if (base == null) return; // cash_eom / inventory_value はプリフィル対象外
+      inp.value = fmtYen(Math.round(base * factor));
+      inp.classList.add('changed');
+      filled++;
+    });
+    updateBudgetDerived();
+    toast(prev + '年実績×' + factor + ' で ' + filled + ' 欄をプリフィルしました (未保存)');
+  } catch (e) { toast('プリフィル失敗: ' + e.message); }
+}
+
+// ── イベント ──
+function renderEvents() {
+  const rows = settings.events;
+  let html = '<tr><th class="l">日付</th><th class="l">内容</th><th>タグ</th><th>対象</th><th>登録</th><th></th></tr>';
+  if (rows.length === 0) html += '<tr><td class="l" colspan="6">イベントはまだありません</td></tr>';
+  for (const ev of rows) {
+    const period = ev.event_date + (ev.event_end_date ? '〜' + ev.event_end_date : '');
+    html += '<tr><td class="l">' + esc(period) + '</td><td class="l">' + esc(ev.description) + '</td>' +
+      '<td>' + esc(ev.tag || '') + '</td><td>' + esc(ev.scope || '') + '</td>' +
+      '<td>' + esc(ev.entered_by) + '</td>' +
+      '<td><button class="danger" data-del="' + esc(ev.event_id) + '">削除</button></td></tr>';
+  }
+  document.getElementById('events-table').innerHTML = html;
+  document.querySelectorAll('[data-del]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('このイベントを削除しますか？ (履歴は残ります)')) return;
+      try {
+        await api('/apps/ai-insights/api/events/' + btn.dataset.del + '/delete', { method: 'POST' });
+        await load();
+      } catch (e) { toast('削除失敗: ' + e.message); }
+    });
+  });
+}
+
+async function addEvent() {
+  const body = {
+    event_date: document.getElementById('ev-date').value,
+    event_end_date: document.getElementById('ev-end').value || null,
+    tag: document.getElementById('ev-tag').value || null,
+    scope: document.getElementById('ev-scope').value,
+    description: document.getElementById('ev-desc').value,
+  };
+  if (!body.event_date) return toast('日付を入れてください');
+  if (!body.description.trim()) return toast('内容を入れてください');
+  try {
+    await api('/apps/ai-insights/api/events', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    document.getElementById('ev-desc').value = '';
+    await load();
+    toast('イベントを追加しました');
+  } catch (e) { toast('追加失敗: ' + e.message); }
+}
+
+// ── 照合・履歴・ソース ──
+function renderRecon() {
+  const rows = settings.reconciliation;
+  const card = document.getElementById('recon-card');
+  card.style.display = rows.length ? '' : 'none';
+  let html = '';
+  for (const j of rows) {
+    html += '<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">' +
+      '<span class="badge badge-red">要照合</span>' +
+      '<b>' + esc(j.public_id || (j.report_type + ' ' + j.period_start)) + '</b>' +
+      '<span style="font-size:12px;color:#6b7280;">' + esc(j.report_type) + ' ' + esc(j.period_start) + '〜 / ' + esc(j.edition) + '</span>' +
+      '<button class="ghost" data-recon="' + esc(j.job_id) + '" data-action="mark_posted">GChatにあった → 投稿済み扱い</button>' +
+      '<button class="danger" data-recon="' + esc(j.job_id) + '" data-action="repost">無かった → 再投稿する</button></div>';
+  }
+  document.getElementById('recon-list').innerHTML = html;
+  document.querySelectorAll('[data-recon]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const action = btn.dataset.action;
+      const msg = action === 'mark_posted'
+        ? 'GChat に投稿があったことを確認しましたか？ このジョブを投稿済み扱いにします。'
+        : 'GChat に投稿が無いことを確認しましたか？ 次回実行時に再投稿されます。';
+      if (!confirm(msg)) return;
+      try {
+        await api('/apps/ai-insights/api/jobs/' + btn.dataset.recon + '/reconcile', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action }),
+        });
+        await load();
+        toast('処理しました');
+      } catch (e) { toast('失敗: ' + e.message); }
+    });
+  });
+}
+
+function renderJobs() {
+  let html = '<tr><th class="l">レポート</th><th>種別</th><th>期間</th><th>版</th><th>状態</th><th>投稿日時</th><th class="l">エラー</th></tr>';
+  if (settings.recent_jobs.length === 0) html += '<tr><td class="l" colspan="7">実行履歴はまだありません (PC runner は PR-2 で稼働開始)</td></tr>';
+  for (const j of settings.recent_jobs) {
+    const [cls, label] = JOB_STATUS_BADGE[j.status] || ['badge-gray', j.status];
+    html += '<tr><td class="l">' + esc(j.public_id || '—') + '</td><td>' + esc(j.report_type) + '</td>' +
+      '<td>' + esc(j.period_start) + '</td><td>' + esc(j.edition) + '</td>' +
+      '<td><span class="badge ' + cls + '">' + esc(label) + '</span></td>' +
+      '<td>' + esc(j.posted_at ? j.posted_at.slice(0, 16).replace('T', ' ') : '') + '</td>' +
+      '<td class="l" style="font-size:11px;color:#6b7280;">' + esc(j.error_class || '') + '</td></tr>';
+  }
+  document.getElementById('jobs-table').innerHTML = html;
+}
+
+function renderSources() {
+  const REQ = { required: '必須', conditional: '条件付き', reference: '参考' };
+  let html = '<tr><th class="l">種別</th><th class="l">単位</th><th>扱い</th><th>有効期間</th></tr>';
+  for (const s of settings.sources) {
+    html += '<tr><td class="l">' + esc(s.source_kind) + '</td><td class="l">' + esc(s.unit) + '</td>' +
+      '<td>' + esc(REQ[s.requirement] || s.requirement) + '</td>' +
+      '<td>' + esc(s.valid_from) + ' 〜 ' + esc(s.valid_to || '') + '</td></tr>';
+  }
+  document.getElementById('sources-table').innerHTML = html;
+}
+
+async function load() {
+  settings = await api('/apps/ai-insights/api/settings');
+  renderBudgetTable();
+  renderEvents();
+  renderRecon();
+  renderJobs();
+  renderSources();
+}
+
+function initYearSelect() {
+  const sel = document.getElementById('budget-year');
+  const y = new Date().getFullYear();
+  for (let i = y - 1; i <= y + 1; i++) {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = i + '年';
+    if (i === y) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.addEventListener('change', renderBudgetTable);
+}
+
+document.getElementById('btn-save-budget').addEventListener('click', saveBudget);
+document.getElementById('btn-prefill').addEventListener('click', prefillBudget);
+document.getElementById('btn-add-event').addEventListener('click', addEvent);
+initYearSelect();
+load().catch((e) => toast('読み込み失敗: ' + e.message));
+</script>
+</body>
+</html>
