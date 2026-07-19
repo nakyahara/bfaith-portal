@@ -45,7 +45,7 @@ const result = {
     {
       title: '楽天売上が前週比+50%',
       category: 'sales',
-      evidence: '今週15,000円 / 前週10,000円 (facts.sales.by_mall)',
+      evidence: '今週1.5万円（前週1.0万円）',
       hypothesis: 'セール参加の影響の可能性 (要確認)',
       next_check: '楽天分析ダッシュボードで商品別内訳',
       action: '好調SKUの在庫日数を確認し補充判断',

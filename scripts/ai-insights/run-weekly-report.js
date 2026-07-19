@@ -22,7 +22,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   PROMPT_VERSION, buildPrompt, validateOutput, buildFallbackBody,
-  buildGChatMessage, buildBlockedNotice,
+  buildGChatMessage, buildBlockedNotice, enrichFactsDisplay,
 } from './weekly-prompt.js';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -280,6 +280,29 @@ async function main() {
     `${cfg.base}/api/ai-insights/report-input?type=weekly&period_start=${periodStart}`,
     { headers: { 'x-read-token': cfg.readToken }, retries: 3 },
   );
+  // 金額の表示用文字列 (*_disp、万円/億円) を機械追加。AI は disp をそのまま引用する契約
+  enrichFactsDisplay(input);
+
+  // --dry-run: サーバ書き込み・GChat 投稿を一切せず、本文プレビューだけをログに出す
+  if (args.includes('--dry-run')) {
+    let previewText;
+    if (input.constraints?.generation === 'blocked') {
+      previewText = buildBlockedNotice(input, 'PREVIEW');
+    } else {
+      let body = null;
+      const prompt = buildPrompt(input);
+      try {
+        body = validateOutput(parseClaudeOutput(await runClaude(cfg, prompt)), input);
+      } catch (e) {
+        log(`dry-run: claude生成失敗 → フォールバックでプレビュー (${e.message})`);
+        body = buildFallbackBody(input);
+      }
+      previewText = buildGChatMessage(body, input, 'PREVIEW', { detailUrl: `${cfg.base}/apps/ai-insights` });
+    }
+    log(`---- GChat本文プレビュー (未投稿) ----\n${previewText}\n---- プレビューここまで ----`);
+    notify('dry_run');
+    return 0;
+  }
 
   // 2. blocked (必須データ全滅) → 締切前なら次の定期実行に任せて静かに終了
   const { ymd: today, hour } = jstParts();
