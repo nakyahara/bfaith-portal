@@ -31,11 +31,16 @@ export async function renderOrderPdf(payload, { timeoutMs = 30000 } = {}) {
   }
   return new Promise((resolve, reject) => {
     const cp = spawn(pythonCmd(), [SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const MAX_PDF = 20 * 1024 * 1024; // 発注書PDFの想定は数十KB。20MB超は異常出力としてkill (メモリ保護)
     const out = [];
-    let err = '';
+    let outBytes = 0, err = '';
     const timer = setTimeout(() => { cp.kill('SIGKILL'); reject(new Error('発注書PDF生成がタイムアウトしました (30秒)')); }, timeoutMs);
-    cp.stdout.on('data', (d) => { out.push(d); });
-    cp.stderr.on('data', (d) => { err += d; });
+    cp.stdout.on('data', (d) => {
+      outBytes += d.length;
+      if (outBytes > MAX_PDF) { clearTimeout(timer); cp.kill('SIGKILL'); return reject(new Error('PDF生成の出力が大きすぎます (20MB超) — 明細数を確認してください')); }
+      out.push(d);
+    });
+    cp.stderr.on('data', (d) => { if (err.length < 65536) err += d; });
     cp.on('error', (e) => { clearTimeout(timer); reject(new Error(`PDF生成プロセス起動失敗: ${e.message} (ローカル実行には python + reportlab が必要です)`)); });
     cp.on('close', (code) => {
       clearTimeout(timer);

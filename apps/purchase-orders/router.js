@@ -1254,18 +1254,23 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
     const channel = sendChannelOf(orderId);
     // プレビュー時のチャネルと不一致なら拒否 (プレビュー後に仕入先の発注方法が変わっていたら、
-    // FAXのつもりの承認でメールを送らない。expectedMode と同じ発想)
+    // FAXのつもりの承認でメールを送らない。expectedMode と同じ発想で必須 (Codex fax-R1 High))
     const expectedChannel = trimS(b.expectedChannel) || null;
-    if (expectedChannel && expectedChannel !== channel) {
+    if (!expectedChannel) return res.status(400).json({ ok: false, error: '送信方法 (expectedChannel) が未指定です。画面を再読み込みしてから送信してください' });
+    if (expectedChannel !== channel) {
       return res.status(400).json({ ok: false, error: `送信方法が変わっています (画面: ${expectedChannel} / 現在: ${channel})。プレビューを開き直して内容を確認してください` });
     }
     let faxPdf = null, faxHash = null;
     if (channel === 'fax') {
-      // PDF生成 (async) はジョブ作成txnの外。生成時点の内容ハッシュを createEmailJob が再検証し、
-      // 生成中に発注が編集されていたら拒否する (プレビューと違うPDFを送らない)
-      const p = buildOrderFax(orderId);
-      faxHash = contentHashOf(p);
-      faxPdf = await renderOrderPdf(p.pdfPayload);
+      // 冪等リプレイ (結果保存済み) は createEmailJob を呼ばないため、PDF生成もスキップ (Codex fax-R1 Medium)
+      const done = getDB().prepare('SELECT result_json FROM po_commands WHERE idempotency_key=?').get(idemKey);
+      if (!done || done.result_json == null) {
+        // PDF生成 (async) はジョブ作成txnの外。生成時点の内容ハッシュを createEmailJob が再検証し、
+        // 生成中に発注が編集されていたら拒否する (プレビューと違うPDFを送らない)
+        const p = buildOrderFax(orderId);
+        faxHash = contentHashOf(p);
+        faxPdf = await renderOrderPdf(p.pdfPayload);
+      }
     }
     const { replay, result: jobId } = withCommand(
       { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode, channel } },
@@ -6080,7 +6085,8 @@ function bulkEligibleIds() {
 // 送信結果の分類: ジョブ作成成功 (ok:true) でも送信自体は failed/unknown/stale があり得る (成功扱いにしない)
 function bulkOutcome(j, at) {
   if (!j.ok) return { kind: 'fail', text: '❌ ' + (j.error || '不明なエラー') };
-  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)' : '✅ 送信しました' };
+  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)'
+    : (j.channel === 'fax' ? '✅ eFaxへ送信済 (FAX送達はeFaxの結果メールで確認)' : '✅ 送信しました') };
   if (j.status === 'scheduled' || j.status === 'queued') return { kind: 'ok', text: '⏰ 予約しました' + (at ? ' (' + at.replace('T', ' ') + ')' : '') };
   if (j.status === 'failed') return { kind: 'fail', text: '❌ 送信失敗: ' + (j.error || '') };
   // unknown / stale — 未送信と断定できない。二重送信を避けるため自動再送せず照合を案内
@@ -6108,15 +6114,16 @@ document.getElementById('boBulkSend').addEventListener('click', function() {
     ids = bulkEligibleIds();
     if (ids.length < before) toast((before - ids.length) + '件は完了/送信対象外になったため対象から外しました');
     if (!ids.length) { toast('送信できるPOがありません'); updateBulkBar(); return; }
-    var labels = {};
+    var labels = {}, channels = {};
     ids.forEach(function(id) {
       var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
-      labels[id] = o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id;
+      channels[id] = (o && o.sendMethod === 'fax') ? 'fax' : 'email';
+      labels[id] = (o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id) + (channels[id] === 'fax' ? ' 📠FAX' : '');
     });
-    if (!confirm('選択した ' + ids.length + '件の発注書メールを' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します。\\n' +
+    if (!confirm('選択した ' + ids.length + '件の発注書を' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します (📠FAX印はeFax経由でPDF送信)。\\n' +
       'モード: ' + (st.mode === 'live' ? '⚠️ 本番送信 (仕入先に届きます)' : '🔒 dry-run (社内 ' + (st.dryrunTo || '未設定') + ' に送信)') + '\\n\\n・' + ids.map(function(id){ return labels[id]; }).join('\\n・') + '\\n\\nよろしいですか?')) return;
     // 冪等キーは確定時に一括生成して保持 — 通信エラー行は「同じキーで再確認」で安全に再実行できる (replayなら二重送信なし)
-    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
+    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], channel: channels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
     btn.disabled = true;
     runBulk(BULK_LAST, function(){ btn.disabled = false; SEL = {}; load(); });
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
@@ -6141,7 +6148,7 @@ function runBulk(batch, done) {
 function sendBulkOne(batch, en) {
   return fetch(API + '/orders/' + en.id + '/email/send', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': en.key },
-    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode }),
+    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode, expectedChannel: en.channel || 'email' }),
   }).then(function(r){ return jsonOrErr(r, true); }).then(function(j) {
     return { en: en, out: bulkOutcome(j, batch.at) };
   }).catch(function(e) {
@@ -6465,8 +6472,8 @@ function emPreviewModal(j, orderId) {
     '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
     '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
     ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span>' +
-    (isFax && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (送信される実物)</a>' : '') + '</h3>' +
-    (isFax ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください。</div>' : '') +
+    (isFax && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (現在のデータから生成)</a>' : '') + '</h3>' +
+    (isFax ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください (送信後の正式な控えは履歴の📄PDF)。</div>' : '') +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
@@ -6520,12 +6527,13 @@ function emailPanel(orderId, errBanner) {
       '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
-      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
-      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>';
+      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
+      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>' +
+      (isFax ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 「送信済」はeFaxゲートウェイへの受け渡し完了です。相手FAX機への送達結果は、eFaxからの結果通知メール (送信元アドレス宛) で確認してください。</div>' : '');
     if (j.jobs.length) {
       h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
       j.jobs.forEach(function(x) {
-        var st = x.status === 'sent' ? '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '') :
+        var st = x.status === 'sent' ? (x.channel === 'fax' && !x.is_dry_run ? '✅ eFaxへ送信済' : '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '')) :
           x.status === 'failed' ? '❌ 失敗' :
           x.status === 'unknown' ? '❓ 結果不明' :
           x.status === 'sending' ? '⏳ 送信中' :
@@ -6550,7 +6558,7 @@ function emailPanel(orderId, errBanner) {
     var idemKey = newIdemKey();
     var whenEl = document.getElementById('emWhen-' + orderId);
     if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
-    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run; })[0] || null;
+    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); })[0] || null;
     function doSend(resend, scheduledAt) {
       var when = scheduledAt ? ' (予約: ' + scheduledAt.replace('T', ' ') + ' JST)' : '';
       var msg = dry

@@ -1211,7 +1211,7 @@ console.log('── P15: メール送信 (fake transport) ──');
   // /email/send は expectedMode 必須 (プレビュー時モードの一致検証)。テストでは現在モードを自動注入
   let CUR_MODE = 'dry_run';
   const jsonPost = (p, body, key) => {
-    if (p.includes('/email/send') && body && body.expectedMode === undefined) body = { expectedMode: CUR_MODE, ...body };
+    if (p.includes('/email/send') && body) body = { expectedMode: CUR_MODE, expectedChannel: 'email', ...body };
     return j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
   };
 
@@ -3707,7 +3707,7 @@ console.log('── P15b: FAX送信 (eFaxゲートウェイ) ──');
   const emailMod = await imp('apps/purchase-orders/email.js');
   const jsonPost = (p, body, key) => j(p, { method: 'POST',
     headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
-    body: JSON.stringify({ expectedMode: 'dry_run', ...body }) });
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: 'fax', ...body }) });
 
   // FAX番号の正規化・ゲートウェイ変換 (eFax公式: 81 + 先頭0を除いた番号 + @efaxsend.com)
   ok(emailMod.normalizeFaxNumber('06-7632-4190') === '0676324190', 'normalizeFaxNumber: ハイフン除去');

@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from io import BytesIO
+from xml.sax.saxutils import escape as xesc
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -75,27 +76,28 @@ def build_pdf(data):
     st_small = ParagraphStyle("small", fontName=font, fontSize=9, leading=12)
     st_supplier = ParagraphStyle("sup", fontName=font, fontSize=13, leading=17)
     st_cell = ParagraphStyle("cell", fontName=font, fontSize=9, leading=11)
-    st_cell_r = ParagraphStyle("cellr", fontName=font, fontSize=9, leading=11, alignment=2)
 
+    # Paragraph はミニXMLマークアップを解釈するため、業務データは全てエスケープして渡す
+    # (商品名等の < & > で生成失敗・マークアップ注入させない)
     story = [Paragraph("発　注　書", st_title), Spacer(1, 6 * mm)]
 
     # ── ヘッダ: 左=宛先 / 右=発注情報+発行元 ──
-    left_lines = [Paragraph(data["supplier_name"], st_supplier)]
+    left_lines = [Paragraph(xesc(data["supplier_name"]), st_supplier)]
     if data.get("contact_name"):
-        left_lines.append(Paragraph("ご担当: " + data["contact_name"], st_base))
+        left_lines.append(Paragraph("ご担当: " + xesc(data["contact_name"]), st_base))
     left_lines.append(Spacer(1, 3 * mm))
     left_lines.append(Paragraph("下記の通り発注いたします。よろしくお願いいたします。", st_base))
-    left_lines.append(Paragraph("希望納期: " + (data.get("nouki_text") or "指定なし"), st_base))
+    left_lines.append(Paragraph("希望納期: " + xesc(data.get("nouki_text") or "指定なし"), st_base))
 
     right_lines = [
-        Paragraph("発注日: " + data["issued_date"], st_base),
-        Paragraph("発注伝票番号: " + data["po_number"], st_base),
+        Paragraph("発注日: " + xesc(data["issued_date"]), st_base),
+        Paragraph("発注伝票番号: " + xesc(data["po_number"]), st_base),
         Spacer(1, 2 * mm),
     ]
     for ln in data.get("company_lines", []):
-        right_lines.append(Paragraph(ln, st_small))
+        right_lines.append(Paragraph(xesc(ln), st_small))
     if data.get("issuer_name"):
-        right_lines.append(Paragraph("発行担当者: " + data["issuer_name"], st_small))
+        right_lines.append(Paragraph("発行担当者: " + xesc(data["issuer_name"]), st_small))
 
     head = Table(
         [[left_lines, right_lines]],
@@ -118,15 +120,15 @@ def build_pdf(data):
     for i, it in enumerate(data["items"], 1):
         row = [
             str(i),
-            Paragraph(it.get("code") or "", st_cell),
-            Paragraph(it.get("name") or "", st_cell),
+            Paragraph(xesc(it.get("code") or ""), st_cell),
+            Paragraph(xesc(it.get("name") or ""), st_cell),
             it.get("nouki") or "",
             fmt_money(it.get("unit_cost")),
             f"{int(it['qty']):,}",
             fmt_money(it.get("subtotal")),
         ]
         if vendor_col:
-            row.append(Paragraph(it.get("vendor_code") or "", st_cell))
+            row.append(Paragraph(xesc(it.get("vendor_code") or ""), st_cell))
         rows.append(row)
 
     # 合計行 (小計列に合計金額。単価列ラベル)

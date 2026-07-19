@@ -371,7 +371,9 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
     const jobId = Number(info.lastInsertRowid);
     audit(db, { actorType: 'user', actor, action: dryRun ? 'email_dryrun_queued' : 'email_queued',
       resource: `order:${orderId}`,
-      detail: { jobId, channel, to, resendOf, scheduledAt: scheduleIso, deliveryKey, contentHash: contentHash.slice(0, 16) } });
+      detail: { jobId, channel, to, resendOf, scheduledAt: scheduleIso, deliveryKey, contentHash: contentHash.slice(0, 16),
+        // FAXは添付PDFバイト列のハッシュも証跡に残す (content_hashは業務データ由来でPDFレイアウト差を含まないため、Codex fax-R1 Medium)
+        ...(channel === 'fax' ? { pdfSha256: createHash('sha256').update(pdfBuffer).digest('hex').slice(0, 32), pdfBytes: pdfBuffer.length } : {}) } });
     return jobId;
   });
   return tx.immediate();

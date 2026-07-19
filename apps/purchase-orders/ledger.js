@@ -467,8 +467,10 @@ export function listBackorders() {
   if (!boundary) return { boundary: null, orders: [], summary };
   const today = jstToday();
   const orders = db.prepare(`
-    SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked, parent_order_id, ne_slip_number
-    FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
+    SELECT o.id, o.supplier_code, o.supplier_name, o.po_number, o.note, o.requested_date, o.issued_at, o.closed_at, o.origin,
+           o.send_blocked, o.parent_order_id, o.ne_slip_number, s.send_method
+    FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
+    WHERE o.status='issued' AND o.issued_at >= ? ORDER BY (o.closed_at IS NULL) DESC, o.issued_at DESC`).all(boundary);
   // 先方管理番号 (対応表)。仕入先別ビュー・注残確認CSVで表示する (仕入先は自社コードではなく自分の管理番号で突合するため)。
   // tracked POに現れる仕入先分だけ読む (対応表全件prefetchの固定コストを避ける、Codex R1 Low)。
   // 仕入先→商品の入れ子Map (文字列連結キーはコードに区切り文字が含まれると別仕入先の番号が混入し得る、Codex R2 Medium)
@@ -528,7 +530,7 @@ export function listBackorders() {
     out.push({
       id: o.id, poNumber: o.po_number, supplierCode: o.supplier_code, supplierName: o.supplier_name,
       note: o.note, requestedDate: o.requested_date, issuedAt: o.issued_at, closedAt: o.closed_at,
-      origin: o.origin, open, sendBlocked: !!o.send_blocked, neSlipNumber: o.ne_slip_number || null,
+      origin: o.origin, open, sendBlocked: !!o.send_blocked, sendMethod: o.send_method || null, neSlipNumber: o.ne_slip_number || null,
       parentOrderId: o.parent_order_id || null,
       parentPoNumber: o.parent_order_id ? (parentPoOf.get(o.parent_order_id) || `#${o.parent_order_id}`) : null,
       supplementPoNumbers: supByParent.get(o.id) || [],
