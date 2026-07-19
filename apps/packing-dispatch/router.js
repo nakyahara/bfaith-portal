@@ -24,7 +24,7 @@ import {
   getMethodChangeSummary, listMethodChangeLog, purgeOldMethodChangeLog,
   backfillShipmentTrackingFromExportedBatches, deleteRecentTrackingImports,
   includeUnmatchedToTracking, bulkApplyTeikeigai,
-  getReadyExportSummary, getReadyNeUketsukeNos, getReadyTrackingCsv,
+  getReadyExportSummary, getReadyNeUketsukeNos, getReadyTrackingCsv, auditTrackingCsvDriveSave,
   startNeSyncRun, getNeSyncRun, listRecentNeSyncRuns,
   claimReadyForNeSync, applyNeSyncResults, completeNeSyncRun,
 } from './service.js';
@@ -40,6 +40,10 @@ import { uploadCsvToDrive, probeFolderWritable } from '../fba-replenishment/driv
 //    共有ドライブに「コンテンツ管理者」以上で招待しておく必要がある (マイドライブ配下は不可)。
 const PD_DRIVE_EXPORT_FOLDER = process.env.PD_DRIVE_EXPORT_FOLDER || '1DMoPgo-f9kmzFSQ0e60apxTFi_2owoO';
 const PD_DRIVE_EXPORT_FILE = process.env.PD_DRIVE_EXPORT_FILE || 'logi_dispatch.csv';
+// ⑤ 追跡番号タブの「受注番号+追跡番号 CSV」の Drive 保存先 (2026-07-19 中原さん指示)。
+// メイン出力(logi_dispatch.csv)とは別フォルダ・別ファイル。同じく共有ドライブ配下 + SA コンテンツ管理者が前提。
+const PD_TRK_DRIVE_FOLDER = process.env.PD_TRK_DRIVE_FOLDER || '1eP4mQv-gR5Z-L-N93G8N3TqcBAzyP-Ar';
+const PD_TRK_DRIVE_FILE = process.env.PD_TRK_DRIVE_FILE || 'ne-tracking.csv';
 
 // Drive 出力の直列化 (Codex High③: 固定ファイルへの並行書込で古いバッチが新しいCSVを上書き、
 // および list→create の非原子性を回避)。bfaith-portal は単一インスタンス運用なのでプロセス内
@@ -48,6 +52,15 @@ let _exportDriveChain = Promise.resolve();
 function withExportDriveLock(fn) {
   const run = _exportDriveChain.then(fn, fn); // 前段の成否に関わらず順番に実行
   _exportDriveChain = run.then(() => {}, () => {}); // チェーン用にエラーを飲む (呼び出し側へは run で伝播)
+  return run;
+}
+// ⑤ 追跡CSV(ne-tracking.csv)の Drive 保存用ロック (Codex Medium: メイン出力 logi_dispatch.csv とは
+// 別ファイル・別フォルダなので別チェーンにする。片方の Drive API タイムアウトでもう片方を待たせない)。
+// ne-tracking.csv 自身への並行書込・世代逆転はこのチェーンで防ぐ (単一インスタンス運用前提)。
+let _trkDriveChain = Promise.resolve();
+function withTrackingDriveLock(fn) {
+  const run = _trkDriveChain.then(fn, fn);
+  _trkDriveChain = run.then(() => {}, () => {});
   return run;
 }
 
@@ -415,6 +428,62 @@ router.get('/api/tracking/ready/csv', (req, res) => {
   } catch (e) {
     res.status(500).json({ ok: false, message: e.message });
   }
+});
+
+// ⑤ 受注番号+追跡番号 CSV を Google Drive 固定ファイル (ne-tracking.csv) へ上書き保存 (2026-07-19 中原さん指示)。
+// 追跡番号タブの「📤 Drive保存」ボタンの本経路。tracking CSV は読み取り生成のみ (状態遷移/CAS 無し) なので、
+// メイン出力のような二相ロック (beginExport/commitExport) は不要。ただし固定ファイルへの並行書込・世代逆転を
+// 防ぐため専用の withTrackingDriveLock で直列化する (メイン出力 logi_dispatch.csv とは別チェーン)。
+// Drive 保存が失敗したら fail-safe で base64 を返し、フロントで従来DLに代替 (SA未共有でも運用継続できる)。
+router.post('/api/tracking/ready/csv/to-drive', (req, res) => handleAsync(res, () =>
+  withTrackingDriveLock(async () => {
+    // このファイルは常に「全件 (混在OK)」。method は受け付けず固定にする (Codex High:
+    // 部分件数で ne-tracking.csv を上書きさせない)。scope のみ 本日/過去履歴に連動 (fail-closed)。
+    const method = 'all';
+    const scope = ((req.body && req.body.scope) === 'all') ? 'all' : 'today';
+    // 確認ダイアログで見せた件数。必須・非負整数 (Codex High: 任意だと件数照合を迂回して上書きできる)。
+    const rawExpected = req.body && req.body.expectedCount;
+    if (!Number.isInteger(rawExpected) || rawExpected < 0) {
+      const e = new Error('expectedCount (確認時の件数) が必要です'); e.code = 'VALIDATION'; throw e;
+    }
+    const expectedCount = rawExpected;
+    const { csv, count } = getReadyTrackingCsv({ method, scope });
+    // 空CSVで固定ファイルを上書きしない (API直叩き含む防御、Codex 補足)。
+    if (count === 0) return { status: 'empty', count: 0 };
+    // 確認時と保存直前で件数が変わっていたら上書きせず、フロントで最新件数を再確認させる (Codex High)。
+    if (expectedCount !== count) {
+      return { status: 'count_mismatch', count, expectedCount };
+    }
+    const buffer = Buffer.from(csv, 'utf-8'); // csv は UTF-8 BOM + CRLF 文字列
+    try {
+      const up = await uploadCsvToDrive(buffer, PD_TRK_DRIVE_FILE, PD_TRK_DRIVE_FOLDER);
+      // 状態遷移が無い経路なので誰が/いつ/範囲/件数/fileId を監査ログに残す (Codex High: 追跡可能性)。
+      // Drive 上書きは取消不能なので、監査書込みが失敗しても保存自体は成功扱い。ただし監査欠落は
+      // サーバログに明示し、レスポンスにも audited を載せて後追いできるようにする (Codex High)。
+      const audited = auditTrackingCsvDriveSave(
+        { scope, count, action: up.action, file_id: up.fileId, filename: PD_TRK_DRIVE_FILE }, currentUser(req));
+      if (!audited) console.error('[packing] tracking csv to-drive: 監査ログ書込み失敗 (Drive保存は成功)', { file_id: up.fileId, count, scope });
+      return { status: 'saved', count, audited,
+        folderUrl: `https://drive.google.com/drive/folders/${PD_TRK_DRIVE_FOLDER}`,
+        drive: { action: up.action, fileId: up.fileId, filename: PD_TRK_DRIVE_FILE } };
+    } catch (e) {
+      console.error('[packing] tracking csv to-drive', e.message);
+      // fail-safe: Drive 保存失敗時は base64 でCSVを返し、フロントで従来DLに代替させる
+      return { status: 'drive_failed', count, message: e.message,
+        filename: `ne-tracking-${count}rows.csv`, csvBase64: buffer.toString('base64') };
+    }
+  })));
+
+// go-live 前確認: SA が tracking 保存先フォルダに書き込めるか (非破壊・admin専用)。
+// ブラウザで /apps/packing-dispatch/api/tracking/ready/csv/drive-check を開いて確認する運用。
+router.get('/api/tracking/ready/csv/drive-check', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handleAsync(res, async () => {
+    const r = await probeFolderWritable(PD_TRK_DRIVE_FOLDER);
+    return { folderId: PD_TRK_DRIVE_FOLDER,
+      folderUrl: `https://drive.google.com/drive/folders/${PD_TRK_DRIVE_FOLDER}`,
+      filename: PD_TRK_DRIVE_FILE, ...r };
+  });
 });
 
 // ── NE 反映ジョブ (Phase 2 PR-A 2026-06-05、構成 B) ──

@@ -328,7 +328,7 @@
   <!-- ───── 追跡番号 / NE反映 (Phase 1 UI 再設計、2026-06-07、状態駆動 + 本日デフォルト) ───── -->
   <section class="panel" id="panel-tracking">
     <div class="help-bar">
-      💡 この画面の使い方: <b>① キャリアCSVを取込</b> (照合できた伝票に追跡番号が自動で紐付く。照合できない分は一覧の「📫 紐付け待ち / ⚠️ 要確認」に出ます) → <b>② 定形外を反映</b> → <b>③ レターパックは追跡番号を手入力</b> → <b>④ 配送方法ごとに NE 受注番号をコピー</b>して NextEngine で配送方法を変更 → <b>⑤ 受注番号+追跡番号 CSV をまとめてダウンロード</b>して NextEngine にインポート。
+      💡 この画面の使い方: <b>① キャリアCSVを取込</b> (照合できた伝票に追跡番号が自動で紐付く。照合できない分は一覧の「📫 紐付け待ち / ⚠️ 要確認」に出ます) → <b>② 定形外を反映</b> → <b>③ レターパックは追跡番号を手入力</b> → <b>④ 配送方法ごとに NE 受注番号をコピー</b>して NextEngine で配送方法を変更 → <b>⑤ 受注番号+追跡番号 CSV を Google Drive (ne-tracking.csv) に保存</b>して NextEngine にインポート。
       <a href="#" data-jump="ch8">📖 詳しい手順を見る</a>
     </div>
 
@@ -520,17 +520,18 @@
       </div>
     </div>
 
-    <!-- ⑤ 受注番号 + 追跡番号 CSV を一括ダウンロード (2026-07-19 中原さん指示で ④ から独立) -->
+    <!-- ⑤ 受注番号 + 追跡番号 CSV を Google Drive 固定ファイルへ保存 (2026-07-19 中原さん指示で ④ から独立 + Drive保存化) -->
     <div class="card" id="trkAllCsvCard" style="background:#f0fff4; border-color:#9ae6b4">
       <div class="row">
-        <strong>⑤ 📥 受注番号 + 追跡番号 CSV ダウンロード (全件)</strong>
+        <strong>⑤ 📤 受注番号 + 追跡番号 CSV を Google Drive に保存 (全件)</strong>
         <span id="trkAllCsvSummary" class="muted"></span>
       </div>
-      <div class="muted">紐付け済で<b>追跡番号あり</b>の伝票を 1 つの CSV にまとめてダウンロード → NextEngine の追跡番号 CSV インポートに流します。<b>配送方法は混在 OK</b> (④ の配送方法選択とは関係なく全件出力)。追跡番号なし (定形外等) は CSV に含まれません。<b>出力範囲は画面上部の 本日 / 過去履歴 の切替に連動</b>します。</div>
+      <div class="muted">紐付け済で<b>追跡番号あり</b>の伝票を 1 つの CSV にまとめ、Google Drive の固定ファイル <code>ne-tracking.csv</code> に<b>上書き保存</b>します → NextEngine の追跡番号 CSV インポートに流します。<b>配送方法は混在 OK</b> (④ の配送方法選択とは関係なく全件出力)。追跡番号なし (定形外等) は含まれません。<b>出力範囲は画面上部の 本日 / 過去履歴 の切替に連動</b>します。<br/><span class="muted">※ Drive 保存に失敗した場合は、代わりに PC へダウンロードされます。</span></div>
       <div class="row" style="margin-top:8px">
-        <button id="btnTrkAllCsvDownload" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
+        <button id="btnTrkAllCsvDownload" style="background:#2e7d32; border-color:#2e7d32" title="Google Drive の ne-tracking.csv に上書き保存します">📤 Driveに保存 (ne-tracking.csv)</button>
         <span id="trkAllCsvStatus" class="muted"></span>
       </div>
+      <div id="trkAllCsvResult" class="muted" style="margin-top:6px"></div>
     </div>
 
     <!-- 📊 配送方法変更ログ (中原さん 2026-06-04 指示) -->
@@ -782,7 +783,7 @@
         <li><b>② 定形外を反映</b>: 定形外郵便は追跡番号が無いためキャリアCSVに出ません。一覧を確認して「<b>✅ すべて反映する</b>」でまとめて反映します。</li>
         <li><b>③ レターパック</b>: 各行の入力欄に追跡番号を手入力して保存します。サイズ超過等で配送方法を変えたい場合は「配送方法変更」ボタンから。</li>
         <li><b>④ NE 受注番号コピー (配送方法ごと)</b>: 配送方法を1つ選んで「NE 受注番号をコピー」→ NextEngine で一括検索して配送方法を変更 (⚠️必ず配送方法ごとに)。</li>
-        <li><b>⑤ 受注番号+追跡番号 CSV ダウンロード (全件)</b>: 「受注番号+追跡番号 CSV ダウンロード」を押すと、紐付け済の伝票を<b>全件まとめて</b> CSV 出力 → NextEngine の追跡番号CSVインポートに流します (配送方法混在OK)。</li>
+        <li><b>⑤ 受注番号+追跡番号 CSV を Google Drive に保存 (全件)</b>: 「📤 Driveに保存 (ne-tracking.csv)」を押すと、紐付け済で追跡番号ありの伝票を<b>全件まとめて</b> Google Drive の固定ファイル <code>ne-tracking.csv</code> に上書き保存します → NextEngine の追跡番号CSVインポートに流します (配送方法混在OK)。Drive保存に失敗した場合は代わりにPCへダウンロードされます。</li>
       </ol>
       <div class="note"><b>「Drive: 取得エラー」が出たら</b>: Driveフォルダがサービスアカウントに共有されていない可能性があります。管理者に「対象フォルダをサービスアカウントに閲覧者共有」を依頼してください (エラー詳細は <code>/apps/packing-dispatch/api/tracking/drive-file-info</code> をブラウザで開くと確認できます)。</div>
       <div class="note"><b>「重複: このファイルは既に取込済み」と出たら</b>: 同じ内容のCSVを既に取り込んでいます。Drive更新日時が古いままの場合は、キャリアソフト側のDL/出力がまだ実行されていないか確認してください。</div>
@@ -2433,16 +2434,31 @@ $('#btnTrkReadyCopyUkes').onclick = async () => {
   }
 };
 
-// ⑤ 📥 CSV ダウンロード (全件)。配送方法は混在 OK なので method=all で紐付け済を全件出力。
-// ④ の配送方法選択とは独立 (2026-07-19 中原さん指示)。
+// base64 の CSV を PC にダウンロードする fail-safe ヘルパ (Drive 保存が失敗した時の代替)。
+function downloadBase64Csv(base64, filename){
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0; i<bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const blob = new Blob([bytes], { type:'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename || 'ne-tracking.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// ⑤ 📤 受注番号+追跡番号 CSV を Google Drive 固定ファイル ne-tracking.csv へ上書き保存 (全件、2026-07-19 中原さん指示)。
+// 配送方法は混在 OK なので method=all で紐付け済を全件出力。④ の配送方法選択とは独立。
 // Codex High: scope は画面(本日/過去履歴)に連動する。過去履歴で押すと全期間を再出力し、
-//   NextEngine へ取込済の追跡番号まで再ダウンロードしてしまうため、都度 confirm で件数と範囲を明示する。
-$('#btnTrkAllCsvDownload').onclick = () => {
+//   NextEngine へ取込済の追跡番号まで再保存してしまうため、都度 confirm で件数と範囲を明示する。
+$('#btnTrkAllCsvDownload').onclick = async () => {
   const status = $('#trkAllCsvStatus');
+  const result = $('#trkAllCsvResult');
+  const btn = $('#btnTrkAllCsvDownload');
   status.style.color = '';
   status.textContent = '';
   // 件数と scope は必ず同じ summary 応答由来の対 (TRK_ALL_CSV) を使う。
-  // ダウンロードもこの scope で行うので、確認した件数と実際の出力範囲が食い違わない。
+  // 保存もこの scope で行うので、確認した件数と実際の出力範囲が食い違わない。
   const { count, scope } = TRK_ALL_CSV;
   // Codex R3 High: scope 切替直後〜新 summary 到着前は旧 scope の対が残る。
   // 画面の選択 scope と出力範囲がズレる窓を閉じるため、不一致なら止めて再取得を促す。
@@ -2458,12 +2474,53 @@ $('#btnTrkAllCsvDownload').onclick = () => {
   }
   const isPast = scope !== 'today';
   const scopeText = isPast ? '過去全期間' : '本日分';
-  let msg = `${scopeText}の「追跡番号あり ${count} 件」を CSV ダウンロードします。\nNextEngine の追跡番号インポート用です。`;
+  let msg = `${scopeText}の「追跡番号あり ${count} 件」を Google Drive の ne-tracking.csv に保存します。\nNextEngine の追跡番号インポート用です。`;
   if(isPast){
     msg += '\n\n⚠️ 過去履歴モードのため全期間が対象です。既に NextEngine へ取込済の追跡番号も含まれます。よろしいですか?';
   }
   if(!confirm(msg)) return;
-  location.href = API_BASE + 'api/tracking/ready/csv?method=all&scope=' + scope;
+  if(btn.disabled) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Google Driveに保存中…';
+  result.textContent = '';
+  try{
+    const r = await fetch(API_BASE + 'api/tracking/ready/csv/to-drive', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ method:'all', scope, expectedCount: count }),
+    });
+    const j = await r.json().catch(() => ({ ok:false, message:'通信エラー' }));
+    if(!j.ok) throw new Error(j.message || j.error || 'エラー');
+    const res = j.result;
+    if(res.status === 'saved'){
+      const act = res.drive && res.drive.action === 'created' ? '新規作成' : '上書き保存';
+      const fname = (res.drive && res.drive.filename) || 'ne-tracking.csv';
+      result.innerHTML = `<span style="color:#2e7d32">✅ Driveに保存しました（${fname} / ${res.count}件）</span>`
+        + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 フォルダを開く</a>` : '');
+      alert(`✅ Google Drive に保存しました\n\nファイル: ${fname}（${act}）\n件数: ${res.count}件\n\n`
+        + `このファイルを NextEngine の追跡番号CSVインポートに取り込んでください。`);
+    } else if(res.status === 'empty'){
+      result.innerHTML = `<span style="color:#c62828">⚠️ 出力対象が 0 件のため保存しませんでした</span>`;
+      alert('⚠️ 追跡番号ありの伝票が 0 件のため、Driveには保存しませんでした。');
+      loadTrkReadyExport();
+    } else if(res.status === 'count_mismatch'){
+      // 確認時と保存直前で件数が変わった → 上書きせず最新に更新して再確認を促す (Codex High)
+      result.innerHTML = `<span style="color:#c62828">⚠️ 件数が変わりました（確認時 ${res.expectedCount} → 現在 ${res.count}）。保存していません。</span>`;
+      alert(`⚠️ 件数が変わりました（確認時 ${res.expectedCount}件 → 現在 ${res.count}件）。\n\n`
+        + `Drive には保存していません。最新の件数に更新したので、もう一度内容を確認して保存してください。`);
+      loadTrkReadyExport();
+    } else {
+      // Drive 保存失敗 (SA未共有など) → fail-safe で PC にダウンロード
+      if(res.csvBase64) downloadBase64Csv(res.csvBase64, res.filename || 'ne-tracking.csv');
+      result.innerHTML = `<span style="color:#c62828">⚠️ Drive保存に失敗したため PC にダウンロードしました（${res.count}件）</span>`;
+      alert('⚠️ Google Drive への保存に失敗しました。\n\n' + (res.message || '')
+        + '\n\n代わりに CSV を PC にダウンロードしました。（保存先フォルダに サービスアカウントが「コンテンツ管理者」で共有されているか確認してください）');
+    }
+  }catch(e){
+    result.innerHTML = `<span style="color:#c62828">エラー: ${esc(e.message)}</span>`;
+    alert('CSV保存エラー: ' + e.message + '\n\n少し待ってもう一度お試しください。');
+  }finally{
+    btn.disabled = false; btn.textContent = orig;
+  }
 };
 
 // 定形外: 全選択 / 全解除

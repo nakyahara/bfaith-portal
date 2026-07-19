@@ -982,11 +982,20 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
   return { registered, syncedSkipped, candidates: byUketsuke.size };
 }
 
+// best-effort。書込めたら true、失敗したら false を返す (呼び出し側が監査有無を判定できるように)。
 function audit(action, target, detail, who) {
   try {
     getMirrorDB().prepare(`INSERT INTO pd_audit_log (ts,who,action,target,detail) VALUES (?,?,?,?,?)`)
       .run(utcIsoNow(), who || null, action, target || null, detail ? JSON.stringify(detail) : null);
-  } catch (e) { console.error('[packing] audit', e.message); }
+    return true;
+  } catch (e) { console.error('[packing] audit', e.message); return false; }
+}
+
+// ⑤ 追跡番号CSVの Drive 保存の監査ログ (router から呼ぶ)。状態遷移(CAS)が無い経路なので、
+// 誰が・いつ・どの範囲(scope)・何件・Drive のどのファイルに保存したかを追跡できるよう別途記録する。
+// Drive 上書きは取消不能なので保存自体は失敗させず、監査の成否を bool で返して呼び出し側に判断を委ねる (Codex High)。
+export function auditTrackingCsvDriveSave(detail, user) {
+  return audit('tracking_csv_drive_save', null, detail, user);
 }
 
 // ───────────────────────── マスタ② CRUD (区間連続性検証) ─────────────────────────
