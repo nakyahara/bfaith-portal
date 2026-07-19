@@ -21,7 +21,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
 //   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
 //   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'DBバックアップ'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -977,6 +977,14 @@ async function main() {
       results.push({ name: '月末確定値', success: true, skipped: true, summary: msg });
     }
   }
+
+  // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
+  // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。
+  // 冪等 (当日分完成済み+元DB変化なしなら再利用して offsite 以降だけやり直す) なので retry 対象。
+  // timeout 6h: 月初最悪ケース = rclone 内訳上限合計 約4h (upload90+manifest5+prune10+monthly copy30
+  // +prune10+restore DL90分) + VACUUM/gzip/検証/復元展開 約1.5h に余裕を乗せた値 (Codex R2 High#2)
+  const backupResult = runScript('apps/warehouse/backup-warehouse.js', 'DBバックアップ', 21600000);
+  results.push({ name: 'DBバックアップ', ...backupResult });
 
   const endTime = new Date();
   const duration = Math.round((endTime - startTime) / 1000);
