@@ -211,6 +211,9 @@ console.log('\n■ AI出力の機械検査 (禁止モール言及 / 数字創作
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い小数 (1.9万円) → 棄却 → fallback (整数部一致では許容しない)', r.out.slice(-300));
   ok(r.out.includes('数字創作の疑い'), '違反理由がログに出る', null);
   reset();
+  r = await runRunner({ FAKE_MODE: 'inventedtitle' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]') && r.out.includes('title'), 'title の創作数値も棄却 → fallback', r.out.slice(-300));
+  reset();
   r = await runRunner({ FAKE_MODE: 'badsummary' });
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'summary の全社集計言及 → 棄却 → fallback', r.out.slice(-300));
   ok(r.out.includes('全社集計に言及'), 'summary 検査の違反理由がログに出る', null);

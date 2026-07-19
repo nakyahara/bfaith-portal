@@ -187,6 +187,7 @@ export function validateOutput(raw, input) {
     const title = String(t?.title ?? '').trim();
     if (!title) throw new Error(`topic[${i}].title missing`);
     checkText(`${title} ${t?.evidence ?? ''}`, `topic[${i}]`);
+    assertEvidenceNumbers({ evidence: title }, numberSet, `topic[${i}].title`);
     assertEvidenceNumbers({ evidence: t?.evidence }, numberSet, `topic[${i}].evidence`);
     return {
       title: cap(title, CAPS.title),

@@ -14,10 +14,12 @@ if (mode === 'bad') {
   process.stdout.write('ここにJSONはありません\n');
   process.exit(0);
 }
-if (mode === 'prohibited' || mode === 'invented') {
+if (mode === 'prohibited' || mode === 'invented' || mode === 'inventedtitle') {
   const badTopic = mode === 'prohibited'
     ? { title: 'amazonの売上が急減', category: 'sales', evidence: '今週0円', action: '確認', confidence: 'med' }
-    : { title: '楽天が好調', category: 'sales', evidence: '今週1.9万円と大幅増', action: '確認', confidence: 'med' };
+    : mode === 'inventedtitle'
+      ? { title: '楽天売上1.9万円を達成', category: 'sales', evidence: '前週比+50%', action: '確認', confidence: 'med' }
+      : { title: '楽天が好調', category: 'sales', evidence: '今週1.9万円と大幅増', action: '確認', confidence: 'med' };
   process.stdout.write(JSON.stringify({
     type: 'result', subtype: 'success', is_error: false,
     result: JSON.stringify({ summary: 'テスト', topics: [badTopic], topic_updates: [], data_notes: '' }),
