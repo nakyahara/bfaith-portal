@@ -29,9 +29,10 @@ import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInb
 import { importNeBackorderCsv } from './migration.js';
 import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
-  buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
-  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell,
+  buildOrderEmail, buildOrderFax, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
+  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf,
 } from './email.js';
+import { renderOrderPdf } from './fax-pdf.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
@@ -498,7 +499,7 @@ function cycleIssuedSuppliers(cycleStart) {
            GROUP_CONCAT(CASE WHEN is_unsent = 1 THEN po_label END) AS unsent_pos
     FROM (
       SELECT o.supplier_code AS code, o.supplier_name AS name, COALESCE(o.po_number, '#' || o.id) AS po_label,
-             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method = 'email'
+             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method IN ('email', 'fax')
                    AND NOT EXISTS (SELECT 1 FROM po_email_jobs e WHERE e.order_id = o.id AND e.status = 'sent' AND e.is_dry_run = 0)
                   THEN 1 ELSE 0 END AS is_unsent
       FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
@@ -1188,14 +1189,21 @@ router.post('/api/inbound/:id/ignore', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// ─── P15: 発注書メール送信 ───
+// ─── P15: 発注書メール送信 (+FAX: eFaxゲートウェイ宛メール。channel='fax') ───
+/** POの仕入先の送信方法 ('fax' なら FAXチャネル、それ以外はemailチャネルで既存の検証メッセージに任せる) */
+function sendChannelOf(orderId) {
+  const r = getDB().prepare(`SELECT s.send_method FROM po_orders o
+    LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code WHERE o.id=?`).get(orderId);
+  return r && r.send_method === 'fax' ? 'fax' : 'email';
+}
+
 router.get('/api/orders/:id/email/preview', (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
-    const p = buildOrderEmail(orderId);
+    const p = sendChannelOf(orderId) === 'fax' ? buildOrderFax(orderId) : buildOrderEmail(orderId);
     res.json({
-      ok: true,
+      ok: true, channel: p.channel, faxNumber: p.faxNumber,
       to: p.to, cc: p.cc, subject: p.subject, body: p.body,
       rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
       attachmentName: p.attachmentName, csvText: p.csvText, csvRows: p.csvRows,
@@ -1204,6 +1212,32 @@ router.get('/api/orders/:id/email/preview', (req, res) => {
       jobs: listEmailJobs(orderId),
     });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// FAX発注書PDFのプレビュー (その場で生成して返す。送信済み控えは /api/email-jobs/:id/pdf)
+router.get('/api/orders/:id/fax/pdf', async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const p = buildOrderFax(orderId);
+    const pdf = await renderOrderPdf(p.pdfPayload);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${p.attachmentName}"`);
+    res.send(pdf);
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 送信ジョブに保存されたPDF控え (送信された実バイト列。プレビュー再生成ではない)
+router.get('/api/email-jobs/:id/pdf', (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const job = getDB().prepare('SELECT channel, attachment_name, attachment_pdf FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!job || job.channel !== 'fax' || !job.attachment_pdf) return res.status(404).json({ ok: false, error: 'FAXジョブのPDFが見つかりません' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${job.attachment_name}"`);
+    res.send(Buffer.from(job.attachment_pdf));
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/api/orders/:id/email/send', async (req, res) => {
@@ -1218,13 +1252,29 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     // 冪等キーは必須 (再送ジョブはdedup対象外のため、通信断後の再実行・自動リトライでの複数通送信をキーで防ぐ、Codex P15-R4 High)
     const idemKey = trimS(req.get('Idempotency-Key'));
     if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
+    const channel = sendChannelOf(orderId);
+    // プレビュー時のチャネルと不一致なら拒否 (プレビュー後に仕入先の発注方法が変わっていたら、
+    // FAXのつもりの承認でメールを送らない。expectedMode と同じ発想)
+    const expectedChannel = trimS(b.expectedChannel) || null;
+    if (expectedChannel && expectedChannel !== channel) {
+      return res.status(400).json({ ok: false, error: `送信方法が変わっています (画面: ${expectedChannel} / 現在: ${channel})。プレビューを開き直して内容を確認してください` });
+    }
+    let faxPdf = null, faxHash = null;
+    if (channel === 'fax') {
+      // PDF生成 (async) はジョブ作成txnの外。生成時点の内容ハッシュを createEmailJob が再検証し、
+      // 生成中に発注が編集されていたら拒否する (プレビューと違うPDFを送らない)
+      const p = buildOrderFax(orderId);
+      faxHash = contentHashOf(p);
+      faxPdf = await renderOrderPdf(p.pdfPayload);
+    }
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode } },
-      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req) })
+      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode, channel } },
+      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req),
+        channel, pdfBuffer: faxPdf, expectedHash: faxHash })
     );
     const outcome = await processEmailJob(jobId);
     const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
-    res.json({ ok: true, jobId, replay, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
+    res.json({ ok: true, jobId, replay, channel, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
   } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
@@ -2119,12 +2169,15 @@ const MASTER_DEFS = {
       email_cc: parseAddresses(b.email_cc || '').join(',') || null,
       contact_name: trimS(b.contact_name) || null,
       send_method: trimS(b.send_method) || null,
+      fax_number: trimS(b.fax_number) || null, // 入力表記のまま保存 (正規化・検証は validate / 送信時)
       lead_days: numOrNull(b.lead_days),
     }),
     validate: r => {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
       if (r.send_method && !['email', 'fax', 'web', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/none';
+      if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
+      if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
       if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
       return null;
     },
@@ -6380,8 +6433,10 @@ function supPanel(orderId) {
   });
 }
 
-// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
-function emPreviewModal(j) {
+// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)。
+// FAX (channel='fax') は宛先=FAX番号、添付=PDF発注書 (「PDFを開く」で実物確認。表は同じ明細データ)
+function emPreviewModal(j, orderId) {
+  var isFax = j.channel === 'fax';
   var old = document.getElementById('emModalBg');
   if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
   var rows = j.csvRows || [];
@@ -6397,18 +6452,21 @@ function emPreviewModal(j) {
   var bg = document.createElement('div');
   bg.className = 'pomodal-bg'; bg.id = 'emModalBg';
   bg.innerHTML = '<div class="pomodal">' +
-    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">📧 送信内容のプレビュー</h2>' +
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">' + (isFax ? '📠 FAX送信内容のプレビュー' : '📧 送信内容のプレビュー') + '</h2>' +
     (j.mode !== 'live'
       ? '<span class="badge b-draft">🔒 dry-run — 実際は ' + esc(j.dryrunTo || '未設定') + ' に届きます</span>'
       : '<span class="badge b-issued">本番送信 (live)</span>') +
     '<button class="ghost" id="emModalClose" style="margin-left:auto;font-size:15px">✕ 閉じる</button></div>' +
     '<table class="t" style="margin-top:8px">' +
-    '<tr><th style="width:80px">宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '') + '</td></tr>' +
+    '<tr><th style="width:80px">宛先</th><td>' + (isFax ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+      : esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '')) + '</td></tr>' +
     '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr></table>' +
-    '<h3 style="margin:12px 0 4px">本文</h3>' +
+    '<h3 style="margin:12px 0 4px">' + (isFax ? '送付状 (FAXの1枚目に印字されます)' : '本文') + '</h3>' +
     '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
     '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
-    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span></h3>' +
+    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span>' +
+    (isFax && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (送信される実物)</a>' : '') + '</h3>' +
+    (isFax ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください。</div>' : '') +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
@@ -6428,6 +6486,7 @@ function emailPanel(orderId, errBanner) {
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
+    var isFax = j.channel === 'fax';
     // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
     var eb = (errBanner && errBanner.head) ? errBanner : null;
     if (!eb) {
@@ -6442,20 +6501,23 @@ function emailPanel(orderId, errBanner) {
       (eb
         ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">' + esc(eb.head) + '<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(eb.detail || '') + '</div></div>'
         : '') +
-      '<b>📧 発注書メール</b> ' +
+      '<b>' + (isFax ? '📠 発注書FAX (eFax)' : '📧 発注書メール') + '</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
       '<table class="t" style="margin-top:6px">' +
-      '<tr><th>宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '') + '</td></tr>' +
-      '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr>' +
+      '<tr><th>宛先</th><td>' + (isFax
+        ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted" title="eFaxのメールtoFAXゲートウェイ経由で相手のFAX機に届きます">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+        : esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '')) + '</td></tr>' +
+      '<tr><th>件名</th><td>' + esc(j.subject) + (isFax ? ' <span class="muted" style="font-size:11px">(件名・本文はFAX送付状として1枚目に印字)</span>' : '') + '</td></tr>' +
       '<tr><th>添付</th><td>' + esc(j.attachmentName) + ' — ' + j.rows + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) +
         (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
-        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') + '</td></tr>' +
+        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') +
+        (isFax ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:12px;font-weight:600">📄 PDFを開く</a>' : '') + '</td></tr>' +
       '</table>' +
       '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
       '<button class="ghost" id="emPrev-' + orderId + '" style="font-weight:600">👁 送信内容をプレビュー (本文+添付)</button>' +
-      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信') + '</button>' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
       (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
@@ -6469,10 +6531,11 @@ function emailPanel(orderId, errBanner) {
           x.status === 'sending' ? '⏳ 送信中' :
           x.status === 'cancelled' ? '🚫 取消' :
           (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + (x.channel === 'fax' ? '📠 ' : '') + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
           '<td style="white-space:nowrap">' +
+            (x.channel === 'fax' ? '<a class="ghost" href="' + API + '/email-jobs/' + x.id + '/pdf" target="_blank" rel="noopener" title="このジョブで送信された (される) PDFの控え">📄 PDF</a> ' : '') +
             (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button> ' : '') +
             ((x.status === 'queued' || x.status === 'failed') ? '<button class="ghost" data-emcancel="' + x.id + '" data-emorder="' + orderId + '">取消</button> ' : '') +
             ((x.status === 'sending' || x.status === 'unknown') ? '<button class="ghost" data-emrec="' + orderId + '">照合</button> ' : '') +
@@ -6483,7 +6546,7 @@ function emailPanel(orderId, errBanner) {
     }
     h += '</div>';
     area.innerHTML = h;
-    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j); });
+    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j, orderId); });
     var idemKey = newIdemKey();
     var whenEl = document.getElementById('emWhen-' + orderId);
     if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
@@ -6492,7 +6555,9 @@ function emailPanel(orderId, errBanner) {
       var when = scheduledAt ? ' (予約: ' + scheduledAt.replace('T', ' ') + ' JST)' : '';
       var msg = dry
         ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
-        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
+        : (isFax
+          ? '⚠️ 本番FAX送信です。仕入先のFAX ' + (j.faxNumber || '') + ' に発注書PDFが届きます (eFax経由)' + when + '。送信しますか?\\n\\n※eFaxの送信結果 (成功/失敗) は送信元メールアドレスへの通知メールで確認できます'
+          : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?');
       // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
       if (j.missingVendorCodes.length) {
         msg += '\\n\\n⚠️ 先方管理番号が未登録の商品が ' + j.missingVendorCodes.length + '件あります (' +
@@ -6503,7 +6568,7 @@ function emailPanel(orderId, errBanner) {
       if (btn) btn.disabled = true;
       post(API + '/orders/' + orderId + '/email/send',
         { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null,
-          expectedMode: j.mode }, idemKey)
+          expectedMode: j.mode, expectedChannel: j.channel || 'email' }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
           if (!r2.ok) {
@@ -7415,11 +7480,11 @@ var TAB = 'suppliers';
 var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
 var GRP_HINTS = {
-  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB) をここで設定します。',
+  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB)、FAX番号 (eFax送信用) をここで設定します。',
   conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
   barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
-  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。',
+  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。📠FAX送信 (eFax) も同じモード・テンプレを使います (件名・本文が送付状になります)。',
 };
 function setGroup(g) {
   GRP = g;
@@ -7443,6 +7508,7 @@ var DEFS = {
     { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
     { k: 'contact_name', l: '担当者名 (様は自動付与)' },
     { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['none', '送信なし']] },
+    { k: 'fax_number', l: 'FAX番号 (発注方法FAXで必須。例: 06-1234-5678)' },
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },

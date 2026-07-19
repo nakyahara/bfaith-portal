@@ -48,6 +48,14 @@ URL: http://b-faith.biz
 // 添付CSVの「発行担当者」列の既定 (既存GAS発注書の値。メール設定で変更可)
 export const DEFAULT_ISSUER = '中原　大輔';
 
+// FAX発注書PDFの発行元表記 (DEFAULT_BODY_TPL の署名と同一内容)
+export const COMPANY_LINES = [
+  'B-Faith株式会社',
+  '〒564-0038 大阪府吹田市南清和園町41-36',
+  'TEL: 06-4860-7868 / FAX: 06-7632-4190',
+  'Email: info＠b-faith.biz',
+];
+
 export function emailSettings() {
   return {
     mode: getSetting('email_mode') || 'dry_run',
@@ -66,6 +74,27 @@ export function parseAddresses(s) {
   const list = trimS(s).split(/[,;、]/).map(x => x.trim()).filter(Boolean);
   for (const a of list) if (!EMAIL_RE.test(a)) throw new Error(`メールアドレスが不正です: ${a}`);
   return list;
+}
+
+// ── FAX送信 (eFaxメールゲートウェイ) ──
+// 宛先書式は eFax 公式ヘルプ「メールでファックスを送信する」準拠:
+//   国番号81 + 市外局番の先頭0を除いた番号 + @efaxsend.com (例: 03-1234-5678 → 81312345678@efaxsend.com)
+// メールの件名・本文はそのまま送付状 (カバーページ) として先方FAXの1枚目に印字される
+
+/** FAX番号を数字のみへ正規化 (国内0始まり10-11桁のみ許容。空はnull、不正はthrow) */
+export function normalizeFaxNumber(s) {
+  const t = trimS(s);
+  if (!t) return null;
+  const digits = t.replace(/[-−ー()（）\s]/g, '');
+  if (!/^0\d{9,10}$/.test(digits)) {
+    throw new Error(`FAX番号が不正です: ${t} (0始まりの10〜11桁で入力してください。例: 06-1234-5678)`);
+  }
+  return digits;
+}
+
+/** 正規化済みFAX番号 → eFaxゲートウェイ宛先 (81 + 先頭0を除いた番号 + @efaxsend.com) */
+export function faxGatewayAddress(digits) {
+  return `81${digits.slice(1)}@efaxsend.com`;
 }
 
 function ensureSama(s) {
@@ -100,6 +129,15 @@ export function csvCell(v) {
  * 発注書メールのプレビューを組み立てる (送信適格チェック込み)。
  */
 export function buildOrderEmail(orderId) {
+  return buildOrderSend(orderId, 'email');
+}
+
+/** 発注書FAXのプレビュー (eFaxゲートウェイ宛メール)。PDF本体は renderOrderPdf(p.pdfPayload) で別途生成 */
+export function buildOrderFax(orderId) {
+  return buildOrderSend(orderId, 'fax');
+}
+
+function buildOrderSend(orderId, channel) {
   const db = getDB();
   const order = db.prepare('SELECT * FROM po_orders WHERE id=?').get(orderId);
   if (!order) throw new Error(`発注が存在しません: ${orderId}`);
@@ -109,11 +147,21 @@ export function buildOrderEmail(orderId) {
   if (!boundary || !order.issued_at || order.issued_at < boundary) throw new Error('アプリ管理外 (legacy) のPOは送信できません');
   const sup = db.prepare('SELECT * FROM po_suppliers WHERE supplier_code=?').get(order.supplier_code);
   if (!sup) throw new Error(`仕入先マスタが未登録です: ${order.supplier_code}`);
-  const to = parseAddresses(sup.email_to || '');
-  if (!to.length) throw new Error(`仕入先にメールアドレスが未登録です: ${sup.name} (マスタ管理→宛先マスタ取込で登録してください)`);
-  // NULL(未設定) も送信不可 (安全側)。宛先マスタ取込が send_method='email' を設定する
-  if (sup.send_method !== 'email') throw new Error(`この仕入先の送信方法が email に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
-  const cc = parseAddresses(sup.email_cc || '');
+  let to, cc, faxNumber = null;
+  if (channel === 'fax') {
+    if (sup.send_method !== 'fax') throw new Error(`この仕入先の送信方法が fax に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
+    const digits = normalizeFaxNumber(sup.fax_number);
+    if (!digits) throw new Error(`仕入先にFAX番号が未登録です: ${sup.name} (マスタ管理→仕入先で登録してください)`);
+    faxNumber = trimS(sup.fax_number);
+    to = [faxGatewayAddress(digits)];
+    cc = []; // eFaxゲートウェイはCC不可 (登録済み送信元→ゲートウェイの1対1)
+  } else {
+    to = parseAddresses(sup.email_to || '');
+    if (!to.length) throw new Error(`仕入先にメールアドレスが未登録です: ${sup.name} (マスタ管理→宛先マスタ取込で登録してください)`);
+    // NULL(未設定) も送信不可 (安全側)。宛先マスタ取込が send_method='email' を設定する
+    if (sup.send_method !== 'email') throw new Error(`この仕入先の送信方法が email に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
+    cc = parseAddresses(sup.email_cc || '');
+  }
 
   const items = db.prepare('SELECT product_code, product_key, product_name, qty, unit_cost, requested_date FROM po_order_items WHERE order_id=? ORDER BY id').all(orderId);
   if (!items.length) throw new Error('明細がありません');
@@ -177,15 +225,47 @@ export function buildOrderEmail(orderId) {
   if (noukiColUsed && !/\{\{\s*nouki\s*\}\}/.test(String(st.bodyTpl))) {
     body += `\n\n希望納期: ${noukiText}`;
   }
+  // FAX用PDFのデータ (CSVと同じ明細スナップショット。レイアウトは python/render_order_pdf.py)
+  const pdfPayload = channel !== 'fax' ? null : {
+    po_number: order.po_number || `#${order.id}`,
+    issued_date: issuedJst,
+    supplier_name: sup.name,
+    contact_name: trimS(sup.contact_name) ? ensureSama(sup.contact_name) : '',
+    issuer_name: st.issuerName,
+    company_lines: COMPANY_LINES,
+    nouki_text: noukiText,
+    vendor_col_used: vendorColUsed,
+    total_qty: totalQty,
+    total_amount: Number(money(csvTotal)),
+    items: items.map(it => ({
+      code: it.product_code, name: it.product_name || '',
+      nouki: reqOf(it) ? String(reqOf(it)).replace(/-/g, '/') : '',
+      unit_cost: it.unit_cost == null ? null : it.unit_cost,
+      qty: it.qty,
+      subtotal: it.unit_cost == null ? null : it.unit_cost * it.qty,
+      vendor_code: vmap.get(it.product_key) || '',
+    })),
+  };
   return {
-    order, supplier: sup, to, cc,
+    order, supplier: sup, to, cc, channel, faxNumber,
     subject: render(st.subjectTpl, data),
     body,
     rows: items.length, totalQty, totalAmount,
-    csvText, csvRows, attachmentName: `${(order.po_number || 'PO-' + order.id)}.csv`,
+    csvText, csvRows, pdfPayload,
+    attachmentName: `${(order.po_number || 'PO-' + order.id)}.${channel === 'fax' ? 'pdf' : 'csv'}`,
     vendorColUsed, missingVendorCodes,
     mode: st.mode, dryrunTo: st.dryrunTo, envReady: st.envReady,
   };
+}
+
+/**
+ * dedup用の内容ハッシュ (buildOrderSend の結果から計算。dry-run加工に依存しない)。
+ * email は既存送信済みジョブとの互換のため計算式を変えない。fax はチャネルマーカーを加えて別空間にする
+ */
+export function contentHashOf(p) {
+  const parts = [p.to.join(','), p.cc.join(','), p.subject, p.body, p.csvText];
+  if (p.channel === 'fax') parts.push('channel=fax');
+  return createHash('sha256').update(parts.join('\x1f')).digest('hex');
 }
 
 /** 'YYYY-MM-DDTHH:mm' (JST入力) → UTC ISO。過去・60日超・実在しない日時 (2/30等) は拒否 */
@@ -210,7 +290,8 @@ export function parseScheduleAt(s) {
  * scheduledAt (JST 'YYYY-MM-DDTHH:mm') を渡すと予約送信 (ディスパッチャが時刻到来で送信)。
  * @returns jobId
  */
-export function createEmailJob(orderId, { resend = false, resendOfJobId = null, scheduledAt = null, expectedMode = null, actor = null } = {}) {
+export function createEmailJob(orderId, { resend = false, resendOfJobId = null, scheduledAt = null, expectedMode = null, actor = null,
+  channel = 'email', pdfBuffer = null, expectedHash = null } = {}) {
   const db = getDB();
   const st = emailSettings();
   // プレビュー時のモードと現在モードの一致を必須にする (プレビュー後に他所でliveへ切り替わっていても、
@@ -219,7 +300,11 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
     throw new Error(`送信モードが変わっています (画面: ${expectedMode || '未指定'} / 現在: ${st.mode})。プレビューを開き直して内容を確認してください`);
   }
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
-  const p = buildOrderEmail(orderId);
+  if (channel !== 'email' && channel !== 'fax') throw new Error(`不明な送信チャネルです: ${channel}`);
+  const p = channel === 'fax' ? buildOrderFax(orderId) : buildOrderEmail(orderId);
+  if (channel === 'fax' && (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length)) {
+    throw new Error('FAX送信には発注書PDFが必要です (内部エラー: pdfBuffer未指定)');
+  }
   // 完了済み (closed) POへの新規送信は拒否 — 一覧画面の選択が古いままでも送らない最終防衛 (Codex 一括R2 High)。
   // 再送 (resend) は送信済みの実績があるPOの控え再送なので完了後も許可
   if (!resend && p.order.closed_at) {
@@ -233,13 +318,19 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
   if (dryRun) {
     if (!st.dryrunTo) throw new Error('dry-runの送信先 (email_dryrun_to) が未設定です。メール設定で社内アドレスを登録してください');
     subject = '【DRYRUN】' + subject;
-    body = `※これはdry-run送信です。本来の宛先: TO=${p.to.join(', ')}${p.cc.length ? ' / CC=' + p.cc.join(', ') : ''}\n\n` + body;
+    const origTo = channel === 'fax' ? `FAX ${p.faxNumber} (${p.to.join(', ')})` : `TO=${p.to.join(', ')}${p.cc.length ? ' / CC=' + p.cc.join(', ') : ''}`;
+    body = `※これはdry-run送信です。本来の宛先: ${origTo}\n\n` + body;
     to = [st.dryrunTo]; cc = [];
   }
   const deliveryKey = 'DK' + randomUUID().replace(/-/g, '').slice(0, 20);
   const bodyWithKey = body + `\n\n整理番号: ${deliveryKey}`;
   // dedupハッシュは「本来の宛先・内容」から計算 (dry-run加工に依存しない)
-  const contentHash = createHash('sha256').update([p.to.join(','), p.cc.join(','), p.subject, p.body, p.csvText].join('\x1f')).digest('hex');
+  const contentHash = contentHashOf(p);
+  // FAXはPDF生成 (async) → ジョブ作成 (sync txn) の2段階のため、生成時点の内容ハッシュと突合して
+  // その間の発注編集を検知する (プレビューと違うPDFを送らない)
+  if (channel === 'fax' && expectedHash !== contentHash) {
+    throw new Error('発注内容が変わっています。プレビューを開き直してから送信してください');
+  }
 
   const tx = db.transaction(() => {
     let resendOf = null;
@@ -248,6 +339,7 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
       if (!orig) throw new Error('再送には元ジョブ (resendOfJobId) の指定が必要です');
       if (orig.order_id !== orderId) throw new Error('元ジョブが別の発注です');
       if (orig.status !== 'sent' || orig.is_dry_run) throw new Error('再送できるのは送信済み (本送信) のジョブだけです');
+      if ((orig.channel || 'email') !== channel) throw new Error(`元ジョブと送信チャネルが違います (元: ${orig.channel || 'email'} / 今回: ${channel})。仕入先の発注方法が変わった場合は新規に送信してください`);
       // 再送の再送でも常にルート (最初の本送信) に正規化して数える (チェーンで3回上限を回避させない、Codex P15-R2 High)
       let hops = 0;
       while (orig.is_resend && orig.resend_of != null) {
@@ -265,10 +357,11 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
     try {
       info = db.prepare(`INSERT INTO po_email_jobs
         (order_id, status, is_dry_run, scheduled_at, delivery_key, to_addr, cc_addr, subject, body, attachment_name, attachment_csv,
-         content_hash, is_resend, resend_of, created_at, actor)
-        VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+         channel, attachment_pdf, content_hash, is_resend, resend_of, created_at, actor)
+        VALUES (?,'queued',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
         .run(orderId, dryRun ? 1 : 0, scheduleIso, deliveryKey, to.join(','), cc.join(',') || null, subject, bodyWithKey,
-          p.attachmentName, p.csvText, contentHash, resend ? 1 : 0, resendOf, nowIso(), actor);
+          p.attachmentName, p.csvText, channel, channel === 'fax' ? pdfBuffer : null,
+          contentHash, resend ? 1 : 0, resendOf, nowIso(), actor);
     } catch (e) {
       if (String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
         throw new Error('同じ内容の発注書は送信済み (または送信待ち) です。もう一度送る場合は「再送」を使ってください');
@@ -278,7 +371,7 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
     const jobId = Number(info.lastInsertRowid);
     audit(db, { actorType: 'user', actor, action: dryRun ? 'email_dryrun_queued' : 'email_queued',
       resource: `order:${orderId}`,
-      detail: { jobId, to, resendOf, scheduledAt: scheduleIso, deliveryKey, contentHash: contentHash.slice(0, 16) } });
+      detail: { jobId, channel, to, resendOf, scheduledAt: scheduleIso, deliveryKey, contentHash: contentHash.slice(0, 16) } });
     return jobId;
   });
   return tx.immediate();
@@ -526,7 +619,7 @@ export function startEmailDispatcher() {
 /** PO単位のジョブ履歴 */
 export function listEmailJobs(orderId) {
   return getDB().prepare(`SELECT id, status, is_dry_run, scheduled_at, delivery_key, to_addr, cc_addr, subject, attempt_count,
-      generation, sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend, resend_of
+      generation, sending_started_at, gmail_message_id, error, created_at, sent_at, is_resend, resend_of, channel
     FROM po_email_jobs WHERE order_id=? ORDER BY id DESC`).all(orderId);
 }
 
@@ -630,16 +723,26 @@ function encodeWord(s) {
   return words.map(w => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n '); // folding (継続行)
 }
 
-/** multipart/mixed MIME (本文UTF-8 + 添付CSV=CP932/Base64、ファイル名はASCII=PO番号.csv) */
+/** multipart/mixed MIME (本文UTF-8 + 添付。email=CSV(CP932) / fax=PDF。ファイル名はASCII=PO番号.拡張子) */
 export function buildMime(job) {
   const boundary = 'b_' + job.delivery_key;
+  const isFax = job.channel === 'fax';
   assertHeaderSafe('宛先', job.to_addr);
   assertHeaderSafe('CC', job.cc_addr);
   assertHeaderSafe('件名', job.subject);
   assertHeaderSafe('添付ファイル名', job.attachment_name);
-  if (!/^[\x21-\x7e]+\.csv$/.test(job.attachment_name)) throw new Error(`添付ファイル名はASCIIの.csvのみ: ${job.attachment_name}`);
+  if (isFax) {
+    if (!/^[\x21-\x7e]+\.pdf$/.test(job.attachment_name)) throw new Error(`FAX添付ファイル名はASCIIの.pdfのみ: ${job.attachment_name}`);
+    if (!job.attachment_pdf || !job.attachment_pdf.length) throw new Error('FAXジョブに添付PDFがありません (内部エラー)');
+  } else if (!/^[\x21-\x7e]+\.csv$/.test(job.attachment_name)) {
+    throw new Error(`添付ファイル名はASCIIの.csvのみ: ${job.attachment_name}`);
+  }
   const from = process.env.PO_MAIL_FROM && EMAIL_RE.test(process.env.PO_MAIL_FROM) ? process.env.PO_MAIL_FROM : null;
-  const csvB64 = iconv.encode(job.attachment_csv, 'cp932').toString('base64').replace(/(.{76})/g, '$1\r\n');
+  const attB64 = (isFax ? Buffer.from(job.attachment_pdf) : iconv.encode(job.attachment_csv, 'cp932'))
+    .toString('base64').replace(/(.{76})/g, '$1\r\n');
+  const attHeaders = isFax
+    ? `Content-Type: application/pdf; name="${job.attachment_name}"\r\n`
+    : `Content-Type: text/csv; charset="Shift_JIS"; name="${job.attachment_name}"\r\n`;
   const bodyB64 = Buffer.from(job.body, 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
   const headers = [
     from ? `From: ${from}` : null,
@@ -656,9 +759,9 @@ export function buildMime(job) {
     'Content-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n' +
     bodyB64 + '\r\n' +
     `--${boundary}\r\n` +
-    `Content-Type: text/csv; charset="Shift_JIS"; name="${job.attachment_name}"\r\n` +
+    attHeaders +
     `Content-Disposition: attachment; filename="${job.attachment_name}"\r\n` +
     'Content-Transfer-Encoding: base64\r\n\r\n' +
-    csvB64 + '\r\n' +
+    attB64 + '\r\n' +
     `--${boundary}--\r\n`;
 }
