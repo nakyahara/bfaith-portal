@@ -45,6 +45,33 @@ export function ensureSchema() {
       CREATE TRIGGER IF NOT EXISTS trg_sl_slips_no_delete
         BEFORE DELETE ON sl_shipping_slips
         BEGIN SELECT RAISE(ABORT, 'sl_shipping_slips is append-only (DELETE forbidden)'); END;
+
+      -- ピッキングリストPDF (トータルピッキングリスト) のバッチ合計。
+      -- 粒度はPDFファイル単位 (通常1フォルダ1枚)。PK に ship_date を含めるのは
+      -- 同名フォルダ (出荷_XX) が毎日使い回されるため。total_qty は GAS 側で
+      -- 「全ページ共通prefix + ページ内合計の総和一致」の検算を通った値のみ受け取り、
+      -- サーバ側でも page_totals との一致を再検証する (誤値の恒久保存を二重に防ぐ)。
+      CREATE TABLE IF NOT EXISTS sl_picking_batches (
+        ship_date TEXT NOT NULL,          -- 取込日 (JST。sl_shipping_slips.ship_date と同じ値で JOIN 可能)
+        folder_name TEXT NOT NULL,        -- 出荷_XX (バッチ)
+        source_file TEXT NOT NULL,        -- 抽出元 ピッキングリストPDF ファイル名
+        total_qty INTEGER NOT NULL,       -- ピッキング総合計 (検算済み)
+        pages INTEGER NOT NULL,           -- ページ数
+        page_totals TEXT NOT NULL,        -- ページ内合計の JSON 配列 (検算の内訳)
+        work_date_on_list TEXT,           -- リスト記載の作業日 (OCR抽出、参考値)
+        printed_at TEXT,                  -- リスト記載の出力日時 (OCR抽出、参考値)
+        run_id TEXT NOT NULL,             -- GAS 実行ID (provenance)
+        extracted_at TEXT,                -- GAS 側抽出時刻 (JST文字列)
+        received_at TEXT NOT NULL,        -- サーバ受信時刻 (UTC ISO)
+        PRIMARY KEY (ship_date, folder_name, source_file)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sl_picking_ship_date ON sl_picking_batches(ship_date);
+      CREATE TRIGGER IF NOT EXISTS trg_sl_picking_no_update
+        BEFORE UPDATE ON sl_picking_batches
+        BEGIN SELECT RAISE(ABORT, 'sl_picking_batches is append-only (UPDATE forbidden)'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_sl_picking_no_delete
+        BEFORE DELETE ON sl_picking_batches
+        BEGIN SELECT RAISE(ABORT, 'sl_picking_batches is append-only (DELETE forbidden)'); END;
     `);
     schemaReady = true;
     schemaError = null;
@@ -139,6 +166,88 @@ export function ingestFolderSlips(p) {
   return tx(p.rows);
 }
 
+/**
+ * 1フォルダ分のピッキングリスト合計を冪等 INSERT する。
+ * 冪等性は sl_shipping_slips と同型: PK 一致 + 業務内容一致 → ignored、
+ * 内容不一致 (total_qty / pages / page_totals が異なる) → conflict (409、削除させない)。
+ * @param {{ runId: string, folderName: string, shipDate: string, extractedAt: string|null,
+ *           rows: Array<{ source_file: string, total_qty: number, pages: number,
+ *                         page_totals: number[], work_date_on_list?: string|null, printed_at?: string|null }> }} p
+ * @returns {{ inserted: number, ignored: number,
+ *             conflicts: Array<{ source_file: string, existing_total_qty: number, existing_page_totals: string }> }}
+ */
+export function ingestPickingBatches(p) {
+  const db = requireSchema();
+  const receivedAt = new Date().toISOString();
+  const insertStmt = db.prepare(`
+    INSERT INTO sl_picking_batches
+      (ship_date, folder_name, source_file, total_qty, pages, page_totals,
+       work_date_on_list, printed_at, run_id, extracted_at, received_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const selectStmt = db.prepare(`
+    SELECT total_qty, pages, page_totals FROM sl_picking_batches
+    WHERE ship_date = ? AND folder_name = ? AND source_file = ?
+  `);
+
+  const tx = db.transaction((rows) => {
+    let inserted = 0;
+    let ignored = 0;
+    const conflicts = [];
+    for (const r of rows) {
+      const pageTotalsJson = JSON.stringify(r.page_totals);
+      try {
+        insertStmt.run(
+          p.shipDate, p.folderName, r.source_file, r.total_qty, r.pages, pageTotalsJson,
+          r.work_date_on_list || null, r.printed_at || null,
+          p.runId, p.extractedAt || null, receivedAt
+        );
+        inserted++;
+      } catch (e) {
+        if (e && String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
+          const existing = selectStmt.get(p.shipDate, p.folderName, r.source_file);
+          if (existing && existing.total_qty === r.total_qty && existing.pages === r.pages
+              && existing.page_totals === pageTotalsJson) {
+            ignored++; // 再送 (内容一致) → 冪等
+          } else {
+            conflicts.push({
+              source_file: r.source_file,
+              existing_total_qty: existing ? existing.total_qty : null,
+              existing_page_totals: existing ? existing.page_totals : null,
+            });
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
+    return { inserted, ignored, conflicts };
+  });
+  return tx(p.rows);
+}
+
+/**
+ * 日付範囲 export (miniPC daily-sync の吸い上げ用。read-only token 前提)。
+ * ship_date が [from, to] (両端含む) の伝票行とピッキング行をまとめて返す。
+ */
+export function exportRange(from, to) {
+  const db = requireSchema();
+  const slips = db.prepare(`
+    SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, extracted_at, received_at
+    FROM sl_shipping_slips
+    WHERE ship_date >= ? AND ship_date <= ?
+    ORDER BY ship_date, folder_name, slip_no
+  `).all(from, to);
+  const picking = db.prepare(`
+    SELECT ship_date, folder_name, source_file, total_qty, pages, page_totals,
+           work_date_on_list, printed_at, run_id, extracted_at, received_at
+    FROM sl_picking_batches
+    WHERE ship_date >= ? AND ship_date <= ?
+    ORDER BY ship_date, folder_name, source_file
+  `).all(from, to);
+  return { slips, picking };
+}
+
 /** 直近の伝票行 (動作確認・突合ジョブ用) */
 export function recentSlips(limit) {
   const db = requireSchema();
@@ -147,6 +256,19 @@ export function recentSlips(limit) {
     SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, received_at
     FROM sl_shipping_slips
     ORDER BY received_at DESC, slip_no
+    LIMIT ?
+  `).all(n);
+}
+
+/** 直近のピッキング合計行 (動作確認用) */
+export function recentPicking(limit) {
+  const db = requireSchema();
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return db.prepare(`
+    SELECT ship_date, folder_name, source_file, total_qty, pages, page_totals,
+           work_date_on_list, printed_at, run_id, received_at
+    FROM sl_picking_batches
+    ORDER BY received_at DESC, folder_name, source_file
     LIMIT ?
   `).all(n);
 }

@@ -21,7 +21,7 @@ const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.
 // Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
 //   sync 単独 retry すると build やり直さずに古い fact を sync する事故になる。
 //   build を retryable に残し、sync は build 成功時のみ実行 (依存連鎖は cron 単位で完結)。
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', '出荷実績ログ'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -908,6 +908,11 @@ async function main() {
     syncResult = { success: false, summary: `⏸️ skipped (${reasons.join(', ')})` };
   }
   results.push({ name: 'Render同期', ...syncResult });
+
+  // 出荷実績ログ吸い上げ + Notion出荷カード担当者スナップショット (shipping-log P2)。
+  // Render 側 sl_shipping_slips / sl_picking_batches → warehouse.db。他ジョブと独立・冪等
+  const shippingLogResult = runScript('apps/warehouse/sync-shipping-log.js', '出荷実績ログ', 600000);
+  results.push({ name: '出荷実績ログ', ...shippingLogResult });
 
   // Amazon手数料カバー率の監視 (SLO 監視、Codex+Claude 議論結果 2026-05-15)
   // 売上加重カバー率 (件数じゃなく金額) を主指標、warn 30日<98%、critical <95% or 売上TOP20未カバー

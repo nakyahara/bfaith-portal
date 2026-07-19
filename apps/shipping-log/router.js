@@ -14,7 +14,7 @@
  */
 import express from 'express';
 import crypto from 'node:crypto';
-import { ingestFolderSlips, recentSlips, getSchemaError } from './db.js';
+import { ingestFolderSlips, ingestPickingBatches, exportRange, recentSlips, recentPicking, getSchemaError } from './db.js';
 
 const router = express.Router();
 
@@ -132,9 +132,87 @@ router.post('/ingest', requireIngestKey, (req, res) => handle(res, () => {
   res.json({ ok: true, inserted, ignored, ignored_details, total: p.rows.length });
 }));
 
+const MAX_PICKING_ROWS = 20;      // 1フォルダのピッキングリストPDF数上限 (通常は1枚)
+const MAX_PAGES = 50;
+const MAX_TOTAL_QTY = 99999;
+
+function validatePickingBody(body) {
+  if (!body || typeof body !== 'object') throw vErr('JSON body が必要です');
+  const runId = fieldStr(body.run_id, 'run_id', { required: true });
+  const folderName = fieldStr(body.folder, 'folder', { required: true });
+  const shipDate = validateShipDate(fieldStr(body.ship_date, 'ship_date', { required: true }));
+  const extractedAt = fieldStr(body.extracted_at, 'extracted_at');
+  if (!Array.isArray(body.rows) || body.rows.length === 0) throw vErr('rows は1件以上の配列が必要です');
+  if (body.rows.length > MAX_PICKING_ROWS) throw vErr(`rows が多すぎます (${MAX_PICKING_ROWS}件まで)`);
+  const seenFiles = new Set();
+  const rows = body.rows.map((r, i) => {
+    if (!r || typeof r !== 'object') throw vErr(`rows[${i}] が不正です`);
+    const sourceFile = fieldStr(r.source_file, `rows[${i}].source_file`, { required: true });
+    if (seenFiles.has(sourceFile)) throw vErr(`rows[${i}].source_file が重複しています: ${sourceFile}`);
+    seenFiles.add(sourceFile);
+    const totalQty = r.total_qty;
+    const pages = r.pages;
+    if (!Number.isInteger(totalQty) || totalQty < 1 || totalQty > MAX_TOTAL_QTY) {
+      throw vErr(`rows[${i}].total_qty は 1〜${MAX_TOTAL_QTY} の整数で指定してください`);
+    }
+    if (!Number.isInteger(pages) || pages < 1 || pages > MAX_PAGES) {
+      throw vErr(`rows[${i}].pages は 1〜${MAX_PAGES} の整数で指定してください`);
+    }
+    if (!Array.isArray(r.page_totals) || r.page_totals.length !== pages) {
+      throw vErr(`rows[${i}].page_totals は pages と同数の配列が必要です`);
+    }
+    const pageTotals = r.page_totals.map((v, j) => {
+      if (!Number.isInteger(v) || v < 1 || v > MAX_TOTAL_QTY) throw vErr(`rows[${i}].page_totals[${j}] が不正です`);
+      return v;
+    });
+    // 検算の再検証 (GAS 側検算のバグ・改ざんデータの恒久保存を入口で拒否)
+    const sum = pageTotals.reduce((a, b) => a + b, 0);
+    if (sum !== totalQty) throw vErr(`rows[${i}] 検算不一致: total_qty=${totalQty} だが page_totals の合計=${sum}`);
+    return {
+      source_file: sourceFile,
+      total_qty: totalQty,
+      pages,
+      page_totals: pageTotals,
+      work_date_on_list: fieldStr(r.work_date_on_list, `rows[${i}].work_date_on_list`),
+      printed_at: fieldStr(r.printed_at, `rows[${i}].printed_at`),
+    };
+  });
+  return { runId, folderName, shipDate, extractedAt, rows };
+}
+
+// GAS 掃除ジョブ: 1フォルダ分のピッキングリスト合計を取込。契約は /ingest と同型
+// (200 + ok:true + inserted+ignored===total のときのみ GAS はピッキングPDFの削除に進む)。
+router.post('/ingest-picking', requireIngestKey, (req, res) => handle(res, () => {
+  const p = validatePickingBody(req.body);
+  const { inserted, ignored, conflicts } = ingestPickingBatches(p);
+  if (conflicts.length > 0) {
+    console.warn('[shipping-log] picking ingest conflicts', { folder: p.folderName, ship_date: p.shipDate, conflicts });
+    return res.status(409).json({ ok: false, error: 'conflict', inserted, ignored, conflicts, total: p.rows.length });
+  }
+  res.json({ ok: true, inserted, ignored, total: p.rows.length });
+}));
+
 // 動作確認・突合ジョブ用: 直近の取込行 (read-only token)
 router.get('/recent', requireReadToken, (req, res) => handle(res, () => {
   res.json({ ok: true, rows: recentSlips(req.query.limit) });
+}));
+
+// 動作確認用: 直近のピッキング合計行 (read-only token)
+router.get('/recent-picking', requireReadToken, (req, res) => handle(res, () => {
+  res.json({ ok: true, rows: recentPicking(req.query.limit) });
+}));
+
+// miniPC daily-sync 吸い上げ用: ship_date 範囲 export (read-only token)。
+// 範囲は最大31日 (1日~700伝票 × 31日でも数MB程度。それ以上は複数回に分けて呼ぶ)
+const MAX_EXPORT_DAYS = 31;
+router.get('/export', requireReadToken, (req, res) => handle(res, () => {
+  const from = validateShipDate(fieldStr(req.query.from, 'from', { required: true }));
+  const to = validateShipDate(fieldStr(req.query.to, 'to', { required: true }));
+  if (from > to) throw vErr('from は to 以前の日付を指定してください');
+  const days = (Date.parse(to + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z')) / 86400000 + 1;
+  if (days > MAX_EXPORT_DAYS) throw vErr(`範囲が広すぎます (${MAX_EXPORT_DAYS}日まで)`);
+  const { slips, picking } = exportRange(from, to);
+  res.json({ ok: true, from, to, slips, picking });
 }));
 
 export default router;
