@@ -288,13 +288,17 @@ serviceRouter.post('/jobs/claim', (req, res) => {
   }
 
   const claimer = String(claimed_by || 'runner').slice(0, 100);
-  // レポート未生成 (report_id なし) の pending/failed → generating
+  // レポート未生成 (report_id なし) の pending/failed → generating。
+  // declare_seq は claim 時点の宣言に更新する (COALESCE: 週次/provisional は null のまま)。
+  // 旧宣言の final job を再利用したとき、古い seq のままだと保存が永久に stale 409 になる
+  // (Codex 3巡目 high: 生成中 reopen→再宣言→final未保存のケース)
   const claimed = db.prepare(`
     UPDATE ai_report_jobs
     SET status = 'generating', claimed_by = ?, claimed_at = ?, heartbeat_at = ?,
+        declare_seq = COALESCE(?, declare_seq),
         error_class = NULL, error_detail = NULL, updated_at = ?
     WHERE job_id = ? AND status IN ('pending', 'failed') AND report_id IS NULL
-  `).run(claimer, now, now, now, job.job_id);
+  `).run(claimer, now, now, declareSeq, now, job.job_id);
   if (claimed.changes === 1) {
     return res.json({ result: 'claimed', job: getJob(db, job.job_id) });
   }

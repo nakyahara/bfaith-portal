@@ -502,6 +502,27 @@ console.log('\n■ 月次 report-input + 締め宣言');
   const closingAfterStale = db.prepare("SELECT final_pl_hash FROM ai_monthly_closing WHERE year_month='2026-06'").get();
   ok(closingAfterStale.final_pl_hash === 'plhash-final-1', 'stale 保存で closing が汚れない', closingAfterStale);
 
+  // 生成中 reopen→再宣言 (final未保存) → 再利用した final job が新しい宣言 seq を継承する
+  {
+    const K4 = { report_type: 'monthly', period_start: '2026-04-01', period_end: '2026-05-01', edition: 'final', claimed_by: 'smoke' };
+    await post('/apps/ai-insights/api/closing/2026-04/declare', {});
+    let c = await post('/api/ai-insights/service/jobs/claim', K4, SVC);
+    ok(c.body.result === 'claimed' && c.body.job.declare_seq === 1, '2026-04 final claim (seq=1)', c.body?.job);
+    const j4 = c.body.job.job_id;
+    db.prepare("UPDATE ai_report_jobs SET heartbeat_at = '2026-01-01T00:00:00Z' WHERE job_id = ?").run(j4);
+    await post('/apps/ai-insights/api/closing/2026-04/reopen', {});
+    await post('/apps/ai-insights/api/closing/2026-04/declare', {});
+    c = await post('/api/ai-insights/service/jobs/claim', K4, SVC); // sweepで孤児→failed→再claim
+    ok(c.body.result === 'claimed' && c.body.job.declare_seq === 2,
+      '再宣言後の final 再claim → declare_seq を現在値に更新 (永久stale防止)', c.body?.job);
+    const rr = await post(`/api/ai-insights/service/jobs/${j4}/report`, {
+      generation_mode: 'claude', body_json: { summary: '2026-04確定' }, topics: [], pl_hash: 'ph4',
+    }, SVC);
+    ok(rr.status === 200, '新宣言 seq での保存が成功する', rr);
+    const c4 = db.prepare("SELECT final_declare_seq FROM ai_monthly_closing WHERE year_month='2026-04'").get();
+    ok(c4.final_declare_seq === 2, 'closing に新 seq で確定記録', c4);
+  }
+
   // 未宣言月の final claim は拒否
   r = await post('/api/ai-insights/service/jobs/claim', {
     report_type: 'monthly', period_start: '2026-05-01', period_end: '2026-06-01', edition: 'final', claimed_by: 'smoke',
