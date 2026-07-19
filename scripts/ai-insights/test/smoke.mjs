@@ -161,10 +161,13 @@ console.log('\n■ 正常系 (claude 生成 → 投稿)');
     '未知 topic_id はフィルタされ既知のみ送信', reportCall.body.topic_updates);
   ok(typeof reportCall.body.input_hash === 'string' && reportCall.body.input_hash.length === 64, 'input_hash (sha256)', reportCall.body.input_hash);
   const text = state.webhookTexts[0] || '';
-  ok(text.startsWith('*AI経営レポート(週次) 2026-07-06〜2026-07-12*'), 'GChat ヘッダー形式', text.split('\n')[0]);
+  ok(text.startsWith('*📊 AI経営レポート（週次）*\n2026-07-06〜2026-07-12'), 'GChat ヘッダー形式', text.split('\n')[0]);
   ok(text.includes('(WK-20260706-f)'), 'public_id 埋め込み', text.slice(-80));
-  ok(text.includes('論点1: 楽天売上が前週比+50%'), '論点タイトル', null);
-  ok(text.includes('対応: ') && text.includes('中原さん / 金曜まで'), '対応: 誰/いつまで', null);
+  ok(text.includes('*1. 楽天売上が前週比+50%*'), '論点タイトル (太字+番号)', null);
+  ok(text.includes('*1.5万円*') && text.includes('*1.0万円*'), '金額は万円表記+太字強調', text);
+  ok(!text.includes('**'), 'AI出力に*があっても二重太字にならない', text);
+  ok(text.includes('→ ') && text.includes('（中原さん・金曜まで）'), '対応 → 誰・いつまで', null);
+  ok(text.includes('\n\n📈 *1.'), '論点は空行区切り+カテゴリアイコン', null);
   ok(!text.includes('全社'), '正常系でも禁止された全社集計は本文に出ない', text);
   ok(text.length <= 3500, '3500字以内', text.length);
   const postedCall = state.calls.find((c) => c.path.endsWith('/posted'));
@@ -205,8 +208,11 @@ console.log('\n■ AI出力の機械検査 (禁止モール言及 / 数字創作
   ok(r.out.includes('禁止領域モール'), '違反理由がログに出る', null);
   reset();
   r = await runRunner({ FAKE_MODE: 'invented' });
-  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い数字 → 棄却 → fallback', r.out.slice(-300));
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い小数 (1.9万円) → 棄却 → fallback (整数部一致では許容しない)', r.out.slice(-300));
   ok(r.out.includes('数字創作の疑い'), '違反理由がログに出る', null);
+  reset();
+  r = await runRunner({ FAKE_MODE: 'inventedtitle' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]') && r.out.includes('title'), 'title の創作数値も棄却 → fallback', r.out.slice(-300));
   reset();
   r = await runRunner({ FAKE_MODE: 'badsummary' });
   ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'summary の全社集計言及 → 棄却 → fallback', r.out.slice(-300));
@@ -275,6 +281,32 @@ console.log('\n■ 生成済みレポートの投稿再開');
   ok(code === 0 && out.includes('[NOTIFY:status=ok_repost]'), 'ok_repost', out.slice(-200));
   ok(!calledPaths().some((p) => p.endsWith('/report')), '再生成しない (report 呼ばず)', calledPaths());
   ok(state.webhookTexts[0]?.includes('再投稿テスト'), '保存済み本文で投稿', state.webhookTexts[0]);
+}
+
+// ═══ 6b. --dry-run (投稿せずプレビューのみ) ═══
+console.log('\n■ --dry-run');
+{
+  reset();
+  const child = await new Promise((resolve) => {
+    const c = spawn(process.execPath, [RUNNER, `--period-start=${PS}`, '--dry-run'], {
+      env: {
+        ...process.env,
+        PORTAL_BASE_URL: `http://127.0.0.1:${port}`,
+        AI_READ_TOKEN: 'tok-read', AI_INSIGHT_SERVICE_TOKEN: 'tok-service',
+        GCHAT_WEBHOOK_URL: `http://127.0.0.1:${port}/webhook`,
+        CLAUDE_CMD: `node ${FAKE_CLAUDE}`, CLAUDE_RETRY_BASE_MS: '10', CLAUDE_TIMEOUT_MS: '20000',
+        FAKE_MODE: 'ok',
+      },
+    });
+    let out = '';
+    c.stdout.on('data', (d) => { out += d; });
+    c.stderr.on('data', (d) => { out += d; });
+    c.on('close', (code) => resolve({ code, out }));
+  });
+  ok(child.code === 0 && child.out.includes('[NOTIFY:status=dry_run]'), 'dry_run 終了', child.out.slice(-200));
+  ok(child.out.includes('GChat本文プレビュー') && child.out.includes('*1.5万円*'), 'プレビュー本文が出る', null);
+  ok(state.webhookTexts.length === 0, 'webhook 投稿なし', state.webhookTexts);
+  ok(!calledPaths().some((p) => p.includes('/service/')), 'サーバ書き込みなし (claim すら呼ばない)', calledPaths());
 }
 
 // ═══ 7. 要照合 (自動再投稿しない) ═══

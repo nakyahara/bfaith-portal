@@ -14,10 +14,12 @@ if (mode === 'bad') {
   process.stdout.write('ここにJSONはありません\n');
   process.exit(0);
 }
-if (mode === 'prohibited' || mode === 'invented') {
+if (mode === 'prohibited' || mode === 'invented' || mode === 'inventedtitle') {
   const badTopic = mode === 'prohibited'
     ? { title: 'amazonの売上が急減', category: 'sales', evidence: '今週0円', action: '確認', confidence: 'med' }
-    : { title: '楽天が好調', category: 'sales', evidence: '今週98,765円と大幅増', action: '確認', confidence: 'med' };
+    : mode === 'inventedtitle'
+      ? { title: '楽天売上1.9万円を達成', category: 'sales', evidence: '前週比+50%', action: '確認', confidence: 'med' }
+      : { title: '楽天が好調', category: 'sales', evidence: '今週1.9万円と大幅増', action: '確認', confidence: 'med' };
   process.stdout.write(JSON.stringify({
     type: 'result', subtype: 'success', is_error: false,
     result: JSON.stringify({ summary: 'テスト', topics: [badTopic], topic_updates: [], data_notes: '' }),
@@ -45,7 +47,7 @@ const result = {
     {
       title: '楽天売上が前週比+50%',
       category: 'sales',
-      evidence: '今週15,000円 / 前週10,000円 (facts.sales.by_mall)',
+      evidence: '今週*1.5万円*（前週1.0万円）', // AIが勝手に付けた '*' は機械側で除去→再装飾される
       hypothesis: 'セール参加の影響の可能性 (要確認)',
       next_check: '楽天分析ダッシュボードで商品別内訳',
       action: '好調SKUの在庫日数を確認し補充判断',
