@@ -7,6 +7,7 @@
  */
 import 'dotenv/config';
 import { execFileSync } from 'child_process';
+import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -16,6 +17,57 @@ const PROJECT_DIR = path.resolve(__dirname, '..', '..');
 
 // retry-failed-jobs.js が読む state ファイル。リトライ対象失敗ジョブをここに記録する
 const RETRY_STATE_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync-retry-state.json');
+// 実行中マーカー兼多重起動ガード (構造監査 H-3)。通知に到達する全終了経路で削除し、
+// プロセス abort (libuv assertion 等、JS の catch に落ちない死に方) の時だけ残る。
+// 残骸は ①翌朝の起動時に「前回異常終了」として通知 ②bat 側の notify-crash.js が即時通知、の2段で拾う。
+const LOCK_FILE = path.join(PROJECT_DIR, 'data', 'daily-sync.lock.json');
+
+// この run が取得した lock の run_id。releaseLock は自分の lock だけ削除する
+// (stale 上書き後に旧 run が完走して新 run の lock を消す事故の防止 — Codex Medium #1)
+let myLockRunId = null;
+
+// lock 削除の共通プロトコル (Codex R4): read→compare→unlink は比較後に差し替えられる TOCTOU があるため、
+// ①固有 claim パスへ rename (原子的な排他取得) ②claim の中身を検証 ③自分のものなら削除、
+// 他人の生存 lock なら返却 (返却先が塞がっていれば claim を破棄) — どの分岐でも他 run の lock を消さない。
+function claimAndDeleteLock(matchFn) {
+  const claim = `${LOCK_FILE}.claim-${process.pid}-${crypto.randomUUID()}`;
+  try { fs.renameSync(LOCK_FILE, claim); } catch { return 'gone'; }
+  let raw = null;
+  try { raw = fs.readFileSync(claim, 'utf-8'); } catch { /* 読めない claim は下で破棄判定へ */ }
+  let mine = false;
+  try { mine = raw !== null && matchFn(raw); } catch { mine = false; }
+  if (mine) {
+    try { fs.unlinkSync(claim); } catch { /* 残置しても実害なし */ }
+    return 'deleted';
+  }
+  try { fs.renameSync(claim, LOCK_FILE); return 'restored'; }
+  catch {
+    try { fs.unlinkSync(claim); } catch { /* 残置しても実害なし */ }
+    return 'conflict';
+  }
+}
+
+function releaseLock() {
+  if (!myLockRunId) return;
+  claimAndDeleteLock(raw => JSON.parse(raw).run_id === myLockRunId);
+}
+
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// pid が「生きている node プロセス」か。単なる pid 生存だと Windows の pid 再利用で
+// 無関係プロセスを先行 run と誤認して毎朝スキップし続けるため、プロセス名まで照合する。
+// (tasklist 失敗時は保守的に「node である」扱い = 多重起動側に倒す)
+function isAliveNodeProcess(pid) {
+  if (!isPidAlive(pid)) return false;
+  try {
+    const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { encoding: 'utf-8', timeout: 10000 });
+    return /^"node(\.exe)?"/i.test(out.trim());
+  } catch {
+    return true;
+  }
+}
 // retry-failed-jobs.js でリトライ可能なジョブ (idempotent + 一時的失敗想定)
 // Amazon Ads / Settlement は SP-API throttle / レポート polling timeout / DL 失敗等の一過性失敗が多いため retry 対象
 // Codex Round 1 #2: 'Amazon finance sync' は RETRYABLE_JOBS に入れない。
@@ -28,7 +80,7 @@ const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
     console.warn('[daily-sync] [NOTIFY:status=skipped] GCHAT_WEBHOOK未設定のため通知スキップ');
-    return;
+    return false;
   }
   try {
     const res = await fetch(GCHAT_WEBHOOK, {
@@ -38,11 +90,13 @@ async function notify(text) {
     });
     if (!res.ok) {
       console.error(`[daily-sync] [NOTIFY:status=failed] GChat HTTP ${res.status}`);
-      return;
+      return false;
     }
     console.log('[daily-sync] [NOTIFY:status=sent]');
+    return true;
   } catch (e) {
     console.error('[daily-sync] [NOTIFY:status=failed]', e.message);
+    return false;
   }
 }
 
@@ -209,6 +263,64 @@ async function main() {
   // 起動時 cleanup / 書き込み失敗時の旧 state 削除 / 全成功時 cleanup の3経路で使う。
   const stateOpWarnings = [];
 
+  // 多重起動ガード + 前回異常終了検知 (構造監査 H-3)
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      // read と parse を分離: 破損 lock も raw 一致で回収できるようにする
+      // (破損 lock を回収不能にすると wx が永久 EEXIST → 毎朝中止が続く)
+      let prevRaw = null;
+      let prev = null;
+      try { prevRaw = fs.readFileSync(LOCK_FILE, 'utf-8'); } catch { /* 消えた直後なら wx 取得で決着 */ }
+      try { prev = prevRaw !== null ? JSON.parse(prevRaw) : null; } catch { /* 破損 = prev null のまま残骸扱い */ }
+      // 先行 run が「生きている node プロセス」なら常に中止 (ハング中でも並走は SQLite 直列書き込み前提を壊すので不可)。
+      // pid 再利用の誤検知はプロセス名照合で排除。それでも残る場合は通知の手動対応案内で回収する
+      if (prev && prev.pid && isAliveNodeProcess(prev.pid)) {
+        const msg = `⚠️ *Warehouse日次同期 多重起動を中止* (先行 run: pid=${prev.pid}, started_at=${prev.started_at})\n先行 run がハングしている場合はプロセス終了後に手動削除を: ${LOCK_FILE}`;
+        console.error(`[DailySync] ${msg}`);
+        await notify(msg);
+        process.exit(1);  // 先行 run の lock は触らない
+      }
+      // 先行 run 死亡 or 破損 lock = 残骸。回収は claimAndDeleteLock で排他化し、
+      // 「自分が観測した raw とバイト一致」する実体だけ削除する (Codex R5: run_id 有無に依存しない同一性判定)
+      if (prevRaw !== null) {
+        const recovery = claimAndDeleteLock(raw => raw === prevRaw);
+        if (recovery === 'deleted') {
+          const info = prev ? `started_at=${prev.started_at}, pid=${prev.pid}` : '(lock 破損)';
+          stateOpWarnings.push(`🔴 前回の daily-sync が完了通知なしで異常終了した形跡 (${info})。当該朝のジョブは途中までしか実行されていない`);
+        } else if (recovery === 'restored' || recovery === 'conflict') {
+          // 観測後に別プロセスが回収→新 lock 作成済み = 並行起動レース → 中止
+          const msg = `⚠️ *Warehouse日次同期 lock 回収レースを検知、今回の起動を中止* (先行 run が並行起動中)`;
+          console.error(`[DailySync] ${msg}`);
+          await notify(msg);
+          process.exit(1);
+        }
+        // 'gone' = 回収レース負け。直後の 'wx' 取得で決着する
+      }
+    }
+  } catch (e) {
+    stateOpWarnings.push(`🔴 lock ファイル検査失敗 (${e.message})。多重起動ガード無効のまま続行: ${LOCK_FILE}`);
+  }
+  // flag 'wx' = 排他的作成。check-then-write の TOCTOU で 2 プロセスが並走するのを防ぐ (Codex High #1)
+  try {
+    const runId = `${process.pid}-${crypto.randomUUID()}`;
+    fs.writeFileSync(LOCK_FILE, JSON.stringify({ run_id: runId, pid: process.pid, started_at: startTime.toISOString(), business_date: businessDate }), { flag: 'wx' });
+    myLockRunId = runId;
+  } catch (e) {
+    if (e.code === 'EEXIST') {
+      // 直前の残骸回収と自分の取得の間に別プロセスが lock を取った = 多重起動レース負け
+      const msg = `⚠️ *Warehouse日次同期 多重起動を中止* (lock 取得レースで先行 run を検知)`;
+      console.error(`[DailySync] ${msg}`);
+      await notify(msg);
+      process.exit(1);
+    }
+    // EEXIST 以外 (EACCES/ENOSPC 等) = data ディレクトリ自体の異常。多重起動ガード不能のまま
+    // 続行しても後続の DB/state 書き込みも壊れるので fail-closed (Codex R6 High)
+    const msg = `🔴 *Warehouse日次同期 起動中止* lock 書き込み失敗 (${e.message})。data ディレクトリの異常を確認してください: ${LOCK_FILE}`;
+    console.error(`[DailySync] ${msg}`);
+    await notify(msg);
+    process.exit(1);
+  }
+
   // retry-state の前処理:
   //   - 別日 or 破損 → 即削除 (古い backlog を引きずらない)
   //   - 同日 → 一旦残す。今回 run の結果に応じて終了時に上書き or 削除する
@@ -365,7 +477,16 @@ async function main() {
   results.push({ name: 'LINEギフト', ...linegiftResult });
 
   // 統合商品マスタ再構築
-  const mProductResult = runScript('apps/warehouse/rebuild-m-products.js', 'm_products 再構築');
+  // NE 失敗時はスキップ: raw_ne_* が部分状態の可能性がある中で rebuild すると、
+  // セット構成の欠落等が staging 件数ゲートを素通りして m_products に固定される (構造監査 H-1)。
+  // スキップ時は前日の m_products が残る (stale but consistent)。
+  let mProductResult;
+  if (neResult.success) {
+    mProductResult = runScript('apps/warehouse/rebuild-m-products.js', 'm_products 再構築');
+  } else {
+    console.log('[DailySync] NE 失敗のため m_products 再構築をスキップ (前日データ維持)');
+    mProductResult = { success: false, summary: '⏭️ skipped (NE失敗のため、前日データ維持)' };
+  }
   results.push({ name: 'm_products', ...mProductResult });
 
   // m_products 変更差分を history に記録 (trigger 廃止 → 差分バッチ化)
@@ -1142,7 +1263,7 @@ async function main() {
   }
 
   console.log('\n' + msg);
-  await notify(msg);
+  const notifyOk = await notify(msg);
 
   console.log(`[DailySync] 完了: ${endTime.toISOString()}`);
 
@@ -1155,6 +1276,11 @@ async function main() {
   // ⚠️ TODO (Codex R3 Low #1): 現状 dq_fail を立ててるのは Qoo10 のみ。LINEギフト/au PAY/楽天/Yahoo の
   //   DQ failure 経路にも同フラグ立てを横展開する別 PR を切ること。pushDqFailureResult() ヘルパー化推奨。
   const hasDqFail = results.some(r => r.dq_fail === true);
+  // lock 解放は「通知が届いた」or「全成功かつ届けるべき警告が無い」時のみ (Codex R7/R8 High)。
+  // 失敗・stateOpWarnings (前回異常終了の未達警告を含む) ありの朝に通知が届かなかった場合は lock を残す →
+  // DQ-fail (exit 1) なら bat の notify-crash.js が、通常時 (exit 0) でも翌朝の起動時検知が 🔴 でフォールバック通知する。
+  // 全成功 + 警告なし + 通知失敗は lock を解放する (run 自体は正常完了、残すと翌朝「異常終了」の誤検知になる)
+  if (notifyOk || (allOk && stateOpWarnings.length === 0)) releaseLock();
   if (hasDqFail) {
     const dqFailNames = results.filter(r => r.dq_fail === true).map(r => r.name).join(', ');
     console.error(`[DailySync] exit 1: DQ gate failure あり (設計書 v0.11 §9-1、mirror sync 中止): ${dqFailNames}`);
@@ -1164,6 +1290,9 @@ async function main() {
 
 main().catch(async (e) => {
   console.error('[DailySync] 致命的エラー:', e.message);
-  await notify(`❌ *Warehouse日次同期 失敗*\n${e.message}`);
+  const notified = await notify(`❌ *Warehouse日次同期 失敗*\n${e.message}`);
+  // 通知が実際に届いた時だけ lock を解放 (Codex R2 High #3)。
+  // 届かなかった場合は lock を残す → bat の notify-crash.js / 翌朝の起動時検知がフォールバックで拾う
+  if (notified) releaseLock();
   process.exit(1);
 });

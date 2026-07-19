@@ -1,0 +1,18 @@
+@echo off
+rem daily-sync.bat — miniPC の C:\Users\bfaith\daily-sync.bat に配置する参照テンプレート
+rem (Task Scheduler が毎朝 07:00 JST に実行。実体はリポジトリ外なので、変更時はこのテンプレートも更新すること)
+set "DATA_DIR=C:\Users\bfaith\bfaith-portal\data"
+set "VPS_SSH_KEY=C:\tools\keys\id_ed25519_vps"
+cd /d C:\Users\bfaith\bfaith-portal
+if not exist logs mkdir logs
+forfiles /p logs /m daily-sync-*.log /d -14 /c "cmd /c del @path" >nul 2>&1
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd_HHmmss"') do set "TS=%%i"
+set "LOG=logs\daily-sync-%TS%.log"
+echo [daily-sync.bat] start %TS% > "%LOG%"
+node apps/warehouse/daily-sync.js >> "%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [daily-sync.bat] node exit code: %RC% >> "%LOG%"
+rem 構造監査 H-3: exit≠0 のとき notify-crash.js を呼ぶ。lock ファイルが残っている場合のみ
+rem (= daily-sync が通知に到達せず abort した場合のみ) 🚨 を GChat へ即時通知する
+if not "%RC%"=="0" node apps/warehouse/notify-crash.js %RC% >> "%LOG%" 2>&1
+exit /b %RC%

@@ -90,6 +90,9 @@ function runScript(scriptPath, label, timeoutMs, args = ['7']) {
       cwd: PROJECT_DIR,
       timeout: timeoutMs,
       encoding: 'utf-8',
+      // daily-sync.js と同じ 64MB (デフォルト 1MB は Settlement 系の stdout で超え、
+      // 本体成功でも ENOBUFS で「失敗」誤記録になる — 構造監査 H-2)
+      maxBuffer: 64 * 1024 * 1024,
       env: {
         ...process.env,
         PATH: process.env.PATH,
