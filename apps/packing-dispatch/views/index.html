@@ -322,7 +322,7 @@
   <!-- ───── 追跡番号 / NE反映 (Phase 1 UI 再設計、2026-06-07、状態駆動 + 本日デフォルト) ───── -->
   <section class="panel" id="panel-tracking">
     <div class="help-bar">
-      💡 この画面の使い方: <b>① キャリアCSVを取込</b> (照合できた伝票に追跡番号が自動で紐付く。照合できない分は一覧の「📫 紐付け待ち / ⚠️ 要確認」に出ます) → <b>② 定形外を反映</b> → <b>③ レターパックは追跡番号を手入力</b> → <b>④ NE 手動反映用エクスポート</b>で NextEngine に反映。
+      💡 この画面の使い方: <b>① キャリアCSVを取込</b> (照合できた伝票に追跡番号が自動で紐付く。照合できない分は一覧の「📫 紐付け待ち / ⚠️ 要確認」に出ます) → <b>② 定形外を反映</b> → <b>③ レターパックは追跡番号を手入力</b> → <b>④ 配送方法ごとに NE 受注番号をコピー</b>して NextEngine で配送方法を変更 → <b>⑤ 受注番号+追跡番号 CSV をまとめてダウンロード</b>して NextEngine にインポート。
       <a href="#" data-jump="ch8">📖 詳しい手順を見る</a>
     </div>
 
@@ -498,19 +498,32 @@
     </div>
 
     <!-- NE 手動反映用エクスポート (2026-06-07 中原さん指示で追跡番号一覧の下に移動 + 対象を linked + ready 両方に拡張) -->
+    <!-- CSV ダウンロードは ⑤ に独立 (2026-07-19 中原さん指示)。この ④ は配送方法ごとの受注番号コピー専用。 -->
     <div class="card" id="trkReadyExportCard" style="background:#f0f7ff; border-color:#b3d4ff">
       <div class="row">
-        <strong>④ 📤 NE 手動反映用エクスポート (紐付け済)</strong>
+        <strong>④ 📋 NE 受注番号コピー (配送方法ごと)</strong>
         <span id="trkReadyExportSummary" class="muted"></span>
         <span style="flex:1"></span>
         <button class="sub" id="btnTrkReadyExportReload">再読込</button>
       </div>
-      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。<b>Step 1</b>: 配送方法を <b>1 つ選んで</b> NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<b>Step 2</b>: 受注番号+追跡番号の CSV をダウンロード → NextEngine の追跡番号 CSV インポートに流す。<br/><span style="color:#c0392b">⚠️ コピーは配送方法ごとに行ってください (まとめて変更すると別配送方法を巻き込みます)。CSV ダウンロードは混在 OK。</span></div>
+      <div class="muted">NE 反映 cron 未実装のため当面は手動運用。配送方法を <b>1 つ選んで</b> NE 受注番号をコピー → NextEngine で一括検索 → 配送方法を変更。<br/><span style="color:#c0392b">⚠️ コピーは配送方法ごとに行ってください (まとめて変更すると別配送方法を巻き込みます)。</span> CSV ダウンロードは下の <b>⑤</b> でまとめて行います。</div>
       <div class="row" style="margin-top:8px">
         <label>配送方法 <select id="trkReadyExportMethod"></select></label>
         <button id="btnTrkReadyCopyUkes" style="background:#2b6cb0; border-color:#2b6cb0">📋 NE 受注番号をコピー</button>
-        <button id="btnTrkReadyDownloadCsv" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
         <span id="trkReadyExportStatus" class="muted"></span>
+      </div>
+    </div>
+
+    <!-- ⑤ 受注番号 + 追跡番号 CSV を一括ダウンロード (2026-07-19 中原さん指示で ④ から独立) -->
+    <div class="card" id="trkAllCsvCard" style="background:#f0fff4; border-color:#9ae6b4">
+      <div class="row">
+        <strong>⑤ 📥 受注番号 + 追跡番号 CSV ダウンロード (全件)</strong>
+        <span id="trkAllCsvSummary" class="muted"></span>
+      </div>
+      <div class="muted">紐付け済で<b>追跡番号あり</b>の伝票を 1 つの CSV にまとめてダウンロード → NextEngine の追跡番号 CSV インポートに流します。<b>配送方法は混在 OK</b> (④ の配送方法選択とは関係なく全件出力)。追跡番号なし (定形外等) は CSV に含まれません。<b>出力範囲は画面上部の 本日 / 過去履歴 の切替に連動</b>します。</div>
+      <div class="row" style="margin-top:8px">
+        <button id="btnTrkAllCsvDownload" style="background:#2e7d32; border-color:#2e7d32">📥 受注番号 + 追跡番号 CSV ダウンロード</button>
+        <span id="trkAllCsvStatus" class="muted"></span>
       </div>
     </div>
 
@@ -762,7 +775,8 @@
         <li><b>① キャリアCSV取込</b>: 通常は各行の「<b>📥 Driveから取込</b>」ボタンを押すだけです。キャリアソフトが出力してDriveに置かれた最新CSVを自動取得し、<b>照合できた伝票に追跡番号が自動で紐付きます</b>。照合できなかった分は取込結果の「未マッチ / 競合」に件数が出て、下の追跡番号一覧の「📫 紐付け待ち / ⚠️ 要確認」フィルタで確認できます (取得元ファイルの更新日時がボタンの下に表示されるので、出荷処理後の時刻になっているか確認)。Driveが使えない時だけ、PCにダウンロードしたCSVを手動アップロードしてください。同じファイルの二重取込は自動で検出されます。</li>
         <li><b>② 定形外を反映</b>: 定形外郵便は追跡番号が無いためキャリアCSVに出ません。一覧を確認して「<b>✅ すべて反映する</b>」でまとめて反映します。</li>
         <li><b>③ レターパック</b>: 各行の入力欄に追跡番号を手入力して保存します。サイズ超過等で配送方法を変えたい場合は「配送方法変更」ボタンから。</li>
-        <li><b>④ NE 手動反映用エクスポート</b>: <b>Step 1</b> = 配送方法を1つ選んで「NE 受注番号をコピー」→ NextEngine で一括検索して配送方法を変更 (⚠️必ず配送方法ごとに)。<b>Step 2</b> = 「受注番号+追跡番号 CSV ダウンロード」→ NextEngine の追跡番号CSVインポートに流す (こちらは配送方法混在OK)。</li>
+        <li><b>④ NE 受注番号コピー (配送方法ごと)</b>: 配送方法を1つ選んで「NE 受注番号をコピー」→ NextEngine で一括検索して配送方法を変更 (⚠️必ず配送方法ごとに)。</li>
+        <li><b>⑤ 受注番号+追跡番号 CSV ダウンロード (全件)</b>: 「受注番号+追跡番号 CSV ダウンロード」を押すと、紐付け済の伝票を<b>全件まとめて</b> CSV 出力 → NextEngine の追跡番号CSVインポートに流します (配送方法混在OK)。</li>
       </ol>
       <div class="note"><b>「Drive: 取得エラー」が出たら</b>: Driveフォルダがサービスアカウントに共有されていない可能性があります。管理者に「対象フォルダをサービスアカウントに閲覧者共有」を依頼してください (エラー詳細は <code>/apps/packing-dispatch/api/tracking/drive-file-info</code> をブラウザで開くと確認できます)。</div>
       <div class="note"><b>「重複: このファイルは既に取込済み」と出たら</b>: 同じ内容のCSVを既に取り込んでいます。Drive更新日時が古いままの場合は、キャリアソフト側のDL/出力がまだ実行されていないか確認してください。</div>
@@ -1826,6 +1840,10 @@ const TRK_STATUS_LABELS = {
 // - 完了時: 「✅ N 件完了」+ 主ボタン「CSV ダウンロード」
 // - 主ボタンは常に 1 つだけ目立たせる (Codex 助言)
 let TRK_SCOPE = 'today'; // 'today' or 'all' (過去履歴ボタンで切替)
+// ⑤ 全件CSVの状態: 件数(追跡番号あり)と、その件数を算出した scope をセットで保持。
+// Codex R2 High: scope 切替中の stale 応答で「件数」と「実際のダウンロード範囲」がズレる事故を防ぐため、
+// count と scope を必ず対に持ち、ダウンロードもこの scope を使う。
+let TRK_ALL_CSV = { count: 0, scope: 'today' };
 let TRK_LOADED_ONCE = false; // タブ切替時の初回ロード判定
 function trkRenderMain(s){
   if(!s) return;
@@ -2298,18 +2316,36 @@ $('#btnTrkTeikeigaiReload').onclick = loadTrkTeikeigai;
 // ── NE 手動反映用エクスポート (2026-06-04、cron 未実装の暫定運用) ──
 async function loadTrkReadyExport(){
   try{
-    const sum = await api('api/tracking/ready/summary?scope=' + TRK_SCOPE);
+    // リクエスト時の scope を固定。応答が返る頃に scope が切替わっていたら stale として破棄する
+    // (Codex R2 High: グローバル TRK_SCOPE を応答後に使うと件数と範囲がズレる)。
+    const reqScope = TRK_SCOPE;
+    const sum = await api('api/tracking/ready/summary?scope=' + reqScope);
+    if(reqScope !== TRK_SCOPE) return; // scope が切替わった → この応答は捨てる (最新の呼び出しが後で確定)
     const sel = $('#trkReadyExportMethod');
     const card = $('#trkReadyExportCard');
+    const allCard = $('#trkAllCsvCard');
     $('#trkReadyExportSummary').textContent = sum.total > 0
       ? `合計 ${sum.total} 件 (内 追跡番号あり ${sum.total_with_tracking} 件)`
       : '';
+    // ④ (配送方法ごとのコピー) と ⑤ (全件CSV) は同じ summary で表示/非表示を連動。
     if(sum.total === 0){
       card.style.display = 'none';
+      allCard.style.display = 'none';
       return;
     }
     card.style.display = 'block';
-    // セレクトボックスはデフォルト = 未選択。「すべて」は CSV ダウンロードのみ用途で末尾に置く。
+    allCard.style.display = 'block';
+    // ⑤ の件数は CSV 実出力対象 = 追跡番号あり (定形外等 追跡なしは CSV に出ない、Codex Medium)。
+    // scope は画面の 本日/過去履歴 に連動する旨を明示 (Codex High: 過去履歴で全期間再出力の事故防止)。
+    TRK_ALL_CSV = { count: sum.total_with_tracking, scope: reqScope };
+    const scopeText = reqScope === 'today' ? '本日分' : '過去全期間';
+    const noTrk = sum.total - sum.total_with_tracking;
+    $('#trkAllCsvSummary').textContent = `CSV出力対象 ${sum.total_with_tracking} 件 (${scopeText})` +
+      (noTrk > 0 ? ` ／ 追跡番号なし ${noTrk} 件は対象外` : '');
+    const btnAllCsv = $('#btnTrkAllCsvDownload');
+    btnAllCsv.disabled = sum.total_with_tracking === 0;
+    btnAllCsv.style.opacity = sum.total_with_tracking === 0 ? '0.5' : '';
+    // セレクトボックスはデフォルト = 未選択。CSV ダウンロードは ⑤ に独立したのでコピー専用。
     // Codex R1 High: デフォルト「すべて」で受注番号コピー → NextEngine で別配送方法を一括変更する
     // 事故防止のため、コピー操作では明示的に配送方法を選ばせる。
     const placeholderOption = `<option value="">（配送方法を選択してください）</option>`;
@@ -2318,8 +2354,7 @@ async function loadTrkReadyExport(){
         (r.without_tracking > 0 ? ` (追跡なし ${r.without_tracking} 件含む)` : '');
       return `<option value="${esc(r.shipping_method_code)}">${esc(label)}</option>`;
     }).join('');
-    const allOption = `<option value="all">— すべて (${sum.total} 件) ※ CSV ダウンロードのみ</option>`;
-    sel.innerHTML = placeholderOption + methodOptions + allOption;
+    sel.innerHTML = placeholderOption + methodOptions;
   }catch(e){ console.error('[trk-ready-export]', e.message); }
 }
 $('#btnTrkReadyExportReload').onclick = loadTrkReadyExport;
@@ -2363,18 +2398,37 @@ $('#btnTrkReadyCopyUkes').onclick = async () => {
   }
 };
 
-// 📥 CSV ダウンロード (配送方法を選択してから、Step 1 のコピー操作と対になる運用)
-// Codex R2 High (2026-06-07): placeholder 未選択時に all で落ちると Step 1 を飛ばす導線になるため、
-// 未選択時は警告して止める。
-$('#btnTrkReadyDownloadCsv').onclick = () => {
-  const method = $('#trkReadyExportMethod').value;
-  if(!method){
-    $('#trkReadyExportStatus').style.color = '#c0392b';
-    $('#trkReadyExportStatus').textContent = '⚠️ 配送方法を選択してください (Step 1 のコピーと同じ配送方法で)';
+// ⑤ 📥 CSV ダウンロード (全件)。配送方法は混在 OK なので method=all で紐付け済を全件出力。
+// ④ の配送方法選択とは独立 (2026-07-19 中原さん指示)。
+// Codex High: scope は画面(本日/過去履歴)に連動する。過去履歴で押すと全期間を再出力し、
+//   NextEngine へ取込済の追跡番号まで再ダウンロードしてしまうため、都度 confirm で件数と範囲を明示する。
+$('#btnTrkAllCsvDownload').onclick = () => {
+  const status = $('#trkAllCsvStatus');
+  status.style.color = '';
+  status.textContent = '';
+  // 件数と scope は必ず同じ summary 応答由来の対 (TRK_ALL_CSV) を使う。
+  // ダウンロードもこの scope で行うので、確認した件数と実際の出力範囲が食い違わない。
+  const { count, scope } = TRK_ALL_CSV;
+  // Codex R3 High: scope 切替直後〜新 summary 到着前は旧 scope の対が残る。
+  // 画面の選択 scope と出力範囲がズレる窓を閉じるため、不一致なら止めて再取得を促す。
+  if(scope !== TRK_SCOPE){
+    status.style.color = '#c0392b';
+    status.textContent = '⚠️ 出力範囲を読込中です。数秒後にもう一度お試しください';
     return;
   }
-  $('#trkReadyExportStatus').textContent = '';
-  location.href = API_BASE + 'api/tracking/ready/csv?method=' + encodeURIComponent(method) + '&scope=' + TRK_SCOPE;
+  if(count === 0){
+    status.style.color = '#c0392b';
+    status.textContent = '⚠️ CSV に出力できる追跡番号ありの伝票がありません';
+    return;
+  }
+  const isPast = scope !== 'today';
+  const scopeText = isPast ? '過去全期間' : '本日分';
+  let msg = `${scopeText}の「追跡番号あり ${count} 件」を CSV ダウンロードします。\nNextEngine の追跡番号インポート用です。`;
+  if(isPast){
+    msg += '\n\n⚠️ 過去履歴モードのため全期間が対象です。既に NextEngine へ取込済の追跡番号も含まれます。よろしいですか?';
+  }
+  if(!confirm(msg)) return;
+  location.href = API_BASE + 'api/tracking/ready/csv?method=all&scope=' + scope;
 };
 
 // 定形外: 全選択 / 全解除
@@ -2850,6 +2904,12 @@ $('#btnTrackingReload').onclick = () => { loadTrackingAll(); loadDriveFileInfo()
 // スコープ切替 (本日 / 過去履歴、Phase 1 UI 再設計)
 function trkSetScope(scope){
   TRK_SCOPE = scope === 'all' ? 'all' : 'today';
+  // Codex R3 High: 新 summary が届くまで ⑤ は旧 scope のまま。即時に未確定化して
+  // 切替直後の誤ダウンロードを防ぐ (loadTrkReadyExport 完了時に再確定される)。
+  TRK_ALL_CSV = { count: 0, scope: null };
+  const btnAllCsv = $('#btnTrkAllCsvDownload');
+  if(btnAllCsv){ btnAllCsv.disabled = true; btnAllCsv.style.opacity = '0.5'; }
+  $('#trkAllCsvSummary').textContent = '読込中…';
   const todayBtn = $('#btnTrkScopeToday');
   const pastBtn = $('#btnTrkScopePast');
   if(TRK_SCOPE === 'today'){
