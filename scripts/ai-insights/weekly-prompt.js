@@ -134,7 +134,10 @@ function prohibitedMalls(input) {
  * 保守的に倒す設計: 誤検知したら claude リトライ → フォールバック (数字は必ず正しい) に落ちる
  */
 function factsNumberSet(input) {
-  const src = JSON.stringify({ facts: input.facts, budget: input.budget, events: input.events });
+  // 検査側 (assertEvidenceNumbers) とカンマ扱いを揃える (disp の "3,260万円" → token "3260")。
+  // 数字に挟まれたカンマのみ除去 (JSON 構造のカンマは温存)
+  const src = JSON.stringify({ facts: input.facts, budget: input.budget, events: input.events })
+    .replace(/(\d)[,，](?=\d)/g, '$1');
   const set = new Set();
   for (const m of src.matchAll(/\d+(?:\.\d+)?/g)) {
     set.add(m[0]);

@@ -13,6 +13,9 @@ const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(TEST_DIR, '..', 'run-weekly-report.js');
 const FAKE_CLAUDE = path.join(TEST_DIR, 'fake-claude.mjs');
 const PS = '2026-07-06';
+const { validateOutput, enrichFactsDisplay } = await import(
+  new URL('../weekly-prompt.js', import.meta.url).href
+);
 
 let pass = 0, fail = 0;
 function ok(cond, name, extra) {
@@ -136,6 +139,23 @@ function reset() {
   state.postedFail = false;
 }
 const calledPaths = () => state.calls.map((c) => c.path.replace(/jb_[a-z0-9_]+/i, ':job'));
+
+// ═══ 0. 数値検査ユニット (カンマ入り万円表記の整合) ═══
+console.log('\n■ 数値検査 (カンマ入り disp)');
+{
+  const inp = enrichFactsDisplay({
+    constraints: { prohibited_topic_areas: [] },
+    facts: { sales: { company: { sales_yen: 32600000, prev_week_sales_yen: 28400000 } } },
+    budget: null, events: null, previous_open_topics: [],
+  });
+  const mk = (evidence) => ({ summary: 'x', topics: [{ title: '売上動向', evidence, confidence: 'med' }], topic_updates: [] });
+  let passed = true;
+  try { validateOutput(mk('今週3,260万円 (前週2,840万円)'), inp); } catch (e) { passed = false; }
+  ok(passed, 'disp のカンマ入り金額 (3,260万円) が検査を通る');
+  let rejected = false;
+  try { validateOutput(mk('今週1.9万円'), inp); } catch { rejected = true; }
+  ok(rejected, 'facts に無い小数は依然として棄却', null);
+}
 
 // ═══ 1. 正常系 (claude 生成 → 投稿) ═══
 console.log('\n■ 正常系 (claude 生成 → 投稿)');
