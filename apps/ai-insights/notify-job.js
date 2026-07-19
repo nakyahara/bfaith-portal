@@ -35,11 +35,13 @@ export async function runClosingChecks(db, { today, post }) {
   // 重複稼働インスタンス・「投稿後マーク前のクラッシュ」でも二重送信しない。
   // 投稿に失敗したらベストエフォートでマーカーを戻す (戻せない場合は「送られない」側に倒す
   // = 二重送信より安全。リマインダーは15/20日の二段構えでカバー)
-  const claimAndPost = async (col, kind, text, extraWhere = '') => {
+  // extraWhere: 通知の「資格条件」も claim と同時に検証する (行取得後〜claim前に宣言/確定が
+  // 進んだ場合、不要になった通知を送らない。Codex 2巡目 medium 対応)
+  const claimAndPost = async (col, kind, text, extraWhere = '', extraParams = []) => {
     const claimed = db.prepare(
       `UPDATE ai_monthly_closing SET ${col} = ?, updated_at = ?
        WHERE year_month = ? AND ${col} IS NULL ${extraWhere}`
-    ).run(now, now, ym);
+    ).run(now, now, ym, ...extraParams);
     if (claimed.changes !== 1) return false;
     try {
       await post(text);
@@ -61,12 +63,12 @@ export async function runClosingChecks(db, { today, post }) {
         `20日を過ぎましたが ${ym} の締め宣言がまだです。`,
         'MFの仕訳入力が終わっていたら、⚙️「AI経営レポート設定」画面で確定宣言をお願いします。',
         '宣言があるまで月次レポートは暫定版のままです。',
-      ].join('\n'));
+      ].join('\n'), "AND status IN ('open','reopened')");
     } else if (day >= 15 && day < 20 && !row.reminder_15_sent_at) {
       await claimAndPost('reminder_15_sent_at', 'reminder_15', [
         `*🔔 ${ym} 月次締めリマインダー*`,
         `${ym} の締め宣言がまだです。MFの仕訳入力完了後、⚙️「AI経営レポート設定」画面で確定宣言をすると、確定版の月次レポートが発行されます。`,
-      ].join('\n'));
+      ].join('\n'), "AND status IN ('open','reopened')");
     }
   }
 
@@ -81,7 +83,7 @@ export async function runClosingChecks(db, { today, post }) {
         `*⚠️ ${ym} 確定版が発行できません*`,
         `締め宣言 (${row.declared_at.slice(0, 10)}) から7日以上、MF同期が成功していません。`,
         'miniPC の daily-sync / MF publish の状態を確認してください。',
-      ].join('\n'));
+      ].join('\n'), "AND status = 'declared' AND final_report_id IS NULL");
     }
   }
 
@@ -94,7 +96,7 @@ export async function runClosingChecks(db, { today, post }) {
         '確定版レポート発行後、対象月のPLに変化を検知しました (過年度仕訳の追加・修正の可能性)。',
         '内容を確認し、レポートを作り直す場合は ⚙️画面で再オープン → 再宣言してください (訂正版が発行されます)。',
         '自動では再発行しません。',
-      ].join('\n'));
+      ].join('\n'), 'AND status = ? AND final_pl_hash = ?', ['declared', row.final_pl_hash]);
     }
   }
   return sent;

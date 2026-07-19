@@ -475,19 +475,30 @@ console.log('\n■ 月次 report-input + 締め宣言');
   ok(r.body.result === 'busy' && r.body.job.edition === 'correction-1',
     '同一宣言の correction-next → 既存jobを再利用 (busy、correction-2を作らない)', r.body);
 
-  // 生成中に再オープン→再宣言 → 旧生成の保存は stale として 409
+  // 生成中に「再オープンだけ」→ seq は同じでも status!=declared なので stale 扱い
   const corrJob = db.prepare(`
     SELECT job_id FROM ai_report_jobs WHERE edition = 'correction-1' AND period_start = '2026-06-01'
   `).get();
   r = await post('/apps/ai-insights/api/closing/2026-06/reopen', {});
   ok(r.status === 200, '(生成中に) 再オープン', r);
+  r = await post(`/api/ai-insights/service/jobs/${corrJob.job_id}/report`, {
+    generation_mode: 'claude', body_json: { summary: '再オープン中の旧生成' }, topics: [], pl_hash: 'stale0',
+  }, SVC);
+  ok(r.status === 409 && r.body.error_class === 'stale_declare_seq',
+    '再オープン中 (seq同一) の生成保存も 409 stale', r.body);
+  // 再宣言 (seq=3) 後、旧宣言 (seq=2) の生成の保存も stale
   r = await post('/apps/ai-insights/api/closing/2026-06/declare', {});
   ok(r.status === 200, '(生成中に) 再宣言 (seq=3)', r);
+  // 宣言が進んだ後の correction-next → 新番号+新seq
+  const reclaim = await post('/api/ai-insights/service/jobs/claim', { ...MKEY, edition: 'correction-next' }, SVC);
+  ok(reclaim.status === 200 && reclaim.body.job.edition === 'correction-2' && reclaim.body.job.declare_seq === 3,
+    '宣言が進んだ後の correction-next → 新番号+新seq', reclaim.body?.job);
+  // 旧宣言 (seq=2) に紐付く correction-1 (まだ generating) の保存は seq 不一致で stale
   r = await post(`/api/ai-insights/service/jobs/${corrJob.job_id}/report`, {
     generation_mode: 'claude', body_json: { summary: '旧宣言の生成' }, topics: [], pl_hash: 'stale',
   }, SVC);
   ok(r.status === 409 && r.body.error_class === 'stale_declare_seq',
-    '旧宣言の生成保存 → 409 stale (確定扱いしない)', r.body);
+    '旧宣言 (seq不一致) の生成保存 → 409 stale (確定扱いしない)', r.body);
   const closingAfterStale = db.prepare("SELECT final_pl_hash FROM ai_monthly_closing WHERE year_month='2026-06'").get();
   ok(closingAfterStale.final_pl_hash === 'plhash-final-1', 'stale 保存で closing が汚れない', closingAfterStale);
 

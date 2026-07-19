@@ -198,6 +198,12 @@ export function initAiInsightsTables(db) {
   if (!jobCols.includes('declare_seq')) {
     db.prepare('ALTER TABLE ai_report_jobs ADD COLUMN declare_seq INTEGER').run();
   }
+  // 1宣言 = 1 correction を DB レベルでも保証 (並行 claim の二重INSERT防止)
+  db.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_jobs_correction_per_declare
+    ON ai_report_jobs(report_type, period_start, period_end, declare_seq)
+    WHERE edition LIKE 'correction-%' AND declare_seq IS NOT NULL
+  `).run();
   const seedStmt = db.prepare(`
     INSERT OR IGNORE INTO ai_expected_sources
       (source_id, source_kind, unit, requirement, valid_from, updated_by, updated_at)

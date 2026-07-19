@@ -243,7 +243,9 @@ serviceRouter.post('/jobs/claim', (req, res) => {
     if (existing) {
       edition = existing.edition;
     } else {
-      // UNIQUE 制約 + 再試行で原子的に採番 (Codexラウンド5 合意方式)
+      // UNIQUE 制約 + 再試行で原子的に採番 (Codexラウンド5 合意方式)。
+      // 競合時はまず「同じ declare_seq の correction が先に作られたか」を再確認して再利用する
+      // (並行 claim が別番号を増殖させない。partial unique index が同一宣言の二重INSERTも防ぐ)
       for (let attempt = 0; attempt < 5; attempt++) {
         const maxRow = db.prepare(`
           SELECT MAX(CAST(SUBSTR(edition, 12) AS INTEGER)) AS n FROM ai_report_jobs
@@ -256,6 +258,12 @@ serviceRouter.post('/jobs/claim', (req, res) => {
           break;
         } catch (e) {
           if (!/UNIQUE constraint/.test(e.message)) throw e; // 採番競合以外は伝播
+          const nowExisting = db.prepare(`
+            SELECT edition FROM ai_report_jobs
+            WHERE report_type = ? AND period_start = ? AND period_end = ?
+              AND edition LIKE 'correction-%' AND declare_seq = ?
+          `).get(report_type, period_start, period_end, declareSeq);
+          if (nowExisting) { edition = nowExisting.edition; break; }
           if (attempt === 4) return res.status(500).json({ error: 'correction 採番が5回競合' });
         }
       }
@@ -404,11 +412,13 @@ serviceRouter.post('/jobs/:jobId/report', (req, res) => {
       //   訂正版が永久に出なくなる (Codex PR-3 high)。不一致は保存ごと中止して 409 にする
       if (job.report_type === 'monthly' && job.edition !== 'provisional') {
         const ym = job.period_start.slice(0, 7);
+        // status='declared' も必須: 「再オープンだけ」でも seq は変わらないため、
+        // declared 以外での旧生成の確定を弾く (Codex 2巡目 high)
         const updated = db.prepare(`
           UPDATE ai_monthly_closing
           SET final_report_id = ?, final_declare_seq = ?,
               final_pl_hash = ?, change_notified_at = NULL, updated_at = ?
-          WHERE year_month = ? AND declare_seq = ?
+          WHERE year_month = ? AND declare_seq = ? AND status = 'declared'
         `).run(reportId, job.declare_seq, b.pl_hash || null, now, ym, job.declare_seq);
         if (updated.changes !== 1) {
           const err = new Error('stale_declare_seq');
