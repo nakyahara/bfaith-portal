@@ -62,8 +62,16 @@ insSales.run('2026-07-06', '2026-07', 'rakuten', 'r-001', '商品A', 10, 10000, 
 insSales.run('2026-07-11', '2026-07', 'rakuten', 'r-001', '商品A', 5, 5000, 'h2');
 insSales.run('2026-06-29', '2026-06', 'rakuten', 'r-001', '商品A', 8, 10000, 'h3');
 insSales.run('2026-06-08', '2026-06', 'rakuten', 'r-001', '商品A', 8, 8000, 'h4');
-// amazon: 過去28日に実績あり・今週 0 行 → suspect
+// amazon: 過去28日に実績あり・今週 0 行 → suspect (全欠損パターン)
 insSales.run('2026-06-15', '2026-06', 'amazon', 'a-001', '商品B', 3, 3000, 'h5');
+// qoo10: 今週は月曜のみ・過去4週は火曜4回+水曜3回に実績 → 部分欠損 suspect (曜日パターン照合)
+insSales.run('2026-07-06', '2026-07', 'qoo10', 'q-001', '商品C', 1, 500, 'h6');
+for (const d of ['2026-06-09', '2026-06-16', '2026-06-23', '2026-06-30']) {
+  insSales.run(d, d.slice(0, 7), 'qoo10', 'q-001', '商品C', 1, 500, 'ht' + d);
+}
+for (const d of ['2026-06-10', '2026-06-17', '2026-06-24']) {
+  insSales.run(d, d.slice(0, 7), 'qoo10', 'q-001', '商品C', 1, 500, 'hw' + d);
+}
 
 const insChunk = db.prepare(`
   INSERT INTO sync_run_chunks
@@ -82,8 +90,13 @@ const insInv = db.prepare(`
      cost_missing_count, source_status, source_row_count, captured_at, synced_at)
   VALUES (?, 'jp', ?, ?, ?, 1, 0, 0, 'ok', 1, '2026-07-13T00:00:00Z', '2026-07-13T00:00:00Z')
 `);
+for (const d of ['2026-07-06', '2026-07-07', '2026-07-08', '2026-07-09', '2026-07-10', '2026-07-11']) {
+  insInv.run(d, 'fba_warehouse', 950, 4700000);
+}
 insInv.run('2026-07-12', 'fba_warehouse', 1000, 5000000);
 insInv.run('2026-07-05', 'fba_warehouse', 900, 4500000);
+// own_warehouse: 中間日1日だけ → partial (最終日なし・5日未満)
+insInv.run('2026-07-08', 'own_warehouse', 100, 300000);
 
 // ═══ 1. 認証 ═══
 console.log('\n■ 認証 (read token / service token)');
@@ -136,13 +149,17 @@ console.log('\n■ 事実層 + 充足判定');
 
   const covSalesAmazon = inp.coverage.find((c) => c.source_id === 'sales:amazon');
   ok(covSalesAmazon?.status === 'suspect', 'amazon = suspect (マーカーありデータ0行)', covSalesAmazon);
+  const covSalesQoo10 = inp.coverage.find((c) => c.source_id === 'sales:qoo10');
+  ok(covSalesQoo10?.status === 'suspect', 'qoo10 = suspect (曜日パターン照合で部分欠損検出)', covSalesQoo10);
+  const covInvOwn = inp.coverage.find((c) => c.source_id === 'inventory:own_warehouse');
+  ok(covInvOwn?.status === 'partial', 'own_warehouse = partial (中間日1日のみ)', covInvOwn);
 
   const rk = inp.facts.sales.by_mall.find((m) => m.mall === 'rakuten');
   ok(rk?.sales_yen === 15000 && rk?.units === 15, '楽天 今週売上 15,000円/15個', rk);
   ok(rk?.prev_week_sales_yen === 10000, '楽天 前週 10,000円', rk);
   ok(rk?.wow_pct === 50, '楽天 WoW +50%', rk);
   ok(rk?.prior_4w_median_sales_yen === 4000, '過去4週中央値 (10000,8000,0,0 → 4000)', rk);
-  ok(inp.facts.sales.company.sales_yen === 15000, '全社今週 15,000円', inp.facts.sales.company);
+  ok(inp.facts.sales.company.sales_yen === 15500, '全社今週 15,500円 (楽天15,000+qoo10 500)', inp.facts.sales.company);
 
   const fba = inp.facts.inventory.by_category.find((c) => c.category === 'fba_warehouse');
   ok(fba?.value_yen === 5000000 && fba?.week_ago_value_yen === 4500000, '在庫金額 今週/先週', fba);
@@ -288,6 +305,59 @@ console.log('\n■ 孤児回収 + 人間照合');
   ok(r.status === 200 && r.body.status === 'posted', '照合: 投稿済み扱い → posted', r);
   r = await post(`/apps/ai-insights/api/jobs/${jobId}/reconcile`, { action: 'repost' });
   ok(r.status === 409, '照合済みジョブへの再照合 → 409', r);
+
+  // 人間照合: repost → 再生成ではなく既存レポートの投稿再開になる (UNIQUE衝突しない)
+  r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-06-08', period_end: '2026-06-15' }, SVC);
+  const repostJob = r.body.job.job_id;
+  await post(`/api/ai-insights/service/jobs/${repostJob}/report`, {
+    generation_mode: 'claude', body_json: { summary: 'z' }, topics: [],
+  }, SVC);
+  await post(`/api/ai-insights/service/jobs/${repostJob}/posting`, {}, SVC);
+  db.prepare("UPDATE ai_report_jobs SET heartbeat_at = '2026-01-01T00:00:00Z' WHERE job_id = ?").run(repostJob);
+  await j('/apps/ai-insights/api/settings'); // sweep
+  r = await post(`/apps/ai-insights/api/jobs/${repostJob}/reconcile`, { action: 'repost' });
+  ok(r.status === 200 && r.body.status === 'pending', '照合: 再投稿指示 → pending', r);
+  r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-06-08', period_end: '2026-06-15' }, SVC);
+  ok(r.body.result === 'claimed_for_posting' && r.body.report?.body_json,
+    'repost 後の claim → 投稿だけ再開 (再生成しない)', r.body?.result);
+  // 投稿失敗申告 (posting → failed) 後も同様に投稿だけ再開
+  await post(`/api/ai-insights/service/jobs/${repostJob}/failed`, { error_class: 'post_failed', error_detail: 'webhook接続前に失敗' }, SVC);
+  r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-06-08', period_end: '2026-06-15' }, SVC);
+  ok(r.body.result === 'claimed_for_posting', '投稿失敗 (report あり) の再claim → claimed_for_posting', r.body?.result);
+  await post(`/api/ai-insights/service/jobs/${repostJob}/posted`, { gchat_message_id: 'm2' }, SVC);
+}
+
+// topic_updates のスコープ制限
+console.log('\n■ topic_updates スコープ制限');
+{
+  const oldTopic = db.prepare(`
+    SELECT t.topic_id FROM ai_report_topics t JOIN ai_reports r ON r.report_id = t.report_id
+    WHERE r.public_id = 'WK-20260706-f'
+  `).get();
+  // 対象期間より前の論点 → 更新できる (2026-07-13 週のジョブから 07-06 週の論点を resolve)
+  let r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-07-13', period_end: '2026-07-20' }, SVC);
+  const futureJob = r.body.job.job_id;
+  await post(`/api/ai-insights/service/jobs/${futureJob}/report`, {
+    generation_mode: 'claude', body_json: { summary: 'w' }, topics: [],
+    topic_updates: [{ topic_id: oldTopic.topic_id, status: 'resolved' }],
+  }, SVC);
+  let st = db.prepare('SELECT status FROM ai_report_topics WHERE topic_id = ?').get(oldTopic.topic_id);
+  ok(st.status === 'resolved', '前期間の論点は更新できる', st);
+  // 対象期間より後の論点 → 更新されない (2026-06-01 週のジョブから 07-13 週の論点は触れない)
+  const newTopic = db.prepare(`
+    INSERT INTO ai_report_topics (topic_id, report_id, seq, title, status, created_at, updated_at)
+    SELECT 'tp_smoke_future', report_id, 9, '未来論点', 'open', '2026-07-20', '2026-07-20'
+    FROM ai_reports WHERE public_id = 'WK-20260713-f'
+  `).run();
+  ok(newTopic.changes === 1, '(fixture) 未来論点を作成', null);
+  r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-06-01', period_end: '2026-06-08' }, SVC);
+  const pastJob = r.body.job.job_id;
+  await post(`/api/ai-insights/service/jobs/${pastJob}/report`, {
+    generation_mode: 'claude', body_json: { summary: 'v' }, topics: [],
+    topic_updates: [{ topic_id: 'tp_smoke_future', status: 'dismissed' }],
+  }, SVC);
+  st = db.prepare("SELECT status FROM ai_report_topics WHERE topic_id = 'tp_smoke_future'").get();
+  ok(st.status === 'open', '自分より後の期間の論点は更新されない', st);
 }
 
 // generated からの投稿再開 (claim_for_posting)

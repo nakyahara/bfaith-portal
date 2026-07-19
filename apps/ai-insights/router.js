@@ -233,21 +233,23 @@ serviceRouter.post('/jobs/claim', (req, res) => {
   }
 
   const claimer = String(claimed_by || 'runner').slice(0, 100);
-  // pending / failed → generating (通常claim)
+  // レポート未生成 (report_id なし) の pending/failed → generating
   const claimed = db.prepare(`
     UPDATE ai_report_jobs
     SET status = 'generating', claimed_by = ?, claimed_at = ?, heartbeat_at = ?,
         error_class = NULL, error_detail = NULL, updated_at = ?
-    WHERE job_id = ? AND status IN ('pending', 'failed')
+    WHERE job_id = ? AND status IN ('pending', 'failed') AND report_id IS NULL
   `).run(claimer, now, now, now, job.job_id);
   if (claimed.changes === 1) {
     return res.json({ result: 'claimed', job: getJob(db, job.job_id) });
   }
-  // generated → posting (生成済み。投稿だけ再開)
+  // レポート生成済み (generated / 投稿失敗後の failed / 照合後 repost の pending) → posting。
+  // 再生成すると既存 ai_reports と UNIQUE 衝突するため、投稿だけを再開する
   const reclaimed = db.prepare(`
     UPDATE ai_report_jobs
-    SET status = 'posting', claimed_by = ?, claimed_at = ?, heartbeat_at = ?, updated_at = ?
-    WHERE job_id = ? AND status = 'generated'
+    SET status = 'posting', claimed_by = ?, claimed_at = ?, heartbeat_at = ?,
+        error_class = NULL, error_detail = NULL, updated_at = ?
+    WHERE job_id = ? AND status IN ('generated', 'pending', 'failed') AND report_id IS NOT NULL
   `).run(claimer, now, now, now, job.job_id);
   if (reclaimed.changes === 1) {
     const fresh = getJob(db, job.job_id);
@@ -330,10 +332,21 @@ serviceRouter.post('/jobs/:jobId/report', (req, res) => {
         topicStmt.run(newId('tp'), reportId, i + 1, t.title.trim().slice(0, 200),
           t.category || null, t.body ? JSON.stringify(t.body) : null, now, now);
       });
-      const updStmt = db.prepare(
-        'UPDATE ai_report_topics SET status = ?, updated_at = ? WHERE topic_id = ?'
-      );
-      for (const u of topicUpdates) updStmt.run(u.status, now, u.topic_id);
+      // 更新できるのは「同じ report_type の、対象期間より前のレポートの未解決論点」のみ
+      // (token 漏洩や runner 不具合で無関係な論点を書き換えられないようスコープを絞る)
+      const updStmt = db.prepare(`
+        UPDATE ai_report_topics SET status = ?, updated_at = ?
+        WHERE topic_id = ?
+          AND status IN ('open', 'carried', 'worsened')
+          AND EXISTS (
+            SELECT 1 FROM ai_reports r
+            WHERE r.report_id = ai_report_topics.report_id
+              AND r.report_type = ? AND r.period_start < ?
+          )
+      `);
+      for (const u of topicUpdates) {
+        updStmt.run(u.status, now, u.topic_id, job.report_type, job.period_start);
+      }
       db.prepare(`
         UPDATE ai_report_jobs SET status = 'generated', report_id = ?, input_hash = ?,
           heartbeat_at = ?, updated_at = ? WHERE job_id = ?
@@ -371,16 +384,20 @@ serviceRouter.post('/jobs/:jobId/posted', (req, res) => {
   const job = getJob(db, req.params.jobId);
   if (!job) return res.status(404).json({ error: 'job not found' });
   const now = nowIso();
-  const r = db.prepare(`
-    UPDATE ai_report_jobs SET status = 'posted', updated_at = ? WHERE job_id = ? AND status = 'posting'
-  `).run(now, req.params.jobId);
-  if (r.changes !== 1) {
+  // ジョブ遷移とレポート側の投稿記録は 1 トランザクション (中間クラッシュで不整合を残さない)
+  let changed = 0;
+  db.transaction(() => {
+    changed = db.prepare(`
+      UPDATE ai_report_jobs SET status = 'posted', updated_at = ? WHERE job_id = ? AND status = 'posting'
+    `).run(now, req.params.jobId).changes;
+    if (changed === 1 && job.report_id) {
+      db.prepare(`
+        UPDATE ai_reports SET gchat_message_id = ?, body_hash = ?, posted_at = ? WHERE report_id = ?
+      `).run(req.body?.gchat_message_id || null, req.body?.body_hash || null, now, job.report_id);
+    }
+  })();
+  if (changed !== 1) {
     return res.status(409).json({ error: `cannot mark posted from ${job.status}` });
-  }
-  if (job.report_id) {
-    db.prepare(`
-      UPDATE ai_reports SET gchat_message_id = ?, body_hash = ?, posted_at = ? WHERE report_id = ?
-    `).run(req.body?.gchat_message_id || null, req.body?.body_hash || null, now, job.report_id);
   }
   res.json({ ok: true });
 });

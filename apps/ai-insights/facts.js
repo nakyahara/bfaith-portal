@@ -100,17 +100,37 @@ function assessCoverage(db, periodStart, periodEnd, days) {
   const salesCovered = coveredDaysForEntity(db, SALES_ENTITY, days);
   const salesMissingDays = days.filter((d) => !salesCovered.has(d));
 
-  // per-mall 実データ量 (suspect 判定用: マーカー完了でも 1 モールだけ上流欠落のケース)
-  const mallPeriodRows = db.prepare(`
-    SELECT mall, COUNT(*) AS cnt FROM v_mall_sales_daily_unified
-    WHERE date_jst >= ? AND date_jst < ? GROUP BY mall
-  `).all(periodStart, periodEnd);
-  const mallPriorRows = db.prepare(`
-    SELECT mall, COUNT(*) AS cnt FROM v_mall_sales_daily_unified
-    WHERE date_jst >= ? AND date_jst < ? GROUP BY mall
-  `).all(addDaysYmd(periodStart, -28), periodStart);
-  const periodCnt = Object.fromEntries(mallPeriodRows.map((r) => [r.mall, r.cnt]));
-  const priorCnt = Object.fromEntries(mallPriorRows.map((r) => [r.mall, r.cnt]));
+  // per-mall 実データ判定 (suspect 検出):
+  // f_sales_by_listing の取得完了マーカーは全モール一体のため、1モールだけ上流 (miniPC側の
+  // モール別sync) が欠落してもマーカー上は「完了」に見える。Render 側でできる補助判定として
+  // 「過去4週の同曜日に売上があったのに今週その曜日が0行」の曜日パターン照合を行う。
+  // ⚠️ 限界: 過去4週も売れていないモールの欠損は検出できない (休止モールは
+  //    ai_expected_sources.valid_to で外す運用)。恒久策 = モール別 row_count meta を
+  //    同期契約に追加 (miniPC 側変更が必要なため PR-1 スコープ外、要件書 §5.4 に追記済み)
+  const presenceRows = db.prepare(`
+    SELECT DISTINCT mall, date_jst FROM v_mall_sales_daily_unified
+    WHERE date_jst >= ? AND date_jst < ?
+  `).all(addDaysYmd(periodStart, -28), periodEnd);
+  const presence = new Set(presenceRows.map((r) => `${r.mall}|${r.date_jst}`));
+  const priorCnt = {};
+  const periodCnt = {};
+  for (const r of presenceRows) {
+    if (r.date_jst >= periodStart) periodCnt[r.mall] = (periodCnt[r.mall] || 0) + 1;
+    else priorCnt[r.mall] = (priorCnt[r.mall] || 0) + 1;
+  }
+  /** 過去4週の同曜日に3週以上実績があるのに今週0行の日を数える */
+  const suspectDaysForMall = (mall) => {
+    let suspect = 0;
+    for (const d of days) {
+      if (presence.has(`${mall}|${d}`)) continue;
+      let priorHits = 0;
+      for (let w = 1; w <= 4; w++) {
+        if (presence.has(`${mall}|${addDaysYmd(d, -7 * w)}`)) priorHits++;
+      }
+      if (priorHits >= 3) suspect++;
+    }
+    return suspect;
+  };
 
   const results = [];
   for (const s of sources) {
@@ -127,6 +147,13 @@ function assessCoverage(db, periodStart, periodEnd, days) {
         // マーカー上は完了だが、直近28日は売上があったモールが今週 0 行 → 上流欠落疑い
         status = 'suspect';
         detail = '取込完了マーカーはあるが当該モールの行が 0 (過去28日は実績あり)';
+      } else {
+        // 部分欠損: 過去4週の同曜日パターンと照合 (2日以上の不自然な空白で疑い)
+        const sd = suspectDaysForMall(s.unit);
+        if (sd >= 2) {
+          status = 'suspect';
+          detail = `過去4週は同曜日に実績があるのに今週 0 行の日が ${sd} 日 (上流欠落疑い)`;
+        }
       }
     } else if (s.source_kind === 'finance') {
       const covered = coveredDaysForEntity(db, `${s.unit}${FINANCE_ENTITY_SUFFIX}`, days);
@@ -151,9 +178,13 @@ function assessCoverage(db, periodStart, periodEnd, days) {
       if ((present?.days || 0) === 0) {
         status = 'missing';
         detail = '対象期間に日次スナップショットなし';
-      } else if (!lastPresent) {
+      } else if (!lastPresent || present.days < 5) {
+        // 最終日欠損 or 半分以上の日が欠損 → 週次比較の信頼性なし
         status = 'partial';
-        detail = `最終日 ${lastDay} のスナップショットなし (${present.days}/7日)`;
+        detail = `スナップショット ${present.days}/7日` + (lastPresent ? '' : ` (最終日 ${lastDay} なし)`);
+      } else if (present.days < 7) {
+        // 中間日の軽微な欠損: 週次は最新日+7日前比較が主のため ok のまま detail のみ記録
+        detail = `スナップショット ${present.days}/7日 (中間日に欠損)`;
       }
     } else if (s.source_kind === 'po') {
       try {
@@ -489,13 +520,16 @@ function buildBudgetFacts(db, periodStart, periodEnd) {
     WHERE budget_kind = 'initial' AND year_month IN (${placeholders})
     ORDER BY year_month, metric
   `).all(...months);
-  const latest = db.prepare(
-    'SELECT budget_row_id FROM ai_budget ORDER BY entered_at DESC, budget_row_id DESC LIMIT 1'
-  ).get();
   return {
     available: rows.length > 0,
-    entries: rows.map((r) => ({ year_month: r.year_month, metric: r.metric, value_yen: r.value_yen })),
-    budget_revision_id: latest?.budget_row_id || null,
+    entries: rows.map((r) => ({
+      year_month: r.year_month, metric: r.metric, value_yen: r.value_yen,
+      budget_row_id: r.budget_row_id,
+    })),
+    // 監査用: このレポートが実際に参照した予算行の集合 (ソート済み join。年度違いの編集に影響されない)
+    budget_revision_id: rows.length > 0
+      ? rows.map((r) => r.budget_row_id).sort().join(',')
+      : null,
     note: rows.length === 0
       ? '予算未入力。予算差に言及する論点は生成禁止 (前年比・トレンドのみで論じる)'
       : '粗利率予算は保存しない設計 (gross_profit / sales で導出)',
