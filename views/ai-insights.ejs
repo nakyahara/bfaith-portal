@@ -62,6 +62,17 @@
     <div id="recon-list"></div>
   </div>
 
+  <!-- 月次締め -->
+  <div class="card">
+    <h3>📅 月次締め (確定宣言)</h3>
+    <p class="hint">
+      MFの仕訳入力を終えた月は「確定宣言」してください。次のMF同期後に<b>確定版の月次レポート</b>が発行されます。
+      宣言が無くても毎月10日に暫定版は自動発行されます。<br>
+      ※「確定」は人間による締め状態の宣言であり、会計データの完全性を保証するものではありません。
+    </p>
+    <table id="closing-table"></table>
+  </div>
+
   <!-- 予算 -->
   <div class="card">
     <h3>📋 年度予算 (全社・月次)</h3>
@@ -361,6 +372,53 @@ function renderRecon() {
   });
 }
 
+function renderClosing() {
+  const CL_BADGE = { open: ['badge-gray', '未締め'], declared: ['badge-green', '確定宣言済み'], reopened: ['badge-yellow', '再オープン中'] };
+  const ED_LABEL = { provisional: '暫定版', final: '確定版' };
+  let html = '<tr><th class="l">月</th><th>締め状態</th><th class="l">発行済みレポート</th><th></th></tr>';
+  for (const c of (settings.closing || [])) {
+    const [cls, label] = CL_BADGE[c.status] || ['badge-gray', c.status];
+    const eds = (c.editions || []).map((e) => {
+      const name = ED_LABEL[e.edition] || e.edition.replace('correction-', '訂正版');
+      const done = e.status === 'posted' ? '✅' : '⏳';
+      return done + name;
+    }).join(' / ') || '—';
+    let btn = '';
+    if (c.status === 'open' || c.status === 'reopened') {
+      btn = '<button class="primary" data-declare="' + esc(c.year_month) + '">確定宣言</button>';
+    } else if (c.status === 'declared') {
+      btn = '<button class="ghost" data-reopen="' + esc(c.year_month) + '">再オープン</button>';
+    }
+    html += '<tr><td class="l"><b>' + esc(c.year_month) + '</b></td>' +
+      '<td><span class="badge ' + cls + '">' + esc(label) + '</span>' +
+      (c.declared_at ? '<div style="font-size:11px;color:#6b7280;">' + esc(c.declared_at.slice(0, 10)) + ' ' + esc(c.declared_by || '') + '</div>' : '') + '</td>' +
+      '<td class="l">' + eds + '</td><td>' + btn + '</td></tr>';
+  }
+  document.getElementById('closing-table').innerHTML = html;
+  document.querySelectorAll('[data-declare]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const ym = b.dataset.declare;
+      if (!confirm(ym + ' の締めを確定宣言しますか？\nMFの仕訳入力が完了していることを確認してください。\n(宣言後、次のMF同期のデータで確定版レポートが発行されます)')) return;
+      try {
+        await api('/apps/ai-insights/api/closing/' + ym + '/declare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        await load();
+        toast(ym + ' を確定宣言しました');
+      } catch (e) { toast('宣言失敗: ' + e.message); }
+    });
+  });
+  document.querySelectorAll('[data-reopen]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const ym = b.dataset.reopen;
+      if (!confirm(ym + ' の締めを再オープンしますか？\n既存の確定版レポートは履歴として残り、再宣言すると訂正版が発行されます。')) return;
+      try {
+        await api('/apps/ai-insights/api/closing/' + ym + '/reopen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        await load();
+        toast(ym + ' を再オープンしました');
+      } catch (e) { toast('再オープン失敗: ' + e.message); }
+    });
+  });
+}
+
 function renderJobs() {
   let html = '<tr><th class="l">レポート</th><th>種別</th><th>期間</th><th>版</th><th>状態</th><th>投稿日時</th><th class="l">エラー</th></tr>';
   if (settings.recent_jobs.length === 0) html += '<tr><td class="l" colspan="7">実行履歴はまだありません (PC runner は PR-2 で稼働開始)</td></tr>';
@@ -391,6 +449,7 @@ async function load() {
   renderBudgetTable();
   renderEvents();
   renderRecon();
+  renderClosing();
   renderJobs();
   renderSources();
 }

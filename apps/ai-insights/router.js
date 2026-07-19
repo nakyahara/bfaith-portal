@@ -17,6 +17,9 @@ import {
   initAiInsightsTables, newId, nowIso, isYmd, isYm, buildPublicId,
 } from './db.js';
 import { buildWeeklyReportInput, addDaysYmd } from './facts.js';
+import {
+  buildMonthlyReportInput, isYmStrict, monthBounds, previousMonthYm,
+} from './facts-monthly.js';
 
 const ORPHAN_TIMEOUT_MS = 30 * 60 * 1000; // claim後30分無heartbeatで孤児扱い (要件 §8)
 const BUDGET_METRICS = ['sales', 'gross_profit', 'operating_income', 'cash_eom', 'inventory_value'];
@@ -122,6 +125,14 @@ function validatePeriod(reportType, periodStart, periodEnd) {
   if (reportType === 'weekly' && addDaysYmd(periodStart, 7) !== periodEnd) {
     return 'weekly period must be exactly 7 days';
   }
+  if (reportType === 'monthly') {
+    const ym = periodStart.slice(0, 7);
+    if (!isYmStrict(ym)) return 'monthly period_start must be a month start';
+    const bounds = monthBounds(ym);
+    if (periodStart !== bounds.periodStart || periodEnd !== bounds.periodEnd) {
+      return 'monthly period must be exactly one calendar month (1日〜翌月1日排他)';
+    }
+  }
   return null;
 }
 
@@ -135,19 +146,26 @@ export const aiInsightsApiRouter = express.Router();
 aiInsightsApiRouter.get('/report-input', requireAiReadToken, ensureReady, (req, res) => {
   try {
     const type = req.query.type || 'weekly';
-    if (type !== 'weekly') {
-      return res.status(501).json({ error: `report type '${type}' は未実装 (monthly は PR-3)` });
-    }
-    const opts = {};
-    if (req.query.period_start) {
-      if (!isYmd(req.query.period_start)) {
-        return res.status(400).json({ error: 'period_start must be YYYY-MM-DD' });
-      }
-      opts.periodStart = req.query.period_start;
-    }
     const db = getMirrorDB();
-    const input = buildWeeklyReportInput(db, opts);
-    res.json(input);
+    if (type === 'weekly') {
+      const opts = {};
+      if (req.query.period_start) {
+        if (!isYmd(req.query.period_start)) {
+          return res.status(400).json({ error: 'period_start must be YYYY-MM-DD' });
+        }
+        opts.periodStart = req.query.period_start;
+      }
+      return res.json(buildWeeklyReportInput(db, opts));
+    }
+    if (type === 'monthly') {
+      const opts = {};
+      if (req.query.month) {
+        if (!isYmStrict(req.query.month)) return res.status(400).json({ error: 'month must be YYYY-MM' });
+        opts.month = req.query.month;
+      }
+      return res.json(buildMonthlyReportInput(db, opts));
+    }
+    return res.status(400).json({ error: `unknown report type '${type}'` });
   } catch (e) {
     console.error('[ai-insights] report-input error:', e);
     res.status(e.message?.includes('must be a Monday') ? 400 : 500).json({ error: e.message });
@@ -351,6 +369,19 @@ serviceRouter.post('/jobs/:jobId/report', (req, res) => {
         UPDATE ai_report_jobs SET status = 'generated', report_id = ?, input_hash = ?,
           heartbeat_at = ?, updated_at = ? WHERE job_id = ?
       `).run(reportId, b.input_hash || null, now, now, job.job_id);
+      // 月次の確定版 (final / correction-N): 締め行に確定情報を記録し「確定後変更検知」の基準にする
+      if (job.report_type === 'monthly' && job.edition !== 'provisional') {
+        const ym = job.period_start.slice(0, 7);
+        db.prepare(`
+          INSERT OR IGNORE INTO ai_monthly_closing (year_month, status, updated_at) VALUES (?, 'open', ?)
+        `).run(ym, now);
+        db.prepare(`
+          UPDATE ai_monthly_closing
+          SET final_report_id = ?, final_declare_seq = declare_seq,
+              final_pl_hash = ?, change_notified_at = NULL, updated_at = ?
+          WHERE year_month = ?
+        `).run(reportId, b.pl_hash || null, now, ym);
+      }
     })();
   } catch (e) {
     if (/UNIQUE constraint/.test(e.message)) {
@@ -466,7 +497,70 @@ router.get('/api/settings', ensureReady, (req, res) => {
     LEFT JOIN ai_reports r ON r.report_id = j.report_id
     ORDER BY j.updated_at DESC LIMIT 20
   `).all();
-  res.json({ budget, events, sources, reconciliation, recent_jobs: recentJobs });
+  // 月次締め: 直近3ヶ月分 (行が無い月は open として合成)
+  const closingMonths = [0, 1, 2].map((i) => {
+    const [y, m] = previousMonthYm().split('-').map(Number);
+    const t = y * 12 + (m - 1) - i;
+    return `${Math.floor(t / 12)}-${String((t % 12) + 1).padStart(2, '0')}`;
+  });
+  const closingRows = db.prepare(`
+    SELECT * FROM ai_monthly_closing WHERE year_month IN (?, ?, ?)
+  `).all(...closingMonths);
+  const jobsByMonth = db.prepare(`
+    SELECT period_start, edition, status FROM ai_report_jobs WHERE report_type = 'monthly'
+  `).all();
+  const closing = closingMonths.map((ym) => {
+    const row = closingRows.find((r) => r.year_month === ym) || { year_month: ym, status: 'open' };
+    const editions = jobsByMonth
+      .filter((j) => j.period_start === `${ym}-01`)
+      .map((j) => ({ edition: j.edition, status: j.status }));
+    return { ...row, editions };
+  });
+  res.json({ budget, events, sources, reconciliation, recent_jobs: recentJobs, closing });
+});
+
+/**
+ * 月次締めの確定宣言 (要件 §6)。宣言後、次の MF 同期成功のスナップショットで確定版が発行される。
+ * 「確定 = 人間による締め状態の宣言。会計データの完全性保証ではない」(UI にも明記)
+ */
+router.post('/api/closing/:ym/declare', ensureReady, (req, res) => {
+  const ym = req.params.ym;
+  if (!isYmStrict(ym)) return res.status(400).json({ error: 'ym must be YYYY-MM' });
+  if (ym > previousMonthYm()) {
+    return res.status(400).json({ error: '締め宣言できるのは前月以前の月だけです (当月・未来月は不可)' });
+  }
+  const db = getMirrorDB();
+  const now = nowIso();
+  const user = sessionUser(req);
+  db.prepare(`
+    INSERT OR IGNORE INTO ai_monthly_closing (year_month, status, updated_at) VALUES (?, 'open', ?)
+  `).run(ym, now);
+  const r = db.prepare(`
+    UPDATE ai_monthly_closing
+    SET status = 'declared', declare_seq = declare_seq + 1,
+        declared_by = ?, declared_at = ?, updated_at = ?
+    WHERE year_month = ? AND status IN ('open', 'reopened')
+  `).run(user, now, now, ym);
+  if (r.changes !== 1) {
+    const cur = db.prepare('SELECT status FROM ai_monthly_closing WHERE year_month = ?').get(ym);
+    return res.status(409).json({ error: `既に ${cur?.status} 状態です` });
+  }
+  res.json({ ok: true, status: 'declared' });
+});
+
+/** 誤操作時の再オープン。既存確定版は superseded として保持 (再宣言で correction 版が出る) */
+router.post('/api/closing/:ym/reopen', ensureReady, (req, res) => {
+  const ym = req.params.ym;
+  if (!isYmStrict(ym)) return res.status(400).json({ error: 'ym must be YYYY-MM' });
+  const db = getMirrorDB();
+  const now = nowIso();
+  const r = db.prepare(`
+    UPDATE ai_monthly_closing
+    SET status = 'reopened', reopened_by = ?, reopened_at = ?, updated_at = ?
+    WHERE year_month = ? AND status = 'declared'
+  `).run(sessionUser(req), now, now, ym);
+  if (r.changes !== 1) return res.status(409).json({ error: 'declared 状態の月のみ再オープンできます' });
+  res.json({ ok: true, status: 'reopened' });
 });
 
 /**

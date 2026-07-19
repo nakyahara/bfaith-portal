@@ -51,6 +51,23 @@
 | reconciliation_required | ⚙️画面で人間照合が必要 |
 | failed / failed_posting_uncertain | 失敗 (ログ参照) / 投稿成否不明→要照合へ |
 
+## 月次レポート (PR-3)
+
+毎日 9:00 の日次チェック (`run-monthly.bat`) が月次状態機械を進める:
+
+- **毎月10日〜**: 前月が未宣言なら**暫定版**を自動発行 (ヘッダー「月次・暫定」)
+- **確定宣言** (⚙️画面) 後、次のMF同期成功で**確定版**を発行 (「月次・確定」)
+- 再オープン→再宣言後は**訂正版** (「月次・訂正N」)
+- 15日/20日の未宣言リマインダーと確定後変更検知は Render 側 cron
+  (env `AI_INSIGHTS_NOTIFY_ENABLED=true` で有効化)
+
+Task Scheduler 追加登録:
+- トリガー: 毎日 9:00、「スケジュールされた時刻を逃した場合〜」= ON
+- 操作: `C:\tools\ai-insights\run-monthly.bat`
+- その他は週次と同じ (ログインユーザー実行・SYSTEM禁止)
+
+月次の手動実行: `run-monthly.bat --month=YYYY-MM` / プレビュー: `--dry-run`
+
 ## 手動実行・トラブル時
 
 - 特定の週を作り直す: ⚙️画面で対象ジョブを確認してから

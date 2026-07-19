@@ -129,6 +129,29 @@ const SCHEMA_STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_ai_events_date ON ai_events(event_date)`,
 
+  // ── 月次締め状態 (PR-3。要件 §6 の状態機械の「人間宣言」部分) ──
+  // 未締め(open) → 確定宣言(declared) → [誤操作時 reopened → 再宣言で declared]
+  // 暫定版/確定版/訂正版の発行状態は ai_report_jobs/ai_reports (edition) が持つ。
+  // declare_seq: 宣言のたびに +1。確定版発行時の seq (final_declare_seq) より大きければ
+  // 「再オープン→再宣言」なので次の確定は correction 版として発行する
+  `CREATE TABLE IF NOT EXISTS ai_monthly_closing (
+    year_month   TEXT PRIMARY KEY,        -- YYYY-MM
+    status       TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','declared','reopened')),
+    declare_seq  INTEGER NOT NULL DEFAULT 0,
+    declared_by  TEXT,
+    declared_at  TEXT,
+    reopened_by  TEXT,
+    reopened_at  TEXT,
+    final_report_id   TEXT,               -- 確定版 ai_reports.report_id
+    final_declare_seq INTEGER,
+    final_pl_hash     TEXT,               -- 確定版生成時の対象月PLハッシュ (確定後変更検知)
+    change_notified_at TEXT,              -- 「確定後変更あり」通知済みマーカー
+    reminder_15_sent_at TEXT,
+    reminder_20_sent_at TEXT,
+    sync_stall_notified_at TEXT,          -- 宣言後7日MF同期なし警告の通知済みマーカー
+    updated_at   TEXT NOT NULL
+  )`,
+
   // ── 期待データソースマスタ (充足判定の基準。有効期間付き) ──
   // requirement: required=欠損なら縮退/生成なし、conditional=該当論点の生成禁止、reference=参考
   `CREATE TABLE IF NOT EXISTS ai_expected_sources (

@@ -138,8 +138,8 @@ console.log('\n■ 認証 (read token / service token)');
 // ═══ 2. report-input バリデーション ═══
 console.log('\n■ report-input バリデーション');
 {
-  let r = await j('/api/ai-insights/report-input?type=monthly', { headers: READ });
-  ok(r.status === 501, 'monthly → 501 (PR-3)', r);
+  let r = await j('/api/ai-insights/report-input?type=quarterly', { headers: READ });
+  ok(r.status === 400, '未知の type → 400', r);
   r = await j('/api/ai-insights/report-input?period_start=2026-07-07', { headers: READ });
   ok(r.status === 400, '月曜以外の period_start → 400', r);
   r = await j('/api/ai-insights/report-input?period_start=garbage', { headers: READ });
@@ -388,6 +388,115 @@ console.log('\n■ topic_updates スコープ制限');
   // posting へ進まず runner が死んだ想定 (generated のまま)
   r = await post('/api/ai-insights/service/jobs/claim', { ...KEY, period_start: '2026-06-15', period_end: '2026-06-22' }, SVC);
   ok(r.body.result === 'claimed_for_posting' && r.body.report?.body_json, 'generated 再claim → 投稿だけ再開 (report 同梱)', r.body?.result);
+}
+
+// ═══ 6c. 月次 (PR-3): report-input / 締め宣言 / 状態機械 ═══
+console.log('\n■ 月次 report-input + 締め宣言');
+{
+  // MF PL fixture (2026-06、run=success)
+  db.prepare(`
+    INSERT INTO mirror_mf_publish_runs (run_id, scope, status, started_at, finished_at, synced_at)
+    VALUES (900, 'all', 'success', '2026-07-01T00:00:00Z', '2026-07-01T00:10:00Z', '2026-07-01T00:10:00Z')
+  `).run();
+  const insPl = db.prepare(`
+    INSERT INTO mirror_mf_pl_monthly (run_id, month_ym, role_key, amount_excl_tax, tax_amount, line_count, is_realized_only, source_row_hash, synced_at)
+    VALUES (900, ?, ?, ?, 0, 1, 1, 'h', '2026-07-01T00:10:00Z')
+  `);
+  insPl.run('2026-06', 'sales', 10000000);
+  insPl.run('2026-06', 'cogs_purchase', 6000000);
+  insPl.run('2026-06', 'sgae_rent', 1000000);
+
+  let r = await j('/api/ai-insights/report-input?type=monthly&month=2026-13', { headers: READ });
+  ok(r.status === 400, '不正 month → 400', r);
+  r = await j('/api/ai-insights/report-input?type=monthly&month=2026-06', { headers: READ });
+  ok(r.status === 200, '月次 report-input 200', r);
+  const mi = r.body;
+  ok(mi.meta.period_start === '2026-06-01' && mi.meta.period_end === '2026-07-01', '月境界 (排他的)', mi.meta);
+  ok(mi.closing.status === 'open', '未宣言月は open', mi.closing);
+  ok(mi.facts.pl.this_month.sales_yen === 10000000, 'PL 売上 1,000万', mi.facts.pl.this_month);
+  ok(mi.facts.pl.this_month.gross_profit_yen === 4000000 && mi.facts.pl.this_month.operating_income_yen === 3000000,
+    '粗利/営業利益の導出', mi.facts.pl.this_month);
+  ok(typeof mi.pl_hash === 'string' && mi.pl_hash.length === 64, 'pl_hash (確定後変更検知の基準)', mi.pl_hash);
+  ok(mi.budget.available === false, '予算未入力 (月次)', mi.budget);
+
+  // 締め宣言
+  r = await post('/apps/ai-insights/api/closing/2099-01/declare', {});
+  ok(r.status === 400, '未来月の宣言 → 400', r);
+  r = await post('/apps/ai-insights/api/closing/2026-06/declare', {});
+  ok(r.status === 200, '2026-06 確定宣言', r);
+  r = await post('/apps/ai-insights/api/closing/2026-06/declare', {});
+  ok(r.status === 409, '二重宣言 → 409', r);
+  r = await j('/api/ai-insights/report-input?type=monthly&month=2026-06', { headers: READ });
+  ok(r.body.closing.status === 'declared', '宣言後は declared', r.body.closing);
+  ok(r.body.closing.mf_synced_after_declare === false, '宣言後のMF同期はまだ無い', r.body.closing);
+  // 宣言後に新しい MF 同期が来たことにする
+  db.prepare(`
+    INSERT INTO mirror_mf_publish_runs (run_id, scope, status, started_at, finished_at, synced_at)
+    VALUES (901, 'all', 'success', ?, ?, ?)
+  `).run(new Date().toISOString(), new Date().toISOString(), new Date(Date.now() + 1000).toISOString());
+  db.prepare(`
+    INSERT INTO mirror_mf_pl_monthly (run_id, month_ym, role_key, amount_excl_tax, tax_amount, line_count, is_realized_only, source_row_hash, synced_at)
+    SELECT 901, month_ym, role_key, amount_excl_tax, tax_amount, line_count, is_realized_only, source_row_hash, synced_at
+    FROM mirror_mf_pl_monthly WHERE run_id = 900
+  `).run();
+  r = await j('/api/ai-insights/report-input?type=monthly&month=2026-06', { headers: READ });
+  ok(r.body.closing.mf_synced_after_declare === true, '宣言後のMF同期を検知', r.body.closing);
+
+  // 月次 claim: 期間バリデーション
+  const MKEY = { report_type: 'monthly', period_start: '2026-06-01', period_end: '2026-07-01', edition: 'final', claimed_by: 'smoke' };
+  r = await post('/api/ai-insights/service/jobs/claim', { ...MKEY, period_end: '2026-06-30' }, SVC);
+  ok(r.status === 400, '月次: 1ヶ月丁度でない期間 → 400', r);
+  r = await post('/api/ai-insights/service/jobs/claim', MKEY, SVC);
+  ok(r.status === 200 && r.body.result === 'claimed', '月次 final claim', r.body?.result);
+  const mJobId = r.body.job.job_id;
+  r = await post(`/api/ai-insights/service/jobs/${mJobId}/report`, {
+    generation_mode: 'claude', body_json: { summary: '月次テスト' }, topics: [],
+    pl_hash: 'plhash-final-1',
+  }, SVC);
+  ok(r.status === 200 && r.body.public_id === 'MO-202606-f', '月次 final 保存 + public_id', r.body);
+  const closingRow = db.prepare("SELECT * FROM ai_monthly_closing WHERE year_month = '2026-06'").get();
+  ok(closingRow.final_pl_hash === 'plhash-final-1' && closingRow.final_report_id,
+    '確定版保存で closing に pl_hash 記録', closingRow);
+  ok(closingRow.final_declare_seq === closingRow.declare_seq, 'final_declare_seq = 宣言 seq', closingRow);
+
+  // 再オープン → 再宣言 → needs_correction
+  r = await post('/apps/ai-insights/api/closing/2026-06/reopen', {});
+  ok(r.status === 200, '再オープン', r);
+  r = await post('/apps/ai-insights/api/closing/2026-06/declare', {});
+  ok(r.status === 200, '再宣言', r);
+  r = await j('/api/ai-insights/report-input?type=monthly&month=2026-06', { headers: READ });
+  ok(r.body.closing.needs_correction === true, '再宣言後は needs_correction', r.body.closing);
+  r = await post('/api/ai-insights/service/jobs/claim', { ...MKEY, edition: 'correction-next' }, SVC);
+  ok(r.status === 200 && r.body.job.edition === 'correction-1', '月次 correction-next 採番', r.body?.job);
+
+  const settings = await j('/apps/ai-insights/api/settings');
+  ok(Array.isArray(settings.body.closing) && settings.body.closing.length === 3, 'settings に月次締め3ヶ月', settings.body.closing?.length);
+}
+
+// ═══ 6d. notify-job (リマインダー / 確定後変更検知) ═══
+console.log('\n■ notify-job (月次リマインダー)');
+{
+  const { runClosingChecks } = await load('apps/ai-insights/notify-job.js');
+  const posts = [];
+  const post_ = async (text) => posts.push(text);
+  // 2026-08-16 時点 → 前月 2026-07 が未宣言 → 15日リマインダー
+  let sent = await runClosingChecks(db, { today: '2026-08-16', post: post_ });
+  ok(sent.includes('reminder_15'), '15日リマインダー送信', sent);
+  sent = await runClosingChecks(db, { today: '2026-08-16', post: post_ });
+  ok(sent.length === 0, '同日再実行では再送しない', sent);
+  sent = await runClosingChecks(db, { today: '2026-08-21', post: post_ });
+  ok(sent.includes('reminder_20'), '20日リマインダー (文言強め)', sent);
+  ok(posts.length === 2 && posts[1].includes('2回目'), '通知本文', posts.map((p) => p.split('\n')[0]));
+
+  // 確定後変更検知: 2026-06 (final発行済み) の pl_hash を古い値に書き換え → 差分検知
+  db.prepare(`
+    UPDATE ai_monthly_closing SET final_pl_hash = 'stale-hash', status = 'declared', change_notified_at = NULL
+    WHERE year_month = '2026-06'
+  `).run();
+  sent = await runClosingChecks(db, { today: '2026-07-25', post: post_ });
+  ok(sent.includes('post_final_change'), '確定後変更あり → 訂正版候補通知', sent);
+  sent = await runClosingChecks(db, { today: '2026-07-26', post: post_ });
+  ok(!sent.includes('post_final_change'), '変更通知は1回だけ', sent);
 }
 
 // ═══ 7. ⚙️画面 ═══
