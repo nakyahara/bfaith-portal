@@ -90,3 +90,59 @@ export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 't
   );
   return { action: 'created', fileId: created.data.id };
 }
+
+/**
+ * 指定フォルダにサービスアカウントが「書き込み」できるかを非破壊で点検する。
+ * Drive の capabilities.canAddChildren (=このフォルダにファイルを作成できるか) を読むだけで、
+ * 実ファイルは作成/削除しない (Codex Medium: GET で副作用を起こさない・プローブ累積を作らない)。
+ * さらに driveId (共有ドライブ配下か) も併せて判定する。
+ *   ok = true になるのは「共有ドライブ配下」かつ「canAddChildren=true」のときだけ。
+ *   ※ マイドライブ配下フォルダは canAddChildren=true でも SA に容量が無く実保存に失敗するため false 扱い。
+ * go-live 前に「SA がコンテンツ管理者で共有されているか」をブラウザ(GET)から確認する用途。
+ * @param {string} folderId 点検するフォルダID
+ * @returns {Promise<object>} { ok, stage?, isSharedDrive, canAddChildren, driveId, folderName, isFolder, serviceAccountEmail, message? }
+ */
+export async function probeFolderWritable(folderId) {
+  const auth = getDriveAuth();
+  const drive = google.drive({ version: 'v3', auth });
+  const TIMEOUT = 20000;
+  const email = getServiceAccountEmail();
+
+  let meta;
+  try {
+    const r = await drive.files.get(
+      { fileId: folderId,
+        fields: 'id, name, driveId, mimeType, capabilities(canAddChildren, canEdit)',
+        supportsAllDrives: true },
+      { timeout: TIMEOUT }
+    );
+    meta = r.data;
+  } catch (e) {
+    return { ok: false, stage: 'access', isSharedDrive: false, canAddChildren: false,
+      driveId: null, folderName: null, isFolder: false, serviceAccountEmail: email,
+      message: `フォルダにアクセスできません。SA${email ? ` 「${email}」` : ''} に共有されているか確認してください。(詳細: ${e.message})` };
+  }
+
+  const driveId = meta.driveId || null;
+  const isSharedDrive = !!driveId;
+  const isFolder = meta.mimeType === 'application/vnd.google-apps.folder';
+  const canAddChildren = !!(meta.capabilities && meta.capabilities.canAddChildren);
+  const folderName = meta.name || null;
+
+  if (!isFolder) {
+    return { ok: false, stage: 'not_folder', isSharedDrive, canAddChildren, driveId, folderName, isFolder,
+      serviceAccountEmail: email,
+      message: `指定IDはフォルダではありません (mimeType=${meta.mimeType})。フォルダIDを確認してください。` };
+  }
+  if (!canAddChildren) {
+    return { ok: false, stage: 'write', isSharedDrive, canAddChildren, driveId, folderName, isFolder,
+      serviceAccountEmail: email,
+      message: `このフォルダに書き込めません。SA${email ? ` 「${email}」` : ''} を「コンテンツ管理者」以上で招待してください。(詳細: capabilities.canAddChildren=false)` };
+  }
+  if (!isSharedDrive) {
+    return { ok: false, stage: 'not_shared_drive', isSharedDrive, canAddChildren, driveId, folderName, isFolder,
+      serviceAccountEmail: email,
+      message: `このフォルダは共有ドライブ配下ではありません (マイドライブ配下だと SA は容量が無く実保存に失敗します)。共有ドライブ内のフォルダを指定してください。` };
+  }
+  return { ok: true, isSharedDrive, canAddChildren, driveId, folderName, isFolder, serviceAccountEmail: email };
+}
