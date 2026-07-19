@@ -165,6 +165,7 @@ console.log('\n■ 正常系 (claude 生成 → 投稿)');
   ok(text.includes('(WK-20260706-f)'), 'public_id 埋め込み', text.slice(-80));
   ok(text.includes('*1. 楽天売上が前週比+50%*'), '論点タイトル (太字+番号)', null);
   ok(text.includes('*1.5万円*') && text.includes('*1.0万円*'), '金額は万円表記+太字強調', text);
+  ok(!text.includes('**'), 'AI出力に*があっても二重太字にならない', text);
   ok(text.includes('→ ') && text.includes('（中原さん・金曜まで）'), '対応 → 誰・いつまで', null);
   ok(text.includes('\n\n📈 *1.'), '論点は空行区切り+カテゴリアイコン', null);
   ok(!text.includes('全社'), '正常系でも禁止された全社集計は本文に出ない', text);
@@ -207,7 +208,7 @@ console.log('\n■ AI出力の機械検査 (禁止モール言及 / 数字創作
   ok(r.out.includes('禁止領域モール'), '違反理由がログに出る', null);
   reset();
   r = await runRunner({ FAKE_MODE: 'invented' });
-  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い数字 → 棄却 → fallback', r.out.slice(-300));
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い小数 (1.9万円) → 棄却 → fallback (整数部一致では許容しない)', r.out.slice(-300));
   ok(r.out.includes('数字創作の疑い'), '違反理由がログに出る', null);
   reset();
   r = await runRunner({ FAKE_MODE: 'badsummary' });

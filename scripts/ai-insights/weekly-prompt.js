@@ -20,7 +20,8 @@ const CAPS = {
 };
 
 function cap(s, n) {
-  const t = String(s ?? '').trim();
+  // AI出力の '*' は除去 (GChat markdown の太字と衝突して装飾が壊れるため。強調は機械側 boldNumbers が担当)
+  const t = String(s ?? '').replace(/\*/g, '').trim();
   return t.length <= n ? t : `${t.slice(0, n - 1)}…`;
 }
 
@@ -137,7 +138,8 @@ function factsNumberSet(input) {
   const set = new Set();
   for (const m of src.matchAll(/\d+(?:\.\d+)?/g)) {
     set.add(m[0]);
-    if (m[0].includes('.')) set.add(m[0].split('.')[0]); // 50.0 → 50 も許容
+    // 正規化は集合の生成側だけで行う (50.0 → 50 / 1.50 → 1.5)。検査側は完全一致のみ
+    if (m[0].includes('.')) set.add(String(parseFloat(m[0])));
   }
   return set;
 }
@@ -147,7 +149,8 @@ function assertEvidenceNumbers(topic, numberSet, label) {
   for (const m of text.matchAll(/\d+(?:\.\d+)?/g)) {
     const tok = m[0];
     if (tok.replace('.', '').length < 2) continue; // 1桁 (「3個」等) は許容
-    if (!numberSet.has(tok) && !(tok.includes('.') && numberSet.has(tok.split('.')[0]))) {
+    // 完全一致のみ (整数部一致での小数許容はしない — 1.9万円 の創作を通さない)
+    if (!numberSet.has(tok)) {
       throw new Error(`${label} に facts に無い数値 "${tok}" (数字創作の疑い)`);
     }
   }
