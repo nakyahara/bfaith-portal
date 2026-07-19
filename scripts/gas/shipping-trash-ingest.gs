@@ -5,6 +5,9 @@
  *   1. 納品書PDF → Docs 変換でテキスト抽出し、伝票ごとに
  *      出荷伝票NO (SPxxx) / 管理番号 / モール注文番号 をパース
  *   2. Render (bfaith-portal) の POST /apps/shipping-log/api/ingest へ送信
+ *   2.5. ピッキングリストPDF → 総合計/ページ内合計を検算付きで抽出し
+ *        POST /apps/shipping-log/api/ingest-picking へ送信 (付加情報。
+ *        失敗しても伝票取込は成立扱いだが、証跡保全のためピッキングPDFのみ隔離)
  *   3. 完全成功 → ファイルをゴミ箱へ / 失敗 → ルート直下の「_要確認」へ隔離移動
  *
  * ★出荷_XX フォルダは毎晩必ず空になる★ (成功=ゴミ箱、失敗=隔離)。
@@ -75,22 +78,26 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
 
   var result = { name: batchName, files: files.length, slips: 0, status: "" };
   var failReason = null;
+  // ピッキングリストPDF (伝票とは独立に処理。失敗時はこのPDFのみ隔離し伝票削除は止めない)
+  var pickingAllFiles = files.filter(function (f) {
+    return /ピッキングリスト/.test(f.getName()) && f.getMimeType() === "application/pdf";
+  });
+  var pickingFail = null;
+  var pickingNote = "";
   try {
     var invoices = files.filter(function (f) {
       return /納品書/.test(f.getName()) && f.getMimeType() === "application/pdf";
     });
-    // 同名・同サイズの納品書PDFは同一内容の複製 (過去の変換ジャンク・二重アップロード) と
+    // 同名・同内容 (md5) の納品書PDFは複製 (過去の変換ジャンク・二重アップロード) と
     // みなし1つに絞る (2026-07-18: Drive APIがv3だった時期の実行が元と同名のPDFコピーを
-    // 残しており、全バッチが「2ファイル×同一伝票」で重複検出になった)
-    var seenInvoiceKey = {};
-    invoices = invoices.filter(function (f) {
-      var k = f.getName() + "::" + f.getSize();
-      if (seenInvoiceKey[k]) return false;
-      seenInvoiceKey[k] = true;
-      return true;
-    });
+    // 残しており、全バッチが「2ファイル×同一伝票」で重複検出になった)。
+    // 同名でも内容が異なれば両方処理され、伝票番号重複の検出で隔離へ倒れる (Codex R2 medium)
+    invoices = dedupeByContent_(invoices);
     var rows = [];
-    if (invoices.length === 0) {
+    if (invoices.length === 0 && pickingAllFiles.length > 0) {
+      // ピッキングPDFのみ残存 (隔離リトライで伝票は取込済み・ピッキングだけ失敗したケース)
+      // → 伝票フェーズはスキップして下のピッキングフェーズだけ実行
+    } else if (invoices.length === 0) {
       failReason = "納品書PDFなし(誤配置?)";
     } else {
       var incomplete = [];
@@ -116,7 +123,7 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
       }
     }
 
-    if (!failReason) {
+    if (!failReason && rows.length > 0) {
       var payload = {
         run_id: runId,
         folder: batchName,
@@ -139,23 +146,48 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
     failReason = e.message;
   }
 
+  // ── ピッキングリストフェーズ (伝票フェーズが成立した場合のみ。失敗時は当該PDFだけ隔離) ──
+  if (!failReason && pickingAllFiles.length > 0) {
+    var pk = ingestPickingLists_(pickingAllFiles, batchName, shipDate, cfg, runId);
+    pickingFail = pk.fail;
+    pickingNote = pk.note;
+  } else if (!failReason) {
+    pickingNote = "ピッキングリストなし";
+  }
+
   // ── 後始末: 出荷_XX を必ず空にする (成功=ゴミ箱 / 失敗=隔離移動)。DRY_RUN は何もしない ──
   if (cfg.dryRun) {
     result.status = failReason
       ? "dry-run NG: " + failReason + " (本番なら隔離)"
-      : "dry-run OK: " + result.slips + "伝票送信 (本番なら削除)";
+      : pickingFail
+        ? "dry-run NG: 伝票OK(" + result.slips + "件) / ピッキングNG: " + pickingFail + " (本番ならPDFのみ隔離)"
+        : "dry-run OK: " + result.slips + "伝票送信 / " + pickingNote + " (本番なら削除)";
     return result;
   }
   if (!failReason) {
-    var t = trashFiles_(files, quarantine, runId, result.name);
+    var filesToTrash = files;
+    var pickingInfo = pickingNote ? " / " + pickingNote : "";
+    if (pickingFail) {
+      // ピッキングPDFのみ隔離して証跡保全。サブフォルダ名は通常隔離と同形式にして
+      // 翌晩の retryQuarantine_ に乗せる (納品書なし+ピッキングありの分岐で再処理される)
+      var pickIds = {};
+      pickingAllFiles.forEach(function (f) { pickIds[f.getId()] = true; });
+      var asideInfo = quarantine
+        ? moveAllToQuarantine_(pickingAllFiles, quarantine, runId, batchName)
+        : "隔離サブフォルダに残置 (翌晩リトライ)";
+      filesToTrash = files.filter(function (f) { return !pickIds[f.getId()]; });
+      pickingInfo = " / ★ピッキングNG: " + pickingFail + " → " + asideInfo;
+    }
+    var t = trashFiles_(filesToTrash, quarantine, runId, result.name);
     if (t.quarantined.length === 0 && t.left.length === 0) {
-      result.status = "ok: " + result.slips + "伝票送信→" + files.length + "ファイル削除";
+      result.status = (pickingFail ? "warn: " : "ok: ") +
+        result.slips + "伝票送信→" + filesToTrash.length + "ファイル削除" + pickingInfo;
     } else {
       // 送信済みなのでデータは安全。ファイルの行き先を正確に報告する (隔離済みと残置は別物)
       var parts = [];
       if (t.quarantined.length > 0) parts.push("隔離: " + t.quarantined.join(", "));
       if (t.left.length > 0) parts.push("★フォルダに残置 (要手動削除): " + t.left.join(", "));
-      result.status = "warn: 送信済みだが削除失敗 → " + parts.join(" / ");
+      result.status = "warn: 送信済みだが削除失敗 → " + parts.join(" / ") + pickingInfo;
     }
   } else if (quarantine) {
     var movedInfo = moveAllToQuarantine_(files, quarantine, runId, result.name);
@@ -165,6 +197,128 @@ function processBatch_(folder, batchName, shipDate, cfg, quarantine, runId) {
     result.status = "error(隔離継続): " + failReason;
   }
   return result;
+}
+
+/**
+ * ピッキングリストPDF群を抽出→POST /ingest-picking。伝票フェーズ成功後にのみ呼ばれる。
+ * 失敗は { fail } で返し、呼び出し側が当該PDFのみ隔離する (伝票の削除は妨げない)。
+ */
+function ingestPickingLists_(pickingFilesAll, batchName, shipDate, cfg, runId) {
+  try {
+    // 同名・同内容 (md5) の複製は1つに絞る。同名で内容が異なる場合は両方送られ、
+    // サーバ側の source_file 重複 400 → 隔離 (安全側)
+    var picks = dedupeByContent_(pickingFilesAll);
+    var rows = picks.map(function (f) {
+      var ex = parsePickingText_(ocrPdfText_(f));
+      return {
+        source_file: f.getName(),
+        total_qty: ex.totalQty,
+        pages: ex.pages,
+        page_totals: ex.pageTotals,
+        work_date_on_list: ex.workDate,
+        printed_at: ex.printedAt,
+      };
+    });
+    var resp = UrlFetchApp.fetch(cfg.base + "/ingest-picking", {
+      method: "post",
+      contentType: "application/json",
+      headers: { Authorization: "Bearer " + cfg.token },
+      payload: JSON.stringify({
+        run_id: runId,
+        folder: batchName,
+        ship_date: shipDate,
+        extracted_at: Utilities.formatDate(new Date(), "Asia/Tokyo", "yyyy-MM-dd HH:mm:ss"),
+        rows: rows,
+      }),
+      muteHttpExceptions: true,
+    });
+    var code = resp.getResponseCode();
+    var body = null;
+    try { body = JSON.parse(resp.getContentText()); } catch (e) { /* 下で non-JSON として扱う */ }
+    if (code !== 200 || !body || body.ok !== true || (body.inserted + body.ignored) !== rows.length) {
+      return { fail: "ingest-picking HTTP " + code + " " + resp.getContentText().slice(0, 200), note: "" };
+    }
+    var totalSum = rows.reduce(function (a, r) { return a + r.total_qty; }, 0);
+    return { fail: null, note: "ピッキング合計" + totalSum + "個" + (rows.length > 1 ? " (" + rows.length + "リスト)" : "") };
+  } catch (e) {
+    return { fail: e.message, note: "" };
+  }
+}
+
+/**
+ * トータルピッキングリストのOCRテキストから総合計・ページ内合計を抽出する。
+ *
+ * OCRの癖 (2026-07-19 実測): 「総合計」の値Tと「ページ内合計」の値pが各ページで
+ * 連結トークン「Tp」として出る (例: 総合計67・各ページ35/31/1 → "6735","6731","671")。
+ * → 全ページ共通の prefix P で、suffix (ページ内合計) の総和が P に一致する分割を探す。
+ *   解が一意でなければ throw (誤った合計を保存するより隔離→人手確認を選ぶ)。
+ * @returns {{ totalQty: number, pages: number, pageTotals: number[], workDate: string|null, printedAt: string|null }}
+ */
+function parsePickingText_(text) {
+  var pages = (text.match(/ページ内合計/g) || []).length;
+  if (pages === 0) throw new Error("ピッキングリスト形式でない (『ページ内合計』が見つからない)");
+
+  var tokens = text.match(/\d+/g) || [];
+  var byPrefix = {}; // P (総合計候補) -> [ページ内合計候補,...]
+  tokens.forEach(function (t) {
+    // 合計トークンは 総合計(≤4桁) + ページ内合計(≤4桁) の連結。長いトークン (JAN等) は対象外。
+    // 先頭0は総合計にもページ内合計にも現れないので棄却 (ロケーション断片 "003" 等を排除)
+    if (t.length < 2 || t.length > 8 || t.charAt(0) === "0") return;
+    for (var pl = 1; pl < t.length && pl <= 4; pl++) {
+      var s = t.slice(pl);
+      if (s.charAt(0) === "0") continue;
+      var P = t.slice(0, pl);
+      (byPrefix[P] = byPrefix[P] || []).push(parseInt(s, 10));
+    }
+  });
+  var solutions = [];
+  Object.keys(byPrefix).forEach(function (P) {
+    var sufs = byPrefix[P];
+    if (sufs.length !== pages) return;             // 合計トークンはページ数と同数のはず
+    var sum = sufs.reduce(function (a, b) { return a + b; }, 0);
+    if (sum === parseInt(P, 10)) solutions.push({ total: parseInt(P, 10), pageTotals: sufs });
+  });
+  if (solutions.length !== 1) {
+    throw new Error("ピッキング総合計を特定できず (検算が通る分割が" + solutions.length + "通り、" + pages + "ページ)");
+  }
+
+  // 出力日時 (日付+時刻の並び)。作業日は最頻出の日付を採用 (賞味期限等の紛れ込み対策)、
+  // タイなら null (参考値なので誤値より欠損を選ぶ)
+  var pm = text.match(/(\d{4}\/\d{2}\/\d{2}) (\d{2}:\d{2}:\d{2})/);
+  var printedAt = pm ? pm[1].replace(/\//g, "-") + " " + pm[2] : null;
+  var counts = {};
+  (text.match(/\d{4}\/\d{2}\/\d{2}/g) || []).forEach(function (d) { counts[d] = (counts[d] || 0) + 1; });
+  var best = null, bestN = 0, tie = false;
+  Object.keys(counts).forEach(function (d) {
+    if (counts[d] > bestN) { best = d; bestN = counts[d]; tie = false; }
+    else if (counts[d] === bestN) tie = true;
+  });
+  var workDate = best && !tie ? best.replace(/\//g, "-") : null;
+
+  return {
+    totalQty: solutions[0].total,
+    pages: pages,
+    pageTotals: solutions[0].pageTotals,
+    workDate: workDate,
+    printedAt: printedAt,
+  };
+}
+
+/** 動作確認用: 指定フォルダ (省略時 出荷_01) のピッキングリストを抽出してログに出す。削除・送信しない */
+function debugPickingPreview(folderName) {
+  var root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  var it = root.getFoldersByName(folderName || "出荷_01");
+  if (!it.hasNext()) { Logger.log("フォルダなし"); return; }
+  var files = it.next().getFiles();
+  while (files.hasNext()) {
+    var f = files.next();
+    if (!/ピッキングリスト/.test(f.getName()) || f.getMimeType() !== "application/pdf") continue;
+    try {
+      Logger.log(f.getName() + " → " + JSON.stringify(parsePickingText_(ocrPdfText_(f))));
+    } catch (e) {
+      Logger.log(f.getName() + " → 抽出失敗: " + e.message);
+    }
+  }
 }
 
 /**
@@ -258,25 +412,7 @@ function verifyIngestResponse_(resp, sentCount, folderName) {
  * @returns {{ expected: number, fusionBlocks: number, slips: Array<{slipNo,mgmtNo,mallOrderNo}> }}
  */
 function extractSlipsFromPdf_(pdfFile) {
-  var tempDoc = Drive.Files.copy(
-    { title: "_tmp_" + pdfFile.getName() },
-    pdfFile.getId(),
-    { convert: true, ocr: true, ocrLanguage: "ja", supportsAllDrives: true }
-  );
-  var text;
-  try {
-    text = DocumentApp.openById(tempDoc.id).getBody().getText();
-  } finally {
-    // 後片付けは「ゴミ箱行き」にする。files.delete (完全削除) は共有ドライブでは
-    // 管理者権限が必要で、コンテンツ管理者だと File not found 相当で拒否される (2026-07-18 実測)。
-    // ゴミ箱なら作成者権限で可能、30日で自動消滅する。
-    try {
-      DriveApp.getFileById(tempDoc.id).setTrashed(true);
-    } catch (e) {
-      // 万一ゴミ箱行きも失敗しても抽出は続行 (_tmp_ 名の一時Docが残るだけで実害なし)
-      Logger.log("一時Docのゴミ箱移動失敗: " + tempDoc.id + " " + e.message);
-    }
-  }
+  var text = ocrPdfText_(pdfFile);
 
   // OCR変換ではレイアウト都合で1伝票が複数ブロックに割れる (「納品書」の語が
   // 伝票あたり2回出る等、2026-07-18 DRY-RUN実測)。同一SP番号のブロックはマージし、
@@ -310,6 +446,56 @@ function extractSlipsFromPdf_(pdfFile) {
   // 全文の distinct SP番号数が「この納品書に存在する伝票数」の正。マージ後と一致しなければ不完全
   var allSlipNos = distinct_(text.match(/SP\d{8,14}/g) || []);
   return { expected: allSlipNos.length, fusionBlocks: fusionBlocks, slips: slips };
+}
+
+/** Drive API v2 の md5Checksum で内容同一性を判定。取れない場合は null (=複製と断定しない) */
+function fileMd5_(f) {
+  try {
+    var meta = Drive.Files.get(f.getId(), { supportsAllDrives: true });
+    if (meta && meta.md5Checksum) return meta.md5Checksum;
+  } catch (e) { /* null を返して呼び出し側で「複製扱いしない」に倒す */ }
+  return null;
+}
+
+/**
+ * 同名・同内容 (md5) のPDF複製を1つに絞る共通ヘルパー。
+ * md5 が取れないファイルは複製と断定できないため除外しない (Codex R2 medium:
+ * サイズ代用だと同名同サイズ異内容を取りこぼしたまま削除しうる)。
+ * 除外しなかった同名ファイルは抽出側の重複検出 (伝票番号重複 / source_file 重複 400)
+ * に引っかかり隔離へ倒れる = 安全側。
+ */
+function dedupeByContent_(files) {
+  var seen = {};
+  return files.filter(function (f) {
+    var md5 = fileMd5_(f);
+    if (!md5) return true;
+    var k = f.getName() + "::" + md5;
+    if (seen[k]) return false;
+    seen[k] = true;
+    return true;
+  });
+}
+
+/** PDF → 一時Docs変換 (OCR) → 全文テキスト。納品書・ピッキングリスト共通 */
+function ocrPdfText_(pdfFile) {
+  var tempDoc = Drive.Files.copy(
+    { title: "_tmp_" + pdfFile.getName() },
+    pdfFile.getId(),
+    { convert: true, ocr: true, ocrLanguage: "ja", supportsAllDrives: true }
+  );
+  try {
+    return DocumentApp.openById(tempDoc.id).getBody().getText();
+  } finally {
+    // 後片付けは「ゴミ箱行き」にする。files.delete (完全削除) は共有ドライブでは
+    // 管理者権限が必要で、コンテンツ管理者だと File not found 相当で拒否される (2026-07-18 実測)。
+    // ゴミ箱なら作成者権限で可能、30日で自動消滅する。
+    try {
+      DriveApp.getFileById(tempDoc.id).setTrashed(true);
+    } catch (e) {
+      // 万一ゴミ箱行きも失敗しても抽出は続行 (_tmp_ 名の一時Docが残るだけで実害なし)
+      Logger.log("一時Docのゴミ箱移動失敗: " + tempDoc.id + " " + e.message);
+    }
+  }
 }
 
 /** モール注文番号: Amazon (AES prefix) / 楽天形式。他モールは dry-run で実物確認して追加する */

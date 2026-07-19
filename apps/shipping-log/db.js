@@ -45,6 +45,56 @@ export function ensureSchema() {
       CREATE TRIGGER IF NOT EXISTS trg_sl_slips_no_delete
         BEFORE DELETE ON sl_shipping_slips
         BEGIN SELECT RAISE(ABORT, 'sl_shipping_slips is append-only (DELETE forbidden)'); END;
+
+      -- ピッキングリストPDF (トータルピッキングリスト) のバッチ合計。
+      -- 粒度はPDFファイル単位 (通常1フォルダ1枚)。PK に ship_date を含めるのは
+      -- 同名フォルダ (出荷_XX) が毎日使い回されるため。total_qty は GAS 側で
+      -- 「全ページ共通prefix + ページ内合計の総和一致」の検算を通った値のみ受け取り、
+      -- サーバ側でも page_totals との一致を再検証する (誤値の恒久保存を二重に防ぐ)。
+      CREATE TABLE IF NOT EXISTS sl_picking_batches (
+        ship_date TEXT NOT NULL,          -- 取込日 (JST。sl_shipping_slips.ship_date と同じ値で JOIN 可能)
+        folder_name TEXT NOT NULL,        -- 出荷_XX (バッチ)
+        source_file TEXT NOT NULL,        -- 抽出元 ピッキングリストPDF ファイル名
+        total_qty INTEGER NOT NULL,       -- ピッキング総合計 (検算済み)
+        pages INTEGER NOT NULL,           -- ページ数
+        page_totals TEXT NOT NULL,        -- ページ内合計の JSON 配列 (検算の内訳)
+        work_date_on_list TEXT,           -- リスト記載の作業日 (OCR抽出、参考値)
+        printed_at TEXT,                  -- リスト記載の出力日時 (OCR抽出、参考値)
+        run_id TEXT NOT NULL,             -- GAS 実行ID (provenance)
+        extracted_at TEXT,                -- GAS 側抽出時刻 (JST文字列)
+        received_at TEXT NOT NULL,        -- サーバ受信時刻 (UTC ISO)
+        PRIMARY KEY (ship_date, folder_name, source_file)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sl_picking_ship_date ON sl_picking_batches(ship_date);
+      CREATE TRIGGER IF NOT EXISTS trg_sl_picking_no_update
+        BEFORE UPDATE ON sl_picking_batches
+        BEGIN SELECT RAISE(ABORT, 'sl_picking_batches is append-only (UPDATE forbidden)'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_sl_picking_no_delete
+        BEFORE DELETE ON sl_picking_batches
+        BEGIN SELECT RAISE(ABORT, 'sl_picking_batches is append-only (DELETE forbidden)'); END;
+
+      -- Notion出荷カードの担当者スナップショット (作業日×バッチ)。
+      -- Notion側の状態のミラーなので append-only にはしない (伝票と性格が違う)。
+      -- 更新方針は upsertStaffRows 参照 (使い回しカード=COALESCE保護 / 日別カード=作業日単位置換)
+      CREATE TABLE IF NOT EXISTS sl_batch_staff (
+        work_date TEXT NOT NULL,          -- 作業日 (JST。sl_shipping_slips.ship_date と JOIN)
+        batch_no TEXT NOT NULL,           -- 出荷_XX に正規化 (folder_name と JOIN)
+        packer TEXT,                      -- 梱包担当者 (複数は「、」区切り)
+        picker TEXT,                      -- ピッキング担当者 (任意)
+        card_status TEXT,                 -- カードのステータス (任意)
+        notion_page_id TEXT,
+        props_summary TEXT,               -- プロパティ要約JSON (マッピング調整・デバッグ用)
+        synced_at TEXT NOT NULL,
+        PRIMARY KEY (work_date, batch_no)
+      );
+
+      -- 突合ビュー: どの伝票を誰が梱包したか (伝票 × 担当者スナップショット)
+      CREATE VIEW IF NOT EXISTS v_sl_slips_staff AS
+      SELECT s.slip_no, s.ship_date, s.folder_name, s.mgmt_no, s.mall_order_no,
+             st.packer, st.picker, st.card_status
+      FROM sl_shipping_slips s
+      LEFT JOIN sl_batch_staff st
+        ON st.work_date = s.ship_date AND st.batch_no = s.folder_name;
     `);
     schemaReady = true;
     schemaError = null;
@@ -139,6 +189,88 @@ export function ingestFolderSlips(p) {
   return tx(p.rows);
 }
 
+/**
+ * 1フォルダ分のピッキングリスト合計を冪等 INSERT する。
+ * 冪等性は sl_shipping_slips と同型: PK 一致 + 業務内容一致 → ignored、
+ * 内容不一致 (total_qty / pages / page_totals が異なる) → conflict (409、削除させない)。
+ * @param {{ runId: string, folderName: string, shipDate: string, extractedAt: string|null,
+ *           rows: Array<{ source_file: string, total_qty: number, pages: number,
+ *                         page_totals: number[], work_date_on_list?: string|null, printed_at?: string|null }> }} p
+ * @returns {{ inserted: number, ignored: number,
+ *             conflicts: Array<{ source_file: string, existing_total_qty: number, existing_page_totals: string }> }}
+ */
+export function ingestPickingBatches(p) {
+  const db = requireSchema();
+  const receivedAt = new Date().toISOString();
+  const insertStmt = db.prepare(`
+    INSERT INTO sl_picking_batches
+      (ship_date, folder_name, source_file, total_qty, pages, page_totals,
+       work_date_on_list, printed_at, run_id, extracted_at, received_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const selectStmt = db.prepare(`
+    SELECT total_qty, pages, page_totals FROM sl_picking_batches
+    WHERE ship_date = ? AND folder_name = ? AND source_file = ?
+  `);
+
+  const tx = db.transaction((rows) => {
+    let inserted = 0;
+    let ignored = 0;
+    const conflicts = [];
+    for (const r of rows) {
+      const pageTotalsJson = JSON.stringify(r.page_totals);
+      try {
+        insertStmt.run(
+          p.shipDate, p.folderName, r.source_file, r.total_qty, r.pages, pageTotalsJson,
+          r.work_date_on_list || null, r.printed_at || null,
+          p.runId, p.extractedAt || null, receivedAt
+        );
+        inserted++;
+      } catch (e) {
+        if (e && String(e.code || '').startsWith('SQLITE_CONSTRAINT')) {
+          const existing = selectStmt.get(p.shipDate, p.folderName, r.source_file);
+          if (existing && existing.total_qty === r.total_qty && existing.pages === r.pages
+              && existing.page_totals === pageTotalsJson) {
+            ignored++; // 再送 (内容一致) → 冪等
+          } else {
+            conflicts.push({
+              source_file: r.source_file,
+              existing_total_qty: existing ? existing.total_qty : null,
+              existing_page_totals: existing ? existing.page_totals : null,
+            });
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
+    return { inserted, ignored, conflicts };
+  });
+  return tx(p.rows);
+}
+
+/**
+ * 日付範囲 export (miniPC daily-sync の吸い上げ用。read-only token 前提)。
+ * ship_date が [from, to] (両端含む) の伝票行とピッキング行をまとめて返す。
+ */
+export function exportRange(from, to) {
+  const db = requireSchema();
+  const slips = db.prepare(`
+    SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, extracted_at, received_at
+    FROM sl_shipping_slips
+    WHERE ship_date >= ? AND ship_date <= ?
+    ORDER BY ship_date, folder_name, slip_no
+  `).all(from, to);
+  const picking = db.prepare(`
+    SELECT ship_date, folder_name, source_file, total_qty, pages, page_totals,
+           work_date_on_list, printed_at, run_id, extracted_at, received_at
+    FROM sl_picking_batches
+    WHERE ship_date >= ? AND ship_date <= ?
+    ORDER BY ship_date, folder_name, source_file
+  `).all(from, to);
+  return { slips, picking };
+}
+
 /** 直近の伝票行 (動作確認・突合ジョブ用) */
 export function recentSlips(limit) {
   const db = requireSchema();
@@ -147,6 +279,79 @@ export function recentSlips(limit) {
     SELECT slip_no, ship_date, folder_name, mgmt_no, mall_order_no, source_file, run_id, received_at
     FROM sl_shipping_slips
     ORDER BY received_at DESC, slip_no
+    LIMIT ?
+  `).all(n);
+}
+
+/**
+ * Notion出荷カードの担当者スナップショットを upsert する (notion-staff.js 専用)。
+ *
+ * preserveNonNull (既定 true) = 使い回しカード運用 (日付プロパティなし) 用:
+ *   COALESCE upsert で「一度取れた値を後続の NULL で潰さない」(夕方の同期後にカードが
+ *   翌日用にリセットされても取得済みの実績を保持する)。
+ * preserveNonNull=false = 日別カード運用 (作業日プロパティ明示) 用:
+ *   カードがその日の正なので、取得できた作業日ごとに delete→insert で置換する
+ *   (空欄への訂正・出荷No/日付の付け替え・カード削除もミラーに反映される — Codex medium ×2)。
+ *   取得結果に現れない過去の作業日は触らない = カードがアーカイブされても履歴は残る。
+ * @param {Array<{ work_date: string, batch_no: string, packer: string|null, picker: string|null,
+ *                 card_status: string|null, notion_page_id: string, props_summary: string }>} rows
+ * @returns {number} 書き込み行数
+ */
+export function upsertStaffRows(rows, { preserveNonNull = true } = {}) {
+  const db = requireSchema();
+  const now = new Date().toISOString();
+  const insertSql = `
+    INSERT INTO sl_batch_staff
+      (work_date, batch_no, packer, picker, card_status, notion_page_id, props_summary, synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+  const stmt = preserveNonNull
+    ? db.prepare(`${insertSql}
+        ON CONFLICT(work_date, batch_no) DO UPDATE SET
+          packer = COALESCE(excluded.packer, packer),
+          picker = COALESCE(excluded.picker, picker),
+          card_status = COALESCE(excluded.card_status, card_status),
+          notion_page_id = excluded.notion_page_id,
+          props_summary = excluded.props_summary,
+          synced_at = excluded.synced_at`)
+    : db.prepare(insertSql);
+  const deleteByDate = db.prepare('DELETE FROM sl_batch_staff WHERE work_date = ?');
+
+  const tx = db.transaction((rs) => {
+    if (!preserveNonNull) {
+      for (const d of new Set(rs.map((r) => r.work_date))) deleteByDate.run(d);
+    }
+    let n = 0;
+    for (const r of rs) {
+      stmt.run(r.work_date, r.batch_no, r.packer, r.picker, r.card_status,
+        r.notion_page_id, r.props_summary, now);
+      n++;
+    }
+    return n;
+  });
+  return tx(rows);
+}
+
+/** 直近の担当者スナップショット (動作確認用) */
+export function recentStaff(limit) {
+  const db = requireSchema();
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return db.prepare(`
+    SELECT work_date, batch_no, packer, picker, card_status, notion_page_id, synced_at
+    FROM sl_batch_staff
+    ORDER BY work_date DESC, batch_no
+    LIMIT ?
+  `).all(n);
+}
+
+/** 直近のピッキング合計行 (動作確認用) */
+export function recentPicking(limit) {
+  const db = requireSchema();
+  const n = Math.min(Math.max(Number(limit) || 50, 1), 500);
+  return db.prepare(`
+    SELECT ship_date, folder_name, source_file, total_qty, pages, page_totals,
+           work_date_on_list, printed_at, run_id, received_at
+    FROM sl_picking_batches
+    ORDER BY received_at DESC, folder_name, source_file
     LIMIT ?
   `).all(n);
 }
