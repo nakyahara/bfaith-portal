@@ -386,9 +386,44 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_received ON sync_run_chunks(entity, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_scope ON sync_run_chunks(entity, scope_from, scope_to)');
 
+  // ---- 構造監査 H-4 (2026-07-19): multi-chunk sync の staging 化
+  // date_range clear の multi-chunk run は、chunk 毎に live 表へ apply せず一旦ここに溜め、
+  // 全 chunk 到着時に「scope DELETE → 一括 INSERT」を単一 tx で実行する。
+  // (従来は第1chunk で DELETE → chunk 毎 INSERT のため、途中失敗で「clear済+部分データ」が
+  //  翌朝まで mirror 直読み画面に露出していた)
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_stage_rows (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    chunk_index       INTEGER NOT NULL,
+    row_idx           INTEGER NOT NULL,
+    row_json          TEXT NOT NULL,
+    PRIMARY KEY (run_id, entity, chunk_index, row_idx)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ssr_entity ON sync_stage_rows(entity)');
+  // 先頭 chunk の meta.clear_dates を apply 時 (最終 chunk) まで持ち越す
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_stage_meta (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    clear_dates_json  TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (run_id, entity)
+  )`);
+  // staged run の apply 済みマーカー (chunk 再送 replay で apply を二重実行しないため)
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_run_applied (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    applied_at        TEXT NOT NULL,
+    cleared_rows      INTEGER NOT NULL,
+    applied_rows      INTEGER NOT NULL,
+    PRIMARY KEY (run_id, entity)
+  )`);
+
   // MF Phase 1a (Codex review #88 反映): finalize cross-check 用に
   // 親 mf_publish_runs.run_id を ledger に記録 (NULL=非MF entity、Amazon/Rakuten 既存 row は NULL のまま)
   addColumnIfMissing('sync_run_chunks', 'mf_source_run_id', 'INTEGER');
+  // H-4: この chunk が staging 経路で受信されたか (1=staged)。stage coverage 判定の正
+  // (sync_stage_rows の行数だと row_count=0 の空 chunk を「stage 欠落」と誤判定する)
+  addColumnIfMissing('sync_run_chunks', 'staged', 'INTEGER');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_mf_source_run ON sync_run_chunks(mf_source_run_id) WHERE mf_source_run_id IS NOT NULL');
 
   // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)

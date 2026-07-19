@@ -219,18 +219,12 @@ async function fetchSetProducts() {
 
   const fields = 'set_goods_id,set_goods_name,set_goods_selling_price,set_goods_detail_goods_id,set_goods_detail_quantity,set_goods_representation_id';
 
-  // 全件洗い替え
-  db.exec('DELETE FROM raw_ne_set_products');
-
-  const stmt = db.prepare(`
-    INSERT OR REPLACE INTO raw_ne_set_products (
-      セット商品コード, セット商品名, セット販売価格,
-      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
-    ) VALUES (?,?,?,?,?,?,?,?)
-  `);
-
+  // 全ページを先にメモリへ取得してから、DELETE + INSERT を単一トランザクションで実行する。
+  // DELETE を先に commit してからページ毎に挿入すると、途中の API エラー / 親 timeout kill で
+  // raw_ne_set_products が空 or 部分状態のまま残り、下流の m_products rebuild が
+  // セット商品を単品扱いで通してしまう (2026-07-19 構造監査 H-1)。
+  const allItems = [];
   let offset = 0;
-  let total = 0;
   const LIMIT = 1000;
 
   while (true) {
@@ -242,32 +236,55 @@ async function fetchSetProducts() {
 
     const items = data.data || [];
     if (items.length === 0) break;
+    allItems.push(...items);
 
-    const tx = db.transaction(() => {
-      for (const item of items) {
-        const setCode = (item.set_goods_id || '').toLowerCase();
-        const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
-        if (!setCode || !childCode) continue;
-        stmt.run(
-          setCode,
-          item.set_goods_name || '',
-          parseFloat(item.set_goods_selling_price) || 0,
-          childCode,
-          parseInt(item.set_goods_detail_quantity) || 1,
-          0,  // セット在庫数（APIでは取得不可、stock APIが必要）
-          (item.set_goods_representation_id || '').toLowerCase(),
-          ts
-        );
-        total++;
-      }
-    });
-    tx();
-
-    console.log(`[NE] セット商品: ${total}件取得 (offset: ${offset})`);
+    console.log(`[NE] セット商品: ${allItems.length}件取得 (offset: ${offset})`);
     offset += LIMIT;
 
     if (items.length < LIMIT) break;
   }
+
+  // tx 前に有効行へ正規化。「API は要素を返すが必須キーが全滅」(仕様変更等) でも
+  // 空 commit しないよう、有効行 0 件 + 既存データありなら洗い替えせず中断 (全消し防止)
+  const validRows = [];
+  for (const item of allItems) {
+    const setCode = (item.set_goods_id || '').toLowerCase();
+    const childCode = (item.set_goods_detail_goods_id || '').toLowerCase();
+    if (!setCode || !childCode) continue;
+    validRows.push([
+      setCode,
+      item.set_goods_name || '',
+      parseFloat(item.set_goods_selling_price) || 0,
+      childCode,
+      parseInt(item.set_goods_detail_quantity) || 1,
+      0,  // セット在庫数（APIでは取得不可、stock APIが必要）
+      (item.set_goods_representation_id || '').toLowerCase(),
+      ts,
+    ]);
+  }
+  if (validRows.length === 0) {
+    const cur = db.prepare('SELECT COUNT(*) AS c FROM raw_ne_set_products').get().c;
+    if (cur > 0) {
+      throw new Error(`セット商品 API の有効行が 0 件 (raw ${allItems.length} 件 / 現行 ${cur} 件保持)。全消し回避のため洗い替えを中断`);
+    }
+  }
+
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO raw_ne_set_products (
+      セット商品コード, セット商品名, セット販売価格,
+      商品コード, 数量, セット在庫数, 代表商品コード, synced_at
+    ) VALUES (?,?,?,?,?,?,?,?)
+  `);
+
+  let total = 0;
+  const tx = db.transaction(() => {
+    db.exec('DELETE FROM raw_ne_set_products');
+    for (const row of validRows) {
+      stmt.run(...row);
+      total++;
+    }
+  });
+  tx();
 
   updateSyncMeta('ne_api_setproducts_last', now());
   updateSyncMeta('ne_api_setproducts_count', String(total));
