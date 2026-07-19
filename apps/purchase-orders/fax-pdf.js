@@ -18,6 +18,10 @@ function pythonCmd() {
   return process.platform === 'win32' ? 'python' : 'python3';
 }
 
+// 同時生成の上限 (プレビュー連打等でPython子プロセスを無制限に並列起動させない、Codex fax-R2 Low)
+let activeRenders = 0;
+const MAX_CONCURRENT = 3;
+
 /**
  * @param {object} payload buildOrderFax() が組み立てた発注書データ (python側のJSONスキーマ)
  * @param {{ timeoutMs?: number }} opts
@@ -29,6 +33,18 @@ export async function renderOrderPdf(payload, { timeoutMs = 30000 } = {}) {
     // %PDF ヘッダを持つ最小スタブ (実PDFではないがMIME組立・保存・配信経路の検証には十分)
     return Buffer.from(`%PDF-1.4 fake\n${JSON.stringify({ po: payload.po_number, rows: payload.items.length })}\n%%EOF\n`, 'utf8');
   }
+  if (activeRenders >= MAX_CONCURRENT) {
+    throw new Error('PDF生成が混み合っています (同時実行上限)。数秒待ってからやり直してください');
+  }
+  activeRenders++;
+  try {
+    return await renderViaPython(payload, timeoutMs);
+  } finally {
+    activeRenders--;
+  }
+}
+
+function renderViaPython(payload, timeoutMs) {
   return new Promise((resolve, reject) => {
     const cp = spawn(pythonCmd(), [SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] });
     const MAX_PDF = 20 * 1024 * 1024; // 発注書PDFの想定は数十KB。20MB超は異常出力としてkill (メモリ保護)
