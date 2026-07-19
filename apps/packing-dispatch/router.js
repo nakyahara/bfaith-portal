@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { ensureSchema, shippingMethodMap, diagInfo, productDiag, assortDiag } from './db.js';
 import {
   importCsv, listBatches, batchSummary, listOrders, getOrderDetail, decideOrder, exportCsv,
+  buildExportCsv, commitExport, beginExport, releaseExport,
   listRules, upsertRules, copyRules, searchRules, searchRulesByCondition, bulkUpdateRules,
   listUnregistered, mirrorFreshness, searchAssort, updateAssort, searchProducts,
   getMeltlineMigrationPreview, executeMeltlineMigration, rollbackMeltlineMigration,
@@ -30,6 +31,25 @@ import {
 import crypto from 'node:crypto';
 import { loadSeed } from './tools/load-shipping-rule-seed.mjs';
 import { getDriveCsvInfoAll, downloadDriveCsv } from './drive-fetch.js';
+import { uploadCsvToDrive, probeFolderWritable } from '../fba-replenishment/drive-upload.js';
+
+// ── CSV出力の Google Drive 固定保存先 (2026-07-19 中原さん指示) ──
+// 「📤 CSV出力してロジザードへ」の出力先を Drive の固定ファイルに一本化 (ブラウザDLは廃止)。
+// 毎回この 1 ファイルへ上書き保存する。env で差し替え可 (フォルダ移設時など)。
+// ⚠️ 前提: サービスアカウント (GOOGLE_SERVICE_ACCOUNT_KEY の client_email) を、保存先が属する
+//    共有ドライブに「コンテンツ管理者」以上で招待しておく必要がある (マイドライブ配下は不可)。
+const PD_DRIVE_EXPORT_FOLDER = process.env.PD_DRIVE_EXPORT_FOLDER || '1DMoPgo-f9kmzFSQ0e60apxTFi_2owoO';
+const PD_DRIVE_EXPORT_FILE = process.env.PD_DRIVE_EXPORT_FILE || 'logi_dispatch.csv';
+
+// Drive 出力の直列化 (Codex High③: 固定ファイルへの並行書込で古いバッチが新しいCSVを上書き、
+// および list→create の非原子性を回避)。bfaith-portal は単一インスタンス運用なのでプロセス内
+// promise チェーンで十分。build→保存→CAS確定 の一連を 1 度に 1 件だけ実行する。
+let _exportDriveChain = Promise.resolve();
+function withExportDriveLock(fn) {
+  const run = _exportDriveChain.then(fn, fn); // 前段の成否に関わらず順番に実行
+  _exportDriveChain = run.then(() => {}, () => {}); // チェーン用にエラーを飲む (呼び出し側へは run で伝播)
+  return run;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -138,20 +158,69 @@ router.post('/api/decide', (req, res) => handle(res, () => {
   }, currentUser(req));
 }));
 
+// ── Drive 保存先の書き込み点検 (go-live 前確認用、admin専用) ──
+// ブラウザで /apps/packing-dispatch/api/export/drive-check を開くと、SA が保存先フォルダに
+// 書き込めるか (capabilities.canAddChildren の読取のみ・非破壊) と、共有ドライブ配下かを判定して返す。
+// 本番バッチを消費せず副作用も無い。⚠️ 動的 :id ルートより手前に定義すること
+// (後ろだと id='drive-check' として GET /api/export/:id に捕捉される、Codex Medium)。
+router.get('/api/export/drive-check', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  handleAsync(res, async () => {
+    const r = await probeFolderWritable(PD_DRIVE_EXPORT_FOLDER);
+    return { folderId: PD_DRIVE_EXPORT_FOLDER,
+      folderUrl: `https://drive.google.com/drive/folders/${PD_DRIVE_EXPORT_FOLDER}`,
+      filename: PD_DRIVE_EXPORT_FILE, ...r };
+  });
+});
+
+// ── CSV出力 → Google Drive 固定ファイルへ上書き保存 (2026-07-19 中原さん指示) ──
+// 「📤 CSV出力してロジザードへ」の本経路。二相ロックで安全に確定する (Codex High①②③):
+//   ① beginExport … classifying→locked_for_export を CAS で claim
+//      (既に exported / 古いバッチは弾かれ、Drive を上書きすらしない。編集APIも locked を拒否)
+//   ② buildExportCsv … CSV 生成 (副作用なし)
+//   ③ uploadCsvToDrive … Drive へ上書き保存
+//   ④ commitExport … locked_for_export→exported を CAS 確定 + tracking 登録
+//   失敗時は releaseExport で classifying へ戻す (未出力のまま再実行可能。同名へ冪等上書き)。
+// 全体を withExportDriveLock で直列化 (固定ファイルへの並行書込・世代逆転を防ぐ)。
+// 残存リスク: ③成功後に④/プロセスが落ちると locked_for_export のまま Drive にだけ載る。
+//   → 再実行で同バッチが再 claim→再upload(冪等)→commit され自己回復する (二重投入は起きない)。
+router.post('/api/export/:id/to-drive', (req, res) => handleAsync(res, () =>
+  withExportDriveLock(async () => {
+    const batchId = req.params.id;
+    beginExport(batchId); // ここで弾かれれば Drive には一切触れない
+    try {
+      const built = buildExportCsv(batchId, {});
+      const up = await uploadCsvToDrive(built.buffer, PD_DRIVE_EXPORT_FILE, PD_DRIVE_EXPORT_FOLDER);
+      commitExport(batchId, currentUser(req), { lineRows: built.lineRows, rowCount: built.rowCount });
+      return { status: 'saved', rowCount: built.rowCount,
+        folderUrl: `https://drive.google.com/drive/folders/${PD_DRIVE_EXPORT_FOLDER}`,
+        drive: { action: up.action, fileId: up.fileId, filename: PD_DRIVE_EXPORT_FILE } };
+    } catch (e) {
+      releaseExport(batchId); // 未出力状態へ戻して再実行可能に (best-effort)
+      throw e;
+    }
+  })));
+
 // 出力 (Shift-JIS)。premeltline=1 で MeltLine を手動出荷に落として出力 (MeltLine 導入前用)。
+// ⚠️ 通常運用の出力先は Drive 固定 (POST /api/export/:id/to-drive) に一本化済み。
+//    この旧DL経路は「Drive一本化を迂回して exported 化するだけ (Drive未保存)」の抜け穴になり得るため
+//    admin 限定にする (Codex High④)。緊急時の premeltline 直DL用に経路自体は残す。
+//    to-drive と同じ withExportDriveLock で直列化し、出力処理の競合を防ぐ。
 router.get('/api/export/:id', (req, res) => {
-  try {
-    const premeltline = req.query.premeltline === '1';
-    const { buffer, rowCount } = exportCsv(req.params.id, currentUser(req), { downgradeMeltline: premeltline });
+  if (!requireAdmin(req, res)) return;
+  const premeltline = req.query.premeltline === '1';
+  withExportDriveLock(async () =>
+    exportCsv(req.params.id, currentUser(req), { downgradeMeltline: premeltline })
+  ).then(({ buffer, rowCount }) => {
     const fname = `logi_dispatch_${premeltline ? 'premelt_' : ''}${rowCount}rows.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
     res.setHeader('Content-Disposition', `attachment; filename="${fname}"`);
     res.send(buffer);
-  } catch (e) {
+  }).catch((e) => {
     if (e.code === 'VALIDATION') return res.status(400).json({ ok: false, error: 'validation', message: e.message, detail: e.detail });
     console.error('[packing] export', e.message);
     res.status(500).json({ ok: false, error: 'server_error', message: e.message });
-  }
+  });
 });
 
 // ── アソート学習 (注文番号/受注番号/商品コードで検索→編集) ──

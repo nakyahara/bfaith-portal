@@ -124,7 +124,13 @@
         <span id="filterCount" class="muted"></span>
         <span style="flex:1"></span>
         <span id="exportHint" class="muted"></span>
-        <button id="btnExportPost" style="background:#2e7d32; border-color:#2e7d32" title="MeltLine はそのまま MeltLine で出力します">📤 CSV出力してロジザードへ</button>
+        <button id="btnExportPost" style="background:#2e7d32; border-color:#2e7d32" title="Google Drive の logi_dispatch.csv に上書き保存します（PCへのダウンロードはされません）">📤 CSV出力してロジザードへ</button>
+      </div>
+      <div class="row" style="margin-top:-2px; align-items:center">
+        <span class="muted" style="font-size:12px">
+          📁 このボタンを押すと、CSVは <b>Google Drive の「logi_dispatch.csv」</b> に<b>上書き保存</b>されます（保存先フォルダ固定・PCへのダウンロードはされません）。
+        </span>
+        <span id="exportResult" style="font-size:12px; margin-left:8px"></span>
       </div>
       <div class="scroll">
         <table>
@@ -592,8 +598,8 @@
         <li>サマリが出る → 「要判断 ◯件」を確認</li>
         <li>伝票一覧から <span class="badge b-warn">要判断</span> の行をクリックして、ダイアログで配送方法・梱包機を選んで「確定」</li>
         <li><b>要判断が0件になったら</b>、CSV出力ボタンが押せるようになる</li>
-        <li>「<b>📤 CSV出力してロジザードへ</b>」を押してCSVをダウンロード</li>
-        <li>ダウンロードしたCSVをロジザードに取り込む</li>
+        <li>「<b>📤 CSV出力してロジザードへ</b>」を押す → CSVが <b>Google Drive の「logi_dispatch.csv」</b> に上書き保存される（PCへのダウンロードはされません）</li>
+        <li>Google Drive の <b>logi_dispatch.csv</b> をロジザードに取り込む（毎回同じファイルが最新版に上書きされます）</li>
       </ol>
       <div class="note"><b>ヒント</b>: 「取込済みデータを再表示」のドロップダウンで、過去48時間以内の取込バッチを再表示できます。途中で画面を閉じても作業を続行可能。</div>
 
@@ -1186,10 +1192,39 @@ $('#dlgOk').onclick = async () => {
   }catch(e){ alert('確定エラー: '+e.message); }
 };
 
-// ── CSV出力 (ロジザードへ渡す Shift-JIS) ──
-// 旧形式ボタン (premeltline=1、MeltLine導入前の手動矯正出力) は 2026-07-18 中原さん指示で撤去。
-// API 側の ?premeltline=1 は残してあり、必要になれば URL 直叩きで旧形式を出力できる。
-$('#btnExportPost').onclick = () => { if(BATCH) location.href = API_BASE + `api/export/${encodeURIComponent(BATCH)}`; };
+// ── CSV出力 (ロジザードへ渡す Shift-JIS) → Google Drive の logi_dispatch.csv へ上書き保存 ──
+// 2026-07-19 中原さん指示: 保存先を Drive 固定ファイルに一本化 (ブラウザDLは廃止)。
+// サーバは「Drive保存に成功したときだけ」出力を確定する。失敗時はバッチが未出力のまま残るので、
+// エラーが出たらそのまま再度ボタンを押せばよい (同じファイルへ冪等に上書きされる)。
+$('#btnExportPost').onclick = async () => {
+  if(!BATCH) return;
+  const btn = $('#btnExportPost'), out = $('#exportResult');
+  if(btn.disabled) return;
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳ Google Driveに保存中…';
+  out.innerHTML = '';
+  try{
+    const r = await fetch(API_BASE + `api/export/${encodeURIComponent(BATCH)}/to-drive`, { method:'POST' });
+    const j = await r.json().catch(() => ({ ok:false, message:'通信エラー' }));
+    if(!j.ok) throw new Error(j.message || j.error || 'エラー');
+    const res = j.result;
+    const act = res.drive && res.drive.action === 'created' ? '新規作成' : '上書き保存';
+    const fname = (res.drive && res.drive.filename) || 'logi_dispatch.csv';
+    out.innerHTML = `<span style="color:#2e7d32">✅ Driveに保存しました（${fname} / ${res.rowCount}件）</span>`
+      + (res.folderUrl ? ` <a href="${res.folderUrl}" target="_blank" rel="noopener">📂 フォルダを開く</a>` : '');
+    alert(`✅ Google Drive に保存しました\n\n`
+      + `ファイル: ${fname}（${act}）\n件数: ${res.rowCount}件\n\n`
+      + `このファイルをロジザードに取り込んでください。`);
+    // 出力済み(exported)になったので状態を再表示
+    try{ const s = await api(`api/batch/${encodeURIComponent(BATCH)}`); renderSummary(s); await loadOrders(); }catch(_){}
+  }catch(e){
+    // Drive保存に失敗 → バッチは未出力のまま。もう一度押せば再実行できる。
+    out.innerHTML = `<span style="color:#c62828">エラー: ${esc(e.message)}（未出力のままです。もう一度押せます）</span>`;
+    alert('CSV出力エラー: ' + e.message + '\n\nバッチは未出力のままです。少し待ってもう一度お試しください。');
+  }finally{
+    btn.disabled = false; btn.textContent = orig;
+  }
+};
 
 // ── 商品マスタ ──
 let justCopied = false; // 直前にコピーで編集欄を埋めたか(保存時の上書き確認用)
