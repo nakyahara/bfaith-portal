@@ -14,8 +14,8 @@
  * Test 10: ingestPickingBatches — INSERT / 冪等再送 / 内容不一致 conflict
  * Test 11: POST /ingest-picking — 認証 / 検算バリデーション / 409
  * Test 12: GET /recent-picking / GET /export (read token + 範囲検証)
- * Test 13: GAS parsePickingText_ — 実物OCRテキスト (2026-07-19 出荷_01) で総合計抽出、
- *          連結トークンの一意分割検算、曖昧・形式外は throw
+ * Test 13: GAS parsePickingText_ — GAS実機OCR (ラベル直後型) で総合計抽出+検算、
+ *          連結型/検算不一致/形式外はすべて throw (フォールバック無し=偽解防止)
  * Test 14: GAS dedupeByContent_ — md5一致のみ複製扱い、md5不明は除外しない
  * Test 15: Notion担当者 (notion-staff.js) — buildStaffRows の設定検証 fail-closed /
  *          正規化 / 重複タイブレーク、upsertStaffRows の COALESCE 保持、
@@ -254,15 +254,52 @@ const realText = [
   'Page：ブロック 良品 P3FD 008-019-05 5209 1 10 トータルピッキングリスト 3 ／ 3 出力日時： 2026/07/19 10:46:41 No.1 671',
   '担当者 moumouhc-co 490487200 総合計 ページ内合計',
 ].join('\n');
-const parsed = parsePickingText(realText);
-expectEq(parsed.totalQty, 67, '実物OCR 総合計');
-expectEq(parsed.pages, 3, '実物OCR ページ数');
-expectEq(JSON.stringify(parsed.pageTotals.slice().sort((a, b) => a - b)), '[1,31,35]', '実物OCR ページ内合計');
-expectEq(parsed.workDate, '2026-07-19', '実物OCR 作業日 (最頻出日付)');
-expectEq(parsed.printedAt, '2026-07-19 10:46:41', '実物OCR 出力日時');
+// 連結型 (別経路抽出の形式) はGASでは出ないため不採用 — 全文数字走査の偽解リスクを
+// 避けるべく throw して隔離に回す (Codex high ×2 の結論)
+try { parsePickingText(realText); fail('連結型が通ってしまった (フォールバック廃止済みのはず)'); }
+catch (e) { /特定できず/.test(e.message) ? ok('連結型OCR → throw (隔離へ)') : fail(`連結型 想定外: ${e.message}`); }
 
-// 1ページもの: 総合計12+ページ内合計12 → 「1212」
-const single = parsePickingText('トータルピッキングリスト 作業日 2026/07/19 ページ内合計 1212 総合計');
+// GAS Docs変換OCRの実出力 (2026-07-19、debugPickingRawText 実機ログ抜粋):
+// ラベルと値が分離して「総合計\n67\nページ内合計\n35」の形で出る (戦略A)
+const gasOcrText = [
+  'トータルピッキングリスト 出力日時： ', 'Page2026/07/19 10:46:41 1 3', '',
+  '作業日 ', '2026/07/19', '業務区分 ', '通販', '荷主名 ', 'No.1B-Faith株式会社 ', '倉庫名 ', 'B-Faith',
+  '担当者', '', '総合計', '67', 'ページ内合計', '35', '',
+  'ブロック', 'ロケーション ', '商品ID', '数量 ', '残数', 'バーコード',
+  'P3FA', '003-009-01 ', 'feelsc', '良品', '4', '280', '2200000029829',
+  'フィールソークール 20g 【ペパーミントの香り】',
+  'P3FB', '003-005-04 ', 'ushi-hidume-2', '良品', '1', '8', 'X000TGXUNJ', '2028/10/08',
+  '牛のひづめ 【ノーマル 2個入り】_K-44',
+  'トータルピッキングリスト 出力日時： ', 'Page2026/07/19 10:46:41 2 3',
+  '作業日 ', '2026/07/19', '担当者', '', '総合計', '67', 'ページ内合計', '31', '',
+  'P3FD', '006-008-03 ', 'nemunemask', '良品', '12', '587', '4530212204027',
+  'トータルピッキングリスト 出力日時： ', 'Page2026/07/19 10:46:41 3 3',
+  '作業日 ', '2026/07/19', '担当者', '', '総合計', '67', 'ページ内合計', '1', '',
+  'P3FD ', '008-019-05 ', 'moumouhc-co', '良品 ', '1 ', '10', '4904872005209 ',
+].join('\n');
+const gasParsed = parsePickingText(gasOcrText);
+expectEq(gasParsed.totalQty, 67, 'GAS実OCR(ラベル直後型) 総合計');
+expectEq(JSON.stringify(gasParsed.pageTotals), '[35,31,1]', 'GAS実OCR(ラベル直後型) ページ内合計');
+expectEq(gasParsed.workDate, '2026-07-19', 'GAS実OCR(ラベル直後型) 作業日');
+expectEq(gasParsed.printedAt, '2026-07-19 10:46:41', 'GAS実OCR(ラベル直後型) 出力日時');
+// ラベル直後型を認識したのに検算が合わない → 戦略Bに迂回せず即throw (Codex high:
+// Bは全文走査なので無関係な数字 71/76 が「総合計7=1+6」の偽解を作りうる)
+try {
+  parsePickingText('総合計 67 ページ内合計 35 総合計 68 ページ内合計 31 余白 71 76');
+  fail('総合計不一致が通ってしまった');
+} catch (e) { /総合計がページ間で不一致/.test(e.message) ? ok('総合計不一致→B迂回せずthrow') : fail(`総合計不一致 想定外: ${e.message}`); }
+try {
+  parsePickingText('総合計\n67\nページ内合計\n35\n総合計\n67\nページ内合計\n31');
+  fail('総和不一致が通ってしまった');
+} catch (e) { /検算不一致/.test(e.message) ? ok('総和不一致→throw') : fail(`総和不一致 想定外: ${e.message}`); }
+// カンマ入り等の想定外数値形式は不成立扱い (「6,7」→67 と読む寛容さは偽解の温床)
+try {
+  parsePickingText('総合計 6,7 ページ内合計 3,5 総合計 6,7 ページ内合計 3,2');
+  fail('カンマ入り数値が通ってしまった');
+} catch (e) { /特定できず/.test(e.message) ? ok('カンマ入り数値→throw') : fail(`カンマ入り 想定外: ${e.message}`); }
+
+// 1ページもの (ラベル直後型)
+const single = parsePickingText('トータルピッキングリスト 作業日 2026/07/19 総合計 12 ページ内合計 12');
 expectEq(single.totalQty, 12, '1ページ 総合計');
 expectEq(JSON.stringify(single.pageTotals), '[12]', '1ページ ページ内合計');
 
