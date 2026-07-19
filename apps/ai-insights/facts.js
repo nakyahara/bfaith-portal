@@ -64,7 +64,9 @@ function roundYen(v) {
 
 /**
  * sync_run_chunks から entity の「取得完了済み日」集合を得る。
- * applied_at IS NOT NULL の chunk の scope_from..scope_to を日展開して union。
+ * ⚠️ chunk 単位の applied_at だけでは不十分 (chunk_count > 1 の run は最初の chunk 適用時点で
+ * scope 全体が完了に見えてしまう)。run 単位で「全 chunk が到着済みかつ applied 済み」の
+ * 完了 run に属する chunk のみを対象にする (Codexレビュー2巡目 high 対応)。
  */
 function coveredDaysForEntity(db, entity, days) {
   const first = days[0];
@@ -74,7 +76,14 @@ function coveredDaysForEntity(db, entity, days) {
     WHERE entity = ? AND applied_at IS NOT NULL
       AND scope_from IS NOT NULL AND scope_to IS NOT NULL
       AND scope_to >= ? AND scope_from <= ?
-  `).all(entity, first, last);
+      AND run_id IN (
+        SELECT run_id FROM sync_run_chunks
+        WHERE entity = ?
+        GROUP BY run_id
+        HAVING COUNT(*) = MAX(chunk_count)
+           AND SUM(CASE WHEN applied_at IS NULL THEN 1 ELSE 0 END) = 0
+      )
+  `).all(entity, first, last, entity);
   const covered = new Set();
   for (const r of rows) {
     for (const d of days) {

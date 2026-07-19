@@ -83,6 +83,23 @@ const insChunk = db.prepare(`
 insChunk.run('sr1', 'f_sales_by_listing', 100, '2026-06-01', '2026-07-12');
 // finance: 楽天のみ取得完了 (他モールは missing → 粗利論点禁止)
 insChunk.run('sr2', 'rakuten_finance_sku_daily', 50, '2026-07-01', '2026-07-12');
+// yahoo finance: chunk_count=2 のうち 1 chunk だけ applied = 未完了 run → 完了扱いしない
+db.prepare(`
+  INSERT INTO sync_run_chunks
+    (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum, contract_version,
+     scope_from, scope_to, received_at, applied_at)
+  VALUES ('sr3', 'yahoo_finance_sku_daily', 0, 2, 10, 'c', 1, '2026-07-06', '2026-07-12',
+          '2026-07-13T00:00:00Z', '2026-07-13T00:05:00Z')
+`).run();
+// aupay finance: chunk_count=2 が両方 applied = 完了 run → 取得完了
+db.prepare(`
+  INSERT INTO sync_run_chunks
+    (run_id, entity, chunk_index, chunk_count, row_count, payload_checksum, contract_version,
+     scope_from, scope_to, received_at, applied_at)
+  VALUES
+    ('sr4', 'aupay_finance_sku_daily', 0, 2, 10, 'c', 1, '2026-07-06', '2026-07-09', '2026-07-13T00:00:00Z', '2026-07-13T00:05:00Z'),
+    ('sr4', 'aupay_finance_sku_daily', 1, 2, 10, 'c', 1, '2026-07-10', '2026-07-12', '2026-07-13T00:00:00Z', '2026-07-13T00:05:00Z')
+`).run();
 
 const insInv = db.prepare(`
   INSERT INTO mirror_inv_daily_summary
@@ -141,7 +158,8 @@ console.log('\n■ 事実層 + 充足判定');
   const areas = inp.constraints.prohibited_topic_areas.map((p) => p.area);
   ok(areas.includes('sales:amazon'), 'amazon 売上 suspect → 論点禁止', areas);
   ok(areas.includes('company_totals'), '欠損モールあり → 全社合計論点禁止', areas);
-  ok(areas.includes('margin:yahoo'), 'finance 未取込モール → 粗利論点禁止', areas);
+  ok(areas.includes('margin:yahoo'), 'finance 未完了 run (chunk 1/2) → 完了扱いせず粗利論点禁止', areas);
+  ok(!areas.includes('margin:aupay'), '完了 run (chunk 2/2 applied) → 取得完了として扱う', areas);
   ok(!areas.includes('margin:rakuten'), '楽天 finance は取込済 → 禁止されない', areas);
   ok(!areas.includes('sales:rakuten'), '楽天売上は ok', areas);
   ok(areas.includes('inventory:own_warehouse'), '自社倉庫在庫なし → 禁止', areas);

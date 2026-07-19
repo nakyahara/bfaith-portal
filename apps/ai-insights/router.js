@@ -590,20 +590,22 @@ router.post('/api/jobs/:jobId/reconcile', ensureReady, (req, res) => {
   const now = nowIso();
   const user = sessionUser(req);
   const to = action === 'mark_posted' ? 'posted' : 'pending';
-  const r = db.prepare(`
-    UPDATE ai_report_jobs
-    SET status = ?, resolved_by = ?, resolved_at = ?, updated_at = ?,
-        claimed_by = NULL, claimed_at = NULL, heartbeat_at = NULL
-    WHERE job_id = ? AND status = 'reconciliation_required'
-  `).run(to, user, now, now, req.params.jobId);
-  if (r.changes !== 1) return res.status(409).json({ error: 'job is not in reconciliation_required' });
-  if (action === 'mark_posted') {
+  // ジョブ遷移とレポート側の記録は 1 トランザクション (/posted と同じ理由)
+  let changed = 0;
+  db.transaction(() => {
     const job = getJob(db, req.params.jobId);
-    if (job?.report_id) {
+    changed = db.prepare(`
+      UPDATE ai_report_jobs
+      SET status = ?, resolved_by = ?, resolved_at = ?, updated_at = ?,
+          claimed_by = NULL, claimed_at = NULL, heartbeat_at = NULL
+      WHERE job_id = ? AND status = 'reconciliation_required'
+    `).run(to, user, now, now, req.params.jobId).changes;
+    if (changed === 1 && action === 'mark_posted' && job?.report_id) {
       db.prepare('UPDATE ai_reports SET posted_at = COALESCE(posted_at, ?) WHERE report_id = ?')
         .run(now, job.report_id);
     }
-  }
+  })();
+  if (changed !== 1) return res.status(409).json({ error: 'job is not in reconciliation_required' });
   res.json({ ok: true, status: to });
 });
 
