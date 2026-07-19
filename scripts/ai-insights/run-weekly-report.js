@@ -141,17 +141,33 @@ async function http(url, { method = 'GET', headers = {}, body, timeoutMs = 60000
 
 // ── claude -p 呼び出し ────────────────────────────────────────────────
 
+/** コマンド文字列を引用符対応でトークン分割 ("C:\Program Files\..." 対応) */
+export function splitCommand(cmd) {
+  const tokens = [];
+  for (const m of String(cmd).matchAll(/"([^"]*)"|(\S+)/g)) tokens.push(m[1] ?? m[2]);
+  return tokens;
+}
+
+function killTree(child) {
+  if (process.platform === 'win32') {
+    // cmd.exe 配下の node/claude まで含めてツリーごと終了 (kill() では孫が残る)
+    try { spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }); } catch { /* noop */ }
+  } else {
+    child.kill('SIGKILL');
+  }
+}
+
 function runClaude(cfg, prompt) {
   return new Promise((resolve, reject) => {
     // prompt は stdin で渡す (数十KB になるため引数長制限を回避)
     const args = ['-p', '--output-format', 'json'];
-    const cmdParts = cfg.claudeCmd.split(' ');
+    const cmdParts = splitCommand(cfg.claudeCmd);
     const child = process.platform === 'win32'
       ? spawn('cmd.exe', ['/c', ...cmdParts, ...args], { windowsHide: true })
       : spawn(cmdParts[0], [...cmdParts.slice(1), ...args]);
     let out = '', err = '';
     const timer = setTimeout(() => {
-      child.kill();
+      killTree(child);
       reject(new Error(`claude timeout ${cfg.claudeTimeoutMs}ms`));
     }, cfg.claudeTimeoutMs);
     child.stdout.on('data', (d) => { out += d; });
@@ -222,6 +238,9 @@ function stableInputHash(input) {
 // ── 投稿 (webhook 送信後のエラーは「成否不明」として /failed を呼ばない) ──
 
 async function postAndFinalize(cfg, jobId, text, publicId) {
+  // ⚠️ webhook 呼び出し以降の失敗は全て「成否不明」扱いで throw しない。
+  //    外側 catch の /failed 申告に到達させると claimed_for_posting → 自動再投稿になり、
+  //    投稿済みのケースで二重投稿するため (要件 §8.1: 不明時は孤児回収 → 人間照合のみ)
   let messageId = null;
   try {
     const res = await http(cfg.webhook, {
@@ -229,13 +248,19 @@ async function postAndFinalize(cfg, jobId, text, publicId) {
     });
     messageId = res?.name || null;
   } catch (e) {
-    // 送信要求は出た可能性がある → 成否不明。放置して孤児回収 → 人間照合へ
     log(`GChat投稿の成否不明: ${e.message}`);
     notify('failed_posting_uncertain', `public_id=${publicId} → 30分後に⚙️画面の要照合に出ます`);
     return false;
   }
-  const bodyHash = crypto.createHash('sha256').update(text).digest('hex');
-  await serviceCall(cfg, `/jobs/${jobId}/posted`, { gchat_message_id: messageId, body_hash: bodyHash });
+  try {
+    const bodyHash = crypto.createHash('sha256').update(text).digest('hex');
+    await serviceCall(cfg, `/jobs/${jobId}/posted`, { gchat_message_id: messageId, body_hash: bodyHash });
+  } catch (e) {
+    // 投稿は成功しているが posted 記録に失敗 → posting のまま残す (孤児回収 → 人間照合)
+    log(`投稿成功だが posted 記録に失敗: ${e.message}`);
+    notify('failed_posting_uncertain', `public_id=${publicId} 投稿済み・記録失敗 → ⚙️画面で「投稿済み扱い」を選択`);
+    return false;
+  }
   return true;
 }
 
@@ -284,7 +309,8 @@ async function main() {
     const body = JSON.parse(report.body_json);
     const pseudoInput = { meta: { period_label: periodLabel }, coverage: [] };
     const text = report.data_quality_status === 'blocked'
-      ? buildBlockedNotice({ meta: { period_label: periodLabel }, coverage: [] }, report.public_id)
+      // 欠損理由は生成時に body.data_notes へ保存済み → 再投稿でも復元できる
+      ? buildBlockedNotice(pseudoInput, report.public_id, body.data_notes || null)
       : buildGChatMessage(body, pseudoInput, report.public_id, { detailUrl: `${cfg.base}/apps/ai-insights` });
     const okPost = await postAndFinalize(cfg, jobId, text, report.public_id);
     if (okPost) notify('ok_repost', report.public_id);

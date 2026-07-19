@@ -43,7 +43,11 @@ function baseInput() {
     ],
     constraints: {
       generation: 'allowed', data_quality_status: 'degraded',
-      prohibited_topic_areas: [{ area: 'sales:amazon', reason: 'suspect' }],
+      // サーバ仕様 (facts.js deriveConstraints): 売上欠損モールがあれば company_totals も禁止
+      prohibited_topic_areas: [
+        { area: 'sales:amazon', reason: 'suspect' },
+        { area: 'company_totals', reason: '売上欠損モールがあるため全社合計を使う論点は禁止' },
+      ],
     },
     facts: {
       sales: {
@@ -83,6 +87,9 @@ const server = http.createServer((req, res) => {
     }
     if (/^\/api\/ai-insights\/service\/jobs\/[^/]+\/report$/.test(url)) {
       return json(200, { ok: true, report_id: 'rp_smoke_1', public_id: 'WK-20260706-f' });
+    }
+    if (/^\/api\/ai-insights\/service\/jobs\/[^/]+\/posted$/.test(url) && state.postedFail) {
+      return json(500, { error: 'simulated posted failure' });
     }
     if (/^\/api\/ai-insights\/service\/jobs\/[^/]+\/(posting|posted|heartbeat|failed)$/.test(url)) {
       return json(200, { ok: true });
@@ -126,6 +133,7 @@ function reset() {
   state.webhookTexts = [];
   state.inputOverride = null;
   state.claimResult = null;
+  state.postedFail = false;
 }
 const calledPaths = () => state.calls.map((c) => c.path.replace(/jb_[a-z0-9_]+/i, ':job'));
 
@@ -182,7 +190,34 @@ console.log('\n■ claude 失敗 → フォールバック (数字は必ず届�
   ok(reportCall.body.generation_mode === 'fallback', 'generation_mode=fallback', reportCall.body.generation_mode);
   const text = state.webhookTexts[0] || '';
   ok(text.includes('AI生成に失敗'), 'フォールバック明記', text.slice(0, 200));
-  ok(text.includes('前週比 +55%'), '機械整形に数字が載る', text);
+  ok(!text.includes('全社売上'), 'company_totals 禁止時は全社集計を出さない', text);
+  ok(text.includes('rakuten 売上 前週比 +50%'), '代わりに健全モールの個別数字', text);
+  ok(!text.includes('+55%'), '禁止された全社WoWは載らない', text);
+}
+
+// ═══ 3b. AI出力のルール違反 → 機械検査で棄却 → フォールバック ═══
+console.log('\n■ AI出力の機械検査 (禁止モール言及 / 数字創作)');
+{
+  reset();
+  let r = await runRunner({ FAKE_MODE: 'prohibited' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), '禁止モール言及 → 棄却 → fallback', r.out.slice(-300));
+  ok(r.out.includes('禁止領域モール'), '違反理由がログに出る', null);
+  reset();
+  r = await runRunner({ FAKE_MODE: 'invented' });
+  ok(r.code === 0 && r.out.includes('[NOTIFY:status=fallback]'), 'facts に無い数字 → 棄却 → fallback', r.out.slice(-300));
+  ok(r.out.includes('数字創作の疑い'), '違反理由がログに出る', null);
+}
+
+// ═══ 3c. webhook成功後の /posted 失敗 → 成否不明扱い (二重投稿させない) ═══
+console.log('\n■ /posted 失敗 → 人間照合行き (自動再投稿しない)');
+{
+  reset();
+  state.postedFail = true;
+  const { code, out } = await runRunner({ FAKE_MODE: 'ok' });
+  ok(code === 1, 'exit 1', code);
+  ok(out.includes('[NOTIFY:status=failed_posting_uncertain]'), 'failed_posting_uncertain', out.slice(-300));
+  ok(out.includes('投稿済み・記録失敗'), '投稿済みと明示', null);
+  ok(!calledPaths().some((p) => p.endsWith('/failed')), '/failed を呼ばない (claimed_for_postingでの再投稿を防ぐ)', calledPaths());
 }
 
 // ═══ 4. 壊れた出力 → リトライ → フォールバック ═══

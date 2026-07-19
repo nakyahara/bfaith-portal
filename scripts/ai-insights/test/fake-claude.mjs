@@ -1,5 +1,6 @@
 // smoke 用の偽 claude CLI。stdin を読み切ってから FAKE_MODE に応じた出力を返す
 // FAKE_MODE: ok (正常JSON) / bad (壊れた出力) / fail (exit 1)
+//            prohibited (禁止モールに言及) / invented (factsに無い数字を創作)
 let stdin = '';
 process.stdin.setEncoding('utf8');
 for await (const chunk of process.stdin) stdin += chunk;
@@ -11,6 +12,16 @@ if (mode === 'fail') {
 }
 if (mode === 'bad') {
   process.stdout.write('ここにJSONはありません\n');
+  process.exit(0);
+}
+if (mode === 'prohibited' || mode === 'invented') {
+  const badTopic = mode === 'prohibited'
+    ? { title: 'amazonの売上が急減', category: 'sales', evidence: '今週0円', action: '確認', confidence: 'med' }
+    : { title: '楽天が好調', category: 'sales', evidence: '今週98,765円と大幅増', action: '確認', confidence: 'med' };
+  process.stdout.write(JSON.stringify({
+    type: 'result', subtype: 'success', is_error: false,
+    result: JSON.stringify({ summary: 'テスト', topics: [badTopic], topic_updates: [], data_notes: '' }),
+  }));
   process.exit(0);
 }
 
