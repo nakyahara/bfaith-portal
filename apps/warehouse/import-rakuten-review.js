@@ -52,7 +52,14 @@ function moveTo(srcPath, destDir) {
  *  送信失敗時はキューに残る → 次回実行 (翌朝daily-sync) で自動リトライ (Codex R2 High:
  *  取込duplicate化で通知が恒久欠落するのを防ぐ)。通知失敗で取込は失敗にしない (fail-soft) */
 async function notifyLowRatings(dbRw) {
-  const queued = dbRw.prepare(`SELECT * FROM rakuten_review_low_notify_queue ORDER BY posted_at`).all();
+  // 移行前に積まれた旧キュー行 (title/body=NULL) は fact から補完 (Codex Medium)
+  const queued = dbRw.prepare(`
+    SELECT q.review_url, q.review_type, q.item_name, q.rating, q.posted_at,
+           COALESCE(q.title, f.title) AS title, COALESCE(q.body, f.body) AS body
+      FROM rakuten_review_low_notify_queue q
+      LEFT JOIN fact_rakuten_reviews f ON f.review_url = q.review_url
+     ORDER BY q.posted_at
+  `).all();
   if (queued.length === 0) return;
   if ((process.env.NOTIFY_LOW_REVIEW || '1') === '0') {
     console.log(`  (低評価通知は NOTIFY_LOW_REVIEW=0 のためスキップ: ${queued.length}件はキューに残置)`);
@@ -66,8 +73,8 @@ async function notifyLowRatings(dbRw) {
   const lines = queued.slice(0, 10).map(r => {
     const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
     const what = r.review_type === 'shop' ? 'ショップレビュー' : (r.item_name || '(商品名不明)').slice(0, 40);
-    // レビュー内容 (改行は畳み、長文は300字で切る。GChatの読みやすさ優先)
-    const title = (r.title || '').trim();
+    // レビュー内容 (タイトル・本文とも改行は畳み、結合後300字で切る。GChatの読みやすさ優先)
+    const title = (r.title || '').replace(/\s+/g, ' ').trim();
     const body = (r.body || '').replace(/\s+/g, ' ').trim();
     const content = [title && `「${title}」`, body].filter(Boolean).join(' ');
     const contentLine = content

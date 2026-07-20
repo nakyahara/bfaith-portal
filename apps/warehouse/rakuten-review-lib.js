@@ -88,10 +88,18 @@ export function ensureRakutenReviewTables(db) {
     body        TEXT
   )`);
   {
-    // 本番テーブル向け冪等 migration (miss_count と同じ後付けパターン)
+    // 本番テーブル向け冪等 migration (miss_count と同じ後付けパターン)。
+    // 並行起動 (planner/importer/sender が同時に ensure を呼ぶ) で両者が「列なし」と
+    // 判定し得るため、duplicate column だけは握って先着を勝ちとする (Codex Medium)
     const qCols = db.prepare(`PRAGMA table_info(rakuten_review_low_notify_queue)`).all().map(c => c.name);
-    if (!qCols.includes('title')) db.exec(`ALTER TABLE rakuten_review_low_notify_queue ADD COLUMN title TEXT`);
-    if (!qCols.includes('body')) db.exec(`ALTER TABLE rakuten_review_low_notify_queue ADD COLUMN body TEXT`);
+    for (const col of ['title', 'body']) {
+      if (qCols.includes(col)) continue;
+      try {
+        db.exec(`ALTER TABLE rakuten_review_low_notify_queue ADD COLUMN ${col} TEXT`);
+      } catch (e) {
+        if (!/duplicate column/i.test(String(e.message))) throw e;
+      }
+    }
   }
 
   // 取込ログ (raw_rakuten_data_import_log と同型)
