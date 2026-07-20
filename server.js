@@ -25,6 +25,7 @@ import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
 import { startShippingStaffCron } from './apps/shipping-log/notion-staff.js';
+import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -1377,6 +1378,10 @@ app.listen(PORT, () => {
   // 出荷カード担当者スナップショット (Notion→sl_batch_staff、毎日19:30 JST。
   // SHIPPING_STAFF_CRON_ENABLED=true で起動、Dark Launch)
   startShippingStaffCron();
+
+  // Render 一次データ自己バックアップ (JST 03:30、Google Drive へ外向き送信のみ =
+  // DB ダウンロード用の公開エンドポイントは作らない。RENDER_BACKUP_CRON_ENABLED=1 で起動、Dark Launch)
+  startRenderBackupCron();
 });
 
 process.on('SIGTERM', () => {
