@@ -25,6 +25,10 @@ import {
 const trimS = v => String(v == null ? '' : v).trim();
 const yenOrNull = v => { const n = numOrNull(v); return n === null ? null : Math.round(n); };
 const intOrNull = v => { const n = numOrNull(v); return n === null ? null : Math.round(n); };
+// null 安全な集約 (検索KW合算用)。片方 null はもう片方を採用、両方数値なら演算、両方 null は null。
+// (null = Yahoo プライバシーマスク「2未満」。数値がある側を優先し下限値として保持する)
+const sumNullable = (a, b) => (a == null ? b : (b == null ? a : a + b));
+const minNullable = (a, b) => (a == null ? b : (b == null ? a : Math.min(a, b)));
 
 const DEVICE_MAP = { '合算値': 'all', 'PC': 'pc', 'スマホ': 'sp', 'アプリ': 'app' };
 
@@ -347,21 +351,64 @@ function prepareKeywordJson(name, json) {
   }
   const results = Array.isArray(json) ? json : (Array.isArray(json?.results) ? json.results : null);
   if (!results) return { name, ok: false, type: 'yahoo_keyword_daily', error: 'KW配列がありません (JSON形式変更の疑い)' };
-  const records = [];
+  // Yahoo は生の検索クエリを返すため、末尾スペース (全角 　 含む。JS trim が除去) 等の表記ゆれで
+  // trimS 後に衝突する KW が別行で入る。PK=(date_jst,keyword) 衝突を dupGuard が当日分丸ごと弾いていたので、
+  // 同一検索意図として合算する: 数値 (inflow/sales/orders/units) は加算、rank は最良 (最小)、率は合算行のみ再計算。
+  //
+  // 集約キーは trimS 済みの「切り詰め前」完全 KW。keyword 列は 200 字に切り詰めて保存するが、合算判定に
+  // 切り詰め後キーを使うと、先頭 200 字だけ一致する別 KW を誤って合算してしまう (Codex R1 High)。
+  // 表記ゆれ (末尾スペース差) は trim で完全一致になるので、切り詰め前キーでも正しく合算される。
+  const byKw = new Map();
+  let rowCount = 0;
   for (const r of results) {
     const kw = trimS(r.keyword);
     if (!kw) continue;
-    records.push({
+    rowCount++;
+    const rec = {
       date_jst: dateJst, keyword: kw.slice(0, 200),
       rank: intOrNull(r.pvRank), inflow: intOrNull(r.pv),
       sales_yen: yenOrNull(r.gmv), orders: intOrNull(r.orderCount), units: intOrNull(r.orderQuantity),
       avg_order_rate_pct: numOrNull(r.orderRate),
       avg_order_aov_yen: yenOrNull(r.orderUnitPrice), avg_units_aov_yen: yenOrNull(r.orderProductPrice),
-    });
+    };
+    const ex = byKw.get(kw);
+    if (!ex) {
+      // taint = 各メトリクスの合計に Yahoo マスク値 (null=「2未満」) が混入したか。率の分子/分母が
+      // 不完全な合計だと率を断定できないため、混入時は率を null にする (Codex R1 Medium)
+      byKw.set(kw, { rec, merged: false, taint: { inflow: rec.inflow == null, sales: rec.sales_yen == null, orders: rec.orders == null, units: rec.units == null } });
+      continue;
+    }
+    const a = ex.rec;
+    a.inflow = sumNullable(a.inflow, rec.inflow);
+    a.sales_yen = sumNullable(a.sales_yen, rec.sales_yen);
+    a.orders = sumNullable(a.orders, rec.orders);
+    a.units = sumNullable(a.units, rec.units);
+    a.rank = minNullable(a.rank, rec.rank);
+    ex.taint.inflow = ex.taint.inflow || rec.inflow == null;
+    ex.taint.sales = ex.taint.sales || rec.sales_yen == null;
+    ex.taint.orders = ex.taint.orders || rec.orders == null;
+    ex.taint.units = ex.taint.units || rec.units == null;
+    ex.merged = true;
   }
-  if (records.length === 0) return { name, ok: false, type: 'yahoo_keyword_daily', error: 'データ行が0件' };
-  const d = dupGuard(name, 'yahoo_keyword_daily', records, (r) => r.keyword, '検索キーワード'); if (d) return d;
-  return { name, ok: true, type: 'yahoo_keyword_daily', label: `検索流入 (KW×日次、JSON ${records.length}語)`, records, dateFrom: dateJst, dateTo: dateJst };
+  if (rowCount === 0) return { name, ok: false, type: 'yahoo_keyword_daily', error: 'データ行が0件' };
+  const aggregated = [...byKw.values()].map(({ rec, merged, taint }) => {
+    // 単独行は Yahoo 公式の率をそのまま尊重。合算行のみ、合算後の値から率を再計算 (元の率を足すのは誤り)。
+    // マスク混入した合計は分子/分母が下限値どうしになり率を断定できないので null にする。
+    if (merged) {
+      rec.avg_order_rate_pct = (!taint.inflow && !taint.orders && rec.inflow > 0) ? Math.round(rec.orders / rec.inflow * 1000) / 10 : null;
+      rec.avg_order_aov_yen = (!taint.sales && !taint.orders && rec.orders > 0) ? Math.round(rec.sales_yen / rec.orders) : null;
+      rec.avg_units_aov_yen = (!taint.sales && !taint.units && rec.units > 0) ? Math.round(rec.sales_yen / rec.units) : null;
+    }
+    return rec;
+  });
+  // 200 字切り詰め由来の真の PK 衝突 (= 先頭 200 字一致の別 KW) は、どちらが正データか判別不能。
+  // 「衝突キーだけ除外して残りを通す」案は、UPSERT 型の再取込だと DB 側に以前の行が stale として
+  // 残り「除外したつもりが除外されていない」状態を生む (Codex High)。取込ログにも残せないため、
+  // ファイル全体を拒否して人が気づける形にする。表記ゆれは上で合算済みなので、ここに残るのは
+  // 200 字超 KW どうしの衝突だけ = 実運用ではほぼ発生しない安全網。
+  const d = dupGuard(name, 'yahoo_keyword_daily', aggregated, (r) => r.keyword, '検索キーワード (200字超の切詰衝突)'); if (d) return d;
+  const mergedCount = rowCount - aggregated.length;
+  return { name, ok: true, type: 'yahoo_keyword_daily', label: `検索流入 (KW×日次、JSON ${aggregated.length}語${mergedCount > 0 ? `、表記ゆれ ${mergedCount}件合算` : ''})`, records: aggregated, dateFrom: dateJst, dateTo: dateJst };
 }
 
 // ─── レシピ5: 商品分析 (期間集計型 → 対象日はファイル名から) ───
