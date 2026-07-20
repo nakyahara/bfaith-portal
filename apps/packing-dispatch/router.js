@@ -38,7 +38,9 @@ import { uploadCsvToDrive, probeFolderWritable } from '../fba-replenishment/driv
 // 毎回この 1 ファイルへ上書き保存する。env で差し替え可 (フォルダ移設時など)。
 // ⚠️ 前提: サービスアカウント (GOOGLE_SERVICE_ACCOUNT_KEY の client_email) を、保存先が属する
 //    共有ドライブに「コンテンツ管理者」以上で招待しておく必要がある (マイドライブ配下は不可)。
-const PD_DRIVE_EXPORT_FOLDER = process.env.PD_DRIVE_EXPORT_FOLDER || '1DMoPgo-f9kmzFSQ0e60apxTFi_2owoO';
+// 保存先は共有ドライブ内フォルダ「bfaithポータルdata」。#585 で末尾1文字 (H) を欠いた ID を
+// 埋め込んでしまい、Drive が 404 File not found を返して CSV 出力が全滅していた (2026-07-20 修正)。
+const PD_DRIVE_EXPORT_FOLDER = process.env.PD_DRIVE_EXPORT_FOLDER || '1DMoPgo-f9kmzFSQ0e60apxTFi_2owoOH';
 const PD_DRIVE_EXPORT_FILE = process.env.PD_DRIVE_EXPORT_FILE || 'logi_dispatch.csv';
 // ⑤ 追跡番号タブの「受注番号+追跡番号 CSV」の Drive 保存先 (2026-07-19 中原さん指示)。
 // メイン出力(logi_dispatch.csv)とは別フォルダ・別ファイル。同じく共有ドライブ配下 + SA コンテンツ管理者が前提。
