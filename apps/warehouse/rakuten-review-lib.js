@@ -74,15 +74,25 @@ export function ensureRakutenReviewTables(db) {
 
   // 低評価通知キュー: GChat送信が失敗しても取込は成功扱い (fail-soft) のため、
   // 未送信分をここに積んで次回実行時にリトライする (送信2xxで削除 — Codex R2 High:
-  // 送信失敗+再取込duplicateで通知が恒久欠落するのを防ぐ)。宛先情報は持たない
+  // 送信失敗+再取込duplicateで通知が恒久欠落するのを防ぐ)。宛先情報・注文番号は持たない。
+  // title/body は 2026-07-20 の方針変更で追加 (中原さん要望: 通知にレビュー内容を表示する。
+  // レビューは楽天上で公開済みの内容のため社内GChatに出してよい。注文番号の非搭載は維持)
   db.exec(`CREATE TABLE IF NOT EXISTS rakuten_review_low_notify_queue (
     review_url  TEXT PRIMARY KEY,
     review_type TEXT NOT NULL,
     item_name   TEXT,
     rating      INTEGER NOT NULL,
     posted_at   TEXT NOT NULL,
-    queued_at   TEXT NOT NULL
+    queued_at   TEXT NOT NULL,
+    title       TEXT,
+    body        TEXT
   )`);
+  {
+    // 本番テーブル向け冪等 migration (miss_count と同じ後付けパターン)
+    const qCols = db.prepare(`PRAGMA table_info(rakuten_review_low_notify_queue)`).all().map(c => c.name);
+    if (!qCols.includes('title')) db.exec(`ALTER TABLE rakuten_review_low_notify_queue ADD COLUMN title TEXT`);
+    if (!qCols.includes('body')) db.exec(`ALTER TABLE rakuten_review_low_notify_queue ADD COLUMN body TEXT`);
+  }
 
   // 取込ログ (raw_rakuten_data_import_log と同型)
   db.exec(`CREATE TABLE IF NOT EXISTS raw_rakuten_review_import_log (
@@ -303,8 +313,8 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
   // 通知キュー追加は取込と同一トランザクション (Codex R3 High: commit後の別処理だと
   // その間のクラッシュで duplicate 化し通知が永久欠落する)
   const enqueueLowStmt = db.prepare(`
-    INSERT OR IGNORE INTO rakuten_review_low_notify_queue (review_url, review_type, item_name, rating, posted_at, queued_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO rakuten_review_low_notify_queue (review_url, review_type, item_name, rating, posted_at, queued_at, title, body)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const missStmt = db.prepare(`UPDATE fact_rakuten_reviews SET miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_url = ?`);
@@ -333,10 +343,11 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
         revisionStmt.run(rec.review_url, now, rec.source_hash, rec.rating, rec.posted_at);
         inserted++;
         if (rec.rating <= 2) {
-          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now);
+          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now, rec.title, rec.body);
           newLowRatings.push({
             review_url: rec.review_url, review_type: rec.review_type,
             item_name: rec.item_name, rating: rec.rating, posted_at: rec.posted_at,
+            title: rec.title, body: rec.body,
           });
         }
       } else if (existing.source_hash !== rec.source_hash) {
@@ -346,10 +357,11 @@ export function importReviewFile(db, { name, buffer, sha256, source = 'incoming'
         // 編集で★3以上→★2以下へ低下した遷移も運用通知の対象 (Codex R4 High)。
         // ★2以下のままの編集は再通知しない (INSERT OR IGNORE でも review_url PK が防ぐ)
         if (rec.rating <= 2 && existing.rating > 2) {
-          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now);
+          enqueueLowStmt.run(rec.review_url, rec.review_type, rec.item_name, rec.rating, rec.posted_at, now, rec.title, rec.body);
           newLowRatings.push({
             review_url: rec.review_url, review_type: rec.review_type,
             item_name: rec.item_name, rating: rec.rating, posted_at: rec.posted_at,
+            title: rec.title, body: rec.body,
           });
         }
       } else {

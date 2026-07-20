@@ -46,7 +46,8 @@ function moveTo(srcPath, destDir) {
   return dest;
 }
 
-/** 低評価GChat通知。本文・注文番号は載せない (PII最小化)。
+/** 低評価GChat通知。タイトル・本文を載せる (2026-07-20 中原さん要望。レビューは楽天上で
+ *  公開済みの内容のため社内通知に出してよい)。注文番号は引き続き載せない (PII最小化)。
  *  キュー方式: 新規★1-2は rakuten_review_low_notify_queue に積み、送信2xxで削除。
  *  送信失敗時はキューに残る → 次回実行 (翌朝daily-sync) で自動リトライ (Codex R2 High:
  *  取込duplicate化で通知が恒久欠落するのを防ぐ)。通知失敗で取込は失敗にしない (fail-soft) */
@@ -65,7 +66,14 @@ async function notifyLowRatings(dbRw) {
   const lines = queued.slice(0, 10).map(r => {
     const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
     const what = r.review_type === 'shop' ? 'ショップレビュー' : (r.item_name || '(商品名不明)').slice(0, 40);
-    return `・${stars} ${what}\n    投稿: ${r.posted_at}`;
+    // レビュー内容 (改行は畳み、長文は300字で切る。GChatの読みやすさ優先)
+    const title = (r.title || '').trim();
+    const body = (r.body || '').replace(/\s+/g, ' ').trim();
+    const content = [title && `「${title}」`, body].filter(Boolean).join(' ');
+    const contentLine = content
+      ? `\n    ${content.length > 300 ? `${content.slice(0, 300)}…` : content}`
+      : '';
+    return `・${stars} ${what}\n    投稿: ${r.posted_at}${contentLine}`;
   });
   if (queued.length > 10) lines.push(`…ほか ${queued.length - 10} 件`);
   const text = [
