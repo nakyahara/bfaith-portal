@@ -36,6 +36,7 @@ import { renderOrderPdf } from './fax-pdf.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
+import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -2763,10 +2764,12 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
 // - 同一商品がロケ別に複数行 → 商品IDごとに合算。品質区分列があれば「良品」のみ在庫に数える
 // - 商品IDはロジザード登録表記そのもの → canonical (貼り付け用の大小表記) をここからも蓄積
 // - 仕組みはNEオーバーレイを再利用 (在庫数以外のカラムはNULL=マージでPML値に自動フォールバック)
-router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
-  let buf;
-  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+// ロジザード在庫CSV取込の本体。手動アップロード経路と Drive 直接取得経路で共用する
+// (取込ルール・プレビュー二段確認・在庫0上書きの判定を一本化するため、経路ごとに分岐させない)。
+//   buf      … CSV本体
+//   filename … 取込履歴に残すファイル名
+//   extra    … レスポンスに添える経路固有の情報 (Drive経路の更新日時など)
+function importLogizardStockCsv(req, res, { buf, filename, extra = {} }) {
   try {
     const rows = parseCsvBuffer(buf);
     if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
@@ -2822,7 +2825,7 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
     })).digest('hex');
     const summary = { products: agg.size, matched, zeroFill: zeroFill.length, dataRows, skippedNonGood, skippedBlank, fileHash, planHash };
     if (String((req.body || {}).commit) !== '1') {
-      return res.json({ ok: true, preview: true, ...summary });
+      return res.json({ ok: true, preview: true, ...summary, ...extra });
     }
     if (trimS((req.body || {}).fileHash) !== fileHash) {
       return res.status(409).json({ ok: false, error: 'プレビューしたファイルと内容が異なります。もう一度プレビューからやり直してください' });
@@ -2845,14 +2848,57 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
       for (const p of zeroFill) ins.run(p.key, p.code, 0, null);
       db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'logizard')
                   ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
-        .run(now, agg.size + zeroFill.length, req.file.originalname || null);
+        .run(now, agg.size + zeroFill.length, filename || null);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'logizard_stock_import', resource: 'ne_overlay',
-        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood } });
+        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood, ...extra } });
       // サイクルリセットも同一txn (在庫だけ更新されてバッジが残る片肺を防ぐ、Codex LZ-R1 Medium)
       bumpCycleReset(actorOf(req), 'ロジザード在庫CSV取込で発注サイクル更新', now);
     })();
-    res.json({ ok: true, ...summary, uploadedAt: now });
+    res.json({ ok: true, ...summary, ...extra, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+}
+
+router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+  importLogizardStockCsv(req, res, { buf, filename: req.file.originalname });
+});
+
+// ── Google Drive 直接取込 (2026-07-20 中原さん指示) ──
+// run-zaiko.bat がロジザードから落とした logizard_zaikosu.csv を Drive の固定フォルダに置く運用。
+// 手元にDLして選び直す手間を省くため、Render サーバが Drive API で直接取得して同じ取込経路へ流す。
+// 更新日時を返すので「最新のCSVを取り込んだか」を画面で確認できる。
+const LZ_DRIVE_SOURCE = {
+  label: 'ロジザード在庫CSV',
+  folderId: process.env.PO_DRIVE_FOLDER_LOGIZARD_STOCK || '1UT6l9G_vRD1PnXN6P4E1FXbxC0PkFPF0',
+  filename: process.env.PO_DRIVE_FILE_LOGIZARD_STOCK || 'logizard_zaikosu.csv',
+  notFoundHint: '会社PCの run-zaiko.bat で在庫CSVを出力済みか確認してください。',
+};
+
+// 更新日時表示用 (60秒キャッシュ)。失敗しても画面全体を落とさないよう ok:false で返す
+router.get('/api/logizard-stock/drive-info', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await getDriveCsvInfo(LZ_DRIVE_SOURCE)) });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Drive からDLして通常の取込と同じ経路へ (プレビュー→確認の二段もそのまま効く)。
+// プレビューと取込の間にCSVが差し替わった場合は fileHash 不一致で409になり、やり直しを促す
+router.post('/api/logizard-stock/drive', async (req, res) => {
+  let dl;
+  try {
+    dl = await downloadDriveCsv(LZ_DRIVE_SOURCE);
+  } catch (e) {
+    return res.status(e.code === 'VALIDATION' ? 400 : 502).json({ ok: false, error: e.message });
+  }
+  importLogizardStockCsv(req, res, {
+    buf: dl.buffer,
+    filename: dl.filename,
+    extra: { drive_file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst, size_kb: dl.size != null ? Math.round(dl.size / 1024) : null } },
+  });
 });
 
 router.delete('/api/ne-overlay', (req, res) => {
@@ -3359,10 +3405,16 @@ router.get('/', (req, res) => {
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">📥 NE最新CSVを取込</button>
       </form>
-      <form id="lzForm" style="display:flex;gap:6px;align-items:center" title="ロジザードのロケ別在庫一覧CSV (CZ04003)。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)。商品IDの表記も蓄積されるのでロジザード貼り付けの表記が揃う">
-        <input type="file" name="file" accept=".csv" required>
-        <button type="submit">📥 ロジザード在庫CSVを取込</button>
-      </form>
+      <span style="display:flex;gap:6px;align-items:center" title="Gドライブの logizard_zaikosu.csv (run-zaiko.bat が出力) をサーバが直接取得して取り込む。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)">
+        <button id="btnLzDrive">📥 ロジザード在庫CSVを取込</button>
+        <span id="lzDriveInfo" class="muted">更新日時を確認中...</span>
+      </span>
+      <details style="margin-left:4px"><summary class="muted" style="cursor:pointer">ファイルを選んで取込</summary>
+        <form id="lzForm" style="display:flex;gap:6px;align-items:center;margin-top:6px" title="ロジザードのロケ別在庫一覧CSV (CZ04003) を手元から選んでアップロードする経路 (Drive取得が使えないとき用)">
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">📥 選んだCSVを取込</button>
+        </form>
+      </details>
       ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
       <span id="opStatus" class="muted"></span>
     </div>
@@ -3546,37 +3598,74 @@ document.getElementById('neForm').addEventListener('submit', function(ev) {
 // ロジザード在庫CSV (在庫数のみ上書き。商品ID表記の蓄積も兼ねる)。
 // プレビュー→確認→取込の二段: CSVに無い取扱中商品は「売り切れ=在庫0」で上書きするため、
 // 絞り込んだCSVの誤取込 (大量の在庫0化) を件数確認で止める
-document.getElementById('lzForm').addEventListener('submit', function(ev) {
-  ev.preventDefault();
-  var form = ev.target;
+// 取込元 (Gドライブ / ファイル選択) が違うだけで、確認〜取込の流れは共通。
+// send(extra) が fetch の Promise を返す。extra は commit 時に {commit,fileHash,planHash} が入る
+function lzImport(send) {
   setStatus('ロジザード在庫CSVを確認中...');
-  fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: new FormData(form) })
+  send({})
     .then(function(r){ return r.json(); })
     .then(function(j) {
       if (!j.ok) { setStatus(''); alert('取込エラー: ' + impErr(j.error) + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
       setStatus('');
-      if (!confirm('ロジザード在庫CSVを取り込みます:\\n' +
+      var d = j.drive_file;
+      var srcNote = d ? ('取込元: ' + d.filename + ' (Gドライブ)\\n更新日時: ' + (d.modified_time_jst || '不明') +
+        (d.size_kb != null ? ' / ' + d.size_kb.toLocaleString('ja-JP') + ' KB' : '') + '\\n\\n') : '';
+      if (!confirm(srcNote + 'ロジザード在庫CSVを取り込みます:\\n' +
         '・在庫を更新: ' + j.matched + '商品\\n' +
         '・CSVに行なし → 売り切れ扱いで在庫0: ' + j.zeroFill + '商品\\n' +
         (j.skippedNonGood ? '・良品以外の行を除外: ' + j.skippedNonGood + '行\\n' : '') +
         '\\n※在庫0の件数が想定より多い場合、絞り込んだCSVの可能性があります (全ロケ・全商品でエクスポートしてください)。よろしいですか?')) return;
       confirmCycleReset(function() {
         setStatus('取込中...');
-        var fd2 = new FormData(form);
-        fd2.append('commit', '1');
-        fd2.append('fileHash', j.fileHash);
-        fd2.append('planHash', j.planHash);
-        fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd2 })
+        send({ commit: '1', fileHash: j.fileHash, planHash: j.planHash })
           .then(function(r){ return r.json(); })
           .then(function(j2) {
             if (!j2.ok) { setStatus(''); alert('取込エラー: ' + impErr(j2.error)); return; }
-            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品)。再読み込みします...');
+            var d2 = j2.drive_file;
+            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品' +
+              (d2 && d2.modified_time_jst ? ' / CSV更新日時 ' + d2.modified_time_jst : '') + ')。再読み込みします...');
             location.reload();
           })
           .catch(function(e){ setStatus('通信エラー: ' + e.message); });
       });
     })
     .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+}
+
+// Gドライブから直接取込 (通常はこちら。run-zaiko.bat が置いた logizard_zaikosu.csv を読む)
+document.getElementById('btnLzDrive').addEventListener('click', function() {
+  lzImport(function(extra) {
+    return fetch('/apps/purchase-orders/api/logizard-stock/drive', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(extra),
+    });
+  });
+});
+
+// Gドライブ上のCSVの更新日時を表示 (最新かどうかを取込前に判断できるように)
+(function() {
+  var el = document.getElementById('lzDriveInfo');
+  if (!el) return;
+  fetch('/apps/purchase-orders/api/logizard-stock/drive-info')
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { el.textContent = '⚠️ Gドライブ確認不可: ' + j.error; el.title = j.error; return; }
+      var jst = j.modified_time_jst || '不明';
+      var today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      var isToday = jst.slice(0, 10) === today;
+      el.textContent = (isToday ? '🟢 ' : '⚠️ ') + 'CSV更新 ' + jst + (isToday ? '' : ' (今日のものではありません)');
+      el.title = j.filename + (j.size != null ? ' / ' + Math.round(j.size / 1024).toLocaleString('ja-JP') + ' KB' : '');
+    })
+    .catch(function(e){ el.textContent = '⚠️ Gドライブ確認不可: ' + e.message; });
+})();
+
+document.getElementById('lzForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var form = ev.target;
+  lzImport(function(extra) {
+    var fd = new FormData(form);
+    Object.keys(extra).forEach(function(k){ fd.append(k, extra[k]); });
+    return fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd });
+  });
 });
 var btnNeClear = document.getElementById('btnNeClear');
 if (btnNeClear) btnNeClear.addEventListener('click', function() {
