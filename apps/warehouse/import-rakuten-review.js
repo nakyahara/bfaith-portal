@@ -46,12 +46,20 @@ function moveTo(srcPath, destDir) {
   return dest;
 }
 
-/** 低評価GChat通知。本文・注文番号は載せない (PII最小化)。
+/** 低評価GChat通知。タイトル・本文を載せる (2026-07-20 中原さん要望。レビューは楽天上で
+ *  公開済みの内容のため社内通知に出してよい)。注文番号は引き続き載せない (PII最小化)。
  *  キュー方式: 新規★1-2は rakuten_review_low_notify_queue に積み、送信2xxで削除。
  *  送信失敗時はキューに残る → 次回実行 (翌朝daily-sync) で自動リトライ (Codex R2 High:
  *  取込duplicate化で通知が恒久欠落するのを防ぐ)。通知失敗で取込は失敗にしない (fail-soft) */
 async function notifyLowRatings(dbRw) {
-  const queued = dbRw.prepare(`SELECT * FROM rakuten_review_low_notify_queue ORDER BY posted_at`).all();
+  // 移行前に積まれた旧キュー行 (title/body=NULL) は fact から補完 (Codex Medium)
+  const queued = dbRw.prepare(`
+    SELECT q.review_url, q.review_type, q.item_name, q.rating, q.posted_at,
+           COALESCE(q.title, f.title) AS title, COALESCE(q.body, f.body) AS body
+      FROM rakuten_review_low_notify_queue q
+      LEFT JOIN fact_rakuten_reviews f ON f.review_url = q.review_url
+     ORDER BY q.posted_at
+  `).all();
   if (queued.length === 0) return;
   if ((process.env.NOTIFY_LOW_REVIEW || '1') === '0') {
     console.log(`  (低評価通知は NOTIFY_LOW_REVIEW=0 のためスキップ: ${queued.length}件はキューに残置)`);
@@ -65,7 +73,14 @@ async function notifyLowRatings(dbRw) {
   const lines = queued.slice(0, 10).map(r => {
     const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
     const what = r.review_type === 'shop' ? 'ショップレビュー' : (r.item_name || '(商品名不明)').slice(0, 40);
-    return `・${stars} ${what}\n    投稿: ${r.posted_at}`;
+    // レビュー内容 (タイトル・本文とも改行は畳み、結合後300字で切る。GChatの読みやすさ優先)
+    const title = (r.title || '').replace(/\s+/g, ' ').trim();
+    const body = (r.body || '').replace(/\s+/g, ' ').trim();
+    const content = [title && `「${title}」`, body].filter(Boolean).join(' ');
+    const contentLine = content
+      ? `\n    ${content.length > 300 ? `${content.slice(0, 300)}…` : content}`
+      : '';
+    return `・${stars} ${what}\n    投稿: ${r.posted_at}${contentLine}`;
   });
   if (queued.length > 10) lines.push(`…ほか ${queued.length - 10} 件`);
   const text = [
