@@ -707,6 +707,13 @@ function renderPage() {
         <div id="mfTable"></div>
       </div>
 
+      <!-- MF振替伝票入力用 仕訳 -->
+      <div class="card">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: 楽天）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。金額0の行はMF側での入力不要です。</p>
+        <div id="mfJournalTable"><span class="meta">店舗別仕訳書CSVを取り込むと表示されます（PF手数料・運賃・広告費の算出に必要）</span></div>
+      </div>
+
       <!-- セグメント別集計 -->
       <div class="card">
         <h2>工程5: セグメント別集計（管理会計用）</h2>
@@ -930,6 +937,9 @@ function renderPage() {
         document.getElementById('mfTable').innerHTML = mfHtml;
       }
 
+      // MF振替伝票入力用 仕訳
+      renderMfJournal();
+
       // セグメント別
       renderSegmentTable(data);
 
@@ -992,6 +1002,103 @@ function renderPage() {
       return { seikyuTotal: seikyuTotalWithTax, adCost, coupon, pfFee, 消費税合計: taxAmount };
     }
 
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    // 仕訳書の配送系品目（あれば）を運賃として合算（税込）
+    // ※現状の仕訳書には配送系品目がなく通常0円。過去に楽天から運賃が控除されていた時期との互換用
+    // 部分一致判定のため、何を運賃に分類したかは items で返して画面に明示する
+    function getFreightFromBilling(byCategory) {
+      const result = { total: 0, items: [] };
+      if (!byCategory) return result;
+      for (const cat of byCategory) {
+        if (cat.品目 && /配送|運賃|宅配|ロジ|あす楽|日本郵便/.test(cat.品目)) {
+          result.total += (cat.金額 || 0) + (cat.消費税額 || 0);
+          result.items.push(cat.品目);
+        }
+      }
+      return result;
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる。
+    // 対応関係（会計処理の実務ルール）:
+    //   貸方 売上高/課売10%    = 商品売上(10%)（クーポン値引後・税込）
+    //   貸方 売上高/課売(軽)8% = 商品売上(8%)（クーポン値引後・税込）
+    //   借方 支払手数料【原価】/課仕10% = PF手数料（請求合計 − 運賃 − 広告費 − クーポン）
+    //   借方 発送運賃【原価】/課仕10%   = 運賃（仕訳書の配送系品目。該当なしなら0）
+    //   借方 広告宣伝費【原価】/課仕10% = 広告費
+    //   借方 売掛金_EC売上/対象外      = 差し引き入金額（売上 − PF手数料 − 運賃 − 広告費）
+    function buildMfJournalRows(mf, pf, freight, ad) {
+      const s10 = mf['商品売上(10%)'] || 0;
+      const s8 = mf['商品売上(8%)'] || 0;
+      return [
+        { dc: 'credit', account: '売上高', sub: '楽天', tax: '課売10%', amount: s10, memo: '楽天売上' },
+        { dc: 'credit', account: '売上高', sub: '楽天', tax: '課売(軽)8%', amount: s8, memo: '楽天売上 軽減8%' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: '楽天', tax: '課仕10%', amount: pf, memo: '楽天 PF手数料' },
+        { dc: 'debit', account: '発送運賃【原価】', sub: '楽天', tax: '課仕10%', amount: freight, memo: '楽天 運賃' },
+        { dc: 'debit', account: '広告宣伝費【原価】', sub: '楽天', tax: '課仕10%', amount: ad, memo: '楽天 広告費' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: '楽天', tax: '対象外', amount: s10 + s8 - pf - freight - ad, memo: '楽天 差し引き入金額' },
+      ];
+    }
+
+    function mfJournalTableHtml(rows) {
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）※売掛金_EC売上は差引で自動算出のため、計算上必ず一致します。売上・費用の各金額が集計表と合っているかを確認してください</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 端数調整・按分ロジックを確認してください</div>';
+
+      if (rows.some(r => Math.round(r.amount) < 0)) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ マイナス金額の行があります。MFに入力する際は、その行だけ借方/貸方を入れ替えて絶対値で入力してください。</div>';
+      }
+
+      return html;
+    }
+
+    function renderMfJournal() {
+      const el = document.getElementById('mfJournalTable');
+      if (!lastData || !lastData.mfRow) {
+        el.innerHTML = '<span class="meta">注文データCSVをアップロードすると表示されます</span>';
+        return;
+      }
+      const bt = getBillingTotals();
+      if (!bt) {
+        el.innerHTML = '<span class="meta">店舗別仕訳書CSVを取り込むと表示されます（PF手数料・運賃・広告費の算出に必要）</span>';
+        return;
+      }
+      const fr = getFreightFromBilling(billingData.byCategory);
+      const freight = Math.round(fr.total);
+      const ad = Math.round(bt.adCost);
+      const pf = Math.round(bt.pfFee) - freight;
+      let html = mfJournalTableHtml(buildMfJournalRows(lastData.mfRow, pf, freight, ad));
+      if (fr.items.length) {
+        html += '<p class="meta" style="margin-top:4px">運賃として分類した品目: ' + fr.items.map(esc).join('、') + '（名称の部分一致判定のため、誤分類があればPF手数料側と読み替えてください）</p>';
+      }
+      if (Math.round(bt.pfFee) < 0) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ PF手数料がマイナスです（請求合計 &lt; 広告費+クーポン）。仕訳書CSVと注文データの月ズレの可能性があります。なお確定保存時のPF手数料は0円に切り上げて保存されるため、確定後の履歴仕訳とは一致しません。</div>';
+      }
+      el.innerHTML = html;
+    }
+
     function updateConfirmState() {
       const ready = lastData && billingData;
       document.getElementById('confirmBtn').disabled = !ready;
@@ -1032,7 +1139,9 @@ function renderPage() {
       const seg = data.bySegment;
       const bt = getBillingTotals();
       const ad = bt ? bt.adCost : 0;
-      const pf = bt ? bt.pfFee : 0;
+      // PF手数料は運賃(配送系品目)分離後の値で統一（変動費サマリー・MF仕訳と同じ定義）
+      const freight = bt ? Math.round(getFreightFromBilling(billingData ? billingData.byCategory : null).total) : 0;
+      const pf = bt ? (Math.round(bt.pfFee) - freight) : 0;
 
       // セグメント1・2・3の売上按分
       const allocTargets = ['1', '2', '3'];
@@ -1087,13 +1196,13 @@ function renderPage() {
       if (bt) {
         let csHtml = '<table><tr><th>PF手数料</th><th>運賃</th><th>広告費</th><th>店舗発行クーポン利用分</th><th>合計</th></tr>';
         csHtml += '<tr>';
-        csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.pfFee) + '</td>';
-        csHtml += '<td class="num" style="color:#aaa">-</td>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(pf) + '</td>';
+        csHtml += '<td class="num" style="font-weight:bold">' + fmt(freight) + '</td>';
         csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.adCost) + '</td>';
         csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.coupon) + '</td>';
         csHtml += '<td class="num" style="font-weight:bold">' + fmt(bt.seikyuTotal) + '</td>';
         csHtml += '</tr></table>';
-        csHtml += '<p class="meta" style="margin-top:4px">PF手数料 = 請求合計(' + fmt(bt.seikyuTotal) + ') − 広告費(' + fmt(bt.adCost) + ') − クーポン(' + fmt(bt.coupon) + ')</p>';
+        csHtml += '<p class="meta" style="margin-top:4px">PF手数料 = 請求合計(' + fmt(bt.seikyuTotal) + ') − 運賃(' + fmt(freight) + ') − 広告費(' + fmt(bt.adCost) + ') − クーポン(' + fmt(bt.coupon) + ')</p>';
         document.getElementById('costSummary').innerHTML = csHtml;
 
         // セグメント別変動費按分テーブル
@@ -1116,6 +1225,9 @@ function renderPage() {
         cbHtml += '<td class="num">' + fmt(cbTotPf) + '</td>';
         cbHtml += '<td class="num">' + fmt(cbTotAd) + '</td>';
         cbHtml += '<td class="num">' + fmt(cbTotPf + cbTotAd) + '</td></tr></table>';
+        if (freight > 0) {
+          cbHtml += '<p class="meta" style="margin-top:4px">※運賃（' + fmt(freight) + '円）はセグメント按分対象外のため、この表の変動費合計には含まれていません</p>';
+        }
         document.getElementById('costBySegment').innerHTML = cbHtml;
       } else {
         document.getElementById('costSummary').innerHTML = '<span class="meta">店舗別仕訳書CSVを取り込むと表示されます</span>';
@@ -1163,6 +1275,7 @@ function renderPage() {
         document.getElementById('billingResult').innerHTML = html;
         updateConfirmState();
         if (lastData) renderSegmentTable(lastData); // 広告費反映でセグメント再描画
+        renderMfJournal();
       } catch(e) {
         document.getElementById('billingResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
       }
@@ -1238,7 +1351,7 @@ function renderPage() {
 
           // MF連携用
           const mf = row.mf_row || {};
-          if (mf['合計']) {
+          if (mf['合計'] != null) {
             const mfCols = ['商品売上(10%)', '商品売上(8%)', '合計'];
             html += '<h3 style="font-size:13px;color:#555;margin-bottom:4px">MF連携用 税込み集計</h3>';
             html += '<table><tr>';
@@ -1246,6 +1359,28 @@ function renderPage() {
             html += '</tr><tr>';
             mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
             html += '</tr></table>';
+          }
+
+          // MF振替伝票入力用 仕訳（PF手数料・運賃・広告費が復元できる月のみ）
+          if (mf['合計'] != null) {
+            let slip = null;
+            const histBill = row.billing;
+            if (histBill && histBill.変動費) {
+              // Excel過去データ形式: 変動費にPF手数料・運賃・広告費が直接入っている
+              slip = { pf: histBill.変動費.PF手数料 || 0, freight: histBill.変動費.運賃 || 0, ad: histBill.変動費.広告費 || 0 };
+            } else if (row.pf_fee != null) {
+              // 仕訳書CSV形式: 保存済みpf_fee（運賃込み）から配送系品目を分離
+              // 当月表示と同じく運賃を先に丸めてから引き、PF+運賃の合計を保存値に一致させる
+              const hFreight = Math.round(getFreightFromBilling(Array.isArray(histBill) ? histBill : null).total);
+              slip = { pf: (row.pf_fee || 0) - hFreight, freight: hFreight, ad: row.ad_cost || 0 };
+            }
+            if (slip) {
+              html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+              html += mfJournalTableHtml(buildMfJournalRows(mf, Math.round(slip.pf), Math.round(slip.freight), Math.round(slip.ad)));
+              if (Math.round(slip.pf) < 0) {
+                html += '<p class="meta">※PF手数料がマイナスです。確定保存時にPF手数料が0円に切り上げられた月は元の値を復元できないため、この仕訳は参考値です。</p>';
+              }
+            }
           }
 
           // セグメント別
