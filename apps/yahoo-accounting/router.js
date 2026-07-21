@@ -800,6 +800,13 @@ function renderPage() {
         <div id="mfTable"></div>
       </div>
 
+      <!-- MF振替伝票入力用 仕訳 -->
+      <div class="card" id="mfJournalCard" style="display:none">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: Yahoo）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。金額0の行はMF側での入力不要です。</p>
+        <div id="mfJournalTable"><span class="meta">請求明細CSVを取り込むと表示されます（PF手数料・広告費の算出に必要）</span></div>
+      </div>
+
       <!-- セグメント別集計 -->
       <div class="card">
         <h2>セグメント別集計（管理会計用）</h2>
@@ -1028,6 +1035,79 @@ function renderPage() {
         adCost: billingData.adCost || 0,
         pfFee: billingData.pfFee || 0,
       };
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる。
+    // 対応関係（会計処理の実務ルール）:
+    //   貸方 売上高/課売10%    = 受取明細ベース売上(10%・税込)
+    //   貸方 売上高/課売(軽)8% = 受取明細ベース売上(8%・税込)
+    //   借方 支払手数料【原価】/課仕10% = PF手数料（請求合計 − 広告費）
+    //   借方 広告宣伝費【原価】/課仕10% = 広告費（クリック課金型広告利用料）
+    //   借方 売掛金_EC売上/対象外      = 差し引き入金額（売上 − PF手数料 − 広告費）
+    function buildMfJournalRows(s10, s8, pf, ad) {
+      return [
+        { dc: 'credit', account: '売上高', sub: 'Yahoo', tax: '課売10%', amount: s10, memo: 'Yahoo売上' },
+        { dc: 'credit', account: '売上高', sub: 'Yahoo', tax: '課売(軽)8%', amount: s8, memo: 'Yahoo売上 軽減8%' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: 'Yahoo', tax: '課仕10%', amount: pf, memo: 'Yahoo PF手数料' },
+        { dc: 'debit', account: '広告宣伝費【原価】', sub: 'Yahoo', tax: '課仕10%', amount: ad, memo: 'Yahoo 広告費' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: 'Yahoo', tax: '対象外', amount: s10 + s8 - pf - ad, memo: 'Yahoo 差し引き入金額' },
+      ];
+    }
+
+    function mfJournalTableHtml(rows) {
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）※売掛金_EC売上は差引で自動算出のため、計算上必ず一致します。売上・費用の各金額が集計表と合っているかを確認してください</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 端数調整・按分ロジックを確認してください</div>';
+
+      if (rows.some(r => Math.round(r.amount) < 0)) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ マイナス金額の行があります。MFに入力する際は、その行だけ借方/貸方を入れ替えて絶対値で入力してください。</div>';
+      }
+
+      return html;
+    }
+
+    function renderMfJournal() {
+      const el = document.getElementById('mfJournalTable');
+      if (!lastData || !lastData.receiptByTax) {
+        el.innerHTML = '<span class="meta">受取明細CSVとNE_Items_Pro CSVを取り込むと表示されます</span>';
+        return;
+      }
+      const bt = getBillingTotals();
+      if (!bt) {
+        el.innerHTML = '<span class="meta">請求明細CSVを取り込むと表示されます（PF手数料・広告費の算出に必要）</span>';
+        return;
+      }
+      const s10 = Math.round(lastData.receiptByTax['10'].売上);
+      const s8 = Math.round(lastData.receiptByTax['8'].売上);
+      const ad = Math.round(bt.adCost);
+      const pf = Math.round(bt.pfFee);
+      let html = mfJournalTableHtml(buildMfJournalRows(s10, s8, pf, ad));
+      if (pf < 0) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ PF手数料がマイナスです（請求合計 &lt; 広告費）。請求明細CSVと受取明細の月ズレの可能性があります。なお確定保存時のPF手数料は0円に切り上げて保存されるため、確定後の履歴仕訳とは一致しません。</div>';
+      }
+      el.innerHTML = html;
     }
 
     function updateConfirmState() {
@@ -1360,6 +1440,10 @@ function renderPage() {
       mfHtml += '<td class="num" style="font-weight:bold">' + fmt(mf10 + mf8) + '</td></tr></table>';
       document.getElementById('mfTable').innerHTML = mfHtml;
 
+      // ─── MF振替伝票入力用 仕訳 ───
+      document.getElementById('mfJournalCard').style.display = 'block';
+      renderMfJournal();
+
       // ─── セグメント別集計 ───
       renderSegmentTableFromReceipt(bySegment, excluded);
 
@@ -1404,7 +1488,10 @@ function renderPage() {
         document.getElementById('billingResult').innerHTML = html;
 
         updateConfirmState();
-        if (lastData) renderSegmentTable(lastData);
+        if (lastData && lastData.receiptBySegment) {
+          renderSegmentTableFromReceipt(lastData.receiptBySegment, lastData.receiptExcluded || {});
+        }
+        renderMfJournal();
       } catch(e) {
         document.getElementById('billingResult').innerHTML = '<div class="err">エラー: ' + e.message + '</div>';
       }
@@ -1509,6 +1596,16 @@ function renderPage() {
             html += '</tr><tr>';
             mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
             html += '</tr></table>';
+          }
+
+          // MF振替伝票入力用 仕訳（税率別売上とPF手数料が保存されている月のみ。Excel移行分はby_tax空のため対象外）
+          const hbt = row.by_tax || {};
+          if ((hbt['10'] || hbt['8']) && row.pf_fee != null) {
+            const s10 = Math.round((hbt['10'] && hbt['10'].売上) || 0);
+            const s8 = Math.round((hbt['8'] && hbt['8'].売上) || 0);
+            const hPf = Math.round(row.pf_fee || 0);
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+            html += mfJournalTableHtml(buildMfJournalRows(s10, s8, hPf, ad));
           }
 
           // セグメント別
