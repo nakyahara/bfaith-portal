@@ -52,6 +52,8 @@ import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter, { startMgmtAutoSyncScheduler } from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
+import inboundInfoRouter from './apps/inbound-info/router.js';
+import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
@@ -664,6 +666,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'inbound-info',
+    name: '入庫情報管理',
+    description: '入数・BCシール・保管荷姿・いろは在庫化などの入庫マスタ。新商品はNE商品マスタから毎日自動追加 (旧: 入庫情報管理表スプレッドシート)',
+    icon: '📥',
+    path: '/apps/inbound-info',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'giftset-assembly',
     name: 'ギフトセット組み依頼',
     description: '構成品のピッキング表(ロジザード貼り付け)と子会社Notionの作業カードを発行',
@@ -1170,6 +1181,7 @@ app.use('/api/ai-insights', aiInsightsApiRouter);
 app.use('/apps/ai-insights', requireAppAccess('ai-insights'), express.json({ limit: '256kb' }), aiInsightsRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
+app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
@@ -1374,6 +1386,10 @@ app.listen(PORT, () => {
 
   // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
   startRysCron();
+
+  // 入庫情報管理: NE商品マスタ(ミラー)から新商品を自動追加 (INBOUND_INFO_SYNC_ENABLED=true で起動、
+  // 既定 JST 09:00 = ミラー同期完了後。Dark Launch)
+  startInboundInfoCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
