@@ -2552,6 +2552,11 @@ function createInboundInfoTables() {
   // 同一商品コードでも管理コード違いで併存し得るため複合 UNIQUE (NULL 管理コードは '' に正規化して比較)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_origin_uni
              ON f_inbound_origin(COALESCE(管理コード, ''), code_key)`);
+
+  // version 列は開発途中 (Codex R2) で追加したため、それ以前に作成された DB への migration
+  // (本番は初回デプロイから version 入り DDL だが、addColumnIfMissing は冪等なので常置で無害)
+  addColumnIfMissing('f_inbound_info', 'version', 'INTEGER NOT NULL DEFAULT 1');
+  addColumnIfMissing('f_inbound_origin', 'version', 'INTEGER NOT NULL DEFAULT 1');
 }
 // ▲▲▲ 入庫情報管理 ▲▲▲
 
