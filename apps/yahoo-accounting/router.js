@@ -1107,6 +1107,11 @@ function renderPage() {
       if (pf < 0) {
         html += '<div class="warn" style="margin-top:8px">⚠️ PF手数料がマイナスです（請求合計 &lt; 広告費）。請求明細CSVと受取明細の月ズレの可能性があります。なお確定保存時のPF手数料は0円に切り上げて保存されるため、確定後の履歴仕訳とは一致しません。</div>';
       }
+      const rYm = receiptData && receiptData.receiptYearMonth;
+      const bYm = billingData.billingYearMonth;
+      if (rYm && bYm && rYm !== bYm) {
+        html = '<div class="err" style="margin-bottom:8px">⚠️ 対象月が一致しません — 受取明細: <b>' + rYm + '</b> / 請求明細: <b>' + bYm + '</b>。別月のCSVを取り込んでいないか確認してください。</div>' + html;
+      }
       el.innerHTML = html;
     }
 
