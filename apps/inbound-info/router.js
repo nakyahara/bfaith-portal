@@ -62,11 +62,11 @@ router.get('/api/list', (req, res) => {
 // ─── 1行更新 ───
 router.post('/api/update', (req, res) => {
   try {
-    const { code_key, fields, expected_updated_at } = req.body || {};
+    const { code_key, fields, expected_version } = req.body || {};
     if (!code_key || typeof fields !== 'object' || fields == null) {
       return res.status(400).json({ ok: false, error: 'bad_request' });
     }
-    const r = updateInbound(code_key, fields, currentUser(req), expected_updated_at);
+    const r = updateInbound(code_key, fields, currentUser(req), expected_version);
     if (!r.ok) {
       const status = r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400;
       return res.status(status).json(r);
@@ -210,16 +210,19 @@ router.post('/api/import', upload.single('file'), async (req, res) => {
       return res.status(400).json({ ok: false, error: parsed.error, headers: parsed.headers });
     }
     let originRows = null;
-    let originHeaderError = null;
     const originWs = wb.getWorksheet('原産国');
     if (originWs) {
       const po = parseOriginSheet(originWs);
-      if (po.error) originHeaderError = { error: po.error };
-      else originRows = po.rows;
+      // Codex R2 High: 原産国シートがあるのにヘッダー不正なら、入数マスタだけ
+      // 取り込んで ok を返さず、書込み前に 400 で止める (全シート検証 → 一括反映)
+      if (po.error) {
+        return res.status(400).json({ ok: false, error: 'origin_header_mismatch', headers: po.headers });
+      }
+      originRows = po.rows;
     }
     const user = currentUser(req);
     const reports = importWorkbook(parsed.rows, originRows, { dryRun, user });
-    res.json({ ok: true, dry_run: dryRun, irisu: reports.irisu, origin: reports.origin ?? originHeaderError });
+    res.json({ ok: true, dry_run: dryRun, irisu: reports.irisu, origin: reports.origin });
   } catch (e) {
     console.error('[inbound-info] import', e.message);
     res.status(500).json({ ok: false, error: 'import_failed' });

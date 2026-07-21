@@ -280,10 +280,10 @@ function loadListRender() {
 async function saveRow(key) {
   const fields = { 商品名: document.getElementById('e-商品名').value, 入数: document.getElementById('e-入数').value };
   for (const f of FIELDS) fields[f] = document.getElementById('e-' + f).value;
-  const expected = window._rows[key]?.updated_at ?? null;
+  const expected = window._rows[key]?.version ?? null;
   try {
     await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code_key: key, fields, expected_updated_at: expected }) });
+      body: JSON.stringify({ code_key: key, fields, expected_version: expected }) });
     state.editing = null;
     showMsg('msg-list', 'ok', '保存しました');
     await loadList(); loadStats();
@@ -399,7 +399,7 @@ function originEditNew() {
 async function originSave(id) {
   const body = {
     id,
-    expected_updated_at: id == null ? null : (window._origin?.[id]?.updated_at ?? null),
+    expected_version: id == null ? null : (window._origin?.[id]?.version ?? null),
     管理コード: document.getElementById('o-管理コード').value,
     識別番号: document.getElementById('o-識別番号').value,
     商品コード: document.getElementById('o-商品コード').value,
@@ -457,7 +457,7 @@ async function doImport(dryRun) {
     document.getElementById('btn-import-live').disabled = !dryRun;
     if (!dryRun) { loadStats(); loadList(); }
   } catch (e) {
-    const m = { invalid_xlsx: 'xlsxとして読み込めませんでした', header_mismatch: '1行目のヘッダーが想定と異なります (商品コード/商品名 が必要)', no_file: 'ファイルを選択してください' }[e.message] || e.message;
+    const m = { invalid_xlsx: 'xlsxとして読み込めませんでした', header_mismatch: '1行目のヘッダーが想定と異なります (商品コード/商品名 が必要)', origin_header_mismatch: '原産国シートのヘッダーが想定と異なります (商品コード列が必要)。全シートを確認してから再実行してください (どのシートも取り込んでいません)', no_file: 'ファイルを選択してください' }[e.message] || e.message;
     showMsg('msg-import', 'err', '取込に失敗しました: ' + m);
   }
 }

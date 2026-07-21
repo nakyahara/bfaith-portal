@@ -2514,6 +2514,9 @@ function createInboundInfoTables() {
       いろは在庫化作業有無 TEXT,
       memo                 TEXT,
       source               TEXT NOT NULL CHECK (source IN ('excel', 'auto', 'manual')),
+      -- 楽観ロック用 (Codex R2: updated_at 比較はミリ秒衝突があり得るため整数 version で行う。
+      --  f_mis_shipments と同じ方式)
+      version              INTEGER NOT NULL DEFAULT 1,
       created_at           TEXT NOT NULL,
       updated_at           TEXT NOT NULL,
       updated_by           TEXT,
@@ -2538,6 +2541,7 @@ function createInboundInfoTables() {
       商品名      TEXT,
       産地        TEXT,
       画像有無    INTEGER NOT NULL DEFAULT 0 CHECK (画像有無 IN (0, 1)),
+      version     INTEGER NOT NULL DEFAULT 1,
       created_at  TEXT NOT NULL,
       updated_at  TEXT NOT NULL,
       updated_by  TEXT,

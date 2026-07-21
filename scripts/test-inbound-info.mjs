@@ -140,19 +140,23 @@ if (!realXlsx) {
 
 // ─── 4. updateInbound ───
 console.log('\n[4] updateInbound');
-const target = db.prepare("SELECT code_key FROM f_inbound_info WHERE source = 'auto' LIMIT 1").get()
-  || db.prepare('SELECT code_key FROM f_inbound_info LIMIT 1').get();
-let u = updateInbound(target.code_key, { 入数: '250', BF保管荷姿: 'そのまま' }, 'tester');
+const target = db.prepare("SELECT code_key, version FROM f_inbound_info WHERE source = 'auto' LIMIT 1").get()
+  || db.prepare('SELECT code_key, version FROM f_inbound_info LIMIT 1').get();
+let u = updateInbound(target.code_key, { 入数: '250', BF保管荷姿: 'そのまま' }, 'tester', target.version);
 ok(u.ok, '更新成功');
 const updated = db.prepare('SELECT * FROM f_inbound_info WHERE code_key = ?').get(target.code_key);
 ok(updated.入数 === 250 && updated.source === 'manual' && updated.updated_by === 'tester', '入数反映 + source=manual + updated_by');
-u = updateInbound(target.code_key, { 入数: '-5' }, 'tester');
+ok(updated.version === target.version + 1, 'version がインクリメントされる');
+const v2 = updated.version;
+u = updateInbound(target.code_key, { 入数: '-5' }, 'tester', v2);
 ok(!u.ok && u.error === 'invalid_irisu', '負の入数を拒否');
-u = updateInbound(target.code_key, { 入数: '1.5' }, 'tester');
+u = updateInbound(target.code_key, { 入数: '1.5' }, 'tester', v2);
 ok(!u.ok && u.error === 'invalid_irisu', '小数の入数を拒否');
-u = updateInbound(target.code_key, { 商品名: '  ' }, 'tester');
+u = updateInbound(target.code_key, { 商品名: '  ' }, 'tester', v2);
 ok(!u.ok && u.error === 'empty_name', '商品名の空クリアを拒否');
-u = updateInbound('no-such-code', { 入数: 1 }, 'tester');
+u = updateInbound(target.code_key, { 入数: 1 }, 'tester');
+ok(!u.ok && u.error === 'version_required', 'version 未指定は拒否 (楽観ロック必須)');
+u = updateInbound('no-such-code', { 入数: 1 }, 'tester', 1);
 ok(!u.ok && u.error === 'not_found', '存在しないコードは not_found');
 ok(parseIrisu(null).ok && parseIrisu(null).value === null, '入数 null は許容 (未記入)');
 
@@ -171,7 +175,8 @@ let o = upsertOrigin({ 管理コード: 'TEST', 商品コード: 'origintest01',
 ok(o.ok, '原産国: 新規追加');
 const oDup = upsertOrigin({ 管理コード: 'TEST', 商品コード: 'ORIGINTEST01', 産地: '中国' }, 'tester');
 ok(!oDup.ok && oDup.error === 'duplicate', '原産国: 大文字小文字違いの重複を拒否');
-o = upsertOrigin({ id: o.id, 管理コード: 'TEST', 商品コード: 'origintest01', 商品名: 'テスト改', 産地: '米国', 画像有無: false }, 'tester');
+const oVer = listOrigin().find((x) => x.商品コード === 'origintest01').version;
+o = upsertOrigin({ id: o.id, expected_version: oVer, 管理コード: 'TEST', 商品コード: 'origintest01', 商品名: 'テスト改', 産地: '米国', 画像有無: false }, 'tester');
 ok(o.ok, '原産国: 更新');
 const oRow = listOrigin().find((x) => x.商品コード === 'origintest01');
 ok(oRow && oRow.産地 === '米国' && oRow.画像有無 === 0, '原産国: 更新内容反映');
@@ -188,19 +193,21 @@ ok(list2.total >= 1, `検索 "${searchTerm}" ヒット (${list2.total}件)`);
 const st = stats();
 ok(typeof st.total === 'number' && typeof st.auto_new === 'number', 'stats 形状');
 
-// ─── 7. Codex R1 対応の検証 ───
+// ─── 7. Codex R1/R2 対応の検証 ───
 console.log('\n[7] 楽観ロック / 一括トランザクション');
-const lockRow = db.prepare('SELECT code_key, updated_at FROM f_inbound_info LIMIT 1').get();
-let c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', 'wrong-timestamp');
-ok(!c1.ok && c1.error === 'conflict', '楽観ロック: updated_at 不一致で conflict');
-c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', lockRow.updated_at);
-ok(c1.ok, '楽観ロック: updated_at 一致で更新成功');
+const lockRow = db.prepare('SELECT code_key, version FROM f_inbound_info LIMIT 1').get();
+let c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', lockRow.version + 5);
+ok(!c1.ok && c1.error === 'conflict', '楽観ロック: version 不一致で conflict');
+c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', lockRow.version);
+ok(c1.ok, '楽観ロック: version 一致で更新成功');
 
 const oc = upsertOrigin({ 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '日本' }, 'tester');
 const ocRow = listOrigin().find((x) => x.商品コード === 'locktest01');
-let c2 = upsertOrigin({ id: oc.id, expected_updated_at: 'wrong', 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
+let c2 = upsertOrigin({ id: oc.id, expected_version: ocRow.version + 5, 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
 ok(!c2.ok && c2.error === 'conflict', '原産国 楽観ロック: conflict');
-c2 = upsertOrigin({ id: oc.id, expected_updated_at: ocRow.updated_at, 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
+c2 = upsertOrigin({ id: oc.id, 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
+ok(!c2.ok && c2.error === 'version_required', '原産国 楽観ロック: version 未指定は拒否');
+c2 = upsertOrigin({ id: oc.id, expected_version: ocRow.version, 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
 ok(c2.ok, '原産国 楽観ロック: 一致で更新成功');
 deleteOrigin(oc.id);
 

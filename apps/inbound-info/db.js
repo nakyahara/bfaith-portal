@@ -82,7 +82,7 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
   const off = Math.max(0, Number(offset) || 0);
   const rows = db.prepare(`
     SELECT code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, 直接ピックロケ保管,
-           BF保管荷姿, いろは在庫化作業有無, memo, source, updated_at, updated_by
+           BF保管荷姿, いろは在庫化作業有無, memo, source, version, updated_at, updated_by
       FROM f_inbound_info ${where}
      ORDER BY (source = 'auto') DESC, code_key
      LIMIT ? OFFSET ?
@@ -91,23 +91,21 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
 }
 
 // ─── 1行更新 (UI から)。人が触った行は source='manual' に倒して「新着」から外す ───
-// expectedUpdatedAt: 楽観ロック (Codex R1 Medium)。編集開始時点の updated_at を渡し、
-//   他の人が先に保存していたら conflict を返して黙った上書きを防ぐ。
-export function updateInbound(key, fields, user, expectedUpdatedAt) {
+// expectedVersion: 楽観ロック (Codex R1 Medium / R2 Medium)。編集開始時点の version を必須で渡し、
+//   条件付き UPDATE (WHERE version = ?) の changes で判定する。updated_at 比較だと
+//   同一ミリ秒衝突と check-then-update の競合窓が残るため、整数 version を正とする。
+export function updateInbound(key, fields, user, expectedVersion) {
   const db = getMirrorDB();
   const k = codeKey(key);
-  const existing = db.prepare('SELECT code_key, updated_at FROM f_inbound_info WHERE code_key = ?').get(k);
-  if (!existing) return { ok: false, error: 'not_found' };
-  if (expectedUpdatedAt != null && existing.updated_at !== expectedUpdatedAt) {
-    return { ok: false, error: 'conflict' };
-  }
+  const ver = Number(expectedVersion);
+  if (!Number.isInteger(ver) || ver < 1) return { ok: false, error: 'version_required' };
 
   // 商品名は空にしない (誤クリアで一覧が読めなくなるため)
   if ('商品名' in fields && cleanText(fields.商品名) == null) {
     return { ok: false, error: 'empty_name' };
   }
 
-  const sets = ["source = 'manual'", 'updated_at = ?', 'updated_by = ?'];
+  const sets = ["source = 'manual'", 'version = version + 1', 'updated_at = ?', 'updated_by = ?'];
   const params = [utcIsoNow(), cleanText(user)];
   if ('入数' in fields) {
     const irisu = parseIrisu(fields.入数);
@@ -121,7 +119,13 @@ export function updateInbound(key, fields, user, expectedUpdatedAt) {
       params.unshift(cleanText(fields[f]));
     }
   }
-  db.prepare(`UPDATE f_inbound_info SET ${sets.join(', ')} WHERE code_key = ?`).run(...params, k);
+  const info = db.prepare(
+    `UPDATE f_inbound_info SET ${sets.join(', ')} WHERE code_key = ? AND version = ?`
+  ).run(...params, k, ver);
+  if (info.changes === 0) {
+    const exists = db.prepare('SELECT 1 FROM f_inbound_info WHERE code_key = ?').get(k);
+    return { ok: false, error: exists ? 'conflict' : 'not_found' };
+  }
   return { ok: true };
 }
 
@@ -215,7 +219,7 @@ export function importInboundRows(rows, { dryRun = false, user = null } = {}) {
     UPDATE f_inbound_info
        SET 商品コード = ?, 商品名 = ?, 入数 = ?, 入庫時BCシール貼りフラグ = ?,
            直接ピックロケ保管 = ?, BF保管荷姿 = ?, いろは在庫化作業有無 = ?,
-           source = 'excel', updated_at = ?, updated_by = ?
+           source = 'excel', version = version + 1, updated_at = ?, updated_by = ?
      WHERE code_key = ?
   `);
 
@@ -282,7 +286,7 @@ export function importWorkbook(irisuRows, originRows, { dryRun = false, user = n
 export function listOrigin() {
   const db = getMirrorDB();
   return db.prepare(`
-    SELECT id, 管理コード, 識別番号, 商品コード, 商品名, 産地, 画像有無, updated_at, updated_by
+    SELECT id, 管理コード, 識別番号, 商品コード, 商品名, 産地, 画像有無, version, updated_at, updated_by
       FROM f_inbound_origin
      ORDER BY COALESCE(管理コード, ''), 識別番号, code_key
   `).all();
@@ -302,7 +306,8 @@ export function importOriginRows(rows, { dryRun = false, user = null } = {}) {
   `);
   const upd = db.prepare(`
     UPDATE f_inbound_origin
-       SET 識別番号 = ?, 商品コード = ?, 商品名 = ?, 産地 = ?, 画像有無 = ?, updated_at = ?, updated_by = ?
+       SET 識別番号 = ?, 商品コード = ?, 商品名 = ?, 産地 = ?, 画像有無 = ?,
+           version = version + 1, updated_at = ?, updated_by = ?
      WHERE id = ?
   `);
   const apply = () => {
@@ -356,18 +361,19 @@ export function upsertOrigin(fields, user) {
   const id = fields.id != null ? Number(fields.id) : null;
   try {
     if (id != null && Number.isInteger(id)) {
-      const existing = db.prepare('SELECT updated_at FROM f_inbound_origin WHERE id = ?').get(id);
-      if (!existing) return { ok: false, error: 'not_found' };
-      // 楽観ロック (Codex R1 Medium): 編集開始時点の updated_at と一致しなければ conflict
-      if (fields.expected_updated_at != null && existing.updated_at !== fields.expected_updated_at) {
-        return { ok: false, error: 'conflict' };
-      }
-      db.prepare(`
+      // 楽観ロック (Codex R1 Medium / R2 Medium): version 必須の条件付き UPDATE で判定
+      const ver = Number(fields.expected_version);
+      if (!Number.isInteger(ver) || ver < 1) return { ok: false, error: 'version_required' };
+      const info = db.prepare(`
         UPDATE f_inbound_origin
            SET 管理コード = ?, 識別番号 = ?, 商品コード = ?, code_key = ?, 商品名 = ?, 産地 = ?, 画像有無 = ?,
-               updated_at = ?, updated_by = ?
-         WHERE id = ?
-      `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, cleanText(user), id);
+               version = version + 1, updated_at = ?, updated_by = ?
+         WHERE id = ? AND version = ?
+      `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, cleanText(user), id, ver);
+      if (info.changes === 0) {
+        const exists = db.prepare('SELECT 1 FROM f_inbound_origin WHERE id = ?').get(id);
+        return { ok: false, error: exists ? 'conflict' : 'not_found' };
+      }
       return { ok: true, id };
     }
     const info = db.prepare(`
