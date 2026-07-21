@@ -14,7 +14,9 @@ const HEADER_ANCHORS = {
 };
 
 // RFC4180 パーサ。CRLF/LF 混在・引用内改行・"" エスケープに対応。
-export function parseCsv(text) {
+// state (省略可) を渡すと構文情報を書き戻す: state.unclosedQuote = EOF 時点で引用符が
+// 閉じていなかったか (破損CSVの fail-closed 判定用。inbound-info の nefuda 取込で使用)。
+export function parseCsv(text, state = {}) {
   const rows = [];
   let row = [], field = '', inQuotes = false, i = 0;
   const n = text.length;
@@ -35,6 +37,7 @@ export function parseCsv(text) {
   }
   // 末尾フィールド/行 (最終行に改行が無い場合)
   if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  state.unclosedQuote = inQuotes;
   return rows;
 }
 

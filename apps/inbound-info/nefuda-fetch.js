@@ -39,7 +39,11 @@ const REQUIRED_HEADERS = ['商品ID', '商品名', 'バーコード', '有効期
  */
 export function parseNefudaCsv(buffer) {
   const text = decodeCp932(buffer);
-  const all = parseCsv(text).filter((r) => r.some((f) => String(f).trim() !== ''));
+  const parseState = {};
+  const all = parseCsv(text, parseState).filter((r) => r.some((f) => String(f).trim() !== ''));
+  if (parseState.unclosedQuote) {
+    throw vErr('nefuda.csv に閉じていない引用符があります (ファイル破損の可能性)。取込を中止し、前回の入荷予定を保持しました。');
+  }
   if (all.length === 0) throw vErr('nefuda.csv が空です (ヘッダ行もありません)。前回の入荷予定を保持しました。');
   const header = all[0].map((h) => String(h).trim());
   for (const name of REQUIRED_HEADERS) {

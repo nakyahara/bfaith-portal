@@ -271,6 +271,7 @@ ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n'), '
 ok(throwsParse('"商品ID","商品名"\r\n"a","b"\r\n'), 'パース拒否: 必須ヘッダ欠落');
 ok(throwsParse('"商品ID","商品名","バーコード","有効期限","商品ID"\r\n"a","b","c","d","e"\r\n'), 'パース拒否: ヘッダ重複');
 ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n"a","b","c"\r\n'), 'パース拒否: 列数不一致 (破損CSV)');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n"a","b","c","未閉鎖\r\n'), 'パース拒否: 閉じていない引用符 (破損CSV)');
 
 // 鮮度ガード (Codex nefuda R1 Medium): 反映済みより古い file_modified_time は上書き拒否
 const newer = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }],
