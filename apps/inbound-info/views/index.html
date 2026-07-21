@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>入庫情報管理</title>
+<style>
+  :root { --blue:#2563eb; --green:#16a34a; --orange:#ea580c; --gray:#6b7280; --bg:#f8fafc; --line:#e2e8f0; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", Meiryo, sans-serif;
+         margin:0; background:var(--bg); color:#1e293b; line-height:1.6; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 20px;
+           display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
+  header h1 { margin:0; font-size:18px; }
+  header .sub { color:var(--gray); font-size:13px; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; }
+  .chip { background:#eef2f7; border:1px solid var(--line); border-radius:999px; padding:4px 12px; font-size:12px; }
+  .chip b { font-size:14px; }
+  .chip.warn { background:#fef3c7; border-color:#fcd34d; }
+  .tabs { display:flex; gap:4px; padding:12px 20px 0; }
+  .tab { padding:9px 18px; border:1px solid var(--line); border-bottom:none; background:#eef2f7;
+         border-radius:8px 8px 0 0; cursor:pointer; font-weight:600; font-size:14px; }
+  .tab.active { background:#fff; color:var(--blue); }
+  .panel { display:none; background:#fff; border:1px solid var(--line); margin:0 20px 24px;
+           border-radius:0 8px 8px 8px; padding:20px; }
+  .panel.active { display:block; }
+  h2 { font-size:15px; margin:0 0 12px; border-left:4px solid var(--blue); padding-left:8px; }
+  input[type=text], input[type=number], select {
+    padding:7px 10px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; }
+  button { cursor:pointer; border:none; border-radius:6px; padding:9px 14px; font-size:13px; font-weight:700; color:#fff; }
+  .btn-blue{background:var(--blue);} .btn-green{background:var(--green);} .btn-orange{background:var(--orange);}
+  .btn-gray{background:var(--gray);} .btn-red{background:#dc2626;} button:disabled{opacity:.45; cursor:not-allowed;}
+  .btn-sm{ padding:4px 9px; font-size:12px; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  .toolbar .spacer { flex:1; }
+  .fchip { padding:6px 14px; border-radius:999px; border:1px solid var(--line); background:#f1f5f9;
+           cursor:pointer; font-size:13px; font-weight:600; color:#334155; }
+  .fchip.active { background:var(--blue); color:#fff; border-color:var(--blue); }
+  table { width:100%; border-collapse:collapse; margin-top:8px; font-size:13px; }
+  th,td { border:1px solid var(--line); padding:5px 8px; text-align:left; vertical-align:top; }
+  th { background:#f1f5f9; white-space:nowrap; }
+  td input { width:100%; }
+  tr.new-row td { background:#fefce8; }
+  .tag { display:inline-block; border-radius:4px; padding:0 6px; font-size:11px; font-weight:700; }
+  .tag.auto { background:#fef3c7; color:#92400e; }
+  .tag.excel { background:#e0e7ff; color:#3730a3; }
+  .tag.manual { background:#dcfce7; color:#166534; }
+  .msg { padding:10px 14px; border-radius:6px; margin:12px 0; font-size:14px; display:none; white-space:pre-wrap; }
+  .msg.ok{ background:#dcfce7; color:#166534; } .msg.err{ background:#fee2e2; color:#991b1b; }
+  .msg.info{ background:#dbeafe; color:#1e40af; }
+  .pager { display:flex; gap:8px; align-items:center; margin-top:10px; font-size:13px; }
+  .hint { font-size:12px; color:var(--gray); margin-top:3px; }
+  .code { font-family:ui-monospace, Consolas, monospace; }
+  .import-box { border:1px dashed #94a3b8; border-radius:8px; padding:16px; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>📥 入庫情報管理</h1>
+    <div class="sub">旧「入庫情報管理表」スプレッドシートの移行先。新商品はNE商品マスタ(ミラー)から毎日自動追加されます</div>
+  </div>
+  <div class="chips">
+    <span class="chip">総件数 <b id="st-total">–</b></span>
+    <span class="chip warn">入数未記入 <b id="st-missing">–</b></span>
+    <span class="chip warn">新着(未編集) <b id="st-new">–</b></span>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="list">入数マスタ</div>
+  <div class="tab" data-tab="origin">原産国</div>
+  <div class="tab" data-tab="import">Excel取込</div>
+</div>
+
+<!-- ─── 入数マスタ ─── -->
+<div class="panel active" id="panel-list">
+  <div class="toolbar">
+    <input type="text" id="q" placeholder="商品コード・商品名で検索" style="min-width:260px"
+           onkeydown="if(event.key==='Enter'){state.offset=0;loadList();}">
+    <button class="btn-blue btn-sm" onclick="state.offset=0;loadList()">検索</button>
+    <span class="fchip active" data-filter="all" onclick="setFilter(this)">すべて</span>
+    <span class="fchip" data-filter="missing" onclick="setFilter(this)">入数未記入</span>
+    <span class="fchip" data-filter="new" onclick="setFilter(this)">新着</span>
+    <span class="spacer"></span>
+    <input type="text" id="add-code" placeholder="商品コードを手動追加" style="width:180px">
+    <button class="btn-green btn-sm" onclick="addCode()">追加</button>
+    <button class="btn-orange btn-sm" id="btn-sync" onclick="syncNow()">🔄 新商品を今すぐ取込</button>
+  </div>
+  <div class="msg" id="msg-list"></div>
+  <table>
+    <thead><tr>
+      <th>商品コード</th><th>商品名</th><th style="width:80px">入数</th>
+      <th>BCシール</th><th>直接ピックロケ</th><th>BF保管荷姿</th><th>いろは在庫化</th>
+      <th>memo</th><th>状態</th><th style="width:110px">操作</th>
+    </tr></thead>
+    <tbody id="tbody-list"></tbody>
+  </table>
+  <div class="pager">
+    <button class="btn-gray btn-sm" id="pg-prev" onclick="page(-1)">← 前へ</button>
+    <span id="pg-info"></span>
+    <button class="btn-gray btn-sm" id="pg-next" onclick="page(1)">次へ →</button>
+  </div>
+  <datalist id="dl-bc"><option value="BCシール貼付必要"><option value="不要"></datalist>
+  <datalist id="dl-pick"><option value="直接ピックロケ"></datalist>
+  <datalist id="dl-nisugata">
+    <option value="そのまま"><option value="バラ"><option value="内箱で保管">
+    <option value="20L折りコン入替"><option value="120サイズ入替">
+  </datalist>
+  <datalist id="dl-iroha"><option value="有り"><option value="無し"></datalist>
+</div>
+
+<!-- ─── 原産国 ─── -->
+<div class="panel" id="panel-origin">
+  <h2>原産国 (食品表示など)</h2>
+  <div class="msg" id="msg-origin"></div>
+  <div class="toolbar">
+    <button class="btn-green btn-sm" onclick="originEditNew()">＋ 行を追加</button>
+  </div>
+  <table>
+    <thead><tr>
+      <th>管理コード</th><th>識別番号</th><th>商品コード</th><th>商品名</th><th>産地・数値等</th><th>画像</th><th style="width:110px">操作</th>
+    </tr></thead>
+    <tbody id="tbody-origin"></tbody>
+  </table>
+  <p class="hint">画像はスプレッドシート側に実体が無かったため「有無フラグ」のみ移行しています。</p>
+</div>
+
+<!-- ─── Excel取込 ─── -->
+<div class="panel" id="panel-import">
+  <h2>Excel取込 (初回移行・再取込)</h2>
+  <div class="import-box">
+    <p style="margin-top:0">「入庫情報管理表.xlsx」(シート: 入数マスタ / 原産国) を選択してください。
+       まず<b>プレビュー</b>で件数を確認し、問題なければ<b>本取込</b>を実行します。</p>
+    <input type="file" id="file" accept=".xlsx">
+    <div style="margin-top:10px; display:flex; gap:8px">
+      <button class="btn-blue" onclick="doImport(true)">① プレビュー (書き込みなし)</button>
+      <button class="btn-orange" id="btn-import-live" onclick="doImport(false)" disabled>② 本取込</button>
+    </div>
+    <p class="hint">本取込は同じ商品コードの行を Excel の値で上書きします (画面で編集した内容より Excel が優先されます)。</p>
+  </div>
+  <div class="msg" id="msg-import"></div>
+</div>
+
+<script>
+const API = '/apps/inbound-info/api';
+const state = { q: '', filter: 'all', offset: 0, limit: 100, total: 0, editing: null };
+const FIELDS = ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿', 'いろは在庫化作業有無', 'memo'];
+const DL = { '入庫時BCシール貼りフラグ': 'dl-bc', '直接ピックロケ保管': 'dl-pick', 'BF保管荷姿': 'dl-nisugata', 'いろは在庫化作業有無': 'dl-iroha' };
+
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+  if (t.dataset.tab === 'origin') loadOrigin();
+}));
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+function showMsg(id, kind, text) {
+  const el = document.getElementById(id);
+  el.className = 'msg ' + kind;
+  el.textContent = text;
+  el.style.display = 'block';
+  if (kind === 'ok') setTimeout(() => { el.style.display = 'none'; }, 5000);
+}
+async function api(path, opts) {
+  const res = await fetch(API + path, opts);
+  let body = null;
+  try { body = await res.json(); } catch (e) { /* non-JSON */ }
+  if (!res.ok || !body || body.ok === false) {
+    const err = (body && body.error) || ('HTTP ' + res.status);
+    throw new Error(err);
+  }
+  return body;
+}
+
+// ─── 統計 ───
+async function loadStats() {
+  try {
+    const { result } = await api('/stats');
+    document.getElementById('st-total').textContent = result.total ?? 0;
+    document.getElementById('st-missing').textContent = result.missing_irisu ?? 0;
+    document.getElementById('st-new').textContent = result.auto_new ?? 0;
+  } catch (e) { /* ヘッダー統計は失敗しても致命でない */ }
+}
+
+// ─── 一覧 ───
+function setFilter(el) {
+  document.querySelectorAll('.fchip').forEach(x => x.classList.remove('active'));
+  el.classList.add('active');
+  state.filter = el.dataset.filter;
+  state.offset = 0;
+  loadList();
+}
+function page(dir) {
+  const next = state.offset + dir * state.limit;
+  if (next < 0 || next >= state.total) return;
+  state.offset = next;
+  loadList();
+}
+async function loadList() {
+  state.q = document.getElementById('q').value;
+  state.editing = null;
+  try {
+    const p = new URLSearchParams({ q: state.q, filter: state.filter, offset: state.offset, limit: state.limit });
+    const { result } = await api('/list?' + p.toString());
+    state.total = result.total;
+    renderList(result.rows);
+    const from = result.total === 0 ? 0 : result.offset + 1;
+    const to = Math.min(result.offset + result.rows.length, result.total);
+    document.getElementById('pg-info').textContent = `${from}–${to} / ${result.total}件`;
+    document.getElementById('pg-prev').disabled = result.offset <= 0;
+    document.getElementById('pg-next').disabled = to >= result.total;
+  } catch (e) {
+    showMsg('msg-list', 'err', '一覧の取得に失敗しました: ' + e.message);
+  }
+}
+function sourceTag(s) {
+  const label = { auto: '新着', excel: 'Excel', manual: '編集済' }[s] || s;
+  return `<span class="tag ${esc(s)}">${esc(label)}</span>`;
+}
+function renderList(rows) {
+  const tb = document.getElementById('tbody-list');
+  tb.innerHTML = rows.map(r => {
+    if (state.editing === r.code_key) return editRowHtml(r);
+    return `<tr class="${r.source === 'auto' ? 'new-row' : ''}" data-key="${esc(r.code_key)}">
+      <td class="code">${esc(r.商品コード)}</td>
+      <td>${esc(r.商品名)}</td>
+      <td style="text-align:right">${r.入数 == null ? '<span style="color:#dc2626">未記入</span>' : esc(r.入数)}</td>
+      <td>${esc(r.入庫時BCシール貼りフラグ)}</td>
+      <td>${esc(r.直接ピックロケ保管)}</td>
+      <td>${esc(r.BF保管荷姿)}</td>
+      <td>${esc(r.いろは在庫化作業有無)}</td>
+      <td>${esc(r.memo)}</td>
+      <td>${sourceTag(r.source)}</td>
+      <td><button class="btn-blue btn-sm" onclick="editRow('${esc(r.code_key)}')">編集</button>
+          <button class="btn-red btn-sm" onclick="delRow('${esc(r.code_key)}','${esc(r.商品コード)}')">削除</button></td>
+    </tr>`;
+  }).join('');
+  window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
+}
+function editRowHtml(r) {
+  const cell = (f) => `<td><input type="text" id="e-${esc(f)}" list="${DL[f] || ''}" value="${esc(r[f])}"></td>`;
+  return `<tr data-key="${esc(r.code_key)}">
+    <td class="code">${esc(r.商品コード)}</td>
+    <td><input type="text" id="e-商品名" value="${esc(r.商品名)}"></td>
+    <td><input type="number" id="e-入数" min="0" step="1" value="${r.入数 == null ? '' : esc(r.入数)}"></td>
+    ${cell('入庫時BCシール貼りフラグ')}${cell('直接ピックロケ保管')}${cell('BF保管荷姿')}${cell('いろは在庫化作業有無')}${cell('memo')}
+    <td>${sourceTag(r.source)}</td>
+    <td><button class="btn-green btn-sm" onclick="saveRow('${esc(r.code_key)}')">保存</button>
+        <button class="btn-gray btn-sm" onclick="state.editing=null;loadList()">取消</button></td>
+  </tr>`;
+}
+function editRow(key) {
+  state.editing = key;
+  const r = window._rows[key];
+  const tr = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+  if (tr && r) tr.outerHTML = editRowHtml(r);
+}
+async function saveRow(key) {
+  const fields = { 商品名: document.getElementById('e-商品名').value, 入数: document.getElementById('e-入数').value };
+  for (const f of FIELDS) fields[f] = document.getElementById('e-' + f).value;
+  try {
+    await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code_key: key, fields }) });
+    state.editing = null;
+    showMsg('msg-list', 'ok', '保存しました');
+    await loadList(); loadStats();
+  } catch (e) {
+    const m = { invalid_irisu: '入数は0以上の整数で入力してください', empty_name: '商品名は空にできません' }[e.message] || e.message;
+    showMsg('msg-list', 'err', '保存に失敗しました: ' + m);
+  }
+}
+async function delRow(key, code) {
+  if (!confirm(`「${code}」を削除しますか？\n(NE商品マスタに残っている取扱中の単品は、翌日の自動取込で再追加されます)`)) return;
+  try {
+    await api('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code_key: key }) });
+    showMsg('msg-list', 'ok', '削除しました');
+    await loadList(); loadStats();
+  } catch (e) {
+    showMsg('msg-list', 'err', '削除に失敗しました: ' + e.message);
+  }
+}
+async function addCode() {
+  const code = document.getElementById('add-code').value.trim();
+  if (!code) return;
+  try {
+    const r = await api('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }) });
+    document.getElementById('add-code').value = '';
+    showMsg('msg-list', 'ok', `「${r.code}」を追加しました`);
+    await loadList(); loadStats();
+  } catch (e) {
+    const m = { duplicate: 'すでに登録済みです', not_in_master: 'NE商品マスタ(ミラー)に存在しないコードです', empty_code: 'コードを入力してください' }[e.message] || e.message;
+    showMsg('msg-list', 'err', '追加できません: ' + m);
+  }
+}
+async function syncNow() {
+  const btn = document.getElementById('btn-sync');
+  btn.disabled = true;
+  try {
+    const r = await api('/sync-now', { method: 'POST' });
+    showMsg('msg-list', 'ok', `新商品 ${r.inserted} 件を追加しました (商品マスタ ${r.mirror_products} 件を確認)`);
+    await loadList(); loadStats();
+  } catch (e) {
+    const m = e.message === 'mirror_empty' ? '商品マスタ(ミラー)が空のため取込できません。miniPCからの同期完了後に再実行してください。' : e.message;
+    showMsg('msg-list', 'err', '取込に失敗しました: ' + m);
+  } finally { btn.disabled = false; }
+}
+
+// ─── 原産国 ───
+let originEditingId = null; // 'new' | id | null
+async function loadOrigin() {
+  originEditingId = null;
+  try {
+    const { result } = await api('/origin/list');
+    renderOrigin(result);
+  } catch (e) {
+    showMsg('msg-origin', 'err', '一覧の取得に失敗しました: ' + e.message);
+  }
+}
+function originRowHtml(r) {
+  return `<tr>
+    <td>${esc(r.管理コード)}</td><td>${esc(r.識別番号)}</td>
+    <td class="code">${esc(r.商品コード)}</td><td>${esc(r.商品名)}</td><td>${esc(r.産地)}</td>
+    <td>${r.画像有無 ? '✔' : ''}</td>
+    <td><button class="btn-blue btn-sm" onclick="originEdit(${r.id})">編集</button>
+        <button class="btn-red btn-sm" onclick="originDel(${r.id},'${esc(r.商品コード)}')">削除</button></td>
+  </tr>`;
+}
+function originEditHtml(r) {
+  const v = (x) => esc(x == null ? '' : x);
+  return `<tr>
+    <td><input type="text" id="o-管理コード" value="${v(r.管理コード)}" style="width:90px"></td>
+    <td><input type="text" id="o-識別番号" value="${v(r.識別番号)}" style="width:90px"></td>
+    <td><input type="text" id="o-商品コード" value="${v(r.商品コード)}"></td>
+    <td><input type="text" id="o-商品名" value="${v(r.商品名)}"></td>
+    <td><input type="text" id="o-産地" value="${v(r.産地)}"></td>
+    <td><input type="checkbox" id="o-画像有無" ${r.画像有無 ? 'checked' : ''}></td>
+    <td><button class="btn-green btn-sm" onclick="originSave(${r.id == null ? 'null' : r.id})">保存</button>
+        <button class="btn-gray btn-sm" onclick="loadOrigin()">取消</button></td>
+  </tr>`;
+}
+function renderOrigin(rows) {
+  window._origin = Object.fromEntries(rows.map(r => [r.id, r]));
+  const tb = document.getElementById('tbody-origin');
+  let html = rows.map(r => (originEditingId === r.id ? originEditHtml(r) : originRowHtml(r))).join('');
+  if (originEditingId === 'new') html = originEditHtml({}) + html;
+  tb.innerHTML = html;
+}
+function originEdit(id) {
+  originEditingId = id;
+  renderOrigin(Object.values(window._origin || {}));
+}
+function originEditNew() {
+  originEditingId = 'new';
+  renderOrigin(Object.values(window._origin || {}));
+}
+async function originSave(id) {
+  const body = {
+    id,
+    管理コード: document.getElementById('o-管理コード').value,
+    識別番号: document.getElementById('o-識別番号').value,
+    商品コード: document.getElementById('o-商品コード').value,
+    商品名: document.getElementById('o-商品名').value,
+    産地: document.getElementById('o-産地').value,
+    画像有無: document.getElementById('o-画像有無').checked,
+  };
+  try {
+    await api('/origin/upsert', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    showMsg('msg-origin', 'ok', '保存しました');
+    loadOrigin();
+  } catch (e) {
+    const m = { duplicate: '同じ管理コード+商品コードの行がすでにあります', empty_code: '商品コードを入力してください' }[e.message] || e.message;
+    showMsg('msg-origin', 'err', '保存に失敗しました: ' + m);
+  }
+}
+async function originDel(id, code) {
+  if (!confirm(`「${code}」の原産国行を削除しますか？`)) return;
+  try {
+    await api('/origin/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }) });
+    showMsg('msg-origin', 'ok', '削除しました');
+    loadOrigin();
+  } catch (e) {
+    showMsg('msg-origin', 'err', '削除に失敗しました: ' + e.message);
+  }
+}
+
+// ─── Excel取込 ───
+function reportText(label, rep) {
+  if (!rep) return `${label}: シートなし (スキップ)`;
+  if (rep.error) return `${label}: ヘッダー不一致のためスキップ (${rep.error})`;
+  let t = `${label}: 対象${rep.total}行 → 新規${rep.inserted} / 上書き${rep.updated} / スキップ${rep.skipped}`;
+  if (rep.warnings && rep.warnings.length) t += '\n  ⚠ ' + rep.warnings.join('\n  ⚠ ');
+  return t;
+}
+async function doImport(dryRun) {
+  const f = document.getElementById('file').files[0];
+  if (!f) { showMsg('msg-import', 'err', 'ファイルを選択してください'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  fd.append('dry_run', dryRun ? '1' : '0');
+  try {
+    const r = await api('/import', { method: 'POST', body: fd });
+    const head = dryRun ? '【プレビュー — まだ書き込んでいません】' : '【本取込 完了】';
+    showMsg('msg-import', dryRun ? 'info' : 'ok',
+      head + '\n' + reportText('入数マスタ', r.irisu) + '\n' + reportText('原産国', r.origin));
+    document.getElementById('btn-import-live').disabled = !dryRun;
+    if (!dryRun) { loadStats(); loadList(); }
+  } catch (e) {
+    const m = { invalid_xlsx: 'xlsxとして読み込めませんでした', header_mismatch: '1行目のヘッダーが想定と異なります (商品コード/商品名 が必要)', no_file: 'ファイルを選択してください' }[e.message] || e.message;
+    showMsg('msg-import', 'err', '取込に失敗しました: ' + m);
+  }
+}
+document.getElementById('file').addEventListener('change', () => {
+  document.getElementById('btn-import-live').disabled = true; // ファイル変更時はプレビューからやり直し
+});
+
+loadStats();
+loadList();
+</script>
+</body>
+</html>
