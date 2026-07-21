@@ -1225,6 +1225,9 @@ function renderPage() {
         cbHtml += '<td class="num">' + fmt(cbTotPf) + '</td>';
         cbHtml += '<td class="num">' + fmt(cbTotAd) + '</td>';
         cbHtml += '<td class="num">' + fmt(cbTotPf + cbTotAd) + '</td></tr></table>';
+        if (freight > 0) {
+          cbHtml += '<p class="meta" style="margin-top:4px">※運賃（' + fmt(freight) + '円）はセグメント按分対象外のため、この表の変動費合計には含まれていません</p>';
+        }
         document.getElementById('costBySegment').innerHTML = cbHtml;
       } else {
         document.getElementById('costSummary').innerHTML = '<span class="meta">店舗別仕訳書CSVを取り込むと表示されます</span>';
@@ -1374,6 +1377,9 @@ function renderPage() {
             if (slip) {
               html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
               html += mfJournalTableHtml(buildMfJournalRows(mf, Math.round(slip.pf), Math.round(slip.freight), Math.round(slip.ad)));
+              if (Math.round(slip.pf) < 0) {
+                html += '<p class="meta">※PF手数料がマイナスです。確定保存時にPF手数料が0円に切り上げられた月は元の値を復元できないため、この仕訳は参考値です。</p>';
+              }
             }
           }
 
