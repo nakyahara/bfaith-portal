@@ -139,7 +139,11 @@ router.get('/api/schedule/info', async (req, res) => {
 router.post('/api/schedule/refresh', async (req, res) => {
   try {
     const r = await refreshNefudaSchedule(currentUser(req));
-    res.json({ ok: true, ...r });
+    if (!r.ok) {
+      // stale_file: 反映済みの方が新しい (並行実行の後追い)。データは最新のまま
+      return res.status(409).json(r);
+    }
+    res.json(r);
   } catch (e) {
     console.error('[inbound-info] schedule refresh', e.message);
     // lib/drive-csv.js の VALIDATION (ファイル無し・サイズ超過等) は利用者に読める文で返す

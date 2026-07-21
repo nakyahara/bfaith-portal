@@ -262,8 +262,26 @@ ok(st8 && st8.row_count === 3 && st8.filename === 'nefuda.csv' && st8.fetched_by
 // 2回目の置換で完全入替 (前回行が残らない)
 const sr2 = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }], { user: 'tester' });
 ok(sr2.schedule_rows === 1 && listInbound({ filter: 'scheduled' }).total === 1, 'full-replace: 前回分は残らない');
-const sr3 = replaceSchedule([], { user: 'tester' });
-ok(sr3.schedule_rows === 0 && listInbound({ filter: 'scheduled' }).total === 0 && scheduleState().row_count === 0,
-  '0件CSV (入荷予定なし) も正常に置換され状態は残る');
+
+// fail-closed パース (Codex nefuda R1 High/Medium): 空・ヘッダのみ・列欠落・列数不一致は取込拒否
+const enc = (t) => iconv.encode(t, 'Shift_JIS');
+const throwsParse = (text) => { try { parseNefudaCsv(enc(text)); return false; } catch (e) { return e.code === 'VALIDATION'; } };
+ok(throwsParse(''), 'パース拒否: 完全に空');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n'), 'パース拒否: ヘッダのみ (既存スナップショット保持)');
+ok(throwsParse('"商品ID","商品名"\r\n"a","b"\r\n'), 'パース拒否: 必須ヘッダ欠落');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限","商品ID"\r\n"a","b","c","d","e"\r\n'), 'パース拒否: ヘッダ重複');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n"a","b","c"\r\n'), 'パース拒否: 列数不一致 (破損CSV)');
+
+// 鮮度ガード (Codex nefuda R1 Medium): 反映済みより古い file_modified_time は上書き拒否
+const newer = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T10:00:00.000Z', user: 'tester' });
+ok(newer.ok, '鮮度ガード: 新しい版の反映は成功');
+const staleR = replaceSchedule([{ 商品コード: 'setitem01', 商品名: 'y', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T09:00:00.000Z', user: 'tester' });
+ok(!staleR.ok && staleR.error === 'stale_file', '鮮度ガード: 古い版は stale_file で拒否');
+ok(listInbound({ filter: 'scheduled' }).rows[0].code_key === 'newitem01', '鮮度ガード: データは新しい版のまま');
+const sameR = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T10:00:00.000Z', user: 'tester' });
+ok(sameR.ok, '鮮度ガード: 同一時刻 (同一ファイル再取得) は冪等に成功');
 
 console.log(`\n🎉 全 ${passed} 項目 PASS`);

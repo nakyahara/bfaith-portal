@@ -28,52 +28,78 @@ export async function getNefudaInfo() {
   return getDriveCsvInfo(CFG);
 }
 
+// CSV 契約 (fail-closed、Codex R1 Medium): 4列固定・ヘッダ名一意・行の列数一致。
+// 未閉鎖引用符などの構文破損は「残り全部が1フィールドに飲み込まれる」ため列数チェックで検出される。
+const REQUIRED_HEADERS = ['商品ID', '商品名', 'バーコード', '有効期限'];
+
 /**
  * nefuda.csv の Buffer をパースして行配列に変換 (export はテスト用)。
- * ヘッダは fail-closed: 「商品ID」列が無ければ取込拒否 (列順は問わずヘッダ名で解決)。
+ * データ行 0 件も取込拒否 (Codex R1 High): Drive 上書き途中・出力障害の一時的な
+ * 空ファイルで既存の入荷予定スナップショットを全消去しないため。
  */
 export function parseNefudaCsv(buffer) {
   const text = decodeCp932(buffer);
   const all = parseCsv(text).filter((r) => r.some((f) => String(f).trim() !== ''));
-  if (all.length === 0) throw vErr('nefuda.csv が空です (ヘッダ行もありません)。');
+  if (all.length === 0) throw vErr('nefuda.csv が空です (ヘッダ行もありません)。前回の入荷予定を保持しました。');
   const header = all[0].map((h) => String(h).trim());
+  for (const name of REQUIRED_HEADERS) {
+    if (header.indexOf(name) === -1) {
+      throw vErr(`nefuda.csv のヘッダに「${name}」列がありません (実際のヘッダ: ${header.join(' / ')})。前回の入荷予定を保持しました。`);
+    }
+    if (header.indexOf(name) !== header.lastIndexOf(name)) {
+      throw vErr(`nefuda.csv のヘッダに「${name}」列が複数あります。前回の入荷予定を保持しました。`);
+    }
+  }
   const col = {
     code: header.indexOf('商品ID'),
     name: header.indexOf('商品名'),
     barcode: header.indexOf('バーコード'),
     expiry: header.indexOf('有効期限'),
   };
-  if (col.code === -1) {
-    throw vErr(`nefuda.csv のヘッダに「商品ID」列がありません (実際のヘッダ: ${header.join(' / ')})`);
-  }
   const rows = [];
-  for (const r of all.slice(1)) {
+  for (let i = 1; i < all.length; i++) {
+    const r = all[i];
+    if (r.length !== header.length) {
+      throw vErr(`nefuda.csv の ${i + 1} 行目の列数がヘッダと一致しません (${r.length}列/期待${header.length}列)。ファイル破損の可能性があるため取込を中止し、前回の入荷予定を保持しました。`);
+    }
     const code = String(r[col.code] ?? '').trim();
     if (!code) continue;
     rows.push({
       商品コード: code,
-      商品名: col.name >= 0 ? r[col.name] : null,
-      バーコード: col.barcode >= 0 ? r[col.barcode] : null,
-      有効期限: col.expiry >= 0 ? r[col.expiry] : null,
+      商品名: r[col.name],
+      バーコード: r[col.barcode],
+      有効期限: r[col.expiry],
     });
+  }
+  if (rows.length === 0) {
+    throw vErr('nefuda.csv にデータ行がありません (ヘッダのみ)。出力障害の可能性があるため取込を中止し、前回の入荷予定を保持しました。');
   }
   return rows;
 }
 
+// cron と UI ボタンの同時実行を直列化するプロセス内 mutex (Codex R1 Medium)。
+// 単一プロセス前提 (Render 1 instance)。DB 側にも file_modified_time の鮮度ガードがあり二重防御。
+let _refreshChain = Promise.resolve();
+
 /**
  * Drive から最新の nefuda.csv を取得して f_inbound_schedule を full-replace する。
- * cron と UI ボタンの共通実体。0件 (入荷予定なし) も正常として置換する。
+ * cron と UI ボタンの共通実体。
  */
-export async function refreshNefudaSchedule(user) {
-  const dl = await downloadDriveCsv(CFG);
-  const rows = parseNefudaCsv(dl.buffer);
-  const result = replaceSchedule(rows, {
-    filename: dl.filename,
-    fileModifiedTime: dl.modified_time,
-    user,
-  });
-  return {
-    ...result,
-    file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst },
+export function refreshNefudaSchedule(user) {
+  const run = async () => {
+    const dl = await downloadDriveCsv(CFG);
+    const rows = parseNefudaCsv(dl.buffer);
+    const result = replaceSchedule(rows, {
+      filename: dl.filename,
+      fileModifiedTime: dl.modified_time,
+      user,
+    });
+    return {
+      ...result,
+      file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst },
+    };
   };
+  const p = _refreshChain.then(run, run);
+  _refreshChain = p.catch(() => {}); // 失敗しても次の実行を塞がない
+  return p;
 }

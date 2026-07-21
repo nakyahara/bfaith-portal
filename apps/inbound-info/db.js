@@ -306,7 +306,17 @@ export function replaceSchedule(rows, { filename = null, fileModifiedTime = null
     VALUES (?, ?, ?, 'auto', ?, ?)
   `);
   const result = { schedule_rows: 0, duplicates: 0, added_to_master: 0, not_in_master: [] };
+  let stale = null;
   db.transaction(() => {
+    // 鮮度ガード (Codex R1 Medium): 取得〜反映の間に別経路 (cron/UI) がより新しい CSV を
+    // 反映済みなら、古い世代での上書きを拒否する。同時刻 (同一ファイル再取得) は冪等なので許可。
+    if (fileModifiedTime) {
+      const cur = db.prepare('SELECT file_modified_time FROM f_inbound_schedule_state WHERE id = 1').get();
+      if (cur?.file_modified_time && Date.parse(cur.file_modified_time) > Date.parse(fileModifiedTime)) {
+        stale = cur.file_modified_time;
+        return;
+      }
+    }
     db.prepare('DELETE FROM f_inbound_schedule').run();
     for (const r of rows) {
       const c = normCode(r.商品コード);
@@ -334,6 +344,7 @@ export function replaceSchedule(rows, { filename = null, fileModifiedTime = null
         fetched_by = excluded.fetched_by
     `).run(now, result.schedule_rows, fileModifiedTime, cleanText(filename), cleanText(user));
   })();
+  if (stale) return { ok: false, error: 'stale_file', current_file_modified_time: stale, ...result };
   return { ok: true, fetched_at: now, ...result };
 }
 

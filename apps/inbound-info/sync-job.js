@@ -43,8 +43,12 @@ export function startInboundInfoCron() {
     }
     try {
       const s = await refreshNefudaSchedule('cron');
-      console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
-        + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+      if (!s.ok) {
+        console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
+      } else {
+        console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
+          + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+      }
     } catch (e) {
       console.error('[inbound-info] nefuda fetch failed:', e.message);
     }

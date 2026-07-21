@@ -383,6 +383,11 @@ async function refreshSchedule() {
     await loadScheduleInfo();
     await loadList(); loadStats();
   } catch (e) {
+    if (e.message === 'stale_file') {
+      showMsg('msg-list', 'info', 'すでに新しい入荷予定が反映済みです (表示を更新しました)');
+      await loadScheduleInfo(); await loadList(); loadStats();
+      return;
+    }
     showMsg('msg-list', 'err', '入荷予定の取得に失敗しました: ' + (e.detail || e.message));
   } finally { btn.disabled = false; }
 }
