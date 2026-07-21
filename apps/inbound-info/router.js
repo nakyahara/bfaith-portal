@@ -16,7 +16,7 @@ import multer from 'multer';
 import ExcelJS from 'exceljs';
 import {
   stats, listInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
-  importInboundRows, importOriginRows, listOrigin, upsertOrigin, deleteOrigin,
+  importWorkbook, listOrigin, upsertOrigin, deleteOrigin,
 } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -62,12 +62,15 @@ router.get('/api/list', (req, res) => {
 // ─── 1行更新 ───
 router.post('/api/update', (req, res) => {
   try {
-    const { code_key, fields } = req.body || {};
+    const { code_key, fields, expected_updated_at } = req.body || {};
     if (!code_key || typeof fields !== 'object' || fields == null) {
       return res.status(400).json({ ok: false, error: 'bad_request' });
     }
-    const r = updateInbound(code_key, fields, currentUser(req));
-    if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+    const r = updateInbound(code_key, fields, currentUser(req), expected_updated_at);
+    if (!r.ok) {
+      const status = r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400;
+      return res.status(status).json(r);
+    }
     res.json(r);
   } catch (e) {
     console.error('[inbound-info] update', e.message);
@@ -200,20 +203,23 @@ router.post('/api/import', upload.single('file'), async (req, res) => {
     }
     const irisuWs = wb.getWorksheet('入数マスタ') || wb.worksheets[0];
     if (!irisuWs) return res.status(400).json({ ok: false, error: 'no_sheet' });
+    // 先に全シートをパース・検証してから、書込みは importWorkbook が単一トランザクションで実行
+    // (Codex R1 Medium: シート別トランザクションだと途中失敗で半端な状態が残る)
     const parsed = parseIrisuSheet(irisuWs);
     if (parsed.error) {
       return res.status(400).json({ ok: false, error: parsed.error, headers: parsed.headers });
     }
-    const user = currentUser(req);
-    const irisuReport = importInboundRows(parsed.rows, { dryRun, user });
-
-    let originReport = null;
+    let originRows = null;
+    let originHeaderError = null;
     const originWs = wb.getWorksheet('原産国');
     if (originWs) {
       const po = parseOriginSheet(originWs);
-      originReport = po.error ? { error: po.error } : importOriginRows(po.rows, { dryRun, user });
+      if (po.error) originHeaderError = { error: po.error };
+      else originRows = po.rows;
     }
-    res.json({ ok: true, dry_run: dryRun, irisu: irisuReport, origin: originReport });
+    const user = currentUser(req);
+    const reports = importWorkbook(parsed.rows, originRows, { dryRun, user });
+    res.json({ ok: true, dry_run: dryRun, irisu: reports.irisu, origin: reports.origin ?? originHeaderError });
   } catch (e) {
     console.error('[inbound-info] import', e.message);
     res.status(500).json({ ok: false, error: 'import_failed' });
@@ -233,12 +239,12 @@ router.get('/api/origin/list', (req, res) => {
 router.post('/api/origin/upsert', (req, res) => {
   try {
     const r = upsertOrigin(req.body || {}, currentUser(req));
-    if (!r.ok) return res.status(r.error === 'not_found' ? 404 : 400).json(r);
+    if (!r.ok) {
+      const status = r.error === 'not_found' ? 404 : r.error === 'conflict' ? 409 : 400;
+      return res.status(status).json(r);
+    }
     res.json(r);
   } catch (e) {
-    if (String(e.message).includes('UNIQUE')) {
-      return res.status(400).json({ ok: false, error: 'duplicate' });
-    }
     console.error('[inbound-info] origin upsert', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
   }

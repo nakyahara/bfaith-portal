@@ -91,11 +91,16 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
 }
 
 // ─── 1行更新 (UI から)。人が触った行は source='manual' に倒して「新着」から外す ───
-export function updateInbound(key, fields, user) {
+// expectedUpdatedAt: 楽観ロック (Codex R1 Medium)。編集開始時点の updated_at を渡し、
+//   他の人が先に保存していたら conflict を返して黙った上書きを防ぐ。
+export function updateInbound(key, fields, user, expectedUpdatedAt) {
   const db = getMirrorDB();
   const k = codeKey(key);
-  const existing = db.prepare('SELECT code_key FROM f_inbound_info WHERE code_key = ?').get(k);
+  const existing = db.prepare('SELECT code_key, updated_at FROM f_inbound_info WHERE code_key = ?').get(k);
   if (!existing) return { ok: false, error: 'not_found' };
+  if (expectedUpdatedAt != null && existing.updated_at !== expectedUpdatedAt) {
+    return { ok: false, error: 'conflict' };
+  }
 
   // 商品名は空にしない (誤クリアで一覧が読めなくなるため)
   if ('商品名' in fields && cleanText(fields.商品名) == null) {
@@ -134,10 +139,16 @@ export function addManual(code, user) {
   ).get(k);
   if (!prod) return { ok: false, error: 'not_in_master' };
   const now = utcIsoNow();
-  db.prepare(`
-    INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, source, created_at, updated_at, updated_by)
-    VALUES (?, ?, ?, 'manual', ?, ?, ?)
-  `).run(k, normCode(prod.商品コード), prod.商品名, now, now, cleanText(user));
+  try {
+    db.prepare(`
+      INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, source, created_at, updated_at, updated_by)
+      VALUES (?, ?, ?, 'manual', ?, ?, ?)
+    `).run(k, normCode(prod.商品コード), prod.商品名, now, now, cleanText(user));
+  } catch (e) {
+    // check-then-insert の隙間で同時追加された場合 (Codex R1 Low): PK 違反は duplicate として返す
+    if (String(e.code || '').startsWith('SQLITE_CONSTRAINT')) return { ok: false, error: 'duplicate' };
+    throw e;
+  }
   return { ok: true, code: prod.商品コード };
 }
 
@@ -252,6 +263,21 @@ export function importInboundRows(rows, { dryRun = false, user = null } = {}) {
   return report;
 }
 
+// ─── ブック単位の一括取込 (入数マスタ + 原産国 を単一トランザクションで) ───
+// Codex R1 Medium: シートごとに別トランザクションだと原産国側の失敗時に
+// 入数マスタだけ更新済みの半端な状態が残るため、本取込は外側で1トランザクションに束ねる。
+// (importInboundRows / importOriginRows 内の db.transaction は better-sqlite3 が
+//  savepoint として入れ子実行するので、どちらかが throw すれば全体が rollback される)
+export function importWorkbook(irisuRows, originRows, { dryRun = false, user = null } = {}) {
+  const run = () => ({
+    irisu: importInboundRows(irisuRows, { dryRun, user }),
+    origin: originRows ? importOriginRows(originRows, { dryRun, user }) : null,
+  });
+  if (dryRun) return run();
+  const db = getMirrorDB();
+  return db.transaction(run)();
+}
+
 // ─── 原産国: 一覧 ───
 export function listOrigin() {
   const db = getMirrorDB();
@@ -328,24 +354,33 @@ export function upsertOrigin(fields, user) {
     画像有無: fields.画像有無 ? 1 : 0,
   };
   const id = fields.id != null ? Number(fields.id) : null;
-  if (id != null && Number.isInteger(id)) {
+  try {
+    if (id != null && Number.isInteger(id)) {
+      const existing = db.prepare('SELECT updated_at FROM f_inbound_origin WHERE id = ?').get(id);
+      if (!existing) return { ok: false, error: 'not_found' };
+      // 楽観ロック (Codex R1 Medium): 編集開始時点の updated_at と一致しなければ conflict
+      if (fields.expected_updated_at != null && existing.updated_at !== fields.expected_updated_at) {
+        return { ok: false, error: 'conflict' };
+      }
+      db.prepare(`
+        UPDATE f_inbound_origin
+           SET 管理コード = ?, 識別番号 = ?, 商品コード = ?, code_key = ?, 商品名 = ?, 産地 = ?, 画像有無 = ?,
+               updated_at = ?, updated_by = ?
+         WHERE id = ?
+      `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, cleanText(user), id);
+      return { ok: true, id };
+    }
     const info = db.prepare(`
-      UPDATE f_inbound_origin
-         SET 管理コード = ?, 識別番号 = ?, 商品コード = ?, code_key = ?, 商品名 = ?, 産地 = ?, 画像有無 = ?,
-             updated_at = ?, updated_by = ?
-       WHERE id = ?
-    `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, cleanText(user), id);
-    return info.changes > 0 ? { ok: true, id } : { ok: false, error: 'not_found' };
+      INSERT INTO f_inbound_origin (管理コード, 識別番号, 商品コード, code_key, 商品名, 産地, 画像有無, created_at, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, now, cleanText(user));
+    return { ok: true, id: info.lastInsertRowid };
+  } catch (e) {
+    // UNIQUE(管理コード, code_key) 違反は INSERT/UPDATE どちらの経路でも duplicate として返す
+    // (check-then-insert の競合窓を作らないため、事前 SELECT でなく制約違反で判定する)
+    if (String(e.code || '').startsWith('SQLITE_CONSTRAINT')) return { ok: false, error: 'duplicate' };
+    throw e;
   }
-  const dup = db.prepare(
-    "SELECT id FROM f_inbound_origin WHERE COALESCE(管理コード, '') = ? AND code_key = ?"
-  ).get(kanri ?? '', k);
-  if (dup) return { ok: false, error: 'duplicate' };
-  const info = db.prepare(`
-    INSERT INTO f_inbound_origin (管理コード, 識別番号, 商品コード, code_key, 商品名, 産地, 画像有無, created_at, updated_at, updated_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(kanri, vals.識別番号, c, k, vals.商品名, vals.産地, vals.画像有無, now, now, cleanText(user));
-  return { ok: true, id: info.lastInsertRowid };
 }
 
 export function deleteOrigin(id) {

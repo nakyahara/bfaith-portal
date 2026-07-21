@@ -6,7 +6,7 @@
  *
  * 環境変数:
  *   INBOUND_INFO_SYNC_ENABLED=true  … cron 起動 (既定 off = Dark Launch)
- *   INBOUND_INFO_SYNC_CRON          … 上書き用 cron 式 (UTC)。既定 '0 0 * * *' = JST 09:00
+ *   INBOUND_INFO_SYNC_CRON          … 上書き用 cron 式 (JST 基準)。既定 '0 9 * * *' = JST 09:00
  *
  * cron が無効でも UI の「新商品を今すぐ取込」(POST /api/sync-now) で同じ処理を実行できる。
  */
@@ -18,7 +18,9 @@ export function startInboundInfoCron() {
     console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED != true)');
     return;
   }
-  const expr = process.env.INBOUND_INFO_SYNC_CRON || '0 0 * * *'; // UTC 00:00 = JST 09:00
+  // timezone を明示 (Codex R1 Low: 未指定だとプロセスのローカル TZ 依存になり、
+  // 実行環境が変わるとミラー同期完了前に走り得る)。式は JST でそのまま読める形にする。
+  const expr = process.env.INBOUND_INFO_SYNC_CRON || '0 9 * * *'; // JST 09:00
   if (!cron.validate(expr)) {
     console.error(`[inbound-info] invalid cron expr: ${expr} — cron not started`);
     return;
@@ -34,6 +36,6 @@ export function startInboundInfoCron() {
     } catch (e) {
       console.error('[inbound-info] sync failed:', e.message);
     }
-  });
-  console.log(`[inbound-info] cron started (${expr} UTC)`);
+  }, { timezone: 'Asia/Tokyo' });
+  console.log(`[inbound-info] cron started (${expr} JST)`);
 }

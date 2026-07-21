@@ -222,7 +222,10 @@ function sourceTag(s) {
   const label = { auto: '新着', excel: 'Excel', manual: '編集済' }[s] || s;
   return `<span class="tag ${esc(s)}">${esc(label)}</span>`;
 }
+// XSS対策 (Codex R1 High): 商品コード等の動的値を inline onclick に埋め込まない。
+// 行データは window._rows に持ち、ボタンは data-act のみでイベントデリゲーションで処理する。
 function renderList(rows) {
+  window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
   const tb = document.getElementById('tbody-list');
   tb.innerHTML = rows.map(r => {
     if (state.editing === r.code_key) return editRowHtml(r);
@@ -236,11 +239,10 @@ function renderList(rows) {
       <td>${esc(r.いろは在庫化作業有無)}</td>
       <td>${esc(r.memo)}</td>
       <td>${sourceTag(r.source)}</td>
-      <td><button class="btn-blue btn-sm" onclick="editRow('${esc(r.code_key)}')">編集</button>
-          <button class="btn-red btn-sm" onclick="delRow('${esc(r.code_key)}','${esc(r.商品コード)}')">削除</button></td>
+      <td><button class="btn-blue btn-sm" data-act="edit">編集</button>
+          <button class="btn-red btn-sm" data-act="del">削除</button></td>
     </tr>`;
   }).join('');
-  window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
 }
 function editRowHtml(r) {
   const cell = (f) => `<td><input type="text" id="e-${esc(f)}" list="${DL[f] || ''}" value="${esc(r[f])}"></td>`;
@@ -250,31 +252,54 @@ function editRowHtml(r) {
     <td><input type="number" id="e-入数" min="0" step="1" value="${r.入数 == null ? '' : esc(r.入数)}"></td>
     ${cell('入庫時BCシール貼りフラグ')}${cell('直接ピックロケ保管')}${cell('BF保管荷姿')}${cell('いろは在庫化作業有無')}${cell('memo')}
     <td>${sourceTag(r.source)}</td>
-    <td><button class="btn-green btn-sm" onclick="saveRow('${esc(r.code_key)}')">保存</button>
-        <button class="btn-gray btn-sm" onclick="state.editing=null;loadList()">取消</button></td>
+    <td><button class="btn-green btn-sm" data-act="save">保存</button>
+        <button class="btn-gray btn-sm" data-act="cancel">取消</button></td>
   </tr>`;
 }
-function editRow(key) {
-  state.editing = key;
-  const r = window._rows[key];
-  const tr = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
-  if (tr && r) tr.outerHTML = editRowHtml(r);
+document.getElementById('tbody-list').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const key = btn.closest('tr')?.dataset.key;
+  if (key == null) return;
+  const act = btn.dataset.act;
+  if (act === 'edit') {
+    state.editing = key;
+    loadListRender();
+  } else if (act === 'cancel') {
+    state.editing = null;
+    loadList();
+  } else if (act === 'save') {
+    saveRow(key);
+  } else if (act === 'del') {
+    delRow(key);
+  }
+});
+function loadListRender() {
+  renderList(Object.values(window._rows || {}));
 }
 async function saveRow(key) {
   const fields = { 商品名: document.getElementById('e-商品名').value, 入数: document.getElementById('e-入数').value };
   for (const f of FIELDS) fields[f] = document.getElementById('e-' + f).value;
+  const expected = window._rows[key]?.updated_at ?? null;
   try {
     await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code_key: key, fields }) });
+      body: JSON.stringify({ code_key: key, fields, expected_updated_at: expected }) });
     state.editing = null;
     showMsg('msg-list', 'ok', '保存しました');
     await loadList(); loadStats();
   } catch (e) {
+    if (e.message === 'conflict') {
+      state.editing = null;
+      showMsg('msg-list', 'err', '他の人が先にこの行を更新しました。最新の内容を再読込したので、もう一度編集してください。');
+      await loadList();
+      return;
+    }
     const m = { invalid_irisu: '入数は0以上の整数で入力してください', empty_name: '商品名は空にできません' }[e.message] || e.message;
     showMsg('msg-list', 'err', '保存に失敗しました: ' + m);
   }
 }
-async function delRow(key, code) {
+async function delRow(key) {
+  const code = window._rows[key]?.商品コード ?? key;
   if (!confirm(`「${code}」を削除しますか？\n(NE商品マスタに残っている取扱中の単品は、翌日の自動取込で再追加されます)`)) return;
   try {
     await api('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -324,27 +349,38 @@ async function loadOrigin() {
   }
 }
 function originRowHtml(r) {
-  return `<tr>
+  return `<tr data-id="${esc(r.id)}">
     <td>${esc(r.管理コード)}</td><td>${esc(r.識別番号)}</td>
     <td class="code">${esc(r.商品コード)}</td><td>${esc(r.商品名)}</td><td>${esc(r.産地)}</td>
     <td>${r.画像有無 ? '✔' : ''}</td>
-    <td><button class="btn-blue btn-sm" onclick="originEdit(${r.id})">編集</button>
-        <button class="btn-red btn-sm" onclick="originDel(${r.id},'${esc(r.商品コード)}')">削除</button></td>
+    <td><button class="btn-blue btn-sm" data-act="edit">編集</button>
+        <button class="btn-red btn-sm" data-act="del">削除</button></td>
   </tr>`;
 }
 function originEditHtml(r) {
   const v = (x) => esc(x == null ? '' : x);
-  return `<tr>
+  return `<tr data-id="${r.id == null ? '' : esc(r.id)}">
     <td><input type="text" id="o-管理コード" value="${v(r.管理コード)}" style="width:90px"></td>
     <td><input type="text" id="o-識別番号" value="${v(r.識別番号)}" style="width:90px"></td>
     <td><input type="text" id="o-商品コード" value="${v(r.商品コード)}"></td>
     <td><input type="text" id="o-商品名" value="${v(r.商品名)}"></td>
     <td><input type="text" id="o-産地" value="${v(r.産地)}"></td>
     <td><input type="checkbox" id="o-画像有無" ${r.画像有無 ? 'checked' : ''}></td>
-    <td><button class="btn-green btn-sm" onclick="originSave(${r.id == null ? 'null' : r.id})">保存</button>
-        <button class="btn-gray btn-sm" onclick="loadOrigin()">取消</button></td>
+    <td><button class="btn-green btn-sm" data-act="save">保存</button>
+        <button class="btn-gray btn-sm" data-act="cancel">取消</button></td>
   </tr>`;
 }
+document.getElementById('tbody-origin').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const idAttr = btn.closest('tr')?.dataset.id;
+  const id = idAttr === '' || idAttr == null ? null : Number(idAttr);
+  const act = btn.dataset.act;
+  if (act === 'edit') originEdit(id);
+  else if (act === 'cancel') loadOrigin();
+  else if (act === 'save') originSave(id);
+  else if (act === 'del') originDel(id);
+});
 function renderOrigin(rows) {
   window._origin = Object.fromEntries(rows.map(r => [r.id, r]));
   const tb = document.getElementById('tbody-origin');
@@ -363,6 +399,7 @@ function originEditNew() {
 async function originSave(id) {
   const body = {
     id,
+    expected_updated_at: id == null ? null : (window._origin?.[id]?.updated_at ?? null),
     管理コード: document.getElementById('o-管理コード').value,
     識別番号: document.getElementById('o-識別番号').value,
     商品コード: document.getElementById('o-商品コード').value,
@@ -376,11 +413,17 @@ async function originSave(id) {
     showMsg('msg-origin', 'ok', '保存しました');
     loadOrigin();
   } catch (e) {
+    if (e.message === 'conflict') {
+      showMsg('msg-origin', 'err', '他の人が先にこの行を更新しました。最新の内容を再読込したので、もう一度編集してください。');
+      loadOrigin();
+      return;
+    }
     const m = { duplicate: '同じ管理コード+商品コードの行がすでにあります', empty_code: '商品コードを入力してください' }[e.message] || e.message;
     showMsg('msg-origin', 'err', '保存に失敗しました: ' + m);
   }
 }
-async function originDel(id, code) {
+async function originDel(id) {
+  const code = window._origin?.[id]?.商品コード ?? id;
   if (!confirm(`「${code}」の原産国行を削除しますか？`)) return;
   try {
     await api('/origin/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },

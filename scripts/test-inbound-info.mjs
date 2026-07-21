@@ -25,7 +25,7 @@ console.log('DATA_DIR =', process.env.DATA_DIR);
 const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 const db = initMirrorDB();
 const {
-  syncNewProducts, importInboundRows, importOriginRows, listInbound, updateInbound,
+  syncNewProducts, importInboundRows, importOriginRows, importWorkbook, listInbound, updateInbound,
   addManual, deleteInbound, upsertOrigin, deleteOrigin, listOrigin, stats, parseIrisu,
 } = await import('../apps/inbound-info/db.js');
 const { parseIrisuSheet, parseOriginSheet } = await import('../apps/inbound-info/router.js');
@@ -187,5 +187,34 @@ const list2 = listInbound({ q: searchTerm });
 ok(list2.total >= 1, `検索 "${searchTerm}" ヒット (${list2.total}件)`);
 const st = stats();
 ok(typeof st.total === 'number' && typeof st.auto_new === 'number', 'stats 形状');
+
+// ─── 7. Codex R1 対応の検証 ───
+console.log('\n[7] 楽観ロック / 一括トランザクション');
+const lockRow = db.prepare('SELECT code_key, updated_at FROM f_inbound_info LIMIT 1').get();
+let c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', 'wrong-timestamp');
+ok(!c1.ok && c1.error === 'conflict', '楽観ロック: updated_at 不一致で conflict');
+c1 = updateInbound(lockRow.code_key, { 入数: 999 }, 'userA', lockRow.updated_at);
+ok(c1.ok, '楽観ロック: updated_at 一致で更新成功');
+
+const oc = upsertOrigin({ 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '日本' }, 'tester');
+const ocRow = listOrigin().find((x) => x.商品コード === 'locktest01');
+let c2 = upsertOrigin({ id: oc.id, expected_updated_at: 'wrong', 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
+ok(!c2.ok && c2.error === 'conflict', '原産国 楽観ロック: conflict');
+c2 = upsertOrigin({ id: oc.id, expected_updated_at: ocRow.updated_at, 管理コード: 'LOCK', 商品コード: 'locktest01', 産地: '中国' }, 'tester');
+ok(c2.ok, '原産国 楽観ロック: 一致で更新成功');
+deleteOrigin(oc.id);
+
+// importWorkbook: 原産国側が途中で throw したら入数マスタ側も rollback される
+const beforeAtomic = db.prepare('SELECT COUNT(*) AS c FROM f_inbound_info').get().c;
+let threw = false;
+try {
+  importWorkbook([{ 商品コード: 'atomictest01', 商品名: 'アトミック', 入数: 1 }], [null], { user: 'tester' });
+} catch (e) {
+  threw = true;
+}
+const afterAtomic = db.prepare('SELECT COUNT(*) AS c FROM f_inbound_info').get().c;
+ok(threw && afterAtomic === beforeAtomic
+  && !db.prepare("SELECT 1 FROM f_inbound_info WHERE code_key = 'atomictest01'").get(),
+  '一括トランザクション: 原産国側の失敗で入数マスタ側も rollback');
 
 console.log(`\n🎉 全 ${passed} 項目 PASS`);
