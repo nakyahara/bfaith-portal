@@ -16,8 +16,9 @@ import multer from 'multer';
 import ExcelJS from 'exceljs';
 import {
   stats, listInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
-  importWorkbook, listOrigin, upsertOrigin, deleteOrigin,
+  importWorkbook, listOrigin, upsertOrigin, deleteOrigin, scheduleState,
 } from './db.js';
+import { getNefudaInfo, refreshNefudaSchedule } from './nefuda-fetch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -111,6 +112,39 @@ router.post('/api/sync-now', (req, res) => {
   } catch (e) {
     console.error('[inbound-info] sync-now', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// ─── 入荷予定 (nefuda.csv) ───
+// 状態表示: DB の最終取得状態 + Drive 上の現在の更新日時 (60秒キャッシュ)。
+// Drive 側の取得失敗 (未共有・ネットワーク等) は状態表示を巻き込まず drive_error として返す。
+router.get('/api/schedule/info', async (req, res) => {
+  try {
+    const state = scheduleState();
+    let drive = null;
+    let driveError = null;
+    try {
+      drive = await getNefudaInfo();
+    } catch (e) {
+      driveError = e.message;
+    }
+    res.json({ ok: true, result: { state, drive, drive_error: driveError } });
+  } catch (e) {
+    console.error('[inbound-info] schedule info', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// 最新の nefuda.csv を取得して入荷予定を置換 (UI ボタン。cron と同一実体)
+router.post('/api/schedule/refresh', async (req, res) => {
+  try {
+    const r = await refreshNefudaSchedule(currentUser(req));
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    console.error('[inbound-info] schedule refresh', e.message);
+    // lib/drive-csv.js の VALIDATION (ファイル無し・サイズ超過等) は利用者に読める文で返す
+    const status = e.code === 'VALIDATION' ? 400 : 502;
+    res.status(status).json({ ok: false, error: 'drive_error', message: e.message });
   }
 });
 
