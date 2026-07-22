@@ -94,13 +94,17 @@ def decide_action(now_utc, input_files, output_file, error_file):
                  (対象フォルダの納品書・引当パターンtxt + logi_dispatch.csv + 素材AES*.pdf)
     output_file / error_file: 前回試行の出力メタ (無ければ None)
     戻り値: 'process' / 'skip_done' (試行済みで入力に変化なし) / 'skip_settling' (整定待ち)
+
+    出力PDFとエラーtxtが両方存在する場合、試行の完了時刻には「古い方」を使う。
+    完全な試行は両方を更新するため、片方だけ新しい = 前回の書き込みが途中で失敗した
+    状態であり、skipせず次サイクルで再試行する (Codexレビュー2巡目 指摘1)。
     """
     newest_input = max(parse_rfc3339(f['modifiedTime']) for f in input_files)
 
     attempts = [f for f in (output_file, error_file) if f]
     if attempts:
-        newest_attempt = max(parse_rfc3339(f['modifiedTime']) for f in attempts)
-        if newest_input <= newest_attempt:
+        attempt_completed = min(parse_rfc3339(f['modifiedTime']) for f in attempts)
+        if newest_input <= attempt_completed:
             return 'skip_done'
 
     if now_utc - newest_input < timedelta(seconds=SETTLE_SECONDS):
