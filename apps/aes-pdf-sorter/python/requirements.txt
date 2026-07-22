@@ -10,4 +10,5 @@ opencv-python-headless==4.10.0.84
 pyzbar==0.1.9
 Jinja2==3.1.6
 python-dotenv==1.1.1
-tqdm==4.66.1
+google-api-python-client==2.155.0
+google-auth==2.37.0

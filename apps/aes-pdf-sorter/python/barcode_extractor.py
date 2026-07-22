@@ -11,8 +11,6 @@ from pyzbar.pyzbar import ZBarSymbol
 import json
 import os
 import sys
-import time
-from tqdm import tqdm
 
 class BarcodeExtractor:
     def __init__(self, config_file="bbox_config.json"):
@@ -137,50 +135,49 @@ class BarcodeExtractor:
                 print(f"{debug_info} バーコード読み取りエラー: {e}")
             return None
 
+    def extract_barcodes_from_doc(self, doc):
+        """開いているfitzドキュメントの全ページからバーコードを読み取る"""
+        barcodes_data = []
+
+        for page_num in range(doc.page_count):
+            page = doc.load_page(page_num)
+
+            box_configs = {
+                '赤枠': ['CODABAR'],
+                '青枠': ['CODE128'],
+                '緑枠': ['CODABAR']
+            }
+
+            for box_name in ['青枠', '緑枠', '赤枠']:
+                if box_name in self.boxes:
+                    rect = self.boxes[box_name]['rect']
+                    barcode_types = box_configs[box_name]
+
+                    binary_array = self.extract_region_image(page, rect, box_name)
+
+                    if binary_array is not None:
+                        debug_label = None
+                        barcode_data = self.read_barcode_from_numpy(binary_array, barcode_types, debug_label)
+
+                        if barcode_data:
+                            barcodes_data.append({
+                                'page': page_num,
+                                'data': barcode_data,
+                                'format': barcode_types[0],
+                                'box': box_name
+                            })
+                            break
+
+        return barcodes_data
+
     def extract_barcodes_from_pdf_return_data(self, pdf_path):
         if not os.path.exists(pdf_path):
             return []
 
-        barcodes_data = []
-
         doc = None
         try:
             doc = fitz.open(pdf_path)
-
-            with tqdm(total=doc.page_count, desc="バーコード読み取り中", unit="ページ") as pbar:
-                for page_num in range(doc.page_count):
-                    page = doc.load_page(page_num)
-
-                    box_configs = {
-                        '赤枠': ['CODABAR'],
-                        '青枠': ['CODE128'],
-                        '緑枠': ['CODABAR']
-                    }
-
-                    for box_name in ['青枠', '緑枠', '赤枠']:
-                        if box_name in self.boxes:
-                            rect = self.boxes[box_name]['rect']
-                            barcode_types = box_configs[box_name]
-
-                            binary_array = self.extract_region_image(page, rect, box_name)
-
-                            if binary_array is not None:
-                                debug_label = None
-                                barcode_data = self.read_barcode_from_numpy(binary_array, barcode_types, debug_label)
-
-                                if barcode_data:
-                                    barcodes_data.append({
-                                        'page': page_num,
-                                        'data': barcode_data,
-                                        'format': barcode_types[0],
-                                        'box': box_name
-                                    })
-                                    break
-
-                    pbar.update(1)
-
-            return barcodes_data
-
+            return self.extract_barcodes_from_doc(doc)
         except Exception as e:
             print(f"PDF処理エラー: {e}")
             return []
