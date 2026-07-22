@@ -56,11 +56,14 @@ def build_order_shipping_map(csv_text, order_shipping_map):
     return None
 
 
-def build_shipping_barcode_map(label_files, extractor):
+def build_shipping_barcode_map(label_files, extractor, duplicates=None):
     """送り状PDF群からバーコードを読み、配送番号→(fitz doc, ページ番号) の対応表を作る。
 
     label_files: [(ファイル名, PDFバイト列)]
     extractor:   extract_barcodes_from_doc(doc) を持つオブジェクト (BarcodeExtractor)
+    duplicates:  listを渡すと、同じ配送番号が異なるページで検出された場合に
+                 その配送番号を追記する (Driveワーカーの競合検知用。
+                 Webアプリは渡さない = 従来どおり後勝ち上書きで挙動不変)
     戻り値: (barcode_map, errors, docs)
       errors は {"file", "error", "type"} の一覧 (既存Webアプリと同じ文言・種別)。
       docs は開いた fitz ドキュメント一覧。並び替えPDFを作り終えるまで開いたままにし、
@@ -89,7 +92,12 @@ def build_shipping_barcode_map(label_files, extractor):
                 barcode_data = barcode_info['data']
                 if barcode_info['format'] == 'CODABAR':
                     barcode_data = CODABAR_EDGE.sub('', barcode_data)
-                barcode_map[barcode_data] = (pdf_doc, barcode_info['page'])
+                entry = (pdf_doc, barcode_info['page'])
+                if (duplicates is not None
+                        and barcode_data in barcode_map
+                        and barcode_map[barcode_data] != entry):
+                    duplicates.append(barcode_data)
+                barcode_map[barcode_data] = entry
         except Exception as e:
             errors.append({"file": filename, "error": f"配送ラベル処理エラー: {str(e)}", "type": "shipping_label_processing"})
 

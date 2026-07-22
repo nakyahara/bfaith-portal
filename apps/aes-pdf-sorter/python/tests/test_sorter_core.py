@@ -172,6 +172,40 @@ class BuildShippingBarcodeMapTest(unittest.TestCase):
             for d in docs:
                 d.close()
 
+    def test_duplicates_recorded_when_list_passed(self):
+        # 同じ配送番号が別ページで検出された場合、duplicates リストに記録される
+        pdf = make_pdf(['p0', 'p1'])
+        extractor = FakeExtractor([[
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+            {'page': 1, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ]])
+        duplicates = []
+        barcode_map, errors, docs = sorter_core.build_shipping_barcode_map(
+            [('AES_x.pdf', pdf)], extractor, duplicates=duplicates)
+        try:
+            self.assertEqual(duplicates, ['DA100'])
+            # マップ自体は従来どおり後勝ち (Webアプリ挙動の保持)
+            self.assertEqual(barcode_map['DA100'][1], 1)
+        finally:
+            for d in docs:
+                d.close()
+
+    def test_duplicates_not_recorded_without_list(self):
+        # duplicates を渡さない場合 (Webアプリ経路) は従来どおり黙って上書き
+        pdf = make_pdf(['p0', 'p1'])
+        extractor = FakeExtractor([[
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+            {'page': 1, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ]])
+        barcode_map, errors, docs = sorter_core.build_shipping_barcode_map(
+            [('AES_x.pdf', pdf)], extractor)
+        try:
+            self.assertEqual(errors, [])
+            self.assertEqual(barcode_map['DA100'][1], 1)
+        finally:
+            for d in docs:
+                d.close()
+
 
 class ExtractOrderNumbersTest(unittest.TestCase):
     def test_order_and_dedup(self):

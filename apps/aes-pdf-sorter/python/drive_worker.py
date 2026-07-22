@@ -12,6 +12,10 @@ logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 安全設計:
 - Driveへの書き込みは AES送り状_並び替え済.pdf / AES送り状_エラー.txt の
   新規作成・自ファイル上書きのみ。削除・移動・リネームは一切行わない。
+- 失敗時に前回の成功PDFが残っていると誤って印刷・使用される恐れがあるため、
+  削除の代わりに「使用禁止」表示のPDFで上書きして失効させる (Codexレビュー指摘1)。
+- 突合の競合 (同一配送番号が複数ページ / 複数注文が同一ページ) は黙って進めず
+  エラー停止する (Codexレビュー指摘3)。
 - ワーカーはシングルスレッドの逐次処理 (フォルダを1つずつ)。Renderインスタンスは1台前提。
   万一二重実行が起きても、出力は同名ファイルへの上書きに収束するため事故にならない。
 """
@@ -34,6 +38,7 @@ OUTPUT_PDF_NAME = 'AES送り状_並び替え済.pdf'
 ERROR_TXT_NAME = 'AES送り状_エラー.txt'
 CSV_NAME = 'logi_dispatch.csv'
 
+SHIP_FOLDER_RE = re.compile(r'^出荷_\d+$')
 PATTERN_TXT_RE = re.compile(r'^引当パターン_.*\.txt$')
 INVOICE_RE = re.compile(r'^納品書_.*\.pdf$', re.IGNORECASE)
 LABEL_RE = re.compile(r'^AES.*\.pdf$', re.IGNORECASE)
@@ -53,6 +58,11 @@ def _log(msg):
 def parse_rfc3339(s):
     """Drive APIの modifiedTime (RFC3339) をawareなdatetimeにする"""
     return datetime.fromisoformat(s.replace('Z', '+00:00'))
+
+
+def natural_key(name):
+    """自然順ソートキー (納品書_2 < 納品書_10 になるように)"""
+    return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', name)]
 
 
 def parse_pattern_name(text):
@@ -122,6 +132,31 @@ def build_resolved_txt(now_jst):
     return ('\ufeff' + line + '\r\n').encode('utf-8')
 
 
+def build_invalid_pdf(now_jst):
+    """失敗時に旧出力PDFを失効させるための「使用禁止」PDFを作る。
+
+    前回の成功PDFがそのまま残ると気づかず印刷・使用される恐れがあるため、
+    削除の代わりに中身を差し替えて無効化する (Drive削除禁止ルールとの両立)。
+    """
+    doc = fitz.open()
+    try:
+        page = doc.new_page()
+        lines = [
+            ('INVALID - DO NOT USE', 24),
+            ('❌ このPDFは使用しないでください', 20),
+            ('並び替えに失敗したため、前回の内容を無効化しました。', 14),
+            (f'同じフォルダの {ERROR_TXT_NAME} を確認してください。', 14),
+            (f'{now_jst.strftime("%Y-%m-%d %H:%M")} JST', 12),
+        ]
+        y = 120
+        for text, size in lines:
+            page.insert_text((60, y), text, fontname='japan', fontsize=size)
+            y += size * 2
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
 def parse_poll_hours(spec):
     """'7-22' 形式の稼働時間帯 (JST) をパースする"""
     m = re.fullmatch(r'(\d{1,2})-(\d{1,2})', (spec or '').strip())
@@ -149,9 +184,11 @@ class DriveClient:
     """Drive API v3 の薄いラッパー (サービスアカウント認証)。
 
     書き込み系は upload_new / overwrite の2つだけ。削除系のメソッドは意図的に持たない。
+    対象は単一の共有ドライブなので corpora='drive' + driveId で検索する
+    (allDrives は incompleteSearch の恐れがあるため使わない。Codexレビュー指摘6)。
     """
 
-    def __init__(self, service_account_json):
+    def __init__(self, service_account_json, drive_id):
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         creds = service_account.Credentials.from_service_account_info(
@@ -159,6 +196,7 @@ class DriveClient:
             scopes=['https://www.googleapis.com/auth/drive'],
         )
         self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
+        self.drive_id = drive_id
 
     def list_children(self, folder_id):
         files = []
@@ -166,13 +204,17 @@ class DriveClient:
         while True:
             res = self.service.files().list(
                 q=f"'{folder_id}' in parents and trashed=false",
-                corpora='allDrives',
+                corpora='drive',
+                driveId=self.drive_id,
                 includeItemsFromAllDrives=True,
                 supportsAllDrives=True,
-                fields='nextPageToken, files(id,name,mimeType,modifiedTime)',
+                fields='nextPageToken, incompleteSearch, files(id,name,mimeType,modifiedTime)',
                 pageSize=200,
                 pageToken=page_token,
             ).execute()
+            if res.get('incompleteSearch'):
+                # 不完全な結果を「ファイルが無い」と誤判定すると誤動作するため中断する
+                raise RuntimeError(f'Drive検索結果が不完全です (incompleteSearch, folder={folder_id})')
             files.extend(res.get('files', []))
             page_token = res.get('nextPageToken')
             if not page_token:
@@ -188,23 +230,24 @@ class DriveClient:
             _, done = downloader.next_chunk()
         return buf.getvalue()
 
-    def upload_new(self, folder_id, name, content, mimetype):
+    def _media(self, content, mimetype):
         from googleapiclient.http import MediaInMemoryUpload
-        media = MediaInMemoryUpload(content, mimetype=mimetype, resumable=False)
+        # 結合PDFは5MBを超え得るため常にresumableでアップロードする (Codexレビュー指摘5)
+        return MediaInMemoryUpload(content, mimetype=mimetype, resumable=True)
+
+    def upload_new(self, folder_id, name, content, mimetype):
         res = self.service.files().create(
             body={'name': name, 'parents': [folder_id]},
-            media_body=media,
+            media_body=self._media(content, mimetype),
             supportsAllDrives=True,
             fields='id',
         ).execute()
         return res['id']
 
     def overwrite(self, file_id, content, mimetype):
-        from googleapiclient.http import MediaInMemoryUpload
-        media = MediaInMemoryUpload(content, mimetype=mimetype, resumable=False)
         self.service.files().update(
             fileId=file_id,
-            media_body=media,
+            media_body=self._media(content, mimetype),
             supportsAllDrives=True,
         ).execute()
         return file_id
@@ -235,6 +278,8 @@ class SharedInputs:
     """1サイクル内で共有する素材 (CSVマップ・バーコードマップ)。
 
     バーコード読み取りは重いので、処理が必要なフォルダが見つかった時に1回だけ構築する。
+    ダウンロード等の例外は load_errors に格納し、呼び出し側がエラーtxtとして通知できる
+    ようにする (握りつぶしてログだけにしない。Codexレビュー指摘4)。
     open済みのfitzドキュメントを保持するため、サイクル終了時に必ず close() を呼ぶこと。
     """
 
@@ -246,33 +291,41 @@ class SharedInputs:
         self._loaded = False
         self.order_shipping_map = {}
         self.barcode_map = {}
-        self.load_errors = []   # 人向けのエラー文言 (素材が読めない類)
+        self.duplicate_barcodes = []  # 同一配送番号が複数ページにあった場合の配送番号一覧
+        self.load_errors = []         # 人向けのエラー文言 (素材が読めない類)
         self._docs = []
 
     def ensure_loaded(self):
         if self._loaded:
             return
-        self._loaded = True
+        try:
+            csv_bytes = self._client.download(self._csv_meta['id'])
+            csv_text = sorter_core.decode_csv_bytes(csv_bytes)
+            if csv_text is None:
+                self.load_errors.append(f'{CSV_NAME} の文字コードが不正です')
+            else:
+                try:
+                    if sorter_core.build_order_shipping_map(csv_text, self.order_shipping_map) == 'csv_header':
+                        self.load_errors.append(f'{CSV_NAME} のヘッダーに「注文番号」または「配送番号」列が見つかりません')
+                except Exception as e:
+                    self.load_errors.append(f'{CSV_NAME} の処理エラー: {e}')
 
-        csv_bytes = self._client.download(self._csv_meta['id'])
-        csv_text = sorter_core.decode_csv_bytes(csv_bytes)
-        if csv_text is None:
-            self.load_errors.append(f'{CSV_NAME} の文字コードが不正です')
-        else:
-            try:
-                if sorter_core.build_order_shipping_map(csv_text, self.order_shipping_map) == 'csv_header':
-                    self.load_errors.append(f'{CSV_NAME} のヘッダーに「注文番号」または「配送番号」列が見つかりません')
-            except Exception as e:
-                self.load_errors.append(f'{CSV_NAME} の処理エラー: {e}')
+            label_files = []
+            for meta in self._labels_meta:
+                label_files.append((meta['name'], self._client.download(meta['id'])))
 
-        label_files = []
-        for meta in self._labels_meta:
-            label_files.append((meta['name'], self._client.download(meta['id'])))
-
-        extractor = self._extractor_factory()
-        self.barcode_map, label_errors, self._docs = sorter_core.build_shipping_barcode_map(label_files, extractor)
-        for err in label_errors:
-            self.load_errors.append(f'{err["file"]}: {err["error"]}')
+            extractor = self._extractor_factory()
+            self.barcode_map, label_errors, self._docs = sorter_core.build_shipping_barcode_map(
+                label_files, extractor, duplicates=self.duplicate_barcodes)
+            for err in label_errors:
+                self.load_errors.append(f'{err["file"]}: {err["error"]}')
+        except Exception as e:
+            # ダウンロード失敗等。不完全なマップで処理しないよう空に戻す
+            self.order_shipping_map = {}
+            self.barcode_map = {}
+            self.load_errors.append(f'素材の読み込みに失敗しました: {e}')
+        finally:
+            self._loaded = True
 
     def close(self):
         for doc in self._docs:
@@ -303,7 +356,7 @@ class Worker:
         material_files = client.list_children(self.config.material_folder_id)
         labels_meta = sorted(
             (f for f in material_files if f.get('mimeType') != FOLDER_MIME and LABEL_RE.match(f['name'])),
-            key=lambda f: f['name'])
+            key=lambda f: natural_key(f['name']))
         csv_meta = next(
             (f for f in client.list_children(self.config.csv_folder_id)
              if f.get('mimeType') != FOLDER_MIME and f['name'] == CSV_NAME),
@@ -313,10 +366,11 @@ class Worker:
         if csv_meta is not None:
             shared = SharedInputs(client, csv_meta, labels_meta, self.extractor_factory)
 
-        folders = [f for f in client.list_children(self.config.root_id) if f.get('mimeType') == FOLDER_MIME]
+        folders = [f for f in client.list_children(self.config.root_id)
+                   if f.get('mimeType') == FOLDER_MIME and SHIP_FOLDER_RE.match(f['name'])]
 
         try:
-            for folder in sorted(folders, key=lambda f: f['name']):
+            for folder in sorted(folders, key=lambda f: natural_key(f['name'])):
                 try:
                     self._handle_folder(folder, shared, csv_meta, labels_meta)
                 except Exception as e:
@@ -331,12 +385,12 @@ class Worker:
         non_folder = [f for f in files if f.get('mimeType') != FOLDER_MIME]
 
         pattern_txts = sorted((f for f in non_folder if PATTERN_TXT_RE.match(f['name'])),
-                              key=lambda f: f['name'])
+                              key=lambda f: natural_key(f['name']))
         if not pattern_txts:
             return
 
         invoices = sorted((f for f in non_folder if INVOICE_RE.match(f['name'])),
-                          key=lambda f: f['name'])
+                          key=lambda f: natural_key(f['name']))
         if not invoices:
             return
 
@@ -351,7 +405,7 @@ class Worker:
             return
 
         # AES引当フォルダかの判定 (処理候補になった時だけtxtをダウンロード)
-        aes = False
+        aes_txts = []
         for txt_meta in pattern_txts:
             try:
                 txt_text = client.download(txt_meta['id']).decode('utf-8', errors='replace')
@@ -359,13 +413,21 @@ class Worker:
                 _log(f"フォルダ '{folder['name']}' の {txt_meta['name']} が読めません: {e}")
                 txt_text = None
             if is_aes_pattern(txt_meta['name'], txt_text):
-                aes = True
-                break
-        if not aes:
+                aes_txts.append(txt_meta)
+
+        if not aes_txts:
             return
 
         _log(f"処理開始: {folder['name']} (納品書 {len(invoices)}件)")
         reasons = []
+
+        # 引当パターンtxtが複数あるフォルダは、どのパターンのフォルダか確定できない
+        # (フォルダ再利用で古いtxtが残った可能性)。誤処理を避けて停止する (Codexレビュー指摘2)
+        if len(pattern_txts) > 1:
+            names = ', '.join(t['name'] for t in pattern_txts)
+            reasons.append(f'引当パターンのテキストが複数あります ({names})。'
+                           'どのパターンのフォルダか判断できないため処理を停止しました。'
+                           '不要なtxtを整理してください')
 
         if csv_meta is None:
             reasons.append(f'{CSV_NAME} が見つかりません (bfaithポータルdataフォルダを確認してください)')
@@ -381,6 +443,10 @@ class Worker:
             elif not shared.barcode_map:
                 reasons.append('送り状PDFからバーコードを読み取れませんでした')
                 reasons.extend(shared.load_errors)
+            elif shared.duplicate_barcodes:
+                dups = ', '.join(sorted(set(shared.duplicate_barcodes)))
+                reasons.append(f'同じ配送番号のバーコードが複数の送り状ページで検出されました: {dups} '
+                               '(素材フォルダに古い送り状PDFが混在していないか確認してください)')
             else:
                 all_orders = []
                 for invoice_meta in invoices:
@@ -405,28 +471,61 @@ class Worker:
                         reasons.append(f'注文番号 {order_number} に対応する送り状が見つかりません')
                     if not matched_pages and not unmatched:
                         reasons.append('納品書から注文番号を1件も抽出できませんでした')
+                    # 複数の注文が同じ送り状ページに解決された場合は競合 (配送番号の重複)。
+                    # 黙って同じページを複数回出すと1枚足りない出荷につながるため停止する
+                    page_keys = [(id(doc), page_num) for doc, page_num in matched_pages]
+                    if len(set(page_keys)) != len(page_keys):
+                        reasons.append('複数の注文が同じ送り状ページに紐づいています (配送番号の重複)。'
+                                       f'{CSV_NAME} と送り状PDFの組み合わせを確認してください')
 
         if reasons:
-            # 部分出力はしない (送り状不足に気づかず出荷する事故防止)。エラーtxtで通知する
-            content = build_error_txt(datetime.now(JST), reasons)
+            self._notify_failure(folder, reasons, output_file, error_file)
+            return
+
+        label_bytes = sorter_core.build_label_pdf(matched_pages)
+        try:
+            if output_file:
+                client.overwrite(output_file['id'], label_bytes, 'application/pdf')
+            else:
+                client.upload_new(folder['id'], OUTPUT_PDF_NAME, label_bytes, 'application/pdf')
+        except Exception as e:
+            # 出力の書き込み失敗も人に見える形で通知する (ログだけにしない)
+            self._notify_failure(
+                folder,
+                [f'{OUTPUT_PDF_NAME} のアップロードに失敗しました: {e}'],
+                output_file, error_file)
+            return
+
+        # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
+        if error_file:
+            try:
+                client.overwrite(error_file['id'], build_resolved_txt(datetime.now(JST)), 'text/plain')
+            except Exception as e:
+                _log(f"フォルダ '{folder['name']}' のエラーtxt更新に失敗 (出力は完了済み): {e}")
+
+        _log(f"出力完了: {folder['name']} / {OUTPUT_PDF_NAME} ({len(matched_pages)}ページ)")
+
+    def _notify_failure(self, folder, reasons, output_file, error_file):
+        """エラーtxtを作成/上書きし、残っている旧出力PDFを「使用禁止」PDFで失効させる"""
+        client = self.client
+        now_jst = datetime.now(JST)
+        try:
+            content = build_error_txt(now_jst, reasons)
             if error_file:
                 client.overwrite(error_file['id'], content, 'text/plain')
             else:
                 client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain')
-            _log(f"エラー通知: {folder['name']} ({len(reasons)}件)")
-            return
+        except Exception as e:
+            _log(f"フォルダ '{folder['name']}' のエラー通知の書き込みに失敗: {e}")
 
-        label_bytes = sorter_core.build_label_pdf(matched_pages)
         if output_file:
-            client.overwrite(output_file['id'], label_bytes, 'application/pdf')
-        else:
-            client.upload_new(folder['id'], OUTPUT_PDF_NAME, label_bytes, 'application/pdf')
+            # 前回の成功PDFが残っていると誤使用の恐れがあるため無効化する (削除はしない)
+            try:
+                client.overwrite(output_file['id'], build_invalid_pdf(now_jst), 'application/pdf')
+            except Exception as e:
+                _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
 
-        # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
-        if error_file:
-            client.overwrite(error_file['id'], build_resolved_txt(datetime.now(JST)), 'text/plain')
-
-        _log(f"出力完了: {folder['name']} / {OUTPUT_PDF_NAME} ({len(matched_pages)}ページ)")
+        _log(f"エラー通知: {folder['name']} ({len(reasons)}件)")
 
 
 # ───────────────────────── 起動 ─────────────────────────
@@ -437,7 +536,7 @@ def _loop(config):
         try:
             if within_hours(datetime.now(JST), config.hours):
                 if client is None:
-                    client = DriveClient(config.sa_json)
+                    client = DriveClient(config.sa_json, config.root_id)
                 Worker(config, client).run_cycle()
         except Exception as e:
             _log(f"サイクルエラー: {e}\n{traceback.format_exc()}")

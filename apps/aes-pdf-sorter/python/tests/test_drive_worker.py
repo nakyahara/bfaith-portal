@@ -11,7 +11,7 @@ import fitz
 import drive_worker
 from drive_worker import (
     Worker, decide_action, is_aes_pattern, parse_pattern_name,
-    parse_poll_hours, within_hours,
+    parse_poll_hours, within_hours, natural_key, build_invalid_pdf,
     OUTPUT_PDF_NAME, ERROR_TXT_NAME, CSV_NAME, FOLDER_MIME,
 )
 
@@ -97,6 +97,23 @@ class DecideActionTest(unittest.TestCase):
         self.assertEqual(
             decide_action(self.now, [meta('納品書_20.pdf', recent)], None, None),
             'skip_settling')
+
+
+class NaturalKeyTest(unittest.TestCase):
+    def test_numeric_order(self):
+        names = ['納品書_10.pdf', '納品書_2.pdf', '納品書_1.pdf']
+        self.assertEqual(
+            sorted(names, key=natural_key),
+            ['納品書_1.pdf', '納品書_2.pdf', '納品書_10.pdf'])
+
+
+class BuildInvalidPdfTest(unittest.TestCase):
+    def test_valid_pdf_with_marker(self):
+        from datetime import datetime as dt
+        data = build_invalid_pdf(dt(2026, 7, 23, 10, 0, tzinfo=drive_worker.JST))
+        texts = page_texts(data)
+        self.assertEqual(len(texts), 1)
+        self.assertIn('INVALID - DO NOT USE', texts[0])
 
 
 class HoursTest(unittest.TestCase):
@@ -322,6 +339,223 @@ class WorkerE2ETest(unittest.TestCase):
         file_id, content, mimetype = client.overwrites[0]
         self.assertEqual(file_id, f'id-{ERROR_TXT_NAME}')
         self.assertIn('解消済み', content.decode('utf-8'))
+
+    def test_stale_output_invalidated_on_failure(self):
+        # 前回の成功PDFが残った状態で新しい入力の処理が失敗 → 旧PDFを「使用禁止」PDFで上書き
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-9999999-9999999'])  # CSVに無い注文 → 失敗
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            meta(OUTPUT_PDF_NAME, '2026-07-01T12:00:00.000Z'),  # 前日の成功PDF
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        # エラーtxtは新規作成、旧出力PDFは使用禁止PDFで上書きされる
+        self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.uploads[0][1], ERROR_TXT_NAME)
+        self.assertEqual(len(client.overwrites), 1)
+        file_id, content, mimetype = client.overwrites[0]
+        self.assertEqual(file_id, f'id-{OUTPUT_PDF_NAME}')
+        self.assertEqual(mimetype, 'application/pdf')
+        self.assertIn('INVALID - DO NOT USE', page_texts(content)[0])
+
+    def test_multiple_invoices_natural_order(self):
+        # 納品書_2 → 納品書_10 の自然順で連結される (辞書順だと10が先になる)
+        label_pdf = make_pdf(['LABEL-DA100', 'LABEL-DA200'])
+        invoice2 = make_pdf(['249-1111111-1111111'])   # 納品書_2 → DA100
+        invoice10 = make_pdf(['249-2222222-2222222'])  # 納品書_10 → DA200
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_10.pdf'),
+            meta('納品書_2.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_2.pdf': invoice2,
+            'id-納品書_10.pdf': invoice10,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+            {'page': 1, 'data': 'DA200', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
+        self.assertEqual(page_texts(client.uploads[0][2]), ['LABEL-DA100', 'LABEL-DA200'])
+
+    def test_multiple_pattern_txts_conflict(self):
+        # AESと非AESのtxtが共存 → どちらのフォルダか確定できないためエラー停止
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('引当パターン_ネコポス《全て》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-引当パターン_ネコポス《全て》.txt': PATTERN_NEKOPOSU.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [])
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('複数あります', content.decode('utf-8'))
+
+    def test_non_ship_folder_ignored(self):
+        # ルート直下でも 出荷_XX 以外の名前のフォルダは走査しない
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        children, all_contents = build_world(csv_text=CSV_TEXT)
+        children['ROOT'] = [meta('メモ置き場', mime=FOLDER_MIME)]
+        children['id-メモ置き場'] = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        all_contents['id-引当パターン_AES《単品》.txt'] = PATTERN_AES.encode('utf-8')
+        all_contents['id-納品書_20.pdf'] = invoice_pdf
+
+        client = self._run(children, all_contents, [])
+        self.assertEqual(client.uploads, [])
+        self.assertEqual(client.overwrites, [])
+
+    def test_shared_download_failure_writes_error_txt(self):
+        # CSVのダウンロード例外 → ログだけでなくエラーtxtで通知される
+        class BrokenDownloadClient(FakeDriveClient):
+            def download(self, file_id):
+                if file_id == f'id-{CSV_NAME}':
+                    raise RuntimeError('network down')
+                return super().download(file_id)
+
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        label_pdf = make_pdf(['LABEL-DA100'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = BrokenDownloadClient(children, all_contents)
+        worker = Worker(FakeConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[]]))
+        worker.run_cycle()
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('素材の読み込みに失敗しました', content.decode('utf-8'))
+
+    def test_duplicate_barcode_conflict_blocks_output(self):
+        # 同じ配送番号が複数ページで検出 → 競合エラーで停止 (どちらのページか確定できない)
+        label_pdf = make_pdf(['LABEL-A', 'LABEL-B'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+            {'page': 1, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('DA100', content.decode('utf-8'))
+
+    def test_shared_shipping_number_conflict_blocks_output(self):
+        # 異なる注文が同一配送番号 → 同じページを複数回出さずエラー停止
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111', '249-2222222-2222222'])
+        csv_text = (
+            '注文番号,配送番号\n'
+            '249-1111111-1111111,DA100\n'
+            '249-2222222-2222222,DA100\n'   # 同じ配送番号
+        )
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=csv_text, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('配送番号の重複', content.decode('utf-8'))
+
+    def test_output_upload_failure_writes_error_txt(self):
+        # 出力PDFのアップロード失敗もエラーtxtで通知される
+        class BrokenUploadClient(FakeDriveClient):
+            def upload_new(self, folder_id, name, content, mimetype):
+                if name == OUTPUT_PDF_NAME:
+                    raise RuntimeError('upload failed')
+                return super().upload_new(folder_id, name, content, mimetype)
+
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = BrokenUploadClient(children, all_contents)
+        worker = Worker(FakeConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        error_uploads = [u for u in client.uploads if u[1] == ERROR_TXT_NAME]
+        self.assertEqual(len(error_uploads), 1)
+        self.assertIn('アップロードに失敗しました', error_uploads[0][2].decode('utf-8'))
 
     def test_skip_when_output_up_to_date(self):
         folder_files = [
