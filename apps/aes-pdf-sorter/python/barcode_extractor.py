@@ -4,13 +4,41 @@
 """
 
 import fitz  # PyMuPDF
-import cv2
 import numpy as np
 from pyzbar import pyzbar
 from pyzbar.pyzbar import ZBarSymbol
 import json
 import os
 import sys
+
+def otsu_binarize(gray_array):
+    """大津の二値化 (旧 cv2.threshold(..., THRESH_BINARY+THRESH_OTSU) と同一結果)。
+
+    以前は閾値処理この1箇所のためだけに OpenCV (常駐メモリ数十MB) を積んでいたため、
+    numpy実装に置き換えた (2026-07-23 省メモリ化。Render OOM対策の一環)。
+    アルゴリズムはOpenCVの getThreshVal_Otsu_8u と同じ:
+    ヒストグラムからクラス間分散が最大になる閾値 t を選び (同値なら最小のt)、
+    画素値 > t を255、それ以外を0にする。
+    """
+    hist = np.bincount(gray_array.ravel(), minlength=256).astype(np.float64)
+    total = gray_array.size
+    levels = np.arange(256, dtype=np.float64)
+    sum_all = float(np.dot(levels, hist))
+
+    weight_bg = np.cumsum(hist)                # クラス1 = [0..t] の画素数
+    sum_bg = np.cumsum(levels * hist)          # クラス1の輝度合計
+    weight_fg = total - weight_bg              # クラス2 = [t+1..255]
+
+    valid = (weight_bg > 0) & (weight_fg > 0)
+    # 0除算を避けるため無効候補は分母1で計算し、後で分散を-1にして除外する
+    mean_bg = sum_bg / np.maximum(weight_bg, 1)
+    mean_fg = (sum_all - sum_bg) / np.maximum(weight_fg, 1)
+    between_variance = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+    between_variance[~valid] = -1.0
+
+    threshold = int(np.argmax(between_variance))  # 同値は最小のt (OpenCVと同じ)
+    return np.where(gray_array > threshold, 255, 0).astype(np.uint8)
+
 
 class BarcodeExtractor:
     def __init__(self, config_file="bbox_config.json"):
@@ -73,8 +101,7 @@ class BarcodeExtractor:
 
     def enhance_barcode_image_from_array(self, gray_array):
         try:
-            _, binary = cv2.threshold(gray_array, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            return binary
+            return otsu_binarize(gray_array)
         except Exception as e:
             print(f"画像処理エラー: {e}")
             return np.where(gray_array > 127, 255, 0).astype(np.uint8)
