@@ -1,7 +1,8 @@
 """
 AES送り状並び替え Drive自動化ワーカー
 
-共有ドライブ「ネクストエンジン【出荷関係】」直下の出荷_XXフォルダを定期的に走査し、
+共有ドライブ「ネクストエンジン【出荷関係】」内の出荷_XXフォルダ (実運用では
+「出荷_no」フォルダの下。AES_SHIP_PARENT_ID で指定、未指定ならドライブ直下) を定期的に走査し、
 AES引当フォルダ (引当パターン_AES….txt があるフォルダ) に納品書PDFが入っていたら、
 logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 納品書順に並び替えた「AES送り状_並び替え済.pdf」を同フォルダに出力する。
@@ -255,11 +256,13 @@ class DriveClient:
     """Drive API v3 の薄いラッパー (サービスアカウント認証)。
 
     書き込み系は upload_new / overwrite の2つだけ。削除系のメソッドは意図的に持たない。
-    対象は単一の共有ドライブなので corpora='drive' + driveId で検索する
-    (allDrives は incompleteSearch の恐れがあるため使わない。Codexレビュー指摘6)。
+    検索は corpora='drive' + driveId で行う (allDrives は incompleteSearch の恐れが
+    あるため使わない。Codexレビュー指摘6)。素材フォルダが別の共有ドライブにある
+    実運用構成に対応するため、driveId はフォルダごとに files.get で解決する
+    (2026-07-23 実機確認: 素材=別ドライブ、出荷_XX=ネクストエンジン【出荷関係】)。
     """
 
-    def __init__(self, service_account_json, drive_id):
+    def __init__(self, service_account_json):
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         creds = service_account.Credentials.from_service_account_info(
@@ -267,22 +270,38 @@ class DriveClient:
             scopes=['https://www.googleapis.com/auth/drive'],
         )
         self.service = build('drive', 'v3', credentials=creds, cache_discovery=False)
-        self.drive_id = drive_id
+        self._drive_id_cache = {}
+
+    def _drive_id_of(self, folder_id):
+        """フォルダが属する共有ドライブのIDを解決する (キャッシュ)。
+
+        共有ドライブのルートIDを渡した場合は driveId = そのID が返る。
+        マイドライブ上のフォルダは driveId を持たないので None。
+        """
+        if folder_id not in self._drive_id_cache:
+            res = self.service.files().get(
+                fileId=folder_id, fields='id,driveId', supportsAllDrives=True,
+            ).execute()
+            self._drive_id_cache[folder_id] = res.get('driveId')
+        return self._drive_id_cache[folder_id]
 
     def list_children(self, folder_id):
+        drive_id = self._drive_id_of(folder_id)
         files = []
         page_token = None
         while True:
-            res = self.service.files().list(
+            kwargs = dict(
                 q=f"'{folder_id}' in parents and trashed=false",
-                corpora='drive',
-                driveId=self.drive_id,
                 includeItemsFromAllDrives=True,
                 supportsAllDrives=True,
                 fields='nextPageToken, incompleteSearch, files(id,name,mimeType,modifiedTime,appProperties)',
                 pageSize=200,
                 pageToken=page_token,
-            ).execute()
+            )
+            if drive_id:
+                kwargs['corpora'] = 'drive'
+                kwargs['driveId'] = drive_id
+            res = self.service.files().list(**kwargs).execute()
             if res.get('incompleteSearch'):
                 # 不完全な結果を「ファイルが無い」と誤判定すると誤動作するため中断する
                 raise RuntimeError(f'Drive検索結果が不完全です (incompleteSearch, folder={folder_id})')
@@ -341,6 +360,9 @@ class Config:
     def __init__(self, env):
         self.sa_json = env.get('GOOGLE_SERVICE_ACCOUNT_JSON') or ''
         self.root_id = env.get('AES_DRIVE_ROOT_ID') or ''
+        # 出荷_XXフォルダの親。実運用ではドライブ直下ではなく「出荷_no」フォルダの下に
+        # あるため個別指定 (未指定ならドライブ直下 = root_id を走査する従来挙動)
+        self.ship_parent_id = env.get('AES_SHIP_PARENT_ID') or self.root_id
         self.material_folder_id = env.get('AES_MATERIAL_FOLDER_ID') or ''
         self.csv_folder_id = env.get('AES_CSV_FOLDER_ID') or ''
         self.interval_sec = int(env.get('AES_POLL_INTERVAL_SEC') or '300')
@@ -448,7 +470,7 @@ class Worker:
         if csv_meta is not None:
             shared = SharedInputs(client, csv_meta, labels_meta, self.extractor_factory)
 
-        folders = [f for f in client.list_children(self.config.root_id)
+        folders = [f for f in client.list_children(self.config.ship_parent_id)
                    if f.get('mimeType') == FOLDER_MIME and SHIP_FOLDER_RE.match(f['name'])]
 
         try:
@@ -677,7 +699,7 @@ def _loop(config):
         try:
             if within_hours(datetime.now(JST), config.hours):
                 if client is None:
-                    client = DriveClient(config.sa_json, config.root_id)
+                    client = DriveClient(config.sa_json)
                 Worker(config, client).run_cycle()
         except Exception as e:
             _log(f"サイクルエラー: {e}\n{traceback.format_exc()}")
