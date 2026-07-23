@@ -1,7 +1,8 @@
 """
 AES送り状並び替え Drive自動化ワーカー
 
-共有ドライブ「ネクストエンジン【出荷関係】」直下の出荷_XXフォルダを定期的に走査し、
+共有ドライブ「ネクストエンジン【出荷関係】」内の出荷_XXフォルダ (実運用では
+「出荷_no」フォルダの下。AES_SHIP_PARENT_ID で指定、未指定ならドライブ直下) を定期的に走査し、
 AES引当フォルダ (引当パターン_AES….txt があるフォルダ) に納品書PDFが入っていたら、
 logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 納品書順に並び替えた「AES送り状_並び替え済.pdf」を同フォルダに出力する。
@@ -341,6 +342,9 @@ class Config:
     def __init__(self, env):
         self.sa_json = env.get('GOOGLE_SERVICE_ACCOUNT_JSON') or ''
         self.root_id = env.get('AES_DRIVE_ROOT_ID') or ''
+        # 出荷_XXフォルダの親。実運用ではドライブ直下ではなく「出荷_no」フォルダの下に
+        # あるため個別指定 (未指定ならドライブ直下 = root_id を走査する従来挙動)
+        self.ship_parent_id = env.get('AES_SHIP_PARENT_ID') or self.root_id
         self.material_folder_id = env.get('AES_MATERIAL_FOLDER_ID') or ''
         self.csv_folder_id = env.get('AES_CSV_FOLDER_ID') or ''
         self.interval_sec = int(env.get('AES_POLL_INTERVAL_SEC') or '300')
@@ -448,7 +452,7 @@ class Worker:
         if csv_meta is not None:
             shared = SharedInputs(client, csv_meta, labels_meta, self.extractor_factory)
 
-        folders = [f for f in client.list_children(self.config.root_id)
+        folders = [f for f in client.list_children(self.config.ship_parent_id)
                    if f.get('mimeType') == FOLDER_MIME and SHIP_FOLDER_RE.match(f['name'])]
 
         try:

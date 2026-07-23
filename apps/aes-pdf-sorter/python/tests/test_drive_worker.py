@@ -307,6 +307,7 @@ class FakeExtractor:
 
 class FakeConfig:
     root_id = 'ROOT'
+    ship_parent_id = 'ROOT'
     material_folder_id = 'MATERIAL'
     csv_folder_id = 'CSVDIR'
 
@@ -551,6 +552,37 @@ class WorkerE2ETest(unittest.TestCase):
         _, name, content, _ = client.uploads[0]
         self.assertEqual(name, ERROR_TXT_NAME)
         self.assertIn('複数あります', content.decode('utf-8'))
+
+    def test_ship_parent_id_scans_subfolder(self):
+        # 実運用では出荷_XXはドライブ直下でなく「出荷_no」フォルダの下にある。
+        # AES_SHIP_PARENT_ID でその親フォルダを指定して走査できる
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        children, all_contents = build_world(csv_text=CSV_TEXT)
+        children['ROOT'] = [meta('出荷_no', mime=FOLDER_MIME)]
+        children['id-出荷_no'] = [meta('出荷_20', mime=FOLDER_MIME)]
+        children['id-出荷_20'] = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        all_contents.update({
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        })
+
+        class SubfolderConfig(FakeConfig):
+            ship_parent_id = 'id-出荷_no'
+
+        client = FakeDriveClient(children, all_contents)
+        worker = Worker(SubfolderConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
 
     def test_non_ship_folder_ignored(self):
         # ルート直下でも 出荷_XX 以外の名前のフォルダは走査しない
