@@ -229,6 +229,8 @@ export function decideOrder(batch_id, shop_name, order_no, { shipping_method_cod
   const batch = db.prepare(`SELECT status FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!batch) throw vErr('バッチが見つかりません');
   if (batch.status === 'exported') throw vErr('出力済みのバッチは編集できません');
+  // 出力処理中 (Drive 保存中) は編集を拒否。build 済みCSVと確定内容がずれるのを防ぐ (Codex High②)。
+  if (batch.status === 'locked_for_export') throw vErr('出力処理中のため編集できません。少し待ってから操作してください');
   const lines = db.prepare(`SELECT * FROM pd_import_line WHERE batch_id=? AND shop_name=? AND order_no=?`)
     .all(batch_id, shop_name, order_no);
   if (!lines.length) throw vErr('対象の伝票が見つかりません');
@@ -424,8 +426,48 @@ export function updateAssort(combo_key, shipping_method_code, packing_machine_co
 
 // ───────────────────────── 出力 (ゲート + CAS) ─────────────────────────
 
-export function exportCsv(batch_id, user, opts = {}) {
-  const downgradeMeltline = !!opts.downgradeMeltline; // MeltLine 導入前: meltline を手動出荷に落として出力
+// ── 出力ロック取得 (classifying → locked_for_export、CAS) ──
+// Drive 保存を始める前に「このバッチだけが今出力中」と宣言する (Codex High①②③)。
+//  - 既に exported / 存在しない → changes=0 で throw (古い/出力済みバッチが Drive を上書きするのを防ぐ)
+//  - locked_for_export の再取得は冪等 (前回の途中失敗からの再実行を許可)
+// pending>0・行数不整合はここで先に弾く (ロックしてから build 失敗→release の往復を避ける)。
+export function beginExport(batch_id) {
+  const db = ensureSchema();
+  const now = utcIsoNow();
+  const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
+  if (!b) throw vErr('バッチが見つかりません');
+  if (b.status === 'exported') throw vErr('このバッチは既に出力済みです');
+  // TTL 切れバッチは出力禁止 (明細が purge され得る・内容が古い、ID直叩き対策、Codex High)。
+  if (b.expires_at && b.expires_at < now) throw vErr('このバッチは期限切れ(48h超)です。再度CSVをアップロードしてください');
+  // 自分より新しい取込バッチが (TTL内で) 存在するなら出力禁止 (Codex High:世代逆転)。
+  // 固定ファイル logi_dispatch.csv は「最新の取込」を載せる運用。再表示ドロップダウンから古い
+  // バッチを選んで出力し、共有ファイルを古い内容で上書きする事故を防ぐ (最新バッチのみ出力可)。
+  const newer = db.prepare(`SELECT batch_id FROM pd_import_batch
+      WHERE (expires_at IS NULL OR expires_at >= ?)
+        AND ( uploaded_at > ? OR (uploaded_at = ? AND batch_id > ?) )
+      LIMIT 1`).get(now, b.uploaded_at, b.uploaded_at, batch_id);
+  if (newer) throw vErr('より新しい取込バッチがあります。最新のバッチを表示して出力してください (古いバッチの出力は共有ファイルを古い内容で上書きするため禁止)');
+  const pending = db.prepare(`SELECT COUNT(*) c FROM pd_import_line WHERE batch_id=? AND row_status='要判断'`).get(batch_id).c;
+  if (pending > 0) throw vErr(`未判断が ${pending} 件あります。すべて確定してから出力してください。`, { pending });
+  const cas = db.prepare(`UPDATE pd_import_batch SET status='locked_for_export'
+      WHERE batch_id=? AND status IN ('classifying','locked_for_export')`).run(batch_id);
+  if (cas.changes === 0) throw vErr('このバッチは出力できる状態ではありません (状態が変わっています)');
+}
+
+// ── 出力ロック解放 (locked_for_export → classifying、CAS) ──
+// Drive 保存や確定に失敗したときに呼び、再編集・再出力できる状態へ戻す。best-effort。
+export function releaseExport(batch_id) {
+  const db = ensureSchema();
+  db.prepare(`UPDATE pd_import_batch SET status='classifying'
+      WHERE batch_id=? AND status='locked_for_export'`).run(batch_id);
+}
+
+// ── CSV バッファ生成 (副作用なし。CAS/tracking を伴わない) ──
+// Drive 保存を「先に」行い、成功時だけ commitExport() で CAS 確定する二段構えのため、
+// 生成 (再試行安全) と 確定 (一度きり) を分離する (Codex High①②: CAS後の取りこぼし/二重投入防止)。
+// lineRows も返し、commit 側で再クエリせず同じスナップショットで tracking 登録できるようにする。
+export function buildExportCsv(batch_id, opts = {}) {
+  // ※ 旧 opts.downgradeMeltline (MeltLine 導入前形式) は撤去済 (2026-07-19)。MeltLine 本番稼働済のため常に通常形式で出力。
   const db = ensureSchema();
   const b = db.prepare(`SELECT * FROM pd_import_batch WHERE batch_id=?`).get(batch_id);
   if (!b) throw vErr('バッチが見つかりません');
@@ -443,7 +485,6 @@ export function exportCsv(batch_id, user, opts = {}) {
     const raw = JSON.parse(l.raw_cols);
     if (l.shipping_method_code && l.shipping_method_code !== 'aes') {
       let pm = l.packing_machine_code;
-      if (downgradeMeltline && pm === 'meltline') pm = 'manual'; // MeltLine 導入前は手動出荷で出す
       if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
       // 沖縄県宛 × ネコポス は梱包機マーカーを「手動出荷」に矯正。
       // 航空便の液体規制は、ヤマト端末で送り状QRを読んだときに「沖縄エラー」で別管理導線へ
@@ -457,9 +498,16 @@ export function exportCsv(batch_id, user, opts = {}) {
     return raw;
   });
 
-  // buffer 生成は副作用なしなので CAS の前に済ませる (失敗してもユーザー操作は復活可能)。
   const buf = buildNeCsv(headerRow, outRows);
+  return { buffer: buf, rowCount: outRows.length, lineRows };
+}
 
+// ── 出力確定 (CAS で exported 化 + tracking 登録 + audit) ──
+// buildExportCsv() が成功し、外部保存 (Drive) も済んだ後に呼ぶ。CAS が 0 件なら二重出力として throw。
+// lineRows は buildExportCsv の戻りをそのまま渡す (再クエリ省略。無ければ再取得)。
+export function commitExport(batch_id, user, { lineRows = null, rowCount = null } = {}) {
+  const db = ensureSchema();
+  const rows = lineRows || db.prepare(`SELECT * FROM pd_import_line WHERE batch_id=? ORDER BY row_no`).all(batch_id);
   // CAS で exported へ (二重出力防止) + tracking UPSERT を 1 transaction に。
   // どちらか失敗したら状態は変えず、ユーザーが再試行できる状態にする。
   let trackingStats = { registered: 0, syncedSkipped: 0, candidates: 0 };
@@ -470,13 +518,21 @@ export function exportCsv(batch_id, user, opts = {}) {
     // pd_shipment_tracking に登録 (CSV 出力した伝票だけが NE 反映対象)。
     // 同一 ne_uketsuke_no (col 20) を伝票単位で 1 行に集約。AES は対象外 (NE 側で別管理)。
     // synced 済み (=既に NE 反映完了) は触らない、それ以外は pending リセット + 追跡番号クリア。
-    trackingStats = registerShipmentTrackingFromBatch(db, lineRows, user);
+    trackingStats = registerShipmentTrackingFromBatch(db, rows, user);
   });
   tx();
 
   // 登録件数を audit log に残す (Codex R0 High 2: 登録件数が低くても検知できるように)
-  audit('export', batch_id, { rows: outRows.length, tracking: trackingStats }, user);
-  return { buffer: buf, rowCount: outRows.length, tracking: trackingStats };
+  audit('export', batch_id, { rows: rowCount ?? rows.length, tracking: trackingStats }, user);
+  return { tracking: trackingStats };
+}
+
+// 従来の一括版 (ブラウザ直DL経路 /api/export/:id 用)。生成→確定を一続きで行う。
+// Drive 保存経路は buildExportCsv → (Drive保存) → commitExport の順で使うこと。
+export function exportCsv(batch_id, user, opts = {}) {
+  const built = buildExportCsv(batch_id, opts);
+  const { tracking } = commitExport(batch_id, user, { lineRows: built.lineRows, rowCount: built.rowCount });
+  return { buffer: built.buffer, rowCount: built.rowCount, tracking };
 }
 
 // 過去の exported バッチを走査して pd_shipment_tracking に backfill する admin 機能。
@@ -488,14 +544,17 @@ export function exportCsv(batch_id, user, opts = {}) {
 // は INSERT OR IGNORE で完全保護する。再出力時の破壊的 UPSERT は exportCsv 専用 (別経路)。
 export function backfillShipmentTrackingFromExportedBatches({ dryRun = false, todayJstOnly = true } = {}, user) {
   const db = ensureSchema();
-  // exported / locked_for_export 状態のバッチを対象 (まだ TTL 内のもの)。
+  // exported 状態のバッチのみ対象 (まだ TTL 内のもの)。
+  // ⚠️ locked_for_export は「出力処理中/クラッシュ残留」の不確定な中間状態で、Drive にCSVが
+  //    載っているとは限らない (Codex High)。これを「CSV出力済み」とみなして tracking を作ると、
+  //    Drive にファイルが無い/別バッチ内容なのに NE 反映対象だけ生成され得るため backfill から除外する。
   // 2026-06-04 中原さん指摘: todayJstOnly (デフォ ON) で「今日 JST にアップしたバッチだけ」に絞れる。
   // 前日以前のバッチを backfill すると、B2 CSV 再投入対象外なのに pending として残って混乱するため。
   const todayFilter = todayJstOnly
     ? `AND date(uploaded_at, '+9 hours') = date('now', '+9 hours')` : '';
   const batches = db.prepare(`SELECT batch_id, status, uploaded_at, row_count
     FROM pd_import_batch
-    WHERE status IN ('exported', 'locked_for_export')
+    WHERE status = 'exported'
       AND (expires_at IS NULL OR expires_at >= ?)
       ${todayFilter}
     ORDER BY uploaded_at`).all(utcIsoNow());
@@ -922,11 +981,20 @@ function registerShipmentTrackingFromBatch(db, lineRows, user) {
   return { registered, syncedSkipped, candidates: byUketsuke.size };
 }
 
+// best-effort。書込めたら true、失敗したら false を返す (呼び出し側が監査有無を判定できるように)。
 function audit(action, target, detail, who) {
   try {
     getMirrorDB().prepare(`INSERT INTO pd_audit_log (ts,who,action,target,detail) VALUES (?,?,?,?,?)`)
       .run(utcIsoNow(), who || null, action, target || null, detail ? JSON.stringify(detail) : null);
-  } catch (e) { console.error('[packing] audit', e.message); }
+    return true;
+  } catch (e) { console.error('[packing] audit', e.message); return false; }
+}
+
+// ⑤ 追跡番号CSVの Drive 保存の監査ログ (router から呼ぶ)。状態遷移(CAS)が無い経路なので、
+// 誰が・いつ・どの範囲(scope)・何件・Drive のどのファイルに保存したかを追跡できるよう別途記録する。
+// Drive 上書きは取消不能なので保存自体は失敗させず、監査の成否を bool で返して呼び出し側に判断を委ねる (Codex High)。
+export function auditTrackingCsvDriveSave(detail, user) {
+  return audit('tracking_csv_drive_save', null, detail, user);
 }
 
 // ───────────────────────── マスタ② CRUD (区間連続性検証) ─────────────────────────

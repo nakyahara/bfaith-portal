@@ -20,8 +20,12 @@ import { bootStart, bootEnd, bootNote, bootFail, getBootId } from './apps/observ
 import profitRouter from './apps/profit-calculator/router.js';
 import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator/price-scheduler.js';
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
+import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
+import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
+import { startShippingStaffCron } from './apps/shipping-log/notion-staff.js';
+import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -48,14 +52,19 @@ import execDashboardRouter from './apps/exec-dashboard/router.js';
 import mgmtAccountingRouter, { startMgmtAutoSyncScheduler } from './apps/mgmt-accounting/router.js';
 import crossSellFinderRouter from './apps/cross-sell-finder/router.js';
 import giftsetAssemblyRouter from './apps/giftset-assembly/router.js';
+import inboundInfoRouter from './apps/inbound-info/router.js';
+import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
+import shippingLogRouter from './apps/shipping-log/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
+import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
+import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
@@ -277,6 +286,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/service-api/') || normalizedPath === '/service-api') return next();
     // /apps/mirror/api/sync* も同様に API key 認証前 body parse を避ける。
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
+    // /api/ai-insights/service/* は AI_INSIGHT_SERVICE_TOKEN 認証後に専用 parser (2MB) が走る。
+    if (normalizedPath.startsWith('/api/ai-insights/service')) return next();
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
@@ -655,6 +666,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'inbound-info',
+    name: '入庫情報管理',
+    description: '入数・BCシール・保管荷姿・いろは在庫化などの入庫マスタ。新商品はNE商品マスタから毎日自動追加 (旧: 入庫情報管理表スプレッドシート)',
+    icon: '📥',
+    path: '/apps/inbound-info',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'giftset-assembly',
     name: 'ギフトセット組み依頼',
     description: '構成品のピッキング表(ロジザード貼り付け)と子会社Notionの作業カードを発行',
@@ -734,6 +754,15 @@ const apps = [
     path: '/apps/inquiry-hub',
     status: 'active',
     category: 'support',
+  },
+  {
+    id: 'ai-insights',
+    name: 'AI経営レポート設定',
+    description: 'AI経営アドバイス定期配信 (週次・月次) の予算・イベントメモ・配信状態管理。レポートはGChat経営インサイトスペースへ投稿',
+    icon: '🤖',
+    path: '/apps/ai-insights',
+    status: 'active',
+    category: 'analysis',
   },
   {
     id: 'supplier-sales',
@@ -1146,8 +1175,13 @@ app.use('/apps/qoo10-analytics', (err, req, res, next) => {
 app.use('/apps/biz-ops-overview', requireAppAccess('biz-ops-overview'), bizOpsOverviewRouter);
 app.use('/apps/product-management-list', requireAppAccess('product-management-list'), productManagementListRouter);
 app.use('/apps/exec-dashboard', requireAppAccess('exec-dashboard'), express.json({ limit: '1mb' }), execDashboardRouter);
+// AI経営レポート (apps/ai-insights): ⚙️設定画面は session、/api/ai-insights はトークン認証
+// (report-input=AI_READ_TOKEN read-only / service=AI_INSIGHT_SERVICE_TOKEN。いずれも fail-closed)
+app.use('/api/ai-insights', aiInsightsApiRouter);
+app.use('/apps/ai-insights', requireAppAccess('ai-insights'), express.json({ limit: '256kb' }), aiInsightsRouter);
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
+app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
@@ -1155,14 +1189,17 @@ app.use('/apps/packing-dispatch/api/ne-sync-worker', express.json({ limit: '2mb'
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
+// 出荷実績ログ (apps/shipping-log): 出荷_no 掃除 GAS からの伝票取込。Bearer fail-closed のみ (session なし)
+app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
-// 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。Step 1 = 一覧/詳細 read-only + 社内操作のみ
-app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '256kb' }), inquiryHubRouter);
+// 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
+// limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
+app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
   // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
@@ -1340,11 +1377,30 @@ app.listen(PORT, () => {
 
   // 経営インサイトGChat通知 (在庫サマリ、INVENTORY_NOTIFY_ENABLED=true で起動)
   startInventoryNotificationJob();
+  // 低粗利商品アラート (粗利率10%割れ、MARGIN_ALERT_ENABLED=true で起動、JST 10:00)
+  startMarginAlertJob();
   // biz-ops-overview 売上サマリ GChat 通知 (在庫と独立メッセージ、SALES_NOTIFY_ENABLED=true で起動)
   startSalesNotificationJob();
+  // ai-insights 月次締めリマインダー+確定後変更検知 (AI_INSIGHTS_NOTIFY_ENABLED=true で起動、JST 10:00)
+  startAiInsightsNotifyJob();
 
   // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
   startRysCron();
+
+  // 入庫情報管理: NE商品マスタ(ミラー)から新商品を自動追加 (INBOUND_INFO_SYNC_ENABLED=true で起動、
+  // 既定 JST 09:00 = ミラー同期完了後。Dark Launch)
+  startInboundInfoCron();
+
+  // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
+  startInquiryHubSyncCron();
+
+  // 出荷カード担当者スナップショット (Notion→sl_batch_staff、毎日19:30 JST。
+  // SHIPPING_STAFF_CRON_ENABLED=true で起動、Dark Launch)
+  startShippingStaffCron();
+
+  // Render 一次データ自己バックアップ (JST 03:30、Google Drive へ外向き送信のみ =
+  // DB ダウンロード用の公開エンドポイントは作らない。RENDER_BACKUP_CRON_ENABLED=1 で起動、Dark Launch)
+  startRenderBackupCron();
 });
 
 process.on('SIGTERM', () => {

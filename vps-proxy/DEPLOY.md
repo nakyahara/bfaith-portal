@@ -110,6 +110,8 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
 | GET | `/yahoo/category-search` | secret | 一般公開 categorySearch (カテゴリツリー)。appid=YAHOO_CLIENT_ID |
 | GET | `/yahoo/orderList` | secret | 受注一覧 (固定 IP 必須) |
 | GET/POST | `/yahoo/orderInfo` | secret | 受注詳細 |
+| GET | `/yahoo/externalTalkList` | secret | 問い合わせ一覧 (inquiry-hub 受信同期。Bearer+公開鍵署名はVPS側で付与) |
+| GET | `/yahoo/externalTalkDetail` | secret | 問い合わせ詳細 (同上。read-onlyのみ、返信系passthroughは作らない) |
 | GET | `/wmshopapi/...` | secret | au PAY 透過 proxy |
 
 - secret 認証は `X-Proxy-Secret` ヘッダ (`PROXY_SECRET` または rotation 中の `PROXY_SECRET_NEXT` のどちらでも可)

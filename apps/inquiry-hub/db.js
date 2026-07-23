@@ -55,6 +55,14 @@ export function getDB() {
   return db;
 }
 
+// 既存テーブルへのカラム追加ヘルパー (冪等。warehouse-mirror/db.js と同パターン)
+function addColumnIfMissing(table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+  if (!cols.includes(column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+  }
+}
+
 function createTables() {
   // 店舗・チャネル
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
@@ -191,6 +199,9 @@ function createTables() {
     consecutive_failures INTEGER NOT NULL DEFAULT 0
   )`);
 
+  // 同期リースの所有者トークン (Codexレビュー: 期限切れ後の旧ジョブが新ジョブのリースを解除/上書きしないため)
+  addColumnIfMissing('sync_state', 'lease_token', 'TEXT');
+
   // 同期・送信エラーログ
   db.exec(`CREATE TABLE IF NOT EXISTS sync_errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,20 +238,70 @@ function createTables() {
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
 
-  // 返信テンプレート (CRUD画面はStep 6)
+  // 返信テンプレート (メールディーラーのテンプレートエクスポートCSVを取込)
   db.exec(`CREATE TABLE IF NOT EXISTS reply_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     channel_type TEXT,                       -- NULL=全チャネル共通
-    category TEXT,
+    category TEXT,                           -- メールディーラーのテンプレートグループ (階層は ' > ' 区切り)
     template_name TEXT NOT NULL,
-    template_body TEXT NOT NULL,
+    template_body TEXT NOT NULL,             -- 本文 (メールディーラー「本文（上）」)
     is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
     usage_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
+  // メールディーラー取込用の追加カラム (Step 1 で作成済みの本番テーブルへの冪等migration)
+  addColumnIfMissing('reply_templates', 'subject', 'TEXT');            // 件名
+  addColumnIfMissing('reply_templates', 'body_bottom', 'TEXT');        // 本文（下）= 署名等 (引用返信の下に付く部分)
+  addColumnIfMissing('reply_templates', 'keywords', 'TEXT');           // 重要キーワード+キーワード
+  addColumnIfMissing('reply_templates', 'notes', 'TEXT');              // 備考
+  addColumnIfMissing('reply_templates', 'sort_order', 'INTEGER');      // 表示順序
+  addColumnIfMissing('reply_templates', 'external_id', 'TEXT');        // メールディーラーテンプレートID (再取込の冪等キー)
+  addColumnIfMissing('reply_templates', 'source_created_at', 'TEXT');
+  addColumnIfMissing('reply_templates', 'source_updated_at', 'TEXT');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_tpl_external
+    ON reply_templates(external_id) WHERE external_id IS NOT NULL`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_tpl_category ON reply_templates(category, sort_order)');
+
+  // Q&A (社内ナレッジ。メールディーラーのQ&AエクスポートCSVを取込。手動追加も可)
+  db.exec(`CREATE TABLE IF NOT EXISTS qa_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT,                        -- メールディーラーQ&A ID (再取込の冪等キー。手動追加はNULL)
+    category TEXT,
+    title TEXT NOT NULL,                     -- 件名
+    question TEXT,
+    answer TEXT NOT NULL,
+    notes TEXT,
+    staff TEXT,                              -- 担当者 (取込元の表示値)
+    is_published INTEGER NOT NULL DEFAULT 1 CHECK(is_published IN (0,1)),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),   -- 論理削除
+    source_created_at TEXT,
+    source_updated_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_qa_external
+    ON qa_entries(external_id) WHERE external_id IS NOT NULL`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_qa_category ON qa_entries(category)');
 
   // AIジョブ (キュー。inquiriesのカラムではなく独立テーブル。処理系はStep 7)
+  // メール取込ルール (メールチャネルのノイズ除去。メールディーラー振り分け設定の移行先)
+  // action: skip=取り込まない / import_done=取り込んで対応完了扱い (通常取込はルール不要の既定動作)
+  db.exec(`CREATE TABLE IF NOT EXISTS mail_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    priority INTEGER NOT NULL DEFAULT 100,       -- 小さいほど先に評価 (先勝ち)
+    name TEXT,
+    match_mode TEXT NOT NULL DEFAULT 'all' CHECK(match_mode IN ('all','any')),
+    conditions_json TEXT NOT NULL,               -- [{field: from|to|reply_to|subject|body, op: contains|not_contains|equals|not_equals|starts_with|ends_with, value}]
+    action TEXT NOT NULL CHECK(action IN ('skip','import_done')),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    external_key TEXT,                           -- メールディーラー条件ID (再取込の冪等キー。手動追加はNULL)
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_rules_external
+    ON mail_rules(external_key) WHERE external_key IS NOT NULL`);
+
   db.exec(`CREATE TABLE IF NOT EXISTS ai_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),

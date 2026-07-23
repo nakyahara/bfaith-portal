@@ -13,7 +13,8 @@ import 'dotenv/config';
 import { parseStringPromise } from 'xml2js';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 
-const YAHOO_PROXY_URL = process.env.YAHOO_PROXY_URL || 'http://133.167.122.198:8081';
+// デフォルトは統合プロキシ 8080 (他12ファイルと同一)。旧 8081 は閉鎖済みの死番だった
+const YAHOO_PROXY_URL = process.env.YAHOO_PROXY_URL || 'http://133.167.122.198:8080';
 const YAHOO_PROXY_SECRET = process.env.YAHOO_PROXY_SECRET || process.env.AUPAY_PROXY_SECRET || '';
 
 function now() { return new Date().toISOString().replace('T', ' ').slice(0, 19); }
@@ -309,9 +310,11 @@ function evaluateFetchResult(label, fetched, currentCount, skippedInvalid, apiEr
 // ─── メイン：日次取得 ───
 
 async function fetchYahoo(days = 7) {
+  // 設定不備・プロキシ死・トークン消滅を exit 0 で握りつぶすと「✅ 0件」が無限継続する
+  // (期限警告も同一プロキシ依存で同時に沈黙する) ため、3経路とも fail として daily-sync に ❌ を出させる
   if (!YAHOO_PROXY_SECRET) {
-    console.log('[Yahoo] YAHOO_PROXY_SECRET（またはAUPAY_PROXY_SECRET）が未設定');
-    return;
+    console.error('[Yahoo] FATAL: YAHOO_PROXY_SECRET（またはAUPAY_PROXY_SECRET）が未設定');
+    process.exit(1);
   }
 
   console.log(`[Yahoo] 受注取得開始（直近${days}日）`);
@@ -321,12 +324,12 @@ async function fetchYahoo(days = 7) {
     const healthRes = await proxyGet('/yahoo/health');
     const health = await healthRes.json();
     if (!health.hasTokens) {
-      console.log('[Yahoo] トークン未初期化。VPSで /yahoo/token/init を実行してください');
-      return;
+      console.error('[Yahoo] FATAL: トークン未初期化。VPSで /yahoo/token/init を実行してください');
+      process.exit(1);
     }
   } catch (e) {
-    console.log(`[Yahoo] VPSプロキシ接続失敗: ${e.message}`);
-    return;
+    console.error(`[Yahoo] FATAL: VPSプロキシ接続失敗: ${e.message}`);
+    process.exit(1);
   }
 
   const db = getDB();

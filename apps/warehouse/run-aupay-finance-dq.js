@@ -15,7 +15,7 @@
  *   4. shipping_missing_rate_pct        (warn 5% / error 10%)
  *   5. unresolved_sku_rate_pct          (warn 12% / error 20%) — au PAY は親 SKU が意図的に unresolved 維持 (~9%)、想定外の急増検知用に閾値高め
  *   6. whitelist_coverage_pct           (warn < 95% / error < 90%、当月 80%/70%)
- *   7. resolved_but_zero_cost_count     (error: 1 件以上 — ne_code 解決済なのに cogs=0/unit_cost NULL)
+ *   7. resolved_but_zero_cost_count     (error: 1 件以上 — ne_code 解決済なのに cogs=0/unit_cost NULL。原価状態=OVERRIDDEN の意図的 0 円は除外)
  *   8. normalized_collision_count       (warn: 1 件以上 — m_products に LOWER(TRIM(商品コード)) 重複)
  *   9. request_price_reconcile_diff_pct (warn 0.5% / error 1%) — SUM(request_price) ≈ SUM(net_sales_after_coupon - use_ponta - use_au + item_option + gift_wrapping)
  *  10. mall_fee_rate_missing_pct        (warn 50% / error 80%) — mall_fee_calc_method='unknown' の比率
@@ -117,8 +117,11 @@ const wlPct = cov.total > 0 ? cov.wl / cov.total * 100 : 0;
 recordResult('whitelist_coverage_pct', wlPct < THRESHOLDS.whitelist_coverage_pct.error ? 'error' : wlPct < THRESHOLDS.whitelist_coverage_pct.warn ? 'warn' : 'info', wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
 
 // Check 7: resolved_but_zero_cost_count
-const zc = db.prepare("SELECT COUNT(*) AS cnt FROM f_aupay_finance_sku_daily_v1 WHERE substr(date_jst,1,7)=? AND ne_code IS NOT NULL AND units_net_sold > 0 AND (cogs_amount_jpy_incl = 0 OR unit_cost_snapshot_incl IS NULL)").get(monthStr);
-recordResult('resolved_but_zero_cost_count', zc.cnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : zc.cnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info', zc.cnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zc.cnt });
+// 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
+// snapshot NULL (lookup 失敗) / snapshot>0 で cogs=0 (計算異常) は error のまま。判定は実行時点の m_products (as-of ではない)
+const zc = db.prepare("SELECT COUNT(*) AS cnt, SUM(CASE WHEN f.unit_cost_snapshot_incl = 0 AND EXISTS (SELECT 1 FROM m_products mp WHERE LOWER(TRIM(mp.商品コード)) = LOWER(TRIM(f.ne_code)) AND mp.原価状態 = 'OVERRIDDEN' AND mp.原価 = 0) THEN 1 ELSE 0 END) AS intentional_zero FROM f_aupay_finance_sku_daily_v1 f WHERE substr(f.date_jst,1,7)=? AND f.ne_code IS NOT NULL AND f.units_net_sold > 0 AND (f.cogs_amount_jpy_incl = 0 OR f.unit_cost_snapshot_incl IS NULL)").get(monthStr);
+const zcCnt = zc.cnt - (zc.intentional_zero || 0);
+recordResult('resolved_but_zero_cost_count', zcCnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : zcCnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info', zcCnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zcCnt, intentional_zero_cost_exempted: zc.intentional_zero || 0 });
 
 // Check 8: normalized_collision_count
 const coll = db.prepare("SELECT COUNT(*) AS cnt FROM (SELECT LOWER(TRIM(商品コード)) AS k, COUNT(*) AS c FROM m_products WHERE 商品コード IS NOT NULL AND TRIM(商品コード)<>'' GROUP BY k HAVING COUNT(*) > 1)").get();

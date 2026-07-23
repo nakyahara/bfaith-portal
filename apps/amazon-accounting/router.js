@@ -666,6 +666,12 @@ function renderPage() {
       </div>
 
       <div class="card">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: Amazon売上）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。</p>
+        <div id="mfJournalTable"></div>
+      </div>
+
+      <div class="card">
         <h2>セグメント別集計（管理会計用）</h2>
         <div id="segmentTable"></div>
         <div id="excludedInfo"></div>
@@ -844,8 +850,72 @@ function renderPage() {
         document.getElementById('mfTable').innerHTML = mfHtml;
       }
 
+      // MF振替伝票入力用 仕訳
+      if (data.mfRow) {
+        document.getElementById('mfJournalTable').innerHTML = mfJournalTableHtml(data.mfRow);
+      }
+
       // セグメント別（1〜3 + other。4=輸出は除外）
       renderSegmentTable('segmentTable', data.bySegment, data.segmentNames, cols, null);
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる。
+    // 対応関係（会計処理の実務ルール）:
+    //   貸方 売上高/課売10%   = 商品売上(10%) + 配送料 + ギフト包装手数料 (+端数調整)
+    //   貸方 売上高/課売(軽)8% = 商品売上(8%)
+    //   借方 支払手数料【原価】/課仕10%       = -(Amazonポイントの費用 + プロモーション割引額 + 手数料)
+    //   借方 発送運賃【原価】(補助:AmazonFBA手数料)/課仕10% = -(FBA手数料)
+    //   借方 広告宣伝費【原価】/課仕10%       = -(トランザクションに関するその他の手数料+その他)
+    //   借方 売掛金_EC売上/対象外            = 合計（差引入金額）
+    function buildMfJournalRows(mf) {
+      const v = k => mf[k] || 0;
+      return [
+        { dc: 'credit', account: '売上高', sub: 'Amazon', tax: '課売10%',
+          amount: v('商品売上(10%)') + v('配送料') + v('ギフト包装手数料'), memo: 'Amazon売上' },
+        { dc: 'credit', account: '売上高', sub: 'Amazon', tax: '課売(軽)8%',
+          amount: v('商品売上(8%)'), memo: 'Amazon売上 軽減8%' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: 'Amazon', tax: '課仕10%',
+          amount: -(v('Amazonポイントの費用') + v('プロモーション割引額') + v('手数料')), memo: 'Amazon PF手数料' },
+        { dc: 'debit', account: '発送運賃【原価】', sub: 'AmazonFBA手数料', tax: '課仕10%',
+          amount: -v('FBA手数料'), memo: 'Amazon 運賃' },
+        { dc: 'debit', account: '広告宣伝費【原価】', sub: 'Amazon', tax: '課仕10%',
+          amount: -v('トランザクションに関するその他の手数料+その他'), memo: 'Amazon その他手数料' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: 'Amazon', tax: '対象外',
+          amount: v('合計'), memo: 'Amazon 差し引き入金額' },
+        { dc: 'credit', account: '売上高', sub: 'Amazon', tax: '課売10%',
+          amount: v('端数調整'), memo: 'Amazon 端数調整' },
+      ];
+    }
+
+    function mfJournalTableHtml(mf) {
+      const rows = buildMfJournalRows(mf);
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 端数調整・按分ロジックを確認してください</div>';
+
+      return html;
     }
 
     function renderSegmentTable(targetId, bySegment, segmentNames, cols, adCost) {
@@ -900,10 +970,10 @@ function renderPage() {
 
       // 除外セグメント（4=輸出）
       let exclHtml = '';
-      if (data.excluded) {
-        for (const [key, row] of Object.entries(data.excluded)) {
+      if (lastData.excluded) {
+        for (const [key, row] of Object.entries(lastData.excluded)) {
           if (row.行数 > 0) {
-            const label = data.excludedNames[key] || key;
+            const label = lastData.excludedNames[key] || key;
             exclHtml += '<div class="excluded">';
             exclHtml += '<b>除外: ' + key + ': ' + label + '</b>（' + row.行数 + '行）';
             exclHtml += ' — 商品売上: ' + fmt(row['商品売上']) + ' / 合計: ' + fmt(row['合計']) + ' / 原価合計: ' + fmt(row.原価合計);
@@ -914,11 +984,11 @@ function renderPage() {
       document.getElementById('excludedInfo').innerHTML = exclHtml;
 
       // 「その他/未分類」明細
-      if (data.otherDetails && data.otherDetails.length > 0) {
+      if (lastData.otherDetails && lastData.otherDetails.length > 0) {
         const card = document.getElementById('otherDetailCard');
         card.style.display = 'block';
         let html = '<table class="detail-table"><tr><th>SKU</th><th>商品コード</th><th>商品名</th><th>種類</th><th>解決方法</th><th>行数</th><th>数量</th><th>商品売上</th><th>合計</th></tr>';
-        for (const d of data.otherDetails) {
+        for (const d of lastData.otherDetails) {
           const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし', adjustment_no_master: '調整(照合対象外)' }[d.解決方法] || d.解決方法;
           html += '<tr>';
           html += '<td style="text-align:left">' + (d.sku || '-') + '</td>';
@@ -939,12 +1009,12 @@ function renderPage() {
       }
 
       // 原価ゼロ警告
-      if (data.zeroGenka && data.zeroGenka.length > 0) {
+      if (lastData.zeroGenka && lastData.zeroGenka.length > 0) {
         const card = document.getElementById('zeroGenkaCard');
         card.style.display = 'block';
-        let html = '<div class="warn" style="margin-bottom:8px"><b>' + data.zeroGenka.length + '商品</b>が原価0円で計算されています</div>';
+        let html = '<div class="warn" style="margin-bottom:8px"><b>' + lastData.zeroGenka.length + '商品</b>が原価0円で計算されています</div>';
         html += '<table class="detail-table"><tr><th>商品コード</th><th>SKU</th><th>商品名</th><th>出現行数</th><th>数量合計</th><th>商品売上合計</th></tr>';
-        for (const z of data.zeroGenka) {
+        for (const z of lastData.zeroGenka) {
           html += '<tr>';
           html += '<td style="text-align:left">' + z.商品コード + '</td>';
           html += '<td style="text-align:left">' + (z.sku || '-') + '</td>';
@@ -1049,6 +1119,9 @@ function renderPage() {
             html += '</tr><tr>';
             mfCols.forEach(c => html += '<td class="num" style="font-weight:bold">' + fmt(mf[c] || 0) + '</td>');
             html += '</tr></table>';
+
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+            html += mfJournalTableHtml(mf);
           }
 
           // セグメント別集計
@@ -1248,7 +1321,21 @@ function renderPage() {
         <tr><td>端数調整</td><td>合計 − 各項目の合計（丸め誤差の吸収）</td></tr>
       </table>
 
-      <h2>7. セグメント別集計（管理会計用）</h2>
+      <h2>7. MF振替伝票入力用 仕訳</h2>
+      <p>「6. MF連携用 税込み集計」の値を、MFクラウド会計の<b>振替伝票入力</b>画面（仕訳辞書「Amazon売上」）にそのまま転記できる借方/貸方の仕訳形式に組み替えたものです。</p>
+      <table class="m-tbl">
+        <tr><th>借方/貸方</th><th>勘定科目</th><th>税区分</th><th>金額の内訳</th></tr>
+        <tr><td>貸方</td><td>売上高</td><td>課売10%</td><td>商品売上(10%) + 配送料 + ギフト包装手数料</td></tr>
+        <tr><td>貸方</td><td>売上高</td><td>課売(軽)8%</td><td>商品売上(8%)</td></tr>
+        <tr><td>借方</td><td>支払手数料【原価】</td><td>課仕10%</td><td>−(Amazonポイントの費用 + プロモーション割引額 + 手数料)</td></tr>
+        <tr><td>借方</td><td>発送運賃【原価】（補助:AmazonFBA手数料）</td><td>課仕10%</td><td>−FBA手数料</td></tr>
+        <tr><td>借方</td><td>広告宣伝費【原価】</td><td>課仕10%</td><td>−(トランザクションに関するその他の手数料+その他)</td></tr>
+        <tr><td>借方</td><td>売掛金_EC売上</td><td>対象外</td><td>合計（差引入金額）</td></tr>
+        <tr><td>貸方</td><td>売上高</td><td>課売10%</td><td>端数調整</td></tr>
+      </table>
+      <div class="note">借方・貸方の合計金額が一致するかを表の下に自動表示します。金額が赤字（マイナス）になっている行がある場合は、その行だけ借方/貸方を入れ替えてMFに入力してください。取引日は集計月の月末日を入力します。</div>
+
+      <h2>8. セグメント別集計（管理会計用）</h2>
       <table class="m-tbl">
         <tr><th>セグメント</th><th>売上分類</th><th>内容</th><th>広告費</th></tr>
         <tr><td><b>1: 自社商品</b></td><td>1</td><td>自社ブランド・独占商品</td><td>売上按分あり</td></tr>
@@ -1265,7 +1352,7 @@ function renderPage() {
       <h3>原価合計</h3>
       <p>各行の <code>原価 × 数量</code> をセグメントごとに合算（税抜）。</p>
 
-      <h2>8. エビデンスCSV</h2>
+      <h2>9. エビデンスCSV</h2>
       <p>アップロード後に2種類ダウンロード可能:</p>
       <table class="m-tbl">
         <tr><th>種類</th><th>内容</th></tr>
@@ -1274,7 +1361,7 @@ function renderPage() {
       </table>
       <div class="note">エビデンスはアップロード時にメモリに一時保存。ページを離れると再アップロードが必要です。</div>
 
-      <h2>9. 確定保存・過去データ</h2>
+      <h2>10. 確定保存・過去データ</h2>
       <ul>
         <li>広告費を入力して「確定」→ DBに保存</li>
         <li>同じ年月で再確定すると上書き</li>
@@ -1282,7 +1369,7 @@ function renderPage() {
         <li>「セグメント別集計CSVダウンロード」で全月分を一括CSV出力（集計月は各月末日 yyyy/mm/dd）</li>
       </ul>
 
-      <h2>10. データソース・更新</h2>
+      <h2>11. データソース・更新</h2>
       <table class="m-tbl">
         <tr><th>データ</th><th>ソース</th><th>更新</th></tr>
         <tr><td>商品マスタ / SKUマップ</td><td>ミニPC → Render</td><td>毎朝7時自動同期</td></tr>
@@ -1290,7 +1377,7 @@ function renderPage() {
         <tr><td>広告費</td><td>手入力（クレカ払い）</td><td>月次</td></tr>
       </table>
 
-      <h2>11. 注意事項</h2>
+      <h2>12. 注意事項</h2>
       <ul>
         <li>CSV金額のカンマ区切り（例: <code>3,200</code>）は自動除去されます</li>
         <li>税率未登録の商品は<b>税率別集計から除外</b>（税率未登録リストに表示、確定不可）</li>

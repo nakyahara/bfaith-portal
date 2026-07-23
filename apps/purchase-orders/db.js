@@ -582,6 +582,7 @@ function initLedgerSchema(db) {
   addCol(db, 'po_suppliers', 'contact_name', 'TEXT');   // 「様」は送信時に自動補完
   addCol(db, 'po_suppliers', 'send_method', 'TEXT');    // email / fax / web / none (NULL=未設定)
   addCol(db, 'po_suppliers', 'lead_days', 'INTEGER');   // 標準リードタイム (欠品リスクP17で使用)
+  addCol(db, 'po_suppliers', 'fax_number', 'TEXT');     // FAX番号 (eFax送信用。国内0始まり10-11桁。保存時に検証)
 
   // 先方管理番号対応表 (アメージングクラフト/ビーフリー等。添付CSVに先方番号列を付与する)
   db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_map (
@@ -694,6 +695,20 @@ function initLedgerSchema(db) {
     `);
   }
 
+  // PO参照メール (サロンジェ等) 起点の減数の対応記録。「この明細はどのメールの連絡で減数したか」を
+  // 追跡し、別メールでの二重減数を変換画面で警告する (正本は po_item_events。これは紐づけの監査、Codex salonge設計相談)
+  db.exec(`CREATE TABLE IF NOT EXISTS po_shipment_mail_adjustments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    mail_id        INTEGER NOT NULL REFERENCES po_shipment_mails(id),
+    order_item_id  INTEGER NOT NULL REFERENCES po_order_items(id),
+    event_id       INTEGER NOT NULL UNIQUE REFERENCES po_item_events(id),
+    qty            INTEGER NOT NULL CHECK(qty > 0),
+    exception_text TEXT,
+    created_at     TEXT NOT NULL,
+    actor          TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_po_mail_adj_item ON po_shipment_mail_adjustments(order_item_id)');
+
   // メール送信ジョブ (outbox方式。txn内でGmail APIを呼ばない。delivery_key で二重送信の確率を構造的に低減:
   // 送信前に sending をcommit → Message-IDヘッダ+本文に埋込 → lease切れ再送前にGmail照合、不明時は自動再送しない)
   db.exec(`CREATE TABLE IF NOT EXISTS po_email_jobs (
@@ -709,6 +724,8 @@ function initLedgerSchema(db) {
     body          TEXT NOT NULL,
     attachment_name TEXT NOT NULL,
     attachment_csv  TEXT NOT NULL,
+    channel       TEXT NOT NULL DEFAULT 'email',
+    attachment_pdf BLOB,
     content_hash  TEXT NOT NULL,
     is_resend     INTEGER NOT NULL DEFAULT 0 CHECK(is_resend IN (0,1)),
     resend_of     INTEGER REFERENCES po_email_jobs(id),
@@ -725,6 +742,9 @@ function initLedgerSchema(db) {
   // 既存DB (本ブランチの旧世代スキーマ) への後付け移行 (新規DBはCREATEに含まれる)
   addCol(db, 'po_email_jobs', 'generation', 'INTEGER NOT NULL DEFAULT 0');
   addCol(db, 'po_email_jobs', 'scheduled_at', 'TEXT');
+  // FAX送信 (eFaxメールゲートウェイ経由。channel='fax' は attachment_pdf を添付、csvは内容ハッシュ/プレビュー用に保持)
+  addCol(db, 'po_email_jobs', 'channel', "TEXT NOT NULL DEFAULT 'email'"); // email / fax (検証はコード側。ALTERではCHECK追加不可)
+  addCol(db, 'po_email_jobs', 'attachment_pdf', 'BLOB'); // channel='fax' のみ必須 (送信時点のPDFスナップショット)
   // 同一PO+同一内容の二重送信を禁止 (再送は is_resend=1 で明示。dry-runは本送信のdedupを妨げない)。
   // unknown (結果不明) も対象 — 不明のまま新規の通常送信で状態機械を迂回させない (Codex P15-R3 High)。
   // 部分インデックスの条件は定義変更があり得るため、トリガ同様に毎起動DROP→CREATEで最新定義を保証 (Codex P15-R11 High)

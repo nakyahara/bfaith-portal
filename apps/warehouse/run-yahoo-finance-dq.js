@@ -18,7 +18,7 @@
  *   4. shipping_missing_rate_pct     (warn 5% / error 10%)
  *   5. unresolved_sku_rate_pct       (warn 1% / error 3%、Phase 1.3 で 35%/50% から引き下げ)
  *   6. whitelist_coverage_pct        (warn < 95% / error < 90%、当月は 80%/70%)
- *   7. resolved_but_zero_cost_count  (error: 1 件以上 — ne_code 解決済だが cogs=0、Phase 1.3 追加)
+ *   7. resolved_but_zero_cost_count  (error: 1 件以上 — ne_code 解決済だが cogs=0、Phase 1.3 追加。原価状態=OVERRIDDEN の意図的 0 円は除外)
  *   8. normalized_collision_count    (warn: 1 件以上 — m_products に LOWER(TRIM()) 重複 SKU、Phase 1.3 追加)
  *
  * 当月閾値緩和 (Issue #83 楽天と同方針 + Phase 1.2/1.3 Yahoo 拡張):
@@ -268,19 +268,32 @@ recordResult(
 // case bug (PR #94) 再発 / cost_lookup CTE 漏れ / m_products.原価 NULL 等を直撃検知。
 // 1 件でも error (実態 0 件想定、unresolved とは別 = 紐付けはできてるが原価が無い状態)。
 // ============================================================
+// 原価状態='OVERRIDDEN' AND 原価=0 はポータル UI からの人手 0 円上書き (もらいもの等の意図的 0 原価) →
+// snapshot=0 (= lookup 成功で 0 円) の行のみ除外。snapshot NULL (lookup 失敗) や snapshot>0 なのに cogs=0 (計算異常) は error のまま。
+// 判定は実行時点の m_products を参照 (as-of 参照ではない): 人が 0 円上書きを承認すれば過去月の DQ も遡って解除される運用。
 const zeroCostStats = db.prepare(`
-  SELECT COUNT(*) AS cnt FROM f_yahoo_finance_sku_daily_v1
-  WHERE substr(date_jst, 1, 7) = ?
-    AND ne_code IS NOT NULL
-    AND units_net_sold > 0
-    AND (cogs_amount_jpy_incl = 0 OR unit_cost_snapshot_incl IS NULL)
+  SELECT
+    COUNT(*) AS cnt,
+    SUM(CASE WHEN f.unit_cost_snapshot_incl = 0
+              AND EXISTS (
+                SELECT 1 FROM m_products mp
+                WHERE LOWER(TRIM(mp.商品コード)) = LOWER(TRIM(f.ne_code))
+                  AND mp.原価状態 = 'OVERRIDDEN' AND mp.原価 = 0
+              )
+         THEN 1 ELSE 0 END) AS intentional_zero
+  FROM f_yahoo_finance_sku_daily_v1 f
+  WHERE substr(f.date_jst, 1, 7) = ?
+    AND f.ne_code IS NOT NULL
+    AND f.units_net_sold > 0
+    AND (f.cogs_amount_jpy_incl = 0 OR f.unit_cost_snapshot_incl IS NULL)
 `).get(monthStr);
+const zeroCostCnt = zeroCostStats.cnt - (zeroCostStats.intentional_zero || 0);
 recordResult(
   'resolved_but_zero_cost_count',
-  zeroCostStats.cnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' :
-    zeroCostStats.cnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info',
-  zeroCostStats.cnt, THRESHOLDS.resolved_but_zero_cost_count.error,
-  { count: zeroCostStats.cnt }
+  zeroCostCnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' :
+    zeroCostCnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info',
+  zeroCostCnt, THRESHOLDS.resolved_but_zero_cost_count.error,
+  { count: zeroCostCnt, intentional_zero_cost_exempted: zeroCostStats.intentional_zero || 0 }
 );
 
 // ============================================================

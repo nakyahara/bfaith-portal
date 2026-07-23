@@ -1211,7 +1211,7 @@ console.log('── P15: メール送信 (fake transport) ──');
   // /email/send は expectedMode 必須 (プレビュー時モードの一致検証)。テストでは現在モードを自動注入
   let CUR_MODE = 'dry_run';
   const jsonPost = (p, body, key) => {
-    if (p.includes('/email/send') && body && body.expectedMode === undefined) body = { expectedMode: CUR_MODE, ...body };
+    if (p.includes('/email/send') && body) body = { expectedMode: CUR_MODE, expectedChannel: 'email', ...body };
     return j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
   };
 
@@ -2671,6 +2671,139 @@ console.log('── 出荷明細メール自動取得 (fetch-mails) ──');
   ok(dashNav.includes('入荷予定') && dashNav.includes('/apps/purchase-orders/inbound-plan'), 'ナビに入荷予定タブ');
 }
 
+// ═══ サロンジェ (PO参照方式): 出荷連絡メール → PO選択 → 台帳明細から入荷予定 → 減数消込 ═══
+console.log('── サロンジェ PO参照 (po_reference) ──');
+{
+  const jpS = (p, body, headers) => j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(headers || {}) }, body: JSON.stringify(body || {}) });
+  // fixture: 仕入先0107 + PML3商品 + PO2本
+  r = await jpS('/api/masters/suppliers', { supplier_code: '0107', name: 'サロンジェ', order_memo: '' });
+  ok(r.status === 200 && r.body.ok, 'salonge: 仕入先マスタ登録 (0107→107)');
+  const insSal = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
+    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+    VALUES ('run_test', ?, ?, '0107', '取扱中', 3, 100, 0, 7, 30, 10, 1.5, 800, ?, '2026-07-01', '2024-01-01')`);
+  insSal.run('sal-towel3p', '16502 KBミニタオル3P', 300);
+  insSal.run('sal-apron110', 'まいぜん子供エプロン110', 500);
+  insSal.run('sal-cup', 'サロンジェ カップ', 200);
+  r = await jpS('/api/supplier/107/issue', { items: [{ code: 'sal-towel3p', qty: 20 }, { code: 'sal-apron110', qty: 10 }] });
+  ok(r.status === 200 && r.body.ok, 'salonge: PO1発行 (towel20+apron10)');
+  const salPo1 = r.body.id;
+  r = await jpS('/api/supplier/107/issue', { items: [{ code: 'sal-cup', qty: 5 }] });
+  const salPo2 = r.body.id;
+
+  // メール取得: 出荷連絡 (※行2件、うち1件は商品コード一致) / 出荷連絡でないメール
+  process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
+    { id: 'gm-sal-1', from: '藤本 <fujimoto@salonge.co.jp>', subject: 'Re: 【発注書】', internalDate: '2026-07-15T04:32:00.000Z',
+      bodyHtml: '<div>中原様<br><br>いつもお世話になります。<br><br>7/14、7/8の御依頼分、出荷準備整いました。<br>添付ご確認ください。<br>※sal-towel3p 16502 KBミニタオル3P…在庫無し。終売となりました。<br>※まったく関係ない商品ZZZ…欠品です。<br>※カップの件、また改めてご連絡します。<br><br>以上、宜しくお願い致します。</div>' },
+    { id: 'gm-sal-2', from: 'fujimoto@salonge.co.jp', subject: '請求書', bodyHtml: '<p>請求書をお送りします</p>' },
+  ]);
+  r = await jpS('/api/inbound-plan/fetch-mails');
+  ok(r.body.ok && r.body.added === 1, 'salonge: 出荷連絡1件を登録 (請求書は対象外)', r.body.added);
+  const salMail = db.prepare("SELECT * FROM po_shipment_mails WHERE gmail_id='gm-sal-1'").get();
+  ok(salMail && salMail.supplier_code === '107' && salMail.status === 'new', 'salonge: supplier=107/new');
+  const salParsed = JSON.parse(salMail.parsed_json);
+  ok(salParsed.kind === 'po_reference' && salParsed.exceptions.length === 3 && salParsed.exceptions[0].kind === 'discontinued'
+    && salParsed.exceptions[1].kind === 'shortage' && salParsed.exceptions[2].kind === 'other'
+    && salParsed.refDates.includes('7/14') && salParsed.refDates.includes('7/8'),
+    'salonge: 例外抽出 (終売/欠品/その他) + 本文日付', salParsed.exceptions);
+  ok(db.prepare("SELECT status FROM po_shipment_mails WHERE gmail_id='gm-sal-2'").get().status === 'not_candidate',
+    'salonge: 出荷連絡でないメールは対象外 (not_candidate)');
+
+  // 既存の🔁変換は拒否 (発注書参照へ誘導)
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/convert');
+  ok(r.status === 400 && r.body.error.includes('発注書参照'), 'salonge: 通常変換は400');
+
+  // PO選択候補
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert');
+  ok(r.body.ok && r.body.pick === true && r.body.orders.length === 2 && r.body.exceptions.length === 3 && r.body.bodyText.includes('出荷準備'),
+    'salonge: PO候補2件+例外+原文', r.body.orders && r.body.orders.length);
+
+  // 別仕入先のPO指定は400
+  const foreignPo = db.prepare("SELECT id FROM po_orders WHERE supplier_code<>'107' AND status='issued' ORDER BY id DESC LIMIT 1").get();
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert', { orderIds: [salPo1, foreignPo.id] });
+  ok(r.status === 400, 'salonge: 別仕入先のPO指定は400');
+
+  // 変換: 台帳の残数明細から行を作る
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert', { orderIds: [salPo1, salPo2] });
+  ok(r.body.ok && r.body.pick === false && r.body.lines.length === 3 && r.body.totalRemaining === 35, 'salonge: 変換3行/残数計35', r.body.lines && r.body.lines.length);
+  const lt = r.body.lines.find(l => l.productName.includes('ミニタオル'));
+  ok(lt && lt.exception && lt.exception.level === 'strong' && lt.exception.kind === 'discontinued', 'salonge: 商品コード一致=強一致 (終売の除外提案)', lt && lt.exception);
+  const la = r.body.lines.find(l => l.productName.includes('エプロン'));
+  ok(la && !la.exception, 'salonge: 無関係の行に例外が付かない');
+  const lc = r.body.lines.find(l => l.productName.includes('カップ'));
+  ok(lc && !lc.exception, 'salonge: kind=other の※行 (「カップの件…」) はマッチ対象外 (誤減数候補にしない)');
+  ok(r.body.lines.every(l => l.costSource === 'po' && l.cost != null), 'salonge: 単価=PO単価 (発注時スナップショット)');
+  const towelItemId = lt.orderItemId, apronItemId = la.orderItemId;
+
+  // ガード: 冪等キー必須 / 非PO参照メール / 仕入先越境の明細
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 1 }] });
+  ok(r.status === 400 && r.body.error.includes('Idempotency-Key'), 'salonge: 冪等キーなしの減数は400');
+  const amcMailRow = db.prepare("SELECT id FROM po_shipment_mails WHERE gmail_id='gm-amc-1'").get();
+  r = await jpS('/api/inbound-plan/mails/' + amcMailRow.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 1 }] }, { 'Idempotency-Key': 'salonge-adj-x1' });
+  ok(r.status === 400 && r.body.error.includes('PO参照方式ではない'), 'salonge: 非PO参照メールを減数の根拠にできない');
+  const foreignItem = db.prepare(`SELECT i.id FROM po_order_items i JOIN po_orders o ON o.id=i.order_id
+    WHERE o.supplier_code<>'107' AND o.status='issued' ORDER BY i.id DESC LIMIT 1`).get();
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: foreignItem.id, qty: 1 }] }, { 'Idempotency-Key': 'salonge-adj-x2' });
+  ok(r.status === 400 && r.body.error.includes('仕入先'), 'salonge: 別仕入先の明細への減数は400 (越境ガード)');
+
+  // 減数: 一括+冪等+原子性
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 20, note: '終売' }] }, { 'Idempotency-Key': 'salonge-adj-1' });
+  ok(r.status === 200 && r.body.ok && r.body.results[0].remaining === 0, 'salonge: 減数20→残0', r.body.results);
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: towelItemId, qty: 20, note: '終売' }] }, { 'Idempotency-Key': 'salonge-adj-1' });
+  ok(r.body.ok && r.body.replay === true, 'salonge: 同一キー再送はreplay (二重減数なし)');
+  ok(db.prepare("SELECT COUNT(*) n FROM po_item_events WHERE order_item_id=? AND event_type='shortage'").get(towelItemId).n === 1, 'salonge: 減数イベント1件のみ');
+  ok(db.prepare('SELECT COUNT(*) n FROM po_shipment_mail_adjustments WHERE mail_id=?').get(salMail.id).n === 1, 'salonge: メール↔減数の対応記録 (監査)');
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: apronItemId, qty: 1 }, { orderItemId: apronItemId, qty: 999 }] }, { 'Idempotency-Key': 'salonge-adj-2' });
+  ok(r.status === 400 && r.body.error.includes('残数超過'), 'salonge: 残数超過は400');
+  ok(db.prepare('SELECT COUNT(*) n FROM po_item_events WHERE order_item_id=?').get(apronItemId).n === 0,
+    'salonge: 失敗時は全件ロールバック (1件目の正常分も登録しない)');
+
+  // 減数後の再変換: 残0の行は消える + 同一メール由来の減数は priorAdjustments に出ない (残数に反映済み)
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/po-convert', { orderIds: [salPo1, salPo2] });
+  ok(r.body.ok && r.body.lines.length === 2 && !r.body.lines.some(l => l.orderItemId === towelItemId), 'salonge: 減数後の再変換で残0行が消える');
+  ok(r.body.lines.every(l => (l.priorAdjustments || []).length === 0), 'salonge: 同一メールの減数は警告に出ない (別メールのみ)');
+
+  // 2通目のメール: 例外0件=全量出荷の正常ケース + 別メールでの二重減数警告 (priorAdjustments)
+  r = await jpS('/api/inbound-plan/mails/' + salMail.id + '/apply-adjustments',
+    { entries: [{ orderItemId: apronItemId, qty: 2, note: '欠品' }] }, { 'Idempotency-Key': 'salonge-adj-3' });
+  ok(r.body.ok && r.body.results[0].remaining === 8, 'salonge: apron減数2→残8');
+  process.env.PO_SHIPMENT_FAKE_DATA = JSON.stringify([
+    { id: 'gm-sal-3', from: 'fujimoto@salonge.co.jp', subject: '出荷のご連絡', bodyHtml: '<div>本日分、出荷準備整いました。</div>' },
+  ]);
+  r = await jpS('/api/inbound-plan/fetch-mails');
+  const salMail2 = db.prepare("SELECT * FROM po_shipment_mails WHERE gmail_id='gm-sal-3'").get();
+  ok(salMail2 && salMail2.status === 'new' && JSON.parse(salMail2.parsed_json).exceptions.length === 0,
+    'salonge: 例外0件=全量出荷の正常ケース (not_candidateにしない)');
+  r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+  const la2 = r.body.lines.find(l => l.orderItemId === apronItemId);
+  ok(la2 && la2.priorAdjustments.length === 1 && la2.priorAdjustments[0].mailId === salMail.id && la2.priorAdjustments[0].qty === 2,
+    'salonge: 別メールでの減数済みを警告 (priorAdjustments)', la2 && la2.priorAdjustments);
+  // 再解析: po_reference は itemCount=null (オブジェクト形を配列と数えない)
+  r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/reparse');
+  ok(r.body.ok && r.body.status === 'new' && r.body.itemCount === null, 'salonge: 再解析の件数はnull (po_reference)', r.body.itemCount);
+  // 逆仕訳した減数は priorAdjustments に出ない (誤減数を復元したのに警告が残らない)
+  {
+    const adjEv = db.prepare('SELECT event_id FROM po_shipment_mail_adjustments WHERE mail_id=? AND order_item_id=?').get(salMail.id, apronItemId);
+    r = await jpS('/api/events/' + adjEv.event_id + '/reverse', { note: '誤減数のため取消 (テスト)' });
+    ok(r.body.ok, 'salonge: 減数イベントを逆仕訳');
+    r = await jpS('/api/inbound-plan/mails/' + salMail2.id + '/po-convert', { orderIds: [salPo1] });
+    const la3 = r.body.lines.find(l => l.orderItemId === apronItemId);
+    ok(la3 && la3.priorAdjustments.length === 0 && la3.remaining === 10, 'salonge: 逆仕訳済みの減数は警告から消える (残数も復元)', la3 && { p: la3.priorAdjustments, rem: la3.remaining });
+  }
+
+  // UI配信
+  const planHtmlS = await (await fetch(base + '/inbound-plan')).text();
+  ok(planHtmlS.includes('data-ippoconv') && planHtmlS.includes('発注書参照') && planHtmlS.includes('renderPoPick') && planHtmlS.includes('サロンジェ'),
+    '/inbound-plan サロンジェ PO参照変換UI');
+  ok(planHtmlS.includes('apply-adjustments') && planHtmlS.includes('plShort') && planHtmlS.includes('減数の確認'),
+    '/inbound-plan ➖減数フロー (提案→確認→一括実行)');
+}
+
 // ═══ NE本来表記 (po_product_code_canonical) — ロジザード貼り付けの商品ID大小表記 ═══
 console.log('── NE本来表記 (canonical) ──');
 {
@@ -3325,10 +3458,344 @@ console.log('── 🏷️ バーコードラベル管理 ──');
   ok(adHtml9.includes('zoneBarcode') && adHtml9.includes('loadBarcode') && adHtml9.includes('data-grp="barcode"'), 'barcode: adminに🏷️タブ+CSV取込UI');
 }
 
+// ═══ P17 欠品リスク (加重日販+在庫推移シミュレーション+2軸分類+しきい値) ═══
+console.log('── P17 欠品リスク ──');
+{
+  const jstD = n => new Date(Date.now() + 9 * 3600000 + n * 86400000).toISOString().slice(0, 10);
+  const insSr = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
+    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+    VALUES ('run_test', ?, ?, '0001', '取扱中', 2, ?, 0, ?, ?, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01')`);
+  // 加重日販は全て 70/7×0.5 + 300/30×0.5 = 10/日
+  insSr.run('sr-high-item', '欠品ハイ (入荷が間に合わない)', 20, 70, 300);      // 2日分 → 欠品、入荷は10日後
+  insSr.run('sr-ok-item', '余裕あり', 1000, 70, 300);                           // 100日分
+  insSr.run('sr-soon-item', '納期未確定・切迫', 50, 70, 300);                    // 5日分 → soon14日以内 → high
+  insSr.run('sr-undated-item', '納期未確定・遠い', 500, 70, 300);                // 50日分 → soon超 → attention (回答督促)
+  insSr.run('sr-over-item', '遅延中・在庫豊富', 5000, 70, 300);                  // 500日分 → 欠品なし+遅延 → ok+督促フラグ (2軸)
+  insSr.run('sr-nodemand-item', '販売なし', 5, 0, 0);
+  insSr.run('sr-split-item', '分納分割', 1000, 70, 300);                         // 分納30個のみ日付つき・残50は納期不明
+  insSr.run('sr-reqover-item', '希望納期超過・回答未着', 5000, 70, 300);          // 希望納期past=遅延ではなく未回答扱い
+  insSr.run('sr-multi-item', '複数仕入先スコープ', 5000, 70, 300);                // 仕入先1=遅延 / 仕入先2=クリーン
+
+  const issueSr = async (items) => {
+    const rr = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }) });
+    ok(rr.status === 200 && rr.body.ok, `P17 fixture発注 (${items.map(x => x.code).join(',')})`);
+    return rr.body.id;
+  };
+  const setPromised = async (orderId, code, date) => {
+    const it = db.prepare('SELECT id FROM po_order_items WHERE order_id=? AND product_key=?').get(orderId, code);
+    const rr = await j('/api/items/' + it.id + '/plan', { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ promisedDate: date }) });
+    ok(rr.status === 200 && rr.body.ok, `P17 回答納期セット (${code}=${date})`);
+  };
+  let oid = await issueSr([{ code: 'sr-high-item', qty: 100 }, { code: 'sr-ok-item', qty: 50 }]);
+  await setPromised(oid, 'sr-high-item', jstD(10));
+  await setPromised(oid, 'sr-ok-item', jstD(5));
+  await issueSr([{ code: 'sr-soon-item', qty: 80 }, { code: 'sr-undated-item', qty: 60 }]); // 納期なし
+  oid = await issueSr([{ code: 'sr-over-item', qty: 40 }, { code: 'sr-nodemand-item', qty: 10 }]);
+  await setPromised(oid, 'sr-over-item', jstD(-1)); // 昨日=予定日超過
+  await setPromised(oid, 'sr-nodemand-item', jstD(30));
+  // 分納分割: 発注100→入荷20→残80のうち分納予定30個 (jstD(5)) のみ日付つき、残50は納期不明
+  oid = await issueSr([{ code: 'sr-split-item', qty: 100 }]);
+  {
+    const it = db.prepare('SELECT id FROM po_order_items WHERE order_id=? AND product_key=?').get(oid, 'sr-split-item');
+    r = await j('/api/items/' + it.id + '/events', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'receipt', qty: 20, remainder: { action: 'await_delivery', nextExpectedDate: jstD(5), nextExpectedQty: 30 } }) });
+    ok(r.status === 200 && r.body.ok && r.body.remaining === 80, 'P17 fixture: 分納予定30/残80');
+  }
+  // 希望納期が過去 (回答なし): NE移行取込で requested_date を過去日にする (issued後のrequestedは不変のため)
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9300', 'テスト様', 'sr-reqover-item', '希望納期超過', '', 25, 25, '2026/1/10', '', '通常', '0', '0', '2026/1/5', '0001', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-reqover.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 希望納期過去の移行PO');
+  }
+  // 複数仕入先: 仕入先1のPOは予定日超過、仕入先2のPO (NE移行) はクリーン → 督促は仕入先スコープで分離
+  oid = await issueSr([{ code: 'sr-multi-item', qty: 30 }]);
+  await setPromised(oid, 'sr-multi-item', jstD(-2));
+  {
+    const neCsvOf2 = rows => iconv.encode(rows.map(rr => rr.map(v => '"' + String(v) + '"').join(',')).join('\r\n'), 'Shift_JIS');
+    const HDR = ['発注伝票番号', '発注先名', '商品コード', '商品名', 'option', '発注数', '注残計', '予定納期', '備考', '商品区分', '受注伝票番号', '明細行', '発行日', '仕入先cd', '発注明細行', '商品区分値'];
+    const row = ['9301', 'テスト様', 'sr-multi-item', '複数仕入先', '', 20, 20, '', '', '通常', '0', '0', '2026/7/1', '0002', '1', '0'];
+    const fdN = new FormData();
+    fdN.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdN });
+    const fdC = new FormData();
+    fdC.append('file', new Blob([neCsvOf2([HDR, row])]), 'sr-multi.csv');
+    fdC.append('commit', '1'); fdC.append('fileHash', r.body.fileHash); fdC.append('planHash', r.body.planHash);
+    r = await j('/api/backorders/ne-import', { method: 'POST', body: fdC });
+    ok(r.status === 200 && r.body.ok && r.body.created.length === 1, 'P17 fixture: 仕入先2の移行PO (クリーン)');
+  }
+
+  r = await j('/api/shortage-risk');
+  ok(r.body.ok && r.body.settings.w7 === 0.5 && r.body.settings.soonDays === 14 && r.body.today === jstD(0), 'P17 API: 既定しきい値+JST今日', r.body.settings);
+  ok(r.body.dataBasis && r.body.dataBasis.pmlAsOfDate && r.body.dataBasis.stale === false, 'P17 API: データ基準 (PML as_of、stale=false)', r.body.dataBasis);
+  const sup1 = r.body.suppliers.find(s => s.code === '1');
+  const item = c => sup1.items.find(x => x.code === c);
+
+  // 🔴 high: 入荷を織り込んでも欠品 (t=1で在庫0、+100は10日後 → 9日間欠品)
+  const hi = item('sr-high-item');
+  ok(hi && hi.risk === 'high' && hi.stockoutDate === jstD(1) && hi.shortageDays === 9 && hi.recovered === true,
+    'P17: 入荷が間に合わない → high (欠品日/9日間/回復)', hi && { d: hi.stockoutDate, s: hi.shortageDays });
+  ok(hi.reason.includes('在庫切れ見込み') && hi.reason.includes('100個') && hi.reason.includes('9日間'), 'P17: 理由文 (次回入荷+欠品日数)', hi.reason);
+  ok(hi.dailySales === 10 && hi.stock === 20, 'P17: 加重日販=10 (70/7×0.5+300/30×0.5)');
+
+  // OK: 余裕95日 (入荷直前 950÷10)
+  const okI = item('sr-ok-item');
+  ok(okI && okI.risk === 'ok' && okI.marginDays === 95, 'P17: 余裕あり → ok (margin95日)', okI && okI.marginDays);
+
+  // 🔴 high: 納期未確定でも切迫 (5日分 ≤ soon14)
+  const soon = item('sr-soon-item');
+  ok(soon && soon.risk === 'high' && soon.reason.includes('至急'), 'P17: 納期未確定+切迫 → high (至急督促)', soon && soon.reason);
+
+  // 🟡 attention: 納期未確定だが50日分 (soon超) → 回答督促
+  const und = item('sr-undated-item');
+  ok(und && und.risk === 'attention' && und.reason.includes('納期を確定') && und.undatedQty === 60,
+    'P17: 納期未確定+遠い → attention (ノイズ化させない)', und && und.risk);
+
+  // 2軸分離: 遅延中でも予測評価は ok のまま、督促は needsFollowup 軸で拾う
+  const over = item('sr-over-item');
+  ok(over && over.risk === 'ok' && over.needsFollowup === true && over.flags.overdue === true && over.overdueQty === 40 && !over.stockoutDate,
+    'P17: 予定日超過 → risk=ok × needsFollowup=true (2軸分離)', over && { r: over.risk, f: over.flags });
+  ok(over.reason.includes('予定日超過'), 'P17: 遅延の理由文', over.reason);
+
+  // 分納分割: 30個のみ日付つき・残50は納期不明 (表示partsも同じ内訳、全量を分納予定と誤表示しない)
+  const spl = item('sr-split-item');
+  ok(spl && spl.undatedQty === 50 && spl.arrivals.length === 1 && spl.arrivals[0].qty === 30 && spl.arrivals[0].date === jstD(5),
+    'P17: 分納分割 (30=日付つき/50=納期不明)', spl && { u: spl.undatedQty, a: spl.arrivals });
+  const splLine = spl.lines.find(l => l.remaining === 80);
+  ok(splLine && splLine.parts.length === 2 && splLine.parts[0].qty === 30 && splLine.parts[0].disp.kind === 'dated'
+    && splLine.parts[1].qty === 50 && splLine.parts[1].disp.kind === 'undated',
+    'P17: 表示partsが分納分割を反映 (残80=30予定+50不明)', splLine && splLine.parts);
+
+  // 希望納期の過去日 = 遅延ではなく「回答未着のまま希望日超過」(overdueフラグは立てない)
+  const reqo = item('sr-reqover-item');
+  ok(reqo && reqo.risk === 'ok' && reqo.needsFollowup === true && reqo.flags.overdue === false
+    && reqo.requestedOverdueQty === 25 && reqo.flags.requested_date_only === true,
+    'P17: 希望納期超過 → overdueではなく回答督促 (requestedOverdueQty)', reqo && { f: reqo.flags, q: reqo.requestedOverdueQty });
+  ok(reqo.reason.includes('希望納期を経過'), 'P17: 希望納期超過の理由文', reqo.reason);
+
+  // 仕入先スコープ: 同一商品でも督促の数量・フラグ・文面は各仕入先の明細だけで再集計 (Codex R2 High)
+  const multi1 = item('sr-multi-item');
+  ok(multi1 && multi1.needsFollowup === true && multi1.overdueQty === 30 && multi1.reason.includes('予定日超過'),
+    'P17: 複数仕入先 — 仕入先1スコープは遅延30個で督促対象', multi1 && { f: multi1.needsFollowup, q: multi1.overdueQty });
+  const multi2 = r.body.suppliers.find(s => s.code === '2').items.find(x => x.code === 'sr-multi-item');
+  ok(multi2 && multi2.needsFollowup === false && multi2.overdueQty === 0 && !multi2.reason.includes('予定日超過')
+    && multi2.lines.length === 1 && multi2.lines[0].poNumber === '9301',
+    'P17: 複数仕入先 — 仕入先2スコープに他仕入先の遅延が混ざらない', multi2 && { f: multi2.needsFollowup, q: multi2.overdueQty, n: multi2.lines.length });
+  ok(multi1.risk === multi2.risk && multi1.stockoutDate === multi2.stockoutDate,
+    'P17: 複数仕入先 — 予測評価 (risk/欠品予測) は商品単位で共通');
+
+  // 販売なし / データ異常 (フラグがあっても risk 軸は純粋)
+  const nd = item('sr-nodemand-item');
+  ok(nd && nd.risk === 'no_demand', 'P17: 日販0 → no_demand');
+  const sup2 = r.body.suppliers.find(s => s.code === '2');
+  const unk = sup2 && sup2.items.find(x => x.code === 'not-in-pml-item');
+  ok(unk && unk.risk === 'unknown' && unk.pmlMissing === true, 'P17: PML行なし → unknown (データ異常のみ)', unk && unk.risk);
+  ok(typeof r.body.summary.followup === 'number' && r.body.summary.followup >= 2, 'P17: summaryに督促対象数', r.body.summary);
+
+  // しきい値PATCH: 範囲外/非整数/空は400、正常は200+監査ログ
+  const patchSr = body => j('/api/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  r = await patchSr({ w7: 1.5 });
+  ok(r.status === 400 && r.body.error.includes('w7'), 'P17設定: w7範囲外は400');
+  r = await patchSr({ marginDays: 2.5 });
+  ok(r.status === 400 && r.body.error.includes('整数'), 'P17設定: 非整数は400');
+  r = await patchSr({});
+  ok(r.status === 400, 'P17設定: 空は400');
+  // null/空文字/文字列数値は Number() で通さず型で拒否 (Codex R2 Medium / R3 Low)
+  r = await patchSr({ w7: null });
+  ok(r.status === 400, 'P17設定: null は400');
+  r = await patchSr({ w7: '' });
+  ok(r.status === 400, 'P17設定: 空文字は400');
+  r = await patchSr({ w7: '0.5' });
+  ok(r.status === 400, 'P17設定: 文字列数値は400 (JSON numberのみ)');
+  r = await patchSr({ unansweredDays: 0 });
+  ok(r.status === 200 && r.body.ok && r.body.settings.unansweredDays === 0, 'P17設定: 未回答督促=0日に変更');
+  ok(db.prepare("SELECT COUNT(*) n FROM po_audit_log WHERE action='setting_change' AND resource='setting:shortage_unanswered_days'").get().n >= 1,
+    'P17設定: 変更が監査ログに残る (old/new)');
+  // 未回答督促0日 → 発注直後の未回答にもフラグが立つ (needsFollowup も連動)
+  r = await j('/api/shortage-risk');
+  const und2 = r.body.suppliers.find(s => s.code === '1').items.find(x => x.code === 'sr-undated-item');
+  ok(und2 && und2.flags.unanswered === true && und2.unansweredQty === 60 && und2.needsFollowup === true,
+    'P17: 未回答フラグ (0日設定で即時)', und2 && und2.flags);
+  r = await patchSr({ unansweredDays: 7 });
+  ok(r.status === 200, 'P17設定: 既定に復元');
+  // setSetting 自体の検証 (routerを経由しない書込でも不正値は入らない)
+  {
+    let thr = null;
+    try { db.prepare("INSERT OR REPLACE INTO po_settings (key, value, effective_at) VALUES ('shortage_horizon_days','14.5',datetime('now'))").run(); } catch (e) { thr = e.message; }
+    // DB直書きは防げない (アプリ層検証) が、読込側が既定値へフォールバックする
+    r = await j('/api/shortage-risk');
+    ok(r.body.settings.horizonDays === 90, 'P17設定: 不正保存値 (14.5) は読込時に既定へフォールバック', r.body.settings.horizonDays);
+    db.prepare("DELETE FROM po_settings WHERE key='shortage_horizon_days'").run();
+  }
+
+  // 画面配信
+  const srHtml = await (await fetch(base + '/shortage-risk')).text();
+  ok(srHtml.includes('欠品リスク') && srHtml.includes('srW7') && srHtml.includes('srSoon') && srHtml.includes('既定値に戻す'),
+    '/shortage-risk しきい値設定UI (5項目+既定に戻す)');
+  ok(srHtml.includes('data-copy') && srHtml.includes('督促リストをコピー') && srHtml.includes('buildCopyText') && srHtml.includes('参考:'),
+    '/shortage-risk 督促コピー (台帳の事実+参考予測の分離文面)');
+  ok(srHtml.includes('#po-') && srHtml.includes('dataBasis'), '/shortage-risk POリンク+データ基準表示');
+  const boHtmlSr = await (await fetch(base + '/backorders')).text();
+  ok(boHtmlSr.includes('HASH_JUMPED') && boHtmlSr.includes('#po-'), '/backorders #po-<id> ハッシュジャンプ対応');
+  const navHtml = await (await fetch(base + '/')).text();
+  ok(navHtml.includes('/apps/purchase-orders/shortage-risk'), 'navに欠品リスクタブ');
+}
+
+// ═══ 商品紐付けタブの全商品既定表示 (中原さん要望 2026-07-16) ═══
+console.log('── 商品紐付け: 全商品既定表示+フィルタ維持 ──');
+{
+  r = await j('/api/masters/attrs');
+  ok(r.body.ok, 'attrs GET: 200');
+  const rows = r.body.rows;
+  // 未紐付けの取扱中商品も行として返る (グループ空欄+linked=false+商品名/仕入先名つき)
+  const hori = rows.find(x => x.product_key === 'horikoshi-item');
+  ok(hori && hori.linked === false && hori.condition_id == null && hori.商品名 === '掘り起こし対象商品' && hori.仕入先名.length > 0,
+    'attrs: 未紐付けの取扱中商品が行として返る (linked=false)', hori && { l: hori.linked, n: hori.商品名 });
+  // 紐付け済みは linked=true でattrs値を保持
+  const oil2 = rows.find(x => x.product_key === 'diyorangeoil100');
+  ok(oil2 && oil2.linked === true && oil2.material_group_id === 'mokouorange', 'attrs: 紐付け済み行は値を保持 (linked=true)');
+  // セット商品と「未紐付け×取扱中止」は出さない
+  ok(!rows.some(x => x.product_key === 'set-2pack'), 'attrs: セット商品は出さない');
+  ok(!rows.some(x => x.product_key === 'teishi-item'), 'attrs: 未紐付け×取扱中止は出さない');
+  // PMLに無い紐付け済み商品は pmlMissing で残す
+  await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'ghost-item-x', case_group: 'GX' }) });
+  r = await j('/api/masters/attrs');
+  const ghost = r.body.rows.find(x => x.product_key === 'ghost-item-x');
+  ok(ghost && ghost.linked === true && ghost.pmlMissing === true, 'attrs: PML外の紐付け済み商品はpmlMissingで残す', ghost && ghost.pmlMissing);
+  ok(r.body.rows.every((x, i, a) => i === 0 || a[i - 1].product_key <= x.product_key), 'attrs: 商品コード順 (バイナリ順)');
+  // PMLに同一コードが「取扱中止→取扱中」の順で重複していても取扱中を採用 (行順依存で消えない)
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+    VALUES ('run_test', 'dup-case-item', '重複コード旧', '0001', '取扱中止', 2, 0, 0, 0, 0)`).run();
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+    VALUES ('run_test', 'DUP-CASE-ITEM', '重複コード新', '0001', '取扱中', 2, 5, 0, 0, 0)`).run();
+  r = await j('/api/masters/attrs');
+  const dup = r.body.rows.find(x => x.product_key === 'dup-case-item');
+  ok(dup && dup.active === true && dup.商品名 === '重複コード新', 'attrs: 重複コードは取扱中の行を優先 (行順非依存)', dup && dup.商品名);
+  // 空保存ガード: 未紐付け商品を全欄空のまま保存しても空のattrs行 (=紐付け済み扱い) を作らない
+  r = await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'horikoshi-item' }) });
+  ok(r.status === 400 && r.body.error.includes('空'), 'attrs: 新規×全空欄の保存は400 (linked化させない)', r.body.error);
+  // 未紐付け行への保存=そのまま紐づけ (upsert)
+  r = await j('/api/masters/attrs', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ product_code: 'horikoshi-item', condition_id: 'testcond' }) });
+  ok(r.status === 200, 'attrs: 未紐付け行の保存でそのまま紐づけ');
+  r = await j('/api/masters/attrs');
+  ok(r.body.rows.find(x => x.product_key === 'horikoshi-item').linked === true, 'attrs: 紐づけ後は linked=true');
+  db.prepare("DELETE FROM po_product_attrs WHERE product_key IN ('ghost-item-x','horikoshi-item')").run(); // 後続テストへの影響を消す
+  // UI: チップ+フィルタ維持+スクロール復元
+  const adminHtmlA = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlA.includes('data-attrview') && adminHtmlA.includes('未紐付け ') && adminHtmlA.includes('FILT_Q') && adminHtmlA.includes('SCROLL_RESTORE'),
+    '/admin 商品紐付けUI (チップ+フィルタ維持+スクロール復元)');
+  ok(adminHtmlA.includes('applyMasterFilter'), '/admin フィルタはタブ状態と組み合わせて適用');
+}
+
+// ═══ P15b: FAX送信 (eFaxメールゲートウェイ, fake transport + fake PDF) ═══
+console.log('── P15b: FAX送信 (eFaxゲートウェイ) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: 'fax', ...body }) });
+
+  // FAX番号の正規化・ゲートウェイ変換 (eFax公式: 81 + 先頭0を除いた番号 + @efaxsend.com)
+  ok(emailMod.normalizeFaxNumber('06-7632-4190') === '0676324190', 'normalizeFaxNumber: ハイフン除去');
+  ok(emailMod.faxGatewayAddress('0676324190') === '81676324190@efaxsend.com', 'faxGatewayAddress: 81変換 (03-1234-5678→81312345678 と同式)');
+  let threw = null;
+  try { emailMod.normalizeFaxNumber('123-45'); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('FAX番号が不正'), 'normalizeFaxNumber: 不正番号はthrow', threw);
+
+  // 仕入先マスタ: 発注方法=FAXはFAX番号必須 / 不正番号は保存拒否
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax' });
+  ok(r.status === 400 && r.body.error.includes('FAX番号'), 'suppliers: send_method=faxでFAX番号未入力は拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '123-45' });
+  ok(r.status === 400 && r.body.error.includes('FAX番号が不正'), 'suppliers: 不正FAX番号は保存拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: FAX仕入先の登録OK', r.body.error);
+
+  // FAX仕入先のPOを発行 → preview は channel=fax + ゲートウェイ宛先 + PDF添付名
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 24 }], requestedDate: '2026-07-30' }) });
+  ok(r.body.ok, 'FAX仕入先のPO発行', r.body.error);
+  const faxOrderId = r.body.id;
+  r = await j('/api/orders/' + faxOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'fax' && r.body.faxNumber === '06-7632-4190', 'preview: channel=fax + FAX番号', r.body);
+  ok(r.body.to.length === 1 && r.body.to[0] === '81676324190@efaxsend.com', 'preview: 宛先=eFaxゲートウェイ (81変換)', r.body.to);
+  ok(/\.pdf$/.test(r.body.attachmentName) && r.body.body.startsWith('佐藤様'), 'preview: 添付=.pdf + 送付状に担当者様', r.body.attachmentName);
+
+  // PDFプレビュー配信 (fake PDF)
+  {
+    const pr = await fetch(base + '/api/orders/' + faxOrderId + '/fax/pdf');
+    const buf = Buffer.from(await pr.arrayBuffer());
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf') && buf.subarray(0, 5).toString() === '%PDF-',
+      'GET /orders/:id/fax/pdf → application/pdf', pr.status);
+  }
+
+  // プレビュー時とチャネルが変わっていたら拒否 (expectedMode と同じ発想)
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedChannel: 'email' }, 'fax-key-ch');
+  ok(r.status === 400 && r.body.error.includes('送信方法が変わっています'), 'send: expectedChannel不一致は拒否', r.body.error);
+
+  // dry-run送信: 宛先は社内へ差し替え、ジョブは channel=fax + PDFスナップショット保存
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', {}, 'fax-key-1');
+  ok(r.body.ok && r.body.channel === 'fax' && r.body.status === 'sent' && r.body.dryRun === true, 'FAX dry-run送信 → sent', r.body);
+  const faxJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC").get(faxOrderId);
+  ok(faxJob.channel === 'fax' && faxJob.attachment_pdf && faxJob.attachment_pdf.length > 20, 'ジョブ: channel=fax + attachment_pdf保存');
+  ok(faxJob.to_addr === 'me@b-faith.biz' && faxJob.subject.startsWith('【DRYRUN】') && /\.pdf$/.test(faxJob.attachment_name),
+    'ジョブ: dry-run宛先差し替え + .pdf添付名', faxJob.to_addr);
+  ok(faxJob.body.includes('本来の宛先: FAX 06-7632-4190'), 'ジョブ: dry-run本文に本来のFAX宛先', faxJob.body.slice(0, 80));
+
+  // MIME: application/pdf 添付で組み立てられる (FAKE送信はMIMEを通らないため直接検証)
+  {
+    const mime = emailMod.buildMime(faxJob);
+    ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${faxJob.attachment_name}"`),
+      'buildMime: application/pdf 添付', faxJob.attachment_name);
+    const bad = { ...faxJob, attachment_name: 'PO-1.csv' };
+    let e2 = null; try { emailMod.buildMime(bad); } catch (e) { e2 = e.message; }
+    ok(e2 && e2.includes('.pdf'), 'buildMime: faxジョブの.csv添付名は拒否', e2);
+  }
+
+  // dry-run はdedup対象外 (メールと同じ仕様: 何度でも確認できる)
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', {}, 'fax-key-2');
+  ok(r.body.ok && r.body.status === 'sent', 'FAX dry-runは繰り返し送信可 (dedup対象外)', r.body.error);
+
+  // live: 本送信は dedup が効く (FAKE transportなので実送信なし)
+  await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedMode: 'live' }, 'fax-key-3');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'FAX live送信 → sent (fake)', r.body);
+  const faxLiveJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? AND is_dry_run=0 ORDER BY id DESC").get(faxOrderId);
+  ok(faxLiveJob.to_addr === '81676324190@efaxsend.com' && faxLiveJob.channel === 'fax', 'liveジョブ: 宛先=ゲートウェイ', faxLiveJob.to_addr);
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedMode: 'live' }, 'fax-key-4');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), 'FAX dedup: 同一内容の本送信は拒否', r.body.error);
+  await jsonPost('/api/email/mode', { mode: 'dry_run' });
+
+  // 送信済みジョブのPDF控え配信
+  {
+    const pr = await fetch(base + '/api/email-jobs/' + faxJob.id + '/pdf');
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf'), 'GET /email-jobs/:id/pdf → PDF控え', pr.status);
+    const nf = await fetch(base + '/api/email-jobs/999999/pdf');
+    ok(nf.status === 400 || nf.status === 404, 'PDF控え: 存在しないジョブは404', nf.status);
+  }
+
+  // /admin にFAX番号欄
+  const adminHtmlF = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlF.includes('fax_number') && adminHtmlF.includes('FAX番号'), '/admin 仕入先にFAX番号欄');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
-  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/inbound-plan', '/backorders']) {
+  for (const p of ['/', '/supplier/1', '/products', '/orders', '/admin', '/inbound', '/inbound-plan', '/backorders', '/shortage-risk']) {
     const html = await (await fetch(base + p)).text();
     const scripts = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m => m[1]);
     let err = null;

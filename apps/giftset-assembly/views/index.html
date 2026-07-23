@@ -187,6 +187,10 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+// API は絶対パスで叩く (他アプリと同スタイル)。相対パス 'api/...' だと末尾スラッシュなしの
+// /apps/giftset-assembly でページを開いた場合に /apps/api/... へ解決されて 404 になる
+// (2026-07-17 本番障害: 一覧取得失敗 + Notion カード未作成の原因)。
+const API = '/apps/giftset-assembly/api';
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
   (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 let lastPicking = null; // { rows:[...] }
@@ -212,7 +216,7 @@ async function loadGiftSelect() {
   const sel = $('reqSet');
   const cur = sel.value;
   try {
-    const r = await fetch('api/list'); const d = await r.json();
+    const r = await fetch(`${API}/list`); const d = await r.json();
     giftListCache = d.result || [];
     sel.innerHTML = '<option value="">― 選んでください ―</option>';
     giftListCache.forEach(g => {
@@ -276,7 +280,7 @@ function updateLotHint() {
 
 async function refreshNotionStatus() {
   try {
-    const r = await fetch('api/notion-status'); const d = await r.json();
+    const r = await fetch(`${API}/notion-status`); const d = await r.json();
     if (!d.configured) {
       $('btnIssue').disabled = true;
       $('notionNote').textContent = '※ Notion連携が未設定のため作業カード作成は無効です（環境変数の設定が必要）。ピッキング表は使えます。';
@@ -317,7 +321,7 @@ $('btnPreview').addEventListener('click', async () => {
     return showMsg($('reqMsg'), 'err', `個数は ${lot} の倍数で入力してください（1ロット = ${lot}個）`);
   }
   try {
-    const r = await fetch(`api/picking?code=${encodeURIComponent(code)}&qty=${qty}`);
+    const r = await fetch(`${API}/picking?code=${encodeURIComponent(code)}&qty=${qty}`);
     const d = await r.json();
     if (!d.ok) return showMsg($('reqMsg'), 'err', d.message || 'ピッキング表の作成に失敗しました');
     lastPicking = d.result;
@@ -351,7 +355,7 @@ $('btnCopy').addEventListener('click', async () => {
 $('btnCsv').addEventListener('click', () => {
   const { code, qty } = reqInputs();
   if (!code || !qty) return;
-  window.location = `api/picking.csv?code=${encodeURIComponent(code)}&qty=${qty}`;
+  window.location = `${API}/picking.csv?code=${encodeURIComponent(code)}&qty=${qty}`;
 });
 
 $('btnIssue').addEventListener('click', async () => {
@@ -365,7 +369,7 @@ $('btnIssue').addEventListener('click', async () => {
   }
   $('btnIssue').disabled = true;
   try {
-    const r = await fetch('api/issue', {
+    const r = await fetch(`${API}/issue`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
     const d = await r.json();
@@ -383,7 +387,7 @@ $('btnIssue').addEventListener('click', async () => {
 async function loadGiftList() {
   const wrap = $('giftList');
   try {
-    const r = await fetch('api/list'); const d = await r.json();
+    const r = await fetch(`${API}/list`); const d = await r.json();
     const items = d.result || [];
     if (!items.length) { wrap.innerHTML = '<div class="meta">まだ登録がありません。下のフォームから追加してください。</div>'; return; }
     wrap.innerHTML = '';
@@ -441,7 +445,7 @@ function onProdInput(input, nameSpan) {
   if (q.length < 1) return;
   suggestTimer = setTimeout(async () => {
     try {
-      const r = await fetch('api/suggest?q=' + encodeURIComponent(q));
+      const r = await fetch(`${API}/suggest?q=` + encodeURIComponent(q));
       const d = await r.json();
       const dl = $('prodList'); dl.innerHTML = '';
       (d.result || []).forEach(p => {
@@ -482,7 +486,7 @@ function updateCompHint() {
 
 async function editGift(code) {
   try {
-    const r = await fetch('api/get?code=' + encodeURIComponent(code)); const d = await r.json();
+    const r = await fetch(`${API}/get?code=` + encodeURIComponent(code)); const d = await r.json();
     if (!d.ok) return showMsg($('regMsg'), 'err', '取得に失敗しました');
     const g = d.result;
     $('giftCode').value = g.giftset_code; $('giftName').value = g.giftset_name;
@@ -509,7 +513,7 @@ async function editGift(code) {
 async function deleteGift(code, name) {
   if (!confirm(`「${name}」を一覧から削除しますか？`)) return;
   try {
-    const r = await fetch('api/delete', {
+    const r = await fetch(`${API}/delete`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ giftset_code: code }),
     });
@@ -579,7 +583,7 @@ $('btnSave').addEventListener('click', async () => {
   if (!payload.giftset_name) return showMsg($('regMsg'), 'err', 'ギフト名を入れてください');
   if (!components.length) return showMsg($('regMsg'), 'err', '構成品を1つ以上入れてください');
   try {
-    const r = await fetch('api/upsert', {
+    const r = await fetch(`${API}/upsert`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     });
     const d = await r.json();

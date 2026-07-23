@@ -15,7 +15,7 @@
  *   4. shipping_missing_rate_pct              (Phase A 無効化: 'no_shipping_in_api' が常態)
  *   5. unresolved_sku_rate_pct                (warn 0.5% / error 1%、v0.7 で error 化、母集団は non-frozen 限定、v0.11 Codex R11 Medium)
  *   6. whitelist_coverage_pct                 (warn 95% / error 90%) — Delivered(5) 通常 97%
- *   7. resolved_but_zero_cost_count           (error: 1 件以上)
+ *   7. resolved_but_zero_cost_count           (error: 1 件以上。原価状態=OVERRIDDEN の意図的 0 円は除外)
  *   8. settle_price_formula_match_pct         (Qoo10 特有、info only、2026-05-19 patch) — 公式成立率の監視のみ、9% 手数料 SKU 等の Qoo10 内部設定で乖離するのは正常、gate しない
  *   9. shop_promo_burden_zero_check           (Qoo10 特有、warn: SellerDiscount > 0 or Cart_Discount_Seller > 0 が 1 件以上)
  *  10. promo_type_classification_health       (Qoo10 特有、info) — megawari/megapo/other_promo 月別件数比率
@@ -175,10 +175,13 @@ recordResult('whitelist_coverage_pct',
   wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
 
 // Check 7: resolved_but_zero_cost_count
-const zc = db.prepare("SELECT COUNT(*) AS cnt FROM f_qoo10_finance_sku_daily_v1 WHERE substr(date_jst,1,7)=? AND ne_code IS NOT NULL AND units_net_sold > 0 AND (cogs_amount_jpy_incl = 0 OR unit_cost_snapshot_incl IS NULL)").get(monthStr);
+// 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
+// snapshot NULL (lookup 失敗) / snapshot>0 で cogs=0 (計算異常) は error のまま。判定は実行時点の m_products (as-of ではない)
+const zc = db.prepare("SELECT COUNT(*) AS cnt, SUM(CASE WHEN f.unit_cost_snapshot_incl = 0 AND EXISTS (SELECT 1 FROM m_products mp WHERE LOWER(TRIM(mp.商品コード)) = LOWER(TRIM(f.ne_code)) AND mp.原価状態 = 'OVERRIDDEN' AND mp.原価 = 0) THEN 1 ELSE 0 END) AS intentional_zero FROM f_qoo10_finance_sku_daily_v1 f WHERE substr(f.date_jst,1,7)=? AND f.ne_code IS NOT NULL AND f.units_net_sold > 0 AND (f.cogs_amount_jpy_incl = 0 OR f.unit_cost_snapshot_incl IS NULL)").get(monthStr);
+const zcCnt = zc.cnt - (zc.intentional_zero || 0);
 recordResult('resolved_but_zero_cost_count',
-  zc.cnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : 'info',
-  zc.cnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zc.cnt });
+  zcCnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : 'info',
+  zcCnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zcCnt, intentional_zero_cost_exempted: zc.intentional_zero || 0 });
 
 // Check 8: settle_price_formula_match_pct (Qoo10 特有、Codex R3 High #1 反映で fact 集約後の domestic_non_cod_line_count/match_count を使う)
 // 母集団 = 各行の domestic_non_cod_line_count 合計 (scope='mixed' fact 行に含まれる domestic 部分も漏れ防止)

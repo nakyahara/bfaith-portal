@@ -40,11 +40,26 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   for (const k of Object.keys(planningMapRaw)) planningMap[normCode(k)] = planningMapRaw[k];
 
   // RESTOCK が空 (初回 or 取得失敗) の場合は旧 daily_snapshots にフォールバック (移行期間の保険)
+  // 部分成功の可視化 (総点検 P0-3): silent skip をやめて meta で件数+SKU一覧を返す
+  // 未マッピングSKU (restock にあるが sku_mapping 不在)。大半はバリエーション登録専用など
+  // 意図的に使っていないSKUなので、稼働実績で2つに分ける:
+  //   active   = 販売/FBA在庫/入荷中/Amazon推奨/他CH販売 のいずれかあり → マッピング漏れ=納品漏れ候補 (要対応・警告)
+  //   inactive = 全シグナルが実績なし → 推奨対象外。件数と一覧は静かに出すが警告にはしない
+  // ※ inactive は「未使用SKU」と断定はできない (レポート欠損でも0になる) ため、表示は事実のみに留める
+  const unmappedActive = [];
+  const unmappedInactive = [];
+  const invalidMappingSkus = [];  // set_components が不正JSON等でパース不能
+  const planningMissingSkus = []; // PLANNING レポート欠落 (販売数0扱いになる)
+
   let snapshots;
   let dataSource;
   if (restockRows.length > 0) {
     dataSource = 'restock';
-    snapshots = restockRows.map(r => mergeRestockWithPlanning(r, planningMap[normCode(r.amazon_sku)]));
+    snapshots = restockRows.map(r => {
+      const planning = planningMap[normCode(r.amazon_sku)];
+      if (!planning) planningMissingSkus.push(r.amazon_sku);
+      return mergeRestockWithPlanning(r, planning);
+    });
   } else {
     // フォールバック: 旧 daily_snapshots
     dataSource = 'legacy_snapshots';
@@ -70,6 +85,23 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   const nonFbaMax60dList = getAllNonFbaMax60d();
   const nonFbaMax60dMap = {};
   for (const r of nonFbaMax60dList) nonFbaMax60dMap[r.amazon_sku] = r;
+  // 未マッピング判定でも参照するので norm キー版も用意 (mirror小文字 vs レポート元ケース差の吸収)
+  const nonFbaMax60dNormMap = {};
+  for (const r of nonFbaMax60dList) nonFbaMax60dNormMap[normCode(r.amazon_sku)] = r;
+
+  // 準備中数量 (Inbound API) を norm キー化 (総点検 B-4)。exact-case 参照だと case 差で override が落ち、
+  // 2026-06-30型「準備中欠損→二重推奨」が再発する。未マッピング判定でも同じ値を使う。
+  // 正規化で衝突した場合 (ABC と abc が両方ある等) は後勝ちにせず最大値を採用する
+  // (小さい方を採ると準備中を過小評価し、二重推奨に戻るため)。
+  const inboundWorkingNormMap = {};
+  if (inboundWorkingOverride) {
+    for (const k of Object.keys(inboundWorkingOverride)) {
+      const nk = normCode(k);
+      const v = Number(inboundWorkingOverride[k]) || 0; // null/非数は0扱い (入力契約は数値)
+      inboundWorkingNormMap[nk] = nk in inboundWorkingNormMap ? Math.max(inboundWorkingNormMap[nk], v) : v;
+    }
+  }
+  const lookupInboundWorking = (sku) => inboundWorkingNormMap[normCode(sku)];
 
   const snapshotDate = snapshots[0]?.snapshot_date || new Date().toISOString().slice(0, 10);
   const oosAmazonRecoThreshold = parseInt(settings.oos_amazon_reco_threshold || 11);
@@ -78,14 +110,64 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
   for (const snap of snapshots) {
     const sku = snap.amazon_sku;
     const mapping = mappingMap[normCode(sku)]; // norm 参照で case 差でも一致
-    if (!mapping) continue; // マッピングがないSKUはスキップ
+    if (!mapping) {
+      // マッピングがないSKUは計算不能なのでスキップ。ただし黙って消すと納品漏れになるため meta に残す。
+      // 稼働実績の有無で仕分け (実績ゼロ=バリエーション登録専用等の未使用SKU → 警告にしない)。
+      // 「実績」は片側だけ見ると取りこぼすため、生きているSKUを示す全シグナルを見る:
+      //   FBA販売 / FBA在庫 / 入荷中 (準備中はAPI優先=通常計算と同じ基準) / Amazon推奨 / 他CH販売
+      const workingOverride = lookupInboundWorking(sku);
+      const working = workingOverride !== undefined ? (workingOverride || 0) : (snap.fba_inbound_working || 0);
+      const inbound = working + (snap.fba_inbound_shipped || 0) + (snap.fba_inbound_received || 0);
+      const sold30d = snap.units_sold_30d || 0;
+      const fbaQty = snap.fba_available || 0;
+      const amazonReco = snap.amazon_recommended_qty; // null=未取得
+      const nonFba30d = nonFbaMax60dNormMap[normCode(sku)]?.max_30d || 0; // 他CHのみ販売のSKUを拾う
+      if (sold30d > 0 || fbaQty > 0 || inbound > 0 || (typeof amazonReco === 'number' && amazonReco > 0) || nonFba30d > 0) {
+        unmappedActive.push({
+          sku, units_sold_30d: sold30d, fba_available: fbaQty, fba_inbound: inbound,
+          amazon_recommended_qty: amazonReco ?? null, non_fba_sales_30d: nonFba30d,
+        });
+      } else {
+        unmappedInactive.push(sku);
+      }
+      continue;
+    }
+
+    // --- set_components をSKU単位で安全にパース+構造検証 (不正1件で全SKUの生成が止まらないよう隔離) ---
+    // 不正な場合は「単品扱いで計算続行」ではなく当該SKUの推奨を停止する (誤った数量提示より安全側)
+    let components = null;
+    let invalidMapping = false;
+    if (mapping.set_components) {
+      try {
+        components = typeof mapping.set_components === 'string'
+          ? JSON.parse(mapping.set_components) : mapping.set_components;
+        if (!Array.isArray(components)) throw new Error('配列ではありません');
+        if (components.length === 0 && mapping.is_set) throw new Error('セット品なのに構成が空');
+        if (components.length === 0) components = null; // 非セットの空配列は「構成なし」と同義 (単品フォールバック)
+        for (const c of components || []) {
+          if (!c || typeof c.ne_code !== 'string' || !c.ne_code.trim()) throw new Error('構成品のne_codeが不正');
+          const q = Number(c.qty ?? 1);
+          if (!Number.isSafeInteger(q) || q < 1) throw new Error(`構成品qtyが不正 (${c.qty})`);
+          c.qty = q; // "2" 等の文字列数値を正規化
+        }
+      } catch (e) {
+        components = null;
+        invalidMapping = true;
+        invalidMappingSkus.push({ sku, reason: `set_componentsが不正: ${e.message}` });
+      }
+    }
+
+    // 期限系の判定単位: セットは全構成品 (1セットあたり perSet 個)、単品は logizard_code
+    const expiryUnits = (components && components.length > 0)
+      ? components.filter(c => c.ne_code).map(c => ({ code: c.ne_code, perSet: c.qty || 1 }))
+      : (mapping.logizard_code ? [{ code: mapping.logizard_code, perSet: 1 }] : []);
+    const locCache = {};
+    const locsFor = (code) => (locCache[code] ??= getWarehouseLocationsByCode(code));
 
     // --- 期限管理商品判定 (effectiveFbaStock 計算と min_shipment_days フィルタで使用) ---
-    const hasExpiryManagement = (() => {
-      if (!mapping.logizard_code) return false;
-      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
-      return locations.some(l => l.expiry_date && l.expiry_date.trim() !== '');
-    })();
+    // セット品は全構成品を確認 (従来は先頭構成品のみで、2番目以降の構成品の期限管理を見落としていた)
+    const hasExpiryManagement = expiryUnits.some(u =>
+      locsFor(u.code).some(l => l.expiry_date && l.expiry_date.trim() !== ''));
 
     // --- 実質FBA在庫 ---
     const fbaAvailable = snap.fba_available || 0;
@@ -95,10 +177,12 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
 
     // inboundWorking: Inbound API のリアルタイムデータを信頼。
     // レポート側の Working 列は信頼しない (0 のことが多く、遅延・残骸を含むため)
+    // 参照は norm キー (総点検 B-4: exact-case だと case 差で override が落ち二重推奨に戻る)
     let inboundWorking;
     let workingSource; // デバッグ用: データソース
-    if (inboundWorkingOverride && inboundWorkingOverride[sku] !== undefined) {
-      inboundWorking = inboundWorkingOverride[sku];
+    const workingOverrideVal = lookupInboundWorking(sku);
+    if (workingOverrideVal !== undefined) {
+      inboundWorking = workingOverrideVal;
       workingSource = 'API';
     } else {
       // API失敗時: レポートの working を参考値として使う (通常商品のみ)
@@ -141,11 +225,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     const nonFbaDailySales = nonFbaSales30d / 30;
     const totalDailySales = dailySales + nonFbaDailySales;
 
-    // set_componentsがあれば常にcomponentsロジックを使う（単品qty>1にも対応）
-    const components = mapping.set_components
-      ? (typeof mapping.set_components === 'string' ? JSON.parse(mapping.set_components) : mapping.set_components)
-      : null;
-
+    // set_componentsがあれば常にcomponentsロジックを使う（単品qty>1にも対応。パースは上部で隔離済み）
     if (components && components.length > 0) {
       // 構成商品の最小在庫がボトルネック（qty倍率を考慮）
       let minSets = Infinity;
@@ -197,7 +277,9 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     // --- 送れる数 ---
     // stockState が revivable_long_oos / dead_candidate の SKU は推奨数ゼロ固定 (FBA欠品タブで別扱い)
     let recommendedQty;
-    if (stockState === 'revivable_long_oos' || stockState === 'dead_candidate') {
+    if (invalidMapping) {
+      recommendedQty = 0; // セット構成不正: 単品扱いの誤数量を出さず推奨停止 (マスタ修正を促す)
+    } else if (stockState === 'revivable_long_oos' || stockState === 'dead_candidate') {
       recommendedQty = 0;
     } else {
       recommendedQty = Math.min(boundedNeeded, warehouseAvailable);
@@ -210,14 +292,21 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     let expiryDate = '';
     let expirySameQty = 0;
     let undatedLocQty = 0; // 期限なしロケにある在庫数（データ不備警告用）
-    if (mapping.logizard_code) {
-      const locations = getWarehouseLocationsByCode(mapping.logizard_code);
-      // 有効期限があるロケが1つでもあるかチェック
-      const locsWithExpiry = locations.filter(l => l.expiry_date && l.expiry_date.trim() !== '');
-      if (locsWithExpiry.length > 0) {
-        // 引当優先順で最初に引き当たる有効期限を基準とする
+    {
+      // 構成品ごとに「引当優先順で最初に引き当たる期限」の同一期限在庫を集計し、
+      // floor(同一期限在庫 / 構成qty) でセット数に換算した上限の最小値をとる。
+      // (従来は先頭構成品の構成品個数と推奨セット数を直接比較しており、qty>1構成で過大/過少になっていた)
+      let maxSameExpirySets = Infinity;
+      let anyExpiry = false;
+      for (const u of expiryUnits) {
+        const locations = locsFor(u.code);
+        const locsWithExpiry = locations.filter(l => l.expiry_date && l.expiry_date.trim() !== '');
+        if (locsWithExpiry.length === 0) continue; // この構成品は期限管理なし → 期限制約に関与しない
+
+        anyExpiry = true;
         const baseExpiry = locsWithExpiry[0].expiry_date.trim();
-        expiryDate = baseExpiry; // 常に有効期限を保持（納品プラン作成時に必要）
+        // 代表期限は最も早いものを保持（納品プラン作成時に必要。セットの実効期限=最短構成品）
+        if (!expiryDate || baseExpiry < expiryDate) expiryDate = baseExpiry;
 
         // 同一期限のロケ在庫のみを合算（期限なしロケは除外し警告対象）
         let sameExpiryTotal = 0;
@@ -229,12 +318,13 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
             undatedLocQty += loc.available_qty;
           }
         }
+        maxSameExpirySets = Math.min(maxSameExpirySets, Math.floor(sameExpiryTotal / u.perSet));
+      }
 
-        if (recommendedQty > 0 && sameExpiryTotal < recommendedQty) {
-          expiryLimited = true;
-          expirySameQty = sameExpiryTotal;
-          recommendedQty = sameExpiryTotal;
-        }
+      if (anyExpiry && recommendedQty > 0 && maxSameExpirySets < recommendedQty) {
+        expiryLimited = true;
+        expirySameQty = maxSameExpirySets;
+        recommendedQty = maxSameExpirySets;
       }
     }
 
@@ -276,7 +366,11 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     let locationAdjusted = false;
     let locationDetail = '';
     const locAdjustPct = parseFloat(settings.location_adjust_pct || 10) / 100;
-    if (!expiryLimited && adjustedQty > 0 && mapping.logizard_code) {
+    // セット品(複数構成品 or qty>1)はロケ補正を無効化: 先頭構成品のロケ累積(構成品個数)と
+    // 推奨セット数は単位が異なり、ボトルネック構成品を無視した増量で送れない数を提示していた
+    const isMultiUnitSet = !!(components && components.length > 0 &&
+      (components.length > 1 || (components[0]?.qty || 1) > 1));
+    if (!expiryLimited && !isMultiUnitSet && adjustedQty > 0 && mapping.logizard_code) {
       const locations = getWarehouseLocationsByCode(mapping.logizard_code);
       if (locations.length > 0) {
         const lower = adjustedQty * (1 - locAdjustPct);
@@ -312,8 +406,19 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       }
     }
 
+    // --- 上限クリップ: 丸め・ロケ補正が倉庫可能数(セットはボトルネック構成品基準)を超えないよう必ず適用 ---
+    if (adjustedQty > warehouseAvailable) {
+      adjustedQty = warehouseAvailable;
+      locationAdjusted = false;
+      locationDetail = '';
+    }
+
     // --- アラート ---
     const alerts = calcAlerts(snap, mapping, effectiveFbaStock, daysOfSupply, warehouseAvailable, settings);
+
+    if (invalidMapping) {
+      alerts.push({ type: 'invalid_mapping', level: 3, message: 'セット構成(set_components)が不正のため推奨停止 (スプシ修正要)' });
+    }
 
     // 期限管理SKUに期限なしロケの在庫がある場合はデータ不備警告（FBA同梱不可のため送れない）
     if (undatedLocQty > 0) {
@@ -342,7 +447,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
         `[Step5] 必要補充数 = ${needsReplenishment ? `ceil(${dailySales.toFixed(2)} × ${targetDays}) - ${effectiveFbaStock} = ${targetStock} - ${effectiveFbaStock} = ${rawNeeded}` : '0(発注点以上のため)'}`,
         `[Step6] 倉庫在庫按分 = ${warehouseRaw}個(倉庫,Yロケ除外) × FBA比率${effectiveTotalDailySales > 0 ? (dailySales / effectiveTotalDailySales * 100).toFixed(0) : 100}% = FBA用${warehouseAvailable}個 / 他CH確保${nonFbaReserve}個${recentArrivalAdjusted ? ` [補正: 他CH実効日販${effectiveNonFbaDailySales.toFixed(2)}${max60d?.max_30d > nonFbaSales30d ? `(60日最大値${max60d.max_30d}ベース)` : daysSinceArrival !== null ? `(入荷${daysSinceArrival}日目推定)` : ''}]` : ''}${lastArrivalDate ? ` (最終入荷: ${lastArrivalDate})` : ''}`,
         `[Step7] 推奨数 = min(${rawNeeded}(必要数), ${warehouseAvailable}(FBA用在庫)) = ${skippedByMinDays ? `0 (元${Math.min(rawNeeded, warehouseAvailable)}個→${(Math.min(rawNeeded, warehouseAvailable) / dailySales).toFixed(1)}日分 < 最低${minShipmentDays}日 → 入荷待ち)` : rawRecommendedQty}${hasExpiryManagement && !skippedByMinDays && dailySales > 0 && rawRecommendedQty > 0 && rawRecommendedQty / dailySales < minShipmentDays ? ` (${(rawRecommendedQty / dailySales).toFixed(1)}日分 < ${minShipmentDays}日だが期限管理商品のためフィルター無効)` : ''}`,
-        `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限在庫' + expirySameQty + '個 → 推奨数を' + expirySameQty + '個に制限' : '制限なし(期限データなし or 同一期限)'}`,
+        `[Step7.5] 有効期限: ${expiryLimited ? '基準期限' + expiryDate + ' → 同一期限で送れるのは' + expirySameQty + '個(セット品はセット数) → 推奨数を' + expirySameQty + 'に制限' : '制限なし(期限データなし or 同一期限)'}`,
         `[Step8] 補正: ${expiryLimited ? 'スキップ(有効期限制限済み → ' + adjustedQty + '個をそのまま送る)' : rawRecommendedQty === adjustedQty ? 'なし' : rawRecommendedQty + ' → ' + (roundedQty !== rawRecommendedQty ? roundedQty + '(' + roundUnit + '個丸め)' : String(rawRecommendedQty)) + (locationAdjusted ? ' → ' + adjustedQty + '(ロケ補正: ' + locationDetail + ')' : '') + ' = 最終' + adjustedQty + '個 (' + (rawRecommendedQty > 0 ? ((adjustedQty - rawRecommendedQty) / rawRecommendedQty * 100).toFixed(0) : 0) + '%)'}`,
         `[Step9] 緊急度 = ${urgencyScore.toFixed(1)} (基本:${Math.max(0, 100 - (daysOfSupply * 100 / 40)).toFixed(0)}, 月商W:${Math.min((snap.your_price || 0) * sold30d / 100000, 5).toFixed(1)}, トレンド:${sold30d > 0 ? ((sold7d / 7 * 30) / sold30d).toFixed(1) : '-'})`,
         `[Step10] アラート: ${alerts.length > 0 ? alerts.map(a => a.message).join(' / ') : 'なし'}`,
@@ -356,6 +461,7 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
       ne_code: mapping.ne_code || '',
       is_set: mapping.is_set ? true : false,
       set_components: components || null,
+      invalid_mapping: invalidMapping,
 
       // SKU状態分類 (タブ振り分け用)
       stock_state: stockState,
@@ -447,6 +553,19 @@ export function generateRecommendations(debug = false, inboundWorkingOverride = 
     recommended_skus: recommendedItems.length,
     recommended_units: recommendedItems.reduce((s, i) => s + i.recommended_qty, 0),
     errors: [],
+    // 部分成功の可視化 (総点検 P0-3): 「ゼロ件成功」と「データ欠損付き成功」を区別できるようにする。
+    // 未マッピングは active (実績あり=要対応) と inactive (未使用SKU=情報のみ) に分離
+    data_quality: {
+      data_source: dataSource,
+      unmapped_active_count: unmappedActive.length,
+      unmapped_active: unmappedActive,
+      unmapped_inactive_count: unmappedInactive.length,
+      unmapped_inactive_skus: unmappedInactive,
+      invalid_mapping_count: invalidMappingSkus.length,
+      invalid_mappings: invalidMappingSkus,
+      planning_missing_count: planningMissingSkus.length,
+      planning_missing_skus: planningMissingSkus,
+    },
   };
 }
 

@@ -34,7 +34,7 @@ import { mkdir, copyFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { openContext, ensureRmsLogin, tryClick, dumpControls, safeHost, assertLoginEnv } from './lib-rakuten-login.mjs';
+import { openContext, ensureRmsLogin, tryClick, dumpControls, safeHost, assertLoginEnv, isAuthBlocked } from './lib-rakuten-login.mjs';
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -491,6 +491,7 @@ async function main() {
           const status = await fetchOneReport(page, spec, month);
           outcomes.push({ spec: spec.key, ym: month.ym, status });
         } catch (e) {
+          const errorUrl = page.url(); // snap/logFetch中の遷移で着地URLを見失わないよう先頭で捕捉 (Codex R1 Medium)
           // 1件の失敗で全体を止めない: 同レポートの残月のみスキップし、別レポートは続行
           console.error(`✗ ${spec.label} ${month.ym}: ${e.message}`);
           const screenshot = join(OUT_DIR, `rpp_${spec.key}_${month.ym}_error.png`);
@@ -504,7 +505,12 @@ async function main() {
             reportType: spec.reportType, ym: month.ym, from: month.from, to: month.to,
             error: e.message, url: page.url(), screenshot,
           });
-          if (String(e.message).startsWith('2FA_REQUIRED')) throw e; // ログイン切れは全レポート共倒れ → 即通知へ
+          if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+          // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+          // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+          if (/app_login_error|system_error/i.test(errorUrl)) {
+            throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+          }
           break; // 同レポートの他の月も同じ原因で落ちる可能性大 → 無駄打ちしない (別レポートは試す)
         }
       }
@@ -524,7 +530,8 @@ async function main() {
     }
   } catch (err) {
     const is2fa = String(err.message).startsWith('2FA_REQUIRED');
-    if (is2fa) {
+    const isUnstable = String(err.message).startsWith('RMS_SESSION_UNSTABLE');
+    if (is2fa || isUnstable) {
       console.error(`\n⚠️ ${err.message}`);
       console.error('  → その日は手動DLで埋める (大原則の手動フォールバック)');
     } else {
@@ -534,14 +541,16 @@ async function main() {
     await sendGChat(buildErrorReport({
       mall: 'rakuten', outcomes, logPath: runLog.logPath,
       failures: [{
-        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : 'rpp(共通処理)',
+        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : isUnstable ? 'RMS_SESSION_UNSTABLE (全レポート停止)' : 'rpp(共通処理)',
         error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'rpp_error.png'),
       }],
       repro: is2fa
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs → 手動ログイン+「信頼できる端末」登録 (14日ごと)'
-        : 'node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs',
+        : isUnstable
+          ? '楽天側の利用規制/障害の可能性 → ログイン連打を避けて当日は手動DL。回復確認は翌朝の自動実行'
+          : 'node scripts/mall-csv-fetcher/rakuten-rpp-download.mjs',
     }), 'rakuten-rpp');
-    process.exitCode = 1;
+    process.exitCode = (is2fa || isUnstable) ? 3 : 1; // 3=手動対応必須/blocked (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');

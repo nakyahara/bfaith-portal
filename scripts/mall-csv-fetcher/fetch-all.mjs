@@ -6,16 +6,26 @@
  * (1モールの障害で他モールのデータ取得を道連れにしない)。
  *
  * 通知の分担:
- *   - 取得スクリプト自身: 業務エラー (FORM_VERIFY/2FA/DL失敗等) の詳細を GChat 通知 (exit 1)
+ *   - 取得スクリプト自身: 業務エラー (FORM_VERIFY/2FA/DL失敗等) の詳細を GChat 通知 (exit 1/3)
  *   - このランナー: 子が通知できない異常終了のみ通知 — env不備(exit 2)/クラッシュ/timeout/signal
- *     (exit 1 は子が通知済みなので二重通知しない。ランナーはログに記録のみ)
+ *     (exit 1/2/3 は子が通知済みなので二重通知しない。ランナーはログに記録のみ)
+ *
+ * 自動リトライ (2026-07-17 実障害の教訓 — 1日1回の一発勝負は一過性エラーで丸1日欠測する):
+ *   - 失敗モール (exit 1 / timeout / クラッシュ) は約25分後に1回だけ再実行する
+ *   - exit 2 (env不備) と exit 3 (2FA_REQUIRED 等の手動対応必須 = blocked) はリトライしない
+ *     (feedback_blocked_field_for_retry_exclusion と同じ考え方。ログイン連打は楽天の
+ *      利用規制を悪化させるため、無差別リトライはしない)
+ *   - リトライで回復したら GChat に回復通知 (初回のエラー通知を打ち消す)
  *
  * 将来のモール追加: FETCHERS に1エントリ追加するだけ (例: Yahoo は 2FA検証が前提)。
  *
  * 実行: node scripts/mall-csv-fetcher/fetch-all.mjs
  *   env: MALL_FETCH_ONLY=rakuten でモール絞り込み (カンマ区切り)
+ *        MALL_FETCH_RETRY_DELAY_MS リトライまでの待ち (既定25分。0でリトライ無効)
  *
  * exit code: 0=全モール成功 / 1=いずれか失敗 (全モール実行は完了)
+ * 子スクリプトの exit code 契約: 0=成功 / 1=業務エラー(リトライ可) / 2=env不備 /
+ *   3=手動対応必須 (2FA_REQUIRED等。リトライしても直らない)
  */
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -29,7 +39,8 @@ const REPO_ROOT = join(__dirname, '..', '..');
 // ─── 多重起動ロック (Task Scheduler + 手動実行の同時起動で同一ブラウザプロファイルを
 // 2プロセスが触るとプロファイル破損/2FA誤検知の恐れ — Codex R1 Medium) ───
 const LOCK_PATH = join(LOG_DIR, 'fetch-all.lock');
-const LOCK_STALE_MS = 3 * 60 * 60 * 1000; // 全モール合計timeoutより長め。超過は前回クラッシュの残骸とみなす
+// stale閾値は実行時間の理論上限から算出 (固定値だと設定次第で「生存中のlockを残骸扱い」
+// して同一ブラウザプロファイルを並行利用し得る — Codex R2 High)。定義は FETCHERS の後方
 function acquireLock() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -54,7 +65,7 @@ function cleanupOldFiles() {
   const KEEP_MS = 30 * 24 * 3600 * 1000;
   const targets = [
     { dir: LOG_DIR, pattern: /\.log$/ },
-    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|yahoo|aupay|qoo10)_/ },
+    { dir: join(__dirname, 'downloads'), pattern: /^(rpp|rdata|rreview|yahoo|aupay|qoo10)_/ },
   ];
   for (const t of targets) {
     let removed = 0;
@@ -84,6 +95,11 @@ const DEFAULT_FETCHERS = [
     timeoutMs: 20 * 60 * 1000,
   },
   {
+    mall: 'rakuten-review', // レビューチェックツールCSV (mall-csv-fetcher P2、らくらくーぽん置換)。同期DL1本
+    script: join(__dirname, 'rakuten-review-download.mjs'),
+    timeoutMs: 15 * 60 * 1000,
+  },
+  {
     mall: 'yahoo', // ストクリ統計6種 (mall-csv-fetcher P1-Y)。全て同期DLなので短め
     script: join(__dirname, 'yahoo-data-download.mjs'),
     timeoutMs: 20 * 60 * 1000,
@@ -103,6 +119,54 @@ const DEFAULT_FETCHERS = [
 const FETCHERS = process.env.MALL_FETCHERS_JSON
   ? JSON.parse(process.env.MALL_FETCHERS_JSON)
   : DEFAULT_FETCHERS;
+
+// リトライまでの待ち時間。25分 = 一過性のRMS側不調 (実測: 2026-07-17は5:31〜5:37の間
+// 全滅→5:38に成功例) を跨ぎつつ、7:00 の daily-sync 取込前に完了できる長さ。
+// 不正値は既定に倒す (NaNで即時リトライ/タイマー異常になるのを防ぐ — Codex R1)
+const RETRY_DELAY_MS = (() => {
+  const DEFAULT = 25 * 60 * 1000;
+  const raw = process.env.MALL_FETCH_RETRY_DELAY_MS;
+  if (raw === undefined || raw === '') return DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > 2 * 60 * 60 * 1000) {
+    console.warn(`[retry] MALL_FETCH_RETRY_DELAY_MS=${raw} は不正 (0〜7200000の整数ms) → 既定25分を使用`);
+    return DEFAULT;
+  }
+  return n;
+})();
+
+// 実行時間の理論上限 = 全モールtimeout合計×2パス + リトライ待ち + 余裕1時間。
+// これより古いlockだけを前回クラッシュの残骸とみなす
+const LOCK_STALE_MS = FETCHERS.reduce((s, f) => s + f.timeoutMs, 0) * 2 + RETRY_DELAY_MS + 60 * 60 * 1000;
+
+/** 子スクリプトを1回実行して結果を返す */
+function runFetcher(f, extraEnv = {}) {
+  console.log(`\n>>> ${f.mall}: ${f.script}`);
+  const started = Date.now();
+  // stdio inherit: 子の出力はコンソールへ (子自身が logs/ に tee 保存する)。
+  // shell:false (feedback_execfile_vs_execsync: cmd.exe 経由の孫プロセス残留を避ける)
+  const r = spawnSync(process.execPath, [f.script], {
+    cwd: REPO_ROOT,
+    stdio: 'inherit',
+    shell: false,
+    timeout: f.timeoutMs,
+    killSignal: 'SIGKILL',
+    env: { ...process.env, ...extraEnv },
+  });
+  const secs = Math.round((Date.now() - started) / 1000);
+  const outcome = {
+    mall: f.mall,
+    code: r.status,       // null = signal/timeout kill
+    signal: r.signal || null,
+    spawnError: r.error ? r.error.message : null,
+    timedOut: !!(r.error && r.error.code === 'ETIMEDOUT'),
+    secs,
+  };
+  console.log(`<<< ${f.mall}: exit=${outcome.code} signal=${outcome.signal || '-'} ${outcome.timedOut ? 'TIMEOUT ' : ''}(${secs}s)`);
+  return outcome;
+}
+
+const fmtStatus = (r) => (r.code === 0 ? 'ok' : (r.timedOut ? 'timeout' : `exit${r.code ?? 'kill'}`));
 
 async function main() {
   const runLog = initRunLog('fetch-all');
@@ -124,38 +188,42 @@ async function main() {
   console.log(`=== モールCSV自動取得 一括実行 (${targets.map((t) => t.mall).join(', ')}) ===`);
   const results = [];
   for (const f of targets) {
-    console.log(`\n>>> ${f.mall}: ${f.script}`);
-    const started = Date.now();
-    // stdio inherit: 子の出力はコンソールへ (子自身が logs/ に tee 保存する)。
-    // shell:false (feedback_execfile_vs_execsync: cmd.exe 経由の孫プロセス残留を避ける)
-    const r = spawnSync(process.execPath, [f.script], {
-      cwd: REPO_ROOT,
-      stdio: 'inherit',
-      shell: false,
-      timeout: f.timeoutMs,
-      killSignal: 'SIGKILL',
-      env: process.env,
-    });
-    const secs = Math.round((Date.now() - started) / 1000);
-    const outcome = {
-      mall: f.mall,
-      code: r.status,       // null = signal/timeout kill
-      signal: r.signal || null,
-      spawnError: r.error ? r.error.message : null,
-      timedOut: !!(r.error && r.error.code === 'ETIMEDOUT'),
-      secs,
-    };
-    results.push(outcome);
-    console.log(`<<< ${f.mall}: exit=${outcome.code} signal=${outcome.signal || '-'} ${outcome.timedOut ? 'TIMEOUT ' : ''}(${secs}s)`);
+    // 初回パス: リトライが控えていることを子のエラー通知に載せる (受け手が慌てて手動DLしないように)
+    const extraEnv = RETRY_DELAY_MS > 0 ? { MALL_FETCH_WILL_RETRY: String(Math.max(1, Math.round(RETRY_DELAY_MS / 60000))) } : {};
+    results.push(runFetcher(f, extraEnv));
     // 失敗しても続行 — 次のモールへ
+  }
+  console.log(`\n=== summary(1回目): ${results.map((r) => `${r.mall}=${fmtStatus(r)}`).join(' / ')} ===`);
+
+  // ─── 自動リトライ (1回だけ)。exit 0=成功 / 2=env不備 / 3=手動対応必須(blocked) は対象外 ───
+  const retryTargets = targets.filter((f) => {
+    const r = results.find((x) => x.mall === f.mall);
+    return r && r.code !== 0 && r.code !== 2 && r.code !== 3;
+  });
+  if (RETRY_DELAY_MS > 0 && retryTargets.length > 0) {
+    console.log(`\n[retry] ${Math.max(1, Math.round(RETRY_DELAY_MS / 60000))}分後に再実行: ${retryTargets.map((f) => f.mall).join(', ')}`);
+    await new Promise((res) => setTimeout(res, RETRY_DELAY_MS));
+    const recovered = [];
+    for (const f of retryTargets) {
+      const second = runFetcher(f); // 2回目は MALL_FETCH_WILL_RETRY を付けない (これが最後)
+      const idx = results.findIndex((x) => x.mall === f.mall);
+      if (second.code === 0) recovered.push(f.mall);
+      results[idx] = second; // 最終結果は2回目で上書き (exit code/通知判定とも2回目基準)
+    }
+    if (recovered.length > 0) {
+      await sendGChat(
+        `♻️ *モールCSV自動取得 リトライで回復 (${recovered.join(', ')})*\n` +
+        '初回は一過性エラー、再実行で取得成功。手動対応は不要です (取込は次回 daily-sync)。',
+        'fetch-all');
+    }
   }
 
   const failed = results.filter((r) => r.code !== 0);
-  console.log(`\n=== summary: ${results.map((r) => `${r.mall}=${r.code === 0 ? 'ok' : (r.timedOut ? 'timeout' : `exit${r.code ?? 'kill'}`)}`).join(' / ')} ===`);
+  console.log(`\n=== summary: ${results.map((r) => `${r.mall}=${fmtStatus(r)}`).join(' / ')} ===`);
 
-  // 子が自力通知できないケースだけランナーが通知 (exit 1=業務エラー / exit 2=env不備 は
+  // 子が自力通知できないケースだけランナーが通知 (exit 1=業務エラー / 2=env不備 / 3=blocked は
   // 子が詳細通知済み → 二重通知しない。実機 2026-07-09 で exit2 の二重通知を確認して除外追加)
-  const unreported = failed.filter((r) => r.code !== 1 && r.code !== 2);
+  const unreported = failed.filter((r) => r.code !== 1 && r.code !== 2 && r.code !== 3);
   if (unreported.length > 0) {
     await sendGChat(buildErrorReport({
       mall: unreported.map((r) => r.mall).join(','),

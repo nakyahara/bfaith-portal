@@ -264,6 +264,35 @@ async function callYahooAPI(endpoint, xmlBody) {
   return await res.text();
 }
 
+// ─── Yahoo 問い合わせ管理API (circus REST GET。inquiry-hub 受信同期用) ───
+// Bearer token + 公開鍵署名 (X-sws-signature) 必須 (署名なしは px-04102 で401、Step 0実測)。
+// 署名は callYahooAPI と同方式。read-only の GET のみ (返信・既読化は passthrough しない)
+async function yahooCircusGet(apiPath, params = {}) {
+  const accessToken = await getAccessToken();
+  const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
+  u.searchParams.set('sellerId', YAHOO_SELLER_ID);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
+  }
+  const headers = { 'Authorization': `Bearer ${accessToken}` };
+  try {
+    if (fs.existsSync(YAHOO_PUBLIC_KEY_PATH)) {
+      const publicKeyPem = fs.readFileSync(YAHOO_PUBLIC_KEY_PATH, 'utf-8');
+      const publicKey = crypto.createPublicKey(publicKeyPem);
+      const timestamp = Math.floor(Date.now() / 1000).toString();
+      const encrypted = crypto.publicEncrypt(
+        { key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+        Buffer.from(`${YAHOO_SELLER_ID}:${timestamp}`, 'utf-8')
+      );
+      headers['X-sws-signature'] = encrypted.toString('base64');
+      headers['X-sws-signature-version'] = YAHOO_SIGNATURE_VERSION;
+    }
+  } catch (e) { console.log(`[${ts()}] 署名スキップ: ${e.message}`); }
+  const res = await fetch(u, { headers, signal: AbortSignal.timeout(30000) });
+  const body = await res.text();
+  return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
+}
+
 async function yahooOrderList(startDate, endDate) {
   const xml = `<Req>
   <Search>
@@ -741,6 +770,29 @@ const server = http.createServer(async (req, res) => {
       const categoryId = url.searchParams.get('category_id') || '1';
       if (!/^\d+$/.test(categoryId)) throw new Error('category_id は数値で指定してください');
       const r = await yahooPublicGet('/V1/categorySearch', { category_id: categoryId });
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+      return;
+    }
+
+    // 問い合わせ管理API passthrough (inquiry-hub 受信同期用。read-onlyのみ、パラメータ許可リスト方式)
+    if (pathname === '/yahoo/externalTalkList' && req.method === 'GET') {
+      const start = url.searchParams.get('start') || '1';
+      const result = url.searchParams.get('result') || '20';
+      if (!/^\d+$/.test(start) || Number(start) < 1) throw new Error('start は1以上の数値で指定してください');
+      if (!/^\d+$/.test(result) || Number(result) < 1 || Number(result) > 20) throw new Error('result は1〜20で指定してください (API上限20)');
+      const r = await yahooCircusGet('/externalTalkList', { start, result });
+      console.log(`[${ts()}] Yahoo externalTalkList start=${start} -> ${r.status} (${r.body.length} bytes)`);
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+      return;
+    }
+
+    if (pathname === '/yahoo/externalTalkDetail' && req.method === 'GET') {
+      const topicId = url.searchParams.get('topicId') || '';
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(topicId)) throw new Error('topicId が不正です');
+      const r = await yahooCircusGet('/externalTalkDetail', { topicId });
+      console.log(`[${ts()}] Yahoo externalTalkDetail ${topicId.slice(0, 12)}… -> ${r.status} (${r.body.length} bytes)`);
       res.writeHead(r.status, { 'Content-Type': r.contentType });
       res.end(r.body);
       return;

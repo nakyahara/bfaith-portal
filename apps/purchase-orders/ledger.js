@@ -55,7 +55,19 @@ export function stableStringify(v) {
 const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_to', 'email_subject_template', 'email_body_template',
   'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
-  'email_issuer_name']); // 発注書CSVの「発行担当者」列
+  'email_issuer_name',   // 発注書CSVの「発行担当者」列
+  // P17 欠品リスクのしきい値 (数値範囲は下の SHORTAGE_SETTING_RULES で setSetting 自体が検証する)
+  'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
+
+// P17 欠品リスク設定の許容範囲 (検証の単一ソース。shortage-risk.js が名前→キー変換して共用、
+// setSetting 自体も検証するので router を経由しない書込でも不正値は入らない — Codex P17-R1 Medium)
+export const SHORTAGE_SETTING_RULES = {
+  shortage_w7: { min: 0, max: 1, int: false },
+  shortage_margin_days: { min: 0, max: 30, int: true },
+  shortage_unanswered_days: { min: 0, max: 60, int: true },
+  shortage_horizon_days: { min: 14, max: 365, int: true },
+  shortage_soon_days: { min: 1, max: 90, int: true },
+};
 
 export function getSetting(key) {
   const r = getDB().prepare('SELECT value FROM po_settings WHERE key=?').get(key);
@@ -81,6 +93,15 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
     if (/[\r\n\0]/.test(String(value))) throw new Error('発行担当者名に改行は使えません');
     value = String(value).trim();
     if (value.length > 50) throw new Error('発行担当者名が長すぎます (50文字まで)');
+  }
+  const sr = SHORTAGE_SETTING_RULES[key];
+  if (sr) {
+    // 空文字・null は Number() で 0 に化けるため明示拒否 (Codex P17-R2 Medium)
+    const s = String(value).trim();
+    const n = s === '' ? NaN : Number(s);
+    if (!Number.isFinite(n) || n < sr.min || n > sr.max || (sr.int && !Number.isInteger(n))) {
+      throw new Error(`${key} は ${sr.min}〜${sr.max}${sr.int ? ' の整数' : ''} で指定してください: ${value}`);
+    }
   }
   const db = getDB();
   db.transaction(() => {
@@ -446,8 +467,10 @@ export function listBackorders() {
   if (!boundary) return { boundary: null, orders: [], summary };
   const today = jstToday();
   const orders = db.prepare(`
-    SELECT id, supplier_code, supplier_name, po_number, note, requested_date, issued_at, closed_at, origin, send_blocked, parent_order_id, ne_slip_number
-    FROM po_orders WHERE status='issued' AND issued_at >= ? ORDER BY (closed_at IS NULL) DESC, issued_at DESC`).all(boundary);
+    SELECT o.id, o.supplier_code, o.supplier_name, o.po_number, o.note, o.requested_date, o.issued_at, o.closed_at, o.origin,
+           o.send_blocked, o.parent_order_id, o.ne_slip_number, s.send_method
+    FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
+    WHERE o.status='issued' AND o.issued_at >= ? ORDER BY (o.closed_at IS NULL) DESC, o.issued_at DESC`).all(boundary);
   // 先方管理番号 (対応表)。仕入先別ビュー・注残確認CSVで表示する (仕入先は自社コードではなく自分の管理番号で突合するため)。
   // tracked POに現れる仕入先分だけ読む (対応表全件prefetchの固定コストを避ける、Codex R1 Low)。
   // 仕入先→商品の入れ子Map (文字列連結キーはコードに区切り文字が含まれると別仕入先の番号が混入し得る、Codex R2 Medium)
@@ -507,7 +530,7 @@ export function listBackorders() {
     out.push({
       id: o.id, poNumber: o.po_number, supplierCode: o.supplier_code, supplierName: o.supplier_name,
       note: o.note, requestedDate: o.requested_date, issuedAt: o.issued_at, closedAt: o.closed_at,
-      origin: o.origin, open, sendBlocked: !!o.send_blocked, neSlipNumber: o.ne_slip_number || null,
+      origin: o.origin, open, sendBlocked: !!o.send_blocked, sendMethod: o.send_method || null, neSlipNumber: o.ne_slip_number || null,
       parentOrderId: o.parent_order_id || null,
       parentPoNumber: o.parent_order_id ? (parentPoOf.get(o.parent_order_id) || `#${o.parent_order_id}`) : null,
       supplementPoNumbers: supByParent.get(o.id) || [],

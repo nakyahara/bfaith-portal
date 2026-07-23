@@ -21,6 +21,10 @@ const nowIso = () => new Date().toISOString();
 export const SHIPMENT_MAIL_RULES = [
   { supplierCode: '1', domain: 'am-craft.jp', kind: 'xlsx', extraAuthDomains: [] },
   { supplierCode: '2', domain: 'be-free.biz', kind: 'body', subjectFilter: '出荷明細', extraAuthDomains: [] },
+  // サロンジェ: 出荷明細の添付なし (添付は納品書PDFスキャン=解析しない)。こちらが送った発注書 (PO) に
+  // 対応して出荷され、欠品/終売だけ本文の※行で通知される → PO参照方式 (台帳の明細から入荷予定を作る)。
+  // 中原さん確認 2026-07-16: コード0107 / ドメイン一致でよい / 分納なし=欠品・終売は減数で注残を消す
+  { supplierCode: '107', domain: 'salonge.co.jp', kind: 'po_reference', extraAuthDomains: [] },
 ];
 
 const b64urlToBuf = s => Buffer.from(String(s || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64');
@@ -246,7 +250,7 @@ export function parseShipmentHtml(html) {
   return items;
 }
 
-/** Gmail message payload から text/html と xlsx添付 ({filename, attachmentId}) を集める */
+/** Gmail message payload から text/plain・text/html と xlsx添付 ({filename, attachmentId}) を集める */
 function walkParts(payload, out) {
   if (!payload) return out;
   const mime = payload.mimeType || '';
@@ -255,8 +259,57 @@ function walkParts(payload, out) {
     out.attachments.push({ filename: fname, attachmentId: payload.body.attachmentId });
   }
   if (mime === 'text/html' && payload.body && payload.body.data) out.html += b64urlToBuf(payload.body.data).toString('utf8');
+  if (mime === 'text/plain' && payload.body && payload.body.data) out.text += b64urlToBuf(payload.body.data).toString('utf8');
   for (const p of payload.parts || []) walkParts(p, out);
   return out;
+}
+
+/** HTML → プレーンテキスト (PO参照メールの本文解析用。返信引用 blockquote/gmail_quote は除去) */
+export function htmlToPlainText(html) {
+  let src = String(html || '');
+  let prev;
+  do { prev = src; src = src.replace(/<blockquote[^>]*>(?:(?!<blockquote)[\s\S])*?<\/blockquote>/gi, ''); } while (src !== prev);
+  src = src.replace(/<div[^>]*class=["']?[^"'>]*gmail_quote[^"'>]*["']?[\s\S]*$/gi, '');
+  return src
+    .replace(/<(br|\/p|\/div|\/tr|\/li)[^>]*>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+
+/** プレーンテキストから返信引用行 (> 始まり) を落とす */
+function stripQuotedLines(text) {
+  return String(text || '').split(/\r?\n/).filter(l => !/^\s*>/.test(l)).join('\n');
+}
+
+/**
+ * PO参照メール (サロンジェ) の本文から欠品/終売の例外を抽出する。
+ * 例: 「※16502 KBミニタオル3P…終売となりました。」→ { text, kind: 'discontinued' }
+ * マーカーは ※ / ＊ / * のみ (・は署名の装飾を拾いやすいため対象外)。抽出0件=全量出荷の正常ケース
+ */
+export function parseShipmentExceptions(text) {
+  const out = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const m = line.match(/^[※＊*]\s*(.+)$/) || (line.includes('※') ? [null, line.slice(line.indexOf('※') + 1).trim()] : null);
+    if (!m || !m[1]) continue;
+    const t = m[1].trim().slice(0, 200);
+    if (!t) continue;
+    const kind = /終売|廃番|廃盤/.test(t) ? 'discontinued' : /在庫無|在庫な|欠品/.test(t) ? 'shortage' : 'other';
+    out.push({ text: t, kind });
+  }
+  return out.slice(0, 50);
+}
+
+/** 本文中の M/D 形式の日付 (「7/14、7/8の御依頼分」等) を拾う (PO選択のハイライト用の参考情報) */
+export function extractRefDates(text) {
+  const seen = new Set();
+  for (const m of String(text || '').matchAll(/(?<![\d/])(\d{1,2})\/(\d{1,2})(?![\d/])/g)) {
+    const mo = Number(m[1]), da = Number(m[2]);
+    if (mo >= 1 && mo <= 12 && da >= 1 && da <= 31) seen.add(`${mo}/${da}`);
+    if (seen.size >= 5) break;
+  }
+  return [...seen];
 }
 
 function headerOf(payload, name) {
@@ -284,6 +337,7 @@ function fakeCandidates() {
       internalDateIso: m.internalDate || nowIso(),
       xlsxNames: xlsx.map(a => a.filename), // 添付メタデータ (中身のDLなしで判定できる)
       getHtml: async () => m.bodyHtml || '',
+      getText: async () => stripQuotedLines(m.bodyText || htmlToPlainText(m.bodyHtml || '')),
       getXlsxAt: async i => ({ filename: xlsx[i].filename, buf: Buffer.from(xlsx[i].dataBase64, 'base64') }),
     };
   });
@@ -293,7 +347,7 @@ const transientErr = e => { e.transient = true; return e; };
 
 /** Gmailのメッセージ (format=full) → 解析候補。添付は「メタデータのみ」保持し、中身のDLは getFirstXlsx まで遅延 */
 function candidateFromGmailMsg(msg) {
-  const collected = walkParts(msg.payload, { html: '', attachments: [] });
+  const collected = walkParts(msg.payload, { html: '', text: '', attachments: [] });
   return {
     id: msg.id,
     from: headerOf(msg.payload, 'From'), subject: headerOf(msg.payload, 'Subject'),
@@ -301,6 +355,7 @@ function candidateFromGmailMsg(msg) {
     internalDateIso: msg.internalDate ? new Date(Number(msg.internalDate)).toISOString() : nowIso(),
     xlsxNames: collected.attachments.map(a => a.filename),
     getHtml: async () => collected.html,
+    getText: async () => stripQuotedLines(collected.text || htmlToPlainText(collected.html)),
     // 添付は必要になった1件ずつDLする — 認証を通ったメールについてのみ呼ばれる
     // (未認証メールの大量添付でAPI/メモリを浪費させない、Codex 入荷予定R1 High)
     getXlsxAt: async i => {
@@ -321,6 +376,22 @@ function candidateFromGmailMsg(msg) {
 export async function parseByRule(c, rule) {
   const authError = () => new Error('送信元の認証を確認できません — なりすましの可能性があるため自動変換しません。' +
     `本物なら手動貼り付けを使ってください [判定: ${summarizeAuth(c.authResults)}]`);
+  if (rule.kind === 'po_reference') {
+    // サロンジェ: 出荷明細は無い。本文から「出荷連絡か」の判定と欠品/終売の例外だけ抽出し、
+    // 明細はこちらの発注台帳 (PO) から作る。例外0件=全量出荷の正常ケース (エラーにしない)
+    if (!authPassed(c.authResults, rule.domain, rule.extraAuthDomains)) throw authError();
+    const text = (typeof c.getText === 'function' ? await c.getText() : '') || '';
+    if (!/出荷|発送/.test(text + String(c.subject || ''))) {
+      const e = new Error('出荷連絡ではありません (本文/件名に出荷・発送の記載なし)');
+      e.notCandidate = true;
+      throw e;
+    }
+    const exceptions = parseShipmentExceptions(text);
+    return {
+      items: { kind: 'po_reference', exceptions, refDates: extractRefDates(text), bodyText: text.slice(0, 4000) },
+      note: '発注書参照 (サロンジェ: 添付は解析しない)',
+    };
+  }
   if (rule.kind === 'xlsx') {
     // 判定順: 添付メタデータなし=対象外 → 認証 → 認証済みだけ添付をDL (Codex 入荷予定R1 High)
     const names = c.xlsxNames || [];
@@ -473,8 +544,10 @@ export async function reparseShipmentMail(id, actor) {
   if (!rule) return toNotCandidate('出荷明細の対象外です (差出人/件名がルールに一致しません)');
   try {
     const { items, note } = await parseByRule(c, rule);
-    applyIfStillOpen("status='new', parsed_json=?, parse_note=?, error=NULL", [JSON.stringify(items), note], { status: 'new', items: items.length });
-    return { status: 'new', itemCount: items.length };
+    // items は配列 (明細解析) または po_reference オブジェクト — 件数は配列のときのみ (Codex salonge-R1 Medium)
+    const itemCount = Array.isArray(items) ? items.length : null;
+    applyIfStillOpen("status='new', parsed_json=?, parse_note=?, error=NULL", [JSON.stringify(items), note], { status: 'new', items: itemCount });
+    return { status: 'new', itemCount };
   } catch (e) {
     if (e.transient) throw new Error(`一時的な取得エラー: ${String(e.message || e)} — もう一度試してください`);
     if (e.notCandidate) return toNotCandidate(`${String(e.message || e)} — 出荷明細ではないため一覧から外しました`);

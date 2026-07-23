@@ -29,11 +29,14 @@ import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInb
 import { importNeBackorderCsv } from './migration.js';
 import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
-  buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
-  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell,
+  buildOrderEmail, buildOrderFax, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
+  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf,
 } from './email.js';
+import { renderOrderPdf } from './fax-pdf.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
+import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
+import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -497,7 +500,7 @@ function cycleIssuedSuppliers(cycleStart) {
            GROUP_CONCAT(CASE WHEN is_unsent = 1 THEN po_label END) AS unsent_pos
     FROM (
       SELECT o.supplier_code AS code, o.supplier_name AS name, COALESCE(o.po_number, '#' || o.id) AS po_label,
-             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method = 'email'
+             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method IN ('email', 'fax')
                    AND NOT EXISTS (SELECT 1 FROM po_email_jobs e WHERE e.order_id = o.id AND e.status = 'sent' AND e.is_dry_run = 0)
                   THEN 1 ELSE 0 END AS is_unsent
       FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
@@ -733,6 +736,32 @@ router.get('/api/backorders/supplier-csv', (req, res) => {
     res.send(iconv.encode(csvText, 'cp932'));
   }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── P17: 欠品リスク (要件v8 F-4、v1=簡易目安の参考表示) ───
+router.get('/api/shortage-risk', (req, res) => {
+  try { res.json({ ok: true, ...computeShortageRisk() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+// しきい値の更新 (範囲検証→setSetting。setSetting が old/new+actor を監査ログに残す)
+router.patch('/api/shortage-risk/settings', (req, res) => {
+  try {
+    const body = req.body || {};
+    const updates = {};
+    for (const name of ['w7', 'marginDays', 'unansweredDays', 'horizonDays', 'soonDays']) {
+      if (body[name] === undefined) continue;
+      updates[name] = validateShortageSetting(name, body[name]);
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ ok: false, error: '変更する設定がありません' });
+    // 複数キーを単一トランザクションで保存 (部分適用を防ぐ。setSetting内のtransactionはsavepointとして入れ子になる)
+    getDB().transaction(() => {
+      for (const [name, v] of Object.entries(updates)) {
+        setSetting(shortageSettingKey(name), String(v), { actor: actorOf(req), reason: '欠品リスクしきい値の変更' });
+      }
+    })();
+    res.json({ ok: true, settings: shortageSettings(), defaults: SHORTAGE_DEFAULTS });
+  }
+  catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // NE発注残CSVの初期取込 (移行PO作成)。commit='1' 以外はプレビューのみ (書込なし)。
@@ -1161,14 +1190,21 @@ router.post('/api/inbound/:id/ignore', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// ─── P15: 発注書メール送信 ───
+// ─── P15: 発注書メール送信 (+FAX: eFaxゲートウェイ宛メール。channel='fax') ───
+/** POの仕入先の送信方法 ('fax' なら FAXチャネル、それ以外はemailチャネルで既存の検証メッセージに任せる) */
+function sendChannelOf(orderId) {
+  const r = getDB().prepare(`SELECT s.send_method FROM po_orders o
+    LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code WHERE o.id=?`).get(orderId);
+  return r && r.send_method === 'fax' ? 'fax' : 'email';
+}
+
 router.get('/api/orders/:id/email/preview', (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
-    const p = buildOrderEmail(orderId);
+    const p = sendChannelOf(orderId) === 'fax' ? buildOrderFax(orderId) : buildOrderEmail(orderId);
     res.json({
-      ok: true,
+      ok: true, channel: p.channel, faxNumber: p.faxNumber,
       to: p.to, cc: p.cc, subject: p.subject, body: p.body,
       rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
       attachmentName: p.attachmentName, csvText: p.csvText, csvRows: p.csvRows,
@@ -1177,6 +1213,32 @@ router.get('/api/orders/:id/email/preview', (req, res) => {
       jobs: listEmailJobs(orderId),
     });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// FAX発注書PDFのプレビュー (その場で生成して返す。送信済み控えは /api/email-jobs/:id/pdf)
+router.get('/api/orders/:id/fax/pdf', async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const p = buildOrderFax(orderId);
+    const pdf = await renderOrderPdf(p.pdfPayload);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${p.attachmentName}"`);
+    res.send(pdf);
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 送信ジョブに保存されたPDF控え (送信された実バイト列。プレビュー再生成ではない)
+router.get('/api/email-jobs/:id/pdf', (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const job = getDB().prepare('SELECT channel, attachment_name, attachment_pdf FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!job || job.channel !== 'fax' || !job.attachment_pdf) return res.status(404).json({ ok: false, error: 'FAXジョブのPDFが見つかりません' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${job.attachment_name}"`);
+    res.send(Buffer.from(job.attachment_pdf));
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/api/orders/:id/email/send', async (req, res) => {
@@ -1191,13 +1253,34 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     // 冪等キーは必須 (再送ジョブはdedup対象外のため、通信断後の再実行・自動リトライでの複数通送信をキーで防ぐ、Codex P15-R4 High)
     const idemKey = trimS(req.get('Idempotency-Key'));
     if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
+    const channel = sendChannelOf(orderId);
+    // プレビュー時のチャネルと不一致なら拒否 (プレビュー後に仕入先の発注方法が変わっていたら、
+    // FAXのつもりの承認でメールを送らない。expectedMode と同じ発想で必須 (Codex fax-R1 High))
+    const expectedChannel = trimS(b.expectedChannel) || null;
+    if (!expectedChannel) return res.status(400).json({ ok: false, error: '送信方法 (expectedChannel) が未指定です。画面を再読み込みしてから送信してください' });
+    if (expectedChannel !== channel) {
+      return res.status(400).json({ ok: false, error: `送信方法が変わっています (画面: ${expectedChannel} / 現在: ${channel})。プレビューを開き直して内容を確認してください` });
+    }
+    let faxPdf = null, faxHash = null;
+    if (channel === 'fax') {
+      // 冪等リプレイ (結果保存済み) は createEmailJob を呼ばないため、PDF生成もスキップ (Codex fax-R1 Medium)
+      const done = getDB().prepare('SELECT result_json FROM po_commands WHERE idempotency_key=?').get(idemKey);
+      if (!done || done.result_json == null) {
+        // PDF生成 (async) はジョブ作成txnの外。生成時点の内容ハッシュを createEmailJob が再検証し、
+        // 生成中に発注が編集されていたら拒否する (プレビューと違うPDFを送らない)
+        const p = buildOrderFax(orderId);
+        faxHash = contentHashOf(p);
+        faxPdf = await renderOrderPdf(p.pdfPayload);
+      }
+    }
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode } },
-      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req) })
+      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode, channel } },
+      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req),
+        channel, pdfBuffer: faxPdf, expectedHash: faxHash })
     );
     const outcome = await processEmailJob(jobId);
     const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
-    res.json({ ok: true, jobId, replay, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
+    res.json({ ok: true, jobId, replay, channel, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
   } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
@@ -1690,10 +1773,169 @@ router.post('/api/inbound-plan/mails/:id/convert', (req, res) => {
     if (!mail) return res.status(404).json({ ok: false, error: 'メールが見つかりません' });
     if (mail.status === 'error') return res.status(400).json({ ok: false, error: `このメールは解析エラーです: ${mail.error || ''} — 本文/添付を確認して手動貼り付けを使ってください` });
     const items = JSON.parse(mail.parsed_json || '[]');
+    if (!Array.isArray(items)) return res.status(400).json({ ok: false, error: 'このメールは発注書参照方式です (🔁 変換 (発注書参照) を使ってください)' });
     if (!items.length) return res.status(400).json({ ok: false, error: '解析済みの明細がありません' });
     const sup = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(mail.supplier_code);
     res.json({ ...convertShipmentItems(db, mail.supplier_code, (sup && sup.name) || mail.supplier_code, items), mailId: id });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ─── PO参照変換 (サロンジェ: 出荷明細が無く、こちらの発注書に対応して出荷される) ───
+// orderIds なし → PO選択候補 (残数のあるオープンPO) を返す / あり → 台帳の明細から入荷予定の行を作る。
+// 例外 (欠品/終売) は自動確定しない: 商品コード含有=強一致 (除外提案) / 商品名トークン一致=弱一致 (ハイライトのみ)
+router.post('/api/inbound-plan/mails/:id/po-convert', (req, res) => {
+  try {
+    const db = getDB();
+    const id = Number(req.params.id);
+    const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
+    if (!mail) return res.status(404).json({ ok: false, error: 'メールが見つかりません' });
+    let parsed = null;
+    try { parsed = JSON.parse(mail.parsed_json || 'null'); } catch { /* 下でエラーに */ }
+    if (!parsed || Array.isArray(parsed) || parsed.kind !== 'po_reference') {
+      return res.status(400).json({ ok: false, error: 'このメールはPO参照方式ではありません (通常の🔁変換を使ってください)' });
+    }
+    if (!['new', 'done'].includes(mail.status)) {
+      return res.status(400).json({ ok: false, error: `このメールは変換できる状態ではありません (現在: ${mail.status})` });
+    }
+    const supplier = mail.supplier_code;
+    const supRow = db.prepare('SELECT name FROM po_suppliers WHERE supplier_code=?').get(supplier);
+    const supplierName = (supRow && supRow.name) || supplier;
+    const exceptions = parsed.exceptions || [];
+    const openOrders = listBackorders().orders.filter(o => o.open && o.supplierCode === supplier);
+    const reqIds = Array.isArray((req.body || {}).orderIds) ? (req.body || {}).orderIds.map(Number) : [];
+    if (!reqIds.length) {
+      const orders = openOrders
+        .map(o => ({ id: o.id, poNumber: o.poNumber || `#${o.id}`, issuedAt: o.issuedAt, requestedDate: o.requestedDate,
+          skus: o.items.filter(i => i.remaining_qty > 0).length,
+          remaining: o.items.reduce((s, i) => s + Math.max(0, i.remaining_qty), 0) }))
+        .filter(o => o.skus > 0)
+        .sort((a, b) => String(b.issuedAt).localeCompare(String(a.issuedAt)));
+      return res.json({ ok: true, pick: true, mailId: id, supplierCode: supplier, supplierName,
+        exceptions, refDates: parsed.refDates || [], bodyText: parsed.bodyText || '', orders });
+    }
+    const chosen = [];
+    for (const oid of [...new Set(reqIds)]) {
+      const o = openOrders.find(x => x.id === oid);
+      if (!o) return res.status(400).json({ ok: false, error: `PO #${oid} はこの仕入先のオープンな発注ではありません (完了済み/別仕入先の可能性)。一覧を更新して選び直してください` });
+      chosen.push(o);
+    }
+    // 商品ID表記 (canonical=NE本来表記 優先) と PML原価 (PO単価が無い明細の補完用。出所は costSource で明示)
+    const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
+      .map(r => [r.product_key, r.product_code]));
+    const costByKey = new Map(), codeByKey = new Map();
+    for (const r of loadPml().rows) {
+      const key = normProductCode(r['商品コード']);
+      const c = r['原価'] == null || r['原価'] === '' ? null : Number(r['原価']);
+      costByKey.set(key, Number.isFinite(c) ? c : null);
+      codeByKey.set(key, String(r['商品コード']).trim());
+    }
+    // 比較用正規化: NFKC (全角英数→半角) + 小文字 + 空白除去。商品キー側と例外本文側の両方に同じ正規化 (Codex salonge-R1 Low)
+    const normJa = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[\s　]/g, '');
+    // kind=other (終売/欠品と読めない※行) はマッチ対象にしない — 挨拶等の※行が減数候補になるのを防ぐ (Codex salonge-R1 High)
+    const normEx = exceptions.filter(ex => ex.kind === 'discontinued' || ex.kind === 'shortage')
+      .map(ex => ({ ...ex, norm: normJa(ex.text) }));
+    // 「別の出荷連絡での減数」だけを警告する (このメール自身の減数は再変換で残数に反映済み、Codex salonge-R1 Medium)。
+    // 逆仕訳で取り消された減数は表示しない (誤減数を復元したのに警告が残り続けない、Codex salonge-R2 Medium)
+    const priorStmt = db.prepare(`SELECT a.mail_id, a.qty, m.received_at FROM po_shipment_mail_adjustments a
+      JOIN po_shipment_mails m ON m.id = a.mail_id
+      WHERE a.order_item_id=? AND a.mail_id<>?
+        AND NOT EXISTS (SELECT 1 FROM po_item_events r WHERE r.reverses_id = a.event_id)
+      ORDER BY a.id`);
+    const lines = [];
+    let totalRemaining = 0;
+    for (const o of chosen) {
+      for (const i of o.items) {
+        if (i.remaining_qty <= 0) continue;
+        totalRemaining += i.remaining_qty;
+        const key = i.product_key || normProductCode(i.product_code);
+        const keyNorm = normJa(key);
+        let exception = null;
+        for (const ex of normEx) {
+          if (keyNorm.length >= 4 && ex.norm.includes(keyNorm)) { exception = { level: 'strong', text: ex.text, kind: ex.kind }; break; }
+        }
+        if (!exception) {
+          const tokens = String(i.product_name || '').split(/[\s　、。()（）[\]/・×-]+/).filter(t => t.length >= 3);
+          for (const ex of normEx) {
+            if (tokens.some(t => ex.norm.includes(normJa(t)))) { exception = { level: 'weak', text: ex.text, kind: ex.kind }; break; }
+          }
+        }
+        const pmlCost = costByKey.get(key);
+        lines.push({
+          orderId: o.id, poNumber: o.poNumber || `#${o.id}`, orderItemId: i.id,
+          productCode: canonicalByKey.get(key) || codeByKey.get(key) || i.product_code,
+          caseVerified: canonicalByKey.has(key),
+          productName: i.product_name || '', remaining: i.remaining_qty,
+          cost: i.unit_cost != null ? i.unit_cost : (pmlCost != null ? pmlCost : null),
+          costSource: i.unit_cost != null ? 'po' : (pmlCost != null ? 'pml' : 'none'),
+          exception,
+          priorAdjustments: priorStmt.all(i.id, id).map(a => ({ mailId: a.mail_id, qty: a.qty, receivedAt: a.received_at })),
+        });
+      }
+    }
+    res.json({ ok: true, pick: false, mailId: id, supplierCode: supplier, supplierName,
+      exceptions, bodyText: parsed.bodyText || '', lines, totalRemaining,
+      caseUnverified: lines.filter(l => !l.caseVerified).map(l => l.productCode),
+      costMissing: lines.filter(l => l.cost == null).map(l => l.productCode) });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// PO参照メールの欠品/終売分を減数で消込む (一括・単一トランザクション・冪等。Codex salonge設計相談:
+// N回のクライアント呼び出しにせず、mail_id と紐づく監査記録を同一txnで残す)
+router.post('/api/inbound-plan/mails/:id/apply-adjustments', (req, res) => {
+  try {
+    const db = getDB();
+    const id = Number(req.params.id);
+    const mail = db.prepare('SELECT * FROM po_shipment_mails WHERE id=?').get(id);
+    if (!mail) return res.status(404).json({ ok: false, error: 'メールが見つかりません' });
+    // メール適格性: PO参照メール以外を減数の根拠にさせない (Codex salonge-R1 High)
+    let parsedAdj = null;
+    try { parsedAdj = JSON.parse(mail.parsed_json || 'null'); } catch { /* 下でエラー */ }
+    if (!parsedAdj || Array.isArray(parsedAdj) || parsedAdj.kind !== 'po_reference') {
+      return res.status(400).json({ ok: false, error: 'このメールはPO参照方式ではないため減数の根拠にできません' });
+    }
+    if (!['new', 'done'].includes(mail.status)) {
+      return res.status(400).json({ ok: false, error: `このメールは処理できる状態ではありません (現在: ${mail.status})` });
+    }
+    const entries = Array.isArray((req.body || {}).entries) ? (req.body || {}).entries : [];
+    if (!entries.length || entries.length > 200) return res.status(400).json({ ok: false, error: '減数する明細を指定してください (1〜200件)' });
+    for (const en of entries) {
+      if (!Number.isInteger(Number(en.orderItemId)) || !Number.isInteger(en.qty) || en.qty <= 0) {
+        return res.status(400).json({ ok: false, error: '明細ID/数量が不正です (数量は正の整数)' });
+      }
+    }
+    // 台帳を変える操作のため冪等キー必須 (再送での二重減数を構造的に防ぐ、Codex salonge-R1 High)
+    if (!req.get('Idempotency-Key')) return res.status(400).json({ ok: false, error: 'Idempotency-Key が必要です' });
+    const actor = actorOf(req);
+    // withCommand が全体を1トランザクションで実行: 1件でも失敗 (残数超過等) すれば全件ロールバック
+    const { replay, result } = withCommand(
+      { idempotencyKey: req.get('Idempotency-Key'), payload: { salongeAdjust: id, entries } },
+      () => {
+        const ins = db.prepare(`INSERT INTO po_shipment_mail_adjustments
+          (mail_id, order_item_id, event_id, qty, exception_text, created_at, actor) VALUES (?,?,?,?,?,?,?)`);
+        const itemSup = db.prepare(`SELECT o.supplier_code FROM po_order_items i JOIN po_orders o ON o.id = i.order_id WHERE i.id=?`);
+        const out = [];
+        for (const en of entries) {
+          // 仕入先越境ガード: このメールの仕入先の明細以外は減数させない (UI迂回の直接API呼び出し対策、Codex salonge-R1 High)
+          const supRow2 = itemSup.get(Number(en.orderItemId));
+          if (!supRow2) throw Object.assign(new Error(`明細が存在しません: ${en.orderItemId}`), { status: 400 });
+          if (supRow2.supplier_code !== mail.supplier_code) {
+            throw Object.assign(new Error(`明細 ${en.orderItemId} はこのメールの仕入先 (${mail.supplier_code}) の発注ではありません`), { status: 400 });
+          }
+          const noteBase = en.note ? String(en.note).slice(0, 200) : '';
+          const r2 = appendPoItemEvent({
+            orderItemId: Number(en.orderItemId), eventType: 'shortage', qty: en.qty,
+            reasonCode: 'supplier_shortage',
+            note: `出荷連絡メール#${id}による減数${noteBase ? `: ${noteBase}` : ''}`, actor,
+          });
+          ins.run(id, Number(en.orderItemId), r2.eventId, en.qty, noteBase || null, nowIso(), actor);
+          out.push({ orderItemId: Number(en.orderItemId), eventId: r2.eventId, remaining: r2.remaining, orderClosed: r2.orderClosed });
+        }
+        audit(db, { actor, action: 'shipment_mail_adjustments', resource: `shipment_mail:${id}`,
+          detail: { entries: out.length, totalQty: entries.reduce((s, e2) => s + e2.qty, 0) } });
+        return out;
+      });
+    res.json({ ok: true, replay, results: result });
+  } catch (e) { res.status(e.status || 400).json({ ok: false, error: e.message }); }
 });
 
 router.post('/api/inbound-plan/mails/:id/status', (req, res) => {
@@ -1933,12 +2175,15 @@ const MASTER_DEFS = {
       email_cc: parseAddresses(b.email_cc || '').join(',') || null,
       contact_name: trimS(b.contact_name) || null,
       send_method: trimS(b.send_method) || null,
+      fax_number: trimS(b.fax_number) || null, // 入力表記のまま保存 (正規化・検証は validate / 送信時)
       lead_days: numOrNull(b.lead_days),
     }),
     validate: r => {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
       if (r.send_method && !['email', 'fax', 'web', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/none';
+      if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
+      if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
       if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
       return null;
     },
@@ -2082,7 +2327,46 @@ router.get('/api/masters/:kind', (req, res) => {
   try {
     let rows = getDB().prepare(`SELECT * FROM ${def.table} ORDER BY ${def.pk}`).all();
     // 人間が読める名前を付与 (商品コード/IDだけでは探せない、ユーザビリティ)
-    if (req.params.kind === 'attrs' || req.params.kind === 'selectable') {
+    if (req.params.kind === 'attrs') {
+      // 全商品を既定表示 (中原さん要望 2026-07-16): PMLの取扱中×非セット商品を全部返し、未紐付けは
+      // attrs空欄の行として出す — 一覧から直接グループを入れて保存すればそのまま紐づけできる。
+      // 「追加」行への手打ちや未紐付けタブ (閲覧専用) を経由しなくてよい
+      const supName = new Map();
+      for (const s of getDB().prepare('SELECT supplier_code, name FROM po_suppliers').all()) supName.set(s.supplier_code, s.name);
+      const byKey = new Map(rows.map(r => [r.product_key, r]));
+      // PMLに同一正規化コードが複数行あるケースは「取扱中を優先」で1行に集約する
+      // (行順依存で取扱中止が勝つと未紐付け商品が消える、Codex attrs-R1)
+      const pmlByKey = new Map();
+      for (const r of loadPml().rows) {
+        if (String(r['商品区分'] || '') === 'セット') continue; // セット商品は発注計算の対象外 (#519)
+        const key = normProductCode(r['商品コード']);
+        const active = String(r['取扱区分'] || '') === '取扱中';
+        const cur = pmlByKey.get(key);
+        if (!cur || (active && !cur.active)) pmlByKey.set(key, { r, active });
+      }
+      const out = [];
+      for (const [key, { r, active }] of pmlByKey) {
+        const a = byKey.get(key);
+        if (!a && !active) continue; // 未紐付け×取扱中止はノイズなので出さない (紐付け済みなら残す)
+        out.push({
+          product_key: key, product_code: a ? a.product_code : String(r['商品コード']).trim(),
+          condition_id: a ? a.condition_id : null, material_group_id: a ? a.material_group_id : null,
+          capacity_per_unit: a ? a.capacity_per_unit : null, case_group: a ? a.case_group : null,
+          case_lot: a ? a.case_lot : null,
+          商品名: r['商品名'] || '', 仕入先名: supName.get(normSupplierCode(r['仕入先'])) || '',
+          linked: !!a, active,
+        });
+      }
+      // attrsにあるがPMLに無い商品 (コード改廃等) も消さずに出す
+      for (const a of rows) {
+        if (pmlByKey.has(a.product_key)) continue;
+        out.push({ ...a, 商品名: '', 仕入先名: '', linked: true, active: false, pmlMissing: true });
+      }
+      // 商品コード順 (ロケール非依存のバイナリ順、Codex attrs-R1 Low)
+      out.sort((x, y) => (x.product_key < y.product_key ? -1 : x.product_key > y.product_key ? 1 : 0));
+      return res.json({ ok: true, rows: out });
+    }
+    if (req.params.kind === 'selectable') {
       const nameByKey = new Map();
       for (const r of loadPml().rows) nameByKey.set(normProductCode(r['商品コード']), r['商品名'] || '');
       rows = rows.map(r => ({ ...r, 商品名: nameByKey.get(r.product_key) || '' }));
@@ -2102,6 +2386,14 @@ router.post('/api/masters/:kind', (req, res) => {
     const row = def.fromBody(req.body || {});
     const err = def.validate(row);
     if (err) return res.status(400).json({ ok: false, error: err });
+    // 商品紐付け: 未紐付け商品の「全部空欄のまま保存」で空のattrs行 (=紐付け済み扱い) を作らせない
+    // (全商品既定表示で未紐付け行も保存ボタンを持つため。既存行の全空更新は従来どおり許容、Codex attrs-R1 High)
+    if (req.params.kind === 'attrs'
+      && row.condition_id == null && row.material_group_id == null && row.capacity_per_unit == null
+      && row.case_group == null && row.case_lot == null
+      && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
+      return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
+    }
     upsertMasterRow(def, row);
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -2472,10 +2764,12 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
 // - 同一商品がロケ別に複数行 → 商品IDごとに合算。品質区分列があれば「良品」のみ在庫に数える
 // - 商品IDはロジザード登録表記そのもの → canonical (貼り付け用の大小表記) をここからも蓄積
 // - 仕組みはNEオーバーレイを再利用 (在庫数以外のカラムはNULL=マージでPML値に自動フォールバック)
-router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
-  let buf;
-  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+// ロジザード在庫CSV取込の本体。手動アップロード経路と Drive 直接取得経路で共用する
+// (取込ルール・プレビュー二段確認・在庫0上書きの判定を一本化するため、経路ごとに分岐させない)。
+//   buf      … CSV本体
+//   filename … 取込履歴に残すファイル名
+//   extra    … レスポンスに添える経路固有の情報 (Drive経路の更新日時など)
+function importLogizardStockCsv(req, res, { buf, filename, extra = {} }) {
   try {
     const rows = parseCsvBuffer(buf);
     if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
@@ -2531,7 +2825,7 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
     })).digest('hex');
     const summary = { products: agg.size, matched, zeroFill: zeroFill.length, dataRows, skippedNonGood, skippedBlank, fileHash, planHash };
     if (String((req.body || {}).commit) !== '1') {
-      return res.json({ ok: true, preview: true, ...summary });
+      return res.json({ ok: true, preview: true, ...summary, ...extra });
     }
     if (trimS((req.body || {}).fileHash) !== fileHash) {
       return res.status(409).json({ ok: false, error: 'プレビューしたファイルと内容が異なります。もう一度プレビューからやり直してください' });
@@ -2554,14 +2848,57 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
       for (const p of zeroFill) ins.run(p.key, p.code, 0, null);
       db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'logizard')
                   ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
-        .run(now, agg.size + zeroFill.length, req.file.originalname || null);
+        .run(now, agg.size + zeroFill.length, filename || null);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'logizard_stock_import', resource: 'ne_overlay',
-        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood } });
+        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood, ...extra } });
       // サイクルリセットも同一txn (在庫だけ更新されてバッジが残る片肺を防ぐ、Codex LZ-R1 Medium)
       bumpCycleReset(actorOf(req), 'ロジザード在庫CSV取込で発注サイクル更新', now);
     })();
-    res.json({ ok: true, ...summary, uploadedAt: now });
+    res.json({ ok: true, ...summary, ...extra, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+}
+
+router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+  importLogizardStockCsv(req, res, { buf, filename: req.file.originalname });
+});
+
+// ── Google Drive 直接取込 (2026-07-20 中原さん指示) ──
+// run-zaiko.bat がロジザードから落とした logizard_zaikosu.csv を Drive の固定フォルダに置く運用。
+// 手元にDLして選び直す手間を省くため、Render サーバが Drive API で直接取得して同じ取込経路へ流す。
+// 更新日時を返すので「最新のCSVを取り込んだか」を画面で確認できる。
+const LZ_DRIVE_SOURCE = {
+  label: 'ロジザード在庫CSV',
+  folderId: process.env.PO_DRIVE_FOLDER_LOGIZARD_STOCK || '1UT6l9G_vRD1PnXN6P4E1FXbxC0PkFPF0',
+  filename: process.env.PO_DRIVE_FILE_LOGIZARD_STOCK || 'logizard_zaikosu.csv',
+  notFoundHint: '会社PCの run-zaiko.bat で在庫CSVを出力済みか確認してください。',
+};
+
+// 更新日時表示用 (60秒キャッシュ)。失敗しても画面全体を落とさないよう ok:false で返す
+router.get('/api/logizard-stock/drive-info', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await getDriveCsvInfo(LZ_DRIVE_SOURCE)) });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Drive からDLして通常の取込と同じ経路へ (プレビュー→確認の二段もそのまま効く)。
+// プレビューと取込の間にCSVが差し替わった場合は fileHash 不一致で409になり、やり直しを促す
+router.post('/api/logizard-stock/drive', async (req, res) => {
+  let dl;
+  try {
+    dl = await downloadDriveCsv(LZ_DRIVE_SOURCE);
+  } catch (e) {
+    return res.status(e.code === 'VALIDATION' ? 400 : 502).json({ ok: false, error: e.message });
+  }
+  importLogizardStockCsv(req, res, {
+    buf: dl.buffer,
+    filename: dl.filename,
+    extra: { drive_file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst, size_kb: dl.size != null ? Math.round(dl.size / 1024) : null } },
+  });
 });
 
 router.delete('/api/ne-overlay', (req, res) => {
@@ -2866,6 +3203,7 @@ function pageShell(title, active, body, script) {
   <nav class="tabs">
     ${tab('/apps/purchase-orders', 'ダッシュボード', 'dash')}
     ${tab('/apps/purchase-orders/backorders', '発注残', 'backorders')}
+    ${tab('/apps/purchase-orders/shortage-risk', '⚠️欠品リスク', 'shortage-risk')}
     ${tab('/apps/purchase-orders/inbound-plan', '入荷予定', 'inbound-plan')}
     ${tab('/apps/purchase-orders/inbound', '入庫消込', 'inbound')}
     ${tab('/apps/purchase-orders/products', '全商品情報', 'products')}
@@ -3067,10 +3405,16 @@ router.get('/', (req, res) => {
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">📥 NE最新CSVを取込</button>
       </form>
-      <form id="lzForm" style="display:flex;gap:6px;align-items:center" title="ロジザードのロケ別在庫一覧CSV (CZ04003)。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)。商品IDの表記も蓄積されるのでロジザード貼り付けの表記が揃う">
-        <input type="file" name="file" accept=".csv" required>
-        <button type="submit">📥 ロジザード在庫CSVを取込</button>
-      </form>
+      <span style="display:flex;gap:6px;align-items:center" title="Gドライブの logizard_zaikosu.csv (run-zaiko.bat が出力) をサーバが直接取得して取り込む。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)">
+        <button id="btnLzDrive">📥 ロジザード在庫CSVを取込</button>
+        <span id="lzDriveInfo" class="muted">更新日時を確認中...</span>
+      </span>
+      <details style="margin-left:4px"><summary class="muted" style="cursor:pointer">ファイルを選んで取込</summary>
+        <form id="lzForm" style="display:flex;gap:6px;align-items:center;margin-top:6px" title="ロジザードのロケ別在庫一覧CSV (CZ04003) を手元から選んでアップロードする経路 (Drive取得が使えないとき用)">
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">📥 選んだCSVを取込</button>
+        </form>
+      </details>
       ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
       <span id="opStatus" class="muted"></span>
     </div>
@@ -3254,37 +3598,74 @@ document.getElementById('neForm').addEventListener('submit', function(ev) {
 // ロジザード在庫CSV (在庫数のみ上書き。商品ID表記の蓄積も兼ねる)。
 // プレビュー→確認→取込の二段: CSVに無い取扱中商品は「売り切れ=在庫0」で上書きするため、
 // 絞り込んだCSVの誤取込 (大量の在庫0化) を件数確認で止める
-document.getElementById('lzForm').addEventListener('submit', function(ev) {
-  ev.preventDefault();
-  var form = ev.target;
+// 取込元 (Gドライブ / ファイル選択) が違うだけで、確認〜取込の流れは共通。
+// send(extra) が fetch の Promise を返す。extra は commit 時に {commit,fileHash,planHash} が入る
+function lzImport(send) {
   setStatus('ロジザード在庫CSVを確認中...');
-  fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: new FormData(form) })
+  send({})
     .then(function(r){ return r.json(); })
     .then(function(j) {
       if (!j.ok) { setStatus(''); alert('取込エラー: ' + impErr(j.error) + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
       setStatus('');
-      if (!confirm('ロジザード在庫CSVを取り込みます:\\n' +
+      var d = j.drive_file;
+      var srcNote = d ? ('取込元: ' + d.filename + ' (Gドライブ)\\n更新日時: ' + (d.modified_time_jst || '不明') +
+        (d.size_kb != null ? ' / ' + d.size_kb.toLocaleString('ja-JP') + ' KB' : '') + '\\n\\n') : '';
+      if (!confirm(srcNote + 'ロジザード在庫CSVを取り込みます:\\n' +
         '・在庫を更新: ' + j.matched + '商品\\n' +
         '・CSVに行なし → 売り切れ扱いで在庫0: ' + j.zeroFill + '商品\\n' +
         (j.skippedNonGood ? '・良品以外の行を除外: ' + j.skippedNonGood + '行\\n' : '') +
         '\\n※在庫0の件数が想定より多い場合、絞り込んだCSVの可能性があります (全ロケ・全商品でエクスポートしてください)。よろしいですか?')) return;
       confirmCycleReset(function() {
         setStatus('取込中...');
-        var fd2 = new FormData(form);
-        fd2.append('commit', '1');
-        fd2.append('fileHash', j.fileHash);
-        fd2.append('planHash', j.planHash);
-        fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd2 })
+        send({ commit: '1', fileHash: j.fileHash, planHash: j.planHash })
           .then(function(r){ return r.json(); })
           .then(function(j2) {
             if (!j2.ok) { setStatus(''); alert('取込エラー: ' + impErr(j2.error)); return; }
-            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品)。再読み込みします...');
+            var d2 = j2.drive_file;
+            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品' +
+              (d2 && d2.modified_time_jst ? ' / CSV更新日時 ' + d2.modified_time_jst : '') + ')。再読み込みします...');
             location.reload();
           })
           .catch(function(e){ setStatus('通信エラー: ' + e.message); });
       });
     })
     .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+}
+
+// Gドライブから直接取込 (通常はこちら。run-zaiko.bat が置いた logizard_zaikosu.csv を読む)
+document.getElementById('btnLzDrive').addEventListener('click', function() {
+  lzImport(function(extra) {
+    return fetch('/apps/purchase-orders/api/logizard-stock/drive', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(extra),
+    });
+  });
+});
+
+// Gドライブ上のCSVの更新日時を表示 (最新かどうかを取込前に判断できるように)
+(function() {
+  var el = document.getElementById('lzDriveInfo');
+  if (!el) return;
+  fetch('/apps/purchase-orders/api/logizard-stock/drive-info')
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { el.textContent = '⚠️ Gドライブ確認不可: ' + j.error; el.title = j.error; return; }
+      var jst = j.modified_time_jst || '不明';
+      var today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      var isToday = jst.slice(0, 10) === today;
+      el.textContent = (isToday ? '🟢 ' : '⚠️ ') + 'CSV更新 ' + jst + (isToday ? '' : ' (今日のものではありません)');
+      el.title = j.filename + (j.size != null ? ' / ' + Math.round(j.size / 1024).toLocaleString('ja-JP') + ' KB' : '');
+    })
+    .catch(function(e){ el.textContent = '⚠️ Gドライブ確認不可: ' + e.message; });
+})();
+
+document.getElementById('lzForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var form = ev.target;
+  lzImport(function(extra) {
+    var fd = new FormData(form);
+    Object.keys(extra).forEach(function(k){ fd.append(k, extra[k]); });
+    return fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd });
+  });
 });
 var btnNeClear = document.getElementById('btnNeClear');
 if (btnNeClear) btnNeClear.addEventListener('click', function() {
@@ -4957,15 +5338,16 @@ load();`;
 // ─── 画面: 入荷予定 (出荷明細メール→ロジザード入荷予定の作成。入庫消込ページから独立) ───
 router.get('/inbound-plan', (req, res) => {
   const body = `
-    <h2 class="page">入荷予定 <span class="muted" style="font-size:12px">アメージングクラフト/ビーフリーの出荷明細 → ロジザード「入荷予定登録 (Excel貼り付け)」用データ</span></h2>
+    <h2 class="page">入荷予定 <span class="muted" style="font-size:12px">仕入先の出荷連絡 → ロジザード「入荷予定登録 (Excel貼り付け)」用データ</span></h2>
     <div class="import-zone">
       <div class="hint">
-        「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) の出荷明細を自動で取り込んで変換できます。
+        「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) / サロンジェ (@salonge.co.jp、<b>発注書参照</b>) の出荷連絡を自動で取り込んで変換できます。
         結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
-        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。
+        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。<br>
+        <b>サロンジェ</b>は出荷明細が無い代わりにこちらの発注書どおり出荷されます — 変換で該当POを選ぶと台帳の明細から入荷予定を作り、本文の「※…終売/在庫無し」は除外候補と➖減数の提案になります。
       </div>
       <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
-        <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー)</button>
+        <button class="pri" id="ipFetch">📬 メールから取得 (AMC/ビーフリー/サロンジェ)</button>
         <button id="ipReparseAll" style="display:none">🔄 解析エラーを再解析</button>
         <button id="ipLogizard" title="ロジザードの入荷予定登録 (Excel貼り付け) を新しいタブで開きます">🚚 ロジザード入荷予定を開く</button>
         <span id="ipFetchStat" class="muted"></span>
@@ -5029,16 +5411,24 @@ function renderIpMails(j) {
   } else {
     h = '<table class="t"><tr><th>受信 <span class="muted" style="font-weight:400">(日本時間)</span></th><th>仕入先</th><th>件名</th><th class="r">明細</th><th></th></tr>';
     open.forEach(function(m) {
-      var items = [];
-      try { items = JSON.parse(m.parsed_json || '[]'); } catch (e) {}
+      var items = [], poRef = null;
+      try {
+        var pj = JSON.parse(m.parsed_json || '[]');
+        if (Array.isArray(pj)) items = pj;
+        else if (pj && pj.kind === 'po_reference') poRef = pj; // サロンジェ等: 明細なし=発注書参照
+      } catch (e) {}
       // 明細0行 (取込データが不完全) の行にも再解析を出す — Gmailから取り直して直せる
-      var needsReparse = m.status === 'error' || items.length === 0;
+      var needsReparse = m.status === 'error' || (!poRef && items.length === 0);
+      var detailCell = m.status === 'error' ? '<span class="badge b-warn">⚠️ 解析エラー</span>'
+        : poRef ? '発注書参照' + ((poRef.exceptions || []).length ? ' <span class="badge b-warn">⚠️例外' + poRef.exceptions.length + '件</span>' : '')
+        : items.length + '行';
       h += '<tr><td class="muted" style="white-space:nowrap">' + esc(jstStamp(m.received_at)) + '</td>' +
         '<td>' + esc(m.supplier_code) + '</td><td>' + esc(m.subject || '') + (m.parse_note ? ' <span class="muted">📎' + esc(m.parse_note) + '</span>' : '') +
         (m.status === 'error' ? '<div class="muted" style="color:#b45309;font-size:11px;max-width:520px">⚠ ' + esc(m.error || '') + '</div>' : '') + '</td>' +
-        '<td class="r">' + (m.status === 'error' ? '<span class="badge b-warn">⚠️ 解析エラー</span>' : items.length + '行') + '</td>' +
+        '<td class="r">' + detailCell + '</td>' +
         '<td style="white-space:nowrap">' +
-          (m.status !== 'error' && items.length > 0 ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '') +
+          (poRef ? '<button class="pri sm" data-ippoconv="' + m.id + '">🔁 変換 (発注書参照)</button> ' : '') +
+          (!poRef && m.status !== 'error' && items.length > 0 ? '<button class="pri sm" data-ipmconv="' + m.id + '">🔁 変換</button> ' : '') +
           (needsReparse ? '<button class="sm" data-ipmrep="' + m.id + '">🔄 再解析</button> ' : '') +
           '<button class="ghost" data-ipmdone="' + m.id + '" title="ロジザードへの貼り付けが済んだら">✅ 登録済み</button>' +
           '<button class="ghost" data-ipmign="' + m.id + '">🚫 無視</button></td></tr>';
@@ -5107,6 +5497,17 @@ document.addEventListener('click', function(ev) {
   if ((v2 = g2('data-ipmconv'))) {
     t2.disabled = true;
     runIpConvert({ mailId: v2 }, function(){ t2.disabled = false; });
+    return;
+  }
+  if ((v2 = g2('data-ippoconv'))) {
+    // PO参照変換 (サロンジェ): まずPO選択候補を取得
+    t2.disabled = true;
+    post(API + '/inbound-plan/mails/' + v2 + '/po-convert', {}).then(function(j) {
+      t2.disabled = false;
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      renderPoPick(j);
+      document.getElementById('ipResult').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }).catch(function(e){ t2.disabled = false; toast('通信エラー: ' + e.message); });
     return;
   }
   // 入数 (単位換算) の保存 → 対応表に反映して同じ変換をやり直す (コピー内容にも反映される)
@@ -5273,7 +5674,223 @@ document.getElementById('ipConvert').addEventListener('click', function() {
   var btn = this; btn.disabled = true;
   runIpConvert({ supplier: document.getElementById('ipSup').value, text: document.getElementById('ipText').value },
     function(){ btn.disabled = false; });
-});`;
+});
+
+// ── PO参照変換 (サロンジェ): PO選択 → 台帳明細から入荷予定 → 除外/数量編集 → 📋コピー + ➖減数 ──
+var IP_PO = null;          // 直近のPO参照変換結果
+var IP_PO_ORDERIDS = null; // 選択したPO (減数後の再変換用)
+function newIdemKey() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'k' + Date.now() + '-' + Math.random().toString(36).slice(2); }
+function mdOf(s) {
+  // 'YYYY-MM-DD…' → 'M/D' (本文の日付ハイライト用)
+  s = String(s || '');
+  if (s.length < 10) return '';
+  var mo = Number(s.slice(5, 7)), da = Number(s.slice(8, 10));
+  return mo && da ? mo + '/' + da : '';
+}
+function exBadge(ex) {
+  if (!ex) return '';
+  var kindTxt = ex.kind === 'discontinued' ? '終売' : ex.kind === 'shortage' ? '欠品' : '例外';
+  return ex.level === 'strong'
+    ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c" title="' + esc(ex.text) + '">❗' + kindTxt + '該当?</span>'
+    : ' <span class="badge b-warn" title="' + esc(ex.text) + '">⚠️' + kindTxt + 'かも</span>';
+}
+function bodyTextDetails(bodyText) {
+  return bodyText ? '<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">📄 メール原文を表示 (解析の元テキスト)</summary>' +
+    '<pre style="white-space:pre-wrap;font-size:11px;background:#f8fafc;padding:8px;border-radius:8px;max-height:240px;overflow:auto">' + esc(bodyText) + '</pre></details>' : '';
+}
+function renderPoPick(j) {
+  var area = document.getElementById('ipResult');
+  var h = '<div class="sec" style="padding:10px 12px"><b>📦 ' + esc(j.supplierName) + ' — 出荷連絡に対応する発注書を選択</b>' +
+    ' <span class="muted" style="font-size:12px">(複数の依頼分をまとめて出荷された場合は複数選択)</span>';
+  if ((j.refDates || []).length) h += '<div class="muted" style="font-size:12px;margin-top:4px">本文の日付: <b>' + j.refDates.map(esc).join('、') + '</b> — 該当しそうな発注をハイライトしています</div>';
+  if ((j.exceptions || []).length) {
+    h += '<div class="warn" style="margin:6px 0">⚠️ 欠品/終売などの連絡 ' + j.exceptions.length + '件:<br>' +
+      j.exceptions.map(function(e2){ return '・' + esc(e2.text); }).join('<br>') + '</div>';
+  }
+  if (!(j.orders || []).length) {
+    h += '<div class="warn" style="margin-top:6px">残数のあるオープンな発注がありません (消込済み/取込前の可能性)。発注残ページを確認してください</div>' + bodyTextDetails(j.bodyText) + '</div>';
+    area.innerHTML = h;
+    return;
+  }
+  h += '<table class="t" style="margin-top:6px"><tr><th></th><th>発注日</th><th>発注書番号</th><th>希望納期</th><th class="r">SKU</th><th class="r">残数</th></tr>';
+  j.orders.forEach(function(o) {
+    var hit = (j.refDates || []).indexOf(mdOf(jstStamp(o.issuedAt))) >= 0 || (j.refDates || []).indexOf(mdOf(o.requestedDate)) >= 0;
+    h += '<tr' + (hit ? ' style="background:#fefce8"' : '') + '><td><input type="checkbox" class="ipPoSel" value="' + o.id + '"' + (hit ? ' checked' : '') + ' style="transform:scale(1.2)"></td>' +
+      '<td>' + esc(jstStamp(o.issuedAt).slice(0, 10)) + (hit ? ' ⭐' : '') + '</td><td>' + esc(o.poNumber) + '</td>' +
+      '<td class="muted">' + esc(o.requestedDate || '—') + '</td>' +
+      '<td class="r">' + o.skus + '</td><td class="r">' + o.remaining.toLocaleString('ja-JP') + '</td></tr>';
+  });
+  h += '</table><div style="margin-top:8px"><button class="pri" id="ipPoGo">🔁 選択した発注書で変換</button></div>' + bodyTextDetails(j.bodyText) + '</div>';
+  area.innerHTML = h;
+  document.getElementById('ipPoGo').addEventListener('click', function() {
+    var ids = [];
+    document.querySelectorAll('.ipPoSel').forEach(function(cb){ if (cb.checked) ids.push(Number(cb.value)); });
+    if (!ids.length) { toast('発注書を選択してください'); return; }
+    var btn = this; btn.disabled = true;
+    post(API + '/inbound-plan/mails/' + j.mailId + '/po-convert', { orderIds: ids }).then(function(r2) {
+      btn.disabled = false;
+      if (!r2.ok) { toast('エラー: ' + r2.error); return; }
+      IP_PO_ORDERIDS = ids;
+      renderPoResult(r2);
+    }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+  });
+}
+function costSrcLabel(l) {
+  if (l.costSource === 'po') return '';
+  if (l.costSource === 'pml') return ' <span class="badge b-warn" title="発注時単価が無いためPML原価で補完 (発注後に原価が変わっていないか注意)">PML補完</span>';
+  return ' <span class="badge b-warn">単価なし</span>';
+}
+function renderPoResult(j) {
+  IP_PO = j;
+  var area = document.getElementById('ipResult');
+  var h = '<div class="sec" style="padding:10px 12px"><b>✅ 発注書参照の変換: ' + esc(j.supplierName) + '</b>' +
+    ' <span class="muted" style="font-size:12px">台帳の残数明細から入荷予定を作ります。欠品/終売の行は ☑ を外すと貼り付けから除外され、下の➖減数の提案に載ります</span>';
+  if ((j.exceptions || []).length) {
+    h += '<div class="warn" style="margin:6px 0">⚠️ 欠品/終売などの連絡:<br>' + j.exceptions.map(function(e2){ return '・' + esc(e2.text); }).join('<br>') +
+      '<div class="muted" style="font-size:11px">❗=商品コード一致 (除外を提案・☑を外してあります) / ⚠️=商品名が似ている (確認してください)。自動では確定しません</div></div>';
+  }
+  h += '<table class="t" style="margin-top:6px"><tr><th>貼付</th><th>発注書</th><th>商品</th><th class="r">残数</th><th class="r">入荷予定数 (編集可)</th><th class="r">仕入単価</th><th>備考</th></tr>';
+  j.lines.forEach(function(l, i) {
+    var checked = !(l.exception && l.exception.level === 'strong'); // 強一致のみ既定で除外提案 (人間が確定)
+    var prior = (l.priorAdjustments || []).length
+      ? '<div class="muted" style="font-size:11px;color:#b45309">⚠️ 別の出荷連絡 (メール#' + l.priorAdjustments.map(function(a){ return a.mailId; }).join(',#') + ') で減数済み ' +
+        l.priorAdjustments.reduce(function(s, a){ return s + a.qty; }, 0) + '個 — 二重減数に注意</div>' : '';
+    h += '<tr data-plrow="' + i + '"' + (l.exception ? ' style="background:#fff7e6"' : '') + '>' +
+      '<td><input type="checkbox" class="plInc" data-pli="' + i + '"' + (checked ? ' checked' : '') + ' style="transform:scale(1.2)"></td>' +
+      '<td class="muted">' + esc(l.poNumber) + '</td>' +
+      '<td><b>' + esc(l.productCode) + '</b><div class="muted" style="font-size:11px">' + esc(String(l.productName || '').slice(0, 40)) + '</div>' + exBadge(l.exception) + prior + '</td>' +
+      '<td class="r">' + l.remaining.toLocaleString('ja-JP') + '</td>' +
+      '<td class="r"><input type="number" class="plQty" data-pli="' + i + '" min="1" max="' + l.remaining + '" step="1" value="' + l.remaining + '" style="width:80px" title="部分出荷 (在庫不足) の場合は実際に出荷される数に減らす"></td>' +
+      '<td class="r">' + (l.cost == null ? '—' : yen(l.cost)) + costSrcLabel(l) + '</td>' +
+      '<td class="muted" style="font-size:11px">' + (l.exception ? esc(l.exception.text) : '') + '</td></tr>';
+  });
+  h += '</table>';
+  h += '<div id="plSummary" class="muted" style="margin-top:6px"></div>';
+  h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
+    '<button class="pri" id="plCopy">📋 貼り付けデータをコピー (商品ID/入荷予定数/仕入単価)</button>' +
+    '<button id="ipLogizard3">🚚 ロジザード入荷予定を開く</button>' +
+    '<button id="plShort" title="☑を外した行 (欠品/終売) と数量を減らした差分を、仕入先都合の減数として注残から消します (分納なしの仕入先向け)">➖ 出荷されない分を減数する (注残を消す)</button>' +
+    '</div><div id="plShortArea" style="margin-top:6px"></div>';
+  if ((j.caseUnverified || []).length) {
+    h += '<div class="warn" style="margin-top:6px">⚠️ ' + j.caseUnverified.length + '行はNE本来の大文字/小文字表記が未確認 (暫定表記で出力。ダッシュボードの「📥 NE最新CSVを取込」で揃います): ' + esc(j.caseUnverified.slice(0, 10).join(', ')) + '</div>';
+  }
+  if ((j.costMissing || []).length) h += '<div class="warn" style="margin-top:6px">⚠️ 単価不明 (空欄で出力): ' + esc(j.costMissing.join(', ')) + '</div>';
+  h += bodyTextDetails(j.bodyText) + '</div>';
+  area.innerHTML = h;
+
+  function readRows() {
+    var rows = [];
+    j.lines.forEach(function(l, i) {
+      var inc = document.querySelector('.plInc[data-pli="' + i + '"]');
+      var qi = document.querySelector('.plQty[data-pli="' + i + '"]');
+      var qty = qi ? Number(qi.value) : l.remaining;
+      rows.push({ l: l, included: !!(inc && inc.checked), qty: qty });
+    });
+    return rows;
+  }
+  function updateSummary() {
+    var rows = readRows();
+    var inc = rows.filter(function(r2){ return r2.included; });
+    var bad = inc.filter(function(r2){ return !Number.isInteger(r2.qty) || r2.qty <= 0 || r2.qty > r2.l.remaining; });
+    var total = inc.reduce(function(s, r2){ return s + (Number.isInteger(r2.qty) && r2.qty > 0 ? r2.qty : 0); }, 0);
+    document.getElementById('plSummary').innerHTML = '貼り付け対象 <b>' + inc.length + '行 / 合計 ' + total.toLocaleString('ja-JP') + '個</b>' +
+      ' (残数計 ' + j.totalRemaining.toLocaleString('ja-JP') + ')' +
+      (bad.length ? ' <span style="color:#b91c1c">⚠️ 数量が不正な行 ' + bad.length + ' (1〜残数の整数)</span>' : '') +
+      ' <span class="muted">— ロジザード側の「入荷予定数合計」と一致するか確認</span>';
+    return { rows: rows, inc: inc, bad: bad };
+  }
+  // リスナーは innerHTML で毎回作り直される先頭要素に付ける (永続の #ipResult に付けると再変換のたびに
+  // 古い j を閉じ込めたリスナーが累積する、Codex salonge-R1 Medium)。checkbox も input イベントを発火する
+  area.firstElementChild.addEventListener('input', function(ev2) {
+    if (ev2.target.classList && (ev2.target.classList.contains('plQty') || ev2.target.classList.contains('plInc'))) updateSummary();
+  });
+  updateSummary();
+
+  document.getElementById('ipLogizard3').addEventListener('click', function(){ window.open(LOGIZARD_URL, '_blank', 'noopener'); });
+  document.getElementById('plCopy').addEventListener('click', function() {
+    var st = updateSummary();
+    if (!st.inc.length) { toast('貼り付ける行がありません (☑を確認してください)'); return; }
+    if (st.bad.length) { toast('数量が不正な行があります (1〜残数の整数で入力してください)'); return; }
+    var tsv = st.inc.map(function(r2){ return r2.l.productCode + '\\t' + r2.qty + '\\t' + (r2.l.cost == null ? '' : r2.l.cost); }).join('\\n');
+    navigator.clipboard.writeText(tsv).then(function() {
+      toast('コピーしました (' + st.inc.length + '行) — ロジザードの「入荷予定登録(Excel貼り付け)」へ。済んだらメール一覧の ✅登録済み');
+    });
+  });
+  // ➖ 減数フロー: 現在のDOM状態から提案を組み立て → チェックで確定対象を選ぶ → confirm → 一括API
+  document.getElementById('plShort').addEventListener('click', function() {
+    var st = updateSummary();
+    if (st.bad.length) { toast('先に数量の不正な行を直してください'); return; }
+    var props = [];
+    st.rows.forEach(function(r2, i) {
+      var shortQty = r2.included ? r2.l.remaining - r2.qty : r2.l.remaining;
+      if (shortQty <= 0) return;
+      props.push({ i: i, l: r2.l, qty: shortQty,
+        note: r2.l.exception ? r2.l.exception.text : (r2.included ? '部分出荷 (在庫不足分)' : '出荷対象外') });
+    });
+    var sa = document.getElementById('plShortArea');
+    if (!props.length) { sa.innerHTML = ''; toast('減数する対象がありません (☑を外した行、または数量を減らした行が対象です)'); return; }
+    var h2 = '<div class="import-zone"><b>➖ 減数の確認</b> <span class="muted" style="font-size:12px">仕入先都合 (欠品/終売) の減数として台帳の注残から消します。間違えたら発注残ページの履歴から↩逆仕訳できます</span>' +
+      '<table class="t" style="margin-top:4px"><tr><th></th><th>発注書</th><th>商品</th><th class="r">減数</th><th>理由 (メールの記載)</th></tr>' +
+      props.map(function(p2, k) {
+        var prior = (p2.l.priorAdjustments || []).length ? ' <span style="color:#b45309" title="別メールで減数済みあり">⚠️</span>' : '';
+        return '<tr><td><input type="checkbox" class="plShortSel" data-plk="' + k + '" checked style="transform:scale(1.2)"></td>' +
+          '<td class="muted">' + esc(p2.l.poNumber) + '</td><td><b>' + esc(p2.l.productCode) + '</b>' + prior + '</td>' +
+          '<td class="r"><b>' + p2.qty.toLocaleString('ja-JP') + '</b> / 残' + p2.l.remaining.toLocaleString('ja-JP') + '</td>' +
+          '<td class="muted" style="font-size:11px">' + esc(p2.note) + '</td></tr>';
+      }).join('') + '</table>' +
+      '<div style="margin-top:6px"><button class="pri" id="plShortGo">➖ チェックした分を減数して注残を消す</button> <button class="ghost" id="plShortClose">閉じる</button></div></div>';
+    sa.innerHTML = h2;
+    document.getElementById('plShortClose').addEventListener('click', function(){ sa.innerHTML = ''; });
+    var idemKey = newIdemKey(); // 提案の組み立て時点で固定 (通信エラー後の再クリックはreplayで二重減数なし)
+    document.getElementById('plShortGo').addEventListener('click', function() {
+      var sel = [];
+      document.querySelectorAll('.plShortSel').forEach(function(cb){ if (cb.checked) sel.push(props[Number(cb.getAttribute('data-plk'))]); });
+      if (!sel.length) { toast('減数する行にチェックを入れてください'); return; }
+      var totalQ = sel.reduce(function(s, p2){ return s + p2.qty; }, 0);
+      if (!confirm('以下の ' + sel.length + '明細 / 計 ' + totalQ.toLocaleString('ja-JP') + '個 を「仕入先都合の減数」として注残から消します。\\n\\n' +
+        sel.map(function(p2){ return '・' + p2.l.poNumber + ' ' + p2.l.productCode + ' −' + p2.qty; }).join('\\n') +
+        '\\n\\nよろしいですか? (間違えたら発注残の履歴から↩逆仕訳できます)')) return;
+      var btn2 = this; btn2.disabled = true;
+      // 実行本体 (通信断からの再確認でも同じ関数を同じ冪等キーで呼ぶ → 二重減数なし)
+      var doApply = function() {
+        fetch(API + '/inbound-plan/mails/' + j.mailId + '/apply-adjustments', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idemKey },
+          body: JSON.stringify({ entries: sel.map(function(p2){ return { orderItemId: p2.l.orderItemId, qty: p2.qty, note: p2.note }; }) }),
+        }).then(function(r2){ return jsonOrErr(r2, true); }).then(function(r2) {
+          if (btn2) btn2.disabled = false;
+          if (!r2.ok) { toast('エラー: ' + r2.error + ' — 全件登録されていません (1件でも失敗すると全体を取り消します)'); return; }
+          var closed = (r2.results || []).filter(function(x){ return x.orderClosed; }).length;
+          toast((r2.replay ? '(確認) 既に登録済みでした: ' : '減数しました: ') + (r2.results || []).length + '明細' + (closed ? ' / 発注完了 ' + closed + '件' : ''));
+          // 台帳が変わったので同じPO選択で変換し直す。古い画面を即座に消す (減数前の数量をコピーさせない) +
+          // 再変換失敗も黙殺しない (Codex salonge-R2 Medium)
+          var area2 = document.getElementById('ipResult');
+          area2.innerHTML = '<div class="muted">減数を登録しました。最新の残数で変換し直しています…</div>';
+          var failMsg = function(detail) {
+            area2.innerHTML = '<div class="warn">⚠️ 減数は登録済みですが、表示の更新に失敗しました (' + esc(detail) + ')。' +
+              'メール一覧の「🔁 変換 (発注書参照)」からやり直してください — <b>古い画面の数量をコピーしないでください</b></div>';
+          };
+          post(API + '/inbound-plan/mails/' + j.mailId + '/po-convert', { orderIds: IP_PO_ORDERIDS }).then(function(r3) {
+            if (r3.ok) renderPoResult(r3);
+            else failMsg(r3.error || '取得エラー');
+          }).catch(function(e3){ failMsg('通信エラー: ' + e3.message); });
+        }).catch(function(e) {
+          // 送信自体の通信断: サーバ側では登録済みの可能性がある → 古い結果画面 (減数前の数量) を残さず、
+          // 同じ冪等キーでの再確認だけをさせる (Codex salonge-R3 Medium)
+          var area3 = document.getElementById('ipResult');
+          area3.innerHTML = '<div class="warn">⚠️ 通信エラー: ' + esc(e.message) + ' — 減数が登録されたか不明です。' +
+            '下のボタンで同じ内容を再送すると、<b>二重減数なし</b> (同じ冪等キー) で結果を確認できます。' +
+            '<div style="margin-top:6px"><button class="pri" id="plShortRetry">🔁 同じ内容で再確認</button></div></div>';
+          btn2 = null; // 元のボタンはDOMから消えている
+          document.getElementById('plShortRetry').addEventListener('click', function() {
+            this.disabled = true;
+            doApply();
+          });
+        });
+      };
+      doApply();
+    });
+  });
+}`;
   res.send(pageShell('発注補助 — 入荷予定', 'inbound-plan', body, script));
 });
 
@@ -5316,6 +5933,7 @@ var API = '/apps/purchase-orders/api';
 var DATA = null, VIEW = 'attention', OPENED = {};
 var SEL = {}; // 一括メール送信の選択状態 (orderId → true)
 var SUP_SEL = null; // 🏭 仕入先別ビューで選択中の仕入先コード (null=仕入先一覧)
+var HASH_JUMPED = false; // #po-<id> リンクの初回ジャンプ済みフラグ
 var REASONS = { supplier_shortage: '仕入先都合 (作れない)', own_decision: '自社判断', cutoff: '打切', other: 'その他', correction: '訂正' };
 var EVLABEL = { receipt: '📥入荷', shortage: '➖減数', cancel: '🚫取消', reversal: '↩逆仕訳' };
 
@@ -5372,6 +5990,13 @@ function load() {
     render();
     // 商品検索の入力が残っていれば再評価 (DATA読込前に入力したケース)
     if (document.getElementById('boQ').value.trim()) renderProd();
+    // 他ページ (欠品リスク等) からの #po-<id> リンクで該当POを開く (初回読込時のみ)。
+    // idは数字のみ許可 (任意文字列を querySelector に渡さない、Codex P17-R1 Low)
+    if (!HASH_JUMPED && location.hash.indexOf('#po-') === 0) {
+      HASH_JUMPED = true;
+      var hashId = location.hash.slice(4);
+      if (/^\\d+$/.test(hashId)) jumpToOrder(hashId);
+    }
   }).catch(function(e) {
     if (seq !== LOAD_SEQ) return;
     document.getElementById('boList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
@@ -5549,7 +6174,8 @@ function bulkEligibleIds() {
 // 送信結果の分類: ジョブ作成成功 (ok:true) でも送信自体は failed/unknown/stale があり得る (成功扱いにしない)
 function bulkOutcome(j, at) {
   if (!j.ok) return { kind: 'fail', text: '❌ ' + (j.error || '不明なエラー') };
-  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)' : '✅ 送信しました' };
+  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)'
+    : (j.channel === 'fax' ? '✅ eFaxへ送信済 (FAX送達はeFaxの結果メールで確認)' : '✅ 送信しました') };
   if (j.status === 'scheduled' || j.status === 'queued') return { kind: 'ok', text: '⏰ 予約しました' + (at ? ' (' + at.replace('T', ' ') + ')' : '') };
   if (j.status === 'failed') return { kind: 'fail', text: '❌ 送信失敗: ' + (j.error || '') };
   // unknown / stale — 未送信と断定できない。二重送信を避けるため自動再送せず照合を案内
@@ -5577,15 +6203,16 @@ document.getElementById('boBulkSend').addEventListener('click', function() {
     ids = bulkEligibleIds();
     if (ids.length < before) toast((before - ids.length) + '件は完了/送信対象外になったため対象から外しました');
     if (!ids.length) { toast('送信できるPOがありません'); updateBulkBar(); return; }
-    var labels = {};
+    var labels = {}, channels = {};
     ids.forEach(function(id) {
       var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
-      labels[id] = o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id;
+      channels[id] = (o && o.sendMethod === 'fax') ? 'fax' : 'email';
+      labels[id] = (o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id) + (channels[id] === 'fax' ? ' 📠FAX' : '');
     });
-    if (!confirm('選択した ' + ids.length + '件の発注書メールを' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します。\\n' +
+    if (!confirm('選択した ' + ids.length + '件の発注書を' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します (📠FAX印はeFax経由でPDF送信)。\\n' +
       'モード: ' + (st.mode === 'live' ? '⚠️ 本番送信 (仕入先に届きます)' : '🔒 dry-run (社内 ' + (st.dryrunTo || '未設定') + ' に送信)') + '\\n\\n・' + ids.map(function(id){ return labels[id]; }).join('\\n・') + '\\n\\nよろしいですか?')) return;
     // 冪等キーは確定時に一括生成して保持 — 通信エラー行は「同じキーで再確認」で安全に再実行できる (replayなら二重送信なし)
-    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
+    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], channel: channels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
     btn.disabled = true;
     runBulk(BULK_LAST, function(){ btn.disabled = false; SEL = {}; load(); });
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
@@ -5610,7 +6237,7 @@ function runBulk(batch, done) {
 function sendBulkOne(batch, en) {
   return fetch(API + '/orders/' + en.id + '/email/send', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': en.key },
-    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode }),
+    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode, expectedChannel: en.channel || 'email' }),
   }).then(function(r){ return jsonOrErr(r, true); }).then(function(j) {
     return { en: en, out: bulkOutcome(j, batch.at) };
   }).catch(function(e) {
@@ -5902,8 +6529,10 @@ function supPanel(orderId) {
   });
 }
 
-// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
-function emPreviewModal(j) {
+// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)。
+// FAX (channel='fax') は宛先=FAX番号、添付=PDF発注書 (「PDFを開く」で実物確認。表は同じ明細データ)
+function emPreviewModal(j, orderId) {
+  var isFax = j.channel === 'fax';
   var old = document.getElementById('emModalBg');
   if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
   var rows = j.csvRows || [];
@@ -5919,18 +6548,21 @@ function emPreviewModal(j) {
   var bg = document.createElement('div');
   bg.className = 'pomodal-bg'; bg.id = 'emModalBg';
   bg.innerHTML = '<div class="pomodal">' +
-    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">📧 送信内容のプレビュー</h2>' +
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">' + (isFax ? '📠 FAX送信内容のプレビュー' : '📧 送信内容のプレビュー') + '</h2>' +
     (j.mode !== 'live'
       ? '<span class="badge b-draft">🔒 dry-run — 実際は ' + esc(j.dryrunTo || '未設定') + ' に届きます</span>'
       : '<span class="badge b-issued">本番送信 (live)</span>') +
     '<button class="ghost" id="emModalClose" style="margin-left:auto;font-size:15px">✕ 閉じる</button></div>' +
     '<table class="t" style="margin-top:8px">' +
-    '<tr><th style="width:80px">宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '') + '</td></tr>' +
+    '<tr><th style="width:80px">宛先</th><td>' + (isFax ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+      : esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '')) + '</td></tr>' +
     '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr></table>' +
-    '<h3 style="margin:12px 0 4px">本文</h3>' +
+    '<h3 style="margin:12px 0 4px">' + (isFax ? '送付状 (FAXの1枚目に印字されます)' : '本文') + '</h3>' +
     '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
     '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
-    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span></h3>' +
+    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span>' +
+    (isFax && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (現在のデータから生成)</a>' : '') + '</h3>' +
+    (isFax ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください (送信後の正式な控えは履歴の📄PDF)。</div>' : '') +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
@@ -5950,6 +6582,7 @@ function emailPanel(orderId, errBanner) {
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
+    var isFax = j.channel === 'fax';
     // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
     var eb = (errBanner && errBanner.head) ? errBanner : null;
     if (!eb) {
@@ -5964,37 +6597,42 @@ function emailPanel(orderId, errBanner) {
       (eb
         ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">' + esc(eb.head) + '<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(eb.detail || '') + '</div></div>'
         : '') +
-      '<b>📧 発注書メール</b> ' +
+      '<b>' + (isFax ? '📠 発注書FAX (eFax)' : '📧 発注書メール') + '</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
       '<table class="t" style="margin-top:6px">' +
-      '<tr><th>宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '') + '</td></tr>' +
-      '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr>' +
+      '<tr><th>宛先</th><td>' + (isFax
+        ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted" title="eFaxのメールtoFAXゲートウェイ経由で相手のFAX機に届きます">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+        : esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '')) + '</td></tr>' +
+      '<tr><th>件名</th><td>' + esc(j.subject) + (isFax ? ' <span class="muted" style="font-size:11px">(件名・本文はFAX送付状として1枚目に印字)</span>' : '') + '</td></tr>' +
       '<tr><th>添付</th><td>' + esc(j.attachmentName) + ' — ' + j.rows + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) +
         (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
-        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') + '</td></tr>' +
+        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') +
+        (isFax ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:12px;font-weight:600">📄 PDFを開く</a>' : '') + '</td></tr>' +
       '</table>' +
       '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
       '<button class="ghost" id="emPrev-' + orderId + '" style="font-weight:600">👁 送信内容をプレビュー (本文+添付)</button>' +
-      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信') + '</button>' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
-      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
-      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>';
+      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
+      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>' +
+      (isFax ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 「送信済」はeFaxゲートウェイへの受け渡し完了です。相手FAX機への送達結果は、eFaxからの結果通知メール (送信元アドレス宛) で確認してください。</div>' : '');
     if (j.jobs.length) {
       h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
       j.jobs.forEach(function(x) {
-        var st = x.status === 'sent' ? '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '') :
+        var st = x.status === 'sent' ? (x.channel === 'fax' && !x.is_dry_run ? '✅ eFaxへ送信済' : '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '')) :
           x.status === 'failed' ? '❌ 失敗' :
           x.status === 'unknown' ? '❓ 結果不明' :
           x.status === 'sending' ? '⏳ 送信中' :
           x.status === 'cancelled' ? '🚫 取消' :
           (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + (x.channel === 'fax' ? '📠 ' : '') + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
           '<td style="white-space:nowrap">' +
+            (x.channel === 'fax' ? '<a class="ghost" href="' + API + '/email-jobs/' + x.id + '/pdf" target="_blank" rel="noopener" title="このジョブで送信された (される) PDFの控え">📄 PDF</a> ' : '') +
             (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button> ' : '') +
             ((x.status === 'queued' || x.status === 'failed') ? '<button class="ghost" data-emcancel="' + x.id + '" data-emorder="' + orderId + '">取消</button> ' : '') +
             ((x.status === 'sending' || x.status === 'unknown') ? '<button class="ghost" data-emrec="' + orderId + '">照合</button> ' : '') +
@@ -6005,16 +6643,18 @@ function emailPanel(orderId, errBanner) {
     }
     h += '</div>';
     area.innerHTML = h;
-    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j); });
+    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j, orderId); });
     var idemKey = newIdemKey();
     var whenEl = document.getElementById('emWhen-' + orderId);
     if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
-    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run; })[0] || null;
+    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); })[0] || null;
     function doSend(resend, scheduledAt) {
       var when = scheduledAt ? ' (予約: ' + scheduledAt.replace('T', ' ') + ' JST)' : '';
       var msg = dry
         ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
-        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
+        : (isFax
+          ? '⚠️ 本番FAX送信です。仕入先のFAX ' + (j.faxNumber || '') + ' に発注書PDFが届きます (eFax経由)' + when + '。送信しますか?\\n\\n※eFaxの送信結果 (成功/失敗) は送信元メールアドレスへの通知メールで確認できます'
+          : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?');
       // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
       if (j.missingVendorCodes.length) {
         msg += '\\n\\n⚠️ 先方管理番号が未登録の商品が ' + j.missingVendorCodes.length + '件あります (' +
@@ -6025,7 +6665,7 @@ function emailPanel(orderId, errBanner) {
       if (btn) btn.disabled = true;
       post(API + '/orders/' + orderId + '/email/send',
         { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null,
-          expectedMode: j.mode }, idemKey)
+          expectedMode: j.mode, expectedChannel: j.channel || 'email' }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
           if (!r2.ok) {
@@ -6475,6 +7115,238 @@ load();`;
   res.send(pageShell('発注補助 — 発注残', 'backorders', body, script));
 });
 
+// ─── 画面: 欠品リスク (P17) ───
+router.get('/shortage-risk', (req, res) => {
+  const body = `
+    <h2 class="page">⚠️ 欠品リスク <span class="muted" style="font-size:12px">注残はあるが納期が先・未回答・遅延で欠品しそうな商品 (仕入先督促の材料)。<b>簡易目安の参考表示</b>であり精密予測ではありません</span></h2>
+    <div id="srBasis"></div>
+    <details class="sec" style="margin-bottom:10px"><summary style="cursor:pointer;padding:8px 12px">⚙ しきい値設定</summary>
+      <div class="bd" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+        <label class="muted" title="加重日販 = 7日販売/7×この重み + 30日販売/30×(1−重み)">7日販売の重み <input type="number" id="srW7" min="0" max="1" step="0.1"></label>
+        <label class="muted" title="欠品しなくても、入荷直前の在庫余裕がこの日数以下なら🔴扱い">余裕しきい値 <input type="number" id="srMargin" min="0" max="30" step="1">日</label>
+        <label class="muted" title="納期未回答のまま発注からこの日数が経過したら🟡回答督促">未回答督促 <input type="number" id="srUnans" min="0" max="60" step="1">日</label>
+        <label class="muted" title="在庫推移をシミュレーションする日数">予測期間 <input type="number" id="srHorizon" min="14" max="365" step="1">日</label>
+        <label class="muted" title="入荷予定が未確定でも、欠品予測日がこの日数以内なら🔴 (それ以降は🟡納期確定の督促)">至急しきい値 <input type="number" id="srSoon" min="1" max="90" step="1">日</label>
+        <button class="pri" id="srSave">保存</button>
+        <button class="ghost" id="srReset" title="5項目を既定値 (0.5 / 3日 / 7日 / 90日 / 14日) に戻して保存">既定値に戻す</button>
+        <span class="muted" style="font-size:11px">変更は監査ログに記録されます</span>
+      </div>
+    </details>
+    <div id="srSummary" class="muted" style="margin:6px 0"></div>
+    <div id="srList">読み込み中…</div>`;
+  const script = `
+var API = '/apps/purchase-orders/api';
+var DATA = null;
+function fmtMd(ymd) { return ymd ? Number(ymd.slice(5, 7)) + '/' + Number(ymd.slice(8, 10)) : '—'; }
+function getJson(url) { return fetch(url).then(function(r){ return r.json().catch(function(){ return { ok: false, error: 'HTTP ' + r.status }; }); }); }
+
+function riskBadge(risk) {
+  if (risk === 'high') return '<span class="badge" style="background:#fee2e2;color:#b91c1c">🔴 欠品リスク</span>';
+  if (risk === 'attention') return '<span class="badge" style="background:#fef9c3;color:#a16207">🟡 要督促</span>';
+  if (risk === 'no_demand') return '<span class="badge" style="background:#e2e8f0;color:#475569">販売なし</span>';
+  if (risk === 'unknown') return '<span class="badge" style="background:#fce7f3;color:#9d174d">データ異常</span>';
+  return '<span class="badge" style="background:#dcfce7;color:#15803d">OK</span>';
+}
+// 数量partの期日表示 (シミュレーションの解釈と1:1。分納分割は「30個=分納予定7/20、70個=納期不明」と内訳で出す)
+function partText(p, unanswered) {
+  var d = p.disp;
+  if (d.kind === 'overdue') {
+    // 回答納期/分納予定の超過=遅延、希望納期の超過=回答が来ないまま希望日を過ぎた (別物、Codex R1 High)
+    return d.source === 'requested'
+      ? '<span style="color:#a16207">希望納期 ' + fmtMd(d.date) + ' 超過 (回答未着)</span>'
+      : '<span style="color:#b91c1c">予定日超過 ' + fmtMd(d.date) + '</span>';
+  }
+  if (d.kind === 'undated') return '<span style="color:#a16207">納期不明' + (unanswered ? ' (未回答)' : '') + '</span>';
+  var src = d.source === 'next' ? '分納予定' : d.source === 'promised' ? '回答納期' : '希望納期 (未回答)';
+  return src + ' ' + fmtMd(d.date);
+}
+function lineText(l) {
+  return l.parts.map(function(p){ return p.qty.toLocaleString('ja-JP') + '個=' + partText(p, l.unanswered); }).join('、');
+}
+function flagBadges(it) {
+  var h = '';
+  if (it.flags.overdue) h += ' <span class="badge" style="background:#fee2e2;color:#b91c1c" title="予定日を過ぎても入荷していない注残があります">遅延中</span>';
+  if (it.flags.unanswered) h += ' <span class="badge" style="background:#fef9c3;color:#a16207" title="納期未回答のまま日数が経過しています">未回答</span>';
+  if (it.flags.undated) h += ' <span class="badge" style="background:#e2e8f0;color:#475569" title="納期不明の数量は在庫推移の計算に入れていません">納期不明あり</span>';
+  if (it.flags.requested_date_only) h += ' <span class="badge" style="background:#e0e7ff;color:#4338ca" title="回答納期がなく、希望納期どおり入荷する楽観仮定で計算しています">希望納期ベース</span>';
+  return h;
+}
+
+function itemRows(it) {
+  var boLines = it.lines.map(function(l) {
+    return '<div>' +
+      '<a href="/apps/purchase-orders/backorders#po-' + l.orderId + '" title="発注残でこのPOを開く">' + esc(l.poNumber) + '</a> ' +
+      '残<b>' + l.remaining.toLocaleString('ja-JP') + '</b>個 (' + lineText(l) + ')</div>';
+  }).join('');
+  var stockCell = it.stock == null ? '—'
+    : it.stock.toLocaleString('ja-JP') + (it.stockDays != null && it.dailySales > 0 ? ' <span class="muted">(≒' + it.stockDays + '日分)</span>' : '');
+  var judge = riskBadge(it.risk) + (it.stockoutDate ? ' <b style="color:#b91c1c">' + fmtMd(it.stockoutDate) + '</b> 欠品見込み'
+    : it.marginDays != null ? ' <span class="muted">余裕' + it.marginDays + '日</span>' : '');
+  return '<tr>' +
+    '<td><b>' + esc(it.code) + '</b><div class="muted" style="font-size:11px">' + esc(it.name) + '</div>' + flagBadges(it) + '</td>' +
+    '<td class="r">' + stockCell + '</td>' +
+    '<td class="r">' + (it.dailySales == null ? '—' : it.dailySales) + '</td>' +
+    '<td>' + judge + '</td>' +
+    '<td>' + boLines + '</td>' +
+    '</tr>' +
+    '<tr><td colspan="5" class="muted" style="font-size:11.5px;padding-top:0;border-top:none">' + esc(it.reason) + '</td></tr>';
+}
+
+// 主一覧・督促コピーの対象 = 欠品リスク (high/attention) または督促フラグあり (2軸、Codex R1 High)
+function isMain(it) { return it.risk === 'high' || it.risk === 'attention' || it.needsFollowup; }
+
+function render() {
+  var s = DATA.summary;
+  document.getElementById('srSummary').textContent =
+    '🔴 欠品リスク ' + s.high + ' / 🟡 注意 ' + s.attention + ' / 📞 督促対象 ' + s.followup + ' / 販売なし ' + s.no_demand + ' / データ異常 ' + s.unknown + ' / OK ' + s.ok +
+    ' (対象=オープン注残のある商品、' + DATA.today + ' 時点)';
+  // データ基準 (在庫・販売のスナップショット時刻。古ければ警告)
+  var b = DATA.dataBasis;
+  var basis = 'データ基準: PML ' + (b.pmlAsOfDate ? esc(b.pmlAsOfDate) : '不明') +
+    (b.overlay ? ' + 日中CSV (' + esc(b.overlay.source || '') + (b.overlay.applied ? '' : '・朝同期より古いため未適用') + ')' : '');
+  document.getElementById('srBasis').innerHTML = b.stale
+    ? '<div class="warn">⚠️ ' + basis + ' — 2日以上古いデータです。判定は参考程度にしてください</div>'
+    : '<div class="muted" style="font-size:12px">' + basis + '</div>';
+  // しきい値
+  document.getElementById('srW7').value = DATA.settings.w7;
+  document.getElementById('srMargin').value = DATA.settings.marginDays;
+  document.getElementById('srUnans').value = DATA.settings.unansweredDays;
+  document.getElementById('srHorizon').value = DATA.settings.horizonDays;
+  document.getElementById('srSoon').value = DATA.settings.soonDays;
+
+  var h = '';
+  if (!DATA.suppliers.length) h = '<div class="muted">オープンな注残がありません 🎉</div>';
+  DATA.suppliers.forEach(function(g) {
+    var main = g.items.filter(isMain);
+    var rest = g.items.filter(function(it){ return !isMain(it); });
+    h += '<div class="sec"><h2>🏭 ' + esc(g.name) +
+      ' <span class="muted" style="font-weight:normal;font-size:12px">🔴' + (g.counts.high || 0) + ' 🟡' + (g.counts.attention || 0) + ' 📞' + (g.counts.followup || 0) + ' / 全' + g.items.length + '商品</span>' +
+      (main.length ? ' <button class="pri sm" data-copy="' + esc(g.code) + '" title="この仕入先向けの督促文面 (台帳の事実+参考予測) をクリップボードにコピー">📋 督促リストをコピー</button>' : '') +
+      '</h2><div class="bd">';
+    if (main.length) {
+      h += '<table class="t"><tr><th>商品</th><th class="r">現在庫</th><th class="r">加重日販</th><th>判定</th><th>注残 (PO別)</th></tr>' +
+        main.map(itemRows).join('') + '</table>';
+    } else {
+      h += '<div class="muted">督促が必要な商品はありません</div>';
+    }
+    if (rest.length) {
+      h += '<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">その他 ' + rest.length + '商品 (OK / 販売なし / データ異常)</summary>' +
+        '<table class="t" style="margin-top:6px"><tr><th>商品</th><th class="r">現在庫</th><th class="r">加重日販</th><th>判定</th><th>注残 (PO別)</th></tr>' +
+        rest.map(itemRows).join('') + '</table></details>';
+    }
+    h += '</div></div>';
+  });
+  document.getElementById('srList').innerHTML = h;
+}
+
+// 督促コピー文面: 台帳上の事実と参考予測を分離し、断定しない (Codex設計相談 2026-07-16)
+function buildCopyText(g) {
+  var L = [];
+  L.push(esc0(g.name) + ' 様');
+  L.push('');
+  L.push('いつもお世話になっております。B-Faith株式会社です。');
+  L.push('以下の発注分について、納期のご確認・ご回答をお願いいたします (' + DATA.today + ' 時点の弊社発注台帳より)。');
+  g.items.forEach(function(it) {
+    if (!isMain(it)) return;
+    L.push('');
+    var vendor = null;
+    it.lines.forEach(function(l){ if (!vendor && l.vendorCode) vendor = l.vendorCode; });
+    L.push('■ ' + esc0(it.name || it.code) + (vendor ? ' (貴社管理番号: ' + esc0(vendor) + ')' : ' (' + esc0(it.code) + ')'));
+    it.lines.forEach(function(l) {
+      // 数量partごとに台帳上の事実を書く (分納分割を全量と誤記しない / 希望納期超過を「ご回答納期の超過」と誤記しない、Codex R1 High)
+      var segs = l.parts.map(function(p) {
+        var q = p.qty.toLocaleString('ja-JP') + '個';
+        if (p.disp.kind === 'overdue') {
+          return p.disp.source === 'requested'
+            ? q + ': 希望納期 ' + fmtMd(p.disp.date) + ' を過ぎましたがご回答が未着です'
+            : q + ': ご回答いただいた納期 ' + fmtMd(p.disp.date) + ' を過ぎております。状況をお知らせください';
+        }
+        if (p.disp.kind === 'undated') return q + ': 納期のご回答が未着です。ご回答をお願いいたします';
+        if (p.disp.source === 'requested') return q + ': 希望納期 ' + fmtMd(p.disp.date) + ' (ご回答未着のため可否のご回答をお願いいたします)';
+        return q + ': ' + (p.disp.source === 'next' ? '分納予定' : 'ご回答納期') + ' ' + fmtMd(p.disp.date);
+      });
+      L.push('・発注書 ' + esc0(l.poNumber) + ' : 残 ' + l.remaining.toLocaleString('ja-JP') + '個 — ' + segs.join(' / '));
+    });
+    if (it.stockoutDate) {
+      L.push('（参考: 現在の販売ペースでは ' + fmtMd(it.stockoutDate) + ' 頃に在庫切れが見込まれます。可能でしたら納期の前倒しをご検討ください）');
+    }
+  });
+  L.push('');
+  L.push('お手数をおかけしますが、よろしくお願いいたします。');
+  return L.join('\\n');
+}
+function esc0(s) { return s == null ? '' : String(s); } // コピーはプレーンテキスト (HTMLエスケープ不要)
+
+function copyText(text, btn) {
+  var done = function(){ toast('督促リストをコピーしました (メール等に貼り付けてください)'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(function(){ fallbackCopy(text); done(); });
+  } else { fallbackCopy(text); done(); }
+}
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  ta.remove();
+}
+
+document.addEventListener('click', function(ev) {
+  var t = ev.target;
+  var code = t.getAttribute && t.getAttribute('data-copy');
+  if (!code || !DATA) return;
+  var g = null;
+  DATA.suppliers.forEach(function(x){ if (x.code === code) g = x; });
+  if (g) copyText(buildCopyText(g), t);
+});
+
+document.getElementById('srSave').addEventListener('click', function() { saveSettings(false); });
+document.getElementById('srReset').addEventListener('click', function() {
+  if (!confirm('しきい値5項目を既定値 (7日重み0.5 / 余裕3日 / 未回答7日 / 予測90日 / 至急14日) に戻しますか?')) return;
+  saveSettings(true);
+});
+function saveSettings(reset) {
+  var body;
+  if (reset) {
+    body = { w7: 0.5, marginDays: 3, unansweredDays: 7, horizonDays: 90, soonDays: 14 };
+  } else {
+    // 空欄は Number('')=0 に化けるため送信前に拒否 (Codex R2 Medium)
+    var ids = { w7: 'srW7', marginDays: 'srMargin', unansweredDays: 'srUnans', horizonDays: 'srHorizon', soonDays: 'srSoon' };
+    body = {};
+    for (var name in ids) {
+      var v = document.getElementById(ids[name]).value;
+      if (String(v).trim() === '') { toast('空欄の項目があります。数値を入力してください'); return; }
+      body[name] = Number(v);
+    }
+  }
+  fetch(API + '/shortage-risk/settings', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { toast('エラー: ' + j.error); return; }
+      toast('しきい値を保存しました。再計算します');
+      load();
+    })
+    .catch(function(e){ toast('通信エラー: ' + e.message); });
+}
+
+function load() {
+  getJson(API + '/shortage-risk').then(function(j) {
+    if (!j.ok) {
+      document.getElementById('srList').innerHTML = '<div class="warn">エラー: ' + esc(j.error) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+      return;
+    }
+    DATA = j;
+    render();
+  }).catch(function(e) {
+    document.getElementById('srList').innerHTML = '<div class="warn">通信エラー: ' + esc(e.message) + ' <button class="ghost" onclick="load()">再読込</button></div>';
+  });
+}
+load();
+`;
+  res.send(pageShell('発注補助 — 欠品リスク', 'shortage-risk', body, script));
+});
+
 router.get('/orders', (req, res) => {
   const body = `
     <h2 class="page">発注履歴</h2>
@@ -6705,11 +7577,11 @@ var TAB = 'suppliers';
 var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
 var GRP_HINTS = {
-  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB) をここで設定します。',
+  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB)、FAX番号 (eFax送信用) をここで設定します。',
   conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
   barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
-  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。',
+  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。📠FAX送信 (eFax) も同じモード・テンプレを使います (件名・本文が送付状になります)。',
 };
 function setGroup(g) {
   GRP = g;
@@ -6733,6 +7605,7 @@ var DEFS = {
     { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
     { k: 'contact_name', l: '担当者名 (様は自動付与)' },
     { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['none', '送信なし']] },
+    { k: 'fax_number', l: 'FAX番号 (発注方法FAXで必須。例: 06-1234-5678)' },
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },
@@ -6740,7 +7613,7 @@ var DEFS = {
   materials: { title: '原料グループ', cols: [
     { k: 'group_id', l: '原料グループID', pk: 1 }, { k: 'name', l: '原料グループ名' }, { k: 'min_order_qty', l: '最低発注量', num: 1 }, { k: 'unit', l: '単位' } ] },
   attrs: { title: '商品紐付け', cols: [
-    { k: 'product_code', l: '商品コード', pk: 1 }, { k: '商品名', l: '商品名', ro: 1 },
+    { k: 'product_code', l: '商品コード', pk: 1 }, { k: '商品名', l: '商品名', ro: 1 }, { k: '仕入先名', l: '仕入先', ro: 1 },
     { k: 'condition_id', l: '発注条件グループ (名前で検索可)', dl: 'conds' }, { k: 'material_group_id', l: '原料グループ (名前で検索可)', dl: 'mats' },
     { k: 'capacity_per_unit', l: '容量/個', num: 1 }, { k: 'case_group', l: 'ケースグループ' }, { k: 'case_lot', l: 'ケースロット', num: 1 } ] },
   selectable: { title: '選べるセット構成商品 (在庫+注残≦最低在庫で要発注入り。最低在庫 空欄=既定10)', cols: [
@@ -6831,11 +7704,36 @@ function cellHtml(c, val) {
   if (c.dl) return '<td><input type="text" list="dl_' + c.dl + '" data-k="' + c.k + '" style="width:98%" value="' + esc(groupLabelOf(c.dl, val)) + '" placeholder="名前でもIDでも"></td>';
   return '<td' + (' contenteditable data-k="' + c.k + '"') + (c.num ? ' class="r"' : '') + '>' + esc(val == null ? '' : val) + '</td>';
 }
+var FILT_Q = {};        // タブごとの絞り込み文字列 (保存→再描画してもフィルタを維持する、中原さん要望 2026-07-16)
+var ATTR_VIEW = 'all';  // 商品紐付けタブのチップ: all / unlinked / linked
+var SCROLL_RESTORE = null; // {tab, y} 保存/削除→再描画後にスクロール位置を戻す (同じタブのときだけ)
+function applyMasterFilter() {
+  var q = (FILT_Q[TAB] || '').trim().toLowerCase();
+  var shown = 0;
+  document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
+    var okChip = TAB !== 'attrs' || ATTR_VIEW === 'all' || tr.getAttribute('data-linked') === (ATTR_VIEW === 'linked' ? '1' : '0');
+    // 検索対象は行生成時に作った data-search (毎入力での全セル走査は数千行で重い、Codex attrs-R1 Medium)
+    var show = okChip && (!q || (tr.getAttribute('data-search') || '').indexOf(q) >= 0);
+    tr.style.display = show ? '' : 'none';
+    if (show) shown++;
+  });
+  var cnt = document.getElementById('filterCount');
+  if (cnt) cnt.textContent = q || (TAB === 'attrs' && ATTR_VIEW !== 'all') ? '表示中 ' + shown + '件' : '';
+}
 function render(rows) {
   var def = DEFS[TAB];
   var h = dlHtml();
-  h += '<div class="toolbar"><span class="muted">' + rows.length + ' 件 — セルを直接編集して「保存」／最上行から追加</span>' +
-    '<input type="text" id="filter" placeholder="🔍 商品名・コード・グループ名で絞り込み" style="margin-left:auto;min-width:260px"></div>';
+  var head = rows.length + ' 件 — セルを直接編集して「保存」／最上行から追加';
+  var chipsHtml = '';
+  if (TAB === 'attrs') {
+    var nUnlinked = rows.filter(function(r){ return !r.linked; }).length;
+    head = '全商品 ' + rows.length + ' 件 (未紐付け ' + nUnlinked + ') — グループを入れて「保存」すればそのまま紐づけできます';
+    chipsHtml = [['all', '全て ' + rows.length], ['unlinked', '未紐付け ' + nUnlinked], ['linked', '紐付け済み ' + (rows.length - nUnlinked)]]
+      .map(function(c){ return '<button class="' + (ATTR_VIEW === c[0] ? 'pri' : 'ghost') + ' sm" data-attrview="' + c[0] + '">' + c[1] + '</button>'; }).join(' ');
+  }
+  h += '<div class="toolbar" style="flex-wrap:wrap;gap:6px"><span class="muted">' + head + '</span>' + chipsHtml +
+    '<span class="muted" id="filterCount" style="margin-left:auto"></span>' +
+    '<input type="text" id="filter" placeholder="🔍 商品名・コード・グループ名で絞り込み" style="min-width:260px" value="' + esc(FILT_Q[TAB] || '') + '"></div>';
   h += '<table class="t" id="mtable"><thead><tr>' + def.cols.map(function(c){ return '<th' + (c.num ? ' class="r"' : '') + '>' + c.l + '</th>'; }).join('') + '<th></th></tr></thead><tbody>';
   h += '<tr>' + def.cols.map(function(c) {
     if (c.ro) return '<td class="muted">(自動)</td>';
@@ -6843,21 +7741,37 @@ function render(rows) {
     return '<td><input type="text" style="width:98%" id="new_' + c.k + '"' + (c.dl ? ' list="dl_' + c.dl + '" placeholder="名前でもIDでも"' : '') + '></td>';
   }).join('') + '<td><button class="pri sm" id="btnAdd">追加</button></td></tr>';
   rows.forEach(function(r) {
-    h += '<tr data-row="1">' + def.cols.map(function(c) {
-      if (c.pk) return '<td>' + esc(r[c.k] == null ? '' : r[c.k]) + '</td>';
+    var attrsMeta = TAB === 'attrs' ? ' data-linked="' + (r.linked ? '1' : '0') + '"' : '';
+    // 検索用テキストを行生成時に正規化して埋め込む (グループはID+名前の両方で当たるように)
+    var searchTxt = def.cols.map(function(c) {
+      var v = r[c.k];
+      return c.dl ? groupLabelOf(c.dl, v) : (v == null ? '' : String(v));
+    }).join(' ').toLowerCase();
+    h += '<tr data-row="1" data-search="' + esc(searchTxt) + '"' + attrsMeta + (TAB === 'attrs' && !r.linked ? ' style="background:#fffbeb"' : '') + '>' + def.cols.map(function(c) {
+      if (c.pk) {
+        var badge = '';
+        if (TAB === 'attrs') {
+          if (!r.linked) badge = ' <span class="badge b-warn" title="どのグループにも未紐付け (グループ対象外の商品はそのままでOK)">未紐付け</span>';
+          else if (r.pmlMissing) badge = ' <span class="badge b-draft" title="PML (商品管理リスト) に見つからない商品 (コード改廃?)">PML外</span>';
+          else if (!r.active) badge = ' <span class="badge b-draft">取扱中止</span>';
+        }
+        return '<td>' + esc(r[c.k] == null ? '' : r[c.k]) + badge + '</td>';
+      }
       return cellHtml(c, r[c.k]);
-    }).join('') + '<td style="white-space:nowrap"><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button><button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button></td></tr>';
+    }).join('') + '<td style="white-space:nowrap"><button class="ghost" data-save="' + esc(r[def.cols[0].k]) + '">保存</button>' +
+      (TAB === 'attrs' && !r.linked ? '' : '<button class="ghost" data-rm="' + esc(r[def.cols[0].k]) + '">削除</button>') + '</td></tr>';
   });
   h += '</tbody></table>';
   document.getElementById('tabBody').innerHTML = h;
+  var filtTimer = null;
   document.getElementById('filter').addEventListener('input', function(ev) {
-    var q = ev.target.value.trim().toLowerCase();
-    document.querySelectorAll('#mtable tr[data-row]').forEach(function(tr) {
-      var txt = tr.textContent.toLowerCase();
-      tr.querySelectorAll('input[data-k]').forEach(function(inp){ txt += ' ' + inp.value.toLowerCase(); });
-      tr.style.display = !q || txt.indexOf(q) >= 0 ? '' : 'none';
-    });
+    FILT_Q[TAB] = ev.target.value;
+    clearTimeout(filtTimer);
+    filtTimer = setTimeout(applyMasterFilter, 200); // 数千行の全行走査を毎キーで走らせない
   });
+  applyMasterFilter();
+  if (SCROLL_RESTORE && SCROLL_RESTORE.tab === TAB) window.scrollTo(0, SCROLL_RESTORE.y);
+  SCROLL_RESTORE = null;
 }
 function renderUnlinked(j) {
   var h = '<div class="toolbar">' +
@@ -7019,14 +7933,24 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
     }).catch(function(e){ document.getElementById('bcImpStatus').textContent = ''; alert('通信エラー: ' + e.message); });
 });
 
+var MLOAD_SEQ = 0;
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
   if (TAB === 'vendormap') { loadVmap(); return; }
   if (TAB === 'barcode') { loadBarcode(); return; }
+  // 世代ガード: 素早いタブ切替で古いGET応答が現在タブのrenderに渡らないように (Codex attrs-R1 Medium)
+  var seq = ++MLOAD_SEQ, reqTab = TAB;
   document.getElementById('tabBody').textContent = '読み込み中…';
   ensureGroups(function() {
-    fetch('/apps/purchase-orders/api/masters/' + TAB).then(function(r){ return r.json(); })
-      .then(function(j){ if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error; });
+    fetch('/apps/purchase-orders/api/masters/' + reqTab).then(function(r){ return r.json(); })
+      .then(function(j) {
+        if (seq !== MLOAD_SEQ || TAB !== reqTab) {
+          // 破棄した応答に紐づくスクロール復元も捨てる (後で元タブに戻ったとき古い位置に飛ばない、Codex attrs-R2 Medium)
+          if (SCROLL_RESTORE && SCROLL_RESTORE.tab === reqTab) SCROLL_RESTORE = null;
+          return;
+        }
+        if (j.ok) render(j.rows); else document.getElementById('tabBody').textContent = j.error;
+      });
   });
 }
 
@@ -7251,6 +8175,15 @@ document.addEventListener('click', function(ev) {
       }).catch(function(e){ toast('通信エラー: ' + e.message); });
     return;
   }
+  var attrView = t.getAttribute && t.getAttribute('data-attrview');
+  if (attrView) {
+    ATTR_VIEW = attrView;
+    document.querySelectorAll('[data-attrview]').forEach(function(b) {
+      b.className = (b.getAttribute('data-attrview') === attrView ? 'pri' : 'ghost') + ' sm';
+    });
+    applyMasterFilter();
+    return;
+  }
   if (t.id === 'btnAdd') {
     var def = DEFS[TAB], b = {};
     def.cols.forEach(function(c) {
@@ -7278,20 +8211,30 @@ document.addEventListener('click', function(ev) {
   var rmKey = t.getAttribute && t.getAttribute('data-rm');
   if (rmKey != null) {
     if (!confirm('削除しますか? ' + rmKey)) return;
-    fetch('/apps/purchase-orders/api/masters/' + TAB + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
+    var rmTab = TAB; // 応答前のタブ切替対策 (postと同じ)
+    fetch('/apps/purchase-orders/api/masters/' + rmTab + '/' + encodeURIComponent(rmKey), { method: 'DELETE' })
       .then(function(r){ return r.json(); }).then(function(j) {
-        if (j.ok) { toast('削除しました'); if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; load(); }
-        else toast(j.error);
+        if (j.ok) {
+          toast('削除しました');
+          if (rmTab === 'conditions' || rmTab === 'materials') GROUPS = null;
+          if (TAB !== rmTab) return;
+          SCROLL_RESTORE = { tab: rmTab, y: window.scrollY };
+          load();
+        } else toast(j.error);
       });
   }
 });
 function post(b) {
-  fetch('/apps/purchase-orders/api/masters/' + TAB, {
+  // 開始時点のタブを捕捉 (応答前にタブ切替しても別タブを誤って再読込・スクロールしない、Codex attrs-R1 Medium)
+  var reqTab = TAB;
+  fetch('/apps/purchase-orders/api/masters/' + reqTab, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
-      if (TAB === 'conditions' || TAB === 'materials') GROUPS = null; // グループ名キャッシュを更新
+      if (reqTab === 'conditions' || reqTab === 'materials') GROUPS = null; // グループ名キャッシュを更新
+      if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
+      SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
       load();
     } else toast('エラー: ' + j.error);
   });

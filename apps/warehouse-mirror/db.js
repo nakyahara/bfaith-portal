@@ -31,6 +31,9 @@ export let aupayDataInitError = null;
 // Qoo10 Analytics表も同様 (mall-csv-fetcher P1-Q R1)
 export let qoo10DataInitError = null;
 
+// 楽天レビュー日次集計表も同様 (mall-csv-fetcher P2 PR-A)
+export let rakutenReviewInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -40,6 +43,7 @@ export function initMirrorDB() {
   yahooInitError = null;
   aupayDataInitError = null;
   qoo10DataInitError = null;
+  rakutenReviewInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -382,9 +386,44 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_received ON sync_run_chunks(entity, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_entity_scope ON sync_run_chunks(entity, scope_from, scope_to)');
 
+  // ---- 構造監査 H-4 (2026-07-19): multi-chunk sync の staging 化
+  // date_range clear の multi-chunk run は、chunk 毎に live 表へ apply せず一旦ここに溜め、
+  // 全 chunk 到着時に「scope DELETE → 一括 INSERT」を単一 tx で実行する。
+  // (従来は第1chunk で DELETE → chunk 毎 INSERT のため、途中失敗で「clear済+部分データ」が
+  //  翌朝まで mirror 直読み画面に露出していた)
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_stage_rows (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    chunk_index       INTEGER NOT NULL,
+    row_idx           INTEGER NOT NULL,
+    row_json          TEXT NOT NULL,
+    PRIMARY KEY (run_id, entity, chunk_index, row_idx)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ssr_entity ON sync_stage_rows(entity)');
+  // 先頭 chunk の meta.clear_dates を apply 時 (最終 chunk) まで持ち越す
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_stage_meta (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    clear_dates_json  TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    PRIMARY KEY (run_id, entity)
+  )`);
+  // staged run の apply 済みマーカー (chunk 再送 replay で apply を二重実行しないため)
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_run_applied (
+    run_id            TEXT NOT NULL,
+    entity            TEXT NOT NULL,
+    applied_at        TEXT NOT NULL,
+    cleared_rows      INTEGER NOT NULL,
+    applied_rows      INTEGER NOT NULL,
+    PRIMARY KEY (run_id, entity)
+  )`);
+
   // MF Phase 1a (Codex review #88 反映): finalize cross-check 用に
   // 親 mf_publish_runs.run_id を ledger に記録 (NULL=非MF entity、Amazon/Rakuten 既存 row は NULL のまま)
   addColumnIfMissing('sync_run_chunks', 'mf_source_run_id', 'INTEGER');
+  // H-4: この chunk が staging 経路で受信されたか (1=staged)。stage coverage 判定の正
+  // (sync_stage_rows の行数だと row_count=0 の空 chunk を「stage 欠落」と誤判定する)
+  addColumnIfMissing('sync_run_chunks', 'staged', 'INTEGER');
   db.exec('CREATE INDEX IF NOT EXISTS idx_src_mf_source_run ON sync_run_chunks(mf_source_run_id) WHERE mf_source_run_id IS NOT NULL');
 
   // mirror_amazon_finance_sku_daily — Phase 1 #1-4 (Render 側 daily fact mirror)
@@ -997,6 +1036,30 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] Qoo10分析表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── 楽天レビュー 日次集計 (mall-csv-fetcher P2 PR-A、2026-07-16) ───
+  // ★非PII集計のみ (本文/注文番号/レビューURLは miniPC 側に留める — らくらくーぽん置換 設計書§4)
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_rakuten_review_daily (
+      date_jst    TEXT NOT NULL CHECK(date_jst GLOB '????-??-??'),
+      review_type TEXT NOT NULL CHECK(review_type IN ('item','shop')),
+      item_id     INTEGER NOT NULL DEFAULT 0,
+      item_name   TEXT,
+      rating      INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),
+      review_count INTEGER NOT NULL,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (date_jst, review_type, item_id, rating)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mrrd_item ON mirror_rakuten_review_daily(item_id, date_jst)');
+  } catch (e) {
+    rakutenReviewInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] 楽天レビュー集計表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)
@@ -2424,7 +2487,78 @@ function createTables() {
   createMisShipmentTables();
   createGiftsetTables();
   createSupplierShareTables();
+  createInboundInfoTables();
 }
+
+// ▼▼▼ 入庫情報管理（apps/inbound-info）正本テーブル ▼▼▼
+// 旧: スプレッドシート「入庫情報管理表.xlsx」(入数マスタ + 原産国) の置き換え。
+// 方針: f_giftset と同じ Render 完結書込 (mirror_* と prefix 分離、ミニPC 不使用)。
+// 新商品は日次 cron が mirror_products (商品区分='単品' AND 取扱区分='取扱中') から
+// 未登録コードを自動 INSERT する (商品コード・商品名のみ。入数等は現場が UI で記入)。
+// 照合キー: 実データ検証 (2026-07-21, m_products 7166件 vs Excel 4897件) で
+//   大文字小文字違いの揺れが 1123 件あったため lower(trim(商品コード)) = code_key を PK にする。
+//   (feedback_sku_case_normalization と同じ罠。JS の .trim() は全角スペース U+3000 も除去)
+function createInboundInfoTables() {
+  // 入数マスタ本体。source: excel=初回移行 / auto=cron自動追加(未記入の新着) / manual=人が編集済み。
+  // 「新着 (現場がまだ触っていない)」= source='auto' で表現するため、UI からの更新時に
+  // db.js 側で必ず source='manual' へ倒す。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_info (
+      code_key             TEXT PRIMARY KEY,
+      商品コード           TEXT NOT NULL,
+      商品名               TEXT,
+      入数                 INTEGER CHECK (入数 IS NULL OR (入数 >= 0 AND 入数 <= 100000000)),
+      入庫時BCシール貼りフラグ TEXT,
+      直接ピックロケ保管   TEXT,
+      BF保管荷姿           TEXT,
+      いろは在庫化作業有無 TEXT,
+      memo                 TEXT,
+      source               TEXT NOT NULL CHECK (source IN ('excel', 'auto', 'manual')),
+      -- 楽観ロック用 (Codex R2: updated_at 比較はミリ秒衝突があり得るため整数 version で行う。
+      --  f_mis_shipments と同じ方式)
+      version              INTEGER NOT NULL DEFAULT 1,
+      created_at           TEXT NOT NULL,
+      updated_at           TEXT NOT NULL,
+      updated_by           TEXT,
+      CHECK (trim(商品コード) <> ''),
+      -- code_key は JS 側で lower(trim()) を計算して渡す。SQLite の lower() は ASCII 限定で
+      -- 全角英字を変換できず JS と食い違うため、SQL 側では等式 CHECK を張らない。
+      CHECK (trim(code_key) <> '')
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inbound_source ON f_inbound_info(source)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_inbound_missing ON f_inbound_info(code_key) WHERE 入数 IS NULL`);
+
+  // 原産国シート (47行、P3FB=食品表示系)。画像はスプレッドシートに埋め込み実体が無く
+  // TRUE/FALSE のチェック列だったため、有無フラグのみ移行する。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_origin (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      管理コード  TEXT,
+      識別番号    TEXT,
+      商品コード  TEXT NOT NULL,
+      code_key    TEXT NOT NULL,
+      商品名      TEXT,
+      産地        TEXT,
+      画像有無    INTEGER NOT NULL DEFAULT 0 CHECK (画像有無 IN (0, 1)),
+      version     INTEGER NOT NULL DEFAULT 1,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL,
+      updated_by  TEXT,
+      CHECK (trim(商品コード) <> ''),
+      CHECK (trim(code_key) <> '')
+    )
+  `);
+  // 同一商品コードでも管理コード違いで併存し得るため複合 UNIQUE (NULL 管理コードは '' に正規化して比較)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_origin_uni
+             ON f_inbound_origin(COALESCE(管理コード, ''), code_key)`);
+
+  // version 列は開発途中 (Codex R2) で追加したため、それ以前に作成された DB への migration
+  // (本番は初回デプロイから version 入り DDL だが、addColumnIfMissing は冪等なので常置で無害)
+  addColumnIfMissing('f_inbound_info', 'version', 'INTEGER NOT NULL DEFAULT 1');
+  addColumnIfMissing('f_inbound_origin', 'version', 'INTEGER NOT NULL DEFAULT 1');
+}
+// ▲▲▲ 入庫情報管理 ▲▲▲
 
 // ▼▼▼ 仕入れ先向け売れ筋共有（apps/supplier-sales）正本テーブル ▼▼▼
 // 方針: Render 完結書込（mirror_* と prefix 分離、ミニPC 不使用）。

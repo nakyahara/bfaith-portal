@@ -35,7 +35,7 @@ import { mkdir, copyFile, readFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
-import { openContext, ensureRmsLogin, safeHost, assertLoginEnv } from './lib-rakuten-login.mjs';
+import { openContext, ensureRmsLogin, safeHost, assertLoginEnv, isAuthBlocked } from './lib-rakuten-login.mjs';
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -495,12 +495,18 @@ async function main() {
         const status = await fetchItemDaily(page, dateIso);
         outcomes.push({ spec: 'item', ym: dateIso, status });
       } catch (e) {
+        const errorUrl = page.url(); // snap/logFetch中の遷移で着地URLを見失わないよう先頭で捕捉 (Codex R1 Medium)
         console.error(`✗ 商品分析 ${dateIso}: ${e.message}`);
         await snap(page, `item_${dateIso}_error`);
         await logFetch({ report_type: 'rdata_item_daily', period_from: dateIso, period_to: dateIso, status: 'error', message: e.message });
         outcomes.push({ spec: 'item', ym: dateIso, status: 'error' });
         failures.push({ reportType: 'rdata_item_daily', ym: dateIso, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_item_${dateIso}_error.png`) });
-        if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+        if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+        // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+        // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+        if (/app_login_error|system_error/i.test(errorUrl)) {
+          throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+        }
         break; // 同レポートの残り日も同原因の可能性大 (店舗日次は試す)
       }
     }
@@ -510,12 +516,18 @@ async function main() {
         const status = await fetchStoreDaily(page, month);
         outcomes.push({ spec: 'store', ym: month.ym, status });
       } catch (e) {
+        const errorUrl = page.url(); // snap/logFetch中の遷移で着地URLを見失わないよう先頭で捕捉 (Codex R1 Medium)
         console.error(`✗ 店舗日次 ${month.ym}: ${e.message}`);
         await snap(page, `store_${month.ym}_error`);
         await logFetch({ report_type: 'rdata_store_daily', period_from: month.from, period_to: month.to, status: 'error', message: e.message });
         outcomes.push({ spec: 'store', ym: month.ym, status: 'error' });
         failures.push({ reportType: 'rdata_store_daily', ym: month.ym, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_store_${month.ym}_error.png`) });
-        if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+        if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+        // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+        // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+        if (/app_login_error|system_error/i.test(errorUrl)) {
+          throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+        }
         break;
       }
     }
@@ -543,6 +555,7 @@ async function main() {
           const status = await fetchDdOne(page, spec, range);
           outcomes.push({ spec: spec.key, ym: ymLabel, status });
         } catch (e) {
+          const errorUrl = page.url(); // snap/logFetch中の遷移で着地URLを見失わないよう先頭で捕捉 (Codex R1 Medium)
           console.error(`✗ ${spec.label} ${ymLabel}: ${e.message}`);
           await snap(page, `${spec.key}_${ymLabel}_error`);
           await logFetch({
@@ -551,7 +564,12 @@ async function main() {
           });
           outcomes.push({ spec: spec.key, ym: ymLabel, status: 'error' });
           failures.push({ reportType: spec.reportType, ym: ymLabel, error: e.message, url: page.url(), screenshot: join(OUT_DIR, `rdata_${spec.key}_${ymLabel}_error.png`) });
-          if (String(e.message).startsWith('2FA_REQUIRED')) throw e;
+          if (isAuthBlocked(e.message)) throw e; // 2FA/セッション不安定は全レポート共倒れ → 即通知へ
+          // 認証拒否ページ (2026-07-17規制) に着地 = 全レポート共倒れ確定 → ログイン連打と
+          // 25分後の無駄なリトライを避けるため RMS_SESSION_UNSTABLE (blocked) に昇格して即中止
+          if (/app_login_error|system_error/i.test(errorUrl)) {
+            throw new Error(`RMS_SESSION_UNSTABLE: サブアプリが認証拒否 (${page.url()})。楽天側の利用規制/障害の可能性 — 以降を中止 (必要分は手動DLで incoming/ へ)`);
+          }
           break; // 同種の残り期間はスキップ (他種は続行)
         }
       }
@@ -570,19 +588,22 @@ async function main() {
     }
   } catch (err) {
     const is2fa = String(err.message).startsWith('2FA_REQUIRED');
+    const isUnstable = String(err.message).startsWith('RMS_SESSION_UNSTABLE');
     console.error(`\n⚠️ ${err.message}`);
     await snap(page, 'error');
     await sendGChat(buildErrorReport({
       mall: 'rakuten-data', outcomes, logPath: runLog.logPath,
       failures: [{
-        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : 'rdata(共通処理)',
+        reportType: is2fa ? '2FA_REQUIRED (全レポート停止)' : isUnstable ? 'RMS_SESSION_UNSTABLE (全レポート停止)' : 'rdata(共通処理)',
         error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'rdata_error.png'),
       }],
       repro: is2fa
         ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/rakuten-login-spike.mjs → 手動ログイン+「信頼できる端末」登録 (14日ごと)'
-        : 'node scripts/mall-csv-fetcher/rakuten-data-download.mjs',
+        : isUnstable
+          ? '楽天側の利用規制/障害の可能性 → ログイン連打を避けて当日は手動DL。回復確認は翌朝の自動実行'
+          : 'node scripts/mall-csv-fetcher/rakuten-data-download.mjs',
     }), 'rakuten-data');
-    process.exitCode = 1;
+    process.exitCode = (is2fa || isUnstable) ? 3 : 1; // 3=手動対応必須/blocked (fetch-all はリトライしない)
   } finally {
     if (process.env.HEADLESS !== '1') {
       console.log('\n目視用にブラウザを120秒開いたままにします。Ctrl+Cで終了可。');

@@ -5,6 +5,8 @@ import fs from 'fs';
 import path from 'path';
 import { initInquiryHubDB, getDB, logActivity, toUtcIso } from './db.js';
 import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE } from './queries.js';
+import { parseCsv, importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { purgeDemo } from './scripts/purge-demo.mjs';
 
 const T = s => toUtcIso(s); // fixture はJSTで書き、保存は正準形式 (UTC 'YYYY-MM-DDTHH:MM:SSZ')
 
@@ -159,6 +161,134 @@ check('logActivity 構造化記録', log && log.action_type === 'status_change'
   && JSON.parse(log.before_json).status === 'open' && JSON.parse(log.after_json).status === 'in_progress');
 db.prepare('INSERT INTO internal_notes (inquiry_id, user_id, body) VALUES (?,?,?)').run(inq1, 'smoke-user', 'テストメモ');
 check('メモが詳細に載る', getInquiryDetail(inq1).notes.length === 1);
+
+// ─── 7. テンプレート/Q&A (メールディーラーCSV取込) ───
+console.log('7. テンプレート/Q&A取込');
+check('parseCsv: 引用符内改行+""エスケープ',
+  JSON.stringify(parseCsv('"a","b\nc","d""e"\n"2","3","4"')) === JSON.stringify([['a', 'b\nc', 'd"e'], ['2', '3', '4']]));
+check('parseCsv: BOM除去', parseCsv('﻿"x"')[0][0] === 'x');
+// 厳格化 (Codex R1 high: 不正CSVを黙って壊れた行にしない)
+throws('parseCsv: 未クローズ引用符はエラー', () => parseCsv('"a","b\nc'), '閉じていません');
+throws('parseCsv: セル途中の引用符はエラー', () => parseCsv('a"b,c'), 'セル途中');
+throws('parseCsv: 閉じ引用符後の余分な文字はエラー', () => parseCsv('"a"x,"b"'), '余分な文字');
+check('parseCsv: CR-only改行', JSON.stringify(parseCsv('"a","b"\r"c","d"')) === JSON.stringify([['a', 'b'], ['c', 'd']]));
+check('parseCsv: CRLF改行+途中空行無視', JSON.stringify(parseCsv('"a"\r\n\r\n"b"')) === JSON.stringify([['a'], ['b']]));
+check('parseCsv: 空セル明示行 ,, は残る (Codex R2)', JSON.stringify(parseCsv(',,')) === JSON.stringify([['', '', '']]));
+check('parseCsv: 空セル明示行 "","" は残る', JSON.stringify(parseCsv('"",""')) === JSON.stringify([['', '']]));
+
+const TPL_HDR = '"テンプレートID","テンプレート名","件名","本文（上）","本文（下）","To","From","Fromの表示名","Cc","Bcc","重要キーワード","キーワード","利用できる画面","備考","表示順序","テンプレートグループ","登録日","最終更新日"';
+const tplCsv = [TPL_HDR,
+  '"977","キャンセル完了","","本文です\n2行目","署名","","","","","","重要","キーワード","新規メール","備考メモ","1","注文キャンセル処理","2021/07/08 07:13:21","2025/03/12 14:15:53"',
+  '"1009","名前だけ本文なし","","","","","","","","","","","","","2","グループB","",""',
+].join('\n');
+const tr1 = importTemplatesCsv(tplCsv);
+check('テンプレ取込: 1新規+1スキップ', tr1.inserted === 1 && tr1.skipped === 1 && tr1.errors.length === 1);
+const tr2 = importTemplatesCsv(tplCsv);
+check('テンプレ再取込は更新 (冪等)', tr2.inserted === 0 && tr2.updated === 1);
+const tpl977 = db.prepare("SELECT * FROM reply_templates WHERE external_id = '977'").get();
+check('テンプレ列マッピング', tpl977.template_name === 'キャンセル完了' && tpl977.category === '注文キャンセル処理'
+  && tpl977.template_body === '本文です\n2行目' && tpl977.body_bottom === '署名'
+  && tpl977.keywords === '重要 / キーワード' && tpl977.sort_order === 1);
+check('メールディーラー日時 JST→UTC正準', tpl977.source_updated_at === '2025-03-12T05:15:53Z');
+throws('テンプレCSV: ヘッダ不正はエラー', () => importTemplatesCsv('"foo","bar"\n"1","2"'), '必須列');
+// 列数不一致・長さ超過は行スキップ+エラー報告 (Codex R1 medium)
+{
+  const badRow = importTemplatesCsv([TPL_HDR, '"9001","列足りず","本文"'].join('\n'));
+  check('テンプレ取込: 列数不一致はスキップ', badRow.skipped === 1 && /列数不一致/.test(badRow.errors[0]));
+  const longName = 'あ'.repeat(201);
+  const longRow = importTemplatesCsv([TPL_HDR,
+    `"9002","${longName}","","本文","","","","","","","","","","","1","G","",""`].join('\n'));
+  check('テンプレ取込: 長さ超過はスキップ', longRow.skipped === 1 && /長すぎます/.test(longRow.errors[0]));
+}
+
+// 手動追加 (external_id NULL) は取込で消えない + NULL複数許容
+db.prepare("INSERT INTO reply_templates (template_name, template_body) VALUES ('手動A', 'x')").run();
+db.prepare("INSERT INTO reply_templates (template_name, template_body) VALUES ('手動B', 'y')").run();
+importTemplatesCsv(tplCsv);
+check('手動追加分は再取込の影響なし (partial unique index)',
+  db.prepare('SELECT COUNT(*) c FROM reply_templates WHERE external_id IS NULL').get().c === 2
+  && db.prepare('SELECT COUNT(*) c FROM reply_templates').get().c === 3);
+
+const lt = listTemplates({ q: 'キャンセル' });
+check('listTemplates 検索', lt.rows.length === 1 && lt.categories.length === 1);
+
+// 論理削除は再取込で復活する (is_active=1 に戻す仕様)
+db.prepare("UPDATE reply_templates SET is_active = 0 WHERE external_id = '977'").run();
+importTemplatesCsv(tplCsv);
+check('論理削除は再取込で復活', db.prepare("SELECT is_active FROM reply_templates WHERE external_id = '977'").get().is_active === 1);
+
+const QA_HDR = '"Q&A ID","カテゴリID","カテゴリ名","件名","質問内容","回答","備考","担当者","登録日","最終更新日","公開状況",';
+const qaCsv = [QA_HDR,
+  '"2","1","商品について","ひまし油の抽出方法","低温圧搾ですか?","高温圧搾です。","","管理者","2023/05/08 13:24:21","2023/05/08 13:24:37","公開",""',
+  '"3","1","商品について","回答なし","質問だけ","","","","","","非公開",""',
+].join('\n');
+const qr1 = importQaCsv(qaCsv);
+check('Q&A取込: 1新規+1スキップ (回答空)', qr1.inserted === 1 && qr1.skipped === 1);
+const qr2 = importQaCsv(qaCsv);
+check('Q&A再取込は更新 (冪等)', qr2.updated === 1);
+const qa2 = db.prepare("SELECT * FROM qa_entries WHERE external_id = '2'").get();
+check('Q&A列マッピング', qa2.title === 'ひまし油の抽出方法' && qa2.answer === '高温圧搾です。'
+  && qa2.category === '商品について' && qa2.is_published === 1);
+check('listQa 検索', listQa({ q: 'ひまし油' }).rows.length === 1);
+throws('Q&A CSV: ヘッダ不正はエラー', () => importQaCsv('"x"\n"1"'), '必須列');
+
+// ─── 8. デモデータ削除 (purge-demo) ───
+console.log('8. デモデータ削除 (purge-demo)');
+{
+  const before = db.prepare('SELECT COUNT(*) c FROM inquiries').get().c;
+  // demoフィクスチャ: seed-demo が作るものと同じ構造 (店舗 + demo:チケット + 全子テーブル)
+  const demoShop = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','デモ楽天','demo-rakuten-shop')").run().lastInsertRowid;
+  const demoInq = insInq.run('rakuten', demoShop, 'demo:rk-1', 'デモ客', 'mask-demo', 'デモ問い合わせ',
+    'open', null, null, null, null, 1, 0, 1, T('2026-07-14T09:00:00+09:00'), T('2026-07-14T09:00:00+09:00')).lastInsertRowid;
+  const demoMsg = insMsg.run(demoInq, 'demo:m-1', 'customer', 'デモ客', 'デモ本文', 1, T('2026-07-14T09:00:00+09:00')).lastInsertRowid;
+  db.prepare("INSERT INTO inquiry_attachments (inquiry_message_id, external_attachment_id, file_name) VALUES (?,?,?)").run(demoMsg, 'demo:att-1', 'd.jpg');
+  db.prepare(`INSERT INTO outbox_replies (inquiry_id, channel_type, client_operation_id, body_text, created_by, base_conversation_rev)
+    VALUES (?,?,?,?,?,?)`).run(demoInq, 'rakuten', 'op-demo-1', 'x', 'smoke', 0);
+  const demoJob = db.prepare('INSERT INTO ai_jobs (inquiry_id, input_rev) VALUES (?, 0)').run(demoInq).lastInsertRowid;
+  db.prepare('INSERT INTO ai_drafts (inquiry_id, ai_job_id, input_rev, draft_body) VALUES (?,?,0,?)').run(demoInq, demoJob, 'AI案');
+  db.prepare('INSERT INTO internal_notes (inquiry_id, user_id, body) VALUES (?,?,?)').run(demoInq, 'smoke', 'demoメモ');
+  logActivity(demoInq, { actorType: 'system', actionType: 'seed', after: { source: 'smoke' } });
+  db.prepare('INSERT INTO sync_state (shop_id) VALUES (?)').run(demoShop);
+  db.prepare("INSERT INTO sync_errors (shop_id, inquiry_id, error_type) VALUES (?,?, 'fetch_failed')").run(demoShop, demoInq);
+
+  // dry-run: 件数レポートのみで何も消えない
+  const dry = purgeDemo({ apply: false });
+  check('purge dry-run: 対象件数を検出', dry.deleted.inquiries === 1 && dry.deleted.inquiry_messages === 1
+    && dry.deleted.inquiry_attachments === 1 && dry.deleted.outbox_replies === 1
+    && dry.deleted.ai_jobs === 1 && dry.deleted.ai_drafts === 1 && dry.deleted.shops === 1);
+  check('purge dry-run: 何も削除されない', db.prepare('SELECT COUNT(*) c FROM inquiries').get().c === before + 1
+    && db.prepare('SELECT COUNT(*) c FROM shops WHERE id = ?').get(demoShop).c === 1);
+
+  // apply: demoだけ消え、既存フィクスチャ・テンプレ/Q&Aは無傷
+  const tplBefore = db.prepare('SELECT COUNT(*) c FROM reply_templates').get().c;
+  const applied = purgeDemo({ apply: true });
+  check('purge apply: demo全削除', applied.remainingDemo === 0
+    && db.prepare('SELECT COUNT(*) c FROM shops WHERE id = ?').get(demoShop).c === 0
+    && db.prepare('SELECT COUNT(*) c FROM sync_state WHERE shop_id = ?').get(demoShop).c === 0
+    && db.prepare('SELECT COUNT(*) c FROM sync_errors WHERE shop_id = ?').get(demoShop).c === 0);
+  check('purge apply: 非demoデータは無傷', db.prepare('SELECT COUNT(*) c FROM inquiries').get().c === before
+    && db.prepare('SELECT COUNT(*) c FROM reply_templates').get().c === tplBefore
+    && getInquiryDetail(inq1) !== null);
+
+  // デモ店舗に実データが紐付いた場合は店舗を残す
+  const mixedShop = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','デモYahoo','demo-yahoo-seller')").run().lastInsertRowid;
+  insInq.run('yahoo', mixedShop, 'demo:yh-1', 'デモ', 'y-demo', 'demoの件',
+    'open', null, null, null, null, 1, 0, 0, T('2026-07-14T10:00:00+09:00'), null);
+  insInq.run('yahoo', mixedShop, 'real-yh-1', '実顧客', 'y-real', '実データの件',
+    'open', null, null, null, null, 1, 0, 0, T('2026-07-14T11:00:00+09:00'), null);
+  const mixed = purgeDemo({ apply: true });
+  check('purge: 実データ紐付き店舗は残す (警告のみ)', mixed.keptShops.length === 1
+    && db.prepare('SELECT COUNT(*) c FROM shops WHERE id = ?').get(mixedShop).c === 1
+    && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'real-yh-1'").get().c === 1
+    && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'demo:yh-1'").get().c === 0);
+
+  // GLOBの大文字小文字区別: 'DEMO:'で始まる実データは誤爆しない (Codexレビュー指摘)
+  insInq.run('yahoo', mixedShop, 'DEMO:not-a-demo', '実顧客2', 'y-real2', '大文字DEMOで始まる実データ',
+    'open', null, null, null, null, 1, 0, 0, T('2026-07-14T12:00:00+09:00'), null);
+  const caseTest = purgeDemo({ apply: true });
+  check('purge: 大文字DEMO:は削除対象外 (GLOB大小区別)', caseTest.deleted.inquiries === 0
+    && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'DEMO:not-a-demo'").get().c === 1);
+}
 
 // ─── 結果 ───
 console.log(`\n${failed === 0 ? 'OK' : 'NG'}: ${passed} PASS / ${failed} FAIL`);

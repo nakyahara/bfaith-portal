@@ -17,9 +17,22 @@
  * 外部API同期 (Step 2)・返信送信 (Step 3〜5)・ロック (Step 6)・AI (Step 7) は未実装。
  * external_status / 最終同期日時 は表示のみ (同期実装前は seed 値がそのまま出る)。
  */
+import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
+import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { runSync, listSyncStatus } from './sync/engine.js';
+import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
+import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
+import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv } from './mail-rules.js';
+
+// 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
+// ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
+const replyEditorEnabled = () => {
+  const v = process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
+  return v === 'true' || v === '1';
+};
 
 const router = Router();
 
@@ -39,6 +52,33 @@ function fmtJst(iso) {
 const badge = (meta, text) => meta ? `<span class="badge" style="${meta.badge}">${he(text != null ? text : meta.label)}</span>` : '';
 const chBadge = ch => badge(CHANNELS[ch], null) || he(ch);
 const stBadge = st => badge(STATUSES[st], null) || he(st);
+
+// ─── 対応履歴の表示整形 (生JSONではなく日本語ラベルで出す) ───
+const ACTION_LABELS = {
+  status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
+  attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
+  reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
+};
+function fmtLogValue(key, v) {
+  switch (key) {
+    case 'status': return (STATUSES[v] || {}).label || String(v);
+    case 'is_unread': return v ? '未読' : '既読';
+    case 'needs_attention': return v ? '⚠️要確認ON' : '要確認OFF';
+    case 'ai_needed': return Number(v) === 0 ? 'AI不要' : ((AI_FLAGS[v] || {}).label || String(v));
+    case 'assigned': return v ? String(v) : '未割当';
+    case 'length': return `${v}文字`;
+    case 'source': return String(v);
+    default: return typeof v === 'object' ? JSON.stringify(v) : String(v);
+  }
+}
+/** before_json/after_json → 「対応中」「未読」等の表示文字列。null入力はnull返し */
+function fmtLogJson(json) {
+  if (!json) return null;
+  try {
+    const o = JSON.parse(json);
+    return Object.entries(o).map(([k, v]) => fmtLogValue(k, v)).join(', ');
+  } catch { return json; } // 表示用なので壊れたJSONはそのまま出す
+}
 
 // ─── 一覧画面 ───
 router.get('/', (req, res) => {
@@ -101,7 +141,7 @@ router.get('/', (req, res) => {
 router.get('/inquiries/:id', (req, res) => {
   const id = Number(req.params.id);
   const detail = getInquiryDetail(id);
-  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', '', '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
+  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', 'list', '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
@@ -130,18 +170,10 @@ router.get('/inquiries/:id', (req, res) => {
     <div class="note"><div class="note-head"><b>${he(n.user_id)}</b> <span class="msg-date">${fmtJst(n.created_at)}</span></div>
     <div>${he(n.body).replace(/\n/g, '<br>')}</div></div>`).join('') || '<div class="empty">メモはありません</div>';
 
-  const ACTION_LABELS = {
-    status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
-    attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
-  };
   const logHtml = logs.map(l => {
-    let detail = '';
-    try {
-      const b = l.before_json ? JSON.parse(l.before_json) : null;
-      const a = l.after_json ? JSON.parse(l.after_json) : null;
-      if (b != null && a != null) detail = `${JSON.stringify(b)} → ${JSON.stringify(a)}`;
-      else if (a != null) detail = JSON.stringify(a);
-    } catch { /* 表示用なので壊れたJSONは無視 */ }
+    const b = fmtLogJson(l.before_json);
+    const a = fmtLogJson(l.after_json);
+    const detail = b != null && a != null ? `${b} → ${a}` : (a != null ? a : '');
     return `<div class="log-row"><span class="msg-date">${fmtJst(l.created_at)}</span> <b>${he(l.user_id || l.actor_type)}</b> ${he(ACTION_LABELS[l.action_type] || l.action_type)} <span class="sub">${he(detail)}</span></div>`;
   }).join('') || '<div class="empty">履歴はありません</div>';
 
@@ -156,6 +188,35 @@ router.get('/inquiries/:id', (req, res) => {
       ${draft.notes ? `<div class="sub">注意: ${he(draft.notes)}</div>` : ''}
     </div>` : '';
 
+  // ─── 返信エディタ (Dark Launch。設計書§7.1#3) ───
+  // 送信ジョブは作成時点では pending。送信ワーカー (Step 3〜) が拾うまで実送信されない
+  const outboxJobs = getDB().prepare(
+    'SELECT * FROM outbox_replies WHERE inquiry_id = ? ORDER BY id DESC LIMIT 10').all(inq.id);
+  const activeJob = outboxJobs.find(o => ['pending', 'sending', 'needs_review'].includes(o.status)
+    || (o.status === 'unknown' && !o.resolution));
+  const jobBadge = o => {
+    const meta = OUTBOX_STATUS_LABELS[o.status] || { label: o.status, style: 'background:#f1f5f9;color:#475569' };
+    return `<span class="badge" style="${meta.style}">${he(meta.label)}</span>`;
+  };
+  const outboxHtml = outboxJobs.length ? `
+    <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
+    ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>
+      <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span></div>`).join('')}` : '';
+  const replyPanel = replyEditorEnabled() ? `
+      <div class="panel">
+        <h3>✉️ 返信を作成</h3>
+        <div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">
+          ⚠️ 送信ワーカーは準備中です。作成した返信ジョブはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>
+        ${outboxHtml}
+        ${activeJob
+          ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
+          : `<textarea id="replyBody" rows="6" placeholder="返信本文 (テンプレートは📄タブからコピーして貼り付け)"></textarea>
+        <div class="row" style="margin-top:8px; justify-content:flex-end">
+          <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
+        </div>`}
+      </div>` : `
+      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>`;
+
   const body = `
   <div class="detail-head">
     <a href="/apps/inquiry-hub">← 一覧に戻る</a>
@@ -164,7 +225,7 @@ router.get('/inquiries/:id', (req, res) => {
   <div class="detail-grid">
     <div class="thread">
       ${msgHtml || '<div class="empty">メッセージがありません</div>'}
-      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>
+      ${replyPanel}
     </div>
     <div class="side">
       <div class="panel">
@@ -246,9 +307,25 @@ router.get('/inquiries/:id', (req, res) => {
     btn.disabled = true;
     post('/notes', { body: body }).then(function() { location.reload(); })
       .catch(function(e) { btn.disabled = false; toast('追加失敗: ' + e.message); });
+  });
+  // 返信ジョブ作成 (Dark Launch時のみボタンが存在)。操作IDはページ描画時にサーバーが採番
+  // → 同じ画面からの再送信 (リトライ) は冪等、新しい返信はリロード後の新IDで作成
+  var REPLY_OP_ID = ${JSON.stringify(crypto.randomUUID())};
+  var REPLY_BASE_REV = ${Number(inq.conversation_rev) || 0};
+  var REPLY_CH = ${JSON.stringify((CHANNELS[inq.channel_type] || {}).label || inq.channel_type).replace(/</g, '\\u003c')};
+  var replyBtn = document.getElementById('replyBtn');
+  if (replyBtn) replyBtn.addEventListener('click', function() {
+    var body = document.getElementById('replyBody').value.trim();
+    if (!body) { toast('本文が空です'); return; }
+    var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
+    if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客\\n\\n' + preview)) return;
+    replyBtn.disabled = true;
+    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV })
+      .then(function(r) { toast(r.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました'); setTimeout(function(){ location.reload(); }, 900); })
+      .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
 
-  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, '', body, script));
+  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, 'list', body, script));
 });
 
 // ─── 操作API (すべて操作ログを記録) ───
@@ -337,6 +414,31 @@ router.post('/api/inquiries/:id/ai-flag', (req, res) => {
   res.json({ ok: true });
 });
 
+// 返信ジョブ作成 (Dark Launch。設計書§7.1#3 / §8.3)。実際の送信は送信ワーカー (Step 3〜) が担う
+router.post('/api/inquiries/:id/reply', (req, res) => {
+  if (!replyEditorEnabled()) return res.status(403).json({ error: '返信機能は現在無効です (INQUIRY_HUB_REPLY_EDITOR_ENABLED)' });
+  const inq = loadInquiry(req, res); if (!inq) return;
+  const body = String((req.body || {}).body || '').trim();
+  const opId = String((req.body || {}).clientOperationId || '');
+  const baseRev = Number((req.body || {}).baseConversationRev);
+  if (!body) return res.status(400).json({ error: '本文が空です' });
+  if (body.length > 10000) return res.status(400).json({ error: '本文が長すぎます (10000文字まで)' });
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(opId)) {
+    return res.status(400).json({ error: '不正な操作IDです (画面を再読み込みしてください)' });
+  }
+  if (!Number.isInteger(baseRev)) return res.status(400).json({ error: '不正なリクエストです (baseConversationRev)' });
+  try {
+    const r = createReplyJob({
+      inquiryId: inq.id, channelType: inq.channel_type, bodyText: body,
+      createdBy: actorOf(req), clientOperationId: opId, baseConversationRev: baseRev,
+    });
+    if (r.conflict) return res.status(409).json({ error: r.conflict });
+    res.json({ ok: true, id: r.id, duplicate: !r.created });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
 router.post('/api/inquiries/:id/notes', (req, res) => {
   const inq = loadInquiry(req, res); if (!inq) return;
   const body = String((req.body || {}).body || '').trim();
@@ -348,13 +450,866 @@ router.post('/api/inquiries/:id/notes', (req, res) => {
   res.json({ ok: true });
 });
 
+// ─── カテゴリ階層ツリー (メールディーラーのグループ階層は ' > ' 区切り。例: 商品についての質問 > エッセンシャルオイル > ハッカ油) ───
+function buildCategoryTree(rows) {
+  const root = { children: new Map(), items: [], total: 0 };
+  for (const r of rows) {
+    const parts = r.category ? String(r.category).split(' > ').map(s => s.trim()).filter(Boolean) : [];
+    let node = root;
+    root.total++;
+    for (const p of parts) {
+      if (!node.children.has(p)) node.children.set(p, { children: new Map(), items: [], total: 0 });
+      node = node.children.get(p);
+      node.total++;
+    }
+    node.items.push(r);
+  }
+  return root;
+}
+
+/**
+ * 階層アコーディオンHTML。デフォルトは第一階層のみ表示 (全グループ閉)。
+ * openAll=true (検索/絞込中や「全て展開」) で全階層+中身を開いた状態で出す。
+ */
+function renderCategoryTree(node, renderItem, openAll, depth = 0) {
+  let html = '';
+  for (const [name, child] of node.children) {
+    html += `<details class="grp"${openAll ? ' open' : ''}>
+      <summary><span class="grp-arrow">▶</span>📁 ${he(name)} <span class="grp-count">${child.total}件</span></summary>
+      <div class="grp-body">${renderCategoryTree(child, renderItem, openAll, depth + 1)}${child.items.map(renderItem).join('')}</div>
+    </details>`;
+  }
+  if (depth === 0 && node.items.length) {
+    html += `<details class="grp"${openAll ? ' open' : ''}>
+      <summary><span class="grp-arrow">▶</span>📁 (グループなし) <span class="grp-count">${node.items.length}件</span></summary>
+      <div class="grp-body">${node.items.map(renderItem).join('')}</div>
+    </details>`;
+  }
+  return html;
+}
+
+/**
+ * カテゴリselectのoption (階層はインデント表示)。
+ * ラベルにフルパスを残す: 別親の同名サブグループ (食品>オイル と 化粧品>オイル) を区別するため (Codexレビュー反映)
+ */
+function categoryOptions(categories, current) {
+  return categories.map(c => {
+    const parts = String(c.category).split(' > ');
+    const label = '　'.repeat(parts.length - 1) + (parts.length > 1 ? '└ ' : '') + parts.join(' › ') + ` (${c.c})`;
+    return `<option value="${he(c.category)}"${String(current || '') === String(c.category) ? ' selected' : ''}>${he(label)}</option>`;
+  }).join('');
+}
+
+// 「全て展開/全て閉じる」ボタン (details.grp を一括開閉)
+const EXPAND_BUTTONS = `
+    <button class="ghost" type="button" id="expandAll">⬇️ 全て展開</button>
+    <button class="ghost" type="button" id="collapseAll">⬆️ 全て閉じる</button>`;
+const EXPAND_SCRIPT = `
+  document.getElementById('expandAll').addEventListener('click', function() {
+    document.querySelectorAll('details.grp').forEach(function(d) { d.open = true; });
+  });
+  document.getElementById('collapseAll').addEventListener('click', function() {
+    document.querySelectorAll('details.grp').forEach(function(d) { d.open = false; });
+  });`;
+
+// ─── テンプレート管理 (メールディーラーCSV取込 + CRUD) ───
+router.get('/templates', (req, res) => {
+  const q = req.query || {};
+  const { rows, categories } = listTemplates(q);
+  const kw = String(q.q || '').trim();
+  const filtering = !!(kw || q.category); // 検索/絞込中は結果がすぐ見えるよう全展開
+
+  const filterBar = `
+  <div class="filters">
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select name="category"><option value="">グループ: 全て</option>${categoryOptions(categories, q.category)}</select>
+      <input type="search" name="q" value="${he(kw)}" placeholder="テンプレート名/件名/本文/キーワード" style="min-width:240px">
+      <button class="pri">🔍 検索</button>
+      <a href="/apps/inquiry-hub/templates" class="ghost btn-link">クリア</a>
+    </form>
+    ${EXPAND_BUTTONS}
+    <span style="flex:1"></span>
+    <button class="ghost" id="newBtn">➕ 新規テンプレート</button>
+    <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
+  </div>
+  <div id="editPanel" class="panel" style="display:none">
+    <h3 id="editTitle">テンプレート編集</h3>
+    <div class="edit-grid">
+      <label>テンプレート名 *<input type="text" id="fName"></label>
+      <label>グループ<input type="text" id="fCategory" list="catList" placeholder="例: 領収書発行について"><datalist id="catList">${categories.map(c => `<option value="${he(c.category)}">`).join('')}</datalist></label>
+      <label>件名<input type="text" id="fSubject"></label>
+      <label>キーワード<input type="text" id="fKeywords"></label>
+    </div>
+    <label>本文 *<textarea id="fBody" rows="10"></textarea></label>
+    <label>本文（下）= 署名等<textarea id="fBodyBottom" rows="3"></textarea></label>
+    <label>備考<input type="text" id="fNotes"></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="editCancel">キャンセル</button>
+      <button class="pri" id="editSave">保存</button>
+    </div>
+  </div>`;
+
+  const renderTplItem = r => `
+    <details class="tpl" id="tpl-${r.id}">
+      <summary><span class="tpl-icon">📄</span><b>${he(r.template_name)}</b>${r.subject ? ` <span class="sub">件名: ${he(r.subject)}</span>` : ''}
+        <span class="sub" style="margin-left:auto">使用${r.usage_count}回 ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
+      <div class="tpl-body">
+        ${r.keywords ? `<div class="sub">🔑 ${he(r.keywords)}</div>` : ''}
+        <pre>${he(r.template_body)}</pre>
+        ${r.body_bottom ? `<pre class="sub">${he(r.body_bottom)}</pre>` : ''}
+        ${r.notes ? `<div class="sub">備考: ${he(r.notes)}</div>` : ''}
+        <div class="tpl-ops">
+          <button class="pri" data-copy="${r.id}">📋 本文をコピー</button>
+          <button class="ghost" data-edit="${r.id}">✏️ 編集</button>
+          <button class="ghost" data-del="${r.id}">🗑 削除</button>
+        </div>
+      </div>
+    </details>`;
+  const items = renderCategoryTree(buildCategoryTree(rows), renderTplItem, filtering);
+
+  const body = `${filterBar}
+  <div class="card" style="padding:12px">
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${filtering ? ' (絞り込み中 — 全グループ展開表示)' : ''} — 📁グループをクリックで開閉、📄テンプレートをクリックで本文表示。返信送信機能 (Step 3) 実装までは「📋コピー」でメールディーラー等に貼り付けて使用</div>
+    ${items || '<div class="empty">テンプレートがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
+  </div>`;
+
+  const script = `
+  var TPL = ${JSON.stringify(Object.fromEntries(rows.map(r => [r.id, {
+    template_name: r.template_name, category: r.category, subject: r.subject, keywords: r.keywords,
+    template_body: r.template_body, body_bottom: r.body_bottom, notes: r.notes,
+  }]))).replace(/</g, '\\u003c')};
+  function post(path, data) {
+    return fetch('/apps/inquiry-hub/api' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  var editId = null;
+  function openEdit(id) {
+    editId = id;
+    var d = id ? TPL[id] : {};
+    document.getElementById('editTitle').textContent = id ? 'テンプレート編集' : '新規テンプレート';
+    document.getElementById('fName').value = d.template_name || '';
+    document.getElementById('fCategory').value = d.category || '';
+    document.getElementById('fSubject').value = d.subject || '';
+    document.getElementById('fKeywords').value = d.keywords || '';
+    document.getElementById('fBody').value = d.template_body || '';
+    document.getElementById('fBodyBottom').value = d.body_bottom || '';
+    document.getElementById('fNotes').value = d.notes || '';
+    document.getElementById('editPanel').style.display = 'block';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  document.getElementById('newBtn').addEventListener('click', function() { openEdit(null); });
+  document.getElementById('editCancel').addEventListener('click', function() { document.getElementById('editPanel').style.display = 'none'; });
+  document.getElementById('editSave').addEventListener('click', function() {
+    var btn = this; btn.disabled = true;
+    var data = {
+      template_name: document.getElementById('fName').value,
+      category: document.getElementById('fCategory').value,
+      subject: document.getElementById('fSubject').value,
+      keywords: document.getElementById('fKeywords').value,
+      template_body: document.getElementById('fBody').value,
+      body_bottom: document.getElementById('fBodyBottom').value,
+      notes: document.getElementById('fNotes').value,
+    };
+    post(editId ? '/templates/' + editId : '/templates', data)
+      .then(function() { location.reload(); })
+      .catch(function(e) { btn.disabled = false; toast('保存失敗: ' + e.message); });
+  });
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+    if (t.dataset && t.dataset.copy) {
+      var d = TPL[t.dataset.copy];
+      var text = d.template_body + (d.body_bottom ? '\\n\\n' + d.body_bottom : '');
+      navigator.clipboard.writeText(text).then(function() {
+        toast('本文をコピーしました');
+        post('/templates/' + t.dataset.copy + '/copied', {}).catch(function(){});
+      }, function() { toast('コピーに失敗しました'); });
+    } else if (t.dataset && t.dataset.edit) {
+      openEdit(t.dataset.edit);
+    } else if (t.dataset && t.dataset.del) {
+      var dd = TPL[t.dataset.del];
+      if (!confirm('テンプレート「' + dd.template_name + '」を削除しますか?(論理削除。再取込で復活します)')) return;
+      post('/templates/' + t.dataset.del + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('削除失敗: ' + e.message); });
+    }
+  });
+  document.getElementById('csvFile').addEventListener('change', function() {
+    var f = this.files[0]; this.value = '';
+    if (!f) return;
+    if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで。JSON化で膨らむためサーバー上限2MBの手前で制限)'); return; }
+    f.text().then(function(text) {
+      if (!confirm('メールディーラーのテンプレートCSVを取り込みますか?\\n(同じテンプレートIDはCSVの内容で上書き / 手動追加分には触りません)')) return;
+      post('/templates/import', { csv: text }).then(function(r) {
+        alert('取込完了: 新規' + r.inserted + '件 / 更新' + r.updated + '件 / スキップ' + r.skipped + '件' + (r.errors.length ? '\\n\\n' + r.errors.slice(0, 10).join('\\n') : ''));
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    });
+  });
+  ${EXPAND_SCRIPT}`;
+  res.send(pageShell('問い合わせ管理 — テンプレート', 'templates', body, script));
+});
+
+// ─── Q&A管理 (社内ナレッジ) ───
+router.get('/qa', (req, res) => {
+  const q = req.query || {};
+  const { rows, categories } = listQa(q);
+  const kw = String(q.q || '').trim();
+  const filtering = !!(kw || q.category);
+
+  const filterBar = `
+  <div class="filters">
+    <form method="get" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select name="category"><option value="">カテゴリ: 全て</option>${categoryOptions(categories, q.category)}</select>
+      <input type="search" name="q" value="${he(kw)}" placeholder="件名/質問/回答" style="min-width:240px">
+      <button class="pri">🔍 検索</button>
+      <a href="/apps/inquiry-hub/qa" class="ghost btn-link">クリア</a>
+    </form>
+    ${EXPAND_BUTTONS}
+    <span style="flex:1"></span>
+    <button class="ghost" id="newBtn">➕ 新規Q&A</button>
+    <label class="ghost btn-link" style="cursor:pointer">📥 メールディーラーCSV取込<input type="file" id="csvFile" accept=".csv" style="display:none"></label>
+  </div>
+  <div id="editPanel" class="panel" style="display:none">
+    <h3 id="editTitle">Q&A編集</h3>
+    <div class="edit-grid">
+      <label>件名 *<input type="text" id="fTitle"></label>
+      <label>カテゴリ<input type="text" id="fCategory" list="catList"><datalist id="catList">${categories.map(c => `<option value="${he(c.category)}">`).join('')}</datalist></label>
+    </div>
+    <label>質問内容<textarea id="fQuestion" rows="3"></textarea></label>
+    <label>回答 *<textarea id="fAnswer" rows="6"></textarea></label>
+    <label>備考<input type="text" id="fNotes"></label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="ghost" id="editCancel">キャンセル</button>
+      <button class="pri" id="editSave">保存</button>
+    </div>
+  </div>`;
+
+  const renderQaItem = r => `
+    <details class="tpl" id="qa-${r.id}">
+      <summary><span class="tpl-icon">❓</span><b>${he(r.title)}</b>
+        <span class="sub" style="margin-left:auto">${he(r.staff || '')} ・ 更新 ${fmtJst(r.source_updated_at || r.updated_at)}</span></summary>
+      <div class="tpl-body">
+        ${r.question ? `<div class="qa-q">Q. ${he(r.question).replace(/\n/g, '<br>')}</div>` : ''}
+        <div class="qa-a">A. ${he(r.answer).replace(/\n/g, '<br>')}</div>
+        ${r.notes ? `<div class="sub">備考: ${he(r.notes)}</div>` : ''}
+        <div class="tpl-ops">
+          <button class="pri" data-copy="${r.id}">📋 回答をコピー</button>
+          <button class="ghost" data-edit="${r.id}">✏️ 編集</button>
+          <button class="ghost" data-del="${r.id}">🗑 削除</button>
+        </div>
+      </div>
+    </details>`;
+  const items = renderCategoryTree(buildCategoryTree(rows), renderQaItem, filtering);
+
+  const body = `${filterBar}
+  <div class="card" style="padding:12px">
+    <div class="sub" style="margin-bottom:8px">全${rows.length}件${filtering ? ' (絞り込み中 — 全カテゴリ展開表示)' : ''} — 📁カテゴリをクリックで開閉、❓質問をクリックで回答表示。商品知識・対応ノウハウの社内ナレッジ</div>
+    ${items || '<div class="empty">Q&amp;Aがありません。メールディーラーのエクスポートCSVを「📥CSV取込」から取り込んでください</div>'}
+  </div>`;
+
+  const script = `
+  var QA = ${JSON.stringify(Object.fromEntries(rows.map(r => [r.id, {
+    title: r.title, category: r.category, question: r.question, answer: r.answer, notes: r.notes,
+  }]))).replace(/</g, '\\u003c')};
+  function post(path, data) {
+    return fetch('/apps/inquiry-hub/api' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  var editId = null;
+  function openEdit(id) {
+    editId = id;
+    var d = id ? QA[id] : {};
+    document.getElementById('editTitle').textContent = id ? 'Q&A編集' : '新規Q&A';
+    document.getElementById('fTitle').value = d.title || '';
+    document.getElementById('fCategory').value = d.category || '';
+    document.getElementById('fQuestion').value = d.question || '';
+    document.getElementById('fAnswer').value = d.answer || '';
+    document.getElementById('fNotes').value = d.notes || '';
+    document.getElementById('editPanel').style.display = 'block';
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  document.getElementById('newBtn').addEventListener('click', function() { openEdit(null); });
+  document.getElementById('editCancel').addEventListener('click', function() { document.getElementById('editPanel').style.display = 'none'; });
+  document.getElementById('editSave').addEventListener('click', function() {
+    var btn = this; btn.disabled = true;
+    var data = {
+      title: document.getElementById('fTitle').value,
+      category: document.getElementById('fCategory').value,
+      question: document.getElementById('fQuestion').value,
+      answer: document.getElementById('fAnswer').value,
+      notes: document.getElementById('fNotes').value,
+    };
+    post(editId ? '/qa/' + editId : '/qa', data)
+      .then(function() { location.reload(); })
+      .catch(function(e) { btn.disabled = false; toast('保存失敗: ' + e.message); });
+  });
+  document.addEventListener('click', function(ev) {
+    var t = ev.target;
+    if (t.dataset && t.dataset.copy) {
+      navigator.clipboard.writeText(QA[t.dataset.copy].answer).then(function() { toast('回答をコピーしました'); }, function() { toast('コピーに失敗しました'); });
+    } else if (t.dataset && t.dataset.edit) {
+      openEdit(t.dataset.edit);
+    } else if (t.dataset && t.dataset.del) {
+      if (!confirm('Q&A「' + QA[t.dataset.del].title + '」を削除しますか?(論理削除。再取込で復活します)')) return;
+      post('/qa/' + t.dataset.del + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('削除失敗: ' + e.message); });
+    }
+  });
+  document.getElementById('csvFile').addEventListener('change', function() {
+    var f = this.files[0]; this.value = '';
+    if (!f) return;
+    if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで。JSON化で膨らむためサーバー上限2MBの手前で制限)'); return; }
+    f.text().then(function(text) {
+      if (!confirm('メールディーラーのQ&A CSVを取り込みますか?\\n(同じQ&A IDはCSVの内容で上書き / 手動追加分には触りません)')) return;
+      post('/qa/import', { csv: text }).then(function(r) {
+        alert('取込完了: 新規' + r.inserted + '件 / 更新' + r.updated + '件 / スキップ' + r.skipped + '件' + (r.errors.length ? '\\n\\n' + r.errors.slice(0, 10).join('\\n') : ''));
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    });
+  });
+  ${EXPAND_SCRIPT}`;
+  res.send(pageShell('問い合わせ管理 — Q&A', 'qa', body, script));
+});
+
+// ─── テンプレート/Q&A API ───
+router.post('/api/templates/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importTemplatesCsv(csv)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+router.post('/api/qa/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importQaCsv(csv)); }
+  catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+/** テンプレートの入力検証。エラー時はnullを返しresへ400を書く */
+function tplFields(body, res) {
+  const b = body || {};
+  const name = String(b.template_name || '').trim().slice(0, 200);
+  const tbody = String(b.template_body || '');
+  if (!name) { res.status(400).json({ error: 'テンプレート名は必須です' }); return null; }
+  if (!tbody.trim()) { res.status(400).json({ error: '本文は必須です' }); return null; }
+  if (tbody.length > 50000) { res.status(400).json({ error: '本文が長すぎます (50000文字まで)' }); return null; }
+  return {
+    template_name: name,
+    category: String(b.category || '').trim().slice(0, 200) || null,
+    subject: String(b.subject || '').trim().slice(0, 500) || null,
+    keywords: String(b.keywords || '').trim().slice(0, 500) || null,
+    template_body: tbody,
+    body_bottom: String(b.body_bottom || '').slice(0, 50000).trim() ? String(b.body_bottom || '').slice(0, 50000) : null,
+    notes: String(b.notes || '').trim().slice(0, 1000) || null,
+  };
+}
+
+router.post('/api/templates', (req, res) => {
+  const f = tplFields(req.body, res); if (!f) return;
+  getDB().prepare(`INSERT INTO reply_templates (template_name, category, subject, keywords, template_body, body_bottom, notes)
+    VALUES (@template_name, @category, @subject, @keywords, @template_body, @body_bottom, @notes)`).run(f);
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)', (req, res) => {
+  const f = tplFields(req.body, res); if (!f) return;
+  const r = getDB().prepare(`UPDATE reply_templates SET template_name = @template_name, category = @category,
+    subject = @subject, keywords = @keywords, template_body = @template_body, body_bottom = @body_bottom,
+    notes = @notes, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = @id AND is_active = 1`).run({ ...f, id: Number(req.params.id) });
+  if (!r.changes) return res.status(404).json({ error: 'テンプレートが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)/delete', (req, res) => {
+  const r = getDB().prepare(`UPDATE reply_templates SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = ? AND is_active = 1`).run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: 'テンプレートが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/templates/:id(\\d+)/copied', (req, res) => {
+  getDB().prepare('UPDATE reply_templates SET usage_count = usage_count + 1 WHERE id = ?').run(Number(req.params.id));
+  res.json({ ok: true });
+});
+
+/** Q&Aの入力検証 */
+function qaFields(body, res) {
+  const b = body || {};
+  const title = String(b.title || '').trim().slice(0, 300);
+  const answer = String(b.answer || '');
+  if (!title) { res.status(400).json({ error: '件名は必須です' }); return null; }
+  if (!answer.trim()) { res.status(400).json({ error: '回答は必須です' }); return null; }
+  if (answer.length > 50000) { res.status(400).json({ error: '回答が長すぎます (50000文字まで)' }); return null; }
+  return {
+    title,
+    category: String(b.category || '').trim().slice(0, 200) || null,
+    question: String(b.question || '').slice(0, 50000).trim() ? String(b.question || '').slice(0, 50000) : null,
+    answer,
+    notes: String(b.notes || '').trim().slice(0, 1000) || null,
+  };
+}
+
+router.post('/api/qa', (req, res) => {
+  const f = qaFields(req.body, res); if (!f) return;
+  getDB().prepare(`INSERT INTO qa_entries (title, category, question, answer, notes)
+    VALUES (@title, @category, @question, @answer, @notes)`).run(f);
+  res.json({ ok: true });
+});
+
+router.post('/api/qa/:id(\\d+)', (req, res) => {
+  const f = qaFields(req.body, res); if (!f) return;
+  const r = getDB().prepare(`UPDATE qa_entries SET title = @title, category = @category, question = @question,
+    answer = @answer, notes = @notes, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = @id AND is_active = 1`).run({ ...f, id: Number(req.params.id) });
+  if (!r.changes) return res.status(404).json({ error: 'Q&Aが見つかりません' });
+  res.json({ ok: true });
+});
+
+router.post('/api/qa/:id(\\d+)/delete', (req, res) => {
+  const r = getDB().prepare(`UPDATE qa_entries SET is_active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    WHERE id = ? AND is_active = 1`).run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: 'Q&Aが見つかりません' });
+  res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 📧 メールルール画面 (メールチャネルのノイズ除去。メールディーラー振り分け設定の移行先)
+// ═══════════════════════════════════════════════════════════════
+
+const RULE_FIELD_LABELS = { from: 'From', to: 'To', reply_to: 'Reply-To', subject: '件名', body: '本文' };
+const RULE_OP_LABELS = {
+  contains: 'を含む', not_contains: 'を含まない', equals: 'と一致', not_equals: 'と一致しない',
+  starts_with: 'で始まる', ends_with: 'で終わる',
+};
+const RULE_ACTION_LABELS = {
+  skip: { label: '🗑️取り込まない', style: 'background:#fee2e2;color:#b91c1c' },
+  import_done: { label: '✅取込+完了扱い', style: 'background:#dcfce7;color:#166534' },
+};
+
+router.get('/mail-rules', (req, res) => {
+  const rules = listMailRules();
+  const fmtConds = (r) => {
+    let conds;
+    try { conds = JSON.parse(r.conditions_json); } catch { return '(解析不能)'; }
+    const glue = r.match_mode === 'any' ? ' または ' : ' かつ ';
+    return conds.map(c => `${RULE_FIELD_LABELS[c.field] || c.field}が「${he(c.value)}」${RULE_OP_LABELS[c.op] || c.op}`).join(glue);
+  };
+  const trs = rules.map(r => {
+    const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
+    return `
+    <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
+      <td class="nowrap">${r.priority}</td>
+      <td>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
+      <td style="overflow-wrap:anywhere">${fmtConds(r)}</td>
+      <td><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
+      <td class="nowrap ops">
+        <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
+        <button onclick="deleteRule(${r.id}, this)">削除</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const fieldOpts = Object.entries(RULE_FIELD_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+  const opOpts = Object.entries(RULE_OP_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('');
+  const body = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">📥 メールディーラー「振り分けの設定」CSVの取込
+      <span class="sub">(ゴミ箱/削除ルール→「取り込まない」、対応完了ルール→「取込+完了扱い」として移行。フォルダ振り分けのみのルールは対象外)</span></div>
+    <div style="padding:12px 14px">
+      <input type="file" id="csvFile" accept=".csv">
+      <span class="sub">Shift-JIS/UTF-8 自動判定。まず内容を確認してから取込を実行します。再取込は同じ条件IDを上書き (手動追加分には触りません)</span>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🧪 ルールのテスト <span class="sub">(実際のメールを想定してどのルールに当たるか確認)</span></div>
+    <div style="padding:12px 14px" class="edit-grid">
+      <label>From <input type="text" id="tFrom" placeholder="例: no-reply@rakuten.co.jp"></label>
+      <label>件名 <input type="text" id="tSubject" placeholder="例: ご注文ありがとうございます"></label>
+      <label>Reply-To <input type="text" id="tReplyTo"></label>
+      <label>本文 (任意) <input type="text" id="tBody"></label>
+    </div>
+    <div style="padding:0 14px 12px"><button class="pri" onclick="testRule(this)">判定する</button> <span id="testResult" class="sub"></span></div>
+  </div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">➕ ルールを手動追加</div>
+    <div style="padding:12px 14px">
+      <div class="edit-grid">
+        <label>名称 (任意) <input type="text" id="nName"></label>
+        <label>優先度 (小さいほど先に評価) <input type="number" id="nPriority" value="50"></label>
+      </div>
+      ${[1, 2, 3].map(n => `
+      <div class="row" style="margin-bottom:6px">
+        <select id="nField${n}">${n > 1 ? '<option value="">(条件なし)</option>' : ''}${fieldOpts}</select>
+        <input type="text" id="nValue${n}" placeholder="文字列">
+        <select id="nOp${n}">${opOpts}</select>
+      </div>`).join('')}
+      <div class="row" style="align-items:center">
+        <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
+        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option></select>
+        <button class="pri" onclick="addRule(this)">追加</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">📜 ルール一覧 (${rules.length}件・優先度順に先勝ち)
+      <input type="search" id="ruleFilter" placeholder="絞り込み" style="margin-left:12px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-weight:normal"></div>
+    <table>
+      <thead><tr><th>優先度</th><th>名称</th><th>条件</th><th>アクション</th><th>操作</th></tr></thead>
+      <tbody id="ruleRows">${trs || '<tr><td colspan="5" class="empty">ルールがありません (CSVを取り込むか手動追加してください)</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+async function post(url, data) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+  const j = await r.json().catch(function(){ return {}; });
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+document.getElementById('csvFile').addEventListener('change', function() {
+  var f = this.files[0]; this.value = '';
+  if (!f) return;
+  if (f.size > 1.5 * 1024 * 1024) { toast('CSVが大きすぎます (1.5MBまで)'); return; }
+  f.arrayBuffer().then(function(buf) {
+    var text = new TextDecoder('utf-8').decode(buf);
+    if (text.indexOf('条件ID') < 0) text = new TextDecoder('shift-jis').decode(buf);
+    if (text.indexOf('条件ID') < 0) { toast('振り分け設定のエクスポートCSVではないようです'); return; }
+    post('/apps/inquiry-hub/api/mail-rules/import', { csv: text, apply: false }).then(function(r) {
+      var msg = '取込プレビュー:\\n・取り込まない(ノイズ除去): ' + r.toSkip + '件\\n・取込+完了扱い: ' + r.toImportDone + '件\\n・対象外(フォルダ振り分け等): ' + r.notTarget + '件\\n・移行不能(複合条件等): ' + r.unsupported.length + '件';
+      if (r.unsupported.length) msg += '\\n\\n移行不能の例:\\n' + r.unsupported.slice(0, 5).map(function(u){ return '  #' + u.condId + ' ' + (u.name || '') + ' — ' + u.reason; }).join('\\n');
+      msg += '\\n\\n取込を実行しますか?';
+      if (!confirm(msg)) return;
+      post('/apps/inquiry-hub/api/mail-rules/import', { csv: text, apply: true }).then(function(r2) {
+        alert('取込完了: 新規' + r2.applied + '件 / 更新' + r2.updated + '件');
+        location.reload();
+      }).catch(function(e) { toast('取込失敗: ' + e.message); });
+    }).catch(function(e) { toast('解析失敗: ' + e.message); });
+  });
+});
+async function toggleRule(id, active, btn) {
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/mail-rules/' + id + '/toggle', { active: !!active }); location.reload(); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function deleteRule(id, btn) {
+  if (!confirm('このルールを削除しますか? (物理削除。CSV再取込で復活します)')) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/mail-rules/' + id + '/delete', {}); location.reload(); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function testRule(btn) {
+  btn.disabled = true;
+  try {
+    var r = await post('/apps/inquiry-hub/api/mail-rules/test', {
+      from: document.getElementById('tFrom').value, subject: document.getElementById('tSubject').value,
+      reply_to: document.getElementById('tReplyTo').value, body: document.getElementById('tBody').value,
+    });
+    document.getElementById('testResult').textContent = r.match
+      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (r.match.action === 'skip' ? '🗑️取り込まない' : '✅取込+完了扱い')
+      : '→ どのルールにも一致しない = 通常どおり問い合わせとして取り込む';
+  } catch (e) { toast('失敗: ' + e.message); }
+  btn.disabled = false;
+}
+async function addRule(btn) {
+  var conditions = [];
+  for (var n = 1; n <= 3; n++) {
+    var field = document.getElementById('nField' + n).value;
+    var value = document.getElementById('nValue' + n).value.trim();
+    if (!field || !value) continue;
+    conditions.push({ field: field, op: document.getElementById('nOp' + n).value, value: value });
+  }
+  if (!conditions.length) { toast('条件を1つ以上入力してください'); return; }
+  btn.disabled = true;
+  try {
+    await post('/apps/inquiry-hub/api/mail-rules', {
+      name: document.getElementById('nName').value, priority: Number(document.getElementById('nPriority').value),
+      matchMode: document.getElementById('nMode').value, action: document.getElementById('nAction').value,
+      conditions: conditions,
+    });
+    toast('追加しました'); setTimeout(function(){ location.reload(); }, 700);
+  } catch (e) { toast('追加失敗: ' + e.message); btn.disabled = false; }
+}
+document.getElementById('ruleFilter').addEventListener('input', function() {
+  var q = this.value.trim().toLowerCase();
+  document.querySelectorAll('#ruleRows tr').forEach(function(tr) {
+    tr.style.display = !q || (tr.dataset.search || '').indexOf(q) >= 0 ? '' : 'none';
+  });
+});`;
+  res.send(pageShell('問い合わせ管理 — メールルール', 'mailrules', body, script));
+});
+
+router.post('/api/mail-rules', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority) }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/import', (req, res) => {
+  const csv = String((req.body || {}).csv || '');
+  if (!csv.trim()) return res.status(400).json({ error: 'CSVが空です' });
+  try { res.json(importMailDealerRulesCsv(csv, { apply: !!(req.body || {}).apply })); }
+  catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/test', (req, res) => {
+  const b = req.body || {};
+  const match = evaluateMailRules({
+    from: String(b.from || ''), to: String(b.to || ''), reply_to: String(b.reply_to || ''),
+    subject: String(b.subject || ''), body: String(b.body || ''),
+  });
+  res.json({ ok: true, match });
+});
+
+router.post('/api/mail-rules/:id(\\d+)/toggle', (req, res) => {
+  try { setMailRuleActive(Number(req.params.id), !!(req.body || {}).active); res.json({ ok: true }); }
+  catch (e) { res.status(404).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+router.post('/api/mail-rules/:id(\\d+)/delete', (req, res) => {
+  try { deleteMailRule(Number(req.params.id)); res.json({ ok: true }); }
+  catch (e) { res.status(404).json({ error: String(e?.message || e).slice(0, 300) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ⚙️ 運用管理画面 (設計書§7.1 #6 同期・エラー管理 + #4 送信結果不明の解決)
+// ═══════════════════════════════════════════════════════════════
+
+const OUTBOX_STATUS_LABELS = {
+  unknown: { label: '❓結果不明', style: 'background:#fef3c7;color:#92400e' },
+  needs_review: { label: '⏸️要確認 (新着競合)', style: 'background:#e0e7ff;color:#3730a3' },
+  failed: { label: '❌送信失敗', style: 'background:#fee2e2;color:#b91c1c' },
+  pending: { label: '⏳送信待ち', style: 'background:#f1f5f9;color:#475569' },
+  sending: { label: '📤送信中', style: 'background:#dbeafe;color:#1d4ed8' },
+  sent: { label: '✅送信済み', style: 'background:#dcfce7;color:#166534' },
+  cancelled: { label: '🚫取消済み', style: 'background:#f1f5f9;color:#64748b' },
+};
+
+router.get('/admin', (req, res) => {
+  const db = getDB();
+  const syncRows = listSyncStatus();
+  const nowMs = Date.now();
+
+  const authBadge = (s) => {
+    const warnDays = s.auth_expires_at ? Math.floor((Date.parse(s.auth_expires_at) - nowMs) / 86400000) : null;
+    if (s.authentication_status !== 'ok') return `<span class="badge" style="background:#fee2e2;color:#b91c1c">認証: ${he(s.authentication_status)}</span>`;
+    if (warnDays != null && warnDays <= 30) return `<span class="badge" style="background:#fef3c7;color:#92400e">認証期限 残${warnDays}日</span>`;
+    return `<span class="badge" style="background:#dcfce7;color:#166534">認証OK</span>`;
+  };
+  const syncTrs = syncRows.map(s => {
+    const failing = (s.consecutive_failures || 0) >= 3;
+    const syncing = s.lease_until && Date.parse(s.lease_until) > nowMs;
+    // 期限の手動登録フォーム (Yahoo!は同期時に自動更新されるため表示のみ)
+    const expiryDateVal = s.auth_expires_at ? new Date(Date.parse(s.auth_expires_at) + 9 * 3600000).toISOString().slice(0, 10) : '';
+    const expiryEdit = s.channel_type === 'yahoo'
+      ? '<div class="sub">(再認可時に自動更新)</div>'
+      : `<div class="sub expiry-edit">
+           <input type="date" id="exp-${s.shop_id}" value="${he(expiryDateVal)}">
+           <button onclick="saveAuthExpiry(${s.shop_id}, this)">保存</button>
+         </div>`;
+    return `
+    <tr${failing ? ' style="background:#fef2f2"' : ''}>
+      <td>${chBadge(s.channel_type)}<div class="sub">${he(s.shop_name)}</div></td>
+      <td>${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}${expiryEdit}</td>
+      <td class="nowrap">${fmtJst(s.last_synced_at)}${syncing ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">同期中…</span>' : ''}</td>
+      <td class="nowrap">${fmtJst(s.committed_until)}</td>
+      <td>${failing ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">連続失敗 ${s.consecutive_failures}回</span>` : (s.consecutive_failures || 0) > 0 ? `${s.consecutive_failures}回` : '—'}
+        ${s.last_error ? `<div class="sub" title="${he(s.last_error)}">${he(String(s.last_error).slice(0, 80))}</div>` : ''}</td>
+      <td>${s.open_errors > 0 ? `<span class="badge" style="background:#fef3c7;color:#92400e">${s.open_errors}件</span>` : '—'}</td>
+      <td class="nowrap">
+        <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, false, this)">▶ 今すぐ同期</button>
+        <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, true, this)" title="365日分を再照合 (数分かかることがあります)">🔎 deep</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const errRows = db.prepare(`SELECT e.*, s.shop_name, s.channel_type FROM sync_errors e
+    LEFT JOIN shops s ON s.id = e.shop_id
+    WHERE e.resolved = 0 ORDER BY e.id DESC LIMIT 20`).all();
+  const errTrs = errRows.map(e => `
+    <tr>
+      <td class="nowrap">${fmtJst(e.created_at)}</td>
+      <td>${e.channel_type ? chBadge(e.channel_type) : ''} ${he(e.shop_name || '')}</td>
+      <td><span class="badge" style="background:#f1f5f9;color:#475569">${he(e.error_type)}</span></td>
+      <td style="overflow-wrap:anywhere">${he(String(e.error_detail || '').slice(0, 300))}</td>
+      <td class="nowrap"><button onclick="resolveSyncError(${e.id}, this)">解決済みにする</button></td>
+    </tr>`).join('');
+
+  const issues = listOutboxIssues();
+  const issueTrs = issues.map(o => {
+    const meta = OUTBOX_STATUS_LABELS[o.status] || { label: o.status, style: '' };
+    const ops = o.status === 'unknown'
+      ? `<button class="pri" onclick="resolveOutbox(${o.id}, 'confirmed_sent', this)">✅送信済みだった</button>
+         <button onclick="resolveOutbox(${o.id}, 'confirmed_not_sent', this)">↩️未送信だった</button>
+         <button onclick="resolveOutbox(${o.id}, 'abandoned', this)">🚫対応断念</button>`
+      : (o.status === 'needs_review' || o.status === 'pending')
+        ? `<button onclick="cancelOutbox(${o.id}, this)">🚫取消</button>`
+        : '<span class="sub">再送は詳細画面から新しい返信として (Step 3)</span>';
+    return `
+    <tr>
+      <td><span class="badge" style="${meta.style}">${he(meta.label)}</span><div class="sub">${fmtJst(o.created_at)}</div></td>
+      <td>${chBadge(o.inquiry_channel)}<div class="sub">${he(o.shop_name)}</div></td>
+      <td><a href="/apps/inquiry-hub/inquiries/${o.inquiry_id}">${he(o.subject || '(件名なし)')}</a>
+        <div class="sub">${he(o.customer_name || '')} ・ 作成: ${he(o.created_by || '—')}</div></td>
+      <td style="overflow-wrap:anywhere"><div class="sub">${he(String(o.body_text || '').slice(0, 120))}${String(o.body_text || '').length > 120 ? '…' : ''}</div>
+        ${o.error_detail ? `<div class="sub" style="color:#b91c1c">${he(String(o.error_detail).slice(0, 150))}</div>` : ''}</td>
+      <td class="nowrap ops">${ops}</td>
+    </tr>`;
+  }).join('');
+
+  const body = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🔄 受信同期の状態 <span class="sub">(cron: 15分間隔 + 深掘り 毎朝5:37。手動実行してもcronと衝突しません)</span></div>
+    <table>
+      <thead><tr><th>チャネル/店舗</th><th>認証</th><th>最終同期</th><th>取り込み済み時刻</th><th>連続失敗</th><th>未解決エラー</th><th>手動同期</th></tr></thead>
+      <tbody>${syncTrs || '<tr><td colspan="7" class="empty">アクティブな店舗がありません</td></tr>'}</tbody>
+    </table>
+  </div>
+  ${errRows.length ? `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">⚠️ 未解決の同期エラー (直近20件)</div>
+    <table>
+      <thead><tr><th>発生</th><th>店舗</th><th>種別</th><th>内容</th><th></th></tr></thead>
+      <tbody>${errTrs}</tbody>
+    </table>
+  </div>` : ''}
+  <div class="card">
+    <div class="card-title">📮 送信の要対応 <span class="sub">(結果不明は自動再送しません。モール管理画面で実際の送信有無を確認してから選択してください)</span></div>
+    <table>
+      <thead><tr><th>状態</th><th>チャネル/店舗</th><th>問い合わせ</th><th>本文/エラー</th><th>操作</th></tr></thead>
+      <tbody>${issueTrs || '<tr><td colspan="5" class="empty">要対応の送信ジョブはありません</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+async function post(url, data) {
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+  const j = await r.json().catch(function(){ return {}; });
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+async function manualSync(shopId, deep, btn) {
+  btn.disabled = true; var old = btn.textContent; btn.textContent = '同期中…';
+  try {
+    var r = await post('/apps/inquiry-hub/api/admin/sync/' + shopId, { deep: deep });
+    if (r.skipped === 'lease') toast('別の同期が実行中です。少し待ってから再実行してください');
+    else if (r.ok) { toast('同期完了: 新規' + r.stats.newInquiries + '件 / 新着メッセージ' + r.stats.newMessages + '件'); setTimeout(function(){ location.reload(); }, 1200); }
+    else toast('同期失敗: ' + (r.error || '不明なエラー'));
+  } catch (e) { toast('同期失敗: ' + e.message); }
+  btn.disabled = false; btn.textContent = old;
+}
+async function resolveOutbox(id, resolution, btn) {
+  var confirms = {
+    confirmed_sent: 'モール/メールの管理画面で「実際に送信されている」ことを確認しましたか?\\n(会話履歴に送信済みとして記録されます)',
+    confirmed_not_sent: 'モール/メールの管理画面で「送信されていない」ことを確認しましたか?\\n(未送信=失敗として確定し、再送できるようになります)',
+    abandoned: '対応を断念しますか? この操作は取り消せず、再送ボタンも出なくなります',
+  };
+  if (!confirm(confirms[resolution])) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/outbox/' + id + '/resolve', { resolution: resolution }); toast('解決を記録しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function cancelOutbox(id, btn) {
+  if (!confirm('この送信ジョブを取消しますか? (送り直す場合は詳細画面から新しい返信を作成します)')) return;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/outbox/' + id + '/cancel', {}); toast('取消しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function resolveSyncError(id, btn) {
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/sync-errors/' + id + '/resolve', {}); toast('解決済みにしました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}
+async function saveAuthExpiry(shopId, btn) {
+  var date = document.getElementById('exp-' + shopId).value;
+  btn.disabled = true;
+  try { await post('/apps/inquiry-hub/api/admin/shops/' + shopId + '/auth-expiry', { date: date }); toast(date ? '認証期限を保存しました' : '認証期限を解除しました'); setTimeout(function(){ location.reload(); }, 800); }
+  catch (e) { toast('失敗: ' + e.message); btn.disabled = false; }
+}`;
+  res.send(pageShell('問い合わせ管理 — 運用管理', 'admin', body, script));
+});
+
+// 手動同期 (運用管理画面の▶ボタン)。cronとの多重起動はエンジンのリースが防ぐ (skipped:'lease')
+router.post('/api/admin/sync/:shopId(\\d+)', async (req, res) => {
+  const db = getDB();
+  const shop = db.prepare("SELECT * FROM shops WHERE id = ? AND is_active = 1 AND executor = 'server'").get(Number(req.params.shopId));
+  if (!shop) return res.status(404).json({ error: '店舗が見つかりません' });
+  const deep = !!(req.body || {}).deep;
+  const adapter = buildAdapterForShop(shop, { deep });
+  if (!adapter) return res.status(503).json({ error: `${shop.channel_type} の同期用環境変数が未設定です` });
+  try {
+    console.log(`[inquiry-hub] 手動同期 ${shop.shop_name}${deep ? ' (deep)' : ''} by ${actorOf(req)}`);
+    const r = await runSync(shop.id, adapter);
+    await refreshShopAuthStatus(shop, adapter); // Yahoo!は認証期限も自動反映 (fail-soft)
+    res.json(r);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/admin/outbox/:id(\\d+)/resolve', (req, res) => {
+  const resolution = String((req.body || {}).resolution || '');
+  if (!['confirmed_sent', 'confirmed_not_sent', 'abandoned'].includes(resolution)) {
+    return res.status(400).json({ error: '不正な resolution です' });
+  }
+  try {
+    res.json({ ok: true, ...resolveUnknown(Number(req.params.id), resolution, actorOf(req)) });
+  } catch (e) {
+    res.status(409).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/admin/outbox/:id(\\d+)/cancel', (req, res) => {
+  try {
+    res.json({ ok: true, ...cancelJob(Number(req.params.id), actorOf(req)) });
+  } catch (e) {
+    res.status(409).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// 認証期限の手動登録 (楽天licenseKey等、APIから取得できないもの用。Yahoo!は同期時に自動更新される)
+router.post('/api/admin/shops/:id(\\d+)/auth-expiry', (req, res) => {
+  const db = getDB();
+  const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(Number(req.params.id));
+  if (!shop) return res.status(404).json({ error: '店舗が見つかりません' });
+  const date = String((req.body || {}).date || '').trim();
+  if (date && (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date)))) {
+    return res.status(400).json({ error: '日付は YYYY-MM-DD 形式の実在する日付で指定してください (空で解除)' });
+  }
+  // 日付のみの入力はJSTの当日終わりまで有効とみなす (UTC 15:00 = JST 24:00)
+  const iso = date ? `${date}T15:00:00Z` : null;
+  db.prepare(`UPDATE shops SET auth_expires_at = ?, updated_at = ${NOW_SQL} WHERE id = ?`).run(iso, shop.id);
+  console.log(`[inquiry-hub] 認証期限を${date ? date + 'に設定' : '解除'}: ${shop.shop_name} by ${actorOf(req)}`);
+  res.json({ ok: true, auth_expires_at: iso });
+});
+
+router.post('/api/admin/sync-errors/:id(\\d+)/resolve', (req, res) => {
+  const r = getDB().prepare(`UPDATE sync_errors SET resolved = 1, resolved_at = ${NOW_SQL} WHERE id = ? AND resolved = 0`)
+    .run(Number(req.params.id));
+  if (!r.changes) return res.status(404).json({ error: '対象のエラーがありません (解決済みの可能性)' });
+  res.json({ ok: true });
+});
+
 // ─── ページシェル ───
 const CSS = `
 * { box-sizing: border-box; }
 body { margin: 0; font-family: -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif; background: #f1f5f9; color: #0f172a; font-size: 14px; }
-header.app { background: #0f172a; color: #fff; padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-header.app h1 { font-size: 16px; margin: 0; }
+header.app { background: #0f172a; color: #fff; padding: 8px 16px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+header.app h1 { font-size: 16px; margin: 0; white-space: nowrap; }
 header.app .back { color: #94a3b8; text-decoration: none; margin-left: auto; font-size: 13px; }
+header.app .back:hover { color: #fff; }
+/* タブ: バイトさんでも今どこにいるか一目で分かるピル型 (アクティブ=白地) */
+nav.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+a.tab { display: inline-flex; align-items: center; gap: 7px; padding: 9px 18px; border-radius: 10px;
+  color: #cbd5e1; text-decoration: none; font-size: 14px; font-weight: 600; line-height: 1; border: 1px solid transparent; }
+a.tab:hover { background: rgba(255,255,255,.14); color: #fff; }
+a.tab.on { background: #fff; color: #0f172a; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
+.tab-icon { font-size: 16px; }
 .wrap { padding: 16px; max-width: 1400px; margin: 0 auto; }
 .card { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; }
@@ -406,18 +1361,53 @@ button:disabled { opacity: .5; cursor: default; }
 .reply-note { color: #64748b; text-align: center; }
 .ai-draft { background: #f0fdfa; border-radius: 8px; padding: 8px 10px; margin: 8px 0; line-height: 1.7; }
 #toast { display: none; position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #0f172a; color: #fff; padding: 10px 18px; border-radius: 10px; z-index: 2000; }
+/* 階層アコーディオン: 📁グループ (第一階層のみ既定表示) → サブグループ → 項目 */
+details.grp { margin: 6px 0; border: 1px solid #dbe3ee; border-radius: 10px; background: #fff; overflow: hidden; }
+details.grp > summary { display: flex; gap: 8px; align-items: center; padding: 11px 14px; cursor: pointer;
+  font-weight: 600; background: #f1f5f9; list-style: none; user-select: none; }
+details.grp > summary::-webkit-details-marker { display: none; }
+details.grp > summary:hover { background: #e2e8f0; }
+.grp-arrow { display: inline-block; font-size: 11px; color: #64748b; transition: transform .15s; }
+details.grp[open] > .grp-arrow, details.grp[open] > summary .grp-arrow { transform: rotate(90deg); }
+.grp-count { margin-left: auto; font-size: 12px; font-weight: normal; color: #475569; background: #fff;
+  border: 1px solid #cbd5e1; border-radius: 999px; padding: 2px 10px; }
+.grp-body { padding: 4px 10px 8px 22px; }
+details.tpl { border-bottom: 1px solid #eef2f7; }
+details.tpl:last-child { border-bottom: none; }
+details.tpl summary { display: flex; gap: 10px; align-items: baseline; padding: 9px 6px; cursor: pointer; flex-wrap: wrap; }
+details.tpl summary:hover { background: #f8fafc; border-radius: 8px; }
+.tpl-icon { font-size: 14px; }
+.tpl-body { padding: 4px 10px 12px; }
+.tpl-body pre { background: #f8fafc; border-radius: 8px; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; line-height: 1.7; margin: 8px 0; }
+.tpl-ops { display: flex; gap: 8px; margin-top: 8px; }
+.edit-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+@media (max-width: 700px) { .edit-grid { grid-template-columns: 1fr; } }
+.qa-q { background: #fef9c3; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
+.qa-a { background: #dcfce7; border-radius: 8px; padding: 8px 12px; margin: 8px 0; line-height: 1.7; }
+/* 運用管理画面 */
+.card-title { padding: 12px 14px; font-weight: 700; border-bottom: 1px solid #e2e8f0; }
+.card-title .sub { font-weight: normal; }
+td.ops { white-space: normal; }
+td.ops button { margin: 2px 4px 2px 0; }
+.expiry-edit { display: flex; gap: 4px; margin-top: 4px; align-items: center; }
+.expiry-edit input[type=date] { padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
+.expiry-edit button { padding: 3px 10px; font-size: 12px; }
 `;
 
 function pageShell(title, active, body, script) {
-  const tab = (href, label, key) => `<a href="${href}" style="color:${active === key ? '#fff' : '#94a3b8'};text-decoration:none;font-size:13px">${label}</a>`;
+  const tab = (href, icon, label, key) => `<a href="${href}" class="tab${active === key ? ' on' : ''}"><span class="tab-icon">${icon}</span>${label}</a>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${he(title)}</title><style>${CSS}</style></head>
 <body>
 <header class="app">
   <h1>💬 問い合わせ管理</h1>
-  <nav style="display:flex;gap:14px">
-    ${tab('/apps/inquiry-hub', '一覧', 'list')}
+  <nav class="tabs">
+    ${tab('/apps/inquiry-hub', '📨', '問い合わせ一覧', 'list')}
+    ${tab('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates')}
+    ${tab('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa')}
+    ${tab('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules')}
+    ${tab('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin')}
   </nav>
   <a href="/" class="back">← ポータルに戻る</a>
 </header>

@@ -1977,6 +1977,38 @@ function createTables() {
     }
   }
 
+  // ---- 楽天レビュー 日次集計: contract auto-seed (mall-csv-fetcher P2 PR-A、2026-07-16)
+  // ★非PII projection のみ mirror へ (本文/注文番号/レビューURL は miniPC 内に留める — らくらくーぽん置換 設計書§4)
+  db.exec(`
+    INSERT INTO sync_contracts (
+      entity, contract_version, source_system, source_object, target_table,
+      grain_definition, key_columns_json, payload_schema_json,
+      clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+    ) VALUES (
+      'rakuten_review_daily', 1, 'minipc-warehouse',
+      'fact_rakuten_reviews', 'mirror_rakuten_review_daily',
+      'one row = one (date_jst, review_type, item_id, rating) — レビューチェックツールCSVの日次集計 (件数のみ、非PII。shop レビューは item_id=0)',
+      '["date_jst","review_type","item_id","rating"]',
+      '{"required":["date_jst","review_type","item_id","rating"],"date_jst_pattern":"^\\d{4}-\\d{2}-\\d{2}$","pii":"none"}',
+      'scope_clear_per_run', 'insert_or_replace', 1, 'mall-csv-fetcher',
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+      strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    )
+    ON CONFLICT(entity) DO UPDATE SET
+      contract_version    = excluded.contract_version,
+      source_system       = excluded.source_system,
+      source_object       = excluded.source_object,
+      target_table        = excluded.target_table,
+      grain_definition    = excluded.grain_definition,
+      key_columns_json    = excluded.key_columns_json,
+      payload_schema_json = excluded.payload_schema_json,
+      clear_strategy      = excluded.clear_strategy,
+      apply_mode          = excluded.apply_mode,
+      enabled             = excluded.enabled,
+      owner               = excluded.owner,
+      updated_at          = excluded.updated_at
+  `);
+
   // ---- Phase 1 #1-4a: sync_runs (run ledger、miniPC 側で sync 開始記録)
   // status 遷移: started → applied (全 chunk Render から 2xx)
   //              | → failed (途中失敗、error_message に記録)
