@@ -295,6 +295,67 @@ class DriveClientUploadBodyTest(unittest.TestCase):
         self.assertNotIn('appProperties', captured['body'])
 
 
+class DriveClientListChildrenTest(unittest.TestCase):
+    """フォルダごとの所属ドライブ解決 (素材フォルダが別共有ドライブにある構成への対応)"""
+
+    def _make_client(self, drive_ids, list_results):
+        calls = {'get': [], 'list': []}
+
+        class FakeRequest:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def execute(self):
+                return self._payload
+
+        class FakeFiles:
+            def get(self, **kwargs):
+                calls['get'].append(kwargs)
+                fid = kwargs['fileId']
+                payload = {'id': fid}
+                if drive_ids.get(fid):
+                    payload['driveId'] = drive_ids[fid]
+                return FakeRequest(payload)
+
+            def list(self, **kwargs):
+                calls['list'].append(kwargs)
+                return FakeRequest(list_results.pop(0))
+
+        class FakeService:
+            def files(self):
+                return FakeFiles()
+
+        client = drive_worker.DriveClient.__new__(drive_worker.DriveClient)
+        client.service = FakeService()
+        client._drive_id_cache = {}
+        return client, calls
+
+    def test_shared_drive_folder_uses_its_own_drive_id(self):
+        client, calls = self._make_client(
+            {'material-folder': 'other-drive'},
+            [{'files': [{'id': 'x', 'name': 'AES_1.pdf'}]}])
+        files = client.list_children('material-folder')
+        self.assertEqual([f['id'] for f in files], ['x'])
+        kwargs = calls['list'][0]
+        self.assertEqual(kwargs['corpora'], 'drive')
+        self.assertEqual(kwargs['driveId'], 'other-drive')
+
+    def test_my_drive_folder_omits_corpora(self):
+        client, calls = self._make_client({'folder-b': None}, [{'files': []}])
+        client.list_children('folder-b')
+        kwargs = calls['list'][0]
+        self.assertNotIn('corpora', kwargs)
+        self.assertNotIn('driveId', kwargs)
+
+    def test_drive_id_resolution_cached(self):
+        client, calls = self._make_client(
+            {'folder-a': 'drive-1'}, [{'files': []}, {'files': []}])
+        client.list_children('folder-a')
+        client.list_children('folder-a')
+        self.assertEqual(len(calls['get']), 1)  # files.getは1回だけ (キャッシュ)
+        self.assertEqual(len(calls['list']), 2)
+
+
 # ───────────────────────── E2E (フェイクDrive) ─────────────────────────
 
 class FakeDriveClient:
@@ -339,6 +400,7 @@ class FakeExtractor:
 
 class FakeConfig:
     root_id = 'ROOT'
+    ship_parent_id = 'ROOT'
     material_folder_id = 'MATERIAL'
     csv_folder_id = 'CSVDIR'
 
@@ -583,6 +645,37 @@ class WorkerE2ETest(unittest.TestCase):
         _, name, content, _ = client.uploads[0]
         self.assertEqual(name, ERROR_TXT_NAME)
         self.assertIn('複数あります', content.decode('utf-8'))
+
+    def test_ship_parent_id_scans_subfolder(self):
+        # 実運用では出荷_XXはドライブ直下でなく「出荷_no」フォルダの下にある。
+        # AES_SHIP_PARENT_ID でその親フォルダを指定して走査できる
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        children, all_contents = build_world(csv_text=CSV_TEXT)
+        children['ROOT'] = [meta('出荷_no', mime=FOLDER_MIME)]
+        children['id-出荷_no'] = [meta('出荷_20', mime=FOLDER_MIME)]
+        children['id-出荷_20'] = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        all_contents.update({
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        })
+
+        class SubfolderConfig(FakeConfig):
+            ship_parent_id = 'id-出荷_no'
+
+        client = FakeDriveClient(children, all_contents)
+        worker = Worker(SubfolderConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        self.assertEqual(len(client.uploads), 1)
+        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
 
     def test_non_ship_folder_ignored(self):
         # ルート直下でも 出荷_XX 以外の名前のフォルダは走査しない
