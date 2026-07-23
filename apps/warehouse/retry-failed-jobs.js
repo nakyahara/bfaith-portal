@@ -53,6 +53,11 @@ const JOB_DEFINITIONS = {
   'Amazon Settlement':     { script: 'apps/warehouse/fetch-amazon-settlements.js', args: ['--days', '14'], timeoutMs: 3600000 },
   'Amazon Ads (campaign)': { script: 'apps/warehouse/fetch-amazon-ads-campaign.js', args: [], timeoutMs: 1800000 },
   'Amazon Ads (SKU)':      { script: 'apps/warehouse/fetch-amazon-ads.js',          args: [], timeoutMs: 1800000 },
+  // 'Amazon手数料' (2026-07-16 障害対応、incident_amazon_fee_coverage_no_retry):
+  //   daily-sync の RETRYABLE_JOBS に入れるだけでは「未対応」🔴 になるため、ここにも定義必須。
+  //   retry は 08:30/10:00/11:30 の空き枠で走るので daily(07:00, 10分) より timeout を 20分に延ばして余裕を取る。
+  //   INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は skip されるので負荷は自然縮小)。
+  'Amazon手数料':          { script: 'apps/warehouse/fetch-amazon-fees.js',        args: ['--recent', '30'], timeoutMs: 1200000 },
   // DBバックアップ: 冪等 (当日分完成済み+元DB変化なしなら再利用し offsite 以降だけやり直す。
   // 先行ジョブの retry で DB が更新されていれば src_sig 不一致で自動的に作り直す)。月初最悪 ~5.5h
   'DBバックアップ':        { script: 'apps/warehouse/backup-warehouse.js',          args: [], timeoutMs: 21600000 },
@@ -61,7 +66,7 @@ const JOB_DEFINITIONS = {
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
-const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
@@ -245,12 +250,16 @@ async function main() {
   }
 
   // fail-closed: remaining_jobs のうち runner に定義が無いジョブ (daily-sync の RETRYABLE_JOBS には
-  // あるが JOB_DEFINITIONS/RETRY_ORDER 未登録、例: Amazon Ads/Settlement/finance build) は上の
+  // あるが JOB_DEFINITIONS/RETRY_ORDER 未登録、例: Amazon finance build) は上の
   // ループで実行されない。results に載らないと stillFailed=0 となり state削除→誤「復旧成功」で
   // サイレントに落ちる。未対応ジョブは失敗扱いで残し、最終的に 🔴 通知で顕在化させる。
-  const unhandled = state.remaining_jobs.filter(j => !JOB_DEFINITIONS[j]);
+  // Codex R2 High #2: JOB_DEFINITIONS だけでなく RETRY_ORDER 漏れも未対応扱いにする。
+  //   定義はあるが RETRY_ORDER に無いと実行ループ (RETRY_ORDER を回す) に入らず、
+  //   かつ従来判定では unhandled にも載らず、誤「✅復旧成功」でサイレントに落ちるため。
+  const unhandled = state.remaining_jobs.filter(j => !JOB_DEFINITIONS[j] || !RETRY_ORDER.includes(j));
   for (const j of unhandled) {
-    results.push({ name: j, success: false, summary: '⚠️ retry runner 未対応 (JOB_DEFINITIONS 未登録) のため未実行' });
+    const reason = !JOB_DEFINITIONS[j] ? 'JOB_DEFINITIONS 未登録' : 'RETRY_ORDER 未登録';
+    results.push({ name: j, success: false, summary: `⚠️ retry runner 未対応 (${reason}) のため未実行` });
   }
 
   const stillFailed = results.filter(r => !r.success).map(r => r.name);
