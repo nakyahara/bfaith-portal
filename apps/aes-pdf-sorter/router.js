@@ -15,6 +15,8 @@ const PYTHON_PORT = process.env.AES_PYTHON_PORT || 8001;
 const PYTHON_BASE = `http://127.0.0.1:${PYTHON_PORT}`;
 
 let pythonProcess = null;
+let stopping = false;
+const RESPAWN_DELAY_MS = 30_000;
 
 /**
  * Pythonバックエンドを起動
@@ -57,6 +59,14 @@ export function startPythonBackend() {
     bootNote('aes-python', `child pid=${childPid} 終了 code=${code}`);
     console.log(`[AES-Python] プロセス終了 (code: ${code})`);
     pythonProcess = null;
+    // Drive自動化ワーカーもこのプロセス内で動いているため、落ちたら自動復帰させる
+    // (2026-07-23 実障害: OOMと思われるkillでcode=null終了→そのまま停止し続けた)
+    if (!stopping) {
+      console.log(`[AES-Python] ${RESPAWN_DELAY_MS / 1000}秒後に自動再起動します`);
+      setTimeout(() => {
+        if (!pythonProcess && !stopping) startPythonBackend();
+      }, RESPAWN_DELAY_MS).unref();
+    }
   });
 
   pythonProcess.on('error', (err) => {
@@ -73,6 +83,7 @@ export function startPythonBackend() {
  * Pythonバックエンドを停止
  */
 export function stopPythonBackend() {
+  stopping = true;
   if (pythonProcess) {
     pythonProcess.kill();
     pythonProcess = null;

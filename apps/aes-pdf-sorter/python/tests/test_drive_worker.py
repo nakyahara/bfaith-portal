@@ -74,32 +74,64 @@ class DecideActionTest(unittest.TestCase):
 
     def test_no_attempt_settled(self):
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf')], [], []),
+            decide_action(self.now, [meta('納品書_20.pdf')], [], [], []),
             'process')
 
     def test_attempt_newer_than_inputs(self):
         out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [out], []),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [], [out], []),
             'skip_done')
 
     def test_error_attempt_blocks_until_inputs_change(self):
         err = meta(ERROR_TXT_NAME, '2026-07-02T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [], [err]),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [], [], [err]),
             'skip_done')
 
-    def test_inputs_newer_than_attempt_reprocess(self):
-        err = meta(ERROR_TXT_NAME, '2026-07-02T00:00:00.000Z')
-        newer_input = meta(CSV_NAME, '2026-07-03T00:00:00.000Z')
+    def test_failure_state_retries_on_shared_change(self):
+        # 失敗中 (マーカー付きエラーtxt) のフォルダは、素材 (CSV) の置き直しで再試行する
+        err = dict(meta(ERROR_TXT_NAME, '2026-07-02T00:00:00.000Z'),
+                   appProperties={CONFLICT_MARKER_PROP: '1'})
+        newer_csv = meta(CSV_NAME, '2026-07-03T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD), newer_input], [], [err]),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [newer_csv], [], [err]),
+            'process')
+
+    def test_success_state_ignores_shared_change(self):
+        # 成功済み (マーカー無し出力PDF) のフォルダは、素材がバッチ入れ替えで新しく
+        # なっても再処理しない (朝の正常PDFを午後の素材で潰さない。2026-07-23 実障害)
+        out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
+        newer_csv = meta(CSV_NAME, '2026-07-03T00:00:00.000Z')
+        newer_label = meta('AES2.pdf', '2026-07-03T00:00:00.000Z')
+        self.assertEqual(
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)],
+                          [newer_csv, newer_label], [out], []),
+            'skip_done')
+
+    def test_success_state_reprocesses_on_local_change(self):
+        # 成功済みでも、フォルダ内の納品書が入れ替われば再処理する (翌日の再利用)
+        out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
+        self.assertEqual(
+            decide_action(self.now, [meta('納品書_20.pdf', '2026-07-03T00:00:00.000Z')],
+                          [], [out], []),
             'process')
 
     def test_settling_wait(self):
         recent = (self.now - timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', recent)], [], []),
+            decide_action(self.now, [meta('納品書_20.pdf', recent)], [], [], []),
+            'skip_settling')
+
+    def test_success_state_local_trigger_still_settles_on_shared(self):
+        # 成功状態のトリガーはlocalのみだが、整定待ちは素材も含めて判定する
+        # (素材の入れ替え途中に処理して一時的な不一致を出さない)
+        recent = (self.now - timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
+        local = meta('納品書_20.pdf', '2026-07-03T00:00:00.000Z')  # 出力より新しい (トリガー)
+        shared = meta(CSV_NAME, recent)  # 30秒前に入れ替わったばかり
+        self.assertEqual(
+            decide_action(self.now, [local], [shared], [out], []),
             'skip_settling')
 
     def test_partial_attempt_retries(self):
@@ -107,9 +139,9 @@ class DecideActionTest(unittest.TestCase):
         # → skipせず再処理する (Codex2巡目 指摘1の検証)
         out = meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z')   # 入力より新しい
         err = meta(ERROR_TXT_NAME, '2026-07-01T00:00:00.000Z')   # 入力より古い
-        newer_input = meta(CSV_NAME, '2026-07-02T00:00:00.000Z')
+        newer_input = meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [newer_input], [out], [err]),
+            decide_action(self.now, [newer_input], [], [out], [err]),
             'process')
 
 
@@ -1080,6 +1112,28 @@ class WorkerE2ETest(unittest.TestCase):
         text = content.decode('utf-8')
         self.assertIn('生成/アップロードに失敗しました', text)
         self.assertIn('broken pdf', text)
+
+    def test_success_output_survives_material_swap(self):
+        # 朝成功したフォルダは、午後のバッチで素材 (AES*.pdf/CSV) が入れ替わっても
+        # 再処理されず、正常PDFが使用禁止で潰されない (2026-07-23 実障害の再発防止)
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', OLDER),
+            meta(OUTPUT_PDF_NAME, OLD),  # 朝の成功PDF (マーカー無し)
+        ]
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files,
+            contents={'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8')})
+        # 素材とCSVは出力より新しい (午後のバッチで入れ替わった状態)
+        for f in children['MATERIAL'] + children['CSVDIR']:
+            f['modifiedTime'] = '2026-07-02T00:00:00.000Z'
+        for f in children['id-出荷_20']:
+            if f['name'] != OUTPUT_PDF_NAME:
+                f['modifiedTime'] = OLDER
+
+        client = self._run(children, all_contents, [])
+        self.assertEqual(client.uploads, [])
+        self.assertEqual(client.overwrites, [])
 
     def test_skip_when_output_up_to_date(self):
         folder_files = [

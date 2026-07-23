@@ -6,7 +6,9 @@ AES送り状並び替え Drive自動化ワーカー
 AES引当フォルダ (引当パターン_AES….txt があるフォルダ) に納品書PDFが入っていたら、
 logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 納品書順に並び替えた「AES送り状_並び替え済.pdf」を同フォルダに出力する。
-失敗時は「AES送り状_エラー.txt」を出力し、入力ファイルが変化したら自動リトライする。
+失敗時は「AES送り状_エラー.txt」を出力し、入力ファイルが変化したら自動リトライする
+(素材=AES*.pdf/CSVはバッチごとに日中入れ替わるため、素材の変化で再試行するのは
+失敗中のフォルダのみ。成功済みフォルダはフォルダ内のファイルが変わるまで触らない)。
 
 設計書: G:\\共有ドライブ\\AI_reference\\システム設計\\AES送り状並び替え_Drive自動化_設計_20260722.md
 
@@ -107,27 +109,43 @@ def is_aes_pattern(txt_filename, txt_text):
     return txt_filename.startswith('引当パターン_AES')
 
 
-def decide_action(now_utc, input_files, output_files, error_files):
+def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_files):
     """処理要否判定 (設計書§6)。
 
-    input_files: 判定に使う入力ファイルのメタ一覧 [{'name','modifiedTime',...}]
-                 (対象フォルダの納品書・引当パターンtxt + logi_dispatch.csv + 素材AES*.pdf)
+    local_inputs:  対象フォルダ内の入力メタ一覧 (納品書・引当パターンtxt)
+    shared_inputs: フォルダ横断の素材メタ一覧 (素材AES*.pdf + logi_dispatch.csv)
     output_files / error_files: 前回試行の出力メタ一覧 (通常0〜1件。同名重複時は全件)
     戻り値: 'process' / 'skip_done' (試行済みで入力に変化なし) / 'skip_settling' (整定待ち)
+
+    素材はバッチごとに日中何度も入れ替わる (2026-07-23 実運用で確認。設計時の
+    「毎日1回入れ替え」前提は不成立)。前回成功済みのフォルダを新しいバッチの素材で
+    再処理すると全件不一致になり、正常な出力PDFを使用禁止で潰してしまうため、
+    成功状態 (失敗マーカー無し) のフォルダはフォルダ内の入力が変わらない限りskipする。
+    失敗状態のフォルダは素材の入れ替えでも再試行する (CSV置き直しでの自動復旧)。
 
     出力PDF・エラーtxtが複数存在する場合、試行の完了時刻には「最も古いもの」を使う。
     完全な試行は全アーティファクトを更新するため、一部だけ新しい = 前回の書き込みが
     途中で失敗した状態であり、skipせず次サイクルで再試行する (Codexレビュー2巡目 指摘1)。
     """
-    newest_input = max(parse_rfc3339(f['modifiedTime']) for f in input_files)
-
     attempts = list(output_files) + list(error_files)
+    failure_state = any(CONFLICT_MARKER_PROP in (f.get('appProperties') or {}) for f in attempts)
+    if not attempts or failure_state:
+        trigger_inputs = list(local_inputs) + list(shared_inputs)
+    else:
+        trigger_inputs = list(local_inputs)
+    newest_trigger = max(parse_rfc3339(f['modifiedTime']) for f in trigger_inputs)
+
     if attempts:
         attempt_completed = min(parse_rfc3339(f['modifiedTime']) for f in attempts)
-        if newest_input <= attempt_completed:
+        if newest_trigger <= attempt_completed:
             return 'skip_done'
 
-    if now_utc - newest_input < timedelta(seconds=SETTLE_SECONDS):
+    # 整定待ちは常に全入力 (素材含む) で判定する。成功状態のトリガーはlocalのみだが、
+    # 素材の入れ替え途中に処理すると一時的な不一致でPDFを無効化しかねないため
+    # (Codexレビュー PR#605 medium)
+    newest_any = max(parse_rfc3339(f['modifiedTime'])
+                     for f in list(local_inputs) + list(shared_inputs))
+    if now_utc - newest_any < timedelta(seconds=SETTLE_SECONDS):
         return 'skip_settling'
 
     return 'process'
@@ -507,11 +525,13 @@ class Worker:
         # (前回の書き込みが途中で失敗した証拠) ③重複整理後に残った通知済みファイル
         # (競合解消後の復旧) がある場合は、mtime上は完了済みに見えても skip せず
         # 処理へ進ませる
-        input_files = invoices + pattern_txts + labels_meta + ([csv_meta] if csv_meta else [])
+        local_inputs = invoices + pattern_txts
+        shared_inputs = labels_meta + ([csv_meta] if csv_meta else [])
         if not (has_unacknowledged_duplicates(output_files, error_files)
                 or has_incomplete_failure_write(output_files, error_files)
                 or has_stale_dup_ack(output_files, error_files)):
-            action = decide_action(self._now_utc(), input_files, output_files, error_files)
+            action = decide_action(self._now_utc(), local_inputs, shared_inputs,
+                                   output_files, error_files)
             if action != 'process':
                 return
 
