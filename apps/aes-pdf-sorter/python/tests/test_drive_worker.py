@@ -11,9 +11,11 @@ import fitz
 
 import drive_worker
 from drive_worker import (
-    Worker, decide_action, is_aes_pattern, parse_pattern_name,
+    Worker, decide_action, has_unacknowledged_duplicates,
+    is_aes_pattern, parse_pattern_name,
     parse_poll_hours, within_hours, natural_key, build_invalid_pdf,
     OUTPUT_PDF_NAME, ERROR_TXT_NAME, CSV_NAME, FOLDER_MIME,
+    CONFLICT_MARKER_PROP,
 )
 
 UTC = timezone.utc
@@ -110,6 +112,31 @@ class DecideActionTest(unittest.TestCase):
             'process')
 
 
+class HasUnacknowledgedDuplicatesTest(unittest.TestCase):
+    def test_no_duplicates(self):
+        self.assertFalse(has_unacknowledged_duplicates([], []))
+        self.assertFalse(has_unacknowledged_duplicates([meta(OUTPUT_PDF_NAME)], [meta(ERROR_TXT_NAME)]))
+
+    def test_unmarked_duplicate_detected(self):
+        out1 = meta(OUTPUT_PDF_NAME)
+        out2 = dict(out1, id='id-dup')
+        self.assertTrue(has_unacknowledged_duplicates([out1, out2], []))
+        # 片方だけマーカー付きでも未処理扱い
+        marked = dict(out1, appProperties={CONFLICT_MARKER_PROP: '1'})
+        self.assertTrue(has_unacknowledged_duplicates([marked, out2], []))
+
+    def test_all_marked_duplicates_acknowledged(self):
+        marked = {CONFLICT_MARKER_PROP: '1'}
+        out1 = dict(meta(OUTPUT_PDF_NAME), appProperties=marked)
+        out2 = dict(out1, id='id-dup')
+        self.assertFalse(has_unacknowledged_duplicates([out1, out2], []))
+
+    def test_error_txt_duplicates_detected(self):
+        err1 = meta(ERROR_TXT_NAME, mime='text/plain')
+        err2 = dict(err1, id='id-dup')
+        self.assertTrue(has_unacknowledged_duplicates([], [err1, err2]))
+
+
 class NaturalKeyTest(unittest.TestCase):
     def test_numeric_order(self):
         names = ['納品書_10.pdf', '納品書_2.pdf', '納品書_1.pdf']
@@ -157,6 +184,7 @@ class FakeDriveClient:
         self.contents = contents    # file_id -> bytes
         self.uploads = []           # (folder_id, name, content, mimetype)
         self.overwrites = []        # (file_id, content, mimetype)
+        self.app_properties = {}    # file_id/new-name -> 最後に指定された app_properties
 
     def list_children(self, folder_id):
         return list(self.children.get(folder_id, []))
@@ -164,12 +192,16 @@ class FakeDriveClient:
     def download(self, file_id):
         return self.contents[file_id]
 
-    def upload_new(self, folder_id, name, content, mimetype):
+    def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
         self.uploads.append((folder_id, name, content, mimetype))
+        if app_properties is not None:
+            self.app_properties[f'new-{name}'] = app_properties
         return f'new-{name}'
 
-    def overwrite(self, file_id, content, mimetype):
+    def overwrite(self, file_id, content, mimetype, app_properties=None):
         self.overwrites.append((file_id, content, mimetype))
+        if app_properties is not None:
+            self.app_properties[file_id] = app_properties
         return file_id
 
 
@@ -538,10 +570,10 @@ class WorkerE2ETest(unittest.TestCase):
     def test_output_upload_failure_writes_error_txt(self):
         # 出力PDFのアップロード失敗もエラーtxtで通知される
         class BrokenUploadClient(FakeDriveClient):
-            def upload_new(self, folder_id, name, content, mimetype):
+            def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
                 if name == OUTPUT_PDF_NAME:
                     raise RuntimeError('upload failed')
-                return super().upload_new(folder_id, name, content, mimetype)
+                return super().upload_new(folder_id, name, content, mimetype, app_properties)
 
         label_pdf = make_pdf(['LABEL-DA100'])
         invoice_pdf = make_pdf(['249-1111111-1111111'])
@@ -633,6 +665,98 @@ class WorkerE2ETest(unittest.TestCase):
         for _, c, m in client.overwrites:
             if m == 'application/pdf':
                 self.assertIn('INVALID - DO NOT USE', page_texts(c)[0])
+
+    def test_fresh_duplicate_outputs_flagged_despite_mtime(self):
+        # 二重実行で作られた同名PDFはどちらも入力より新しい → mtime基準では skip_done に
+        # なってしまうが、マーカーの無い重複は競合処理へ進み検出される (Codex3巡目 指摘2)
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        out1 = meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z')  # 入力より新しい
+        out2 = dict(out1, id='id-out-dup')
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            out1,
+            out2,
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [])
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('同名の出力ファイルが複数あります', content.decode('utf-8'))
+        # 両方無効化され、失敗ハンドラのマーカーが付く
+        invalidated = {file_id for file_id, c, m in client.overwrites if m == 'application/pdf'}
+        self.assertEqual(invalidated, {out1['id'], out2['id']})
+        for file_id in invalidated:
+            self.assertEqual(client.app_properties[file_id], {CONFLICT_MARKER_PROP: '1'})
+        self.assertEqual(client.app_properties[f'new-{ERROR_TXT_NAME}'],
+                         {CONFLICT_MARKER_PROP: '1'})
+
+    def test_marked_duplicates_converge_no_rewrite(self):
+        # 競合通知済み (全件マーカー付き・エラーtxtも新しい) なら再書き込みしない (収束)
+        marked = {CONFLICT_MARKER_PROP: '1'}
+        out1 = dict(meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z'), appProperties=marked)
+        out2 = dict(out1, id='id-out-dup')
+        err = dict(meta(ERROR_TXT_NAME, '2026-07-03T00:00:00.000Z', mime='text/plain'),
+                   appProperties=marked)
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            out1,
+            out2,
+            err,
+        ]
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files,
+            contents={'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8')})
+        # 入力側 (素材・CSV) も出力より古くしておく
+        for f in children['MATERIAL'] + children['CSVDIR']:
+            f['modifiedTime'] = '2026-07-02T00:00:00.000Z'
+
+        client = self._run(children, all_contents, [])
+        self.assertEqual(client.uploads, [])
+        self.assertEqual(client.overwrites, [])
+
+    def test_error_txt_failure_skips_pdf_invalidation(self):
+        # エラーtxtの新規作成に失敗したら旧PDFの無効化も見送る。先にPDFを無効化すると
+        # 「新しいPDFだけがある」状態になり恒久skipに陥るため (Codex3巡目 指摘1)
+        class BrokenErrorTxtClient(FakeDriveClient):
+            def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
+                if name == ERROR_TXT_NAME:
+                    raise RuntimeError('txt upload failed')
+                return super().upload_new(folder_id, name, content, mimetype, app_properties)
+
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-9999999-9999999'])  # CSVに無い注文 → 失敗
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            meta(OUTPUT_PDF_NAME, '2026-07-01T12:00:00.000Z'),  # 前日の成功PDF
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = BrokenErrorTxtClient(children, all_contents)
+        worker = Worker(FakeConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        # 旧PDFは無効化されない (次サイクルでエラーtxtごと再試行される)
+        self.assertEqual(client.overwrites, [])
 
     def test_build_label_pdf_failure_writes_error_txt(self):
         # PDF組み立て自体の失敗 (壊れたPDF等) もログだけでなくエラーtxtで通知される

@@ -19,6 +19,8 @@ logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 - ワーカーはシングルスレッドの逐次処理 (フォルダを1つずつ)。Renderインスタンスは1台前提。
   Driveは同名ファイルを許すため、万一の二重実行等で同名の出力ファイルが複数できていた
   場合は上書き先を確定できず、競合エラーで停止する (Codexレビュー2巡目 指摘3)。
+  重複ファイルは通常どちらも入力より新しいため、失敗ハンドラのマーカー
+  (appProperties) が無い重複は mtime に関係なく検出する (Codexレビュー3巡目 指摘2)。
 """
 import io
 import json
@@ -38,6 +40,14 @@ JST = timezone(timedelta(hours=9))
 OUTPUT_PDF_NAME = 'AES送り状_並び替え済.pdf'
 ERROR_TXT_NAME = 'AES送り状_エラー.txt'
 CSV_NAME = 'logi_dispatch.csv'
+
+# 失敗ハンドラが書いたファイルに付ける appProperties マーカー。
+# 二重実行で作られた同名重複は通常どちらも入力より新しく、mtime基準の decide_action
+# では skip_done になり競合検出に到達しない。マーカーの無い同名重複 = 未通知の競合
+# として mtime に関係なく処理へ進ませるために使う (Codexレビュー3巡目 指摘2)。
+CONFLICT_MARKER_PROP = 'aesFailureWrite'
+_MARK_FAILURE = {CONFLICT_MARKER_PROP: '1'}
+_CLEAR_FAILURE = {CONFLICT_MARKER_PROP: None}  # Drive APIは値nullでキーを削除する
 
 SHIP_FOLDER_RE = re.compile(r'^出荷_\d+$')
 PATTERN_TXT_RE = re.compile(r'^引当パターン_.*\.txt$')
@@ -112,6 +122,22 @@ def decide_action(now_utc, input_files, output_files, error_files):
         return 'skip_settling'
 
     return 'process'
+
+
+def has_unacknowledged_duplicates(output_files, error_files):
+    """同名出力ファイルの重複のうち、失敗ハンドラ未処理 (マーカー無し) のものがあるか。
+
+    二重実行で作られた同名ファイルは通常どちらも入力より新しいため、mtime基準の
+    decide_action では skip_done になってしまう。失敗ハンドラが書いたファイルには
+    CONFLICT_MARKER_PROP が付くので、マーカーの無い重複があれば mtime に関係なく
+    競合処理へ進ませる。全件マーカー付きになれば通常判定に戻り、書き込みが
+    毎サイクル繰り返されることもない (収束する)。
+    """
+    for group in (output_files, error_files):
+        if len(group) > 1 and any(
+                CONFLICT_MARKER_PROP not in (f.get('appProperties') or {}) for f in group):
+            return True
+    return False
 
 
 def build_error_txt(now_jst, reasons):
@@ -213,7 +239,7 @@ class DriveClient:
                 driveId=self.drive_id,
                 includeItemsFromAllDrives=True,
                 supportsAllDrives=True,
-                fields='nextPageToken, incompleteSearch, files(id,name,mimeType,modifiedTime)',
+                fields='nextPageToken, incompleteSearch, files(id,name,mimeType,modifiedTime,appProperties)',
                 pageSize=200,
                 pageToken=page_token,
             ).execute()
@@ -240,20 +266,27 @@ class DriveClient:
         # 結合PDFは5MBを超え得るため常にresumableでアップロードする (Codexレビュー指摘5)
         return MediaInMemoryUpload(content, mimetype=mimetype, resumable=True)
 
-    def upload_new(self, folder_id, name, content, mimetype):
+    def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
+        body = {'name': name, 'parents': [folder_id]}
+        if app_properties:
+            body['appProperties'] = app_properties
         res = self.service.files().create(
-            body={'name': name, 'parents': [folder_id]},
+            body=body,
             media_body=self._media(content, mimetype),
             supportsAllDrives=True,
             fields='id',
         ).execute()
         return res['id']
 
-    def overwrite(self, file_id, content, mimetype):
+    def overwrite(self, file_id, content, mimetype, app_properties=None):
+        kwargs = {}
+        if app_properties is not None:
+            kwargs['body'] = {'appProperties': app_properties}
         self.service.files().update(
             fileId=file_id,
             media_body=self._media(content, mimetype),
             supportsAllDrives=True,
+            **kwargs,
         ).execute()
         return file_id
 
@@ -403,11 +436,14 @@ class Worker:
         error_files = [f for f in non_folder if f['name'] == ERROR_TXT_NAME]
 
         # 処理要否判定 (素材のメタも入力に含める。CSV不在時はフォルダ側の変化だけで判定し、
-        # エラー通知→CSVが置かれたら modifiedTime が新しくなるので自動リトライされる)
+        # エラー通知→CSVが置かれたら modifiedTime が新しくなるので自動リトライされる)。
+        # ただしマーカーの無い同名重複 (二重実行の痕跡) がある場合は、どちらも入力より
+        # 新しく skip_done になってしまうため、mtimeに関係なく競合処理へ進ませる
         input_files = invoices + pattern_txts + labels_meta + ([csv_meta] if csv_meta else [])
-        action = decide_action(self._now_utc(), input_files, output_files, error_files)
-        if action != 'process':
-            return
+        if not has_unacknowledged_duplicates(output_files, error_files):
+            action = decide_action(self._now_utc(), input_files, output_files, error_files)
+            if action != 'process':
+                return
 
         # AES引当フォルダかの判定 (処理候補になった時だけtxtをダウンロード)
         aes_txts = []
@@ -519,7 +555,9 @@ class Worker:
             # PDF組み立ての失敗 (壊れたPDF等) もログだけにせず人に見える形で通知する
             label_bytes = sorter_core.build_label_pdf(matched_pages)
             if output_file:
-                client.overwrite(output_file['id'], label_bytes, 'application/pdf')
+                # 成功したので失敗ハンドラのマーカーは外す
+                client.overwrite(output_file['id'], label_bytes, 'application/pdf',
+                                 app_properties=_CLEAR_FAILURE)
             else:
                 client.upload_new(folder['id'], OUTPUT_PDF_NAME, label_bytes, 'application/pdf')
         except Exception as e:
@@ -532,38 +570,48 @@ class Worker:
         # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
         for error_file in error_files:
             try:
-                client.overwrite(error_file['id'], build_resolved_txt(datetime.now(JST)), 'text/plain')
+                client.overwrite(error_file['id'], build_resolved_txt(datetime.now(JST)), 'text/plain',
+                                 app_properties=_CLEAR_FAILURE)
             except Exception as e:
                 _log(f"フォルダ '{folder['name']}' のエラーtxt更新に失敗 (出力は完了済み): {e}")
 
         _log(f"出力完了: {folder['name']} / {OUTPUT_PDF_NAME} ({len(matched_pages)}ページ)")
 
     def _notify_failure(self, folder, reasons, output_files, error_files):
-        """残っている旧出力PDF全件を「使用禁止」PDFで失効させてから、エラーtxtを作成/上書きする。
+        """エラーtxtを作成/上書きしてから、残っている旧出力PDF全件を「使用禁止」PDFで失効させる。
 
-        前回の成功PDFが残っていると誤使用の恐れがあるため、無効化を先に行い
-        古い正常PDFだけが残る時間を最小化する (削除はしない)。decide_action は
-        全アーティファクトの最古mtime基準なので、どちらの書き込みが途中で失敗しても
-        次サイクルで再試行される。
+        順序が重要: 先にPDFを無効化した後でエラーtxtの書き込みに失敗すると、
+        「入力より新しいPDFだけがある」状態になり decide_action が完了済みと誤判定して
+        エラーtxtの無いまま恒久skipに陥る (Codexレビュー3巡目 指摘1)。
+        エラーtxtを先に書き、書けなかった場合はPDF無効化も見送って次サイクルの
+        再試行に任せる (全アーティファクトの最古mtime基準により必ず再試行される)。
+        失敗ハンドラが書いたファイルには CONFLICT_MARKER_PROP を付け、
+        マーカーの無い同名重複 (二重実行の痕跡) を検出できるようにする。
         """
         client = self.client
         now_jst = datetime.now(JST)
-
-        for output_file in output_files:
-            try:
-                client.overwrite(output_file['id'], build_invalid_pdf(now_jst), 'application/pdf')
-            except Exception as e:
-                _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
 
         try:
             content = build_error_txt(now_jst, reasons)
             if error_files:
                 for error_file in error_files:
-                    client.overwrite(error_file['id'], content, 'text/plain')
+                    client.overwrite(error_file['id'], content, 'text/plain',
+                                     app_properties=_MARK_FAILURE)
             else:
-                client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain')
+                client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain',
+                                  app_properties=_MARK_FAILURE)
         except Exception as e:
-            _log(f"フォルダ '{folder['name']}' のエラー通知の書き込みに失敗: {e}")
+            _log(f"フォルダ '{folder['name']}' のエラー通知の書き込みに失敗 "
+                 f"(旧出力PDFの無効化は見送り、次サイクルで再試行): {e}")
+            return
+
+        # 前回の成功PDFが残っていると誤使用の恐れがあるため無効化する (削除はしない)
+        for output_file in output_files:
+            try:
+                client.overwrite(output_file['id'], build_invalid_pdf(now_jst), 'application/pdf',
+                                 app_properties=_MARK_FAILURE)
+            except Exception as e:
+                _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
 
         _log(f"エラー通知: {folder['name']} ({len(reasons)}件)")
 
