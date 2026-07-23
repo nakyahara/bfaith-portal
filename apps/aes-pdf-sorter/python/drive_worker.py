@@ -51,7 +51,9 @@ CSV_NAME = 'logi_dispatch.csv'
 #   判定には専用マーカーを使う (Codexレビュー3巡目 指摘2・4巡目 指摘2)
 CONFLICT_MARKER_PROP = 'aesFailureWrite'
 DUP_ACK_PROP = 'aesDupAcked'
-_MARK_FAILURE = {CONFLICT_MARKER_PROP: '1'}
+# 非重複ファイルへの失敗書き込みでは、手動整理で重複が解消された後に残る古い
+# DUP_ACK_PROP を同時に消す (残すと復旧再処理が毎サイクル繰り返される)
+_MARK_FAILURE = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: None}
 _MARK_FAILURE_DUP = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'}
 _CLEAR_FAILURE = {CONFLICT_MARKER_PROP: None, DUP_ACK_PROP: None}  # 値nullでキー削除
 
@@ -144,6 +146,22 @@ def has_unacknowledged_duplicates(output_files, error_files):
     for group in (output_files, error_files):
         if len(group) > 1 and any(
                 DUP_ACK_PROP not in (f.get('appProperties') or {}) for f in group):
+            return True
+    return False
+
+
+def has_stale_dup_ack(output_files, error_files):
+    """重複の手動整理後に、競合通知の出力 (通知済みマーカー付きの1件) が残っている状態か。
+
+    競合通知後にユーザーが重複を1件に整理すると、残ったファイルは DUP_ACK_PROP
+    付きのまま「全件失敗マーカー」の定常状態になり、mtime基準では入力が変わるまで
+    再処理されない (無効PDF/競合エラーtxtが残り続ける)。通知済みマーカーの付いた
+    非重複ファイルを見つけたら一度再処理して復旧させる (Codexレビュー5巡目 指摘)。
+    再処理の書き込みは成功時 (_CLEAR_FAILURE)・失敗時 (_MARK_FAILURE) とも
+    DUP_ACK_PROP を消すため、復旧処理が毎サイクル繰り返されることはない。
+    """
+    for group in (output_files, error_files):
+        if len(group) == 1 and DUP_ACK_PROP in (group[0].get('appProperties') or {}):
             return True
     return False
 
@@ -460,11 +478,13 @@ class Worker:
         # 処理要否判定 (素材のメタも入力に含める。CSV不在時はフォルダ側の変化だけで判定し、
         # エラー通知→CSVが置かれたら modifiedTime が新しくなるので自動リトライされる)。
         # ただし①通知済みマーカーの無い同名重複 (二重実行の痕跡) ②失敗マーカーの混在
-        # (前回の書き込みが途中で失敗した証拠) がある場合は、mtime上は完了済みに
-        # 見えても skip せず処理へ進ませる
+        # (前回の書き込みが途中で失敗した証拠) ③重複整理後に残った通知済みファイル
+        # (競合解消後の復旧) がある場合は、mtime上は完了済みに見えても skip せず
+        # 処理へ進ませる
         input_files = invoices + pattern_txts + labels_meta + ([csv_meta] if csv_meta else [])
         if not (has_unacknowledged_duplicates(output_files, error_files)
-                or has_incomplete_failure_write(output_files, error_files)):
+                or has_incomplete_failure_write(output_files, error_files)
+                or has_stale_dup_ack(output_files, error_files)):
             action = decide_action(self._now_utc(), input_files, output_files, error_files)
             if action != 'process':
                 return

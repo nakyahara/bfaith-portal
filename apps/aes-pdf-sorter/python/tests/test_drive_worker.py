@@ -12,6 +12,7 @@ import fitz
 import drive_worker
 from drive_worker import (
     Worker, decide_action, has_unacknowledged_duplicates, has_incomplete_failure_write,
+    has_stale_dup_ack,
     is_aes_pattern, parse_pattern_name,
     parse_poll_hours, within_hours, natural_key, build_invalid_pdf,
     OUTPUT_PDF_NAME, ERROR_TXT_NAME, CSV_NAME, FOLDER_MIME,
@@ -143,6 +144,29 @@ class HasUnacknowledgedDuplicatesTest(unittest.TestCase):
         err1 = meta(ERROR_TXT_NAME, mime='text/plain')
         err2 = dict(err1, id='id-dup')
         self.assertTrue(has_unacknowledged_duplicates([], [err1, err2]))
+
+
+class HasStaleDupAckTest(unittest.TestCase):
+    def test_single_without_ack_ok(self):
+        self.assertFalse(has_stale_dup_ack([meta(OUTPUT_PDF_NAME)], []))
+        marked = dict(meta(OUTPUT_PDF_NAME), appProperties={CONFLICT_MARKER_PROP: '1'})
+        self.assertFalse(has_stale_dup_ack([marked], []))
+
+    def test_single_with_ack_detected(self):
+        # 重複整理後に残った通知済みファイル → 復旧のため再処理
+        acked = dict(meta(OUTPUT_PDF_NAME),
+                     appProperties={CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'})
+        self.assertTrue(has_stale_dup_ack([acked], []))
+        err = dict(meta(ERROR_TXT_NAME, mime='text/plain'),
+                   appProperties={CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'})
+        self.assertTrue(has_stale_dup_ack([], [err]))
+
+    def test_still_duplicated_not_stale(self):
+        # まだ重複している間は対象外 (重複側のロジックが扱う)
+        acked = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'}
+        out1 = dict(meta(OUTPUT_PDF_NAME), appProperties=acked)
+        out2 = dict(out1, id='id-dup')
+        self.assertFalse(has_stale_dup_ack([out1, out2], []))
 
 
 class HasIncompleteFailureWriteTest(unittest.TestCase):
@@ -728,17 +752,18 @@ class WorkerE2ETest(unittest.TestCase):
         for file_id in invalidated:
             self.assertEqual(client.app_properties[file_id],
                              {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'})
-        # エラーtxtは単独 (新規作成) なので失敗マーカーのみ
+        # エラーtxtは単独 (新規作成) なので失敗マーカーのみ (通知済みマーカーは消す側)
         self.assertEqual(client.app_properties[f'new-{ERROR_TXT_NAME}'],
-                         {CONFLICT_MARKER_PROP: '1'})
+                         {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: None})
 
     def test_marked_duplicates_converge_no_rewrite(self):
-        # 競合通知済み (全件マーカー付き・エラーtxtも新しい) なら再書き込みしない (収束)
-        marked = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'}
-        out1 = dict(meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z'), appProperties=marked)
+        # 競合通知済み (重複PDF全件に通知済みマーカー・エラーtxtも新しい) なら
+        # 再書き込みしない (収束)。単独のエラーtxtは失敗マーカーのみ (実運用と同じ)
+        acked = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'}
+        out1 = dict(meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z'), appProperties=acked)
         out2 = dict(out1, id='id-out-dup')
         err = dict(meta(ERROR_TXT_NAME, '2026-07-03T00:00:00.000Z', mime='text/plain'),
-                   appProperties=marked)
+                   appProperties={CONFLICT_MARKER_PROP: '1'})
         folder_files = [
             meta('引当パターン_AES《単品》.txt', mime='text/plain'),
             meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
@@ -791,7 +816,8 @@ class WorkerE2ETest(unittest.TestCase):
         self.assertIn('失敗しました', by_id[err['id']][0].decode('utf-8'))
         self.assertIn(out['id'], by_id)
         self.assertIn('INVALID - DO NOT USE', page_texts(by_id[out['id']][0])[0])
-        self.assertEqual(client.app_properties[out['id']], {CONFLICT_MARKER_PROP: '1'})
+        self.assertEqual(client.app_properties[out['id']],
+                         {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: None})
 
     def test_simultaneous_error_txt_duplicates_flagged(self):
         # 二重実行で同時新規作成されたエラーtxt2つは、どちらも失敗マーカー付き・
@@ -825,6 +851,44 @@ class WorkerE2ETest(unittest.TestCase):
             self.assertIn('同名の出力ファイルが複数あります', content.decode('utf-8'))
             self.assertEqual(client.app_properties[file_id],
                              {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'})
+
+    def test_dup_cleanup_recovery_reprocesses(self):
+        # 競合通知後にユーザーが重複を1件に整理 → 残った通知済みファイルは入力より
+        # 新しくても一度再処理され、正常なPDF+解消済みtxtに戻る (Codex5巡目 指摘)
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        out = dict(meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z'),
+                   appProperties={CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'})  # 残った無効PDF
+        err = dict(meta(ERROR_TXT_NAME, '2026-07-03T00:00:00.000Z', mime='text/plain'),
+                   appProperties={CONFLICT_MARKER_PROP: '1'})
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+            out,
+            err,
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(client.uploads, [])
+        by_id = {file_id: (content, m) for file_id, content, m in client.overwrites}
+        # 無効PDFは正常な並び替え済みPDFで上書きされ、マーカーは両方消える
+        self.assertEqual(page_texts(by_id[out['id']][0]), ['LABEL-DA100'])
+        self.assertEqual(client.app_properties[out['id']],
+                         {CONFLICT_MARKER_PROP: None, DUP_ACK_PROP: None})
+        # エラーtxtは解消済みに上書きされ、マーカーは両方消える
+        self.assertIn('解消済み', by_id[err['id']][0].decode('utf-8'))
+        self.assertEqual(client.app_properties[err['id']],
+                         {CONFLICT_MARKER_PROP: None, DUP_ACK_PROP: None})
 
     def test_error_txt_failure_skips_pdf_invalidation(self):
         # エラーtxtの新規作成に失敗したら旧PDFの無効化も見送る。先にPDFを無効化すると
