@@ -17,7 +17,8 @@ logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 - 突合の競合 (同一配送番号が複数ページ / 複数注文が同一ページ) は黙って進めず
   エラー停止する (Codexレビュー指摘3)。
 - ワーカーはシングルスレッドの逐次処理 (フォルダを1つずつ)。Renderインスタンスは1台前提。
-  万一二重実行が起きても、出力は同名ファイルへの上書きに収束するため事故にならない。
+  Driveは同名ファイルを許すため、万一の二重実行等で同名の出力ファイルが複数できていた
+  場合は上書き先を確定できず、競合エラーで停止する (Codexレビュー2巡目 指摘3)。
 """
 import io
 import json
@@ -87,21 +88,21 @@ def is_aes_pattern(txt_filename, txt_text):
     return txt_filename.startswith('引当パターン_AES')
 
 
-def decide_action(now_utc, input_files, output_file, error_file):
+def decide_action(now_utc, input_files, output_files, error_files):
     """処理要否判定 (設計書§6)。
 
     input_files: 判定に使う入力ファイルのメタ一覧 [{'name','modifiedTime',...}]
                  (対象フォルダの納品書・引当パターンtxt + logi_dispatch.csv + 素材AES*.pdf)
-    output_file / error_file: 前回試行の出力メタ (無ければ None)
+    output_files / error_files: 前回試行の出力メタ一覧 (通常0〜1件。同名重複時は全件)
     戻り値: 'process' / 'skip_done' (試行済みで入力に変化なし) / 'skip_settling' (整定待ち)
 
-    出力PDFとエラーtxtが両方存在する場合、試行の完了時刻には「古い方」を使う。
-    完全な試行は両方を更新するため、片方だけ新しい = 前回の書き込みが途中で失敗した
-    状態であり、skipせず次サイクルで再試行する (Codexレビュー2巡目 指摘1)。
+    出力PDF・エラーtxtが複数存在する場合、試行の完了時刻には「最も古いもの」を使う。
+    完全な試行は全アーティファクトを更新するため、一部だけ新しい = 前回の書き込みが
+    途中で失敗した状態であり、skipせず次サイクルで再試行する (Codexレビュー2巡目 指摘1)。
     """
     newest_input = max(parse_rfc3339(f['modifiedTime']) for f in input_files)
 
-    attempts = [f for f in (output_file, error_file) if f]
+    attempts = list(output_files) + list(error_files)
     if attempts:
         attempt_completed = min(parse_rfc3339(f['modifiedTime']) for f in attempts)
         if newest_input <= attempt_completed:
@@ -398,13 +399,13 @@ class Worker:
         if not invoices:
             return
 
-        output_file = next((f for f in non_folder if f['name'] == OUTPUT_PDF_NAME), None)
-        error_file = next((f for f in non_folder if f['name'] == ERROR_TXT_NAME), None)
+        output_files = [f for f in non_folder if f['name'] == OUTPUT_PDF_NAME]
+        error_files = [f for f in non_folder if f['name'] == ERROR_TXT_NAME]
 
         # 処理要否判定 (素材のメタも入力に含める。CSV不在時はフォルダ側の変化だけで判定し、
         # エラー通知→CSVが置かれたら modifiedTime が新しくなるので自動リトライされる)
         input_files = invoices + pattern_txts + labels_meta + ([csv_meta] if csv_meta else [])
-        action = decide_action(self._now_utc(), input_files, output_file, error_file)
+        action = decide_action(self._now_utc(), input_files, output_files, error_files)
         if action != 'process':
             return
 
@@ -433,6 +434,17 @@ class Worker:
                            'どのパターンのフォルダか判断できないため処理を停止しました。'
                            '不要なtxtを整理してください')
 
+        # Driveは同名ファイルを許すため、二重実行等で出力ファイルが複数できていると
+        # どれを更新すべきか確定できない。以後は片方だけ更新される事故になるため停止する
+        # (削除はしない方針なので自動では直せない。Codexレビュー2巡目 指摘3)
+        duplicated_outputs = [name for name, group in
+                              ((OUTPUT_PDF_NAME, output_files), (ERROR_TXT_NAME, error_files))
+                              if len(group) > 1]
+        if duplicated_outputs:
+            reasons.append(f'同名の出力ファイルが複数あります ({", ".join(duplicated_outputs)})。'
+                           'どれを更新すべきか確定できないため処理を停止しました。'
+                           '重複ファイルを手で整理してください')
+
         if csv_meta is None:
             reasons.append(f'{CSV_NAME} が見つかりません (bfaithポータルdataフォルダを確認してください)')
         if not labels_meta:
@@ -453,6 +465,8 @@ class Worker:
                                '(素材フォルダに古い送り状PDFが混在していないか確認してください)')
             else:
                 all_orders = []
+                order_invoice = {}   # 注文番号 -> 初出の納品書ファイル名
+                cross_dups = []      # 納品書をまたいだ重複注文番号
                 for invoice_meta in invoices:
                     try:
                         invoice_bytes = client.download(invoice_meta['id'])
@@ -464,9 +478,22 @@ class Worker:
                         if not orders:
                             reasons.append(f'{invoice_meta["name"]}: 注文番号パターン（3桁-7桁-7桁）が見つかりませんでした')
                             continue
-                        all_orders.extend(o for o in orders if o not in all_orders)
+                        # 同一納品書内の重複は extract_order_numbers 側でdedupe済み。
+                        # 別の納品書ファイルに同じ注文番号が出た場合は、古い納品書PDFの
+                        # 残留の疑いがあるため黙って除去せず競合停止する (Codex2巡目 指摘2)
+                        for order_number in orders:
+                            if order_number in order_invoice:
+                                cross_dups.append(
+                                    f'{order_number} ({order_invoice[order_number]} / {invoice_meta["name"]})')
+                            else:
+                                order_invoice[order_number] = invoice_meta['name']
+                                all_orders.append(order_number)
                     except Exception as e:
                         reasons.append(f'{invoice_meta["name"]}: 納品書処理エラー: {e}')
+                if cross_dups:
+                    reasons.append('同じ注文番号が複数の納品書に含まれています: '
+                                   + ', '.join(cross_dups)
+                                   + ' (古い納品書PDFが残っていないか確認してください)')
 
                 if not reasons:
                     matched_pages, unmatched = sorter_core.match_orders(
@@ -483,25 +510,27 @@ class Worker:
                                        f'{CSV_NAME} と送り状PDFの組み合わせを確認してください')
 
         if reasons:
-            self._notify_failure(folder, reasons, output_file, error_file)
+            self._notify_failure(folder, reasons, output_files, error_files)
             return
 
-        label_bytes = sorter_core.build_label_pdf(matched_pages)
+        # ここに来た時点で output_files / error_files は0〜1件 (複数なら上で停止済み)
+        output_file = output_files[0] if output_files else None
         try:
+            # PDF組み立ての失敗 (壊れたPDF等) もログだけにせず人に見える形で通知する
+            label_bytes = sorter_core.build_label_pdf(matched_pages)
             if output_file:
                 client.overwrite(output_file['id'], label_bytes, 'application/pdf')
             else:
                 client.upload_new(folder['id'], OUTPUT_PDF_NAME, label_bytes, 'application/pdf')
         except Exception as e:
-            # 出力の書き込み失敗も人に見える形で通知する (ログだけにしない)
             self._notify_failure(
                 folder,
-                [f'{OUTPUT_PDF_NAME} のアップロードに失敗しました: {e}'],
-                output_file, error_file)
+                [f'{OUTPUT_PDF_NAME} の生成/アップロードに失敗しました: {e}'],
+                output_files, error_files)
             return
 
         # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
-        if error_file:
+        for error_file in error_files:
             try:
                 client.overwrite(error_file['id'], build_resolved_txt(datetime.now(JST)), 'text/plain')
             except Exception as e:
@@ -509,25 +538,32 @@ class Worker:
 
         _log(f"出力完了: {folder['name']} / {OUTPUT_PDF_NAME} ({len(matched_pages)}ページ)")
 
-    def _notify_failure(self, folder, reasons, output_file, error_file):
-        """エラーtxtを作成/上書きし、残っている旧出力PDFを「使用禁止」PDFで失効させる"""
+    def _notify_failure(self, folder, reasons, output_files, error_files):
+        """残っている旧出力PDF全件を「使用禁止」PDFで失効させてから、エラーtxtを作成/上書きする。
+
+        前回の成功PDFが残っていると誤使用の恐れがあるため、無効化を先に行い
+        古い正常PDFだけが残る時間を最小化する (削除はしない)。decide_action は
+        全アーティファクトの最古mtime基準なので、どちらの書き込みが途中で失敗しても
+        次サイクルで再試行される。
+        """
         client = self.client
         now_jst = datetime.now(JST)
-        try:
-            content = build_error_txt(now_jst, reasons)
-            if error_file:
-                client.overwrite(error_file['id'], content, 'text/plain')
-            else:
-                client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain')
-        except Exception as e:
-            _log(f"フォルダ '{folder['name']}' のエラー通知の書き込みに失敗: {e}")
 
-        if output_file:
-            # 前回の成功PDFが残っていると誤使用の恐れがあるため無効化する (削除はしない)
+        for output_file in output_files:
             try:
                 client.overwrite(output_file['id'], build_invalid_pdf(now_jst), 'application/pdf')
             except Exception as e:
                 _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
+
+        try:
+            content = build_error_txt(now_jst, reasons)
+            if error_files:
+                for error_file in error_files:
+                    client.overwrite(error_file['id'], content, 'text/plain')
+            else:
+                client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain')
+        except Exception as e:
+            _log(f"フォルダ '{folder['name']}' のエラー通知の書き込みに失敗: {e}")
 
         _log(f"エラー通知: {folder['name']} ({len(reasons)}件)")
 

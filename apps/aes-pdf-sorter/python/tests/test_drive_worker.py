@@ -5,6 +5,7 @@
 """
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import fitz
 
@@ -70,33 +71,43 @@ class DecideActionTest(unittest.TestCase):
 
     def test_no_attempt_settled(self):
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf')], None, None),
+            decide_action(self.now, [meta('納品書_20.pdf')], [], []),
             'process')
 
     def test_attempt_newer_than_inputs(self):
         out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD)], out, None),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [out], []),
             'skip_done')
 
     def test_error_attempt_blocks_until_inputs_change(self):
         err = meta(ERROR_TXT_NAME, '2026-07-02T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD)], None, err),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD)], [], [err]),
             'skip_done')
 
     def test_inputs_newer_than_attempt_reprocess(self):
         err = meta(ERROR_TXT_NAME, '2026-07-02T00:00:00.000Z')
         newer_input = meta(CSV_NAME, '2026-07-03T00:00:00.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', OLD), newer_input], None, err),
+            decide_action(self.now, [meta('納品書_20.pdf', OLD), newer_input], [], [err]),
             'process')
 
     def test_settling_wait(self):
         recent = (self.now - timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
         self.assertEqual(
-            decide_action(self.now, [meta('納品書_20.pdf', recent)], None, None),
+            decide_action(self.now, [meta('納品書_20.pdf', recent)], [], []),
             'skip_settling')
+
+    def test_partial_attempt_retries(self):
+        # 片方のアーティファクトだけ入力より新しい = 前回の書き込みが途中で失敗した状態
+        # → skipせず再処理する (Codex2巡目 指摘1の検証)
+        out = meta(OUTPUT_PDF_NAME, '2026-07-03T00:00:00.000Z')   # 入力より新しい
+        err = meta(ERROR_TXT_NAME, '2026-07-01T00:00:00.000Z')   # 入力より古い
+        newer_input = meta(CSV_NAME, '2026-07-02T00:00:00.000Z')
+        self.assertEqual(
+            decide_action(self.now, [newer_input], [out], [err]),
+            'process')
 
 
 class NaturalKeyTest(unittest.TestCase):
@@ -556,6 +567,102 @@ class WorkerE2ETest(unittest.TestCase):
         error_uploads = [u for u in client.uploads if u[1] == ERROR_TXT_NAME]
         self.assertEqual(len(error_uploads), 1)
         self.assertIn('アップロードに失敗しました', error_uploads[0][2].decode('utf-8'))
+
+    def test_same_order_across_invoices_conflict(self):
+        # 同じ注文番号が別々の納品書ファイルに出た → 古い納品書の残留を疑い競合停止
+        # (黙って重複排除すると送り状1枚で「正常」扱いになってしまう。Codex2巡目 指摘2)
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice2 = make_pdf(['249-1111111-1111111'])
+        invoice10 = make_pdf(['249-1111111-1111111'])  # 納品書_10にも同じ注文
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_2.pdf'),
+            meta('納品書_10.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_2.pdf': invoice2,
+            'id-納品書_10.pdf': invoice10,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        text = content.decode('utf-8')
+        self.assertIn('複数の納品書', text)
+        self.assertIn('249-1111111-1111111', text)
+        self.assertIn('納品書_2.pdf', text)
+        self.assertIn('納品書_10.pdf', text)
+
+    def test_duplicate_output_files_conflict(self):
+        # 同名の出力PDFが2つある (二重実行の痕跡) → 上書き先を確定できないため停止し、
+        # 両方を「使用禁止」PDFで無効化する (Codex2巡目 指摘3)
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        out1 = meta(OUTPUT_PDF_NAME, '2026-07-01T12:00:00.000Z')
+        out2 = dict(out1, id='id-out-dup')
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            out1,
+            out2,
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [])
+
+        # エラーtxtは新規作成
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        self.assertIn('同名の出力ファイルが複数あります', content.decode('utf-8'))
+        # 両方の旧出力PDFが使用禁止PDFで無効化される
+        invalidated = {file_id for file_id, c, m in client.overwrites if m == 'application/pdf'}
+        self.assertEqual(invalidated, {out1['id'], out2['id']})
+        for _, c, m in client.overwrites:
+            if m == 'application/pdf':
+                self.assertIn('INVALID - DO NOT USE', page_texts(c)[0])
+
+    def test_build_label_pdf_failure_writes_error_txt(self):
+        # PDF組み立て自体の失敗 (壊れたPDF等) もログだけでなくエラーtxtで通知される
+        # (Codex2巡目 指摘4)
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        with mock.patch.object(drive_worker.sorter_core, 'build_label_pdf',
+                               side_effect=RuntimeError('broken pdf')):
+            client = self._run(children, all_contents, [
+                {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+            ])
+
+        self.assertEqual(len(client.uploads), 1)
+        _, name, content, _ = client.uploads[0]
+        self.assertEqual(name, ERROR_TXT_NAME)
+        text = content.decode('utf-8')
+        self.assertIn('生成/アップロードに失敗しました', text)
+        self.assertIn('broken pdf', text)
 
     def test_skip_when_output_up_to_date(self):
         folder_files = [
