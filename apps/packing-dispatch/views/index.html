@@ -1176,6 +1176,9 @@ async function openDecide(o){
     fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, d.packing_machine_code||'manual');
     $('#dlgDate').value = toPickerDate(d.delivery_date);  // CSVの日付 → YYYY-MM-DD
     $('#dlgTime').value = d.delivery_time || '';
+    // 学習チェックは開くたびON初期化。ダイアログは使い回しのため、前の伝票でレターパック
+    // (syncDlgMachine が checked=false にする) を扱うと以降ずっとOFFのままになるバグの修正。
+    $('#dlgLearn').checked = true;
     syncDlgMachine();
     $('#dlgLearnWrap').style.display = d.order_type==='assort' ? 'block':'none';
   }catch(e){ $('#dlgInfo').innerHTML = '読込エラー: '+esc(e.message); }
@@ -1191,7 +1194,13 @@ function syncDlgMachine(){
   if(!nk || lg){ mc.value='manual'; mc.disabled=true; } else { mc.disabled=false; }
   const note=$('#dlgLgNote'); if(note) note.style.display = lg ? 'inline' : 'none';
   const learn = $('#dlgLearn'); const lpNote = $('#dlgLearnLpNote');
-  if(learn){ learn.disabled = lp; if(lp) learn.checked = false; }
+  // レターパック中はOFF固定、レターパックから戻したらONへ復帰 (ユーザーが自分でOFFにした状態は維持)。
+  if(learn){
+    const wasDisabled = learn.disabled;
+    learn.disabled = lp;
+    if(lp) learn.checked = false;
+    else if(wasDisabled) learn.checked = true;
+  }
   if(lpNote) lpNote.style.display = lp ? 'inline' : 'none';
 }
 $('#dlgMethod').addEventListener('change', syncDlgMachine);
