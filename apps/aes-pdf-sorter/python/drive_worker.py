@@ -309,7 +309,11 @@ class DriveClient:
     def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
         body = {'name': name, 'parents': [folder_id]}
         if app_properties:
-            body['appProperties'] = app_properties
+            # 値None (キー削除指示) はupdate/copy専用の仕様。createに渡すと拒否され得る
+            # ため除外する (新規ファイルに削除すべきキーは無い。Codexレビュー6巡目 指摘)
+            props = {k: v for k, v in app_properties.items() if v is not None}
+            if props:
+                body['appProperties'] = props
         res = self.service.files().create(
             body=body,
             media_body=self._media(content, mimetype),

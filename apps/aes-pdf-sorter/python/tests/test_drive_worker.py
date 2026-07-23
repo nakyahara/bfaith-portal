@@ -229,6 +229,40 @@ class HoursTest(unittest.TestCase):
         self.assertFalse(within_hours(datetime(2026, 7, 22, 12, 0, tzinfo=jst), (22, 7)))
 
 
+class DriveClientUploadBodyTest(unittest.TestCase):
+    def test_upload_new_strips_null_app_properties(self):
+        # 値None (キー削除指示) は update/copy 専用で、create に渡すと拒否され得る。
+        # upload_new が body から除外することを実クライアント側で検証する (Codex6巡目)
+        captured = {}
+
+        class FakeRequest:
+            def execute(self):
+                return {'id': 'new-id'}
+
+        class FakeFiles:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return FakeRequest()
+
+        class FakeService:
+            def files(self):
+                return FakeFiles()
+
+        client = drive_worker.DriveClient.__new__(drive_worker.DriveClient)
+        client.service = FakeService()
+        client._media = lambda content, mimetype: 'media-stub'
+
+        client.upload_new('folder-id', ERROR_TXT_NAME, b'x', 'text/plain',
+                          app_properties={CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: None})
+        self.assertEqual(captured['body'].get('appProperties'), {CONFLICT_MARKER_PROP: '1'})
+
+        # 全てNoneならappPropertiesキー自体を送らない
+        captured.clear()
+        client.upload_new('folder-id', ERROR_TXT_NAME, b'x', 'text/plain',
+                          app_properties={CONFLICT_MARKER_PROP: None})
+        self.assertNotIn('appProperties', captured['body'])
+
+
 # ───────────────────────── E2E (フェイクDrive) ─────────────────────────
 
 class FakeDriveClient:
