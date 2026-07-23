@@ -12,7 +12,11 @@ import numpy as np
 try:
     from barcode_extractor import otsu_binarize
     HAVE_DEPS = True
-except Exception:  # pyzbar (zbar DLL) 未導入環境ではskip
+except ImportError as e:
+    # skipするのは pyzbar (zbar DLL) 未導入の場合のみ。それ以外のimport失敗は
+    # 本体の回帰なので隠さず落とす (Codexレビュー PR#606 low)
+    if 'pyzbar' not in str(e):
+        raise
     HAVE_DEPS = False
 
 
