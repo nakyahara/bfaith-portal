@@ -123,6 +123,17 @@ class DecideActionTest(unittest.TestCase):
             decide_action(self.now, [meta('納品書_20.pdf', recent)], [], [], []),
             'skip_settling')
 
+    def test_success_state_local_trigger_still_settles_on_shared(self):
+        # 成功状態のトリガーはlocalのみだが、整定待ちは素材も含めて判定する
+        # (素材の入れ替え途中に処理して一時的な不一致を出さない)
+        recent = (self.now - timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        out = meta(OUTPUT_PDF_NAME, '2026-07-02T00:00:00.000Z')
+        local = meta('納品書_20.pdf', '2026-07-03T00:00:00.000Z')  # 出力より新しい (トリガー)
+        shared = meta(CSV_NAME, recent)  # 30秒前に入れ替わったばかり
+        self.assertEqual(
+            decide_action(self.now, [local], [shared], [out], []),
+            'skip_settling')
+
     def test_partial_attempt_retries(self):
         # 片方のアーティファクトだけ入力より新しい = 前回の書き込みが途中で失敗した状態
         # → skipせず再処理する (Codex2巡目 指摘1の検証)

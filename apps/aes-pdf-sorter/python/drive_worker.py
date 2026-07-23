@@ -129,17 +129,22 @@ def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_file
     attempts = list(output_files) + list(error_files)
     failure_state = any(CONFLICT_MARKER_PROP in (f.get('appProperties') or {}) for f in attempts)
     if not attempts or failure_state:
-        relevant_inputs = list(local_inputs) + list(shared_inputs)
+        trigger_inputs = list(local_inputs) + list(shared_inputs)
     else:
-        relevant_inputs = list(local_inputs)
-    newest_input = max(parse_rfc3339(f['modifiedTime']) for f in relevant_inputs)
+        trigger_inputs = list(local_inputs)
+    newest_trigger = max(parse_rfc3339(f['modifiedTime']) for f in trigger_inputs)
 
     if attempts:
         attempt_completed = min(parse_rfc3339(f['modifiedTime']) for f in attempts)
-        if newest_input <= attempt_completed:
+        if newest_trigger <= attempt_completed:
             return 'skip_done'
 
-    if now_utc - newest_input < timedelta(seconds=SETTLE_SECONDS):
+    # 整定待ちは常に全入力 (素材含む) で判定する。成功状態のトリガーはlocalのみだが、
+    # 素材の入れ替え途中に処理すると一時的な不一致でPDFを無効化しかねないため
+    # (Codexレビュー PR#605 medium)
+    newest_any = max(parse_rfc3339(f['modifiedTime'])
+                     for f in list(local_inputs) + list(shared_inputs))
+    if now_utc - newest_any < timedelta(seconds=SETTLE_SECONDS):
         return 'skip_settling'
 
     return 'process'
