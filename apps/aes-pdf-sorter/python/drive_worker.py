@@ -41,13 +41,19 @@ OUTPUT_PDF_NAME = 'AES送り状_並び替え済.pdf'
 ERROR_TXT_NAME = 'AES送り状_エラー.txt'
 CSV_NAME = 'logi_dispatch.csv'
 
-# 失敗ハンドラが書いたファイルに付ける appProperties マーカー。
-# 二重実行で作られた同名重複は通常どちらも入力より新しく、mtime基準の decide_action
-# では skip_done になり競合検出に到達しない。マーカーの無い同名重複 = 未通知の競合
-# として mtime に関係なく処理へ進ませるために使う (Codexレビュー3巡目 指摘2)。
+# 出力ファイルに付ける appProperties マーカー2種。mtimeだけでは「前回の書き込みが
+# 完全に終わったか」を判定できないケースがあるため、書き込みの種別を記録する。
+# - CONFLICT_MARKER_PROP: 失敗ハンドラが書いたファイル。完全な失敗通知は全アーティ
+#   ファクトに付け、完全な成功更新は全てから外す。混在 = 書き込み途中失敗の証拠
+#   として再処理する (Codexレビュー4巡目 指摘1)
+# - DUP_ACK_PROP: 同名重複の競合通知として書いたファイル。二重実行で同時新規作成
+#   された重複は最初から CONFLICT_MARKER_PROP 付きになり得るため、重複の通知済み
+#   判定には専用マーカーを使う (Codexレビュー3巡目 指摘2・4巡目 指摘2)
 CONFLICT_MARKER_PROP = 'aesFailureWrite'
+DUP_ACK_PROP = 'aesDupAcked'
 _MARK_FAILURE = {CONFLICT_MARKER_PROP: '1'}
-_CLEAR_FAILURE = {CONFLICT_MARKER_PROP: None}  # Drive APIは値nullでキーを削除する
+_MARK_FAILURE_DUP = {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: '1'}
+_CLEAR_FAILURE = {CONFLICT_MARKER_PROP: None, DUP_ACK_PROP: None}  # 値nullでキー削除
 
 SHIP_FOLDER_RE = re.compile(r'^出荷_\d+$')
 PATTERN_TXT_RE = re.compile(r'^引当パターン_.*\.txt$')
@@ -125,19 +131,35 @@ def decide_action(now_utc, input_files, output_files, error_files):
 
 
 def has_unacknowledged_duplicates(output_files, error_files):
-    """同名出力ファイルの重複のうち、失敗ハンドラ未処理 (マーカー無し) のものがあるか。
+    """同名出力ファイルの重複のうち、競合通知が済んでいない (DUP_ACK_PROP無し) ものがあるか。
 
     二重実行で作られた同名ファイルは通常どちらも入力より新しいため、mtime基準の
-    decide_action では skip_done になってしまう。失敗ハンドラが書いたファイルには
-    CONFLICT_MARKER_PROP が付くので、マーカーの無い重複があれば mtime に関係なく
-    競合処理へ進ませる。全件マーカー付きになれば通常判定に戻り、書き込みが
-    毎サイクル繰り返されることもない (収束する)。
+    decide_action では skip_done になってしまう。競合通知として書いたファイルには
+    DUP_ACK_PROP が付くので、これの無い重複があれば mtime に関係なく競合処理へ
+    進ませる。全件マーカー付きになれば通常判定に戻り、書き込みが毎サイクル
+    繰り返されることもない (収束する)。CONFLICT_MARKER_PROP では代用できない:
+    二重実行で同時新規作成されたエラーtxtは最初から両方に付いているため
+    (Codexレビュー4巡目 指摘2)。
     """
     for group in (output_files, error_files):
         if len(group) > 1 and any(
-                CONFLICT_MARKER_PROP not in (f.get('appProperties') or {}) for f in group):
+                DUP_ACK_PROP not in (f.get('appProperties') or {}) for f in group):
             return True
     return False
+
+
+def has_incomplete_failure_write(output_files, error_files):
+    """失敗マーカーの付与状態が混在 = 前回の失敗通知/成功更新が途中で失敗している。
+
+    完全な失敗通知は全アーティファクトに CONFLICT_MARKER_PROP を付け、完全な
+    成功更新は全てから外すため、正常な定常状態では全件付きか全件無しになる。
+    混在は「エラーtxtは失敗を示すのに正常内容のPDFが残っている」等の途中失敗で、
+    両方のmtimeが入力より新しくなり得て decide_action では検出できないため、
+    mtimeに関係なく再処理する (Codexレビュー4巡目 指摘1)。
+    """
+    flags = [CONFLICT_MARKER_PROP in (f.get('appProperties') or {})
+             for f in list(output_files) + list(error_files)]
+    return any(flags) and not all(flags)
 
 
 def build_error_txt(now_jst, reasons):
@@ -437,10 +459,12 @@ class Worker:
 
         # 処理要否判定 (素材のメタも入力に含める。CSV不在時はフォルダ側の変化だけで判定し、
         # エラー通知→CSVが置かれたら modifiedTime が新しくなるので自動リトライされる)。
-        # ただしマーカーの無い同名重複 (二重実行の痕跡) がある場合は、どちらも入力より
-        # 新しく skip_done になってしまうため、mtimeに関係なく競合処理へ進ませる
+        # ただし①通知済みマーカーの無い同名重複 (二重実行の痕跡) ②失敗マーカーの混在
+        # (前回の書き込みが途中で失敗した証拠) がある場合は、mtime上は完了済みに
+        # 見えても skip せず処理へ進ませる
         input_files = invoices + pattern_txts + labels_meta + ([csv_meta] if csv_meta else [])
-        if not has_unacknowledged_duplicates(output_files, error_files):
+        if not (has_unacknowledged_duplicates(output_files, error_files)
+                or has_incomplete_failure_write(output_files, error_files)):
             action = decide_action(self._now_utc(), input_files, output_files, error_files)
             if action != 'process':
                 return
@@ -585,18 +609,23 @@ class Worker:
         エラーtxtの無いまま恒久skipに陥る (Codexレビュー3巡目 指摘1)。
         エラーtxtを先に書き、書けなかった場合はPDF無効化も見送って次サイクルの
         再試行に任せる (全アーティファクトの最古mtime基準により必ず再試行される)。
-        失敗ハンドラが書いたファイルには CONFLICT_MARKER_PROP を付け、
-        マーカーの無い同名重複 (二重実行の痕跡) を検出できるようにする。
+        書いたファイルには CONFLICT_MARKER_PROP を付け、マーカーの混在 =
+        書き込み途中失敗を検出できるようにする。同名重複グループへの書き込みには
+        DUP_ACK_PROP も付け、競合通知済みであることを記録する。
         """
         client = self.client
         now_jst = datetime.now(JST)
+
+        # 同名重複グループへの書き込みは「競合通知済み」マーカーも付ける
+        txt_props = _MARK_FAILURE_DUP if len(error_files) > 1 else _MARK_FAILURE
+        pdf_props = _MARK_FAILURE_DUP if len(output_files) > 1 else _MARK_FAILURE
 
         try:
             content = build_error_txt(now_jst, reasons)
             if error_files:
                 for error_file in error_files:
                     client.overwrite(error_file['id'], content, 'text/plain',
-                                     app_properties=_MARK_FAILURE)
+                                     app_properties=txt_props)
             else:
                 client.upload_new(folder['id'], ERROR_TXT_NAME, content, 'text/plain',
                                   app_properties=_MARK_FAILURE)
@@ -609,7 +638,7 @@ class Worker:
         for output_file in output_files:
             try:
                 client.overwrite(output_file['id'], build_invalid_pdf(now_jst), 'application/pdf',
-                                 app_properties=_MARK_FAILURE)
+                                 app_properties=pdf_props)
             except Exception as e:
                 _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
 
