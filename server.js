@@ -1343,12 +1343,27 @@ app.listen(PORT, () => {
   // [perf] イベントループ遅延 / メモリ推移の定期計測（PERF_LOG=1 のときのみ）
   try { startPerfMonitor(); } catch (e) { console.warn('[perf] monitor 起動スキップ:', e.message); }
 
-  try {
-    startPythonBackend();
-  } catch (e) {
-    bootFail('aes-python', 'startPythonBackend', e);
-    console.warn(`[AES-Python] 起動スキップ: ${e.message}`);
-    console.warn('[AES-Python] Python環境がない場合、AESラベル並び替え機能は使用できません');
+  // AES Pythonバックエンドは既定で Render (本番ポータル) のみ起動する。
+  // 同じ server.js は miniPC でも warehouse/API host (port 3000) として動いているが、
+  // miniPC には実体のPythonが無く (Store エイリアスのみ・SYSTEM実行でPATH外)、
+  // spawn('python') が ENOENT (-4058) で失敗 → #605 自動再起動ループ + #607 GChat通知が
+  // 誤発報していた (2026-07-24)。
+  // AES_PYTHON_ENABLED を明示した場合はそれを優先 (Render側の緊急停止=0 も可能)、
+  // 未指定なら RENDER の有無を既定値にする。
+  const aesPythonEnabled = process.env.AES_PYTHON_ENABLED !== undefined
+    ? process.env.AES_PYTHON_ENABLED === '1'
+    : !!process.env.RENDER;
+  if (aesPythonEnabled) {
+    try {
+      startPythonBackend();
+    } catch (e) {
+      bootFail('aes-python', 'startPythonBackend', e);
+      console.warn(`[AES-Python] 起動スキップ: ${e.message}`);
+      console.warn('[AES-Python] Python環境がない場合、AESラベル並び替え機能は使用できません');
+    }
+  } else {
+    bootNote('aes-python', 'RENDER未設定のため起動スキップ (AES_PYTHON_ENABLED=1 で明示起動可)');
+    console.log('[AES-Python] 非Render環境のため起動スキップ (AESラベル並び替えはRender側で提供)');
   }
 
   // 楽天順位チェッカー スケジューラー
