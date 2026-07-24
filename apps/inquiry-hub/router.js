@@ -204,11 +204,11 @@ router.get('/inquiries/:id', (req, res) => {
       <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span></div>`).join('')}` : '';
   // 送信ワーカーの状態に応じたバナー (チャネル別モード。env は起動時固定なので都度読んでも軽い)
   const outboxOn = ['true', '1'].includes(process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED || '');
-  const SEND_MODE_ENV = { email: 'INQUIRY_HUB_MAIL_SEND_MODE', rakuten: 'INQUIRY_HUB_RAKUTEN_SEND_MODE' };
+  const SEND_MODE_ENV = { email: 'INQUIRY_HUB_MAIL_SEND_MODE', rakuten: 'INQUIRY_HUB_RAKUTEN_SEND_MODE', yahoo: 'INQUIRY_HUB_YAHOO_SEND_MODE' };
   const channelSupported = inq.channel_type in SEND_MODE_ENV;
   const sendLive = channelSupported && process.env[SEND_MODE_ENV[inq.channel_type]] === 'live';
   const workerBanner = !channelSupported
-    ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ このチャネルの送信は未実装です (Yahoo!はStep 5)。作成したジョブは送信されず保留されます</div>'
+    ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ このチャネルの送信は未実装です。作成したジョブは送信されず保留されます</div>'
     : !outboxOn
       ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ 送信ワーカーは停止中です。作成した返信ジョブはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>'
       : !sendLive
@@ -434,6 +434,9 @@ router.post('/api/inquiries/:id/reply', (req, res) => {
   const baseRev = Number((req.body || {}).baseConversationRev);
   if (!body) return res.status(400).json({ error: '本文が空です' });
   if (body.length > 10000) return res.status(400).json({ error: '本文が長すぎます (10000文字まで)' });
+  if (inq.channel_type === 'yahoo' && body.length > 2000) {
+    return res.status(400).json({ error: `Yahoo!の返信は2000文字までです (現在${body.length}文字。短くしてください)` });
+  }
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(opId)) {
     return res.status(400).json({ error: '不正な操作IDです (画面を再読み込みしてください)' });
   }

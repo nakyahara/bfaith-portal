@@ -253,6 +253,57 @@ console.log('6. エンジン結合');
     db.prepare('SELECT sent_at FROM inquiry_messages WHERE inquiry_id = ? LIMIT 1').get(inq.id).sent_at));
 }
 
+// ─── 7. 返信送信 (sendReply) ───
+console.log('7. 返信送信');
+{
+  const { SendRejectedError } = await import('./outbox.js');
+  const okInq = { external_inquiry_id: '33c2dfab10ef4a' };
+
+  const fNone = mockFetch(() => ({ body: {} }));
+  const adDry = createYahooAdapter({ ...CFG, fetchImpl: fNone });
+  const dry = await adDry.sendReply({ inquiry: okInq, bodyText: 'ご返信です' });
+  check('dryrun (既定): dryRun:true + API未呼び出し', dry.dryRun === true && fNone.calls.length === 0);
+  check('isLive フラグ', adDry.isLive === false && createYahooAdapter({ ...CFG, fetchImpl: fNone, sendMode: 'live' }).isLive === true);
+
+  let eTopic = null;
+  try { await adDry.sendReply({ inquiry: { external_inquiry_id: 'bad topic!' }, bodyText: 'x' }); } catch (e) { eTopic = e; }
+  check('topicId不正は SendRejectedError', eTopic instanceof SendRejectedError);
+  let eLong = null;
+  try { await adDry.sendReply({ inquiry: okInq, bodyText: 'あ'.repeat(2001) }); } catch (e) { eLong = e; }
+  check('2000字超は SendRejectedError (公式上限)', eLong instanceof SendRejectedError && /2000/.test(eLong.message));
+
+  // live: passthroughへPOST + messageid → m:<id> (受信のID体系と整合)
+  let sentReq = null;
+  const fLive = (() => {
+    const fn = async (url, opts) => { sentReq = { url, opts }; return { status: 200, text: async () => JSON.stringify({ topicid: okInq.external_inquiry_id, messageid: 4, postdate: '1784254138' }) }; };
+    fn.calls = []; return fn;
+  })();
+  const adLive = createYahooAdapter({ ...CFG, fetchImpl: fLive, sendMode: 'live' });
+  const live = await adLive.sendReply({ inquiry: okInq, bodyText: '在庫ございます' });
+  check('live: passthrough URL+X-Proxy-Secret+{topicId,message}', sentReq.url === 'http://localhost:18080/yahoo/externalTalkAdd'
+    && sentReq.opts.headers['X-Proxy-Secret'] === 'ps' && JSON.parse(sentReq.opts.body).topicId === okInq.external_inquiry_id);
+  check('live: externalReplyId=m:<messageid> (受信同期と二重表示しない)', live.externalReplyId === 'm:4');
+  const dryOverride = await adLive.sendReply({ inquiry: okInq, bodyText: 'x', dryRun: true });
+  check('liveアダプターでも dryRun:true 強制', dryOverride.dryRun === true);
+
+  const f400 = (() => { const fn = async () => ({ status: 400, text: async () => JSON.stringify({ error: { reason: 'invalid topic' } }) }); fn.calls = []; return fn; })();
+  let e400 = null;
+  try { await createYahooAdapter({ ...CFG, fetchImpl: f400, sendMode: 'live' }).sendReply({ inquiry: okInq, bodyText: 'x' }); } catch (e) { e400 = e; }
+  check('4xxは SendRejectedError (reason抽出)', e400 instanceof SendRejectedError && /invalid topic/.test(e400.message));
+  const f500 = (() => { const fn = async () => ({ status: 500, text: async () => 'boom' }); fn.calls = []; return fn; })();
+  let e500 = null;
+  try { await createYahooAdapter({ ...CFG, fetchImpl: f500, sendMode: 'live' }).sendReply({ inquiry: okInq, bodyText: 'x' }); } catch (e) { e500 = e; }
+  check('5xxは汎用エラー (→unknown)', e500 !== null && !(e500 instanceof SendRejectedError));
+
+  // 2xxでもmessageid欠落/非JSONは結果不明 (unknown)。sent確定させると次回同期と二重表示になる (Codex R1 high)
+  for (const [label, text] of [['messageid欠落', JSON.stringify({ topicid: 'x' })], ['非JSON', '<html>ok?</html>']]) {
+    const fNoId = (() => { const fn = async () => ({ status: 200, text: async () => text }); fn.calls = []; return fn; })();
+    let eNoId = null;
+    try { await createYahooAdapter({ ...CFG, fetchImpl: fNoId, sendMode: 'live' }).sendReply({ inquiry: okInq, bodyText: 'x' }); } catch (e) { eNoId = e; }
+    check(`2xxでも${label}は汎用エラー (→unknown、SendRejectedにしない)`, eNoId !== null && !(eNoId instanceof SendRejectedError) && /結果不明/.test(eNoId.message));
+  }
+}
+
 check('DBは一時サブディレクトリのみに作成 (ベース直下に漏れない)',
   fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
 

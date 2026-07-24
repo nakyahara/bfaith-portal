@@ -197,7 +197,7 @@ let outboxRunning = false;
 
 /** 送信アダプター一式を env から構築。送信モードはチャネル別
  * (INQUIRY_HUB_MAIL_SEND_MODE / INQUIRY_HUB_RAKUTEN_SEND_MODE。'live' 以外はすべて dryrun)。
- * Yahoo!送信は Step 5 */
+ * INQUIRY_HUB_YAHOO_SEND_MODE も同様 */
 export function buildSendAdapters() {
   const adapters = {};
   const gmailT = resolveGmailTransportFromEnv();
@@ -209,6 +209,11 @@ export function buildSendAdapters() {
   if (rkT) {
     adapters.rakuten = createRakutenAdapter({ ...rkT,
       sendMode: process.env.INQUIRY_HUB_RAKUTEN_SEND_MODE === 'live' ? 'live' : 'dryrun' });
+  }
+  const yhT = resolveYahooTransportFromEnv();
+  if (yhT) {
+    adapters.yahoo = createYahooAdapter({ ...yhT,
+      sendMode: process.env.INQUIRY_HUB_YAHOO_SEND_MODE === 'live' ? 'live' : 'dryrun' });
   }
   return adapters;
 }
@@ -287,11 +292,12 @@ export function startInquiryHubOutboxCron() {
   const intervalMs = Number(process.env.INQUIRY_HUB_OUTBOX_INTERVAL_MS) || DEFAULT_OUTBOX_INTERVAL_MS;
   const mailMode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
   const rkMode = process.env.INQUIRY_HUB_RAKUTEN_SEND_MODE === 'live' ? 'live' : 'dryrun';
+  const yhMode = process.env.INQUIRY_HUB_YAHOO_SEND_MODE === 'live' ? 'live' : 'dryrun';
   const timer = setInterval(() => {
     runInquiryHubOutboxTick().catch((e) => console.error('[inquiry-hub-outbox] 未捕捉例外:', e));
   }, intervalMs);
   timer.unref?.(); // プロセス終了を妨げない
-  console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, モード= メール:${mailMode} / 楽天:${rkMode} (dryrunは実送信しません)`);
+  console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, モード= メール:${mailMode} / 楽天:${rkMode} / Yahoo:${yhMode} (dryrunは実送信しません)`);
   return timer;
 }
 

@@ -264,16 +264,11 @@ async function callYahooAPI(endpoint, xmlBody) {
   return await res.text();
 }
 
-// ─── Yahoo 問い合わせ管理API (circus REST GET。inquiry-hub 受信同期用) ───
+// ─── Yahoo 問い合わせ管理API (circus REST。inquiry-hub 受信同期+返信送信用) ───
 // Bearer token + 公開鍵署名 (X-sws-signature) 必須 (署名なしは px-04102 で401、Step 0実測)。
-// 署名は callYahooAPI と同方式。read-only の GET のみ (返信・既読化は passthrough しない)
-async function yahooCircusGet(apiPath, params = {}) {
-  const accessToken = await getAccessToken();
-  const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
-  u.searchParams.set('sellerId', YAHOO_SELLER_ID);
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
-  }
+// 署名は callYahooAPI と同方式
+
+function yahooCircusHeaders(accessToken) {
   const headers = { 'Authorization': `Bearer ${accessToken}` };
   try {
     if (fs.existsSync(YAHOO_PUBLIC_KEY_PATH)) {
@@ -288,7 +283,32 @@ async function yahooCircusGet(apiPath, params = {}) {
       headers['X-sws-signature-version'] = YAHOO_SIGNATURE_VERSION;
     }
   } catch (e) { console.log(`[${ts()}] 署名スキップ: ${e.message}`); }
-  const res = await fetch(u, { headers, signal: AbortSignal.timeout(30000) });
+  return headers;
+}
+
+async function yahooCircusGet(apiPath, params = {}) {
+  const accessToken = await getAccessToken();
+  const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
+  u.searchParams.set('sellerId', YAHOO_SELLER_ID);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
+  }
+  const res = await fetch(u, { headers: yahooCircusHeaders(accessToken), signal: AbortSignal.timeout(30000) });
+  const body = await res.text();
+  return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
+}
+
+// POST (メッセージ投稿等)。⚠️リトライしない (送信系の再試行は二重投稿になる。結果不明の扱いは呼び出し元=outboxに委ねる)
+async function yahooCircusPost(apiPath, queryParams = {}, jsonBody = {}) {
+  const accessToken = await getAccessToken();
+  const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
+  for (const [k, v] of Object.entries(queryParams)) {
+    if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
+  }
+  const headers = { ...yahooCircusHeaders(accessToken), 'Content-Type': 'application/json' };
+  const res = await fetch(u, {
+    method: 'POST', headers, body: JSON.stringify(jsonBody), signal: AbortSignal.timeout(30000),
+  });
   const body = await res.text();
   return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
 }
@@ -783,6 +803,40 @@ const server = http.createServer(async (req, res) => {
       if (!/^\d+$/.test(result) || Number(result) < 1 || Number(result) > 20) throw new Error('result は1〜20で指定してください (API上限20)');
       const r = await yahooCircusGet('/externalTalkList', { start, result });
       console.log(`[${ts()}] Yahoo externalTalkList start=${start} -> ${r.status} (${r.body.length} bytes)`);
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+      return;
+    }
+
+    // メッセージ投稿 passthrough (inquiry-hub Step 5。変更系はこの1本のみ・厳重ガード)
+    // 公式仕様: POST /externalTalkAdd?topicId=... body={sellerId, body(2000字上限)} → {topicid, messageid, postdate}
+    if (pathname === '/yahoo/externalTalkAdd' && req.method === 'POST') {
+      const reqBody = await readBody(req);
+      let parsed;
+      try { parsed = JSON.parse(reqBody); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'JSONボディが必要です' }));
+        return;
+      }
+      if (typeof parsed.topicId !== 'string' || typeof parsed.message !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'topicId / message は文字列で指定してください' }));
+        return;
+      }
+      const topicId = parsed.topicId.trim();
+      const message = parsed.message;
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(topicId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'topicId が不正です' }));
+        return;
+      }
+      if (!message.trim() || message.length > 2000) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'message は1〜2000文字で指定してください (Yahoo!公式上限)' }));
+        return;
+      }
+      const r = await yahooCircusPost('/externalTalkAdd', { topicId }, { sellerId: YAHOO_SELLER_ID, body: message });
+      console.log(`[${ts()}] Yahoo externalTalkAdd ${topicId.slice(0, 12)}… -> ${r.status} (${r.body.length} bytes)`);
       res.writeHead(r.status, { 'Content-Type': r.contentType });
       res.end(r.body);
       return;
