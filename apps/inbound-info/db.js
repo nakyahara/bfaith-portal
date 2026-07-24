@@ -59,11 +59,13 @@ export function stats() {
       FROM f_inbound_info
   `).get();
   const mirrorCount = db.prepare('SELECT COUNT(*) AS c FROM mirror_products').get().c;
-  return { ...row, mirror_products: mirrorCount };
+  const schedCount = db.prepare('SELECT COUNT(*) AS c FROM f_inbound_schedule').get().c;
+  return { ...row, mirror_products: mirrorCount, schedule_count: schedCount };
 }
 
 // ─── 一覧 (サーバー側ページング + 検索 + フィルタ) ───
 // filter: 'all' | 'missing' (入数未記入) | 'new' (source='auto' = cron 追加後に未編集)
+//         | 'scheduled' (入荷予定 = Drive nefuda.csv に載っている商品のみ)
 export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } = {}) {
   const db = getMirrorDB();
   const conds = [];
@@ -76,6 +78,7 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
   }
   if (filter === 'missing') conds.push('入数 IS NULL');
   else if (filter === 'new') conds.push("source = 'auto'");
+  else if (filter === 'scheduled') conds.push('code_key IN (SELECT code_key FROM f_inbound_schedule)');
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM f_inbound_info ${where}`).get(...params).c;
   const lim = Math.min(Math.max(1, Number(limit) || 100), 500);
@@ -280,6 +283,75 @@ export function importWorkbook(irisuRows, originRows, { dryRun = false, user = n
   if (dryRun) return run();
   const db = getMirrorDB();
   return db.transaction(run)();
+}
+
+// ─── 入荷予定 (nefuda.csv) : full-replace + f_inbound_info への自動追加 ───
+// rows: [{ 商品コード, 商品名, バーコード, 有効期限 }] (nefuda-fetch.js がパース済み)
+// 置換とマスタ自動追加を単一トランザクションで行う。
+// マスタ自動追加: 入荷予定に載っているのに f_inbound_info に無いコードは「実際に入荷してくる」ため
+//   区分に関わらず追加する (商品名は mirror_products を正とし、無ければ CSV の商品名)。
+//   mirror_products に無いコードは not_in_master として返し、UI で注意表示する (追加はする)。
+export function replaceSchedule(rows, { filename = null, fileModifiedTime = null, user = null } = {}) {
+  const db = getMirrorDB();
+  const now = utcIsoNow();
+  const insSched = db.prepare(`
+    INSERT INTO f_inbound_schedule (code_key, 商品コード, 商品名, バーコード, 有効期限, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(code_key) DO NOTHING
+  `);
+  const selInfo = db.prepare('SELECT 1 FROM f_inbound_info WHERE code_key = ?');
+  const selProd = db.prepare('SELECT 商品コード, 商品名 FROM mirror_products WHERE lower(trim(商品コード)) = ? LIMIT 1');
+  const insInfo = db.prepare(`
+    INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, source, created_at, updated_at)
+    VALUES (?, ?, ?, 'auto', ?, ?)
+  `);
+  const result = { schedule_rows: 0, duplicates: 0, added_to_master: 0, not_in_master: [] };
+  let stale = null;
+  db.transaction(() => {
+    // 鮮度ガード (Codex R1 Medium): 取得〜反映の間に別経路 (cron/UI) がより新しい CSV を
+    // 反映済みなら、古い世代での上書きを拒否する。同時刻 (同一ファイル再取得) は冪等なので許可。
+    if (fileModifiedTime) {
+      const cur = db.prepare('SELECT file_modified_time FROM f_inbound_schedule_state WHERE id = 1').get();
+      if (cur?.file_modified_time && Date.parse(cur.file_modified_time) > Date.parse(fileModifiedTime)) {
+        stale = cur.file_modified_time;
+        return;
+      }
+    }
+    db.prepare('DELETE FROM f_inbound_schedule').run();
+    for (const r of rows) {
+      const c = normCode(r.商品コード);
+      const k = codeKey(c);
+      if (!k) continue;
+      const info = insSched.run(k, c, cleanText(r.商品名), cleanText(r.バーコード), cleanText(r.有効期限), now);
+      if (info.changes === 0) {
+        result.duplicates++;
+        continue;
+      }
+      result.schedule_rows++;
+      if (!selInfo.get(k)) {
+        const prod = selProd.get(k);
+        if (!prod && result.not_in_master.length < 20) result.not_in_master.push(c);
+        insInfo.run(k, prod ? normCode(prod.商品コード) : c, prod ? prod.商品名 : cleanText(r.商品名), now, now);
+        result.added_to_master++;
+      }
+    }
+    db.prepare(`
+      INSERT INTO f_inbound_schedule_state (id, fetched_at, row_count, file_modified_time, filename, fetched_by)
+      VALUES (1, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        fetched_at = excluded.fetched_at, row_count = excluded.row_count,
+        file_modified_time = excluded.file_modified_time, filename = excluded.filename,
+        fetched_by = excluded.fetched_by
+    `).run(now, result.schedule_rows, fileModifiedTime, cleanText(filename), cleanText(user));
+  })();
+  if (stale) return { ok: false, error: 'stale_file', current_file_modified_time: stale, ...result };
+  return { ok: true, fetched_at: now, ...result };
+}
+
+// 入荷予定の最終取得状態 (未取得なら null)
+export function scheduleState() {
+  const db = getMirrorDB();
+  return db.prepare('SELECT * FROM f_inbound_schedule_state WHERE id = 1').get() || null;
 }
 
 // ─── 原産国: 一覧 ───

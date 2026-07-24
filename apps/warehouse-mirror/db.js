@@ -2557,6 +2557,31 @@ function createInboundInfoTables() {
   // (本番は初回デプロイから version 入り DDL だが、addColumnIfMissing は冪等なので常置で無害)
   addColumnIfMissing('f_inbound_info', 'version', 'INTEGER NOT NULL DEFAULT 1');
   addColumnIfMissing('f_inbound_origin', 'version', 'INTEGER NOT NULL DEFAULT 1');
+
+  // 入荷予定 (Drive の nefuda.csv = 値札発行用データ)。取得ごとに full-replace する揮発キャッシュで、
+  // 正本は Drive 側。f_inbound_info の「入荷予定のみ」絞り込みに使う。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_schedule (
+      code_key    TEXT PRIMARY KEY,
+      商品コード  TEXT NOT NULL,
+      商品名      TEXT,
+      バーコード  TEXT,
+      有効期限    TEXT,
+      created_at  TEXT NOT NULL,
+      CHECK (trim(code_key) <> '')
+    )
+  `);
+  // 最終取得の状態 (1行固定)。CSV が0件の日でも「いつ取得したか」を表示できるように行と分離して持つ
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_schedule_state (
+      id                 INTEGER PRIMARY KEY CHECK (id = 1),
+      fetched_at         TEXT NOT NULL,
+      row_count          INTEGER NOT NULL,
+      file_modified_time TEXT,
+      filename           TEXT,
+      fetched_by         TEXT
+    )
+  `);
 }
 // ▲▲▲ 入庫情報管理 ▲▲▲
 

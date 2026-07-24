@@ -29,7 +29,10 @@ const {
   addManual, deleteInbound, upsertOrigin, deleteOrigin, listOrigin, stats, parseIrisu,
 } = await import('../apps/inbound-info/db.js');
 const { parseIrisuSheet, parseOriginSheet } = await import('../apps/inbound-info/router.js');
+const { parseNefudaCsv } = await import('../apps/inbound-info/nefuda-fetch.js');
+const { replaceSchedule, scheduleState } = await import('../apps/inbound-info/db.js');
 const ExcelJS = (await import('exceljs')).default;
+const iconv = (await import('iconv-lite')).default;
 
 let passed = 0;
 function ok(cond, label) {
@@ -223,5 +226,63 @@ const afterAtomic = db.prepare('SELECT COUNT(*) AS c FROM f_inbound_info').get()
 ok(threw && afterAtomic === beforeAtomic
   && !db.prepare("SELECT 1 FROM f_inbound_info WHERE code_key = 'atomictest01'").get(),
   '一括トランザクション: 原産国側の失敗で入数マスタ側も rollback');
+
+// ─── 8. 入荷予定 (nefuda.csv) ───
+console.log('\n[8] 入荷予定 (nefuda.csv)');
+const nefudaText = [
+  '"商品ID","商品名","バーコード","有効期限"',
+  '"newitem01","新商品テスト1 (マスタ登録済)","4560278235130",""',
+  '"NEFUDAONLY01","入荷予定のみの商品 (マスタ未登録・mirror有)","4900000000001","2027-01-31"',
+  '"ghostitem99","NEマスタに無いコード","4900000000002",""',
+  '"newitem01","重複行","4560278235130",""',
+  '"",""',
+].join('\r\n') + '\r\n';
+// mirror に NEFUDAONLY01 相当 (小文字表記) を用意 → CSV とは大小違いでも同一視されるべき
+insProd.run('nefudaonly01', '入荷予定のみ商品 (NE正式名)', '単品', '取扱中止', now);
+
+const nefudaRows = parseNefudaCsv(iconv.encode(nefudaText, 'Shift_JIS'));
+ok(nefudaRows.length === 4, `パース: 空行除外で4行 (実際 ${nefudaRows.length})`);
+ok(nefudaRows[1].有効期限 === '2027-01-31' && nefudaRows[0].バーコード === '4560278235130', 'パース: バーコード/有効期限');
+
+const sr = replaceSchedule(nefudaRows, { filename: 'nefuda.csv', fileModifiedTime: now, user: 'tester' });
+ok(sr.schedule_rows === 3 && sr.duplicates === 1, `置換: 3件+重複1スキップ (rows=${sr.schedule_rows}, dup=${sr.duplicates})`);
+ok(sr.added_to_master === 2, `マスタ未登録2件を自動追加 (added=${sr.added_to_master})`);
+const addedFromMirror = db.prepare("SELECT * FROM f_inbound_info WHERE code_key = 'nefudaonly01'").get();
+ok(addedFromMirror && addedFromMirror.商品名 === '入荷予定のみ商品 (NE正式名)' && addedFromMirror.source === 'auto',
+  '自動追加: mirror の正式名を優先 + source=auto (取扱中止でも入荷予定なら追加)');
+const addedGhost = db.prepare("SELECT * FROM f_inbound_info WHERE code_key = 'ghostitem99'").get();
+ok(addedGhost && sr.not_in_master.length === 1 && sr.not_in_master[0] === 'ghostitem99',
+  'マスタに無いコードも追加しつつ not_in_master で警告');
+
+const schedList = listInbound({ filter: 'scheduled', limit: 50 });
+ok(schedList.total === 3, `filter=scheduled は入荷予定の3件のみ (実際 ${schedList.total})`);
+const st8 = scheduleState();
+ok(st8 && st8.row_count === 3 && st8.filename === 'nefuda.csv' && st8.fetched_by === 'tester', 'scheduleState 反映');
+
+// 2回目の置換で完全入替 (前回行が残らない)
+const sr2 = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }], { user: 'tester' });
+ok(sr2.schedule_rows === 1 && listInbound({ filter: 'scheduled' }).total === 1, 'full-replace: 前回分は残らない');
+
+// fail-closed パース (Codex nefuda R1 High/Medium): 空・ヘッダのみ・列欠落・列数不一致は取込拒否
+const enc = (t) => iconv.encode(t, 'Shift_JIS');
+const throwsParse = (text) => { try { parseNefudaCsv(enc(text)); return false; } catch (e) { return e.code === 'VALIDATION'; } };
+ok(throwsParse(''), 'パース拒否: 完全に空');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n'), 'パース拒否: ヘッダのみ (既存スナップショット保持)');
+ok(throwsParse('"商品ID","商品名"\r\n"a","b"\r\n'), 'パース拒否: 必須ヘッダ欠落');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限","商品ID"\r\n"a","b","c","d","e"\r\n'), 'パース拒否: ヘッダ重複');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n"a","b","c"\r\n'), 'パース拒否: 列数不一致 (破損CSV)');
+ok(throwsParse('"商品ID","商品名","バーコード","有効期限"\r\n"a","b","c","未閉鎖\r\n'), 'パース拒否: 閉じていない引用符 (破損CSV)');
+
+// 鮮度ガード (Codex nefuda R1 Medium): 反映済みより古い file_modified_time は上書き拒否
+const newer = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T10:00:00.000Z', user: 'tester' });
+ok(newer.ok, '鮮度ガード: 新しい版の反映は成功');
+const staleR = replaceSchedule([{ 商品コード: 'setitem01', 商品名: 'y', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T09:00:00.000Z', user: 'tester' });
+ok(!staleR.ok && staleR.error === 'stale_file', '鮮度ガード: 古い版は stale_file で拒否');
+ok(listInbound({ filter: 'scheduled' }).rows[0].code_key === 'newitem01', '鮮度ガード: データは新しい版のまま');
+const sameR = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', バーコード: null, 有効期限: null }],
+  { fileModifiedTime: '2026-07-21T10:00:00.000Z', user: 'tester' });
+ok(sameR.ok, '鮮度ガード: 同一時刻 (同一ファイル再取得) は冪等に成功');
 
 console.log(`\n🎉 全 ${passed} 項目 PASS`);

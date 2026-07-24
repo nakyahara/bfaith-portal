@@ -82,10 +82,17 @@
     <span class="fchip active" data-filter="all" onclick="setFilter(this)">すべて</span>
     <span class="fchip" data-filter="missing" onclick="setFilter(this)">入数未記入</span>
     <span class="fchip" data-filter="new" onclick="setFilter(this)">新着</span>
+    <span class="fchip" data-filter="scheduled" onclick="setFilter(this)">🚚 入荷予定のみ</span>
     <span class="spacer"></span>
     <input type="text" id="add-code" placeholder="商品コードを手動追加" style="width:180px">
     <button class="btn-green btn-sm" onclick="addCode()">追加</button>
     <button class="btn-orange btn-sm" id="btn-sync" onclick="syncNow()">🔄 新商品を今すぐ取込</button>
+  </div>
+  <div class="toolbar" style="background:#f8fafc; border:1px solid var(--line); border-radius:8px; padding:8px 12px">
+    <span style="font-weight:700; font-size:13px">🚚 入荷予定 (nefuda.csv)</span>
+    <span class="hint" id="sched-info" style="margin-top:0">読み込み中…</span>
+    <span class="spacer"></span>
+    <button class="btn-blue btn-sm" id="btn-sched" onclick="refreshSchedule()">最新の入荷予定を取得</button>
   </div>
   <div class="msg" id="msg-list"></div>
   <table>
@@ -171,8 +178,9 @@ async function api(path, opts) {
   let body = null;
   try { body = await res.json(); } catch (e) { /* non-JSON */ }
   if (!res.ok || !body || body.ok === false) {
-    const err = (body && body.error) || ('HTTP ' + res.status);
-    throw new Error(err);
+    const err = new Error((body && body.error) || ('HTTP ' + res.status));
+    if (body && body.message) err.detail = body.message; // サーバーが人間向け文を返した場合
+    throw err;
   }
   return body;
 }
@@ -337,6 +345,53 @@ async function syncNow() {
   } finally { btn.disabled = false; }
 }
 
+// ─── 入荷予定 (nefuda.csv) ───
+async function loadScheduleInfo() {
+  const el = document.getElementById('sched-info');
+  try {
+    const { result } = await api('/schedule/info');
+    const parts = [];
+    if (result.state) {
+      parts.push(`${result.state.row_count}件`);
+      parts.push(`最終取得 ${jst(result.state.fetched_at)}`);
+    } else {
+      parts.push('未取得 (「最新の入荷予定を取得」を押してください)');
+    }
+    if (result.drive) parts.push(`Drive上のCSV更新 ${result.drive.modified_time_jst}`);
+    else if (result.drive_error) parts.push('⚠ Drive確認不可');
+    el.textContent = parts.join(' ／ ');
+    if (result.drive_error) el.title = result.drive_error;
+  } catch (e) {
+    el.textContent = '状態を取得できませんでした';
+  }
+}
+function jst(iso) {
+  if (!iso) return '-';
+  const d = new Date(Date.parse(iso) + 9 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
+async function refreshSchedule() {
+  const btn = document.getElementById('btn-sched');
+  btn.disabled = true;
+  try {
+    const r = await api('/schedule/refresh', { method: 'POST' });
+    let m = `入荷予定を更新しました: ${r.schedule_rows}件 (CSV更新 ${r.file.modified_time_jst})`;
+    if (r.added_to_master > 0) m += `\n入庫マスタに未登録だった ${r.added_to_master} 件を「新着」として追加しました`;
+    if (r.not_in_master.length) m += `\n⚠ NE商品マスタに見つからないコード: ${r.not_in_master.join(', ')} (コード誤りの可能性)`;
+    showMsg('msg-list', 'ok', m);
+    await loadScheduleInfo();
+    await loadList(); loadStats();
+  } catch (e) {
+    if (e.message === 'stale_file') {
+      showMsg('msg-list', 'info', 'すでに新しい入荷予定が反映済みです (表示を更新しました)');
+      await loadScheduleInfo(); await loadList(); loadStats();
+      return;
+    }
+    showMsg('msg-list', 'err', '入荷予定の取得に失敗しました: ' + (e.detail || e.message));
+  } finally { btn.disabled = false; }
+}
+
 // ─── 原産国 ───
 let originEditingId = null; // 'new' | id | null
 async function loadOrigin() {
@@ -467,6 +522,7 @@ document.getElementById('file').addEventListener('change', () => {
 
 loadStats();
 loadList();
+loadScheduleInfo();
 </script>
 </body>
 </html>
