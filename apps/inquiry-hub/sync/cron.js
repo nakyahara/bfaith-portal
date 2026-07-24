@@ -195,13 +195,20 @@ export async function runInquiryHubSyncTick(opts = {}) {
 export const DEFAULT_OUTBOX_INTERVAL_MS = 30000;
 let outboxRunning = false;
 
-/** 送信アダプター一式を env から構築 (現状メールのみ。楽天/Yahoo!送信は Step 4/5) */
+/** 送信アダプター一式を env から構築。送信モードはチャネル別
+ * (INQUIRY_HUB_MAIL_SEND_MODE / INQUIRY_HUB_RAKUTEN_SEND_MODE。'live' 以外はすべて dryrun)。
+ * Yahoo!送信は Step 5 */
 export function buildSendAdapters() {
   const adapters = {};
   const gmailT = resolveGmailTransportFromEnv();
   if (gmailT) {
-    const sendMode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
-    adapters.email = createGmailAdapter({ ...gmailT, sendMode });
+    adapters.email = createGmailAdapter({ ...gmailT,
+      sendMode: process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun' });
+  }
+  const rkT = resolveRakutenTransportFromEnv();
+  if (rkT) {
+    adapters.rakuten = createRakutenAdapter({ ...rkT,
+      sendMode: process.env.INQUIRY_HUB_RAKUTEN_SEND_MODE === 'live' ? 'live' : 'dryrun' });
   }
   return adapters;
 }
@@ -240,20 +247,27 @@ async function dryrunPreviewPass(adapters) {
 }
 
 /** outbox 1周 (テスト・手動実行からも呼べる)。多重実行はプロセス内ガード+ジョブ単位のリースの二段。
- * opts.sendMode 'live' のときだけ実際にジョブを処理する (それ以外はプレビューのみ・状態不変) */
+ * チャネル別モード: isLive=true のアダプターのジョブだけ実処理し、dryrunアダプターのチャネルは
+ * claimせずプレビューのみ (状態不変)。opts.sendMode 'live' は全アダプターをlive扱い (テスト用) */
 export async function runInquiryHubOutboxTick(opts = {}) {
   if (outboxRunning) return { skipped: 'overlap' };
   outboxRunning = true;
   try {
     const adapters = opts.adapters ?? buildSendAdapters();
-    const mode = opts.sendMode ?? (process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun');
-    if (mode !== 'live') return await dryrunPreviewPass(adapters);
-    const r = await runOutboxPass(adapters, { executor: 'server' });
+    const forceLive = opts.sendMode === 'live';
+    const liveAdapters = {}, dryrunAdapters = {};
+    for (const [ch, ad] of Object.entries(adapters)) {
+      if (forceLive || ad?.isLive) liveAdapters[ch] = ad;
+      else dryrunAdapters[ch] = ad;
+    }
+    const preview = Object.keys(dryrunAdapters).length ? await dryrunPreviewPass(dryrunAdapters) : null;
+    if (!Object.keys(liveAdapters).length) return preview ?? { mode: 'dryrun', previewed: 0, pending: 0 };
+    const r = await runOutboxPass(liveAdapters, { executor: 'server' });
     if (r.processed > 0 || r.swept > 0) {
       console.log(`[inquiry-hub-outbox] pass: swept=${r.swept} processed=${r.processed} ` +
         r.results.map(x => `#${x.id}:${x.outcome}`).join(' '));
     }
-    return r;
+    return preview ? { ...r, preview } : r;
   } catch (e) {
     console.error(`[inquiry-hub-outbox] pass 失敗: ${e?.message || e}`);
     return { error: String(e?.message || e) };
@@ -271,12 +285,13 @@ export function startInquiryHubOutboxCron() {
     return null;
   }
   const intervalMs = Number(process.env.INQUIRY_HUB_OUTBOX_INTERVAL_MS) || DEFAULT_OUTBOX_INTERVAL_MS;
-  const mode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
+  const mailMode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
+  const rkMode = process.env.INQUIRY_HUB_RAKUTEN_SEND_MODE === 'live' ? 'live' : 'dryrun';
   const timer = setInterval(() => {
     runInquiryHubOutboxTick().catch((e) => console.error('[inquiry-hub-outbox] 未捕捉例外:', e));
   }, intervalMs);
   timer.unref?.(); // プロセス終了を妨げない
-  console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, メール送信モード=${mode}${mode === 'dryrun' ? ' (実送信しません)' : ''}`);
+  console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, モード= メール:${mailMode} / 楽天:${rkMode} (dryrunは実送信しません)`);
   return timer;
 }
 

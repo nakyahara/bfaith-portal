@@ -21,6 +21,8 @@
  * - 認証: Authorization: ESA Base64(serviceSecret:licenseKey)
  */
 
+import { SendRejectedError } from '../../outbox.js';
+
 const BASE = 'https://api.rms.rakuten.co.jp/es/1.0/inquirymng-api';
 const DAY_MS = 86400000;
 
@@ -137,6 +139,7 @@ export function resolveRakutenTransportFromEnv(env = process.env) {
  *   fetchImpl?: fetch 差し替え (テスト用)
  *   sleepMs?: リクエスト間隔 (既定1100。テストでは0)
  *   maxPages?: ページ数上限 (超過は throw。既定60)
+ *   sendMode?: 'dryrun' (既定) | 'live' — 返信送信 (sendReply)。dryrunは検証とログのみで実送信しない
  */
 export function createRakutenAdapter(cfg = {}) {
   const { serviceSecret, licenseKey, expectedShopId = null } = cfg;
@@ -213,8 +216,66 @@ export function createRakutenAdapter(cfg = {}) {
     return j;
   }
 
+  const sendMode = cfg.sendMode ?? 'dryrun';
+  // 送信URL: warehouse=miniPC passthrough (自動リトライ無効化済み) / direct=RMS直
+  const replyUrl = transport === 'warehouse'
+    ? `${cfg.warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiry-reply`
+    : `${BASE}/inquiry/reply`;
+
   return {
     channelType: 'rakuten',
+    isLive: sendMode === 'live',
+
+    /**
+     * 返信送信 (outbox.js §8.3 契約)。未送信確定の失敗のみ SendRejectedError。
+     * 送信要求後の失敗 (5xx/timeout/network) は汎用エラー → unknown (自動再送しない。
+     * miniPC passthrough 側も maxAttempts:1 でリトライ無効化済み)。
+     * 引数 dryRun: true はアダプター設定に関係なく実送信を禁止 (プレビュー経路用)
+     */
+    async sendReply({ inquiry, bodyText, dryRun = false }) {
+      const inquiryNumber = String(inquiry?.external_inquiry_id || '').trim();
+      if (!/^\d{1,10}-\d{8}-\d{1,12}[a-z]?$/i.test(inquiryNumber)) {
+        throw new SendRejectedError(`楽天問い合わせ番号が不正です (external_inquiry_id='${inquiryNumber}')`);
+      }
+      const message = String(bodyText || '');
+      if (!message.trim()) throw new SendRejectedError('本文が空です');
+      if (message.length > 10000) throw new SendRejectedError('本文が長すぎます (10000文字まで)');
+
+      if (dryRun || sendMode !== 'live') {
+        console.log(`[rakuten-send DRYRUN] inquiry=${inquiryNumber} bytes=${message.length} (実送信していません)`);
+        return { dryRun: true, externalReplyId: `dryrun:${inquiryNumber}` };
+      }
+
+      let res;
+      try {
+        res = await fetchImpl(replyUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...buildHeaders() },
+          body: JSON.stringify({ inquiryNumber, message }),
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      } catch (err) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        throw new Error(timedOut
+          ? `楽天返信送信タイムアウト (${requestTimeoutMs}ms) — 結果不明`
+          : `楽天返信送信の接続失敗: ${err?.message || err}`);
+      }
+      const text = await res.text().catch(() => '');
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* 非JSONはdata=nullのまま */ }
+      if (res.status >= 400 && res.status < 500) {
+        // 4xx = 受理されなかった (未送信確定)。エラー本文は構造化フィールドのみ (本文露出防止)
+        throw new SendRejectedError(`楽天返信が拒否されました (HTTP ${res.status}): ${JSON.stringify({
+          code: data?.error?.code ?? (typeof data?.error === 'string' ? data.error : undefined),
+          message: data?.error?.message ?? data?.message,
+        }).slice(0, 300)}`);
+      }
+      if (res.status >= 500) throw new Error(`楽天返信送信 HTTP ${res.status} — 結果不明`);
+      // 成功。ReplyResult の返信IDの形は実返信テストで確定させる (無ければ outbox が op:<operation_id> を使う)
+      const replyId = data?.result?.id ?? data?.result?.replyId ?? data?.replyId ?? data?.id;
+      console.log(`[rakuten-send] 送信完了 inquiry=${inquiryNumber} replyId=${replyId ?? '(レスポンスに無し)'}`);
+      return { externalReplyId: replyId != null ? `r:${replyId}` : undefined };
+    },
 
     /** sync/engine.js 契約。部分成功は返さない (途中失敗は全体 throw) */
     async fetchNew({ sinceIso, untilIso }) {

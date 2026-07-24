@@ -305,6 +305,7 @@ export function createGmailAdapter(cfg = {}) {
 
   return {
     channelType: 'email',
+    isLive: sendMode === 'live',
 
     /**
      * 返信送信 (outbox.js §8.3 契約)。未送信確定の失敗のみ SendRejectedError を throw。
