@@ -187,7 +187,7 @@ console.log('5. 返信エディタ');
   // フラグON
   process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED = 'true';
   const htmlOn = await (await fetch(base + `/inquiries/${inq}`)).text();
-  check('フラグON: エディタ表示+ワーカー未稼働の警告', htmlOn.includes('id="replyBody"') && htmlOn.includes('送信ワーカーは準備中'));
+  check('フラグON: エディタ表示+ワーカー未稼働の警告', htmlOn.includes('id="replyBody"') && htmlOn.includes('送信ワーカーは停止中'));
   check('送信ジョブ履歴が表示される (failedになったジョブ)', htmlOn.includes('❌送信失敗'));
 
   const rEmpty = await jpost(`/api/inquiries/${inq}/reply`, { body: '  ', clientOperationId: randomUUID(), baseConversationRev: 1 });

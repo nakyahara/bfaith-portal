@@ -23,7 +23,7 @@ import { startNotificationJob as startInventoryNotificationJob } from './apps/pr
 import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
-import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
+import { startInquiryHubSyncCron, startInquiryHubOutboxCron } from './apps/inquiry-hub/sync/cron.js';
 import { startShippingStaffCron } from './apps/shipping-log/notion-staff.js';
 import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
@@ -1393,6 +1393,10 @@ app.listen(PORT, () => {
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
+
+  // inquiry-hub 送信ワーカー (outbox 30秒。INQUIRY_HUB_OUTBOX_CRON_ENABLED=true で起動、
+  // メール実送信はさらに INQUIRY_HUB_MAIL_SEND_MODE=live が必要。既定=dryrun)
+  startInquiryHubOutboxCron();
 
   // 出荷カード担当者スナップショット (Notion→sl_batch_staff、毎日19:30 JST。
   // SHIPPING_STAFF_CRON_ENABLED=true で起動、Dark Launch)

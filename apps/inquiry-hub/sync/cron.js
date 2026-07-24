@@ -15,6 +15,7 @@
 import cron from 'node-cron';
 import { getDB } from '../db.js';
 import { runSync } from './engine.js';
+import { runOutboxPass } from '../outbox.js';
 import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAYS } from './adapters/rakuten.js';
 import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DAYS } from './adapters/yahoo.js';
 import { createGmailAdapter, resolveGmailTransportFromEnv } from './adapters/gmail.js';
@@ -187,6 +188,96 @@ export async function runInquiryHubSyncTick(opts = {}) {
   } finally {
     tickRunning = false;
   }
+}
+
+// ─── 送信ワーカー (outbox。設計書§8.3: 30秒間隔) ───
+
+export const DEFAULT_OUTBOX_INTERVAL_MS = 30000;
+let outboxRunning = false;
+
+/** 送信アダプター一式を env から構築 (現状メールのみ。楽天/Yahoo!送信は Step 4/5) */
+export function buildSendAdapters() {
+  const adapters = {};
+  const gmailT = resolveGmailTransportFromEnv();
+  if (gmailT) {
+    const sendMode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
+    adapters.email = createGmailAdapter({ ...gmailT, sendMode });
+  }
+  return adapters;
+}
+
+const dryrunPreviewedJobs = new Set(); // 同じジョブのDRYRUNログを30秒ごとに繰り返さない (プロセス内)
+
+/**
+ * DRYRUNプレビュー: pending ジョブを claim せず (状態を一切変えず)、組み立て検証とログだけ行う。
+ * DRYRUNでジョブを消費すると「未送信なのに送信済み」になるため、claim自体をしない (Codexレビュー反映)
+ */
+async function dryrunPreviewPass(adapters) {
+  const db = getDB();
+  const jobs = db.prepare(`SELECT o.* FROM outbox_replies o
+      JOIN inquiries i ON i.id = o.inquiry_id
+      JOIN shops s ON s.id = i.shop_id
+    WHERE o.status = 'pending' AND s.executor = 'server'
+    ORDER BY o.id LIMIT 10`).all();
+  let previewed = 0;
+  for (const job of jobs) {
+    if (dryrunPreviewedJobs.has(job.id)) continue;
+    const adapter = adapters?.[job.channel_type];
+    if (!adapter?.sendReply) continue;
+    const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(job.inquiry_id);
+    const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(inq.shop_id);
+    try {
+      // dryRun: true を明示 = アダプターがliveモードでもプレビュー経路からは絶対に実送信させない (Codexレビュー反映)
+      await adapter.sendReply({ inquiry: inq, shop, bodyText: job.body_text, attachmentsJson: job.attachments_json, dryRun: true });
+      console.log(`[inquiry-hub-outbox] DRYRUN #${job.id}: 組み立てOK (実送信はliveモードで)`);
+    } catch (e) {
+      console.warn(`[inquiry-hub-outbox] DRYRUN #${job.id}: 組み立てNG — ${String(e?.message || e).slice(0, 200)}`);
+    }
+    dryrunPreviewedJobs.add(job.id);
+    previewed++;
+  }
+  return { mode: 'dryrun', previewed, pending: jobs.length };
+}
+
+/** outbox 1周 (テスト・手動実行からも呼べる)。多重実行はプロセス内ガード+ジョブ単位のリースの二段。
+ * opts.sendMode 'live' のときだけ実際にジョブを処理する (それ以外はプレビューのみ・状態不変) */
+export async function runInquiryHubOutboxTick(opts = {}) {
+  if (outboxRunning) return { skipped: 'overlap' };
+  outboxRunning = true;
+  try {
+    const adapters = opts.adapters ?? buildSendAdapters();
+    const mode = opts.sendMode ?? (process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun');
+    if (mode !== 'live') return await dryrunPreviewPass(adapters);
+    const r = await runOutboxPass(adapters, { executor: 'server' });
+    if (r.processed > 0 || r.swept > 0) {
+      console.log(`[inquiry-hub-outbox] pass: swept=${r.swept} processed=${r.processed} ` +
+        r.results.map(x => `#${x.id}:${x.outcome}`).join(' '));
+    }
+    return r;
+  } catch (e) {
+    console.error(`[inquiry-hub-outbox] pass 失敗: ${e?.message || e}`);
+    return { error: String(e?.message || e) };
+  } finally {
+    outboxRunning = false;
+  }
+}
+
+/** INQUIRY_HUB_OUTBOX_CRON_ENABLED='true'|'1' のときだけ 30秒間隔で送信ワーカーを回す (Dark Launch)。
+ * 送信モードは INQUIRY_HUB_MAIL_SEND_MODE ('live' 以外はすべて dryrun = 実送信しない) */
+export function startInquiryHubOutboxCron() {
+  const enabled = process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED;
+  if (enabled !== 'true' && enabled !== '1') {
+    console.log('[inquiry-hub-outbox] INQUIRY_HUB_OUTBOX_CRON_ENABLED が未設定/false のため起動しない (Dark Launch)');
+    return null;
+  }
+  const intervalMs = Number(process.env.INQUIRY_HUB_OUTBOX_INTERVAL_MS) || DEFAULT_OUTBOX_INTERVAL_MS;
+  const mode = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun';
+  const timer = setInterval(() => {
+    runInquiryHubOutboxTick().catch((e) => console.error('[inquiry-hub-outbox] 未捕捉例外:', e));
+  }, intervalMs);
+  timer.unref?.(); // プロセス終了を妨げない
+  console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, メール送信モード=${mode}${mode === 'dryrun' ? ' (実送信しません)' : ''}`);
+  return timer;
 }
 
 /** INQUIRY_HUB_SYNC_CRON_ENABLED='true'|'1' のときだけ schedule する (Dark Launch) */
