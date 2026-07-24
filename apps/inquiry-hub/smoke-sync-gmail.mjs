@@ -315,25 +315,21 @@ console.log('5. 送信');
   const preview = await runInquiryHubOutboxTick({ adapters: { email: adDry } });
   check('dryrun tick: claimせずプレビューのみ', preview.mode === 'dryrun' && preview.previewed >= 1, JSON.stringify(preview));
   check('dryrun tick: ジョブはpendingのまま (消費しない)', db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(job.id).status === 'pending');
-  // 安全境界: liveアダプターを渡してもプレビュー経路 (dryRun:true強制) からは実送信されない (Codex R2 high)。
-  // ⚠️ 既プレビュー済みジョブはスキップされテストが空振りするため、未プレビューの新規ジョブを
-  //    「liveアダプターで初めてプレビューさせる」形で検証する (Codex R3 high)
-  const inqG3 = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'g3'").get(mailShop);
-  const job2 = createReplyJob({ inquiryId: inqG3.id, channelType: 'email', bodyText: '2通目テスト', createdBy: 'tester', clientOperationId: 'op-send-2', baseConversationRev: inqG3.conversation_rev });
-  const sendCallsBefore = fSendCapture.calls.filter(c => c.url.includes('messages/send')).length;
-  const previewLive = await runInquiryHubOutboxTick({ adapters: { email: adLive } }); // env未設定=dryrunモード+liveアダプター
-  check('liveアダプター×dryrun tick: 新規ジョブがプレビューされる', previewLive.mode === 'dryrun' && previewLive.previewed >= 1, JSON.stringify(previewLive));
-  check('liveアダプター×dryrun tickでも実送信されない (呼び出し単位dryRun強制)',
-    fSendCapture.calls.filter(c => c.url.includes('messages/send')).length === sendCallsBefore
-    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(job2.id).status === 'pending');
-  db.prepare("UPDATE outbox_replies SET status = 'cancelled' WHERE id = ?").run(job2.id); // 5d-2のlive処理対象を job のみに戻す
-  // 防御層: runOutboxPass に dryrun アダプターが渡っても sent 確定しない
+  // チャネル別モデル (Step 4改修): isLive=false のアダプターのチャネルは claim されずプレビューのみ。
+  // dryrunアダプターがrunOutboxPassへ直接渡っても防御層が pending に戻す
+  check('adDry.isLive=false / adLive.isLive=true', adDry.isLive === false && adLive.isLive === true);
   const passDry = await runOutboxPass({ email: adDry }, { executor: 'server' });
   check('runOutboxPass防御: dryRun結果は pending に戻す', passDry.results.some(r => r.id === job.id && r.outcome === 'dryrun')
     && db.prepare('SELECT status, error_message FROM outbox_replies WHERE id = ?').get(job.id).status === 'pending');
+  // dryrunアダプターだけのtickはlive処理ゼロ (プレビューのみ)・実送信APIも呼ばれない
+  const sendCallsBefore = fSendCapture.calls.filter(c => c.url.includes('messages/send')).length;
+  const tickDry = await runInquiryHubOutboxTick({ adapters: { email: adDry } });
+  check('dryrunアダプターのtickはプレビューのみ (実送信ゼロ)', (tickDry.mode === 'dryrun' || tickDry.preview)
+    && fSendCapture.calls.filter(c => c.url.includes('messages/send')).length === sendCallsBefore
+    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(job.id).status === 'pending');
 
-  // 5d-2. live: pending → sent + 会話記録 + waiting_reply
-  const pass = await runInquiryHubOutboxTick({ adapters: { email: adLive }, sendMode: 'live' });
+  // 5d-2. live: pending → sent + 会話記録 + waiting_reply (isLive=trueのアダプターは通常処理)
+  const pass = await runInquiryHubOutboxTick({ adapters: { email: adLive } });
   check('outbox tick (live): sent', pass.results?.some(r => r.id === job.id && r.outcome === 'sent'), JSON.stringify(pass));
   const jobRow = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(job.id);
   check('external_reply_id=sent-001+sent_at刻印', jobRow.status === 'sent' && jobRow.external_reply_id === 'sent-001' && !!jobRow.sent_at);

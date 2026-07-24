@@ -283,6 +283,68 @@ console.log('6. エンジン結合');
     db.prepare('SELECT sent_at FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = ?').get(inq.id, 'q').sent_at === '2026-07-15T01:00:00Z');
 }
 
+// ─── 6b. 返信送信 (sendReply) ───
+console.log('6b. 返信送信');
+{
+  const { SendRejectedError, createReplyJob, runOutboxPass } = await import('./outbox.js');
+  const okInq = { external_inquiry_id: '373343-20260617-49607914o' };
+
+  // dryrun (既定): 実送信せず dryRun:true
+  const fNone = mockFetch(() => ({ body: {} }));
+  const adDry = createRakutenAdapter({ ...CRED, fetchImpl: fNone });
+  const dry = await adDry.sendReply({ inquiry: okInq, bodyText: '返金します' });
+  check('dryrun: dryRun:true + API未呼び出し', dry.dryRun === true && fNone.calls.length === 0);
+  check('isLive=false (既定dryrun)', adDry.isLive === false);
+
+  // 拒否系 = SendRejectedError
+  let eNum = null;
+  try { await adDry.sendReply({ inquiry: { external_inquiry_id: 'not-a-number' }, bodyText: 'x' }); } catch (e) { eNum = e; }
+  check('問い合わせ番号不正は SendRejectedError', eNum instanceof SendRejectedError);
+  let eEmpty = null;
+  try { await adDry.sendReply({ inquiry: okInq, bodyText: '  ' }); } catch (e) { eEmpty = e; }
+  check('空本文は SendRejectedError', eEmpty instanceof SendRejectedError);
+
+  // live: warehouse passthrough へPOST
+  let sentReq = null;
+  const fLive = (() => {
+    const fn = async (url, opts) => { sentReq = { url, opts }; return { status: 200, text: async () => JSON.stringify({ result: { id: 5 } }), json: async () => ({}) }; };
+    fn.calls = []; return fn;
+  })();
+  const adLive = createRakutenAdapter({
+    transport: 'warehouse', warehouseUrl: 'https://wh.example.com', serviceToken: 'tok',
+    cfClientId: 'i', cfClientSecret: 'c', sleepMs: 0, fetchImpl: fLive, sendMode: 'live',
+  });
+  check('isLive=true (live設定)', adLive.isLive === true);
+  const live = await adLive.sendReply({ inquiry: okInq, bodyText: 'ご返金します' });
+  check('live: passthrough URLへPOST+認証ヘッダ', sentReq.url === 'https://wh.example.com/service-api/rakuten-rms/inquiry-reply'
+    && sentReq.opts.method === 'POST' && sentReq.opts.headers.Authorization === 'Bearer tok');
+  check('live: body={inquiryNumber, message}', JSON.parse(sentReq.opts.body).inquiryNumber === okInq.external_inquiry_id);
+  check('live: 返信IDを r:<id> で返す', live.externalReplyId === 'r:5');
+  const dryOverride = await adLive.sendReply({ inquiry: okInq, bodyText: 'x', dryRun: true });
+  check('liveアダプターでも dryRun:true 強制で実送信しない', dryOverride.dryRun === true);
+
+  const fLive400 = (() => { const fn = async () => ({ status: 400, text: async () => JSON.stringify({ error: { code: 'IE001', message: 'bad' } }) }); fn.calls = []; return fn; })();
+  let e400 = null;
+  try { await createRakutenAdapter({ ...CRED, fetchImpl: fLive400, sendMode: 'live' }).sendReply({ inquiry: okInq, bodyText: 'x' }); } catch (e) { e400 = e; }
+  check('4xxは SendRejectedError (未送信確定)', e400 instanceof SendRejectedError && /IE001/.test(e400.message));
+  const fLive500 = (() => { const fn = async () => ({ status: 500, text: async () => 'boom' }); fn.calls = []; return fn; })();
+  let e500 = null;
+  try { await createRakutenAdapter({ ...CRED, fetchImpl: fLive500, sendMode: 'live' }).sendReply({ inquiry: okInq, bodyText: 'x' }); } catch (e) { e500 = e; }
+  check('5xxは汎用エラー (→unknown)', e500 !== null && !(e500 instanceof SendRejectedError));
+
+  // outboxのチャネル別claim: 楽天ジョブはrakutenアダプターが無いpassでは触られない
+  const rkShopId = db.prepare("SELECT id FROM shops WHERE channel_type='rakuten' LIMIT 1").get().id;
+  const rkInq = db.prepare('SELECT * FROM inquiries WHERE shop_id = ? LIMIT 1').get(rkShopId);
+  const rkJob = createReplyJob({ inquiryId: rkInq.id, channelType: 'rakuten', bodyText: 'テスト返信', createdBy: 'tester', clientOperationId: 'op-rk-1', baseConversationRev: rkInq.conversation_rev });
+  const passNoRk = await runOutboxPass({ email: { sendReply: async () => ({}) } }, { executor: 'server' });
+  check('rakutenアダプター無しのpassでは楽天ジョブをclaimしない (pendingのまま)',
+    !passNoRk.results.some(r => r.id === rkJob.id)
+    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(rkJob.id).status === 'pending');
+  const passRk = await runOutboxPass({ rakuten: adLive }, { executor: 'server' });
+  check('rakutenアダプターを渡すと送信される', passRk.results.some(r => r.id === rkJob.id && r.outcome === 'sent')
+    && db.prepare('SELECT status, external_reply_id FROM outbox_replies WHERE id = ?').get(rkJob.id).status === 'sent');
+}
+
 // ─── 7. transport解決 + cron ───
 console.log('7. transport解決 + cron');
 {

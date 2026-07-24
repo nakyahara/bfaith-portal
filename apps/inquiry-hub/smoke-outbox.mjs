@@ -222,14 +222,20 @@ const inqY = mkInquiry(shopRunner, 'yahoo', 'yh-t1');
   check('runner workerが送信する', rRunner.processed === 1 && rRunner.results[0].outcome === 'sent' && runnerAdapter.state.calls === 1);
 }
 
-// ─── 8. アダプター未設定 → needs_review / リース喪失 → メッセージ挿入しない ───
+// ─── 8. アダプター未設定 → claimしない (pending維持) / リース喪失 → メッセージ挿入しない ───
 console.log('8. 異常系');
 const inqF = mkInquiry(shopEmail, 'email', 'th-f');
 {
-  createReplyJob({ inquiryId: inqF, channelType: 'email', bodyText: 'x', createdBy: 'u',
+  const jf1 = createReplyJob({ inquiryId: inqF, channelType: 'email', bodyText: 'x', createdBy: 'u',
     clientOperationId: 'op-f1', baseConversationRev: 0 });
+  // Step 4改修: アダプターの無いチャネルのジョブは claim しない (needs_review へ消費せず pending のまま。
+  // dryrun中/未実装チャネルのジョブが誤消費されたり他チャネルを詰まらせたりしないため)
   const r = await runOutboxPass({}, { now: T0 });
-  check('アダプター未設定 → needs_review', r.results[0].outcome === 'needs_review');
+  check('アダプター未設定 → claimせず pending 維持', r.processed === 0
+    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(jf1.id).status === 'pending');
+  const rOther = await runOutboxPass({ rakuten: { sendReply: async () => ({}) } }, { now: T0 });
+  check('別チャネルのアダプターだけでは触られない', rOther.processed === 0
+    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(jf1.id).status === 'pending');
 
   cancelJob(db.prepare("SELECT id FROM outbox_replies WHERE client_operation_id='op-f1'").get().id, 'u');
   createReplyJob({ inquiryId: inqF, channelType: 'email', bodyText: 'x', createdBy: 'u',
@@ -247,11 +253,12 @@ const inqF = mkInquiry(shopEmail, 'email', 'th-f');
 // ─── 9. issues一覧 ───
 console.log('9. issues一覧');
 {
-  // needs_review の実例を1件用意 (前段のものは取消済みのため)
+  // needs_review の実例を1件用意 (rev競合経路。旧「アダプター未設定→needs_review」はStep 4改修で廃止)
   const inqH = mkInquiry(shopEmail, 'email', 'th-h');
   createReplyJob({ inquiryId: inqH, channelType: 'email', bodyText: 'x', createdBy: 'u',
     clientOperationId: 'op-h1', baseConversationRev: 0 });
-  await runOutboxPass({}, { now: T0 });
+  db.prepare('UPDATE inquiries SET conversation_rev = 1 WHERE id = ?').run(inqH); // 新着相当でrevを進める
+  await runOutboxPass({ email: okAdapter() }, { now: T0 });
   const issues = listOutboxIssues();
   const statuses = new Set(issues.map(i => i.status));
   check('unknown/needs_review/failed が一覧に載る', statuses.has('unknown') && statuses.has('needs_review') && statuses.has('failed')

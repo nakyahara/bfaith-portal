@@ -95,16 +95,21 @@ export function sweepZombies({ now } = {}) {
   return zombies.length;
 }
 
-/** pending を1件 claim する (BEGIN IMMEDIATE + executor制約。設計書§8.3(b)/§5.3)。無ければ null */
-function claimNext(db, executor, nowMs, leaseMinutes) {
+/** pending を1件 claim する (BEGIN IMMEDIATE + executor制約 + チャネル制約。設計書§8.3(b)/§5.3)。無ければ null
+ * channels: claim対象のチャネル一覧 (=送信アダプターを渡されたチャネルのみ)。
+ * アダプターが無い/ドライランのチャネルのジョブは claim せず pending のまま残す
+ * (誤って needs_review へ消費したり、他チャネルの処理を詰まらせたりしない) */
+function claimNext(db, executor, nowMs, leaseMinutes, channels) {
+  if (!channels.length) return null;
   const tx = db.transaction(() => {
     // 同一問い合わせに sending が存在する間はclaimしない (作成ガードに加えた多層防御。Codexレビュー反映)
     const job = db.prepare(`SELECT o.* FROM outbox_replies o
         JOIN inquiries i ON i.id = o.inquiry_id
         JOIN shops s ON s.id = i.shop_id
       WHERE o.status = 'pending' AND s.executor = ?
+        AND o.channel_type IN (${channels.map(() => '?').join(',')})
         AND NOT EXISTS (SELECT 1 FROM outbox_replies o2 WHERE o2.inquiry_id = o.inquiry_id AND o2.status = 'sending')
-      ORDER BY o.id LIMIT 1`).get(executor);
+      ORDER BY o.id LIMIT 1`).get(executor, ...channels);
     if (!job) return null;
     const leaseToken = crypto.randomUUID();
     db.prepare("UPDATE outbox_replies SET status = 'sending', lease_token = ?, lease_until = ? WHERE id = ? AND status = 'pending'")
@@ -138,11 +143,13 @@ export async function runOutboxPass(adapters, opts = {}) {
 
   const swept = sweepZombies({ now: tick() });
   const results = [];
+  // claim対象 = sendReply を持つアダプターが渡されたチャネルのみ (それ以外は pending のまま触らない)
+  const channels = Object.keys(adapters || {}).filter(ch => typeof adapters[ch]?.sendReply === 'function');
 
   for (let n = 0; n < (opts.maxJobs ?? 20); n++) {
     const nowMs = tick();
     const nowIso = toUtcIso(nowMs);
-    const job = claimNext(db, executor, nowMs, leaseMinutes);
+    const job = claimNext(db, executor, nowMs, leaseMinutes, channels);
     if (!job) break;
     const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(job.inquiry_id);
     const shop = db.prepare('SELECT * FROM shops WHERE id = ?').get(inq.shop_id);

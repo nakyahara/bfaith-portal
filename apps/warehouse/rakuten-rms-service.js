@@ -287,6 +287,39 @@ router.get('/inquiries', rateLimitMiddleware('rakuten'), async (req, res) => {
   }
 });
 
+// 問い合わせ返信 passthrough (inquiry-hub Step 4。変更系はこの1本のみ・厳重ガード)
+// - 呼び出し元は inquiry-hub の outbox worker のみ (Render→CF Tunnel→サービストークン認証の内側)
+// - inquiryNumber は実測形式 (shopId-日付-連番英字) の厳格検証。任意パス・任意ペイロードは通さない
+// - 既読化/完了化/添付アップロードの passthrough は作らない (必要になった時点で個別設計)
+router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const inquiryNumber = String(req.body?.inquiryNumber || '').trim();
+    const message = String(req.body?.message || '');
+    if (!/^\d{1,10}-\d{8}-\d{1,12}[a-z]?$/i.test(inquiryNumber)) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'inquiryNumber が実測形式ではありません', requestId: req.requestId });
+    }
+    if (!message.trim()) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'message が空です', requestId: req.requestId });
+    }
+    if (message.length > 10000) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'message が長すぎます (10000文字まで)', requestId: req.requestId });
+    }
+    // ⚠️ maxAttempts:1 必須 — rakutenRequest の既定は 429/5xx を自動リトライ (計4回) するが、
+    // 送信系でのリトライは二重送信になり得る (5xx=送信された可能性が残る)。結果不明の扱いは
+    // inquiry-hub の outbox (unknown→人手解決) に委ねる
+    const result = await rakutenRequest({
+      path: '/es/1.0/inquirymng-api/inquiry/reply',
+      method: 'POST',
+      body: { inquiryNumber, message },
+      maxAttempts: 1,
+    });
+    console.log(`[rakuten-rms] inquiry-reply ${inquiryNumber} -> HTTP ${result.status}`);
+    res.status(result.status).json(result.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 // ==========================================
 // ステータス
 // ==========================================

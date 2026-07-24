@@ -202,14 +202,18 @@ router.get('/inquiries/:id', (req, res) => {
     <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
     ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>
       <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span></div>`).join('')}` : '';
-  // 送信ワーカーの状態に応じたバナー (env は起動時固定なので都度読んでも軽い)
+  // 送信ワーカーの状態に応じたバナー (チャネル別モード。env は起動時固定なので都度読んでも軽い)
   const outboxOn = ['true', '1'].includes(process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED || '');
-  const sendLive = process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live';
-  const workerBanner = !outboxOn
-    ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ 送信ワーカーは停止中です。作成した返信ジョブはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>'
-    : !sendLive
-      ? '<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px;margin-bottom:8px">🧪 DRYRUNモード: 送信ジョブは処理されますが実際のメールは送信されません (動作確認用)</div>'
-      : '';
+  const SEND_MODE_ENV = { email: 'INQUIRY_HUB_MAIL_SEND_MODE', rakuten: 'INQUIRY_HUB_RAKUTEN_SEND_MODE' };
+  const channelSupported = inq.channel_type in SEND_MODE_ENV;
+  const sendLive = channelSupported && process.env[SEND_MODE_ENV[inq.channel_type]] === 'live';
+  const workerBanner = !channelSupported
+    ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ このチャネルの送信は未実装です (Yahoo!はStep 5)。作成したジョブは送信されず保留されます</div>'
+    : !outboxOn
+      ? '<div class="sub" style="background:#fef3c7;border-radius:8px;padding:8px 10px;margin-bottom:8px">⚠️ 送信ワーカーは停止中です。作成した返信ジョブはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>'
+      : !sendLive
+        ? '<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px;margin-bottom:8px">🧪 DRYRUNモード: このチャネルの送信ジョブは検証のみで、実際には送信されません (動作確認用)</div>'
+        : '';
   const replyPanel = replyEditorEnabled() ? `
       <div class="panel">
         <h3>✉️ 返信を作成</h3>
