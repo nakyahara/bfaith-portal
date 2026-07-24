@@ -29,12 +29,14 @@ import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInb
 import { importNeBackorderCsv } from './migration.js';
 import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
-  buildOrderEmail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
-  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell,
+  buildOrderEmail, buildOrderFax, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
+  markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf,
 } from './email.js';
+import { renderOrderPdf } from './fax-pdf.js';
 import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseShipmentMail } from './shipment-mail.js';
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
+import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -498,7 +500,7 @@ function cycleIssuedSuppliers(cycleStart) {
            GROUP_CONCAT(CASE WHEN is_unsent = 1 THEN po_label END) AS unsent_pos
     FROM (
       SELECT o.supplier_code AS code, o.supplier_name AS name, COALESCE(o.po_number, '#' || o.id) AS po_label,
-             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method = 'email'
+             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method IN ('email', 'fax')
                    AND NOT EXISTS (SELECT 1 FROM po_email_jobs e WHERE e.order_id = o.id AND e.status = 'sent' AND e.is_dry_run = 0)
                   THEN 1 ELSE 0 END AS is_unsent
       FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
@@ -1188,14 +1190,21 @@ router.post('/api/inbound/:id/ignore', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// ─── P15: 発注書メール送信 ───
+// ─── P15: 発注書メール送信 (+FAX: eFaxゲートウェイ宛メール。channel='fax') ───
+/** POの仕入先の送信方法 ('fax' なら FAXチャネル、それ以外はemailチャネルで既存の検証メッセージに任せる) */
+function sendChannelOf(orderId) {
+  const r = getDB().prepare(`SELECT s.send_method FROM po_orders o
+    LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code WHERE o.id=?`).get(orderId);
+  return r && r.send_method === 'fax' ? 'fax' : 'email';
+}
+
 router.get('/api/orders/:id/email/preview', (req, res) => {
   try {
     const orderId = Number(req.params.id);
     if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
-    const p = buildOrderEmail(orderId);
+    const p = sendChannelOf(orderId) === 'fax' ? buildOrderFax(orderId) : buildOrderEmail(orderId);
     res.json({
-      ok: true,
+      ok: true, channel: p.channel, faxNumber: p.faxNumber,
       to: p.to, cc: p.cc, subject: p.subject, body: p.body,
       rows: p.rows, totalQty: p.totalQty, totalAmount: p.totalAmount,
       attachmentName: p.attachmentName, csvText: p.csvText, csvRows: p.csvRows,
@@ -1204,6 +1213,32 @@ router.get('/api/orders/:id/email/preview', (req, res) => {
       jobs: listEmailJobs(orderId),
     });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// FAX発注書PDFのプレビュー (その場で生成して返す。送信済み控えは /api/email-jobs/:id/pdf)
+router.get('/api/orders/:id/fax/pdf', async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const p = buildOrderFax(orderId);
+    const pdf = await renderOrderPdf(p.pdfPayload);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${p.attachmentName}"`);
+    res.send(pdf);
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 送信ジョブに保存されたPDF控え (送信された実バイト列。プレビュー再生成ではない)
+router.get('/api/email-jobs/:id/pdf', (req, res) => {
+  try {
+    const jobId = Number(req.params.id);
+    if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
+    const job = getDB().prepare('SELECT channel, attachment_name, attachment_pdf FROM po_email_jobs WHERE id=?').get(jobId);
+    if (!job || job.channel !== 'fax' || !job.attachment_pdf) return res.status(404).json({ ok: false, error: 'FAXジョブのPDFが見つかりません' });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${job.attachment_name}"`);
+    res.send(Buffer.from(job.attachment_pdf));
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
 router.post('/api/orders/:id/email/send', async (req, res) => {
@@ -1218,13 +1253,34 @@ router.post('/api/orders/:id/email/send', async (req, res) => {
     // 冪等キーは必須 (再送ジョブはdedup対象外のため、通信断後の再実行・自動リトライでの複数通送信をキーで防ぐ、Codex P15-R4 High)
     const idemKey = trimS(req.get('Idempotency-Key'));
     if (!idemKey) return res.status(400).json({ ok: false, error: 'Idempotency-Key ヘッダが必要です (画面からの送信では自動付与されます)' });
+    const channel = sendChannelOf(orderId);
+    // プレビュー時のチャネルと不一致なら拒否 (プレビュー後に仕入先の発注方法が変わっていたら、
+    // FAXのつもりの承認でメールを送らない。expectedMode と同じ発想で必須 (Codex fax-R1 High))
+    const expectedChannel = trimS(b.expectedChannel) || null;
+    if (!expectedChannel) return res.status(400).json({ ok: false, error: '送信方法 (expectedChannel) が未指定です。画面を再読み込みしてから送信してください' });
+    if (expectedChannel !== channel) {
+      return res.status(400).json({ ok: false, error: `送信方法が変わっています (画面: ${expectedChannel} / 現在: ${channel})。プレビューを開き直して内容を確認してください` });
+    }
+    let faxPdf = null, faxHash = null;
+    if (channel === 'fax') {
+      // 冪等リプレイ (結果保存済み) は createEmailJob を呼ばないため、PDF生成もスキップ (Codex fax-R1 Medium)
+      const done = getDB().prepare('SELECT result_json FROM po_commands WHERE idempotency_key=?').get(idemKey);
+      if (!done || done.result_json == null) {
+        // PDF生成 (async) はジョブ作成txnの外。生成時点の内容ハッシュを createEmailJob が再検証し、
+        // 生成中に発注が編集されていたら拒否する (プレビューと違うPDFを送らない)
+        const p = buildOrderFax(orderId);
+        faxHash = contentHashOf(p);
+        faxPdf = await renderOrderPdf(p.pdfPayload);
+      }
+    }
     const { replay, result: jobId } = withCommand(
-      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode } },
-      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req) })
+      { idempotencyKey: idemKey, payload: { op: 'email_send', orderId, resend, resendOfJobId, scheduledAt, expectedMode, channel } },
+      () => createEmailJob(orderId, { resend, resendOfJobId, scheduledAt, expectedMode, actor: actorOf(req),
+        channel, pdfBuffer: faxPdf, expectedHash: faxHash })
     );
     const outcome = await processEmailJob(jobId);
     const jb = getDB().prepare('SELECT is_dry_run FROM po_email_jobs WHERE id=?').get(jobId);
-    res.json({ ok: true, jobId, replay, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
+    res.json({ ok: true, jobId, replay, channel, dryRun: !!(jb && jb.is_dry_run), ...outcome, jobs: listEmailJobs(orderId) });
   } catch (e) { res.status(e.status === 409 ? 409 : 400).json({ ok: false, error: e.message }); }
 });
 
@@ -2119,12 +2175,15 @@ const MASTER_DEFS = {
       email_cc: parseAddresses(b.email_cc || '').join(',') || null,
       contact_name: trimS(b.contact_name) || null,
       send_method: trimS(b.send_method) || null,
+      fax_number: trimS(b.fax_number) || null, // 入力表記のまま保存 (正規化・検証は validate / 送信時)
       lead_days: numOrNull(b.lead_days),
     }),
     validate: r => {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
       if (r.send_method && !['email', 'fax', 'web', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/none';
+      if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
+      if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
       if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
       return null;
     },
@@ -2705,10 +2764,12 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
 // - 同一商品がロケ別に複数行 → 商品IDごとに合算。品質区分列があれば「良品」のみ在庫に数える
 // - 商品IDはロジザード登録表記そのもの → canonical (貼り付け用の大小表記) をここからも蓄積
 // - 仕組みはNEオーバーレイを再利用 (在庫数以外のカラムはNULL=マージでPML値に自動フォールバック)
-router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
-  let buf;
-  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+// ロジザード在庫CSV取込の本体。手動アップロード経路と Drive 直接取得経路で共用する
+// (取込ルール・プレビュー二段確認・在庫0上書きの判定を一本化するため、経路ごとに分岐させない)。
+//   buf      … CSV本体
+//   filename … 取込履歴に残すファイル名
+//   extra    … レスポンスに添える経路固有の情報 (Drive経路の更新日時など)
+function importLogizardStockCsv(req, res, { buf, filename, extra = {} }) {
   try {
     const rows = parseCsvBuffer(buf);
     if (rows.length < 2) return res.status(400).json({ ok: false, error: 'データ行がありません' });
@@ -2764,7 +2825,7 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
     })).digest('hex');
     const summary = { products: agg.size, matched, zeroFill: zeroFill.length, dataRows, skippedNonGood, skippedBlank, fileHash, planHash };
     if (String((req.body || {}).commit) !== '1') {
-      return res.json({ ok: true, preview: true, ...summary });
+      return res.json({ ok: true, preview: true, ...summary, ...extra });
     }
     if (trimS((req.body || {}).fileHash) !== fileHash) {
       return res.status(409).json({ ok: false, error: 'プレビューしたファイルと内容が異なります。もう一度プレビューからやり直してください' });
@@ -2787,14 +2848,57 @@ router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
       for (const p of zeroFill) ins.run(p.key, p.code, 0, null);
       db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'logizard')
                   ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
-        .run(now, agg.size + zeroFill.length, req.file.originalname || null);
+        .run(now, agg.size + zeroFill.length, filename || null);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'logizard_stock_import', resource: 'ne_overlay',
-        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood } });
+        detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood, ...extra } });
       // サイクルリセットも同一txn (在庫だけ更新されてバッジが残る片肺を防ぐ、Codex LZ-R1 Medium)
       bumpCycleReset(actorOf(req), 'ロジザード在庫CSV取込で発注サイクル更新', now);
     })();
-    res.json({ ok: true, ...summary, uploadedAt: now });
+    res.json({ ok: true, ...summary, ...extra, uploadedAt: now });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+}
+
+router.post('/api/logizard-stock/csv', upload.single('file'), (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'CSVファイルが必要です' });
+  let buf;
+  try { buf = fs.readFileSync(req.file.path); } finally { try { fs.unlinkSync(req.file.path); } catch {} }
+  importLogizardStockCsv(req, res, { buf, filename: req.file.originalname });
+});
+
+// ── Google Drive 直接取込 (2026-07-20 中原さん指示) ──
+// run-zaiko.bat がロジザードから落とした logizard_zaikosu.csv を Drive の固定フォルダに置く運用。
+// 手元にDLして選び直す手間を省くため、Render サーバが Drive API で直接取得して同じ取込経路へ流す。
+// 更新日時を返すので「最新のCSVを取り込んだか」を画面で確認できる。
+const LZ_DRIVE_SOURCE = {
+  label: 'ロジザード在庫CSV',
+  folderId: process.env.PO_DRIVE_FOLDER_LOGIZARD_STOCK || '1UT6l9G_vRD1PnXN6P4E1FXbxC0PkFPF0',
+  filename: process.env.PO_DRIVE_FILE_LOGIZARD_STOCK || 'logizard_zaikosu.csv',
+  notFoundHint: '会社PCの run-zaiko.bat で在庫CSVを出力済みか確認してください。',
+};
+
+// 更新日時表示用 (60秒キャッシュ)。失敗しても画面全体を落とさないよう ok:false で返す
+router.get('/api/logizard-stock/drive-info', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await getDriveCsvInfo(LZ_DRIVE_SOURCE)) });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+// Drive からDLして通常の取込と同じ経路へ (プレビュー→確認の二段もそのまま効く)。
+// プレビューと取込の間にCSVが差し替わった場合は fileHash 不一致で409になり、やり直しを促す
+router.post('/api/logizard-stock/drive', async (req, res) => {
+  let dl;
+  try {
+    dl = await downloadDriveCsv(LZ_DRIVE_SOURCE);
+  } catch (e) {
+    return res.status(e.code === 'VALIDATION' ? 400 : 502).json({ ok: false, error: e.message });
+  }
+  importLogizardStockCsv(req, res, {
+    buf: dl.buffer,
+    filename: dl.filename,
+    extra: { drive_file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst, size_kb: dl.size != null ? Math.round(dl.size / 1024) : null } },
+  });
 });
 
 router.delete('/api/ne-overlay', (req, res) => {
@@ -3301,10 +3405,16 @@ router.get('/', (req, res) => {
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">📥 NE最新CSVを取込</button>
       </form>
-      <form id="lzForm" style="display:flex;gap:6px;align-items:center" title="ロジザードのロケ別在庫一覧CSV (CZ04003)。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)。商品IDの表記も蓄積されるのでロジザード貼り付けの表記が揃う">
-        <input type="file" name="file" accept=".csv" required>
-        <button type="submit">📥 ロジザード在庫CSVを取込</button>
-      </form>
+      <span style="display:flex;gap:6px;align-items:center" title="Gドライブの logizard_zaikosu.csv (run-zaiko.bat が出力) をサーバが直接取得して取り込む。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)">
+        <button id="btnLzDrive">📥 ロジザード在庫CSVを取込</button>
+        <span id="lzDriveInfo" class="muted">更新日時を確認中...</span>
+      </span>
+      <details style="margin-left:4px"><summary class="muted" style="cursor:pointer">ファイルを選んで取込</summary>
+        <form id="lzForm" style="display:flex;gap:6px;align-items:center;margin-top:6px" title="ロジザードのロケ別在庫一覧CSV (CZ04003) を手元から選んでアップロードする経路 (Drive取得が使えないとき用)">
+          <input type="file" name="file" accept=".csv" required>
+          <button type="submit">📥 選んだCSVを取込</button>
+        </form>
+      </details>
       ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
       <span id="opStatus" class="muted"></span>
     </div>
@@ -3488,37 +3598,74 @@ document.getElementById('neForm').addEventListener('submit', function(ev) {
 // ロジザード在庫CSV (在庫数のみ上書き。商品ID表記の蓄積も兼ねる)。
 // プレビュー→確認→取込の二段: CSVに無い取扱中商品は「売り切れ=在庫0」で上書きするため、
 // 絞り込んだCSVの誤取込 (大量の在庫0化) を件数確認で止める
-document.getElementById('lzForm').addEventListener('submit', function(ev) {
-  ev.preventDefault();
-  var form = ev.target;
+// 取込元 (Gドライブ / ファイル選択) が違うだけで、確認〜取込の流れは共通。
+// send(extra) が fetch の Promise を返す。extra は commit 時に {commit,fileHash,planHash} が入る
+function lzImport(send) {
   setStatus('ロジザード在庫CSVを確認中...');
-  fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: new FormData(form) })
+  send({})
     .then(function(r){ return r.json(); })
     .then(function(j) {
       if (!j.ok) { setStatus(''); alert('取込エラー: ' + impErr(j.error) + (j.errors ? '\\n' + j.errors.join('\\n') : '')); return; }
       setStatus('');
-      if (!confirm('ロジザード在庫CSVを取り込みます:\\n' +
+      var d = j.drive_file;
+      var srcNote = d ? ('取込元: ' + d.filename + ' (Gドライブ)\\n更新日時: ' + (d.modified_time_jst || '不明') +
+        (d.size_kb != null ? ' / ' + d.size_kb.toLocaleString('ja-JP') + ' KB' : '') + '\\n\\n') : '';
+      if (!confirm(srcNote + 'ロジザード在庫CSVを取り込みます:\\n' +
         '・在庫を更新: ' + j.matched + '商品\\n' +
         '・CSVに行なし → 売り切れ扱いで在庫0: ' + j.zeroFill + '商品\\n' +
         (j.skippedNonGood ? '・良品以外の行を除外: ' + j.skippedNonGood + '行\\n' : '') +
         '\\n※在庫0の件数が想定より多い場合、絞り込んだCSVの可能性があります (全ロケ・全商品でエクスポートしてください)。よろしいですか?')) return;
       confirmCycleReset(function() {
         setStatus('取込中...');
-        var fd2 = new FormData(form);
-        fd2.append('commit', '1');
-        fd2.append('fileHash', j.fileHash);
-        fd2.append('planHash', j.planHash);
-        fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd2 })
+        send({ commit: '1', fileHash: j.fileHash, planHash: j.planHash })
           .then(function(r){ return r.json(); })
           .then(function(j2) {
             if (!j2.ok) { setStatus(''); alert('取込エラー: ' + impErr(j2.error)); return; }
-            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品)。再読み込みします...');
+            var d2 = j2.drive_file;
+            setStatus('取込完了 (在庫更新 ' + j2.matched + '商品 / 在庫0扱い ' + j2.zeroFill + '商品' +
+              (d2 && d2.modified_time_jst ? ' / CSV更新日時 ' + d2.modified_time_jst : '') + ')。再読み込みします...');
             location.reload();
           })
           .catch(function(e){ setStatus('通信エラー: ' + e.message); });
       });
     })
     .catch(function(e){ setStatus('通信エラー: ' + e.message); });
+}
+
+// Gドライブから直接取込 (通常はこちら。run-zaiko.bat が置いた logizard_zaikosu.csv を読む)
+document.getElementById('btnLzDrive').addEventListener('click', function() {
+  lzImport(function(extra) {
+    return fetch('/apps/purchase-orders/api/logizard-stock/drive', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(extra),
+    });
+  });
+});
+
+// Gドライブ上のCSVの更新日時を表示 (最新かどうかを取込前に判断できるように)
+(function() {
+  var el = document.getElementById('lzDriveInfo');
+  if (!el) return;
+  fetch('/apps/purchase-orders/api/logizard-stock/drive-info')
+    .then(function(r){ return r.json(); })
+    .then(function(j) {
+      if (!j.ok) { el.textContent = '⚠️ Gドライブ確認不可: ' + j.error; el.title = j.error; return; }
+      var jst = j.modified_time_jst || '不明';
+      var today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+      var isToday = jst.slice(0, 10) === today;
+      el.textContent = (isToday ? '🟢 ' : '⚠️ ') + 'CSV更新 ' + jst + (isToday ? '' : ' (今日のものではありません)');
+      el.title = j.filename + (j.size != null ? ' / ' + Math.round(j.size / 1024).toLocaleString('ja-JP') + ' KB' : '');
+    })
+    .catch(function(e){ el.textContent = '⚠️ Gドライブ確認不可: ' + e.message; });
+})();
+
+document.getElementById('lzForm').addEventListener('submit', function(ev) {
+  ev.preventDefault();
+  var form = ev.target;
+  lzImport(function(extra) {
+    var fd = new FormData(form);
+    Object.keys(extra).forEach(function(k){ fd.append(k, extra[k]); });
+    return fetch('/apps/purchase-orders/api/logizard-stock/csv', { method: 'POST', body: fd });
+  });
 });
 var btnNeClear = document.getElementById('btnNeClear');
 if (btnNeClear) btnNeClear.addEventListener('click', function() {
@@ -6027,7 +6174,8 @@ function bulkEligibleIds() {
 // 送信結果の分類: ジョブ作成成功 (ok:true) でも送信自体は failed/unknown/stale があり得る (成功扱いにしない)
 function bulkOutcome(j, at) {
   if (!j.ok) return { kind: 'fail', text: '❌ ' + (j.error || '不明なエラー') };
-  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)' : '✅ 送信しました' };
+  if (j.status === 'sent') return { kind: 'ok', text: j.dryRun ? '✅ dry-run送信 (社内宛)'
+    : (j.channel === 'fax' ? '✅ eFaxへ送信済 (FAX送達はeFaxの結果メールで確認)' : '✅ 送信しました') };
   if (j.status === 'scheduled' || j.status === 'queued') return { kind: 'ok', text: '⏰ 予約しました' + (at ? ' (' + at.replace('T', ' ') + ')' : '') };
   if (j.status === 'failed') return { kind: 'fail', text: '❌ 送信失敗: ' + (j.error || '') };
   // unknown / stale — 未送信と断定できない。二重送信を避けるため自動再送せず照合を案内
@@ -6055,15 +6203,16 @@ document.getElementById('boBulkSend').addEventListener('click', function() {
     ids = bulkEligibleIds();
     if (ids.length < before) toast((before - ids.length) + '件は完了/送信対象外になったため対象から外しました');
     if (!ids.length) { toast('送信できるPOがありません'); updateBulkBar(); return; }
-    var labels = {};
+    var labels = {}, channels = {};
     ids.forEach(function(id) {
       var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
-      labels[id] = o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id;
+      channels[id] = (o && o.sendMethod === 'fax') ? 'fax' : 'email';
+      labels[id] = (o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id) + (channels[id] === 'fax' ? ' 📠FAX' : '');
     });
-    if (!confirm('選択した ' + ids.length + '件の発注書メールを' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します。\\n' +
+    if (!confirm('選択した ' + ids.length + '件の発注書を' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します (📠FAX印はeFax経由でPDF送信)。\\n' +
       'モード: ' + (st.mode === 'live' ? '⚠️ 本番送信 (仕入先に届きます)' : '🔒 dry-run (社内 ' + (st.dryrunTo || '未設定') + ' に送信)') + '\\n\\n・' + ids.map(function(id){ return labels[id]; }).join('\\n・') + '\\n\\nよろしいですか?')) return;
     // 冪等キーは確定時に一括生成して保持 — 通信エラー行は「同じキーで再確認」で安全に再実行できる (replayなら二重送信なし)
-    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
+    BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], channel: channels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
     btn.disabled = true;
     runBulk(BULK_LAST, function(){ btn.disabled = false; SEL = {}; load(); });
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
@@ -6088,7 +6237,7 @@ function runBulk(batch, done) {
 function sendBulkOne(batch, en) {
   return fetch(API + '/orders/' + en.id + '/email/send', {
     method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': en.key },
-    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode }),
+    body: JSON.stringify({ scheduledAt: batch.at, expectedMode: batch.mode, expectedChannel: en.channel || 'email' }),
   }).then(function(r){ return jsonOrErr(r, true); }).then(function(j) {
     return { en: en, out: bulkOutcome(j, batch.at) };
   }).catch(function(e) {
@@ -6380,8 +6529,10 @@ function supPanel(orderId) {
   });
 }
 
-// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)
-function emPreviewModal(j) {
+// 送信内容のポップアッププレビュー: 宛先・件名・本文と、添付CSVを発注書の表として表示 (中原さん要望 2026-07-13)。
+// FAX (channel='fax') は宛先=FAX番号、添付=PDF発注書 (「PDFを開く」で実物確認。表は同じ明細データ)
+function emPreviewModal(j, orderId) {
+  var isFax = j.channel === 'fax';
   var old = document.getElementById('emModalBg');
   if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
   var rows = j.csvRows || [];
@@ -6397,18 +6548,21 @@ function emPreviewModal(j) {
   var bg = document.createElement('div');
   bg.className = 'pomodal-bg'; bg.id = 'emModalBg';
   bg.innerHTML = '<div class="pomodal">' +
-    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">📧 送信内容のプレビュー</h2>' +
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">' + (isFax ? '📠 FAX送信内容のプレビュー' : '📧 送信内容のプレビュー') + '</h2>' +
     (j.mode !== 'live'
       ? '<span class="badge b-draft">🔒 dry-run — 実際は ' + esc(j.dryrunTo || '未設定') + ' に届きます</span>'
       : '<span class="badge b-issued">本番送信 (live)</span>') +
     '<button class="ghost" id="emModalClose" style="margin-left:auto;font-size:15px">✕ 閉じる</button></div>' +
     '<table class="t" style="margin-top:8px">' +
-    '<tr><th style="width:80px">宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '') + '</td></tr>' +
+    '<tr><th style="width:80px">宛先</th><td>' + (isFax ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+      : esc(j.to.join(', ')) + (j.cc.length ? ' <span class="muted">/ CC: ' + esc(j.cc.join(', ')) + '</span>' : '')) + '</td></tr>' +
     '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr></table>' +
-    '<h3 style="margin:12px 0 4px">本文</h3>' +
+    '<h3 style="margin:12px 0 4px">' + (isFax ? '送付状 (FAXの1枚目に印字されます)' : '本文') + '</h3>' +
     '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
     '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
-    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span></h3>' +
+    ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span>' +
+    (isFax && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (現在のデータから生成)</a>' : '') + '</h3>' +
+    (isFax ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください (送信後の正式な控えは履歴の📄PDF)。</div>' : '') +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
@@ -6428,6 +6582,7 @@ function emailPanel(orderId, errBanner) {
   getJson(API + '/orders/' + orderId + '/email/preview').then(function(j) {
     if (!j.ok) { area.innerHTML = '<div class="warn">📧 送信できません: ' + esc(j.error) + '</div>'; return; }
     var dry = j.mode !== 'live';
+    var isFax = j.channel === 'fax';
     // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
     var eb = (errBanner && errBanner.head) ? errBanner : null;
     if (!eb) {
@@ -6442,37 +6597,42 @@ function emailPanel(orderId, errBanner) {
       (eb
         ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">' + esc(eb.head) + '<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(eb.detail || '') + '</div></div>'
         : '') +
-      '<b>📧 発注書メール</b> ' +
+      '<b>' + (isFax ? '📠 発注書FAX (eFax)' : '📧 発注書メール') + '</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
       '<table class="t" style="margin-top:6px">' +
-      '<tr><th>宛先</th><td>' + esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '') + '</td></tr>' +
-      '<tr><th>件名</th><td>' + esc(j.subject) + '</td></tr>' +
+      '<tr><th>宛先</th><td>' + (isFax
+        ? '📠 FAX ' + esc(j.faxNumber || '') + ' <span class="muted" title="eFaxのメールtoFAXゲートウェイ経由で相手のFAX機に届きます">(eFax: ' + esc(j.to.join(', ')) + ')</span>'
+        : esc(j.to.join(', ')) + (j.cc.length ? ' / CC: ' + esc(j.cc.join(', ')) : '')) + '</td></tr>' +
+      '<tr><th>件名</th><td>' + esc(j.subject) + (isFax ? ' <span class="muted" style="font-size:11px">(件名・本文はFAX送付状として1枚目に印字)</span>' : '') + '</td></tr>' +
       '<tr><th>添付</th><td>' + esc(j.attachmentName) + ' — ' + j.rows + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) +
         (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
-        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') + '</td></tr>' +
+        (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') +
+        (isFax ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:12px;font-weight:600">📄 PDFを開く</a>' : '') + '</td></tr>' +
       '</table>' +
       '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
       '<button class="ghost" id="emPrev-' + orderId + '" style="font-weight:600">👁 送信内容をプレビュー (本文+添付)</button>' +
-      '<button class="pri" id="emGo-' + orderId + '">' + (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信') + '</button>' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
-      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run; }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
-      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>';
+      (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
+      '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>' +
+      (isFax ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 「送信済」はeFaxゲートウェイへの受け渡し完了です。相手FAX機への送達結果は、eFaxからの結果通知メール (送信元アドレス宛) で確認してください。</div>' : '');
     if (j.jobs.length) {
       h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
       j.jobs.forEach(function(x) {
-        var st = x.status === 'sent' ? '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '') :
+        var st = x.status === 'sent' ? (x.channel === 'fax' && !x.is_dry_run ? '✅ eFaxへ送信済' : '✅ 送信済' + (x.is_dry_run ? ' (dry-run)' : '')) :
           x.status === 'failed' ? '❌ 失敗' :
           x.status === 'unknown' ? '❓ 結果不明' :
           x.status === 'sending' ? '⏳ 送信中' :
           x.status === 'cancelled' ? '🚫 取消' :
           (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + esc(x.to_addr) + '</td>' +
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + (x.channel === 'fax' ? '📠 ' : '') + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
           '<td style="white-space:nowrap">' +
+            (x.channel === 'fax' ? '<a class="ghost" href="' + API + '/email-jobs/' + x.id + '/pdf" target="_blank" rel="noopener" title="このジョブで送信された (される) PDFの控え">📄 PDF</a> ' : '') +
             (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button> ' : '') +
             ((x.status === 'queued' || x.status === 'failed') ? '<button class="ghost" data-emcancel="' + x.id + '" data-emorder="' + orderId + '">取消</button> ' : '') +
             ((x.status === 'sending' || x.status === 'unknown') ? '<button class="ghost" data-emrec="' + orderId + '">照合</button> ' : '') +
@@ -6483,16 +6643,18 @@ function emailPanel(orderId, errBanner) {
     }
     h += '</div>';
     area.innerHTML = h;
-    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j); });
+    document.getElementById('emPrev-' + orderId).addEventListener('click', function(){ emPreviewModal(j, orderId); });
     var idemKey = newIdemKey();
     var whenEl = document.getElementById('emWhen-' + orderId);
     if (whenEl) whenEl.addEventListener('input', function(){ idemKey = newIdemKey(); });
-    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run; })[0] || null;
+    var lastSent = j.jobs.filter(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); })[0] || null;
     function doSend(resend, scheduledAt) {
       var when = scheduledAt ? ' (予約: ' + scheduledAt.replace('T', ' ') + ' JST)' : '';
       var msg = dry
         ? 'dry-run送信します (宛先は ' + (j.dryrunTo || '未設定') + ' に差し替え)' + when + '。よろしいですか?'
-        : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?';
+        : (isFax
+          ? '⚠️ 本番FAX送信です。仕入先のFAX ' + (j.faxNumber || '') + ' に発注書PDFが届きます (eFax経由)' + when + '。送信しますか?\\n\\n※eFaxの送信結果 (成功/失敗) は送信元メールアドレスへの通知メールで確認できます'
+          : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?');
       // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
       if (j.missingVendorCodes.length) {
         msg += '\\n\\n⚠️ 先方管理番号が未登録の商品が ' + j.missingVendorCodes.length + '件あります (' +
@@ -6503,7 +6665,7 @@ function emailPanel(orderId, errBanner) {
       if (btn) btn.disabled = true;
       post(API + '/orders/' + orderId + '/email/send',
         { resend: !!resend, resendOfJobId: resend && lastSent ? lastSent.id : null, scheduledAt: scheduledAt || null,
-          expectedMode: j.mode }, idemKey)
+          expectedMode: j.mode, expectedChannel: j.channel || 'email' }, idemKey)
         .then(function(r2) {
           if (btn) btn.disabled = false;
           if (!r2.ok) {
@@ -7415,11 +7577,11 @@ var TAB = 'suppliers';
 var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
 var GRP_HINTS = {
-  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB) をここで設定します。',
+  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB)、FAX番号 (eFax送信用) をここで設定します。',
   conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
   barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
-  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。',
+  mail: '📧 発注書メールの送信モード (dry-run/本番)・差出情報・文面テンプレ・宛先マスタの一括取込。📠FAX送信 (eFax) も同じモード・テンプレを使います (件名・本文が送付状になります)。',
 };
 function setGroup(g) {
   GRP = g;
@@ -7443,6 +7605,7 @@ var DEFS = {
     { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
     { k: 'contact_name', l: '担当者名 (様は自動付与)' },
     { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['none', '送信なし']] },
+    { k: 'fax_number', l: 'FAX番号 (発注方法FAXで必須。例: 06-1234-5678)' },
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },

@@ -550,6 +550,12 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 //   7. apply 成功で applied_at を更新
 //   8. is_last=true なら status response
 //
+// 構造監査 H-4 (2026-07-19): date_range clear の multi-chunk run は 4-5 を staging 化。
+//   chunk 毎の受信は sync_stage_rows へ溜めるだけ (live 表は無傷のまま)。全 chunk 到着した
+//   chunk の tx 内で「scope DELETE → stage 全行 INSERT → applied マーカー」を原子的に実行する。
+//   途中失敗・run 放棄でも live 表に「clear済+部分データ」が露出しない。
+//   single-chunk run (元々 atomic) と no_clear (MF finalize 契約) は従来経路のまま。
+//
 // Phase 1 #1-4 で sync_contracts に登録済みの entity のみ受信
 // (現状: amazon_finance_sku_daily v1)
 //
@@ -2002,6 +2008,50 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   const requestId = `sync-${Date.now().toString(36)}`;
   const insertStmt = entityCfg.getInsertStmt(db);
   const insertLedger = getLedgerInsert(db);
+
+  // 構造監査 H-4: date_range clear の multi-chunk run は staging 経由で原子的に apply する。
+  // single-chunk run は従来どおり (clear+INSERT が元々単一 tx で atomic)。
+  // no_clear (MF 等) は独自の finalize 契約があるため対象外。
+  const useStaging = clearStrategy === 'date_range' && chunk_count > 1;
+
+  // 全 chunk 到着時に呼ぶ: scope DELETE → stage 全行 INSERT → stage 掃除 → applied マーカー。
+  // 呼び出し元 tx 内で実行される (単一 tx で「clear済+部分データ」を外部に見せない)。
+  // 既 applied なら null (chunk 再送 replay での二重 apply 防止)。
+  const applyStagedRun = () => {
+    const already = db.prepare(`SELECT applied_at FROM sync_run_applied WHERE run_id = ? AND entity = ?`).get(sync_run_id, entity);
+    if (already) return null;
+    const metaRow = db.prepare(`SELECT clear_dates_json FROM sync_stage_meta WHERE run_id = ? AND entity = ?`).get(sync_run_id, entity);
+    // stage coverage は ledger の staged フラグを正とする (sync_stage_rows の行数だと
+    // row_count=0 の空 chunk を「stage 欠落」と誤判定して永久 409 になる — Codex R2 High #1)
+    const stageChunks = db.prepare(`SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ? AND staged = 1`).get(sync_run_id, entity).c;
+    // 全 chunk が新経路で stage されている時だけ apply する。不足 = デプロイ跨ぎで一部 chunk が
+    // 旧コードにより live 直接 apply された混在 run。clear 実施有無を事後に確定できず、
+    // 推測での救済 (clear せず追加 INSERT 等) は取り違えると欠損/重複を作るため、
+    // 明示的に 409 で失敗させて新 run_id での再同期を要求する (fail-closed、Codex R1)
+    if (stageChunks !== chunk_count || !metaRow) {
+      throw new HttpError(409, {
+        error: 'staged_run_incomplete_stage',
+        message: `staged run の stage 内容が不完全 (stage_chunks=${stageChunks}/${chunk_count}, meta=${metaRow ? 'ok' : 'missing'})。` +
+          `デプロイ跨ぎ等の混在 run のため apply できません。新しい sync_run_id で再同期してください`,
+        entity, sync_run_id,
+      });
+    }
+    const dates = JSON.parse(metaRow.clear_dates_json);
+    const placeholders = dates.map(() => '?').join(',');
+    const clearedRows = db.prepare(`DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})`).run(...dates).changes;
+    const stageRows = db.prepare(`SELECT row_json FROM sync_stage_rows WHERE run_id = ? AND entity = ? ORDER BY chunk_index, row_idx`).all(sync_run_id, entity);
+    for (const s of stageRows) {
+      insertStmt.run(entityCfg.normalizeRow(JSON.parse(s.row_json)));
+    }
+    db.prepare(`DELETE FROM sync_stage_rows WHERE run_id = ? AND entity = ?`).run(sync_run_id, entity);
+    db.prepare(`DELETE FROM sync_stage_meta WHERE run_id = ? AND entity = ?`).run(sync_run_id, entity);
+    db.prepare(`INSERT INTO sync_run_applied (run_id, entity, applied_at, cleared_rows, applied_rows) VALUES (?,?,?,?,?)`)
+      .run(sync_run_id, entity, now, clearedRows, stageRows.length);
+    // ledger: staged 中は applied_at=NULL で受信記録のみ。live 反映が確定したここで一括更新
+    db.prepare(`UPDATE sync_run_chunks SET applied_at = ? WHERE run_id = ? AND entity = ?`).run(now, sync_run_id, entity);
+    return { clearedRows, appliedRows: stageRows.length };
+  };
+
   let result;
   try {
     db.transaction(() => {
@@ -2038,12 +2088,21 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
             existing, received: { payload_checksum, row_count, chunk_count },
           });
         }
-        result = { replayed: true };
+        // staged run: 全 chunk 受信済みなのに未 apply (直前の apply tx が 500 で失敗した後の再送等) なら
+        // ここで apply を再試行する (applyStagedRun は applied マーカーで冪等)
+        let appliedNow = null;
+        if (useStaging) {
+          const received = db.prepare(`SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?`).get(sync_run_id, entity).c;
+          if (received === chunk_count) appliedNow = applyStagedRun();
+        }
+        result = { replayed: true, appliedNow };
         return;
       }
 
       // 4c. scope clear (is_first かつ この run でまだ何も apply 無い時のみ、#1 race 解消版)
       // MF Phase 1a: clear_strategy='no_clear' は scope clear をスキップ (run_id ベース append-only)
+      // H-4: staged run は live clear を apply 時 (全 chunk 到着) まで遅延。ここでは clear_dates の
+      // 持ち越し保存と、放置された旧 run の stage 残骸掃除のみ行う
       let didClear = false;
       let clearedRows = 0;
       if (is_first && clearStrategy === 'date_range') {
@@ -2051,12 +2110,41 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
           SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
         `).get(sync_run_id, entity).c;
         if (priorCount === 0) {
-          const placeholders = clearDates.map(() => '?').join(',');
-          clearedRows = db.prepare(`
-            DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})
-          `).run(...clearDates).changes;
-          didClear = true;
+          if (useStaging) {
+            // 同一 entity の別 run の stage 残骸を掃除 — ただし「最終受信から 24h 超」の放棄確定 run のみ
+            // (無条件削除だと進行中の並行 run の stage を破壊し、正常 run を強制 409 にする — Codex R2 High #2)
+            const abandonCutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+            const staleRuns = db.prepare(`
+              SELECT DISTINCT run_id FROM (
+                SELECT run_id FROM sync_stage_rows WHERE entity = ? AND run_id <> ?
+                UNION SELECT run_id FROM sync_stage_meta WHERE entity = ? AND run_id <> ?
+              ) cand
+              WHERE COALESCE((
+                SELECT MAX(c.received_at) FROM sync_run_chunks c WHERE c.run_id = cand.run_id AND c.entity = ?
+              ), '') < ?
+            `).all(entity, sync_run_id, entity, sync_run_id, entity, abandonCutoff);
+            for (const sr of staleRuns) {
+              db.prepare(`DELETE FROM sync_stage_rows WHERE entity = ? AND run_id = ?`).run(entity, sr.run_id);
+              db.prepare(`DELETE FROM sync_stage_meta WHERE entity = ? AND run_id = ?`).run(entity, sr.run_id);
+            }
+            // applied マーカーの経年掃除 (30日超)
+            const cutoff = new Date(Date.now() - 30 * 86400000).toISOString();
+            db.prepare(`DELETE FROM sync_run_applied WHERE entity = ? AND applied_at < ?`).run(entity, cutoff);
+          } else {
+            const placeholders = clearDates.map(() => '?').join(',');
+            clearedRows = db.prepare(`
+              DELETE FROM ${entityCfg.mirror_table} WHERE date_jst IN (${placeholders})
+            `).run(...clearDates).changes;
+            didClear = true;
+          }
         }
+      }
+      // H-4: clear_dates の持ち越し保存は priorCount に依存させない (chunk 0 が後着する run —
+      // 再送順序の乱れ等 — で meta 未保存のまま恒久 409 になるのを防ぐ — Codex R3 High)。
+      // replay は 4b で短絡済みなので、ここに来る chunk 0 は常に新規受信
+      if (is_first && clearStrategy === 'date_range' && useStaging) {
+        db.prepare(`INSERT OR REPLACE INTO sync_stage_meta (run_id, entity, clear_dates_json, created_at) VALUES (?,?,?,?)`)
+          .run(sync_run_id, entity, JSON.stringify(clearDates), now);
       }
 
       // 4c-mf. MF entity の場合、tx 内で parent.status='pending_sync' を再 check (race 防止)
@@ -2099,17 +2187,38 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         }
       }
 
-      // 4d. row INSERT
-      for (const r of rows) {
-        insertStmt.run(entityCfg.normalizeRow(r));
+      // 4d. row INSERT (staged run は live 表ではなく stage へ。apply は全 chunk 到着時に一括)
+      if (useStaging) {
+        const stageInsert = db.prepare(`INSERT OR REPLACE INTO sync_stage_rows (run_id, entity, chunk_index, row_idx, row_json) VALUES (?,?,?,?,?)`);
+        for (let i = 0; i < rows.length; i++) {
+          stageInsert.run(sync_run_id, entity, chunk_index, i, JSON.stringify(rows[i]));
+        }
+      } else {
+        for (const r of rows) {
+          insertStmt.run(entityCfg.normalizeRow(r));
+        }
       }
 
-      // 4e. ledger insert (mf_source_run_id NULL=非MF entity)
+      // 4e. ledger insert (mf_source_run_id NULL=非MF entity)。
+      // staged chunk は live 未反映なので applied_at=NULL、applyStagedRun が反映確定時に一括 UPDATE する
       insertLedger.run(sync_run_id, entity, chunk_index, chunk_count, row_count,
-                       payload_checksum, contract_version, scope_from, scope_to, now, now,
+                       payload_checksum, contract_version, scope_from, scope_to, now,
+                       useStaging ? null : now,
                        mfSourceRunIdForLedger);
+      if (useStaging) {
+        // staged フラグ (stage coverage 判定の正。0 行 chunk も staged としてカウントされる)
+        db.prepare(`UPDATE sync_run_chunks SET staged = 1 WHERE run_id = ? AND entity = ? AND chunk_index = ?`)
+          .run(sync_run_id, entity, chunk_index);
+      }
 
-      result = { applied: true, didClear, clearedRows };
+      // 4f. staged run: この chunk で全 chunk 揃ったら同一 tx 内で原子的に apply
+      let appliedNow = null;
+      if (useStaging) {
+        const received = db.prepare(`SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?`).get(sync_run_id, entity).c;
+        if (received === chunk_count) appliedNow = applyStagedRun();
+      }
+
+      result = { applied: true, didClear, clearedRows, staged: useStaging, appliedNow };
     }).immediate();  // BEGIN IMMEDIATE で write 直列化 (cross-process 安全)
   } catch (e) {
     if (e instanceof HttpError) {
@@ -2120,11 +2229,15 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   }
 
   if (result.replayed) {
-    console.log(`[Mirror] sync chunk replayed (idempotent) req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}`);
-    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index, replayed: true });
+    const replayApplied = result.appliedNow ? ` staged_apply=${result.appliedNow.appliedRows}rows/cleared=${result.appliedNow.clearedRows}` : '';
+    console.log(`[Mirror] sync chunk replayed (idempotent) req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}${replayApplied}`);
+    return res.json({ ok: true, request_id: requestId, sync_run_id, entity, chunk_index, replayed: true, staged_apply: result.appliedNow || undefined });
   }
 
-  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length} cleared=${result.didClear ? result.clearedRows : 'no'}`);
+  const stagedInfo = result.staged
+    ? (result.appliedNow ? ` staged_apply=${result.appliedNow.appliedRows}rows/cleared=${result.appliedNow.clearedRows}` : ' staged')
+    : ` cleared=${result.didClear ? result.clearedRows : 'no'}`;
+  console.log(`[Mirror] sync chunk applied req=${requestId} entity=${entity} run=${sync_run_id} chunk=${chunk_index}/${chunk_count} rows=${rows.length}${stagedInfo}`);
 
   // ────────── 5. is_last なら欠番チェック ──────────
   if (is_last) {
@@ -2148,6 +2261,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     return res.json({
       ok: true, request_id: requestId, sync_run_id, entity, status: 'completed',
       chunks_received: present.length, expected: chunk_count, rows_received: totalRows,
+      staged_apply: result.appliedNow || undefined,
     });
   }
 

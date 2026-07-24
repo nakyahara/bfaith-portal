@@ -1211,7 +1211,7 @@ console.log('── P15: メール送信 (fake transport) ──');
   // /email/send は expectedMode 必須 (プレビュー時モードの一致検証)。テストでは現在モードを自動注入
   let CUR_MODE = 'dry_run';
   const jsonPost = (p, body, key) => {
-    if (p.includes('/email/send') && body && body.expectedMode === undefined) body = { expectedMode: CUR_MODE, ...body };
+    if (p.includes('/email/send') && body) body = { expectedMode: CUR_MODE, expectedChannel: 'email', ...body };
     return j(p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) }, body: JSON.stringify(body) });
   };
 
@@ -3697,6 +3697,99 @@ console.log('── 商品紐付け: 全商品既定表示+フィルタ維持 �
   ok(adminHtmlA.includes('data-attrview') && adminHtmlA.includes('未紐付け ') && adminHtmlA.includes('FILT_Q') && adminHtmlA.includes('SCROLL_RESTORE'),
     '/admin 商品紐付けUI (チップ+フィルタ維持+スクロール復元)');
   ok(adminHtmlA.includes('applyMasterFilter'), '/admin フィルタはタブ状態と組み合わせて適用');
+}
+
+// ═══ P15b: FAX送信 (eFaxメールゲートウェイ, fake transport + fake PDF) ═══
+console.log('── P15b: FAX送信 (eFaxゲートウェイ) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: 'fax', ...body }) });
+
+  // FAX番号の正規化・ゲートウェイ変換 (eFax公式: 81 + 先頭0を除いた番号 + @efaxsend.com)
+  ok(emailMod.normalizeFaxNumber('06-7632-4190') === '0676324190', 'normalizeFaxNumber: ハイフン除去');
+  ok(emailMod.faxGatewayAddress('0676324190') === '81676324190@efaxsend.com', 'faxGatewayAddress: 81変換 (03-1234-5678→81312345678 と同式)');
+  let threw = null;
+  try { emailMod.normalizeFaxNumber('123-45'); } catch (e) { threw = e.message; }
+  ok(threw && threw.includes('FAX番号が不正'), 'normalizeFaxNumber: 不正番号はthrow', threw);
+
+  // 仕入先マスタ: 発注方法=FAXはFAX番号必須 / 不正番号は保存拒否
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax' });
+  ok(r.status === 400 && r.body.error.includes('FAX番号'), 'suppliers: send_method=faxでFAX番号未入力は拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '123-45' });
+  ok(r.status === 400 && r.body.error.includes('FAX番号が不正'), 'suppliers: 不正FAX番号は保存拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: FAX仕入先の登録OK', r.body.error);
+
+  // FAX仕入先のPOを発行 → preview は channel=fax + ゲートウェイ宛先 + PDF添付名
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 24 }], requestedDate: '2026-07-30' }) });
+  ok(r.body.ok, 'FAX仕入先のPO発行', r.body.error);
+  const faxOrderId = r.body.id;
+  r = await j('/api/orders/' + faxOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'fax' && r.body.faxNumber === '06-7632-4190', 'preview: channel=fax + FAX番号', r.body);
+  ok(r.body.to.length === 1 && r.body.to[0] === '81676324190@efaxsend.com', 'preview: 宛先=eFaxゲートウェイ (81変換)', r.body.to);
+  ok(/\.pdf$/.test(r.body.attachmentName) && r.body.body.startsWith('佐藤様'), 'preview: 添付=.pdf + 送付状に担当者様', r.body.attachmentName);
+
+  // PDFプレビュー配信 (fake PDF)
+  {
+    const pr = await fetch(base + '/api/orders/' + faxOrderId + '/fax/pdf');
+    const buf = Buffer.from(await pr.arrayBuffer());
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf') && buf.subarray(0, 5).toString() === '%PDF-',
+      'GET /orders/:id/fax/pdf → application/pdf', pr.status);
+  }
+
+  // プレビュー時とチャネルが変わっていたら拒否 (expectedMode と同じ発想)
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedChannel: 'email' }, 'fax-key-ch');
+  ok(r.status === 400 && r.body.error.includes('送信方法が変わっています'), 'send: expectedChannel不一致は拒否', r.body.error);
+
+  // dry-run送信: 宛先は社内へ差し替え、ジョブは channel=fax + PDFスナップショット保存
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', {}, 'fax-key-1');
+  ok(r.body.ok && r.body.channel === 'fax' && r.body.status === 'sent' && r.body.dryRun === true, 'FAX dry-run送信 → sent', r.body);
+  const faxJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC").get(faxOrderId);
+  ok(faxJob.channel === 'fax' && faxJob.attachment_pdf && faxJob.attachment_pdf.length > 20, 'ジョブ: channel=fax + attachment_pdf保存');
+  ok(faxJob.to_addr === 'me@b-faith.biz' && faxJob.subject.startsWith('【DRYRUN】') && /\.pdf$/.test(faxJob.attachment_name),
+    'ジョブ: dry-run宛先差し替え + .pdf添付名', faxJob.to_addr);
+  ok(faxJob.body.includes('本来の宛先: FAX 06-7632-4190'), 'ジョブ: dry-run本文に本来のFAX宛先', faxJob.body.slice(0, 80));
+
+  // MIME: application/pdf 添付で組み立てられる (FAKE送信はMIMEを通らないため直接検証)
+  {
+    const mime = emailMod.buildMime(faxJob);
+    ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${faxJob.attachment_name}"`),
+      'buildMime: application/pdf 添付', faxJob.attachment_name);
+    const bad = { ...faxJob, attachment_name: 'PO-1.csv' };
+    let e2 = null; try { emailMod.buildMime(bad); } catch (e) { e2 = e.message; }
+    ok(e2 && e2.includes('.pdf'), 'buildMime: faxジョブの.csv添付名は拒否', e2);
+  }
+
+  // dry-run はdedup対象外 (メールと同じ仕様: 何度でも確認できる)
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', {}, 'fax-key-2');
+  ok(r.body.ok && r.body.status === 'sent', 'FAX dry-runは繰り返し送信可 (dedup対象外)', r.body.error);
+
+  // live: 本送信は dedup が効く (FAKE transportなので実送信なし)
+  await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedMode: 'live' }, 'fax-key-3');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'FAX live送信 → sent (fake)', r.body);
+  const faxLiveJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? AND is_dry_run=0 ORDER BY id DESC").get(faxOrderId);
+  ok(faxLiveJob.to_addr === '81676324190@efaxsend.com' && faxLiveJob.channel === 'fax', 'liveジョブ: 宛先=ゲートウェイ', faxLiveJob.to_addr);
+  r = await jsonPost('/api/orders/' + faxOrderId + '/email/send', { expectedMode: 'live' }, 'fax-key-4');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), 'FAX dedup: 同一内容の本送信は拒否', r.body.error);
+  await jsonPost('/api/email/mode', { mode: 'dry_run' });
+
+  // 送信済みジョブのPDF控え配信
+  {
+    const pr = await fetch(base + '/api/email-jobs/' + faxJob.id + '/pdf');
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf'), 'GET /email-jobs/:id/pdf → PDF控え', pr.status);
+    const nf = await fetch(base + '/api/email-jobs/999999/pdf');
+    ok(nf.status === 400 || nf.status === 404, 'PDF控え: 存在しないジョブは404', nf.status);
+  }
+
+  // /admin にFAX番号欄
+  const adminHtmlF = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlF.includes('fax_number') && adminHtmlF.includes('FAX番号'), '/admin 仕入先にFAX番号欄');
 }
 
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══

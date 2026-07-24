@@ -208,6 +208,63 @@ console.log('=== 8d. 一括型は実行日が変わっても sha256 のみで冪
   check('翌日実行でも duplicate (タイムスタンプを日付と誤認しない)', r2.status === 'duplicate', r2.status);
 }
 
+console.log('=== 8e. 検索KW 表記ゆれ合算 (末尾全角空白) ===');
+{
+  // インセンス と インセンス　(末尾全角空白) は trim 後同一 → 従来 dupGuard が当日分を丸ごと弾いていた
+  const arr = [
+    { keyword: 'インセンス', pv: '3', pvRank: '18', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0.0', orderUnitPrice: '-', orderProductPrice: '-' },
+    { keyword: 'インセンス　', pv: '2', pvRank: '39', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0.0', orderUnitPrice: '-', orderProductPrice: '-' },
+  ];
+  const p = prepareYahooFile('yahoo_keyword_d2026-06-10_x.json', jsonBuf(arr));
+  check('表記ゆれ合算で ok:true', p.ok === true, JSON.stringify(p.error));
+  check('1語に合算', p.records?.length === 1, `got ${p.records?.length}`);
+  check('inflow=5(加算) rank=18(最小)', p.records?.[0].inflow === 5 && p.records?.[0].rank === 18, JSON.stringify(p.records?.[0]));
+}
+
+console.log('=== 8f. 3行合算 + 率再計算 (売上あり) ===');
+{
+  const arr = [
+    { keyword: 'アロマ', pv: '10', pvRank: '5', gmv: '5000', orderCount: '2', orderQuantity: '3', orderRate: '20.0', orderUnitPrice: '2500', orderProductPrice: '1666' },
+    { keyword: 'アロマ ', pv: '6', pvRank: '8', gmv: '3000', orderCount: '1', orderQuantity: '2', orderRate: '16.6', orderUnitPrice: '3000', orderProductPrice: '1500' },
+    { keyword: 'アロマ　', pv: '4', pvRank: '3', gmv: '2000', orderCount: '1', orderQuantity: '1', orderRate: '25.0', orderUnitPrice: '2000', orderProductPrice: '2000' },
+  ];
+  const p = prepareYahooFile('yahoo_keyword_d2026-06-11_x.json', jsonBuf(arr));
+  check('3行→1語合算', p.ok && p.records?.length === 1, JSON.stringify(p.error || p.records?.length));
+  const k = p.records?.[0];
+  // inflow=20 sales=10000 orders=4 units=6 rank=3 / rate=4/20=20.0 aov=10000/4=2500 uaov=10000/6=1667
+  check('合算値+率再計算', k?.inflow === 20 && k?.sales_yen === 10000 && k?.orders === 4 && k?.units === 6 && k?.rank === 3
+    && k?.avg_order_rate_pct === 20 && k?.avg_order_aov_yen === 2500 && k?.avg_units_aov_yen === 1667, JSON.stringify(k));
+}
+
+console.log('=== 8g. マスク値(2未満=null)混入合算 → 汚染メトリクスの率は null ===');
+{
+  const arr = [
+    { keyword: 'マスクKW', pv: '2未満', pvRank: '10', gmv: '1000', orderCount: '1', orderQuantity: '1', orderRate: '', orderUnitPrice: '1000', orderProductPrice: '1000' },
+    { keyword: 'マスクKW　', pv: '10', pvRank: '5', gmv: '2000', orderCount: '1', orderQuantity: '1', orderRate: '10.0', orderUnitPrice: '2000', orderProductPrice: '2000' },
+  ];
+  const p = prepareYahooFile('yahoo_keyword_d2026-06-12_x.json', jsonBuf(arr));
+  check('合算 ok', p.ok && p.records?.length === 1, JSON.stringify(p.error));
+  const k = p.records?.[0];
+  // inflow=null+10=10(下限), orders=1+1=2, sales=3000。inflow汚染→rate=null。sales/ordersはクリーン→aov=3000/2=1500
+  check('inflow下限=10 orders=2', k?.inflow === 10 && k?.orders === 2, JSON.stringify(k));
+  check('inflow汚染で rate=null', k?.avg_order_rate_pct === null, JSON.stringify(k));
+  check('クリーンな aov は算出', k?.avg_order_aov_yen === 1500, JSON.stringify(k));
+}
+
+console.log('=== 8h. 200字切詰の別KW衝突はファイル全体を拒否 (stale row/静かな破損を防ぐ) ===');
+{
+  const long1 = 'あ'.repeat(200) + 'X';
+  const long2 = 'あ'.repeat(200) + 'Y';  // 先頭200字一致・201字目のみ差の別KW (切詰後は衝突)
+  const arr = [
+    { keyword: long1, pv: '5', pvRank: '1', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0', orderUnitPrice: '-', orderProductPrice: '-' },
+    { keyword: long2, pv: '3', pvRank: '2', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0', orderUnitPrice: '-', orderProductPrice: '-' },
+    { keyword: '正常KW', pv: '7', pvRank: '3', gmv: '0', orderCount: '0', orderQuantity: '0', orderRate: '0', orderUnitPrice: '-', orderProductPrice: '-' },
+  ];
+  const p = prepareYahooFile('yahoo_keyword_d2026-06-13_x.json', jsonBuf(arr));
+  // 部分除外は UPSERT 再取込で DB に stale row を残すため、全体拒否で人が気づける形にする
+  check('切詰衝突はファイル全体を ok:false で拒否', p.ok === false && /切詰|重複/.test(p.error || ''), JSON.stringify(p.error));
+}
+
 console.log('=== 9. 取込ログ ===');
 {
   const logs = db.prepare(`SELECT status, COUNT(*) n FROM raw_yahoo_data_import_log GROUP BY status`).all();

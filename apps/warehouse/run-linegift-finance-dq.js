@@ -17,7 +17,7 @@
  *   5. unmatched_sku_rate_pct                 (warn 0.5% / error 1%、Codex #6) — 100% master_match のはず
  *   6. fallback_to_item_code_rate_pct         (warn: 1件以上、Codex #6) — variation.code 欠損 → item.code fallback (parent_match) 件数
  *   7. whitelist_coverage_pct                 (warn 90% / error 80%、当月 70%) — received 比率 (91% 想定)
- *   8. resolved_but_zero_cost_count           (error: 1 件以上) — ne_code 解決済なのに cogs=0/unit_cost NULL
+ *   8. resolved_but_zero_cost_count           (error: 1 件以上) — ne_code 解決済なのに cogs=0/unit_cost NULL。原価状態=OVERRIDDEN の意図的 0 円は除外
  *   9. fee_rate_drift_pct                     (warn 0.5% / error 1%、LINEギフト特有) — SUM(mall_fee)/SUM(sales_principal) が 12.97% 中央値からドリフト
  *  10. provisional_state_age_days             (warn: 7日以上、LINEギフト特有、Codex #1) — gift_message_send/payment のまま 7日以上動いてない注文数 (status flip 失敗検知)
  *  11. horizon_frozen_observed_count          (info、LINEギフト特有、Codex R5 critical 反映で意味変更) — monthStr 月に final observation (last_seen_at) を持つ frozen 行数 = 凍結に向かう正常な observation 監視指標
@@ -196,10 +196,13 @@ recordResult('whitelist_coverage_pct',
   wlPct, THRESHOLDS.whitelist_coverage_pct.warn, { total_lines: cov.total, whitelist_lines: cov.wl });
 
 // Check 8: resolved_but_zero_cost_count
-const zc = db.prepare("SELECT COUNT(*) AS cnt FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7)=? AND ne_code IS NOT NULL AND units_net_sold > 0 AND (cogs_amount_jpy_incl = 0 OR unit_cost_snapshot_incl IS NULL)").get(monthStr);
+// 原価状態='OVERRIDDEN' AND 原価=0 は人手の意図的 0 円上書き → snapshot=0 (lookup 成功で 0 円) の行のみ除外。
+// snapshot NULL (lookup 失敗) / snapshot>0 で cogs=0 (計算異常) は error のまま。判定は実行時点の m_products (as-of ではない)
+const zc = db.prepare("SELECT COUNT(*) AS cnt, SUM(CASE WHEN f.unit_cost_snapshot_incl = 0 AND EXISTS (SELECT 1 FROM m_products mp WHERE LOWER(TRIM(mp.商品コード)) = LOWER(TRIM(f.ne_code)) AND mp.原価状態 = 'OVERRIDDEN' AND mp.原価 = 0) THEN 1 ELSE 0 END) AS intentional_zero FROM f_linegift_finance_sku_daily_v1 f WHERE substr(f.date_jst,1,7)=? AND f.ne_code IS NOT NULL AND f.units_net_sold > 0 AND (f.cogs_amount_jpy_incl = 0 OR f.unit_cost_snapshot_incl IS NULL)").get(monthStr);
+const zcCnt = zc.cnt - (zc.intentional_zero || 0);
 recordResult('resolved_but_zero_cost_count',
-  zc.cnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : zc.cnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info',
-  zc.cnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zc.cnt });
+  zcCnt >= THRESHOLDS.resolved_but_zero_cost_count.error ? 'error' : zcCnt >= THRESHOLDS.resolved_but_zero_cost_count.warn ? 'warn' : 'info',
+  zcCnt, THRESHOLDS.resolved_but_zero_cost_count.error, { count: zcCnt, intentional_zero_cost_exempted: zc.intentional_zero || 0 });
 
 // Check 9: fee_rate_drift_pct (LINEギフト特有、12.95% 中央値からのドリフト)
 const fr = db.prepare("SELECT SUM(mall_fee_jpy_incl) AS fee, SUM(sales_principal_jpy_incl) AS sales FROM f_linegift_finance_sku_daily_v1 WHERE substr(date_jst,1,7) = ?").get(monthStr);

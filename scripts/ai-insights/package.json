@@ -1,0 +1,6 @@
+{
+  "name": "ai-insights-runner",
+  "private": true,
+  "type": "module",
+  "description": "AI経営レポート PC runner (依存パッケージなし。Node 20+ 組み込みのみ)"
+}

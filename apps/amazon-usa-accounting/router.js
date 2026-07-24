@@ -614,6 +614,12 @@ function renderPage() {
       </div>
 
       <div class="card">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: アメリカAmazon売上）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。</p>
+        <div id="mfJournalTable"></div>
+      </div>
+
+      <div class="card">
         <h2>管理会計用 セグメント4(輸出) — 円建</h2>
         <div class="rate-box" style="margin-bottom:8px">
           <label><b>広告費 (税込・円):</b></label>
@@ -762,6 +768,9 @@ function renderPage() {
       jpyHtml += '</tr></table>';
       document.getElementById('jpyTable').innerHTML = jpyHtml;
 
+      // MF振替伝票入力用 仕訳
+      document.getElementById('mfJournalTable').innerHTML = mfJournalTableHtml(buildMfJournalRows(data.jpy));
+
       // 管理会計用テーブル
       renderMgmtTable();
 
@@ -785,6 +794,67 @@ function renderPage() {
       } else {
         document.getElementById('zeroGenkaCard').style.display = 'none';
       }
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる（金額はJPY換算集計の各列を四捨五入）。
+    // 対応関係（会計処理の実務ルール・MF仕訳辞書「アメリカAmazon売上」）:
+    //   貸方 売上高_輸出/輸売0% = product sales + product sales tax + shipping credits(+tax) + gift wrap credits(+tax)
+    //   借方 支払手数料【原価】/課仕10% = −(Regulatory Fee(+tax) + promotional rebates(+tax) + marketplace withheld tax + selling fees)
+    //   借方 発送運賃【原価】(補助:AmazonUS_FBA手数料)/課仕10% = −fba fees
+    //   借方 広告宣伝費【原価】/課仕10% = −(other transaction fees + other)
+    //   借方 売掛金_EC売上/対象外 = 売上 − 各費用の差引（丸め誤差を吸収。total×レートとほぼ一致）
+    function buildMfJournalRows(jpy) {
+      const v = k => jpy[k] || 0;
+      const sales = Math.round(v('product sales') + v('product sales tax')
+        + v('shipping credits') + v('shipping credits tax')
+        + v('gift wrap credits') + v('giftwrap credits tax'));
+      const pfFee = Math.round(-(v('Regulatory Fee') + v('Tax On Regulatory Fee')
+        + v('promotional rebates') + v('promotional rebates tax')
+        + v('marketplace withheld tax') + v('selling fees')));
+      const shipping = Math.round(-v('fba fees'));
+      const ad = Math.round(-(v('other transaction fees') + v('other')));
+      const receivable = sales - pfFee - shipping - ad;
+      return [
+        { dc: 'credit', account: '売上高_輸出', sub: 'AmazonUS', tax: '輸売0%', amount: sales, memo: 'Amazon売上' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: 'AmazonUS', tax: '課仕10%', amount: pfFee, memo: 'Amazon PF手数料' },
+        { dc: 'debit', account: '発送運賃【原価】', sub: 'AmazonUS_FBA手数料', tax: '課仕10%', amount: shipping, memo: 'Amazon 運賃' },
+        { dc: 'debit', account: '広告宣伝費【原価】', sub: 'AmazonUS', tax: '課仕10%', amount: ad, memo: 'Amazon 広告宣伝費' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: 'AmazonUS', tax: '対象外', amount: receivable, memo: 'Amazon 差し引き入金額' },
+      ];
+    }
+
+    function mfJournalTableHtml(rows) {
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）※売掛金_EC売上は差引で自動算出（丸め誤差を吸収）のため、計算上必ず一致します。売上・費用の各金額がJPY換算集計と合っているかを確認してください</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 集計ロジックを確認してください</div>';
+
+      if (rows.some(r => Math.round(r.amount) < 0)) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ マイナス金額の行があります。MFに入力する際は、その行だけ借方/貸方を入れ替えて絶対値で入力してください。</div>';
+      }
+
+      return html;
     }
 
     function renderMgmtTable() {
@@ -877,6 +947,14 @@ function renderPage() {
           html += '<th>広告費</th></tr><tr><td>4: 輸出</td>';
           mgmtCols.forEach(c => html += '<td class="num">¥' + fmt(mg[c] || 0) + '</td>');
           html += '<td class="num">¥' + fmt(ad) + '</td></tr></table>';
+
+          // MF振替伝票入力用 仕訳（JPY換算集計が保存されている月のみ。ヒストリカル投入分はjpy_row空のため非表示）
+          const hjpy = row.jpy_row || {};
+          if (Object.keys(hjpy).length > 0) {
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+            html += mfJournalTableHtml(buildMfJournalRows(hjpy));
+          }
+
           html += '</div>';
         }
         document.getElementById('historyList').innerHTML = html;
