@@ -21,7 +21,10 @@
  * - レート制限 1リクエスト/秒 → 1.1秒間隔
  */
 
+import { SendRejectedError } from '../../outbox.js';
+
 const DAY_MS = 86400000;
+const SEND_BODY_MAX = 2000; // externalTalkAdd の本文上限 (公式仕様)
 
 export const DEFAULT_LIST_LOOKBACK_DAYS = 14;  // 通常同期の一覧スキャン幅 (店舗側更新の取りこぼし対策)
 export const DEEP_LIST_LOOKBACK_DAYS = 365;    // 深掘り同期 (日次) のスキャン幅
@@ -109,6 +112,7 @@ export function createYahooAdapter(cfg = {}) {
   const sleepMs = cfg.sleepMs ?? 1100;
   const maxPages = cfg.maxPages ?? DEFAULT_MAX_PAGES;
   const requestTimeoutMs = cfg.requestTimeoutMs ?? 45000;
+  const sendMode = cfg.sendMode ?? 'dryrun';
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   let requests = 0;
 
@@ -151,6 +155,69 @@ export function createYahooAdapter(cfg = {}) {
 
   return {
     channelType: 'yahoo',
+    isLive: sendMode === 'live',
+
+    /**
+     * 返信送信 (outbox.js §8.3 契約)。VPSプロキシの /yahoo/externalTalkAdd passthrough を叩く
+     * (Bearer+公開鍵署名はVPS側付与、プロキシ側もリトライしない=二重投稿防止)。
+     * 未送信確定 (topicId不正/本文空・2000字超/4xx) のみ SendRejectedError、
+     * 5xx/timeout/network は汎用エラー → unknown (自動再送しない)。
+     * 成功時は externalReplyId='m:<messageid>' — 受信同期のメッセージID体系と揃えて
+     * 後続の同期で同じメッセージが来ても二重表示にならない。
+     * 引数 dryRun: true はアダプター設定に関係なく実送信を禁止 (プレビュー経路用)
+     */
+    async sendReply({ inquiry, bodyText, dryRun = false }) {
+      const topicId = String(inquiry?.external_inquiry_id || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(topicId)) {
+        throw new SendRejectedError(`Yahoo!トピックIDが不正です (external_inquiry_id='${topicId}')`);
+      }
+      const message = String(bodyText || '');
+      if (!message.trim()) throw new SendRejectedError('本文が空です');
+      if (message.length > SEND_BODY_MAX) {
+        throw new SendRejectedError(`本文が長すぎます (Yahoo!の上限${SEND_BODY_MAX}文字。現在${message.length}文字 — 短くしてください)`);
+      }
+
+      if (dryRun || sendMode !== 'live') {
+        console.log(`[yahoo-send DRYRUN] topic=${topicId.slice(0, 12)}… bytes=${message.length} (実送信していません)`);
+        return { dryRun: true, externalReplyId: `dryrun:${topicId}` };
+      }
+
+      let res;
+      try {
+        res = await fetchImpl(`${base}/yahoo/externalTalkAdd`, {
+          method: 'POST',
+          headers: { 'X-Proxy-Secret': proxySecret, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ topicId, message }),
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      } catch (err) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        throw new Error(timedOut
+          ? `Yahoo!返信送信タイムアウト (${requestTimeoutMs}ms) — 結果不明`
+          : `Yahoo!返信送信の接続失敗: ${err?.message || err}`);
+      }
+      const text = await res.text().catch(() => '');
+      if (res.status >= 400 && res.status < 500) {
+        // 4xx = 受理されなかった (未送信確定)。エラーコードのみ抽出 (本文露出防止)
+        const code = (text.match(/<Code>([^<]{1,40})<\/Code>/) || [])[1];
+        let reason;
+        try { reason = JSON.parse(text)?.error?.reason ?? JSON.parse(text)?.error; } catch { /* XML等 */ }
+        throw new SendRejectedError(`Yahoo!返信が拒否されました (HTTP ${res.status})${code ? ` code=${code}` : ''}${reason ? ` reason=${String(reason).slice(0, 120)}` : ''}`);
+      }
+      if (res.status >= 500) throw new Error(`Yahoo!返信送信 HTTP ${res.status} — 結果不明`);
+      // 2xx でも messageid が取れなければ「結果不明」扱い (unknown→人手照合)。
+      // externalReplyId 無しで sent 確定させると outbox が op:<操作ID> で記録し、次回同期の
+      // m:<messageid> と二重表示になる (Codexレビュー反映)。投稿された可能性は残るため
+      // SendRejectedError にはしない
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* 下でエラー化 */ }
+      const messageId = data?.messageid ?? data?.messageId;
+      if (messageId == null || messageId === '') {
+        throw new Error(`Yahoo!返信送信はHTTP ${res.status}だが messageid を取得できず — 結果不明 (投稿済みの可能性あり。Yahoo!管理画面で確認して解決してください)`);
+      }
+      console.log(`[yahoo-send] 送信完了 topic=${topicId.slice(0, 12)}… messageid=${messageId}`);
+      return { externalReplyId: `m:${messageId}` };
+    },
 
     /**
      * 認証状態の取得 (任意メソッド。cron/手動同期が shops.auth_expires_at の自動更新に使う)。
