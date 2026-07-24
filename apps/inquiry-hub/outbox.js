@@ -176,6 +176,14 @@ export async function runOutboxPass(adapters, opts = {}) {
       const sent = await adapter.sendReply({
         inquiry: inq, shop, bodyText: job.body_text, attachmentsJson: job.attachments_json,
       });
+      // DRYRUNアダプターの結果はジョブを消費しない (sent確定させると未送信メールが送信済み扱いに
+      // なり顧客返信が欠落する。Codexレビュー反映)。pending に戻して pass を終了 (同一passでの再claim防止)
+      if (sent?.dryRun) {
+        const done = finishTx({ status: 'pending', lease_token: null, lease_until: null,
+          error_message: 'DRYRUN検証のみ実施 (未送信。INQUIRY_HUB_MAIL_SEND_MODE=live で実送信されます)' });
+        results.push({ id: job.id, outcome: done ? 'dryrun' : 'lease_lost' });
+        break;
+      }
       const extReplyId = sent?.externalReplyId || `op:${job.client_operation_id}`;
       const sentIso = toUtcIso(tick()); // 完了時刻は送信後に取り直す (長い送信でもsent_atを正確に)
       const tx = db.transaction(() => {

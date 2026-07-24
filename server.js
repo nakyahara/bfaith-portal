@@ -22,7 +22,7 @@ import { startPriceWorker, startMaintenanceJobs } from './apps/profit-calculator
 import { startNotificationJob as startInventoryNotificationJob } from './apps/profit-analysis/notify-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
-import { startInquiryHubSyncCron } from './apps/inquiry-hub/sync/cron.js';
+import { startInquiryHubSyncCron, startInquiryHubOutboxCron } from './apps/inquiry-hub/sync/cron.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
 import warehouseRouter from './apps/warehouse/router.js';
@@ -1350,6 +1350,10 @@ app.listen(PORT, () => {
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
+
+  // inquiry-hub 送信ワーカー (outbox 30秒。INQUIRY_HUB_OUTBOX_CRON_ENABLED=true で起動、
+  // メール実送信はさらに INQUIRY_HUB_MAIL_SEND_MODE=live が必要。既定=dryrun)
+  startInquiryHubOutboxCron();
 });
 
 process.on('SIGTERM', () => {

@@ -23,6 +23,7 @@
  * 送受信の区別: From のドメインが b-faith.biz → shop (自社)、それ以外 → customer
  */
 import { evaluateMailRules } from '../../mail-rules.js';
+import { SendRejectedError } from '../../outbox.js';
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
@@ -175,6 +176,10 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
  *   maxListPages?: 一覧ページ上限 (既定200)
  *   concurrency?: スレッド取得の並列数 (既定5。quota 250units/s に対し余裕圏内)
  *   ruleEvaluator?: メールルール評価の差し替え (テスト用)
+ *   sendMode?: 'dryrun' (既定) | 'live' — 返信送信 (sendReply)。dryrunは組み立てとログのみで実送信しない
+ *   fromAddress?: 送信Fromアドレス (既定 info@b-faith.biz。d.nakahara側でinfo@のsend-asエイリアスが
+ *                 未設定だとGmailが認証ユーザーのアドレスに置き換える → live初回で実Fromを確認すること)
+ *   fromName?: Fromの表示名 (既定 '雑貨イズム（B-Faith株式会社）' — メールディーラーのFrom表示名と同一)
  */
 export function createGmailAdapter(cfg = {}) {
   const { clientId, clientSecret, refreshToken } = cfg;
@@ -187,6 +192,9 @@ export function createGmailAdapter(cfg = {}) {
   const maxListPages = cfg.maxListPages ?? DEFAULT_MAX_LIST_PAGES;
   const concurrency = cfg.concurrency ?? 5;
   const ruleEvaluator = cfg.ruleEvaluator ?? evaluateMailRules;
+  const sendMode = cfg.sendMode ?? 'dryrun';
+  const fromAddress = cfg.fromAddress ?? 'info@b-faith.biz';
+  const fromName = cfg.fromName ?? '雑貨イズム（B-Faith株式会社）';
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   let tokenCache = { token: null, exp: 0 };
@@ -257,8 +265,106 @@ export function createGmailAdapter(cfg = {}) {
     return j;
   }
 
+  // ─── 送信 (outbox.js の sendReply 契約) ───
+
+  /** 非ASCIIヘッダの RFC2047 (UTF-8/Base64) エンコード */
+  const mimeWord = s => /^[\x20-\x7e]*$/.test(s) ? s
+    : s.match(/.{1,20}/gs).map(w => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n ');
+  /** ヘッダ値のCR/LF/NUL拒否 (ヘッダインジェクション対策) */
+  const headerSafe = (name, v) => {
+    if (/[\r\n\0]/.test(String(v || ''))) throw new SendRejectedError(`${name} に改行を含めることはできません`);
+    return String(v || '');
+  };
+
+  async function apiPost(pathAndQuery, body, label) {
+    await throttle();
+    requests++;
+    const token = await accessToken();
+    let res;
+    try {
+      res = await fetchImpl(`${GMAIL_BASE}/${pathAndQuery}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(requestTimeoutMs),
+      });
+    } catch (err) {
+      // 送信要求を発した後の失敗 = 結果不明 → 汎用エラー (outboxがunknown化。自動再送しない)
+      const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+      throw new Error(timedOut ? `Gmail送信タイムアウト (${requestTimeoutMs}ms, ${label}) — 結果不明` : `Gmail送信の接続失敗 (${label}): ${err?.message || err}`);
+    }
+    const j = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = `Gmail API HTTP ${res.status} (${label}): ${j?.error?.message || '不明'}`;
+      // 4xx = リクエストが受理されなかった (未送信確定) → SendRejectedError。5xx = 結果不明
+      if (res.status >= 400 && res.status < 500) throw new SendRejectedError(msg);
+      throw new Error(msg);
+    }
+    return j;
+  }
+
   return {
     channelType: 'email',
+
+    /**
+     * 返信送信 (outbox.js §8.3 契約)。未送信確定の失敗のみ SendRejectedError を throw。
+     * 送信要求後の失敗は汎用エラー (→ unknown、自動再送しない)。
+     * スレッド返信: Gmailスレッドの最後のメッセージから Message-ID を取り、In-Reply-To/References を付ける。
+     * 引数 dryRun: true はアダプターのモード設定に関係なく実送信を禁止する
+     * (プレビュー経路がliveアダプターを受け取っても安全なように、呼び出し単位で強制。Codexレビュー反映)
+     */
+    async sendReply({ inquiry, bodyText, dryRun = false }) {
+      requests = 0;
+      const to = String(inquiry?.customer_identifier || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+        throw new SendRejectedError(`宛先メールアドレスを特定できません (customer_identifier='${inquiry?.customer_identifier || ''}')`);
+      }
+      headerSafe('宛先', to);
+      const threadId = String(inquiry?.external_inquiry_id || '');
+      if (!threadId) throw new SendRejectedError('Gmailスレッド外部IDがありません');
+      const subjectBase = headerSafe('件名', String(inquiry?.subject || 'お問い合わせについて').trim() || 'お問い合わせについて');
+      const subject = /^re:/i.test(subjectBase) ? subjectBase : `Re: ${subjectBase}`;
+
+      // スレッド返信ヘッダの材料 (この時点の失敗 = 未送信確定)
+      let inReplyTo = '', references = '';
+      try {
+        const t = await apiGet(`threads/${encodeURIComponent(threadId)}?format=metadata&metadataHeaders=Message-ID&metadataHeaders=References`, 'send-thread-meta');
+        const last = (t.messages || [])[t.messages.length - 1];
+        const msgId = headerOf(last?.payload, 'Message-ID');
+        const prevRefs = headerOf(last?.payload, 'References');
+        if (msgId) {
+          inReplyTo = headerSafe('In-Reply-To', msgId);
+          references = headerSafe('References', prevRefs ? `${prevRefs} ${msgId}`.slice(-2000) : msgId);
+        }
+      } catch (e) {
+        throw new SendRejectedError(`返信ヘッダの取得に失敗 (未送信): ${String(e?.message || e).slice(0, 200)}`);
+      }
+
+      const headers = [
+        `From: ${mimeWord(fromName)} <${headerSafe('From', fromAddress)}>`,
+        `To: ${to}`,
+        `Subject: ${mimeWord(subject)}`,
+        inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
+        references ? `References: ${references}` : null,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset="UTF-8"',
+        'Content-Transfer-Encoding: base64',
+      ].filter(Boolean);
+      const mime = headers.join('\r\n') + '\r\n\r\n' +
+        Buffer.from(String(bodyText || ''), 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
+      const raw = Buffer.from(mime).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+      if (dryRun || sendMode !== 'live') {
+        // dryRun: true を返す = outbox はジョブを消費しない (sent確定させると未送信メールが
+        // 送信済み扱いになり顧客返信が欠落する。Codexレビュー反映)。実送信は一切しない
+        console.log(`[gmail-send DRYRUN] To=${to} Subject=${subject.slice(0, 40)} thread=${threadId.slice(0, 12)}… bytes=${mime.length} (実送信していません)`);
+        return { dryRun: true, externalReplyId: `dryrun:${threadId}` };
+      }
+      const sent = await apiPost('messages/send', { raw, threadId }, 'send');
+      if (!sent?.id) throw new Error('Gmail送信レスポンスに id がありません — 結果不明');
+      console.log(`[gmail-send] 送信完了 To=${to} messageId=${sent.id}`);
+      return { externalReplyId: sent.id };
+    },
 
     /** 認証状態 (運用管理画面用)。refresh token は再認可レス無期限運用のため期限は返さない */
     async getAuthStatus() {

@@ -251,6 +251,101 @@ console.log('4. エンジン結合');
     db.prepare('SELECT sent_at FROM inquiry_messages LIMIT 1').get().sent_at));
 }
 
+// ─── 5. 送信 (sendReply + outbox worker) ───
+console.log('5. 送信');
+{
+  const { createReplyJob, runOutboxPass, SendRejectedError } = await import('./outbox.js');
+  const { runInquiryHubOutboxTick, startInquiryHubOutboxCron } = await import('./sync/cron.js');
+  const CRED = { clientId: 'c', clientSecret: 's', refreshToken: 'r', sleepMs: 0, ruleEvaluator: () => null };
+  const threadMeta = { id: 'g1', messages: [{ id: 'a1', payload: { headers: [{ name: 'Message-ID', value: '<orig-123@mail.gmail.com>' }] } }] };
+
+  // 5a. sendReply 単体 (live): スレッド返信ヘッダ+raw組み立て+send呼び出し
+  let sendBody = null;
+  const fSend = mockFetch((url, n) => {
+    if (url.includes('/threads/')) return { body: threadMeta };
+    return { body: { id: 'sent-001', threadId: 'g1' } };
+  });
+  const origFetch = fSend;
+  const fSendCapture = async (url, opts) => {
+    if (url.includes('messages/send')) sendBody = JSON.parse(opts.body);
+    return origFetch(url, opts);
+  };
+  fSendCapture.calls = fSend.calls;
+  const adLive = createGmailAdapter({ ...CRED, fetchImpl: fSendCapture, sendMode: 'live' });
+  const sent = await adLive.sendReply({
+    inquiry: { external_inquiry_id: 'g1', customer_identifier: 'Customer@Gmail.com', subject: '在庫はありますか' },
+    bodyText: 'ございます。\nよろしくお願いします',
+  });
+  check('live送信: externalReplyId=Gmail messageId', sent.externalReplyId === 'sent-001');
+  check('send payload に threadId (スレッド維持)', sendBody?.threadId === 'g1');
+  const mime = Buffer.from(sendBody.raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+  check('To=顧客 (小文字化)', mime.includes('To: customer@gmail.com'));
+  check('Subject=Re:付き (RFC2047)', /Subject: =\?UTF-8\?B\?/.test(mime));
+  check('In-Reply-To/References=元Message-ID', mime.includes('In-Reply-To: <orig-123@mail.gmail.com>') && mime.includes('References: <orig-123@mail.gmail.com>'));
+  check('From=info@b-faith.biz', mime.includes('<info@b-faith.biz>'));
+  check('本文base64が復元できる', Buffer.from(mime.split('\r\n\r\n')[1].replace(/\r\n/g, ''), 'base64').toString('utf8') === 'ございます。\nよろしくお願いします');
+
+  // 5b. dryrun: send APIを呼ばない
+  const fDry = mockFetch((url) => url.includes('/threads/') ? { body: threadMeta } : { body: {} });
+  const adDry = createGmailAdapter({ ...CRED, fetchImpl: fDry, sendMode: 'dryrun' });
+  const dry = await adDry.sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: 'c@x.com', subject: 'a' }, bodyText: 'x' });
+  check('dryrun: 実送信せず dryRun:true', dry.dryRun === true && dry.externalReplyId.startsWith('dryrun:') && !fDry.calls.some(c => c.url.includes('messages/send')));
+
+  // 5c. 拒否系 = SendRejectedError (未送信確定)
+  let eNoTo = null;
+  try { await adDry.sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: '', subject: 'a' }, bodyText: 'x' }); } catch (e) { eNoTo = e; }
+  check('宛先不明は SendRejectedError', eNoTo instanceof SendRejectedError);
+  let eInj = null;
+  try { await adDry.sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: 'c@x.com', subject: 'a\r\nBcc: evil@x.com' }, bodyText: 'x' }); } catch (e) { eInj = e; }
+  check('件名の改行 (ヘッダインジェクション) は SendRejectedError', eInj instanceof SendRejectedError);
+  const f400 = mockFetch((url) => url.includes('/threads/') ? { body: threadMeta } : { status: 400, body: { error: { message: 'Invalid' } } });
+  let e400 = null;
+  try { await createGmailAdapter({ ...CRED, fetchImpl: f400, sendMode: 'live' }).sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: 'c@x.com', subject: 'a' }, bodyText: 'x' }); } catch (e) { e400 = e; }
+  check('send 4xx は SendRejectedError (未送信確定)', e400 instanceof SendRejectedError);
+  const f500 = mockFetch((url) => url.includes('/threads/') ? { body: threadMeta } : { status: 500, body: { error: { message: 'boom' } } });
+  let e500 = null;
+  try { await createGmailAdapter({ ...CRED, fetchImpl: f500, sendMode: 'live' }).sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: 'c@x.com', subject: 'a' }, bodyText: 'x' }); } catch (e) { e500 = e; }
+  check('send 5xx は汎用エラー (→unknown)', e500 !== null && !(e500 instanceof SendRejectedError));
+
+  // 5d-1. DRYRUNではジョブを一切消費しない (tick=プレビューのみ / runOutboxPass直呼びでもpendingへ戻す)
+  const mailShop = db.prepare("SELECT id FROM shops WHERE channel_type = 'email'").get().id;
+  const inqRow = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'g1'").get(mailShop);
+  const job = createReplyJob({ inquiryId: inqRow.id, channelType: 'email', bodyText: '返信テストです', createdBy: 'tester', clientOperationId: 'op-send-1', baseConversationRev: inqRow.conversation_rev });
+  delete process.env.INQUIRY_HUB_MAIL_SEND_MODE; // 既定=dryrun
+  const preview = await runInquiryHubOutboxTick({ adapters: { email: adDry } });
+  check('dryrun tick: claimせずプレビューのみ', preview.mode === 'dryrun' && preview.previewed >= 1, JSON.stringify(preview));
+  check('dryrun tick: ジョブはpendingのまま (消費しない)', db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(job.id).status === 'pending');
+  // 安全境界: liveアダプターを渡してもプレビュー経路 (dryRun:true強制) からは実送信されない (Codex R2 high)。
+  // ⚠️ 既プレビュー済みジョブはスキップされテストが空振りするため、未プレビューの新規ジョブを
+  //    「liveアダプターで初めてプレビューさせる」形で検証する (Codex R3 high)
+  const inqG3 = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'g3'").get(mailShop);
+  const job2 = createReplyJob({ inquiryId: inqG3.id, channelType: 'email', bodyText: '2通目テスト', createdBy: 'tester', clientOperationId: 'op-send-2', baseConversationRev: inqG3.conversation_rev });
+  const sendCallsBefore = fSendCapture.calls.filter(c => c.url.includes('messages/send')).length;
+  const previewLive = await runInquiryHubOutboxTick({ adapters: { email: adLive } }); // env未設定=dryrunモード+liveアダプター
+  check('liveアダプター×dryrun tick: 新規ジョブがプレビューされる', previewLive.mode === 'dryrun' && previewLive.previewed >= 1, JSON.stringify(previewLive));
+  check('liveアダプター×dryrun tickでも実送信されない (呼び出し単位dryRun強制)',
+    fSendCapture.calls.filter(c => c.url.includes('messages/send')).length === sendCallsBefore
+    && db.prepare('SELECT status FROM outbox_replies WHERE id = ?').get(job2.id).status === 'pending');
+  db.prepare("UPDATE outbox_replies SET status = 'cancelled' WHERE id = ?").run(job2.id); // 5d-2のlive処理対象を job のみに戻す
+  // 防御層: runOutboxPass に dryrun アダプターが渡っても sent 確定しない
+  const passDry = await runOutboxPass({ email: adDry }, { executor: 'server' });
+  check('runOutboxPass防御: dryRun結果は pending に戻す', passDry.results.some(r => r.id === job.id && r.outcome === 'dryrun')
+    && db.prepare('SELECT status, error_message FROM outbox_replies WHERE id = ?').get(job.id).status === 'pending');
+
+  // 5d-2. live: pending → sent + 会話記録 + waiting_reply
+  const pass = await runInquiryHubOutboxTick({ adapters: { email: adLive }, sendMode: 'live' });
+  check('outbox tick (live): sent', pass.results?.some(r => r.id === job.id && r.outcome === 'sent'), JSON.stringify(pass));
+  const jobRow = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(job.id);
+  check('external_reply_id=sent-001+sent_at刻印', jobRow.status === 'sent' && jobRow.external_reply_id === 'sent-001' && !!jobRow.sent_at);
+  const inqAfter = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inqRow.id);
+  check('会話に送信メッセージ追加+rev++/waiting_reply', inqAfter.conversation_rev === inqRow.conversation_rev + 1 && inqAfter.internal_status === 'waiting_reply'
+    && !!db.prepare("SELECT 1 FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = 'sent-001'").get(inqRow.id));
+
+  // 5e. cron dark launch
+  delete process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED;
+  check('outbox cron: flag未設定は起動しない', startInquiryHubOutboxCron() === null);
+}
+
 check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
