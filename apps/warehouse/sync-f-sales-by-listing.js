@@ -229,7 +229,9 @@ import('node:os').then(async (os) => {
     `).run(chunksApplied, totalRowsSent, new Date().toISOString(), new Date().toISOString(), runId);
     console.log(`\n✓ sync complete (run_id=${runId}, ${totalRowsSent} rows in ${chunksApplied} chunks)`);
     finishDb.close();
-    process.exit(0);
+    // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
+    // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
+    process.exitCode = 0;
   }
 }).catch(e => {
   console.error(`FATAL: ${e.message}`);

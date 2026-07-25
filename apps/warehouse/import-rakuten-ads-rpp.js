@@ -101,71 +101,77 @@ db.pragma('busy_timeout = 5000');
 ensureRppTables(db);
 if (!isDryRun) await warnIfFetchStale(db); // 取込0件の朝こそ鮮度を検分する
 
+// ⚠️ 直前の warnIfFetchStale() は GChat通知 (fetch/undici) を打つことがある。その直後の
+//   process.exit() は Windows node で libuv assertion (UV_HANDLE_CLOSING / abort) を踏み、
+//   取込が成功していても daily-sync に失敗と見なされる (#614 楽天レビュー取込と同じ地雷)。
+//   → exitCode + 自然終了にする
 if (entries.length === 0) {
   console.log('取込対象なし (正常終了)');
   db.close();
-  process.exit(0);
-}
-
-let okCount = 0, dupCount = 0, failCount = 0;
-try {
-  for (const name of entries) {
-    const srcPath = path.join(incomingDir, name);
-    let buffer;
-    try {
-      buffer = fs.readFileSync(srcPath);
-    } catch (e) {
-      console.error(`✗ ${name}: 読込失敗 (${e.message})`);
-      failCount++;
-      continue;
-    }
-    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-
-    if (isDryRun) {
-      // DRY RUN: parse 検証のみ (DB書込・ファイル移動なし)
-      const g = expandFile(name, buffer);
-      if (g.error) { console.log(`  [dry] ✗ ${name}: ${g.error}`); failCount++; continue; }
-      let allOk = true;
-      for (const f of g.files) {
-        const p = prepareFile(f.name, f.buffer);
-        if (p.ok) {
-          console.log(`  [dry] ✓ ${f.name}: ${p.recipe.label} ${p.records.length}件 (期間 ${p.reportStart || '?'}〜${p.reportEnd || '?'})`);
-        } else {
-          console.log(`  [dry] ✗ ${f.name}: ${p.error}`);
-          allOk = false;
-        }
-      }
-      if (allOk) okCount++; else failCount++;
-      continue;
-    }
-
-    const outcome = importPhysicalFile(db, { name, buffer, sha256, source: 'incoming' });
-    for (const r of outcome.results) {
-      if (r.ok) console.log(`  ✓ ${r.file}: ${r.label} ${r.rows}件 (insert ${r.inserted} / update ${r.updated}) ${r.date_from}〜${r.date_to}`);
-      else console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
-    }
-
-    // ファイル移動 (DB commit 後): ok/duplicate → processed/YYYY-MM/、error/skipped → failed/
-    try {
-      if (outcome.status === 'ok' || outcome.status === 'duplicate') {
-        const ym = new Date().toISOString().slice(0, 7);
-        const dest = moveTo(srcPath, path.join(processedRoot, ym));
-        console.log(`    → ${path.relative(incomingDir, dest)}`);
-        if (outcome.status === 'ok') okCount++; else dupCount++;
-      } else {
-        const dest = moveTo(srcPath, failedDir);
-        console.log(`    → ${path.relative(incomingDir, dest)} (要確認)`);
+  process.exitCode = 0;
+} else {
+  let okCount = 0, dupCount = 0, failCount = 0;
+  try {
+    for (const name of entries) {
+      const srcPath = path.join(incomingDir, name);
+      let buffer;
+      try {
+        buffer = fs.readFileSync(srcPath);
+      } catch (e) {
+        console.error(`✗ ${name}: 読込失敗 (${e.message})`);
         failCount++;
+        continue;
       }
-    } catch (e) {
-      // 移動失敗は取込自体の成否に影響させないが、翌回 duplicate 検知で再取込は防がれる
-      console.error(`  ⚠ ${name}: ファイル移動失敗 (${e.message})。手で移動してください`);
-      if (outcome.status === 'ok' || outcome.status === 'duplicate') okCount++; else failCount++;
-    }
-  }
-} finally {
-  db.close();
-}
+      const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
 
-console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} ===`);
-process.exit(failCount > 0 ? 1 : 0);
+      if (isDryRun) {
+        // DRY RUN: parse 検証のみ (DB書込・ファイル移動なし)
+        const g = expandFile(name, buffer);
+        if (g.error) { console.log(`  [dry] ✗ ${name}: ${g.error}`); failCount++; continue; }
+        let allOk = true;
+        for (const f of g.files) {
+          const p = prepareFile(f.name, f.buffer);
+          if (p.ok) {
+            console.log(`  [dry] ✓ ${f.name}: ${p.recipe.label} ${p.records.length}件 (期間 ${p.reportStart || '?'}〜${p.reportEnd || '?'})`);
+          } else {
+            console.log(`  [dry] ✗ ${f.name}: ${p.error}`);
+            allOk = false;
+          }
+        }
+        if (allOk) okCount++; else failCount++;
+        continue;
+      }
+
+      const outcome = importPhysicalFile(db, { name, buffer, sha256, source: 'incoming' });
+      for (const r of outcome.results) {
+        if (r.ok) console.log(`  ✓ ${r.file}: ${r.label} ${r.rows}件 (insert ${r.inserted} / update ${r.updated}) ${r.date_from}〜${r.date_to}`);
+        else console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
+      }
+
+      // ファイル移動 (DB commit 後): ok/duplicate → processed/YYYY-MM/、error/skipped → failed/
+      try {
+        if (outcome.status === 'ok' || outcome.status === 'duplicate') {
+          const ym = new Date().toISOString().slice(0, 7);
+          const dest = moveTo(srcPath, path.join(processedRoot, ym));
+          console.log(`    → ${path.relative(incomingDir, dest)}`);
+          if (outcome.status === 'ok') okCount++; else dupCount++;
+        } else {
+          const dest = moveTo(srcPath, failedDir);
+          console.log(`    → ${path.relative(incomingDir, dest)} (要確認)`);
+          failCount++;
+        }
+      } catch (e) {
+        // 移動失敗は取込自体の成否に影響させないが、翌回 duplicate 検知で再取込は防がれる
+        console.error(`  ⚠ ${name}: ファイル移動失敗 (${e.message})。手で移動してください`);
+        if (outcome.status === 'ok' || outcome.status === 'duplicate') okCount++; else failCount++;
+      }
+    }
+  } finally {
+    db.close();
+  }
+
+  console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} ===`);
+  // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
+  // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
+  process.exitCode = failCount > 0 ? 1 : 0;
+}
