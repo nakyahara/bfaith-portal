@@ -1,0 +1,101 @@
+/* =========================================================================
+   B-Faith Portal 共通モバイル底上げ (responsive baseline)
+   -------------------------------------------------------------------------
+   全ページの <head> から読み込む。各ページが持つ独自 <style> と衝突しないよう、
+   原則「要素セレクタのみ」で構成している (例外はタブバーの3クラスだけ。理由は後述)。
+
+   ⚠ 重要な設計方針: デスクトップ表示も印刷結果も変えない。
+      そのため全ルールを @media screen and (max-width: 768px) の中に閉じてある。
+      - screen を明示するのは、印刷時のページ幅が 768px 以下になる用紙設定だと
+        メディアクエリが印刷にも当たり、既存の @media print 指定
+        (fba-picking-print / inbound-info) を上書きしてしまうため。
+      - 「デスクトップでは無害だから」とブロック外に出さない。狭いコンテナに
+        大きな画像やグラフ (canvas) を置いているページでは、max-width:100% が
+        デスクトップの見た目まで変えてしまう。
+   ========================================================================= */
+
+@media screen and (max-width: 768px) {
+
+  /* iOS Safari は横向きにすると勝手に文字を拡大する。等倍で固定。 */
+  html { -webkit-text-size-adjust: 100%; }
+
+  /* 画像・グラフが親幅を超えてページ全体を横スクロールさせるのを防ぐ。 */
+  img, canvas, svg, video, iframe { max-width: 100%; }
+  img, video { height: auto; }
+
+  /* --- iOS の自動ズーム対策 ---------------------------------------------
+     iOS Safari は font-size が 16px 未満の入力欄をタップすると画面を勝手に
+     拡大し、そのまま戻らない (以降ずっと横スクロール状態になる)。
+     ページ側は .form-group input { font-size:15px } のように "クラス付き"
+     で指定していて要素セレクタより詳細度が高いため、ここは !important が
+     必須。モバイル幅限定なのでデスクトップには一切影響しない。
+     チェックボックス/ラジオ/レンジはズーム対象外かつ 16px 指定で表示が
+     崩れるため除外する。 */
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+
+  /* --- 横長テーブルの扱い -------------------------------------------------
+     テーブル自体に overflow を掛けると thead と tbody の列幅がズレるので、
+     "テーブルを直接包んでいる要素" 側をスクロールコンテナにする。
+     対象を div/form/section/article に限定しているのは、body や main のような
+     ページ全体の器を巻き込むと、中の position:sticky の基準がズレたり
+     縦スクロールが二重になったりするため。
+     :has() 未対応の古いブラウザでは単に何も起きない (現状維持で悪化しない)。
+     既に overflow-x を持つラッパ (.table-scroll 等) に当たっても同じ値なので無害。 */
+  :is(div, form, section, article):has(> table) {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* 1画面に収まる情報量を増やす。行の折り返しは殺さない
+     (nowrap にすると商品名などでスクロール幅が爆発するため)。
+     ページ側がクラス付きで font-size を指定している表には効かないが、
+     効かない場合も「元のまま」であって悪化はしない。 */
+  table { font-size: 13px; }
+
+  /* --- アプリ共通ヘッダー -------------------------------------------------
+     各アプリのヘッダーは [← ポータル][タイトル][タブ] を display:flex の一行に
+     並べている。スマホ幅ではタイトルが潰れて1〜2文字ずつ縦積みになるため、
+     入りきらない要素は次の行へ折り返させる。
+     display:flex でない <header> には何の影響も出ない。 */
+  header { flex-wrap: wrap; }
+
+  /* --- 横並びタブバー -----------------------------------------------------
+     ポータル内の各アプリはタブを display:flex の一列で並べており、タブが
+     4つ以上あるとスマホ幅でページごと横にはみ出す (梱包機振り分け、利益計算機など)。
+     バーの中だけを横スクロールさせる。
+     ここだけは要素セレクタで表現できないためクラス名を指定している。列挙した
+     5つは repo 内を grep して「タブバー」の意味で使われていることを確認済み
+     (.tabs=23画面 / .page-tabs=9画面 / .nav-tabs,.sub-tabs,.pd-mega-tabs=各1〜2画面)。
+     なお flex-wrap:wrap を持つタブバーは折り返しが優先され、このルールは
+     何もしない。折り返せているならそれで読めるので、あえて nowrap は強制しない。
+     mobile.css は各ページの <style> より後に読み込むので後勝ちで効く。 */
+  .tabs, .page-tabs, .nav-tabs, .sub-tabs, .pd-mega-tabs {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tabs > *, .page-tabs > *, .nav-tabs > *, .sub-tabs > *, .pd-mega-tabs > * {
+    flex: 0 0 auto;      /* 縮んで文字が潰れるのを防ぐ */
+    white-space: nowrap;
+  }
+
+  /* --- はみ出し防止 ------------------------------------------------------- */
+
+  /* SKU・URL など空白のない長い文字列で行が伸びるのを防ぐ。 */
+  body { overflow-wrap: break-word; }
+
+  /* ログ/JSON の整形表示はブロック内で横スクロールさせる。 */
+  pre { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* --- タップしやすさ ----------------------------------------------------- */
+
+  /* 指で押せる最小サイズ。padding は各ページの指定を尊重し、
+     高さの下限だけ引き上げる。 */
+  button, input[type="submit"], input[type="button"] { min-height: 36px; }
+
+  /* チェックボックス/ラジオは既定サイズだと押しにくい。 */
+  input[type="checkbox"], input[type="radio"] { min-width: 18px; min-height: 18px; }
+}

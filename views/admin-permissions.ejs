@@ -6,6 +6,7 @@
   <title>権限管理 - B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
 </head>
 <body>
   <header class="portal-header">
@@ -25,6 +26,7 @@
     <% } %>
 
     <form method="POST" action="/admin/permissions">
+      <div class="table-scroll">
       <table class="permissions-table">
         <thead>
           <tr>
@@ -57,6 +59,7 @@
           <% }) %>
         </tbody>
       </table>
+      </div>
 
       <div class="admin-actions">
         <button type="submit" class="btn-save">保存</button>
