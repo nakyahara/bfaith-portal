@@ -121,17 +121,25 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
     WHERE id = ?
       AND source = 'portal'
       AND notion_page_id IS NULL
+      AND ne_code = ?
       AND (notion_card_status IN ('pending','failed')
            OR (notion_card_status = 'creating' AND updated_at < ?))
-  `).run(claimToken, draftId, staleBefore);
+  `).run(claimToken, draftId, draft.ne_code, staleBefore);
   if (claim.changes === 0) return { outcome: 'skip_locked' };
 
+  // claim 成立後に読み直す。ここまでの間に regroup で ne_code が変わっていても、
+  // claim の CAS (ne_code 一致) が弾くので、この行は「読んだときと同じ商品」であることが保証される。
+  // 商品名なども古いスナップショットを使わないよう、以降は claimed を使う (Codex R3 high)
+  const claimed = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!claimed) return { outcome: 'not_found' };
+
   // claim がまだ自分のものか (stale 奪取されていないか) を確認する。
-  // source も一緒に見る: claim 後に取り込み由来へ変わった行へは書き込ませない (Codex R1 high-2)
+  // source / ne_code も一緒に見る: claim 後に取り込み由来へ変わった行や、
+  // 商品コードが付け替わった行へは書き込ませない (Codex R1 high-2 / R3 high)
   const holdsClaim = () => {
-    const row = db.prepare('SELECT notion_card_status, notion_card_claim, source FROM product_drafts WHERE id = ?').get(draftId);
+    const row = db.prepare('SELECT notion_card_status, notion_card_claim, source, ne_code FROM product_drafts WHERE id = ?').get(draftId);
     return row && row.notion_card_status === 'creating' && row.notion_card_claim === claimToken
-      && canWriteToNotion(row);
+      && canWriteToNotion(row) && row.ne_code === claimed.ne_code;
   };
 
   // finalize は claim 一致時のみ書き込む CAS (奪取した新 worker の結果を旧 worker が上書きしない)。
@@ -145,14 +153,14 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
         notion_card_claim = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ? AND notion_card_status = 'creating' AND notion_card_claim = ?
-        AND source = 'portal'
-    `).run(status, pageId || null, error || null, draftId, claimToken);
+        AND source = 'portal' AND ne_code = ?
+    `).run(status, pageId || null, error || null, draftId, claimToken, claimed.ne_code);
     return info.changes > 0;
   };
 
   try {
     // pre-check: 既に同じ商品コードのカードがあれば作らず採用 (冪等)
-    const existing = await findPageByManageNumber(String(draft.ne_code));
+    const existing = await findPageByManageNumber(String(claimed.ne_code));
     if (existing?.id) {
       if (!finalize('created', existing.id, null)) return { outcome: 'claim_lost' };
       logEvent(db, draftId, 'notion_card_adopted', existing.id, actor);
@@ -162,7 +170,7 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
     // createPage 直前に claim 再確認: stale 奪取されていたら作成せず撤退 (二重カード防止)
     if (!holdsClaim()) return { outcome: 'claim_lost' };
 
-    const page = await createPage(buildProperties(draft));
+    const page = await createPage(buildProperties(claimed));
     if (!finalize('created', page.id, null)) {
       // 作成は成功したが claim を失った (stale 奪取後)。page.id を握ったまま黙らない
       logEvent(db, draftId, 'notion_card_claim_lost_after_create', page.id, actor);

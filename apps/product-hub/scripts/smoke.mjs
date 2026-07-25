@@ -287,18 +287,176 @@ check('delete cascades children',
   db.prepare('SELECT COUNT(*) c FROM draft_yahoo WHERE draft_id = ?').get(impId).c === 0
   && db.prepare('SELECT COUNT(*) c FROM draft_ai_outputs WHERE draft_id = ?').get(impId).c === 0);
 
+// ─── バリエーション判定 (NE 代表商品コード) ───
+const vari = await import('../lib/variation.js');
+// mirror_products に実データ相当を入れる (rooms = 代表コードだが商品としては実在しない = 本番の93%型)
+const insProd = db.prepare(`INSERT OR REPLACE INTO mirror_products
+  (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+  VALUES (?, ?, ?, '1', '取扱中', 'ok', ?, '2026-07-25T00:00:00Z')`);
+insProd.run(9001, 'rooms-l-bk', 'ルームズ L 黒', 'rooms');
+insProd.run(9002, 'rooms-l-wh', 'ルームズ L 白', 'rooms');
+insProd.run(9003, 'rooms-m-bk', 'ルームズ M 黒', 'rooms');
+insProd.run(9004, 'SOLO-1', '単品商品', null);          // 代表なし = 単品
+insProd.run(9005, 'SELF-REP', '自分が代表', 'SELF-REP'); // 代表 = 自分自身 (本番27件型)
+
+const vChild = vari.resolveVariationGroup(db, 'rooms-l-bk');
+check('variation: 子SKU → 代表コードでまとめ判定',
+  vChild.kind === 'variation' && vChild.groupKey === 'rooms' && vChild.isChild === true
+  && vChild.memberCount === 3 && vChild.members.length === 3,
+  JSON.stringify({ ...vChild, members: vChild.members.length }));
+const vRep = vari.resolveVariationGroup(db, 'rooms');
+check('variation: 代表コード自体 (商品として実在しなくても解決)',
+  vRep.kind === 'variation' && vRep.groupKey === 'rooms' && vRep.isChild === false
+  && vRep.memberCount === 3 && vRep.found === false,
+  JSON.stringify({ ...vRep, members: vRep.members.length }));
+check('variation: 大文字/前後空白ゆらぎを吸収',
+  vari.resolveVariationGroup(db, '  ROOMS-L-BK ').groupKey === 'rooms');
+check('variation: 単品', vari.resolveVariationGroup(db, 'SOLO-1').kind === 'single');
+check('variation: 代表=自分自身は子SKU扱いにしない',
+  (() => { const v = vari.resolveVariationGroup(db, 'SELF-REP'); return v.kind === 'variation' && v.isChild === false; })());
+check('variation: NEに無いコードは unknown',
+  vari.resolveVariationGroup(db, 'NOT-IN-NE-XYZ').kind === 'unknown');
+
+const batch = vari.resolveVariationGroupsBatch(db, ['rooms-l-bk', 'SOLO-1', 'NOT-IN-NE-XYZ', 'rooms']);
+check('variation batch: 一括判定が単発と一致',
+  batch.get('rooms-l-bk').kind === 'variation' && batch.get('rooms-l-bk').isChild === true
+  && batch.get('rooms-l-bk').memberCount === 3
+  && batch.get('solo-1').kind === 'single'
+  && batch.get('not-in-ne-xyz').kind === 'unknown'
+  && batch.get('rooms').isChild === false,
+  JSON.stringify([...batch]));
+check('variation batch: 空入力で落ちない', vari.resolveVariationGroupsBatch(db, []).size === 0);
+
+check('effectiveHasVariation: NE優先 (手入力を上書き)',
+  vari.effectiveHasVariation(vChild, { has_variation: 0 }).value === true
+  && vari.effectiveHasVariation(vChild, { has_variation: 0 }).source === 'ne'
+  && vari.effectiveHasVariation({ kind: 'single' }, { has_variation: 1 }).value === false);
+check('effectiveHasVariation: NEに無ければ手入力へフォールバック',
+  vari.effectiveHasVariation({ kind: 'unknown' }, { has_variation: 1 }).value === true
+  && vari.effectiveHasVariation({ kind: 'unknown' }, { has_variation: 1 }).source === 'manual');
+check('effectiveHasVariation: conflict も手入力へフォールバック',
+  vari.effectiveHasVariation({ kind: 'conflict' }, { has_variation: 1 }).source === 'manual');
+
+// 正規化後に重複する商品コードは判定不能 (conflict) にする — Codex R1 low-8
+insProd.run(9006, 'DUP-1', '重複その1', null);
+insProd.run(9007, ' dup-1 ', '重複その2', 'rooms');
+check('variation: 正規化後の重複は conflict',
+  vari.resolveVariationGroup(db, 'DUP-1').kind === 'conflict'
+  && vari.resolveVariationGroupsBatch(db, ['DUP-1']).get('dup-1').kind === 'conflict');
+db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9006, 9007)`).run();
+
+// IN 句の分割 (SQLite バインド上限を超える入力でも落ちない) — Codex R1 low-7
+const many = Array.from({ length: 1200 }, (_, i) => `BULK-${i}`);
+check('variation batch: 1200件でも too many SQL variables にならない',
+  vari.resolveVariationGroupsBatch(db, many).size === 1200);
+
+// 正規化 UNIQUE index: 'ABC' と ' abc ' を別ドラフトにできない — Codex R1 medium-4
+db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('CASE-A', 'ケース検証')`).run();
+let caseErr = null;
+try { db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES (' case-a ', '大文字ゆらぎ')`).run(); } catch (e) { caseErr = e; }
+check('ne_code 正規化 UNIQUE (大小/空白ゆらぎを別行にしない)', caseErr && /UNIQUE/i.test(String(caseErr.message)), String(caseErr && caseErr.message));
+
+// ─── regroup API (子SKU → 代表コード)。競合条件まで検証 (Codex R2 補足) ───
+const rg = await import('../services/regroup.js');
+const mkChild = (extra = {}) => {
+  db.prepare(`DELETE FROM product_drafts WHERE ne_code = ?`).run(`rooms-l-bk`);
+  db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rooms'`).run();
+  const info = db.prepare(`INSERT INTO product_drafts (ne_code, name, source) VALUES ('rooms-l-bk', '子SKU', 'portal')`).run();
+  const did = Number(info.lastInsertRowid);
+  for (const [k, v] of Object.entries(extra)) {
+    db.prepare(`UPDATE product_drafts SET ${k} = ? WHERE id = ?`).run(v, did);
+  }
+  return did;
+};
+
+let did = mkChild();
+const okRes = rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms', actor: 'smoke' });
+check('regroup: 成功して ne_code が代表コードになる',
+  okRes.code === 200 && db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(did).ne_code === 'rooms',
+  JSON.stringify(okRes));
+check('regroup: 監査ログが残る',
+  db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'regrouped_to_rep_code'`).get(did).c === 1);
+
+did = mkChild();
+check('regroup: expected_to 不一致は409 (画面が古い)',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'OTHER' }).code === 409);
+check('regroup: expected_from 不一致は409',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'WRONG', expectedTo: 'rooms' }).code === 409);
+check('regroup: expected 欠落は400',
+  rg.regroupToRepCode(db, did, {}).code === 400);
+check('regroup: 弾かれた後も ne_code は変わっていない',
+  db.prepare('SELECT ne_code FROM product_drafts WHERE id = ?').get(did).ne_code === 'rooms-l-bk');
+
+// Notion カード作成を一度でも試みた行は付け替えない (旧コードのカードが新コードに紐づく事故を防ぐ)
+did = mkChild({ notion_card_attempts: 1 });
+check('regroup: attempts>0 は拒否',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms' }).code === 400);
+did = mkChild({ notion_card_status: 'creating' });
+check('regroup: creating 中は拒否',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms' }).code === 400);
+did = mkChild({ notion_page_id: 'page-x', notion_card_status: 'created' });
+check('regroup: カード作成済みは拒否',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms' }).code === 400);
+did = mkChild({ source: 'notion_import' });
+check('regroup: 取り込み由来は拒否',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms' }).code === 400);
+
+// 代表コードのドラフトが既にある場合
+did = mkChild();
+db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('rooms', '先客')`).run();
+check('regroup: 代表コードのドラフトが既にあれば拒否',
+  rg.regroupToRepCode(db, did, { expectedFrom: 'rooms-l-bk', expectedTo: 'rooms' }).code === 400);
+db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rooms'`).run();
+
+// 単品/対象外
+db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rooms-l-bk'`).run();
+const soloId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('SOLO-1', '単品')`).run().lastInsertRowid);
+check('regroup: 単品は対象外 (400)',
+  rg.regroupToRepCode(db, soloId, { expectedFrom: 'SOLO-1', expectedTo: 'SOLO-1' }).code === 400);
+check('regroup: 存在しないIDは404',
+  rg.regroupToRepCode(db, 999999, { expectedFrom: 'a', expectedTo: 'b' }).code === 404);
+
+// Notion worker が「読んでから claim するまで」に ne_code が変わったら claim を成立させない
+// (旧コードのカードが新コードのドラフトに紐づく事故 — Codex R3 high)
+db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
+const raceId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, source) VALUES ('rooms-l-bk', 'レース検証', 'portal')`).run().lastInsertRowid);
+db.prepare(`UPDATE product_drafts SET ne_code = 'rooms' WHERE id = ?`).run(raceId); // worker が読んだ後に付け替わった状況
+const raceClaim = db.prepare(`
+  UPDATE product_drafts SET notion_card_status = 'creating', notion_card_claim = 'tok'
+  WHERE id = ? AND source = 'portal' AND notion_page_id IS NULL AND ne_code = ?
+    AND notion_card_status IN ('pending','failed')
+`).run(raceId, 'rooms-l-bk'); // 古い ne_code で claim を試みる
+check('notion claim: ne_code が変わっていたら claim できない', raceClaim.changes === 0);
+db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(raceId);
+db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'SOLO-1'`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
 const statusLabels = dbmod.STATUS_LABELS;
 const counts = Object.fromEntries(statuses.map((s) => [s, 1]));
-const draftRow = { ...after, thumb: 'https://drive.google.com/thumbnail?id=x&sz=w160', first_image_id: 'x' };
+const draftRow = {
+  ...after, thumb: 'https://drive.google.com/thumbnail?id=x&sz=w160', first_image_id: 'x',
+  variation: { kind: 'single', groupKey: after.ne_code, memberCount: 0, isChild: false },
+};
+// 詳細画面のバリエーションカードは 3 分岐 × 子SKU有無を全部描かせる
+const variationFixtures = {
+  child: vari.resolveVariationGroup(db, 'rooms-l-bk'),
+  rep: vari.resolveVariationGroup(db, 'rooms'),
+  single: vari.resolveVariationGroup(db, 'SOLO-1'),
+  unknown: vari.resolveVariationGroup(db, 'NOT-IN-NE-XYZ'),
+};
 
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
     title: 't', displayName: 'smoke',
     // ポータル起点と取り込み由来の両方の行を描かせる (出自列の全分岐)
-    drafts: [draftRow, { ...draftRow, id: 999, source: 'notion_import', ne_code: 'IMP-1' }],
+    drafts: [
+      draftRow,
+      { ...draftRow, id: 999, source: 'notion_import', ne_code: 'IMP-1' },
+      { ...draftRow, id: 998, ne_code: 'rooms-l-bk', variation: { kind: 'variation', groupKey: 'rooms', memberCount: 3, isChild: true } },
+      { ...draftRow, id: 997, ne_code: 'ZZZ', variation: { kind: 'unknown', groupKey: 'ZZZ', memberCount: 0, isChild: false } },
+    ],
     counts, statusFilter: null,
     statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
   }],
@@ -319,6 +477,8 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels,
     aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
+    regroup: null,
     yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
     imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
   }],
@@ -329,6 +489,7 @@ const renders = [
     aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -342,6 +503,29 @@ const renders = [
     events: [], gate: ['商品画像 (Driveリンク) が1枚もありません'],
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
+    yahoo: null, imageProduction: null,
+  }],
+  // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
+  ['detail.ejs (child SKU + regroup button)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, ne_code: 'rooms-l-bk', source: 'portal', notion_page_id: null },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
+    yahoo: null, imageProduction: null,
+  }],
+  ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, ne_code: 'rooms-l-bk', source: 'notion_import', notion_page_id: 'p1' },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
+    regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
     yahoo: null, imageProduction: null,
   }],
 ];

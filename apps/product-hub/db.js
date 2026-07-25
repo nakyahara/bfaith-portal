@@ -210,6 +210,33 @@ export function initProductHubDB() {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
 
+  // バリエーション判定は LOWER(TRIM()) 照合なので、通常の索引が効かない (Codex medium-6)。
+  // 式インデックスを張って全走査を避ける。mirror 側の所有テーブルなので失敗しても無視する
+  for (const stmt of [
+    'CREATE INDEX IF NOT EXISTS idx_mirp_sku_norm ON mirror_products(LOWER(TRIM(商品コード)))',
+    'CREATE INDEX IF NOT EXISTS idx_mirp_rep_norm ON mirror_products(LOWER(TRIM(代表商品コード)))',
+  ]) {
+    try { db.exec(stmt); } catch (e) { console.warn('[product-hub] index skip:', e.message); }
+  }
+
+  // ne_code の一意性: DB の UNIQUE は BINARY 比較だが、NE/Notion 突合は LOWER(TRIM()) で行う。
+  // 'ABC' と 'abc' が別ドラフトとして共存すると突合が壊れるので正規化 UNIQUE も張る (Codex medium-4)。
+  // ⚠️ 既存データが衝突していると CREATE が失敗する → 起動を巻き添えにしないよう事前検査 + try/catch
+  try {
+    const dup = db.prepare(`
+      SELECT COUNT(*) AS c FROM (
+        SELECT LOWER(TRIM(ne_code)) k FROM product_drafts GROUP BY LOWER(TRIM(ne_code)) HAVING COUNT(*) > 1
+      )
+    `).get().c;
+    if (dup === 0) {
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_product_drafts_ne_norm ON product_drafts(LOWER(TRIM(ne_code)))');
+    } else {
+      console.warn(`[product-hub] ne_code の正規化重複 ${dup} 件のため UNIQUE index を張れません (要データ修正)`);
+    }
+  } catch (e) {
+    console.warn('[product-hub] ne_code 正規化 UNIQUE index skip:', e.message);
+  }
+
   // draft_events は append-only (mis-shipment と同じ trigger ガード)
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS trg_draft_events_no_update

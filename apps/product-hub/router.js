@@ -20,6 +20,8 @@ import {
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation } from './lib/variation.js';
+import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -106,8 +108,12 @@ router.get('/', (req, res) => {
     ORDER BY d.updated_at DESC
     LIMIT 500
   `).all(...params);
+  // NE 判定は一覧では 2 クエリで一括解決する (行ごとに引くと N+1 になる)
+  const variations = resolveVariationGroupsBatch(db, drafts.map((d) => d.ne_code));
   for (const d of drafts) {
     d.thumb = d.first_image_id ? thumbnailUrl(d.first_image_id, 160) : null;
+    d.variation = variations.get(String(d.ne_code || '').trim().toLowerCase())
+      || { kind: 'unknown', groupKey: d.ne_code, memberCount: 0, isChild: false };
   }
 
   res.render(view('index.ejs'), {
@@ -148,6 +154,11 @@ router.get('/detail/:id', (req, res) => {
   const nextStatuses = (TRANSITIONS[draft.status] || [])
     .concat(ESCAPE_STATUSES.filter((s) => s !== draft.status));
 
+  // NE の代表商品コードでバリエーション判定 (NE が正・DB には焼かない)
+  const variation = resolveVariationGroup(db, draft.ne_code);
+  const hasVariation = effectiveHasVariation(variation, draft);
+  const regroup = regroupBlockReason(db, draft, variation);
+
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
@@ -156,6 +167,7 @@ router.get('/detail/:id', (req, res) => {
     nextStatuses,
     statusLabels: STATUS_LABELS,
     aiKinds: AI_OUTPUT_KINDS,
+    variation, hasVariation, regroup,
   });
 });
 
@@ -212,6 +224,14 @@ router.post('/api/drafts/:id', async (req, res) => {
     return res.status(400).json({ ok: false, error: '画像フォルダURLの形式が不正です (http/https)' });
   }
 
+  // has_variation は NE を正とする方針なので、**NE で判定できる商品は DB に焼かない** (Codex high-3)。
+  // クライアント側だけの制御だと、後で NE から消えたときに「焼かれた NE 値」が手入力値として復活する
+  const neInfo = resolveVariationGroup(getDB(), draft.ne_code, { withMembers: false });
+  const neDecides = neInfo.kind === 'variation' || neInfo.kind === 'single';
+  const hasVariationValue = (!neDecides && req.body?.has_variation !== undefined)
+    ? (req.body.has_variation ? 1 : 0)
+    : draft.has_variation;
+
   const amazonUrl = req.body?.amazon_url !== undefined ? cleanText(req.body.amazon_url, 1000) : draft.amazon_url;
   if (amazonUrl && !isHttpUrl(amazonUrl)) {
     return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
@@ -227,7 +247,7 @@ router.post('/api/drafts/:id', async (req, res) => {
     officialUrl,
     req.body?.price !== undefined ? sanitizeMoney(req.body.price) : draft.price,
     req.body?.jan_code !== undefined ? cleanText(req.body.jan_code, 20) : draft.jan_code,
-    req.body?.has_variation !== undefined ? (req.body.has_variation ? 1 : 0) : draft.has_variation,
+    hasVariationValue,
     driveFolderUrl,
     req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo,
     req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin,
@@ -440,6 +460,35 @@ router.post('/api/notion-retry-all', async (req, res) => {
   const results = await retryPendingCards({ actor: actorOf(req) });
   const failed = results.filter((r) => r.outcome === 'failed');
   res.json({ ok: failed.length === 0, tried: results.length, failed: failed.length, results });
+});
+
+// ─── API: バリエーション ────────────────────────────────
+
+// NE 判定のプレビュー (新規登録画面が入力中に問い合わせる。読み取り専用)
+router.get('/api/variation', (req, res) => {
+  const code = cleanText(req.query?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const info = resolveVariationGroup(getDB(), code);
+  res.json({
+    ok: true,
+    kind: info.kind, groupKey: info.groupKey, isChild: info.isChild,
+    memberCount: info.memberCount,
+    members: info.members.slice(0, 60).map((m) => ({ code: m.商品コード, name: m.商品名, status: m.取扱区分 })),
+  });
+});
+
+// 子SKUで作られたドラフトを代表商品コードにまとめる (人が確認してから実行する)。
+// 判定・照合・更新・監査ログは services/regroup.js が 1 トランザクションで行う
+router.post('/api/drafts/:id/regroup', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const r = regroupToRepCode(getDB(), draft.id, {
+    expectedFrom: cleanText(req.body?.expected_from, 100),
+    expectedTo: cleanText(req.body?.expected_to, 100),
+    actor: actorOf(req),
+  });
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true, ne_code: r.ne_code });
 });
 
 // ─── API: Notion 取り込み (検証用の選択インポート) ──────────
