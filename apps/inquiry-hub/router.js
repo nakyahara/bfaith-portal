@@ -183,9 +183,11 @@ router.get('/inquiries/:id', (req, res) => {
   const aiPanel = draft ? `
     <div class="panel">
       <h3>🤖 AI返信案 ${draft.is_stale ? '<span class="badge" style="background:#fef3c7;color:#92400e">⚠️古い会話に基づく返信案</span>' : ''}</h3>
-      ${draft.summary ? `<div class="sub">要約: ${he(draft.summary)}</div>` : ''}
+      ${draft.summary ? `<div class="sub">要約: ${he(draft.summary)}${draft.category ? ` ・ 分類: ${he(draft.category)}` : ''}</div>` : ''}
       <div class="ai-draft">${he(draft.draft_body || '').replace(/\n/g, '<br>')}</div>
-      ${draft.notes ? `<div class="sub">注意: ${he(draft.notes)}</div>` : ''}
+      ${draft.notes ? `<div class="sub">⚠️ 注意: ${he(draft.notes)}</div>` : ''}
+      ${draft.confirmation_items ? `<div class="sub">☑️ 送信前の確認: ${he(draft.confirmation_items)}</div>` : ''}
+      ${replyEditorEnabled() && !draft.is_stale ? '<button class="ghost" id="useDraftBtn" style="margin-top:8px">📝 この案を返信欄へコピー</button>' : ''}
     </div>` : '';
 
   // ─── 返信エディタ (Dark Launch。設計書§7.1#3) ───
@@ -324,6 +326,18 @@ router.get('/inquiries/:id', (req, res) => {
   var REPLY_OP_ID = ${JSON.stringify(crypto.randomUUID())};
   var REPLY_BASE_REV = ${Number(inq.conversation_rev) || 0};
   var REPLY_CH = ${JSON.stringify((CHANNELS[inq.channel_type] || {}).label || inq.channel_type).replace(/</g, '\\u003c')};
+  // AI返信案 → 返信欄へコピー (人間が必ず確認・編集してから送信ジョブを作る)
+  var AI_DRAFT_BODY = ${JSON.stringify(draft?.draft_body || '').replace(/</g, '\\u003c')};
+  var useDraftBtn = document.getElementById('useDraftBtn');
+  if (useDraftBtn) useDraftBtn.addEventListener('click', function() {
+    var ta = document.getElementById('replyBody');
+    if (!ta) { toast('返信フォームが使えません (未決着の送信ジョブを解決してください)'); return; }
+    if (ta.value.trim() && !confirm('返信欄の内容をAI返信案で置き換えますか?')) return;
+    ta.value = AI_DRAFT_BODY;
+    ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    ta.focus();
+    toast('AI返信案をコピーしました。内容を確認・編集してから送信してください');
+  });
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
@@ -1176,7 +1190,28 @@ router.get('/admin', (req, res) => {
     </tr>`;
   }).join('');
 
+  // AIバッチ状況 (§9.2: ai_runs を管理画面に表示)
+  const aiStats = db.prepare(`SELECT
+      (SELECT COUNT(*) FROM ai_jobs WHERE status = 'queued') AS queued,
+      (SELECT COUNT(*) FROM ai_jobs WHERE status = 'processing') AS processing,
+      (SELECT COUNT(*) FROM ai_drafts WHERE is_stale = 0) AS drafts`).get();
+  const aiRuns = db.prepare('SELECT * FROM ai_runs ORDER BY id DESC LIMIT 5').all();
+  const aiRunTrs = aiRuns.map(r => `
+    <tr>
+      <td class="nowrap">${fmtJst(r.started_at)}</td>
+      <td>${he(r.runner_info || '—')}</td>
+      <td>claim ${r.claimed} / 生成 ${r.done} / 破棄 ${r.discarded} / 失敗 ${r.failed}</td>
+      <td>${r.error ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">${he(String(r.error).slice(0, 60))}</span>` : '<span class="badge" style="background:#dcfce7;color:#166534">OK</span>'}</td>
+    </tr>`).join('');
+  const aiCard = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🤖 AI返信案 <span class="sub">(待機 ${aiStats.queued}件 / 生成中 ${aiStats.processing}件 / 有効な返信案 ${aiStats.drafts}件。ローカルランナーが定時に生成)</span></div>
+    ${aiRuns.length ? `<table><thead><tr><th>実行</th><th>ランナー</th><th>結果</th><th></th></tr></thead><tbody>${aiRunTrs}</tbody></table>`
+      : '<div class="empty">まだAIバッチが実行されていません (ai-draft-runner.mjs を定時実行すると履歴が出ます)</div>'}
+  </div>`;
+
   const body = `
+  ${aiCard}
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🔄 受信同期の状態 <span class="sub">(cron: 15分間隔 + 深掘り 毎朝5:37。手動実行してもcronと衝突しません)</span></div>
     <table>
