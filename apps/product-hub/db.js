@@ -61,6 +61,17 @@ export const AI_OUTPUT_KINDS = [
 
 let initialized = false;
 
+/**
+ * ne_code の正規化 UNIQUE index を張れたか。
+ * 既存データに 'ABC'/'abc' の重複があると張れず、その状態では
+ * 「代表コードにまとめる」の衝突検出 (LOWER(TRIM()) 照合) が DB 制約に守られない。
+ * 起動は止めず (ポータル全体を巻き添えにしない)、**登録系だけ fail-closed** にする (Codex medium)。
+ */
+let neCodeUniqueEnforced = false;
+export function isNeCodeUniqueEnforced() {
+  return neCodeUniqueEnforced;
+}
+
 export function initProductHubDB() {
   if (initialized) return getMirrorDB();
   const db = getMirrorDB();
@@ -169,6 +180,23 @@ export function initProductHubDB() {
       updated_at             TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
+    -- バリエーションから外したSKU (2026-07-25 中原さん方針: 既定でまとめ、例外だけ外す)。
+    -- NE の代表商品コードは概ね正しいが例外がある (代表コード '10' に無関係な訳アリ品50件など)。
+    -- 外した SKU はこのドラフトのSKU一覧から消え、別ページにしたければそのコードで新規登録する
+    -- (登録時の自動まとめは、ここに載っているコードではスキップされる)。
+    -- 1 SKU は NE の代表商品コードを1つしか持たない = 属するグループ (ドラフト) も1つ。
+    -- したがって除外も **SKU 単位でグローバルに一意**にする (Codex high-4)。
+    -- draft 単位 UNIQUE だと、A から戻しても B の除外行が残って detached のままになる。
+    -- 照合は LOWER(TRIM()) なので UNIQUE も式インデックスで揃える (生の UNIQUE では 'ABC'/' abc ' が別行になる)
+    CREATE TABLE IF NOT EXISTS draft_variation_exclusions (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      ne_code    TEXT NOT NULL,
+      actor      TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_draft_vari_excl_draft ON draft_variation_exclusions(draft_id);
+
     CREATE TABLE IF NOT EXISTS draft_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id   INTEGER NOT NULL,
@@ -210,6 +238,80 @@ export function initProductHubDB() {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
 
+  // 除外の一意性を「SKU単位グローバル」へ移行する (Codex R2 high)。
+  //   CREATE ... IF NOT EXISTS は、旧定義 (draft 単位 UNIQUE) が残っていても何もしない。
+  //   旧形のまま動くと「A で外して B から戻せない」不整合が残るので、定義を実測して張り替える。
+  try {
+    const tableSql = db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='draft_variation_exclusions'`
+    ).get()?.sql || '';
+    const idxSql = db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_draft_vari_excl_code'`
+    ).get()?.sql || null;
+
+    // 旧テーブル制約 UNIQUE(draft_id, ne_code) が残っているか / 期待する式インデックスが無いか
+    const hasOldTableUnique = /UNIQUE\s*\(\s*draft_id\s*,\s*ne_code\s*\)/i.test(tableSql);
+    const hasWantedIndex = !!idxSql && /LOWER\s*\(\s*TRIM\s*\(\s*ne_code/i.test(idxSql) && /UNIQUE/i.test(idxSql);
+
+    if (hasOldTableUnique || !hasWantedIndex) {
+      // テーブル入れ替えは SQLite の手順どおり foreign_keys を一時 OFF にする
+      // (ON のままだと DROP/RENAME と INSERT..SELECT が FK 違反で落ちる)。
+      // PRAGMA はトランザクション外で切り替える必要がある
+      const fkWasOn = db.pragma('foreign_keys', { simple: true }) === 1;
+      if (fkWasOn) db.pragma('foreign_keys = OFF');
+      try {
+        db.transaction(() => {
+          // ① 親ドラフトを失った孤児行を先に落とす。
+          //    集約を先にやると「最古が孤児・後発が有効」のとき有効な除外まで消える (Codex R3 high)
+          db.exec(`
+            DELETE FROM draft_variation_exclusions
+            WHERE NOT EXISTS (SELECT 1 FROM product_drafts d WHERE d.id = draft_variation_exclusions.draft_id)
+          `);
+          // ② 残った有効行のうち、正規化後に重複するものは最古の1件だけ残す
+          db.exec(`
+            DELETE FROM draft_variation_exclusions WHERE id NOT IN (
+              SELECT MIN(id) FROM draft_variation_exclusions GROUP BY LOWER(TRIM(ne_code))
+            )
+          `);
+          if (hasOldTableUnique) {
+            // テーブル制約は ALTER で外せないので作り直す (swap)。
+            // 親を失った孤児行はここで落とす (FK を復帰させるため)
+            db.exec(`
+              CREATE TABLE draft_variation_exclusions_new (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+                ne_code    TEXT NOT NULL,
+                actor      TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+              );
+              INSERT INTO draft_variation_exclusions_new (id, draft_id, ne_code, actor, created_at)
+                SELECT e.id, e.draft_id, e.ne_code, e.actor, e.created_at
+                FROM draft_variation_exclusions e
+                WHERE EXISTS (SELECT 1 FROM product_drafts d WHERE d.id = e.draft_id);
+              DROP TABLE draft_variation_exclusions;
+              ALTER TABLE draft_variation_exclusions_new RENAME TO draft_variation_exclusions;
+              CREATE INDEX IF NOT EXISTS idx_draft_vari_excl_draft ON draft_variation_exclusions(draft_id);
+            `);
+          } else if (idxSql) {
+            db.exec('DROP INDEX idx_draft_vari_excl_code');
+          }
+          db.exec(`CREATE UNIQUE INDEX idx_draft_vari_excl_code
+                   ON draft_variation_exclusions(LOWER(TRIM(ne_code)))`);
+        })();
+        const violations = db.pragma('foreign_key_check(draft_variation_exclusions)');
+        if (violations.length > 0) {
+          console.warn(`[product-hub] 除外テーブル移行後に FK 違反 ${violations.length} 件`);
+        }
+      } finally {
+        if (fkWasOn) db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (e) {
+    // 起動をポータルごと落とさない。張れていない場合は exclude API の INSERT が
+    // 冪等でなくなるだけで、表示・既存機能は動く
+    console.warn('[product-hub] 除外テーブルの一意制約移行に失敗:', e.message);
+  }
+
   // バリエーション判定は LOWER(TRIM()) 照合なので、通常の索引が効かない (Codex medium-6)。
   // 式インデックスを張って全走査を避ける。mirror 側の所有テーブルなので失敗しても無視する
   for (const stmt of [
@@ -230,6 +332,7 @@ export function initProductHubDB() {
     `).get().c;
     if (dup === 0) {
       db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_product_drafts_ne_norm ON product_drafts(LOWER(TRIM(ne_code)))');
+      neCodeUniqueEnforced = true;
     } else {
       console.warn(`[product-hub] ne_code の正規化重複 ${dup} 件のため UNIQUE index を張れません (要データ修正)`);
     }
@@ -255,6 +358,11 @@ export function initProductHubDB() {
 
 export function getDB() {
   return initProductHubDB();
+}
+
+/** smoke 専用: 初期化フラグを戻して migration を再実行させる (本番からは呼ばない) */
+export function _resetInitForTest() {
+  initialized = false;
 }
 
 export function logEvent(db, draftId, event, detail, actor) {

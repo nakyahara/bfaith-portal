@@ -79,22 +79,61 @@
           <% } %>
         </div>
       <% } %>
-      <details>
-        <summary style="cursor:pointer; font-size:13px; font-weight:600;">SKU一覧 (<%= variation.members.length %>件)</summary>
+      <details open>
+        <summary style="cursor:pointer; font-size:13px; font-weight:600;">このページに載るSKU (<%= variation.members.length %>件)</summary>
         <table class="list" style="margin-top:8px;">
-          <thead><tr><th style="width:200px">商品コード</th><th>商品名</th><th style="width:110px">取扱区分</th><th style="width:70px">在庫</th></tr></thead>
+          <thead><tr><th style="width:190px">商品コード</th><th>商品名</th><th style="width:100px">取扱区分</th><th style="width:60px">在庫</th><th style="width:70px"></th></tr></thead>
           <tbody>
             <% for (const m of variation.members) { %>
-              <tr<%= String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase() ? ' style="background:#eff6ff"' : '' %>>
+              <% const isSelf = String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase(); %>
+              <tr<%= isSelf ? ' style="background:#eff6ff"' : '' %>>
                 <td><code style="font-size:12px"><%= m.商品コード %></code></td>
                 <td><%= m.商品名 || '' %></td>
                 <td class="muted"><%= m.取扱区分 || '' %></td>
                 <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
+                <td>
+                  <% if (!isSelf) { %>
+                    <button class="btn btn-sm exclude-sku-btn" data-code="<%= m.商品コード %>">外す</button>
+                  <% } %>
+                </td>
               </tr>
             <% } %>
           </tbody>
         </table>
       </details>
+      <% if (variation.excludedMembers.length > 0) { %>
+        <details style="margin-top:10px;">
+          <summary style="cursor:pointer; font-size:13px; font-weight:600; color:#b45309;">
+            このページから外したSKU (<%= variation.excludedMembers.length %>件)
+          </summary>
+          <p class="muted" style="margin:8px 0 0;">
+            外したSKUは楽天のこのページに載りません。別ページにする場合は、そのコードで新規登録してください
+            （まとめ直されずに単独のドラフトになります）。
+          </p>
+          <table class="list" style="margin-top:8px;">
+            <tbody>
+              <% for (const m of variation.excludedMembers) { %>
+                <tr>
+                  <td style="width:190px"><code style="font-size:12px"><%= m.商品コード %></code></td>
+                  <td class="muted"><%= m.商品名 || '' %></td>
+                  <td style="width:150px; font-size:12px;">
+                    <% if (m.ownDraftId) { %>
+                      <a href="/apps/product-hub/detail/<%= m.ownDraftId %>">単独ページ #<%= m.ownDraftId %></a>
+                    <% } else { %>
+                      <span style="color:#b45309" title="このSKUはどの楽天ページにも載りません">未割当</span>
+                    <% } %>
+                  </td>
+                  <td style="width:70px"><button class="btn btn-sm restore-sku-btn" data-code="<%= m.商品コード %>">戻す</button></td>
+                </tr>
+              <% } %>
+            </tbody>
+          </table>
+        </details>
+      <% } %>
+    <% } else if (variation.kind === 'detached') { %>
+      <p class="muted" style="margin:0;">
+        このSKUは他ページのバリエーションから外され、<strong>単独のページ</strong>として扱われています。
+      </p>
     <% } else if (variation.kind === 'single') { %>
       <p class="muted" style="margin:0;">単品です（NEに代表商品コードの登録なし）。</p>
     <% } else if (variation.kind === 'conflict') { %>
@@ -477,6 +516,19 @@
     const el = document.getElementById('f-has-variation');
     return el ? { has_variation: el.checked } : {};
   }
+
+  // SKU をバリエーションから外す / 戻す (委譲。表は再描画されるため)
+  document.addEventListener('click', async (ev) => {
+    const ex = ev.target.closest && ev.target.closest('.exclude-sku-btn');
+    const re = ev.target.closest && ev.target.closest('.restore-sku-btn');
+    if (!ex && !re) return;
+    const btn = ex || re;
+    const code = btn.getAttribute('data-code');
+    if (ex && !confirm(code + ' をこのページのバリエーションから外します。\n\n別ページにしたい場合は、後でこのコードで新規登録してください。')) return;
+    btn.disabled = true;
+    const json = await post(BASE + '/variation/' + (ex ? 'exclude' : 'restore'), { ne_code: code });
+    if (json.ok) { location.reload(); } else { alert(json.error || '操作に失敗しました'); btn.disabled = false; }
+  });
 
   // 子SKUのドラフトを代表商品コードにまとめる。
   // 画面に出した from/to をサーバーへ送り、実行時の再計算と一致した場合だけ適用させる

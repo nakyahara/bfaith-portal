@@ -58,29 +58,27 @@
       if (!j.ok) { hint.textContent = ''; return; }
       hint.innerHTML = '';
       if (j.kind === 'variation' && j.isChild) {
-        // 楽天は1ページ=代表コード単位。自動では変えず、人に決めさせる
-        hint.style.color = '#b45309';
-        const span = document.createElement('span');
-        span.textContent = '⚠️ これは代表商品コード「' + j.groupKey + '」のバリエーション子SKUです ('
-          + j.memberCount + ' SKU)。楽天は1ページ＝代表コード単位です。';
-        const b = document.createElement('button');
-        b.className = 'btn btn-sm';
-        b.type = 'button';
-        b.style.marginLeft = '8px';
-        b.textContent = '「' + j.groupKey + '」に変更';
-        b.addEventListener('click', function () {
-          neInput.value = j.groupKey;
-          lastChecked = null;
-          checkVariation();
-        });
-        hint.appendChild(span);
-        hint.appendChild(b);
+        // 既定でまとめる (中原さん方針)。確認は挟まないが、**入力欄をその場で代表コードに書き換える**。
+        // 送信時にサーバー側だけで正規化すると、子SKU向けに書いた商品名のまま代表ページと
+        // Notionカードが作られてしまう (Codex high-3)。先に見せて直す機会を作る。
+        neInput.value = j.groupKey;
+        lastChecked = j.groupKey;
+        hint.style.color = '#166534';
+        hint.textContent = '✅ 代表商品コード「' + j.groupKey + '」に変更しました ('
+          + j.memberCount + ' SKU)。楽天は1ページ＝代表コード単位です。'
+          + '商品名は個別SKUではなく、ページ全体の名前にしてください。';
       } else if (j.kind === 'variation') {
         hint.style.color = '#166534';
         hint.textContent = '✅ バリエーション商品です (代表コード ' + j.groupKey + ' に ' + j.memberCount + ' SKU)';
+      } else if (j.kind === 'detached') {
+        hint.style.color = '#64748b';
+        hint.textContent = 'バリエーションから外されたSKUです。単独のページとして登録します';
       } else if (j.kind === 'single') {
         hint.style.color = '#64748b';
         hint.textContent = '単品です (NEに代表商品コードの登録なし)';
+      } else if (j.kind === 'conflict') {
+        hint.style.color = '#b45309';
+        hint.textContent = '⚠️ NE商品マスタに同じ商品コードが重複しています。NE側を直してください';
       } else {
         hint.style.color = '#94a3b8';
         hint.textContent = 'NE商品マスタに見つかりません (未登録の新商品なら問題ありません)';

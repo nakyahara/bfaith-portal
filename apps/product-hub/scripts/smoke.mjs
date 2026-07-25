@@ -416,6 +416,111 @@ check('regroup: 単品は対象外 (400)',
 check('regroup: 存在しないIDは404',
   rg.regroupToRepCode(db, 999999, { expectedFrom: 'a', expectedTo: 'b' }).code === 404);
 
+// ─── バリエーション除外 (既定でまとめ、例外だけ外す) ───
+db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
+const grpId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, source) VALUES ('rooms', 'ルームズ', 'portal')`).run().lastInsertRowid);
+
+let gv = vari.resolveVariationGroup(db, 'rooms', { draftId: grpId });
+check('除外なし: 全SKUが載る', gv.members.length === 3 && gv.excludedMembers.length === 0 && gv.memberCount === 3);
+
+db.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, 'rooms-m-bk', 'smoke')`).run(grpId);
+gv = vari.resolveVariationGroup(db, 'rooms', { draftId: grpId });
+check('外したSKUは一覧から消え、除外欄に出る',
+  gv.members.length === 2 && gv.excludedMembers.length === 1
+  && gv.excludedMembers[0].商品コード === 'rooms-m-bk' && gv.memberCount === 2,
+  JSON.stringify({ m: gv.members.map((x) => x.商品コード), e: gv.excludedMembers.map((x) => x.商品コード) }));
+// 除外は SKU 単位でグローバル一意 (draft A で外して B から戻せない不整合を防ぐ)
+let exclDupErr = null;
+try {
+  db.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code) VALUES (?, ' ROOMS-M-BK ')`).run(grpId);
+} catch (e) { exclDupErr = e; }
+check('除外は正規化してSKU単位でグローバル一意', exclDupErr && /UNIQUE/i.test(String(exclDupErr.message)));
+check('除外の一意制約が式インデックスで張られている',
+  /LOWER\s*\(\s*TRIM\s*\(\s*ne_code/i.test(
+    db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_draft_vari_excl_code'`).get()?.sql || ''
+  ));
+
+// 旧形 (draft単位 UNIQUE) の DB からの移行 — CREATE IF NOT EXISTS では張り替わらない (Codex R2 high)
+{
+  const keep = db.prepare('SELECT id, draft_id, ne_code FROM draft_variation_exclusions').all();
+  db.exec('DROP TABLE draft_variation_exclusions');
+  db.exec(`CREATE TABLE draft_variation_exclusions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    draft_id INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+    ne_code TEXT NOT NULL, actor TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(draft_id, ne_code))`);
+  const dA = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('MIG-A', 'a')`).run().lastInsertRowid);
+  const dB = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('MIG-B', 'b')`).run().lastInsertRowid);
+  const ins = db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code) VALUES (?, ?)');
+  ins.run(dA, 'MIG-SKU');
+  ins.run(dB, ' mig-sku ');   // 旧形では同一SKUを2ドラフトから除外できてしまう
+  ins.run(dA, 'MIG-OTHER');
+  check('旧形DB: 移行前は同一SKUが複数draftに入る',
+    db.prepare('SELECT COUNT(*) c FROM draft_variation_exclusions').get().c === 3);
+
+  dbmod._resetInitForTest();
+  dbmod.initProductHubDB();
+
+  const idxSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_draft_vari_excl_code'`).get()?.sql || '';
+  const tblSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='draft_variation_exclusions'`).get().sql;
+  check('旧形DB: 重複が集約される (3→2)',
+    db.prepare('SELECT COUNT(*) c FROM draft_variation_exclusions').get().c === 2);
+  check('旧形DB: 旧UNIQUE(draft_id, ne_code) が除去される', !/UNIQUE\s*\(\s*draft_id/i.test(tblSql));
+  check('旧形DB: 式UNIQUEに張り替わる', /LOWER\s*\(\s*TRIM\s*\(\s*ne_code/i.test(idxSql) && /UNIQUE/i.test(idxSql));
+  check('旧形DB: 移行後も foreign_keys=ON に戻る', db.pragma('foreign_keys', { simple: true }) === 1);
+  let migDup = null;
+  try { ins.run(dB, 'Mig-Sku'); } catch (e) { migDup = e; }
+  check('旧形DB: 移行後は重複INSERTがブロックされる', migDup && /UNIQUE/i.test(String(migDup.message)));
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(dA);
+  check('旧形DB: 移行後も CASCADE が効く',
+    db.prepare('SELECT COUNT(*) c FROM draft_variation_exclusions WHERE draft_id = ?').get(dA).c === 0);
+
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(dB);
+
+  // 「最古が孤児・後発が有効」の組み合わせ: 有効な除外を消さずに残すこと (Codex R3 high)
+  db.exec('DELETE FROM draft_variation_exclusions');
+  db.exec('DROP INDEX IF EXISTS idx_draft_vari_excl_code');
+  const dC = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('MIG-C', 'c')`).run().lastInsertRowid);
+  const orphanDraftId = 987654; // 実在しない親 = 孤児行
+  // 孤児は FK ON では作れないので、旧環境の状態を再現するため一時的に外す
+  db.pragma('foreign_keys = OFF');
+  db.prepare('INSERT INTO draft_variation_exclusions (id, draft_id, ne_code) VALUES (1, ?, ?)').run(orphanDraftId, 'ORPH-SKU');
+  db.prepare('INSERT INTO draft_variation_exclusions (id, draft_id, ne_code) VALUES (2, ?, ?)').run(dC, ' orph-sku ');
+  db.pragma('foreign_keys = ON');
+  dbmod._resetInitForTest();
+  dbmod.initProductHubDB();
+  const survived = db.prepare('SELECT draft_id, ne_code FROM draft_variation_exclusions').all();
+  check('旧形DB: 最古が孤児でも有効な除外が生き残る',
+    survived.length === 1 && survived[0].draft_id === dC,
+    JSON.stringify(survived));
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(dC);
+
+  // 後続テストのために元の除外行を復元
+  db.exec('DELETE FROM draft_variation_exclusions');
+  for (const r of keep) ins.run(r.draft_id, r.ne_code);
+}
+
+// 外したSKUは detached: 単独ページ扱いになり、自動まとめの対象外
+check('外したSKUは detached', vari.resolveVariationGroup(db, 'rooms-m-bk').kind === 'detached');
+check('detached はバッチでも detached',
+  vari.resolveVariationGroupsBatch(db, ['rooms-m-bk']).get('rooms-m-bk').kind === 'detached');
+check('detached の has_variation は なし(NE確定)',
+  vari.effectiveHasVariation(vari.resolveVariationGroup(db, 'rooms-m-bk'), { has_variation: 1 }).value === false);
+check('isDetached', vari.isDetached(db, 'ROOMS-M-BK') === true && vari.isDetached(db, 'rooms-l-bk') === false);
+
+// 実効SKUが1件になったら「バリエーションあり」ではなくなる
+db.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, 'rooms-l-wh', 'smoke')`).run(grpId);
+check('外して実効1SKUになったら has_variation=false',
+  vari.effectiveHasVariation(vari.resolveVariationGroup(db, 'rooms', { draftId: grpId }), {}).value === false);
+db.prepare(`DELETE FROM draft_variation_exclusions WHERE draft_id = ? AND ne_code = 'rooms-l-wh'`).run(grpId);
+
+// CASCADE: ドラフトを消したら除外も消える
+db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(grpId);
+check('除外は draft 削除で CASCADE',
+  db.prepare('SELECT COUNT(*) c FROM draft_variation_exclusions WHERE draft_id = ?').get(grpId).c === 0);
+check('CASCADE 後は detached でなくなる', vari.resolveVariationGroup(db, 'rooms-m-bk').kind === 'variation');
+
 // Notion worker が「読んでから claim するまで」に ne_code が変わったら claim を成立させない
 // (旧コードのカードが新コードのドラフトに紐づく事故 — Codex R3 high)
 db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('rooms-l-bk','rooms')`).run();
@@ -445,6 +550,15 @@ const variationFixtures = {
   rep: vari.resolveVariationGroup(db, 'rooms'),
   single: vari.resolveVariationGroup(db, 'SOLO-1'),
   unknown: vari.resolveVariationGroup(db, 'NOT-IN-NE-XYZ'),
+  // 外したSKUがある状態 (除外欄の「単独ページあり」「未割当」両分岐)
+  withExcluded: {
+    ...vari.resolveVariationGroup(db, 'rooms'),
+    excludedMembers: [
+      { 商品コード: 'rooms-m-bk', 商品名: 'ルームズ M 黒', 取扱区分: '取扱中', 在庫数: 3, ownDraftId: null },
+      { 商品コード: 'rooms-s-bk', 商品名: 'ルームズ S 黒', 取扱区分: '取扱中', 在庫数: 1, ownDraftId: 42 },
+    ],
+  },
+  detached: { kind: 'detached', groupKey: 'rooms-m-bk', repCode: null, isChild: false, memberCount: 0, members: [], excludedMembers: [], found: true },
 };
 
 const renders = [
@@ -515,6 +629,26 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
+    yahoo: null, imageProduction: null,
+  }],
+  ['detail.ejs (excluded SKU section)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, ne_code: 'rooms', source: 'portal' },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
+    yahoo: null, imageProduction: null,
+  }],
+  ['detail.ejs (detached SKU)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, ne_code: 'rooms-m-bk', source: 'portal' },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
