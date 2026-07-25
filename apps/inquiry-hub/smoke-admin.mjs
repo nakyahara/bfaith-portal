@@ -217,6 +217,9 @@ console.log('5. 返信エディタ');
   check('10000字超は400', rTooLong.status === 400);
   const rBadRevType = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: '1.5' });
   check('非整数のbaseConversationRevは400', rBadRevType.status === 400);
+  // completeOnSend は boolean のみ ("false" を真と解釈して意図せず完了にしない。Codexレビュー反映)
+  const rBadFlag = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: 1, completeOnSend: 'false' });
+  check('completeOnSend が boolean 以外は400', rBadFlag.status === 400);
   const rBadRev = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: 99 });
   check('rev不一致 (新着競合) は409', rBadRev.status === 409);
 

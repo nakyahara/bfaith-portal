@@ -292,6 +292,7 @@ router.get('/inquiries/:id', (req, res) => {
           ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
           : `<textarea id="replyBody" rows="6" placeholder="返信本文 (テンプレートは📄タブからコピーして貼り付け)"></textarea>
         <div class="row" style="margin-top:8px; justify-content:flex-end">
+          <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
         </div>`}
       </div>` : `
@@ -410,9 +411,12 @@ router.get('/inquiries/:id', (req, res) => {
     var body = document.getElementById('replyBody').value.trim();
     if (!body) { toast('本文が空です'); return; }
     var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
-    if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客\\n\\n' + preview)) return;
+    var completeEl = document.getElementById('replyComplete');
+    var complete = !!(completeEl && completeEl.checked);
+    if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客'
+      + (complete ? '\\n送信後に「完了」にします' : '\\n送信後は「返信処理中」になります') + '\\n\\n' + preview)) return;
     replyBtn.disabled = true;
-    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV })
+    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV, completeOnSend: complete })
       .then(function(r) { toast(r.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました'); setTimeout(function(){ location.reload(); }, 900); })
       .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
@@ -522,10 +526,17 @@ router.post('/api/inquiries/:id/reply', (req, res) => {
     return res.status(400).json({ error: '不正な操作IDです (画面を再読み込みしてください)' });
   }
   if (!Number.isInteger(baseRev)) return res.status(400).json({ error: '不正なリクエストです (baseConversationRev)' });
+  // completeOnSend は boolean のみ受け付ける (文字列 "false" を真と解釈して意図せず完了に
+  // してしまわないため。Codexレビュー反映)
+  const completeOnSend = (req.body || {}).completeOnSend;
+  if (completeOnSend !== undefined && typeof completeOnSend !== 'boolean') {
+    return res.status(400).json({ error: '不正なリクエストです (completeOnSend は true/false)' });
+  }
   try {
     const r = createReplyJob({
       inquiryId: inq.id, channelType: inq.channel_type, bodyText: body,
       createdBy: actorOf(req), clientOperationId: opId, baseConversationRev: baseRev,
+      completeOnSend: completeOnSend === true,   // メールディーラーの「返信して完了」
     });
     if (r.conflict) return res.status(409).json({ error: r.conflict });
     res.json({ ok: true, id: r.id, duplicate: !r.created });

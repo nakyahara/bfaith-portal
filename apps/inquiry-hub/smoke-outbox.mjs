@@ -250,6 +250,27 @@ const inqF = mkInquiry(shopEmail, 'email', 'th-f');
     && db.prepare('SELECT COUNT(*) c FROM inquiry_messages WHERE outbox_id = ?').get(job.id).c === 0);
 }
 
+// ─── 8b. 送信して完了にする (メールディーラーの「返信して完了」。2026-07-25) ───
+console.log('8b. 送信して完了');
+{
+  const inqC = mkInquiry(shopEmail, 'email', 'th-complete');
+  const jobC = createReplyJob({ inquiryId: inqC, channelType: 'email', bodyText: 'ご案内は以上です', createdBy: 'u',
+    clientOperationId: 'op-complete-1', baseConversationRev: 0, completeOnSend: true });
+  check('complete_on_send が保存される', db.prepare('SELECT complete_on_send FROM outbox_replies WHERE id = ?').get(jobC.id).complete_on_send === 1);
+  const rc = await runOutboxPass({ email: okAdapter() }, { now: T0 });
+  const inqCRow = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inqC);
+  check('送信成功で「完了」まで進む', rc.results.some(x => x.id === jobC.id && x.outcome === 'sent')
+    && inqCRow.internal_status === 'done' && !!inqCRow.completed_at && inqCRow.is_unread === 0);
+
+  // 既定 (チェックなし) は「返信処理中」止まり
+  const inqW = mkInquiry(shopEmail, 'email', 'th-waiting');
+  const jobW = createReplyJob({ inquiryId: inqW, channelType: 'email', bodyText: '確認します', createdBy: 'u',
+    clientOperationId: 'op-waiting-1', baseConversationRev: 0 });
+  await runOutboxPass({ email: okAdapter() }, { now: T0 });
+  check('既定は「返信処理中」', db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(inqW).internal_status === 'waiting_reply'
+    && db.prepare('SELECT complete_on_send FROM outbox_replies WHERE id = ?').get(jobW.id).complete_on_send === 0);
+}
+
 // ─── 9. issues一覧 ───
 console.log('9. issues一覧');
 {

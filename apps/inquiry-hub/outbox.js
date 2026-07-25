@@ -33,7 +33,7 @@ export class SendRejectedError extends Error {
  * @returns {{ id, created: boolean, conflict?: string }}
  */
 export function createReplyJob({ inquiryId, channelType, bodyText, attachmentsJson = null,
-  createdBy, clientOperationId, baseConversationRev }) {
+  createdBy, clientOperationId, baseConversationRev, completeOnSend = false }) {
   const db = getDB();
   if (!bodyText || !String(bodyText).trim()) throw new Error('本文が空です');
   if (!clientOperationId) throw new Error('clientOperationId は必須です');
@@ -59,9 +59,9 @@ export function createReplyJob({ inquiryId, channelType, bodyText, attachmentsJs
       return { id: null, created: false, conflict: `会話が更新されています (rev ${baseConversationRev} → ${inq.conversation_rev})。内容を確認してから再送信してください` };
     }
     const r = db.prepare(`INSERT INTO outbox_replies
-        (inquiry_id, channel_type, client_operation_id, body_text, attachments_json, created_by, base_conversation_rev)
-      VALUES (?,?,?,?,?,?,?)`)
-      .run(inquiryId, channelType, clientOperationId, String(bodyText), attachmentsJson, createdBy, baseConversationRev);
+        (inquiry_id, channel_type, client_operation_id, body_text, attachments_json, created_by, base_conversation_rev, complete_on_send)
+      VALUES (?,?,?,?,?,?,?,?)`)
+      .run(inquiryId, channelType, clientOperationId, String(bodyText), attachmentsJson, createdBy, baseConversationRev, completeOnSend ? 1 : 0);
     logActivity(inquiryId, { actorType: 'user', userId: createdBy, actionType: 'reply_created',
       operationId: clientOperationId, after: { outbox_id: r.lastInsertRowid } });
     return { id: r.lastInsertRowid, created: true };
@@ -206,11 +206,21 @@ export async function runOutboxPass(adapters, opts = {}) {
           VALUES (?,?,'shop',?,?,0,?,?,?,?)`)
           .run(job.inquiry_id, extReplyId, job.created_by, job.body_text, job.created_by, job.id, sentIso, sentIso);
         // 自送信も conversation_rev++ (以後の送信操作は送信後の会話を基準にする)
-        db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
-            last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
-            internal_status = CASE WHEN internal_status IN ('open','in_progress') THEN 'waiting_reply' ELSE internal_status END,
-            updated_at = ? WHERE id = ?`)
-          .run(sentIso, sentIso, sentIso, job.inquiry_id);
+        // 送信後のステータス (メールディーラー準拠): 通常は「返信処理中」、
+        // 「送信して完了にする」を選んでいれば「完了」まで進める
+        if (job.complete_on_send) {
+          db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
+              last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
+              internal_status = 'done', completed_at = COALESCE(completed_at, ?), is_unread = 0,
+              updated_at = ? WHERE id = ?`)
+            .run(sentIso, sentIso, sentIso, sentIso, job.inquiry_id);
+        } else {
+          db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
+              last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
+              internal_status = CASE WHEN internal_status IN ('open','in_progress','pending') THEN 'waiting_reply' ELSE internal_status END,
+              updated_at = ? WHERE id = ?`)
+            .run(sentIso, sentIso, sentIso, job.inquiry_id);
+        }
         logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_sent',
           operationId: job.client_operation_id, after: { outbox_id: job.id, external_reply_id: extReplyId } });
         return true;

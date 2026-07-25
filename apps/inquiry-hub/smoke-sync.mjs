@@ -111,6 +111,37 @@ console.log('3. 状態遷移');
     && inq.last_message_at === iso(35) && inq.conversation_rev === 3);
   check('再オープンが操作ログに残る', db.prepare(
     "SELECT COUNT(*) c FROM inquiry_activity_logs WHERE inquiry_id=? AND actor_type='system' AND action_type='status_change'").get(inqRow.id).c === 1);
+
+  // メールディーラー準拠のステータス自動遷移 (2026-07-25)
+  // ① 店舗から返信 (メールディーラー等アプリ外からの返信も同期で検知) → 新着系は「返信処理中」へ
+  const withShopReply2 = item({ updatedAt: iso(50), messages: [
+    ...withCustomerMsg.messages,
+    { externalMessageId: 'rk-001-m4', senderType: 'shop', senderName: '店舗', bodyText: '追ってご案内します', isIncoming: 0, sentAt: iso(48) },
+  ]});
+  const r2 = await runSync(shopId, createMockAdapter([withShopReply2]), { now: T0 + 55 * 60000 });
+  inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inqRow.id);
+  check('店舗返信で open→waiting_reply (返信処理中) へ自動遷移',
+    r2.stats.movedToWaiting === 1 && inq.internal_status === 'waiting_reply');
+
+  // ② 返信処理中に顧客から返事 → 新着へ戻る (完了からだけでなく返信処理中からも)
+  const withCustomerAgain = item({ updatedAt: iso(60), messages: [
+    ...withShopReply2.messages,
+    { externalMessageId: 'rk-001-m5', senderType: 'customer', senderName: '顧客A', bodyText: 'ありがとうございます', isIncoming: 1, receivedAt: iso(58) },
+  ]});
+  const r3 = await runSync(shopId, createMockAdapter([withCustomerAgain]), { now: T0 + 65 * 60000 });
+  inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inqRow.id);
+  check('返信処理中に顧客返信 → 新着へ戻る',
+    r3.stats.reopened === 1 && inq.internal_status === 'open' && inq.is_unread === 1);
+  // ③ 完了のまま店舗が追加案内しても完了を維持する (完了後の連絡で受信箱を汚さない)
+  db.prepare("UPDATE inquiries SET internal_status = 'done' WHERE id = ?").run(inqRow.id);
+  const withShopReply3 = item({ updatedAt: iso(70), messages: [
+    ...withCustomerAgain.messages,
+    { externalMessageId: 'rk-001-m6', senderType: 'shop', bodyText: '補足です', isIncoming: 0, sentAt: iso(68) },
+  ]});
+  await runSync(shopId, createMockAdapter([withShopReply3]), { now: T0 + 75 * 60000 });
+  check('完了は店舗返信では変わらない',
+    db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(inqRow.id).internal_status === 'done');
+
 }
 
 // ─── 4. 失敗時: committed_until 据え置き + エラー記録 → 復旧でリセット ───
@@ -227,6 +258,45 @@ console.log('8. synthetic ID・サマリ');
   const status = listSyncStatus();
   check('listSyncStatus', status.length === 1 && status[0].shop_id === shopId
     && typeof status[0].open_errors === 'number' && status[0].open_errors >= 1);
+}
+
+// ─── 9. 1回の同期で顧客・店舗の両方を取り込むケース (独立店舗で検証。Codex R1 high) ───
+// 同期間隔中に往復した場合、件数で判定すると本来「返信処理中」なのに「新着」になってしまう。
+// 時系列で最後のメッセージの向きを見ていることを確認する
+console.log('9. 双方向を一括取込');
+{
+  const shopMix = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','混在店','rk-mix')").run().lastInsertRowid;
+  const mixItem = (msgs, updatedAt) => ({
+    externalInquiryId: 'mix-1', customerName: '顧客M', subject: '混在テスト',
+    receivedAt: iso(0), updatedAt, messages: msgs,
+  });
+  const m1 = { externalMessageId: 'mix-m1', senderType: 'customer', bodyText: '質問です', isIncoming: 1, receivedAt: iso(0) };
+  await runSync(shopMix, createMockAdapter([mixItem([m1], iso(0))]), { now: T0 + 5 * 60000 });
+  const mixId = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id = 'mix-1'").get().id;
+  check('初回は新着', db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(mixId).internal_status === 'open');
+
+  // 顧客返信 → 店舗返信 を1回でまとめて取り込む (最後が店舗)。
+  // 「この同期で新たに未読化しない」ことを見るため、いったん既読にしてから取り込む
+  db.prepare('UPDATE inquiries SET is_unread = 0 WHERE id = ?').run(mixId);
+  const r1 = await runSync(shopMix, createMockAdapter([mixItem([m1,
+    { externalMessageId: 'mix-m2', senderType: 'customer', bodyText: '追加質問', isIncoming: 1, receivedAt: iso(10) },
+    { externalMessageId: 'mix-m3', senderType: 'shop', bodyText: 'ご案内です', isIncoming: 0, sentAt: iso(20) },
+  ], iso(25))]), { now: T0 + 30 * 60000 });
+  const after1 = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(mixId);
+  check('顧客→店舗の一括取込: 最後が店舗なので「返信処理中」(新着にしない)',
+    after1.internal_status === 'waiting_reply' && r1.stats.movedToWaiting === 1 && r1.stats.reopened === 0);
+  check('一括取込でも未読にしない (最後が店舗返信)', after1.is_unread === 0);
+
+  // 店舗返信 → 顧客返信 を1回でまとめて取り込む (最後が顧客)
+  const r2 = await runSync(shopMix, createMockAdapter([mixItem([m1,
+    { externalMessageId: 'mix-m2', senderType: 'customer', bodyText: '追加質問', isIncoming: 1, receivedAt: iso(10) },
+    { externalMessageId: 'mix-m3', senderType: 'shop', bodyText: 'ご案内です', isIncoming: 0, sentAt: iso(20) },
+    { externalMessageId: 'mix-m4', senderType: 'shop', bodyText: '補足です', isIncoming: 0, sentAt: iso(30) },
+    { externalMessageId: 'mix-m5', senderType: 'customer', bodyText: 'ありがとうございます', isIncoming: 1, receivedAt: iso(40) },
+  ], iso(45))]), { now: T0 + 50 * 60000 });
+  const after2 = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(mixId);
+  check('店舗→顧客の一括取込: 最後が顧客なので「新着」+未読',
+    after2.internal_status === 'open' && after2.is_unread === 1 && r2.stats.reopened === 1);
 }
 
 console.log(`\n${failed === 0 ? 'OK' : 'NG'}: ${passed} PASS / ${failed} FAIL`);
