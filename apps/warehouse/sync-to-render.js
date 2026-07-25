@@ -666,5 +666,7 @@ if (isMain) {
   const pmlOnly = process.argv.includes('--pml-only');
   const result = pmlOnly ? await syncPmlSnapshotOnly() : await syncToRender();
   console.log('\n結果:', JSON.stringify(result, null, 2));
-  process.exit(result.ok === false ? 1 : 0);
+  // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
+  // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
+  process.exitCode = result.ok === false ? 1 : 0;
 }

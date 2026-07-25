@@ -253,7 +253,9 @@ async function main() {
     console.error(`[AdsCampaign] ❌ ${failedRanges}/${ranges.length} 期間が失敗 → 不完全データ`);
     process.exit(1);
   }
-  process.exit(0);
+  // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
+  // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
+  process.exitCode = 0;
 }
 
 main().catch(e => {

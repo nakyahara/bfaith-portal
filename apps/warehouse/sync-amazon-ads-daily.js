@@ -316,4 +316,6 @@ for (const entity of targetEntities) {
 
 const failed = outcomes.filter(o => !o.ok);
 console.log(`\n=== summary: ${outcomes.length - failed.length}/${outcomes.length} entities OK ===`);
-process.exit(failed.length > 0 ? 1 : 0);
+// 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
+// (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
+process.exitCode = failed.length > 0 ? 1 : 0;
