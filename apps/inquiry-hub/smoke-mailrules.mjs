@@ -200,6 +200,22 @@ console.log('4. 詳細画面からのルール作成');
   let badCond = null;
   try { applyRuleToExistingMails([{ field: 'from', op: 'contains', value: '' }], { apply: false }); } catch (e) { badCond = e; }
   check('空条件はthrow (全件マッチを防ぐ)', badCond !== null);
+  // Reply-To/To/本文は inquiries に保存していないので既存適用は断る (差出人で代用すると誤爆する)
+  const { canApplyToExisting } = await import('./mail-rules.js');
+  check('canApplyToExisting: from/subject のみ true',
+    canApplyToExisting([{ field: 'from', op: 'equals', value: 'a@b.c' }, { field: 'subject', op: 'contains', value: 'x' }]) === true
+    && canApplyToExisting([{ field: 'reply_to', op: 'contains', value: 'x' }]) === false
+    && canApplyToExisting([{ field: 'body', op: 'contains', value: 'x' }]) === false);
+  let unsupported = null;
+  try { applyRuleToExistingMails([{ field: 'reply_to', op: 'contains', value: 'x' }], { apply: false }); } catch (e) { unsupported = e; }
+  check('非対応フィールドの一括適用はthrow', unsupported !== null && /対応していません/.test(unsupported.message));
+  // 複合条件 (かつ/または) の絞り込み
+  check('複合条件 かつ',
+    applyRuleToExistingMails([{ field: 'from', op: 'ends_with', value: '@amazon.co.jp' }, { field: 'subject', op: 'contains', value: '請求' }],
+      { matchMode: 'all', apply: false }).matched === 1);
+  check('複合条件 または',
+    applyRuleToExistingMails([{ field: 'from', op: 'equals', value: 'customer@gmail.com' }, { field: 'subject', op: 'contains', value: '請求' }],
+      { matchMode: 'any', apply: false }).matched === 2);
 }
 
 // ─── 5. HTTP: 詳細画面のルール作成API ───
@@ -215,22 +231,46 @@ console.log('5. ルール作成API');
   const rakutenInq = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id = 'r1'").get().id;
 
   const html = await (await fetch(`${base2}/inquiries/${mailInq}`)).text();
-  check('メール詳細に「今後の自動処理」パネル', html.includes('今後の自動処理') && html.includes('mrCond'));
+  check('メール詳細に「今後の自動処理」パネル (複合条件3行+かつ/または)', html.includes('今後の自動処理')
+    && html.includes('id="mrField1"') && html.includes('id="mrField3"') && html.includes('id="mrMode"'));
   const htmlRk = await (await fetch(`${base2}/inquiries/${rakutenInq}`)).text();
-  check('楽天詳細にはパネルを出さない', !htmlRk.includes('id="mrCond"'));
+  check('楽天詳細にはパネルを出さない', !htmlRk.includes('id="mrField1"'));
 
-  const rBad = await jp(`/api/inquiries/${rakutenInq}/mail-rule`, { condition: 'from_exact', action: 'skip' });
+  const fromCond = [{ field: 'from', op: 'equals', value: 'customer@gmail.com' }];
+  const rBad = await jp(`/api/inquiries/${rakutenInq}/mail-rule`, { conditions: fromCond, action: 'skip' });
   check('メール以外のチャネルは400', rBad.status === 400);
-  const rBadAction = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'nuke' });
+  const rBadAction = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: fromCond, action: 'nuke' });
   check('不正な扱いは400', rBadAction.status === 400);
-  const rBadCond = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'bogus', action: 'skip' });
-  check('不正な条件は400', rBadCond.status === 400);
+  const rNoCond = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: [], action: 'skip' });
+  check('条件が空は400', rNoCond.status === 400);
+  const rBadField = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: [{ field: 'x-header', op: 'contains', value: 'a' }], action: 'skip' });
+  check('不正なフィールドは400', rBadField.status === 400);
 
-  const rDry = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'skip', applyToExisting: true, dryRun: true });
+  const rDry = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: fromCond, action: 'skip', applyToExisting: true, dryRun: true });
   const dryJson = await rDry.json();
-  check('dryRun: 件数だけ返しルールは作らない', dryJson.matched === 1 && listMailRules().every(r => !String(r.name || '').includes('customer@gmail.com')));
+  check('dryRun: 件数だけ返しルールは作らない', dryJson.matched === 1 && dryJson.canApplyToExisting === true
+    && listMailRules().every(r => !String(r.name || '').includes('customer@gmail.com')));
 
-  const rMake = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'skip', applyToExisting: true });
+  // 複合条件 (メールディーラーと同じ「件名が○○ かつ Reply-Toが△△」。2026-07-25 中原さん要望)
+  const multi = [
+    { field: 'subject', op: 'contains', value: 'Your payment is on the way' },
+    { field: 'reply_to', op: 'contains', value: 'no-reply@amazon.co.jp' },
+  ];
+  const rMultiDry = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: multi, matchMode: 'all', action: 'skip', applyToExisting: true, dryRun: true });
+  const multiDry = await rMultiDry.json();
+  check('複合条件: 説明文が「かつ」で連結される', multiDry.description.includes('かつ') && multiDry.description.includes('Reply-To'));
+  check('Reply-To を含む条件は既存への一括適用に非対応と返す', multiDry.canApplyToExisting === false && multiDry.matched === 0);
+  const rMulti = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: multi, matchMode: 'all', action: 'skip', applyToExisting: true });
+  const multiMade = await rMulti.json();
+  check('複合条件でもルールは作れる (既存適用は0件)', rMulti.status === 200 && multiMade.completed === 0);
+  const multiRule = listMailRules().find(r => r.id === multiMade.id);
+  check('複合条件が2件保存される', JSON.parse(multiRule.conditions_json).length === 2 && multiRule.match_mode === 'all');
+  check('複合条件が評価に効く (両方一致でskip)',
+    evaluateMailRules({ subject: 'Your payment is on the way', reply_to: 'no-reply@amazon.co.jp' })?.action === 'skip');
+  check('片方だけでは一致しない (かつ)',
+    evaluateMailRules({ subject: 'Your payment is on the way', reply_to: 'someone@example.com' }) === null);
+
+  const rMake = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: fromCond, action: 'skip', applyToExisting: true });
   const made = await rMake.json();
   check('ルール作成+既存1件を完了に', rMake.status === 200 && made.completed === 1
     && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(mailInq).internal_status === 'done');

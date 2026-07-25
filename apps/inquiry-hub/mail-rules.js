@@ -111,9 +111,13 @@ export function addMailRule({ name, matchMode = 'all', conditions, action, prior
  */
 export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply = false, actorId = 'portal' } = {}) {
   validateConditions(conditions);
+  if (!canApplyToExisting(conditions)) {
+    // Reply-To/To/本文は inquiries に保存しておらず正確に照合できない。
+    // 差出人で代用すると取りこぼし・過剰完了のどちらも起こるため、明示的に断る
+    throw new Error('この条件は既存メールへの一括適用に対応していません (差出人・件名の条件のみ対応)。今後の取り込みからはルールが効きます');
+  }
   const db = getDB();
-  // inquiries が持っているのは差出人 (customer_identifier) と件名。本文照合は重いので対象外とし、
-  // from/reply_to/to は customer_identifier、subject は subject に対して評価する
+  // inquiries が持っているのは差出人 (customer_identifier) と件名だけ
   const clauses = [], params = [];
   for (const c of conditions) {
     const col = c.field === 'subject' ? 'i.subject' : 'i.customer_identifier';
@@ -150,6 +154,14 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
 }
 /** LIKE用エスケープ (小文字化込み。templates.js の likeEsc と同等) */
 const likeEscLocal = s => String(s).toLowerCase().replace(/[\\%_]/g, c => '\\' + c);
+
+/** 既存メールへの一括適用が可能な条件か (inquiries に保存しているのは差出人と件名だけ)。
+ * 今後の取り込みでは reply_to/to/body も正しく評価される (アダプターが生ヘッダを渡すため) */
+export const EXISTING_APPLICABLE_FIELDS = ['from', 'subject'];
+export function canApplyToExisting(conditions) {
+  return Array.isArray(conditions) && conditions.length > 0
+    && conditions.every(c => EXISTING_APPLICABLE_FIELDS.includes(c?.field));
+}
 
 export function setMailRuleActive(id, active) {
   const r = getDB().prepare(`UPDATE mail_rules SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)

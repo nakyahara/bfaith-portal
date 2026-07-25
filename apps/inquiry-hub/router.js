@@ -25,7 +25,8 @@ import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templa
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
-import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv, applyRuleToExistingMails } from './mail-rules.js';
+import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
+  applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
 // ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
@@ -303,22 +304,38 @@ router.get('/inquiries/:id', (req, res) => {
   const senderAddr = inq.channel_type === 'email' ? String(inq.customer_identifier || '').trim().toLowerCase() : '';
   const senderDomain = senderAddr.includes('@') ? senderAddr.slice(senderAddr.indexOf('@')) : '';
   const subjectSeed = String(inq.subject || '').replace(/[（(].*?[）)]/g, '').trim().slice(0, 40);
+  // メールディーラーの振り分け設定と同じく複数条件を組み合わせられる
+  // (例: 件名が「Your payment is on the way」を含む かつ Reply-To が ○○)
+  const mrFieldOpts = (sel) => Object.entries(RULE_FIELD_LABELS)
+    .map(([k, v]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${v}</option>`).join('');
+  const mrOpOpts = (sel) => Object.entries(RULE_OP_LABELS)
+    .map(([k, v]) => `<option value="${k}"${k === sel ? ' selected' : ''}>${v}</option>`).join('');
+  const mrRow = (n, field, op, value) => `
+        <div class="row rule-row" style="margin-bottom:6px">
+          <select id="mrField${n}">${n > 1 ? '<option value="">(条件なし)</option>' : ''}${mrFieldOpts(field)}</select>
+          <input type="text" id="mrValue${n}" value="${he(value || '')}" placeholder="文字列">
+          <select id="mrOp${n}">${mrOpOpts(op)}</select>
+        </div>`;
   const mailRulePanel = inq.channel_type === 'email' ? `
       <div class="panel">
         <h3>📧 今後の自動処理</h3>
-        <div class="sub" style="margin-bottom:8px">同じようなメールが来たときの扱いをルールにします (📧メールルールタブでいつでも編集・削除できます)</div>
-        <label>条件
-          <select id="mrCond">
-            ${senderAddr ? `<option value="from_exact">この差出人から (${he(senderAddr)})</option>` : ''}
-            ${senderDomain ? `<option value="from_domain">このドメインから (${he(senderDomain)})</option>` : ''}
-            ${subjectSeed ? `<option value="subject">件名に「${he(subjectSeed)}」を含む</option>` : ''}
-          </select></label>
-        <label>扱い
+        <div class="sub" style="margin-bottom:8px">同じようなメールが来たときの扱いをルールにします。条件は組み合わせられます (📧メールルールタブでいつでも編集・削除できます)</div>
+        ${mrRow(1, 'from', 'equals', senderAddr)}
+        ${mrRow(2, '', 'contains', '')}
+        ${mrRow(3, '', 'contains', '')}
+        ${senderDomain ? `<div class="sub">よく使う値: <a href="#" id="mrUseDomain">ドメイン全体 (${he(senderDomain)}) にする</a></div>` : ''}
+        <div class="row rule-row">
+          <select id="mrMode">
+            <option value="all">すべての条件を満たす (かつ)</option>
+            <option value="any">いずれかの条件を満たす (または)</option>
+          </select>
           <select id="mrAction">
             <option value="skip">取り込まない (問い合わせにしない)</option>
             <option value="import_done">取り込むが完了扱い (履歴には残す)</option>
-          </select></label>
+          </select>
+        </div>
         <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールも完了にする</label>
+        <div class="sub">※ 一括適用は差出人・件名の条件のみ対応 (Reply-To/To/本文は今後の取り込みから効きます)</div>
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
 
@@ -431,29 +448,66 @@ router.get('/inquiries/:id', (req, res) => {
     ta.focus();
     toast('AI返信案をコピーしました。内容を確認・編集してから送信してください');
   });
-  // 📧 今後の自動処理 (メールルール作成)
+  // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
   var mrBtn = document.getElementById('mrBtn');
-  if (mrBtn) mrBtn.addEventListener('click', function() {
-    var cond = document.getElementById('mrCond').value;
-    var action = document.getElementById('mrAction').value;
-    var applyExisting = document.getElementById('mrApplyExisting').checked;
-    mrBtn.disabled = true;
-    // まず件数を数えてから確認する (いきなり大量を完了にしない)
-    post('/mail-rule', { condition: cond, action: action, applyToExisting: applyExisting, dryRun: true })
-      .then(function(p) {
-        var msg = 'ルール: ' + p.description + '\\n扱い: ' + (action === 'skip' ? '取り込まない' : '取り込むが完了扱い');
-        if (applyExisting) msg += '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も完了にします';
-        msg += '\\n\\n作成しますか?';
-        if (!confirm(msg)) { mrBtn.disabled = false; return null; }
-        return post('/mail-rule', { condition: cond, action: action, applyToExisting: applyExisting });
-      })
-      .then(function(r) {
-        if (!r) return;
-        toast('ルールを作成しました' + (r.completed ? ' (既存' + r.completed + '件を完了に)' : ''));
-        setTimeout(function(){ location.reload(); }, 1000);
-      })
-      .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
-  });
+  if (mrBtn) {
+    // フィールドを選んだら、この問い合わせの値を候補として自動で入れる (空欄のときだけ)
+    var MR_SEED = ${JSON.stringify({ from: senderAddr || '', subject: subjectSeed || '' }).replace(/</g, '\\u003c')};
+    [1, 2, 3].forEach(function(n) {
+      var f = document.getElementById('mrField' + n), v = document.getElementById('mrValue' + n);
+      if (!f || !v) return;
+      f.addEventListener('change', function() {
+        if (!v.value.trim() && MR_SEED[f.value]) v.value = MR_SEED[f.value];
+      });
+    });
+    // 「ドメイン全体にする」: 1行目を From が @example.com で終わる に切り替える
+    var mrUseDomain = document.getElementById('mrUseDomain');
+    if (mrUseDomain) mrUseDomain.addEventListener('click', function(ev) {
+      ev.preventDefault();
+      document.getElementById('mrField1').value = 'from';
+      document.getElementById('mrOp1').value = 'ends_with';
+      document.getElementById('mrValue1').value = ${JSON.stringify(senderDomain || '')};
+      toast('1行目をドメイン条件にしました');
+    });
+    function collectConditions() {
+      var out = [];
+      [1, 2, 3].forEach(function(n) {
+        var field = document.getElementById('mrField' + n).value;
+        var value = document.getElementById('mrValue' + n).value.trim();
+        if (!field || !value) return;
+        out.push({ field: field, op: document.getElementById('mrOp' + n).value, value: value });
+      });
+      return out;
+    }
+    mrBtn.addEventListener('click', function() {
+      var conditions = collectConditions();
+      if (!conditions.length) { toast('条件を1つ以上入力してください'); return; }
+      var action = document.getElementById('mrAction').value;
+      var matchMode = document.getElementById('mrMode').value;
+      var applyExisting = document.getElementById('mrApplyExisting').checked;
+      mrBtn.disabled = true;
+      // まず件数を数えてから確認する (いきなり大量を完了にしない)
+      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, applyToExisting: applyExisting, dryRun: true })
+        .then(function(p) {
+          var msg = 'ルール: ' + p.description + '\\n扱い: ' + (action === 'skip' ? '取り込まない' : '取り込むが完了扱い');
+          if (applyExisting) {
+            msg += p.canApplyToExisting
+              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も完了にします'
+              : '\\n\\n⚠️ この条件は既存メールへの一括適用に対応していません (差出人・件名の条件のみ)。今後の取り込みからルールが効きます';
+          }
+          msg += '\\n\\n作成しますか?';
+          if (!confirm(msg)) { mrBtn.disabled = false; return null; }
+          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action,
+            applyToExisting: applyExisting && p.canApplyToExisting });
+        })
+        .then(function(r) {
+          if (!r) return;
+          toast('ルールを作成しました' + (r.completed ? ' (既存' + r.completed + '件を完了に)' : ''));
+          setTimeout(function(){ location.reload(); }, 1000);
+        })
+        .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
+    });
+  }
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
@@ -605,46 +659,42 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   const action = String(b.action || '');
   if (!['skip', 'import_done'].includes(action)) return res.status(400).json({ error: '不正な扱いです' });
 
-  const addr = String(inq.customer_identifier || '').trim().toLowerCase();
-  const domain = addr.includes('@') ? addr.slice(addr.indexOf('@')) : '';
-  const subjectSeed = String(inq.subject || '').replace(/[（(].*?[）)]/g, '').trim().slice(0, 40);
-  let conditions, description;
-  switch (String(b.condition || '')) {
-    case 'from_exact':
-      if (!addr) return res.status(400).json({ error: 'この問い合わせには差出人アドレスがありません' });
-      conditions = [{ field: 'from', op: 'equals', value: addr }];
-      description = `差出人が ${addr}`;
-      break;
-    case 'from_domain':
-      if (!domain) return res.status(400).json({ error: '差出人ドメインを特定できません' });
-      conditions = [{ field: 'from', op: 'ends_with', value: domain }];
-      description = `差出人が ${domain} で終わる`;
-      break;
-    case 'subject':
-      if (!subjectSeed) return res.status(400).json({ error: 'この問い合わせには件名がありません' });
-      conditions = [{ field: 'subject', op: 'contains', value: subjectSeed }];
-      description = `件名に「${subjectSeed}」を含む`;
-      break;
-    default:
-      return res.status(400).json({ error: '不正な条件です' });
+  // 条件は画面が組み立てて配列で渡す (メールディーラーと同じく複数条件の組み合わせが可能)。
+  // 値の検証は mail-rules.js の validateConditions (フィールド/演算子のallow-list) に委ねる
+  const conditions = Array.isArray(b.conditions) ? b.conditions : null;
+  if (!conditions || conditions.length === 0) return res.status(400).json({ error: '条件を1つ以上指定してください' });
+  const matchMode = b.matchMode === 'any' ? 'any' : 'all';
+  const glue = matchMode === 'any' ? ' または ' : ' かつ ';
+  let description;
+  try {
+    validateConditions(conditions);
+    description = conditions
+      .map(c => `${RULE_FIELD_LABELS[c.field] || c.field}が「${c.value}」${RULE_OP_LABELS[c.op] || c.op}`)
+      .join(glue);
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
   }
 
   const applyToExisting = b.applyToExisting === true;
+  const applicable = canApplyToExisting(conditions);
   try {
     // 下見: ルールは作らず、既存で何件が対象になるかだけ返す
     if (b.dryRun === true) {
-      const { matched } = applyRuleToExistingMails(conditions, { apply: false });
-      return res.json({ ok: true, description, matched: applyToExisting ? matched : 0 });
+      const matched = applicable
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: false }).matched : 0;
+      return res.json({ ok: true, description, canApplyToExisting: applicable, matched: applyToExisting ? matched : 0 });
     }
     // ルール作成と既存への一括適用は同一トランザクションで (途中で失敗したときに
     // ルールだけ残り、再試行で重複ルールができるのを防ぐ。Codexレビュー反映)
     const { created, completed } = getDB().transaction(() => {
       const c = addMailRule({
-        name: `${description} → ${action === 'skip' ? '取り込まない' : '完了扱い'}`,
-        matchMode: 'all', conditions, action, priority: 50,
+        name: `${description} → ${action === 'skip' ? '取り込まない' : '完了扱い'}`.slice(0, 200),
+        matchMode, conditions, action, priority: 50,
       });
-      const n = applyToExisting
-        ? applyRuleToExistingMails(conditions, { apply: true, actorId: actorOf(req) }).completed
+      // 既存への一括適用は差出人・件名の条件のみ (Reply-To/To/本文は inquiries に無いため)。
+      // 非対応の条件でも「今後の取り込み」からはルールが効く
+      const n = (applyToExisting && applicable)
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req) }).completed
         : 0;
       return { created: c, completed: n };
     }).immediate();
@@ -1634,6 +1684,11 @@ td.ops button { margin: 2px 4px 2px 0; }
 .expiry-edit { display: flex; gap: 4px; margin-top: 4px; align-items: center; }
 .expiry-edit input[type=date] { padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
 .expiry-edit button { padding: 3px 10px; font-size: 12px; }
+
+/* 詳細サイドバーの条件行: 幅が狭いので [項目][条件] を上段・[値] を下段全幅に */
+.panel .row.rule-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.panel .row.rule-row > select { flex: 1 1 calc(50% - 3px); min-width: 0; }
+.panel .row.rule-row > input[type=text] { flex: 1 1 100%; min-width: 0; order: 3; margin-top: 0; }
 
 /* ═══ Gmail風レイアウト: 左サイドバー + 本文 ═══ */
 .layout { display: flex; align-items: flex-start; }
