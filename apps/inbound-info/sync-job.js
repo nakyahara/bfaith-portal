@@ -19,9 +19,13 @@ import cron from 'node-cron';
 import { syncNewProducts } from './db.js';
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
 
+// 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
+const OFF = new Set(['false', '0', 'off', 'no']);
+
 export function startInboundInfoCron() {
-  if (process.env.INBOUND_INFO_SYNC_ENABLED === 'false') {
-    console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED=false)');
+  const flag = String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase();
+  if (OFF.has(flag)) {
+    console.log(`[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED=${flag})`);
     return;
   }
   // timezone を明示 (Codex R1 Low: 未指定だとプロセスのローカル TZ 依存になり、

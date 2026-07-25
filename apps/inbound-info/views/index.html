@@ -499,7 +499,8 @@ async function doPrint() {
     return;
   }
   if (state.total > PRINT_CONFIRM_ROWS
-      && !confirm(`${state.total}件を印刷します (A4横で約${Math.ceil(state.total / 45)}ページ)。よろしいですか？\n`
+      && !confirm(`${state.total}件を印刷します。よろしいですか？\n`
+        + '(A4横で1ページ約45行。商品名やmemoが長い行は折り返すのでページ数はこれより増えます)\n'
         + '件数を絞るには、上の絞り込みや検索を使ってください。')) return;
   const btn = document.getElementById('btn-print');
   btn.disabled = true;
@@ -533,7 +534,10 @@ async function doPrint() {
       </table>`;
     window.print();
   } catch (e) {
-    showMsg('msg-list', 'err', '印刷用データの取得に失敗しました: ' + e.message);
+    const m = e.message === 'too_many_rows'
+      ? '件数が多すぎて一度に印刷できません。絞り込みや検索で件数を絞ってください。'
+      : e.message;
+    showMsg('msg-list', 'err', '印刷用データの取得に失敗しました: ' + m);
   } finally { btn.disabled = false; }
 }
 

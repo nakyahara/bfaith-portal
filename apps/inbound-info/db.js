@@ -72,6 +72,9 @@ export function stats() {
 // limit = 'all' … LIMIT/OFFSET を付けず該当全件を 1 クエリで返す (印刷用)。
 //   OFFSET で分割取得すると、取得中に他の人が保存して並び順キー (source) が変わり、
 //   ページ境界で行の重複・欠落が起きるため (Codex R3 Medium)。
+//   ただし無制限だと直接 API を叩かれた時に全行の JSON 化でプロセスを圧迫できるので、
+//   MAX_ALL_ROWS を超える場合は黙って切らずに error='too_many_rows' を返す (Codex R4 Medium)。
+const MAX_ALL_ROWS = 20000; // 現状 約4900件 (入数マスタ全件)
 export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } = {}) {
   const db = getMirrorDB();
   const scheduled = filter === 'scheduled';
@@ -95,6 +98,10 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
     ? 'ORDER BY CASE WHEN s.seq IS NULL THEN 1 ELSE 0 END, s.seq, i.code_key'
     : "ORDER BY (i.source = 'auto') DESC, i.code_key";
   const total = db.prepare(`SELECT COUNT(*) AS c FROM ${from} ${where}`).get(...params).c;
+  if (all && total > MAX_ALL_ROWS) {
+    return { total, rows: [], offset: 0, limit: 'all', order: scheduled ? 'csv' : 'code',
+             error: 'too_many_rows', max_rows: MAX_ALL_ROWS };
+  }
   const lim = all ? null : Math.min(Math.max(1, Number(limit) || 100), 500);
   const off = all ? 0 : Math.max(0, Number(offset) || 0);
   const rows = db.prepare(`

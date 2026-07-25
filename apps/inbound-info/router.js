@@ -52,7 +52,10 @@ router.get('/api/list', (req, res) => {
     const { q, filter, offset } = req.query;
     // limit=all は印刷用 (該当全件を1クエリで返す)。それ以外は db.js 側で 1〜500 に丸める
     const limit = req.query.limit === 'all' ? 'all' : req.query.limit;
-    res.json({ ok: true, result: listInbound({ q, filter, offset, limit }) });
+    const result = listInbound({ q, filter, offset, limit });
+    // limit=all で上限超過 (現実的には起こらないが API 契約として上限を持つ)
+    if (result.error) return res.status(413).json({ ok: false, error: result.error, total: result.total, max_rows: result.max_rows });
+    res.json({ ok: true, result });
   } catch (e) {
     console.error('[inbound-info] list', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });

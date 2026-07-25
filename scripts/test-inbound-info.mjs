@@ -206,6 +206,7 @@ const allList = listInbound({ limit: 'all' });
 ok(allList.limit === 'all' && allList.rows.length === allList.total && allList.total === stats().total,
   `limit='all' は該当全件を返す (${allList.rows.length}/${allList.total})`);
 ok(listInbound({ limit: 99999 }).rows.length <= 500, 'limit は通常 500 件で丸める');
+ok(!listInbound({ limit: 'all' }).error, `limit='all' は上限内なら error なし (現在 ${allList.total}件)`);
 // updateInbound は保存後の行 (正規化済み・新 version) を返す
 const upRow = listInbound({ limit: 1 }).rows[0];
 const upRes = updateInbound(upRow.code_key, { memo: '  前後に空白  ' }, 'tester', upRow.version);
