@@ -12,6 +12,8 @@
     <div class="field">
       <label class="req">NE商品コード</label>
       <input type="text" id="f-ne-code" placeholder="例: ABC-001">
+      <!-- NE の代表商品コードで判定。子SKUを入れた場合は代表コードへの差し替えを提案する -->
+      <div id="variation-hint" style="margin-top:6px; font-size:12px;"></div>
     </div>
     <div class="field">
       <label>公式ページURL (AI生成に必須。後からでも可)</label>
@@ -37,6 +39,57 @@
 <script>
   const btn = document.getElementById('create-btn');
   const out = document.getElementById('create-result');
+
+  // ─── NE バリエーション判定 (入力欄を離れたら問い合わせる) ───
+  const neInput = document.getElementById('f-ne-code');
+  const hint = document.getElementById('variation-hint');
+  let lastChecked = null;
+
+  neInput.addEventListener('blur', checkVariation);
+  async function checkVariation() {
+    const code = neInput.value.trim();
+    if (!code || code === lastChecked) return;
+    lastChecked = code;
+    hint.textContent = 'NE商品マスタを確認中…';
+    hint.style.color = '#94a3b8';
+    try {
+      const res = await fetch('/apps/product-hub/api/variation?ne_code=' + encodeURIComponent(code));
+      const j = await res.json();
+      if (!j.ok) { hint.textContent = ''; return; }
+      hint.innerHTML = '';
+      if (j.kind === 'variation' && j.isChild) {
+        // 楽天は1ページ=代表コード単位。自動では変えず、人に決めさせる
+        hint.style.color = '#b45309';
+        const span = document.createElement('span');
+        span.textContent = '⚠️ これは代表商品コード「' + j.groupKey + '」のバリエーション子SKUです ('
+          + j.memberCount + ' SKU)。楽天は1ページ＝代表コード単位です。';
+        const b = document.createElement('button');
+        b.className = 'btn btn-sm';
+        b.type = 'button';
+        b.style.marginLeft = '8px';
+        b.textContent = '「' + j.groupKey + '」に変更';
+        b.addEventListener('click', function () {
+          neInput.value = j.groupKey;
+          lastChecked = null;
+          checkVariation();
+        });
+        hint.appendChild(span);
+        hint.appendChild(b);
+      } else if (j.kind === 'variation') {
+        hint.style.color = '#166534';
+        hint.textContent = '✅ バリエーション商品です (代表コード ' + j.groupKey + ' に ' + j.memberCount + ' SKU)';
+      } else if (j.kind === 'single') {
+        hint.style.color = '#64748b';
+        hint.textContent = '単品です (NEに代表商品コードの登録なし)';
+      } else {
+        hint.style.color = '#94a3b8';
+        hint.textContent = 'NE商品マスタに見つかりません (未登録の新商品なら問題ありません)';
+      }
+    } catch (e) {
+      hint.textContent = '';
+    }
+  }
+
   btn.addEventListener('click', async () => {
     btn.disabled = true;
     out.textContent = '登録中… (Notionカードも作成します)';

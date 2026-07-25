@@ -1,6 +1,10 @@
 <%- include('_header') %>
 <div class="wrap">
 
+  <div style="margin-bottom:12px;">
+    <a class="btn" href="/apps/product-hub">← 一覧に戻る</a>
+  </div>
+
   <!-- ステータス + Notion -->
   <div class="card">
     <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
@@ -49,10 +53,74 @@
     </div>
   </div>
 
+  <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
+  <div class="card">
+    <h2>バリエーション</h2>
+    <% if (variation.kind === 'variation') { %>
+      <div style="font-size:13px; margin-bottom:10px;">
+        <strong>バリエーションあり</strong> — 代表商品コード
+        <button type="button" class="copy-code" data-code="<%= variation.groupKey %>" title="クリックでコピー"><%= variation.groupKey %><span class="copy-hint">📋 コピー</span></button>
+        に <strong><%= variation.memberCount %> SKU</strong> がぶら下がっています
+        <span class="muted">(NE判定)</span>
+      </div>
+      <% if (variation.isChild) { %>
+        <div class="banner-warn" style="margin:0 0 10px;">
+          <div>
+            ⚠️ このドラフトの商品コード <code><%= draft.ne_code %></code> は<strong>子SKU</strong>です。
+            楽天は1ページ＝代表コード単位なので、<code><%= variation.groupKey %></code> にまとめることを推奨します。
+            <% if (regroup) { %>
+              <div class="muted" style="margin-top:4px;">まとめられません: <%= regroup %></div>
+            <% } %>
+          </div>
+          <% if (!regroup) { %>
+            <button class="btn btn-sm btn-primary" id="regroup-btn"
+                    data-from="<%= draft.ne_code %>" data-to="<%= variation.groupKey %>"
+                    style="white-space:nowrap">代表コードにまとめる</button>
+          <% } %>
+        </div>
+      <% } %>
+      <details>
+        <summary style="cursor:pointer; font-size:13px; font-weight:600;">SKU一覧 (<%= variation.members.length %>件)</summary>
+        <table class="list" style="margin-top:8px;">
+          <thead><tr><th style="width:200px">商品コード</th><th>商品名</th><th style="width:110px">取扱区分</th><th style="width:70px">在庫</th></tr></thead>
+          <tbody>
+            <% for (const m of variation.members) { %>
+              <tr<%= String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase() ? ' style="background:#eff6ff"' : '' %>>
+                <td><code style="font-size:12px"><%= m.商品コード %></code></td>
+                <td><%= m.商品名 || '' %></td>
+                <td class="muted"><%= m.取扱区分 || '' %></td>
+                <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      </details>
+    <% } else if (variation.kind === 'single') { %>
+      <p class="muted" style="margin:0;">単品です（NEに代表商品コードの登録なし）。</p>
+    <% } else if (variation.kind === 'conflict') { %>
+      <div class="banner-warn" style="margin:0;">
+        ⚠️ NE商品マスタに商品コード <code><%= draft.ne_code %></code> が
+        <strong><%= variation.memberCount %>件</strong>あります（大文字小文字・空白違いの重複）。
+        どちらのグループか判定できないため、NE側の重複を解消してください。
+      </div>
+    <% } else { %>
+      <p class="muted" style="margin:0;">
+        商品コード <code><%= draft.ne_code %></code> はNE商品マスタに見つかりませんでした（未登録の新商品など）。
+        判定できないため、下の「バリエーションあり」チェックが手動の値として使われます。
+      </p>
+    <% } %>
+  </div>
+
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
     <!-- 基本情報 -->
     <div class="card">
       <h2>基本情報</h2>
+      <div class="field">
+        <label>商品コード (NE / 楽天管理番号)</label>
+        <!-- 登録後の変更は影響範囲が広い (Notionカード・NE突合のキー) ので表示専用。クリックでコピー -->
+        <button type="button" class="copy-code" data-code="<%= draft.ne_code %>"
+                title="クリックでコピー"><%= draft.ne_code %><span class="copy-hint">📋 コピー</span></button>
+      </div>
       <div class="field">
         <label class="req">商品名</label>
         <input type="text" id="f-name" value="<%= draft.name %>">
@@ -89,7 +157,18 @@
         <input type="url" id="f-drive-folder" value="<%= draft.drive_folder_url || '' %>" placeholder="https://drive.google.com/drive/folders/...">
       </div>
       <div class="field">
-        <label><input type="checkbox" id="f-has-variation" style="width:auto" <%= draft.has_variation ? 'checked' : '' %>> バリエーションあり (サイズ・色違い)</label>
+        <% if (hasVariation.source === 'ne') { %>
+          <!-- NE にある商品は NE が正 (中原さん決定 2026-07-25)。手入力させず判定結果を出す -->
+          <label>バリエーション</label>
+          <div style="font-size:13px;">
+            <%= hasVariation.value ? 'あり' : 'なし' %>
+            <span class="muted">— NE商品マスタの判定<%= hasVariation.value ? ` (代表 ${variation.groupKey} / ${variation.memberCount} SKU)` : '' %></span>
+          </div>
+          <!-- NE 判定時は保存リクエストに含めない (サーバー側でも無視される) -->
+        <% } else { %>
+          <label><input type="checkbox" id="f-has-variation" style="width:auto" <%= draft.has_variation ? 'checked' : '' %>> バリエーションあり (サイズ・色違い)</label>
+          <div class="muted">NEに無い商品のため手動指定です。NEに登録されると自動判定に切り替わります。</div>
+        <% } %>
       </div>
       <div class="field">
         <label>メモ</label>
@@ -387,11 +466,31 @@
       asin: document.getElementById('f-asin').value,
       amazon_url: document.getElementById('f-amazon-url').value,
       own_brand: document.getElementById('f-own-brand').checked,
-      has_variation: document.getElementById('f-has-variation').checked,
+      // NE で判定できる商品はキーごと送らない (DB に焼かせない)
+      ...hasVariationPayload(),
       drive_folder_url: document.getElementById('f-drive-folder').value,
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
+
+  function hasVariationPayload() {
+    const el = document.getElementById('f-has-variation');
+    return el ? { has_variation: el.checked } : {};
+  }
+
+  // 子SKUのドラフトを代表商品コードにまとめる。
+  // 画面に出した from/to をサーバーへ送り、実行時の再計算と一致した場合だけ適用させる
+  const regroupBtn = document.getElementById('regroup-btn');
+  if (regroupBtn) {
+    regroupBtn.addEventListener('click', async () => {
+      const from = regroupBtn.getAttribute('data-from');
+      const to = regroupBtn.getAttribute('data-to');
+      if (!confirm('このドラフトの商品コードを「' + from + '」から代表商品コード「' + to + '」に変更します。\n\nよろしいですか?')) return;
+      regroupBtn.disabled = true;
+      const json = await post(BASE + '/regroup', { expected_from: from, expected_to: to });
+      if (json.ok) { location.reload(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
+    });
+  }
 
   // 取り込みテストデータの掃除 (取り込み由来のみ。Notion 側のカードには触らない)
   const deleteDraftBtn = document.getElementById('delete-draft-btn');

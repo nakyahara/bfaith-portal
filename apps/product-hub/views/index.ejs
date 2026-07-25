@@ -49,7 +49,8 @@
           <tr>
             <th style="width:60px">画像</th>
             <th>商品名</th>
-            <th style="width:140px">NEコード</th>
+            <th style="width:160px">商品コード</th>
+            <th style="width:120px">バリエーション</th>
             <th style="width:110px">ステータス</th>
             <th style="width:90px">出自</th>
             <th style="width:90px">Notion</th>
@@ -67,7 +68,21 @@
                 <% } %>
               </td>
               <td><a href="/apps/product-hub/detail/<%= d.id %>" style="color:#1d4ed8; text-decoration:none;"><%= d.name %></a></td>
-              <td><code style="font-size:12px"><%= d.ne_code %></code></td>
+              <td>
+                <button type="button" class="copy-code" data-code="<%= d.ne_code %>" title="クリックでコピー"><%= d.ne_code %><span class="copy-hint">📋</span></button>
+              </td>
+              <td style="font-size:12px;">
+                <% if (d.variation.kind === 'variation') { %>
+                  あり <span class="muted">(<%= d.variation.memberCount %>SKU)</span>
+                  <% if (d.variation.isChild) { %><br><span style="color:#b45309">⚠️ 子SKU</span><% } %>
+                <% } else if (d.variation.kind === 'single') { %>
+                  <span class="muted">なし</span>
+                <% } else if (d.variation.kind === 'conflict') { %>
+                  <span style="color:#b45309" title="NE商品マスタに同じ商品コードが重複しています">⚠️ 重複</span>
+                <% } else { %>
+                  <span class="muted" title="NE商品マスタに見つかりません">—</span>
+                <% } %>
+              </td>
               <td><span class="badge badge-<%= d.status %>"><%= statusLabels[d.status] || d.status %></span></td>
               <td>
                 <% if (d.source === 'notion_import') { %>
