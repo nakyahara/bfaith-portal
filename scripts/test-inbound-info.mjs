@@ -201,6 +201,16 @@ const got = getInbound(one.商品コード.toUpperCase());
 ok(got && got.code_key === one.code_key && typeof got.version === 'number',
   'getInbound: 大文字小文字を問わず1行取得 (version 付き)');
 ok(getInbound('存在しないコードzz') === null, 'getInbound: 無いコードは null');
+// limit='all' (印刷用): 500件上限を無視して該当全件を1クエリで返す
+const allList = listInbound({ limit: 'all' });
+ok(allList.limit === 'all' && allList.rows.length === allList.total && allList.total === stats().total,
+  `limit='all' は該当全件を返す (${allList.rows.length}/${allList.total})`);
+ok(listInbound({ limit: 99999 }).rows.length <= 500, 'limit は通常 500 件で丸める');
+// updateInbound は保存後の行 (正規化済み・新 version) を返す
+const upRow = listInbound({ limit: 1 }).rows[0];
+const upRes = updateInbound(upRow.code_key, { memo: '  前後に空白  ' }, 'tester', upRow.version);
+ok(upRes.ok && upRes.row && upRes.row.memo === '前後に空白' && upRes.row.version === upRow.version + 1,
+  'updateInbound: 保存後の行を返す (trim済み・version+1)');
 
 // ─── 7. Codex R1/R2 対応の検証 ───
 console.log('\n[7] 楽観ロック / 一括トランザクション');

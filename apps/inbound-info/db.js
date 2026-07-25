@@ -69,9 +69,13 @@ export function stats() {
 // 並び順: 通常は 新着優先 → コード順。'scheduled' だけは CSV の行順 (f_inbound_schedule.seq)。
 //   現場は nefuda.csv の並びで入荷品を検品するため、画面もその順に合わせる。
 //   seq が NULL (seq 列追加前に取得したスナップショット) の行は末尾へ寄せてコード順にする。
+// limit = 'all' … LIMIT/OFFSET を付けず該当全件を 1 クエリで返す (印刷用)。
+//   OFFSET で分割取得すると、取得中に他の人が保存して並び順キー (source) が変わり、
+//   ページ境界で行の重複・欠落が起きるため (Codex R3 Medium)。
 export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } = {}) {
   const db = getMirrorDB();
   const scheduled = filter === 'scheduled';
+  const all = limit === 'all';
   const conds = [];
   const params = [];
   const term = String(q || '').trim();
@@ -91,16 +95,16 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
     ? 'ORDER BY CASE WHEN s.seq IS NULL THEN 1 ELSE 0 END, s.seq, i.code_key'
     : "ORDER BY (i.source = 'auto') DESC, i.code_key";
   const total = db.prepare(`SELECT COUNT(*) AS c FROM ${from} ${where}`).get(...params).c;
-  const lim = Math.min(Math.max(1, Number(limit) || 100), 500);
-  const off = Math.max(0, Number(offset) || 0);
+  const lim = all ? null : Math.min(Math.max(1, Number(limit) || 100), 500);
+  const off = all ? 0 : Math.max(0, Number(offset) || 0);
   const rows = db.prepare(`
     SELECT i.code_key, i.商品コード, i.商品名, i.入数, i.入庫時BCシール貼りフラグ, i.直接ピックロケ保管,
            i.BF保管荷姿, i.いろは在庫化作業有無, i.memo, i.source, i.version, i.updated_at, i.updated_by
       FROM ${from} ${where}
      ${orderBy}
-     LIMIT ? OFFSET ?
-  `).all(...params, lim, off);
-  return { total, rows, offset: off, limit: lim, order: scheduled ? 'csv' : 'code' };
+     ${all ? '' : 'LIMIT ? OFFSET ?'}
+  `).all(...params, ...(all ? [] : [lim, off]));
+  return { total, rows, offset: off, limit: all ? 'all' : lim, order: scheduled ? 'csv' : 'code' };
 }
 
 // ─── 1行取得 (UI の競合復旧用: 一覧全体を再読込せずその行だけ最新化する) ───
@@ -149,7 +153,9 @@ export function updateInbound(key, fields, user, expectedVersion) {
     const exists = db.prepare('SELECT 1 FROM f_inbound_info WHERE code_key = ?').get(k);
     return { ok: false, error: exists ? 'conflict' : 'not_found' };
   }
-  return { ok: true };
+  // 保存後の行を返す (Codex R3 Medium): 画面は一覧を再読込せずこの行だけ差し替えるため、
+  // trim / 空文字→NULL / 500文字切り詰め後の「実際に保存された値」と新しい version を渡す。
+  return { ok: true, row: getInbound(k) };
 }
 
 // ─── 手動追加 (mirror_products に実在するコードのみ) ───

@@ -13,6 +13,8 @@
            display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; }
   header h1 { margin:0; font-size:18px; }
   header .sub { color:var(--gray); font-size:13px; }
+  header .back { display:inline-block; color:var(--blue); font-size:13px; text-decoration:none; margin-bottom:2px; }
+  header .back:hover { text-decoration:underline; }
   .chips { display:flex; gap:8px; flex-wrap:wrap; }
   .chip { background:#eef2f7; border:1px solid var(--line); border-radius:999px; padding:4px 12px; font-size:12px; }
   .chip b { font-size:14px; }
@@ -55,7 +57,6 @@
   .pager { display:flex; gap:8px; align-items:center; margin-top:10px; font-size:13px; }
   .hint { font-size:12px; color:var(--gray); margin-top:3px; }
   .code { font-family:ui-monospace, Consolas, monospace; }
-  .import-box { border:1px dashed #94a3b8; border-radius:8px; padding:16px; margin-top:8px; }
 
   /* ─── 印刷 ─── 画面では隠し、印刷時だけ #print-area を出す (A4横・見出し行はページ毎に再掲) */
   #print-area { display:none; }
@@ -79,8 +80,9 @@
 <body>
 <header>
   <div>
+    <a href="/" class="back">← B-Faithポータルに戻る</a>
     <h1>📥 入庫情報管理</h1>
-    <div class="sub">旧「入庫情報管理表」スプレッドシートの移行先。新商品はNE商品マスタ(ミラー)から毎日自動追加されます</div>
+    <div class="sub">新商品はNE商品マスタ(ミラー)から毎日 9:00 に自動追加されます (入荷予定 nefuda.csv も同時に自動取得)</div>
   </div>
   <div class="chips">
     <span class="chip">総件数 <b id="st-total">–</b></span>
@@ -92,7 +94,6 @@
 <div class="tabs">
   <div class="tab active" data-tab="list">入数マスタ</div>
   <div class="tab" data-tab="origin">原産国</div>
-  <div class="tab" data-tab="import">Excel取込</div>
 </div>
 
 <!-- ─── 入数マスタ ─── -->
@@ -155,22 +156,6 @@
     <tbody id="tbody-origin"></tbody>
   </table>
   <p class="hint">画像はスプレッドシート側に実体が無かったため「有無フラグ」のみ移行しています。</p>
-</div>
-
-<!-- ─── Excel取込 ─── -->
-<div class="panel" id="panel-import">
-  <h2>Excel取込 (初回移行・再取込)</h2>
-  <div class="import-box">
-    <p style="margin-top:0">「入庫情報管理表.xlsx」(シート: 入数マスタ / 原産国) を選択してください。
-       まず<b>プレビュー</b>で件数を確認し、問題なければ<b>本取込</b>を実行します。</p>
-    <input type="file" id="file" accept=".xlsx">
-    <div style="margin-top:10px; display:flex; gap:8px">
-      <button class="btn-blue" onclick="doImport(true)">① プレビュー (書き込みなし)</button>
-      <button class="btn-orange" id="btn-import-live" onclick="doImport(false)" disabled>② 本取込</button>
-    </div>
-    <p class="hint">本取込は同じ商品コードの行を Excel の値で上書きします (画面で編集した内容より Excel が優先されます)。</p>
-  </div>
-  <div class="msg" id="msg-import"></div>
 </div>
 
 <!-- 印刷用 (画面では非表示。doPrint() が中身を組んで window.print() を呼ぶ) -->
@@ -317,14 +302,14 @@ document.getElementById('tbody-list').addEventListener('input', (ev) => {
   if (btn) btn.disabled = false;
   if (inp.dataset.f === '入数') inp.closest('td').classList.toggle('miss', inp.value.trim() === '');
 });
-// Enter でその行を保存 (テンキー入力のみで完結させる)
+// Enter でその行を保存 (テンキー入力のみで完結させる)。保存中の連打は無視する
 document.getElementById('tbody-list').addEventListener('keydown', (ev) => {
   if (ev.key !== 'Enter') return;
   const inp = ev.target.closest('input[data-f]');
   if (!inp) return;
   ev.preventDefault();
   const tr = inp.closest('tr');
-  if (tr?.classList.contains('dirty')) saveRow(tr.dataset.key);
+  if (tr?.classList.contains('dirty') && tr.dataset.saving !== '1') saveRow(tr.dataset.key);
 });
 document.getElementById('tbody-list').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button[data-act]');
@@ -334,30 +319,38 @@ document.getElementById('tbody-list').addEventListener('click', (ev) => {
   if (btn.dataset.act === 'save') saveRow(key);
   else if (btn.dataset.act === 'del') delRow(key);
 });
+// 保存中はその行の入力を readOnly にする (Codex R3 High): 通信中に打った文字は送信されていないのに
+// 応答後に dirty を落とすと「保存済み」に見えて入力が失われるため、そもそも打てないようにする。
+function setRowBusy(tr, busy) {
+  tr.dataset.saving = busy ? '1' : '';
+  tr.querySelectorAll('input[data-f]').forEach(inp => { inp.readOnly = busy; });
+  tr.querySelectorAll('button[data-act]').forEach(b => { b.disabled = busy; });
+}
 async function saveRow(key) {
   const tr = findTr(key);
-  if (!tr) return;
+  if (!tr || tr.dataset.saving === '1') return;
   const fields = {};
   tr.querySelectorAll('input[data-f]').forEach(inp => { fields[inp.dataset.f] = inp.value; });
-  const btn = tr.querySelector('button[data-act="save"]');
   const expected = window._rows[key]?.version ?? null;
-  if (btn) btn.disabled = true;
+  const focused = document.activeElement?.closest?.('tr') === tr ? document.activeElement.dataset.f : null;
+  setRowBusy(tr, true);
   try {
-    await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const r = await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code_key: key, fields, expected_version: expected }) });
-    // 一覧全体を再読込すると他の行の未保存入力が消えるため、保存した行だけを更新する
-    const cur = window._rows[key];
-    if (cur) {
-      Object.assign(cur, fields, { version: (Number(cur.version) || 1) + 1, source: 'manual' });
-      cur.入数 = fields.入数 === '' ? null : Number(fields.入数);
+    // 一覧全体を再読込すると他の行の未保存入力が消えるため、保存した行だけを差し替える。
+    // 値はサーバーが返した保存後の行 (trim・空→NULL・500文字切り詰め済み) を正とする。
+    if (r.row) {
+      window._rows[key] = r.row;
+      tr.outerHTML = rowHtml(r.row);
     }
-    tr.classList.remove('dirty', 'new-row');
-    tr.classList.add('saved');
-    setTimeout(() => tr.classList.remove('saved'), 1500);
+    const tr2 = findTr(key) || tr;
+    tr2.classList.add('saved');
+    setTimeout(() => tr2.classList.remove('saved'), 1500);
+    if (focused) tr2.querySelector(`input[data-f="${CSS.escape(focused)}"]`)?.focus();
     showMsg('msg-list', 'ok', `「${window._rows[key]?.商品コード ?? key}」を保存しました`);
     loadStats();
   } catch (e) {
-    if (btn) btn.disabled = false;
+    setRowBusy(tr, false);
     if (e.message === 'conflict' || e.message === 'not_found') {
       await reloadRow(key, e.message);
       return;
@@ -494,38 +487,33 @@ async function refreshSchedule() {
 }
 
 // ─── 印刷 ───
-// 画面はページング (100件) しているが、印刷は今の絞り込み・検索の全件を出す。
+// 画面はページング (100件) しているが、印刷は今の絞り込み・検索の全件を出す (件数の打ち切りはしない)。
+// 取得は limit=all の 1 リクエスト = 1 クエリ。分割取得すると取得中の保存で並び順が変わり
+// ページ境界で重複・欠落が起き得るため (Codex R3 Medium)。
 // 印刷用の静的テーブルを #print-area に組んで window.print() を呼ぶ (別ウィンドウを開かないので
 // ポップアップブロックの影響を受けない)。
-const PRINT_CAP = 3000; // 万一「すべて」で全4900件を印刷しようとした時の上限
-async function fetchAllRows() {
-  const rows = [];
-  let total = 0;
-  for (let offset = 0; ; offset += 500) {
-    const p = new URLSearchParams({ q: state.q, filter: state.filter, offset, limit: 500 });
-    const { result } = await api('/list?' + p.toString());
-    total = result.total;
-    rows.push(...result.rows);
-    if (result.rows.length === 0 || rows.length >= Math.min(total, PRINT_CAP)) break;
-  }
-  return { rows: rows.slice(0, PRINT_CAP), total };
-}
+const PRINT_CONFIRM_ROWS = 500; // これを超える件数は紙が大量になるので一度確認する
 async function doPrint() {
   if (dirtyCount() > 0) {
     showMsg('msg-list', 'err', '未保存の行があります。保存してから印刷してください (印刷内容は保存済みのデータです)');
     return;
   }
+  if (state.total > PRINT_CONFIRM_ROWS
+      && !confirm(`${state.total}件を印刷します (A4横で約${Math.ceil(state.total / 45)}ページ)。よろしいですか？\n`
+        + '件数を絞るには、上の絞り込みや検索を使ってください。')) return;
   const btn = document.getElementById('btn-print');
   btn.disabled = true;
   try {
-    const { rows, total } = await fetchAllRows();
+    const qs = new URLSearchParams({ q: state.q, filter: state.filter, limit: 'all' });
+    const { result } = await api('/list?' + qs.toString());
+    const rows = result.rows;
     const now = new Date(Date.now() + 9 * 3600 * 1000);
     const p = (n) => String(n).padStart(2, '0');
     const stamp = `${now.getUTCFullYear()}/${p(now.getUTCMonth() + 1)}/${p(now.getUTCDate())} ${p(now.getUTCHours())}:${p(now.getUTCMinutes())}`;
     const meta = [
       `絞り込み: ${FILTER_LABEL[state.filter] || state.filter}`,
       state.q ? `検索: ${state.q}` : null,
-      `${rows.length}件${total > rows.length ? ` (全${total}件のうち先頭${rows.length}件のみ印刷)` : ''}`,
+      `${rows.length}件`,
       state.order === 'csv' ? 'nefuda.csv の並び順' : '商品コード順',
       `印刷 ${stamp}`,
     ].filter(Boolean);
@@ -646,36 +634,6 @@ async function originDel(id) {
     showMsg('msg-origin', 'err', '削除に失敗しました: ' + e.message);
   }
 }
-
-// ─── Excel取込 ───
-function reportText(label, rep) {
-  if (!rep) return `${label}: シートなし (スキップ)`;
-  if (rep.error) return `${label}: ヘッダー不一致のためスキップ (${rep.error})`;
-  let t = `${label}: 対象${rep.total}行 → 新規${rep.inserted} / 上書き${rep.updated} / スキップ${rep.skipped}`;
-  if (rep.warnings && rep.warnings.length) t += '\n  ⚠ ' + rep.warnings.join('\n  ⚠ ');
-  return t;
-}
-async function doImport(dryRun) {
-  const f = document.getElementById('file').files[0];
-  if (!f) { showMsg('msg-import', 'err', 'ファイルを選択してください'); return; }
-  const fd = new FormData();
-  fd.append('file', f);
-  fd.append('dry_run', dryRun ? '1' : '0');
-  try {
-    const r = await api('/import', { method: 'POST', body: fd });
-    const head = dryRun ? '【プレビュー — まだ書き込んでいません】' : '【本取込 完了】';
-    showMsg('msg-import', dryRun ? 'info' : 'ok',
-      head + '\n' + reportText('入数マスタ', r.irisu) + '\n' + reportText('原産国', r.origin));
-    document.getElementById('btn-import-live').disabled = !dryRun;
-    if (!dryRun) { loadStats(); loadList(); }
-  } catch (e) {
-    const m = { invalid_xlsx: 'xlsxとして読み込めませんでした', header_mismatch: '1行目のヘッダーが想定と異なります (商品コード/商品名 が必要)', origin_header_mismatch: '原産国シートのヘッダーが想定と異なります (商品コード列が必要)。全シートを確認してから再実行してください (どのシートも取り込んでいません)', no_file: 'ファイルを選択してください' }[e.message] || e.message;
-    showMsg('msg-import', 'err', '取込に失敗しました: ' + m);
-  }
-}
-document.getElementById('file').addEventListener('change', () => {
-  document.getElementById('btn-import-live').disabled = true; // ファイル変更時はプレビューからやり直し
-});
 
 loadStats();
 loadList();

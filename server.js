@@ -1406,8 +1406,8 @@ app.listen(PORT, () => {
   // RYS 楽天↔Yahoo 差分検出 daily sync (RYS_FULL_SYNC_CRON_ENABLED=true で起動、 Dark Launch)
   startRysCron();
 
-  // 入庫情報管理: NE商品マスタ(ミラー)から新商品を自動追加 (INBOUND_INFO_SYNC_ENABLED=true で起動、
-  // 既定 JST 09:00 = ミラー同期完了後。Dark Launch)
+  // 入庫情報管理: NE商品マスタ(ミラー)から新商品を自動追加 + 入荷予定 nefuda.csv 取得。
+  // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
