@@ -26,7 +26,7 @@ const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 const db = initMirrorDB();
 const {
   syncNewProducts, importInboundRows, importOriginRows, importWorkbook, listInbound, updateInbound,
-  addManual, deleteInbound, upsertOrigin, deleteOrigin, listOrigin, stats, parseIrisu,
+  addManual, deleteInbound, upsertOrigin, deleteOrigin, listOrigin, stats, parseIrisu, getInbound,
 } = await import('../apps/inbound-info/db.js');
 const { parseIrisuSheet, parseOriginSheet } = await import('../apps/inbound-info/router.js');
 const { parseNefudaCsv } = await import('../apps/inbound-info/nefuda-fetch.js');
@@ -195,6 +195,23 @@ const list2 = listInbound({ q: searchTerm });
 ok(list2.total >= 1, `検索 "${searchTerm}" ヒット (${list2.total}件)`);
 const st = stats();
 ok(typeof st.total === 'number' && typeof st.auto_new === 'number', 'stats 形状');
+// getInbound: 保存時の競合復旧で「その1行だけ」最新化するための単票取得
+const one = listInbound({ limit: 1 }).rows[0];
+const got = getInbound(one.商品コード.toUpperCase());
+ok(got && got.code_key === one.code_key && typeof got.version === 'number',
+  'getInbound: 大文字小文字を問わず1行取得 (version 付き)');
+ok(getInbound('存在しないコードzz') === null, 'getInbound: 無いコードは null');
+// limit='all' (印刷用): 500件上限を無視して該当全件を1クエリで返す
+const allList = listInbound({ limit: 'all' });
+ok(allList.limit === 'all' && allList.rows.length === allList.total && allList.total === stats().total,
+  `limit='all' は該当全件を返す (${allList.rows.length}/${allList.total})`);
+ok(listInbound({ limit: 99999 }).rows.length <= 500, 'limit は通常 500 件で丸める');
+ok(!listInbound({ limit: 'all' }).error, `limit='all' は上限内なら error なし (現在 ${allList.total}件)`);
+// updateInbound は保存後の行 (正規化済み・新 version) を返す
+const upRow = listInbound({ limit: 1 }).rows[0];
+const upRes = updateInbound(upRow.code_key, { memo: '  前後に空白  ' }, 'tester', upRow.version);
+ok(upRes.ok && upRes.row && upRes.row.memo === '前後に空白' && upRes.row.version === upRow.version + 1,
+  'updateInbound: 保存後の行を返す (trim済み・version+1)');
 
 // ─── 7. Codex R1/R2 対応の検証 ───
 console.log('\n[7] 楽観ロック / 一括トランザクション');
@@ -256,6 +273,13 @@ ok(addedGhost && sr.not_in_master.length === 1 && sr.not_in_master[0] === 'ghost
 
 const schedList = listInbound({ filter: 'scheduled', limit: 50 });
 ok(schedList.total === 3, `filter=scheduled は入荷予定の3件のみ (実際 ${schedList.total})`);
+// 並び順 = CSV の行順 (コード順なら ghostitem99 → newitem01 → nefudaonly01 になる)
+ok(schedList.order === 'csv'
+  && schedList.rows.map((r) => r.code_key).join(',') === 'newitem01,nefudaonly01,ghostitem99',
+  `filter=scheduled は CSV の行順 (実際 ${schedList.rows.map((r) => r.code_key).join(',')})`);
+ok(db.prepare("SELECT seq FROM f_inbound_schedule WHERE code_key = 'ghostitem99'").get().seq === 3,
+  'seq に CSV 行番号 (1始まり) を保存');
+ok(listInbound({ filter: 'all', limit: 5 }).order === 'code', 'scheduled 以外は従来の 新着優先→コード順');
 const st8 = scheduleState();
 ok(st8 && st8.row_count === 3 && st8.filename === 'nefuda.csv' && st8.fetched_by === 'tester', 'scheduleState 反映');
 

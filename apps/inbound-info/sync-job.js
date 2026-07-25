@@ -7,20 +7,25 @@
  * 片方の失敗はもう片方を巻き込まない (それぞれ try/catch)。
  *
  * 環境変数:
- *   INBOUND_INFO_SYNC_ENABLED=true  … cron 起動 (既定 off = Dark Launch)
+ *   INBOUND_INFO_SYNC_ENABLED=false … cron を止める (既定は有効。2026-07-25 に Dark Launch を解除し、
+ *                                     「ボタンを押さなくても新商品が入ってくる」既定に変更)
  *   INBOUND_INFO_SYNC_CRON          … 上書き用 cron 式 (JST 基準)。既定 '0 9 * * *' = JST 09:00
  *   INBOUND_NEFUDA_FOLDER_ID / INBOUND_NEFUDA_FILE … nefuda.csv の場所 (nefuda-fetch.js 参照)
  *
- * cron が無効でも UI の「新商品を今すぐ取込」(POST /api/sync-now) と
- * 「入荷予定を更新」(POST /api/schedule/refresh) で同じ処理を実行できる。
+ * cron を止めている間も UI の「新商品を今すぐ取込」(POST /api/sync-now) と
+ * 「最新の入荷予定を取得」(POST /api/schedule/refresh) で同じ処理を実行できる。
  */
 import cron from 'node-cron';
 import { syncNewProducts } from './db.js';
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
 
+// 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
+const OFF = new Set(['false', '0', 'off', 'no']);
+
 export function startInboundInfoCron() {
-  if (process.env.INBOUND_INFO_SYNC_ENABLED !== 'true') {
-    console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED != true)');
+  const flag = String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase();
+  if (OFF.has(flag)) {
+    console.log(`[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED=${flag})`);
     return;
   }
   // timezone を明示 (Codex R1 Low: 未指定だとプロセスのローカル TZ 依存になり、

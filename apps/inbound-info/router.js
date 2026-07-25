@@ -12,17 +12,14 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import multer from 'multer';
-import ExcelJS from 'exceljs';
 import {
-  stats, listInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
-  importWorkbook, listOrigin, upsertOrigin, deleteOrigin, scheduleState,
+  stats, listInbound, getInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
+  listOrigin, upsertOrigin, deleteOrigin, scheduleState,
 } from './db.js';
 import { getNefudaInfo, refreshNefudaSchedule } from './nefuda-fetch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 function currentUser(req) {
   return req.session?.email || req.session?.displayName || null;
@@ -52,10 +49,27 @@ router.get('/api/stats', (req, res) => {
 // ─── 一覧 ───
 router.get('/api/list', (req, res) => {
   try {
-    const { q, filter, offset, limit } = req.query;
-    res.json({ ok: true, result: listInbound({ q, filter, offset, limit }) });
+    const { q, filter, offset } = req.query;
+    // limit=all は印刷用 (該当全件を1クエリで返す)。それ以外は db.js 側で 1〜500 に丸める
+    const limit = req.query.limit === 'all' ? 'all' : req.query.limit;
+    const result = listInbound({ q, filter, offset, limit });
+    // limit=all で上限超過 (現実的には起こらないが API 契約として上限を持つ)
+    if (result.error) return res.status(413).json({ ok: false, error: result.error, total: result.total, max_rows: result.max_rows });
+    res.json({ ok: true, result });
   } catch (e) {
     console.error('[inbound-info] list', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// ─── 1行取得 (保存時の競合復旧。存在しない場合も 200 + result:null を返す) ───
+router.get('/api/row', (req, res) => {
+  try {
+    const key = req.query?.code_key;
+    if (!key) return res.status(400).json({ ok: false, error: 'bad_request' });
+    res.json({ ok: true, result: getInbound(String(key)) });
+  } catch (e) {
+    console.error('[inbound-info] row', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
@@ -153,6 +167,11 @@ router.post('/api/schedule/refresh', async (req, res) => {
 });
 
 // ─── Excel パース ───
+// 【2026-07-25】初回移行が完了したため「Excel取込」タブと POST /api/import は廃止した
+// (画面編集を Excel で一括上書きできる経路を残さない)。以下のパーサと db.js の
+// importWorkbook / importInboundRows / importOriginRows は、再移行が必要になった時に
+// scripts から呼べるよう残置 (scripts/test-inbound-info.mjs が動作を担保している)。
+//
 // exceljs の cell.value は string / number / boolean / Date / {richText} / {text,hyperlink} /
 // {formula,result} を取り得るため、素の値へ潰すヘルパーを通す。
 function plainValue(v) {
@@ -226,46 +245,6 @@ export function parseOriginSheet(ws) {
   });
   return { rows };
 }
-
-// ─── Excel 取込 (multipart)。dry_run=1 でプレビューのみ ───
-router.post('/api/import', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file?.buffer) return res.status(400).json({ ok: false, error: 'no_file' });
-    const dryRun = req.body?.dry_run === '1';
-    const wb = new ExcelJS.Workbook();
-    try {
-      await wb.xlsx.load(req.file.buffer);
-    } catch (e) {
-      console.error('[inbound-info] xlsx parse', e.message);
-      return res.status(400).json({ ok: false, error: 'invalid_xlsx' });
-    }
-    const irisuWs = wb.getWorksheet('入数マスタ') || wb.worksheets[0];
-    if (!irisuWs) return res.status(400).json({ ok: false, error: 'no_sheet' });
-    // 先に全シートをパース・検証してから、書込みは importWorkbook が単一トランザクションで実行
-    // (Codex R1 Medium: シート別トランザクションだと途中失敗で半端な状態が残る)
-    const parsed = parseIrisuSheet(irisuWs);
-    if (parsed.error) {
-      return res.status(400).json({ ok: false, error: parsed.error, headers: parsed.headers });
-    }
-    let originRows = null;
-    const originWs = wb.getWorksheet('原産国');
-    if (originWs) {
-      const po = parseOriginSheet(originWs);
-      // Codex R2 High: 原産国シートがあるのにヘッダー不正なら、入数マスタだけ
-      // 取り込んで ok を返さず、書込み前に 400 で止める (全シート検証 → 一括反映)
-      if (po.error) {
-        return res.status(400).json({ ok: false, error: 'origin_header_mismatch', headers: po.headers });
-      }
-      originRows = po.rows;
-    }
-    const user = currentUser(req);
-    const reports = importWorkbook(parsed.rows, originRows, { dryRun, user });
-    res.json({ ok: true, dry_run: dryRun, irisu: reports.irisu, origin: reports.origin });
-  } catch (e) {
-    console.error('[inbound-info] import', e.message);
-    res.status(500).json({ ok: false, error: 'import_failed' });
-  }
-});
 
 // ─── 原産国 CRUD ───
 router.get('/api/origin/list', (req, res) => {

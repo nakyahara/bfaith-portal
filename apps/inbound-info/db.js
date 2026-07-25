@@ -66,31 +66,62 @@ export function stats() {
 // ─── 一覧 (サーバー側ページング + 検索 + フィルタ) ───
 // filter: 'all' | 'missing' (入数未記入) | 'new' (source='auto' = cron 追加後に未編集)
 //         | 'scheduled' (入荷予定 = Drive nefuda.csv に載っている商品のみ)
+// 並び順: 通常は 新着優先 → コード順。'scheduled' だけは CSV の行順 (f_inbound_schedule.seq)。
+//   現場は nefuda.csv の並びで入荷品を検品するため、画面もその順に合わせる。
+//   seq が NULL (seq 列追加前に取得したスナップショット) の行は末尾へ寄せてコード順にする。
+// limit = 'all' … LIMIT/OFFSET を付けず該当全件を 1 クエリで返す (印刷用)。
+//   OFFSET で分割取得すると、取得中に他の人が保存して並び順キー (source) が変わり、
+//   ページ境界で行の重複・欠落が起きるため (Codex R3 Medium)。
+//   ただし無制限だと直接 API を叩かれた時に全行の JSON 化でプロセスを圧迫できるので、
+//   MAX_ALL_ROWS を超える場合は黙って切らずに error='too_many_rows' を返す (Codex R4 Medium)。
+const MAX_ALL_ROWS = 20000; // 現状 約4900件 (入数マスタ全件)
 export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } = {}) {
   const db = getMirrorDB();
+  const scheduled = filter === 'scheduled';
+  const all = limit === 'all';
   const conds = [];
   const params = [];
   const term = String(q || '').trim();
   if (term) {
-    conds.push('(商品コード LIKE ? OR 商品名 LIKE ?)');
+    conds.push('(i.商品コード LIKE ? OR i.商品名 LIKE ?)');
     const like = `%${term}%`;
     params.push(like, like);
   }
-  if (filter === 'missing') conds.push('入数 IS NULL');
-  else if (filter === 'new') conds.push("source = 'auto'");
-  else if (filter === 'scheduled') conds.push('code_key IN (SELECT code_key FROM f_inbound_schedule)');
+  if (filter === 'missing') conds.push('i.入数 IS NULL');
+  else if (filter === 'new') conds.push("i.source = 'auto'");
+  // scheduled は JOIN 自体が絞り込みになる (IN サブクエリ不要)
+  const from = scheduled
+    ? 'f_inbound_info i JOIN f_inbound_schedule s ON s.code_key = i.code_key'
+    : 'f_inbound_info i';
   const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
-  const total = db.prepare(`SELECT COUNT(*) AS c FROM f_inbound_info ${where}`).get(...params).c;
-  const lim = Math.min(Math.max(1, Number(limit) || 100), 500);
-  const off = Math.max(0, Number(offset) || 0);
+  const orderBy = scheduled
+    ? 'ORDER BY CASE WHEN s.seq IS NULL THEN 1 ELSE 0 END, s.seq, i.code_key'
+    : "ORDER BY (i.source = 'auto') DESC, i.code_key";
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM ${from} ${where}`).get(...params).c;
+  if (all && total > MAX_ALL_ROWS) {
+    return { total, rows: [], offset: 0, limit: 'all', order: scheduled ? 'csv' : 'code',
+             error: 'too_many_rows', max_rows: MAX_ALL_ROWS };
+  }
+  const lim = all ? null : Math.min(Math.max(1, Number(limit) || 100), 500);
+  const off = all ? 0 : Math.max(0, Number(offset) || 0);
   const rows = db.prepare(`
+    SELECT i.code_key, i.商品コード, i.商品名, i.入数, i.入庫時BCシール貼りフラグ, i.直接ピックロケ保管,
+           i.BF保管荷姿, i.いろは在庫化作業有無, i.memo, i.source, i.version, i.updated_at, i.updated_by
+      FROM ${from} ${where}
+     ${orderBy}
+     ${all ? '' : 'LIMIT ? OFFSET ?'}
+  `).all(...params, ...(all ? [] : [lim, off]));
+  return { total, rows, offset: off, limit: all ? 'all' : lim, order: scheduled ? 'csv' : 'code' };
+}
+
+// ─── 1行取得 (UI の競合復旧用: 一覧全体を再読込せずその行だけ最新化する) ───
+export function getInbound(key) {
+  const db = getMirrorDB();
+  return db.prepare(`
     SELECT code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ, 直接ピックロケ保管,
            BF保管荷姿, いろは在庫化作業有無, memo, source, version, updated_at, updated_by
-      FROM f_inbound_info ${where}
-     ORDER BY (source = 'auto') DESC, code_key
-     LIMIT ? OFFSET ?
-  `).all(...params, lim, off);
-  return { total, rows, offset: off, limit: lim };
+      FROM f_inbound_info WHERE code_key = ?
+  `).get(codeKey(key)) || null;
 }
 
 // ─── 1行更新 (UI から)。人が触った行は source='manual' に倒して「新着」から外す ───
@@ -129,7 +160,9 @@ export function updateInbound(key, fields, user, expectedVersion) {
     const exists = db.prepare('SELECT 1 FROM f_inbound_info WHERE code_key = ?').get(k);
     return { ok: false, error: exists ? 'conflict' : 'not_found' };
   }
-  return { ok: true };
+  // 保存後の行を返す (Codex R3 Medium): 画面は一覧を再読込せずこの行だけ差し替えるため、
+  // trim / 空文字→NULL / 500文字切り詰め後の「実際に保存された値」と新しい version を渡す。
+  return { ok: true, row: getInbound(k) };
 }
 
 // ─── 手動追加 (mirror_products に実在するコードのみ) ───
@@ -295,8 +328,8 @@ export function replaceSchedule(rows, { filename = null, fileModifiedTime = null
   const db = getMirrorDB();
   const now = utcIsoNow();
   const insSched = db.prepare(`
-    INSERT INTO f_inbound_schedule (code_key, 商品コード, 商品名, バーコード, 有効期限, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO f_inbound_schedule (code_key, 商品コード, 商品名, バーコード, 有効期限, seq, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(code_key) DO NOTHING
   `);
   const selInfo = db.prepare('SELECT 1 FROM f_inbound_info WHERE code_key = ?');
@@ -318,11 +351,14 @@ export function replaceSchedule(rows, { filename = null, fileModifiedTime = null
       }
     }
     db.prepare('DELETE FROM f_inbound_schedule').run();
+    // seq は CSV の行順 (1始まり)。重複コードは先に出てきた行の位置を採用する
+    let seq = 0;
     for (const r of rows) {
       const c = normCode(r.商品コード);
       const k = codeKey(c);
       if (!k) continue;
-      const info = insSched.run(k, c, cleanText(r.商品名), cleanText(r.バーコード), cleanText(r.有効期限), now);
+      seq++;
+      const info = insSched.run(k, c, cleanText(r.商品名), cleanText(r.バーコード), cleanText(r.有効期限), seq, now);
       if (info.changes === 0) {
         result.duplicates++;
         continue;

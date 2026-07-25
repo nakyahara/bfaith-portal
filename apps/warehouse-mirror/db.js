@@ -2560,6 +2560,8 @@ function createInboundInfoTables() {
 
   // 入荷予定 (Drive の nefuda.csv = 値札発行用データ)。取得ごとに full-replace する揮発キャッシュで、
   // 正本は Drive 側。f_inbound_info の「入荷予定のみ」絞り込みに使う。
+  // seq = CSV 上の行順 (1始まり)。現場は nefuda.csv の並び (=入荷/値札発行の順) で作業するため、
+  // 「入荷予定のみ」表示はコード順ではなく seq 順に出す。
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_inbound_schedule (
       code_key    TEXT PRIMARY KEY,
@@ -2567,10 +2569,13 @@ function createInboundInfoTables() {
       商品名      TEXT,
       バーコード  TEXT,
       有効期限    TEXT,
+      seq         INTEGER,
       created_at  TEXT NOT NULL,
       CHECK (trim(code_key) <> '')
     )
   `);
+  // seq は後付け列 (既存 DB 用の冪等 migration)。次回の入荷予定取得で全行に値が入る
+  addColumnIfMissing('f_inbound_schedule', 'seq', 'INTEGER');
   // 最終取得の状態 (1行固定)。CSV が0件の日でも「いつ取得したか」を表示できるように行と分離して持つ
   db.exec(`
     CREATE TABLE IF NOT EXISTS f_inbound_schedule_state (
