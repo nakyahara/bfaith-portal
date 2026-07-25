@@ -4,7 +4,7 @@
 import fs from 'fs';
 import path from 'path';
 import { initInquiryHubDB, getDB, logActivity, toUtcIso } from './db.js';
-import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE } from './queries.js';
+import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE, STATUSES, INBOX_STATUSES } from './queries.js';
 import { parseCsv, importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { purgeDemo } from './scripts/purge-demo.mjs';
 
@@ -159,16 +159,15 @@ console.log('4b. 受信箱ビュー');
   addMsg(vDone, 1, '2026-07-20T10:00:00');
   const vEmpty = mkV('v-empty');    // メッセージ0件 → 取りこぼさず受信トレイ
 
+  // ステータスはメールディーラー準拠 (新着 / 返信処理中 / 完了)。ビューはステータスで振り分く
+  db.prepare("UPDATE inquiries SET internal_status = 'waiting_reply' WHERE id = ?").run(vReplied);
   const ids = v => listInquiries({ view: v, shop: String(shopV) }).rows.map(r => r.id).sort();
-  check('受信トレイ: 新着 + メッセージ0件 (送信済み・完了は出ない)', JSON.stringify(ids('inbox')) === JSON.stringify([vNew, vEmpty].sort()));
-  check('送信済み: こちらが最後に返信したもの', JSON.stringify(ids('sent')) === JSON.stringify([vReplied]));
-  check('対応済み: done のみ', JSON.stringify(ids('done')) === JSON.stringify([vDone]));
+  check('新着: open のもの (返信処理中・完了は出ない)', JSON.stringify(ids('inbox')) === JSON.stringify([vNew, vEmpty].sort()));
+  check('返信処理中: waiting_reply のもの', JSON.stringify(ids('sent')) === JSON.stringify([vReplied]));
+  check('完了: done のみ', JSON.stringify(ids('done')) === JSON.stringify([vDone]));
   check('すべて: 全部', ids('all').length === 4);
-
-  // 返事が返ってきたら受信トレイへ自動で戻る (中原さん方針の核心)
-  addMsg(vReplied, 1, '2026-07-21T09:00:00');
-  check('顧客の返信で送信済み→受信トレイへ戻る', ids('inbox').includes(vReplied) && !ids('sent').includes(vReplied));
-  check('スレッド履歴は保持 (3通)', db.prepare('SELECT COUNT(*) c FROM inquiry_messages WHERE inquiry_id = ?').get(vReplied).c === 3);
+  check('ラベルがメールディーラー語彙', STATUSES.open.label === '新着' && STATUSES.waiting_reply.label === '返信処理中' && STATUSES.done.label === '完了');
+  check('対応中・保留も新着ビューに入る (自分のタスク)', INBOX_STATUSES.includes('in_progress') && INBOX_STATUSES.includes('pending'));
 
   check('既定ビューは受信トレイ', DEFAULT_VIEW === 'inbox' && listInquiries({ shop: String(shopV) }).view === 'inbox');
   check('不正なビュー指定は既定へフォールバック', listInquiries({ view: 'bogus', shop: String(shopV) }).view === 'inbox');
@@ -177,7 +176,7 @@ console.log('4b. 受信箱ビュー');
   // 「N日 返信なし」の基準はメッセージ本体の最終日時 (inquiries.last_message_at は手動の送信確定で
   // 更新されないため、そのままだと送信直後に「◯日返信なし」と誤表示される。Codexレビュー反映)
   {
-    const vStale = mkV('v-stale');
+    const vStale = mkV('v-stale', 'waiting_reply');   // 返信処理中 = 送信済みビューに出る
     addMsg(vStale, 1, '2026-07-01T10:00:00');
     addMsg(vStale, 0, '2026-07-22T10:00:00');   // こちらの返信は新しい
     db.prepare('UPDATE inquiries SET last_message_at = ? WHERE id = ?').run(T('2026-07-01T10:00:00'), vStale); // 古いまま (手動確定を再現)

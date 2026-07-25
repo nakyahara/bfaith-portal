@@ -8,13 +8,22 @@ export const CHANNELS = {
   rakuten: { label: '楽天',   badge: 'background:#fee2e2;color:#b91c1c' },
   yahoo:   { label: 'Yahoo!', badge: 'background:#fef3c7;color:#92400e' },
 };
+/**
+ * ステータス (メールディーラー準拠。2026-07-25 中原さん要望)
+ *   新着       … 顧客から来てまだ返信していない = 自分のタスク
+ *   対応中/保留 … 新着の内訳 (調査中・社内確認待ちなど。任意で使う)
+ *   返信処理中 … こちらが返信済み = 相手の返事待ち
+ *   完了       … 対応終了。顧客から返信が来ると自動で新着に戻る
+ */
 export const STATUSES = {
-  open:          { label: '未対応',       badge: 'background:#fee2e2;color:#b91c1c' },
+  open:          { label: '新着',         badge: 'background:#fee2e2;color:#b91c1c' },
   in_progress:   { label: '対応中',       badge: 'background:#dbeafe;color:#1d4ed8' },
   pending:       { label: '保留',         badge: 'background:#fef3c7;color:#92400e' },
-  waiting_reply: { label: '顧客返信待ち', badge: 'background:#ede9fe;color:#6d28d9' },
+  waiting_reply: { label: '返信処理中',   badge: 'background:#ede9fe;color:#6d28d9' },
   done:          { label: '完了',         badge: 'background:#dcfce7;color:#166534' },
 };
+/** 受信トレイに出すステータス (=まだこちらのタスク) */
+export const INBOX_STATUSES = ['open', 'in_progress', 'pending'];
 export const AI_FLAGS = {
   0: { label: '—', badge: '' },
   1: { label: '🤖AI返信', badge: 'background:#ccfbf1;color:#0f766e' },
@@ -25,14 +34,14 @@ export const AI_FLAGS = {
 export const PAGE_SIZE = 50;
 
 /**
- * 受信箱ビュー (2026-07-25 中原さん方針)。
+ * 受信箱ビュー (2026-07-25 中原さん方針 + メールディーラーのステータス管理を踏襲)。
  * 「いまボールが自分にあるもの」だけをTOP (受信トレイ) に出し、こちらが返信したものは
- * 送信済みへ移す。相手から返事が来れば最後のメッセージが顧客側になるので自動で受信へ戻る
- * (スレッド全履歴つき)。人がステータスを更新しなくても正しく振り分くのが要点。
+ * 返信処理中へ移す。相手から返事が来れば自動で新着に戻る (スレッド全履歴つき)。
  *
- * 判定は「最後のメッセージの向き」。キャッシュ列を持たず常にメッセージから導出するので、
- * 同期・送信・手動解決のどの経路で増えても表示がズレない
- * (件数規模: 数千件。idx_messages_inquiry が効くため一覧クエリで十分速い)
+ * 振り分けは internal_status を正とする (手動で完了にできる・返信時に強制完了もできる)。
+ * ステータス自体は sync/engine.js が「最後のメッセージの向き」で自動更新するので、
+ * メールディーラーで返信した分・アプリから返信した分のどちらでも正しく遷移する
+ * (人がステータスを更新し忘れても崩れない)。
  */
 const LAST_INCOMING_SQL = `(SELECT m.is_incoming FROM inquiry_messages m
   WHERE m.inquiry_id = i.id ORDER BY COALESCE(m.received_at, m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1)`;
@@ -44,22 +53,21 @@ const LAST_MESSAGE_AT_SQL = `(SELECT COALESCE(m.received_at, m.sent_at, m.create
 
 export const VIEWS = {
   inbox: {
-    label: '受信トレイ', icon: '📥',
-    // 未完了 かつ (最後が顧客 or メッセージ無し=取りこぼし防止)
-    where: `i.internal_status != 'done' AND COALESCE(${LAST_INCOMING_SQL}, 1) = 1`,
-    hint: '返信が必要なもの (相手から返事が来たものはここに戻ります)',
+    label: '新着', icon: '📥',
+    where: `i.internal_status IN (${INBOX_STATUSES.map(s => `'${s}'`).join(',')})`,
+    hint: '返信が必要なもの (完了・返信処理中でも顧客から返事が来ればここに戻ります)',
   },
   sent: {
-    label: '送信済み', icon: '📤',
-    where: `i.internal_status != 'done' AND COALESCE(${LAST_INCOMING_SQL}, 1) = 0`,
+    label: '返信処理中', icon: '📤',
+    where: `i.internal_status = 'waiting_reply'`,
     hint: 'こちらが返信して相手の返事待ちのもの',
   },
   done: {
-    label: '対応済み', icon: '✅',
+    label: '完了', icon: '✅',
     where: `i.internal_status = 'done'`,
-    hint: '完了にしたもの',
+    hint: '対応を終えたもの',
   },
-  all: { label: 'すべて', icon: '🗂️', where: '1=1', hint: '受信・送信・完了を問わず全件' },
+  all: { label: 'すべて', icon: '🗂️', where: '1=1', hint: '新着・返信処理中・完了を問わず全件' },
 };
 export const DEFAULT_VIEW = 'inbox';
 

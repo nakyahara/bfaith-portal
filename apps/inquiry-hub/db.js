@@ -184,6 +184,8 @@ function createTables() {
     resolved_by TEXT,
     resolved_at TEXT
   )`);
+  // 送信と同時に完了にする (メールディーラーの「返信して完了」。2026-07-25 中原さん要望)
+  addColumnIfMissing('outbox_replies', 'complete_on_send', 'INTEGER NOT NULL DEFAULT 0');
 
   // 同期状態 (チャネル×店舗)
   db.exec(`CREATE TABLE IF NOT EXISTS sync_state (

@@ -89,7 +89,8 @@ function releaseLease(db, shopId, token) {
 /** 1チケット分のUPSERT + メッセージ/添付取り込み + 状態遷移。トランザクション内で呼ぶこと */
 function ingestInquiry(db, shop, item, nowIso) {
   if (!item.externalInquiryId) throw new Error('adapter bug: externalInquiryId がありません');
-  const stats = { newInquiry: false, newMessages: 0, newCustomerMessages: 0, reopened: false };
+  const stats = { newInquiry: false, newMessages: 0, newCustomerMessages: 0, reopened: false, movedToWaiting: false,
+    lastNewMessageAt: null, lastNewIsIncoming: null };
 
   let inq = db.prepare('SELECT * FROM inquiries WHERE channel_type = ? AND shop_id = ? AND external_inquiry_id = ?')
     .get(shop.channel_type, shop.id, item.externalInquiryId);
@@ -157,6 +158,14 @@ function ingestInquiry(db, shop, item, nowIso) {
     if (r.changes > 0) {
       stats.newMessages++;
       if (m.isIncoming) stats.newCustomerMessages++;
+      // 取り込んだ新規メッセージのうち「最も新しいもの」の向きを記録する。
+      // 1回の同期で顧客返信→店舗返信をまとめて取り込むケースがあるため、件数ではなく
+      // 時系列の最後で状態を決める (Codex R1 high)
+      const at = msgAt || '';
+      if (!stats.lastNewMessageAt || at >= stats.lastNewMessageAt) {
+        stats.lastNewMessageAt = at;
+        stats.lastNewIsIncoming = !!m.isIncoming;
+      }
     }
     // 添付メタデータは既存メッセージでも毎回照合する
     // (初回レスポンスで添付が欠落していた場合に修復同期で取り込めるように。Codexレビュー反映)
@@ -178,18 +187,38 @@ function ingestInquiry(db, shop, item, nowIso) {
       WHERE id = ?`).run(stats.newMessages, maxMsgAt, maxMsgAt, nowIso, inq.id);
     db.prepare('UPDATE ai_drafts SET is_stale = 1 WHERE inquiry_id = ? AND is_stale = 0').run(inq.id);
   }
-  if (stats.newCustomerMessages > 0) {
-    // initialInternalStatus='done' で作った直後は未読化しない (自動配信を静かに取り込む)。
-    // 既存チケットへの顧客新着は従来どおり未読化+再オープン
-    if (!(stats.newInquiry && item.initialInternalStatus === 'done')) {
-      db.prepare('UPDATE inquiries SET is_unread = 1 WHERE id = ?').run(inq.id);
-    }
-    // internal_status を同期が触るのはこの1パターンのみ: 顧客新着で done → open (再問い合わせ。§8.1)
-    if (inq.internal_status === 'done' && !stats.newInquiry) {
-      db.prepare("UPDATE inquiries SET internal_status = 'open', completed_at = NULL WHERE id = ? AND internal_status = 'done'").run(inq.id);
-      logActivity(inq.id, { actorType: 'system', actionType: 'status_change',
-        before: { internal_status: 'done' }, after: { internal_status: 'open', reason: '顧客新着で再オープン' } });
-      stats.reopened = true;
+  // ステータス自動遷移 (メールディーラー準拠。2026-07-25)。
+  // ⚠️ 件数ではなく「取り込んだ新規メッセージのうち時系列で最後のもの」の向きで決める。
+  // 1回の同期で 顧客返信→店舗返信 をまとめて取り込むことがあり (同期間隔中に往復した場合や
+  // 初回取り込み)、件数で判定すると本来「返信処理中」なのに「新着」になってしまう (Codex R1 high)
+  if (stats.newMessages > 0) {
+    if (stats.lastNewIsIncoming) {
+      // 最後が顧客 = ボールはこちら → 未読化して「新着」へ戻す (完了・返信処理中のどちらからでも)。
+      // 過去のやり取りはスレッドとして残るので、履歴つきで受信トレイに再登場する
+      // (initialInternalStatus='done' で作った直後は未読化しない = 自動配信を静かに取り込む)
+      if (!(stats.newInquiry && item.initialInternalStatus === 'done')) {
+        db.prepare('UPDATE inquiries SET is_unread = 1 WHERE id = ?').run(inq.id);
+      }
+      if (['done', 'waiting_reply'].includes(inq.internal_status) && !stats.newInquiry) {
+        const from = inq.internal_status;
+        db.prepare(`UPDATE inquiries SET internal_status = 'open', completed_at = NULL
+          WHERE id = ? AND internal_status = ?`).run(inq.id, from);
+        logActivity(inq.id, { actorType: 'system', actionType: 'status_change',
+          before: { internal_status: from }, after: { internal_status: 'open', reason: '顧客から返信 → 新着' } });
+        stats.reopened = true;
+      }
+    } else {
+      // 最後が自社 = こちらが返信済み (メールディーラーやモール画面から返信した分は
+      // 同期でしか検知できない) → 新着系なら「返信処理中」へ。完了はそのまま
+      // (完了後の追加案内で受信箱を汚さない)
+      if (['open', 'in_progress', 'pending'].includes(inq.internal_status)) {
+        const from = inq.internal_status;
+        db.prepare(`UPDATE inquiries SET internal_status = 'waiting_reply'
+          WHERE id = ? AND internal_status = ?`).run(inq.id, from);
+        logActivity(inq.id, { actorType: 'system', actionType: 'status_change',
+          before: { internal_status: from }, after: { internal_status: 'waiting_reply', reason: '店舗から返信 → 返信処理中' } });
+        stats.movedToWaiting = true;
+      }
     }
   }
   return stats;
@@ -233,7 +262,7 @@ export async function runSync(shopId, adapter, opts = {}) {
     const committedIso = st.committed_until && st.committed_until > boundedObservedIso
       ? st.committed_until : boundedObservedIso;
 
-    const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0 };
+    const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0, movedToWaiting: 0 };
     const tx = db.transaction(() => {
       // 所有権確認: リースを奪われていたら (fetchNew がリース期間超過) コミットを破棄 (Codexレビュー反映)
       const cur = db.prepare('SELECT lease_token FROM sync_state WHERE shop_id = ?').get(shopId);
@@ -247,6 +276,7 @@ export async function runSync(shopId, adapter, opts = {}) {
         totals.newInquiries += s.newInquiry ? 1 : 0;
         totals.newMessages += s.newMessages;
         totals.reopened += s.reopened ? 1 : 0;
+        totals.movedToWaiting += s.movedToWaiting ? 1 : 0;
       }
       // 全件取り込み成功時のみ high-water mark を前進 (§8.1)
       db.prepare(`UPDATE sync_state SET
