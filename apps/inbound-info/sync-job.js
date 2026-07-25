@@ -119,10 +119,19 @@ export function applyInboundInfoSchedule() {
     console.error(`[inbound-info] invalid cron expr: ${expr} — 既存の予約を維持します`);
     return { started: !!task, expr, source, reason: 'invalid_expr' };
   }
-  disposeOld();
+  // 新タスクの生成に成功してから旧タスクを破棄する。逆順だと schedule() が例外を投げた時に
+  // 「予約が1つも無い」状態で残る (Codex pdf-R2 Low)。
   // timezone を明示 (未指定だとプロセスのローカル TZ 依存になり、実行環境が変わると
   // ミラー同期完了前に走り得る)
-  task = cron.schedule(expr, runDailyJob, { timezone: 'Asia/Tokyo' });
+  let next;
+  try {
+    next = cron.schedule(expr, runDailyJob, { timezone: 'Asia/Tokyo' });
+  } catch (e) {
+    console.error(`[inbound-info] cron の登録に失敗 (${expr}): ${e.message} — 既存の予約を維持します`);
+    return { started: !!task, expr, source, reason: 'schedule_failed' };
+  }
+  disposeOld();
+  task = next;
   console.log(`[inbound-info] cron started (${expr} JST${time ? ` = ${time}` : ''}, source=${source})`);
   return { started: true, expr, source };
 }

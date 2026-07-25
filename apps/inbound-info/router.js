@@ -27,6 +27,14 @@ function currentUser(req) {
   return req.session?.email || req.session?.displayName || null;
 }
 
+// 自動実行の時刻設定は「全社共通の設定」なので管理者だけが変更できる (Codex pdf-R2 Medium)。
+// 参照と、入数の編集・PDFの手動出力は従来どおり inbound-info の利用者全員に許可する
+// (現場が入数を直してからPDFを刷り直す運用があるため)。
+// server.js の requireAdmin は HTML を返すので、API 用に JSON を返す軽い判定を置く。
+function isAdmin(req) {
+  return req.session?.role === 'admin';
+}
+
 // ─── UI (giftset-assembly と同じ末尾スラッシュ正規化) ───
 router.get('/', (req, res) => {
   const qIdx = req.originalUrl.indexOf('?');
@@ -177,6 +185,7 @@ router.get('/api/settings', (req, res) => {
       ...s,
       // env で cron 式が直接指定されている場合は画面の時刻設定より優先される (その旨を画面に出す)
       env_override: eff.source === 'env' ? eff.expr : null,
+      can_edit: isAdmin(req), // 時刻設定を変更できるか (画面で入力を無効化するため)
       pdf: { filename: PDF_FILENAME(), folder_id: PDF_FOLDER_ID() },
       state: pdfState(),
       // 手動でPDFを出すときに「いつ取得したCSVの内容か」が分かるように添える
@@ -190,6 +199,7 @@ router.get('/api/settings', (req, res) => {
 
 router.post('/api/settings', (req, res) => {
   try {
+    if (!isAdmin(req)) return res.status(403).json({ ok: false, error: 'admin_only' });
     const r = saveJobSettings(req.body || {}, currentUser(req));
     if (!r.ok) return res.status(400).json(r);
     // 保存した時刻で cron を張り替える (再デプロイ不要で反映)

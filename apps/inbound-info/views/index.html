@@ -181,9 +181,11 @@
       <label style="font-size:14px"><input type="checkbox" id="set-pdf" style="width:auto"> PDFを作成してDriveに上書き保存する</label>
     </div>
     <div class="toolbar">
-      <button class="btn-green" onclick="saveSettings()">この設定で保存</button>
+      <button class="btn-green" id="btn-set-save" onclick="saveSettings()">この設定で保存</button>
       <span class="hint" id="set-saved" style="margin-top:0"></span>
     </div>
+    <p class="hint" id="set-readonly" style="display:none">
+      ⚠ 実行時刻は全社共通の設定のため、変更は管理者のみです (表示は誰でも確認できます)。</p>
     <p class="hint" id="set-envnote" style="display:none"></p>
   </div>
 
@@ -703,6 +705,12 @@ async function loadSettings() {
     const { result } = await api('/settings');
     document.getElementById('set-time').value = result.time;
     document.getElementById('set-pdf').checked = result.pdf_enabled !== false;
+    // 時刻設定は管理者のみ変更可 (それ以外は表示だけ)
+    const canEdit = result.can_edit !== false;
+    document.getElementById('set-time').disabled = !canEdit;
+    document.getElementById('set-pdf').disabled = !canEdit;
+    document.getElementById('btn-set-save').disabled = !canEdit;
+    document.getElementById('set-readonly').style.display = canEdit ? 'none' : 'block';
     document.getElementById('set-saved').textContent = result.updated_at
       ? `最終更新 ${jst(result.updated_at)}${result.updated_by ? ` (${result.updated_by})` : ''}` : '未設定 (既定 09:00)';
     document.getElementById('pdf-dest').textContent = result.pdf.filename;
@@ -749,7 +757,8 @@ async function saveSettings() {
     loadSettings();
     loadHeaderTime();
   } catch (e) {
-    const msg = e.message === 'invalid_time' ? '時刻の形式が不正です (00:00〜23:59)' : e.message;
+    const msg = { invalid_time: '時刻の形式が不正です (00:00〜23:59)',
+                  admin_only: '実行時刻の変更は管理者のみです' }[e.message] || e.message;
     showMsg('msg-auto', 'err', '保存に失敗しました: ' + msg);
   }
 }
