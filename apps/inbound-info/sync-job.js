@@ -1,62 +1,142 @@
 /**
- * 入庫情報管理 — 日次 cron (新商品自動追加 + 入荷予定 nefuda.csv 取得)
+ * 入庫情報管理 — 日次自動処理 (新商品追加 → 入荷予定 nefuda.csv 取得 → 入荷予定リストPDFをDrive保存)
  *
  * 1) mirror_products (単品・取扱中) のうち f_inbound_info 未登録のコードを INSERT
  * 2) Drive の nefuda.csv (入荷予定) を取得して f_inbound_schedule を full-replace
- * ミラー同期 (miniPC daily-sync 07:00 JST 起点) の完了後に走るよう既定は JST 09:00。
- * 片方の失敗はもう片方を巻き込まない (それぞれ try/catch)。
+ * 3) 入荷予定リスト (CSV順) の PDF を作って nefuda.csv と同じフォルダに上書き保存
+ * 各段は独立の try/catch で、前段の失敗が後段を巻き込まない (ただし 3 は 2 の結果を使うので
+ * 2 が失敗した場合は「前回のスナップショット」で PDF を作る = 中身が古いだけで壊れない)。
+ *
+ * 実行時刻: 画面 (入庫情報管理 → ⚙️自動実行) で設定した時刻 (既定 09:00 JST)。
+ *   設定変更時に applyInboundInfoSchedule() が呼ばれて cron を張り替える。
+ *   ミラー同期 (miniPC daily-sync 07:00 JST 起点) の完了後になる時刻にすること。
  *
  * 環境変数:
- *   INBOUND_INFO_SYNC_ENABLED=false … cron を止める (既定は有効。2026-07-25 に Dark Launch を解除し、
- *                                     「ボタンを押さなくても新商品が入ってくる」既定に変更)
- *   INBOUND_INFO_SYNC_CRON          … 上書き用 cron 式 (JST 基準)。既定 '0 9 * * *' = JST 09:00
+ *   INBOUND_INFO_SYNC_ENABLED=false … 自動実行を止める (既定は有効。false/0/off/no)
+ *   INBOUND_INFO_SYNC_CRON          … cron 式で直接指定する上級者向け上書き (JST 基準)。
+ *                                     設定されている場合、画面の時刻設定より優先される
  *   INBOUND_NEFUDA_FOLDER_ID / INBOUND_NEFUDA_FILE … nefuda.csv の場所 (nefuda-fetch.js 参照)
+ *   INBOUND_SCHEDULE_PDF_FILE       … 保存するPDFのファイル名 (既定 入荷予定リスト.pdf)
  *
- * cron を止めている間も UI の「新商品を今すぐ取込」(POST /api/sync-now) と
- * 「最新の入荷予定を取得」(POST /api/schedule/refresh) で同じ処理を実行できる。
+ * 自動実行を止めている間も UI の「新商品を今すぐ取込」「最新の入荷予定を取得」
+ * 「今すぐPDFを作成してDriveに保存」で同じ処理を手動実行できる。
  */
 import cron from 'node-cron';
-import { syncNewProducts } from './db.js';
+import { syncNewProducts, getJobSettings, parseHhmm, savePdfState } from './db.js';
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
+import { exportSchedulePdfToDrive, PDF_FILENAME } from './schedule-pdf.js';
 
 // 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
 const OFF = new Set(['false', '0', 'off', 'no']);
 
-export function startInboundInfoCron() {
-  const flag = String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase();
-  if (OFF.has(flag)) {
-    console.log(`[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED=${flag})`);
+function isDisabled() {
+  return OFF.has(String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase());
+}
+
+/** 実効の cron 式と表示用の時刻。env 上書きがあればそれを使う */
+export function effectiveSchedule() {
+  const envExpr = (process.env.INBOUND_INFO_SYNC_CRON || '').trim();
+  if (envExpr) return { expr: envExpr, source: 'env', time: null };
+  const s = getJobSettings();
+  const t = parseHhmm(s.time) || parseHhmm('09:00');
+  return { expr: `${t.minute} ${t.hour} * * *`, source: 'settings', time: t.text };
+}
+
+// export はテスト (scripts/test-inbound-info.mjs) 用。cron からは下の schedule 経由で呼ぶ
+export async function runDailyJob() {
+  try {
+    const r = syncNewProducts();
+    if (!r.ok) console.warn(`[inbound-info] sync skipped: ${r.error}`);
+    else console.log(`[inbound-info] sync done: inserted=${r.inserted} (mirror_products=${r.mirror_products})`);
+  } catch (e) {
+    console.error('[inbound-info] sync failed:', e.message);
+  }
+  // ② 入荷予定 (nefuda.csv) の取得。この結果で ③ を出すかどうかが変わる
+  let csvError = null;
+  try {
+    const s = await refreshNefudaSchedule('cron');
+    // stale_file = 別経路がより新しいCSVを反映済み = DBの中身は最新なので PDF は出してよい
+    if (!s.ok) console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
+    else console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
+      + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+  } catch (e) {
+    csvError = e.message;
+    console.error('[inbound-info] nefuda fetch failed:', e.message);
+  }
+
+  // ③ 入荷予定リストPDF。
+  // ⚠ CSV取得が失敗した日は **Drive のPDFを上書きしない** (Codex pdf-R1 High)。
+  //   前回スナップショットで作った古いPDFで上書きすると、現場は「今日の入荷予定」として
+  //   古い紙を刷ってしまい、しかも保存状態が「成功」に見えて失敗を見逃す。
+  //   代わりに失敗として記録し、画面に理由を出す (手動ボタンなら意図的に出せる)。
+  if (!getJobSettings().pdf_enabled) {
+    console.log('[inbound-info] pdf export skipped (画面設定で無効)');
     return;
   }
-  // timezone を明示 (Codex R1 Low: 未指定だとプロセスのローカル TZ 依存になり、
-  // 実行環境が変わるとミラー同期完了前に走り得る)。式は JST でそのまま読める形にする。
-  const expr = process.env.INBOUND_INFO_SYNC_CRON || '0 9 * * *'; // JST 09:00
+  if (csvError) {
+    const msg = `入荷予定(nefuda.csv)の取得に失敗したため、PDFは更新していません (Drive上のPDFは前回のまま): ${csvError}`;
+    savePdfState({ ok: false, error: msg, filename: PDF_FILENAME(), user: 'cron' });
+    console.warn(`[inbound-info] pdf export skipped: ${msg}`);
+    return;
+  }
+  try {
+    const p = await exportSchedulePdfToDrive('cron');
+    console.log(`[inbound-info] pdf ${p.action}: ${p.filename} rows=${p.rows} bytes=${p.bytes}`);
+  } catch (e) {
+    console.error('[inbound-info] pdf export failed:', e.message);
+  }
+}
+
+let task = null;
+
+/**
+ * cron を (再)登録する。起動時と、画面で時刻を変更した時に呼ぶ。
+ * @returns {{started:boolean, expr:string|null, source:string|null, reason?:string}}
+ */
+export function applyInboundInfoSchedule() {
+  const disposeOld = () => {
+    if (!task) return;
+    // stop() だけだとタスクが登録簿に残り得るので destroy() で完全に破棄する
+    // (設定保存を繰り返してもリスナー/登録が積み上がらない — Codex pdf-R1 Medium)
+    try {
+      if (typeof task.destroy === 'function') task.destroy();
+      else task.stop();
+    } catch (e) {
+      console.error('[inbound-info] 旧cronの破棄に失敗:', e.message);
+    }
+    task = null;
+  };
+
+  if (isDisabled()) {
+    disposeOld();
+    console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED)');
+    return { started: false, expr: null, source: null, reason: 'disabled_by_env' };
+  }
+  // 先に式を検証してから旧タスクを破棄する。env に不正な cron 式が入っていた場合に、
+  // 稼働中の予約まで失って「何も動かない」状態になるのを避ける (Codex pdf-R1 Medium)
+  const { expr, source, time } = effectiveSchedule();
   if (!cron.validate(expr)) {
-    console.error(`[inbound-info] invalid cron expr: ${expr} — cron not started`);
-    return;
+    console.error(`[inbound-info] invalid cron expr: ${expr} — 既存の予約を維持します`);
+    return { started: !!task, expr, source, reason: 'invalid_expr' };
   }
-  cron.schedule(expr, async () => {
-    try {
-      const r = syncNewProducts();
-      if (!r.ok) {
-        console.warn(`[inbound-info] sync skipped: ${r.error}`);
-      } else {
-        console.log(`[inbound-info] sync done: inserted=${r.inserted} (mirror_products=${r.mirror_products})`);
-      }
-    } catch (e) {
-      console.error('[inbound-info] sync failed:', e.message);
-    }
-    try {
-      const s = await refreshNefudaSchedule('cron');
-      if (!s.ok) {
-        console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
-      } else {
-        console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
-          + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
-      }
-    } catch (e) {
-      console.error('[inbound-info] nefuda fetch failed:', e.message);
-    }
-  }, { timezone: 'Asia/Tokyo' });
-  console.log(`[inbound-info] cron started (${expr} JST)`);
+  // 新タスクの生成に成功してから旧タスクを破棄する。逆順だと schedule() が例外を投げた時に
+  // 「予約が1つも無い」状態で残る (Codex pdf-R2 Low)。
+  // timezone を明示 (未指定だとプロセスのローカル TZ 依存になり、実行環境が変わると
+  // ミラー同期完了前に走り得る)
+  let next;
+  try {
+    next = cron.schedule(expr, runDailyJob, { timezone: 'Asia/Tokyo' });
+  } catch (e) {
+    console.error(`[inbound-info] cron の登録に失敗 (${expr}): ${e.message} — 既存の予約を維持します`);
+    return { started: !!task, expr, source, reason: 'schedule_failed' };
+  }
+  disposeOld();
+  task = next;
+  console.log(`[inbound-info] cron started (${expr} JST${time ? ` = ${time}` : ''}, source=${source})`);
+  return { started: true, expr, source };
+}
+
+// 既存の呼び出し名 (server.js) を維持
+export function startInboundInfoCron() {
+  return applyInboundInfoSchedule();
 }

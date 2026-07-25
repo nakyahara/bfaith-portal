@@ -2587,6 +2587,23 @@ function createInboundInfoTables() {
       fetched_by         TEXT
     )
   `);
+
+  // 入荷予定リストPDF の Drive 保存結果 (1行固定)。成功も失敗も上書き記録し、画面に
+  // 「最終保存」と失敗理由を出す (毎朝の自動実行が黙って失敗しているのを見逃さないため)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_pdf_state (
+      id          INTEGER PRIMARY KEY CHECK (id = 1),
+      saved_at    TEXT NOT NULL,
+      ok          INTEGER NOT NULL CHECK (ok IN (0, 1)),
+      filename    TEXT,
+      row_count   INTEGER,
+      bytes       INTEGER,
+      file_id     TEXT,
+      folder_name TEXT,
+      error       TEXT,
+      saved_by    TEXT
+    )
+  `);
 }
 // ▲▲▲ 入庫情報管理 ▲▲▲
 

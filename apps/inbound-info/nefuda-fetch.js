@@ -14,6 +14,7 @@
 import { getDriveCsvInfo, downloadDriveCsv, vErr } from '../../lib/drive-csv.js';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 import { replaceSchedule } from './db.js';
+import { runExclusive } from './job-lock.js';
 
 // フォルダID は共有ドライブ直下 (2026-07-21 中原さん指定 URL の ID)。env で差し替え可。
 const CFG = {
@@ -81,13 +82,12 @@ export function parseNefudaCsv(buffer) {
   return rows;
 }
 
-// cron と UI ボタンの同時実行を直列化するプロセス内 mutex (Codex R1 Medium)。
-// 単一プロセス前提 (Render 1 instance)。DB 側にも file_modified_time の鮮度ガードがあり二重防御。
-let _refreshChain = Promise.resolve();
-
 /**
  * Drive から最新の nefuda.csv を取得して f_inbound_schedule を full-replace する。
  * cron と UI ボタンの共通実体。
+ *
+ * 同時実行は job-lock.js の共通 mutex で直列化する (PDF出力と同じロック。CSV更新と
+ * PDF生成が交錯して古い内容で Drive を上書きするのを防ぐ — Codex pdf-R1 Medium)。
  */
 export function refreshNefudaSchedule(user) {
   const run = async () => {
@@ -103,7 +103,5 @@ export function refreshNefudaSchedule(user) {
       file: { filename: dl.filename, modified_time: dl.modified_time, modified_time_jst: dl.modified_time_jst },
     };
   };
-  const p = _refreshChain.then(run, run);
-  _refreshChain = p.catch(() => {}); // 失敗しても次の実行を塞がない
-  return p;
+  return runExclusive(run);
 }
