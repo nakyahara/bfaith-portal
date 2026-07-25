@@ -24,6 +24,45 @@ export const AI_FLAGS = {
 
 export const PAGE_SIZE = 50;
 
+/**
+ * 受信箱ビュー (2026-07-25 中原さん方針)。
+ * 「いまボールが自分にあるもの」だけをTOP (受信トレイ) に出し、こちらが返信したものは
+ * 送信済みへ移す。相手から返事が来れば最後のメッセージが顧客側になるので自動で受信へ戻る
+ * (スレッド全履歴つき)。人がステータスを更新しなくても正しく振り分くのが要点。
+ *
+ * 判定は「最後のメッセージの向き」。キャッシュ列を持たず常にメッセージから導出するので、
+ * 同期・送信・手動解決のどの経路で増えても表示がズレない
+ * (件数規模: 数千件。idx_messages_inquiry が効くため一覧クエリで十分速い)
+ */
+const LAST_INCOMING_SQL = `(SELECT m.is_incoming FROM inquiry_messages m
+  WHERE m.inquiry_id = i.id ORDER BY COALESCE(m.received_at, m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1)`;
+/** 最後のメッセージの日時 (送信済みビューの「N日 返信なし」用)。
+ * inquiries.last_message_at は手動の送信確定 (confirmed_sent) では更新されないため、
+ * メッセージ本体から取る (Codexレビュー反映) */
+const LAST_MESSAGE_AT_SQL = `(SELECT COALESCE(m.received_at, m.sent_at, m.created_at) FROM inquiry_messages m
+  WHERE m.inquiry_id = i.id ORDER BY COALESCE(m.received_at, m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1)`;
+
+export const VIEWS = {
+  inbox: {
+    label: '受信トレイ', icon: '📥',
+    // 未完了 かつ (最後が顧客 or メッセージ無し=取りこぼし防止)
+    where: `i.internal_status != 'done' AND COALESCE(${LAST_INCOMING_SQL}, 1) = 1`,
+    hint: '返信が必要なもの (相手から返事が来たものはここに戻ります)',
+  },
+  sent: {
+    label: '送信済み', icon: '📤',
+    where: `i.internal_status != 'done' AND COALESCE(${LAST_INCOMING_SQL}, 1) = 0`,
+    hint: 'こちらが返信して相手の返事待ちのもの',
+  },
+  done: {
+    label: '対応済み', icon: '✅',
+    where: `i.internal_status = 'done'`,
+    hint: '完了にしたもの',
+  },
+  all: { label: 'すべて', icon: '🗂️', where: '1=1', hint: '受信・送信・完了を問わず全件' },
+};
+export const DEFAULT_VIEW = 'inbox';
+
 /** LIKE検索用エスケープ (%_ をリテラル化。ESCAPE '\' とセットで使う) */
 export const likeEsc = s => String(s).replace(/[\\%_]/g, c => '\\' + c);
 
@@ -35,6 +74,10 @@ export function listInquiries(q = {}) {
   const db = getDB();
   const where = ['i.is_archived = 0'];
   const params = [];
+
+  // ビュー (受信トレイ/送信済み/対応済み)。未知の値は既定の受信トレイに寄せる
+  const view = VIEWS[q.view] ? q.view : DEFAULT_VIEW;
+  where.push(VIEWS[view].where);
 
   if (q.status && STATUSES[q.status]) { where.push('i.internal_status = ?'); params.push(q.status); }
   if (q.channel && CHANNELS[q.channel]) { where.push('i.channel_type = ?'); params.push(q.channel); }
@@ -62,12 +105,24 @@ export function listInquiries(q = {}) {
   const total = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where.join(' AND ')}`).get(...params).c;
   const rows = db.prepare(`
     SELECT i.*, s.shop_name,
-      (SELECT COUNT(*) FROM inquiry_messages m WHERE m.inquiry_id = i.id) AS msg_count
+      (SELECT COUNT(*) FROM inquiry_messages m WHERE m.inquiry_id = i.id) AS msg_count,
+      ${LAST_INCOMING_SQL} AS last_incoming,
+      ${LAST_MESSAGE_AT_SQL} AS last_message_at_actual
     FROM inquiries i JOIN shops s ON s.id = i.shop_id
     WHERE ${where.join(' AND ')}
     ORDER BY COALESCE(i.last_message_at, i.received_at) DESC, i.id DESC
     LIMIT ? OFFSET ?`).all(...params, PAGE_SIZE, (page - 1) * PAGE_SIZE);
-  return { rows, total, page, pages: Math.max(1, Math.ceil(total / PAGE_SIZE)) };
+  return { rows, total, page, pages: Math.max(1, Math.ceil(total / PAGE_SIZE)), view };
+}
+
+/** サイドバーのビュー別件数 (未アーカイブのみ) */
+export function countByView() {
+  const db = getDB();
+  const out = {};
+  for (const [key, v] of Object.entries(VIEWS)) {
+    out[key] = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE i.is_archived = 0 AND ${v.where}`).get().c;
+  }
+  return out;
 }
 
 /** 一覧画面のフィルタ用マスタ (店舗・担当者・状態別件数) */
