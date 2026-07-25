@@ -11,6 +11,8 @@ const baseDir = process.env.DATA_DIR;
 fs.mkdirSync(baseDir, { recursive: true });
 const workDir = fs.mkdtempSync(path.join(baseDir, 'smoke-gmail-'));
 process.env.DATA_DIR = workDir;
+// 他のsmokeと同じDATA_DIRを共有して連続実行しても誤検知しないよう、開始時点の状態を記録
+const baseDbExistedAtStart = fs.existsSync(path.join(baseDir, 'inquiry-hub.db'));
 
 const { initInquiryHubDB, getDB } = await import('./db.js');
 const { runSync } = await import('./sync/engine.js');
@@ -342,7 +344,7 @@ console.log('5. 送信');
   check('outbox cron: flag未設定は起動しない', startInquiryHubOutboxCron() === null);
 }
 
-check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
+check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
 db.close();
