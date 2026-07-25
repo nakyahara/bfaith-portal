@@ -111,34 +111,86 @@ throws('outbox: client_operation_id UNIQUE', () => {
 }, 'UNIQUE');
 
 // ─── 4. 一覧クエリ ───
-console.log('4. 一覧クエリ');
-check('全件 (archived除外)', listInquiries({}).total === 3);
-check('並び順 = 最終更新降順', listInquiries({}).rows[0].id === inq2);
-check('status フィルタ', listInquiries({ status: 'open' }).total === 1);
-check('不正 status は無視', listInquiries({ status: 'bogus' }).total === 3);
-check('channel フィルタ', listInquiries({ channel: 'email' }).total === 2);
-check('shop フィルタ', listInquiries({ shop: String(shopRakuten) }).total === 1);
-check('担当=未割当', listInquiries({ assigned: 'none' }).total === 1);
-check('担当=user-a', listInquiries({ assigned: 'user-a' }).total === 1);
-check('未読のみ', listInquiries({ unread: '1' }).total === 1);
-check('要確認のみ', listInquiries({ attention: '1' }).total === 1);
-check('AIフラグあり', listInquiries({ ai: '1' }).total === 1);
-check('期間 from', listInquiries({ from: '2026-07-11' }).total === 1);
-check('期間 to (当日終日含む)', listInquiries({ to: '2026-07-10' }).total === 2);
-check('検索: 顧客名', listInquiries({ q: '検索太郎' }).total === 1);
-check('検索: 注文番号', listInquiries({ q: 'ORD-200' }).total === 1);
-check('検索: 本文 (メッセージ横断)', listInquiries({ q: 'カモノハシ' }).total === 1);
-check('検索: LIKE特殊文字がリテラル扱い (% は0件)', listInquiries({ q: '99%' }).total === 0);
-check('検索: _ を含む語の完全リテラル一致', listInquiries({ q: '100%オーガニックですか_特殊記号' }).total === 1);
-check('検索: ヒットなし', listInquiries({ q: '存在しない語ゼブラ' }).total === 0);
+console.log('4. 一覧クエリ (ビュー横断=all で従来の絞り込みを検証)');
+check('全件 (archived除外)', listInquiries({ view: 'all' }).total === 3);
+check('並び順 = 最終更新降順', listInquiries({ view: 'all' }).rows[0].id === inq2);
+check('status フィルタ', listInquiries({ view: 'all', status: 'open' }).total === 1);
+check('不正 status は無視', listInquiries({ view: 'all', status: 'bogus' }).total === 3);
+check('channel フィルタ', listInquiries({ view: 'all', channel: 'email' }).total === 2);
+check('shop フィルタ', listInquiries({ view: 'all', shop: String(shopRakuten) }).total === 1);
+check('担当=未割当', listInquiries({ view: 'all', assigned: 'none' }).total === 1);
+check('担当=user-a', listInquiries({ view: 'all', assigned: 'user-a' }).total === 1);
+check('未読のみ', listInquiries({ view: 'all', unread: '1' }).total === 1);
+check('要確認のみ', listInquiries({ view: 'all', attention: '1' }).total === 1);
+check('AIフラグあり', listInquiries({ view: 'all', ai: '1' }).total === 1);
+check('期間 from', listInquiries({ view: 'all', from: '2026-07-11' }).total === 1);
+check('期間 to (当日終日含む)', listInquiries({ view: 'all', to: '2026-07-10' }).total === 2);
+check('検索: 顧客名', listInquiries({ view: 'all', q: '検索太郎' }).total === 1);
+check('検索: 注文番号', listInquiries({ view: 'all', q: 'ORD-200' }).total === 1);
+check('検索: 本文 (メッセージ横断)', listInquiries({ view: 'all', q: 'カモノハシ' }).total === 1);
+check('検索: LIKE特殊文字がリテラル扱い (% は0件)', listInquiries({ view: 'all', q: '99%' }).total === 0);
+check('検索: _ を含む語の完全リテラル一致', listInquiries({ view: 'all', q: '100%オーガニックですか_特殊記号' }).total === 1);
+check('検索: ヒットなし', listInquiries({ view: 'all', q: '存在しない語ゼブラ' }).total === 0);
 check('likeEsc', likeEsc('a%b_c\\d') === 'a\\%b\\_c\\\\d');
-check('msg_count 付与', listInquiries({ q: 'ORD-200' }).rows[0].msg_count === 2);
-check('ページング: page=2 は空', listInquiries({ page: '2' }).rows.length === 0 && PAGE_SIZE === 50);
+check('msg_count 付与', listInquiries({ view: 'all', q: 'ORD-200' }).rows[0].msg_count === 2);
+check('ページング: page=2 は空', listInquiries({ view: 'all', page: '2' }).rows.length === 0 && PAGE_SIZE === 50);
 
 // 論理削除は一覧から消える
 db.prepare('UPDATE inquiries SET is_archived = 1 WHERE id = ?').run(inq3);
-check('is_archived=1 は一覧から除外', listInquiries({}).total === 2);
+check('is_archived=1 は一覧から除外', listInquiries({ view: 'all' }).total === 2);
 db.prepare('UPDATE inquiries SET is_archived = 0 WHERE id = ?').run(inq3);
+
+// ─── 4b. 受信箱ビュー (2026-07-25: 送信済みはTOPから外し、返事が来たら受信へ戻る) ───
+console.log('4b. 受信箱ビュー');
+{
+  const { countByView, VIEWS, DEFAULT_VIEW } = await import('./queries.js');
+  const shopV = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','V店','v@b-faith.biz')").run().lastInsertRowid;
+  const mkV = (ext, status = 'open') => db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, internal_status, received_at, last_message_at, conversation_rev)
+    VALUES ('email', ?, ?, ?, ?, ?, ?, 1)`).run(shopV, ext, ext, status, T('2026-07-20T10:00:00'), T('2026-07-20T10:00:00')).lastInsertRowid;
+  const addMsg = (id, incoming, at) => db.prepare(`INSERT INTO inquiry_messages (inquiry_id, external_message_id, sender_type, message_body_text, is_incoming, received_at)
+    VALUES (?,?,?,?,?,?)`).run(id, `${id}-${at}`, incoming ? 'customer' : 'shop', 'x', incoming ? 1 : 0, T(at));
+
+  const vNew = mkV('v-new');        // 顧客からの新着のみ → 受信トレイ
+  addMsg(vNew, 1, '2026-07-20T10:00:00');
+  const vReplied = mkV('v-replied'); // 顧客→こちらが返信 → 送信済み (ボールは相手)
+  addMsg(vReplied, 1, '2026-07-20T10:00:00');
+  addMsg(vReplied, 0, '2026-07-20T11:00:00');
+  const vDone = mkV('v-done', 'done'); // 完了 → 対応済み
+  addMsg(vDone, 1, '2026-07-20T10:00:00');
+  const vEmpty = mkV('v-empty');    // メッセージ0件 → 取りこぼさず受信トレイ
+
+  const ids = v => listInquiries({ view: v, shop: String(shopV) }).rows.map(r => r.id).sort();
+  check('受信トレイ: 新着 + メッセージ0件 (送信済み・完了は出ない)', JSON.stringify(ids('inbox')) === JSON.stringify([vNew, vEmpty].sort()));
+  check('送信済み: こちらが最後に返信したもの', JSON.stringify(ids('sent')) === JSON.stringify([vReplied]));
+  check('対応済み: done のみ', JSON.stringify(ids('done')) === JSON.stringify([vDone]));
+  check('すべて: 全部', ids('all').length === 4);
+
+  // 返事が返ってきたら受信トレイへ自動で戻る (中原さん方針の核心)
+  addMsg(vReplied, 1, '2026-07-21T09:00:00');
+  check('顧客の返信で送信済み→受信トレイへ戻る', ids('inbox').includes(vReplied) && !ids('sent').includes(vReplied));
+  check('スレッド履歴は保持 (3通)', db.prepare('SELECT COUNT(*) c FROM inquiry_messages WHERE inquiry_id = ?').get(vReplied).c === 3);
+
+  check('既定ビューは受信トレイ', DEFAULT_VIEW === 'inbox' && listInquiries({ shop: String(shopV) }).view === 'inbox');
+  check('不正なビュー指定は既定へフォールバック', listInquiries({ view: 'bogus', shop: String(shopV) }).view === 'inbox');
+  const c = countByView();
+  check('countByView が各ビューの件数を返す', typeof c.inbox === 'number' && typeof c.sent === 'number' && typeof c.done === 'number');
+  // 「N日 返信なし」の基準はメッセージ本体の最終日時 (inquiries.last_message_at は手動の送信確定で
+  // 更新されないため、そのままだと送信直後に「◯日返信なし」と誤表示される。Codexレビュー反映)
+  {
+    const vStale = mkV('v-stale');
+    addMsg(vStale, 1, '2026-07-01T10:00:00');
+    addMsg(vStale, 0, '2026-07-22T10:00:00');   // こちらの返信は新しい
+    db.prepare('UPDATE inquiries SET last_message_at = ? WHERE id = ?').run(T('2026-07-01T10:00:00'), vStale); // 古いまま (手動確定を再現)
+    const row = listInquiries({ view: 'sent', shop: String(shopV) }).rows.find(r => r.id === vStale);
+    check('last_message_at_actual はメッセージ本体の最終日時', row && row.last_message_at_actual === T('2026-07-22T10:00:00'));
+  }
+  check('VIEWS 定義が4種', Object.keys(VIEWS).length === 4);
+
+  // 後片付け (以降のテストに影響させない)
+  db.prepare('DELETE FROM inquiry_messages WHERE inquiry_id IN (SELECT id FROM inquiries WHERE shop_id = ?)').run(shopV);
+  db.prepare('DELETE FROM inquiries WHERE shop_id = ?').run(shopV);
+  db.prepare('DELETE FROM shops WHERE id = ?').run(shopV);
+}
 
 // ─── 5. フィルタ用マスタ・詳細 ───
 console.log('5. フィルタ用マスタ・詳細');

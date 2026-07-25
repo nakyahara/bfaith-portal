@@ -20,7 +20,7 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, listInquiries, listFilterOptions, getInquiryDetail } from './queries.js';
+import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, getInquiryDetail } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
@@ -94,17 +94,20 @@ function fmtLogJson(json) {
 router.get('/', (req, res) => {
   const q = req.query || {};
   const kw = String(q.q || '').trim();
-  const { rows, total, page, pages } = listInquiries(q);
+  const { rows, total, page, pages, view } = listInquiries(q);
   const { shops, assignees, countMap } = listFilterOptions();
 
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
-  const filtering = Object.entries(q).some(([k, v]) => k !== 'page' && v !== '' && v != null);
+  // view/page はビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
+  // スマホで絞り込みが常に開いてしまう)
+  const filtering = Object.entries(q).some(([k, v]) => !['page', 'view'].includes(k) && v !== '' && v != null);
   const filterBar = `
   <details class="fbox" open>
   <summary>🔍 絞り込み${filtering ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">条件あり</span>' : ''}</summary>
   <div class="fbody">
   <form method="get" class="filters">
+    <input type="hidden" name="view" value="${he(view)}">
     <select name="status"><option value="">状態: 全て</option>${Object.entries(STATUSES).map(([k, v]) => opt(k, `${v.label} (${countMap[k] || 0})`, q.status)).join('')}</select>
     <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
     <select name="shop"><option value="">店舗: 全て</option>${shops.map(s => opt(s.id, `${(CHANNELS[s.channel_type] || {}).label || s.channel_type} / ${s.shop_name}`, q.shop)).join('')}</select>
@@ -115,26 +118,39 @@ router.get('/', (req, res) => {
     <input type="date" name="from" value="${he(q.from || '')}" title="受信日 From">〜<input type="date" name="to" value="${he(q.to || '')}" title="受信日 To">
     <input type="search" name="q" value="${he(kw)}" placeholder="顧客名/件名/本文/注文番号/商品コード" style="min-width:240px">
     <button class="pri">検索</button>
-    <a href="/apps/inquiry-hub" class="ghost btn-link">クリア</a>
+    <a href="/apps/inquiry-hub?view=${he(view)}" class="ghost btn-link">クリア</a>
   </form>
   </div>
   </details>`;
 
+  // 送信済みビュー: 返事を待っている日数を出す (返信したまま放置される案件を拾えるように)
+  const waitingLabel = (r) => {
+    // last_message_at_actual = メッセージ本体から取った実際の最終送信日時
+    // (inquiries.last_message_at は手動の送信確定で更新されないため。Codexレビュー反映)
+    const t = Date.parse(r.last_message_at_actual || r.last_message_at || r.received_at);
+    if (!Number.isFinite(t)) return '返信待ち';
+    const days = Math.floor((Date.now() - t) / 86400000);
+    if (days >= 7) return `<span style="color:#b91c1c;font-weight:700">⏳ ${days}日 返信なし</span>`;
+    if (days >= 3) return `<span style="color:#92400e">⏳ ${days}日 返信なし</span>`;
+    return `返信待ち (${days === 0 ? '本日' : days + '日'})`;
+  };
+
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
-    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}'">
+    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
-      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">更新 ${fmtJst(r.last_message_at || r.received_at)}</div></td>
+      <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
     </tr>`).join('');
 
   const pageLink = p => {
     const u = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== '' && v != null));
+    u.set('view', view);
     u.set('page', p);
     return `/apps/inquiry-hub?${u.toString()}`;
   };
@@ -143,12 +159,19 @@ router.get('/', (req, res) => {
     <span>${page} / ${pages} ページ (全${total}件)</span>
     ${page < pages ? `<a href="${he(pageLink(page + 1))}">次 →</a>` : ''}</div>` : `<div class="pager"><span>全${total}件</span></div>`;
 
+  const emptyMsg = {
+    inbox: '受信トレイは空です 🎉 (返信が必要な問い合わせはありません)',
+    sent: '返事待ちの案件はありません',
+    done: '対応済みの問い合わせはまだありません',
+    all: '問い合わせがありません',
+  }[view];
   const body = `
+  <div class="view-hint">${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}</div>
   ${filterBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>担当</th><th>AI</th><th>受信</th></tr></thead>
-      <tbody>${trs || '<tr><td colspan="7" class="empty">問い合わせがありません (同期実装前は手動投入データのみ表示されます)</td></tr>'}</tbody>
+      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>担当</th><th>AI</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <tbody>${trs || `<tr><td colspan="7" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
   </div>`;
@@ -167,15 +190,17 @@ router.get('/', (req, res) => {
     sync();
     mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
   })();`;
-  res.send(pageShell('問い合わせ管理 — 一覧', 'list', body, listScript));
+  res.send(pageShell(`問い合わせ管理 — ${VIEWS[view].label}`, view, body, listScript));
 });
 
 // ─── 詳細画面 ───
 router.get('/inquiries/:id', (req, res) => {
   const id = Number(req.params.id);
   const detail = getInquiryDetail(id);
-  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', 'list', '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
+  if (!detail) return res.status(404).send(pageShell('問い合わせ管理', DEFAULT_VIEW, '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
+  // 戻り先のビュー (一覧から ?view= を引き継ぐ。直リンク時は受信トレイ)
+  const backView = VIEWS[req.query?.view] ? req.query.view : DEFAULT_VIEW;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
 
@@ -274,7 +299,7 @@ router.get('/inquiries/:id', (req, res) => {
 
   const body = `
   <div class="detail-head">
-    <a href="/apps/inquiry-hub">← 一覧に戻る</a>
+    <a href="/apps/inquiry-hub?view=${he(backView)}">← ${he(VIEWS[backView].label)}に戻る</a>
     <h2>${chBadge(inq.channel_type)} ${he(inq.subject || '(件名なし)')}</h2>
   </div>
   <div class="detail-grid">
@@ -392,7 +417,7 @@ router.get('/inquiries/:id', (req, res) => {
       .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
 
-  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, 'list', body, script));
+  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, backView, body, script));
 });
 
 // ─── 操作API (すべて操作ログを記録) ───
@@ -1489,6 +1514,26 @@ td.ops button { margin: 2px 4px 2px 0; }
 .expiry-edit input[type=date] { padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
 .expiry-edit button { padding: 3px 10px; font-size: 12px; }
 
+/* ═══ Gmail風レイアウト: 左サイドバー + 本文 ═══ */
+.layout { display: flex; align-items: flex-start; }
+.side-nav { width: 210px; flex: 0 0 210px; padding: 12px 8px; position: sticky; top: 0;
+  max-height: 100vh; overflow-y: auto; }
+.nav-group { display: flex; flex-direction: column; gap: 2px; }
+.nav-sep { height: 1px; background: #dbe3ee; margin: 10px 12px; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: 999px;
+  color: #334155; text-decoration: none; font-size: 14px; line-height: 1.3; }
+.nav-item:hover { background: #e2e8f0; }
+.nav-item.on { background: #dbeafe; color: #1d4ed8; font-weight: 700; }
+.nav-icon { font-size: 16px; flex: 0 0 auto; }
+.nav-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-count { flex: 0 0 auto; font-size: 12px; font-weight: 700; color: #1d4ed8; }
+.nav-item.on .nav-count { color: #1d4ed8; }
+.nav-toggle { display: none; background: transparent; border: none; color: #fff; font-size: 20px;
+  padding: 4px 8px; cursor: pointer; min-height: 0; }
+.nav-backdrop { display: none; }
+.layout > .wrap { flex: 1 1 auto; min-width: 0; padding: 16px; max-width: 1400px; }
+.view-hint { color: #64748b; font-size: 13px; margin: 0 0 10px; }
+
 /* ═══ 絞り込みボックス: PCは常時展開・スマホは折りたたみ (画面上半分をフィルタで潰さない) ═══ */
 details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性はサーバーが常に付与) */
 
@@ -1499,15 +1544,18 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
    PC表示 (701px〜) は一切変更しない */
 @media (max-width: 700px) {
   body { font-size: 15px; }                       /* iOSの自動ズーム回避 (16px未満の入力欄対策と併用) */
-  header.app { padding: 8px 10px; gap: 10px; }
+  header.app { padding: 6px 8px; gap: 8px; }
   header.app h1 { font-size: 15px; }
   header.app .back { font-size: 12px; }
-  /* タブは折り返さず横スクロール1行 (縦を食わない) */
-  nav.tabs { flex-wrap: nowrap; overflow-x: auto; width: 100%; order: 3; padding-bottom: 2px;
-    scrollbar-width: none; -webkit-overflow-scrolling: touch; }
-  nav.tabs::-webkit-scrollbar { display: none; }
-  a.tab { padding: 10px 14px; white-space: nowrap; min-height: 44px; }
-  .wrap { padding: 10px; }
+  /* サイドバーはドロワー化 (Gmailアプリと同じく ☰ で開く) */
+  .nav-toggle { display: block; }
+  .side-nav { position: fixed; top: 0; left: 0; bottom: 0; z-index: 1200; width: 268px; flex-basis: 268px;
+    background: #fff; box-shadow: 2px 0 12px rgba(0,0,0,.18); padding: 14px 10px;
+    transform: translateX(-100%); transition: transform .18s ease-out; max-height: none; }
+  .side-nav.open { transform: translateX(0); }
+  .nav-backdrop.on { display: block; position: fixed; inset: 0; background: rgba(15,23,42,.4); z-index: 1100; }
+  .nav-item { padding: 12px 14px; min-height: 44px; }
+  .layout > .wrap { padding: 10px; }
 
   /* タップターゲット確保 (指で押せる高さ)。font-size:16px = iOSの自動ズーム防止 */
   button, .btn-link, select, textarea,
@@ -1562,24 +1610,51 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
 }
 `;
 
+/**
+ * ページ共通シェル (Gmail風の左サイドバー)。
+ * active: 'inbox'|'sent'|'done'|'all'|'templates'|'qa'|'mailrules'|'admin'
+ * PCではサイドバー常時表示、スマホでは ☰ で開くドロワー
+ */
 function pageShell(title, active, body, script) {
-  const tab = (href, icon, label, key) => `<a href="${href}" class="tab${active === key ? ' on' : ''}"><span class="tab-icon">${icon}</span>${label}</a>`;
+  // 受信箱の件数はサイドバーに出す (Gmailの「受信トレイ (12)」と同じ位置づけ)。
+  // 一覧以外の画面でも出すが、失敗しても画面は出す (fail-soft)
+  let counts = {};
+  try { counts = countByView(); } catch { /* 初期化前などは件数なしで表示 */ }
+  const navItem = (href, icon, label, key, count) => `
+    <a href="${href}" class="nav-item${active === key ? ' on' : ''}">
+      <span class="nav-icon">${icon}</span><span class="nav-label">${label}</span>
+      ${count ? `<span class="nav-count">${count}</span>` : ''}
+    </a>`;
+  const sidebar = `
+  <aside class="side-nav" id="sideNav">
+    <div class="nav-group">
+      ${navItem('/apps/inquiry-hub?view=inbox', '📥', '受信トレイ', 'inbox', counts.inbox)}
+      ${navItem('/apps/inquiry-hub?view=sent', '📤', '送信済み', 'sent', counts.sent)}
+      ${navItem('/apps/inquiry-hub?view=done', '✅', '対応済み', 'done', 0)}
+      ${navItem('/apps/inquiry-hub?view=all', '🗂️', 'すべて', 'all', 0)}
+    </div>
+    <div class="nav-sep"></div>
+    <div class="nav-group">
+      ${navItem('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates', 0)}
+      ${navItem('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa', 0)}
+      ${navItem('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules', 0)}
+      ${navItem('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin', 0)}
+    </div>
+  </aside>`;
   return `<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${he(title)}</title><style>${CSS}</style></head>
 <body>
 <header class="app">
+  <button id="navToggle" class="nav-toggle" aria-label="メニュー">☰</button>
   <h1>💬 問い合わせ管理</h1>
-  <nav class="tabs">
-    ${tab('/apps/inquiry-hub', '📨', '問い合わせ一覧', 'list')}
-    ${tab('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates')}
-    ${tab('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa')}
-    ${tab('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules')}
-    ${tab('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin')}
-  </nav>
   <a href="/" class="back">← ポータルに戻る</a>
 </header>
-<div class="wrap">${body}</div>
+<div class="layout">
+  ${sidebar}
+  <div class="nav-backdrop" id="navBackdrop"></div>
+  <div class="wrap">${body}</div>
+</div>
 <div id="toast"></div>
 <script>
 function toast(msg) {
@@ -1587,6 +1662,18 @@ function toast(msg) {
   t.textContent = msg; t.style.display = 'block';
   clearTimeout(t._h); t._h = setTimeout(function(){ t.style.display = 'none'; }, 2800);
 }
+// サイドバー開閉 (スマホ)。PCでは常時表示なのでボタン自体をCSSで隠している
+(function() {
+  var btn = document.getElementById('navToggle'), nav = document.getElementById('sideNav'),
+      bd = document.getElementById('navBackdrop');
+  if (!btn || !nav) return;
+  function close() { nav.classList.remove('open'); if (bd) bd.classList.remove('on'); }
+  btn.addEventListener('click', function() {
+    nav.classList.toggle('open');
+    if (bd) bd.classList.toggle('on', nav.classList.contains('open'));
+  });
+  if (bd) bd.addEventListener('click', close);
+})();
 ${script || ''}
 </script>
 </body></html>`;
