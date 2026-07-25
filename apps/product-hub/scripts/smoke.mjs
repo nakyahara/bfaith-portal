@@ -135,6 +135,158 @@ const after = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.
 check('notion status = failed + error saved', after.notion_card_status === 'failed' && !!after.notion_card_error);
 check('pendingCardCount counts it', notionCard.pendingCardCount() >= 1);
 
+// ─── Notion 取り込み (検証用の選択インポート。finder を注入して API 非接続) ───
+const imp = await import('../services/notion-import.js');
+
+check('parseNeCodes splits/dedups/trims',
+  JSON.stringify(imp.parseNeCodes(' A-1 \nB-2,A-1\n\n , C-3\t')) === JSON.stringify(['A-1', 'B-2', 'C-3']),
+  JSON.stringify(imp.parseNeCodes(' A-1 \nB-2,A-1\n\n , C-3\t')));
+
+const rt = (s) => ({ type: 'rich_text', rich_text: [{ plain_text: s }] });
+const fakePage = (neCode) => ({
+  id: `page-${neCode}`,
+  properties: {
+    'Name': { type: 'title', title: [{ plain_text: `取込商品 ${neCode}` }] },
+    '商品コード': rt(neCode),
+    '売価': { type: 'number', number: 1980 },
+    'Yahoo価格（佐川の場合）': { type: 'number', number: 2200 },
+    '配送方法': { type: 'select', select: { name: 'ネコポス' } },
+    '税率': { type: 'select', select: { name: '10%' } },
+    'バリエーション有無': { type: 'select', select: { name: 'あり' } },
+    'Yahoo!タイトル': rt('Yahooタイトル本文'),
+    'キャッチコピー': rt('キャッチ本文'),
+    '商品説明文': rt('説明本文'),
+    'HTML_商品説明文': rt('<p>html</p>'),
+    'JANコード': { type: 'number', number: 4901234567890 },
+    'Status': { type: 'select', select: { name: '⓪新規商品_高島' } },
+    'Yahoo!カテゴリID': { type: 'number', number: 43494 },
+    'Yahoo!path': rt('おもちゃ > 知育'),
+    'メーカーページURL': { type: 'url', url: 'https://example.com/official' },
+    'amazon販売ページ': { type: 'url', url: 'https://www.amazon.co.jp/dp/B0IMP' },
+  },
+});
+
+const rec = imp.buildImportRecord(fakePage('IMP-1'));
+check('buildImportRecord maps core fields',
+  rec.ne_code === 'IMP-1' && rec.name === '取込商品 IMP-1' && rec.price === 1980
+  && rec.jan_code === '4901234567890' && rec.has_variation === 1
+  && rec.official_url === 'https://example.com/official'
+  && rec.amazon_url === 'https://www.amazon.co.jp/dp/B0IMP'
+  && rec.notion_status === '⓪新規商品_高島',
+  JSON.stringify(rec));
+check('buildImportRecord maps yahoo fields',
+  rec.yahoo.yahoo_price_sagawa === 2200 && rec.yahoo.delivery_label === 'ネコポス'
+  && rec.yahoo.tax_rate === '10%' && rec.yahoo.yahoo_category_id === 43494,
+  JSON.stringify(rec.yahoo));
+check('buildImportRecord reports HTML_商品説明文 as skipped',
+  rec.skipped_fields.length === 1 && rec.skipped_fields[0] === 'HTML_商品説明文');
+check('buildImportRecord null on missing 商品コード',
+  imp.buildImportRecord({ id: 'p', properties: { 'Name': { type: 'title', title: [{ plain_text: 'x' }] } } }) === null);
+// 判別できない「バリエーション有無」は単品(0)に倒す
+check('has_variation unknown → 0', imp.buildImportRecord({
+  id: 'p2', properties: { '商品コード': rt('V-0'), 'バリエーション有無': { type: 'select', select: { name: '未確認' } } },
+}).has_variation === 0);
+
+const fakeFinder = async (code) => (code === 'MISSING' ? null : fakePage(code));
+
+const r1 = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });
+check('import → imported', r1.summary.imported === 1 && r1.results[0].outcome === 'imported', JSON.stringify(r1));
+const imported = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'IMP-1'`).get();
+check('imported row marked source=notion_import',
+  imported.source === 'notion_import' && imported.status === 'draft'
+  && imported.notion_page_id === 'page-IMP-1' && imported.notion_card_status === 'created'
+  && imported.source_notion_status === '⓪新規商品_高島' && !!imported.imported_at,
+  JSON.stringify(imported));
+check('imported yahoo row written',
+  db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(imported.id)?.delivery_label === 'ネコポス');
+const aiRows = db.prepare('SELECT kind, content FROM draft_ai_outputs WHERE draft_id = ? ORDER BY kind').all(imported.id);
+check('imported ai outputs (yahoo_title/desc_catch/desc_features)',
+  aiRows.length === 3 && aiRows.map((r) => r.kind).join(',') === 'desc_catch,desc_features,yahoo_title',
+  JSON.stringify(aiRows));
+check('import logged', db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'notion_imported'`).get(imported.id).c === 1);
+
+const r2 = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: fakeFinder });
+check('re-import → updated (冪等・二重行を作らない)',
+  r2.summary.updated === 1
+  && db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE ne_code = 'IMP-1'`).get().c === 1,
+  JSON.stringify(r2));
+
+const r3 = await imp.importFromNotion(['MISSING'], { actor: 'smoke', finder: fakeFinder });
+check('import not_found', r3.summary.not_found === 1);
+
+// Notion 側で空にした項目は再取り込みで消える (スキップして古い値を残さない)
+const blankPage = fakePage('IMP-1');
+blankPage.properties['キャッチコピー'] = { type: 'rich_text', rich_text: [] };
+const r2b = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => blankPage });
+check('re-import clears emptied Notion value',
+  r2b.summary.updated === 1
+  && db.prepare(`SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = 'desc_catch'`).get(imported.id).content === null,
+  JSON.stringify(r2b));
+
+// 検索コードと返却カードのコードが不一致なら書かない
+const r5 = await imp.importFromNotion(['WANT-A'], { actor: 'smoke', finder: async () => fakePage('OTHER-B') });
+check('import rejects code mismatch',
+  r5.summary.failed === 1
+  && db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE ne_code IN ('WANT-A','OTHER-B')`).get().c === 0,
+  JSON.stringify(r5));
+
+// 同じ商品コードに別 Notion ページが来たら黙って付け替えない
+const r6 = await imp.importFromNotion(['IMP-1'], { actor: 'smoke', finder: async () => ({ ...fakePage('IMP-1'), id: 'page-DIFFERENT' }) });
+check('import conflict_page_id (別カードへ黙って付け替えない)',
+  r6.summary.conflict_page_id === 1
+  && db.prepare(`SELECT notion_page_id FROM product_drafts WHERE ne_code = 'IMP-1'`).get().notion_page_id === 'page-IMP-1',
+  JSON.stringify(r6));
+
+// ポータル起点の商品は取り込みで塗り潰さない
+const r4 = await imp.importFromNotion(['SMOKE-1'], { actor: 'smoke', finder: fakeFinder });
+check('import conflict_portal (ポータル起点を上書きしない)',
+  r4.summary.conflict_portal === 1
+  && db.prepare(`SELECT name FROM product_drafts WHERE ne_code = 'SMOKE-1'`).get().name === 'スモーク商品',
+  JSON.stringify(r4));
+check('default source = portal', db.prepare(`SELECT source FROM product_drafts WHERE ne_code = 'SMOKE-1'`).get().source === 'portal');
+
+let overErr = null;
+try {
+  await imp.importFromNotion(Array.from({ length: imp.MAX_IMPORT_CODES + 1 }, (_, i) => `OVER-${i}`), { finder: fakeFinder });
+} catch (e) { overErr = e; }
+check('import rejects over MAX_IMPORT_CODES', !!overErr);
+
+// 取り込み由来は Notion へ書き戻さない (これが無いと既存カードの URL が消える)
+check('syncCardLinks skips imported',
+  (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
+check('attemptCardCreation skips imported',
+  (await notionCard.attemptCardCreation(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
+// fail-closed: source が未知の値でも書き戻さない (deny-list だとここが通ってしまう)
+db.prepare(`UPDATE product_drafts SET source = 'notion-import' WHERE id = ?`).run(imported.id);
+check('syncCardLinks fail-closed on unknown source',
+  (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
+check('attemptCardCreation fail-closed on unknown source',
+  (await notionCard.attemptCardCreation(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
+db.prepare(`UPDATE product_drafts SET source = 'notion_import' WHERE id = ?`).run(imported.id);
+check('canWriteToNotion allow-list',
+  dbmod.canWriteToNotion({ source: 'portal' }) === true
+  && dbmod.canWriteToNotion({ source: 'notion_import' }) === false
+  && dbmod.canWriteToNotion({ source: 'unknown' }) === false
+  && dbmod.canWriteToNotion(null) === false);
+// 空URLは送らない = Notion 側の既存値を消さない (#423 の { url: null } を撤回)
+db.prepare(`UPDATE product_drafts SET official_url = NULL, amazon_url = NULL WHERE id = ?`).run(draft.id);
+db.prepare(`UPDATE product_drafts SET notion_page_id = 'fake-page-id' WHERE id = ?`).run(draft.id);
+check('syncCardLinks does not clear (nothing_to_sync)',
+  (await notionCard.syncCardLinks(draft.id, { actor: 'smoke' })).outcome === 'nothing_to_sync');
+db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item', notion_page_id = NULL WHERE id = ?`).run(draft.id);
+check('no sync/create event written for imported',
+  db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ?
+    AND event IN ('notion_card_links_synced','notion_card_sync_failed','notion_card_failed')`).get(imported.id).c === 0);
+check('retryPendingCards excludes imported',
+  (await notionCard.retryPendingCards({ actor: 'smoke' })).every((r) => r.draftId !== imported.id));
+
+// 削除は取り込み由来だけ (children は CASCADE、draft_events は append-only なので孤児で残る)
+const impId = imported.id;
+db.prepare('DELETE FROM product_drafts WHERE id = ?').run(impId);
+check('delete cascades children',
+  db.prepare('SELECT COUNT(*) c FROM draft_yahoo WHERE draft_id = ?').get(impId).c === 0
+  && db.prepare('SELECT COUNT(*) c FROM draft_ai_outputs WHERE draft_id = ?').get(impId).c === 0);
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -143,13 +295,16 @@ const counts = Object.fromEntries(statuses.map((s) => [s, 1]));
 const draftRow = { ...after, thumb: 'https://drive.google.com/thumbnail?id=x&sz=w160', first_image_id: 'x' };
 
 const renders = [
-  ['index.ejs (banner+rows)', 'index.ejs', {
-    title: 't', displayName: 'smoke', drafts: [draftRow], counts, statusFilter: null,
-    statuses, statusLabels, notionPending: 1,
+  ['index.ejs (banner+rows+import panel)', 'index.ejs', {
+    title: 't', displayName: 'smoke',
+    // ポータル起点と取り込み由来の両方の行を描かせる (出自列の全分岐)
+    drafts: [draftRow, { ...draftRow, id: 999, source: 'notion_import', ne_code: 'IMP-1' }],
+    counts, statusFilter: null,
+    statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
   }],
   ['index.ejs (empty)', 'index.ejs', {
     title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: 'draft',
-    statuses, statusLabels, notionPending: 0,
+    statuses, statusLabels, notionPending: 0, maxImportCodes: imp.MAX_IMPORT_CODES,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
@@ -173,6 +328,19 @@ const renders = [
     refs: [], images: [], specs: [],
     aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    yahoo: null, imageProduction: null,
+  }],
+  ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: {
+      ...after, status: 'draft', source: 'notion_import', source_notion_status: '⓪新規商品_高島',
+      notion_card_status: 'created', notion_page_id: 'abcd-ef', own_brand: 0, asin: null, amazon_url: null,
+    },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: ['商品画像 (Driveリンク) が1枚もありません'],
+    nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     yahoo: null, imageProduction: null,
   }],

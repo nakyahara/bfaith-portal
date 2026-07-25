@@ -22,6 +22,17 @@
         </div>
       </div>
     <% } %>
+    <% if (draft.source === 'notion_import') { %>
+      <div class="banner-warn" style="margin:12px 0 0;">
+        📥 <strong>Notionから取り込んだ商品です (検証用)。</strong>
+        Notion 側が正のため、ここで編集しても <strong>Notionには書き戻されません</strong>。
+        既存カードの運用はNotionで行ってください。
+        <% if (draft.source_notion_status) { %>
+          <span class="muted">／ 取り込み時のNotion Status: <%= draft.source_notion_status %></span>
+        <% } %>
+        <button class="btn btn-sm btn-danger" id="delete-draft-btn" style="margin-left:8px">この取り込みを削除</button>
+      </div>
+    <% } %>
     <div style="margin-top:10px; font-size:13px;">
       Notionカード:
       <% if (draft.notion_card_status === 'created' && draft.notion_page_id) { %>
@@ -381,6 +392,20 @@
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
+
+  // 取り込みテストデータの掃除 (取り込み由来のみ。Notion 側のカードには触らない)
+  const deleteDraftBtn = document.getElementById('delete-draft-btn');
+  if (deleteDraftBtn) {
+    deleteDraftBtn.addEventListener('click', async () => {
+      if (!confirm('この取り込みドラフトをアプリから削除します。\nNotion側のカードは削除されません。\n\nよろしいですか?')) return;
+      const json = await post(BASE + '/delete');
+      if (json.ok) {
+        location.href = '/apps/product-hub';
+      } else {
+        alert(json.error || '削除に失敗しました');
+      }
+    });
+  }
 
   document.getElementById('save-yahoo-btn').addEventListener('click', async () => {
     showAndReload(await post(BASE + '/yahoo', {

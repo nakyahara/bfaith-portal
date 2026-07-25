@@ -14,11 +14,12 @@ import crypto from 'crypto';
 
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken,
-  upsertDraftYahoo, upsertImageProduction, listGenerationQueue,
+  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
+import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -115,6 +116,7 @@ router.get('/', (req, res) => {
     drafts, counts, statusFilter,
     statuses: DRAFT_STATUSES, statusLabels: STATUS_LABELS,
     notionPending: pendingCardCount(),
+    maxImportCodes: MAX_IMPORT_CODES,
   });
 });
 
@@ -438,6 +440,43 @@ router.post('/api/notion-retry-all', async (req, res) => {
   const results = await retryPendingCards({ actor: actorOf(req) });
   const failed = results.filter((r) => r.outcome === 'failed');
   res.json({ ok: failed.length === 0, tried: results.length, failed: failed.length, results });
+});
+
+// ─── API: Notion 取り込み (検証用の選択インポート) ──────────
+// 商品コード指定で Notion 既存カードを取り込む。**読み取り専用** (Notion へ書き戻さない)。
+// 取り込んだ行は source='notion_import' で印が付き、notion-card.js の同期経路から外れる。
+
+router.post('/api/notion-import', async (req, res) => {
+  const codes = parseNeCodes(req.body?.codes);
+  if (codes.length === 0) {
+    return res.status(400).json({ ok: false, error: '商品コードを1件以上入力してください' });
+  }
+  if (codes.length > MAX_IMPORT_CODES) {
+    return res.status(400).json({ ok: false, error: `一度に取り込めるのは ${MAX_IMPORT_CODES} 件までです (指定: ${codes.length} 件)` });
+  }
+  try {
+    const { results, summary } = await importFromNotion(codes, { actor: actorOf(req) });
+    res.json({ ok: summary.failed === 0, summary, results });
+  } catch (e) {
+    // Notion env 未設定 (fail-closed) 等。取り込みは検証機能なので落ちても他機能に影響させない。
+    // 詳細はサーバーログに残し、クライアントには内部情報を返さない (Codex R1 low-7)
+    console.error('[product-hub] notion-import failed:', e);
+    res.status(500).json({ ok: false, error: '取り込みに失敗しました (詳細はサーバーログを確認してください)' });
+  }
+});
+
+// 取り込んだテストデータの掃除。**取り込み由来だけ**削除可 (ポータル起点の商品は消させない)。
+// Notion 側のカードには一切触らない (ポータル DB の行を消すだけ)。
+router.post('/api/drafts/:id/delete', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (!isNotionImported(draft)) {
+    return res.status(400).json({ ok: false, error: '削除できるのはNotion取り込み由来のドラフトだけです' });
+  }
+  const db = getDB();
+  // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
+  res.json({ ok: true, deleted: draft.ne_code });
 });
 
 export default router;

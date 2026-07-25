@@ -17,6 +17,32 @@ export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
 ];
 
+/**
+ * ドラフトの出自 (§8 「商品コード単位でどちらを正とするか」)。
+ *   portal        … ポータル起点の新規商品。ポータルが正 → Notion カードを作成/同期する
+ *   notion_import … Notion 既存カードの取り込み。**Notion が正** → ポータルから書き戻さない
+ * 中原さん方針 (2026-07-25): 既存カードは Notion 側で運用、新商品はアプリ、検証用に一部だけ取り込む。
+ */
+export const DRAFT_SOURCES = ['portal', 'notion_import'];
+export const SOURCE_PORTAL = 'portal';
+export const SOURCE_NOTION_IMPORT = 'notion_import';
+
+/**
+ * Notion へ書き戻してよい行か。
+ * **allow-list (fail-closed)**: portal 起点だけを許可する。
+ * 「notion_import でなければ許可」の deny-list だと、source が未知の値や誤記
+ * ('notion-import' 等) になった瞬間に書き戻しが通ってしまう (Codex R1 high-1)。
+ * ALTER で足した列には CHECK を付けられないため、コード側を fail-closed にして担保する。
+ */
+export function canWriteToNotion(draft) {
+  return !!draft && draft.source === SOURCE_PORTAL;
+}
+
+/** Notion 取り込み由来か (削除許可など「取り込みだけ」を対象にする判定用) */
+export function isNotionImported(draft) {
+  return !!draft && draft.source === SOURCE_NOTION_IMPORT;
+}
+
 export const STATUS_LABELS = {
   draft: '下書き',
   ready_for_ai: '生成待ち',
@@ -168,6 +194,20 @@ export function initProductHubDB() {
   }
   if (!draftCols.has('own_brand')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN own_brand INTEGER NOT NULL DEFAULT 0 CHECK (own_brand IN (0, 1))');
+  }
+  // Notion 取り込み (テスト検証用)。source='notion_import' の行は Notion 側が正であり、
+  // ポータルから Notion へ書き戻してはならない (既存カードの破壊防止 — notion-card.js のガード参照)。
+  //   注意: ALTER で足す列に CHECK は付けられない。そのため書き戻し判定は canWriteToNotion の
+  //   allow-list (source==='portal' のみ許可) で fail-closed にしてある。
+  if (!draftCols.has('source')) {
+    db.exec(`ALTER TABLE product_drafts ADD COLUMN source TEXT NOT NULL DEFAULT 'portal'`);
+  }
+  if (!draftCols.has('source_notion_status')) {
+    // 取り込み時点の Notion Status (⓪新規商品_高島 等)。product_drafts.status とは別軸なので原文保持
+    db.exec('ALTER TABLE product_drafts ADD COLUMN source_notion_status TEXT');
+  }
+  if (!draftCols.has('imported_at')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
 
   // draft_events は append-only (mis-shipment と同じ trigger ガード)

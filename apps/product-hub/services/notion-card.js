@@ -15,7 +15,7 @@
 import crypto from 'crypto';
 
 import { createPage, findPageByManageNumber, patchPageProperties } from '../../rakuten-yahoo-sync/lib/notion-client.js';
-import { getDB, logEvent } from '../db.js';
+import { getDB, logEvent, canWriteToNotion } from '../db.js';
 
 // notion-client の worst case (timeout 30s × retry 5 + backoff) を大きく上回る保守的な値
 const STALE_CREATING_MS = 30 * 60 * 1000;
@@ -60,15 +60,28 @@ export async function syncCardLinks(draftId, { actor = null } = {}) {
   const db = getDB();
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { outcome: 'not_found' };
+  // fail-closed: portal 起点だけ書き戻す。取り込み由来 (Notion が正) はここで抜ける
+  if (!canWriteToNotion(draft)) return { outcome: 'skipped_not_portal' };
   if (!draft.notion_page_id) return { outcome: 'no_card' };
+
+  // 空値は送らない。#423 は「ポータルで消したら Notion も消す」意図で { url: null } を
+  // 送っていたが、既存カードを採用/取り込みした行で未入力のまま保存すると実データが
+  // 消える (Codex R1 critical)。クリアの利便より破壊の回避を優先し、非空だけ送る。
+  const props = {};
+  if (draft.official_url) props['メーカーページURL'] = { url: draft.official_url };
+  if (draft.amazon_url) props['amazon販売ページ'] = { url: draft.amazon_url };
+  if (Object.keys(props).length === 0) return { outcome: 'nothing_to_sync' };
+
   try {
+    // TOCTOU 縮小 (Codex R1 high-2): API 直前に source を読み直す。
+    // DB を共有する別プロセスや将来の機能が source を変えても、書き込み直前で弾く
+    const fresh = db.prepare('SELECT source, notion_page_id FROM product_drafts WHERE id = ?').get(draftId);
+    if (!canWriteToNotion(fresh) || fresh.notion_page_id !== draft.notion_page_id) {
+      return { outcome: 'skipped_not_portal' };
+    }
     // 保存レスポンスを道連れにしないよう短い timeout + リトライ1回に制限 (Codex medium)。
     // 失敗しても fail-soft でイベントに残るだけなので、粘るより早く返す方が UX が良い
-    await patchPageProperties(draft.notion_page_id, {
-      // { url: null } で Notion 側もクリアされる (ポータルで消したら Notion も消す)
-      'メーカーページURL': { url: draft.official_url || null },
-      'amazon販売ページ': { url: draft.amazon_url || null },
-    }, { cfg: { timeoutMs: 10_000 }, maxRetries: 1 });
+    await patchPageProperties(draft.notion_page_id, props, { cfg: { timeoutMs: 10_000 }, maxRetries: 1 });
     logEvent(db, draftId, 'notion_card_links_synced', null, actor);
     return { outcome: 'synced' };
   } catch (e) {
@@ -91,6 +104,8 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
   const db = getDB();
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { outcome: 'not_found' };
+  // fail-closed: portal 起点だけ作成対象。取り込み由来は既に Notion にカードが在る (取り込み元がそれ)
+  if (!canWriteToNotion(draft)) return { outcome: 'skipped_not_portal' };
   if (draft.notion_page_id) return { outcome: 'already_created', notionPageId: draft.notion_page_id };
 
   // CAS claim: pending/failed → creating (creating は stale のときだけ奪取可)。
@@ -104,16 +119,19 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
       notion_card_attempts = notion_card_attempts + 1,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = ?
+      AND source = 'portal'
       AND notion_page_id IS NULL
       AND (notion_card_status IN ('pending','failed')
            OR (notion_card_status = 'creating' AND updated_at < ?))
   `).run(claimToken, draftId, staleBefore);
   if (claim.changes === 0) return { outcome: 'skip_locked' };
 
-  // claim がまだ自分のものか (stale 奪取されていないか) を確認する
+  // claim がまだ自分のものか (stale 奪取されていないか) を確認する。
+  // source も一緒に見る: claim 後に取り込み由来へ変わった行へは書き込ませない (Codex R1 high-2)
   const holdsClaim = () => {
-    const row = db.prepare('SELECT notion_card_status, notion_card_claim FROM product_drafts WHERE id = ?').get(draftId);
-    return row && row.notion_card_status === 'creating' && row.notion_card_claim === claimToken;
+    const row = db.prepare('SELECT notion_card_status, notion_card_claim, source FROM product_drafts WHERE id = ?').get(draftId);
+    return row && row.notion_card_status === 'creating' && row.notion_card_claim === claimToken
+      && canWriteToNotion(row);
   };
 
   // finalize は claim 一致時のみ書き込む CAS (奪取した新 worker の結果を旧 worker が上書きしない)。
@@ -127,6 +145,7 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
         notion_card_claim = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       WHERE id = ? AND notion_card_status = 'creating' AND notion_card_claim = ?
+        AND source = 'portal'
     `).run(status, pageId || null, error || null, draftId, claimToken);
     return info.changes > 0;
   };
@@ -172,6 +191,7 @@ export async function retryPendingCards({ actor = null, limit = 50 } = {}) {
   const targets = db.prepare(`
     SELECT id FROM product_drafts
     WHERE notion_page_id IS NULL
+      AND source = 'portal'
       AND (notion_card_status IN ('pending','failed')
            OR (notion_card_status = 'creating' AND updated_at < ?))
     ORDER BY id
@@ -191,5 +211,6 @@ export function pendingCardCount() {
   return db.prepare(`
     SELECT COUNT(*) AS c FROM product_drafts
     WHERE notion_page_id IS NULL AND notion_card_status != 'created'
+      AND source = 'portal'
   `).get().c;
 }
