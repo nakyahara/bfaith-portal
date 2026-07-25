@@ -88,7 +88,12 @@ router.get('/', (req, res) => {
   const { shops, assignees, countMap } = listFilterOptions();
 
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
+  // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
+  const filtering = Object.entries(q).some(([k, v]) => k !== 'page' && v !== '' && v != null);
   const filterBar = `
+  <details class="fbox" open>
+  <summary>🔍 絞り込み${filtering ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">条件あり</span>' : ''}</summary>
+  <div class="fbody">
   <form method="get" class="filters">
     <select name="status"><option value="">状態: 全て</option>${Object.entries(STATUSES).map(([k, v]) => opt(k, `${v.label} (${countMap[k] || 0})`, q.status)).join('')}</select>
     <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
@@ -101,18 +106,21 @@ router.get('/', (req, res) => {
     <input type="search" name="q" value="${he(kw)}" placeholder="顧客名/件名/本文/注文番号/商品コード" style="min-width:240px">
     <button class="pri">検索</button>
     <a href="/apps/inquiry-hub" class="ghost btn-link">クリア</a>
-  </form>`;
+  </form>
+  </div>
+  </details>`;
 
+  // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
     <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
-      <td class="subj"><a href="/apps/inquiry-hub/inquiries/${r.id}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通</div></td>
-      <td>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
-      <td>${he(r.assigned_user_id || '—')}</td>
-      <td>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="nowrap">${fmtJst(r.received_at)}<div class="sub">更新 ${fmtJst(r.last_message_at || r.received_at)}</div></td>
+      <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
+      <td data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
+      <td data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
+      <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">更新 ${fmtJst(r.last_message_at || r.received_at)}</div></td>
     </tr>`).join('');
 
   const pageLink = p => {
@@ -128,13 +136,28 @@ router.get('/', (req, res) => {
   const body = `
   ${filterBar}
   <div class="card">
-    <table>
+    <table class="cardable">
       <thead><tr><th>チャネル/店舗</th><th>状態</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>担当</th><th>AI</th><th>受信</th></tr></thead>
       <tbody>${trs || '<tr><td colspan="7" class="empty">問い合わせがありません (同期実装前は手動投入データのみ表示されます)</td></tr>'}</tbody>
     </table>
     ${pager}
   </div>`;
-  res.send(pageShell('問い合わせ管理 — 一覧', 'list', body, ''));
+  // スマホ幅では絞り込みを畳む (PCは開いたまま)。条件が入っているときは畳まない。
+  // 幅の変化 (回転・ウィンドウリサイズ) にも追従させる — PC幅で閉じたままだと summary が
+  // 非表示なので絞り込みに触れなくなるため (Codexレビュー反映)。JSが動かない場合は開いたまま
+  const listScript = `
+  (function() {
+    var fb = document.querySelector('details.fbox');
+    if (!fb) return;
+    var mq = window.matchMedia('(max-width: 700px)');
+    function sync() {
+      if (mq.matches && !${filtering}) fb.removeAttribute('open');
+      else fb.setAttribute('open', '');
+    }
+    sync();
+    mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
+  })();`;
+  res.send(pageShell('問い合わせ管理 — 一覧', 'list', body, listScript));
 });
 
 // ─── 詳細画面 ───
@@ -931,10 +954,10 @@ router.get('/mail-rules', (req, res) => {
     const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
     return `
     <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
-      <td class="nowrap">${r.priority}</td>
-      <td>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
-      <td style="overflow-wrap:anywhere">${fmtConds(r)}</td>
-      <td><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
+      <td class="nowrap" data-label="優先度">${r.priority}</td>
+      <td data-full>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
+      <td style="overflow-wrap:anywhere" data-full data-label="条件">${fmtConds(r)}</td>
+      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
       <td class="nowrap ops">
         <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
         <button onclick="deleteRule(${r.id}, this)">削除</button>
@@ -971,12 +994,12 @@ router.get('/mail-rules', (req, res) => {
         <label>優先度 (小さいほど先に評価) <input type="number" id="nPriority" value="50"></label>
       </div>
       ${[1, 2, 3].map(n => `
-      <div class="row" style="margin-bottom:6px">
+      <div class="row rule-row" style="margin-bottom:6px">
         <select id="nField${n}">${n > 1 ? '<option value="">(条件なし)</option>' : ''}${fieldOpts}</select>
         <input type="text" id="nValue${n}" placeholder="文字列">
         <select id="nOp${n}">${opOpts}</select>
       </div>`).join('')}
-      <div class="row" style="align-items:center">
+      <div class="row rule-row" style="align-items:center">
         <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
         <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option></select>
         <button class="pri" onclick="addRule(this)">追加</button>
@@ -986,7 +1009,7 @@ router.get('/mail-rules', (req, res) => {
   <div class="card">
     <div class="card-title">📜 ルール一覧 (${rules.length}件・優先度順に先勝ち)
       <input type="search" id="ruleFilter" placeholder="絞り込み" style="margin-left:12px;padding:4px 8px;border:1px solid #cbd5e1;border-radius:8px;font-size:13px;font-weight:normal"></div>
-    <table>
+    <table class="cardable">
       <thead><tr><th>優先度</th><th>名称</th><th>条件</th><th>アクション</th><th>操作</th></tr></thead>
       <tbody id="ruleRows">${trs || '<tr><td colspan="5" class="empty">ルールがありません (CSVを取り込むか手動追加してください)</td></tr>'}</tbody>
     </table>
@@ -1142,14 +1165,14 @@ router.get('/admin', (req, res) => {
          </div>`;
     return `
     <tr${failing ? ' style="background:#fef2f2"' : ''}>
-      <td>${chBadge(s.channel_type)}<div class="sub">${he(s.shop_name)}</div></td>
-      <td>${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}${expiryEdit}</td>
-      <td class="nowrap">${fmtJst(s.last_synced_at)}${syncing ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">同期中…</span>' : ''}</td>
-      <td class="nowrap">${fmtJst(s.committed_until)}</td>
-      <td>${failing ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">連続失敗 ${s.consecutive_failures}回</span>` : (s.consecutive_failures || 0) > 0 ? `${s.consecutive_failures}回` : '—'}
+      <td data-full>${chBadge(s.channel_type)}<div class="sub">${he(s.shop_name)}</div></td>
+      <td data-full data-label="認証">${authBadge(s)}${s.auth_expires_at ? `<div class="sub">期限 ${fmtJst(s.auth_expires_at)}</div>` : ''}${expiryEdit}</td>
+      <td class="nowrap" data-label="最終同期">${fmtJst(s.last_synced_at)}${syncing ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">同期中…</span>' : ''}</td>
+      <td class="nowrap" data-label="取り込み済み">${fmtJst(s.committed_until)}</td>
+      <td data-full data-label="連続失敗"${failing || (s.consecutive_failures || 0) > 0 || s.last_error ? '' : ' data-empty'}>${failing ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">連続失敗 ${s.consecutive_failures}回</span>` : (s.consecutive_failures || 0) > 0 ? `${s.consecutive_failures}回` : '—'}
         ${s.last_error ? `<div class="sub" title="${he(s.last_error)}">${he(String(s.last_error).slice(0, 80))}</div>` : ''}</td>
-      <td>${s.open_errors > 0 ? `<span class="badge" style="background:#fef3c7;color:#92400e">${s.open_errors}件</span>` : '—'}</td>
-      <td class="nowrap">
+      <td data-label="未解決エラー"${s.open_errors > 0 ? '' : ' data-empty'}>${s.open_errors > 0 ? `<span class="badge" style="background:#fef3c7;color:#92400e">${s.open_errors}件</span>` : '—'}</td>
+      <td class="nowrap ops">
         <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, false, this)">▶ 今すぐ同期</button>
         <button onclick="event.stopPropagation(); manualSync(${s.shop_id}, true, this)" title="365日分を再照合 (数分かかることがあります)">🔎 deep</button>
       </td>
@@ -1161,11 +1184,11 @@ router.get('/admin', (req, res) => {
     WHERE e.resolved = 0 ORDER BY e.id DESC LIMIT 20`).all();
   const errTrs = errRows.map(e => `
     <tr>
-      <td class="nowrap">${fmtJst(e.created_at)}</td>
-      <td>${e.channel_type ? chBadge(e.channel_type) : ''} ${he(e.shop_name || '')}</td>
-      <td><span class="badge" style="background:#f1f5f9;color:#475569">${he(e.error_type)}</span></td>
-      <td style="overflow-wrap:anywhere">${he(String(e.error_detail || '').slice(0, 300))}</td>
-      <td class="nowrap"><button onclick="resolveSyncError(${e.id}, this)">解決済みにする</button></td>
+      <td class="nowrap" data-label="発生">${fmtJst(e.created_at)}</td>
+      <td data-label="店舗">${e.channel_type ? chBadge(e.channel_type) : ''} ${he(e.shop_name || '')}</td>
+      <td data-label="種別"><span class="badge" style="background:#f1f5f9;color:#475569">${he(e.error_type)}</span></td>
+      <td style="overflow-wrap:anywhere" data-full data-label="内容">${he(String(e.error_detail || '').slice(0, 300))}</td>
+      <td class="nowrap ops"><button onclick="resolveSyncError(${e.id}, this)">解決済みにする</button></td>
     </tr>`).join('');
 
   const issues = listOutboxIssues();
@@ -1181,10 +1204,10 @@ router.get('/admin', (req, res) => {
     return `
     <tr>
       <td><span class="badge" style="${meta.style}">${he(meta.label)}</span><div class="sub">${fmtJst(o.created_at)}</div></td>
-      <td>${chBadge(o.inquiry_channel)}<div class="sub">${he(o.shop_name)}</div></td>
-      <td><a href="/apps/inquiry-hub/inquiries/${o.inquiry_id}">${he(o.subject || '(件名なし)')}</a>
+      <td class="chcell">${chBadge(o.inquiry_channel)}<div class="sub">${he(o.shop_name)}</div></td>
+      <td data-full><a href="/apps/inquiry-hub/inquiries/${o.inquiry_id}">${he(o.subject || '(件名なし)')}</a>
         <div class="sub">${he(o.customer_name || '')} ・ 作成: ${he(o.created_by || '—')}</div></td>
-      <td style="overflow-wrap:anywhere"><div class="sub">${he(String(o.body_text || '').slice(0, 120))}${String(o.body_text || '').length > 120 ? '…' : ''}</div>
+      <td style="overflow-wrap:anywhere" data-full data-label="本文 / エラー"><div class="sub">${he(String(o.body_text || '').slice(0, 120))}${String(o.body_text || '').length > 120 ? '…' : ''}</div>
         ${o.error_detail ? `<div class="sub" style="color:#b91c1c">${he(String(o.error_detail).slice(0, 150))}</div>` : ''}</td>
       <td class="nowrap ops">${ops}</td>
     </tr>`;
@@ -1198,15 +1221,15 @@ router.get('/admin', (req, res) => {
   const aiRuns = db.prepare('SELECT * FROM ai_runs ORDER BY id DESC LIMIT 5').all();
   const aiRunTrs = aiRuns.map(r => `
     <tr>
-      <td class="nowrap">${fmtJst(r.started_at)}</td>
-      <td>${he(r.runner_info || '—')}</td>
-      <td>claim ${r.claimed} / 生成 ${r.done} / 破棄 ${r.discarded} / 失敗 ${r.failed}</td>
+      <td class="nowrap" data-label="実行">${fmtJst(r.started_at)}</td>
+      <td data-label="ランナー">${he(r.runner_info || '—')}</td>
+      <td data-full data-label="結果">claim ${r.claimed} / 生成 ${r.done} / 破棄 ${r.discarded} / 失敗 ${r.failed}</td>
       <td>${r.error ? `<span class="badge" style="background:#fee2e2;color:#b91c1c">${he(String(r.error).slice(0, 60))}</span>` : '<span class="badge" style="background:#dcfce7;color:#166534">OK</span>'}</td>
     </tr>`).join('');
   const aiCard = `
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🤖 AI返信案 <span class="sub">(待機 ${aiStats.queued}件 / 生成中 ${aiStats.processing}件 / 有効な返信案 ${aiStats.drafts}件。ローカルランナーが定時に生成)</span></div>
-    ${aiRuns.length ? `<table><thead><tr><th>実行</th><th>ランナー</th><th>結果</th><th></th></tr></thead><tbody>${aiRunTrs}</tbody></table>`
+    ${aiRuns.length ? `<table class="cardable"><thead><tr><th>実行</th><th>ランナー</th><th>結果</th><th></th></tr></thead><tbody>${aiRunTrs}</tbody></table>`
       : '<div class="empty">まだAIバッチが実行されていません (ai-draft-runner.mjs を定時実行すると履歴が出ます)</div>'}
   </div>`;
 
@@ -1214,7 +1237,7 @@ router.get('/admin', (req, res) => {
   ${aiCard}
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🔄 受信同期の状態 <span class="sub">(cron: 15分間隔 + 深掘り 毎朝5:37。手動実行してもcronと衝突しません)</span></div>
-    <table>
+    <table class="cardable">
       <thead><tr><th>チャネル/店舗</th><th>認証</th><th>最終同期</th><th>取り込み済み時刻</th><th>連続失敗</th><th>未解決エラー</th><th>手動同期</th></tr></thead>
       <tbody>${syncTrs || '<tr><td colspan="7" class="empty">アクティブな店舗がありません</td></tr>'}</tbody>
     </table>
@@ -1222,14 +1245,14 @@ router.get('/admin', (req, res) => {
   ${errRows.length ? `
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">⚠️ 未解決の同期エラー (直近20件)</div>
-    <table>
+    <table class="cardable">
       <thead><tr><th>発生</th><th>店舗</th><th>種別</th><th>内容</th><th></th></tr></thead>
       <tbody>${errTrs}</tbody>
     </table>
   </div>` : ''}
   <div class="card">
     <div class="card-title">📮 送信の要対応 <span class="sub">(結果不明は自動再送しません。モール管理画面で実際の送信有無を確認してから選択してください)</span></div>
-    <table>
+    <table class="cardable">
       <thead><tr><th>状態</th><th>チャネル/店舗</th><th>問い合わせ</th><th>本文/エラー</th><th>操作</th></tr></thead>
       <tbody>${issueTrs || '<tr><td colspan="5" class="empty">要対応の送信ジョブはありません</td></tr>'}</tbody>
     </table>
@@ -1441,6 +1464,78 @@ td.ops button { margin: 2px 4px 2px 0; }
 .expiry-edit { display: flex; gap: 4px; margin-top: 4px; align-items: center; }
 .expiry-edit input[type=date] { padding: 3px 6px; border: 1px solid #cbd5e1; border-radius: 6px; font-size: 12px; }
 .expiry-edit button { padding: 3px 10px; font-size: 12px; }
+
+/* ═══ 絞り込みボックス: PCは常時展開・スマホは折りたたみ (画面上半分をフィルタで潰さない) ═══ */
+details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性はサーバーが常に付与) */
+
+/* ═══════════ スマホ対応 (〜700px) ═══════════
+   方針: 横スクロールする表を「1件=1カード」に組み替える (table.cardable)。
+   thead を隠し、各 td の内容を data-label の見出し付きで縦に積む。
+   data-full の td は1行占有、それ以外はバッジのように横に流す。
+   PC表示 (701px〜) は一切変更しない */
+@media (max-width: 700px) {
+  body { font-size: 15px; }                       /* iOSの自動ズーム回避 (16px未満の入力欄対策と併用) */
+  header.app { padding: 8px 10px; gap: 10px; }
+  header.app h1 { font-size: 15px; }
+  header.app .back { font-size: 12px; }
+  /* タブは折り返さず横スクロール1行 (縦を食わない) */
+  nav.tabs { flex-wrap: nowrap; overflow-x: auto; width: 100%; order: 3; padding-bottom: 2px;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+  nav.tabs::-webkit-scrollbar { display: none; }
+  a.tab { padding: 10px 14px; white-space: nowrap; min-height: 44px; }
+  .wrap { padding: 10px; }
+
+  /* タップターゲット確保 (指で押せる高さ)。font-size:16px = iOSの自動ズーム防止 */
+  button, .btn-link, select, textarea,
+  input[type=text], input[type=search], input[type=number], input[type=date], input[type=file] {
+    min-height: 44px; font-size: 16px; }
+  input[type=checkbox] { width: 20px; height: 20px; }
+  .chk { padding: 6px 0; }
+  .expiry-edit button, .tpl-ops button, td.ops button { min-height: 40px; }
+  .pager { gap: 10px; padding: 14px 10px; }
+  .pager a { padding: 10px 14px; background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; text-decoration: none; }
+
+  /* 絞り込みは折りたたみ */
+  details.fbox { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 10px; }
+  details.fbox > summary { display: flex; align-items: center; gap: 8px; padding: 12px 14px;
+    font-weight: 600; cursor: pointer; list-style: none; }
+  details.fbox > summary::-webkit-details-marker { display: none; }
+  details.fbox .filters { box-shadow: none; margin-bottom: 0; padding: 0 12px 12px; }
+  /* 入力欄は1行占有 (指で選びやすく)・ボタンは横に流す (縦に伸ばしすぎない) */
+  .filters { align-items: stretch; }
+  .filters select, .filters input { flex: 1 1 100%; width: 100%; }
+  .filters button, .filters .btn-link, .filters .chk { flex: 1 1 auto; text-align: center; justify-content: center; }
+
+  /* 表 → カード */
+  table.cardable, table.cardable tbody { display: block; }
+  table.cardable thead { display: none; }
+  table.cardable tr { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline;
+    border: 1px solid #e2e8f0; border-radius: 12px; margin: 10px; padding: 12px; cursor: pointer; }
+  table.cardable td { display: block; border: none; padding: 0; max-width: 100%; }
+  table.cardable td[data-full] { flex-basis: 100%; }
+  table.cardable td[data-empty] { display: none; }   /* 値が「—」だけの列はスマホでは省く */
+  table.cardable td[data-label]::before { content: attr(data-label); display: block;
+    color: #94a3b8; font-size: 11px; line-height: 1.4; }
+  table.cardable td.empty { flex-basis: 100%; text-align: center; }
+  /* 一覧: 件名を先頭・大きく。1列目 (チャネルバッジ) の店舗名はバッジの右に添える */
+  table.cardable td.subj { order: -1; font-size: 15px; }
+  table.cardable td:first-child > .sub, table.cardable td.chcell > .sub { display: inline; margin-left: 6px; }
+  table.cardable td.ops { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+  table.cardable td.ops button { margin: 0; flex: 1 1 auto; }
+
+  /* 詳細画面 */
+  .detail-head h2 { font-size: 16px; }
+  .msg { padding: 10px 12px; }
+  .panel dl { grid-template-columns: 78px 1fr; }
+  .panel textarea, .panel input[type=text] { font-size: 16px; }
+  .grp-body { padding: 4px 6px 8px 10px; }        /* テンプレ階層の左インデントを詰める */
+
+  /* フォーム: 入力欄をカード幅いっぱいに (はみ出し・不揃い防止) */
+  .edit-grid label { display: block; }
+  .edit-grid input, .edit-grid select, .edit-grid textarea { width: 100%; }
+  .row.rule-row { display: flex; flex-wrap: wrap; gap: 6px; }  /* .row は既定でflexではない (.panel .row のみ) */
+  .row.rule-row > * { flex: 1 1 100%; width: 100%; }
+}
 `;
 
 function pageShell(title, active, body, script) {

@@ -12,6 +12,8 @@ const baseDir = process.env.DATA_DIR;
 fs.mkdirSync(baseDir, { recursive: true });
 const workDir = fs.mkdtempSync(path.join(baseDir, 'smoke-ai-'));
 process.env.DATA_DIR = workDir;
+// 他のsmokeと同じDATA_DIRを共有して連続実行しても誤検知しないよう、開始時点の状態を記録
+const baseDbExistedAtStart = fs.existsSync(path.join(baseDir, 'inquiry-hub.db'));
 process.env.INQUIRY_HUB_AI_KEY = 'test-ai-key';
 
 const { initInquiryHubDB, getDB, toUtcIso } = await import('./db.js');
@@ -191,7 +193,7 @@ console.log('6. 旧ai_runs移行');
   fs.rmSync(migDir, { recursive: true, force: true });
 }
 
-check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
+check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
 db.close();

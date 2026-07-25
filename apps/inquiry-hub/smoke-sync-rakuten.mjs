@@ -13,6 +13,8 @@ const baseDir = process.env.DATA_DIR;
 fs.mkdirSync(baseDir, { recursive: true });
 const workDir = fs.mkdtempSync(path.join(baseDir, 'smoke-rakuten-'));
 process.env.DATA_DIR = workDir;
+// 他のsmokeと同じDATA_DIRを共有して連続実行しても誤検知しないよう、開始時点の状態を記録
+const baseDbExistedAtStart = fs.existsSync(path.join(baseDir, 'inquiry-hub.db'));
 
 // ⚠️ db.js は import 時点で DATA_DIR を定数化するため、env を一時ディレクトリへ差し替えた後に
 // 動的 import する (静的 import だと本番 DATA_DIR 誤指定時に実DBへ書いてしまう。Codex R2 high)
@@ -381,7 +383,7 @@ console.log('7. transport解決 + cron');
 
 // ガードの自己検証: DBが一時サブディレクトリ「のみ」に作られていること (ベース直下に漏れたら即FAIL)
 check('DBは一時サブディレクトリのみに作成 (ベース直下に漏れない)',
-  fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
+  fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
 db.close();

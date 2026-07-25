@@ -13,6 +13,8 @@ const baseDir = process.env.DATA_DIR;
 fs.mkdirSync(baseDir, { recursive: true });
 const workDir = fs.mkdtempSync(path.join(baseDir, 'smoke-admin-'));
 process.env.DATA_DIR = workDir;
+// 他のsmokeと同じDATA_DIRを共有して連続実行しても誤検知しないよう、開始時点の状態を記録
+const baseDbExistedAtStart = fs.existsSync(path.join(baseDir, 'inquiry-hub.db'));
 // 手動同期の no_transport 経路を確定させる (誤って実APIに出ないよう transport env を全て消す)
 for (const k of ['RAKUTEN_SERVICE_SECRET', 'RAKUTEN_LICENSE_KEY', 'WAREHOUSE_URL', 'WAREHOUSE_SERVICE_TOKEN',
   'CF_ACCESS_CLIENT_ID', 'CF_ACCESS_CLIENT_SECRET', 'YAHOO_PROXY_URL', 'YAHOO_PROXY_SECRET']) delete process.env[k];
@@ -218,7 +220,7 @@ console.log('5. 返信エディタ');
 }
 
 check('DBは一時サブディレクトリのみに作成 (ベース直下に漏れない)',
-  fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && !fs.existsSync(path.join(baseDir, 'inquiry-hub.db')));
+  fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
 server.close();
