@@ -69,6 +69,16 @@ export function htmlToText(html) {
     .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/** 保存前の本文正規化: 行末空白の除去 + 3行以上の連続空行を1行に詰める。
+ * 自動配信メール (Amazon等) は空行を大量に含み、そのまま保存すると表示が延々と間延びする */
+export function normalizeMailBody(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t　]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 /** payload を再帰して text/plain・text/html・添付を収集 */
 export function walkPayload(payload, out = { text: '', html: '', attachments: [] }) {
   if (!payload) return out;
@@ -122,7 +132,7 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     const fromDomain = from.mailbox ? from.mailbox.slice(from.mailbox.indexOf('@') + 1) : '';
     const isShop = fromDomain === OWN_DOMAIN;
     const { text, html, attachments } = walkPayload(payload);
-    const bodyText = (text || htmlToText(html)).slice(0, BODY_MAX_CHARS);
+    const bodyText = normalizeMailBody(text || htmlToText(html)).slice(0, BODY_MAX_CHARS);
     const atMs = Number(m.internalDate) || null;
     if (!m.id || !atMs) {
       const e = new Error(`Gmailメッセージ契約違反: id/internalDate がありません (thread ${thread.id})`);

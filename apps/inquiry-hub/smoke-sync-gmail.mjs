@@ -17,7 +17,7 @@ const baseDbExistedAtStart = fs.existsSync(path.join(baseDir, 'inquiry-hub.db'))
 const { initInquiryHubDB, getDB } = await import('./db.js');
 const { runSync } = await import('./sync/engine.js');
 const { addMailRule } = await import('./mail-rules.js');
-const { createGmailAdapter, resolveGmailTransportFromEnv, parseFromHeader, htmlToText, mapThread } = await import('./sync/adapters/gmail.js');
+const { createGmailAdapter, resolveGmailTransportFromEnv, parseFromHeader, htmlToText, mapThread, normalizeMailBody } = await import('./sync/adapters/gmail.js');
 
 initInquiryHubDB();
 const db = getDB();
@@ -51,6 +51,12 @@ console.log('1. ユーティリティ');
   check('parseFromHeader: アドレスのみ', parseFromHeader('a@b.com').mailbox === 'a@b.com');
   check('parseFromHeader: 不正はnull', parseFromHeader('こんにちは').mailbox === null);
   check('htmlToText: タグ除去+改行', htmlToText('<p>こんにちは</p><br><div>世界 &amp; 平和</div>') === 'こんにちは\n\n世界 & 平和');
+  // 自動配信メールの空行だらけ本文を詰める (2026-07-25 実測: スマホで画面が延々と間延びしていた)
+  check('normalizeMailBody: 3連以上の空行を1行に詰める',
+    normalizeMailBody('件名\n\n\n\n\n96\n\n\n\n\n本文') === '件名\n\n96\n\n本文');
+  check('normalizeMailBody: 行末空白 (全角含む) 除去+CRLF正規化',
+    normalizeMailBody('a  \r\nb　\r\n\r\nc') === 'a\nb\n\nc');
+  check('normalizeMailBody: 前後の空白行を除去', normalizeMailBody('\n\n  本文  \n\n\n') === '本文');
   check('env解決: INQUIRY優先', resolveGmailTransportFromEnv({ INQUIRY_GMAIL_CLIENT_ID: 'a', INQUIRY_GMAIL_CLIENT_SECRET: 'b', INQUIRY_GMAIL_REFRESH_TOKEN: 'c' })?.clientId === 'a');
   check('env解決: PO_GMAIL_*フォールバック', resolveGmailTransportFromEnv({ PO_GMAIL_CLIENT_ID: 'p', PO_GMAIL_CLIENT_SECRET: 'q', PO_GMAIL_REFRESH_TOKEN: 'r' })?.clientId === 'p');
   check('env解決: 不足はnull', resolveGmailTransportFromEnv({ PO_GMAIL_CLIENT_ID: 'p' }) === null);

@@ -43,6 +43,13 @@ const expShop = db.prepare(`INSERT INTO shops (channel_type, shop_name, account_
 const inq = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, customer_name, received_at, conversation_rev)
   VALUES ('rakuten', ?, 'adm-1', '返金について', '顧客A', ?, 1)`).run(rkShop, toUtcIso(Date.now())).lastInsertRowid;
 const errId = db.prepare("INSERT INTO sync_errors (shop_id, error_type, error_detail) VALUES (?, 'fetch_failed', '接続失敗')").run(rkShop).lastInsertRowid;
+// 詳細画面の本文表示テスト用: 空行だらけの長文 (自動配信メール相当) と短い問い合わせ
+const messyBody = ['自動配信のお知らせ', '', '', '', '', '96', '', '', '', '', '', '',
+  ...Array.from({ length: 12 }, (_, i) => `本文${i + 1}行目です。`), '', '', '', '', '配信専用です'].join('\n');
+db.prepare(`INSERT INTO inquiry_messages (inquiry_id, external_message_id, sender_type, sender_name, message_body_text, is_incoming, received_at)
+  VALUES (?,?,'customer','Amazon.co.jp',?,1,?)`).run(inq, 'am-long', messyBody, toUtcIso(Date.now()));
+db.prepare(`INSERT INTO inquiry_messages (inquiry_id, external_message_id, sender_type, sender_name, message_body_text, is_incoming, received_at)
+  VALUES (?,?,'customer','顧客A',?,1,?)`).run(inq, 'am-short', '在庫はいつ入りますか?\n\nよろしくお願いします。', toUtcIso(Date.now()));
 
 // outbox: unknown 1件 + needs_review 1件 (別問い合わせ。1問い合わせ1未決着制約のため)
 const inq2 = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, received_at, conversation_rev)
@@ -78,6 +85,16 @@ console.log('1. 画面表示');
   check('pending (送信待ち) も要対応に出る (送信前に止められる)', html.includes('⏳送信待ち'));
   check('認証期限30日前警告が出る', html.includes('認証期限 残'));
   check('ナビに運用管理タブ', html.includes('運用管理'));
+}
+
+// ─── 1b. 詳細画面の本文表示 (空行圧縮+長文折りたたみ) ───
+console.log('1b. 本文表示');
+{
+  const html = await (await fetch(base + `/inquiries/${inq}`)).text();
+  check('連続空行が詰まる (<br>の3連以上が残らない)', !/(<br>\s*){3,}/.test(html));
+  check('長文は「続きを表示」で畳まれる', html.includes('続きを表示'));
+  check('短い問い合わせは畳まない (全文がそのまま出る)', html.includes('よろしくお願いします。')
+    && html.split('続きを表示').length === 2);
 }
 
 // ─── 2. 手動同期API ───
