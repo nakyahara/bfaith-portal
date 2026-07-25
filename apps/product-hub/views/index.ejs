@@ -21,6 +21,25 @@
     <a class="btn btn-primary" href="/apps/product-hub/new">＋ 新規登録</a>
   </div>
 
+  <!-- 検証用: Notion 既存カードの選択取り込み (読み取り専用) -->
+  <div class="card" style="margin-bottom:14px;">
+    <details>
+      <summary style="cursor:pointer; font-size:14px; font-weight:600;">Notion から取り込み (検証用)</summary>
+      <p class="muted" style="margin:10px 0;">
+        Notion 商品マスターの既存カードを、商品コード指定でこのアプリに取り込みます。
+        <strong>読み取り専用です — 取り込んだ商品からNotionへ書き戻すことはありません。</strong>
+        既存カードの運用はこれまで通りNotion側で行ってください。
+        （一度に最大 <%= maxImportCodes %> 件。改行またはカンマ区切り）
+      </p>
+      <textarea id="import-codes" rows="4" placeholder="FBNS-BU-BU&#10;pr_xxxxx" style="width:100%; font-family:monospace; font-size:13px;"></textarea>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+        <button class="btn btn-primary" id="import-btn">取り込む</button>
+        <span class="muted" id="import-result"></span>
+      </div>
+      <div id="import-detail" style="margin-top:10px;"></div>
+    </details>
+  </div>
+
   <div class="card">
     <% if (drafts.length === 0) { %>
       <p class="muted">ドラフトがありません。「＋ 新規登録」から商品を追加してください。</p>
@@ -32,6 +51,7 @@
             <th>商品名</th>
             <th style="width:140px">NEコード</th>
             <th style="width:110px">ステータス</th>
+            <th style="width:90px">出自</th>
             <th style="width:90px">Notion</th>
             <th style="width:150px">更新日時</th>
           </tr>
@@ -49,6 +69,13 @@
               <td><a href="/apps/product-hub/detail/<%= d.id %>" style="color:#1d4ed8; text-decoration:none;"><%= d.name %></a></td>
               <td><code style="font-size:12px"><%= d.ne_code %></code></td>
               <td><span class="badge badge-<%= d.status %>"><%= statusLabels[d.status] || d.status %></span></td>
+              <td>
+                <% if (d.source === 'notion_import') { %>
+                  <span class="muted" title="Notionから取り込み (Notion側が正・書き戻さない)">📥 取り込み</span>
+                <% } else { %>
+                  <span class="muted">アプリ</span>
+                <% } %>
+              </td>
               <td>
                 <% if (d.notion_card_status === 'created') { %>
                   <span title="Notionカード作成済み">✅</span>
@@ -84,6 +111,72 @@
         retryAllBtn.disabled = false;
         retryAllBtn.textContent = 'まとめて再作成';
       }
+    });
+  }
+
+  // ─── Notion 取り込み (検証用) ───
+  const OUTCOME_LABELS = {
+    imported: '取り込み',
+    updated: '再取り込み (更新)',
+    not_found: 'Notionに見つかりません',
+    conflict_portal: 'アプリ起点の商品のため取り込みません',
+    conflict_page_id: '別のNotionカードが紐づいています (要確認)',
+    failed: '失敗',
+  };
+  const importBtn = document.getElementById('import-btn');
+  importBtn.addEventListener('click', async () => {
+    const codes = document.getElementById('import-codes').value;
+    if (!codes.trim()) {
+      document.getElementById('import-result').textContent = '商品コードを入力してください';
+      return;
+    }
+    importBtn.disabled = true;
+    importBtn.textContent = '取り込み中…';
+    document.getElementById('import-detail').innerHTML = '';
+    try {
+      const res = await fetch('/apps/product-hub/api/notion-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codes }),
+      });
+      const json = await res.json();
+      if (!json.results) {
+        document.getElementById('import-result').textContent = 'エラー: ' + (json.error || '不明');
+        return;
+      }
+      const s = json.summary;
+      document.getElementById('import-result').textContent =
+        '新規 ' + s.imported + ' / 更新 ' + s.updated + ' / 未検出 ' + s.not_found
+        + ' / 衝突 ' + (s.conflict_portal + s.conflict_page_id) + ' / 失敗 ' + s.failed;
+
+      const rows = json.results.map(function (r) {
+        var note = r.error || '';
+        if (!note && r.skipped_fields && r.skipped_fields.length) {
+          note = '未取込: ' + r.skipped_fields.join(', ');
+        }
+        // draftId は整数のはず。型が変わっても innerHTML に流し込まない (Codex R1 low-8)
+        var link = Number.isSafeInteger(r.draftId)
+          ? '<a href="/apps/product-hub/detail/' + r.draftId + '">開く</a>'
+          : '';
+        return '<tr><td><code>' + escapeHtml(r.ne_code) + '</code></td><td>'
+          + escapeHtml(OUTCOME_LABELS[r.outcome] || r.outcome) + '</td><td class="muted">'
+          + escapeHtml(note) + '</td><td>' + link + '</td></tr>';
+      }).join('');
+      document.getElementById('import-detail').innerHTML =
+        '<table class="list"><tbody>' + rows + '</tbody></table>';
+
+      if (s.imported + s.updated > 0) setTimeout(function () { location.reload(); }, 2500);
+    } catch (e) {
+      document.getElementById('import-result').textContent = '通信エラー: ' + e.message;
+    } finally {
+      importBtn.disabled = false;
+      importBtn.textContent = '取り込む';
+    }
+  });
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
   }
 </script>
