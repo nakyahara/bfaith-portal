@@ -155,6 +155,92 @@ console.log('3. HTTP');
   server.close();
 }
 
+// ─── 4. 詳細画面からのルール作成 + 既存メールへの一括適用 (2026-07-25 中原さん要望) ───
+console.log('4. 詳細画面からのルール作成');
+{
+  const { applyRuleToExistingMails } = await import('./mail-rules.js');
+  const { toUtcIso } = await import('./db.js');
+  const shopM = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','メール','info@b-faith.biz')").run().lastInsertRowid;
+  const shopR = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','楽天','373343')").run().lastInsertRowid;
+  const mk = (shopId, ch, ext, subject, from, status = 'open') => db.prepare(`INSERT INTO inquiries
+      (channel_type, shop_id, external_inquiry_id, subject, customer_identifier, internal_status, is_unread, received_at, conversation_rev)
+    VALUES (?,?,?,?,?,?,1,?,1)`).run(ch, shopId, ext, subject, from, status, toUtcIso(Date.now())).lastInsertRowid;
+
+  const a1 = mk(shopM, 'email', 'm1', 'FBA商品を受領中です (FBA15GF962P2)', 'donotreply@amazon.com');
+  const a2 = mk(shopM, 'email', 'm2', 'FBA商品が受領されました', 'donotreply@amazon.com');
+  const other = mk(shopM, 'email', 'm3', '商品の在庫について', 'customer@gmail.com');
+  const doneAlready = mk(shopM, 'email', 'm4', 'FBA通知', 'donotreply@amazon.com', 'done');
+  const rakutenSame = mk(shopR, 'rakuten', 'r1', 'FBA商品を受領中です', 'donotreply@amazon.com');
+
+  const cond = [{ field: 'from', op: 'equals', value: 'donotreply@amazon.com' }];
+  const dry = applyRuleToExistingMails(cond, { apply: false });
+  check('下見: 未完了のメールのみ数える (完了済み・他チャネルは除外)', dry.matched === 2 && dry.completed === 0, JSON.stringify(dry));
+  check('下見では状態を変えない', db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(a1).internal_status === 'open');
+
+  const applied = applyRuleToExistingMails(cond, { apply: true, actorId: 'tester' });
+  check('適用: 2件を完了に', applied.completed === 2
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(a1).internal_status === 'done'
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(a2).internal_status === 'done');
+  check('関係ない問い合わせは触らない', db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(other).internal_status === 'open');
+  check('他チャネル (楽天) は対象外', db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(rakutenSame).internal_status === 'open');
+  check('完了は削除しない (履歴に残る)', !!db.prepare('SELECT id FROM inquiries WHERE id = ?').get(a1));
+  check('一括適用が操作ログに残る', db.prepare(
+    "SELECT COUNT(*) c FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'status_change'").get(a1).c >= 1);
+
+  // 件名条件・ドメイン条件
+  const bySubject = applyRuleToExistingMails([{ field: 'subject', op: 'contains', value: '在庫' }], { apply: false });
+  check('件名条件で絞れる', bySubject.matched === 1);
+  const m5 = mk(shopM, 'email', 'm5', '請求のお知らせ', 'billing@amazon.co.jp');
+  const byDomain = applyRuleToExistingMails([{ field: 'from', op: 'ends_with', value: '@amazon.co.jp' }], { apply: false });
+  check('ドメイン条件で絞れる', byDomain.matched === 1);
+  // LIKE特殊文字はリテラル扱い
+  mk(shopM, 'email', 'm6', '100%OFFクーポン', 'promo@example.com');
+  check('LIKE特殊文字はリテラル (%は全件マッチしない)',
+    applyRuleToExistingMails([{ field: 'subject', op: 'contains', value: '100%O' }], { apply: false }).matched === 1);
+  let badCond = null;
+  try { applyRuleToExistingMails([{ field: 'from', op: 'contains', value: '' }], { apply: false }); } catch (e) { badCond = e; }
+  check('空条件はthrow (全件マッチを防ぐ)', badCond !== null);
+}
+
+// ─── 5. HTTP: 詳細画面のルール作成API ───
+console.log('5. ルール作成API');
+{
+  const app2 = express();
+  app2.use('/apps/inquiry-hub', express.json({ limit: '2mb' }), routerModule.default);
+  const srv = await new Promise(r => { const s = app2.listen(0, '127.0.0.1', () => r(s)); });
+  const base2 = `http://127.0.0.1:${srv.address().port}/apps/inquiry-hub`;
+  const jp = (p, data) => fetch(base2 + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) });
+
+  const mailInq = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id = 'm3'").get().id;   // customer@gmail.com
+  const rakutenInq = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id = 'r1'").get().id;
+
+  const html = await (await fetch(`${base2}/inquiries/${mailInq}`)).text();
+  check('メール詳細に「今後の自動処理」パネル', html.includes('今後の自動処理') && html.includes('mrCond'));
+  const htmlRk = await (await fetch(`${base2}/inquiries/${rakutenInq}`)).text();
+  check('楽天詳細にはパネルを出さない', !htmlRk.includes('id="mrCond"'));
+
+  const rBad = await jp(`/api/inquiries/${rakutenInq}/mail-rule`, { condition: 'from_exact', action: 'skip' });
+  check('メール以外のチャネルは400', rBad.status === 400);
+  const rBadAction = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'nuke' });
+  check('不正な扱いは400', rBadAction.status === 400);
+  const rBadCond = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'bogus', action: 'skip' });
+  check('不正な条件は400', rBadCond.status === 400);
+
+  const rDry = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'skip', applyToExisting: true, dryRun: true });
+  const dryJson = await rDry.json();
+  check('dryRun: 件数だけ返しルールは作らない', dryJson.matched === 1 && listMailRules().every(r => !String(r.name || '').includes('customer@gmail.com')));
+
+  const rMake = await jp(`/api/inquiries/${mailInq}/mail-rule`, { condition: 'from_exact', action: 'skip', applyToExisting: true });
+  const made = await rMake.json();
+  check('ルール作成+既存1件を完了に', rMake.status === 200 && made.completed === 1
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(mailInq).internal_status === 'done');
+  const rule = listMailRules().find(r => r.id === made.id);
+  check('作成されたルールが評価に効く', evaluateMailRules({ from: 'customer@gmail.com' })?.action === 'skip' && rule.action === 'skip');
+  check('ルール名に条件が入る', String(rule.name).includes('customer@gmail.com'));
+
+  srv.close();
+}
+
 check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);
