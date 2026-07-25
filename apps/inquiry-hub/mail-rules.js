@@ -14,7 +14,7 @@
  *    CSV取込では確実に解釈できるルールだけを移行し、それ以外は理由付きでレポートする
  *    (取り込み漏れ側に倒す。ノイズが混ざるのは画面で見えるので安全)。
  */
-import { getDB } from './db.js';
+import { getDB, logActivity } from './db.js';
 import { parseCsv } from './templates.js';
 
 export const RULE_FIELDS = ['from', 'to', 'reply_to', 'subject', 'body'];
@@ -99,6 +99,57 @@ export function addMailRule({ name, matchMode = 'all', conditions, action, prior
     VALUES (?,?,?,?,?)`).run(priority, String(name || '').slice(0, 200) || null, matchMode, JSON.stringify(conditions), action);
   return { id: r.lastInsertRowid };
 }
+
+/**
+ * ルールを既存の取込済みメールにも適用する (2026-07-25 中原さん要望)。
+ * ルールは本来「次回の取込」からしか効かないが、自動配信メールが既に大量に溜まっている
+ * ため、同じ条件の既存分をまとめて片付けられるようにする。
+ * ⚠️ 削除はしない (完了にするだけ = 受信トレイから外れるが履歴は残る)。
+ * 対象はメールチャネルのみ・未完了のものだけ。
+ *
+ * @returns {{ matched: number, completed: number }}
+ */
+export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply = false, actorId = 'portal' } = {}) {
+  validateConditions(conditions);
+  const db = getDB();
+  // inquiries が持っているのは差出人 (customer_identifier) と件名。本文照合は重いので対象外とし、
+  // from/reply_to/to は customer_identifier、subject は subject に対して評価する
+  const clauses = [], params = [];
+  for (const c of conditions) {
+    const col = c.field === 'subject' ? 'i.subject' : 'i.customer_identifier';
+    const v = String(c.value);
+    switch (c.op) {
+      case 'contains':      clauses.push(`LOWER(COALESCE(${col},'')) LIKE ? ESCAPE '\\'`); params.push(`%${likeEscLocal(v)}%`); break;
+      case 'not_contains':  clauses.push(`LOWER(COALESCE(${col},'')) NOT LIKE ? ESCAPE '\\'`); params.push(`%${likeEscLocal(v)}%`); break;
+      case 'equals':        clauses.push(`LOWER(COALESCE(${col},'')) = ?`); params.push(v.toLowerCase()); break;
+      case 'not_equals':    clauses.push(`LOWER(COALESCE(${col},'')) != ?`); params.push(v.toLowerCase()); break;
+      case 'starts_with':   clauses.push(`LOWER(COALESCE(${col},'')) LIKE ? ESCAPE '\\'`); params.push(`${likeEscLocal(v)}%`); break;
+      case 'ends_with':     clauses.push(`LOWER(COALESCE(${col},'')) LIKE ? ESCAPE '\\'`); params.push(`%${likeEscLocal(v)}`); break;
+      default: throw new Error(`不正なマッチ方式: ${c.op}`);
+    }
+  }
+  const where = `i.channel_type = 'email' AND i.is_archived = 0 AND i.internal_status != 'done'
+    AND (${clauses.join(matchMode === 'any' ? ' OR ' : ' AND ')})`;
+  const matched = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where}`).get(...params).c;
+  if (!apply) return { matched, completed: 0 };
+
+  const rows = db.prepare(`SELECT i.id FROM inquiries i WHERE ${where}`).all(...params);
+  const tx = db.transaction(() => {
+    const upd = db.prepare(`UPDATE inquiries SET internal_status = 'done', is_unread = 0,
+      completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ? AND internal_status != 'done'`);
+    for (const r of rows) {
+      if (upd.run(r.id).changes > 0) {
+        logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'status_change',
+          after: { internal_status: 'done', reason: 'メールルールの一括適用' } });
+      }
+    }
+  });
+  tx.immediate();
+  return { matched, completed: rows.length };
+}
+/** LIKE用エスケープ (小文字化込み。templates.js の likeEsc と同等) */
+const likeEscLocal = s => String(s).toLowerCase().replace(/[\\%_]/g, c => '\\' + c);
 
 export function setMailRuleActive(id, active) {
   const r = getDB().prepare(`UPDATE mail_rules SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
