@@ -179,6 +179,8 @@ router.get('/api/settings', (req, res) => {
       env_override: eff.source === 'env' ? eff.expr : null,
       pdf: { filename: PDF_FILENAME(), folder_id: PDF_FOLDER_ID() },
       state: pdfState(),
+      // 手動でPDFを出すときに「いつ取得したCSVの内容か」が分かるように添える
+      schedule: scheduleState(),
     } });
   } catch (e) {
     console.error('[inbound-info] settings get', e.message);
@@ -216,6 +218,7 @@ router.get('/api/pdf/preview', async (req, res) => {
     const { buffer } = await buildSchedulePdf();
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="inbound-schedule.pdf"`);
+    res.setHeader('Cache-Control', 'private, no-store'); // 在庫情報を含むので共有キャッシュに残さない
     res.send(buffer);
   } catch (e) {
     console.error('[inbound-info] pdf preview', e.message);

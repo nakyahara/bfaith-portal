@@ -194,6 +194,7 @@
       (<span class="code">nefuda.csv</span> と同じフォルダ。毎回同じファイルを上書きします)
     </p>
     <p class="hint">内容は「🚚 入荷予定のみ」の一覧と同じ (nefuda.csv の並び順)。A4横・見出し行は各ページに再掲。</p>
+    <p class="hint" id="pdf-source">–</p>
     <div class="toolbar">
       <button class="btn-orange" id="btn-pdf-now" onclick="exportPdfNow()">今すぐPDFを作成してDriveに保存</button>
       <a class="btn-blue btn-sm" href="/apps/inbound-info/api/pdf/preview" target="_blank"
@@ -713,6 +714,9 @@ async function loadSettings() {
     } else {
       note.style.display = 'none';
     }
+    document.getElementById('pdf-source').textContent = result.schedule
+      ? `いま「今すぐ作成」を押すと、${jst(result.schedule.fetched_at)} に取得した入荷予定 (${result.schedule.row_count}件) の内容で作られます`
+      : '入荷予定をまだ一度も取得していません (「入数マスタ」タブの「最新の入荷予定を取得」を先に実行してください)';
     renderPdfState(result.state);
   } catch (e) {
     showMsg('msg-auto', 'err', '設定の取得に失敗しました: ' + e.message);

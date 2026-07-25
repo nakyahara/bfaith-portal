@@ -20,6 +20,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { listInbound, scheduleState, savePdfState } from './db.js';
 import { uploadCsvToDrive, probeFolderWritable } from '../fba-replenishment/drive-upload.js';
+import { runExclusive } from './job-lock.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT = path.join(__dirname, 'python', 'render_schedule_pdf.py');
@@ -91,6 +92,11 @@ function renderViaPython(payload, timeoutMs) {
   });
 }
 
+// プレビュー連打・複数タブで Python 子プロセスが無制限に増えないようにする (Codex pdf-R1 Medium)。
+// Drive保存は job-lock で直列化されるが、プレビュー (GET) はロック外なのでここで止める。
+let activeBuilds = 0;
+const MAX_CONCURRENT_BUILDS = 2;
+
 /** 入荷予定 (CSV順) の PDF バイナリを組み立てる。rows も返す (件数表示用) */
 export async function buildSchedulePdf({ timeoutMs = 60000 } = {}) {
   const list = listInbound({ filter: 'scheduled', limit: 'all' });
@@ -107,16 +113,22 @@ export async function buildSchedulePdf({ timeoutMs = 60000 } = {}) {
     const stub = Buffer.from(`%PDF-1.4 fake\n${JSON.stringify({ rows: list.rows.length })}\n%%EOF\n`, 'utf8');
     return { buffer: stub, rows: list.rows.length };
   }
-  const buffer = await renderViaPython(payload, timeoutMs);
-  return { buffer, rows: list.rows.length };
+  if (activeBuilds >= MAX_CONCURRENT_BUILDS) {
+    throw new Error('PDF生成が混み合っています (同時実行上限)。数秒待ってからやり直してください');
+  }
+  activeBuilds++;
+  try {
+    const buffer = await renderViaPython(payload, timeoutMs);
+    return { buffer, rows: list.rows.length };
+  } finally {
+    activeBuilds--;
+  }
 }
-
-// 同時実行の直列化 (cron と UI ボタンが重なっても Drive を二重更新しない)
-let _chain = Promise.resolve();
 
 /**
  * PDF を作って Drive に上書き保存する。cron / UI ボタン共通の実体。
  * 結果は f_inbound_pdf_state に記録し、画面に「最終保存」を出せるようにする。
+ * job-lock の共通 mutex 内で実行するので、CSV取得との交錯は起きない。
  * @returns {Promise<{ok:true, rows:number, bytes:number, action:'updated'|'created', fileId:string, filename:string, folderName:string|null, saved_at:string}>}
  */
 export function exportSchedulePdfToDrive(user) {
@@ -151,7 +163,5 @@ export function exportSchedulePdfToDrive(user) {
     return { ok: true, rows: built.rows, bytes: built.buffer.length, action: up.action,
              fileId: up.fileId, filename, folderName: up.folderName, saved_at: state.saved_at };
   };
-  const p = _chain.then(run, run);
-  _chain = p.catch(() => {}); // 失敗しても次の実行を塞がない
-  return p;
+  return runExclusive(run);
 }

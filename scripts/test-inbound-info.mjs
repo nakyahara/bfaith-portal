@@ -352,6 +352,53 @@ ok(fake.buffer.subarray(0, 5).toString() === '%PDF-' && fake.rows === listInboun
   `PDF組立: 入荷予定の件数と一致 (${fake.rows}件)`);
 delete process.env.INBOUND_PDF_FAKE;
 
+// 共通 mutex: CSV取得とPDF出力が交錯しない (Codex pdf-R1 Medium)
+const { runExclusive } = await import('../apps/inbound-info/job-lock.js');
+const order = [];
+const slow = (label, ms) => runExclusive(async () => {
+  order.push(`${label}:start`);
+  await new Promise((r) => setTimeout(r, ms));
+  order.push(`${label}:end`);
+});
+await Promise.all([slow('A', 30), slow('B', 1), runExclusive(() => { throw new Error('boom'); }).catch(() => {}), slow('C', 1)]);
+ok(order.join(',') === 'A:start,A:end,B:start,B:end,C:start,C:end',
+  `job-lock: 直列実行 + 失敗しても後続を塞がない (${order.join(',')})`);
+
+// cron 張り替え: 不正な env 式では既存の予約を壊さない (Codex pdf-R1 Medium)
+const { applyInboundInfoSchedule } = await import('../apps/inbound-info/sync-job.js');
+const a1 = applyInboundInfoSchedule();
+ok(a1.started, 'cron: 起動');
+process.env.INBOUND_INFO_SYNC_CRON = 'これは cron 式ではない';
+const a2 = applyInboundInfoSchedule();
+ok(!a2.started === false && a2.reason === 'invalid_expr', 'cron: 不正な式なら既存の予約を維持 (started=true)');
+delete process.env.INBOUND_INFO_SYNC_CRON;
+// 何度張り替えても壊れない (destroy → schedule)
+for (let i = 0; i < 5; i++) applyInboundInfoSchedule();
+ok(applyInboundInfoSchedule().started, 'cron: 繰り返し張り替えても起動状態を保つ');
+// 日次ジョブ: CSV取得が失敗した日は Drive のPDFを上書きしない (Codex pdf-R1 High)
+// (このテスト環境には GOOGLE_SERVICE_ACCOUNT_KEY が無いので nefuda 取得は必ず失敗する)
+const { runDailyJob } = await import('../apps/inbound-info/sync-job.js');
+savePdfState({ ok: true, filename: '入荷予定リスト.pdf', rows: 99, bytes: 1, user: 'before' });
+saveJobSettings({ time: '09:00', pdf_enabled: true }, 'tester');
+process.env.INBOUND_PDF_FAKE = '1'; // ここまで来たら生成しないはずだが、万一来ても Drive を叩かせない
+await runDailyJob();
+const afterFail = pdfState();
+ok(afterFail.ok === 0 && /取得に失敗したため、PDFは更新していません/.test(afterFail.error),
+  'CSV取得失敗時: PDFを上書きせず理由を記録 (古い紙を刷らせない)');
+ok(afterFail.row_count === null, 'CSV取得失敗時: 前回の成功件数を「成功」として残さない');
+// PDF出力が無効なら状態も触らない
+savePdfState({ ok: true, filename: 'x.pdf', rows: 5, bytes: 1, user: 'keep' });
+saveJobSettings({ time: '09:00', pdf_enabled: false }, 'tester');
+await runDailyJob();
+ok(pdfState().saved_by === 'keep', 'PDF出力を無効にしていれば状態を上書きしない');
+delete process.env.INBOUND_PDF_FAKE;
+saveJobSettings({ time: '08:05', pdf_enabled: true }, 'tester');
+
+// 最後は停止状態で終える (予約が残るとプロセスが終了しない = テストがハングする)
+process.env.INBOUND_INFO_SYNC_ENABLED = 'false';
+ok(applyInboundInfoSchedule().reason === 'disabled_by_env', 'cron: env=false で停止 (予約も破棄)');
+delete process.env.INBOUND_INFO_SYNC_ENABLED;
+
 // 実 PDF 生成 (python + reportlab がある環境のみ。無い場合はスキップ)
 try {
   const real = await buildSchedulePdf({ timeoutMs: 60000 });

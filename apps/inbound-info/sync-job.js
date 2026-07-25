@@ -22,9 +22,9 @@
  * 「今すぐPDFを作成してDriveに保存」で同じ処理を手動実行できる。
  */
 import cron from 'node-cron';
-import { syncNewProducts, getJobSettings, parseHhmm } from './db.js';
+import { syncNewProducts, getJobSettings, parseHhmm, savePdfState } from './db.js';
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
-import { exportSchedulePdfToDrive } from './schedule-pdf.js';
+import { exportSchedulePdfToDrive, PDF_FILENAME } from './schedule-pdf.js';
 
 // 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
 const OFF = new Set(['false', '0', 'off', 'no']);
@@ -42,7 +42,8 @@ export function effectiveSchedule() {
   return { expr: `${t.minute} ${t.hour} * * *`, source: 'settings', time: t.text };
 }
 
-async function runDailyJob() {
+// export はテスト (scripts/test-inbound-info.mjs) 用。cron からは下の schedule 経由で呼ぶ
+export async function runDailyJob() {
   try {
     const r = syncNewProducts();
     if (!r.ok) console.warn(`[inbound-info] sync skipped: ${r.error}`);
@@ -50,24 +51,39 @@ async function runDailyJob() {
   } catch (e) {
     console.error('[inbound-info] sync failed:', e.message);
   }
+  // ② 入荷予定 (nefuda.csv) の取得。この結果で ③ を出すかどうかが変わる
+  let csvError = null;
   try {
     const s = await refreshNefudaSchedule('cron');
+    // stale_file = 別経路がより新しいCSVを反映済み = DBの中身は最新なので PDF は出してよい
     if (!s.ok) console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
     else console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
       + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
   } catch (e) {
+    csvError = e.message;
     console.error('[inbound-info] nefuda fetch failed:', e.message);
   }
-  // PDF は CSV 取得の「その後」。取得が失敗しても前回スナップショットで出す (中身が古いだけ)
-  if (getJobSettings().pdf_enabled) {
-    try {
-      const p = await exportSchedulePdfToDrive('cron');
-      console.log(`[inbound-info] pdf ${p.action}: ${p.filename} rows=${p.rows} bytes=${p.bytes}`);
-    } catch (e) {
-      console.error('[inbound-info] pdf export failed:', e.message);
-    }
-  } else {
+
+  // ③ 入荷予定リストPDF。
+  // ⚠ CSV取得が失敗した日は **Drive のPDFを上書きしない** (Codex pdf-R1 High)。
+  //   前回スナップショットで作った古いPDFで上書きすると、現場は「今日の入荷予定」として
+  //   古い紙を刷ってしまい、しかも保存状態が「成功」に見えて失敗を見逃す。
+  //   代わりに失敗として記録し、画面に理由を出す (手動ボタンなら意図的に出せる)。
+  if (!getJobSettings().pdf_enabled) {
     console.log('[inbound-info] pdf export skipped (画面設定で無効)');
+    return;
+  }
+  if (csvError) {
+    const msg = `入荷予定(nefuda.csv)の取得に失敗したため、PDFは更新していません (Drive上のPDFは前回のまま): ${csvError}`;
+    savePdfState({ ok: false, error: msg, filename: PDF_FILENAME(), user: 'cron' });
+    console.warn(`[inbound-info] pdf export skipped: ${msg}`);
+    return;
+  }
+  try {
+    const p = await exportSchedulePdfToDrive('cron');
+    console.log(`[inbound-info] pdf ${p.action}: ${p.filename} rows=${p.rows} bytes=${p.bytes}`);
+  } catch (e) {
+    console.error('[inbound-info] pdf export failed:', e.message);
   }
 }
 
@@ -78,19 +94,32 @@ let task = null;
  * @returns {{started:boolean, expr:string|null, source:string|null, reason?:string}}
  */
 export function applyInboundInfoSchedule() {
-  if (task) {
-    task.stop();
+  const disposeOld = () => {
+    if (!task) return;
+    // stop() だけだとタスクが登録簿に残り得るので destroy() で完全に破棄する
+    // (設定保存を繰り返してもリスナー/登録が積み上がらない — Codex pdf-R1 Medium)
+    try {
+      if (typeof task.destroy === 'function') task.destroy();
+      else task.stop();
+    } catch (e) {
+      console.error('[inbound-info] 旧cronの破棄に失敗:', e.message);
+    }
     task = null;
-  }
+  };
+
   if (isDisabled()) {
+    disposeOld();
     console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED)');
     return { started: false, expr: null, source: null, reason: 'disabled_by_env' };
   }
+  // 先に式を検証してから旧タスクを破棄する。env に不正な cron 式が入っていた場合に、
+  // 稼働中の予約まで失って「何も動かない」状態になるのを避ける (Codex pdf-R1 Medium)
   const { expr, source, time } = effectiveSchedule();
   if (!cron.validate(expr)) {
-    console.error(`[inbound-info] invalid cron expr: ${expr} — cron not started`);
-    return { started: false, expr, source, reason: 'invalid_expr' };
+    console.error(`[inbound-info] invalid cron expr: ${expr} — 既存の予約を維持します`);
+    return { started: !!task, expr, source, reason: 'invalid_expr' };
   }
+  disposeOld();
   // timezone を明示 (未指定だとプロセスのローカル TZ 依存になり、実行環境が変わると
   // ミラー同期完了前に走り得る)
   task = cron.schedule(expr, runDailyJob, { timezone: 'Asia/Tokyo' });
