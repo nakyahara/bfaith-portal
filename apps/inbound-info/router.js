@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import ExcelJS from 'exceljs';
 import {
-  stats, listInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
+  stats, listInbound, getInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
   importWorkbook, listOrigin, upsertOrigin, deleteOrigin, scheduleState,
 } from './db.js';
 import { getNefudaInfo, refreshNefudaSchedule } from './nefuda-fetch.js';
@@ -56,6 +56,18 @@ router.get('/api/list', (req, res) => {
     res.json({ ok: true, result: listInbound({ q, filter, offset, limit }) });
   } catch (e) {
     console.error('[inbound-info] list', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// ─── 1行取得 (保存時の競合復旧。存在しない場合も 200 + result:null を返す) ───
+router.get('/api/row', (req, res) => {
+  try {
+    const key = req.query?.code_key;
+    if (!key) return res.status(400).json({ ok: false, error: 'bad_request' });
+    res.json({ ok: true, result: getInbound(String(key)) });
+  } catch (e) {
+    console.error('[inbound-info] row', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
   }
 });

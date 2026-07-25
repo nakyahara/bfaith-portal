@@ -41,10 +41,14 @@
   th { background:#f1f5f9; white-space:nowrap; }
   td input { width:100%; }
   tr.new-row td { background:#fefce8; }
-  .tag { display:inline-block; border-radius:4px; padding:0 6px; font-size:11px; font-weight:700; }
-  .tag.auto { background:#fef3c7; color:#92400e; }
-  .tag.excel { background:#e0e7ff; color:#3730a3; }
-  .tag.manual { background:#dcfce7; color:#166534; }
+  /* 直接編集: 未保存 (dirty) → オレンジ、保存直後 → 緑を一瞬。new-row より後に定義して優先させる */
+  tr.dirty td { background:#ffedd5; }
+  tr.dirty td:first-child { box-shadow: inset 4px 0 0 var(--orange); }
+  tr.saved td { background:#dcfce7; }
+  tr.saved td:first-child { box-shadow: inset 4px 0 0 var(--green); }
+  td.miss input { background:#fef2f2; border-color:#fca5a5; }
+  td.ops { white-space:nowrap; }
+  tbody td input { padding:4px 6px; font-size:12px; }
   .msg { padding:10px 14px; border-radius:6px; margin:12px 0; font-size:14px; display:none; white-space:pre-wrap; }
   .msg.ok{ background:#dcfce7; color:#166534; } .msg.err{ background:#fee2e2; color:#991b1b; }
   .msg.info{ background:#dbeafe; color:#1e40af; }
@@ -52,6 +56,24 @@
   .hint { font-size:12px; color:var(--gray); margin-top:3px; }
   .code { font-family:ui-monospace, Consolas, monospace; }
   .import-box { border:1px dashed #94a3b8; border-radius:8px; padding:16px; margin-top:8px; }
+
+  /* ─── 印刷 ─── 画面では隠し、印刷時だけ #print-area を出す (A4横・見出し行はページ毎に再掲) */
+  #print-area { display:none; }
+  @media print {
+    @page { size: A4 landscape; margin: 10mm; }
+    body { background:#fff; }
+    header, .tabs, .panel, .pager, .msg { display:none !important; }
+    #print-area { display:block !important; color:#000; }
+    #print-area h1 { font-size:14px; margin:0 0 2px; }
+    #print-area .pmeta { font-size:10px; color:#000; margin-bottom:6px; }
+    #print-area table { width:100%; border-collapse:collapse; font-size:10px; table-layout:fixed; }
+    #print-area th, #print-area td { border:1px solid #333; padding:2px 4px; vertical-align:top;
+                                     color:#000; word-break:break-all; }
+    #print-area th { font-size:9px; }
+    #print-area td.code { font-family:ui-monospace, Consolas, monospace; }
+    #print-area thead { display:table-header-group; }
+    #print-area tr { page-break-inside:avoid; }
+  }
 </style>
 </head>
 <body>
@@ -77,12 +99,13 @@
 <div class="panel active" id="panel-list">
   <div class="toolbar">
     <input type="text" id="q" placeholder="商品コード・商品名で検索" style="min-width:260px"
-           onkeydown="if(event.key==='Enter'){state.offset=0;loadList();}">
-    <button class="btn-blue btn-sm" onclick="state.offset=0;loadList()">検索</button>
+           onkeydown="if(event.key==='Enter'){searchNow();}">
+    <button class="btn-blue btn-sm" onclick="searchNow()">検索</button>
     <span class="fchip active" data-filter="all" onclick="setFilter(this)">すべて</span>
     <span class="fchip" data-filter="missing" onclick="setFilter(this)">入数未記入</span>
     <span class="fchip" data-filter="new" onclick="setFilter(this)">新着</span>
     <span class="fchip" data-filter="scheduled" onclick="setFilter(this)">🚚 入荷予定のみ</span>
+    <button class="btn-gray btn-sm" id="btn-print" onclick="doPrint()">🖨 印刷</button>
     <span class="spacer"></span>
     <input type="text" id="add-code" placeholder="商品コードを手動追加" style="width:180px">
     <button class="btn-green btn-sm" onclick="addCode()">追加</button>
@@ -95,11 +118,12 @@
     <button class="btn-blue btn-sm" id="btn-sched" onclick="refreshSchedule()">最新の入荷予定を取得</button>
   </div>
   <div class="msg" id="msg-list"></div>
+  <p class="hint" style="margin:0">各セルはそのまま書き換えできます。行の <b>保存</b> を押した行だけが保存されます (未保存の行はオレンジ色)。黄色い行は自動追加された新着です。</p>
   <table>
     <thead><tr>
-      <th>商品コード</th><th>商品名</th><th style="width:80px">入数</th>
+      <th>商品コード</th><th>商品名</th><th style="width:70px">入数</th>
       <th>BCシール</th><th>直接ピックロケ</th><th>BF保管荷姿</th><th>いろは在庫化</th>
-      <th>memo</th><th>状態</th><th style="width:110px">操作</th>
+      <th>memo</th><th style="width:110px">操作</th>
     </tr></thead>
     <tbody id="tbody-list"></tbody>
   </table>
@@ -149,11 +173,21 @@
   <div class="msg" id="msg-import"></div>
 </div>
 
+<!-- 印刷用 (画面では非表示。doPrint() が中身を組んで window.print() を呼ぶ) -->
+<div id="print-area"></div>
+
 <script>
 const API = '/apps/inbound-info/api';
-const state = { q: '', filter: 'all', offset: 0, limit: 100, total: 0, editing: null };
-const FIELDS = ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿', 'いろは在庫化作業有無', 'memo'];
+const state = { q: '', filter: 'all', offset: 0, limit: 100, total: 0, order: 'code' };
 const DL = { '入庫時BCシール貼りフラグ': 'dl-bc', '直接ピックロケ保管': 'dl-pick', 'BF保管荷姿': 'dl-nisugata', 'いろは在庫化作業有無': 'dl-iroha' };
+// 印刷・画面共通の列定義 (状態列は廃止)
+const COLS = [
+  { key: '商品コード', label: '商品コード' }, { key: '商品名', label: '商品名' },
+  { key: '入数', label: '入数' }, { key: '入庫時BCシール貼りフラグ', label: 'BCシール' },
+  { key: '直接ピックロケ保管', label: '直接ピックロケ' }, { key: 'BF保管荷姿', label: 'BF保管荷姿' },
+  { key: 'いろは在庫化作業有無', label: 'いろは在庫化' }, { key: 'memo', label: 'memo' },
+];
+const FILTER_LABEL = { all: 'すべて', missing: '入数未記入', new: '新着', scheduled: '入荷予定のみ' };
 
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -196,7 +230,21 @@ async function loadStats() {
 }
 
 // ─── 一覧 ───
+// 未保存 (dirty) の行がある状態で再読込・ページ送り・フィルタ切替をすると入力が消えるため確認する
+function dirtyCount() {
+  return document.querySelectorAll('#tbody-list tr.dirty').length;
+}
+function confirmDiscard() {
+  const n = dirtyCount();
+  if (n === 0) return true;
+  return confirm(`未保存の行が ${n} 件あります。\n表示を切り替えると入力内容は破棄されます。続けますか？`);
+}
+window.addEventListener('beforeunload', (ev) => {
+  if (dirtyCount() > 0) { ev.preventDefault(); ev.returnValue = ''; }
+});
 function setFilter(el) {
+  if (el.dataset.filter === state.filter) return;
+  if (!confirmDiscard()) return;
   document.querySelectorAll('.fchip').forEach(x => x.classList.remove('active'));
   el.classList.add('active');
   state.filter = el.dataset.filter;
@@ -206,16 +254,17 @@ function setFilter(el) {
 function page(dir) {
   const next = state.offset + dir * state.limit;
   if (next < 0 || next >= state.total) return;
+  if (!confirmDiscard()) return;
   state.offset = next;
   loadList();
 }
 async function loadList() {
   state.q = document.getElementById('q').value;
-  state.editing = null;
   try {
     const p = new URLSearchParams({ q: state.q, filter: state.filter, offset: state.offset, limit: state.limit });
     const { result } = await api('/list?' + p.toString());
     state.total = result.total;
+    state.order = result.order || 'code';
     renderList(result.rows);
     const from = result.total === 0 ? 0 : result.offset + 1;
     const to = Math.min(result.offset + result.rows.length, result.total);
@@ -226,84 +275,116 @@ async function loadList() {
     showMsg('msg-list', 'err', '一覧の取得に失敗しました: ' + e.message);
   }
 }
-function sourceTag(s) {
-  const label = { auto: '新着', excel: 'Excel', manual: '編集済' }[s] || s;
-  return `<span class="tag ${esc(s)}">${esc(label)}</span>`;
+function searchNow() {
+  if (!confirmDiscard()) return;
+  state.offset = 0;
+  loadList();
 }
 // XSS対策 (Codex R1 High): 商品コード等の動的値を inline onclick に埋め込まない。
 // 行データは window._rows に持ち、ボタンは data-act のみでイベントデリゲーションで処理する。
-function renderList(rows) {
-  window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
-  const tb = document.getElementById('tbody-list');
-  tb.innerHTML = rows.map(r => {
-    if (state.editing === r.code_key) return editRowHtml(r);
-    return `<tr class="${r.source === 'auto' ? 'new-row' : ''}" data-key="${esc(r.code_key)}">
-      <td class="code">${esc(r.商品コード)}</td>
-      <td>${esc(r.商品名)}</td>
-      <td style="text-align:right">${r.入数 == null ? '<span style="color:#dc2626">未記入</span>' : esc(r.入数)}</td>
-      <td>${esc(r.入庫時BCシール貼りフラグ)}</td>
-      <td>${esc(r.直接ピックロケ保管)}</td>
-      <td>${esc(r.BF保管荷姿)}</td>
-      <td>${esc(r.いろは在庫化作業有無)}</td>
-      <td>${esc(r.memo)}</td>
-      <td>${sourceTag(r.source)}</td>
-      <td><button class="btn-blue btn-sm" data-act="edit">編集</button>
-          <button class="btn-red btn-sm" data-act="del">削除</button></td>
-    </tr>`;
-  }).join('');
-}
-function editRowHtml(r) {
-  const cell = (f) => `<td><input type="text" id="e-${esc(f)}" list="${DL[f] || ''}" value="${esc(r[f])}"></td>`;
-  return `<tr data-key="${esc(r.code_key)}">
+//
+// 全行を常に入力欄で描画する (編集ボタンを押さずにそのまま書き換えられる)。
+// 保存は行単位で、その行の「保存」を押した時だけ。押していない行は一切送らない。
+function rowHtml(r) {
+  const cell = (f) => `<td><input type="text" data-f="${esc(f)}" list="${DL[f] || ''}" value="${esc(r[f])}"></td>`;
+  const irisuBlank = r.入数 == null || r.入数 === '';
+  return `<tr class="${r.source === 'auto' ? 'new-row' : ''}" data-key="${esc(r.code_key)}">
     <td class="code">${esc(r.商品コード)}</td>
-    <td><input type="text" id="e-商品名" value="${esc(r.商品名)}"></td>
-    <td><input type="number" id="e-入数" min="0" step="1" value="${r.入数 == null ? '' : esc(r.入数)}"></td>
+    <td><input type="text" data-f="商品名" value="${esc(r.商品名)}"></td>
+    <td class="${irisuBlank ? 'miss' : ''}"><input type="number" data-f="入数" min="0" step="1"
+        value="${irisuBlank ? '' : esc(r.入数)}" title="未記入の行は赤くなります"></td>
     ${cell('入庫時BCシール貼りフラグ')}${cell('直接ピックロケ保管')}${cell('BF保管荷姿')}${cell('いろは在庫化作業有無')}${cell('memo')}
-    <td>${sourceTag(r.source)}</td>
-    <td><button class="btn-green btn-sm" data-act="save">保存</button>
-        <button class="btn-gray btn-sm" data-act="cancel">取消</button></td>
+    <td class="ops"><button class="btn-green btn-sm" data-act="save" disabled>保存</button>
+        <button class="btn-red btn-sm" data-act="del">削除</button></td>
   </tr>`;
 }
+function renderList(rows) {
+  window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
+  document.getElementById('tbody-list').innerHTML = rows.map(rowHtml).join('');
+}
+function findTr(key) {
+  return document.querySelector(`#tbody-list tr[data-key="${CSS.escape(key)}"]`);
+}
+// 入力があった行だけ dirty にして「保存」を有効化する (未編集の行を誤って保存 = 新着扱いを
+// 解除してしまうのを防ぐ)
+document.getElementById('tbody-list').addEventListener('input', (ev) => {
+  const inp = ev.target.closest('input[data-f]');
+  if (!inp) return;
+  const tr = inp.closest('tr');
+  tr.classList.add('dirty');
+  tr.classList.remove('saved');
+  const btn = tr.querySelector('button[data-act="save"]');
+  if (btn) btn.disabled = false;
+  if (inp.dataset.f === '入数') inp.closest('td').classList.toggle('miss', inp.value.trim() === '');
+});
+// Enter でその行を保存 (テンキー入力のみで完結させる)
+document.getElementById('tbody-list').addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  const inp = ev.target.closest('input[data-f]');
+  if (!inp) return;
+  ev.preventDefault();
+  const tr = inp.closest('tr');
+  if (tr?.classList.contains('dirty')) saveRow(tr.dataset.key);
+});
 document.getElementById('tbody-list').addEventListener('click', (ev) => {
   const btn = ev.target.closest('button[data-act]');
   if (!btn) return;
   const key = btn.closest('tr')?.dataset.key;
   if (key == null) return;
-  const act = btn.dataset.act;
-  if (act === 'edit') {
-    state.editing = key;
-    loadListRender();
-  } else if (act === 'cancel') {
-    state.editing = null;
-    loadList();
-  } else if (act === 'save') {
-    saveRow(key);
-  } else if (act === 'del') {
-    delRow(key);
-  }
+  if (btn.dataset.act === 'save') saveRow(key);
+  else if (btn.dataset.act === 'del') delRow(key);
 });
-function loadListRender() {
-  renderList(Object.values(window._rows || {}));
-}
 async function saveRow(key) {
-  const fields = { 商品名: document.getElementById('e-商品名').value, 入数: document.getElementById('e-入数').value };
-  for (const f of FIELDS) fields[f] = document.getElementById('e-' + f).value;
+  const tr = findTr(key);
+  if (!tr) return;
+  const fields = {};
+  tr.querySelectorAll('input[data-f]').forEach(inp => { fields[inp.dataset.f] = inp.value; });
+  const btn = tr.querySelector('button[data-act="save"]');
   const expected = window._rows[key]?.version ?? null;
+  if (btn) btn.disabled = true;
   try {
     await api('/update', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code_key: key, fields, expected_version: expected }) });
-    state.editing = null;
-    showMsg('msg-list', 'ok', '保存しました');
-    await loadList(); loadStats();
+    // 一覧全体を再読込すると他の行の未保存入力が消えるため、保存した行だけを更新する
+    const cur = window._rows[key];
+    if (cur) {
+      Object.assign(cur, fields, { version: (Number(cur.version) || 1) + 1, source: 'manual' });
+      cur.入数 = fields.入数 === '' ? null : Number(fields.入数);
+    }
+    tr.classList.remove('dirty', 'new-row');
+    tr.classList.add('saved');
+    setTimeout(() => tr.classList.remove('saved'), 1500);
+    showMsg('msg-list', 'ok', `「${window._rows[key]?.商品コード ?? key}」を保存しました`);
+    loadStats();
   } catch (e) {
-    if (e.message === 'conflict') {
-      state.editing = null;
-      showMsg('msg-list', 'err', '他の人が先にこの行を更新しました。最新の内容を再読込したので、もう一度編集してください。');
-      await loadList();
+    if (btn) btn.disabled = false;
+    if (e.message === 'conflict' || e.message === 'not_found') {
+      await reloadRow(key, e.message);
       return;
     }
     const m = { invalid_irisu: '入数は0以上の整数で入力してください', empty_name: '商品名は空にできません' }[e.message] || e.message;
     showMsg('msg-list', 'err', '保存に失敗しました: ' + m);
+  }
+}
+// 競合・行消失の復旧。一覧全体ではなくその1行だけ差し替えるので、他の行の未保存入力は残る
+async function reloadRow(key, reason) {
+  const tr = findTr(key);
+  try {
+    const { result } = await api('/row?code_key=' + encodeURIComponent(key));
+    if (!result) {
+      if (tr) tr.remove();
+      delete window._rows[key];
+      showMsg('msg-list', 'err', 'この行は他の人が削除したため、一覧から外しました。');
+      loadStats();
+      return;
+    }
+    window._rows[key] = result;
+    if (tr) tr.outerHTML = rowHtml(result);
+    showMsg('msg-list', 'err', reason === 'not_found'
+      ? 'この行は削除されていましたが再作成されていました。最新の内容に更新しました。'
+      : '他の人が先にこの行を更新しました。この行だけ最新の内容に更新したので、必要なら入力し直して保存してください。');
+  } catch (e) {
+    showMsg('msg-list', 'err', '最新の内容を取得できませんでした: ' + e.message + ' (画面を再読込してください)');
   }
 }
 async function delRow(key) {
@@ -312,8 +393,12 @@ async function delRow(key) {
   try {
     await api('/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code_key: key }) });
-    showMsg('msg-list', 'ok', '削除しました');
-    await loadList(); loadStats();
+    // 全体再読込はしない (他の行の未保存入力を消さないため)。消えた行だけ画面から外す
+    findTr(key)?.remove();
+    delete window._rows[key];
+    state.total = Math.max(0, state.total - 1);
+    showMsg('msg-list', 'ok', `「${code}」を削除しました`);
+    loadStats();
   } catch (e) {
     showMsg('msg-list', 'err', '削除に失敗しました: ' + e.message);
   }
@@ -321,6 +406,7 @@ async function delRow(key) {
 async function addCode() {
   const code = document.getElementById('add-code').value.trim();
   if (!code) return;
+  if (!confirmDiscard()) return;
   try {
     const r = await api('/add', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ code }) });
@@ -333,6 +419,7 @@ async function addCode() {
   }
 }
 async function syncNow() {
+  if (!confirmDiscard()) return;
   const btn = document.getElementById('btn-sync');
   btn.disabled = true;
   try {
@@ -371,24 +458,94 @@ function jst(iso) {
   const p = (n) => String(n).padStart(2, '0');
   return `${d.getUTCMonth() + 1}/${d.getUTCDate()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
+// 取得後は「入荷予定のみ」に自動で切り替える。この絞り込みだけ並び順が nefuda.csv の行順
+// (サーバー側 ORDER BY f_inbound_schedule.seq) なので、現場は CSV と同じ順に検品できる。
+function showScheduleFilter() {
+  const chip = document.querySelector('.fchip[data-filter="scheduled"]');
+  if (!chip) return;
+  document.querySelectorAll('.fchip').forEach(x => x.classList.remove('active'));
+  chip.classList.add('active');
+  state.filter = 'scheduled';
+  state.offset = 0;
+}
 async function refreshSchedule() {
+  if (!confirmDiscard()) return;
   const btn = document.getElementById('btn-sched');
   btn.disabled = true;
   try {
     const r = await api('/schedule/refresh', { method: 'POST' });
-    let m = `入荷予定を更新しました: ${r.schedule_rows}件 (CSV更新 ${r.file.modified_time_jst})`;
+    let m = `入荷予定を更新しました: ${r.schedule_rows}件 (CSV更新 ${r.file.modified_time_jst})\nCSVの並び順で表示しています`;
     if (r.added_to_master > 0) m += `\n入庫マスタに未登録だった ${r.added_to_master} 件を「新着」として追加しました`;
     if (r.not_in_master.length) m += `\n⚠ NE商品マスタに見つからないコード: ${r.not_in_master.join(', ')} (コード誤りの可能性)`;
     showMsg('msg-list', 'ok', m);
     await loadScheduleInfo();
+    showScheduleFilter();
     await loadList(); loadStats();
   } catch (e) {
     if (e.message === 'stale_file') {
-      showMsg('msg-list', 'info', 'すでに新しい入荷予定が反映済みです (表示を更新しました)');
-      await loadScheduleInfo(); await loadList(); loadStats();
+      showMsg('msg-list', 'info', 'すでに新しい入荷予定が反映済みです (CSVの並び順で表示を更新しました)');
+      await loadScheduleInfo();
+      showScheduleFilter();
+      await loadList(); loadStats();
       return;
     }
     showMsg('msg-list', 'err', '入荷予定の取得に失敗しました: ' + (e.detail || e.message));
+  } finally { btn.disabled = false; }
+}
+
+// ─── 印刷 ───
+// 画面はページング (100件) しているが、印刷は今の絞り込み・検索の全件を出す。
+// 印刷用の静的テーブルを #print-area に組んで window.print() を呼ぶ (別ウィンドウを開かないので
+// ポップアップブロックの影響を受けない)。
+const PRINT_CAP = 3000; // 万一「すべて」で全4900件を印刷しようとした時の上限
+async function fetchAllRows() {
+  const rows = [];
+  let total = 0;
+  for (let offset = 0; ; offset += 500) {
+    const p = new URLSearchParams({ q: state.q, filter: state.filter, offset, limit: 500 });
+    const { result } = await api('/list?' + p.toString());
+    total = result.total;
+    rows.push(...result.rows);
+    if (result.rows.length === 0 || rows.length >= Math.min(total, PRINT_CAP)) break;
+  }
+  return { rows: rows.slice(0, PRINT_CAP), total };
+}
+async function doPrint() {
+  if (dirtyCount() > 0) {
+    showMsg('msg-list', 'err', '未保存の行があります。保存してから印刷してください (印刷内容は保存済みのデータです)');
+    return;
+  }
+  const btn = document.getElementById('btn-print');
+  btn.disabled = true;
+  try {
+    const { rows, total } = await fetchAllRows();
+    const now = new Date(Date.now() + 9 * 3600 * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    const stamp = `${now.getUTCFullYear()}/${p(now.getUTCMonth() + 1)}/${p(now.getUTCDate())} ${p(now.getUTCHours())}:${p(now.getUTCMinutes())}`;
+    const meta = [
+      `絞り込み: ${FILTER_LABEL[state.filter] || state.filter}`,
+      state.q ? `検索: ${state.q}` : null,
+      `${rows.length}件${total > rows.length ? ` (全${total}件のうち先頭${rows.length}件のみ印刷)` : ''}`,
+      state.order === 'csv' ? 'nefuda.csv の並び順' : '商品コード順',
+      `印刷 ${stamp}`,
+    ].filter(Boolean);
+    if (state.filter === 'scheduled') meta.push('入荷予定CSV: ' + document.getElementById('sched-info').textContent);
+    const W = { 商品コード: '9%', 商品名: '26%', 入数: '4%' }; // 残りは均等割り
+    document.getElementById('print-area').innerHTML = `
+      <h1>入庫情報管理</h1>
+      <div class="pmeta">${esc(meta.join(' ／ '))}</div>
+      <table>
+        <colgroup>${COLS.map(c => `<col${W[c.key] ? ` style="width:${W[c.key]}"` : ''}>`).join('')}</colgroup>
+        <thead><tr>${COLS.map(c => `<th>${esc(c.label)}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map(r => `<tr>${COLS.map(c => {
+          const cls = c.key === '商品コード' ? ' class="code"' : '';
+          const st = c.key === '入数' ? ' style="text-align:right"' : '';
+          return `<td${cls}${st}>${esc(r[c.key])}</td>`;
+        }).join('')}</tr>`).join('')}</tbody>
+      </table>`;
+    window.print();
+  } catch (e) {
+    showMsg('msg-list', 'err', '印刷用データの取得に失敗しました: ' + e.message);
   } finally { btn.disabled = false; }
 }
 
