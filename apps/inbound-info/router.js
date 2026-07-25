@@ -14,9 +14,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   stats, listInbound, getInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
-  listOrigin, upsertOrigin, deleteOrigin, scheduleState,
+  listOrigin, upsertOrigin, deleteOrigin, scheduleState, pdfState, getJobSettings, saveJobSettings,
 } from './db.js';
 import { getNefudaInfo, refreshNefudaSchedule } from './nefuda-fetch.js';
+import { exportSchedulePdfToDrive, buildSchedulePdf, PDF_FILENAME, PDF_FOLDER_ID } from './schedule-pdf.js';
+import { applyInboundInfoSchedule, effectiveSchedule } from './sync-job.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -163,6 +165,61 @@ router.post('/api/schedule/refresh', async (req, res) => {
     // lib/drive-csv.js の VALIDATION (ファイル無し・サイズ超過等) は利用者に読める文で返す
     const status = e.code === 'VALIDATION' ? 400 : 502;
     res.status(status).json({ ok: false, error: 'drive_error', message: e.message });
+  }
+});
+
+// ─── 自動実行の設定 (時刻 / PDF出力の有無) ───
+router.get('/api/settings', (req, res) => {
+  try {
+    const s = getJobSettings();
+    const eff = effectiveSchedule();
+    res.json({ ok: true, result: {
+      ...s,
+      // env で cron 式が直接指定されている場合は画面の時刻設定より優先される (その旨を画面に出す)
+      env_override: eff.source === 'env' ? eff.expr : null,
+      pdf: { filename: PDF_FILENAME(), folder_id: PDF_FOLDER_ID() },
+      state: pdfState(),
+    } });
+  } catch (e) {
+    console.error('[inbound-info] settings get', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+router.post('/api/settings', (req, res) => {
+  try {
+    const r = saveJobSettings(req.body || {}, currentUser(req));
+    if (!r.ok) return res.status(400).json(r);
+    // 保存した時刻で cron を張り替える (再デプロイ不要で反映)
+    const applied = applyInboundInfoSchedule();
+    res.json({ ok: true, ...r, cron: applied });
+  } catch (e) {
+    console.error('[inbound-info] settings post', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// ─── 入荷予定リストPDF ───
+// Drive 上書き保存 (cron と同一実体)。UI の「今すぐPDFを作成してDriveに保存」ボタン用。
+router.post('/api/pdf/export', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await exportSchedulePdfToDrive(currentUser(req))) });
+  } catch (e) {
+    console.error('[inbound-info] pdf export', e.message);
+    res.status(502).json({ ok: false, error: 'pdf_export_failed', message: e.message });
+  }
+});
+
+// 保存せずブラウザで中身を確認する用 (Drive に触らない)
+router.get('/api/pdf/preview', async (req, res) => {
+  try {
+    const { buffer } = await buildSchedulePdf();
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="inbound-schedule.pdf"`);
+    res.send(buffer);
+  } catch (e) {
+    console.error('[inbound-info] pdf preview', e.message);
+    res.status(502).json({ ok: false, error: 'pdf_build_failed', message: e.message });
   }
 });
 

@@ -309,4 +309,56 @@ const sameR = replaceSchedule([{ 商品コード: 'newitem01', 商品名: 'x', �
   { fileModifiedTime: '2026-07-21T10:00:00.000Z', user: 'tester' });
 ok(sameR.ok, '鮮度ガード: 同一時刻 (同一ファイル再取得) は冪等に成功');
 
+// ─── 9. 自動実行の設定 + 入荷予定リストPDF ───
+console.log('\n[9] 自動実行の設定 / 入荷予定リストPDF');
+const { getJobSettings, saveJobSettings, parseHhmm, pdfState, savePdfState } = await import('../apps/inbound-info/db.js');
+
+ok(getJobSettings().time === '09:00' && getJobSettings().pdf_enabled === true, '設定: 未保存なら既定 09:00 / PDF有効');
+ok(parseHhmm('7:05').text === '07:05' && parseHhmm('23:59') && parseHhmm('00:00'), 'parseHhmm: 正常値');
+ok(['24:00', '9:60', 'あ', '', '9', '09:0', null, '09:00 ', '0:00:00'].every((v) => parseHhmm(v) === null || v === '09:00 '),
+  'parseHhmm: 不正値は null (前後空白は許容)');
+ok(!saveJobSettings({ time: '25:00' }, 'tester').ok, '設定: 不正な時刻は拒否');
+const sv = saveJobSettings({ time: '7:30', pdf_enabled: false }, 'tester');
+ok(sv.ok && sv.time === '07:30' && sv.pdf_enabled === false, '設定: 保存 (HH:MM に正規化)');
+const gs = getJobSettings();
+ok(gs.time === '07:30' && gs.pdf_enabled === false && gs.updated_by === 'tester', '設定: 読み出し');
+// 壊れたJSONでも既定値で動く (自動実行が止まる方が損害が大きい)
+db.prepare("UPDATE dashboard_settings SET value_json = '{壊れ' WHERE key = 'inbound_info.daily_job'").run();
+ok(getJobSettings().time === '09:00', '設定: JSON破損時は既定値にフォールバック');
+saveJobSettings({ time: '09:00', pdf_enabled: true }, 'tester');
+
+// cron 式の組み立て (env 上書きが勝つ)
+const { effectiveSchedule } = await import('../apps/inbound-info/sync-job.js');
+saveJobSettings({ time: '08:05', pdf_enabled: true }, 'tester');
+const eff = effectiveSchedule();
+ok(eff.expr === '5 8 * * *' && eff.source === 'settings', `cron式: 画面設定から組み立て (${eff.expr})`);
+process.env.INBOUND_INFO_SYNC_CRON = '0 10 * * *';
+ok(effectiveSchedule().expr === '0 10 * * *' && effectiveSchedule().source === 'env', 'cron式: env 上書きが優先');
+delete process.env.INBOUND_INFO_SYNC_CRON;
+
+// PDF 保存状態の記録 (成功/失敗どちらも上書き)
+ok(pdfState() === null, 'PDF状態: 初期は null');
+savePdfState({ ok: false, error: 'テスト失敗', filename: 'x.pdf', user: 'tester' });
+ok(pdfState().ok === 0 && pdfState().error === 'テスト失敗', 'PDF状態: 失敗を記録');
+savePdfState({ ok: true, filename: '入荷予定リスト.pdf', rows: 3, bytes: 12345, file_id: 'fid', folder_name: 'F', user: 'tester' });
+const ps = pdfState();
+ok(ps.ok === 1 && ps.row_count === 3 && ps.bytes === 12345 && ps.error === null, 'PDF状態: 成功で上書き (前回のエラーは消える)');
+
+// PDF 組み立て (スタブ経路 — Drive には触らない)
+process.env.INBOUND_PDF_FAKE = '1';
+const { buildSchedulePdf } = await import('../apps/inbound-info/schedule-pdf.js');
+const fake = await buildSchedulePdf();
+ok(fake.buffer.subarray(0, 5).toString() === '%PDF-' && fake.rows === listInbound({ filter: 'scheduled' }).total,
+  `PDF組立: 入荷予定の件数と一致 (${fake.rows}件)`);
+delete process.env.INBOUND_PDF_FAKE;
+
+// 実 PDF 生成 (python + reportlab がある環境のみ。無い場合はスキップ)
+try {
+  const real = await buildSchedulePdf({ timeoutMs: 60000 });
+  ok(real.buffer.length > 1000 && real.buffer.subarray(0, 5).toString() === '%PDF-',
+    `PDF実生成: reportlab で ${Math.round(real.buffer.length / 1024)}KB`);
+} catch (e) {
+  console.log(`  ⏭  PDF実生成はスキップ (${e.message.slice(0, 80)})`);
+}
+
 console.log(`\n🎉 全 ${passed} 項目 PASS`);

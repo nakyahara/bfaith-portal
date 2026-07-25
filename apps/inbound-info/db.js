@@ -390,6 +390,75 @@ export function scheduleState() {
   return db.prepare('SELECT * FROM f_inbound_schedule_state WHERE id = 1').get() || null;
 }
 
+// ─── 入荷予定リストPDF の Drive 保存結果 (1行固定。成功/失敗どちらも記録) ───
+export function pdfState() {
+  const db = getMirrorDB();
+  return db.prepare('SELECT * FROM f_inbound_pdf_state WHERE id = 1').get() || null;
+}
+
+export function savePdfState({ ok, filename = null, rows = null, bytes = null, file_id = null,
+                               folder_name = null, error = null, user = null } = {}) {
+  const db = getMirrorDB();
+  const now = utcIsoNow();
+  db.prepare(`
+    INSERT INTO f_inbound_pdf_state (id, saved_at, ok, filename, row_count, bytes, file_id, folder_name, error, saved_by)
+    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      saved_at = excluded.saved_at, ok = excluded.ok, filename = excluded.filename,
+      row_count = excluded.row_count, bytes = excluded.bytes, file_id = excluded.file_id,
+      folder_name = excluded.folder_name, error = excluded.error, saved_by = excluded.saved_by
+  `).run(now, ok ? 1 : 0, cleanText(filename), rows, bytes, cleanText(file_id),
+         cleanText(folder_name), error == null ? null : String(error).slice(0, 1000), cleanText(user));
+  return { saved_at: now };
+}
+
+// ─── 自動実行の設定 (時刻・PDF出力の有無) ───
+// 中原さんが画面から変更できるよう dashboard_settings (汎用 key/value) に持つ。
+// env INBOUND_INFO_SYNC_CRON が設定されている場合はそちらが優先 (上級者向けの上書き)。
+const SETTINGS_KEY = 'inbound_info.daily_job';
+export const DEFAULT_SETTINGS = { time: '09:00', pdf_enabled: true };
+
+// 'HH:MM' (00:00〜23:59) のみ許可。cron 式を組み立てる前に必ず通す
+export function parseHhmm(v) {
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(v ?? '').trim());
+  if (!m) return null;
+  return { hour: Number(m[1]), minute: Number(m[2]), text: `${String(Number(m[1])).padStart(2, '0')}:${m[2]}` };
+}
+
+export function getJobSettings() {
+  const db = getMirrorDB();
+  const row = db.prepare('SELECT value_json, updated_at, updated_by FROM dashboard_settings WHERE key = ?').get(SETTINGS_KEY);
+  if (!row) return { ...DEFAULT_SETTINGS, updated_at: null, updated_by: null };
+  let v = {};
+  try {
+    v = JSON.parse(row.value_json) || {};
+  } catch (e) {
+    // 壊れていても既定値で動かす (自動実行が止まる方が損害が大きい)
+    console.error(`[inbound-info] dashboard_settings.${SETTINGS_KEY} の JSON parse に失敗 (既定値で続行):`, e.message);
+  }
+  const t = parseHhmm(v.time);
+  return {
+    time: t ? t.text : DEFAULT_SETTINGS.time,
+    pdf_enabled: v.pdf_enabled !== false,
+    updated_at: row.updated_at,
+    updated_by: row.updated_by,
+  };
+}
+
+export function saveJobSettings({ time, pdf_enabled }, user) {
+  const t = parseHhmm(time);
+  if (!t) return { ok: false, error: 'invalid_time' };
+  const db = getMirrorDB();
+  const value = { time: t.text, pdf_enabled: pdf_enabled !== false };
+  db.prepare(`
+    INSERT INTO dashboard_settings (key, value_json, updated_at, updated_by)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value_json = excluded.value_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by
+  `).run(SETTINGS_KEY, JSON.stringify(value), utcIsoNow(), cleanText(user));
+  return { ok: true, ...value };
+}
+
 // ─── 原産国: 一覧 ───
 export function listOrigin() {
   const db = getMirrorDB();

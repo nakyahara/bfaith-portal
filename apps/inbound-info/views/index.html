@@ -57,6 +57,7 @@
   .pager { display:flex; gap:8px; align-items:center; margin-top:10px; font-size:13px; }
   .hint { font-size:12px; color:var(--gray); margin-top:3px; }
   .code { font-family:ui-monospace, Consolas, monospace; }
+  .set-box { border:1px solid var(--line); border-radius:8px; padding:14px; background:#f8fafc; }
 
   /* ─── 印刷 ─── 画面では隠し、印刷時だけ #print-area を出す (A4横・見出し行はページ毎に再掲) */
   #print-area { display:none; }
@@ -82,7 +83,8 @@
   <div>
     <a href="/" class="back">← B-Faithポータルに戻る</a>
     <h1>📥 入庫情報管理</h1>
-    <div class="sub">新商品はNE商品マスタ(ミラー)から毎日 9:00 に自動追加されます (入荷予定 nefuda.csv も同時に自動取得)</div>
+    <div class="sub">新商品の追加・入荷予定(nefuda.csv)の取得・入荷予定リストPDFの保存は
+      <b id="hdr-time">毎日</b> に自動実行されます (時刻は「⚙️ 自動実行」タブで変更できます)</div>
   </div>
   <div class="chips">
     <span class="chip">総件数 <b id="st-total">–</b></span>
@@ -94,6 +96,7 @@
 <div class="tabs">
   <div class="tab active" data-tab="list">入数マスタ</div>
   <div class="tab" data-tab="origin">原産国</div>
+  <div class="tab" data-tab="auto">⚙️ 自動実行</div>
 </div>
 
 <!-- ─── 入数マスタ ─── -->
@@ -158,6 +161,51 @@
   <p class="hint">画像はスプレッドシート側に実体が無かったため「有無フラグ」のみ移行しています。</p>
 </div>
 
+<!-- ─── 自動実行 ─── -->
+<div class="panel" id="panel-auto">
+  <h2>毎日の自動実行</h2>
+  <p style="margin-top:0">設定した時刻に、毎日この順番で自動実行します (ボタン操作は不要です)。</p>
+  <ol style="margin:0 0 14px; padding-left:22px; font-size:14px">
+    <li>NE商品マスタ(ミラー)から<b>新商品を追加</b></li>
+    <li>Google ドライブの <span class="code">nefuda.csv</span> を読んで<b>入荷予定を更新</b></li>
+    <li><b>入荷予定リストのPDFを作成して、同じフォルダに上書き保存</b></li>
+  </ol>
+  <div class="msg" id="msg-auto"></div>
+  <div class="set-box">
+    <div class="toolbar" style="margin-bottom:6px">
+      <label for="set-time" style="font-weight:700; font-size:14px">実行時刻</label>
+      <input type="time" id="set-time" step="60" style="width:120px; font-size:15px">
+      <span class="hint" style="margin-top:0">JST。倉庫の朝の同期(7:00)より後にしてください</span>
+    </div>
+    <div class="toolbar" style="margin-bottom:6px">
+      <label style="font-size:14px"><input type="checkbox" id="set-pdf" style="width:auto"> PDFを作成してDriveに上書き保存する</label>
+    </div>
+    <div class="toolbar">
+      <button class="btn-green" onclick="saveSettings()">この設定で保存</button>
+      <span class="hint" id="set-saved" style="margin-top:0"></span>
+    </div>
+    <p class="hint" id="set-envnote" style="display:none"></p>
+  </div>
+
+  <h2 style="margin-top:20px">入荷予定リストPDF</h2>
+  <div class="set-box">
+    <p style="margin-top:0; font-size:14px">
+      保存先: <span class="code" id="pdf-dest">–</span>
+      (<span class="code">nefuda.csv</span> と同じフォルダ。毎回同じファイルを上書きします)
+    </p>
+    <p class="hint">内容は「🚚 入荷予定のみ」の一覧と同じ (nefuda.csv の並び順)。A4横・見出し行は各ページに再掲。</p>
+    <div class="toolbar">
+      <button class="btn-orange" id="btn-pdf-now" onclick="exportPdfNow()">今すぐPDFを作成してDriveに保存</button>
+      <a class="btn-blue btn-sm" href="/apps/inbound-info/api/pdf/preview" target="_blank"
+         style="text-decoration:none; padding:9px 14px; border-radius:6px; color:#fff; font-weight:700; font-size:13px">
+        中身を確認 (保存しない)</a>
+    </div>
+    <p class="hint" id="pdf-state">–</p>
+  </div>
+  <p class="hint">⚠ PDFの保存には、サービスアカウントが共有ドライブの<b>コンテンツ管理者</b>である必要があります
+     (CSVの読み取りは閲覧者権限でも通ります)。失敗したときは上に理由が出ます。</p>
+</div>
+
 <!-- 印刷用 (画面では非表示。doPrint() が中身を組んで window.print() を呼ぶ) -->
 <div id="print-area"></div>
 
@@ -180,6 +228,7 @@ document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () =>
   t.classList.add('active');
   document.getElementById('panel-' + t.dataset.tab).classList.add('active');
   if (t.dataset.tab === 'origin') loadOrigin();
+  if (t.dataset.tab === 'auto') loadSettings();
 }));
 
 function esc(s) {
@@ -639,9 +688,86 @@ async function originDel(id) {
   }
 }
 
+// ─── 自動実行の設定 + 入荷予定リストPDF ───
+// ヘッダーに実効の実行時刻を出す (画面を開いた人が「何時に動くのか」を一目で分かるように)
+async function loadHeaderTime() {
+  try {
+    const { result } = await api('/settings');
+    document.getElementById('hdr-time').textContent =
+      result.env_override ? `毎日 (cron: ${result.env_override})` : `毎日 ${result.time}`;
+  } catch (e) { /* ヘッダー表示は失敗しても致命でない */ }
+}
+async function loadSettings() {
+  try {
+    const { result } = await api('/settings');
+    document.getElementById('set-time').value = result.time;
+    document.getElementById('set-pdf').checked = result.pdf_enabled !== false;
+    document.getElementById('set-saved').textContent = result.updated_at
+      ? `最終更新 ${jst(result.updated_at)}${result.updated_by ? ` (${result.updated_by})` : ''}` : '未設定 (既定 09:00)';
+    document.getElementById('pdf-dest').textContent = result.pdf.filename;
+    const note = document.getElementById('set-envnote');
+    if (result.env_override) {
+      note.style.display = 'block';
+      note.textContent = `⚠ 環境変数 INBOUND_INFO_SYNC_CRON (${result.env_override}) が設定されているため、`
+        + 'この時刻設定より env の指定が優先されます。画面で時刻を管理する場合は env を空にしてください。';
+    } else {
+      note.style.display = 'none';
+    }
+    renderPdfState(result.state);
+  } catch (e) {
+    showMsg('msg-auto', 'err', '設定の取得に失敗しました: ' + e.message);
+  }
+}
+function renderPdfState(st) {
+  const el = document.getElementById('pdf-state');
+  if (!st) { el.textContent = 'まだ一度も保存していません'; return; }
+  if (st.ok) {
+    el.textContent = `✅ 最終保存 ${jst(st.saved_at)} — ${st.filename} (${st.row_count}件 / ${Math.round((st.bytes || 0) / 1024)}KB`
+      + `${st.folder_name ? ` / 保存先フォルダ「${st.folder_name}」` : ''})${st.saved_by ? ` [${st.saved_by}]` : ''}`;
+  } else {
+    el.textContent = `❌ ${jst(st.saved_at)} 失敗: ${st.error || '(理由不明)'}`;
+  }
+}
+async function saveSettings() {
+  const time = document.getElementById('set-time').value;
+  const pdf_enabled = document.getElementById('set-pdf').checked;
+  try {
+    const r = await api('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ time, pdf_enabled }) });
+    let m = `保存しました。毎日 ${r.time} に自動実行します`;
+    if (!r.pdf_enabled) m += ' (PDF保存は無効)';
+    if (r.cron && !r.cron.started) {
+      m += r.cron.reason === 'disabled_by_env'
+        ? '\n⚠ ただし環境変数 INBOUND_INFO_SYNC_ENABLED で自動実行が止められています'
+        : `\n⚠ 予約に失敗しました (${r.cron.reason})`;
+    }
+    showMsg('msg-auto', 'ok', m);
+    loadSettings();
+    loadHeaderTime();
+  } catch (e) {
+    const msg = e.message === 'invalid_time' ? '時刻の形式が不正です (00:00〜23:59)' : e.message;
+    showMsg('msg-auto', 'err', '保存に失敗しました: ' + msg);
+  }
+}
+async function exportPdfNow() {
+  const btn = document.getElementById('btn-pdf-now');
+  btn.disabled = true;
+  showMsg('msg-auto', 'info', 'PDFを作成してDriveに保存しています…');
+  try {
+    const r = await api('/pdf/export', { method: 'POST' });
+    showMsg('msg-auto', 'ok', `${r.action === 'created' ? '新規作成' : '上書き保存'}しました: ${r.filename}`
+      + ` (${r.rows}件 / ${Math.round(r.bytes / 1024)}KB${r.folderName ? ` / フォルダ「${r.folderName}」` : ''})`);
+    loadSettings();
+  } catch (e) {
+    showMsg('msg-auto', 'err', 'PDFの保存に失敗しました: ' + (e.detail || e.message));
+    loadSettings();
+  } finally { btn.disabled = false; }
+}
+
 loadStats();
 loadList();
 loadScheduleInfo();
+loadHeaderTime();
 </script>
 </body>
 </html>
