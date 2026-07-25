@@ -49,6 +49,16 @@ function fmtJst(iso) {
   return `${j.getUTCFullYear()}-${p(j.getUTCMonth() + 1)}-${p(j.getUTCDate())} ${p(j.getUTCHours())}:${p(j.getUTCMinutes())}`;
 }
 
+/** 本文表示の正規化: 行末の空白除去 + 3行以上の連続空行を1行に詰める。
+ * 自動配信メールは空行を大量に含み、そのまま<br>にすると画面が延々と間延びする (2026-07-25 実測) */
+export function normalizeBodyText(text) {
+  return String(text || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t　]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 const badge = (meta, text) => meta ? `<span class="badge" style="${meta.badge}">${he(text != null ? text : meta.label)}</span>` : '';
 const chBadge = ch => badge(CHANNELS[ch], null) || he(ch);
 const stBadge = st => badge(STATUSES[st], null) || he(st);
@@ -175,8 +185,17 @@ router.get('/inquiries/:id', (req, res) => {
   const msgHtml = messages.map(m => {
     const atts = (attByMsg[m.id] || []).map(a =>
       `<span class="att" title="取得状態: ${he(a.fetch_status)}">📎 ${he(a.file_name || '(名称不明)')}${a.file_size ? ` (${Math.round(a.file_size / 1024)}KB)` : ''}</span>`).join(' ');
-    // Step 1 は text のみ表示 (message_body_html のサニタイズ表示は Gmail 同期実装時に導入)
-    const bodyText = m.message_body_text || '(本文なし)';
+    // Step 1 は text のみ表示 (message_body_html のサニタイズ表示は Gmail 同期実装時に導入)。
+    // 取込済みデータには過剰な空行が残っているものがあるため表示時にも正規化する
+    // (自動配信メールの空行がそのまま<br>になり、スマホで画面が延々と間延びしていた実測)
+    const bodyText = normalizeBodyText(m.message_body_text) || '(本文なし)';
+    const lines = bodyText.split('\n');
+    // 長文 (メールの自動配信・署名込みの長い問い合わせ) はスレッドを追いやすいよう畳む
+    const FOLD_LINES = 14, FOLD_CHARS = 700;
+    const folded = lines.length > FOLD_LINES || bodyText.length > FOLD_CHARS;
+    const headPart = folded ? lines.slice(0, 8).join('\n').slice(0, 400) : bodyText;
+    const restPart = folded ? bodyText.slice(headPart.length) : '';
+    const br = s => he(s).replace(/\n/g, '<br>');
     return `
     <div class="msg ${m.is_incoming ? 'in' : 'out'}">
       <div class="msg-head">
@@ -184,7 +203,7 @@ router.get('/inquiries/:id', (req, res) => {
         ${m.sender_type === 'system' ? '<span class="badge" style="background:#f1f5f9;color:#64748b">system</span>' : ''}
         <span class="msg-date">${fmtJst(m.received_at || m.sent_at || m.created_at)}${m.is_incoming ? '' : m.sent_by_user_id ? ` ・ 送信者: ${he(m.sent_by_user_id)}` : ''}</span>
       </div>
-      <div class="msg-body">${he(bodyText).replace(/\n/g, '<br>')}</div>
+      <div class="msg-body">${br(headPart)}${folded ? `<details class="more"><summary>… 続きを表示 (全${lines.length}行)</summary><div>${br(restPart)}</div></details>` : ''}</div>
       ${atts ? `<div class="msg-atts">${atts}</div>` : ''}
     </div>`;
   }).join('');
@@ -1415,6 +1434,11 @@ button:disabled { opacity: .5; cursor: default; }
 .msg-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; flex-wrap: wrap; }
 .msg-date { color: #94a3b8; font-size: 12px; }
 .msg-body { white-space: normal; line-height: 1.7; overflow-wrap: anywhere; }
+/* 長文メール (自動配信・署名込み) はスレッドを追いやすいよう畳む */
+.msg-body details.more > summary { cursor: pointer; color: #1d4ed8; font-size: 13px; margin-top: 6px;
+  list-style: none; padding: 4px 0; }
+.msg-body details.more > summary::-webkit-details-marker { display: none; }
+.msg-body details.more[open] > summary { color: #64748b; }
 .msg-atts { margin-top: 8px; }
 .att { display: inline-block; background: #f1f5f9; border-radius: 8px; padding: 3px 8px; font-size: 12px; margin-right: 6px; }
 .panel { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 12px; }
