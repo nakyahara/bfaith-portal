@@ -63,6 +63,7 @@ import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
+import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
 import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
@@ -1198,6 +1199,9 @@ app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
+// AI連携API (ローカルClaude Codeランナー用) は X-AI-Key 認証・セッション外 (設計書§9.2 権限分離。
+// 先に mount してポータルセッション認証を通さない。product-hub/service-api と同パターン)
+app.use('/apps/inquiry-hub/ai-api', express.json({ limit: '1mb' }), inquiryHubAiApiRouter);
 // limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
 app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {

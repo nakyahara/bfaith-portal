@@ -329,15 +329,37 @@ function createTables() {
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
 
-  // AIバッチ実行ログ
+  // AIバッチ実行ログ (設計書§9.2。ローカルランナーが1回のバッチごとに記録し、運用管理画面に表示)
+  // 移行 (Step 7): Step 1で定義した旧スキーマ (started_at NOT NULL/processed_count/status等) が
+  // 既存DBに残っている。旧スキーマは書き込みコードが存在せず常に空のため、空ならDROPして作り直す。
+  // 万一データがある場合はDROPせず不足カラムをALTERで足す (Codexレビュー反映)
+  {
+    const cols = db.prepare('PRAGMA table_info(ai_runs)').all().map(c => c.name);
+    if (cols.length > 0 && !cols.includes('runner_info')) {
+      const cnt = db.prepare('SELECT COUNT(*) AS c FROM ai_runs').get().c;
+      if (cnt === 0) {
+        db.exec('DROP TABLE ai_runs');
+      } else {
+        for (const [name, ddl] of [['runner_info', 'TEXT'], ['finished_at', 'TEXT'],
+          ['claimed', 'INTEGER NOT NULL DEFAULT 0'], ['done', 'INTEGER NOT NULL DEFAULT 0'],
+          ['failed', 'INTEGER NOT NULL DEFAULT 0'], ['discarded', 'INTEGER NOT NULL DEFAULT 0'],
+          ['error', 'TEXT']]) {
+          addColumnIfMissing('ai_runs', name, ddl);
+        }
+      }
+    }
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS ai_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at TEXT NOT NULL,
-    completed_at TEXT,
-    processed_count INTEGER NOT NULL DEFAULT 0,
-    failed_count INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','done','failed')),
-    detail TEXT
+    runner_info TEXT,                        -- 実行元 (ホスト名+モデル等)
+    started_at TEXT,
+    finished_at TEXT,
+    claimed INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    discarded INTEGER NOT NULL DEFAULT 0,    -- rev競合で破棄された結果数
+    error TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
 
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_status ON inquiries(internal_status, last_message_at)');
