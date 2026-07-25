@@ -18,7 +18,48 @@
  * 照合は LOWER(TRIM()) で行う ([[feedback-sku-case-normalization]])。
  */
 
-/** @typedef {'unknown'|'single'|'variation'|'conflict'} VariationKind */
+/** @typedef {'unknown'|'single'|'variation'|'conflict'|'detached'} VariationKind */
+
+/**
+ * その商品コードが「どこかのドラフトでバリエーションから外された」ものか。
+ * 外した SKU を別ページにしたい場合はそのコードで新規登録する運用なので、
+ * ここに載っているコードは自動まとめの対象から除く (2026-07-25 中原さん方針)。
+ */
+export function isDetached(db, neCode) {
+  try {
+    return !!db.prepare('SELECT 1 FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) = ?')
+      .get(norm(neCode));
+  } catch (_) {
+    return false; // テーブル未作成でも判定を止めない
+  }
+}
+
+/** 指定ドラフトの除外のうち、今そのグループに属している SKU の件数だけ数える */
+function countExcludedInGroup(db, draftId, groupKey) {
+  if (!draftId) return 0;
+  try {
+    return db.prepare(`
+      SELECT COUNT(*) AS c FROM draft_variation_exclusions e
+      JOIN mirror_products p ON LOWER(TRIM(p.商品コード)) = LOWER(TRIM(e.ne_code))
+      WHERE e.draft_id = ? AND LOWER(TRIM(p.代表商品コード)) = ?
+    `).get(draftId, norm(groupKey)).c;
+  } catch (_) {
+    return 0;
+  }
+}
+
+/** 指定ドラフトで外されている SKU コード (正規化済み) の集合 */
+function excludedSet(db, draftId) {
+  if (!draftId) return new Set();
+  try {
+    return new Set(
+      db.prepare('SELECT ne_code FROM draft_variation_exclusions WHERE draft_id = ?')
+        .all(draftId).map((r) => norm(r.ne_code))
+    );
+  } catch (_) {
+    return new Set();
+  }
+}
 
 /** IN 句のバインド上限 (SQLite 既定 999) に当たらないための分割単位 (Codex low-7) */
 const IN_CHUNK = 400;
@@ -31,8 +72,13 @@ function chunk(arr, size) {
 
 const norm = (v) => (v == null ? '' : String(v).trim().toLowerCase());
 
-/** mirror_products が未作成/空でも落ちないようにする (fail-soft) */
-function mirrorReady(db) {
+/**
+ * mirror_products を読めるか。
+ * **表示は fail-soft・登録は fail-closed** に使い分ける (Codex medium):
+ * ここが false のまま子SKUで登録すると、代表コードにまとめられないドラフト+Notionカードが
+ * でき、カード作成後は regroup 禁止なので自動修復できない。
+ */
+export function mirrorReady(db) {
   try {
     db.prepare('SELECT 1 FROM mirror_products LIMIT 1').get();
     return true;
@@ -52,13 +98,18 @@ function mirrorReady(db) {
  *   kind='variation' … バリエーション。groupKey が楽天1ページに相当する
  *   isChild=true     … 渡されたコードが子SKUで、groupKey と異なる (まとめる候補)
  */
-export function resolveVariationGroup(db, neCode, { withMembers = true } = {}) {
+export function resolveVariationGroup(db, neCode, { withMembers = true, draftId = null } = {}) {
   const code = String(neCode == null ? '' : neCode).trim();
   const empty = {
     kind: 'unknown', groupKey: code, repCode: null,
-    isChild: false, memberCount: 0, members: [], found: false,
+    isChild: false, memberCount: 0, members: [], excludedMembers: [], found: false,
   };
   if (!code || !mirrorReady(db)) return empty;
+
+  // 明示的にバリエーションから外された SKU は単独ページとして扱う (グループへ引き戻さない)
+  if (isDetached(db, code)) {
+    return { ...empty, kind: 'detached', groupKey: code, found: true };
+  }
 
   // 正規化後に複数行ヒットする = mirror 側の表記ゆらぎ重複。
   // どちらのグループに属するか決められないので人に確認させる (Codex low-8)
@@ -85,13 +136,17 @@ export function resolveVariationGroup(db, neCode, { withMembers = true } = {}) {
     return { ...empty, kind: self ? 'single' : 'unknown', groupKey: code, found: !!self };
   }
 
-  const members = withMembers
+  // このドラフトで外された SKU は一覧から分離する (外した記録は残して復帰できるようにする)
+  const excluded = excludedSet(db, draftId);
+  const all = withMembers
     ? db.prepare(`
         SELECT 商品コード, 商品名, 取扱区分, 在庫数, 標準売価
         FROM mirror_products WHERE LOWER(TRIM(代表商品コード)) = ?
         ORDER BY 商品コード
       `).all(norm(groupKey))
     : [];
+  const members = all.filter((m) => !excluded.has(norm(m.商品コード)));
+  const excludedMembers = all.filter((m) => excluded.has(norm(m.商品コード)));
 
   return {
     kind: 'variation',
@@ -99,8 +154,12 @@ export function resolveVariationGroup(db, neCode, { withMembers = true } = {}) {
     repCode: rep,
     // 入力コードがグループキーと違う = 子SKU を入力された (まとめる候補)
     isChild: norm(code) !== norm(groupKey),
-    memberCount,
+    // 外した分を引いた実効SKU数 (楽天1ページに載る数)。
+    // excluded.size をそのまま引くと、mirror 側で代表コードが変わった古い除外行まで
+    // 差し引いて実数より小さくなる (Codex low) → グループ内の除外だけ数える
+    memberCount: withMembers ? members.length : Math.max(0, memberCount - countExcludedInGroup(db, draftId, groupKey)),
     members,
+    excludedMembers,
     found: !!self,
   };
 }
@@ -150,7 +209,22 @@ export function resolveVariationGroupsBatch(db, neCodes) {
     `).all(...part)) counts.set(r.k, r.c);
   }
 
+  // 外された SKU の集合 (一覧でも「単独ページ」として扱う)
+  const detached = new Set();
+  try {
+    for (const part of chunk(codes.map(norm), IN_CHUNK)) {
+      const ph = part.map(() => '?').join(',');
+      for (const r of db.prepare(
+        `SELECT DISTINCT LOWER(TRIM(ne_code)) k FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) IN (${ph})`
+      ).all(...part)) detached.add(r.k);
+    }
+  } catch (_) { /* テーブル未作成でも一覧を止めない */ }
+
   for (const c of codes) {
+    if (detached.has(norm(c))) {
+      result.set(norm(c), { kind: 'detached', groupKey: c, memberCount: 0, isChild: false });
+      continue;
+    }
     if (dupCodes.has(norm(c))) {
       result.set(norm(c), { kind: 'conflict', groupKey: c, memberCount: 0, isChild: false });
       continue;
@@ -173,7 +247,8 @@ export function resolveVariationGroupsBatch(db, neCodes) {
  * NE 側でバリエーション構成が変わっても常に最新が映る。
  */
 export function effectiveHasVariation(info, draft) {
-  if (info && info.kind === 'variation') return { value: true, source: 'ne' };
-  if (info && info.kind === 'single') return { value: false, source: 'ne' };
+  if (info && info.kind === 'variation') return { value: info.memberCount > 1, source: 'ne' };
+  // detached = バリエーションから外した単独ページ。single と同じく「なし」で確定
+  if (info && (info.kind === 'single' || info.kind === 'detached')) return { value: false, source: 'ne' };
   return { value: !!(draft && draft.has_variation), source: 'manual' };
 }

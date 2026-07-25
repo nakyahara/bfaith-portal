@@ -14,13 +14,13 @@ import crypto from 'crypto';
 
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken,
-  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported,
+  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -155,9 +155,15 @@ router.get('/detail/:id', (req, res) => {
     .concat(ESCAPE_STATUSES.filter((s) => s !== draft.status));
 
   // NE の代表商品コードでバリエーション判定 (NE が正・DB には焼かない)
-  const variation = resolveVariationGroup(db, draft.ne_code);
+  const variation = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
   const hasVariation = effectiveHasVariation(variation, draft);
   const regroup = regroupBlockReason(db, draft, variation);
+  // 外したSKUが「どのページにも載っていない」状態を見えるようにする (Codex high-2 の可視化)。
+  // 別ページ化は手動 (中原さん方針) なので、未登録なら未割当として明示する
+  for (const m of variation.excludedMembers) {
+    m.ownDraftId = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?')
+      .get(String(m.商品コード).trim().toLowerCase())?.id || null;
+  }
 
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
@@ -188,25 +194,63 @@ router.post('/api/drafts', async (req, res) => {
   }
 
   const db = getDB();
-  let draftId;
-  try {
-    const info = db.prepare(`
-      INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, asin, amazon_url, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(neCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20),
-      cleanText(req.body?.asin, 20), amazonUrlCreate, actorOf(req));
-    draftId = info.lastInsertRowid;
-  } catch (e) {
-    if (String(e.message).includes('UNIQUE')) {
-      return res.status(409).json({ ok: false, error: `NE商品コード ${neCode} のドラフトは既に存在します` });
-    }
-    throw e;
+
+  // fail-closed (Codex medium): 判定基盤が壊れている状態で子SKUを登録すると、
+  // 代表コードにまとめられないドラフト + Notion カードができ、カード作成後は regroup 禁止で
+  // 自動修復できない。NE に「その商品コードが無い」のは正常 (新商品) なので通す。
+  if (!mirrorReady(db)) {
+    return res.status(503).json({ ok: false, error: 'NE商品マスタを参照できないため登録できません (時間をおいて再試行してください)' });
   }
-  logEvent(db, draftId, 'created', neCode, actorOf(req));
+  if (!isNeCodeUniqueEnforced()) {
+    return res.status(503).json({
+      ok: false,
+      error: '商品コードの重複 (大文字小文字違い) があるため登録を停止しています。管理者にご連絡ください',
+    });
+  }
+
+  // 既定でまとめる (2026-07-25 中原さん方針): 子SKUのコードで登録されたら、
+  // 確認を挟まず代表商品コード (= 楽天1ページ) に正規化する。人の作業を最小にするため。
+  // 明示的にバリエーションから外された SKU は対象外 (別ページにしたい意図なので、そのまま登録)。
+  // 判定と INSERT は 1 トランザクション: 分けると restore と競合して二重掲載しうる (Codex high-1)
+  const created = db.transaction(() => {
+    const vari = resolveVariationGroup(db, neCode, { withMembers: false });
+    const groupedFrom = (vari.kind === 'variation' && vari.isChild) ? neCode : null;
+    const effectiveCode = groupedFrom ? vari.groupKey : neCode;
+    try {
+      const info = db.prepare(`
+        INSERT INTO product_drafts (ne_code, name, official_url, price, jan_code, asin, amazon_url, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(effectiveCode, name, officialUrl, sanitizeMoney(req.body?.price), cleanText(req.body?.jan_code, 20),
+        cleanText(req.body?.asin, 20), amazonUrlCreate, actorOf(req));
+      const id = Number(info.lastInsertRowid);
+      logEvent(db, id, 'created', effectiveCode, actorOf(req));
+      if (groupedFrom) logEvent(db, id, 'grouped_on_create', `${groupedFrom} → ${effectiveCode}`, actorOf(req));
+      return { id, effectiveCode, groupedFrom, memberCount: vari.memberCount };
+    } catch (e) {
+      if (!String(e.message).includes('UNIQUE')) throw e;
+      const existing = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?')
+        .get(String(effectiveCode).trim().toLowerCase());
+      // 正規化した結果ぶつかった場合は「なぜ別コードのドラフトに当たったか」を説明する
+      return {
+        conflict: groupedFrom
+          ? `${groupedFrom} は代表商品コード ${effectiveCode} のバリエーションです。${effectiveCode} のドラフトが既にあります`
+          : `商品コード ${effectiveCode} のドラフトは既に存在します`,
+        existingId: existing?.id,
+      };
+    }
+  })();
+  if (created.conflict) {
+    return res.status(409).json({ ok: false, error: created.conflict, existingId: created.existingId });
+  }
+  const { id: draftId, effectiveCode, groupedFrom } = created;
 
   // §5: 登録と同時に Notion カード作成 (失敗しても登録は成功。バナー+リトライで回収)
   const notion = await attemptCardCreation(draftId, { actor: actorOf(req) });
-  res.json({ ok: true, id: draftId, notion });
+  res.json({
+    ok: true, id: draftId, notion,
+    ne_code: effectiveCode,
+    grouped: groupedFrom ? { from: groupedFrom, to: effectiveCode, memberCount: created.memberCount } : null,
+  });
 });
 
 router.post('/api/drafts/:id', async (req, res) => {
@@ -475,6 +519,73 @@ router.get('/api/variation', (req, res) => {
     memberCount: info.memberCount,
     members: info.members.slice(0, 60).map((m) => ({ code: m.商品コード, name: m.商品名, status: m.取扱区分 })),
   });
+});
+
+// SKU をこのドラフト (楽天1ページ) のバリエーションから外す。
+// 外した SKU を別ページにしたい場合は、そのコードで新規登録する (自動まとめはスキップされる)。
+router.post('/api/drafts/:id/variation/exclude', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const db = getDB();
+  // 判定・所属確認・INSERT・監査ログを 1 トランザクションに閉じる (Codex medium)
+  const r = db.transaction(() => {
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+    if (v.kind !== 'variation') {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    // ドラフト自身の商品コード (代表コード) は外せない
+    if (code.trim().toLowerCase() === String(draft.ne_code).trim().toLowerCase()) {
+      return { code: 400, error: 'このドラフト自身の商品コードは外せません' };
+    }
+    // グループに属さないコードを外したことにしない (入力ミス・古い画面からの誤操作を弾く)
+    const inGroup = [...v.members, ...v.excludedMembers]
+      .some((m) => String(m.商品コード).trim().toLowerCase() === code.trim().toLowerCase());
+    if (!inGroup) {
+      return { code: 409, error: `${code} はこのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    try {
+      db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
+        .run(draft.id, code, actorOf(req));
+    } catch (e) {
+      // SKU 単位のグローバル UNIQUE。既に外れているなら成功扱い (冪等)
+      if (/UNIQUE/i.test(String(e && e.message))) return { code: 200, already: true };
+      throw e;
+    }
+    logEvent(db, draft.id, 'variation_sku_excluded', code, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// 外した SKU をバリエーションに戻す
+router.post('/api/drafts/:id/variation/restore', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const db = getDB();
+  // 「単独ドラフトの有無を見る」と「除外を消す」を 1 トランザクションにする (Codex high-1)。
+  // 分けると、確認と削除の間に同じ SKU の単独ドラフトが作られ、代表ページと単独ページの
+  // 両方に同じ SKU が載る (二重掲載) 余地が残る
+  const r = db.transaction(() => {
+    const separate = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?')
+      .get(code.trim().toLowerCase());
+    if (separate) {
+      return {
+        code: 409,
+        error: `${code} は単独のドラフト (#${separate.id}) として登録されています。先にそちらを削除してください`,
+      };
+    }
+    const info = db.prepare('DELETE FROM draft_variation_exclusions WHERE draft_id = ? AND LOWER(TRIM(ne_code)) = ?')
+      .run(draft.id, code.trim().toLowerCase());
+    if (info.changes > 0) logEvent(db, draft.id, 'variation_sku_restored', code, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
 });
 
 // 子SKUで作られたドラフトを代表商品コードにまとめる (人が確認してから実行する)。
