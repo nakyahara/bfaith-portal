@@ -117,68 +117,74 @@ db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
 ensureRakutenReviewTables(db);
 
+// ⚠️ 終了は process.exit() ではなく exitCode + 自然終了にする (monitor-fee-coverage.js #439 と同手法)。
+//   GChat通知 (fetch/undici) 直後の process.exit() は Windows node で libuv assertion
+//   (UV_HANDLE_CLOSING / status=3221226505 = abort) を踏み、取込が全部成功していても abort する。
+//   2026-07-25 調査: 7/17〜7/25 の daily-sync で「★1-2 レビューがあった日」4日 (7/18,7/20,7/23,7/25) は
+//   全て abort、「0件だった日」4日は全て正常 — 通知fetchの有無と完全一致した。
+//   abort すると daily-sync 側が取込失敗と見なし後続の mirror sync を丸ごとスキップする (7/25 実害)。
 if (entries.length === 0) {
   console.log('取込対象なし (正常終了)');
   // 前回送信失敗分のキュー消化だけは行う (通知リトライは取込対象の有無と独立)
   if (!isDryRun) await notifyLowRatings(db);
   db.close();
-  process.exit(0);
-}
-
-let okCount = 0, dupCount = 0, failCount = 0;
-let newLowCount = 0;
-try {
-  for (const name of entries) {
-    const srcPath = path.join(incomingDir, name);
-    let buffer;
-    try {
-      buffer = fs.readFileSync(srcPath);
-    } catch (e) {
-      console.error(`✗ ${name}: 読込失敗 (${e.message})`);
-      failCount++;
-      continue;
-    }
-    const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-
-    if (isDryRun) {
-      const p = prepareReviewFile(name, buffer);
-      if (p.ok) { console.log(`  [dry] ✓ ${name}: ${p.label} (${p.dateFrom}〜${p.dateTo})`); okCount++; }
-      else { console.log(`  [dry] ✗ ${name}: ${p.error}`); failCount++; }
-      continue;
-    }
-
-    const outcome = importReviewFile(db, { name, buffer, sha256, source: 'incoming' });
-    for (const r of outcome.results) {
-      if (r.ok) {
-        const delNote = (r.missed || r.deleted) ? ` / 不在+1 ${r.missed} / 削除確定 ${r.deleted}` : '';
-        console.log(`  ✓ ${r.file}: ${r.label} (insert ${r.inserted} / update ${r.updated} / 変化なし ${r.unchanged}${delNote}) ${r.date_from}〜${r.date_to}`);
-        for (const w of r.warnings || []) console.log(`    ⚠ ${w}`);
-      } else {
-        console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
-      }
-    }
-    newLowCount += outcome.newLowRatings.length; // キュー追加は取込tx内 (lib側) で完了済み
-
-    try {
-      if (outcome.status === 'ok' || outcome.status === 'duplicate') {
-        const ym = new Date().toISOString().slice(0, 7);
-        const dest = moveTo(srcPath, path.join(processedRoot, ym));
-        console.log(`    → ${path.relative(incomingDir, dest)}`);
-        if (outcome.status === 'ok') okCount++; else dupCount++;
-      } else {
-        const dest = moveTo(srcPath, failedDir);
-        console.log(`    → ${path.relative(incomingDir, dest)} (要確認)`);
+  process.exitCode = 0;
+} else {
+  let okCount = 0, dupCount = 0, failCount = 0;
+  let newLowCount = 0;
+  try {
+    for (const name of entries) {
+      const srcPath = path.join(incomingDir, name);
+      let buffer;
+      try {
+        buffer = fs.readFileSync(srcPath);
+      } catch (e) {
+        console.error(`✗ ${name}: 読込失敗 (${e.message})`);
         failCount++;
+        continue;
       }
-    } catch (e) {
-      console.error(`  ⚠ ${name}: ファイル移動失敗 (${e.message})。手で移動してください`);
-      if (outcome.status === 'ok' || outcome.status === 'duplicate') okCount++; else failCount++;
-    }
-  }
-  if (!isDryRun) await notifyLowRatings(db);
-} finally {
-  db.close();
-}
+      const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
 
-console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} 新規低評価=${newLowCount} ===`);
-process.exit(failCount > 0 ? 1 : 0);
+      if (isDryRun) {
+        const p = prepareReviewFile(name, buffer);
+        if (p.ok) { console.log(`  [dry] ✓ ${name}: ${p.label} (${p.dateFrom}〜${p.dateTo})`); okCount++; }
+        else { console.log(`  [dry] ✗ ${name}: ${p.error}`); failCount++; }
+        continue;
+      }
+
+      const outcome = importReviewFile(db, { name, buffer, sha256, source: 'incoming' });
+      for (const r of outcome.results) {
+        if (r.ok) {
+          const delNote = (r.missed || r.deleted) ? ` / 不在+1 ${r.missed} / 削除確定 ${r.deleted}` : '';
+          console.log(`  ✓ ${r.file}: ${r.label} (insert ${r.inserted} / update ${r.updated} / 変化なし ${r.unchanged}${delNote}) ${r.date_from}〜${r.date_to}`);
+          for (const w of r.warnings || []) console.log(`    ⚠ ${w}`);
+        } else {
+          console.log(`  ${r.duplicate ? '↷' : '✗'} ${r.file}: ${r.error}`);
+        }
+      }
+      newLowCount += outcome.newLowRatings.length; // キュー追加は取込tx内 (lib側) で完了済み
+
+      try {
+        if (outcome.status === 'ok' || outcome.status === 'duplicate') {
+          const ym = new Date().toISOString().slice(0, 7);
+          const dest = moveTo(srcPath, path.join(processedRoot, ym));
+          console.log(`    → ${path.relative(incomingDir, dest)}`);
+          if (outcome.status === 'ok') okCount++; else dupCount++;
+        } else {
+          const dest = moveTo(srcPath, failedDir);
+          console.log(`    → ${path.relative(incomingDir, dest)} (要確認)`);
+          failCount++;
+        }
+      } catch (e) {
+        console.error(`  ⚠ ${name}: ファイル移動失敗 (${e.message})。手で移動してください`);
+        if (outcome.status === 'ok' || outcome.status === 'duplicate') okCount++; else failCount++;
+      }
+    }
+    if (!isDryRun) await notifyLowRatings(db);
+  } finally {
+    db.close();
+  }
+
+  console.log(`\n=== summary: ok=${okCount} duplicate=${dupCount} failed=${failCount} 新規低評価=${newLowCount} ===`);
+  process.exitCode = failCount > 0 ? 1 : 0;
+}

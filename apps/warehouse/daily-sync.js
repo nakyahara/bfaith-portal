@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { isLibuvTransientCrash } from '../../lib/libuv-transient-crash.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -127,68 +128,110 @@ function extractErrorSummary(errMsg, maxLen = 1024) {
   return fallback.length > maxLen ? fallback.slice(0, maxLen - 12) + '... [trunc]' : fallback;
 }
 
-function runScript(scriptPath, label, timeoutMs = 600000) {
+/** 一過性 libuv クラッシュ後、再実行するまでの待機 (孫プロセス・ファイルロック・
+ *  進行中リクエストの後始末が終わるのを待つ — Codex Medium 指摘)。
+ *  runScript は同期関数なので Atomics.wait で同期スリープする */
+const LIBUV_RETRY_WAIT_MS = Number(process.env.LIBUV_RETRY_WAIT_MS || 3000);
+function sleepSync(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * 子スクリプトを実行する。
+ *
+ * 一過性 libuv クラッシュ ([[lib/libuv-transient-crash.js]] 参照) の保険として、
+ * `{ retryLibuvCrash: true }` を渡した呼び出しだけ 1 回自動再実行する。
+ *
+ * 🚨 **既定は false (opt-in)。** このクラッシュには「本処理を全部終えてから終了時に abort する」型が
+ *   あるため、再実行すると "完了済みの副作用" がもう一度走る。成功通知を直接送るジョブ
+ *   (sync-to-render.js の `✅ Render同期完了` など) で有効化すると通知が二重に飛ぶ (Codex R3 High)。
+ *   有効化してよいのは **再実行が完全に no-op になると確認済みのジョブだけ**
+ *   (sha256 冪等 / run_id publish / 通知はキュー方式 = 送信済み分は消えている、等)。
+ *
+ * なお本命の対策は各スクリプト側で「通知 fetch 直後の process.exit() をやめる」こと
+ * (#439 monitor-fee-coverage.js / #464 sync-rakuten-review-daily.js / 今回 import-rakuten-review.js)。
+ * こちらは取りこぼし用の保険。
+ *
+ * @param {string} scriptPath - PROJECT_DIR からの相対パス (+ スペース区切り引数)
+ * @param {string} label - ログ・GChat レポート上の表示名
+ * @param {number} [timeoutMs=600000]
+ * @param {object} [opts]
+ * @param {boolean} [opts.retryLibuvCrash=false] - true で一過性 libuv クラッシュ時のみ1回再実行
+ */
+function runScript(scriptPath, label, timeoutMs = 600000, { retryLibuvCrash = false } = {}) {
   const parts = scriptPath.split(' ').filter(Boolean);
   const filePath = path.join(PROJECT_DIR, parts[0]);
   const scriptArgs = parts.slice(1);
   // 旧仕様互換: 引数なしなら '7' を強制 (一部スクリプトが days 指定として受け取る)
   if (scriptArgs.length === 0) scriptArgs.push('7');
   console.log(`\n=== ${label} ===`);
-  const startedAt = Date.now();
-  try {
-    // execFileSync(node, [...]) で直接 node を起動 (cmd.exe を経由しない)
-    // → timeout 時に確実に node 本体が SIGTERM で殺される
-    // (Codex 朝レビュー指摘: execSync("node ...") は Windows で cmd.exe 経由となり、
-    //  shell だけ殺されて孫の node.exe が残り SQLite WAL lock が残存する事故あり)
-    const output = execFileSync(process.execPath, [filePath, ...scriptArgs], {
-      cwd: PROJECT_DIR,
-      timeout: timeoutMs,
-      encoding: 'utf-8',
-      shell: false,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        PATH: process.env.PATH,
-        // 子プロセス側のSQLite busy_timeout を 60秒 に上書き（バッチ用）。
-        // db.js の initDB() がこの env を参照する。
-        WAREHOUSE_DB_BUSY_TIMEOUT_MS: process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS || '60000',
-      },
-      // 大きな stdout でも握りつぶさず確保 (デフォルト 1MB は settlement で超える)
-      maxBuffer: 64 * 1024 * 1024,
-    });
-    console.log(output);
-    const lines = output.trim().split('\n');
-    const lastLine = lines[lines.length - 1] || '';
-    return { success: true, summary: lastLine };
-  } catch (e) {
-    // 観測性 (2026-07-16 障害対応、Codex 指摘 Critical):
-    //   execFileSync 失敗時 e.message は "Command failed: node ..." のみ。子の stdout/stderr・
-    //   exit status・signal は e に別プロパティで残る (捨てられていない)。これらを残さないと
-    //   「timeout kill (signal=SIGTERM) / 子の非ゼロ終了 (status=1) / spawn 失敗 / maxBuffer 超過」
-    //   を後から判別できず、単日の失敗原因が特定不能になる (今回まさにこれで確定できなかった)。
-    const elapsedMs = Date.now() - startedAt;
-    // 子出力は末尾 tail のみ扱う (全量 64MiB を再連結すると失敗処理中にメモリ増幅、Codex R2 #4)。
-    const tail = (s, n) => String(s ?? '').trim().split('\n').slice(-n).join('\n');
-    const errTail = tail(e.stderr, 20);
-    const outTail = tail(e.stdout, 20);
-    const meta = `status=${e.status ?? 'null'} signal=${e.signal ?? 'null'} code=${e.code ?? 'null'} elapsed=${Math.round(elapsedMs / 1000)}s`;
-    const diagLines = [
-      `[${label}] エラー: ${e.message} (${meta})`,
-      errTail && `--- ${label} stderr(tail) ---\n${errTail}`,
-      outTail && `--- ${label} stdout(tail) ---\n${outTail}`,
-    ].filter(Boolean);
-    console.error(diagLines.join('\n'));  // ローカルログには full-ish な tail を残す
-    // GChat summary は message + meta + 子ログ tail を明示構成し ~400 字で cap。
-    //   extractErrorSummary の「Error 始まりの行を優先」に依存すると、子ログが
-    //   `[3/10] Error after 3 retries:` 形式で拾えず meta が落ちる (Codex R2 #5)。→ meta を先頭固定。
-    //   per-job summary を抑えることで、多重失敗時の集約メッセージ肥大 (Codex R2 High #1) も緩和。
-    //   meta を本当に先頭に置く (Codex R3 High): e.message が長い場合でも 400字cap で
-    //   signal/status が落ちないよう、診断上最重要な meta を先頭固定にする。
-    const rootish = errTail || outTail || '';
-    const head = `${meta} | ${e.message}`;
-    let summary = rootish ? `${head}\n${tail(rootish, 6)}` : head;
-    if (summary.length > 400) summary = summary.slice(0, 388) + '… [trunc]';
-    return { success: false, summary };
+  // libuv 一過性クラッシュ時のみ 1 回だけ再実行 (それ以外は従来どおり即失敗)
+  for (let attempt = 1; ; attempt++) {
+    const startedAt = Date.now();
+    try {
+      // execFileSync(node, [...]) で直接 node を起動 (cmd.exe を経由しない)
+      // → timeout 時に確実に node 本体が SIGTERM で殺される
+      // (Codex 朝レビュー指摘: execSync("node ...") は Windows で cmd.exe 経由となり、
+      //  shell だけ殺されて孫の node.exe が残り SQLite WAL lock が残存する事故あり)
+      const output = execFileSync(process.execPath, [filePath, ...scriptArgs], {
+        cwd: PROJECT_DIR,
+        timeout: timeoutMs,
+        encoding: 'utf-8',
+        shell: false,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          PATH: process.env.PATH,
+          // 子プロセス側のSQLite busy_timeout を 60秒 に上書き（バッチ用）。
+          // db.js の initDB() がこの env を参照する。
+          WAREHOUSE_DB_BUSY_TIMEOUT_MS: process.env.WAREHOUSE_DB_BUSY_TIMEOUT_MS || '60000',
+        },
+        // 大きな stdout でも握りつぶさず確保 (デフォルト 1MB は settlement で超える)
+        maxBuffer: 64 * 1024 * 1024,
+      });
+      console.log(output);
+      const lines = output.trim().split('\n');
+      const lastLine = lines[lines.length - 1] || '';
+      // 再実行で通った場合は朝レポートに痕跡を残す (握り潰すと再発に気づけない)
+      return { success: true, summary: attempt > 1 ? `♻️再実行で成功 | ${lastLine}` : lastLine };
+    } catch (e) {
+      // 観測性 (2026-07-16 障害対応、Codex 指摘 Critical):
+      //   execFileSync 失敗時 e.message は "Command failed: node ..." のみ。子の stdout/stderr・
+      //   exit status・signal は e に別プロパティで残る (捨てられていない)。これらを残さないと
+      //   「timeout kill (signal=SIGTERM) / 子の非ゼロ終了 (status=1) / spawn 失敗 / maxBuffer 超過」
+      //   を後から判別できず、単日の失敗原因が特定不能になる (今回まさにこれで確定できなかった)。
+      const elapsedMs = Date.now() - startedAt;
+      // 子出力は末尾 tail のみ扱う (全量 64MiB を再連結すると失敗処理中にメモリ増幅、Codex R2 #4)。
+      const tail = (s, n) => String(s ?? '').trim().split('\n').slice(-n).join('\n');
+      const errTail = tail(e.stderr, 20);
+      const outTail = tail(e.stdout, 20);
+      const meta = `status=${e.status ?? 'null'} signal=${e.signal ?? 'null'} code=${e.code ?? 'null'} elapsed=${Math.round(elapsedMs / 1000)}s${attempt > 1 ? ` attempt=${attempt}` : ''}`;
+      const diagLines = [
+        `[${label}] エラー: ${e.message} (${meta})`,
+        errTail && `--- ${label} stderr(tail) ---\n${errTail}`,
+        outTail && `--- ${label} stdout(tail) ---\n${outTail}`,
+      ].filter(Boolean);
+      console.error(diagLines.join('\n'));  // ローカルログには full-ish な tail を残す
+      // 一過性 libuv クラッシュなら 1 回だけ再実行。ここで診断出力を先に出しているので、
+      // 「1回目で実際に何をやり終えていたか」(取込件数・通知送信など) はログに残る
+      if (attempt === 1 && retryLibuvCrash && isLibuvTransientCrash(e)) {
+        console.error(`[${label}] ↑は Node/Windows の一過性 libuv クラッシュ (UV_HANDLE_CLOSING)。${Math.round(LIBUV_RETRY_WAIT_MS / 1000)}秒待って1回だけ自動再実行します`);
+        sleepSync(LIBUV_RETRY_WAIT_MS);
+        continue;
+      }
+      // GChat summary は message + meta + 子ログ tail を明示構成し ~400 字で cap。
+      //   extractErrorSummary の「Error 始まりの行を優先」に依存すると、子ログが
+      //   `[3/10] Error after 3 retries:` 形式で拾えず meta が落ちる (Codex R2 #5)。→ meta を先頭固定。
+      //   per-job summary を抑えることで、多重失敗時の集約メッセージ肥大 (Codex R2 High #1) も緩和。
+      //   meta を本当に先頭に置く (Codex R3 High): e.message が長い場合でも 400字cap で
+      //   signal/status が落ちないよう、診断上最重要な meta を先頭固定にする。
+      const rootish = errTail || outTail || '';
+      const head = `${meta} | ${e.message}`;
+      let summary = rootish ? `${head}\n${tail(rootish, 6)}` : head;
+      if (summary.length > 400) summary = summary.slice(0, 388) + '… [trunc]';
+      return { success: false, summary };
+    }
   }
 }
 
@@ -748,15 +791,19 @@ async function main() {
     // 自動DL (rakuten-review-download.mjs、fetch-all 05:30) が incoming/rakuten-review/ に置いた
     // CSVを取り込む (新規★1-2は取込内でGChat通知)。対象0件は正常。
     // --days 35 = downloader の直近30日窓+余裕。mirror へは非PII日次集計のみ
+    // retryLibuvCrash: 取込は sha256 冪等 (処理済CSVは processed/ へ移動)、低評価通知はキュー方式
+    // (送信済み分は消えている) で再実行が完全に no-op → 一過性 libuv クラッシュの保険を有効化。
+    // 2026-07-25 までに 4 回踏んでおり、失敗扱いになると直後の mirror sync が丸ごと落ちる
     const rakutenReviewImportResult = runScript(
       `apps/warehouse/import-rakuten-review.js --data-dir ${DATA_DIR_ARG}`,
-      '楽天レビュー 取込', 600000
+      '楽天レビュー 取込', 600000, { retryLibuvCrash: true }
     );
     results.push({ name: '楽天レビュー 取込', ...rakutenReviewImportResult });
     if (rakutenReviewImportResult.success) {
+      // retryLibuvCrash: run_id 単位 publish で冪等、GChat 通知なし → 再実行安全
       const rakutenReviewSyncResult = runScript(
         `apps/warehouse/sync-rakuten-review-daily.js --data-dir ${DATA_DIR_ARG} --days 35`,
-        '楽天レビュー sync', 600000
+        '楽天レビュー sync', 600000, { retryLibuvCrash: true }
       );
       results.push({ name: '楽天レビュー sync', ...rakutenReviewSyncResult });
     } else {
