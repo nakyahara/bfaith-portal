@@ -54,8 +54,12 @@
   </div>
 
   <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
-  <div class="card">
-    <h2>バリエーション</h2>
+  <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
+    <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
+    <p class="muted" style="margin-top:-6px">
+      入力不要です。ネクストエンジンの代表商品コードから自動で判定しています。
+      商品名・税率は<strong>登録時の初期値としてだけ</strong>NEから取り込み、以降はこのアプリの値が正です。
+    </p>
     <% if (variation.kind === 'variation') { %>
       <div style="font-size:13px; margin-bottom:10px;">
         <strong>バリエーションあり</strong> — 代表商品コード
@@ -153,7 +157,7 @@
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
     <!-- 基本情報 -->
     <div class="card">
-      <h2>基本情報</h2>
+      <h2>✏️ 基本情報 <span class="muted" style="font-weight:400">(入力)</span></h2>
       <div class="field">
         <label>商品コード (NE / 楽天管理番号)</label>
         <!-- 登録後の変更は影響範囲が広い (Notionカード・NE突合のキー) ので表示専用。クリックでコピー -->
@@ -218,7 +222,7 @@
 
     <!-- 参考URL -->
     <div class="card">
-      <h2>参考URL (公式ページ以外の参照元)</h2>
+      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span></h2>
       <% if (refs.length === 0) { %>
         <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
       <% } %>
@@ -240,7 +244,7 @@
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
     <!-- Yahoo!向け追記項目 -->
     <div class="card">
-      <h2>Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(楽天→Yahoo移行で使用)</span></h2>
+      <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
           <label>Yahoo!売価 (税込・円)</label>
@@ -257,7 +261,7 @@
           <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
         </div>
         <div style="flex:1">
-          <label>税率</label>
+          <label>税率 <span class="muted">(登録時にNEから初期値)</span></label>
           <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
         </div>
       </div>
@@ -359,7 +363,7 @@
 
   <!-- 画像 -->
   <div class="card">
-    <h2>商品画像 (Driveリンク)</h2>
+    <h2>✏️ 商品画像 (Driveリンク)</h2>
     <div style="display:flex; gap:8px; margin-bottom:12px;">
       <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
       <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
@@ -384,7 +388,7 @@
 
   <!-- 仕様表 -->
   <div class="card">
-    <h2>仕様表 (サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</h2>
+    <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span></h2>
     <table class="list" style="margin-bottom:12px;">
       <% if (specs.length > 0) { %>
         <thead><tr><th style="width:200px">項目</th><th>値</th><th style="width:70px"></th></tr></thead>
@@ -407,9 +411,12 @@
   </div>
 
   <!-- AI出力 -->
-  <div class="card">
-    <h2>タイトル・説明文</h2>
-    <p class="muted" style="margin-top:-6px">「生成待ち」にすると夜間バッチが AI で下書きを作ります (P2 で稼働予定)。手で書く/直すこともできます。</p>
+  <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
+    <h2>🤖 AIが書く項目 <span class="muted" style="font-weight:400">(タイトル・説明文)</span></h2>
+    <p class="muted" style="margin-top:-6px">
+      <strong>ここは手で埋めなくて構いません。</strong>「生成待ち」にすると AI が下書きを作ります (P2 で稼働予定)。
+      できあがったものを直すのは自由です。
+    </p>
     <%
       const aiLabels = {
         rakuten_title: '楽天タイトル',

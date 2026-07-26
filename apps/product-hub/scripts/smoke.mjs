@@ -535,6 +535,63 @@ check('notion claim: ne_code が変わっていたら claim できない', raceC
 db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(raceId);
 db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'SOLO-1'`).run();
 
+// ─── NE 初期値 (商品名・税率のみ。配送方法/在庫/JANは対象外) ───
+check('taxToPercent: 小数(0.1)→10', vari.taxToPercent(0.1) === 10);
+check('taxToPercent: 百分率(10)→10', vari.taxToPercent(10) === 10);
+check('taxToPercent: 8%系も両形式', vari.taxToPercent(0.08) === 8 && vari.taxToPercent(8) === 8);
+check('taxToPercent: 0/null は未設定扱い (誤った0%をYahooへ流さない)',
+  vari.taxToPercent(0) === null && vari.taxToPercent(null) === null);
+
+db.prepare(`UPDATE mirror_products SET 商品名 = ?, 消費税率 = ? WHERE 商品コード = 'SOLO-1'`).run('NE側の商品名', 0.1);
+const nd = vari.getNeDefaults(db, 'SOLO-1');
+check('getNeDefaults: 商品名と税率を返す', nd && nd.name === 'NE側の商品名' && nd.taxPercent === 10, JSON.stringify(nd));
+check('getNeDefaults: 大小/空白ゆらぎ吸収', vari.getNeDefaults(db, ' solo-1 ')?.taxPercent === 10);
+db.prepare(`UPDATE mirror_products SET 消費税率 = 0 WHERE 商品コード = 'SOLO-1'`).run();
+check('getNeDefaults: NE税率0%は初期値にしない (空欄で人に設定させる)',
+  vari.getNeDefaults(db, 'SOLO-1').taxPercent === null);
+db.prepare(`UPDATE mirror_products SET 消費税率 = 0.1 WHERE 商品コード = 'SOLO-1'`).run();
+check('getNeDefaults: NEに無ければ null', vari.getNeDefaults(db, 'NOT-IN-NE-XYZ') === null);
+check('taxToPercent: 想定外の値は推測せず null (1 / 0.8 / 1000)',
+  vari.taxToPercent(1) === null && vari.taxToPercent(0.8) === null && vari.taxToPercent(1000) === null);
+// 丸めてから照合すると 9.6→10% のように誤税率が通る (Codex R2 high)
+check('taxToPercent: 近い値でも丸めて通さない (9.6 / 7.6 / 0.096)',
+  vari.taxToPercent(9.6) === null && vari.taxToPercent(7.6) === null && vari.taxToPercent(0.096) === null,
+  JSON.stringify([vari.taxToPercent(9.6), vari.taxToPercent(7.6), vari.taxToPercent(0.096)]));
+check('taxToPercent: 浮動小数の誤差は許容 (0.1→10 / 0.08→8)',
+  vari.taxToPercent(0.1) === 10 && vari.taxToPercent(0.08) === 8);
+check('taxToPercent: 許可は8%/10%のみ', JSON.stringify(vari.ALLOWED_TAX_PERCENTS) === '[8,10]');
+
+// 画面と登録で同じ規則にする: 代表行が無く子SKU行だけでも初期値が取れる (Codex medium-4)
+db.prepare(`UPDATE mirror_products SET 商品名 = ?, 消費税率 = ? WHERE 商品コード = 'rooms-l-bk'`).run('ルームズ子SKU', 0.08);
+const rd = vari.resolveNeDefaults(db, 'rooms-l-bk');
+check('resolveNeDefaults: 代表コード行が無くても子SKUで補える',
+  rd && rd.name === 'ルームズ子SKU' && rd.taxPercent === 8, JSON.stringify(rd));
+// 代表コード自体は NE に商品として存在しない (365種中338種) ので初期値は取れない。
+// どの子SKUの名前を採るかは決められないため、推測せず null にする。
+// 画面(GET)も登録(POST)も **入力されたコード** で引くので結果は必ず一致する
+check('resolveNeDefaults: 実在しない代表コード指定は null (推測しない)',
+  vari.resolveNeDefaults(db, 'rooms') === null);
+check('resolveNeDefaults: NEに無ければ null', vari.resolveNeDefaults(db, 'NOT-IN-NE-XYZ') === null);
+
+// 正規化後に重複する行があるとき、値が割れていたら採用しない (Codex R3 high)
+insProd.run(9101, 'DUPTAX', '重複その1', null);
+db.prepare(`UPDATE mirror_products SET 商品名 = ?, 消費税率 = ? WHERE product_id = 9101`).run('名前A', 0.1);
+insProd.run(9102, ' duptax ', '重複その2', null);
+db.prepare(`UPDATE mirror_products SET 商品名 = ?, 消費税率 = ? WHERE product_id = 9102`).run('名前B', 0.08);
+const dt = vari.getNeDefaults(db, 'DUPTAX');
+check('getNeDefaults: 重複行で値が割れたら採用しない (不定な税率をYahooへ流さない)',
+  dt && dt.name === null && dt.taxPercent === null, JSON.stringify(dt));
+// 全行が一致していれば採用してよい
+db.prepare(`UPDATE mirror_products SET 商品名 = '名前A', 消費税率 = 0.1 WHERE product_id = 9102`).run();
+const dt2 = vari.getNeDefaults(db, 'DUPTAX');
+check('getNeDefaults: 重複でも全行一致なら採用', dt2.name === '名前A' && dt2.taxPercent === 10, JSON.stringify(dt2));
+// 片方だけ値がある (10% / 未設定、名前あり / 空欄) も「一致」とみなさない (Codex R4 high)
+db.prepare(`UPDATE mirror_products SET 商品名 = NULL, 消費税率 = 0 WHERE product_id = 9102`).run();
+const dt3 = vari.getNeDefaults(db, 'DUPTAX');
+check('getNeDefaults: 片方が空欄/未設定でも一致扱いにしない',
+  dt3 && dt3.name === null && dt3.taxPercent === null, JSON.stringify(dt3));
+db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9101, 9102)`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;

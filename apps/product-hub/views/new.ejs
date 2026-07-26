@@ -55,8 +55,12 @@
     try {
       const res = await fetch('/apps/product-hub/api/variation?ne_code=' + encodeURIComponent(code));
       const j = await res.json();
+      // 応答が返る頃には別のコードが入力されているかもしれない。
+      // 古い応答で上書きしないよう、現在の入力と一致するときだけ反映する (Codex medium-2)
+      if (neInput.value.trim() !== code) return;
       if (!j.ok) { hint.textContent = ''; return; }
       hint.innerHTML = '';
+      applyNeDefaults(j.neDefaults);
       if (j.kind === 'variation' && j.isChild) {
         // 既定でまとめる (中原さん方針)。確認は挟まないが、**入力欄をその場で代表コードに書き換える**。
         // 送信時にサーバー側だけで正規化すると、子SKU向けに書いた商品名のまま代表ページと
@@ -86,6 +90,35 @@
     } catch (e) {
       hint.textContent = '';
     }
+  }
+
+  // NE商品マスタから **初期値だけ** 入れる (中原さん決定 2026-07-25)。
+  // 以降はアプリが正なので、人が既に書いた値は絶対に上書きしない。
+  // 税率は登録APIが draft_yahoo に入れる (この画面に欄が無いため)。
+  let lastAutoName = null; // 直前に自動入力した値。人の編集と区別するために覚えておく
+
+  function applyNeDefaults(ne) {
+    const noteId = 'ne-default-note';
+    document.getElementById(noteId)?.remove();
+    const nameInput = document.getElementById('f-name');
+    const current = nameInput.value.trim();
+    // 空 or「前回の自動入力値のまま」なら差し替えてよい。
+    // 人が手を入れていたら触らない (Codex medium-3: 別商品の自動値が残るのも防ぐ)
+    const replaceable = current === '' || (lastAutoName !== null && current === lastAutoName);
+    if (!replaceable) return;
+    if (!ne || !ne.name) {
+      // NE に無いコードへ変えたら、前回の自動入力値は消す (別商品の名前を残さない)
+      if (current !== '' && current === lastAutoName) { nameInput.value = ''; lastAutoName = null; }
+      return;
+    }
+    nameInput.value = ne.name;
+    lastAutoName = ne.name;
+    const note = document.createElement('div');
+    note.id = noteId;
+    note.className = 'muted';
+    note.style.marginTop = '4px';
+    note.textContent = 'NE商品マスタから初期値を入れました。売り場向けに直して構いません。';
+    nameInput.insertAdjacentElement('afterend', note);
   }
 
   btn.addEventListener('click', async () => {
