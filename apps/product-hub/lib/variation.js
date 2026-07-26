@@ -21,6 +21,76 @@
 /** @typedef {'unknown'|'single'|'variation'|'conflict'|'detached'} VariationKind */
 
 /**
+ * mirror_products.消費税率 は **小数** (0.1 = 10%) で持つ。
+ * (aupay/linegift/amazon-accounting が揃って `* 100` している / 書き込み側は `/ 100`)
+ * ただし取り込み経路によっては百分率が入る余地があるので両方を吸収する。
+ */
+export const ALLOWED_TAX_PERCENTS = [8, 10];
+
+export function taxToPercent(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null; // 0 は「未設定」として扱う (下記 §初期値 参照)
+  const pct = n < 1 ? n * 100 : n;
+  // 大小だけでは 1 (=100% or 1%) や 0.8 (=80% or 0.8%) を判別できない (Codex low)。
+  // これは「新規出品の初期値」なので、現行の消費税率だけを許可し、
+  // それ以外は推測せず null (= 人が設定する) に倒す。
+  // ⚠️ 丸めてから照合すると 9.6 → 10% のように誤った値が通る (Codex R2 high) ので厳密一致。
+  //    0.1*100 = 10.000000000000002 になる浮動小数の誤差だけを許容する
+  return ALLOWED_TAX_PERCENTS.find((p) => Math.abs(pct - p) < 1e-6) ?? null;
+}
+
+/**
+ * 新規登録時の初期値として NE 商品マスタから引く値 (中原さん決定 2026-07-25)。
+ *   商品名 … 初期値として入れる。以降はアプリが正 (売り場向けに整えるため)
+ *   税率   … 初期値として入れる。以降はアプリで編集
+ * 配送方法・在庫数・JAN は対象外 (配送方法=アプリ内設定 / 在庫=登録時0で後から在庫連携 / JAN=手入力)。
+ * @returns {{name: string|null, taxPercent: number|null}|null} NE に無ければ null
+ */
+export function getNeDefaults(db, neCode) {
+  const code = String(neCode == null ? '' : neCode).trim();
+  if (!code || !mirrorReady(db)) return null;
+  let rows;
+  try {
+    rows = db.prepare('SELECT 商品名, 消費税率 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').all(norm(code));
+  } catch (_) {
+    return null;
+  }
+  if (rows.length === 0) return null;
+
+  // 正規化後に重複する行がありうる (kind='conflict' と同じ状況)。
+  // `.get()` で任意の1行を採ると、行ごとに税率が違うとき不定な値が Yahoo 初期値になる
+  // (Codex R3 high) → **全行が一致する項目だけ**採用し、割れていたら null にする
+  // null も比較に含める: 除外すると「10% / 未設定」を一致とみなして
+  // 片方の値を採ってしまう (Codex R4 high)。全行が完全に同じときだけ採用する
+  const agreed = (pick) => {
+    const vals = new Set(rows.map(pick));
+    if (vals.size !== 1) return null;
+    return [...vals][0] ?? null;
+  };
+  const name = agreed((r) => (r.商品名 && String(r.商品名).trim() !== '' ? String(r.商品名).trim() : null));
+  const taxPercent = agreed((r) => taxToPercent(r.消費税率));
+  return { name, taxPercent };
+}
+
+/**
+ * 画面 (GET /api/variation) と登録 (POST /api/drafts) で **同じ規則**で初期値を決める。
+ * 別々に書くと、代表コードの行が無く子SKU行だけある NE データで
+ * 「画面には出るが登録時は空」というズレが出る (Codex medium-4)。
+ * 代表コード行を優先し、**項目ごとに**空なら入力コード側で補う。
+ */
+export function resolveNeDefaults(db, inputCode) {
+  const v = resolveVariationGroup(db, inputCode, { withMembers: false });
+  const primary = getNeDefaults(db, v.groupKey);
+  const fallback = getNeDefaults(db, inputCode);
+  if (!primary && !fallback) return null;
+  return {
+    name: primary?.name ?? fallback?.name ?? null,
+    taxPercent: primary?.taxPercent ?? fallback?.taxPercent ?? null,
+  };
+}
+
+/**
  * その商品コードが「どこかのドラフトでバリエーションから外された」ものか。
  * 外した SKU を別ページにしたい場合はそのコードで新規登録する運用なので、
  * ここに載っているコードは自動まとめの対象から除く (2026-07-25 中原さん方針)。

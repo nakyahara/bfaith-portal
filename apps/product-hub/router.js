@@ -20,7 +20,7 @@ import {
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -225,6 +225,16 @@ router.post('/api/drafts', async (req, res) => {
       const id = Number(info.lastInsertRowid);
       logEvent(db, id, 'created', effectiveCode, actorOf(req));
       if (groupedFrom) logEvent(db, id, 'grouped_on_create', `${groupedFrom} → ${effectiveCode}`, actorOf(req));
+      // NE の税率を初期値として入れる (中原さん決定: 初期値だけ。以降はアプリで編集)。
+      // **作成と同じトランザクション**に入れる: 分けると失敗時に「ドラフトはあるが税率なし」で
+      // 再送すると商品コード重複 409 になり復旧しづらい (Codex high-1)。
+      // ⚠️ NE 税率 0%/想定外値は入れない (誤った税率が Yahoo へ流れる方が危険) → taxToPercent が null を返す
+      // 画面側と同じ **入力されたコード** で引く。effectiveCode (正規化後の代表コード) で引くと、
+      // 代表コード行が NE に無い場合 (365種中338種) に画面では出て登録時は空、というズレになる
+      const neDefaults = resolveNeDefaults(db, neCode);
+      if (neDefaults?.taxPercent) {
+        upsertDraftYahoo(db, id, { tax_rate: `${neDefaults.taxPercent}%` });
+      }
       return { id, effectiveCode, groupedFrom, memberCount: vari.memberCount };
     } catch (e) {
       if (!String(e.message).includes('UNIQUE')) throw e;
@@ -512,12 +522,15 @@ router.post('/api/notion-retry-all', async (req, res) => {
 router.get('/api/variation', (req, res) => {
   const code = cleanText(req.query?.ne_code, 100);
   if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
-  const info = resolveVariationGroup(getDB(), code);
+  const db = getDB();
+  const info = resolveVariationGroup(db, code);
   res.json({
     ok: true,
     kind: info.kind, groupKey: info.groupKey, isChild: info.isChild,
     memberCount: info.memberCount,
     members: info.members.slice(0, 60).map((m) => ({ code: m.商品コード, name: m.商品名, status: m.取扱区分 })),
+    // 新規登録画面が初期値として使う (商品名・税率のみ)
+    neDefaults: resolveNeDefaults(db, code),
   });
 });
 
