@@ -21,6 +21,37 @@
     <a class="btn btn-primary" href="/apps/product-hub/new">＋ 新規登録</a>
   </div>
 
+  <!-- NE商品コードからの一括登録 -->
+  <div class="card" style="margin-bottom:14px; border-color:#bae6fd;">
+    <details>
+      <summary style="cursor:pointer; font-size:14px; font-weight:600;">
+        商品コードから一括登録
+        <% if (intake.pending > 0 && intake.initialized) { %>
+          <span class="muted" style="font-weight:400">／ NEに未取込の新商品 <%= intake.pending %> 件</span>
+        <% } %>
+      </summary>
+      <p class="muted" style="margin:10px 0;">
+        NE商品マスタにある商品コードを貼り付けると、ドラフトをまとめて作ります。
+        <strong>バリエーションは代表商品コード単位で1件にまとまります</strong>（楽天は1ページ＝代表コード単位のため）。
+        商品名・税率はNEから初期値が入ります。
+        （一度に最大 <%= maxRegisterCodes %> 件。改行またはカンマ区切り）
+      </p>
+      <textarea id="reg-codes" rows="5" placeholder="sgs-or&#10;sgs-cm&#10;flaxseed" style="width:100%; font-family:monospace; font-size:13px;"></textarea>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+        <button class="btn" id="reg-preview-btn">先に確認する</button>
+        <button class="btn btn-primary" id="reg-run-btn">登録する</button>
+        <span class="muted" id="reg-result"></span>
+      </div>
+      <div id="reg-detail" style="margin-top:10px;"></div>
+    </details>
+  </div>
+
+  <% if (!notionCardEnabled) { %>
+    <p class="muted" style="margin:-6px 0 14px; font-size:12px;">
+      ℹ️ Notionカードの自動作成は停止中です（新商品はこのアプリが起点）。
+    </p>
+  <% } %>
+
   <!-- 検証用: Notion 既存カードの選択取り込み (読み取り専用) -->
   <div class="card" style="margin-bottom:14px;">
     <details>
@@ -187,6 +218,60 @@
       importBtn.disabled = false;
       importBtn.textContent = '取り込む';
     }
+  });
+
+  // ─── 商品コードから一括登録 ───
+  const REG_LABELS = {
+    created: '新規ドラフト',
+    merged: '既存にまとまる',
+    not_in_ne: 'NE商品マスタに無い',
+  };
+  async function runRegister(dryRun) {
+    const codes = document.getElementById('reg-codes').value;
+    const out = document.getElementById('reg-result');
+    if (!codes.trim()) { out.textContent = '商品コードを入力してください'; return; }
+    const btns = [document.getElementById('reg-preview-btn'), document.getElementById('reg-run-btn')];
+    btns.forEach(function (b) { b.disabled = true; });
+    out.textContent = dryRun ? '確認中…' : '登録中…';
+    document.getElementById('reg-detail').innerHTML = '';
+    try {
+      const res = await fetch('/apps/product-hub/api/register-codes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ codes: codes, dry_run: dryRun }),
+      });
+      const j = await res.json();
+      if (!j.ok) { out.textContent = 'エラー: ' + (j.error || '不明'); return; }
+      const s = j.summary;
+      out.textContent = (dryRun ? '【確認】' : '') + '新規 ' + s.created + ' / 既存にまとまる ' + s.merged
+        + ' / NEに無い ' + s.not_in_ne + '（' + j.results.length + ' コード）';
+
+      const rows = j.results.map(function (r) {
+        var note = '';
+        if (r.groupKey && r.groupKey !== r.code) note = '→ ' + r.groupKey + ' にまとめ';
+        if (r.outcome === 'created' && r.name) note = (note ? note + ' / ' : '') + r.name;
+        if (r.outcome === 'created' && dryRun && r.taxPercent == null) {
+          note = (note ? note + ' / ' : '') + '⚠️税率はNE未設定のため空欄';
+        }
+        var link = Number.isSafeInteger(r.draftId)
+          ? '<a href="/apps/product-hub/detail/' + r.draftId + '">開く</a>' : '';
+        return '<tr><td><code>' + escapeHtml(r.code) + '</code></td><td>'
+          + escapeHtml(REG_LABELS[r.outcome] || r.outcome) + '</td><td class="muted">'
+          + escapeHtml(note) + '</td><td>' + link + '</td></tr>';
+      }).join('');
+      document.getElementById('reg-detail').innerHTML =
+        '<table class="list"><tbody>' + rows + '</tbody></table>';
+      if (!dryRun && s.created > 0) setTimeout(function () { location.reload(); }, 2500);
+    } catch (e) {
+      out.textContent = '通信エラー: ' + e.message;
+    } finally {
+      btns.forEach(function (b) { b.disabled = false; });
+    }
+  }
+  document.getElementById('reg-preview-btn').addEventListener('click', function () { runRegister(true); });
+  document.getElementById('reg-run-btn').addEventListener('click', function () {
+    if (!confirm('入力した商品コードのドラフトを作成します。よろしいですか?')) return;
+    runRegister(false);
   });
 
   function escapeHtml(s) {

@@ -21,6 +21,18 @@ import { getDB, logEvent, canWriteToNotion } from '../db.js';
 const STALE_CREATING_MS = 30 * 60 * 1000;
 const ERROR_MAX_LEN = 500;
 
+/**
+ * Notion カード連携を行うか。**既定 OFF** (2026-07-25 中原さん決定: Notion を切る)。
+ * 中原さんが Notion 側の「新商品が入ってきたらカードを作成する処理」を止めたため、
+ * アプリからも作らない。コードは残してあるので env で戻せる。
+ * ⚠️ OFF の間、RYS は Notion 経由で Yahoo 項目を得られない = 新商品は Yahoo に出せない。
+ *    Yahoo 展開には要件定義 §12 のアダプタ (draft_yahoo → RYS) が別途必要。
+ */
+const ON = new Set(['1', 'true', 'on', 'yes']);
+export function isNotionCardEnabled() {
+  return ON.has(String(process.env.PH_NOTION_CARD_ENABLED ?? '').trim().toLowerCase());
+}
+
 function defaultNotionStatus() {
   // RYS のページ自動作成と同じ既定 (新規商品の入口ステータス)。env で差し替え可
   return process.env.PH_NOTION_STATUS_DEFAULT || '⓪新規商品_高島';
@@ -58,6 +70,7 @@ export function buildProperties(draft) {
  */
 export async function syncCardLinks(draftId, { actor = null } = {}) {
   const db = getDB();
+  if (!isNotionCardEnabled()) return { outcome: 'disabled' };
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { outcome: 'not_found' };
   // fail-closed: portal 起点だけ書き戻す。取り込み由来 (Notion が正) はここで抜ける
@@ -102,6 +115,7 @@ function truncateError(e) {
  */
 export async function attemptCardCreation(draftId, { actor = null } = {}) {
   const db = getDB();
+  if (!isNotionCardEnabled()) return { outcome: 'disabled' };
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { outcome: 'not_found' };
   // fail-closed: portal 起点だけ作成対象。取り込み由来は既に Notion にカードが在る (取り込み元がそれ)
@@ -194,6 +208,7 @@ export async function attemptCardCreation(draftId, { actor = null } = {}) {
  * Notion client 側の rate limiter (350ms) が pacing するので直列 await でよい。
  */
 export async function retryPendingCards({ actor = null, limit = 50 } = {}) {
+  if (!isNotionCardEnabled()) return [];
   const db = getDB();
   const staleBefore = new Date(Date.now() - STALE_CREATING_MS).toISOString();
   const targets = db.prepare(`
@@ -215,6 +230,7 @@ export async function retryPendingCards({ actor = null, limit = 50 } = {}) {
 
 /** 画面バナー用: 未作成件数 */
 export function pendingCardCount() {
+  if (!isNotionCardEnabled()) return 0; // 連携OFF中はバナーで急かさない
   const db = getDB();
   return db.prepare(`
     SELECT COUNT(*) AS c FROM product_drafts

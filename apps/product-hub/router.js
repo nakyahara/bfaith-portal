@@ -18,10 +18,11 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
-import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks } from './services/notion-card.js';
+import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
+import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -123,6 +124,9 @@ router.get('/', (req, res) => {
     statuses: DRAFT_STATUSES, statusLabels: STATUS_LABELS,
     notionPending: pendingCardCount(),
     maxImportCodes: MAX_IMPORT_CODES,
+    maxRegisterCodes: MAX_REGISTER_CODES,
+    intake: intakeStatus(),
+    notionCardEnabled: isNotionCardEnabled(),
   });
 });
 
@@ -613,6 +617,48 @@ router.post('/api/drafts/:id/regroup', (req, res) => {
   });
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
   res.json({ ok: true, ne_code: r.ne_code });
+});
+
+// ─── API: NE商品コードからの一括登録 / 新商品の自動取込 ──────
+
+// 商品コードを貼り付けて一括でドラフトを作る。バリエーションは代表コード単位にまとまる。
+// Notion カードは作らない (2026-07-25 方針)。
+router.post('/api/register-codes', (req, res) => {
+  const codes = parseNeCodes(req.body?.codes);
+  if (codes.length === 0) return res.status(400).json({ ok: false, error: '商品コードを1件以上入力してください' });
+  if (codes.length > MAX_REGISTER_CODES) {
+    return res.status(400).json({ ok: false, error: `一度に登録できるのは ${MAX_REGISTER_CODES} 件までです (指定: ${codes.length} 件)` });
+  }
+  const r = registerByCodes(codes, { actor: actorOf(req), dryRun: req.body?.dry_run === true });
+  if (!r.ok) {
+    const msg = {
+      mirror_unavailable: 'NE商品マスタを参照できません (時間をおいて再試行してください)',
+      ne_unique_not_enforced: '商品コードの重複 (大文字小文字違い) があるため登録を停止しています。管理者にご連絡ください',
+      no_codes: '商品コードを1件以上入力してください',
+      too_many_codes: `一度に登録できるのは ${MAX_REGISTER_CODES} 件までです`,
+    }[r.error] || r.error;
+    return res.status(400).json({ ok: false, error: msg });
+  }
+  res.json(r);
+});
+
+// 新商品の自動取込を手動で走らせる (cron と同じ処理)。
+// 初回シード = カットオフの確定は影響が大きいので admin 限定 (Codex 補足指摘)
+router.post('/api/intake/run', (req, res) => {
+  if (req.session?.role !== 'admin') {
+    return res.status(403).json({ ok: false, error: '自動取込の実行は管理者のみです' });
+  }
+  const r = syncNewProducts({ dryRun: req.body?.dry_run === true, actor: actorOf(req) });
+  if (!r.ok) {
+    const msg = {
+      mirror_unavailable: 'NE商品マスタを参照できません',
+      mirror_empty: 'NE商品マスタが空です (miniPCからの同期待ち)',
+      mirror_too_small: `NE商品マスタの件数が少なすぎます (${r.singles}件 < ${r.minRequired}件)。同期途中の可能性があるため実行しません`,
+      ne_unique_not_enforced: '商品コードの重複 (大文字小文字違い) があるため停止しています',
+    }[r.error] || r.error;
+    return res.status(400).json({ ok: false, error: msg });
+  }
+  res.json(r);
 });
 
 // ─── API: Notion 取り込み (検証用の選択インポート) ──────────

@@ -197,6 +197,25 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_draft_vari_excl_draft ON draft_variation_exclusions(draft_id);
 
+    -- NE で「見たことがある商品コード」の記録 (2026-07-25: 新商品の自動取込)。
+    -- ⚠️ これが無いと「mirror にあって product_drafts に無いコード」= 取扱中3,723件が全部
+    --    新商品として流れ込む。初回実行では**全件をここに登録するだけでドラフトは作らず**、
+    --    2回目以降に現れた未知コードだけを「今日以降の新商品」として扱う (カットオフ)。
+    CREATE TABLE IF NOT EXISTS ph_ne_seen_codes (
+      code_key      TEXT PRIMARY KEY,   -- LOWER(TRIM(商品コード))
+      ne_code       TEXT NOT NULL,
+      draft_id      INTEGER,            -- 取り込んだ先のドラフト (NULL = 初回シード)
+      first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
+    -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
+    -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
+    CREATE TABLE IF NOT EXISTS ph_intake_state (
+      key   TEXT PRIMARY KEY,
+      value TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS draft_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id   INTEGER NOT NULL,
