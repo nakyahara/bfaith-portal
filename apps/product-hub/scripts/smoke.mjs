@@ -110,6 +110,10 @@ db.prepare(`UPDATE product_drafts SET status = 'draft' WHERE id = ?`).run(draft.
 // ─── notion-card fail-closed (env 未設定 → failed で残り、登録は無事) ───
 delete process.env.RYS_NOTION_TOKEN;
 const notionCard = await import('../services/notion-card.js');
+// 既定 OFF (2026-07-25) の確認と、以降のテストのための ON 切替
+check('notion連携は既定OFF', notionCard.isNotionCardEnabled() === false);
+check('OFF中は disabled を返す', (await notionCard.attemptCardCreation(draft.id, {})).outcome === 'disabled');
+process.env.PH_NOTION_CARD_ENABLED = '1'; // ここから下は「ONのときの内部動作」の検証
 
 // buildProperties: 公式URL/Amazon URL が url 型プロパティで含まれる (2026-07-05 修正の回帰チェック)
 const props = notionCard.buildProperties({
@@ -592,6 +596,102 @@ check('getNeDefaults: 片方が空欄/未設定でも一致扱いにしない',
   dt3 && dt3.name === null && dt3.taxPercent === null, JSON.stringify(dt3));
 db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9101, 9102)`).run();
 
+// ─── 新商品の自動取込 / 商品コードからの一括登録 ───
+process.env.PH_NOTION_CARD_ENABLED = ''; // 本番と同じ既定OFFで検証
+const intake = await import('../services/new-product-intake.js');
+
+// mirror に「新商品」を用意 (sgs 型のバリエーション + 単品)
+const insP = db.prepare(`INSERT OR REPLACE INTO mirror_products
+  (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, 消費税率, updated_at)
+  VALUES (?, ?, ?, '単品', '取扱中', 'ok', ?, ?, '2026-07-25T00:00:00Z')`);
+insP.run(9201, 'sgs-or', 'メガネストラップ オレンジ', 'sgs', 0.1);
+insP.run(9202, 'sgs-bk', 'メガネストラップ ブラック', 'sgs', 0.1);
+insP.run(9203, 'flaxseed', 'アマニシード 100g', null, 0.1);
+insP.run(9204, 'notaxprod', '税率未設定商品', null, 0);
+
+// mirror が痩せている (同期途中の疑い) 間はシードもintakeも拒否 (Codex critical-2)
+check('intake: 件数が下限未満ならシードしない',
+  intake.syncNewProducts({}).error === 'mirror_too_small');
+// 一括登録で seen に書かれても「シード済み」と誤認しない (Codex critical-1)
+// (この時点で ph_ne_seen_codes は空でないかもしれないが、状態キーが無い限り seed モードのまま)
+db.prepare(`INSERT OR IGNORE INTO ph_ne_seen_codes (code_key, ne_code) VALUES ('manual-1', 'MANUAL-1')`).run();
+check('intake: seen に行があってもシード未了なら intake モードに入らない',
+  intake.syncNewProducts({}).error === 'mirror_too_small' && intake.intakeStatus().initialized === false);
+db.prepare(`DELETE FROM ph_ne_seen_codes WHERE code_key = 'manual-1'`).run();
+
+// 下限を満たすダミー行を入れてからシードする
+const fillStmt = db.prepare(`INSERT OR REPLACE INTO mirror_products
+  (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at)
+  VALUES (?, ?, ?, '単品', '取扱中', 'ok', '2026-07-25T00:00:00Z')`);
+for (let i = 0; i < intake.MIN_SEED_SINGLES; i++) fillStmt.run(50000 + i, `FILL-${i}`, `既存商品${i}`);
+
+// 初回は「シードだけ」= 既存商品が大量にドラフト化されない (カットオフ)
+const seedDry = intake.syncNewProducts({ dryRun: true });
+check('intake: 初回は seed モード', seedDry.mode === 'seed' && seedDry.created === 0, JSON.stringify(seedDry));
+const draftsBefore = db.prepare('SELECT COUNT(*) c FROM product_drafts').get().c;
+const seeded = intake.syncNewProducts({});
+check('intake: 初回シードでドラフトを作らない',
+  seeded.mode === 'seed' && seeded.created === 0
+  && db.prepare('SELECT COUNT(*) c FROM product_drafts').get().c === draftsBefore,
+  JSON.stringify(seeded));
+check('intake: シード後は初期化済み (状態キーで判定)',
+  intake.intakeStatus().initialized === true
+  && !!db.prepare(`SELECT value FROM ph_intake_state WHERE key='seed_completed_at'`).get()?.value);
+
+// 2回目以降: 新しく現れたコードだけが対象
+const again = intake.syncNewProducts({});
+check('intake: 変化が無ければ何も作らない', again.mode === 'intake' && again.created === 0, JSON.stringify(again));
+
+insP.run(9205, 'newitem1', '新商品その1', null, 0.1);
+insP.run(9206, 'sgs-gr', 'メガネストラップ グリーン', 'sgs', 0.1); // 既存グループの追加色
+const run2 = intake.syncNewProducts({});
+// newitem1 は単品新商品 → 1件。sgs-gr は既存グループの追加色だが、グループのドラフトが
+// まだ無い (シードはドラフトを作らない) ので sgs のドラフトが1件できる = 人に見える。計2件
+check('intake: 新商品ぶんだけドラフトを作る (単品1 + 新色でグループ1)',
+  run2.created === 2
+  && run2.drafts.some((d) => d.ne_code === 'newitem1')
+  && run2.drafts.some((d) => d.ne_code === 'sgs' && d.from === 'sgs-gr'),
+  JSON.stringify(run2));
+check('intake: グループのドラフトは代表コード1件だけ',
+  db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'sgs'`).get().c === 1);
+// 一括登録テストは「グループのドラフトが無い」状態から始めたいので一旦消す
+db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'sgs'`).run();
+check('intake: 作ったドラフトに created_by が付く',
+  db.prepare(`SELECT created_by FROM product_drafts WHERE ne_code = 'newitem1'`).get().created_by === 'auto:ne-intake');
+check('intake: NE税率が初期値で入る',
+  db.prepare(`SELECT tax_rate FROM draft_yahoo WHERE draft_id = (SELECT id FROM product_drafts WHERE ne_code='newitem1')`).get()?.tax_rate === '10%');
+
+// ── 一括登録 (人が明示実行。カットオフと無関係) ──
+const dry = intake.registerByCodes(['sgs-or', 'sgs-bk', 'flaxseed', 'ZZZ-NOT-IN-NE'], { dryRun: true });
+check('一括登録 dry-run: 7色は代表コードで1件にまとまる',
+  dry.summary.created === 2 && dry.summary.merged === 1 && dry.summary.not_in_ne === 1,
+  JSON.stringify(dry.summary));
+check('一括登録 dry-run: 書き込まない',
+  db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sgs','flaxseed')`).get().c === 0);
+
+const reg = intake.registerByCodes(['sgs-or', 'sgs-bk', 'flaxseed', 'notaxprod', 'ZZZ-NOT-IN-NE'], { actor: 'smoke' });
+check('一括登録: 代表コード単位でドラフトが作られる',
+  db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE LOWER(TRIM(ne_code)) = 'sgs'`).get().c === 1,
+  JSON.stringify(reg.summary));
+check('一括登録: 2件目の同グループは merged',
+  reg.summary.created === 3 && reg.summary.merged === 1 && reg.summary.not_in_ne === 1,
+  JSON.stringify(reg.summary));
+check('一括登録: NE税率0%の商品は税率を入れない (空欄で人が設定)',
+  !db.prepare(`SELECT tax_rate FROM draft_yahoo WHERE draft_id = (SELECT id FROM product_drafts WHERE ne_code='notaxprod')`).get()?.tax_rate);
+check('一括登録: 再実行しても増えない (冪等)',
+  intake.registerByCodes(['sgs-or', 'flaxseed'], { actor: 'smoke' }).summary.created === 0);
+check('一括登録: NotionカードはOFFなので作られない',
+  db.prepare(`SELECT notion_card_status FROM product_drafts WHERE LOWER(TRIM(ne_code))='sgs'`).get().notion_card_status === 'pending'
+  && notionCard.isNotionCardEnabled() === false);
+check('一括登録: 上限を超えたら弾く',
+  intake.registerByCodes(Array.from({ length: intake.MAX_REGISTER_CODES + 1 }, (_, i) => `X-${i}`), {}).error === 'too_many_codes');
+check('一括登録: 空入力は弾く', intake.registerByCodes([], {}).error === 'no_codes');
+
+// 後片付け (後続の render fixture に影響させない)
+db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sgs','flaxseed','notaxprod','newitem1')`).run();
+db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9206`).run();
+db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 50000 AND ${50000 + intake.MIN_SEED_SINGLES}`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -630,10 +730,12 @@ const renders = [
     ],
     counts, statusFilter: null,
     statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: false,
   }],
   ['index.ejs (empty)', 'index.ejs', {
     title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: 'draft',
     statuses, statusLabels, notionPending: 0, maxImportCodes: imp.MAX_IMPORT_CODES,
+    maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: true,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
