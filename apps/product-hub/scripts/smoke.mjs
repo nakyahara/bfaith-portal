@@ -692,6 +692,74 @@ db.prepare(`DELETE FROM product_drafts WHERE LOWER(TRIM(ne_code)) IN ('sgs','fla
 db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 9201 AND 9206`).run();
 db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 50000 AND ${50000 + intake.MIN_SEED_SINGLES}`).run();
 
+// ─── 楽天出品 (P3): payload builder / 属性パース (RMS 非接続) ───
+const listing = await import('../services/rakuten-listing.js');
+
+check('parseAttributes: [{name,values}] を受ける',
+  JSON.stringify(listing.parseAttributes('[{"name":"ブランド名","values":["ノーブランド"]}]'))
+  === '[{"name":"ブランド名","values":["ノーブランド"]}]');
+check('parseAttributes: value 単数形も受けて values に正規化',
+  listing.parseAttributes('[{"name":"原産国／製造国","value":"日本"}]')[0].values[0] === '日本');
+check('parseAttributes: 空JSON → []', JSON.stringify(listing.parseAttributes('')) === '[]');
+check('parseAttributes: 壊れたJSON → null (エラー扱い)', listing.parseAttributes('{oops') === null);
+check('parseAttributes: name欠落 → null', listing.parseAttributes('[{"values":["x"]}]') === null);
+
+// payload builder — 単品ドラフトで組み立て
+const rkId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rk-smoke-1', '出品スモーク商品', 1980)`).run().lastInsertRowid);
+let built = listing.buildItemPayload(db, rkId);
+check('payload: 不足理由を列挙 (ジャンル/画像)',
+  built.ok === false && built.reasons.some((r) => r.includes('ジャンル')) && built.reasons.some((r) => r.includes('画像')),
+  JSON.stringify(built.reasons));
+
+db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
+  VALUES (?, '205761', '[{"name":"ブランド名","values":["ノーブランド品"]}]', NULL)`).run(rkId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
+db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文')`).run(rkId, rkId, rkId);
+db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
+
+built = listing.buildItemPayload(db, rkId);
+check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
+const pl = built.payload;
+check('payload: hideItem=true 固定 (非公開登録のみ)', pl.hideItem === true);
+check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
+check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
+check('payload: 説明文に特徴+仕様表', pl.productDescription.pc.includes('特徴文') && pl.productDescription.pc.includes('サイズ: W10cm'));
+check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
+check('payload: variants は ne_code キー + 属性 + 型番なし例外',
+  pl.variants['rk-smoke-1'].standardPrice === 1980
+  && pl.variants['rk-smoke-1'].articleNumber.exemptionReason === 1
+  && pl.variants['rk-smoke-1'].attributes[0].name === 'ブランド名',
+  JSON.stringify(pl.variants));
+
+// メーカー型番があれば value で送る
+db.prepare(`UPDATE draft_rakuten SET article_number = 'ABC-100' WHERE draft_id = ?`).run(rkId);
+check('payload: 型番があれば value で送る',
+  listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === 'ABC-100');
+
+// バリエーションページ (複数SKU) は未対応として弾く
+db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rk-smoke-1'`).run();
+insProd.run(9301, 'rkv-a', 'バリA', 'rkv');
+insProd.run(9302, 'rkv-b', 'バリB', 'rkv');
+const rkvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rkv', 'バリエページ', 1000)`).run().lastInsertRowid);
+db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '1')`).run(rkvId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'g2', '/x/y.jpg')`).run(rkvId);
+const bv = listing.buildItemPayload(db, rkvId);
+check('payload: バリエーションページは未対応と明示',
+  bv.ok === false && bv.reasons.some((r) => r.includes('バリエーション')), JSON.stringify(bv.reasons));
+db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rkv'`).run();
+db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9301, 9302)`).run();
+
+// toCabinetJpeg: 実画像で 2MB 以下 JPEG になる
+const bigPng = await (await import('sharp')).default({
+  create: { width: 3000, height: 3000, channels: 3, background: { r: 200, g: 100, b: 50 } },
+}).png().toBuffer();
+const jpg = await listing.toCabinetJpeg(bigPng);
+check('toCabinetJpeg: 2MB以下のJPEGに変換', jpg.length <= 2 * 1024 * 1024 && jpg[0] === 0xFF && jpg[1] === 0xD8, `${jpg.length} bytes`);
+
+// extractRmsErrors: RMS 400 の形
+check('extractRmsErrors: errors[] を整形',
+  listing.extractRmsErrors({ errors: [{ code: 'IE0418', message: 'Invalid attribute' }] }).includes('IE0418'));
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -752,6 +820,7 @@ const renders = [
     aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: null,
+    rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null }, cabinetImages: [],
     yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
     imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
   }],
@@ -763,6 +832,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -777,6 +847,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
   // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
@@ -788,6 +859,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (excluded SKU section)', 'detail.ejs', {
@@ -798,6 +870,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (detached SKU)', 'detail.ejs', {
@@ -808,6 +881,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
@@ -819,6 +893,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
+    rakuten: null, cabinetImages: [],
     yahoo: null, imageProduction: null,
   }],
 ];

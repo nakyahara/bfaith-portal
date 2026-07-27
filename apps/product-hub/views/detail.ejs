@@ -441,6 +441,62 @@
     <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
   </div>
 
+  <!-- 楽天出品 (P3) -->
+  <div class="card" style="border-color:#fecaca; background:#fffbfa;">
+    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → 公開はRMS画面で)</span></h2>
+    <% if (rakuten && rakuten.registered_at) { %>
+      <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+        ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
+        <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
+        RMS の商品管理で内容を確認し、問題なければ<strong>RMS側で公開</strong>してください。
+      </div>
+    <% } %>
+    <% if (rakuten && rakuten.last_error) { %>
+      <div class="banner-warn" style="margin:0 0 12px; white-space:pre-wrap; font-size:12px;">⚠️ 前回のRMSエラー:
+<%= rakuten.last_error %></div>
+    <% } %>
+
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label class="req">ジャンルID (楽天)</label>
+        <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="例: 205761">
+      </div>
+      <div style="flex:1">
+        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span></label>
+        <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
+      </div>
+    </div>
+
+    <label>商品属性 <span class="muted">(ジャンルの必須属性。足りないと登録時にRMSがエラーで教えてくれます)</span></label>
+    <table class="list" id="rk-attrs" style="margin-bottom:8px;">
+      <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
+      <tbody>
+        <%
+          let rkAttrs = [];
+          try { rkAttrs = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrs = []; }
+          if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
+        %>
+        <% for (const a of rkAttrs) { %>
+          <tr>
+            <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>"></td>
+            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>"></td>
+            <td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 属性行を追加</button>
+
+    <div style="display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+      <button class="btn" id="rk-save-btn">出品情報を保存</button>
+      <button class="btn" id="rk-images-btn">画像をR-Cabinetへ転送 (<%= cabinetImages.length %>/<%= images.length %> 済)</button>
+      <button class="btn" id="rk-preview-btn">送信内容を確認</button>
+      <button class="btn btn-primary" id="rk-register-btn">非公開で登録</button>
+      <span class="muted" id="rk-result"></span>
+    </div>
+    <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
+  </div>
+
   <!-- 履歴 -->
   <div class="card">
     <details>
@@ -523,6 +579,98 @@
     const el = document.getElementById('f-has-variation');
     return el ? { has_variation: el.checked } : {};
   }
+
+  // ─── 楽天出品 (P3) ───
+  const rkResult = document.getElementById('rk-result');
+
+  document.getElementById('rk-attr-add').addEventListener('click', () => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td><input type="text" class="rk-attr-name"></td>'
+      + '<td><input type="text" class="rk-attr-value"></td>'
+      + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
+    document.querySelector('#rk-attrs tbody').appendChild(tr);
+  });
+  document.getElementById('rk-attrs').addEventListener('click', (ev) => {
+    const del = ev.target.closest && ev.target.closest('.rk-attr-del');
+    if (del) del.closest('tr').remove();
+  });
+
+  function collectRakutenFields() {
+    const attrs = [];
+    document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+      attrs.push({
+        name: tr.querySelector('.rk-attr-name').value,
+        value: tr.querySelector('.rk-attr-value').value,
+      });
+    });
+    return {
+      genre_id: document.getElementById('rk-genre').value,
+      article_number: document.getElementById('rk-article').value,
+      attributes: attrs,
+    };
+  }
+
+  async function saveRakutenFields() {
+    const json = await post(BASE + '/rakuten', collectRakutenFields());
+    if (!json.ok) { alert(json.error || '保存に失敗しました'); return false; }
+    return true;
+  }
+
+  document.getElementById('rk-save-btn').addEventListener('click', async () => {
+    if (await saveRakutenFields()) { rkResult.textContent = '保存しました'; }
+  });
+
+  document.getElementById('rk-images-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('rk-images-btn');
+    btn.disabled = true;
+    rkResult.textContent = '画像を転送中… (Drive → R-Cabinet)';
+    try {
+      const json = await post(BASE + '/rakuten/transfer-images');
+      if (json.error) { rkResult.textContent = ''; alert(json.error); return; }
+      const failed = (json.results || []).filter((r) => r.outcome === 'failed');
+      rkResult.textContent = '転送 ' + (json.uploaded || 0) + ' 件 / 済み '
+        + (json.results || []).filter((r) => r.outcome === 'already').length + ' 件 / 失敗 ' + failed.length + ' 件';
+      if (failed.length > 0) {
+        alert('転送に失敗した画像があります:\n' + failed.map((f) => '・' + (f.error || '')).join('\n')
+          + '\n\nDriveの画像フォルダがサービスアカウントに共有されているか確認してください。');
+      } else {
+        setTimeout(() => location.reload(), 900);
+      }
+    } finally { btn.disabled = false; }
+  });
+
+  document.getElementById('rk-preview-btn').addEventListener('click', async () => {
+    if (!(await saveRakutenFields())) return;
+    const res = await fetch(BASE + '/rakuten/preview');
+    const json = await res.json();
+    const pre = document.getElementById('rk-preview');
+    pre.style.display = 'block';
+    if (!json.ok) {
+      pre.textContent = 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
+      return;
+    }
+    pre.textContent = '商品管理番号: ' + json.manageNumber + '\n\n' + JSON.stringify(json.payload, null, 2);
+  });
+
+  document.getElementById('rk-register-btn').addEventListener('click', async () => {
+    if (!(await saveRakutenFields())) return;
+    if (!confirm('楽天に「非公開 (倉庫指定)」で登録します。\n売り場には表示されません。公開はRMS画面で行います。\n\nよろしいですか?')) return;
+    const btn = document.getElementById('rk-register-btn');
+    btn.disabled = true;
+    rkResult.textContent = '楽天に登録中…';
+    try {
+      const json = await post(BASE + '/rakuten/register', { confirm: true });
+      if (json.ok) {
+        rkResult.textContent = '✅ 非公開で登録しました';
+        setTimeout(() => location.reload(), 1200);
+      } else {
+        rkResult.textContent = '';
+        const pre = document.getElementById('rk-preview');
+        pre.style.display = 'block';
+        pre.textContent = '❌ RMSエラー:\n' + (json.error || (json.reasons || []).join('\n'));
+      }
+    } finally { btn.disabled = false; }
+  });
 
   // SKU をバリエーションから外す / 戻す (委譲。表は再描画されるため)
   document.addEventListener('click', async (ev) => {

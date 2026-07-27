@@ -208,6 +208,31 @@ export function initProductHubDB() {
       first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
+    -- 楽天出品 (P3、2026-07-26 権限smoke実証後に実装)。
+    -- ジャンルID・商品属性は中原さん決定で手入力 (attributes_json = RMS 2.0 の
+    -- variants[].attributes と同形 [{name, values:[..]}])。
+    CREATE TABLE IF NOT EXISTS draft_rakuten (
+      draft_id       INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      genre_id       TEXT,
+      attributes_json TEXT,                 -- [{name, values:[string]}]
+      article_number TEXT,                  -- メーカー型番 (空 = exemptionReason で送る)
+      registered_at  TEXT,                  -- 非公開登録に成功した日時
+      last_error     TEXT,                  -- 直近の RMS エラー (人が直す材料)
+      updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- R-Cabinet へ転送済みの画像 (draft_images の Drive 画像 → cabinet location)
+    CREATE TABLE IF NOT EXISTS draft_cabinet_images (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      draft_id       INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      drive_file_id  TEXT NOT NULL,
+      cabinet_location TEXT NOT NULL,       -- item images[].location に入れる形 (/dir/file.jpg)
+      cabinet_file_id  INTEGER,
+      uploaded_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      UNIQUE(draft_id, drive_file_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_draft_cabinet_draft ON draft_cabinet_images(draft_id);
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
