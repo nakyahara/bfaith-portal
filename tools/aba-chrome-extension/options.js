@@ -2,7 +2,7 @@ const DEFAULTS = { baseUrl: 'https://wh.bfaith-wh.uk', token: '' };
 
 const $ = (id) => document.getElementById(id);
 
-chrome.storage.sync.get(DEFAULTS, (cfg) => {
+chrome.storage.local.get(DEFAULTS, (cfg) => {
   $('baseUrl').value = cfg.baseUrl;
   $('token').value = cfg.token;
 });
@@ -15,14 +15,14 @@ function show(msg, ok) {
 }
 
 $('save').addEventListener('click', () => {
-  chrome.storage.sync.set({
+  chrome.storage.local.set({
     baseUrl: $('baseUrl').value.trim() || DEFAULTS.baseUrl,
     token: $('token').value.trim(),
   }, () => show('保存しました', true));
 });
 
 $('test').addEventListener('click', () => {
-  chrome.storage.sync.set({
+  chrome.storage.local.set({
     baseUrl: $('baseUrl').value.trim() || DEFAULTS.baseUrl,
     token: $('token').value.trim(),
   }, () => {

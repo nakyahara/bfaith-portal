@@ -5,7 +5,7 @@
 const DEFAULTS = { baseUrl: 'https://wh.bfaith-wh.uk', token: '' };
 
 function getConfig() {
-  return new Promise((resolve) => chrome.storage.sync.get(DEFAULTS, resolve));
+  return new Promise((resolve) => chrome.storage.local.get(DEFAULTS, resolve));
 }
 
 async function api(path, opts = {}) {

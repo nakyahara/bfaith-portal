@@ -66,6 +66,27 @@ const FIXTURE = JSON.stringify({
   check('空配列: 0要素', itemCount === 0);
 }
 
+// --- 4b. 文字列値に囮キーが含まれても誤検知しない (Codex R1 medium) ---
+{
+  const decoy = JSON.stringify({
+    reportSpecification: { note: 'this mentions "dataByDepartmentAndSearchTerm" inside a value', fake: { dataByDepartmentAndSearchTerm: [{ searchTerm: 'ネスト内は無視' }] } },
+    decoyValue: 'dataByDepartmentAndSearchTerm',
+    dataByDepartmentAndSearchTerm: [{ departmentName: 'Amazon.co.jp', searchTerm: '本物', searchFrequencyRank: 1, clickedAsin: 'B000000001' }],
+  });
+  const items = [];
+  await parseAbaReportStream(chunked(decoy, 5), (it) => items.push(it));
+  check('囮キー: 本物の配列だけ解析', items.length === 1 && items[0].searchTerm === '本物');
+}
+
+// --- 4c. 最後の要素が完成していても配列が閉じていなければエラー (Codex R1 high) ---
+{
+  let threw = false;
+  const noClose = '{"dataByDepartmentAndSearchTerm":[{"searchTerm":"x","searchFrequencyRank":1,"clickedAsin":"B000000001"}';
+  try { await parseAbaReportStream(chunked(noClose, 9), () => {}); }
+  catch { threw = true; }
+  check('配列未クローズでエラー', threw);
+}
+
 // --- 5. キーが無い → エラー ---
 {
   let threw = false;

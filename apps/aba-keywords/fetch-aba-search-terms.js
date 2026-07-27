@@ -23,7 +23,6 @@ const REPORT_TYPE = 'GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT';
 const KEEP_WEEKS = Math.max(4, parseInt(process.env.ABA_KEEP_WEEKS || '26', 10) || 26);
 const POLL_INTERVAL_MS = 15000;
 const POLL_MAX = 120;           // 15s × 120 = 30分
-const INSERT_BATCH = 5000;
 
 // ---- 引数 ----
 const args = process.argv.slice(2);
@@ -64,6 +63,8 @@ function weekFromStart(weekStart) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(weekStart)) throw new Error(`--week は YYYY-MM-DD 形式: ${weekStart}`);
   const [y, m, d] = weekStart.split('-').map(Number);
   const ms = Date.UTC(y, m - 1, d);
+  // Date.UTC は 2026-02-29 等を翌月へ繰り上げるため、往復一致で実在日を検証 (Codex R1 low)
+  if (fmt(ms) !== weekStart) throw new Error(`--week が実在しない日付: ${weekStart}`);
   if (new Date(ms).getUTCDay() !== 0) throw new Error(`--week は日曜日を指定: ${weekStart} は ${'日月火水木金土'[new Date(ms).getUTCDay()]}曜`);
   return { weekStart, weekEnd: fmt(ms + 6 * 86400000) };
 }
@@ -118,8 +119,10 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       reportType: REPORT_TYPE,
       marketplaceIds: [MARKETPLACE_ID],
       reportOptions: { reportPeriod: 'WEEK' },
-      dataStartTime: `${weekStart}T00:00:00Z`,
-      dataEndTime: `${weekEnd}T23:59:59Z`,
+      // ABA週 = 日曜〜土曜。JP マーケットプレイスなので JST 境界を明示する
+      // (Amazon が日付部分だけ見るなら同値。⚠ 初回実取得時に週の同定を要確認)
+      dataStartTime: `${weekStart}T00:00:00+09:00`,
+      dataEndTime: `${weekEnd}T23:59:59+09:00`,
     },
     options: { version: '2021-06-30' },
   }), 60000, 'createReport');
@@ -138,8 +141,15 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
     if (['DONE', 'FATAL', 'CANCELLED'].includes(report.processingStatus)) break;
   }
   if (report.processingStatus !== 'DONE') {
-    // 未公開週 (集計がまだ) やデータなしは FATAL/CANCELLED で返る。
-    // ハード失敗にすると公開までの数日間 毎朝 🔴 通知が出続けるため、正常スキップ扱い。
+    // 未公開週 (週明け〜数日は集計中) は FATAL/CANCELLED で返るため、直近週に限り正常スキップ
+    // (ハード失敗にすると公開までの数日間 毎朝 🔴 通知が出続ける)。
+    // ただし週末から10日過ぎても FATAL のままなら「未公開」ではなく恒久障害
+    // (ロール不足・reportOptions不正等) の可能性が高いのでハード失敗させて顕在化 (Codex R1 medium)。
+    const [ey, em, ed] = weekEnd.split('-').map(Number);
+    const daysSinceWeekEnd = Math.floor((Date.now() + 9 * 3600 * 1000 - Date.UTC(ey, em - 1, ed)) / 86400000);
+    if (daysSinceWeekEnd > 10) {
+      throw new Error(`${weekStart}週のレポートが週末から${daysSinceWeekEnd}日経っても ${report.processingStatus} — 未公開ではなく設定/権限問題を疑う`);
+    }
     console.log(`[ABA] ${weekStart}: レポート未生成 (${report.processingStatus}) → skip (公開後に自動取込)`);
     return 'unavailable';
   }
@@ -169,14 +179,6 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
        asin, product_title, click_share, conversion_share)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const flushBatch = db.transaction((rows) => {
-    for (const r of rows) {
-      insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
-        r.click_position, r.asin, r.product_title, r.click_share, r.conversion_share);
-    }
-  });
-
-  let pending = [];
   let rowCount = 0;
   let skipped = 0;
   const terms = new Set();
@@ -184,28 +186,42 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
   let lastTermKey = '';
   let posCounter = 0;
 
-  await parseAbaReportStream(stream, (item) => {
-    const row = normalizeAbaItem(item);
-    if (!row) { skipped++; return; }
-    const termKey = `${row.department}${row.search_term}`;
-    if (termKey === lastTermKey) posCounter++; else { lastTermKey = termKey; posCounter = 1; }
-    if (row.click_position == null) row.click_position = posCounter;
-    terms.add(termKey);
-    pending.push(row);
-    if (pending.length >= INSERT_BATCH) { flushBatch(pending); rowCount += pending.length; pending = []; }
-  });
-  if (pending.length) { flushBatch(pending); rowCount += pending.length; }
+  // 行データと完了台帳を単一トランザクションで確定する (Codex R1 medium):
+  //   - 途中失敗 → ROLLBACK で痕跡ゼロ (次回まっさらに再取込)
+  //   - 週の先頭で DELETE → 再生成レポートで消えた行・旧ロジックの行が残らない
+  // WAL なので取込中も router の読み取りはブロックされない。書き手はこのジョブのみ。
+  // better-sqlite3 の .transaction() は async ストリームを跨げないため明示 BEGIN/COMMIT を使う。
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
 
-  // 全行が normalize で弾かれた = レポートのフィールド名が想定と違う (仕様変更)。
-  // 台帳に書いて「取込済み」にしてしまうとサイレント欠落になるためハード失敗させて通知に載せる
-  if (rowCount === 0 && skipped > 0) {
-    throw new Error(`全${skipped}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`);
+    await parseAbaReportStream(stream, (item) => {
+      const row = normalizeAbaItem(item);
+      if (!row) { skipped++; return; }
+      const termKey = JSON.stringify([row.department, row.search_term]);
+      if (termKey === lastTermKey) posCounter++; else { lastTermKey = termKey; posCounter = 1; }
+      if (row.click_position == null) row.click_position = posCounter;
+      terms.add(termKey);
+      insert.run(weekStart, row.department, row.search_term, row.search_frequency_rank,
+        row.click_position, row.asin, row.product_title, row.click_share, row.conversion_share);
+      rowCount++;
+    });
+
+    // 全行が normalize で弾かれた = レポートのフィールド名が想定と違う (仕様変更)。
+    // 台帳に書いて「取込済み」にしてしまうとサイレント欠落になるためハード失敗させて通知に載せる
+    if (rowCount === 0 && skipped > 0) {
+      throw new Error(`全${skipped}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`);
+    }
+
+    db.prepare(`
+      INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count)
+      VALUES (?, ?, datetime('now'), ?, ?)
+    `).run(weekStart, weekEnd, terms.size, rowCount);
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* BEGIN前の失敗等は無視 */ }
+    throw e;
   }
-
-  db.prepare(`
-    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count)
-    VALUES (?, ?, datetime('now'), ?, ?)
-  `).run(weekStart, weekEnd, terms.size, rowCount);
 
   console.log(`[ABA] ${weekStart}: 取込完了 ${rowCount}行 / ${terms.size}検索語 (不正行skip=${skipped})`);
   return 'ingested';
@@ -244,6 +260,21 @@ async function main() {
     else unavailable++;
   }
   if (!DRY_RUN && ingested > 0) pruneOldWeeks(db, targets[0].weekStart);
+
+  // 鮮度アラーム: 過去に取込実績があるのに3週間以上新しい週が入らない場合はハード失敗。
+  // 対象週は毎週転がるため「直近週の未公開skip」だけでは恒久障害 (権限剥奪・仕様変更) が
+  // 永遠にサイレントになる。ここが最後の検知線 (初回セットアップ中 = 台帳空なら鳴らさない)
+  if (ingested === 0) {
+    const latest = db.prepare('SELECT MAX(week_end) AS we FROM aba_weeks').get();
+    if (latest && latest.we) {
+      const [ly, lm, ld] = latest.we.split('-').map(Number);
+      const ageDays = Math.floor((Date.now() + 9 * 3600 * 1000 - Date.UTC(ly, lm - 1, ld)) / 86400000);
+      if (ageDays > 21) {
+        closeAbaDB();
+        throw new Error(`最終取込週 (〜${latest.we}) から${ageDays}日間 新しい週が取り込めていない — 権限/仕様変更を疑う`);
+      }
+    }
+  }
 
   const weekRows = db.prepare('SELECT COUNT(*) AS c FROM aba_weeks WHERE row_count > 0').get();
   closeAbaDB();

@@ -70,13 +70,24 @@ function getClient() {
   return spClient;
 }
 
-// レート制御: API種別ごとに前回呼び出しからの最小間隔を守る (helper一元化方針)
+// レート制御 (helper一元化方針): API種別ごとの Promise チェーンで直列化しつつ最小間隔を守る。
+// 単純な「前回時刻を見て sleep」は同時リクエストが同じ待ちを並行消化して一斉発射になる
+// (Codex R1 medium)。あわせて SP-API 呼び出しにタイムアウトを付けて滞留を防ぐ。
+const apiQueues = new Map();
 const lastCallAt = new Map();
-async function throttle(key, minIntervalMs) {
-  const prev = lastCallAt.get(key) || 0;
-  const wait = prev + minIntervalMs - Date.now();
-  if (wait > 0) await new Promise(r => setTimeout(r, wait));
-  lastCallAt.set(key, Date.now());
+function enqueueApiCall(key, minIntervalMs, timeoutMs, fn) {
+  const prev = apiQueues.get(key) || Promise.resolve();
+  const next = prev.catch(() => { /* 前段の失敗はチェーンを止めない */ }).then(async () => {
+    const wait = (lastCallAt.get(key) || 0) + minIntervalMs - Date.now();
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    lastCallAt.set(key, Date.now());
+    return Promise.race([
+      fn(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`SP-API タイムアウト (${timeoutMs / 1000}秒): ${key}`)), timeoutMs)),
+    ]);
+  });
+  apiQueues.set(key, next);
+  return next;
 }
 
 function sanitizeAsins(input, max = 100) {
@@ -239,11 +250,13 @@ router.post('/catalog', async (req, res) => {
   const misses = [];
   for (const asin of asins) {
     const hit = cacheGet.get(asin);
-    if (hit && now - Date.parse(hit.fetched_at) < CATALOG_TTL_MS) {
-      result[asin] = JSON.parse(hit.payload);
-    } else {
-      misses.push(asin);
+    if (hit) {
+      const payload = JSON.parse(hit.payload);
+      // notFound は短命キャッシュ (最長1h): 一時的な欠落応答を丸1日「存在なし」に固定しない (Codex R1 low)
+      const ttl = payload.notFound ? Math.min(CATALOG_TTL_MS, 3600 * 1000) : CATALOG_TTL_MS;
+      if (now - Date.parse(hit.fetched_at) < ttl) { result[asin] = payload; continue; }
     }
+    misses.push(asin);
   }
 
   let fetchErrors = 0;
@@ -255,9 +268,8 @@ router.post('/catalog', async (req, res) => {
     for (let i = 0; i < misses.length; i += 20) {
       const chunk = misses.slice(i, i + 20);
       try {
-        // searchCatalogItems: 2req/秒 (burst 2)。安全側 600ms 間隔
-        await throttle('catalog', 600);
-        const resp = await sp.callAPI({
+        // searchCatalogItems: 2req/秒 (burst 2)。安全側 600ms 間隔で直列化
+        const resp = await enqueueApiCall('catalog', 600, 30000, () => sp.callAPI({
           operation: 'searchCatalogItems',
           endpoint: 'catalogItems',
           query: {
@@ -268,7 +280,7 @@ router.post('/catalog', async (req, res) => {
             pageSize: 20,
           },
           options: { version: '2022-04-01' },
-        });
+        }));
         const ts = new Date().toISOString();
         for (const item of resp.items || []) {
           const norm = normalizeCatalogItem(item);
@@ -323,8 +335,8 @@ router.post('/offers', async (req, res) => {
     for (let i = 0; i < misses.length; i += 20) {
       const chunk = misses.slice(i, i + 20);
       try {
-        await throttle('offers', 12000); // 0.1req/秒 → 12秒間隔で安全側
-        const resp = await sp.callAPI({
+        // getItemOffersBatch: 0.1req/秒 → 12秒間隔で直列化
+        const resp = await enqueueApiCall('offers', 12000, 60000, () => sp.callAPI({
           operation: 'getItemOffersBatch',
           endpoint: 'productPricing',
           body: {
@@ -337,13 +349,19 @@ router.post('/offers', async (req, res) => {
             })),
           },
           options: { version: 'v0' },
-        });
+        }));
         const ts = new Date().toISOString();
         const responses = resp.responses || [];
         responses.forEach((r, idx) => {
           // 応答順はリクエスト順と保証されないため request.uri から ASIN を復元 (index は fallback)
           const uriMatch = String(r?.request?.uri || '').match(/items\/([A-Z0-9]{10})\/offers/i);
           const asin = uriMatch ? uriMatch[1].toUpperCase() : chunk[idx];
+          // 個別失敗 (非2xx) は一時エラーの可能性があるためキャッシュせず error 返却 (Codex R1 low)
+          const status = r?.status?.statusCode;
+          if (status != null && !(status >= 200 && status < 300)) {
+            if (!result[asin]) result[asin] = { asin, error: true };
+            return;
+          }
           const offers = r?.body?.payload?.Offers || [];
           const bb = offers.find(o => o.IsBuyBoxWinner) || null;
           const norm = {
