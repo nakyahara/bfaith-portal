@@ -233,6 +233,27 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_draft_cabinet_draft ON draft_cabinet_images(draft_id);
 
+    -- 楽天の店舗内カテゴリ (お店の棚) マスタ。RMS 画面からの貼り付けで取り込む
+    -- (Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要 = 未実装)。
+    -- 全置き換え取り込みでも行は消さず is_active で外す (draft_shop_categories が参照するため)
+    CREATE TABLE IF NOT EXISTS ph_shop_categories (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      category_id  TEXT,                   -- RMS上のカテゴリID (貼り付けに含まれていた場合のみ。将来の自動紐付け用)
+      path         TEXT NOT NULL,          -- 例: 犬用品 > おやつ > 無添加 (' > ' 区切りに正規化)
+      path_key     TEXT NOT NULL UNIQUE,   -- LOWER(path)
+      is_active    INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+      sort_order   INTEGER NOT NULL DEFAULT 0,
+      imported_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- ドラフトが載る店舗内カテゴリ (複数選択)。公開時に RMS 画面で設定する指示として使う
+    CREATE TABLE IF NOT EXISTS draft_shop_categories (
+      draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, shop_category_id)
+    );
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)

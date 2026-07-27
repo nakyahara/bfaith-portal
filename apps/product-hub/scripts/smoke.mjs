@@ -760,6 +760,52 @@ check('toCabinetJpeg: 2MB以下のJPEGに変換', jpg.length <= 2 * 1024 * 1024 
 check('extractRmsErrors: errors[] を整形',
   listing.extractRmsErrors({ errors: [{ code: 'IE0418', message: 'Invalid attribute' }] }).includes('IE0418'));
 
+// ─── 店舗内カテゴリ (マスタ貼り付け取り込み + ドラフト選択) ───
+const shopCat = await import('../lib/shop-categories.js');
+
+const catParsed = shopCat.parseShopCategoryText(
+  '犬用品 > おやつ\n123456,猫用品 ＞ ケア用品\n\n犬用品>おやつ\n789\tその他');
+check('cat parse: 4行から重複1を除いて3件', catParsed.ok && catParsed.rows.length === 3 && catParsed.duplicates === 1,
+  JSON.stringify(catParsed));
+check('cat parse: パスのみの行は ID なし', catParsed.rows[0].categoryId === null && catParsed.rows[0].path === '犬用品 > おやつ');
+check('cat parse: 「ID,パス」+ 全角＞の正規化', catParsed.rows[1].categoryId === '123456' && catParsed.rows[1].path === '猫用品 > ケア用品');
+check('cat parse: タブ区切りも受ける', catParsed.rows[2].categoryId === '789' && catParsed.rows[2].path === 'その他');
+check('cat parse: 行数超過は弾く',
+  shopCat.parseShopCategoryText(Array.from({ length: shopCat.MAX_SHOP_CATEGORY_LINES + 1 }, () => 'x').join('\n')).ok === false);
+check('cat parse: 長すぎるカテゴリ名は弾く', shopCat.parseShopCategoryText('あ'.repeat(301)).ok === false);
+check('cat parse: 空入力 → 0件', shopCat.parseShopCategoryText('  \n \n').rows.length === 0);
+
+const catR1 = shopCat.replaceShopCategories(db, catParsed.rows);
+check('cat import: 3件が有効', catR1.active === 3 && shopCat.countActiveShopCategories(db) === 3);
+
+// 再取り込み (全置き換え): 消えたカテゴリは is_active=0 に落ち、既知の ID は保持される
+const catParsed2 = shopCat.parseShopCategoryText('猫用品 > ケア用品\n新カテゴリ');
+const catR2 = shopCat.replaceShopCategories(db, catParsed2.rows);
+check('cat import: 全置き換えで有効2 / 非活性2', catR2.active === 2 && catR2.deactivated === 2, JSON.stringify(catR2));
+check('cat import: ID無しで再取り込みしても既知のカテゴリIDを保持',
+  db.prepare(`SELECT category_id FROM ph_shop_categories WHERE path = '猫用品 > ケア用品'`).get().category_id === '123456');
+
+// ドラフトへの割り当て
+const catDraftId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('cat-smoke-1', '棚スモーク')`).run().lastInsertRowid);
+const activeCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path = '猫用品 > ケア用品'`).get().id;
+const inactiveCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path = '犬用品 > おやつ'`).get().id;
+shopCat.setDraftShopCategories(db, catDraftId, [activeCat, inactiveCat]);
+const catList = shopCat.listShopCategoriesForDraft(db, catDraftId);
+check('cat list: 有効カテゴリ + 選択中の非活性カテゴリが出る (未選択の非活性は出ない)',
+  catList.length === 3
+  && catList.filter((c) => c.selected).length === 2
+  && catList.some((c) => c.id === inactiveCat && c.selected === 1 && c.is_active === 0),
+  JSON.stringify(catList));
+check('cat paths: 選択中のパスを返す',
+  JSON.stringify(shopCat.selectedShopCategoryPaths(db, catDraftId).sort())
+  === JSON.stringify(['犬用品 > おやつ', '猫用品 > ケア用品']));
+shopCat.setDraftShopCategories(db, catDraftId, [activeCat]);
+check('cat set: 入れ替えで1件になる', shopCat.selectedShopCategoryPaths(db, catDraftId).length === 1);
+db.prepare('DELETE FROM product_drafts WHERE id = ?').run(catDraftId);
+check('cat cascade: ドラフト削除で選択も消える',
+  db.prepare('SELECT COUNT(*) AS c FROM draft_shop_categories WHERE draft_id = ?').get(catDraftId).c === 0);
+db.prepare('DELETE FROM ph_shop_categories').run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -799,11 +845,13 @@ const renders = [
     counts, statusFilter: null,
     statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: false,
+    isAdmin: true, shopCategoryCount: 12, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['index.ejs (empty)', 'index.ejs', {
     title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: 'draft',
     statuses, statusLabels, notionPending: 0, maxImportCodes: imp.MAX_IMPORT_CODES,
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: true,
+    isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
@@ -821,8 +869,30 @@ const renders = [
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: null,
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null }, cabinetImages: [],
+    // 店舗内カテゴリの選択リスト分岐 (有効/選択済み/一覧から外れた選択済み)
+    shopCategories: [
+      { id: 1, category_id: '100', path: '犬用品 > おやつ', is_active: 1, selected: 1 },
+      { id: 2, category_id: null, path: '猫用品 > ケア用品', is_active: 1, selected: 0 },
+      { id: 3, category_id: null, path: '廃止された棚', is_active: 0, selected: 1 },
+    ],
     yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
     imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
+  }],
+  ['detail.ejs (rakuten registered + shop categories)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, own_brand: 0, asin: null, amazon_url: null },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
+    rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr' },
+    cabinetImages: [{ id: 1 }],
+    shopCategories: [
+      { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
+      { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
+    ],
+    yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (created notion / non-own-brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
@@ -832,7 +902,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -847,7 +917,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
   // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
@@ -859,7 +929,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (excluded SKU section)', 'detail.ejs', {
@@ -870,7 +940,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (detached SKU)', 'detail.ejs', {
@@ -881,7 +951,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
@@ -893,7 +963,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [],
     yahoo: null, imageProduction: null,
   }],
 ];

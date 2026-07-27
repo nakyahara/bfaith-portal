@@ -24,6 +24,11 @@ import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariati
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import { transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes } from './services/rakuten-listing.js';
+import {
+  parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
+  listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
+  MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+} from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -128,6 +133,9 @@ router.get('/', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     notionCardEnabled: isNotionCardEnabled(),
+    isAdmin: req.session?.role === 'admin',
+    shopCategoryCount: countActiveShopCategories(db),
+    maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
   });
 });
 
@@ -183,6 +191,7 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages,
+    shopCategories: listShopCategoriesForDraft(db, draft.id),
   });
 });
 
@@ -552,17 +561,62 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
   }
-  db.prepare(`
-    INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(draft_id) DO UPDATE SET
-      genre_id = excluded.genre_id,
-      attributes_json = excluded.attributes_json,
-      article_number = excluded.article_number,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(draft.id, genreId, attributesJson, cleanText(req.body?.article_number, 100));
-  logEvent(db, draft.id, 'rakuten_fields_saved', genreId, actorOf(req));
+  // 店舗内カテゴリ (複数選択)。フィールドが来たときだけ入れ替える
+  let shopCategoryIds = null;
+  if (req.body?.shop_category_ids !== undefined) {
+    if (!Array.isArray(req.body.shop_category_ids)) {
+      return res.status(400).json({ ok: false, error: '店舗内カテゴリの形式が不正です' });
+    }
+    const ids = [...new Set(req.body.shop_category_ids.map((v) => Number.parseInt(v, 10)))];
+    if (ids.some((v) => !Number.isInteger(v) || v <= 0)) {
+      return res.status(400).json({ ok: false, error: '店舗内カテゴリの指定が不正です' });
+    }
+    if (ids.length > MAX_DRAFT_SHOP_CATEGORIES) {
+      return res.status(400).json({ ok: false, error: `店舗内カテゴリは最大 ${MAX_DRAFT_SHOP_CATEGORIES} 件までです` });
+    }
+    if (ids.length > 0) {
+      const found = db.prepare(
+        `SELECT COUNT(*) AS c FROM ph_shop_categories WHERE id IN (${ids.map(() => '?').join(',')})`
+      ).get(...ids).c;
+      if (found !== ids.length) {
+        return res.status(400).json({ ok: false, error: '存在しない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
+      }
+    }
+    shopCategoryIds = ids;
+  }
+  const articleNumber = cleanText(req.body?.article_number, 100);
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        genre_id = excluded.genre_id,
+        attributes_json = excluded.attributes_json,
+        article_number = excluded.article_number,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, genreId, attributesJson, articleNumber);
+    if (shopCategoryIds !== null) setDraftShopCategories(db, draft.id, shopCategoryIds);
+  })();
+  logEvent(db, draft.id, 'rakuten_fields_saved',
+    [genreId, shopCategoryIds !== null ? `店舗内カテゴリ${shopCategoryIds.length}件` : null].filter(Boolean).join(' / ') || null,
+    actorOf(req));
   res.json({ ok: true });
+});
+
+// 店舗内カテゴリ一覧の取り込み (貼り付け・全置き換え)。マスタ全体に影響するので admin 限定。
+// RMS Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要なため未対応 —
+// この一覧は「公開時に RMS 画面で設定するカテゴリ」の選択肢・指示として使う。
+router.post('/api/shop-categories/import', (req, res) => {
+  if (req.session?.role !== 'admin') {
+    return res.status(403).json({ ok: false, error: '店舗内カテゴリ一覧の取り込みは管理者のみです' });
+  }
+  const parsed = parseShopCategoryText(req.body?.text);
+  if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.error });
+  if (parsed.rows.length === 0) {
+    return res.status(400).json({ ok: false, error: 'カテゴリが1件も読み取れませんでした' });
+  }
+  const r = replaceShopCategories(getDB(), parsed.rows);
+  res.json({ ok: true, imported: parsed.rows.length, duplicates: parsed.duplicates, active: r.active, deactivated: r.deactivated });
 });
 
 // Drive 画像 → R-Cabinet 転送 (冪等。転送済みはスキップ)
@@ -585,9 +639,15 @@ router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
 router.get('/api/drafts/:id/rakuten/preview', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const built = buildItemPayload(getDB(), draft.id);
+  const db = getDB();
+  const built = buildItemPayload(db, draft.id);
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
-  res.json({ ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload });
+  res.json({
+    ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
+    // 店舗内カテゴリは RMS payload に含まれない (Category API が別 = miniPC 対応待ち)。
+    // 公開時に RMS 画面で設定するものとしてプレビューに添える
+    shopCategories: selectedShopCategoryPaths(db, draft.id),
+  });
 });
 
 // 非公開 (倉庫指定) で楽天に登録。公開は人が RMS 画面で行う

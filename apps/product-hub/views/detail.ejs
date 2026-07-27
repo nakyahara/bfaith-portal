@@ -444,11 +444,16 @@
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → 公開はRMS画面で)</span></h2>
+    <% const selectedShopCats = shopCategories.filter((c) => c.selected); %>
     <% if (rakuten && rakuten.registered_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
         <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
         RMS の商品管理で内容を確認し、問題なければ<strong>RMS側で公開</strong>してください。
+        <% if (selectedShopCats.length > 0) { %>
+          <br>公開時に店舗内カテゴリを設定: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
+          <span class="muted">(RMSへの自動反映は未対応)</span>
+        <% } %>
       </div>
     <% } %>
     <% if (rakuten && rakuten.last_error) { %>
@@ -465,6 +470,25 @@
         <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span></label>
         <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
       </div>
+    </div>
+
+    <div class="field">
+      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span></label>
+      <% if (shopCategories.length === 0) { %>
+        <p class="muted" style="margin:4px 0;">
+          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
+        </p>
+      <% } else { %>
+        <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
+        <div id="rk-cats" style="max-height:200px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;">
+          <% for (const c of shopCategories) { %>
+            <label class="rk-cat-row" style="display:block; font-size:13px; padding:2px 0; font-weight:400; cursor:pointer;">
+              <input type="checkbox" class="rk-cat-check" value="<%= c.id %>" <%= c.selected ? 'checked' : '' %>>
+              <%= c.path %><% if (!c.is_active) { %> <span class="muted">(現在の一覧に無いカテゴリ)</span><% } %>
+            </label>
+          <% } %>
+        </div>
+      <% } %>
     </div>
 
     <label>商品属性 <span class="muted">(ジャンルの必須属性。足りないと登録時にRMSがエラーで教えてくれます)</span></label>
@@ -607,7 +631,20 @@
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
       attributes: attrs,
+      shop_category_ids: Array.from(document.querySelectorAll('.rk-cat-check:checked')).map((c) => Number(c.value)),
     };
+  }
+
+  // 店舗内カテゴリの絞り込み (選択済みは常に表示)
+  const rkCatFilter = document.getElementById('rk-cat-filter');
+  if (rkCatFilter) {
+    rkCatFilter.addEventListener('input', () => {
+      const q = rkCatFilter.value.trim().toLowerCase();
+      document.querySelectorAll('.rk-cat-row').forEach((row) => {
+        const hit = !q || row.textContent.toLowerCase().includes(q) || row.querySelector('.rk-cat-check').checked;
+        row.style.display = hit ? '' : 'none';
+      });
+    });
   }
 
   async function saveRakutenFields() {
@@ -649,7 +686,10 @@
       pre.textContent = 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
       return;
     }
-    pre.textContent = '商品管理番号: ' + json.manageNumber + '\n\n' + JSON.stringify(json.payload, null, 2);
+    const cats = json.shopCategories || [];
+    pre.textContent = '商品管理番号: ' + json.manageNumber
+      + (cats.length ? '\n店舗内カテゴリ (公開時にRMS画面で設定 — payloadには含まれません): ' + cats.join(' ／ ') : '')
+      + '\n\n' + JSON.stringify(json.payload, null, 2);
   });
 
   document.getElementById('rk-register-btn').addEventListener('click', async () => {
