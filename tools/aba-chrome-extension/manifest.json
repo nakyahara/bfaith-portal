@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "B-Faith ABAキーワード",
+  "version": "1.0.0",
+  "description": "Amazon商品ページにABA注文ワード表、検索結果にBSR/梱包/ブランドを表示 (社内用・セラースプライト置換)",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://wh.bfaith-wh.uk/*",
+    "http://localhost/*"
+  ],
+  "background": { "service_worker": "sw.js" },
+  "content_scripts": [
+    {
+      "matches": ["https://www.amazon.co.jp/*"],
+      "js": ["content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}

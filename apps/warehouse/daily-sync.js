@@ -78,7 +78,7 @@ function isAliveNodeProcess(pid) {
 //   07:00 の SP-API 混雑帯で一過性失敗しても同日 retry されず、TTL(168h) 超過した高額 SKU が
 //   数日累積して手数料カバー率が 69.84% まで崩壊した (incident_amazon_fee_coverage_no_retry)。
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'DBバックアップ'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -473,6 +473,12 @@ async function main() {
   // (2026-05-07 朝の cron で --days 30 default + 30分 timeout で ETIMEDOUT、過去 90 日分は手動 fetch 済)
   const settlementResult = runScript('apps/warehouse/fetch-amazon-settlements.js --days 14', 'Amazon Settlement', 3600000);
   results.push({ name: 'Amazon Settlement', ...settlementResult });
+
+  // ABA「Amazon検索用語」週次取込 (セラースプライト置換、aba.db 別建て)
+  // 取込済み週は即skip・レポート未公開 (集計中) は正常skip の冪等設計なので毎朝呼んでよい。
+  // 週次レポートの公開日が不定 (週明け〜数日後) なため、毎朝叩いて公開当日に自動取込する。
+  const abaResult = runScript('apps/aba-keywords/fetch-aba-search-terms.js', 'ABA検索ワード', 3600000);
+  results.push({ name: 'ABA検索ワード', ...abaResult });
 
   // Amazon Ads spCampaigns (campaign 全広告費、Phase 3.4)
   // 直近 30 日。fact_ad_spend_campaign に PK(日付,モール,キャンペーンID,広告タイプ) で UPSERT
