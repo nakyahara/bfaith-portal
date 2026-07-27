@@ -23,6 +23,7 @@ import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/not
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+import { transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes } from './services/rakuten-listing.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -169,6 +170,9 @@ router.get('/detail/:id', (req, res) => {
       .get(String(m.商品コード).trim().toLowerCase())?.id || null;
   }
 
+  const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  const cabinetImages = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draft.id);
+
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
@@ -178,6 +182,7 @@ router.get('/detail/:id', (req, res) => {
     statusLabels: STATUS_LABELS,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
+    rakuten, cabinetImages,
   });
 });
 
@@ -518,6 +523,88 @@ router.post('/api/notion-retry-all', async (req, res) => {
   const results = await retryPendingCards({ actor: actorOf(req) });
   const failed = results.filter((r) => r.outcome === 'failed');
   res.json({ ok: failed.length === 0, tried: results.length, failed: failed.length, results });
+});
+
+// ─── API: 楽天出品 (P3) ──────────────────────────────────
+
+// ジャンルID・商品属性・メーカー型番の保存 (手入力 — 中原さん決定)
+router.post('/api/drafts/:id/rakuten', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const genreId = cleanText(req.body?.genre_id, 20);
+  if (genreId && !/^\d+$/.test(genreId)) {
+    return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
+  }
+  // attributes は [{name, value}] で受けて [{name, values:[..]}] に正規化して保存
+  let attributesJson = null;
+  if (Array.isArray(req.body?.attributes)) {
+    const rows = req.body.attributes
+      .map((a) => ({ name: cleanText(a?.name, 100), value: cleanText(a?.value, 300) }))
+      .filter((a) => a.name || a.value);
+    for (const a of rows) {
+      if (!a.name || !a.value) {
+        return res.status(400).json({ ok: false, error: '属性は「属性名」と「値」の両方を入力してください (不要な行は両方空に)' });
+      }
+    }
+    attributesJson = JSON.stringify(rows.map((a) => ({ name: a.name, values: [a.value] })));
+    if (parseAttributes(attributesJson) === null) {
+      return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
+    }
+  }
+  db.prepare(`
+    INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(draft_id) DO UPDATE SET
+      genre_id = excluded.genre_id,
+      attributes_json = excluded.attributes_json,
+      article_number = excluded.article_number,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run(draft.id, genreId, attributesJson, cleanText(req.body?.article_number, 100));
+  logEvent(db, draft.id, 'rakuten_fields_saved', genreId, actorOf(req));
+  res.json({ ok: true });
+});
+
+// Drive 画像 → R-Cabinet 転送 (冪等。転送済みはスキップ)
+router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await transferImagesToCabinet(draft.id, { actor: actorOf(req) });
+    if (r.error === 'no_images') {
+      return res.status(400).json({ ok: false, error: '商品画像 (Driveリンク) を先に追加してください' });
+    }
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] cabinet transfer failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// 送信内容のプレビュー (dry run — RMS には送らない)
+router.get('/api/drafts/:id/rakuten/preview', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const built = buildItemPayload(getDB(), draft.id);
+  if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
+  res.json({ ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload });
+});
+
+// 非公開 (倉庫指定) で楽天に登録。公開は人が RMS 画面で行う
+router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'confirm が必要です' });
+  }
+  try {
+    const r = await registerHidden(draft.id, { actor: actorOf(req) });
+    if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
 });
 
 // ─── API: バリエーション ────────────────────────────────

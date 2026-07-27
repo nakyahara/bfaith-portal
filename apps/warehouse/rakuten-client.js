@@ -54,6 +54,8 @@ function sleep(ms) {
  * @param {any} [opts.body] - POST 時の JSON body
  * @param {string} [opts.rawBody] - JSON化せずそのまま送る生ボディ (XML API 用。
  *   Content-Type は headers で指定する。クーポンAPI 1.0 は application/xml — PR-C3 実測)
+ * @param {FormData} [opts.formData] - multipart/form-data 送信用 (R-Cabinet file/insert)。
+ *   Content-Type は fetch が boundary 付きで自動設定するため headers で指定しないこと
  * @param {object} [opts.headers] - 追加ヘッダー
  * @param {number} [opts.timeoutMs=60000]
  * @param {number} [opts.maxAttempts=4] - 初回 + retry 含む総試行回数
@@ -71,6 +73,7 @@ async function doRakutenRequest({
   method = 'GET',
   body,
   rawBody,
+  formData,
   headers = {},
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
@@ -91,10 +94,12 @@ async function doRakutenRequest({
   const url = `https://${RAKUTEN_HOST}${path}`;
   const finalHeaders = {
     Authorization: auth,
-    ...(body !== undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}),
+    // formData のときは Content-Type を付けない (fetch が boundary 付きで自動設定する)
+    ...(body !== undefined && formData === undefined ? { 'Content-Type': 'application/json; charset=utf-8' } : {}),
     ...headers,
   };
-  const requestBody = rawBody !== undefined ? rawBody : (body !== undefined ? JSON.stringify(body) : undefined);
+  const requestBody = formData !== undefined ? formData
+    : (rawBody !== undefined ? rawBody : (body !== undefined ? JSON.stringify(body) : undefined));
 
   let lastError = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {

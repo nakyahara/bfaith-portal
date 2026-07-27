@@ -324,6 +324,316 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
 // ステータス
 // ==========================================
 
+// ==========================================
+// 書込系 (product-hub P3 楽天自動出品、2026-07-26 権限smoke実証済)
+//   - env RAKUTEN_RMS_WRITE_ENABLED が ON のときだけ有効 (fail-closed)
+//   - 商品の新規作成は **必ず倉庫指定 (hideItem=true) に強制** — 公開は人が RMS 画面で行う
+//   - 既存商品の上書きは拒否 (稼働中の商品ページを事故で潰さない)
+//   - 削除は非公開 (hideItem=true) の商品だけ許可
+// ==========================================
+
+// 書込は manageNumber 単位で直列化する (High-1: GET確認→PUT の間に同じ番号への
+// 別リクエストが入る競合を防ぐ)。RMS 側に条件付き作成が無いため、RMS画面など
+// 外部からの同時作成は API 仕様上防げない — その場合は直後の内容確認で人が気づく前提。
+const writeLocks = new Map(); // key -> Promise (チェーン末尾)
+async function withManageNumberLock(mn, fn) {
+  const prev = writeLocks.get(mn) || Promise.resolve();
+  let release;
+  const cur = new Promise((r) => { release = r; });
+  const tail = prev.then(() => cur);
+  writeLocks.set(mn, tail);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    // 自分が末尾のままなら削除 (Codex low: cur と比較すると一致せず Map が増え続ける)
+    if (writeLocks.get(mn) === tail) writeLocks.delete(mn);
+  }
+}
+
+const WRITE_ON = new Set(['1', 'true', 'on', 'yes']);
+function writeEnabled() {
+  return WRITE_ON.has(String(process.env.RAKUTEN_RMS_WRITE_ENABLED ?? '').trim().toLowerCase());
+}
+function requireWrite(req, res, next) {
+  if (!writeEnabled()) {
+    return errorResponse(res, {
+      status: 503, error: 'RMS_WRITE_DISABLED',
+      message: 'RAKUTEN_RMS_WRITE_ENABLED が未設定のため書込は無効です (fail-closed)',
+      requestId: req.requestId,
+    });
+  }
+  next();
+}
+
+// 楽天の商品管理番号形式 (小文字英数とハイフン)。パス組み立てに使うので厳格に
+const MANAGE_NUMBER_RE = /^[a-z0-9][a-z0-9\-]{0,31}$/;
+
+// 単一商品 GET (書込前後の確認用。読み取りなので write gate 不要)
+router.get('/items/manage-numbers/:manageNumber', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    const result = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+    res.status(result.status).json(result.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// 新規作成 (倉庫指定固定)。既存商品なら 409 で拒否
+router.put('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    const payload = req.body && typeof req.body === 'object' ? { ...req.body } : null;
+    if (!payload || !payload.title) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'item payload (title 必須) が必要です', requestId: req.requestId });
+    }
+
+    // 確認→PUT を manageNumber 単位のロック内で行う (同番号への並行リクエストを直列化)
+    const result = await withManageNumberLock(mn, async () => {
+      // 稼働中ページの上書き防止: 既に存在するなら作らない
+      const existing = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (existing.status === 200) return { block: 409 };
+      if (existing.status !== 404) return { block: 502, detail: existing.status };
+
+      // 公開状態はサーバー側で強制 (P3 スコープ: 非公開登録のみ。公開は人が RMS で)
+      payload.hideItem = true;
+
+      // 変更系は自動リトライしない (High-2: timeout 後の再送は既存確認を通らず
+      // 上書きになりうる)。結果不明なら呼び出し側が GET で照合する
+      return rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}`, method: 'PUT', body: payload, timeoutMs: 90_000, maxAttempts: 1 });
+    });
+    if (result.block === 409) {
+      return errorResponse(res, {
+        status: 409, error: 'ITEM_ALREADY_EXISTS',
+        message: `商品管理番号 ${mn} は楽天に既に存在します。既存ページの上書きはこの API では行いません`,
+        requestId: req.requestId,
+      });
+    }
+    if (result.block === 502) {
+      return errorResponse(res, { status: 502, error: 'RMS_PRECHECK_FAILED', message: `既存確認に失敗 (HTTP ${result.detail})`, requestId: req.requestId });
+    }
+    console.log(`[rakuten-rms] item create mn=${mn} status=${result.status}`);
+    res.status(result.status).json(result.data ?? { ok: result.status < 300 });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// 削除 (非公開の商品のみ)。テスト登録の掃除用
+router.delete('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    // High-3: 「非公開確認→DELETE」の間に公開される競合は API 仕様上防げない。
+    // そこで削除はテスト用の管理番号 (zz- で始まる) に**構造的に限定**する。
+    // 本番商品は zz- で始まらないので、この route から消えることはない
+    if (!mn.startsWith('zz-')) {
+      return errorResponse(res, {
+        status: 403, error: 'DELETE_NOT_ALLOWED',
+        message: '削除できるのはテスト用商品 (zz- で始まる管理番号) だけです',
+        requestId: req.requestId,
+      });
+    }
+    const result = await withManageNumberLock(mn, async () => {
+      const existing = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (existing.status === 404) return { block: 404 };
+      const item = existing.data?.item || existing.data;
+      if (item?.hideItem !== true) return { block: 403 };
+      return rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}`, method: 'DELETE', maxAttempts: 1 });
+    });
+    if (result.block === 404) {
+      return errorResponse(res, { status: 404, error: 'ITEM_NOT_FOUND', message: `${mn} は存在しません`, requestId: req.requestId });
+    }
+    if (result.block === 403) {
+      return errorResponse(res, {
+        status: 403, error: 'ITEM_IS_PUBLIC',
+        message: `${mn} は公開中のため削除しません (非公開の商品だけ削除できます)`,
+        requestId: req.requestId,
+      });
+    }
+    console.log(`[rakuten-rms] item delete mn=${mn} status=${result.status}`);
+    res.status(result.status === 204 ? 200 : result.status).json({ ok: result.status === 204, status: result.status });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// ==========================================
+// R-Cabinet (画像置き場)。XML API 1.0
+//   folder-ensure: directoryName で検索し、無ければ作成 (冪等)
+//   upload: base64 画像を multipart で insert → FileUrl から item 用 location を導出
+// ==========================================
+
+const CABINET_UPLOAD_MAX_BYTES = 2 * 1024 * 1024; // R-Cabinet の上限 2MB (デコード後)
+
+function xmlEscape(s) {
+  return String(s).replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
+}
+
+// 1.0 XML response から result ブロックを安全に取り出す (xml2js explicitArray:false 前提)
+async function parseCabinetXml(text) {
+  const { parseStringPromise } = await import('xml2js');
+  return parseStringPromise(String(text || ''), { explicitArray: false });
+}
+
+router.post('/cabinet/folder-ensure', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const directoryName = String(req.body?.directoryName || '').trim();
+    // 同じ directoryName の folder-ensure は直列化 (同時要求の二重作成防止)
+    return await withManageNumberLock(`cabinet-dir:${directoryName}`, async () => {
+    const folderName = String(req.body?.folderName || directoryName).trim();
+    // directoryName は URL パスになる。楽天仕様 (半角英数字) に限定
+    if (!/^[a-z0-9][a-z0-9\-]{0,19}$/.test(directoryName)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_DIRECTORY', message: 'directoryName は半角英数小文字とハイフンで指定してください', requestId: req.requestId });
+    }
+
+    // 既存フォルダを探す (最大10ページ = 1000フォルダまで走査)。
+    // 検索失敗や走査上限到達は「存在しない」とみなさず fail-closed で返す
+    // (Codex medium: 見落として同名フォルダを二重作成しない)
+    let searched = 0;
+    let totalFolders = null;
+    for (let offset = 1; offset <= 10; offset++) {
+      const r = await rakutenRequest({ path: `/es/1.0/cabinet/folders/search?offset=${offset}&limit=100` });
+      if (r.status !== 200) {
+        return errorResponse(res, { status: 502, error: 'CABINET_SEARCH_FAILED', message: `folder search 失敗 (HTTP ${r.status})`, requestId: req.requestId });
+      }
+      const parsed = await parseCabinetXml(r.data);
+      const resBlock = parsed?.result?.cabinetFoldersSearchResult;
+      let folders = resBlock?.folders?.folder || [];
+      if (!Array.isArray(folders)) folders = [folders];
+      const hit = folders.find((f) => String(f?.DirectoryName || '').trim() === directoryName);
+      if (hit) {
+        return okResponse(res, { folderId: Number(hit.FolderId), directoryName, existed: true });
+      }
+      searched += folders.length;
+      totalFolders = Number(resBlock?.folderAllCount || 0);
+      if (searched >= totalFolders || folders.length === 0) break;
+    }
+    if (totalFolders !== null && searched < totalFolders) {
+      return errorResponse(res, {
+        status: 502, error: 'CABINET_TOO_MANY_FOLDERS',
+        message: `フォルダ数が多く全走査できません (${searched}/${totalFolders})。手動でフォルダIDを確認してください`,
+        requestId: req.requestId,
+      });
+    }
+
+    // 無ければ作成
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<request><folderInsertRequest><folder>
+<folderName>${xmlEscape(folderName)}</folderName>
+<directoryName>${xmlEscape(directoryName)}</directoryName>
+<upperFolderId>0</upperFolderId>
+</folder></folderInsertRequest></request>`;
+    const ins = await rakutenRequest({
+      path: '/es/1.0/cabinet/folder/insert', method: 'POST',
+      rawBody: xml, headers: { 'Content-Type': 'text/xml; charset=UTF-8' },
+      maxAttempts: 1, // 変更系は自動リトライしない (二重作成防止)
+    });
+    const parsed = await parseCabinetXml(ins.data);
+    const result = parsed?.result?.cabinetFolderInsertResult;
+    const code = String(result?.resultCode ?? '');
+    if (ins.status !== 200 || code !== '0') {
+      return errorResponse(res, {
+        status: 502, error: 'CABINET_FOLDER_INSERT_FAILED',
+        message: `folder insert 失敗 (HTTP ${ins.status} / resultCode ${code || 'なし'})`,
+        requestId: req.requestId,
+      });
+    }
+    console.log(`[rakuten-rms] cabinet folder created dir=${directoryName} id=${result.FolderId}`);
+    okResponse(res, { folderId: Number(result.FolderId), directoryName, existed: false });
+    });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+router.post('/cabinet/upload', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const folderId = Number(req.body?.folderId);
+    const filePath = String(req.body?.filePath || '').trim();
+    const fileName = String(req.body?.fileName || filePath).trim();
+    const fileBase64 = String(req.body?.fileBase64 || '');
+    if (!Number.isInteger(folderId) || folderId <= 0) {
+      return errorResponse(res, { status: 400, error: 'INVALID_FOLDER_ID', message: 'folderId が必要です', requestId: req.requestId });
+    }
+    // filePath は画像URLの一部になる。この route は JPEG 専用 (Content-Type と整合させる)
+    if (!/^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(filePath)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_FILE_PATH', message: 'filePath は英数小文字とハイフン + .jpg で指定してください', requestId: req.requestId });
+    }
+    let buf;
+    try {
+      buf = Buffer.from(fileBase64, 'base64');
+    } catch (_) {
+      buf = null;
+    }
+    if (!buf || buf.length === 0) {
+      return errorResponse(res, { status: 400, error: 'INVALID_FILE', message: 'fileBase64 が空か不正です', requestId: req.requestId });
+    }
+    // JPEG マジックバイト (FF D8) を検証 (Codex medium: 不正 base64 は黙って壊れた画像になる)
+    if (buf[0] !== 0xFF || buf[1] !== 0xD8) {
+      return errorResponse(res, { status: 400, error: 'NOT_JPEG', message: 'JPEG ではありません (先頭バイト不一致)', requestId: req.requestId });
+    }
+    if (buf.length > CABINET_UPLOAD_MAX_BYTES) {
+      return errorResponse(res, { status: 400, error: 'FILE_TOO_LARGE', message: `画像は2MB以下にしてください (${Math.round(buf.length / 1024)}KB)`, requestId: req.requestId });
+    }
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<request><fileInsertRequest><file>
+<fileName>${xmlEscape(fileName)}</fileName>
+<folderId>${folderId}</folderId>
+<filePath>${xmlEscape(filePath)}</filePath>
+<overWrite>true</overWrite>
+</file></fileInsertRequest></request>`;
+    const fd = new FormData();
+    fd.append('xml', xml);
+    fd.append('file', new Blob([buf], { type: 'image/jpeg' }), filePath);
+    const ins = await rakutenRequest({
+      path: '/es/1.0/cabinet/file/insert', method: 'POST', formData: fd, timeoutMs: 90_000,
+      maxAttempts: 1, // overWrite=true で再実行は安全だが、自動再送はしない (呼び出し側の再操作に任せる)
+    });
+    const parsed = await parseCabinetXml(ins.data);
+    const result = parsed?.result?.cabinetFileInsertResult;
+    const code = String(result?.resultCode ?? '');
+    if (ins.status !== 200 || code !== '0') {
+      return errorResponse(res, {
+        status: 502, error: 'CABINET_UPLOAD_FAILED',
+        message: `file insert 失敗 (HTTP ${ins.status} / resultCode ${code || 'なし'})`,
+        requestId: req.requestId,
+      });
+    }
+    const fileId = Number(result.FileId);
+
+    // FileUrl を引いて item 用の location (/dir/file.jpg) を導出する
+    let fileUrl = null;
+    let location = null;
+    const search = await rakutenRequest({ path: `/es/1.0/cabinet/files/search?fileId=${fileId}` });
+    if (search.status === 200) {
+      const sp = await parseCabinetXml(search.data);
+      let files = sp?.result?.cabinetFilesSearchResult?.files?.file || [];
+      if (!Array.isArray(files)) files = [files];
+      fileUrl = files[0]?.FileUrl || null;
+      if (fileUrl) {
+        const m = String(fileUrl).match(/\/cabinet(\/.+)$/);
+        location = m ? m[1] : null;
+      }
+    }
+    console.log(`[rakuten-rms] cabinet upload fileId=${fileId} path=${filePath} location=${location}`);
+    okResponse(res, { fileId, fileUrl, location });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 router.get('/status', (req, res) => {
   okResponse(res, {
     hasCredentials: !!(process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY),
