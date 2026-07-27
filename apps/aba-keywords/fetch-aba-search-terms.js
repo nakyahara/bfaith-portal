@@ -207,10 +207,12 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       rowCount++;
     });
 
-    // 全行が normalize で弾かれた = レポートのフィールド名が想定と違う (仕様変更)。
-    // 台帳に書いて「取込済み」にしてしまうとサイレント欠落になるためハード失敗させて通知に載せる
-    if (rowCount === 0 && skipped > 0) {
-      throw new Error(`全${skipped}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`);
+    // 0行取込は台帳に書かずハード失敗 (書くと「取込済み」でサイレント欠落が確定する):
+    //   skipped>0 = フィールド名が想定と違う (仕様変更) / skipped=0 = 空レポート (想定外)
+    if (rowCount === 0) {
+      throw new Error(skipped > 0
+        ? `全${skipped}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`
+        : '取込0行 (空レポート) — ABA週次が空になることは想定外のため要確認');
     }
 
     db.prepare(`

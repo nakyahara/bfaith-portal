@@ -5,11 +5,15 @@
  *   { "reportSpecification": {...}, "dataByDepartmentAndSearchTerm": [ {...}, {...}, ... ] }
  * 数百MB級になり得るため JSON.parse は使えない (miniPC はメモリ制約あり)。
  *
- * 依存を増やさないため専用の逐次スキャナで実装する。キー探索は生テキストの
- * indexOf ではなく JSON 構文 (トップレベル深さ・文字列・エスケープ) を追跡し、
- * 「depth=1 のプロパティ名 dataByDepartmentAndSearchTerm の直後の ':' → '['」
- * だけを配列開始と認める (文字列値にキー名が現れても誤検知しない — Codex R1 medium)。
- * 要素は {} / [] ネストとエスケープを追跡して切り出し、要素単位で JSON.parse する。
+ * 依存を増やさないため専用の逐次スキャナで実装する。方針は「省メモリだが厳格」:
+ *   - キー探索は JSON 構文 (トップレベル深さ・文字列・エスケープ) を追跡し、
+ *     depth=1 のプロパティ名の直後の ':' → '[' だけを配列開始と認める
+ *     (文字列値にキー名が現れても誤検知しない — Codex R1 medium)
+ *   - 配列要素はオブジェクトのみ許容。非オブジェクト要素・要素間のゴミは即エラー
+ *     (黙って読み飛ばすと 0件取込が「完了」として台帳確定する — Codex R2 high)
+ *   - 配列の閉じ ']' と外側オブジェクトの閉じまで検証。途中切断・末尾ゴミはエラー
+ *     (Codex R1 high / R2 medium)
+ *   - 要素単位で JSON.parse するので値の解釈は本物の JSON パーサに任せる
  */
 import { StringDecoder } from 'string_decoder';
 
@@ -17,8 +21,6 @@ const ARRAY_KEY = 'dataByDepartmentAndSearchTerm';
 
 /**
  * ストリーミングで配列要素を1件ずつ callback に渡す。
- * 配列の閉じ ']' まで読めなければ必ず throw する (途中切断を成功扱いすると
- * 台帳が「取込完了」になりサイレント欠落するため — Codex R1 high)。
  * @param {AsyncIterable<Buffer|string>} source - 解凍済みJSONテキストのチャンク列
  * @param {(item: object) => void} onItem
  * @returns {Promise<{itemCount: number}>}
@@ -26,28 +28,26 @@ const ARRAY_KEY = 'dataByDepartmentAndSearchTerm';
 export async function parseAbaReportStream(source, onItem) {
   let itemCount = 0;
 
-  // ---- 探索フェーズの状態 (in-array 前) ----
-  // phase: 'seek' → キー探索 / 'expect-colon' → キー直後の ':' 待ち /
-  //        'expect-bracket' → '[' 待ち / 'in-array' → 要素収集
+  // phase: 'seek' キー探索 → 'expect-colon' → 'expect-bracket' → 'in-array' 要素収集
+  //        → 'tail' 外側JSONの閉じ待ち → 'complete' 文書終端 (以降は空白のみ許容)
   let phase = 'seek';
-  let depth = 0;          // ドキュメントの {} / [] 深さ
+  let depth = 0;          // 要素外の {} / [] 深さ (対象配列の '[' は数えない)
   let inString = false;
   let escaped = false;
   let strBuf = null;      // depth===1 の文字列の中身 (キー候補)。それ以外は null
 
-  // ---- in-array フェーズの状態 ----
+  // in-array の状態
+  let arrayExpect = 'value-or-end'; // 'value-or-end' | 'value' | 'comma-or-end'
   let elDepth = 0;
   let elInString = false;
   let elEscaped = false;
   let buf = '';
   let collecting = false;
-  let done = false;
 
   // マルチバイト文字がチャンク境界で割れても壊れないよう StringDecoder で持ち越す
   const decoder = new StringDecoder('utf8');
 
   for await (const chunk of source) {
-    if (done) break;
     const text = typeof chunk === 'string' ? chunk : decoder.write(chunk);
 
     for (let i = 0; i < text.length; i++) {
@@ -76,18 +76,46 @@ export async function parseAbaReportStream(source, onItem) {
           }
           continue;
         }
-        // 要素間: '{' で次要素開始、']' で配列終端
+        // 要素間: 期待トークンを厳格に検証 (ゴミ・非オブジェクト要素は即エラー)
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+        if (ch === ']' && arrayExpect !== 'value') { phase = 'tail'; continue; }
+        if (arrayExpect === 'comma-or-end') {
+          if (ch === ',') { arrayExpect = 'value'; continue; }
+          throw new Error(`ABAレポート解析エラー: 要素の後に不正な文字 '${ch}' (itemCount=${itemCount})`);
+        }
+        // 'value' / 'value-or-end': 要素はオブジェクトのみ許容
         if (ch === '{') {
           collecting = true;
           elDepth = 1;
           elInString = false;
           elEscaped = false;
           buf = '{';
-        } else if (ch === ']') {
-          done = true;
-          break;
+          arrayExpect = 'comma-or-end';
+          continue;
         }
-        continue; // カンマ・空白は読み飛ばす
+        throw new Error(`ABAレポート解析エラー: オブジェクト以外の配列要素 (先頭文字 '${ch}', itemCount=${itemCount})`);
+      }
+
+      // ================= 配列後: 外側JSONの閉じを検証 =================
+      if (phase === 'tail' || phase === 'complete') {
+        if (inString) {
+          if (escaped) { escaped = false; }
+          else if (ch === '\\') { escaped = true; }
+          else if (ch === '"') { inString = false; }
+          continue;
+        }
+        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+        if (phase === 'complete') {
+          throw new Error(`ABAレポート解析エラー: 文書終端後に余分な文字 '${ch}'`);
+        }
+        if (ch === '"') { inString = true; continue; }
+        if (ch === '{' || ch === '[') { depth++; continue; }
+        if (ch === '}' || ch === ']') {
+          depth--;
+          if (depth === 0) phase = 'complete';
+          continue;
+        }
+        continue; // ',' ':' 値リテラル等は素通し (完全な構文検証はここでは不要)
       }
 
       // ================= キー探索 (JSON構文追跡) =================
@@ -118,7 +146,7 @@ export async function parseAbaReportStream(source, onItem) {
         phase = 'seek';
       }
       if (phase === 'expect-bracket') {
-        if (ch === '[') { phase = 'in-array'; continue; }
+        if (ch === '[') { phase = 'in-array'; arrayExpect = 'value-or-end'; continue; }
         // 値が配列でない → 探索継続
         phase = 'seek';
       }
@@ -127,13 +155,16 @@ export async function parseAbaReportStream(source, onItem) {
     }
   }
 
-  if (!done) {
-    if (phase !== 'in-array') {
+  if (phase !== 'complete') {
+    if (phase === 'seek' || phase === 'expect-colon' || phase === 'expect-bracket') {
       throw new Error('ABAレポート解析エラー: dataByDepartmentAndSearchTerm 配列が見つからない');
     }
-    // 配列の閉じ ']' 未到達 = ダウンロード途中切断。成功扱いにすると欠損データで
-    // 台帳が確定してしまうため必ず失敗させる
-    throw new Error(`ABAレポート解析エラー: 配列が閉じる前にストリームが終了 (itemCount=${itemCount}, collecting=${collecting})`);
+    if (phase === 'in-array') {
+      // 配列の閉じ ']' 未到達 = ダウンロード途中切断。成功扱いにすると欠損データで
+      // 台帳が確定してしまうため必ず失敗させる
+      throw new Error(`ABAレポート解析エラー: 配列が閉じる前にストリームが終了 (itemCount=${itemCount}, collecting=${collecting})`);
+    }
+    throw new Error(`ABAレポート解析エラー: 外側JSONが閉じる前にストリームが終了 (itemCount=${itemCount})`);
   }
   return { itemCount };
 }

@@ -104,6 +104,29 @@ const FIXTURE = JSON.stringify({
   check('途中切断でエラー', threw);
 }
 
+// --- 6b. 非オブジェクト要素・要素間ゴミ・末尾ゴミ・外側未クローズ (Codex R2) ---
+{
+  const cases = [
+    ['非object要素 [null]', '{"dataByDepartmentAndSearchTerm":[null]}'],
+    ['非object要素 [123]', '{"dataByDepartmentAndSearchTerm":[123]}'],
+    ['要素間ゴミ', '{"dataByDepartmentAndSearchTerm":[{"searchTerm":"x","searchFrequencyRank":1,"clickedAsin":"B000000001"} garbage]}'],
+    ['trailing comma', '{"dataByDepartmentAndSearchTerm":[{"a":1},]}'],
+    ['文書終端後のゴミ', '{"dataByDepartmentAndSearchTerm":[]}x'],
+    ['外側未クローズ', '{"dataByDepartmentAndSearchTerm":[]'],
+  ];
+  for (const [name, json] of cases) {
+    let threw = false;
+    try { await parseAbaReportStream(chunked(json, 4), () => {}); }
+    catch { threw = true; }
+    check(`厳格検証: ${name} でエラー`, threw);
+  }
+  // 正常系: 配列の後に別プロパティが続いても外側が正しく閉じればOK
+  const after = '{"dataByDepartmentAndSearchTerm":[{"searchTerm":"x","searchFrequencyRank":1,"clickedAsin":"B000000001"}],"summary":{"count":1,"note":"a]b}c"}}';
+  const items = [];
+  await parseAbaReportStream(chunked(after, 4), (it) => items.push(it));
+  check('厳格検証: 配列後の後続プロパティは許容', items.length === 1);
+}
+
 // --- 7. normalizeAbaItem ---
 {
   const n = normalizeAbaItem({ departmentName: 'Amazon.co.jp', searchTerm: 'x', searchFrequencyRank: 10, clickedAsin: 'b072hhz1sm', clickShareRank: 2, clickShare: 0.1, conversionShare: 0.2 });

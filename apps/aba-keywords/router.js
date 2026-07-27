@@ -77,17 +77,28 @@ const apiQueues = new Map();
 const lastCallAt = new Map();
 function enqueueApiCall(key, minIntervalMs, timeoutMs, fn) {
   const prev = apiQueues.get(key) || Promise.resolve();
-  const next = prev.catch(() => { /* 前段の失敗はチェーンを止めない */ }).then(async () => {
+  // キューの占有は fn の settle まで維持する (Codex R2 high: Promise.race はキャンセルでは
+  // ないため、タイムアウト = キュー解放にすると未完の呼び出しと次の呼び出しが並走する)。
+  // 呼び出し元へのタイムアウト通知とキュー解放は分離する。
+  let releaseQueue;
+  const gate = new Promise((resolve) => { releaseQueue = resolve; });
+  apiQueues.set(key, prev.then(() => gate)); // 格納チェーンは reject しない
+  return prev.then(async () => {
     const wait = (lastCallAt.get(key) || 0) + minIntervalMs - Date.now();
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     lastCallAt.set(key, Date.now());
-    return Promise.race([
-      fn(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`SP-API タイムアウト (${timeoutMs / 1000}秒): ${key}`)), timeoutMs)),
-    ]);
+    const call = Promise.resolve().then(fn);
+    call.catch(() => { /* rejection は下の race で伝播済み */ }).then(() => releaseQueue());
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`SP-API タイムアウト (${timeoutMs / 1000}秒): ${key} — 呼び出し完了までキューは待機`)), timeoutMs);
+    });
+    try {
+      return await Promise.race([call, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
   });
-  apiQueues.set(key, next);
-  return next;
 }
 
 function sanitizeAsins(input, max = 100) {
