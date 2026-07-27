@@ -6,18 +6,19 @@
  * 数百MB級になり得るため JSON.parse は使えない (miniPC はメモリ制約あり)。
  *
  * 依存を増やさないため専用の逐次スキャナで実装する。方針は「省メモリだが厳格」:
- *   - キー探索は JSON 構文 (トップレベル深さ・文字列・エスケープ) を追跡し、
- *     depth=1 のプロパティ名の直後の ':' → '[' だけを配列開始と認める
+ *   - キー探索は JSON 構文 (括弧スタック・文字列・エスケープ) を追跡し、
+ *     トップレベル (スタック深さ1) のプロパティ名の直後の ':' → '[' だけを配列開始と認める
  *     (文字列値にキー名が現れても誤検知しない — Codex R1 medium)
  *   - 配列要素はオブジェクトのみ許容。非オブジェクト要素・要素間のゴミは即エラー
  *     (黙って読み飛ばすと 0件取込が「完了」として台帳確定する — Codex R2 high)
- *   - 配列の閉じ ']' と外側オブジェクトの閉じまで検証。途中切断・末尾ゴミはエラー
- *     (Codex R1 high / R2 medium)
+ *   - 括弧はスタックで種類まで照合 ('{' を ']' で閉じる破損を検出 — Codex R3 high)。
+ *     配列後の残り (tail) も文字列/括弧/スカラーリテラルを検証し、末尾ゴミはエラー
  *   - 要素単位で JSON.parse するので値の解釈は本物の JSON パーサに任せる
  */
 import { StringDecoder } from 'string_decoder';
 
 const ARRAY_KEY = 'dataByDepartmentAndSearchTerm';
+const SCALAR_RE = /^(true|false|null|-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?)$/;
 
 /**
  * ストリーミングで配列要素を1件ずつ callback に渡す。
@@ -31,10 +32,11 @@ export async function parseAbaReportStream(source, onItem) {
   // phase: 'seek' キー探索 → 'expect-colon' → 'expect-bracket' → 'in-array' 要素収集
   //        → 'tail' 外側JSONの閉じ待ち → 'complete' 文書終端 (以降は空白のみ許容)
   let phase = 'seek';
-  let depth = 0;          // 要素外の {} / [] 深さ (対象配列の '[' は数えない)
+  const stack = [];       // 要素外の開き括弧 ('{' | '[')。対象配列の '[' は積まない
   let inString = false;
   let escaped = false;
-  let strBuf = null;      // depth===1 の文字列の中身 (キー候補)。それ以外は null
+  let strBuf = null;      // スタック深さ1の文字列の中身 (キー候補)。それ以外は null
+  let literal = '';       // tail のスカラーリテラル蓄積 (true/false/null/数値の検証用)
 
   // in-array の状態
   let arrayExpect = 'value-or-end'; // 'value-or-end' | 'value' | 'comma-or-end'
@@ -43,6 +45,21 @@ export async function parseAbaReportStream(source, onItem) {
   let elEscaped = false;
   let buf = '';
   let collecting = false;
+
+  const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
+  const popBracket = (ch) => {
+    const open = stack.pop();
+    if (!open || (ch === '}' && open !== '{') || (ch === ']' && open !== '[')) {
+      throw new Error(`ABAレポート解析エラー: 括弧の対応不一致 ('${open || 'なし'}' に対して '${ch}')`);
+    }
+  };
+  const flushLiteral = () => {
+    if (literal === '') return;
+    if (!SCALAR_RE.test(literal)) {
+      throw new Error(`ABAレポート解析エラー: 不正なリテラル '${literal.slice(0, 30)}'`);
+    }
+    literal = '';
+  };
 
   // マルチバイト文字がチャンク境界で割れても壊れないよう StringDecoder で持ち越す
   const decoder = new StringDecoder('utf8');
@@ -77,7 +94,7 @@ export async function parseAbaReportStream(source, onItem) {
           continue;
         }
         // 要素間: 期待トークンを厳格に検証 (ゴミ・非オブジェクト要素は即エラー)
-        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+        if (isWs(ch)) continue;
         if (ch === ']' && arrayExpect !== 'value') { phase = 'tail'; continue; }
         if (arrayExpect === 'comma-or-end') {
           if (ch === ',') { arrayExpect = 'value'; continue; }
@@ -104,18 +121,21 @@ export async function parseAbaReportStream(source, onItem) {
           else if (ch === '"') { inString = false; }
           continue;
         }
-        if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+        if (isWs(ch)) { flushLiteral(); continue; }
         if (phase === 'complete') {
           throw new Error(`ABAレポート解析エラー: 文書終端後に余分な文字 '${ch}'`);
         }
-        if (ch === '"') { inString = true; continue; }
-        if (ch === '{' || ch === '[') { depth++; continue; }
+        if (ch === '"') { flushLiteral(); inString = true; continue; }
+        if (ch === ',' || ch === ':') { flushLiteral(); continue; }
+        if (ch === '{' || ch === '[') { flushLiteral(); stack.push(ch); continue; }
         if (ch === '}' || ch === ']') {
-          depth--;
-          if (depth === 0) phase = 'complete';
+          flushLiteral();
+          popBracket(ch);
+          if (stack.length === 0) phase = 'complete';
           continue;
         }
-        continue; // ',' ':' 値リテラル等は素通し (完全な構文検証はここでは不要)
+        literal += ch; // スカラーリテラル候補 (区切りで検証)
+        continue;
       }
 
       // ================= キー探索 (JSON構文追跡) =================
@@ -124,7 +144,7 @@ export async function parseAbaReportStream(source, onItem) {
         else if (ch === '\\') { escaped = true; }
         else if (ch === '"') {
           inString = false;
-          if (depth === 1 && strBuf === ARRAY_KEY) phase = 'expect-colon';
+          if (stack.length === 1 && strBuf === ARRAY_KEY) phase = 'expect-colon';
           strBuf = null;
         } else if (strBuf !== null && strBuf.length <= ARRAY_KEY.length) {
           strBuf += ch;
@@ -135,10 +155,10 @@ export async function parseAbaReportStream(source, onItem) {
         // 文字列開始。expect-colon/expect-bracket 中なら誤検知だったのでリセット
         if (phase !== 'seek') phase = 'seek';
         inString = true;
-        strBuf = depth === 1 ? '' : null;
+        strBuf = stack.length === 1 ? '' : null;
         continue;
       }
-      if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+      if (isWs(ch)) continue;
 
       if (phase === 'expect-colon') {
         if (ch === ':') { phase = 'expect-bracket'; continue; }
@@ -150,8 +170,8 @@ export async function parseAbaReportStream(source, onItem) {
         // 値が配列でない → 探索継続
         phase = 'seek';
       }
-      if (ch === '{' || ch === '[') depth++;
-      else if (ch === '}' || ch === ']') depth--;
+      if (ch === '{' || ch === '[') stack.push(ch);
+      else if (ch === '}' || ch === ']') popBracket(ch);
     }
   }
 

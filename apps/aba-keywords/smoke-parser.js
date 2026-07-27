@@ -113,6 +113,9 @@ const FIXTURE = JSON.stringify({
     ['trailing comma', '{"dataByDepartmentAndSearchTerm":[{"a":1},]}'],
     ['文書終端後のゴミ', '{"dataByDepartmentAndSearchTerm":[]}x'],
     ['外側未クローズ', '{"dataByDepartmentAndSearchTerm":[]'],
+    ['括弧種類の不一致 (Codex R3)', '{"dataByDepartmentAndSearchTerm":[{"a":1}]]'],
+    ['tail内の不正リテラル', '{"dataByDepartmentAndSearchTerm":[],"x":garbage}'],
+    ['seek内の括弧不一致', '{"reportSpecification":{"a":1],"dataByDepartmentAndSearchTerm":[]}'],
   ];
   for (const [name, json] of cases) {
     let threw = false;
@@ -120,8 +123,8 @@ const FIXTURE = JSON.stringify({
     catch { threw = true; }
     check(`厳格検証: ${name} でエラー`, threw);
   }
-  // 正常系: 配列の後に別プロパティが続いても外側が正しく閉じればOK
-  const after = '{"dataByDepartmentAndSearchTerm":[{"searchTerm":"x","searchFrequencyRank":1,"clickedAsin":"B000000001"}],"summary":{"count":1,"note":"a]b}c"}}';
+  // 正常系: 配列の後に別プロパティ (数値/真偽/null/ネスト/括弧入り文字列) が続いても外側が正しく閉じればOK
+  const after = '{"dataByDepartmentAndSearchTerm":[{"searchTerm":"x","searchFrequencyRank":1,"clickedAsin":"B000000001"}],"summary":{"count":1,"ratio":-1.5e3,"ok":true,"none":null,"note":"a]b}c"}}';
   const items = [];
   await parseAbaReportStream(chunked(after, 4), (it) => items.push(it));
   check('厳格検証: 配列後の後続プロパティは許容', items.length === 1);
