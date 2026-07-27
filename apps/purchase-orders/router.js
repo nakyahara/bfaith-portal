@@ -5666,6 +5666,7 @@ function renderIpResult(j, req) {
       });
       // ❓対応表になし行の再登録: 番号変更なら既存商品を検索して選び、その場で対応表を上書き→再変換。
       // 仕入先は変換時点の j.supplierCode に固定 (仮登録ボタンと同じ理由、Codex plan-R1 High)
+      var ipRenderGen = IP_CONV_GEN; // この描画が属する変換世代 (描画時に捕捉 — タイマー発火時ではもう新世代になりうる、Codex 再登録R2 Medium)
       var ipQDeb = null, ipQGen = 0;
       area.querySelectorAll('input[data-iprelinkq]').forEach(function(inp) {
         inp.addEventListener('input', function(ev) {
@@ -5674,10 +5675,10 @@ function renderIpResult(j, req) {
           var g = ++ipQGen; // 早期returnでも世代を進め、送信済み要求の遅延応答で候補を上書きしない
           if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
           ipQDeb = setTimeout(function() {
-            var pg = IP_CONV_GEN; // 別の変換結果の描画をまたいだ旧応答で候補を上書きしない (仕入先違いの候補が見えるのを防ぐ、Codex 再登録R1 Medium)
+            // 別の変換結果の描画をまたいだ旧応答で候補を上書きしない (仕入先違いの候補が見えるのを防ぐ、Codex 再登録R1 Medium)
             getJson(API + '/vendor-map/products?supplier=' + encodeURIComponent(j.supplierCode) + '&q=' + encodeURIComponent(v))
               .then(function(r2) {
-                if (!r2.ok || g !== ipQGen || pg !== IP_CONV_GEN) return;
+                if (!r2.ok || g !== ipQGen || ipRenderGen !== IP_CONV_GEN) return;
                 var dl = document.getElementById('ipProdDl');
                 if (dl) dl.innerHTML = r2.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>'; }).join('');
               }).catch(function(){});
