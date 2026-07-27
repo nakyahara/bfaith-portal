@@ -290,13 +290,26 @@ export function buildItemPayload(db, draftId) {
   if (taxText && !/^(8|10)\s*%?$/.test(taxText)) {
     reasons.push(`税率「${taxText}」が不正です (8% / 10% / 空欄のみ)`);
   }
-  // JAN はチェックデジットまで検証し、手入力のカタログID属性と食い違ったら止める (Codex R1 Medium-4)
+  // JAN はチェックデジットまで検証し、手入力のカタログID属性と食い違ったら止める (Codex R1 Medium-4)。
+  // カタログID属性は最大1件・値1個に限定し、その値自体も GTIN 検証する
+  // (R2 Medium: 複数記述で不一致検査を迂回できた / JAN欄が空だと手入力値が未検証だった)
   const jan = String(draft.jan_code || '').trim();
-  const manualCatalog = Array.isArray(attributes) ? attributes.find((a) => a.name === 'カタログID') : null;
+  const catalogAttrs = Array.isArray(attributes) ? attributes.filter((a) => a.name === 'カタログID') : [];
+  let manualCatalog = null;
+  if (catalogAttrs.length > 1) {
+    reasons.push('商品属性「カタログID」が複数あります (1件にまとめてください)');
+  } else if (catalogAttrs.length === 1) {
+    manualCatalog = catalogAttrs[0];
+    if (manualCatalog.values.length !== 1) {
+      reasons.push('商品属性「カタログID」の値は1個だけにしてください');
+    } else if (!isValidGtin(manualCatalog.values[0])) {
+      reasons.push(`商品属性のカタログID「${manualCatalog.values[0]}」の形式が不正です (8/12/13桁 + チェックデジット)`);
+    }
+  }
   if (jan) {
     if (!isValidGtin(jan)) {
       reasons.push(`JANコード「${jan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
-    } else if (manualCatalog && manualCatalog.values[0] !== jan) {
+    } else if (manualCatalog && manualCatalog.values.length === 1 && manualCatalog.values[0] !== jan) {
       reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
     }
   }

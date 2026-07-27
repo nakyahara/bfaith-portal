@@ -13,6 +13,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
@@ -21,34 +22,36 @@ import { rakutenRequest } from './rakuten-client.js';
 const router = Router();
 
 // ─── アプリ起点で作成した商品の台帳 (visibility の対象制限) ───
-// Codex R1 High-2: service token を持てば任意の商品管理番号を公開/非公開にできるのは危険。
-// この service の PUT (新規作成) が作った管理番号だけを台帳に記録し、
-// visibility は「台帳にある商品 + zz- テスト商品」に構造的に制限する。
-// 台帳導入以前にこの route で作られた本番商品は無い (P3 未稼働・smoke は zz- のみ) ので抜けは無い。
+// Codex R1 High-2 / R2 High: service token を持てば任意の商品管理番号を公開/非公開に
+// できるのは危険。この service の PUT (新規作成) が作った管理番号だけを台帳に記録し、
+// visibility は**台帳にある商品のみ**に構造的に制限する (zz- の無条件例外は R2 で撤廃 —
+// zz- テスト商品も PUT で作れば台帳に載るので例外は不要)。
+// 永続層は SQLite (WAL・原子的 upsert)。JSON ファイル書き戻しは複数プロセスで後勝ち消失が
+// あり得るため不採用 (R2 Medium)。台帳導入以前にこの route で作られた本番商品は無い。
 const RMS_DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const CREATED_ITEMS_FILE = path.join(RMS_DATA_DIR, 'rms-app-created-items.json');
-let createdItemsCache = null; // Set<manageNumber (lowercase)>
-function loadCreatedItems() {
-  if (createdItemsCache) return createdItemsCache;
-  try {
-    const arr = JSON.parse(fs.readFileSync(CREATED_ITEMS_FILE, 'utf8'));
-    createdItemsCache = new Set(Array.isArray(arr) ? arr.map((s) => String(s).toLowerCase()) : []);
-  } catch (_) {
-    createdItemsCache = new Set(); // ファイル無し = 未作成 (fail-closed: 台帳に無ければ切替不可)
-  }
-  return createdItemsCache;
+let registryDb = null;
+function getRegistryDb() {
+  if (registryDb) return registryDb;
+  fs.mkdirSync(RMS_DATA_DIR, { recursive: true });
+  registryDb = new Database(path.join(RMS_DATA_DIR, 'rms-app-items.db'));
+  registryDb.pragma('journal_mode = WAL');
+  registryDb.pragma('busy_timeout = 5000');
+  registryDb.exec(`CREATE TABLE IF NOT EXISTS app_created_items (
+    manage_number TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`);
+  return registryDb;
 }
 function recordCreatedItem(mn) {
-  const set = loadCreatedItems();
-  if (set.has(mn)) return;
-  set.add(mn);
   try {
-    fs.mkdirSync(RMS_DATA_DIR, { recursive: true });
-    fs.writeFileSync(CREATED_ITEMS_FILE, JSON.stringify([...set]));
+    getRegistryDb().prepare('INSERT OR IGNORE INTO app_created_items (manage_number) VALUES (?)').run(mn);
   } catch (e) {
-    // 保存に失敗すると再起動後にその商品の公開切替ができなくなるだけ (安全側)。ログだけ残す
-    console.error('[rakuten-rms] created-items 台帳の保存に失敗:', e.message);
+    // 記録に失敗しても RMS 側の作成は成功している。その商品の公開切替が拒否されるだけ (安全側)
+    console.error('[rakuten-rms] app_created_items 台帳の保存に失敗:', e.message);
   }
+}
+function isAppCreatedItem(mn) {
+  return !!getRegistryDb().prepare('SELECT 1 FROM app_created_items WHERE manage_number = ?').get(mn);
 }
 
 const DETAILS_BULK_MAX = 200;
@@ -474,7 +477,8 @@ router.post('/items/manage-numbers/:manageNumber/visibility', requireWrite, rate
     if (typeof req.body?.hide !== 'boolean') {
       return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'hide (boolean) が必要です', requestId: req.requestId });
     }
-    if (!mn.startsWith('zz-') && !loadCreatedItems().has(mn)) {
+    // 台帳照合のみ (zz- 例外なし — R2 High)。zz- テスト商品も PUT 経由なら台帳に載る
+    if (!isAppCreatedItem(mn)) {
       return errorResponse(res, {
         status: 403, error: 'VISIBILITY_NOT_ALLOWED',
         message: `${mn} はこの service から登録した商品ではないため公開切替できません (既存商品は RMS 画面で操作)`,

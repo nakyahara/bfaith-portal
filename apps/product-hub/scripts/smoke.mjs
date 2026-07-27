@@ -791,6 +791,19 @@ dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
 check('payload: カタログID属性とJAN欄の不一致を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('一致しません')), JSON.stringify(b27.reasons));
+
+// R2: 複数のカタログID属性で不一致検査を迂回できない
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]},{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: カタログID属性の複数記述を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('複数')), JSON.stringify(b27.reasons));
+
+// R2: JAN欄が空でも手入力カタログID自体を GTIN 検証する
+db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567890"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 手入力カタログIDの不正値を弾く (JAN欄が空でも)',
+  b27.ok === false && b27.reasons.some((r) => r.includes('カタログID') && r.includes('不正')), JSON.stringify(b27.reasons));
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
 
 // 転送後に削除した画像は送らない (Codex R1 Medium-2: draft_images との JOIN)
