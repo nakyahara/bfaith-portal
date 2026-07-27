@@ -5674,9 +5674,10 @@ function renderIpResult(j, req) {
           var g = ++ipQGen; // 早期returnでも世代を進め、送信済み要求の遅延応答で候補を上書きしない
           if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
           ipQDeb = setTimeout(function() {
+            var pg = IP_CONV_GEN; // 別の変換結果の描画をまたいだ旧応答で候補を上書きしない (仕入先違いの候補が見えるのを防ぐ、Codex 再登録R1 Medium)
             getJson(API + '/vendor-map/products?supplier=' + encodeURIComponent(j.supplierCode) + '&q=' + encodeURIComponent(v))
               .then(function(r2) {
-                if (!r2.ok || g !== ipQGen) return;
+                if (!r2.ok || g !== ipQGen || pg !== IP_CONV_GEN) return;
                 var dl = document.getElementById('ipProdDl');
                 if (dl) dl.innerHTML = r2.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>'; }).join('');
               }).catch(function(){});
@@ -5692,17 +5693,27 @@ function renderIpResult(j, req) {
           var dash = pv.indexOf(' — ');
           var pcode = (dash >= 0 ? pv.slice(0, dash) : pv).trim(); // 「コード — 商品名」からコードを取り出す (手入力のコードだけでも可)
           if (!pcode) { toast('再登録する商品を検索して選択してください (新商品は下の🕗仮登録へ)'); return; }
-          if (!confirm('商品 ' + pcode + ' の先方番号を「' + line.vendorCode + '」として対応表へ登録しますか?\\n(既に別の番号が付いている場合は上書きします。入数はそのまま)')) return;
           btn.disabled = true;
-          // baseUpdatedAt なし = 無条件上書き (直前にconfirmで確認済み。旧番号は応答で表示し、監査ログにも残る)
-          post(API + '/vendor-map/entry', { supplier_code: j.supplierCode, product_code: pcode, vendor_code: line.vendorCode })
-            .then(function(r2) {
-              btn.disabled = false;
-              if (!r2.ok) { toast('エラー: ' + r2.error); return; }
-              toast(r2.updated ? '先方番号を更新しました (旧: ' + (r2.oldVendorCode || '—') + ') — 変換し直します' : '対応表へ登録しました — 変換し直します');
-              if (r2.warning) toast('⚠️ ' + r2.warning);
-              reconvertIp();
-            }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+          // 現在の登録内容を取得してから確認 → baseUpdatedAt 付きで送信 (マスタ管理と同じ楽観ロック。
+          // 確認中に他画面が変更していたらサーバが409で知らせる、Codex 再登録R1 Medium)
+          getJson(API + '/vendor-map/entries?supplier=' + encodeURIComponent(j.supplierCode)).then(function(r0) {
+            if (!r0.ok) { btn.disabled = false; toast('エラー: ' + r0.error); return; }
+            var keyLc = pcode.toLowerCase(); // product_key = trim+小文字 (db.js normProductCode と同じ照合キー)
+            var cur = (r0.rows || []).find(function(x){ return String(x.product_key) === keyLc; });
+            var msg = cur
+              ? '商品 ' + pcode + ' の先方番号を更新しますか?\\n現在: ' + cur.vendor_code + ' → 新: ' + line.vendorCode + '\\n(入数はそのまま維持されます)'
+              : '商品 ' + pcode + ' に先方番号「' + line.vendorCode + '」を新規登録しますか?';
+            if (!confirm(msg)) { btn.disabled = false; return; }
+            post(API + '/vendor-map/entry', { supplier_code: j.supplierCode, product_code: pcode, vendor_code: line.vendorCode,
+              baseUpdatedAt: cur ? cur.updated_at : null })
+              .then(function(r2) {
+                btn.disabled = false;
+                if (!r2.ok) { toast('エラー: ' + r2.error); return; }
+                toast(r2.updated ? '先方番号を更新しました (旧: ' + (r2.oldVendorCode || '—') + ') — 変換し直します' : '対応表へ登録しました — 変換し直します');
+                if (r2.warning) toast('⚠️ ' + r2.warning);
+                reconvertIp();
+              }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+          }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
         });
       });
       var pd = document.getElementById('ipPend');
