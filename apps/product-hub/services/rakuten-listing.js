@@ -221,6 +221,20 @@ export function taxRateToPayment(taxRateText) {
 }
 
 /**
+ * GTIN (JAN-8 / UPC-12 / JAN-13) の桁数 + チェックデジット検証。
+ * 右端 (チェックデジット除く) から 3,1,3,1… の重みで合計し、(10 - sum%10)%10 が末尾と一致すること。
+ */
+export function isValidGtin(code) {
+  const s = String(code || '').trim();
+  if (!/^(\d{8}|\d{12}|\d{13})$/.test(s)) return false;
+  const digits = s.split('').map(Number);
+  const check = digits.pop();
+  let sum = 0;
+  digits.reverse().forEach((d, i) => { sum += d * (i % 2 === 0 ? 3 : 1); });
+  return (10 - (sum % 10)) % 10 === check;
+}
+
+/**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
  */
 export function buildItemPayload(db, draftId) {
@@ -237,7 +251,16 @@ export function buildItemPayload(db, draftId) {
   // 白抜き背景画像は images[] ではなく whiteBgImage で送る (検索サムネ用の別枠)
   const whiteBgId = rk.white_bg_drive_file_id || null;
   const whiteBg = whiteBgId ? cabinetAll.find((c) => c.drive_file_id === whiteBgId) || null : null;
-  const cabinet = cabinetAll.filter((c) => c.drive_file_id !== whiteBgId);
+  // 送る画像は「現在の draft_images」と転送履歴の JOIN (Codex R1 Medium-2:
+  // 履歴だけから作ると、転送後に削除・差し替えた画像や旧白抜き画像が payload に残る)。
+  // 並びも draft_images の sort に従う
+  const cabinetByFile = new Map(cabinetAll.map((c) => [c.drive_file_id, c.cabinet_location]));
+  const currentImages = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draftId)
+    .filter((i) => i.drive_file_id !== whiteBgId);
+  const cabinet = currentImages
+    .filter((i) => cabinetByFile.has(i.drive_file_id))
+    .map((i) => ({ cabinet_location: cabinetByFile.get(i.drive_file_id) }));
+  const untransferredCount = currentImages.length - cabinet.length;
 
   const reasons = [];
   // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
@@ -255,10 +278,28 @@ export function buildItemPayload(db, draftId) {
   const attributes = parseAttributes(rk.attributes_json);
   if (attributes === null) reasons.push('商品属性の形式が不正です (name と value を埋めてください)');
   if (cabinet.length === 0) reasons.push('R-Cabinet へ転送済みの画像がありません (先に「画像を転送」)');
+  if (untransferredCount > 0) {
+    reasons.push(`商品画像 ${untransferredCount} 枚が R-Cabinet に未転送です (「画像を転送」を実行)`);
+  }
   if (cabinet.length > MAX_RAKUTEN_IMAGES) {
     reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (現在 ${cabinet.length} 枚 — 減らしてください)`);
   }
   if (whiteBgId && !whiteBg) reasons.push('白抜き背景画像が R-Cabinet に未転送です (先に「画像を転送」)');
+  // 税率は 8% / 10% / 空欄 (=店舗デフォルト10%) 以外を fail-closed で止める (Codex R1 Medium-1)
+  const taxText = String(yahooRow.tax_rate ?? '').trim();
+  if (taxText && !/^(8|10)\s*%?$/.test(taxText)) {
+    reasons.push(`税率「${taxText}」が不正です (8% / 10% / 空欄のみ)`);
+  }
+  // JAN はチェックデジットまで検証し、手入力のカタログID属性と食い違ったら止める (Codex R1 Medium-4)
+  const jan = String(draft.jan_code || '').trim();
+  const manualCatalog = Array.isArray(attributes) ? attributes.find((a) => a.name === 'カタログID') : null;
+  if (jan) {
+    if (!isValidGtin(jan)) {
+      reasons.push(`JANコード「${jan}」の形式が不正です (8/12/13桁 + チェックデジット)`);
+    } else if (manualCatalog && manualCatalog.values[0] !== jan) {
+      reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
+    }
+  }
   if (rk.shipping_method_group != null && String(rk.shipping_method_group).trim() !== ''
       && !SHIPPING_METHOD_GROUPS[String(rk.shipping_method_group).trim()]) {
     reasons.push('配送方法の指定が不正です');
@@ -278,8 +319,7 @@ export function buildItemPayload(db, draftId) {
   // JAN → カタログID。SKU 移行後の RMS はカタログIDを商品属性で受ける。
   // ⚠️ 属性名「カタログID」は zz- テスト商品で本番検証してから本運用 (2026-07-27 仕様 §検証)
   const attrs = attributes.slice();
-  const jan = String(draft.jan_code || '').trim();
-  if (jan && !attrs.some((a) => a.name === 'カタログID')) {
+  if (jan && !manualCatalog) {
     attrs.push({ name: 'カタログID', values: [jan] });
   }
 

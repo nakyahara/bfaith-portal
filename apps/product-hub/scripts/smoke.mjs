@@ -713,6 +713,7 @@ check('payload: 不足理由を列挙 (ジャンル/画像)',
 
 db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
   VALUES (?, '205761', '[{"name":"ブランド名","values":["ノーブランド品"]}]', NULL)`).run(rkId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gfile1')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
 db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文')`).run(rkId, rkId, rkId);
 db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
@@ -741,13 +742,17 @@ check('taxRateToPayment: 8% → payment.taxRate 0.08', listing.taxRateToPayment(
 check('taxRateToPayment: 10%/未設定/変値は送らない (店舗デフォルト)',
   listing.taxRateToPayment('10%') === null && listing.taxRateToPayment(null) === null && listing.taxRateToPayment('9.6') === null);
 
-db.prepare(`UPDATE product_drafts SET jan_code = '4901234567890' WHERE id = ?`).run(rkId);
+check('isValidGtin: 正しいJAN-13を通す', listing.isValidGtin('4901234567894') === true);
+check('isValidGtin: チェックデジット不一致/桁数違い/非数字を弾く',
+  listing.isValidGtin('4901234567890') === false && listing.isValidGtin('49012') === false && listing.isValidGtin('4901234abc894') === false);
+
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '8%' });
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', postage_included = 1, normal_delivery_date_id = '1000' WHERE draft_id = ?`).run(rkId);
 built = listing.buildItemPayload(db, rkId);
 const rkVar = built.payload?.variants?.['rk-smoke-1'] || {};
 check('payload: JAN はカタログID属性で送る (本番検証待ちの属性名)',
-  (rkVar.attributes || []).some((a) => a.name === 'カタログID' && a.values[0] === '4901234567890'),
+  (rkVar.attributes || []).some((a) => a.name === 'カタログID' && a.values[0] === '4901234567894'),
   JSON.stringify(rkVar.attributes));
 check('payload: 8% は payment.taxRate で送る', built.payload?.payment?.taxRate === 0.08);
 check('payload: 配送方法グループ + 送料込み', rkVar.shipping?.shippingMethodGroup === '5' && rkVar.shipping?.postageIncluded === true);
@@ -776,11 +781,40 @@ check('payload: 配送方法/納期の不正値を弾く',
   JSON.stringify(b27.reasons));
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL, normal_delivery_date_id = NULL WHERE draft_id = ?`).run(rkId);
 
+// 税率の不正値は fail-closed (Codex R1 Medium-1)
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '9.6%' });
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
+
+// 手入力のカタログID属性と JAN欄の不一致は止める (Codex R1 Medium-4)
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: カタログID属性とJAN欄の不一致を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('一致しません')), JSON.stringify(b27.reasons));
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
+
+// 転送後に削除した画像は送らない (Codex R1 Medium-2: draft_images との JOIN)
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gstale', '/app-newitems/rk-smoke-1-stale.jpg')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 削除済み画像 (転送履歴のみ) は送らない',
+  b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.payload?.images));
+
+// 未転送の画像があれば止める
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 未転送の商品画像があれば止める', b27.ok === false && b27.reasons.some((r) => r.includes('未転送')), JSON.stringify(b27.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gnotyet'`).run(rkId);
+
 // 画像は 20 枚まで (白抜きはカウント外)
+const insImg21 = db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)`);
 const insCab = db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)`);
-for (let i = 2; i <= 21; i++) insCab.run(rkId, `gfile${i}`, `/app-newitems/rk-smoke-1-${i}.jpg`);
+for (let i = 2; i <= 21; i++) { insImg21.run(rkId, `gfile${i}`); insCab.run(rkId, `gfile${i}`, `/app-newitems/rk-smoke-1-${i}.jpg`); }
 b27 = listing.buildItemPayload(db, rkId);
 check('payload: 画像は20枚まで', b27.ok === false && b27.reasons.some((r) => r.includes('20')), JSON.stringify(b27.reasons));
+
+// 公開切替は「アプリから登録済み」のドラフト限定 (registered_at 無しは RMS に接続せず拒否)
+const visGuard = await listing.setItemVisibility(rkId, { hide: false });
+check('visibility: 未登録ドラフトは拒否 (fail-closed)', visGuard.ok === false && String(visGuard.error).includes('登録'), JSON.stringify(visGuard));
 
 // バリエーションページ (複数SKU) は未対応として弾く
 db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rk-smoke-1'`).run();
@@ -788,6 +822,7 @@ insProd.run(9301, 'rkv-a', 'バリA', 'rkv');
 insProd.run(9302, 'rkv-b', 'バリB', 'rkv');
 const rkvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rkv', 'バリエページ', 1000)`).run().lastInsertRowid);
 db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '1')`).run(rkvId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'g2')`).run(rkvId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'g2', '/x/y.jpg')`).run(rkvId);
 const bv = listing.buildItemPayload(db, rkvId);
 check('payload: バリエーションページは未対応と明示',
@@ -850,6 +885,24 @@ check('cat set: 入れ替えで1件になる', shopCat.selectedShopCategoryPaths
 db.prepare('DELETE FROM product_drafts WHERE id = ?').run(catDraftId);
 check('cat cascade: ドラフト削除で選択も消える',
   db.prepare('SELECT COUNT(*) AS c FROM draft_shop_categories WHERE draft_id = ?').get(catDraftId).c === 0);
+
+// id の厳密検証 (Codex R1 Medium-3)
+check('cat ids: 整数と数字文字列だけ通す',
+  JSON.stringify(shopCat.sanitizeShopCategoryIds([1, '2', 1]).ids) === '[1,2]'
+  && shopCat.sanitizeShopCategoryIds(['12abc']).error === 'invalid_id'
+  && shopCat.sanitizeShopCategoryIds([1.5]).error === 'invalid_id'
+  && shopCat.sanitizeShopCategoryIds('x').error === 'not_array'
+  && shopCat.sanitizeShopCategoryIds(Array.from({ length: shopCat.MAX_DRAFT_SHOP_CATEGORIES + 1 }, (_, i) => i + 1)).error === 'too_many');
+
+// 全置き換えの激減ガード (Codex R1 High-4)
+const catMany = shopCat.parseShopCategoryText(Array.from({ length: 12 }, (_, i) => `棚${i}`).join('\n'));
+shopCat.replaceShopCategories(db, catMany.rows);
+const catFew = shopCat.parseShopCategoryText('棚0\n棚1');
+check('cat import: 半分未満への激減は force なしで拒否',
+  shopCat.replaceShopCategories(db, catFew.rows).error === 'too_few');
+check('cat import: force 指定なら激減置き換えを実行',
+  shopCat.replaceShopCategories(db, catFew.rows, { force: true }).active === 2);
+
 db.prepare('DELETE FROM ph_shop_categories').run();
 
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───

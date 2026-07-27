@@ -59,8 +59,15 @@ export function parseShopCategoryText(text) {
  * マスタを貼り付け内容で全置き換えする。
  * 行は消さず is_active で外す (ドラフトの選択が参照しているため)。
  * 既知のカテゴリIDは、ID無しで再取り込みされても保持する (COALESCE)。
+ *
+ * 事故ガード (Codex R1 High-4): 貼り付けミス (一部だけコピー等) で件数が半分未満に
+ * 急減する置き換えは、force 指定が無い限り拒否する (現在10件以上あるときのみ判定)。
  */
-export function replaceShopCategories(db, rows) {
+export function replaceShopCategories(db, rows, { force = false } = {}) {
+  const current = countActiveShopCategories(db);
+  if (!force && current >= 10 && rows.length < Math.ceil(current / 2)) {
+    return { error: 'too_few', active: current, incoming: rows.length };
+  }
   const tx = db.transaction(() => {
     db.prepare('UPDATE ph_shop_categories SET is_active = 0').run();
     const upsert = db.prepare(`
@@ -84,6 +91,24 @@ export function replaceShopCategories(db, rows) {
 
 export function countActiveShopCategories(db) {
   return db.prepare('SELECT COUNT(*) AS c FROM ph_shop_categories WHERE is_active = 1').get().c;
+}
+
+/**
+ * ドラフト保存で受けるカテゴリ id 配列の厳密検証 (Codex R1 Medium-3: parseInt は "12abc" を通す)。
+ * 整数 number か「数字だけの文字列」以外は不正。重複は除去。
+ */
+export function sanitizeShopCategoryIds(input, max = MAX_DRAFT_SHOP_CATEGORIES) {
+  if (!Array.isArray(input)) return { error: 'not_array' };
+  const ids = [];
+  for (const v of input) {
+    let n = null;
+    if (typeof v === 'number' && Number.isInteger(v)) n = v;
+    else if (typeof v === 'string' && /^\d+$/.test(v.trim())) n = Number(v.trim());
+    if (n == null || n <= 0) return { error: 'invalid_id' };
+    if (!ids.includes(n)) ids.push(n);
+  }
+  if (ids.length > max) return { error: 'too_many' };
+  return { ids };
 }
 
 /**

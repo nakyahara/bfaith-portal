@@ -448,7 +448,7 @@
     <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         🟢 <strong>楽天で公開中</strong>
-        <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %>)</span><br>
+        <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
         問題があれば「非公開に戻す」で売り場から下げられます。
         <div style="margin-top:8px;">
           <button class="btn btn-sm" id="rk-unpublish-btn">非公開に戻す</button>

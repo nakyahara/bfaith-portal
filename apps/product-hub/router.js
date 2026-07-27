@@ -30,7 +30,7 @@ import {
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
-  MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
 } from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -568,16 +568,17 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   // 店舗内カテゴリ (複数選択)。フィールドが来たときだけ入れ替える
   let shopCategoryIds = null;
   if (req.body?.shop_category_ids !== undefined) {
-    if (!Array.isArray(req.body.shop_category_ids)) {
+    const sanitized = sanitizeShopCategoryIds(req.body.shop_category_ids);
+    if (sanitized.error === 'not_array') {
       return res.status(400).json({ ok: false, error: '店舗内カテゴリの形式が不正です' });
     }
-    const ids = [...new Set(req.body.shop_category_ids.map((v) => Number.parseInt(v, 10)))];
-    if (ids.some((v) => !Number.isInteger(v) || v <= 0)) {
+    if (sanitized.error === 'invalid_id') {
       return res.status(400).json({ ok: false, error: '店舗内カテゴリの指定が不正です' });
     }
-    if (ids.length > MAX_DRAFT_SHOP_CATEGORIES) {
+    if (sanitized.error === 'too_many') {
       return res.status(400).json({ ok: false, error: `店舗内カテゴリは最大 ${MAX_DRAFT_SHOP_CATEGORIES} 件までです` });
     }
+    const ids = sanitized.ids;
     if (ids.length > 0) {
       const found = db.prepare(
         `SELECT COUNT(*) AS c FROM ph_shop_categories WHERE id IN (${ids.map(() => '?').join(',')})`
@@ -650,7 +651,14 @@ router.post('/api/shop-categories/import', (req, res) => {
   if (parsed.rows.length === 0) {
     return res.status(400).json({ ok: false, error: 'カテゴリが1件も読み取れませんでした' });
   }
-  const r = replaceShopCategories(getDB(), parsed.rows);
+  const r = replaceShopCategories(getDB(), parsed.rows, { force: req.body?.force === true });
+  if (r.error === 'too_few') {
+    // 貼り付けミスでマスタが激減する事故ガード (High-4)。UI 側が再確認のうえ force で再送する
+    return res.status(400).json({
+      ok: false, error: 'too_few', active: r.active, incoming: r.incoming,
+      message: `取り込み件数 (${r.incoming}件) が現在の一覧 (${r.active}件) の半分未満です。貼り付け漏れがないか確認してください`,
+    });
+  }
   res.json({ ok: true, imported: parsed.rows.length, duplicates: parsed.duplicates, active: r.active, deactivated: r.deactivated });
 });
 
@@ -709,8 +717,12 @@ router.post('/api/drafts/:id/rakuten/visibility', async (req, res) => {
   if (req.body?.confirm !== true) {
     return res.status(400).json({ ok: false, error: 'confirm が必要です' });
   }
+  // 公開操作は fail-closed に: hide が boolean でない (欠落・"true" 等) なら拒否 (Codex R1 High-3)
+  if (typeof req.body?.hide !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'hide (true/false) が必要です' });
+  }
   try {
-    const r = await setItemVisibility(draft.id, { hide: req.body?.hide === true, actor: actorOf(req) });
+    const r = await setItemVisibility(draft.id, { hide: req.body.hide, actor: actorOf(req) });
     if (!r.ok) return res.status(400).json(r);
     res.json(r);
   } catch (e) {

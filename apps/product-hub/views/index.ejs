@@ -185,6 +185,14 @@
   // ─── 楽天 店舗内カテゴリ一覧の取り込み (admin のみパネルが出る) ───
   const catImportBtn = document.getElementById('cat-import-btn');
   if (catImportBtn) {
+    async function postCatImport(text, force) {
+      const res = await fetch('/apps/product-hub/api/shop-categories/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text, force: force === true }),
+      });
+      return res.json();
+    }
     catImportBtn.addEventListener('click', async () => {
       const text = document.getElementById('cat-lines').value;
       const out = document.getElementById('cat-import-result');
@@ -193,13 +201,13 @@
       catImportBtn.disabled = true;
       out.textContent = '取り込み中…';
       try {
-        const res = await fetch('/apps/product-hub/api/shop-categories/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: text }),
-        });
-        const json = await res.json();
-        if (!json.ok) { out.textContent = ''; alert(json.error || '取り込みに失敗しました'); return; }
+        let json = await postCatImport(text, false);
+        if (!json.ok && json.error === 'too_few') {
+          // サーバー側の激減ガード。件数を見せて再確認してから force で再送
+          if (!confirm((json.message || '件数が大きく減ります') + '\n\nそれでも置き換えますか?')) { out.textContent = ''; return; }
+          json = await postCatImport(text, true);
+        }
+        if (!json.ok) { out.textContent = ''; alert(json.message || json.error || '取り込みに失敗しました'); return; }
         out.textContent = '取り込み ' + json.imported + ' 件'
           + (json.duplicates ? ' (重複 ' + json.duplicates + ' 行を除外)' : '')
           + (json.deactivated ? ' / 一覧から外れた ' + json.deactivated + ' 件' : '');
