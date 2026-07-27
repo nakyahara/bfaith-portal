@@ -218,6 +218,13 @@ export function initProductHubDB() {
       article_number TEXT,                  -- メーカー型番 (空 = exemptionReason で送る)
       registered_at  TEXT,                  -- 非公開登録に成功した日時
       last_error     TEXT,                  -- 直近の RMS エラー (人が直す材料)
+      -- 2026-07-27 仕様確定: 「アプリが正、RMS手直しは最終手段」— 公開に必要な情報をアプリで持つ
+      shipping_method_group  TEXT,          -- variants[].shipping.shippingMethodGroup (店舗の配送方法ID '1'〜'9')
+      postage_included       INTEGER,       -- variants[].shipping.postageIncluded (NULL=未設定 / 0=送料別 / 1=送料込み)
+      normal_delivery_date_id TEXT,         -- variants[].normalDeliveryDateId (RMS 納期情報ID = リードタイム)
+      white_bg_drive_file_id TEXT,          -- 白抜き背景画像 (whiteBgImage) の Drive fileId
+      white_bg_drive_url     TEXT,
+      published_at   TEXT,                  -- アプリから公開に切り替えた日時 (NULL = 非公開のまま)
       updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
@@ -301,6 +308,19 @@ export function initProductHubDB() {
   }
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
+  }
+
+  // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER
+  const rkCols = new Set(db.prepare('PRAGMA table_info(draft_rakuten)').all().map((c) => c.name));
+  for (const [col, ddl] of [
+    ['shipping_method_group', 'TEXT'],
+    ['postage_included', 'INTEGER'],
+    ['normal_delivery_date_id', 'TEXT'],
+    ['white_bg_drive_file_id', 'TEXT'],
+    ['white_bg_drive_url', 'TEXT'],
+    ['published_at', 'TEXT'],
+  ]) {
+    if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
 
   // 除外の一意性を「SKU単位グローバル」へ移行する (Codex R2 high)。

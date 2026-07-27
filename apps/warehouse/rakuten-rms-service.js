@@ -427,6 +427,55 @@ router.put('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddlew
   }
 });
 
+// 公開/非公開の切り替え (product-hub の「公開」ボタン用。2026-07-27 仕様)。
+// GET した item の hideItem だけを反転して PUT で書き戻す (RMS 2.0 に部分更新が無いため)。
+// ⚠️ Render 側 (rakuten-listing.js setItemVisibility) が「アプリから登録した商品のみ」に
+//    制限している。この route 単体では任意の商品を切り替えられるので、呼び出しは service token 前提。
+router.post('/items/manage-numbers/:manageNumber/visibility', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    if (typeof req.body?.hide !== 'boolean') {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'hide (boolean) が必要です', requestId: req.requestId });
+    }
+    const hide = req.body.hide;
+    const result = await withManageNumberLock(mn, async () => {
+      const existing = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (existing.status === 404) return { block: 404 };
+      if (existing.status !== 200) return { block: 502, detail: existing.status };
+      const item = existing.data?.item || existing.data;
+      if (!item || typeof item !== 'object') return { block: 502, detail: 'empty_item' };
+      if (item.hideItem === hide) return { noop: true };
+      // GET の形をそのまま PUT に戻す (smoke 実証済みの往復)。読み取り専用メタだけ落とす
+      const body = { ...item, hideItem: hide };
+      delete body.manageNumber;
+      delete body.created;
+      delete body.updated;
+      // 変更系は自動リトライしない (PUT route と同じ理由)
+      return rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}`, method: 'PUT', body, timeoutMs: 90_000, maxAttempts: 1 });
+    });
+    if (result.block === 404) {
+      return errorResponse(res, { status: 404, error: 'ITEM_NOT_FOUND', message: `${mn} は楽天に存在しません`, requestId: req.requestId });
+    }
+    if (result.block) {
+      return errorResponse(res, { status: 502, error: 'RMS_PRECHECK_FAILED', message: `商品の取得に失敗 (${result.detail})`, requestId: req.requestId });
+    }
+    if (result.noop) {
+      console.log(`[rakuten-rms] visibility noop mn=${mn} hide=${hide}`);
+      return res.status(200).json({ ok: true, hidden: hide, noop: true });
+    }
+    console.log(`[rakuten-rms] visibility mn=${mn} hide=${hide} status=${result.status}`);
+    if (result.status === 200 || result.status === 201 || result.status === 204) {
+      return res.status(200).json({ ok: true, hidden: hide });
+    }
+    res.status(result.status).json(result.data ?? { ok: false });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 // 削除 (非公開の商品のみ)。テスト登録の掃除用
 router.delete('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
   try {

@@ -23,7 +23,10 @@ import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/not
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
-import { transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes } from './services/rakuten-listing.js';
+import {
+  transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
+  setItemVisibility, SHIPPING_METHOD_GROUPS,
+} from './services/rakuten-listing.js';
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
@@ -192,6 +195,7 @@ router.get('/detail/:id', (req, res) => {
     variation, hasVariation, regroup,
     rakuten, cabinetImages,
     shopCategories: listShopCategoriesForDraft(db, draft.id),
+    shippingGroups: SHIPPING_METHOD_GROUPS,
   });
 });
 
@@ -584,17 +588,48 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     }
     shopCategoryIds = ids;
   }
+  // 配送・納期 (2026-07-27 仕様: 公開に必要な情報はアプリで持つ)
+  const shippingGroup = cleanText(req.body?.shipping_method_group, 10);
+  if (shippingGroup && !SHIPPING_METHOD_GROUPS[shippingGroup]) {
+    return res.status(400).json({ ok: false, error: '配送方法の指定が不正です' });
+  }
+  let postageIncluded = null;
+  if (req.body?.postage_included === '1' || req.body?.postage_included === 1) postageIncluded = 1;
+  else if (req.body?.postage_included === '0' || req.body?.postage_included === 0) postageIncluded = 0;
+  const deliveryDateId = cleanText(req.body?.normal_delivery_date_id, 10);
+  if (deliveryDateId && !/^\d+$/.test(deliveryDateId)) {
+    return res.status(400).json({ ok: false, error: '納期情報IDは数字で入力してください' });
+  }
+  // 白抜き背景画像 (Drive リンク)
+  const whiteBgRaw = cleanText(req.body?.white_bg_url, 1000);
+  let whiteBgFileId = null;
+  if (whiteBgRaw) {
+    const parsed = parseDriveLink(whiteBgRaw);
+    if (!parsed || parsed.type === 'folder') {
+      return res.status(400).json({ ok: false, error: '白抜き背景画像は Drive のファイルリンクを貼ってください' });
+    }
+    whiteBgFileId = parsed.id;
+  }
+
   const articleNumber = cleanText(req.body?.article_number, 100);
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
+        shipping_method_group, postage_included, normal_delivery_date_id,
+        white_bg_drive_file_id, white_bg_drive_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
         genre_id = excluded.genre_id,
         attributes_json = excluded.attributes_json,
         article_number = excluded.article_number,
+        shipping_method_group = excluded.shipping_method_group,
+        postage_included = excluded.postage_included,
+        normal_delivery_date_id = excluded.normal_delivery_date_id,
+        white_bg_drive_file_id = excluded.white_bg_drive_file_id,
+        white_bg_drive_url = excluded.white_bg_drive_url,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    `).run(draft.id, genreId, attributesJson, articleNumber);
+    `).run(draft.id, genreId, attributesJson, articleNumber,
+      shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
     if (shopCategoryIds !== null) setDraftShopCategories(db, draft.id, shopCategoryIds);
   })();
   logEvent(db, draft.id, 'rakuten_fields_saved',
@@ -663,6 +698,23 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// 公開/非公開の切り替え (アプリから登録した商品のみ。miniPC の visibility ルート経由)
+router.post('/api/drafts/:id/rakuten/visibility', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'confirm が必要です' });
+  }
+  try {
+    const r = await setItemVisibility(draft.id, { hide: req.body?.hide === true, actor: actorOf(req) });
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] rakuten visibility failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });

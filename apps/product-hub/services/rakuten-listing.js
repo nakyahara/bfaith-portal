@@ -123,6 +123,11 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, error: 'draft_not_found' };
   const images = db.prepare('SELECT * FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draftId);
+  // 白抜き背景画像 (whiteBgImage) も同じ転送に載せる。
+  // ファイル名を "-white" にして商品画像と区別する (payload 側は drive_file_id で判別)
+  const rkRow = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  const whiteBgId = rkRow?.white_bg_drive_file_id || null;
+  if (whiteBgId) images.push({ drive_file_id: whiteBgId, isWhiteBg: true });
   if (images.length === 0) return { ok: false, error: 'no_images' };
 
   const folderId = await ensureCabinetFolder(db);
@@ -139,11 +144,12 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
     try {
       const raw = await downloadDriveImage(img.drive_file_id);
       const jpeg = await toCabinetJpeg(raw);
-      // ファイル名は「商品コード-連番」。同名は overWrite=true で置き換わる (再転送に安全)
-      const filePath = `${String(draft.ne_code).toLowerCase().replace(/[^a-z0-9\-]/g, '-')}-${n}.jpg`;
+      // ファイル名は「商品コード-連番」(白抜きは -white)。同名は overWrite=true で置き換わる (再転送に安全)
+      const baseName = String(draft.ne_code).toLowerCase().replace(/[^a-z0-9\-]/g, '-');
+      const filePath = img.isWhiteBg ? `${baseName}-white.jpg` : `${baseName}-${n}.jpg`;
       const up = await callWarehouse('/service-api/rakuten-rms/cabinet/upload', {
         method: 'POST',
-        body: { folderId, filePath, fileName: `${draft.ne_code} ${n}`, fileBase64: jpeg.toString('base64') },
+        body: { folderId, filePath, fileName: img.isWhiteBg ? `${draft.ne_code} 白抜き` : `${draft.ne_code} ${n}`, fileBase64: jpeg.toString('base64') },
       });
       const location = up.data?.location ?? up.data?.data?.location;
       const fileId = up.data?.fileId ?? up.data?.data?.fileId;
@@ -188,6 +194,32 @@ export function parseAttributes(json) {
   return out;
 }
 
+/** 楽天の商品ページは画像20枚まで */
+export const MAX_RAKUTEN_IMAGES = 20;
+
+/** B-Faith 店舗の配送方法グループ (RYS rakuten-to-notion-draft.js の実測変換表と同一 ID) */
+export const SHIPPING_METHOD_GROUPS = {
+  '1': '定形外',
+  '3': '飛脚宅配便',
+  '4': '宅急便',
+  '5': 'ネコポス',
+  '6': 'クリックポスト',
+  '7': 'ヤマト運輸宅急便',
+  '8': '宅急便50サイズ以上',
+  '9': 'ゆうパケットパフ',
+};
+
+/**
+ * draft_yahoo.tax_rate ('8%' / '10%' の文字列) → RMS payment.taxRate。
+ * RYS 実測 (2026-06-28): B-Faith 店舗は default 10% で、軽減税率 8% の商品だけ明示する運用。
+ * → 8% のときだけ payment を送り、10%・未設定・想定外値は送らない (店舗デフォルトに任せる)
+ */
+export function taxRateToPayment(taxRateText) {
+  const m = String(taxRateText || '').trim().match(/^(\d+)\s*%?$/);
+  if (m && Number(m[1]) === 8) return { taxRate: 0.08 };
+  return null;
+}
+
 /**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
  */
@@ -195,12 +227,17 @@ export function buildItemPayload(db, draftId) {
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, reasons: ['ドラフトが見つかりません'] };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId) || {};
+  const yahooRow = db.prepare('SELECT tax_rate FROM draft_yahoo WHERE draft_id = ?').get(draftId) || {};
   const ai = {};
   for (const r of db.prepare('SELECT kind, content FROM draft_ai_outputs WHERE draft_id = ?').all(draftId)) {
     ai[r.kind] = r.content;
   }
   const specs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draftId);
-  const cabinet = db.prepare('SELECT cabinet_location FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
+  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
+  // 白抜き背景画像は images[] ではなく whiteBgImage で送る (検索サムネ用の別枠)
+  const whiteBgId = rk.white_bg_drive_file_id || null;
+  const whiteBg = whiteBgId ? cabinetAll.find((c) => c.drive_file_id === whiteBgId) || null : null;
+  const cabinet = cabinetAll.filter((c) => c.drive_file_id !== whiteBgId);
 
   const reasons = [];
   // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
@@ -218,6 +255,18 @@ export function buildItemPayload(db, draftId) {
   const attributes = parseAttributes(rk.attributes_json);
   if (attributes === null) reasons.push('商品属性の形式が不正です (name と value を埋めてください)');
   if (cabinet.length === 0) reasons.push('R-Cabinet へ転送済みの画像がありません (先に「画像を転送」)');
+  if (cabinet.length > MAX_RAKUTEN_IMAGES) {
+    reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (現在 ${cabinet.length} 枚 — 減らしてください)`);
+  }
+  if (whiteBgId && !whiteBg) reasons.push('白抜き背景画像が R-Cabinet に未転送です (先に「画像を転送」)');
+  if (rk.shipping_method_group != null && String(rk.shipping_method_group).trim() !== ''
+      && !SHIPPING_METHOD_GROUPS[String(rk.shipping_method_group).trim()]) {
+    reasons.push('配送方法の指定が不正です');
+  }
+  if (rk.normal_delivery_date_id != null && String(rk.normal_delivery_date_id).trim() !== ''
+      && !/^\d+$/.test(String(rk.normal_delivery_date_id).trim())) {
+    reasons.push('納期情報IDは数字で入力してください (RMS の納期設定のID)');
+  }
   if (reasons.length > 0) return { ok: false, reasons };
 
   const descParts = [];
@@ -226,21 +275,43 @@ export function buildItemPayload(db, draftId) {
   if (specs.length > 0) descParts.push(specs.map((s) => `${s.spec_key}: ${s.spec_value || ''}`.trim()).join('\n'));
   if (ai.desc_notes) descParts.push(ai.desc_notes);
 
+  // JAN → カタログID。SKU 移行後の RMS はカタログIDを商品属性で受ける。
+  // ⚠️ 属性名「カタログID」は zz- テスト商品で本番検証してから本運用 (2026-07-27 仕様 §検証)
+  const attrs = attributes.slice();
+  const jan = String(draft.jan_code || '').trim();
+  if (jan && !attrs.some((a) => a.name === 'カタログID')) {
+    attrs.push({ name: 'カタログID', values: [jan] });
+  }
+
+  // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
+  const shippingGroup = String(rk.shipping_method_group ?? '').trim();
+  const shipping = {
+    ...(shippingGroup ? { shippingMethodGroup: shippingGroup } : {}),
+    ...(rk.postage_included != null ? { postageIncluded: rk.postage_included === 1 } : {}),
+  };
+  const deliveryDateId = String(rk.normal_delivery_date_id ?? '').trim();
+
+  const payment = taxRateToPayment(yahooRow.tax_rate);
+
   const payload = {
     title,
     ...(ai.desc_catch ? { tagline: String(ai.desc_catch).trim() } : {}),
     productDescription: { pc: descParts.join('\n\n') || title },
     genreId: String(rk.genre_id).trim(),
-    hideItem: true, // miniPC 側でも強制されるが、意図としてここでも明示
+    hideItem: true, // 登録は常に非公開。公開はアプリの「公開」ボタン (setItemVisibility) で行う
     itemType: 'NORMAL',
     images: cabinet.map((c) => ({ type: 'CABINET', location: c.cabinet_location })),
+    ...(whiteBg ? { whiteBgImage: { type: 'CABINET', location: whiteBg.cabinet_location } } : {}),
+    ...(payment ? { payment } : {}),
     variants: {
       [draft.ne_code]: {
         standardPrice: draft.price,
         articleNumber: rk.article_number && String(rk.article_number).trim() !== ''
           ? { value: String(rk.article_number).trim() }
           : { exemptionReason: 1 },
-        ...(attributes.length > 0 ? { attributes } : {}),
+        ...(attrs.length > 0 ? { attributes: attrs } : {}),
+        ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
+        ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
       },
     },
   };
@@ -295,4 +366,38 @@ export async function registerHidden(draftId, { actor = null } = {}) {
   saveResult.run(draftId, null, String(errText).slice(0, 1500));
   logEvent(db, draftId, 'rakuten_register_failed', String(errText).slice(0, 500), actor);
   return { ok: false, status: r.status, error: errText };
+}
+
+/**
+ * 公開/非公開の切り替え (2026-07-27 仕様: 公開に必要な情報は全てアプリから入れ、
+ * 公開操作もアプリで行う。RMS 画面での手直しは最終手段)。
+ * miniPC 側の visibility ルートで hideItem だけを反転する — このアプリから登録した商品限定。
+ * ⚠️ miniPC が visibility ルート未反映 (出社時デプロイ前) の間は明示エラーになる。
+ */
+export async function setItemVisibility(draftId, { hide, actor = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'draft_not_found' };
+  const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  if (!rk?.registered_at) {
+    return { ok: false, error: 'このアプリから楽天に登録した商品だけ公開切替できます (先に「非公開で登録」)' };
+  }
+  const mn = String(draft.ne_code).trim().toLowerCase();
+  const r = await callWarehouse(
+    `/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}/visibility`,
+    { method: 'POST', body: { hide: hide === true } },
+  );
+  if (r.status === 404 && !r.data) {
+    // ルート自体が無い (express の HTML 404)。RMS の 404 は JSON で返るので区別できる
+    return { ok: false, error: 'miniPC 側の公開切替ルートが未反映です (miniPC で git pull + Restart-Service — 出社時対応)' };
+  }
+  if (r.status === 200) {
+    db.prepare(`UPDATE draft_rakuten SET published_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE draft_id = ?`)
+      .run(hide === true ? null : new Date().toISOString(), draftId);
+    logEvent(db, draftId, hide === true ? 'rakuten_unpublished' : 'rakuten_published', mn, actor);
+    return { ok: true, hidden: hide === true };
+  }
+  const errText = r.data?.message || extractRmsErrors(r.data) || `HTTP ${r.status}`;
+  logEvent(db, draftId, 'rakuten_visibility_failed', String(errText).slice(0, 500), actor);
+  return { ok: false, error: errText };
 }
