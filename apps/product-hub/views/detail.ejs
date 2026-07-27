@@ -444,11 +444,34 @@
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → 公開はRMS画面で)</span></h2>
-    <% if (rakuten && rakuten.registered_at) { %>
+    <% const selectedShopCats = shopCategories.filter((c) => c.selected); %>
+    <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+        🟢 <strong>楽天で公開中</strong>
+        <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
+        問題があれば「非公開に戻す」で売り場から下げられます。
+        <div style="margin-top:8px;">
+          <button class="btn btn-sm" id="rk-unpublish-btn">非公開に戻す</button>
+        </div>
+      </div>
+    <% } else if (rakuten && rakuten.registered_at) { %>
+      <div style="background:#fefce8; border:1px solid #fde047; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
         <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
-        RMS の商品管理で内容を確認し、問題なければ<strong>RMS側で公開</strong>してください。
+        公開前チェック:
+        <ul style="margin:6px 0 0 18px; padding:0;">
+          <li>在庫は <strong>0 で登録</strong>されています (在庫は NE 連携 / 運用側で入れる)</li>
+          <% if (selectedShopCats.length > 0) { %>
+            <li>店舗内カテゴリを RMS で設定: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong> <span class="muted">(自動反映は未対応)</span></li>
+          <% } else { %>
+            <li class="muted">店舗内カテゴリが未選択です (どの棚にも載りません)</li>
+          <% } %>
+          <li>「送信内容を確認」でページ内容を最終確認</li>
+        </ul>
+        <div style="margin-top:8px;">
+          <button class="btn btn-primary btn-sm" id="rk-publish-btn">楽天で公開する</button>
+          <span class="muted" style="font-size:12px;">アプリから公開に切り替えます (RMS画面を開く必要はありません)</span>
+        </div>
       </div>
     <% } %>
     <% if (rakuten && rakuten.last_error) { %>
@@ -465,6 +488,68 @@
         <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span></label>
         <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
       </div>
+    </div>
+
+    <div class="field" style="display:flex; gap:12px; flex-wrap:wrap;">
+      <div style="flex:1; min-width:160px;">
+        <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span></label>
+        <select id="rk-shipping-group" style="width:100%;">
+          <option value="">未設定 (店舗デフォルト)</option>
+          <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
+            <option value="<%= gid %>" <%= String(rakuten?.shipping_method_group || '') === gid ? 'selected' : '' %>><%= gname %></option>
+          <% } %>
+        </select>
+      </div>
+      <div style="flex:1; min-width:120px;">
+        <label>送料</label>
+        <select id="rk-postage" style="width:100%;">
+          <option value="">未設定 (店舗デフォルト)</option>
+          <option value="1" <%= rakuten?.postage_included === 1 ? 'selected' : '' %>>送料込み</option>
+          <option value="0" <%= rakuten?.postage_included === 0 ? 'selected' : '' %>>送料別</option>
+        </select>
+      </div>
+      <div style="flex:1; min-width:120px;">
+        <label>納期情報ID <span class="muted">(RMSの納期設定)</span></label>
+        <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= rakuten?.normal_delivery_date_id || '' %>" placeholder="未設定可">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span></label>
+      <%
+        const whiteBgTransferred = rakuten?.white_bg_drive_file_id
+          && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
+      %>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="rk-whitebg" style="flex:1;" value="<%= rakuten?.white_bg_drive_url || '' %>" placeholder="https://drive.google.com/file/d/...">
+        <% if (rakuten?.white_bg_drive_file_id) { %>
+          <span class="muted" style="font-size:12px; white-space:nowrap;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送 (「画像を転送」で送る)' %></span>
+        <% } %>
+      </div>
+    </div>
+
+    <p class="muted" style="margin:0 0 10px; font-size:12px;">
+      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報・Yahoo!欄の値を自動で送ります。
+      在庫は常に 0 で登録します。
+    </p>
+
+    <div class="field">
+      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span></label>
+      <% if (shopCategories.length === 0) { %>
+        <p class="muted" style="margin:4px 0;">
+          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
+        </p>
+      <% } else { %>
+        <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
+        <div id="rk-cats" style="max-height:200px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;">
+          <% for (const c of shopCategories) { %>
+            <label class="rk-cat-row" style="display:block; font-size:13px; padding:2px 0; font-weight:400; cursor:pointer;">
+              <input type="checkbox" class="rk-cat-check" value="<%= c.id %>" <%= c.selected ? 'checked' : '' %>>
+              <%= c.path %><% if (!c.is_active) { %> <span class="muted">(現在の一覧に無いカテゴリ)</span><% } %>
+            </label>
+          <% } %>
+        </div>
+      <% } %>
     </div>
 
     <label>商品属性 <span class="muted">(ジャンルの必須属性。足りないと登録時にRMSがエラーで教えてくれます)</span></label>
@@ -607,7 +692,50 @@
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
       attributes: attrs,
+      shop_category_ids: Array.from(document.querySelectorAll('.rk-cat-check:checked')).map((c) => Number(c.value)),
+      shipping_method_group: document.getElementById('rk-shipping-group').value,
+      postage_included: document.getElementById('rk-postage').value,
+      normal_delivery_date_id: document.getElementById('rk-delivery-date').value,
+      white_bg_url: document.getElementById('rk-whitebg').value,
     };
+  }
+
+  // 公開 / 非公開の切り替え (アプリから登録した商品のみ)
+  const rkPublishBtn = document.getElementById('rk-publish-btn');
+  if (rkPublishBtn) {
+    rkPublishBtn.addEventListener('click', async () => {
+      if (!confirm('楽天で公開します。売り場に表示されるようになります。\n\nよろしいですか?')) return;
+      rkPublishBtn.disabled = true;
+      try {
+        const json = await post(BASE + '/rakuten/visibility', { hide: false, confirm: true });
+        if (json.ok) { rkResult.textContent = '🟢 公開しました'; setTimeout(() => location.reload(), 1000); }
+        else { alert(json.error || '公開に失敗しました'); }
+      } finally { rkPublishBtn.disabled = false; }
+    });
+  }
+  const rkUnpublishBtn = document.getElementById('rk-unpublish-btn');
+  if (rkUnpublishBtn) {
+    rkUnpublishBtn.addEventListener('click', async () => {
+      if (!confirm('楽天の売り場から下げて非公開 (倉庫指定) に戻します。\n\nよろしいですか?')) return;
+      rkUnpublishBtn.disabled = true;
+      try {
+        const json = await post(BASE + '/rakuten/visibility', { hide: true, confirm: true });
+        if (json.ok) { rkResult.textContent = '非公開に戻しました'; setTimeout(() => location.reload(), 1000); }
+        else { alert(json.error || '切り替えに失敗しました'); }
+      } finally { rkUnpublishBtn.disabled = false; }
+    });
+  }
+
+  // 店舗内カテゴリの絞り込み (選択済みは常に表示)
+  const rkCatFilter = document.getElementById('rk-cat-filter');
+  if (rkCatFilter) {
+    rkCatFilter.addEventListener('input', () => {
+      const q = rkCatFilter.value.trim().toLowerCase();
+      document.querySelectorAll('.rk-cat-row').forEach((row) => {
+        const hit = !q || row.textContent.toLowerCase().includes(q) || row.querySelector('.rk-cat-check').checked;
+        row.style.display = hit ? '' : 'none';
+      });
+    });
   }
 
   async function saveRakutenFields() {
@@ -649,7 +777,10 @@
       pre.textContent = 'まだ送信できません:\n' + (json.reasons || []).map((r) => '・' + r).join('\n');
       return;
     }
-    pre.textContent = '商品管理番号: ' + json.manageNumber + '\n\n' + JSON.stringify(json.payload, null, 2);
+    const cats = json.shopCategories || [];
+    pre.textContent = '商品管理番号: ' + json.manageNumber
+      + (cats.length ? '\n店舗内カテゴリ (公開時にRMS画面で設定 — payloadには含まれません): ' + cats.join(' ／ ') : '')
+      + '\n\n' + JSON.stringify(json.payload, null, 2);
   });
 
   document.getElementById('rk-register-btn').addEventListener('click', async () => {

@@ -218,6 +218,13 @@ export function initProductHubDB() {
       article_number TEXT,                  -- メーカー型番 (空 = exemptionReason で送る)
       registered_at  TEXT,                  -- 非公開登録に成功した日時
       last_error     TEXT,                  -- 直近の RMS エラー (人が直す材料)
+      -- 2026-07-27 仕様確定: 「アプリが正、RMS手直しは最終手段」— 公開に必要な情報をアプリで持つ
+      shipping_method_group  TEXT,          -- variants[].shipping.shippingMethodGroup (店舗の配送方法ID '1'〜'9')
+      postage_included       INTEGER,       -- variants[].shipping.postageIncluded (NULL=未設定 / 0=送料別 / 1=送料込み)
+      normal_delivery_date_id TEXT,         -- variants[].normalDeliveryDateId (RMS 納期情報ID = リードタイム)
+      white_bg_drive_file_id TEXT,          -- 白抜き背景画像 (whiteBgImage) の Drive fileId
+      white_bg_drive_url     TEXT,
+      published_at   TEXT,                  -- アプリから公開に切り替えた日時 (NULL = 非公開のまま)
       updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
@@ -232,6 +239,27 @@ export function initProductHubDB() {
       UNIQUE(draft_id, drive_file_id)
     );
     CREATE INDEX IF NOT EXISTS idx_draft_cabinet_draft ON draft_cabinet_images(draft_id);
+
+    -- 楽天の店舗内カテゴリ (お店の棚) マスタ。RMS 画面からの貼り付けで取り込む
+    -- (Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要 = 未実装)。
+    -- 全置き換え取り込みでも行は消さず is_active で外す (draft_shop_categories が参照するため)
+    CREATE TABLE IF NOT EXISTS ph_shop_categories (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      category_id  TEXT,                   -- RMS上のカテゴリID (貼り付けに含まれていた場合のみ。将来の自動紐付け用)
+      path         TEXT NOT NULL,          -- 例: 犬用品 > おやつ > 無添加 (' > ' 区切りに正規化)
+      path_key     TEXT NOT NULL UNIQUE,   -- LOWER(path)
+      is_active    INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+      sort_order   INTEGER NOT NULL DEFAULT 0,
+      imported_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- ドラフトが載る店舗内カテゴリ (複数選択)。公開時に RMS 画面で設定する指示として使う
+    CREATE TABLE IF NOT EXISTS draft_shop_categories (
+      draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
+      created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, shop_category_id)
+    );
 
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
@@ -280,6 +308,19 @@ export function initProductHubDB() {
   }
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
+  }
+
+  // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER
+  const rkCols = new Set(db.prepare('PRAGMA table_info(draft_rakuten)').all().map((c) => c.name));
+  for (const [col, ddl] of [
+    ['shipping_method_group', 'TEXT'],
+    ['postage_included', 'INTEGER'],
+    ['normal_delivery_date_id', 'TEXT'],
+    ['white_bg_drive_file_id', 'TEXT'],
+    ['white_bg_drive_url', 'TEXT'],
+    ['published_at', 'TEXT'],
+  ]) {
+    if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }
 
   // 除外の一意性を「SKU単位グローバル」へ移行する (Codex R2 high)。

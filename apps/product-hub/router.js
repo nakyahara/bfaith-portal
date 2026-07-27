@@ -23,7 +23,15 @@ import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/not
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
-import { transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes } from './services/rakuten-listing.js';
+import {
+  transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
+  setItemVisibility, SHIPPING_METHOD_GROUPS,
+} from './services/rakuten-listing.js';
+import {
+  parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
+  listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
+  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+} from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -128,6 +136,9 @@ router.get('/', (req, res) => {
     maxRegisterCodes: MAX_REGISTER_CODES,
     intake: intakeStatus(),
     notionCardEnabled: isNotionCardEnabled(),
+    isAdmin: req.session?.role === 'admin',
+    shopCategoryCount: countActiveShopCategories(db),
+    maxShopCategoryLines: MAX_SHOP_CATEGORY_LINES,
   });
 });
 
@@ -183,6 +194,8 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages,
+    shopCategories: listShopCategoriesForDraft(db, draft.id),
+    shippingGroups: SHIPPING_METHOD_GROUPS,
   });
 });
 
@@ -552,17 +565,101 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
   }
-  db.prepare(`
-    INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(draft_id) DO UPDATE SET
-      genre_id = excluded.genre_id,
-      attributes_json = excluded.attributes_json,
-      article_number = excluded.article_number,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(draft.id, genreId, attributesJson, cleanText(req.body?.article_number, 100));
-  logEvent(db, draft.id, 'rakuten_fields_saved', genreId, actorOf(req));
+  // 店舗内カテゴリ (複数選択)。フィールドが来たときだけ入れ替える
+  let shopCategoryIds = null;
+  if (req.body?.shop_category_ids !== undefined) {
+    const sanitized = sanitizeShopCategoryIds(req.body.shop_category_ids);
+    if (sanitized.error === 'not_array') {
+      return res.status(400).json({ ok: false, error: '店舗内カテゴリの形式が不正です' });
+    }
+    if (sanitized.error === 'invalid_id') {
+      return res.status(400).json({ ok: false, error: '店舗内カテゴリの指定が不正です' });
+    }
+    if (sanitized.error === 'too_many') {
+      return res.status(400).json({ ok: false, error: `店舗内カテゴリは最大 ${MAX_DRAFT_SHOP_CATEGORIES} 件までです` });
+    }
+    const ids = sanitized.ids;
+    if (ids.length > 0) {
+      const found = db.prepare(
+        `SELECT COUNT(*) AS c FROM ph_shop_categories WHERE id IN (${ids.map(() => '?').join(',')})`
+      ).get(...ids).c;
+      if (found !== ids.length) {
+        return res.status(400).json({ ok: false, error: '存在しない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
+      }
+    }
+    shopCategoryIds = ids;
+  }
+  // 配送・納期 (2026-07-27 仕様: 公開に必要な情報はアプリで持つ)
+  const shippingGroup = cleanText(req.body?.shipping_method_group, 10);
+  if (shippingGroup && !SHIPPING_METHOD_GROUPS[shippingGroup]) {
+    return res.status(400).json({ ok: false, error: '配送方法の指定が不正です' });
+  }
+  let postageIncluded = null;
+  if (req.body?.postage_included === '1' || req.body?.postage_included === 1) postageIncluded = 1;
+  else if (req.body?.postage_included === '0' || req.body?.postage_included === 0) postageIncluded = 0;
+  const deliveryDateId = cleanText(req.body?.normal_delivery_date_id, 10);
+  if (deliveryDateId && !/^\d+$/.test(deliveryDateId)) {
+    return res.status(400).json({ ok: false, error: '納期情報IDは数字で入力してください' });
+  }
+  // 白抜き背景画像 (Drive リンク)
+  const whiteBgRaw = cleanText(req.body?.white_bg_url, 1000);
+  let whiteBgFileId = null;
+  if (whiteBgRaw) {
+    const parsed = parseDriveLink(whiteBgRaw);
+    if (!parsed || parsed.type === 'folder') {
+      return res.status(400).json({ ok: false, error: '白抜き背景画像は Drive のファイルリンクを貼ってください' });
+    }
+    whiteBgFileId = parsed.id;
+  }
+
+  const articleNumber = cleanText(req.body?.article_number, 100);
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
+        shipping_method_group, postage_included, normal_delivery_date_id,
+        white_bg_drive_file_id, white_bg_drive_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        genre_id = excluded.genre_id,
+        attributes_json = excluded.attributes_json,
+        article_number = excluded.article_number,
+        shipping_method_group = excluded.shipping_method_group,
+        postage_included = excluded.postage_included,
+        normal_delivery_date_id = excluded.normal_delivery_date_id,
+        white_bg_drive_file_id = excluded.white_bg_drive_file_id,
+        white_bg_drive_url = excluded.white_bg_drive_url,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, genreId, attributesJson, articleNumber,
+      shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
+    if (shopCategoryIds !== null) setDraftShopCategories(db, draft.id, shopCategoryIds);
+  })();
+  logEvent(db, draft.id, 'rakuten_fields_saved',
+    [genreId, shopCategoryIds !== null ? `店舗内カテゴリ${shopCategoryIds.length}件` : null].filter(Boolean).join(' / ') || null,
+    actorOf(req));
   res.json({ ok: true });
+});
+
+// 店舗内カテゴリ一覧の取り込み (貼り付け・全置き換え)。マスタ全体に影響するので admin 限定。
+// RMS Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要なため未対応 —
+// この一覧は「公開時に RMS 画面で設定するカテゴリ」の選択肢・指示として使う。
+router.post('/api/shop-categories/import', (req, res) => {
+  if (req.session?.role !== 'admin') {
+    return res.status(403).json({ ok: false, error: '店舗内カテゴリ一覧の取り込みは管理者のみです' });
+  }
+  const parsed = parseShopCategoryText(req.body?.text);
+  if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.error });
+  if (parsed.rows.length === 0) {
+    return res.status(400).json({ ok: false, error: 'カテゴリが1件も読み取れませんでした' });
+  }
+  const r = replaceShopCategories(getDB(), parsed.rows, { force: req.body?.force === true });
+  if (r.error === 'too_few') {
+    // 貼り付けミスでマスタが激減する事故ガード (High-4)。UI 側が再確認のうえ force で再送する
+    return res.status(400).json({
+      ok: false, error: 'too_few', active: r.active, incoming: r.incoming,
+      message: `取り込み件数 (${r.incoming}件) が現在の一覧 (${r.active}件) の半分未満です。貼り付け漏れがないか確認してください`,
+    });
+  }
+  res.json({ ok: true, imported: parsed.rows.length, duplicates: parsed.duplicates, active: r.active, deactivated: r.deactivated });
 });
 
 // Drive 画像 → R-Cabinet 転送 (冪等。転送済みはスキップ)
@@ -585,9 +682,15 @@ router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
 router.get('/api/drafts/:id/rakuten/preview', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const built = buildItemPayload(getDB(), draft.id);
+  const db = getDB();
+  const built = buildItemPayload(db, draft.id);
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
-  res.json({ ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload });
+  res.json({
+    ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
+    // 店舗内カテゴリは RMS payload に含まれない (Category API が別 = miniPC 対応待ち)。
+    // 公開時に RMS 画面で設定するものとしてプレビューに添える
+    shopCategories: selectedShopCategoryPaths(db, draft.id),
+  });
 });
 
 // 非公開 (倉庫指定) で楽天に登録。公開は人が RMS 画面で行う
@@ -603,6 +706,27 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// 公開/非公開の切り替え (アプリから登録した商品のみ。miniPC の visibility ルート経由)
+router.post('/api/drafts/:id/rakuten/visibility', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.confirm !== true) {
+    return res.status(400).json({ ok: false, error: 'confirm が必要です' });
+  }
+  // 公開操作は fail-closed に: hide が boolean でない (欠落・"true" 等) なら拒否 (Codex R1 High-3)
+  if (typeof req.body?.hide !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'hide (true/false) が必要です' });
+  }
+  try {
+    const r = await setItemVisibility(draft.id, { hide: req.body.hide, actor: actorOf(req) });
+    if (!r.ok) return res.status(400).json(r);
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] rakuten visibility failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });

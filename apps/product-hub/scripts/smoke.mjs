@@ -713,6 +713,7 @@ check('payload: 不足理由を列挙 (ジャンル/画像)',
 
 db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number)
   VALUES (?, '205761', '[{"name":"ブランド名","values":["ノーブランド品"]}]', NULL)`).run(rkId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gfile1')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
 db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文')`).run(rkId, rkId, rkId);
 db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
@@ -736,12 +737,105 @@ db.prepare(`UPDATE draft_rakuten SET article_number = 'ABC-100' WHERE draft_id =
 check('payload: 型番があれば value で送る',
   listing.buildItemPayload(db, rkId).payload.variants['rk-smoke-1'].articleNumber.value === 'ABC-100');
 
+// ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
+check('taxRateToPayment: 8% → payment.taxRate 0.08', listing.taxRateToPayment('8%')?.taxRate === 0.08);
+check('taxRateToPayment: 10%/未設定/変値は送らない (店舗デフォルト)',
+  listing.taxRateToPayment('10%') === null && listing.taxRateToPayment(null) === null && listing.taxRateToPayment('9.6') === null);
+
+check('isValidGtin: 正しいJAN-13を通す', listing.isValidGtin('4901234567894') === true);
+check('isValidGtin: チェックデジット不一致/桁数違い/非数字を弾く',
+  listing.isValidGtin('4901234567890') === false && listing.isValidGtin('49012') === false && listing.isValidGtin('4901234abc894') === false);
+
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '8%' });
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', postage_included = 1, normal_delivery_date_id = '1000' WHERE draft_id = ?`).run(rkId);
+built = listing.buildItemPayload(db, rkId);
+const rkVar = built.payload?.variants?.['rk-smoke-1'] || {};
+check('payload: JAN はカタログID属性で送る (本番検証待ちの属性名)',
+  (rkVar.attributes || []).some((a) => a.name === 'カタログID' && a.values[0] === '4901234567894'),
+  JSON.stringify(rkVar.attributes));
+check('payload: 8% は payment.taxRate で送る', built.payload?.payment?.taxRate === 0.08);
+check('payload: 配送方法グループ + 送料込み', rkVar.shipping?.shippingMethodGroup === '5' && rkVar.shipping?.postageIncluded === true);
+check('payload: 納期情報ID は数値で送る', rkVar.normalDeliveryDateId === 1000);
+
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
+check('payload: 10% は payment を送らない', !('payment' in listing.buildItemPayload(db, rkId).payload));
+
+// 白抜き背景: 未転送なら理由を返し、転送済みなら whiteBgImage 別枠 (images には入れない)
+db.prepare(`UPDATE draft_rakuten SET white_bg_drive_file_id = 'gwhite', white_bg_drive_url = 'https://drive.google.com/file/d/gwhite/view' WHERE draft_id = ?`).run(rkId);
+let b27 = listing.buildItemPayload(db, rkId);
+check('payload: 白抜き未転送は理由を返す', b27.ok === false && b27.reasons.some((r) => r.includes('白抜き')), JSON.stringify(b27.reasons));
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gwhite', '/app-newitems/rk-smoke-1-white.jpg')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: whiteBgImage は images と別枠',
+  b27.ok === true
+  && b27.payload.whiteBgImage?.location === '/app-newitems/rk-smoke-1-white.jpg'
+  && b27.payload.images.every((i) => i.location !== '/app-newitems/rk-smoke-1-white.jpg'),
+  JSON.stringify(b27.reasons || b27.payload?.images));
+
+// 不正値は理由で弾く
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '99', normal_delivery_date_id = 'abc' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 配送方法/納期の不正値を弾く',
+  b27.ok === false && b27.reasons.some((r) => r.includes('配送方法')) && b27.reasons.some((r) => r.includes('納期')),
+  JSON.stringify(b27.reasons));
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL, normal_delivery_date_id = NULL WHERE draft_id = ?`).run(rkId);
+
+// 税率の不正値は fail-closed (Codex R1 Medium-1)
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '9.6%' });
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 税率の不正値を弾く (8/10/空欄のみ)', b27.ok === false && b27.reasons.some((r) => r.includes('税率')), JSON.stringify(b27.reasons));
+dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
+
+// 手入力のカタログID属性と JAN欄の不一致は止める (Codex R1 Medium-4)
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: カタログID属性とJAN欄の不一致を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('一致しません')), JSON.stringify(b27.reasons));
+
+// R2: 複数のカタログID属性で不一致検査を迂回できない
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567894"]},{"name":"カタログID","values":["4999999999999"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: カタログID属性の複数記述を弾く', b27.ok === false && b27.reasons.some((r) => r.includes('複数')), JSON.stringify(b27.reasons));
+
+// R2: JAN欄が空でも手入力カタログID自体を GTIN 検証する
+db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"カタログID","values":["4901234567890"]}]' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 手入力カタログIDの不正値を弾く (JAN欄が空でも)',
+  b27.ok === false && b27.reasons.some((r) => r.includes('カタログID') && r.includes('不正')), JSON.stringify(b27.reasons));
+db.prepare(`UPDATE product_drafts SET jan_code = '4901234567894' WHERE id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["ノーブランド品"]}]' WHERE draft_id = ?`).run(rkId);
+
+// 転送後に削除した画像は送らない (Codex R1 Medium-2: draft_images との JOIN)
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gstale', '/app-newitems/rk-smoke-1-stale.jpg')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 削除済み画像 (転送履歴のみ) は送らない',
+  b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.payload?.images));
+
+// 未転送の画像があれば止める
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 未転送の商品画像があれば止める', b27.ok === false && b27.reasons.some((r) => r.includes('未転送')), JSON.stringify(b27.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gnotyet'`).run(rkId);
+
+// 画像は 20 枚まで (白抜きはカウント外)
+const insImg21 = db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)`);
+const insCab = db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)`);
+for (let i = 2; i <= 21; i++) { insImg21.run(rkId, `gfile${i}`); insCab.run(rkId, `gfile${i}`, `/app-newitems/rk-smoke-1-${i}.jpg`); }
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 画像は20枚まで', b27.ok === false && b27.reasons.some((r) => r.includes('20')), JSON.stringify(b27.reasons));
+
+// 公開切替は「アプリから登録済み」のドラフト限定 (registered_at 無しは RMS に接続せず拒否)
+const visGuard = await listing.setItemVisibility(rkId, { hide: false });
+check('visibility: 未登録ドラフトは拒否 (fail-closed)', visGuard.ok === false && String(visGuard.error).includes('登録'), JSON.stringify(visGuard));
+
 // バリエーションページ (複数SKU) は未対応として弾く
 db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'rk-smoke-1'`).run();
 insProd.run(9301, 'rkv-a', 'バリA', 'rkv');
 insProd.run(9302, 'rkv-b', 'バリB', 'rkv');
 const rkvId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price) VALUES ('rkv', 'バリエページ', 1000)`).run().lastInsertRowid);
 db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, '1')`).run(rkvId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'g2')`).run(rkvId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'g2', '/x/y.jpg')`).run(rkvId);
 const bv = listing.buildItemPayload(db, rkvId);
 check('payload: バリエーションページは未対応と明示',
@@ -759,6 +853,70 @@ check('toCabinetJpeg: 2MB以下のJPEGに変換', jpg.length <= 2 * 1024 * 1024 
 // extractRmsErrors: RMS 400 の形
 check('extractRmsErrors: errors[] を整形',
   listing.extractRmsErrors({ errors: [{ code: 'IE0418', message: 'Invalid attribute' }] }).includes('IE0418'));
+
+// ─── 店舗内カテゴリ (マスタ貼り付け取り込み + ドラフト選択) ───
+const shopCat = await import('../lib/shop-categories.js');
+
+const catParsed = shopCat.parseShopCategoryText(
+  '犬用品 > おやつ\n123456,猫用品 ＞ ケア用品\n\n犬用品>おやつ\n789\tその他');
+check('cat parse: 4行から重複1を除いて3件', catParsed.ok && catParsed.rows.length === 3 && catParsed.duplicates === 1,
+  JSON.stringify(catParsed));
+check('cat parse: パスのみの行は ID なし', catParsed.rows[0].categoryId === null && catParsed.rows[0].path === '犬用品 > おやつ');
+check('cat parse: 「ID,パス」+ 全角＞の正規化', catParsed.rows[1].categoryId === '123456' && catParsed.rows[1].path === '猫用品 > ケア用品');
+check('cat parse: タブ区切りも受ける', catParsed.rows[2].categoryId === '789' && catParsed.rows[2].path === 'その他');
+check('cat parse: 行数超過は弾く',
+  shopCat.parseShopCategoryText(Array.from({ length: shopCat.MAX_SHOP_CATEGORY_LINES + 1 }, () => 'x').join('\n')).ok === false);
+check('cat parse: 長すぎるカテゴリ名は弾く', shopCat.parseShopCategoryText('あ'.repeat(301)).ok === false);
+check('cat parse: 空入力 → 0件', shopCat.parseShopCategoryText('  \n \n').rows.length === 0);
+
+const catR1 = shopCat.replaceShopCategories(db, catParsed.rows);
+check('cat import: 3件が有効', catR1.active === 3 && shopCat.countActiveShopCategories(db) === 3);
+
+// 再取り込み (全置き換え): 消えたカテゴリは is_active=0 に落ち、既知の ID は保持される
+const catParsed2 = shopCat.parseShopCategoryText('猫用品 > ケア用品\n新カテゴリ');
+const catR2 = shopCat.replaceShopCategories(db, catParsed2.rows);
+check('cat import: 全置き換えで有効2 / 非活性2', catR2.active === 2 && catR2.deactivated === 2, JSON.stringify(catR2));
+check('cat import: ID無しで再取り込みしても既知のカテゴリIDを保持',
+  db.prepare(`SELECT category_id FROM ph_shop_categories WHERE path = '猫用品 > ケア用品'`).get().category_id === '123456');
+
+// ドラフトへの割り当て
+const catDraftId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES ('cat-smoke-1', '棚スモーク')`).run().lastInsertRowid);
+const activeCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path = '猫用品 > ケア用品'`).get().id;
+const inactiveCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path = '犬用品 > おやつ'`).get().id;
+shopCat.setDraftShopCategories(db, catDraftId, [activeCat, inactiveCat]);
+const catList = shopCat.listShopCategoriesForDraft(db, catDraftId);
+check('cat list: 有効カテゴリ + 選択中の非活性カテゴリが出る (未選択の非活性は出ない)',
+  catList.length === 3
+  && catList.filter((c) => c.selected).length === 2
+  && catList.some((c) => c.id === inactiveCat && c.selected === 1 && c.is_active === 0),
+  JSON.stringify(catList));
+check('cat paths: 選択中のパスを返す',
+  JSON.stringify(shopCat.selectedShopCategoryPaths(db, catDraftId).sort())
+  === JSON.stringify(['犬用品 > おやつ', '猫用品 > ケア用品']));
+shopCat.setDraftShopCategories(db, catDraftId, [activeCat]);
+check('cat set: 入れ替えで1件になる', shopCat.selectedShopCategoryPaths(db, catDraftId).length === 1);
+db.prepare('DELETE FROM product_drafts WHERE id = ?').run(catDraftId);
+check('cat cascade: ドラフト削除で選択も消える',
+  db.prepare('SELECT COUNT(*) AS c FROM draft_shop_categories WHERE draft_id = ?').get(catDraftId).c === 0);
+
+// id の厳密検証 (Codex R1 Medium-3)
+check('cat ids: 整数と数字文字列だけ通す',
+  JSON.stringify(shopCat.sanitizeShopCategoryIds([1, '2', 1]).ids) === '[1,2]'
+  && shopCat.sanitizeShopCategoryIds(['12abc']).error === 'invalid_id'
+  && shopCat.sanitizeShopCategoryIds([1.5]).error === 'invalid_id'
+  && shopCat.sanitizeShopCategoryIds('x').error === 'not_array'
+  && shopCat.sanitizeShopCategoryIds(Array.from({ length: shopCat.MAX_DRAFT_SHOP_CATEGORIES + 1 }, (_, i) => i + 1)).error === 'too_many');
+
+// 全置き換えの激減ガード (Codex R1 High-4)
+const catMany = shopCat.parseShopCategoryText(Array.from({ length: 12 }, (_, i) => `棚${i}`).join('\n'));
+shopCat.replaceShopCategories(db, catMany.rows);
+const catFew = shopCat.parseShopCategoryText('棚0\n棚1');
+check('cat import: 半分未満への激減は force なしで拒否',
+  shopCat.replaceShopCategories(db, catFew.rows).error === 'too_few');
+check('cat import: force 指定なら激減置き換えを実行',
+  shopCat.replaceShopCategories(db, catFew.rows, { force: true }).active === 2);
+
+db.prepare('DELETE FROM ph_shop_categories').run();
 
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
@@ -799,11 +957,13 @@ const renders = [
     counts, statusFilter: null,
     statuses, statusLabels, notionPending: 1, maxImportCodes: imp.MAX_IMPORT_CODES,
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: false,
+    isAdmin: true, shopCategoryCount: 12, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['index.ejs (empty)', 'index.ejs', {
     title: 't', displayName: 'smoke', drafts: [], counts, statusFilter: 'draft',
     statuses, statusLabels, notionPending: 0, maxImportCodes: imp.MAX_IMPORT_CODES,
     maxRegisterCodes: intake.MAX_REGISTER_CODES, intake: intake.intakeStatus(), notionCardEnabled: true,
+    isAdmin: false, shopCategoryCount: 0, maxShopCategoryLines: shopCat.MAX_SHOP_CATEGORY_LINES,
   }],
   ['new.ejs', 'new.ejs', { title: 't', displayName: 'smoke' }],
   ['detail.ejs (full/own_brand)', 'detail.ejs', {
@@ -820,9 +980,48 @@ const renders = [
     aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: null,
-    rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null }, cabinetImages: [],
+    rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    // 店舗内カテゴリの選択リスト分岐 (有効/選択済み/一覧から外れた選択済み)
+    shopCategories: [
+      { id: 1, category_id: '100', path: '犬用品 > おやつ', is_active: 1, selected: 1 },
+      { id: 2, category_id: null, path: '猫用品 > ケア用品', is_active: 1, selected: 0 },
+      { id: 3, category_id: null, path: '廃止された棚', is_active: 0, selected: 1 },
+    ],
     yahoo: { yahoo_price: 1980, yahoo_price_sagawa: null, delivery_label: 'ネコポス', tax_rate: '10%', yahoo_category_id: 43494, yahoo_path: 'おもちゃ' },
     imageProduction: { status: '参考画像収集', importance_tier: 'そこそこ力を入れる（6〜8枚）', production_type: null, aplus_content: null, aplus_related: null, camera_instruction_url: null, shipping_status: null, reference_collection: null, designer: '外注_大川さん', page_composer: null, request_text: '依頼文' },
+  }],
+  ['detail.ejs (rakuten registered + shop categories)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, own_brand: 0, asin: null, amazon_url: null },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
+    rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr', shipping_method_group: null, postage_included: null, normal_delivery_date_id: null, white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://x', published_at: null },
+    cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    shopCategories: [
+      { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
+      { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
+    ],
+    yahoo: null, imageProduction: null,
+  }],
+  ['detail.ejs (rakuten published)', 'detail.ejs', {
+    title: 't', displayName: 'smoke',
+    draft: { ...after, own_brand: 0, asin: null, amazon_url: null },
+    refs: [], images: [], specs: [],
+    aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
+    events: [], gate: [], nextStatuses: ['ready_for_ai'],
+    statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
+    variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
+    rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: null, shipping_method_group: '7', postage_included: 0, normal_delivery_date_id: null, white_bg_drive_file_id: null, white_bg_drive_url: null, published_at: '2026-07-27T01:00:00Z' },
+    cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    shopCategories: [],
+    yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
+    imageProduction: null,
   }],
   ['detail.ejs (created notion / non-own-brand)', 'detail.ejs', {
     title: 't', displayName: 'smoke',
@@ -832,7 +1031,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -847,7 +1046,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
   // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
@@ -859,7 +1058,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (excluded SKU section)', 'detail.ejs', {
@@ -870,7 +1069,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (detached SKU)', 'detail.ejs', {
@@ -881,7 +1080,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
@@ -893,7 +1092,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [],
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     yahoo: null, imageProduction: null,
   }],
 ];

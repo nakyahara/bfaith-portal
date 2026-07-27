@@ -11,12 +11,48 @@
  * rateLimitMiddleware('rakuten') は HTTP route レベルでの過負荷保護
  * (同時実行数 1 + queue 5 超で早期 429) として残してある。
  */
+import fs from 'fs';
+import path from 'path';
+import Database from 'better-sqlite3';
 import { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
 import { rakutenRequest } from './rakuten-client.js';
 
 const router = Router();
+
+// ─── アプリ起点で作成した商品の台帳 (visibility の対象制限) ───
+// Codex R1 High-2 / R2 High: service token を持てば任意の商品管理番号を公開/非公開に
+// できるのは危険。この service の PUT (新規作成) が作った管理番号だけを台帳に記録し、
+// visibility は**台帳にある商品のみ**に構造的に制限する (zz- の無条件例外は R2 で撤廃 —
+// zz- テスト商品も PUT で作れば台帳に載るので例外は不要)。
+// 永続層は SQLite (WAL・原子的 upsert)。JSON ファイル書き戻しは複数プロセスで後勝ち消失が
+// あり得るため不採用 (R2 Medium)。台帳導入以前にこの route で作られた本番商品は無い。
+const RMS_DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+let registryDb = null;
+function getRegistryDb() {
+  if (registryDb) return registryDb;
+  fs.mkdirSync(RMS_DATA_DIR, { recursive: true });
+  registryDb = new Database(path.join(RMS_DATA_DIR, 'rms-app-items.db'));
+  registryDb.pragma('journal_mode = WAL');
+  registryDb.pragma('busy_timeout = 5000');
+  registryDb.exec(`CREATE TABLE IF NOT EXISTS app_created_items (
+    manage_number TEXT PRIMARY KEY,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  )`);
+  return registryDb;
+}
+function recordCreatedItem(mn) {
+  try {
+    getRegistryDb().prepare('INSERT OR IGNORE INTO app_created_items (manage_number) VALUES (?)').run(mn);
+  } catch (e) {
+    // 記録に失敗しても RMS 側の作成は成功している。その商品の公開切替が拒否されるだけ (安全側)
+    console.error('[rakuten-rms] app_created_items 台帳の保存に失敗:', e.message);
+  }
+}
+function isAppCreatedItem(mn) {
+  return !!getRegistryDb().prepare('SELECT 1 FROM app_created_items WHERE manage_number = ?').get(mn);
+}
 
 const DETAILS_BULK_MAX = 200;
 
@@ -421,7 +457,60 @@ router.put('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddlew
       return errorResponse(res, { status: 502, error: 'RMS_PRECHECK_FAILED', message: `既存確認に失敗 (HTTP ${result.detail})`, requestId: req.requestId });
     }
     console.log(`[rakuten-rms] item create mn=${mn} status=${result.status}`);
+    if (result.status === 200 || result.status === 201) recordCreatedItem(mn); // visibility の対象台帳
     res.status(result.status).json(result.data ?? { ok: result.status < 300 });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// 公開/非公開の切り替え (product-hub の「公開」ボタン用。2026-07-27 仕様)。
+// PATCH (部分更新・マージ形式) で hideItem だけを送る — 全文 GET→PUT 往復だと
+// GET→PUT 間の RMS 画面・他プロセスの変更を古い値で巻き戻すため (Codex R1 High-1)。
+// 対象は「この service の PUT で作った商品 (台帳) + zz- テスト商品」に構造的に限定 (High-2)。
+router.post('/items/manage-numbers/:manageNumber/visibility', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    if (typeof req.body?.hide !== 'boolean') {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'hide (boolean) が必要です', requestId: req.requestId });
+    }
+    // 台帳照合のみ (zz- 例外なし — R2 High)。zz- テスト商品も PUT 経由なら台帳に載る
+    if (!isAppCreatedItem(mn)) {
+      return errorResponse(res, {
+        status: 403, error: 'VISIBILITY_NOT_ALLOWED',
+        message: `${mn} はこの service から登録した商品ではないため公開切替できません (既存商品は RMS 画面で操作)`,
+        requestId: req.requestId,
+      });
+    }
+    const hide = req.body.hide;
+    const result = await withManageNumberLock(mn, async () => {
+      const existing = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (existing.status === 404) return { block: 404 };
+      if (existing.status !== 200) return { block: 502, detail: existing.status };
+      const item = existing.data?.item || existing.data;
+      if (!item || typeof item !== 'object') return { block: 502, detail: 'empty_item' };
+      if (item.hideItem === hide) return { noop: true };
+      // 変更系は自動リトライしない (PUT route と同じ理由)
+      return rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}`, method: 'PATCH', body: { hideItem: hide }, timeoutMs: 90_000, maxAttempts: 1 });
+    });
+    if (result.block === 404) {
+      return errorResponse(res, { status: 404, error: 'ITEM_NOT_FOUND', message: `${mn} は楽天に存在しません`, requestId: req.requestId });
+    }
+    if (result.block) {
+      return errorResponse(res, { status: 502, error: 'RMS_PRECHECK_FAILED', message: `商品の取得に失敗 (${result.detail})`, requestId: req.requestId });
+    }
+    if (result.noop) {
+      console.log(`[rakuten-rms] visibility noop mn=${mn} hide=${hide}`);
+      return res.status(200).json({ ok: true, hidden: hide, noop: true });
+    }
+    console.log(`[rakuten-rms] visibility mn=${mn} hide=${hide} status=${result.status}`);
+    if (result.status === 200 || result.status === 201 || result.status === 204) {
+      return res.status(200).json({ ok: true, hidden: hide });
+    }
+    res.status(result.status).json(result.data ?? { ok: false });
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
   }
