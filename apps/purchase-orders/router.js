@@ -5343,7 +5343,7 @@ router.get('/inbound-plan', (req, res) => {
       <div class="hint">
         「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) / サロンジェ (@salonge.co.jp、<b>発注書参照</b>) の出荷連絡を自動で取り込んで変換できます。
         結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
-        対応表に無い先方番号は一覧されます — <b>新商品/番号変更</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。<br>
+        対応表に無い先方番号は一覧されます — <b>番号変更</b>ならその行で既存商品を検索して「🔁この番号で再登録」(その場で対応表を上書き)、<b>新商品</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。<br>
         <b>サロンジェ</b>は出荷明細が無い代わりにこちらの発注書どおり出荷されます — 変換で該当POを選ぶと台帳の明細から入荷予定を作り、本文の「※…終売/在庫無し」は除外候補と➖減数の提案になります。
       </div>
       <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
@@ -5600,12 +5600,15 @@ function renderIpResult(j, req) {
         '<th colspan="5" style="background:#eef4ff">🏠 うち (弊社)</th></tr>' +
         '<tr><th>先方番号</th><th>先方商品名</th><th class="r" style="border-right:2px solid #cbd5e1">数量</th>' +
         '<th>商品コード</th><th>商品名</th><th class="r">入数<br><span class="muted" style="font-weight:400;font-size:10px">1あたり個数</span></th><th class="r">入荷予定数</th><th class="r">単価</th></tr>';
-      (j.lines || []).forEach(function(l) {
+      (j.lines || []).forEach(function(l, li) {
         var left = '<td>' + esc(l.vendorCode) + '</td><td class="muted">' + esc(l.vendorName || '') + '</td>' +
           '<td class="r" style="border-right:2px solid #cbd5e1">' + l.vendorQty.toLocaleString('ja-JP') + '</td>';
         if (l.type === 'unmatched') {
           h += '<tr style="background:#fff7e6">' + left +
-            '<td colspan="5"><span class="badge b-warn">❓ 対応表になし — 新商品?</span> <span class="muted">下の🕗仮登録で控えて、NE登録の翌朝以降にマスタ管理→📇対応表で紐づけ。番号変更なら📇対応表で既存行を修正</span></td></tr>';
+            '<td colspan="5"><span class="badge b-warn">❓ 対応表になし</span> ' +
+            '<span style="white-space:nowrap"><input type="text" list="ipProdDl" data-iprelinkq="' + li + '" placeholder="🔍 番号変更なら既存商品を検索" style="width:220px" title="先方番号が変わっただけの既存商品なら、ここで商品を検索して選び🔁で対応表を上書きします"> ' +
+            '<button class="ghost sm" data-iprelink="' + li + '" title="選んだ商品の先方番号をこの番号に更新して対応表へ登録し、変換し直します (入数は維持)">🔁 この番号で再登録</button></span> ' +
+            '<span class="muted">新商品は下の🕗仮登録 → NE登録の翌朝以降にマスタ管理→📇対応表で紐づけ</span></td></tr>';
           return;
         }
         if (l.type === 'ambiguous') {
@@ -5628,10 +5631,11 @@ function renderIpResult(j, req) {
           '<td class="r"><b>' + l.qty.toLocaleString('ja-JP') + '</b>' + (l.qtyPerUnit !== 1 ? ' <span class="muted" style="font-size:10px">(' + l.vendorQty.toLocaleString('ja-JP') + '×' + l.qtyPerUnit + ')</span>' : '') + '</td>' +
           '<td class="r">' + (l.cost == null ? '—' : yen(l.cost)) + '</td></tr>';
       });
-      h += '</table>';
+      h += '</table><datalist id="ipProdDl"></datalist>';
       h += '<div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">' +
         '<button class="pri" id="ipCopy">📋 貼り付けデータをコピー (商品ID/入荷予定数/仕入単価 ' + j.rowCount + '行)</button>' +
         '<button id="ipLogizard2">🚚 ロジザード入荷予定を開く</button>' +
+        '<button id="ipVmapOpen" title="マスタ管理の📇先方番号対応表 (この仕入先) を新しいタブで開きます">📇 対応表を開く</button>' +
         '<span class="muted" style="font-size:11px">商品IDはNE商品マスタの表記どおりに出力 (ロジザードは大文字小文字を区別)</span>' +
         '<details style="flex-basis:100%"><summary class="muted" style="cursor:pointer;font-size:11px">コピーされる内容を表示</summary>' +
         '<textarea id="ipPaste" rows="5" style="width:100%;margin-top:4px" readonly>' + esc(j.pasteText) + '</textarea></details></div>';
@@ -5655,6 +5659,52 @@ function renderIpResult(j, req) {
       });
       var lg2 = document.getElementById('ipLogizard2');
       if (lg2) lg2.addEventListener('click', function(){ window.open(LOGIZARD_URL, '_blank', 'noopener'); });
+      // 📇 マスタ管理→先方番号対応表を変換した仕入先で直接開く (番号変更をまとめて直すとき用)
+      var vmo = document.getElementById('ipVmapOpen');
+      if (vmo) vmo.addEventListener('click', function() {
+        window.open('/apps/purchase-orders/admin?grp=vendormap&sup=' + encodeURIComponent(j.supplierCode), '_blank', 'noopener');
+      });
+      // ❓対応表になし行の再登録: 番号変更なら既存商品を検索して選び、その場で対応表を上書き→再変換。
+      // 仕入先は変換時点の j.supplierCode に固定 (仮登録ボタンと同じ理由、Codex plan-R1 High)
+      var ipQDeb = null, ipQGen = 0;
+      area.querySelectorAll('input[data-iprelinkq]').forEach(function(inp) {
+        inp.addEventListener('input', function(ev) {
+          var v = ev.target.value.trim();
+          if (ipQDeb) clearTimeout(ipQDeb);
+          var g = ++ipQGen; // 早期returnでも世代を進め、送信済み要求の遅延応答で候補を上書きしない
+          if (v.length < 2 || v.indexOf(' — ') >= 0) return; // 候補選択後は再検索しない
+          ipQDeb = setTimeout(function() {
+            getJson(API + '/vendor-map/products?supplier=' + encodeURIComponent(j.supplierCode) + '&q=' + encodeURIComponent(v))
+              .then(function(r2) {
+                if (!r2.ok || g !== ipQGen) return;
+                var dl = document.getElementById('ipProdDl');
+                if (dl) dl.innerHTML = r2.rows.map(function(p){ return '<option value="' + esc(p.code + ' — ' + p.name) + '"></option>'; }).join('');
+              }).catch(function(){});
+          }, 250);
+        });
+      });
+      area.querySelectorAll('button[data-iprelink]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var line = (j.lines || [])[Number(btn.getAttribute('data-iprelink'))];
+          if (!line) return;
+          var inp = area.querySelector('input[data-iprelinkq="' + btn.getAttribute('data-iprelink') + '"]');
+          var pv = inp ? inp.value : '';
+          var dash = pv.indexOf(' — ');
+          var pcode = (dash >= 0 ? pv.slice(0, dash) : pv).trim(); // 「コード — 商品名」からコードを取り出す (手入力のコードだけでも可)
+          if (!pcode) { toast('再登録する商品を検索して選択してください (新商品は下の🕗仮登録へ)'); return; }
+          if (!confirm('商品 ' + pcode + ' の先方番号を「' + line.vendorCode + '」として対応表へ登録しますか?\\n(既に別の番号が付いている場合は上書きします。入数はそのまま)')) return;
+          btn.disabled = true;
+          // baseUpdatedAt なし = 無条件上書き (直前にconfirmで確認済み。旧番号は応答で表示し、監査ログにも残る)
+          post(API + '/vendor-map/entry', { supplier_code: j.supplierCode, product_code: pcode, vendor_code: line.vendorCode })
+            .then(function(r2) {
+              btn.disabled = false;
+              if (!r2.ok) { toast('エラー: ' + r2.error); return; }
+              toast(r2.updated ? '先方番号を更新しました (旧: ' + (r2.oldVendorCode || '—') + ') — 変換し直します' : '対応表へ登録しました — 変換し直します');
+              if (r2.warning) toast('⚠️ ' + r2.warning);
+              reconvertIp();
+            }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+        });
+      });
       var pd = document.getElementById('ipPend');
       if (pd) pd.addEventListener('click', function() {
         pd.disabled = true;
@@ -8317,7 +8367,12 @@ document.getElementById('vmapForm').addEventListener('submit', function(ev) {
   }).catch(function(e){ toast('通信エラー: ' + e.message); });
 });
 emLoad();
-setGroup('suppliers');
+// URLパラメータで開くグループ・仕入先を指定できる (入荷予定タブの「📇対応表を開く」が ?grp=vendormap&sup=仕入先 で別タブ遷移してくる)。
+// 不正な grp は既定の suppliers に落とす / sup は loadVmap 側が実在チェックして無効なら既定に戻す
+var qp0 = new URLSearchParams(location.search);
+if (qp0.get('sup')) VM_SUP = qp0.get('sup');
+var grp0 = qp0.get('grp');
+setGroup(grp0 && GRP_HINTS[grp0] ? grp0 : 'suppliers');
 // 未紐付けの新商品バッジ (作業キューなので件数を見せる、Codex IA提言)
 fetch('/apps/purchase-orders/api/attrs/unlinked?days=60').then(function(r){ return r.json(); }).then(function(j) {
   if (j.ok && j.count > 0) document.getElementById('unlinkedBadge').innerHTML = ' <span class="badge b-draft">' + j.count + '</span>';

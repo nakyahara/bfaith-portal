@@ -2413,9 +2413,12 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   ok(inbHtml2.includes('入荷予定') && inbHtml2.includes('ipConvert'), '/inbound-plan 入荷予定作成ページ');
   ok(inbHtml2.includes('仕入先の出荷明細') && inbHtml2.includes('data-ipqpu') && inbHtml2.includes('新商品'), '/inbound-plan 左右対応表+入数編集UI');
   ok(inbHtml2.includes('ロジザード入荷予定を開く') && inbHtml2.includes('ap003.logizard.net/LPSTD405/PA01/Index'), '/inbound-plan ロジザードを開くボタン');
+  ok(inbHtml2.includes('data-iprelink') && inbHtml2.includes('この番号で再登録'), '/inbound-plan 対応表になし行の再登録UI');
+  ok(inbHtml2.includes('ipVmapOpen') && inbHtml2.includes('grp=vendormap'), '/inbound-plan 対応表を別タブで開くボタン');
   const adminHtml3 = await (await fetch(base + '/admin')).text();
   ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
   ok(adminHtml3.includes('data-vmqpu') && adminHtml3.includes('vmNewQpu'), '/admin 対応表に入数列');
+  ok(adminHtml3.includes('URLSearchParams') && adminHtml3.includes("qp0.get('sup')"), '/admin URLパラメータでグループ・仕入先を指定可');
 }
 
 // ═══ 出荷明細メールの自動取得 (Gmail偽装) ═══
