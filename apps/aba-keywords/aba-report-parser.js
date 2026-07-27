@@ -5,15 +5,14 @@
  *   { "reportSpecification": {...}, "dataByDepartmentAndSearchTerm": [ {...}, {...}, ... ] }
  * 数百MB級になり得るため JSON.parse は使えない (miniPC はメモリ制約あり)。
  *
- * 依存を増やさないため専用の逐次スキャナで実装する。方針は「省メモリだが厳格」:
- *   - キー探索は JSON 構文 (括弧スタック・文字列・エスケープ) を追跡し、
- *     トップレベル (スタック深さ1) のプロパティ名の直後の ':' → '[' だけを配列開始と認める
- *     (文字列値にキー名が現れても誤検知しない — Codex R1 medium)
- *   - 配列要素はオブジェクトのみ許容。非オブジェクト要素・要素間のゴミは即エラー
- *     (黙って読み飛ばすと 0件取込が「完了」として台帳確定する — Codex R2 high)
- *   - 括弧はスタックで種類まで照合 ('{' を ']' で閉じる破損を検出 — Codex R3 high)。
- *     配列後の残り (tail) も文字列/括弧/スカラーリテラルを検証し、末尾ゴミはエラー
- *   - 要素単位で JSON.parse するので値の解釈は本物の JSON パーサに任せる
+ * 実装方針 (Codex R1〜R4 の指摘を反映した決定版):
+ *   文書全体を「厳密なJSON文法の streaming FSM」で検証しながら読む。
+ *   キー/コロン/値/カンマの順序・括弧の種類・リテラルの正当性をすべて検証し、
+ *   途中切断・ゴミ・構文崩れは必ずエラーにする (fail-closed —
+ *   壊れたレポートを「取込完了」として台帳確定させない)。
+ *   対象配列 (トップレベルの dataByDepartmentAndSearchTerm) の要素オブジェクトだけは
+ *   生テキストをキャプチャして要素単位で JSON.parse する (値の解釈は本物に任せる)。
+ *   文字列値にキー名が現れても誤検知しない (キー文字列だけを照合)。
  */
 import { StringDecoder } from 'string_decoder';
 
@@ -29,36 +28,57 @@ const SCALAR_RE = /^(true|false|null|-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?)$/;
 export async function parseAbaReportStream(source, onItem) {
   let itemCount = 0;
 
-  // phase: 'seek' キー探索 → 'expect-colon' → 'expect-bracket' → 'in-array' 要素収集
-  //        → 'tail' 外側JSONの閉じ待ち → 'complete' 文書終端 (以降は空白のみ許容)
-  let phase = 'seek';
-  const stack = [];       // 要素外の開き括弧 ('{' | '[')。対象配列の '[' は積まない
+  // ---- 文法FSM ----
+  // frame: { type: 'obj', expect: 'key-or-end'|'key'|'colon'|'value'|'comma-or-end' }
+  //        { type: 'arr', expect: 'value-or-end'|'value'|'comma-or-end', isTarget }
+  const stack = [];
+  let rootSeen = false;           // トップレベル値を読み始めたか
+  let docDone = false;            // トップレベル値が完結したか
+  let targetSeen = false;         // 対象配列が現れたか
+  let pendingTargetValue = false; // 直前のトップレベルキーが ARRAY_KEY → 次の値が対象配列
   let inString = false;
   let escaped = false;
-  let strBuf = null;      // スタック深さ1の文字列の中身 (キー候補)。それ以外は null
-  let literal = '';       // tail のスカラーリテラル蓄積 (true/false/null/数値の検証用)
+  let strIsKey = false;
+  let strBuf = null;              // トップレベルのキー文字列の中身 (キー照合用)。それ以外は null
+  let literal = '';               // スカラーリテラル蓄積 (true/false/null/数値の検証用)
 
-  // in-array の状態
-  let arrayExpect = 'value-or-end'; // 'value-or-end' | 'value' | 'comma-or-end'
+  // ---- 対象配列の要素キャプチャ ----
+  let collecting = false;
   let elDepth = 0;
   let elInString = false;
   let elEscaped = false;
   let buf = '';
-  let collecting = false;
 
   const isWs = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\r';
-  const popBracket = (ch) => {
-    const open = stack.pop();
-    if (!open || (ch === '}' && open !== '{') || (ch === ']' && open !== '[')) {
-      throw new Error(`ABAレポート解析エラー: 括弧の対応不一致 ('${open || 'なし'}' に対して '${ch}')`);
-    }
+  const err = (msg) => { throw new Error(`ABAレポート解析エラー: ${msg} (itemCount=${itemCount})`); };
+  const top = () => stack[stack.length - 1];
+
+  // 1つの値が完結した → 親フレームの期待を進める (親なし = 文書完結)
+  const valueDone = () => {
+    const t = top();
+    if (!t) { docDone = true; return; }
+    t.expect = 'comma-or-end';
   };
   const flushLiteral = () => {
     if (literal === '') return;
-    if (!SCALAR_RE.test(literal)) {
-      throw new Error(`ABAレポート解析エラー: 不正なリテラル '${literal.slice(0, 30)}'`);
-    }
+    if (!SCALAR_RE.test(literal)) err(`不正なリテラル '${literal.slice(0, 30)}'`);
     literal = '';
+    valueDone();
+  };
+  // いま「値の開始」が許される位置か
+  const expectingValue = () => {
+    if (docDone) return false;
+    if (stack.length === 0) return !rootSeen;
+    const t = top();
+    if (t.type === 'obj') return t.expect === 'value';
+    return t.expect === 'value' || t.expect === 'value-or-end';
+  };
+  // 値開始の共通処理。対象配列フラグは「次の1値」だけに効く
+  const beginValue = () => {
+    if (stack.length === 0) rootSeen = true;
+    const wasTarget = pendingTargetValue;
+    pendingTargetValue = false;
+    return wasTarget;
   };
 
   // マルチバイト文字がチャンク境界で割れても壊れないよう StringDecoder で持ち越す
@@ -70,122 +90,145 @@ export async function parseAbaReportStream(source, onItem) {
     for (let i = 0; i < text.length; i++) {
       const ch = text[i];
 
-      // ================= 要素収集 =================
-      if (phase === 'in-array') {
-        if (collecting) {
-          buf += ch;
-          if (elInString) {
-            if (elEscaped) { elEscaped = false; }
-            else if (ch === '\\') { elEscaped = true; }
-            else if (ch === '"') { elInString = false; }
-            continue;
-          }
-          if (ch === '"') { elInString = true; continue; }
-          if (ch === '{' || ch === '[') { elDepth++; continue; }
-          if (ch === '}' || ch === ']') {
-            elDepth--;
-            if (elDepth === 0) {
-              onItem(JSON.parse(buf));
-              itemCount++;
-              buf = '';
-              collecting = false;
-            }
-          }
+      // ================= 対象配列の要素キャプチャ =================
+      if (collecting) {
+        buf += ch;
+        if (elInString) {
+          if (elEscaped) { elEscaped = false; }
+          else if (ch === '\\') { elEscaped = true; }
+          else if (ch === '"') { elInString = false; }
           continue;
         }
-        // 要素間: 期待トークンを厳格に検証 (ゴミ・非オブジェクト要素は即エラー)
-        if (isWs(ch)) continue;
-        if (ch === ']' && arrayExpect !== 'value') { phase = 'tail'; continue; }
-        if (arrayExpect === 'comma-or-end') {
-          if (ch === ',') { arrayExpect = 'value'; continue; }
-          throw new Error(`ABAレポート解析エラー: 要素の後に不正な文字 '${ch}' (itemCount=${itemCount})`);
-        }
-        // 'value' / 'value-or-end': 要素はオブジェクトのみ許容
-        if (ch === '{') {
-          collecting = true;
-          elDepth = 1;
-          elInString = false;
-          elEscaped = false;
-          buf = '{';
-          arrayExpect = 'comma-or-end';
-          continue;
-        }
-        throw new Error(`ABAレポート解析エラー: オブジェクト以外の配列要素 (先頭文字 '${ch}', itemCount=${itemCount})`);
-      }
-
-      // ================= 配列後: 外側JSONの閉じを検証 =================
-      if (phase === 'tail' || phase === 'complete') {
-        if (inString) {
-          if (escaped) { escaped = false; }
-          else if (ch === '\\') { escaped = true; }
-          else if (ch === '"') { inString = false; }
-          continue;
-        }
-        if (isWs(ch)) { flushLiteral(); continue; }
-        if (phase === 'complete') {
-          throw new Error(`ABAレポート解析エラー: 文書終端後に余分な文字 '${ch}'`);
-        }
-        if (ch === '"') { flushLiteral(); inString = true; continue; }
-        if (ch === ',' || ch === ':') { flushLiteral(); continue; }
-        if (ch === '{' || ch === '[') { flushLiteral(); stack.push(ch); continue; }
+        if (ch === '"') { elInString = true; continue; }
+        if (ch === '{' || ch === '[') { elDepth++; continue; }
         if (ch === '}' || ch === ']') {
-          flushLiteral();
-          popBracket(ch);
-          if (stack.length === 0) phase = 'complete';
-          continue;
+          elDepth--;
+          if (elDepth === 0) {
+            onItem(JSON.parse(buf));
+            itemCount++;
+            buf = '';
+            collecting = false;
+            top().expect = 'comma-or-end';
+          }
         }
-        literal += ch; // スカラーリテラル候補 (区切りで検証)
         continue;
       }
 
-      // ================= キー探索 (JSON構文追跡) =================
+      // ================= 文字列 (キー / 値) =================
       if (inString) {
         if (escaped) { escaped = false; }
         else if (ch === '\\') { escaped = true; }
         else if (ch === '"') {
           inString = false;
-          if (stack.length === 1 && strBuf === ARRAY_KEY) phase = 'expect-colon';
+          if (strIsKey) {
+            top().expect = 'colon';
+            pendingTargetValue = stack.length === 1 && strBuf === ARRAY_KEY;
+          } else {
+            valueDone();
+          }
           strBuf = null;
         } else if (strBuf !== null && strBuf.length <= ARRAY_KEY.length) {
           strBuf += ch;
         }
         continue;
       }
-      if (ch === '"') {
-        // 文字列開始。expect-colon/expect-bracket 中なら誤検知だったのでリセット
-        if (phase !== 'seek') phase = 'seek';
-        inString = true;
-        strBuf = stack.length === 1 ? '' : null;
-        continue;
-      }
-      if (isWs(ch)) continue;
 
-      if (phase === 'expect-colon') {
-        if (ch === ':') { phase = 'expect-bracket'; continue; }
-        // ':' 以外 = キーではなく「キー名と同じ文字列値」だった → 探索継続 (構造文字は下で処理)
-        phase = 'seek';
+      if (isWs(ch)) { flushLiteral(); continue; }
+      // リテラルの直後に構造文字が来たら先に確定させる (例: `123,` / `true}`)
+      if (ch === ',' || ch === ':' || ch === '}' || ch === ']') flushLiteral();
+      if (docDone) err(`文書終端後に余分な文字 '${ch}'`);
+
+      switch (ch) {
+        case '{': {
+          if (!expectingValue()) err(`'{' の位置が不正`);
+          const t = top();
+          if (t && t.type === 'arr' && t.isTarget) {
+            // 対象配列の要素 → キャプチャ開始 (FSMを一時バイパス、閉じで JSON.parse)
+            collecting = true;
+            elDepth = 1;
+            elInString = false;
+            elEscaped = false;
+            buf = '{';
+            break;
+          }
+          beginValue();
+          stack.push({ type: 'obj', expect: 'key-or-end' });
+          break;
+        }
+        case '[': {
+          if (!expectingValue()) err(`'[' の位置が不正`);
+          const isTarget = beginValue();
+          if (isTarget && targetSeen) err('対象配列が複数回出現');
+          if (isTarget) targetSeen = true;
+          stack.push({ type: 'arr', expect: 'value-or-end', isTarget });
+          break;
+        }
+        case '}': {
+          const t = top();
+          if (!t || t.type !== 'obj' || (t.expect !== 'key-or-end' && t.expect !== 'comma-or-end')) {
+            err(`'}' の位置が不正`);
+          }
+          stack.pop();
+          valueDone();
+          break;
+        }
+        case ']': {
+          const t = top();
+          if (!t || t.type !== 'arr' || (t.expect !== 'value-or-end' && t.expect !== 'comma-or-end')) {
+            err(`']' の位置が不正`);
+          }
+          stack.pop();
+          valueDone();
+          break;
+        }
+        case ',': {
+          const t = top();
+          if (!t || t.expect !== 'comma-or-end') err(`',' の位置が不正`);
+          t.expect = t.type === 'obj' ? 'key' : 'value';
+          break;
+        }
+        case ':': {
+          const t = top();
+          if (!t || t.type !== 'obj' || t.expect !== 'colon') err(`':' の位置が不正`);
+          t.expect = 'value';
+          break;
+        }
+        case '"': {
+          const t = top();
+          if (t && t.type === 'obj' && (t.expect === 'key-or-end' || t.expect === 'key')) {
+            inString = true;
+            strIsKey = true;
+            // キー照合はトップレベル (= root オブジェクト直下) だけ必要
+            strBuf = stack.length === 1 ? '' : null;
+            break;
+          }
+          if (!expectingValue()) err(`'"' の位置が不正`);
+          if (t && t.type === 'arr' && t.isTarget) err('対象配列に文字列要素 (オブジェクトのみ想定)');
+          beginValue();
+          inString = true;
+          strIsKey = false;
+          strBuf = null;
+          break;
+        }
+        default: {
+          // スカラーリテラル (true/false/null/数値) の開始または継続
+          if (literal === '') {
+            if (!expectingValue()) err(`不正な文字 '${ch}'`);
+            const t = top();
+            if (t && t.type === 'arr' && t.isTarget) err('対象配列に非オブジェクト要素');
+            beginValue();
+          }
+          literal += ch;
+        }
       }
-      if (phase === 'expect-bracket') {
-        if (ch === '[') { phase = 'in-array'; arrayExpect = 'value-or-end'; continue; }
-        // 値が配列でない → 探索継続
-        phase = 'seek';
-      }
-      if (ch === '{' || ch === '[') stack.push(ch);
-      else if (ch === '}' || ch === ']') popBracket(ch);
     }
   }
 
-  if (phase !== 'complete') {
-    if (phase === 'seek' || phase === 'expect-colon' || phase === 'expect-bracket') {
-      throw new Error('ABAレポート解析エラー: dataByDepartmentAndSearchTerm 配列が見つからない');
-    }
-    if (phase === 'in-array') {
-      // 配列の閉じ ']' 未到達 = ダウンロード途中切断。成功扱いにすると欠損データで
-      // 台帳が確定してしまうため必ず失敗させる
-      throw new Error(`ABAレポート解析エラー: 配列が閉じる前にストリームが終了 (itemCount=${itemCount}, collecting=${collecting})`);
-    }
-    throw new Error(`ABAレポート解析エラー: 外側JSONが閉じる前にストリームが終了 (itemCount=${itemCount})`);
+  flushLiteral(); // トップレベルがスカラーだけの文書 (異常系) の確定用
+  if (collecting || inString || stack.length > 0 || !docDone) {
+    err('文書が完結する前にストリームが終了 (ダウンロード途中切断の疑い)');
   }
+  if (!targetSeen) err('dataByDepartmentAndSearchTerm 配列が見つからない');
   return { itemCount };
 }
 

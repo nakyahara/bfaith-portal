@@ -116,6 +116,10 @@ const FIXTURE = JSON.stringify({
     ['括弧種類の不一致 (Codex R3)', '{"dataByDepartmentAndSearchTerm":[{"a":1}]]'],
     ['tail内の不正リテラル', '{"dataByDepartmentAndSearchTerm":[],"x":garbage}'],
     ['seek内の括弧不一致', '{"reportSpecification":{"a":1],"dataByDepartmentAndSearchTerm":[]}'],
+    ['値なしキー (Codex R4)', '{"dataByDepartmentAndSearchTerm":[],"x"}'],
+    ['objのtrailing comma (Codex R4)', '{"dataByDepartmentAndSearchTerm":[],}'],
+    ['コロン欠落', '{"dataByDepartmentAndSearchTerm" [1]}'],
+    ['対象キーの値が配列でない', '{"dataByDepartmentAndSearchTerm":{"a":1}}'],
   ];
   for (const [name, json] of cases) {
     let threw = false;
