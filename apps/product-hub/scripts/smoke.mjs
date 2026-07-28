@@ -1083,6 +1083,32 @@ check('ichiba: root (children のみ) も新形式で通る',
 check('ichiba: 壊れた応答も落ちない',
   JSON.stringify(ichiba.normalizeGenreSearch({})) === JSON.stringify({ current: null, parents: [], children: [] }));
 
+// ─── 利益シミュレーション (Notion 数式の移植) ───
+const profit = await import('../lib/profit.js');
+check('profit: Notion式どおり (1280円/原価660/税10%/送料237 → 189円 14.8%)',
+  JSON.stringify(profit.computeProfit({ price: 1280, costExTax: 660, taxPercent: 10, shippingCost: 237 }))
+  === JSON.stringify({ profit: 189, marginPct: 14.8, costIncTax: 726 }));
+check('profit: 税率8%', profit.computeProfit({ price: 1000, costExTax: 500, taxPercent: 8, shippingCost: 100 }).profit === Math.round(900 - 540 - 100));
+check('profit: 税率null は計算しない (フォールバックは呼び出し側の責務)',
+  profit.computeProfit({ price: 1000, costExTax: 500, taxPercent: null, shippingCost: 100 }) === null);
+check('profit: 赤字も計算できる', profit.computeProfit({ price: 500, costExTax: 600, taxPercent: 10, shippingCost: 200 }).profit < 0);
+check('profit: 欠損は null (売価0/原価null/送料null/税率異常)',
+  profit.computeProfit({ price: 0, costExTax: 1, taxPercent: 10, shippingCost: 1 }) === null
+  && profit.computeProfit({ price: 100, costExTax: null, taxPercent: 10, shippingCost: 1 }) === null
+  && profit.computeProfit({ price: 100, costExTax: 1, taxPercent: 10, shippingCost: null }) === null
+  && profit.computeProfit({ price: 100, costExTax: 1, taxPercent: 999, shippingCost: 1 }) === null);
+check('profit: TAKE_RATE=0.9 (Notion式の手数料控除)', profit.TAKE_RATE === 0.9);
+
+// getNeCost: mirror から原価/送料/配送方法/税率
+insProd.run(9401, 'cost-smoke', '原価検証', null);
+db.prepare(`UPDATE mirror_products SET 原価 = 660, 送料 = 237, 配送方法 = 'ネコポス', 消費税率 = 0.1 WHERE product_id = 9401`).run();
+const nc = vari.getNeCost(db, 'COST-SMOKE');
+check('getNeCost: 原価/送料/配送方法/税率 (大小ゆらぎ吸収)',
+  nc && nc.costExTax === 660 && nc.shippingCost === 237 && nc.shippingMethod === 'ネコポス' && nc.taxPercent === 10,
+  JSON.stringify(nc));
+check('getNeCost: NEに無ければ null', vari.getNeCost(db, 'NO-SUCH-COST') === null);
+db.prepare(`DELETE FROM mirror_products WHERE product_id = 9401`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -1147,6 +1173,7 @@ const renders = [
     regroup: null,
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
+    neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     // 店舗内カテゴリの選択リスト分岐 (有効/選択済み/一覧から外れた選択済み)
     shopCategories: [
@@ -1168,6 +1195,7 @@ const renders = [
     rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr', shipping_method_group: null, postage_included: null, normal_delivery_date_id: null, white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://x', published_at: null },
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
@@ -1186,6 +1214,7 @@ const renders = [
     rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: null, shipping_method_group: '7', postage_included: 0, normal_delivery_date_id: null, white_bg_drive_file_id: null, white_bg_drive_url: null, published_at: '2026-07-27T01:00:00Z' },
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
@@ -1201,6 +1230,7 @@ const renders = [
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -1217,6 +1247,7 @@ const renders = [
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
   // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
@@ -1230,6 +1261,7 @@ const renders = [
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (excluded SKU section)', 'detail.ejs', {
@@ -1242,6 +1274,7 @@ const renders = [
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (detached SKU)', 'detail.ejs', {
@@ -1254,6 +1287,7 @@ const renders = [
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
@@ -1267,6 +1301,7 @@ const renders = [
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     genreDict: null,
+    neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
   }],
 ];

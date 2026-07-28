@@ -20,7 +20,7 @@ import {
 import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
-import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults } from './lib/variation.js';
+import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import {
@@ -29,6 +29,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes,
 } from './services/rakuten-listing.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
+import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
@@ -183,6 +184,18 @@ router.get('/detail/:id', (req, res) => {
       .get(String(m.商品コード).trim().toLowerCase())?.id || null;
   }
 
+  // 利益シミュレーション (Notion 数式の移植)。原価・送料 (配送方法から自動算出済) ・税率は NE から
+  const neCost = getNeCost(db, draft.ne_code);
+  const simTaxPercent = (() => {
+    const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
+    if (t) return Number(t[1]);
+    return neCost?.taxPercent ?? 10;
+  })();
+  const profitSim = neCost ? computeProfit({
+    price: draft.price, costExTax: neCost.costExTax,
+    taxPercent: simTaxPercent, shippingCost: neCost.shippingCost,
+  }) : null;
+
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // ジャンル属性辞書 (取得済みならUIに必須件数と自動フォームの材料を渡す)
   const genreDict = rakuten?.genre_id ? getCachedGenreAttributes(db, rakuten.genre_id) : null;
@@ -198,6 +211,7 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE,
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
   });
