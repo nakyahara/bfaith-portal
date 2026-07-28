@@ -17,11 +17,16 @@
 
 // ⚠️ ホスト事情 (2026-07-28 実測):
 //   - 新ホスト openapi.rakuten.co.jp/ichibams には IchibaItem はあるが **IchibaGenre は無い** (404)
-//   - 旧ホスト app.rakuten.co.jp は両方生きているが、Render の RAKUTEN_APP_ID は
-//     新システム (accessKey ペア) の ID なので旧ホストでは「specify valid applicationId」になる
-//   → 商品検索 = 新ホスト (ranking-checker と同じ資格情報で今すぐ動く)
-//     ジャンルツリー = 旧ホスト (専用の旧式 applicationId = env RAKUTEN_WS_APP_ID が必要)
+//   - 旧ホスト app.rakuten.co.jp は生きているが、新システム (UUID+accessKey) の ID は通らない。
+//     さらに webservice.rakuten.co.jp の新規登録も新形式のみ = **旧式IDはもう入手できない**
+//   → ジャンルツリーは新システムの正式ジャンルAPI **ichibagt/IchibaGenre/Search** を使う。
+//     ⚠️ ichibagt は認証がルート解決より先 (dummy では全バージョン 403) のため、
+//     APIバージョンは実行時に 404 フォールバックで自己決定し、成功したものを記憶する。
+//     旧式IDを持っている場合だけ旧ホスト IchibaGenre に fallback (env RAKUTEN_WS_APP_ID)
 const ICHIBA_GENRE_URL = 'https://app.rakuten.co.jp/services/api/IchibaGenre/Search/20140222';
+const ICHIBA_GENRE_BASE_NEW = 'https://openapi.rakuten.co.jp/ichibagt/api/IchibaGenre/Search/';
+export const ICHIBA_GENRE_NEW_VERSIONS = ['20260701', '20170711', '20140222'];
+let workingGenreVersion = null; // 実行時に確定したバージョン (プロセス内メモ)
 const ICHIBA_ITEM_URL_NEW = 'https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260401';
 const ICHIBA_ITEM_URL_OLD = 'https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601';
 const ICHIBA_HEADERS = {
@@ -102,25 +107,43 @@ export async function fetchGenreChildren(genreId) {
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     return { ok: true, ...cached };
   }
-  const app = wsAppId();
-  if (!app) {
+  const ms = msCreds();
+  const ws = wsAppId();
+  if (!ms && !ws) {
     return {
       ok: false, needsSetup: true,
-      error: 'ジャンルツリー用の楽天ウェブサービスID (RAKUTEN_WS_APP_ID) が未設定です。webservice.rakuten.co.jp でアプリ登録し、Render の env に設定してください',
+      error: '楽天ウェブサービスの資格情報が未設定です (RAKUTEN_APP_ID + RAKUTEN_ACCESS_KEY)',
     };
   }
   // 同じ未キャッシュIDへの並行要求は 1 回の API 呼び出しに束ねる (stampede 防止)
   if (inflight.has(id)) return inflight.get(id);
   const job = (async () => {
-    const url = `${ICHIBA_GENRE_URL}?applicationId=${encodeURIComponent(app)}&genreId=${id}&format=json`;
-    const r = await ichibaGet(url);
+    let r = null;
+    if (ms) {
+      // バージョンは 404 フォールバックで自己決定 (確定後は 1 回で当たる)
+      const tryVersions = workingGenreVersion ? [workingGenreVersion, ...ICHIBA_GENRE_NEW_VERSIONS.filter((v) => v !== workingGenreVersion)] : ICHIBA_GENRE_NEW_VERSIONS;
+      for (const v of tryVersions) {
+        const url = `${ICHIBA_GENRE_BASE_NEW}${v}?applicationId=${encodeURIComponent(ms.applicationId)}`
+          + `&accessKey=${encodeURIComponent(ms.accessKey)}&genreId=${id}&format=json`;
+        r = await ichibaGet(url);
+        if (r.status === 404) { if (workingGenreVersion === v) workingGenreVersion = null; continue; }
+        if (r.status === 200) workingGenreVersion = v;
+        break;
+      }
+    } else {
+      r = await ichibaGet(`${ICHIBA_GENRE_URL}?applicationId=${encodeURIComponent(ws)}&genreId=${id}&format=json`);
+    }
     if (r.status !== 200 || !r.data) {
       // 一時障害なら期限切れキャッシュで凌ぐ (無ければエラー)
       if (cached) return { ok: true, ...cached, stale: true };
-      const msg = r.data?.error_description || r.data?.error || `HTTP ${r.status}`;
+      const msg = r.data?.errors?.errorMessage || r.data?.error_description || r.data?.error || `HTTP ${r.status}`;
       return { ok: false, error: `ジャンル取得に失敗: ${msg}` };
     }
     const entry = normalizeGenreSearch(r.data);
+    if (!entry || (!entry.current && entry.children.length === 0)) {
+      if (cached) return { ok: true, ...cached, stale: true };
+      return { ok: false, error: 'ジャンル情報を解釈できませんでした (応答形が想定と異なります)' };
+    }
     childrenCache.set(id, { fetchedAt: Date.now(), ...entry });
     if (childrenCache.size > 2000) {
       // 全 clear は再取得の集中を招くので、古い方から 500 件だけ落とす (Map は挿入順)
@@ -136,18 +159,30 @@ export async function fetchGenreChildren(genreId) {
   return job;
 }
 
-/** IchibaGenre/Search 応答の正規化 (pure、テスト可能) */
+/**
+ * ジャンルAPI応答の正規化 (pure、テスト可能)。新旧両方の形を許容する:
+ *   旧 (app.rakuten.co.jp 20140222): { current:{genreId,genreName,genreLevel},
+ *     parents:[{parent:{...}}], children:[{child:{...}}] }
+ *   新 (openapi ichibagt 20260701): { genre:{id,jaName,level},
+ *     ancestors:[{...}], children:[{...}] } — フィールド名は公式docより。実応答の
+ *     ゆらぎに備えて id|genreId / jaName|genreName|name / level|genreLevel を全部拾う
+ */
 export function normalizeGenreSearch(data) {
+  const idOf = (g) => g?.genreId ?? g?.id;
   const pick = (g) => ({
-    genreId: String(g.genreId),
-    name: g.genreName || '',
-    level: Number(g.genreLevel) || 0,
+    genreId: String(idOf(g)),
+    name: g.genreName ?? g.jaName ?? g.nameJa ?? g.name ?? '',
+    level: Number(g.genreLevel ?? g.level) || 0,
   });
-  const current = data?.current ? pick(data.current) : null;
-  const parents = (Array.isArray(data?.parents) ? data.parents : [])
-    .map((p) => pick(p.parent || p)).filter((p) => p.genreId !== '0');
-  const children = (Array.isArray(data?.children) ? data.children : [])
-    .map((c) => pick(c.child || c));
+  const arr = (v) => (Array.isArray(v) ? v : v != null ? [v] : []);
+  const valid = (g) => g && idOf(g) != null;
+
+  const currentRaw = data?.current ?? data?.genre;
+  const current = valid(currentRaw) ? pick(currentRaw) : null;
+  const parents = arr(data?.parents ?? data?.ancestors)
+    .map((p) => p?.parent || p).filter(valid).map(pick).filter((p) => p.genreId !== '0');
+  const children = arr(data?.children)
+    .map((c) => c?.child || c).filter(valid).map(pick);
   return { current, parents, children };
 }
 

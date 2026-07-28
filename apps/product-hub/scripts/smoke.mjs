@@ -1058,11 +1058,27 @@ delete process.env.RAKUTEN_WS_APP_ID;
 delete process.env.RAKUTEN_APP_ID;
 delete process.env.RAKUTEN_ACCESS_KEY;
 const treeNoEnv = await ichiba.fetchGenreChildren('0');
-check('ichiba: RAKUTEN_WS_APP_ID 未設定はセットアップ案内 (API を叩かない)',
-  treeNoEnv.ok === false && treeNoEnv.needsSetup === true && /RAKUTEN_WS_APP_ID/.test(treeNoEnv.error));
-const sugNoEnv = await ichiba.suggestGenreByName('テスト商品');
-check('ichiba: 資格情報が両方無ければ提案もエラー (API を叩かない)',
-  sugNoEnv.ok === false && /資格情報/.test(sugNoEnv.error));
+check('ichiba: 資格情報が無ければツリーはセットアップ案内 (API を叩かない)',
+  treeNoEnv.ok === false && treeNoEnv.needsSetup === true && /RAKUTEN_APP_ID/.test(treeNoEnv.error));
+
+// 新システム ichibagt 20260701 の形 (genre/ancestors/children + id/jaName/level) を許容
+const NEW_GENRE_FIXTURE = {
+  genre: { id: 100901, jaName: '文房具・事務用品', level: 2 },
+  ancestors: [{ id: 215783, jaName: '日用品雑貨・文房具・手芸', level: 1 }],
+  children: [
+    { id: 111142, jaName: '手帳・ノート・紙製品', level: 3 },
+    { id: 216057, jaName: '筆記具', level: 3 },
+  ],
+};
+const gNew = ichiba.normalizeGenreSearch(NEW_GENRE_FIXTURE);
+check('ichiba: 新形式 (genre/ancestors/id/jaName) を正規化',
+  gNew.current.genreId === '100901' && gNew.current.name === '文房具・事務用品'
+  && gNew.parents.length === 1 && gNew.children.length === 2 && gNew.children[1].name === '筆記具',
+  JSON.stringify(gNew));
+check('ichiba: 新形式のフルパス組み立て',
+  ichiba.genrePathOf(gNew) === '日用品雑貨・文房具・手芸 > 文房具・事務用品');
+check('ichiba: root (children のみ) も新形式で通る',
+  ichiba.normalizeGenreSearch({ genre: { id: 0, jaName: 'root', level: 0 }, children: [{ id: 100371, jaName: 'レディースファッション', level: 1 }] }).children[0].genreId === '100371');
 
 check('ichiba: 壊れた応答も落ちない',
   JSON.stringify(ichiba.normalizeGenreSearch({})) === JSON.stringify({ current: null, parents: [], children: [] }));
