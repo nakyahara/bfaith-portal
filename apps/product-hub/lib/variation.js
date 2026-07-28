@@ -91,6 +91,37 @@ export function resolveNeDefaults(db, inputCode) {
 }
 
 /**
+ * 利益シミュレーション用の NE 実費 (原価・送料・税率)。mirror_products から引く。
+ * ⚠️ 送料は「配送方法の値から自動算出」(中原さん 2026-07-28) — NE 側で配送方法→送料の
+ * 導出が済んだ値が mirror_products.送料 に入っている (例: ネコポス→237円)。
+ * どの配送方法由来かを表示できるよう shippingMethod も返す。
+ * 正規化重複で値が割れたら採用しない (getNeDefaults と同じ方針)。無ければ null
+ */
+export function getNeCost(db, neCode) {
+  const code = String(neCode == null ? '' : neCode).trim();
+  if (!code || !mirrorReady(db)) return null;
+  let rows;
+  try {
+    rows = db.prepare('SELECT 原価, 送料, 配送方法, 消費税率 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').all(norm(code));
+  } catch (_) {
+    return null;
+  }
+  if (rows.length === 0) return null;
+  const agreed = (pick) => {
+    const vals = new Set(rows.map(pick));
+    if (vals.size !== 1) return null;
+    return [...vals][0] ?? null;
+  };
+  const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  return {
+    costExTax: num(agreed((r) => r.原価)),
+    shippingCost: num(agreed((r) => r.送料)),
+    shippingMethod: agreed((r) => (r.配送方法 && String(r.配送方法).trim() !== '' ? String(r.配送方法).trim() : null)),
+    taxPercent: taxToPercent(agreed((r) => r.消費税率)),
+  };
+}
+
+/**
  * その商品コードが「どこかのドラフトでバリエーションから外された」ものか。
  * 外した SKU を別ページにしたい場合はそのコードで新規登録する運用なので、
  * ここに載っているコードは自動まとめの対象から除く (2026-07-25 中原さん方針)。
