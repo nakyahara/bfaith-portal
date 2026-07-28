@@ -232,7 +232,12 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
       if (parsed === 0) throw zeroParsedError(skippedRows);
 
       db.transaction(() => {
-        db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+        // ⚠ watched では週の先頭 DELETE をしない (Codex R7 high):
+        // この週の既存行は「router の初回照会スキャンが同じレポートファイルから拾った行」
+        // だけであり (台帳存在チェックで再取込は無い)、DELETE すると解析中に完了した
+        // 並走スキャンの成果を消して last_scanned_week だけ残る = 次週まで欠落する。
+        // 同一ファイル由来なので INSERT OR REPLACE で同一PKに収束し、消す理由がない。
+        // (手動で台帳行を消して強制再取込した場合のみ、旧レポート版の残骸が残り得る)
         for (const r of keptRows) {
           insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
             r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
