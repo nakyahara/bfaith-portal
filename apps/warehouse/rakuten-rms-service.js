@@ -723,6 +723,43 @@ router.post('/cabinet/upload', requireWrite, rateLimitMiddleware('rakuten'), asy
   }
 });
 
+// ==========================================
+// ジャンル属性辞書 (product-hub P3: 必須属性の自動フォーム / カタログID自動付与の判定)
+//   GET /es/2.0/navigation/genres/{genreId}/attributes (2026-07-28 プローブで実証)
+//   応答: genre.nameJa / nameJaPath / attributes[] (rmsMandatoryFlg / rmsInputMethod 等)
+//   ⚠️ SELECTIVE 属性の選択肢一覧はこの API では取れない (単一属性 endpoint でも同じ)
+//   読み取り専用なので write gate は不要。辞書はめったに変わらないので 24h キャッシュ
+// ==========================================
+
+const GENRE_ATTR_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const GENRE_ATTR_NEGATIVE_TTL_MS = 60 * 60 * 1000; // 404 (存在しない/非末端ジャンル) は 1h
+const GENRE_ATTR_CACHE_MAX = 500; // 店で使うジャンル数は高々数十。暴走上限
+const genreAttrCache = new Map(); // genreId -> { fetchedAt, status, data }
+
+router.get('/genres/:genreId/attributes', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const genreId = String(req.params.genreId || '').trim();
+    if (!/^\d{1,12}$/.test(genreId)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_GENRE_ID', message: 'ジャンルIDは数字で指定してください', requestId: req.requestId });
+    }
+    const force = req.query.refresh === '1';
+    const cached = genreAttrCache.get(genreId);
+    const ttl = cached?.status === 200 ? GENRE_ATTR_CACHE_TTL_MS : GENRE_ATTR_NEGATIVE_TTL_MS;
+    if (!force && cached && (Date.now() - cached.fetchedAt) < ttl) {
+      return res.status(cached.status).json(cached.data);
+    }
+    const r = await rakutenRequest({ path: `/es/2.0/navigation/genres/${genreId}/attributes` });
+    // 200/404 だけキャッシュ (5xx や 429 は次回また取りに行く)
+    if (r.status === 200 || r.status === 404) {
+      if (genreAttrCache.size >= GENRE_ATTR_CACHE_MAX) genreAttrCache.clear();
+      genreAttrCache.set(genreId, { fetchedAt: Date.now(), status: r.status, data: r.data });
+    }
+    res.status(r.status).json(r.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 router.get('/status', (req, res) => {
   okResponse(res, {
     hasCredentials: !!(process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY),

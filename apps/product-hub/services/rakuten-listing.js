@@ -195,6 +195,98 @@ export function parseAttributes(json) {
 }
 
 /** 楽天の商品ページは画像20枚まで */
+// ─── ジャンル属性辞書 (Genre API、2026-07-28 実証) ───
+// endpoint: miniPC GET /genres/:id/attributes → RMS /es/2.0/navigation/genres/{id}/attributes
+// ⚠️ SELECTIVE 属性の選択肢一覧は API では取れない (自由入力 + RMS 検証に任せる)
+
+/** RMS の genre attributes 応答をアプリ用に正規化する (pure、テスト可能) */
+export function normalizeGenreAttributes(rmsData) {
+  const g = rmsData?.genre;
+  if (!g || !Number.isFinite(Number(g.genreId))) return null;
+  const attributes = (Array.isArray(g.attributes) ? g.attributes : []).map((a) => {
+    const p = a?.properties || {};
+    return {
+      name: String(a?.nameJa || '').trim(),
+      dataType: a?.dataType || 'STRING',
+      mandatory: p.rmsMandatoryFlg === true,
+      mandatoryType: p.rmsMandatoryType || null, // MANDATORY / OPTIONAL_NAVIGATION / OPTIONAL_ITEM_PAGE
+      multiValueLimit: Number.isFinite(p.rmsMultiValueLimit) ? p.rmsMultiValueLimit : null,
+      inputMethod: p.rmsInputMethod || null,     // DESCRIPTIVE / SELECTIVE
+      maxLength: Number.isFinite(a?.maxLength) ? a.maxLength : null,
+      unit: a?.unit || null,
+    };
+  }).filter((a) => a.name);
+  return {
+    genreId: String(g.genreId),
+    genreName: g.nameJa || null,
+    genrePath: Array.isArray(g.nameJaPath) ? g.nameJaPath.join(' > ') : null,
+    itemRegisterable: g.properties?.itemRegisterFlg !== false, // 末端ジャンルのみ登録可
+    fixedAt: rmsData?.version?.fixedAt || null,
+    attributes,
+  };
+}
+
+const GENRE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * キャッシュ済み辞書。maxAgeMs を指定すると鮮度切れは null (= 辞書なし扱い)。
+ * ⚠️ buildItemPayload は必ず鮮度付きで呼ぶこと (Codex R1 High-1: 古い辞書を根拠に
+ * 正しい属性を IE1002 扱いで弾いたり、廃止されたカタログIDを付与したりする)。
+ */
+export function getCachedGenreAttributes(db, genreId, { maxAgeMs = null } = {}) {
+  const id = String(genreId ?? '').trim();
+  if (!id) return null;
+  const row = db.prepare('SELECT * FROM ph_genre_attributes WHERE genre_id = ?').get(id);
+  if (!row) return null;
+  if (maxAgeMs != null) {
+    const age = Date.now() - Date.parse(row.fetched_at || 0);
+    if (!Number.isFinite(age) || age > maxAgeMs) return null;
+  }
+  let attributes;
+  try { attributes = JSON.parse(row.payload_json); } catch (_) { return null; }
+  if (!Array.isArray(attributes)) return null;
+  return {
+    genreId: row.genre_id, genreName: row.genre_name, genrePath: row.genre_path,
+    fixedAt: row.fixed_at, fetchedAt: row.fetched_at, attributes,
+  };
+}
+
+/**
+ * 辞書を取得してキャッシュする (24h 以内のキャッシュがあればそれを返す。force で強制再取得)。
+ * @returns {{ok:true, genre}|{ok:false, notFound?:true, error?:string}}
+ */
+export async function fetchGenreAttributes(db, genreId, { force = false, fetcher = callWarehouse } = {}) {
+  const id = String(genreId ?? '').trim();
+  if (!/^\d{1,12}$/.test(id)) return { ok: false, error: 'ジャンルIDは数字で指定してください' };
+
+  if (!force) {
+    const cached = getCachedGenreAttributes(db, id, { maxAgeMs: GENRE_CACHE_TTL_MS });
+    if (cached) return { ok: true, genre: cached, cached: true };
+  }
+
+  const r = await fetcher(`/service-api/rakuten-rms/genres/${id}/attributes${force ? '?refresh=1' : ''}`);
+  if (r.status === 404) {
+    // ジャンル廃止・非末端化。古い成功キャッシュを残すと「画面では見つからないのに
+    // 登録時は古い辞書で判定する」矛盾になる (Codex R1 High-2) → 行ごと消す
+    db.prepare('DELETE FROM ph_genre_attributes WHERE genre_id = ?').run(id);
+    return { ok: false, notFound: true };
+  }
+  if (r.status !== 200) {
+    return { ok: false, error: r.data?.message || r.data?.error || `HTTP ${r.status}` };
+  }
+  const norm = normalizeGenreAttributes(r.data);
+  if (!norm) return { ok: false, error: 'ジャンル情報を解釈できませんでした' };
+  db.prepare(`
+    INSERT INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at, fetched_at)
+    VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    ON CONFLICT(genre_id) DO UPDATE SET
+      genre_name = excluded.genre_name, genre_path = excluded.genre_path,
+      payload_json = excluded.payload_json, fixed_at = excluded.fixed_at,
+      fetched_at = excluded.fetched_at
+  `).run(norm.genreId, norm.genreName, norm.genrePath, JSON.stringify(norm.attributes), norm.fixedAt);
+  return { ok: true, genre: { ...norm, fetchedAt: new Date().toISOString() }, cached: false };
+}
+
 export const MAX_RAKUTEN_IMAGES = 20;
 
 /** B-Faith 店舗の配送方法グループ (RYS rakuten-to-notion-draft.js の実測変換表と同一 ID) */
@@ -313,6 +405,46 @@ export function buildItemPayload(db, draftId) {
       reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
     }
   }
+  // ─── ジャンル属性辞書による事前検証 (2026-07-28 Genre API) ───
+  // 辞書キャッシュがある場合だけ検証する (無ければ RMS が最終検証する)。
+  // genre_id をキーに引くので、ジャンルを変えた直後は辞書未取得 = 検証スキップになる
+  // 鮮度 24h 以内の辞書だけ検証に使う。古い/無い場合は検証スキップ (RMS が最終検証)。
+  // 登録経路 (registerHidden/preview) は事前に fetchGenreAttributes で鮮度を回復させている
+  const genreDict = (rk.genre_id && /^\d+$/.test(String(rk.genre_id).trim()))
+    ? getCachedGenreAttributes(db, String(rk.genre_id).trim(), { maxAgeMs: GENRE_CACHE_TTL_MS })
+    : null;
+  let dictHasCatalogId = false;
+  if (genreDict && Array.isArray(attributes)) {
+    const dictByName = new Map(genreDict.attributes.map((a) => [a.name, a]));
+    dictHasCatalogId = dictByName.has('カタログID');
+    // ① 辞書に無い属性名は IE1002 で登録が失敗する → 送る前に止める
+    for (const a of attributes) {
+      if (!dictByName.has(a.name)) {
+        reasons.push(`属性「${a.name}」はジャンル「${genreDict.genreName || rk.genre_id}」の属性辞書にありません (登録エラー IE1002 になります)`);
+      }
+    }
+    // ② 必須属性の欠落 (カタログIDは JAN欄からの自動付与があるので別扱い)
+    const presentNames = new Set(attributes.map((a) => a.name));
+    for (const da of genreDict.attributes) {
+      if (!da.mandatory || presentNames.has(da.name)) continue;
+      if (da.name === 'カタログID' && jan) continue; // 下で自動付与する
+      reasons.push(`必須属性「${da.name}」が未入力です (ジャンル ${genreDict.genreName || rk.genre_id} の必須)`);
+    }
+    // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
+    for (const a of attributes) {
+      const da = dictByName.get(a.name);
+      if (!da) continue;
+      if (da.multiValueLimit && a.values.length > da.multiValueLimit) {
+        reasons.push(`属性「${a.name}」の値は最大 ${da.multiValueLimit} 個です`);
+      }
+      if (da.maxLength) {
+        for (const v of a.values) {
+          if (String(v).length > da.maxLength) reasons.push(`属性「${a.name}」の値が長すぎます (上限 ${da.maxLength} 文字)`);
+        }
+      }
+    }
+  }
+
   if (rk.shipping_method_group != null && String(rk.shipping_method_group).trim() !== ''
       && !SHIPPING_METHOD_GROUPS[String(rk.shipping_method_group).trim()]) {
     reasons.push('配送方法の指定が不正です');
@@ -329,14 +461,13 @@ export function buildItemPayload(db, draftId) {
   if (specs.length > 0) descParts.push(specs.map((s) => `${s.spec_key}: ${s.spec_value || ''}`.trim()).join('\n'));
   if (ai.desc_notes) descParts.push(ai.desc_notes);
 
-  // JAN → カタログID属性の**自動付与はしない** (2026-07-28 本番検証で確定)。
-  // zz- テスト商品での実測: 属性「カタログID」「JANコード」「GTIN」は IE1002
-  // (ジャンル属性辞書に無い / genre 111145)、variant.catalogId / catalogIdExemptionReason は
-  // IE0002 (フィールド自体が存在しない)。= 属性辞書は**ジャンルごと**で、無いジャンルに
-  // 自動付与すると登録そのものが失敗する。
-  // → カタログIDを属性で持つジャンルでは人が属性欄に手入力する (JAN欄との一致検証は上で実施済み)。
-  //   Genre API (次の玉) で属性辞書を引けるようになったら「辞書にあるときだけ自動付与」に戻す。
+  // JAN → カタログID属性の自動付与は**ジャンル属性辞書にあるときだけ** (2026-07-28 確定)。
+  // 実測: 「カタログID」が辞書に無いジャンル (111145等) へ付与すると IE1002 で登録自体が失敗する。
+  // 辞書未取得のジャンルでは付与しない (安全側。必要なら「ジャンル情報を取得」してから登録する)
   const attrs = attributes.slice();
+  if (dictHasCatalogId && jan && !manualCatalog) {
+    attrs.push({ name: 'カタログID', values: [jan] });
+  }
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
   const shippingGroup = String(rk.shipping_method_group ?? '').trim();
@@ -390,6 +521,12 @@ export function extractRmsErrors(data) {
  */
 export async function registerHidden(draftId, { actor = null } = {}) {
   const db = getDB();
+  // 登録直前に辞書の鮮度を回復する (24h キャッシュ内なら通信なし)。
+  // 失敗しても登録は止めない — 辞書が無ければ検証スキップで RMS が最終検証する
+  const rkRow = db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
+    try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
+  }
   const built = buildItemPayload(db, draftId);
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
