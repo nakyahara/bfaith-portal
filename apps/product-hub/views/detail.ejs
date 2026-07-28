@@ -483,9 +483,11 @@
       <div style="flex:1">
         <label class="req">ジャンルID (楽天)</label>
         <div style="display:flex; gap:6px;">
-          <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="例: 205761" style="flex:1;">
+          <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="AIが自動で提案します" style="flex:1;">
+          <button type="button" class="btn btn-sm" id="rk-genre-tree" style="white-space:nowrap;">🌲 ツリーから選ぶ</button>
           <button type="button" class="btn btn-sm" id="rk-genre-fetch" style="white-space:nowrap;">ジャンル情報を取得</button>
         </div>
+        <div id="rk-genre-suggest" style="font-size:12px; margin-top:4px;"></div>
         <div id="rk-genre-info" style="font-size:12px; margin-top:4px;">
           <% if (genreDict) { %>
             <span style="color:#166534;">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
@@ -552,14 +554,9 @@
         </p>
       <% } else { %>
         <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
-        <div id="rk-cats" style="max-height:200px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;">
-          <% for (const c of shopCategories) { %>
-            <label class="rk-cat-row" style="display:block; font-size:13px; padding:2px 0; font-weight:400; cursor:pointer;">
-              <input type="checkbox" class="rk-cat-check" value="<%= c.id %>" <%= c.selected ? 'checked' : '' %>>
-              <%= c.path %><% if (!c.is_active) { %> <span class="muted">(現在の一覧に無いカテゴリ)</span><% } %>
-            </label>
-          <% } %>
-        </div>
+        <!-- RMS と同じくツリーで選ぶ (2026-07-28)。checkbox の class/value は保存処理と共通 -->
+        <div id="rk-cats" style="max-height:240px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;"></div>
+        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
       <% } %>
     </div>
 
@@ -591,6 +588,28 @@
       <span class="muted" id="rk-result"></span>
     </div>
     <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
+  </div>
+
+  <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->
+  <div id="genre-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
+    <div style="background:#fff; max-width:640px; margin:6vh auto; border-radius:12px; padding:18px 20px; max-height:84vh; display:flex; flex-direction:column;">
+      <div style="display:flex; align-items:center;">
+        <h2 style="margin:0; font-size:16px;">ジャンルID選択</h2>
+        <span style="flex:1"></span>
+        <button type="button" class="btn btn-sm" id="genre-modal-close">✕</button>
+      </div>
+      <div id="genre-tree" style="flex:1; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; margin:12px 0; padding:6px 4px; font-size:13px;">
+        <p class="muted" style="margin:8px;">読み込み中…</p>
+      </div>
+      <div style="background:#f8fafc; border-radius:8px; padding:8px 12px; font-size:12px;">
+        選択ジャンルID: <code id="genre-modal-id">—</code><br>
+        選択ジャンルパス: <span id="genre-modal-path" class="muted">—</span>
+      </div>
+      <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:12px;">
+        <button type="button" class="btn" id="genre-modal-cancel">キャンセル</button>
+        <button type="button" class="btn btn-primary" id="genre-modal-apply">入力画面に反映</button>
+      </div>
+    </div>
   </div>
 
   <!-- 履歴 -->
@@ -678,6 +697,267 @@
 
   // ─── 楽天出品 (P3) ───
   const rkResult = document.getElementById('rk-result');
+
+  // ─── ジャンルツリー選択モーダル (IchibaGenre/Search。RMS の「ジャンルID選択」相当) ───
+  const genreModal = document.getElementById('genre-modal');
+  let genreSelected = null; // { id, path, hasChildren }
+
+  function setGenreSelection(id, path, hasChildren) {
+    genreSelected = { id, path, hasChildren };
+    document.getElementById('genre-modal-id').textContent = id;
+    document.getElementById('genre-modal-path').textContent = path;
+  }
+
+  async function fetchGenreChildrenApi(genreId) {
+    const res = await fetch('/apps/product-hub/api/rakuten/genre-children?genre_id=' + encodeURIComponent(genreId));
+    return res.json();
+  }
+
+  function makeGenreNode(child, parentPath) {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:2px 0;';
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex; align-items:center; gap:6px; cursor:pointer; padding:3px 6px; border-radius:6px;';
+    const arrow = document.createElement('span');
+    arrow.textContent = '>';
+    arrow.style.cssText = 'width:14px; color:#94a3b8; transition:transform .15s; display:inline-block;';
+    const label = document.createElement('span');
+    label.textContent = child.name;
+    head.appendChild(arrow); head.appendChild(label);
+    const box = document.createElement('div'); // 子の入れ物 (遅延読み込み)
+    box.style.cssText = 'margin-left:18px; display:none;';
+    row.appendChild(head); row.appendChild(box);
+    const myPath = parentPath ? parentPath + ' > ' + child.name : child.name;
+    let loaded = false;
+    head.addEventListener('click', async () => {
+      // 行クリック = 選択 + 展開/折り畳み (RMS モーダルと同じ)
+      document.querySelectorAll('#genre-tree .genre-row-active').forEach((el) => {
+        el.classList.remove('genre-row-active'); el.style.background = '';
+      });
+      head.classList.add('genre-row-active');
+      head.style.background = '#eff6ff';
+      if (!loaded) {
+        arrow.textContent = '…';
+        try {
+          const j = await fetchGenreChildrenApi(child.genreId);
+          if (!j.ok) {
+            // 取得失敗を「末端」と誤判定しない (429/障害でも反映できてしまう) — 選択も確定しない
+            arrow.textContent = '>';
+            head.style.background = '';
+            head.classList.remove('genre-row-active');
+            alert('子ジャンルの取得に失敗しました: ' + (j.error || '') + '\nもう一度クリックして再試行してください');
+            return;
+          }
+          loaded = true;
+          const kids = j.children || [];
+          if (kids.length === 0) {
+            arrow.textContent = '・';
+            row.dataset.leaf = '1';
+          } else {
+            arrow.textContent = '>';
+            for (const k of kids) box.appendChild(makeGenreNode(k, myPath));
+          }
+        } catch (e) {
+          arrow.textContent = '>';
+          head.style.background = '';
+          head.classList.remove('genre-row-active');
+          alert('通信エラー: ' + e.message);
+          return;
+        }
+      }
+      const isLeaf = row.dataset.leaf === '1';
+      if (!isLeaf) {
+        const open = box.style.display !== 'none';
+        box.style.display = open ? 'none' : 'block';
+        arrow.style.transform = open ? '' : 'rotate(90deg)';
+      }
+      setGenreSelection(child.genreId, myPath, !isLeaf);
+    });
+    return row;
+  }
+
+  async function openGenreModal() {
+    genreModal.style.display = 'block';
+    setGenreSelection('—', '—', true);
+    genreSelected = null;
+    const tree = document.getElementById('genre-tree');
+    tree.textContent = '読み込み中…';
+    try {
+      const j = await fetchGenreChildrenApi('0');
+      if (!j.ok) { tree.textContent = '❌ ' + (j.error || '取得に失敗しました'); return; }
+      tree.replaceChildren();
+      for (const c of j.children || []) tree.appendChild(makeGenreNode(c, ''));
+    } catch (e) { tree.textContent = '通信エラー: ' + e.message; }
+  }
+
+  function closeGenreModal() { genreModal.style.display = 'none'; }
+  document.getElementById('rk-genre-tree').addEventListener('click', openGenreModal);
+  document.getElementById('genre-modal-close').addEventListener('click', closeGenreModal);
+  document.getElementById('genre-modal-cancel').addEventListener('click', closeGenreModal);
+  genreModal.addEventListener('click', (ev) => { if (ev.target === genreModal) closeGenreModal(); });
+
+  document.getElementById('genre-modal-apply').addEventListener('click', async () => {
+    if (!genreSelected || genreSelected.id === '—') { alert('ジャンルを選択してください'); return; }
+    if (genreSelected.hasChildren) {
+      alert('末端のジャンル (これ以上開けない階層) を選んでください。\n商品を登録できるのは末端ジャンルだけです。');
+      return;
+    }
+    const btn = document.getElementById('genre-modal-apply');
+    btn.disabled = true;
+    try {
+      if (await applyGenre(genreSelected.id, 'tree')) closeGenreModal();
+    } finally { btn.disabled = false; }
+  });
+
+  // ジャンルを反映する共通処理。順序が重要 (Codex R1 High-2/Medium-3):
+  //   ① 先に RMS 属性辞書で検証 (末端でない/存在しないジャンルは 404 → 保存しない)
+  //   ② genre だけを保存 (genre_only — 編集途中の他フォーム値を巻き込まない)
+  //   ③ 成功してから入力欄と辞書 UI を更新
+  let applyingGenre = false;
+  async function applyGenre(genreId, source) {
+    if (applyingGenre) return false;
+    applyingGenre = true;
+    try {
+      const vres = await fetch('/apps/product-hub/api/rakuten/genre-attributes?genre_id=' + encodeURIComponent(genreId));
+      const vj = await vres.json();
+      if (!vj.ok) {
+        const msg = 'ジャンル ' + genreId + ' は登録に使えません: ' + (vj.error || '');
+        if (source === 'ai') document.getElementById('rk-genre-suggest').textContent = '❌ ' + msg;
+        else alert(msg);
+        return false;
+      }
+      const sres = await post(BASE + '/rakuten', { genre_only: true, genre_id: genreId });
+      if (!sres.ok) {
+        if (source === 'ai') document.getElementById('rk-genre-suggest').textContent = '❌ 保存に失敗: ' + (sres.error || '');
+        else alert(sres.error || 'ジャンルの保存に失敗しました');
+        return false;
+      }
+      document.getElementById('rk-genre').value = genreId;
+      document.getElementById('rk-genre-fetch').click(); // 辞書はキャッシュ済みなので即応答
+      if (source === 'ai') rkResult.textContent = 'AIがジャンルを設定しました (違う場合は「ツリーから選ぶ」で修正)';
+      return true;
+    } finally { applyingGenre = false; }
+  }
+
+  // ─── AI がジャンルの初期値を入れる (中原さん 2026-07-28) ───
+  // 商品名で楽天市場を検索し、上位ヒット商品のジャンル多数決。人は違うと思ったらツリーで直す
+  async function suggestGenre(autoApply) {
+    const box = document.getElementById('rk-genre-suggest');
+    box.textContent = 'AIがジャンルを探しています… (楽天市場の類似商品から)';
+    try {
+      const res = await fetch(BASE + '/rakuten/genre-suggest');
+      const j = await res.json();
+      if (!j.ok) { box.textContent = '提案できませんでした: ' + (j.error || ''); return; }
+      const cands = (j.candidates || []).filter((c) => c.path);
+      if (cands.length === 0) { box.textContent = '類似商品が見つかりませんでした。「ツリーから選ぶ」で指定してください'; return; }
+      // 自動適用は「明確な多数」のときだけ (Codex R1 High-2):
+      //   最多候補が 5 件以上 かつ 2位の2倍以上。曖昧なら候補ボタンだけ出して人に選ばせる
+      const clearWinner = cands[0].count >= 5 && (cands.length < 2 || cands[0].count >= cands[1].count * 2);
+      if (autoApply && clearWinner && !document.getElementById('rk-genre').value.trim()) {
+        await applyGenre(cands[0].genreId, 'ai');
+      }
+      box.replaceChildren();
+      const lbl = document.createElement('span');
+      lbl.className = 'muted';
+      lbl.textContent = 'AI提案: ';
+      box.appendChild(lbl);
+      cands.forEach((c) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'btn btn-sm';
+        b.style.cssText = 'margin:2px 4px 2px 0; font-size:11px;';
+        b.textContent = c.path + ' (' + c.count + '件)';
+        b.addEventListener('click', () => applyGenre(c.genreId, 'ai'));
+        box.appendChild(b);
+      });
+    } catch (e) { box.textContent = '通信エラー: ' + e.message; }
+  }
+  // 初期値: ジャンルが空なら AI が自動で入れる
+  if (!document.getElementById('rk-genre').value.trim()) suggestGenre(true);
+
+  // ─── 店舗内カテゴリ: パスからツリーを組んで表示 (RMS のカテゴリ選択相当) ───
+  (function buildShopCategoryTree() {
+    const dataEl = document.getElementById('rk-cats-data');
+    const holder = document.getElementById('rk-cats');
+    if (!dataEl || !holder) return;
+    let rows = [];
+    try { rows = JSON.parse(dataEl.textContent); } catch (e) { rows = []; }
+    // path を ' > ' で割ってツリー構造にする。実在する行 (id あり) だけ checkbox
+    const root = { children: new Map(), row: null, name: '' };
+    for (const r of rows) {
+      const segs = String(r.path).split(' > ');
+      let node = root;
+      for (const seg of segs) {
+        if (!node.children.has(seg)) node.children.set(seg, { children: new Map(), row: null, name: seg });
+        node = node.children.get(seg);
+      }
+      node.row = r;
+    }
+    function renderNode(node, fullPath) {
+      const wrap = document.createElement('div');
+      wrap.className = 'rk-cat-node';
+      wrap.dataset.path = fullPath.toLowerCase();
+      const head = document.createElement('div');
+      head.className = 'rk-cat-row';
+      head.style.cssText = 'display:flex; align-items:center; gap:4px; padding:2px 0;';
+      const hasKids = node.children.size > 0;
+      const arrow = document.createElement('span');
+      arrow.textContent = hasKids ? '>' : '・';
+      arrow.style.cssText = 'width:14px; color:#94a3b8; cursor:' + (hasKids ? 'pointer' : 'default') + '; display:inline-block; transition:transform .15s;';
+      head.appendChild(arrow);
+      let box = null;
+      const toggle = () => {
+        if (!box) return;
+        const open = box.style.display !== 'none';
+        box.style.display = open ? 'none' : 'block';
+        arrow.style.transform = open ? '' : 'rotate(90deg)';
+      };
+      if (node.row) {
+        const label = document.createElement('label');
+        label.style.cssText = 'font-size:13px; font-weight:400; cursor:pointer; display:inline-flex; align-items:center; gap:4px; margin:0;';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'rk-cat-check';
+        cb.value = String(node.row.id);
+        cb.checked = !!node.row.selected;
+        cb.style.width = 'auto';
+        label.appendChild(cb);
+        label.appendChild(document.createTextNode(node.name + (node.row.inactive ? ' (現在の一覧に無いカテゴリ)' : '')));
+        head.appendChild(label);
+      } else {
+        const span = document.createElement('span');
+        span.textContent = node.name;
+        span.style.cssText = 'font-size:13px; cursor:' + (hasKids ? 'pointer' : 'default') + ';';
+        span.addEventListener('click', toggle);
+        head.appendChild(span);
+      }
+      wrap.appendChild(head);
+      if (hasKids) {
+        box = document.createElement('div');
+        box.style.cssText = 'margin-left:16px; display:none;';
+        for (const child of node.children.values()) {
+          box.appendChild(renderNode(child, fullPath ? fullPath + ' > ' + child.name : child.name));
+        }
+        wrap.appendChild(box);
+        arrow.addEventListener('click', toggle);
+      }
+      return wrap;
+    }
+    holder.replaceChildren();
+    for (const child of root.children.values()) {
+      holder.appendChild(renderNode(child, child.name));
+    }
+    // 選択済みノードが見えるように、そこまでの枝を開く
+    holder.querySelectorAll('.rk-cat-check').forEach((cb) => {
+      if (!cb.checked) return;
+      let el = cb.closest('.rk-cat-node');
+      while (el && el.parentElement && el.parentElement !== holder) {
+        const p = el.parentElement;
+        if (p.style && p.style.display === 'none') p.style.display = 'block';
+        el = p;
+      }
+    });
+  })();
 
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
@@ -811,13 +1091,22 @@
   }
 
   // 店舗内カテゴリの絞り込み (選択済みは常に表示)
+  // ツリー版の絞り込み: パスが一致するノード (とその子孫) を表示し、枝を開く。
+  // 選択済み (checked) は常に残す。空にしたら全て畳んだ初期状態に近い表示へ戻す
   const rkCatFilter = document.getElementById('rk-cat-filter');
   if (rkCatFilter) {
     rkCatFilter.addEventListener('input', () => {
       const q = rkCatFilter.value.trim().toLowerCase();
-      document.querySelectorAll('.rk-cat-row').forEach((row) => {
-        const hit = !q || row.textContent.toLowerCase().includes(q) || row.querySelector('.rk-cat-check').checked;
-        row.style.display = hit ? '' : 'none';
+      document.querySelectorAll('#rk-cats .rk-cat-node').forEach((node) => {
+        const path = node.dataset.path || '';
+        const hasChecked = !!node.querySelector('.rk-cat-check:checked');
+        const hit = !q || path.includes(q) || hasChecked;
+        // 子孫に一致があれば自分も表示 (枝として必要)
+        const descendantHit = q && [...node.querySelectorAll('.rk-cat-node')].some((d) => (d.dataset.path || '').includes(q));
+        node.style.display = (hit || descendantHit) ? '' : 'none';
+        // 絞り込み中は一致枝を開く
+        const box = [...node.children].find((el) => el.tagName === 'DIV' && el !== node.firstElementChild);
+        if (box && q && (hit || descendantHit)) box.style.display = 'block';
       });
     });
   }

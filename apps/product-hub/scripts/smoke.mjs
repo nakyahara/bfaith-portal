@@ -1030,6 +1030,32 @@ check('genre: 24h以内はキャッシュから返す (通信しない)', fetchC
 db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(gdId);
 db.prepare(`DELETE FROM ph_genre_attributes WHERE genre_id = '900001'`).run();
 
+// ─── ジャンルツリー (IchibaGenre/Search) の正規化 / パス組み立て ───
+const ichiba = await import('../lib/ichiba-genre.js');
+const ICHIBA_FIXTURE = {
+  current: { genreId: 111145, genreName: '付箋紙', genreLevel: 5 },
+  parents: [
+    { parent: { genreId: 215783, genreName: '日用品雑貨・文房具・手芸', genreLevel: 1 } },
+    { parent: { genreId: 100901, genreName: '文房具・事務用品', genreLevel: 2 } },
+  ],
+  children: [],
+};
+const ig = ichiba.normalizeGenreSearch(ICHIBA_FIXTURE);
+check('ichiba: 正規化 (current/parents/children)',
+  ig.current.genreId === '111145' && ig.parents.length === 2 && ig.children.length === 0,
+  JSON.stringify(ig));
+check('ichiba: フルパス組み立て',
+  ichiba.genrePathOf(ig) === '日用品雑貨・文房具・手芸 > 文房具・事務用品 > 付箋紙');
+const igRoot = ichiba.normalizeGenreSearch({
+  current: { genreId: 0, genreName: 'ルート', genreLevel: 0 },
+  children: [{ child: { genreId: 100371, genreName: 'レディースファッション', genreLevel: 1 } }],
+});
+check('ichiba: root は path に含めない・子は child ラップを剥がす',
+  ichiba.genrePathOf(igRoot) === '' && igRoot.children[0].genreId === '100371'
+  && igRoot.children[0].name === 'レディースファッション');
+check('ichiba: 壊れた応答も落ちない',
+  JSON.stringify(ichiba.normalizeGenreSearch({})) === JSON.stringify({ current: null, parents: [], children: [] }));
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
