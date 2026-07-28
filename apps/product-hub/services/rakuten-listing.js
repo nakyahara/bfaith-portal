@@ -329,12 +329,14 @@ export function buildItemPayload(db, draftId) {
   if (specs.length > 0) descParts.push(specs.map((s) => `${s.spec_key}: ${s.spec_value || ''}`.trim()).join('\n'));
   if (ai.desc_notes) descParts.push(ai.desc_notes);
 
-  // JAN → カタログID。SKU 移行後の RMS はカタログIDを商品属性で受ける。
-  // ⚠️ 属性名「カタログID」は zz- テスト商品で本番検証してから本運用 (2026-07-27 仕様 §検証)
+  // JAN → カタログID属性の**自動付与はしない** (2026-07-28 本番検証で確定)。
+  // zz- テスト商品での実測: 属性「カタログID」「JANコード」「GTIN」は IE1002
+  // (ジャンル属性辞書に無い / genre 111145)、variant.catalogId / catalogIdExemptionReason は
+  // IE0002 (フィールド自体が存在しない)。= 属性辞書は**ジャンルごと**で、無いジャンルに
+  // 自動付与すると登録そのものが失敗する。
+  // → カタログIDを属性で持つジャンルでは人が属性欄に手入力する (JAN欄との一致検証は上で実施済み)。
+  //   Genre API (次の玉) で属性辞書を引けるようになったら「辞書にあるときだけ自動付与」に戻す。
   const attrs = attributes.slice();
-  if (jan && !manualCatalog) {
-    attrs.push({ name: 'カタログID', values: [jan] });
-  }
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
   const shippingGroup = String(rk.shipping_method_group ?? '').trim();
