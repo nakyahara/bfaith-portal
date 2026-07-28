@@ -920,6 +920,116 @@ check('cat import: force 指定なら激減置き換えを実行',
 
 db.prepare('DELETE FROM ph_shop_categories').run();
 
+// ─── Genre API: 辞書の正規化 / キャッシュ / 事前検証 / カタログID自動付与 ───
+// RMS 実応答の形 (2026-07-28 プローブ実測) を fixture にする
+const RMS_GENRE_FIXTURE = {
+  version: { id: 132, fixedAt: '2026-07-28T07:52:18+09:00' },
+  genre: {
+    genreId: 900001, nameJa: 'テストジャンル', nameJaPath: ['大分類', '中分類', 'テストジャンル'],
+    level: 3, lowest: true, properties: { itemRegisterFlg: true },
+    attributes: [
+      { id: 3, nameJa: 'ブランド名', dataType: 'STRING', maxLength: 100, unit: null,
+        properties: { rmsMandatoryFlg: true, rmsMandatoryType: 'MANDATORY', rmsMultiValueLimit: 3, rmsInputMethod: 'DESCRIPTIVE' } },
+      { id: 8, nameJa: '代表カラー', dataType: 'STRING', maxLength: 50, unit: null,
+        properties: { rmsMandatoryFlg: true, rmsMandatoryType: 'MANDATORY', rmsMultiValueLimit: 1, rmsInputMethod: 'SELECTIVE' } },
+      { id: 99, nameJa: 'カタログID', dataType: 'STRING', maxLength: 14, unit: null,
+        properties: { rmsMandatoryFlg: true, rmsMandatoryType: 'MANDATORY', rmsMultiValueLimit: 1, rmsInputMethod: 'DESCRIPTIVE' } },
+      { id: 50, nameJa: '総枚数', dataType: 'NUMBER', maxLength: null, unit: '枚',
+        properties: { rmsMandatoryFlg: false, rmsMandatoryType: 'OPTIONAL_NAVIGATION', rmsMultiValueLimit: 1, rmsInputMethod: 'DESCRIPTIVE' } },
+    ],
+  },
+};
+
+const gnorm = listing.normalizeGenreAttributes(RMS_GENRE_FIXTURE);
+check('genre: 正規化 (名前/必須/選択式/上限)',
+  gnorm.genreId === '900001' && gnorm.genrePath === '大分類 > 中分類 > テストジャンル'
+  && gnorm.attributes.length === 4
+  && gnorm.attributes[0].mandatory === true && gnorm.attributes[0].multiValueLimit === 3
+  && gnorm.attributes[1].inputMethod === 'SELECTIVE'
+  && gnorm.attributes[3].mandatory === false && gnorm.attributes[3].unit === '枚',
+  JSON.stringify(gnorm).slice(0, 300));
+check('genre: 壊れた応答は null', listing.normalizeGenreAttributes({}) === null && listing.normalizeGenreAttributes(null) === null);
+
+// キャッシュ保存 → 取得
+db.prepare(`INSERT OR REPLACE INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at)
+  VALUES ('900001', ?, ?, ?, ?)`).run(gnorm.genreName, gnorm.genrePath, JSON.stringify(gnorm.attributes), gnorm.fixedAt);
+const gc = listing.getCachedGenreAttributes(db, '900001');
+check('genre: キャッシュ取得', gc && gc.genreName === 'テストジャンル' && gc.attributes.length === 4);
+check('genre: 未キャッシュは null', listing.getCachedGenreAttributes(db, '999999') === null);
+
+// ─── 辞書ありでの buildItemPayload 事前検証 ───
+const gdId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, price, jan_code) VALUES ('gd-smoke-1', '辞書検証商品', 2980, '4999999999999')`).run().lastInsertRowid);
+db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json)
+  VALUES (?, '900001', '[{"name":"ブランド名","values":["テストブランド"]},{"name":"代表カラー","values":["ブラック"]}]')`).run(gdId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gd1', '/x/gd1.jpg')`).run(gdId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gd1')`).run(gdId);
+
+let gb = listing.buildItemPayload(db, gdId);
+check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から自動付与 (辞書にあるジャンル)',
+  gb.ok === true
+  && gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID' && a.values[0] === '4999999999999'),
+  JSON.stringify(gb.ok ? gb.payload.variants['gd-smoke-1'].attributes : gb.reasons));
+
+// 辞書に無い属性名は登録前に止める (IE1002 の事前検知)
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"存在しない属性","values":["y"]}]' WHERE draft_id = ?`).run(gdId);
+gb = listing.buildItemPayload(db, gdId);
+check('genre: 辞書に無い属性名を事前に止める (IE1002対策)',
+  gb.ok === false && gb.reasons.some((r) => r.includes('存在しない属性') && r.includes('IE1002')), JSON.stringify(gb.reasons));
+
+// 必須属性の欠落を事前に止める
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["x"]}]' WHERE draft_id = ?`).run(gdId);
+gb = listing.buildItemPayload(db, gdId);
+check('genre: 必須属性の欠落を事前に止める',
+  gb.ok === false && gb.reasons.some((r) => r.includes('必須属性「代表カラー」')), JSON.stringify(gb.reasons));
+
+// multiValueLimit / maxLength
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"ブランド名","values":["a","b","c","d"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
+gb = listing.buildItemPayload(db, gdId);
+check('genre: 値の個数上限を事前に止める', gb.ok === false && gb.reasons.some((r) => r.includes('最大 3 個')), JSON.stringify(gb.reasons));
+
+// 辞書が無いジャンルでは検証もカタログID付与もしない (従来どおり RMS に任せる)
+db.prepare(`UPDATE draft_rakuten SET genre_id = '999999', attributes_json = '[{"name":"何でも属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
+gb = listing.buildItemPayload(db, gdId);
+check('genre: 辞書未取得ジャンルは検証スキップ + カタログID付与なし',
+  gb.ok === true
+  && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
+  JSON.stringify(gb.ok ? gb.payload.variants['gd-smoke-1'].attributes : gb.reasons));
+
+// JAN欄が空 + 辞書のカタログID必須 → 必須欠落として止まる
+db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]' WHERE draft_id = ?`).run(gdId);
+db.prepare(`UPDATE product_drafts SET jan_code = NULL WHERE id = ?`).run(gdId);
+gb = listing.buildItemPayload(db, gdId);
+check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
+  gb.ok === false && gb.reasons.some((r) => r.includes('カタログID')), JSON.stringify(gb.reasons));
+
+// 鮮度切れ辞書は検証に使わない (Codex R1 High-1: 古い辞書で正しい属性を弾かない)
+db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
+db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"存在しない属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
+db.prepare(`UPDATE ph_genre_attributes SET fetched_at = '2026-01-01T00:00:00.000Z' WHERE genre_id = '900001'`).run();
+gb = listing.buildItemPayload(db, gdId);
+check('genre: 鮮度切れ辞書は検証スキップ + カタログID付与なし (RMSに任せる)',
+  gb.ok === true
+  && !gb.payload.variants['gd-smoke-1'].attributes.some((a) => a.name === 'カタログID'),
+  JSON.stringify(gb.ok ? gb.payload.variants['gd-smoke-1'].attributes : gb.reasons));
+check('genre: getCachedGenreAttributes は maxAgeMs で鮮度切れを null',
+  listing.getCachedGenreAttributes(db, '900001') !== null
+  && listing.getCachedGenreAttributes(db, '900001', { maxAgeMs: 24 * 60 * 60 * 1000 }) === null);
+
+// 404 (ジャンル廃止) で旧キャッシュ行が消える (Codex R1 High-2)
+const del404 = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: async () => ({ status: 404, data: null }) });
+check('genre: 404 で notFound + 旧キャッシュ行を削除',
+  del404.ok === false && del404.notFound === true
+  && listing.getCachedGenreAttributes(db, '900001') === null);
+
+// fetcher 注入で 200 → 保存されキャッシュから返る
+const fetch200 = await listing.fetchGenreAttributes(db, '900001', { force: true, fetcher: async () => ({ status: 200, data: RMS_GENRE_FIXTURE }) });
+check('genre: fetch 200 → 正規化して保存', fetch200.ok === true && fetch200.genre.genreName === 'テストジャンル');
+const fetchCached = await listing.fetchGenreAttributes(db, '900001', { fetcher: async () => { throw new Error('should not fetch'); } });
+check('genre: 24h以内はキャッシュから返す (通信しない)', fetchCached.ok === true && fetchCached.cached === true);
+
+db.prepare(`DELETE FROM product_drafts WHERE id = ?`).run(gdId);
+db.prepare(`DELETE FROM ph_genre_attributes WHERE genre_id = '900001'`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -983,6 +1093,7 @@ const renders = [
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: null,
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
+    genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     // 店舗内カテゴリの選択リスト分岐 (有効/選択済み/一覧から外れた選択済み)
     shopCategories: [
@@ -1003,6 +1114,7 @@ const renders = [
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr', shipping_method_group: null, postage_included: null, normal_delivery_date_id: null, white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://x', published_at: null },
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
+    genreDict: null,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
@@ -1020,6 +1132,7 @@ const renders = [
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: null, shipping_method_group: '7', postage_included: 0, normal_delivery_date_id: null, white_bg_drive_file_id: null, white_bg_drive_url: null, published_at: '2026-07-27T01:00:00Z' },
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
+    genreDict: null,
     shippingGroups: listing.SHIPPING_METHOD_GROUPS,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
@@ -1034,6 +1147,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (notion_import banner + delete)', 'detail.ejs', {
@@ -1049,6 +1163,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
   // 子SKU: まとめボタンが出る形 / まとめられない理由が出る形 の両方
@@ -1061,6 +1176,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (excluded SKU section)', 'detail.ejs', {
@@ -1072,6 +1188,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (detached SKU)', 'detail.ejs', {
@@ -1083,6 +1200,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
   ['detail.ejs (child SKU + regroup blocked)', 'detail.ejs', {
@@ -1095,6 +1213,7 @@ const renders = [
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
     rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    genreDict: null,
     yahoo: null, imageProduction: null,
   }],
 ];

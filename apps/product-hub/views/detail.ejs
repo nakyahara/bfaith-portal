@@ -482,7 +482,18 @@
     <div class="field" style="display:flex; gap:12px;">
       <div style="flex:1">
         <label class="req">ジャンルID (楽天)</label>
-        <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="例: 205761">
+        <div style="display:flex; gap:6px;">
+          <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="例: 205761" style="flex:1;">
+          <button type="button" class="btn btn-sm" id="rk-genre-fetch" style="white-space:nowrap;">ジャンル情報を取得</button>
+        </div>
+        <div id="rk-genre-info" style="font-size:12px; margin-top:4px;">
+          <% if (genreDict) { %>
+            <span style="color:#166534;">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
+            <span class="muted">(必須属性 <%= genreDict.attributes.filter((a) => a.mandatory).length %> 件 / 辞書取得済み)</span>
+          <% } else { %>
+            <span class="muted">辞書未取得 — 取得すると必須属性の行が自動で並び、登録前にチェックされます</span>
+          <% } %>
+        </div>
       </div>
       <div style="flex:1">
         <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span></label>
@@ -552,7 +563,7 @@
       <% } %>
     </div>
 
-    <label>商品属性 <span class="muted">(ジャンルの必須属性。足りないと登録時にRMSがエラーで教えてくれます)</span></label>
+    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span></label>
     <table class="list" id="rk-attrs" style="margin-bottom:8px;">
       <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
       <tbody>
@@ -667,6 +678,79 @@
 
   // ─── 楽天出品 (P3) ───
   const rkResult = document.getElementById('rk-result');
+
+  // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
+  function addAttrRow(name, value, meta) {
+    const tr = document.createElement('tr');
+    const hint = meta
+      ? [meta.mandatory ? '必須' : null, meta.inputMethod === 'SELECTIVE' ? '選択式' : null,
+         meta.unit ? '単位:' + meta.unit : null, meta.maxLength ? '〜' + meta.maxLength + '文字' : null]
+          .filter(Boolean).join(' / ')
+      : '';
+    tr.innerHTML = '<td><input type="text" class="rk-attr-name">'
+      + (hint ? '<div class="muted" style="font-size:11px;"></div>' : '') + '</td>'
+      + '<td><input type="text" class="rk-attr-value"></td>'
+      + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
+    tr.querySelector('.rk-attr-name').value = name || '';
+    tr.querySelector('.rk-attr-value').value = value || '';
+    if (hint) tr.querySelector('td div').textContent = hint;
+    if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
+    document.querySelector('#rk-attrs tbody').appendChild(tr);
+    return tr;
+  }
+
+  document.getElementById('rk-genre-fetch').addEventListener('click', async () => {
+    const genreId = document.getElementById('rk-genre').value.trim();
+    const info = document.getElementById('rk-genre-info');
+    if (!genreId) { info.textContent = 'ジャンルIDを入力してください'; return; }
+    const btn = document.getElementById('rk-genre-fetch');
+    btn.disabled = true;
+    info.textContent = '取得中…';
+    try {
+      const res = await fetch('/apps/product-hub/api/rakuten/genre-attributes?genre_id=' + encodeURIComponent(genreId));
+      const j = await res.json();
+      // 取得中に別のジャンルIDへ書き換えられていたら、この応答は捨てる
+      // (古いジャンルの必須行が現在のフォームへ混入するのを防ぐ — Codex R1 Medium-3)
+      if (document.getElementById('rk-genre').value.trim() !== genreId) return;
+      if (!j.ok) { info.textContent = '❌ ' + (j.error || '取得に失敗しました'); return; }
+      const g = j.genre;
+      const mandatory = (g.attributes || []).filter((a) => a.mandatory);
+      info.innerHTML = '';
+      const ok = document.createElement('span');
+      ok.style.color = '#166534';
+      ok.textContent = '✅ ' + (g.genrePath || g.genreName || genreId);
+      const mut = document.createElement('span');
+      mut.className = 'muted';
+      mut.textContent = ' (必須属性 ' + mandatory.length + ' 件)';
+      info.appendChild(ok); info.appendChild(mut);
+
+      // 既存行の属性名を集め、無い必須属性だけ行を足す (人の入力は消さない)
+      const present = new Set();
+      document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+        const n = tr.querySelector('.rk-attr-name').value.trim();
+        if (n) present.add(n);
+        // 空行 (name も value も空) は整理して詰める
+        if (!n && !tr.querySelector('.rk-attr-value').value.trim()) tr.remove();
+      });
+      let added = 0;
+      for (const a of mandatory) {
+        if (present.has(a.name)) continue;
+        if (a.name === 'カタログID') continue; // JAN欄から自動送信される (footnote 参照)
+        addAttrRow(a.name, '', a);
+        added += 1;
+      }
+      if ((g.attributes || []).some((a) => a.name === 'カタログID')) {
+        const note = document.createElement('div');
+        note.className = 'muted';
+        note.style.fontSize = '11px';
+        note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。JAN欄の値が自動で送られます。';
+        info.appendChild(note);
+      }
+      if (added > 0) rkResult.textContent = '必須属性 ' + added + ' 行を追加しました。値を埋めて「出品情報を保存」してください';
+    } catch (e) {
+      info.textContent = '通信エラー: ' + e.message;
+    } finally { btn.disabled = false; }
+  });
 
   document.getElementById('rk-attr-add').addEventListener('click', () => {
     const tr = document.createElement('tr');

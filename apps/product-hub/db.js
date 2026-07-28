@@ -261,6 +261,18 @@ export function initProductHubDB() {
       PRIMARY KEY (draft_id, shop_category_id)
     );
 
+    -- 楽天ジャンル属性辞書のキャッシュ (Genre API、2026-07-28 プローブで実証)。
+    -- ドラフト間で共有。buildItemPayload の事前検証 (IE1002防止・必須属性チェック) と
+    -- 「辞書に カタログID があるジャンルだけ JAN を自動付与」の判定に使う。
+    CREATE TABLE IF NOT EXISTS ph_genre_attributes (
+      genre_id     TEXT PRIMARY KEY,
+      genre_name   TEXT,                    -- 例: 付箋紙
+      genre_path   TEXT,                    -- 例: 日用品雑貨… > 文房具… > 付箋紙
+      payload_json TEXT NOT NULL,           -- 正規化済み attributes 配列 (JSON)
+      fixed_at     TEXT,                    -- RMS 辞書の version.fixedAt
+      fetched_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)

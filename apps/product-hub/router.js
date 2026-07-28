@@ -26,6 +26,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
+  fetchGenreAttributes, getCachedGenreAttributes,
 } from './services/rakuten-listing.js';
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
@@ -182,6 +183,8 @@ router.get('/detail/:id', (req, res) => {
   }
 
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
+  // ジャンル属性辞書 (取得済みならUIに必須件数と自動フォームの材料を渡す)
+  const genreDict = rakuten?.genre_id ? getCachedGenreAttributes(db, rakuten.genre_id) : null;
   const cabinetImages = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draft.id);
 
   res.render(view('detail.ejs'), {
@@ -193,7 +196,7 @@ router.get('/detail/:id', (req, res) => {
     statusLabels: STATUS_LABELS,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
-    rakuten, cabinetImages,
+    rakuten, cabinetImages, genreDict,
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
   });
@@ -679,10 +682,35 @@ router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
 });
 
 // 送信内容のプレビュー (dry run — RMS には送らない)
-router.get('/api/drafts/:id/rakuten/preview', (req, res) => {
+// ジャンル属性辞書の取得 (Genre API)。取得結果は ph_genre_attributes にキャッシュされ、
+// buildItemPayload の事前検証 (IE1002防止・必須属性チェック・カタログID自動付与) に効く
+router.get('/api/rakuten/genre-attributes', async (req, res) => {
+  const genreId = cleanText(req.query?.genre_id, 12);
+  if (!genreId) return res.status(400).json({ ok: false, error: 'genre_id が必要です' });
+  try {
+    const r = await fetchGenreAttributes(getDB(), genreId, { force: req.query?.refresh === '1' });
+    if (!r.ok) {
+      if (r.notFound) {
+        return res.status(404).json({ ok: false, error: 'このジャンルIDは見つかりません (末端ジャンルのIDか確認してください)' });
+      }
+      return res.status(502).json({ ok: false, error: r.error || 'ジャンル情報の取得に失敗しました' });
+    }
+    res.json({ ok: true, genre: r.genre, cached: r.cached === true });
+  } catch (e) {
+    console.error('[product-hub] genre-attributes failed:', e);
+    res.status(502).json({ ok: false, error: 'ジャンル情報の取得に失敗しました (miniPC 接続を確認)' });
+  }
+});
+
+router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  // プレビューでも辞書の鮮度を回復 (24h 以内なら通信なし。失敗しても検証スキップで続行)
+  const rkRow = db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
+    try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
+  }
   const built = buildItemPayload(db, draft.id);
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
   res.json({
