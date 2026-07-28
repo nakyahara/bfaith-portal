@@ -2,7 +2,7 @@
  * aba-report-parser のスモークテスト (依存なし・ネットワークなし)
  * 実行: node apps/aba-keywords/smoke-parser.js
  */
-import { parseAbaReportStream, normalizeAbaItem } from './aba-report-parser.js';
+import { parseAbaReportStream, normalizeAbaItem, streamTermGroups } from './aba-report-parser.js';
 
 let passed = 0, failed = 0;
 function check(name, cond) {
@@ -143,6 +143,27 @@ const FIXTURE = JSON.stringify({
   check('normalize: snake_case変種', snake && snake.search_term === 'y' && snake.click_position === null);
   const bad = normalizeAbaItem({ searchTerm: 'z' });
   check('normalize: 必須欠落はnull', bad === null);
+}
+
+// --- 8. streamTermGroups (検索語グループ化 + position補完 + skip集計) ---
+{
+  const doc = JSON.stringify({
+    dataByDepartmentAndSearchTerm: [
+      { departmentName: 'A', searchTerm: 'kw1', searchFrequencyRank: 10, clickedAsin: 'B000000001' },
+      { departmentName: 'A', searchTerm: 'kw1', searchFrequencyRank: 10, clickedAsin: 'B000000002' },
+      { departmentName: 'A', searchTerm: 'kw1', searchFrequencyRank: 10, clickedAsin: 'B000000003' },
+      { departmentName: 'A', searchTerm: 'kw2', searchFrequencyRank: 20, clickedAsin: 'B000000004', clickShareRank: 1 },
+      { departmentName: 'A', searchTerm: 'broken' }, // 必須欠落 → skip (グループは形成されない)
+      { departmentName: 'A', searchTerm: 'kw3', searchFrequencyRank: 30, clickedAsin: 'B000000005' },
+    ],
+  });
+  const groups = [];
+  const { itemCount, skipped } = await streamTermGroups(chunked(doc, 6), (g) => groups.push(g));
+  check('groups: グループ数', groups.length === 3);
+  check('groups: itemCount/skipped', itemCount === 6 && skipped === 1);
+  check('groups: position補完 1..3', groups[0].map(r => r.click_position).join(',') === '1,2,3');
+  check('groups: 明示rankを尊重', groups[1][0].click_position === 1);
+  check('groups: skip行を跨いでもグループ継続', groups[2][0].search_term === 'kw3' && groups[2][0].click_position === 1);
 }
 
 console.log(`\n結果: ${passed} passed / ${failed} failed`);

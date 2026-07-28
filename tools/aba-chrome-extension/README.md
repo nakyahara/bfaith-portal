@@ -18,10 +18,29 @@
 ## サーバー側の前提 (miniPC)
 
 - `.env` に `ENABLE_ABA_EXT=1` と `ABA_EXT_TOKEN=<ランダム長文字列>` を設定して `Restart-Service`
-- ABAレポートは毎朝の daily-sync (`ABA検索ワード` ジョブ) が自動取込 (要: ブランド登録 + SP-API Brand Analytics ロール)
-- 手動取込: `node apps/aba-keywords/fetch-aba-search-terms.js [--backfill 4] [--week YYYY-MM-DD(日曜)] [--dry-run]`
+- ABAレポートは毎朝の daily-sync (`ABA検索ワード` ジョブ) が自動処理 (要: ブランド登録 + SP-API Brand Analytics ロール)
+- 手動実行: `node apps/aba-keywords/fetch-aba-search-terms.js [--backfill 4] [--week YYYY-MM-DD(日曜)] [--dry-run]`
+
+## 蓄積しない設計 (既定)
+
+- DB に貯まるのは**照会した ASIN の分だけ** (数MB規模)。市場全体の検索語は保存しない
+- レポート本体は最新週のファイル1本 (100〜300MB) だけ `data/aba-reports/` に保持
+- **初めて照会する ASIN は 1〜2分の初回スキャン**が走る (画面に進捗表示、次回から即表示)
+- 照会済み ASIN は以降の週次処理で自動追跡され、履歴が貯まっていく
+- 過去週も欲しいときは ASIN 照会後に `--backfill 4` を手動実行 (過去4週分を追跡対象だけ取り込む)
+
+## Keepa 商品企画スカウトとの連携
+
+候補ASINをまとめて登録すると、レポート1パスのスキャンで全候補の注文ワードが引けるようになる:
+
+```
+POST /aba-ext-api/watch  (x-api-key: ABA_EXT_TOKEN)
+{ "asins": ["B0XXXXXXXX", ...] }   # 最大500件
+```
+
+登録後は `GET /aba-ext-api/reverse?asin=...` で各候補のキーワード (ABA順位・クリック/転換共有・Top3比率) が取れる。企画候補の「需要キーワード・検索順位・上位集中度」の判断材料になる。
 
 ## 注意
 
-- 注文ワードが空 = そのASINが保有データの全週でどの検索語でもクリック上位3に入っていない (ABAの仕様。セラースプライトでも同じ)
+- 注文ワードが空 = そのASINが保有データの週でどの検索語でもクリック上位3に入っていない (ABAの仕様。セラースプライトでも同じ)
 - 検索結果バッジの初回表示は 1〜2秒 (SP-API 取得)。2回目以降はキャッシュで即表示 (既定24h)
