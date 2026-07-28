@@ -751,8 +751,10 @@ dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '8%' });
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5', postage_included = 1, normal_delivery_date_id = '1000' WHERE draft_id = ?`).run(rkId);
 built = listing.buildItemPayload(db, rkId);
 const rkVar = built.payload?.variants?.['rk-smoke-1'] || {};
-check('payload: JAN はカタログID属性で送る (本番検証待ちの属性名)',
-  (rkVar.attributes || []).some((a) => a.name === 'カタログID' && a.values[0] === '4901234567894'),
+// 2026-07-28 本番検証: 属性辞書はジャンルごとで「カタログID」が無いジャンル (111145実測) では
+// IE1002 で登録自体が失敗する → **自動付与しない**。手入力した場合だけ送る (JAN欄との一致検証あり)
+check('payload: JAN欄だけではカタログID属性を自動付与しない (IE1002対策)',
+  !(rkVar.attributes || []).some((a) => a.name === 'カタログID'),
   JSON.stringify(rkVar.attributes));
 check('payload: 8% は payment.taxRate で送る', built.payload?.payment?.taxRate === 0.08);
 check('payload: 配送方法グループ + 送料込み', rkVar.shipping?.shippingMethodGroup === '5' && rkVar.shipping?.postageIncluded === true);
