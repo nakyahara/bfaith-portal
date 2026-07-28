@@ -58,6 +58,9 @@ const JOB_DEFINITIONS = {
   //   retry は 08:30/10:00/11:30 の空き枠で走るので daily(07:00, 10分) より timeout を 20分に延ばして余裕を取る。
   //   INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は skip されるので負荷は自然縮小)。
   'Amazon手数料':          { script: 'apps/warehouse/fetch-amazon-fees.js',        args: ['--recent', '30'], timeoutMs: 1200000 },
+  // ABA検索ワード: 冪等 (aba_weeks 台帳で取込済み週は即skip、未公開週は正常skip。
+  //   INSERT OR REPLACE なので中断後の再実行も安全)。SP-API throttle 等の一過性失敗を拾う
+  'ABA検索ワード':         { script: 'apps/aba-keywords/fetch-aba-search-terms.js',  args: [], timeoutMs: 3600000 },
   // DBバックアップ: 冪等 (当日分完成済み+元DB変化なしなら再利用し offsite 以降だけやり直す。
   // 先行ジョブの retry で DB が更新されていれば src_sig 不一致で自動的に作り直す)。月初最悪 ~5.5h
   'DBバックアップ':        { script: 'apps/warehouse/backup-warehouse.js',          args: [], timeoutMs: 21600000 },
@@ -66,7 +69,7 @@ const JOB_DEFINITIONS = {
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
-const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {

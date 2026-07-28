@@ -71,6 +71,7 @@ import supplierSalesPublicRouter from './apps/supplier-sales/public-router.js';
 import serviceRouter from './apps/warehouse/service-router.js';
 import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js';
+import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -299,6 +300,8 @@ app.use((req, res, next) => {
     // mgmt-accounting は mount 側で「認証ゲート → 50MB parser」の順に処理する (Excel seed 等の
     // 大容量投入があるため global 10MB を通すと mount 側 50MB が無効化される問題も同時に解消)。
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
+    // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
+    if (normalizedPath.startsWith('/aba-ext-api')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -1132,6 +1135,14 @@ app.use('/service-api', serviceAuth, (req, res, next) => {
 if (process.env.ENABLE_MINIPC_NE_SYNC_CONTROL === '1') {
   app.use('/ne-sync-control', express.json({ limit: '64kb' }), neSyncControlRouter);
   console.log('[server] ne-sync-control mounted (miniPC mode)');
+}
+
+// ABAキーワード拡張 API (セラースプライト置換)。ミニPC 専用 env で mount 自体を gate
+// (ne-sync-control と同パターン: Render には endpoint 自体が立たない = 攻撃面削減)。
+// 認証 (x-api-key = ABA_EXT_TOKEN, fail-closed) と 64KB parser は router 内で処理。
+if (process.env.ENABLE_ABA_EXT === '1') {
+  app.use('/aba-ext-api', abaExtRouter);
+  console.log('[server] aba-ext-api mounted (miniPC mode)');
 }
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲

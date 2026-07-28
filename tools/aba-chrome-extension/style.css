@@ -1,0 +1,71 @@
+/* B-Faith ABAキーワード拡張 */
+
+/* ===== 商品ページ: 注文ワードパネル ===== */
+.bfaba-panel {
+  margin: 12px 0;
+  border: 1px solid #d5a021;
+  border-radius: 8px;
+  background: #fffdf6;
+  font-size: 13px;
+  color: #111;
+}
+.bfaba-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #f7e8c3;
+  border-radius: 8px 8px 0 0;
+}
+.bfaba-title { font-weight: 700; }
+.bfaba-toggle {
+  border: 1px solid #c9a227;
+  background: #fff;
+  border-radius: 4px;
+  width: 24px; height: 24px;
+  cursor: pointer;
+  line-height: 1;
+}
+.bfaba-body { padding: 8px 12px 12px; }
+.bfaba-note { color: #666; margin: 4px 0 8px; }
+.bfaba-error { color: #b12704; margin: 4px 0; }
+.bfaba-scroll { overflow-x: auto; }
+.bfaba-table { border-collapse: collapse; width: 100%; min-width: 640px; }
+.bfaba-table th, .bfaba-table td {
+  border-bottom: 1px solid #eee;
+  padding: 5px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+.bfaba-table th { background: #faf6ea; font-weight: 600; }
+.bfaba-kw { cursor: pointer; font-weight: 600; }
+.bfaba-kw:hover { text-decoration: underline; }
+.bfaba-stale { color: #999; }
+.bfaba-stale .bfaba-kw { color: #999; }
+.bfaba-up { color: #067d62; }
+.bfaba-down { color: #b12704; }
+.bfaba-copied { background: #d8f3dc !important; }
+
+/* ===== 検索結果ページ: バッジ ===== */
+.bfaba-badge {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.bfaba-badge > span {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #f0f2f2;
+  color: #333;
+}
+.bfaba-b-rank { background: #fff3d6 !important; color: #7a5200 !important; font-weight: 700; }
+.bfaba-b-rank2 { background: #f5eede !important; color: #7a5200 !important; }
+.bfaba-b-phys { background: #e8f4fd !important; color: #0f4d7a !important; }
+.bfaba-b-brand { background: #eef7ee !important; color: #1d6428 !important; }
+.bfaba-b-asin { background: #f0f0f5 !important; color: #444 !important; cursor: pointer; font-family: monospace; }
+.bfaba-b-asin:hover { text-decoration: underline; }
+.bfaba-b-muted { color: #999 !important; }
