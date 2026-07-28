@@ -431,6 +431,19 @@ export function scheduleState() {
   return db.prepare('SELECT * FROM f_inbound_schedule_state WHERE id = 1').get() || null;
 }
 
+// ─── 入数の一括引き当て (値札印刷用CSV nefudaprint.csv 用) ───
+// 旧 GAS は スプレッドシート「入数マスタ」の C列 を引いていた。入数の正が f_inbound_info に
+// 移ったので、ここから code_key (lower(trim(商品コード))) で引く。
+// 未登録・未記入は Map に入れない (呼び出し側で空欄にする = 旧 GAS と同じ挙動)。
+export function irisuMap() {
+  const db = getMirrorDB();
+  const m = new Map();
+  for (const r of db.prepare('SELECT code_key, 入数 FROM f_inbound_info WHERE 入数 IS NOT NULL').iterate()) {
+    m.set(r.code_key, r.入数);
+  }
+  return m;
+}
+
 // ─── 入荷予定リストPDF の Drive 保存結果 (1行固定。成功/失敗どちらも記録) ───
 export function pdfState() {
   const db = getMirrorDB();
@@ -453,11 +466,38 @@ export function savePdfState({ ok, filename = null, rows = null, bytes = null, f
   return { saved_at: now };
 }
 
+// ─── 値札印刷用CSV (nefudaprint.csv) の Drive 保存結果 (1行固定。PDF と同じ作り) ───
+export function nefudaPrintState() {
+  const db = getMirrorDB();
+  return db.prepare('SELECT * FROM f_inbound_nefuda_print_state WHERE id = 1').get() || null;
+}
+
+export function saveNefudaPrintState({ ok, filename = null, rows = null, missing_irisu = null,
+                                       formula_cells = null, bytes = null, file_id = null,
+                                       folder_name = null, error = null, user = null } = {}) {
+  const db = getMirrorDB();
+  const now = utcIsoNow();
+  db.prepare(`
+    INSERT INTO f_inbound_nefuda_print_state
+      (id, saved_at, ok, filename, row_count, missing_irisu, formula_cells, bytes, file_id, folder_name, error, saved_by)
+    VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      saved_at = excluded.saved_at, ok = excluded.ok, filename = excluded.filename,
+      row_count = excluded.row_count, missing_irisu = excluded.missing_irisu,
+      formula_cells = excluded.formula_cells, bytes = excluded.bytes,
+      file_id = excluded.file_id, folder_name = excluded.folder_name, error = excluded.error,
+      saved_by = excluded.saved_by
+  `).run(now, ok ? 1 : 0, cleanText(filename), rows, missing_irisu, formula_cells, bytes,
+         cleanText(file_id), cleanText(folder_name),
+         error == null ? null : String(error).slice(0, 1000), cleanText(user));
+  return { saved_at: now };
+}
+
 // ─── 自動実行の設定 (時刻・PDF出力の有無) ───
 // 中原さんが画面から変更できるよう dashboard_settings (汎用 key/value) に持つ。
 // env INBOUND_INFO_SYNC_CRON が設定されている場合はそちらが優先 (上級者向けの上書き)。
 const SETTINGS_KEY = 'inbound_info.daily_job';
-export const DEFAULT_SETTINGS = { time: '09:00', pdf_enabled: true };
+export const DEFAULT_SETTINGS = { time: '09:00', pdf_enabled: true, nefuda_print_enabled: true };
 
 // 'HH:MM' (00:00〜23:59) のみ許可。cron 式を組み立てる前に必ず通す
 export function parseHhmm(v) {
@@ -481,16 +521,18 @@ export function getJobSettings() {
   return {
     time: t ? t.text : DEFAULT_SETTINGS.time,
     pdf_enabled: v.pdf_enabled !== false,
+    nefuda_print_enabled: v.nefuda_print_enabled !== false,
     updated_at: row.updated_at,
     updated_by: row.updated_by,
   };
 }
 
-export function saveJobSettings({ time, pdf_enabled }, user) {
+export function saveJobSettings({ time, pdf_enabled, nefuda_print_enabled }, user) {
   const t = parseHhmm(time);
   if (!t) return { ok: false, error: 'invalid_time' };
   const db = getMirrorDB();
-  const value = { time: t.text, pdf_enabled: pdf_enabled !== false };
+  const value = { time: t.text, pdf_enabled: pdf_enabled !== false,
+                  nefuda_print_enabled: nefuda_print_enabled !== false };
   db.prepare(`
     INSERT INTO dashboard_settings (key, value_json, updated_at, updated_by)
     VALUES (?, ?, ?, ?)

@@ -1,10 +1,12 @@
 /**
- * 入庫情報管理 — 日次自動処理 (新商品追加 → 入荷予定 nefuda.csv 取得 → 入荷予定リストPDFをDrive保存)
+ * 入庫情報管理 — 日次自動処理 (新商品追加 → 入荷予定 nefuda.csv 取得 → 値札印刷用CSV → 入荷予定リストPDF)
  *
  * 1) mirror_products (単品・取扱中) のうち f_inbound_info 未登録のコードを INSERT
  * 2) Drive の nefuda.csv (入荷予定) を取得して f_inbound_schedule を full-replace
- * 3) 入荷予定リスト (CSV順) の PDF を作って nefuda.csv と同じフォルダに上書き保存
- * 各段は独立の try/catch で、前段の失敗が後段を巻き込まない (ただし 3 は 2 の結果を使うので
+ * 3) 値札印刷用CSV (nefudaprint.csv) を作って nefuda.csv と同じフォルダに上書き保存
+ *    (旧 GAS processNefudaCsv の置き換え。入数は f_inbound_info が正 — nefuda-print.js 参照)
+ * 4) 入荷予定リスト (CSV順) の PDF を作って nefuda.csv と同じフォルダに上書き保存
+ * 各段は独立の try/catch で、前段の失敗が後段を巻き込まない (ただし 4 は 2 の結果を使うので
  * 2 が失敗した場合は「前回のスナップショット」で PDF を作る = 中身が古いだけで壊れない)。
  *
  * 実行時刻: 画面 (入庫情報管理 → ⚙️自動実行) で設定した時刻 (既定 09:00 JST)。
@@ -51,7 +53,9 @@ export async function runDailyJob() {
   } catch (e) {
     console.error('[inbound-info] sync failed:', e.message);
   }
-  // ② 入荷予定 (nefuda.csv) の取得。この結果で ③ を出すかどうかが変わる
+  // ②③ 入荷予定 (nefuda.csv) の取得 + 値札印刷用CSV (nefudaprint.csv) の出力。
+  // ③ は ② と同じダウンロード結果から同一ロック内で作られる (nefuda-fetch.js)。
+  // この結果で ④ を出すかどうかが変わる。
   let csvError = null;
   try {
     const s = await refreshNefudaSchedule('cron');
@@ -59,12 +63,18 @@ export async function runDailyJob() {
     if (!s.ok) console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
     else console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
       + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+    const np = s.nefuda_print;
+    if (np?.skipped) console.log(`[inbound-info] nefudaprint skipped (${np.skipped})`);
+    else if (np?.ok) console.log(`[inbound-info] nefudaprint ${np.action}: ${np.filename}`
+      + ` rows=${np.rows} missing_irisu=${np.missing_irisu}`);
+    else if (np) console.error(`[inbound-info] nefudaprint failed: ${np.error}`);
   } catch (e) {
     csvError = e.message;
     console.error('[inbound-info] nefuda fetch failed:', e.message);
+    // 値札CSVの「更新していない」記録は refreshNefudaSchedule 側で残している
   }
 
-  // ③ 入荷予定リストPDF。
+  // ④ 入荷予定リストPDF。
   // ⚠ CSV取得が失敗した日は **Drive のPDFを上書きしない** (Codex pdf-R1 High)。
   //   前回スナップショットで作った古いPDFで上書きすると、現場は「今日の入荷予定」として
   //   古い紙を刷ってしまい、しかも保存状態が「成功」に見えて失敗を見逃す。

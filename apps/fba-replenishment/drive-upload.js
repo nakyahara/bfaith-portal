@@ -79,6 +79,13 @@ export async function uploadCsvToDrive(buffer, filename, folderId, mimeType = 't
 
   const media = { mimeType, body: Readable.from(buffer) };
   const existing = list.data.files && list.data.files[0];
+  // 同名ファイルが複数あると、更新するのは先頭1件だけで残りは古い中身のまま残る。
+  // 読み手が別の1件を掴んでいると「更新したのに反映されない」ので気付けるよう警告する
+  // (Codex Medium。既存の挙動は変えない = 勝手に消さない)。
+  if (list.data.files && list.data.files.length > 1) {
+    console.warn(`[drive-upload] 「${filename}」がフォルダ内に ${list.data.files.length} 件あります`
+      + ` (id: ${list.data.files.map((f) => f.id).join(', ')})。更新するのは先頭の1件だけです`);
+  }
 
   if (existing) {
     // 既存ファイルの中身だけ差し替え (fileId/共有設定は維持)

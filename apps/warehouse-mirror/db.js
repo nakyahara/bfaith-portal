@@ -2660,6 +2660,26 @@ function createInboundInfoTables() {
       saved_by    TEXT
     )
   `);
+
+  // 値札印刷用CSV (nefudaprint.csv) の Drive 保存結果 (1行固定)。上と同じ理由で成功/失敗を記録。
+  // 2026-07-28: GAS processNefudaCsv (入数を旧スプレッドシート「入数マスタ」から引いていた) を
+  //   廃止し、入数の正を f_inbound_info に移すためポータル側で生成する。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_nefuda_print_state (
+      id             INTEGER PRIMARY KEY CHECK (id = 1),
+      saved_at       TEXT NOT NULL,
+      ok             INTEGER NOT NULL CHECK (ok IN (0, 1)),
+      filename       TEXT,
+      row_count      INTEGER,
+      missing_irisu  INTEGER,
+      formula_cells  INTEGER,
+      bytes          INTEGER,
+      file_id        TEXT,
+      folder_name    TEXT,
+      error          TEXT,
+      saved_by       TEXT
+    )
+  `);
 }
 // ▲▲▲ 入庫情報管理 ▲▲▲
 
