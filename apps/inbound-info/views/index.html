@@ -42,6 +42,19 @@
   th,td { border:1px solid var(--line); padding:5px 8px; text-align:left; vertical-align:top; }
   th { background:#f1f5f9; white-space:nowrap; }
   td input { width:100%; }
+  /* 一覧は枠内スクロール + 見出し行を固定する (行を追ってスクロールしても列名が見えるように)。
+     高さは「画面の高さ − ヘッダー/タブ」を上限にした flex で決める。検索や入荷予定の
+     ツールバーが折り返して背が伸びても、その分だけ表の枠が縮んでページ送りが画面内に残る。
+     border-collapse:collapse のままだと sticky 時に th の枠線が描かれないので inset shadow で代用する。 */
+  #panel-list.active { display:flex; flex-direction:column; max-height: calc(100vh - 190px); }
+  .tbox { flex:0 1 auto; min-height:160px; overflow:auto;
+          border:1px solid var(--line); border-radius:8px; background:#fff; }
+  .tbox table { margin-top:0; }
+  .tbox thead th { position:sticky; top:0; z-index:2;
+                   box-shadow: inset 0 1px 0 var(--line), inset 0 -1px 0 var(--line); }
+  /* いろは在庫化=有り の行で入力できない項目 (グレーアウト) */
+  td input.na, td input.na:disabled { background:#f1f5f9; color:#94a3b8; border-color:#e2e8f0;
+                                      cursor:not-allowed; text-align:center; }
   tr.new-row td { background:#fefce8; }
   /* 直接編集: 未保存 (dirty) → オレンジ、保存直後 → 緑を一瞬。new-row より後に定義して優先させる */
   tr.dirty td { background:#ffedd5; }
@@ -58,6 +71,12 @@
   .hint { font-size:12px; color:var(--gray); margin-top:3px; }
   .code { font-family:ui-monospace, Consolas, monospace; }
   .set-box { border:1px solid var(--line); border-radius:8px; padding:14px; background:#f8fafc; }
+  /* スマホは縦が短くツールバーも折り返すので、枠の高さは画面比で決める (mobile.css と同じ閾値) */
+  @media screen and (max-width:768px) {
+    #panel-list.active { max-height:none; }
+    /* dvh はアドレスバーの出入りに追従する (未対応ブラウザは直前の vh にフォールバック) */
+    .tbox { max-height:70vh; max-height:70dvh; }
+  }
 
   /* ─── 印刷 ─── 画面では隠し、印刷時だけ #print-area を出す (A4横・見出し行はページ毎に再掲) */
   #print-area { display:none; }
@@ -124,14 +143,17 @@
   </div>
   <div class="msg" id="msg-list"></div>
   <p class="hint" style="margin:0">各セルはそのまま書き換えできます。行の <b>保存</b> を押した行だけが保存されます (未保存の行はオレンジ色)。黄色い行は自動追加された新着です。</p>
-  <table>
-    <thead><tr>
-      <th>商品コード</th><th>商品名</th><th style="width:70px">入数</th>
-      <th>BCシール</th><th>直接ピックロケ</th><th>BF保管荷姿</th><th>いろは在庫化</th>
-      <th>memo</th><th style="width:110px">操作</th>
-    </tr></thead>
-    <tbody id="tbody-list"></tbody>
-  </table>
+  <p class="hint" style="margin:0">「いろは在庫化」を <b>有り</b> にした行は、入数・BCシール・直接ピックロケ・BF保管荷姿がグレーアウトします (BF側の入庫作業が無いため、3項目は「－」固定)。</p>
+  <div class="tbox">
+    <table>
+      <thead><tr>
+        <th>商品コード</th><th>商品名</th><th style="width:70px">入数</th>
+        <th>BCシール</th><th>直接ピックロケ</th><th>BF保管荷姿</th><th>いろは在庫化</th>
+        <th>memo</th><th style="width:110px">操作</th>
+      </tr></thead>
+      <tbody id="tbody-list"></tbody>
+    </table>
+  </div>
   <div class="pager">
     <button class="btn-gray btn-sm" id="pg-prev" onclick="page(-1)">← 前へ</button>
     <span id="pg-info"></span>
@@ -143,7 +165,7 @@
     <option value="そのまま"><option value="バラ"><option value="内箱で保管">
     <option value="20L折りコン入替"><option value="120サイズ入替">
   </datalist>
-  <datalist id="dl-iroha"><option value="有り"><option value="無し"></datalist>
+  <datalist id="dl-iroha"><option value="有り"><option value="無し"><option value="状況による"></datalist>
 </div>
 
 <!-- ─── 原産国 ─── -->
@@ -225,6 +247,13 @@ const COLS = [
   { key: 'いろは在庫化作業有無', label: 'いろは在庫化' }, { key: 'memo', label: 'memo' },
 ];
 const FILTER_LABEL = { all: 'すべて', missing: '入数未記入', new: '新着', scheduled: '入荷予定のみ' };
+// いろは在庫化=「有り」= いろは側で在庫化するので BF 倉庫の入庫作業が無い。
+// 該当3項目は「－」固定 + 入数も含めてグレーアウト (値の強制は apps/inbound-info/db.js が正)。
+const IROHA_FIELD = 'いろは在庫化作業有無';
+const IROHA_YES = '有り';
+const IROHA_NA_VALUE = '－';
+const IROHA_NA_FIELDS = ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿'];
+function irohaLocked(v) { return String(v == null ? '' : v).trim() === IROHA_YES; }
 
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -324,17 +353,48 @@ function searchNow() {
 // 全行を常に入力欄で描画する (編集ボタンを押さずにそのまま書き換えられる)。
 // 保存は行単位で、その行の「保存」を押した時だけ。押していない行は一切送らない。
 function rowHtml(r) {
-  const cell = (f) => `<td><input type="text" data-f="${esc(f)}" list="${DL[f] || ''}" value="${esc(r[f])}"></td>`;
+  const lock = irohaLocked(r[IROHA_FIELD]);
+  const cell = (f) => {
+    const na = lock && IROHA_NA_FIELDS.includes(f);
+    return `<td><input type="text" data-f="${esc(f)}" list="${na ? '' : (DL[f] || '')}"`
+      + ` value="${esc(na ? IROHA_NA_VALUE : r[f])}"${na ? ' class="na" disabled' : ''}></td>`;
+  };
   const irisuBlank = r.入数 == null || r.入数 === '';
   return `<tr class="${r.source === 'auto' ? 'new-row' : ''}" data-key="${esc(r.code_key)}">
     <td class="code">${esc(r.商品コード)}</td>
     <td><input type="text" data-f="商品名" value="${esc(r.商品名)}"></td>
-    <td class="${irisuBlank ? 'miss' : ''}"><input type="number" data-f="入数" min="0" step="1"
-        value="${irisuBlank ? '' : esc(r.入数)}" title="未記入の行は赤くなります"></td>
-    ${cell('入庫時BCシール貼りフラグ')}${cell('直接ピックロケ保管')}${cell('BF保管荷姿')}${cell('いろは在庫化作業有無')}${cell('memo')}
+    <td class="${irisuBlank && !lock ? 'miss' : ''}"><input type="number" data-f="入数" min="0" step="1"
+        value="${irisuBlank ? '' : esc(r.入数)}" title="未記入の行は赤くなります"${lock ? ' class="na" disabled' : ''}></td>
+    ${cell('入庫時BCシール貼りフラグ')}${cell('直接ピックロケ保管')}${cell('BF保管荷姿')}${cell(IROHA_FIELD)}${cell('memo')}
     <td class="ops"><button class="btn-green btn-sm" data-act="save" disabled>保存</button>
         <button class="btn-red btn-sm" data-act="del">削除</button></td>
   </tr>`;
+}
+// 「いろは在庫化」を打ち替えたその場でグレーアウトを反映する (保存前に見た目で分かるように)。
+// 実際に保存される値はサーバー側 (updateInbound) でも同じ規則で強制している。
+function applyIrohaRule(tr) {
+  const lock = irohaLocked(tr.querySelector(`input[data-f="${CSS.escape(IROHA_FIELD)}"]`)?.value);
+  for (const f of IROHA_NA_FIELDS) {
+    const inp = tr.querySelector(`input[data-f="${CSS.escape(f)}"]`);
+    if (!inp) continue;
+    // 選び間違いで入力途中の値を失わないよう、「－」で潰す前の値を退避して戻せるようにする
+    if (lock) {
+      if (inp.value !== IROHA_NA_VALUE) inp.dataset.prev = inp.value;
+      inp.value = IROHA_NA_VALUE;
+    } else if (inp.dataset.prev != null && inp.value === IROHA_NA_VALUE) {
+      inp.value = inp.dataset.prev;
+      delete inp.dataset.prev;
+    }
+    inp.disabled = lock;
+    inp.classList.toggle('na', lock);
+    inp.setAttribute('list', lock ? '' : (DL[f] || ''));
+  }
+  const irisu = tr.querySelector('input[data-f="入数"]');
+  if (irisu) {
+    irisu.disabled = lock;
+    irisu.classList.toggle('na', lock);
+    irisu.closest('td').classList.toggle('miss', !lock && irisu.value.trim() === '');
+  }
 }
 function renderList(rows) {
   window._rows = Object.fromEntries(rows.map(r => [r.code_key, r]));
@@ -354,6 +414,12 @@ document.getElementById('tbody-list').addEventListener('input', (ev) => {
   const btn = tr.querySelector('button[data-act="save"]');
   if (btn) btn.disabled = false;
   if (inp.dataset.f === '入数') inp.closest('td').classList.toggle('miss', inp.value.trim() === '');
+  if (inp.dataset.f === IROHA_FIELD) applyIrohaRule(tr);
+});
+// datalist から選んだ時に input が飛ばないブラウザ向けの保険 (dirty 判定は input 側が担当)
+document.getElementById('tbody-list').addEventListener('change', (ev) => {
+  const inp = ev.target.closest(`input[data-f="${CSS.escape(IROHA_FIELD)}"]`);
+  if (inp) applyIrohaRule(inp.closest('tr'));
 });
 // Enter でその行を保存 (テンキー入力のみで完結させる)。保存中の連打は無視する
 document.getElementById('tbody-list').addEventListener('keydown', (ev) => {

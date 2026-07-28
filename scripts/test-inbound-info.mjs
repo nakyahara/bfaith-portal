@@ -22,7 +22,7 @@ if (!process.env.DATA_DIR) {
 }
 console.log('DATA_DIR =', process.env.DATA_DIR);
 
-const { initMirrorDB } = await import('../apps/warehouse-mirror/db.js');
+const { initMirrorDB, getMirrorDB } = await import('../apps/warehouse-mirror/db.js');
 const db = initMirrorDB();
 const {
   syncNewProducts, importInboundRows, importOriginRows, importWorkbook, listInbound, updateInbound,
@@ -406,6 +406,114 @@ try {
     `PDF実生成: reportlab で ${Math.round(real.buffer.length / 1024)}KB`);
 } catch (e) {
   console.log(`  ⏭  PDF実生成はスキップ (${e.message.slice(0, 80)})`);
+}
+
+// ─── 10. いろは在庫化=「有り」の規則 (2026-07-28) ───
+// いろは側で在庫化する商品は BF 倉庫の入庫作業が無いので、BCシール/直接ピックロケ/BF保管荷姿は
+// '－' 固定。入数は値を残すが「入数未記入」には数えない (画面はグレーアウトで編集させない)。
+console.log('\n[10] いろは在庫化=有り の規則');
+const NA = '－';
+const nowI = new Date().toISOString();
+db.prepare(`
+  INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ,
+    直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
+  VALUES ('irohatest01', 'irohatest01', 'いろはテスト (旧データ)', NULL,
+    'BCシール貼付必要', '直接ピックロケ', 'バラ', '有り', 'excel', ?, ?)
+`).run(nowI, nowI);
+
+// 入数未記入の集計・絞り込みから外れる (入数を記入できない行なので拾っても直せない)
+const missAll = listInbound({ filter: 'missing', limit: 'all' });
+ok(!missAll.rows.some((x) => x.code_key === 'irohatest01'),
+  'いろは=有り の行は「入数未記入」に出ない (入数はグレーアウトで記入できないため)');
+ok(stats().missing_irisu === missAll.total, 'stats.missing_irisu と filter=missing の件数が一致');
+
+// 保存時: 画面から何を送られても3項目は '－' に倒す (API 直叩き対策)
+const ih0 = getInbound('irohatest01');
+let ih = updateInbound('irohatest01', {
+  入数: '24', 入庫時BCシール貼りフラグ: 'BCシール貼付必要', 直接ピックロケ保管: '直接ピックロケ',
+  BF保管荷姿: 'そのまま', いろは在庫化作業有無: '有り', memo: 'メモは残る',
+}, 'tester', ih0.version);
+ok(ih.ok && ih.row.入庫時BCシール貼りフラグ === NA && ih.row.直接ピックロケ保管 === NA && ih.row.BF保管荷姿 === NA,
+  'いろは=有り で保存すると3項目は「－」に固定される');
+ok(ih.row.入数 === 24 && ih.row.memo === 'メモは残る', 'いろは=有り でも入数と memo は保存される');
+
+// 更新内容に いろは列 が含まれない場合も、現在値が 有り なら固定は続く
+ih = updateInbound('irohatest01', { BF保管荷姿: '20L折りコン入替' }, 'tester', ih.row.version);
+ok(ih.ok && ih.row.BF保管荷姿 === NA, 'いろは列を送らない更新でも、現在値が有りなら「－」のまま');
+
+// 「状況による」「無し」は対象外 (通常どおり編集できる)
+ih = updateInbound('irohatest01', { いろは在庫化作業有無: '状況による', BF保管荷姿: 'そのまま' }, 'tester', ih.row.version);
+ok(ih.ok && ih.row.いろは在庫化作業有無 === '状況による' && ih.row.BF保管荷姿 === 'そのまま',
+  '「状況による」は固定対象外 (3項目は通常どおり編集できる)');
+ih = updateInbound('irohatest01', { いろは在庫化作業有無: '無し', BF保管荷姿: 'バラ' }, 'tester', ih.row.version);
+ok(ih.ok && ih.row.BF保管荷姿 === 'バラ', '「無し」も固定対象外');
+
+// 競合時 (version 不一致) は「－」への強制も含めて一切書き換わらない
+// (先に いろは列 を SELECT していても、最終 UPDATE が version 条件付きなので取りこぼさない)
+ih = updateInbound('irohatest01', { いろは在庫化作業有無: '有り', BF保管荷姿: 'そのまま' }, 'tester', getInbound('irohatest01').version);
+const beforeConflict = getInbound('irohatest01');
+const cf = updateInbound('irohatest01', { BF保管荷姿: 'そのまま' }, 'userB', beforeConflict.version + 5);
+const afterConflict = getInbound('irohatest01');
+ok(!cf.ok && cf.error === 'conflict' && afterConflict.version === beforeConflict.version
+  && ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿', '入数', 'memo', 'updated_by']
+       .every((f) => afterConflict[f] === beforeConflict[f]),
+  'version 不一致なら「－」への強制も含めて何も書き換えない (conflict)');
+
+// Excel 再取込 (移行ツール経路) でも同じ規則を通す
+importInboundRows([{ 商品コード: 'irohatest01', 商品名: 'いろはテスト', 入数: 12,
+  入庫時BCシール貼りフラグ: '不要', 直接ピックロケ保管: '直接ピックロケ', BF保管荷姿: 'バラ',
+  いろは在庫化作業有無: '有り' }], { user: 'tester' });
+const ihImp = getInbound('irohatest01');
+ok(ihImp.入庫時BCシール貼りフラグ === NA && ihImp.直接ピックロケ保管 === NA && ihImp.BF保管荷姿 === NA && ihImp.入数 === 12,
+  'Excel取込でも いろは=有り なら3項目は「－」(入数は取り込む)');
+
+// 既存データの backfill (initMirrorDB 内の冪等 UPDATE)。旧データを直接書き戻して再初期化する
+db.prepare(`
+  UPDATE f_inbound_info
+     SET 入庫時BCシール貼りフラグ = 'BCシール貼付必要', 直接ピックロケ保管 = '直接ピックロケ',
+         BF保管荷姿 = 'バラ', いろは在庫化作業有無 = '有り'
+   WHERE code_key = 'irohatest01'
+`).run();
+const beforeBf = getInbound('irohatest01');
+initMirrorDB(); // ← 起動時と同じ経路 (createInboundInfoTables の backfill が走る)
+const afterBf = getInbound('irohatest01');
+ok(afterBf.入庫時BCシール貼りフラグ === NA && afterBf.直接ピックロケ保管 === NA && afterBf.BF保管荷姿 === NA,
+  '既存データ: 起動時の backfill で「－」に揃う');
+ok(afterBf.version === beforeBf.version + 1 && afterBf.updated_by === 'system(iroha-rule)',
+  'backfill: version を進めて更新者を残す (開いたままの画面は conflict で気付ける)');
+initMirrorDB();
+ok(getInbound('irohatest01').version === afterBf.version, 'backfill: 2回目以降は 0 件更新 (冪等)');
+
+// 表記ゆれ「　有り　」(全角スペース付き) も同じ扱いにする。SQLite の素の trim() は全角空白を
+// 落とさないため、JS の .trim() と判定がズレて backfill / 入数未記入 だけすり抜ける (Codex R2 Medium)
+const nowW = new Date().toISOString();
+getMirrorDB().prepare(`
+  INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ,
+    直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
+  VALUES ('irohaws01', 'irohaws01', '全角スペース付き 有り', NULL, 'BCシール貼付必要',
+    '直接ピックロケ', 'バラ', '　有り　', 'excel', ?, ?)
+`).run(nowW, nowW);
+// NBSP (U+00A0) 付きも同様 (JS の .trim() は落とすので SQL 側と判定を揃えている)
+getMirrorDB().prepare(`
+  INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, 入庫時BCシール貼りフラグ,
+    直接ピックロケ保管, BF保管荷姿, いろは在庫化作業有無, source, created_at, updated_at)
+  VALUES ('irohaws02', 'irohaws02', 'NBSP付き 有り', NULL, 'BCシール貼付必要',
+    '直接ピックロケ', 'バラ', ' 有り ', 'excel', ?, ?)
+`).run(nowW, nowW);
+const missWs = listInbound({ filter: 'missing', limit: 'all' }).rows.map((x) => x.code_key);
+ok(!missWs.includes('irohaws01') && !missWs.includes('irohaws02'),
+  '「　有り　」(全角スペース) / NBSP 付きも「入数未記入」から外れる');
+const db3 = initMirrorDB();
+const wsRows = ['irohaws01', 'irohaws02'].map(getInbound);
+ok(wsRows.every((w) => w.入庫時BCシール貼りフラグ === NA && w.直接ピックロケ保管 === NA && w.BF保管荷姿 === NA),
+  '「　有り　」(全角スペース) / NBSP 付きも backfill の対象になる');
+// 上書き前の値は控えてある (戻せる形にしておく)。db2 は initMirrorDB() の再入で閉じているので db3 を使う
+const bk = db3.prepare("SELECT * FROM f_inbound_info_iroha_backup WHERE code_key = 'irohatest01'").get();
+ok(bk && bk.入庫時BCシール貼りフラグ === 'BCシール貼付必要' && bk.直接ピックロケ保管 === '直接ピックロケ'
+  && bk.BF保管荷姿 === 'バラ' && bk.backed_up_at,
+  'backfill: 上書き前の値を f_inbound_info_iroha_backup に控えている');
+for (const t of ['f_inbound_info', 'f_inbound_info_iroha_backup']) {
+  db3.prepare(`DELETE FROM ${t} WHERE code_key IN ('irohatest01', 'irohaws01', 'irohaws02')`).run();
 }
 
 console.log(`\n🎉 全 ${passed} 項目 PASS`);

@@ -11,7 +11,7 @@
  *   実データ検証 (2026-07-21) で Excel と NE の商品コードに大文字小文字違いが
  *   1123 件あったため、表示用の元表記 (商品コード) と照合キーを分離して持つ。
  */
-import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { getMirrorDB, TRIM_WS_SQL } from '../warehouse-mirror/db.js';
 
 export function utcIsoNow() {
   return new Date().toISOString();
@@ -42,6 +42,23 @@ export function parseIrisu(v) {
 const TEXT_FIELDS = ['商品名', '入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿', 'いろは在庫化作業有無', 'memo'];
 const MAX_TEXT_LEN = 500;
 
+// ─── いろは在庫化=「有り」の行の扱い (2026-07-28 中原さん指示) ───
+// いろは (就労B型) 側で在庫化作業を行う商品は B-Faith 倉庫での入庫作業が発生しないため、
+// BCシール / 直接ピックロケ / BF保管荷姿 は一律「－」で固定する (画面はグレーアウト)。
+// 入数は参考値として残すが画面では編集させない (= 未記入でも「入数未記入」に数えない)。
+// 画面側でも同じ見た目を出すが、値を決めるのはこのモジュールの書き込み関数
+// (updateInbound / importInboundRows)。画面を経由しない API 直叩きでも壊れない。
+// ※ DB の制約ではないので、この2つを通さない経路 (直 SQL 等) を新設する場合は同じ規則を通すこと。
+export const IROHA_YES = '有り';
+export const IROHA_NA_VALUE = '－'; // 全角ハイフンマイナス (U+FF0D)
+export const IROHA_NA_FIELDS = ['入庫時BCシール貼りフラグ', '直接ピックロケ保管', 'BF保管荷姿'];
+// SQL 側の空白除去は JS の .trim() と揃える (TRIM_WS_SQL の定義と理由は warehouse-mirror/db.js)。
+// '　有り　' や NBSP 付きの表記ゆれが SQL 側だけすり抜けるのを防ぐ (Codex R2/R3 Medium)。
+const trimSql = (col) => `trim(COALESCE(${col}, ''), ${TRIM_WS_SQL})`;
+// 「入数未記入」の判定。いろは=有り の行は入数を記入できないので対象外にする
+const MISSING_IRISU_SQL = (p = '') =>
+  `${p}入数 IS NULL AND ${trimSql(`${p}いろは在庫化作業有無`)} <> ?`;
+
 function cleanText(v) {
   if (v == null) return null;
   const s = String(v).trim();
@@ -49,15 +66,20 @@ function cleanText(v) {
   return s.slice(0, MAX_TEXT_LEN);
 }
 
+// いろは在庫化=有り か (前後空白・全角空白は cleanText が落とす)
+export function isIrohaLocked(v) {
+  return cleanText(v) === IROHA_YES;
+}
+
 // ─── ヘッダー統計 ───
 export function stats() {
   const db = getMirrorDB();
   const row = db.prepare(`
     SELECT COUNT(*) AS total,
-           SUM(CASE WHEN 入数 IS NULL THEN 1 ELSE 0 END) AS missing_irisu,
+           SUM(CASE WHEN ${MISSING_IRISU_SQL()} THEN 1 ELSE 0 END) AS missing_irisu,
            SUM(CASE WHEN source = 'auto' THEN 1 ELSE 0 END) AS auto_new
       FROM f_inbound_info
-  `).get();
+  `).get(IROHA_YES);
   const mirrorCount = db.prepare('SELECT COUNT(*) AS c FROM mirror_products').get().c;
   const schedCount = db.prepare('SELECT COUNT(*) AS c FROM f_inbound_schedule').get().c;
   return { ...row, mirror_products: mirrorCount, schedule_count: schedCount };
@@ -87,8 +109,10 @@ export function listInbound({ q = '', filter = 'all', offset = 0, limit = 100 } 
     const like = `%${term}%`;
     params.push(like, like);
   }
-  if (filter === 'missing') conds.push('i.入数 IS NULL');
-  else if (filter === 'new') conds.push("i.source = 'auto'");
+  if (filter === 'missing') {
+    conds.push(`(${MISSING_IRISU_SQL('i.')})`);
+    params.push(IROHA_YES);
+  } else if (filter === 'new') conds.push("i.source = 'auto'");
   // scheduled は JOIN 自体が絞り込みになる (IN サブクエリ不要)
   const from = scheduled
     ? 'f_inbound_info i JOIN f_inbound_schedule s ON s.code_key = i.code_key'
@@ -139,6 +163,15 @@ export function updateInbound(key, fields, user, expectedVersion) {
     return { ok: false, error: 'empty_name' };
   }
 
+  // 更新後の「いろは在庫化作業有無」を先に確定する (今回の更新に含まれなければ現在値)。
+  // 有り なら BCシール / 直接ピックロケ / BF保管荷姿 は送られてきた値によらず '－' に倒す。
+  // (version 付き条件更新なので、この参照と UPDATE の間に他人が更新すれば conflict になる)
+  const cur = db.prepare('SELECT いろは在庫化作業有無 FROM f_inbound_info WHERE code_key = ?').get(k);
+  if (!cur) return { ok: false, error: 'not_found' };
+  const irohaLocked = isIrohaLocked(
+    'いろは在庫化作業有無' in fields ? fields.いろは在庫化作業有無 : cur.いろは在庫化作業有無
+  );
+
   const sets = ["source = 'manual'", 'version = version + 1', 'updated_at = ?', 'updated_by = ?'];
   const params = [utcIsoNow(), cleanText(user)];
   if ('入数' in fields) {
@@ -148,6 +181,11 @@ export function updateInbound(key, fields, user, expectedVersion) {
     params.unshift(irisu.value);
   }
   for (const f of TEXT_FIELDS) {
+    if (irohaLocked && IROHA_NA_FIELDS.includes(f)) {
+      sets.unshift(`${f} = ?`);
+      params.unshift(IROHA_NA_VALUE);
+      continue;
+    }
     if (f in fields) {
       sets.unshift(`${f} = ?`);
       params.unshift(cleanText(fields[f]));
@@ -281,12 +319,15 @@ export function importInboundRows(rows, { dryRun = false, user = null } = {}) {
         if (report.warnings.length < 20) report.warnings.push(`行${r.rowNumber ?? i + 2}: 入数が整数でない (${c}: ${r.入数})`);
         continue;
       }
+      // いろは=有り の行は UI 編集と同じく入庫作業列を '－' に固定する
+      const locked = isIrohaLocked(r.いろは在庫化作業有無);
+      const na = (v) => (locked ? IROHA_NA_VALUE : cleanText(v));
       const vals = [
         cleanText(r.商品名),
         irisu.value,
-        cleanText(r.入庫時BCシール貼りフラグ),
-        cleanText(r.直接ピックロケ保管),
-        cleanText(r.BF保管荷姿),
+        na(r.入庫時BCシール貼りフラグ),
+        na(r.直接ピックロケ保管),
+        na(r.BF保管荷姿),
         cleanText(r.いろは在庫化作業有無),
       ];
       if (sel.get(k)) {
