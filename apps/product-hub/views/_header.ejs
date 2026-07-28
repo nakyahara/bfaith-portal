@@ -54,6 +54,16 @@
   .copy-code.copied { background: #dcfce7; border-color: #86efac; }
   .copy-hint { font-size: 11px; color: #94a3b8; font-family: inherit; }
   .copy-code.copied .copy-hint { color: #166534; }
+  /* 詳細画面はワイド表示 (縦スクロール削減。中原さん要望 2026-07-28) */
+  .wrap.wide { max-width: 1720px; }
+  /* 項目の埋まり方タグ: 手入力 / AI / 自動 (組み合わせ可) */
+  .ftag { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 999px;
+          font-weight: 600; margin-left: 6px; vertical-align: 1px; }
+  .ftag-m { background: #e2e8f0; color: #334155; }    /* ✏️手入力 */
+  .ftag-ai { background: #ede9fe; color: #6d28d9; }   /* 🤖AI */
+  .ftag-auto { background: #e0f2fe; color: #0369a1; } /* 🗄️自動 */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+  @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
 </style>
 <link rel="stylesheet" href="/mobile.css">
 <div class="topbar">

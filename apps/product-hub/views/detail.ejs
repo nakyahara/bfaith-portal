@@ -1,8 +1,13 @@
 <%- include('_header') %>
-<div class="wrap">
+<div class="wrap wide">
 
-  <div style="margin-bottom:12px;">
+  <div style="margin-bottom:12px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
     <a class="btn" href="/apps/product-hub">← 一覧に戻る</a>
+    <span class="muted" style="font-size:12px;">
+      項目の見方: <span class="ftag ftag-m" style="margin-left:0">手入力</span>=人が入れる /
+      <span class="ftag ftag-ai" style="margin-left:0">AI</span>=AIが入れる (直してOK) /
+      <span class="ftag ftag-auto" style="margin-left:0">自動</span>=何もしなくてよい
+    </span>
   </div>
 
   <!-- ステータス + Notion -->
@@ -159,36 +164,36 @@
     <div class="card">
       <h2>✏️ 基本情報 <span class="muted" style="font-weight:400">(入力)</span></h2>
       <div class="field">
-        <label>商品コード (NE / 楽天管理番号)</label>
+        <label>商品コード (NE / 楽天管理番号)<span class="ftag ftag-auto">自動</span></label>
         <!-- 登録後の変更は影響範囲が広い (Notionカード・NE突合のキー) ので表示専用。クリックでコピー -->
         <button type="button" class="copy-code" data-code="<%= draft.ne_code %>"
                 title="クリックでコピー"><%= draft.ne_code %><span class="copy-hint">📋 コピー</span></button>
       </div>
       <div class="field">
-        <label class="req">商品名</label>
+        <label class="req">商品名<span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="f-name" value="<%= draft.name %>">
       </div>
       <div class="field">
-        <label class="req">公式ページURL (AI生成の参照元)</label>
+        <label class="req">公式ページURL (AI生成の参照元)<span class="ftag ftag-m">手入力</span></label>
         <input type="url" id="f-official-url" value="<%= draft.official_url || '' %>" placeholder="https://...">
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>売価 (税込・円)</label>
+          <label>売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="f-price" min="0" step="1" value="<%= draft.price != null ? draft.price : '' %>">
         </div>
         <div style="flex:1">
-          <label>JANコード</label>
+          <label>JANコード<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
         </div>
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>ASIN</label>
+          <label>ASIN<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-asin" value="<%= draft.asin || '' %>" placeholder="B0XXXXXXXX">
         </div>
         <div style="flex:2">
-          <label>Amazon URL</label>
+          <label>Amazon URL<span class="ftag ftag-m">手入力</span></label>
           <input type="url" id="f-amazon-url" value="<%= draft.amazon_url || '' %>" placeholder="https://www.amazon.co.jp/dp/...">
         </div>
       </div>
@@ -196,13 +201,13 @@
         <label><input type="checkbox" id="f-own-brand" style="width:auto" <%= draft.own_brand ? 'checked' : '' %>> 自社商品 (画像制作ワークフローを使う)</label>
       </div>
       <div class="field">
-        <label>画像フォルダURL (共有ドライブ。「商品コード_商品名」規則を推奨)</label>
+        <label>画像フォルダURL (共有ドライブ。「商品コード_商品名」規則を推奨)<span class="ftag ftag-m">手入力</span></label>
         <input type="url" id="f-drive-folder" value="<%= draft.drive_folder_url || '' %>" placeholder="https://drive.google.com/drive/folders/...">
       </div>
       <div class="field">
         <% if (hasVariation.source === 'ne') { %>
           <!-- NE にある商品は NE が正 (中原さん決定 2026-07-25)。手入力させず判定結果を出す -->
-          <label>バリエーション</label>
+          <label>バリエーション<span class="ftag ftag-auto">自動</span></label>
           <div style="font-size:13px;">
             <%= hasVariation.value ? 'あり' : 'なし' %>
             <span class="muted">— NE商品マスタの判定<%= hasVariation.value ? ` (代表 ${variation.groupKey} / ${variation.memberCount} SKU)` : '' %></span>
@@ -214,7 +219,7 @@
         <% } %>
       </div>
       <div class="field">
-        <label>メモ</label>
+        <label>メモ<span class="ftag ftag-m">手入力</span></label>
         <textarea id="f-memo" rows="3"><%= draft.memo || '' %></textarea>
       </div>
       <button class="btn btn-primary" id="save-basic-btn">基本情報を保存</button>
@@ -222,7 +227,7 @@
 
     <!-- 参考URL -->
     <div class="card">
-      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span></h2>
+      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span><span class="ftag ftag-m">手入力</span></h2>
       <% if (refs.length === 0) { %>
         <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
       <% } %>
@@ -247,31 +252,31 @@
       <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>Yahoo!売価 (税込・円)</label>
+          <label>Yahoo!売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
         </div>
         <div style="flex:1">
-          <label>Yahoo!売価 (佐川の場合)</label>
+          <label>Yahoo!売価 (佐川の場合)<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
         </div>
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>配送方法</label>
+          <label>配送方法<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
         </div>
         <div style="flex:1">
-          <label>税率 <span class="muted">(登録時にNEから初期値)</span></label>
+          <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
         </div>
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>Yahoo!カテゴリID</label>
+          <label>Yahoo!カテゴリID<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
         </div>
         <div style="flex:2">
-          <label>Yahoo!path (店カテゴリ)</label>
+          <label>Yahoo!path (店カテゴリ)<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
         </div>
       </div>
@@ -362,8 +367,9 @@
   </div>
 
   <!-- 画像 -->
+  <div class="grid-2" style="gap:16px; align-items:start;">
   <div class="card">
-    <h2>✏️ 商品画像 (Driveリンク)</h2>
+    <h2>✏️ 商品画像 (Driveリンク)<span class="ftag ftag-m">手入力</span></h2>
     <div style="display:flex; gap:8px; margin-bottom:12px;">
       <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
       <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
@@ -388,7 +394,7 @@
 
   <!-- 仕様表 -->
   <div class="card">
-    <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span></h2>
+    <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span><span class="ftag ftag-m">手入力</span></h2>
     <table class="list" style="margin-bottom:12px;">
       <% if (specs.length > 0) { %>
         <thead><tr><th style="width:200px">項目</th><th>値</th><th style="width:70px"></th></tr></thead>
@@ -409,6 +415,7 @@
       <button class="btn" id="add-spec-btn" style="white-space:nowrap">追加</button>
     </div>
   </div>
+  </div><!-- /grid-2 (商品画像+仕様表) -->
 
   <!-- AI出力 -->
   <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
@@ -427,10 +434,11 @@
         desc_notes: '注意書き',
       };
     %>
+    <div class="grid-2">
     <% for (const kind of aiKinds) { %>
       <div class="field">
         <label>
-          <%= aiLabels[kind] || kind %>
+          <%= aiLabels[kind] || kind %><span class="ftag ftag-ai">AI</span>
           <% if (aiOutputs[kind] && aiOutputs[kind].generated_at && !aiOutputs[kind].edited_by_human) { %>
             <span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span>
           <% } %>
@@ -438,6 +446,7 @@
         <textarea class="ai-output" data-kind="<%= kind %>" rows="<%= kind.startsWith('desc_') ? 4 : 2 %>"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
       </div>
     <% } %>
+    </div>
     <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
   </div>
 
@@ -481,7 +490,7 @@
 
     <div class="field" style="display:flex; gap:12px;">
       <div style="flex:1">
-        <label class="req">ジャンルID (楽天)</label>
+        <label class="req">ジャンルID (楽天)<span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
         <div style="display:flex; gap:6px;">
           <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="AIが自動で提案します" style="flex:1;">
           <button type="button" class="btn btn-sm" id="rk-genre-tree" style="white-space:nowrap;">🌲 ツリーから選ぶ</button>
@@ -498,14 +507,14 @@
         </div>
       </div>
       <div style="flex:1">
-        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span></label>
+        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
       </div>
     </div>
 
     <div class="field" style="display:flex; gap:12px; flex-wrap:wrap;">
       <div style="flex:1; min-width:160px;">
-        <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span></label>
+        <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
         <select id="rk-shipping-group" style="width:100%;">
           <option value="">未設定 (店舗デフォルト)</option>
           <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
@@ -514,7 +523,7 @@
         </select>
       </div>
       <div style="flex:1; min-width:120px;">
-        <label>送料</label>
+        <label>送料<span class="ftag ftag-m">手入力</span></label>
         <select id="rk-postage" style="width:100%;">
           <option value="">未設定 (店舗デフォルト)</option>
           <option value="1" <%= rakuten?.postage_included === 1 ? 'selected' : '' %>>送料込み</option>
@@ -522,13 +531,13 @@
         </select>
       </div>
       <div style="flex:1; min-width:120px;">
-        <label>納期情報ID <span class="muted">(RMSの納期設定)</span></label>
+        <label>納期情報ID <span class="muted">(RMSの納期設定)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= rakuten?.normal_delivery_date_id || '' %>" placeholder="未設定可">
       </div>
     </div>
 
     <div class="field">
-      <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span></label>
+      <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
       <%
         const whiteBgTransferred = rakuten?.white_bg_drive_file_id
           && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
@@ -547,7 +556,7 @@
     </p>
 
     <div class="field">
-      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span></label>
+      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-m">手入力</span></label>
       <% if (shopCategories.length === 0) { %>
         <p class="muted" style="margin:4px 0;">
           カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
@@ -560,7 +569,7 @@
       <% } %>
     </div>
 
-    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span></label>
+    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
     <table class="list" id="rk-attrs" style="margin-bottom:8px;">
       <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
       <tbody>
