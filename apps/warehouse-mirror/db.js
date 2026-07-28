@@ -2498,6 +2498,13 @@ function createTables() {
 // 照合キー: 実データ検証 (2026-07-21, m_products 7166件 vs Excel 4897件) で
 //   大文字小文字違いの揺れが 1123 件あったため lower(trim(商品コード)) = code_key を PK にする。
 //   (feedback_sku_case_normalization と同じ罠。JS の .trim() は全角スペース U+3000 も除去)
+// SQLite の素の trim() は半角スペースしか落とさず、JS の .trim() (全角スペース U+3000 や NBSP も
+// 除去) と判定がズレる。trim(X, Y) は Y に含まれる文字を両端から全て除くので、空白の集合を渡して
+// 揃える (Codex R2/R3 Medium)。apps/inbound-info/db.js からも import して同じ集合を使う。
+//   半角(32) / タブ(9) / LF(10) / CR(13) / 垂直タブ(11) / 改頁(12) / NBSP(160) / 全角(12288)
+export const TRIM_WS_SQL =
+  'char(32)||char(9)||char(10)||char(11)||char(12)||char(13)||char(160)||char(12288)';
+
 function createInboundInfoTables() {
   // 入数マスタ本体。source: excel=初回移行 / auto=cron自動追加(未記入の新着) / manual=人が編集済み。
   // 「新着 (現場がまだ触っていない)」= source='auto' で表現するため、UI からの更新時に
@@ -2557,6 +2564,55 @@ function createInboundInfoTables() {
   // (本番は初回デプロイから version 入り DDL だが、addColumnIfMissing は冪等なので常置で無害)
   addColumnIfMissing('f_inbound_info', 'version', 'INTEGER NOT NULL DEFAULT 1');
   addColumnIfMissing('f_inbound_origin', 'version', 'INTEGER NOT NULL DEFAULT 1');
+
+  // いろは在庫化作業=「有り」の行は B-Faith 倉庫での入庫作業が発生しないため、
+  // BCシール / 直接ピックロケ / BF保管荷姿 を '－' (U+FF0D) で固定する (2026-07-28 中原さん指示)。
+  // 以降の書き込みは apps/inbound-info/db.js (updateInbound / importInboundRows) が保証するので、
+  // ここは移行済みの既存データを揃えるための backfill。条件付きなので 2 回目以降は 0 件更新
+  // (= 冪等) になる。楽観ロックの整合のため version も進める。
+  //
+  // 上書きする前の値は必ず控える (Codex R1 High: 起動時の破壊的更新を戻せる形にする)。
+  // code_key を PK にした INSERT OR IGNORE なので、控えるのは「最初に上書きした時の値」。
+  //
+  // TRIM_WS_SQL を挟んでいるのは、'　有り　' のような表記ゆれが backfill だけすり抜けるのを
+  // 防ぐため (Codex R2/R3 Medium。定義はこのファイル上部)。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS f_inbound_info_iroha_backup (
+      code_key                 TEXT PRIMARY KEY,
+      入庫時BCシール貼りフラグ TEXT,
+      直接ピックロケ保管       TEXT,
+      BF保管荷姿               TEXT,
+      backed_up_at             TEXT NOT NULL
+    )
+  `);
+  db.prepare(`
+    INSERT OR IGNORE INTO f_inbound_info_iroha_backup
+      (code_key, 入庫時BCシール貼りフラグ, 直接ピックロケ保管, BF保管荷姿, backed_up_at)
+    SELECT code_key, 入庫時BCシール貼りフラグ, 直接ピックロケ保管, BF保管荷姿,
+           strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      FROM f_inbound_info
+     WHERE trim(COALESCE(いろは在庫化作業有無, ''), ${TRIM_WS_SQL}) = '有り'
+       AND (COALESCE(入庫時BCシール貼りフラグ, '') <> '－'
+         OR COALESCE(直接ピックロケ保管, '')       <> '－'
+         OR COALESCE(BF保管荷姿, '')               <> '－')
+  `).run();
+  const irohaBackfill = db.prepare(`
+    UPDATE f_inbound_info
+       SET 入庫時BCシール貼りフラグ = '－',
+           直接ピックロケ保管       = '－',
+           BF保管荷姿               = '－',
+           version    = version + 1,
+           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+           updated_by = 'system(iroha-rule)'
+     WHERE trim(COALESCE(いろは在庫化作業有無, ''), ${TRIM_WS_SQL}) = '有り'
+       AND (COALESCE(入庫時BCシール貼りフラグ, '') <> '－'
+         OR COALESCE(直接ピックロケ保管, '')       <> '－'
+         OR COALESCE(BF保管荷姿, '')               <> '－')
+  `).run();
+  if (irohaBackfill.changes > 0) {
+    console.log(`[inbound-info] いろは在庫化=有り の ${irohaBackfill.changes} 件を「－」に揃えました`
+      + ' (上書き前の値は f_inbound_info_iroha_backup に控えています)');
+  }
 
   // 入荷予定 (Drive の nefuda.csv = 値札発行用データ)。取得ごとに full-replace する揮発キャッシュで、
   // 正本は Drive 側。f_inbound_info の「入荷予定のみ」絞り込みに使う。
