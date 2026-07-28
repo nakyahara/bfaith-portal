@@ -187,9 +187,9 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
     return 'ingested';
   }
 
-  const watchSet = MODE === 'watched'
-    ? new Set(db.prepare('SELECT asin FROM aba_watch_asins').all().map(r => r.asin))
-    : null;
+  // 取込開始時点の監視ASINスナップショット (両モードで使用)
+  const watchAsins = db.prepare('SELECT asin FROM aba_watch_asins').all().map(r => r.asin);
+  const watchSet = new Set(watchAsins);
 
   const insert = db.prepare(`
     INSERT OR REPLACE INTO aba_search_terms
@@ -197,52 +197,79 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
        asin, product_title, click_share, conversion_share)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const insertLedger = db.prepare(`
+    INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count)
+    VALUES (?, ?, datetime('now'), ?, ?, ?)
+  `);
+  // ⚠ スナップショットのASINだけを走査済みにする。全体UPDATEにすると解析中に
+  // router 側で登録されたASIN (このパスでは拾っていない) まで「出現なし」で確定し、
+  // 次週まで欠落する (Codex R6 high)。取込中登録分は初回照会スキャンが新ファイルを見る
+  const markScanned = db.prepare(`
+    UPDATE aba_watch_asins SET last_scanned_week = ?
+    WHERE asin = ? AND (last_scanned_week IS NULL OR last_scanned_week < ?)
+  `);
+  const zeroParsedError = (skippedRows) => new Error(skippedRows > 0
+    ? `全${skippedRows}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`
+    : '解析0行 (空レポート) — ABA週次が空になることは想定外のため要確認');
 
   let parsed = 0, kept = 0, termsKept = 0, skippedRows = 0;
 
-  // 保存行と完了台帳を単一トランザクションで確定する (Codex R1 medium):
-  //   - 途中失敗 → ROLLBACK で痕跡ゼロ (次回まっさらに再処理)
-  //   - 週の先頭で DELETE → 再生成レポートで消えた行・旧ロジックの行が残らない
-  // WAL なので処理中も router の読み取りはブロックされない。
-  // better-sqlite3 の .transaction() は async ストリームを跨げないため明示 BEGIN/COMMIT を使う。
-  db.exec('BEGIN IMMEDIATE');
   try {
-    db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+    if (MODE === 'watched') {
+      // watched: 該当行だけメモリに集め、書き込みは短い1トランザクションで確定する。
+      // 解析中 (数分〜数十分) に書込トランザクションを張りっぱなしにすると、WAL でも
+      // writer は単一のため router 側の watch 登録/キャッシュ書込が busy で失敗し続ける
+      // (Codex R6 medium)。監視分は高々数万行なのでメモリで安全
+      const keptRows = [];
+      const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
+        parsed += group.length;
+        if (!group.some(r => watchSet.has(r.asin))) return;
+        keptRows.push(...group);
+        termsKept++;
+      });
+      skippedRows = skipped;
+      // 全行 parse 不能は台帳に書かずハード失敗 (書くと「処理済み」でサイレント欠落が確定する)
+      if (parsed === 0) throw zeroParsedError(skippedRows);
 
-    const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
-      parsed += group.length;
-      if (watchSet && !group.some(r => watchSet.has(r.asin))) return;
-      for (const r of group) {
-        insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
-          r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
-          r.click_share, r.conversion_share);
-        kept++;
+      db.transaction(() => {
+        db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+        for (const r of keptRows) {
+          insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
+            r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
+            r.click_share, r.conversion_share);
+        }
+        kept = keptRows.length;
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
+      })();
+    } else {
+      // full: 数百万行はメモリに置けないため streaming insert + 明示 BEGIN/COMMIT
+      // (.transaction() は async を跨げない)。行データと台帳を単一txnで確定 (Codex R1 medium)。
+      // この間 router の書き込みは busy になり得るが、full は opt-in かつ朝バッチ帯のみ
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
+        const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
+          parsed += group.length;
+          for (const r of group) {
+            insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
+              r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
+              r.click_share, r.conversion_share);
+            kept++;
+          }
+          termsKept++;
+        });
+        skippedRows = skipped;
+        if (parsed === 0) throw zeroParsedError(skippedRows);
+        insertLedger.run(weekStart, weekEnd, termsKept, kept, parsed);
+        for (const a of watchAsins) markScanned.run(weekStart, a, weekStart);
+        db.exec('COMMIT');
+      } catch (e) {
+        try { db.exec('ROLLBACK'); } catch { /* BEGIN前の失敗等は無視 */ }
+        throw e;
       }
-      termsKept++;
-    });
-    skippedRows = skipped;
-
-    // 全行 parse 不能は台帳に書かずハード失敗 (書くと「処理済み」でサイレント欠落が確定する)
-    if (parsed === 0) {
-      throw new Error(skippedRows > 0
-        ? `全${skippedRows}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`
-        : '解析0行 (空レポート) — ABA週次が空になることは想定外のため要確認');
     }
-
-    db.prepare(`
-      INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count)
-      VALUES (?, ?, datetime('now'), ?, ?, ?)
-    `).run(weekStart, weekEnd, termsKept, kept, parsed);
-
-    // 監視ASINはこのパスで走査済み → 初回照会スキャンの対象から外す
-    db.prepare(`
-      UPDATE aba_watch_asins SET last_scanned_week = ?
-      WHERE last_scanned_week IS NULL OR last_scanned_week < ?
-    `).run(weekStart, weekStart);
-
-    db.exec('COMMIT');
   } catch (e) {
-    try { db.exec('ROLLBACK'); } catch { /* BEGIN前の失敗等は無視 */ }
     // 解析に失敗したファイルはスキャンにも使えないため残さない
     try { fs.unlinkSync(filePath); } catch { /* 無ければ無視 */ }
     throw e;

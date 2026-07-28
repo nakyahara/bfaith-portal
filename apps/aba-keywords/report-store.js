@@ -8,6 +8,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
 import { createGunzip } from 'zlib';
@@ -28,7 +29,8 @@ export function ensureReportsDir() {
 export async function downloadReportToFile(docUrl, isGzip, weekStart) {
   ensureReportsDir();
   const finalPath = path.join(REPORTS_DIR, `${weekStart}.json${isGzip ? '.gz' : ''}`);
-  const tmpPath = `${finalPath}.tmp-${process.pid}`;
+  // PIDだけだと同一プロセス内の並行DLで衝突するため乱数まで付ける (一意ID規約)
+  const tmpPath = `${finalPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
   const res = await fetch(docUrl, { signal: AbortSignal.timeout(15 * 60 * 1000) });
   if (!res.ok || !res.body) throw new Error(`レポートDL失敗: HTTP ${res.status}`);
   try {
@@ -71,9 +73,14 @@ export function cleanupReportFiles(keepN = 1) {
   for (const f of weeks.slice(keepN)) {
     try { fs.unlinkSync(path.join(REPORTS_DIR, f.name)); } catch { /* 使用中等は次回 */ }
   }
+  // tmp残骸は「十分古いもの」だけ回収する。無条件削除だと別プロセス (daily-sync と
+  // server が同じ DATA_DIR を見る) の進行中DLを消しかねない (Codex R6 medium)
+  const TMP_MAX_AGE_MS = 2 * 3600 * 1000;
   for (const name of entries) {
-    if (name.includes('.tmp-')) {
-      try { fs.unlinkSync(path.join(REPORTS_DIR, name)); } catch { /* 無視 */ }
-    }
+    if (!name.includes('.tmp-')) continue;
+    const fp = path.join(REPORTS_DIR, name);
+    try {
+      if (Date.now() - fs.statSync(fp).mtimeMs > TMP_MAX_AGE_MS) fs.unlinkSync(fp);
+    } catch { /* 消えていた等は無視 */ }
   }
 }

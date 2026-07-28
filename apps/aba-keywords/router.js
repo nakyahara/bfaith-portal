@@ -119,6 +119,7 @@ function sanitizeAsins(input, max = 100) {
 // ============================================================
 let scanRunning = null;             // 実行中スキャンチェーンの Promise
 let pendingScanAsins = new Set();   // 次のパスで拾うASIN
+let activeScanAsins = new Set();    // 実行中パスの対象ASIN (ポーリング再投入による重複パス防止 — Codex R6)
 const scanErrors = new Map();       // asin → 直近のスキャン失敗メッセージ
 
 const INSERT_TERM_SQL = `
@@ -153,20 +154,28 @@ async function scanPass(db, targets, file) {
 }
 
 function requestScan(db, asins) {
-  for (const a of asins) pendingScanAsins.add(a);
+  // 実行中パスが既に拾う予定のASINは再投入しない (ポーリングごとの重複パス防止)
+  for (const a of asins) {
+    if (!activeScanAsins.has(a)) pendingScanAsins.add(a);
+  }
   if (scanRunning) return;
   scanRunning = (async () => {
     while (pendingScanAsins.size > 0) {
-      const targets = pendingScanAsins;
+      activeScanAsins = pendingScanAsins;
       pendingScanAsins = new Set();
-      // ファイルはパスごとに取り直す (スキャン中に週次処理が新しい週を保存した場合に追随)
-      const file = findLatestReportFile();
-      if (!file) { for (const a of targets) scanErrors.set(a, 'レポートファイルなし (初回週次取込前)'); continue; }
       try {
-        await scanPass(db, targets, file);
+        // ファイルはパスごとに取り直す (スキャン中に週次処理が新しい週を保存した場合に追随)
+        const file = findLatestReportFile();
+        if (!file) {
+          for (const a of activeScanAsins) scanErrors.set(a, 'レポートファイルなし (初回週次取込前)');
+          continue;
+        }
+        await scanPass(db, activeScanAsins, file);
       } catch (e) {
         console.error('[aba-ext] scan失敗:', e.message);
-        for (const a of targets) scanErrors.set(a, e.message);
+        for (const a of activeScanAsins) scanErrors.set(a, e.message);
+      } finally {
+        activeScanAsins = new Set();
       }
     }
     scanRunning = null;
