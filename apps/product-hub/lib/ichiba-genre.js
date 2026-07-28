@@ -15,8 +15,21 @@
  * レート: 楽天ウェブサービスは 1req/秒目安 → 直列化 + 24h キャッシュ。
  */
 
+// ⚠️ ホスト事情 (2026-07-28 実測):
+//   - 新ホスト openapi.rakuten.co.jp/ichibams には IchibaItem はあるが **IchibaGenre は無い** (404)
+//   - 旧ホスト app.rakuten.co.jp は両方生きているが、Render の RAKUTEN_APP_ID は
+//     新システム (accessKey ペア) の ID なので旧ホストでは「specify valid applicationId」になる
+//   → 商品検索 = 新ホスト (ranking-checker と同じ資格情報で今すぐ動く)
+//     ジャンルツリー = 旧ホスト (専用の旧式 applicationId = env RAKUTEN_WS_APP_ID が必要)
 const ICHIBA_GENRE_URL = 'https://app.rakuten.co.jp/services/api/IchibaGenre/Search/20140222';
-const ICHIBA_ITEM_URL = 'https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601';
+const ICHIBA_ITEM_URL_NEW = 'https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260401';
+const ICHIBA_ITEM_URL_OLD = 'https://app.rakuten.co.jp/services/api/IchibaItem/Search/20220601';
+const ICHIBA_HEADERS = {
+  // ranking-checker の実績ヘッダー (新ホストはこれで通っている)
+  'Origin': 'https://rakuten.co.jp',
+  'Referer': 'https://rakuten.co.jp/',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+};
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const MIN_GAP_MS = 1100;
 
@@ -27,14 +40,16 @@ let queueDepth = 0;
 const MAX_QUEUE_DEPTH = 50;      // 操作集中時に待ち行列が伸び続けないための早期エラー
 let lastCallAt = 0;
 
-function appId() {
-  const v = (process.env.RAKUTEN_APP_ID || '').trim();
-  if (!v) {
-    const err = new Error('RAKUTEN_APP_ID が未設定です (ランキングチェッカーと共通の楽天ウェブサービスID)');
-    err.statusCode = 503;
-    throw err;
-  }
-  return v;
+// 旧式 (app.rakuten.co.jp) の applicationId。ジャンルツリー専用。
+// webservice.rakuten.co.jp で無料登録して Render env RAKUTEN_WS_APP_ID に設定する
+function wsAppId() {
+  return (process.env.RAKUTEN_WS_APP_ID || '').trim() || null;
+}
+// 新システム (openapi.rakuten.co.jp/ichibams) の資格情報。ranking-checker と共通
+function msCreds() {
+  const applicationId = (process.env.RAKUTEN_APP_ID || '').trim();
+  const accessKey = (process.env.RAKUTEN_ACCESS_KEY || '').trim();
+  return applicationId && accessKey ? { applicationId, accessKey } : null;
 }
 
 function serialized(fn) {
@@ -55,7 +70,7 @@ function serialized(fn) {
 async function ichibaGet(url) {
   return serialized(async () => {
     const doFetch = async () => {
-      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      const res = await fetch(url, { headers: ICHIBA_HEADERS, signal: AbortSignal.timeout(20_000) });
       const data = await res.json().catch(() => null);
       return { status: res.status, data, retryAfterMs: parseRetryAfterHeader(res.headers) };
     };
@@ -87,10 +102,17 @@ export async function fetchGenreChildren(genreId) {
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     return { ok: true, ...cached };
   }
+  const app = wsAppId();
+  if (!app) {
+    return {
+      ok: false, needsSetup: true,
+      error: 'ジャンルツリー用の楽天ウェブサービスID (RAKUTEN_WS_APP_ID) が未設定です。webservice.rakuten.co.jp でアプリ登録し、Render の env に設定してください',
+    };
+  }
   // 同じ未キャッシュIDへの並行要求は 1 回の API 呼び出しに束ねる (stampede 防止)
   if (inflight.has(id)) return inflight.get(id);
   const job = (async () => {
-    const url = `${ICHIBA_GENRE_URL}?applicationId=${encodeURIComponent(appId())}&genreId=${id}&format=json`;
+    const url = `${ICHIBA_GENRE_URL}?applicationId=${encodeURIComponent(app)}&genreId=${id}&format=json`;
     const r = await ichibaGet(url);
     if (r.status !== 200 || !r.data) {
       // 一時障害なら期限切れキャッシュで凌ぐ (無ければエラー)
@@ -143,11 +165,23 @@ export function genrePathOf(entry) {
 export async function suggestGenreByName(name, { maxCandidates = 3 } = {}) {
   const keyword = String(name || '').trim().slice(0, 100);
   if (!keyword) return { ok: false, error: '商品名が空です' };
-  const url = `${ICHIBA_ITEM_URL}?applicationId=${encodeURIComponent(appId())}`
-    + `&keyword=${encodeURIComponent(keyword)}&hits=30&format=json`;
+  // 新ホスト優先 (ranking-checker と同じ資格情報 = Render 設定済みで今すぐ動く)。
+  // 無ければ旧ホスト (RAKUTEN_WS_APP_ID)。両方無ければ設定案内
+  const ms = msCreds();
+  const ws = wsAppId();
+  let url;
+  if (ms) {
+    url = `${ICHIBA_ITEM_URL_NEW}?applicationId=${encodeURIComponent(ms.applicationId)}`
+      + `&accessKey=${encodeURIComponent(ms.accessKey)}&keyword=${encodeURIComponent(keyword)}&hits=30&format=json`;
+  } else if (ws) {
+    url = `${ICHIBA_ITEM_URL_OLD}?applicationId=${encodeURIComponent(ws)}`
+      + `&keyword=${encodeURIComponent(keyword)}&hits=30&format=json`;
+  } else {
+    return { ok: false, error: '楽天ウェブサービスの資格情報が未設定です (RAKUTEN_APP_ID+RAKUTEN_ACCESS_KEY または RAKUTEN_WS_APP_ID)' };
+  }
   const r = await ichibaGet(url);
   if (r.status !== 200 || !r.data) {
-    const msg = r.data?.error_description || r.data?.error || `HTTP ${r.status}`;
+    const msg = r.data?.errors?.errorMessage || r.data?.error_description || r.data?.error || `HTTP ${r.status}`;
     return { ok: false, error: `商品検索に失敗: ${msg}` };
   }
   const counts = new Map();
@@ -158,15 +192,7 @@ export async function suggestGenreByName(name, { maxCandidates = 3 } = {}) {
   }
   if (counts.size === 0) return { ok: true, candidates: [] };
   const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, maxCandidates);
-  // 各候補のフルパスをジャンルAPIで補完 (キャッシュが効く)
-  const candidates = [];
-  for (const [gid, count] of top) {
-    const g = await fetchGenreChildren(gid);
-    candidates.push({
-      genreId: gid,
-      path: g.ok ? genrePathOf(g) : null,
-      count,
-    });
-  }
-  return { ok: true, candidates };
+  // パスの補完は呼び出し側 (router) が RMS 属性辞書経由で行う
+  // (旧ホストIDが無くても動かすため。RMS 辞書は末端でないジャンルを 404 で弾く効果もある)
+  return { ok: true, candidates: top.map(([gid, count]) => ({ genreId: gid, count })) };
 }

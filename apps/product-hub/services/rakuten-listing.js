@@ -255,7 +255,7 @@ export function getCachedGenreAttributes(db, genreId, { maxAgeMs = null } = {}) 
  * 辞書を取得してキャッシュする (24h 以内のキャッシュがあればそれを返す。force で強制再取得)。
  * @returns {{ok:true, genre}|{ok:false, notFound?:true, error?:string}}
  */
-export async function fetchGenreAttributes(db, genreId, { force = false, fetcher = callWarehouse } = {}) {
+export async function fetchGenreAttributes(db, genreId, { force = false, fetcher = callWarehouse, timeoutMs = 120_000 } = {}) {
   const id = String(genreId ?? '').trim();
   if (!/^\d{1,12}$/.test(id)) return { ok: false, error: 'ジャンルIDは数字で指定してください' };
 
@@ -264,7 +264,7 @@ export async function fetchGenreAttributes(db, genreId, { force = false, fetcher
     if (cached) return { ok: true, genre: cached, cached: true };
   }
 
-  const r = await fetcher(`/service-api/rakuten-rms/genres/${id}/attributes${force ? '?refresh=1' : ''}`);
+  const r = await fetcher(`/service-api/rakuten-rms/genres/${id}/attributes${force ? '?refresh=1' : ''}`, { timeoutMs });
   if (r.status === 404) {
     // ジャンル廃止・非末端化。古い成功キャッシュを残すと「画面では見つからないのに
     // 登録時は古い辞書で判定する」矛盾になる (Codex R1 High-2) → 行ごと消す
