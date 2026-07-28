@@ -28,6 +28,7 @@ import {
   setItemVisibility, SHIPPING_METHOD_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes,
 } from './services/rakuten-listing.js';
+import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
@@ -549,6 +550,21 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   if (!draft) return;
   const db = getDB();
   const genreId = cleanText(req.body?.genre_id, 20);
+  // genre_only: ジャンルIDだけ更新 (AI提案/ツリー反映用 — 編集途中の他フィールドを巻き込まない)
+  if (req.body?.genre_only === true) {
+    if (!genreId || !/^\d+$/.test(genreId)) {
+      return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
+    }
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, genre_id) VALUES (?, ?)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        genre_id = excluded.genre_id,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, genreId);
+    logEvent(db, draft.id, 'rakuten_genre_set', genreId, actorOf(req));
+    return res.json({ ok: true });
+  }
+
   if (genreId && !/^\d+$/.test(genreId)) {
     return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
   }
@@ -682,6 +698,34 @@ router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
 });
 
 // 送信内容のプレビュー (dry run — RMS には送らない)
+// ジャンルツリー: 子ジャンル一覧 (IchibaGenre/Search。genre_id=0 が最上位)。
+// RMS ナビゲーションAPI は root 以外の子を返さないため公開APIを使う (ID体系は同一)
+router.get('/api/rakuten/genre-children', async (req, res) => {
+  const genreId = cleanText(req.query?.genre_id, 12) || '0';
+  try {
+    const r = await fetchGenreChildren(genreId);
+    if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
+    res.json({ ok: true, current: r.current, parents: r.parents, children: r.children, path: genrePathOf(r) });
+  } catch (e) {
+    const status = e?.statusCode === 503 ? 503 : 502;
+    res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
+  }
+});
+
+// ジャンル候補の自動提案 (AI初期値): 商品名で楽天市場を検索し上位ヒットのジャンル多数決
+router.get('/api/drafts/:id/rakuten/genre-suggest', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await suggestGenreByName(draft.name);
+    if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
+    res.json({ ok: true, candidates: r.candidates });
+  } catch (e) {
+    const status = e?.statusCode === 503 ? 503 : 502;
+    res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
+  }
+});
+
 // ジャンル属性辞書の取得 (Genre API)。取得結果は ph_genre_attributes にキャッシュされ、
 // buildItemPayload の事前検証 (IE1002防止・必須属性チェック・カタログID自動付与) に効く
 router.get('/api/rakuten/genre-attributes', async (req, res) => {
