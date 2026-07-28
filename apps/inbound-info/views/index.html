@@ -103,7 +103,7 @@
   <div>
     <a href="/" class="back">← B-Faithポータルに戻る</a>
     <h1>📥 入庫情報管理</h1>
-    <div class="sub">新商品の追加・入荷予定(nefuda.csv)の取得・入荷予定リストPDFの保存は
+    <div class="sub">新商品の追加・入荷予定(nefuda.csv)の取得・値札印刷用CSV(nefudaprint.csv)と入荷予定リストPDFの保存は
       <b id="hdr-time">毎日</b> に自動実行されます (時刻は「⚙️ 自動実行」タブで変更できます)</div>
   </div>
   <div class="chips">
@@ -191,6 +191,7 @@
   <ol style="margin:0 0 14px; padding-left:22px; font-size:14px">
     <li>NE商品マスタ(ミラー)から<b>新商品を追加</b></li>
     <li>Google ドライブの <span class="code">nefuda.csv</span> を読んで<b>入荷予定を更新</b></li>
+    <li><b>値札印刷用CSV (<span class="code">nefudaprint.csv</span>) を作成して、同じフォルダに上書き保存</b></li>
     <li><b>入荷予定リストのPDFを作成して、同じフォルダに上書き保存</b></li>
   </ol>
   <div class="msg" id="msg-auto"></div>
@@ -199,6 +200,9 @@
       <label for="set-time" style="font-weight:700; font-size:14px">実行時刻</label>
       <input type="time" id="set-time" step="60" style="width:120px; font-size:15px">
       <span class="hint" style="margin-top:0">JST。倉庫の朝の同期(7:00)より後にしてください</span>
+    </div>
+    <div class="toolbar" style="margin-bottom:6px">
+      <label style="font-size:14px"><input type="checkbox" id="set-nefuda-print" style="width:auto"> 値札印刷用CSV (nefudaprint.csv) を作成してDriveに上書き保存する</label>
     </div>
     <div class="toolbar" style="margin-bottom:6px">
       <label style="font-size:14px"><input type="checkbox" id="set-pdf" style="width:auto"> PDFを作成してDriveに上書き保存する</label>
@@ -210,6 +214,28 @@
     <p class="hint" id="set-readonly" style="display:none">
       ⚠ 実行時刻は全社共通の設定のため、変更は管理者のみです (表示は誰でも確認できます)。</p>
     <p class="hint" id="set-envnote" style="display:none"></p>
+  </div>
+
+  <h2 style="margin-top:20px">値札印刷用CSV (nefudaprint.csv)</h2>
+  <div class="set-box">
+    <p style="margin-top:0; font-size:14px">
+      保存先: <span class="code" id="np-dest">–</span>
+      (<span class="code">nefuda.csv</span> と同じフォルダ。毎回同じファイルを上書きします)
+    </p>
+    <p class="hint"><span class="code">nefuda.csv</span> の 商品ID・商品名・バーコード・有効期限 に、
+      <b>この画面の入数</b>を足した6列 (商品ID / 商品名 / JAN / FNSKU / 有効期限 / 入数) で出力します。
+      バーコードは英字を含めば FNSKU、数字だけなら JAN に振り分けます。文字コードは Shift_JIS。</p>
+    <p class="hint">🚚「最新の入荷予定を取得」を押した時にも自動で作り直します。
+      入数を直した後にもう一度作りたい時は下のボタンを押してください。</p>
+    <p class="hint">⚠ 以前は GAS (<span class="code">processNefudaCsv</span>) が旧スプレッドシート「入数マスタ」の入数で
+      作っていました。<b>そちらのトリガーは止めてください</b> (両方動くと古い入数で上書きされます)。</p>
+    <div class="toolbar">
+      <button class="btn-orange" id="btn-np-now" onclick="exportNefudaPrintNow()">今すぐ値札印刷用CSVを作成してDriveに保存</button>
+      <a class="btn-blue btn-sm" href="/apps/inbound-info/api/nefuda-print/preview" target="_blank"
+         style="text-decoration:none; padding:9px 14px; border-radius:6px; color:#fff; font-weight:700; font-size:13px">
+        中身を確認 (保存しない)</a>
+    </div>
+    <p class="hint" id="np-state">–</p>
   </div>
 
   <h2 style="margin-top:20px">入荷予定リストPDF</h2>
@@ -580,6 +606,15 @@ function showScheduleFilter() {
   state.filter = 'scheduled';
   state.offset = 0;
 }
+// 入荷予定の取得に付随して作り直した値札印刷用CSVの結果 (取得自体は成功しているので添えるだけ)
+function nefudaPrintNote(np) {
+  if (!np || np.skipped) return '';
+  if (np.ok) {
+    return `\n値札印刷用CSV (${np.filename}) も作り直しました: ${np.rows}件`
+      + (np.missing_irisu ? ` (うち入数が空 ${np.missing_irisu}件 — 入数を入れてから作り直してください)` : '');
+  }
+  return `\n⚠ 値札印刷用CSVの保存に失敗しました: ${np.error} (Drive上のファイルは前回のままです)`;
+}
 async function refreshSchedule() {
   if (!confirmDiscard()) return;
   const btn = document.getElementById('btn-sched');
@@ -589,7 +624,8 @@ async function refreshSchedule() {
     let m = `入荷予定を更新しました: ${r.schedule_rows}件 (CSV更新 ${r.file.modified_time_jst})\nCSVの並び順で表示しています`;
     if (r.added_to_master > 0) m += `\n入庫マスタに未登録だった ${r.added_to_master} 件を「新着」として追加しました`;
     if (r.not_in_master.length) m += `\n⚠ NE商品マスタに見つからないコード: ${r.not_in_master.join(', ')} (コード誤りの可能性)`;
-    showMsg('msg-list', 'ok', m);
+    m += nefudaPrintNote(r.nefuda_print);
+    showMsg('msg-list', r.nefuda_print?.ok === false ? 'err' : 'ok', m);
     await loadScheduleInfo();
     showScheduleFilter();
     await loadList(); loadStats();
@@ -772,15 +808,19 @@ async function loadSettings() {
     const { result } = await api('/settings');
     document.getElementById('set-time').value = result.time;
     document.getElementById('set-pdf').checked = result.pdf_enabled !== false;
+    document.getElementById('set-nefuda-print').checked = result.nefuda_print_enabled !== false;
     // 時刻設定は管理者のみ変更可 (それ以外は表示だけ)
     const canEdit = result.can_edit !== false;
     document.getElementById('set-time').disabled = !canEdit;
     document.getElementById('set-pdf').disabled = !canEdit;
+    document.getElementById('set-nefuda-print').disabled = !canEdit;
     document.getElementById('btn-set-save').disabled = !canEdit;
     document.getElementById('set-readonly').style.display = canEdit ? 'none' : 'block';
     document.getElementById('set-saved').textContent = result.updated_at
       ? `最終更新 ${jst(result.updated_at)}${result.updated_by ? ` (${result.updated_by})` : ''}` : '未設定 (既定 09:00)';
     document.getElementById('pdf-dest').textContent = result.pdf.filename;
+    document.getElementById('np-dest').textContent = result.nefuda_print.filename;
+    renderNefudaPrintState(result.nefuda_print.state);
     const note = document.getElementById('set-envnote');
     if (result.env_override) {
       note.style.display = 'block';
@@ -807,13 +847,46 @@ function renderPdfState(st) {
     el.textContent = `❌ ${jst(st.saved_at)} 失敗: ${st.error || '(理由不明)'}`;
   }
 }
+// 値札印刷用CSV の最終保存状態。入数が引けなかった件数も出す (入数未記入に気付けるように)
+function renderNefudaPrintState(st) {
+  const el = document.getElementById('np-state');
+  if (!st) { el.textContent = 'まだ一度も保存していません'; return; }
+  if (st.ok) {
+    el.textContent = `✅ 最終保存 ${jst(st.saved_at)} — ${st.filename} (${st.row_count}件`
+      + `${st.missing_irisu ? ` / うち入数が空 ${st.missing_irisu}件` : ''}`
+      + ` / ${Math.round((st.bytes || 0) / 1024)}KB`
+      + `${st.folder_name ? ` / 保存先フォルダ「${st.folder_name}」` : ''})${st.saved_by ? ` [${st.saved_by}]` : ''}`
+      + (st.formula_cells ? `\n⚠ 先頭が = + - @ (タブ・CRを含む) のセルが ${st.formula_cells} 個あります`
+        + ' (値札ソフト向けにそのまま出していますが、Excelで開くと数式として解釈され得ます)' : '');
+    el.style.whiteSpace = 'pre-wrap';
+  } else {
+    el.textContent = `❌ ${jst(st.saved_at)} 失敗: ${st.error || '(理由不明)'}`;
+  }
+}
+async function exportNefudaPrintNow() {
+  const btn = document.getElementById('btn-np-now');
+  btn.disabled = true;
+  showMsg('msg-auto', 'info', '値札印刷用CSVを作成してDriveに保存しています…');
+  try {
+    const r = await api('/nefuda-print/export', { method: 'POST' });
+    showMsg('msg-auto', 'ok', `${r.action === 'created' ? '新規作成' : '上書き保存'}しました: ${r.filename}`
+      + ` (${r.rows}件${r.missingIrisu ? ` / うち入数が空 ${r.missingIrisu}件` : ''}`
+      + ` / ${Math.round(r.bytes / 1024)}KB${r.folderName ? ` / フォルダ「${r.folderName}」` : ''})`);
+    loadSettings();
+  } catch (e) {
+    showMsg('msg-auto', 'err', '値札印刷用CSVの保存に失敗しました: ' + (e.detail || e.message));
+    loadSettings();
+  } finally { btn.disabled = false; }
+}
 async function saveSettings() {
   const time = document.getElementById('set-time').value;
   const pdf_enabled = document.getElementById('set-pdf').checked;
+  const nefuda_print_enabled = document.getElementById('set-nefuda-print').checked;
   try {
     const r = await api('/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ time, pdf_enabled }) });
+      body: JSON.stringify({ time, pdf_enabled, nefuda_print_enabled }) });
     let m = `保存しました。毎日 ${r.time} に自動実行します`;
+    if (!r.nefuda_print_enabled) m += ' (値札印刷用CSVの保存は無効)';
     if (!r.pdf_enabled) m += ' (PDF保存は無効)';
     if (r.cron && !r.cron.started) {
       m += r.cron.reason === 'disabled_by_env'

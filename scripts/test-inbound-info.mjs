@@ -516,4 +516,130 @@ for (const t of ['f_inbound_info', 'f_inbound_info_iroha_backup']) {
   db3.prepare(`DELETE FROM ${t} WHERE code_key IN ('irohatest01', 'irohaws01', 'irohaws02')`).run();
 }
 
+// ─── 11. 値札印刷用CSV (nefudaprint.csv) — 旧 GAS processNefudaCsv の置き換え (2026-07-28) ───
+// nefuda.csv (4列) + この画面の入数 → 6列 (商品ID/商品名/JAN/FNSKU/有効期限/入数)、Shift_JIS。
+// 現場の値札印刷ソフトが読むファイルなので、書式は旧 GAS と1バイトも変えない。
+console.log('\n[11] 値札印刷用CSV (nefudaprint.csv)');
+const { buildNefudaPrintCsv, OUT_HEADER, NEFUDA_PRINT_FILENAME } = await import('../apps/inbound-info/nefuda-print.js');
+const { regenerateNefudaPrint } = await import('../apps/inbound-info/nefuda-fetch.js');
+const { irisuMap, nefudaPrintState, saveNefudaPrintState } = await import('../apps/inbound-info/db.js');
+
+const npDb = getMirrorDB();
+const nowN = new Date().toISOString();
+const insNp = npDb.prepare(`
+  INSERT INTO f_inbound_info (code_key, 商品コード, 商品名, 入数, source, created_at, updated_at)
+  VALUES (?, ?, ?, ?, 'excel', ?, ?)
+  ON CONFLICT(code_key) DO UPDATE SET 入数 = excluded.入数, 商品名 = excluded.商品名
+`);
+insNp.run('npjan01', 'npJAN01', 'JAN商品', 24, nowN, nowN);       // JAN + 入数あり
+insNp.run('npfnsku01', 'npFNSKU01', 'FNSKU商品', 6, nowN, nowN);  // FNSKU + 入数あり
+insNp.run('npnoirisu01', 'npNoIrisu01', '入数未記入', null, nowN, nowN);
+
+const npRows = [
+  { 商品コード: 'npJAN01', 商品名: 'JAN商品', バーコード: '4532416200201', 有効期限: '' },
+  { 商品コード: 'npFNSKU01', 商品名: 'FNSKU商品', バーコード: 'X001976RMN', 有効期限: '2027-01-31' },
+  { 商品コード: 'npNoIrisu01', 商品名: '入数未記入', バーコード: '4900000000001', 有効期限: '' },
+  { 商品コード: 'npGhost01', 商品名: 'マスタに無い商品', バーコード: '', 有効期限: '' },
+  // 大文字小文字違いでも入数が引ける (code_key 照合) / 引用符が要る商品名
+  { 商品コード: 'NPJAN01', 商品名: 'カンマ, と "引用符" を含む商品', バーコード: '4900000000002', 有効期限: '' },
+];
+const np = buildNefudaPrintCsv(npRows);
+const npText = iconv.decode(np.buffer, 'Shift_JIS');
+const npLines = npText.split('\r\n');
+
+ok(npLines[0] === OUT_HEADER.join(','), `ヘッダは6列 (${npLines[0]})`);
+ok(npLines[1] === 'npJAN01,JAN商品,4532416200201,,,24', `数字だけのバーコードは JAN 列 + 入数を補完 (${npLines[1]})`);
+ok(npLines[2] === 'npFNSKU01,FNSKU商品,,X001976RMN,2027-01-31,6', `英字を含むバーコードは FNSKU 列 (${npLines[2]})`);
+ok(npLines[3] === 'npNoIrisu01,入数未記入,4900000000001,,,', '入数未記入なら空欄 (旧GASと同じ)');
+ok(npLines[4] === 'npGhost01,マスタに無い商品,,,,', 'マスタに無いコード / バーコード空は該当列を空に');
+ok(npLines[5] === 'NPJAN01,"カンマ, と ""引用符"" を含む商品",4900000000002,,,24',
+  '大文字小文字違いでも入数を引ける + カンマ/引用符のエスケープ');
+ok(np.rows === 5 && np.missingIrisu === 2, `件数と入数が空の件数 (rows=${np.rows}, missing=${np.missingIrisu})`);
+ok(!npText.endsWith('\r\n') && npLines.length === 6, '末尾に余分な改行を付けない (旧GASと同じ)');
+ok(np.buffer.includes(Buffer.from('JAN商品', 'utf8')) === false
+  && iconv.decode(np.buffer, 'Shift_JIS').includes('JAN商品'), '出力は Shift_JIS (UTF-8 ではない)');
+
+// 旧 GAS のロジックをそのまま書き下したものと1バイトも違わないこと (移植の等価性)
+function gasReference(rows, master) {
+  const esc = (v) => {
+    if (v === null || v === undefined) return '';
+    const s = String(v);
+    return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const out = [['商品ID', '商品名', 'JAN', 'FNSKU', '有効期限', '入数']];
+  for (const r of rows) {
+    const id = String(r.商品コード ?? '').trim();
+    const barcode = String(r.バーコード ?? '').trim();
+    let irisu = '';
+    if (id) irisu = master.has(id) ? master.get(id) : '';
+    let jan = '', fnsku = '';
+    if (/[A-Za-z]/.test(barcode)) fnsku = barcode;
+    else if (/^[0-9]+$/.test(barcode)) jan = barcode;
+    out.push([id, r.商品名 ?? '', jan, fnsku, r.有効期限 ?? '', irisu]);
+  }
+  return out.map((r) => r.map(esc).join(',')).join('\r\n');
+}
+// 旧 GAS の master は「シートの商品コードそのまま」で突合していたので、同じ表記で用意する
+const gasMaster = new Map([['npJAN01', 24], ['npFNSKU01', 6], ['NPJAN01', 24]]);
+ok(gasReference(npRows, gasMaster) === npText, '旧 GAS processNefudaCsv の出力と完全一致 (移植の等価性)');
+
+// 入数を画面で直すと次の出力に反映される (= 入数の正がスプレッドシートからこの画面に移った)
+const npTarget = getInbound('npjan01');
+updateInbound('npjan01', { 入数: '48' }, 'tester', npTarget.version);
+ok(iconv.decode(buildNefudaPrintCsv([npRows[0]]).buffer, 'Shift_JIS').endsWith(',48'),
+  '画面で入数を直すと値札印刷用CSVに反映される');
+ok(irisuMap().get('npjan01') === 48, 'irisuMap は code_key で引ける');
+
+// Excel で数式扱いされ得る先頭文字は「数えるだけ」(旧GASとのバイト等価性を壊さない — Codex R1 Medium)
+const npFormula = buildNefudaPrintCsv([
+  { 商品コード: 'npJAN01', 商品名: '=HYPERLINK("x")', バーコード: '1', 有効期限: '' },
+  { 商品コード: 'npJAN01', 商品名: '+81 対応品', バーコード: '1', 有効期限: '' },
+  { 商品コード: 'npJAN01', 商品名: '普通の商品名', バーコード: '1', 有効期限: '' },
+]);
+ok(npFormula.formulaCells === 2, `数式に見えるセルを数える (${npFormula.formulaCells}個)`);
+ok(iconv.decode(npFormula.buffer, 'Shift_JIS').includes('=HYPERLINK("x")') === false
+  && iconv.decode(npFormula.buffer, 'Shift_JIS').includes('"=HYPERLINK(""x"")"'),
+  '数式に見える値も書き換えない (引用符のエスケープだけ)');
+
+// nefuda.csv が取れない時は Drive を触らず失敗を記録する (既存の値札CSVを壊さない)
+saveNefudaPrintState({ ok: true, filename: 'nefudaprint.csv', rows: 1, bytes: 1, user: 'keep-before' });
+let npThrew = false;
+try {
+  await regenerateNefudaPrint('tester'); // この環境は GOOGLE_SERVICE_ACCOUNT_KEY 無し
+} catch (e) {
+  npThrew = true;
+}
+ok(npThrew && nefudaPrintState().ok === 0 && nefudaPrintState().saved_by === 'tester',
+  '「今すぐ作成」で nefuda.csv が取れない時は失敗を記録して Drive に触らない');
+
+// 保存状態の記録 (成功/失敗どちらも上書き。画面の「最終保存」表示用)
+saveNefudaPrintState({ ok: false, error: 'テスト失敗', filename: NEFUDA_PRINT_FILENAME(), user: 'tester' });
+ok(nefudaPrintState().ok === 0 && nefudaPrintState().error === 'テスト失敗', '値札CSV状態: 失敗を記録');
+saveNefudaPrintState({ ok: true, filename: 'nefudaprint.csv', rows: 5, missing_irisu: 2, bytes: 300,
+  file_id: 'fid', folder_name: 'F', user: 'tester' });
+const nps = nefudaPrintState();
+ok(nps.ok === 1 && nps.row_count === 5 && nps.missing_irisu === 2 && nps.error === null,
+  '値札CSV状態: 成功で上書き (前回のエラーは消える)');
+
+// 設定: 既定ON / 保存と読み出し
+ok(getJobSettings().nefuda_print_enabled === true, '設定: 値札印刷用CSVは既定ON');
+saveJobSettings({ time: '08:05', pdf_enabled: true, nefuda_print_enabled: false }, 'tester');
+ok(getJobSettings().nefuda_print_enabled === false, '設定: 値札印刷用CSVをOFFにできる');
+saveJobSettings({ time: '08:05', pdf_enabled: true, nefuda_print_enabled: true }, 'tester');
+
+// 日次ジョブ: CSV取得が失敗した日は Drive の値札CSVを上書きしない (PDF と同じ扱い)
+saveNefudaPrintState({ ok: true, filename: 'nefudaprint.csv', rows: 99, bytes: 1, user: 'before' });
+await runDailyJob(); // この環境は GOOGLE_SERVICE_ACCOUNT_KEY 無し = nefuda 取得は必ず失敗する
+const npAfterFail = nefudaPrintState();
+ok(npAfterFail.ok === 0 && /取得に失敗したため、値札印刷用CSVは更新していません/.test(npAfterFail.error),
+  'CSV取得失敗時: 値札CSVを上書きせず理由を記録');
+ok(npAfterFail.row_count === null, 'CSV取得失敗時: 前回の成功件数を「成功」として残さない');
+// 無効にしていれば状態も触らない
+saveNefudaPrintState({ ok: true, filename: 'nefudaprint.csv', rows: 5, bytes: 1, user: 'keep' });
+saveJobSettings({ time: '08:05', pdf_enabled: false, nefuda_print_enabled: false }, 'tester');
+await runDailyJob();
+ok(nefudaPrintState().saved_by === 'keep', '値札印刷用CSVを無効にしていれば状態を上書きしない');
+saveJobSettings({ time: '08:05', pdf_enabled: true, nefuda_print_enabled: true }, 'tester');
+for (const c of ['npjan01', 'npfnsku01', 'npnoirisu01']) deleteInbound(c);
+
 console.log(`\n🎉 全 ${passed} 項目 PASS`);

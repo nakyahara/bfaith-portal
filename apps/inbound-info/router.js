@@ -15,9 +15,13 @@ import { fileURLToPath } from 'url';
 import {
   stats, listInbound, getInbound, updateInbound, addManual, deleteInbound, syncNewProducts,
   listOrigin, upsertOrigin, deleteOrigin, scheduleState, pdfState, getJobSettings, saveJobSettings,
+  nefudaPrintState,
 } from './db.js';
-import { getNefudaInfo, refreshNefudaSchedule } from './nefuda-fetch.js';
+import {
+  getNefudaInfo, refreshNefudaSchedule, regenerateNefudaPrint, previewNefudaPrint,
+} from './nefuda-fetch.js';
 import { exportSchedulePdfToDrive, buildSchedulePdf, PDF_FILENAME, PDF_FOLDER_ID } from './schedule-pdf.js';
+import { NEFUDA_PRINT_FILENAME, NEFUDA_PRINT_FOLDER_ID } from './nefuda-print.js';
 import { applyInboundInfoSchedule, effectiveSchedule } from './sync-job.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -160,6 +164,8 @@ router.get('/api/schedule/info', async (req, res) => {
 });
 
 // 最新の nefuda.csv を取得して入荷予定を置換 (UI ボタン。cron と同一実体)
+// 取得に成功したら値札印刷用CSV (nefudaprint.csv) も作り直す。nefuda.csv が変わったら
+// 値札CSVも追随する、という旧 GAS と同じ関係を保つため (best-effort: 失敗しても取得自体は成功扱い)。
 router.post('/api/schedule/refresh', async (req, res) => {
   try {
     const r = await refreshNefudaSchedule(currentUser(req));
@@ -167,12 +173,40 @@ router.post('/api/schedule/refresh', async (req, res) => {
       // stale_file: 反映済みの方が新しい (並行実行の後追い)。データは最新のまま
       return res.status(409).json(r);
     }
-    res.json(r);
+    res.json(r); // r.nefuda_print に値札CSVの結果が入る (同じ nefuda.csv から同一ロック内で生成)
   } catch (e) {
     console.error('[inbound-info] schedule refresh', e.message);
     // lib/drive-csv.js の VALIDATION (ファイル無し・サイズ超過等) は利用者に読める文で返す
     const status = e.code === 'VALIDATION' ? 400 : 502;
     res.status(status).json({ ok: false, error: 'drive_error', message: e.message });
+  }
+});
+
+// ─── 値札印刷用CSV (nefudaprint.csv) ───
+// nefuda.csv を取り直して作り直す。UI の「今すぐ値札印刷用CSVを作成」ボタン用
+// (入数を画面で直した後に刷り直すケース。入荷予定の取り込みは行わない)。
+router.post('/api/nefuda-print/export', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await regenerateNefudaPrint(currentUser(req))) });
+  } catch (e) {
+    console.error('[inbound-info] nefudaprint export', e.message);
+    res.status(502).json({ ok: false, error: 'nefuda_print_export_failed', message: e.message });
+  }
+});
+
+// 保存せず中身を確認する用 (Drive に触らない)。旧 GAS の出力と見比べて切り替え判断するため。
+// 現場の値札ソフトが Shift_JIS を読むので、ダウンロードも同じバイト列で返す。
+router.get('/api/nefuda-print/preview', async (req, res) => {
+  try {
+    const built = await previewNefudaPrint();
+    res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+    res.setHeader('Content-Disposition', `attachment; filename="${NEFUDA_PRINT_FILENAME()}"`);
+    res.setHeader('Cache-Control', 'private, no-store'); // 在庫情報を含むので共有キャッシュに残さない
+    res.send(built.buffer);
+  } catch (e) {
+    console.error('[inbound-info] nefudaprint preview', e.message);
+    const status = e.code === 'VALIDATION' ? 400 : 502;
+    res.status(status).json({ ok: false, error: 'nefuda_print_build_failed', message: e.message });
   }
 });
 
@@ -187,6 +221,8 @@ router.get('/api/settings', (req, res) => {
       env_override: eff.source === 'env' ? eff.expr : null,
       can_edit: isAdmin(req), // 時刻設定を変更できるか (画面で入力を無効化するため)
       pdf: { filename: PDF_FILENAME(), folder_id: PDF_FOLDER_ID() },
+      nefuda_print: { filename: NEFUDA_PRINT_FILENAME(), folder_id: NEFUDA_PRINT_FOLDER_ID(),
+                      state: nefudaPrintState() },
       state: pdfState(),
       // 手動でPDFを出すときに「いつ取得したCSVの内容か」が分かるように添える
       schedule: scheduleState(),
