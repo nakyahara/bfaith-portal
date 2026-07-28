@@ -660,6 +660,11 @@ function initLedgerSchema(db) {
     updated_at    TEXT NOT NULL,
     UNIQUE (supplier_code, vendor_code_norm)
   )`);
+  // 仮商品コード (中原さん要望 2026-07-28)。新商品はNE登録を待たずに弊社の商品コードを決めておき、
+  // 入荷予定の貼り付けデータ (商品ID/入荷予定数/仕入単価) に含めて出力する。
+  // provisional_qty_per_unit = 先方数量1あたりの弊社個数。対応表へ昇格するとき qty_per_unit へ引き継ぐ
+  addCol(db, 'po_vendor_code_pending', 'provisional_product_code', 'TEXT');
+  addCol(db, 'po_vendor_code_pending', 'provisional_qty_per_unit', 'REAL');
 
   // 出荷明細メール (AMC/ビーフリーからの入荷予定の元データ。Gmail readonly で自動取得し解析結果を保持。
   // gmail_id UNIQUE = 同じメールを二重処理しない冪等キー)
