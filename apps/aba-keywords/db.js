@@ -39,6 +39,14 @@ export function closeAbaDB() {
   if (db) { try { db.close(); } catch { /* 既closeは無視 */ } db = null; }
 }
 
+/** 列が無ければ ALTER で追加。追加したときだけ true (warehouse/db.js の同名ヘルパ準拠) */
+function addColumnIfMissing(table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some(c => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+  return true;
+}
+
 function createTables() {
   // 週の取込台帳 (冪等キー)。台帳に行がある週は処理済みとして再取得しない。
   // parsed_count = レポート全体の行数 / row_count = 保存した行数 (watchedモードでは監視分のみ)
@@ -83,6 +91,15 @@ function createTables() {
       last_scanned_week TEXT
     );
   `);
+
+  // #630 (全量蓄積版) が先に aba.db を作成済みの環境向けの追い付き migration。
+  // CREATE TABLE IF NOT EXISTS は既存表に列を足さないため PRAGMA で確認して ALTER する
+  if (addColumnIfMissing('aba_weeks', 'parsed_count', 'INTEGER NOT NULL DEFAULT 0')) {
+    // 旧版の週は parsed_count が無い (=0)。全量蓄積版は保存行数≈解析行数なので row_count で埋める
+    // (0のままだと /reverse の週一覧 (parsed_count>0) から既存週が消える)
+    db.exec('UPDATE aba_weeks SET parsed_count = row_count WHERE parsed_count = 0');
+  }
+  addColumnIfMissing('aba_watch_asins', 'last_scanned_week', 'TEXT');
 
   // 検索結果ページ用: SP-API Catalog Items のキャッシュ (BSR/梱包/ブランド)
   db.exec(`
