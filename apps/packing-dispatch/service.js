@@ -10,7 +10,7 @@ import {
   finalizeLine, classifyOrder, shippingMethodMap, mallGroupOf, isLineGift,
   saveAssortDecision, comboKeyOf, listUnregistered, mirrorFreshness,
   recordAssortUsage, comboKeysByOrderRef, getAssortByCombo, purgeOldUsage,
-  COL, MALL_GROUPS, COMBO_KEY_VERSION,
+  COL, MALL_GROUPS, COMBO_KEY_VERSION, AES_NONMAIL_PM,
 } from './db.js';
 import { parseNeCsv, buildNeCsv, decodeCp932 } from './csv.js';
 
@@ -478,12 +478,20 @@ export function buildExportCsv(batch_id, opts = {}) {
   if (lineRows.length !== b.row_count) throw vErr('行数不整合のため出力中止 (取込時と異なります)');
 
   const smMap = shippingMethodMap();
+  // AES(メール便以外) の梱包機マーカー名 (91列に書く値)。マスタから引く。
+  const aesNonmailRow = db.prepare(`SELECT name_csv FROM pd_packing_machine WHERE code=?`).get(AES_NONMAIL_PM);
+  const aesNonmailName = aesNonmailRow ? aesNonmailRow.name_csv : '手動出荷（AESメール便以外）';
   // 元 raw を1行目=ヘッダとして復元するため、row_no 0..n を raw_cols から再構築 + ヘッダは別途必要
   // raw_cols はデータ行のみ。ヘッダは保持していないので、出力ヘッダは取込時のヘッダを使う必要がある。
   const headerRow = JSON.parse(b.header_json || 'null');
   const outRows = lineRows.map((l) => {
     const raw = JSON.parse(l.raw_cols);
-    if (l.shipping_method_code && l.shipping_method_code !== 'aes') {
+    if (l.shipping_method_code === 'aes') {
+      // AES は原則 raw 完全パススルー (連動列 34/17/76/92 は絶対に触らない)。
+      // 例外: 判定で manual_aes_nonmail が付いた 1点物のみ、梱包機マーカー(91列)だけ書く
+      // (メール便サイズ外の AES をロジザード側で別レーンに仕分けるため)。
+      if (l.packing_machine_code === AES_NONMAIL_PM) raw[COL.packing] = aesNonmailName;
+    } else if (l.shipping_method_code) {
       let pm = l.packing_machine_code;
       if (isLineGift(l.shop_name)) pm = 'manual';                // LINEギフトは必ず手動出荷 (安全網)
       // 沖縄県宛 × ネコポス は梱包機マーカーを「手動出荷」に矯正。

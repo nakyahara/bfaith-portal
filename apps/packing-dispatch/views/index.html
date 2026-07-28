@@ -646,6 +646,7 @@
           <tr><td>学習済</td><td>過去のアソート学習を流用</td><td>そのままでOK (内容に違和感があれば修正可能)</td></tr>
           <tr><td>沖縄/北海道→要目視確認</td><td>地域別運賃の配送方法をレターパックに振替候補</td><td>後述「特例ルール」参照</td></tr>
           <tr><td>AES対象外</td><td>AES配送は変更しない</td><td>そのまま (変更不可)</td></tr>
+          <tr><td>AES(メール便以外)→手動出荷</td><td>AESの1点物で、発送条件(Amazon×数量1)が宅急便50/発払い相当 = メール便サイズ外</td><td>そのまま (変更不可)。CSV出力時に梱包機マーカーだけ「手動出荷（AESメール便以外）」が付く</td></tr>
         </tbody>
       </table>
 
@@ -671,7 +672,14 @@
       <p>ショップ名「LINE ギフト」の伝票は、配送方法を何にしても梱包機は「手動出荷」固定です。</p>
 
       <h3>4-4. AES の伝票は変更対象外</h3>
-      <p>元の配送方法が AES の伝票は、自動判定で一切触りません。状態は「自動」、理由は「AES対象外」で確定ボタンも出ません。</p>
+      <p>元の配送方法が AES の伝票は、配送方法を自動判定で一切変更しません。状態は「自動」、理由は「AES対象外」で確定ボタンも出ません。</p>
+      <h3>4-5. AES(メール便以外)の手動出荷振り分け (2026-07-16〜)</h3>
+      <p>AES の伝票のうち <b>1点物 (単一SKU×数量1)</b> だけは、発送条件 (モール=Amazon × 数量帯1、Amazon 未登録なら通常判定と同じく楽天=既定を参照) を引き、その配送方法が以下の2つなら「メール便で送れないサイズ」とみなして、梱包機だけ<b>「手動出荷（AESメール便以外）」</b>に振り分けます。</p>
+      <ul>
+        <li>ヤマト宅急便【50サイズ専用】 (takkyu50)</li>
+        <li>ヤマト(発払い)B2v6 (hatsubarai)</li>
+      </ul>
+      <div class="warn"><b>配送方法は AES のまま</b>: 変わるのは梱包機マーカー (CSV 第91列) だけです。配送方法・配送会社id等の連動列は元の値を完全に保持します。複数SKU・数量2以上・発送条件が未登録/上記以外の AES 伝票は従来どおり (理由「AES対象外」・91列も元のまま)。</div>
 
       <h2 id="ch5">5. よくある質問 (FAQ)</h2>
       <h3>Q. 配送方法を間違えて確定した。やり直せる?</h3>
@@ -761,12 +769,13 @@
           <tr><td>pasline2</td><td>pasline2つ折り</td><td>約24-25円/個</td><td>プチプチ用、2つ折りで収まるもの</td></tr>
           <tr><td>meltline</td><td>meltline</td><td>約40円/個</td><td>ネコポス段ボール専用、3つ折り・2つ折りで収まらないもの</td></tr>
           <tr><td>manual</td><td>手動出荷</td><td>—</td><td>梱包機NG・LINEギフト・沖縄ネコポス出力時 等</td></tr>
+          <tr><td>manual_aes_nonmail</td><td>手動出荷（AESメール便以外）</td><td>—</td><td>AESの1点物でメール便サイズ外 (自動判定専用・手動選択不可)</td></tr>
         </tbody>
       </table>
 
       <h3>7-7. 自動判定の優先順位</h3>
       <ol>
-        <li>AES → 即座に対象外 (触らない)</li>
+        <li>AES → 対象外 (配送方法は触らない)。ただし1点物で発送条件(Amazon×数量1)が takkyu50/hatsubarai なら梱包機マーカーだけ「手動出荷（AESメール便以外）」</li>
         <li>単品/同一商品複数 → 商品マスタ区間ルール (sku × mall × 数量帯) で引く</li>
         <li>アソート(異商品の組合せ) → アソート学習(combo_key)で照会、ヒットで自動 / 初出は上位ルールでサジェストして要判断</li>
         <li>沖縄/北海道で結果が takkyu50/hatsubarai/yupack なら letterpack 振替候補 + 要判断に格下げ</li>
@@ -1021,6 +1030,8 @@ document.addEventListener('click', (e) => {
 async function loadOptions(){ OPTIONS = await api('api/options'); }
 function methodName(code){ const m=OPTIONS.methods.find(x=>x.code===code); return m?m.name_csv:(code||'—'); }
 function machineName(code){ const m=OPTIONS.machines.find(x=>x.code===code); return m?m.name_csv:(code||'—'); }
+// 手動出荷（AESメール便以外）は AES 自動判定専用。人が選ぶドロップダウンには出さない (表示名解決は machineName で可)。
+function selectableMachines(){ return OPTIONS.machines.filter(m=>m.code!=='manual_aes_nonmail'); }
 const REASON_LABELS = {
   unregistered: '未登録',
   qty_gap: '数量帯穴',
@@ -1029,6 +1040,7 @@ const REASON_LABELS = {
   region_letterpack_check: '沖縄/北海道→要目視確認(A4・4kg超ならゆうパック等に戻す)',
   region_letterpack: '地域特例(旧)',
   aes_locked: 'AES対象外',
+  aes_nonmail: 'AES(メール便以外)→手動出荷',
   manual_decided: '手動確定',
   no_valid_line: '有効明細なし',
 };
@@ -1091,7 +1103,7 @@ function renderSummary(s){
     `<div><div class="num" style="color:#c0392b">${c['要判断']||0}</div><div class="muted">要判断</div></div>`+
     `<div><div class="num" style="color:#2e7d32">${c['確定']||0}</div><div class="muted">確定</div></div>`+
     `<div><div class="num" style="color:#2b6cb0">${c['auto']||0}</div><div class="muted">自動</div></div>`+
-    `<div class="muted">理由: 未登録 ${r['unregistered']||0} / 数量帯穴 ${r['qty_gap']||0} / 初出アソート ${r['assort_new']||0} / 学習済 ${r['assort_learned']||0} / 地域特例(要確認) ${r['region_letterpack_check']||0} / 地域特例(旧) ${r['region_letterpack']||0} / AES ${r['aes_locked']||0}</div>`;
+    `<div class="muted">理由: 未登録 ${r['unregistered']||0} / 数量帯穴 ${r['qty_gap']||0} / 初出アソート ${r['assort_new']||0} / 学習済 ${r['assort_learned']||0} / 地域特例(要確認) ${r['region_letterpack_check']||0} / 地域特例(旧) ${r['region_letterpack']||0} / AES ${r['aes_locked']||0} / AES(メール便以外) ${r['aes_nonmail']||0}</div>`;
   $('#ordersCard').style.display='block';
   updateExportBtn(c['要判断']||0);
 }
@@ -1139,7 +1151,7 @@ function renderOrders(){
     const tr=document.createElement('tr');
     const badge = o.row_status==='要判断'?'<span class="badge b-warn">要判断</span>':o.row_status==='確定'?'<span class="badge b-ok">確定</span>':'<span class="badge b-auto">自動</span>';
     tr.innerHTML = `<td>${badge}</td>`+
-      `<td>${o.reason_code==='aes_locked'?'<span class="muted">対象外</span>':`<button class="sub" data-act="decide">確定/変更</button>`}</td>`+
+      `<td>${(o.reason_code==='aes_locked'||o.reason_code==='aes_nonmail')?'<span class="muted">対象外</span>':`<button class="sub" data-act="decide">確定/変更</button>`}</td>`+
       `<td>${esc(o.shop_name)}</td><td>${esc(o.order_no)}</td><td>${esc(o.order_type)}</td><td>${esc(o.pref)}</td>`+
       `<td><span class="items-cell" title="${esc(o.items)}">${esc(o.items)}</span></td>`+
       `<td>${esc(methodName(o.shipping_method_code))}</td><td>${esc(machineName(o.packing_machine_code))}</td>`+
@@ -1174,7 +1186,7 @@ async function openDecide(o){
       </table>
       <table class="items"><thead><tr><th>商品コード</th><th>商品名</th><th>数</th></tr></thead><tbody>${items}</tbody></table>`;
     fillSelect($('#dlgMethod'), OPTIONS.methods.filter(m=>m.code!=='aes'), 'code', m=>m.name_csv, d.shipping_method_code);
-    fillSelect($('#dlgMachine'), OPTIONS.machines, 'code', m=>m.name_csv, d.packing_machine_code||'manual');
+    fillSelect($('#dlgMachine'), selectableMachines(), 'code', m=>m.name_csv, d.packing_machine_code||'manual');
     $('#dlgDate').value = toPickerDate(d.delivery_date);  // CSVの日付 → YYYY-MM-DD
     $('#dlgTime').value = d.delivery_time || '';
     // 学習チェックは開くたびON初期化。ダイアログは使い回しのため、前の伝票でレターパック
@@ -1299,7 +1311,7 @@ let justCopied = false; // 直前にコピーで編集欄を埋めたか(保存�
 function tierRow(t){
   const div=document.createElement('div'); div.className='tier';
   const mOpts = OPTIONS.methods.filter(m=>m.code!=='aes').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
-  const pOpts = OPTIONS.machines.map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+  const pOpts = selectableMachines().map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
   div.innerHTML = `下限<input type="number" class="qmin" min="1" value="${t?.qty_min??1}" style="width:70px">`+
     `上限<input type="number" class="qmax" min="1" value="${t?.qty_max??''}" placeholder="空=∞" style="width:80px">`+
     `<select class="sm">${mOpts}</select><select class="pm">${pOpts}</select>`+
@@ -1453,8 +1465,8 @@ function appendOpts(sel, items, labelFn){
 }
 function initCondSelects(){
   const methods=OPTIONS.methods.filter(m=>m.code!=='aes');
-  appendOpts($('#cSm'),methods,m=>m.name_csv); appendOpts($('#cPm'),OPTIONS.machines,m=>m.name_csv);
-  appendOpts($('#bSm'),methods,m=>m.name_csv); appendOpts($('#bPm'),OPTIONS.machines,m=>m.name_csv);
+  appendOpts($('#cSm'),methods,m=>m.name_csv); appendOpts($('#cPm'),selectableMachines(),m=>m.name_csv);
+  appendOpts($('#bSm'),methods,m=>m.name_csv); appendOpts($('#bPm'),selectableMachines(),m=>m.name_csv);
 }
 async function doCondSearch(){
   const qs=new URLSearchParams();
@@ -1592,7 +1604,7 @@ $('#btnLoadUnreg').onclick=loadUnreg;
 function initAssortFilters(){
   // aes は学習対象外なので除外 / letterpack も同様
   fillSelect($('#aSm'), [{code:'',name_csv:'（指定なし）'}, ...OPTIONS.methods.filter(m=>m.code!=='aes' && m.code!=='letterpack')], 'code', m=>m.name_csv, '');
-  fillSelect($('#aPm'), [{code:'',name_csv:'（指定なし）'}, ...OPTIONS.machines], 'code', m=>m.name_csv, '');
+  fillSelect($('#aPm'), [{code:'',name_csv:'（指定なし）'}, ...selectableMachines()], 'code', m=>m.name_csv, '');
 }
 async function doAssortSearch(){
   const params = new URLSearchParams();
@@ -1621,7 +1633,7 @@ async function doAssortSearch(){
       const totalQtyHtml = (typeof r.total_qty==='number') ? `<span class="muted"> (合計${r.total_qty}個)</span>` : '';
       // letterpack は学習対象外 (A4/4kg制限、目視判断必須)。選択肢から除外。
       const mOpts=OPTIONS.methods.filter(m=>m.code!=='aes' && m.code!=='letterpack').map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
-      const pOpts=OPTIONS.machines.map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
+      const pOpts=selectableMachines().map(m=>`<option value="${m.code}">${esc(m.name_csv)}</option>`).join('');
       card.innerHTML=`<div style="margin-bottom:6px"><b>商品:</b> ${items}${totalQtyHtml}</div>`+
         `<div class="muted" style="margin-bottom:8px"><b>利用注文:</b> ${orders}</div>`+
         `<div class="row"><label>配送方法</label><select class="asm" style="min-width:220px">${mOpts}</select>`+
