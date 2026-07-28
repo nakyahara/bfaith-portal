@@ -2262,6 +2262,84 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: shipText });
   ok(r.body.ok && r.body.rowCount === 2 && r.body.unmatched.length === 0, 'convert: 紐づけ後は全行マッチ (E2E)', r.body.rowCount);
 
+  // ── 仮商品コード: NE未登録の新商品も貼り付けデータに含める (中原さん要望 2026-07-28) ──
+  {
+    const provText = 'ZZZ-PROV-1\tｽｴｰﾄﾞ補修ｼｰﾄ ﾌﾞﾗｯｸ\t12\n';
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.ok && r.body.rowCount === 0 && r.body.unmatched.length === 1, 'prov: 仮商品コードなしは従来どおりunmatched (貼り付けに含まれない)', r.body.rowCount);
+    // 日本語 (商品名で検索した文字列の消し忘れ) は拒否 = 検索語がそのまま商品IDになる事故を防ぐ
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'スエード補修シート' }] });
+    ok(r.status === 400 && r.body.error.includes('仮商品コード'), 'prov: 日本語の仮商品コードは拒否', r.body.error);
+    ok(!db.prepare("SELECT 1 FROM po_vendor_code_pending WHERE supplier_code='1' AND vendor_code_norm='ZZZ-PROV-1'").get(),
+      'prov: 検証エラーなら1件も登録しない (入力を直せるようにする)');
+    // 既に対応表にある商品コードは拒否 (🔁この番号で再登録へ誘導 — 同じ商品IDが2行出るのを防ぐ)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'noflyersticker' }] });
+    ok(r.status === 400 && r.body.error.includes('再登録'), 'prov: 対応表にある商品コードは拒否', r.body.error);
+    // 他仕入先の実在商品も拒否 (打ち間違い検知)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'gyoumuhandcream60-BI' }] });
+    ok(r.status === 400 && r.body.error.includes('仕入先'), 'prov: 他仕入先の商品コードは拒否', r.body.error);
+    // 正常系: 仮登録 → 変換すると貼り付けデータに載る (単価はPMLに無いので空欄)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1',
+      items: [{ vendorCode: 'ZZZ-PROV-1', vendorName: 'ｽｴｰﾄﾞ補修ｼｰﾄ ﾌﾞﾗｯｸ', qty: 12, provisionalProductCode: 'sueders-bk' }] });
+    ok(r.body.ok && r.body.added === 1 && r.body.provisionalSet === 1, 'prov: 仮商品コード付きで仮登録', r.body);
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.ok && r.body.rowCount === 1 && r.body.unmatched.length === 0 && r.body.pasteText === 'sueders-bk\t12\t',
+      'prov: 貼り付けデータに仮商品コードの行が入る (単価は空欄)', r.body.pasteText);
+    ok(r.body.totalQty === 12 && (r.body.provisionalRows || []).length === 1 && r.body.caseUnverified.length === 0,
+      'prov: 入荷予定数合計に含む / provisionalRowsで警告 / NE表記未確認の警告には出さない', r.body.provisionalRows);
+    ok((r.body.lines || [])[0].type === 'provisional' && r.body.lines[0].provisionalCode === 'sueders-bk', 'prov: 行の種別=provisional');
+    // 入数換算も対応表と同じ (先方1 = 弊社24個)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1',
+      items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'sueders-bk', provisionalQtyPerUnit: 24 }] });
+    ok(r.body.ok && r.body.refreshed === 1, 'prov: 入数つきで更新', r.body);
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.pasteText === 'sueders-bk\t288\t' && r.body.totalQty === 288, 'prov: 入数換算 (12×24)', r.body.pasteText);
+    // 同じ仮商品コードを別の先方番号に付けるのは拒否 (貼り付けに同じ商品IDが2行出る)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-2', qty: 1, provisionalProductCode: 'sueders-bk' }] });
+    ok(r.status === 400 && r.body.error.includes('別の先方番号'), 'prov: 仮商品コードの重複は拒否', r.body.error);
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [
+      { vendorCode: 'ZZZ-PROV-3', qty: 1, provisionalProductCode: 'sueders-db' },
+      { vendorCode: 'ZZZ-PROV-4', qty: 1, provisionalProductCode: 'sueders-db' }] });
+    ok(r.status === 400 && r.body.error.includes('重複'), 'prov: 同一バッチ内の重複も拒否', r.body.error);
+    // 仮商品コードを送らない仮登録は既存のコードを消さない (❓行だけの一括仮登録で消えないこと)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 5 }] });
+    const keepRow = db.prepare("SELECT provisional_product_code AS c, provisional_qty_per_unit AS q FROM po_vendor_code_pending WHERE supplier_code='1' AND vendor_code_norm='ZZZ-PROV-1'").get();
+    ok(r.body.ok && keepRow.c === 'sueders-bk' && keepRow.q === 24, 'prov: provisionalProductCode未指定はコードも入数も保持', keepRow);
+    // コードだけ直したときに入数が黙って消えない (Codex 仮コードR1 Medium)
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'sueders-bk2' }] });
+    const keep2 = db.prepare("SELECT provisional_product_code AS c, provisional_qty_per_unit AS q FROM po_vendor_code_pending WHERE supplier_code='1' AND vendor_code_norm='ZZZ-PROV-1'").get();
+    ok(r.body.ok && keep2.c === 'sueders-bk2' && keep2.q === 24, 'prov: コードだけ変更しても入数は保持 (三値更新)', keep2);
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'sueders-bk', provisionalQtyPerUnit: '' }] });
+    ok(r.body.ok && db.prepare("SELECT provisional_qty_per_unit AS q FROM po_vendor_code_pending WHERE supplier_code='1' AND vendor_code_norm='ZZZ-PROV-1'").get().q === null,
+      'prov: 入数に空文字を送ると消える');
+    // 仮登録の後にそのコードが対応表へ入ったら、貼り付けから外して警告 (同じ商品IDが2行出るのを防ぐ)
+    {
+      db.prepare("INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES ('1','sueders-bk','sueders-bk','ZZZ-OTHER-9',?)").run(nowIsoStr());
+      r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+      ok(r.body.rowCount === 0 && (r.body.provisionalConflicts || []).length === 1 && r.body.provisionalConflicts[0].mappedVendorCode === 'ZZZ-OTHER-9',
+        'prov: 対応表と重複した仮商品コードは貼り付けから除外して警告', r.body.provisionalConflicts);
+      ok(!r.body.pasteText.includes('sueders-bk'), 'prov: 重複行は貼り付けデータに出ない', r.body.pasteText);
+      db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='sueders-bk'").run();
+    }
+    // 空文字を送ると消える → ❓対応表になしへ戻る
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: '' }] });
+    ok(r.body.ok && r.body.provisionalCleared === 1, 'prov: 空文字で仮商品コードを消す', r.body);
+    r = await jp2('/api/inbound-plan/convert', { supplier_code: '1', text: provText });
+    ok(r.body.rowCount === 0 && r.body.unmatched.length === 1, 'prov: 消したら貼り付けから外れる');
+    // 対応表へ昇格すると入数を引き継ぎ、仮コードと違う商品に紐づけたら警告
+    r = await jp2('/api/vendor-map/pending', { supplier_code: '1',
+      items: [{ vendorCode: 'ZZZ-PROV-1', qty: 12, provisionalProductCode: 'sueders-bk', provisionalQtyPerUnit: 24 }] });
+    r = await j('/api/vendor-map/pending?supplier=1');
+    const pendProv = r.body.rows.find(x => x.vendor_code === 'ZZZ-PROV-1');
+    ok(pendProv && pendProv.provisional_product_code === 'sueders-bk' && pendProv.provisional_qty_per_unit === 24, 'prov: 一覧に仮商品コード/入数が出る', pendProv);
+    r = await jp2('/api/vendor-map/pending/' + pendProv.id + '/link', { product_code: 'diyorangeoil100' });
+    ok(r.body.ok && r.body.warning && r.body.warning.includes('sueders-bk'), 'prov link: 仮コードと違う商品に紐づけたら警告', r.body.warning);
+    const provMap = db.prepare("SELECT qty_per_unit FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='diyorangeoil100'").get();
+    ok(provMap && provMap.qty_per_unit === 24, 'prov link: 仮登録の入数を対応表へ引き継ぐ', provMap);
+    db.prepare("DELETE FROM po_vendor_code_map WHERE supplier_code='1' AND product_key='diyorangeoil100'").run();
+    db.prepare("DELETE FROM po_vendor_code_pending WHERE supplier_code='1' AND vendor_code_norm LIKE 'ZZZ-PROV-%'").run();
+  }
+
   // 破棄
   r = await jp2('/api/vendor-map/pending', { supplier_code: '1', items: [{ vendorCode: 'ZZZ-MISTAKE', qty: 1 }] });
   r = await j('/api/vendor-map/pending?supplier=1');
@@ -2414,9 +2492,12 @@ console.log('── 入荷予定変換 (inbound-plan) + 仮登録 (pending) ─�
   ok(inbHtml2.includes('仕入先の出荷明細') && inbHtml2.includes('data-ipqpu') && inbHtml2.includes('新商品'), '/inbound-plan 左右対応表+入数編集UI');
   ok(inbHtml2.includes('ロジザード入荷予定を開く') && inbHtml2.includes('ap003.logizard.net/LPSTD405/PA01/Index'), '/inbound-plan ロジザードを開くボタン');
   ok(inbHtml2.includes('data-iprelink') && inbHtml2.includes('この番号で再登録'), '/inbound-plan 対応表になし行の再登録UI');
+  ok(inbHtml2.includes('data-ipprovcode') && inbHtml2.includes('data-ipprovsave') && inbHtml2.includes('仮商品コード'),
+    '/inbound-plan 仮商品コードの入力+保存UI (新商品も貼り付けに含める)');
   ok(inbHtml2.includes('ipVmapOpen') && inbHtml2.includes('grp=vendormap'), '/inbound-plan 対応表を別タブで開くボタン');
   const adminHtml3 = await (await fetch(base + '/admin')).text();
   ok(adminHtml3.includes('loadVmapPending') && adminHtml3.includes('未紐付けの先方番号'), '/admin 対応表タブに仮登録リスト');
+  ok(adminHtml3.includes('provisional_product_code'), '/admin 仮登録リストに仮商品コード列 (紐づけ欄へ初期表示)');
   ok(adminHtml3.includes('data-vmqpu') && adminHtml3.includes('vmNewQpu'), '/admin 対応表に入数列');
   ok(adminHtml3.includes('URLSearchParams') && adminHtml3.includes("qp0.get('sup')"), '/admin URLパラメータでグループ・仕入先を指定可');
 }

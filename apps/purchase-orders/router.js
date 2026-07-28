@@ -1667,10 +1667,12 @@ const QPU_ERR = `入数は0より大きく${QPU_MAX.toLocaleString('ja-JP')}以�
 function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
   // 対応表の逆引き: 先方番号 → 弊社商品コード (同じ先方番号が複数商品に付いている場合は ambiguous)
   const rev = new Map();
+  const mappedByKey = new Map(); // 弊社商品コード → 対応表の行 (仮商品コードとの衝突検出用)
   for (const m of db.prepare('SELECT product_code, product_key, vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=?').all(supplier)) {
     const k = normVendorCode(m.vendor_code);
     if (!rev.has(k)) rev.set(k, []);
     rev.get(k).push(m);
+    if (!mappedByKey.has(m.product_key)) mappedByKey.set(m.product_key, m);
   }
   const costByKey = new Map();
   const nameByKey = new Map();
@@ -1686,14 +1688,59 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
   // NE本来の大小表記 (NE手動CSV取込で蓄積)。ロジザードはNE登録表記と大小まで一致しないと登録エラーのため最優先
   const canonicalByKey = new Map(db.prepare('SELECT product_key, product_code FROM po_product_code_canonical').all()
     .map(r => [r.product_key, r.product_code]));
-  const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [];
+  // 仮商品コード付きの仮登録 (NE登録前の新商品)。先方番号 → 決め打ちの弊社コード。
+  // 対応表に無くても貼り付けデータに含める (中原さん要望 2026-07-28)
+  const provByVendor = new Map(db.prepare(
+    `SELECT id, vendor_code_norm, provisional_product_code, provisional_qty_per_unit FROM po_vendor_code_pending
+      WHERE supplier_code=? AND status='pending' AND provisional_product_code IS NOT NULL AND TRIM(provisional_product_code) <> ''`)
+    .all(supplier).map(r => [r.vendor_code_norm, r]));
+  const okRows = [], unmatched = [], ambiguous = [], lines = [], qtyInvalid = [], provisionalRows = [], provisionalConflicts = [];
   let totalQty = 0, totalVendorQty = 0;
   for (const it of items) {
     totalVendorQty += it.qty;
     const hits = rev.get(normVendorCode(it.vendorCode)) || [];
     if (hits.length === 0) {
-      unmatched.push(it);
-      lines.push({ type: 'unmatched', vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty });
+      const prov = provByVendor.get(normVendorCode(it.vendorCode));
+      if (!prov) {
+        unmatched.push(it);
+        lines.push({ type: 'unmatched', vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty });
+        continue;
+      }
+      // 仮商品コードの行: 対応表と同じ換算・原価付けをして貼り付けに含める。
+      // 既にNE/PMLに存在するコードならその表記・商品名・原価を使う (未登録なら入力どおりの表記+単価空欄)
+      const pkey = normProductCode(prov.provisional_product_code);
+      // 仮登録の後にその商品コードが対応表へ入った場合 (CSV取込等)、貼り付けに同じ商品IDが2行出る危険がある。
+      // 黙って出さず、コードを直すか🔁再登録するよう促す (Codex 仮コードR1 High)
+      const mapped = mappedByKey.get(pkey);
+      if (mapped) {
+        const conflict = { vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
+          provisionalCode: trimS(prov.provisional_product_code), mappedProductCode: mapped.product_code, mappedVendorCode: mapped.vendor_code, pendingId: prov.id };
+        provisionalConflicts.push(conflict);
+        lines.push({ type: 'provisional', ...conflict, productName: nameByKey.get(pkey) || '', qtyPerUnit: null, qty: null, cost: null, codeConflict: true });
+        continue;
+      }
+      const pqpu = prov.provisional_qty_per_unit != null && Number.isFinite(Number(prov.provisional_qty_per_unit)) && Number(prov.provisional_qty_per_unit) > 0
+        ? Number(prov.provisional_qty_per_unit) : 1;
+      const praw = it.qty * pqpu;
+      const pqty = Math.round(praw);
+      const provRow = {
+        vendorCode: it.vendorCode, vendorName: it.vendorName || null, vendorQty: it.qty,
+        productCode: canonicalByKey.get(pkey) || codeByKey.get(pkey) || trimS(prov.provisional_product_code),
+        productName: nameByKey.get(pkey) || '',
+        caseVerified: canonicalByKey.has(pkey),
+        qtyPerUnit: pqpu, qty: pqty,
+        cost: costByKey.has(pkey) ? costByKey.get(pkey) : null,
+        provisional: true, provisionalCode: trimS(prov.provisional_product_code), pendingId: prov.id,
+      };
+      if (!Number.isSafeInteger(pqty) || pqty <= 0 || Math.abs(praw - pqty) > 1e-6) {
+        qtyInvalid.push({ vendorCode: it.vendorCode, vendorQty: it.qty, productCode: provRow.productCode, qtyPerUnit: pqpu });
+        lines.push({ ...provRow, type: 'provisional', qty: null, qtyBad: true });
+        continue;
+      }
+      okRows.push(provRow);
+      provisionalRows.push(provRow);
+      lines.push({ ...provRow, type: 'provisional' });
+      totalQty += pqty;
       continue;
     }
     if (hits.length > 1) {
@@ -1733,7 +1780,10 @@ function convertShipmentItems(db, supplier, supplierName, items, skipped = []) {
     ok: true, supplierName, supplierCode: supplier, // 仮登録は変換時の仕入先に固定する (Codex plan-R1 High)
     rows: okRows, lines, pasteText, totalQty, totalVendorQty, rowCount: okRows.length,
     costMissing: okRows.filter(r2 => r2.cost == null).map(r2 => r2.productCode),
-    caseUnverified: okRows.filter(r2 => !r2.caseVerified).map(r2 => r2.productCode), // NE本来表記が未蓄積 (小文字のまま出力)
+    // NE本来表記が未蓄積 (小文字のまま出力)。仮商品コードの行はそもそもNE未登録なので別枠で警告する
+    caseUnverified: okRows.filter(r2 => !r2.caseVerified && !r2.provisional).map(r2 => r2.productCode),
+    provisionalRows: provisionalRows.map(r2 => ({ vendorCode: r2.vendorCode, productCode: r2.productCode, qty: r2.qty })),
+    provisionalConflicts,
     unmatched, ambiguous, skipped, qtyInvalid,
   };
 }
@@ -1977,7 +2027,16 @@ router.post('/api/inbound-plan/mails/reparse-errors', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// 未紐付け番号を仮登録リストへ (UNIQUE upsert=再変換で重複しない)
+// 仮商品コード: 半角の印字可能ASCIIのみ (商品名で検索した日本語がそのまま登録されるのを防ぐ。
+// 貼り付けデータはタブ区切りのため空白・タブ・改行も混入させない)
+const PROV_CODE_MAX = 60;
+const PROV_CODE_RE = /^[\x21-\x7E]+$/;
+
+// 未紐付け番号を仮登録リストへ (UNIQUE upsert=再変換で重複しない)。
+// items[].provisionalProductCode = 新商品の仮商品コード (指定すると入荷予定の貼り付けデータに含まれる)。
+//   未指定 (undefined) = 既存の仮商品コードを変更しない / '' = 消す (❓対応表になしに戻す)
+// items[].provisionalQtyPerUnit も同じ三値。コードと入数は独立して更新する
+//   (コードだけ直したときに入数が黙って消えない、Codex 仮コードR1 Medium)
 router.post('/api/vendor-map/pending', (req, res) => {
   try {
     const db = getDB();
@@ -1986,31 +2045,103 @@ router.post('/api/vendor-map/pending', (req, res) => {
     if (!supplier) return res.status(400).json({ ok: false, error: '仕入先コードが必要です' });
     if (!db.prepare('SELECT 1 FROM po_suppliers WHERE supplier_code=?').get(supplier)) return res.status(400).json({ ok: false, error: `仕入先が未登録です: ${supplier}` });
     if (!items.length) return res.status(400).json({ ok: false, error: '仮登録する番号がありません' });
-    let added = 0, refreshed = 0, skippedProcessed = 0;
+
+    // 1) 正規化 (バッチ内の大小文字違い重複は1件に)
+    const seenNorm = new Set();
+    const prepared = [];
+    for (const it of items) {
+      const code = trimS(it && it.vendorCode);
+      if (!code || code.length > 100) continue;
+      const norm = normVendorCode(code);
+      if (seenNorm.has(norm)) continue;
+      seenNorm.add(norm);
+      prepared.push({
+        code, norm,
+        vendorName: trimS(it && it.vendorName).slice(0, 200) || null,
+        qty: Number.isInteger(Number(it && it.qty)) ? Number(it.qty) : null,
+        provTouched: !!it && it.provisionalProductCode !== undefined,
+        prov: trimS(it && it.provisionalProductCode),
+        qpuTouched: !!it && it.provisionalQtyPerUnit !== undefined,
+        qpuRaw: it ? it.provisionalQtyPerUnit : undefined,
+        qpu: null,
+      });
+    }
+
+    // 2) 仮商品コードの検証。1件でも誤りがあれば何も登録しない
+    //    (画面の入力欄を消さずに直せるようにする — 部分適用+再変換だと他の行の入力が消える)
+    const provErrors = [];
+    const withProv = prepared.filter(p => p.prov);
+    if (withProv.length) {
+      const mapByKey = new Map(db.prepare('SELECT product_key, product_code, vendor_code FROM po_vendor_code_map WHERE supplier_code=?')
+        .all(supplier).map(m => [m.product_key, m]));
+      const otherPending = db.prepare(`SELECT vendor_code, vendor_code_norm, provisional_product_code FROM po_vendor_code_pending
+        WHERE supplier_code=? AND status='pending' AND provisional_product_code IS NOT NULL AND TRIM(provisional_product_code) <> ''`).all(supplier);
+      const pmlByKey = new Map(loadPml().rows.map(r => [normProductCode(r['商品コード']), r]));
+      const batchByKey = new Map();
+      for (const p of withProv) {
+        if (p.prov.length > PROV_CODE_MAX || !PROV_CODE_RE.test(p.prov)) {
+          provErrors.push(`${p.code}: 仮商品コード「${p.prov}」は使えません (半角英数字・記号のみ / ${PROV_CODE_MAX}文字以内)。商品名で検索した文字列が残っていませんか?`);
+          continue;
+        }
+        const pk = normProductCode(p.prov);
+        const dupBatch = batchByKey.get(pk);
+        if (dupBatch) { provErrors.push(`${p.code}: 仮商品コード ${p.prov} を ${dupBatch} と重複して指定しています (同じ商品IDが貼り付けに2行出ます)`); continue; }
+        batchByKey.set(pk, p.code);
+        const m = mapByKey.get(pk);
+        if (m && normVendorCode(m.vendor_code) !== p.norm) {
+          provErrors.push(`${p.code}: 商品 ${m.product_code} は既に対応表にあります (先方番号 ${m.vendor_code})。番号変更なら「🔁 この番号で再登録」を使ってください`);
+          continue;
+        }
+        const op = otherPending.find(x => normProductCode(x.provisional_product_code) === pk && x.vendor_code_norm !== p.norm);
+        if (op) { provErrors.push(`${p.code}: 仮商品コード ${p.prov} は別の先方番号 ${op.vendor_code} で仮登録済みです`); continue; }
+        // 商品マスタに実在するコードなら仕入先違い (打ち間違い) を弾く。未登録=新商品はここを通る
+        const pmlRow = pmlByKey.get(pk);
+        const prodSup = pmlRow ? normSupplierCode(pmlRow['仕入先']) : '';
+        if (prodSup && prodSup !== supplier) { provErrors.push(`${p.code}: 商品 ${p.prov} の仕入先は ${prodSup} です (この仕入先の商品ではありません)`); continue; }
+      }
+    }
+    for (const p of prepared) {
+      // 仮商品コードを消す指示のときは入数も一緒に消えるので、入力欄の値は検証しない (削除が失敗しない)
+      if (p.provTouched && !p.prov) continue;
+      if (!p.qpuTouched || p.qpuRaw == null || trimS(p.qpuRaw) === '') continue;
+      const n = Number(String(p.qpuRaw).replace(/,/g, ''));
+      if (!Number.isFinite(n) || n <= 0 || n > QPU_MAX) { provErrors.push(`${p.code}: ${QPU_ERR}`); continue; }
+      p.qpu = n;
+    }
+    if (provErrors.length) return res.status(400).json({ ok: false, error: provErrors.join('\n') });
+
+    let added = 0, refreshed = 0, skippedProcessed = 0, provisionalSet = 0, provisionalCleared = 0;
     db.transaction(() => {
-      const exists = db.prepare('SELECT status FROM po_vendor_code_pending WHERE supplier_code=? AND vendor_code_norm=?');
-      const up = db.prepare(`INSERT INTO po_vendor_code_pending (supplier_code, vendor_code, vendor_code_norm, vendor_name, last_qty, status, created_at, updated_at)
-        VALUES (?,?,?,?,?,'pending',?,?)
-        ON CONFLICT(supplier_code, vendor_code_norm) DO UPDATE SET
-          vendor_name = COALESCE(excluded.vendor_name, vendor_name), last_qty = excluded.last_qty, updated_at = excluded.updated_at`);
-      const seenNorm = new Set(); // バッチ内の大小文字違い重複も1件に
-      for (const it of items) {
-        const code = trimS(it && it.vendorCode);
-        if (!code || code.length > 100) continue;
-        const norm = normVendorCode(code);
-        if (seenNorm.has(norm)) continue;
-        seenNorm.add(norm);
-        const cur = exists.get(supplier, norm);
+      const exists = db.prepare(`SELECT id, status, provisional_product_code, provisional_qty_per_unit
+        FROM po_vendor_code_pending WHERE supplier_code=? AND vendor_code_norm=?`);
+      const ins = db.prepare(`INSERT INTO po_vendor_code_pending
+        (supplier_code, vendor_code, vendor_code_norm, vendor_name, last_qty, provisional_product_code, provisional_qty_per_unit, status, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,'pending',?,?)`);
+      const upd = db.prepare(`UPDATE po_vendor_code_pending
+        SET vendor_name=COALESCE(?, vendor_name), last_qty=?, provisional_product_code=?, provisional_qty_per_unit=?, updated_at=? WHERE id=?`);
+      for (const p of prepared) {
+        const cur = exists.get(supplier, p.norm);
         // 処理済み (linked/dismissed) は復活させない (破棄の取り消しは明示操作にしない、Codex plan-R1 Medium)
         if (cur && cur.status !== 'pending') { skippedProcessed++; continue; }
-        up.run(supplier, code, norm, trimS(it && it.vendorName).slice(0, 200) || null,
-          Number.isInteger(Number(it && it.qty)) ? Number(it.qty) : null, nowIso(), nowIso());
-        if (cur) refreshed++; else added++;
+        const curProv = cur ? trimS(cur.provisional_product_code) : '';
+        const curQpu = cur && cur.provisional_qty_per_unit != null ? Number(cur.provisional_qty_per_unit) : null;
+        // コードと入数はそれぞれ「未指定=保持 / 空=消す / 値=更新」。コードが無くなれば入数も無意味なので落とす
+        const newProv = (p.provTouched ? p.prov : curProv) || null;
+        const newQpu = !newProv ? null : (p.qpuTouched ? p.qpu : curQpu);
+        if (!cur) {
+          ins.run(supplier, p.code, p.norm, p.vendorName, p.qty, newProv, newQpu, nowIso(), nowIso());
+          added++;
+        } else {
+          upd.run(p.vendorName, p.qty, newProv, newQpu, nowIso(), cur.id);
+          refreshed++;
+        }
+        if (p.provTouched && p.prov) provisionalSet++;
+        else if (p.provTouched && !p.prov && curProv) provisionalCleared++;
       }
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_pending_add', resource: `supplier:${supplier}`,
-        detail: { count: items.length, added, refreshed, skippedProcessed } });
+        detail: { count: items.length, added, refreshed, skippedProcessed, provisionalSet, provisionalCleared } });
     })();
-    res.json({ ok: true, added, refreshed, skippedProcessed });
+    res.json({ ok: true, added, refreshed, skippedProcessed, provisionalSet, provisionalCleared });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -2050,15 +2181,30 @@ router.post('/api/vendor-map/pending/:id/link', (req, res) => {
     if (dup) return res.status(400).json({ ok: false, error: `この先方番号は既に商品 ${dup.product_code} に登録されています。番号変更なら📇対応表で既存の行を修正してください` });
     let out = null;
     db.transaction(() => {
-      const old = db.prepare('SELECT vendor_code FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(pend.supplier_code, key);
-      db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, updated_at) VALUES (?,?,?,?,?)
-        ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code, updated_at=excluded.updated_at`)
-        .run(pend.supplier_code, key, productCode, pend.vendor_code, nowIso());
+      const old = db.prepare('SELECT vendor_code, qty_per_unit FROM po_vendor_code_map WHERE supplier_code=? AND product_key=?').get(pend.supplier_code, key);
+      // 仮登録時に入れた入数は対応表へ引き継ぐ (既に入数が入っている行は上書きしない)
+      const pqpu = pend.provisional_qty_per_unit != null && Number.isFinite(Number(pend.provisional_qty_per_unit)) && Number(pend.provisional_qty_per_unit) > 0
+        ? Number(pend.provisional_qty_per_unit) : null;
+      const oldQpu = old && old.qty_per_unit != null ? Number(old.qty_per_unit) : null;
+      db.prepare(`INSERT INTO po_vendor_code_map (supplier_code, product_key, product_code, vendor_code, qty_per_unit, updated_at) VALUES (?,?,?,?,?,?)
+        ON CONFLICT(supplier_code, product_key) DO UPDATE SET product_code=excluded.product_code, vendor_code=excluded.vendor_code,
+          qty_per_unit=COALESCE(qty_per_unit, excluded.qty_per_unit), updated_at=excluded.updated_at`)
+        .run(pend.supplier_code, key, productCode, pend.vendor_code, pqpu, nowIso());
       db.prepare("UPDATE po_vendor_code_pending SET status='linked', linked_product_code=?, updated_at=? WHERE id=?")
         .run(productCode, nowIso(), id);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'vendor_pending_link', resource: `supplier:${pend.supplier_code}`,
-        detail: { vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null } });
-      out = { ok: true, oldVendorCode: old ? old.vendor_code : null };
+        detail: { vendorCode: pend.vendor_code, productCode, oldVendorCode: old ? old.vendor_code : null,
+          provisionalProductCode: pend.provisional_product_code || null, provisionalQtyPerUnit: pqpu, oldQtyPerUnit: oldQpu } });
+      const warnings = [];
+      // 仮商品コードで入荷予定を作った後に別コードへ紐づけた場合はロジザード側が食い違う
+      if (pend.provisional_product_code && normProductCode(pend.provisional_product_code) !== key) {
+        warnings.push(`仮商品コード ${pend.provisional_product_code} で入荷予定を作成済みの場合は、ロジザード側も ${productCode} に直してください`);
+      }
+      // 対応表に既に入数がある行は上書きしない → 以後の換算が仮登録時と変わることを知らせる (Codex 仮コードR1 Medium)
+      if (pqpu != null && oldQpu != null && oldQpu !== pqpu) {
+        warnings.push(`入数は対応表の既存値 ${oldQpu} のままです (仮登録時は ${pqpu})。次回以降の換算が変わります — 📇対応表で確認してください`);
+      }
+      out = { ok: true, oldVendorCode: old ? old.vendor_code : null, warning: warnings.length ? warnings.join(' / ') : null };
     })();
     res.json(out);
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
@@ -5343,7 +5489,7 @@ router.get('/inbound-plan', (req, res) => {
       <div class="hint">
         「📬 メールから取得」を押すと、AMC (@am-craft.jp のxlsx添付) / ビーフリー (@be-free.biz の本文の表) / サロンジェ (@salonge.co.jp、<b>発注書参照</b>) の出荷連絡を自動で取り込んで変換できます。
         結果 (商品ID / 入荷予定数 / 仕入単価) を📋コピーして、ロジザードの「入荷予定登録 (Excel貼り付け)」へ貼り付け → 済んだら ✅ ロジザード登録済み。<br>
-        対応表に無い先方番号は一覧されます — <b>番号変更</b>ならその行で既存商品を検索して「🔁この番号で再登録」(その場で対応表を上書き)、<b>新商品</b>は「仮登録」しておき、NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から紐づけます。<br>
+        対応表に無い先方番号は一覧されます — <b>番号変更</b>ならその行で既存商品を検索して「🔁この番号で再登録」(その場で対応表を上書き)、<b>新商品</b>はその行に<b>仮商品コード</b> (弊社で決めた商品コード) を入れて「🕗仮登録」すると<b>貼り付けデータに含まれます</b>。NE登録の翌朝以降にマスタ管理→📇対応表の「未紐付けの先方番号」から正式に紐づけます。<br>
         <b>サロンジェ</b>は出荷明細が無い代わりにこちらの発注書どおり出荷されます — 変換で該当POを選ぶと台帳の明細から入荷予定を作り、本文の「※…終売/在庫無し」は除外候補と➖減数の提案になります。
       </div>
       <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:6px">
@@ -5589,8 +5735,10 @@ function renderIpResult(j, req) {
       IP_LAST = j;
       // IP_REQ は runIpConvert の開始時に更新済み (描画時に上書きしない — 古い応答でreqを巻き戻さない)
       var newCount = (j.lines || []).filter(function(l){ return l.type === 'unmatched'; }).length;
+      var provCount = (j.provisionalRows || []).length;
       var h = '<div class="sec" style="padding:10px 12px">' +
         '<div><b>✅ 変換結果: ' + esc(j.supplierName || j.supplierCode) + '</b> — 貼り付け ' + j.rowCount + '行 / 入荷予定数合計 <b>' + j.totalQty.toLocaleString('ja-JP') + '個</b>' +
+        (provCount ? ' / <span style="color:#0369a1">🕗仮商品コード ' + provCount + '行 (貼り付けに含む)</span>' : '') +
         (newCount ? ' / <span style="color:#b45309">❓対応表になし ' + newCount + '行</span>' : '') +
         (j.mailId ? ' <span class="muted">(メール#' + j.mailId + ' — 貼り付けが済んだら下の一覧の ✅登録済み)</span>' : '') +
         ' <span class="muted">(ロジザード側の「入荷予定数合計」と一致するか確認)</span></div>';
@@ -5606,9 +5754,32 @@ function renderIpResult(j, req) {
         if (l.type === 'unmatched') {
           h += '<tr style="background:#fff7e6">' + left +
             '<td colspan="5"><span class="badge b-warn">❓ 対応表になし</span> ' +
-            '<span style="white-space:nowrap"><input type="text" list="ipProdDl" data-iprelinkq="' + li + '" placeholder="🔍 番号変更なら既存商品を検索" style="width:220px" title="先方番号が変わっただけの既存商品なら、ここで商品を検索して選び🔁で対応表を上書きします"> ' +
+            '<span style="white-space:nowrap"><input type="text" list="ipProdDl" data-iprelinkq="' + li + '" placeholder="🔍 既存商品を検索 / 新商品は仮商品コード" style="width:250px" title="番号が変わっただけの既存商品 → 商品を検索して選び🔁。新商品 → 弊社で決めた商品コード (仮商品コード) を入れて下の🕗仮登録 (貼り付けデータに含まれます)"> ' +
             '<button class="ghost sm" data-iprelink="' + li + '" title="選んだ商品の先方番号をこの番号に更新して対応表へ登録し、変換し直します (入数は維持)">🔁 この番号で再登録</button></span> ' +
-            '<span class="muted">新商品は下の🕗仮登録 → NE登録の翌朝以降にマスタ管理→📇対応表で紐づけ</span></td></tr>';
+            '<span class="muted">新商品は<b>仮商品コード</b>を入れて下の🕗仮登録 → 貼り付けに含まれます</span></td></tr>';
+          return;
+        }
+        // 仮商品コードの行: NE未登録でも貼り付けに含める。コード/入数はこの場で直せる (空にすると❓に戻る)
+        if (l.type === 'provisional') {
+          if (l.codeConflict) {
+            // 仮登録の後にそのコードが対応表へ入った (CSV取込等) → 貼り付けに同じ商品IDが2行出るので除外して知らせる
+            h += '<tr style="background:#fff7e6">' + left +
+              '<td colspan="5"><span class="badge b-warn">⚠ 仮商品コードが対応表と重複</span> ' +
+              '<input type="text" value="' + esc(l.provisionalCode) + '" data-ipprovcode="' + li + '" style="width:160px" title="仮商品コード"> ' +
+              '<button class="ghost sm" data-ipprovsave="' + li + '" title="仮商品コードを直して変換し直します (空にすると❓対応表になしに戻ります)">💾</button> ' +
+              '<span class="muted">' + esc(l.provisionalCode) + ' は既に商品 ' + esc(l.mappedProductCode) + ' (先方番号 ' + esc(l.mappedVendorCode) + ') に登録済みです。' +
+              'この行は貼り付けに含めていません — 番号変更なら📇対応表を直してください</span></td></tr>';
+            return;
+          }
+          h += '<tr style="background:#eff6ff">' + left +
+            '<td style="white-space:nowrap"><span class="badge">🕗仮</span> <input type="text" value="' + esc(l.provisionalCode) + '" data-ipprovcode="' + li + '" style="width:160px" title="仮商品コード (ロジザードへ貼り付ける商品ID)"></td>' +
+            '<td class="muted">' + esc(String(l.productName || '').slice(0, 40)) + '</td>' +
+            '<td class="r" style="white-space:nowrap"><input type="number" min="0" step="any" value="' + (l.qtyPerUnit === 1 ? '' : l.qtyPerUnit) + '" placeholder="1" style="width:64px" data-ipprovqpu="' + li + '" title="先方数量1あたりの弊社個数。空欄=換算なし">' +
+              '<button class="ghost sm" data-ipprovsave="' + li + '" title="仮商品コードと入数を保存して変換し直します (コードを空にすると❓対応表になしに戻ります)">💾</button></td>' +
+            '<td class="r">' + (l.qtyBad
+              ? '<span class="badge b-warn">⚠ 換算不正</span>'
+              : '<b>' + l.qty.toLocaleString('ja-JP') + '</b>' + (l.qtyPerUnit !== 1 ? ' <span class="muted" style="font-size:10px">(' + l.vendorQty.toLocaleString('ja-JP') + '×' + l.qtyPerUnit + ')</span>' : '')) + '</td>' +
+            '<td class="r">' + (l.cost == null ? '—' : yen(l.cost)) + '</td></tr>';
           return;
         }
         if (l.type === 'ambiguous') {
@@ -5645,10 +5816,21 @@ function renderIpResult(j, req) {
           ' (ロジザードで登録エラーになる場合があります)。<b>ダッシュボードの「📥 NE最新CSVを取込」を一度実行</b>すると全商品の表記が揃います: ' +
           esc(j.caseUnverified.slice(0, 10).join(', ')) + (j.caseUnverified.length > 10 ? ' …' : '') + '</div>';
       }
-      if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の橙色の行の入数を直して💾してください</div>';
+      if (j.qtyInvalid && j.qtyInvalid.length) h += '<div class="warn" style="margin-top:6px">⚠️ 入数換算が不正のため貼り付けから除外 ' + j.qtyInvalid.length + '行 — 表の該当行 (⚠換算不正) の入数を直して💾してください</div>';
+      if (provCount) {
+        h += '<div class="warn" style="margin-top:6px">🕗 <b>仮商品コードで出力 ' + provCount + '行</b> — ' +
+          esc(j.provisionalRows.map(function(p){ return p.productCode; }).join(', ')) +
+          '<br><span class="muted">この商品IDが<b>ロジザードの商品マスタに登録済み</b>でないと貼り付けでエラーになります。NE登録の翌朝以降にマスタ管理→📇対応表の「🕗未紐付けの先方番号」で正式に紐づけてください</span></div>';
+      }
+      if ((j.provisionalConflicts || []).length) {
+        h += '<div class="warn" style="margin-top:6px">⚠️ <b>仮商品コードが対応表と重複 ' + j.provisionalConflicts.length + '件</b> — ' +
+          esc(j.provisionalConflicts.map(function(c){ return c.provisionalCode + ' → ' + c.mappedProductCode + ' (先方番号 ' + c.mappedVendorCode + ')'; }).join(' / ')) +
+          '<br><span class="muted">同じ商品IDが貼り付けに2行出るため除外しました。仮商品コードを直すか、📇対応表の先方番号を直してください</span></div>';
+      }
       if (j.unmatched.length) {
         h += '<div class="warn" style="margin-top:8px"><b>❓ 対応表に無い先方番号 ' + j.unmatched.length + '件</b> (上の表の橙色の行。貼り付けデータには含まれていません) ' +
-          '<button class="pri" id="ipPend" style="margin-top:4px">🕗 この' + j.unmatched.length + '件を仮登録 (後日NE登録後に紐づけ)</button></div>';
+          '<button class="pri" id="ipPend" style="margin-top:4px">🕗 この' + j.unmatched.length + '件を仮登録 (後日NE登録後に紐づけ)</button>' +
+          '<div class="muted" style="font-size:11px;margin-top:2px">新商品は上の表の入力欄に<b>仮商品コード</b>を入れてから押すと、その行が貼り付けデータに加わります (空欄の行は番号だけ仮登録)</div></div>';
       }
       if (j.skipped.length) h += '<div class="muted" style="margin-top:4px">解析スキップ ' + j.skipped.length + '行 (番号や数量が読めない行)</div>';
       h += '</div>';
@@ -5717,17 +5899,65 @@ function renderIpResult(j, req) {
           }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
         });
       });
+      // 入力欄から仮商品コードを取り出す (「コード — 商品名」で選ばれていたらコード部分だけ)
+      function ipCodeOf(inp) {
+        var v = inp ? String(inp.value || '').trim() : '';
+        var d = v.indexOf(' — ');
+        return (d >= 0 ? v.slice(0, d) : v).trim();
+      }
+      // 🕗仮登録: ❓行の入力欄に入っている仮商品コードも一緒に登録する。
+      // コードを入れた行は次の変換から貼り付けデータに含まれるので、登録後に変換し直す
       var pd = document.getElementById('ipPend');
       if (pd) pd.addEventListener('click', function() {
+        var byNorm = {}; // 同じ番号が複数行にあるときは仮コードを入れた行を優先 (サーバ側は先勝ちで1件に潰す)
+        var order = [];
+        (j.lines || []).forEach(function(l, li) {
+          if (l.type !== 'unmatched') return;
+          var nk = String(l.vendorCode || '').trim().toUpperCase();
+          var item = { vendorCode: l.vendorCode, vendorName: l.vendorName, qty: l.vendorQty };
+          // 入力欄がある行だけ provisionalProductCode を送る。'' は「消す」指示なので、
+          // 欄が無い行にまで付けると既存の仮商品コードを消してしまう (Codex 仮コードR1 High)
+          var inp = area.querySelector('input[data-iprelinkq="' + li + '"]');
+          if (inp) item.provisionalProductCode = ipCodeOf(inp);
+          if (!byNorm[nk]) { byNorm[nk] = item; order.push(nk); }
+          else if (!byNorm[nk].provisionalProductCode && item.provisionalProductCode) byNorm[nk] = item;
+        });
+        var items = order.map(function(nk){ return byNorm[nk]; });
+        if (!items.length) { toast('仮登録する番号がありません'); return; }
+        var provN = items.filter(function(x){ return x.provisionalProductCode; }).length;
         pd.disabled = true;
         // 仕入先は「変換した時点」のもの (j.supplierCode) に固定。ボタン押下時にselectを変えていても誤登録しない (Codex plan-R1 High)
-        post(API + '/vendor-map/pending', { supplier_code: j.supplierCode, items: j.unmatched })
+        post(API + '/vendor-map/pending', { supplier_code: j.supplierCode, items: items })
           .then(function(r2) {
             pd.disabled = false;
-            if (!r2.ok) { toast('エラー: ' + r2.error); return; }
+            if (!r2.ok) { toast('エラー: ' + r2.error); return; } // 誤りがあれば1件も登録されない (入力欄はそのまま直せる)
             toast('仮登録しました (新規' + r2.added + '件/更新' + r2.refreshed + '件' +
-              (r2.skippedProcessed ? '/処理済みのためスキップ' + r2.skippedProcessed + '件' : '') + ')。NE登録の翌朝以降にマスタ管理→📇対応表で紐づけてください');
+              (r2.provisionalSet ? '/仮商品コード' + r2.provisionalSet + '件' : '') +
+              (r2.skippedProcessed ? '/処理済みのためスキップ' + r2.skippedProcessed + '件' : '') + ')。' +
+              (r2.provisionalSet ? '仮商品コードの行を貼り付けデータに入れて変換し直します' : 'NE登録の翌朝以降にマスタ管理→📇対応表で紐づけてください'));
+            if (provN) reconvertIp(); // 貼り付けデータを作り直す (コード未入力だけなら結果は変わらないので再変換しない)
           }).catch(function(e){ pd.disabled = false; toast('通信エラー: ' + e.message); });
+      });
+      // 🕗仮の行: 仮商品コード/入数の直し。コードを空にすると仮登録から外して❓対応表になしへ戻す
+      area.querySelectorAll('button[data-ipprovsave]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          var li = btn.getAttribute('data-ipprovsave');
+          var line = (j.lines || [])[Number(li)];
+          if (!line) return;
+          var code = ipCodeOf(area.querySelector('input[data-ipprovcode="' + li + '"]'));
+          var qpuInp = area.querySelector('input[data-ipprovqpu="' + li + '"]');
+          if (!code && !confirm('仮商品コードを消すと、この行は貼り付けデータから外れます。よろしいですか?')) return;
+          var item = { vendorCode: line.vendorCode, vendorName: line.vendorName, qty: line.vendorQty, provisionalProductCode: code };
+          if (qpuInp) item.provisionalQtyPerUnit = qpuInp.value.trim(); // 入数欄が無い行 (重複警告行) では入数を変更しない
+          btn.disabled = true;
+          post(API + '/vendor-map/pending', { supplier_code: j.supplierCode, items: [item] })
+            .then(function(r2) {
+              btn.disabled = false;
+              if (!r2.ok) { toast('エラー: ' + r2.error); return; }
+              toast(code ? '仮商品コードを保存しました — 変換し直します' : '仮商品コードを消しました — 変換し直します');
+              reconvertIp();
+            }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
+        });
       });
 }
 
@@ -8113,12 +8343,15 @@ function loadVmapPending() {
       if (!j.ok || !document.getElementById('vmPendArea')) return;
       if (!j.rows.length) { document.getElementById('vmPendArea').innerHTML = ''; return; }
       var h = '<h3 style="margin:0 0 4px">🕗 未紐付けの先方番号 (仮登録) ' + j.rows.length + '件</h3>' +
-        '<div class="hint">出荷明細に出てきたが対応表に無かった番号。新商品はNE登録の<b>翌朝以降</b>に商品検索で紐づけできます (商品マスタへ反映されるまで検索に出ません)。</div>' +
-        '<table class="t"><tr><th>先方番号</th><th>先方の商品名</th><th class="r">直近数量</th><th>登録日</th><th style="min-width:280px">紐づける商品</th><th></th></tr>';
+        '<div class="hint">出荷明細に出てきたが対応表に無かった番号。新商品はNE登録の<b>翌朝以降</b>に商品検索で紐づけできます (商品マスタへ反映されるまで検索に出ません)。' +
+        '<b>🕗仮商品コード</b>が入っている行は、入荷予定の貼り付けデータに既にそのコードで出力されています — 別のコードで紐づけるとロジザード側と食い違います。</div>' +
+        '<table class="t"><tr><th>先方番号</th><th>先方の商品名</th><th>仮商品コード</th><th class="r">直近数量</th><th>登録日</th><th style="min-width:280px">紐づける商品</th><th></th></tr>';
       j.rows.forEach(function(p) {
         h += '<tr><td><b>' + esc(p.vendor_code) + '</b></td><td class="muted">' + esc(p.vendor_name || '') + '</td>' +
+          '<td>' + (p.provisional_product_code ? '🕗 ' + esc(p.provisional_product_code) +
+            (p.provisional_qty_per_unit ? ' <span class="muted">(入数' + esc(p.provisional_qty_per_unit) + ')</span>' : '') : '<span class="muted">—</span>') + '</td>' +
           '<td class="r">' + (p.last_qty == null ? '—' : p.last_qty) + '</td><td class="muted">' + esc(String(p.created_at).slice(0, 10)) + '</td>' +
-          '<td><input type="text" list="vmProdDl" id="vmpProd-' + p.id + '" placeholder="🔍 商品コード / 商品名で検索" style="width:98%"></td>' +
+          '<td><input type="text" list="vmProdDl" id="vmpProd-' + p.id + '" value="' + esc(p.provisional_product_code || '') + '" placeholder="🔍 商品コード / 商品名で検索" style="width:98%"></td>' +
           '<td style="white-space:nowrap"><button class="pri sm" data-vmplink="' + p.id + '">🔗 紐づけ</button> ' +
           '<button class="ghost" data-vmpdismiss="' + p.id + '" title="入力ミス等でこの番号を使わない場合">✕ 破棄</button></td></tr>';
       });
@@ -8210,6 +8443,7 @@ document.addEventListener('click', function(ev) {
       t.disabled = false;
       if (!j.ok) { toast('エラー: ' + j.error); return; }
       toast('対応表へ登録しました' + (j.oldVendorCode ? ' (旧番号 ' + j.oldVendorCode + ' を上書き)' : ''));
+      if (j.warning) toast('⚠️ ' + j.warning);
       loadVmap();
     }).catch(function(e){ t.disabled = false; toast('通信エラー: ' + e.message); });
     return;
