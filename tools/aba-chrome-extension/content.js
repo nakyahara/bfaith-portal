@@ -66,10 +66,26 @@ async function renderProductPanel(asin) {
   if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(panel, anchor.nextSibling);
   else document.body.prepend(panel);
 
+  loadReverse(asin, body, 0);
+}
+
+// 逆引きの取得+描画。初回照会は miniPC 側で最新レポートのスキャンが走る (1〜2分) ため、
+// scanning 応答の間は 5秒間隔でポーリングする
+async function loadReverse(asin, body, attempt) {
   const res = await sendMessage({ type: 'reverse', asin });
   body.textContent = '';
   if (!res.ok) {
     body.appendChild(el('div', 'bfaba-error', `取得エラー: ${res.error}`));
+    return;
+  }
+  if (res.data.scanning) {
+    if (attempt >= 36) { // 3分待っても終わらないときは打ち切り (再読み込みで再開)
+      body.appendChild(el('div', 'bfaba-error', 'スキャンが完了しません。しばらくしてページを再読み込みしてください'));
+      return;
+    }
+    body.appendChild(el('div', 'bfaba-note',
+      `📡 初回照会: 最新レポートをスキャン中… (約1〜2分、次回から即表示) ${attempt * 5}秒経過`));
+    setTimeout(() => loadReverse(asin, body, attempt + 1), 5000);
     return;
   }
   const { terms, latestWeek, note } = res.data;

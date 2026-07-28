@@ -14,8 +14,11 @@
 import express from 'express';
 import SellingPartner from 'amazon-sp-api';
 import { initAbaDB, getAbaDB } from './db.js';
+import { streamTermGroups } from './aba-report-parser.js';
+import { findLatestReportFile, openReportStream } from './report-store.js';
 
 const router = express.Router();
+const STORE_TITLES = process.env.ABA_STORE_TITLES === '1';
 
 const ASIN_RE = /^[A-Z0-9]{10}$/;
 const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
@@ -109,8 +112,78 @@ function sanitizeAsins(input, max = 100) {
 }
 
 // ============================================================
-// GET /reverse — 注文ワード逆引き
+// 初回照会スキャン (蓄積しない設計の要)
+// DBには監視ASINの行しか無いため、未知ASINは最新週のレポートファイルを
+// その場で1パスして行を拾う (1〜2分)。要求は貯めて1パスにまとめる
+// (Keepa企画候補の一括登録が来ても全ASINを1回のスキャンで処理)。
 // ============================================================
+let scanRunning = null;             // 実行中スキャンチェーンの Promise
+let pendingScanAsins = new Set();   // 次のパスで拾うASIN
+const scanErrors = new Map();       // asin → 直近のスキャン失敗メッセージ
+
+const INSERT_TERM_SQL = `
+  INSERT OR REPLACE INTO aba_search_terms
+    (week_start, department, search_term, search_frequency_rank, click_position,
+     asin, product_title, click_share, conversion_share)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+async function scanPass(db, targets, file) {
+  const kept = [];
+  await streamTermGroups(openReportStream(file.path), (group) => {
+    if (group.some(r => targets.has(r.asin))) kept.push(...group);
+  });
+  const insert = db.prepare(INSERT_TERM_SQL);
+  const markScanned = db.prepare(`
+    UPDATE aba_watch_asins SET last_scanned_week = ?
+    WHERE asin = ? AND (last_scanned_week IS NULL OR last_scanned_week < ?)
+  `);
+  db.transaction(() => {
+    for (const r of kept) {
+      insert.run(file.week, r.department, r.search_term, r.search_frequency_rank,
+        r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
+        r.click_share, r.conversion_share);
+    }
+    for (const a of targets) {
+      markScanned.run(file.week, a, file.week);
+      scanErrors.delete(a);
+    }
+  })();
+  console.log(`[aba-ext] scan完了: ${targets.size}ASIN → ${kept.length}行 (week=${file.week})`);
+}
+
+function requestScan(db, asins) {
+  for (const a of asins) pendingScanAsins.add(a);
+  if (scanRunning) return;
+  scanRunning = (async () => {
+    while (pendingScanAsins.size > 0) {
+      const targets = pendingScanAsins;
+      pendingScanAsins = new Set();
+      // ファイルはパスごとに取り直す (スキャン中に週次処理が新しい週を保存した場合に追随)
+      const file = findLatestReportFile();
+      if (!file) { for (const a of targets) scanErrors.set(a, 'レポートファイルなし (初回週次取込前)'); continue; }
+      try {
+        await scanPass(db, targets, file);
+      } catch (e) {
+        console.error('[aba-ext] scan失敗:', e.message);
+        for (const a of targets) scanErrors.set(a, e.message);
+      }
+    }
+    scanRunning = null;
+  })();
+}
+
+/** スキャンが必要か (純粋な判定。予約は requestScan で別途行う) */
+function scanNeeded(db, asin) {
+  const hasRows = db.prepare('SELECT 1 FROM aba_search_terms WHERE asin = ? LIMIT 1').get(asin);
+  if (hasRows) return false;
+  const file = findLatestReportFile();
+  if (!file) return false; // スキャンしようがない (初回週次取込前)
+  const watch = db.prepare('SELECT last_scanned_week FROM aba_watch_asins WHERE asin = ?').get(asin);
+  if (watch && watch.last_scanned_week && watch.last_scanned_week >= file.week) return false; // スキャン済みで出現なし
+  if (scanErrors.has(asin)) return false; // 失敗はエラーとして返す (呼び直しで再予約される前に表示)
+  return true;
+}
 router.get('/reverse', (req, res) => {
   const asin = String(req.query.asin || '').trim().toUpperCase();
   if (!ASIN_RE.test(asin)) return res.status(400).json({ error: 'invalid_asin' });
@@ -118,15 +191,26 @@ router.get('/reverse', (req, res) => {
 
   const db = getAbaDB();
 
-  // 照会実績 → 監視対象 (古い週の prune から保護)
+  // 照会実績 → 監視対象 (以降の週次処理で自動追跡+prune保護)
   db.prepare(`
     INSERT INTO aba_watch_asins (asin, first_queried_at, last_queried_at, query_count)
     VALUES (?, datetime('now'), datetime('now'), 1)
     ON CONFLICT(asin) DO UPDATE SET last_queried_at = datetime('now'), query_count = query_count + 1
   `).run(asin);
 
+  // 未知ASIN → 最新レポートファイルをその場でスキャン (拡張側は scanning を見てポーリング)
+  if (scanNeeded(db, asin)) {
+    requestScan(db, [asin]);
+    return res.json({ asin, scanning: true, note: '初回照会: 最新レポートをスキャン中 (1〜2分)。次回からは即表示されます' });
+  }
+  if (scanErrors.has(asin)) {
+    const msg = scanErrors.get(asin);
+    scanErrors.delete(asin); // 次の照会で再試行できるようにする
+    return res.status(502).json({ error: `初回スキャン失敗: ${msg}`, asin });
+  }
+
   const ingestedWeeks = db.prepare(
-    'SELECT week_start, week_end FROM aba_weeks WHERE row_count > 0 ORDER BY week_start DESC LIMIT ?'
+    'SELECT week_start, week_end FROM aba_weeks WHERE parsed_count > 0 ORDER BY week_start DESC LIMIT ?'
   ).all(weeksLimit);
   if (ingestedWeeks.length === 0) {
     return res.json({ asin, weeks: [], terms: [], note: 'ABAレポート未取込 (初回取込前)' });
@@ -193,6 +277,34 @@ router.get('/reverse', (req, res) => {
   });
 
   res.json({ asin, latestWeek, weeks: ingestedWeeks, terms });
+});
+
+// ============================================================
+// POST /watch — 監視ASINの一括登録 (Keepa商品企画スカウト等の外部ツール用)
+// 登録したASINは①既存レポートを1パスのスキャンで即反映 ②以降の週次処理で自動追跡。
+// スカウトの候補リストを貼れば、全候補の注文ワードが /reverse で引けるようになる
+// ============================================================
+router.post('/watch', (req, res) => {
+  const asins = sanitizeAsins(req.body?.asins, 500);
+  if (!asins) return res.status(400).json({ error: 'invalid_asins (1〜500件のASIN配列)' });
+
+  const db = getAbaDB();
+  const upsert = db.prepare(`
+    INSERT INTO aba_watch_asins (asin, first_queried_at, last_queried_at, query_count)
+    VALUES (?, datetime('now'), datetime('now'), 0)
+    ON CONFLICT(asin) DO UPDATE SET last_queried_at = datetime('now')
+  `);
+  db.transaction(() => { for (const a of asins) upsert.run(a); })();
+
+  const toScan = asins.filter(a => scanNeeded(db, a));
+  if (toScan.length > 0) requestScan(db, toScan); // 全ASINを1回のファイルパスにまとめる
+  res.json({
+    registered: asins.length,
+    scanning: toScan.length,
+    note: toScan.length > 0
+      ? `既存レポートを1パスでスキャン中 (${toScan.length}ASIN、数分)。以降は週次で自動追跡`
+      : '全ASIN反映済みまたはスキャン不要。以降は週次で自動追跡',
+  });
 });
 
 // ============================================================
@@ -400,10 +512,19 @@ router.post('/offers', async (req, res) => {
 router.get('/status', (req, res) => {
   const db = getAbaDB();
   const weeks = db.prepare(
-    'SELECT week_start, week_end, term_count, row_count, ingested_at FROM aba_weeks ORDER BY week_start DESC LIMIT 8'
+    'SELECT week_start, week_end, term_count, row_count, parsed_count, ingested_at FROM aba_weeks ORDER BY week_start DESC LIMIT 8'
   ).all();
   const watch = db.prepare('SELECT COUNT(*) AS c FROM aba_watch_asins').get();
-  res.json({ ok: true, weeks, watchAsins: watch.c, offersEnabled: process.env.ABA_EXT_OFFERS === '1' });
+  const file = findLatestReportFile();
+  res.json({
+    ok: true,
+    weeks,
+    watchAsins: watch.c,
+    ingestMode: process.env.ABA_INGEST_MODE === 'full' ? 'full' : 'watched',
+    reportFileWeek: file ? file.week : null,
+    scanning: scanRunning != null,
+    offersEnabled: process.env.ABA_EXT_OFFERS === '1',
+  });
 });
 
 export default router;

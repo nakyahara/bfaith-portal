@@ -239,6 +239,33 @@ export async function parseAbaReportStream(source, onItem) {
 }
 
 /**
+ * 検索語グループ単位のストリーミング読み出し。
+ * レポートは同一検索語の行 (クリック上位1..3) が連続する前提で、正規化済み行を
+ * (department, search_term) ごとにまとめて onGroup に渡す。clickShareRank が無い
+ * 場合は連番で click_position を補完する。
+ * 「監視ASINを含む検索語グループだけ保存する」蓄積しない設計の中核ヘルパ。
+ * @returns {Promise<{itemCount: number, skipped: number}>}
+ */
+export async function streamTermGroups(source, onGroup) {
+  let skipped = 0;
+  let groupKey = null;
+  let group = [];
+  let posCounter = 0;
+  const flush = () => { if (group.length) onGroup(group); group = []; };
+  const { itemCount } = await parseAbaReportStream(source, (item) => {
+    const row = normalizeAbaItem(item);
+    if (!row) { skipped++; return; }
+    const key = JSON.stringify([row.department, row.search_term]);
+    if (key !== groupKey) { flush(); groupKey = key; posCounter = 0; }
+    posCounter++;
+    if (row.click_position == null) row.click_position = posCounter;
+    group.push(row);
+  });
+  flush();
+  return { itemCount, skipped };
+}
+
+/**
  * レポート要素 → aba_search_terms 行への正規化。
  * フィールド名はAmazonの仕様変更に備えて候補を複数見る (実レポートで要確認)。
  * @returns {object|null} 必須フィールド欠落時は null (呼び出し側でカウント)

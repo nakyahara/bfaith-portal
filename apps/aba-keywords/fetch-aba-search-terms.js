@@ -2,25 +2,38 @@
  * ABA「Amazon検索用語 (Top Search Terms)」週次レポート取込
  *
  * SP-API GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT (要: ブランド登録 + Brand Analytics ロール)
- * を取得し aba.db に蓄積する。セラースプライト「注文ワード」の置換 (2026-07-27)。
+ * を取得する。セラースプライト「注文ワード」の置換 (2026-07-27)。
+ *
+ * 蓄積しない設計 (中原さん方針):
+ *   - 既定 (ABA_INGEST_MODE=watched): 監視ASIN (aba_watch_asins = 拡張で照会した/企画候補
+ *     として登録したASIN) を含む検索語グループだけ DB に保存し、残りは捨てる。
+ *     DBは数MB規模。レポート本体は最新週のファイル1本だけ data/aba-reports/ に残し、
+ *     未知ASINの初回照会時に router がその場でスキャンする
+ *   - ABA_INGEST_MODE=full にすると全検索語を保存 (任意ASINが即答になる代わりにGB級)。
+ *     その場合の保持は ABA_KEEP_WEEKS 週 (監視ASINを含む語は無期限)
  *
  * 実行: node apps/aba-keywords/fetch-aba-search-terms.js [--week YYYY-MM-DD] [--backfill N] [--dry-run]
  *   - 引数なし: 直近の「完了した週 (日曜〜土曜, JST)」を対象
- *   - 取込済みの週は即スキップ (冪等)。daily-sync から毎朝呼んでも新しい週だけ取り込む
- *   - レポート未公開 (FATAL/CANCELLED) は正常終了扱いでスキップ (公開まで毎朝リトライになる)
+ *   - 処理済みの週は即スキップ (冪等)。daily-sync から毎朝呼んでも新しい週だけ処理
+ *   - レポート未公開 (直近週のFATAL/CANCELLED) は正常終了扱いでスキップ
+ *   - 監視ASINを増やした後に --backfill 4 を回すと過去週の履歴も埋まる
  *
  * メモリ注意: レポートは数百MB級。全体を JSON.parse せず streaming で流し込む
  * (miniPC は AES sorter OOM の前科があるため常に省メモリ側に倒す)。
  */
 import 'dotenv/config';
+import fs from 'fs';
 import SellingPartner from 'amazon-sp-api';
-import { createGunzip } from 'zlib';
-import { Readable } from 'stream';
 import { initAbaDB, closeAbaDB } from './db.js';
-import { parseAbaReportStream, normalizeAbaItem } from './aba-report-parser.js';
+import { streamTermGroups } from './aba-report-parser.js';
+import { downloadReportToFile, openReportStream, cleanupReportFiles } from './report-store.js';
 
 const REPORT_TYPE = 'GET_BRAND_ANALYTICS_SEARCH_TERMS_REPORT';
-const KEEP_WEEKS = Math.max(4, parseInt(process.env.ABA_KEEP_WEEKS || '26', 10) || 26);
+const MODE = process.env.ABA_INGEST_MODE === 'full' ? 'full' : 'watched';
+// fullモード時のみ: 全検索語の保持週数 (監視ASINを含む語は無期限)
+const KEEP_WEEKS = Math.max(4, parseInt(process.env.ABA_KEEP_WEEKS || '8', 10) || 8);
+// 商品タイトルは1行あたりの容量を数倍にする割に拡張UIでは未使用のため既定で保存しない
+const STORE_TITLES = process.env.ABA_STORE_TITLES === '1';
 const POLL_INTERVAL_MS = 15000;
 const POLL_MAX = 120;           // 15s × 120 = 30分
 
@@ -37,7 +50,7 @@ const BACKFILL = Math.min(12, Math.max(1, parseInt(argValue('--backfill') || '1'
 // ---- JST 週計算 (toISOString の UTC ズレ罠を避けるため UTC+9 を明示加算) ----
 function jstToday() {
   const t = new Date(Date.now() + 9 * 3600 * 1000);
-  return { y: t.getUTCFullYear(), m: t.getUTCMonth(), d: t.getUTCDate(), dow: t.getUTCDay() };
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth(), d: t.getUTCDate() };
 }
 function fmt(dateUtcMs) {
   const t = new Date(dateUtcMs);
@@ -100,14 +113,14 @@ function withTimeout(promise, ms, label = '') {
 }
 
 /**
- * 1週分を取得して取込。
+ * 1週分を取得して処理。
  * @returns {'ingested'|'already'|'unavailable'} 結果種別
  */
 async function ingestWeek(db, { weekStart, weekEnd }) {
-  // 台帳に行がある = 取込完了済み (台帳は取込がすべて成功した後にだけ書くので、中断時は残らない)
-  const existing = db.prepare('SELECT row_count FROM aba_weeks WHERE week_start = ?').get(weekStart);
+  // 台帳に行がある = 処理完了済み (台帳は処理がすべて成功した後にだけ書くので、中断時は残らない)
+  const existing = db.prepare('SELECT row_count, parsed_count FROM aba_weeks WHERE week_start = ?').get(weekStart);
   if (existing) {
-    console.log(`[ABA] ${weekStart}〜${weekEnd}: 取込済み (${existing.row_count}行) → skip`);
+    console.log(`[ABA] ${weekStart}〜${weekEnd}: 処理済み (全${existing.parsed_count}行/保存${existing.row_count}行) → skip`);
     return 'already';
   }
 
@@ -160,18 +173,23 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
     options: { version: '2021-06-30' },
   }), 30000, 'getReportDocument');
 
+  // ファイルへ保存してから解析 (初回照会スキャンで再利用するため + ネットワーク切断と
+  // DB トランザクションを分離するため)
   console.log(`[ABA] ダウンロード開始 (compression=${doc.compressionAlgorithm || 'none'})`);
-  const res = await fetch(doc.url, { signal: AbortSignal.timeout(15 * 60 * 1000) });
-  if (!res.ok || !res.body) throw new Error(`レポートDL失敗: HTTP ${res.status}`);
-  let stream = Readable.fromWeb(res.body);
-  if (doc.compressionAlgorithm === 'GZIP') stream = stream.pipe(createGunzip());
+  const filePath = await downloadReportToFile(doc.url, doc.compressionAlgorithm === 'GZIP', weekStart);
+  const fileMB = Math.round(fs.statSync(filePath).size / 1e6);
+  console.log(`[ABA] 保存完了: ${filePath} (${fileMB}MB) → 解析開始 (mode=${MODE})`);
 
   if (DRY_RUN) {
-    let count = 0;
-    await parseAbaReportStream(stream, () => { count++; });
-    console.log(`[ABA] dry-run: ${count}行 (書き込みなし)`);
+    let groups = 0, rows = 0;
+    const { skipped } = await streamTermGroups(openReportStream(filePath), (g) => { groups++; rows += g.length; });
+    console.log(`[ABA] dry-run: ${groups}検索語 / ${rows}行 (skip=${skipped}、書き込みなし)`);
     return 'ingested';
   }
+
+  const watchSet = MODE === 'watched'
+    ? new Set(db.prepare('SELECT asin FROM aba_watch_asins').all().map(r => r.asin))
+    : null;
 
   const insert = db.prepare(`
     INSERT OR REPLACE INTO aba_search_terms
@@ -179,57 +197,62 @@ async function ingestWeek(db, { weekStart, weekEnd }) {
        asin, product_title, click_share, conversion_share)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  let rowCount = 0;
-  let skipped = 0;
-  const terms = new Set();
-  // clickShareRank が無い場合に備えた連番 fallback (レポートは同一検索語の行が連続する前提)
-  let lastTermKey = '';
-  let posCounter = 0;
 
-  // 行データと完了台帳を単一トランザクションで確定する (Codex R1 medium):
-  //   - 途中失敗 → ROLLBACK で痕跡ゼロ (次回まっさらに再取込)
+  let parsed = 0, kept = 0, termsKept = 0, skippedRows = 0;
+
+  // 保存行と完了台帳を単一トランザクションで確定する (Codex R1 medium):
+  //   - 途中失敗 → ROLLBACK で痕跡ゼロ (次回まっさらに再処理)
   //   - 週の先頭で DELETE → 再生成レポートで消えた行・旧ロジックの行が残らない
-  // WAL なので取込中も router の読み取りはブロックされない。書き手はこのジョブのみ。
+  // WAL なので処理中も router の読み取りはブロックされない。
   // better-sqlite3 の .transaction() は async ストリームを跨げないため明示 BEGIN/COMMIT を使う。
   db.exec('BEGIN IMMEDIATE');
   try {
     db.prepare('DELETE FROM aba_search_terms WHERE week_start = ?').run(weekStart);
 
-    await parseAbaReportStream(stream, (item) => {
-      const row = normalizeAbaItem(item);
-      if (!row) { skipped++; return; }
-      const termKey = JSON.stringify([row.department, row.search_term]);
-      if (termKey === lastTermKey) posCounter++; else { lastTermKey = termKey; posCounter = 1; }
-      if (row.click_position == null) row.click_position = posCounter;
-      terms.add(termKey);
-      insert.run(weekStart, row.department, row.search_term, row.search_frequency_rank,
-        row.click_position, row.asin, row.product_title, row.click_share, row.conversion_share);
-      rowCount++;
+    const { skipped } = await streamTermGroups(openReportStream(filePath), (group) => {
+      parsed += group.length;
+      if (watchSet && !group.some(r => watchSet.has(r.asin))) return;
+      for (const r of group) {
+        insert.run(weekStart, r.department, r.search_term, r.search_frequency_rank,
+          r.click_position, r.asin, STORE_TITLES ? r.product_title : null,
+          r.click_share, r.conversion_share);
+        kept++;
+      }
+      termsKept++;
     });
+    skippedRows = skipped;
 
-    // 0行取込は台帳に書かずハード失敗 (書くと「取込済み」でサイレント欠落が確定する):
-    //   skipped>0 = フィールド名が想定と違う (仕様変更) / skipped=0 = 空レポート (想定外)
-    if (rowCount === 0) {
-      throw new Error(skipped > 0
-        ? `全${skipped}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`
-        : '取込0行 (空レポート) — ABA週次が空になることは想定外のため要確認');
+    // 全行 parse 不能は台帳に書かずハード失敗 (書くと「処理済み」でサイレント欠落が確定する)
+    if (parsed === 0) {
+      throw new Error(skippedRows > 0
+        ? `全${skippedRows}行が必須フィールド欠落で skip — レポート形式が想定と異なる (normalizeAbaItem 要確認)`
+        : '解析0行 (空レポート) — ABA週次が空になることは想定外のため要確認');
     }
 
     db.prepare(`
-      INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count)
-      VALUES (?, ?, datetime('now'), ?, ?)
-    `).run(weekStart, weekEnd, terms.size, rowCount);
+      INSERT OR REPLACE INTO aba_weeks (week_start, week_end, ingested_at, term_count, row_count, parsed_count)
+      VALUES (?, ?, datetime('now'), ?, ?, ?)
+    `).run(weekStart, weekEnd, termsKept, kept, parsed);
+
+    // 監視ASINはこのパスで走査済み → 初回照会スキャンの対象から外す
+    db.prepare(`
+      UPDATE aba_watch_asins SET last_scanned_week = ?
+      WHERE last_scanned_week IS NULL OR last_scanned_week < ?
+    `).run(weekStart, weekStart);
+
     db.exec('COMMIT');
   } catch (e) {
     try { db.exec('ROLLBACK'); } catch { /* BEGIN前の失敗等は無視 */ }
+    // 解析に失敗したファイルはスキャンにも使えないため残さない
+    try { fs.unlinkSync(filePath); } catch { /* 無ければ無視 */ }
     throw e;
   }
 
-  console.log(`[ABA] ${weekStart}: 取込完了 ${rowCount}行 / ${terms.size}検索語 (不正行skip=${skipped})`);
+  console.log(`[ABA] ${weekStart}: 処理完了 全${parsed}行 → 保存${kept}行/${termsKept}検索語 (mode=${MODE}, 不正行skip=${skippedRows})`);
   return 'ingested';
 }
 
-/** 保持期間を過ぎた週から、監視ASINを含まない検索語を削除 */
+/** fullモードのみ: 保持期間を過ぎた週から、監視ASINを含まない検索語を削除 */
 function pruneOldWeeks(db, anchorWeekStart) {
   const [y, m, d] = anchorWeekStart.split('-').map(Number);
   const cutoff = fmt(Date.UTC(y, m - 1, d) - KEEP_WEEKS * 7 * 86400000);
@@ -261,9 +284,13 @@ async function main() {
     else if (r === 'already') already++;
     else unavailable++;
   }
-  if (!DRY_RUN && ingested > 0) pruneOldWeeks(db, targets[0].weekStart);
+  if (!DRY_RUN) {
+    if (MODE === 'full' && ingested > 0) pruneOldWeeks(db, targets[0].weekStart);
+    // レポートファイルは最新1本だけ残す (初回照会スキャン用)。--backfill 中の過去週分もここで掃除
+    cleanupReportFiles(1);
+  }
 
-  // 鮮度アラーム: 過去に取込実績があるのに3週間以上新しい週が入らない場合はハード失敗。
+  // 鮮度アラーム: 過去に処理実績があるのに3週間以上新しい週が入らない場合はハード失敗。
   // 対象週は毎週転がるため「直近週の未公開skip」だけでは恒久障害 (権限剥奪・仕様変更) が
   // 永遠にサイレントになる。ここが最後の検知線 (初回セットアップ中 = 台帳空なら鳴らさない)
   if (ingested === 0) {
@@ -273,15 +300,16 @@ async function main() {
       const ageDays = Math.floor((Date.now() + 9 * 3600 * 1000 - Date.UTC(ly, lm - 1, ld)) / 86400000);
       if (ageDays > 21) {
         closeAbaDB();
-        throw new Error(`最終取込週 (〜${latest.we}) から${ageDays}日間 新しい週が取り込めていない — 権限/仕様変更を疑う`);
+        throw new Error(`最終処理週 (〜${latest.we}) から${ageDays}日間 新しい週が処理できていない — 権限/仕様変更を疑う`);
       }
     }
   }
 
-  const weekRows = db.prepare('SELECT COUNT(*) AS c FROM aba_weeks WHERE row_count > 0').get();
+  const stats = db.prepare('SELECT COUNT(*) AS weeks FROM aba_weeks WHERE parsed_count > 0').get();
+  const watch = db.prepare('SELECT COUNT(*) AS c FROM aba_watch_asins').get();
   closeAbaDB();
   // 最終行 = daily-sync が拾うサマリ
-  console.log(`ABA検索ワード: 新規${ingested}週 / 取込済${already}週 / 未公開${unavailable}週 (DB保有${weekRows.c}週)`);
+  console.log(`ABA検索ワード: 新規${ingested}週 / 処理済${already}週 / 未公開${unavailable}週 (DB保有${stats.weeks}週・監視${watch.c}ASIN, mode=${MODE})`);
 }
 
 main().catch((err) => {
