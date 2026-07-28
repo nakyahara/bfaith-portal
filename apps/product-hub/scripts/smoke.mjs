@@ -1053,6 +1053,17 @@ const igRoot = ichiba.normalizeGenreSearch({
 check('ichiba: root は path に含めない・子は child ラップを剥がす',
   ichiba.genrePathOf(igRoot) === '' && igRoot.children[0].genreId === '100371'
   && igRoot.children[0].name === 'レディースファッション');
+// env 未設定時の fail-closed (ツリー=設定案内 / 提案=資格情報エラー)
+delete process.env.RAKUTEN_WS_APP_ID;
+delete process.env.RAKUTEN_APP_ID;
+delete process.env.RAKUTEN_ACCESS_KEY;
+const treeNoEnv = await ichiba.fetchGenreChildren('0');
+check('ichiba: RAKUTEN_WS_APP_ID 未設定はセットアップ案内 (API を叩かない)',
+  treeNoEnv.ok === false && treeNoEnv.needsSetup === true && /RAKUTEN_WS_APP_ID/.test(treeNoEnv.error));
+const sugNoEnv = await ichiba.suggestGenreByName('テスト商品');
+check('ichiba: 資格情報が両方無ければ提案もエラー (API を叩かない)',
+  sugNoEnv.ok === false && /資格情報/.test(sugNoEnv.error));
+
 check('ichiba: 壊れた応答も落ちない',
   JSON.stringify(ichiba.normalizeGenreSearch({})) === JSON.stringify({ current: null, parents: [], children: [] }));
 

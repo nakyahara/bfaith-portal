@@ -704,7 +704,7 @@ router.get('/api/rakuten/genre-children', async (req, res) => {
   const genreId = cleanText(req.query?.genre_id, 12) || '0';
   try {
     const r = await fetchGenreChildren(genreId);
-    if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
+    if (!r.ok) return res.status(r.needsSetup ? 503 : 502).json({ ok: false, error: r.error, needsSetup: r.needsSetup === true });
     res.json({ ok: true, current: r.current, parents: r.parents, children: r.children, path: genrePathOf(r) });
   } catch (e) {
     const status = e?.statusCode === 503 ? 503 : 502;
@@ -719,7 +719,21 @@ router.get('/api/drafts/:id/rakuten/genre-suggest', async (req, res) => {
   try {
     const r = await suggestGenreByName(draft.name);
     if (!r.ok) return res.status(502).json({ ok: false, error: r.error });
-    res.json({ ok: true, candidates: r.candidates });
+    // 候補のフルパスは RMS 属性辞書 (miniPC 経由・DB キャッシュあり) で補完する。
+    // 旧ホストのジャンルAPIに依存しない + 末端でないジャンルは 404 になるので自然に落ちる
+    const db = getDB();
+    // miniPC 障害時に画面表示を道連れにしない (Codex high):
+    //   ①鮮度を問わず DB キャッシュを先に使う ②未キャッシュ分だけ短い timeout (10s) で並列取得
+    const candidates = await Promise.all((r.candidates || []).map(async (c) => {
+      const cached = getCachedGenreAttributes(db, c.genreId);
+      if (cached) return { genreId: c.genreId, count: c.count, path: cached.genrePath || cached.genreName || c.genreId };
+      try {
+        const g = await fetchGenreAttributes(db, c.genreId, { timeoutMs: 10_000 });
+        if (g.ok) return { genreId: c.genreId, count: c.count, path: g.genre.genrePath || g.genre.genreName || c.genreId };
+      } catch (_) { /* miniPC 不達などはその候補だけ落とす */ }
+      return null;
+    }));
+    res.json({ ok: true, candidates: candidates.filter(Boolean) });
   } catch (e) {
     const status = e?.statusCode === 503 ? 503 : 502;
     res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
