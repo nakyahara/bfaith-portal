@@ -493,6 +493,63 @@ console.log('── 上限条件 (出荷制限) ──');
   ok(ev.auto && ev.auto.met === false, '上限: 360は超過でNG', ev.auto);
 }
 
+console.log('── ケース・ロット系条件タイプ (旧GAS参照ツール移植: ジョンズブレンド/パシーマ等) ──');
+{
+  // 数量[ケース]: ケースロット優先、無ければ発注ロット単位で換算
+  const cases = { condition_type: '数量', condition_value: 3, unit: 'ケース' };
+  const keys = new Set(['a', 'b', 'c']);
+  let ev = evaluateCondition(cases, keys, [
+    { key: 'a', qty: 48, cost: 100, caseLot: 48 },          // 1ケース
+    { key: 'b', qty: 60, cost: 100, lot: 30 },              // ロット換算で2ケース
+  ]);
+  ok(ev.auto && ev.auto.kind === 'cases' && ev.auto.current === 3 && ev.auto.met === true, '数量[ケース]: 48/48 + 60/30 = 3ケースで充足', ev.auto);
+  ev = evaluateCondition(cases, keys, [{ key: 'a', qty: 72, cost: 100, caseLot: 48 }]);
+  ok(ev.auto && ev.auto.current === 1.5 && ev.auto.met === false, '数量[ケース]: 端数は小数ケースで未達', ev.auto);
+  ev = evaluateCondition(cases, keys, [{ key: 'c', qty: 10, cost: 100 }]);
+  ok(ev.auto && ev.auto.met === false && ev.auto.noSize.length === 1, '数量[ケース]: 入数不明はnoSizeに記録し数えない', ev.auto);
+
+  // ケース入数かつ金額 (ジョンズブレンド): ケースグループ合算がケースロットの倍数 + 金額下限
+  const ja = { condition_type: 'ケース入数かつ金額', condition_value: 50000, unit: '円' };
+  const jkeys = new Set(['j1', 'j2', 'j3', 'solo', 'noinfo']);
+  ev = evaluateCondition(ja, jkeys, [
+    { key: 'j1', qty: 100, cost: 300, caseGroup: 'OA-JON-1', caseLot: 144 },
+    { key: 'j2', qty: 44, cost: 300, caseGroup: 'OA-JON-1', caseLot: 144 },   // グループ計144 = 1ケース
+  ]);
+  ok(ev.auto && ev.auto.kind === 'caseAmount' && ev.auto.met === false && ev.auto.amountMet === false && ev.auto.misaligned.length === 0,
+    'ケース入数かつ金額: 混載でグループ計がケースちょうど (金額未達でmet=false)', ev.auto);
+  ev = evaluateCondition(ja, jkeys, [
+    { key: 'j1', qty: 144, cost: 300, caseGroup: 'OA-JON-1', caseLot: 144 },
+    { key: 'j3', qty: 30, cost: 610, caseGroup: 'OA-JON-2', caseLot: 30 },
+  ]);
+  ok(ev.auto && ev.auto.met === true && ev.auto.misaligned.length === 0 && ev.sumAmount === 144 * 300 + 30 * 610,
+    'ケース入数かつ金額: 全グループ整列 + 金額充足でmet', ev.auto);
+  ev = evaluateCondition(ja, jkeys, [
+    { key: 'j1', qty: 100, cost: 600, caseGroup: 'OA-JON-1', caseLot: 144 },  // 144の倍数でない
+    { key: 'solo', qty: 25, cost: 100, caseLot: 12 },                          // グループ無し単品: 12の倍数でない
+    { key: 'noinfo', qty: 5, cost: 100 },                                      // ケース情報なし
+  ]);
+  ok(ev.auto && ev.auto.met === false && ev.auto.misaligned.length === 2 && ev.auto.noInfo.length === 1,
+    'ケース入数かつ金額: グループズレ+単品ズレをmisaligned、情報なしはnoInfo', ev.auto);
+
+  // ロット倍率 (パシーマ): 各商品 ロット×倍率 の倍数で発注
+  const lm = { condition_type: 'ロット倍率', condition_value: 2, unit: '倍' };
+  const pkeys = new Set(['p1', 'p2']);
+  ev = evaluateCondition(lm, pkeys, [{ key: 'p1', qty: 20, cost: 6050, lot: 10 }]);
+  ok(ev.auto && ev.auto.kind === 'lotMultiple' && ev.auto.met === true, 'ロット倍率2: lot10×2=20個はOK', ev.auto);
+  ev = evaluateCondition(lm, pkeys, [{ key: 'p1', qty: 30, cost: 6050, lot: 10 }, { key: 'p2', qty: 28, cost: 4900, lot: 14 }]);
+  ok(ev.auto && ev.auto.met === false && ev.auto.off.length === 1 && ev.auto.off[0].key === 'p1' && ev.auto.off[0].step === 20,
+    'ロット倍率2: 30個 (20の倍数でない) だけ違反', ev.auto);
+  ev = evaluateCondition(lm, pkeys, [{ key: 'p1', qty: 10, cost: 100 }]);
+  ok(ev.auto && ev.auto.met === true && ev.auto.unknown.length === 1, 'ロット倍率: ロット不明はunknownに記録しmetは下げない', ev.auto);
+
+  // ロット倍率以上 (ノアテック): 各商品 ロット×倍率 以上を発注
+  const lmin = { condition_type: 'ロット倍率以上', condition_value: 2, unit: '倍' };
+  ev = evaluateCondition(lmin, pkeys, [{ key: 'p1', qty: 60, cost: 750, lot: 30 }]);
+  ok(ev.auto && ev.auto.kind === 'lotMin' && ev.auto.met === true, 'ロット倍率以上2: lot30で60個はOK', ev.auto);
+  ev = evaluateCondition(lmin, pkeys, [{ key: 'p1', qty: 30, cost: 750, lot: 30 }]);
+  ok(ev.auto && ev.auto.met === false && ev.auto.off[0].min === 60, 'ロット倍率以上2: 30個は最低60個未満でNG', ev.auto);
+}
+
 console.log('── 商品別モール販売内訳 API ──');
 {
   const now = new Date().toISOString();

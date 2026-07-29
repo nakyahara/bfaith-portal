@@ -308,7 +308,8 @@ function productDto(p) {
     stockMonths: Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
     cost: p.cost, price: p.price, lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
     conditionId: p.conditionId, materialGroupId: p.materialGroupId,
-    capacityPerUnit: p.capacityPerUnit, recentIssued: p.recentIssued,
+    capacityPerUnit: p.capacityPerUnit, caseGroup: p.caseGroup || '', caseLot: p.caseLot || null,
+    recentIssued: p.recentIssued,
     selectableLow: p.selectableLow || null,
   };
 }
@@ -4065,22 +4066,120 @@ function capBarHtml(cartQ, issuedQ, cap, unit) {
     (over ? ' — <b>⚠ ' + (cur - cap).toLocaleString('ja-JP') + u + ' 超過</b>' : ' ✅') +
     '<span class="bar"><span style="width:' + pct + '%"></span></span></span>';
 }
+// 条件グループの評価 (サーバ logic.js evaluateCondition と同じ解釈。ゲージ/確定前チェックで共通)。
+// 返り値 kind: qty/amount/cap = 従来3タイプ、cases/caseAmount/lotMultiple/lotMin = 旧GAS参照ツール由来の
+// ケース・ロット系タイプ、manual = 未知タイプ (条件文を表示して人間が判断)
+function condEval(c, items) {
+  var mem = {}; c.memberCodes.forEach(function(x){ mem[x] = 1; });
+  var inG = items.filter(function(i){ return c.supplierWide || mem[i.code]; });
+  var sumQ = 0, sumA = 0;
+  inG.forEach(function(i){ sumQ += i.qty; sumA += i.qty * (i.cost || 0); });
+  var r = { sumQ: sumQ, sumA: sumA, kind: 'manual' };
+  if (c.conditionType === '金額') {
+    r.kind = 'amount'; r.met = sumA >= c.conditionValue;
+  } else if (c.conditionType === '数量' && (c.unit === '個' || !c.unit)) {
+    r.kind = 'qty'; r.met = sumQ >= c.conditionValue;
+  } else if (c.conditionType === '上限') {
+    r.kind = 'cap'; r.met = sumQ + issuedMonthFor(c) <= c.conditionValue;
+  } else if (c.conditionType === '数量' && c.unit === 'ケース') {
+    // ケース換算: ケースロット(商品紐付けマスタ) 優先、無ければ発注ロット単位を1ケースとみなす
+    r.kind = 'cases'; r.cases = 0; r.noSize = [];
+    inG.forEach(function(i) {
+      var p = byCode[i.code];
+      var size = (p && (p.caseLot || p.lot)) || 0;
+      if (size > 0) r.cases += i.qty / size; else r.noSize.push(i.code);
+    });
+    r.cases = Math.round(r.cases * 100) / 100;
+    r.met = r.cases >= c.conditionValue;
+  } else if (c.conditionType === 'ケース入数かつ金額') {
+    // 金額下限 + ケースグループごとに Σ数量がケースロット (ケース入数) の倍数。
+    // 同グループ内は種類を混載できるが、合計はケースちょうどで発注する (例: ジョンズブレンド)
+    r.kind = 'caseAmount'; r.amountMet = sumA >= c.conditionValue;
+    var grp = {}; r.misaligned = []; r.noInfo = [];
+    inG.forEach(function(i) {
+      var p = byCode[i.code];
+      var cg = p && p.caseGroup, cl = (p && p.caseLot) || 0;
+      if (cg) {
+        if (!grp[cg]) grp[cg] = { qty: 0, lot: 0 };
+        grp[cg].qty += i.qty;
+        if (cl > grp[cg].lot) grp[cg].lot = cl;
+      } else if (cl > 0) {
+        if (i.qty % cl !== 0) r.misaligned.push({ group: i.code, qty: i.qty, lot: cl });
+      } else r.noInfo.push(i.code);
+    });
+    Object.keys(grp).forEach(function(gname) {
+      var g = grp[gname];
+      if (g.lot > 0) { if (g.qty % g.lot !== 0) r.misaligned.push({ group: gname, qty: g.qty, lot: g.lot }); }
+      else r.noInfo.push(gname);
+    });
+    r.met = r.amountMet && r.misaligned.length === 0;
+  } else if (c.conditionType === 'ロット倍率' || c.conditionType === 'ロット倍率以上') {
+    // ロット倍率: 各商品 (ロット×倍率) の倍数で発注 / ロット倍率以上: 各商品 (ロット×倍率) 以上を発注
+    r.kind = c.conditionType === 'ロット倍率' ? 'lotMultiple' : 'lotMin';
+    r.off = []; r.unknown = [];
+    inG.forEach(function(i) {
+      var p = byCode[i.code];
+      var base = ((p && p.lot) || 0) * c.conditionValue;
+      if (!(base > 0)) { r.unknown.push(i.code); return; }
+      if (r.kind === 'lotMultiple') { if (i.qty % base !== 0) r.off.push({ code: i.code, qty: i.qty, step: base }); }
+      else { if (i.qty < base) r.off.push({ code: i.code, qty: i.qty, min: base }); }
+    });
+    r.met = r.off.length === 0;
+  }
+  return r;
+}
+function numJa(v){ return Number(v).toLocaleString('ja-JP'); }
+// ケース・ロット系のデータ不備バッジ (met は下げず人間に知らせる)
+function condWarnBadges(ev) {
+  var h = '';
+  if (ev.noSize && ev.noSize.length) h += ' <span class="badge b-warn" title="ケースロット/発注ロット単位が未設定の商品はケース数に数えられていません: ' + esc(ev.noSize.join(', ')) + '">入数未設定' + ev.noSize.length + '件</span>';
+  if (ev.noInfo && ev.noInfo.length) h += ' <span class="badge b-warn" title="ケースグループ/ケースロット未設定 (マスタ管理→商品紐付けで設定): ' + esc(ev.noInfo.join(', ')) + '">ケース情報なし' + ev.noInfo.length + '件</span>';
+  if (ev.unknown && ev.unknown.length) h += ' <span class="badge b-warn" title="発注ロット単位が不明のため判定できません: ' + esc(ev.unknown.join(', ')) + '">ロット不明' + ev.unknown.length + '件</span>';
+  return h;
+}
+// ケース単位ズレ・ロット違反の明細行 (ゲージ下に表示)
+function condOffListHtml(ev) {
+  var rows = [];
+  (ev.misaligned || []).forEach(function(m) {
+    var next = Math.ceil(m.qty / m.lot) * m.lot;
+    rows.push('⚠ ' + esc(m.group) + ': ' + numJa(m.qty) + '個 — ' + numJa(m.lot) + '個/ケースの倍数で (あと' + numJa(next - m.qty) + '個 か ' + numJa(m.qty - (next - m.lot)) + '個減)');
+  });
+  (ev.off || []).forEach(function(o) {
+    if (o.step != null) {
+      var nx = Math.ceil(o.qty / o.step) * o.step;
+      rows.push('⚠ ' + esc(o.code) + ': ' + numJa(o.qty) + '個 — ' + numJa(o.step) + '個単位で (あと' + numJa(nx - o.qty) + '個 か ' + numJa(o.qty - (nx - o.step)) + '個減)');
+    } else {
+      rows.push('⚠ ' + esc(o.code) + ': ' + numJa(o.qty) + '個 — 最低 ' + numJa(o.min) + '個から');
+    }
+  });
+  return rows.length ? '<span class="muted" style="display:block">' + rows.join('<br>') + '</span>' : '';
+}
 function gaugeHtml(k) {
   var items = cartItems();
   if (k.slice(0, 2) === 'c:') {
     var c = condById[k.slice(2)];
     if (!c) return '<span class="badge b-warn">条件グループ未登録: ' + esc(k.slice(2)) + '</span>';
-    var mem = {}; c.memberCodes.forEach(function(x){ mem[x] = 1; });
-    var sumQ = 0, sumA = 0;
-    items.forEach(function(i){ if (c.supplierWide || mem[i.code]) { sumQ += i.qty; sumA += i.qty * (i.cost || 0); } });
-    if (c.conditionType === '金額')
+    var ev = condEval(c, items);
+    var sumQ = ev.sumQ, sumA = ev.sumA;
+    if (ev.kind === 'amount')
       return barHtml(sumA, c.conditionValue, yen(sumA) + ' / ' + yen(c.conditionValue), 'あと ' + yen(Math.max(0, c.conditionValue - sumA)));
-    if (c.conditionType === '数量' && (c.unit === '個' || !c.unit))
-      return barHtml(sumQ, c.conditionValue, sumQ.toLocaleString('ja-JP') + ' / ' + c.conditionValue.toLocaleString('ja-JP') + ' 個', 'あと ' + Math.max(0, c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
-    if (c.conditionType === '上限')
+    if (ev.kind === 'qty')
+      return barHtml(sumQ, c.conditionValue, numJa(sumQ) + ' / ' + numJa(c.conditionValue) + ' 個', 'あと ' + numJa(Math.max(0, c.conditionValue - sumQ)) + ' 個');
+    if (ev.kind === 'cap')
       return capBarHtml(sumQ, issuedMonthFor(c), c.conditionValue, c.unit);
+    if (ev.kind === 'cases')
+      return barHtml(ev.cases, c.conditionValue, numJa(ev.cases) + ' / ' + numJa(c.conditionValue) + ' ケース', 'あと ' + numJa(Math.max(0, Math.round((c.conditionValue - ev.cases) * 100) / 100)) + ' ケース') + condWarnBadges(ev);
+    if (ev.kind === 'caseAmount')
+      return barHtml(sumA, c.conditionValue, yen(sumA) + ' / ' + yen(c.conditionValue), 'あと ' + yen(Math.max(0, c.conditionValue - sumA))) +
+        (ev.misaligned.length ? ' <span class="badge b-warn">⚠ ケース単位ズレ' + ev.misaligned.length + '件</span>' : (sumQ > 0 ? ' <span class="badge b-issued">ケース単位OK</span>' : '')) +
+        condWarnBadges(ev) + condOffListHtml(ev);
+    if (ev.kind === 'lotMultiple' || ev.kind === 'lotMin')
+      return (ev.met && (sumQ > 0 || !ev.unknown.length)
+          ? '<span class="badge b-issued">✅ ロット×' + numJa(c.conditionValue) + (ev.kind === 'lotMultiple' ? '単位' : '以上') + '</span>'
+          : '<span class="badge b-warn">⚠ ロット×' + numJa(c.conditionValue) + (ev.kind === 'lotMultiple' ? '単位で発注' : '以上で発注') + '</span>') +
+        ' <span class="muted">現在 ' + numJa(sumQ) + '個</span>' + condWarnBadges(ev) + condOffListHtml(ev);
     return '<span class="badge b-warn">条件 ' + esc(c.conditionType) + ' ' + c.conditionValue.toLocaleString('ja-JP') + esc(c.unit || '') + ' (手動確認)</span>' +
-      ' <span class="muted">現在 ' + sumQ.toLocaleString('ja-JP') + '個 / ' + yen(sumA) + '</span>';
+      ' <span class="muted">現在 ' + numJa(sumQ) + '個 / ' + yen(sumA) + '</span>';
   }
   if (k.slice(0, 2) === 'm:') {
     var m = matById[k.slice(2)];
@@ -4154,7 +4253,8 @@ function accHtml(p) {
     kvHtml('在庫月数 ', months(p)) + kvHtml('推奨保有月数 ', p.holdMonths != null ? p.holdMonths : '—') +
     kvHtml('ロット ', p.lot || '—') + kvHtml('原価 ', p.cost ? yen(p.cost) : '—') + kvHtml('売価 ', p.price ? yen(p.price) : '—') +
     kvHtml('最終仕入日 ', esc(p.lastPurchase || '—')) +
-    (p.capacityPerUnit ? kvHtml('容量/個 ', numFmt(p.capacityPerUnit)) : '') + '</div>';
+    (p.capacityPerUnit ? kvHtml('容量/個 ', numFmt(p.capacityPerUnit)) : '') +
+    (p.caseGroup || p.caseLot ? kvHtml('ケース ', (p.caseGroup ? esc(p.caseGroup) + ' ' : '') + (p.caseLot ? numFmt(p.caseLot) + '個/ケース' : '')) : '') + '</div>';
   // ◯ヶ月分シミュレーション (旧GAS参照ツールの機能)。必要数は下の同グループ表の「必要数」列にも反映
   h += '<div class="accg">📐 <b><input type="number" class="simM" value="' + (p.holdMonths > 0 ? p.holdMonths : 2) + '" min="0.5" step="0.5" style="width:64px;text-align:right"> ヶ月分</b>を保有するのに必要な数: ' +
     '<a class="need" data-nc="' + esc(p.code) + '" title="クリックで発注数に反映" style="font-weight:700">—</a>' +
@@ -4252,19 +4352,38 @@ function condCheck() {
   D.conditions.forEach(function(c) {
     var relevant = c.supplierWide ? items.length > 0 : c.memberCodes.some(function(x){ return inCart[x]; });
     if (!relevant) return;
-    var mem = {}; c.memberCodes.forEach(function(x){ mem[x] = 1; });
-    var sumQ = 0, sumA = 0;
-    items.forEach(function(i){ if (c.supplierWide || mem[i.code]) { sumQ += i.qty; sumA += i.qty * (i.cost || 0); } });
-    if (c.conditionType === '金額') {
-      if (sumA < c.conditionValue) unmet.push(c.displayName + ': あと ' + yen(c.conditionValue - sumA));
-    } else if (c.conditionType === '数量' && (c.unit === '個' || !c.unit)) {
-      if (sumQ < c.conditionValue) unmet.push(c.displayName + ': あと ' + (c.conditionValue - sumQ).toLocaleString('ja-JP') + ' 個');
-    } else if (c.conditionType === '上限') {
+    var ev = condEval(c, items);
+    var sumQ = ev.sumQ, sumA = ev.sumA;
+    if (ev.kind === 'amount') {
+      if (!ev.met) unmet.push(c.displayName + ': あと ' + yen(c.conditionValue - sumA));
+    } else if (ev.kind === 'qty') {
+      if (!ev.met) unmet.push(c.displayName + ': あと ' + numJa(c.conditionValue - sumQ) + ' 個');
+    } else if (ev.kind === 'cap') {
       var issuedQ = issuedMonthFor(c);
       var totalQ = sumQ + issuedQ;
-      if (totalQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '個') + '/月 に対し ' +
-        (issuedQ ? '今月済 ' + issuedQ.toLocaleString('ja-JP') + ' + 今回 ' + sumQ.toLocaleString('ja-JP') + ' = ' : '') + totalQ.toLocaleString('ja-JP') +
-        ' (' + (totalQ - c.conditionValue).toLocaleString('ja-JP') + ' 超過)');
+      if (totalQ > c.conditionValue) unmet.push('🚫出荷制限超過 ' + c.displayName + ': 上限 ' + numJa(c.conditionValue) + (c.unit || '個') + '/月 に対し ' +
+        (issuedQ ? '今月済 ' + numJa(issuedQ) + ' + 今回 ' + numJa(sumQ) + ' = ' : '') + numJa(totalQ) +
+        ' (' + numJa(totalQ - c.conditionValue) + ' 超過)');
+    } else if (ev.kind === 'cases') {
+      if (!ev.met) unmet.push(c.displayName + ': あと ' + numJa(Math.round((c.conditionValue - ev.cases) * 100) / 100) + ' ケース');
+      if (ev.noSize.length) manual.push(c.displayName + ' (入数未設定' + ev.noSize.length + '件: ' + ev.noSize.join(', ') + ')');
+    } else if (ev.kind === 'caseAmount') {
+      if (!ev.amountMet) unmet.push(c.displayName + ': あと ' + yen(c.conditionValue - sumA));
+      ev.misaligned.forEach(function(m) {
+        var next = Math.ceil(m.qty / m.lot) * m.lot;
+        unmet.push(c.displayName + ' ' + m.group + ': ' + numJa(m.qty) + '個 → ' + numJa(m.lot) + '個/ケースの倍数で (あと' + numJa(next - m.qty) + '個 か ' + numJa(m.qty - (next - m.lot)) + '個減)');
+      });
+      if (ev.noInfo.length) manual.push(c.displayName + ' (ケース情報なし' + ev.noInfo.length + '件: ' + ev.noInfo.join(', ') + ')');
+    } else if (ev.kind === 'lotMultiple' || ev.kind === 'lotMin') {
+      ev.off.forEach(function(o) {
+        if (o.step != null) {
+          var nx = Math.ceil(o.qty / o.step) * o.step;
+          unmet.push(c.displayName + ' ' + o.code + ': ' + numJa(o.qty) + '個 → ロット×' + numJa(c.conditionValue) + '=' + numJa(o.step) + '個単位で (あと' + numJa(nx - o.qty) + '個 か ' + numJa(o.qty - (nx - o.step)) + '個減)');
+        } else {
+          unmet.push(c.displayName + ' ' + o.code + ': ' + numJa(o.qty) + '個 → 最低ロット×' + numJa(c.conditionValue) + '=' + numJa(o.min) + '個から');
+        }
+      });
+      if (ev.unknown.length) manual.push(c.displayName + ' (ロット不明' + ev.unknown.length + '件: ' + ev.unknown.join(', ') + ')');
     } else {
       manual.push(c.displayName + ' (条件 ' + c.conditionType + ' ' + c.conditionValue.toLocaleString('ja-JP') + (c.unit || '') + ')');
     }
@@ -7901,7 +8020,7 @@ var DEFS = {
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },
   conditions: { title: '発注条件グループ', cols: [
     { k: 'condition_id', l: '条件ID', pk: 1 }, { k: 'supplier_code', l: '仕入先コード' }, { k: '仕入先名', l: '仕入先名', ro: 1 }, { k: 'maker_name', l: 'メーカー名' },
-    { k: 'display_name', l: '管理名' }, { k: 'condition_type', l: '条件タイプ (数量/金額/上限 他)' }, { k: 'condition_value', l: '条件値', num: 1 }, { k: 'unit', l: '単位' } ] },
+    { k: 'display_name', l: '管理名' }, { k: 'condition_type', l: '条件タイプ (数量[個/ケース]/金額/上限/ケース入数かつ金額/ロット倍率[以上])' }, { k: 'condition_value', l: '条件値', num: 1 }, { k: 'unit', l: '単位' } ] },
   materials: { title: '原料グループ', cols: [
     { k: 'group_id', l: '原料グループID', pk: 1 }, { k: 'name', l: '原料グループ名' }, { k: 'min_order_qty', l: '最低発注量', num: 1 }, { k: 'unit', l: '単位' } ] },
   attrs: { title: '商品紐付け', cols: [

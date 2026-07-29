@@ -228,6 +228,7 @@ export function computeAll() {
     p.conditionId = a ? (a.condition_id || '') : '';
     p.materialGroupId = a ? (a.material_group_id || '') : '';
     p.capacityPerUnit = a ? (a.capacity_per_unit || null) : null;
+    p.caseGroup = a ? (a.case_group || '') : '';
     p.caseLot = a ? (a.case_lot || null) : null;
     const ri = recentIssued.get(p.key);
     p.recentIssued = ri || null;
@@ -272,21 +273,75 @@ export function computeAll() {
 }
 
 /**
- * 発注条件の充足評価 (自動判定は 数量[個]=下限 / 金額[円]=下限 / 上限=数量上限。他タイプは表示専用)。
- * 「上限」= 仕入先の出荷制限 (例: びわこふきん300枚まで)。数量が条件値以下なら met。
- * items: [{key, qty, cost}] — 発注内容 (qty=発注数量, cost=単価原価)
+ * 発注条件の充足評価。旧GAS参照ツール (発注条件マスタ) の全条件タイプを自動判定する。
+ *   数量[個]           Σ数量 ≧ 条件値
+ *   金額[円]           Σ(数量×原価) ≧ 条件値
+ *   上限               Σ数量 ≦ 条件値 (仕入先の出荷制限。例: びわこふきん300枚まで)
+ *   数量[ケース]       Σ(数量÷ケース入数) ≧ 条件値。ケース入数 = attrsのケースロット、無ければ発注ロット単位
+ *   ケース入数かつ金額  金額下限 + ケースグループごとに Σ数量がケースロットの倍数 (ジョンズブレンド:
+ *                      同グループ内は香り違いを混載できるが、ケース入数ちょうどで発注する)
+ *   ロット倍率 n倍     各商品の発注数が (発注ロット単位×n) の倍数 (パシーマ: 2ロット単位で発注)
+ *   ロット倍率以上 n倍  各商品の発注数が (発注ロット単位×n) 以上 (ノアテック: 最低2ロットから)
+ * items: [{key, qty, cost, lot?, caseLot?, caseGroup?}] — 発注内容 (lot=発注ロット単位)。
+ * lot/ケース情報が無い商品は判定不能として auto.unknown / auto.noSize に件数・キーを載せ、met は下げない
+ * (データ不備で発注を止めない。バッジで人間に知らせる)。
  */
 export function evaluateCondition(cond, memberKeys, items) {
   const inGroup = items.filter(i => memberKeys.has(i.key));
   const sumQty = inGroup.reduce((s, i) => s + i.qty, 0);
   const sumAmount = Math.round(inGroup.reduce((s, i) => s + i.qty * (i.cost || 0), 0));
-  let auto = null; // null=自動判定不可
+  const active = inGroup.filter(i => i.qty > 0);
+  let auto = null; // null=自動判定不可 (未知の条件タイプ → 条件文を表示して人間が判断)
   if (cond.condition_type === '数量' && (cond.unit === '個' || !cond.unit)) {
     auto = { current: sumQty, required: cond.condition_value, met: sumQty >= cond.condition_value, kind: 'qty' };
+  } else if (cond.condition_type === '数量' && cond.unit === 'ケース') {
+    let cases = 0; const noSize = [];
+    for (const i of active) {
+      const size = i.caseLot || i.lot || 0;
+      if (size > 0) cases += i.qty / size;
+      else noSize.push(i.key);
+    }
+    cases = Math.round(cases * 100) / 100;
+    auto = { current: cases, required: cond.condition_value, met: cases >= cond.condition_value, kind: 'cases', noSize };
   } else if (cond.condition_type === '金額') {
     auto = { current: sumAmount, required: cond.condition_value, met: sumAmount >= cond.condition_value, kind: 'amount' };
   } else if (cond.condition_type === '上限') {
     auto = { current: sumQty, required: cond.condition_value, met: sumQty <= cond.condition_value, kind: 'cap' };
+  } else if (cond.condition_type === 'ケース入数かつ金額') {
+    // ケースグループごとに合算 (グループ無しの商品は単品でケースロット判定)
+    const byGroup = new Map(); const misaligned = []; const noInfo = [];
+    for (const i of active) {
+      if (i.caseGroup) {
+        let g = byGroup.get(i.caseGroup);
+        if (!g) { g = { qty: 0, lot: 0 }; byGroup.set(i.caseGroup, g); }
+        g.qty += i.qty;
+        if (i.caseLot > 0) g.lot = Math.max(g.lot, i.caseLot);
+      } else if (i.caseLot > 0) {
+        if (i.qty % i.caseLot !== 0) misaligned.push({ group: i.key, qty: i.qty, lot: i.caseLot });
+      } else noInfo.push(i.key);
+    }
+    for (const [name, g] of byGroup) {
+      if (g.lot > 0) { if (g.qty % g.lot !== 0) misaligned.push({ group: name, qty: g.qty, lot: g.lot }); }
+      else noInfo.push(name);
+    }
+    const amountMet = sumAmount >= cond.condition_value;
+    auto = { current: sumAmount, required: cond.condition_value, met: amountMet && misaligned.length === 0, kind: 'caseAmount', amountMet, misaligned, noInfo };
+  } else if (cond.condition_type === 'ロット倍率') {
+    const off = []; const unknown = [];
+    for (const i of active) {
+      const step = (i.lot || 0) * cond.condition_value;
+      if (!(step > 0)) { unknown.push(i.key); continue; }
+      if (i.qty % step !== 0) off.push({ key: i.key, qty: i.qty, step });
+    }
+    auto = { current: sumQty, required: cond.condition_value, met: off.length === 0, kind: 'lotMultiple', off, unknown };
+  } else if (cond.condition_type === 'ロット倍率以上') {
+    const off = []; const unknown = [];
+    for (const i of active) {
+      const min = (i.lot || 0) * cond.condition_value;
+      if (!(min > 0)) { unknown.push(i.key); continue; }
+      if (i.qty < min) off.push({ key: i.key, qty: i.qty, min });
+    }
+    auto = { current: sumQty, required: cond.condition_value, met: off.length === 0, kind: 'lotMin', off, unknown };
   }
   return { sumQty, sumAmount, auto };
 }
