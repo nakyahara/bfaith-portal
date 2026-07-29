@@ -20,7 +20,10 @@ import sharp from 'sharp';
 import { google } from 'googleapis';
 
 import { getDB, logEvent } from '../db.js';
-import { resolveVariationGroup } from '../lib/variation.js';
+import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
+// ⚠️ page-info.js はこのファイルの SHIPPING_METHOD_GROUPS を import する (循環参照)。
+//    双方とも関数呼び出し時にしか使わないので ESM 的に安全。module 評価時に参照しないこと
+import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
 
 // ─── miniPC proxy client (rakuten-rms-proxy.js と同じ env / 認証) ───
 
@@ -453,6 +456,10 @@ export function buildItemPayload(db, draftId) {
       && !/^\d+$/.test(String(rk.normal_delivery_date_id).trim())) {
     reasons.push('納期情報IDは数字で入力してください (RMS の納期設定のID)');
   }
+  // 商品ページ表記 (化粧品・健康食品は楽天必須記載が揃うまで登録をブロック)
+  const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draftId) || null;
+  reasons.push(...validatePageInfo(pageInfo).map((r) => `商品ページ表記: ${r}`));
+
   if (reasons.length > 0) return { ok: false, reasons };
 
   const descParts = [];
@@ -460,6 +467,18 @@ export function buildItemPayload(db, draftId) {
   if (ai.desc_spec) descParts.push(ai.desc_spec);
   if (specs.length > 0) descParts.push(specs.map((s) => `${s.spec_key}: ${s.spec_value || ''}`.trim()).join('\n'));
   if (ai.desc_notes) descParts.push(ai.desc_notes);
+
+  // 商品ページ表記の表を説明文の末尾に連結 (旧xlsm の移植)。
+  // 発送方法の表示名はアプリ指定の配送方法グループ > NE配送方法のマッピング の順で決める
+  const pageShipGroup = String(rk.shipping_method_group ?? '').trim();
+  const pageShippingLabel = pageShipGroup && SHIPPING_METHOD_GROUPS[pageShipGroup]
+    ? SHIPPING_METHOD_GROUPS[pageShipGroup]
+    : mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod).label;
+  // 表はカードを一度でも保存した商品にだけ付ける (未保存の既存ドラフトの説明文を変えない)
+  const pageHtml = pageInfo
+    ? buildPageInfoHtml({ productName: title, info: pageInfo, shippingLabel: pageShippingLabel })
+    : '';
+  if (pageHtml) descParts.push(pageHtml);
 
   // JAN → カタログID属性の自動付与は**ジャンル属性辞書にあるときだけ** (2026-07-28 確定)。
   // 実測: 「カタログID」が辞書に無いジャンル (111145等) へ付与すると IE1002 で登録自体が失敗する。

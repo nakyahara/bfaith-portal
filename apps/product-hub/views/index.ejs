@@ -91,6 +91,25 @@
       </div>
     </details>
   </div>
+
+  <!-- NE配送方法 → 楽天配送方法グループ (商品ページ表記の「発送方法」とデフォルト選択に使用) -->
+  <div class="card" style="margin-bottom:14px;">
+    <details id="shipmap-details">
+      <summary style="cursor:pointer; font-size:14px; font-weight:600;">
+        配送方法マッピング (NE → 楽天)
+      </summary>
+      <p class="muted" style="margin:10px 0;">
+        NE商品マスタの「配送方法」を楽天の配送方法グループに割り当てます。
+        商品ページ表記の「発送方法」欄と、楽天出品カードの配送方法の初期値に使われます。
+        名前が一致するものは自動で推測されます (<span style="color:#b45309">推測</span> 表示。保存すると確定)。
+      </p>
+      <div id="shipmap-body" class="muted">読み込み中…</div>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+        <button class="btn btn-primary" id="shipmap-save-btn" style="display:none;">保存</button>
+        <span class="muted" id="shipmap-result"></span>
+      </div>
+    </details>
+  </div>
   <% } %>
 
   <div class="card">
@@ -216,6 +235,86 @@
         out.textContent = '通信エラー: ' + e.message;
       } finally {
         catImportBtn.disabled = false;
+      }
+    });
+  }
+
+  // ─── 配送方法マッピング (NE → 楽天。admin のみパネルが出る) ───
+  const shipmapDetails = document.getElementById('shipmap-details');
+  if (shipmapDetails) {
+    let shipmapLoaded = false;
+    shipmapDetails.addEventListener('toggle', async () => {
+      if (!shipmapDetails.open || shipmapLoaded) return;
+      shipmapLoaded = true;
+      const body = document.getElementById('shipmap-body');
+      try {
+        const res = await fetch('/apps/product-hub/api/shipping-method-map');
+        const json = await res.json();
+        if (!json.ok) { body.textContent = json.error || '読み込みに失敗しました'; return; }
+        if (!json.rows.length) { body.textContent = 'NE商品マスタに配送方法がまだありません'; return; }
+        const table = document.createElement('table');
+        table.className = 'list';
+        table.innerHTML = '<thead><tr><th>NE配送方法</th><th style="width:90px">商品数</th><th style="width:260px">楽天配送方法グループ</th><th style="width:80px">状態</th></tr></thead>';
+        const tbody = document.createElement('tbody');
+        for (const row of json.rows) {
+          const tr = document.createElement('tr');
+          const tdLabel = document.createElement('td');
+          tdLabel.textContent = row.neLabel;
+          const tdCount = document.createElement('td');
+          tdCount.textContent = row.count ? row.count + '件' : '—';
+          if (!row.count) tdCount.title = 'NE商品マスタに現存しない配送方法 (過去の割当)';
+          const tdSel = document.createElement('td');
+          const sel = document.createElement('select');
+          sel.style.width = '100%';
+          sel.dataset.neLabel = row.neLabel;
+          const optNone = document.createElement('option');
+          optNone.value = '';
+          optNone.textContent = '未割当';
+          sel.appendChild(optNone);
+          for (const gid of Object.keys(json.groups)) {
+            const opt = document.createElement('option');
+            opt.value = gid;
+            opt.textContent = gid + ': ' + json.groups[gid];
+            if (row.rakutenGroup === gid) opt.selected = true;
+            sel.appendChild(opt);
+          }
+          tdSel.appendChild(sel);
+          const tdState = document.createElement('td');
+          tdState.style.fontSize = '12px';
+          if (row.saved) { tdState.textContent = '保存済'; tdState.style.color = '#166534'; }
+          else if (row.rakutenGroup) { tdState.textContent = '推測'; tdState.style.color = '#b45309'; }
+          else { tdState.textContent = '未割当'; tdState.className = 'muted'; }
+          tr.append(tdLabel, tdCount, tdSel, tdState);
+          tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        body.replaceChildren(table);
+        document.getElementById('shipmap-save-btn').style.display = '';
+      } catch (e) {
+        body.textContent = '通信エラー: ' + e.message;
+      }
+    });
+    const shipmapSaveBtn = document.getElementById('shipmap-save-btn');
+    shipmapSaveBtn.addEventListener('click', async () => {
+      const out = document.getElementById('shipmap-result');
+      const entries = Array.from(document.querySelectorAll('#shipmap-body select')).map((sel) => ({
+        ne_label: sel.dataset.neLabel,
+        rakuten_group: sel.value,
+      }));
+      shipmapSaveBtn.disabled = true;
+      out.textContent = '保存中…';
+      try {
+        const res = await fetch('/apps/product-hub/api/shipping-method-map', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ entries: entries }),
+        });
+        const json = await res.json();
+        out.textContent = json.ok ? '保存しました (' + json.saved + '件)' : (json.error || '保存に失敗しました');
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        shipmapSaveBtn.disabled = false;
       }
     });
   }
