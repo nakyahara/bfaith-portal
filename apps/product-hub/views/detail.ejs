@@ -74,16 +74,25 @@
     </div>
   </div>
 
-  <!-- タブバー。バッジ = 未入力の必須項目数 (楽天登録が止まる項目とタブ内で計算が一致するようにしている) -->
+  <!-- タブバー。バッジ = 未入力の主要な必須項目数。
+       サーバーの登録プリフライトの完全な再現ではない (形式エラー等はサーバーが最終判定) ため、
+       0件でも「送信内容を確認」で最終チェックする前提 (Codex R1 Medium-3) -->
+  <%
+    // 転送済み判定は件数比較ではなく drive_file_id の突合 (Codex R1 Medium-2:
+    // 画像を入れ替えると件数が同じでも未転送が発生し、サーバー検証とズレる)
+    const transferredImageCount = images.filter(
+      (im) => cabinetImages.some((c) => c.drive_file_id === im.drive_file_id)
+    ).length;
+  %>
   <div class="tabbar" id="tabbar"
-       data-image-count="<%= images.length %>" data-cabinet-count="<%= cabinetImages.length %>">
+       data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>">
     <button type="button" class="tab-btn" data-tab="tab-basic">✏️ 基本情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-info">📄 商品情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-listing">🛒 出品<span class="tab-badge" hidden></span></button>
-    <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の必須項目数 (マウスオーバーで内訳)</span>
+    <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
 
   <!-- ═══ タブ1: 基本情報 ═══ -->
@@ -865,7 +874,10 @@
     activate(btns.some((b) => b.dataset.tab === initial) ? initial : 'tab-basic', false);
   })();
 
-  // ─── 必須未入力バッジ。「楽天登録が止まる項目」だけを数える (サーバー側チェックのミラー) ───
+  // ─── 必須未入力バッジ。楽天登録・AI生成ゲートで必要な「入力もの」を数える。
+  //     サーバーのプリフライト (buildItemPayload 事前検証) の完全ミラーではない —
+  //     形式エラー (JAN桁数/文字数超過/税率不正など) はサーバーが最終判定する。
+  //     公式ページURLは楽天登録には不要だが「生成待ち」ゲートの必須なので含めている ───
   let mandatoryAttrNames = [];
   try { mandatoryAttrNames = JSON.parse(document.getElementById('rk-mandatory-json').textContent) || []; } catch (e) {}
 
@@ -906,19 +918,25 @@
     if (!Number.isFinite(price) || price <= 0) m['tab-basic'].push('売価');
     const bar = document.getElementById('tabbar');
     const imgs = Number(bar.dataset.imageCount || 0);
-    const cab = Number(bar.dataset.cabinetCount || 0);
+    const transferred = Number(bar.dataset.transferredCount || 0); // drive_file_id 突合済みの件数
     if (imgs === 0) m['tab-images'].push('商品画像 (1枚以上)');
-    else if (cab < imgs) m['tab-images'].push('R-Cabinet未転送 ' + (imgs - cab) + '枚');
+    else if (transferred < imgs) m['tab-images'].push('R-Cabinet未転送 ' + (imgs - transferred) + '枚');
     m['tab-info'].push(...pageInfoMissing());
     if (!tv('rk-genre')) m['tab-category'].push('ジャンルID');
-    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID'); // カタログIDはJAN欄から自動送信
+    // カタログIDは JAN欄に値があればサーバーが自動送信する。JAN も手入力属性も無ければ必須扱い
+    // (Codex R1 High-1: 無条件に除外すると「未入力0件」のまま登録が失敗する)
+    const janFilled = !!tv('f-jan');
+    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID' || !janFilled);
     if (need.length > 0) {
       const vals = {};
       document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
         const n = tr.querySelector('.rk-attr-name').value.trim();
         if (n) vals[n] = tr.querySelector('.rk-attr-value').value.trim();
       });
-      for (const n of need) { if (!vals[n]) m['tab-category'].push('必須属性「' + n + '」'); }
+      for (const n of need) {
+        if (vals[n]) continue;
+        m['tab-category'].push(n === 'カタログID' ? '必須属性「カタログID」(基本情報タブのJAN欄入力でも可)' : '必須属性「' + n + '」');
+      }
     }
     return m;
   }
