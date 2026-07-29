@@ -273,6 +273,37 @@ export function initProductHubDB() {
       fetched_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
+    -- 商品ページ表記 (化粧品・食品) — 旧「商品ページ詳細ページ作成.xlsm」の移植 (2026-07-29)。
+    -- 楽天必須記載事項 (広告文責/メーカーor販売業者名/製造国/商品区分 — テキスト記載必須・画像化不可)
+    -- + 食品表示系の項目。HTML は buildPageInfoHtml が xlsm と同じ表形式で生成し説明文に結合する
+    CREATE TABLE IF NOT EXISTS draft_page_info (
+      draft_id        INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
+      product_type    TEXT NOT NULL DEFAULT 'general'
+                      CHECK (product_type IN ('general','cosmetics','health_food','food')),
+      content_volume  TEXT,               -- 内容量 (例: 50ml)
+      size_text       TEXT,               -- サイズ (例: 縦5cm×横10cm×高さ15cm)
+      ingredients     TEXT,               -- 成分/素材/材質 (化粧品=全成分、雑貨=素材)
+      usage_notes     TEXT,               -- 使用上の注意
+      origin_type     TEXT CHECK (origin_type IN (NULL, '日本製', '海外製')),
+      origin_country  TEXT,               -- 原産国名 (海外製のとき。健康食品は必須)
+      category_label  TEXT,               -- 商品分類区分 (化粧品/医薬部外品/健康食品/…)
+      seller_name     TEXT,               -- 発売元 (メーカー名 or 販売業者名)
+      importer_name   TEXT,               -- 輸入者名 (輸入品はメーカー名と両記載が楽天必須)
+      food_name       TEXT,               -- 名称 (食品表示)
+      food_ingredients TEXT,              -- 原材料名 (食品表示)
+      food_expiry     TEXT,               -- 賞味期限 (例: 商品ラベルに記載)
+      food_storage    TEXT,               -- 保存方法
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    -- NE の配送方法 ↔ 楽天の発送方法コード (配送方法グループ 1〜9) の紐付け (2026-07-29 中原さん指示)。
+    -- 出品カードの配送方法デフォルトと、商品ページ表記の「発送方法」行に使う
+    CREATE TABLE IF NOT EXISTS ph_shipping_method_map (
+      ne_label        TEXT PRIMARY KEY,   -- NE の配送方法 (例: ネコポス)
+      rakuten_group   TEXT,               -- 楽天 配送方法グループID '1'〜'9' (NULL=未割当)
+      updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)

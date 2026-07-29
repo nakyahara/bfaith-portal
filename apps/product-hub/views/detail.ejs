@@ -466,6 +466,99 @@
     <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
   </div>
 
+  <!-- 商品ページ表記 (化粧品・食品) — 旧xlsmの移植 -->
+  <div class="card" style="border-color:#fde68a; background:#fffdf5;">
+    <h2>📄 商品ページ表記 <span class="muted" style="font-weight:400">(化粧品・食品の必須記載。説明文の末尾に表として自動掲載)</span></h2>
+    <div class="grid-2">
+      <div class="field">
+        <label>商品タイプ<span class="ftag ftag-m">手入力</span></label>
+        <select id="pi-type" style="width:100%;">
+          <% for (const [k, v] of Object.entries(productTypes)) { %>
+            <option value="<%= k %>" <%= (pageInfo?.product_type || 'general') === k ? 'selected' : '' %>><%= v %></option>
+          <% } %>
+        </select>
+        <div class="muted" style="font-size:11px;">化粧品・健康食品は楽天の必須記載 (広告文責/発売元/製造国/商品区分) を登録前にチェックします</div>
+      </div>
+      <div class="field">
+        <label>商品区分<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須)</span></label>
+        <select id="pi-category" style="width:100%;">
+          <option value="">未選択</option>
+          <% for (const c of categoryLabels) { %>
+            <option value="<%= c %>" <%= pageInfo?.category_label === c ? 'selected' : '' %>><%= c %></option>
+          <% } %>
+        </select>
+      </div>
+      <div class="field">
+        <label>製造国<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須。原産国=製造事業所の国)</span></label>
+        <div style="display:flex; gap:8px;">
+          <select id="pi-origin-type" style="width:130px;">
+            <option value="">未選択</option>
+            <option value="日本製" <%= pageInfo?.origin_type === '日本製' ? 'selected' : '' %>>日本製</option>
+            <option value="海外製" <%= pageInfo?.origin_type === '海外製' ? 'selected' : '' %>>海外製</option>
+          </select>
+          <input type="text" id="pi-origin-country" style="flex:1;" placeholder="海外製のとき原産国名 (健康食品は必須)" value="<%= pageInfo?.origin_country || '' %>">
+        </div>
+      </div>
+      <div class="field">
+        <label>発売元 (メーカー名/販売業者名)<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須)</span></label>
+        <input type="text" id="pi-seller" value="<%= pageInfo?.seller_name || '' %>" placeholder="例: 株式会社アメージングクラフト">
+      </div>
+      <div class="field">
+        <label>輸入者名<span class="ftag ftag-m">手入力</span> <span class="muted">(輸入品はメーカー名と両記載が楽天必須)</span></label>
+        <input type="text" id="pi-importer" value="<%= pageInfo?.importer_name || '' %>">
+      </div>
+      <div class="field">
+        <label>内容量<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-volume" value="<%= pageInfo?.content_volume || '' %>" placeholder="例: 50ml">
+      </div>
+      <div class="field">
+        <label>サイズ<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-size" value="<%= pageInfo?.size_text || '' %>" placeholder="例: 縦5cm×横10cm×高さ15cm">
+      </div>
+      <div class="field">
+        <label>成分・素材・材質<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品は全成分)</span></label>
+        <textarea id="pi-ingredients" rows="3"><%= pageInfo?.ingredients || '' %></textarea>
+      </div>
+      <div class="field">
+        <label>使用上の注意<span class="ftag ftag-m">手入力</span></label>
+        <textarea id="pi-usage" rows="3"><%= pageInfo?.usage_notes || '' %></textarea>
+      </div>
+    </div>
+    <div id="pi-food-fields" class="grid-2" style="display:none; background:#fef9ec; border-radius:8px; padding:8px 12px; margin-bottom:8px;">
+      <div class="field">
+        <label>名称 (食品表示)<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-food-name" value="<%= pageInfo?.food_name || '' %>" placeholder="例: 有機亜麻仁シード">
+      </div>
+      <div class="field">
+        <label>原材料名 (食品表示)<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-food-ingredients" value="<%= pageInfo?.food_ingredients || '' %>" placeholder="例: 有機アマニ (アルゼンチン産)">
+      </div>
+      <div class="field">
+        <label>賞味期限<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-food-expiry" value="<%= pageInfo?.food_expiry || '' %>" placeholder="例: 商品ラベルに記載">
+      </div>
+      <div class="field">
+        <label>保存方法<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-food-storage" value="<%= pageInfo?.food_storage || '' %>" placeholder="例: 直射日光を避け常温保存">
+      </div>
+    </div>
+    <p class="muted" style="font-size:12px; margin:4px 0 10px;">
+      広告文責<span class="ftag ftag-auto">自動</span>: <%- adResponsibilityText %> ／
+      発送方法<span class="ftag ftag-auto">自動</span>: <%= neShipping.label ? (neShipping.label + (neShipping.guessed ? ' (NE配送方法から推測)' : ' (マッピング表)')) : '未割当 — 一覧画面の配送方法マッピングで設定' %> ／
+      注意事項<span class="ftag ftag-auto">自動</span>: 固定文
+    </p>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button class="btn btn-primary" id="pi-save-btn">ページ表記を保存</button>
+      <button class="btn" id="pi-preview-btn">掲載HTMLを確認</button>
+      <button class="btn" id="pi-copy-btn">HTMLをコピー</button>
+      <span class="muted" id="pi-result"></span>
+    </div>
+    <div id="pi-warnings" style="margin-top:8px;"></div>
+    <div id="pi-preview" style="display:none; margin-top:10px; border:1px solid #e2e8f0; border-radius:8px; padding:10px; background:#fff; overflow:auto; max-height:400px;"></div>
+    <textarea id="pi-html-src" style="display:none;"><%= pageInfoHtml %></textarea>
+    <script type="application/json" id="pi-cat-by-type"><%- JSON.stringify(categoryLabelsByType).replace(/</g, '\\u003c') %></script>
+  </div>
+
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → 公開はRMS画面で)</span></h2>
@@ -533,10 +626,17 @@
         <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
         <select id="rk-shipping-group" style="width:100%;">
           <option value="">未設定 (店舗デフォルト)</option>
+          <%
+            // 未設定なら NE 配送方法のマッピングをデフォルト選択 (「出品情報を保存」で確定)
+            const shipDefault = String(rakuten?.shipping_method_group || '') || (neShipping.group || '');
+          %>
           <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
-            <option value="<%= gid %>" <%= String(rakuten?.shipping_method_group || '') === gid ? 'selected' : '' %>><%= gname %></option>
+            <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
           <% } %>
         </select>
+        <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
+          <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
+        <% } %>
       </div>
       <div style="flex:1; min-width:120px;">
         <label>送料<span class="ftag ftag-m">手入力</span></label>
@@ -1227,6 +1327,84 @@
       if (json.ok) { location.reload(); } else { alert(json.error || 'まとめられませんでした'); regroupBtn.disabled = false; }
     });
   }
+
+  // ─── 商品ページ表記 (化粧品・食品) ───
+  (function initPageInfo() {
+    const typeSel = document.getElementById('pi-type');
+    if (!typeSel) return;
+    const foodBox = document.getElementById('pi-food-fields');
+    // 商品タイプに整合する商品区分だけ選べるようにする (サーバー側でも検証)
+    const catSel = document.getElementById('pi-category');
+    let catByType = {};
+    try { catByType = JSON.parse(document.getElementById('pi-cat-by-type').textContent); } catch (e) {}
+    const toggleFood = () => {
+      foodBox.style.display = (typeSel.value === 'food' || typeSel.value === 'health_food') ? '' : 'none';
+      const allowed = catByType[typeSel.value] || null;
+      for (const opt of catSel.options) {
+        if (!opt.value) continue;
+        const ok = !allowed || allowed.includes(opt.value);
+        opt.hidden = !ok;
+        opt.disabled = !ok;
+      }
+      if (allowed && catSel.value && !allowed.includes(catSel.value)) catSel.value = '';
+    };
+    typeSel.addEventListener('change', toggleFood);
+    toggleFood();
+
+    const collect = () => ({
+      product_type: typeSel.value,
+      category_label: document.getElementById('pi-category').value,
+      origin_type: document.getElementById('pi-origin-type').value,
+      origin_country: document.getElementById('pi-origin-country').value,
+      seller_name: document.getElementById('pi-seller').value,
+      importer_name: document.getElementById('pi-importer').value,
+      content_volume: document.getElementById('pi-volume').value,
+      size_text: document.getElementById('pi-size').value,
+      ingredients: document.getElementById('pi-ingredients').value,
+      usage_notes: document.getElementById('pi-usage').value,
+      food_name: document.getElementById('pi-food-name').value,
+      food_ingredients: document.getElementById('pi-food-ingredients').value,
+      food_expiry: document.getElementById('pi-food-expiry').value,
+      food_storage: document.getElementById('pi-food-storage').value,
+    });
+
+    const result = document.getElementById('pi-result');
+    const warnBox = document.getElementById('pi-warnings');
+    async function savePageInfo() {
+      const json = await post(BASE + '/page-info', collect());
+      if (!json.ok) { alert(json.error || '保存に失敗しました'); return null; }
+      document.getElementById('pi-html-src').value = json.html || '';
+      warnBox.replaceChildren();
+      if (json.warnings && json.warnings.length) {
+        const div = document.createElement('div');
+        div.className = 'banner-warn';
+        div.style.margin = '0';
+        div.textContent = '⚠️ 楽天必須記載が不足 (登録時に止まります): ' + json.warnings.join(' / ');
+        warnBox.appendChild(div);
+      }
+      return json;
+    }
+    document.getElementById('pi-save-btn').addEventListener('click', async () => {
+      const j = await savePageInfo();
+      if (j) result.textContent = j.warnings.length ? '保存しました (必須の不足あり)' : '保存しました';
+    });
+    document.getElementById('pi-preview-btn').addEventListener('click', async () => {
+      const j = await savePageInfo();
+      if (!j) return;
+      const pv = document.getElementById('pi-preview');
+      pv.style.display = 'block';
+      // 自前生成の表HTMLのみ (入力値はサーバー側でエスケープ済み)
+      pv.innerHTML = j.html || '<span class="muted">掲載する項目がまだありません</span>';
+    });
+    document.getElementById('pi-copy-btn').addEventListener('click', async () => {
+      const j = await savePageInfo();
+      if (!j) return;
+      const src = document.getElementById('pi-html-src').value;
+      if (!src) { result.textContent = 'コピーする内容がありません'; return; }
+      try { await navigator.clipboard.writeText(src); result.textContent = 'HTMLをコピーしました'; }
+      catch (e) { result.textContent = 'コピーできませんでした (手動で選択してください)'; }
+    });
+  })();
 
   // ─── 利益シミュレーション (Notion 数式の移植)。売価入力でライブ更新 ───
   (function initProfitSim() {

@@ -814,6 +814,27 @@ b27 = listing.buildItemPayload(db, rkId);
 check('payload: 削除済み画像 (転送履歴のみ) は送らない',
   b27.ok === true && b27.payload.images.every((i) => !i.location.includes('stale')), JSON.stringify(b27.payload?.images));
 
+// ─── 商品ページ表記の統合 (Codex R1 high: import だけで未統合だった回帰) ───
+db.prepare(`INSERT INTO draft_page_info (draft_id, product_type, content_volume) VALUES (?, 'cosmetics', '50ml')`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 化粧品の必須記載不足は登録をブロック',
+  b27.ok === false && b27.reasons.some((r) => r.includes('商品ページ表記')), JSON.stringify(b27.reasons));
+db.prepare(`UPDATE draft_page_info SET seller_name = 'メーカーA', origin_type = '日本製', category_label = '化粧品' WHERE draft_id = ?`).run(rkId);
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 充足すると説明文末尾に表を連結 (発送方法=アプリ指定グループ名)',
+  b27.ok === true
+  && b27.payload.productDescription.pc.includes('<table')
+  && b27.payload.productDescription.pc.includes('メーカーA')
+  && b27.payload.productDescription.pc.includes('ネコポス'),
+  JSON.stringify(b27.reasons || null));
+check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
+db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: page_info 未保存なら表を付けない (既存ドラフトの説明文を変えない)',
+  b27.ok === true && !b27.payload.productDescription.pc.includes('<table'), JSON.stringify(b27.reasons || null));
+
 // 未転送の画像があれば止める
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
@@ -1109,11 +1130,135 @@ check('getNeCost: 原価/送料/配送方法/税率 (大小ゆらぎ吸収)',
 check('getNeCost: NEに無ければ null', vari.getNeCost(db, 'NO-SUCH-COST') === null);
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 9401`).run();
 
+// ─── 商品ページ表記 (xlsm移植) ───
+const pinfo = await import('../lib/page-info.js');
+
+// validatePageInfo: 化粧品/健康食品の楽天必須記載
+check('page-info: general は必須チェック対象外',
+  pinfo.validatePageInfo({ product_type: 'general' }).length === 0
+  && pinfo.validatePageInfo(null).length === 0);
+check('page-info: 食品(一般) も対象外 (食品表示は推奨に留める)',
+  pinfo.validatePageInfo({ product_type: 'food' }).length === 0);
+check('page-info: 化粧品の空は 発売元/製造国/商品区分 の3件不足',
+  pinfo.validatePageInfo({ product_type: 'cosmetics' }).length === 3);
+check('page-info: 化粧品の充足でゼロ',
+  pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '日本製', category_label: '化粧品' }).length === 0);
+check('page-info: 化粧品の海外製は原産国なしでも通る (原則記載だが必須ではない)',
+  pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '海外製', importer_name: '輸入X', category_label: '化粧品' }).length === 0);
+check('page-info: 海外製 (輸入品) は輸入者名が必須 (メーカー名との両記載)',
+  pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '海外製', category_label: '化粧品' })
+    .some((r) => r.includes('輸入者名')));
+check('page-info: 健康食品の海外製は原産国名が必須',
+  pinfo.validatePageInfo({ product_type: 'health_food', seller_name: 'X社', origin_type: '海外製', importer_name: '輸入X', category_label: '健康食品' })
+    .some((r) => r.includes('原産国')));
+check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品×雑貨)',
+  pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '日本製', category_label: '雑貨' })
+    .some((r) => r.includes('整合しない'))
+  && pinfo.validatePageInfo({ product_type: 'health_food', seller_name: 'X社', origin_type: '日本製', category_label: '化粧品' })
+    .some((r) => r.includes('整合しない')));
+
+// 広告文責 env は <br> 以外を全部エスケープ (Codex R1 medium: env経由のXSS)
+{
+  const prev = process.env.PH_AD_RESPONSIBILITY;
+  process.env.PH_AD_RESPONSIBILITY = 'X社<br><script>alert(1)</script>';
+  check('page-info: 広告文責envは<br>だけ許可して他はエスケープ',
+    pinfo.adResponsibility() === 'X社<br>&lt;script&gt;alert(1)&lt;/script&gt;',
+    pinfo.adResponsibility());
+  if (prev === undefined) delete process.env.PH_AD_RESPONSIBILITY;
+  else process.env.PH_AD_RESPONSIBILITY = prev;
+}
+
+// buildPageInfoHtml: 表の生成・空行の省略・エスケープ
+{
+  const html = pinfo.buildPageInfoHtml({
+    productName: 'テスト<商品> & "A"',
+    info: {
+      product_type: 'cosmetics', content_volume: '50ml', ingredients: '水\nグリセリン',
+      origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品',
+      seller_name: 'メーカーA', importer_name: '輸入者B',
+    },
+    shippingLabel: 'ネコポス',
+  });
+  check('page-info html: table + エスケープ + 改行→<br>',
+    html.startsWith('<table') && html.includes('テスト&lt;商品&gt; &amp; &quot;A&quot;') && html.includes('水<br>グリセリン'),
+    html.slice(0, 200));
+  check('page-info html: 製造国は「海外製（フランス）」形式', html.includes('海外製（フランス）'));
+  check('page-info html: 発売元 + 輸入者の両記載 (楽天ルール: 輸入品)', html.includes('メーカーA<br>輸入者: 輸入者B'));
+  check('page-info html: 発送方法/広告文責/注意事項が載る',
+    html.includes('ネコポス') && html.includes(pinfo.adResponsibility()) && html.includes(pinfo.FIXED_NOTES));
+  check('page-info html: 空欄の行は出さない (サイズ/使用上の注意なし)',
+    !html.includes('サイズ') && !html.includes('使用上の注意'));
+  const foodHtml = pinfo.buildPageInfoHtml({
+    productName: 'アマニ', info: {
+      product_type: 'food', food_name: '有機亜麻仁シード', food_ingredients: '有機アマニ',
+      food_expiry: 'ラベルに記載', food_storage: '常温',
+    }, shippingLabel: null,
+  });
+  check('page-info html: 食品は 名称/原材料名/賞味期限/保存方法',
+    ['名称', '原材料名', '賞味期限', '保存方法'].every((k) => foodHtml.includes(k))
+    && !foodHtml.includes('発送方法'));
+  check('page-info html: 全空でも固定行 (商品名/広告文責/注意事項) だけの表になる',
+    pinfo.buildPageInfoHtml({ productName: 'X', info: null, shippingLabel: null }).includes('広告文責'));
+  check('page-info html: 商品名すら無ければ固定行のみ (空文字にはならない)',
+    pinfo.buildPageInfoHtml({ productName: '', info: null, shippingLabel: null }).includes('注意事項'));
+}
+
+// mapNeShippingToRakuten: 保存済み > 完全一致 > 部分一致 > null
+insProd.run(9402, 'ship-smoke', '配送検証', null);
+db.prepare(`UPDATE mirror_products SET 配送方法 = 'ネコポス' WHERE product_id = 9402`).run();
+insProd.run(9403, 'ship-smoke2', '配送検証2', null);
+db.prepare(`UPDATE mirror_products SET 配送方法 = '宅急便コンパクト' WHERE product_id = 9403`).run();
+{
+  const exact = pinfo.mapNeShippingToRakuten(db, 'ネコポス');
+  check('shipmap: 名前完全一致は推測で当たる (ネコポス→5)', exact.group === '5' && exact.guessed === true, JSON.stringify(exact));
+  const partial = pinfo.mapNeShippingToRakuten(db, '宅急便コンパクト');
+  check('shipmap: 部分一致は推測しない (宅急便コンパクト≠宅急便。誤マッピング防止)',
+    partial.guessed === false && partial.group === null, JSON.stringify(partial));
+  check('shipmap: 一致なしは null', pinfo.mapNeShippingToRakuten(db, '謎の配送方法').group === null);
+  check('shipmap: 空/null は null', pinfo.mapNeShippingToRakuten(db, '').group === null && pinfo.mapNeShippingToRakuten(db, null).group === null);
+
+  const saved = pinfo.saveShippingMethodMap(db, [
+    { ne_label: 'ネコポス', rakuten_group: '6' },        // 推測(5)を明示上書き
+    { ne_label: '謎の配送方法', rakuten_group: '99' },   // 不正グループ → 保存されない
+    { ne_label: '  ', rakuten_group: '1' },              // 空ラベル → 無視
+    { ne_label: '廃止された方法', rakuten_group: '1' },  // NEに現存しないが保存はできる
+  ]);
+  check('shipmap: 保存は正当な2件のみ', saved === 2, String(saved));
+  check('shipmap: 保存済みが推測より優先 (ネコポス→6)',
+    pinfo.mapNeShippingToRakuten(db, 'ネコポス').group === '6'
+    && pinfo.mapNeShippingToRakuten(db, 'ネコポス').guessed === false);
+  const rows = pinfo.listShippingMethodMap(db);
+  const neko = rows.find((r) => r.neLabel === 'ネコポス');
+  const orphan = rows.find((r) => r.neLabel === '廃止された方法');
+  check('shipmap 一覧: 保存済み + 件数', neko && neko.saved === true && neko.rakutenGroup === '6' && neko.count >= 1, JSON.stringify(neko));
+  check('shipmap 一覧: NEに現存しない保存済みも出る (棚卸し用)', orphan && orphan.count === 0 && orphan.saved === true);
+  const compact = rows.find((r) => r.neLabel === '宅急便コンパクト');
+  check('shipmap 一覧: 完全一致しない未保存ラベルは未割当のまま出る',
+    compact && compact.saved === false && compact.rakutenGroup === null, JSON.stringify(compact));
+  // upsert 再保存の冪等
+  pinfo.saveShippingMethodMap(db, [{ ne_label: 'ネコポス', rakuten_group: '5' }]);
+  check('shipmap: 再保存で上書き (6→5)', pinfo.mapNeShippingToRakuten(db, 'ネコポス').group === '5');
+  // 未割当 (空) 保存 → 推測に戻る
+  pinfo.saveShippingMethodMap(db, [{ ne_label: 'ネコポス', rakuten_group: '' }]);
+  check('shipmap: 空で保存すると未割当 → 名前一致の推測に戻る',
+    pinfo.mapNeShippingToRakuten(db, 'ネコポス').guessed === true);
+}
+db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9402, 9403)`).run();
+db.prepare(`DELETE FROM ph_shipping_method_map`).run();
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
 const statusLabels = dbmod.STATUS_LABELS;
 const counts = Object.fromEntries(statuses.map((s) => [s, 1]));
+// 商品ページ表記カードの render 変数 (全 detail fixture に必要)
+const pageInfoVars = {
+  pageInfo: null, pageInfoHtml: '',
+  neShipping: { group: null, label: null, guessed: false },
+  productTypes: pinfo.PRODUCT_TYPES, categoryLabels: pinfo.CATEGORY_LABELS,
+  categoryLabelsByType: pinfo.CATEGORY_LABELS_BY_TYPE,
+  adResponsibilityText: pinfo.adResponsibility(),
+};
 const draftRow = {
   ...after, thumb: 'https://drive.google.com/thumbnail?id=x&sz=w160', first_image_id: 'x',
   variation: { kind: 'single', groupKey: after.ne_code, memberCount: 0, isChild: false },
@@ -1174,7 +1319,11 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
+    pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
+    pageInfoHtml: '<table><tr><td>x</td></tr></table>',
+    neShipping: { group: '5', label: 'ネコポス', guessed: true },
     // 店舗内カテゴリの選択リスト分岐 (有効/選択済み/一覧から外れた選択済み)
     shopCategories: [
       { id: 1, category_id: '100', path: '犬用品 > おやつ', is_active: 1, selected: 1 },
@@ -1196,7 +1345,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
       { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
@@ -1215,7 +1364,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
@@ -1228,7 +1377,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -1245,7 +1394,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -1259,7 +1408,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -1272,7 +1421,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -1285,7 +1434,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -1299,7 +1448,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,

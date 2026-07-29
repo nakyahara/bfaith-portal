@@ -31,6 +31,10 @@ import {
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import {
+  PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
+  buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap,
+} from './lib/page-info.js';
+import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
   sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
@@ -98,6 +102,13 @@ function loadDraftOr404(req, res) {
     return null;
   }
   return draft;
+}
+
+// 出品カードで選択済みの楽天配送方法グループ名 (未選択なら null)
+function rakutenShippingLabelOf(db, draftId) {
+  const rk = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  const g = rk?.shipping_method_group != null ? String(rk.shipping_method_group).trim() : '';
+  return g && SHIPPING_METHOD_GROUPS[g] ? SHIPPING_METHOD_GROUPS[g] : null;
 }
 
 // ─── 画面 ───────────────────────────────────────────────
@@ -196,6 +207,15 @@ router.get('/detail/:id', (req, res) => {
     taxPercent: simTaxPercent, shippingCost: neCost.shippingCost,
   }) : null;
 
+  const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id) || null;
+  // 発送方法: NE 配送方法 → 楽天グループ (マップ表 + 名前一致の推測)
+  const neShipping = mapNeShippingToRakuten(db, neCost?.shippingMethod);
+  const pageInfoHtml = buildPageInfoHtml({
+    productName: draft.name, info: pageInfo,
+    shippingLabel: pageInfo?.shipping_label_override
+      || (rakutenShippingLabelOf(db, draft.id) ?? neShipping.label),
+  });
+
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // ジャンル属性辞書 (取得済みならUIに必須件数と自動フォームの材料を渡す)
   const genreDict = rakuten?.genre_id ? getCachedGenreAttributes(db, rakuten.genre_id) : null;
@@ -212,6 +232,10 @@ router.get('/detail/:id', (req, res) => {
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE,
+    pageInfo, pageInfoHtml, neShipping,
+    productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
+    categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
+    adResponsibilityText: adResponsibility(),
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
   });
@@ -829,6 +853,73 @@ router.post('/api/drafts/:id/rakuten/visibility', async (req, res) => {
     console.error('[product-hub] rakuten visibility failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
+});
+
+// ─── API: 商品ページ表記 (化粧品・食品) ──────────────────
+
+router.post('/api/drafts/:id/page-info', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const b = req.body || {};
+  const productType = Object.keys(PRODUCT_TYPES).includes(b.product_type) ? b.product_type : 'general';
+  const categoryLabel = cleanText(b.category_label, 50);
+  if (categoryLabel && !CATEGORY_LABELS.includes(categoryLabel)) {
+    return res.status(400).json({ ok: false, error: '商品区分は選択肢から選んでください' });
+  }
+  const originType = ['日本製', '海外製'].includes(b.origin_type) ? b.origin_type : null;
+  db.prepare(`
+    INSERT INTO draft_page_info (
+      draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
+      origin_type, origin_country, category_label, seller_name, importer_name,
+      food_name, food_ingredients, food_expiry, food_storage
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(draft_id) DO UPDATE SET
+      product_type = excluded.product_type,
+      content_volume = excluded.content_volume, size_text = excluded.size_text,
+      ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
+      origin_type = excluded.origin_type, origin_country = excluded.origin_country,
+      category_label = excluded.category_label, seller_name = excluded.seller_name,
+      importer_name = excluded.importer_name,
+      food_name = excluded.food_name, food_ingredients = excluded.food_ingredients,
+      food_expiry = excluded.food_expiry, food_storage = excluded.food_storage,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run(
+    draft.id, productType,
+    cleanText(b.content_volume, 200), cleanText(b.size_text, 300),
+    cleanText(b.ingredients, 3000), cleanText(b.usage_notes, 2000),
+    originType, cleanText(b.origin_country, 100),
+    categoryLabel, cleanText(b.seller_name, 200), cleanText(b.importer_name, 200),
+    cleanText(b.food_name, 200), cleanText(b.food_ingredients, 3000),
+    cleanText(b.food_expiry, 200), cleanText(b.food_storage, 300),
+  );
+  logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
+  const info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
+  const neShip = mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
+  res.json({
+    ok: true,
+    warnings: validatePageInfo(info),
+    html: buildPageInfoHtml({
+      productName: draft.name, info,
+      shippingLabel: rakutenShippingLabelOf(db, draft.id) ?? neShip.label,
+    }),
+  });
+});
+
+// NE配送方法 ↔ 楽天配送方法グループのマッピング (admin)
+router.get('/api/shipping-method-map', (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ操作できます' });
+  res.json({ ok: true, rows: listShippingMethodMap(getDB()), groups: SHIPPING_METHOD_GROUPS });
+});
+
+router.post('/api/shipping-method-map', (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ操作できます' });
+  if (!Array.isArray(req.body?.entries) || req.body.entries.length > 200) {
+    return res.status(400).json({ ok: false, error: 'entries (最大200件) が必要です' });
+  }
+  const saved = saveShippingMethodMap(getDB(), req.body.entries);
+  logEvent(getDB(), 0, 'shipping_map_saved', `${saved}件`, actorOf(req));
+  res.json({ ok: true, saved });
 });
 
 // ─── API: バリエーション ────────────────────────────────
