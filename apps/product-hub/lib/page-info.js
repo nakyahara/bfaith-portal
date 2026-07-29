@@ -74,6 +74,15 @@ export function validatePageInfo(info) {
   } else if (!CATEGORY_LABELS_BY_TYPE[info.product_type].includes(cat)) {
     reasons.push(`商品タイプ「${label}」に商品区分「${cat}」は選べません (整合しない組み合わせ)`);
   }
+  // 健康食品は食品なので加工食品の必須記載 (名称/原材料名/内容量/賞味期限/保存方法) も楽天必須
+  // (2026-07-29 Web再確認: 楽天ガイドラインの加工食品ルール。食品(一般) は推奨に留める従来判断を維持)
+  if (info.product_type === 'health_food') {
+    if (!s(info.food_name)) reasons.push('健康食品は「名称 (食品表示)」の記載が楽天必須です');
+    if (!s(info.food_ingredients)) reasons.push('健康食品は「原材料名」の記載が楽天必須です');
+    if (!s(info.content_volume)) reasons.push('健康食品は「内容量」の記載が楽天必須です');
+    if (!s(info.food_expiry)) reasons.push('健康食品は「賞味期限」の記載が楽天必須です');
+    if (!s(info.food_storage)) reasons.push('健康食品は「保存方法」の記載が楽天必須です');
+  }
   return reasons;
 }
 

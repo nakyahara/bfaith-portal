@@ -1,4 +1,20 @@
 <%- include('_header') %>
+<style>
+  /* タブ構成 (2026-07-29 中原さん要望: 項目をタブで整理し、必須未入力をバッジで見せる) */
+  .tabbar { position: sticky; top: 0; z-index: 40; background: #f5f6f8; display: flex; gap: 6px;
+            flex-wrap: wrap; align-items: center; padding: 10px 0; margin-bottom: 12px;
+            border-bottom: 2px solid #e2e8f0; }
+  .tab-btn { position: relative; border: 1px solid #cbd5e1; background: #fff; color: #475569;
+             border-radius: 999px; padding: 7px 16px; font-size: 13px; cursor: pointer; }
+  .tab-btn:hover { background: #f1f5f9; }
+  .tab-btn.active { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+  .tab-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 18px;
+               height: 18px; border-radius: 999px; background: #dc2626; color: #fff; font-size: 11px;
+               font-weight: 700; margin-left: 6px; padding: 0 5px; vertical-align: 1px; }
+  .tab-btn.active .tab-badge { background: #fff; color: #dc2626; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+</style>
 <div class="wrap wide">
 
   <div style="margin-bottom:12px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
@@ -58,108 +74,30 @@
     </div>
   </div>
 
-  <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
-  <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
-    <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
-    <p class="muted" style="margin-top:-6px">
-      入力不要です。ネクストエンジンの代表商品コードから自動で判定しています。
-      商品名・税率は<strong>登録時の初期値としてだけ</strong>NEから取り込み、以降はこのアプリの値が正です。
-    </p>
-    <% if (variation.kind === 'variation') { %>
-      <div style="font-size:13px; margin-bottom:10px;">
-        <strong>バリエーションあり</strong> — 代表商品コード
-        <button type="button" class="copy-code" data-code="<%= variation.groupKey %>" title="クリックでコピー"><%= variation.groupKey %><span class="copy-hint">📋 コピー</span></button>
-        に <strong><%= variation.memberCount %> SKU</strong> がぶら下がっています
-        <span class="muted">(NE判定)</span>
-      </div>
-      <% if (variation.isChild) { %>
-        <div class="banner-warn" style="margin:0 0 10px;">
-          <div>
-            ⚠️ このドラフトの商品コード <code><%= draft.ne_code %></code> は<strong>子SKU</strong>です。
-            楽天は1ページ＝代表コード単位なので、<code><%= variation.groupKey %></code> にまとめることを推奨します。
-            <% if (regroup) { %>
-              <div class="muted" style="margin-top:4px;">まとめられません: <%= regroup %></div>
-            <% } %>
-          </div>
-          <% if (!regroup) { %>
-            <button class="btn btn-sm btn-primary" id="regroup-btn"
-                    data-from="<%= draft.ne_code %>" data-to="<%= variation.groupKey %>"
-                    style="white-space:nowrap">代表コードにまとめる</button>
-          <% } %>
-        </div>
-      <% } %>
-      <details open>
-        <summary style="cursor:pointer; font-size:13px; font-weight:600;">このページに載るSKU (<%= variation.members.length %>件)</summary>
-        <table class="list" style="margin-top:8px;">
-          <thead><tr><th style="width:190px">商品コード</th><th>商品名</th><th style="width:100px">取扱区分</th><th style="width:60px">在庫</th><th style="width:70px"></th></tr></thead>
-          <tbody>
-            <% for (const m of variation.members) { %>
-              <% const isSelf = String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase(); %>
-              <tr<%= isSelf ? ' style="background:#eff6ff"' : '' %>>
-                <td><code style="font-size:12px"><%= m.商品コード %></code></td>
-                <td><%= m.商品名 || '' %></td>
-                <td class="muted"><%= m.取扱区分 || '' %></td>
-                <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
-                <td>
-                  <% if (!isSelf) { %>
-                    <button class="btn btn-sm exclude-sku-btn" data-code="<%= m.商品コード %>">外す</button>
-                  <% } %>
-                </td>
-              </tr>
-            <% } %>
-          </tbody>
-        </table>
-      </details>
-      <% if (variation.excludedMembers.length > 0) { %>
-        <details style="margin-top:10px;">
-          <summary style="cursor:pointer; font-size:13px; font-weight:600; color:#b45309;">
-            このページから外したSKU (<%= variation.excludedMembers.length %>件)
-          </summary>
-          <p class="muted" style="margin:8px 0 0;">
-            外したSKUは楽天のこのページに載りません。別ページにする場合は、そのコードで新規登録してください
-            （まとめ直されずに単独のドラフトになります）。
-          </p>
-          <table class="list" style="margin-top:8px;">
-            <tbody>
-              <% for (const m of variation.excludedMembers) { %>
-                <tr>
-                  <td style="width:190px"><code style="font-size:12px"><%= m.商品コード %></code></td>
-                  <td class="muted"><%= m.商品名 || '' %></td>
-                  <td style="width:150px; font-size:12px;">
-                    <% if (m.ownDraftId) { %>
-                      <a href="/apps/product-hub/detail/<%= m.ownDraftId %>">単独ページ #<%= m.ownDraftId %></a>
-                    <% } else { %>
-                      <span style="color:#b45309" title="このSKUはどの楽天ページにも載りません">未割当</span>
-                    <% } %>
-                  </td>
-                  <td style="width:70px"><button class="btn btn-sm restore-sku-btn" data-code="<%= m.商品コード %>">戻す</button></td>
-                </tr>
-              <% } %>
-            </tbody>
-          </table>
-        </details>
-      <% } %>
-    <% } else if (variation.kind === 'detached') { %>
-      <p class="muted" style="margin:0;">
-        このSKUは他ページのバリエーションから外され、<strong>単独のページ</strong>として扱われています。
-      </p>
-    <% } else if (variation.kind === 'single') { %>
-      <p class="muted" style="margin:0;">単品です（NEに代表商品コードの登録なし）。</p>
-    <% } else if (variation.kind === 'conflict') { %>
-      <div class="banner-warn" style="margin:0;">
-        ⚠️ NE商品マスタに商品コード <code><%= draft.ne_code %></code> が
-        <strong><%= variation.memberCount %>件</strong>あります（大文字小文字・空白違いの重複）。
-        どちらのグループか判定できないため、NE側の重複を解消してください。
-      </div>
-    <% } else { %>
-      <p class="muted" style="margin:0;">
-        商品コード <code><%= draft.ne_code %></code> はNE商品マスタに見つかりませんでした（未登録の新商品など）。
-        判定できないため、下の「バリエーションあり」チェックが手動の値として使われます。
-      </p>
-    <% } %>
+  <!-- タブバー。バッジ = 未入力の主要な必須項目数。
+       サーバーの登録プリフライトの完全な再現ではない (形式エラー等はサーバーが最終判定) ため、
+       0件でも「送信内容を確認」で最終チェックする前提 (Codex R1 Medium-3) -->
+  <%
+    // 転送済み判定は件数比較ではなく drive_file_id の突合 (Codex R1 Medium-2:
+    // 画像を入れ替えると件数が同じでも未転送が発生し、サーバー検証とズレる)
+    const transferredImageCount = images.filter(
+      (im) => cabinetImages.some((c) => c.drive_file_id === im.drive_file_id)
+    ).length;
+  %>
+  <div class="tabbar" id="tabbar"
+       data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>">
+    <button type="button" class="tab-btn" data-tab="tab-basic">✏️ 基本情報<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-info">📄 商品情報<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-listing">🛒 出品<span class="tab-badge" hidden></span></button>
+    <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
 
-  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+  <!-- ═══ タブ1: 基本情報 ═══ -->
+  <div class="tab-panel" id="tab-basic">
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
     <!-- 基本情報 -->
     <div class="card">
       <h2>✏️ 基本情報 <span class="muted" style="font-weight:400">(入力)</span></h2>
@@ -179,7 +117,7 @@
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
-          <label>売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
+          <label class="req">売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
           <input type="number" id="f-price" min="0" step="1" value="<%= draft.price != null ? draft.price : '' %>">
           <!-- 利益シミュレーション (Notion 数式の移植 2026-07-28):
                利益額 = 売価×0.9 − 原価×(1+税率/100) − 配送関係費(=NEが配送方法から自動算出した送料) -->
@@ -201,6 +139,39 @@
         <div style="flex:1">
           <label>JANコード<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
+        </div>
+      </div>
+      <!-- 配送・納期。売価とセットで見たい (利益に効く) ため基本情報タブに配置 (2026-07-29 中原さん要望)。
+           保存は下の「基本情報を保存」で出品情報 (/rakuten) にも書き込まれる -->
+      <div class="field" style="display:flex; gap:12px; flex-wrap:wrap; background:#f8fafc; border-radius:8px; padding:10px 12px;">
+        <div style="flex:1; min-width:160px;">
+          <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
+          <select id="rk-shipping-group" style="width:100%;">
+            <option value="">未設定 (店舗デフォルト)</option>
+            <%
+              // 未設定なら NE 配送方法のマッピングをデフォルト選択 (保存で確定)
+              const shipDefault = String(rakuten?.shipping_method_group || '') || (neShipping.group || '');
+            %>
+            <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
+              <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
+            <% } %>
+          </select>
+          <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
+            <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
+          <% } %>
+          <div class="muted" style="font-size:11px;">※利益計算の配送費はNEの配送方法から自動算出 (ここを変えても計算は変わりません)</div>
+        </div>
+        <div style="flex:1; min-width:120px;">
+          <label>送料<span class="ftag ftag-m">手入力</span></label>
+          <select id="rk-postage" style="width:100%;">
+            <option value="">未設定 (店舗デフォルト)</option>
+            <option value="1" <%= rakuten?.postage_included === 1 ? 'selected' : '' %>>送料込み</option>
+            <option value="0" <%= rakuten?.postage_included === 0 ? 'selected' : '' %>>送料別</option>
+          </select>
+        </div>
+        <div style="flex:1; min-width:120px;">
+          <label>納期情報ID <span class="muted">(RMSの納期設定)</span><span class="ftag ftag-m">手入力</span></label>
+          <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= rakuten?.normal_delivery_date_id || '' %>" placeholder="未設定可">
         </div>
       </div>
       <div class="field" style="display:flex; gap:12px;">
@@ -241,63 +212,154 @@
       <button class="btn btn-primary" id="save-basic-btn">基本情報を保存</button>
     </div>
 
-    <!-- 参考URL -->
-    <div class="card">
-      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span><span class="ftag ftag-m">手入力</span></h2>
-      <% if (refs.length === 0) { %>
-        <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
-      <% } %>
-      <ul style="list-style:none; margin:0 0 12px; padding:0;">
-        <% for (const r of refs) { %>
-          <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
-            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
-            <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
-          </li>
+    <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
+    <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
+      <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
+      <p class="muted" style="margin-top:-6px">
+        入力不要です。ネクストエンジンの代表商品コードから自動で判定しています。
+        商品名・税率は<strong>登録時の初期値としてだけ</strong>NEから取り込み、以降はこのアプリの値が正です。
+      </p>
+      <% if (variation.kind === 'variation') { %>
+        <div style="font-size:13px; margin-bottom:10px;">
+          <strong>バリエーションあり</strong> — 代表商品コード
+          <button type="button" class="copy-code" data-code="<%= variation.groupKey %>" title="クリックでコピー"><%= variation.groupKey %><span class="copy-hint">📋 コピー</span></button>
+          に <strong><%= variation.memberCount %> SKU</strong> がぶら下がっています
+          <span class="muted">(NE判定)</span>
+        </div>
+        <% if (variation.isChild) { %>
+          <div class="banner-warn" style="margin:0 0 10px;">
+            <div>
+              ⚠️ このドラフトの商品コード <code><%= draft.ne_code %></code> は<strong>子SKU</strong>です。
+              楽天は1ページ＝代表コード単位なので、<code><%= variation.groupKey %></code> にまとめることを推奨します。
+              <% if (regroup) { %>
+                <div class="muted" style="margin-top:4px;">まとめられません: <%= regroup %></div>
+              <% } %>
+            </div>
+            <% if (!regroup) { %>
+              <button class="btn btn-sm btn-primary" id="regroup-btn"
+                      data-from="<%= draft.ne_code %>" data-to="<%= variation.groupKey %>"
+                      style="white-space:nowrap">代表コードにまとめる</button>
+            <% } %>
+          </div>
         <% } %>
-      </ul>
-      <div style="display:flex; gap:8px;">
-        <input type="url" id="new-ref-url" placeholder="https://...">
-        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
-      </div>
+        <details open>
+          <summary style="cursor:pointer; font-size:13px; font-weight:600;">このページに載るSKU (<%= variation.members.length %>件)</summary>
+          <table class="list" style="margin-top:8px;">
+            <thead><tr><th style="width:190px">商品コード</th><th>商品名</th><th style="width:100px">取扱区分</th><th style="width:60px">在庫</th><th style="width:70px"></th></tr></thead>
+            <tbody>
+              <% for (const m of variation.members) { %>
+                <% const isSelf = String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase(); %>
+                <tr<%= isSelf ? ' style="background:#eff6ff"' : '' %>>
+                  <td><code style="font-size:12px"><%= m.商品コード %></code></td>
+                  <td><%= m.商品名 || '' %></td>
+                  <td class="muted"><%= m.取扱区分 || '' %></td>
+                  <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
+                  <td>
+                    <% if (!isSelf) { %>
+                      <button class="btn btn-sm exclude-sku-btn" data-code="<%= m.商品コード %>">外す</button>
+                    <% } %>
+                  </td>
+                </tr>
+              <% } %>
+            </tbody>
+          </table>
+        </details>
+        <% if (variation.excludedMembers.length > 0) { %>
+          <details style="margin-top:10px;">
+            <summary style="cursor:pointer; font-size:13px; font-weight:600; color:#b45309;">
+              このページから外したSKU (<%= variation.excludedMembers.length %>件)
+            </summary>
+            <p class="muted" style="margin:8px 0 0;">
+              外したSKUは楽天のこのページに載りません。別ページにする場合は、そのコードで新規登録してください
+              （まとめ直されずに単独のドラフトになります）。
+            </p>
+            <table class="list" style="margin-top:8px;">
+              <tbody>
+                <% for (const m of variation.excludedMembers) { %>
+                  <tr>
+                    <td style="width:190px"><code style="font-size:12px"><%= m.商品コード %></code></td>
+                    <td class="muted"><%= m.商品名 || '' %></td>
+                    <td style="width:150px; font-size:12px;">
+                      <% if (m.ownDraftId) { %>
+                        <a href="/apps/product-hub/detail/<%= m.ownDraftId %>">単独ページ #<%= m.ownDraftId %></a>
+                      <% } else { %>
+                        <span style="color:#b45309" title="このSKUはどの楽天ページにも載りません">未割当</span>
+                      <% } %>
+                    </td>
+                    <td style="width:70px"><button class="btn btn-sm restore-sku-btn" data-code="<%= m.商品コード %>">戻す</button></td>
+                  </tr>
+                <% } %>
+              </tbody>
+            </table>
+          </details>
+        <% } %>
+      <% } else if (variation.kind === 'detached') { %>
+        <p class="muted" style="margin:0;">
+          このSKUは他ページのバリエーションから外され、<strong>単独のページ</strong>として扱われています。
+        </p>
+      <% } else if (variation.kind === 'single') { %>
+        <p class="muted" style="margin:0;">単品です（NEに代表商品コードの登録なし）。</p>
+      <% } else if (variation.kind === 'conflict') { %>
+        <div class="banner-warn" style="margin:0;">
+          ⚠️ NE商品マスタに商品コード <code><%= draft.ne_code %></code> が
+          <strong><%= variation.memberCount %>件</strong>あります（大文字小文字・空白違いの重複）。
+          どちらのグループか判定できないため、NE側の重複を解消してください。
+        </div>
+      <% } else { %>
+        <p class="muted" style="margin:0;">
+          商品コード <code><%= draft.ne_code %></code> はNE商品マスタに見つかりませんでした（未登録の新商品など）。
+          判定できないため、「バリエーションあり」チェックが手動の値として使われます。
+        </p>
+      <% } %>
     </div>
   </div>
+  </div><!-- /tab-basic -->
 
-  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
-    <!-- Yahoo!向け追記項目 -->
-    <div class="card">
-      <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
-      <div class="field" style="display:flex; gap:12px;">
-        <div style="flex:1">
-          <label>Yahoo!売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
-          <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
-        </div>
-        <div style="flex:1">
-          <label>Yahoo!売価 (佐川の場合)<span class="ftag ftag-m">手入力</span></label>
-          <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
-        </div>
-      </div>
-      <div class="field" style="display:flex; gap:12px;">
-        <div style="flex:1">
-          <label>配送方法<span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
-        </div>
-        <div style="flex:1">
-          <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
-        </div>
-      </div>
-      <div class="field" style="display:flex; gap:12px;">
-        <div style="flex:1">
-          <label>Yahoo!カテゴリID<span class="ftag ftag-m">手入力</span></label>
-          <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
-        </div>
-        <div style="flex:2">
-          <label>Yahoo!path (店カテゴリ)<span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
-        </div>
-      </div>
-      <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
+  <!-- ═══ タブ2: 画像 ═══ -->
+  <div class="tab-panel" id="tab-images">
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
+  <div class="card">
+    <h2>✏️ 商品画像 (Driveリンク)<span class="ftag ftag-m">手入力</span></h2>
+    <div style="display:flex; gap:8px; margin-bottom:12px;">
+      <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
+      <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
     </div>
+    <% if (images.length === 0) { %>
+      <p class="muted">まだ画像がありません。Drive で画像ファイルを右クリック →「リンクをコピー」で取得した URL を貼ってください。</p>
+    <% } else { %>
+      <div style="display:flex; gap:12px; flex-wrap:wrap;">
+        <% for (const img of images) { %>
+          <div style="text-align:center;">
+            <a href="<%= img.view_url %>" target="_blank" rel="noopener">
+              <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                   style="width:140px; height:140px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
+            </a>
+            <div><button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button></div>
+          </div>
+        <% } %>
+      </div>
+      <p class="muted" style="margin-bottom:0">※ サムネイルは Drive の閲覧権限があるアカウントでログインしたブラウザでのみ表示されます</p>
+    <% } %>
+    <div class="field" style="margin-top:14px;">
+      <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
+      <%
+        const whiteBgTransferred = rakuten?.white_bg_drive_file_id
+          && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
+      %>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="rk-whitebg" style="flex:1;" value="<%= rakuten?.white_bg_drive_url || '' %>" placeholder="https://drive.google.com/file/d/...">
+        <% if (rakuten?.white_bg_drive_file_id) { %>
+          <span class="muted" style="font-size:12px; white-space:nowrap;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送 (「画像を転送」で送る)' %></span>
+        <% } %>
+      </div>
+      <div class="muted" style="font-size:11px;">保存は「出品」タブの「出品情報を保存」か「基本情報を保存」で行われます</div>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
+      <!-- 件数は drive_file_id 突合 (Codex R2: 履歴件数だと画像差し替え後や白抜き分でズレる) -->
+      <button class="btn" id="rk-images-btn">画像をR-Cabinetへ転送 (<%= transferredImageCount %>/<%= images.length %> 済)</button>
+      <span class="muted" id="rk-images-result"></span>
+    </div>
+  </div>
 
     <!-- 画像制作 (自社商品のみ) -->
     <div class="card">
@@ -381,58 +443,10 @@
       <% } %>
     </div>
   </div>
+  </div><!-- /tab-images -->
 
-  <!-- 画像 -->
-  <div class="grid-2" style="gap:16px; align-items:start;">
-  <div class="card">
-    <h2>✏️ 商品画像 (Driveリンク)<span class="ftag ftag-m">手入力</span></h2>
-    <div style="display:flex; gap:8px; margin-bottom:12px;">
-      <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
-      <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
-    </div>
-    <% if (images.length === 0) { %>
-      <p class="muted">まだ画像がありません。Drive で画像ファイルを右クリック →「リンクをコピー」で取得した URL を貼ってください。</p>
-    <% } else { %>
-      <div style="display:flex; gap:12px; flex-wrap:wrap;">
-        <% for (const img of images) { %>
-          <div style="text-align:center;">
-            <a href="<%= img.view_url %>" target="_blank" rel="noopener">
-              <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
-                   style="width:140px; height:140px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
-            </a>
-            <div><button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button></div>
-          </div>
-        <% } %>
-      </div>
-      <p class="muted" style="margin-bottom:0">※ サムネイルは Drive の閲覧権限があるアカウントでログインしたブラウザでのみ表示されます</p>
-    <% } %>
-  </div>
-
-  <!-- 仕様表 -->
-  <div class="card">
-    <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span><span class="ftag ftag-m">手入力</span></h2>
-    <table class="list" style="margin-bottom:12px;">
-      <% if (specs.length > 0) { %>
-        <thead><tr><th style="width:200px">項目</th><th>値</th><th style="width:70px"></th></tr></thead>
-      <% } %>
-      <tbody>
-        <% for (const sp of specs) { %>
-          <tr>
-            <td><%= sp.spec_key %></td>
-            <td><%= sp.spec_value || '' %></td>
-            <td><button class="btn btn-sm btn-danger del-spec-btn" data-id="<%= sp.id %>">削除</button></td>
-          </tr>
-        <% } %>
-      </tbody>
-    </table>
-    <div style="display:flex; gap:8px;">
-      <input type="text" id="new-spec-key" placeholder="項目 (例: サイズ)" style="width:200px">
-      <input type="text" id="new-spec-value" placeholder="値 (例: W10×D10×H15cm)">
-      <button class="btn" id="add-spec-btn" style="white-space:nowrap">追加</button>
-    </div>
-  </div>
-  </div><!-- /grid-2 (商品画像+仕様表) -->
-
+  <!-- ═══ タブ3: 商品説明 ═══ -->
+  <div class="tab-panel" id="tab-desc">
   <!-- AI出力 -->
   <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
     <h2>🤖 AIが書く項目 <span class="muted" style="font-weight:400">(タイトル・説明文)</span></h2>
@@ -466,9 +480,62 @@
     <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
   </div>
 
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
+    <!-- 参考URL -->
+    <div class="card">
+      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span><span class="ftag ftag-m">手入力</span></h2>
+      <% if (refs.length === 0) { %>
+        <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
+      <% } %>
+      <ul style="list-style:none; margin:0 0 12px; padding:0;">
+        <% for (const r of refs) { %>
+          <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
+            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
+            <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
+          </li>
+        <% } %>
+      </ul>
+      <div style="display:flex; gap:8px;">
+        <input type="url" id="new-ref-url" placeholder="https://...">
+        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
+      </div>
+    </div>
+
+    <!-- 仕様表 -->
+    <div class="card">
+      <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span><span class="ftag ftag-m">手入力</span></h2>
+      <table class="list" style="margin-bottom:12px;">
+        <% if (specs.length > 0) { %>
+          <thead><tr><th style="width:200px">項目</th><th>値</th><th style="width:70px"></th></tr></thead>
+        <% } %>
+        <tbody>
+          <% for (const sp of specs) { %>
+            <tr>
+              <td><%= sp.spec_key %></td>
+              <td><%= sp.spec_value || '' %></td>
+              <td><button class="btn btn-sm btn-danger del-spec-btn" data-id="<%= sp.id %>">削除</button></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <div style="display:flex; gap:8px;">
+        <input type="text" id="new-spec-key" placeholder="項目 (例: サイズ)" style="width:200px">
+        <input type="text" id="new-spec-value" placeholder="値 (例: W10×D10×H15cm)">
+        <button class="btn" id="add-spec-btn" style="white-space:nowrap">追加</button>
+      </div>
+    </div>
+  </div>
+  </div><!-- /tab-desc -->
+
+  <!-- ═══ タブ4: 商品情報 (商品ページ表記) ═══ -->
+  <div class="tab-panel" id="tab-info">
   <!-- 商品ページ表記 (化粧品・食品) — 旧xlsmの移植 -->
   <div class="card" style="border-color:#fde68a; background:#fffdf5;">
     <h2>📄 商品ページ表記 <span class="muted" style="font-weight:400">(化粧品・食品の必須記載。説明文の末尾に表として自動掲載)</span></h2>
+    <p class="muted" style="margin-top:-6px; font-size:12px;">
+      商品タイプを選ぶと、そのタイプで入力が要る項目だけが表示されます (値が入っている項目は常に表示)。
+      <span style="color:#dc2626">*必須</span> は楽天の必須記載事項です。
+    </p>
     <div class="grid-2">
       <div class="field">
         <label>商品タイプ<span class="ftag ftag-m">手入力</span></label>
@@ -479,8 +546,8 @@
         </select>
         <div class="muted" style="font-size:11px;">化粧品・健康食品は楽天の必須記載 (広告文責/発売元/製造国/商品区分) を登録前にチェックします</div>
       </div>
-      <div class="field">
-        <label>商品区分<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須)</span></label>
+      <div class="field" id="pi-f-category">
+        <label id="pi-l-category">商品区分<span class="ftag ftag-m">手入力</span></label>
         <select id="pi-category" style="width:100%;">
           <option value="">未選択</option>
           <% for (const c of categoryLabels) { %>
@@ -488,8 +555,8 @@
           <% } %>
         </select>
       </div>
-      <div class="field">
-        <label>製造国<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須。原産国=製造事業所の国)</span></label>
+      <div class="field" id="pi-f-origin">
+        <label id="pi-l-origin">製造国 <span class="muted">(原産国=製造事業所の国)</span><span class="ftag ftag-m">手入力</span></label>
         <div style="display:flex; gap:8px;">
           <select id="pi-origin-type" style="width:130px;">
             <option value="">未選択</option>
@@ -499,46 +566,46 @@
           <input type="text" id="pi-origin-country" style="flex:1;" placeholder="海外製のとき原産国名 (健康食品は必須)" value="<%= pageInfo?.origin_country || '' %>">
         </div>
       </div>
-      <div class="field">
-        <label>発売元 (メーカー名/販売業者名)<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品・健康食品は必須)</span></label>
+      <div class="field" id="pi-f-seller">
+        <label id="pi-l-seller">発売元 (メーカー名/販売業者名)<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-seller" value="<%= pageInfo?.seller_name || '' %>" placeholder="例: 株式会社アメージングクラフト">
       </div>
-      <div class="field">
-        <label>輸入者名<span class="ftag ftag-m">手入力</span> <span class="muted">(輸入品はメーカー名と両記載が楽天必須)</span></label>
+      <div class="field" id="pi-f-importer">
+        <label id="pi-l-importer">輸入者名 <span class="muted">(輸入品はメーカー名と両記載が楽天必須)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-importer" value="<%= pageInfo?.importer_name || '' %>">
       </div>
-      <div class="field">
-        <label>内容量<span class="ftag ftag-m">手入力</span></label>
+      <div class="field" id="pi-f-volume">
+        <label id="pi-l-volume">内容量<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-volume" value="<%= pageInfo?.content_volume || '' %>" placeholder="例: 50ml">
       </div>
-      <div class="field">
+      <div class="field" id="pi-f-size">
         <label>サイズ<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-size" value="<%= pageInfo?.size_text || '' %>" placeholder="例: 縦5cm×横10cm×高さ15cm">
       </div>
-      <div class="field">
-        <label>成分・素材・材質<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品は全成分)</span></label>
+      <div class="field" id="pi-f-ingredients">
+        <label>成分・素材・材質<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品は全成分。食品は原材料名欄へ)</span></label>
         <textarea id="pi-ingredients" rows="3"><%= pageInfo?.ingredients || '' %></textarea>
       </div>
-      <div class="field">
+      <div class="field" id="pi-f-usage">
         <label>使用上の注意<span class="ftag ftag-m">手入力</span></label>
         <textarea id="pi-usage" rows="3"><%= pageInfo?.usage_notes || '' %></textarea>
       </div>
     </div>
     <div id="pi-food-fields" class="grid-2" style="display:none; background:#fef9ec; border-radius:8px; padding:8px 12px; margin-bottom:8px;">
       <div class="field">
-        <label>名称 (食品表示)<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-food-name">名称 (食品表示)<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-food-name" value="<%= pageInfo?.food_name || '' %>" placeholder="例: 有機亜麻仁シード">
       </div>
       <div class="field">
-        <label>原材料名 (食品表示)<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-food-ingredients">原材料名 (食品表示)<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-food-ingredients" value="<%= pageInfo?.food_ingredients || '' %>" placeholder="例: 有機アマニ (アルゼンチン産)">
       </div>
       <div class="field">
-        <label>賞味期限<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-food-expiry">賞味期限<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-food-expiry" value="<%= pageInfo?.food_expiry || '' %>" placeholder="例: 商品ラベルに記載">
       </div>
       <div class="field">
-        <label>保存方法<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-food-storage">保存方法<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-food-storage" value="<%= pageInfo?.food_storage || '' %>" placeholder="例: 直射日光を避け常温保存">
       </div>
     </div>
@@ -558,10 +625,84 @@
     <textarea id="pi-html-src" style="display:none;"><%= pageInfoHtml %></textarea>
     <script type="application/json" id="pi-cat-by-type"><%- JSON.stringify(categoryLabelsByType).replace(/</g, '\\u003c') %></script>
   </div>
+  </div><!-- /tab-info -->
 
+  <!-- ═══ タブ5: カテゴリ・属性 ═══ -->
+  <div class="tab-panel" id="tab-category">
+  <div class="card">
+    <h2>🗂 カテゴリ・属性 <span class="muted" style="font-weight:400">(楽天のジャンル・店舗内カテゴリ・商品属性)</span></h2>
+
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label class="req">ジャンルID (楽天)<span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
+        <div style="display:flex; gap:6px;">
+          <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="AIが自動で提案します" style="flex:1;">
+          <button type="button" class="btn btn-sm" id="rk-genre-tree" style="white-space:nowrap;">🌲 ツリーから選ぶ</button>
+          <button type="button" class="btn btn-sm" id="rk-genre-fetch" style="white-space:nowrap;">ジャンル情報を取得</button>
+        </div>
+        <div id="rk-genre-suggest" style="font-size:12px; margin-top:4px;"></div>
+        <div id="rk-genre-info" style="font-size:12px; margin-top:4px;">
+          <% if (genreDict) { %>
+            <span style="color:#166534;">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
+            <span class="muted">(必須属性 <%= genreDict.attributes.filter((a) => a.mandatory).length %> 件 / 辞書取得済み)</span>
+          <% } else { %>
+            <span class="muted">辞書未取得 — 取得すると必須属性の行が自動で並び、登録前にチェックされます</span>
+          <% } %>
+        </div>
+      </div>
+      <div style="flex:1">
+        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
+      </div>
+    </div>
+
+    <div class="field">
+      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-m">手入力</span></label>
+      <% if (shopCategories.length === 0) { %>
+        <p class="muted" style="margin:4px 0;">
+          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
+        </p>
+      <% } else { %>
+        <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
+        <!-- RMS と同じくツリーで選ぶ (2026-07-28)。checkbox の class/value は保存処理と共通 -->
+        <div id="rk-cats" style="max-height:240px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;"></div>
+        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
+      <% } %>
+    </div>
+
+    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
+    <table class="list" id="rk-attrs" style="margin-bottom:8px;">
+      <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
+      <tbody>
+        <%
+          let rkAttrs = [];
+          try { rkAttrs = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrs = []; }
+          if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
+        %>
+        <% for (const a of rkAttrs) { %>
+          <tr>
+            <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>"></td>
+            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>"></td>
+            <td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 属性行を追加</button>
+    <script type="application/json" id="rk-mandatory-json"><%- JSON.stringify(genreDict ? genreDict.attributes.filter((a) => a.mandatory).map((a) => a.name) : []).replace(/</g, '\\u003c') %></script>
+
+    <div style="display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+      <button class="btn btn-primary" id="rk-save-btn-cat">カテゴリ・属性を保存</button>
+      <span class="muted" id="rk-result-cat"></span>
+    </div>
+  </div>
+  </div><!-- /tab-category -->
+
+  <!-- ═══ タブ6: 出品 ═══ -->
+  <div class="tab-panel" id="tab-listing">
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
-    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → 公開はRMS画面で)</span></h2>
+    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → アプリの公開ボタンで公開)</span></h2>
     <% const selectedShopCats = shopCategories.filter((c) => c.selected); %>
     <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
@@ -597,123 +738,60 @@
 <%= rakuten.last_error %></div>
     <% } %>
 
-    <div class="field" style="display:flex; gap:12px;">
-      <div style="flex:1">
-        <label class="req">ジャンルID (楽天)<span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
-        <div style="display:flex; gap:6px;">
-          <input type="text" id="rk-genre" inputmode="numeric" value="<%= rakuten?.genre_id || '' %>" placeholder="AIが自動で提案します" style="flex:1;">
-          <button type="button" class="btn btn-sm" id="rk-genre-tree" style="white-space:nowrap;">🌲 ツリーから選ぶ</button>
-          <button type="button" class="btn btn-sm" id="rk-genre-fetch" style="white-space:nowrap;">ジャンル情報を取得</button>
-        </div>
-        <div id="rk-genre-suggest" style="font-size:12px; margin-top:4px;"></div>
-        <div id="rk-genre-info" style="font-size:12px; margin-top:4px;">
-          <% if (genreDict) { %>
-            <span style="color:#166534;">✅ <%= genreDict.genrePath || genreDict.genreName %></span>
-            <span class="muted">(必須属性 <%= genreDict.attributes.filter((a) => a.mandatory).length %> 件 / 辞書取得済み)</span>
-          <% } else { %>
-            <span class="muted">辞書未取得 — 取得すると必須属性の行が自動で並び、登録前にチェックされます</span>
-          <% } %>
-        </div>
-      </div>
-      <div style="flex:1">
-        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
-      </div>
-    </div>
-
-    <div class="field" style="display:flex; gap:12px; flex-wrap:wrap;">
-      <div style="flex:1; min-width:160px;">
-        <label>配送方法 <span class="muted">(楽天の配送方法グループ)</span><span class="ftag ftag-m">手入力</span></label>
-        <select id="rk-shipping-group" style="width:100%;">
-          <option value="">未設定 (店舗デフォルト)</option>
-          <%
-            // 未設定なら NE 配送方法のマッピングをデフォルト選択 (「出品情報を保存」で確定)
-            const shipDefault = String(rakuten?.shipping_method_group || '') || (neShipping.group || '');
-          %>
-          <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
-            <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
-          <% } %>
-        </select>
-        <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
-          <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
-        <% } %>
-      </div>
-      <div style="flex:1; min-width:120px;">
-        <label>送料<span class="ftag ftag-m">手入力</span></label>
-        <select id="rk-postage" style="width:100%;">
-          <option value="">未設定 (店舗デフォルト)</option>
-          <option value="1" <%= rakuten?.postage_included === 1 ? 'selected' : '' %>>送料込み</option>
-          <option value="0" <%= rakuten?.postage_included === 0 ? 'selected' : '' %>>送料別</option>
-        </select>
-      </div>
-      <div style="flex:1; min-width:120px;">
-        <label>納期情報ID <span class="muted">(RMSの納期設定)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= rakuten?.normal_delivery_date_id || '' %>" placeholder="未設定可">
-      </div>
-    </div>
-
-    <div class="field">
-      <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
-      <%
-        const whiteBgTransferred = rakuten?.white_bg_drive_file_id
-          && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
-      %>
-      <div style="display:flex; gap:8px; align-items:center;">
-        <input type="text" id="rk-whitebg" style="flex:1;" value="<%= rakuten?.white_bg_drive_url || '' %>" placeholder="https://drive.google.com/file/d/...">
-        <% if (rakuten?.white_bg_drive_file_id) { %>
-          <span class="muted" style="font-size:12px; white-space:nowrap;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送 (「画像を転送」で送る)' %></span>
-        <% } %>
-      </div>
-    </div>
-
     <p class="muted" style="margin:0 0 10px; font-size:12px;">
       💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報・Yahoo!欄の値を自動で送ります。
-      在庫は常に 0 で登録します。
+      在庫は常に 0 で登録します。<br>
+      配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
+      「出品情報を保存」はタブをまたいで全ての出品項目を保存します。
     </p>
 
-    <div class="field">
-      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-m">手入力</span></label>
-      <% if (shopCategories.length === 0) { %>
-        <p class="muted" style="margin:4px 0;">
-          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
-        </p>
-      <% } else { %>
-        <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
-        <!-- RMS と同じくツリーで選ぶ (2026-07-28)。checkbox の class/value は保存処理と共通 -->
-        <div id="rk-cats" style="max-height:240px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;"></div>
-        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
-      <% } %>
-    </div>
-
-    <label>商品属性 <span class="muted">(「ジャンル情報を取得」で必須属性の行が自動で並びます。<span style="color:#dc2626">*必須</span> / 選択式はRMSの選択肢と同じ表記で)</span><span class="ftag ftag-auto">自動</span><span class="ftag ftag-m">手入力</span></label>
-    <table class="list" id="rk-attrs" style="margin-bottom:8px;">
-      <thead><tr><th style="width:40%">属性名 (例: ブランド名)</th><th>値</th><th style="width:50px"></th></tr></thead>
-      <tbody>
-        <%
-          let rkAttrs = [];
-          try { rkAttrs = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrs = []; }
-          if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
-        %>
-        <% for (const a of rkAttrs) { %>
-          <tr>
-            <td><input type="text" class="rk-attr-name" value="<%= a.name || '' %>"></td>
-            <td><input type="text" class="rk-attr-value" value="<%= (a.values && a.values[0]) || '' %>"></td>
-            <td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>
-          </tr>
-        <% } %>
-      </tbody>
-    </table>
-    <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 属性行を追加</button>
-
-    <div style="display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap;">
+    <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap;">
       <button class="btn" id="rk-save-btn">出品情報を保存</button>
-      <button class="btn" id="rk-images-btn">画像をR-Cabinetへ転送 (<%= cabinetImages.length %>/<%= images.length %> 済)</button>
       <button class="btn" id="rk-preview-btn">送信内容を確認</button>
       <button class="btn btn-primary" id="rk-register-btn">非公開で登録</button>
       <span class="muted" id="rk-result"></span>
     </div>
     <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
   </div>
+
+  <!-- Yahoo!向け追記項目 -->
+  <div class="card">
+    <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
+    <div class="grid-2">
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>Yahoo!売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
+      </div>
+      <div style="flex:1">
+        <label>Yahoo!売価 (佐川の場合)<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
+      </div>
+    </div>
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>配送方法<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
+      </div>
+      <div style="flex:1">
+        <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+      </div>
+    </div>
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>Yahoo!カテゴリID<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
+      </div>
+      <div style="flex:2">
+        <label>Yahoo!path (店カテゴリ)<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
+      </div>
+    </div>
+    </div>
+    <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
+  </div>
+  </div><!-- /tab-listing -->
 
   <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->
   <div id="genre-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
@@ -783,6 +861,101 @@
     }
   }
 
+  // ─── タブ切り替え (2026-07-29)。location.hash に保持して保存後の reload でも同じタブに戻る ───
+  (function initTabs() {
+    const btns = Array.from(document.querySelectorAll('#tabbar .tab-btn'));
+    function activate(id, remember) {
+      btns.forEach((b) => b.classList.toggle('active', b.dataset.tab === id));
+      document.querySelectorAll('.tab-panel').forEach((p) => p.classList.toggle('active', p.id === id));
+      // location.hash 直代入はパネルへスクロールしてしまうため replaceState を使う
+      if (remember) history.replaceState(null, '', '#' + id);
+    }
+    btns.forEach((b) => b.addEventListener('click', () => activate(b.dataset.tab, true)));
+    const initial = (location.hash || '').slice(1);
+    activate(btns.some((b) => b.dataset.tab === initial) ? initial : 'tab-basic', false);
+  })();
+
+  // ─── 必須未入力バッジ。楽天登録・AI生成ゲートで必要な「入力もの」を数える。
+  //     サーバーのプリフライト (buildItemPayload 事前検証) の完全ミラーではない —
+  //     形式エラー (JAN桁数/文字数超過/税率不正など) はサーバーが最終判定する。
+  //     公式ページURLは楽天登録には不要だが「生成待ち」ゲートの必須なので含めている ───
+  let mandatoryAttrNames = [];
+  try { mandatoryAttrNames = JSON.parse(document.getElementById('rk-mandatory-json').textContent) || []; } catch (e) {}
+
+  function tv(id) {
+    const el = document.getElementById(id);
+    return el ? String(el.value || '').trim() : '';
+  }
+
+  // lib/page-info.js validatePageInfo のミラー。変更時は両方直すこと
+  function pageInfoMissing() {
+    const t = tv('pi-type') || 'general';
+    const miss = [];
+    if (t === 'cosmetics' || t === 'health_food') {
+      if (!tv('pi-seller')) miss.push('発売元');
+      const ot = tv('pi-origin-type');
+      if (!ot) miss.push('製造国');
+      else if (ot === '海外製') {
+        if (t === 'health_food' && !tv('pi-origin-country')) miss.push('原産国名');
+        if (!tv('pi-importer')) miss.push('輸入者名');
+      }
+      if (!tv('pi-category')) miss.push('商品区分');
+    }
+    if (t === 'health_food') {
+      if (!tv('pi-food-name')) miss.push('名称 (食品表示)');
+      if (!tv('pi-food-ingredients')) miss.push('原材料名');
+      if (!tv('pi-volume')) miss.push('内容量');
+      if (!tv('pi-food-expiry')) miss.push('賞味期限');
+      if (!tv('pi-food-storage')) miss.push('保存方法');
+    }
+    return miss;
+  }
+
+  function computeMissing() {
+    const m = { 'tab-basic': [], 'tab-images': [], 'tab-desc': [], 'tab-info': [], 'tab-category': [], 'tab-listing': [] };
+    if (!tv('f-name')) m['tab-basic'].push('商品名');
+    if (!tv('f-official-url')) m['tab-basic'].push('公式ページURL');
+    const price = Number(tv('f-price'));
+    if (!Number.isFinite(price) || price <= 0) m['tab-basic'].push('売価');
+    const bar = document.getElementById('tabbar');
+    const imgs = Number(bar.dataset.imageCount || 0);
+    const transferred = Number(bar.dataset.transferredCount || 0); // drive_file_id 突合済みの件数
+    if (imgs === 0) m['tab-images'].push('商品画像 (1枚以上)');
+    else if (transferred < imgs) m['tab-images'].push('R-Cabinet未転送 ' + (imgs - transferred) + '枚');
+    m['tab-info'].push(...pageInfoMissing());
+    if (!tv('rk-genre')) m['tab-category'].push('ジャンルID');
+    // カタログIDは JAN欄に値があればサーバーが自動送信する。JAN も手入力属性も無ければ必須扱い
+    // (Codex R1 High-1: 無条件に除外すると「未入力0件」のまま登録が失敗する)
+    const janFilled = !!tv('f-jan');
+    const need = mandatoryAttrNames.filter((n) => n !== 'カタログID' || !janFilled);
+    if (need.length > 0) {
+      const vals = {};
+      document.querySelectorAll('#rk-attrs tbody tr').forEach((tr) => {
+        const n = tr.querySelector('.rk-attr-name').value.trim();
+        if (n) vals[n] = tr.querySelector('.rk-attr-value').value.trim();
+      });
+      for (const n of need) {
+        if (vals[n]) continue;
+        m['tab-category'].push(n === 'カタログID' ? '必須属性「カタログID」(基本情報タブのJAN欄入力でも可)' : '必須属性「' + n + '」');
+      }
+    }
+    return m;
+  }
+
+  function updateTabBadges() {
+    const m = computeMissing();
+    document.querySelectorAll('#tabbar .tab-btn').forEach((b) => {
+      const list = m[b.dataset.tab] || [];
+      const badge = b.querySelector('.tab-badge');
+      badge.hidden = list.length === 0;
+      badge.textContent = list.length;
+      b.title = list.length ? '未入力の必須: ' + list.join(' / ') : '';
+    });
+  }
+  document.addEventListener('input', () => updateTabBadges());
+  document.addEventListener('change', () => updateTabBadges());
+  document.addEventListener('click', () => setTimeout(updateTabBadges, 60)); // 属性行の追加/削除ボタン対応
+
   document.querySelectorAll('.status-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       showAndReload(await post(BASE + '/status', { to: btn.dataset.to }), 'ステータスを変更しました');
@@ -800,6 +973,9 @@
   }
 
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
+    // 配送方法・送料・納期 (楽天出品の項目) を基本情報タブに置いたため、先に出品情報も保存する。
+    // /rakuten は全項目 upsert なので、部分送信せず collectRakutenFields の全量を送る
+    if (!(await saveRakutenFields())) return;
     showAndReload(await post(BASE, {
       name: document.getElementById('f-name').value,
       official_url: document.getElementById('f-official-url').value,
@@ -822,6 +998,7 @@
 
   // ─── 楽天出品 (P3) ───
   const rkResult = document.getElementById('rk-result');
+  const rkResultCat = document.getElementById('rk-result-cat');
 
   // ─── ジャンルツリー選択モーダル (IchibaGenre/Search。RMS の「ジャンルID選択」相当) ───
   const genreModal = document.getElementById('genre-modal');
@@ -959,7 +1136,7 @@
       }
       document.getElementById('rk-genre').value = genreId;
       document.getElementById('rk-genre-fetch').click(); // 辞書はキャッシュ済みなので即応答
-      if (source === 'ai') rkResult.textContent = 'AIがジャンルを設定しました (違う場合は「ツリーから選ぶ」で修正)';
+      if (source === 'ai') rkResultCat.textContent = 'AIがジャンルを設定しました (違う場合は「ツリーから選ぶ」で修正)';
       return true;
     } finally { applyingGenre = false; }
   }
@@ -1120,6 +1297,7 @@
       if (!j.ok) { info.textContent = '❌ ' + (j.error || '取得に失敗しました'); return; }
       const g = j.genre;
       const mandatory = (g.attributes || []).filter((a) => a.mandatory);
+      mandatoryAttrNames = mandatory.map((a) => a.name); // バッジの必須属性リストも更新
       info.innerHTML = '';
       const ok = document.createElement('span');
       ok.style.color = '#166534';
@@ -1151,7 +1329,8 @@
         note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。JAN欄の値が自動で送られます。';
         info.appendChild(note);
       }
-      if (added > 0) rkResult.textContent = '必須属性 ' + added + ' 行を追加しました。値を埋めて「出品情報を保存」してください';
+      if (added > 0) rkResultCat.textContent = '必須属性 ' + added + ' 行を追加しました。値を埋めて保存してください';
+      updateTabBadges();
     } catch (e) {
       info.textContent = '通信エラー: ' + e.message;
     } finally { btn.disabled = false; }
@@ -1245,16 +1424,20 @@
   document.getElementById('rk-save-btn').addEventListener('click', async () => {
     if (await saveRakutenFields()) { rkResult.textContent = '保存しました'; }
   });
+  document.getElementById('rk-save-btn-cat').addEventListener('click', async () => {
+    if (await saveRakutenFields()) { rkResultCat.textContent = '保存しました'; }
+  });
 
   document.getElementById('rk-images-btn').addEventListener('click', async () => {
     const btn = document.getElementById('rk-images-btn');
+    const imgResult = document.getElementById('rk-images-result');
     btn.disabled = true;
-    rkResult.textContent = '画像を転送中… (Drive → R-Cabinet)';
+    imgResult.textContent = '画像を転送中… (Drive → R-Cabinet)';
     try {
       const json = await post(BASE + '/rakuten/transfer-images');
-      if (json.error) { rkResult.textContent = ''; alert(json.error); return; }
+      if (json.error) { imgResult.textContent = ''; alert(json.error); return; }
       const failed = (json.results || []).filter((r) => r.outcome === 'failed');
-      rkResult.textContent = '転送 ' + (json.uploaded || 0) + ' 件 / 済み '
+      imgResult.textContent = '転送 ' + (json.uploaded || 0) + ' 件 / 済み '
         + (json.results || []).filter((r) => r.outcome === 'already').length + ' 件 / 失敗 ' + failed.length + ' 件';
       if (failed.length > 0) {
         alert('転送に失敗した画像があります:\n' + failed.map((f) => '・' + (f.error || '')).join('\n')
@@ -1333,13 +1516,52 @@
     const typeSel = document.getElementById('pi-type');
     if (!typeSel) return;
     const foodBox = document.getElementById('pi-food-fields');
+    const originSel = document.getElementById('pi-origin-type');
     // 商品タイプに整合する商品区分だけ選べるようにする (サーバー側でも検証)
     const catSel = document.getElementById('pi-category');
     let catByType = {};
-    try { catByType = JSON.parse(document.getElementById('pi-cat-by-type').textContent); } catch (e) {}
-    const toggleFood = () => {
-      foodBox.style.display = (typeSel.value === 'food' || typeSel.value === 'health_food') ? '' : 'none';
-      const allowed = catByType[typeSel.value] || null;
+    try { catByType = JSON.parse(document.getElementById('pi-cat-by-type').textContent) || {}; } catch (e) {}
+
+    // 商品タイプごとの表示項目 (2026-07-29 中原さん要望: タイプ連動で表示を絞る)。
+    // true=表示 / false=非表示 / 'overseas'=海外製のときだけ表示。
+    // ただし値が入っている項目は絶対に隠さない (掲載HTMLに載る値が見えなくなるため)
+    const FIELD_RULES = {
+      'pi-f-category':    { valueId: 'pi-category',    general: false, cosmetics: true,  health_food: true,  food: true },
+      'pi-f-origin':      { valueId: 'pi-origin-type', general: true,  cosmetics: true,  health_food: true,  food: true },
+      'pi-f-seller':      { valueId: 'pi-seller',      general: true,  cosmetics: true,  health_food: true,  food: true },
+      'pi-f-importer':    { valueId: 'pi-importer',    general: false, cosmetics: 'overseas', health_food: 'overseas', food: 'overseas' },
+      'pi-f-volume':      { valueId: 'pi-volume',      general: false, cosmetics: true,  health_food: true,  food: true },
+      'pi-f-ingredients': { valueId: 'pi-ingredients', general: true,  cosmetics: true,  health_food: false, food: false },
+    };
+    // 楽天必須の *必須 マーク (validatePageInfo と対応)
+    const REQ_LABELS = {
+      cosmetics: ['pi-l-category', 'pi-l-origin', 'pi-l-seller'],
+      health_food: ['pi-l-category', 'pi-l-origin', 'pi-l-seller', 'pi-l-volume',
+        'pi-l-food-name', 'pi-l-food-ingredients', 'pi-l-food-expiry', 'pi-l-food-storage'],
+    };
+    const ALL_REQ_LABELS = ['pi-l-category', 'pi-l-origin', 'pi-l-seller', 'pi-l-importer', 'pi-l-volume',
+      'pi-l-food-name', 'pi-l-food-ingredients', 'pi-l-food-expiry', 'pi-l-food-storage'];
+
+    const applyTypeVisibility = () => {
+      const t = typeSel.value || 'general';
+      for (const [wrapId, rule] of Object.entries(FIELD_RULES)) {
+        const wrap = document.getElementById(wrapId);
+        if (!wrap) continue;
+        const hasValue = !!String((document.getElementById(rule.valueId) || {}).value || '').trim();
+        let show = rule[t];
+        if (show === 'overseas') show = originSel.value === '海外製';
+        wrap.style.display = (show || hasValue) ? '' : 'none';
+      }
+      foodBox.style.display = (t === 'food' || t === 'health_food') ? '' : 'none';
+      // *必須 マークの付け替え
+      const req = new Set(REQ_LABELS[t] || []);
+      if ((t === 'cosmetics' || t === 'health_food') && originSel.value === '海外製') req.add('pi-l-importer');
+      for (const id of ALL_REQ_LABELS) {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('req', req.has(id));
+      }
+      // 商品タイプに整合する商品区分だけ選べるようにする
+      const allowed = catByType[t] || null;
       for (const opt of catSel.options) {
         if (!opt.value) continue;
         const ok = !allowed || allowed.includes(opt.value);
@@ -1347,9 +1569,11 @@
         opt.disabled = !ok;
       }
       if (allowed && catSel.value && !allowed.includes(catSel.value)) catSel.value = '';
+      updateTabBadges();
     };
-    typeSel.addEventListener('change', toggleFood);
-    toggleFood();
+    typeSel.addEventListener('change', applyTypeVisibility);
+    originSel.addEventListener('change', applyTypeVisibility);
+    applyTypeVisibility();
 
     const collect = () => ({
       product_type: typeSel.value,
@@ -1516,4 +1740,8 @@
     result.textContent = '保存しました';
     setTimeout(() => location.reload(), 600);
   });
+
+  // 初期表示のバッジ計算 (initPageInfo 内の applyTypeVisibility でも一度呼ばれるが、
+  // pi-type が無い画面状態でも必ず一度は計算しておく)
+  updateTabBadges();
 </script>

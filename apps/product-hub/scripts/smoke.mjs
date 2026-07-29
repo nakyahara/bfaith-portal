@@ -1151,6 +1151,18 @@ check('page-info: 海外製 (輸入品) は輸入者名が必須 (メーカー�
 check('page-info: 健康食品の海外製は原産国名が必須',
   pinfo.validatePageInfo({ product_type: 'health_food', seller_name: 'X社', origin_type: '海外製', importer_name: '輸入X', category_label: '健康食品' })
     .some((r) => r.includes('原産国')));
+// 健康食品は加工食品の必須記載 (名称/原材料名/内容量/賞味期限/保存方法) も必須 (2026-07-29 追加)
+{
+  const hfBase = { product_type: 'health_food', seller_name: 'X社', origin_type: '日本製', category_label: '健康食品' };
+  const missing = pinfo.validatePageInfo(hfBase);
+  check('page-info: 健康食品は食品表示5項目 (名称/原材料名/内容量/賞味期限/保存方法) が必須',
+    ['名称', '原材料名', '内容量', '賞味期限', '保存方法'].every((k) => missing.some((r) => r.includes(k))));
+  check('page-info: 健康食品の充足でゼロ',
+    pinfo.validatePageInfo({ ...hfBase, food_name: 'サプリ', food_ingredients: 'アマニ',
+      content_volume: '90粒', food_expiry: 'ラベルに記載', food_storage: '常温保存' }).length === 0);
+  check('page-info: 化粧品には食品表示チェックは掛からない',
+    pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '日本製', category_label: '化粧品' }).length === 0);
+}
 check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品×雑貨)',
   pinfo.validatePageInfo({ product_type: 'cosmetics', seller_name: 'X社', origin_type: '日本製', category_label: '雑貨' })
     .some((r) => r.includes('整合しない'))
