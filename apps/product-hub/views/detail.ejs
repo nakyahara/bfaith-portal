@@ -355,7 +355,8 @@
       <div class="muted" style="font-size:11px;">保存は「出品」タブの「出品情報を保存」か「基本情報を保存」で行われます</div>
     </div>
     <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
-      <button class="btn" id="rk-images-btn">画像をR-Cabinetへ転送 (<%= cabinetImages.length %>/<%= images.length %> 済)</button>
+      <!-- 件数は drive_file_id 突合 (Codex R2: 履歴件数だと画像差し替え後や白抜き分でズレる) -->
+      <button class="btn" id="rk-images-btn">画像をR-Cabinetへ転送 (<%= transferredImageCount %>/<%= images.length %> 済)</button>
       <span class="muted" id="rk-images-result"></span>
     </div>
   </div>
