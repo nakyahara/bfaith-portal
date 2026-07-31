@@ -88,7 +88,26 @@ function prepareStmts(db) {
   return stmts;
 }
 
-function lookupMalls(s, code) {
+/**
+ * lookupの実行時エラーもモール単位でfail-softにする (Codex R1 High):
+ * prepare成功後でもatomic swap等で表が変わると .get() が失敗しうる。
+ * その場合は該当lookupだけnull運用に落とし、runtimeDegradedへ記録する (500にしない)。
+ */
+function safeGet(s, key, runtimeDegraded, arg) {
+  const stmt = s[key];
+  if (!stmt) return null;
+  try {
+    return stmt.get(arg);
+  } catch (e) {
+    if (!runtimeDegraded.has(key)) {
+      runtimeDegraded.add(key);
+      console.warn(`[site-products] lookup実行時エラー (${key}) — null運用に降格:`, e.message);
+    }
+    return null;
+  }
+}
+
+function lookupMalls(s, code, runtimeDegraded) {
   const malls = {
     rakuten: { code: null, url: null },
     yahoo: { code: null, url: null },
@@ -97,35 +116,35 @@ function lookupMalls(s, code) {
     aupay: { skuKey: null, url: null }, // URL形式が未確定のためid のみ (site側で将来対応)
   };
 
-  const rk = s.rakutenCode?.get(code);
+  const rk = safeGet(s, 'rakutenCode', runtimeDegraded, code);
   if (rk?.rakuten_code) {
     malls.rakuten.code = rk.rakuten_code;
-    const snap = s.rakutenUrl?.get(rk.rakuten_code);
+    const snap = safeGet(s, 'rakutenUrl', runtimeDegraded, rk.rakuten_code);
     malls.rakuten.url =
       snap?.item_url ??
       `https://item.rakuten.co.jp/${RAKUTEN_SHOP_SLUG}/${rk.rakuten_code.toLowerCase()}/`;
 
     // Yahoo (RYS連携): アイテムコード=楽天商品管理番号の小文字。実在確認できた場合のみURL化
-    const y = s.yahooItem?.get(rk.rakuten_code.toLowerCase());
+    const y = safeGet(s, 'yahooItem', runtimeDegraded, rk.rakuten_code.toLowerCase());
     if (y?.item_code) {
       malls.yahoo.code = y.item_code;
       malls.yahoo.url = `https://store.shopping.yahoo.co.jp/${YAHOO_SELLER_ID}/${y.item_code}.html`;
     }
   }
 
-  const az = s.amazonAsin?.get(code);
+  const az = safeGet(s, 'amazonAsin', runtimeDegraded, code);
   if (az?.asin) {
     malls.amazon.asin = az.asin;
     malls.amazon.url = `https://www.amazon.co.jp/dp/${az.asin}`;
   }
 
-  const q = s.qoo10Item?.get(code);
+  const q = safeGet(s, 'qoo10Item', runtimeDegraded, code);
   if (q?.item_no) {
     malls.qoo10.itemNo = q.item_no;
     malls.qoo10.url = `https://www.qoo10.jp/g/${q.item_no}`;
   }
 
-  const au = s.aupaySku?.get(code);
+  const au = safeGet(s, 'aupaySku', runtimeDegraded, code);
   if (au?.aupay_sku_key) {
     malls.aupay.skuKey = au.aupay_sku_key;
   }
@@ -145,9 +164,11 @@ router.get('/products', requireSiteReadToken, (req, res) => {
   try {
     const s = prepareStmts(db);
     if (!s.products) {
-      return res.status(503).json({ ok: false, error: 'mirror_products_unavailable', detail: stmtsError.products });
+      // detailはログのみ (スキーマ情報をレスポンスに漏らさない)
+      return res.status(503).json({ ok: false, error: 'mirror_products_unavailable' });
     }
     // 1トランザクションで読む (syncのatomic swapとの競合回避、product-management-listと同じ慣例)
+    const runtimeDegraded = new Set();
     const result = db.transaction(() => {
       const rows = s.products.all();
       return rows.map((r) => ({
@@ -159,7 +180,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
         price: r.price ?? null,
         stockFree: Math.max(0, (r.stock ?? 0) - (r.allocated ?? 0)),
         representativeCode: r.representativeCode ?? null,
-        malls: lookupMalls(s, r.code),
+        malls: lookupMalls(s, r.code, runtimeDegraded),
       }));
     })();
 
@@ -171,7 +192,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
       generatedAt: new Date().toISOString(),
       source: 'warehouse-mirror',
       count: result.length,
-      degradedLookups: Object.keys(stmtsError),
+      degradedLookups: [...new Set([...Object.keys(stmtsError), ...runtimeDegraded])],
       products: result,
     });
   } catch (e) {
