@@ -12,7 +12,8 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'site-contact-test-'));
 process.env.DATA_DIR = tmpDir;
 delete process.env.SITE_CONTACT_SERVICE_TOKEN;
 delete process.env.SITE_CONTACT_GCHAT_WEBHOOK;
-process.env.MIRROR_READ_TOKEN = 'read-token';
+process.env.SITE_CONTACT_READ_TOKEN = 'read-token';
+process.env.MIRROR_READ_TOKEN = 'other-token'; // 汎用tokenでは/recentを読めないことを検証する
 
 const { default: router } = await import('../apps/site-contact/router.js');
 const app = express();
@@ -91,6 +92,8 @@ const AUTH = { authorization: 'Bearer svc-token' };
 {
   const r = await fetch(`${base}/recent`);
   ok('recent: tokenなし → 401', r.status === 401, `got ${r.status}`);
+  const rG = await fetch(`${base}/recent`, { headers: { 'x-read-token': 'other-token' } });
+  ok('recent: 汎用MIRROR_READ_TOKENでは読めない → 401', rG.status === 401, `got ${rG.status}`);
   const r2 = await fetch(`${base}/recent`, { headers: { 'x-read-token': 'read-token' } });
   const b2 = await r2.json();
   ok('recent: 1件 (重複は保存されない)', r2.status === 200 && b2.inquiries.length === 1, JSON.stringify(b2.inquiries?.length));

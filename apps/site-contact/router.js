@@ -3,7 +3,7 @@
  *
  * bfaith-siteのPages Functions (/api/contact) がoutbox方式で配送してくる (設計書§11)。
  * 認証: POST /inquiries : SITE_CONTACT_SERVICE_TOKEN (Bearer)。未設定なら503 fail-closed。
- *       GET  /recent    : MIRROR_READ_TOKEN (既存read-only token、運用確認用)。
+ *       GET  /recent    : SITE_CONTACT_READ_TOKEN (専用。PIIを含むため汎用tokenを再利用しない)。
  * 冪等: 受付ID (id) をPKにINSERT OR IGNORE。重複配送は {ok:true, duplicate:true} で成功応答
  *       (site側の再送が安全に空振りできる)。
  * 通知: 新規のみGChat (SITE_CONTACT_GCHAT_WEBHOOK設定時)。受付ID+種別のみ・個人情報を流さない。
@@ -37,9 +37,11 @@ function requireServiceToken(req, res, next) {
   next();
 }
 
-function requireReadToken(req, res, next) {
-  const expected = process.env.MIRROR_READ_TOKEN || '';
-  if (!expected) return res.status(503).json({ ok: false, error: 'mirror_read_token_unset' });
+// 問い合わせは個人情報を含むため、汎用MIRROR_READ_TOKENを再利用せず専用tokenで権限分離する
+// (汎用tokenの既存保有者にPIIを開示しない、Codex R1 High)
+function requireContactReadToken(req, res, next) {
+  const expected = process.env.SITE_CONTACT_READ_TOKEN || '';
+  if (!expected) return res.status(503).json({ ok: false, error: 'site_contact_read_token_unset' });
   const got = String(req.headers['x-read-token'] || '');
   if (!got || !timingSafeEq(got, expected)) {
     return res.status(401).json({ ok: false, error: 'invalid_read_token' });
@@ -123,8 +125,8 @@ router.post('/inquiries', requireServiceToken, async (req, res) => {
   }
 });
 
-// GET /recent — 運用確認用 (read-only token)
-router.get('/recent', requireReadToken, (req, res) => {
+// GET /recent — 運用確認用 (問い合わせ専用read token)
+router.get('/recent', requireContactReadToken, (req, res) => {
   res.set('Cache-Control', 'no-store');
   try {
     return res.json({ ok: true, inquiries: recentInquiries(50) });
