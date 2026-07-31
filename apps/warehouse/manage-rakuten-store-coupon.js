@@ -56,32 +56,41 @@ if (!process.env.RAKUTEN_SERVICE_SECRET || !process.env.RAKUTEN_LICENSE_KEY) {
 // 発行直前の再検索だけでは、2プロセスが同時に「重複なし」を見てから両方発行する隙が残る
 // (Task Scheduler の重複起動・手動実行との衝突)。発行を伴うモードではロックを取る。
 const LOCK_PATH = join(process.env.DATA_DIR || tmpdir(), 'rakuten-store-coupon.lock');
-const LOCK_STALE_MS = 30 * 60 * 1000; // これ以上古いロックは異常終了の置き土産とみなして奪う
+let lockToken = null;
 
+/**
+ * ⚠️ **古いロックを自動で奪わない**。
+ * 「N分より古ければ奪う」方式は、読み取り→削除の間に本来の持ち主が終了して
+ * 別の実行が新しいロックを取ると、それを消してしまう (奪取が原子的でないため)。
+ * 二重発行の代償が大きいので、ロックが残っていたら必ず止まる方を選ぶ。
+ * 異常終了の置き土産なら人がファイルを消す (GChatに残骸のパスを通知する)。
+ */
 function acquireLock() {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      writeFileSync(LOCK_PATH, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: 'wx' });
-      return true;
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-      let info = null;
-      try { info = JSON.parse(readFileSync(LOCK_PATH, 'utf8')); } catch { /* 壊れたロックは古い扱い */ }
-      const age = info && info.at ? Date.now() - Date.parse(info.at) : Infinity;
-      if (!(age > LOCK_STALE_MS)) {
-        console.error(`FATAL: 別の実行が進行中 (pid=${info?.pid ?? '不明'}, ${Math.round((age || 0) / 60000)}分前に開始)。二重発行を避けるため中止 — ${LOCK_PATH}`);
-        return false;
-      }
-      console.warn(`[lock] ${Math.round(age / 60000)}分前の古いロックを破棄して続行 (pid=${info?.pid ?? '不明'})`);
-      try { unlinkSync(LOCK_PATH); } catch { /* 競合で既に消えていれば次の試行で取れる */ }
-    }
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    writeFileSync(LOCK_PATH, JSON.stringify({ token, pid: process.pid, at: new Date().toISOString() }), { flag: 'wx' });
+    lockToken = token;
+    return { ok: true };
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    let info = null;
+    try { info = JSON.parse(readFileSync(LOCK_PATH, 'utf8')); } catch { /* 壊れていても情報が無いだけ */ }
+    return {
+      ok: false,
+      detail: `pid=${info?.pid ?? '不明'} / 開始=${info?.at ?? '不明'} / ${LOCK_PATH}`,
+    };
   }
-  console.error('FATAL: ロックを取得できなかった');
-  return false;
 }
 
+/** 自分が取ったロックだけを消す (他の実行のロックには触らない) */
 function releaseLock() {
+  if (!lockToken) return;
+  try {
+    const info = JSON.parse(readFileSync(LOCK_PATH, 'utf8'));
+    if (info.token !== lockToken) return;
+  } catch { return; }
   try { unlinkSync(LOCK_PATH); } catch { /* 既に無ければ何もしない */ }
+  lockToken = null;
 }
 
 /** GChat 通知 (best effort) */
@@ -339,8 +348,17 @@ const needsLock = (mode === 'rotate' && LIVE) || mode === 'test-cycle';
 let locked = false;
 try {
   if (needsLock) {
-    locked = acquireLock();
-    if (!locked) process.exit(1);
+    const lock = acquireLock();
+    locked = lock.ok;
+    if (!locked) {
+      // 毎日の自動実行がここで止まり続けると気付けないので通知する
+      console.error(`FATAL: 別の実行が進行中か、異常終了のロックが残っている (${lock.detail})。二重発行を避けるため中止`);
+      await sendGChat(['*楽天ストアクーポン 入れ替えを中止*', '',
+        '別の実行が進行中か、異常終了のロックが残っています。',
+        `　${lock.detail}`, '',
+        '_進行中の実行が無ければ、上のロックファイルを削除してください_'].join('\n')).catch(() => {});
+      process.exit(1);
+    }
   }
   let code = 0;
   if (mode === 'list') code = (await cmdList()) ?? 0;
