@@ -86,11 +86,14 @@ function parseArgs(argv) {
  * copyto は同名ファイルを中身だけ差し替えるので **DriveのファイルIDは変わらない**
  * (共有リンクやシートの参照が生きたまま)。2026-07-31に実測で確認:
  * `Copied (replaced existing)` → id/createdTime そのまま・modifiedTime だけ更新。
- * --checksum を付けているので、中身が前回と同一なら転送自体をスキップする
- * (Drive側は既に正しい内容なので、どちらでも結果は同じ)。
+ *
+ * ⭐--ignore-times で **中身が前回と同一でも必ず転送する**。
+ * 既定 (サイズ+時刻) や --checksum だと同一内容の回は転送がスキップされ、
+ * Drive上の更新日時が前回のまま残る。商品マスタは在庫と違って何日も変わらないので、
+ * 中原さんが更新日時を見て「item.csv だけ更新されていない?」と毎回不安になる。
+ * 550KB程度の転送で「更新日時 = 最後に実行した時刻」が保証される方が価値が高い。
  *
  * 引数は spawnSync + shell:false で配列渡し ([[feedback_execfile_vs_execsync]])。
- * 戻り値: 実際に転送したら 'updated'、同一でスキップなら 'unchanged'
  */
 function uploadToDrive(localPath, destName, { remote, folderId }) {
   if (!DRIVE_REMOTE_RE.test(remote)) throw new Error(`DRIVE_CONFIG: rcloneリモート名が不正 (${remote})`);
@@ -99,7 +102,8 @@ function uploadToDrive(localPath, destName, { remote, folderId }) {
   const args = [
     'copyto', localPath, `${remote}${destName}`,
     '--drive-root-folder-id', folderId,   // ここで指定したフォルダの外には絶対に書かない
-    '--checksum', '--stats', '0', '--log-level', 'INFO',
+    '--ignore-times',                     // 同一内容でも必ず転送 = 更新日時が実行時刻になる
+    '--stats', '0', '--log-level', 'INFO',
   ];
   // rclone の INFO ログは stderr に出るので spawnSync で両方受け取る
   const r = spawnSync('rclone', args, {
@@ -111,7 +115,10 @@ function uploadToDrive(localPath, destName, { remote, folderId }) {
     const why = r.error ? r.error.message : `exit ${r.status}${r.signal ? ` signal ${r.signal}` : ''}`;
     throw new Error(`DRIVE_UPLOAD: ${destName} のアップロードに失敗 (${why})${log.trim() ? ` :: ${log.trim().slice(0, 400)}` : ''}`);
   }
-  return /Copied|Updated|Transferred:\s*[1-9]/i.test(log) ? 'updated' : 'unchanged';
+  // --ignore-times なので必ず転送されるはず。されていなければ想定外なので気づけるようにする
+  if (!/Copied|Updated|Transferred:\s*[1-9]/i.test(log)) {
+    console.warn(`  ⚠ ${destName}: rcloneが転送した形跡なし (更新日時が古いままの可能性) :: ${log.trim().slice(0, 200)}`);
+  }
 }
 
 function jstStamp() {
@@ -526,9 +533,9 @@ async function run(page, { templateName, sellKey, linefeedDel, outDir, drive }) 
     const done = [];
     try {
       for (const s of saved) {
-        const r = uploadToDrive(s.latest, s.file, drive);
+        uploadToDrive(s.latest, s.file, drive);
         done.push(s.file);
-        console.log(`  ☁ ${s.file} ${r === 'updated' ? 'を上書き' : 'は前回と同一のため転送スキップ'} (${s.rows}行)`);
+        console.log(`  ☁ ${s.file} を上書き (${s.rows}行)`);
       }
     } catch (e) {
       const rest = saved.map((s) => s.file).filter((f) => !done.includes(f));
