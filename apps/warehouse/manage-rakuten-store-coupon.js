@@ -28,6 +28,9 @@
  * exit code: 0=成功 / 1=失敗 / 2=env・引数エラー
  */
 import 'dotenv/config';
+import { writeFileSync, readFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   buildIssueXml, buildDeleteXml, issueCoupon, deleteCoupon, searchAllCoupons, searchCouponByCode, maskCode,
 } from './rakuten-coupon-lib.js';
@@ -47,6 +50,38 @@ const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 if (!process.env.RAKUTEN_SERVICE_SECRET || !process.env.RAKUTEN_LICENSE_KEY) {
   console.error('FATAL: RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY が未設定');
   process.exit(2);
+}
+
+// ─── 単一実行の保証 ───
+// 発行直前の再検索だけでは、2プロセスが同時に「重複なし」を見てから両方発行する隙が残る
+// (Task Scheduler の重複起動・手動実行との衝突)。発行を伴うモードではロックを取る。
+const LOCK_PATH = join(process.env.DATA_DIR || tmpdir(), 'rakuten-store-coupon.lock');
+const LOCK_STALE_MS = 30 * 60 * 1000; // これ以上古いロックは異常終了の置き土産とみなして奪う
+
+function acquireLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(LOCK_PATH, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: 'wx' });
+      return true;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      let info = null;
+      try { info = JSON.parse(readFileSync(LOCK_PATH, 'utf8')); } catch { /* 壊れたロックは古い扱い */ }
+      const age = info && info.at ? Date.now() - Date.parse(info.at) : Infinity;
+      if (!(age > LOCK_STALE_MS)) {
+        console.error(`FATAL: 別の実行が進行中 (pid=${info?.pid ?? '不明'}, ${Math.round((age || 0) / 60000)}分前に開始)。二重発行を避けるため中止 — ${LOCK_PATH}`);
+        return false;
+      }
+      console.warn(`[lock] ${Math.round(age / 60000)}分前の古いロックを破棄して続行 (pid=${info?.pid ?? '不明'})`);
+      try { unlinkSync(LOCK_PATH); } catch { /* 競合で既に消えていれば次の試行で取れる */ }
+    }
+  }
+  console.error('FATAL: ロックを取得できなかった');
+  return false;
+}
+
+function releaseLock() {
+  try { unlinkSync(LOCK_PATH); } catch { /* 既に無ければ何もしない */ }
 }
 
 /** GChat 通知 (best effort) */
@@ -198,7 +233,10 @@ async function cmdRotate() {
   // 何も起きなかった日 (全skip) は通知しない
   const hasNews = results.some((r) => r.status !== 'skip');
   if (hasNews) await notify(results);
-  return results.some((r) => r.status === 'failed' || r.status === 'unknown' || r.status === 'error') ? 1 : 0;
+  // 発行できても「意図した設定で載っているか」を確認できなければ失敗扱いにする
+  // (金額・期間・公開設定の取り違えを exit 0 で見逃さない)
+  return results.some((r) => r.status === 'failed' || r.status === 'unknown' || r.status === 'error'
+    || (r.status === 'issued' && !(r.verified && r.settingsOk))) ? 1 : 0;
 }
 
 async function notify(results) {
@@ -296,7 +334,14 @@ async function cmdTestCycle() {
   return (hit && delOk && goneOk) ? 0 : 1;
 }
 
+// 発行し得るモードだけロックを取る (list と dry-run は読み取りのみなので不要)
+const needsLock = (mode === 'rotate' && LIVE) || mode === 'test-cycle';
+let locked = false;
 try {
+  if (needsLock) {
+    locked = acquireLock();
+    if (!locked) process.exit(1);
+  }
   let code = 0;
   if (mode === 'list') code = (await cmdList()) ?? 0;
   else if (mode === 'rotate') code = await cmdRotate();
@@ -309,4 +354,6 @@ try {
 } catch (e) {
   console.error(`FATAL: ${e.message}`);
   process.exitCode = 1;
+} finally {
+  if (locked) releaseLock();
 }
