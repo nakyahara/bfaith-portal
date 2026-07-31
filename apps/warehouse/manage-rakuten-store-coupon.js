@@ -99,6 +99,7 @@ async function sendGChat(text) {
   try {
     const res = await fetch(GCHAT_WEBHOOK, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(15000), // 応答が無いWebhookで実行が居座らないように
     });
     return res.ok;
   } catch (e) {
