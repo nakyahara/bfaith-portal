@@ -13,6 +13,9 @@
  *   - 生成は約25秒。ダウンロードリンクは /productCsvDl/download/<id> の素のhref (GETで直取り可)
  *   - CSV本体は Shift_JIS (BOMなし)、ヘッダ行はASCII、改行コード CRLF
  *
+ * DL後は Google ドライブの共有フォルダ「AUpayダウンロード」へ **固定名で毎回上書き** する
+ * (miniPCにGドライブは無いのでrclone経由。[[feedback_minipc_no_gdrive_use_rclone]])。
+ *
  * 実行: node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs [--out <dir>] [--template <名前>]
  *   env: HEADLESS=1
  *        AITEM_TEMPLATE      テンプレート名 (既定「ヤフー在庫アップ後確認」)。--template が優先
@@ -20,10 +23,14 @@
  *        AITEM_OUT_DIR       保存先ディレクトリ (既定 downloads/aupay-item-csv)
  *        AITEM_LINEFEED_DEL  1=各項目内の改行を除去 (既定1、画面の既定と同じ)
  *        AITEM_NOTIFY        1=失敗時にGChat通知 (既定0。定期実行に載せるときだけ1)
+ *        AITEM_DRIVE_FOLDER  アップロード先のDriveフォルダID (既定=AUpayダウンロード)
+ *        AITEM_DRIVE_REMOTE  rcloneリモート名 (既定 gdrive:)
+ *        --no-drive          Driveアップロードを行わない (ローカル保存だけ)
  */
 
 import { mkdir, writeFile, rename, unlink, open } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
 import { openAupayContext, ensureWowmaLogin, gotoWowmaPage, WOWMA_BASE } from './lib-aupay-login.mjs';
@@ -33,6 +40,13 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const IDX_URL = `${WOWMA_BASE}productCsvDl/index`;
 const OUT_DIR_DEFAULT = join(__dirname, 'downloads', 'aupay-item-csv');
 const LOCK_PATH = join(__dirname, 'logs', 'aupay-item-csv.lock');
+
+// Google ドライブ 共有フォルダ「AUpayダウンロード」(2026-07-31 中原さん作成、実在をAPIで確認済)。
+// 秘密ではないので既定値として持つ。別フォルダに出すなら AITEM_DRIVE_FOLDER で上書き
+const DRIVE_FOLDER_DEFAULT = '1Stxagr7RybClMrt_W1x7izeD8cCadPmq';
+const DRIVE_REMOTE_DEFAULT = 'gdrive:';
+const DRIVE_ID_RE = /^[A-Za-z0-9_-]{20,60}$/;   // フォルダIDの形 (パス/オプション混入を弾く)
+const DRIVE_REMOTE_RE = /^[A-Za-z0-9_-]+:$/;
 
 // 販売ステータス radio csvDlSellStsKbn: 9=全て 1=販売中 2=販売終了
 const SELL_STATUS = { all: '9', selling: '1', ended: '2' };
@@ -45,7 +59,7 @@ const STATUS_PAGE_SIZE = 50;
 const SAFE_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*\.csv$/;
 
 function parseArgs(argv) {
-  const a = { out: null, template: null, sellStatus: null, help: false };
+  const a = { out: null, template: null, sellStatus: null, driveFolder: null, noDrive: false, help: false };
   const need = (i, k) => {
     const v = argv[i];
     if (v === undefined || v.startsWith('--')) throw new Error(`${k} には値が必要です`);
@@ -56,10 +70,43 @@ function parseArgs(argv) {
     if (k === '--out') a.out = need(++i, '--out');
     else if (k === '--template') a.template = need(++i, '--template');
     else if (k === '--sell-status') a.sellStatus = need(++i, '--sell-status');
+    else if (k === '--drive-folder') a.driveFolder = need(++i, '--drive-folder');
+    else if (k === '--no-drive') a.noDrive = true;
     else if (k === '--help' || k === '-h') a.help = true;
-    else throw new Error(`不明な引数: ${k} (--out / --template / --sell-status)`);
+    else throw new Error(`不明な引数: ${k} (--out / --template / --sell-status / --drive-folder / --no-drive)`);
   }
   return a;
+}
+
+/**
+ * rclone で Google ドライブへ固定名アップロード (毎回上書き)。
+ *
+ * copyto は同名ファイルを中身だけ差し替えるので **DriveのファイルIDは変わらない**
+ * (共有リンクやシートの参照が生きたまま)。2026-07-31に実測で確認:
+ * `Copied (replaced existing)` → id/createdTime そのまま・modifiedTime だけ更新。
+ * --checksum を付けているので、中身が前回と同一なら転送自体をスキップする
+ * (Drive側は既に正しい内容なので、どちらでも結果は同じ)。
+ *
+ * 引数は spawnSync + shell:false で配列渡し ([[feedback_execfile_vs_execsync]])。
+ * 戻り値: 実際に転送したら 'updated'、同一でスキップなら 'unchanged'
+ */
+function uploadToDrive(localPath, destName, { remote, folderId }) {
+  if (!DRIVE_REMOTE_RE.test(remote)) throw new Error(`DRIVE_CONFIG: rcloneリモート名が不正 (${remote})`);
+  if (!DRIVE_ID_RE.test(folderId)) throw new Error(`DRIVE_CONFIG: DriveフォルダIDが不正 (${folderId})`);
+  if (!SAFE_FILE_NAME.test(destName)) throw new Error(`DRIVE_CONFIG: アップロード名が不正 (${destName})`);
+  const args = [
+    'copyto', localPath, `${remote}${destName}`,
+    '--drive-root-folder-id', folderId,   // ここで指定したフォルダの外には絶対に書かない
+    '--checksum', '--stats', '0', '--log-level', 'INFO',
+  ];
+  // rclone の INFO ログは stderr に出るので spawnSync で両方受け取る
+  const r = spawnSync('rclone', args, { shell: false, encoding: 'utf8', timeout: 5 * 60 * 1000 });
+  const log = `${r.stdout || ''}${r.stderr || ''}`;
+  if (r.error || r.status !== 0) {
+    const why = r.error ? r.error.message : `exit ${r.status}${r.signal ? ` signal ${r.signal}` : ''}`;
+    throw new Error(`DRIVE_UPLOAD: ${destName} のアップロードに失敗 (${why})${log.trim() ? ` :: ${log.trim().slice(0, 400)}` : ''}`);
+  }
+  return /Copied|Updated|Transferred:\s*[1-9]/i.test(log) ? 'updated' : 'unchanged';
 }
 
 function jstStamp() {
@@ -412,7 +459,7 @@ async function downloadRow(page, row) {
   return { buf, header: head, dataRows: Math.max(0, lines - 1) };
 }
 
-async function run(page, { templateName, sellKey, linefeedDel, outDir }) {
+async function run(page, { templateName, sellKey, linefeedDel, outDir, drive }) {
   await ensureWowmaLogin(page);
   await gotoWowmaPage(page, IDX_URL, '一括商品CSVダウンロード');
 
@@ -462,7 +509,19 @@ async function run(page, { templateName, sellKey, linefeedDel, outDir }) {
     console.log(`     ${dest}`);
     console.log(`     ${latest} (固定名)`);
     console.log(`     列: ${f.header.slice(0, 200)}${f.header.length > 200 ? ' …' : ''}`);
-    saved.push({ file: f.name, rows: f.dataRows });
+    saved.push({ file: f.name, rows: f.dataRows, latest });
+  }
+
+  // ── Google ドライブへ固定名で上書き (全ファイル揃ってから) ──
+  if (drive) {
+    console.log(`\n  [drive] アップロード先=${drive.remote} folderId=${drive.folderId}`);
+    for (const s of saved) {
+      const r = uploadToDrive(s.latest, s.file, drive);
+      console.log(`  ☁ ${s.file} ${r === 'updated' ? 'を上書き' : 'は前回と同一のため転送スキップ'} (${s.rows}行)`);
+    }
+    console.log(`  https://drive.google.com/drive/folders/${drive.folderId}`);
+  } else {
+    console.log('\n  [drive] --no-drive のためアップロードなし (ローカル保存のみ)');
   }
   return saved;
 }
@@ -477,7 +536,9 @@ async function main() {
     return;
   }
   if (args.help) {
-    console.log('使い方: node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs [--out <dir>] [--template <名前>] [--sell-status all|selling|ended]');
+    console.log('使い方: node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs');
+    console.log('  [--out <dir>] [--template <名前>] [--sell-status all|selling|ended]');
+    console.log('  [--drive-folder <DriveフォルダID>] [--no-drive]');
     return;
   }
   const templateName = args.template || process.env.AITEM_TEMPLATE || 'ヤフー在庫アップ後確認';
@@ -490,6 +551,22 @@ async function main() {
   const outDir = args.out || process.env.AITEM_OUT_DIR || OUT_DIR_DEFAULT;
   const linefeedDel = (process.env.AITEM_LINEFEED_DEL ?? '1') === '1';
   const notify = process.env.AITEM_NOTIFY === '1';
+  let drive = null;
+  if (!args.noDrive) {
+    const folderId = (args.driveFolder || process.env.AITEM_DRIVE_FOLDER || DRIVE_FOLDER_DEFAULT).trim();
+    const remote = (process.env.AITEM_DRIVE_REMOTE || DRIVE_REMOTE_DEFAULT).trim();
+    if (!DRIVE_ID_RE.test(folderId)) {
+      console.error(`FATAL: DriveフォルダIDが不正です (${folderId})`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!DRIVE_REMOTE_RE.test(remote)) {
+      console.error(`FATAL: rcloneリモート名が不正です (${remote})。末尾のコロンまで含めて指定`);
+      process.exitCode = 2;
+      return;
+    }
+    drive = { folderId, remote };
+  }
 
   let runLog = { logPath: null };
   let locked = false;
@@ -520,6 +597,7 @@ async function main() {
     console.log('=== au PAY 一括商品CSVダウンロード ===');
     console.log(`テンプレート: ${templateName} / 販売ステータス: ${sellKey} / 改行除去: ${linefeedDel ? 'ON' : 'OFF'}`);
     console.log(`保存先: ${outDir}`);
+    console.log(`Drive: ${drive ? `${drive.remote} folderId=${drive.folderId} (固定名で上書き)` : '(なし)'}`);
     await acquireLock();
     locked = true;
     await mkdir(outDir, { recursive: true });
@@ -527,7 +605,7 @@ async function main() {
     page = context.pages()[0] || await context.newPage();
     page.on('dialog', (d) => { console.log(`  [dialog] ${d.message()}`); d.accept().catch(() => {}); });
 
-    const saved = await run(page, { templateName, sellKey, linefeedDel, outDir });
+    const saved = await run(page, { templateName, sellKey, linefeedDel, outDir, drive });
     console.log(`\n=== 完了: ${saved.map((s) => `${s.file}(${s.rows}行)`).join(' / ')} ===`);
     console.log('※ CSVは Shift_JIS / CRLF。Excelはそのまま開けます');
   } catch (err) {

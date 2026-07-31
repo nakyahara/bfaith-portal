@@ -198,17 +198,31 @@ Wow!manager「商品・画像・デザイン > 一括商品CSVダウンロード
 **条件設定 → CSVデータ作成 → 処理状況が完了になるまで待つ → ダウンロード** を1コマンドにしたもの。
 定期実行 (fetch-all) には載せていない。手作業のタイミングで叩くツール。
 
+**中原さんの普段の使い方**: Stream Deck「マンスリー業務」フォルダの `auPAY 商品CSV` ボタン。
+押すと会社PCから miniPC へ SSH して下記が走り、Google ドライブの共有フォルダ
+**「AUpayダウンロード」** の `item.csv` / `stock.csv` が毎回上書きされる (所要 約1分)。
+
+- 会社PC側ランチャー: `C:\tools\aupay-item-csv\run-aupay-item-csv.bat` (リポジトリ外)
+- miniPC側ランナー: `scripts/mall-csv-fetcher/run-aupay-item-csv.bat`
+
 ```powershell
 $env:HEADLESS=1
 node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs
 # 既定 = オリジナルテンプレート「ヤフー在庫アップ後確認」/ 販売ステータス=販売中 / 対象商品=指定なし
 node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs --template "検索対象外チェック" --sell-status all --out D:\somewhere
+node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs --no-drive   # ローカル保存だけ
 ```
 
 出力は `downloads/aupay-item-csv/` に2本 (テンプレートが選択肢在庫の列を含むため画面が2ファイル生成する):
 
 - `item.csv` … 商品側。`aupay_item_<JST時刻>.csv` (履歴) と `item.csv` (固定名・毎回上書き) の両方を書く
 - `stock.csv` … 選択肢在庫側。同上
+
+固定名の2本を rclone で Google ドライブへ上げる (miniPCにGドライブは無いのでrclone一択)。
+`copyto` は同名ファイルの中身だけ差し替えるので **DriveのファイルIDは変わらない** —
+共有リンクやシートの参照が生きたままになる (2026-07-31に実測確認: `Copied (replaced existing)`、
+id と createdTime はそのまま、modifiedTime だけ更新)。`--checksum` により中身が前回と同一なら
+転送自体をスキップする。フォルダIDは `AITEM_DRIVE_FOLDER` / `--drive-folder` で変更可。
 
 実測した画面仕様 (2026-07-31):
 
