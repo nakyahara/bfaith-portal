@@ -43,6 +43,8 @@ export function xmlEscape(s) {
 }
 
 const JST_DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+09:00$/;
+// XML 1.0 で許可されないコードポイント (タブ・LF・CR は許可)
+const hasXmlInvalidChar = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0x20 && c !== 0x09 && c !== 0x0A && c !== 0x0D) return true; } return false; };
 
 /** coupon.issue リクエストXML (公式サンプルの完全形・要素順厳守)。検証込み */
 export function buildIssueXml(p) {
@@ -52,8 +54,15 @@ export function buildIssueXml(p) {
   if (!name) errors.push('couponName は必須');
   if (name.length > 60) errors.push(`couponName が60文字超 (${name.length})`);
   if (caption.length > 200) errors.push(`couponCaption が200文字超 (${caption.length})`);
+  // XML 1.0 が許さない制御文字が混じると不正なXMLになる (エスケープでは救えない)
+  if (hasXmlInvalidChar(name)) errors.push('couponName にXMLで使えない制御文字が含まれる');
+  if (hasXmlInvalidChar(caption)) errors.push('couponCaption にXMLで使えない制御文字が含まれる');
   if (!JST_DT_RE.test(p.couponStartDate)) errors.push(`couponStartDate は YYYY-MM-DDThh:mm:ss+09:00 形式 (${p.couponStartDate})`);
   if (!JST_DT_RE.test(p.couponEndDate)) errors.push(`couponEndDate は YYYY-MM-DDThh:mm:ss+09:00 形式 (${p.couponEndDate})`);
+  // 形式が合っていても 2026-99-99 のような実在しない日時は弾く (正規表現だけでは通ってしまう)
+  for (const k of ['couponStartDate', 'couponEndDate']) {
+    if (JST_DT_RE.test(p[k]) && !Number.isFinite(Date.parse(p[k]))) errors.push(`${k} が実在しない日時 (${p[k]})`);
+  }
   if (JST_DT_RE.test(p.couponStartDate) && JST_DT_RE.test(p.couponEndDate)
       && Date.parse(p.couponEndDate) < Date.parse(p.couponStartDate) + 5 * 60000) {
     errors.push('couponEndDate は couponStartDate+5分以降が必要');
@@ -66,7 +75,27 @@ export function buildIssueXml(p) {
   if (p.discountType === 2 && (!Number.isInteger(p.discountFactor) || p.discountFactor < 1 || p.discountFactor > 99)) {
     errors.push(`定率 (discountType=2) の discountFactor は 1〜99 (${p.discountFactor})`);
   }
+  if (p.discountType === 1 && (!Number.isInteger(p.discountFactor) || p.discountFactor < 1 || p.discountFactor > 999999)) {
+    errors.push(`定額 (discountType=1) の discountFactor は 1〜999999円 (${p.discountFactor})`);
+  }
+  // 利用個数条件 (RS004)。省略時は otherConditions ごと出力しない (RS001/RS002 は楽天側で自動設定)
+  const oc = p.orderCountCond;
+  if (oc != null && (!Number.isInteger(oc) || oc < 1 || oc > 999999999)) {
+    errors.push(`orderCountCond (利用個数 RS004) は 1〜999999999 の整数 (${oc})`);
+  }
   if (errors.length > 0) return { ok: false, errors };
+
+  // 「N個以上購入で」条件。実測 (2026-07-31 coupon.search) では店舗の全品クーポンが
+  //   RS001=0,RS001=1 (PC/モバイル) + RS002=0 (通常購入) + RS004=N
+  // を持つが、RS001/RS002 は「設定のない場合は自動的に設定される」(公式) ため RS004 だけ送る。
+  // 要素順は .NET 公式クライアントの宣言順に合わせて displayFlag の後 (items/otherConditions が末尾)。
+  const otherConditionsXml = oc == null ? '' : `
+            <otherConditions>
+                <otherCondition>
+                    <conditionTypeCode>RS004</conditionTypeCode>
+                    <startValue>${oc}</startValue>
+                </otherCondition>
+            </otherConditions>`;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <request>
@@ -97,7 +126,7 @@ export function buildIssueXml(p) {
                 <prefectureCond>NONE</prefectureCond>
             </multiPrefectureCond>
             <combineFlag>${p.combineFlag}</combineFlag>
-            <displayFlag>${p.displayFlag}</displayFlag>
+            <displayFlag>${p.displayFlag}</displayFlag>${otherConditionsXml}
         </coupon>
     </couponIssueRequest>
 </request>`;
@@ -261,3 +290,76 @@ async function callCouponApi(path, xml, maxAttempts) {
 export const issueCoupon = (xml) => callCouponApi('/es/1.0/coupon/issue', xml, 1);
 export const deleteCoupon = (xml) => callCouponApi('/es/1.0/coupon/delete', xml, 1);
 export const searchCouponByCode = (code) => callCouponApi(`/es/1.0/coupon/search?couponCode=${encodeURIComponent(code)}`, undefined, 4);
+
+// ─── クーポン一覧の取得 (店舗クーポン入れ替えが「現況」を読むための GET) ───
+
+const xmlUnescape = (s) => String(s)
+  .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+  .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+/**
+ * coupon.search のレスポンスXMLを配列に変換する。
+ * ⚠️ <status><requests> に検索条件がエコーされるため、status ブロックを除いてから抽出する
+ *    (parseCouponResult と同じ罠。2026-07-18 実測)。
+ */
+export function parseCouponSearchList(xmlText) {
+  const t = String(xmlText ?? '');
+  const systemStatus = (t.match(/<systemStatus>([^<]*)<\/systemStatus>/) || [])[1] || null;
+  const allCountRaw = (t.match(/<allCount>(\d+)<\/allCount>/) || [])[1];
+  const body = t.replace(/<status>[\s\S]*?<\/status>/, '');
+  const get = (blk, tag) => {
+    const m = blk.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+    return m ? xmlUnescape(m[1]) : '';
+  };
+  const num = (blk, tag) => {
+    const v = get(blk, tag);
+    return v === '' ? null : Number(v);
+  };
+  const coupons = [...body.matchAll(/<coupon>([\s\S]*?)<\/coupon>/g)].map((m) => {
+    const blk = m[1];
+    const conds = [...blk.matchAll(/<otherCondition>\s*<conditionTypeCode>([^<]+)<\/conditionTypeCode>\s*<startValue>([^<]*)<\/startValue>\s*<\/otherCondition>/g)]
+      .map((c) => ({ code: c[1], value: c[2] }));
+    const rs004 = conds.find((c) => c.code === 'RS004');
+    return {
+      couponCode: get(blk, 'couponCode'),
+      couponName: get(blk, 'couponName'),
+      couponStartDate: get(blk, 'couponStartDate'),
+      couponEndDate: get(blk, 'couponEndDate'),
+      itemType: num(blk, 'itemType'),
+      discountType: num(blk, 'discountType'),
+      discountFactor: num(blk, 'discountFactor'),
+      issueCount: num(blk, 'issueCount'),
+      memberAvailMaxCount: num(blk, 'memberAvailMaxCount'),
+      combineFlag: num(blk, 'combineFlag'),
+      displayFlag: num(blk, 'displayFlag'),
+      couponStatus: num(blk, 'couponStatus'),
+      getCount: num(blk, 'getCount'),
+      // 利用個数条件 (「N点以上購入で」)。無い場合は null
+      orderCountCond: rs004 ? Number(rs004.value) : null,
+      regDate: get(blk, 'regDate'),
+    };
+  });
+  return { ok: systemStatus === 'OK', systemStatus, allCount: allCountRaw != null ? Number(allCountRaw) : null, coupons };
+}
+
+/** クーポンを全ページ取得する (GET なのでリトライ可)。maxPages は暴走防止 */
+export async function searchAllCoupons({ hits = 50, maxPages = 20 } = {}) {
+  const out = [];
+  let allCount = null;
+  for (let page = 1; page <= maxPages; page++) {
+    const r = await rakutenRequest({
+      path: `/es/1.0/coupon/search?hits=${hits}&page=${page}`, method: 'GET', timeoutMs: 30000, maxAttempts: 4,
+    });
+    const text = typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    const parsed = parseCouponSearchList(text);
+    if (!parsed.ok) throw new Error(`coupon.search 失敗 (HTTP ${r.status} / ${parsed.systemStatus})`);
+    allCount = parsed.allCount ?? allCount;
+    out.push(...parsed.coupons);
+    if (parsed.coupons.length === 0 || (allCount != null && out.length >= allCount)) break;
+  }
+  // 全件取り切れないまま打ち切ると「現況」を誤読し、重複を見落として二重発行しかねない → fail-closed
+  if (allCount != null && out.length < allCount) {
+    throw new Error(`coupon.search を全件取得できなかった (${out.length}/${allCount}件、hits=${hits} maxPages=${maxPages})`);
+  }
+  return { allCount, coupons: out };
+}
