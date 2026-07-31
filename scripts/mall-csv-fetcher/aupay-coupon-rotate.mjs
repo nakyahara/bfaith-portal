@@ -15,8 +15,10 @@
  *   - 既定は dry-run (確認画面まで進んで内容を検証し、作成はしない)。--live で実作成
  *   - 遷移先URLを /wmshopclient/(shopCouponMgt|distributionCoupon)/ 配下に限定し、
  *     停止・削除系のパス (detailStop 等) へ入ろうとしたら即中止
- *   - 二重作成防止: 同じ利用開始日のクーポンが既にあればスキップ
- *   - 作成前にフォームの読み戻し検証 + 確認画面の表示内容の検証 (どちらか食い違えば作成しない)
+ *   - 二重作成防止: その月に利用開始するクーポンが既にあればスキップ。
+ *     さらに「一覧が判定に使える状態か」(降順・対象月より前まで届く・日付が全行読める) を先に検証
+ *   - 多重起動ロック (取得経路は open(wx) の1本だけ。自動回収はしない = 下の解説を参照)
+ *   - 作成前にフォームの読み戻し検証 + 確認画面の全項目照合 (どちらか食い違えば作成しない)
  *   - クーポン名の金額と「割引種別」の実額が食い違う行はコピー元にしない
  *
  * 実行:
@@ -27,7 +29,8 @@
  *        ACOUPON_NOTIFY=1 (dry-runでもGChat通知する。既定は --live のときだけ通知)
  */
 
-import { mkdir } from 'node:fs/promises';
+import { mkdir, open, unlink } from 'node:fs/promises';
+import { statSync, readFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +39,7 @@ import { openAupayContext, gotoWowmaPage, WOWMA_BASE } from './lib-aupay-login.m
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   planCoupon, todayJst, parseCouponTitle, parseDiscountAmount, parseUsePeriod, findCreatedRow,
+  computeNextMonthPeriod, checkListCoverage, findUnparsedInMonth,
 } from './aupay-coupon-lib.mjs';
 
 const execFileP = promisify(execFile);
@@ -49,7 +53,13 @@ const CREATE_DAY = Math.max(1, Math.min(28, parseInt(process.env.ACOUPON_CREATE_
 const ONLY = (process.env.ACOUPON_ONLY || '').split(',').map((s) => s.trim()).filter(Boolean);
 const DRIVE_DIR = (process.env.ACOUPON_DRIVE_DIR || 'gdrive:aupay-coupon-captures').trim();
 
-const LIST_URL = `${WOWMA_BASE}shopCouponMgt/index?couponType=1`;
+// 一覧の表示件数。既定50件だと過去1年ぶんで埋まり、対象月の既存クーポンが次ページへ
+// 押し出されると「未作成」と誤判定して二重作成しうる。画面が用意している最大 200 を使う
+// (2026-07-31 実測: psz=200 で 2022-08 まで届く = 4年ぶん)。
+const PAGE_SIZE = Math.max(50, Math.min(200, parseInt(process.env.ACOUPON_PAGE_SIZE, 10) || 200));
+const LIST_URL = `${WOWMA_BASE}shopCouponMgt/index?couponType=1&btnResetVisible=0&pno=1&psz=${PAGE_SIZE}`;
+// 対象月に「名前を解析できないクーポン」があったとき、止めずに続行するか (既定は止める)
+const IGNORE_UNPARSED = process.env.ACOUPON_IGNORE_UNPARSED === '1';
 const START_HOUR = '00'; // 分秒は画面が自動で 00 を入れる
 const END_HOUR = '23';   // 分秒は画面が自動で 59 を入れる
 
@@ -87,6 +97,58 @@ function assertCouponUrl(url, label) {
   if (u.hostname !== 'manager.wowma.jp') throw new Error(`URL_GUARD: ${label} が想定外のホスト (${u.hostname})`);
   if (!COUPON_PATH_RE.test(u.pathname)) throw new Error(`URL_GUARD: ${label} がクーポン画面の外 (${u.pathname})`);
   if (FORBIDDEN_PATH_RE.test(u.pathname)) throw new Error(`URL_GUARD: ${label} が停止・削除系の画面 (${u.pathname})`);
+}
+
+// ─────────────────────────── 多重起動ロック ───────────────────────────
+
+/**
+ * 定時実行の最中に人が手で --live を叩くと、どちらも「未作成」と判定して
+ * 同じクーポンを2本作ってしまう (登録後は削除できない)。それを構造的に防ぐ。
+ */
+const LOCK_PATH = join(__dirname, 'logs', 'aupay-coupon.lock');
+
+/**
+ * ⭐ロックの取得経路は open(…, 'wx') **1本だけ**にしてある。
+ *
+ * 「古いロックを回収してから取り直す」経路を作ると、確認と削除の間に別の実行が
+ * ロックを取り直したときにそれを消してしまい、2つのプロセスが同時に登録しうる
+ * (Codexレビュー 3〜5巡目)。Node on Windows は共有削除ありでファイルを開くため、
+ * ハンドルを持ち続けても他プロセスの unlink を防げないことも実測で確認した。
+ * → **自動回収はしない**。残ったロックは通知して人に消してもらう。
+ *   このツールは毎日走り、作成期限(月末)まで数日の猶予があるので、1日止まっても取り返せる。
+ *   取り消せない二重登録より、確実に止まる方を選ぶ。
+ */
+let lockAcquired = false;
+
+function readLock() {
+  try { return JSON.parse(readFileSync(LOCK_PATH, 'utf8')); } catch { return null; }
+}
+
+async function acquireLock() {
+  await mkdir(dirname(LOCK_PATH), { recursive: true });
+  try {
+    const fh = await open(LOCK_PATH, 'wx'); // 既にあれば EEXIST = 原子的な排他
+    await fh.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), live: LIVE }));
+    await fh.close();
+    lockAcquired = true;
+  } catch (e) {
+    if (e.code !== 'EEXIST') throw e;
+    const info = readLock();
+    let age = null;
+    try { age = Date.now() - statSync(LOCK_PATH).mtimeMs; } catch { /* 直前に消えた */ }
+    const since = age === null ? '' : `${Math.round(age / 60000)}分前・`;
+    throw new Error(
+      `LOCKED: 別の実行が進行中か、前回が異常終了してロックが残っています `
+      + `(${since}pid=${info?.pid ?? '?'})。実行中でなければ ${LOCK_PATH} を削除してから再実行してください`,
+    );
+  }
+}
+
+/** 自分が取得したときだけ消す (取得できていないなら他人のロックなので触らない) */
+async function releaseLock() {
+  if (!lockAcquired) return;
+  lockAcquired = false;
+  await unlink(LOCK_PATH).catch(() => {});
 }
 
 async function snap(page, label) {
@@ -482,22 +544,46 @@ async function uploadCapture(localPath, remoteName) {
 
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
+  await acquireLock();
   const runLog = initRunLog('aupay-coupon');
   console.log(`=== au PAY ストアクーポン 月次入れ替え (${LIVE ? '★LIVE=実作成' : 'dry-run'}) ===`);
   console.log(`作成日=毎月${CREATE_DAY}日 / 対象=${ONLY.length ? ONLY.join(',') : '全4本'}`);
 
-  const ctx = await openAupayContext();
-  const page = ctx.pages()[0] || (await ctx.newPage());
-  page.on('dialog', async (d) => {
-    console.log(`  [dialog] ${d.type()}: ${d.message()}`);
-    await d.accept().catch(() => {});
-  });
   const results = [];
   const captures = [];
+  // ブラウザ起動そのものが失敗してもロックを解放できるよう、try の中で開く
+  let ctx = null;
+  let page = null;
 
   try {
+    ctx = await openAupayContext();
+    page = ctx.pages()[0] || (await ctx.newPage());
+    page.on('dialog', async (d) => {
+      console.log(`  [dialog] ${d.type()}: ${d.message()}`);
+      await d.accept().catch(() => {});
+    });
+
     const rows = await fetchCouponRows(page);
     const todayYmd = todayJst();
+
+    // 「二重作成の判定に使える一覧か」を、取り消せない登録の手前で確かめる
+    const period = computeNextMonthPeriod(todayYmd);
+    if (!period) throw new Error(`PERIOD: 対象期間を計算できない (today=${todayYmd})`);
+    const coverage = checkListCoverage(rows, period.monthLabel);
+    if (!coverage.ok) throw new Error(`LIST_COVERAGE: ${coverage.reason}`);
+    console.log(`[list] ${coverage.count}件・最古の利用開始=${coverage.oldest} → ${period.monthLabel} 分の判定に足りている`);
+
+    const unparsed = findUnparsedInMonth(rows, period.monthLabel);
+    if (unparsed.length) {
+      const detail = unparsed.map((u) => `${u.couponId} "${u.title}"`).join(' / ');
+      if (IGNORE_UNPARSED) {
+        console.warn(`  ⚠ ${period.monthLabel} に名前を解析できないクーポンが${unparsed.length}件 (続行指定): ${detail}`);
+      } else {
+        throw new Error(`LIST_UNPARSED: ${period.monthLabel} に名前を解析できないクーポンが${unparsed.length}件あります (${detail})。`
+          + '同じ内容のクーポンを表記違いで二重に作る恐れがあるため中止しました。'
+          + '別種のクーポンを手で作った場合は ACOUPON_IGNORE_UNPARSED=1 で続行できます');
+      }
+    }
 
     const defs = ONLY.length ? COUPON_DEFS.filter((d) => ONLY.includes(d.key)) : COUPON_DEFS;
     const plans = defs.map((def) => planCoupon({ def, rows, todayYmd, createDay: CREATE_DAY }));
@@ -588,14 +674,15 @@ async function main() {
   } catch (e) {
     const is2fa = String(e.message).startsWith('2FA_REQUIRED');
     console.error('[FATAL]', e.message);
-    const shot = await snap(page, 'fatal_error');
+    // ブラウザを開く前に落ちた場合は page が無い
+    const shot = page ? await snap(page, 'fatal_error') : '';
     if (NOTIFY) await sendGChat(buildErrorReport({
       mall: 'aupay-coupon',
       logPath: runLog?.logPath,
       failures: [{
         reportType: is2fa ? '2FA_REQUIRED (クーポン入れ替え中止)' : 'クーポン入れ替え (共通処理)',
         error: e.message,
-        url: page.url(),
+        url: page ? page.url() : '(ブラウザ起動前)',
         screenshot: shot,
       }],
       repro: is2fa
@@ -604,7 +691,8 @@ async function main() {
     }), 'aupay-coupon').catch(() => {});
     process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須
   } finally {
-    await ctx.close().catch(() => {});
+    if (ctx) await ctx.close().catch(() => {});
+    await releaseLock();
   }
 }
 
@@ -652,4 +740,8 @@ async function notify(results, captures) {
   await sendGChat(lines.join('\n'), 'aupay-coupon').catch((e) => console.warn(`  ⚠ GChat通知失敗: ${e.message}`));
 }
 
-main();
+// ロック取得失敗など、ブラウザを開く前の失敗もここで拾う (ロックは掴めていないので解放しない)
+main().catch((e) => {
+  console.error('[FATAL]', e.message);
+  process.exitCode = 1;
+});

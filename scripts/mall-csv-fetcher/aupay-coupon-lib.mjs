@@ -79,6 +79,13 @@ export function lastDayOfMonth(ymd) {
 export const MAX_DISTRIBUTION_DAYS = 30;
 
 /**
+ * コピー元として許容する「利用終了からの経過日数」の上限。
+ * 月次運用なら最新クーポンの利用終了は未来か、せいぜい数週間前 (25日実行なら24日前) のはず。
+ * これを大きく超えるのは一覧の並び順や表示件数が変わったサインとみなして止める。
+ */
+export const STALE_SOURCE_DAYS = 45;
+
+/**
  * 翌月分の掲載期間を決める。
  *   配布: (翌月1日 または 月末-29日のうち遅い方) 00:00 〜 翌月末日 23:59
  *   利用: 配布と同じ開始 〜 配布終了の翌日 23:59 (現行運用と同じ「翌日まで使える」形)
@@ -133,9 +140,18 @@ export function nextAmount(cycle, current) {
 
 // ─────────── 計画 ───────────
 
-/** 定義 (orderCount) に対応する「コピー元にすべき最新クーポン」= 利用終了が最も遅いもの */
+/** 配布を止めたクーポン (中原さんが意図的に止めたもの) */
+export function isStopped(row) {
+  return /停止/.test(String(row?.distributionState || ''));
+}
+
+/**
+ * 定義 (orderCount) に対応する「コピー元にすべき最新クーポン」= 利用終了が最も遅いもの。
+ * 配布停止したものは除外する — 止めたクーポンを翌月また作り直してしまわないため
+ * (全部止まっていればコピー元なし = エラーになり、人が気づける)。
+ */
 export function pickSourceRow(rows, orderCount) {
-  const cands = rows.filter((r) => r.parsed && r.parsed.orderCount === orderCount);
+  const cands = rows.filter((r) => r.parsed && r.parsed.orderCount === orderCount && !isStopped(r));
   if (!cands.length) return null;
   return cands.slice().sort((a, b) => (ymdToMs(b.useEndYmd) ?? 0) - (ymdToMs(a.useEndYmd) ?? 0))[0];
 }
@@ -160,10 +176,59 @@ export function findCreatedRow(rows, { orderCount, amount, useStartYmd }) {
     && r.parsed.amount === amount && r.useStartYmd === useStartYmd) || null;
 }
 
+/**
+ * 「二重作成の判定に使える一覧か」を確かめる。
+ *
+ * 一覧はページングされる (1ページ最大200件)。対象月の既存クーポンが次ページに押し出されると
+ * 「未作成」と誤判定して**取り消せない二重作成**をしてしまう。そこで
+ *   ①利用開始日の降順に並んでいる ②最古の行が対象月より前まで届いている
+ * の両方が成り立つときだけ「対象月はこのページに全部載っている」と判断する。
+ * (2026-07-31 実測: psz=200 で 2022-08 まで届き、降順の逆転は0件)
+ */
+export function checkListCoverage(rows, monthLabel) {
+  if (!rows.length) return { ok: false, reason: '一覧が空 (画面仕様変更の疑い)' };
+  // 日付を読めない行を黙って捨てると、それが対象月の既存クーポンだった場合に
+  // 「未作成」と誤判定してしまう。1件でもあれば一覧全体を信用しない
+  const undated = rows.filter((r) => ymdToMs(r.useStartYmd) === null);
+  if (undated.length) {
+    const e = undated[0];
+    return {
+      ok: false,
+      reason: `利用期間を読み取れない行が ${undated.length}/${rows.length} 件ある `
+        + `(例: ${e.couponId || '?'} "${e.usePeriodText || e.useStartYmd || ''}")。`
+        + '対象月の既存クーポンを見落とす恐れがあるため中止する',
+    };
+  }
+  const dates = rows.map((r) => r.useStartYmd);
+  for (let i = 1; i < dates.length; i++) {
+    if (dates[i - 1] < dates[i]) {
+      return { ok: false, reason: `一覧が利用開始日の降順で並んでいない (${dates[i - 1]} の次が ${dates[i]})` };
+    }
+  }
+  const oldest = dates[dates.length - 1];
+  if (!(oldest < `${monthLabel}-01`)) {
+    return {
+      ok: false,
+      reason: `一覧が ${monthLabel} より古い行まで届いていない (最古=${oldest})。`
+        + '表示件数を増やさないと、既存クーポンの見落とし=二重作成につながる',
+    };
+  }
+  return { ok: true, oldest, count: rows.length };
+}
+
+/**
+ * 対象月にあって「クーポン名を解析できない」行。
+ * 手作業で表記を変えたクーポンがあると二重作成の見落としにつながるため、人に確認させる。
+ * (日付そのものを読めない行は checkListCoverage が先に弾く)
+ */
+export function findUnparsedInMonth(rows, monthLabel) {
+  return rows.filter((r) => !r.parsed && String(r.useStartYmd || '').slice(0, 7) === monthLabel);
+}
+
 /** 今この瞬間に有効な (利用期間中の) クーポンがあるか。無ければ運用に穴が空いている */
 export function hasActiveCoupon(rows, orderCount, todayYmd) {
   return rows.some((r) => {
-    if (!r.parsed || r.parsed.orderCount !== orderCount) return false;
+    if (!r.parsed || r.parsed.orderCount !== orderCount || isStopped(r)) return false;
     const s = diffDays(r.useStartYmd, todayYmd);
     const e = diffDays(todayYmd, r.useEndYmd);
     return s !== null && e !== null && s >= 0 && e >= 0;
@@ -182,13 +247,49 @@ export function renderTemplate(tpl, { orderCount, amount }) {
  * createDay = 「毎月何日に翌月分を作るか」。毎日実行し、その日以降で未作成なら作る
  *   (作成日に失敗しても翌日以降に自動で挽回できる = 月末までのリトライ猶予)。
  */
-export function planCoupon({ def, rows, todayYmd, createDay = 25 }) {
+export function planCoupon({ def, rows, todayYmd, createDay = 25, staleSourceDays = STALE_SOURCE_DAYS }) {
   const src = pickSourceRow(rows, def.orderCount);
   if (!src) {
-    return { key: def.key, status: 'error', reason: `コピー元が見つからない (${def.orderCount}点以上のクーポンが一覧に無い)` };
+    return { key: def.key, status: 'error', reason: `コピー元が見つからない (${def.orderCount}点以上のクーポンが一覧に無い、または全部配布停止)` };
+  }
+  // コピー元の期間や実額が読めない = 一覧のパースが壊れている。不可逆な登録には進まない
+  if (ymdToMs(src.useStartYmd) === null || ymdToMs(src.useEndYmd) === null) {
+    return {
+      key: def.key, status: 'error',
+      reason: `コピー元の利用期間を読み取れない (${src.couponId} "${src.usePeriodText || `${src.useStartYmd}〜${src.useEndYmd}`}")`,
+      source: src,
+    };
+  }
+  if (diffDays(src.useStartYmd, src.useEndYmd) < 0) {
+    return {
+      key: def.key, status: 'error',
+      reason: `コピー元の利用期間が逆転している (${src.couponId} ${src.useStartYmd}〜${src.useEndYmd})`,
+      source: src,
+    };
+  }
+  if (src.discountAmount === null || src.discountAmount === undefined) {
+    return {
+      key: def.key, status: 'error',
+      reason: `コピー元の割引額を読み取れない (${src.couponId} "${src.discountText || ''}")。`
+        + '画面表記が変わった可能性があるため、実額を確認できないままでは作らない',
+      source: src,
+    };
+  }
+
+  // 一覧はページングされる。並び順が変わって古い行を最新と誤認すると、
+  // 「作成済みなのに未作成と判定 → 二重作成」につながる。最新のはずのコピー元が
+  // 大きく過去に終わっていたら、一覧の見え方がおかしいとみなして止める。
+  const staleness = diffDays(src.useEndYmd, todayYmd);
+  if (staleness !== null && staleness > staleSourceDays) {
+    return {
+      key: def.key, status: 'error',
+      reason: `コピー元が古すぎる (最新の${def.orderCount}点クーポンが ${src.useEndYmd} に利用終了、${staleness}日前)。`
+        + '一覧の並び順・表示件数が変わっていないか確認してください',
+      source: src,
+    };
   }
   // タイトルの金額と「割引種別」列の実額がずれていたら触らない (名前と実額の食い違いを伝播させない)
-  if (src.discountAmount !== null && src.discountAmount !== src.parsed.amount) {
+  if (src.discountAmount !== src.parsed.amount) {
     return {
       key: def.key, status: 'error',
       reason: `コピー元のクーポン名と実際の割引額が不一致 (名前=${src.parsed.amount}円 / 設定=${src.discountAmount}円、${src.couponId})`,

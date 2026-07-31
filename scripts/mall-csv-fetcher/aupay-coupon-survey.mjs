@@ -131,7 +131,9 @@ async function main() {
     await ensureWowmaLogin(page);
 
     for (const t of TYPES) {
-      const url = `${WOWMA_BASE}shopCouponMgt/index?couponType=${t}`;
+      const psz = (process.env.ACOUPON_PSZ || '').trim();
+      const url = `${WOWMA_BASE}shopCouponMgt/index?couponType=${t}`
+        + (psz ? `&btnResetVisible=0&pno=1&psz=${encodeURIComponent(psz)}` : '');
       console.log(`\n--- couponType=${t} ---`);
       await gotoWowmaPage(page, url, `クーポン一覧 type=${t}`);
       assertCouponUrl(page.url(), `クーポン一覧 type=${t}`);
@@ -146,6 +148,19 @@ async function main() {
         }
       }
       console.log(`  [forms] ${JSON.stringify(info.forms.map((f) => ({ name: f.name, action: f.action, method: f.method, nFields: f.fields.length })))}`);
+
+      // ページャの実装 (全件取れたかを判定する材料)
+      const pager = await page.evaluate(() => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const links = [...document.querySelectorAll('a')]
+          .filter((a) => /shopCouponMgt\/index/.test(a.getAttribute('href') || ''))
+          .filter((a) => /次|前|\d+|最後|最初/.test(norm(a.innerText)))
+          .map((a) => ({ text: norm(a.innerText).slice(0, 12), href: a.getAttribute('href') }));
+        const body = norm(document.body.innerText);
+        const count = (body.match(/(\d+)\s*件/) || [])[0] || '';
+        return { count, links: links.slice(0, 15) };
+      }).catch(() => ({ count: '', links: [] }));
+      console.log(`  [pager] 件数表示="${pager.count}" links=${JSON.stringify(pager.links)}`);
 
       const rows = await extractCouponRows(page);
       if (rows) {
