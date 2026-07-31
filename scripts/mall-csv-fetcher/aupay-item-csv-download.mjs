@@ -247,14 +247,20 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
 /**
  * 自ジョブの行が全部終端になるまでポーリングし、自ジョブ行だけを返す。
  *
- * bindは3条件のAND: ①submit前に無かった行 ②テンプレート名が自分のもの
- * ③downloadIdが (submit前の最大id, jobId] の範囲内。
- * ③があるので、並行して他者が作成したジョブの行は範囲外として除外される
- * (ファイル名が item.csv/stock.csv 固定で論理日付を持たないため、行の同定はidが頼り)。
- * ②は「完了するまでidが振られない」ポーリング中の唯一の識別子で、
- * 別テンプレートの並行ジョブのエラー/未完了に巻き込まれるのを防ぐ。
- * 同一テンプレートで並行作成された場合だけは分離できないので fail-closed に倒す
- * (自ジョブでない失敗でこちらも止まる。誤ったCSVを掴むよりは安全)。
+ * 行の同定が難しい理由: ファイル名は item.csv/stock.csv 固定で論理日付を持たず、
+ * 画面はジョブ単位のIDを行に出さない。使える手掛かりは downloadId と受付日時だけ。
+ *
+ * 待ち合わせ (ポーリング中): 「submit前に無かった」×「テンプレート名が自分のもの」で絞る。
+ *   完了までdownloadIdが振られないため、この2つがポーリング中に使える識別子。
+ *   同一テンプレートの並行ジョブは混じり得るが、他人の失敗でこちらも止まる方向
+ *   (fail-closed) なので危険はない。
+ *
+ * 取得対象の確定 (完了後): **受付日時をアンカーにして厳密に絞る**。
+ *   downloadId === jobId の行は、サーバーが自分のPOSTに返したIDそのものなので確実に自ジョブ。
+ *   その行の受付日時と一致する行だけを自ジョブとする (1ジョブの複数ファイルは受付日時が同一)。
+ *   これで「事前取得後・自ジョブ受付前」に割り込んだ同一テンプレートの並行ジョブ
+ *   (id範囲だけでは弾けない) も、受付日時が違うので除外される。
+ *   同一秒に別ジョブが受け付けられた場合だけは原理的に分離できない。
  */
 async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }) {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
@@ -299,31 +305,38 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }
     console.log(`  [poll] ${fresh.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
   }
 
-  // downloadId で自ジョブに絞る (完了行は必ずidを持つ)
-  const mine = [];
-  const foreign = [];
+  // 完了行は必ずidを持つ。まずid範囲で粗く絞る
+  const inRange = [];
+  const outOfRange = [];
   for (const r of fresh) {
-    if (classify(r.statusText) === 'no_data') {
-      // データなし行はidが振られないので範囲判定できない。同一テンプレートの
-      // 並行ジョブの行を拾う可能性があるが、DL対象にはしないので実害はない
-      mine.push(r);
-      continue;
-    }
+    if (classify(r.statusText) === 'no_data') continue; // id無し。アンカー確定後に受付日時で拾う
     const id = Number(r.downloadId);
     if (!Number.isFinite(id)) {
       throw new Error(`JOB_BIND: 完了行 ${r.fileName} からダウンロードIDを取得できず (href="${r.href}")`);
     }
-    if (id <= jobIdNum && (maxIdBefore === null || id > maxIdBefore)) mine.push(r);
-    else foreign.push(`${r.fileName}#${id}`);
+    if (id <= jobIdNum && (maxIdBefore === null || id > maxIdBefore)) inRange.push(r);
+    else outOfRange.push(r);
   }
-  if (foreign.length) {
-    console.warn(`  ⚠ 自ジョブ範囲 (${maxIdBefore ?? '-'} < id <= ${jobIdNum}) 外の新規行を除外: ${foreign.join(', ')} — 並行して別の作成が走った模様`);
+  if (outOfRange.length) {
+    console.warn(`  ⚠ 自ジョブ範囲 (${maxIdBefore ?? '-'} < id <= ${jobIdNum}) 外の新規行を除外: ${outOfRange.map((r) => `${r.fileName}#${r.downloadId}`).join(', ')} — 並行して別の作成が走った模様`);
   }
-  if (mine.length === 0) throw new Error(`JOB_BIND: 自ジョブの行を特定できず (新規 ${fresh.length} 行はすべて範囲外)`);
-  if (!mine.some((r) => r.downloadId === jobId)) {
-    console.warn(`  ⚠ 受理jobId ${jobId} 自体が自ジョブ行 (${mine.map((r) => r.downloadId).join(',')}) に無い`);
+
+  // アンカー = downloadId が jobId そのものの行 (サーバーが自分に返したID = 確実に自ジョブ)。
+  // その受付日時と一致する行だけを自ジョブとする
+  const anchor = inRange.find((r) => r.downloadId === jobId);
+  if (!anchor) {
+    // 自ジョブのファイルが全部「データなし」なら起こり得る。DL対象が無いだけなので
+    // 空で返し、呼び元の RESULT_EMPTY に委ねる (他ジョブのCSVは絶対に掴まない)
+    console.warn(`  ⚠ 受理jobId ${jobId} の行が見つからず — DL対象なしとして扱います (id: ${inRange.map((r) => r.downloadId).join(',') || 'なし'})`);
+    return [];
   }
-  console.log(`  [poll] 完了 (${mine.length}件: ${mine.map((r) => r.fileName).join(', ')})`);
+  const candidates = [...inRange, ...fresh.filter((r) => classify(r.statusText) === 'no_data')];
+  const mine = candidates.filter((r) => r.acceptedAt === anchor.acceptedAt);
+  const dropped = candidates.filter((r) => r.acceptedAt !== anchor.acceptedAt);
+  if (dropped.length) {
+    console.warn(`  ⚠ 受付日時が自ジョブ (${anchor.acceptedAt}) と違う新規行を除外: ${dropped.map((r) => `${r.fileName}@${r.acceptedAt}`).join(', ')}`);
+  }
+  console.log(`  [poll] 完了 (${mine.length}件: ${mine.map((r) => r.fileName).join(', ')} / 受付 ${anchor.acceptedAt})`);
   return mine;
 }
 
