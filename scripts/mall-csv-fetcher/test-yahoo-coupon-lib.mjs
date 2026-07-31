@@ -42,8 +42,11 @@ eq(todayJst(Date.UTC(2026, 6, 31, 15, 30)), '2026/08/01', 'todayJst UTC15:30→J
 eq(todayJst(Date.UTC(2026, 6, 31, 14, 30)), '2026/07/31', 'todayJst UTC14:30→JST同日');
 
 // ── 次期間の計算 ──
-eq(computeNextPeriod('2026/07/31', 89), { startYmd: '2026/08/01', endYmd: '2026/10/29' }, '次期間 8/1〜10/29');
-eq(computeNextPeriod('2026/04/30', 89), { startYmd: '2026/05/01', endYmd: '2026/07/29' }, '次期間 5/1起点');
+eq(computeNextPeriod('2026/07/31', 89), { startYmd: '2026/08/01', endYmd: '2026/10/29', delayed: false }, '次期間 8/1〜10/29');
+eq(computeNextPeriod('2026/04/30', 89), { startYmd: '2026/05/01', endYmd: '2026/07/29', delayed: false }, '次期間 5/1起点');
+eq(computeNextPeriod('2026/07/31', 89, '2026/07/25'), { startYmd: '2026/08/01', endYmd: '2026/10/29', delayed: false }, '期限前の実行はそのまま連続');
+// 実行が遅れて開始日が過去になったら「明日から」に繰り上げる (空白は出るが復活はする)
+eq(computeNextPeriod('2026/07/31', 89, '2026/08/05'), { startYmd: '2026/08/06', endYmd: '2026/11/03', delayed: true }, '遅延時は明日始まりへ繰り上げ');
 
 // ── Yahoo制約の検証 ──
 eq(validatePeriod({ startYmd: '2026/08/01', endYmd: '2026/10/29', todayYmd: '2026/07/31' }), [], '89日+前日登録=合格');
@@ -90,7 +93,7 @@ eq(p1.status, 'ready', 'plan: ready');
 eq(p1.amount, 50, 'plan: 55の次は50');
 eq(p1.title, '2点以上購入で50円割引', 'plan: タイトル');
 eq(p1.description, '当店で2点以上ご購入された場合、50円引きになるクーポンです。', 'plan: 説明文');
-eq(p1.period, { startYmd: '2026/08/01', endYmd: '2026/10/29' }, 'plan: 期間');
+eq(p1.period, { startYmd: '2026/08/01', endYmd: '2026/10/29', delayed: false }, 'plan: 期間');
 eq(p1.source.couponId, 'A', 'plan: コピー元');
 eq(p1.image, 'coupon50.jpg', 'plan: 金額に対応する画像を選ぶ');
 
@@ -104,15 +107,27 @@ const p2 = planCoupon({ def: DEF2, rows: ROWS2, periodDays: 89, todayYmd: '2026/
 eq(p2.status, 'skip', 'plan: 次期間ぶんが作成済みならskip');
 ok(/作成済み/.test(p2.reason), 'plan: skip理由が「作成済み」');
 
-// 期限までまだ日があるとき = 異常ではなく「まだ早い」でskip (月次実行を想定)
+// 期限までまだ日があるとき = 異常ではなく「まだ早い」でskip (毎日実行を想定)
 const ROWS_EARLY = [{ couponId: 'G', title: '2点以上購入で55円割引', useStartYmd: '2026/05/03', useEndYmd: '2026/07/31', state: '公開中' }];
 const p6 = planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/05/10' });
 eq(p6.status, 'skip', 'plan: 期限まで余裕があればskip (エラーにしない)');
 ok(/まだ早い/.test(p6.reason), 'plan: skip理由が「まだ早い」');
 
-// 期限間近 (60日以内に入った) なら作る
-const p7 = planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/06/10' });
-eq(p7.status, 'ready', 'plan: 60日以内に入ったら作成対象');
+// リードタイム境界: 8日前はまだ作らない / 7日前になったら作る
+eq(planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/07/24' }).status, 'skip',
+  'plan: 8日前はまだ作らない');
+eq(planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/07/25' }).status, 'ready',
+  'plan: 7日前になったら作成対象');
+eq(planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/07/31' }).status, 'ready',
+  'plan: 前日でも作成対象');
+eq(planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/06/10', leadDays: 60 }).status, 'ready',
+  'plan: leadDaysを広げれば早めにも作れる');
+
+// 実行が遅れて期限切れ後に回った場合も、明日始まりで復活させる
+const p9 = planCoupon({ def: DEF2, rows: ROWS_EARLY, periodDays: 89, todayYmd: '2026/08/05' });
+eq(p9.status, 'ready', 'plan: 期限切れ後でも作成する (空白を最小化)');
+eq(p9.period.startYmd, '2026/08/06', 'plan: 遅延時は明日始まり');
+ok(p9.period.delayed === true, 'plan: 遅延フラグが立つ');
 
 const p3 = planCoupon({ def: DEF2, rows: [], periodDays: 89, todayYmd: '2026/07/31' });
 eq(p3.status, 'error', 'plan: コピー元なしはerror');

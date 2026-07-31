@@ -70,14 +70,24 @@ export function todayJst(nowMs = Date.now()) {
 /**
  * 次の掲載期間を決める。
  *   開始 = 前回の利用終了日の翌日 / 終了 = 開始 + periodDays 日
+ *   ただし実行が遅れて「前回終了日の翌日」が過去になっている場合は翌日始まりに繰り上げる
+ *   (空白期間は生じるが、クーポンが復活しないよりはよい)。
  * 時刻は開始00:00・終了23:00 (現行運用と同じ) を呼び出し側が付ける。
  */
-export function computeNextPeriod(prevEndYmd, periodDays) {
-  const start = addDays(prevEndYmd, 1);
+export function computeNextPeriod(prevEndYmd, periodDays, todayYmd = null) {
+  let start = addDays(prevEndYmd, 1);
   if (!start) return null;
+  let delayed = false;
+  if (todayYmd) {
+    const lead = diffDays(todayYmd, start);
+    if (lead !== null && lead <= 0) {
+      start = addDays(todayYmd, 1); // 最短で明日から
+      delayed = true;
+    }
+  }
   const end = addDays(start, periodDays);
   if (!end) return null;
-  return { startYmd: start, endYmd: end };
+  return { startYmd: start, endYmd: end, delayed };
 }
 
 /**
@@ -130,8 +140,12 @@ export function findExistingForPeriod(rows, orderCount, startYmd) {
   }) || null;
 }
 
-/** 1本ぶんの入れ替え計画を組み立てる */
-export function planCoupon({ def, rows, periodDays, todayYmd }) {
+/**
+ * 1本ぶんの入れ替え計画を組み立てる。
+ * leadDays = 「次期間の開始まで残り何日になったら作るか」。毎日実行して、
+ *   期限が近づいた1回だけ作る運用を想定 (既定7日)。
+ */
+export function planCoupon({ def, rows, periodDays, todayYmd, leadDays = 7 }) {
   const src = pickSourceRow(rows, def.orderCount);
   if (!src) {
     return { key: def.key, status: 'error', reason: `コピー元が見つからない (${def.orderCount}点以上のクーポンが一覧に無い)` };
@@ -153,23 +167,22 @@ export function planCoupon({ def, rows, periodDays, todayYmd }) {
       source: src,
     };
   }
-  const period = computeNextPeriod(src.useEndYmd, periodDays);
+  const period = computeNextPeriod(src.useEndYmd, periodDays, todayYmd);
   if (!period) {
     return { key: def.key, status: 'error', reason: `期間を計算できない (前回終了=${src.useEndYmd})`, source: src };
   }
+  // 期限までまだ日があるうちは作らない (毎日実行して、期限が近づいた1回だけ作る)
+  const lead = diffDays(todayYmd, period.startYmd);
+  if (lead !== null && lead > leadDays) {
+    return {
+      key: def.key, status: 'skip',
+      reason: `作成にはまだ早い (次期間の開始=${period.startYmd}、あと${lead}日。${leadDays}日前になったら作成)`,
+      source: src, period,
+    };
+  }
   const errs = validatePeriod({ ...period, todayYmd });
   if (errs.length) {
-    // 「開始が60日超先」だけなら異常ではなく“まだ早い”。月次で回して期限が近づいたら作られる
-    const onlyTooEarly = errs.every((e) => e.includes('60日'));
-    return {
-      key: def.key,
-      status: onlyTooEarly ? 'skip' : 'error',
-      reason: onlyTooEarly
-        ? `作成にはまだ早い (次期間の開始=${period.startYmd}、Yahoo は登録日から60日以内しか設定できない)`
-        : errs.join(' / '),
-      source: src,
-      period,
-    };
+    return { key: def.key, status: 'error', reason: errs.join(' / '), source: src, period };
   }
   const dup = findExistingForPeriod(rows, def.orderCount, period.startYmd);
   if (dup) {

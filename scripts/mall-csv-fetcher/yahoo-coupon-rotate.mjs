@@ -40,6 +40,8 @@ const OUT_DIR = join(__dirname, 'spike-output', 'yahoo-coupon-rotate');
 
 const LIVE = process.argv.includes('--live');
 const PERIOD_DAYS = Math.max(1, Math.min(90, parseInt(process.env.YCOUPON_PERIOD_DAYS, 10) || 89));
+// 毎日実行して「次期間の開始まで残りN日」になった1回だけ作る。それ以外の日は何もしない
+const LEAD_DAYS = Math.max(0, Math.min(60, parseInt(process.env.YCOUPON_LEAD_DAYS, 10) || 7));
 const IMAGE_OVERRIDE = (process.env.YCOUPON_IMAGE || '').trim();
 const ONLY = (process.env.YCOUPON_ONLY || '').split(',').map((s) => s.trim()).filter(Boolean);
 const DRIVE_DIR = (process.env.YCOUPON_DRIVE_DIR || 'gdrive:yahoo-coupon-captures').trim();
@@ -355,7 +357,9 @@ async function main() {
     const todayYmd = todayJst();
 
     const defs = ONLY.length ? COUPON_DEFS.filter((d) => ONLY.includes(d.key)) : COUPON_DEFS;
-    const plans = defs.map((def) => planCoupon({ def, rows, periodDays: PERIOD_DAYS, todayYmd }));
+    const plans = defs.map((def) => planCoupon({
+      def, rows, periodDays: PERIOD_DAYS, todayYmd, leadDays: LEAD_DAYS,
+    }));
 
     console.log('\n--- 計画 ---');
     for (const p of plans) {
@@ -419,7 +423,13 @@ async function main() {
       captures.push({ key: 'list', label: 'after', path: await snap(page, 'list_after') });
     }
 
-    await notify(results, captures);
+    // 毎日実行するため、何も起きなかった日 (全部skip) は通知しない
+    const hasNews = results.some((r) => r.status !== 'skip');
+    if (hasNews) {
+      await notify(results, captures);
+    } else {
+      console.log('\n(すべてスキップ = 作成タイミングではないため、GChat通知は送りません)');
+    }
     const failed = results.filter((r) => r.status === 'failed' || r.status === 'error');
     process.exitCode = failed.length ? 1 : 0;
   } catch (e) {
@@ -540,6 +550,9 @@ async function notify(results, captures) {
       lines.push(`　値引き: *${r.amount}円* (前回 ${r.source.amount}円)`);
       lines.push(`　条件: ${r.orderCount}点以上・ストア全品`);
       lines.push(`　期間: ${r.period.startYmd} 00:00 〜 ${r.period.endYmd} 23:00`);
+      if (r.period.delayed) {
+        lines.push(`　⚠️ 前回クーポンの期限を過ぎてからの作成です (${r.source.useEndYmd}終了 → ${r.period.startYmd}開始)。空白期間が発生しました`);
+      }
       if (r.status === 'issued') {
         lines.push(`　結果: ${r.verifiedInList ? `✅発行済み (${r.newCouponId})` : '⚠️発行したが一覧で未確認'}`);
       } else {
