@@ -43,6 +43,8 @@ export function xmlEscape(s) {
 }
 
 const JST_DT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+09:00$/;
+// XML 1.0 で許可されないコードポイント (タブ・LF・CR は許可)
+const hasXmlInvalidChar = (s) => { for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0x20 && c !== 0x09 && c !== 0x0A && c !== 0x0D) return true; } return false; };
 
 /** coupon.issue リクエストXML (公式サンプルの完全形・要素順厳守)。検証込み */
 export function buildIssueXml(p) {
@@ -52,8 +54,15 @@ export function buildIssueXml(p) {
   if (!name) errors.push('couponName は必須');
   if (name.length > 60) errors.push(`couponName が60文字超 (${name.length})`);
   if (caption.length > 200) errors.push(`couponCaption が200文字超 (${caption.length})`);
+  // XML 1.0 が許さない制御文字が混じると不正なXMLになる (エスケープでは救えない)
+  if (hasXmlInvalidChar(name)) errors.push('couponName にXMLで使えない制御文字が含まれる');
+  if (hasXmlInvalidChar(caption)) errors.push('couponCaption にXMLで使えない制御文字が含まれる');
   if (!JST_DT_RE.test(p.couponStartDate)) errors.push(`couponStartDate は YYYY-MM-DDThh:mm:ss+09:00 形式 (${p.couponStartDate})`);
   if (!JST_DT_RE.test(p.couponEndDate)) errors.push(`couponEndDate は YYYY-MM-DDThh:mm:ss+09:00 形式 (${p.couponEndDate})`);
+  // 形式が合っていても 2026-99-99 のような実在しない日時は弾く (正規表現だけでは通ってしまう)
+  for (const k of ['couponStartDate', 'couponEndDate']) {
+    if (JST_DT_RE.test(p[k]) && !Number.isFinite(Date.parse(p[k]))) errors.push(`${k} が実在しない日時 (${p[k]})`);
+  }
   if (JST_DT_RE.test(p.couponStartDate) && JST_DT_RE.test(p.couponEndDate)
       && Date.parse(p.couponEndDate) < Date.parse(p.couponStartDate) + 5 * 60000) {
     errors.push('couponEndDate は couponStartDate+5分以降が必要');
@@ -347,6 +356,10 @@ export async function searchAllCoupons({ hits = 50, maxPages = 20 } = {}) {
     allCount = parsed.allCount ?? allCount;
     out.push(...parsed.coupons);
     if (parsed.coupons.length === 0 || (allCount != null && out.length >= allCount)) break;
+  }
+  // 全件取り切れないまま打ち切ると「現況」を誤読し、重複を見落として二重発行しかねない → fail-closed
+  if (allCount != null && out.length < allCount) {
+    throw new Error(`coupon.search を全件取得できなかった (${out.length}/${allCount}件、hits=${hits} maxPages=${maxPages})`);
   }
   return { allCount, coupons: out };
 }

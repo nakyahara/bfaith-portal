@@ -33,6 +33,7 @@ import {
 } from './rakuten-coupon-lib.js';
 import {
   STORE_COUPON_DEFS, STORE_COUPON_FIXED, planStoreCoupon, planToIssueParams, todayJst, isoToYmd,
+  findExistingForStart, validatePeriod,
 } from './rakuten-store-coupon-lib.js';
 
 const args = process.argv.slice(2);
@@ -80,8 +81,29 @@ async function cmdList() {
   if (store.length > 20) console.log(`  … 他 ${store.length - 20} 件`);
 }
 
-/** 発行 1本。戻り値は結果オブジェクト (throw しない) */
+/**
+ * 発行 1本。戻り値は結果オブジェクト (throw しない)。
+ *
+ * 発行の直前に現況を取り直して重複と時刻制約を見直す。
+ *   - 計画時の検索から時間が経っており、その間に人が画面から作っているかもしれない
+ *     (このCLIを二重起動した場合も同じ) → 同じ開始日のものがあれば発行しない
+ *   - 遅延リカバリでは開始を「今+90分」に置くため、待たされると楽天の60分制約を割り得る
+ */
 async function issueOne(plan) {
+  let fresh;
+  try {
+    fresh = await searchAllCoupons();
+  } catch (e) {
+    return { ...plan, status: 'failed', error: `発行直前の現況確認に失敗したため発行を見送り (${e.message})` };
+  }
+  const dup = findExistingForStart(fresh.coupons, plan.orderCount, plan.period.startYmd, plan.couponName);
+  if (dup) {
+    return { ...plan, status: 'skip', reason: `発行直前の確認で同じ開始日のクーポンを検出 (${dup.discountFactor}円) — 二重発行を回避` };
+  }
+  const errs = validatePeriod({ startIso: plan.period.startIso, endIso: plan.period.endIso, maxSpanDays: MAX_SPAN_DAYS });
+  if (errs.length > 0) {
+    return { ...plan, status: 'failed', error: `発行直前の再検証NG: ${errs.join(' / ')}` };
+  }
   const params = planToIssueParams(plan);
   const built = buildIssueXml(params);
   if (!built.ok) return { ...plan, status: 'failed', error: `パラメータ検証NG: ${built.errors.join(' / ')}` };
@@ -151,10 +173,15 @@ async function cmdRotate() {
   }
   for (const p of plans) if (p.status !== 'ready') results.push(p);
 
-  // 発行後の実在確認
+  // 発行後の実在確認。ここで失敗しても「発行できたこと」は通知したいので握り潰す
   if (results.some((r) => r.status === 'issued')) {
-    const after = await searchAllCoupons();
-    for (const r of results.filter((x) => x.status === 'issued')) {
+    let after = null;
+    try {
+      after = await searchAllCoupons();
+    } catch (e) {
+      console.error(`  ⚠️ 発行後の確認に失敗 (発行そのものは成功している可能性が高い): ${e.message}`);
+    }
+    for (const r of after ? results.filter((x) => x.status === 'issued') : []) {
       const hit = after.coupons.find((c) => c.couponCode === r.couponCode);
       r.verified = !!hit;
       r.verifiedDetail = hit

@@ -38,6 +38,9 @@ console.log('=== 1. 日付ユーティリティ ===');
   check('addDays: 7/31 +1 = 8/1', addDays('2026-07-31', 1) === '2026-08-01');
   check('diffDays: 8/1〜10/31 = 91日', diffDays('2026-08-01', '2026-10-31') === 91, String(diffDays('2026-08-01', '2026-10-31')));
   check('isoToYmd', isoToYmd('2026-07-31T23:59:59+09:00') === '2026-07-31');
+  check('isoToYmd: 別オフセットはJSTに直す (UTC 15:00 → 翌日)', isoToYmd('2026-07-31T15:00:00Z') === '2026-08-01', isoToYmd('2026-07-31T15:00:00Z'));
+  check('isoToYmd: 実在しない日付は null', isoToYmd('2026-02-31T00:00:00+09:00') === null, String(isoToYmd('2026-02-31T00:00:00+09:00')));
+  check('isoToYmd: 解釈できない値は null', isoToYmd('なにか') === null);
   check('todayJst: UTC 15:00 は翌日JST', todayJst(Date.parse('2026-07-31T15:00:00Z')) === '2026-08-01');
 }
 
@@ -93,6 +96,10 @@ console.log('=== 5. 現況の読み取り (名前ではなく設定値を正と�
   check('存在しない点数は null', pickSourceCoupon(CURRENT, 7) === null);
   check('二重発行の検出: 同じ開始日があれば見つかる', !!findExistingForStart(CURRENT, 3, '2026-05-01'));
   check('二重発行の検出: 別の開始日なら見つからない', findExistingForStart(CURRENT, 3, '2026-08-01') === null);
+  // RS004 が読めなかったレスポンスでも、同名・同開始日なら重複として拾う (見落とすと二重発行)
+  const rs004Lost = [{ ...CURRENT[0], orderCountCond: null, couponName: '3点以上ご購入で100円引きクーポン', couponStartDate: '2026-08-01T00:00:00+09:00' }];
+  check('RS004欠落でも同名・同開始日なら重複と判定', !!findExistingForStart(rs004Lost, 3, '2026-08-01', '3点以上ご購入で100円引きクーポン'));
+  check('開始日が null なら重複判定しない', findExistingForStart(CURRENT, 3, null) === null);
 
   // 新旧が混在していても、終了日が最も遅いものを選ぶ
   const withOld = [...CURRENT, {
@@ -150,6 +157,8 @@ console.log('=== 7. 発行XML (otherConditions RS004) ===');
   check('定額で金額0はNG', buildIssueXml({ ...params, discountFactor: 0 }).ok === false);
   check('利用個数0はNG', buildIssueXml({ ...params, orderCountCond: 0 }).ok === false);
   check('利用個数が小数はNG', buildIssueXml({ ...params, orderCountCond: 1.5 }).ok === false);
+  check('クーポン名に制御文字が混じったらNG', buildIssueXml({ ...params, couponName: '3点以上' + String.fromCharCode(1) + '引き' }).ok === false);
+  check('実在しない日時はNG', buildIssueXml({ ...params, couponEndDate: '2026-02-31T23:59:59+09:00' }).ok === false);
   // 要素順 (既存の発行成功実績と同じ並び + 末尾 otherConditions)
   const order = ['couponName', 'couponCaption', 'couponStartDate', 'couponEndDate', 'issueCount',
     'itemType', 'discountType', 'discountFactor', 'memberAvailMaxCount', 'purchaseHistoryCond',

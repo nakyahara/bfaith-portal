@@ -84,10 +84,19 @@ export function todayJst(nowMs = Date.now()) {
   return msToYmd(nowMs + 9 * 3600 * 1000);
 }
 
-/** '2026-07-31T23:59:59+09:00' → '2026-07-31' (JST表記の日付部をそのまま使う) */
+/**
+ * '2026-07-31T23:59:59+09:00' → '2026-07-31'。
+ * 楽天は +09:00 で返すが、別オフセット (Z など) で返ってきた場合に JST の暦日がずれると
+ * 重複判定や期間の連結を誤るため、その場合は JST に直してから日付を取る。
+ * 解釈できない値・実在しない日付は null (fail-closed。呼び出し側で error になる)。
+ */
 export function isoToYmd(iso) {
-  const m = String(iso || '').match(/^(\d{4}-\d{2}-\d{2})T/);
-  return m ? m[1] : null;
+  const s = String(iso || '');
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}\+09:00$/);
+  if (m) return ymdToMs(m[1]) === null ? null : m[1];
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) return null;
+  return msToYmd(ms + 9 * 3600 * 1000);
 }
 
 /** ymd の月から addMonths ヶ月後の月末 'YYYY-MM-DD' */
@@ -142,12 +151,18 @@ export function pickSourceCoupon(coupons, orderCount) {
   return cands.slice().sort((a, b) => Date.parse(b.couponEndDate || 0) - Date.parse(a.couponEndDate || 0))[0];
 }
 
-/** 同じ条件・同じ開始日のクーポンが既にあるか (二重発行の防止) */
-export function findExistingForStart(coupons, orderCount, startYmd) {
-  return (coupons || []).find((c) => c.orderCountCond === orderCount
-    && c.discountType === 1
-    && c.itemType === 4
-    && isoToYmd(c.couponStartDate) === startYmd) || null;
+/**
+ * 同じ条件・同じ開始日のクーポンが既にあるか (二重発行の防止)。
+ * couponName を渡すと「同名・同開始日」も重複とみなす — RS004 の読み取りに失敗した
+ * レスポンスがあっても重複を見落とさないための保険 (見落とすと二重発行になる)。
+ */
+export function findExistingForStart(coupons, orderCount, startYmd, couponName = null) {
+  if (!startYmd) return null;
+  return (coupons || []).find((c) => {
+    if (isoToYmd(c.couponStartDate) !== startYmd) return false;
+    if (c.orderCountCond === orderCount && c.discountType === 1 && c.itemType === 4) return true;
+    return couponName != null && c.couponName === couponName;
+  }) || null;
 }
 
 // ─────────── 期間の決定 ───────────
@@ -160,8 +175,9 @@ export function findExistingForStart(coupons, orderCount, startYmd) {
  * 実行が遅れて開始日が過去になっている場合は「今から minLeadMinutes 分後」に繰り上げる
  * (楽天は開始が現在+60分以降でないと登録できないため。空白は生じるが復活を優先)。
  *
- * maxSpanDays を超える期間は終了日を切り詰める (楽天の上限は「3ヶ月」だが、
- * 90日という情報もあるため設定で締められるようにしてある)。
+ * maxSpanDays = 開始日と終了日の**日付差**の上限 (既定91 = 8/01〜10/31。暦日数では92日ぶん)。
+ * 超える場合は終了日を切り詰める。楽天の実際の上限は「3ヶ月」で、91日差が通ることは
+ * 2026-07-31 にテストクーポンの発行で実測済み。90日に締めたい場合は 90 を渡す。
  */
 export function computeNextPeriod({ prevEndYmd, todayYmd, nowMs = Date.now(), maxSpanDays = 91, minLeadMinutes = 90 }) {
   const startYmd = addDays(prevEndYmd, 1);
@@ -213,7 +229,7 @@ export function validatePeriod({ startIso, endIso, nowMs = Date.now(), maxSpanDa
   if (leadMin > 30 * 24 * 60) errs.push(`開始が現在+30日超 (${Math.floor(leadMin / 1440)}日後、楽天の上限は30日)`);
   if (endMs <= startMs) errs.push(`終了が開始以前 (${startIso}〜${endIso})`);
   const span = diffDays(isoToYmd(startIso), isoToYmd(endIso));
-  if (span !== null && span > maxSpanDays) errs.push(`期間が${maxSpanDays}日を超過 (${span}日)`);
+  if (span !== null && span > maxSpanDays) errs.push(`開始〜終了の日付差が上限${maxSpanDays}日を超過 (${span}日)`);
   return errs;
 }
 
@@ -255,17 +271,18 @@ export function planStoreCoupon({ def, coupons, todayYmd, nowMs = Date.now(), le
       source: src, period,
     };
   }
-  const dup = findExistingForStart(coupons, def.orderCount, period.startYmd);
+  const { amount, reset } = nextAmount(def.cycle, src.discountFactor);
+  if (amount === null) {
+    return { key: def.key, orderCount: def.orderCount, status: 'error', reason: `巡回リストが空 (設定を確認)`, source: src, period };
+  }
+  const couponName = renderCouponName({ orderCount: def.orderCount, amount });
+  const dup = findExistingForStart(coupons, def.orderCount, period.startYmd, couponName);
   if (dup) {
     return {
       key: def.key, orderCount: def.orderCount, status: 'skip',
       reason: `同じ開始日のクーポンが既に存在 (${dup.discountFactor}円 ${period.startYmd}〜)`,
       source: src, period,
     };
-  }
-  const { amount, reset } = nextAmount(def.cycle, src.discountFactor);
-  if (amount === null) {
-    return { key: def.key, orderCount: def.orderCount, status: 'error', reason: `巡回リストが空 (設定を確認)`, source: src, period };
   }
   const errs = validatePeriod({ startIso: period.startIso, endIso: period.endIso, nowMs, maxSpanDays });
   if (errs.length > 0) {
@@ -280,7 +297,7 @@ export function planStoreCoupon({ def, coupons, todayYmd, nowMs = Date.now(), le
     amount,
     amountReset: reset,
     period,
-    couponName: renderCouponName({ orderCount: def.orderCount, amount }),
+    couponName,
   };
 }
 
