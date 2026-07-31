@@ -277,7 +277,7 @@ function parseAcceptedAt(s) {
 async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName, submitAtMs }) {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
   const jobIdNum = Number(jobId);
-  const NEAR_MS = 5 * 60 * 1000;
+  const NEAR_MS = 120 * 1000; // 自ジョブの受付日時はPOST直後の数秒以内。狭くして他ジョブとの取り違えを減らす
   let group = [];
   let unknownStreak = 0;
 
@@ -311,10 +311,10 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName, 
     let pickedAt = null;
     if (anchorRow) {
       pickedAt = anchorRow.acceptedAt;                                 // (a) 確定
-    } else if (byAccepted.size === 1) {
-      pickedAt = [...byAccepted.keys()][0];
     } else {
-      let best = null;                                                 // (b) POST時刻に最も近い
+      // (b) POST時刻に最も近いグループ。グループが1つでも近接判定は必ず通す
+      // (自ジョブの行がまだ出ておらず、並行ジョブの行だけが見えている場合があるため)
+      let best = null;
       for (const at of byAccepted.keys()) {
         const ms = parseAcceptedAt(at);
         if (ms === null) continue;
@@ -323,6 +323,7 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName, 
       }
       pickedAt = best ? best.at : null;
     }
+    const certain = Boolean(anchorRow);
     group = pickedAt === null ? fresh : byAccepted.get(pickedAt);      // (c) 決まらなければ全部
     if (pickedAt !== null && byAccepted.size > 1) {
       const others = [...byAccepted.keys()].filter((a) => a !== pickedAt);
@@ -331,25 +332,34 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName, 
 
     const st = group.map((r) => classify(r.statusText));
     const errored = group.filter((r, k) => st[k] === 'error');
-    if (errored.length) throw new Error(`JOB_FAILED: 処理エラー (${errored.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
-    if (st.includes('unknown')) {
+    const unknowns = group.filter((r, k) => st[k] === 'unknown');
+    // 異常の扱い: アンカー確定 or POST時刻の近傍グループなら自ジョブとして即中断する。
+    // 近接判定すら通らない (pickedAt=null) 場合は自ジョブと断定できないので、
+    // 警告に留めて待ち続ける — 他人のジョブのエラーでこちらを落とさない (fail-closed)
+    if (errored.length) {
+      const msg = `処理エラー (${errored.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`;
+      if (pickedAt !== null) throw new Error(`JOB_FAILED: ${msg}`);
+      console.warn(`  ⚠ 自ジョブと断定できない行でエラー: ${msg} — 待機継続`);
+    }
+    if (unknowns.length) {
       // 新しい失敗状態やログイン画面の混入をタイムアウトまで放置しない
-      if (++unknownStreak >= 3) {
-        const u = group.filter((r, k) => st[k] === 'unknown').map((r) => `${r.fileName}:"${r.statusText}"`).join(', ');
+      if (++unknownStreak >= 3 && pickedAt !== null) {
+        const u = unknowns.map((r) => `${r.fileName}:"${r.statusText}"`).join(', ');
         throw new Error(`POLL_UNKNOWN_STATUS: 解釈できないステータスが続いています (${u}) url=${page.url()} — 画面仕様変更の疑い`);
       }
     } else {
       unknownStreak = 0;
     }
-    // 終端条件: 選んだグループが全部終端。ただし (b)(c) の推定グループの場合は、
-    // アンカーが出るまで待つ (自ジョブがまだ未完了なだけ、の可能性を潰す)
+    // 終端条件: 選んだグループが全部終端。ただしアンカー未確定なら、
+    // 「自ジョブがまだ未完了なだけ」の可能性を潰すためアンカーが出るまで待つ。
+    // 例外は「近傍グループが全部データなし」= 自ジョブにDL対象が無いケース
     if (st.every((s) => s === 'done' || s === 'no_data')) {
-      if (anchorRow) break;
-      if (byAccepted.size === 1 && group.every((r) => classify(r.statusText) === 'no_data')) break; // 全てデータなし
+      if (certain) break;
+      if (pickedAt !== null && st.every((s) => s === 'no_data')) break;
       console.log('  [poll] 受理jobIdの行が未出現 — 自ジョブの完了を待機中 ...');
     }
     if (Date.now() > deadline) {
-      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${group.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
+      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${group.map((r) => `${r.fileName}:${r.statusText}`).join(', ') || '自ジョブの行を特定できず'})`);
     }
     console.log(`  [poll] ${group.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
   }
