@@ -1,0 +1,6 @@
+# .bat は必ず CRLF でチェックアウトする。
+# LF のままだと cmd.exe が終了コード 255 で即死し、Stream Deck や
+# タスクスケジューラから叩いたときだけ静かに落ちる。
+# 各PCの core.autocrlf 設定に依存させないため明示する。
+*.bat text eol=crlf
+*.cmd text eol=crlf
