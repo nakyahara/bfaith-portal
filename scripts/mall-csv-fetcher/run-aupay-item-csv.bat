@@ -8,6 +8,7 @@ REM  folder "AUpay download" via rclone.
 REM
 REM  Called from the desktop PC over SSH (Stream Deck button).
 REM  Run it directly on the miniPC for a manual test.
+REM  Args are forwarded to node as-is: do not pass untrusted input.
 REM  ASCII only + CRLF: a LF-only .bat dies with exit code 255.
 REM ============================================================
 setlocal
@@ -18,12 +19,12 @@ if errorlevel 1 (
 )
 
 REM headless: nobody is looking at the miniPC screen
-set HEADLESS=1
+set "HEADLESS=1"
 REM Playwright browsers live under the bfaith profile, not systemprofile
 set PLAYWRIGHT_BROWSERS_PATH=C:\Users\bfaith\AppData\Local\ms-playwright
 
 node scripts\mall-csv-fetcher\aupay-item-csv-download.mjs %*
-set RC=%ERRORLEVEL%
+set "RC=%ERRORLEVEL%"
 
 if not "%RC%"=="0" (
     echo.

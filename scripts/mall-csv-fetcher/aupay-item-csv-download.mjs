@@ -43,6 +43,8 @@ const LOCK_PATH = join(__dirname, 'logs', 'aupay-item-csv.lock');
 
 // Google ドライブ 共有フォルダ「AUpayダウンロード」(2026-07-31 中原さん作成、実在をAPIで確認済)。
 // 秘密ではないので既定値として持つ。別フォルダに出すなら AITEM_DRIVE_FOLDER で上書き
+const TEMPLATE_DEFAULT = 'ヤフー在庫アップ後確認';
+// このフォルダは上のテンプレート専用 (別テンプレートの結果は入れない)
 const DRIVE_FOLDER_DEFAULT = '1Stxagr7RybClMrt_W1x7izeD8cCadPmq';
 const DRIVE_REMOTE_DEFAULT = 'gdrive:';
 const DRIVE_ID_RE = /^[A-Za-z0-9_-]{20,60}$/;   // フォルダIDの形 (パス/オプション混入を弾く)
@@ -100,7 +102,10 @@ function uploadToDrive(localPath, destName, { remote, folderId }) {
     '--checksum', '--stats', '0', '--log-level', 'INFO',
   ];
   // rclone の INFO ログは stderr に出るので spawnSync で両方受け取る
-  const r = spawnSync('rclone', args, { shell: false, encoding: 'utf8', timeout: 5 * 60 * 1000 });
+  const r = spawnSync('rclone', args, {
+    shell: false, encoding: 'utf8', timeout: 5 * 60 * 1000,
+    maxBuffer: 8 * 1024 * 1024,   // 既定1MBだとログ量が増えたとき成功しても失敗扱いになる
+  });
   const log = `${r.stdout || ''}${r.stderr || ''}`;
   if (r.error || r.status !== 0) {
     const why = r.error ? r.error.message : `exit ${r.status}${r.signal ? ` signal ${r.signal}` : ''}`;
@@ -515,13 +520,23 @@ async function run(page, { templateName, sellKey, linefeedDel, outDir, drive }) 
   // ── Google ドライブへ固定名で上書き (全ファイル揃ってから) ──
   if (drive) {
     console.log(`\n  [drive] アップロード先=${drive.remote} folderId=${drive.folderId}`);
-    for (const s of saved) {
-      const r = uploadToDrive(s.latest, s.file, drive);
-      console.log(`  ☁ ${s.file} ${r === 'updated' ? 'を上書き' : 'は前回と同一のため転送スキップ'} (${s.rows}行)`);
+    // 2本を1回のAPI呼び出しで差し替える手段は無いので、途中で失敗すると
+    // Drive上で item.csv と stock.csv の世代が食い違う。黙って終わらせず、
+    // どれが新版でどれが旧版のままかを名指しで報告する
+    const done = [];
+    try {
+      for (const s of saved) {
+        const r = uploadToDrive(s.latest, s.file, drive);
+        done.push(s.file);
+        console.log(`  ☁ ${s.file} ${r === 'updated' ? 'を上書き' : 'は前回と同一のため転送スキップ'} (${s.rows}行)`);
+      }
+    } catch (e) {
+      const rest = saved.map((s) => s.file).filter((f) => !done.includes(f));
+      throw new Error(`${e.message}\n  ⚠ Driveの世代が食い違っています: 更新済=${done.join(', ') || 'なし'} / 旧版のまま=${rest.join(', ')}。再実行して揃えてください`);
     }
     console.log(`  https://drive.google.com/drive/folders/${drive.folderId}`);
   } else {
-    console.log('\n  [drive] --no-drive のためアップロードなし (ローカル保存のみ)');
+    console.log('\n  [drive] Driveアップロードなし (ローカル保存のみ)');
   }
   return saved;
 }
@@ -541,7 +556,7 @@ async function main() {
     console.log('  [--drive-folder <DriveフォルダID>] [--no-drive]');
     return;
   }
-  const templateName = args.template || process.env.AITEM_TEMPLATE || 'ヤフー在庫アップ後確認';
+  const templateName = args.template || process.env.AITEM_TEMPLATE || TEMPLATE_DEFAULT;
   const sellKey = (args.sellStatus || process.env.AITEM_SELL_STATUS || 'selling').trim();
   if (!SELL_STATUS[sellKey]) {
     console.error(`FATAL: 販売ステータスは all / selling / ended のいずれか (got: ${sellKey})`);
@@ -555,6 +570,17 @@ async function main() {
   if (!args.noDrive) {
     const folderId = (args.driveFolder || process.env.AITEM_DRIVE_FOLDER || DRIVE_FOLDER_DEFAULT).trim();
     const remote = (process.env.AITEM_DRIVE_REMOTE || DRIVE_REMOTE_DEFAULT).trim();
+    // 既定のDriveフォルダは既定テンプレート専用。別テンプレートの結果を同じ
+    // item.csv / stock.csv に上書きすると、中身の違うCSVが黙って入れ替わる。
+    // 別テンプレートを使うなら出力先も明示させる
+    const usingDefaultFolder = !args.driveFolder && !process.env.AITEM_DRIVE_FOLDER;
+    if (usingDefaultFolder && templateName !== TEMPLATE_DEFAULT) {
+      console.error(`FATAL: テンプレート「${templateName}」の結果を既定のDriveフォルダへは出せません`);
+      console.error(`  既定フォルダは「${TEMPLATE_DEFAULT}」専用です (同じ item.csv/stock.csv を別の中身で上書きしてしまうため)`);
+      console.error('  --drive-folder <別フォルダID> で出力先を指定するか、--no-drive を付けてください');
+      process.exitCode = 2;
+      return;
+    }
     if (!DRIVE_ID_RE.test(folderId)) {
       console.error(`FATAL: DriveフォルダIDが不正です (${folderId})`);
       process.exitCode = 2;
