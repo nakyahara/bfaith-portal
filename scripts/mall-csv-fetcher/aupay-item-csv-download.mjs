@@ -22,28 +22,40 @@
  *        AITEM_NOTIFY        1=失敗時にGChat通知 (既定0。定期実行に載せるときだけ1)
  */
 
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, rename, unlink, open } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, basename } from 'node:path';
 import { openAupayContext, ensureWowmaLogin, gotoWowmaPage, WOWMA_BASE } from './lib-aupay-login.mjs';
 import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IDX_URL = `${WOWMA_BASE}productCsvDl/index`;
 const OUT_DIR_DEFAULT = join(__dirname, 'downloads', 'aupay-item-csv');
+const LOCK_PATH = join(__dirname, 'logs', 'aupay-item-csv.lock');
 
 // 販売ステータス radio csvDlSellStsKbn: 9=全て 1=販売中 2=販売終了
 const SELL_STATUS = { all: '9', selling: '1', ended: '2' };
 const JOB_TIMEOUT_MS = 10 * 60 * 1000;
+const LOCK_STALE_MS = 30 * 60 * 1000;
+// 処理状況テーブルの1ページ表示件数 (画面既定50)。これに近づいたらページングで
+// 自ジョブ行が押し出される恐れがあるため警告する
+const STATUS_PAGE_SIZE = 50;
+// サーバー由来のファイル名をそのままパスに使わないための許可パターン
+const SAFE_FILE_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]*\.csv$/;
 
 function parseArgs(argv) {
   const a = { out: null, template: null, sellStatus: null, help: false };
+  const need = (i, k) => {
+    const v = argv[i];
+    if (v === undefined || v.startsWith('--')) throw new Error(`${k} には値が必要です`);
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
-    if (k === '--out') a.out = argv[++i];
-    else if (k === '--template') a.template = argv[++i];
-    else if (k === '--sell-status') a.sellStatus = argv[++i];
+    if (k === '--out') a.out = need(++i, '--out');
+    else if (k === '--template') a.template = need(++i, '--template');
+    else if (k === '--sell-status') a.sellStatus = need(++i, '--sell-status');
     else if (k === '--help' || k === '-h') a.help = true;
     else throw new Error(`不明な引数: ${k} (--out / --template / --sell-status)`);
   }
@@ -52,8 +64,34 @@ function parseArgs(argv) {
 
 function jstStamp() {
   const d = new Date(Date.now() + 9 * 3600 * 1000).toISOString();
-  return d.slice(0, 19).replace(/[-:]/g, '').replace('T', '-'); // YYYYMMDD-HHMMSS (JST)
+  return d.slice(0, 23).replace(/[-:.]/g, '').replace('T', '-'); // YYYYMMDD-HHMMSSmmm (JST)
 }
+
+/** 多重起動ロック (自分自身の同時実行が固定名ファイルを相互に上書きするのを防ぐ) */
+async function acquireLock() {
+  await mkdir(dirname(LOCK_PATH), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fh = await open(LOCK_PATH, 'wx');
+      await fh.writeFile(JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+      await fh.close();
+      return;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const { statSync } = await import('node:fs');
+      let age = Infinity;
+      try { age = Date.now() - statSync(LOCK_PATH).mtimeMs; } catch { /* 直前に消えた */ }
+      if (age > LOCK_STALE_MS) {
+        console.warn(`  ⚠ 古いロック (${Math.round(age / 60000)}分前) を破棄します`);
+        await unlink(LOCK_PATH).catch(() => {});
+        continue;
+      }
+      throw new Error(`LOCKED: 別の実行が進行中です (${LOCK_PATH})。終わってから再実行してください`);
+    }
+  }
+  throw new Error(`LOCKED: ロックを取得できません (${LOCK_PATH})`);
+}
+const releaseLock = () => unlink(LOCK_PATH).catch(() => {});
 
 /** 処理状況テーブルを読む。[{fileName, acceptedAt, template, statusText, downloadId, href}] */
 async function readStatusRows(page) {
@@ -109,15 +147,27 @@ async function resolveTemplate(page, wantName) {
 /**
  * フォームに条件を反映し、画面JSと同じ hidden (insertproc) を足して serialize → POST。
  * DOMのFormDataをそのまま送るので hidden/Struts の `_name=on` 群も画面と完全一致する。
+ * 画面submitとの等価性が崩れる条件 (ファイル項目・非文字列値・insertprocの既存) は明示的に弾く。
  */
 async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) {
-  const body = await page.evaluate((cfg) => {
+  const built = await page.evaluate((cfg) => {
     const f = document.querySelector('form#_main_frm');
     if (!f) return { error: 'form#_main_frm が無い' };
+    const enc = f.getAttribute('enctype');
+    if (enc && !/urlencoded/i.test(enc)) return { error: `enctype が想定外 (${enc})` };
+    if (f.querySelector('input[type=file]')) {
+      return { error: 'フォームにファイル項目がある — urlencodedシリアライズでは等価にならない' };
+    }
+    if (f.querySelector('[name=insertproc]')) {
+      return { error: '画面側に既に insertproc がある — 二重付与になるため中断' };
+    }
     const sel = (n) => f.querySelector(`select[name=${n}]`);
     if (!sel('productCsvDlType') || !sel('csvDlUserTmpltName')) return { error: 'ダウンロードタイプ/テンプレートのselectが無い' };
     sel('productCsvDlType').value = '2';                 // オリジナルテンプレートでダウンロード
     sel('csvDlUserTmpltName').value = cfg.templateId;
+    if (sel('csvDlUserTmpltName').value !== cfg.templateId) {
+      return { error: `テンプレートID ${cfg.templateId} がselectに無い` };
+    }
     const lf = f.querySelector('input[name=csvLinefeedDelFlg]');
     if (lf) lf.checked = cfg.linefeedDel;
     let sellHit = false;
@@ -126,7 +176,12 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
       if (r.checked) sellHit = true;
     }
     if (!sellHit) return { error: `販売ステータス ${cfg.sellStatusValue} のradioが無い` };
-    for (const r of f.querySelectorAll('input[name=csvDLCondType]')) r.checked = (r.value === '0'); // 対象商品=指定なし
+    let condHit = false;
+    for (const r of f.querySelectorAll('input[name=csvDLCondType]')) {
+      r.checked = (r.value === '0');                     // 対象商品=指定なし
+      if (r.checked) condHit = true;
+    }
+    if (!condHit) return { error: '対象商品「指定なし」のradioが無い' };
     for (const n of ['csvDLCondLotNo', 'csvDLCondProductCd', 'csvDLCondMgtId']) {
       const el = f.querySelector(`textarea[name=${n}]`);
       if (el) el.value = '';
@@ -136,8 +191,13 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
     hid.type = 'hidden'; hid.name = 'insertproc'; hid.value = 'insertproc';
     f.appendChild(hid);
     const p = new URLSearchParams();
-    for (const [k, v] of new FormData(f).entries()) if (typeof v === 'string') p.append(k, v);
+    const nonString = [];
+    for (const [k, v] of new FormData(f).entries()) {
+      if (typeof v === 'string') p.append(k, v);
+      else nonString.push(k);
+    }
     hid.remove();
+    if (nonString.length) return { error: `非文字列のフォーム項目がある (${nonString.join(', ')})` };
     // 送信直前の読み戻し検証 (画面が別の値に矯正していないか)
     return {
       body: p.toString(),
@@ -149,8 +209,8 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
     };
   }, { templateId, sellStatusValue, linefeedDel });
 
-  if (body.error) throw new Error(`FORM_VERIFY: ${body.error} — 画面仕様変更の疑い`);
-  const e = body.echo;
+  if (built.error) throw new Error(`FORM_VERIFY: ${built.error} — 画面仕様変更の疑い`);
+  const e = built.echo;
   if (e.type !== '2' || e.tmpl !== templateId || e.sell !== sellStatusValue || e.cond !== '0' || e.insertproc !== 'insertproc') {
     throw new Error(`FORM_VERIFY: 送信値の読み戻しが不一致 ${JSON.stringify(e)}`);
   }
@@ -158,44 +218,85 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
 
   const res = await page.request.post(IDX_URL, {
     headers: { 'content-type': 'application/x-www-form-urlencoded', referer: IDX_URL },
-    data: body.body, maxRedirects: 0, timeout: 60000,
+    data: built.body, maxRedirects: 0, timeout: 60000,
   });
   if (res.status() !== 302) {
-    throw new Error(`CREATE_FAILED: 「CSVデータ作成」POST が HTTP ${res.status()} (302=受理 が来ない)`);
+    const peek = (await res.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200);
+    throw new Error(`CREATE_FAILED: 「CSVデータ作成」POST が HTTP ${res.status()} (302=受理 が来ない)${peek ? ` body="${peek}"` : ''}`);
   }
+  // jobId は自ジョブbindの上限として必須。取れないなら誤ダウンロードを避けて即中断
   const loc = res.headers()['location'] || '';
-  const jobId = (loc.match(/\/productCsvDl\/index\/(\d+)/) || [])[1] || null;
-  console.log(`  [create] 受理 (302) jobId=${jobId || '(不明)'}`);
-  return jobId;
+  const m = loc.match(/\/productCsvDl\/index\/(\d+)(?:[/?#]|$)/);
+  if (!m) {
+    throw new Error(`CREATE_VERIFY: 302のLocationからjobIdを取得できず (location="${loc}") — 画面仕様変更の疑い`);
+  }
+  console.log(`  [create] 受理 (302) jobId=${m[1]}`);
+  return m[1];
 }
 
-/** 自ジョブの行が全部終端になるまでポーリング */
-async function waitForJob(page, beforeKeys, jobId) {
+/**
+ * 自ジョブの行が全部終端になるまでポーリングし、自ジョブ行だけを返す。
+ *
+ * bindは2条件のAND: ①submit前に無かった行 ②downloadIdが (submit前の最大id, jobId] の範囲内。
+ * ②があるので、並行して他者が作成したジョブの行は範囲外として除外される
+ * (ファイル名が item.csv/stock.csv 固定で論理日付を持たないため、行の同定はidが頼り)。
+ */
+async function waitForJob(page, { beforeKeys, maxIdBefore, jobId }) {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
-  let mine = [];
+  const jobIdNum = Number(jobId);
+  let fresh = [];
+  let unknownStreak = 0;
   for (let i = 0; ; i++) {
     await page.waitForTimeout(i === 0 ? 5000 : 10000);
     await gotoWowmaPage(page, IDX_URL, '一括商品CSVダウンロード');
     const rows = await readStatusRows(page);
     if (rows === null) throw new Error('POLL_FAILED: 処理状況テーブルが見つからず (画面仕様変更の疑い)');
-    mine = rows.filter((r) => !beforeKeys.has(rowKey(r)));
-    if (mine.length === 0) {
+    if (rows.length >= STATUS_PAGE_SIZE) {
+      console.warn(`  ⚠ 処理状況が ${rows.length} 行 — ページングで自ジョブ行が押し出される恐れ (表示件数を増やすか日を置いて再実行)`);
+    }
+    fresh = rows.filter((r) => !beforeKeys.has(rowKey(r)));
+    if (fresh.length === 0) {
       if (Date.now() > deadline) throw new Error('JOB_BIND: 作成を受理されたのに処理状況へ行が現れない');
       console.log('  [poll] 行の出現待ち ...');
       continue;
     }
-    const st = mine.map((r) => classify(r.statusText));
-    const errored = mine.filter((r, k) => st[k] === 'error');
+    const st = fresh.map((r) => classify(r.statusText));
+    const errored = fresh.filter((r, k) => st[k] === 'error');
     if (errored.length) throw new Error(`JOB_FAILED: 処理エラー (${errored.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
+    if (st.includes('unknown')) {
+      // 新しい失敗状態やログイン画面の混入をタイムアウトまで放置しない
+      if (++unknownStreak >= 3) {
+        const u = fresh.filter((r, k) => st[k] === 'unknown').map((r) => `${r.fileName}:"${r.statusText}"`).join(', ');
+        throw new Error(`POLL_UNKNOWN_STATUS: 解釈できないステータスが続いています (${u}) url=${page.url()} — 画面仕様変更の疑い`);
+      }
+    } else {
+      unknownStreak = 0;
+    }
     if (st.every((s) => s === 'done' || s === 'no_data')) break;
     if (Date.now() > deadline) {
-      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${mine.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
+      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${fresh.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
     }
-    console.log(`  [poll] ${mine.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
+    console.log(`  [poll] ${fresh.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
   }
-  // 302 Location の jobId が自ジョブ行に含まれるか (bind取り違えの検算)
-  if (jobId && mine.some((r) => r.downloadId) && !mine.some((r) => r.downloadId === jobId)) {
-    console.warn(`  ⚠ 受理jobId ${jobId} が自ジョブ行 (${mine.map((r) => r.downloadId).join(',')}) に無い — 並行操作の疑い`);
+
+  // downloadId で自ジョブに絞る (完了行は必ずidを持つ)
+  const mine = [];
+  const foreign = [];
+  for (const r of fresh) {
+    if (classify(r.statusText) === 'no_data') { mine.push(r); continue; } // データなしはid無しが正常
+    const id = Number(r.downloadId);
+    if (!Number.isFinite(id)) {
+      throw new Error(`JOB_BIND: 完了行 ${r.fileName} からダウンロードIDを取得できず (href="${r.href}")`);
+    }
+    if (id <= jobIdNum && (maxIdBefore === null || id > maxIdBefore)) mine.push(r);
+    else foreign.push(`${r.fileName}#${id}`);
+  }
+  if (foreign.length) {
+    console.warn(`  ⚠ 自ジョブ範囲 (${maxIdBefore ?? '-'} < id <= ${jobIdNum}) 外の新規行を除外: ${foreign.join(', ')} — 並行して別の作成が走った模様`);
+  }
+  if (mine.length === 0) throw new Error(`JOB_BIND: 自ジョブの行を特定できず (新規 ${fresh.length} 行はすべて範囲外)`);
+  if (!mine.some((r) => r.downloadId === jobId)) {
+    console.warn(`  ⚠ 受理jobId ${jobId} 自体が自ジョブ行 (${mine.map((r) => r.downloadId).join(',')}) に無い`);
   }
   console.log(`  [poll] 完了 (${mine.length}件: ${mine.map((r) => r.fileName).join(', ')})`);
   return mine;
@@ -217,8 +318,63 @@ async function downloadRow(page, row) {
   if (!/(^|,)"?(lotNumber|itemCode|ctrlCol)"?(,|$)/.test(head)) {
     throw new Error(`DL_VERIFY: ${row.fileName} のヘッダに lotNumber/itemCode/ctrlCol が無い (head="${head.slice(0, 120)}")`);
   }
+  // 引用符内の改行は AITEM_LINEFEED_DEL=1 (既定) で除去済み。0 のときは行数が概算になる
   const lines = buf.toString('latin1').split(/\r?\n/).filter((l) => l.length > 0).length;
   return { buf, header: head, dataRows: Math.max(0, lines - 1) };
+}
+
+async function run(page, { templateName, sellKey, linefeedDel, outDir }) {
+  await ensureWowmaLogin(page);
+  await gotoWowmaPage(page, IDX_URL, '一括商品CSVダウンロード');
+
+  const tmpl = await resolveTemplate(page, templateName);
+  console.log(`  [template] ${tmpl.name} (id=${tmpl.id})`);
+
+  const before = await readStatusRows(page);
+  if (before === null) throw new Error('FORM_VERIFY: 処理状況テーブルが見つからず (画面仕様変更の疑い)');
+  const beforeKeys = new Set(before.map(rowKey));
+  const beforeIds = before.map((r) => Number(r.downloadId)).filter(Number.isFinite);
+  const maxIdBefore = beforeIds.length ? Math.max(...beforeIds) : null;
+  console.log(`  [status] 既存 ${before.length} 行 (最大id=${maxIdBefore ?? '-'})`);
+
+  const jobId = await submitCreate(page, { templateId: tmpl.id, sellStatusValue: SELL_STATUS[sellKey], linefeedDel });
+  const mine = await waitForJob(page, { beforeKeys, maxIdBefore, jobId });
+
+  // ── 全ファイルをDL+検証してから公開する (item だけ新版 / stock は旧版、を作らない) ──
+  const staged = [];
+  for (const row of mine) {
+    if (classify(row.statusText) === 'no_data') {
+      console.log(`  [empty] ${row.fileName}: ${row.statusText} — 保存スキップ`);
+      continue;
+    }
+    if (!row.href) throw new Error(`DL_FAILED: ${row.fileName} は完了だがダウンロードリンクなし`);
+    // サーバー由来のファイル名をそのままパスに使わない
+    const safeName = basename(row.fileName);
+    if (!SAFE_FILE_NAME.test(safeName)) {
+      throw new Error(`DL_VERIFY: 想定外のファイル名 "${row.fileName}" — 保存先逸脱を避けて中断`);
+    }
+    const { buf, header, dataRows } = await downloadRow(page, row);
+    staged.push({ name: safeName, base: safeName.replace(/\.csv$/i, ''), buf, header, dataRows });
+  }
+  if (staged.length === 0) throw new Error('RESULT_EMPTY: 保存できたファイルが1本もない (全てデータなし)');
+
+  const stamp = jstStamp();
+  const saved = [];
+  for (const f of staged) {
+    const dest = join(outDir, `aupay_${f.base}_${stamp}.csv`);
+    await writeFile(dest, f.buf);                       // 履歴 (一意名なので上書き衝突しない)
+    const latest = join(outDir, `${f.base}.csv`);        // 固定名 (下流ツールが参照しやすいように)
+    const tmp = `${latest}.tmp-${process.pid}`;
+    await writeFile(tmp, f.buf);
+    await rename(tmp, latest);                          // 差し替えは atomic に
+    const sha = createHash('sha256').update(f.buf).digest('hex').slice(0, 12);
+    console.log(`  ✅ ${f.name}: ${f.dataRows}行 ${f.buf.length}bytes sha=${sha}`);
+    console.log(`     ${dest}`);
+    console.log(`     ${latest} (固定名)`);
+    console.log(`     列: ${f.header.slice(0, 200)}${f.header.length > 200 ? ' …' : ''}`);
+    saved.push({ file: f.name, rows: f.dataRows });
+  }
+  return saved;
 }
 
 async function main() {
@@ -234,7 +390,6 @@ async function main() {
     console.log('使い方: node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs [--out <dir>] [--template <名前>] [--sell-status all|selling|ended]');
     return;
   }
-  const runLog = initRunLog('aupay-item-csv');
   const templateName = args.template || process.env.AITEM_TEMPLATE || 'ヤフー在庫アップ後確認';
   const sellKey = (args.sellStatus || process.env.AITEM_SELL_STATUS || 'selling').trim();
   if (!SELL_STATUS[sellKey]) {
@@ -246,78 +401,55 @@ async function main() {
   const linefeedDel = (process.env.AITEM_LINEFEED_DEL ?? '1') === '1';
   const notify = process.env.AITEM_NOTIFY === '1';
 
-  await mkdir(outDir, { recursive: true });
-  console.log('=== au PAY 一括商品CSVダウンロード ===');
-  console.log(`テンプレート: ${templateName} / 販売ステータス: ${sellKey} / 改行除去: ${linefeedDel ? 'ON' : 'OFF'}`);
-  console.log(`保存先: ${outDir}`);
+  let runLog = { logPath: null };
+  let locked = false;
+  let context = null;
+  let page = null;
 
-  let context;
-  const saved = [];
-  try {
-    context = await openAupayContext();
-  } catch (e) {
-    console.error(`FATAL: ブラウザ起動失敗: ${e.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  const page = context.pages()[0] || await context.newPage();
-  page.on('dialog', (d) => { console.log(`  [dialog] ${d.message()}`); d.accept().catch(() => {}); });
-
-  try {
-    await ensureWowmaLogin(page);
-    await gotoWowmaPage(page, IDX_URL, '一括商品CSVダウンロード');
-
-    const tmpl = await resolveTemplate(page, templateName);
-    console.log(`  [template] ${tmpl.name} (id=${tmpl.id})`);
-
-    const before = await readStatusRows(page);
-    if (before === null) throw new Error('FORM_VERIFY: 処理状況テーブルが見つからず (画面仕様変更の疑い)');
-    const beforeKeys = new Set(before.map(rowKey));
-    console.log(`  [status] 既存 ${before.length} 行`);
-
-    const jobId = await submitCreate(page, { templateId: tmpl.id, sellStatusValue: SELL_STATUS[sellKey], linefeedDel });
-    const mine = await waitForJob(page, beforeKeys, jobId);
-
-    const stamp = jstStamp();
-    for (const row of mine) {
-      if (classify(row.statusText) === 'no_data') {
-        console.log(`  [empty] ${row.fileName}: ${row.statusText} — 保存スキップ`);
-        continue;
-      }
-      if (!row.href) throw new Error(`DL_FAILED: ${row.fileName} は完了だがダウンロードリンクなし`);
-      const { buf, header, dataRows } = await downloadRow(page, row);
-      const base = row.fileName.replace(/\.csv$/i, '');
-      const dest = join(outDir, `aupay_${base}_${stamp}.csv`);
-      await writeFile(dest, buf);
-      const latest = join(outDir, `${base}.csv`); // 固定名 (下流ツールが参照しやすいように毎回上書き)
-      await writeFile(latest, buf);
-      const sha = createHash('sha256').update(buf).digest('hex').slice(0, 12);
-      console.log(`  ✅ ${row.fileName}: ${dataRows}行 ${buf.length}bytes sha=${sha}`);
-      console.log(`     ${dest}`);
-      console.log(`     ${latest} (固定名)`);
-      console.log(`     列: ${header.slice(0, 200)}${header.length > 200 ? ' …' : ''}`);
-      saved.push({ file: row.fileName, rows: dataRows, bytes: buf.length, path: dest });
-    }
-
-    if (saved.length === 0) throw new Error('RESULT_EMPTY: 保存できたファイルが1本もない (全てデータなし)');
-    console.log(`\n=== 完了: ${saved.map((s) => `${s.file}(${s.rows}行)`).join(' / ')} ===`);
-    console.log('※ CSVは Shift_JIS / CRLF。Excelはそのまま開けます');
-  } catch (err) {
+  const fail = async (err, phase) => {
     console.error(`\n⚠️ ${err.message}`);
-    const shot = join(__dirname, 'spike-output', 'aupay_item_csv_error.png');
-    await mkdir(dirname(shot), { recursive: true }).catch(() => {});
-    await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+    let shot = null;
+    if (page) {
+      shot = join(__dirname, 'spike-output', `aupay_item_csv_error_${process.pid}.png`);
+      await mkdir(dirname(shot), { recursive: true }).catch(() => {});
+      const ok = await page.screenshot({ path: shot, fullPage: true }).then(() => true).catch(() => false);
+      if (!ok) shot = null;
+    }
     if (notify) {
       await sendGChat(buildErrorReport({
         mall: 'aupay', logPath: runLog.logPath,
-        failures: [{ reportType: `一括商品CSV (${templateName})`, error: err.message, url: page.url(), screenshot: shot }],
+        failures: [{ reportType: `一括商品CSV (${templateName}/${phase})`, error: err.message, url: page ? page.url() : '', screenshot: shot }],
         repro: 'node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs',
       }), 'aupay-item-csv').catch(() => {});
     }
     process.exitCode = String(err.message).startsWith('AUTH_') || String(err.message).startsWith('2FA_') ? 3 : 1;
+  };
+
+  try {
+    runLog = initRunLog('aupay-item-csv');
+    console.log('=== au PAY 一括商品CSVダウンロード ===');
+    console.log(`テンプレート: ${templateName} / 販売ステータス: ${sellKey} / 改行除去: ${linefeedDel ? 'ON' : 'OFF'}`);
+    console.log(`保存先: ${outDir}`);
+    await acquireLock();
+    locked = true;
+    await mkdir(outDir, { recursive: true });
+    context = await openAupayContext();
+    page = context.pages()[0] || await context.newPage();
+    page.on('dialog', (d) => { console.log(`  [dialog] ${d.message()}`); d.accept().catch(() => {}); });
+
+    const saved = await run(page, { templateName, sellKey, linefeedDel, outDir });
+    console.log(`\n=== 完了: ${saved.map((s) => `${s.file}(${s.rows}行)`).join(' / ')} ===`);
+    console.log('※ CSVは Shift_JIS / CRLF。Excelはそのまま開けます');
+  } catch (err) {
+    await fail(err, context ? '実行' : '起動');
   } finally {
-    await context.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (locked) await releaseLock();
   }
 }
 
-main();
+main().catch((err) => {
+  // 最終防衛線 (通知やスクショの経路自体が壊れた場合でも無音終了させない)
+  console.error(`FATAL(uncaught): ${err && err.stack ? err.stack : err}`);
+  process.exitCode = 1;
+});
