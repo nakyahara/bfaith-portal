@@ -224,24 +224,39 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
     const peek = (await res.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 200);
     throw new Error(`CREATE_FAILED: 「CSVデータ作成」POST が HTTP ${res.status()} (302=受理 が来ない)${peek ? ` body="${peek}"` : ''}`);
   }
-  // jobId は自ジョブbindの上限として必須。取れないなら誤ダウンロードを避けて即中断
+  // jobId は自ジョブbindの上限として必須。取れないなら誤ダウンロードを避けて即中断。
+  // 部分一致だと別オリジンや余計なパスを含むLocationも通ってしまうので、
+  // origin と pathname 全体をアンカーして検証する
   const loc = res.headers()['location'] || '';
-  const m = loc.match(/\/productCsvDl\/index\/(\d+)(?:[/?#]|$)/);
-  if (!m) {
+  const expected = new URL(IDX_URL);
+  let jobId = null;
+  try {
+    const u = new URL(loc, IDX_URL);
+    if (u.origin === expected.origin) {
+      const m = u.pathname.match(new RegExp(`^${expected.pathname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(\\d+)$`));
+      if (m) jobId = m[1];
+    }
+  } catch { /* 不正URL → jobId=null で下の検証に落ちる */ }
+  if (!jobId) {
     throw new Error(`CREATE_VERIFY: 302のLocationからjobIdを取得できず (location="${loc}") — 画面仕様変更の疑い`);
   }
-  console.log(`  [create] 受理 (302) jobId=${m[1]}`);
-  return m[1];
+  console.log(`  [create] 受理 (302) jobId=${jobId}`);
+  return jobId;
 }
 
 /**
  * 自ジョブの行が全部終端になるまでポーリングし、自ジョブ行だけを返す。
  *
- * bindは2条件のAND: ①submit前に無かった行 ②downloadIdが (submit前の最大id, jobId] の範囲内。
- * ②があるので、並行して他者が作成したジョブの行は範囲外として除外される
+ * bindは3条件のAND: ①submit前に無かった行 ②テンプレート名が自分のもの
+ * ③downloadIdが (submit前の最大id, jobId] の範囲内。
+ * ③があるので、並行して他者が作成したジョブの行は範囲外として除外される
  * (ファイル名が item.csv/stock.csv 固定で論理日付を持たないため、行の同定はidが頼り)。
+ * ②は「完了するまでidが振られない」ポーリング中の唯一の識別子で、
+ * 別テンプレートの並行ジョブのエラー/未完了に巻き込まれるのを防ぐ。
+ * 同一テンプレートで並行作成された場合だけは分離できないので fail-closed に倒す
+ * (自ジョブでない失敗でこちらも止まる。誤ったCSVを掴むよりは安全)。
  */
-async function waitForJob(page, { beforeKeys, maxIdBefore, jobId }) {
+async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }) {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
   const jobIdNum = Number(jobId);
   let fresh = [];
@@ -254,7 +269,12 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId }) {
     if (rows.length >= STATUS_PAGE_SIZE) {
       console.warn(`  ⚠ 処理状況が ${rows.length} 行 — ページングで自ジョブ行が押し出される恐れ (表示件数を増やすか日を置いて再実行)`);
     }
-    fresh = rows.filter((r) => !beforeKeys.has(rowKey(r)));
+    const newRows = rows.filter((r) => !beforeKeys.has(rowKey(r)));
+    fresh = newRows.filter((r) => r.template === templateName);
+    const otherTmpl = newRows.filter((r) => r.template !== templateName);
+    if (otherTmpl.length) {
+      console.warn(`  ⚠ 別テンプレートの新規行を無視: ${otherTmpl.map((r) => `${r.fileName}(${r.template})`).join(', ')}`);
+    }
     if (fresh.length === 0) {
       if (Date.now() > deadline) throw new Error('JOB_BIND: 作成を受理されたのに処理状況へ行が現れない');
       console.log('  [poll] 行の出現待ち ...');
@@ -283,7 +303,12 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId }) {
   const mine = [];
   const foreign = [];
   for (const r of fresh) {
-    if (classify(r.statusText) === 'no_data') { mine.push(r); continue; } // データなしはid無しが正常
+    if (classify(r.statusText) === 'no_data') {
+      // データなし行はidが振られないので範囲判定できない。同一テンプレートの
+      // 並行ジョブの行を拾う可能性があるが、DL対象にはしないので実害はない
+      mine.push(r);
+      continue;
+    }
     const id = Number(r.downloadId);
     if (!Number.isFinite(id)) {
       throw new Error(`JOB_BIND: 完了行 ${r.fileName} からダウンロードIDを取得できず (href="${r.href}")`);
@@ -338,7 +363,7 @@ async function run(page, { templateName, sellKey, linefeedDel, outDir }) {
   console.log(`  [status] 既存 ${before.length} 行 (最大id=${maxIdBefore ?? '-'})`);
 
   const jobId = await submitCreate(page, { templateId: tmpl.id, sellStatusValue: SELL_STATUS[sellKey], linefeedDel });
-  const mine = await waitForJob(page, { beforeKeys, maxIdBefore, jobId });
+  const mine = await waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName: tmpl.name });
 
   // ── 全ファイルをDL+検証してから公開する (item だけ新版 / stock は旧版、を作らない) ──
   const staged = [];
