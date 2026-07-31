@@ -59,6 +59,7 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import shippingLogRouter from './apps/shipping-log/router.js';
+import siteProductsRouter from './apps/site-products/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
@@ -1204,6 +1205,8 @@ app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
 // 出荷実績ログ (apps/shipping-log): 出荷_no 掃除 GAS からの伝票取込。Bearer fail-closed のみ (session なし)
 app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
+// コーポレートサイト向け商品スナップショット (apps/site-products): 専用read token・読み取り専用 (session なし)
+app.use('/apps/site-products/api', siteProductsRouter);
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
