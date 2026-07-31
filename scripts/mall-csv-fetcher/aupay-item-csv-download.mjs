@@ -244,29 +244,43 @@ async function submitCreate(page, { templateId, sellStatusValue, linefeedDel }) 
   return jobId;
 }
 
+/** 受付日時「YYYY/MM/DD HH:MM:SS」(JST) を epoch ms に。読めなければ null */
+function parseAcceptedAt(s) {
+  const m = String(s).match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const [, y, mo, d, h, mi, se] = m.map(Number);
+  return Date.UTC(y, mo - 1, d, h - 9, mi, se); // JST → UTC
+}
+
 /**
  * 自ジョブの行が全部終端になるまでポーリングし、自ジョブ行だけを返す。
  *
  * 行の同定が難しい理由: ファイル名は item.csv/stock.csv 固定で論理日付を持たず、
  * 画面はジョブ単位のIDを行に出さない。使える手掛かりは downloadId と受付日時だけ。
+ * 実測では 1ジョブ = 同一の受付日時 + 連番の downloadId (末尾が302で返る jobId)。
  *
- * 待ち合わせ (ポーリング中): 「submit前に無かった」×「テンプレート名が自分のもの」で絞る。
- *   完了までdownloadIdが振られないため、この2つがポーリング中に使える識別子。
- *   同一テンプレートの並行ジョブは混じり得るが、他人の失敗でこちらも止まる方向
- *   (fail-closed) なので危険はない。
+ * ①待ち合わせ対象の絞り込み (ポーリング中):
+ *   「submit前に無かった」×「テンプレート名が自分のもの」で候補を作り、受付日時でグループ化して
+ *   自ジョブのグループだけを待つ。グループの選び方は
+ *     (a) downloadId === jobId の行を含むグループ → 確定 (サーバーが自分に返したID)
+ *     (b) まだ (a) が出ていなければ、受付日時が自分のPOST時刻に最も近いグループ (許容±5分)
+ *     (c) それも決まらなければ候補全部 (fail-closed)
+ *   これで、同一テンプレートの並行ジョブのエラーや未完了に巻き込まれて
+ *   誤終了・タイムアウトすることがなくなる。
  *
- * 取得対象の確定 (完了後): **受付日時をアンカーにして厳密に絞る**。
- *   downloadId === jobId の行は、サーバーが自分のPOSTに返したIDそのものなので確実に自ジョブ。
- *   その行の受付日時と一致する行だけを自ジョブとする (1ジョブの複数ファイルは受付日時が同一)。
- *   これで「事前取得後・自ジョブ受付前」に割り込んだ同一テンプレートの並行ジョブ
- *   (id範囲だけでは弾けない) も、受付日時が違うので除外される。
+ * ②取得対象の確定 (完了後): downloadId === jobId の行をアンカーにし、
+ *   その受付日時と一致する行だけを自ジョブとする。これが最終的な正。
+ *   「事前取得後・自ジョブ受付前」に割り込んだ同一テンプレートの並行ジョブ
+ *   (id範囲だけでは弾けない) も受付日時が違うので除外される。
  *   同一秒に別ジョブが受け付けられた場合だけは原理的に分離できない。
  */
-async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }) {
+async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName, submitAtMs }) {
   const deadline = Date.now() + JOB_TIMEOUT_MS;
   const jobIdNum = Number(jobId);
-  let fresh = [];
+  const NEAR_MS = 5 * 60 * 1000;
+  let group = [];
   let unknownStreak = 0;
+
   for (let i = 0; ; i++) {
     await page.waitForTimeout(i === 0 ? 5000 : 10000);
     await gotoWowmaPage(page, IDX_URL, '一括商品CSVダウンロード');
@@ -276,7 +290,7 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }
       console.warn(`  ⚠ 処理状況が ${rows.length} 行 — ページングで自ジョブ行が押し出される恐れ (表示件数を増やすか日を置いて再実行)`);
     }
     const newRows = rows.filter((r) => !beforeKeys.has(rowKey(r)));
-    fresh = newRows.filter((r) => r.template === templateName);
+    const fresh = newRows.filter((r) => r.template === templateName);
     const otherTmpl = newRows.filter((r) => r.template !== templateName);
     if (otherTmpl.length) {
       console.warn(`  ⚠ 別テンプレートの新規行を無視: ${otherTmpl.map((r) => `${r.fileName}(${r.template})`).join(', ')}`);
@@ -286,55 +300,82 @@ async function waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName }
       console.log('  [poll] 行の出現待ち ...');
       continue;
     }
-    const st = fresh.map((r) => classify(r.statusText));
-    const errored = fresh.filter((r, k) => st[k] === 'error');
+
+    // 受付日時でグループ化 → 自ジョブのグループを選ぶ
+    const byAccepted = new Map();
+    for (const r of fresh) {
+      if (!byAccepted.has(r.acceptedAt)) byAccepted.set(r.acceptedAt, []);
+      byAccepted.get(r.acceptedAt).push(r);
+    }
+    const anchorRow = fresh.find((r) => r.downloadId === jobId);
+    let pickedAt = null;
+    if (anchorRow) {
+      pickedAt = anchorRow.acceptedAt;                                 // (a) 確定
+    } else if (byAccepted.size === 1) {
+      pickedAt = [...byAccepted.keys()][0];
+    } else {
+      let best = null;                                                 // (b) POST時刻に最も近い
+      for (const at of byAccepted.keys()) {
+        const ms = parseAcceptedAt(at);
+        if (ms === null) continue;
+        const diff = Math.abs(ms - submitAtMs);
+        if (diff <= NEAR_MS && (best === null || diff < best.diff)) best = { at, diff };
+      }
+      pickedAt = best ? best.at : null;
+    }
+    group = pickedAt === null ? fresh : byAccepted.get(pickedAt);      // (c) 決まらなければ全部
+    if (pickedAt !== null && byAccepted.size > 1) {
+      const others = [...byAccepted.keys()].filter((a) => a !== pickedAt);
+      console.warn(`  ⚠ 同一テンプレートの別ジョブ (受付 ${others.join(', ')}) は待ち合わせ対象から除外`);
+    }
+
+    const st = group.map((r) => classify(r.statusText));
+    const errored = group.filter((r, k) => st[k] === 'error');
     if (errored.length) throw new Error(`JOB_FAILED: 処理エラー (${errored.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
     if (st.includes('unknown')) {
       // 新しい失敗状態やログイン画面の混入をタイムアウトまで放置しない
       if (++unknownStreak >= 3) {
-        const u = fresh.filter((r, k) => st[k] === 'unknown').map((r) => `${r.fileName}:"${r.statusText}"`).join(', ');
+        const u = group.filter((r, k) => st[k] === 'unknown').map((r) => `${r.fileName}:"${r.statusText}"`).join(', ');
         throw new Error(`POLL_UNKNOWN_STATUS: 解釈できないステータスが続いています (${u}) url=${page.url()} — 画面仕様変更の疑い`);
       }
     } else {
       unknownStreak = 0;
     }
-    if (st.every((s) => s === 'done' || s === 'no_data')) break;
-    if (Date.now() > deadline) {
-      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${fresh.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
+    // 終端条件: 選んだグループが全部終端。ただし (b)(c) の推定グループの場合は、
+    // アンカーが出るまで待つ (自ジョブがまだ未完了なだけ、の可能性を潰す)
+    if (st.every((s) => s === 'done' || s === 'no_data')) {
+      if (anchorRow) break;
+      if (byAccepted.size === 1 && group.every((r) => classify(r.statusText) === 'no_data')) break; // 全てデータなし
+      console.log('  [poll] 受理jobIdの行が未出現 — 自ジョブの完了を待機中 ...');
     }
-    console.log(`  [poll] ${fresh.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
+    if (Date.now() > deadline) {
+      throw new Error(`JOB_TIMEOUT: ${Math.round(JOB_TIMEOUT_MS / 60000)}分待っても完了せず (${group.map((r) => `${r.fileName}:${r.statusText}`).join(', ')})`);
+    }
+    console.log(`  [poll] ${group.map((r) => `${r.fileName}=${r.statusText}`).join(' / ')}`);
   }
 
-  // 完了行は必ずidを持つ。まずid範囲で粗く絞る
-  const inRange = [];
-  const outOfRange = [];
-  for (const r of fresh) {
-    if (classify(r.statusText) === 'no_data') continue; // id無し。アンカー確定後に受付日時で拾う
+  // ── 取得対象の確定 ──
+  const anchor = group.find((r) => r.downloadId === jobId);
+  if (!anchor) {
+    // 自ジョブのファイルが全部「データなし」の場合。DL対象が無いだけなので
+    // 空で返し、呼び元の RESULT_EMPTY に委ねる (他ジョブのCSVは絶対に掴まない)
+    console.warn(`  ⚠ 受理jobId ${jobId} の行が無い — DL対象なしとして扱います`);
+    return [];
+  }
+  const mine = [];
+  const dropped = [];
+  for (const r of group) {
+    if (r.acceptedAt !== anchor.acceptedAt) { dropped.push(`${r.fileName}@${r.acceptedAt}`); continue; }
+    if (classify(r.statusText) === 'no_data') { mine.push(r); continue; }  // id無しが正常
     const id = Number(r.downloadId);
     if (!Number.isFinite(id)) {
       throw new Error(`JOB_BIND: 完了行 ${r.fileName} からダウンロードIDを取得できず (href="${r.href}")`);
     }
-    if (id <= jobIdNum && (maxIdBefore === null || id > maxIdBefore)) inRange.push(r);
-    else outOfRange.push(r);
+    if (id <= jobIdNum && (maxIdBefore === null || id > maxIdBefore)) mine.push(r);
+    else dropped.push(`${r.fileName}#${id}`);
   }
-  if (outOfRange.length) {
-    console.warn(`  ⚠ 自ジョブ範囲 (${maxIdBefore ?? '-'} < id <= ${jobIdNum}) 外の新規行を除外: ${outOfRange.map((r) => `${r.fileName}#${r.downloadId}`).join(', ')} — 並行して別の作成が走った模様`);
-  }
-
-  // アンカー = downloadId が jobId そのものの行 (サーバーが自分に返したID = 確実に自ジョブ)。
-  // その受付日時と一致する行だけを自ジョブとする
-  const anchor = inRange.find((r) => r.downloadId === jobId);
-  if (!anchor) {
-    // 自ジョブのファイルが全部「データなし」なら起こり得る。DL対象が無いだけなので
-    // 空で返し、呼び元の RESULT_EMPTY に委ねる (他ジョブのCSVは絶対に掴まない)
-    console.warn(`  ⚠ 受理jobId ${jobId} の行が見つからず — DL対象なしとして扱います (id: ${inRange.map((r) => r.downloadId).join(',') || 'なし'})`);
-    return [];
-  }
-  const candidates = [...inRange, ...fresh.filter((r) => classify(r.statusText) === 'no_data')];
-  const mine = candidates.filter((r) => r.acceptedAt === anchor.acceptedAt);
-  const dropped = candidates.filter((r) => r.acceptedAt !== anchor.acceptedAt);
   if (dropped.length) {
-    console.warn(`  ⚠ 受付日時が自ジョブ (${anchor.acceptedAt}) と違う新規行を除外: ${dropped.map((r) => `${r.fileName}@${r.acceptedAt}`).join(', ')}`);
+    console.warn(`  ⚠ 自ジョブ (受付 ${anchor.acceptedAt} / ${maxIdBefore ?? '-'} < id <= ${jobIdNum}) に合わない行を除外: ${dropped.join(', ')}`);
   }
   console.log(`  [poll] 完了 (${mine.length}件: ${mine.map((r) => r.fileName).join(', ')} / 受付 ${anchor.acceptedAt})`);
   return mine;
@@ -375,8 +416,9 @@ async function run(page, { templateName, sellKey, linefeedDel, outDir }) {
   const maxIdBefore = beforeIds.length ? Math.max(...beforeIds) : null;
   console.log(`  [status] 既存 ${before.length} 行 (最大id=${maxIdBefore ?? '-'})`);
 
+  const submitAtMs = Date.now();
   const jobId = await submitCreate(page, { templateId: tmpl.id, sellStatusValue: SELL_STATUS[sellKey], linefeedDel });
-  const mine = await waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName: tmpl.name });
+  const mine = await waitForJob(page, { beforeKeys, maxIdBefore, jobId, templateName: tmpl.name, submitAtMs });
 
   // ── 全ファイルをDL+検証してから公開する (item だけ新版 / stock は旧版、を作らない) ──
   const staged = [];
