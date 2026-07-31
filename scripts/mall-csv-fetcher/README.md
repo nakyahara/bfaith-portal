@@ -221,8 +221,14 @@ node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs --no-drive   # ロー�
 固定名の2本を rclone で Google ドライブへ上げる (miniPCにGドライブは無いのでrclone一択)。
 `copyto` は同名ファイルの中身だけ差し替えるので **DriveのファイルIDは変わらない** —
 共有リンクやシートの参照が生きたままになる (2026-07-31に実測確認: `Copied (replaced existing)`、
-id と createdTime はそのまま、modifiedTime だけ更新)。`--checksum` により中身が前回と同一なら
-転送自体をスキップする。フォルダIDは `AITEM_DRIVE_FOLDER` / `--drive-folder` で変更可。
+id と createdTime はそのまま、modifiedTime だけ更新)。
+
+**`--ignore-times` で中身が前回と同一でも必ず転送する。** 商品マスタは在庫と違って
+何日も中身が変わらないため、転送をスキップするとDrive上の更新日時が前回のまま残り、
+「item.csv だけ更新されてない?」と毎回不安になる (実際に発生)。550KB程度の転送で
+「更新日時 = 最後に実行した時刻」が保証される方が価値が高い。
+
+フォルダIDは `AITEM_DRIVE_FOLDER` / `--drive-folder` で変更可。
 
 実測した画面仕様 (2026-07-31):
 
