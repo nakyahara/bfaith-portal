@@ -103,10 +103,15 @@ export async function gotoStorePage(page, url, label = url) {
   await page.waitForTimeout(1500);
 
   const finalHost = safeHost(page.url());
-  if (/login\.yahoo\.co\.jp|login\.bizmanager/.test(finalHost)) {
+  // ⚠️2026-07-25 以降、セッション切れの飛び先が LINEヤフー Business ID (account.line.biz) に
+  // 変わった。これを 2FA_REQUIRED として扱わないと「AUTH_VERIFY: 認証済み証拠を確認できず」
+  // という分かりにくい通知になり、実際に6日間 (7/25〜7/30) 停止に気付けなかった。
+  if (/login\.yahoo\.co\.jp|login\.bizmanager|account\.line\.biz/.test(finalHost)) {
     throw new Error(
-      '2FA_REQUIRED: Yahoo!セッションが切れています。miniPCで手動再ログインしてください: '
-      + '$env:MANUAL=1; node scripts/mall-csv-fetcher/yahoo-login-spike.mjs'
+      '2FA_REQUIRED: Yahoo!のセッションが切れています (再ログインが必要)。'
+      + 'ミニPCの画面で デスクトップの「Yahoo-Relogin.bat」をダブルクリック → '
+      + '「Yahoo! JAPAN ID」を選んでログイン (確認コードはメール受信)。'
+      + 'コマンドで実行する場合: node scripts/mall-csv-fetcher/yahoo-manual-login.mjs'
     );
   }
   // メインframeのHTTP statusを検証 (リダイレクト後の最終レスポンス)

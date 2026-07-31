@@ -371,7 +371,7 @@ async function main() {
         error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'ydata_error.png'),
       }],
       repro: is2fa
-        ? 'miniPCで $env:MANUAL=1; node scripts/mall-csv-fetcher/yahoo-login-spike.mjs → Yahoo! JAPAN IDで手動ログイン (確認コードはメール受信)'
+        ? 'ミニPCの画面でデスクトップの「Yahoo-Relogin.bat」をダブルクリック →「Yahoo! JAPAN ID」でログイン (確認コードはメール受信)。コマンド版: node scripts/mall-csv-fetcher/yahoo-manual-login.mjs'
         : 'node scripts/mall-csv-fetcher/yahoo-data-download.mjs',
     }), 'yahoo-data');
     process.exitCode = is2fa ? 3 : 1; // 3=手動対応必須 (fetch-all はリトライしない)
