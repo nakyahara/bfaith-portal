@@ -192,6 +192,43 @@ rakuten-data-download.mjs
   `FORM_VERIFY:` エラーが出たらログの `[DOM:reports-form-*]` を見てセレクタを追記する
   (誤条件のデータを黙って取らないための設計)。
 
+## au PAY 一括商品CSVダウンロード (オンデマンド、2026-07-31 実装)
+
+Wow!manager「商品・画像・デザイン > 一括商品CSVダウンロード」の
+**条件設定 → CSVデータ作成 → 処理状況が完了になるまで待つ → ダウンロード** を1コマンドにしたもの。
+定期実行 (fetch-all) には載せていない。手作業のタイミングで叩くツール。
+
+```powershell
+$env:HEADLESS=1
+node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs
+# 既定 = オリジナルテンプレート「ヤフー在庫アップ後確認」/ 販売ステータス=販売中 / 対象商品=指定なし
+node scripts/mall-csv-fetcher/aupay-item-csv-download.mjs --template "検索対象外チェック" --sell-status all --out D:\somewhere
+```
+
+出力は `downloads/aupay-item-csv/` に2本 (テンプレートが選択肢在庫の列を含むため画面が2ファイル生成する):
+
+- `item.csv` … 商品側。`aupay_item_<JST時刻>.csv` (履歴) と `item.csv` (固定名・毎回上書き) の両方を書く
+- `stock.csv` … 選択肢在庫側。同上
+
+実測した画面仕様 (2026-07-31):
+
+- 「CSVデータ作成」は `<a id=btnSave>` で、JSが hidden **`insertproc=insertproc`** を足してから
+  `form#_main_frm` を submit する。**この hidden が無いと POST は HTTP 400** で無言に落ちる
+- POST先は画面と同じ `productCsvDl/index`、受理は 302 + `Location=/productCsvDl/index/<jobId>`
+- 生成は約25秒。ダウンロードは `/productCsvDl/download/<id>` の素のhref → `request.get` で直取り可
+- CSV本体は **Shift_JIS (BOMなし) / CRLF**、ヘッダ行はASCII
+- テンプレートは名前で指定する (IDは `select#csvDlUserTmpltName` の option から解決)。
+  画面でテンプレートを作り直すとIDが変わるため、IDを直書きしない
+
+ガード: 送信値をFormDataから読み戻して検証 / 処理状況は「submit前に無かった行」だけを自ジョブとして
+bind (302のjobIdで検算) / DL結果はHTML混入と主キー列 (`lotNumber`/`itemCode`/`ctrlCol`) の有無を確認。
+
+> ℹ️ この2本のCSVの全列は au PAY API (`searchItemInfos` + `searchStocks`) でも取得できる
+> (`ctrlCol` はCSVアップロード用の制御列なので対象外)。画面経由にしているのは、
+> **テンプレートの列順・ヘッダ名・文字コードを画面が保証してくれる**ため
+> (一括商品CSVアップロードに戻す用途では列仕様の完全一致が要る)。
+> データとして warehouse.db に取り込みたいだけならAPI経由の方が速くて壊れにくい。
+
 ## 次フェーズの予定
 
 - **P1-R 残**: miniPC移設 (プロファイル手動セットアップ+ACL、Task Scheduler 時間帯分離/多重起動禁止)、
