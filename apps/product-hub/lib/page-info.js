@@ -122,23 +122,28 @@ function nl2br(v) {
  * @param {Array<{spec_key:string, spec_value:string|null}>|null} [p.specs] 仕様表 → 1項目1行
  */
 export function buildPageInfoHtml({ productName, info, shippingLabel, descriptionText = null, notesText = null, specs = null }) {
+  // 行は3ブロックに分けて組む: 先頭 (説明/注意事項) → 仕様表 → 商品ページ表記。
+  // 同じラベルが仕様表と商品ページ表記の両方にあるときは**商品ページ表記が正**
+  // (楽天必須記載の正本。Codex R1 Medium: サイズ等が2行になる重複を防ぐ)
+  const mkRow = (label, valueHtml) =>
+    `<tr><td bgcolor="#eeeeee" width="30%"><b>${esc(label)}</b></td><td>${valueHtml}</td></tr>`;
+  const headRows = [];
+  const addHead = (label, valueHtml) => { if (valueHtml) headRows.push(mkRow(label, valueHtml)); };
+  if (s(descriptionText)) {
+    addHead('説明', nl2br(descriptionText));
+    // 注意事項は店舗フォーマットに合わせて説明の直後 (AI注意書き → 固定文の順)
+    addHead('注意事項', (s(notesText) ? nl2br(notesText) + '<br>' : '') + FIXED_NOTES);
+  } else {
+    addHead('商品名', s(productName) ? esc(productName) : null);
+  }
+
   const rows = [];
+  const pageLabels = new Set();
   const add = (label, valueHtml) => {
     if (!valueHtml) return;
-    rows.push(
-      `<tr><td bgcolor="#eeeeee" width="30%"><b>${esc(label)}</b></td><td>${valueHtml}</td></tr>`
-    );
+    pageLabels.add(String(label).trim());
+    rows.push(mkRow(label, valueHtml));
   };
-  if (s(descriptionText)) {
-    add('説明', nl2br(descriptionText));
-    // 注意事項は店舗フォーマットに合わせて説明の直後 (AI注意書き → 固定文の順)
-    add('注意事項', (s(notesText) ? nl2br(notesText) + '<br>' : '') + FIXED_NOTES);
-  } else {
-    add('商品名', s(productName) ? esc(productName) : null);
-  }
-  for (const sp of Array.isArray(specs) ? specs : []) {
-    if (s(sp?.spec_key)) add(sp.spec_key, s(sp.spec_value) ? nl2br(sp.spec_value) : null);
-  }
   const i = info || {};
   add('サイズ', s(i.size_text) ? nl2br(i.size_text) : null);
   add('内容量', s(i.content_volume) ? nl2br(i.content_volume) : null);
@@ -166,9 +171,18 @@ export function buildPageInfoHtml({ productName, info, shippingLabel, descriptio
   add('広告文責', adResponsibility()); // 固定値 (env 由来。<br> を含む信頼済み文字列)
   if (!s(descriptionText)) add('注意事項', FIXED_NOTES); // 説明行ありのときは先頭側で追加済み
 
-  if (rows.length === 0) return '';
+  // 仕様表 (1項目1行)。商品ページ表記に同名ラベルの行があるものはスキップ
+  const specRows = [];
+  for (const sp of Array.isArray(specs) ? specs : []) {
+    const key = s(sp?.spec_key);
+    if (!key || pageLabels.has(key) || key === '説明' || key === '注意事項') continue;
+    if (s(sp.spec_value)) specRows.push(mkRow(key, nl2br(sp.spec_value)));
+  }
+
+  const allRows = [...headRows, ...specRows, ...rows];
+  if (allRows.length === 0) return '';
   return '<table width="100%" cellpadding="4" cellspacing="2" border="1" bordercolor="#000000">'
-    + rows.join('') + '</table>';
+    + allRows.join('') + '</table>';
 }
 
 /**

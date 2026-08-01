@@ -373,9 +373,12 @@ function escAttr(v) {
  * 旧運用ではスプレッドシートで生成して手貼りしていたもの)。
  */
 export function buildSalesDescriptionHtml(locations) {
-  const base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
+  // env が https URL でなければ既定に戻す (Codex R1 Medium: 属性注入の fail-safe)。
+  // src には結合後のURL全体をエスケープして入れる
+  let base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
+  if (!/^https:\/\/[\w.-]+(?:\/[\w.\-\/]*)?$/.test(base)) base = CABINET_IMAGE_BASE;
   return locations
-    .map((loc) => `<img src="${base}${escAttr(loc)}" width="100%" border="0"><br><br><br>`)
+    .map((loc) => `<img src="${escAttr(`${base}${loc}`)}" width="100%" border="0"><br><br><br>`)
     .join('\n');
 }
 

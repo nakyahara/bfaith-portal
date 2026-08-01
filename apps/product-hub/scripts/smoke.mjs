@@ -789,6 +789,26 @@ check('payload: 販売説明文 = 商品画像の画像HTML',
   pl.salesDescription);
 check('payload: スマホ用説明文 = 販売説明文 + PC説明文',
   pl.productDescription.sp === pl.salesDescription + '\n' + pl.productDescription.pc);
+
+// 10240字ガード (Codex R1 Low): PC説明文の超過は理由で止める
+db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(11000), rkId);
+let bLen = listing.buildItemPayload(db, rkId);
+check('payload: PC説明文10240字超は理由で止める',
+  bLen.ok === false && bLen.reasons.some((r) => r.includes('PC用商品説明文が長すぎます')), JSON.stringify(bLen.reasons));
+// スマホ用だけが連結で超過するケース (PC・販売は上限内)
+db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(6000), rkId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'glong')`).run(rkId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'glong', ?)`).run(rkId, '/app-newitems/' + 'x'.repeat(4000) + '.jpg');
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
+  bLen.ok === false
+  && bLen.reasons.some((r) => r.includes('スマホ用商品説明文'))
+  && !bLen.reasons.some((r) => r.includes('PC用商品説明文'))
+  && !bLen.reasons.some((r) => r.includes('画像HTML')),
+  JSON.stringify(bLen.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
+db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
+db.prepare(`UPDATE draft_ai_outputs SET content = '特徴文' WHERE draft_id = ? AND kind = 'desc_features'`).run(rkId);
 check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
@@ -894,6 +914,16 @@ check('payload: 充足すると説明文末尾に表を連結 (発送方法=ア�
   && b27.payload.productDescription.pc.includes('ネコポス'),
   JSON.stringify(b27.reasons || null));
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
+// 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
+db.prepare(`UPDATE draft_page_info SET size_text = '約W5cm' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 仕様表とページ表記の同名ラベルはページ表記が正 (サイズ行は1つ)',
+  b27.ok === true
+  && (b27.payload.productDescription.pc.match(/<b>サイズ<\/b>/g) || []).length === 1
+  && b27.payload.productDescription.pc.includes('約W5cm')
+  && !b27.payload.productDescription.pc.includes('W10cm'),
+  JSON.stringify(b27.reasons || null));
+db.prepare(`UPDATE draft_page_info SET size_text = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
