@@ -371,13 +371,15 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
   // [Codex R1 #2 / R2 #1] summary/detail 世代不一致チェック
   // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る
   // カテゴリ存在だけでは同日付の古い detail が残るケースを検出できないため、
-  // total_qty と detail の SUM(qty) をカテゴリ毎に突合する (両者は同じ集計ロジックで生成され厳密一致する)
+  // total_qty と detail の SUM(qty) をカテゴリ毎に突合する (両者は同じ集計ロジックで生成され厳密一致する)。
+  // total_qty=0 のカテゴリも検査する: summary=0 なのに古い detail 行が残っていると
+  // 明細だけ旧在庫が混入したスナップショットになるため (Codex R1 #3)
   const detailQty = new Map(
     db.prepare(`SELECT category, SUM(qty) AS q FROM mirror_inv_daily_detail WHERE business_date = ? GROUP BY category`)
       .all(source_business_date).map(r => [r.category, Number(r.q)])
   );
   const mismatchCats = summaryRows
-    .filter(r => Number(r.total_qty || 0) > 0 && detailQty.get(r.category) !== Number(r.total_qty))
+    .filter(r => (detailQty.get(r.category) ?? 0) !== Number(r.total_qty || 0))
     .map(r => `${r.category} (summary=${r.total_qty}, detail=${detailQty.get(r.category) ?? 'なし'})`);
   if (mismatchCats.length > 0) {
     const err = new Error(`${source_business_date} 朝の明細 (mirror_inv_daily_detail) が summary と一致しません: ${mismatchCats.join(', ')}。次回 sync 完了まで待ってください。`);

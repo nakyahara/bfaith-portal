@@ -1265,7 +1265,9 @@ async function savePending() {
   };
   msg.textContent = '保存中...';
   try {
-    const res = await fetch('${id}/pending', {
+    // <base href="/apps/inventory-monthly/"> 基準なので history/ を明示する
+    // (相対 '${id}/pending' だと /apps/inventory-monthly/${id}/pending に解決されて404)
+    const res = await fetch('history/${id}/pending', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify({ rows }),
@@ -1298,8 +1300,9 @@ if (CURRENT_PENDING.length) {
 
 // 発注後未着の後編集: 行を丸ごと差し替えて pending_orders / total を再計算する。
 // cron 自動保存 (発注後未着なし) の後から手入力を追加できるようにするための endpoint。
-// total は「保存済み total - 保存済み pending + 新 pending」で更新し、
-// 他カテゴリの丸め済み金額には触らない。
+// [Codex R1 #2] total は「保存済みのカテゴリ列 (丸め済みint) + 新 pending」から再構成する。
+// 「旧total - 旧pending + 新pending」だと保存時の丸め規則 (生値合計を最後に1回round) と
+// 等価でなく1円ズレが残り得る。カテゴリ列からの再構成なら画面の行合計とも常に一致する。
 router.post('/history/:id/pending', json({ limit: '64kb' }), (req, res) => {
   if (!ensureDbOrFail(res)) return;
   const id = Number(req.params.id);
@@ -1321,13 +1324,16 @@ router.post('/history/:id/pending', json({ limit: '64kb' }), (req, res) => {
   try {
     const db = getDB();
     const txn = db.transaction(() => {
-      const s = db.prepare('SELECT id, pending_orders, total FROM inv_snapshot WHERE id = ?').get(id);
+      const s = db.prepare(
+        'SELECT id, fba_warehouse, fba_inbound, own_warehouse, fba_us, fba_us_inbound, manual_adjustment FROM inv_snapshot WHERE id = ?'
+      ).get(id);
       if (!s) return null;
       db.prepare('DELETE FROM inv_snapshot_pending WHERE snapshot_id = ?').run(id);
       const ins = db.prepare('INSERT INTO inv_snapshot_pending (snapshot_id, supplier_name, amount, note) VALUES (?, ?, ?, NULL)');
       for (const p of pendingRows) ins.run(id, p.supplier_name, p.amount);
       const newPending = pendingRows.reduce((sum, p) => sum + p.amount, 0);
-      const newTotal = (s.total || 0) - (s.pending_orders || 0) + newPending;
+      const newTotal = (s.fba_warehouse || 0) + (s.fba_inbound || 0) + (s.own_warehouse || 0)
+        + (s.fba_us || 0) + (s.fba_us_inbound || 0) + (s.manual_adjustment || 0) + newPending;
       db.prepare('UPDATE inv_snapshot SET pending_orders = ?, total = ? WHERE id = ?').run(newPending, newTotal, id);
       return { pending: newPending, total: newTotal };
     });
