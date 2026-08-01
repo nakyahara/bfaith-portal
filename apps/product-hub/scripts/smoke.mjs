@@ -71,6 +71,10 @@ asn = assignImageSlots([fim('code_01.jpg'), fim('code_01.png')], 'code');
 check('同一番号の重複 → conflicts (セットしない)',
   asn.slots.length === 0 && asn.conflicts.length === 1 && asn.conflicts[0].num === 1, JSON.stringify(asn));
 
+asn = assignImageSlots([fim('code_01.jpg'), fim('code_21.jpg'), fim('code_21.png')], 'code');
+check('上限超え番号は重複でも conflicts にしない (skippedで_01は取り込める)',
+  asn.slots.length === 1 && asn.conflicts.length === 0 && asn.skipped.length === 2, JSON.stringify(asn));
+
 asn = assignImageSlots([fim('CODE_01.JPG')], 'code');
 check('大文字小文字は同一視', asn.slots.length === 1, JSON.stringify(asn));
 

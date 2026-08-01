@@ -72,6 +72,11 @@ export function assignImageSlots(files, neCode) {
   const slots = [];
   const conflicts = [];
   for (const [num, group] of [...byNum.entries()].sort((a, b) => a[0] - b[0])) {
+    // 上限超えは重複していても skipped 扱い (Codex R2 low: 対象外番号の重複で全体を止めない)
+    if (num > MAX_IMAGE_SLOTS) {
+      for (const g of group) skipped.push({ name: g.name, reason: `_${num} は楽天の上限 (_01〜_${MAX_IMAGE_SLOTS}) を超えています` });
+      continue;
+    }
     if (group.length > 1) {
       conflicts.push({ num, names: group.map((g) => g.name) });
       continue;
@@ -79,10 +84,8 @@ export function assignImageSlots(files, neCode) {
     const f = group[0];
     if (num === 0) {
       whiteBg = { id: f.id, name: f.name };
-    } else if (num <= MAX_IMAGE_SLOTS) {
-      slots.push({ slot: num, id: f.id, name: f.name });
     } else {
-      skipped.push({ name: f.name, reason: `_${num} は楽天の上限 (_01〜_${MAX_IMAGE_SLOTS}) を超えています` });
+      slots.push({ slot: num, id: f.id, name: f.name });
     }
   }
 

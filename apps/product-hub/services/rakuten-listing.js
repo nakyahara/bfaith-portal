@@ -78,6 +78,8 @@ async function downloadDriveImage(fileId) {
 
 /**
  * Drive フォルダ直下の画像ファイル一覧 (共有ドライブ対応・ページング対応)。
+ * 1000件を超えるフォルダは商品画像フォルダではない可能性が高いので fail-closed
+ * (Codex R2: 打ち切った不完全な一覧で既存画像を置換しないため)。
  * @returns {Promise<Array<{id: string, name: string, mimeType: string}>>}
  */
 export async function listDriveFolderImages(folderId) {
@@ -96,7 +98,10 @@ export async function listDriveFolderImages(folderId) {
     });
     files.push(...(res.data.files || []));
     pageToken = res.data.nextPageToken;
-  } while (pageToken && files.length < 1000);
+    if (files.length > 1000) {
+      throw new Error('フォルダ内の画像が1000件を超えています。商品の画像フォルダを指定しているか確認してください');
+    }
+  } while (pageToken);
   return files;
 }
 

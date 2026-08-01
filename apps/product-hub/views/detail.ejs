@@ -331,7 +331,7 @@
       </div>
       <div class="muted" style="font-size:11px;">
         ファイル名「<%= draft.ne_code %>_00」= 白抜き背景 / 「<%= draft.ne_code %>_01」〜「_20」= 楽天の画像1〜20 として自動で振り分けます (欠番は詰めて登録)。
-        実行すると現在の商品画像は<b>フォルダの内容で置き換わります</b>
+        _01〜_20 が1枚でも見つかると、現在の商品画像は<b>フォルダの内容で置き換わります</b> (_00 だけの場合は白抜きのみ更新)
       </div>
     </div>
 
@@ -1766,9 +1766,10 @@
         alert((json.error || 'エラーが発生しました') + (details.length ? '\n\n' + details.join('\n') : ''));
         return;
       }
-      let msg = '画像 ' + json.slots.length + ' 枚をセットしました'
-        + (json.whiteBg ? ' (白抜き背景もセット)' : '')
-        + (json.skipped && json.skipped.length ? ' / 対象外 ' + json.skipped.length + ' 件' : '');
+      let msg = json.slots.length === 0
+        ? '白抜き背景をセットしました (商品画像は変更していません)'
+        : '画像 ' + json.slots.length + ' 枚をセットしました' + (json.whiteBg ? ' (白抜き背景もセット)' : '');
+      if (json.skipped && json.skipped.length) msg += ' / 対象外 ' + json.skipped.length + ' 件';
       const warns = (json.warnings || []).slice();
       if (json.demoted) warns.push('必須項目が欠けたため、ステータスを「下書き」に戻しました: ' + json.demoted.join(' / '));
       if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
