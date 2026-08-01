@@ -73,8 +73,21 @@
   </div>
 
   <script>
-    // 表示専用の自動更新 (5秒)。操作系が付く PR3 で fetch 差分更新に置き換える。
-    setTimeout(() => location.reload(), 5000);
+    // 表示専用の自動更新 (30秒)。スクロール位置を復元する (Codex PR1レビュー#10)。
+    // 操作系が付く PR3 で fetch 差分更新に置き換える。
+    (() => {
+      const board = document.querySelector('.sw-board');
+      const saved = sessionStorage.getItem('sw-kanban-scroll');
+      if (saved) {
+        const { x, y } = JSON.parse(saved);
+        board.scrollLeft = x;
+        window.scrollTo(0, y);
+      }
+      setTimeout(() => {
+        sessionStorage.setItem('sw-kanban-scroll', JSON.stringify({ x: board.scrollLeft, y: window.scrollY }));
+        location.reload();
+      }, 30000);
+    })();
   </script>
 </body>
 </html>

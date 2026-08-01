@@ -64,6 +64,9 @@ export const STATUS_LABELS = {
   cancelled: '取消',
 };
 
+// スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
+const SCHEMA_VERSION = 1;
+
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
@@ -72,17 +75,44 @@ export function initShippingWorkDB() {
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
-  createTables();
+  migrate();
   seedMasters();
   return db;
 }
+
+/**
+ * バージョン式マイグレーション (Codex PR1レビュー#3)。
+ * CREATE IF NOT EXISTS 頼みだと既存DBにスキーマ変更が当たらないため、
+ * user_version で管理し、各版をトランザクションで適用する。
+ * 失敗時は throw して起動を止める (router.js が import 時に init するため boot が失敗する)。
+ */
+function migrate() {
+  let v = db.pragma('user_version', { simple: true });
+  if (v > SCHEMA_VERSION) {
+    throw new Error(`shipping-work.db の user_version=${v} がコードの期待 ${SCHEMA_VERSION} より新しい (ロールバック不可)`);
+  }
+  while (v < SCHEMA_VERSION) {
+    const next = v + 1;
+    const step = MIGRATIONS[next];
+    if (!step) throw new Error(`shipping-work migration v${next} が未定義`);
+    db.transaction(() => {
+      step();
+      db.pragma(`user_version = ${next}`);
+    })();
+    v = next;
+  }
+}
+
+const MIGRATIONS = {
+  1: createTablesV1,
+};
 
 export function getDB() {
   if (!db) initShippingWorkDB();
   return db;
 }
 
-function createTables() {
+function createTablesV1() {
   // 区分マスタ。kind: shipping_no / bunrui / packing_method / carrier /
   //   pause_reason_pick / pause_reason_pack / mistake_kind / print_trouble_reason
   db.exec(`CREATE TABLE IF NOT EXISTS sw_masters (
@@ -109,7 +139,10 @@ function createTables() {
     pdf_path       TEXT,                         -- 添付帳票 (ピッキングリスト等)。PR2で添付UI
     created_by     INTEGER NOT NULL,
     created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    updated_at     TEXT NOT NULL,
+    -- 業務キー: 同じ作業日に同じ出荷Noのバッチは1つ (現行Notion運用と同じ。
+    -- 二重クリック・再送による二重作成の防止。Codex PR1レビュー#1)
+    UNIQUE(work_date, shipping_no)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sw_batches_date ON sw_batches(work_date, status)');
 
@@ -144,6 +177,10 @@ function createTables() {
   // 同一バッチ×工程の進行中セッションは 1 つ (リースの実体)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_sessions_active
     ON sw_sessions(batch_id, process) WHERE outcome='open'`);
+  // 一人一作業の原則 (要件v2: 完了しないと次の仕事を取得できない) をDB制約で保証。
+  // 応援・交代の例外運用が必要になったら PR3 で migration により見直す (Codex PR1レビュー#5)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_sessions_worker_open
+    ON sw_sessions(worker_id) WHERE outcome='open'`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sw_sessions_worker ON sw_sessions(worker_id, requested_at)');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_sessions_opid ON sw_sessions(op_id) WHERE op_id IS NOT NULL');
 
@@ -157,6 +194,9 @@ function createTables() {
     resumed_at  TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_sw_pauses_session ON sw_pauses(session_id)');
+  // 未解除の保留は1セッション1つ (連打・再送による保留時間の二重計上防止。Codex PR1レビュー#6)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_pauses_active
+    ON sw_pauses(session_id) WHERE resumed_at IS NULL`);
 
   // 印刷ジョブ (業務上の要求) と試行 (投入ごと)。PR6 でブリッジ接続
   db.exec(`CREATE TABLE IF NOT EXISTS sw_print_jobs (
@@ -166,8 +206,12 @@ function createTables() {
     doc_type     TEXT NOT NULL DEFAULT 'picking_list',
     pdf_path     TEXT NOT NULL,
     printer      TEXT,
+    -- spooled = スプーラー投入成功まで (物理印刷完了は保証しない)。
+    -- uncertain = タイムアウト等で結果不明 (failed と区別。管理者が実物確認)。
+    -- cancelled = 未印刷ジョブの取消。(Codex PR1レビュー#2: 状態集合はCHECK変更が
+    -- テーブル再作成になるため PR1 で確保)
     status       TEXT NOT NULL DEFAULT 'requested'
-      CHECK(status IN ('requested','leased','spooling','done','failed')),
+      CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
     requested_by INTEGER NOT NULL,
     requested_at TEXT NOT NULL
   )`);
@@ -180,7 +224,8 @@ function createTables() {
     result         TEXT,
     error          TEXT,
     leased_at      TEXT,
-    reported_at    TEXT
+    reported_at    TEXT,
+    UNIQUE(job_id, attempt_no)
   )`);
 
   // ミス記録 (現行 Notion の4分類を維持)
@@ -267,9 +312,12 @@ function seedMasters() {
     ['wrong_doc', '帳票違い'], ['other', 'その他'],
   ].forEach(([code, label], i) => rows.push(['print_trouble_reason', code, label, i + 1]));
 
-  const ins = db.prepare(
-    'INSERT OR IGNORE INTO sw_masters (kind, code, label, sort) VALUES (?, ?, ?, ?)'
-  );
+  // コード定義を初期マスタの正本とし、label/sort はデプロイごとに追従させる。
+  // active は運用での停止設定を守るため上書きしない (Codex PR1レビュー#9)
+  const ins = db.prepare(`
+    INSERT INTO sw_masters (kind, code, label, sort) VALUES (?, ?, ?, ?)
+    ON CONFLICT(kind, code) DO UPDATE SET label = excluded.label, sort = excluded.sort
+  `);
   const tx = db.transaction(() => { for (const r of rows) ins.run(...r); });
   tx();
 }
@@ -281,7 +329,11 @@ export function listMasters(kind) {
   ).all(kind);
 }
 
-/** カンバン用: 指定作業日のバッチ + 未完了の持ち越しバッチ。 */
+/**
+ * カンバン用: 指定作業日のバッチ + それ以前の未完了持ち越しバッチ。
+ * 未来日の未完了は含めない (Codex PR1レビュー#4)。
+ * cancelled はカンバンに出さないため取得段階で除外し、件数表示と一致させる (同#8)。
+ */
 export function listKanbanBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
@@ -289,8 +341,9 @@ export function listKanbanBatches(workDate) {
       (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
       (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
     FROM sw_batches b
-    WHERE b.work_date = ?
-       OR b.status NOT IN ('done','cancelled','stock_return')
+    WHERE b.status != 'cancelled'
+      AND (b.work_date = ?
+        OR (b.work_date < ? AND b.status NOT IN ('done','stock_return')))
     ORDER BY b.work_date, b.id
-  `).all(workDate);
+  `).all(workDate, workDate);
 }

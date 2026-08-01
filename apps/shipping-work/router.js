@@ -13,10 +13,14 @@
 import { Router } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getDB, jstToday, listKanbanBatches, BATCH_STATUSES, STATUS_LABELS } from './db.js';
+import { getDB, initShippingWorkDB, jstToday, listKanbanBatches, BATCH_STATUSES, STATUS_LABELS } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
+
+// import 時 (= server.js boot 時) に DB を初期化する。
+// migration 失敗時はここで throw し、旧スキーマのまま起動を継続させない (Codex PR1レビュー#3)
+initShippingWorkDB();
 
 // カンバンの列構成 (表示順)。hold/stock_return は横断列として末尾に置く。
 // cancelled はカンバンに出さない (管理画面のみ・PR5)。
