@@ -86,11 +86,12 @@
   %>
   <div class="tabbar" id="tabbar"
        data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>">
+    <!-- 並び順 = 入力の流れ (中原さん指定 2026-08-01): 基本情報 → 商品情報 → カテゴリ → 説明 → 画像 → 出品 -->
     <button type="button" class="tab-btn" data-tab="tab-basic">✏️ 基本情報<span class="tab-badge" hidden></span></button>
-    <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
-    <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-info">📄 商品情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
+    <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-listing">🛒 出品<span class="tab-badge" hidden></span></button>
     <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
@@ -162,25 +163,43 @@
           <div class="muted" style="font-size:11px;">※利益計算の配送費はNEの配送方法から自動算出 (ここを変えても計算は変わりません)</div>
         </div>
         <div style="flex:1; min-width:120px;">
-          <label>送料<span class="ftag ftag-m">手入力</span></label>
-          <select id="rk-postage" style="width:100%;">
-            <option value="">未設定 (店舗デフォルト)</option>
-            <option value="1" <%= rakuten?.postage_included === 1 ? 'selected' : '' %>>送料込み</option>
-            <option value="0" <%= rakuten?.postage_included === 0 ? 'selected' : '' %>>送料別</option>
+          <label>送料<span class="ftag ftag-auto">自動</span></label>
+          <!-- 外注マニュアル (楽天登録手順): 「弊社は全て送料無料です」→ 既定=送料込みで固定表示。
+               送料別は誤操作防止のためリンク→confirm 経由でのみ選べる (中原さん指示 2026-08-01) -->
+          <% const postageIsOther = rakuten?.postage_included === 0; %>
+          <div id="rk-postage-fixed" style="<%= postageIsOther ? 'display:none;' : '' %>">
+            <div style="padding:7px 10px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; font-size:13px;">送料込み <span class="muted">(全商品共通)</span></div>
+            <a href="#" id="rk-postage-unlock" class="muted" style="font-size:11px;">送料別にする (特殊なケースのみ)</a>
+          </div>
+          <select id="rk-postage" style="width:100%; <%= postageIsOther ? '' : 'display:none;' %>">
+            <option value="1" <%= postageIsOther ? '' : 'selected' %>>送料込み</option>
+            <option value="0" <%= postageIsOther ? 'selected' : '' %>>送料別</option>
           </select>
         </div>
         <div style="flex:1; min-width:120px;">
-          <label>納期情報ID <span class="muted">(RMSの納期設定)</span><span class="ftag ftag-m">手入力</span></label>
-          <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= rakuten?.normal_delivery_date_id || '' %>" placeholder="未設定可">
+          <label>納期情報 <span class="muted">(RMSの納期設定)</span><span class="ftag ftag-auto">自動</span></label>
+          <!-- 外注マニュアル: 在庫あり時は「4: 12時までの注文で当日発送」固定 -->
+          <%
+            const DELIVERY_DEFAULT_ID = '4';
+            const deliveryVal = String(rakuten?.normal_delivery_date_id || DELIVERY_DEFAULT_ID);
+            const deliveryIsCustom = deliveryVal !== DELIVERY_DEFAULT_ID;
+          %>
+          <div id="rk-delivery-fixed" style="<%= deliveryIsCustom ? 'display:none;' : '' %>">
+            <div style="padding:7px 10px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:6px; font-size:13px;">12時までの注文で当日発送 <span class="muted">(ID: 4)</span></div>
+            <a href="#" id="rk-delivery-unlock" class="muted" style="font-size:11px;">別の納期IDにする (特殊なケースのみ)</a>
+          </div>
+          <input type="text" id="rk-delivery-date" inputmode="numeric" value="<%= deliveryVal %>"
+                 style="<%= deliveryIsCustom ? '' : 'display:none;' %>" placeholder="RMSの納期管理番号">
         </div>
       </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
           <label>ASIN<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-asin" value="<%= draft.asin || '' %>" placeholder="B0XXXXXXXX">
+          <div class="muted" id="f-asin-note" style="font-size:11px;" hidden>Amazon URLが入っているのでASINは不要です</div>
         </div>
         <div style="flex:2">
-          <label>Amazon URL<span class="ftag ftag-m">手入力</span></label>
+          <label>Amazon URL <span class="muted">(ASINを入れると自動で作られます)</span><span class="ftag ftag-m">手入力</span></label>
           <input type="url" id="f-amazon-url" value="<%= draft.amazon_url || '' %>" placeholder="https://www.amazon.co.jp/dp/...">
         </div>
       </div>
@@ -212,6 +231,7 @@
       <button class="btn btn-primary" id="save-basic-btn">基本情報を保存</button>
     </div>
 
+    <div style="display:grid; gap:16px; align-content:start;"><!-- 右カラム: バリエーション+参考URL -->
     <!-- バリエーション (NE の代表商品コードで判定。NE が正・DBには焼かない) -->
     <div class="card" style="border-color:#bae6fd; background:#f8fdff;">
       <h2>🗄️ NE商品マスタから自動取得 <span class="muted" style="font-weight:400">(バリエーション判定)</span></h2>
@@ -312,6 +332,27 @@
         </p>
       <% } %>
     </div>
+
+    <!-- 参考URL (2026-08-01 中原さん指示: 商品説明タブ→基本情報タブへ移動) -->
+    <div class="card">
+      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span><span class="ftag ftag-m">手入力</span></h2>
+      <% if (refs.length === 0) { %>
+        <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
+      <% } %>
+      <ul style="list-style:none; margin:0 0 12px; padding:0;">
+        <% for (const r of refs) { %>
+          <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
+            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
+            <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
+          </li>
+        <% } %>
+      </ul>
+      <div style="display:flex; gap:8px;">
+        <input type="url" id="new-ref-url" placeholder="https://...">
+        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
+      </div>
+    </div>
+    </div><!-- /右カラム -->
   </div>
   </div><!-- /tab-basic -->
 
@@ -518,26 +559,7 @@
   </div>
 
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
-    <!-- 参考URL -->
-    <div class="card">
-      <h2>✏️ 参考URL <span class="muted" style="font-weight:400">(公式ページ以外の参照元)</span><span class="ftag ftag-m">手入力</span></h2>
-      <% if (refs.length === 0) { %>
-        <p class="muted">まだありません。メーカーの商品ページや類似商品ページなど、AI が説明文を書くときに参考にする URL を追加してください。</p>
-      <% } %>
-      <ul style="list-style:none; margin:0 0 12px; padding:0;">
-        <% for (const r of refs) { %>
-          <li style="display:flex; gap:8px; align-items:center; padding:4px 0; font-size:13px;">
-            <a href="<%= r.url %>" target="_blank" rel="noopener" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= r.url %></a>
-            <button class="btn btn-sm btn-danger del-ref-btn" data-id="<%= r.id %>">削除</button>
-          </li>
-        <% } %>
-      </ul>
-      <div style="display:flex; gap:8px;">
-        <input type="url" id="new-ref-url" placeholder="https://...">
-        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
-      </div>
-    </div>
-
+    <!-- 参考URLは 2026-08-01 に基本情報タブへ移動 -->
     <!-- 仕様表 -->
     <div class="card">
       <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span><span class="ftag ftag-m">手入力</span></h2>
@@ -616,15 +638,15 @@
         <input type="text" id="pi-volume" value="<%= pageInfo?.content_volume || '' %>" placeholder="例: 50ml">
       </div>
       <div class="field" id="pi-f-size">
-        <label>サイズ<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-size">サイズ<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-size" value="<%= pageInfo?.size_text || '' %>" placeholder="例: 縦5cm×横10cm×高さ15cm">
       </div>
       <div class="field" id="pi-f-ingredients">
-        <label>成分・素材・材質<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品は全成分。食品は原材料名欄へ)</span></label>
+        <label id="pi-l-ingredients">成分・素材・材質<span class="ftag ftag-m">手入力</span> <span class="muted">(化粧品は全成分。食品は原材料名欄へ)</span></label>
         <textarea id="pi-ingredients" rows="3"><%= pageInfo?.ingredients || '' %></textarea>
       </div>
       <div class="field" id="pi-f-usage">
-        <label>使用上の注意<span class="ftag ftag-m">手入力</span></label>
+        <label id="pi-l-usage">使用上の注意<span class="ftag ftag-m">手入力</span></label>
         <textarea id="pi-usage" rows="3"><%= pageInfo?.usage_notes || '' %></textarea>
       </div>
     </div>
@@ -1578,6 +1600,8 @@
     };
     const ALL_REQ_LABELS = ['pi-l-category', 'pi-l-origin', 'pi-l-seller', 'pi-l-importer', 'pi-l-volume',
       'pi-l-food-name', 'pi-l-food-ingredients', 'pi-l-food-expiry', 'pi-l-food-storage'];
+    // 雑貨は楽天必須の記載がない → 入力ハードルを下げるため「(任意)」を明示 (中原さん指示 2026-08-01)
+    const OPT_LABELS_GENERAL = ['pi-l-seller', 'pi-l-size', 'pi-l-ingredients', 'pi-l-usage'];
 
     const applyTypeVisibility = () => {
       const t = typeSel.value || 'general';
@@ -1596,6 +1620,11 @@
       for (const id of ALL_REQ_LABELS) {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('req', req.has(id));
+      }
+      // 雑貨のとき (任意) マーク (必須マークとは排他: 雑貨はREQ_LABELS対象外)
+      for (const id of OPT_LABELS_GENERAL) {
+        const el = document.getElementById(id);
+        if (el) el.classList.toggle('opt', t === 'general' && !req.has(id));
       }
       // 商品タイプに整合する商品区分だけ選べるようにする
       const allowed = catByType[t] || null;
@@ -1741,6 +1770,69 @@
   document.getElementById('add-ref-btn').addEventListener('click', async () => {
     showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
   });
+
+  // ─── ASIN ⇔ Amazon URL 連動 (2026-08-01 中原さん指示) ───
+  // ・ASIN を入れると URL を https://www.amazon.co.jp/dp/<ASIN> で自動生成
+  // ・URL が手入力されている (自動生成形式でない) 間は ASIN 不要 → グレーアウト
+  (function initAsinAmazonSync() {
+    const asinEl = document.getElementById('f-asin');
+    const urlEl = document.getElementById('f-amazon-url');
+    const noteEl = document.getElementById('f-asin-note');
+    const AUTO_PREFIX = 'https://www.amazon.co.jp/dp/';
+    const isAutoUrl = (url, asin) => !!asin && url === AUTO_PREFIX + asin;
+    const refresh = () => {
+      const url = urlEl.value.trim();
+      const manualUrl = url !== '' && !isAutoUrl(url, asinEl.value.trim());
+      asinEl.disabled = manualUrl;
+      asinEl.style.background = manualUrl ? '#f1f5f9' : '';
+      noteEl.hidden = !manualUrl;
+    };
+    asinEl.addEventListener('input', () => {
+      const asin = asinEl.value.trim();
+      const url = urlEl.value.trim();
+      // ASIN が編集できている = URL は空か自動生成値 → 追従して書き換える
+      if (url === '' || isAutoUrl(url, asin) || url.startsWith(AUTO_PREFIX)) {
+        urlEl.value = asin ? AUTO_PREFIX + asin : '';
+      }
+      refresh();
+    });
+    urlEl.addEventListener('input', refresh);
+    refresh();
+  })();
+
+  // ─── 送料・納期の固定表示 (外注マニュアル: 全商品送料無料 / 納期ID=4 固定) ───
+  (function initFixedShippingDelivery() {
+    const postageUnlock = document.getElementById('rk-postage-unlock');
+    const postageSel = document.getElementById('rk-postage');
+    postageUnlock.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!confirm('弊社は全商品「送料無料 (送料込み)」がルールです。\n本当に送料別へ変更できるようにしますか？')) return;
+      document.getElementById('rk-postage-fixed').style.display = 'none';
+      postageSel.style.display = '';
+      postageSel.value = '0';
+    });
+    postageSel.addEventListener('change', () => {
+      if (postageSel.value === '1') {  // 送料込みへ戻したら固定表示に戻す
+        document.getElementById('rk-postage-fixed').style.display = '';
+        postageSel.style.display = 'none';
+      }
+    });
+    const deliveryUnlock = document.getElementById('rk-delivery-unlock');
+    const deliveryInput = document.getElementById('rk-delivery-date');
+    deliveryUnlock.addEventListener('click', (e) => {
+      e.preventDefault();
+      if (!confirm('納期情報は全商品「4: 12時までの注文で当日発送」がルールです。\n本当に別の納期IDへ変更できるようにしますか？')) return;
+      document.getElementById('rk-delivery-fixed').style.display = 'none';
+      deliveryInput.style.display = '';
+      deliveryInput.focus();
+    });
+    deliveryInput.addEventListener('input', () => {
+      if (deliveryInput.value.trim() === '4') {  // 既定値に戻したら固定表示へ
+        document.getElementById('rk-delivery-fixed').style.display = '';
+        deliveryInput.style.display = 'none';
+      }
+    });
+  })();
   document.querySelectorAll('.del-ref-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {
       showAndReload(await post(BASE + '/refs/' + btn.dataset.id + '/delete'), '削除しました');
