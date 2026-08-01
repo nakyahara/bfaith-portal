@@ -77,6 +77,30 @@ async function downloadDriveImage(fileId) {
 }
 
 /**
+ * Drive フォルダ直下の画像ファイル一覧 (共有ドライブ対応・ページング対応)。
+ * @returns {Promise<Array<{id: string, name: string, mimeType: string}>>}
+ */
+export async function listDriveFolderImages(folderId) {
+  const drive = getDriveClient();
+  const files = [];
+  let pageToken;
+  do {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false and mimeType contains 'image/'`,
+      fields: 'nextPageToken, files(id, name, mimeType)',
+      pageSize: 200,
+      orderBy: 'name',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      pageToken,
+    });
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+  } while (pageToken && files.length < 1000);
+  return files;
+}
+
+/**
  * R-Cabinet 制約 (JPEG / 2MB / 3840px) に収める。
  * RYS image-uploader と同じ「品質を段階的に落とす」方式。
  */

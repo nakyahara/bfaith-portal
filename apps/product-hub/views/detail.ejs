@@ -320,32 +320,69 @@
   <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
   <div class="card">
     <h2>✏️ 商品画像 (Driveリンク)<span class="ftag ftag-m">手入力</span></h2>
-    <div style="display:flex; gap:8px; margin-bottom:12px;">
-      <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンク)">
-      <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
+
+    <!-- フォルダ一括取り込み (2026-08-01): 「商品コード_番号」規則でスロットへ自動セット -->
+    <div class="field" style="margin-bottom:14px;">
+      <label>画像フォルダから自動セット</label>
+      <div style="display:flex; gap:8px;">
+        <input type="url" id="import-folder-url" style="flex:1;" value="<%= draft.drive_folder_url || '' %>"
+               placeholder="https://drive.google.com/drive/folders/... (画像フォルダのリンク)">
+        <button class="btn btn-primary" id="import-folder-btn" style="white-space:nowrap">フォルダから自動セット</button>
+      </div>
+      <div class="muted" style="font-size:11px;">
+        ファイル名「<%= draft.ne_code %>_00」= 白抜き背景 / 「<%= draft.ne_code %>_01」〜「_20」= 楽天の画像1〜20 として自動で振り分けます。
+        実行すると現在の商品画像は<b>フォルダの内容で置き換わります</b>
+      </div>
     </div>
-    <% if (images.length === 0) { %>
-      <p class="muted">まだ画像がありません。Drive で画像ファイルを右クリック →「リンクをコピー」で取得した URL を貼ってください。</p>
-    <% } else { %>
-      <div style="display:flex; gap:12px; flex-wrap:wrap;">
-        <% for (const img of images) { %>
-          <div style="text-align:center;">
-            <a href="<%= img.view_url %>" target="_blank" rel="noopener">
-              <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
-                   style="width:140px; height:140px; object-fit:cover; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
-            </a>
-            <div><button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button></div>
-          </div>
+
+    <%
+      const whiteBgTransferred = rakuten?.white_bg_drive_file_id
+        && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
+      const transferredIds = new Set(cabinetImages.map((c) => c.drive_file_id));
+      const slotCount = Math.max(20, images.length);
+    %>
+    <!-- スロットグリッド: 白抜き (00) + 楽天の登録口20個 -->
+    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr)); gap:10px;">
+      <div style="text-align:center;">
+        <div style="font-size:11px; color:#64748b; margin-bottom:2px;">00 白抜き</div>
+        <% if (rakuten?.white_bg_drive_file_id) { %>
+          <a href="<%= fileViewUrl(rakuten.white_bg_drive_file_id) %>" target="_blank" rel="noopener">
+            <img src="<%= thumbnailUrl(rakuten.white_bg_drive_file_id, 320) %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                 style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:2px solid #c7d2fe; background:#f8fafc;">
+          </a>
+          <div style="font-size:11px;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送' %></div>
+        <% } else { %>
+          <div style="width:100%; aspect-ratio:1; border:2px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px;">未設定</div>
         <% } %>
       </div>
-      <p class="muted" style="margin-bottom:0">※ サムネイルは Drive の閲覧権限があるアカウントでログインしたブラウザでのみ表示されます</p>
-    <% } %>
+      <% for (let i = 0; i < slotCount; i++) { const img = images[i]; const over = i >= 20; %>
+        <div style="text-align:center;">
+          <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= over ? ' ⚠上限超え' : '' %></div>
+          <% if (img) { %>
+            <a href="<%= img.view_url %>" target="_blank" rel="noopener">
+              <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                   style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:1px solid <%= over ? '#fca5a5' : '#e2e8f0' %>; background:#f8fafc;">
+            </a>
+            <div style="font-size:11px; display:flex; gap:4px; align-items:center; justify-content:center;">
+              <span><%= transferredIds.has(img.drive_file_id) ? '✅' : '⏳' %></span>
+              <button class="btn btn-sm btn-danger del-image-btn" data-id="<%= img.id %>">削除</button>
+            </div>
+          <% } else { %>
+            <div style="width:100%; aspect-ratio:1; border:2px dashed #e2e8f0; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:16px;">＋</div>
+          <% } %>
+        </div>
+      <% } %>
+    </div>
+    <p class="muted" style="font-size:11px; margin-top:8px;">※ サムネイルは Drive の閲覧権限があるアカウントでログインしたブラウザでのみ表示されます。✅ = R-Cabinet転送済み / ⏳ = 未転送</p>
+
+    <!-- 1枚ずつの追加 (差し替え・追加用。末尾のスロットに入る) -->
+    <div style="display:flex; gap:8px; margin-top:10px;">
+      <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンクを1枚ずつ追加)">
+      <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
+    </div>
+
     <div class="field" style="margin-top:14px;">
       <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
-      <%
-        const whiteBgTransferred = rakuten?.white_bg_drive_file_id
-          && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
-      %>
       <div style="display:flex; gap:8px; align-items:center;">
         <input type="text" id="rk-whitebg" style="flex:1;" value="<%= rakuten?.white_bg_drive_url || '' %>" placeholder="https://drive.google.com/file/d/...">
         <% if (rakuten?.white_bg_drive_file_id) { %>
@@ -1712,6 +1749,34 @@
 
   document.getElementById('add-image-btn').addEventListener('click', async () => {
     showAndReload(await post(BASE + '/images', { url: document.getElementById('new-image-url').value }), '追加しました');
+  });
+  document.getElementById('import-folder-btn').addEventListener('click', async () => {
+    const btn = document.getElementById('import-folder-btn');
+    const url = document.getElementById('import-folder-url').value.trim();
+    if (!url) return alert('画像フォルダのURLを入力してください');
+    const currentCount = <%= images.length %>;
+    if (currentCount > 0 && !confirm('現在の商品画像 ' + currentCount + ' 枚をフォルダの内容で置き換えます。よろしいですか？')) return;
+    btn.disabled = true; btn.textContent = '取込中…';
+    try {
+      const json = await post(BASE + '/images/import-folder', { url });
+      if (!json.ok) {
+        const details = []
+          .concat((json.conflicts || []).map((c) => '・_' + c.num + ' が複数あります: ' + c.names.join(' / ')))
+          .concat((json.skipped || []).map((s) => '・' + s.name + ' — ' + s.reason));
+        alert((json.error || 'エラーが発生しました') + (details.length ? '\n\n' + details.join('\n') : ''));
+        return;
+      }
+      let msg = '画像 ' + json.slots.length + ' 枚をセットしました'
+        + (json.whiteBg ? ' (白抜き背景もセット)' : '')
+        + (json.skipped && json.skipped.length ? ' / 対象外 ' + json.skipped.length + ' 件' : '');
+      const warns = (json.conflicts || []).map((c) => '_' + c.num + ' が複数あるためセットしませんでした: ' + c.names.join(' / '));
+      if (json.slots.length === 0 && !json.whiteBg) warns.push('番号付きの画像が見つかりませんでした');
+      if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
+      result.textContent = msg;
+      setTimeout(() => location.reload(), warns.length ? 100 : 600);
+    } finally {
+      btn.disabled = false; btn.textContent = 'フォルダから自動セット';
+    }
   });
   document.querySelectorAll('.del-image-btn').forEach((btn) => {
     btn.addEventListener('click', async () => {

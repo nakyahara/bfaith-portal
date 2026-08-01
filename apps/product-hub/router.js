@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 
 import {
-  getDB, logEvent, gateReasons, demoteIfGateBroken,
+  getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -26,8 +26,9 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages,
 } from './services/rakuten-listing.js';
+import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import {
@@ -231,6 +232,7 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
@@ -439,6 +441,45 @@ router.post('/api/drafts/:id/images/:imageId/delete', (req, res) => {
   // 最後の画像を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
   res.json({ ok: true, demoted: demoted || undefined });
+});
+
+// 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_番号」ファイルをスロットへ自動セット。
+// _00 = 白抜き背景 (whiteBgImage) / _01〜_20 = 楽天商品画像 1〜20 (並び順 = sort)。
+// 番号付き画像が1枚でも見つかったら draft_images は全置き換え (フォルダが正)。
+router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const raw = cleanText(req.body?.url, 1000) || draft.drive_folder_url;
+  if (!raw) return res.status(400).json({ ok: false, error: '画像フォルダのURLを入力してください' });
+  if (!isHttpUrl(raw)) return res.status(400).json({ ok: false, error: 'URLの形式が不正です' });
+  const parsed = parseDriveLink(raw);
+  if (!parsed || parsed.type === 'file') {
+    return res.status(400).json({ ok: false, error: 'Drive のフォルダリンクを貼ってください (https://drive.google.com/drive/folders/…)' });
+  }
+  let files;
+  try {
+    files = await listDriveFolderImages(parsed.id);
+  } catch (e) {
+    return res.status(502).json({
+      ok: false,
+      error: 'フォルダ一覧の取得に失敗しました。フォルダがサービスアカウントに共有されているか確認してください ('
+        + String(e.message || e).slice(0, 200) + ')',
+    });
+  }
+  const assigned = assignImageSlots(files, draft.ne_code);
+  if (!assigned.whiteBg && assigned.slots.length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: `_00〜_${MAX_IMAGE_SLOTS} の番号付き画像が見つかりませんでした (「${draft.ne_code}_01.jpg」のような名前にしてください)`,
+      skipped: assigned.skipped, conflicts: assigned.conflicts,
+    });
+  }
+  const db = getDB();
+  // 入力されたフォルダURLは基本情報にも保存 (次回はワンクリックで再取込できる)
+  applyFolderImport(db, draft.id, assigned, { folderUrl: raw, currentFolderUrl: draft.drive_folder_url });
+  logEvent(db, draft.id, 'images_imported_from_folder',
+    `画像${assigned.slots.length}枚 / 白抜き${assigned.whiteBg ? 'あり' : 'なし'}`, actorOf(req));
+  res.json({ ok: true, ...assigned });
 });
 
 router.post('/api/drafts/:id/specs', (req, res) => {

@@ -24,7 +24,7 @@ function check(name, cond, detail = '') {
 }
 
 // ─── drive-link ───
-const { parseDriveLink, thumbnailUrl } = await import('../lib/drive-link.js');
+const { parseDriveLink, thumbnailUrl, fileViewUrl } = await import('../lib/drive-link.js');
 check('parse file/d/', parseDriveLink('https://drive.google.com/file/d/1AbC_dEf-123456789012345/view?usp=sharing')?.id === '1AbC_dEf-123456789012345');
 check('parse open?id=', parseDriveLink('https://drive.google.com/open?id=1AbC_dEf-123456789012345')?.type === 'file');
 check('parse folders/', parseDriveLink('https://drive.google.com/drive/folders/0AMb_oOR8-Ss1Uk9PVA')?.type === 'folder');
@@ -32,6 +32,45 @@ check('parse u/0/folders', parseDriveLink('https://drive.google.com/drive/u/0/fo
 check('parse raw id', parseDriveLink('1AbC_dEf-1234567890123456789')?.type === 'unknown');
 check('parse garbage', parseDriveLink('https://example.com/x') === null);
 check('thumbnail url', thumbnailUrl('abc', 160).includes('sz=w160'));
+
+// ─── folder-import (画像フォルダ→スロット割当、2026-08-01) ───
+const { assignImageSlots, parseNumberedName, MAX_IMAGE_SLOTS } = await import('../lib/folder-import.js');
+check('MAX_IMAGE_SLOTS = 楽天の登録口20', MAX_IMAGE_SLOTS === 20);
+check('parseNumberedName 基本形', JSON.stringify(parseNumberedName('abc_01.jpg')) === '{"base":"abc","num":1}');
+check('parseNumberedName 番号なし', parseNumberedName('abc.jpg') === null);
+check('parseNumberedName 拡張子なし', parseNumberedName('abc_01') === null);
+check('parseNumberedName ゼロ埋めなし _5', parseNumberedName('abc_5.png')?.num === 5);
+
+const fim = (name, mimeType = 'image/jpeg') => ({ id: 'id-' + name, name, mimeType });
+let asn = assignImageSlots([fim('code_02.png'), fim('code_00.jpg'), fim('code_01.jpg')], 'code');
+check('_00→白抜き / _01,_02→スロット1,2 (番号順)',
+  asn.whiteBg?.id === 'id-code_00.jpg' && asn.slots.length === 2
+  && asn.slots[0].slot === 1 && asn.slots[0].id === 'id-code_01.jpg' && asn.slots[1].slot === 2,
+  JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('メモ.jpg'), fim('code_21.jpg'), fim('code_02.txt', 'text/plain')], 'code');
+check('番号なし/上限超え/非画像 → skipped',
+  asn.slots.length === 1 && asn.skipped.length === 3
+  && asn.skipped.some((s) => s.name === 'code_21.jpg'), JSON.stringify(asn.skipped));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('other_01.jpg'), fim('other_02.jpg')], 'code');
+check('商品コード一致があれば他コードは除外 (conflictにしない)',
+  asn.slots.length === 1 && asn.slots[0].id === 'id-code_01.jpg' && asn.conflicts.length === 0
+  && asn.skipped.length === 2, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('xxx_01.jpg'), fim('xxx_03.jpg')], 'code');
+check('コード一致ゼロなら寛容モード (全番号付きを採用・欠番はそのまま)',
+  asn.slots.length === 2 && asn.slots[0].slot === 1 && asn.slots[1].slot === 3, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('code_01.png')], 'code');
+check('同一番号の重複 → conflicts (セットしない)',
+  asn.slots.length === 0 && asn.conflicts.length === 1 && asn.conflicts[0].num === 1, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('CODE_01.JPG')], 'code');
+check('大文字小文字は同一視', asn.slots.length === 1, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_0.jpg'), fim('code_20.jpg')], 'code');
+check('_0 は白抜き / _20 は最終スロット', asn.whiteBg?.id === 'id-code_0.jpg' && asn.slots[0]?.slot === 20, JSON.stringify(asn));
 
 // ─── DB init (2回呼んで冪等) ───
 const { initMirrorDB } = await import('../../warehouse-mirror/db.js');
@@ -1292,6 +1331,34 @@ const variationFixtures = {
   detached: { kind: 'detached', groupKey: 'rooms-m-bk', repCode: null, isChild: false, memberCount: 0, members: [], excludedMembers: [], found: true },
 };
 
+// ─── applyFolderImport (フォルダ取込のDB反映、2026-08-01) ───
+db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, drive_folder_url)
+  VALUES ('FOLDER-1', 'フォルダ取込テスト', 'smoke', 'https://drive.google.com/drive/folders/OLDFOLDER')`).run();
+const fdraft = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'FOLDER-1'`).get();
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'hand-placed-old', 0)`).run(fdraft.id);
+dbmod.applyFolderImport(db, fdraft.id, {
+  whiteBg: { id: 'wb1', name: 'FOLDER-1_00.jpg' },
+  slots: [{ slot: 1, id: 'f1', name: 'FOLDER-1_01.jpg' }, { slot: 3, id: 'f3', name: 'FOLDER-1_03.jpg' }],
+  skipped: [], conflicts: [],
+}, { folderUrl: 'https://drive.google.com/drive/folders/NEWFOLDER', currentFolderUrl: fdraft.drive_folder_url });
+const fimgs = db.prepare('SELECT drive_file_id, sort FROM draft_images WHERE draft_id = ? ORDER BY sort').all(fdraft.id);
+check('取込で手貼り画像が置き換わる (sort = スロット番号-1)',
+  fimgs.length === 2 && fimgs[0].drive_file_id === 'f1' && fimgs[0].sort === 0
+  && fimgs[1].drive_file_id === 'f3' && fimgs[1].sort === 2, JSON.stringify(fimgs));
+const frk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(fdraft.id);
+check('白抜きが draft_rakuten に upsert される',
+  frk?.white_bg_drive_file_id === 'wb1' && frk.white_bg_drive_url.includes('wb1'), JSON.stringify(frk));
+check('フォルダURLが基本情報に保存される',
+  db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(fdraft.id).drive_folder_url.includes('NEWFOLDER'));
+db.prepare(`UPDATE draft_rakuten SET genre_id = '123456' WHERE draft_id = ?`).run(fdraft.id);
+dbmod.applyFolderImport(db, fdraft.id,
+  { whiteBg: { id: 'wb2', name: 'n' }, slots: [], skipped: [], conflicts: [] }, {});
+const fimgs2 = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? ORDER BY sort').all(fdraft.id);
+const frk2 = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(fdraft.id);
+check('白抜きのみの取込は商品画像を触らず、draft_rakuten の他カラムも保持',
+  fimgs2.length === 2 && frk2.white_bg_drive_file_id === 'wb2' && frk2.genre_id === '123456',
+  JSON.stringify({ fimgs2, frk2 }));
+
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
     title: 't', displayName: 'smoke',
@@ -1468,7 +1535,8 @@ const renders = [
 ];
 for (const [name, file, data] of renders) {
   try {
-    const html = await ejs.renderFile(path.join(views, file), data);
+    // thumbnailUrl / fileViewUrl は router が常に渡す共通 locals (画像スロットグリッドで使用)
+    const html = await ejs.renderFile(path.join(views, file), { thumbnailUrl, fileViewUrl, ...data });
     check(`render ${name}`, html.length > 500);
   } catch (e) {
     check(`render ${name}`, false, e.message);
