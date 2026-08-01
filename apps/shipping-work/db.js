@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -104,7 +104,21 @@ function migrate() {
 }
 
 const MIGRATIONS = {
-  1: createTablesV1,
+  1: createCoreTables,
+  // v2: actor系カラムを INTEGER → TEXT(email) に変更 (portal のセッションは数値IDを持たず
+  // email が既存アプリ共通のactor識別子のため。mis-shipment 等と同規約)。
+  // v1スキーマの本番DBは業務データ0件のうちに適用する前提。データがあれば安全側で停止。
+  2: () => {
+    const hasData = ['sw_batches', 'sw_sessions', 'sw_audit_logs'].some(
+      (t) => db.prepare(`SELECT COUNT(*) c FROM ${t}`).get().c > 0
+    );
+    if (hasData) throw new Error('shipping-work migration v2: 業務データが存在するため自動再作成を中止 (手動対応が必要)');
+    for (const t of ['sw_print_attempts', 'sw_print_jobs', 'sw_pauses', 'sw_sessions',
+      'sw_status_events', 'sw_mistakes', 'sw_audit_logs', 'sw_batches']) {
+      db.exec(`DROP TABLE IF EXISTS ${t}`);
+    }
+    createCoreTables();
+  },
 };
 
 export function getDB() {
@@ -112,7 +126,9 @@ export function getDB() {
   return db;
 }
 
-function createTablesV1() {
+// 正準DDL。fresh DBはv1でこれを作り、v2は旧v1スキーマのDBを作り直すために同じ関数を使う
+// (どちらの経路でも最終形が一致する)。
+function createCoreTables() {
   // 区分マスタ。kind: shipping_no / bunrui / packing_method / carrier /
   //   pause_reason_pick / pause_reason_pack / mistake_kind / print_trouble_reason
   db.exec(`CREATE TABLE IF NOT EXISTS sw_masters (
@@ -136,8 +152,8 @@ function createTablesV1() {
     status         TEXT NOT NULL DEFAULT 'ready'
       CHECK(status IN ('ready','picking','picked','sorting','sorted','packing','done','hold','stock_return','cancelled')),
     hold_from_status TEXT,                       -- 保留解除時の復帰先
-    pdf_path       TEXT,                         -- 添付帳票 (ピッキングリスト等)。PR2で添付UI
-    created_by     INTEGER NOT NULL,
+    pdf_path       TEXT,                         -- 添付帳票のファイル名 (DOCS_DIR相対)
+    created_by     TEXT NOT NULL,                -- 作成者 email
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     -- 業務キー: 同じ作業日に同じ出荷Noのバッチは1つ (現行Notion運用と同じ。
@@ -152,7 +168,7 @@ function createTablesV1() {
     batch_id    INTEGER NOT NULL REFERENCES sw_batches(id),
     from_status TEXT,
     to_status   TEXT NOT NULL,
-    actor_id    INTEGER NOT NULL,
+    actor       TEXT NOT NULL,      -- 操作者 email ('system'=自動遷移)
     via         TEXT NOT NULL CHECK(via IN ('button','auto','admin')),
     reason      TEXT,
     at          TEXT NOT NULL
@@ -164,7 +180,7 @@ function createTablesV1() {
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id          INTEGER NOT NULL REFERENCES sw_batches(id),
     process           TEXT NOT NULL CHECK(process IN ('picking','sorting','packing')),
-    worker_id         INTEGER NOT NULL,
+    worker            TEXT NOT NULL,   -- 作業者 email
     requested_at      TEXT NOT NULL,   -- 開始ボタン押下 (正常時の計測開始)
     print_accepted_at TEXT,            -- 印刷ブリッジ受付 (バイアス検証用・PR6)
     ended_at          TEXT,
@@ -180,8 +196,8 @@ function createTablesV1() {
   // 一人一作業の原則 (要件v2: 完了しないと次の仕事を取得できない) をDB制約で保証。
   // 応援・交代の例外運用が必要になったら PR3 で migration により見直す (Codex PR1レビュー#5)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_sessions_worker_open
-    ON sw_sessions(worker_id) WHERE outcome='open'`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_sw_sessions_worker ON sw_sessions(worker_id, requested_at)');
+    ON sw_sessions(worker) WHERE outcome='open'`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sw_sessions_worker ON sw_sessions(worker, requested_at)');
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_sessions_opid ON sw_sessions(op_id) WHERE op_id IS NOT NULL');
 
   // 保留区間 (セッションに紐付く。理由必須)
@@ -212,7 +228,7 @@ function createTablesV1() {
     -- テーブル再作成になるため PR1 で確保)
     status       TEXT NOT NULL DEFAULT 'requested'
       CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
-    requested_by INTEGER NOT NULL,
+    requested_by TEXT NOT NULL,      -- 要求者 email
     requested_at TEXT NOT NULL
   )`);
   db.exec(`CREATE TABLE IF NOT EXISTS sw_print_attempts (
@@ -236,14 +252,14 @@ function createTablesV1() {
     kind        TEXT NOT NULL,
     count       INTEGER NOT NULL CHECK(count > 0),
     note        TEXT,
-    recorded_by INTEGER NOT NULL,
+    recorded_by TEXT NOT NULL,       -- 記録者 email
     at          TEXT NOT NULL
   )`);
 
   // 管理者修正・重要操作 (追記のみ。UPDATE/DELETE はアプリ層で行わない)
   db.exec(`CREATE TABLE IF NOT EXISTS sw_audit_logs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    actor_id    INTEGER NOT NULL,
+    actor       TEXT NOT NULL,       -- 操作者 email
     action      TEXT NOT NULL,
     target      TEXT,
     before_json TEXT,
@@ -327,6 +343,114 @@ export function listMasters(kind) {
   return getDB().prepare(
     'SELECT code, label, sort FROM sw_masters WHERE kind = ? AND active = 1 ORDER BY sort'
   ).all(kind);
+}
+
+/** マスタ code の存在チェック (active のみ)。 */
+export function isValidMaster(kind, code) {
+  return !!getDB().prepare(
+    'SELECT 1 FROM sw_masters WHERE kind = ? AND code = ? AND active = 1'
+  ).get(kind, code);
+}
+
+// ─── バッチ CRUD (PR2: 管理者のみ。router 側で admin check 済みの前提) ───
+
+/** 帳票PDFの保存ディレクトリ。この外のパスは serve しない (パストラバーサル防止)。 */
+export const DOCS_DIR = path.join(DATA_DIR, 'shipping-work-docs');
+
+/** 監査ログ追記 (追記のみ。修正・削除APIは作らない)。actor は email。 */
+export function addAuditLog(actor, action, target, before, after, reason) {
+  getDB().prepare(`
+    INSERT INTO sw_audit_logs (actor, action, target, before_json, after_json, reason, at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(actor, action, target,
+    before == null ? null : JSON.stringify(before),
+    after == null ? null : JSON.stringify(after),
+    reason ?? null, utcNow());
+}
+
+/** ステータス遷移イベント追記。バッチ本体の status 更新は呼び出し側のトランザクションで行う。 */
+export function addStatusEvent(batchId, fromStatus, toStatus, actor, via, reason) {
+  getDB().prepare(`
+    INSERT INTO sw_status_events (batch_id, from_status, to_status, actor, via, reason, at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(batchId, fromStatus, toStatus, actor, via, reason ?? null, utcNow());
+}
+
+/**
+ * バッチ作成 (status_events と同一トランザクション)。
+ * UNIQUE(work_date, shipping_no) 違反は SQLITE_CONSTRAINT_UNIQUE で throw (router 側で 409 に変換)。
+ */
+export function createBatch({ workDate, shippingNo, bunrui, packingMethod, carriers, slipCount, note, pdfPath }, actor) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const info = db.prepare(`
+      INSERT INTO sw_batches
+        (work_date, shipping_no, bunrui, packing_method, carriers_json, slip_count, note, status, pdf_path, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+    `).run(workDate, shippingNo, bunrui, packingMethod,
+      JSON.stringify(carriers ?? []), slipCount ?? null, note ?? null,
+      pdfPath ?? null, actor, now, now);
+    const id = Number(info.lastInsertRowid);
+    addStatusEvent(id, null, 'ready', actor, 'admin', 'バッチ作成');
+    return id;
+  })();
+}
+
+/**
+ * バッチ更新 (ready のみ・作業開始後は PR5 の手動修正フローで扱う)。
+ * 更新できたら true。ready でなくなっていたら false (楽観排他)。
+ */
+export function updateBatch(id, { bunrui, packingMethod, carriers, slipCount, note, pdfPath }, actor) {
+  const db = getDB();
+  return db.transaction(() => {
+    const before = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
+    if (!before || before.status !== 'ready') return { ok: false };
+    const res = db.prepare(`
+      UPDATE sw_batches SET bunrui=?, packing_method=?, carriers_json=?, slip_count=?, note=?,
+        pdf_path=COALESCE(?, pdf_path), updated_at=?
+      WHERE id=? AND status='ready'
+    `).run(bunrui, packingMethod, JSON.stringify(carriers ?? []), slipCount ?? null,
+      note ?? null, pdfPath ?? null, utcNow(), id);
+    if (res.changes === 0) return { ok: false };
+    const after = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
+    addAuditLog(actor, 'batch_update', `sw_batches:${id}`, before, after, null);
+    // PDF差し替え時は呼び出し側が旧ファイルを削除する (成功後のみ。Codex PR2レビュー#1)
+    return { ok: true, replacedPdf: pdfPath ? before.pdf_path : null };
+  })();
+}
+
+/**
+ * バッチ取消 (ready のみ。hold は進行中セッション・未解除保留を持つため、
+ * それらの同時クローズが必要 = PR5 の手動修正フローで扱う。Codex PR2レビュー#2)。
+ * 取消できたら true。対象外ステータスなら false。理由必須。
+ */
+export function cancelBatch(id, actor, reason) {
+  const db = getDB();
+  return db.transaction(() => {
+    const before = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
+    if (!before || before.status !== 'ready') return false;
+    db.prepare("UPDATE sw_batches SET status='cancelled', updated_at=? WHERE id=?")
+      .run(utcNow(), id);
+    addStatusEvent(id, before.status, 'cancelled', actor, 'admin', reason);
+    addAuditLog(actor, 'batch_cancel', `sw_batches:${id}`, { status: before.status }, { status: 'cancelled' }, reason);
+    return true;
+  })();
+}
+
+/** 管理画面用: 指定作業日の全バッチ (cancelled 含む・作成順)。 */
+export function listAdminBatches(workDate) {
+  return getDB().prepare(`
+    SELECT b.*,
+      (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
+      (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
+      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
+    FROM sw_batches b WHERE b.work_date = ? ORDER BY b.id
+  `).all(workDate);
+}
+
+export function getBatch(id) {
+  return getDB().prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
 }
 
 /**

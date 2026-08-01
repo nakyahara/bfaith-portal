@@ -44,7 +44,7 @@
     <span class="date">作業日: <%= workDate %></span>
     <span>バッチ <%= totalCount %> 件</span>
     <% if (isAdmin) { %>
-      <span style="color:#868e96">(バッチ作成・管理画面は PR2 で追加)</span>
+      <a href="/apps/shipping-work/admin/batches">バッチ管理</a>
     <% } %>
   </div>
 
@@ -79,9 +79,11 @@
       const board = document.querySelector('.sw-board');
       const saved = sessionStorage.getItem('sw-kanban-scroll');
       if (saved) {
-        const { x, y } = JSON.parse(saved);
-        board.scrollLeft = x;
-        window.scrollTo(0, y);
+        try {
+          const { x, y } = JSON.parse(saved);
+          board.scrollLeft = x;
+          window.scrollTo(0, y);
+        } catch { sessionStorage.removeItem('sw-kanban-scroll'); }
       }
       setTimeout(() => {
         sessionStorage.setItem('sw-kanban-scroll', JSON.stringify({ x: board.scrollLeft, y: window.scrollY }));

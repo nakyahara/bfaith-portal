@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .sw-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px; }
+    .sw-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+    .sw-form h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .sw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+    .sw-grid label { display: block; font-size: 0.8em; color: #495057; margin-bottom: 3px; }
+    .sw-grid select, .sw-grid input[type=date], .sw-grid input[type=number],
+    .sw-grid input[type=text], .sw-grid input[type=file] { width: 100%; padding: 6px; box-sizing: border-box; }
+    .sw-carriers { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; }
+    .sw-carriers label { font-size: 0.85em; display: inline-flex; align-items: center; gap: 3px; margin: 0; }
+    .sw-actions { margin-top: 12px; display: flex; gap: 10px; align-items: center; }
+    .sw-actions button { padding: 8px 22px; font-size: 1em; cursor: pointer; }
+    .sw-msg { font-size: 0.9em; }
+    .sw-msg.err { color: #c92a2a; } .sw-msg.ok { color: #2b8a3e; }
+    table.sw-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.sw-list th, table.sw-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    table.sw-list th { background: #f1f3f5; }
+    tr.cancelled td { color: #adb5bd; text-decoration: line-through; }
+    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.92em; }
+    .st.ready { background: #d0ebff; } .st.done { background: #d3f9d8; }
+    .st.hold { background: #fff3bf; } .st.cancelled { background: #f1f3f5; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🏭 バッチ管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/" class="btn-logout">← カンバン</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="sw-wrap">
+    <div class="sw-form">
+      <h2 id="formTitle">バッチ作成</h2>
+      <form id="createForm">
+        <div class="sw-grid">
+          <div>
+            <label>作業日</label>
+            <input type="date" name="work_date" value="<%= workDate %>" required>
+          </div>
+          <div>
+            <label>出荷No</label>
+            <select name="shipping_no" required>
+              <option value="">選択</option>
+              <% for (const m of masters.shippingNo) { %><option value="<%= m.code %>"><%= m.label %></option><% } %>
+            </select>
+          </div>
+          <div>
+            <label>発送分類</label>
+            <select name="bunrui" required>
+              <% for (const m of masters.bunrui) { %><option value="<%= m.code %>"><%= m.label %></option><% } %>
+            </select>
+          </div>
+          <div>
+            <label>梱包方法</label>
+            <select name="packing_method" required>
+              <% for (const m of masters.packingMethod) { %><option value="<%= m.code %>"><%= m.label %></option><% } %>
+            </select>
+          </div>
+          <div>
+            <label>伝票件数</label>
+            <input type="number" name="slip_count" min="1" placeholder="例: 26">
+          </div>
+          <div>
+            <label>帳票PDF (任意)</label>
+            <input type="file" name="pdf" accept="application/pdf">
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <label style="font-size:0.8em;color:#495057">配送種別 (複数可)</label>
+          <div class="sw-carriers">
+            <% for (const m of masters.carrier) { %>
+              <label><input type="checkbox" name="carriers" value="<%= m.code %>"><%= m.label %></label>
+            <% } %>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <label style="font-size:0.8em;color:#495057">メモ</label>
+          <input type="text" name="note" style="width:100%;padding:6px;box-sizing:border-box" placeholder="注意事項など">
+        </div>
+        <div class="sw-actions">
+          <button type="submit" id="submitBtn">作成</button>
+          <button type="button" id="cancelEditBtn" style="display:none" onclick="exitEditMode()">編集をやめる</button>
+          <span id="createMsg" class="sw-msg"></span>
+        </div>
+      </form>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+      <h2 style="font-size:1.0em;margin:0"><%= workDate %> のバッチ (<%= batches.length %>件)</h2>
+      <form method="get" style="margin:0">
+        <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
+      </form>
+    </div>
+    <table class="sw-list">
+      <thead>
+        <tr><th>ID</th><th>出荷No</th><th>状態</th><th>発送分類</th><th>梱包方法</th><th>件数</th><th>メモ</th><th>PDF</th><th></th></tr>
+      </thead>
+      <tbody>
+        <% if (batches.length === 0) { %>
+          <tr><td colspan="9" style="color:#adb5bd;text-align:center">バッチがありません</td></tr>
+        <% } %>
+        <% for (const b of batches) { %>
+          <tr class="<%= b.status === 'cancelled' ? 'cancelled' : '' %>">
+            <td><%= b.id %></td>
+            <td><%= b.shipping_no_label || b.shipping_no %></td>
+            <td><span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %></span></td>
+            <td><%= b.bunrui_label || b.bunrui %></td>
+            <td><%= b.packing_method_label || b.packing_method %></td>
+            <td><%= b.slip_count ?? '' %></td>
+            <td><%= b.note || '' %></td>
+            <td><% if (b.pdf_path) { %><a href="/apps/shipping-work/admin/batches/<%= b.id %>/pdf" target="_blank">表示</a><% } %></td>
+            <td>
+              <% if (b.status === 'ready') { %>
+                <button class="btn-sm" data-id="<%= b.id %>" data-bunrui="<%= b.bunrui %>"
+                  data-packing="<%= b.packing_method %>" data-carriers="<%= b.carriers_json %>"
+                  data-slip="<%= b.slip_count ?? '' %>" data-note="<%= b.note || '' %>"
+                  onclick="enterEditMode(this)">編集</button>
+                <button class="btn-sm" onclick="cancelBatch(<%= b.id %>)">取消</button>
+              <% } %>
+            </td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const createForm = document.getElementById('createForm');
+    const createMsg = document.getElementById('createMsg');
+    let editingId = null;  // null=作成モード / 数値=編集モード (readyのみ・業務キーは変更不可)
+
+    function enterEditMode(btn) {
+      editingId = Number(btn.dataset.id);
+      const f = createForm;
+      f.elements.bunrui.value = btn.dataset.bunrui;
+      f.elements.packing_method.value = btn.dataset.packing;
+      f.elements.slip_count.value = btn.dataset.slip;
+      f.elements.note.value = btn.dataset.note;
+      let carriers = [];
+      try { carriers = JSON.parse(btn.dataset.carriers); } catch {}
+      for (const cb of f.querySelectorAll('input[name=carriers]')) cb.checked = carriers.includes(cb.value);
+      f.elements.work_date.disabled = true;
+      f.elements.shipping_no.disabled = true;
+      document.getElementById('formTitle').textContent = `バッチ #${editingId} を編集 (作業日・出荷Noは変更不可)`;
+      document.getElementById('submitBtn').textContent = '更新';
+      document.getElementById('cancelEditBtn').style.display = '';
+      createMsg.textContent = '';
+      window.scrollTo(0, 0);
+    }
+
+    function exitEditMode() {
+      editingId = null;
+      createForm.reset();
+      createForm.elements.work_date.disabled = false;
+      createForm.elements.shipping_no.disabled = false;
+      createForm.elements.work_date.value = '<%= workDate %>';
+      document.getElementById('formTitle').textContent = 'バッチ作成';
+      document.getElementById('submitBtn').textContent = '作成';
+      document.getElementById('cancelEditBtn').style.display = 'none';
+      createMsg.textContent = '';
+    }
+
+    createForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      createMsg.textContent = editingId ? '更新中...' : '作成中...'; createMsg.className = 'sw-msg';
+      const fd = new FormData(createForm);
+      const url = editingId
+        ? `/apps/shipping-work/api/admin/batches/${editingId}/update`
+        : '/apps/shipping-work/api/admin/batches';
+      try {
+        const r = await fetch(url, { method: 'POST', body: fd });
+        const j = await r.json();
+        if (!r.ok) { createMsg.textContent = j.error || 'エラー'; createMsg.className = 'sw-msg err'; return; }
+        location.reload();
+      } catch {
+        createMsg.textContent = '通信エラー'; createMsg.className = 'sw-msg err';
+      }
+    });
+
+    async function cancelBatch(id) {
+      const reason = prompt('取消理由を入力してください (必須)');
+      if (reason === null) return;
+      if (!reason.trim()) { alert('取消理由は必須です'); return; }
+      const r = await fetch(`/apps/shipping-work/api/admin/batches/${id}/cancel`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: reason.trim() }),
+      });
+      const j = await r.json();
+      if (!r.ok) { alert(j.error || 'エラー'); return; }
+      location.reload();
+    }
+  </script>
+</body>
+</html>
