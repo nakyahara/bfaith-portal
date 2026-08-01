@@ -75,6 +75,8 @@ import { serviceAuth } from './apps/warehouse/service-auth.js';
 import { neSyncControlRouter } from './apps/warehouse/ne-sync-control-router.js';
 import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
+import jobsMonitorRouter from './apps/jobs-monitor/router.js';
+import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1145,6 +1147,16 @@ if (process.env.ENABLE_MINIPC_NE_SYNC_CONTROL === '1') {
 if (process.env.ENABLE_ABA_EXT === '1') {
   app.use('/aba-ext-api', abaExtRouter);
   console.log('[server] aba-ext-api mounted (miniPC mode)');
+}
+
+// 定期実行の見張り役 (jobs-monitor)。Render 専用 env で mount 自体を gate —
+// miniPC も同じ server.js を動かすため、無条件 mount だと監視が二重に立ち
+// 誤通知の温床になる (feedback_minipc_shares_portal_server_js の教訓)。
+// 認証は router 内 (Bearer JOBS_MONITOR_TOKEN、health のみ公開・情報最小)。
+if (process.env.JOBS_MONITOR_ENABLED === '1') {
+  app.use('/apps/jobs-monitor', jobsMonitorRouter);
+  startJobsMonitor();
+  console.log('[server] jobs-monitor mounted');
 }
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲
