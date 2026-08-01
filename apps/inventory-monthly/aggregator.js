@@ -278,15 +278,20 @@ export function aggregateInventory({ fbaRows = [], ownRows = [], usFbaRows = nul
 }
 
 /**
- * mirror_inv_daily_summary / mirror_inv_daily_detail から指定日の集計を再構成する。
+ * mirror_inv_daily_summary / mirror_inv_daily_detail から月末在庫を再構成する。
  * CSV アップロード経路の代替: 毎朝 sync された mirror データを使うことで CSV 取得不要にする。
  *
- * 同じ商品×同じ日付なら CSV 経路と数値は一致する想定 (どちらも同じ原価マスタを使う)。
+ * ⭐ 断面の定義 (2026-08 変更): snapshot_date (例 7/31) の月末在庫は
+ *    「翌日朝 (business_date = snapshot_date + 1日、例 8/1 朝7時) の取得断面」から作る。
+ *    business_date は毎朝の取得時点の日付なので、snapshot_date 当日の business_date を読むと
+ *    月末最終日の出荷・入荷が反映されない (実質前日末)。旧 CSV 手動運用も
+ *    「月初にCSVをDL = 前日末の状態」だったので、この定義が旧運用と一致する。
+ *    厳密には「翌朝観測値を用いた月末期末推計」(深夜0時〜朝7時の在庫移動は軽微として補正なし)。
  *
  * 入力:
- *   - snapshot_date: 'YYYY-MM-DD'
+ *   - snapshot_date: 'YYYY-MM-DD' (実在日であること)
  *   - pendingRows: [{ supplier_name, amount, note }] (発注後未着は手動入力のみ)
- * 出力: aggregateInventory() と同じ形 { totals, details, warnings }
+ * 出力: aggregateInventory() と同じ形 { totals, details, warnings } + source_business_date
  */
 const MIRROR_STATUS_TO_LEGACY = {
   ok: 'COMPLETE',
@@ -298,39 +303,125 @@ const MIRROR_CATEGORY_TO_LEGACY = {
   fba_us_inbound: 'fba_us',
 };
 
+// mirror 経路で必須のカテゴリ。summary に行自体が無いカテゴリを 0 円として
+// 静かに保存しないためのガード (source_status チェックは「存在する行」にしか効かない)
+const REQUIRED_MIRROR_CATEGORIES = ['own_warehouse', 'fba_warehouse', 'fba_inbound', 'fba_us_warehouse', 'fba_us_inbound'];
+
+/** 'YYYY-MM-DD' が実在日か検証 (2026-02-31 のような日付を弾く) */
+export function isValidIsoDate(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso || '')) return false;
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/** 実在日 'YYYY-MM-DD' に n 日足す (UTC 演算なので月跨ぎ・年跨ぎ・うるう年安全) */
+export function addDaysIso(iso, n) {
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + n));
+  return dt.toISOString().slice(0, 10);
+}
+
 export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
   const db = getDB();
 
-  // 1) サマリ → totals
-  const summaryRows = db.prepare(
-    `SELECT category, total_value, source_status
-     FROM mirror_inv_daily_summary WHERE business_date = ?`
-  ).all(snapshot_date);
-  if (summaryRows.length === 0) {
-    throw new Error(`${snapshot_date} の在庫スナップショットが mirror に存在しません (sync 待ち or 別日付を指定)`);
+  if (!isValidIsoDate(snapshot_date)) {
+    const err = new Error(`棚卸し基準日が不正です: ${snapshot_date}`);
+    err.statusCode = 400;
+    throw err;
   }
+  // 読み取る断面 = 翌日朝の business_date (ヘッダコメント参照)
+  const source_business_date = addDaysIso(snapshot_date, 1);
 
-  // [Codex R1 #1] source_status チェック: no_source / failed の日は保存・プレビュー共に拒否
-  // 「正常な 0 円在庫」として履歴保存される事故を防ぐ
-  const fatalRows = summaryRows.filter(r => r.source_status === 'no_source' || r.source_status === 'failed');
-  if (fatalRows.length > 0) {
-    const cats = fatalRows.map(r => `${r.category}=${r.source_status}`).join(', ');
-    throw new Error(`${snapshot_date} の在庫データは不完全です (${cats})。SP-API 取得失敗 or sync 未完了の可能性があるので、cron 完了を待つか別日付を指定してください。`);
-  }
+  // 1) summary / detail の読み取り + 整合性検査。
+  // 単一の読取トランザクションで囲み、検査と明細取得の間に sync の書き込みが
+  // 挟まって別世代のデータを読む余地 (TOCTOU) を塞ぐ (Codex R2 High)。
+  // ※ better-sqlite3 は同期実行なので同一プロセス内では元々割り込み不可。
+  //   これは将来の複数プロセス化・非同期化への防御。
+  const readSnapshot = db.transaction(() => {
+    const summaryRows = db.prepare(
+      `SELECT category, total_qty, total_value, source_status
+       FROM mirror_inv_daily_summary WHERE business_date = ?`
+    ).all(source_business_date);
+    if (summaryRows.length === 0) {
+      const latest = db.prepare(`SELECT MAX(business_date) AS d FROM mirror_inv_daily_summary`).get()?.d || 'なし';
+      const err = new Error(
+        `${snapshot_date} の月末在庫は翌朝 ${source_business_date} の同期データから作成しますが、` +
+        `mirror に business_date=${source_business_date} がありません (mirror 最新=${latest})。` +
+        `翌朝の daily-sync 完了後に再実行してください。`
+      );
+      err.statusCode = 409; // source 未着 = 再試行で解消し得る
+      throw err;
+    }
 
-  // [Codex R1 #2 / R2 #1] summary/detail 世代不一致チェック
-  // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る
-  // 検出条件: total_qty > 0 の category は detail にも行が必要
-  //   - total_qty=0 (例: fba_us_inbound qty=0) なら detail 行は生成されないので check 不要
-  //   - total_qty>0 で source_status='partial'/cost_missing のみでも detail に SKU 行は生成される
-  const detailCats = new Set(
-    db.prepare(`SELECT DISTINCT category FROM mirror_inv_daily_detail WHERE business_date = ?`)
-      .all(snapshot_date).map(r => r.category)
-  );
-  const missingDetailCats = summaryRows.filter(r => Number(r.total_qty || 0) > 0 && !detailCats.has(r.category));
-  if (missingDetailCats.length > 0) {
-    throw new Error(`${snapshot_date} の明細 (mirror_inv_daily_detail) が summary と一致しません (${missingDetailCats.map(r => r.category).join(',')} の detail 未着)。次回 sync 完了まで待ってください。`);
-  }
+    // [Codex R1 #1] source_status チェック: no_source / failed の日は保存・プレビュー共に拒否
+    // 「正常な 0 円在庫」として履歴保存される事故を防ぐ
+    const fatalRows = summaryRows.filter(r => r.source_status === 'no_source' || r.source_status === 'failed');
+    if (fatalRows.length > 0) {
+      const cats = fatalRows.map(r => `${r.category}=${r.source_status}`).join(', ');
+      const err = new Error(`${source_business_date} 朝の在庫データは不完全です (${cats})。SP-API 取得失敗 or sync 未完了の可能性があるので、cron 完了を待つか別日付を指定してください。`);
+      err.statusCode = 409;
+      throw err;
+    }
+
+    // 必須カテゴリの存在チェック: summary 行自体が欠けている場合は fail-closed
+    const presentCats = new Set(summaryRows.map(r => r.category));
+    const absentCats = REQUIRED_MIRROR_CATEGORIES.filter(c => !presentCats.has(c));
+    if (absentCats.length > 0) {
+      const err = new Error(`${source_business_date} 朝の summary に必須カテゴリがありません (${absentCats.join(', ')})。sync 未完了の可能性があります。`);
+      err.statusCode = 409;
+      throw err;
+    }
+
+    // [Codex R1 #2 / R2 #1] summary/detail 世代不一致チェック
+    // sync は summary / detail を別 payload で送るため「summary は新、detail は古い」状態が一瞬発生し得る。
+    // 3層で突合する:
+    //   a) 数量: total_qty vs SUM(qty) の厳密一致 (total_qty=0 カテゴリも検査 — Codex R1 #3)
+    //   b) 金額: total_value vs SUM(total_value) の一致 (許容誤差1円 = 浮動小数の加算順差のみ許す)。
+    //      数量が偶然一致しても原価・SKU構成だけ変わった世代ズレを検出する (Codex R2 High)
+    //   c) detail 内の snapshot_run_id 混在: 同一 business_date に複数世代の行が残っている状態を検出
+    // 完全な保証は summary 側にも snapshot_run_id を持たせて照合すること (miniPC + mirror の
+    // スキーマ変更が必要なため別PR。summary には現状 run_id 列が無い)。
+    const detailAgg = new Map(
+      db.prepare(`SELECT category, SUM(qty) AS q, SUM(total_value) AS v FROM mirror_inv_daily_detail WHERE business_date = ? GROUP BY category`)
+        .all(source_business_date).map(r => [r.category, { q: Number(r.q), v: Number(r.v || 0) }])
+    );
+    const mismatchCats = summaryRows
+      .filter(r => {
+        const agg = detailAgg.get(r.category);
+        if ((agg?.q ?? 0) !== Number(r.total_qty || 0)) return true;
+        return Math.abs((agg?.v ?? 0) - Number(r.total_value || 0)) > 1;
+      })
+      .map(r => {
+        const agg = detailAgg.get(r.category);
+        return `${r.category} (summary: qty=${r.total_qty}/value=${Math.round(r.total_value || 0)}, detail: qty=${agg?.q ?? 'なし'}/value=${Math.round(agg?.v || 0)})`;
+      });
+    if (mismatchCats.length > 0) {
+      const err = new Error(`${source_business_date} 朝の明細 (mirror_inv_daily_detail) が summary と一致しません: ${mismatchCats.join(', ')}。次回 sync 完了まで待ってください。`);
+      err.statusCode = 409;
+      throw err;
+    }
+    const runIdCount = db.prepare(
+      `SELECT COUNT(DISTINCT snapshot_run_id) AS n FROM mirror_inv_daily_detail WHERE business_date = ? AND snapshot_run_id IS NOT NULL`
+    ).get(source_business_date)?.n ?? 0;
+    if (runIdCount > 1) {
+      const err = new Error(`${source_business_date} 朝の明細に複数世代 (snapshot_run_id ${runIdCount}種) が混在しています。次回 sync 完了まで待ってください。`);
+      err.statusCode = 409;
+      throw err;
+    }
+
+    const detailRows = db.prepare(`
+      SELECT category, source_item_code, ne_code,
+             COALESCE(product_name, source_product_name, '') AS product_name,
+             qty, unit_cost, total_value, cost_status, resolution_method
+      FROM mirror_inv_daily_detail
+      WHERE business_date = ?
+      ORDER BY category, ne_code
+    `).all(source_business_date);
+
+    return { summaryRows, detailRows };
+  });
+  const { summaryRows, detailRows } = readSnapshot();
 
   const byCat = Object.fromEntries(summaryRows.map(r => [r.category, r]));
   const v = (cat) => Number(byCat[cat]?.total_value || 0);
@@ -349,16 +440,8 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
     total: Math.round(rawTotal),
   };
 
-  // 2) 明細 → details (mirror_inv_daily_detail はすでにセット展開済 + 原価適用済)
-  const detailRows = db.prepare(`
-    SELECT category, source_item_code, ne_code,
-           COALESCE(product_name, source_product_name, '') AS product_name,
-           qty, unit_cost, total_value, cost_status, resolution_method
-    FROM mirror_inv_daily_detail
-    WHERE business_date = ?
-    ORDER BY category, ne_code
-  `).all(snapshot_date);
-
+  // 2) 明細 → details (mirror_inv_daily_detail はすでにセット展開済 + 原価適用済。
+  //    detailRows は readSnapshot トランザクション内で summary と同時に取得済み)
   const details = detailRows.map(d => {
     let 原価状態 = MIRROR_STATUS_TO_LEGACY[d.cost_status] || d.cost_status || 'UNKNOWN';
     if (d.resolution_method === 'unresolved') 原価状態 = 'UNMAPPED_SKU';
@@ -391,7 +474,7 @@ export function aggregateFromMirror({ snapshot_date, pendingRows = [] }) {
     partialCategories: summaryRows.filter(r => r.source_status === 'partial').map(r => r.category),
   };
 
-  return { totals, details, warnings };
+  return { totals, details, warnings, source_business_date };
 }
 
 /** 集計結果を inv_snapshot* に保存。同一日が既存なら上書きする。 */
