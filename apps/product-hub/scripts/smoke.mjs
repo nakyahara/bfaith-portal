@@ -763,7 +763,7 @@ db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, arti
   VALUES (?, '205761', '[{"name":"ブランド名","values":["ノーブランド品"]}]', NULL)`).run(rkId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gfile1')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
-db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文')`).run(rkId, rkId, rkId);
+db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文'), (?, 'desc_notes', 'AI注意書き文')`).run(rkId, rkId, rkId, rkId);
 db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
 
 built = listing.buildItemPayload(db, rkId);
@@ -772,7 +772,68 @@ const pl = built.payload;
 check('payload: hideItem=true 固定 (非公開登録のみ)', pl.hideItem === true);
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
-check('payload: 説明文に特徴+仕様表', pl.productDescription.pc.includes('特徴文') && pl.productDescription.pc.includes('サイズ: W10cm'));
+// 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
+check('payload: PC説明文は表形式 — 説明行に商品名+特徴',
+  pl.productDescription.pc.startsWith('<table')
+  && pl.productDescription.pc.includes('<b>説明</b>')
+  && pl.productDescription.pc.includes('楽天用タイトル')
+  && pl.productDescription.pc.includes('特徴文'),
+  pl.productDescription.pc);
+check('payload: 仕様表は1項目1行',
+  pl.productDescription.pc.includes('<b>サイズ</b>') && pl.productDescription.pc.includes('<td>W10cm</td>'));
+check('payload: 注意事項行 = AI注意書き + 固定文 (説明の直後)',
+  pl.productDescription.pc.includes('AI注意書き文<br>※モニター画面の状況')
+  && pl.productDescription.pc.indexOf('<b>注意事項</b>') < pl.productDescription.pc.indexOf('<b>サイズ</b>'));
+check('payload: 販売説明文 = 商品画像の画像HTML',
+  pl.salesDescription === '<img src="https://image.rakuten.co.jp/b-faith/cabinet/app-newitems/rk-smoke-1-1.jpg" width="100%" border="0"><br><br><br>',
+  pl.salesDescription);
+check('payload: スマホ用説明文 = 販売説明文 + PC説明文',
+  pl.productDescription.sp === pl.salesDescription + '\n' + pl.productDescription.pc);
+
+// 10240字ガード (Codex R1 Low): PC説明文の超過は理由で止める
+db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(11000), rkId);
+let bLen = listing.buildItemPayload(db, rkId);
+check('payload: PC説明文10240字超は理由で止める',
+  bLen.ok === false && bLen.reasons.some((r) => r.includes('PC用商品説明文が長すぎます')), JSON.stringify(bLen.reasons));
+// スマホ用だけが連結で超過するケース (PC・販売は上限内)
+db.prepare(`UPDATE draft_ai_outputs SET content = ? WHERE draft_id = ? AND kind = 'desc_features'`).run('あ'.repeat(6000), rkId);
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'glong')`).run(rkId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'glong', ?)`).run(rkId, '/app-newitems/' + 'x'.repeat(4000) + '.jpg');
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
+  bLen.ok === false
+  && bLen.reasons.some((r) => r.includes('スマホ用商品説明文'))
+  && !bLen.reasons.some((r) => r.includes('PC用商品説明文'))
+  && !bLen.reasons.some((r) => r.includes('画像HTML')),
+  JSON.stringify(bLen.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
+db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
+db.prepare(`UPDATE draft_ai_outputs SET content = '特徴文' WHERE draft_id = ? AND kind = 'desc_features'`).run(rkId);
+
+// 販売説明文単独の境界 (Codex R2 Low): ちょうど10240字は販売ガードにかからず、+1字でかかる
+const salesLine1Len = listing.buildSalesDescriptionHtml(['/app-newitems/rk-smoke-1-1.jpg']).length;
+const salesEmptyLen = listing.buildSalesDescriptionHtml(['']).length;
+const exactLocLen = 10240 - salesLine1Len - 1 - salesEmptyLen; // -1 は行間の '\n'
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gedge')`).run(rkId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gedge', ?)`).run(rkId, '/' + 'x'.repeat(exactLocLen - 1));
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: 販売説明文ちょうど10240字は販売ガードにかからない (連結のスマホ用のみ)',
+  bLen.ok === false && !bLen.reasons.some((r) => r.includes('画像HTML')) && bLen.reasons.some((r) => r.includes('スマホ用')),
+  JSON.stringify(bLen.reasons));
+db.prepare(`UPDATE draft_cabinet_images SET cabinet_location = ? WHERE draft_id = ? AND drive_file_id = 'gedge'`).run('/' + 'x'.repeat(exactLocLen), rkId);
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: 販売説明文10241字は理由で止める', bLen.ok === false && bLen.reasons.some((r) => r.includes('画像HTML')), JSON.stringify(bLen.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
+db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
+
+// env の悪意ある値は既定URLへフォールバック (Codex R2 Low: R1修正の回帰テスト)
+process.env.PH_CABINET_IMAGE_BASE = '"><script>alert(1)<' + '/script>';
+check('salesDesc: 引用符/タグ入りenvは既定URLへフォールバック',
+  listing.buildSalesDescriptionHtml(['/a/b.jpg']) === '<img src="https://image.rakuten.co.jp/b-faith/cabinet/a/b.jpg" width="100%" border="0"><br><br><br>');
+process.env.PH_CABINET_IMAGE_BASE = 'http://evil.example/x';
+check('salesDesc: http のenvは拒否して既定URL',
+  listing.buildSalesDescriptionHtml(['/a/b.jpg']).startsWith('<img src="https://image.rakuten.co.jp/b-faith/cabinet/'));
+delete process.env.PH_CABINET_IMAGE_BASE;
 check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
@@ -822,6 +883,7 @@ check('payload: whiteBgImage は images と別枠',
   && b27.payload.whiteBgImage?.location === '/app-newitems/rk-smoke-1-white.jpg'
   && b27.payload.images.every((i) => i.location !== '/app-newitems/rk-smoke-1-white.jpg'),
   JSON.stringify(b27.reasons || b27.payload?.images));
+check('payload: 販売説明文にも白抜き画像は入れない', !b27.payload.salesDescription.includes('white'));
 
 // 不正値は理由で弾く
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '99', normal_delivery_date_id = 'abc' WHERE draft_id = ?`).run(rkId);
@@ -877,11 +939,24 @@ check('payload: 充足すると説明文末尾に表を連結 (発送方法=ア�
   && b27.payload.productDescription.pc.includes('ネコポス'),
   JSON.stringify(b27.reasons || null));
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
+// 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
+db.prepare(`UPDATE draft_page_info SET size_text = '約W5cm' WHERE draft_id = ?`).run(rkId);
+b27 = listing.buildItemPayload(db, rkId);
+check('payload: 仕様表とページ表記の同名ラベルはページ表記が正 (サイズ行は1つ)',
+  b27.ok === true
+  && (b27.payload.productDescription.pc.match(/<b>サイズ<\/b>/g) || []).length === 1
+  && b27.payload.productDescription.pc.includes('約W5cm')
+  && !b27.payload.productDescription.pc.includes('W10cm'),
+  JSON.stringify(b27.reasons || null));
+db.prepare(`UPDATE draft_page_info SET size_text = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: page_info 未保存なら表を付けない (既存ドラフトの説明文を変えない)',
-  b27.ok === true && !b27.payload.productDescription.pc.includes('<table'), JSON.stringify(b27.reasons || null));
+check('payload: page_info 未保存でも説明は表形式 (表記の行だけ載らない)',
+  b27.ok === true
+  && b27.payload.productDescription.pc.includes('<b>説明</b>')
+  && !b27.payload.productDescription.pc.includes('メーカーA'),
+  JSON.stringify(b27.reasons || null));
 
 // 未転送の画像があれば止める
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);
