@@ -69,8 +69,46 @@ export function initInventoryMonthly() {
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_inv_pending_snap ON inv_snapshot_pending(snapshot_id)');
 
+  fixMislabeledSnapshotDates20260801(db);
+
   initialized = true;
   return db;
+}
+
+/**
+ * 一回限りのデータ訂正 (2026-08-01) — 月末棚卸し履歴の基準日ズレ修復。
+ *
+ * 月初にCSVをアップした際、日付欄のデフォルトが「当月末」だったため、
+ * 前月末データが翌月末の日付ラベルで保存されていた (デフォルトは #655 で修正済み):
+ *   誤 2026-06-30 (created_at 2026-05-31T22:38 UTC = 6/1朝JST作成) → 正 2026-05-31
+ *   誤 2026-07-31 (created_at 2026-07-01T00:50 UTC = 7/1朝JST作成) → 正 2026-06-30
+ * 中身のCSVは月初朝DL = 前月末断面なので、ラベルの付け替えだけで正しくなる
+ * (発注後未着・手動調整もそのまま正しい月に付いて残る)。
+ *
+ * ガード: 「2026-05-31 が存在しない」かつ「対象2行が上記 created_at で存在する」
+ * 場合のみ実行。実行後・別環境 (miniPC/テスト等の同居コード) ではガードが成立せず
+ * 完全に no-op なので冪等。訂正失敗でもツール全体は止めない (次回 init 時に再試行)。
+ */
+function fixMislabeledSnapshotDates20260801(db) {
+  try {
+    const get = (d) => db.prepare('SELECT id, created_at, total FROM inv_snapshot WHERE snapshot_date = ?').get(d);
+    const r531 = get('2026-05-31');
+    const r630 = get('2026-06-30');
+    const r731 = get('2026-07-31');
+    if (r531 || !r630 || !r731) return;
+    // 本番Render DBで確認済みの実値に完全一致した場合のみ実行 (Codex High:
+    // 日単位のstartsWith緩和ガードだと同居環境で偶然一致→正常履歴を誤って動かし得る)
+    if (r630.created_at !== '2026-05-31 22:38:09' || r630.total !== 230256859) return;
+    if (r731.created_at !== '2026-07-01 00:50:37' || r731.total !== 227113054 || r731.id !== 26) return;
+    const upd = db.prepare("UPDATE inv_snapshot SET snapshot_date = ?, note = COALESCE(note || ' ', '') || ? WHERE id = ?");
+    db.transaction(() => {
+      upd.run('2026-05-31', '[日付訂正 2026-08-01: 誤6/30→正5/31 (月初アップ時の日付デフォルト事故)]', r630.id);
+      upd.run('2026-06-30', '[日付訂正 2026-08-01: 誤7/31→正6/30 (月初アップ時の日付デフォルト事故)]', r731.id);
+    })();
+    console.log(`[inventory-monthly] 日付訂正migration実行: id=${r630.id} 6/30→5/31, id=${r731.id} 7/31→6/30`);
+  } catch (e) {
+    console.error('[inventory-monthly] 日付訂正migration失敗 (次回initで再試行):', e.message);
+  }
 }
 
 export function getDB() {
