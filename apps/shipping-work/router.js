@@ -76,27 +76,47 @@ function requireAdminApi(req, res, next) {
   next();
 }
 
+// CSRF: portal のセッションCookieは httpOnly + secure + SameSite=Lax (server.js) のため、
+// クロスサイトのフォームPOST/fetchにはCookieが送られず、状態変更APIは同一サイトからのみ実行できる。
+// portal他アプリと同じ前提 (Codex PR2レビュー#4 確認済み)。
+
 // PDF は memoryStorage で受けて自前で DOCS_DIR に保存する (ファイル名はサーバー発行の乱数のみ。
 // クライアント由来のファイル名・パスは一切使わない)
 const uploadPdf = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 30, parts: 40, fieldSize: 64 * 1024 },
 });
 
-function savePdf(file) {
+async function savePdf(file) {
   if (!file) return null;
+  if (!file.buffer?.length) throw new Error('PDFファイルが空です');
   const head = file.buffer.subarray(0, 5).toString('latin1');
   if (head !== '%PDF-') throw new Error('PDFファイルではありません');
-  if (!fs.existsSync(DOCS_DIR)) fs.mkdirSync(DOCS_DIR, { recursive: true });
+  await fs.promises.mkdir(DOCS_DIR, { recursive: true });
   const name = `${crypto.randomUUID()}.pdf`;
-  fs.writeFileSync(path.join(DOCS_DIR, name), file.buffer);
+  // 同期writeはNodeプロセス全体を止めるため非同期で書く (Codex PR2レビュー#9)
+  await fs.promises.writeFile(path.join(DOCS_DIR, name), file.buffer);
   return name; // pdf_path には DOCS_DIR 相対のファイル名のみ保存
+}
+
+/** DB書込み失敗時などの孤児PDFの補償削除 (失敗は握りつぶしてよい)。 */
+function removePdfQuietly(name) {
+  if (!name) return;
+  fs.promises.unlink(path.join(DOCS_DIR, name)).catch(() => {});
+}
+
+/** 'YYYY-MM-DD' が実在する日付か (2026-02-31 等を拒否。Codex PR2レビュー#7)。 */
+function isRealDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
 }
 
 /** フォーム入力の検証。エラー文字列 or 検証済み値を返す。 */
 function validateBatchInput(body) {
   const workDate = String(body.work_date || '');
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(workDate)) return { error: '作業日が不正です' };
+  if (!isRealDate(workDate)) return { error: '作業日が不正です' };
   const shippingNo = String(body.shipping_no || '');
   if (!isValidMaster('shipping_no', shippingNo)) return { error: '出荷Noが不正です' };
   const bunrui = String(body.bunrui || '');
@@ -138,50 +158,55 @@ router.get('/admin/batches', requireAdminPage, (req, res) => {
 });
 
 // バッチ作成
-router.post('/api/admin/batches', requireAdminApi, uploadPdf.single('pdf'), (req, res) => {
+router.post('/api/admin/batches', requireAdminApi, uploadPdf.single('pdf'), async (req, res) => {
   const v = validateBatchInput(req.body);
   if (v.error) return res.status(400).json({ error: v.error });
   let pdfPath = null;
   try {
-    pdfPath = savePdf(req.file);
-  } catch (e) {
-    return res.status(400).json({ error: e.message });
-  }
-  try {
+    pdfPath = await savePdf(req.file);
     const id = createBatch({ ...v, pdfPath }, req.session.email);
     res.json({ ok: true, id });
   } catch (e) {
-    if (String(e.code).startsWith('SQLITE_CONSTRAINT')) {
+    removePdfQuietly(pdfPath);  // DB失敗時に孤児PDFを残さない (Codex PR2レビュー#1)
+    if (e.code === 'SQLITE_CONSTRAINT_UNIQUE') {
       return res.status(409).json({ error: `${v.workDate} の同じ出荷Noのバッチが既にあります` });
     }
+    if (!e.code) return res.status(400).json({ error: e.message });  // savePdf の検証エラー
     throw e;
   }
 });
 
 // バッチ更新 (ready のみ)
-router.post('/api/admin/batches/:id(\\d+)/update', requireAdminApi, uploadPdf.single('pdf'), (req, res) => {
+router.post('/api/admin/batches/:id(\\d+)/update', requireAdminApi, uploadPdf.single('pdf'), async (req, res) => {
   const batch = getBatch(Number(req.params.id));
   if (!batch) return res.status(404).json({ error: 'not_found' });
   // work_date / shipping_no (業務キー) は変更不可。それ以外を検証するためキーは既存値を使う
   const v = validateBatchInput({ ...req.body, work_date: batch.work_date, shipping_no: batch.shipping_no });
   if (v.error) return res.status(400).json({ error: v.error });
   let pdfPath = null;
+  let result;
   try {
-    pdfPath = savePdf(req.file);
+    pdfPath = await savePdf(req.file);
+    result = updateBatch(batch.id, { ...v, pdfPath }, req.session.email);
   } catch (e) {
-    return res.status(400).json({ error: e.message });
+    removePdfQuietly(pdfPath);
+    if (!e.code) return res.status(400).json({ error: e.message });
+    throw e;
   }
-  const ok = updateBatch(batch.id, { ...v, pdfPath }, req.session.email);
-  if (!ok) return res.status(409).json({ error: '作業開始後のバッチは編集できません (管理者手動修正はPR5)' });
+  if (!result.ok) {
+    removePdfQuietly(pdfPath);  // 楽観排他で負けた場合も孤児にしない
+    return res.status(409).json({ error: '作業開始後のバッチは編集できません (管理者手動修正はPR5)' });
+  }
+  removePdfQuietly(result.replacedPdf);  // 差し替え成功後に旧PDFを削除
   res.json({ ok: true });
 });
 
-// バッチ取消 (ready / hold のみ・理由必須)
+// バッチ取消 (ready のみ・理由必須。hold の取消はセッション同時クローズが必要なため PR5)
 router.post('/api/admin/batches/:id(\\d+)/cancel', requireAdminApi, (req, res) => {
   const reason = String(req.body?.reason || '').trim();
   if (!reason) return res.status(400).json({ error: '取消理由は必須です' });
   const ok = cancelBatch(Number(req.params.id), req.session.email, reason);
-  if (!ok) return res.status(409).json({ error: '取消できるのは「本日のやること」「保留」のバッチのみです' });
+  if (!ok) return res.status(409).json({ error: '取消できるのは「本日のやること」のバッチのみです' });
   res.json({ ok: true });
 });
 
@@ -195,7 +220,19 @@ router.get('/admin/batches/:id(\\d+)/pdf', requireAdminPage, (req, res) => {
   if (!fs.existsSync(abs)) return res.status(404).send('PDFファイルが見つかりません');
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="batch-${batch.id}.pdf"`);
+  // 帳票は個人情報を含むため共有PCのキャッシュを抑止 (Codex PR2レビュー#8)
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'private, no-store');
   fs.createReadStream(abs).pipe(res);
+});
+
+// Multer のエラー (サイズ超過等) を JSON で返す (Codex PR2レビュー#5)
+router.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    const msg = err.code === 'LIMIT_FILE_SIZE' ? 'PDFは10MB以下にしてください' : `アップロードエラー: ${err.code}`;
+    return res.status(err.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: msg });
+  }
+  next(err);
 });
 
 export default router;

@@ -47,7 +47,7 @@
 
   <div class="sw-wrap">
     <div class="sw-form">
-      <h2>バッチ作成</h2>
+      <h2 id="formTitle">バッチ作成</h2>
       <form id="createForm">
         <div class="sw-grid">
           <div>
@@ -95,7 +95,8 @@
           <input type="text" name="note" style="width:100%;padding:6px;box-sizing:border-box" placeholder="注意事項など">
         </div>
         <div class="sw-actions">
-          <button type="submit">作成</button>
+          <button type="submit" id="submitBtn">作成</button>
+          <button type="button" id="cancelEditBtn" style="display:none" onclick="exitEditMode()">編集をやめる</button>
           <span id="createMsg" class="sw-msg"></span>
         </div>
       </form>
@@ -126,7 +127,11 @@
             <td><%= b.note || '' %></td>
             <td><% if (b.pdf_path) { %><a href="/apps/shipping-work/admin/batches/<%= b.id %>/pdf" target="_blank">表示</a><% } %></td>
             <td>
-              <% if (['ready','hold'].includes(b.status)) { %>
+              <% if (b.status === 'ready') { %>
+                <button class="btn-sm" data-id="<%= b.id %>" data-bunrui="<%= b.bunrui %>"
+                  data-packing="<%= b.packing_method %>" data-carriers="<%= b.carriers_json %>"
+                  data-slip="<%= b.slip_count ?? '' %>" data-note="<%= b.note || '' %>"
+                  onclick="enterEditMode(this)">編集</button>
                 <button class="btn-sm" onclick="cancelBatch(<%= b.id %>)">取消</button>
               <% } %>
             </td>
@@ -139,12 +144,48 @@
   <script>
     const createForm = document.getElementById('createForm');
     const createMsg = document.getElementById('createMsg');
+    let editingId = null;  // null=作成モード / 数値=編集モード (readyのみ・業務キーは変更不可)
+
+    function enterEditMode(btn) {
+      editingId = Number(btn.dataset.id);
+      const f = createForm;
+      f.elements.bunrui.value = btn.dataset.bunrui;
+      f.elements.packing_method.value = btn.dataset.packing;
+      f.elements.slip_count.value = btn.dataset.slip;
+      f.elements.note.value = btn.dataset.note;
+      let carriers = [];
+      try { carriers = JSON.parse(btn.dataset.carriers); } catch {}
+      for (const cb of f.querySelectorAll('input[name=carriers]')) cb.checked = carriers.includes(cb.value);
+      f.elements.work_date.disabled = true;
+      f.elements.shipping_no.disabled = true;
+      document.getElementById('formTitle').textContent = `バッチ #${editingId} を編集 (作業日・出荷Noは変更不可)`;
+      document.getElementById('submitBtn').textContent = '更新';
+      document.getElementById('cancelEditBtn').style.display = '';
+      createMsg.textContent = '';
+      window.scrollTo(0, 0);
+    }
+
+    function exitEditMode() {
+      editingId = null;
+      createForm.reset();
+      createForm.elements.work_date.disabled = false;
+      createForm.elements.shipping_no.disabled = false;
+      createForm.elements.work_date.value = '<%= workDate %>';
+      document.getElementById('formTitle').textContent = 'バッチ作成';
+      document.getElementById('submitBtn').textContent = '作成';
+      document.getElementById('cancelEditBtn').style.display = 'none';
+      createMsg.textContent = '';
+    }
+
     createForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      createMsg.textContent = '作成中...'; createMsg.className = 'sw-msg';
+      createMsg.textContent = editingId ? '更新中...' : '作成中...'; createMsg.className = 'sw-msg';
       const fd = new FormData(createForm);
+      const url = editingId
+        ? `/apps/shipping-work/api/admin/batches/${editingId}/update`
+        : '/apps/shipping-work/api/admin/batches';
       try {
-        const r = await fetch('/apps/shipping-work/api/admin/batches', { method: 'POST', body: fd });
+        const r = await fetch(url, { method: 'POST', body: fd });
         const j = await r.json();
         if (!r.ok) { createMsg.textContent = j.error || 'エラー'; createMsg.className = 'sw-msg err'; return; }
         location.reload();

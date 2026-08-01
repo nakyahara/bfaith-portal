@@ -405,29 +405,31 @@ export function updateBatch(id, { bunrui, packingMethod, carriers, slipCount, no
   const db = getDB();
   return db.transaction(() => {
     const before = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
-    if (!before || before.status !== 'ready') return false;
+    if (!before || before.status !== 'ready') return { ok: false };
     const res = db.prepare(`
       UPDATE sw_batches SET bunrui=?, packing_method=?, carriers_json=?, slip_count=?, note=?,
         pdf_path=COALESCE(?, pdf_path), updated_at=?
       WHERE id=? AND status='ready'
     `).run(bunrui, packingMethod, JSON.stringify(carriers ?? []), slipCount ?? null,
       note ?? null, pdfPath ?? null, utcNow(), id);
-    if (res.changes === 0) return false;
+    if (res.changes === 0) return { ok: false };
     const after = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
     addAuditLog(actor, 'batch_update', `sw_batches:${id}`, before, after, null);
-    return true;
+    // PDF差し替え時は呼び出し側が旧ファイルを削除する (成功後のみ。Codex PR2レビュー#1)
+    return { ok: true, replacedPdf: pdfPath ? before.pdf_path : null };
   })();
 }
 
 /**
- * バッチ取消 (ready / hold のみ。作業中の取消は PR5 の手動修正フローで扱う)。
+ * バッチ取消 (ready のみ。hold は進行中セッション・未解除保留を持つため、
+ * それらの同時クローズが必要 = PR5 の手動修正フローで扱う。Codex PR2レビュー#2)。
  * 取消できたら true。対象外ステータスなら false。理由必須。
  */
 export function cancelBatch(id, actor, reason) {
   const db = getDB();
   return db.transaction(() => {
     const before = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
-    if (!before || !['ready', 'hold'].includes(before.status)) return false;
+    if (!before || before.status !== 'ready') return false;
     db.prepare("UPDATE sw_batches SET status='cancelled', updated_at=? WHERE id=?")
       .run(utcNow(), id);
     addStatusEvent(id, before.status, 'cancelled', actor, 'admin', reason);
