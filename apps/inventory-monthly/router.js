@@ -22,6 +22,13 @@ import { exportSnapshotToXlsx } from './excel-export.js';
 import { buildSnapshotCsv } from './csv-export.js';
 
 const router = Router();
+
+// MF会計の振替伝票入力ページ (月末在庫の仕訳をここで入力する運用)。
+// cti はMF側の事業者コンテキスト識別子でリンク先の事業者選択に使われるだけ
+// (認証はMFログインが必要)。差し替えたい場合は env MF_JOURNAL_ENTRY_URL で上書き可。
+const MF_JOURNAL_ENTRY_URL = process.env.MF_JOURNAL_ENTRY_URL
+  || 'https://accounting.moneyforward.com/journal_entry?cti=G0Ghiio4Y9PkRh6QPWAq2g';
+
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 50 * 1024 * 1024 } });
@@ -1199,11 +1206,15 @@ router.get('/history/:id', (req, res) => {
     <tr class="total-row"><td>合計</td><td class="num">${yen(s.total)}</td></tr>
   </tbody>
 </table>
-<p>
-  <a href="export/${id}.xlsx">📥 Excelダウンロード</a>
-  &nbsp;|&nbsp;
-  <a href="export/${id}.csv">📥 CSVダウンロード</a>
-  &nbsp;/&nbsp; 明細件数: ${snap.details.length}
+<p style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+  <a href="${MF_JOURNAL_ENTRY_URL}" target="_blank" rel="noopener"
+     style="display:inline-block;background:#2c5aa0;color:#fff;padding:8px 18px;border-radius:4px;text-decoration:none;font-size:14px">📒 MFへ登録</a>
+  <span>
+    <a href="export/${id}.xlsx">📥 Excelダウンロード</a>
+    &nbsp;|&nbsp;
+    <a href="export/${id}.csv">📥 CSVダウンロード</a>
+    &nbsp;/&nbsp; 明細件数: ${snap.details.length}
+  </span>
 </p>
 <h2>発注後未着商品（あとから編集できます）</h2>
 <div class="card">
