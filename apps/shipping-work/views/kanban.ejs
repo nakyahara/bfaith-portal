@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    /* カンバンは表示専用 (要件v2 §9: 作業者はドラッグ不可。ステータスはボタン操作でのみ遷移) */
+    .sw-toolbar { display: flex; align-items: center; gap: 12px; margin: 12px 16px; flex-wrap: wrap; }
+    .sw-toolbar .date { font-weight: bold; font-size: 1.05em; }
+    .sw-board { display: flex; gap: 10px; overflow-x: auto; padding: 0 16px 24px; align-items: flex-start; }
+    .sw-col { flex: 0 0 220px; background: #f1f3f5; border-radius: 8px; padding: 8px; }
+    .sw-col h2 { font-size: 0.9em; margin: 4px 4px 8px; display: flex; justify-content: space-between; }
+    .sw-col h2 .count { color: #868e96; font-weight: normal; }
+    .sw-col.hold { background: #fff3cd; }
+    .sw-col.stock_return { background: #e7d8f5; }
+    .sw-card { background: #fff; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px;
+               box-shadow: 0 1px 2px rgba(0,0,0,.12); font-size: 0.85em; }
+    .sw-card .no { font-weight: bold; font-size: 1.1em; }
+    .sw-card .meta { color: #495057; margin-top: 2px; }
+    .sw-card .badge { display: inline-block; background: #e9ecef; border-radius: 4px;
+                      padding: 1px 6px; margin: 2px 4px 0 0; font-size: 0.92em; }
+    .sw-empty { color: #adb5bd; text-align: center; padding: 16px 0; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🏭 出荷作業管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/" class="btn-logout">← ダッシュボード</a>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <div class="sw-toolbar">
+    <span class="date">作業日: <%= workDate %></span>
+    <span>バッチ <%= totalCount %> 件</span>
+    <% if (isAdmin) { %>
+      <span style="color:#868e96">(バッチ作成・管理画面は PR2 で追加)</span>
+    <% } %>
+  </div>
+
+  <div class="sw-board">
+    <% for (const col of columns) { %>
+      <div class="sw-col <%= col.status %>">
+        <h2><%= col.label %> <span class="count"><%= col.batches.length %></span></h2>
+        <% if (col.batches.length === 0) { %>
+          <div class="sw-empty">なし</div>
+        <% } %>
+        <% for (const b of col.batches) { %>
+          <div class="sw-card">
+            <div class="no"><%= b.shipping_no_label || b.shipping_no %></div>
+            <div class="meta">
+              <span class="badge"><%= b.bunrui_label || b.bunrui %></span><span class="badge"><%= b.packing_method_label || b.packing_method %></span>
+              <% if (b.slip_count != null) { %><span class="badge"><%= b.slip_count %>件</span><% } %>
+            </div>
+            <% if (b.work_date !== workDate) { %>
+              <div class="meta">持ち越し: <%= b.work_date %></div>
+            <% } %>
+            <% if (b.note) { %><div class="meta"><%= b.note %></div><% } %>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+  </div>
+
+  <script>
+    // 表示専用の自動更新 (5秒)。操作系が付く PR3 で fetch 差分更新に置き換える。
+    setTimeout(() => location.reload(), 5000);
+  </script>
+</body>
+</html>

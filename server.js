@@ -66,6 +66,7 @@ import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
+import shippingWorkRouter from './apps/shipping-work/router.js';
 import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
@@ -702,6 +703,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'shipping-work',
+    name: '出荷作業管理',
+    description: 'Notionカンバン置き換え。ピッキング・梱包の作業時間をボタン操作で自動計測 (PR1: カンバン表示)',
+    icon: '🏭',
+    path: '/apps/shipping-work',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'packing-dispatch',
     name: '梱包機振り分け・配送方法',
     description: 'NE受注CSVを取り込み、配送方法と梱包機(pasline/meltline)を判定・編集して再出力。Tapes代替',
@@ -1234,6 +1244,7 @@ app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.js
 app.use('/apps/inquiry-hub/ai-api', express.json({ limit: '1mb' }), inquiryHubAiApiRouter);
 // limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
 app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
+app.use('/apps/shipping-work', requireAppAccess('shipping-work'), express.json({ limit: '256kb' }), shippingWorkRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
   // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
