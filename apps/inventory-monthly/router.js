@@ -6,17 +6,18 @@
  *   POST /aggregate       - 集計実行（保存はしない）
  *   POST /save            - 集計結果を inv_snapshot に保存
  *   GET  /history         - 履歴一覧
- *   GET  /history/:id     - 履歴詳細
+ *   GET  /history/:id     - 履歴詳細（発注後未着の後編集フォーム付き）
+ *   POST /history/:id/pending - 発注後未着の差し替え + pending/total 再計算
  *   GET  /export/:id.xlsx - Excelダウンロード
  *
  * 仕様: g:\共有ドライブ\AI_reference\システム設計\月末棚卸しツール_仕様書.md
  */
-import { Router } from 'express';
+import { Router, json } from 'express';
 import multer from 'multer';
 import fs from 'fs';
 import { initInventoryMonthly, getDB } from './db.js';
 import { parseRestockReport, parseOwnWarehouse } from './csv-parser.js';
-import { aggregateInventory, aggregateFromMirror, saveSnapshot, listSnapshots, getSnapshot } from './aggregator.js';
+import { aggregateInventory, aggregateFromMirror, saveSnapshot, listSnapshots, getSnapshot, isValidIsoDate } from './aggregator.js';
 import { exportSnapshotToXlsx } from './excel-export.js';
 import { buildSnapshotCsv } from './csv-export.js';
 
@@ -94,7 +95,12 @@ ${body}
 }
 
 function renderInputPage() {
-  // 当月末をJST(Asia/Tokyo)で計算する。
+  // 日付デフォルト = 「直近の過去(今日含む)の月末日」をJST(Asia/Tokyo)で計算する。
+  // 以前は「当月末」がデフォルトだったため、月初に前月分をアップすると
+  // 日付を直し忘れて前月末データが翌月末日付で保存される事故があった
+  // (例: 7/1 に6月末CSVをアップ → デフォルト 7/31 のまま保存)。
+  // 月末棚卸しは「過ぎた月末」を対象にする作業なので、
+  // 今日が月末日ならその日、月途中なら前月末をデフォルトにする。
   // 本番コンテナ(Render等)は TZ 未設定だと UTC で動くため、`new Date()` の
   // ローカル取得だと JST 月初 0:00〜9:00 の間に「先月」と誤判定して
   // 月末日が1ヶ月ズレる。Intl で JST の年月日を直接取り出して回避する。
@@ -105,10 +111,17 @@ function renderInputPage() {
   const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
   const jstYear = Number(parts.year);
   const jstMonth = Number(parts.month); // 1-12
+  const jstDay = Number(parts.day);
   // JSTでの当月末日: その月の翌月0日 = 月末
-  const lastDay = new Date(Date.UTC(jstYear, jstMonth, 0)).getUTCDate();
+  const lastDayThisMonth = new Date(Date.UTC(jstYear, jstMonth, 0)).getUTCDate();
   const pad2 = n => String(n).padStart(2, '0');
-  const monthEnd = `${jstYear}-${pad2(jstMonth)}-${pad2(lastDay)}`;
+  let monthEnd;
+  if (jstDay === lastDayThisMonth) {
+    monthEnd = `${jstYear}-${pad2(jstMonth)}-${pad2(lastDayThisMonth)}`;
+  } else {
+    const prevMonthEnd = new Date(Date.UTC(jstYear, jstMonth - 1, 0)); // 当月0日 = 前月末
+    monthEnd = `${prevMonthEnd.getUTCFullYear()}-${pad2(prevMonthEnd.getUTCMonth() + 1)}-${pad2(prevMonthEnd.getUTCDate())}`;
+  }
 
   return renderLayout('月末棚卸し - 入力', `
 <form id="frm" enctype="multipart/form-data">
@@ -180,8 +193,9 @@ function renderInputPage() {
     <small class="hint">保存ボタンは同じCSVをサーバー側で再集計してから保存します（クライアント結果は信頼しません）</small>
   </div>
   <p style="margin:8px 0 0;font-size:12px;color:#666">
-    💡 月初に miniPC daily-sync の最後で「前月末日」を mirror データから自動保存する仕組みあり (POST /api/save-month-end)。
-    この CSV経路は backfill / 過去月末の手動再計算用に温存。
+    💡 月初1〜3日の朝、miniPC daily-sync の最後で「前月末日」を自動保存する仕組みあり (POST /api/save-month-end)。
+    月末在庫は「翌月1日朝の取得断面」から作る (=月末最終日の出荷入荷まで反映)。
+    発注後未着は自動保存後に履歴詳細ページから追記できる。この CSV経路は backfill / 過去月末の手動再計算用に温存。
   </p>
 </form>
 
@@ -420,7 +434,7 @@ router.post('/aggregate', upload.fields([
     const wantSave = req.body.save === '1' || req.body.save === 'true';
 
     const snapshot_date = (req.body.snapshot_date || '').slice(0, 10);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot_date)) {
+    if (!isValidIsoDate(snapshot_date)) {
       cleanup();
       return res.status(400).json({ error: '棚卸し基準日が不正です' });
     }
@@ -1153,12 +1167,24 @@ router.get('/history/:id', (req, res) => {
   const snap = getSnapshot(id);
   if (!snap) return res.status(404).send('Not found');
   const s = snap.summary;
+  const db = getDB();
+  // 仕入先名の入力補助: 過去に入力した仕入先名を datalist で提示
+  const supplierNames = db.prepare(
+    `SELECT DISTINCT supplier_name FROM inv_snapshot_pending WHERE supplier_name != '' ORDER BY supplier_name LIMIT 100`
+  ).all().map(r => r.supplier_name);
+  // 「前回分をコピー」: この snapshot より前で直近の、未着入力がある snapshot の内容
+  const prevPending = db.prepare(`
+    SELECT p.supplier_name, p.amount FROM inv_snapshot_pending p
+    JOIN inv_snapshot sn ON sn.id = p.snapshot_id
+    WHERE sn.snapshot_date = (
+      SELECT MAX(sn2.snapshot_date) FROM inv_snapshot sn2
+      JOIN inv_snapshot_pending p2 ON p2.snapshot_id = sn2.id
+      WHERE sn2.snapshot_date < ?
+    )
+  `).all(s.snapshot_date);
+  // </script> によるタグ切りを防ぐため < をエスケープして埋め込む
+  const jsonEmbed = obj => JSON.stringify(obj).replace(/</g, '\\u003c');
   const totalRow = (label, val) => `<tr><td>${label}</td><td class="num">${yen(val)}</td></tr>`;
-  const pendingHtml = snap.pending.length ? `
-<h2>発注後未着商品</h2>
-<table><thead><tr><th>仕入先</th><th>金額</th></tr></thead><tbody>
-${snap.pending.map(p => `<tr><td>${esc(p.supplier_name)}</td><td class="num">${yen(p.amount)}</td></tr>`).join('')}
-</tbody></table>` : '';
   res.send(renderLayout('月末棚卸し ' + s.snapshot_date, `
 <h2>${esc(s.snapshot_date)}</h2>
 <table>
@@ -1179,8 +1205,138 @@ ${snap.pending.map(p => `<tr><td>${esc(p.supplier_name)}</td><td class="num">${y
   <a href="export/${id}.csv">📥 CSVダウンロード</a>
   &nbsp;/&nbsp; 明細件数: ${snap.details.length}
 </p>
-${pendingHtml}
+<h2>発注後未着商品（あとから編集できます）</h2>
+<div class="card">
+  <div id="pendingRows"></div>
+  <div style="margin-top:8px">
+    <button type="button" class="secondary" onclick="addPendingRow('', '')">＋ 行追加</button>
+    ${prevPending.length ? `<button type="button" class="secondary" onclick="copyPrev()">📋 前回分をコピー</button>` : ''}
+    <button type="button" onclick="savePending()">💾 保存（合計も再計算）</button>
+  </div>
+  <small class="hint">金額は税抜。cron の自動保存後でもここから追記できます。空行は保存時に無視されます。</small>
+  <div id="pendingMsg"></div>
+</div>
+<datalist id="supplierList">
+  ${supplierNames.map(n => `<option value="${esc(n)}">`).join('')}
+</datalist>
+<script>
+const CURRENT_PENDING = ${jsonEmbed(snap.pending.map(p => ({ supplier_name: p.supplier_name, amount: p.amount })))};
+const PREV_PENDING = ${jsonEmbed(prevPending)};
+
+function addPendingRow(name, amount) {
+  const div = document.createElement('div');
+  div.className = 'pending-row';
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.placeholder = '仕入先名';
+  nameInput.setAttribute('list', 'supplierList');
+  nameInput.value = name || '';
+  const amountInput = document.createElement('input');
+  amountInput.type = 'number';
+  amountInput.placeholder = '金額（税抜）';
+  amountInput.min = '0';
+  amountInput.step = '1';
+  amountInput.value = (amount === '' || amount == null) ? '' : amount;
+  const delBtn = document.createElement('button');
+  delBtn.type = 'button';
+  delBtn.className = 'secondary';
+  delBtn.textContent = '削除';
+  delBtn.onclick = () => div.remove();
+  div.append(nameInput, amountInput, delBtn);
+  document.getElementById('pendingRows').appendChild(div);
+}
+
+function copyPrev() {
+  for (const p of PREV_PENDING) addPendingRow(p.supplier_name, p.amount);
+}
+
+async function savePending() {
+  const rows = [...document.querySelectorAll('#pendingRows .pending-row')].map(div => {
+    const [nameInput, amountInput] = div.querySelectorAll('input');
+    return { supplier_name: nameInput.value.trim(), amount: Number(amountInput.value) };
+  }).filter(r => r.supplier_name && Number.isFinite(r.amount) && r.amount > 0);
+  const msg = document.getElementById('pendingMsg');
+  // 動的な文言は textContent で入れて XSS を避ける (サーバのエラーメッセージ等)
+  const showErr = (text) => {
+    const div = document.createElement('div');
+    div.className = 'err';
+    div.textContent = text;
+    msg.replaceChildren(div);
+  };
+  msg.textContent = '保存中...';
+  try {
+    const res = await fetch('${id}/pending', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ rows }),
+    });
+    if (res.status === 401 || res.status === 403) {
+      // 静的HTMLのみ (再ログインリンク)
+      msg.innerHTML = '<div class="err">認証が切れました。<a href="/login">再ログイン</a>してから再実行してください。</div>';
+      return;
+    }
+    const data = await res.json();
+    if (!res.ok) {
+      showErr(data.error || 'エラー');
+      return;
+    }
+    location.reload();
+  } catch (e) {
+    showErr(e.message);
+  }
+}
+
+// 初期表示: 既存の未着行 (無ければ空行1つ)
+if (CURRENT_PENDING.length) {
+  for (const p of CURRENT_PENDING) addPendingRow(p.supplier_name, p.amount);
+} else {
+  addPendingRow('', '');
+}
+</script>
 `));
+});
+
+// 発注後未着の後編集: 行を丸ごと差し替えて pending_orders / total を再計算する。
+// cron 自動保存 (発注後未着なし) の後から手入力を追加できるようにするための endpoint。
+// total は「保存済み total - 保存済み pending + 新 pending」で更新し、
+// 他カテゴリの丸め済み金額には触らない。
+router.post('/history/:id/pending', json({ limit: '64kb' }), (req, res) => {
+  if (!ensureDbOrFail(res)) return;
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: 'id が不正です' });
+  const rawRows = Array.isArray(req.body?.rows) ? req.body.rows : null;
+  if (!rawRows) return res.status(400).json({ error: 'rows (配列) が必要です' });
+  if (rawRows.length > 100) return res.status(400).json({ error: '未着行が多すぎます (最大100行)' });
+
+  const MONEY_CAP = 1e12;
+  const pendingRows = [];
+  for (const r of rawRows) {
+    const supplier_name = String(r?.supplier_name || '').trim().slice(0, 200);
+    let amount = Number(r?.amount);
+    if (!Number.isFinite(amount) || amount <= 0) amount = 0;
+    amount = Math.round(Math.min(MONEY_CAP, amount));
+    if (supplier_name && amount > 0) pendingRows.push({ supplier_name, amount });
+  }
+
+  try {
+    const db = getDB();
+    const txn = db.transaction(() => {
+      const s = db.prepare('SELECT id, pending_orders, total FROM inv_snapshot WHERE id = ?').get(id);
+      if (!s) return null;
+      db.prepare('DELETE FROM inv_snapshot_pending WHERE snapshot_id = ?').run(id);
+      const ins = db.prepare('INSERT INTO inv_snapshot_pending (snapshot_id, supplier_name, amount, note) VALUES (?, ?, ?, NULL)');
+      for (const p of pendingRows) ins.run(id, p.supplier_name, p.amount);
+      const newPending = pendingRows.reduce((sum, p) => sum + p.amount, 0);
+      const newTotal = (s.total || 0) - (s.pending_orders || 0) + newPending;
+      db.prepare('UPDATE inv_snapshot SET pending_orders = ?, total = ? WHERE id = ?').run(newPending, newTotal, id);
+      return { pending: newPending, total: newTotal };
+    });
+    const result = txn();
+    if (!result) return res.status(404).json({ error: 'snapshot が見つかりません' });
+    res.json({ ok: true, ...result, rows: pendingRows.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 router.get('/export/:id.xlsx', async (req, res) => {
@@ -1242,8 +1398,8 @@ apiRouter.post('/save-month-end', (req, res) => {
       const pd = String(lastDayPrevMonth.getUTCDate()).padStart(2, '0');
       snapshot_date = `${py}-${pm}-${pd}`;
     }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(snapshot_date)) {
-      return res.status(400).json({ error: '棚卸し基準日が不正です' });
+    if (!isValidIsoDate(snapshot_date)) {
+      return res.status(400).json({ error: `棚卸し基準日が不正です: ${snapshot_date}` });
     }
 
     // [Codex R2 #2] 既存スナップショットがあれば上書きしない (cron 再実行で手動入力 pending を消さないため)
@@ -1258,20 +1414,27 @@ apiRouter.post('/save-month-end', (req, res) => {
         snapshot_date,
         snapshot_id: existing.id,
         skipped: true,
-        reason: `既存 snapshot あり (id=${existing.id}, created_at=${existing.created_at})。上書きしないため cron では skip。force=1 で強制上書き可能`,
+        reason: `既存 snapshot あり (id=${existing.id}, created_at=${existing.created_at}, note=${existing.note || 'なし'})。上書きしないため cron では skip。force=1 で強制上書き可能`,
         existing_total: existing.total,
       });
     }
 
     // 発注後未着は cron では入らない (mirror に該当データなし)。空配列で進める。
+    // → 保存後に /history/:id の「発注後未着」編集フォームから追記できる。
     const pendingRows = [];
 
+    // aggregateFromMirror は snapshot_date の翌朝断面 (business_date=snapshot_date+1) を読む。
+    // どの断面から作ったか後から検証できるよう note に source 日付を残す。
     const result = aggregateFromMirror({ snapshot_date, pendingRows });
-    const snapshot_id = saveSnapshot({ snapshot_date, result, pendingRows, note: 'auto: cron save-month-end' });
+    const snapshot_id = saveSnapshot({
+      snapshot_date, result, pendingRows,
+      note: `auto: cron save-month-end (source=${result.source_business_date}朝)`,
+    });
 
     res.json({
       ok: true,
       snapshot_date,
+      source_business_date: result.source_business_date,
       snapshot_id,
       totals: result.totals,
       warnings_count: {
@@ -1282,6 +1445,7 @@ apiRouter.post('/save-month-end', (req, res) => {
       partial_categories: result.warnings.partialCategories || [],
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    // aggregateFromMirror は「source 未着 = 再試行で解消し得る」を 409 で区別する
+    res.status(e.statusCode || 500).json({ ok: false, error: e.message });
   }
 });

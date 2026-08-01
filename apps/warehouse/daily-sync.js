@@ -1125,11 +1125,14 @@ async function main() {
   // スケジューラが in-process で実行）に移行したため、daily-sync(miniPC)からの起動は撤去。
 
   // 月初の自動 月末確定値保存
-  // 条件: 今日が月初 (JST) かつ アップストリームのデータ取得が全部成功してる
+  // 条件: 今日が月初1〜3日 (JST) かつ アップストリームのデータ取得が全部成功してる
   // (ハンガリ式: FBA snapshot / 在庫集計 / Render同期 が全て成功 = mirror に最新データ揃ってる)
   // 失敗してれば skip + retry 待ちにすることで 「壊れた前月末値が履歴に残る」事故を防ぐ
+  // [Codex 設計相談 2026-08-01] 1日のみだと当日失敗で月末snapshotが欠落したままになるため、
+  // 1〜3日は毎朝試す自己修復方式に変更。保存済みなら server 側が skip を返すので冪等。
+  // (source断面は snapshot_date+1日 = 月初1日朝で固定。2〜3日の実行でも同じ断面を読む)
   const todayJstDay = Number(businessDate.slice(8, 10)); // 'YYYY-MM-DD' の dd
-  if (todayJstDay === 1) {
+  if (todayJstDay >= 1 && todayJstDay <= 3) {
     const fbaSnapOk = fbaSnapResult.success;
     const invAggOk = invAggResult.success;
     const renderOk = syncResult.success;
@@ -1160,10 +1163,11 @@ async function main() {
             console.log(`[月末確定値] スキップ: ${data.reason}`);
             results.push({ name: '月末確定値', success: true, skipped: true, summary: `⏸️ ${data.snapshot_date} 既存あり (id=${data.snapshot_id})` });
           } else if (resp.ok && data.ok) {
-            const { snapshot_date, totals, partial_categories } = data;
+            const { snapshot_date, source_business_date, totals, partial_categories } = data;
             const partialNote = (partial_categories && partial_categories.length > 0) ? ` (partial: ${partial_categories.join(',')})` : '';
-            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${partialNote}`);
-            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${partialNote}` });
+            const sourceNote = source_business_date ? ` (source=${source_business_date}朝)` : '';
+            console.log(`[月末確定値] 保存成功: ${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}`);
+            results.push({ name: '月末確定値', success: true, summary: `${snapshot_date} 合計=¥${totals.total.toLocaleString('ja-JP')}${sourceNote}${partialNote}` });
           } else {
             const err = data.error || `HTTP ${resp.status}`;
             console.error(`[月末確定値] 保存失敗:`, err);
