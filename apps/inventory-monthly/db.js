@@ -98,8 +98,8 @@ function fixMislabeledSnapshotDates20260801(db) {
     if (r531 || !r630 || !r731) return;
     // 本番Render DBで確認済みの実値に完全一致した場合のみ実行 (Codex High:
     // 日単位のstartsWith緩和ガードだと同居環境で偶然一致→正常履歴を誤って動かし得る)
-    if (r630.created_at !== '2026-05-31 22:38:09' || Math.round(r630.total) !== 230256859) return;
-    if (r731.created_at !== '2026-07-01 00:50:37' || Math.round(r731.total) !== 227113054 || r731.id !== 26) return;
+    if (r630.created_at !== '2026-05-31 22:38:09' || r630.total !== 230256859) return;
+    if (r731.created_at !== '2026-07-01 00:50:37' || r731.total !== 227113054 || r731.id !== 26) return;
     const upd = db.prepare("UPDATE inv_snapshot SET snapshot_date = ?, note = COALESCE(note || ' ', '') || ? WHERE id = ?");
     db.transaction(() => {
       upd.run('2026-05-31', '[日付訂正 2026-08-01: 誤6/30→正5/31 (月初アップ時の日付デフォルト事故)]', r630.id);
