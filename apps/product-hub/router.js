@@ -467,19 +467,44 @@ router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
     });
   }
   const assigned = assignImageSlots(files, draft.ne_code);
+  if (!assigned.codeMatched) {
+    return res.status(400).json({
+      ok: false,
+      error: `「${draft.ne_code}_番号」で始まる画像が見つかりませんでした。ファイル名を「${draft.ne_code}_00 (白抜き)」「${draft.ne_code}_01〜_${MAX_IMAGE_SLOTS}」の形式にしてください`,
+      skipped: assigned.skipped, conflicts: assigned.conflicts,
+    });
+  }
+  // 同一番号の重複はどれが正か判断できないので、DBを触る前に止める (Codex R1 medium)
+  if (assigned.conflicts.length > 0) {
+    return res.status(400).json({
+      ok: false,
+      error: '同じ番号のファイルが複数あります。フォルダを整理してからやり直してください',
+      skipped: assigned.skipped, conflicts: assigned.conflicts,
+    });
+  }
   if (!assigned.whiteBg && assigned.slots.length === 0) {
     return res.status(400).json({
       ok: false,
-      error: `_00〜_${MAX_IMAGE_SLOTS} の番号付き画像が見つかりませんでした (「${draft.ne_code}_01.jpg」のような名前にしてください)`,
+      error: `_00〜_${MAX_IMAGE_SLOTS} の番号付き画像が見つかりませんでした`,
       skipped: assigned.skipped, conflicts: assigned.conflicts,
     });
   }
   const db = getDB();
+  const warnings = [];
+  if (assigned.missingNums.length > 0) {
+    warnings.push(`_${assigned.missingNums.map((n) => String(n).padStart(2, '0')).join(' / _')} が欠番です。楽天へは番号順に詰めて登録されます`);
+  }
+  if (!assigned.whiteBg) {
+    const existingWb = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(draft.id)?.white_bg_drive_file_id;
+    if (existingWb) warnings.push(`フォルダに ${draft.ne_code}_00 (白抜き背景) が見つかりません。白抜き背景は以前の設定のまま残っています`);
+  }
   // 入力されたフォルダURLは基本情報にも保存 (次回はワンクリックで再取込できる)
   applyFolderImport(db, draft.id, assigned, { folderUrl: raw, currentFolderUrl: draft.drive_folder_url });
   logEvent(db, draft.id, 'images_imported_from_folder',
     `画像${assigned.slots.length}枚 / 白抜き${assigned.whiteBg ? 'あり' : 'なし'}`, actorOf(req));
-  res.json({ ok: true, ...assigned });
+  // 置換で必須項目が壊れた場合は ready_for_ai を差し戻す (個別削除と同じ扱い)
+  const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
+  res.json({ ok: true, ...assigned, warnings, demoted: demoted || undefined });
 });
 
 router.post('/api/drafts/:id/specs', (req, res) => {

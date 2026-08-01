@@ -330,7 +330,7 @@
         <button class="btn btn-primary" id="import-folder-btn" style="white-space:nowrap">フォルダから自動セット</button>
       </div>
       <div class="muted" style="font-size:11px;">
-        ファイル名「<%= draft.ne_code %>_00」= 白抜き背景 / 「<%= draft.ne_code %>_01」〜「_20」= 楽天の画像1〜20 として自動で振り分けます。
+        ファイル名「<%= draft.ne_code %>_00」= 白抜き背景 / 「<%= draft.ne_code %>_01」〜「_20」= 楽天の画像1〜20 として自動で振り分けます (欠番は詰めて登録)。
         実行すると現在の商品画像は<b>フォルダの内容で置き換わります</b>
       </div>
     </div>
@@ -1769,8 +1769,8 @@
       let msg = '画像 ' + json.slots.length + ' 枚をセットしました'
         + (json.whiteBg ? ' (白抜き背景もセット)' : '')
         + (json.skipped && json.skipped.length ? ' / 対象外 ' + json.skipped.length + ' 件' : '');
-      const warns = (json.conflicts || []).map((c) => '_' + c.num + ' が複数あるためセットしませんでした: ' + c.names.join(' / '));
-      if (json.slots.length === 0 && !json.whiteBg) warns.push('番号付きの画像が見つかりませんでした');
+      const warns = (json.warnings || []).slice();
+      if (json.demoted) warns.push('必須項目が欠けたため、ステータスを「下書き」に戻しました: ' + json.demoted.join(' / '));
       if (warns.length) alert(msg + '\n\n⚠ ' + warns.join('\n'));
       result.textContent = msg;
       setTimeout(() => location.reload(), warns.length ? 100 : 600);

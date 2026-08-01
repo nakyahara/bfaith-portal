@@ -3,13 +3,13 @@
  *
  * 命名規則: <商品コード>_<番号>.<拡張子>
  *   _00        → 白抜き背景画像 (whiteBgImage)
- *   _01〜_20   → 楽天商品画像スロット 1〜20 (images[] の並び順)
+ *   _01〜_20   → 楽天商品画像スロット 1〜20 (images[] の並び順。欠番は詰めて登録される)
  *   _21以上    → 楽天上限超えのため対象外 (警告として報告)
  *   番号なし    → 対象外 (警告として報告)
  *
- * プレフィックス (番号より前の部分) が商品コードと一致するファイルが1枚でもあれば
- * それだけに絞る (複数商品の画像が同居するフォルダ対策)。一致ゼロなら
- * 番号付きファイル全部を対象にする (フォルダ専有前提の寛容モード)。
+ * プレフィックス (番号より前の部分) が商品コードと一致するファイルだけを採用する
+ * (fail-closed。Codex R1 high: 誤ったフォルダURLで別商品の画像に全置換される事故を防ぐ)。
+ * 一致ゼロのときは codeMatched: false を返し、呼び出し側がエラーにする。
  */
 
 export const MAX_IMAGE_SLOTS = 20;
@@ -25,12 +25,14 @@ const norm = (s) => String(s || '').trim().toLowerCase();
 
 /**
  * @param {Array<{id: string, name: string, mimeType?: string}>} files
- * @param {string} neCode 商品コード (プレフィックス絞り込みに使用)
+ * @param {string} neCode 商品コード (プレフィックス一致で採用を判定)
  * @returns {{
  *   whiteBg: {id, name}|null,
  *   slots: Array<{slot: number, id: string, name: string}>,  // slot は 1〜20、slot 昇順
  *   skipped: Array<{name: string, reason: string}>,
- *   conflicts: Array<{num: number, names: string[]}>,        // 同一番号の重複 (セットしない)
+ *   conflicts: Array<{num: number, names: string[]}>,        // 同一番号の重複
+ *   missingNums: number[],   // 1〜最終スロットの間の欠番 (楽天へは詰めて登録される)
+ *   codeMatched: boolean,    // 商品コード一致の番号付きファイルが1枚でもあったか
  * }}
  */
 export function assignImageSlots(files, neCode) {
@@ -49,22 +51,19 @@ export function assignImageSlots(files, neCode) {
     numbered.push({ ...parsed, id: f.id, name: f.name });
   }
 
-  // 商品コード一致のファイルがあればそれだけに絞る
+  // 商品コード一致のファイルだけを採用 (fail-closed)
   const code = norm(neCode);
-  if (code) {
-    const matched = numbered.filter((f) => norm(f.base) === code);
-    if (matched.length > 0) {
-      for (const f of numbered) {
-        if (norm(f.base) !== code) skipped.push({ name: f.name, reason: `商品コード (${neCode}) と先頭が一致しません` });
-      }
-      numbered.length = 0;
-      numbered.push(...matched);
-    }
+  const matched = numbered.filter((f) => norm(f.base) === code);
+  for (const f of numbered) {
+    if (norm(f.base) !== code) skipped.push({ name: f.name, reason: `商品コード (${neCode}) と先頭が一致しません` });
+  }
+  if (matched.length === 0) {
+    return { whiteBg: null, slots: [], skipped, conflicts: [], missingNums: [], codeMatched: false };
   }
 
   // 番号ごとにグループ化して重複検出
   const byNum = new Map();
-  for (const f of numbered) {
+  for (const f of matched) {
     if (!byNum.has(f.num)) byNum.set(f.num, []);
     byNum.get(f.num).push(f);
   }
@@ -87,5 +86,11 @@ export function assignImageSlots(files, neCode) {
     }
   }
 
-  return { whiteBg, slots, skipped, conflicts };
+  // 欠番 (conflictでセットされなかった番号も欠番として知らせる)
+  const present = new Set(slots.map((s) => s.slot));
+  const lastSlot = slots.length > 0 ? slots[slots.length - 1].slot : 0;
+  const missingNums = [];
+  for (let n = 1; n < lastSlot; n++) if (!present.has(n)) missingNums.push(n);
+
+  return { whiteBg, slots, skipped, conflicts, missingNums, codeMatched: true };
 }

@@ -54,13 +54,18 @@ check('番号なし/上限超え/非画像 → skipped',
   && asn.skipped.some((s) => s.name === 'code_21.jpg'), JSON.stringify(asn.skipped));
 
 asn = assignImageSlots([fim('code_01.jpg'), fim('other_01.jpg'), fim('other_02.jpg')], 'code');
-check('商品コード一致があれば他コードは除外 (conflictにしない)',
+check('商品コード一致だけを採用 (他コードは除外・conflictにしない)',
   asn.slots.length === 1 && asn.slots[0].id === 'id-code_01.jpg' && asn.conflicts.length === 0
   && asn.skipped.length === 2, JSON.stringify(asn));
 
 asn = assignImageSlots([fim('xxx_01.jpg'), fim('xxx_03.jpg')], 'code');
-check('コード一致ゼロなら寛容モード (全番号付きを採用・欠番はそのまま)',
-  asn.slots.length === 2 && asn.slots[0].slot === 1 && asn.slots[1].slot === 3, JSON.stringify(asn));
+check('コード一致ゼロは fail-closed (codeMatched=false・何も採用しない)',
+  asn.codeMatched === false && asn.slots.length === 0 && asn.whiteBg === null
+  && asn.skipped.length === 2, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('code_04.jpg')], 'code');
+check('欠番は missingNums で報告 (_02,_03)',
+  JSON.stringify(asn.missingNums) === '[2,3]' && asn.slots.length === 2, JSON.stringify(asn));
 
 asn = assignImageSlots([fim('code_01.jpg'), fim('code_01.png')], 'code');
 check('同一番号の重複 → conflicts (セットしない)',
