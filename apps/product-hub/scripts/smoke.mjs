@@ -763,7 +763,7 @@ db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, arti
   VALUES (?, '205761', '[{"name":"ブランド名","values":["ノーブランド品"]}]', NULL)`).run(rkId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gfile1')`).run(rkId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
-db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文')`).run(rkId, rkId, rkId);
+db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文'), (?, 'desc_notes', 'AI注意書き文')`).run(rkId, rkId, rkId, rkId);
 db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
 
 built = listing.buildItemPayload(db, rkId);
@@ -772,7 +772,23 @@ const pl = built.payload;
 check('payload: hideItem=true 固定 (非公開登録のみ)', pl.hideItem === true);
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
-check('payload: 説明文に特徴+仕様表', pl.productDescription.pc.includes('特徴文') && pl.productDescription.pc.includes('サイズ: W10cm'));
+// 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
+check('payload: PC説明文は表形式 — 説明行に商品名+特徴',
+  pl.productDescription.pc.startsWith('<table')
+  && pl.productDescription.pc.includes('<b>説明</b>')
+  && pl.productDescription.pc.includes('楽天用タイトル')
+  && pl.productDescription.pc.includes('特徴文'),
+  pl.productDescription.pc);
+check('payload: 仕様表は1項目1行',
+  pl.productDescription.pc.includes('<b>サイズ</b>') && pl.productDescription.pc.includes('<td>W10cm</td>'));
+check('payload: 注意事項行 = AI注意書き + 固定文 (説明の直後)',
+  pl.productDescription.pc.includes('AI注意書き文<br>※モニター画面の状況')
+  && pl.productDescription.pc.indexOf('<b>注意事項</b>') < pl.productDescription.pc.indexOf('<b>サイズ</b>'));
+check('payload: 販売説明文 = 商品画像の画像HTML',
+  pl.salesDescription === '<img src="https://image.rakuten.co.jp/b-faith/cabinet/app-newitems/rk-smoke-1-1.jpg" width="100%" border="0"><br><br><br>',
+  pl.salesDescription);
+check('payload: スマホ用説明文 = 販売説明文 + PC説明文',
+  pl.productDescription.sp === pl.salesDescription + '\n' + pl.productDescription.pc);
 check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
@@ -822,6 +838,7 @@ check('payload: whiteBgImage は images と別枠',
   && b27.payload.whiteBgImage?.location === '/app-newitems/rk-smoke-1-white.jpg'
   && b27.payload.images.every((i) => i.location !== '/app-newitems/rk-smoke-1-white.jpg'),
   JSON.stringify(b27.reasons || b27.payload?.images));
+check('payload: 販売説明文にも白抜き画像は入れない', !b27.payload.salesDescription.includes('white'));
 
 // 不正値は理由で弾く
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '99', normal_delivery_date_id = 'abc' WHERE draft_id = ?`).run(rkId);
@@ -880,8 +897,11 @@ check('payload: 表は説明文の末尾に付く', b27.payload.productDescripti
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
 db.prepare(`DELETE FROM draft_page_info WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: page_info 未保存なら表を付けない (既存ドラフトの説明文を変えない)',
-  b27.ok === true && !b27.payload.productDescription.pc.includes('<table'), JSON.stringify(b27.reasons || null));
+check('payload: page_info 未保存でも説明は表形式 (表記の行だけ載らない)',
+  b27.ok === true
+  && b27.payload.productDescription.pc.includes('<b>説明</b>')
+  && !b27.payload.productDescription.pc.includes('メーカーA'),
+  JSON.stringify(b27.reasons || null));
 
 // 未転送の画像があれば止める
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gnotyet')`).run(rkId);

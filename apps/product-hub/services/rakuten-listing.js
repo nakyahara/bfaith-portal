@@ -359,6 +359,30 @@ export function isValidGtin(code) {
 }
 
 /**
+ * R-Cabinet の location (/dir/file.jpg) → 店舗の公開画像URLのベース。
+ * 例の実URL: https://image.rakuten.co.jp/b-faith/cabinet/image3/.../xxx_01.jpg
+ */
+const CABINET_IMAGE_BASE = 'https://image.rakuten.co.jp/b-faith/cabinet';
+
+function escAttr(v) {
+  return String(v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/**
+ * PC用販売説明文: 商品画像を width100% で縦に並べる画像HTML (店舗の従来運用。
+ * 旧運用ではスプレッドシートで生成して手貼りしていたもの)。
+ */
+export function buildSalesDescriptionHtml(locations) {
+  const base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
+  return locations
+    .map((loc) => `<img src="${base}${escAttr(loc)}" width="100%" border="0"><br><br><br>`)
+    .join('\n');
+}
+
+/** RMS の各説明文の文字数上限 (超過は登録エラー。最終判定は RMS) */
+export const DESC_LIMIT = 10240;
+
+/**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
  */
 export function buildItemPayload(db, draftId) {
@@ -491,23 +515,33 @@ export function buildItemPayload(db, draftId) {
 
   if (reasons.length > 0) return { ok: false, reasons };
 
-  const descParts = [];
-  if (ai.desc_features) descParts.push(ai.desc_features);
-  if (ai.desc_spec) descParts.push(ai.desc_spec);
-  if (specs.length > 0) descParts.push(specs.map((s) => `${s.spec_key}: ${s.spec_value || ''}`.trim()).join('\n'));
-  if (ai.desc_notes) descParts.push(ai.desc_notes);
-
-  // 商品ページ表記の表を説明文の末尾に連結 (旧xlsm の移植)。
+  // ─── 説明文3欄 (2026-08-01 店舗フォーマット確定) ───
+  //   PC用商品説明文 (productDescription.pc) = 表1枚 (説明/注意事項/仕様表/商品ページ表記)
+  //   PC用販売説明文 (salesDescription)      = 商品画像を width100% で並べた画像HTML
+  //   スマホ用商品説明文 (productDescription.sp) = 販売説明文 + 商品説明文
   // 発送方法の表示名はアプリ指定の配送方法グループ > NE配送方法のマッピング の順で決める
   const pageShipGroup = String(rk.shipping_method_group ?? '').trim();
   const pageShippingLabel = pageShipGroup && SHIPPING_METHOD_GROUPS[pageShipGroup]
     ? SHIPPING_METHOD_GROUPS[pageShipGroup]
     : mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod).label;
-  // 表はカードを一度でも保存した商品にだけ付ける (未保存の既存ドラフトの説明文を変えない)
-  const pageHtml = pageInfo
-    ? buildPageInfoHtml({ productName: title, info: pageInfo, shippingLabel: pageShippingLabel })
-    : '';
-  if (pageHtml) descParts.push(pageHtml);
+  // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
+  const descTexts = [title];
+  if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
+  if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
+  const pcHtml = buildPageInfoHtml({
+    productName: title,
+    info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
+    shippingLabel: pageShippingLabel,
+    descriptionText: descTexts.join('\n\n'),
+    notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
+    specs,
+  });
+  const salesHtml = buildSalesDescriptionHtml(cabinet.map((c) => c.cabinet_location));
+  const spHtml = [salesHtml, pcHtml].filter(Boolean).join('\n');
+  if (pcHtml.length > DESC_LIMIT) reasons.push(`PC用商品説明文が長すぎます (${pcHtml.length}字 / 上限${DESC_LIMIT}字)`);
+  if (salesHtml.length > DESC_LIMIT) reasons.push(`PC用販売説明文 (画像HTML) が長すぎます (${salesHtml.length}字 / 上限${DESC_LIMIT}字 — 画像を減らしてください)`);
+  if (spHtml.length > DESC_LIMIT) reasons.push(`スマホ用商品説明文 (販売説明文+商品説明文) が長すぎます (${spHtml.length}字 / 上限${DESC_LIMIT}字)`);
+  if (reasons.length > 0) return { ok: false, reasons };
 
   // JAN → カタログID属性の自動付与は**ジャンル属性辞書にあるときだけ** (2026-07-28 確定)。
   // 実測: 「カタログID」が辞書に無いジャンル (111145等) へ付与すると IE1002 で登録自体が失敗する。
@@ -530,7 +564,8 @@ export function buildItemPayload(db, draftId) {
   const payload = {
     title,
     ...(ai.desc_catch ? { tagline: String(ai.desc_catch).trim() } : {}),
-    productDescription: { pc: descParts.join('\n\n') || title },
+    productDescription: { pc: pcHtml || title, ...(spHtml ? { sp: spHtml } : {}) },
+    ...(salesHtml ? { salesDescription: salesHtml } : {}),
     genreId: String(rk.genre_id).trim(),
     hideItem: true, // 登録は常に非公開。公開はアプリの「公開」ボタン (setItemVisibility) で行う
     itemType: 'NORMAL',

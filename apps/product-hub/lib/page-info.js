@@ -107,12 +107,21 @@ function nl2br(v) {
 
 /**
  * xlsm と同じ表形式の掲載用 HTML を作る。空欄の行は出さない。
+ *
+ * 店舗の従来フォーマット (2026-08-01 中原さん提示の実例) では PC用商品説明文が
+ * この表1枚で、先頭が「説明」行 (商品名+説明文)・2行目が「注意事項」行。
+ * descriptionText を渡すとそのフォーマットになる (渡さなければ従来どおり
+ * 「商品名」行から始まる = 商品情報タブの掲載プレビュー互換)。
+ *
  * @param {object} p
  * @param {string} p.productName  商品名
  * @param {object|null} p.info    draft_page_info 行
  * @param {string|null} p.shippingLabel 発送方法の表示名 (楽天配送方法グループ名)
+ * @param {string|null} [p.descriptionText] 「説明」行に入れる平文 (商品名は呼び出し側が文頭に含める)
+ * @param {string|null} [p.notesText] AI注意書き (平文)。「注意事項」行の固定文の前に載せる
+ * @param {Array<{spec_key:string, spec_value:string|null}>|null} [p.specs] 仕様表 → 1項目1行
  */
-export function buildPageInfoHtml({ productName, info, shippingLabel }) {
+export function buildPageInfoHtml({ productName, info, shippingLabel, descriptionText = null, notesText = null, specs = null }) {
   const rows = [];
   const add = (label, valueHtml) => {
     if (!valueHtml) return;
@@ -120,7 +129,16 @@ export function buildPageInfoHtml({ productName, info, shippingLabel }) {
       `<tr><td bgcolor="#eeeeee" width="30%"><b>${esc(label)}</b></td><td>${valueHtml}</td></tr>`
     );
   };
-  add('商品名', s(productName) ? esc(productName) : null);
+  if (s(descriptionText)) {
+    add('説明', nl2br(descriptionText));
+    // 注意事項は店舗フォーマットに合わせて説明の直後 (AI注意書き → 固定文の順)
+    add('注意事項', (s(notesText) ? nl2br(notesText) + '<br>' : '') + FIXED_NOTES);
+  } else {
+    add('商品名', s(productName) ? esc(productName) : null);
+  }
+  for (const sp of Array.isArray(specs) ? specs : []) {
+    if (s(sp?.spec_key)) add(sp.spec_key, s(sp.spec_value) ? nl2br(sp.spec_value) : null);
+  }
   const i = info || {};
   add('サイズ', s(i.size_text) ? nl2br(i.size_text) : null);
   add('内容量', s(i.content_volume) ? nl2br(i.content_volume) : null);
@@ -146,7 +164,7 @@ export function buildPageInfoHtml({ productName, info, shippingLabel }) {
   add('発売元', seller);
   add('発送方法', s(shippingLabel) ? esc(shippingLabel) : null);
   add('広告文責', adResponsibility()); // 固定値 (env 由来。<br> を含む信頼済み文字列)
-  add('注意事項', FIXED_NOTES);
+  if (!s(descriptionText)) add('注意事項', FIXED_NOTES); // 説明行ありのときは先頭側で追加済み
 
   if (rows.length === 0) return '';
   return '<table width="100%" cellpadding="4" cellspacing="2" border="1" bordercolor="#000000">'
