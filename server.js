@@ -60,6 +60,7 @@ import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from '
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import shippingLogRouter from './apps/shipping-log/router.js';
 import siteProductsRouter from './apps/site-products/router.js';
+import siteContactRouter from './apps/site-contact/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
@@ -1207,6 +1208,8 @@ app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ l
 app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
 // コーポレートサイト向け商品スナップショット (apps/site-products): 専用read token・読み取り専用 (session なし)
 app.use('/apps/site-products/api', siteProductsRouter);
+// コーポレートサイト問い合わせ受付 (apps/site-contact): Bearer service token・冪等 (session なし)
+app.use('/apps/site-contact/api', express.json({ limit: '64kb' }), siteContactRouter);
 // 仕入れ先向け 売れ筋共有 (社内管理): 仕入先名登録・共有URL発行・プレビュー
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
