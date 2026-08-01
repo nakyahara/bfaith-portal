@@ -77,6 +77,35 @@ async function downloadDriveImage(fileId) {
 }
 
 /**
+ * Drive フォルダ直下の画像ファイル一覧 (共有ドライブ対応・ページング対応)。
+ * 1000件を超えるフォルダは商品画像フォルダではない可能性が高いので fail-closed
+ * (Codex R2: 打ち切った不完全な一覧で既存画像を置換しないため)。
+ * @returns {Promise<Array<{id: string, name: string, mimeType: string}>>}
+ */
+export async function listDriveFolderImages(folderId) {
+  const drive = getDriveClient();
+  const files = [];
+  let pageToken;
+  do {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false and mimeType contains 'image/'`,
+      fields: 'nextPageToken, files(id, name, mimeType)',
+      pageSize: 200,
+      orderBy: 'name',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      pageToken,
+    });
+    files.push(...(res.data.files || []));
+    pageToken = res.data.nextPageToken;
+    if (files.length > 1000) {
+      throw new Error('フォルダ内の画像が1000件を超えています。商品の画像フォルダを指定しているか確認してください');
+    }
+  } while (pageToken);
+  return files;
+}
+
+/**
  * R-Cabinet 制約 (JPEG / 2MB / 3840px) に収める。
  * RYS image-uploader と同じ「品質を段階的に落とす」方式。
  */

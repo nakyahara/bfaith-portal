@@ -12,6 +12,7 @@
  *   → listed(楽天出品済み) → expanded(展開済み)。どこからでも on_hold / excluded へ退避可。
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { fileViewUrl } from './lib/drive-link.js';
 
 export const DRAFT_STATUSES = [
   'draft', 'ready_for_ai', 'review', 'approved', 'listed', 'expanded', 'on_hold', 'excluded',
@@ -599,4 +600,34 @@ export function demoteIfGateBroken(db, draftId, actor) {
   `).run(draftId);
   logEvent(db, draftId, 'auto_demoted_to_draft', reasons.join(' / '), actor);
   return reasons;
+}
+
+/**
+ * 画像フォルダ一括取り込みの結果 (assignImageSlots の戻り値) を DB に反映する。
+ *   - slots があるときだけ draft_images を全置き換え (sort = スロット番号 - 1)。
+ *     白抜きだけ見つかった場合は既存の商品画像を触らない
+ *   - whiteBg があれば draft_rakuten の白抜き背景を upsert (他カラムは触らない)
+ *   - フォルダURLが基本情報と違えば product_drafts.drive_folder_url も更新
+ */
+export function applyFolderImport(db, draftId, assigned, { folderUrl = null, currentFolderUrl = null } = {}) {
+  db.transaction(() => {
+    if (assigned.slots.length > 0) {
+      db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(draftId);
+      const ins = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort) VALUES (?, ?, ?, ?)');
+      for (const s of assigned.slots) ins.run(draftId, s.id, fileViewUrl(s.id), s.slot - 1);
+    }
+    if (assigned.whiteBg) {
+      db.prepare(`
+        INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_drive_url) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id) DO UPDATE SET
+          white_bg_drive_file_id = excluded.white_bg_drive_file_id,
+          white_bg_drive_url = excluded.white_bg_drive_url,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run(draftId, assigned.whiteBg.id, fileViewUrl(assigned.whiteBg.id));
+    }
+    if (folderUrl && folderUrl !== currentFolderUrl) {
+      db.prepare(`UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`)
+        .run(folderUrl, draftId);
+    }
+  })();
 }
