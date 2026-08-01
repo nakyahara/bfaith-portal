@@ -37,9 +37,7 @@ const KANBAN_COLUMNS = [
 
 // ─── カンバン (全員・表示専用。ドラッグ機能は作らない) ───
 router.get('/', (req, res) => {
-  const workDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || ''))
-    ? String(req.query.date)
-    : jstToday();
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listKanbanBatches(workDate);
 
   const columns = KANBAN_COLUMNS.map((status) => ({
@@ -99,10 +97,12 @@ async function savePdf(file) {
   return name; // pdf_path には DOCS_DIR 相対のファイル名のみ保存
 }
 
-/** DB書込み失敗時などの孤児PDFの補償削除 (失敗は握りつぶしてよい)。 */
+/** DB書込み失敗時などの孤児PDFの補償削除 (失敗は業務を止めないがログには残す)。 */
 function removePdfQuietly(name) {
   if (!name) return;
-  fs.promises.unlink(path.join(DOCS_DIR, name)).catch(() => {});
+  fs.promises.unlink(path.join(DOCS_DIR, name)).catch((err) => {
+    if (err.code !== 'ENOENT') console.error('[shipping-work] PDF削除失敗', { name, code: err.code });
+  });
 }
 
 /** 'YYYY-MM-DD' が実在する日付か (2026-02-31 等を拒否。Codex PR2レビュー#7)。 */
@@ -138,9 +138,7 @@ function validateBatchInput(body) {
 
 // バッチ管理画面
 router.get('/admin/batches', requireAdminPage, (req, res) => {
-  const workDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || ''))
-    ? String(req.query.date)
-    : jstToday();
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   res.render(path.join(__dirname, 'views/admin_batches'), {
     title: 'バッチ管理 | 出荷作業管理',
     username: req.session.email,
