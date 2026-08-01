@@ -809,6 +809,31 @@ check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
 db.prepare(`UPDATE draft_ai_outputs SET content = '特徴文' WHERE draft_id = ? AND kind = 'desc_features'`).run(rkId);
+
+// 販売説明文単独の境界 (Codex R2 Low): ちょうど10240字は販売ガードにかからず、+1字でかかる
+const salesLine1Len = listing.buildSalesDescriptionHtml(['/app-newitems/rk-smoke-1-1.jpg']).length;
+const salesEmptyLen = listing.buildSalesDescriptionHtml(['']).length;
+const exactLocLen = 10240 - salesLine1Len - 1 - salesEmptyLen; // -1 は行間の '\n'
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gedge')`).run(rkId);
+db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gedge', ?)`).run(rkId, '/' + 'x'.repeat(exactLocLen - 1));
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: 販売説明文ちょうど10240字は販売ガードにかからない (連結のスマホ用のみ)',
+  bLen.ok === false && !bLen.reasons.some((r) => r.includes('画像HTML')) && bLen.reasons.some((r) => r.includes('スマホ用')),
+  JSON.stringify(bLen.reasons));
+db.prepare(`UPDATE draft_cabinet_images SET cabinet_location = ? WHERE draft_id = ? AND drive_file_id = 'gedge'`).run('/' + 'x'.repeat(exactLocLen), rkId);
+bLen = listing.buildItemPayload(db, rkId);
+check('payload: 販売説明文10241字は理由で止める', bLen.ok === false && bLen.reasons.some((r) => r.includes('画像HTML')), JSON.stringify(bLen.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
+db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'gedge'`).run(rkId);
+
+// env の悪意ある値は既定URLへフォールバック (Codex R2 Low: R1修正の回帰テスト)
+process.env.PH_CABINET_IMAGE_BASE = '"><script>alert(1)<' + '/script>';
+check('salesDesc: 引用符/タグ入りenvは既定URLへフォールバック',
+  listing.buildSalesDescriptionHtml(['/a/b.jpg']) === '<img src="https://image.rakuten.co.jp/b-faith/cabinet/a/b.jpg" width="100%" border="0"><br><br><br>');
+process.env.PH_CABINET_IMAGE_BASE = 'http://evil.example/x';
+check('salesDesc: http のenvは拒否して既定URL',
+  listing.buildSalesDescriptionHtml(['/a/b.jpg']).startsWith('<img src="https://image.rakuten.co.jp/b-faith/cabinet/'));
+delete process.env.PH_CABINET_IMAGE_BASE;
 check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
