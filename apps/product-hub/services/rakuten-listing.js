@@ -55,6 +55,25 @@ async function callWarehouse(path, { method = 'GET', body = null, timeoutMs = 12
   return { status: res.status, data };
 }
 
+/**
+ * 店舗内カテゴリ (お店の棚) のツリーを RMS から取得する (miniPC 経由、2026-08-02)。
+ * 楽天ジャンルとは別物 = Category API 2.0。miniPC 側で 24h キャッシュ済み。
+ * @returns {Promise<{ok: true, trees: Array}|{ok: false, error: string}>}
+ */
+export async function fetchShopCategoryTree({ force = false, fetcher = callWarehouse } = {}) {
+  const r = await fetcher(
+    `/service-api/rakuten-rms/shop-categories/tree${force ? '?refresh=1' : ''}`,
+    { timeoutMs: 60_000 },
+  );
+  if (r.status !== 200) {
+    const msg = r.data?.message || r.data?.error || `HTTP ${r.status}`;
+    return { ok: false, error: String(msg).slice(0, 300) };
+  }
+  const trees = r.data?.trees ?? r.data?.data?.trees;
+  if (!Array.isArray(trees)) return { ok: false, error: '応答に trees がありません (miniPC の更新が必要かもしれません)' };
+  return { ok: true, trees };
+}
+
 // ─── Drive 画像ダウンロード (fba-replenishment/drive-upload.js と同じ SA) ───
 
 function getDriveClient() {

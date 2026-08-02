@@ -26,7 +26,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -38,7 +38,7 @@ import {
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
-  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES, flattenCategoryTrees, shopCategorySnapshotHash,
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
@@ -765,9 +765,64 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   res.json({ ok: true });
 });
 
+// 店舗内カテゴリ一覧を RMS から直接同期する (2026-08-02、Category API 2.0)。
+// 貼り付け取り込みと同じ replaceShopCategories を使うので激減ガードもそのまま効く。
+router.post('/api/shop-categories/sync', async (req, res) => {
+  if (req.session?.role !== 'admin') {
+    return res.status(403).json({ ok: false, error: '店舗内カテゴリの同期は管理者のみです' });
+  }
+  let fetched;
+  try {
+    // force 再送 (too_few の確認後) は取り直さない — 人が見て承認した内容をそのまま適用する
+    // (再取得すると確認した件数と実際に入る内容がズレる。Codex R1)
+    fetched = await fetchShopCategoryTree({ force: req.body?.refresh === true && req.body?.force !== true });
+  } catch (e) {
+    return res.status(502).json({ ok: false, error: `楽天への接続に失敗しました: ${String(e.message || e).slice(0, 200)}` });
+  }
+  if (!fetched.ok) return res.status(502).json({ ok: false, error: fetched.error });
+  // 複数カテゴリセット (メガプラン) は同名パスで categoryId が割れるため、黙って1つに決めない
+  if (fetched.trees.length > 1) {
+    return res.status(400).json({
+      ok: false,
+      error: `カテゴリセットが ${fetched.trees.length} 個あります。どのセットを使うか決める必要があるため、自動同期を中止しました (中原さんに相談してください)`,
+    });
+  }
+  const { rows, duplicates, skipped, truncated } = flattenCategoryTrees(fetched.trees);
+  if (truncated) {
+    return res.status(502).json({
+      ok: false,
+      error: `店舗内カテゴリが上限 (${MAX_SHOP_CATEGORY_LINES} 件) を超えました。一部だけ取り込むとマスタが欠けるため中止しました`,
+    });
+  }
+  if (rows.length === 0) {
+    return res.status(502).json({ ok: false, error: '楽天から店舗内カテゴリを1件も取得できませんでした' });
+  }
+  // 承認 (force) は「人が件数を見て確認した、その内容」にだけ効かせる (Codex R2 high)。
+  // 確認と再送の間に再取得が走って内容が変わっていたら適用せず、やり直してもらう
+  const snapshot = shopCategorySnapshotHash(rows);
+  const isApproval = req.body?.force === true;
+  if (isApproval && req.body?.expectedSnapshot !== snapshot) {
+    return res.status(409).json({
+      ok: false, error: 'changed',
+      message: '確認したあとに楽天側の内容が変わりました。取り込みからやり直してください',
+    });
+  }
+  const r = replaceShopCategories(getDB(), rows, { force: isApproval });
+  if (r.error === 'too_few') {
+    return res.status(400).json({
+      ok: false, error: 'too_few', active: r.active, incoming: r.incoming, expectedSnapshot: snapshot,
+      message: `取得した件数 (${r.incoming}件) が現在の一覧 (${r.active}件) の半分未満です。楽天側でカテゴリを整理したのでなければ、取得が不完全な可能性があります`,
+    });
+  }
+  res.json({
+    ok: true, imported: rows.length, duplicates, skipped: skipped.length,
+    skippedDetail: skipped.slice(0, 20),
+    active: r.active, deactivated: r.deactivated, source: 'rms',
+  });
+});
+
 // 店舗内カテゴリ一覧の取り込み (貼り付け・全置き換え)。マスタ全体に影響するので admin 限定。
-// RMS Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要なため未対応 —
-// この一覧は「公開時に RMS 画面で設定するカテゴリ」の選択肢・指示として使う。
+// 通常は上の /sync (RMS から直接) を使う。こちらは API が使えないときのフォールバック。
 router.post('/api/shop-categories/import', (req, res) => {
   if (req.session?.role !== 'admin') {
     return res.status(403).json({ ok: false, error: '店舗内カテゴリ一覧の取り込みは管理者のみです' });

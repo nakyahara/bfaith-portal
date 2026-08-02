@@ -760,6 +760,80 @@ router.get('/genres/:genreId/attributes', rateLimitMiddleware('rakuten'), async 
   }
 });
 
+// ==========================================
+// 店舗内カテゴリ (お店の棚) の取得 — Category API 2.0
+//   2026-08-02 プローブで実証したパス (楽天ジャンルとは全くの別物):
+//     GET /es/2.0/categories/shop-category-set-lists                        → { categorySetKeyList: ["0"] }
+//     GET /es/2.0/categories/shop-category-trees/category-set-ids/{setId}   → { rootNode: { children: [...] } }
+//   ⚠️ 誤りやすいパス: /es/2.0/categories/category-sets や .../shop-categories は 404/405。
+//      shop-categories は POST (カテゴリ作成) 専用で、一覧取得には使えない。
+//   読み取り専用なので write gate 不要。棚の構成はめったに変わらないので 24h キャッシュ
+// ==========================================
+
+const SHOP_CAT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+let shopCatCache = null; // { fetchedAt, data }
+
+router.get('/shop-categories/tree', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const force = req.query.refresh === '1';
+    if (!force && shopCatCache && (Date.now() - shopCatCache.fetchedAt) < SHOP_CAT_CACHE_TTL_MS) {
+      return okResponse(res, { ...shopCatCache.data, cached: true });
+    }
+    const listRes = await rakutenRequest({ path: '/es/2.0/categories/shop-category-set-lists' });
+    if (listRes.status !== 200) {
+      return errorResponse(res, {
+        status: 502, error: 'RMS_API_ERROR',
+        message: `カテゴリセット一覧の取得に失敗しました (status ${listRes.status})`,
+        requestId: req.requestId,
+      });
+    }
+    // メガプランは複数セットを持てる。通常店は "0" の 1 つだけ
+    const setIds = Array.isArray(listRes.data?.categorySetKeyList) ? listRes.data.categorySetKeyList : [];
+    if (setIds.length === 0) {
+      return errorResponse(res, {
+        status: 502, error: 'RMS_API_ERROR',
+        message: 'カテゴリセットが1つも返りませんでした', requestId: req.requestId,
+      });
+    }
+    const trees = [];
+    for (const setId of setIds) {
+      if (!/^\d{1,10}$/.test(String(setId))) {
+        // 想定外の ID 形式を黙って捨てると「一部が欠けたまま全置き換え」になるので中断する
+        return errorResponse(res, {
+          status: 502, error: 'RMS_API_ERROR',
+          message: `カテゴリセットIDの形式が想定外です (${String(setId).slice(0, 20)})`,
+          requestId: req.requestId,
+        });
+      }
+      const r = await rakutenRequest({
+        path: `/es/2.0/categories/shop-category-trees/category-set-ids/${encodeURIComponent(setId)}?categoryfields=TITLE`,
+      });
+      if (r.status !== 200) {
+        return errorResponse(res, {
+          status: 502, error: 'RMS_API_ERROR',
+          message: `カテゴリツリー (セット ${setId}) の取得に失敗しました (status ${r.status})`,
+          requestId: req.requestId,
+        });
+      }
+      // 200 でも中身が壊れていたら中断 (Codex R1: 部分データで全置き換えするとマスタが欠ける)
+      const rootNode = r.data?.rootNode;
+      if (!rootNode || !Array.isArray(rootNode.children)) {
+        return errorResponse(res, {
+          status: 502, error: 'RMS_API_ERROR',
+          message: `カテゴリツリー (セット ${setId}) の応答形が想定外です (rootNode.children が無い)`,
+          requestId: req.requestId,
+        });
+      }
+      trees.push({ categorySetId: String(setId), rootNode });
+    }
+    const data = { categorySetIds: setIds.map(String), trees };
+    shopCatCache = { fetchedAt: Date.now(), data };
+    okResponse(res, { ...data, cached: false });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 router.get('/status', (req, res) => {
   okResponse(res, {
     hasCredentials: !!(process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY),
