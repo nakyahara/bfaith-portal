@@ -266,6 +266,9 @@ async function fetchDriveThumbnail(fileId, width) {
         && (res.headers.get('content-type') || '').startsWith('image/')
         && !(Number.isFinite(declared) && declared > THUMB_SOURCE_MAX_BYTES)) {
         raw = await readBodyLimited(res, THUMB_SOURCE_MAX_BYTES);
+      } else {
+        // 拒否したレスポンスの転送を続けさせない (タイムアウトまで接続を保持しないよう明示中断)
+        await res.body?.cancel();
       }
     } catch (_) {
       raw = null; // フォールバックへ
