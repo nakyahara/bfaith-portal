@@ -56,6 +56,9 @@ function isAppCreatedItem(mn) {
 
 const DETAILS_BULK_MAX = 200;
 
+// 問い合わせ添付の受信上限 (inquiry-hub 側の上限とは独立に、この中継自身も自衛する)
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
 // /items/all-codes は 100ページ × 1.1秒 = ~110秒かかるので 5分キャッシュ。
 // 進行中の取得は in-flight promise を共有して同時実行重複を防ぐ。
 // 強制再取得は ?refresh=1 で可能。
@@ -318,6 +321,48 @@ router.get('/inquiries', rateLimitMiddleware('rakuten'), async (req, res) => {
     const result = await rakutenRequest({ path: `/es/1.0/inquirymng-api/inquiries?${params.toString()}` });
     // RMS のレスポンスをステータスごと素通し (アダプター側が形を検証する)
     res.status(result.status).json(result.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// 添付ファイル取得 passthrough (inquiry-hub 添付表示。2026-08-02)
+// - read-only。RMS の GET /attachment?path=&label= をバイナリのまま素通しする
+// - path は RMS が発行した取得キーをそのまま渡す (任意パス注入にはならない。path/label 以外は通さない)
+// - 呼び出し元は inquiry-hub の添付配信ルートのみ (Render→CF Tunnel→サービストークン認証の内側)
+router.get('/inquiry-attachment', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const attPath = String(req.query.path || '');
+    const label = String(req.query.label || '');
+    if (!attPath) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'path が必要です', requestId: req.requestId });
+    }
+    if (attPath.length > 500 || label.length > 300) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'path / label が長すぎます', requestId: req.requestId });
+    }
+    const params = new URLSearchParams({ path: attPath, label });
+    let result;
+    try {
+      result = await rakutenRequest({
+        path: `/es/1.0/inquirymng-api/attachment?${params.toString()}`,
+        responseType: 'buffer',
+        maxBytes: MAX_ATTACHMENT_BYTES,   // 呼び出し元 (Render) とは独立に自分でも上限を持つ
+      });
+    } catch (e) {
+      if (e?.tooLarge) {
+        return errorResponse(res, { status: 413, error: 'ATTACHMENT_TOO_LARGE', message: e.message, requestId: req.requestId });
+      }
+      throw e;
+    }
+    if (result.status !== 200 || !Buffer.isBuffer(result.data)) {
+      const detail = Buffer.isBuffer(result.data) ? '(binary)' : String(JSON.stringify(result.data ?? '')).slice(0, 200);
+      return errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: `添付取得に失敗 (HTTP ${result.status}) ${detail}`, requestId: req.requestId });
+    }
+    console.log(`[rakuten-rms] inquiry-attachment ${attPath.slice(0, 24)}… -> ${result.data.length} bytes`);
+    res.setHeader('Content-Type', result.contentType || 'application/octet-stream');
+    res.setHeader('Content-Length', String(result.data.length));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.status(200).end(result.data);
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
   }

@@ -87,8 +87,11 @@ export function walkPayload(payload, out = { text: '', html: '', attachments: []
   if (filename) {
     out.attachments.push({
       // Gmail の attachmentId は取得ごとに変わり得る (安定しない) ため外部IDにしない。
-      // undefined → エンジンの決定的 synthetic 採番 (msgId+fileName+size) に委ねて再同期でも冪等にする
-      externalAttachmentId: undefined,
+      // 代わりに partId (MIME構造上の位置。再取得しても安定) を使う。
+      // これで同名・同サイズの添付が同じメールに複数あっても1件に潰れない (Codexレビュー Medium-3)。
+      // partId が無い旧レスポンス形は undefined → エンジンの決定的 synthetic 採番に委ねる
+      externalAttachmentId: payload.partId ? `part:${payload.partId}` : undefined,
+      partId: payload.partId ?? null,
       fileName: filename,
       contentType: mime || null,
       fileSize: payload.body?.size ?? null,
@@ -375,6 +378,46 @@ export function createGmailAdapter(cfg = {}) {
       if (!sent?.id) throw new Error('Gmail送信レスポンスに id がありません — 結果不明');
       console.log(`[gmail-send] 送信完了 To=${to} messageId=${sent.id}`);
       return { externalReplyId: sent.id };
+    },
+
+    /**
+     * 添付の実体取得 (画面の添付表示用。attachments.js から呼ばれる)。
+     * Gmail の attachmentId は取得ごとに変わり得るため同期時に保存していない (walkPayload 参照)。
+     * そのためメッセージを取り直し、ファイル名 (+サイズ) で part を特定してから本体を取る。
+     * @returns {{ buffer: Buffer, contentType: string|null, fileName: string|null }}
+     */
+    async fetchAttachment({ externalAttachmentId, externalMessageId, fileName, fileSize, maxBytes = null }) {
+      requests = 0;
+      const msgId = String(externalMessageId || '');
+      if (!msgId || msgId.startsWith('syn:')) {
+        throw new Error('このメッセージにはGmailのメッセージIDがありません (再同期が必要です)');
+      }
+      const m = await apiGet(`messages/${encodeURIComponent(msgId)}?format=full`, 'attachment-message');
+      const parts = [];
+      (function walk(p) {
+        if (!p) return;
+        parts.push(p);
+        for (const c of p.parts || []) walk(c);
+      })(m.payload);
+      const withFile = parts.filter(p => p.filename && p.body?.attachmentId);
+      // 同期時に保存した partId (MIME構造上の位置) が最も確実。無い場合 (旧データ) は
+      // ファイル名 + サイズ、最後にファイル名だけ、の順にフォールバックする
+      const wantPartId = String(externalAttachmentId || '').startsWith('part:')
+        ? String(externalAttachmentId).slice(5) : null;
+      // partId を保存してあるならそれと一致必須 (見つからなければ失敗させる)。
+      // 名前へのフォールバックは partId を保存していない旧データ (syn:) のときだけ
+      // — 一致しないのに同名の別添付を返すと、別の顧客の写真を表示しかねない
+      const part = wantPartId
+        ? withFile.find(p => String(p.partId) === wantPartId)
+        : (withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
+          || withFile.find(p => p.filename === fileName));
+      if (!part) throw new Error(`添付「${fileName || '(名称不明)'}」がメール内に見つかりません (削除された、またはメールの構成が変わった可能性)`);
+      if (maxBytes && part.body?.size > maxBytes) {
+        throw new Error(`添付が大きすぎます (${Math.round(part.body.size / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
+      }
+      const a = await apiGet(`messages/${encodeURIComponent(msgId)}/attachments/${encodeURIComponent(part.body.attachmentId)}`, 'attachment-body');
+      if (!a?.data) throw new Error('Gmail添付レスポンスに data がありません');
+      return { buffer: b64urlToBuf(a.data), contentType: part.mimeType || null, fileName: part.filename || fileName || null };
     },
 
     /** 認証状態 (運用管理画面用)。refresh token は再認可レス無期限運用のため期限は返さない */

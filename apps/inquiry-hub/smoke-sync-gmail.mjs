@@ -88,7 +88,13 @@ console.log('2. mapThread');
   check('b-faith.bizドメイン=shop/outgoing', r.messages[1].senderType === 'shop' && r.messages[1].isIncoming === 0);
   check('顧客=customer/incoming', r.messages[0].senderType === 'customer' && r.messages[0].isIncoming === 1);
   check('本文デコード', r.messages[1].bodyText === '在庫ございます');
-  check('添付はsynthetic採番に委ねる (externalAttachmentId=undefined)', r.messages[0].attachments.length === 1 && r.messages[0].attachments[0].externalAttachmentId === undefined && r.messages[0].attachments[0].fileName === 'photo.jpg');
+  // 添付の外部IDは partId (MIME構造上の位置。再取得しても安定 = 同名・同サイズでも取り違えない)。
+  // partId が無い形のレスポンスでは undefined = エンジンの synthetic 採番に委ねる (2026-08-02)
+  {
+    const a0 = r.messages[0].attachments[0];
+    check('添付の外部ID', r.messages[0].attachments.length === 1 && a0.fileName === 'photo.jpg'
+      && a0.externalAttachmentId === (a0.partId ? `part:${a0.partId}` : undefined), JSON.stringify(a0));
+  }
   check('receivedAt=最初のメッセージ', r.receivedAt === NOW_MS - 7200e3);
   check('initialInternalStatusなし (通常取込)', r.initialInternalStatus === undefined);
 

@@ -22,6 +22,8 @@
  */
 
 import { SendRejectedError } from '../../outbox.js';
+import { contentTypeFromExt } from '../../mime.js';
+import { readBodyWithLimit } from '../../read-limited.js';
 
 const DAY_MS = 86400000;
 const SEND_BODY_MAX = 2000; // externalTalkAdd の本文上限 (公式仕様)
@@ -63,9 +65,14 @@ export function mapTopicDetail(topicId, detail, headline = null) {
       bodyText: m.body ?? null,
       isIncoming: fromUser ? 1 : 0,
       sentAt: atMs, receivedAt: atMs,
+      // 公式仕様 (質問詳細API): fileList[] = { fileName, objectKey, fileExt, thumbnailUrl, fileSize }。
+      // objectKey がファイル取得API (externalTalkFileDownload) のキーなので外部IDに使う
+      // (旧実装は fileId/id を見ていて objectKey を捨てていた → 添付を取得できなかった)
       attachments: (m.fileList || []).map(f => ({
-        externalAttachmentId: f?.fileId ?? f?.id ?? undefined,
+        externalAttachmentId: f?.objectKey ?? f?.fileId ?? f?.id ?? undefined,
         fileName: f?.fileName ?? f?.name ?? null,
+        contentType: contentTypeFromExt(f?.fileExt),
+        fileSize: Number.isFinite(Number(f?.fileSize)) ? Number(f.fileSize) : null,
       })),
     };
   });
@@ -217,6 +224,37 @@ export function createYahooAdapter(cfg = {}) {
       }
       console.log(`[yahoo-send] 送信完了 topic=${topicId.slice(0, 12)}… messageid=${messageId}`);
       return { externalReplyId: `m:${messageId}` };
+    },
+
+    /**
+     * 添付の実体取得 (画面の添付表示用。attachments.js から呼ばれる)。
+     * VPSプロキシの /yahoo/externalTalkFile passthrough (公式: ファイル取得API
+     * externalTalkFileDownload?key=<objectKey>) を叩き、投稿時の Content-Type のまま受け取る。
+     * @returns {{ buffer: Buffer, contentType: string|null, fileName: string|null }}
+     */
+    async fetchAttachment({ externalAttachmentId, fileName, maxBytes = null }) {
+      const key = String(externalAttachmentId || '');
+      // syn: = 同期時に objectKey が取れず決定的IDで代替したもの (取得キーが無い)。
+      // objectKey 対応前に取り込んだ添付が該当し、再同期 (deep) で実キーに更新される
+      if (!key || key.startsWith('syn:')) {
+        throw new Error('この添付にはYahoo!側の取得キー (objectKey) がありません (再同期が必要です)');
+      }
+      const u = new URL(`${base}/yahoo/externalTalkFile`);
+      u.searchParams.set('key', key);
+      let res;
+      try {
+        res = await fetchImpl(u.toString(), {
+          headers: { 'X-Proxy-Secret': proxySecret },
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      } catch (err) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        throw new Error(timedOut ? `Yahoo添付取得 タイムアウト (${requestTimeoutMs}ms)` : `Yahoo添付取得の接続失敗: ${err?.message || err}`);
+      }
+      if (res.status !== 200) throw new Error(`Yahoo添付取得 HTTP ${res.status}`);
+      // Content-Length は信用せず、読みながら実バイト数で打ち切る (Codexレビュー High-1)
+      const buffer = await readBodyWithLimit(res, maxBytes, '添付');
+      return { buffer, contentType: res.headers.get('content-type') || null, fileName: fileName || null };
     },
 
     /**

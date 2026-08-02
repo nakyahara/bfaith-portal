@@ -172,8 +172,43 @@ function ingestInquiry(db, shop, item, nowIso) {
     const msgRow = db.prepare('SELECT id FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = ?')
       .get(inq.id, extMsgId);
     for (const a of m.attachments || []) {
-      const extAttId = a.externalAttachmentId || syntheticAttachmentId(extMsgId, a.fileName, a.fileSize);
+      const realId = a.externalAttachmentId || null;
+      const extAttId = realId || syntheticAttachmentId(extMsgId, a.fileName, a.fileSize);
+      // 旧同期が synthetic ID で取り込んだ行を実IDへ昇格させる (同じ添付が2行に増えないように)。
+      // 実IDが後から取れるようになったケース: Yahoo! の objectKey (2026-08-02 添付表示で対応)。
+      // synthetic ID は fileSize を含むため旧行のIDは再計算できない → 同一メッセージ内の
+      // 同名 syn: 行を照合キーにする
+      if (realId) {
+        const already = db.prepare('SELECT id FROM inquiry_attachments WHERE inquiry_message_id = ? AND external_attachment_id = ?')
+          .get(msgRow.id, realId);
+        // 昇格先の特定は「同じ生成規則で計算した synthetic ID の完全一致」を最優先にする。
+        // メタデータ (fileSize) が旧同期時と変わっていて再計算が当たらない場合だけ、
+        // 同名 syn: 行のうち最も古いものにフォールバックする (同名添付が複数あっても
+        // 決定的な順序で1対1に対応させる。ORDER BY id 昇順)
+        const synId = syntheticAttachmentId(extMsgId, a.fileName, a.fileSize);
+        const legacy = db.prepare('SELECT id FROM inquiry_attachments WHERE inquiry_message_id = ? AND external_attachment_id = ?')
+          .get(msgRow.id, synId)
+          // フォールバックはファイル名に加えてサイズも照合する (旧同期でサイズを保存して
+          // いなかった NULL 行のみ名前一致で拾う)。別サイズの同名添付を誤って昇格させない
+          || db.prepare(`SELECT id FROM inquiry_attachments
+            WHERE inquiry_message_id = ? AND external_attachment_id LIKE 'syn:%'
+              AND IFNULL(file_name, '') = IFNULL(?, '')
+              AND (file_size IS NULL OR ? IS NULL OR file_size = ?)
+            ORDER BY id LIMIT 1`).get(msgRow.id, a.fileName ?? null, a.fileSize ?? null, a.fileSize ?? null);
+        if (legacy) {
+          if (already) db.prepare('DELETE FROM inquiry_attachments WHERE id = ?').run(legacy.id);
+          else db.prepare('UPDATE inquiry_attachments SET external_attachment_id = ? WHERE id = ?').run(realId, legacy.id);
+        }
+      }
       insAtt.run(msgRow.id, extAttId, a.fileName ?? null, a.contentType ?? null, a.fileSize ?? null);
+      // メタデータは後から取れるようになった分を埋める (既存行の content_type/file_size が NULL のまま
+      // 残らないように。表示側が画像判定に使う)
+      db.prepare(`UPDATE inquiry_attachments SET
+          file_name = COALESCE(file_name, ?),
+          content_type = COALESCE(?, content_type),
+          file_size = COALESCE(?, file_size)
+        WHERE inquiry_message_id = ? AND external_attachment_id = ?`)
+        .run(a.fileName ?? null, a.contentType ?? null, a.fileSize ?? null, msgRow.id, extAttId);
     }
   }
 

@@ -64,6 +64,30 @@ function addColumnIfMissing(table, column, typeClause) {
 }
 
 function createTables() {
+  // 任意フォルダ (スタッフが作る分類箱。2026-08-02 要望)。
+  // 「新着/返信処理中/完了」= 対応の進行状態 とは直交する分類軸で、フォルダに入れても
+  // 受信トレイからは消えない (入れたまま返信を忘れる事故を作らないため)。
+  // inquiries.folder_id から参照されるので inquiries より先に作る
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_folders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    name_key TEXT,                  -- 重複判定用の正規化キー (NFKC + 小文字。folders.js が入れる)
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),  -- 削除は論理削除のみ
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  addColumnIfMissing('inquiry_folders', 'name_key', 'TEXT');
+  db.exec('UPDATE inquiry_folders SET name_key = LOWER(name) WHERE name_key IS NULL');
+  // 同名フォルダの禁止は「有効なもの同士」だけ (削除済みと同じ名前は作り直せる)。
+  // 判定はアプリと同じ正規化キーで行う (アプリ側だけの検査だとDBが素通しし、
+  // 見た目が同じフォルダが並ぶ。Codexレビュー2巡目 Medium-6)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_name_active
+    ON inquiry_folders(name) WHERE is_active = 1`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_namekey_active
+    ON inquiry_folders(name_key) WHERE is_active = 1 AND name_key IS NOT NULL`);
+
   // 店舗・チャネル
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +148,8 @@ function createTables() {
     -- 複合FK: shop の存在 + channel_type の一致を同時に保証 (email shop に楽天チケット等の不整合を防ぐ)
     FOREIGN KEY (shop_id, channel_type) REFERENCES shops(id, channel_type)
   )`);
+  // 任意フォルダへの所属 (1件1フォルダ。NULL=未分類)。既存DBへの冪等migration
+  addColumnIfMissing('inquiries', 'folder_id', 'INTEGER REFERENCES inquiry_folders(id)');
 
   // メッセージ (受信・送信の両方)
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (
@@ -368,6 +394,7 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_order ON inquiries(order_number)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_product ON inquiries(product_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_customer ON inquiries(customer_identifier)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_folder ON inquiries(folder_id, last_message_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_inquiry ON inquiry_messages(inquiry_id, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_replies(status, lease_until)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)');

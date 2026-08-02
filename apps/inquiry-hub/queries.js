@@ -90,6 +90,10 @@ export function listInquiries(q = {}) {
   if (q.status && STATUSES[q.status]) { where.push('i.internal_status = ?'); params.push(q.status); }
   if (q.channel && CHANNELS[q.channel]) { where.push('i.channel_type = ?'); params.push(q.channel); }
   if (q.shop && /^\d+$/.test(String(q.shop))) { where.push('i.shop_id = ?'); params.push(Number(q.shop)); }
+  // 任意フォルダ ('none'=未分類 / 数値=そのフォルダ)。ビュー (新着・完了等) とはAND条件で重ねる
+  // = フォルダに入れても受信トレイからは消えない (2026-08-02 中原さん確認)
+  if (q.folder === 'none') where.push('i.folder_id IS NULL');
+  else if (/^\d+$/.test(String(q.folder || ''))) { where.push('i.folder_id = ?'); params.push(Number(q.folder)); }
   if (q.assigned === 'none') where.push("(i.assigned_user_id IS NULL OR i.assigned_user_id = '')");
   else if (q.assigned) { where.push('i.assigned_user_id = ?'); params.push(String(q.assigned)); }
   if (q.unread === '1') where.push('i.is_unread = 1');
@@ -112,11 +116,12 @@ export function listInquiries(q = {}) {
   const page = Math.max(1, parseInt(q.page, 10) || 1);
   const total = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where.join(' AND ')}`).get(...params).c;
   const rows = db.prepare(`
-    SELECT i.*, s.shop_name,
+    SELECT i.*, s.shop_name, f.name AS folder_name,
       (SELECT COUNT(*) FROM inquiry_messages m WHERE m.inquiry_id = i.id) AS msg_count,
       ${LAST_INCOMING_SQL} AS last_incoming,
       ${LAST_MESSAGE_AT_SQL} AS last_message_at_actual
     FROM inquiries i JOIN shops s ON s.id = i.shop_id
+    LEFT JOIN inquiry_folders f ON f.id = i.folder_id
     WHERE ${where.join(' AND ')}
     ORDER BY COALESCE(i.last_message_at, i.received_at) DESC, i.id DESC
     LIMIT ? OFFSET ?`).all(...params, PAGE_SIZE, (page - 1) * PAGE_SIZE);
@@ -147,8 +152,11 @@ export function getInquiryDetail(id) {
   const db = getDB();
   if (!Number.isInteger(id)) return null;
   const inquiry = db.prepare(`
-    SELECT i.*, s.shop_name, s.account_identifier, s.last_synced_at AS shop_last_synced_at
-    FROM inquiries i JOIN shops s ON s.id = i.shop_id WHERE i.id = ?`).get(id);
+    SELECT i.*, s.shop_name, s.account_identifier, s.last_synced_at AS shop_last_synced_at,
+      f.name AS folder_name, f.is_active AS folder_is_active
+    FROM inquiries i JOIN shops s ON s.id = i.shop_id
+    LEFT JOIN inquiry_folders f ON f.id = i.folder_id
+    WHERE i.id = ?`).get(id);
   if (!inquiry) return null;
   const messages = db.prepare('SELECT * FROM inquiry_messages WHERE inquiry_id = ? ORDER BY COALESCE(received_at, sent_at, created_at), id').all(id);
   const attachments = db.prepare(`SELECT a.* FROM inquiry_attachments a

@@ -199,7 +199,7 @@ console.log('5. 返信エディタ');
   // フラグOFF (既定): UIも APIも無効
   delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
   const htmlOff = await (await fetch(base + `/inquiries/${inq}`)).text();
-  check('フラグOFF: エディタ非表示 (プレースホルダのみ)', !htmlOff.includes('id="replyBody"') && htmlOff.includes('返信機能は Step 3 以降で実装'));
+  check('フラグOFF: エディタ非表示 (プレースホルダのみ)', !htmlOff.includes('id="replyBody"') && htmlOff.includes('返信機能はまだ有効になっていません'));
   const rOff = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: randomUUID(), baseConversationRev: 1 });
   check('フラグOFF: APIは403', rOff.status === 403);
 

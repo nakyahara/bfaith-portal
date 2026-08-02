@@ -25,6 +25,10 @@ import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templa
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
+import { listFolders, countUnfiled, createFolder, updateFolder, deleteFolder, setInquiryFolder,
+  FOLDER_NAME_MAX } from './folders.js';
+import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
+import { isImage, isInlineSafe, fmtBytes, resolveContentType } from './mime.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
 
@@ -67,6 +71,7 @@ const stBadge = st => badge(STATUSES[st], null) || he(st);
 // ─── 対応履歴の表示整形 (生JSONではなく日本語ラベルで出す) ───
 const ACTION_LABELS = {
   status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
+  folder_change: 'フォルダ変更',
   attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
   reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
 };
@@ -77,6 +82,7 @@ function fmtLogValue(key, v) {
     case 'needs_attention': return v ? '⚠️要確認ON' : '要確認OFF';
     case 'ai_needed': return Number(v) === 0 ? 'AI不要' : ((AI_FLAGS[v] || {}).label || String(v));
     case 'assigned': return v ? String(v) : '未割当';
+    case 'folder': return v ? `📁${v}` : '未分類';
     case 'length': return `${v}文字`;
     case 'source': return String(v);
     default: return typeof v === 'object' ? JSON.stringify(v) : String(v);
@@ -97,6 +103,9 @@ router.get('/', (req, res) => {
   const kw = String(q.q || '').trim();
   const { rows, total, page, pages, view } = listInquiries(q);
   const { shops, assignees, countMap } = listFilterOptions();
+  // 任意フォルダ (サイドバーから ?folder=<id> で来る。ビュー条件とはANDで重なる)
+  const folders = listFolders();
+  const curFolder = /^\d+$/.test(String(q.folder || '')) ? folders.find(f => f.id === Number(q.folder)) : null;
 
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
@@ -112,6 +121,7 @@ router.get('/', (req, res) => {
     <select name="status"><option value="">状態: 全て</option>${Object.entries(STATUSES).map(([k, v]) => opt(k, `${v.label} (${countMap[k] || 0})`, q.status)).join('')}</select>
     <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
     <select name="shop"><option value="">店舗: 全て</option>${shops.map(s => opt(s.id, `${(CHANNELS[s.channel_type] || {}).label || s.channel_type} / ${s.shop_name}`, q.shop)).join('')}</select>
+    <select name="folder"><option value="">フォルダ: 全て</option>${opt('none', '未分類', q.folder)}${folders.map(f => opt(f.id, `📁 ${f.name}`, q.folder)).join('')}</select>
     <select name="assigned"><option value="">担当: 全て</option>${opt('none', '未割当', q.assigned)}${assignees.map(u => opt(u, u, q.assigned)).join('')}</select>
     <label class="chk"><input type="checkbox" name="unread" value="1"${q.unread === '1' ? ' checked' : ''}>未読</label>
     <label class="chk"><input type="checkbox" name="attention" value="1"${q.attention === '1' ? ' checked' : ''}>要確認</label>
@@ -119,7 +129,7 @@ router.get('/', (req, res) => {
     <input type="date" name="from" value="${he(q.from || '')}" title="受信日 From">〜<input type="date" name="to" value="${he(q.to || '')}" title="受信日 To">
     <input type="search" name="q" value="${he(kw)}" placeholder="顧客名/件名/本文/注文番号/商品コード" style="min-width:240px">
     <button class="pri">検索</button>
-    <a href="/apps/inquiry-hub?view=${he(view)}" class="ghost btn-link">クリア</a>
+    <a href="/apps/inquiry-hub?view=${he(view)}${curFolder ? `&folder=${curFolder.id}` : ''}" class="ghost btn-link">クリア</a>
   </form>
   </div>
   </details>`;
@@ -138,11 +148,11 @@ router.get('/', (req, res) => {
 
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
-    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}'">
+    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
-      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}">${he(r.subject || '(件名なし)')}</a>
-        <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通</div></td>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}">${he(r.subject || '(件名なし)')}</a>
+        <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
@@ -160,14 +170,21 @@ router.get('/', (req, res) => {
     <span>${page} / ${pages} ページ (全${total}件)</span>
     ${page < pages ? `<a href="${he(pageLink(page + 1))}">次 →</a>` : ''}</div>` : `<div class="pager"><span>全${total}件</span></div>`;
 
-  const emptyMsg = {
+  const emptyMsg = curFolder ? `フォルダ「${curFolder.name}」に該当する問い合わせはありません` : {
     inbox: '受信トレイは空です 🎉 (返信が必要な問い合わせはありません)',
     sent: '返事待ちの案件はありません',
     done: '対応済みの問い合わせはまだありません',
     all: '問い合わせがありません',
   }[view];
+  // フォルダを開いているときはフォルダ名を主役にする (ビューはAND条件として併記)
+  const hintLine = curFolder
+    ? `📁 <b>${he(curFolder.name)}</b> — このフォルダに入れた問い合わせ${q.folder === 'none' ? '' : ''}
+       <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
+    : q.folder === 'none'
+      ? `🗃️ <b>未分類</b> — フォルダに入れていない問い合わせ <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
+      : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
   const body = `
-  <div class="view-hint">${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}</div>
+  <div class="view-hint">${hintLine}</div>
   ${filterBar}
   <div class="card">
     <table class="cardable">
@@ -191,7 +208,9 @@ router.get('/', (req, res) => {
     sync();
     mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
   })();`;
-  res.send(pageShell(`問い合わせ管理 — ${VIEWS[view].label}`, view, body, listScript));
+  res.send(pageShell(
+    curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${VIEWS[view].label}`,
+    curFolder ? `folder:${curFolder.id}` : view, body, listScript));
 });
 
 // ─── 詳細画面 ───
@@ -200,8 +219,11 @@ router.get('/inquiries/:id', (req, res) => {
   const detail = getInquiryDetail(id);
   if (!detail) return res.status(404).send(pageShell('問い合わせ管理', DEFAULT_VIEW, '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
-  // 戻り先のビュー (一覧から ?view= を引き継ぐ。直リンク時は受信トレイ)
+  // 戻り先のビュー (一覧から ?view=/?folder= を引き継ぐ。直リンク時は受信トレイ)
   const backView = VIEWS[req.query?.view] ? req.query.view : DEFAULT_VIEW;
+  const backFolderId = /^\d+$/.test(String(req.query?.folder || '')) ? Number(req.query.folder) : null;
+  const backFolder = backFolderId ? listFolders().find(f => f.id === backFolderId) : null;
+  const backUrl = `/apps/inquiry-hub?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
 
@@ -209,8 +231,27 @@ router.get('/inquiries/:id', (req, res) => {
   // (Codex R1 medium: プリフェッチ/リンクプレビューでの意図しない既読化と監査ログ欠落の防止)
 
   const msgHtml = messages.map(m => {
-    const atts = (attByMsg[m.id] || []).map(a =>
-      `<span class="att" title="取得状態: ${he(a.fetch_status)}">📎 ${he(a.file_name || '(名称不明)')}${a.file_size ? ` (${Math.round(a.file_size / 1024)}KB)` : ''}</span>`).join(' ');
+    // 添付: 画像はその場でサムネイル表示 (クリックで原寸)、それ以外はダウンロードリンク。
+    // 実体は保存せず表示のたびに外部から取る (attachments.js) ため lazy 読み込みにする
+    const atts = (attByMsg[m.id] || []).map(a => {
+      const ct = resolveContentType(a.file_name, a.content_type);
+      const url = `/apps/inquiry-hub/attachments/${a.id}`;
+      const size = fmtBytes(a.file_size);
+      const label = `${he(a.file_name || '(名称不明)')}${size ? ` (${size})` : ''}`;
+      if (isImage(ct)) {
+        return `<figure class="att-img">
+          <a href="${url}" target="_blank" rel="noopener">
+            <img src="${url}" alt="${he(a.file_name || '添付画像')}" loading="lazy"
+              onerror="this.closest('figure').classList.add('att-err')">
+          </a>
+          <figcaption>🖼️ <a href="${url}" target="_blank" rel="noopener">${label}</a>
+            <a class="att-dl" href="${url}?download=1">⬇️保存</a>
+            <span class="att-fail">取得できませんでした (モール/メール側で確認してください)</span></figcaption>
+        </figure>`;
+      }
+      const icon = isInlineSafe(ct) ? '📄' : '📎';
+      return `<span class="att">${icon} <a href="${url}${isInlineSafe(ct) ? '' : '?download=1'}" target="_blank" rel="noopener">${label}</a></span>`;
+    }).join(' ');
     // Step 1 は text のみ表示 (message_body_html のサニタイズ表示は Gmail 同期実装時に導入)。
     // 取込済みデータには過剰な空行が残っているものがあるため表示時にも正規化する
     // (自動配信メールの空行がそのまま<br>になり、スマホで画面が延々と間延びしていた実測)
@@ -244,6 +285,11 @@ router.get('/inquiries/:id', (req, res) => {
     const detail = b != null && a != null ? `${b} → ${a}` : (a != null ? a : '');
     return `<div class="log-row"><span class="msg-date">${fmtJst(l.created_at)}</span> <b>${he(l.user_id || l.actor_type)}</b> ${he(ACTION_LABELS[l.action_type] || l.action_type)} <span class="sub">${he(detail)}</span></div>`;
   }).join('') || '<div class="empty">履歴はありません</div>';
+
+  // 任意フォルダ (分類ラベル。ステータスとは独立で、入れても受信トレイからは消えない)
+  const folderList = listFolders();
+  const folderOptions = `<option value="">未分類</option>` + folderList
+    .map(f => `<option value="${f.id}"${inq.folder_id === f.id ? ' selected' : ''}>📁 ${he(f.name)}</option>`).join('');
 
   const stOptions = Object.entries(STATUSES).map(([k, v]) => `<option value="${k}"${inq.internal_status === k ? ' selected' : ''}>${he(v.label)}</option>`).join('');
   const aiOptions = Object.entries(AI_FLAGS).map(([k, v]) => `<option value="${k}"${String(inq.ai_needed) === k ? ' selected' : ''}>${he(k === '0' ? 'AI不要' : v.label)}</option>`).join('');
@@ -297,7 +343,8 @@ router.get('/inquiries/:id', (req, res) => {
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
         </div>`}
       </div>` : `
-      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>`;
+      <div class="panel reply-note">✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
+        <span class="sub">管理者が env <code>INQUIRY_HUB_REPLY_EDITOR_ENABLED=true</code> を設定すると、この画面から返信できます</span></div>`;
 
   // 📧 このメールを今後どう扱うか (メールチャネルのみ)。自動配信メールが受信トレイを
   // 埋めるので、その場でルールを作れるようにする (2026-07-25 中原さん要望)
@@ -341,7 +388,7 @@ router.get('/inquiries/:id', (req, res) => {
 
   const body = `
   <div class="detail-head">
-    <a href="/apps/inquiry-hub?view=${he(backView)}">← ${he(VIEWS[backView].label)}に戻る</a>
+    <a href="${backUrl}">← ${backFolder ? `📁${he(backFolder.name)}` : he(VIEWS[backView].label)}に戻る</a>
     <h2>${chBadge(inq.channel_type)} ${he(inq.subject || '(件名なし)')}</h2>
   </div>
   <div class="detail-grid">
@@ -369,6 +416,9 @@ router.get('/inquiries/:id', (req, res) => {
         <label>担当者
           <div class="row"><input id="asgInput" type="text" value="${he(inq.assigned_user_id || '')}" placeholder="メールアドレス等">
           <button class="ghost" id="asgMe" type="button">自分</button></div></label>
+        <label>📁 フォルダ
+          <select id="folderSel">${folderOptions}</select>
+          <span class="sub">分類用。入れても未返信なら受信トレイに残ります (<a href="/apps/inquiry-hub/folders">フォルダ管理</a>)</span></label>
         <label>AIフラグ <select id="aiSel">${aiOptions}</select></label>
         <label class="chk"><input type="checkbox" id="attnChk"${inq.needs_attention ? ' checked' : ''}>⚠️要確認</label>
         <label class="chk"><input type="checkbox" id="unreadChk"${inq.is_unread ? ' checked' : ''}>未読に戻す</label>
@@ -391,7 +441,7 @@ router.get('/inquiries/:id', (req, res) => {
 
   const script = `
   var ID = ${id};
-  var CUR = ${JSON.stringify({ status: inq.internal_status, assigned: inq.assigned_user_id || '', ai: inq.ai_needed, attention: !!inq.needs_attention, unread: !!inq.is_unread }).replace(/</g, '\\u003c')};
+  var CUR = ${JSON.stringify({ status: inq.internal_status, assigned: inq.assigned_user_id || '', ai: inq.ai_needed, attention: !!inq.needs_attention, unread: !!inq.is_unread, folder: inq.folder_id == null ? '' : String(inq.folder_id) }).replace(/</g, '\\u003c')};
   var ME = ${JSON.stringify(String(actorOf(req))).replace(/</g, '\\u003c')};
   function post(path, data) {
     return fetch('/apps/inquiry-hub/api/inquiries/' + ID + path, {
@@ -414,8 +464,10 @@ router.get('/inquiries/:id', (req, res) => {
     var ai = Number(document.getElementById('aiSel').value);
     var attn = document.getElementById('attnChk').checked;
     var unread = document.getElementById('unreadChk').checked;
+    var folder = document.getElementById('folderSel').value;
     if (st !== CUR.status) ops.push(post('/status', { status: st }));
     if (asg !== CUR.assigned) ops.push(post('/assign', { user: asg }));
+    if (folder !== CUR.folder) ops.push(post('/folder', { folder_id: folder === '' ? null : Number(folder) }));
     if (ai !== CUR.ai) ops.push(post('/ai-flag', { ai_needed: ai }));
     if (attn !== CUR.attention) ops.push(post('/attention', { needs_attention: attn }));
     if (unread !== CUR.unread) ops.push(post('/read', { is_unread: unread }));
@@ -523,7 +575,8 @@ router.get('/inquiries/:id', (req, res) => {
       .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
 
-  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`, backView, body, script));
+  res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`,
+    backFolder ? `folder:${backFolder.id}` : backView, body, script));
 });
 
 // ─── 操作API (すべて操作ログを記録) ───
@@ -600,6 +653,21 @@ router.post('/api/inquiries/:id/attention', (req, res) => {
     getDB().prepare(`UPDATE inquiries SET needs_attention = ?, updated_at = ${NOW_SQL} WHERE id = ?`).run(v, inq.id);
   });
   res.json({ ok: true });
+});
+
+// 任意フォルダの割当 (folder_id: 数値 or null=未分類)。ステータスには影響しない
+router.post('/api/inquiries/:id/folder', (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  const raw = (req.body || {}).folder_id;
+  if (raw !== null && raw !== undefined && !Number.isInteger(raw)) {
+    return res.status(400).json({ error: '不正なフォルダ指定です' });
+  }
+  try {
+    const r = setInquiryFolder(inq.id, raw ?? null, actorOf(req));
+    res.json({ ok: true, folder: r.folder, unchanged: !!r.unchanged });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
+  }
 });
 
 router.post('/api/inquiries/:id/ai-flag', (req, res) => {
@@ -1343,6 +1411,148 @@ router.post('/api/mail-rules/:id(\\d+)/delete', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// 📁 フォルダ管理 (2026-08-02 スタッフ要望「任意でフォルダを作成できるように」)
+//    作成・改名・並び替え・削除をここに集約する (削除は問い合わせの所属も外すため、
+//    一覧の片手間ではなく専用画面で行う)
+// ═══════════════════════════════════════════════════════════════
+
+router.get('/folders', (req, res) => {
+  const folders = listFolders({ withCounts: true });
+  const unfiled = countUnfiled();
+  const rows = folders.map(f => `
+    <tr>
+      <td data-full data-label="フォルダ名"><input type="text" class="f-name" data-id="${f.id}" value="${he(f.name)}" maxlength="${FOLDER_NAME_MAX}"></td>
+      <td data-label="表示順"><input type="number" class="f-order" data-id="${f.id}" value="${f.sort_order}" style="width:80px"></td>
+      <td data-label="件数"><a href="/apps/inquiry-hub?view=all&folder=${f.id}">${f.total}件</a>
+        <div class="sub">${f.open_count ? `未対応 ${f.open_count}件` : '未対応なし'}</div></td>
+      <td class="ops">
+        <button class="pri f-save" data-id="${f.id}">保存</button>
+        <button class="f-del" data-id="${f.id}" data-name="${he(f.name)}" data-total="${f.total}">削除</button>
+      </td>
+    </tr>`).join('');
+
+  const body = `
+  <div class="view-hint">📁 <b>フォルダ</b> — 問い合わせを自由に分類できます。
+    フォルダに入れても対応状況 (新着・完了など) は変わらないので、<b>未返信のものは受信トレイにも残ります</b>。</div>
+  <div class="filters">
+    <input type="text" id="newName" placeholder="新しいフォルダ名 (例: 返品・交換)" maxlength="${FOLDER_NAME_MAX}" style="min-width:260px">
+    <button class="pri" id="createBtn">➕ 作成</button>
+    <span style="flex:1"></span>
+    <a class="ghost btn-link" href="/apps/inquiry-hub?view=all&folder=none">🗃️ 未分類 ${unfiled}件を見る</a>
+  </div>
+  <div class="card">
+    <table class="cardable">
+      <thead><tr><th>フォルダ名</th><th>表示順</th><th>件数</th><th>操作</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="4" class="empty">フォルダはまだありません。上の欄から作成してください</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/folders' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.getElementById('createBtn').addEventListener('click', function() {
+    var el = document.getElementById('newName'), name = el.value.trim();
+    if (!name) { toast('フォルダ名を入力してください'); return; }
+    this.disabled = true;
+    var btn = this;
+    api('', { name: name }).then(function() { location.reload(); })
+      .catch(function(e) { toast('作成失敗: ' + e.message); btn.disabled = false; });
+  });
+  document.getElementById('newName').addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') document.getElementById('createBtn').click();
+  });
+  document.querySelectorAll('.f-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var id = b.dataset.id;
+      var name = document.querySelector('.f-name[data-id="' + id + '"]').value.trim();
+      var order = Number(document.querySelector('.f-order[data-id="' + id + '"]').value);
+      b.disabled = true;
+      api('/' + id, { name: name, sortOrder: order }).then(function() { location.reload(); })
+        .catch(function(e) { toast('保存失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.f-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var n = Number(b.dataset.total);
+      if (!confirm('フォルダ「' + b.dataset.name + '」を削除しますか?\\n\\n'
+        + (n ? '中の ' + n + '件 は削除されず「未分類」に戻ります。' : '中身は空です。')
+        + '\\n問い合わせそのものは消えません。')) return;
+      b.disabled = true;
+      api('/' + b.dataset.id + '/delete', {}).then(function(r) {
+        toast('削除しました' + (r.detached ? ' (' + r.detached + '件を未分類に戻しました)' : ''));
+        setTimeout(function(){ location.reload(); }, 800);
+      }).catch(function(e) { toast('削除失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — フォルダ', 'folders', body, script));
+});
+
+router.post('/api/folders', (req, res) => {
+  try {
+    const f = createFolder((req.body || {}).name, actorOf(req));
+    console.log(`[inquiry-hub] フォルダ作成「${f.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true, id: f.id, name: f.name });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/folders/:id(\\d+)', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = updateFolder(Number(req.params.id), { name: b.name, sortOrder: b.sortOrder });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/folders/:id(\\d+)/delete', (req, res) => {
+  try {
+    const r = deleteFolder(Number(req.params.id), actorOf(req));
+    console.log(`[inquiry-hub] フォルダ削除「${r.name}」 by ${actorOf(req)} / ${r.detached}件を未分類へ`);
+    res.json({ ok: true, detached: r.detached });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 📎 添付ファイルの配信 (2026-08-02 スタッフ要望「添付された写真や画像を確認したい」)
+//    実体はDBに持たず、都度チャネル (Gmail/楽天/Yahoo!) から取って返す (attachments.js)
+// ═══════════════════════════════════════════════════════════════
+
+router.get('/attachments/:id(\\d+)', async (req, res) => {
+  const ctx = getAttachmentContext(Number(req.params.id));
+  if (!ctx) return res.status(404).type('text/plain; charset=utf-8').send('添付が見つかりません');
+  try {
+    const { buffer, contentType, fileName } = await fetchAttachmentBody(ctx);
+    // 画像・PDF以外、および ?download=1 は必ずダウンロード (ブラウザ内で開かせない)
+    const inline = isInlineSafe(contentType) && req.query.download !== '1';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', String(buffer.length));
+    res.setHeader('Content-Disposition', contentDispositionValue(fileName, inline));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // 添付は顧客から預かった中身そのもの → ディスクに残さない
+    // (共有PCでログアウト後にブラウザキャッシュから開ける状態を作らない)
+    res.setHeader('Cache-Control', 'private, no-store');
+    // 他サイトからの埋め込み・PDFビューア経由の外部読み込みを塞ぐ
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; object-src 'none'; sandbox");
+    res.status(200).end(buffer);
+  } catch (e) {
+    // 混雑 (同時取得の待ち行列超過) は一時的なので 503 + Retry-After で返す
+    if (e?.busy) {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).type('text/plain; charset=utf-8').send(String(e.message));
+    }
+    // それ以外は画面には固定文言のみ (上流のURL・内部ホスト名・設定状況を利用者に出さない。
+    // 原因はサーバーログとエラーIDで追う。Codexレビュー Medium-5)
+    const errorId = crypto.randomUUID().slice(0, 8);
+    console.warn(`[inquiry-hub] 添付取得失敗 id=${ctx.id} (${ctx.channel_type}) errorId=${errorId}: ${String(e?.message || e).slice(0, 300)}`);
+    res.status(502).type('text/plain; charset=utf-8')
+      .send(`添付を取得できませんでした (時間をおいて再度お試しください)。解決しない場合は管理者にエラーID ${errorId} をお伝えください`);
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ⚙️ 運用管理画面 (設計書§7.1 #6 同期・エラー管理 + #4 送信結果不明の解決)
 // ═══════════════════════════════════════════════════════════════
 
@@ -1635,8 +1845,20 @@ button:disabled { opacity: .5; cursor: default; }
   list-style: none; padding: 4px 0; }
 .msg-body details.more > summary::-webkit-details-marker { display: none; }
 .msg-body details.more[open] > summary { color: #64748b; }
-.msg-atts { margin-top: 8px; }
-.att { display: inline-block; background: #f1f5f9; border-radius: 8px; padding: 3px 8px; font-size: 12px; margin-right: 6px; }
+.msg-atts { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: flex-start; }
+.att { display: inline-block; background: #f1f5f9; border-radius: 8px; padding: 3px 8px; font-size: 12px; }
+.att a { color: #1d4ed8; }
+/* 添付画像: その場でサムネイル表示 (クリックで原寸を別タブ)。取得失敗時は文言に差し替え */
+figure.att-img { margin: 0; max-width: 240px; }
+figure.att-img img { max-width: 240px; max-height: 240px; border-radius: 8px; border: 1px solid #e2e8f0; display: block; background: #f8fafc; }
+figure.att-img figcaption { font-size: 12px; color: #475569; margin-top: 4px; overflow-wrap: anywhere; }
+figure.att-img figcaption a { color: #1d4ed8; }
+figure.att-img .att-fail { display: none; color: #b91c1c; }
+figure.att-img.att-err img { display: none; }
+figure.att-img.att-err .att-fail { display: block; }
+.att-dl { margin-left: 6px; white-space: nowrap; }
+/* 一覧のフォルダ表示 */
+.folder-chip { background: #eef2ff; color: #3730a3; border-radius: 6px; padding: 1px 6px; }
 .panel { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 12px; }
 .panel h3 { margin: 0 0 10px; font-size: 14px; }
 .panel dl { margin: 0; display: grid; grid-template-columns: 90px 1fr; gap: 6px 8px; }
@@ -1774,6 +1996,9 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* 詳細画面 */
   .detail-head h2 { font-size: 16px; }
   .msg { padding: 10px 12px; }
+  /* 添付画像はスマホでは2枚並び (指で押せる大きさを保つ) */
+  figure.att-img { max-width: calc(50% - 8px); }
+  figure.att-img img { max-width: 100%; max-height: 200px; }
   .panel dl { grid-template-columns: 78px 1fr; }
   .panel textarea, .panel input[type=text] { font-size: 16px; }
   .grp-body { padding: 4px 6px 8px 10px; }        /* テンプレ階層の左インデントを詰める */
@@ -1788,7 +2013,7 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
 
 /**
  * ページ共通シェル (Gmail風の左サイドバー)。
- * active: 'inbox'|'sent'|'done'|'all'|'templates'|'qa'|'mailrules'|'admin'
+ * active: 'inbox'|'sent'|'done'|'all'|'folder:<id>'|'folders'|'templates'|'qa'|'mailrules'|'admin'
  * PCではサイドバー常時表示、スマホでは ☰ で開くドロワー
  */
 function pageShell(title, active, body, script) {
@@ -1801,6 +2026,13 @@ function pageShell(title, active, body, script) {
       <span class="nav-icon">${icon}</span><span class="nav-label">${label}</span>
       ${count ? `<span class="nav-count">${count}</span>` : ''}
     </a>`;
+  // 任意フォルダ (スタッフが作る分類箱)。件数は「そのフォルダの未対応 (新着・対応中・保留)」を出す
+  // = 受信トレイと同じ「自分のタスク」基準。失敗しても画面は出す (fail-soft)
+  let folderNav = [];
+  try { folderNav = listFolders({ withCounts: true }); } catch { /* 初期化前などは出さない */ }
+  const folderItems = folderNav.map(f =>
+    navItem(`/apps/inquiry-hub?view=all&folder=${f.id}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
+
   const sidebar = `
   <aside class="side-nav" id="sideNav">
     <div class="nav-group">
@@ -1808,6 +2040,11 @@ function pageShell(title, active, body, script) {
       ${navItem('/apps/inquiry-hub?view=sent', '📤', '送信済み', 'sent', counts.sent)}
       ${navItem('/apps/inquiry-hub?view=done', '✅', '対応済み', 'done', 0)}
       ${navItem('/apps/inquiry-hub?view=all', '🗂️', 'すべて', 'all', 0)}
+    </div>
+    <div class="nav-sep"></div>
+    <div class="nav-group">
+      ${folderItems}
+      ${navItem('/apps/inquiry-hub/folders', '⚙️', 'フォルダを作る・編集', 'folders', 0)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">
