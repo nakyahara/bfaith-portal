@@ -23,6 +23,8 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_BYTES = 16 * 1024 * 1024;
 /** 外部APIへの同時取得数 (Gmail/RMS/Yahoo!のレート制限とRenderのメモリを守る) */
 const MAX_CONCURRENT_FETCH = 2;
+/** 順番待ちの上限 (これを超える同時要求は待たせずに混雑として返す) */
+const MAX_WAITING_FETCH = 20;
 /**
  * ピークメモリの見積り (Codexレビュー2巡目 High-2):
  *   キャッシュ16MB + 同時取得2×10MB + Gmailのbase64中間データ ≒ 60〜70MB。
@@ -65,9 +67,16 @@ function cachePut(id, value) {
   cacheBytes += bytes;
 }
 
-/** 同時取得数の制限 (超過分は順番待ち)。取得を始める前にキャッシュを削ってピークを抑える */
+/** 同時取得数の制限 (超過分は順番待ち)。取得を始める前にキャッシュを削ってピークを抑える。
+ * 待ち行列にも上限を設ける — 大量の添付を一度に開かれたときは待たせ続けるより
+ * 「後で開き直してください」と返したほうが、他の画面まで巻き込まない */
 async function withSlot(fn) {
-  if (running >= MAX_CONCURRENT_FETCH) await new Promise(resolve => waiters.push(resolve));
+  if (running >= MAX_CONCURRENT_FETCH) {
+    if (waiters.length >= MAX_WAITING_FETCH) {
+      throw Object.assign(new Error('添付の取得が混み合っています (時間をおいて開き直してください)'), { busy: true });
+    }
+    await new Promise(resolve => waiters.push(resolve));
+  }
   running++;
   trimCacheTo(CACHE_SOFT_BYTES);
   try { return await fn(); }

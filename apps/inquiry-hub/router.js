@@ -1530,14 +1530,20 @@ router.get('/attachments/:id(\\d+)', async (req, res) => {
     res.setHeader('Content-Length', String(buffer.length));
     res.setHeader('Content-Disposition', contentDispositionValue(fileName, inline));
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    // 添付は問い合わせ内容そのもの → 共有キャッシュには置かせない (ブラウザ内のみ短時間)
-    res.setHeader('Cache-Control', 'private, max-age=300');
+    // 添付は顧客から預かった中身そのもの → ディスクに残さない
+    // (共有PCでログアウト後にブラウザキャッシュから開ける状態を作らない)
+    res.setHeader('Cache-Control', 'private, no-store');
     // 他サイトからの埋め込み・PDFビューア経由の外部読み込みを塞ぐ
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; object-src 'none'; sandbox");
     res.status(200).end(buffer);
   } catch (e) {
-    // 画面には固定文言のみ (上流のURL・内部ホスト名・設定状況を利用者に出さない。
+    // 混雑 (同時取得の待ち行列超過) は一時的なので 503 + Retry-After で返す
+    if (e?.busy) {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).type('text/plain; charset=utf-8').send(String(e.message));
+    }
+    // それ以外は画面には固定文言のみ (上流のURL・内部ホスト名・設定状況を利用者に出さない。
     // 原因はサーバーログとエラーIDで追う。Codexレビュー Medium-5)
     const errorId = crypto.randomUUID().slice(0, 8);
     console.warn(`[inquiry-hub] 添付取得失敗 id=${ctx.id} (${ctx.channel_type}) errorId=${errorId}: ${String(e?.message || e).slice(0, 300)}`);
