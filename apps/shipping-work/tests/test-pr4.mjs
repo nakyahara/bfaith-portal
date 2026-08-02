@@ -126,6 +126,25 @@ reset();
     'ピッキング完了の mistakes は無視される (recordMistakes=false)');
 }
 
+console.log('# 3b. Codexレビュー指摘の回帰');
+reset();
+{
+  // 同じミス分類の重複は拒否 (「分類×件数」の形を保証)
+  const id = mk({ workDate: today, shippingNo: 's01', slipCount: 5 });
+  pick(id);
+  const rp = svc.startProcess('packing', id, W2, uuid());
+  expectErr(() => svc.completeProcess('packing', rp.session_id, W2, uuid(),
+    { mistakes: [{ kind: 'toriwasure', count: 1 }, { kind: 'toriwasure', count: 2 }] }),
+    400, '⭐同じミス分類の重複は 400');
+  svc.completeProcess('packing', rp.session_id, W2, uuid());
+  // 管理者救済で非アソートを sorted にしても、梱包候補に出ない (開始できないものは見せない)
+  const id2 = mk({ workDate: today, shippingNo: 's02', slipCount: 5 });
+  pick(id2);
+  svc.adminFixStatus(id2, 'sorted', ADMIN, 'テスト: 誤って sorted へ', uuid(), { force: true });
+  ok(!svc.listStartableBatches('packing', today).some((b) => b.id === id2),
+    '⭐非アソートの sorted は梱包候補に出ない (resolveFrom と一覧SQLの一致)');
+}
+
 console.log('# 4. 開始候補の一覧 (工程ごと)');
 reset();
 {

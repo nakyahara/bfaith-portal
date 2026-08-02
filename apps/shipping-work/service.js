@@ -59,7 +59,8 @@ const PROCESS_FLOW = {
   packing: {
     label: '梱包',
     resolveFrom: (batch) => (batch.bunrui === 'assort' ? 'sorted' : 'picked'),
-    startableWhere: "((b.status = 'picked' AND b.bunrui != 'assort') OR b.status = 'sorted')",
+    // resolveFrom と完全に一致させる (sorted はアソートのみ。ずれると一覧に出るのに開始できない)
+    startableWhere: "((b.status = 'picked' AND b.bunrui != 'assort') OR (b.status = 'sorted' AND b.bunrui = 'assort'))",
     active: 'packing',
     to: 'done',
     pauseReasonKind: 'pause_reason_pack',
@@ -302,10 +303,14 @@ export function startProcess(process, batchId, worker, opId) {
 function normalizeMistakes(flow, raw) {
   if (!flow.recordMistakes || raw == null) return [];
   if (!Array.isArray(raw) || raw.length > 10) throw new SwError(400, 'ミス記録の形式が不正です');
+  const seen = new Set();
   return raw.map((m) => {
     const kind = String(m?.kind || '');
     const count = Number(m?.count);
     if (!isValidMaster('mistake_kind', kind)) throw new SwError(400, 'ミスの分類が不正です');
+    // 「分類×件数」が正なので同じ分類は1行だけ (重複を許すと集計が分類単位でなくなる)
+    if (seen.has(kind)) throw new SwError(400, '同じミス分類が重複しています');
+    seen.add(kind);
     if (!Number.isInteger(count) || count <= 0 || count > 999) {
       throw new SwError(400, 'ミスの件数は1以上の整数で入力してください');
     }

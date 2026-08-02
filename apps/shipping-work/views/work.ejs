@@ -378,7 +378,7 @@
 
     async function startBatch(batchId) {
       if (busy) return;
-      if (!confirm('このバッチのピッキングを開始しますか？\n(開始すると計測が始まります)')) return;
+      if (!confirm('このバッチの<%= conf.label %>を開始しますか？\n(開始すると計測が始まります)')) return;
       busy = true;
       try {
         await callApi('start', { batch_id: batchId, op_id: opId() });
@@ -420,24 +420,37 @@
       if (!modal) return complete(withNext);
       modal.classList.add('show');
     }
+    // 不正値 (負数・小数・数字以外) は黙って「ミスなし」に変換せず、完了を止める。
+    // ミス記録は完了後に訂正できないため、入力ミスの取りこぼしは回復が難しい
     function collectMistakes() {
       const list = [];
+      let error = null;
       document.querySelectorAll('#mistakeInputs input[data-kind]').forEach((el) => {
-        const n = Number(el.value);
-        if (Number.isInteger(n) && n > 0) list.push({ kind: el.dataset.kind, count: n });
+        const raw = el.value.trim();
+        if (raw === '' || raw === '0') return;   // 空欄・0 = その分類はミスなし
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 0 || n > 999) { error = el; return; }
+        if (n > 0) list.push({ kind: el.dataset.kind, count: n });
       });
-      return list;
+      if (error) return { error };
+      return { list };
     }
     function submitComplete() {
-      const mistakes = collectMistakes();
+      const r = collectMistakes();
+      if (r.error) {
+        alert('ミスの件数は0〜999の整数で入力してください');
+        r.error.focus();
+        return;
+      }
       closeModal('mistakeModal');
-      complete(mistakeWithNext, mistakes);
+      complete(mistakeWithNext, r.list);
     }
     // 件数を入れたらボタンの文言を変える (押し間違い防止)
     document.addEventListener('input', (e) => {
       if (!e.target.matches('#mistakeInputs input')) return;
       const btn = document.querySelector('#mistakeModal .primary');
-      if (btn) btn.textContent = collectMistakes().length > 0 ? 'ミスを記録して完了' : 'ミスなしで完了';
+      const r = collectMistakes();
+      if (btn) btn.textContent = (r.list && r.list.length > 0) ? 'ミスを記録して完了' : 'ミスなしで完了';
     });
 
     // ─── モーダル ───
@@ -479,7 +492,7 @@
       if (!sel.correct) return alert('理由を選んでください');
       const note = document.getElementById('correctNote').value;
       if (sel.correct.label === 'その他' && !note.trim()) return alert('「その他」は内容の記入が必須です');
-      if (!confirm('この作業を「ピッキング中」に戻します。よろしいですか？\n(今までの作業時間は消えません)')) return;
+      if (!confirm('この作業を「<%= conf.label %>中」に戻します。よろしいですか？\n(今までの作業時間は消えません)')) return;
       postForSession('correct', { reason: sel.correct.code, note });
     }
 
