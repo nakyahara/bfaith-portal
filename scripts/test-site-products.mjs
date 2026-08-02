@@ -33,7 +33,7 @@ const insProduct = db.prepare(
 );
 insProduct.run(1, 'TEST1', 'テスト商品1', '通常', '取扱', 1980, 'ok', 10, 3, 5, now);
 insProduct.run(2, 'TEST2', 'テスト商品2 (モール紐付けなし)', '通常', '取扱', 980, 'ok', 0, 0, 5, now);
-insProduct.run(3, 'TEST3', 'テスト商品3 (snapshotなし=フォールバックURL)', '通常', '取扱', 500, 'ok', 5, 0, 5, now);
+insProduct.run(3, 'TEST3', 'テスト商品3 (楽天フォールバックURL+price_snapshot経由ASIN)', '通常', '取扱', 500, 'ok', 5, 0, 5, now);
 insProduct.run(4, 'TEST4', null, '通常', '取扱', null, 'ok', 2, 5, 5, now); // 境界: name/price null・引当>在庫
 
 const insRkMap = db.prepare(
@@ -67,6 +67,16 @@ db.prepare(
    (date_jst, aupay_sku_key, ne_code, resolution_method, shipping_quality, cost_status, source_run_id, source_row_hash, synced_at)
    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 ).run('2026-07-30', 'aupay-test1', 'TEST1', 'master_match', 'actual', 'complete', 'r1', 'h5', now);
+
+// TEST3: financeに実績が無く、seller_skuの大小が揺れているケース (LOWER(TRIM())突合+price_snapshotフォールバック)
+db.prepare(
+  `INSERT INTO mirror_sku_resolved (seller_sku, ne_code, quantity, source, synced_at) VALUES (?, ?, ?, ?, ?)`
+).run('PR_TEST3_UPPER', 'test3', 1, 'master', now);
+db.prepare(
+  `INSERT INTO mirror_amazon_price_snapshot_daily
+   (date_jst, seller_sku, asin, source_run_id, source_row_hash, synced_at)
+   VALUES (?, ?, ?, ?, ?, ?)`
+).run('2026-07-30', 'pr_test3_upper', 'B0PRICESNAP', 'r1', 'h6', now);
 
 // ---------- server ----------
 const { default: router } = await import('../apps/site-products/router.js');
@@ -120,6 +130,16 @@ const p2 = body.products.find((p) => p.code === 'TEST2');
 const p3 = body.products.find((p) => p.code === 'TEST3');
 const p4 = body.products.find((p) => p.code === 'TEST4');
 ok('TEST1が返る', !!p1);
+ok(
+  'Amazon: price_snapshot経由+SKU大小ゆれでも解決',
+  p3?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0PRICESNAP',
+  p3?.malls?.amazon?.url
+);
+ok(
+  '診断: resolved件数とASIN解決元を返す',
+  body.resolved?.amazon === 2 && body.resolved?.asinSources?.amazonAsinPrice === 1,
+  JSON.stringify(body.resolved)
+);
 ok('name/price', p1?.name === 'テスト商品1' && p1?.price === 1980);
 ok('stockFree=在庫-引当=7', p1?.stockFree === 7, `got ${p1?.stockFree}`);
 ok('TEST2 stockFree=0', p2?.stockFree === 0, `got ${p2?.stockFree}`);
