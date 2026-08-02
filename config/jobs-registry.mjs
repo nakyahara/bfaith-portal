@@ -11,7 +11,8 @@
  *                      成功が来なければ「締切超過」(予定時刻基準 = 成功が遅れても締切がドリフトしない)
  *                      ⭐partial_max_days を持つジョブは「1回で終わらない長時間バッチ」。
  *                        毎日の締切は status=partial (動いたが未完走) でも満たせる代わりに、
- *                        未完走が partial_max_days 回続いたら「停滞 (stalled)」として要対応に出す。
+ *                        未完走が partial_max_days 回までは許容し、それを超えたら
+ *                        「停滞 (stalled)」として要対応に出す (max = 許容する最大回数)。
  *                        これが無いと、実行時間の上限で毎回中断されるバッチは
  *                        「毎朝鳴りっぱなし」か「永遠に完走しなくても緑」の二択になる
  *   human_obligation — 人がやる期限つき作業 (OAuth再認可・APIキーローテ等)。完了時に ping。
@@ -186,7 +187,7 @@ export const JOBS_REGISTRY = [
     anchor_minute_jst: 0,
     grace_hours: 22, // 14:00開始 + 自主中断19h = 翌09:00終了。翌12:00までに実行報告が無ければ締切超過
     // Keepaのトークン補充律速で数日〜数週間かかることがある (14,534 ASIN を 7,200/日)。
-    // 未完走が7回続いたら「進んでいないのでは」と疑う
+    // 未完走7回までは許容し、8回目で「進んでいないのでは」と疑う
     partial_max_days: 7,
     lifecycle: 'permanent',
     runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
