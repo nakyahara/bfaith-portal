@@ -543,7 +543,13 @@ export function getWorkerState(process, worker) {
     "SELECT * FROM sw_sessions WHERE worker = ? AND process = ? AND outcome = 'open' AND paused = 0"
   ).get(worker, process);
   if (!s) {
-    return { session: null, batch: null, pauseSec: 0, paused, ready: listStartableBatches(process, today), stats };
+    const ready = listStartableBatches(process, today);
+    // 「開始できるバッチが無い」には2種類ある — 全部やり終えた (お疲れさま) と、
+    // そもそも1件も登録されていない (バッチ作成待ち)。画面の文言を出し分けるため区別する
+    const noBatchesAtAll = ready.length === 0 && !db.prepare(
+      "SELECT 1 FROM sw_batches WHERE work_date <= ? AND status != 'cancelled' LIMIT 1"
+    ).get(today);
+    return { session: null, batch: null, pauseSec: 0, paused, ready, stats, noBatchesAtAll };
   }
   return {
     session: s,
@@ -552,5 +558,6 @@ export function getWorkerState(process, worker) {
     paused,
     ready: [],
     stats,
+    noBatchesAtAll: false,
   };
 }

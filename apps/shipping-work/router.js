@@ -87,6 +87,7 @@ router.get('/picking', (req, res) => {
     title: 'ピッキング | 出荷作業管理',
     username: req.session.email,
     displayName: req.session.displayName,
+    isAdmin: req.session.role === 'admin',
     state,
     today: jstToday(),
     pauseReasons: listMasters('pause_reason_pick'),
