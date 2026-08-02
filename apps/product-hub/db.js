@@ -73,6 +73,51 @@ export function isNeCodeUniqueEnforced() {
   return neCodeUniqueEnforced;
 }
 
+/**
+ * draft_shop_categories に枠番 (slot) を導入する冪等マイグレーション (2026-08-02)。
+ * RMS の「表示先カテゴリ」は 1〜5 の 5 枠 — 既存行はマスタの並び順で採番し、
+ * 旧上限 (30) 時代に 6 件以上選んでいた draft は先頭 5 件だけ残す
+ * (残すと保存 API と RMS 同期が全部 400 で詰む。Codex R1 high)。
+ * 黙って消さず、何を外したかを draft_events に記録する。
+ */
+export function migrateShopCategorySlots(db) {
+  const cols = new Set(db.prepare('PRAGMA table_info(draft_shop_categories)').all().map((c) => c.name));
+  if (cols.has('slot')) return false;
+  // 列追加〜採番〜切り詰めを単一トランザクションで (Codex R2 high)。
+  // 別々に走らせると、列追加直後のクラッシュで「slot 列はあるが全行 slot=1・6件超も残存」の
+  // 中途半端な状態になり、再実行判定 (列の有無) が二度と移行を走らせない。
+  // SQLite は DDL もトランザクショナルなので、失敗すれば列追加ごとロールバックされる
+  db.transaction(() => {
+    db.exec('ALTER TABLE draft_shop_categories ADD COLUMN slot INTEGER NOT NULL DEFAULT 1');
+    // 既存の選択はマスタの並び順を枠順とみなす (それ以外に順序の手がかりが無い)
+    db.exec(`
+      UPDATE draft_shop_categories AS d SET slot = (
+        SELECT COUNT(*) FROM draft_shop_categories x
+        JOIN ph_shop_categories cx ON cx.id = x.shop_category_id
+        JOIN ph_shop_categories cd ON cd.id = d.shop_category_id
+        WHERE x.draft_id = d.draft_id
+          AND (cx.sort_order < cd.sort_order OR (cx.sort_order = cd.sort_order AND cx.id <= cd.id))
+      )
+    `);
+    const overDrafts = db.prepare(
+      'SELECT draft_id, COUNT(*) AS c FROM draft_shop_categories GROUP BY draft_id HAVING c > 5'
+    ).all();
+    for (const o of overDrafts) {
+      const dropped = db.prepare(`
+        SELECT c.path FROM draft_shop_categories s
+        JOIN ph_shop_categories c ON c.id = s.shop_category_id
+        WHERE s.draft_id = ? AND s.slot > 5 ORDER BY s.slot
+      `).all(o.draft_id).map((r) => r.path);
+      db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ? AND slot > 5').run(o.draft_id);
+      db.prepare(`
+        INSERT INTO draft_events (draft_id, event, detail, actor)
+        VALUES (?, 'shop_categories_trimmed_to_5', ?, 'migration')
+      `).run(o.draft_id, `RMSの5枠制限に合わせ ${dropped.length} 件を外しました: ${dropped.join(' ／ ').slice(0, 400)}`);
+    }
+  })();
+  return true;
+}
+
 export function initProductHubDB() {
   if (initialized) return getMirrorDB();
   const db = getMirrorDB();
@@ -261,6 +306,9 @@ export function initProductHubDB() {
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
+      -- RMS の「表示先カテゴリ 1〜5」に対応する枠番 (2026-08-02)。
+      -- 順序に意味がある: 枠1 = item-mappings の mainPluralCategoryId (メインページ)
+      slot             INTEGER NOT NULL DEFAULT 1,
       created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (draft_id, shop_category_id)
     );
@@ -356,6 +404,9 @@ export function initProductHubDB() {
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
+
+  // 店舗内カテゴリの枠番 (2026-08-02、RMS「表示先カテゴリ 1〜5」対応)
+  migrateShopCategorySlots(db);
 
   // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER
   const rkCols = new Set(db.prepare('PRAGMA table_info(draft_rakuten)').all().map((c) => c.name));
@@ -516,7 +567,15 @@ export function gateReasons(db, draft) {
   const reasons = [];
   if (!draft.name || !String(draft.name).trim()) reasons.push('商品名が未入力です');
   if (!draft.ne_code || !String(draft.ne_code).trim()) reasons.push('NE商品コードが未入力です');
-  if (!draft.official_url || !String(draft.official_url).trim()) reasons.push('公式ページURLが未入力です');
+  // AI が説明文を書くための「材料」が1つでもあれば通す (中原さん 2026-08-02)。
+  // 公式ページが無い商品でも、参考URL や Amazon の販売ページがあれば書ける
+  const has = (v) => !!(v && String(v).trim());
+  if (!has(draft.official_url) && !has(draft.amazon_url)) {
+    const refCount = db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(draft.id).c;
+    if (refCount === 0) {
+      reasons.push('AIが参照できるURLがありません (公式ページURL / 参考URL / Amazon URL のどれか1つ)');
+    }
+  }
   const imgCount = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(draft.id).c;
   if (imgCount === 0) reasons.push('商品画像 (Driveリンク) が1枚もありません');
   return reasons;
@@ -571,12 +630,14 @@ export function upsertImageProduction(db, draftId, fields) {
 
 /**
  * 生成待ち (ready_for_ai) の一覧を、AI 生成に必要な材料つきで返す (P2 スキル接続用)。
- * 返す形: [{ id, ne_code, name, official_url, price, jan_code, drive_folder_url,
+ * 返す形: [{ id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url,
  *            reference_urls: [], specs: [{key,value}], yahoo: {...}|null, image_count }]
  */
 export function listGenerationQueue(db, { limit = 50 } = {}) {
+  // amazon_url / asin も返す: ゲートは「公式URL / 参考URL / Amazon URL のどれか」なので
+  // Amazon URL だけで通過した draft の参照元がキューから欠けないように (Codex R1 high)
   const drafts = db.prepare(`
-    SELECT id, ne_code, name, official_url, price, jan_code, drive_folder_url, own_brand
+    SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
     FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
   `).all(limit);
   const refStmt = db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id');

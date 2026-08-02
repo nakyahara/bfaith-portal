@@ -164,6 +164,17 @@ check('draft inserted', draft && draft.status === 'draft' && draft.notion_card_s
 let reasons = dbmod.gateReasons(db, draft);
 check('gate blocks (no url/image)', reasons.length === 2, JSON.stringify(reasons));
 
+// AI の参照元は「公式URL / 参考URL / Amazon URL のどれか1つ」でよい (2026-08-02 中原さん)
+db.prepare(`UPDATE product_drafts SET amazon_url = 'https://www.amazon.co.jp/dp/B0TEST' WHERE id = ?`).run(draft.id);
+reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
+check('gate: 公式URLが無くても Amazon URL があれば参照元は満たす',
+  !reasons.some((r) => r.includes('URL')), JSON.stringify(reasons));
+db.prepare(`UPDATE product_drafts SET amazon_url = NULL WHERE id = ?`).run(draft.id);
+db.prepare(`INSERT INTO draft_reference_urls (draft_id, url) VALUES (?, 'https://example.com/ref')`).run(draft.id);
+reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
+check('gate: 参考URLだけでも参照元は満たす', !reasons.some((r) => r.includes('URL')), JSON.stringify(reasons));
+db.prepare(`DELETE FROM draft_reference_urls WHERE draft_id = ?`).run(draft.id);
+
 db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item' WHERE id = ?`).run(draft.id);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'fileid_1234567890')`).run(draft.id);
 reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
@@ -1529,6 +1540,61 @@ check('店舗内カテゴリ: 無効な棚への新規紐付けは弾く', count
 check('店舗内カテゴリ: 無効でも既に選択中なら維持できる',
   countSelectableShopCategories(db, fdraft.id, [scInactiveSel]) === 1);
 check('店舗内カテゴリ: 空配列は 0', countSelectableShopCategories(db, fdraft.id, []) === 0);
+
+// 枠 (slot) の保存と順序 (2026-08-02: RMSの「表示先カテゴリ1〜5」対応)
+const { setDraftShopCategories: setCats, selectedShopCategoriesInOrder, MAX_DRAFT_SHOP_CATEGORIES: MAXC }
+  = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: 上限はRMSと同じ5枠', MAXC === 5);
+setCats(db, fdraft.id, [scInactiveSel, scActive]);   // わざと sort_order と逆順で保存
+const inOrder = selectedShopCategoriesInOrder(db, fdraft.id);
+check('店舗内カテゴリ: 配列順がそのまま枠番になる (マスタの並び順に引きずられない)',
+  inOrder.length === 2 && inOrder[0].id === scInactiveSel && inOrder[0].slot === 1
+  && inOrder[1].id === scActive && inOrder[1].slot === 2, JSON.stringify(inOrder));
+const { sanitizeShopCategoryIds: sanitize6 } = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: 6件は sanitize で too_many (5枠上限)',
+  sanitize6([1, 2, 3, 4, 5, 6]).error === 'too_many');
+setCats(db, fdraft.id, []);
+
+// 旧上限 (30) 時代のDBからの移行: slot 列を落として6件選択の旧形を作り、再init で
+// ①slot 採番 ②6件目以降の切り詰め+イベント記録 が走ることを確認 (Codex R1 high)
+db.exec('ALTER TABLE draft_shop_categories DROP COLUMN slot');
+for (let i = 1; i <= 6; i++) {
+  db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+    VALUES (?, ?, ?, 1, ?)`).run(String(8000 + i), `移行棚${i}`, `移行棚${i}`, 200 + i);
+}
+const migIds = db.prepare(`SELECT id FROM ph_shop_categories WHERE path LIKE '移行棚%' ORDER BY sort_order`).all();
+for (const r of migIds) {
+  db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, r.id);
+}
+// 途中失敗はロールバックされ、再実行で回復できる (Codex R2 high: 非アトミックだと
+// 「slot列はあるが未採番」の中途半端な状態が残り、二度と移行が走らない)
+db.exec('ALTER TABLE draft_events RENAME TO draft_events_bk');   // trim のINSERTを故意に失敗させる
+let migThrew = false;
+try { dbmod.migrateShopCategorySlots(db); } catch (e) { migThrew = true; }
+check('slot移行: 途中失敗でロールバック (slot列ごと消え、再実行可能な状態に戻る)',
+  migThrew === true
+  && !db.prepare('PRAGMA table_info(draft_shop_categories)').all().some((c) => c.name === 'slot'));
+db.exec('ALTER TABLE draft_events_bk RENAME TO draft_events');
+
+check('slot移行: 旧形DBで migrate が走る', dbmod.migrateShopCategorySlots(db) === true);
+check('slot移行: 2回目は no-op (冪等)', dbmod.migrateShopCategorySlots(db) === false);
+const migRows = selectedShopCategoriesInOrder(db, fdraft.id);
+check('slot移行: 6件が5件に切り詰められ slot 1..5 で採番される',
+  migRows.length === 5 && migRows.every((r, i) => r.slot === i + 1)
+  && migRows[0].path === '移行棚1' && migRows[4].path === '移行棚5', JSON.stringify(migRows));
+check('slot移行: 外した棚は draft_events に記録される (黙って消さない)',
+  (db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_trimmed_to_5'`)
+    .get(fdraft.id)?.detail || '').includes('移行棚6'));
+setCats(db, fdraft.id, []);
+
+// Amazon URL だけでゲート通過した draft の参照元が generation queue から欠けない (Codex R1 high)
+db.prepare(`UPDATE product_drafts SET official_url = NULL, amazon_url = 'https://www.amazon.co.jp/dp/B0GENQ', asin = 'B0GENQ',
+  status = 'ready_for_ai' WHERE id = ?`).run(fdraft.id);
+const q = dbmod.listGenerationQueue(db).find((d) => d.id === fdraft.id);
+check('generation queue: amazon_url / asin が材料に含まれる',
+  q && q.amazon_url === 'https://www.amazon.co.jp/dp/B0GENQ' && q.asin === 'B0GENQ' && q.official_url == null,
+  JSON.stringify(q));
+db.prepare(`UPDATE product_drafts SET status = 'draft', amazon_url = NULL, asin = NULL WHERE id = ?`).run(fdraft.id);
 
 // Category API 2.0 のツリー展開 (2026-08-02 実測形。miniPC /shop-categories/tree の trees)
 const { flattenCategoryTrees } = await import('../lib/shop-categories.js');
