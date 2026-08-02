@@ -81,6 +81,72 @@ check('大文字小文字は同一視', asn.slots.length === 1, JSON.stringify(a
 asn = assignImageSlots([fim('code_0.jpg'), fim('code_20.jpg')], 'code');
 check('_0 は白抜き / _20 は最終スロット', asn.whiteBg?.id === 'id-code_0.jpg' && asn.slots[0]?.slot === 20, JSON.stringify(asn));
 
+// ─── shop-categories: AI 初期候補の採点 (2026-08-02) ───
+const { suggestShopCategories, SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE, canAutoApplyShopCategory } =
+  await import('../lib/shop-categories.js');
+const CATS = [
+  { id: 1, path: '生活雑貨・日用品 > 洗濯用品', is_active: 1 },
+  { id: 2, path: '生活雑貨・日用品 > キッチン用品', is_active: 1 },
+  { id: 3, path: 'コスメ・美容 > アロマオイル', is_active: 1 },
+  { id: 4, path: 'ペット用品', is_active: 1 },
+  { id: 5, path: '旧カテゴリ > 洗濯用品', is_active: 0 },
+];
+let sug = suggestShopCategories(CATS, { name: '洗濯ネット 3枚セット', genrePath: '日用品雑貨・文房具・手芸 > 洗濯用品 > 洗濯ネット' });
+check('店舗内カテゴリ提案: 末端一致が1位 + 自動適用しきい値以上',
+  sug[0]?.id === 1 && sug[0].score >= SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE, JSON.stringify(sug));
+check('店舗内カテゴリ提案: is_active=0 は候補に出ない', !sug.some((s) => s.id === 5), JSON.stringify(sug));
+check('店舗内カテゴリ提案: スコア0 (無関係) は返さない', !sug.some((s) => s.id === 4), JSON.stringify(sug));
+sug = suggestShopCategories(CATS, { name: 'アロマオイル ラベンダー 10ml', genrePath: '' });
+check('店舗内カテゴリ提案: 商品名だけでも末端一致', sug[0]?.id === 3, JSON.stringify(sug));
+check('店舗内カテゴリ提案: 材料が空なら空配列', suggestShopCategories(CATS, { name: '', genrePath: '' }).length === 0);
+sug = suggestShopCategories(CATS, { name: '洗濯ネット' }, { max: 1 });
+check('店舗内カテゴリ提案: max 件数制限', sug.length === 1, JSON.stringify(sug));
+check('店舗内カテゴリ提案: 外れたカテゴリでも選択中なら採点対象',
+  suggestShopCategories([{ id: 5, path: '旧カテゴリ > 洗濯用品', is_active: 0, selected: 1 }], { name: '洗濯ネット' }).length === 1);
+
+// 自動適用の可否 (Codex R1 high: スコア合計だけだと「親だけ一致」で無関係な末端が自動保存される)
+const SIBLINGS = [
+  { id: 11, path: '生活雑貨・日用品 > 洗濯用品 > 物干し', is_active: 1 },
+  { id: 12, path: '生活雑貨・日用品 > 洗濯用品 > アイロン', is_active: 1 },
+];
+const parentOnly = suggestShopCategories(SIBLINGS,
+  { name: 'なにか', genrePath: '日用品雑貨・文房具・手芸 > 生活雑貨・日用品 > 洗濯用品' });
+check('自動適用しない: 親セグメントだけ一致 (スコア4に達しても末端が言い当てられていない)',
+  parentOnly[0].score >= SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE && canAutoApplyShopCategory(parentOnly) === false,
+  JSON.stringify(parentOnly));
+check('自動適用しない: 同点1位が複数 (どの棚か決められない)',
+  canAutoApplyShopCategory([
+    { id: 1, path: 'A > 洗濯用品', score: 6, leafExact: true },
+    { id: 2, path: 'B > 洗濯用品', score: 6, leafExact: true },
+  ]) === false);
+check('自動適用する: 末端完全一致で単独1位',
+  canAutoApplyShopCategory([
+    { id: 1, path: '生活雑貨・日用品 > 洗濯用品', score: 6, leafExact: true },
+    { id: 2, path: '生活雑貨・日用品 > キッチン用品', score: 2, leafExact: false },
+  ]) === true);
+check('自動適用しない: 候補ゼロ', canAutoApplyShopCategory([]) === false && canAutoApplyShopCategory(null) === false);
+
+// 保存直前の再検証 (Codex R3 high: GET後にジャンルが変わって候補が入れ替わったケース)
+const { isAutoApplyRequestValid } = await import('../lib/shop-categories.js');
+const FRESH = [
+  { id: 7, path: '生活雑貨・日用品 > 洗濯用品', score: 6, leafExact: true },
+  { id: 8, path: 'コスメ・美容 > アロマオイル', score: 2, leafExact: false },
+];
+check('自動適用の再検証: 現在の1位と一致すれば通す', isAutoApplyRequestValid(FRESH, [7]) === true);
+check('自動適用の再検証: 別カテゴリ (古い候補) は弾く', isAutoApplyRequestValid(FRESH, [8]) === false);
+check('自動適用の再検証: 複数IDや空は弾く',
+  isAutoApplyRequestValid(FRESH, [7, 8]) === false && isAutoApplyRequestValid(FRESH, []) === false);
+check('自動適用の再検証: 現在は自動適用不可なら弾く',
+  isAutoApplyRequestValid([{ id: 7, path: 'x', score: 6, leafExact: false }], [7]) === false);
+check('leafExact フラグが立つのは末端完全一致のときだけ',
+  suggestShopCategories(CATS, { name: 'アロマオイル ラベンダー 10ml' })[0].leafExact === true
+  && parentOnly.every((c) => c.leafExact === false), JSON.stringify(parentOnly));
+// 語頭の補助点だけで拾った候補 (「洗濯ネット」→「洗濯用品」) は表示のみで自動適用しない
+const headOnly = suggestShopCategories(CATS, { name: '洗濯ネット 3枚セット' });
+check('自動適用しない: 語頭一致どまり (棚名そのものは言い当てていない)',
+  headOnly[0].id === 1 && headOnly[0].leafExact === false && canAutoApplyShopCategory(headOnly) === false,
+  JSON.stringify(headOnly));
+
 // ─── DB init (2回呼んで冪等) ───
 const { initMirrorDB } = await import('../../warehouse-mirror/db.js');
 initMirrorDB(); // 本番では server.js が起動時に実行する (smoke では明示)
@@ -1442,6 +1508,33 @@ const frk2 = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(fd
 check('白抜きのみの取込は商品画像を触らず、draft_rakuten の他カラムも保持',
   fimgs2.length === 2 && frk2.white_bg_drive_file_id === 'wb2' && frk2.genre_id === '123456',
   JSON.stringify({ fimgs2, frk2 }));
+
+// 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)
+const everSavedQuery = (id) => db.prepare(
+  `SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_saved'`
+).get(id).c > 0;
+check('店舗内カテゴリ: 未保存のドラフトは everSaved=false (AI自動適用の対象)', everSavedQuery(fdraft.id) === false);
+
+// 紐付け可能判定 = 有効 or そのドラフトが既に選択中 (Codex R1 medium)
+const { countSelectableShopCategories, shopCategoriesNeverSaved } = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: shopCategoriesNeverSaved は未保存で true', shopCategoriesNeverSaved(db, fdraft.id) === true);
+db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+  VALUES ('900','有効な棚','有効な棚',1,0), ('901','無効な棚','無効な棚',0,1), ('902','無効だが選択中','無効だが選択中',0,2)`).run();
+const scActive = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = '有効な棚'`).get().id;
+const scInactive = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = '無効な棚'`).get().id;
+const scInactiveSel = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = '無効だが選択中'`).get().id;
+db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, scInactiveSel);
+check('店舗内カテゴリ: 有効な棚は紐付け可', countSelectableShopCategories(db, fdraft.id, [scActive]) === 1);
+check('店舗内カテゴリ: 無効な棚への新規紐付けは弾く', countSelectableShopCategories(db, fdraft.id, [scInactive]) === 0);
+check('店舗内カテゴリ: 無効でも既に選択中なら維持できる',
+  countSelectableShopCategories(db, fdraft.id, [scInactiveSel]) === 1);
+check('店舗内カテゴリ: 空配列は 0', countSelectableShopCategories(db, fdraft.id, []) === 0);
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id);
+dbmod.logEvent(db, fdraft.id, 'shop_categories_saved', '0件', 'smoke'); // 人が全部外した保存
+check('店舗内カテゴリ: 0件保存でも everSaved=true (人が外した意思を尊重し再挿入しない)',
+  everSavedQuery(fdraft.id) === true);
+check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自動適用をtx内で拒否できる)',
+  shopCategoriesNeverSaved(db, fdraft.id) === false);
 
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {

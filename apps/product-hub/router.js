@@ -39,6 +39,8 @@ import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
   sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+  suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
+  shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -702,13 +704,9 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
       return res.status(400).json({ ok: false, error: `店舗内カテゴリは最大 ${MAX_DRAFT_SHOP_CATEGORIES} 件までです` });
     }
     const ids = sanitized.ids;
-    if (ids.length > 0) {
-      const found = db.prepare(
-        `SELECT COUNT(*) AS c FROM ph_shop_categories WHERE id IN (${ids.map(() => '?').join(',')})`
-      ).get(...ids).c;
-      if (found !== ids.length) {
-        return res.status(400).json({ ok: false, error: '存在しない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
-      }
+    // 検証条件は画面の選択肢と同じ = 有効 or このドラフトが既に選択中 (Codex R1 medium)
+    if (countSelectableShopCategories(db, draft.id, ids) !== ids.length) {
+      return res.status(400).json({ ok: false, error: '選べない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
     }
     shopCategoryIds = ids;
   }
@@ -754,7 +752,12 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
-    if (shopCategoryIds !== null) setDraftShopCategories(db, draft.id, shopCategoryIds);
+    if (shopCategoryIds !== null) {
+      setDraftShopCategories(db, draft.id, shopCategoryIds);
+      // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)。
+      // 選択の入れ替えと同一トランザクションに置く (Codex R2: マーカーと実体の整合)
+      logEvent(db, draft.id, 'shop_categories_saved', `${shopCategoryIds.length}件`, actorOf(req));
+    }
   })();
   logEvent(db, draft.id, 'rakuten_fields_saved',
     [genreId, shopCategoryIds !== null ? `店舗内カテゴリ${shopCategoryIds.length}件` : null].filter(Boolean).join(' / ') || null,
@@ -842,6 +845,73 @@ router.get('/api/drafts/:id/rakuten/genre-suggest', async (req, res) => {
     const status = e?.statusCode === 503 ? 503 : 502;
     res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
   }
+});
+
+// 店舗内カテゴリの AI 初期候補 (2026-08-02): ジャンルフルパス+商品名とカテゴリパスの語彙マッチ。
+// 外部 API なし (マスタとキャッシュ済みジャンル辞書だけで即答)。
+// GET (提案) と POST (自動適用の直前検証) の両方から呼ぶ = 同じ材料・同じ計算を保証する
+function computeShopCategoryCandidates(db, draft) {
+  const cats = listShopCategoriesForDraft(db, draft.id);
+  if (cats.length === 0) return null;
+  const genreId = db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(draft.id)?.genre_id;
+  const genrePath = genreId ? (getCachedGenreAttributes(db, genreId)?.genrePath || '') : '';
+  return suggestShopCategories(cats, { name: draft.name, genrePath });
+}
+
+router.get('/api/drafts/:id/rakuten/shop-category-suggest', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const candidates = computeShopCategoryCandidates(db, draft);
+  if (candidates === null) return res.json({ ok: true, candidates: [], reason: 'no_master' });
+  // 自動セットは「まだ一度も店舗内カテゴリが保存されていないドラフト」だけ。
+  // これが無いと、人が意図的に全部外してもページを開き直すたびに AI が入れ直してしまう
+  // (最終判定は POST 側のトランザクション内でもう一度行う)
+  const neverSaved = shopCategoriesNeverSaved(db, draft.id);
+  // 自動適用の可否はサーバーで確定させる (画面側にしきい値ロジックを持たせない)
+  res.json({
+    ok: true, candidates,
+    everSaved: !neverSaved,
+    autoApply: neverSaved && canAutoApplyShopCategory(candidates),
+  });
+});
+
+// 店舗内カテゴリだけの部分保存 (AI自動適用・候補ボタン用。draft_rakuten の他カラムは触らない)
+router.post('/api/drafts/:id/shop-categories', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const sanitized = sanitizeShopCategoryIds(req.body?.ids);
+  if (sanitized.error) {
+    return res.status(400).json({ ok: false, error: `店舗内カテゴリの指定が不正です (${sanitized.error})` });
+  }
+  const db = getDB();
+  const ids = sanitized.ids;
+  // 検証条件は画面の選択肢 (listShopCategoriesForDraft) と同じ = 有効 or 既に選択中 (Codex R1 medium)
+  if (countSelectableShopCategories(db, draft.id, ids) !== ids.length) {
+    return res.status(400).json({ ok: false, error: '選べない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
+  }
+  // AI の自動適用 (人の操作を伴わない書き込み) だけは、トランザクション内で
+  // 「まだ一度も保存されていない」ことを再確認する (Codex R2 high: GET と POST の間に
+  // 人が「全部外して保存」していると、遅れて届いた自動適用がその意思を上書きしてしまう)。
+  // 候補ボタン (ai_candidate) は人の明示操作なのでこの制約の対象外
+  const isAutoApply = req.body?.source === 'ai';
+  let skipped = null;
+  db.transaction(() => {   // 全削除→INSERT の途中失敗で空にしない (Codex R1 low)
+    if (isAutoApply) {
+      if (!shopCategoriesNeverSaved(db, draft.id)) { skipped = 'already_saved'; return; }
+      // 候補取得後にジャンルが変わっていないか (Codex R3 high: 旧ジャンル由来の候補を保存すると
+      // 保存イベントが立ち、新ジャンルでの再提案まで塞いでしまう)
+      if (!isAutoApplyRequestValid(computeShopCategoryCandidates(db, draft) || [], ids)) {
+        skipped = 'stale_suggestion';
+        return;
+      }
+    }
+    setDraftShopCategories(db, draft.id, ids);
+    logEvent(db, draft.id, 'shop_categories_saved',
+      `${ids.length}件${isAutoApply ? ' (AI初期設定)' : ''}`, actorOf(req));
+  })();
+  if (skipped) return res.json({ ok: true, skipped });
+  res.json({ ok: true, count: ids.length });
 });
 
 // ジャンル属性辞書の取得 (Genre API)。取得結果は ph_genre_attributes にキャッシュされ、

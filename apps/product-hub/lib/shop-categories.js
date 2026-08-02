@@ -141,3 +141,109 @@ export function setDraftShopCategories(db, draftId, ids) {
   const ins = db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)');
   for (const id of ids) ins.run(draftId, id);
 }
+
+/**
+ * 店舗内カテゴリの AI 初期候補 (2026-08-02 中原さん要望「AIが最初に設定して人が後で修正」)。
+ *
+ * 外部 API は使わないローカル採点: カテゴリパスの各セグメント語が
+ * 「楽天ジャンルのフルパス + 商品名」にどれだけ含まれるかでスコアリングする
+ * (店舗の棚名は楽天ジャンルに寄せた命名が多いため、ジャンル確定後ほど精度が上がる)。
+ *
+ * 採点: 末端セグメント完全一致 4 / 非末端完全一致 2 /
+ *       セグメント内の語 (「・」等区切り、2文字以上) の部分一致 = 末端2×命中率・非末端1×命中率 /
+ *       語の先頭2文字一致 (「洗濯ネット」⇔「洗濯用品」、「化粧水」⇔「化粧品」の表記ゆれ) =
+ *       末端1・非末端0.5×命中率 の補助点 — 補助点だけでは自動適用しきい値 (4) に届かない
+ *       (後方の「〜用品」「〜セット」だけが共通するカテゴリを拾わないよう、n-gram でなく語頭で見る)
+ *
+ * @param {Array<{id, path, is_active?, selected?}>} categories listShopCategoriesForDraft の行
+ * @param {{name?: string, genrePath?: string}} source 採点の材料
+ * @returns {Array<{id, path, score, leafExact}>} スコア降順 (score > 0 のみ)、最大 max 件
+ */
+export function suggestShopCategories(categories, { name = '', genrePath = '' } = {}, { max = 5 } = {}) {
+  const hay = `${genrePath} ${name}`.toLowerCase();
+  if (hay.trim() === '') return [];
+  const splitWords = (s) => s.split(/[・･、/／\s>＞]+/).filter((w) => w.length >= 2);
+  const hayHeads = new Set(splitWords(hay).map((w) => w.slice(0, 2)));
+  const scored = [];
+  for (const c of categories || []) {
+    if (c.is_active === 0 && !c.selected) continue; // 一覧から外れたカテゴリは提案しない
+    const segs = String(c.path).split(/\s*>\s*/).map((s) => s.trim()).filter(Boolean);
+    let score = 0;
+    let leafExact = false;   // 末端 (実際に商品が載る棚) 自体が言い当てられたか
+    segs.forEach((seg, i) => {
+      const isLeaf = i === segs.length - 1;
+      const s = seg.toLowerCase();
+      if (hay.includes(s)) {
+        score += isLeaf ? 4 : 2;
+        if (isLeaf) leafExact = true;
+        return;
+      }
+      const words = splitWords(s);
+      if (words.length === 0) return;
+      const hit = words.filter((w) => hay.includes(w)).length;
+      if (hit > 0) { score += (isLeaf ? 2 : 1) * (hit / words.length); return; }
+      // 完全一致も語一致もないときだけ、語頭2文字の一致で補助点
+      const headHit = words.filter((w) => hayHeads.has(w.slice(0, 2))).length;
+      if (headHit > 0) score += (isLeaf ? 1 : 0.5) * (headHit / words.length);
+    });
+    if (score > 0) scored.push({ id: c.id, path: c.path, score: Math.round(score * 100) / 100, leafExact });
+  }
+  scored.sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path), 'ja'));
+  return scored.slice(0, max);
+}
+
+/** 自動適用の最低スコア (末端完全一致 = 4 相当) */
+export const SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE = 4;
+
+/**
+ * 人の確認なしに 1 位を保存してよいか (Codex R1 high 対応)。
+ * スコア合計だけで判定すると「親セグメントだけ一致」(例: `日用品 > 洗濯用品 > 無関係A` に対して
+ * ジャンルが `… > 日用品 > 洗濯用品`) で 2+2=4 に達し、同点の兄弟から辞書順で無関係な棚が
+ * 自動保存されてしまう。そのため **末端そのものの完全一致** と **単独1位** を必須にする。
+ */
+export function canAutoApplyShopCategory(candidates) {
+  const top = (candidates || [])[0];
+  if (!top || !top.leafExact || top.score < SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE) return false;
+  // 同スコアの対抗馬がいる = どちらの棚か決められない → 人に選ばせる
+  if (candidates.length > 1 && candidates[1].score >= top.score) return false;
+  return true;
+}
+
+/**
+ * AI 自動適用の書き込みリクエストが「今の候補」と一致しているか (Codex R3 high)。
+ * 候補取得 (GET) の後にジャンルが変わると候補も変わるため、保存の直前にも
+ * 現在の材料で計算し直した候補と突き合わせる。ズレていたら書かない
+ * (書いてしまうと保存イベントが立ち、新しいジャンルでの再提案まで塞いでしまう)。
+ */
+export function isAutoApplyRequestValid(candidates, ids) {
+  if (!canAutoApplyShopCategory(candidates)) return false;
+  return Array.isArray(ids) && ids.length === 1 && ids[0] === candidates[0].id;
+}
+
+/**
+ * そのドラフトで店舗内カテゴリが一度も保存されていないか (0 件保存も「保存済み」)。
+ * AI 自動適用の可否判定。**書き込みトランザクションの中でも再確認する** (Codex R2 high):
+ * GET で autoApply を返した後に人が「全部外して保存」すると、遅れて届いた AI の
+ * 自動適用がその意思を上書きしてしまうため。
+ */
+export function shopCategoriesNeverSaved(db, draftId) {
+  return db.prepare(
+    `SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_saved'`
+  ).get(draftId).c === 0;
+}
+
+/**
+ * ドラフトに紐付けてよいカテゴリ id の件数 (有効なもの + そのドラフトが既に選択中のもの)。
+ * 画面・提案の対象 (listShopCategoriesForDraft) と検証条件を揃える (Codex R1 medium)。
+ */
+export function countSelectableShopCategories(db, draftId, ids) {
+  if (!ids || ids.length === 0) return 0;
+  const ph = ids.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT COUNT(*) AS c FROM ph_shop_categories c
+    WHERE c.id IN (${ph})
+      AND (c.is_active = 1
+           OR EXISTS (SELECT 1 FROM draft_shop_categories s
+                      WHERE s.shop_category_id = c.id AND s.draft_id = ?))
+  `).get(...ids, draftId).c;
+}
