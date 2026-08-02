@@ -18,6 +18,17 @@
     .pk-current .meta { margin-top: 6px; color: #495057; font-size: 1.05em; }
     .pk-current .badge { display: inline-block; background: #e9ecef; border-radius: 6px;
                          padding: 2px 10px; margin: 3px 6px 0 0; }
+    .pk-done { background: #fff; border: 1px solid #d3f9d8; border-left: 5px solid #40c057;
+               border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; }
+    .pk-done .row1 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+    .pk-done .no { font-size: 1.15em; font-weight: bold; }
+    .pk-done .time { color: #868e96; font-size: 0.88em; }
+    .pk-done .acts { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+    .pk-done .mini { display: inline-block; background: #f1f3f5; border: 1px solid #dee2e6;
+                     border-radius: 6px; padding: 7px 14px; font-size: 0.92em; cursor: pointer;
+                     text-decoration: none; color: #212529; }
+    .pk-done .mini.warn { border-color: #f59f00; color: #e67700; }
+    .pk-done .mini-note { color: #adb5bd; font-size: 0.85em; }
     .pk-held { background: #fff9db; border: 2px solid #f59f00; border-radius: 12px;
                padding: 14px 16px; margin-bottom: 10px; }
     .pk-held .no { font-size: 1.4em; font-weight: bold; }
@@ -147,6 +158,36 @@
       <% } %>
     <% } %>
 
+    <%# 完了すると画面から消えて「印刷し忘れた」に気づいても戻れない、を避けるため
+        本日完了した分を残す。帳票をもう一度出す/完了を訂正する はここから %>
+    <% if (state.recentCompleted && state.recentCompleted.length > 0) { %>
+      <h2 class="pk-ready-title">✅ 本日完了した作業</h2>
+      <% for (const r of state.recentCompleted) { %>
+        <div class="pk-done">
+          <div class="row1">
+            <span class="no"><%= r.batch.shipping_no_label || r.batch.shipping_no %></span>
+            <span class="time">
+              <%= r.session.ended_at.slice(11, 16) %> 完了<% if (r.workSec != null) { %>
+                ／ <%= Math.floor(r.workSec / 60) %>分<%= String(r.workSec % 60).padStart(2, '0') %>秒<% } %>
+            </span>
+          </div>
+          <div class="acts">
+            <% if (r.batch.doc_url) { %>
+              <a class="mini" href="<%= r.batch.doc_url %>" target="_blank" rel="noopener noreferrer">📄 帳票</a>
+            <% } else if (r.batch.pdf_path) { %>
+              <a class="mini" href="/apps/shipping-work/batches/<%= r.batch.id %>/pdf" target="_blank">📄 帳票</a>
+            <% } %>
+            <button class="mini" onclick="openReprintModal(<%= r.session.id %>)">🖨 もう一度出す</button>
+            <% if (r.canCorrect) { %>
+              <button class="mini warn" onclick="openCorrectModal(<%= r.session.id %>)">↩ 完了を訂正</button>
+            <% } else { %>
+              <span class="mini-note" title="<%= r.correctBlockedReason %>">訂正は管理者へ</span>
+            <% } %>
+          </div>
+        </div>
+      <% } %>
+    <% } %>
+
     <%# 保留中の自分の作業。保留すると別の作業へ移れる (理由「他作業への応援」) ため常に表示する %>
     <% if (state.paused.length > 0) { %>
       <h2 class="pk-ready-title">⏸ 保留中の作業 (<%= state.paused.length %>件)</h2>
@@ -176,6 +217,47 @@
       <div class="row">
         <button class="ghost" onclick="closeModal('pauseModal')">やめる</button>
         <button class="primary" onclick="submitPause()">保留にする</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 帳票をもう一度出す (完了後。ステータスも計測も変えない) -->
+  <div class="pk-modal-bg" id="reprintModal">
+    <div class="pk-modal">
+      <h3>🖨 帳票をもう一度出す</h3>
+      <p style="margin:0 0 10px;color:#495057;font-size:0.92em">
+        作業の記録は変わりません。帳票だけもう一度出します
+      </p>
+      <div id="reprintReasons">
+        <% for (const r of reprintReasons) { %>
+          <button class="pk-reason" data-code="<%= r.code %>" data-label="<%= r.label %>" onclick="selReason(this, 'reprint')"><%= r.label %></button>
+        <% } %>
+      </div>
+      <textarea id="reprintNote" placeholder="補足 (「その他」は必須)"></textarea>
+      <div class="row">
+        <button class="ghost" onclick="closeModal('reprintModal')">やめる</button>
+        <button class="primary" onclick="submitReprint()">出す</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 完了を訂正 (作業に戻す) -->
+  <div class="pk-modal-bg" id="correctModal">
+    <div class="pk-modal">
+      <h3>↩ 完了を訂正する</h3>
+      <p style="margin:0 0 10px;color:#495057;font-size:0.92em">
+        この作業を「ピッキング中」に戻します。<br>
+        <b>今までの作業時間は消えません</b>。続きの時間と合算して記録されます
+      </p>
+      <div id="correctReasons">
+        <% for (const r of correctionReasons) { %>
+          <button class="pk-reason" data-code="<%= r.code %>" data-label="<%= r.label %>" onclick="selReason(this, 'correct')"><%= r.label %></button>
+        <% } %>
+      </div>
+      <textarea id="correctNote" placeholder="補足 (「その他」は必須)"></textarea>
+      <div class="row">
+        <button class="ghost" onclick="closeModal('correctModal')">やめる</button>
+        <button class="primary" onclick="submitCorrect()">作業に戻す</button>
       </div>
     </div>
   </div>
@@ -288,16 +370,47 @@
     }
 
     // ─── モーダル ───
-    const sel = { pause: null, trouble: null };
+    const REASON_BOX = { pause: 'pauseReasons', trouble: 'troubleReasons', reprint: 'reprintReasons', correct: 'correctReasons' };
+    const sel = { pause: null, trouble: null, reprint: null, correct: null };
+    let targetSessionId = null;  // 完了済み行から開いたモーダルの対象
     function selReason(btn, kind) {
       sel[kind] = { code: btn.dataset.code, label: btn.dataset.label };
-      const box = kind === 'pause' ? 'pauseReasons' : 'troubleReasons';
-      document.querySelectorAll(`#${box} .pk-reason`).forEach((b) => b.classList.remove('sel'));
+      document.querySelectorAll(`#${REASON_BOX[kind]} .pk-reason`).forEach((b) => b.classList.remove('sel'));
       btn.classList.add('sel');
     }
     function openPauseModal() { document.getElementById('pauseModal').classList.add('show'); }
     function openTroubleModal() { document.getElementById('troubleModal').classList.add('show'); }
+    function openReprintModal(sid) { targetSessionId = sid; document.getElementById('reprintModal').classList.add('show'); }
+    function openCorrectModal(sid) { targetSessionId = sid; document.getElementById('correctModal').classList.add('show'); }
     function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+    // 完了済み行に対する操作 (対象セッションを明示して送る)
+    async function postForSession(pathName, body) {
+      if (busy) return;
+      busy = true;
+      try {
+        await callApi(pathName, { session_id: targetSessionId, op_id: opId(), ...body });
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
+    function submitReprint() {
+      if (!sel.reprint) return alert('理由を選んでください');
+      const note = document.getElementById('reprintNote').value;
+      if (sel.reprint.label === 'その他' && !note.trim()) return alert('「その他」は内容の記入が必須です');
+      postForSession('reprint', { reason: sel.reprint.code, note });
+    }
+
+    function submitCorrect() {
+      if (!sel.correct) return alert('理由を選んでください');
+      const note = document.getElementById('correctNote').value;
+      if (sel.correct.label === 'その他' && !note.trim()) return alert('「その他」は内容の記入が必須です');
+      if (!confirm('この作業を「ピッキング中」に戻します。よろしいですか？\n(今までの作業時間は消えません)')) return;
+      postForSession('correct', { reason: sel.correct.code, note });
+    }
 
     function submitPause() {
       if (!sel.pause) return alert('理由を選んでください');
