@@ -1555,6 +1555,37 @@ check('店舗内カテゴリ: 6件は sanitize で too_many (5枠上限)',
   sanitize6([1, 2, 3, 4, 5, 6]).error === 'too_many');
 setCats(db, fdraft.id, []);
 
+// 旧上限 (30) 時代のDBからの移行: slot 列を落として6件選択の旧形を作り、再init で
+// ①slot 採番 ②6件目以降の切り詰め+イベント記録 が走ることを確認 (Codex R1 high)
+db.exec('ALTER TABLE draft_shop_categories DROP COLUMN slot');
+for (let i = 1; i <= 6; i++) {
+  db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+    VALUES (?, ?, ?, 1, ?)`).run(String(8000 + i), `移行棚${i}`, `移行棚${i}`, 200 + i);
+}
+const migIds = db.prepare(`SELECT id FROM ph_shop_categories WHERE path LIKE '移行棚%' ORDER BY sort_order`).all();
+for (const r of migIds) {
+  db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, r.id);
+}
+check('slot移行: 旧形DBで migrate が走る', dbmod.migrateShopCategorySlots(db) === true);
+check('slot移行: 2回目は no-op (冪等)', dbmod.migrateShopCategorySlots(db) === false);
+const migRows = selectedShopCategoriesInOrder(db, fdraft.id);
+check('slot移行: 6件が5件に切り詰められ slot 1..5 で採番される',
+  migRows.length === 5 && migRows.every((r, i) => r.slot === i + 1)
+  && migRows[0].path === '移行棚1' && migRows[4].path === '移行棚5', JSON.stringify(migRows));
+check('slot移行: 外した棚は draft_events に記録される (黙って消さない)',
+  (db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_trimmed_to_5'`)
+    .get(fdraft.id)?.detail || '').includes('移行棚6'));
+setCats(db, fdraft.id, []);
+
+// Amazon URL だけでゲート通過した draft の参照元が generation queue から欠けない (Codex R1 high)
+db.prepare(`UPDATE product_drafts SET official_url = NULL, amazon_url = 'https://www.amazon.co.jp/dp/B0GENQ', asin = 'B0GENQ',
+  status = 'ready_for_ai' WHERE id = ?`).run(fdraft.id);
+const q = dbmod.listGenerationQueue(db).find((d) => d.id === fdraft.id);
+check('generation queue: amazon_url / asin が材料に含まれる',
+  q && q.amazon_url === 'https://www.amazon.co.jp/dp/B0GENQ' && q.asin === 'B0GENQ' && q.official_url == null,
+  JSON.stringify(q));
+db.prepare(`UPDATE product_drafts SET status = 'draft', amazon_url = NULL, asin = NULL WHERE id = ?`).run(fdraft.id);
+
 // Category API 2.0 のツリー展開 (2026-08-02 実測形。miniPC /shop-categories/tree の trees)
 const { flattenCategoryTrees } = await import('../lib/shop-categories.js');
 const REAL_TREE = [{
