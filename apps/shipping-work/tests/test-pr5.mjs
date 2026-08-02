@@ -114,6 +114,24 @@ reset();
     `⭐保留と休憩の重なりは二重控除しない (実作業 ${c.workSec}秒 ≒ 60分)`);
 }
 
+console.log('# 2b. 日をまたぐセッションの休憩控除 (Codex round2 low)');
+reset();
+{
+  // 26時間前に開始したセッション (必ずJSTの日を跨ぐ)。休憩帯は now の90〜30分前 (60分)。
+  // 帯は暦日ごとに展開されるので、昨日と今日の2回分 = 120分が控除される
+  const now = Date.now();
+  const fmtJst = (ms) => new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ms));
+  svc.saveSetting('break_periods', `${fmtJst(now - 90 * 60_000)}-${fmtJst(now - 30 * 60_000)}`, ADMIN);
+  const id = mk({ workDate: today, shippingNo: 's09', slipCount: 10 });
+  const r = svc.startProcess('picking', id, W, uuid());
+  const start = new Date(now - 26 * 3600_000).toISOString().slice(0, 19) + 'Z';
+  db.prepare('UPDATE sw_sessions SET requested_at=? WHERE id=?').run(start, r.session_id);
+  const c = svc.completeProcess('picking', r.session_id, W, uuid());
+  const expected = 26 * 3600 - 2 * 3600;  // 経過26h − 休憩(60分×2日分)
+  ok(Math.abs(c.workSec - expected) < 120,
+    `⭐日をまたぐと休憩帯が暦日ごとに控除される (実作業 ${c.workSec}秒 ≒ ${expected}秒)`);
+}
+
 console.log('# 3. 異常候補一覧');
 reset();
 {
