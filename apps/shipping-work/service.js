@@ -263,10 +263,11 @@ export function completeProcess(process, sessionId, worker, opId) {
       const tooLongMin = getSettingInt(SETTING_TOO_LONG_KEY, DEFAULT_TOO_LONG_MIN);
       if (workSec > tooLongMin * 60 && !flags.includes('too_long')) flags.push('too_long');
 
+      // active_sec = 判定に使った実作業秒数そのもの。集計と異常候補の根拠を後から検証できる
       const res = db.prepare(`
-        UPDATE sw_sessions SET ended_at = ?, outcome = 'completed', flags_json = ?
+        UPDATE sw_sessions SET ended_at = ?, outcome = 'completed', flags_json = ?, active_sec = ?
         WHERE id = ? AND outcome = 'open'
-      `).run(now, JSON.stringify(flags), sessionId);
+      `).run(now, JSON.stringify(flags), Math.round(workSec), sessionId);
       if (res.changes === 0) throw new SwError(409, '同時操作が競合しました。画面を更新してください');
       cancelOpenPrintJobs(db, sessionId);
       db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ?').run(flow.to, now, s.batch_id);

@@ -314,11 +314,20 @@ router.post('/api/admin/batches/:id(\\d+)/cancel', requireAdminApi, (req, res) =
 });
 
 // 添付PDFの表示 (開発中モード: ブリッジ未設置でも手動印刷できる逃げ道。実装計画§5)。
-// PR3 で作業者向けルートを追加 (ピッキングは帳票を見て行う作業のため、
-// requireAppAccess('shipping-work') を持つ社内ユーザー全員に表示可)。admin ルートは後方互換で残す。
+// 帳票は顧客の氏名・住所を含むため、閲覧できるのは管理者と「そのバッチを担当した本人」だけ。
+// アプリ権限だけで通すと、IDを変えるだけで全バッチの帳票を読めてしまう。
+function canViewBatchPdf(req, batchId) {
+  if (req.session.role === 'admin') return true;
+  return !!getDB().prepare(
+    'SELECT 1 FROM sw_sessions WHERE batch_id = ? AND worker = ? LIMIT 1'
+  ).get(batchId, req.session.email);
+}
+
 function servePdf(req, res) {
   const batch = getBatch(Number(req.params.id));
   if (!batch || !batch.pdf_path) return res.status(404).send('PDFがありません');
+  // 存在の有無を伏せるため、権限外も404で返す
+  if (!canViewBatchPdf(req, batch.id)) return res.status(404).send('PDFがありません');
   // pdf_path はサーバー発行のファイル名のみだが、念のため DOCS_DIR 内であることを検証
   const abs = path.resolve(DOCS_DIR, batch.pdf_path);
   if (!abs.startsWith(path.resolve(DOCS_DIR) + path.sep)) return res.status(400).send('不正なパス');

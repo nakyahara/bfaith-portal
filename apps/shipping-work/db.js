@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -137,25 +137,20 @@ const MIGRATIONS = {
   // sw_sessions.op_id だけでは「同じ op_id を別バッチに送った再送」を成功扱いしてしまい、
   // 完了・保留・再開は op_id を持たないため通信タイムアウト後の遅延再送で記録が壊れる。
   // 全作業操作を (op_id, 操作種別, 対象, 入力) で束縛し、一致した再送だけ前回結果を返す。
-  4: () => {
-    createOperationsTable();
-    // 進行中セッションの op_id を開始操作として引き継ぐ。これが無いと
-    // 「v3で開始がコミットされたが応答が届かず、v4デプロイ後に同じ開始が再送される」場合に
-    // 冪等判定できず 409 になる (デプロイ跨ぎの退行。Codex PR3レビュー round2 #medium)。
-    // 再印刷由来のセッション (reprintフラグ) は元の操作種別・対象が復元できないため対象外。
-    const ins = db.prepare(`
-      INSERT OR IGNORE INTO sw_operations
-        (op_id, worker, operation, target_kind, target_id, params_hash, result_json, at)
-      VALUES (?, ?, ?, 'batch', ?, NULL, ?, ?)
-    `);
-    const rows = db.prepare(`
-      SELECT id, batch_id, process, worker, op_id, requested_at FROM sw_sessions
-      WHERE op_id IS NOT NULL AND outcome = 'open' AND flags_json NOT LIKE '%reprint%'
-    `).all();
-    for (const r of rows) {
-      ins.run(r.op_id, r.worker, `start:${r.process}`, r.batch_id,
-        JSON.stringify({ session_id: r.id, batch_id: r.batch_id }), r.requested_at);
-    }
+  // 進行中セッションの op_id を sw_operations へ backfill することは意図的にしない。
+  // 旧セッションからは「手動開始 (start:) だったのか『完了して次を開始』(start-next:) だったのか」
+  // を判別できず、誤った操作種別で記録すると再送時の照合がかえって狂う
+  // (Codex PR3レビュー round3 #medium)。
+  // 本番DBは v2 (業務データ0件) からこの版へ上がるため、冪等記録を持たない
+  // in-flight セッションはそもそも存在しない。将来 sw_operations 導入前の状態から
+  // 移行する必要が生じた場合も、判別できない以上 backfill せず 409 を返す方が安全。
+  4: createOperationsTable,
+  // v5: 実作業秒数 (終了 - 開始 - 保留合計) を完了時に保存する。
+  // 集計側で再計算もできるが、異常候補フラグ (too_short/too_long) がどの数値で立ったのかを
+  // 後から検証できるようにするため、判定に使った値そのものを残す。
+  // これは計測が主目的のアプリなので、指標の再現性を記録側で担保する。
+  5: () => {
+    db.exec('ALTER TABLE sw_sessions ADD COLUMN active_sec INTEGER');
   },
 };
 
