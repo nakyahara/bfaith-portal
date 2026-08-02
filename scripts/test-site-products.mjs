@@ -179,7 +179,7 @@ db.exec('DROP TABLE mirror_qoo10_items');
   const q1 = b.products.find((p) => p.code === 'TEST1');
   ok('Qoo10のみnull降格', q1?.malls?.qoo10?.url === null, JSON.stringify(q1?.malls?.qoo10));
   ok('他モールは維持', q1?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0TESTASIN');
-  ok('degradedLookupsにqoo10Item', b.degradedLookups.includes('qoo10Item'), JSON.stringify(b.degradedLookups));
+  ok('degradedLookupsにqoo10Item', b.degradedLookups.includes('qoo10Items'), JSON.stringify(b.degradedLookups));
 }
 
 server.close();

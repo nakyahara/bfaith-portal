@@ -8,6 +8,10 @@
  *       query不可)。env未設定なら503 fail-closed (mirror系の既存慣例に準拠)。
  * mount: session認証の外側 (server.jsで requireAppAccess を通さない)。読み取り専用・書き込み系なし。
  *
+ * ⚠️性能 (2026-08-02): 全lookupを「一括ロード → メモリ上のMapで解決」する。
+ *   商品ごとの個別照会 (6,800商品 × 8lookup) は応答90秒超でsite側の同期がタイムアウトした。
+ *   特に LOWER(TRIM()) を使ったJOINはインデックスが効かず致命的だった。
+ *
  * データ契約 (bfaith-site側 sync-products.js が検証する):
  *  - products[].code/name/price/stockFree/malls.{rakuten,yahoo,amazon,qoo10,aupay}
  *  - モールURLは判明分のみ (null許容)。site側はurl非nullのモールだけカードに描画する
@@ -42,166 +46,236 @@ function requireSiteReadToken(req, res, next) {
   next();
 }
 
-/**
- * モール別lookupのprepared statement群。
- * mirror表はデプロイ時期によって存在しないことがあるため、prepare失敗はそのモールを
- * null運用に落とす (fail-soft。新mirror表はfail-soft必須の運用ルールに準拠)。
- */
-let stmts = null;
-let stmtsError = {};
-function prepareStmts(db) {
-  if (stmts) return stmts;
-  stmts = {};
-  const defs = {
-    products: `SELECT 商品コード AS code, 商品名 AS name, 商品区分 AS productType,
-                      取扱区分 AS handling, 売上分類 AS salesCategory,
-                      標準売価 AS price, 在庫数 AS stock, 引当数 AS allocated,
-                      代表商品コード AS representativeCode
-               FROM mirror_products
-               WHERE 商品コード IS NOT NULL AND trim(商品コード) <> ''
-               ORDER BY 商品コード`,
-    rakutenCode: `SELECT rakuten_code FROM mirror_rakuten_sku_map
-                  WHERE ne_code = ? ORDER BY updated_at DESC LIMIT 1`,
-    rakutenUrl: `SELECT item_url FROM mirror_rakuten_item_purchaser_snapshot
-                 WHERE item_manage_number = ? AND item_url IS NOT NULL AND item_url <> ''
-                 ORDER BY date_jst DESC LIMIT 1`,
-    // 楽天の商品ページは「親商品」単位。色/サイズのバリエーションSKUコードでURLを組むと404になる
-    // (2026-08-02: サンプル20件中7件が404だった)。実在する商品管理番号かをRMS由来データで確認する。
-    // ⚠️商品ごとに個別照会すると6,800商品×最大4候補で応答が90秒を超えたため、一括で読んで
-    // メモリ上のSetで判定する (2026-08-02のタイムアウト対処)
-    rakutenItemNumbers: `SELECT DISTINCT item_manage_number FROM mirror_rakuten_item_daily
-                         WHERE item_manage_number IS NOT NULL AND trim(item_manage_number) <> ''`,
-    yahooItem: `SELECT item_code FROM mirror_yahoo_item_daily
-                WHERE item_code = ? ORDER BY date_jst DESC LIMIT 1`,
-    // Amazon ASINは供給元が3つあるので順に試す (2026-08-02: 販売実績のみだと解決0件だった)。
-    // SKU突合は case/空白ゆれに強くするためLOWER(TRIM())で行う (運用ルール: SKUのcase揃え)
-    amazonAsinFinance: `SELECT f.asin_norm AS asin
-                        FROM mirror_sku_resolved r
-                        JOIN mirror_amazon_finance_sku_daily f
-                          ON LOWER(TRIM(f.seller_sku)) = LOWER(TRIM(r.seller_sku))
-                        WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(f.asin_norm) <> ''
-                        ORDER BY f.date_jst DESC LIMIT 1`,
-    amazonAsinPrice: `SELECT p.asin AS asin
-                      FROM mirror_sku_resolved r
-                      JOIN mirror_amazon_price_snapshot_daily p
-                        ON LOWER(TRIM(p.seller_sku)) = LOWER(TRIM(r.seller_sku))
-                      WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(p.asin) <> ''
-                      ORDER BY p.date_jst DESC LIMIT 1`,
-    amazonAsinFees: `SELECT s.asin AS asin
-                     FROM mirror_sku_resolved r
-                     JOIN mirror_amazon_sku_fees s
-                       ON LOWER(TRIM(s.seller_sku)) = LOWER(TRIM(r.seller_sku))
-                     WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(s.asin) <> ''
-                     LIMIT 1`,
-    qoo10Item: `SELECT item_no FROM mirror_qoo10_items WHERE seller_code = ? LIMIT 1`,
-    aupaySku: `SELECT aupay_sku_key FROM mirror_aupay_finance_sku_daily
-               WHERE ne_code = ? ORDER BY date_jst DESC LIMIT 1`,
-  };
-  for (const [key, sql] of Object.entries(defs)) {
-    try {
-      stmts[key] = db.prepare(sql);
-    } catch (e) {
-      stmts[key] = null;
-      stmtsError[key] = String(e.message || e);
-      console.warn(`[site-products] prepare失敗 (${key}) — このlookupはnull運用:`, e.message);
-    }
-  }
-  return stmts;
-}
+const norm = (v) => String(v ?? '').trim().toLowerCase();
 
 /**
- * lookupの実行時エラーもモール単位でfail-softにする (Codex R1 High):
- * prepare成功後でもatomic swap等で表が変わると .get() が失敗しうる。
- * その場合は該当lookupだけnull運用に落とし、runtimeDegradedへ記録する (500にしない)。
+ * lookupに使う表を一括ロードする。1表につき1クエリ。
+ * mirror表はデプロイ時期によって存在しないことがあるため、失敗した表だけnull運用に落とす
+ * (fail-soft。新mirror表はfail-soft必須の運用ルールに準拠)。
  */
-function safeGet(s, key, runtimeDegraded, arg) {
-  const stmt = s[key];
-  if (!stmt) return null;
-  try {
-    return stmt.get(arg);
-  } catch (e) {
-    if (!runtimeDegraded.has(key)) {
-      runtimeDegraded.add(key);
-      console.warn(`[site-products] lookup実行時エラー (${key}) — null運用に降格:`, e.message);
+function loadIndexes(db, degraded) {
+  const q = (key, sql, build) => {
+    try {
+      return build(db.prepare(sql).all());
+    } catch (e) {
+      degraded.add(key);
+      console.warn(`[site-products] 一括ロード失敗 (${key}) — このlookupはnull運用:`, e.message);
+      return null;
     }
-    return null;
-  }
+  };
+  const pairMap = (rows, k, v) => {
+    const m = new Map();
+    for (const r of rows) {
+      const key = norm(r[k]);
+      if (key) m.set(key, r[v]);
+    }
+    return m;
+  };
+  // ASIN用: 日付も保持する (複数SKUを持つ商品で「最新のASIN」を選ぶため)
+  const datedMap = (rows) => {
+    const m = new Map();
+    for (const r of rows) {
+      const key = norm(r.seller_sku);
+      if (!key || !r.asin) continue;
+      const prev = m.get(key);
+      if (!prev || String(r.date ?? '') > String(prev.date ?? '')) {
+        m.set(key, { asin: r.asin, date: String(r.date ?? '') });
+      }
+    }
+    return m;
+  };
+
+  return {
+    // ne_code (小文字) → 楽天SKUコード
+    rakutenByNe: q(
+      'rakutenMap',
+      `SELECT ne_code, rakuten_code FROM mirror_rakuten_sku_map ORDER BY updated_at ASC`,
+      (rows) => pairMap(rows, 'ne_code', 'rakuten_code')
+    ),
+    // 実在する楽天商品管理番号 (小文字 → 元表記)。親商品の特定に使う
+    rakutenItemNumbers: q(
+      'rakutenItemNumbers',
+      `SELECT DISTINCT item_manage_number FROM mirror_rakuten_item_daily
+       WHERE item_manage_number IS NOT NULL AND trim(item_manage_number) <> ''`,
+      (rows) => {
+        const m = new Map();
+        for (const r of rows) m.set(norm(r.item_manage_number), r.item_manage_number);
+        return m;
+      }
+    ),
+    // 商品管理番号 (小文字) → 実URL (楽天が返した本物のURL)。
+    // ⚠️日次履歴表は全件ロードせず、SQL側でキーごとの最新1行に絞る (Codex指摘: 履歴は増え続ける)
+    rakutenUrlByItem: q(
+      'rakutenUrls',
+      `SELECT s.item_manage_number, s.item_url
+       FROM mirror_rakuten_item_purchaser_snapshot s
+       JOIN (SELECT item_manage_number, MAX(date_jst) AS d
+             FROM mirror_rakuten_item_purchaser_snapshot
+             WHERE item_url IS NOT NULL AND item_url <> ''
+             GROUP BY item_manage_number) l
+         ON l.item_manage_number = s.item_manage_number AND l.d = s.date_jst
+       WHERE s.item_url IS NOT NULL AND s.item_url <> ''`,
+      (rows) => pairMap(rows, 'item_manage_number', 'item_url')
+    ),
+    // Yahooに実在するアイテムコード (小文字 → 元表記)
+    yahooItems: q(
+      'yahooItems',
+      `SELECT DISTINCT item_code FROM mirror_yahoo_item_daily
+       WHERE item_code IS NOT NULL AND trim(item_code) <> ''`,
+      (rows) => {
+        const m = new Map();
+        for (const r of rows) m.set(norm(r.item_code), r.item_code);
+        return m;
+      }
+    ),
+    // ne_code (小文字) → seller_sku[] (Amazon SKU。1商品が複数SKUに紐づく)
+    skusByNe: q('skuResolved', `SELECT seller_sku, ne_code FROM mirror_sku_resolved`, (rows) => {
+      const m = new Map();
+      for (const r of rows) {
+        const k = norm(r.ne_code);
+        if (!k) continue;
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push(norm(r.seller_sku));
+      }
+      return m;
+    }),
+    // seller_sku (小文字) → {asin, date}。供給元3つを別Mapで持ち、優先順に引く。
+    // ⚠️日次履歴はSQL側でSKUごとの最新1行に絞る+dateを保持し、複数SKUでは最新を選ぶ (Codex指摘)
+    asinFinance: q(
+      'asinFinance',
+      `SELECT f.seller_sku, f.asin_norm AS asin, f.date_jst AS date
+       FROM mirror_amazon_finance_sku_daily f
+       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily
+             WHERE TRIM(asin_norm) <> '' GROUP BY seller_sku) l
+         ON l.seller_sku = f.seller_sku AND l.d = f.date_jst
+       WHERE TRIM(f.asin_norm) <> ''`,
+      (rows) => datedMap(rows)
+    ),
+    asinPrice: q(
+      'asinPrice',
+      `SELECT p.seller_sku, p.asin, p.date_jst AS date
+       FROM mirror_amazon_price_snapshot_daily p
+       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_price_snapshot_daily
+             WHERE TRIM(asin) <> '' GROUP BY seller_sku) l
+         ON l.seller_sku = p.seller_sku AND l.d = p.date_jst
+       WHERE TRIM(p.asin) <> ''`,
+      (rows) => datedMap(rows)
+    ),
+    asinFees: q(
+      'asinFees',
+      `SELECT seller_sku, asin, '' AS date FROM mirror_amazon_sku_fees WHERE TRIM(asin) <> ''`,
+      (rows) => datedMap(rows)
+    ),
+    // 商品コード (小文字) → Qoo10商品番号
+    qoo10ByCode: q(
+      'qoo10Items',
+      `SELECT seller_code, item_no FROM mirror_qoo10_items
+       WHERE seller_code IS NOT NULL AND trim(seller_code) <> ''`,
+      (rows) => pairMap(rows, 'seller_code', 'item_no')
+    ),
+    // ne_code (小文字) → auPAY SKUキー (日次履歴のためSQL側で最新1行に絞る)
+    aupayByNe: q(
+      'aupaySkus',
+      `SELECT a.ne_code, a.aupay_sku_key
+       FROM mirror_aupay_finance_sku_daily a
+       JOIN (SELECT ne_code, MAX(date_jst) AS d FROM mirror_aupay_finance_sku_daily
+             WHERE ne_code IS NOT NULL GROUP BY ne_code) l
+         ON l.ne_code = a.ne_code AND l.d = a.date_jst
+       WHERE a.ne_code IS NOT NULL`,
+      (rows) => pairMap(rows, 'ne_code', 'aupay_sku_key')
+    ),
+  };
 }
 
 /**
  * 楽天SKUコードから「実在する商品管理番号 (親商品)」を解決する。
  * 楽天の商品ページは親商品単位で、色/サイズはバリエーションとして1ページにまとまる。
  * そのためSKUコード (例: 0726-000629-bk) でURLを組むと404になる (2026-08-02に実測)。
- * ハイフン区切りの末尾を1段ずつ削りながら、RMS由来データ (mirror_rakuten_item_daily) に
- * 実在する番号かを確認する。見つからなければ null = URLを出さない。
+ * ハイフン区切りの末尾を1段ずつ削りながら、RMS由来データに実在する番号かを確認する。
+ * 見つからなければ null = URLを出さない。
  */
 function resolveRakutenItemNumber(itemNumbers, rakutenCode) {
   if (!itemNumbers) return null;
   const parts = String(rakutenCode).split('-');
-  // 例: a-b-c-d → [a-b-c-d, a-b-c, a-b] (最大3段まで遡る。1要素まで削ると別商品に当たる恐れ)
-  const maxStrip = Math.min(3, parts.length - 1);
+  const maxStrip = Math.min(3, parts.length - 1); // 1要素まで削ると別商品に当たる恐れ
   for (let i = 0; i <= maxStrip; i++) {
     const candidate = parts.slice(0, parts.length - i).join('-');
     if (!candidate) break;
-    const hit = itemNumbers.get(candidate.toLowerCase());
+    const hit = itemNumbers.get(norm(candidate));
     if (hit) return hit;
   }
   return null;
 }
 
-function lookupMalls(s, code, runtimeDegraded, asinSourceCounts, itemNumbers) {
+function lookupMalls(idx, code, asinSourceCounts) {
+  const key = norm(code);
   const malls = {
     rakuten: { code: null, url: null },
     yahoo: { code: null, url: null },
     amazon: { asin: null, url: null },
     qoo10: { itemNo: null, url: null },
-    aupay: { skuKey: null, url: null }, // URL形式が未確定のためid のみ (site側で将来対応)
+    aupay: { skuKey: null, url: null }, // URL形式が未確定のためidのみ (site側で将来対応)
   };
 
-  const rk = safeGet(s, 'rakutenCode', runtimeDegraded, code);
-  if (rk?.rakuten_code) {
-    malls.rakuten.code = rk.rakuten_code;
-    // 楽天の商品ページは親商品単位。SKUコード (例: xxx-bk) から親 (xxx) を段階的に探し、
-    // **RMS由来データに実在する商品管理番号だけ**をURL化する (存在しなければURLを出さない)
-    const itemNumber = resolveRakutenItemNumber(itemNumbers, rk.rakuten_code);
+  const rakutenCode = idx.rakutenByNe?.get(key);
+  if (rakutenCode) {
+    malls.rakuten.code = rakutenCode;
+    const itemNumber = resolveRakutenItemNumber(idx.rakutenItemNumbers, rakutenCode);
     if (itemNumber) {
-      const snap = safeGet(s, 'rakutenUrl', runtimeDegraded, itemNumber);
       malls.rakuten.url =
-        snap?.item_url ?? `https://item.rakuten.co.jp/${RAKUTEN_SHOP_SLUG}/${itemNumber.toLowerCase()}/`;
+        idx.rakutenUrlByItem?.get(norm(itemNumber)) ??
+        `https://item.rakuten.co.jp/${RAKUTEN_SHOP_SLUG}/${itemNumber.toLowerCase()}/`;
 
       // Yahoo (RYS連携): アイテムコード=楽天商品管理番号の小文字。実在確認できた場合のみURL化
-      const y = safeGet(s, 'yahooItem', runtimeDegraded, itemNumber.toLowerCase());
-      if (y?.item_code) {
-        malls.yahoo.code = y.item_code;
-        malls.yahoo.url = `https://store.shopping.yahoo.co.jp/${YAHOO_SELLER_ID}/${y.item_code}.html`;
+      const yahooCode = idx.yahooItems?.get(norm(itemNumber));
+      if (yahooCode) {
+        malls.yahoo.code = yahooCode;
+        malls.yahoo.url = `https://store.shopping.yahoo.co.jp/${YAHOO_SELLER_ID}/${yahooCode}.html`;
       }
     }
   }
 
-  // ASINは finance → price_snapshot → fees の順に探す (どれで解決したかを診断に記録)
-  for (const key of ['amazonAsinFinance', 'amazonAsinPrice', 'amazonAsinFees']) {
-    const az = safeGet(s, key, runtimeDegraded, code);
-    if (az?.asin) {
-      malls.amazon.asin = az.asin;
-      malls.amazon.url = `https://www.amazon.co.jp/dp/${az.asin}`;
-      asinSourceCounts[key] = (asinSourceCounts[key] ?? 0) + 1;
+  // ASINは finance → price_snapshot → fees の順。同一ソース内では全SKUのうち最新日付を選ぶ
+  // (Codex指摘: 複数SKUを持つ商品で古い/不定のASINを拾わないため)
+  const sellerSkus = idx.skusByNe?.get(key) ?? [];
+  for (const [srcName, map] of [
+    ['amazonAsinFinance', idx.asinFinance],
+    ['amazonAsinPrice', idx.asinPrice],
+    ['amazonAsinFees', idx.asinFees],
+  ]) {
+    if (!map) continue;
+    let best = null;
+    for (const sku of sellerSkus) {
+      const hit = map.get(sku);
+      if (hit && (!best || hit.date > best.date)) best = hit;
+    }
+    if (best) {
+      malls.amazon.asin = best.asin;
+      malls.amazon.url = `https://www.amazon.co.jp/dp/${best.asin}`;
+      asinSourceCounts[srcName] = (asinSourceCounts[srcName] ?? 0) + 1;
       break;
     }
   }
 
-  const q = safeGet(s, 'qoo10Item', runtimeDegraded, code);
-  if (q?.item_no) {
-    malls.qoo10.itemNo = q.item_no;
-    malls.qoo10.url = `https://www.qoo10.jp/g/${q.item_no}`;
+  const itemNo = idx.qoo10ByCode?.get(key);
+  if (itemNo) {
+    malls.qoo10.itemNo = itemNo;
+    malls.qoo10.url = `https://www.qoo10.jp/g/${itemNo}`;
   }
 
-  const au = safeGet(s, 'aupaySku', runtimeDegraded, code);
-  if (au?.aupay_sku_key) {
-    malls.aupay.skuKey = au.aupay_sku_key;
-  }
+  const aupaySku = idx.aupayByNe?.get(key);
+  if (aupaySku) malls.aupay.skuKey = aupaySku;
 
   return malls;
 }
+
+const PRODUCTS_SQL = `SELECT 商品コード AS code, 商品名 AS name, 商品区分 AS productType,
+                             取扱区分 AS handling, 売上分類 AS salesCategory,
+                             標準売価 AS price, 在庫数 AS stock, 引当数 AS allocated,
+                             代表商品コード AS representativeCode
+                      FROM mirror_products
+                      WHERE 商品コード IS NOT NULL AND trim(商品コード) <> ''
+                      ORDER BY 商品コード`;
 
 // GET /products — 全商品スナップショット (読み取り専用)
 router.get('/products', requireSiteReadToken, (req, res) => {
@@ -210,44 +284,37 @@ router.get('/products', requireSiteReadToken, (req, res) => {
   try {
     db = getMirrorDB();
   } catch (e) {
-    return res.status(503).json({ ok: false, error: 'mirror_db_unavailable', message: String(e.message || e) });
+    return res
+      .status(503)
+      .json({ ok: false, error: 'mirror_db_unavailable', message: String(e.message || e) });
   }
   try {
-    const s = prepareStmts(db);
-    if (!s.products) {
-      // detailはログのみ (スキーマ情報をレスポンスに漏らさない)
+    const degraded = new Set();
+    const asinSourceCounts = {};
+    let rows;
+    let idx;
+    // 1トランザクションで読む (syncのatomic swapとの競合回避、product-management-listと同じ慣例)
+    try {
+      db.transaction(() => {
+        rows = db.prepare(PRODUCTS_SQL).all();
+        idx = loadIndexes(db, degraded);
+      })();
+    } catch (e) {
+      console.error('[site-products] products読み込み失敗:', e);
       return res.status(503).json({ ok: false, error: 'mirror_products_unavailable' });
     }
-    // 1トランザクションで読む (syncのatomic swapとの競合回避、product-management-listと同じ慣例)
-    const runtimeDegraded = new Set();
-    const asinSourceCounts = {}; // どのソースでASINが解決できたか (診断用)
-    const result = db.transaction(() => {
-      // 楽天の実在商品管理番号を一括ロード (小文字キー → 元表記)。商品ごとの個別照会は遅すぎる
-      let itemNumbers = null;
-      try {
-        itemNumbers = new Map(
-          (s.rakutenItemNumbers?.all() ?? []).map((r) => [
-            String(r.item_manage_number).toLowerCase(),
-            r.item_manage_number,
-          ])
-        );
-      } catch (e) {
-        runtimeDegraded.add('rakutenItemNumbers');
-        console.warn('[site-products] 楽天商品番号の一括読込に失敗:', e.message);
-      }
-      const rows = s.products.all();
-      return rows.map((r) => ({
-        code: r.code,
-        name: r.name ?? '',
-        productType: r.productType ?? null,
-        handling: r.handling ?? null,
-        salesCategory: r.salesCategory ?? null,
-        price: r.price ?? null,
-        stockFree: Math.max(0, (r.stock ?? 0) - (r.allocated ?? 0)),
-        representativeCode: r.representativeCode ?? null,
-        malls: lookupMalls(s, r.code, runtimeDegraded, asinSourceCounts, itemNumbers),
-      }));
-    })();
+
+    const result = rows.map((r) => ({
+      code: r.code,
+      name: r.name ?? '',
+      productType: r.productType ?? null,
+      handling: r.handling ?? null,
+      salesCategory: r.salesCategory ?? null,
+      price: r.price ?? null,
+      stockFree: Math.max(0, (r.stock ?? 0) - (r.allocated ?? 0)),
+      representativeCode: r.representativeCode ?? null,
+      malls: lookupMalls(idx, r.code, asinSourceCounts),
+    }));
 
     // 監査ログ (設計書§15 PR-4a): 誰に何件返したか。PIIなし
     console.log('[site-products] served', { count: result.length, ip: req.ip });
@@ -257,7 +324,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
       generatedAt: new Date().toISOString(),
       source: 'warehouse-mirror',
       count: result.length,
-      degradedLookups: [...new Set([...Object.keys(stmtsError), ...runtimeDegraded])],
+      degradedLookups: [...degraded],
       // 診断: モール別のURL解決数。0が続く場合は元データ (mirror同期) 側を疑う
       resolved: {
         rakuten: result.filter((p) => p.malls.rakuten.url).length,
