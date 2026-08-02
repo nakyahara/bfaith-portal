@@ -25,16 +25,51 @@ export class SwError extends Error {
   }
 }
 
-// 工程ごとの遷移定義 (from → active → to)。PR4 で sorting/packing を追加する。
-// sorting は from:'picked' (アソートのみ)、packing は from:'picked'|'sorted' (分類による) の予定。
+// 工程ごとの遷移定義 (from → active → to)。
+//   resolveFrom  — そのバッチでの開始元状態。null を返すと「この工程の対象外」(409)
+//   startableWhere — 開始できるバッチの一覧条件 (listStartableBatches)
+//   printOnStart — 開始時に印刷ジョブを積むか。印刷はピッキングリストだけ
+//     (納品書・送り状は現行どおりロケーション順に事前印刷 = 要件§8.1。仕分け・梱包では刷らない)
+//   requireDocument — 開始に帳票が必須か (「開始=印刷」が成立する工程のみ)
+//   recordMistakes — 完了時にミス件数を受け付けるか (要件§8.1: 梱包完了時に任意入力)
 const PROCESS_FLOW = {
   picking: {
-    from: 'ready',
+    label: 'ピッキング',
+    resolveFrom: () => 'ready',
+    startableWhere: "b.status = 'ready'",
     active: 'picking',
     to: 'picked',
     pauseReasonKind: 'pause_reason_pick',
+    printOnStart: true,
+    requireDocument: true,
+    recordMistakes: false,
+  },
+  // 仕分けはアソート (複数商品の詰め合わせ) のみ。単品・同一複数は picked から直接梱包へ
+  sorting: {
+    label: '仕分け',
+    resolveFrom: (batch) => (batch.bunrui === 'assort' ? 'picked' : null),
+    startableWhere: "b.status = 'picked' AND b.bunrui = 'assort'",
+    active: 'sorting',
+    to: 'sorted',
+    pauseReasonKind: 'pause_reason_pack',
+    printOnStart: false,
+    requireDocument: false,
+    recordMistakes: false,
+  },
+  packing: {
+    label: '梱包',
+    resolveFrom: (batch) => (batch.bunrui === 'assort' ? 'sorted' : 'picked'),
+    startableWhere: "((b.status = 'picked' AND b.bunrui != 'assort') OR b.status = 'sorted')",
+    active: 'packing',
+    to: 'done',
+    pauseReasonKind: 'pause_reason_pack',
+    printOnStart: false,
+    requireDocument: false,
+    recordMistakes: true,
   },
 };
+// 工程の順序 (完了訂正の「後続工程が始まっていないか」判定に使う)
+const PROCESS_ORDER = ['picking', 'sorting', 'packing'];
 
 // 工程が完了したときに入る状態 (どこまで進んだかの判定に使う)。PR4 で sorting/packing を追加。
 const PROCESS_TO_STATUS = { picking: 'picked', sorting: 'sorted', packing: 'done' };
@@ -210,19 +245,24 @@ function startInternal(db, process, batchId, worker, opId) {
   const flow = PROCESS_FLOW[process];
   const batch = getBatch(batchId);
   if (!batch) throw new SwError(404, 'バッチが見つかりません');
-  // 帳票が無いと「開始=印刷」が成立しない (実装計画§5: 事務がバッチ作成時に添付する方式)。
+  // 開始元状態はバッチによって変わる (アソートは仕分けを経由する)。
+  // null = この工程の対象外 (例: 単品バッチに仕分けは無い)
+  const from = flow.resolveFrom(batch);
+  if (!from) throw new SwError(409, `このバッチは${flow.label}の対象ではありません`, 'not_applicable');
+  // 帳票が無いと「開始=印刷」が成立しない (実装計画§5)。ピッキングのみの制約 —
+  // 仕分け・梱包はピッキングを通った時点で帳票があるはずで、開始時に刷りもしない。
   // リースを取る前に止め、開始済みデータを残さない (Codex PR3レビュー#3)
-  if (!batchHasDocument(batch)) {
+  if (flow.requireDocument && !batchHasDocument(batch)) {
     throw new SwError(409, '帳票PDFが未添付のため開始できません。管理者に添付を依頼してください', 'no_document');
   }
-  // 進行中の作業は1人1つ。保留中 (paused=1) は対象外 = 保留して別の作業へ移れる
+  // 進行中の作業は1人1つ (工程をまたいでも)。保留中 (paused=1) は対象外 = 保留して別の作業へ移れる
   // (保留理由「他作業への応援」の運用。DB制約 idx_sw_sessions_worker_open と同じ条件)
   const mine = db.prepare("SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0").get(worker);
   if (mine) throw new SwError(409, '作業中のバッチがあります。完了・保留・中止のいずれかをしてから次を開始してください', 'busy_worker');
   const now = utcNow();
   // リース: 条件付き UPDATE。0行なら他の人が先に取った (ここまで書き込みなし)
   const res = db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ? AND status = ?')
-    .run(flow.active, now, batchId, flow.from);
+    .run(flow.active, now, batchId, from);
   if (res.changes === 0) {
     throw new SwError(409, '他の人が先に開始したか、開始できない状態です。画面を更新してください', 'lease_lost');
   }
@@ -231,11 +271,13 @@ function startInternal(db, process, batchId, worker, opId) {
     VALUES (?, ?, ?, ?, ?)
   `).run(batchId, process, worker, now, opId);
   const sessionId = Number(info.lastInsertRowid);
-  db.prepare(`
-    INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, doc_url, requested_by, requested_at)
-    VALUES (?, ?, 'picking_list', ?, ?, ?, ?)
-  `).run(batchId, sessionId, batch.pdf_path, batch.doc_url, worker, now);
-  addStatusEvent(batchId, flow.from, flow.active, worker, 'button', null);
+  if (flow.printOnStart) {
+    db.prepare(`
+      INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, doc_url, requested_by, requested_at)
+      VALUES (?, ?, 'picking_list', ?, ?, ?, ?)
+    `).run(batchId, sessionId, batch.pdf_path, batch.doc_url, worker, now);
+  }
+  addStatusEvent(batchId, from, flow.active, worker, 'button', null);
   return { session_id: sessionId, batch_id: batchId };
 }
 
@@ -253,12 +295,34 @@ export function startProcess(process, batchId, worker, opId) {
 /**
  * 完了 (要件§7.2)。終了時刻を記録し、異常候補フラグを同期判定して flow.to へ遷移。
  */
-export function completeProcess(process, sessionId, worker, opId) {
+/**
+ * ミス記録の検証 (要件§8.1: 梱包完了時に任意入力。現行Notionの4分類×件数)。
+ * [{ kind, count }] を検証して返す。ミスなし = 空配列。
+ */
+function normalizeMistakes(flow, raw) {
+  if (!flow.recordMistakes || raw == null) return [];
+  if (!Array.isArray(raw) || raw.length > 10) throw new SwError(400, 'ミス記録の形式が不正です');
+  return raw.map((m) => {
+    const kind = String(m?.kind || '');
+    const count = Number(m?.count);
+    if (!isValidMaster('mistake_kind', kind)) throw new SwError(400, 'ミスの分類が不正です');
+    if (!Number.isInteger(count) || count <= 0 || count > 999) {
+      throw new SwError(400, 'ミスの件数は1以上の整数で入力してください');
+    }
+    return { kind, count };
+  });
+}
+
+export function completeProcess(process, sessionId, worker, opId, opts = {}) {
   const flow = getFlow(process);
   validateOpId(opId);
+  const mistakes = normalizeMistakes(flow, opts.mistakes);
   const db = getDB();
   return runIdempotent(
-    { opId, worker, operation: `complete:${process}`, targetKind: 'session', targetId: sessionId },
+    {
+      opId, worker, operation: `complete:${process}`, targetKind: 'session', targetId: sessionId,
+      params: mistakes.length > 0 ? { mistakes } : undefined,
+    },
     () => {
       const s = getOwnSession(db, process, sessionId, worker);
       if (s.outcome === 'completed') {
@@ -292,6 +356,13 @@ export function completeProcess(process, sessionId, worker, opId) {
       cancelOpenPrintJobs(db, sessionId);
       db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ?').run(flow.to, now, s.batch_id);
       addStatusEvent(s.batch_id, flow.active, flow.to, worker, 'button', null);
+      // ミス記録 (梱包完了時の任意入力)。完了と同一トランザクション = 冪等レイヤーで再送も安全
+      for (const m of mistakes) {
+        db.prepare(`
+          INSERT INTO sw_mistakes (batch_id, process, kind, count, recorded_by, at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(s.batch_id, process, m.kind, m.count, worker, now);
+      }
       return { flags, workSec: Math.round(workSec), pauseSec: Math.round(pauseSec), batch_id: s.batch_id };
     }
   );
@@ -467,7 +538,7 @@ export function startNextReady(process, worker, opId) {
       // 開始可能な先頭から順に試す。他者に取られた (lease_lost) ら次候補へ。
       // 帳票未添付のバッチは自動では選ばない (開始できないため。手動一覧には出して理由を示す)
       for (const c of listStartableBatches(process, jstToday())) {
-        if (!batchHasDocument(c)) continue;
+        if (getFlow(process).requireDocument && !batchHasDocument(c)) continue;
         try {
           const started = startInternal(db, process, c.id, worker, opId);
           return { batch_id: started.batch_id, session_id: started.session_id };
@@ -496,6 +567,7 @@ export function startNextReady(process, worker, opId) {
  */
 export function listStartableBatches(process, workDate) {
   const flow = getFlow(process);
+  // startableWhere は PROCESS_FLOW 内の固定文字列 (ユーザー入力は入らない)
   return getDB().prepare(`
     SELECT b.*,
       (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
@@ -503,9 +575,9 @@ export function listStartableBatches(process, workDate) {
       (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
     FROM sw_batches b
     LEFT JOIN sw_masters sm ON sm.kind='shipping_no' AND sm.code=b.shipping_no
-    WHERE b.status = ? AND b.work_date <= ?
+    WHERE ${flow.startableWhere} AND b.work_date <= ?
     ORDER BY b.work_date, COALESCE(sm.sort, 999), b.id
-  `).all(flow.from, workDate);
+  `).all(workDate);
 }
 
 /** バッチ1件をラベル付きで取得 (画面表示用)。 */
@@ -552,11 +624,20 @@ function canCorrectCompletion(db, flow, session, batch, nowUtc) {
   if (batch.status !== flow.to) {
     return { ok: false, reason: '後の工程が進んでいるため訂正できません。管理者に依頼してください' };
   }
-  // 後続工程 (仕分け・梱包) が一度でも始まっていたら戻さない
-  const later = db.prepare(
-    "SELECT 1 FROM sw_sessions WHERE batch_id = ? AND process != ? LIMIT 1"
-  ).get(session.batch_id, session.process);
-  if (later) return { ok: false, reason: '後の工程が始まっているため訂正できません。管理者に依頼してください' };
+  // 後続の工程が始まっていたら戻さない (工程順で判定。前の工程の記録があるのは当然なので
+  // 「自分より後ろ」だけを見る — 例: 梱包完了の訂正で、ピッキングの記録があるのは正常)。
+  // 実際に進んだ証拠にならない outcome/validity は無視する (laterProcessSessions と同基準)
+  const myIdx = PROCESS_ORDER.indexOf(session.process);
+  const laterProcs = PROCESS_ORDER.slice(myIdx + 1);
+  if (laterProcs.length > 0) {
+    const later = db.prepare(`
+      SELECT 1 FROM sw_sessions
+      WHERE batch_id = ? AND process IN (${laterProcs.map(() => '?').join(',')})
+        AND outcome IN ('open', 'completed') AND validity != 'invalid'
+      LIMIT 1
+    `).get(session.batch_id, ...laterProcs);
+    if (later) return { ok: false, reason: '後の工程が始まっているため訂正できません。管理者に依頼してください' };
+  }
   const windowMin = getSettingInt(SETTING_CORRECT_WINDOW_KEY, DEFAULT_CORRECT_WINDOW_MIN);
   if (secondsBetween(session.ended_at, nowUtc) > windowMin * 60) {
     return { ok: false, reason: `完了から${windowMin}分を過ぎたため訂正できません。管理者に依頼してください` };

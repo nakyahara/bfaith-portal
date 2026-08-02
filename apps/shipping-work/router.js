@@ -81,21 +81,35 @@ router.get('/', (req, res) => {
   });
 });
 
-// ═══ ピッキング (PR3: 作業者の本体画面。タブレット前提・大ボタン) ═══
+// ═══ 作業画面 (タブレット前提・大ボタン)。3工程が同じ view (views/work.ejs) を共有 ═══
+//
+// ピッキング=開始で印刷+計測 / 仕分け=アソートのみ (picked→sorted) / 梱包=最終工程 (→done)。
+// 工程の違いは PROCESS_FLOW (service.js) が持ち、画面と API は :process で共通化する。
 
-router.get('/picking', (req, res) => {
-  const state = getWorkerState('picking', req.session.email);
-  res.render(path.join(__dirname, 'views/picking'), {
-    title: 'ピッキング | 出荷作業管理',
+const WORK_PROCESSES = {
+  picking: { label: 'ピッキング', icon: '📦', pauseReasonKind: 'pause_reason_pick', hasTrouble: true, hasMistakes: false },
+  sorting: { label: '仕分け', icon: '🗂', pauseReasonKind: 'pause_reason_pack', hasTrouble: false, hasMistakes: false },
+  packing: { label: '梱包', icon: '📮', pauseReasonKind: 'pause_reason_pack', hasTrouble: false, hasMistakes: true },
+};
+
+router.get('/:process(picking|sorting|packing)', (req, res) => {
+  const process = req.params.process;
+  const conf = WORK_PROCESSES[process];
+  const state = getWorkerState(process, req.session.email);
+  res.render(path.join(__dirname, 'views/work'), {
+    title: `${conf.label} | 出荷作業管理`,
     username: req.session.email,
     displayName: req.session.displayName,
     isAdmin: req.session.role === 'admin',
+    process,
+    conf,
     state,
     today: jstToday(),
-    pauseReasons: listMasters('pause_reason_pick'),
+    pauseReasons: listMasters(conf.pauseReasonKind),
     troubleReasons: listMasters('print_trouble_reason'),
     reprintReasons: listMasters('reprint_reason'),
     correctionReasons: listMasters('correction_reason'),
+    mistakeKinds: listMasters('mistake_kind'),
   });
 });
 
@@ -122,23 +136,27 @@ function api(handler) {
 // 「操作種別 × 対象 × 入力」に束縛して記録する。完全一致の再送だけが前回結果を返す。
 const opId = (v) => String(v || '');
 const sessionId = (v) => Number(v);
+const PROC = ':process(picking|sorting|packing)';
 
-// 開始 (楽観開始 = リース + 印刷ジョブ + 計測開始)
-router.post('/api/picking/start', api((req) => {
-  const r = startProcess('picking', Number(req.body?.batch_id), req.session.email, opId(req.body?.op_id));
+// 開始 (ピッキングはリース + 印刷ジョブ + 計測開始。仕分け・梱包は印刷なし)
+router.post(`/api/${PROC}/start`, api((req) => {
+  const r = startProcess(req.params.process, Number(req.body?.batch_id), req.session.email, opId(req.body?.op_id));
   return { ok: true, session_id: r.session_id, batch_id: r.batch_id, already: r.already };
 }));
 
 // 完了。next=true なら次の開始可能バッチを連続開始 (op_id_next 必須)。
+// 梱包のみ mistakes ([{kind,count}]) を任意で受ける (要件§8.1)。
 // 完了は確定済みのため、次の開始が失敗しても完了をエラーとして返さない
 // (作業者には「完了はできた・次は取れなかった」と伝わるのが正しい)。
-router.post('/api/picking/complete', api((req) => {
-  const r = completeProcess('picking', sessionId(req.body?.session_id), req.session.email, opId(req.body?.op_id));
+router.post(`/api/${PROC}/complete`, api((req) => {
+  const process = req.params.process;
+  const r = completeProcess(process, sessionId(req.body?.session_id), req.session.email,
+    opId(req.body?.op_id), { mistakes: req.body?.mistakes });
   let next = null;
   let nextError = null;
   if (req.body?.next) {
     try {
-      next = startNextReady('picking', req.session.email, opId(req.body?.op_id_next));
+      next = startNextReady(process, req.session.email, opId(req.body?.op_id_next));
     } catch (e) {
       nextError = e instanceof SwError ? e.message : '次のバッチを開始できませんでした';
       console.error('[shipping-work] 次バッチ開始に失敗', e);
@@ -149,33 +167,34 @@ router.post('/api/picking/complete', api((req) => {
 
 // 保留 (理由必須・「その他」は記述必須)。
 // 既に別の理由で保留済みだった場合は effectiveReason で実際に効いている理由を返す
-router.post('/api/picking/pause', api((req) => {
-  const r = pauseProcess('picking', sessionId(req.body?.session_id), req.session.email,
+router.post(`/api/${PROC}/pause`, api((req) => {
+  const r = pauseProcess(req.params.process, sessionId(req.body?.session_id), req.session.email,
     String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
   return { ok: true, already: r.already, effectiveReason: r.effectiveReason ?? null };
 }));
 
 // 保留解除
-router.post('/api/picking/resume', api((req) => {
-  const r = resumeProcess('picking', sessionId(req.body?.session_id), req.session.email, opId(req.body?.op_id));
+router.post(`/api/${PROC}/resume`, api((req) => {
+  const r = resumeProcess(req.params.process, sessionId(req.body?.session_id), req.session.email, opId(req.body?.op_id));
   return { ok: true, already: r.already };
 }));
 
 // 完了後に帳票をもう一度出す (ステータスも計測も触らない。印刷ジョブを追記するだけ)
-router.post('/api/picking/reprint', api((req) => {
-  const r = requestReprint('picking', sessionId(req.body?.session_id), req.session.email,
+router.post(`/api/${PROC}/reprint`, api((req) => {
+  const r = requestReprint(req.params.process, sessionId(req.body?.session_id), req.session.email,
     String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
   return { ok: true, already: r.already, batch_id: r.batch_id };
 }));
 
 // 完了の訂正 (押し間違い・作業が残っていた)。元の計測は残し、続きは継続セッションに記録する
-router.post('/api/picking/correct', api((req) => {
-  const r = correctCompletion('picking', sessionId(req.body?.session_id), req.session.email,
+router.post(`/api/${PROC}/correct`, api((req) => {
+  const r = correctCompletion(req.params.process, sessionId(req.body?.session_id), req.session.email,
     String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
   return { ok: true, already: r.already, session_id: r.session_id, held: r.held };
 }));
 
-// 印刷トラブル (reprint=再印刷して開始し直す / abort=中止して ready へ戻す)
+// 印刷トラブル (reprint=再印刷して開始し直す / abort=中止して ready へ戻す)。ピッキングのみ
+// (仕分け・梱包は開始時に印刷しないため、このボタン自体が無い)
 router.post('/api/picking/trouble', api((req) => {
   const r = troubleProcess('picking', sessionId(req.body?.session_id), req.session.email,
     String(req.body?.reason || ''), req.body?.note, String(req.body?.action || ''), opId(req.body?.op_id));

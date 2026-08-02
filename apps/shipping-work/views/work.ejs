@@ -80,11 +80,14 @@
   <header class="portal-header">
     <div class="header-left">
       <h1>B-Faith Portal</h1>
-      <span class="page-title">📦 ピッキング</span>
+      <span class="page-title"><%= conf.icon %> <%= conf.label %></span>
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
       <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+      <% for (const [pKey, pConf] of Object.entries({picking:'📦', sorting:'🗂', packing:'📮'})) { if (pKey !== process) { %>
+        <a href="/apps/shipping-work/<%= pKey %>" class="btn-logout"><%= pConf %> <%= pKey === 'picking' ? 'ピッキング' : pKey === 'sorting' ? '仕分け' : '梱包' %></a>
+      <% } } %>
       <% if (isAdmin) { %><a href="/apps/shipping-work/admin/batches" class="btn-logout">バッチ管理</a><% } %>
       <a href="/logout" class="btn-logout">ログアウト</a>
     </div>
@@ -108,8 +111,13 @@
         <div class="pk-timer-note">経過時間 (保留を除く)</div>
 
         <div class="pk-btns">
-          <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
-          <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
+          <% if (conf.hasMistakes) { %>
+            <button class="pk-btn complete-next" onclick="openMistakeModal(true)">✅ 完了して次を開始</button>
+            <button class="pk-btn complete" onclick="openMistakeModal(false)">✅ 完了して作業終了</button>
+          <% } else { %>
+            <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
+            <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
+          <% } %>
           <button class="pk-btn pause" onclick="openPauseModal()">⏸ 保留にする</button>
           <%# 帳票は Drive リンクが主。アップロードPDFのときはアプリ内で配信する %>
           <% if (state.batch.doc_url) { %>
@@ -119,7 +127,9 @@
             <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
                href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票を開く</a>
           <% } %>
-          <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
+          <% if (conf.hasTrouble) { %>
+            <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
+          <% } %>
         </div>
       </div>
     <% } else { %>
@@ -141,15 +151,19 @@
         <% } %>
       <% } %>
       <% for (const b of state.ready) { %>
-        <% const hasDoc = !!(b.doc_url || b.pdf_path); %>
-        <button class="pk-tile <%= hasDoc ? '' : 'nodoc' %>"
-          <% if (hasDoc) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
+        <% const hasDoc = !!(b.doc_url || b.pdf_path);
+           const startable = hasDoc || !conf.hasTrouble; /* 帳票必須なのは開始=印刷のピッキングのみ */ %>
+        <button class="pk-tile <%= startable ? '' : 'nodoc' %>"
+          <% if (startable) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
           <div class="no"><%= b.shipping_no_label || b.shipping_no %></div>
           <div class="meta">
             <%= b.bunrui_label || b.bunrui %> ／ <%= b.packing_method_label || b.packing_method %>
             <% if (b.slip_count != null) { %> ／ <%= b.slip_count %>件<% } %>
             <% if (b.work_date !== today) { %> ／ <span class="carry">持ち越し (<%= b.work_date %>)</span><% } %>
           </div>
+          <% if (process === 'packing' && b.bunrui === 'assort') { %>
+            <div class="meta">🗂 仕分け済み → 梱包</div>
+          <% } %>
           <% if (b.note) { %><div class="meta">📝 <%= b.note %></div><% } %>
           <% if (!hasDoc) { %>
             <div class="meta nodoc-msg">⚠ 帳票が未設定のため開始できません (管理者にリンクの登録を依頼してください)</div>
@@ -221,6 +235,32 @@
     </div>
   </div>
 
+  <!-- ミス記録 (梱包の完了時のみ・任意。現行Notionの4分類×件数 = 要件§8.1) -->
+  <% if (conf.hasMistakes) { %>
+  <div class="pk-modal-bg" id="mistakeModal">
+    <div class="pk-modal">
+      <h3>✅ 完了 — ミスはありましたか？</h3>
+      <p style="margin:0 0 10px;color:#495057;font-size:0.92em">
+        ピッキングのミスに気づいたら件数を入れてください。<b>なければそのまま完了</b>できます
+      </p>
+      <div id="mistakeInputs">
+        <% for (const m of mistakeKinds) { %>
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+            <label style="flex:1;font-size:1.0em"><%= m.label %></label>
+            <input type="number" min="0" max="999" value="0" data-kind="<%= m.code %>"
+                   style="width:90px;padding:8px;font-size:1.1em;text-align:center">
+            <span style="color:#868e96">件</span>
+          </div>
+        <% } %>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="closeModal('mistakeModal')">やめる</button>
+        <button class="primary" onclick="submitComplete()">ミスなしで完了</button>
+      </div>
+    </div>
+  </div>
+  <% } %>
+
   <!-- 帳票をもう一度出す (完了後。ステータスも計測も変えない) -->
   <div class="pk-modal-bg" id="reprintModal">
     <div class="pk-modal">
@@ -246,7 +286,7 @@
     <div class="pk-modal">
       <h3>↩ 完了を訂正する</h3>
       <p style="margin:0 0 10px;color:#495057;font-size:0.92em">
-        この作業を「ピッキング中」に戻します。<br>
+        この作業を「<%= conf.label %>中」に戻します。<br>
         <b>今までの作業時間は消えません</b>。続きの時間と合算して記録されます
       </p>
       <div id="correctReasons">
@@ -262,7 +302,8 @@
     </div>
   </div>
 
-  <!-- 印刷トラブルモーダル -->
+  <!-- 印刷トラブルモーダル (ピッキングのみ: 開始=印刷の工程だけが持つ例外) -->
+  <% if (conf.hasTrouble) { %>
   <div class="pk-modal-bg" id="troubleModal">
     <div class="pk-modal">
       <h3>🖨 印刷トラブル</h3>
@@ -284,10 +325,11 @@
       </div>
     </div>
   </div>
+  <% } %>
 
   <script>
     const SESSION_ID = <%- state.session ? state.session.id : 'null' %>;
-    const API = '/apps/shipping-work/api/picking';
+    const API = '/apps/shipping-work/api/<%= process %>';
     let busy = false;
 
     // 冪等キー。crypto.randomUUID が使えない環境 (非https) 向けフォールバックあり
@@ -347,7 +389,7 @@
       }
     }
 
-    async function complete(withNext) {
+    async function complete(withNext, mistakes) {
       if (busy) return;
       const msg = withNext ? '完了して、次のバッチを開始しますか？' : '完了して作業を終了しますか？';
       if (!confirm(msg)) return;
@@ -356,6 +398,7 @@
         const j = await callApi('complete', {
           session_id: SESSION_ID, op_id: opId(),
           next: withNext, op_id_next: withNext ? opId() : undefined,
+          mistakes: mistakes && mistakes.length > 0 ? mistakes : undefined,
         });
         if (withNext && !j.next) {
           alert(j.nextError
@@ -368,6 +411,34 @@
         location.reload();
       }
     }
+
+    // ─── ミス記録 (梱包のみ)。完了ボタン → 件数入力 → 完了送信 ───
+    let mistakeWithNext = false;
+    function openMistakeModal(withNext) {
+      mistakeWithNext = withNext;
+      const modal = document.getElementById('mistakeModal');
+      if (!modal) return complete(withNext);
+      modal.classList.add('show');
+    }
+    function collectMistakes() {
+      const list = [];
+      document.querySelectorAll('#mistakeInputs input[data-kind]').forEach((el) => {
+        const n = Number(el.value);
+        if (Number.isInteger(n) && n > 0) list.push({ kind: el.dataset.kind, count: n });
+      });
+      return list;
+    }
+    function submitComplete() {
+      const mistakes = collectMistakes();
+      closeModal('mistakeModal');
+      complete(mistakeWithNext, mistakes);
+    }
+    // 件数を入れたらボタンの文言を変える (押し間違い防止)
+    document.addEventListener('input', (e) => {
+      if (!e.target.matches('#mistakeInputs input')) return;
+      const btn = document.querySelector('#mistakeModal .primary');
+      if (btn) btn.textContent = collectMistakes().length > 0 ? 'ミスを記録して完了' : 'ミスなしで完了';
+    });
 
     // ─── モーダル ───
     const REASON_BOX = { pause: 'pauseReasons', trouble: 'troubleReasons', reprint: 'reprintReasons', correct: 'correctReasons' };

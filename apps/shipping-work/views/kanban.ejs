@@ -43,7 +43,9 @@
   <div class="sw-toolbar">
     <span class="date">作業日: <%= workDate %></span>
     <span>バッチ <%= totalCount %> 件</span>
-    <a href="/apps/shipping-work/picking">📦 ピッキング画面</a>
+    <a href="/apps/shipping-work/picking">📦 ピッキング</a>
+    <a href="/apps/shipping-work/sorting">🗂 仕分け</a>
+    <a href="/apps/shipping-work/packing">📮 梱包</a>
     <% if (isAdmin) { %>
       <a href="/apps/shipping-work/admin/batches">バッチ管理</a>
     <% } %>
