@@ -157,7 +157,7 @@ export function setDraftShopCategories(db, draftId, ids) {
  *
  * @param {Array<{id, path, is_active?, selected?}>} categories listShopCategoriesForDraft の行
  * @param {{name?: string, genrePath?: string}} source 採点の材料
- * @returns {Array<{id, path, score}>} スコア降順 (score > 0 のみ)、最大 max 件
+ * @returns {Array<{id, path, score, leafExact}>} スコア降順 (score > 0 のみ)、最大 max 件
  */
 export function suggestShopCategories(categories, { name = '', genrePath = '' } = {}, { max = 5 } = {}) {
   const hay = `${genrePath} ${name}`.toLowerCase();
@@ -169,10 +169,15 @@ export function suggestShopCategories(categories, { name = '', genrePath = '' } 
     if (c.is_active === 0 && !c.selected) continue; // 一覧から外れたカテゴリは提案しない
     const segs = String(c.path).split(/\s*>\s*/).map((s) => s.trim()).filter(Boolean);
     let score = 0;
+    let leafExact = false;   // 末端 (実際に商品が載る棚) 自体が言い当てられたか
     segs.forEach((seg, i) => {
       const isLeaf = i === segs.length - 1;
       const s = seg.toLowerCase();
-      if (hay.includes(s)) { score += isLeaf ? 4 : 2; return; }
+      if (hay.includes(s)) {
+        score += isLeaf ? 4 : 2;
+        if (isLeaf) leafExact = true;
+        return;
+      }
       const words = splitWords(s);
       if (words.length === 0) return;
       const hit = words.filter((w) => hay.includes(w)).length;
@@ -181,11 +186,41 @@ export function suggestShopCategories(categories, { name = '', genrePath = '' } 
       const headHit = words.filter((w) => hayHeads.has(w.slice(0, 2))).length;
       if (headHit > 0) score += (isLeaf ? 1 : 0.5) * (headHit / words.length);
     });
-    if (score > 0) scored.push({ id: c.id, path: c.path, score: Math.round(score * 100) / 100 });
+    if (score > 0) scored.push({ id: c.id, path: c.path, score: Math.round(score * 100) / 100, leafExact });
   }
   scored.sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path), 'ja'));
   return scored.slice(0, max);
 }
 
-/** 自動適用してよい提案か (1位が「末端の完全一致以上」の確度)。曖昧なら人に選ばせる */
+/** 自動適用の最低スコア (末端完全一致 = 4 相当) */
 export const SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE = 4;
+
+/**
+ * 人の確認なしに 1 位を保存してよいか (Codex R1 high 対応)。
+ * スコア合計だけで判定すると「親セグメントだけ一致」(例: `日用品 > 洗濯用品 > 無関係A` に対して
+ * ジャンルが `… > 日用品 > 洗濯用品`) で 2+2=4 に達し、同点の兄弟から辞書順で無関係な棚が
+ * 自動保存されてしまう。そのため **末端そのものの完全一致** と **単独1位** を必須にする。
+ */
+export function canAutoApplyShopCategory(candidates) {
+  const top = (candidates || [])[0];
+  if (!top || !top.leafExact || top.score < SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE) return false;
+  // 同スコアの対抗馬がいる = どちらの棚か決められない → 人に選ばせる
+  if (candidates.length > 1 && candidates[1].score >= top.score) return false;
+  return true;
+}
+
+/**
+ * ドラフトに紐付けてよいカテゴリ id の件数 (有効なもの + そのドラフトが既に選択中のもの)。
+ * 画面・提案の対象 (listShopCategoriesForDraft) と検証条件を揃える (Codex R1 medium)。
+ */
+export function countSelectableShopCategories(db, draftId, ids) {
+  if (!ids || ids.length === 0) return 0;
+  const ph = ids.map(() => '?').join(',');
+  return db.prepare(`
+    SELECT COUNT(*) AS c FROM ph_shop_categories c
+    WHERE c.id IN (${ph})
+      AND (c.is_active = 1
+           OR EXISTS (SELECT 1 FROM draft_shop_categories s
+                      WHERE s.shop_category_id = c.id AND s.draft_id = ?))
+  `).get(...ids, draftId).c;
+}
