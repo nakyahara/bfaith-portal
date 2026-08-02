@@ -112,18 +112,22 @@ eq(realertIntervalMs('P1'), 6 * H, 'P1の再通知は6時間');
 eq(realertIntervalMs('P2'), 24 * H, 'P2の再通知は24時間');
 
 // ── digest ──
-const dAllOk = buildDigest([{ id: 'a', importance: 'P1', status: 'ok', detail: '' }], [], '2026-08-01T00:00:00Z');
+const dAllOk = buildDigest([{ id: 'a', importance: 'P1', status: 'ok', detail: '' }], [], jst(2026, 8, 1, 8, 50));
 ok(/✅ すべて正常/.test(dAllOk), '全部okなら1行サマリ');
 const dMix = buildDigest([
   { id: 'a', importance: 'P1', status: 'late', detail: '3日止まってる', runbook: 'logsを見る' },
   { id: 'b', importance: 'P2', status: 'due_soon', detail: 'あと3日', runbook: '再認可する' },
   { id: 'c', importance: 'TMP', status: 'remove_due', detail: '期限切れ', runbook: '消す' },
-], ['mystery-job'], '2026-08-01T00:00:00Z');
+], ['mystery-job'], jst(2026, 8, 1, 8, 50));
 ok(/🔴 \*a\*/.test(dMix), 'lateは🔴で出る');
 ok(/🟡 \*b\*/.test(dMix), 'due_soonは🟡で出る');
 ok(/🟠 \*c\*/.test(dMix), 'remove_dueは🟠で出る');
 ok(/mystery-job/.test(dMix), '未登録pingを警告する');
 ok(dMix.indexOf('🔴') < dMix.indexOf('🟠') && dMix.indexOf('🟠') < dMix.indexOf('🟡'), '深刻な順に並ぶ');
+// 見出しの日付はJST暦日。配信時刻の 08:50 JST は UTC では前日 23:50 なので、
+// UTC由来の日付を使うと毎朝ちょうど1日前が出てしまう (2026-08-02 に実際に発覚)
+ok(/\(2026-08-02\)/.test(buildDigest([], [], jst(2026, 8, 2, 8, 50))), '見出しは配信時点のJST暦日 (08:50でも当日)');
+ok(/\(2026-08-01\)/.test(buildDigest([], [], jst(2026, 8, 1, 0, 5))), '見出しはJST深夜0:05でも当日');
 
 // ── ユーティリティ ──
 eq(fmtAge(3 * D + 5 * H), '3日', '3日+5時間→3日');

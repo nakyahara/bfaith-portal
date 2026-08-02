@@ -141,11 +141,16 @@ export function realertIntervalMs(importance) {
 /**
  * 毎朝の「要対応」サマリ本文を組み立てる。
  * アクションが必要なものだけを並べ、無ければ1行で終わる (読み手ファースト)。
+ *
+ * 見出しの日付は必ず JST 暦日。呼び出し側に日付文字列を作らせない
+ * (ISO文字列を受け取る形にしていたため、配信時刻 08:50 JST = 前日 23:50 UTC で
+ *  毎朝ちょうど1日前の日付が出ていた。2026-08-02 に修正)。
+ * @param nowMs 現在時刻 (UTCミリ秒)
  */
-export function buildDigest(results, unknownIds = [], nowIso = '') {
+export function buildDigest(results, unknownIds = [], nowMs = Date.now()) {
   const attention = results.filter((r) => r.status !== 'ok');
   const lines = [];
-  lines.push(`*🩺 定期実行 今日の要対応* (${nowIso.slice(0, 10)})`);
+  lines.push(`*🩺 定期実行 今日の要対応* (${todayJst(nowMs)})`);
   lines.push('');
 
   if (!attention.length && !unknownIds.length) {
