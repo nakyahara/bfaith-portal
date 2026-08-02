@@ -224,15 +224,16 @@
   // ─── 楽天から直接同期 (Category API 2.0。通常はこちら) ───
   const catSyncBtn = document.getElementById('cat-sync-btn');
   if (catSyncBtn) {
-    async function postCatSync(force) {
+    async function postCatSync(force, expectedSnapshot) {
       const res = await fetch('/apps/product-hub/api/shop-categories/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // refresh はチェックが入っているときだけ (既定は miniPC の 24h キャッシュを使う)。
-        // force 再送では取り直さない = 確認した内容がそのまま入る
+        // 承認 (force) では取り直さず、確認した内容の指紋を送って一致したときだけ適用させる
         body: JSON.stringify({
           force: force === true,
           refresh: force !== true && document.getElementById('cat-sync-refresh')?.checked === true,
+          expectedSnapshot: expectedSnapshot || undefined,
         }),
       });
       return res.json();
@@ -243,10 +244,11 @@
       catSyncBtn.disabled = true;
       out.textContent = '楽天から取得中…';
       try {
-        let json = await postCatSync(false);
+        let json = await postCatSync(false, null);
         if (!json.ok && json.error === 'too_few') {
           if (!confirm((json.message || '件数が大きく減ります') + '\n\nそれでも置き換えますか?')) { out.textContent = ''; return; }
-          json = await postCatSync(true);
+          // 確認したのと同じ内容にだけ適用させる (指紋が変わっていればサーバーが 409 で止める)
+          json = await postCatSync(true, json.expectedSnapshot);
         }
         if (!json.ok) { out.textContent = ''; alert(json.message || json.error || '取り込みに失敗しました'); return; }
         out.textContent = '取り込み ' + json.imported + ' 件'

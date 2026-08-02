@@ -1590,6 +1590,18 @@ check('カテゴリツリー展開: 件数上限を超えたら truncated (部�
 check('カテゴリツリー展開: 正常データでは truncated=false・skipped 空',
   flat.truncated === false && flat.skipped.length === 0);
 
+// 承認 (too_few → force) を「確認した内容」に固定する指紋 (Codex R2 high)
+const { shopCategorySnapshotHash } = await import('../lib/shop-categories.js');
+const snapA = shopCategorySnapshotHash(flat.rows);
+check('同期スナップショット: 同じ内容なら同じ指紋', snapA === shopCategorySnapshotHash(flat.rows.slice()));
+check('同期スナップショット: 1件減ると変わる (部分取得のすり替えを検知)',
+  snapA !== shopCategorySnapshotHash(flat.rows.slice(0, flat.rows.length - 1)));
+check('同期スナップショット: 件数が同じでも中身が違えば変わる',
+  snapA !== shopCategorySnapshotHash(flat.rows.map((r, i) => (i === 0 ? { ...r, categoryId: '99999' } : r))));
+check('同期スナップショット: 先頭に件数が入る (人が読める形)',
+  snapA.startsWith(String(flat.rows.length) + '-'), snapA);
+check('同期スナップショット: 空配列でも落ちない', typeof shopCategorySnapshotHash([]) === 'string');
+
 check('カテゴリツリー展開: 同一パスの重複は1件だけ採用し duplicates で報告',
   (() => {
     const d = flattenCategoryTrees([{ rootNode: { children: [

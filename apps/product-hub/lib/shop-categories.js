@@ -96,6 +96,25 @@ export function countActiveShopCategories(db) {
 export const MAX_CATEGORY_TREE_DEPTH = 20;   // 実測は最大5階層。再帰暴走の backstop
 
 /**
+ * 取り込む内容そのものの指紋 (Codex R2 high)。
+ * 激減ガード (too_few) は「人が件数を見て承認 → 再送」の2段階なので、その間に
+ * 取得内容が変わると「確認したものと違うデータで全置き換え」が起きる
+ * (miniPC 再起動やキャッシュ失効で再取得が走るため)。承認時にこの指紋を突き合わせる。
+ */
+export function shopCategorySnapshotHash(rows) {
+  const body = (rows || []).map((r) => `${r.categoryId}\t${r.pathKey}`).join('\n');
+  // 依存を増やさない範囲の非暗号ハッシュ (FNV-1a 32bit × 2 で衝突耐性を上げる)
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < body.length; i++) {
+    const c = body.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 + c, 0x85ebca6b) >>> 0;
+  }
+  return `${rows.length}-${h1.toString(16)}${h2.toString(16)}`;
+}
+
+/**
  * Category API 2.0 のツリー応答 → replaceShopCategories に渡せる行 (2026-08-02)。
  *
  * 応答形 (実測): { rootNode: { children: [ { category: {categoryId, title}, children: [...] } ] } }

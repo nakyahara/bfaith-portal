@@ -38,7 +38,7 @@ import {
 import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
-  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES, flattenCategoryTrees,
+  sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES, flattenCategoryTrees, shopCategorySnapshotHash,
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
   shopCategoriesNeverSaved, isAutoApplyRequestValid,
 } from './lib/shop-categories.js';
@@ -797,10 +797,20 @@ router.post('/api/shop-categories/sync', async (req, res) => {
   if (rows.length === 0) {
     return res.status(502).json({ ok: false, error: '楽天から店舗内カテゴリを1件も取得できませんでした' });
   }
-  const r = replaceShopCategories(getDB(), rows, { force: req.body?.force === true });
+  // 承認 (force) は「人が件数を見て確認した、その内容」にだけ効かせる (Codex R2 high)。
+  // 確認と再送の間に再取得が走って内容が変わっていたら適用せず、やり直してもらう
+  const snapshot = shopCategorySnapshotHash(rows);
+  const isApproval = req.body?.force === true;
+  if (isApproval && req.body?.expectedSnapshot !== snapshot) {
+    return res.status(409).json({
+      ok: false, error: 'changed',
+      message: '確認したあとに楽天側の内容が変わりました。取り込みからやり直してください',
+    });
+  }
+  const r = replaceShopCategories(getDB(), rows, { force: isApproval });
   if (r.error === 'too_few') {
     return res.status(400).json({
-      ok: false, error: 'too_few', active: r.active, incoming: r.incoming,
+      ok: false, error: 'too_few', active: r.active, incoming: r.incoming, expectedSnapshot: snapshot,
       message: `取得した件数 (${r.incoming}件) が現在の一覧 (${r.active}件) の半分未満です。楽天側でカテゴリを整理したのでなければ、取得が不完全な可能性があります`,
     });
   }
