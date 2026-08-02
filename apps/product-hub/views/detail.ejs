@@ -423,6 +423,24 @@
       <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
     </div>
 
+    <!-- 出品時に自動追加される店舗共通バナー (R-Cabinet 既存画像。転送・取込は不要) -->
+    <div class="field" style="margin-top:14px;">
+      <label>出品時に末尾へ自動追加されるバナー <span class="ftag ftag-auto">自動</span></label>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <% for (const b of trailingBanners) { %>
+          <div style="text-align:center; width:110px;">
+            <img src="<%= b.url %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                 style="width:100%; aspect-ratio:1; object-fit:contain; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
+            <div class="muted" style="font-size:11px;"><%= b.label %></div>
+          </div>
+        <% } %>
+      </div>
+      <div class="muted" style="font-size:11px; margin-top:4px;">
+        配送方法 (定形外 / ネコポス / ゆうパケットパフ) に応じたバナー + 共通3枚が楽天登録時に商品画像の後ろへ自動で付きます。
+        商品画像は自動追加分と合わせて20枚までです (商品画像は実質<%= 20 - trailingBanners.length %>枚まで)
+      </div>
+    </div>
+
     <div class="field" style="margin-top:14px;">
       <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
       <div style="display:flex; gap:8px; align-items:center;">
