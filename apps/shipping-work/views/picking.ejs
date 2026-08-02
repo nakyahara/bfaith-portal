@@ -167,7 +167,7 @@
           <div class="row1">
             <span class="no"><%= r.batch.shipping_no_label || r.batch.shipping_no %></span>
             <span class="time">
-              <%= r.session.ended_at.slice(11, 16) %> 完了<% if (r.workSec != null) { %>
+              <%= r.endedAtJst %> 完了<% if (r.workSec != null) { %>
                 ／ <%= Math.floor(r.workSec / 60) %>分<%= String(r.workSec % 60).padStart(2, '0') %>秒<% } %>
             </span>
           </div>

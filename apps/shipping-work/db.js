@@ -255,10 +255,16 @@ const MIGRATIONS = {
     addColumn('sw_sessions', 'continues_session_id',
       'continues_session_id INTEGER REFERENCES sw_sessions(id)');
     // 計測として採用してよいかの判定。作業者の訂正では自動で無効にせず review_required に留め、
-    // 無効判定は管理者が理由付きで行う (判断も追記で残す)
+    // 無効判定は管理者が理由付きで行う。
+    // ⭐「作業者がなぜ訂正したか (correction_*)」と「管理者がどう判定したか (validity_*)」は
+    // 別の列に分ける。同じ列を使い回すと、管理者が判定した時点で作業者の訂正理由が消え、
+    // 「訂正と判断を追記で残す」という設計が崩れる (Codexレビュー medium)
     addColumn('sw_sessions', 'validity',
       `validity TEXT NOT NULL DEFAULT 'valid' CHECK(validity IN ('valid','invalid','review_required'))`);
-    addColumn('sw_sessions', 'validity_reason', 'validity_reason TEXT');
+    addColumn('sw_sessions', 'correction_reason', 'correction_reason TEXT');  // 作業者が訂正した理由
+    addColumn('sw_sessions', 'corrected_by', 'corrected_by TEXT');
+    addColumn('sw_sessions', 'corrected_at', 'corrected_at TEXT');
+    addColumn('sw_sessions', 'validity_reason', 'validity_reason TEXT');      // 管理者の判定理由
     addColumn('sw_sessions', 'validity_by', 'validity_by TEXT');
     addColumn('sw_sessions', 'validity_at', 'validity_at TEXT');
     // 再印刷の理由。要件§13「印刷起因の作業中断が全バッチの1%を超えたら二段階確認を再検討」の

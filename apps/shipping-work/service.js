@@ -45,8 +45,10 @@ const SETTING_TOO_LONG_KEY = 'anomaly_too_long_minutes';
 // 「完了後に別の業務イベントが起きていないこと」の方 (canCorrectCompletion を参照)。
 const DEFAULT_CORRECT_WINDOW_MIN = 5;
 const SETTING_CORRECT_WINDOW_KEY = 'completion_correct_window_minutes';
-// 作業者画面に出す「最近完了した作業」の件数
-const RECENT_COMPLETED_LIMIT = 5;
+// 作業者画面に出す「本日完了した作業」の件数。
+// 「印刷を忘れた」の救済が目的なので、少なすぎると当日分が画面から消えて意味が薄れる。
+// 1人あたり1日十数バッチ (851バッチ/月・10名) なので当日分は全部載る想定
+const RECENT_COMPLETED_LIMIT = 30;
 
 /** 自由記述の上限。現場のメモ用途にこれ以上は不要で、DB肥大とログ汚染を防ぐ。 */
 const NOTE_MAX = 500;
@@ -553,30 +555,54 @@ function canCorrectCompletion(db, flow, session, batch, nowUtc) {
 }
 
 /**
- * 本日の完了済みセッション (新しい順)。各行に帳票と訂正可否を添える。
+ * 本日完了した作業 (新しい順)。各行に帳票と訂正可否を添える。
  * 完了すると画面から消えてしまう問題への対処なので、進行中の作業があっても返す。
+ *
+ * ⭐バッチ単位にまとめる。訂正して再完了すると同じバッチに完了セッションが2つ並び、
+ * セッション単位だと同じ出荷Noが2行出て、どちらを押せばよいか作業者に判別できない。
+ * 代表は最新の完了セッション、作業時間は合算 (元 + 継続) を出す。
  */
 export function listRecentCompleted(process, worker, limit = RECENT_COMPLETED_LIMIT) {
   const flow = getFlow(process);
   const db = getDB();
   const now = utcNow();
   const jstStartUtc = new Date(`${jstToday()}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
+  // バッチごとに最新の完了セッションを1件だけ拾う
   const rows = db.prepare(`
-    SELECT * FROM sw_sessions
-    WHERE worker = ? AND process = ? AND outcome = 'completed' AND ended_at >= ?
-    ORDER BY ended_at DESC LIMIT ?
+    SELECT * FROM sw_sessions s
+    WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
+      AND s.id = (SELECT s2.id FROM sw_sessions s2
+                  WHERE s2.batch_id = s.batch_id AND s2.process = s.process
+                    AND s2.worker = s.worker AND s2.outcome = 'completed'
+                  ORDER BY s2.ended_at DESC, s2.id DESC LIMIT 1)
+    ORDER BY s.ended_at DESC LIMIT ?
   `).all(worker, process, jstStartUtc, limit);
   return rows.map((s) => {
     const batch = getBatchWithLabels(db, s.batch_id);
     const can = canCorrectCompletion(db, flow, s, batch, now);
+    // 訂正して続きをやった場合は、元と継続の実作業時間を合算して見せる
+    const total = db.prepare(`
+      SELECT COALESCE(SUM(active_sec), 0) AS sec FROM sw_sessions
+      WHERE batch_id = ? AND process = ? AND worker = ? AND outcome = 'completed'
+    `).get(s.batch_id, s.process, worker);
     return {
       session: s,
       batch,
-      workSec: s.active_sec,
+      workSec: total.sec,
+      endedAtJst: toJstHm(s.ended_at),
       canCorrect: can.ok,
       correctBlockedReason: can.ok ? null : can.reason,
     };
   });
+}
+
+/** UTC 'YYYY-MM-DDTHH:MM:SSZ' を JST の 'HH:MM' にする (画面表示用)。 */
+function toJstHm(utc) {
+  if (!utc) return '';
+  const d = new Date(utc);
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(d);
 }
 
 /**
@@ -598,6 +624,11 @@ export function requestReprint(process, sessionId, worker, reason, note, opId) {
     },
     () => {
       const s = getOwnSession(db, process, sessionId, worker);
+      // 完了後の再印刷に限る。作業中は「印刷トラブル」ボタンが別にあり、
+      // ここを開けると reprint_reason の集計が「完了後の再印刷件数」を表さなくなる
+      if (s.outcome !== 'completed') {
+        throw new SwError(409, '完了した作業の帳票のみ出し直せます', 'not_completed');
+      }
       const batch = getBatch(s.batch_id);
       if (!batchHasDocument(batch)) {
         throw new SwError(409, '帳票が設定されていません。管理者に依頼してください', 'no_document');
@@ -640,11 +671,14 @@ export function correctCompletion(process, sessionId, worker, reason, note, opId
       if (!can.ok) throw new SwError(409, can.reason, 'cannot_correct');
 
       const detail = label + (noteTrim ? `: ${noteTrim}` : '');
-      // 元セッションは書き換えない。計測として採用してよいかは管理者が判断する
+      // 元セッションの計測 (時刻・active_sec・outcome) は書き換えない。
+      // 採用してよいかは管理者が判断するので review_required に留め、
+      // 作業者の訂正理由は correction_* に、管理者の判定は validity_* に分けて残す
       db.prepare(`
-        UPDATE sw_sessions SET validity = 'review_required', validity_reason = ?, validity_by = ?, validity_at = ?
+        UPDATE sw_sessions
+        SET validity = 'review_required', correction_reason = ?, corrected_by = ?, corrected_at = ?
         WHERE id = ?
-      `).run(`完了を訂正 (${detail})`, worker, now, s.id);
+      `).run(detail, worker, now, s.id);
 
       // 既に別の作業を始めていたら、そちらは止めずにこのバッチを保留として積む
       const busy = db.prepare(
