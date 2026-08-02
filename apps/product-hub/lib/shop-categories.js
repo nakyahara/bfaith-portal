@@ -210,6 +210,17 @@ export function canAutoApplyShopCategory(candidates) {
 }
 
 /**
+ * AI 自動適用の書き込みリクエストが「今の候補」と一致しているか (Codex R3 high)。
+ * 候補取得 (GET) の後にジャンルが変わると候補も変わるため、保存の直前にも
+ * 現在の材料で計算し直した候補と突き合わせる。ズレていたら書かない
+ * (書いてしまうと保存イベントが立ち、新しいジャンルでの再提案まで塞いでしまう)。
+ */
+export function isAutoApplyRequestValid(candidates, ids) {
+  if (!canAutoApplyShopCategory(candidates)) return false;
+  return Array.isArray(ids) && ids.length === 1 && ids[0] === candidates[0].id;
+}
+
+/**
  * そのドラフトで店舗内カテゴリが一度も保存されていないか (0 件保存も「保存済み」)。
  * AI 自動適用の可否判定。**書き込みトランザクションの中でも再確認する** (Codex R2 high):
  * GET で autoApply を返した後に人が「全部外して保存」すると、遅れて届いた AI の

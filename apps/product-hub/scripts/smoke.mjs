@@ -125,6 +125,19 @@ check('自動適用する: 末端完全一致で単独1位',
     { id: 2, path: '生活雑貨・日用品 > キッチン用品', score: 2, leafExact: false },
   ]) === true);
 check('自動適用しない: 候補ゼロ', canAutoApplyShopCategory([]) === false && canAutoApplyShopCategory(null) === false);
+
+// 保存直前の再検証 (Codex R3 high: GET後にジャンルが変わって候補が入れ替わったケース)
+const { isAutoApplyRequestValid } = await import('../lib/shop-categories.js');
+const FRESH = [
+  { id: 7, path: '生活雑貨・日用品 > 洗濯用品', score: 6, leafExact: true },
+  { id: 8, path: 'コスメ・美容 > アロマオイル', score: 2, leafExact: false },
+];
+check('自動適用の再検証: 現在の1位と一致すれば通す', isAutoApplyRequestValid(FRESH, [7]) === true);
+check('自動適用の再検証: 別カテゴリ (古い候補) は弾く', isAutoApplyRequestValid(FRESH, [8]) === false);
+check('自動適用の再検証: 複数IDや空は弾く',
+  isAutoApplyRequestValid(FRESH, [7, 8]) === false && isAutoApplyRequestValid(FRESH, []) === false);
+check('自動適用の再検証: 現在は自動適用不可なら弾く',
+  isAutoApplyRequestValid([{ id: 7, path: 'x', score: 6, leafExact: false }], [7]) === false);
 check('leafExact フラグが立つのは末端完全一致のときだけ',
   suggestShopCategories(CATS, { name: 'アロマオイル ラベンダー 10ml' })[0].leafExact === true
   && parentOnly.every((c) => c.leafExact === false), JSON.stringify(parentOnly));
