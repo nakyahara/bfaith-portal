@@ -14,10 +14,10 @@ import crypto from 'crypto';
 
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
-  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced,
+  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
-import { parseDriveLink, thumbnailUrl, fileViewUrl } from './lib/drive-link.js';
+import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
@@ -27,6 +27,7 @@ import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState,
+  getDriveThumbnail,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -444,6 +445,32 @@ router.post('/api/drafts/:id/images/:imageId/delete', (req, res) => {
   // 最後の画像を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
   res.json({ ok: true, demoted: demoted || undefined });
+});
+
+// 画像サムネイルプロキシ: Drive のサムネイルを SA 経由で取得してアプリから返す。
+// drive.google.com/thumbnail 直リンクはブラウザの Google セッション頼みで、
+// サードパーティ Cookie ブロックや authuser 不一致 (複数アカウント) で 403 になるため。
+router.get('/api/thumb/:fileId', async (req, res) => {
+  const fileId = String(req.params.fileId || '');
+  if (!DRIVE_FILE_ID_PATTERN.test(fileId)) return res.status(400).json({ ok: false, error: 'invalid file id' });
+  // product-hub に画像として登録済みの ID だけ取得を許す
+  // (SA は Drive を広く読めるため、無制限だと任意 ID を覗ける confused-deputy になる)
+  if (!isKnownImageFileId(getDB(), fileId)) return res.status(404).json({ ok: false, error: 'unknown image' });
+  const w = Number.parseInt(String(req.query.w || ''), 10);
+  const width = THUMB_WIDTHS.includes(w) ? w : 320;
+  try {
+    const { buf } = await getDriveThumbnail(fileId, width);
+    res.set('Content-Type', 'image/jpeg'); // sharp 再エンコード済み (service 側で固定)
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cache-Control', 'private, max-age=86400');
+    res.send(buf);
+  } catch (e) {
+    // 詳細はログのみ。<img> は壊れ表示のままにする (SA 権限なしはフォルダ取込時に別途エラーが出る)
+    const upstream = e?.code || e?.response?.status;
+    const status = upstream === 404 ? 404 : upstream === 403 ? 403 : 502;
+    console.error(`[product-hub] thumb proxy failed (${status}):`, fileId, String(e?.message || e).slice(0, 300));
+    res.status(status).json({ ok: false, error: 'thumbnail unavailable' });
+  }
 });
 
 // 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_番号」ファイルをスロットへ自動セット。

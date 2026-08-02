@@ -9,9 +9,10 @@
  *   https://drive.google.com/drive/u/0/folders/<ID>     → { type: 'folder', id }
  *   生の ID (25文字以上の [-\w]) をそのまま貼った場合    → { type: 'unknown', id }
  *
- * サムネイルは閲覧者の Google セッションで解決される軽量 endpoint を使う
- * (サービスアカウント不要。社内ユーザーは Drive 権限を既に持っている前提):
- *   https://drive.google.com/thumbnail?id=<ID>&sz=w320
+ * サムネイルはアプリ内プロキシ (/apps/product-hub/api/thumb/:fileId) を指す。
+ * かつての drive.google.com/thumbnail 直リンクは「閲覧者の Google セッション」を
+ * サードパーティ Cookie として送れる前提で、Cookie ブロックや複数アカウント
+ * (authuser 不一致) 環境で 403 になり表示できなかった (2026-08 プロキシ化)。
  */
 
 const FILE_PATTERNS = [
@@ -38,9 +39,16 @@ export function parseDriveLink(input) {
   return null;
 }
 
+// プロキシが生成するサムネイル幅の allowlist (一覧=160 / 詳細=320)。
+// キャッシュキーが際限なく増えないよう、これ以外の指定は 320 に丸める
+export const THUMB_WIDTHS = [160, 320];
+
+// router の /api/thumb/:fileId が受け付ける ID 形式 (parseDriveLink と同じ文字種)
+export const DRIVE_FILE_ID_PATTERN = /^[-\w]{10,200}$/;
+
 export function thumbnailUrl(fileId, width = 320) {
-  const w = Number.isFinite(width) && width > 0 ? Math.floor(width) : 320;
-  return `https://drive.google.com/thumbnail?id=${encodeURIComponent(fileId)}&sz=w${w}`;
+  const w = THUMB_WIDTHS.includes(width) ? width : 320;
+  return `/apps/product-hub/api/thumb/${encodeURIComponent(fileId)}?w=${w}`;
 }
 
 export function fileViewUrl(fileId) {

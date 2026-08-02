@@ -672,6 +672,20 @@ export function demoteIfGateBroken(db, draftId, actor) {
 }
 
 /**
+ * サムネイルプロキシ (/api/thumb) の取得対象を「product-hub が管理している画像」に限定する。
+ * SA は Drive の広い範囲を読めるため、形式チェックだけだと任意の Drive ID を
+ * SA 権限で覗ける confused-deputy になる (Codex R1 high)。
+ */
+export function isKnownImageFileId(db, fileId) {
+  if (!fileId) return false;
+  return !!db.prepare(`
+    SELECT 1 FROM draft_images WHERE drive_file_id = ?
+    UNION SELECT 1 FROM draft_rakuten WHERE white_bg_drive_file_id = ?
+    LIMIT 1
+  `).get(fileId, fileId);
+}
+
+/**
  * 画像フォルダ一括取り込みの結果 (assignImageSlots の戻り値) を DB に反映する。
  *   - slots があるときだけ draft_images を全置き換え (sort = スロット番号 - 1)。
  *     白抜きだけ見つかった場合は既存の商品画像を触らない

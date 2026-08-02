@@ -124,6 +124,168 @@ export async function listDriveFolderImages(folderId) {
   return files;
 }
 
+// ─── サムネイル取得 (アプリ内プロキシ /api/thumb 用) ───
+// drive.google.com/thumbnail 直リンクは「閲覧者の Google セッション」をサードパーティ
+// Cookie として送れる前提で、Cookie ブロックや複数アカウント (authuser 不一致) で 403 になる。
+// SA で Drive の thumbnailLink (トークン付き短命URL・Cookie不要) を取り、その画像バイトを
+// アプリから返す。thumbnailLink が取れない場合だけ原本DL+縮小にフォールバック。
+
+const THUMB_CACHE_MAX = 300;
+const THUMB_CACHE_MAX_BYTES = 30 * 1024 * 1024; // 件数と総バイトの両方で上限 (Codex R1 medium)
+const THUMB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const THUMB_SOURCE_MAX_BYTES = 40 * 1024 * 1024; // これを超える取得元は商品画像ではないとみなす
+const thumbCache = new Map(); // `${fileId}:${width}` → { buf, at } (Map 挿入順 = LRU)
+let thumbCacheBytes = 0;
+const thumbInflight = new Map(); // 同一キーの同時リクエストは 1 回の Drive アクセスに束ねる
+
+// 異なる画像への同時リクエストも束ねる (詳細画面は最大21枚を一斉に要求してくる。
+// 原本DLフォールバック時のメモリ/帯域スパイクを抑える。Codex R1 medium)
+const THUMB_MAX_CONCURRENCY = 4;
+let thumbActive = 0;
+const thumbWaiters = [];
+async function withThumbSlot(fn) {
+  if (thumbActive >= THUMB_MAX_CONCURRENCY) await new Promise((resolve) => thumbWaiters.push(resolve));
+  thumbActive++;
+  try {
+    return await fn();
+  } finally {
+    thumbActive--;
+    thumbWaiters.shift()?.();
+  }
+}
+
+function thumbCacheSet(key, entry) {
+  const old = thumbCache.get(key);
+  if (old) {
+    thumbCacheBytes -= old.buf.length;
+    thumbCache.delete(key);
+  }
+  thumbCache.set(key, entry);
+  thumbCacheBytes += entry.buf.length;
+  while (thumbCache.size > THUMB_CACHE_MAX || thumbCacheBytes > THUMB_CACHE_MAX_BYTES) {
+    const oldest = thumbCache.keys().next().value;
+    thumbCacheBytes -= thumbCache.get(oldest).buf.length;
+    thumbCache.delete(oldest);
+  }
+}
+
+/** thumbnailLink 末尾の =s220 をリクエスト幅に差し替える (pure・smoke対象) */
+export function sizedThumbnailLink(link, width) {
+  return /=s\d+$/.test(link) ? link.replace(/=s\d+$/, `=w${width}`) : link;
+}
+
+/** SSRF 防御: thumbnailLink は https の googleusercontent.com 配下のみ許可 (pure・smoke対象) */
+export function isAllowedThumbnailHost(link) {
+  try {
+    const u = new URL(link);
+    return u.protocol === 'https:'
+      && (u.hostname === 'googleusercontent.com' || u.hostname.endsWith('.googleusercontent.com'));
+  } catch (_) {
+    return false;
+  }
+}
+
+export async function getDriveThumbnail(fileId, width) {
+  const key = `${fileId}:${width}`;
+  const hit = thumbCache.get(key);
+  if (hit) {
+    if (Date.now() - hit.at <= THUMB_CACHE_TTL_MS) {
+      thumbCache.delete(key);
+      thumbCache.set(key, hit); // LRU 更新
+      return hit;
+    }
+    thumbCacheBytes -= hit.buf.length;
+    thumbCache.delete(key);
+  }
+  if (thumbInflight.has(key)) return thumbInflight.get(key);
+  const p = withThumbSlot(() => fetchDriveThumbnail(fileId, width))
+    .then((entry) => {
+      thumbCacheSet(key, entry);
+      return entry;
+    })
+    .finally(() => thumbInflight.delete(key));
+  thumbInflight.set(key, p);
+  return p;
+}
+
+/** fetch Response の body を上限付きで読む。超過したら中断して throw (全量バッファ後の検査にしない) */
+async function readBodyLimited(res, maxBytes) {
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error('サムネイル取得元のレスポンスが大きすぎます');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Drive 原本を stream で上限付きダウンロード (超過時は途中で破棄) */
+async function downloadDriveImageLimited(fileId, maxBytes) {
+  const drive = getDriveClient();
+  const res = await drive.files.get(
+    { fileId, alt: 'media', supportsAllDrives: true },
+    { responseType: 'stream' },
+  );
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    res.data.on('data', (c) => {
+      total += c.length;
+      if (total > maxBytes) {
+        res.data.destroy(new Error('サムネイル生成対象の画像が大きすぎます'));
+        return;
+      }
+      chunks.push(c);
+    });
+    res.data.on('error', reject);
+    res.data.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
+async function fetchDriveThumbnail(fileId, width) {
+  const drive = getDriveClient();
+  const meta = await drive.files.get({ fileId, fields: 'thumbnailLink', supportsAllDrives: true });
+  const link = meta.data.thumbnailLink; // 例: https://lh3.googleusercontent.com/...=s220
+  let raw = null;
+  if (link && isAllowedThumbnailHost(link)) {
+    try {
+      // redirect: 'error' = 許可ホスト検証をリダイレクトで迂回させない (失敗したら原本DLへ)
+      const res = await fetch(sizedThumbnailLink(link, width), {
+        redirect: 'error',
+        signal: AbortSignal.timeout(30_000),
+      });
+      const declared = Number(res.headers.get('content-length'));
+      if (res.ok
+        && (res.headers.get('content-type') || '').startsWith('image/')
+        && !(Number.isFinite(declared) && declared > THUMB_SOURCE_MAX_BYTES)) {
+        raw = await readBodyLimited(res, THUMB_SOURCE_MAX_BYTES);
+      } else {
+        // 拒否したレスポンスの転送を続けさせない (タイムアウトまで接続を保持しないよう明示中断)
+        await res.body?.cancel();
+      }
+    } catch (_) {
+      raw = null; // フォールバックへ
+    }
+  }
+  if (!raw) {
+    raw = await downloadDriveImageLimited(fileId, THUMB_SOURCE_MAX_BYTES);
+  }
+  // 取得元に関わらず sharp で再エンコード = 「本当に画像である」ことの検証 +
+  // 出力を width 上限の JPEG に固定 (Content-Type 偽装をアプリ起点で配らない。Codex R1 medium)
+  const buf = await sharp(raw).rotate()
+    .resize({ width, height: width, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  return { buf, at: Date.now() };
+}
+
 /**
  * R-Cabinet 制約 (JPEG / 2MB / 3840px) に収める。
  * RYS image-uploader と同じ「品質を段階的に落とす」方式。

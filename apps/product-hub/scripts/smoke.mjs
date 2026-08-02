@@ -31,7 +31,9 @@ check('parse folders/', parseDriveLink('https://drive.google.com/drive/folders/0
 check('parse u/0/folders', parseDriveLink('https://drive.google.com/drive/u/0/folders/0AMb_oOR8-Ss1Uk9PVA')?.type === 'folder');
 check('parse raw id', parseDriveLink('1AbC_dEf-1234567890123456789')?.type === 'unknown');
 check('parse garbage', parseDriveLink('https://example.com/x') === null);
-check('thumbnail url', thumbnailUrl('abc', 160).includes('sz=w160'));
+check('thumbnail url = アプリ内プロキシ', thumbnailUrl('abc-123', 160) === '/apps/product-hub/api/thumb/abc-123?w=160');
+check('thumbnail url allowlist外の幅→320', thumbnailUrl('abc-123', 999).endsWith('?w=320'));
+check('thumbnail url 幅未指定→320', thumbnailUrl('abc-123').endsWith('?w=320'));
 
 // ─── folder-import (画像フォルダ→スロット割当、2026-08-01) ───
 const { assignImageSlots, parseNumberedName, MAX_IMAGE_SLOTS } = await import('../lib/folder-import.js');
@@ -820,6 +822,15 @@ db.prepare(`DELETE FROM mirror_products WHERE product_id BETWEEN 50000 AND ${500
 // ─── 楽天出品 (P3): payload builder / 属性パース (RMS 非接続) ───
 const listing = await import('../services/rakuten-listing.js');
 
+// ─── サムネイルプロキシの pure ヘルパー (Codex R1: SSRF/リンク差し替え) ───
+check('sizedThumbnailLink: =s220 → =w320', listing.sizedThumbnailLink('https://lh3.googleusercontent.com/abc=s220', 320) === 'https://lh3.googleusercontent.com/abc=w320');
+check('sizedThumbnailLink: サフィックス無しはそのまま', listing.sizedThumbnailLink('https://lh3.googleusercontent.com/abc', 320) === 'https://lh3.googleusercontent.com/abc');
+check('isAllowedThumbnailHost: lh3.googleusercontent.com OK', listing.isAllowedThumbnailHost('https://lh3.googleusercontent.com/abc=s220'));
+check('isAllowedThumbnailHost: http は拒否', !listing.isAllowedThumbnailHost('http://lh3.googleusercontent.com/abc'));
+check('isAllowedThumbnailHost: 他ホストは拒否', !listing.isAllowedThumbnailHost('https://evil.example.com/abc'));
+check('isAllowedThumbnailHost: サフィックス偽装は拒否', !listing.isAllowedThumbnailHost('https://evilgoogleusercontent.com/abc'));
+check('isAllowedThumbnailHost: 不正URLは拒否', !listing.isAllowedThumbnailHost('not a url'));
+
 check('parseAttributes: [{name,values}] を受ける',
   JSON.stringify(listing.parseAttributes('[{"name":"ブランド名","values":["ノーブランド"]}]'))
   === '[{"name":"ブランド名","values":["ノーブランド"]}]');
@@ -885,6 +896,21 @@ check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
   JSON.stringify(bLen.reasons));
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
+
+// ─── サムネイルプロキシの取得対象ガード (Codex R1 high: confused-deputy 防止) ───
+const { isKnownImageFileId } = await import('../db.js');
+db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'thumb-known-test')`).run(rkId);
+const wbRowBefore = db.prepare('SELECT white_bg_drive_file_id AS v FROM draft_rakuten WHERE draft_id = ?').get(rkId);
+db.prepare(`INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id) VALUES (?, 'thumb-wb-test')
+  ON CONFLICT(draft_id) DO UPDATE SET white_bg_drive_file_id = 'thumb-wb-test'`).run(rkId);
+check('isKnownImageFileId: draft_images 登録済み → true', isKnownImageFileId(db, 'thumb-known-test'));
+check('isKnownImageFileId: 白抜き背景 (draft_rakuten) → true', isKnownImageFileId(db, 'thumb-wb-test'));
+check('isKnownImageFileId: 未登録IDは false', !isKnownImageFileId(db, 'not-registered-file-id'));
+check('isKnownImageFileId: 空は false', !isKnownImageFileId(db, ''));
+// フィクスチャを元の状態へ (後続の白抜き/payload テストの前提を変えない)
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'thumb-known-test'`).run(rkId);
+if (wbRowBefore === undefined) db.prepare('DELETE FROM draft_rakuten WHERE draft_id = ?').run(rkId);
+else db.prepare('UPDATE draft_rakuten SET white_bg_drive_file_id = ? WHERE draft_id = ?').run(wbRowBefore.v, rkId);
 db.prepare(`UPDATE draft_ai_outputs SET content = '特徴文' WHERE draft_id = ? AND kind = 'desc_features'`).run(rkId);
 
 // 販売説明文単独の境界 (Codex R2 Low): ちょうど10240字は販売ガードにかからず、+1字でかかる
