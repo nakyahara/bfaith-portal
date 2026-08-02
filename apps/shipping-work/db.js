@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -240,6 +240,36 @@ const MIGRATIONS = {
         db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
       }
     },
+  },
+  // v7: 誤操作からの復帰 (作業者の救済) のための列。
+  // 要件v2「例外は人が処理し、システムは記録する」の後半 = 人が処理する手段が無かったため、
+  // 完了後に何も直せない状態だった。過去の計測は書き換えず、訂正と継続を追記して扱う。
+  7: () => {
+    // 版数チェックが主の防御だが、ALTER TABLE ADD COLUMN は再実行すると必ず失敗するので、
+    // 列の有無を見てから足す (どこから再実行されても同じ結果になる)
+    const addColumn = (table, column, ddl) => {
+      if (!hasColumn(table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    };
+    // 完了を訂正して作業に戻ったとき、続きの時間は新しいセッションに記録し、元と紐付ける。
+    // 元セッションの時刻は消さない (集計では両方を合算する)
+    addColumn('sw_sessions', 'continues_session_id',
+      'continues_session_id INTEGER REFERENCES sw_sessions(id)');
+    // 計測として採用してよいかの判定。作業者の訂正では自動で無効にせず review_required に留め、
+    // 無効判定は管理者が理由付きで行う。
+    // ⭐「作業者がなぜ訂正したか (correction_*)」と「管理者がどう判定したか (validity_*)」は
+    // 別の列に分ける。同じ列を使い回すと、管理者が判定した時点で作業者の訂正理由が消え、
+    // 「訂正と判断を追記で残す」という設計が崩れる (Codexレビュー medium)
+    addColumn('sw_sessions', 'validity',
+      `validity TEXT NOT NULL DEFAULT 'valid' CHECK(validity IN ('valid','invalid','review_required'))`);
+    addColumn('sw_sessions', 'correction_reason', 'correction_reason TEXT');  // 作業者が訂正した理由
+    addColumn('sw_sessions', 'corrected_by', 'corrected_by TEXT');
+    addColumn('sw_sessions', 'corrected_at', 'corrected_at TEXT');
+    addColumn('sw_sessions', 'validity_reason', 'validity_reason TEXT');      // 管理者の判定理由
+    addColumn('sw_sessions', 'validity_by', 'validity_by TEXT');
+    addColumn('sw_sessions', 'validity_at', 'validity_at TEXT');
+    // 再印刷の理由。要件§13「印刷起因の作業中断が全バッチの1%を超えたら二段階確認を再検討」の
+    // 判断材料になるため、件数と理由を数えられるようにする
+    addColumn('sw_print_jobs', 'reprint_reason', 'reprint_reason TEXT');
   },
 };
 
@@ -484,6 +514,18 @@ function seedMasters() {
     ['jam', '紙詰まり'], ['no_output', '出てこない'],
     ['wrong_doc', '帳票違い'], ['other', 'その他'],
   ].forEach(([code, label], i) => rows.push(['print_trouble_reason', code, label, i + 1]));
+
+  // 完了後に帳票をもう一度出す理由 (作業中の「印刷トラブル」とは別。作業はやり直さない)
+  [
+    ['forgot', '印刷し忘れた'], ['not_printed', '紙が出ていなかった'],
+    ['damaged', '汚れた・破れた'], ['other', 'その他'],
+  ].forEach(([code, label], i) => rows.push(['reprint_reason', code, label, i + 1]));
+
+  // 完了を訂正する理由 (押し間違い・作業が残っていた等)
+  [
+    ['misclick', '完了ボタンを押し間違えた'], ['work_remained', '作業がまだ残っていた'],
+    ['doc_unchecked', '帳票を確認できていなかった'], ['other', 'その他'],
+  ].forEach(([code, label], i) => rows.push(['correction_reason', code, label, i + 1]));
 
   // コード定義を初期マスタの正本とし、label/sort はデプロイごとに追従させる。
   // active は運用での停止設定を守るため上書きしない (Codex PR1レビュー#9)

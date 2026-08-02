@@ -12,6 +12,7 @@
 import crypto from 'node:crypto';
 import {
   getDB, utcNow, jstToday, getBatch, addStatusEvent, isValidMaster, batchHasDocument,
+  listMasters as listMastersRaw,
 } from './db.js';
 
 /** 業務エラー。router が status を HTTP ステータスに変換する。 */
@@ -39,6 +40,15 @@ const TOO_SHORT_SEC = 60;
 const EARLY_PAUSE_SEC = 60;
 const DEFAULT_TOO_LONG_MIN = 120;
 const SETTING_TOO_LONG_KEY = 'anomaly_too_long_minutes';
+
+// 完了を訂正できる猶予 (分)。時間はあくまで利便性の境界で、安全性の本体は
+// 「完了後に別の業務イベントが起きていないこと」の方 (canCorrectCompletion を参照)。
+const DEFAULT_CORRECT_WINDOW_MIN = 5;
+const SETTING_CORRECT_WINDOW_KEY = 'completion_correct_window_minutes';
+// 作業者画面に出す「本日完了した作業」の件数。
+// 「印刷を忘れた」の救済が目的なので、少なすぎると当日分が画面から消えて意味が薄れる。
+// 1人あたり1日十数バッチ (851バッチ/月・10名) なので当日分は全部載る想定
+const RECENT_COMPLETED_LIMIT = 30;
 
 /** 自由記述の上限。現場のメモ用途にこれ以上は不要で、DB肥大とログ汚染を防ぐ。 */
 const NOTE_MAX = 500;
@@ -507,6 +517,202 @@ function closedPauseSec(db, sessionId) {
   return Math.round(closed.reduce((a, p) => a + secondsBetween(p.paused_at, p.resumed_at), 0));
 }
 
+// ─── 完了後の救済 (要件v2 §2「例外は人が処理し、システムは記録する」の人側) ───
+//
+// 完了したら画面から消えて何も直せない、という状態が現場の詰みを生んでいたため、
+// 「最近完了した作業」を残し、そこから ①帳票をもう一度出す ②完了を訂正する ができるようにする。
+// どちらも過去の計測時刻は書き換えない。訂正は元セッションを completed のまま残し、
+// 続きの時間は継続セッションに記録して集計で合算する。
+
+/**
+ * その完了セッションを本人が訂正できるか。
+ * 時間の猶予より「完了後に別の業務イベントが起きていないこと」が本体
+ * (後続工程が始まっていたら、戻すと二重処理になるため管理者へ回す)。
+ */
+function canCorrectCompletion(db, flow, session, batch, nowUtc) {
+  if (session.outcome !== 'completed') return { ok: false, reason: 'このセッションは完了していません' };
+  if (session.continues_session_id) {
+    // 継続セッションまで訂正できると際限がないので、2回目以降は管理者へ
+    return { ok: false, reason: '訂正後の作業です。もう一度直す場合は管理者に依頼してください' };
+  }
+  const already = db.prepare(
+    'SELECT 1 FROM sw_sessions WHERE continues_session_id = ? LIMIT 1'
+  ).get(session.id);
+  if (already) return { ok: false, reason: 'この作業は既に訂正済みです' };
+  if (batch.status !== flow.to) {
+    return { ok: false, reason: '後の工程が進んでいるため訂正できません。管理者に依頼してください' };
+  }
+  // 後続工程 (仕分け・梱包) が一度でも始まっていたら戻さない
+  const later = db.prepare(
+    "SELECT 1 FROM sw_sessions WHERE batch_id = ? AND process != ? LIMIT 1"
+  ).get(session.batch_id, session.process);
+  if (later) return { ok: false, reason: '後の工程が始まっているため訂正できません。管理者に依頼してください' };
+  const windowMin = getSettingInt(SETTING_CORRECT_WINDOW_KEY, DEFAULT_CORRECT_WINDOW_MIN);
+  if (secondsBetween(session.ended_at, nowUtc) > windowMin * 60) {
+    return { ok: false, reason: `完了から${windowMin}分を過ぎたため訂正できません。管理者に依頼してください` };
+  }
+  return { ok: true };
+}
+
+/**
+ * 本日完了した作業 (新しい順)。各行に帳票と訂正可否を添える。
+ * 完了すると画面から消えてしまう問題への対処なので、進行中の作業があっても返す。
+ *
+ * ⭐バッチ単位にまとめる。訂正して再完了すると同じバッチに完了セッションが2つ並び、
+ * セッション単位だと同じ出荷Noが2行出て、どちらを押せばよいか作業者に判別できない。
+ * 代表は最新の完了セッション、作業時間は合算 (元 + 継続) を出す。
+ */
+export function listRecentCompleted(process, worker, limit = RECENT_COMPLETED_LIMIT) {
+  const flow = getFlow(process);
+  const db = getDB();
+  const now = utcNow();
+  const jstStartUtc = new Date(`${jstToday()}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
+  // バッチごとに最新の完了セッションを1件だけ拾う
+  const rows = db.prepare(`
+    SELECT * FROM sw_sessions s
+    WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
+      AND s.id = (SELECT s2.id FROM sw_sessions s2
+                  WHERE s2.batch_id = s.batch_id AND s2.process = s.process
+                    AND s2.worker = s.worker AND s2.outcome = 'completed'
+                  ORDER BY s2.ended_at DESC, s2.id DESC LIMIT 1)
+    ORDER BY s.ended_at DESC LIMIT ?
+  `).all(worker, process, jstStartUtc, limit);
+  return rows.map((s) => {
+    const batch = getBatchWithLabels(db, s.batch_id);
+    const can = canCorrectCompletion(db, flow, s, batch, now);
+    // 訂正して続きをやった場合は、元と継続の実作業時間を合算して見せる
+    const total = db.prepare(`
+      SELECT COALESCE(SUM(active_sec), 0) AS sec FROM sw_sessions
+      WHERE batch_id = ? AND process = ? AND worker = ? AND outcome = 'completed'
+    `).get(s.batch_id, s.process, worker);
+    return {
+      session: s,
+      batch,
+      workSec: total.sec,
+      endedAtJst: toJstHm(s.ended_at),
+      canCorrect: can.ok,
+      correctBlockedReason: can.ok ? null : can.reason,
+    };
+  });
+}
+
+/** UTC 'YYYY-MM-DDTHH:MM:SSZ' を JST の 'HH:MM' にする (画面表示用)。 */
+function toJstHm(utc) {
+  if (!utc) return '';
+  const d = new Date(utc);
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(d);
+}
+
+/**
+ * 完了後に帳票をもう一度出す。ステータスも計測も一切触らず、印刷ジョブを追記するだけ。
+ * 「作業は終わったが紙だけ出ていない」を「作業もできていない」と混同しないため、訂正とは別操作にする。
+ */
+export function requestReprint(process, sessionId, worker, reason, note, opId) {
+  getFlow(process);
+  validateOpId(opId);
+  const noteTrim = normalizeNote(note);
+  if (!isValidMaster('reprint_reason', reason)) throw new SwError(400, '再印刷の理由が不正です');
+  const label = masterLabel('reprint_reason', reason);
+  if (label === 'その他' && !noteTrim) throw new SwError(400, '「その他」を選んだ場合は内容の記入が必須です');
+  const db = getDB();
+  return runIdempotent(
+    {
+      opId, worker, operation: `reprint:${process}`, targetKind: 'session', targetId: sessionId,
+      params: { reason, note: noteTrim },
+    },
+    () => {
+      const s = getOwnSession(db, process, sessionId, worker);
+      // 完了後の再印刷に限る。作業中は「印刷トラブル」ボタンが別にあり、
+      // ここを開けると reprint_reason の集計が「完了後の再印刷件数」を表さなくなる
+      if (s.outcome !== 'completed') {
+        throw new SwError(409, '完了した作業の帳票のみ出し直せます', 'not_completed');
+      }
+      const batch = getBatch(s.batch_id);
+      if (!batchHasDocument(batch)) {
+        throw new SwError(409, '帳票が設定されていません。管理者に依頼してください', 'no_document');
+      }
+      const now = utcNow();
+      const info = db.prepare(`
+        INSERT INTO sw_print_jobs
+          (batch_id, session_id, doc_type, pdf_path, doc_url, reprint_reason, requested_by, requested_at)
+        VALUES (?, ?, 'picking_list', ?, ?, ?, ?, ?)
+      `).run(s.batch_id, s.id, batch.pdf_path, batch.doc_url,
+        label + (noteTrim ? `: ${noteTrim}` : ''), worker, now);
+      return { print_job_id: Number(info.lastInsertRowid), batch_id: s.batch_id };
+    }
+  );
+}
+
+/**
+ * 完了の訂正 (要件v2 §2 の「例外ボタン」)。押し間違い・作業が残っていた場合に作業へ戻す。
+ * 元セッションは completed のまま残し、続きは継続セッションに記録する。
+ * 既に別の作業中なら、そちらを止めずに保留として積む (一人一作業の原則を壊さない)。
+ */
+export function correctCompletion(process, sessionId, worker, reason, note, opId) {
+  const flow = getFlow(process);
+  validateOpId(opId);
+  const noteTrim = normalizeNote(note);
+  if (!isValidMaster('correction_reason', reason)) throw new SwError(400, '訂正理由が不正です');
+  const label = masterLabel('correction_reason', reason);
+  if (label === 'その他' && !noteTrim) throw new SwError(400, '「その他」を選んだ場合は内容の記入が必須です');
+  const db = getDB();
+  return runIdempotent(
+    {
+      opId, worker, operation: `correct:${process}`, targetKind: 'session', targetId: sessionId,
+      params: { reason, note: noteTrim },
+    },
+    () => {
+      const s = getOwnSession(db, process, sessionId, worker);
+      const batch = getBatch(s.batch_id);
+      const now = utcNow();
+      const can = canCorrectCompletion(db, flow, s, batch, now);
+      if (!can.ok) throw new SwError(409, can.reason, 'cannot_correct');
+
+      const detail = label + (noteTrim ? `: ${noteTrim}` : '');
+      // 元セッションの計測 (時刻・active_sec・outcome) は書き換えない。
+      // 採用してよいかは管理者が判断するので review_required に留め、
+      // 作業者の訂正理由は correction_* に、管理者の判定は validity_* に分けて残す
+      db.prepare(`
+        UPDATE sw_sessions
+        SET validity = 'review_required', correction_reason = ?, corrected_by = ?, corrected_at = ?
+        WHERE id = ?
+      `).run(detail, worker, now, s.id);
+
+      // 既に別の作業を始めていたら、そちらは止めずにこのバッチを保留として積む
+      const busy = db.prepare(
+        "SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0"
+      ).get(worker);
+      const toStatus = busy ? 'hold' : flow.active;
+      const info = db.prepare(`
+        INSERT INTO sw_sessions (batch_id, process, worker, requested_at, op_id, paused, continues_session_id, flags_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '["correction"]')
+      `).run(s.batch_id, process, worker, now, opId, busy ? 1 : 0, s.id);
+      const newSessionId = Number(info.lastInsertRowid);
+      if (busy) {
+        // 保留として積む = 既存の「保留中の作業」から再開できる形にする
+        db.prepare('INSERT INTO sw_pauses (session_id, reason, reason_note, paused_at) VALUES (?, ?, ?, ?)')
+          .run(newSessionId, correctionPauseReason(flow), `完了を訂正: ${detail}`, now);
+        db.prepare("UPDATE sw_batches SET status = 'hold', hold_from_status = ?, updated_at = ? WHERE id = ?")
+          .run(flow.active, now, s.batch_id);
+      } else {
+        db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ?')
+          .run(flow.active, now, s.batch_id);
+      }
+      addStatusEvent(s.batch_id, flow.to, toStatus, worker, 'button', `完了を訂正 (${detail})`);
+      return { session_id: newSessionId, batch_id: s.batch_id, held: !!busy };
+    }
+  );
+}
+
+/** 訂正で積む保留に使う理由コード (「管理者確認待ち」相当を選ぶ)。 */
+function correctionPauseReason(flow) {
+  const rows = listMastersRaw(flow.pauseReasonKind);
+  const hit = rows.find((r) => r.label === '管理者確認待ち') || rows[0];
+  return hit ? hit.code : 'pk1';
+}
+
 /**
  * 作業者画面の状態。
  *   session — 進行中 (paused=0) のセッション。なければ null で ready 一覧を出す
@@ -519,10 +725,18 @@ export function getWorkerState(process, worker) {
   const today = jstToday();
   // JST 今日 00:00 を UTC に変換して本日実績の下限にする
   const jstStartUtc = new Date(`${today}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
+  // バッチ単位で数える。完了を訂正して作業に戻り再度完了すると、同じバッチに
+  // 完了セッションが2つ (元 + 継続) 並ぶため、セッション数で数えると二重に計上される
   const stats = db.prepare(`
-    SELECT COUNT(*) AS batches, COALESCE(SUM(b.slip_count), 0) AS slips
-    FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
-    WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
+    SELECT COUNT(*) AS batches, COALESCE(SUM(slip_count), 0) AS slips FROM (
+      SELECT b.id, b.slip_count
+      FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
+      WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
+        -- 完了を訂正して作業に戻したものは、終わるまで実績に数えない
+        AND NOT EXISTS (SELECT 1 FROM sw_sessions o
+          WHERE o.batch_id = b.id AND o.process = s.process AND o.outcome = 'open')
+      GROUP BY b.id
+    )
   `).get(worker, process, jstStartUtc);
 
   // 保留中の自分の作業 (再開ボタンを常に出すため、進行中の有無に関わらず返す)
@@ -549,7 +763,10 @@ export function getWorkerState(process, worker) {
     const noBatchesAtAll = ready.length === 0 && !db.prepare(
       "SELECT 1 FROM sw_batches WHERE work_date <= ? AND status != 'cancelled' LIMIT 1"
     ).get(today);
-    return { session: null, batch: null, pauseSec: 0, paused, ready, stats, noBatchesAtAll };
+    return {
+      session: null, batch: null, pauseSec: 0, paused, ready, stats, noBatchesAtAll,
+      recentCompleted: listRecentCompleted(process, worker),
+    };
   }
   return {
     session: s,
@@ -559,5 +776,7 @@ export function getWorkerState(process, worker) {
     ready: [],
     stats,
     noBatchesAtAll: false,
+    // 作業中でも直前の完了は見えるようにする (完了直後に「印刷し忘れた」と気づけるように)
+    recentCompleted: listRecentCompleted(process, worker),
   };
 }

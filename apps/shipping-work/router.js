@@ -23,7 +23,7 @@ import {
 } from './db.js';
 import {
   SwError, startProcess, completeProcess, pauseProcess, resumeProcess, troubleProcess,
-  startNextReady, getWorkerState,
+  startNextReady, getWorkerState, requestReprint, correctCompletion,
 } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -92,6 +92,8 @@ router.get('/picking', (req, res) => {
     today: jstToday(),
     pauseReasons: listMasters('pause_reason_pick'),
     troubleReasons: listMasters('print_trouble_reason'),
+    reprintReasons: listMasters('reprint_reason'),
+    correctionReasons: listMasters('correction_reason'),
   });
 });
 
@@ -154,6 +156,20 @@ router.post('/api/picking/resume', api((req) => {
   return { ok: true, already: r.already };
 }));
 
+// 完了後に帳票をもう一度出す (ステータスも計測も触らない。印刷ジョブを追記するだけ)
+router.post('/api/picking/reprint', api((req) => {
+  const r = requestReprint('picking', sessionId(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
+  return { ok: true, already: r.already, batch_id: r.batch_id };
+}));
+
+// 完了の訂正 (押し間違い・作業が残っていた)。元の計測は残し、続きは継続セッションに記録する
+router.post('/api/picking/correct', api((req) => {
+  const r = correctCompletion('picking', sessionId(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
+  return { ok: true, already: r.already, session_id: r.session_id, held: r.held };
+}));
+
 // 印刷トラブル (reprint=再印刷して開始し直す / abort=中止して ready へ戻す)
 router.post('/api/picking/trouble', api((req) => {
   const r = troubleProcess('picking', sessionId(req.body?.session_id), req.session.email,
@@ -163,8 +179,16 @@ router.post('/api/picking/trouble', api((req) => {
 
 // ─── ヘルスチェック (デプロイ確認用) ───
 router.get('/api/health', (req, res) => {
-  const masters = getDB().prepare('SELECT COUNT(*) AS c FROM sw_masters').get();
-  res.json({ ok: true, masters: masters.c, statuses: BATCH_STATUSES.length });
+  const db = getDB();
+  const masters = db.prepare('SELECT COUNT(*) AS c FROM sw_masters').get();
+  // schema = 適用済みのDB版数。migration を含むデプロイの前後で、
+  // 「本番がどの版か」を外から確かめられるようにしておく (版を跨ぐ判断に必要)
+  res.json({
+    ok: true,
+    schema: db.pragma('user_version', { simple: true }),
+    masters: masters.c,
+    statuses: BATCH_STATUSES.length,
+  });
 });
 
 // ═══ 管理者: バッチ管理 (PR2) ═══
