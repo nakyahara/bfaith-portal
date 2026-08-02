@@ -705,10 +705,11 @@ export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
     return { ok: false, error: msg, ...extra };
   };
 
+  // 枠 (slot) 順 = RMS の「表示先カテゴリ 1〜5」の並び。枠1 がメインページになる
   const rows = db.prepare(`
     SELECT c.category_id, c.path FROM draft_shop_categories s
     JOIN ph_shop_categories c ON c.id = s.shop_category_id
-    WHERE s.draft_id = ? ORDER BY c.sort_order, c.id
+    WHERE s.draft_id = ? ORDER BY s.slot, c.id
   `).all(draftId);
   if (rows.length === 0) {
     return fail('店舗内カテゴリが選択されていません (「カテゴリ・属性」タブで選んでください)');
@@ -767,7 +768,7 @@ export function shopCategorySyncState(db, draftId, rakuten) {
   const ids = db.prepare(`
     SELECT c.category_id FROM draft_shop_categories s
     JOIN ph_shop_categories c ON c.id = s.shop_category_id
-    WHERE s.draft_id = ? ORDER BY c.sort_order, c.id
+    WHERE s.draft_id = ? ORDER BY s.slot, c.id
   `).all(draftId).map((r) => (r.category_id == null ? '' : String(r.category_id).trim()));
   if (ids.length === 0) return 'none';
   const currentKey = ids.join(',');

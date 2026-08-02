@@ -164,6 +164,17 @@ check('draft inserted', draft && draft.status === 'draft' && draft.notion_card_s
 let reasons = dbmod.gateReasons(db, draft);
 check('gate blocks (no url/image)', reasons.length === 2, JSON.stringify(reasons));
 
+// AI の参照元は「公式URL / 参考URL / Amazon URL のどれか1つ」でよい (2026-08-02 中原さん)
+db.prepare(`UPDATE product_drafts SET amazon_url = 'https://www.amazon.co.jp/dp/B0TEST' WHERE id = ?`).run(draft.id);
+reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
+check('gate: 公式URLが無くても Amazon URL があれば参照元は満たす',
+  !reasons.some((r) => r.includes('URL')), JSON.stringify(reasons));
+db.prepare(`UPDATE product_drafts SET amazon_url = NULL WHERE id = ?`).run(draft.id);
+db.prepare(`INSERT INTO draft_reference_urls (draft_id, url) VALUES (?, 'https://example.com/ref')`).run(draft.id);
+reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
+check('gate: 参考URLだけでも参照元は満たす', !reasons.some((r) => r.includes('URL')), JSON.stringify(reasons));
+db.prepare(`DELETE FROM draft_reference_urls WHERE draft_id = ?`).run(draft.id);
+
 db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item' WHERE id = ?`).run(draft.id);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'fileid_1234567890')`).run(draft.id);
 reasons = dbmod.gateReasons(db, db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draft.id));
@@ -1529,6 +1540,20 @@ check('店舗内カテゴリ: 無効な棚への新規紐付けは弾く', count
 check('店舗内カテゴリ: 無効でも既に選択中なら維持できる',
   countSelectableShopCategories(db, fdraft.id, [scInactiveSel]) === 1);
 check('店舗内カテゴリ: 空配列は 0', countSelectableShopCategories(db, fdraft.id, []) === 0);
+
+// 枠 (slot) の保存と順序 (2026-08-02: RMSの「表示先カテゴリ1〜5」対応)
+const { setDraftShopCategories: setCats, selectedShopCategoriesInOrder, MAX_DRAFT_SHOP_CATEGORIES: MAXC }
+  = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: 上限はRMSと同じ5枠', MAXC === 5);
+setCats(db, fdraft.id, [scInactiveSel, scActive]);   // わざと sort_order と逆順で保存
+const inOrder = selectedShopCategoriesInOrder(db, fdraft.id);
+check('店舗内カテゴリ: 配列順がそのまま枠番になる (マスタの並び順に引きずられない)',
+  inOrder.length === 2 && inOrder[0].id === scInactiveSel && inOrder[0].slot === 1
+  && inOrder[1].id === scActive && inOrder[1].slot === 2, JSON.stringify(inOrder));
+const { sanitizeShopCategoryIds: sanitize6 } = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: 6件は sanitize で too_many (5枠上限)',
+  sanitize6([1, 2, 3, 4, 5, 6]).error === 'too_many');
+setCats(db, fdraft.id, []);
 
 // Category API 2.0 のツリー展開 (2026-08-02 実測形。miniPC /shop-categories/tree の trees)
 const { flattenCategoryTrees } = await import('../lib/shop-categories.js');

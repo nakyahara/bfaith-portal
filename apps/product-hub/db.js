@@ -261,6 +261,9 @@ export function initProductHubDB() {
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
+      -- RMS の「表示先カテゴリ 1〜5」に対応する枠番 (2026-08-02)。
+      -- 順序に意味がある: 枠1 = item-mappings の mainPluralCategoryId (メインページ)
+      slot             INTEGER NOT NULL DEFAULT 1,
       created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (draft_id, shop_category_id)
     );
@@ -355,6 +358,22 @@ export function initProductHubDB() {
   }
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
+  }
+
+  // 店舗内カテゴリの枠番 (2026-08-02、RMS「表示先カテゴリ 1〜5」対応)。既存行は 1 から順に振る
+  const dscCols = new Set(db.prepare('PRAGMA table_info(draft_shop_categories)').all().map((c) => c.name));
+  if (!dscCols.has('slot')) {
+    db.exec('ALTER TABLE draft_shop_categories ADD COLUMN slot INTEGER NOT NULL DEFAULT 1');
+    // 既存の選択はマスタの並び順を枠順とみなす (それ以外に順序の手がかりが無い)
+    db.exec(`
+      UPDATE draft_shop_categories AS d SET slot = (
+        SELECT COUNT(*) FROM draft_shop_categories x
+        JOIN ph_shop_categories cx ON cx.id = x.shop_category_id
+        JOIN ph_shop_categories cd ON cd.id = d.shop_category_id
+        WHERE x.draft_id = d.draft_id
+          AND (cx.sort_order < cd.sort_order OR (cx.sort_order = cd.sort_order AND cx.id <= cd.id))
+      )
+    `);
   }
 
   // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER
@@ -516,7 +535,15 @@ export function gateReasons(db, draft) {
   const reasons = [];
   if (!draft.name || !String(draft.name).trim()) reasons.push('商品名が未入力です');
   if (!draft.ne_code || !String(draft.ne_code).trim()) reasons.push('NE商品コードが未入力です');
-  if (!draft.official_url || !String(draft.official_url).trim()) reasons.push('公式ページURLが未入力です');
+  // AI が説明文を書くための「材料」が1つでもあれば通す (中原さん 2026-08-02)。
+  // 公式ページが無い商品でも、参考URL や Amazon の販売ページがあれば書ける
+  const has = (v) => !!(v && String(v).trim());
+  if (!has(draft.official_url) && !has(draft.amazon_url)) {
+    const refCount = db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(draft.id).c;
+    if (refCount === 0) {
+      reasons.push('AIが参照できるURLがありません (公式ページURL / 参考URL / Amazon URL のどれか1つ)');
+    }
+  }
   const imgCount = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(draft.id).c;
   if (imgCount === 0) reasons.push('商品画像 (Driveリンク) が1枚もありません');
   return reasons;

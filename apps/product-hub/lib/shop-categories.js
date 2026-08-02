@@ -8,7 +8,8 @@
  */
 
 export const MAX_SHOP_CATEGORY_LINES = 1000;
-export const MAX_DRAFT_SHOP_CATEGORIES = 30;
+// RMS の商品編集画面「表示先カテゴリ」は 1〜5 の 5 枠 (2026-08-02 中原さんのスクショで確認)
+export const MAX_DRAFT_SHOP_CATEGORIES = 5;
 const MAX_PATH_LEN = 300;
 
 // 階層区切りは「>」(全角＞も可)。前後の空白を落として ' > ' に正規化する
@@ -196,7 +197,8 @@ export function sanitizeShopCategoryIds(input, max = MAX_DRAFT_SHOP_CATEGORIES) 
 export function listShopCategoriesForDraft(db, draftId) {
   return db.prepare(`
     SELECT c.id, c.category_id, c.path, c.is_active,
-           CASE WHEN s.draft_id IS NULL THEN 0 ELSE 1 END AS selected
+           CASE WHEN s.draft_id IS NULL THEN 0 ELSE 1 END AS selected,
+           s.slot AS slot
     FROM ph_shop_categories c
     LEFT JOIN draft_shop_categories s ON s.shop_category_id = c.id AND s.draft_id = ?
     WHERE c.is_active = 1 OR s.draft_id IS NOT NULL
@@ -204,20 +206,29 @@ export function listShopCategoriesForDraft(db, draftId) {
   `).all(draftId);
 }
 
-export function selectedShopCategoryPaths(db, draftId) {
+/** 選択中の棚を枠 (slot) 順に返す。枠1 = RMS のメインページ設定 */
+export function selectedShopCategoriesInOrder(db, draftId) {
   return db.prepare(`
-    SELECT c.path FROM draft_shop_categories s
+    SELECT c.id, c.category_id, c.path, s.slot
+    FROM draft_shop_categories s
     JOIN ph_shop_categories c ON c.id = s.shop_category_id
     WHERE s.draft_id = ?
-    ORDER BY c.sort_order, c.id
-  `).all(draftId).map((r) => r.path);
+    ORDER BY s.slot, c.id
+  `).all(draftId);
 }
 
-/** ドラフトの選択を丸ごと入れ替える (呼び出し側で存在チェック済みの id 配列)。 */
+export function selectedShopCategoryPaths(db, draftId) {
+  return selectedShopCategoriesInOrder(db, draftId).map((r) => r.path);
+}
+
+/**
+ * ドラフトの選択を丸ごと入れ替える (呼び出し側で存在チェック済みの id 配列)。
+ * **配列の順序がそのまま枠番 (slot) になる** — 先頭が RMS のメインページ設定。
+ */
 export function setDraftShopCategories(db, draftId, ids) {
   db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(draftId);
-  const ins = db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)');
-  for (const id of ids) ins.run(draftId, id);
+  const ins = db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id, slot) VALUES (?, ?, ?)');
+  ids.forEach((id, i) => ins.run(draftId, id, i + 1));
 }
 
 /**

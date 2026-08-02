@@ -85,7 +85,8 @@
     ).length;
   %>
   <div class="tabbar" id="tabbar"
-       data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>">
+       data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>"
+       data-ref-count="<%= refs.length %>">
     <!-- 並び順 = 入力の流れ (中原さん指定 2026-08-01): 基本情報 → 商品情報 → カテゴリ → 説明 → 画像 → 出品 -->
     <button type="button" class="tab-btn" data-tab="tab-basic">✏️ 基本情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-info">📄 商品情報<span class="tab-badge" hidden></span></button>
@@ -113,7 +114,7 @@
         <input type="text" id="f-name" value="<%= draft.name %>">
       </div>
       <div class="field">
-        <label class="req">公式ページURL (AI生成の参照元)<span class="ftag ftag-m">手入力</span></label>
+        <label>公式ページURL <span class="muted">(AI生成の参照元。無ければ参考URL / Amazon URL でも可)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="url" id="f-official-url" value="<%= draft.official_url || '' %>" placeholder="https://...">
       </div>
       <div class="field" style="display:flex; gap:12px;">
@@ -716,7 +717,7 @@
     </div>
 
     <div class="field">
-      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
+      <label>店舗内カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
       <% if (shopCategories.length === 0) { %>
         <p class="muted" style="margin:4px 0;">
           カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
@@ -724,10 +725,17 @@
       <% } else { %>
         <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
         <div id="rk-cats-suggest" style="font-size:12px; margin-bottom:4px;"></div>
-        <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
-        <!-- RMS と同じくツリーで選ぶ (2026-07-28)。checkbox の class/value は保存処理と共通 -->
-        <div id="rk-cats" style="max-height:240px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;"></div>
-        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
+        <!-- RMS「表示先カテゴリ 1〜5」と同じ5枠 (2026-08-02 中原さん要望)。チェックした順に枠へ入る -->
+        <div id="rk-cat-slots" style="display:grid; gap:4px; margin-bottom:6px;"></div>
+        <!-- ツリーはアコーディオンで開閉 (常時表示だと縦に長い) -->
+        <details id="rk-cats-acc" style="border:1px solid #e2e8f0; border-radius:8px; background:#fff;">
+          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリーを開く)</summary>
+          <div style="padding:0 10px 8px;">
+            <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin:6px 0;">
+            <div id="rk-cats" style="max-height:280px; overflow:auto;"></div>
+          </div>
+        </details>
+        <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, slot: c.slot ?? null, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
       <% } %>
     </div>
 
@@ -764,7 +772,8 @@
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → アプリの公開ボタンで公開)</span></h2>
-    <% const selectedShopCats = shopCategories.filter((c) => c.selected); %>
+    <% const selectedShopCats = shopCategories.filter((c) => c.selected)
+         .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99) || a.id - b.id); // 枠順 (枠1=メイン) %>
     <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         🟢 <strong>楽天で公開中</strong>
@@ -992,7 +1001,10 @@
   function computeMissing() {
     const m = { 'tab-basic': [], 'tab-images': [], 'tab-desc': [], 'tab-info': [], 'tab-category': [], 'tab-listing': [] };
     if (!tv('f-name')) m['tab-basic'].push('商品名');
-    if (!tv('f-official-url')) m['tab-basic'].push('公式ページURL');
+    // AI の参照元は「公式ページURL / 参考URL / Amazon URL のどれか1つ」でよい (サーバーの gateReasons と対応)
+    if (!tv('f-official-url') && !tv('f-amazon-url') && Number(document.getElementById('tabbar').dataset.refCount || 0) === 0) {
+      m['tab-basic'].push('AIが参照できるURL (公式/参考/Amazon のどれか)');
+    }
     const price = Number(tv('f-price'));
     if (!Number.isFinite(price) || price <= 0) m['tab-basic'].push('売価');
     const bar = document.getElementById('tabbar');
@@ -1258,13 +1270,85 @@
   }
   // 初期値の自動入力は、店舗内カテゴリの提案関数を定義したあとで直列に実行する (initSuggestions)
 
-  // ─── 店舗内カテゴリ: パスからツリーを組んで表示 (RMS のカテゴリ選択相当) ───
+  // ─── 店舗内カテゴリ: RMS「表示先カテゴリ 1〜5」の5枠 + アコーディオンのツリー (2026-08-02) ───
+  // 枠の順序 = 保存順 = RMS の枠番。枠1 が item-mappings の mainPluralCategoryId (メインページ)。
+  // 外から使う口: getShopCatOrderedIds() = 枠順の id 配列 / setShopCatChecked(id, on) = AI適用・候補ボタン用
+  const SHOP_CAT_MAX_SLOTS = 5;
+  let getShopCatOrderedIds = () => [];
+  let setShopCatChecked = () => false;
   (function buildShopCategoryTree() {
     const dataEl = document.getElementById('rk-cats-data');
     const holder = document.getElementById('rk-cats');
     if (!dataEl || !holder) return;
     let rows = [];
     try { rows = JSON.parse(dataEl.textContent); } catch (e) { rows = []; }
+    const byId = new Map(rows.map((r) => [Number(r.id), r]));
+    // 枠順の id 配列。初期値 = 保存済みの slot 順
+    const order = rows.filter((r) => r.selected)
+      .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99) || Number(a.id) - Number(b.id))
+      .map((r) => Number(r.id));
+    getShopCatOrderedIds = () => order.slice();
+
+    const slotsEl = document.getElementById('rk-cat-slots');
+    function renderSlots() {
+      if (!slotsEl) return;
+      slotsEl.replaceChildren();
+      for (let i = 0; i < SHOP_CAT_MAX_SLOTS; i++) {
+        const id = order[i];
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:13px;';
+        const num = document.createElement('span');
+        num.textContent = String(i + 1);
+        num.style.cssText = 'width:18px; text-align:right; color:#94a3b8; font-size:12px;';
+        row.appendChild(num);
+        const boxEl = document.createElement('div');
+        if (id != null) {
+          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+          boxEl.textContent = byId.get(id)?.path || id;
+          boxEl.title = (i === 0 ? '枠1 = メインページ設定\n' : '') + (byId.get(id)?.path || '');
+          row.appendChild(boxEl);
+          if (i === 0 && order.length > 1) {
+            const mainTag = document.createElement('span');
+            mainTag.textContent = 'メイン';
+            mainTag.style.cssText = 'font-size:10px; color:#1d4ed8; background:#dbeafe; border-radius:4px; padding:1px 5px; white-space:nowrap;';
+            row.appendChild(mainTag);
+          }
+          const clear = document.createElement('button');
+          clear.type = 'button';
+          clear.className = 'btn btn-sm';
+          clear.textContent = 'クリア';
+          clear.addEventListener('click', () => setShopCatChecked(id, false));
+          row.appendChild(clear);
+        } else {
+          boxEl.style.cssText = 'flex:1; padding:6px 10px; border:1px dashed #e2e8f0; border-radius:6px; color:#cbd5e1;';
+          boxEl.textContent = '(未設定)';
+          row.appendChild(boxEl);
+        }
+        slotsEl.appendChild(row);
+      }
+    }
+
+    // チェック状態と order の唯一の更新経路 (ツリーのチェック・AI適用・候補ボタン・クリアが全部ここを通る)
+    setShopCatChecked = (id, on) => {
+      id = Number(id);
+      const cb = holder.querySelector('.rk-cat-check[value="' + id + '"]');
+      const idx = order.indexOf(id);
+      if (on) {
+        if (idx !== -1) return true; // 既に入っている
+        if (order.length >= SHOP_CAT_MAX_SLOTS) {
+          alert('店舗内カテゴリは ' + SHOP_CAT_MAX_SLOTS + ' 枠までです (RMSの「表示先カテゴリ」と同じ)。先にどれかをクリアしてください');
+          if (cb) cb.checked = false;
+          return false;
+        }
+        order.push(id);
+        if (cb) cb.checked = true;
+      } else {
+        if (idx !== -1) order.splice(idx, 1);
+        if (cb) cb.checked = false;
+      }
+      renderSlots();
+      return true;
+    };
     // path を ' > ' で割ってツリー構造にする。実在する行 (id あり) だけ checkbox
     const root = { children: new Map(), row: null, name: '' };
     for (const r of rows) {
@@ -1304,6 +1388,8 @@
         cb.value = String(node.row.id);
         cb.checked = !!node.row.selected;
         cb.style.width = 'auto';
+        // チェック操作は order 管理を通す (5枠上限・枠表示の更新)
+        cb.addEventListener('change', () => setShopCatChecked(node.row.id, cb.checked));
         label.appendChild(cb);
         label.appendChild(document.createTextNode(node.name + (node.row.inactive ? ' (現在の一覧に無いカテゴリ)' : '')));
         head.appendChild(label);
@@ -1340,6 +1426,7 @@
         el = p;
       }
     });
+    renderSlots();
   })();
 
   // ─── 店舗内カテゴリ: AI 初期候補 (2026-08-02 中原さん要望「AIが最初に設定して人が修正」) ───
@@ -1358,14 +1445,11 @@
       }
     };
     // 保存は直列化する (Codex R1 medium: 候補ボタン連打で古い選択集合が後着し逆転するのを防ぐ)。
-    // ids はチェーン実行時点の DOM から読むので、最後のクリックの状態が最後に届く
+    // ids はチェーン実行時点の枠順 (order) から読むので、最後のクリックの状態が最後に届く
     const saveChecked = (source) => {
       shopCatSaveChain = shopCatSaveChain
         .catch(() => {})
-        .then(() => post(BASE + '/shop-categories', {
-          ids: Array.from(document.querySelectorAll('.rk-cat-check:checked')).map((c) => Number(c.value)),
-          source,
-        }));
+        .then(() => post(BASE + '/shop-categories', { ids: getShopCatOrderedIds(), source }));
       return shopCatSaveChain;
     };
     try {
@@ -1381,16 +1465,14 @@
       let autoMsg = '';
       // 自動セットの可否はサーバー判定 (j.autoApply = 未保存 かつ 末端完全一致 かつ 単独1位)。
       // 一度保存されたら (0件保存=人が外した も含む) 二度と自動では入れない
-      if (autoApply && j.autoApply
-          && document.querySelectorAll('.rk-cat-check:checked').length === 0) {
+      if (autoApply && j.autoApply && getShopCatOrderedIds().length === 0) {
         const cb = findCb(cands[0].id);
-        if (cb) {
-          cb.checked = true;
+        if (cb && setShopCatChecked(cands[0].id, true)) {
           revealCb(cb);
           const r = await saveChecked('ai');
           // skipped = 送信中に人が保存していた → サーバーが書き込みを拒否したのでチェックも戻す
           if (r.ok && !r.skipped) autoMsg = 'AIが設定: ' + cands[0].path + ' (違うときは外して選び直してください)';
-          else cb.checked = false;
+          else setShopCatChecked(cands[0].id, false);
         }
       }
       const render = () => {
@@ -1409,10 +1491,11 @@
           b.textContent = (cb && cb.checked ? '✓ ' : '') + c.path;
           b.addEventListener('click', async () => {
             if (!cb) return;
-            cb.checked = !cb.checked;
-            if (cb.checked) revealCb(cb);
+            const turningOn = !cb.checked;
+            if (!setShopCatChecked(c.id, turningOn)) return; // 5枠上限で拒否
+            if (turningOn) revealCb(cb);
             const r = await saveChecked('ai_candidate');
-            if (!r.ok) { cb.checked = !cb.checked; alert(r.error || '保存に失敗しました'); return; }
+            if (!r.ok) { setShopCatChecked(c.id, !turningOn); alert(r.error || '保存に失敗しました'); return; }
             result.textContent = '店舗内カテゴリを保存しました (' + r.count + '件)';
             render();
           });
@@ -1533,7 +1616,7 @@
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
       attributes: attrs,
-      shop_category_ids: Array.from(document.querySelectorAll('.rk-cat-check:checked')).map((c) => Number(c.value)),
+      shop_category_ids: getShopCatOrderedIds(),   // 枠順 (配列順=slot。先頭=メインページ)
       shipping_method_group: document.getElementById('rk-shipping-group').value,
       postage_included: document.getElementById('rk-postage').value,
       normal_delivery_date_id: document.getElementById('rk-delivery-date').value,
