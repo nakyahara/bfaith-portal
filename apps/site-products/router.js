@@ -67,11 +67,26 @@ function prepareStmts(db) {
                  ORDER BY date_jst DESC LIMIT 1`,
     yahooItem: `SELECT item_code FROM mirror_yahoo_item_daily
                 WHERE item_code = ? ORDER BY date_jst DESC LIMIT 1`,
-    amazonAsin: `SELECT f.asin_norm AS asin
-                 FROM mirror_sku_resolved r
-                 JOIN mirror_amazon_finance_sku_daily f ON f.seller_sku = r.seller_sku
-                 WHERE r.ne_code = ? AND f.asin_norm <> ''
-                 ORDER BY f.date_jst DESC LIMIT 1`,
+    // Amazon ASINは供給元が3つあるので順に試す (2026-08-02: 販売実績のみだと解決0件だった)。
+    // SKU突合は case/空白ゆれに強くするためLOWER(TRIM())で行う (運用ルール: SKUのcase揃え)
+    amazonAsinFinance: `SELECT f.asin_norm AS asin
+                        FROM mirror_sku_resolved r
+                        JOIN mirror_amazon_finance_sku_daily f
+                          ON LOWER(TRIM(f.seller_sku)) = LOWER(TRIM(r.seller_sku))
+                        WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(f.asin_norm) <> ''
+                        ORDER BY f.date_jst DESC LIMIT 1`,
+    amazonAsinPrice: `SELECT p.asin AS asin
+                      FROM mirror_sku_resolved r
+                      JOIN mirror_amazon_price_snapshot_daily p
+                        ON LOWER(TRIM(p.seller_sku)) = LOWER(TRIM(r.seller_sku))
+                      WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(p.asin) <> ''
+                      ORDER BY p.date_jst DESC LIMIT 1`,
+    amazonAsinFees: `SELECT s.asin AS asin
+                     FROM mirror_sku_resolved r
+                     JOIN mirror_amazon_sku_fees s
+                       ON LOWER(TRIM(s.seller_sku)) = LOWER(TRIM(r.seller_sku))
+                     WHERE LOWER(TRIM(r.ne_code)) = LOWER(TRIM(?)) AND TRIM(s.asin) <> ''
+                     LIMIT 1`,
     qoo10Item: `SELECT item_no FROM mirror_qoo10_items WHERE seller_code = ? LIMIT 1`,
     aupaySku: `SELECT aupay_sku_key FROM mirror_aupay_finance_sku_daily
                WHERE ne_code = ? ORDER BY date_jst DESC LIMIT 1`,
@@ -107,7 +122,7 @@ function safeGet(s, key, runtimeDegraded, arg) {
   }
 }
 
-function lookupMalls(s, code, runtimeDegraded) {
+function lookupMalls(s, code, runtimeDegraded, asinSourceCounts) {
   const malls = {
     rakuten: { code: null, url: null },
     yahoo: { code: null, url: null },
@@ -132,10 +147,15 @@ function lookupMalls(s, code, runtimeDegraded) {
     }
   }
 
-  const az = safeGet(s, 'amazonAsin', runtimeDegraded, code);
-  if (az?.asin) {
-    malls.amazon.asin = az.asin;
-    malls.amazon.url = `https://www.amazon.co.jp/dp/${az.asin}`;
+  // ASINは finance → price_snapshot → fees の順に探す (どれで解決したかを診断に記録)
+  for (const key of ['amazonAsinFinance', 'amazonAsinPrice', 'amazonAsinFees']) {
+    const az = safeGet(s, key, runtimeDegraded, code);
+    if (az?.asin) {
+      malls.amazon.asin = az.asin;
+      malls.amazon.url = `https://www.amazon.co.jp/dp/${az.asin}`;
+      asinSourceCounts[key] = (asinSourceCounts[key] ?? 0) + 1;
+      break;
+    }
   }
 
   const q = safeGet(s, 'qoo10Item', runtimeDegraded, code);
@@ -169,6 +189,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
     }
     // 1トランザクションで読む (syncのatomic swapとの競合回避、product-management-listと同じ慣例)
     const runtimeDegraded = new Set();
+    const asinSourceCounts = {}; // どのソースでASINが解決できたか (診断用)
     const result = db.transaction(() => {
       const rows = s.products.all();
       return rows.map((r) => ({
@@ -180,7 +201,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
         price: r.price ?? null,
         stockFree: Math.max(0, (r.stock ?? 0) - (r.allocated ?? 0)),
         representativeCode: r.representativeCode ?? null,
-        malls: lookupMalls(s, r.code, runtimeDegraded),
+        malls: lookupMalls(s, r.code, runtimeDegraded, asinSourceCounts),
       }));
     })();
 
@@ -193,6 +214,14 @@ router.get('/products', requireSiteReadToken, (req, res) => {
       source: 'warehouse-mirror',
       count: result.length,
       degradedLookups: [...new Set([...Object.keys(stmtsError), ...runtimeDegraded])],
+      // 診断: モール別のURL解決数。0が続く場合は元データ (mirror同期) 側を疑う
+      resolved: {
+        rakuten: result.filter((p) => p.malls.rakuten.url).length,
+        yahoo: result.filter((p) => p.malls.yahoo.url).length,
+        amazon: result.filter((p) => p.malls.amazon.url).length,
+        qoo10: result.filter((p) => p.malls.qoo10.url).length,
+        asinSources: asinSourceCounts,
+      },
       products: result,
     });
   } catch (e) {
