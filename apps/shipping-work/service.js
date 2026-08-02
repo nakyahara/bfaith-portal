@@ -208,6 +208,65 @@ function secondsBetween(fromUtc, toUtc) {
   return Math.max(0, (Date.parse(toUtc) - Date.parse(fromUtc)) / 1000);
 }
 
+// ─── 休憩の自動控除 (要件§10.4) ───
+//
+// 固定休憩時間帯 (JST 'HH:MM-HH:MM' の配列) を管理者が設定し、休憩をまたぐセッションは
+// 実作業時間から休憩分を自動控除する (またぎは over_break フラグ)。
+// 保留と休憩が重なる時間は二重に引かない: 控除 = (セッション∩休憩) − (保留∩休憩)。
+
+const SETTING_BREAKS_KEY = 'break_periods';
+
+/** 設定から休憩帯を読む。['12:00-13:00', ...] → 検証済み配列 (不正エントリは無視)。 */
+export function getBreakPeriods() {
+  const row = getDB().prepare('SELECT value FROM sw_settings WHERE key = ?').get(SETTING_BREAKS_KEY);
+  if (!row) return [];
+  try {
+    const arr = JSON.parse(row.value);
+    return Array.isArray(arr) ? arr.filter((s) => /^\d{2}:\d{2}-\d{2}:\d{2}$/.test(s)) : [];
+  } catch { return []; }
+}
+
+/** UTC区間 [fromUtc, toUtc] と JST休憩帯の重なり秒数。日またぎセッションにも対応。 */
+function breakOverlapSec(fromUtc, toUtc, breaks) {
+  if (breaks.length === 0) return 0;
+  const fromMs = Date.parse(fromUtc);
+  const toMs = Date.parse(toUtc);
+  if (!(toMs > fromMs)) return 0;
+  let total = 0;
+  // セッションが跨ぎうる JST 暦日ごとに、その日の休憩帯を UTC 区間へ展開して重なりを取る
+  const startDay = new Date(fromMs - 9 * 3600_000);  // JST日付の起点を出すため-9hしてUTC日付を使う
+  for (let d = 0; ; d++) {
+    const day = new Date(Date.UTC(startDay.getUTCFullYear(), startDay.getUTCMonth(), startDay.getUTCDate() + d));
+    const dayStr = day.toISOString().slice(0, 10);
+    const dayStartMs = Date.parse(`${dayStr}T00:00:00+09:00`);
+    if (dayStartMs > toMs) break;
+    for (const b of breaks) {
+      const [bs, be] = b.split('-');
+      const s = Date.parse(`${dayStr}T${bs}:00+09:00`);
+      const e = Date.parse(`${dayStr}T${be}:00+09:00`);
+      if (!(e > s)) continue;  // 終了<=開始の帯は無効
+      const lo = Math.max(fromMs, s);
+      const hi = Math.min(toMs, e);
+      if (hi > lo) total += (hi - lo) / 1000;
+    }
+    if (d > 3) break;  // 想定外の長期セッションでも無限ループしない
+  }
+  return total;
+}
+
+/**
+ * セッションの休憩控除秒数。保留と重なる分は既に保留として引かれているので差し引く。
+ * pauses = [{paused_at, resumed_at}] (解除済みのみ)。
+ */
+function sessionBreakSec(fromUtc, toUtc, pauses, breaks) {
+  if (breaks.length === 0) return 0;
+  let sec = breakOverlapSec(fromUtc, toUtc, breaks);
+  for (const p of pauses) {
+    sec -= breakOverlapSec(p.paused_at, p.resumed_at, breaks);
+  }
+  return Math.max(0, sec);
+}
+
 /** セッションの取得 + 本人・工程チェック。 */
 function getOwnSession(db, process, sessionId, worker) {
   const s = db.prepare('SELECT * FROM sw_sessions WHERE id = ?').get(sessionId);
@@ -344,10 +403,13 @@ export function completeProcess(process, sessionId, worker, opId, opts = {}) {
       const now = utcNow();
       const pauses = db.prepare('SELECT paused_at, resumed_at FROM sw_pauses WHERE session_id = ? AND resumed_at IS NOT NULL').all(sessionId);
       const pauseSec = pauses.reduce((a, p) => a + secondsBetween(p.paused_at, p.resumed_at), 0);
-      const workSec = Math.max(0, secondsBetween(s.requested_at, now) - pauseSec);
+      // 休憩をまたいだ分は自動控除する (要件§10.4。保留と重なる時間は二重に引かない)
+      const breakSec = sessionBreakSec(s.requested_at, now, pauses, getBreakPeriods());
+      const workSec = Math.max(0, secondsBetween(s.requested_at, now) - pauseSec - breakSec);
 
-      // 異常候補フラグ (要件§7.4)。自動除外はしない。PR5 の管理者一覧で人が判定する
+      // 異常候補フラグ (要件§7.4)。自動除外はしない。管理者一覧で人が判定する
       const flags = parseFlags(s.flags_json);
+      if (breakSec > 0 && !flags.includes('over_break')) flags.push('over_break');  // 休憩またぎ (要件§10.4)
       if (workSec < TOO_SHORT_SEC && !flags.includes('too_short')) flags.push('too_short');
       const tooLongMin = getSettingInt(SETTING_TOO_LONG_KEY, DEFAULT_TOO_LONG_MIN);
       if (workSec > tooLongMin * 60 && !flags.includes('too_long')) flags.push('too_long');
@@ -1079,4 +1141,216 @@ export function listSessionsForReview(limit = 100) {
     endedAtJst: s.ended_at ? toJstDateTime(s.ended_at) : null,
     correctedAtJst: s.corrected_at ? toJstDateTime(s.corrected_at) : null,
   }));
+}
+
+// ═══ PR5: 異常候補一覧・集計・設定 (要件§7.4 / §10 / 実装計画§6) ═══
+
+/** JST日付 'YYYY-MM-DD' の [開始, 翌日開始) を UTC 文字列で返す (ended_at の範囲条件用)。 */
+function jstDayRangeUtc(fromDate, toDate) {
+  const startUtc = new Date(`${fromDate}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
+  const endMs = Date.parse(`${toDate}T00:00:00+09:00`) + 24 * 3600_000;
+  const endUtc = new Date(endMs).toISOString().slice(0, 19) + 'Z';
+  return { startUtc, endUtc };
+}
+
+/** 異常候補フラグの日本語ラベル (画面表示用)。 */
+export const FLAG_LABELS = {
+  too_short: '60秒未満で完了',
+  too_long: '長時間',
+  early_pause: '開始直後の保留',
+  reprint: '再印刷後',
+  correction: '完了訂正の続き',
+  over_break: '休憩またぎ',
+};
+
+/**
+ * 異常候補一覧 (要件§7.4「日次一覧に表示して管理者が判断」)。
+ * フラグ付きの完了セッションを期間で返す。判定は既存の 採用/除外 (adminJudgeSession)。
+ * review_required (完了訂正・管理者強制終了) は確認待ち画面が受け持つ。
+ * 判定済み (invalid や validity_by あり) も表示して見分けられるようにする。
+ */
+export function listAnomalies(fromDate, toDate, limit = 300) {
+  const db = getDB();
+  const { startUtc, endUtc } = jstDayRangeUtc(fromDate, toDate);
+  return db.prepare(`
+    SELECT s.*, b.work_date, b.shipping_no, b.bunrui, b.slip_count,
+      (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
+      (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label
+    FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
+    WHERE s.outcome = 'completed' AND s.flags_json != '[]'
+      AND s.ended_at >= ? AND s.ended_at < ?
+    ORDER BY s.ended_at DESC LIMIT ?
+  `).all(startUtc, endUtc, limit).map((s) => ({
+    ...s,
+    flags: parseFlags(s.flags_json),
+    requestedAtJst: toJstDateTime(s.requested_at),
+    endedAtJst: s.ended_at ? toJstDateTime(s.ended_at) : null,
+  }));
+}
+
+/** 中央値 (配列は破壊しない)。空なら null。 */
+function median(values) {
+  if (values.length === 0) return null;
+  const a = [...values].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+/**
+ * 集計 (要件§10.2)。作業者×工程×発送分類で、
+ * バッチ数・伝票数・実作業秒計・保留秒計・1時間あたり伝票数・1伝票あたり秒 (平均/中央値)・異常候補数。
+ * 集計対象 = completed かつ validity != 'invalid' (除外判定は集計から外れる。review_required は含む)。
+ */
+export function getStats(fromDate, toDate) {
+  const db = getDB();
+  const { startUtc, endUtc } = jstDayRangeUtc(fromDate, toDate);
+  const rows = db.prepare(`
+    SELECT s.worker, s.process, b.bunrui, s.active_sec, s.flags_json, s.batch_id, b.slip_count,
+      (SELECT COALESCE(SUM(
+         CAST((julianday(COALESCE(p.resumed_at, s.ended_at)) - julianday(p.paused_at)) * 86400 AS INTEGER)
+       ), 0) FROM sw_pauses p WHERE p.session_id = s.id) AS pause_sec,
+      (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label
+    FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
+    WHERE s.outcome = 'completed' AND s.validity != 'invalid'
+      AND s.ended_at >= ? AND s.ended_at < ?
+  `).all(startUtc, endUtc);
+
+  // worker × process × bunrui でグループ化。
+  // 完了訂正の継続セッションは同じバッチに複数行になるため、バッチ数は distinct で数え、
+  // 時間は合算する (訂正しても合計時間は正しく積み上がる)
+  const groups = new Map();
+  for (const r of rows) {
+    const key = `${r.worker} ${r.process} ${r.bunrui}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        worker: r.worker, process: r.process, bunrui: r.bunrui, bunruiLabel: r.bunrui_label,
+        batchIds: new Set(), slipByBatch: new Map(), activeSec: 0, pauseSec: 0,
+        perBatchSec: new Map(), anomalies: 0,
+      });
+    }
+    const g = groups.get(key);
+    g.batchIds.add(r.batch_id);
+    g.slipByBatch.set(r.batch_id, r.slip_count ?? 0);
+    g.activeSec += r.active_sec ?? 0;
+    g.pauseSec += r.pause_sec ?? 0;
+    g.perBatchSec.set(r.batch_id, (g.perBatchSec.get(r.batch_id) ?? 0) + (r.active_sec ?? 0));
+    if (r.flags_json !== '[]') g.anomalies++;
+  }
+  return [...groups.values()].map((g) => {
+    const batches = g.batchIds.size;
+    const slips = [...g.slipByBatch.values()].reduce((a, n) => a + n, 0);
+    const perSlip = [...g.perBatchSec.entries()]
+      .filter(([id]) => (g.slipByBatch.get(id) ?? 0) > 0)
+      .map(([id, sec]) => sec / g.slipByBatch.get(id));
+    return {
+      worker: g.worker,
+      process: g.process,
+      bunrui: g.bunrui,
+      bunruiLabel: g.bunruiLabel,
+      batches,
+      slips,
+      activeSec: g.activeSec,
+      pauseSec: g.pauseSec,
+      slipsPerHour: g.activeSec > 0 ? +(slips / (g.activeSec / 3600)).toFixed(1) : null,
+      secPerSlipAvg: slips > 0 ? +(g.activeSec / slips).toFixed(1) : null,
+      secPerSlipMedian: perSlip.length > 0 ? +median(perSlip).toFixed(1) : null,
+      batchSecMedian: g.perBatchSec.size > 0 ? Math.round(median([...g.perBatchSec.values()])) : null,
+      anomalies: g.anomalies,
+    };
+  }).sort((a, b) => a.worker.localeCompare(b.worker)
+    || PROCESS_ORDER.indexOf(a.process) - PROCESS_ORDER.indexOf(b.process)
+    || String(a.bunrui).localeCompare(String(b.bunrui)));
+}
+
+// ─── 設定 (要件§5: アラート閾値・休憩時間帯。マスタの有効/無効) ───
+
+/** 管理者が編集できる設定キーの定義 (画面と検証の正本)。 */
+export const SETTING_DEFS = [
+  {
+    key: SETTING_TOO_LONG_KEY, label: '長時間の異常候補 (分)',
+    hint: 'この分数を超えた実作業時間に「長時間」フラグを付ける', type: 'int', min: 1, max: 1440, dflt: DEFAULT_TOO_LONG_MIN,
+  },
+  {
+    key: SETTING_CORRECT_WINDOW_KEY, label: '完了を訂正できる時間 (分)',
+    hint: '作業者が自分で「完了を訂正」できる猶予', type: 'int', min: 1, max: 120, dflt: DEFAULT_CORRECT_WINDOW_MIN,
+  },
+  {
+    key: SETTING_BREAKS_KEY, label: '休憩時間帯 (JST)',
+    hint: '例: 12:00-13:00。複数はカンマ区切り。またいだセッションは自動控除', type: 'breaks', dflt: '',
+  },
+];
+
+export function getSettings() {
+  const db = getDB();
+  return SETTING_DEFS.map((def) => {
+    const row = db.prepare('SELECT value FROM sw_settings WHERE key = ?').get(def.key);
+    let value = row ? row.value : '';
+    if (def.type === 'breaks' && value) {
+      try { value = JSON.parse(value).join(', '); } catch { value = ''; }
+    }
+    return { ...def, value };
+  });
+}
+
+/** 設定の保存。変更は監査ログに残す。 */
+export function saveSetting(key, rawValue, actor) {
+  const def = SETTING_DEFS.find((d) => d.key === key);
+  if (!def) throw new SwError(400, '不明な設定です');
+  const db = getDB();
+  let stored;
+  if (def.type === 'int') {
+    const n = Number(String(rawValue).trim());
+    if (!Number.isInteger(n) || n < def.min || n > def.max) {
+      throw new SwError(400, `${def.label} は ${def.min}〜${def.max} の整数で入力してください`);
+    }
+    stored = String(n);
+  } else if (def.type === 'breaks') {
+    const parts = String(rawValue).split(',').map((s) => s.trim()).filter(Boolean);
+    for (const p of parts) {
+      const m = p.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
+      if (!m) throw new SwError(400, `休憩時間帯の形式が不正です: ${p} (例: 12:00-13:00)`);
+      const h1 = +m[1]; const m1 = +m[2]; const h2 = +m[3]; const m2 = +m[4];
+      if (h1 > 23 || h2 > 23 || m1 > 59 || m2 > 59) throw new SwError(400, `時刻が不正です: ${p}`);
+      if (h1 * 60 + m1 >= h2 * 60 + m2) throw new SwError(400, `終了は開始より後にしてください: ${p}`);
+    }
+    stored = JSON.stringify(parts);
+  } else {
+    throw new SwError(400, '不明な設定型です');
+  }
+  const before = db.prepare('SELECT value FROM sw_settings WHERE key = ?').get(key);
+  db.transaction(() => {
+    db.prepare(`
+      INSERT INTO sw_settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).run(key, stored);
+    addAuditLog(actor, 'admin_save_setting', `sw_settings:${key}`,
+      { value: before?.value ?? null }, { value: stored }, null);
+  })();
+  return { key, value: stored };
+}
+
+/** マスタの有効/無効の切替 (追加・改名はコード管理 = seedMasters が正本)。 */
+export function toggleMaster(kind, code, active, actor) {
+  const db = getDB();
+  const row = db.prepare('SELECT * FROM sw_masters WHERE kind = ? AND code = ?').get(kind, code);
+  if (!row) throw new SwError(404, 'マスタが見つかりません');
+  const next = active ? 1 : 0;
+  if (row.active === next) return { noop: true };
+  db.transaction(() => {
+    db.prepare('UPDATE sw_masters SET active = ? WHERE kind = ? AND code = ?').run(next, kind, code);
+    addAuditLog(actor, 'admin_toggle_master', `sw_masters:${kind}:${code}`,
+      { active: row.active }, { active: next }, null);
+  })();
+  return { active: next };
+}
+
+/** 設定画面用: 全マスタを kind ごとにまとめて返す (inactive も含む)。 */
+export function listAllMasters() {
+  const rows = getDB().prepare('SELECT * FROM sw_masters ORDER BY kind, sort').all();
+  const kinds = new Map();
+  for (const r of rows) {
+    if (!kinds.has(r.kind)) kinds.set(r.kind, []);
+    kinds.get(r.kind).push(r);
+  }
+  return kinds;
 }
