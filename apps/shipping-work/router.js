@@ -25,6 +25,7 @@ import {
   SwError, startProcess, completeProcess, pauseProcess, resumeProcess, troubleProcess,
   startNextReady, getWorkerState, requestReprint, correctCompletion,
   getBatchDetail, adminFixStatus, adminJudgeSession, listSessionsForReview,
+  ADMIN_FIXABLE_STATUSES,
 } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -107,7 +108,10 @@ function api(handler) {
     try {
       res.json(handler(req));
     } catch (e) {
-      if (e instanceof SwError) return res.status(e.status).json({ error: e.message, code: e.code });
+      // detail は「後の工程が進んでいます」のように、画面で内容を見せて確認させるための付随情報
+      if (e instanceof SwError) {
+        return res.status(e.status).json({ error: e.message, code: e.code, detail: e.detail });
+      }
       console.error('[shipping-work] API error', e);
       res.status(500).json({ error: 'サーバーエラーが発生しました' });
     }
@@ -380,7 +384,7 @@ router.get('/admin/batches/:id(\\d+)', requireAdminPage, (req, res) => {
     displayName: req.session.displayName,
     ...detail,
     statusLabels: STATUS_LABELS,
-    statuses: BATCH_STATUSES,
+    statuses: ADMIN_FIXABLE_STATUSES,
     displayNames: loadDisplayNames(),
   });
 });
@@ -399,7 +403,7 @@ router.get('/admin/review', requireAdminPage, (req, res) => {
 // ステータスの手動訂正 (理由必須)
 router.post('/api/admin/batches/:id(\\d+)/fix-status', requireAdminApi, api((req) => {
   const r = adminFixStatus(Number(req.params.id), String(req.body?.status || ''),
-    req.session.email, req.body?.reason, opId(req.body?.op_id));
+    req.session.email, req.body?.reason, opId(req.body?.op_id), { force: !!req.body?.force });
   return { ok: true, already: r.already, status: r.status, closedSessions: r.closedSessions ?? 0 };
 }));
 

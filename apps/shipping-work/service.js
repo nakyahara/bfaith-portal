@@ -15,12 +15,13 @@ import {
   batchHasDocument, BATCH_STATUSES, listMasters as listMastersRaw,
 } from './db.js';
 
-/** 業務エラー。router が status を HTTP ステータスに変換する。 */
+/** 業務エラー。router が status を HTTP ステータスに変換する。detail は画面で確認を出すための付随情報。 */
 export class SwError extends Error {
-  constructor(status, message, code) {
+  constructor(status, message, code, detail) {
     super(message);
     this.status = status;
     this.code = code || null;
+    this.detail = detail || null;
   }
 }
 
@@ -34,6 +35,15 @@ const PROCESS_FLOW = {
     pauseReasonKind: 'pause_reason_pick',
   },
 };
+
+// 工程が完了したときに入る状態 (どこまで進んだかの判定に使う)。PR4 で sorting/packing を追加。
+const PROCESS_TO_STATUS = { picking: 'picked', sorting: 'sorted', packing: 'done' };
+// 工程の進み順。手動訂正で「後の工程を巻き戻すか」を判定する
+const STATUS_ORDER = ['ready', 'picking', 'picked', 'sorting', 'sorted', 'packing', 'done'];
+// 管理者が直接指定できるステータス。作業中の状態 (picking/sorting/packing) は含めない —
+// 対応する進行中セッションが無いまま「作業中」に見えるバッチができ、誰も操作できなくなるため。
+// hold も除外 (復帰先 hold_from_status が決まらない)
+export const ADMIN_FIXABLE_STATUSES = ['ready', 'picked', 'sorted', 'done', 'stock_return', 'cancelled'];
 
 // 異常候補の閾値 (要件§7.4)。too_long は sw_settings で管理者が上書きできる (PR5 で設定画面)。
 const TOO_SHORT_SEC = 60;
@@ -584,6 +594,7 @@ export function listRecentCompleted(process, worker, limit = RECENT_COMPLETED_LI
     const total = db.prepare(`
       SELECT COALESCE(SUM(active_sec), 0) AS sec FROM sw_sessions
       WHERE batch_id = ? AND process = ? AND worker = ? AND outcome = 'completed'
+        AND validity != 'invalid'
     `).get(s.batch_id, s.process, worker);
     return {
       session: s,
@@ -732,6 +743,11 @@ export function getWorkerState(process, worker) {
       SELECT b.id, b.slip_count
       FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
       WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
+        -- 管理者が「除外」と判定した計測は入れない。
+        -- review_required (確認待ち) は入れる — 訂正して続きをやった場合の元セッションが
+        -- ここに入るので、外すと実際にやった時間が消えてしまう。
+        -- 「本当に作業していない」ものだけ管理者が invalid にして外す
+        AND s.validity != 'invalid'
         -- 完了を訂正して作業に戻したものは、終わるまで実績に数えない
         AND NOT EXISTS (SELECT 1 FROM sw_sessions o
           WHERE o.batch_id = b.id AND o.process = s.process AND o.outcome = 'open')
@@ -790,6 +806,7 @@ export function getWorkerState(process, worker) {
 // 「採用するかどうか」だけを validity で切り替える。
 
 /** 管理者向けのバッチ詳細。現在の状態・遷移履歴・全セッション・印刷ジョブを1画面ぶん。 */
+
 export function getBatchDetail(batchId) {
   const db = getDB();
   const batch = getBatchWithLabels(db, batchId);
@@ -825,45 +842,95 @@ function toJstDateTime(utc) {
  * 進行中セッションが残ったまま状態だけ動かすと作業者が次の作業を取れなくなるため、
  * 開いているセッションは cancelled で閉じる (時刻は残す)。
  */
-export function adminFixStatus(batchId, toStatus, actor, reason, opId) {
+export function adminFixStatus(batchId, toStatus, actor, reason, opId, opts = {}) {
   validateOpId(opId);
   const reasonTrim = normalizeNote(reason);
   if (!reasonTrim) throw new SwError(400, '訂正の理由は必須です');
-  if (!BATCH_STATUSES.includes(toStatus)) throw new SwError(400, 'ステータスが不正です');
+  // ⭐遷移先は「安定状態」だけ。picking/sorting/packing のような作業中状態へ直接飛ばすと、
+  // 対応する進行中セッションが無いまま「作業中」に見えるバッチができ、
+  // 誰も開始も完了もできなくなる (開始は ready からの条件付きUPDATEなので取れない)。
+  // 管理者の役目は「現物がどうなっているかを確定させる」ことなので、これで足りる
+  if (!ADMIN_FIXABLE_STATUSES.includes(toStatus)) {
+    throw new SwError(400, `このステータスには直接変更できません (${ADMIN_FIXABLE_STATUSES.join(' / ')} のいずれか)`);
+  }
   const db = getDB();
   return runIdempotent(
     {
       opId, worker: actor, operation: 'admin-fix-status', targetKind: 'batch', targetId: batchId,
-      params: { toStatus, reason: reasonTrim },
+      params: { toStatus, reason: reasonTrim, force: !!opts.force },
     },
     () => {
       const before = getBatch(batchId);
       if (!before) throw new SwError(404, 'バッチが見つかりません');
-      if (before.status === toStatus) return { noop: true, status: toStatus };
       const now = utcNow();
-
-      // 開いているセッションを閉じる (計測時刻はそのまま。採用可否は管理者が別途判定する)
       const open = db.prepare("SELECT * FROM sw_sessions WHERE batch_id = ? AND outcome = 'open'").all(batchId);
+
+      // 後続工程が動いていたら黙って巻き戻さない (梱包を始めているのに ready へ戻すと二重作業になる)。
+      // 何を閉じることになるのかを返し、管理者が内容を見て force で確定する
+      const laterProcesses = laterProcessSessions(db, batchId, toStatus);
+      if (laterProcesses.length > 0 && !opts.force) {
+        throw new SwError(409, '後の工程が進んでいます。内容を確認してください', 'later_process', {
+          sessions: laterProcesses,
+        });
+      }
+      // 状態が同じでも、開いたままのセッションが残っていれば閉じる用途で通す
+      // (「done なのに作業中セッションだけ残った」不整合の救済)
+      if (before.status === toStatus && open.length === 0) return { noop: true, status: toStatus };
+
+      const closed = [];
       for (const s of open) {
         db.prepare('UPDATE sw_pauses SET resumed_at = ? WHERE session_id = ? AND resumed_at IS NULL')
           .run(now, s.id);
+        // 未終了なら訂正時刻を終了とみなし、実作業秒数もここで確定させる。
+        // 確定しておかないと「採用」しても集計対象の時間が無いセッションになる
+        const endedAt = s.ended_at || now;
+        const activeSec = s.active_sec != null
+          ? s.active_sec
+          : Math.max(0, Math.round(secondsBetween(s.requested_at, endedAt) - closedPauseSec(db, s.id)));
         db.prepare(`
           UPDATE sw_sessions
-          SET outcome = 'cancelled', ended_at = COALESCE(ended_at, ?), paused = 0,
+          SET outcome = 'cancelled', ended_at = ?, active_sec = ?, paused = 0,
               validity = 'review_required', correction_reason = ?, corrected_by = ?, corrected_at = ?
           WHERE id = ?
-        `).run(now, `管理者がステータスを訂正: ${reasonTrim}`, actor, now, s.id);
+        `).run(endedAt, activeSec, `管理者がステータスを訂正: ${reasonTrim}`, actor, now, s.id);
         cancelOpenPrintJobs(db, s.id);
+        // セッションごとに before/after を残す (どのセッションの何が変わったかを追えるように)
+        addAuditLog(actor, 'admin_close_session', `sw_sessions:${s.id}`,
+          { outcome: s.outcome, ended_at: s.ended_at, active_sec: s.active_sec, paused: s.paused, validity: s.validity },
+          { outcome: 'cancelled', ended_at: endedAt, active_sec: activeSec, paused: 0, validity: 'review_required' },
+          reasonTrim);
+        closed.push({ id: s.id, process: s.process, worker: s.worker });
       }
 
-      db.prepare('UPDATE sw_batches SET status = ?, hold_from_status = NULL, updated_at = ? WHERE id = ?')
-        .run(toStatus, now, batchId);
-      addStatusEvent(batchId, before.status, toStatus, actor, 'admin', reasonTrim);
+      if (before.status !== toStatus) {
+        db.prepare('UPDATE sw_batches SET status = ?, hold_from_status = NULL, updated_at = ? WHERE id = ?')
+          .run(toStatus, now, batchId);
+        addStatusEvent(batchId, before.status, toStatus, actor, 'admin', reasonTrim);
+      }
       addAuditLog(actor, 'admin_fix_status', `sw_batches:${batchId}`,
-        { status: before.status }, { status: toStatus, closedSessions: open.map((s) => s.id) }, reasonTrim);
-      return { status: toStatus, closedSessions: open.length };
+        { status: before.status }, { status: toStatus, closedSessions: closed, force: !!opts.force }, reasonTrim);
+      return { status: toStatus, closedSessions: closed.length };
     }
   );
+}
+
+/**
+ * その遷移で「後の工程を巻き戻すことになる」セッション一覧。
+ * 遷移先より後ろの工程で動いた記録があれば、管理者に見せてから確定させる。
+ *
+ * 「後ろの工程」= その工程の作業中状態 (picking=1/sorting=3/packing=5) が、
+ * 遷移先の直後 (toStatus+1) より先にあるもの。
+ * 例: ready へ戻すとき、picking のセッションは「今の工程の中止」なので通常フローで閉じるが、
+ *     packing のセッションがあれば梱包まで進んだものを巻き戻すことになる → 警告。
+ */
+function laterProcessSessions(db, batchId, toStatus) {
+  const idx = STATUS_ORDER.indexOf(toStatus);
+  if (idx < 0) return [];
+  const activeIdx = { picking: 1, sorting: 3, packing: 5 };
+  const rows = db.prepare('SELECT * FROM sw_sessions WHERE batch_id = ? ORDER BY id').all(batchId);
+  return rows
+    .filter((s) => (activeIdx[s.process] ?? 0) > idx + 1 && s.outcome !== 'voided')
+    .map((s) => ({ id: s.id, process: s.process, worker: s.worker, outcome: s.outcome }));
 }
 
 /**
@@ -874,8 +941,10 @@ export function adminJudgeSession(sessionId, validity, actor, reason, opId) {
   validateOpId(opId);
   const reasonTrim = normalizeNote(reason);
   if (!reasonTrim) throw new SwError(400, '判定の理由は必須です');
-  if (!['valid', 'invalid', 'review_required'].includes(validity)) {
-    throw new SwError(400, '判定値が不正です');
+  // 判定は「採用」か「除外」だけ。review_required は作業者の訂正や管理者の強制終了で
+  // 自動的に付くものなので、APIから戻せるようにはしない (画面にもその操作は無い)
+  if (!['valid', 'invalid'].includes(validity)) {
+    throw new SwError(400, '判定は採用 (valid) か除外 (invalid) のいずれかです');
   }
   const db = getDB();
   return runIdempotent(

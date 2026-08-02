@@ -75,9 +75,12 @@
           <% } %>
         </select>
         <input type="text" id="fixReason" placeholder="理由 (必須。例: 現物は梱包済みだったため完了に直す)">
-        <button onclick="fixStatus()">この状態に直す</button>
+        <button id="fixBtn" onclick="fixStatus()">この状態に直す</button>
         <div class="note">
-          計測時刻は書き換えません。進行中のセッションがあれば閉じ、確認待ちに回します。
+          記録済みの<b>開始・終了時刻は書き換えません</b>。
+          進行中のセッションがあれば「そこまでで終了」として閉じ (終了時刻は今)、確認待ちに回します。<br>
+          作業中の状態 (ピッキング中など) には直接変更できません
+          — 担当者のいない「作業中」ができて誰も操作できなくなるためです。<br>
           操作は履歴と監査ログに残ります
         </div>
       </div>
@@ -166,34 +169,66 @@
       if (window.crypto?.randomUUID) return crypto.randomUUID();
       return 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
     }
-    async function post(url, body) {
+    let busy = false;
+    // 1回のユーザー操作では同じ op_id を使い回す (ダブルクリックが別操作として2回記録されないように)
+    async function post(url, body, reuseOpId) {
       const r = await fetch(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ op_id: opId(), ...body }),
+        body: JSON.stringify({ op_id: reuseOpId, ...body }),
       });
       let j = {};
       try { j = await r.json(); } catch {}
-      if (!r.ok) { alert(j.error || `エラー (${r.status})`); return null; }
-      return j;
+      return { ok: r.ok, status: r.status, body: j };
     }
+
     async function fixStatus() {
-      const status = document.getElementById('fixStatus').value;
+      if (busy) return;
+      const sel = document.getElementById('fixStatus');
+      const status = sel.value;
       const reason = document.getElementById('fixReason').value.trim();
       if (!reason) return alert('理由は必須です');
-      if (!confirm(`ステータスを「${document.getElementById('fixStatus').selectedOptions[0].text}」に直します。よろしいですか？`)) return;
-      const j = await post(`/apps/shipping-work/api/admin/batches/${BATCH_ID}/fix-status`, { status, reason });
-      if (j) {
-        if (j.closedSessions > 0) alert(`直しました。進行中だったセッション ${j.closedSessions} 件を閉じ、確認待ちに回しました`);
+      if (!confirm(`ステータスを「${sel.selectedOptions[0].text}」に直します。よろしいですか？`)) return;
+      busy = true;
+      document.getElementById('fixBtn').disabled = true;
+      const op = opId();
+      try {
+        let res = await post(`/apps/shipping-work/api/admin/batches/${BATCH_ID}/fix-status`, { status, reason }, op);
+        // 後の工程が進んでいる場合は、何を閉じることになるのかを見せてから確定させる
+        if (!res.ok && res.body.code === 'later_process') {
+          const list = (res.body.detail?.sessions || [])
+            .map((s) => `  ・${s.process} / ${s.worker.split('@')[0]} (${s.outcome})`).join('\n');
+          const okForce = confirm(
+            `⚠ 後の工程が進んでいます。\n\n${list}\n\n`
+            + `この操作は上記 ${res.body.detail?.sessions?.length || 0} 件のセッションを閉じ、`
+            + `作業をやり直すことになります (二重作業の恐れ)。\n\n本当に実行しますか？`);
+          if (!okForce) return;
+          res = await post(`/apps/shipping-work/api/admin/batches/${BATCH_ID}/fix-status`,
+            { status, reason, force: true }, opId());
+        }
+        if (!res.ok) return alert(res.body.error || `エラー (${res.status})`);
+        if (res.body.closedSessions > 0) {
+          alert(`直しました。進行中だったセッション ${res.body.closedSessions} 件を閉じ、確認待ちに回しました`);
+        }
         location.reload();
+      } finally {
+        busy = false;
+        document.getElementById('fixBtn').disabled = false;
       }
     }
+
     async function judge(sessionId, validity) {
+      if (busy) return;
       const label = validity === 'valid' ? '採用' : '除外';
       const reason = prompt(`このセッションを計測から「${label}」します。理由を入力してください (必須)`);
       if (reason === null) return;
       if (!reason.trim()) return alert('理由は必須です');
-      const j = await post(`/apps/shipping-work/api/admin/sessions/${sessionId}/judge`, { validity, reason: reason.trim() });
-      if (j) location.reload();
+      busy = true;
+      try {
+        const res = await post(`/apps/shipping-work/api/admin/sessions/${sessionId}/judge`,
+          { validity, reason: reason.trim() }, opId());
+        if (!res.ok) return alert(res.body.error || `エラー (${res.status})`);
+        location.reload();
+      } finally { busy = false; }
     }
   </script>
 </body>
