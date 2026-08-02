@@ -581,6 +581,16 @@ export const COMMON_TRAILING_BANNERS = [
   { location: '/11720388/refund.jpg', label: '返金保証' },
 ];
 
+/**
+ * 配送方法の解決: アプリ指定グループ > NE配送方法のマッピング。
+ * 商品ページ表記の発送方法表示と末尾バナーの選択で共通に使う (router のプレビューも同じ関数)
+ */
+export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
+  const g = String(shippingMethodGroup ?? '').trim();
+  if (g && SHIPPING_METHOD_GROUPS[g]) return { group: g, label: SHIPPING_METHOD_GROUPS[g] };
+  return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
+}
+
 /** 配送方法グループ → 末尾に自動追加するバナー location 一覧 (配送バナー + 共通3枚) */
 export function trailingBannerLocations(shippingGroup) {
   const g = String(shippingGroup ?? '').trim();
@@ -625,12 +635,8 @@ export function buildItemPayload(db, draftId) {
     .map((i) => ({ cabinet_location: cabinetByFile.get(i.drive_file_id) }));
   const untransferredCount = currentImages.length - cabinet.length;
 
-  // 発送方法はアプリ指定の配送方法グループ > NE配送方法のマッピング の順で決める
-  // (商品ページ表記の表示名と末尾バナーの選択で共通に使う)
-  const pageShipGroup = String(rk.shipping_method_group ?? '').trim();
-  const effectiveShip = pageShipGroup && SHIPPING_METHOD_GROUPS[pageShipGroup]
-    ? { group: pageShipGroup, label: SHIPPING_METHOD_GROUPS[pageShipGroup] }
-    : mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
+  // 発送方法 (アプリ指定 > NEマッピング)。商品ページ表記の表示名と末尾バナーの選択で共通
+  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];

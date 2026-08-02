@@ -995,6 +995,23 @@ check('payload: ネコポス指定でバナー→共通3枚を商品画像の後
 check('payload: 販売説明文 (画像HTML) にはバナーを入れない (商品画像のみ)',
   !built.payload.salesDescription.includes('coupon') && !built.payload.salesDescription.includes('07722747'));
 
+// NE配送方法フォールバック (Codex R1 low: 統合レベルで検証)。
+// アプリ指定なし + NE配送方法「定形外」→ 名前一致で楽天グループ1 → 定形外バナー
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
+db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
+  VALUES (99401, 'rk-smoke-1', '出品smoke', '1', '取扱中', 'ok', 660, 120, '定形外', 0.1, '2026-08-03T00:00:00Z')`).run();
+let bNe = listing.buildItemPayload(db, rkId);
+check('payload: アプリ指定なしは NE配送方法から定形外バナーを選ぶ',
+  bNe.ok === true && bNe.payload.images.some((i) => i.location === '/07722747/08581403/teikeigai_soryomuryo.jpg')
+  && !bNe.payload.images.some((i) => i.location === '/07722747/09610094/imgrc0104897185.jpg'),
+  JSON.stringify(bNe.payload?.images || bNe.reasons));
+check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より優先 / 指定なしはNE',
+  listing.effectiveShippingForDraft(db, 'rk-smoke-1', '9').group === '9'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').group === '1');
+db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
+
 // 20枚上限は自動追加バナーを含めて判定する
 const capIns = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)');
 const capCab = db.prepare('INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)');

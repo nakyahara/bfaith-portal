@@ -27,7 +27,7 @@ import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState,
-  getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl,
+  getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -222,11 +222,8 @@ router.get('/detail/:id', (req, res) => {
 
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // 出品時に商品画像の末尾へ自動追加される店舗共通バナー (画像タブのプレビュー用)。
-  // 配送方法の解決順は buildItemPayload と同じ: アプリ指定 > NEマッピング
-  const effShipGroup = (() => {
-    const g = String(rakuten?.shipping_method_group ?? '').trim();
-    return g && SHIPPING_METHOD_GROUPS[g] ? g : neShipping.group;
-  })();
+  // 配送方法の解決は buildItemPayload と同じ関数 (アプリ指定 > NEマッピング)
+  const effShipGroup = effectiveShippingForDraft(db, draft.ne_code, rakuten?.shipping_method_group).group;
   const trailingBanners = [
     ...(SHIPPING_BANNER_LOCATIONS[effShipGroup]
       ? [{ location: SHIPPING_BANNER_LOCATIONS[effShipGroup], label: `配送: ${SHIPPING_METHOD_GROUPS[effShipGroup]}` }]
