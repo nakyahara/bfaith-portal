@@ -1566,6 +1566,16 @@ const migIds = db.prepare(`SELECT id FROM ph_shop_categories WHERE path LIKE '�
 for (const r of migIds) {
   db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, r.id);
 }
+// 途中失敗はロールバックされ、再実行で回復できる (Codex R2 high: 非アトミックだと
+// 「slot列はあるが未採番」の中途半端な状態が残り、二度と移行が走らない)
+db.exec('ALTER TABLE draft_events RENAME TO draft_events_bk');   // trim のINSERTを故意に失敗させる
+let migThrew = false;
+try { dbmod.migrateShopCategorySlots(db); } catch (e) { migThrew = true; }
+check('slot移行: 途中失敗でロールバック (slot列ごと消え、再実行可能な状態に戻る)',
+  migThrew === true
+  && !db.prepare('PRAGMA table_info(draft_shop_categories)').all().some((c) => c.name === 'slot'));
+db.exec('ALTER TABLE draft_events_bk RENAME TO draft_events');
+
 check('slot移行: 旧形DBで migrate が走る', dbmod.migrateShopCategorySlots(db) === true);
 check('slot移行: 2回目は no-op (冪等)', dbmod.migrateShopCategorySlots(db) === false);
 const migRows = selectedShopCategoriesInOrder(db, fdraft.id);
