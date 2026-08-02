@@ -9,6 +9,12 @@
  *   scheduled_job    — 定期実行。成功時に POST /apps/jobs-monitor/ping/<id> を打つ (dead-man方式)。
  *                      直近の予定時刻 (anchor_hour_jst:anchor_minute_jst) + grace_hours までに
  *                      成功が来なければ「締切超過」(予定時刻基準 = 成功が遅れても締切がドリフトしない)
+ *                      ⭐partial_max_days を持つジョブは「1回で終わらない長時間バッチ」。
+ *                        毎日の締切は status=partial (動いたが未完走) でも満たせる代わりに、
+ *                        未完走が partial_max_days 回までは許容し、それを超えたら
+ *                        「停滞 (stalled)」として要対応に出す (max = 許容する最大回数)。
+ *                        これが無いと、実行時間の上限で毎回中断されるバッチは
+ *                        「毎朝鳴りっぱなし」か「永遠に完走しなくても緑」の二択になる
  *   human_obligation — 人がやる期限つき作業 (OAuth再認可・APIキーローテ等)。完了時に ping。
  *                      次回期限 = 前回完了 + period_hours。warn_days 前から毎朝の要対応に出る
  *   temporary_asset  — 一時タスク・退避フォルダなど「いつか消すもの」。remove_by を過ぎたら要対応に出る
@@ -176,12 +182,15 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集。冪等・全件取得済みなら即終了)',
     where: 'miniPC TaskScheduler [ProductIdeaScout]',
-    schedule: '毎日 14:00 (最長20時間で打ち切り→翌日続きから)',
+    schedule: '毎日 14:00 (19時間で自主中断→翌日続きから。Task Scheduler の上限20hは保険)',
     anchor_hour_jst: 14,
     anchor_minute_jst: 0,
-    grace_hours: 21, // 実行上限20hのため。翌日11:00までに ok が無ければ締切超過
+    grace_hours: 22, // 14:00開始 + 自主中断19h = 翌09:00終了。翌12:00までに実行報告が無ければ締切超過
+    // Keepaのトークン補充律速で数日〜数週間かかることがある (14,534 ASIN を 7,200/日)。
+    // 未完走7回までは許容し、8回目で「進んでいないのでは」と疑う
+    partial_max_days: 7,
     lifecycle: 'permanent',
-    runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
+    runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
   },
 
   // ─────────────── human_obligation (人がやる期限つき作業) ───────────────
@@ -274,6 +283,13 @@ export function validateRegistry(registry = JOBS_REGISTRY) {
       if (!(Number.isFinite(e.grace_hours) && e.grace_hours > 0 && e.grace_hours < 24)) {
         errs.push(`${label}: grace_hours は必須 (0より大きく24未満 — 次のアンカーを跨ぐ猶予は判定を壊す)`);
       }
+      if (e.partial_max_days !== undefined
+        && !(Number.isInteger(e.partial_max_days) && e.partial_max_days > 0)) {
+        errs.push(`${label}: partial_max_days が不正 (正の整数。0だと partial を1回も許さない = 設定しないのと同じ)`);
+      }
+    }
+    if (e.type !== 'scheduled_job' && e.partial_max_days !== undefined) {
+      errs.push(`${label}: partial_max_days は scheduled_job だけの設定`);
     }
     if (e.type === 'human_obligation') {
       if (!(Number.isFinite(e.period_hours) && e.period_hours > 0)) errs.push(`${label}: period_hours は必須`);

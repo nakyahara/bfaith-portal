@@ -14,7 +14,11 @@
 #   every ping got 401 while the same code pasted inline worked fine).
 param(
   [Parameter(Mandatory = $true)][string]$Id,
-  [ValidateSet('ok', 'fail', 'start')][string]$Status = 'ok'
+  # partial = the job ran but did not finish (long batch stopped at its time limit).
+  # It keeps the daily deadline satisfied but does NOT count as completion.
+  [ValidateSet('ok', 'fail', 'start', 'partial')][string]$Status = 'ok',
+  # Optional short progress text shown in the morning digest (e.g. "remaining 484").
+  [string]$Note = ''
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -37,6 +41,11 @@ try {
   $base = (Select-String -Path $envFile -Pattern '^JOBS_MONITOR_URL=' | Select-Object -First 1).Line -replace '^[^=]+=', ''
   if (-not $base) { $base = 'https://bfaith-portal.onrender.com' }
   $uri = $base.TrimEnd('/') + '/apps/jobs-monitor/ping/' + $Id + '?status=' + $Status
+  if ($Note) {
+    $n = $Note
+    if ($n.Length -gt 200) { $n = $n.Substring(0, 200) }
+    $uri = $uri + '&note=' + [System.Uri]::EscapeDataString($n)
+  }
   Invoke-RestMethod -Uri $uri -Method Post -Headers @{ Authorization = 'Bearer ' + $token } -TimeoutSec 15 | Out-Null
   Write-PingLog 'sent'
 } catch {
