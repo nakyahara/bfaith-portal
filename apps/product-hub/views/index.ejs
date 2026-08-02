@@ -79,16 +79,33 @@
         楽天 店舗内カテゴリ一覧
         <span class="muted" style="font-weight:400">／ 取り込み済み <%= shopCategoryCount %> 件</span>
       </summary>
-      <p class="muted" style="margin:10px 0;">
-        RMS の店舗内カテゴリ一覧を貼り付けて取り込みます (<strong>全置き換え</strong>。1行1カテゴリ、最大 <%= maxShopCategoryLines %> 行)。
-        階層は「&gt;」区切り (例: <code>犬用品 &gt; おやつ</code>)。カテゴリIDが分かる場合は「ID,カテゴリ名」でも取り込めます (将来のRMS自動紐付けに使用)。
-        取り込むと各ドラフトの「楽天に出品」カードで選択できます。<strong>RMSへの自動反映は未対応</strong>です (公開時にRMS画面で設定)。
-      </p>
-      <textarea id="cat-lines" rows="6" placeholder="犬用品 &gt; おやつ&#10;犬用品 &gt; おやつ &gt; 無添加&#10;123456,猫用品 &gt; ケア用品" style="width:100%; font-family:monospace; font-size:13px;"></textarea>
-      <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
-        <button class="btn btn-primary" id="cat-import-btn">取り込む (全置き換え)</button>
-        <span class="muted" id="cat-import-result"></span>
+      <!-- 楽天から直接同期 (2026-08-02、Category API 2.0)。これが通常の運用 -->
+      <div style="margin:10px 0; padding:10px 12px; background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px;">
+        <div style="font-size:13px; margin-bottom:8px;">
+          <strong>楽天から直接取り込みます</strong> (お店の棚＝店舗内カテゴリ。楽天ジャンルとは別物)。
+          カテゴリIDも一緒に取得するので、貼り付けは不要です。
+        </div>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button class="btn btn-primary" id="cat-sync-btn">楽天から取り込む</button>
+          <span class="muted" id="cat-sync-result"></span>
+        </div>
       </div>
+      <details>
+        <summary style="cursor:pointer; font-size:13px; color:#64748b;">貼り付けで取り込む (APIが使えないときのみ)</summary>
+        <p class="muted" style="margin:8px 0;">
+          RMS の店舗内カテゴリ一覧を貼り付けて取り込みます (<strong>全置き換え</strong>。1行1カテゴリ、最大 <%= maxShopCategoryLines %> 行)。
+          階層は「&gt;」区切り (例: <code>犬用品 &gt; おやつ</code>)。カテゴリIDが分かる場合は「ID,カテゴリ名」でも取り込めます。
+        </p>
+        <textarea id="cat-lines" rows="6" placeholder="犬用品 &gt; おやつ&#10;犬用品 &gt; おやつ &gt; 無添加&#10;123456,猫用品 &gt; ケア用品" style="width:100%; font-family:monospace; font-size:13px;"></textarea>
+        <div style="display:flex; align-items:center; gap:10px; margin-top:8px;">
+          <button class="btn" id="cat-import-btn">貼り付けを取り込む (全置き換え)</button>
+          <span class="muted" id="cat-import-result"></span>
+        </div>
+      </details>
+      <p class="muted" style="margin:10px 0 0; font-size:12px;">
+        取り込むと各ドラフトの「カテゴリ・属性」タブで選択でき、AIが初期候補を入れます。
+        <strong>商品への割り当て自体のRMS反映は未対応</strong>です (公開時にRMS画面で設定)。
+      </p>
     </details>
   </div>
 
@@ -201,7 +218,42 @@
     });
   }
 
-  // ─── 楽天 店舗内カテゴリ一覧の取り込み (admin のみパネルが出る) ───
+  // ─── 楽天から直接同期 (Category API 2.0。通常はこちら) ───
+  const catSyncBtn = document.getElementById('cat-sync-btn');
+  if (catSyncBtn) {
+    async function postCatSync(force) {
+      const res = await fetch('/apps/product-hub/api/shop-categories/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force: force === true, refresh: true }),
+      });
+      return res.json();
+    }
+    catSyncBtn.addEventListener('click', async () => {
+      const out = document.getElementById('cat-sync-result');
+      if (!confirm('楽天から店舗内カテゴリを取り込みます (全置き換え)。\n楽天側に無いカテゴリは選択肢から外れます (選択済みのドラフトには残ります)。\n\nよろしいですか?')) return;
+      catSyncBtn.disabled = true;
+      out.textContent = '楽天から取得中…';
+      try {
+        let json = await postCatSync(false);
+        if (!json.ok && json.error === 'too_few') {
+          if (!confirm((json.message || '件数が大きく減ります') + '\n\nそれでも置き換えますか?')) { out.textContent = ''; return; }
+          json = await postCatSync(true);
+        }
+        if (!json.ok) { out.textContent = ''; alert(json.message || json.error || '取り込みに失敗しました'); return; }
+        out.textContent = '取り込み ' + json.imported + ' 件'
+          + (json.duplicates ? ' (同名パス ' + json.duplicates + ' 件を除外)' : '')
+          + (json.deactivated ? ' / 一覧から外れた ' + json.deactivated + ' 件' : '');
+        setTimeout(function () { location.reload(); }, 1500);
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        catSyncBtn.disabled = false;
+      }
+    });
+  }
+
+  // ─── 貼り付けでの取り込み (フォールバック) ───
   const catImportBtn = document.getElementById('cat-import-btn');
   if (catImportBtn) {
     async function postCatImport(text, force) {

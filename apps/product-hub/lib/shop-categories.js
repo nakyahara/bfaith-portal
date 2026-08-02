@@ -94,6 +94,43 @@ export function countActiveShopCategories(db) {
 }
 
 /**
+ * Category API 2.0 のツリー応答 → replaceShopCategories に渡せる行 (2026-08-02)。
+ *
+ * 応答形 (実測): { rootNode: { children: [ { category: {categoryId, title}, children: [...] } ] } }
+ *   rootNode 自身は category を持たない。子孫のすべての階層が「棚」として実在するので全部行にする
+ *   (中間ノードにも商品を割り当てられるため)。パス区切りは貼り付け取り込みと同じ ' > '。
+ *
+ * @param {Array<{categorySetId: string, rootNode: object}>} trees miniPC の /shop-categories/tree の trees
+ * @returns {{rows: Array<{categoryId, path, pathKey}>, duplicates: number}}
+ */
+export function flattenCategoryTrees(trees) {
+  const rows = [];
+  const seen = new Set();
+  let duplicates = 0;
+  const walk = (node, parentPath) => {
+    if (!node || typeof node !== 'object') return;
+    const title = typeof node.category?.title === 'string' ? node.category.title.trim() : '';
+    const rawId = node.category?.categoryId;
+    // 区切り文字がタイトルに混ざるとパスが壊れるので潰す (貼り付け側の normalizePath と同じ意味論)
+    const safeTitle = title.replace(/[>＞]/g, '／').trim();
+    const path = safeTitle ? (parentPath ? `${parentPath} > ${safeTitle}` : safeTitle) : parentPath;
+    if (safeTitle && rawId != null && String(rawId).trim() !== '') {
+      const pathKey = path.toLowerCase();
+      if (seen.has(pathKey)) duplicates++;
+      else {
+        seen.add(pathKey);
+        rows.push({ categoryId: String(rawId).trim(), path, pathKey });
+      }
+    }
+    for (const child of Array.isArray(node.children) ? node.children : []) walk(child, path);
+  };
+  for (const t of Array.isArray(trees) ? trees : []) {
+    for (const child of Array.isArray(t?.rootNode?.children) ? t.rootNode.children : []) walk(child, '');
+  }
+  return { rows, duplicates };
+}
+
+/**
  * ドラフト保存で受けるカテゴリ id 配列の厳密検証 (Codex R1 Medium-3: parseInt は "12abc" を通す)。
  * 整数 number か「数字だけの文字列」以外は不正。重複は除去。
  */

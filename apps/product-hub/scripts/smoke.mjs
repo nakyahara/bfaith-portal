@@ -1529,6 +1529,55 @@ check('店舗内カテゴリ: 無効な棚への新規紐付けは弾く', count
 check('店舗内カテゴリ: 無効でも既に選択中なら維持できる',
   countSelectableShopCategories(db, fdraft.id, [scInactiveSel]) === 1);
 check('店舗内カテゴリ: 空配列は 0', countSelectableShopCategories(db, fdraft.id, []) === 0);
+
+// Category API 2.0 のツリー展開 (2026-08-02 実測形。miniPC /shop-categories/tree の trees)
+const { flattenCategoryTrees } = await import('../lib/shop-categories.js');
+const REAL_TREE = [{
+  categorySetId: '0',
+  rootNode: {
+    children: [
+      { category: { categoryId: '115', title: '精油・アロマ・ハーブ' }, children: [
+        { category: { categoryId: '145', title: '精油（エッセンシャルオイル）' }, children: [
+          { category: { categoryId: '146', title: '精油 ア行' }, children: [
+            { category: { categoryId: '176', title: '青森ひば' } },
+          ] },
+        ] },
+      ] },
+      { category: { categoryId: '120', title: '生活雑貨・日用品' }, children: [
+        { category: { categoryId: '1270', title: '洗濯用品' } },
+      ] },
+    ],
+  },
+}];
+const flat = flattenCategoryTrees(REAL_TREE);
+check('カテゴリツリー展開: 全階層が行になる (中間ノードにも商品を割り当てられる)',
+  flat.rows.length === 6, JSON.stringify(flat.rows.map((r) => r.path)));
+check('カテゴリツリー展開: パスが「 > 」連結・categoryIdを保持',
+  flat.rows.some((r) => r.path === '生活雑貨・日用品 > 洗濯用品' && r.categoryId === '1270')
+  && flat.rows.some((r) => r.path === '精油・アロマ・ハーブ > 精油（エッセンシャルオイル） > 精油 ア行 > 青森ひば'),
+  JSON.stringify(flat.rows));
+check('カテゴリツリー展開: pathKey は小文字', flat.rows.every((r) => r.pathKey === r.path.toLowerCase()));
+check('カテゴリツリー展開: 空・壊れた入力でも落ちない',
+  flattenCategoryTrees(null).rows.length === 0 && flattenCategoryTrees([{}]).rows.length === 0
+  && flattenCategoryTrees([{ rootNode: { children: [{}] } }]).rows.length === 0);
+check('カテゴリツリー展開: タイトル内の「>」はパス区切りと衝突しないよう潰す',
+  flattenCategoryTrees([{ rootNode: { children: [{ category: { categoryId: '9', title: 'A > B' } }] } }])
+    .rows[0].path === 'A ／ B');
+check('カテゴリツリー展開: 同一パスの重複は1件だけ採用し duplicates で報告',
+  (() => {
+    const d = flattenCategoryTrees([{ rootNode: { children: [
+      { category: { categoryId: '1', title: '同じ' } },
+      { category: { categoryId: '2', title: '同じ' } },
+    ] } }]);
+    return d.rows.length === 1 && d.duplicates === 1;
+  })());
+// replaceShopCategories にそのまま渡せる形か (貼り付け取り込みと同じ経路に載る)
+const { replaceShopCategories: applyRows } = await import('../lib/shop-categories.js');
+const applied = applyRows(db, flat.rows, { force: true });
+check('カテゴリツリー展開: replaceShopCategories にそのまま渡せる (categoryIdごと保存される)',
+  applied.active >= 6
+  && db.prepare(`SELECT category_id FROM ph_shop_categories WHERE path = '生活雑貨・日用品 > 洗濯用品'`).get()?.category_id === '1270',
+  JSON.stringify(applied));
 db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id);
 dbmod.logEvent(db, fdraft.id, 'shop_categories_saved', '0件', 'smoke'); // 人が全部外した保存
 check('店舗内カテゴリ: 0件保存でも everSaved=true (人が外した意思を尊重し再挿入しない)',
