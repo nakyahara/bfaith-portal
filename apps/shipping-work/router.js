@@ -179,8 +179,16 @@ router.post('/api/picking/trouble', api((req) => {
 
 // ─── ヘルスチェック (デプロイ確認用) ───
 router.get('/api/health', (req, res) => {
-  const masters = getDB().prepare('SELECT COUNT(*) AS c FROM sw_masters').get();
-  res.json({ ok: true, masters: masters.c, statuses: BATCH_STATUSES.length });
+  const db = getDB();
+  const masters = db.prepare('SELECT COUNT(*) AS c FROM sw_masters').get();
+  // schema = 適用済みのDB版数。migration を含むデプロイの前後で、
+  // 「本番がどの版か」を外から確かめられるようにしておく (版を跨ぐ判断に必要)
+  res.json({
+    ok: true,
+    schema: db.pragma('user_version', { simple: true }),
+    masters: masters.c,
+    statuses: BATCH_STATUSES.length,
+  });
 });
 
 // ═══ 管理者: バッチ管理 (PR2) ═══
