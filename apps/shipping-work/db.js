@@ -97,13 +97,22 @@ function migrate() {
     if (!step) throw new Error(`shipping-work migration v${next} が未定義`);
     // 通常はこちらでトランザクションを張る。
     // テーブル作り直しのように PRAGMA をトランザクション外で切り替える必要がある版は
-    // { manual: true } を宣言し、自分でトランザクションと user_version を管理する
+    // { manual: true } を宣言し、自分でトランザクションと user_version を管理する。
+    // immediate = BEGIN IMMEDIATE。migration は読んでから書くので、DEFERRED だと
+    // 読み取り後の書込み昇格時に SQLITE_BUSY_SNAPSHOT (busy_timeout で待てない) になりうる
     if (step.manual) step.run(next);
     else {
       db.transaction(() => {
         step();
         db.pragma(`user_version = ${next}`);
-      })();
+      }).immediate();
+    }
+    // manual 版が user_version の更新を忘れると、そのプロセスだけ適用済みとして起動し
+    // 次回起動で同じ migration が再実行される (非冪等なら部分適用や起動不能)。
+    // ローカル変数を進める前に実DBの値で必ず突き合わせる
+    const applied = db.pragma('user_version', { simple: true });
+    if (applied !== next) {
+      throw new Error(`shipping-work migration v${next}: user_version が ${applied} のまま更新されていない`);
     }
     v = next;
   }
@@ -175,11 +184,13 @@ const MIGRATIONS = {
   6: {
     manual: true,
     run(version) {
-      const fkWasOn = db.pragma('foreign_keys', { simple: true });
-      db.pragma('foreign_keys = OFF');
-      // RENAME 時に他テーブルのFK句を書き換えさせない (参照名は sw_print_jobs のまま維持したい)
-      db.pragma('legacy_alter_table = ON');
+      // 変更する PRAGMA は先に全て控えてから触る (どこで失敗しても finally で元に戻せるように)
+      const fkWas = db.pragma('foreign_keys', { simple: true });
+      const legacyWas = db.pragma('legacy_alter_table', { simple: true });
       try {
+        db.pragma('foreign_keys = OFF');
+        // RENAME 時に他テーブルのFK句を書き換えさせない (参照名は sw_print_jobs のまま維持したい)
+        db.pragma('legacy_alter_table = ON');
         db.transaction(() => {
           if (!hasColumn('sw_batches', 'doc_url')) {
             db.exec('ALTER TABLE sw_batches ADD COLUMN doc_url TEXT');
@@ -213,10 +224,10 @@ const MIGRATIONS = {
             throw new Error(`shipping-work migration v6: 外部キー違反 ${bad.length} 件のため中止`);
           }
           db.pragma(`user_version = ${version}`);
-        })();
+        }).immediate();
       } finally {
-        db.pragma('legacy_alter_table = OFF');
-        if (fkWasOn) db.pragma('foreign_keys = ON');
+        db.pragma(`legacy_alter_table = ${legacyWas ? 'ON' : 'OFF'}`);
+        db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
       }
     },
   },
