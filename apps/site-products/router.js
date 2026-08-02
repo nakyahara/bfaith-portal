@@ -65,6 +65,10 @@ function prepareStmts(db) {
     rakutenUrl: `SELECT item_url FROM mirror_rakuten_item_purchaser_snapshot
                  WHERE item_manage_number = ? AND item_url IS NOT NULL AND item_url <> ''
                  ORDER BY date_jst DESC LIMIT 1`,
+    // 楽天の商品ページは「親商品」単位。色/サイズのバリエーションSKUコードでURLを組むと404になる
+    // (2026-08-02: サンプル20件中7件が404だった)。実在する商品管理番号かをRMS由来データで確認する
+    rakutenItemExists: `SELECT item_manage_number FROM mirror_rakuten_item_daily
+                        WHERE item_manage_number = ? ORDER BY date_jst DESC LIMIT 1`,
     yahooItem: `SELECT item_code FROM mirror_yahoo_item_daily
                 WHERE item_code = ? ORDER BY date_jst DESC LIMIT 1`,
     // Amazon ASINは供給元が3つあるので順に試す (2026-08-02: 販売実績のみだと解決0件だった)。
@@ -122,6 +126,26 @@ function safeGet(s, key, runtimeDegraded, arg) {
   }
 }
 
+/**
+ * 楽天SKUコードから「実在する商品管理番号 (親商品)」を解決する。
+ * 楽天の商品ページは親商品単位で、色/サイズはバリエーションとして1ページにまとまる。
+ * そのためSKUコード (例: 0726-000629-bk) でURLを組むと404になる (2026-08-02に実測)。
+ * ハイフン区切りの末尾を1段ずつ削りながら、RMS由来データ (mirror_rakuten_item_daily) に
+ * 実在する番号かを確認する。見つからなければ null = URLを出さない。
+ */
+function resolveRakutenItemNumber(s, rakutenCode, runtimeDegraded) {
+  const parts = String(rakutenCode).split('-');
+  // 例: a-b-c-d → [a-b-c-d, a-b-c, a-b] (最大3段まで遡る。1要素まで削ると別商品に当たる恐れ)
+  const maxStrip = Math.min(3, parts.length - 1);
+  for (let i = 0; i <= maxStrip; i++) {
+    const candidate = parts.slice(0, parts.length - i).join('-');
+    if (!candidate) break;
+    const hit = safeGet(s, 'rakutenItemExists', runtimeDegraded, candidate);
+    if (hit?.item_manage_number) return hit.item_manage_number;
+  }
+  return null;
+}
+
 function lookupMalls(s, code, runtimeDegraded, asinSourceCounts) {
   const malls = {
     rakuten: { code: null, url: null },
@@ -134,16 +158,20 @@ function lookupMalls(s, code, runtimeDegraded, asinSourceCounts) {
   const rk = safeGet(s, 'rakutenCode', runtimeDegraded, code);
   if (rk?.rakuten_code) {
     malls.rakuten.code = rk.rakuten_code;
-    const snap = safeGet(s, 'rakutenUrl', runtimeDegraded, rk.rakuten_code);
-    malls.rakuten.url =
-      snap?.item_url ??
-      `https://item.rakuten.co.jp/${RAKUTEN_SHOP_SLUG}/${rk.rakuten_code.toLowerCase()}/`;
+    // 楽天の商品ページは親商品単位。SKUコード (例: xxx-bk) から親 (xxx) を段階的に探し、
+    // **RMS由来データに実在する商品管理番号だけ**をURL化する (存在しなければURLを出さない)
+    const itemNumber = resolveRakutenItemNumber(s, rk.rakuten_code, runtimeDegraded);
+    if (itemNumber) {
+      const snap = safeGet(s, 'rakutenUrl', runtimeDegraded, itemNumber);
+      malls.rakuten.url =
+        snap?.item_url ?? `https://item.rakuten.co.jp/${RAKUTEN_SHOP_SLUG}/${itemNumber.toLowerCase()}/`;
 
-    // Yahoo (RYS連携): アイテムコード=楽天商品管理番号の小文字。実在確認できた場合のみURL化
-    const y = safeGet(s, 'yahooItem', runtimeDegraded, rk.rakuten_code.toLowerCase());
-    if (y?.item_code) {
-      malls.yahoo.code = y.item_code;
-      malls.yahoo.url = `https://store.shopping.yahoo.co.jp/${YAHOO_SELLER_ID}/${y.item_code}.html`;
+      // Yahoo (RYS連携): アイテムコード=楽天商品管理番号の小文字。実在確認できた場合のみURL化
+      const y = safeGet(s, 'yahooItem', runtimeDegraded, itemNumber.toLowerCase());
+      if (y?.item_code) {
+        malls.yahoo.code = y.item_code;
+        malls.yahoo.url = `https://store.shopping.yahoo.co.jp/${YAHOO_SELLER_ID}/${y.item_code}.html`;
+      }
     }
   }
 

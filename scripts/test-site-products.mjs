@@ -40,7 +40,16 @@ const insRkMap = db.prepare(
   `INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?, ?, ?, ?)`
 );
 insRkMap.run('test1-rk', 'TEST1', 'am', now);
-insRkMap.run('TEST3-RK', 'TEST3', 'am', now); // 大文字→フォールバックURLはlower化される
+insRkMap.run('TEST3-RK', 'TEST3', 'am', now);
+insRkMap.run('test1-rk-bk-l', 'TEST4', 'am', now);
+insRkMap.run('unknown-item-xyz', 'TEST2', 'am', now); // item_dailyに無い→URLを出さない // バリエーションSKU→親 test1-rk に解決される // 大文字→フォールバックURLはlower化される
+// 楽天の商品ページは親商品単位。RMS由来のitem_daily に実在する管理番号だけURL化される
+const insItemDaily = db.prepare(
+  `INSERT INTO mirror_rakuten_item_daily (date_jst, item_manage_number, source_run_id, source_row_hash, synced_at)
+   VALUES (?, ?, ?, ?, ?)`
+);
+insItemDaily.run('2026-07-30', 'test1-rk', 'r1', 'hd1', now);
+insItemDaily.run('2026-07-30', 'TEST3-RK', 'r1', 'hd2', now);
 db.prepare(
   `INSERT INTO mirror_rakuten_item_purchaser_snapshot
    (date_jst, item_manage_number, item_name, item_url, source_run_id, source_row_hash, synced_at)
@@ -150,6 +159,7 @@ ok('Yahoo: 実在確認済→URL', p1?.malls?.yahoo?.url === 'https://store.shop
 ok('Amazon: asin→dp URL', p1?.malls?.amazon?.url === 'https://www.amazon.co.jp/dp/B0TESTASIN', p1?.malls?.amazon?.url);
 ok('Qoo10: item_no→URL', p1?.malls?.qoo10?.url === 'https://www.qoo10.jp/g/123456789', p1?.malls?.qoo10?.url);
 ok('auPAY: idのみ・url=null', p1?.malls?.aupay?.skuKey === 'aupay-test1' && p1?.malls?.aupay?.url === null);
+ok('楽天: item_dailyに無いコードはURLを出さない (404防止)', p2?.malls?.rakuten?.url === null, p2?.malls?.rakuten?.url);
 ok('TEST2: 全モールnull', ['rakuten', 'yahoo', 'amazon', 'qoo10', 'aupay'].every((m) => p2?.malls?.[m]?.url === null));
 ok('楽天: snapshotなし→フォールバックURL (lower化)', p3?.malls?.rakuten?.url === 'https://item.rakuten.co.jp/b-faith/test3-rk/', p3?.malls?.rakuten?.url);
 ok('TEST3: Yahoo実在確認なし→URLなし', p3?.malls?.yahoo?.url === null, p3?.malls?.yahoo?.url);
@@ -158,6 +168,7 @@ ok('TEST3: Yahoo実在確認なし→URLなし', p3?.malls?.yahoo?.url === null,
 ok('引当>在庫 → stockFree=0', p4?.stockFree === 0, `got ${p4?.stockFree}`);
 ok('name null → 空文字', p4?.name === '', JSON.stringify(p4?.name));
 ok('price null → null', p4?.price === null, JSON.stringify(p4?.price));
+ok('楽天: バリエーションSKU→親商品URLに解決', p4?.malls?.rakuten?.url === 'https://item.rakuten.co.jp/b-faith/test1-rk/', p4?.malls?.rakuten?.url);
 
 // 5. fail-soft: prepare後に表をDROP → 該当lookupのみ降格・500にしない
 db.exec('DROP TABLE mirror_qoo10_items');
