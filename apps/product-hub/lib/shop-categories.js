@@ -210,6 +210,18 @@ export function canAutoApplyShopCategory(candidates) {
 }
 
 /**
+ * そのドラフトで店舗内カテゴリが一度も保存されていないか (0 件保存も「保存済み」)。
+ * AI 自動適用の可否判定。**書き込みトランザクションの中でも再確認する** (Codex R2 high):
+ * GET で autoApply を返した後に人が「全部外して保存」すると、遅れて届いた AI の
+ * 自動適用がその意思を上書きしてしまうため。
+ */
+export function shopCategoriesNeverSaved(db, draftId) {
+  return db.prepare(
+    `SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_saved'`
+  ).get(draftId).c === 0;
+}
+
+/**
  * ドラフトに紐付けてよいカテゴリ id の件数 (有効なもの + そのドラフトが既に選択中のもの)。
  * 画面・提案の対象 (listShopCategoriesForDraft) と検証条件を揃える (Codex R1 medium)。
  */

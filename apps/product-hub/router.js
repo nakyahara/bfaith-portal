@@ -40,6 +40,7 @@ import {
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
   sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
   suggestShopCategories, canAutoApplyShopCategory, countSelectableShopCategories,
+  shopCategoriesNeverSaved,
 } from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -751,15 +752,16 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, genreId, attributesJson, articleNumber,
       shippingGroup, postageIncluded, deliveryDateId, whiteBgFileId, whiteBgRaw);
-    if (shopCategoryIds !== null) setDraftShopCategories(db, draft.id, shopCategoryIds);
+    if (shopCategoryIds !== null) {
+      setDraftShopCategories(db, draft.id, shopCategoryIds);
+      // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)。
+      // 選択の入れ替えと同一トランザクションに置く (Codex R2: マーカーと実体の整合)
+      logEvent(db, draft.id, 'shop_categories_saved', `${shopCategoryIds.length}件`, actorOf(req));
+    }
   })();
   logEvent(db, draft.id, 'rakuten_fields_saved',
     [genreId, shopCategoryIds !== null ? `店舗内カテゴリ${shopCategoryIds.length}件` : null].filter(Boolean).join(' / ') || null,
     actorOf(req));
-  // 店舗内カテゴリが確定した記録 (AI 初期設定の「一度だけ」判定に使う。0件保存も「人が外した」意思表示)
-  if (shopCategoryIds !== null) {
-    logEvent(db, draft.id, 'shop_categories_saved', `${shopCategoryIds.length}件`, actorOf(req));
-  }
   res.json({ ok: true });
 });
 
@@ -858,11 +860,14 @@ router.get('/api/drafts/:id/rakuten/shop-category-suggest', (req, res) => {
   const candidates = suggestShopCategories(cats, { name: draft.name, genrePath });
   // 自動セットは「まだ一度も店舗内カテゴリが保存されていないドラフト」だけ。
   // これが無いと、人が意図的に全部外してもページを開き直すたびに AI が入れ直してしまう
-  const everSaved = db.prepare(
-    `SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_saved'`
-  ).get(draft.id).c > 0;
+  // (最終判定は POST 側のトランザクション内でもう一度行う)
+  const neverSaved = shopCategoriesNeverSaved(db, draft.id);
   // 自動適用の可否はサーバーで確定させる (画面側にしきい値ロジックを持たせない)
-  res.json({ ok: true, candidates, everSaved, autoApply: !everSaved && canAutoApplyShopCategory(candidates) });
+  res.json({
+    ok: true, candidates,
+    everSaved: !neverSaved,
+    autoApply: neverSaved && canAutoApplyShopCategory(candidates),
+  });
 });
 
 // 店舗内カテゴリだけの部分保存 (AI自動適用・候補ボタン用。draft_rakuten の他カラムは触らない)
@@ -879,11 +884,19 @@ router.post('/api/drafts/:id/shop-categories', (req, res) => {
   if (countSelectableShopCategories(db, draft.id, ids) !== ids.length) {
     return res.status(400).json({ ok: false, error: '選べない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
   }
+  // AI の自動適用 (人の操作を伴わない書き込み) だけは、トランザクション内で
+  // 「まだ一度も保存されていない」ことを再確認する (Codex R2 high: GET と POST の間に
+  // 人が「全部外して保存」していると、遅れて届いた自動適用がその意思を上書きしてしまう)。
+  // 候補ボタン (ai_candidate) は人の明示操作なのでこの制約の対象外
+  const isAutoApply = req.body?.source === 'ai';
+  let skipped = false;
   db.transaction(() => {   // 全削除→INSERT の途中失敗で空にしない (Codex R1 low)
+    if (isAutoApply && !shopCategoriesNeverSaved(db, draft.id)) { skipped = true; return; }
     setDraftShopCategories(db, draft.id, ids);
     logEvent(db, draft.id, 'shop_categories_saved',
-      `${ids.length}件${req.body?.source === 'ai' ? ' (AI初期設定)' : ''}`, actorOf(req));
+      `${ids.length}件${isAutoApply ? ' (AI初期設定)' : ''}`, actorOf(req));
   })();
+  if (skipped) return res.json({ ok: true, skipped: 'already_saved' });
   res.json({ ok: true, count: ids.length });
 });
 

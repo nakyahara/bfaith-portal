@@ -1503,7 +1503,8 @@ const everSavedQuery = (id) => db.prepare(
 check('店舗内カテゴリ: 未保存のドラフトは everSaved=false (AI自動適用の対象)', everSavedQuery(fdraft.id) === false);
 
 // 紐付け可能判定 = 有効 or そのドラフトが既に選択中 (Codex R1 medium)
-const { countSelectableShopCategories } = await import('../lib/shop-categories.js');
+const { countSelectableShopCategories, shopCategoriesNeverSaved } = await import('../lib/shop-categories.js');
+check('店舗内カテゴリ: shopCategoriesNeverSaved は未保存で true', shopCategoriesNeverSaved(db, fdraft.id) === true);
 db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
   VALUES ('900','有効な棚','有効な棚',1,0), ('901','無効な棚','無効な棚',0,1), ('902','無効だが選択中','無効だが選択中',0,2)`).run();
 const scActive = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = '有効な棚'`).get().id;
@@ -1519,6 +1520,8 @@ db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id
 dbmod.logEvent(db, fdraft.id, 'shop_categories_saved', '0件', 'smoke'); // 人が全部外した保存
 check('店舗内カテゴリ: 0件保存でも everSaved=true (人が外した意思を尊重し再挿入しない)',
   everSavedQuery(fdraft.id) === true);
+check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自動適用をtx内で拒否できる)',
+  shopCategoriesNeverSaved(db, fdraft.id) === false);
 
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
