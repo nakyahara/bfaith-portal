@@ -1007,8 +1007,12 @@ check('payload: アプリ指定なしは NE配送方法から定形外バナー�
   JSON.stringify(bNe.payload?.images || bNe.reasons));
 check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より優先 / 指定なしはNE',
   listing.effectiveShippingForDraft(db, 'rk-smoke-1', '9').group === '9'
-  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1'
-  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').group === '1');
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1');
+// 不正な明示指定は NE に隠さない (プレビュー=配送バナーなし / payload=「配送方法の指定が不正です」
+// で停止 — payload 経路は後段の「配送方法/納期の不正値を弾く」チェックが検証している)
+check('effectiveShippingForDraft: 不正指定(99)はフォールバックせず未解決を返す',
+  listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').group === null
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').invalid === true);
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 

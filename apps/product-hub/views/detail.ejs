@@ -397,8 +397,13 @@
           <div style="width:100%; aspect-ratio:1; border:2px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px;">未設定</div>
         <% } %>
       </div>
-      <%# 上限は自動追加バナー込みで判定 (出品時に初めて弾かれないよう、超過をこの場で見せる) %>
-      <% for (let i = 0; i < slotCount; i++) { const img = images[i]; const over = !!img && i >= 20 - trailingBanners.length; %>
+      <%# 上限は自動追加バナー込みで判定 (出品時に初めて弾かれないよう、超過をこの場で見せる)。
+          白抜きと同じファイルのスロットは payload で除外されるため商品画像として数えない (Codex R2) %>
+      <% let productImgCount = 0; %>
+      <% for (let i = 0; i < slotCount; i++) { const img = images[i];
+           const isWhiteBgDup = !!img && !!rakuten?.white_bg_drive_file_id && img.drive_file_id === rakuten.white_bg_drive_file_id;
+           if (img && !isWhiteBgDup) productImgCount++;
+           const over = !!img && !isWhiteBgDup && productImgCount > 20 - trailingBanners.length; %>
         <div style="text-align:center;">
           <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= over ? ' ⚠上限超え' : '' %></div>
           <% if (img) { %>

@@ -588,6 +588,9 @@ export const COMMON_TRAILING_BANNERS = [
 export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
   const g = String(shippingMethodGroup ?? '').trim();
   if (g && SHIPPING_METHOD_GROUPS[g]) return { group: g, label: SHIPPING_METHOD_GROUPS[g] };
+  // 不正な明示指定は NE へフォールバックして隠さない (buildItemPayload 側は理由で停止する。
+  // プレビューも「配送バナーなし」に揃え、直すべき状態が見えるようにする — Codex R2)
+  if (g) return { group: null, label: null, invalid: true };
   return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
 }
 
