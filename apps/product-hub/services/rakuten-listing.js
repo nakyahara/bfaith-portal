@@ -566,6 +566,50 @@ export function buildSalesDescriptionHtml(locations) {
 /** RMS の各説明文の文字数上限 (超過は登録エラー。最終判定は RMS) */
 export const DESC_LIMIT = 10240;
 
+// ─── 出品時に商品画像の末尾へ自動追加する店舗共通バナー (2026-08-03 中原さん指定) ───
+// いずれも R-Cabinet に既存の店舗共通画像 (location = image.rakuten.co.jp/b-faith/cabinet 以下)。
+// Drive には無いので draft_images/転送とは独立に、payload 組み立て時だけ付け足す
+// (配送方法を後から変えても再取込なしで追従させるため DB には持たない)
+export const SHIPPING_BANNER_LOCATIONS = {
+  '1': '/07722747/08581403/teikeigai_soryomuryo.jpg', // 定形外 送料無料
+  '5': '/07722747/09610094/imgrc0104897185.jpg',      // ネコポス
+  '9': '/07722747/09610098/rakutensouko.jpg',         // ゆうパケットパフ (楽天倉庫)
+};
+export const COMMON_TRAILING_BANNERS = [
+  { location: '/coupon/imgrc0122590661.jpg', label: 'クーポン' },
+  { location: '/11720388/same_day.jpg', label: '当日出荷' },
+  { location: '/11720388/refund.jpg', label: '返金保証' },
+];
+
+/**
+ * 配送方法の解決: アプリ指定グループ > NE配送方法のマッピング。
+ * 商品ページ表記の発送方法表示と末尾バナーの選択で共通に使う (router のプレビューも同じ関数)
+ */
+export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
+  const g = String(shippingMethodGroup ?? '').trim();
+  if (g && SHIPPING_METHOD_GROUPS[g]) return { group: g, label: SHIPPING_METHOD_GROUPS[g] };
+  // 不正な明示指定は NE へフォールバックして隠さない (buildItemPayload 側は理由で停止する。
+  // プレビューも「配送バナーなし」に揃え、直すべき状態が見えるようにする — Codex R2)
+  if (g) return { group: null, label: null, invalid: true };
+  return mapNeShippingToRakuten(db, getNeCost(db, neCode)?.shippingMethod);
+}
+
+/** 配送方法グループ → 末尾に自動追加するバナー location 一覧 (配送バナー + 共通3枚) */
+export function trailingBannerLocations(shippingGroup) {
+  const g = String(shippingGroup ?? '').trim();
+  return [
+    ...(SHIPPING_BANNER_LOCATIONS[g] ? [SHIPPING_BANNER_LOCATIONS[g]] : []),
+    ...COMMON_TRAILING_BANNERS.map((b) => b.location),
+  ];
+}
+
+/** UI プレビュー用: location → 公開画像URL (buildSalesDescriptionHtml と同じベース解決) */
+export function cabinetImageUrl(location) {
+  let base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
+  if (!/^https:\/\/[\w.-]+(?:\/[\w.\-\/]*)?$/.test(base)) base = CABINET_IMAGE_BASE;
+  return `${base}${location}`;
+}
+
 /**
  * 出品 payload を組み立てる。送れない状態なら reasons を返す (dry_run と live で共通)。
  */
@@ -594,6 +638,10 @@ export function buildItemPayload(db, draftId) {
     .map((i) => ({ cabinet_location: cabinetByFile.get(i.drive_file_id) }));
   const untransferredCount = currentImages.length - cabinet.length;
 
+  // 発送方法 (アプリ指定 > NEマッピング)。商品ページ表記の表示名と末尾バナーの選択で共通
+  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
+  const trailingBanners = trailingBannerLocations(effectiveShip.group);
+
   const reasons = [];
   // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
   const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: false });
@@ -613,8 +661,8 @@ export function buildItemPayload(db, draftId) {
   if (untransferredCount > 0) {
     reasons.push(`商品画像 ${untransferredCount} 枚が R-Cabinet に未転送です (「画像を転送」を実行)`);
   }
-  if (cabinet.length > MAX_RAKUTEN_IMAGES) {
-    reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (現在 ${cabinet.length} 枚 — 減らしてください)`);
+  if (cabinet.length + trailingBanners.length > MAX_RAKUTEN_IMAGES) {
+    reasons.push(`楽天の商品画像は最大 ${MAX_RAKUTEN_IMAGES} 枚です (商品画像 ${cabinet.length} 枚 + 自動追加バナー ${trailingBanners.length} 枚 — 商品画像を減らしてください)`);
   }
   if (whiteBgId && !whiteBg) reasons.push('白抜き背景画像が R-Cabinet に未転送です (先に「画像を転送」)');
   // 税率は 8% / 10% / 空欄 (=店舗デフォルト10%) 以外を fail-closed で止める (Codex R1 Medium-1)
@@ -703,11 +751,8 @@ export function buildItemPayload(db, draftId) {
   //   PC用商品説明文 (productDescription.pc) = 表1枚 (説明/注意事項/仕様表/商品ページ表記)
   //   PC用販売説明文 (salesDescription)      = 商品画像を width100% で並べた画像HTML
   //   スマホ用商品説明文 (productDescription.sp) = 販売説明文 + 商品説明文
-  // 発送方法の表示名はアプリ指定の配送方法グループ > NE配送方法のマッピング の順で決める
-  const pageShipGroup = String(rk.shipping_method_group ?? '').trim();
-  const pageShippingLabel = pageShipGroup && SHIPPING_METHOD_GROUPS[pageShipGroup]
-    ? SHIPPING_METHOD_GROUPS[pageShipGroup]
-    : mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod).label;
+  // 発送方法の表示名は上で解決済みの effectiveShip (アプリ指定 > NEマッピング)
+  const pageShippingLabel = effectiveShip.label;
   // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
   const descTexts = [title];
   if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
@@ -753,7 +798,11 @@ export function buildItemPayload(db, draftId) {
     genreId: String(rk.genre_id).trim(),
     hideItem: true, // 登録は常に非公開。公開はアプリの「公開」ボタン (setItemVisibility) で行う
     itemType: 'NORMAL',
-    images: cabinet.map((c) => ({ type: 'CABINET', location: c.cabinet_location })),
+    // 商品画像の末尾に店舗共通バナー (配送方法バナー + 共通3枚) を自動追加
+    images: [
+      ...cabinet.map((c) => ({ type: 'CABINET', location: c.cabinet_location })),
+      ...trailingBanners.map((loc) => ({ type: 'CABINET', location: loc })),
+    ],
     ...(whiteBg ? { whiteBgImage: { type: 'CABINET', location: whiteBg.cabinet_location } } : {}),
     ...(payment ? { payment } : {}),
     variants: {

@@ -937,7 +937,23 @@ process.env.PH_CABINET_IMAGE_BASE = 'http://evil.example/x';
 check('salesDesc: http のenvは拒否して既定URL',
   listing.buildSalesDescriptionHtml(['/a/b.jpg']).startsWith('<img src="https://image.rakuten.co.jp/b-faith/cabinet/'));
 delete process.env.PH_CABINET_IMAGE_BASE;
-check('payload: 画像は CABINET location', pl.images.length === 1 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg');
+// ─── 末尾バナー自動追加 (2026-08-03 中原さん指定) ───
+check('trailingBannerLocations: ネコポス(5) = 配送バナー + 共通3枚',
+  JSON.stringify(listing.trailingBannerLocations('5'))
+  === JSON.stringify(['/07722747/09610094/imgrc0104897185.jpg', '/coupon/imgrc0122590661.jpg', '/11720388/same_day.jpg', '/11720388/refund.jpg']));
+check('trailingBannerLocations: 定形外(1)', listing.trailingBannerLocations('1')[0] === '/07722747/08581403/teikeigai_soryomuryo.jpg');
+check('trailingBannerLocations: ゆうパケットパフ(9)', listing.trailingBannerLocations('9')[0] === '/07722747/09610098/rakutensouko.jpg');
+check('trailingBannerLocations: 対応バナーの無い配送方法/未設定は共通3枚のみ',
+  listing.trailingBannerLocations('4').length === 3 && listing.trailingBannerLocations(null).length === 3
+  && listing.trailingBannerLocations('4')[0] === '/coupon/imgrc0122590661.jpg');
+check('cabinetImageUrl: location → 公開URL',
+  listing.cabinetImageUrl('/coupon/imgrc0122590661.jpg') === 'https://image.rakuten.co.jp/b-faith/cabinet/coupon/imgrc0122590661.jpg');
+
+check('payload: 画像は CABINET location + 共通バナー3枚が末尾 (配送方法未確定)',
+  pl.images.length === 4 && pl.images[0].type === 'CABINET' && pl.images[0].location === '/app-newitems/rk-smoke-1-1.jpg'
+  && pl.images[1].location === '/coupon/imgrc0122590661.jpg'
+  && pl.images[3].location === '/11720388/refund.jpg',
+  JSON.stringify(pl.images));
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
   && pl.variants['rk-smoke-1'].articleNumber.exemptionReason === 1
@@ -971,6 +987,44 @@ check('payload: JAN欄だけではカタログID属性を自動付与しない (
 check('payload: 8% は payment.taxRate で送る', built.payload?.payment?.taxRate === 0.08);
 check('payload: 配送方法グループ + 送料込み', rkVar.shipping?.shippingMethodGroup === '5' && rkVar.shipping?.postageIncluded === true);
 check('payload: 納期情報ID は数値で送る', rkVar.normalDeliveryDateId === 1000);
+check('payload: ネコポス指定でバナー→共通3枚を商品画像の後ろに自動追加',
+  JSON.stringify(built.payload.images.slice(-4).map((i) => i.location))
+  === JSON.stringify(['/07722747/09610094/imgrc0104897185.jpg', '/coupon/imgrc0122590661.jpg', '/11720388/same_day.jpg', '/11720388/refund.jpg'])
+  && built.payload.images[0].location === '/app-newitems/rk-smoke-1-1.jpg',
+  JSON.stringify(built.payload.images));
+check('payload: 販売説明文 (画像HTML) にはバナーを入れない (商品画像のみ)',
+  !built.payload.salesDescription.includes('coupon') && !built.payload.salesDescription.includes('07722747'));
+
+// NE配送方法フォールバック (Codex R1 low: 統合レベルで検証)。
+// アプリ指定なし + NE配送方法「定形外」→ 名前一致で楽天グループ1 → 定形外バナー
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = NULL WHERE draft_id = ?`).run(rkId);
+db.prepare(`INSERT OR REPLACE INTO mirror_products (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 原価, 送料, 配送方法, 消費税率, updated_at)
+  VALUES (99401, 'rk-smoke-1', '出品smoke', '1', '取扱中', 'ok', 660, 120, '定形外', 0.1, '2026-08-03T00:00:00Z')`).run();
+let bNe = listing.buildItemPayload(db, rkId);
+check('payload: アプリ指定なしは NE配送方法から定形外バナーを選ぶ',
+  bNe.ok === true && bNe.payload.images.some((i) => i.location === '/07722747/08581403/teikeigai_soryomuryo.jpg')
+  && !bNe.payload.images.some((i) => i.location === '/07722747/09610094/imgrc0104897185.jpg'),
+  JSON.stringify(bNe.payload?.images || bNe.reasons));
+check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より優先 / 指定なしはNE',
+  listing.effectiveShippingForDraft(db, 'rk-smoke-1', '9').group === '9'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', null).group === '1');
+// 不正な明示指定は NE に隠さない (プレビュー=配送バナーなし / payload=「配送方法の指定が不正です」
+// で停止 — payload 経路は後段の「配送方法/納期の不正値を弾く」チェックが検証している)
+check('effectiveShippingForDraft: 不正指定(99)はフォールバックせず未解決を返す',
+  listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').group === null
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').invalid === true);
+db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
+db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
+
+// 20枚上限は自動追加バナーを含めて判定する
+const capIns = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)');
+const capCab = db.prepare('INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, ?, ?)');
+for (let i = 1; i <= 16; i++) { capIns.run(rkId, `gcap${i}`); capCab.run(rkId, `gcap${i}`, `/app-newitems/rk-smoke-1-cap${i}.jpg`); }
+let bCap = listing.buildItemPayload(db, rkId); // 商品17枚 + バナー4枚 = 21
+check('payload: 商品画像+自動追加バナーで20枚超は理由で止める',
+  bCap.ok === false && bCap.reasons.some((r) => r.includes('自動追加バナー')), JSON.stringify(bCap.reasons));
+db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
+db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
 
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
 check('payload: 10% は payment を送らない', !('payment' in listing.buildItemPayload(db, rkId).payload));
@@ -1953,9 +2007,16 @@ const renders = [
 ];
 for (const [name, file, data] of renders) {
   try {
-    // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態)
+    // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態・自動追加バナー)
     const html = await ejs.renderFile(path.join(views, file),
-      { thumbnailUrl, fileViewUrl, shopCatSyncState: null, ...data });
+      {
+        thumbnailUrl, fileViewUrl, shopCatSyncState: null,
+        trailingBanners: [
+          { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
+          ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),
+        ],
+        ...data,
+      });
     check(`render ${name}`, html.length > 500);
   } catch (e) {
     check(`render ${name}`, false, e.message);

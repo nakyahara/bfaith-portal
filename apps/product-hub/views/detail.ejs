@@ -397,7 +397,13 @@
           <div style="width:100%; aspect-ratio:1; border:2px dashed #cbd5e1; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:11px;">未設定</div>
         <% } %>
       </div>
-      <% for (let i = 0; i < slotCount; i++) { const img = images[i]; const over = i >= 20; %>
+      <%# 上限は自動追加バナー込みで判定 (出品時に初めて弾かれないよう、超過をこの場で見せる)。
+          白抜きと同じファイルのスロットは payload で除外されるため商品画像として数えない (Codex R2) %>
+      <% let productImgCount = 0; %>
+      <% for (let i = 0; i < slotCount; i++) { const img = images[i];
+           const isWhiteBgDup = !!img && !!rakuten?.white_bg_drive_file_id && img.drive_file_id === rakuten.white_bg_drive_file_id;
+           if (img && !isWhiteBgDup) productImgCount++;
+           const over = !!img && !isWhiteBgDup && productImgCount > 20 - trailingBanners.length; %>
         <div style="text-align:center;">
           <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= over ? ' ⚠上限超え' : '' %></div>
           <% if (img) { %>
@@ -421,6 +427,24 @@
     <div style="display:flex; gap:8px; margin-top:10px;">
       <input type="url" id="new-image-url" placeholder="https://drive.google.com/file/d/... (画像ファイルのリンクを1枚ずつ追加)">
       <button class="btn" id="add-image-btn" style="white-space:nowrap">追加</button>
+    </div>
+
+    <!-- 出品時に自動追加される店舗共通バナー (R-Cabinet 既存画像。転送・取込は不要) -->
+    <div class="field" style="margin-top:14px;">
+      <label>出品時に末尾へ自動追加されるバナー <span class="ftag ftag-auto">自動</span></label>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <% for (const b of trailingBanners) { %>
+          <div style="text-align:center; width:110px;">
+            <img src="<%= b.url %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+                 style="width:100%; aspect-ratio:1; object-fit:contain; border-radius:8px; border:1px solid #e2e8f0; background:#f8fafc;">
+            <div class="muted" style="font-size:11px;"><%= b.label %></div>
+          </div>
+        <% } %>
+      </div>
+      <div class="muted" style="font-size:11px; margin-top:4px;">
+        配送方法 (定形外 / ネコポス / ゆうパケットパフ) に応じたバナー + 共通3枚が楽天登録時に商品画像の後ろへ自動で付きます。
+        商品画像は自動追加分と合わせて20枚までです (商品画像は実質<%= 20 - trailingBanners.length %>枚まで)
+      </div>
     </div>
 
     <div class="field" style="margin-top:14px;">
