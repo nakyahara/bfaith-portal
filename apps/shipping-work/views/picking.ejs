@@ -74,6 +74,7 @@
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
       <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+      <% if (isAdmin) { %><a href="/apps/shipping-work/admin/batches" class="btn-logout">バッチ管理</a><% } %>
       <a href="/logout" class="btn-logout">ログアウト</a>
     </div>
   </header>
@@ -109,7 +110,20 @@
     <% } else { %>
       <h2 class="pk-ready-title">開始できるバッチ (<%= state.ready.length %>件)</h2>
       <% if (state.ready.length === 0) { %>
-        <div class="pk-empty">開始できるバッチはありません。<br>お疲れさまでした！</div>
+        <% if (state.noBatchesAtAll) { %>
+          <%# バッチが1件も無い = まだ誰も作っていない状態。「お疲れさま」は誤解を招くので出し分ける %>
+          <div class="pk-empty">
+            今日のバッチはまだ登録されていません。
+            <% if (isAdmin) { %>
+              <br><a class="pk-btn pdf" style="display:inline-block;width:auto;padding:10px 20px;margin-top:12px;text-decoration:none"
+                     href="/apps/shipping-work/admin/batches">🗂 バッチ管理で作成する</a>
+            <% } else { %>
+              <br>担当者がバッチを登録するまでお待ちください。
+            <% } %>
+          </div>
+        <% } else { %>
+          <div class="pk-empty">開始できるバッチはありません。<br>お疲れさまでした！</div>
+        <% } %>
       <% } %>
       <% for (const b of state.ready) { %>
         <button class="pk-tile <%= b.pdf_path ? '' : 'nodoc' %>"
