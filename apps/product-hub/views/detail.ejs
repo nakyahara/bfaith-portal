@@ -1177,6 +1177,7 @@
   //   ② genre だけを保存 (genre_only — 編集途中の他フォーム値を巻き込まない)
   //   ③ 成功してから入力欄と辞書 UI を更新
   let applyingGenre = false;
+  let initialSuggestRunning = false;  // 初期化フロー中は個別の再提案を抑止する (下の initSuggestions 参照)
   async function applyGenre(genreId, source) {
     if (applyingGenre) return false;
     applyingGenre = true;
@@ -1199,7 +1200,8 @@
       document.getElementById('rk-genre-fetch').click(); // 辞書はキャッシュ済みなので即応答
       if (source === 'ai') rkResultCat.textContent = 'AIがジャンルを設定しました (違う場合は「ツリーから選ぶ」で修正)';
       // ジャンルが確定するとフルパスで店舗内カテゴリの採点精度が上がる → AI候補を出し直す
-      if (typeof suggestShopCats === 'function') suggestShopCats(true);
+      // (初期化フローでは最後に一度だけ呼ぶので、ここでは呼ばない)
+      if (!initialSuggestRunning && typeof suggestShopCats === 'function') suggestShopCats(true);
       return true;
     } finally { applyingGenre = false; }
   }
@@ -1237,8 +1239,7 @@
       });
     } catch (e) { box.textContent = '通信エラー: ' + e.message; }
   }
-  // 初期値: ジャンルが空なら AI が自動で入れる
-  if (!document.getElementById('rk-genre').value.trim()) suggestGenre(true);
+  // 初期値の自動入力は、店舗内カテゴリの提案関数を定義したあとで直列に実行する (initSuggestions)
 
   // ─── 店舗内カテゴリ: パスからツリーを組んで表示 (RMS のカテゴリ選択相当) ───
   (function buildShopCategoryTree() {
@@ -1404,7 +1405,17 @@
       render();
     } catch (e) { box.textContent = ''; }
   }
-  if (document.getElementById('rk-cats-suggest')) suggestShopCats(true);
+  // ─── 初期値の自動入力: ジャンル → 店舗内カテゴリ の順で直列に走らせる (Codex R4 high) ───
+  // 並行に走らせると、ローカル計算で速い店舗内カテゴリの提案が先に「商品名だけの候補」で保存され、
+  // その保存記録のせいで、後から決まったジャンルを加味した候補が二度と自動適用されなくなる。
+  (async function initSuggestions() {
+    if (!document.getElementById('rk-genre').value.trim()) {
+      initialSuggestRunning = true;
+      try { await suggestGenre(true); } catch (e) { /* 提案できなくても後続は動かす */ }
+      initialSuggestRunning = false;
+    }
+    if (document.getElementById('rk-cats-suggest')) suggestShopCats(true);
+  })();
 
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
