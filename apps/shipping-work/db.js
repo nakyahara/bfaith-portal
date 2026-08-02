@@ -95,12 +95,23 @@ function migrate() {
     const next = v + 1;
     const step = MIGRATIONS[next];
     if (!step) throw new Error(`shipping-work migration v${next} が未定義`);
-    db.transaction(() => {
-      step();
-      db.pragma(`user_version = ${next}`);
-    })();
+    // 通常はこちらでトランザクションを張る。
+    // テーブル作り直しのように PRAGMA をトランザクション外で切り替える必要がある版は
+    // { manual: true } を宣言し、自分でトランザクションと user_version を管理する
+    if (step.manual) step.run(next);
+    else {
+      db.transaction(() => {
+        step();
+        db.pragma(`user_version = ${next}`);
+      })();
+    }
     v = next;
   }
+}
+
+/** テーブルに指定の列があるか (migration の冪等判定用)。 */
+function hasColumn(table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
 }
 
 const MIGRATIONS = {
@@ -156,23 +167,58 @@ const MIGRATIONS = {
   // 現場は既にピッキングリストPDFを Drive (出荷_01〜45 フォルダ) に置いてリンクで見ており、
   // アプリへのファイルアップロードを必須にすると二重管理になる。
   // 「アップロードしたPDF」か「Driveリンク」のどちらかがあれば帳票ありとして扱う。
-  6: () => {
-    db.exec('ALTER TABLE sw_batches ADD COLUMN doc_url TEXT');
-    // sw_print_jobs は pdf_path が NOT NULL のままだと doc_url だけの帳票を記録できない。
-    // SQLite は列制約を後から変更できないため作り直す。
-    // (新規DBは createPrintTables が既に新形で作っているので、旧形のときだけ実行する)
-    const hasDocUrl = db.prepare('PRAGMA table_info(sw_print_jobs)').all().some((c) => c.name === 'doc_url');
-    if (hasDocUrl) return;
-    // FK 参照元 (sw_print_attempts) があり、PRAGMA foreign_keys はトランザクション内で効かないため、
-    // 印刷データが無いうちだけ実行する (v2 と同じ安全側の方針)
-    const printRows = db.prepare('SELECT COUNT(*) c FROM sw_print_jobs').get().c
-      + db.prepare('SELECT COUNT(*) c FROM sw_print_attempts').get().c;
-    if (printRows > 0) {
-      throw new Error('shipping-work migration v6: 印刷ジョブが存在するため sw_print_jobs の再作成を中止 (手動対応が必要)');
-    }
-    db.exec('DROP TABLE sw_print_attempts');
-    db.exec('DROP TABLE sw_print_jobs');
-    createPrintTables();
+  // sw_print_jobs.pdf_path は NOT NULL のままだと doc_url だけの帳票を記録できないが、
+  // SQLite は列制約を後から変更できないためテーブルを作り直す (SQLite公式の12ステップ手順)。
+  // FK 参照元 (sw_print_attempts) があり、PRAGMA foreign_keys はトランザクション内で
+  // 切り替えられないため、この版だけ manual にして自分でトランザクションを張る。
+  // 既存の印刷ジョブ・試行は行ごとコピーして保持する (稼働後でも安全に上げられるように)。
+  6: {
+    manual: true,
+    run(version) {
+      const fkWasOn = db.pragma('foreign_keys', { simple: true });
+      db.pragma('foreign_keys = OFF');
+      // RENAME 時に他テーブルのFK句を書き換えさせない (参照名は sw_print_jobs のまま維持したい)
+      db.pragma('legacy_alter_table = ON');
+      try {
+        db.transaction(() => {
+          if (!hasColumn('sw_batches', 'doc_url')) {
+            db.exec('ALTER TABLE sw_batches ADD COLUMN doc_url TEXT');
+          }
+          // 新規DBは createPrintTables が既に新形で作っているので、旧形のときだけ入れ替える
+          if (!hasColumn('sw_print_jobs', 'doc_url')) {
+            db.exec(`CREATE TABLE sw_print_jobs_v6 (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id     INTEGER NOT NULL REFERENCES sw_batches(id),
+              session_id   INTEGER REFERENCES sw_sessions(id),
+              doc_type     TEXT NOT NULL DEFAULT 'picking_list',
+              pdf_path     TEXT,
+              doc_url      TEXT,
+              printer      TEXT,
+              status       TEXT NOT NULL DEFAULT 'requested'
+                CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
+              requested_by TEXT NOT NULL,
+              requested_at TEXT NOT NULL,
+              CHECK(pdf_path IS NOT NULL OR doc_url IS NOT NULL)
+            )`);
+            db.exec(`INSERT INTO sw_print_jobs_v6
+              (id, batch_id, session_id, doc_type, pdf_path, doc_url, printer, status, requested_by, requested_at)
+              SELECT id, batch_id, session_id, doc_type, pdf_path, NULL, printer, status, requested_by, requested_at
+              FROM sw_print_jobs`);
+            db.exec('DROP TABLE sw_print_jobs');
+            db.exec('ALTER TABLE sw_print_jobs_v6 RENAME TO sw_print_jobs');
+          }
+          // 参照が壊れていないことを確認してからコミットする
+          const bad = db.pragma('foreign_key_check');
+          if (bad.length > 0) {
+            throw new Error(`shipping-work migration v6: 外部キー違反 ${bad.length} 件のため中止`);
+          }
+          db.pragma(`user_version = ${version}`);
+        })();
+      } finally {
+        db.pragma('legacy_alter_table = OFF');
+        if (fkWasOn) db.pragma('foreign_keys = ON');
+      }
+    },
   },
 };
 
