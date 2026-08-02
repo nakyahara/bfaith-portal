@@ -87,8 +87,11 @@ export function walkPayload(payload, out = { text: '', html: '', attachments: []
   if (filename) {
     out.attachments.push({
       // Gmail の attachmentId は取得ごとに変わり得る (安定しない) ため外部IDにしない。
-      // undefined → エンジンの決定的 synthetic 採番 (msgId+fileName+size) に委ねて再同期でも冪等にする
-      externalAttachmentId: undefined,
+      // 代わりに partId (MIME構造上の位置。再取得しても安定) を使う。
+      // これで同名・同サイズの添付が同じメールに複数あっても1件に潰れない (Codexレビュー Medium-3)。
+      // partId が無い旧レスポンス形は undefined → エンジンの決定的 synthetic 採番に委ねる
+      externalAttachmentId: payload.partId ? `part:${payload.partId}` : undefined,
+      partId: payload.partId ?? null,
       fileName: filename,
       contentType: mime || null,
       fileSize: payload.body?.size ?? null,
@@ -383,7 +386,7 @@ export function createGmailAdapter(cfg = {}) {
      * そのためメッセージを取り直し、ファイル名 (+サイズ) で part を特定してから本体を取る。
      * @returns {{ buffer: Buffer, contentType: string|null, fileName: string|null }}
      */
-    async fetchAttachment({ externalMessageId, fileName, fileSize, maxBytes = null }) {
+    async fetchAttachment({ externalAttachmentId, externalMessageId, fileName, fileSize, maxBytes = null }) {
       requests = 0;
       const msgId = String(externalMessageId || '');
       if (!msgId || msgId.startsWith('syn:')) {
@@ -397,8 +400,12 @@ export function createGmailAdapter(cfg = {}) {
         for (const c of p.parts || []) walk(c);
       })(m.payload);
       const withFile = parts.filter(p => p.filename && p.body?.attachmentId);
-      // 同名添付が複数ある場合はサイズ一致を優先 (同期時に保存した file_size と突き合わせる)
-      const part = withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
+      // 同期時に保存した partId (MIME構造上の位置) が最も確実。無い場合 (旧データ) は
+      // ファイル名 + サイズ、最後にファイル名だけ、の順にフォールバックする
+      const wantPartId = String(externalAttachmentId || '').startsWith('part:')
+        ? String(externalAttachmentId).slice(5) : null;
+      const part = (wantPartId && withFile.find(p => String(p.partId) === wantPartId))
+        || withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
         || withFile.find(p => p.filename === fileName);
       if (!part) throw new Error(`添付「${fileName || '(名称不明)'}」がメール内に見つかりません (削除された可能性)`);
       if (maxBytes && part.body?.size > maxBytes) {

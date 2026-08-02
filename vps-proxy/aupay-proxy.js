@@ -298,8 +298,12 @@ async function yahooCircusGet(apiPath, params = {}) {
   return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
 }
 
-// バイナリGET (問い合わせ添付ファイルの取得。投稿時の Content-Type のまま返る)
-async function yahooCircusGetBinary(apiPath, params = {}) {
+// 添付ファイルの受信上限 (呼び出し元とは独立に、この中継自身も自衛する)
+const YAHOO_ATTACHMENT_MAX_BYTES = 20 * 1024 * 1024;
+
+// バイナリGET (問い合わせ添付ファイルの取得。投稿時の Content-Type のまま返る)。
+// Content-Length は信用せず、読みながら実バイト数で打ち切る (巨大レスポンスでのメモリ枯渇防止)
+async function yahooCircusGetBinary(apiPath, params = {}, maxBytes = YAHOO_ATTACHMENT_MAX_BYTES) {
   const accessToken = await getAccessToken();
   const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
   u.searchParams.set('sellerId', YAHOO_SELLER_ID);
@@ -307,8 +311,32 @@ async function yahooCircusGetBinary(apiPath, params = {}) {
     if (v !== undefined && v !== null && v !== '') u.searchParams.set(k, String(v));
   }
   const res = await fetch(u, { headers: yahooCircusHeaders(accessToken), signal: AbortSignal.timeout(30000) });
-  const buf = Buffer.from(await res.arrayBuffer());
-  return { status: res.status, contentType: res.headers.get('content-type') || 'application/octet-stream', buffer: buf };
+  const contentType = res.headers.get('content-type') || 'application/octet-stream';
+  const declared = Number(res.headers.get('content-length'));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { status: 413, contentType: 'application/json', buffer: Buffer.from(JSON.stringify({ error: 'attachment too large' })), tooLarge: true };
+  }
+  const reader = res.body?.getReader?.();
+  if (!reader) {
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > maxBytes) {
+      return { status: 413, contentType: 'application/json', buffer: Buffer.from(JSON.stringify({ error: 'attachment too large' })), tooLarge: true };
+    }
+    return { status: res.status, contentType, buffer: buf };
+  }
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return { status: 413, contentType: 'application/json', buffer: Buffer.from(JSON.stringify({ error: 'attachment too large' })), tooLarge: true };
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return { status: res.status, contentType, buffer: Buffer.concat(chunks, total) };
 }
 
 // POST (メッセージ投稿等)。⚠️リトライしない (送信系の再試行は二重投稿になる。結果不明の扱いは呼び出し元=outboxに委ねる)

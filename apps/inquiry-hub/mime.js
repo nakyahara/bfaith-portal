@@ -56,6 +56,37 @@ export function isInlineSafe(contentType) {
   return INLINE_SAFE.has(String(contentType || '').split(';')[0].trim().toLowerCase());
 }
 
+/**
+ * 中身 (先頭バイト) から実際の形式を判定する (2026-08-02 Codexレビュー Medium-4)。
+ * 拡張子だけを信じて inline 配信すると、拡張子を偽った別形式のファイルを
+ * 画像/PDFとしてブラウザに渡すことになる → 実データと一致したときだけ inline を許す。
+ * @returns {string|null} 判定できた Content-Type (判定不能は null)
+ */
+export function sniffContentType(buffer) {
+  if (!buffer || buffer.length < 4) return null;
+  const b = buffer;
+  const startsWith = (...bytes) => bytes.every((v, i) => b[i] === v);
+  if (startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return 'image/png';
+  if (startsWith(0xff, 0xd8, 0xff)) return 'image/jpeg';
+  if (startsWith(0x47, 0x49, 0x46, 0x38)) return 'image/gif';
+  if (startsWith(0x42, 0x4d)) return 'image/bmp';
+  if (b.length >= 12 && startsWith(0x52, 0x49, 0x46, 0x46)
+    && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+  if (startsWith(0x25, 0x50, 0x44, 0x46)) return 'application/pdf';    // %PDF
+  return null;
+}
+
+/**
+ * 配信に使う最終的な Content-Type。inline 対象 (画像・PDF) は中身と一致したときだけ
+ * その型で返し、食い違う/判定できないものは octet-stream (=必ずダウンロード) に落とす。
+ */
+export function contentTypeForServing(fileName, declared, buffer) {
+  const wanted = resolveContentType(fileName, declared);
+  if (!isInlineSafe(wanted)) return wanted;             // もともとダウンロード扱いのものはそのまま
+  const actual = sniffContentType(buffer);
+  return actual === wanted ? wanted : 'application/octet-stream';
+}
+
 /** 画面にサムネイルを出す対象か */
 export function isImage(contentType) {
   return IMAGE_TYPES.has(String(contentType || '').split(';')[0].trim().toLowerCase());

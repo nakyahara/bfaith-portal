@@ -17,13 +17,31 @@ import { getDB, logActivity } from './db.js';
 export const FOLDER_NAME_MAX = 40;
 /** サイドバーが縦に伸びすぎない上限 (これ以上必要になったら階層化を設計する) */
 export const MAX_ACTIVE_FOLDERS = 30;
+/** フォルダ削除時に問い合わせ1件ずつの操作ログを残す上限 (超えたら削除ログのみ) */
+const PER_INQUIRY_LOG_LIMIT = 200;
 
-/** 入力名の正規化 + 検証。不正なら throw */
+/** 入力名の正規化 + 検証。不正なら throw。
+ * Unicode正規化 (NFKC) までかける: 全角/半角・合成文字の違いで「見た目が同じ別フォルダ」が
+ * 並ぶのを防ぐ (DBの UNIQUE はバイト比較なので正規化しないと重複を弾けない) */
 export function normalizeFolderName(input) {
-  const name = String(input ?? '').replace(/[\r\n\t]/g, ' ').trim().replace(/\s{2,}/g, ' ');
+  const name = String(input ?? '').normalize('NFKC').replace(/[\r\n\t]/g, ' ').trim().replace(/\s{2,}/g, ' ');
   if (!name) throw new Error('フォルダ名が空です');
   if (name.length > FOLDER_NAME_MAX) throw new Error(`フォルダ名が長すぎます (${FOLDER_NAME_MAX}文字まで)`);
   return name;
+}
+
+/** 表示順の検証 (APIから直接叩かれても壊れた値を保存しない) */
+function normalizeSortOrder(v, fallback) {
+  if (v === undefined || v === null || v === '') return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 100000) throw new Error('表示順は0〜100000の整数で指定してください');
+  return n;
+}
+
+/** 大文字小文字を区別しない同名チェック (Returns と returns を別物にしない) */
+function findSameName(db, name, exceptId = null) {
+  return db.prepare(`SELECT id FROM inquiry_folders
+    WHERE is_active = 1 AND LOWER(name) = LOWER(?) AND (? IS NULL OR id != ?)`).get(name, exceptId, exceptId);
 }
 
 /**
@@ -64,9 +82,7 @@ export function createFolder(nameInput, createdBy = null) {
     if (active >= MAX_ACTIVE_FOLDERS) {
       throw new Error(`フォルダは${MAX_ACTIVE_FOLDERS}個までです (不要なフォルダを削除してください)`);
     }
-    if (db.prepare('SELECT id FROM inquiry_folders WHERE is_active = 1 AND name = ?').get(name)) {
-      throw new Error(`同じ名前のフォルダがあります: ${name}`);
-    }
+    if (findSameName(db, name)) throw new Error(`同じ名前のフォルダがあります: ${name}`);
     // 末尾に追加 (並び順は管理画面から変更できる)
     const maxOrder = db.prepare('SELECT MAX(sort_order) AS m FROM inquiry_folders WHERE is_active = 1').get().m;
     const r = db.prepare('INSERT INTO inquiry_folders (name, sort_order, created_by) VALUES (?,?,?)')
@@ -82,10 +98,10 @@ export function updateFolder(id, { name, sortOrder } = {}) {
     const f = getFolder(id);
     if (!f || !f.is_active) throw new Error('フォルダが見つかりません');
     const newName = name === undefined ? f.name : normalizeFolderName(name);
-    if (newName !== f.name && db.prepare('SELECT id FROM inquiry_folders WHERE is_active = 1 AND name = ? AND id != ?').get(newName, id)) {
+    if (newName !== f.name && findSameName(db, newName, id)) {
       throw new Error(`同じ名前のフォルダがあります: ${newName}`);
     }
-    const newOrder = Number.isFinite(Number(sortOrder)) ? Number(sortOrder) : f.sort_order;
+    const newOrder = normalizeSortOrder(sortOrder, f.sort_order);
     db.prepare(`UPDATE inquiry_folders SET name = ?, sort_order = ?,
         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).run(newName, newOrder, id);
     return { id, name: newName, sortOrder: newOrder };
@@ -94,24 +110,32 @@ export function updateFolder(id, { name, sortOrder } = {}) {
 
 /**
  * 削除 (論理削除)。中の問い合わせは未分類に戻す。
- * @returns {{ id, name, detached: number }} detached = 未分類に戻した件数
+ * 既に削除済みのフォルダを再度削除しても成功として返す (通信エラー後の再送で
+ * 「消えているのに失敗」と見えないように = 冪等。Codexレビュー Medium-6)。
+ * @returns {{ id, name, detached: number, alreadyDeleted?: boolean }}
  */
 export function deleteFolder(id, actorId = null) {
   const db = getDB();
   return db.transaction(() => {
     const f = getFolder(id);
-    if (!f || !f.is_active) throw new Error('フォルダが見つかりません');
-    // 所属していた問い合わせは未分類へ (履歴には「フォルダ解除」を残す)
-    const members = db.prepare('SELECT id FROM inquiries WHERE folder_id = ?').all(id);
-    db.prepare(`UPDATE inquiries SET folder_id = NULL,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE folder_id = ?`).run(id);
-    for (const m of members) {
-      logActivity(m.id, { actorType: 'user', userId: actorId, actionType: 'folder_change',
-        before: { folder: f.name }, after: { folder: null } });
+    if (!f) throw new Error('フォルダが見つかりません');
+    if (!f.is_active) return { id, name: f.name, detached: 0, alreadyDeleted: true };
+    // 所属していた問い合わせは未分類へ (履歴には「フォルダ解除」を残す)。
+    // 件数が多いフォルダを消したときに監査ログを大量INSERTしてトランザクションを長時間
+    // 占有しないよう、一定数を超えたら1件ずつのログは省く (削除操作自体はサーバーログに残る)
+    const members = db.prepare('SELECT id FROM inquiries WHERE folder_id = ? ORDER BY id LIMIT ?')
+      .all(id, PER_INQUIRY_LOG_LIMIT + 1);
+    const detached = db.prepare(`UPDATE inquiries SET folder_id = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE folder_id = ?`).run(id).changes;
+    if (members.length <= PER_INQUIRY_LOG_LIMIT) {
+      for (const m of members) {
+        logActivity(m.id, { actorType: 'user', userId: actorId, actionType: 'folder_change',
+          before: { folder: f.name }, after: { folder: null } });
+      }
     }
     db.prepare(`UPDATE inquiry_folders SET is_active = 0,
         updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).run(id);
-    return { id, name: f.name, detached: members.length };
+    return { id, name: f.name, detached };
   }).immediate();
 }
 

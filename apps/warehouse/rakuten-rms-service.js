@@ -56,6 +56,9 @@ function isAppCreatedItem(mn) {
 
 const DETAILS_BULK_MAX = 200;
 
+// 問い合わせ添付の受信上限 (inquiry-hub 側の上限とは独立に、この中継自身も自衛する)
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
 // /items/all-codes は 100ページ × 1.1秒 = ~110秒かかるので 5分キャッシュ。
 // 進行中の取得は in-flight promise を共有して同時実行重複を防ぐ。
 // 強制再取得は ?refresh=1 で可能。
@@ -338,10 +341,19 @@ router.get('/inquiry-attachment', rateLimitMiddleware('rakuten'), async (req, re
       return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'path / label が長すぎます', requestId: req.requestId });
     }
     const params = new URLSearchParams({ path: attPath, label });
-    const result = await rakutenRequest({
-      path: `/es/1.0/inquirymng-api/attachment?${params.toString()}`,
-      responseType: 'buffer',
-    });
+    let result;
+    try {
+      result = await rakutenRequest({
+        path: `/es/1.0/inquirymng-api/attachment?${params.toString()}`,
+        responseType: 'buffer',
+        maxBytes: MAX_ATTACHMENT_BYTES,   // 呼び出し元 (Render) とは独立に自分でも上限を持つ
+      });
+    } catch (e) {
+      if (e?.tooLarge) {
+        return errorResponse(res, { status: 413, error: 'ATTACHMENT_TOO_LARGE', message: e.message, requestId: req.requestId });
+      }
+      throw e;
+    }
     if (result.status !== 200 || !Buffer.isBuffer(result.data)) {
       const detail = Buffer.isBuffer(result.data) ? '(binary)' : String(JSON.stringify(result.data ?? '')).slice(0, 200);
       return errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: `添付取得に失敗 (HTTP ${result.status}) ${detail}`, requestId: req.requestId });

@@ -181,9 +181,20 @@ function ingestInquiry(db, shop, item, nowIso) {
       if (realId) {
         const already = db.prepare('SELECT id FROM inquiry_attachments WHERE inquiry_message_id = ? AND external_attachment_id = ?')
           .get(msgRow.id, realId);
-        const legacy = db.prepare(`SELECT id FROM inquiry_attachments
-          WHERE inquiry_message_id = ? AND external_attachment_id LIKE 'syn:%'
-            AND IFNULL(file_name, '') = IFNULL(?, '') LIMIT 1`).get(msgRow.id, a.fileName ?? null);
+        // 昇格先の特定は「同じ生成規則で計算した synthetic ID の完全一致」を最優先にする。
+        // メタデータ (fileSize) が旧同期時と変わっていて再計算が当たらない場合だけ、
+        // 同名 syn: 行のうち最も古いものにフォールバックする (同名添付が複数あっても
+        // 決定的な順序で1対1に対応させる。ORDER BY id 昇順)
+        const synId = syntheticAttachmentId(extMsgId, a.fileName, a.fileSize);
+        const legacy = db.prepare('SELECT id FROM inquiry_attachments WHERE inquiry_message_id = ? AND external_attachment_id = ?')
+          .get(msgRow.id, synId)
+          // フォールバックはファイル名に加えてサイズも照合する (旧同期でサイズを保存して
+          // いなかった NULL 行のみ名前一致で拾う)。別サイズの同名添付を誤って昇格させない
+          || db.prepare(`SELECT id FROM inquiry_attachments
+            WHERE inquiry_message_id = ? AND external_attachment_id LIKE 'syn:%'
+              AND IFNULL(file_name, '') = IFNULL(?, '')
+              AND (file_size IS NULL OR ? IS NULL OR file_size = ?)
+            ORDER BY id LIMIT 1`).get(msgRow.id, a.fileName ?? null, a.fileSize ?? null, a.fileSize ?? null);
         if (legacy) {
           if (already) db.prepare('DELETE FROM inquiry_attachments WHERE id = ?').run(legacy.id);
           else db.prepare('UPDATE inquiry_attachments SET external_attachment_id = ? WHERE id = ?').run(realId, legacy.id);

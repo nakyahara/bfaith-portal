@@ -50,6 +50,19 @@ console.log('1. MIME判定');
   check('サイズ表記', mime.fmtBytes(2048) === '2KB' && mime.fmtBytes(0) === '' && mime.fmtBytes(3 * 1048576) === '3.0MB');
   check('拡張子→型 (Yahoo fileExt用)', mime.contentTypeFromExt('PNG') === 'image/png' && mime.contentTypeFromExt('.pdf') === 'application/pdf');
 
+  // 中身 (先頭バイト) と拡張子が食い違うものは inline させない
+  const realPng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+  const fakePng = Buffer.from('<html><script>alert(1)</script></html>');
+  const realPdf = Buffer.from('%PDF-1.7 test');
+  check('magic bytes 判定 (PNG/JPEG/PDF)', mime.sniffContentType(realPng) === 'image/png'
+    && mime.sniffContentType(Buffer.from([0xff, 0xd8, 0xff, 0xe0])) === 'image/jpeg'
+    && mime.sniffContentType(realPdf) === 'application/pdf');
+  check('中身が一致する画像はそのまま配信', mime.contentTypeForServing('a.png', 'image/png', realPng) === 'image/png');
+  check('拡張子を偽ったファイルはoctet-streamへ落とす',
+    mime.contentTypeForServing('a.png', 'image/png', fakePng) === 'application/octet-stream');
+  check('中身が一致するPDFはinline可', mime.isInlineSafe(mime.contentTypeForServing('a.pdf', null, realPdf)));
+  check('判定不能 (短すぎる) もoctet-stream', mime.contentTypeForServing('a.png', 'image/png', Buffer.from([1])) === 'application/octet-stream');
+
   const cd = contentDispositionValue('請求書 2026.pdf', true);
   check('Content-Disposition: inline + RFC5987', cd.startsWith('inline;') && cd.includes("filename*=UTF-8''") && cd.includes('%E8%AB%8B'), cd);
   check('Content-Disposition: 非ASCIIはASCII名にも落とす', /filename="[\x20-\x7e]+"/.test(cd), cd);
@@ -70,13 +83,18 @@ console.log('2. Gmail添付取得');
     return new Response(JSON.stringify({
       id: 'msg1',
       payload: { mimeType: 'multipart/mixed', parts: [
-        { mimeType: 'text/plain', body: { data: '' } },
-        { filename: '写真.png', mimeType: 'image/png', body: { attachmentId: 'att-abc', size: png.length } },
-        { filename: '写真.png', mimeType: 'image/png', body: { attachmentId: 'att-other', size: 999 } },
+        { partId: '0', mimeType: 'text/plain', body: { data: '' } },
+        { partId: '1', filename: '写真.png', mimeType: 'image/png', body: { attachmentId: 'att-abc', size: png.length } },
+        { partId: '2', filename: '写真.png', mimeType: 'image/png', body: { attachmentId: 'att-other', size: 999 } },
       ] },
     }), { status: 200 });
   };
   const ad = createGmailAdapter({ clientId: 'a', clientSecret: 'b', refreshToken: 'c', fetchImpl, sleepMs: 0 });
+  // partId 指定 (同期時に保存した外部ID) があれば、それでpartを特定する
+  const byPart = await ad.fetchAttachment({ externalAttachmentId: 'part:2', externalMessageId: 'msg1', fileName: '写真.png' });
+  check('partIdで正しいpartを引く (同名・別サイズでも取り違えない)',
+    Buffer.compare(byPart.buffer, png) === 0 && calls.some(u => u.includes('att-other')));
+  calls.length = 0;
   const got = await ad.fetchAttachment({ externalMessageId: 'msg1', fileName: '写真.png', fileSize: png.length });
   check('本体を取得できる', Buffer.compare(got.buffer, png) === 0);
   check('Content-Typeはpartのmime', got.contentType === 'image/png');
@@ -119,6 +137,14 @@ console.log('3. 楽天・Yahoo添付取得');
   try { await rk.fetchAttachment({ externalAttachmentId: 'syn:zzz', fileName: 'x.png' }); } catch (e) { rkSyn = e; }
   check('楽天: 取得キーが無い添付はthrow', rkSyn !== null && /取得キー/.test(rkSyn.message));
 
+  // Content-Length を偽って申告しても、実バイト数で打ち切る (Codexレビュー High-1)
+  const liar = async () => new Response(Buffer.alloc(1024), { status: 200,
+    headers: { 'Content-Type': 'image/png', 'Content-Length': '10' } });
+  const rkLiar = createRakutenAdapter({ transport: 'direct', serviceSecret: 's', licenseKey: 'l', fetchImpl: liar, sleepMs: 0 });
+  let liarErr = null;
+  try { await rkLiar.fetchAttachment({ externalAttachmentId: 'p', fileName: 'f.png', maxBytes: 100 }); } catch (e) { liarErr = e; }
+  check('Content-Length過小申告でも実バイト数で打ち切る', liarErr !== null && /大きすぎ/.test(liarErr.message));
+
   const yh = createYahooAdapter({ proxyUrl: 'https://vps.example.com', proxySecret: 'ps', fetchImpl, sleepMs: 0 });
   const g2 = await yh.fetchAttachment({ externalAttachmentId: 'obj/key/123', fileName: '画像.png' });
   check('Yahoo: VPSプロキシの externalTalkFile を叩く',
@@ -128,6 +154,19 @@ console.log('3. 楽天・Yahoo添付取得');
   let big = null;
   try { await yh.fetchAttachment({ externalAttachmentId: 'k', fileName: 'x.png', maxBytes: 3 }); } catch (e) { big = e; }
   check('Yahoo: Content-Lengthで事前に上限判定', big !== null && /大きすぎ/.test(big.message));
+}
+
+// ─── 3.5 Gmail: walkPayload が partId を外部IDにする ───
+console.log('3.5 Gmail添付の外部ID');
+{
+  const { walkPayload } = await import('./sync/adapters/gmail.js');
+  const out = walkPayload({ mimeType: 'multipart/mixed', parts: [
+    { partId: '1', filename: 'a.png', mimeType: 'image/png', body: { attachmentId: 'x', size: 10 } },
+    { partId: '2', filename: 'a.png', mimeType: 'image/png', body: { attachmentId: 'y', size: 10 } },
+  ] });
+  check('同名・同サイズでも partId で別IDになる (1件に潰れない)',
+    out.attachments.length === 2 && out.attachments[0].externalAttachmentId === 'part:1'
+    && out.attachments[1].externalAttachmentId === 'part:2', JSON.stringify(out.attachments));
 }
 
 // ─── 4. Yahoo detail → objectKey のマッピング + 同期時の昇格 ───
@@ -189,7 +228,10 @@ console.log('5. HTTP配信');
 
   // Yahoo transport env が無い状態 → 502 + 日本語エラー (画面が壊れない)
   const rErr = await fetch(`${base}/attachments/${attRow.id}`);
-  check('取得できないときは502で理由を返す', rErr.status === 502 && (await rErr.text()).includes('添付を取得できませんでした'));
+  const errText = await rErr.text();
+  check('取得できないときは502', rErr.status === 502 && errText.includes('添付を取得できませんでした'));
+  check('内部事情 (env・上流URL) は画面に出さずエラーIDのみ',
+    errText.includes('エラーID') && !errText.includes('env') && !errText.includes('http'), errText);
 
   const detailHtml = await (await fetch(`${base}/inquiries/${db.prepare('SELECT id FROM inquiries LIMIT 1').get().id}`)).text();
   check('詳細画面に画像サムネイル (img + lazy)', detailHtml.includes(`/apps/inquiry-hub/attachments/${attRow.id}`) && detailHtml.includes('loading="lazy"'));

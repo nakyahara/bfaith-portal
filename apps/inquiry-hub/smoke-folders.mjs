@@ -117,9 +117,11 @@ console.log('3. 削除');
   check('includeInactiveなら見える', listFolders({ includeInactive: true }).some(f => f.name === '返品・交換'));
   check('削除済みと同じ名前は作り直せる', createFolder('返品・交換').id > 0);
 
-  let gone = null;
-  try { deleteFolder(ret.id, 'tester'); } catch (e) { gone = e; }
-  check('削除済みの再削除はthrow', gone !== null);
+  const again = deleteFolder(ret.id, 'tester');
+  check('削除済みの再削除は成功扱い (冪等)', again.alreadyDeleted === true && again.detached === 0);
+  let missing = null;
+  try { deleteFolder(999999, 'tester'); } catch (e) { missing = e; }
+  check('存在しないIDの削除はthrow', missing !== null);
 }
 
 // ─── 4. HTTP (画面 + API) ───
@@ -161,7 +163,16 @@ console.log('4. HTTP');
 
   const rDel = await jpost(`/api/folders/${newId}/delete`, {});
   check('削除API', rDel.status === 200);
-  check('削除済みの操作は400', (await jpost(`/api/folders/${newId}`, { name: 'x' })).status === 400);
+  check('削除の再送も200 (冪等)', (await jpost(`/api/folders/${newId}/delete`, {})).status === 200);
+  check('削除済みの改名は400', (await jpost(`/api/folders/${newId}`, { name: 'x' })).status === 400);
+
+  // 表示順の検証 (APIから直接壊れた値を送っても保存しない)
+  check('表示順が小数は400', (await jpost(`/api/folders/${listFolders()[0].id}`, { sortOrder: 1.5 })).status === 400);
+  check('表示順が範囲外は400', (await jpost(`/api/folders/${listFolders()[0].id}`, { sortOrder: -1 })).status === 400);
+  // 大文字小文字・全角半角ちがいの同名も弾く
+  await jpost('/api/folders', { name: 'Returns' });
+  check('大文字小文字ちがいの同名は400', (await jpost('/api/folders', { name: 'returns' })).status === 400);
+  check('全角/半角ちがいの同名も400 (NFKC正規化)', (await jpost('/api/folders', { name: 'Ｒｅｔｕｒｎｓ' })).status === 400);
 
   server.close();
 }

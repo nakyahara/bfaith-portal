@@ -23,6 +23,7 @@
 
 import { SendRejectedError } from '../../outbox.js';
 import { contentTypeFromExt } from '../../mime.js';
+import { readBodyWithLimit } from '../../read-limited.js';
 
 const DAY_MS = 86400000;
 const SEND_BODY_MAX = 2000; // externalTalkAdd の本文上限 (公式仕様)
@@ -251,14 +252,8 @@ export function createYahooAdapter(cfg = {}) {
         throw new Error(timedOut ? `Yahoo添付取得 タイムアウト (${requestTimeoutMs}ms)` : `Yahoo添付取得の接続失敗: ${err?.message || err}`);
       }
       if (res.status !== 200) throw new Error(`Yahoo添付取得 HTTP ${res.status}`);
-      const declared = Number(res.headers.get('content-length'));
-      if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
-        throw new Error(`添付が大きすぎます (${Math.round(declared / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
-      }
-      const buffer = Buffer.from(await res.arrayBuffer());
-      if (maxBytes && buffer.length > maxBytes) {
-        throw new Error(`添付が大きすぎます (${Math.round(buffer.length / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
-      }
+      // Content-Length は信用せず、読みながら実バイト数で打ち切る (Codexレビュー High-1)
+      const buffer = await readBodyWithLimit(res, maxBytes, '添付');
       return { buffer, contentType: res.headers.get('content-type') || null, fileName: fileName || null };
     },
 

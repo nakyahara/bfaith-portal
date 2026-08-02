@@ -45,6 +45,35 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** バイナリレスポンスを上限つきで読む (Content-Length を信用せず実バイト数で打ち切る) */
+async function readWithLimit(response, maxBytes) {
+  const declared = Number(response.headers.get('content-length'));
+  if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
+    throw Object.assign(new Error(`レスポンスが大きすぎます (${Math.round(declared / 1048576)}MB > 上限${Math.round(maxBytes / 1048576)}MB)`), { tooLarge: true });
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    const buf = Buffer.from(await response.arrayBuffer());
+    if (maxBytes && buf.length > maxBytes) {
+      throw Object.assign(new Error(`レスポンスが大きすぎます (上限${Math.round(maxBytes / 1048576)}MB)`), { tooLarge: true });
+    }
+    return buf;
+  }
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (maxBytes && total > maxBytes) {
+      await reader.cancel().catch(() => { /* 既に切れている場合は無視 */ });
+      throw Object.assign(new Error(`レスポンスが大きすぎます (上限${Math.round(maxBytes / 1048576)}MB)`), { tooLarge: true });
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
+}
+
 /**
  * 楽天 RMS への単発リクエスト。直列キューに必ず乗る。
  *
@@ -61,6 +90,7 @@ function sleep(ms) {
  * @param {number} [opts.maxAttempts=4] - 初回 + retry 含む総試行回数
  * @param {'json'|'buffer'} [opts.responseType='json'] - 'buffer' はレスポンスを Buffer で返す
  *   (問い合わせ添付ファイル等のバイナリ用。data が Buffer になり contentType が付く)
+ * @param {number|null} [opts.maxBytes=null] - responseType='buffer' 時の受信上限 (超過は throw)
  * @returns {Promise<{status:number, data:any, attempts:number, contentType?:string}>}
  */
 export function rakutenRequest(opts) {
@@ -80,6 +110,7 @@ async function doRakutenRequest({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
   responseType = 'json',
+  maxBytes = null,
 }) {
   const auth = makeAuthHeader();
   if (!auth) {
@@ -118,9 +149,10 @@ async function doRakutenRequest({
 
       const contentType = response.headers.get('content-type') || undefined;
       // バイナリ (添付ファイル) は Buffer のまま返す。エラー時はJSON/テキストなので
-      // 成功レスポンスだけ Buffer 化し、失敗は従来どおり文字列で扱う
+      // 成功レスポンスだけ Buffer 化し、失敗は従来どおり文字列で扱う。
+      // Content-Length は信用せず読みながら打ち切る (巨大レスポンスでのメモリ枯渇防止)
       if (responseType === 'buffer' && response.status >= 200 && response.status < 300) {
-        const buf = Buffer.from(await response.arrayBuffer());
+        const buf = await readWithLimit(response, maxBytes);
         return { status: response.status, data: buf, attempts: attempt, contentType };
       }
 
@@ -149,6 +181,7 @@ async function doRakutenRequest({
     } catch (e) {
       // ネットワークエラー / timeout
       lastError = e;
+      if (e?.tooLarge) throw e;   // サイズ超過は再試行しても結果が変わらない (帯域の無駄)
       if (attempt < maxAttempts) {
         const waitMs = 1000 * Math.pow(2, attempt - 1) + Math.random() * 250;
         await sleep(waitMs);

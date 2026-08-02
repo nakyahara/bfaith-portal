@@ -343,7 +343,8 @@ router.get('/inquiries/:id', (req, res) => {
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
         </div>`}
       </div>` : `
-      <div class="panel reply-note">✉️ 返信機能は Step 3 以降で実装 (現在は read-only 運用。返信はメールディーラーから)</div>`;
+      <div class="panel reply-note">✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
+        <span class="sub">管理者が env <code>INQUIRY_HUB_REPLY_EDITOR_ENABLED=true</code> を設定すると、この画面から返信できます</span></div>`;
 
   // 📧 このメールを今後どう扱うか (メールチャネルのみ)。自動配信メールが受信トレイを
   // 埋めるので、その場でルールを作れるようにする (2026-07-25 中原さん要望)
@@ -1531,11 +1532,17 @@ router.get('/attachments/:id(\\d+)', async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     // 添付は問い合わせ内容そのもの → 共有キャッシュには置かせない (ブラウザ内のみ短時間)
     res.setHeader('Cache-Control', 'private, max-age=300');
+    // 他サイトからの埋め込み・PDFビューア経由の外部読み込みを塞ぐ
+    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; object-src 'none'; sandbox");
     res.status(200).end(buffer);
   } catch (e) {
-    const msg = String(e?.message || e).slice(0, 200);
-    console.warn(`[inquiry-hub] 添付取得失敗 id=${ctx.id} (${ctx.channel_type}): ${msg}`);
-    res.status(502).type('text/plain; charset=utf-8').send(`添付を取得できませんでした: ${msg}`);
+    // 画面には固定文言のみ (上流のURL・内部ホスト名・設定状況を利用者に出さない。
+    // 原因はサーバーログとエラーIDで追う。Codexレビュー Medium-5)
+    const errorId = crypto.randomUUID().slice(0, 8);
+    console.warn(`[inquiry-hub] 添付取得失敗 id=${ctx.id} (${ctx.channel_type}) errorId=${errorId}: ${String(e?.message || e).slice(0, 300)}`);
+    res.status(502).type('text/plain; charset=utf-8')
+      .send(`添付を取得できませんでした (時間をおいて再度お試しください)。解決しない場合は管理者にエラーID ${errorId} をお伝えください`);
   }
 });
 
