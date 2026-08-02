@@ -834,6 +834,78 @@ router.get('/shop-categories/tree', rateLimitMiddleware('rakuten'), async (req, 
   }
 });
 
+// ==========================================
+// 商品 ⇔ 店舗内カテゴリ の割り当て (item-mappings、2026-08-02)
+//   GET  /es/2.0/categories/item-mappings/manage-numbers/{mn} → {"categoryIds":["1270"], created, updated}
+//   PUT  同 body {categoryIds:[...], mainPluralCategoryId?} → 登録/変更 (⚠️POST ではなく PUT)
+//   複数カテゴリのときは mainPluralCategoryId (メインに据える棚) が必須で、categoryIds に含める必要がある。
+//   ⚠️商品 API (items) には店舗内カテゴリのフィールドが無いので、割り当てはこの API が唯一の経路
+// ==========================================
+
+router.get('/item-mappings/manage-numbers/:manageNumber', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    const r = await rakutenRequest({ path: `/es/2.0/categories/item-mappings/manage-numbers/${mn}` });
+    res.status(r.status).json(r.data ?? { ok: r.status < 300 });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+router.put('/item-mappings/manage-numbers/:manageNumber', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    // 入力検証を先に行う (台帳ガードが先だと、入力ミスまで 403 に見えて原因が分からない)
+    const ids = Array.isArray(req.body?.categoryIds) ? req.body.categoryIds.map(String) : null;
+    if (!ids || ids.length === 0) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'categoryIds (1件以上) が必要です', requestId: req.requestId });
+    }
+    if (ids.some((id) => !/^\d{1,12}$/.test(id))) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'categoryIds は数字で指定してください', requestId: req.requestId });
+    }
+    if (new Set(ids).size !== ids.length) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'categoryIds が重複しています', requestId: req.requestId });
+    }
+    const body = { categoryIds: ids };
+    if (ids.length > 1) {
+      // 複数のときは「メインの棚」を必ず指定する (RMS 仕様)
+      const main = req.body?.mainPluralCategoryId != null ? String(req.body.mainPluralCategoryId) : '';
+      if (!main || !ids.includes(main)) {
+        return errorResponse(res, {
+          status: 400, error: 'INVALID_PAYLOAD',
+          message: '複数カテゴリのときは mainPluralCategoryId (categoryIds に含まれる値) が必要です',
+          requestId: req.requestId,
+        });
+      }
+      body.mainPluralCategoryId = main;
+    }
+    // 既存商品の棚を勝手に付け替えないよう、対象はこの service で登録した商品に限る
+    // (items の PUT / visibility と同じ台帳ガード)
+    if (!isAppCreatedItem(mn)) {
+      return errorResponse(res, {
+        status: 403, error: 'MAPPING_NOT_ALLOWED',
+        message: `${mn} はこの service から登録した商品ではないため店舗内カテゴリを変更できません (既存商品は RMS 画面で操作)`,
+        requestId: req.requestId,
+      });
+    }
+    // 変更系は自動リトライしない (items PUT と同じ理由。結果不明なら呼び出し側が GET で照合)
+    const result = await withManageNumberLock(mn, async () => rakutenRequest({
+      path: `/es/2.0/categories/item-mappings/manage-numbers/${mn}`,
+      method: 'PUT', body, timeoutMs: 60_000, maxAttempts: 1,
+    }));
+    console.log(`[rakuten-rms] item-mapping mn=${mn} ids=${ids.join(',')} status=${result.status}`);
+    res.status(result.status).json(result.data ?? { ok: result.status < 300 });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 router.get('/status', (req, res) => {
   okResponse(res, {
     hasCredentials: !!(process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY),

@@ -1590,6 +1590,34 @@ check('カテゴリツリー展開: 件数上限を超えたら truncated (部�
 check('カテゴリツリー展開: 正常データでは truncated=false・skipped 空',
   flat.truncated === false && flat.skipped.length === 0);
 
+// item-mappings で棚を反映するための列 (2026-08-02)
+const rkColsNow = new Set(db.prepare('PRAGMA table_info(draft_rakuten)').all().map((c) => c.name));
+check('draft_rakuten に反映状態の列がある (冪等ALTER)',
+  rkColsNow.has('shop_categories_synced_at') && rkColsNow.has('shop_categories_error'),
+  [...rkColsNow].join(','));
+const listing2 = await import('../services/rakuten-listing.js');
+check('syncShopCategoriesToRms がエクスポートされている', typeof listing2.syncShopCategoriesToRms === 'function');
+// 未登録ドラフトは反映できない (先に「非公開で登録」が必要)
+const unreg = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('未登録ドラフトの棚反映は拒否される',
+  unreg.ok === false && String(unreg.error).includes('登録した商品だけ'), JSON.stringify(unreg));
+// 登録済みだが棚が未選択 → 明示エラー (RMS を叩かない)
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id); // 他テストの残りを掃除
+db.prepare(`UPDATE draft_rakuten SET registered_at = '2026-08-02T00:00:00Z' WHERE draft_id = ?`).run(fdraft.id);
+const noCat = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('棚が未選択なら RMS を叩かずエラー',
+  noCat.ok === false && String(noCat.error).includes('選択されていません'), JSON.stringify(noCat));
+// categoryId を持たない棚 (貼り付け取り込み由来) だけのときも叩かない
+db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+  VALUES (NULL, 'ID無しの棚', 'id無しの棚', 1, 99)`).run();
+const noIdCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = 'id無しの棚'`).get().id;
+db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, noIdCat);
+const idless = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('カテゴリIDが無い棚だけなら「取り込み直して」と案内し RMS を叩かない',
+  idless.ok === false && String(idless.error).includes('カテゴリIDがありません'), JSON.stringify(idless));
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id);
+db.prepare(`UPDATE draft_rakuten SET registered_at = NULL WHERE draft_id = ?`).run(fdraft.id);
+
 // 承認 (too_few → force) を「確認した内容」に固定する指紋 (Codex R2 high)
 const { shopCategorySnapshotHash } = await import('../lib/shop-categories.js');
 const snapA = shopCategorySnapshotHash(flat.rows);

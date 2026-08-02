@@ -656,12 +656,92 @@ export async function registerHidden(draftId, { actor = null } = {}) {
     if (d?.status === 'approved') {
       db.prepare(`UPDATE product_drafts SET status = 'listed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'approved'`).run(draftId);
     }
-    return { ok: true, manageNumber: mn, status: r.status };
+    // 店舗内カテゴリ (お店の棚) は商品 payload に載らない別 API なので、登録成功後に続けて反映する。
+    // ここで失敗しても登録自体は成功しているので止めない (結果は shopCategories として返し、
+    // draft_rakuten.shop_categories_error にも残るので画面から再実行できる)
+    let shopCategories = null;
+    try {
+      shopCategories = await syncShopCategoriesToRms(draftId, { actor });
+    } catch (e) {
+      shopCategories = { ok: false, error: String(e.message || e).slice(0, 300) };
+    }
+    return { ok: true, manageNumber: mn, status: r.status, shopCategories };
   }
 
   const errText = r.data?.message || extractRmsErrors(r.data) || `HTTP ${r.status}`;
   saveResult.run(draftId, null, String(errText).slice(0, 1500));
   logEvent(db, draftId, 'rakuten_register_failed', String(errText).slice(0, 500), actor);
+  return { ok: false, status: r.status, error: errText };
+}
+
+/**
+ * 選択した店舗内カテゴリ (お店の棚) を RMS に反映する (2026-08-02、item-mappings API)。
+ *
+ * ⚠️ 商品 API には店舗内カテゴリのフィールドが無いので、出品 payload には載せられず
+ * 登録とは別の API 呼び出しになる。そのため「登録は成功したが棚は未反映」が起こり得る
+ * → 結果を draft_rakuten.shop_categories_synced_at / last_error に残し、画面から再実行できるようにする。
+ *
+ * @param {number} draftId
+ * @param {{actor?: string|null, silent?: boolean}} opts silent=true なら登録直後の自動反映 (失敗しても throw しない)
+ */
+export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'draft_not_found' };
+  const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  if (!rk?.registered_at) {
+    return { ok: false, error: 'このアプリから楽天に登録した商品だけ棚を反映できます (先に「非公開で登録」)' };
+  }
+  // 選択中の棚 (categoryId が判っているものだけ = API 同期で取り込んだもの)
+  const rows = db.prepare(`
+    SELECT c.category_id, c.path FROM draft_shop_categories s
+    JOIN ph_shop_categories c ON c.id = s.shop_category_id
+    WHERE s.draft_id = ? ORDER BY c.sort_order, c.id
+  `).all(draftId);
+  const withId = rows.filter((r) => r.category_id != null && String(r.category_id).trim() !== '');
+  if (rows.length === 0) {
+    return { ok: false, error: '店舗内カテゴリが選択されていません (「カテゴリ・属性」タブで選んでください)' };
+  }
+  if (withId.length === 0) {
+    return {
+      ok: false,
+      error: '選択中の棚にカテゴリIDがありません。一覧画面の「楽天から取り込む」でカテゴリ一覧を同期し直してください',
+    };
+  }
+  const categoryIds = withId.map((r) => String(r.category_id).trim());
+  const mn = String(draft.ne_code).trim().toLowerCase();
+  const body = { categoryIds };
+  // 複数のときは「メインの棚」= 先頭 (画面の並び順で最初に選ばれた棚) を指定する
+  if (categoryIds.length > 1) body.mainPluralCategoryId = categoryIds[0];
+
+  const r = await callWarehouse(
+    `/service-api/rakuten-rms/item-mappings/manage-numbers/${encodeURIComponent(mn)}`,
+    { method: 'PUT', body, timeoutMs: 90_000 },
+  );
+  if (r.status === 404 && !r.data) {
+    return { ok: false, error: 'miniPC 側の店舗内カテゴリ反映ルートが未反映です (miniPC で git pull + Restart-Service)' };
+  }
+  const skipped = rows.length - withId.length;
+  if (r.status >= 200 && r.status < 300) {
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, shop_categories_synced_at, shop_categories_error) VALUES (?, ?, NULL)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        shop_categories_synced_at = excluded.shop_categories_synced_at,
+        shop_categories_error = NULL,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draftId, new Date().toISOString());
+    logEvent(db, draftId, 'rakuten_shop_categories_synced',
+      withId.map((r2) => r2.path).join(' ／ ').slice(0, 500), actor);
+    return { ok: true, count: categoryIds.length, skipped, paths: withId.map((r2) => r2.path) };
+  }
+  const errText = r.data?.message || extractRmsErrors(r.data) || `HTTP ${r.status}`;
+  db.prepare(`
+    INSERT INTO draft_rakuten (draft_id, shop_categories_error) VALUES (?, ?)
+    ON CONFLICT(draft_id) DO UPDATE SET
+      shop_categories_error = excluded.shop_categories_error,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+  `).run(draftId, String(errText).slice(0, 1000));
+  logEvent(db, draftId, 'rakuten_shop_categories_failed', String(errText).slice(0, 500), actor);
   return { ok: false, status: r.status, error: errText };
 }
 

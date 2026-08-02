@@ -26,7 +26,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -1021,6 +1021,21 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// 店舗内カテゴリ (お店の棚) を RMS へ反映 (2026-08-02、item-mappings API)。
+// 登録時に自動で走るが、失敗したときや棚を選び直したときに手動で再実行する
+router.post('/api/drafts/:id/rakuten/sync-shop-categories', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await syncShopCategoriesToRms(draft.id, { actor: actorOf(req) });
+    if (!r.ok) return res.status(400).json({ ok: false, error: r.error });
+    res.json(r);
+  } catch (e) {
+    console.error('[product-hub] shop-category mapping failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });
