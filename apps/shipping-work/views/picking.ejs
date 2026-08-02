@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    /* タブレット前提: 1画面1動作・大ボタン (実装計画§6) */
+    .pk-wrap { max-width: 720px; margin: 0 auto; padding: 12px 16px 40px; }
+    .pk-stats { color: #495057; font-size: 0.95em; margin-bottom: 10px; }
+    .pk-stats b { font-size: 1.15em; }
+    .pk-current { background: #fff; border: 2px solid #339af0; border-radius: 12px; padding: 18px; }
+    .pk-current .no { font-size: 2.0em; font-weight: bold; }
+    .pk-current .meta { margin-top: 6px; color: #495057; font-size: 1.05em; }
+    .pk-current .badge { display: inline-block; background: #e9ecef; border-radius: 6px;
+                         padding: 2px 10px; margin: 3px 6px 0 0; }
+    .pk-held { background: #fff9db; border: 2px solid #f59f00; border-radius: 12px;
+               padding: 14px 16px; margin-bottom: 10px; }
+    .pk-held .no { font-size: 1.4em; font-weight: bold; }
+    .pk-held .meta { color: #495057; margin: 4px 0 10px; }
+    .pk-timer { font-size: 2.6em; font-weight: bold; text-align: center; margin: 14px 0 4px;
+                font-variant-numeric: tabular-nums; }
+    .pk-timer.paused { color: #f59f00; }
+    .pk-timer-note { text-align: center; color: #868e96; font-size: 0.9em; margin-bottom: 10px; }
+    .pk-btns { display: grid; gap: 12px; margin-top: 14px; }
+    .pk-btn { display: block; width: 100%; border: none; border-radius: 12px; padding: 20px 10px;
+              font-size: 1.35em; font-weight: bold; cursor: pointer; }
+    .pk-btn.complete { background: #2b8a3e; color: #fff; }
+    .pk-btn.complete-next { background: #1971c2; color: #fff; }
+    .pk-btn.pause { background: #f59f00; color: #fff; }
+    .pk-btn.resume { background: #2b8a3e; color: #fff; }
+    .pk-btn.trouble { background: #fff; color: #c92a2a; border: 2px solid #c92a2a; font-size: 1.05em; padding: 12px 10px; }
+    .pk-btn.pdf { background: #f1f3f5; color: #212529; font-size: 1.05em; padding: 12px 10px; }
+    .pk-btn:disabled { opacity: 0.5; cursor: default; }
+    .pk-ready-title { font-size: 1.1em; margin: 18px 0 8px; }
+    .pk-tile { display: block; width: 100%; text-align: left; background: #fff; border: 1px solid #dee2e6;
+               border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; cursor: pointer; font-size: 1em; }
+    .pk-tile:active { background: #e7f5ff; }
+    .pk-tile .no { font-size: 1.35em; font-weight: bold; }
+    .pk-tile .meta { color: #495057; margin-top: 3px; }
+    .pk-tile .carry { color: #e8590c; font-weight: bold; }
+    .pk-tile.nodoc { background: #f8f9fa; color: #868e96; cursor: default; }
+    .pk-tile .nodoc-msg { color: #c92a2a; font-weight: bold; margin-top: 4px; }
+    .pk-empty { color: #868e96; text-align: center; padding: 30px 0; font-size: 1.05em; }
+    .pk-note { background: #fff3bf; border-radius: 8px; padding: 8px 12px; margin-top: 10px; }
+    /* モーダル */
+    .pk-modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 50; }
+    .pk-modal-bg.show { display: flex; align-items: center; justify-content: center; }
+    .pk-modal { background: #fff; border-radius: 12px; padding: 18px; width: min(480px, 92vw);
+                max-height: 88vh; overflow-y: auto; }
+    .pk-modal h3 { margin: 0 0 12px; }
+    .pk-reason { display: block; width: 100%; text-align: left; background: #f8f9fa; border: 2px solid #dee2e6;
+                 border-radius: 8px; padding: 12px 14px; margin-bottom: 8px; font-size: 1.05em; cursor: pointer; }
+    .pk-reason.sel { border-color: #339af0; background: #e7f5ff; }
+    .pk-modal textarea { width: 100%; box-sizing: border-box; padding: 8px; font-size: 1em; min-height: 60px; }
+    .pk-modal .row { display: flex; gap: 10px; margin-top: 12px; }
+    .pk-modal .row button { flex: 1; border: none; border-radius: 8px; padding: 12px; font-size: 1.05em;
+                            font-weight: bold; cursor: pointer; }
+    .pk-modal .primary { background: #1971c2; color: #fff; }
+    .pk-modal .danger { background: #c92a2a; color: #fff; }
+    .pk-modal .ghost { background: #f1f3f5; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 ピッキング</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-stats">本日の完了: <b><%= state.stats.batches %></b> バッチ / <b><%= state.stats.slips %></b> 伝票</div>
+
+    <% if (state.session) { %>
+      <div class="pk-current">
+        <div class="no"><%= state.batch.shipping_no_label || state.batch.shipping_no %></div>
+        <div class="meta">
+          <span class="badge"><%= state.batch.bunrui_label || state.batch.bunrui %></span><span class="badge"><%= state.batch.packing_method_label || state.batch.packing_method %></span>
+          <% if (state.batch.slip_count != null) { %><span class="badge"><%= state.batch.slip_count %>件</span><% } %>
+        </div>
+        <% if (state.batch.note) { %><div class="pk-note"><%= state.batch.note %></div><% } %>
+
+        <div id="timer" class="pk-timer"
+             data-start="<%= state.session.requested_at %>"
+             data-pause-sec="<%= state.pauseSec %>">--:--</div>
+        <div class="pk-timer-note">経過時間 (保留を除く)</div>
+
+        <div class="pk-btns">
+          <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
+          <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
+          <button class="pk-btn pause" onclick="openPauseModal()">⏸ 保留にする</button>
+          <% if (state.batch.pdf_path) { %>
+            <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
+               href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票PDFを開く</a>
+          <% } %>
+          <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
+        </div>
+      </div>
+    <% } else { %>
+      <h2 class="pk-ready-title">開始できるバッチ (<%= state.ready.length %>件)</h2>
+      <% if (state.ready.length === 0) { %>
+        <div class="pk-empty">開始できるバッチはありません。<br>お疲れさまでした！</div>
+      <% } %>
+      <% for (const b of state.ready) { %>
+        <button class="pk-tile <%= b.pdf_path ? '' : 'nodoc' %>"
+          <% if (b.pdf_path) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
+          <div class="no"><%= b.shipping_no_label || b.shipping_no %></div>
+          <div class="meta">
+            <%= b.bunrui_label || b.bunrui %> ／ <%= b.packing_method_label || b.packing_method %>
+            <% if (b.slip_count != null) { %> ／ <%= b.slip_count %>件<% } %>
+            <% if (b.work_date !== today) { %> ／ <span class="carry">持ち越し (<%= b.work_date %>)</span><% } %>
+          </div>
+          <% if (b.note) { %><div class="meta">📝 <%= b.note %></div><% } %>
+          <% if (!b.pdf_path) { %>
+            <div class="meta nodoc-msg">⚠ 帳票PDFが未添付のため開始できません (管理者に添付を依頼してください)</div>
+          <% } %>
+        </button>
+      <% } %>
+    <% } %>
+
+    <%# 保留中の自分の作業。保留すると別の作業へ移れる (理由「他作業への応援」) ため常に表示する %>
+    <% if (state.paused.length > 0) { %>
+      <h2 class="pk-ready-title">⏸ 保留中の作業 (<%= state.paused.length %>件)</h2>
+      <% for (const p of state.paused) { %>
+        <div class="pk-held">
+          <div class="no"><%= p.batch.shipping_no_label || p.batch.shipping_no %></div>
+          <div class="meta">
+            理由: <%= p.reasonLabel %><%= p.reasonNote ? ' (' + p.reasonNote + ')' : '' %>
+            <% if (p.batch.slip_count != null) { %> ／ <%= p.batch.slip_count %>件<% } %>
+          </div>
+          <button class="pk-btn resume" onclick="resumeSession(<%= p.session.id %>)">▶ この作業を再開する</button>
+        </div>
+      <% } %>
+    <% } %>
+  </div>
+
+  <!-- 保留モーダル -->
+  <div class="pk-modal-bg" id="pauseModal">
+    <div class="pk-modal">
+      <h3>⏸ 保留の理由</h3>
+      <div id="pauseReasons">
+        <% for (const r of pauseReasons) { %>
+          <button class="pk-reason" data-code="<%= r.code %>" data-label="<%= r.label %>" onclick="selReason(this, 'pause')"><%= r.label %></button>
+        <% } %>
+      </div>
+      <textarea id="pauseNote" placeholder="補足 (「その他」は必須)"></textarea>
+      <div class="row">
+        <button class="ghost" onclick="closeModal('pauseModal')">やめる</button>
+        <button class="primary" onclick="submitPause()">保留にする</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 印刷トラブルモーダル -->
+  <div class="pk-modal-bg" id="troubleModal">
+    <div class="pk-modal">
+      <h3>🖨 印刷トラブル</h3>
+      <p style="margin:0 0 10px;color:#495057;font-size:0.92em">
+        どうしましたか？ 理由を選んでください (記録は削除されず残ります)
+      </p>
+      <div id="troubleReasons">
+        <% for (const r of troubleReasons) { %>
+          <button class="pk-reason" data-code="<%= r.code %>" data-label="<%= r.label %>" onclick="selReason(this, 'trouble')"><%= r.label %></button>
+        <% } %>
+      </div>
+      <textarea id="troubleNote" placeholder="補足 (「その他」は必須)"></textarea>
+      <div class="row">
+        <button class="primary" onclick="submitTrouble('reprint')">🖨 再印刷して<br>開始し直す</button>
+        <button class="danger" onclick="submitTrouble('abort')">⏹ 中止して<br>一覧に戻す</button>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="closeModal('troubleModal')">やめる</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SESSION_ID = <%- state.session ? state.session.id : 'null' %>;
+    const API = '/apps/shipping-work/api/picking';
+    let busy = false;
+
+    // 冪等キー。crypto.randomUUID が使えない環境 (非https) 向けフォールバックあり
+    function opId() {
+      if (window.crypto?.randomUUID) return crypto.randomUUID();
+      return 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+    }
+
+    async function callApi(pathName, body) {
+      const r = await fetch(`${API}/${pathName}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let j = {};
+      try { j = await r.json(); } catch {}
+      if (!r.ok) throw new Error(j.error || `エラー (${r.status})`);
+      return j;
+    }
+
+    // 全操作に op_id を付ける (サーバー側の冪等レイヤーが操作種別・対象・入力に束縛して記録する)
+    async function post(pathName, body) {
+      if (busy) return;
+      busy = true;
+      try {
+        await callApi(pathName, { session_id: SESSION_ID, op_id: opId(), ...body });
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
+    // 保留中の作業を再開 (進行中の作業がある場合はサーバーが 409 で弾く)
+    async function resumeSession(sessionId) {
+      if (busy) return;
+      busy = true;
+      try {
+        await callApi('resume', { session_id: sessionId, op_id: opId() });
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
+    async function startBatch(batchId) {
+      if (busy) return;
+      if (!confirm('このバッチのピッキングを開始しますか？\n(開始すると計測が始まります)')) return;
+      busy = true;
+      try {
+        await callApi('start', { batch_id: batchId, op_id: opId() });
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
+    async function complete(withNext) {
+      if (busy) return;
+      const msg = withNext ? '完了して、次のバッチを開始しますか？' : '完了して作業を終了しますか？';
+      if (!confirm(msg)) return;
+      busy = true;
+      try {
+        const j = await callApi('complete', {
+          session_id: SESSION_ID, op_id: opId(),
+          next: withNext, op_id_next: withNext ? opId() : undefined,
+        });
+        if (withNext && !j.next) {
+          alert(j.nextError
+            ? `完了しました。次のバッチは開始できませんでした:\n${j.nextError}`
+            : 'お疲れさまでした！ 開始できる次のバッチはありません。');
+        }
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
+    // ─── モーダル ───
+    const sel = { pause: null, trouble: null };
+    function selReason(btn, kind) {
+      sel[kind] = { code: btn.dataset.code, label: btn.dataset.label };
+      const box = kind === 'pause' ? 'pauseReasons' : 'troubleReasons';
+      document.querySelectorAll(`#${box} .pk-reason`).forEach((b) => b.classList.remove('sel'));
+      btn.classList.add('sel');
+    }
+    function openPauseModal() { document.getElementById('pauseModal').classList.add('show'); }
+    function openTroubleModal() { document.getElementById('troubleModal').classList.add('show'); }
+    function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+
+    function submitPause() {
+      if (!sel.pause) return alert('理由を選んでください');
+      const note = document.getElementById('pauseNote').value;
+      if (sel.pause.label === 'その他' && !note.trim()) return alert('「その他」は内容の記入が必須です');
+      post('pause', { reason: sel.pause.code, note });
+    }
+
+    function submitTrouble(action) {
+      if (!sel.trouble) return alert('理由を選んでください');
+      const note = document.getElementById('troubleNote').value;
+      if (sel.trouble.label === 'その他' && !note.trim()) return alert('「その他」は内容の記入が必須です');
+      const confirmMsg = action === 'reprint'
+        ? '計測をやり直し、帳票を再印刷して開始し直します。よろしいですか？'
+        : 'このバッチを「本日のやること」に戻します。よろしいですか？';
+      if (!confirm(confirmMsg)) return;
+      post('trouble', { reason: sel.trouble.code, note, action });
+    }
+
+    // ─── 経過タイマー (保留を除いた実作業時間の目安表示。正式な計測はサーバー時刻) ───
+    (() => {
+      const el = document.getElementById('timer');
+      if (!el) return;
+      const start = Date.parse(el.dataset.start);
+      const pauseMs = Number(el.dataset.pauseSec || 0) * 1000;
+      function fmt(ms) {
+        const s = Math.max(0, Math.floor(ms / 1000));
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+        const mm = String(m).padStart(2, '0'), sss = String(ss).padStart(2, '0');
+        return h > 0 ? `${h}:${mm}:${sss}` : `${mm}:${sss}`;
+      }
+      const tick = () => { el.textContent = fmt(Date.now() - start - pauseMs); };
+      tick();
+      setInterval(tick, 1000);
+    })();
+  </script>
+</body>
+</html>

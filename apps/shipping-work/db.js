@@ -18,7 +18,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'shipping-work.db');
 
 let db = null;
@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 5;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -119,7 +119,55 @@ const MIGRATIONS = {
     }
     createCoreTables();
   },
+  // v3: 保留中セッションを「一人一作業」制約の対象外にする (PR3)。
+  // 保留理由マスタに「他作業への応援」がある = 保留して別の作業へ移る運用が要件に含まれるが、
+  // v1/v2 の worker 部分UNIQUE は保留中も1作業と数えるため応援に行けなかった。
+  // paused 列を制約条件に加えることで「進行中は1つ・保留中は何件でも持てる」をDBで保証する。
+  // (PR1のコメント「応援・交代の例外運用が必要になったら PR3 で migration により見直す」の実施)
+  3: () => {
+    db.exec('ALTER TABLE sw_sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1))');
+    // 既存の未解除保留があれば paused=1 に揃える (v2以前のDBからの移行時)
+    db.exec(`UPDATE sw_sessions SET paused = 1 WHERE outcome = 'open' AND EXISTS
+      (SELECT 1 FROM sw_pauses p WHERE p.session_id = sw_sessions.id AND p.resumed_at IS NULL)`);
+    db.exec('DROP INDEX IF EXISTS idx_sw_sessions_worker_open');
+    db.exec(`CREATE UNIQUE INDEX idx_sw_sessions_worker_open
+      ON sw_sessions(worker) WHERE outcome='open' AND paused=0`);
+  },
+  // v4: 冪等性をセッションの op_id 相乗りから専用テーブルへ移す (Codex PR3レビュー#1/#2/#4)。
+  // sw_sessions.op_id だけでは「同じ op_id を別バッチに送った再送」を成功扱いしてしまい、
+  // 完了・保留・再開は op_id を持たないため通信タイムアウト後の遅延再送で記録が壊れる。
+  // 全作業操作を (op_id, 操作種別, 対象, 入力) で束縛し、一致した再送だけ前回結果を返す。
+  // 進行中セッションの op_id を sw_operations へ backfill することは意図的にしない。
+  // 旧セッションからは「手動開始 (start:) だったのか『完了して次を開始』(start-next:) だったのか」
+  // を判別できず、誤った操作種別で記録すると再送時の照合がかえって狂う
+  // (Codex PR3レビュー round3 #medium)。
+  // 本番DBは v2 (業務データ0件) からこの版へ上がるため、冪等記録を持たない
+  // in-flight セッションはそもそも存在しない。将来 sw_operations 導入前の状態から
+  // 移行する必要が生じた場合も、判別できない以上 backfill せず 409 を返す方が安全。
+  4: createOperationsTable,
+  // v5: 実作業秒数 (終了 - 開始 - 保留合計) を完了時に保存する。
+  // 集計側で再計算もできるが、異常候補フラグ (too_short/too_long) がどの数値で立ったのかを
+  // 後から検証できるようにするため、判定に使った値そのものを残す。
+  // これは計測が主目的のアプリなので、指標の再現性を記録側で担保する。
+  5: () => {
+    db.exec('ALTER TABLE sw_sessions ADD COLUMN active_sec INTEGER');
+  },
 };
+
+/** 冪等操作の記録。全作業APIがここを通り、同一 op_id の再送は保存済み結果を返す。 */
+function createOperationsTable() {
+  db.exec(`CREATE TABLE IF NOT EXISTS sw_operations (
+    op_id       TEXT PRIMARY KEY,
+    worker      TEXT NOT NULL,
+    operation   TEXT NOT NULL,      -- start/complete/pause/resume/trouble
+    target_kind TEXT NOT NULL,      -- batch/session
+    target_id   INTEGER NOT NULL,
+    params_hash TEXT,               -- 入力内容のハッシュ (別入力での使い回しを検知)
+    result_json TEXT NOT NULL,
+    at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sw_operations_worker ON sw_operations(worker, at)');
+}
 
 export function getDB() {
   if (!db) initShippingWorkDB();
@@ -273,6 +321,11 @@ function createCoreTables() {
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`);
+}
+
+/** 帳票PDFが無いバッチは開始できない (実装計画§5: バッチ作成時に事務がPDFを添付する方式)。 */
+export function batchHasDocument(batch) {
+  return !!batch?.pdf_path;
 }
 
 // ─── マスタ初期データ (現行 Notion「スタッフ用デイリー業務」の区分をそのまま引き継ぐ) ───
@@ -457,13 +510,20 @@ export function getBatch(id) {
  * カンバン用: 指定作業日のバッチ + それ以前の未完了持ち越しバッチ。
  * 未来日の未完了は含めない (Codex PR1レビュー#4)。
  * cancelled はカンバンに出さないため取得段階で除外し、件数表示と一致させる (同#8)。
+ * active_worker/active_since は進行中セッション (open) の担当者と開始時刻 (PR3: カード表示用)。
  */
 export function listKanbanBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
       (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
-      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
+      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label,
+      -- 工程が増える PR4 では同一バッチに picking と packing の open が並びうるため、
+      -- 最新セッション1件に固定する (スカラーサブクエリの暗黙の先頭行依存を避ける)
+      (SELECT s.worker FROM sw_sessions s WHERE s.batch_id=b.id AND s.outcome='open'
+        ORDER BY s.id DESC LIMIT 1) AS active_worker,
+      (SELECT s.requested_at FROM sw_sessions s WHERE s.batch_id=b.id AND s.outcome='open'
+        ORDER BY s.id DESC LIMIT 1) AS active_since
     FROM sw_batches b
     WHERE b.status != 'cancelled'
       AND (b.work_date = ?

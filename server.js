@@ -705,7 +705,7 @@ const apps = [
   {
     id: 'shipping-work',
     name: '出荷作業管理',
-    description: 'Notionカンバン置き換え。ピッキング・梱包の作業時間をボタン操作で自動計測 (PR1: カンバン表示)',
+    description: 'Notionカンバン置き換え。ピッキング・梱包の作業時間をボタン操作で自動計測',
     icon: '🏭',
     path: '/apps/shipping-work',
     status: 'active',
