@@ -479,14 +479,17 @@ router.get('/admin/stats.csv', requireAdminPage, (req, res) => {
   const names = loadDisplayNames();
   const procLabels = { picking: 'ピッキング', sorting: '仕分け', packing: '梱包' };
   const esc = (v) => {
-    const s = String(v ?? '');
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    let s = String(v ?? '');
+    // Excel が数式として評価する先頭文字は ' を前置して無害化 (CSVインジェクション対策)
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
-  const header = ['作業者', '工程', '発送分類', 'バッチ数', '伝票数', '実作業時間(分)', '保留時間(分)',
+  const header = ['日付', '作業者', '工程', '発送分類', 'バッチ数', '伝票数', '実作業時間(分)', '保留時間(分)',
     '伝票/時', '1伝票あたり秒(平均)', '1伝票あたり秒(中央値)', 'バッチ時間中央値(分)', '異常候補数'];
   const lines = [header.join(',')];
   for (const r of rows) {
     lines.push([
+      r.date,
       esc(names[r.worker] || r.worker), esc(procLabels[r.process] || r.process), esc(r.bunruiLabel || r.bunrui),
       r.batches, r.slips, (r.activeSec / 60).toFixed(1), (r.pauseSec / 60).toFixed(1),
       r.slipsPerHour ?? '', r.secPerSlipAvg ?? '', r.secPerSlipMedian ?? '',

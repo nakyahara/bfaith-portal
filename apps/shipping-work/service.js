@@ -233,9 +233,11 @@ function breakOverlapSec(fromUtc, toUtc, breaks) {
   const toMs = Date.parse(toUtc);
   if (!(toMs > fromMs)) return 0;
   let total = 0;
-  // セッションが跨ぎうる JST 暦日ごとに、その日の休憩帯を UTC 区間へ展開して重なりを取る
-  const startDay = new Date(fromMs - 9 * 3600_000);  // JST日付の起点を出すため-9hしてUTC日付を使う
-  for (let d = 0; ; d++) {
+  // セッションが跨ぎうる JST 暦日ごとに、その日の休憩帯を UTC 区間へ展開して重なりを取る。
+  // JST暦日 = UTC時刻 + 9時間 の年月日 (引き算だと開始日の前日から走査してしまう)
+  const startDay = new Date(fromMs + 9 * 3600_000);
+  const dayCount = Math.ceil((toMs - fromMs) / 86_400_000) + 2;  // 終了日まで必ず届く反復数
+  for (let d = 0; d < dayCount; d++) {
     const day = new Date(Date.UTC(startDay.getUTCFullYear(), startDay.getUTCMonth(), startDay.getUTCDate() + d));
     const dayStr = day.toISOString().slice(0, 10);
     const dayStartMs = Date.parse(`${dayStr}T00:00:00+09:00`);
@@ -249,7 +251,6 @@ function breakOverlapSec(fromUtc, toUtc, breaks) {
       const hi = Math.min(toMs, e);
       if (hi > lo) total += (hi - lo) / 1000;
     }
-    if (d > 3) break;  // 想定外の長期セッションでも無限ループしない
   }
   return total;
 }
@@ -1188,6 +1189,13 @@ export function listAnomalies(fromDate, toDate, limit = 300) {
   }));
 }
 
+/** UTC を JST の 'YYYY-MM-DD' にする (集計の日付軸)。 */
+function toJstDate(utc) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(new Date(utc));
+}
+
 /** 中央値 (配列は破壊しない)。空なら null。 */
 function median(values) {
   if (values.length === 0) return null;
@@ -1206,6 +1214,7 @@ export function getStats(fromDate, toDate) {
   const { startUtc, endUtc } = jstDayRangeUtc(fromDate, toDate);
   const rows = db.prepare(`
     SELECT s.worker, s.process, b.bunrui, s.active_sec, s.flags_json, s.batch_id, b.slip_count,
+      s.ended_at,
       (SELECT COALESCE(SUM(
          CAST((julianday(COALESCE(p.resumed_at, s.ended_at)) - julianday(p.paused_at)) * 86400 AS INTEGER)
        ), 0) FROM sw_pauses p WHERE p.session_id = s.id) AS pause_sec,
@@ -1220,9 +1229,12 @@ export function getStats(fromDate, toDate) {
   // 時間は合算する (訂正しても合計時間は正しく積み上がる)
   const groups = new Map();
   for (const r of rows) {
-    const key = `${r.worker} ${r.process} ${r.bunrui}`;
+    // 要件§10.2 は「作業者×日×工程×発送分類」— 日付軸 (完了日のJST) を必ず持つ
+    const date = toJstDate(r.ended_at);
+    const key = `${date} ${r.worker} ${r.process} ${r.bunrui}`;
     if (!groups.has(key)) {
       groups.set(key, {
+        date,
         worker: r.worker, process: r.process, bunrui: r.bunrui, bunruiLabel: r.bunrui_label,
         batchIds: new Set(), slipByBatch: new Map(), activeSec: 0, pauseSec: 0,
         perBatchSec: new Map(), anomalies: 0,
@@ -1243,6 +1255,7 @@ export function getStats(fromDate, toDate) {
       .filter(([id]) => (g.slipByBatch.get(id) ?? 0) > 0)
       .map(([id, sec]) => sec / g.slipByBatch.get(id));
     return {
+      date: g.date,
       worker: g.worker,
       process: g.process,
       bunrui: g.bunrui,
@@ -1257,7 +1270,8 @@ export function getStats(fromDate, toDate) {
       batchSecMedian: g.perBatchSec.size > 0 ? Math.round(median([...g.perBatchSec.values()])) : null,
       anomalies: g.anomalies,
     };
-  }).sort((a, b) => a.worker.localeCompare(b.worker)
+  }).sort((a, b) => a.date.localeCompare(b.date)
+    || a.worker.localeCompare(b.worker)
     || PROCESS_ORDER.indexOf(a.process) - PROCESS_ORDER.indexOf(b.process)
     || String(a.bunrui).localeCompare(String(b.bunrui)));
 }
@@ -1306,14 +1320,25 @@ export function saveSetting(key, rawValue, actor) {
     stored = String(n);
   } else if (def.type === 'breaks') {
     const parts = String(rawValue).split(',').map((s) => s.trim()).filter(Boolean);
+    if (parts.length > 10) throw new SwError(400, '休憩時間帯は10個までにしてください');
+    const spans = [];
     for (const p of parts) {
       const m = p.match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/);
       if (!m) throw new SwError(400, `休憩時間帯の形式が不正です: ${p} (例: 12:00-13:00)`);
       const h1 = +m[1]; const m1 = +m[2]; const h2 = +m[3]; const m2 = +m[4];
       if (h1 > 23 || h2 > 23 || m1 > 59 || m2 > 59) throw new SwError(400, `時刻が不正です: ${p}`);
-      if (h1 * 60 + m1 >= h2 * 60 + m2) throw new SwError(400, `終了は開始より後にしてください: ${p}`);
+      const lo = h1 * 60 + m1; const hi = h2 * 60 + m2;
+      if (lo >= hi) throw new SwError(400, `終了は開始より後にしてください: ${p}`);
+      spans.push([lo, hi, p]);
     }
-    stored = JSON.stringify(parts);
+    // 重なりは二重控除になるため保存時に拒否する (breakOverlapSec は帯ごとに加算する実装)
+    spans.sort((a, b) => a[0] - b[0]);
+    for (let i = 1; i < spans.length; i++) {
+      if (spans[i][0] < spans[i - 1][1]) {
+        throw new SwError(400, `休憩時間帯が重なっています: ${spans[i - 1][2]} と ${spans[i][2]}`);
+      }
+    }
+    stored = JSON.stringify(spans.map((sp) => sp[2]));
   } else {
     throw new SwError(400, '不明な設定型です');
   }

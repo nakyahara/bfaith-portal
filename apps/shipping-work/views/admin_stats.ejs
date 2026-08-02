@@ -60,10 +60,11 @@
             <th>秒/伝票 平均</th><th>秒/伝票 中央値</th><th>バッチ中央値(分)</th><th>⚠</th></tr>
       </thead>
       <tbody>
-        <% let prevWorker = null; %>
+        <% let prevKey = null; %>
         <% for (const r of rows) { %>
-          <% if (r.worker !== prevWorker) { prevWorker = r.worker; %>
-            <tr class="worker-head"><td colspan="12">👤 <%= displayNames[r.worker] || r.worker.split('@')[0] %></td></tr>
+          <% const headKey = r.date + ' ' + r.worker; %>
+          <% if (headKey !== prevKey) { prevKey = headKey; %>
+            <tr class="worker-head"><td colspan="12">📅 <%= r.date %> ／ 👤 <%= displayNames[r.worker] || r.worker.split('@')[0] %></td></tr>
           <% } %>
           <tr>
             <td></td>

@@ -175,6 +175,36 @@ reset();
   ok(g.batches === 1 && g.activeSec === 420, '⭐訂正の継続はバッチ1・時間は合算 (300+120)');
 }
 
+console.log('# 4b. Codexレビュー指摘の回帰');
+reset();
+{
+  // 集計に日付軸がある (要件は 作業者×日×工程×発送分類)
+  const nowIso = (min) => new Date(Date.now() - min * 60_000).toISOString().slice(0, 19) + 'Z';
+  const yesterdayUtc = (min) => new Date(Date.now() - 24 * 3600_000 - min * 60_000).toISOString().slice(0, 19) + 'Z';
+  const yesterday = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo' })
+    .format(new Date(Date.now() - 24 * 3600_000));
+  const a = mk({ workDate: yesterday, shippingNo: 's01', slipCount: 10 });
+  const b = mk({ workDate: today, shippingNo: 's02', slipCount: 10 });
+  doneSession(a, W, { startUtc: yesterdayUtc(60), endUtc: yesterdayUtc(30), activeSec: 600 });
+  doneSession(b, W, { startUtc: nowIso(60), endUtc: nowIso(30), activeSec: 900 });
+  const rows = svc.getStats(yesterday, today);
+  ok(rows.length === 2, '⭐複数日は日付別の行に分かれる (1行に合算しない)');
+  ok(rows[0].date === yesterday && rows[1].date === today, '各行に日付が付く (昇順)');
+  ok(rows[0].activeSec === 600 && rows[1].activeSec === 900, '日ごとの時間が正しい');
+
+  // 休憩帯の重複は保存できない (二重控除の防止)
+  expectErr(() => svc.saveSetting('break_periods', '12:00-13:00, 12:30-13:30', ADMIN), 400,
+    '⭐重なる休憩帯は 400');
+  expectErr(() => svc.saveSetting('break_periods', '12:00-13:00, 12:00-13:00', ADMIN), 400,
+    '同一帯の二重登録も 400');
+  expectErr(() => svc.saveSetting('break_periods',
+    Array.from({ length: 11 }, (_, i) => `${String(i).padStart(2, '0')}:00-${String(i).padStart(2, '0')}:30`).join(','),
+    ADMIN), 400, '11個以上は 400');
+  svc.saveSetting('break_periods', '15:00-15:15, 12:00-13:00', ADMIN);
+  ok(JSON.stringify(svc.getBreakPeriods()) === '["12:00-13:00","15:00-15:15"]',
+    '重ならない複数帯はソートされて保存される');
+}
+
 console.log('# 5. マスタの有効/無効');
 reset();
 {
