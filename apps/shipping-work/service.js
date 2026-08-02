@@ -124,9 +124,10 @@ export function startProcess(process, batchId, worker, opId) {
       }
       const batch = getBatch(batchId);
       if (!batch) throw new SwError(404, 'バッチが見つかりません');
-      // 一人一作業 (要件v2)。DB制約 (idx_sw_sessions_worker_open) の事前チェックで明確なエラーにする
-      const mine = db.prepare("SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open'").get(worker);
-      if (mine) throw new SwError(409, '作業中のバッチがあります。完了または中止してから次を開始してください', 'busy_worker');
+      // 進行中の作業は1人1つ。保留中 (paused=1) は対象外 = 保留して別の作業へ移れる
+      // (保留理由「他作業への応援」の運用。DB制約 idx_sw_sessions_worker_open と同じ条件)
+      const mine = db.prepare("SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0").get(worker);
+      if (mine) throw new SwError(409, '作業中のバッチがあります。完了・保留・中止のいずれかをしてから次を開始してください', 'busy_worker');
       if (batch.status !== flow.from) {
         throw new SwError(409, '他の人が先に開始したか、開始できない状態です。画面を更新してください', 'lease_lost');
       }
@@ -223,13 +224,13 @@ export function pauseProcess(process, sessionId, worker, reason, note) {
     db.prepare('INSERT INTO sw_pauses (session_id, reason, reason_note, paused_at) VALUES (?, ?, ?, ?)')
       .run(sessionId, reason, noteTrim, now);
     // 開始直後の保留は異常候補 (要件§7.4「印刷直後の保留」)
-    if (secondsBetween(s.requested_at, now) < EARLY_PAUSE_SEC) {
-      const flags = parseFlags(s.flags_json);
-      if (!flags.includes('early_pause')) {
-        flags.push('early_pause');
-        db.prepare('UPDATE sw_sessions SET flags_json = ? WHERE id = ?').run(JSON.stringify(flags), sessionId);
-      }
+    const flags = parseFlags(s.flags_json);
+    if (secondsBetween(s.requested_at, now) < EARLY_PAUSE_SEC && !flags.includes('early_pause')) {
+      flags.push('early_pause');
     }
+    // paused=1 で「進行中は1人1つ」の対象から外す (保留したら別の作業へ移れる)
+    db.prepare('UPDATE sw_sessions SET paused = 1, flags_json = ? WHERE id = ?')
+      .run(JSON.stringify(flags), sessionId);
     db.prepare("UPDATE sw_batches SET status = 'hold', hold_from_status = ?, updated_at = ? WHERE id = ?")
       .run(flow.active, now, s.batch_id);
     addStatusEvent(s.batch_id, flow.active, 'hold', worker, 'button', label + (noteTrim ? `: ${noteTrim}` : ''));
@@ -248,9 +249,16 @@ export function resumeProcess(process, sessionId, worker) {
     const activePause = db.prepare('SELECT id FROM sw_pauses WHERE session_id = ? AND resumed_at IS NULL').get(sessionId);
     if (batch.status === flow.active && !activePause) return { already: true };  // 二重送信
     if (batch.status !== 'hold') throw new SwError(409, 'バッチは保留中ではありません。画面を更新してください');
+    // 保留中に別の作業を始めていたら、そちらを先に片付けてもらう
+    // (DB制約 idx_sw_sessions_worker_open に当たる前に分かりやすいエラーにする)
+    const other = db.prepare(
+      "SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0 AND id != ?"
+    ).get(worker, sessionId);
+    if (other) throw new SwError(409, '別の作業が進行中です。そちらを完了か保留にしてから再開してください', 'busy_worker');
 
     const now = utcNow();
     closeActivePause(db, sessionId, now);
+    db.prepare('UPDATE sw_sessions SET paused = 0 WHERE id = ?').run(sessionId);
     db.prepare('UPDATE sw_batches SET status = ?, hold_from_status = NULL, updated_at = ? WHERE id = ?')
       .run(batch.hold_from_status || flow.active, now, s.batch_id);
     addStatusEvent(s.batch_id, 'hold', batch.hold_from_status || flow.active, worker, 'button', null);
@@ -373,12 +381,33 @@ export function listStartableBatches(process, workDate) {
   `).all(flow.from, workDate);
 }
 
+/** バッチ1件をラベル付きで取得 (画面表示用)。 */
+function getBatchWithLabels(db, batchId) {
+  return db.prepare(`
+    SELECT b.*,
+      (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
+      (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
+      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
+    FROM sw_batches b WHERE b.id = ?
+  `).get(batchId);
+}
+
+/** そのセッションの解除済み保留時間の合計 (秒)。 */
+function closedPauseSec(db, sessionId) {
+  const closed = db.prepare(
+    'SELECT paused_at, resumed_at FROM sw_pauses WHERE session_id = ? AND resumed_at IS NOT NULL'
+  ).all(sessionId);
+  return Math.round(closed.reduce((a, p) => a + secondsBetween(p.paused_at, p.resumed_at), 0));
+}
+
 /**
- * 作業者画面の状態。進行中セッション (open) があればその詳細、なければ開始可能バッチ一覧。
- * todayStats は常に返す (本日完了件数・伝票数)。
+ * 作業者画面の状態。
+ *   session — 進行中 (paused=0) のセッション。なければ null で ready 一覧を出す
+ *   paused  — 自分が保留中のセッション一覧 (「他作業への応援」で複数持ちうる)
+ *   stats   — 本日の完了実績 (バッチ数・伝票数)
  */
 export function getWorkerState(process, worker) {
-  getFlow(process);
+  const flow = getFlow(process);
   const db = getDB();
   const today = jstToday();
   // JST 今日 00:00 を UTC に変換して本日実績の下限にする
@@ -389,28 +418,32 @@ export function getWorkerState(process, worker) {
     WHERE s.worker = ? AND s.process = ? AND s.outcome = 'completed' AND s.ended_at >= ?
   `).get(worker, process, jstStartUtc);
 
-  const s = db.prepare("SELECT * FROM sw_sessions WHERE worker = ? AND process = ? AND outcome = 'open'")
-    .get(worker, process);
+  // 保留中の自分の作業 (再開ボタンを常に出すため、進行中の有無に関わらず返す)
+  const paused = db.prepare(
+    "SELECT * FROM sw_sessions WHERE worker = ? AND process = ? AND outcome = 'open' AND paused = 1 ORDER BY id"
+  ).all(worker, process).map((ps) => {
+    const pauseRow = db.prepare('SELECT * FROM sw_pauses WHERE session_id = ? AND resumed_at IS NULL').get(ps.id);
+    return {
+      session: ps,
+      batch: getBatchWithLabels(db, ps.batch_id),
+      reasonLabel: pauseRow ? masterLabel(flow.pauseReasonKind, pauseRow.reason) : '',
+      reasonNote: pauseRow ? pauseRow.reason_note : null,
+      pausedAt: pauseRow ? pauseRow.paused_at : null,
+    };
+  });
+
+  const s = db.prepare(
+    "SELECT * FROM sw_sessions WHERE worker = ? AND process = ? AND outcome = 'open' AND paused = 0"
+  ).get(worker, process);
   if (!s) {
-    return { session: null, batch: null, activePause: null, pauseSec: 0, ready: listStartableBatches(process, today), stats };
+    return { session: null, batch: null, pauseSec: 0, paused, ready: listStartableBatches(process, today), stats };
   }
-  const batch = db.prepare(`
-    SELECT b.*,
-      (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
-      (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
-      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
-    FROM sw_batches b WHERE b.id = ?
-  `).get(s.batch_id);
-  const flow = PROCESS_FLOW[process];
-  const activePauseRow = db.prepare(
-    'SELECT * FROM sw_pauses WHERE session_id = ? AND resumed_at IS NULL'
-  ).get(s.id);
-  const activePause = activePauseRow
-    ? { ...activePauseRow, reason_label: masterLabel(flow.pauseReasonKind, activePauseRow.reason) }
-    : null;
-  const closed = db.prepare(
-    'SELECT paused_at, resumed_at FROM sw_pauses WHERE session_id = ? AND resumed_at IS NOT NULL'
-  ).all(s.id);
-  const pauseSec = closed.reduce((a, p) => a + secondsBetween(p.paused_at, p.resumed_at), 0);
-  return { session: s, batch, activePause, pauseSec: Math.round(pauseSec), ready: [], stats };
+  return {
+    session: s,
+    batch: getBatchWithLabels(db, s.batch_id),
+    pauseSec: closedPauseSec(db, s.id),
+    paused,
+    ready: [],
+    stats,
+  };
 }

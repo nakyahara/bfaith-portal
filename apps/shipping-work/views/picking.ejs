@@ -14,11 +14,14 @@
     .pk-stats { color: #495057; font-size: 0.95em; margin-bottom: 10px; }
     .pk-stats b { font-size: 1.15em; }
     .pk-current { background: #fff; border: 2px solid #339af0; border-radius: 12px; padding: 18px; }
-    .pk-current.hold { border-color: #f59f00; background: #fff9db; }
     .pk-current .no { font-size: 2.0em; font-weight: bold; }
     .pk-current .meta { margin-top: 6px; color: #495057; font-size: 1.05em; }
     .pk-current .badge { display: inline-block; background: #e9ecef; border-radius: 6px;
                          padding: 2px 10px; margin: 3px 6px 0 0; }
+    .pk-held { background: #fff9db; border: 2px solid #f59f00; border-radius: 12px;
+               padding: 14px 16px; margin-bottom: 10px; }
+    .pk-held .no { font-size: 1.4em; font-weight: bold; }
+    .pk-held .meta { color: #495057; margin: 4px 0 10px; }
     .pk-timer { font-size: 2.6em; font-weight: bold; text-align: center; margin: 14px 0 4px;
                 font-variant-numeric: tabular-nums; }
     .pk-timer.paused { color: #f59f00; }
@@ -77,8 +80,7 @@
     <div class="pk-stats">本日の完了: <b><%= state.stats.batches %></b> バッチ / <b><%= state.stats.slips %></b> 伝票</div>
 
     <% if (state.session) { %>
-      <% const paused = !!state.activePause; %>
-      <div class="pk-current <%= paused ? 'hold' : '' %>">
+      <div class="pk-current">
         <div class="no"><%= state.batch.shipping_no_label || state.batch.shipping_no %></div>
         <div class="meta">
           <span class="badge"><%= state.batch.bunrui_label || state.batch.bunrui %></span><span class="badge"><%= state.batch.packing_method_label || state.batch.packing_method %></span>
@@ -86,29 +88,20 @@
         </div>
         <% if (state.batch.note) { %><div class="pk-note"><%= state.batch.note %></div><% } %>
 
-        <div id="timer" class="pk-timer <%= paused ? 'paused' : '' %>"
+        <div id="timer" class="pk-timer"
              data-start="<%= state.session.requested_at %>"
-             data-pause-sec="<%= state.pauseSec %>"
-             data-paused-at="<%= paused ? state.activePause.paused_at : '' %>">--:--</div>
-        <div class="pk-timer-note">
-          <% if (paused) { %>
-            保留中: <%= state.activePause.reason_label %><%= state.activePause.reason_note ? ' (' + state.activePause.reason_note + ')' : '' %>
-          <% } else { %>経過時間 (保留を除く)<% } %>
-        </div>
+             data-pause-sec="<%= state.pauseSec %>">--:--</div>
+        <div class="pk-timer-note">経過時間 (保留を除く)</div>
 
         <div class="pk-btns">
-          <% if (paused) { %>
-            <button class="pk-btn resume" onclick="post('resume', {})">▶ 作業を再開する</button>
-          <% } else { %>
-            <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
-            <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
-            <button class="pk-btn pause" onclick="openPauseModal()">⏸ 保留にする</button>
-            <% if (state.batch.pdf_path) { %>
-              <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
-                 href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票PDFを開く</a>
-            <% } %>
-            <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
+          <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
+          <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
+          <button class="pk-btn pause" onclick="openPauseModal()">⏸ 保留にする</button>
+          <% if (state.batch.pdf_path) { %>
+            <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
+               href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票PDFを開く</a>
           <% } %>
+          <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
         </div>
       </div>
     <% } else { %>
@@ -126,6 +119,21 @@
           </div>
           <% if (b.note) { %><div class="meta">📝 <%= b.note %></div><% } %>
         </button>
+      <% } %>
+    <% } %>
+
+    <%# 保留中の自分の作業。保留すると別の作業へ移れる (理由「他作業への応援」) ため常に表示する %>
+    <% if (state.paused.length > 0) { %>
+      <h2 class="pk-ready-title">⏸ 保留中の作業 (<%= state.paused.length %>件)</h2>
+      <% for (const p of state.paused) { %>
+        <div class="pk-held">
+          <div class="no"><%= p.batch.shipping_no_label || p.batch.shipping_no %></div>
+          <div class="meta">
+            理由: <%= p.reasonLabel %><%= p.reasonNote ? ' (' + p.reasonNote + ')' : '' %>
+            <% if (p.batch.slip_count != null) { %> ／ <%= p.batch.slip_count %>件<% } %>
+          </div>
+          <button class="pk-btn resume" onclick="resumeSession(<%= p.session.id %>)">▶ この作業を再開する</button>
+        </div>
       <% } %>
     <% } %>
   </div>
@@ -205,6 +213,19 @@
       }
     }
 
+    // 保留中の作業を再開 (進行中の作業がある場合はサーバーが 409 で弾く)
+    async function resumeSession(sessionId) {
+      if (busy) return;
+      busy = true;
+      try {
+        await callApi('resume', { session_id: sessionId });
+        location.reload();
+      } catch (e) {
+        alert(e.message);
+        location.reload();
+      }
+    }
+
     async function startBatch(batchId) {
       if (busy) return;
       if (!confirm('このバッチのピッキングを開始しますか？\n(開始すると計測が始まります)')) return;
@@ -273,19 +294,15 @@
       if (!el) return;
       const start = Date.parse(el.dataset.start);
       const pauseMs = Number(el.dataset.pauseSec || 0) * 1000;
-      const pausedAt = el.dataset.pausedAt ? Date.parse(el.dataset.pausedAt) : null;
       function fmt(ms) {
         const s = Math.max(0, Math.floor(ms / 1000));
         const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
         const mm = String(m).padStart(2, '0'), sss = String(ss).padStart(2, '0');
         return h > 0 ? `${h}:${mm}:${sss}` : `${mm}:${sss}`;
       }
-      function tick() {
-        const nowMs = pausedAt ?? Date.now();  // 保留中は保留開始時点で停止表示
-        el.textContent = fmt(nowMs - start - pauseMs);
-      }
+      const tick = () => { el.textContent = fmt(Date.now() - start - pauseMs); };
       tick();
-      if (!pausedAt) setInterval(tick, 1000);
+      setInterval(tick, 1000);
     })();
   </script>
 </body>

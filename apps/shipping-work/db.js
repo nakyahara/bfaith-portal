@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -118,6 +118,20 @@ const MIGRATIONS = {
       db.exec(`DROP TABLE IF EXISTS ${t}`);
     }
     createCoreTables();
+  },
+  // v3: 保留中セッションを「一人一作業」制約の対象外にする (PR3)。
+  // 保留理由マスタに「他作業への応援」がある = 保留して別の作業へ移る運用が要件に含まれるが、
+  // v1/v2 の worker 部分UNIQUE は保留中も1作業と数えるため応援に行けなかった。
+  // paused 列を制約条件に加えることで「進行中は1つ・保留中は何件でも持てる」をDBで保証する。
+  // (PR1のコメント「応援・交代の例外運用が必要になったら PR3 で migration により見直す」の実施)
+  3: () => {
+    db.exec('ALTER TABLE sw_sessions ADD COLUMN paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0,1))');
+    // 既存の未解除保留があれば paused=1 に揃える (v2以前のDBからの移行時)
+    db.exec(`UPDATE sw_sessions SET paused = 1 WHERE outcome = 'open' AND EXISTS
+      (SELECT 1 FROM sw_pauses p WHERE p.session_id = sw_sessions.id AND p.resumed_at IS NULL)`);
+    db.exec('DROP INDEX IF EXISTS idx_sw_sessions_worker_open');
+    db.exec(`CREATE UNIQUE INDEX idx_sw_sessions_worker_open
+      ON sw_sessions(worker) WHERE outcome='open' AND paused=0`);
   },
 };
 
