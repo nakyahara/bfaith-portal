@@ -212,9 +212,9 @@ function startInternal(db, process, batchId, worker, opId) {
   `).run(batchId, process, worker, now, opId);
   const sessionId = Number(info.lastInsertRowid);
   db.prepare(`
-    INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, requested_by, requested_at)
-    VALUES (?, ?, 'picking_list', ?, ?, ?)
-  `).run(batchId, sessionId, batch.pdf_path, worker, now);
+    INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, doc_url, requested_by, requested_at)
+    VALUES (?, ?, 'picking_list', ?, ?, ?, ?)
+  `).run(batchId, sessionId, batch.pdf_path, batch.doc_url, worker, now);
   addStatusEvent(batchId, flow.from, flow.active, worker, 'button', null);
   return { session_id: sessionId, batch_id: batchId };
 }
@@ -412,9 +412,9 @@ export function troubleProcess(process, sessionId, worker, reason, note, action,
         `).run(s.batch_id, process, worker, now, opId);
         const newSessionId = Number(info.lastInsertRowid);
         db.prepare(`
-          INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, requested_by, requested_at)
-          VALUES (?, ?, 'picking_list', ?, ?, ?)
-        `).run(s.batch_id, newSessionId, batch.pdf_path, worker, now);
+          INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, doc_url, requested_by, requested_at)
+          VALUES (?, ?, 'picking_list', ?, ?, ?, ?)
+        `).run(s.batch_id, newSessionId, batch.pdf_path, batch.doc_url, worker, now);
         addStatusEvent(s.batch_id, flow.active, flow.active, worker, 'button', `印刷トラブル(${label})→再印刷して開始し直し`);
         return { session_id: newSessionId, batch_id: s.batch_id, aborted: false };
       }
@@ -447,7 +447,7 @@ export function startNextReady(process, worker, opId) {
       // 開始可能な先頭から順に試す。他者に取られた (lease_lost) ら次候補へ。
       // 帳票未添付のバッチは自動では選ばない (開始できないため。手動一覧には出して理由を示す)
       for (const c of listStartableBatches(process, jstToday())) {
-        if (!c.pdf_path) continue;
+        if (!batchHasDocument(c)) continue;
         try {
           const started = startInternal(db, process, c.id, worker, opId);
           return { batch_id: started.batch_id, session_id: started.session_id };

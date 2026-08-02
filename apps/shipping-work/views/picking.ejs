@@ -100,9 +100,13 @@
           <button class="pk-btn complete-next" onclick="complete(true)">✅ 完了して次を開始</button>
           <button class="pk-btn complete" onclick="complete(false)">✅ 完了して作業終了</button>
           <button class="pk-btn pause" onclick="openPauseModal()">⏸ 保留にする</button>
-          <% if (state.batch.pdf_path) { %>
+          <%# 帳票は Drive リンクが主。アップロードPDFのときはアプリ内で配信する %>
+          <% if (state.batch.doc_url) { %>
             <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
-               href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票PDFを開く</a>
+               href="<%= state.batch.doc_url %>" target="_blank" rel="noopener noreferrer">📄 帳票を開く</a>
+          <% } else if (state.batch.pdf_path) { %>
+            <a class="pk-btn pdf" style="text-align:center;text-decoration:none"
+               href="/apps/shipping-work/batches/<%= state.batch.id %>/pdf" target="_blank">📄 帳票を開く</a>
           <% } %>
           <button class="pk-btn trouble" onclick="openTroubleModal()">🖨 印刷トラブル</button>
         </div>
@@ -126,8 +130,9 @@
         <% } %>
       <% } %>
       <% for (const b of state.ready) { %>
-        <button class="pk-tile <%= b.pdf_path ? '' : 'nodoc' %>"
-          <% if (b.pdf_path) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
+        <% const hasDoc = !!(b.doc_url || b.pdf_path); %>
+        <button class="pk-tile <%= hasDoc ? '' : 'nodoc' %>"
+          <% if (hasDoc) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
           <div class="no"><%= b.shipping_no_label || b.shipping_no %></div>
           <div class="meta">
             <%= b.bunrui_label || b.bunrui %> ／ <%= b.packing_method_label || b.packing_method %>
@@ -135,8 +140,8 @@
             <% if (b.work_date !== today) { %> ／ <span class="carry">持ち越し (<%= b.work_date %>)</span><% } %>
           </div>
           <% if (b.note) { %><div class="meta">📝 <%= b.note %></div><% } %>
-          <% if (!b.pdf_path) { %>
-            <div class="meta nodoc-msg">⚠ 帳票PDFが未添付のため開始できません (管理者に添付を依頼してください)</div>
+          <% if (!hasDoc) { %>
+            <div class="meta nodoc-msg">⚠ 帳票が未設定のため開始できません (管理者にリンクの登録を依頼してください)</div>
           <% } %>
         </button>
       <% } %>

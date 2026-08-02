@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -95,12 +95,40 @@ function migrate() {
     const next = v + 1;
     const step = MIGRATIONS[next];
     if (!step) throw new Error(`shipping-work migration v${next} が未定義`);
-    db.transaction(() => {
-      step();
-      db.pragma(`user_version = ${next}`);
-    })();
-    v = next;
+    // 通常はこちらでトランザクションを張る。
+    // テーブル作り直しのように PRAGMA をトランザクション外で切り替える必要がある版は
+    // { manual: true } を宣言し、自分でトランザクションと user_version を管理する。
+    // immediate = BEGIN IMMEDIATE。migration は読んでから書くので、DEFERRED だと
+    // 読み取り後の書込み昇格時に SQLITE_BUSY_SNAPSHOT (busy_timeout で待てない) になりうる
+    if (step.manual) step.run(next);
+    else {
+      db.transaction(() => {
+        // ロックを取ってから版数を読み直す。Render のデプロイは新旧プロセスが重なるため、
+        // 外で読んだ値のまま進めると、待たされた側が適用済みの版を二重に実行してしまう
+        // (v3/v5 の ADD COLUMN は再実行で失敗する)
+        if (db.pragma('user_version', { simple: true }) >= next) return;
+        step();
+        db.pragma(`user_version = ${next}`);
+      }).immediate();
+    }
+    // manual 版が user_version の更新を忘れると、そのプロセスだけ適用済みとして起動し
+    // 次回起動で同じ migration が再実行される (非冪等なら部分適用や起動不能)。
+    // ローカル変数を進める前に実DBの値で必ず確かめる。
+    // 別プロセスが更に先へ進めている場合もあるので「next 以上」で判定する
+    const applied = db.pragma('user_version', { simple: true });
+    if (applied < next) {
+      throw new Error(`shipping-work migration v${next}: user_version が ${applied} のまま更新されていない`);
+    }
+    if (applied > SCHEMA_VERSION) {
+      throw new Error(`shipping-work.db の user_version=${applied} がコードの期待 ${SCHEMA_VERSION} より新しい (新しい版が並行して適用された)`);
+    }
+    v = applied;
   }
+}
+
+/** テーブルに指定の列があるか (migration の冪等判定用)。 */
+function hasColumn(table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
 }
 
 const MIGRATIONS = {
@@ -152,7 +180,106 @@ const MIGRATIONS = {
   5: () => {
     db.exec('ALTER TABLE sw_sessions ADD COLUMN active_sec INTEGER');
   },
+  // v6: 帳票を Google Drive のリンクでも指せるようにする。
+  // 現場は既にピッキングリストPDFを Drive (出荷_01〜45 フォルダ) に置いてリンクで見ており、
+  // アプリへのファイルアップロードを必須にすると二重管理になる。
+  // 「アップロードしたPDF」か「Driveリンク」のどちらかがあれば帳票ありとして扱う。
+  // sw_print_jobs.pdf_path は NOT NULL のままだと doc_url だけの帳票を記録できないが、
+  // SQLite は列制約を後から変更できないためテーブルを作り直す (SQLite公式の12ステップ手順)。
+  // FK 参照元 (sw_print_attempts) があり、PRAGMA foreign_keys はトランザクション内で
+  // 切り替えられないため、この版だけ manual にして自分でトランザクションを張る。
+  // 既存の印刷ジョブ・試行は行ごとコピーして保持する (稼働後でも安全に上げられるように)。
+  6: {
+    manual: true,
+    run(version) {
+      // 変更する PRAGMA は先に全て控えてから触る (どこで失敗しても finally で元に戻せるように)
+      const fkWas = db.pragma('foreign_keys', { simple: true });
+      const legacyWas = db.pragma('legacy_alter_table', { simple: true });
+      try {
+        db.pragma('foreign_keys = OFF');
+        // RENAME 時に他テーブルのFK句を書き換えさせない (参照名は sw_print_jobs のまま維持したい)
+        db.pragma('legacy_alter_table = ON');
+        db.transaction(() => {
+          // 通常版と同じく、ロック取得後に適用済みでないか確認する (並行起動対策)
+          if (db.pragma('user_version', { simple: true }) >= version) return;
+          if (!hasColumn('sw_batches', 'doc_url')) {
+            db.exec('ALTER TABLE sw_batches ADD COLUMN doc_url TEXT');
+          }
+          // 新規DBは createPrintTables が既に新形で作っているので、旧形のときだけ入れ替える
+          if (!hasColumn('sw_print_jobs', 'doc_url')) {
+            db.exec(`CREATE TABLE sw_print_jobs_v6 (
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id     INTEGER NOT NULL REFERENCES sw_batches(id),
+              session_id   INTEGER REFERENCES sw_sessions(id),
+              doc_type     TEXT NOT NULL DEFAULT 'picking_list',
+              pdf_path     TEXT,
+              doc_url      TEXT,
+              printer      TEXT,
+              status       TEXT NOT NULL DEFAULT 'requested'
+                CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
+              requested_by TEXT NOT NULL,
+              requested_at TEXT NOT NULL,
+              CHECK(pdf_path IS NOT NULL OR doc_url IS NOT NULL)
+            )`);
+            db.exec(`INSERT INTO sw_print_jobs_v6
+              (id, batch_id, session_id, doc_type, pdf_path, doc_url, printer, status, requested_by, requested_at)
+              SELECT id, batch_id, session_id, doc_type, pdf_path, NULL, printer, status, requested_by, requested_at
+              FROM sw_print_jobs`);
+            db.exec('DROP TABLE sw_print_jobs');
+            db.exec('ALTER TABLE sw_print_jobs_v6 RENAME TO sw_print_jobs');
+          }
+          // 参照が壊れていないことを確認してからコミットする
+          const bad = db.pragma('foreign_key_check');
+          if (bad.length > 0) {
+            throw new Error(`shipping-work migration v6: 外部キー違反 ${bad.length} 件のため中止`);
+          }
+          db.pragma(`user_version = ${version}`);
+        }).immediate();
+      } finally {
+        db.pragma(`legacy_alter_table = ${legacyWas ? 'ON' : 'OFF'}`);
+        db.pragma(`foreign_keys = ${fkWas ? 'ON' : 'OFF'}`);
+      }
+    },
+  },
 };
+
+/**
+ * 印刷ジョブ (業務上の要求) と試行 (投入ごと)。PR6 でブリッジ接続。
+ * 帳票は「アップロードしたPDF (pdf_path)」か「Driveリンク (doc_url)」のどちらか。
+ * PR6 のブリッジは doc_url の場合サービスアカウントで Drive から取得する想定。
+ */
+function createPrintTables() {
+  db.exec(`CREATE TABLE IF NOT EXISTS sw_print_jobs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id     INTEGER NOT NULL REFERENCES sw_batches(id),
+    session_id   INTEGER REFERENCES sw_sessions(id),
+    doc_type     TEXT NOT NULL DEFAULT 'picking_list',
+    pdf_path     TEXT,                 -- DOCS_DIR 相対のファイル名 (アップロード時)
+    doc_url      TEXT,                 -- Google Drive 等のリンク (リンク運用時)
+    printer      TEXT,
+    -- spooled = スプーラー投入成功まで (物理印刷完了は保証しない)。
+    -- uncertain = タイムアウト等で結果不明 (failed と区別。管理者が実物確認)。
+    -- cancelled = 未印刷ジョブの取消。(Codex PR1レビュー#2: 状態集合はCHECK変更が
+    -- テーブル再作成になるため PR1 で確保)
+    status       TEXT NOT NULL DEFAULT 'requested'
+      CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
+    requested_by TEXT NOT NULL,      -- 要求者 email
+    requested_at TEXT NOT NULL,
+    CHECK(pdf_path IS NOT NULL OR doc_url IS NOT NULL)
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS sw_print_attempts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id         INTEGER NOT NULL REFERENCES sw_print_jobs(id),
+    attempt_no     INTEGER NOT NULL,
+    version_no     INTEGER NOT NULL,   -- 再印刷帳票に「再印刷 v2」を印字
+    reprint_reason TEXT,
+    result         TEXT,
+    error          TEXT,
+    leased_at      TEXT,
+    reported_at    TEXT,
+    UNIQUE(job_id, attempt_no)
+  )`);
+}
 
 /** 冪等操作の記録。全作業APIがここを通り、同一 op_id の再送は保存済み結果を返す。 */
 function createOperationsTable() {
@@ -201,6 +328,8 @@ function createCoreTables() {
       CHECK(status IN ('ready','picking','picked','sorting','sorted','packing','done','hold','stock_return','cancelled')),
     hold_from_status TEXT,                       -- 保留解除時の復帰先
     pdf_path       TEXT,                         -- 添付帳票のファイル名 (DOCS_DIR相対)
+    -- doc_url (帳票のリンク) は v6 の ALTER で追加する。
+    -- この関数は v1/v2 時点の正準DDLで、以降の版は MIGRATIONS の ALTER で重ねる規約
     created_by     TEXT NOT NULL,                -- 作成者 email
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
@@ -262,35 +391,7 @@ function createCoreTables() {
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sw_pauses_active
     ON sw_pauses(session_id) WHERE resumed_at IS NULL`);
 
-  // 印刷ジョブ (業務上の要求) と試行 (投入ごと)。PR6 でブリッジ接続
-  db.exec(`CREATE TABLE IF NOT EXISTS sw_print_jobs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    batch_id     INTEGER NOT NULL REFERENCES sw_batches(id),
-    session_id   INTEGER REFERENCES sw_sessions(id),
-    doc_type     TEXT NOT NULL DEFAULT 'picking_list',
-    pdf_path     TEXT NOT NULL,
-    printer      TEXT,
-    -- spooled = スプーラー投入成功まで (物理印刷完了は保証しない)。
-    -- uncertain = タイムアウト等で結果不明 (failed と区別。管理者が実物確認)。
-    -- cancelled = 未印刷ジョブの取消。(Codex PR1レビュー#2: 状態集合はCHECK変更が
-    -- テーブル再作成になるため PR1 で確保)
-    status       TEXT NOT NULL DEFAULT 'requested'
-      CHECK(status IN ('requested','leased','spooling','spooled','failed','uncertain','cancelled')),
-    requested_by TEXT NOT NULL,      -- 要求者 email
-    requested_at TEXT NOT NULL
-  )`);
-  db.exec(`CREATE TABLE IF NOT EXISTS sw_print_attempts (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id         INTEGER NOT NULL REFERENCES sw_print_jobs(id),
-    attempt_no     INTEGER NOT NULL,
-    version_no     INTEGER NOT NULL,   -- 再印刷帳票に「再印刷 v2」を印字
-    reprint_reason TEXT,
-    result         TEXT,
-    error          TEXT,
-    leased_at      TEXT,
-    reported_at    TEXT,
-    UNIQUE(job_id, attempt_no)
-  )`);
+  createPrintTables();
 
   // ミス記録 (現行 Notion の4分類を維持)
   db.exec(`CREATE TABLE IF NOT EXISTS sw_mistakes (
@@ -323,9 +424,12 @@ function createCoreTables() {
   )`);
 }
 
-/** 帳票PDFが無いバッチは開始できない (実装計画§5: バッチ作成時に事務がPDFを添付する方式)。 */
+/**
+ * 帳票が紐付いていないバッチは開始できない (開始=印刷が成立しないため)。
+ * 帳票は「アップロードしたPDF」か「Driveリンク」のどちらかで指定する。
+ */
 export function batchHasDocument(batch) {
-  return !!batch?.pdf_path;
+  return !!(batch?.pdf_path || batch?.doc_url);
 }
 
 // ─── マスタ初期データ (現行 Notion「スタッフ用デイリー業務」の区分をそのまま引き継ぐ) ───
@@ -433,17 +537,17 @@ export function addStatusEvent(batchId, fromStatus, toStatus, actor, via, reason
  * バッチ作成 (status_events と同一トランザクション)。
  * UNIQUE(work_date, shipping_no) 違反は SQLITE_CONSTRAINT_UNIQUE で throw (router 側で 409 に変換)。
  */
-export function createBatch({ workDate, shippingNo, bunrui, packingMethod, carriers, slipCount, note, pdfPath }, actor) {
+export function createBatch({ workDate, shippingNo, bunrui, packingMethod, carriers, slipCount, note, pdfPath, docUrl }, actor) {
   const db = getDB();
   const now = utcNow();
   return db.transaction(() => {
     const info = db.prepare(`
       INSERT INTO sw_batches
-        (work_date, shipping_no, bunrui, packing_method, carriers_json, slip_count, note, status, pdf_path, created_by, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+        (work_date, shipping_no, bunrui, packing_method, carriers_json, slip_count, note, status, pdf_path, doc_url, created_by, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?)
     `).run(workDate, shippingNo, bunrui, packingMethod,
       JSON.stringify(carriers ?? []), slipCount ?? null, note ?? null,
-      pdfPath ?? null, actor, now, now);
+      pdfPath ?? null, docUrl ?? null, actor, now, now);
     const id = Number(info.lastInsertRowid);
     addStatusEvent(id, null, 'ready', actor, 'admin', 'バッチ作成');
     return id;
@@ -454,17 +558,19 @@ export function createBatch({ workDate, shippingNo, bunrui, packingMethod, carri
  * バッチ更新 (ready のみ・作業開始後は PR5 の手動修正フローで扱う)。
  * 更新できたら true。ready でなくなっていたら false (楽観排他)。
  */
-export function updateBatch(id, { bunrui, packingMethod, carriers, slipCount, note, pdfPath }, actor) {
+export function updateBatch(id, { bunrui, packingMethod, carriers, slipCount, note, pdfPath, docUrl }, actor) {
   const db = getDB();
   return db.transaction(() => {
     const before = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
     if (!before || before.status !== 'ready') return { ok: false };
+    // PDF は未選択なら既存を保持 (COALESCE)。doc_url は空欄=消したい意図なのでそのまま反映する。
+    // ただし両方空になると帳票なしバッチができてしまうため、呼び出し側で検証済みの前提
     const res = db.prepare(`
       UPDATE sw_batches SET bunrui=?, packing_method=?, carriers_json=?, slip_count=?, note=?,
-        pdf_path=COALESCE(?, pdf_path), updated_at=?
+        pdf_path=COALESCE(?, pdf_path), doc_url=?, updated_at=?
       WHERE id=? AND status='ready'
     `).run(bunrui, packingMethod, JSON.stringify(carriers ?? []), slipCount ?? null,
-      note ?? null, pdfPath ?? null, utcNow(), id);
+      note ?? null, pdfPath ?? null, docUrl ?? null, utcNow(), id);
     if (res.changes === 0) return { ok: false };
     const after = db.prepare('SELECT * FROM sw_batches WHERE id = ?').get(id);
     addAuditLog(actor, 'batch_update', `sw_batches:${id}`, before, after, null);

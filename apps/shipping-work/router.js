@@ -217,6 +217,22 @@ function isRealDate(s) {
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
 }
 
+/**
+ * 帳票リンクの検証。http(s) のみ許可し、javascript: や data: を弾く。
+ * 空文字は「リンク無し」として null を返す (PDFアップロード側で担保する想定)。
+ */
+function validateDocUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return { value: null };
+  if (s.length > 2000) return { error: '帳票リンクが長すぎます' };
+  let u;
+  try { u = new URL(s); } catch { return { error: '帳票リンクの形式が正しくありません' }; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    return { error: '帳票リンクは http(s) のURLを指定してください' };
+  }
+  return { value: u.href };
+}
+
 /** フォーム入力の検証。エラー文字列 or 検証済み値を返す。 */
 function validateBatchInput(body) {
   const workDate = String(body.work_date || '');
@@ -237,7 +253,9 @@ function validateBatchInput(body) {
     if (!Number.isInteger(slipCount) || slipCount <= 0) return { error: '伝票件数は正の整数で入力してください' };
   }
   const note = String(body.note || '').trim() || null;
-  return { workDate, shippingNo, bunrui, packingMethod, carriers, slipCount, note };
+  const url = validateDocUrl(body.doc_url);
+  if (url.error) return { error: url.error };
+  return { workDate, shippingNo, bunrui, packingMethod, carriers, slipCount, note, docUrl: url.value };
 }
 
 // バッチ管理画面
@@ -259,12 +277,15 @@ router.get('/admin/batches', requireAdminPage, (req, res) => {
   });
 });
 
-// バッチ作成。帳票PDFは必須 (実装計画§5「バッチ作成時に事務がPDFを添付」= 開始時にそれを印刷する。
-// 未添付だと作業者が開始できずカンバンで滞留するため、入口で止める。Codex PR3レビュー#3)
+// バッチ作成。帳票は必須だが、指定方法は「Driveリンク」か「PDFアップロード」のどちらでもよい。
+// 現場はピッキングリストPDFを既に Drive に置いてリンクで見ているため、リンクが主。
+// 帳票が無いと作業者が開始できずカンバンで滞留するので、入口で止める (Codex PR3レビュー#3)
 router.post('/api/admin/batches', requireAdminApi, uploadPdf.single('pdf'), async (req, res) => {
   const v = validateBatchInput(req.body);
   if (v.error) return res.status(400).json({ error: v.error });
-  if (!req.file) return res.status(400).json({ error: '帳票PDFを添付してください (作業者はこれを見てピッキングします)' });
+  if (!req.file && !v.docUrl) {
+    return res.status(400).json({ error: '帳票リンク (Google Drive等) を入力するか、PDFを添付してください' });
+  }
   let pdfPath = null;
   try {
     pdfPath = await savePdf(req.file);
@@ -287,6 +308,11 @@ router.post('/api/admin/batches/:id(\\d+)/update', requireAdminApi, uploadPdf.si
   // work_date / shipping_no (業務キー) は変更不可。それ以外を検証するためキーは既存値を使う
   const v = validateBatchInput({ ...req.body, work_date: batch.work_date, shipping_no: batch.shipping_no });
   if (v.error) return res.status(400).json({ error: v.error });
+  // 更新で帳票が両方空になると、開始できないバッチができてしまう。
+  // PDF は未選択なら既存を保持するので「既存PDFがある」も帳票ありとみなす
+  if (!v.docUrl && !req.file && !batch.pdf_path) {
+    return res.status(400).json({ error: '帳票リンクを入力するか、PDFを添付してください' });
+  }
   let pdfPath = null;
   let result;
   try {
