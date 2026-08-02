@@ -180,44 +180,53 @@ function closeActivePause(db, sessionId, now) {
  * 開始 (楽観開始・要件§7.1)。1トランザクションで
  * リース → セッション作成 → 印刷ジョブ登録 → status_events 追記。
  */
+/**
+ * 開始の中身 (冪等レイヤーを通さない内部関数)。
+ * 呼び出し側 (startProcess / startNextReady) が runIdempotent の中で使う。
+ * リース取得に失敗する場合は書き込みを一切行わずに throw するため、
+ * startNextReady は lease_lost を捕まえて次候補へ進める。
+ */
+function startInternal(db, process, batchId, worker, opId) {
+  const flow = PROCESS_FLOW[process];
+  const batch = getBatch(batchId);
+  if (!batch) throw new SwError(404, 'バッチが見つかりません');
+  // 帳票が無いと「開始=印刷」が成立しない (実装計画§5: 事務がバッチ作成時に添付する方式)。
+  // リースを取る前に止め、開始済みデータを残さない (Codex PR3レビュー#3)
+  if (!batchHasDocument(batch)) {
+    throw new SwError(409, '帳票PDFが未添付のため開始できません。管理者に添付を依頼してください', 'no_document');
+  }
+  // 進行中の作業は1人1つ。保留中 (paused=1) は対象外 = 保留して別の作業へ移れる
+  // (保留理由「他作業への応援」の運用。DB制約 idx_sw_sessions_worker_open と同じ条件)
+  const mine = db.prepare("SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0").get(worker);
+  if (mine) throw new SwError(409, '作業中のバッチがあります。完了・保留・中止のいずれかをしてから次を開始してください', 'busy_worker');
+  const now = utcNow();
+  // リース: 条件付き UPDATE。0行なら他の人が先に取った (ここまで書き込みなし)
+  const res = db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ? AND status = ?')
+    .run(flow.active, now, batchId, flow.from);
+  if (res.changes === 0) {
+    throw new SwError(409, '他の人が先に開始したか、開始できない状態です。画面を更新してください', 'lease_lost');
+  }
+  const info = db.prepare(`
+    INSERT INTO sw_sessions (batch_id, process, worker, requested_at, op_id)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(batchId, process, worker, now, opId);
+  const sessionId = Number(info.lastInsertRowid);
+  db.prepare(`
+    INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, requested_by, requested_at)
+    VALUES (?, ?, 'picking_list', ?, ?, ?)
+  `).run(batchId, sessionId, batch.pdf_path, worker, now);
+  addStatusEvent(batchId, flow.from, flow.active, worker, 'button', null);
+  return { session_id: sessionId, batch_id: batchId };
+}
+
 export function startProcess(process, batchId, worker, opId) {
-  const flow = getFlow(process);
+  getFlow(process);
   validateOpId(opId);
   if (!Number.isInteger(batchId) || batchId <= 0) throw new SwError(400, 'batch_id が不正です');
   const db = getDB();
   return runIdempotent(
     { opId, worker, operation: `start:${process}`, targetKind: 'batch', targetId: batchId },
-    () => {
-      const batch = getBatch(batchId);
-      if (!batch) throw new SwError(404, 'バッチが見つかりません');
-      // 帳票が無いと「開始=印刷」が成立しない (実装計画§5: 事務がバッチ作成時に添付する方式)。
-      // リースを取る前に止め、開始済みデータを残さない (Codex PR3レビュー#3)
-      if (!batchHasDocument(batch)) {
-        throw new SwError(409, '帳票PDFが未添付のため開始できません。管理者に添付を依頼してください', 'no_document');
-      }
-      // 進行中の作業は1人1つ。保留中 (paused=1) は対象外 = 保留して別の作業へ移れる
-      // (保留理由「他作業への応援」の運用。DB制約 idx_sw_sessions_worker_open と同じ条件)
-      const mine = db.prepare("SELECT id FROM sw_sessions WHERE worker = ? AND outcome = 'open' AND paused = 0").get(worker);
-      if (mine) throw new SwError(409, '作業中のバッチがあります。完了・保留・中止のいずれかをしてから次を開始してください', 'busy_worker');
-      const now = utcNow();
-      // リース: 条件付き UPDATE。0行なら他の人が先に取った
-      const res = db.prepare('UPDATE sw_batches SET status = ?, updated_at = ? WHERE id = ? AND status = ?')
-        .run(flow.active, now, batchId, flow.from);
-      if (res.changes === 0) {
-        throw new SwError(409, '他の人が先に開始したか、開始できない状態です。画面を更新してください', 'lease_lost');
-      }
-      const info = db.prepare(`
-        INSERT INTO sw_sessions (batch_id, process, worker, requested_at, op_id)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(batchId, process, worker, now, opId);
-      const sessionId = Number(info.lastInsertRowid);
-      db.prepare(`
-        INSERT INTO sw_print_jobs (batch_id, session_id, doc_type, pdf_path, requested_by, requested_at)
-        VALUES (?, ?, 'picking_list', ?, ?, ?)
-      `).run(batchId, sessionId, batch.pdf_path, worker, now);
-      addStatusEvent(batchId, flow.from, flow.active, worker, 'button', null);
-      return { session_id: sessionId, batch_id: batchId };
-    }
+    () => startInternal(db, process, batchId, worker, opId)
   );
 }
 
@@ -288,8 +297,17 @@ export function pauseProcess(process, sessionId, worker, reason, note, opId) {
       const s = getOwnSession(db, process, sessionId, worker);
       if (s.outcome !== 'open') throw new SwError(409, 'このセッションは終了しています。画面を更新してください');
       const batch = getBatch(s.batch_id);
-      const activePause = db.prepare('SELECT id FROM sw_pauses WHERE session_id = ? AND resumed_at IS NULL').get(sessionId);
-      if (batch.status === 'hold' && activePause) return { noop: true };  // 別 op_id での二重クリック
+      const activePause = db.prepare('SELECT * FROM sw_pauses WHERE session_id = ? AND resumed_at IS NULL').get(sessionId);
+      if (batch.status === 'hold' && activePause) {
+        // 別 op_id での二重クリック。今回の理由では保留していないので、実際に効いている理由を返す
+        // (「その理由で保留できた」と誤解させない。Codex PR3レビュー round2 #low)
+        return {
+          noop: true,
+          batch_id: s.batch_id,
+          effectiveReason: masterLabel(flow.pauseReasonKind, activePause.reason),
+          effectiveNote: activePause.reason_note,
+        };
+      }
       if (batch.status !== flow.active) throw new SwError(409, 'バッチの状態が変わっています。画面を更新してください');
       if (activePause) throw new SwError(409, '未解除の保留があります');
 
@@ -417,41 +435,38 @@ export function startNextReady(process, worker, opId) {
   getFlow(process);
   validateOpId(opId, 'op_id_next');
   const db = getDB();
-  // 再送: この op_id で既に開始済みなら、候補を選び直さず前回開始したバッチを返す。
-  // (候補一覧は他者の操作で入れ替わるため、再送のたびに先頭を見ると別バッチを指してしまう。
-  //  Codex PR3レビュー#4)
-  const prev = db.prepare('SELECT * FROM sw_operations WHERE op_id = ?').get(opId);
-  if (prev) {
-    if (prev.worker !== worker || prev.operation !== `start:${process}`) {
-      throw new SwError(409, '操作IDが別の操作に使われています。画面を更新してやり直してください', 'op_conflict');
+  // 「次を開始」自体を1つの冪等操作として記録する。候補一覧は他者の操作で入れ替わるため、
+  // 再送のたびに候補を選び直すと別バッチを開始してしまう。
+  // 「候補なし (null)」も結果として保存する — 保存しないと、再送までの間に ready バッチが
+  // 増えた場合に再送が新しいバッチを開始してしまう (Codex PR3レビュー round2 #high)。
+  // 手動開始 (start:) とは別の操作種別にして op_id の使い回しも弾く (同 round2 #medium)。
+  const r = runIdempotent(
+    { opId, worker, operation: `start-next:${process}`, targetKind: 'worker', targetId: 0 },
+    () => {
+      // 開始可能な先頭から順に試す。他者に取られた (lease_lost) ら次候補へ。
+      // 帳票未添付のバッチは自動では選ばない (開始できないため。手動一覧には出して理由を示す)
+      for (const c of listStartableBatches(process, jstToday())) {
+        if (!c.pdf_path) continue;
+        try {
+          const started = startInternal(db, process, c.id, worker, opId);
+          return { batch_id: started.batch_id, session_id: started.session_id };
+        } catch (e) {
+          // lease_lost はリース取得前に throw されるため書き込みは無い = 次候補へ進んで安全
+          if (e instanceof SwError && e.code === 'lease_lost') continue;
+          throw e;
+        }
+      }
+      return { batch_id: null, session_id: null };
     }
-    const r = JSON.parse(prev.result_json);
-    const b = getBatchWithLabels(db, r.batch_id);
-    return {
-      batch_id: r.batch_id,
-      shipping_no_label: b?.shipping_no_label || b?.shipping_no || '',
-      session_id: r.session_id,
-      already: true,
-    };
-  }
-  // 開始可能な先頭から順に試す。他者に取られた (lease_lost) ら次候補へ。
-  // 帳票未添付のバッチは自動では選ばない (開始できないため。手動一覧には出して理由を示す)
-  for (const c of listStartableBatches(process, jstToday())) {
-    if (!c.pdf_path) continue;
-    try {
-      const r = startProcess(process, c.id, worker, opId);
-      return {
-        batch_id: r.batch_id,
-        shipping_no_label: c.shipping_no_label || c.shipping_no,
-        session_id: r.session_id,
-        already: r.already,
-      };
-    } catch (e) {
-      if (e instanceof SwError && e.code === 'lease_lost') continue;
-      throw e;
-    }
-  }
-  return null;
+  );
+  if (r.batch_id == null) return null;
+  const b = getBatchWithLabels(db, r.batch_id);
+  return {
+    batch_id: r.batch_id,
+    shipping_no_label: b?.shipping_no_label || b?.shipping_no || '',
+    session_id: r.session_id,
+    already: r.already,
+  };
 }
 
 /**

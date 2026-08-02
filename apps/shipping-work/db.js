@@ -137,7 +137,26 @@ const MIGRATIONS = {
   // sw_sessions.op_id だけでは「同じ op_id を別バッチに送った再送」を成功扱いしてしまい、
   // 完了・保留・再開は op_id を持たないため通信タイムアウト後の遅延再送で記録が壊れる。
   // 全作業操作を (op_id, 操作種別, 対象, 入力) で束縛し、一致した再送だけ前回結果を返す。
-  4: createOperationsTable,
+  4: () => {
+    createOperationsTable();
+    // 進行中セッションの op_id を開始操作として引き継ぐ。これが無いと
+    // 「v3で開始がコミットされたが応答が届かず、v4デプロイ後に同じ開始が再送される」場合に
+    // 冪等判定できず 409 になる (デプロイ跨ぎの退行。Codex PR3レビュー round2 #medium)。
+    // 再印刷由来のセッション (reprintフラグ) は元の操作種別・対象が復元できないため対象外。
+    const ins = db.prepare(`
+      INSERT OR IGNORE INTO sw_operations
+        (op_id, worker, operation, target_kind, target_id, params_hash, result_json, at)
+      VALUES (?, ?, ?, 'batch', ?, NULL, ?, ?)
+    `);
+    const rows = db.prepare(`
+      SELECT id, batch_id, process, worker, op_id, requested_at FROM sw_sessions
+      WHERE op_id IS NOT NULL AND outcome = 'open' AND flags_json NOT LIKE '%reprint%'
+    `).all();
+    for (const r of rows) {
+      ins.run(r.op_id, r.worker, `start:${r.process}`, r.batch_id,
+        JSON.stringify({ session_id: r.id, batch_id: r.batch_id }), r.requested_at);
+    }
+  },
 };
 
 /** 冪等操作の記録。全作業APIがここを通り、同一 op_id の再送は保存済み結果を返す。 */

@@ -139,11 +139,12 @@ router.post('/api/picking/complete', api((req) => {
   return { ok: true, already: r.already, flags: r.flags, workSec: r.workSec ?? null, next, nextError };
 }));
 
-// 保留 (理由必須・「その他」は記述必須)
+// 保留 (理由必須・「その他」は記述必須)。
+// 既に別の理由で保留済みだった場合は effectiveReason で実際に効いている理由を返す
 router.post('/api/picking/pause', api((req) => {
   const r = pauseProcess('picking', sessionId(req.body?.session_id), req.session.email,
     String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
-  return { ok: true, already: r.already };
+  return { ok: true, already: r.already, effectiveReason: r.effectiveReason ?? null };
 }));
 
 // 保留解除
