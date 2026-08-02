@@ -112,18 +112,22 @@ eq(realertIntervalMs('P1'), 6 * H, 'P1の再通知は6時間');
 eq(realertIntervalMs('P2'), 24 * H, 'P2の再通知は24時間');
 
 // ── digest ──
-const dAllOk = buildDigest([{ id: 'a', importance: 'P1', status: 'ok', detail: '' }], [], '2026-08-01T00:00:00Z');
+const dAllOk = buildDigest([{ id: 'a', importance: 'P1', status: 'ok', detail: '' }], [], jst(2026, 8, 1, 8, 50));
 ok(/✅ すべて正常/.test(dAllOk), '全部okなら1行サマリ');
 const dMix = buildDigest([
   { id: 'a', importance: 'P1', status: 'late', detail: '3日止まってる', runbook: 'logsを見る' },
   { id: 'b', importance: 'P2', status: 'due_soon', detail: 'あと3日', runbook: '再認可する' },
   { id: 'c', importance: 'TMP', status: 'remove_due', detail: '期限切れ', runbook: '消す' },
-], ['mystery-job'], '2026-08-01T00:00:00Z');
+], ['mystery-job'], jst(2026, 8, 1, 8, 50));
 ok(/🔴 \*a\*/.test(dMix), 'lateは🔴で出る');
 ok(/🟡 \*b\*/.test(dMix), 'due_soonは🟡で出る');
 ok(/🟠 \*c\*/.test(dMix), 'remove_dueは🟠で出る');
 ok(/mystery-job/.test(dMix), '未登録pingを警告する');
 ok(dMix.indexOf('🔴') < dMix.indexOf('🟠') && dMix.indexOf('🟠') < dMix.indexOf('🟡'), '深刻な順に並ぶ');
+// 見出しの日付はJST暦日。配信時刻の 08:50 JST は UTC では前日 23:50 なので、
+// UTC由来の日付を使うと毎朝ちょうど1日前が出てしまう (2026-08-02 に実際に発覚)
+ok(/\(2026-08-02\)/.test(buildDigest([], [], jst(2026, 8, 2, 8, 50))), '見出しは配信時点のJST暦日 (08:50でも当日)');
+ok(/\(2026-08-01\)/.test(buildDigest([], [], jst(2026, 8, 1, 0, 5))), '見出しはJST深夜0:05でも当日');
 
 // ── ユーティリティ ──
 eq(fmtAge(3 * D + 5 * H), '3日', '3日+5時間→3日');
@@ -131,6 +135,13 @@ eq(fmtAge(5 * H), '5時間', '5時間');
 eq(fmtAge(10 * 60 * 1000), '1時間', '1時間未満は切り上げて1時間');
 eq(todayJst(jst(2026, 8, 1, 0, 10)), '2026-08-01', 'todayJst JST深夜');
 eq(todayJst(Date.UTC(2026, 6, 31, 15, 30)), '2026-08-01', 'todayJst UTC15:30はJST翌日');
+// 暦の境界 (JST固定・DSTなしの前提。UTCとの9時間差で日/月/年が繰り上がる所)
+eq(todayJst(jst(2026, 7, 31, 23, 59)), '2026-07-31', 'todayJst 月末23:59はその月のまま');
+eq(todayJst(jst(2026, 8, 1, 0, 0)), '2026-08-01', 'todayJst 月初0:00');
+eq(todayJst(jst(2026, 12, 31, 23, 59)), '2026-12-31', 'todayJst 年末23:59');
+eq(todayJst(jst(2027, 1, 1, 0, 0)), '2027-01-01', 'todayJst 年始0:00');
+eq(todayJst(jst(2028, 2, 29, 8, 50)), '2028-02-29', 'todayJst うるう日');
+eq(todayJst(jst(2028, 3, 1, 0, 0)), '2028-03-01', 'todayJst うるう日の翌日');
 
 // ── 実台帳のサンプル評価 (整合性の煙テスト) ──
 const seenAll = {};

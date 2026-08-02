@@ -107,7 +107,7 @@ export async function runEvaluation(nowMs = Date.now()) {
     // 毎朝のサマリ (時刻を過ぎた最初の評価で送る。送信成功時だけ日付を刻む = 失敗したら次の5分で再試行)
     if (digestDue(nowMs)) {
       const unknown = Object.keys(states).filter((id) => !REGISTERED.has(id));
-      const sent = await notify(buildDigest(results, unknown, new Date(nowMs).toISOString()), nowMs);
+      const sent = await notify(buildDigest(results, unknown, nowMs), nowMs);
       if (sent) {
         setMeta('last_digest_date', todayJst(nowMs));
         setMeta('last_digest_ok_at', nowMs);
