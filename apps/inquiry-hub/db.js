@@ -71,15 +71,22 @@ function createTables() {
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_folders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
+    name_key TEXT,                  -- 重複判定用の正規化キー (NFKC + 小文字。folders.js が入れる)
     sort_order INTEGER NOT NULL DEFAULT 100,
     is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),  -- 削除は論理削除のみ
     created_by TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
-  // 同名フォルダの禁止は「有効なもの同士」だけ (削除済みと同じ名前は作り直せる)
+  addColumnIfMissing('inquiry_folders', 'name_key', 'TEXT');
+  db.exec('UPDATE inquiry_folders SET name_key = LOWER(name) WHERE name_key IS NULL');
+  // 同名フォルダの禁止は「有効なもの同士」だけ (削除済みと同じ名前は作り直せる)。
+  // 判定はアプリと同じ正規化キーで行う (アプリ側だけの検査だとDBが素通しし、
+  // 見た目が同じフォルダが並ぶ。Codexレビュー2巡目 Medium-6)
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_name_active
     ON inquiry_folders(name) WHERE is_active = 1`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_namekey_active
+    ON inquiry_folders(name_key) WHERE is_active = 1 AND name_key IS NOT NULL`);
 
   // 店舗・チャネル
   db.exec(`CREATE TABLE IF NOT EXISTS shops (

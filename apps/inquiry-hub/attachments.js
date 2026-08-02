@@ -17,12 +17,21 @@ import { contentTypeForServing } from './mime.js';
 /** 1ファイルの上限 (これを超えるものはモール/メールの画面で見てもらう)。
  * 取得はメモリ上に全量を載せる (Gmailはbase64 JSONで返るためストリームできない) ので、
  * 同時アクセス時のメモリを見込んで控えめにする */
-export const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 /** 取得結果の短期キャッシュ (画像を並べたスレッドを複数人が開いても外部APIを叩き直さない) */
 const CACHE_TTL_MS = 5 * 60 * 1000;
-const CACHE_MAX_BYTES = 48 * 1024 * 1024;
+const CACHE_MAX_BYTES = 16 * 1024 * 1024;
 /** 外部APIへの同時取得数 (Gmail/RMS/Yahoo!のレート制限とRenderのメモリを守る) */
-const MAX_CONCURRENT_FETCH = 3;
+const MAX_CONCURRENT_FETCH = 2;
+/**
+ * ピークメモリの見積り (Codexレビュー2巡目 High-2):
+ *   キャッシュ16MB + 同時取得2×10MB + Gmailのbase64中間データ ≒ 60〜70MB。
+ *   取得を始める前にキャッシュを CACHE_SOFT_BYTES まで削り、取得中のバッファ分の
+ *   余地を必ず空けてから走らせる (取得完了後の cachePut だけではピークを抑えられない)
+ */
+const CACHE_SOFT_BYTES = CACHE_MAX_BYTES - MAX_CONCURRENT_FETCH * MAX_ATTACHMENT_BYTES > 0
+  ? CACHE_MAX_BYTES - MAX_CONCURRENT_FETCH * MAX_ATTACHMENT_BYTES
+  : Math.floor(CACHE_MAX_BYTES / 4);
 
 const cache = new Map();      // attachmentId -> { value, bytes, expiresAt }
 const inflight = new Map();   // attachmentId -> Promise (同一添付の同時リクエストを1回に集約)
@@ -37,25 +46,30 @@ function cacheGet(id) {
   return hit.value;
 }
 
+/** キャッシュを指定バイト数まで削る (古い順 = 挿入順) */
+function trimCacheTo(limit) {
+  while (cacheBytes > limit && cache.size > 0) {
+    const [k, v] = cache.entries().next().value;
+    cache.delete(k);
+    cacheBytes -= v.bytes;
+  }
+}
+
 function cachePut(id, value) {
   const bytes = value.buffer.length;
   if (bytes > CACHE_MAX_BYTES) return;              // 単体で枠を超えるものは載せない
   const old = cache.get(id);
   if (old) { cache.delete(id); cacheBytes -= old.bytes; }
-  // 枠を超えたら古い順 (挿入順) に捨てる
-  while (cacheBytes + bytes > CACHE_MAX_BYTES && cache.size > 0) {
-    const [k, v] = cache.entries().next().value;
-    cache.delete(k);
-    cacheBytes -= v.bytes;
-  }
+  trimCacheTo(CACHE_MAX_BYTES - bytes);
   cache.set(id, { value, bytes, expiresAt: Date.now() + CACHE_TTL_MS });
   cacheBytes += bytes;
 }
 
-/** 同時取得数の制限 (超過分は順番待ち) */
+/** 同時取得数の制限 (超過分は順番待ち)。取得を始める前にキャッシュを削ってピークを抑える */
 async function withSlot(fn) {
   if (running >= MAX_CONCURRENT_FETCH) await new Promise(resolve => waiters.push(resolve));
   running++;
+  trimCacheTo(CACHE_SOFT_BYTES);
   try { return await fn(); }
   finally {
     running--;
@@ -123,9 +137,15 @@ async function fetchFromChannel(ctx) {
   return { buffer: got.buffer, contentType: contentTypeForServing(fileName, got.contentType || ctx.content_type, got.buffer), fileName };
 }
 
-/** ダウンロード名のヘッダー値 (RFC5987。日本語ファイル名を壊さない + ヘッダーインジェクション防止) */
+/** ダウンロード名のヘッダー値 (RFC5987。日本語ファイル名を壊さない + ヘッダーインジェクション防止)。
+ * 外部由来のファイル名には壊れたサロゲートが混ざり得る (そのまま encodeURIComponent すると
+ * URIError で本文取得後に失敗する) ため、well-formed 化してからエンコードする */
 export function contentDispositionValue(fileName, inline) {
-  const safeAscii = String(fileName || 'attachment').replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
-  const encoded = encodeURIComponent(String(fileName || 'attachment')).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const raw = String(fileName || 'attachment');
+  const wellFormed = typeof raw.toWellFormed === 'function'
+    ? raw.toWellFormed()
+    : raw.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+  const safeAscii = wellFormed.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(wellFormed).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
   return `${inline ? 'inline' : 'attachment'}; filename="${safeAscii}"; filename*=UTF-8''${encoded}`;
 }

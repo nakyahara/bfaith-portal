@@ -38,10 +38,15 @@ function normalizeSortOrder(v, fallback) {
   return n;
 }
 
+/** 重複判定用の正規化キー (NFKC + 小文字)。DBの部分UNIQUE index と同じ値を入れる */
+export function folderNameKey(name) {
+  return String(name || '').normalize('NFKC').toLowerCase();
+}
+
 /** 大文字小文字を区別しない同名チェック (Returns と returns を別物にしない) */
 function findSameName(db, name, exceptId = null) {
   return db.prepare(`SELECT id FROM inquiry_folders
-    WHERE is_active = 1 AND LOWER(name) = LOWER(?) AND (? IS NULL OR id != ?)`).get(name, exceptId, exceptId);
+    WHERE is_active = 1 AND name_key = ? AND (? IS NULL OR id != ?)`).get(folderNameKey(name), exceptId, exceptId);
 }
 
 /**
@@ -85,8 +90,8 @@ export function createFolder(nameInput, createdBy = null) {
     if (findSameName(db, name)) throw new Error(`同じ名前のフォルダがあります: ${name}`);
     // 末尾に追加 (並び順は管理画面から変更できる)
     const maxOrder = db.prepare('SELECT MAX(sort_order) AS m FROM inquiry_folders WHERE is_active = 1').get().m;
-    const r = db.prepare('INSERT INTO inquiry_folders (name, sort_order, created_by) VALUES (?,?,?)')
-      .run(name, (maxOrder ?? 0) + 10, createdBy);
+    const r = db.prepare('INSERT INTO inquiry_folders (name, name_key, sort_order, created_by) VALUES (?,?,?,?)')
+      .run(name, folderNameKey(name), (maxOrder ?? 0) + 10, createdBy);
     return { id: r.lastInsertRowid, name };
   }).immediate();
 }
@@ -102,8 +107,9 @@ export function updateFolder(id, { name, sortOrder } = {}) {
       throw new Error(`同じ名前のフォルダがあります: ${newName}`);
     }
     const newOrder = normalizeSortOrder(sortOrder, f.sort_order);
-    db.prepare(`UPDATE inquiry_folders SET name = ?, sort_order = ?,
-        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`).run(newName, newOrder, id);
+    db.prepare(`UPDATE inquiry_folders SET name = ?, name_key = ?, sort_order = ?,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
+      .run(newName, folderNameKey(newName), newOrder, id);
     return { id, name: newName, sortOrder: newOrder };
   }).immediate();
 }

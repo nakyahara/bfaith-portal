@@ -404,10 +404,14 @@ export function createGmailAdapter(cfg = {}) {
       // ファイル名 + サイズ、最後にファイル名だけ、の順にフォールバックする
       const wantPartId = String(externalAttachmentId || '').startsWith('part:')
         ? String(externalAttachmentId).slice(5) : null;
-      const part = (wantPartId && withFile.find(p => String(p.partId) === wantPartId))
-        || withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
-        || withFile.find(p => p.filename === fileName);
-      if (!part) throw new Error(`添付「${fileName || '(名称不明)'}」がメール内に見つかりません (削除された可能性)`);
+      // partId を保存してあるならそれと一致必須 (見つからなければ失敗させる)。
+      // 名前へのフォールバックは partId を保存していない旧データ (syn:) のときだけ
+      // — 一致しないのに同名の別添付を返すと、別の顧客の写真を表示しかねない
+      const part = wantPartId
+        ? withFile.find(p => String(p.partId) === wantPartId)
+        : (withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
+          || withFile.find(p => p.filename === fileName));
+      if (!part) throw new Error(`添付「${fileName || '(名称不明)'}」がメール内に見つかりません (削除された、またはメールの構成が変わった可能性)`);
       if (maxBytes && part.body?.size > maxBytes) {
         throw new Error(`添付が大きすぎます (${Math.round(part.body.size / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
       }
