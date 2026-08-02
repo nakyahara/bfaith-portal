@@ -66,9 +66,11 @@ function prepareStmts(db) {
                  WHERE item_manage_number = ? AND item_url IS NOT NULL AND item_url <> ''
                  ORDER BY date_jst DESC LIMIT 1`,
     // 楽天の商品ページは「親商品」単位。色/サイズのバリエーションSKUコードでURLを組むと404になる
-    // (2026-08-02: サンプル20件中7件が404だった)。実在する商品管理番号かをRMS由来データで確認する
-    rakutenItemExists: `SELECT item_manage_number FROM mirror_rakuten_item_daily
-                        WHERE item_manage_number = ? ORDER BY date_jst DESC LIMIT 1`,
+    // (2026-08-02: サンプル20件中7件が404だった)。実在する商品管理番号かをRMS由来データで確認する。
+    // ⚠️商品ごとに個別照会すると6,800商品×最大4候補で応答が90秒を超えたため、一括で読んで
+    // メモリ上のSetで判定する (2026-08-02のタイムアウト対処)
+    rakutenItemNumbers: `SELECT DISTINCT item_manage_number FROM mirror_rakuten_item_daily
+                         WHERE item_manage_number IS NOT NULL AND trim(item_manage_number) <> ''`,
     yahooItem: `SELECT item_code FROM mirror_yahoo_item_daily
                 WHERE item_code = ? ORDER BY date_jst DESC LIMIT 1`,
     // Amazon ASINは供給元が3つあるので順に試す (2026-08-02: 販売実績のみだと解決0件だった)。
@@ -133,20 +135,21 @@ function safeGet(s, key, runtimeDegraded, arg) {
  * ハイフン区切りの末尾を1段ずつ削りながら、RMS由来データ (mirror_rakuten_item_daily) に
  * 実在する番号かを確認する。見つからなければ null = URLを出さない。
  */
-function resolveRakutenItemNumber(s, rakutenCode, runtimeDegraded) {
+function resolveRakutenItemNumber(itemNumbers, rakutenCode) {
+  if (!itemNumbers) return null;
   const parts = String(rakutenCode).split('-');
   // 例: a-b-c-d → [a-b-c-d, a-b-c, a-b] (最大3段まで遡る。1要素まで削ると別商品に当たる恐れ)
   const maxStrip = Math.min(3, parts.length - 1);
   for (let i = 0; i <= maxStrip; i++) {
     const candidate = parts.slice(0, parts.length - i).join('-');
     if (!candidate) break;
-    const hit = safeGet(s, 'rakutenItemExists', runtimeDegraded, candidate);
-    if (hit?.item_manage_number) return hit.item_manage_number;
+    const hit = itemNumbers.get(candidate.toLowerCase());
+    if (hit) return hit;
   }
   return null;
 }
 
-function lookupMalls(s, code, runtimeDegraded, asinSourceCounts) {
+function lookupMalls(s, code, runtimeDegraded, asinSourceCounts, itemNumbers) {
   const malls = {
     rakuten: { code: null, url: null },
     yahoo: { code: null, url: null },
@@ -160,7 +163,7 @@ function lookupMalls(s, code, runtimeDegraded, asinSourceCounts) {
     malls.rakuten.code = rk.rakuten_code;
     // 楽天の商品ページは親商品単位。SKUコード (例: xxx-bk) から親 (xxx) を段階的に探し、
     // **RMS由来データに実在する商品管理番号だけ**をURL化する (存在しなければURLを出さない)
-    const itemNumber = resolveRakutenItemNumber(s, rk.rakuten_code, runtimeDegraded);
+    const itemNumber = resolveRakutenItemNumber(itemNumbers, rk.rakuten_code);
     if (itemNumber) {
       const snap = safeGet(s, 'rakutenUrl', runtimeDegraded, itemNumber);
       malls.rakuten.url =
@@ -219,6 +222,19 @@ router.get('/products', requireSiteReadToken, (req, res) => {
     const runtimeDegraded = new Set();
     const asinSourceCounts = {}; // どのソースでASINが解決できたか (診断用)
     const result = db.transaction(() => {
+      // 楽天の実在商品管理番号を一括ロード (小文字キー → 元表記)。商品ごとの個別照会は遅すぎる
+      let itemNumbers = null;
+      try {
+        itemNumbers = new Map(
+          (s.rakutenItemNumbers?.all() ?? []).map((r) => [
+            String(r.item_manage_number).toLowerCase(),
+            r.item_manage_number,
+          ])
+        );
+      } catch (e) {
+        runtimeDegraded.add('rakutenItemNumbers');
+        console.warn('[site-products] 楽天商品番号の一括読込に失敗:', e.message);
+      }
       const rows = s.products.all();
       return rows.map((r) => ({
         code: r.code,
@@ -229,7 +245,7 @@ router.get('/products', requireSiteReadToken, (req, res) => {
         price: r.price ?? null,
         stockFree: Math.max(0, (r.stock ?? 0) - (r.allocated ?? 0)),
         representativeCode: r.representativeCode ?? null,
-        malls: lookupMalls(s, r.code, runtimeDegraded, asinSourceCounts),
+        malls: lookupMalls(s, r.code, runtimeDegraded, asinSourceCounts, itemNumbers),
       }));
     })();
 
