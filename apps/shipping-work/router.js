@@ -26,6 +26,7 @@ import {
   startNextReady, getWorkerState, requestReprint, correctCompletion,
   getBatchDetail, adminFixStatus, adminJudgeSession, listSessionsForReview,
   ADMIN_FIXABLE_STATUSES,
+  listAnomalies, getStats, getSettings, saveSetting, toggleMaster, listAllMasters, FLAG_LABELS,
 } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -431,6 +432,101 @@ router.post('/api/admin/sessions/:id(\\d+)/judge', requireAdminApi, api((req) =>
   const r = adminJudgeSession(Number(req.params.id), String(req.body?.validity || ''),
     req.session.email, req.body?.reason, opId(req.body?.op_id));
   return { ok: true, already: r.already, validity: r.validity };
+}));
+
+// ═══ 管理者: 異常候補・集計・設定 (PR5) ═══
+
+/** 期間クエリの検証。不正なら今日1日。from > to は入れ替える。 */
+function dateRange(req) {
+  let from = isRealDate(String(req.query.from || '')) ? String(req.query.from) : jstToday();
+  let to = isRealDate(String(req.query.to || '')) ? String(req.query.to) : from;
+  if (from > to) [from, to] = [to, from];
+  return { from, to };
+}
+
+// 異常候補一覧 (要件§7.4: 日次一覧に表示して管理者が判断)
+router.get('/admin/anomalies', requireAdminPage, (req, res) => {
+  const { from, to } = dateRange(req);
+  res.render(path.join(__dirname, 'views/admin_anomalies'), {
+    title: '異常候補 | 出荷作業管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    from, to,
+    sessions: listAnomalies(from, to),
+    flagLabels: FLAG_LABELS,
+    displayNames: loadDisplayNames(),
+  });
+});
+
+// 集計 (要件§10.2: 作業者×工程×発送分類。平均と中央値)
+router.get('/admin/stats', requireAdminPage, (req, res) => {
+  const { from, to } = dateRange(req);
+  res.render(path.join(__dirname, 'views/admin_stats'), {
+    title: '集計 | 出荷作業管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    from, to,
+    rows: getStats(from, to),
+    processLabels: { picking: 'ピッキング', sorting: '仕分け', packing: '梱包' },
+    displayNames: loadDisplayNames(),
+  });
+});
+
+// 集計CSV (BOM付きUTF-8 = Excelでそのまま開ける)
+router.get('/admin/stats.csv', requireAdminPage, (req, res) => {
+  const { from, to } = dateRange(req);
+  const rows = getStats(from, to);
+  const names = loadDisplayNames();
+  const procLabels = { picking: 'ピッキング', sorting: '仕分け', packing: '梱包' };
+  const esc = (v) => {
+    let s = String(v ?? '');
+    // Excel が数式として評価する先頭文字は ' を前置して無害化 (CSVインジェクション対策)
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const header = ['日付', '作業者', '工程', '発送分類', 'バッチ数', '伝票数', '実作業時間(分)', '保留時間(分)',
+    '伝票/時', '1伝票あたり秒(平均)', '1伝票あたり秒(中央値)', 'バッチ時間中央値(分)', '異常候補数'];
+  const lines = [header.join(',')];
+  for (const r of rows) {
+    lines.push([
+      r.date,
+      esc(names[r.worker] || r.worker), esc(procLabels[r.process] || r.process), esc(r.bunruiLabel || r.bunrui),
+      r.batches, r.slips, (r.activeSec / 60).toFixed(1), (r.pauseSec / 60).toFixed(1),
+      r.slipsPerHour ?? '', r.secPerSlipAvg ?? '', r.secPerSlipMedian ?? '',
+      r.batchSecMedian != null ? (r.batchSecMedian / 60).toFixed(1) : '', r.anomalies,
+    ].join(','));
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="shipping-stats_${from}_${to}.csv"`);
+  res.send('\uFEFF' + lines.join('\r\n'));
+});
+
+// 設定画面 (閾値・休憩時間帯・マスタ有効/無効)
+router.get('/admin/settings', requireAdminPage, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_settings'), {
+    title: '設定 | 出荷作業管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    settings: getSettings(),
+    masterKinds: listAllMasters(),
+    kindLabels: {
+      shipping_no: '出荷No', bunrui: '発送分類', packing_method: '梱包方法', carrier: '配送種別',
+      pause_reason_pick: '保留理由 (ピッキング)', pause_reason_pack: '保留理由 (仕分け・梱包)',
+      mistake_kind: 'ミス分類', print_trouble_reason: '印刷トラブル理由',
+      reprint_reason: '再印刷理由', correction_reason: '訂正理由',
+    },
+  });
+});
+
+router.post('/api/admin/settings', requireAdminApi, api((req) => {
+  const r = saveSetting(String(req.body?.key || ''), req.body?.value, req.session.email);
+  return { ok: true, key: r.key };
+}));
+
+router.post('/api/admin/masters/toggle', requireAdminApi, api((req) => {
+  const r = toggleMaster(String(req.body?.kind || ''), String(req.body?.code || ''),
+    !!req.body?.active, req.session.email);
+  return { ok: true, active: r.active ?? null };
 }));
 
 // 添付PDFの表示 (開発中モード: ブリッジ未設置でも手動印刷できる逃げ道。実装計画§5)。

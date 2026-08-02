@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .sw-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 40px; }
+    .bar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+    .scroll { overflow-x: auto; }
+    table.t { width: 100%; border-collapse: collapse; font-size: 0.87em; white-space: nowrap; }
+    table.t th, table.t td { border-bottom: 1px solid #e9ecef; padding: 6px 8px; text-align: right; }
+    table.t th { background: #f8f9fa; }
+    table.t th:nth-child(-n+3), table.t td:nth-child(-n+3) { text-align: left; }
+    .btn-sm { padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+    .note { color: #868e96; font-size: 0.85em; }
+    .empty { color: #868e96; text-align: center; padding: 40px 0; }
+    tr.worker-head td { background: #f8f9fa; font-weight: bold; text-align: left; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📊 集計</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/admin/anomalies" class="btn-logout">異常候補</a>
+      <a href="/apps/shipping-work/admin/settings" class="btn-logout">設定</a>
+      <a href="/apps/shipping-work/admin/batches" class="btn-logout">バッチ管理</a>
+      <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+    </div>
+  </header>
+
+  <div class="sw-wrap">
+    <div class="bar">
+      <form method="get" style="display:flex;gap:8px;align-items:center;margin:0">
+        <input type="date" name="from" value="<%= from %>">
+        〜 <input type="date" name="to" value="<%= to %>">
+        <button type="submit" class="btn-sm">表示</button>
+      </form>
+      <a class="btn-sm" style="text-decoration:none;border:1px solid #dee2e6;border-radius:4px;background:#f1f3f5;color:#212529"
+         href="/apps/shipping-work/admin/stats.csv?from=<%= from %>&to=<%= to %>">⬇ CSV</a>
+      <span class="note">実作業時間 = 終了 − 開始 − 保留 − 休憩。除外判定した計測は含みません</span>
+    </div>
+
+    <% if (rows.length === 0) { %>
+      <div class="empty">この期間に完了した作業はありません。</div>
+    <% } else { %>
+    <div class="scroll">
+    <table class="t">
+      <thead>
+        <tr><th>作業者</th><th>工程</th><th>発送分類</th><th>バッチ</th><th>伝票</th>
+            <th>実作業(分)</th><th>保留(分)</th><th>伝票/時</th>
+            <th>秒/伝票 平均</th><th>秒/伝票 中央値</th><th>バッチ中央値(分)</th><th>⚠</th></tr>
+      </thead>
+      <tbody>
+        <% let prevKey = null; %>
+        <% for (const r of rows) { %>
+          <% const headKey = r.date + ' ' + r.worker; %>
+          <% if (headKey !== prevKey) { prevKey = headKey; %>
+            <tr class="worker-head"><td colspan="12">📅 <%= r.date %> ／ 👤 <%= displayNames[r.worker] || r.worker.split('@')[0] %></td></tr>
+          <% } %>
+          <tr>
+            <td></td>
+            <td><%= processLabels[r.process] || r.process %></td>
+            <td><%= r.bunruiLabel || r.bunrui %></td>
+            <td><%= r.batches %></td>
+            <td><%= r.slips %></td>
+            <td><%= (r.activeSec / 60).toFixed(1) %></td>
+            <td><%= (r.pauseSec / 60).toFixed(1) %></td>
+            <td><%= r.slipsPerHour ?? '—' %></td>
+            <td><%= r.secPerSlipAvg ?? '—' %></td>
+            <td><%= r.secPerSlipMedian ?? '—' %></td>
+            <td><%= r.batchSecMedian != null ? (r.batchSecMedian / 60).toFixed(1) : '—' %></td>
+            <td><%= r.anomalies > 0 ? r.anomalies : '' %></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    </div>
+    <div class="note" style="margin-top:8px">
+      発送分類別の「秒/伝票 中央値」が標準値設定の基準です (要件§10.3。現行実測は 0.27〜0.46分/伝票)。
+      ⚠ = 異常候補フラグ付きセッション数 (<a href="/apps/shipping-work/admin/anomalies?from=<%= from %>&to=<%= to %>">一覧で確認</a>)
+    </div>
+    <% } %>
+  </div>
+</body>
+</html>

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .sw-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px 40px; }
+    .card { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .card h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .srow { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+    .srow label { flex: 0 0 240px; font-weight: bold; font-size: 0.92em; }
+    .srow input { flex: 1; min-width: 200px; padding: 7px; }
+    .srow .hint { flex-basis: 100%; color: #868e96; font-size: 0.82em; margin-left: 250px; }
+    .btn-sm { padding: 4px 12px; font-size: 0.9em; cursor: pointer; }
+    .note { color: #868e96; font-size: 0.85em; }
+    details { margin-bottom: 8px; }
+    summary { cursor: pointer; font-weight: bold; padding: 6px 0; }
+    .m-item { display: flex; align-items: center; gap: 10px; padding: 4px 0 4px 16px; font-size: 0.9em; }
+    .m-item.off { color: #adb5bd; text-decoration: line-through; }
+    .msg { font-size: 0.9em; margin-left: 8px; }
+    .msg.ok { color: #2b8a3e; } .msg.err { color: #c92a2a; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">⚙ 設定</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/admin/stats" class="btn-logout">集計</a>
+      <a href="/apps/shipping-work/admin/batches" class="btn-logout">バッチ管理</a>
+      <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+    </div>
+  </header>
+
+  <div class="sw-wrap">
+    <div class="card">
+      <h2>しきい値・休憩</h2>
+      <% for (const s of settings) { %>
+        <div class="srow">
+          <label><%= s.label %></label>
+          <input type="text" id="set-<%= s.key %>" value="<%= s.value %>"
+                 placeholder="<%= s.dflt !== '' ? '未設定なら ' + s.dflt : '未設定' %>">
+          <button class="btn-sm" onclick="saveSetting('<%= s.key %>')">保存</button>
+          <span class="msg" id="msg-<%= s.key %>"></span>
+          <div class="hint"><%= s.hint %></div>
+        </div>
+      <% } %>
+      <div class="note">変更は監査ログに残ります。休憩の控除は「これから完了する」セッションから効きます (過去の計測は変わりません)</div>
+    </div>
+
+    <div class="card">
+      <h2>マスタの有効/無効</h2>
+      <div class="note" style="margin-bottom:8px">
+        無効にすると新しい選択肢として出なくなります (過去の記録はそのまま)。
+        追加・名前の変更はシステム管理で行うため、必要なら開発担当へ依頼してください
+      </div>
+      <% for (const [kind, items] of masterKinds) { %>
+        <details>
+          <summary><%= kindLabels[kind] || kind %> (<%= items.filter((m) => m.active).length %>/<%= items.length %>)</summary>
+          <% for (const m of items) { %>
+            <div class="m-item <%= m.active ? '' : 'off' %>">
+              <input type="checkbox" <%= m.active ? 'checked' : '' %>
+                     onchange="toggleMaster('<%= kind %>', '<%= m.code %>', this)">
+              <span><%= m.label %></span>
+              <span class="note"><%= m.code %></span>
+            </div>
+          <% } %>
+        </details>
+      <% } %>
+    </div>
+  </div>
+
+  <script>
+    async function post(url, body) {
+      const r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let j = {};
+      try { j = await r.json(); } catch {}
+      return { ok: r.ok, body: j };
+    }
+    async function saveSetting(key) {
+      const value = document.getElementById('set-' + key).value;
+      const msg = document.getElementById('msg-' + key);
+      msg.textContent = '保存中...'; msg.className = 'msg';
+      const r = await post('/apps/shipping-work/api/admin/settings', { key, value });
+      if (!r.ok) { msg.textContent = r.body.error || 'エラー'; msg.className = 'msg err'; return; }
+      msg.textContent = '保存しました'; msg.className = 'msg ok';
+    }
+    async function toggleMaster(kind, code, el) {
+      const r = await post('/apps/shipping-work/api/admin/masters/toggle', { kind, code, active: el.checked });
+      if (!r.ok) { alert(r.body.error || 'エラー'); el.checked = !el.checked; return; }
+      el.closest('.m-item').classList.toggle('off', !el.checked);
+    }
+  </script>
+</body>
+</html>
