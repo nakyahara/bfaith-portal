@@ -65,7 +65,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function initShippingWorkDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -133,7 +133,27 @@ const MIGRATIONS = {
     db.exec(`CREATE UNIQUE INDEX idx_sw_sessions_worker_open
       ON sw_sessions(worker) WHERE outcome='open' AND paused=0`);
   },
+  // v4: 冪等性をセッションの op_id 相乗りから専用テーブルへ移す (Codex PR3レビュー#1/#2/#4)。
+  // sw_sessions.op_id だけでは「同じ op_id を別バッチに送った再送」を成功扱いしてしまい、
+  // 完了・保留・再開は op_id を持たないため通信タイムアウト後の遅延再送で記録が壊れる。
+  // 全作業操作を (op_id, 操作種別, 対象, 入力) で束縛し、一致した再送だけ前回結果を返す。
+  4: createOperationsTable,
 };
+
+/** 冪等操作の記録。全作業APIがここを通り、同一 op_id の再送は保存済み結果を返す。 */
+function createOperationsTable() {
+  db.exec(`CREATE TABLE IF NOT EXISTS sw_operations (
+    op_id       TEXT PRIMARY KEY,
+    worker      TEXT NOT NULL,
+    operation   TEXT NOT NULL,      -- start/complete/pause/resume/trouble
+    target_kind TEXT NOT NULL,      -- batch/session
+    target_id   INTEGER NOT NULL,
+    params_hash TEXT,               -- 入力内容のハッシュ (別入力での使い回しを検知)
+    result_json TEXT NOT NULL,
+    at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sw_operations_worker ON sw_operations(worker, at)');
+}
 
 export function getDB() {
   if (!db) initShippingWorkDB();
@@ -287,6 +307,11 @@ function createCoreTables() {
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`);
+}
+
+/** 帳票PDFが無いバッチは開始できない (実装計画§5: バッチ作成時に事務がPDFを添付する方式)。 */
+export function batchHasDocument(batch) {
+  return !!batch?.pdf_path;
 }
 
 // ─── マスタ初期データ (現行 Notion「スタッフ用デイリー業務」の区分をそのまま引き継ぐ) ───

@@ -43,6 +43,8 @@
     .pk-tile .no { font-size: 1.35em; font-weight: bold; }
     .pk-tile .meta { color: #495057; margin-top: 3px; }
     .pk-tile .carry { color: #e8590c; font-weight: bold; }
+    .pk-tile.nodoc { background: #f8f9fa; color: #868e96; cursor: default; }
+    .pk-tile .nodoc-msg { color: #c92a2a; font-weight: bold; margin-top: 4px; }
     .pk-empty { color: #868e96; text-align: center; padding: 30px 0; font-size: 1.05em; }
     .pk-note { background: #fff3bf; border-radius: 8px; padding: 8px 12px; margin-top: 10px; }
     /* モーダル */
@@ -110,7 +112,8 @@
         <div class="pk-empty">開始できるバッチはありません。<br>お疲れさまでした！</div>
       <% } %>
       <% for (const b of state.ready) { %>
-        <button class="pk-tile" onclick="startBatch(<%= b.id %>)">
+        <button class="pk-tile <%= b.pdf_path ? '' : 'nodoc' %>"
+          <% if (b.pdf_path) { %>onclick="startBatch(<%= b.id %>)"<% } else { %>disabled<% } %>>
           <div class="no"><%= b.shipping_no_label || b.shipping_no %></div>
           <div class="meta">
             <%= b.bunrui_label || b.bunrui %> ／ <%= b.packing_method_label || b.packing_method %>
@@ -118,6 +121,9 @@
             <% if (b.work_date !== today) { %> ／ <span class="carry">持ち越し (<%= b.work_date %>)</span><% } %>
           </div>
           <% if (b.note) { %><div class="meta">📝 <%= b.note %></div><% } %>
+          <% if (!b.pdf_path) { %>
+            <div class="meta nodoc-msg">⚠ 帳票PDFが未添付のため開始できません (管理者に添付を依頼してください)</div>
+          <% } %>
         </button>
       <% } %>
     <% } %>
@@ -201,11 +207,12 @@
       return j;
     }
 
+    // 全操作に op_id を付ける (サーバー側の冪等レイヤーが操作種別・対象・入力に束縛して記録する)
     async function post(pathName, body) {
       if (busy) return;
       busy = true;
       try {
-        await callApi(pathName, { session_id: SESSION_ID, ...body });
+        await callApi(pathName, { session_id: SESSION_ID, op_id: opId(), ...body });
         location.reload();
       } catch (e) {
         alert(e.message);
@@ -218,7 +225,7 @@
       if (busy) return;
       busy = true;
       try {
-        await callApi('resume', { session_id: sessionId });
+        await callApi('resume', { session_id: sessionId, op_id: opId() });
         location.reload();
       } catch (e) {
         alert(e.message);
@@ -245,7 +252,10 @@
       if (!confirm(msg)) return;
       busy = true;
       try {
-        const j = await callApi('complete', { session_id: SESSION_ID, next: withNext, op_id_next: withNext ? opId() : undefined });
+        const j = await callApi('complete', {
+          session_id: SESSION_ID, op_id: opId(),
+          next: withNext, op_id_next: withNext ? opId() : undefined,
+        });
         if (withNext && !j.next) {
           alert(j.nextError
             ? `完了しました。次のバッチは開始できませんでした:\n${j.nextError}`
@@ -285,7 +295,7 @@
         ? '計測をやり直し、帳票を再印刷して開始し直します。よろしいですか？'
         : 'このバッチを「本日のやること」に戻します。よろしいですか？';
       if (!confirm(confirmMsg)) return;
-      post('trouble', { reason: sel.trouble.code, note, action, op_id_new: action === 'reprint' ? opId() : undefined });
+      post('trouble', { reason: sel.trouble.code, note, action });
     }
 
     // ─── 経過タイマー (保留を除いた実作業時間の目安表示。正式な計測はサーバー時刻) ───

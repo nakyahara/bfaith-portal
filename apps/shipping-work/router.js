@@ -110,22 +110,27 @@ function api(handler) {
   };
 }
 
-// 開始 (楽観開始 = リース + 印刷ジョブ + 計測開始)。op_id はクライアント発行 UUID (冪等)
+// 全作業APIはクライアント発行の op_id (UUID) を必須とし、service の冪等レイヤーが
+// 「操作種別 × 対象 × 入力」に束縛して記録する。完全一致の再送だけが前回結果を返す。
+const opId = (v) => String(v || '');
+const sessionId = (v) => Number(v);
+
+// 開始 (楽観開始 = リース + 印刷ジョブ + 計測開始)
 router.post('/api/picking/start', api((req) => {
-  const r = startProcess('picking', Number(req.body?.batch_id), req.session.email, String(req.body?.op_id || ''));
-  return { ok: true, session_id: r.session.id, already: r.already };
+  const r = startProcess('picking', Number(req.body?.batch_id), req.session.email, opId(req.body?.op_id));
+  return { ok: true, session_id: r.session_id, batch_id: r.batch_id, already: r.already };
 }));
 
 // 完了。next=true なら次の開始可能バッチを連続開始 (op_id_next 必須)。
-// 完了は別トランザクションで確定済みのため、次の開始が失敗しても完了をエラーとして返さない
+// 完了は確定済みのため、次の開始が失敗しても完了をエラーとして返さない
 // (作業者には「完了はできた・次は取れなかった」と伝わるのが正しい)。
 router.post('/api/picking/complete', api((req) => {
-  const r = completeProcess('picking', Number(req.body?.session_id), req.session.email);
+  const r = completeProcess('picking', sessionId(req.body?.session_id), req.session.email, opId(req.body?.op_id));
   let next = null;
   let nextError = null;
   if (req.body?.next) {
     try {
-      next = startNextReady('picking', req.session.email, String(req.body?.op_id_next || ''));
+      next = startNextReady('picking', req.session.email, opId(req.body?.op_id_next));
     } catch (e) {
       nextError = e instanceof SwError ? e.message : '次のバッチを開始できませんでした';
       console.error('[shipping-work] 次バッチ開始に失敗', e);
@@ -136,23 +141,22 @@ router.post('/api/picking/complete', api((req) => {
 
 // 保留 (理由必須・「その他」は記述必須)
 router.post('/api/picking/pause', api((req) => {
-  const r = pauseProcess('picking', Number(req.body?.session_id), req.session.email,
-    String(req.body?.reason || ''), req.body?.note);
+  const r = pauseProcess('picking', sessionId(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note, opId(req.body?.op_id));
   return { ok: true, already: r.already };
 }));
 
 // 保留解除
 router.post('/api/picking/resume', api((req) => {
-  const r = resumeProcess('picking', Number(req.body?.session_id), req.session.email);
+  const r = resumeProcess('picking', sessionId(req.body?.session_id), req.session.email, opId(req.body?.op_id));
   return { ok: true, already: r.already };
 }));
 
 // 印刷トラブル (reprint=再印刷して開始し直す / abort=中止して ready へ戻す)
 router.post('/api/picking/trouble', api((req) => {
-  const r = troubleProcess('picking', Number(req.body?.session_id), req.session.email,
-    String(req.body?.reason || ''), req.body?.note, String(req.body?.action || ''),
-    req.body?.op_id_new ? String(req.body.op_id_new) : null);
-  return { ok: true, already: r.already, session_id: r.session?.id ?? null, aborted: r.aborted ?? false };
+  const r = troubleProcess('picking', sessionId(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note, String(req.body?.action || ''), opId(req.body?.op_id));
+  return { ok: true, already: r.already, session_id: r.session_id, aborted: r.aborted };
 }));
 
 // ─── ヘルスチェック (デプロイ確認用) ───
@@ -253,10 +257,12 @@ router.get('/admin/batches', requireAdminPage, (req, res) => {
   });
 });
 
-// バッチ作成
+// バッチ作成。帳票PDFは必須 (実装計画§5「バッチ作成時に事務がPDFを添付」= 開始時にそれを印刷する。
+// 未添付だと作業者が開始できずカンバンで滞留するため、入口で止める。Codex PR3レビュー#3)
 router.post('/api/admin/batches', requireAdminApi, uploadPdf.single('pdf'), async (req, res) => {
   const v = validateBatchInput(req.body);
   if (v.error) return res.status(400).json({ error: v.error });
+  if (!req.file) return res.status(400).json({ error: '帳票PDFを添付してください (作業者はこれを見てピッキングします)' });
   let pdfPath = null;
   try {
     pdfPath = await savePdf(req.file);

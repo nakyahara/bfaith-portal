@@ -78,8 +78,8 @@
             <input type="number" name="slip_count" min="1" placeholder="例: 26">
           </div>
           <div>
-            <label>帳票PDF (任意)</label>
-            <input type="file" name="pdf" accept="application/pdf">
+            <label>帳票PDF <span id="pdfReq">(必須)</span></label>
+            <input type="file" name="pdf" accept="application/pdf" required>
           </div>
         </div>
         <div style="margin-top:8px">
@@ -158,6 +158,9 @@
       for (const cb of f.querySelectorAll('input[name=carriers]')) cb.checked = carriers.includes(cb.value);
       f.elements.work_date.disabled = true;
       f.elements.shipping_no.disabled = true;
+      // 編集では PDF は差し替えたいときだけ選ぶ (未選択なら既存を保持)
+      f.elements.pdf.required = false;
+      document.getElementById('pdfReq').textContent = '(差し替える場合のみ)';
       document.getElementById('formTitle').textContent = `バッチ #${editingId} を編集 (作業日・出荷Noは変更不可)`;
       document.getElementById('submitBtn').textContent = '更新';
       document.getElementById('cancelEditBtn').style.display = '';
@@ -171,6 +174,8 @@
       createForm.elements.work_date.disabled = false;
       createForm.elements.shipping_no.disabled = false;
       createForm.elements.work_date.value = '<%= workDate %>';
+      createForm.elements.pdf.required = true;
+      document.getElementById('pdfReq').textContent = '(必須)';
       document.getElementById('formTitle').textContent = 'バッチ作成';
       document.getElementById('submitBtn').textContent = '作成';
       document.getElementById('cancelEditBtn').style.display = 'none';
