@@ -24,6 +24,8 @@ import {
 import {
   SwError, startProcess, completeProcess, pauseProcess, resumeProcess, troubleProcess,
   startNextReady, getWorkerState, requestReprint, correctCompletion,
+  getBatchDetail, adminFixStatus, adminJudgeSession, listSessionsForReview,
+  ADMIN_FIXABLE_STATUSES,
 } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -106,7 +108,10 @@ function api(handler) {
     try {
       res.json(handler(req));
     } catch (e) {
-      if (e instanceof SwError) return res.status(e.status).json({ error: e.message, code: e.code });
+      // detail は「後の工程が進んでいます」のように、画面で内容を見せて確認させるための付随情報
+      if (e instanceof SwError) {
+        return res.status(e.status).json({ error: e.message, code: e.code, detail: e.detail });
+      }
       console.error('[shipping-work] API error', e);
       res.status(500).json({ error: 'サーバーエラーが発生しました' });
     }
@@ -363,6 +368,51 @@ router.post('/api/admin/batches/:id(\\d+)/cancel', requireAdminApi, (req, res) =
   if (!ok) return res.status(409).json({ error: '取消できるのは「本日のやること」のバッチのみです' });
   res.json({ ok: true });
 });
+
+// ═══ 管理者: 救済 (現物とシステムが食い違ったときの最終手段) ═══
+//
+// 作業者の訂正は「自分の直前操作」に限ってあるので、条件を外れたものは全部ここへ来る。
+// できることは広いが、必ず理由と履歴を残し、計測時刻は決して書き換えない。
+
+// バッチ詳細 (履歴・全セッション・印刷ジョブ)
+router.get('/admin/batches/:id(\\d+)', requireAdminPage, (req, res) => {
+  const detail = getBatchDetail(Number(req.params.id));
+  if (!detail) return res.status(404).send('バッチが見つかりません');
+  res.render(path.join(__dirname, 'views/admin_batch_detail'), {
+    title: `バッチ #${detail.batch.id} | 出荷作業管理`,
+    username: req.session.email,
+    displayName: req.session.displayName,
+    ...detail,
+    statusLabels: STATUS_LABELS,
+    statuses: ADMIN_FIXABLE_STATUSES,
+    displayNames: loadDisplayNames(),
+  });
+});
+
+// 確認待ち (作業者が訂正した / 管理者が閉じた セッション)
+router.get('/admin/review', requireAdminPage, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_review'), {
+    title: '確認待ち | 出荷作業管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    sessions: listSessionsForReview(),
+    displayNames: loadDisplayNames(),
+  });
+});
+
+// ステータスの手動訂正 (理由必須)
+router.post('/api/admin/batches/:id(\\d+)/fix-status', requireAdminApi, api((req) => {
+  const r = adminFixStatus(Number(req.params.id), String(req.body?.status || ''),
+    req.session.email, req.body?.reason, opId(req.body?.op_id), { force: !!req.body?.force });
+  return { ok: true, already: r.already, status: r.status, closedSessions: r.closedSessions ?? 0 };
+}));
+
+// セッションを計測として採用するかの判定 (時刻は触らない)
+router.post('/api/admin/sessions/:id(\\d+)/judge', requireAdminApi, api((req) => {
+  const r = adminJudgeSession(Number(req.params.id), String(req.body?.validity || ''),
+    req.session.email, req.body?.reason, opId(req.body?.op_id));
+  return { ok: true, already: r.already, validity: r.validity };
+}));
 
 // 添付PDFの表示 (開発中モード: ブリッジ未設置でも手動印刷できる逃げ道。実装計画§5)。
 // 帳票は顧客の氏名・住所を含むため、閲覧できるのは管理者と「そのバッチを担当した本人」だけ。

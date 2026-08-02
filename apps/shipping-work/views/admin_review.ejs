@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .sw-wrap { max-width: 1000px; margin: 0 auto; padding: 12px 16px 40px; }
+    table.t { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.t th, table.t td { border-bottom: 1px solid #e9ecef; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.t th { background: #f8f9fa; white-space: nowrap; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .note { color: #868e96; font-size: 0.85em; }
+    .lead { background: #fff9db; border: 1px solid #ffe066; border-radius: 8px;
+            padding: 10px 14px; margin-bottom: 14px; font-size: 0.9em; }
+    .empty { color: #868e96; text-align: center; padding: 40px 0; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🔎 確認待ち</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/admin/batches" class="btn-logout">バッチ管理</a>
+      <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+    </div>
+  </header>
+
+  <div class="sw-wrap">
+    <div class="lead">
+      作業者が完了を訂正した分と、管理者がステータスを直したときに閉じた分です。<br>
+      その時間を<b>集計に入れるか (採用) / 入れないか (除外)</b> を決めてください。
+      <b>どちらを選んでも記録した時刻は消えません</b>。
+    </div>
+
+    <% if (sessions.length === 0) { %>
+      <div class="empty">確認待ちはありません。</div>
+    <% } else { %>
+    <table class="t">
+      <thead>
+        <tr><th>作業日</th><th>出荷No</th><th>担当</th><th>開始</th><th>終了</th><th>実作業</th>
+            <th>結果</th><th>訂正の理由</th><th></th></tr>
+      </thead>
+      <tbody>
+        <% for (const s of sessions) { %>
+          <tr>
+            <td><%= s.work_date %></td>
+            <td><a href="/apps/shipping-work/admin/batches/<%= s.batch_id %>"><%= s.shipping_no_label || s.shipping_no %></a></td>
+            <td><%= displayNames[s.worker] || s.worker.split('@')[0] %></td>
+            <td><%= s.requestedAtJst %></td>
+            <td><%= s.endedAtJst || '—' %></td>
+            <td><%= s.active_sec != null ? Math.floor(s.active_sec / 60) + '分' + String(s.active_sec % 60).padStart(2, '0') + '秒' : '—' %></td>
+            <td><%= s.outcome %></td>
+            <td>
+              <%= s.correction_reason || '' %>
+              <% if (s.correctedAtJst) { %><br><span class="note"><%= s.correctedAtJst %> / <%= displayNames[s.corrected_by] || (s.corrected_by || '').split('@')[0] %></span><% } %>
+            </td>
+            <td style="white-space:nowrap">
+              <button class="btn-sm" onclick="judge(<%= s.id %>, 'valid')">採用</button>
+              <button class="btn-sm" onclick="judge(<%= s.id %>, 'invalid')">除外</button>
+            </td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    <% } %>
+  </div>
+
+  <script>
+    function opId() {
+      if (window.crypto?.randomUUID) return crypto.randomUUID();
+      return 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+    }
+    async function judge(sessionId, validity) {
+      const label = validity === 'valid' ? '採用' : '除外';
+      const reason = prompt(`このセッションを計測から「${label}」します。理由を入力してください (必須)`);
+      if (reason === null) return;
+      if (!reason.trim()) return alert('理由は必須です');
+      const r = await fetch(`/apps/shipping-work/api/admin/sessions/${sessionId}/judge`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op_id: opId(), validity, reason: reason.trim() }),
+      });
+      let j = {};
+      try { j = await r.json(); } catch {}
+      if (!r.ok) return alert(j.error || `エラー (${r.status})`);
+      location.reload();
+    }
+  </script>
+</body>
+</html>
