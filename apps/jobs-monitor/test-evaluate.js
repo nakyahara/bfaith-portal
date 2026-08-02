@@ -135,6 +135,13 @@ eq(fmtAge(5 * H), '5時間', '5時間');
 eq(fmtAge(10 * 60 * 1000), '1時間', '1時間未満は切り上げて1時間');
 eq(todayJst(jst(2026, 8, 1, 0, 10)), '2026-08-01', 'todayJst JST深夜');
 eq(todayJst(Date.UTC(2026, 6, 31, 15, 30)), '2026-08-01', 'todayJst UTC15:30はJST翌日');
+// 暦の境界 (JST固定・DSTなしの前提。UTCとの9時間差で日/月/年が繰り上がる所)
+eq(todayJst(jst(2026, 7, 31, 23, 59)), '2026-07-31', 'todayJst 月末23:59はその月のまま');
+eq(todayJst(jst(2026, 8, 1, 0, 0)), '2026-08-01', 'todayJst 月初0:00');
+eq(todayJst(jst(2026, 12, 31, 23, 59)), '2026-12-31', 'todayJst 年末23:59');
+eq(todayJst(jst(2027, 1, 1, 0, 0)), '2027-01-01', 'todayJst 年始0:00');
+eq(todayJst(jst(2028, 2, 29, 8, 50)), '2028-02-29', 'todayJst うるう日');
+eq(todayJst(jst(2028, 3, 1, 0, 0)), '2028-03-01', 'todayJst うるう日の翌日');
 
 // ── 実台帳のサンプル評価 (整合性の煙テスト) ──
 const seenAll = {};
