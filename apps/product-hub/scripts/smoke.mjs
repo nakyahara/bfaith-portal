@@ -81,6 +81,28 @@ check('大文字小文字は同一視', asn.slots.length === 1, JSON.stringify(a
 asn = assignImageSlots([fim('code_0.jpg'), fim('code_20.jpg')], 'code');
 check('_0 は白抜き / _20 は最終スロット', asn.whiteBg?.id === 'id-code_0.jpg' && asn.slots[0]?.slot === 20, JSON.stringify(asn));
 
+// ─── shop-categories: AI 初期候補の採点 (2026-08-02) ───
+const { suggestShopCategories, SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE } = await import('../lib/shop-categories.js');
+const CATS = [
+  { id: 1, path: '生活雑貨・日用品 > 洗濯用品', is_active: 1 },
+  { id: 2, path: '生活雑貨・日用品 > キッチン用品', is_active: 1 },
+  { id: 3, path: 'コスメ・美容 > アロマオイル', is_active: 1 },
+  { id: 4, path: 'ペット用品', is_active: 1 },
+  { id: 5, path: '旧カテゴリ > 洗濯用品', is_active: 0 },
+];
+let sug = suggestShopCategories(CATS, { name: '洗濯ネット 3枚セット', genrePath: '日用品雑貨・文房具・手芸 > 洗濯用品 > 洗濯ネット' });
+check('店舗内カテゴリ提案: 末端一致が1位 + 自動適用しきい値以上',
+  sug[0]?.id === 1 && sug[0].score >= SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE, JSON.stringify(sug));
+check('店舗内カテゴリ提案: is_active=0 は候補に出ない', !sug.some((s) => s.id === 5), JSON.stringify(sug));
+check('店舗内カテゴリ提案: スコア0 (無関係) は返さない', !sug.some((s) => s.id === 4), JSON.stringify(sug));
+sug = suggestShopCategories(CATS, { name: 'アロマオイル ラベンダー 10ml', genrePath: '' });
+check('店舗内カテゴリ提案: 商品名だけでも末端一致', sug[0]?.id === 3, JSON.stringify(sug));
+check('店舗内カテゴリ提案: 材料が空なら空配列', suggestShopCategories(CATS, { name: '', genrePath: '' }).length === 0);
+sug = suggestShopCategories(CATS, { name: '洗濯ネット' }, { max: 1 });
+check('店舗内カテゴリ提案: max 件数制限', sug.length === 1, JSON.stringify(sug));
+check('店舗内カテゴリ提案: 外れたカテゴリでも選択中なら採点対象',
+  suggestShopCategories([{ id: 5, path: '旧カテゴリ > 洗濯用品', is_active: 0, selected: 1 }], { name: '洗濯ネット' }).length === 1);
+
 // ─── DB init (2回呼んで冪等) ───
 const { initMirrorDB } = await import('../../warehouse-mirror/db.js');
 initMirrorDB(); // 本番では server.js が起動時に実行する (smoke では明示)

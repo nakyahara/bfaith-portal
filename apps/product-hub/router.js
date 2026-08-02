@@ -39,6 +39,7 @@ import {
   parseShopCategoryText, replaceShopCategories, countActiveShopCategories,
   listShopCategoriesForDraft, selectedShopCategoryPaths, setDraftShopCategories,
   sanitizeShopCategoryIds, MAX_SHOP_CATEGORY_LINES, MAX_DRAFT_SHOP_CATEGORIES,
+  suggestShopCategories, SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE,
 } from './lib/shop-categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -842,6 +843,44 @@ router.get('/api/drafts/:id/rakuten/genre-suggest', async (req, res) => {
     const status = e?.statusCode === 503 ? 503 : 502;
     res.status(status).json({ ok: false, error: String(e.message || e).slice(0, 200) });
   }
+});
+
+// 店舗内カテゴリの AI 初期候補 (2026-08-02): ジャンルフルパス+商品名とカテゴリパスの語彙マッチ。
+// 外部 API なし (マスタとキャッシュ済みジャンル辞書だけで即答)
+router.get('/api/drafts/:id/rakuten/shop-category-suggest', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  const cats = listShopCategoriesForDraft(db, draft.id);
+  if (cats.length === 0) return res.json({ ok: true, candidates: [], reason: 'no_master' });
+  const genreId = db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(draft.id)?.genre_id;
+  const genrePath = genreId ? (getCachedGenreAttributes(db, genreId)?.genrePath || '') : '';
+  const candidates = suggestShopCategories(cats, { name: draft.name, genrePath });
+  res.json({ ok: true, candidates, autoApplyMinScore: SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE });
+});
+
+// 店舗内カテゴリだけの部分保存 (AI自動適用・候補ボタン用。draft_rakuten の他カラムは触らない)
+router.post('/api/drafts/:id/shop-categories', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const sanitized = sanitizeShopCategoryIds(req.body?.ids);
+  if (sanitized.error) {
+    return res.status(400).json({ ok: false, error: `店舗内カテゴリの指定が不正です (${sanitized.error})` });
+  }
+  const db = getDB();
+  const ids = sanitized.ids;
+  if (ids.length > 0) {
+    const found = db.prepare(
+      `SELECT COUNT(*) AS c FROM ph_shop_categories WHERE id IN (${ids.map(() => '?').join(',')})`
+    ).get(...ids).c;
+    if (found !== ids.length) {
+      return res.status(400).json({ ok: false, error: '存在しない店舗内カテゴリが指定されました。画面を再読み込みしてください' });
+    }
+  }
+  setDraftShopCategories(db, draft.id, ids);
+  logEvent(db, draft.id, 'shop_categories_saved',
+    `${ids.length}件${req.body?.source === 'ai' ? ' (AI初期設定)' : ''}`, actorOf(req));
+  res.json({ ok: true, count: ids.length });
 });
 
 // ジャンル属性辞書の取得 (Genre API)。取得結果は ph_genre_attributes にキャッシュされ、

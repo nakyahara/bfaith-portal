@@ -141,3 +141,51 @@ export function setDraftShopCategories(db, draftId, ids) {
   const ins = db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)');
   for (const id of ids) ins.run(draftId, id);
 }
+
+/**
+ * 店舗内カテゴリの AI 初期候補 (2026-08-02 中原さん要望「AIが最初に設定して人が後で修正」)。
+ *
+ * 外部 API は使わないローカル採点: カテゴリパスの各セグメント語が
+ * 「楽天ジャンルのフルパス + 商品名」にどれだけ含まれるかでスコアリングする
+ * (店舗の棚名は楽天ジャンルに寄せた命名が多いため、ジャンル確定後ほど精度が上がる)。
+ *
+ * 採点: 末端セグメント完全一致 4 / 非末端完全一致 2 /
+ *       セグメント内の語 (「・」等区切り、2文字以上) の部分一致 = 末端2×命中率・非末端1×命中率 /
+ *       語の先頭2文字一致 (「洗濯ネット」⇔「洗濯用品」、「化粧水」⇔「化粧品」の表記ゆれ) =
+ *       末端1・非末端0.5×命中率 の補助点 — 補助点だけでは自動適用しきい値 (4) に届かない
+ *       (後方の「〜用品」「〜セット」だけが共通するカテゴリを拾わないよう、n-gram でなく語頭で見る)
+ *
+ * @param {Array<{id, path, is_active?, selected?}>} categories listShopCategoriesForDraft の行
+ * @param {{name?: string, genrePath?: string}} source 採点の材料
+ * @returns {Array<{id, path, score}>} スコア降順 (score > 0 のみ)、最大 max 件
+ */
+export function suggestShopCategories(categories, { name = '', genrePath = '' } = {}, { max = 5 } = {}) {
+  const hay = `${genrePath} ${name}`.toLowerCase();
+  if (hay.trim() === '') return [];
+  const splitWords = (s) => s.split(/[・･、/／\s>＞]+/).filter((w) => w.length >= 2);
+  const hayHeads = new Set(splitWords(hay).map((w) => w.slice(0, 2)));
+  const scored = [];
+  for (const c of categories || []) {
+    if (c.is_active === 0 && !c.selected) continue; // 一覧から外れたカテゴリは提案しない
+    const segs = String(c.path).split(/\s*>\s*/).map((s) => s.trim()).filter(Boolean);
+    let score = 0;
+    segs.forEach((seg, i) => {
+      const isLeaf = i === segs.length - 1;
+      const s = seg.toLowerCase();
+      if (hay.includes(s)) { score += isLeaf ? 4 : 2; return; }
+      const words = splitWords(s);
+      if (words.length === 0) return;
+      const hit = words.filter((w) => hay.includes(w)).length;
+      if (hit > 0) { score += (isLeaf ? 2 : 1) * (hit / words.length); return; }
+      // 完全一致も語一致もないときだけ、語頭2文字の一致で補助点
+      const headHit = words.filter((w) => hayHeads.has(w.slice(0, 2))).length;
+      if (headHit > 0) score += (isLeaf ? 1 : 0.5) * (headHit / words.length);
+    });
+    if (score > 0) scored.push({ id: c.id, path: c.path, score: Math.round(score * 100) / 100 });
+  }
+  scored.sort((a, b) => b.score - a.score || String(a.path).localeCompare(String(b.path), 'ja'));
+  return scored.slice(0, max);
+}
+
+/** 自動適用してよい提案か (1位が「末端の完全一致以上」の確度)。曖昧なら人に選ばせる */
+export const SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE = 4;

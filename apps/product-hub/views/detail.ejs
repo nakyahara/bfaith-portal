@@ -716,12 +716,14 @@
     </div>
 
     <div class="field">
-      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-m">手入力</span></label>
+      <label>店舗内カテゴリ <span class="muted">(複数選択可。RMSへの自動反映は未対応 — 公開時にRMS画面で設定する欄です)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
       <% if (shopCategories.length === 0) { %>
         <p class="muted" style="margin:4px 0;">
           カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
         </p>
       <% } else { %>
+        <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
+        <div id="rk-cats-suggest" style="font-size:12px; margin-bottom:4px;"></div>
         <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin-bottom:6px;">
         <!-- RMS と同じくツリーで選ぶ (2026-07-28)。checkbox の class/value は保存処理と共通 -->
         <div id="rk-cats" style="max-height:240px; overflow:auto; border:1px solid #e2e8f0; border-radius:8px; padding:6px 10px; background:#fff;"></div>
@@ -1196,6 +1198,8 @@
       document.getElementById('rk-genre').value = genreId;
       document.getElementById('rk-genre-fetch').click(); // 辞書はキャッシュ済みなので即応答
       if (source === 'ai') rkResultCat.textContent = 'AIがジャンルを設定しました (違う場合は「ツリーから選ぶ」で修正)';
+      // ジャンルが確定するとフルパスで店舗内カテゴリの採点精度が上がる → AI候補を出し直す
+      if (typeof suggestShopCats === 'function') suggestShopCats(true);
       return true;
     } finally { applyingGenre = false; }
   }
@@ -1319,6 +1323,78 @@
       }
     });
   })();
+
+  // ─── 店舗内カテゴリ: AI 初期候補 (2026-08-02 中原さん要望「AIが最初に設定して人が修正」) ───
+  async function suggestShopCats(autoApply) {
+    const box = document.getElementById('rk-cats-suggest');
+    if (!box) return; // マスタ未取込
+    box.textContent = 'AIが店舗内カテゴリを探しています…';
+    const findCb = (id) => document.querySelector('.rk-cat-check[value="' + id + '"]');
+    const revealCb = (cb) => { // チェックしたノードまでの枝を開く (選択済み展開と同じ方式)
+      let el = cb.closest('.rk-cat-node');
+      while (el && el.id !== 'rk-cats') {
+        const p = el.parentElement;
+        if (p && p.style && p.style.display === 'none') p.style.display = 'block';
+        el = p;
+      }
+    };
+    const saveChecked = (source) => post(BASE + '/shop-categories', {
+      ids: Array.from(document.querySelectorAll('.rk-cat-check:checked')).map((c) => Number(c.value)),
+      source,
+    });
+    try {
+      const res = await fetch(BASE + '/rakuten/shop-category-suggest');
+      const j = await res.json();
+      if (!j.ok) { box.textContent = ''; return; }
+      const cands = j.candidates || [];
+      if (cands.length === 0) {
+        box.textContent = 'AI候補が見つかりませんでした (ジャンルを設定すると精度が上がります)';
+        box.className = 'muted';
+        return;
+      }
+      let autoMsg = '';
+      // 未選択のドラフトだけ、1位が十分な確度なら自動セット (人はいつでも外せる)
+      if (autoApply && document.querySelectorAll('.rk-cat-check:checked').length === 0
+          && cands[0].score >= (j.autoApplyMinScore || 4)) {
+        const cb = findCb(cands[0].id);
+        if (cb) {
+          cb.checked = true;
+          revealCb(cb);
+          const r = await saveChecked('ai');
+          if (r.ok) autoMsg = 'AIが設定: ' + cands[0].path + ' (違うときは外して選び直してください)';
+          else cb.checked = false;
+        }
+      }
+      const render = () => {
+        box.replaceChildren();
+        const lbl = document.createElement('span');
+        lbl.className = 'muted';
+        lbl.textContent = (autoMsg ? '✅ ' + autoMsg + ' ／ ' : '') + 'AI候補: ';
+        box.appendChild(lbl);
+        cands.forEach((c) => {
+          const cb = findCb(c.id);
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'btn btn-sm';
+          b.style.cssText = 'margin:2px 4px 2px 0; font-size:11px;'
+            + (cb && cb.checked ? ' background:#dcfce7; border-color:#86efac;' : '');
+          b.textContent = (cb && cb.checked ? '✓ ' : '') + c.path;
+          b.addEventListener('click', async () => {
+            if (!cb) return;
+            cb.checked = !cb.checked;
+            if (cb.checked) revealCb(cb);
+            const r = await saveChecked('ai_candidate');
+            if (!r.ok) { cb.checked = !cb.checked; alert(r.error || '保存に失敗しました'); return; }
+            result.textContent = '店舗内カテゴリを保存しました (' + r.count + '件)';
+            render();
+          });
+          box.appendChild(b);
+        });
+      };
+      render();
+    } catch (e) { box.textContent = ''; }
+  }
+  if (document.getElementById('rk-cats-suggest')) suggestShopCats(true);
 
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
