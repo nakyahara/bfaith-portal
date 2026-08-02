@@ -208,6 +208,47 @@ export async function getDriveThumbnail(fileId, width) {
   return p;
 }
 
+/** fetch Response の body を上限付きで読む。超過したら中断して throw (全量バッファ後の検査にしない) */
+async function readBodyLimited(res, maxBytes) {
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new Error('サムネイル取得元のレスポンスが大きすぎます');
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Drive 原本を stream で上限付きダウンロード (超過時は途中で破棄) */
+async function downloadDriveImageLimited(fileId, maxBytes) {
+  const drive = getDriveClient();
+  const res = await drive.files.get(
+    { fileId, alt: 'media', supportsAllDrives: true },
+    { responseType: 'stream' },
+  );
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    res.data.on('data', (c) => {
+      total += c.length;
+      if (total > maxBytes) {
+        res.data.destroy(new Error('サムネイル生成対象の画像が大きすぎます'));
+        return;
+      }
+      chunks.push(c);
+    });
+    res.data.on('error', reject);
+    res.data.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+}
+
 async function fetchDriveThumbnail(fileId, width) {
   const drive = getDriveClient();
   const meta = await drive.files.get({ fileId, fields: 'thumbnailLink', supportsAllDrives: true });
@@ -220,17 +261,18 @@ async function fetchDriveThumbnail(fileId, width) {
         redirect: 'error',
         signal: AbortSignal.timeout(30_000),
       });
-      if (res.ok && (res.headers.get('content-type') || '').startsWith('image/')) {
-        const b = Buffer.from(await res.arrayBuffer());
-        if (b.length <= THUMB_SOURCE_MAX_BYTES) raw = b;
+      const declared = Number(res.headers.get('content-length'));
+      if (res.ok
+        && (res.headers.get('content-type') || '').startsWith('image/')
+        && !(Number.isFinite(declared) && declared > THUMB_SOURCE_MAX_BYTES)) {
+        raw = await readBodyLimited(res, THUMB_SOURCE_MAX_BYTES);
       }
     } catch (_) {
       raw = null; // フォールバックへ
     }
   }
   if (!raw) {
-    raw = await downloadDriveImage(fileId);
-    if (raw.length > THUMB_SOURCE_MAX_BYTES) throw new Error('サムネイル生成対象の画像が大きすぎます');
+    raw = await downloadDriveImageLimited(fileId, THUMB_SOURCE_MAX_BYTES);
   }
   // 取得元に関わらず sharp で再エンコード = 「本当に画像である」ことの検証 +
   // 出力を width 上限の JPEG に固定 (Content-Type 偽装をアプリ起点で配らない。Codex R1 medium)
