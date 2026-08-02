@@ -43,6 +43,7 @@
   <div class="sw-toolbar">
     <span class="date">作業日: <%= workDate %></span>
     <span>バッチ <%= totalCount %> 件</span>
+    <a href="/apps/shipping-work/picking">📦 ピッキング画面</a>
     <% if (isAdmin) { %>
       <a href="/apps/shipping-work/admin/batches">バッチ管理</a>
     <% } %>
@@ -62,6 +63,11 @@
               <span class="badge"><%= b.bunrui_label || b.bunrui %></span><span class="badge"><%= b.packing_method_label || b.packing_method %></span>
               <% if (b.slip_count != null) { %><span class="badge"><%= b.slip_count %>件</span><% } %>
             </div>
+            <% if (b.active_worker) { %>
+              <div class="meta">👤 <%= displayNames[b.active_worker] || b.active_worker.split('@')[0] %>
+                <% if (b.active_since) { %><span class="elapsed" data-since="<%= b.active_since %>"></span><% } %>
+              </div>
+            <% } %>
             <% if (b.work_date !== workDate) { %>
               <div class="meta">持ち越し: <%= b.work_date %></div>
             <% } %>
@@ -73,8 +79,15 @@
   </div>
 
   <script>
+    // 進行中カードの経過表示 (分単位の目安。正式な計測はサーバー側)
+    document.querySelectorAll('.elapsed').forEach((el) => {
+      const t = Date.parse(el.dataset.since);
+      if (!Number.isFinite(t)) return;
+      const min = Math.max(0, Math.floor((Date.now() - t) / 60000));
+      el.textContent = ` (${min}分経過)`;
+    });
+
     // 表示専用の自動更新 (30秒)。スクロール位置を復元する (Codex PR1レビュー#10)。
-    // 操作系が付く PR3 で fetch 差分更新に置き換える。
     (() => {
       const board = document.querySelector('.sw-board');
       const saved = sessionStorage.getItem('sw-kanban-scroll');

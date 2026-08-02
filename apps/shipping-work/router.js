@@ -19,8 +19,12 @@ import multer from 'multer';
 import {
   getDB, initShippingWorkDB, jstToday, listKanbanBatches, BATCH_STATUSES, STATUS_LABELS,
   listMasters, isValidMaster, createBatch, updateBatch, cancelBatch, listAdminBatches, getBatch,
-  DOCS_DIR,
+  DOCS_DIR, DATA_DIR,
 } from './db.js';
+import {
+  SwError, startProcess, completeProcess, pauseProcess, resumeProcess, troubleProcess,
+  startNextReady, getWorkerState,
+} from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -34,6 +38,23 @@ initShippingWorkDB();
 const KANBAN_COLUMNS = [
   'ready', 'picking', 'picked', 'sorting', 'sorted', 'packing', 'done', 'hold', 'stock_return',
 ];
+
+/**
+ * 表示名の解決 (email → displayName)。portal の users.json を読むだけの表示専用ヘルパー。
+ * 読めなければ空マップ (fail-soft: email の @ 前を表示に使う)。
+ * カンバンは全端末が30秒ごとに再読み込みするため、同期readを毎回走らせないよう60秒キャッシュする。
+ */
+let displayNameCache = { at: 0, map: {} };
+function loadDisplayNames() {
+  if (Date.now() - displayNameCache.at < 60_000) return displayNameCache.map;
+  let map = {};
+  try {
+    const arr = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'users.json'), 'utf-8'));
+    map = Object.fromEntries(arr.filter((u) => u?.email).map((u) => [u.email, u.displayName || u.email]));
+  } catch { /* 読めなければ email 表示にフォールバック */ }
+  displayNameCache = { at: Date.now(), map };
+  return map;
+}
 
 // ─── カンバン (全員・表示専用。ドラッグ機能は作らない) ───
 router.get('/', (req, res) => {
@@ -54,8 +75,85 @@ router.get('/', (req, res) => {
     workDate,
     columns,
     totalCount: batches.length,
+    displayNames: loadDisplayNames(),
   });
 });
+
+// ═══ ピッキング (PR3: 作業者の本体画面。タブレット前提・大ボタン) ═══
+
+router.get('/picking', (req, res) => {
+  const state = getWorkerState('picking', req.session.email);
+  res.render(path.join(__dirname, 'views/picking'), {
+    title: 'ピッキング | 出荷作業管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    state,
+    today: jstToday(),
+    pauseReasons: listMasters('pause_reason_pick'),
+    troubleReasons: listMasters('print_trouble_reason'),
+  });
+});
+
+/**
+ * 作業APIの共通ラッパ。SwError は業務エラーとして status + message を返す。
+ * express 4 は async ハンドラの throw を拾わないため、ここで必ず捕捉する。
+ */
+function api(handler) {
+  return (req, res) => {
+    try {
+      res.json(handler(req));
+    } catch (e) {
+      if (e instanceof SwError) return res.status(e.status).json({ error: e.message, code: e.code });
+      console.error('[shipping-work] API error', e);
+      res.status(500).json({ error: 'サーバーエラーが発生しました' });
+    }
+  };
+}
+
+// 開始 (楽観開始 = リース + 印刷ジョブ + 計測開始)。op_id はクライアント発行 UUID (冪等)
+router.post('/api/picking/start', api((req) => {
+  const r = startProcess('picking', Number(req.body?.batch_id), req.session.email, String(req.body?.op_id || ''));
+  return { ok: true, session_id: r.session.id, already: r.already };
+}));
+
+// 完了。next=true なら次の開始可能バッチを連続開始 (op_id_next 必須)。
+// 完了は別トランザクションで確定済みのため、次の開始が失敗しても完了をエラーとして返さない
+// (作業者には「完了はできた・次は取れなかった」と伝わるのが正しい)。
+router.post('/api/picking/complete', api((req) => {
+  const r = completeProcess('picking', Number(req.body?.session_id), req.session.email);
+  let next = null;
+  let nextError = null;
+  if (req.body?.next) {
+    try {
+      next = startNextReady('picking', req.session.email, String(req.body?.op_id_next || ''));
+    } catch (e) {
+      nextError = e instanceof SwError ? e.message : '次のバッチを開始できませんでした';
+      console.error('[shipping-work] 次バッチ開始に失敗', e);
+    }
+  }
+  return { ok: true, already: r.already, flags: r.flags, workSec: r.workSec ?? null, next, nextError };
+}));
+
+// 保留 (理由必須・「その他」は記述必須)
+router.post('/api/picking/pause', api((req) => {
+  const r = pauseProcess('picking', Number(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note);
+  return { ok: true, already: r.already };
+}));
+
+// 保留解除
+router.post('/api/picking/resume', api((req) => {
+  const r = resumeProcess('picking', Number(req.body?.session_id), req.session.email);
+  return { ok: true, already: r.already };
+}));
+
+// 印刷トラブル (reprint=再印刷して開始し直す / abort=中止して ready へ戻す)
+router.post('/api/picking/trouble', api((req) => {
+  const r = troubleProcess('picking', Number(req.body?.session_id), req.session.email,
+    String(req.body?.reason || ''), req.body?.note, String(req.body?.action || ''),
+    req.body?.op_id_new ? String(req.body.op_id_new) : null);
+  return { ok: true, already: r.already, session_id: r.session?.id ?? null, aborted: r.aborted ?? false };
+}));
 
 // ─── ヘルスチェック (デプロイ確認用) ───
 router.get('/api/health', (req, res) => {
@@ -208,8 +306,10 @@ router.post('/api/admin/batches/:id(\\d+)/cancel', requireAdminApi, (req, res) =
   res.json({ ok: true });
 });
 
-// 添付PDFの表示 (開発中モード: ブリッジ未設置でも手動印刷できる逃げ道。実装計画§5)
-router.get('/admin/batches/:id(\\d+)/pdf', requireAdminPage, (req, res) => {
+// 添付PDFの表示 (開発中モード: ブリッジ未設置でも手動印刷できる逃げ道。実装計画§5)。
+// PR3 で作業者向けルートを追加 (ピッキングは帳票を見て行う作業のため、
+// requireAppAccess('shipping-work') を持つ社内ユーザー全員に表示可)。admin ルートは後方互換で残す。
+function servePdf(req, res) {
   const batch = getBatch(Number(req.params.id));
   if (!batch || !batch.pdf_path) return res.status(404).send('PDFがありません');
   // pdf_path はサーバー発行のファイル名のみだが、念のため DOCS_DIR 内であることを検証
@@ -222,7 +322,9 @@ router.get('/admin/batches/:id(\\d+)/pdf', requireAdminPage, (req, res) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Cache-Control', 'private, no-store');
   fs.createReadStream(abs).pipe(res);
-});
+}
+router.get('/batches/:id(\\d+)/pdf', servePdf);
+router.get('/admin/batches/:id(\\d+)/pdf', requireAdminPage, servePdf);
 
 // Multer のエラー (サイズ超過等) を JSON で返す (Codex PR2レビュー#5)
 router.use((err, req, res, next) => {

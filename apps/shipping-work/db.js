@@ -18,7 +18,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
+export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'shipping-work.db');
 
 let db = null;
@@ -457,13 +457,20 @@ export function getBatch(id) {
  * カンバン用: 指定作業日のバッチ + それ以前の未完了持ち越しバッチ。
  * 未来日の未完了は含めない (Codex PR1レビュー#4)。
  * cancelled はカンバンに出さないため取得段階で除外し、件数表示と一致させる (同#8)。
+ * active_worker/active_since は進行中セッション (open) の担当者と開始時刻 (PR3: カード表示用)。
  */
 export function listKanbanBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label,
       (SELECT label FROM sw_masters m WHERE m.kind='bunrui' AND m.code=b.bunrui) AS bunrui_label,
-      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label
+      (SELECT label FROM sw_masters m WHERE m.kind='packing_method' AND m.code=b.packing_method) AS packing_method_label,
+      -- 工程が増える PR4 では同一バッチに picking と packing の open が並びうるため、
+      -- 最新セッション1件に固定する (スカラーサブクエリの暗黙の先頭行依存を避ける)
+      (SELECT s.worker FROM sw_sessions s WHERE s.batch_id=b.id AND s.outcome='open'
+        ORDER BY s.id DESC LIMIT 1) AS active_worker,
+      (SELECT s.requested_at FROM sw_sessions s WHERE s.batch_id=b.id AND s.outcome='open'
+        ORDER BY s.id DESC LIMIT 1) AS active_since
     FROM sw_batches b
     WHERE b.status != 'cancelled'
       AND (b.work_date = ?
