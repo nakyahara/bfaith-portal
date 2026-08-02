@@ -78,8 +78,8 @@
             <input type="number" name="slip_count" min="1" placeholder="例: 26">
           </div>
           <div>
-            <label>帳票PDF <span id="pdfReq">(必須)</span></label>
-            <input type="file" name="pdf" accept="application/pdf" required>
+            <label>帳票PDFを直接添付 (任意)</label>
+            <input type="file" name="pdf" accept="application/pdf">
           </div>
         </div>
         <div style="margin-top:8px">
@@ -88,6 +88,14 @@
             <% for (const m of masters.carrier) { %>
               <label><input type="checkbox" name="carriers" value="<%= m.code %>"><%= m.label %></label>
             <% } %>
+          </div>
+        </div>
+        <div style="margin-top:8px">
+          <label style="font-size:0.8em;color:#495057">帳票リンク (Google Drive のピッキングリスト)</label>
+          <input type="url" name="doc_url" style="width:100%;padding:6px;box-sizing:border-box"
+                 placeholder="https://drive.google.com/... (作業者はこれを開いてピッキングします)">
+          <div style="font-size:0.78em;color:#868e96;margin-top:3px">
+            リンクか上のPDF添付のどちらかが必要です。作業者が開けるよう共有設定を確認してください
           </div>
         </div>
         <div style="margin-top:8px">
@@ -110,7 +118,7 @@
     </div>
     <table class="sw-list">
       <thead>
-        <tr><th>ID</th><th>出荷No</th><th>状態</th><th>発送分類</th><th>梱包方法</th><th>件数</th><th>メモ</th><th>PDF</th><th></th></tr>
+        <tr><th>ID</th><th>出荷No</th><th>状態</th><th>発送分類</th><th>梱包方法</th><th>件数</th><th>メモ</th><th>帳票</th><th></th></tr>
       </thead>
       <tbody>
         <% if (batches.length === 0) { %>
@@ -125,12 +133,17 @@
             <td><%= b.packing_method_label || b.packing_method %></td>
             <td><%= b.slip_count ?? '' %></td>
             <td><%= b.note || '' %></td>
-            <td><% if (b.pdf_path) { %><a href="/apps/shipping-work/admin/batches/<%= b.id %>/pdf" target="_blank">表示</a><% } %></td>
+            <td>
+              <% if (b.doc_url) { %><a href="<%= b.doc_url %>" target="_blank" rel="noopener noreferrer">リンク</a><% } %>
+              <% if (b.pdf_path) { %><a href="/apps/shipping-work/admin/batches/<%= b.id %>/pdf" target="_blank">PDF</a><% } %>
+              <% if (!b.doc_url && !b.pdf_path) { %><span style="color:#c92a2a">未設定</span><% } %>
+            </td>
             <td>
               <% if (b.status === 'ready') { %>
                 <button class="btn-sm" data-id="<%= b.id %>" data-bunrui="<%= b.bunrui %>"
                   data-packing="<%= b.packing_method %>" data-carriers="<%= b.carriers_json %>"
                   data-slip="<%= b.slip_count ?? '' %>" data-note="<%= b.note || '' %>"
+                  data-docurl="<%= b.doc_url || '' %>"
                   onclick="enterEditMode(this)">編集</button>
                 <button class="btn-sm" onclick="cancelBatch(<%= b.id %>)">取消</button>
               <% } %>
@@ -156,11 +169,9 @@
       let carriers = [];
       try { carriers = JSON.parse(btn.dataset.carriers); } catch {}
       for (const cb of f.querySelectorAll('input[name=carriers]')) cb.checked = carriers.includes(cb.value);
+      f.elements.doc_url.value = btn.dataset.docurl || '';
       f.elements.work_date.disabled = true;
       f.elements.shipping_no.disabled = true;
-      // 編集では PDF は差し替えたいときだけ選ぶ (未選択なら既存を保持)
-      f.elements.pdf.required = false;
-      document.getElementById('pdfReq').textContent = '(差し替える場合のみ)';
       document.getElementById('formTitle').textContent = `バッチ #${editingId} を編集 (作業日・出荷Noは変更不可)`;
       document.getElementById('submitBtn').textContent = '更新';
       document.getElementById('cancelEditBtn').style.display = '';
@@ -174,8 +185,6 @@
       createForm.elements.work_date.disabled = false;
       createForm.elements.shipping_no.disabled = false;
       createForm.elements.work_date.value = '<%= workDate %>';
-      createForm.elements.pdf.required = true;
-      document.getElementById('pdfReq').textContent = '(必須)';
       document.getElementById('formTitle').textContent = 'バッチ作成';
       document.getElementById('submitBtn').textContent = '作成';
       document.getElementById('cancelEditBtn').style.display = 'none';
