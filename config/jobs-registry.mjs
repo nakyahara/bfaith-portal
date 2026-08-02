@@ -106,6 +106,23 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\logizard-automation のログ確認',
   },
   {
+    id: 'logizard-kinkyu-hokyu',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '緊急在庫補充リストの自動印刷 (NE仮連携DL→ロジザード取込→補充リスト2アップ印刷→出荷指示キャンセル削除→0件検証)',
+    where: 'miniPC TaskScheduler [Logizard-KinkyuHokyu]',
+    schedule: '毎日 08:50 (SYSTEM実行・Edgeヘッドレス・事務所プリンタ①へSumatraPDF印刷)',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 50,
+    grace_hours: 4,
+    lifecycle: 'permanent',
+    runbook:
+      'C:\\tools\\logizard-automation\\logs\\scheduled.log を確認。取込後にキャンセル段階で失敗した場合は '
+      + 'ロジザードPS02で手動キャンセル(削除)、または node auto-kinkyu.js --cancel-only (残骸は --expect-qty=N)。'
+      + '朝の伝票出しが8:50より先に始まって未指示データが残っていた日は、安全ガードで取込前に中止する (fail=仕様。その日の補充リストは手動ボタンで)',
+  },
+  {
     id: 'qoo10-nyukin',
     type: 'scheduled_job',
     importance: 'P2',
