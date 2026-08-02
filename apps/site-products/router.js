@@ -63,12 +63,24 @@ function loadIndexes(db, degraded) {
       return null;
     }
   };
-  // ORDER BY ... ASC + 後勝ちで「最新の値」を採用する (Mapの上書き)
-  const pairMap = (rows, k, v, keyNorm = true) => {
+  const pairMap = (rows, k, v) => {
     const m = new Map();
     for (const r of rows) {
-      const key = keyNorm ? norm(r[k]) : String(r[k] ?? '');
+      const key = norm(r[k]);
       if (key) m.set(key, r[v]);
+    }
+    return m;
+  };
+  // ASIN用: 日付も保持する (複数SKUを持つ商品で「最新のASIN」を選ぶため)
+  const datedMap = (rows) => {
+    const m = new Map();
+    for (const r of rows) {
+      const key = norm(r.seller_sku);
+      if (!key || !r.asin) continue;
+      const prev = m.get(key);
+      if (!prev || String(r.date ?? '') > String(prev.date ?? '')) {
+        m.set(key, { asin: r.asin, date: String(r.date ?? '') });
+      }
     }
     return m;
   };
@@ -91,11 +103,18 @@ function loadIndexes(db, degraded) {
         return m;
       }
     ),
-    // 商品管理番号 (小文字) → 実URL (楽天が返した本物のURL)
+    // 商品管理番号 (小文字) → 実URL (楽天が返した本物のURL)。
+    // ⚠️日次履歴表は全件ロードせず、SQL側でキーごとの最新1行に絞る (Codex指摘: 履歴は増え続ける)
     rakutenUrlByItem: q(
       'rakutenUrls',
-      `SELECT item_manage_number, item_url FROM mirror_rakuten_item_purchaser_snapshot
-       WHERE item_url IS NOT NULL AND item_url <> '' ORDER BY date_jst ASC`,
+      `SELECT s.item_manage_number, s.item_url
+       FROM mirror_rakuten_item_purchaser_snapshot s
+       JOIN (SELECT item_manage_number, MAX(date_jst) AS d
+             FROM mirror_rakuten_item_purchaser_snapshot
+             WHERE item_url IS NOT NULL AND item_url <> ''
+             GROUP BY item_manage_number) l
+         ON l.item_manage_number = s.item_manage_number AND l.d = s.date_jst
+       WHERE s.item_url IS NOT NULL AND s.item_url <> ''`,
       (rows) => pairMap(rows, 'item_manage_number', 'item_url')
     ),
     // Yahooに実在するアイテムコード (小文字 → 元表記)
@@ -120,23 +139,32 @@ function loadIndexes(db, degraded) {
       }
       return m;
     }),
-    // seller_sku (小文字) → ASIN。供給元3つを別Mapで持ち、優先順に引く
+    // seller_sku (小文字) → {asin, date}。供給元3つを別Mapで持ち、優先順に引く。
+    // ⚠️日次履歴はSQL側でSKUごとの最新1行に絞る+dateを保持し、複数SKUでは最新を選ぶ (Codex指摘)
     asinFinance: q(
       'asinFinance',
-      `SELECT seller_sku, asin_norm AS asin FROM mirror_amazon_finance_sku_daily
-       WHERE TRIM(asin_norm) <> '' ORDER BY date_jst ASC`,
-      (rows) => pairMap(rows, 'seller_sku', 'asin')
+      `SELECT f.seller_sku, f.asin_norm AS asin, f.date_jst AS date
+       FROM mirror_amazon_finance_sku_daily f
+       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_finance_sku_daily
+             WHERE TRIM(asin_norm) <> '' GROUP BY seller_sku) l
+         ON l.seller_sku = f.seller_sku AND l.d = f.date_jst
+       WHERE TRIM(f.asin_norm) <> ''`,
+      (rows) => datedMap(rows)
     ),
     asinPrice: q(
       'asinPrice',
-      `SELECT seller_sku, asin FROM mirror_amazon_price_snapshot_daily
-       WHERE TRIM(asin) <> '' ORDER BY date_jst ASC`,
-      (rows) => pairMap(rows, 'seller_sku', 'asin')
+      `SELECT p.seller_sku, p.asin, p.date_jst AS date
+       FROM mirror_amazon_price_snapshot_daily p
+       JOIN (SELECT seller_sku, MAX(date_jst) AS d FROM mirror_amazon_price_snapshot_daily
+             WHERE TRIM(asin) <> '' GROUP BY seller_sku) l
+         ON l.seller_sku = p.seller_sku AND l.d = p.date_jst
+       WHERE TRIM(p.asin) <> ''`,
+      (rows) => datedMap(rows)
     ),
     asinFees: q(
       'asinFees',
-      `SELECT seller_sku, asin FROM mirror_amazon_sku_fees WHERE TRIM(asin) <> ''`,
-      (rows) => pairMap(rows, 'seller_sku', 'asin')
+      `SELECT seller_sku, asin, '' AS date FROM mirror_amazon_sku_fees WHERE TRIM(asin) <> ''`,
+      (rows) => datedMap(rows)
     ),
     // 商品コード (小文字) → Qoo10商品番号
     qoo10ByCode: q(
@@ -145,11 +173,15 @@ function loadIndexes(db, degraded) {
        WHERE seller_code IS NOT NULL AND trim(seller_code) <> ''`,
       (rows) => pairMap(rows, 'seller_code', 'item_no')
     ),
-    // ne_code (小文字) → auPAY SKUキー
+    // ne_code (小文字) → auPAY SKUキー (日次履歴のためSQL側で最新1行に絞る)
     aupayByNe: q(
       'aupaySkus',
-      `SELECT ne_code, aupay_sku_key FROM mirror_aupay_finance_sku_daily
-       WHERE ne_code IS NOT NULL ORDER BY date_jst ASC`,
+      `SELECT a.ne_code, a.aupay_sku_key
+       FROM mirror_aupay_finance_sku_daily a
+       JOIN (SELECT ne_code, MAX(date_jst) AS d FROM mirror_aupay_finance_sku_daily
+             WHERE ne_code IS NOT NULL GROUP BY ne_code) l
+         ON l.ne_code = a.ne_code AND l.d = a.date_jst
+       WHERE a.ne_code IS NOT NULL`,
       (rows) => pairMap(rows, 'ne_code', 'aupay_sku_key')
     ),
   };
@@ -203,22 +235,25 @@ function lookupMalls(idx, code, asinSourceCounts) {
     }
   }
 
-  // ASINは finance → price_snapshot → fees の順に探す (どれで解決したかを診断に記録)
+  // ASINは finance → price_snapshot → fees の順。同一ソース内では全SKUのうち最新日付を選ぶ
+  // (Codex指摘: 複数SKUを持つ商品で古い/不定のASINを拾わないため)
   const sellerSkus = idx.skusByNe?.get(key) ?? [];
-  outer: for (const [srcName, map] of [
+  for (const [srcName, map] of [
     ['amazonAsinFinance', idx.asinFinance],
     ['amazonAsinPrice', idx.asinPrice],
     ['amazonAsinFees', idx.asinFees],
   ]) {
     if (!map) continue;
+    let best = null;
     for (const sku of sellerSkus) {
-      const asin = map.get(sku);
-      if (asin) {
-        malls.amazon.asin = asin;
-        malls.amazon.url = `https://www.amazon.co.jp/dp/${asin}`;
-        asinSourceCounts[srcName] = (asinSourceCounts[srcName] ?? 0) + 1;
-        break outer;
-      }
+      const hit = map.get(sku);
+      if (hit && (!best || hit.date > best.date)) best = hit;
+    }
+    if (best) {
+      malls.amazon.asin = best.asin;
+      malls.amazon.url = `https://www.amazon.co.jp/dp/${best.asin}`;
+      asinSourceCounts[srcName] = (asinSourceCounts[srcName] ?? 0) + 1;
+      break;
     }
   }
 
