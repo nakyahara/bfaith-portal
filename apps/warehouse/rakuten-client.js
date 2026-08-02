@@ -59,7 +59,9 @@ function sleep(ms) {
  * @param {object} [opts.headers] - 追加ヘッダー
  * @param {number} [opts.timeoutMs=60000]
  * @param {number} [opts.maxAttempts=4] - 初回 + retry 含む総試行回数
- * @returns {Promise<{status:number, data:any, attempts:number}>}
+ * @param {'json'|'buffer'} [opts.responseType='json'] - 'buffer' はレスポンスを Buffer で返す
+ *   (問い合わせ添付ファイル等のバイナリ用。data が Buffer になり contentType が付く)
+ * @returns {Promise<{status:number, data:any, attempts:number, contentType?:string}>}
  */
 export function rakutenRequest(opts) {
   const job = queueTail.then(() => doRakutenRequest(opts));
@@ -77,6 +79,7 @@ async function doRakutenRequest({
   headers = {},
   timeoutMs = DEFAULT_TIMEOUT_MS,
   maxAttempts = DEFAULT_MAX_ATTEMPTS,
+  responseType = 'json',
 }) {
   const auth = makeAuthHeader();
   if (!auth) {
@@ -113,13 +116,21 @@ async function doRakutenRequest({
         signal: AbortSignal.timeout(timeoutMs),
       });
 
+      const contentType = response.headers.get('content-type') || undefined;
+      // バイナリ (添付ファイル) は Buffer のまま返す。エラー時はJSON/テキストなので
+      // 成功レスポンスだけ Buffer 化し、失敗は従来どおり文字列で扱う
+      if (responseType === 'buffer' && response.status >= 200 && response.status < 300) {
+        const buf = Buffer.from(await response.arrayBuffer());
+        return { status: response.status, data: buf, attempts: attempt, contentType };
+      }
+
       const text = await response.text();
       let data;
       try { data = text ? JSON.parse(text) : null; } catch { data = text; }
 
       // 成功
       if (response.status >= 200 && response.status < 300) {
-        return { status: response.status, data, attempts: attempt };
+        return { status: response.status, data, attempts: attempt, contentType };
       }
 
       // リトライ可能 (429 / 5xx)
@@ -134,7 +145,7 @@ async function doRakutenRequest({
       }
 
       // 非リトライ or 最終試行失敗 → そのまま返す (呼び元が status を見て判断)
-      return { status: response.status, data, attempts: attempt };
+      return { status: response.status, data, attempts: attempt, contentType };
     } catch (e) {
       // ネットワークエラー / timeout
       lastError = e;

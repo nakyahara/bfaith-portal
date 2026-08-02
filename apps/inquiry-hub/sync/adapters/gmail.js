@@ -377,6 +377,38 @@ export function createGmailAdapter(cfg = {}) {
       return { externalReplyId: sent.id };
     },
 
+    /**
+     * 添付の実体取得 (画面の添付表示用。attachments.js から呼ばれる)。
+     * Gmail の attachmentId は取得ごとに変わり得るため同期時に保存していない (walkPayload 参照)。
+     * そのためメッセージを取り直し、ファイル名 (+サイズ) で part を特定してから本体を取る。
+     * @returns {{ buffer: Buffer, contentType: string|null, fileName: string|null }}
+     */
+    async fetchAttachment({ externalMessageId, fileName, fileSize, maxBytes = null }) {
+      requests = 0;
+      const msgId = String(externalMessageId || '');
+      if (!msgId || msgId.startsWith('syn:')) {
+        throw new Error('このメッセージにはGmailのメッセージIDがありません (再同期が必要です)');
+      }
+      const m = await apiGet(`messages/${encodeURIComponent(msgId)}?format=full`, 'attachment-message');
+      const parts = [];
+      (function walk(p) {
+        if (!p) return;
+        parts.push(p);
+        for (const c of p.parts || []) walk(c);
+      })(m.payload);
+      const withFile = parts.filter(p => p.filename && p.body?.attachmentId);
+      // 同名添付が複数ある場合はサイズ一致を優先 (同期時に保存した file_size と突き合わせる)
+      const part = withFile.find(p => p.filename === fileName && (fileSize == null || p.body?.size === fileSize))
+        || withFile.find(p => p.filename === fileName);
+      if (!part) throw new Error(`添付「${fileName || '(名称不明)'}」がメール内に見つかりません (削除された可能性)`);
+      if (maxBytes && part.body?.size > maxBytes) {
+        throw new Error(`添付が大きすぎます (${Math.round(part.body.size / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
+      }
+      const a = await apiGet(`messages/${encodeURIComponent(msgId)}/attachments/${encodeURIComponent(part.body.attachmentId)}`, 'attachment-body');
+      if (!a?.data) throw new Error('Gmail添付レスポンスに data がありません');
+      return { buffer: b64urlToBuf(a.data), contentType: part.mimeType || null, fileName: part.filename || fileName || null };
+    },
+
     /** 認証状態 (運用管理画面用)。refresh token は再認可レス無期限運用のため期限は返さない */
     async getAuthStatus() {
       const p = await apiGet('profile', 'profile');

@@ -323,6 +323,39 @@ router.get('/inquiries', rateLimitMiddleware('rakuten'), async (req, res) => {
   }
 });
 
+// 添付ファイル取得 passthrough (inquiry-hub 添付表示。2026-08-02)
+// - read-only。RMS の GET /attachment?path=&label= をバイナリのまま素通しする
+// - path は RMS が発行した取得キーをそのまま渡す (任意パス注入にはならない。path/label 以外は通さない)
+// - 呼び出し元は inquiry-hub の添付配信ルートのみ (Render→CF Tunnel→サービストークン認証の内側)
+router.get('/inquiry-attachment', rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const attPath = String(req.query.path || '');
+    const label = String(req.query.label || '');
+    if (!attPath) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'path が必要です', requestId: req.requestId });
+    }
+    if (attPath.length > 500 || label.length > 300) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'path / label が長すぎます', requestId: req.requestId });
+    }
+    const params = new URLSearchParams({ path: attPath, label });
+    const result = await rakutenRequest({
+      path: `/es/1.0/inquirymng-api/attachment?${params.toString()}`,
+      responseType: 'buffer',
+    });
+    if (result.status !== 200 || !Buffer.isBuffer(result.data)) {
+      const detail = Buffer.isBuffer(result.data) ? '(binary)' : String(JSON.stringify(result.data ?? '')).slice(0, 200);
+      return errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: `添付取得に失敗 (HTTP ${result.status}) ${detail}`, requestId: req.requestId });
+    }
+    console.log(`[rakuten-rms] inquiry-attachment ${attPath.slice(0, 24)}… -> ${result.data.length} bytes`);
+    res.setHeader('Content-Type', result.contentType || 'application/octet-stream');
+    res.setHeader('Content-Length', String(result.data.length));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.status(200).end(result.data);
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 // 問い合わせ返信 passthrough (inquiry-hub Step 4。変更系はこの1本のみ・厳重ガード)
 // - 呼び出し元は inquiry-hub の outbox worker のみ (Render→CF Tunnel→サービストークン認証の内側)
 // - inquiryNumber は実測形式 (shopId-日付-連番英字) の厳格検証。任意パス・任意ペイロードは通さない

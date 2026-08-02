@@ -221,6 +221,10 @@ export function createRakutenAdapter(cfg = {}) {
   const replyUrl = transport === 'warehouse'
     ? `${cfg.warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiry-reply`
     : `${BASE}/inquiry/reply`;
+  // 添付取得URL (read-only)。warehouse は miniPC passthrough 経由
+  const attachmentUrlBase = transport === 'warehouse'
+    ? `${cfg.warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiry-attachment`
+    : `${BASE}/attachment`;
 
   return {
     channelType: 'rakuten',
@@ -275,6 +279,39 @@ export function createRakutenAdapter(cfg = {}) {
       const replyId = data?.result?.id ?? data?.result?.replyId ?? data?.replyId ?? data?.id;
       console.log(`[rakuten-send] 送信完了 inquiry=${inquiryNumber} replyId=${replyId ?? '(レスポンスに無し)'}`);
       return { externalReplyId: replyId != null ? `r:${replyId}` : undefined };
+    },
+
+    /**
+     * 添付の実体取得 (画面の添付表示用。attachments.js から呼ばれる)。
+     * RMS の GET /attachment?path=&label= (契約テスト§2.4で実証済み) を叩く。
+     * path = 同期時に external_attachment_id へ保存した値 / label = ファイル名。
+     * transport=warehouse では miniPC passthrough 経由 (Renderに楽天キーを置かないため)。
+     * @returns {{ buffer: Buffer, contentType: string|null, fileName: string|null }}
+     */
+    async fetchAttachment({ externalAttachmentId, fileName, maxBytes = null }) {
+      const attPath = String(externalAttachmentId || '');
+      // syn: = 同期時に path が取れず決定的IDで代替したもの (取得キーが無い)
+      if (!attPath || attPath.startsWith('syn:')) {
+        throw new Error('この添付には楽天側の取得キーがありません (再同期が必要です)');
+      }
+      const url = `${attachmentUrlBase}?path=${encodeURIComponent(attPath)}&label=${encodeURIComponent(fileName || '')}`;
+      let res;
+      try {
+        res = await fetchImpl(url, { headers: buildHeaders(), signal: AbortSignal.timeout(requestTimeoutMs) });
+      } catch (err) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        throw new Error(timedOut ? `楽天添付取得 タイムアウト (${requestTimeoutMs}ms)` : `楽天添付取得の接続失敗: ${err?.message || err}`);
+      }
+      if (res.status !== 200) throw new Error(`楽天添付取得 HTTP ${res.status}: ${await errorHead(res)}`);
+      const declared = Number(res.headers.get('content-length'));
+      if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error(`添付が大きすぎます (${Math.round(declared / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
+      }
+      const buffer = Buffer.from(await res.arrayBuffer());
+      if (maxBytes && buffer.length > maxBytes) {
+        throw new Error(`添付が大きすぎます (${Math.round(buffer.length / 1048576)}MB。上限${Math.round(maxBytes / 1048576)}MB)`);
+      }
+      return { buffer, contentType: res.headers.get('content-type') || null, fileName: fileName || null };
     },
 
     /** sync/engine.js 契約。部分成功は返さない (途中失敗は全体 throw) */
