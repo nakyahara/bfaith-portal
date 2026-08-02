@@ -103,18 +103,26 @@ function migrate() {
     if (step.manual) step.run(next);
     else {
       db.transaction(() => {
+        // ロックを取ってから版数を読み直す。Render のデプロイは新旧プロセスが重なるため、
+        // 外で読んだ値のまま進めると、待たされた側が適用済みの版を二重に実行してしまう
+        // (v3/v5 の ADD COLUMN は再実行で失敗する)
+        if (db.pragma('user_version', { simple: true }) >= next) return;
         step();
         db.pragma(`user_version = ${next}`);
       }).immediate();
     }
     // manual 版が user_version の更新を忘れると、そのプロセスだけ適用済みとして起動し
     // 次回起動で同じ migration が再実行される (非冪等なら部分適用や起動不能)。
-    // ローカル変数を進める前に実DBの値で必ず突き合わせる
+    // ローカル変数を進める前に実DBの値で必ず確かめる。
+    // 別プロセスが更に先へ進めている場合もあるので「next 以上」で判定する
     const applied = db.pragma('user_version', { simple: true });
-    if (applied !== next) {
+    if (applied < next) {
       throw new Error(`shipping-work migration v${next}: user_version が ${applied} のまま更新されていない`);
     }
-    v = next;
+    if (applied > SCHEMA_VERSION) {
+      throw new Error(`shipping-work.db の user_version=${applied} がコードの期待 ${SCHEMA_VERSION} より新しい (新しい版が並行して適用された)`);
+    }
+    v = applied;
   }
 }
 
@@ -192,6 +200,8 @@ const MIGRATIONS = {
         // RENAME 時に他テーブルのFK句を書き換えさせない (参照名は sw_print_jobs のまま維持したい)
         db.pragma('legacy_alter_table = ON');
         db.transaction(() => {
+          // 通常版と同じく、ロック取得後に適用済みでないか確認する (並行起動対策)
+          if (db.pragma('user_version', { simple: true }) >= version) return;
           if (!hasColumn('sw_batches', 'doc_url')) {
             db.exec('ALTER TABLE sw_batches ADD COLUMN doc_url TEXT');
           }
