@@ -773,12 +773,27 @@ router.post('/api/shop-categories/sync', async (req, res) => {
   }
   let fetched;
   try {
-    fetched = await fetchShopCategoryTree({ force: req.body?.refresh === true });
+    // force 再送 (too_few の確認後) は取り直さない — 人が見て承認した内容をそのまま適用する
+    // (再取得すると確認した件数と実際に入る内容がズレる。Codex R1)
+    fetched = await fetchShopCategoryTree({ force: req.body?.refresh === true && req.body?.force !== true });
   } catch (e) {
     return res.status(502).json({ ok: false, error: `楽天への接続に失敗しました: ${String(e.message || e).slice(0, 200)}` });
   }
   if (!fetched.ok) return res.status(502).json({ ok: false, error: fetched.error });
-  const { rows, duplicates } = flattenCategoryTrees(fetched.trees);
+  // 複数カテゴリセット (メガプラン) は同名パスで categoryId が割れるため、黙って1つに決めない
+  if (fetched.trees.length > 1) {
+    return res.status(400).json({
+      ok: false,
+      error: `カテゴリセットが ${fetched.trees.length} 個あります。どのセットを使うか決める必要があるため、自動同期を中止しました (中原さんに相談してください)`,
+    });
+  }
+  const { rows, duplicates, skipped, truncated } = flattenCategoryTrees(fetched.trees);
+  if (truncated) {
+    return res.status(502).json({
+      ok: false,
+      error: `店舗内カテゴリが上限 (${MAX_SHOP_CATEGORY_LINES} 件) を超えました。一部だけ取り込むとマスタが欠けるため中止しました`,
+    });
+  }
   if (rows.length === 0) {
     return res.status(502).json({ ok: false, error: '楽天から店舗内カテゴリを1件も取得できませんでした' });
   }
@@ -789,7 +804,11 @@ router.post('/api/shop-categories/sync', async (req, res) => {
       message: `取得した件数 (${r.incoming}件) が現在の一覧 (${r.active}件) の半分未満です。楽天側でカテゴリを整理したのでなければ、取得が不完全な可能性があります`,
     });
   }
-  res.json({ ok: true, imported: rows.length, duplicates, active: r.active, deactivated: r.deactivated, source: 'rms' });
+  res.json({
+    ok: true, imported: rows.length, duplicates, skipped: skipped.length,
+    skippedDetail: skipped.slice(0, 20),
+    active: r.active, deactivated: r.deactivated, source: 'rms',
+  });
 });
 
 // 店舗内カテゴリ一覧の取り込み (貼り付け・全置き換え)。マスタ全体に影響するので admin 限定。

@@ -1563,6 +1563,33 @@ check('カテゴリツリー展開: 空・壊れた入力でも落ちない',
 check('カテゴリツリー展開: タイトル内の「>」はパス区切りと衝突しないよう潰す',
   flattenCategoryTrees([{ rootNode: { children: [{ category: { categoryId: '9', title: 'A > B' } }] } }])
     .rows[0].path === 'A ／ B');
+// 上限・形式検証 (貼り付け取り込みと同じ基準を API 側にも適用)
+const deepTree = (depth) => {
+  let node = { category: { categoryId: String(depth), title: 'L' + depth } };
+  for (let i = depth - 1; i >= 1; i--) node = { category: { categoryId: String(i), title: 'L' + i }, children: [node] };
+  return [{ rootNode: { children: [node] } }];
+};
+check('カテゴリツリー展開: 深すぎる階層は打ち切って skipped に出す',
+  (() => { const d = flattenCategoryTrees(deepTree(30)); return d.skipped.length > 0 && d.rows.length <= 20; })());
+check('カテゴリツリー展開: categoryId が数字でない行は skipped',
+  (() => {
+    const d = flattenCategoryTrees([{ rootNode: { children: [{ category: { categoryId: 'abc', title: 'X' } }] } }]);
+    return d.rows.length === 0 && d.skipped.length === 1 && d.skipped[0].reason.includes('数字');
+  })());
+check('カテゴリツリー展開: 長すぎるパスは skipped',
+  (() => {
+    const d = flattenCategoryTrees([{ rootNode: { children: [{ category: { categoryId: '1', title: 'あ'.repeat(400) } }] } }]);
+    return d.rows.length === 0 && d.skipped.length === 1;
+  })());
+check('カテゴリツリー展開: 件数上限を超えたら truncated (部分取り込みしない合図)',
+  (() => {
+    const many = Array.from({ length: 1200 }, (_, i) => ({ category: { categoryId: String(i + 1), title: 'C' + i } }));
+    const d = flattenCategoryTrees([{ rootNode: { children: many } }]);
+    return d.truncated === true;
+  })());
+check('カテゴリツリー展開: 正常データでは truncated=false・skipped 空',
+  flat.truncated === false && flat.skipped.length === 0);
+
 check('カテゴリツリー展開: 同一パスの重複は1件だけ採用し duplicates で報告',
   (() => {
     const d = flattenCategoryTrees([{ rootNode: { children: [

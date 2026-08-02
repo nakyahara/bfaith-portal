@@ -85,8 +85,11 @@
           <strong>楽天から直接取り込みます</strong> (お店の棚＝店舗内カテゴリ。楽天ジャンルとは別物)。
           カテゴリIDも一緒に取得するので、貼り付けは不要です。
         </div>
-        <div style="display:flex; align-items:center; gap:10px;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
           <button class="btn btn-primary" id="cat-sync-btn">楽天から取り込む</button>
+          <label class="muted" style="font-size:12px; display:inline-flex; align-items:center; gap:4px; margin:0;">
+            <input type="checkbox" id="cat-sync-refresh" style="width:auto;"> 楽天から取り直す (通常は不要・24時間キャッシュ)
+          </label>
           <span class="muted" id="cat-sync-result"></span>
         </div>
       </div>
@@ -225,7 +228,12 @@
       const res = await fetch('/apps/product-hub/api/shop-categories/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force: force === true, refresh: true }),
+        // refresh はチェックが入っているときだけ (既定は miniPC の 24h キャッシュを使う)。
+        // force 再送では取り直さない = 確認した内容がそのまま入る
+        body: JSON.stringify({
+          force: force === true,
+          refresh: force !== true && document.getElementById('cat-sync-refresh')?.checked === true,
+        }),
       });
       return res.json();
     }
@@ -243,7 +251,12 @@
         if (!json.ok) { out.textContent = ''; alert(json.message || json.error || '取り込みに失敗しました'); return; }
         out.textContent = '取り込み ' + json.imported + ' 件'
           + (json.duplicates ? ' (同名パス ' + json.duplicates + ' 件を除外)' : '')
+          + (json.skipped ? ' / 取り込めなかった ' + json.skipped + ' 件' : '')
           + (json.deactivated ? ' / 一覧から外れた ' + json.deactivated + ' 件' : '');
+        if (json.skipped) {
+          alert('次のカテゴリは取り込めませんでした:\n'
+            + (json.skippedDetail || []).map(function (s) { return '・' + s.path + ' — ' + s.reason; }).join('\n'));
+        }
         setTimeout(function () { location.reload(); }, 1500);
       } catch (e) {
         out.textContent = '通信エラー: ' + e.message;

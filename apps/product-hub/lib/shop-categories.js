@@ -93,6 +93,8 @@ export function countActiveShopCategories(db) {
   return db.prepare('SELECT COUNT(*) AS c FROM ph_shop_categories WHERE is_active = 1').get().c;
 }
 
+export const MAX_CATEGORY_TREE_DEPTH = 20;   // 実測は最大5階層。再帰暴走の backstop
+
 /**
  * Category API 2.0 のツリー応答 → replaceShopCategories に渡せる行 (2026-08-02)。
  *
@@ -100,34 +102,54 @@ export function countActiveShopCategories(db) {
  *   rootNode 自身は category を持たない。子孫のすべての階層が「棚」として実在するので全部行にする
  *   (中間ノードにも商品を割り当てられるため)。パス区切りは貼り付け取り込みと同じ ' > '。
  *
+ * 貼り付け取り込み (parseShopCategoryText) と同じ上限・検証を通す (Codex R1 low):
+ *   パス300文字 / 全体1000件 / categoryId は数字のみ / 深さ20。外れた行は skipped で報告。
+ *
  * @param {Array<{categorySetId: string, rootNode: object}>} trees miniPC の /shop-categories/tree の trees
- * @returns {{rows: Array<{categoryId, path, pathKey}>, duplicates: number}}
+ * @returns {{rows: Array<{categoryId, path, pathKey}>, duplicates: number,
+ *            skipped: Array<{path: string, reason: string}>, truncated: boolean}}
  */
 export function flattenCategoryTrees(trees) {
   const rows = [];
   const seen = new Set();
+  const skipped = [];
   let duplicates = 0;
-  const walk = (node, parentPath) => {
-    if (!node || typeof node !== 'object') return;
+  let truncated = false;
+  const walk = (node, parentPath, depth) => {
+    if (!node || typeof node !== 'object' || truncated) return;
+    if (depth > MAX_CATEGORY_TREE_DEPTH) {
+      skipped.push({ path: parentPath, reason: `階層が深すぎます (${MAX_CATEGORY_TREE_DEPTH}段まで)` });
+      return;
+    }
     const title = typeof node.category?.title === 'string' ? node.category.title.trim() : '';
     const rawId = node.category?.categoryId;
     // 区切り文字がタイトルに混ざるとパスが壊れるので潰す (貼り付け側の normalizePath と同じ意味論)
     const safeTitle = title.replace(/[>＞]/g, '／').trim();
     const path = safeTitle ? (parentPath ? `${parentPath} > ${safeTitle}` : safeTitle) : parentPath;
     if (safeTitle && rawId != null && String(rawId).trim() !== '') {
-      const pathKey = path.toLowerCase();
-      if (seen.has(pathKey)) duplicates++;
-      else {
-        seen.add(pathKey);
-        rows.push({ categoryId: String(rawId).trim(), path, pathKey });
+      const categoryId = String(rawId).trim();
+      if (path.length > MAX_PATH_LEN) {
+        skipped.push({ path: path.slice(0, 60) + '…', reason: `カテゴリ名が長すぎます (${MAX_PATH_LEN}文字まで)` });
+      } else if (!/^\d{1,12}$/.test(categoryId)) {
+        skipped.push({ path, reason: `カテゴリIDが数字ではありません (${categoryId.slice(0, 20)})` });
+      } else if (rows.length >= MAX_SHOP_CATEGORY_LINES) {
+        truncated = true;   // これ以上は取り込まない (部分データでの全置き換えを避けるため呼び出し側が中断する)
+        return;
+      } else {
+        const pathKey = path.toLowerCase();
+        if (seen.has(pathKey)) duplicates++;
+        else {
+          seen.add(pathKey);
+          rows.push({ categoryId, path, pathKey });
+        }
       }
     }
-    for (const child of Array.isArray(node.children) ? node.children : []) walk(child, path);
+    for (const child of Array.isArray(node.children) ? node.children : []) walk(child, path, depth + 1);
   };
   for (const t of Array.isArray(trees) ? trees : []) {
-    for (const child of Array.isArray(t?.rootNode?.children) ? t.rootNode.children : []) walk(child, '');
+    for (const child of Array.isArray(t?.rootNode?.children) ? t.rootNode.children : []) walk(child, '', 1);
   }
-  return { rows, duplicates };
+  return { rows, duplicates, skipped, truncated };
 }
 
 /**

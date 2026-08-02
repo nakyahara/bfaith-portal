@@ -789,9 +789,22 @@ router.get('/shop-categories/tree', rateLimitMiddleware('rakuten'), async (req, 
     }
     // メガプランは複数セットを持てる。通常店は "0" の 1 つだけ
     const setIds = Array.isArray(listRes.data?.categorySetKeyList) ? listRes.data.categorySetKeyList : [];
+    if (setIds.length === 0) {
+      return errorResponse(res, {
+        status: 502, error: 'RMS_API_ERROR',
+        message: 'カテゴリセットが1つも返りませんでした', requestId: req.requestId,
+      });
+    }
     const trees = [];
     for (const setId of setIds) {
-      if (!/^\d{1,10}$/.test(String(setId))) continue;
+      if (!/^\d{1,10}$/.test(String(setId))) {
+        // 想定外の ID 形式を黙って捨てると「一部が欠けたまま全置き換え」になるので中断する
+        return errorResponse(res, {
+          status: 502, error: 'RMS_API_ERROR',
+          message: `カテゴリセットIDの形式が想定外です (${String(setId).slice(0, 20)})`,
+          requestId: req.requestId,
+        });
+      }
       const r = await rakutenRequest({
         path: `/es/2.0/categories/shop-category-trees/category-set-ids/${encodeURIComponent(setId)}?categoryfields=TITLE`,
       });
@@ -802,7 +815,16 @@ router.get('/shop-categories/tree', rateLimitMiddleware('rakuten'), async (req, 
           requestId: req.requestId,
         });
       }
-      trees.push({ categorySetId: String(setId), rootNode: r.data?.rootNode ?? null });
+      // 200 でも中身が壊れていたら中断 (Codex R1: 部分データで全置き換えするとマスタが欠ける)
+      const rootNode = r.data?.rootNode;
+      if (!rootNode || !Array.isArray(rootNode.children)) {
+        return errorResponse(res, {
+          status: 502, error: 'RMS_API_ERROR',
+          message: `カテゴリツリー (セット ${setId}) の応答形が想定外です (rootNode.children が無い)`,
+          requestId: req.requestId,
+        });
+      }
+      trees.push({ categorySetId: String(setId), rootNode });
     }
     const data = { categorySetIds: setIds.map(String), trees };
     shopCatCache = { fetchedAt: Date.now(), data };
