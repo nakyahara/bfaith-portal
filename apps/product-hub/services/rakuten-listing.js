@@ -124,6 +124,60 @@ export async function listDriveFolderImages(folderId) {
   return files;
 }
 
+// ─── サムネイル取得 (アプリ内プロキシ /api/thumb 用) ───
+// drive.google.com/thumbnail 直リンクは「閲覧者の Google セッション」をサードパーティ
+// Cookie として送れる前提で、Cookie ブロックや複数アカウント (authuser 不一致) で 403 になる。
+// SA で Drive の thumbnailLink (トークン付き短命URL・Cookie不要) を取り、その画像バイトを
+// アプリから返す。thumbnailLink が取れない場合だけ原本DL+縮小にフォールバック。
+
+const THUMB_CACHE_MAX = 300;
+const THUMB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const thumbCache = new Map(); // `${fileId}:${width}` → { buf, type, at } (Map 挿入順 = LRU)
+const thumbInflight = new Map(); // 同一キーの同時リクエストは 1 回の Drive アクセスに束ねる
+
+export async function getDriveThumbnail(fileId, width) {
+  const key = `${fileId}:${width}`;
+  const hit = thumbCache.get(key);
+  if (hit && Date.now() - hit.at <= THUMB_CACHE_TTL_MS) {
+    thumbCache.delete(key);
+    thumbCache.set(key, hit);
+    return hit;
+  }
+  if (thumbInflight.has(key)) return thumbInflight.get(key);
+  const p = fetchDriveThumbnail(fileId, width)
+    .then((entry) => {
+      thumbCache.set(key, entry);
+      while (thumbCache.size > THUMB_CACHE_MAX) thumbCache.delete(thumbCache.keys().next().value);
+      return entry;
+    })
+    .finally(() => thumbInflight.delete(key));
+  thumbInflight.set(key, p);
+  return p;
+}
+
+async function fetchDriveThumbnail(fileId, width) {
+  const drive = getDriveClient();
+  const meta = await drive.files.get({ fileId, fields: 'thumbnailLink', supportsAllDrives: true });
+  const link = meta.data.thumbnailLink; // 例: https://lh3.googleusercontent.com/...=s220
+  if (link) {
+    const sized = /=s\d+$/.test(link) ? link.replace(/=s\d+$/, `=w${width}`) : link;
+    const res = await fetch(sized, { signal: AbortSignal.timeout(30_000) });
+    if (res.ok) {
+      return {
+        buf: Buffer.from(await res.arrayBuffer()),
+        type: res.headers.get('content-type') || 'image/jpeg',
+        at: Date.now(),
+      };
+    }
+  }
+  const raw = await downloadDriveImage(fileId);
+  const buf = await sharp(raw).rotate()
+    .resize({ width, height: width, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 80 })
+    .toBuffer();
+  return { buf, type: 'image/jpeg', at: Date.now() };
+}
+
 /**
  * R-Cabinet 制約 (JPEG / 2MB / 3840px) に収める。
  * RYS image-uploader と同じ「品質を段階的に落とす」方式。

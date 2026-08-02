@@ -31,7 +31,9 @@ check('parse folders/', parseDriveLink('https://drive.google.com/drive/folders/0
 check('parse u/0/folders', parseDriveLink('https://drive.google.com/drive/u/0/folders/0AMb_oOR8-Ss1Uk9PVA')?.type === 'folder');
 check('parse raw id', parseDriveLink('1AbC_dEf-1234567890123456789')?.type === 'unknown');
 check('parse garbage', parseDriveLink('https://example.com/x') === null);
-check('thumbnail url', thumbnailUrl('abc', 160).includes('sz=w160'));
+check('thumbnail url = アプリ内プロキシ', thumbnailUrl('abc-123', 160) === '/apps/product-hub/api/thumb/abc-123?w=160');
+check('thumbnail url allowlist外の幅→320', thumbnailUrl('abc-123', 999).endsWith('?w=320'));
+check('thumbnail url 幅未指定→320', thumbnailUrl('abc-123').endsWith('?w=320'));
 
 // ─── folder-import (画像フォルダ→スロット割当、2026-08-01) ───
 const { assignImageSlots, parseNumberedName, MAX_IMAGE_SLOTS } = await import('../lib/folder-import.js');
