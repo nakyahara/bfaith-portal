@@ -1,7 +1,9 @@
 /**
  * jobs-monitor 受付API
  *
- *   POST /apps/jobs-monitor/ping/:id?status=ok|fail|start   — ジョブからの報告 (Bearer認証)
+ *   POST /apps/jobs-monitor/ping/:id?status=ok|fail|start|partial[&note=...]
+ *        — ジョブからの報告 (Bearer認証)。partial = 「動いたが終わっていない」
+ *          (長時間バッチが実行時間の上限で中断したとき。生存は進むが完了は進まない)
  *   GET  /apps/jobs-monitor/health                          — 監視自身の生存確認 (認証なし・情報最小)
  *   GET  /apps/jobs-monitor/status                          — 全評価のJSON (Bearer認証)
  *
@@ -76,7 +78,9 @@ router.post('/ping/:id', requireToken, (req, res) => {
   const id = String(req.params.id || '');
   if (!ID_RE.test(id)) return res.status(400).json({ error: 'id が不正' });
   const status = String(req.query.status || 'ok');
-  if (!['ok', 'fail', 'start'].includes(status)) return res.status(400).json({ error: 'status は ok|fail|start' });
+  if (!['ok', 'fail', 'start', 'partial'].includes(status)) {
+    return res.status(400).json({ error: 'status は ok|fail|start|partial' });
+  }
   const note = typeof req.query.note === 'string' ? req.query.note.slice(0, 200) : null;
   recordPing(id, status, note, Date.now());
   // 台帳に無い id も 200 で受ける (拒否するとジョブ側が失敗扱いになる)。

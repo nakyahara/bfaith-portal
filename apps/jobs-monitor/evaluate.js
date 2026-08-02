@@ -62,7 +62,7 @@ export function todayJst(nowMs = Date.now()) {
 /**
  * 台帳の1エントリを評価する。
  * @param def   台帳エントリ
- * @param state { lastOkAtMs?: number|null, firstSeenAtMs?: number|null }
+ * @param state { lastOkAtMs?, lastAliveAtMs?, partialStreak?, lastNote?, firstSeenAtMs? }
  * @param nowMs 現在時刻 (UTCミリ秒)
  */
 export function evaluateEntry(def, state, nowMs) {
@@ -86,17 +86,42 @@ export function evaluateEntry(def, state, nowMs) {
     // 「監視を始める前のアンカー」には責任を持てない (デプロイ直後の誤報防止)。
     // firstSeen より後のアンカーだけを評価対象にする
     const accountable = anchor >= firstSeen;
-    const okSinceAnchor = lastOk !== null && lastOk >= anchor;
 
-    // 「猶予までに成功が無ければ、その時点で late」— 境界含む (>=)
-    if (accountable && nowMs >= anchor + graceMs && !okSinceAnchor) {
-      const detail = neverPinged
+    // partial_max_days があるジョブ = 1回で終わらない長時間バッチ。
+    // 毎日の締切は「動いたか (ok|partial)」で見て、「完走したか (ok)」は別軸で見る。
+    // 両方を ok 一本で見ると、実行時間の上限で中断される日は永久に締切超過になり
+    // (→ 打ち切り前提のバッチが毎朝鳴り続ける)、逆に中断を ok 扱いすると
+    // 永遠に完走しなくても緑のままになる。どちらか一方では表現できない。
+    const allowsPartial = Number.isFinite(def.partial_max_days);
+    const lastAlive = state?.lastAliveAtMs ?? lastOk;
+    const streak = state?.partialStreak ?? 0;
+    const aliveMark = allowsPartial ? lastAlive : lastOk;
+    const neverAlive = aliveMark === null || aliveMark === undefined;
+    const aliveSinceAnchor = !neverAlive && aliveMark >= anchor;
+    const word = allowsPartial ? '実行' : '成功';
+
+    // 「猶予までに報告が無ければ、その時点で late」— 境界含む (>=)
+    if (accountable && nowMs >= anchor + graceMs && !aliveSinceAnchor) {
+      const detail = neverAlive
         ? `ping が一度も来ないまま初回締切を超過。ジョブ側の ping 配線か、ジョブ自体が動いていない可能性`
-        : `直近の予定 (JST ${String(def.anchor_hour_jst).padStart(2, '0')}:${String(def.anchor_minute_jst ?? 0).padStart(2, '0')} + 猶予${def.grace_hours}h) までに成功が来ていません (最終成功 ${fmtAge(nowMs - lastOk)} 前)`;
+        : `直近の予定 (JST ${String(def.anchor_hour_jst).padStart(2, '0')}:${String(def.anchor_minute_jst ?? 0).padStart(2, '0')} + 猶予${def.grace_hours}h) までに${word}が来ていません (最終${word} ${fmtAge(nowMs - aliveMark)} 前)`;
       return { ...base, status: 'late', detail };
     }
-    if (neverPinged) {
+    if (neverAlive) {
       return { ...base, status: 'uninitialized', detail: 'ping がまだ来ていません (導入直後なら正常。ジョブ側の ping 配線を確認)' };
+    }
+    // 動いてはいるが完走しない = 「毎日少しずつしか進まず永遠に終わらない」を捕まえる
+    if (allowsPartial && streak > def.partial_max_days) {
+      const note = state?.lastNote ? ` 直近の報告: ${state.lastNote}` : '';
+      const okAge = lastOk === null ? '一度も完走していません' : `最終完走 ${fmtAge(nowMs - lastOk)} 前`;
+      return {
+        ...base,
+        status: 'stalled',
+        detail: `${streak}回連続で「実行したが完走せず」です (許容 ${def.partial_max_days}回)。毎日動いてはいるので、進んでいるかを確認してください (${okAge})。${note}`,
+      };
+    }
+    if (allowsPartial && streak > 0) {
+      return { ...base, status: 'ok', detail: `最終実行 ${fmtAge(nowMs - lastAlive)} 前 (未完走が ${streak}回連続・許容 ${def.partial_max_days}回)` };
     }
     return { ...base, status: 'ok', detail: `最終成功 ${fmtAge(nowMs - lastOk)} 前` };
   }
@@ -127,7 +152,11 @@ export function evaluateAll(registry, statesById, nowMs) {
   return registry.map((def) => evaluateEntry(def, statesById[def.id] || null, nowMs));
 }
 
-/** 即時通知の対象か (P1/P2 の late/overdue のみ。それ以外は毎朝のサマリで扱う) */
+/**
+ * 即時通知の対象か (P1/P2 の late/overdue のみ。それ以外は毎朝のサマリで扱う)
+ * stalled は意図的に外している — 「動いてはいる」ので分単位の緊急性は無く、
+ * 朝サマリで残件を見ながら判断すれば足りる。即時に混ぜると通知疲れの元になる。
+ */
 export function needsImmediateAlert(result) {
   return (result.importance === 'P1' || result.importance === 'P2')
     && (result.status === 'late' || result.status === 'overdue');
@@ -158,8 +187,8 @@ export function buildDigest(results, unknownIds = [], nowMs = Date.now()) {
     return lines.join('\n');
   }
 
-  const order = { late: 0, overdue: 0, remove_due: 1, due_soon: 2, uninitialized: 3 };
-  const icon = { late: '🔴', overdue: '🔴', remove_due: '🟠', due_soon: '🟡', uninitialized: '⚪' };
+  const order = { late: 0, overdue: 0, stalled: 1, remove_due: 1, due_soon: 2, uninitialized: 3 };
+  const icon = { late: '🔴', overdue: '🔴', stalled: '🟠', remove_due: '🟠', due_soon: '🟡', uninitialized: '⚪' };
   attention.sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9));
 
   for (const r of attention) {

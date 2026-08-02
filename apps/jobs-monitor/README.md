@@ -39,6 +39,12 @@ GAS (Google側=両方から独立) ──/health を10分ごと監視──┘ �
 - **ping が一度も来ないままでも、監視開始 (firstSeen) を起点に締切超過へ昇格する**
   (配線忘れ・ジョブ自体が死んでいるケースを永遠の「未初期化」で無音にしない)
 - `status=fail` は記録のみ (失敗の中身はジョブ自身の GChat 通知が担当。二重に鳴らさない)
+- ⭐**`status=partial` = 「動いたが完走していない」** — 1回では終わらない長時間バッチ用。
+  台帳に `partial_max_days` があるジョブだけが使える。partial は**その日の締切は満たすが
+  完走にはならない**。未完走が `partial_max_days` 回続くと `stalled` (🟠) で要対応に出る。
+  これが無いと、実行時間の上限で毎回中断されるバッチは
+  「毎朝鳴りっぱなし」か「永遠に完走しなくても緑」の二択にしかならない
+  (2026-08-02 に product-idea-scout で実際に前者が起きた)
 - P1/P2 の締切超過 → 即時通知 + 再通知 (P1=6h / P2=24h) + 復旧通知。
   **通知は送信に成功したときだけ「通知済み」になる** (送信失敗は次の5分で再試行)
 - P3 / TMP / 期限接近 / 未初期化 → 毎朝 08:50 のサマリのみ
@@ -51,7 +57,7 @@ GAS (Google側=両方から独立) ──/health を10分ごと監視──┘ �
 
 | エンドポイント | 認証 | 用途 |
 |---|---|---|
-| `POST /apps/jobs-monitor/ping/:id?status=ok\|fail\|start` | Bearer `JOBS_MONITOR_TOKEN` | ジョブからの報告 |
+| `POST /apps/jobs-monitor/ping/:id?status=ok\|fail\|start\|partial[&note=...]` | Bearer `JOBS_MONITOR_TOKEN` | ジョブからの報告 (`note` は200文字まで・サマリに表示) |
 | `GET /apps/jobs-monitor/health` | なし (ok と評価時刻のみ返す) | GAS 見張り用 |
 | `GET /apps/jobs-monitor/status` | Bearer | 全評価JSON (デバッグ・将来の一覧画面) |
 
@@ -60,6 +66,9 @@ ping はどの環境からでも1リクエスト:
 ```powershell
 # miniPC ランナー (bat/ps1) の末尾に1行:
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\jobs-monitor\ping.ps1 -Id <job-id> -Status ok
+
+# 長時間バッチが時間切れで中断したとき (完走ではないが動いてはいる):
+powershell -NoProfile -ExecutionPolicy Bypass -File ...\ping.ps1 -Id <job-id> -Status partial -Note "remaining 484"
 ```
 
 ```bash

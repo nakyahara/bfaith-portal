@@ -37,10 +37,14 @@ ok(validateRegistry([{ ...VALID_SJ, anchor_minute_jst: 60 }]).some((e) => /ancho
 ok(validateRegistry([{ ...VALID_SJ, grace_hours: 30 }]).some((e) => /grace_hours/.test(e)), 'grace>=24を弾く (次アンカー跨ぎ)');
 ok(validateRegistry([{ ...VALID_SJ, importance: 'TMP' }]).some((e) => /TMP/.test(e)), 'scheduled_jobのTMPを弾く');
 ok(validateRegistry([{ ...VALID_SJ, where: undefined }]).some((e) => /where/.test(e)), 'where欠落を検出');
+eq(validateRegistry([{ ...VALID_SJ, partial_max_days: 7 }]), [], '正のpartial_max_daysは通る');
+ok(validateRegistry([{ ...VALID_SJ, partial_max_days: 0 }]).some((e) => /partial_max_days/.test(e)), 'partial_max_days=0を弾く');
+ok(validateRegistry([{ ...VALID_SJ, partial_max_days: 1.5 }]).some((e) => /partial_max_days/.test(e)), '小数のpartial_max_daysを弾く');
 const VALID_HO = {
   id: 'ho-1', type: 'human_obligation', importance: 'P1', owner: 'o', purpose: 'p', runbook: 'r',
   where: 'w', schedule: 's', period_hours: 28 * 24, warn_days: 5, lifecycle: 'permanent',
 };
+ok(validateRegistry([{ ...VALID_HO, partial_max_days: 7 }]).some((e) => /partial_max_days/.test(e)), 'scheduled_job以外のpartial_max_daysを弾く');
 eq(validateRegistry([VALID_HO]), [], '正しいhuman_obligationは通る');
 ok(validateRegistry([{ ...VALID_HO, warn_days: -1 }]).some((e) => /warn_days/.test(e)), '負のwarn_daysを弾く');
 const VALID_TA = {
@@ -80,6 +84,32 @@ eq(rNoPing.status, 'late', 'ping未着でも初回締切超過でlateに昇格')
 ok(/配線/.test(rNoPing.detail), '配線忘れの可能性を案内');
 // 監視開始前のアンカーには責任を持たない (デプロイ直後の誤報防止)
 eq(evaluateEntry(SJ, { firstSeenAtMs: jst(2026, 8, 1, 13, 30) }, jst(2026, 8, 1, 14, 0)).status, 'uninitialized', '監視開始前のアンカーでは鳴らさない');
+
+// ── partial: 長時間バッチの「動いた」と「完走した」を分ける ──
+// (実行時間の上限で毎回中断されるバッチが、鳴りっぱなしにも緑のままにもならないこと)
+const SJP = { ...SJ, id: 'j2', importance: 'P3', partial_max_days: 7 };
+const OLD_OK = jst(2026, 7, 20, 8, 0);     // 最後に完走したのは12日前
+const LATE_TODAY = jst(2026, 8, 1, 13, 1); // 今日の締切(13:00)を過ぎた時点で評価する
+const partialState = (aliveAt, streak, note) => ({
+  ...SEEN_OLD, lastOkAtMs: OLD_OK, lastAliveAtMs: aliveAt, partialStreak: streak, lastNote: note,
+});
+eq(evaluateEntry(SJP, partialState(jst(2026, 8, 1, 9, 0), 3), LATE_TODAY).status, 'ok',
+  '今日partialが来ていれば締切は満たす (完走していなくても)');
+eq(evaluateEntry(SJ, partialState(jst(2026, 8, 1, 9, 0), 3), LATE_TODAY).status, 'late',
+  '⭐partial_max_days が無いジョブは partial を締切充足に使わない (完走が毎回の締切)');
+eq(evaluateEntry(SJP, partialState(jst(2026, 7, 31, 9, 0), 3), LATE_TODAY).status, 'late',
+  '今日の実行報告が無ければ partial 対応でも late');
+// 未完走が続いたら stalled — 「毎日動いてはいるが永遠に終わらない」を捕まえる
+const rStalled = evaluateEntry(SJP, partialState(jst(2026, 8, 1, 9, 0), 8, '残り484件'), LATE_TODAY);
+eq(rStalled.status, 'stalled', '未完走が許容(7)を超えたらstalled');
+ok(/残り484件/.test(rStalled.detail), 'stalledの本文に直近の報告 (残件) を出す');
+eq(evaluateEntry(SJP, partialState(jst(2026, 8, 1, 9, 0), 7), LATE_TODAY).status, 'ok', '許容ちょうど(7)はまだok');
+ok(!needsImmediateAlert({ importance: 'P1', status: 'stalled' }), 'stalledは即時通知しない (朝サマリで扱う)');
+// 列を足す前のデータ (lastAliveAtMs が無い) でも壊れない
+eq(evaluateEntry(SJP, { ...SEEN_OLD, lastOkAtMs: jst(2026, 8, 1, 9, 0) }, LATE_TODAY).status, 'ok',
+  '旧データ (alive列なし) は ok を生存の印として引き継ぐ');
+eq(evaluateEntry(SJP, { firstSeenAtMs: jst(2026, 8, 1, 5, 0) }, LATE_TODAY).status, 'late',
+  'partial対応でもping未着なら初回締切でlate');
 
 // ── human_obligation ──
 const NOW = jst(2026, 8, 1, 12, 0);
@@ -124,6 +154,9 @@ ok(/🟡 \*b\*/.test(dMix), 'due_soonは🟡で出る');
 ok(/🟠 \*c\*/.test(dMix), 'remove_dueは🟠で出る');
 ok(/mystery-job/.test(dMix), '未登録pingを警告する');
 ok(dMix.indexOf('🔴') < dMix.indexOf('🟠') && dMix.indexOf('🟠') < dMix.indexOf('🟡'), '深刻な順に並ぶ');
+const dStalled = buildDigest([{ id: 's', importance: 'P3', status: 'stalled', detail: '8回連続で未完走', runbook: 'logを見る' }], [], jst(2026, 8, 2, 8, 50));
+ok(/🟠 \*s\*/.test(dStalled), 'stalledは🟠でサマリに出る');
+ok(/logを見る/.test(dStalled), 'stalledにもrunbookを出す');
 // 見出しの日付はJST暦日。配信時刻の 08:50 JST は UTC では前日 23:50 なので、
 // UTC由来の日付を使うと毎朝ちょうど1日前が出てしまう (2026-08-02 に実際に発覚)
 ok(/\(2026-08-02\)/.test(buildDigest([], [], jst(2026, 8, 2, 8, 50))), '見出しは配信時点のJST暦日 (08:50でも当日)');
