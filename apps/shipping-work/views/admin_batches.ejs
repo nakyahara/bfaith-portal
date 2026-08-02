@@ -40,6 +40,7 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/admin/review" class="btn-logout">🔎 確認待ち</a>
       <a href="/apps/shipping-work/" class="btn-logout">← カンバン</a>
       <a href="/" class="btn-logout">ダッシュボード</a>
     </div>
@@ -126,7 +127,7 @@
         <% } %>
         <% for (const b of batches) { %>
           <tr class="<%= b.status === 'cancelled' ? 'cancelled' : '' %>">
-            <td><%= b.id %></td>
+            <td><a href="/apps/shipping-work/admin/batches/<%= b.id %>"><%= b.id %></a></td>
             <td><%= b.shipping_no_label || b.shipping_no %></td>
             <td><span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %></span></td>
             <td><%= b.bunrui_label || b.bunrui %></td>

@@ -11,8 +11,8 @@
  */
 import crypto from 'node:crypto';
 import {
-  getDB, utcNow, jstToday, getBatch, addStatusEvent, isValidMaster, batchHasDocument,
-  listMasters as listMastersRaw,
+  getDB, utcNow, jstToday, getBatch, addStatusEvent, addAuditLog, isValidMaster,
+  batchHasDocument, BATCH_STATUSES, listMasters as listMastersRaw,
 } from './db.js';
 
 /** 業務エラー。router が status を HTTP ステータスに変換する。 */
@@ -779,4 +779,138 @@ export function getWorkerState(process, worker) {
     // 作業中でも直前の完了は見えるようにする (完了直後に「印刷し忘れた」と気づけるように)
     recentCompleted: listRecentCompleted(process, worker),
   };
+}
+
+// ═══ 管理者の救済 (要件v2 §5「管理者はステータス手動変更可・理由必須・履歴必須・
+//     計測データは上書きされない」/ §14-8「手動修正・監査ログ」) ═══
+//
+// 作業者の訂正は「自分の直前操作」に限定してあるので、条件を外れたものは全部ここへ来る。
+// 現物とシステムが食い違ったときの最終手段なので、できることは広いが必ず理由と履歴を残す。
+// 計測 (requested_at / ended_at / active_sec) は決して書き換えず、
+// 「採用するかどうか」だけを validity で切り替える。
+
+/** 管理者向けのバッチ詳細。現在の状態・遷移履歴・全セッション・印刷ジョブを1画面ぶん。 */
+export function getBatchDetail(batchId) {
+  const db = getDB();
+  const batch = getBatchWithLabels(db, batchId);
+  if (!batch) return null;
+  const events = db.prepare(
+    'SELECT * FROM sw_status_events WHERE batch_id = ? ORDER BY id'
+  ).all(batchId).map((e) => ({ ...e, atJst: toJstDateTime(e.at) }));
+  const sessions = db.prepare(
+    'SELECT * FROM sw_sessions WHERE batch_id = ? ORDER BY id'
+  ).all(batchId).map((s) => ({
+    ...s,
+    requestedAtJst: toJstDateTime(s.requested_at),
+    endedAtJst: s.ended_at ? toJstDateTime(s.ended_at) : null,
+    pauses: db.prepare('SELECT * FROM sw_pauses WHERE session_id = ? ORDER BY id').all(s.id),
+  }));
+  const printJobs = db.prepare(
+    'SELECT * FROM sw_print_jobs WHERE batch_id = ? ORDER BY id'
+  ).all(batchId).map((j) => ({ ...j, requestedAtJst: toJstDateTime(j.requested_at) }));
+  return { batch, events, sessions, printJobs };
+}
+
+/** UTC を JST の 'MM/DD HH:MM' にする (管理画面の表示用)。 */
+function toJstDateTime(utc) {
+  if (!utc) return '';
+  return new Intl.DateTimeFormat('ja-JP', {
+    timeZone: 'Asia/Tokyo', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(utc));
+}
+
+/**
+ * ステータスの手動訂正 (理由必須)。計測は書き換えない。
+ * 進行中セッションが残ったまま状態だけ動かすと作業者が次の作業を取れなくなるため、
+ * 開いているセッションは cancelled で閉じる (時刻は残す)。
+ */
+export function adminFixStatus(batchId, toStatus, actor, reason, opId) {
+  validateOpId(opId);
+  const reasonTrim = normalizeNote(reason);
+  if (!reasonTrim) throw new SwError(400, '訂正の理由は必須です');
+  if (!BATCH_STATUSES.includes(toStatus)) throw new SwError(400, 'ステータスが不正です');
+  const db = getDB();
+  return runIdempotent(
+    {
+      opId, worker: actor, operation: 'admin-fix-status', targetKind: 'batch', targetId: batchId,
+      params: { toStatus, reason: reasonTrim },
+    },
+    () => {
+      const before = getBatch(batchId);
+      if (!before) throw new SwError(404, 'バッチが見つかりません');
+      if (before.status === toStatus) return { noop: true, status: toStatus };
+      const now = utcNow();
+
+      // 開いているセッションを閉じる (計測時刻はそのまま。採用可否は管理者が別途判定する)
+      const open = db.prepare("SELECT * FROM sw_sessions WHERE batch_id = ? AND outcome = 'open'").all(batchId);
+      for (const s of open) {
+        db.prepare('UPDATE sw_pauses SET resumed_at = ? WHERE session_id = ? AND resumed_at IS NULL')
+          .run(now, s.id);
+        db.prepare(`
+          UPDATE sw_sessions
+          SET outcome = 'cancelled', ended_at = COALESCE(ended_at, ?), paused = 0,
+              validity = 'review_required', correction_reason = ?, corrected_by = ?, corrected_at = ?
+          WHERE id = ?
+        `).run(now, `管理者がステータスを訂正: ${reasonTrim}`, actor, now, s.id);
+        cancelOpenPrintJobs(db, s.id);
+      }
+
+      db.prepare('UPDATE sw_batches SET status = ?, hold_from_status = NULL, updated_at = ? WHERE id = ?')
+        .run(toStatus, now, batchId);
+      addStatusEvent(batchId, before.status, toStatus, actor, 'admin', reasonTrim);
+      addAuditLog(actor, 'admin_fix_status', `sw_batches:${batchId}`,
+        { status: before.status }, { status: toStatus, closedSessions: open.map((s) => s.id) }, reasonTrim);
+      return { status: toStatus, closedSessions: open.length };
+    }
+  );
+}
+
+/**
+ * セッションを計測として採用するかの判定 (valid / invalid)。
+ * 時刻は触らず validity だけ切り替え、判断そのものも監査ログに追記する。
+ */
+export function adminJudgeSession(sessionId, validity, actor, reason, opId) {
+  validateOpId(opId);
+  const reasonTrim = normalizeNote(reason);
+  if (!reasonTrim) throw new SwError(400, '判定の理由は必須です');
+  if (!['valid', 'invalid', 'review_required'].includes(validity)) {
+    throw new SwError(400, '判定値が不正です');
+  }
+  const db = getDB();
+  return runIdempotent(
+    {
+      opId, worker: actor, operation: 'admin-judge-session', targetKind: 'session', targetId: sessionId,
+      params: { validity, reason: reasonTrim },
+    },
+    () => {
+      const before = db.prepare('SELECT * FROM sw_sessions WHERE id = ?').get(sessionId);
+      if (!before) throw new SwError(404, 'セッションが見つかりません');
+      const now = utcNow();
+      db.prepare(`
+        UPDATE sw_sessions SET validity = ?, validity_reason = ?, validity_by = ?, validity_at = ?
+        WHERE id = ?
+      `).run(validity, reasonTrim, actor, now, sessionId);
+      addAuditLog(actor, 'admin_judge_session', `sw_sessions:${sessionId}`,
+        { validity: before.validity }, { validity }, reasonTrim);
+      return { validity };
+    }
+  );
+}
+
+/** 管理者確認待ち (作業者が訂正した・管理者が閉じた) のセッション一覧。 */
+export function listSessionsForReview(limit = 100) {
+  const db = getDB();
+  return db.prepare(`
+    SELECT s.*, b.work_date, b.shipping_no,
+      (SELECT label FROM sw_masters m WHERE m.kind='shipping_no' AND m.code=b.shipping_no) AS shipping_no_label
+    FROM sw_sessions s JOIN sw_batches b ON b.id = s.batch_id
+    WHERE s.validity = 'review_required'
+    ORDER BY s.id DESC LIMIT ?
+  `).all(limit).map((s) => ({
+    ...s,
+    requestedAtJst: toJstDateTime(s.requested_at),
+    endedAtJst: s.ended_at ? toJstDateTime(s.ended_at) : null,
+    correctedAtJst: s.corrected_at ? toJstDateTime(s.corrected_at) : null,
+  }));
 }

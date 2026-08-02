@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .sw-wrap { max-width: 1000px; margin: 0 auto; padding: 12px 16px 40px; }
+    .sw-card { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .sw-card h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font-size: 0.92em; }
+    .kv dt { color: #868e96; }
+    .kv dd { margin: 0; }
+    table.t { width: 100%; border-collapse: collapse; font-size: 0.87em; }
+    table.t th, table.t td { border-bottom: 1px solid #e9ecef; padding: 5px 8px; text-align: left; vertical-align: top; }
+    table.t th { background: #f8f9fa; white-space: nowrap; }
+    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.92em; }
+    .st.ready { background: #d0ebff; } .st.done, .st.picked { background: #d3f9d8; }
+    .st.hold { background: #fff3bf; } .st.cancelled { background: #f1f3f5; }
+    .vd { font-size: 0.85em; border-radius: 4px; padding: 1px 7px; }
+    .vd.valid { background: #d3f9d8; color: #2b8a3e; }
+    .vd.invalid { background: #ffe3e3; color: #c92a2a; text-decoration: line-through; }
+    .vd.review_required { background: #fff3bf; color: #e67700; font-weight: bold; }
+    .fix { background: #fff9db; border: 1px solid #ffe066; border-radius: 8px; padding: 12px 14px; }
+    .fix select, .fix input[type=text] { padding: 6px; }
+    .fix input[type=text] { width: 100%; box-sizing: border-box; margin-top: 6px; }
+    .fix button { padding: 7px 18px; cursor: pointer; margin-top: 8px; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .note { color: #868e96; font-size: 0.85em; margin-top: 6px; }
+    .warn { color: #c92a2a; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🔧 バッチ #<%= batch.id %></span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/shipping-work/admin/batches" class="btn-logout">← バッチ管理</a>
+      <a href="/apps/shipping-work/admin/review" class="btn-logout">確認待ち</a>
+      <a href="/apps/shipping-work/" class="btn-logout">カンバン</a>
+    </div>
+  </header>
+
+  <div class="sw-wrap">
+    <div class="sw-card">
+      <h2><%= batch.shipping_no_label || batch.shipping_no %>
+        <span class="st <%= batch.status %>"><%= statusLabels[batch.status] || batch.status %></span></h2>
+      <dl class="kv">
+        <dt>作業日</dt><dd><%= batch.work_date %></dd>
+        <dt>発送分類</dt><dd><%= batch.bunrui_label || batch.bunrui %></dd>
+        <dt>梱包方法</dt><dd><%= batch.packing_method_label || batch.packing_method %></dd>
+        <dt>伝票件数</dt><dd><%= batch.slip_count ?? '—' %></dd>
+        <dt>帳票</dt><dd>
+          <% if (batch.doc_url) { %><a href="<%= batch.doc_url %>" target="_blank" rel="noopener noreferrer">リンク</a><% } %>
+          <% if (batch.pdf_path) { %><a href="/apps/shipping-work/admin/batches/<%= batch.id %>/pdf" target="_blank">PDF</a><% } %>
+          <% if (!batch.doc_url && !batch.pdf_path) { %><span class="warn">未設定</span><% } %>
+        </dd>
+        <% if (batch.note) { %><dt>メモ</dt><dd><%= batch.note %></dd><% } %>
+      </dl>
+    </div>
+
+    <div class="sw-card">
+      <h2>🔧 ステータスを手動で直す</h2>
+      <div class="fix">
+        <select id="fixStatus">
+          <% for (const s of statuses) { %>
+            <option value="<%= s %>" <%= s === batch.status ? 'selected' : '' %>><%= statusLabels[s] || s %></option>
+          <% } %>
+        </select>
+        <input type="text" id="fixReason" placeholder="理由 (必須。例: 現物は梱包済みだったため完了に直す)">
+        <button onclick="fixStatus()">この状態に直す</button>
+        <div class="note">
+          計測時刻は書き換えません。進行中のセッションがあれば閉じ、確認待ちに回します。
+          操作は履歴と監査ログに残ります
+        </div>
+      </div>
+    </div>
+
+    <div class="sw-card">
+      <h2>⏱ 計測セッション (<%= sessions.length %>)</h2>
+      <% if (sessions.length === 0) { %><div class="note">まだありません</div><% } else { %>
+      <table class="t">
+        <thead><tr><th>ID</th><th>工程</th><th>担当</th><th>開始</th><th>終了</th><th>実作業</th><th>結果</th><th>採用</th><th></th></tr></thead>
+        <tbody>
+          <% for (const s of sessions) { %>
+            <tr>
+              <td><%= s.id %><% if (s.continues_session_id) { %><br><span class="note">#<%= s.continues_session_id %>の続き</span><% } %></td>
+              <td><%= s.process %></td>
+              <td><%= displayNames[s.worker] || s.worker.split('@')[0] %></td>
+              <td><%= s.requestedAtJst %></td>
+              <td><%= s.endedAtJst || '—' %></td>
+              <td><%= s.active_sec != null ? Math.floor(s.active_sec / 60) + '分' + String(s.active_sec % 60).padStart(2, '0') + '秒' : '—' %></td>
+              <td><%= s.outcome %><% if (s.void_reason) { %><br><span class="note"><%= s.void_reason %></span><% } %></td>
+              <td>
+                <span class="vd <%= s.validity %>"><%= s.validity %></span>
+                <% if (s.correction_reason) { %><br><span class="note">訂正: <%= s.correction_reason %></span><% } %>
+                <% if (s.validity_reason) { %><br><span class="note">判定: <%= s.validity_reason %></span><% } %>
+              </td>
+              <td>
+                <% if (s.ended_at) { %>
+                  <button class="btn-sm" onclick="judge(<%= s.id %>, 'valid')">採用</button>
+                  <button class="btn-sm" onclick="judge(<%= s.id %>, 'invalid')">除外</button>
+                <% } %>
+              </td>
+            </tr>
+            <% for (const p of s.pauses) { %>
+              <tr><td></td><td colspan="8" class="note">
+                保留: <%= p.reason %><%= p.reason_note ? ' (' + p.reason_note + ')' : '' %>
+                <%= p.resumed_at ? '' : ' ← 未解除' %>
+              </td></tr>
+            <% } %>
+          <% } %>
+        </tbody>
+      </table>
+      <div class="note">「除外」しても時刻は消えません。集計に入れるかどうかだけが変わります</div>
+      <% } %>
+    </div>
+
+    <div class="sw-card">
+      <h2>📜 ステータス履歴 (<%= events.length %>)</h2>
+      <table class="t">
+        <thead><tr><th>日時</th><th>遷移</th><th>操作者</th><th>経路</th><th>理由</th></tr></thead>
+        <tbody>
+          <% for (const e of events) { %>
+            <tr>
+              <td><%= e.atJst %></td>
+              <td><%= e.from_status || '—' %> → <%= e.to_status %></td>
+              <td><%= displayNames[e.actor] || e.actor.split('@')[0] %></td>
+              <td><%= e.via %></td>
+              <td><%= e.reason || '' %></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <% if (printJobs.length > 0) { %>
+    <div class="sw-card">
+      <h2>🖨 印刷ジョブ (<%= printJobs.length %>)</h2>
+      <table class="t">
+        <thead><tr><th>ID</th><th>日時</th><th>状態</th><th>要求者</th><th>再印刷の理由</th></tr></thead>
+        <tbody>
+          <% for (const j of printJobs) { %>
+            <tr>
+              <td><%= j.id %></td><td><%= j.requestedAtJst %></td><td><%= j.status %></td>
+              <td><%= displayNames[j.requested_by] || j.requested_by.split('@')[0] %></td>
+              <td><%= j.reprint_reason || '' %></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+    <% } %>
+  </div>
+
+  <script>
+    const BATCH_ID = <%= batch.id %>;
+    function opId() {
+      if (window.crypto?.randomUUID) return crypto.randomUUID();
+      return 'op-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+    }
+    async function post(url, body) {
+      const r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ op_id: opId(), ...body }),
+      });
+      let j = {};
+      try { j = await r.json(); } catch {}
+      if (!r.ok) { alert(j.error || `エラー (${r.status})`); return null; }
+      return j;
+    }
+    async function fixStatus() {
+      const status = document.getElementById('fixStatus').value;
+      const reason = document.getElementById('fixReason').value.trim();
+      if (!reason) return alert('理由は必須です');
+      if (!confirm(`ステータスを「${document.getElementById('fixStatus').selectedOptions[0].text}」に直します。よろしいですか？`)) return;
+      const j = await post(`/apps/shipping-work/api/admin/batches/${BATCH_ID}/fix-status`, { status, reason });
+      if (j) {
+        if (j.closedSessions > 0) alert(`直しました。進行中だったセッション ${j.closedSessions} 件を閉じ、確認待ちに回しました`);
+        location.reload();
+      }
+    }
+    async function judge(sessionId, validity) {
+      const label = validity === 'valid' ? '採用' : '除外';
+      const reason = prompt(`このセッションを計測から「${label}」します。理由を入力してください (必須)`);
+      if (reason === null) return;
+      if (!reason.trim()) return alert('理由は必須です');
+      const j = await post(`/apps/shipping-work/api/admin/sessions/${sessionId}/judge`, { validity, reason: reason.trim() });
+      if (j) location.reload();
+    }
+  </script>
+</body>
+</html>
