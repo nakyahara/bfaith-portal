@@ -226,6 +226,9 @@ export function initProductHubDB() {
       white_bg_drive_file_id TEXT,          -- 白抜き背景画像 (whiteBgImage) の Drive fileId
       white_bg_drive_url     TEXT,
       published_at   TEXT,                  -- アプリから公開に切り替えた日時 (NULL = 非公開のまま)
+      shop_categories_synced_at TEXT,       -- 店舗内カテゴリ (item-mappings) を RMS へ反映した日時
+      shop_categories_synced_key TEXT,      -- そのとき反映した categoryId の並び (選択を変えたら「未反映」に戻すため)
+      shop_categories_error     TEXT,       -- 直近の反映エラー (人が直す材料)
       updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
@@ -363,6 +366,11 @@ export function initProductHubDB() {
     ['white_bg_drive_file_id', 'TEXT'],
     ['white_bg_drive_url', 'TEXT'],
     ['published_at', 'TEXT'],
+    // 店舗内カテゴリの RMS 反映 (2026-08-02、item-mappings API)。
+    // 商品APIに棚のフィールドが無く登録とは別呼び出しになるため、結果を個別に持つ
+    ['shop_categories_synced_at', 'TEXT'],
+    ['shop_categories_synced_key', 'TEXT'],
+    ['shop_categories_error', 'TEXT'],
   ]) {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
   }

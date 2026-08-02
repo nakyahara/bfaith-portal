@@ -1590,6 +1590,65 @@ check('カテゴリツリー展開: 件数上限を超えたら truncated (部�
 check('カテゴリツリー展開: 正常データでは truncated=false・skipped 空',
   flat.truncated === false && flat.skipped.length === 0);
 
+// item-mappings で棚を反映するための列 (2026-08-02)
+const rkColsNow = new Set(db.prepare('PRAGMA table_info(draft_rakuten)').all().map((c) => c.name));
+check('draft_rakuten に反映状態の列がある (冪等ALTER)',
+  rkColsNow.has('shop_categories_synced_at') && rkColsNow.has('shop_categories_error'),
+  [...rkColsNow].join(','));
+const listing2 = await import('../services/rakuten-listing.js');
+check('syncShopCategoriesToRms がエクスポートされている', typeof listing2.syncShopCategoriesToRms === 'function');
+// 未登録ドラフトは反映できない (先に「非公開で登録」が必要)
+const unreg = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('未登録ドラフトの棚反映は拒否される',
+  unreg.ok === false && String(unreg.error).includes('登録した商品だけ'), JSON.stringify(unreg));
+// 登録済みだが棚が未選択 → 明示エラー (RMS を叩かない)
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id); // 他テストの残りを掃除
+db.prepare(`UPDATE draft_rakuten SET registered_at = '2026-08-02T00:00:00Z' WHERE draft_id = ?`).run(fdraft.id);
+const noCat = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('棚が未選択なら RMS を叩かずエラー',
+  noCat.ok === false && String(noCat.error).includes('選択されていません'), JSON.stringify(noCat));
+// categoryId を持たない棚 (貼り付け取り込み由来) だけのときも叩かない
+db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+  VALUES (NULL, 'ID無しの棚', 'id無しの棚', 1, 99)`).run();
+const noIdCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = 'id無しの棚'`).get().id;
+db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, noIdCat);
+const idless = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('カテゴリIDが無い棚が混ざったら反映しない (部分反映で画面とRMSがズレるため)',
+  idless.ok === false && String(idless.error).includes('カテゴリIDが分からない棚'), JSON.stringify(idless));
+check('失敗理由は shop_categories_error に残る (リロードしても原因が分かる)',
+  (db.prepare('SELECT shop_categories_error FROM draft_rakuten WHERE draft_id = ?').get(fdraft.id)
+    ?.shop_categories_error || '').includes('カテゴリIDが分からない棚'));
+// IDありの棚を1件足しても、ID無しが残っていれば止まる (Codex R1 medium: 部分反映の禁止)
+db.prepare(`INSERT INTO ph_shop_categories (category_id, path, path_key, is_active, sort_order)
+  VALUES ('1270', 'ID有りの棚(テスト)', 'id有りの棚(てすと)', 1, 50)`).run();
+const okCat = db.prepare(`SELECT id FROM ph_shop_categories WHERE path_key = 'id有りの棚(てすと)'`).get();
+db.prepare('INSERT INTO draft_shop_categories (draft_id, shop_category_id) VALUES (?, ?)').run(fdraft.id, okCat.id);
+const mixed = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
+check('ID有りと無しが混在しても反映しない (全体置換APIなので部分送信しない)',
+  mixed.ok === false && (mixed.missingPaths || []).length === 1, JSON.stringify(mixed));
+
+// 反映状態の判定 (反映後に棚を変えたら「未反映」に戻る)
+// ID無しの棚だけ選択から外す (マスタ行は draft_shop_categories から参照されているので消さない)
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ? AND shop_category_id = ?').run(fdraft.id, noIdCat);
+const rkNow = () => db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(fdraft.id);
+db.prepare(`UPDATE draft_rakuten SET shop_categories_synced_at = NULL, shop_categories_synced_key = NULL,
+  shop_categories_error = NULL WHERE draft_id = ?`).run(fdraft.id);
+check('同期状態: 未反映は pending', listing2.shopCategorySyncState(db, fdraft.id, rkNow()) === 'pending');
+db.prepare(`UPDATE draft_rakuten SET shop_categories_synced_at = '2026-08-02T00:00:00Z',
+  shop_categories_synced_key = '1270' WHERE draft_id = ?`).run(fdraft.id);
+check('同期状態: 反映した棚と一致すれば synced',
+  listing2.shopCategorySyncState(db, fdraft.id, rkNow()) === 'synced');
+db.prepare(`UPDATE draft_rakuten SET shop_categories_synced_key = '9999' WHERE draft_id = ?`).run(fdraft.id);
+check('同期状態: 反映後に棚を変えたら stale (✅表示のままにしない)',
+  listing2.shopCategorySyncState(db, fdraft.id, rkNow()) === 'stale');
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id);
+check('同期状態: 棚が空なら none', listing2.shopCategorySyncState(db, fdraft.id, rkNow()) === 'none');
+check('同期状態: 未登録商品は null (判定対象外)',
+  listing2.shopCategorySyncState(db, fdraft.id, { registered_at: null }) === null);
+db.prepare('DELETE FROM draft_shop_categories WHERE draft_id = ?').run(fdraft.id);
+db.prepare(`UPDATE draft_rakuten SET registered_at = NULL, shop_categories_synced_at = NULL,
+  shop_categories_synced_key = NULL, shop_categories_error = NULL WHERE draft_id = ?`).run(fdraft.id);
+
 // 承認 (too_few → force) を「確認した内容」に固定する指紋 (Codex R2 high)
 const { shopCategorySnapshotHash } = await import('../lib/shop-categories.js');
 const snapA = shopCategorySnapshotHash(flat.rows);
@@ -1685,7 +1744,9 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr', shipping_method_group: null, postage_included: null, normal_delivery_date_id: null, white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://x', published_at: null },
+    rakuten: { genre_id: '1', attributes_json: null, article_number: null, registered_at: '2026-07-27T00:00:00Z', last_error: 'IE0418: attr', shipping_method_group: null, postage_included: null, normal_delivery_date_id: null, white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://x', published_at: null,
+      shop_categories_synced_at: '2026-08-02T01:00:00Z', shop_categories_synced_key: '1270', shop_categories_error: null },
+    shopCatSyncState: 'stale',   // 反映後に棚を変えた表示の分岐
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
@@ -1800,8 +1861,9 @@ const renders = [
 ];
 for (const [name, file, data] of renders) {
   try {
-    // thumbnailUrl / fileViewUrl は router が常に渡す共通 locals (画像スロットグリッドで使用)
-    const html = await ejs.renderFile(path.join(views, file), { thumbnailUrl, fileViewUrl, ...data });
+    // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態)
+    const html = await ejs.renderFile(path.join(views, file),
+      { thumbnailUrl, fileViewUrl, shopCatSyncState: null, ...data });
     check(`render ${name}`, html.length > 500);
   } catch (e) {
     check(`render ${name}`, false, e.message);

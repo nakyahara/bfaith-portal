@@ -782,7 +782,24 @@
         <ul style="margin:6px 0 0 18px; padding:0;">
           <li>在庫は <strong>0 で登録</strong>されています (在庫は NE 連携 / 運用側で入れる)</li>
           <% if (selectedShopCats.length > 0) { %>
-            <li>店舗内カテゴリを RMS で設定: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong> <span class="muted">(自動反映は未対応)</span></li>
+            <li>
+              店舗内カテゴリ: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
+              <%# 状態は「今の選択が反映済みか」で判定する (反映後に棚を変えたら stale) %>
+              <% if (shopCatSyncState === 'synced') { %>
+                <span style="color:#166534;">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
+              <% } else if (shopCatSyncState === 'stale') { %>
+                <span style="color:#b45309;">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
+              <% } else if (shopCatSyncState === 'failed') { %>
+                <span style="color:#dc2626;">❌ 反映に失敗</span>
+              <% } else { %>
+                <span class="muted">⏳ 未反映</span>
+              <% } %>
+              <button class="btn btn-sm" id="rk-syncshopcat-btn" style="margin-left:6px;">棚を反映</button>
+              <span class="muted" id="rk-syncshopcat-result" style="font-size:12px;"></span>
+              <% if (rakuten.shop_categories_error && shopCatSyncState !== 'synced') { %>
+                <div class="muted" style="font-size:11px; color:#b91c1c; white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
+              <% } %>
+            </li>
           <% } else { %>
             <li class="muted">店舗内カテゴリが未選択です (どの棚にも載りません)</li>
           <% } %>
@@ -1525,6 +1542,26 @@
   }
 
   // 公開 / 非公開の切り替え (アプリから登録した商品のみ)
+  // 店舗内カテゴリ (お店の棚) を RMS へ反映。登録時に自動で走るが、失敗時や選び直したときに手動で
+  const rkSyncCatBtn = document.getElementById('rk-syncshopcat-btn');
+  if (rkSyncCatBtn) {
+    rkSyncCatBtn.addEventListener('click', async () => {
+      const out = document.getElementById('rk-syncshopcat-result');
+      rkSyncCatBtn.disabled = true;
+      out.textContent = '反映中…';
+      try {
+        const json = await post(BASE + '/rakuten/sync-shop-categories', {});
+        if (json.ok) {
+          out.textContent = '✅ ' + json.count + ' 件を反映しました';
+          setTimeout(() => location.reload(), 1000);
+        } else {
+          out.textContent = '';
+          alert(json.error || '反映に失敗しました');
+        }
+      } finally { rkSyncCatBtn.disabled = false; }
+    });
+  }
+
   const rkPublishBtn = document.getElementById('rk-publish-btn');
   if (rkPublishBtn) {
     rkPublishBtn.addEventListener('click', async () => {
@@ -1629,8 +1666,18 @@
     try {
       const json = await post(BASE + '/rakuten/register', { confirm: true });
       if (json.ok) {
-        rkResult.textContent = '✅ 非公開で登録しました';
-        setTimeout(() => location.reload(), 1200);
+        // 棚 (店舗内カテゴリ) の反映は登録とは別APIなので、失敗を登録成功に紛れさせない
+        const cat = json.shopCategories;
+        if (cat && cat.ok === false) {
+          rkResult.textContent = '✅ 登録しました (店舗内カテゴリの反映は失敗)';
+          alert('楽天への登録は成功しましたが、店舗内カテゴリ (棚) の反映に失敗しました:\n\n'
+            + (cat.error || '') + '\n\n「棚を反映」ボタンでやり直せます。');
+        } else if (cat && cat.ok) {
+          rkResult.textContent = '✅ 非公開で登録しました (棚 ' + cat.count + ' 件も反映)';
+        } else {
+          rkResult.textContent = '✅ 非公開で登録しました';
+        }
+        setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
       } else {
         rkResult.textContent = '';
         const pre = document.getElementById('rk-preview');
