@@ -199,8 +199,8 @@
             .map((s) => `  ・${s.process} / ${s.worker.split('@')[0]} (${s.outcome})`).join('\n');
           const okForce = confirm(
             `⚠ 後の工程が進んでいます。\n\n${list}\n\n`
-            + `この操作は上記 ${res.body.detail?.sessions?.length || 0} 件のセッションを閉じ、`
-            + `作業をやり直すことになります (二重作業の恐れ)。\n\n本当に実行しますか？`);
+            + `この状態に戻すと、上記の工程をやり直すことになります (二重作業の恐れ)。\n`
+            + `進行中のセッションは閉じ、完了済みの記録はそのまま残ります。\n\n本当に実行しますか？`);
           if (!okForce) return;
           res = await post(`/apps/shipping-work/api/admin/batches/${BATCH_ID}/fix-status`,
             { status, reason, force: true }, opId());

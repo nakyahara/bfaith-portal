@@ -916,12 +916,17 @@ export function adminFixStatus(batchId, toStatus, actor, reason, opId, opts = {}
 
 /**
  * その遷移で「後の工程を巻き戻すことになる」セッション一覧。
- * 遷移先より後ろの工程で動いた記録があれば、管理者に見せてから確定させる。
+ * 遷移先より後ろの工程で実際に進んだ記録があれば、管理者に見せてから確定させる。
  *
- * 「後ろの工程」= その工程の作業中状態 (picking=1/sorting=3/packing=5) が、
- * 遷移先の直後 (toStatus+1) より先にあるもの。
- * 例: ready へ戻すとき、picking のセッションは「今の工程の中止」なので通常フローで閉じるが、
- *     packing のセッションがあれば梱包まで進んだものを巻き戻すことになる → 警告。
+ * 判定は位置と結果の両方で行う (Codexレビュー round2 High):
+ *   - 遷移先の直後より先の工程 (activeIdx > toStatus+1) → 記録があれば警告
+ *   - 遷移先の直後の工程 (activeIdx == toStatus+1) → open は「今の工程の中止」なので
+ *     通常フロー (閉じて確認待ち) に任せるが、completed なら完了済みの工程を
+ *     やり直させることになるので警告する (例: picked → ready は完了済み picking の巻き戻し)
+ *
+ * 「実際に進んだ記録」に数えない outcome/validity:
+ *   voided (印刷トラブルで破棄) / cancelled (管理者が閉じた) / print_failed /
+ *   invalid 判定済み — これらは工程が進んだ証拠ではないので、残っていても警告し続けない。
  */
 function laterProcessSessions(db, batchId, toStatus) {
   const idx = STATUS_ORDER.indexOf(toStatus);
@@ -929,7 +934,13 @@ function laterProcessSessions(db, batchId, toStatus) {
   const activeIdx = { picking: 1, sorting: 3, packing: 5 };
   const rows = db.prepare('SELECT * FROM sw_sessions WHERE batch_id = ? ORDER BY id').all(batchId);
   return rows
-    .filter((s) => (activeIdx[s.process] ?? 0) > idx + 1 && s.outcome !== 'voided')
+    .filter((s) => {
+      const evidence = (s.outcome === 'completed' || s.outcome === 'open') && s.validity !== 'invalid';
+      if (!evidence) return false;
+      const p = activeIdx[s.process] ?? 0;
+      if (p > idx + 1) return true;                       // 明確に後ろの工程
+      return p === idx + 1 && s.outcome === 'completed';  // 直後の工程は完了済みのみ警告
+    })
     .map((s) => ({ id: s.id, process: s.process, worker: s.worker, outcome: s.outcome }));
 }
 
