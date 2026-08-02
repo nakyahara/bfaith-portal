@@ -26,7 +26,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -234,6 +234,7 @@ router.get('/detail/:id', (req, res) => {
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
+    shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
     neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE,
     pageInfo, pageInfoHtml, neShipping,

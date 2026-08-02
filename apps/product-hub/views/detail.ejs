@@ -784,16 +784,19 @@
           <% if (selectedShopCats.length > 0) { %>
             <li>
               店舗内カテゴリ: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
-              <% if (rakuten.shop_categories_synced_at) { %>
+              <%# 状態は「今の選択が反映済みか」で判定する (反映後に棚を変えたら stale) %>
+              <% if (shopCatSyncState === 'synced') { %>
                 <span style="color:#166534;">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
-              <% } else if (rakuten.shop_categories_error) { %>
+              <% } else if (shopCatSyncState === 'stale') { %>
+                <span style="color:#b45309;">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
+              <% } else if (shopCatSyncState === 'failed') { %>
                 <span style="color:#dc2626;">❌ 反映に失敗</span>
               <% } else { %>
                 <span class="muted">⏳ 未反映</span>
               <% } %>
               <button class="btn btn-sm" id="rk-syncshopcat-btn" style="margin-left:6px;">棚を反映</button>
               <span class="muted" id="rk-syncshopcat-result" style="font-size:12px;"></span>
-              <% if (rakuten.shop_categories_error) { %>
+              <% if (rakuten.shop_categories_error && shopCatSyncState !== 'synced') { %>
                 <div class="muted" style="font-size:11px; color:#b91c1c; white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
               <% } %>
             </li>
@@ -1663,8 +1666,18 @@
     try {
       const json = await post(BASE + '/rakuten/register', { confirm: true });
       if (json.ok) {
-        rkResult.textContent = '✅ 非公開で登録しました';
-        setTimeout(() => location.reload(), 1200);
+        // 棚 (店舗内カテゴリ) の反映は登録とは別APIなので、失敗を登録成功に紛れさせない
+        const cat = json.shopCategories;
+        if (cat && cat.ok === false) {
+          rkResult.textContent = '✅ 登録しました (店舗内カテゴリの反映は失敗)';
+          alert('楽天への登録は成功しましたが、店舗内カテゴリ (棚) の反映に失敗しました:\n\n'
+            + (cat.error || '') + '\n\n「棚を反映」ボタンでやり直せます。');
+        } else if (cat && cat.ok) {
+          rkResult.textContent = '✅ 非公開で登録しました (棚 ' + cat.count + ' 件も反映)';
+        } else {
+          rkResult.textContent = '✅ 非公開で登録しました';
+        }
+        setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
       } else {
         rkResult.textContent = '';
         const pre = document.getElementById('rk-preview');

@@ -690,59 +690,90 @@ export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
   if (!draft) return { ok: false, error: 'draft_not_found' };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   if (!rk?.registered_at) {
+    // 未登録は「状態として自明」(画面に登録済みバッジが出ない) ので error 欄には残さない
     return { ok: false, error: 'このアプリから楽天に登録した商品だけ棚を反映できます (先に「非公開で登録」)' };
   }
-  // 選択中の棚 (categoryId が判っているものだけ = API 同期で取り込んだもの)
+  // どの失敗経路でも理由を残す (Codex R1 medium: リロードすると原因が消えていた)
+  const fail = (msg, extra = {}) => {
+    db.prepare(`
+      INSERT INTO draft_rakuten (draft_id, shop_categories_error) VALUES (?, ?)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        shop_categories_error = excluded.shop_categories_error,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draftId, String(msg).slice(0, 1000));
+    logEvent(db, draftId, 'rakuten_shop_categories_failed', String(msg).slice(0, 500), actor);
+    return { ok: false, error: msg, ...extra };
+  };
+
   const rows = db.prepare(`
     SELECT c.category_id, c.path FROM draft_shop_categories s
     JOIN ph_shop_categories c ON c.id = s.shop_category_id
     WHERE s.draft_id = ? ORDER BY c.sort_order, c.id
   `).all(draftId);
-  const withId = rows.filter((r) => r.category_id != null && String(r.category_id).trim() !== '');
   if (rows.length === 0) {
-    return { ok: false, error: '店舗内カテゴリが選択されていません (「カテゴリ・属性」タブで選んでください)' };
+    return fail('店舗内カテゴリが選択されていません (「カテゴリ・属性」タブで選んでください)');
   }
-  if (withId.length === 0) {
-    return {
-      ok: false,
-      error: '選択中の棚にカテゴリIDがありません。一覧画面の「楽天から取り込む」でカテゴリ一覧を同期し直してください',
-    };
+  // item-mappings の PUT は「割り当て全体の置き換え」なので、一部だけ送ると画面の選択と
+  // RMS の状態がズレる。カテゴリIDが無い棚が1件でもあれば反映しない (Codex R1 medium)
+  const missing = rows.filter((r) => r.category_id == null || String(r.category_id).trim() === '');
+  if (missing.length > 0) {
+    return fail(
+      `カテゴリIDが分からない棚があります (${missing.map((m) => m.path).join(' ／ ').slice(0, 200)})。`
+      + '一覧画面の「楽天から取り込む」でカテゴリ一覧を同期し直してください',
+      { missingPaths: missing.map((m) => m.path) },
+    );
   }
-  const categoryIds = withId.map((r) => String(r.category_id).trim());
+
+  const categoryIds = rows.map((r) => String(r.category_id).trim());
+  const syncedKey = categoryIds.join(',');
   const mn = String(draft.ne_code).trim().toLowerCase();
   const body = { categoryIds };
   // 複数のときは「メインの棚」= 先頭 (画面の並び順で最初に選ばれた棚) を指定する
   if (categoryIds.length > 1) body.mainPluralCategoryId = categoryIds[0];
 
-  const r = await callWarehouse(
-    `/service-api/rakuten-rms/item-mappings/manage-numbers/${encodeURIComponent(mn)}`,
-    { method: 'PUT', body, timeoutMs: 90_000 },
-  );
-  if (r.status === 404 && !r.data) {
-    return { ok: false, error: 'miniPC 側の店舗内カテゴリ反映ルートが未反映です (miniPC で git pull + Restart-Service)' };
+  let r;
+  try {
+    r = await callWarehouse(
+      `/service-api/rakuten-rms/item-mappings/manage-numbers/${encodeURIComponent(mn)}`,
+      { method: 'PUT', body, timeoutMs: 90_000 },
+    );
+  } catch (e) {
+    return fail(`楽天への接続に失敗しました: ${String(e.message || e).slice(0, 200)}`);
   }
-  const skipped = rows.length - withId.length;
+  if (r.status === 404 && !r.data) {
+    return fail('miniPC 側の店舗内カテゴリ反映ルートが未反映です (miniPC で git pull + Restart-Service)');
+  }
   if (r.status >= 200 && r.status < 300) {
     db.prepare(`
-      INSERT INTO draft_rakuten (draft_id, shop_categories_synced_at, shop_categories_error) VALUES (?, ?, NULL)
+      INSERT INTO draft_rakuten (draft_id, shop_categories_synced_at, shop_categories_synced_key, shop_categories_error)
+      VALUES (?, ?, ?, NULL)
       ON CONFLICT(draft_id) DO UPDATE SET
         shop_categories_synced_at = excluded.shop_categories_synced_at,
+        shop_categories_synced_key = excluded.shop_categories_synced_key,
         shop_categories_error = NULL,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    `).run(draftId, new Date().toISOString());
+    `).run(draftId, new Date().toISOString(), syncedKey);
     logEvent(db, draftId, 'rakuten_shop_categories_synced',
-      withId.map((r2) => r2.path).join(' ／ ').slice(0, 500), actor);
-    return { ok: true, count: categoryIds.length, skipped, paths: withId.map((r2) => r2.path) };
+      rows.map((r2) => r2.path).join(' ／ ').slice(0, 500), actor);
+    return { ok: true, count: categoryIds.length, paths: rows.map((r2) => r2.path) };
   }
   const errText = r.data?.message || extractRmsErrors(r.data) || `HTTP ${r.status}`;
-  db.prepare(`
-    INSERT INTO draft_rakuten (draft_id, shop_categories_error) VALUES (?, ?)
-    ON CONFLICT(draft_id) DO UPDATE SET
-      shop_categories_error = excluded.shop_categories_error,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(draftId, String(errText).slice(0, 1000));
-  logEvent(db, draftId, 'rakuten_shop_categories_failed', String(errText).slice(0, 500), actor);
-  return { ok: false, status: r.status, error: errText };
+  return fail(errText, { status: r.status });
+}
+
+/** 現在選択中の棚が RMS へ反映済みか (反映後に選択を変えたら「未反映」に戻す) */
+export function shopCategorySyncState(db, draftId, rakuten) {
+  if (!rakuten?.registered_at) return null;
+  const ids = db.prepare(`
+    SELECT c.category_id FROM draft_shop_categories s
+    JOIN ph_shop_categories c ON c.id = s.shop_category_id
+    WHERE s.draft_id = ? ORDER BY c.sort_order, c.id
+  `).all(draftId).map((r) => (r.category_id == null ? '' : String(r.category_id).trim()));
+  if (ids.length === 0) return 'none';
+  const currentKey = ids.join(',');
+  if (rakuten.shop_categories_synced_at && rakuten.shop_categories_synced_key === currentKey) return 'synced';
+  if (rakuten.shop_categories_synced_at) return 'stale';   // 反映後に棚を変えた
+  return rakuten.shop_categories_error ? 'failed' : 'pending';
 }
 
 /**
