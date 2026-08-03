@@ -470,6 +470,49 @@ export function exportCsv(excelMode) {
   return bom + toCsv(rows);
 }
 
+// ---------- 拡張からの自動登録 ----------
+
+/** 表示名から梱包サイズコードを導出 (「メール便…」→mail /「NNサイズ…」→NN / 不明→auto) */
+export function deriveSizeCode(label) {
+  if (/^メール便/.test(label)) return 'mail';
+  const m = label.match(/^(\d+)サイズ/);
+  return m ? m[1] : 'auto';
+}
+
+/**
+ * セラーセントラルで担当者が手動選択したサイズをマスターへ自動登録する (Chrome拡張の学習機能)。
+ * - 既存SKUは大小文字違いを含め**絶対に上書きしない** (created:false を返すだけ)
+ * - amazonOptionValue (実画面で選択された option の UUID) を必須にする
+ *   (照合tier1が常に効く状態でのみ登録を受け付ける)
+ * - 検証は createMaster と同一 (validateInput + 大小無視の重複チェック + DB一意制約)
+ */
+export function autoRegisterFromExt(body) {
+  const label = str(body?.packageSizeLabel).trim();
+  const uuid = str(body?.amazonOptionValue).trim();
+  if (!uuid) {
+    throw new EsError(400, 'VALIDATION_ERROR', 'amazonOptionValue が必要です');
+  }
+  try {
+    const item = createMaster(
+      {
+        sku: body?.sku,
+        packageSizeCode: deriveSizeCode(label),
+        packageSizeLabel: label,
+        amazonOptionValue: uuid,
+        isActive: true,
+        note: 'セラーセントラル初回手動選択から自動登録 (拡張)',
+      },
+      'extension:auto-register',
+    );
+    return { created: true, item };
+  } catch (e) {
+    if (e instanceof EsError && e.code === 'DUPLICATE_SKU') {
+      return { created: false, reason: 'already_exists' };
+    }
+    throw e;
+  }
+}
+
 // ---------- 操作ログ ----------
 
 function logAdmin(userEmail, action, result, sku, message) {

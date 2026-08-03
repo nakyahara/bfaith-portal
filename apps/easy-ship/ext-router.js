@@ -10,7 +10,7 @@
 import { Router } from 'express';
 import crypto from 'crypto';
 import express from 'express';
-import { EsError, addExtLogs, bulkLookup, lookupOne } from './service.js';
+import { EsError, addExtLogs, autoRegisterFromExt, bulkLookup, lookupOne } from './service.js';
 
 const router = Router();
 
@@ -60,6 +60,9 @@ function api(handler) {
 router.get('/api/v1/ping', api(() => ({ pong: true })));
 
 router.post('/api/v1/package-sizes/bulk-lookup', api((req) => bulkLookup(req.body?.skus)));
+
+// セラーセントラルで担当者が手動選択したサイズの自動登録 (既存SKUは上書きしない)
+router.post('/api/v1/package-sizes/auto-register', api((req) => autoRegisterFromExt(req.body ?? {})));
 
 router.post('/api/v1/logs', api((req) => addExtLogs(req.body?.entries)));
 
