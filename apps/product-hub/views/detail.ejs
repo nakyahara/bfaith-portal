@@ -628,6 +628,7 @@
         <div class="field">
           <label>
             <%= aiMeta[kind].label %><span class="ftag ftag-ai">AI</span>
+            <span class="ai-len muted" data-for="<%= kind %>" style="margin-left:6px; font-size:11px;"></span>
             <% if (aiBadge(kind)) { %><span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span><% } %>
           </label>
           <textarea class="ai-output" data-kind="<%= kind %>" rows="4"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
@@ -2085,7 +2086,15 @@
       try {
         const res = await fetch(BASE + '/rakuten/desc-preview');
         const j = await res.json();
-        if (!j.ok) { status.textContent = '組み立てに失敗: ' + (j.error || ''); return; }
+        if (!j.ok) {
+          // 前回の成功結果が画面に残っている場合は「古い」ことを明示する (Codex medium:
+          // 素材を直した直後の失敗で、旧内容を最新と誤認してコピーしてしまう)
+          status.textContent = '⚠️ 組み立てに失敗しました'
+            + (latest ? ' — 下の表示とコピーは前回の結果です' : '') + ': ' + (j.error || '');
+          status.style.color = '#dc2626';
+          return;
+        }
+        status.style.color = '';
         latest = j;
         document.getElementById('desc3-result').style.display = '';
         for (const key of ['pc', 'sp', 'sales']) {
@@ -2110,7 +2119,9 @@
         }
         status.textContent = '';
       } catch (e) {
-        document.getElementById('desc3-status').textContent = '通信エラー: ' + e.message;
+        const st = document.getElementById('desc3-status');
+        st.textContent = '⚠️ 通信エラー' + (latest ? ' — 下の表示とコピーは前回の結果です' : '') + ': ' + e.message;
+        st.style.color = '#dc2626';
       } finally {
         btn.disabled = false;
       }
@@ -2257,18 +2268,19 @@
     });
   });
 
-  // 文字数カウンタ (店舗ルール: 楽天タイトル128 / Yahoo!タイトル65 / キャッチコピー30。超過は赤)
-  document.querySelectorAll('.ai-output[data-max]').forEach((ta) => {
-    const max = Number(ta.dataset.max);
+  // 文字数カウンタ (全AI項目)。上限があるもの (楽天タイトル128 / Yahoo!タイトル65 / キャッチコピー30)
+  // は「n / 上限文字」+ 超過で赤。上限なしの素材 (特徴・仕様・注意書き) は「n文字」の単純カウント
+  document.querySelectorAll('.ai-output').forEach((ta) => {
+    const max = ta.dataset.max ? Number(ta.dataset.max) : null;
     const lenEl = document.querySelector('.ai-len[data-for="' + ta.dataset.kind + '"]');
     const update = () => {
       const n = ta.value.length;
       if (lenEl) {
-        lenEl.textContent = n + ' / ' + max + '文字';
-        lenEl.style.color = n > max ? '#dc2626' : '';
-        lenEl.style.fontWeight = n > max ? '700' : '';
+        lenEl.textContent = max ? (n + ' / ' + max + '文字') : (n + '文字');
+        lenEl.style.color = max && n > max ? '#dc2626' : '';
+        lenEl.style.fontWeight = max && n > max ? '700' : '';
       }
-      ta.style.borderColor = n > max ? '#dc2626' : '';
+      ta.style.borderColor = max && n > max ? '#dc2626' : '';
     };
     ta.addEventListener('input', update);
     update();
