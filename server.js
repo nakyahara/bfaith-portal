@@ -67,6 +67,8 @@ import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
+import easyShipRouter from './apps/easy-ship/router.js';
+import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
@@ -307,6 +309,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/mgmt-accounting')) return next();
     // /aba-ext-api は router 内で「x-api-key 認証 → 64KB parser」の順に処理 (認証前 body parse を避ける)
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
+    // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理
+    if (normalizedPath.startsWith('/apps/easy-ship/ext-api')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -708,6 +712,15 @@ const apps = [
     description: 'Notionカンバン置き換え。ピッキング・梱包の作業時間をボタン操作で自動計測',
     icon: '🏭',
     path: '/apps/shipping-work',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
+    id: 'easy-ship',
+    name: '梱包サイズマスター (Easy Ship)',
+    description: 'Amazon Easy Ship画面でSKUごとの梱包サイズを自動選択するChrome拡張のマスター管理',
+    icon: '📦',
+    path: '/apps/easy-ship',
     status: 'active',
     category: 'shipping',
   },
@@ -1245,6 +1258,9 @@ app.use('/apps/inquiry-hub/ai-api', express.json({ limit: '1mb' }), inquiryHubAi
 // limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
 app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/shipping-work', requireAppAccess('shipping-work'), express.json({ limit: '256kb' }), shippingWorkRouter);
+// easy-ship: Chrome拡張向けAPI (x-api-key 認証・fail-closed) はセッション認証付き本体より先に mount
+app.use('/apps/easy-ship/ext-api', easyShipExtRouter);
+app.use('/apps/easy-ship', requireAppAccess('easy-ship'), express.json({ limit: '2mb' }), easyShipRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
   // 監査 2026-07-06 I-43: 従来は 50MB parser が認証より前 + router 内 checkAuth が
