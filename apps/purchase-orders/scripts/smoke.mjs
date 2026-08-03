@@ -49,6 +49,9 @@ db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商�
   VALUES ('run_test', 'set-2pack', '2個セット商品', '', '取扱中', 'セット', 2, 0, 0, 0, 0)`).run();
 insRow.run('gyoumuhandcream60-BI', 'プロ業務用ハンドクリーム 60g 微香', '0002', '取扱中', 3, 195, 178, 55, 258, 24, 1, 1236, 672, '2026-07-01', '2022-02-03');
 insRow.run('diyorangeoil100', '木工用オレンジオイル 100ml', '0001', '取扱中', 1, 1536, 900, 169, 808, 600, 1.5, 698, 270, '2026-06-30', '2021-05-23');
+// 引当済み込み回帰: 総在庫数≠総在庫数_引当なし の行 (誤って旧列を参照すると L=0.5→対象になり検出できる)
+db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数)
+  VALUES ('run_test', 'alloc-item', 'FBA準備で引当済みの商品', '0001', '取扱中', 2, 200, 50, 0, 25, 100, 100, 1.5)`).run();
 
 console.log('── computeProduct (シート数式一致) ──');
 const get = code => computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code));
@@ -70,6 +73,9 @@ const oil = get('diyorangeoil100');
 // L=(1536+900)/808=3.0148>1.5 → 対象外 (シートも空)
 ok(oil.isTarget === false, 'diyorangeoil100 注残込みで対象外', oil.stockMonths);
 ok(stockConstant(1) === 0.5 && stockConstant(1.5) === 1 && stockConstant(2.5) === 2 && stockConstant(4) === 3, '在庫定数 IFS 移植');
+const alloc = get('alloc-item');
+// 引当済み込みの総在庫数を使う: L=200/100=2.0>1.5→対象外 (旧列の引当なし50なら L=0.5→対象になってしまう)
+ok(alloc.stock === 200 && alloc.isTarget === false, 'alloc-item 在庫=総在庫数(引当込み200)で対象外 (引当なし50は使わない)', { stock: alloc.stock, m: alloc.stockMonths });
 
 // ── 2. express 起動 (認証なしで直 mount) ──
 const app = express();
