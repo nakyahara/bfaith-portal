@@ -1829,6 +1829,114 @@ check('店舗内カテゴリ: 0件保存でも everSaved=true (人が外した�
 check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自動適用をtx内で拒否できる)',
   shopCategoriesNeverSaved(db, fdraft.id) === false);
 
+// ─── P2: AI生成の claim/lease + service-api の書き込みガード (2026-08-03、HTTPレベル) ───
+{
+  process.env.PH_SERVICE_TOKEN = 'smoke-token-1234567890';
+  const express = (await import('express')).default;
+  const { serviceApiRouter } = await import('../router.js');
+  const app = express();
+  app.use('/svc', serviceApiRouter);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/svc`;
+  const call = async (method, path, body) => {
+    const res = await fetch(base + path, {
+      method,
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer smoke-token-1234567890' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+
+  // 生成待ちの draft を用意 (材料 = amazon_url + 画像)
+  db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, amazon_url, status)
+    VALUES ('GEN-1', '生成テスト商品', 'smoke', 'https://www.amazon.co.jp/dp/B0GEN1', 'ready_for_ai')`).run();
+  const gdraft = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-1'`).get();
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gen-img-1')`).run(gdraft.id);
+
+  // claim: 取得と排他が1回で行われる
+  let r = await call('POST', '/generation-queue/claim', { run_id: 'runA', limit: 5 });
+  check('P2 claim: ready_for_ai を材料付きで claim できる',
+    r.status === 200 && r.json.drafts.some((d) => d.id === gdraft.id)
+    && r.json.drafts.find((d) => d.id === gdraft.id).amazon_url === 'https://www.amazon.co.jp/dp/B0GEN1',
+    JSON.stringify(r.json).slice(0, 300));
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runB', limit: 5 });
+  check('P2 claim: lease 中は別 run が取れない (二重生成防止)',
+    r.status === 200 && !r.json.drafts.some((d) => d.id === gdraft.id), JSON.stringify(r.json).slice(0, 200));
+
+  // 書き込みガード
+  const SIX = {
+    rakuten_title: 'タイトル', yahoo_title: 'Yahooタイトル', desc_catch: 'キャッチ',
+    desc_features: '特徴', desc_spec: '仕様', desc_notes: '注意',
+  };
+  r = await call('POST', `/drafts/${gdraft.id}/ai-outputs`, { outputs: SIX, advance: true });
+  check('P2 書き込み: run_id なしは 409 (claim していない実行は書けない)', r.status === 409, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft.id}/ai-outputs`, { run_id: 'runB', outputs: SIX, advance: true });
+  check('P2 書き込み: 別 run の claim 中は 409', r.status === 409, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft.id}/ai-outputs`,
+    { run_id: 'runA', outputs: { rakuten_title: 'だけ' }, advance: true });
+  check('P2 書き込み: advance は6項目そろわないと 400 (部分生成で review に進めない)',
+    r.status === 400 && r.json.error.includes('不足'), JSON.stringify(r.json));
+
+  // 人編集済みの項目は AI が上書きしない
+  db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human)
+    VALUES (?, 'desc_notes', '人が書いた注意書き', 1)`).run(gdraft.id);
+  r = await call('POST', `/drafts/${gdraft.id}/ai-outputs`, { run_id: 'runA', outputs: SIX, advance: true });
+  check('P2 書き込み: 6項目+正しいrun_idで review へ進む',
+    r.status === 200 && r.json.advanced === true
+    && db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(gdraft.id).status === 'review',
+    JSON.stringify(r.json));
+  check('P2 書き込み: 人編集済み項目は上書きされない (skipped_human_edited)',
+    (r.json.skipped_human_edited || []).includes('desc_notes')
+    && db.prepare(`SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = 'desc_notes'`).get(gdraft.id).content === '人が書いた注意書き',
+    JSON.stringify(r.json));
+  check('P2 書き込み: 完了後 claim は解放される',
+    db.prepare('SELECT generation_claim_run_id FROM product_drafts WHERE id = ?').get(gdraft.id).generation_claim_run_id == null);
+
+  // review 中への再書き込みは 409 (人のレビュー中を守る)
+  r = await call('POST', `/drafts/${gdraft.id}/ai-outputs`, { run_id: 'runA', outputs: SIX });
+  check('P2 書き込み: review 中の draft へは 409 (人のレビューを上書きしない)', r.status === 409, JSON.stringify(r.json));
+
+  // lease 切れの回収 + release
+  db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai' WHERE id = ?`).run(gdraft.id);
+  await call('POST', '/generation-queue/claim', { run_id: 'runC', limit: 5 });
+  db.prepare(`UPDATE product_drafts SET generation_claim_until = '2000-01-01T00:00:00Z' WHERE id = ?`).run(gdraft.id);
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runD', limit: 5 });
+  check('P2 claim: lease が切れたらハングした実行から取り戻せる',
+    r.status === 200 && r.json.drafts.some((d) => d.id === gdraft.id), JSON.stringify(r.json).slice(0, 200));
+  r = await call('POST', `/drafts/${gdraft.id}/release`, { run_id: 'runD', reason: 'smoke' });
+  check('P2 release: run_id 一致で解放できる', r.status === 200 && r.json.released === true, JSON.stringify(r.json));
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runE', limit: 5 });
+  check('P2 release 後: 次の実行がすぐ拾える', r.json.drafts.some((d) => d.id === gdraft.id));
+
+  // 書き込み直前のレース (Codex R2 high): 事前チェック後に claim が奪われた状況を
+  // acquireGenerationWriteLock 直叩きで再現 — 条件を満たさない限り false = 1バイトも書かれない
+  // (gdraft は直前のテストで runE が claim 済み)
+  check('P2 原子性: 正しい run は書き込み権を取れて lease も延長される',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runE') === true);
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runG' WHERE id = ?`).run(gdraft.id);
+  check('P2 原子性: claim を奪われた旧 run は書き込み権を取れない (旧runが新runの結果を上書きできない)',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runE') === false);
+  db.prepare(`UPDATE product_drafts SET generation_claim_until = '2000-01-01T00:00:00Z' WHERE id = ?`).run(gdraft.id);
+  check('P2 原子性: lease 失効後も書き込み権を取れない',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runG') === false);
+
+  // claim 応答の欠落防止 (Codex R2 medium): 他 run が lease 中の draft が多数あっても、
+  // 新しく claim できた draft は必ず応答に含まれる (一覧の LIMIT に依存しない ids 直接取得)
+  db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = 'runH',
+    generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft.id);
+  db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, amazon_url, status)
+    VALUES ('GEN-2', '生成テスト2', 'smoke', 'https://www.amazon.co.jp/dp/B0GEN2', 'ready_for_ai')`).run();
+  const gdraft2 = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-2'`).get();
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runI', limit: 5 });
+  check('P2 claim応答: 他runがlease中でも、自分がclaimしたdraftは必ず材料付きで返る',
+    r.json.drafts.some((d) => d.id === gdraft2.id) && !r.json.drafts.some((d) => d.id === gdraft.id),
+    JSON.stringify(r.json).slice(0, 200));
+
+  // 後始末
+  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id IN (?, ?)`).run(gdraft.id, gdraft2.id);
+  server.close();
+}
+
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
     title: 't', displayName: 'smoke',

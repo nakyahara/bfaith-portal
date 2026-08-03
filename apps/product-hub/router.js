@@ -14,6 +14,7 @@ import crypto from 'crypto';
 
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
+  claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -1369,19 +1370,55 @@ export const serviceApiRouter = express.Router();
 serviceApiRouter.use(express.json({ limit: '1mb' }));
 serviceApiRouter.use(requireServiceToken);
 
-// 生成待ち一覧 (AI 生成の材料つき)
+// 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
 serviceApiRouter.get('/generation-queue', (req, res) => {
   const db = getDB();
   res.json({ ok: true, drafts: listGenerationQueue(db) });
 });
 
+// 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
+// 取得と排他を1回で行う: ready_for_ai かつ 未claim/lease切れ の draft を run_id で押さえて材料付きで返す。
+// 定期実行と手動、前夜のハングした実行が同じ draft を二重生成するのを防ぐ (lease 30分)
+serviceApiRouter.post('/generation-queue/claim', (req, res) => {
+  const runId = cleanText(req.body?.run_id, 100);
+  if (!runId) return res.status(400).json({ ok: false, error: 'run_id が必要です (例: 20260803-2200-a1b2)' });
+  let limit = Number.parseInt(req.body?.limit, 10);
+  if (!Number.isInteger(limit) || limit < 1) limit = 2;
+  if (limit > 10) limit = 10;   // 1回の実行で押さえられる上限 (Codex: サーバー側上限)
+  const db = getDB();
+  const r = claimGenerationDrafts(db, runId, { limit });
+  for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
+    logEvent(db, d.id, 'generation_claimed', runId, 'service-api');
+  }
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
+});
+
+// claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)
+serviceApiRouter.post('/drafts/:id/release', (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  const runId = cleanText(req.body?.run_id, 100);
+  if (!Number.isInteger(id) || id <= 0 || !runId) {
+    return res.status(400).json({ ok: false, error: 'draft id と run_id が必要です' });
+  }
+  const db = getDB();
+  const released = releaseGenerationClaim(db, id, runId);
+  if (released) logEvent(db, id, 'generation_released', `${runId}: ${cleanText(req.body?.reason, 300) || '理由未記載'}`, 'service-api');
+  res.json({ ok: true, released });
+});
+
 // AI 生成結果の一括書き戻し + status ready_for_ai → review
-// body: { outputs: { rakuten_title: "...", yahoo_title: "...", desc_catch: ... }, model_note?, advance? }
+// body: { run_id, outputs: { rakuten_title: "...", ... }, model_note?, advance? }
+// ⚠️ run_id 必須 (claim 済みの実行だけが書ける)。status が ready_for_ai でなければ 409
+//    (人がレビュー中の文章への上書き防止 — Codex設計相談 Critical/High 対応)
 serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   const db = getDB();
   const draft = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id) : null;
   if (!draft) return res.status(404).json({ ok: false, error: 'draft not found' });
+
+  const runId = cleanText(req.body?.run_id, 100);
+  const claimErr = generationClaimError(draft, runId);
+  if (claimErr) return res.status(409).json({ ok: false, error: claimErr });
 
   const outputs = req.body?.outputs;
   if (!outputs || typeof outputs !== 'object' || Array.isArray(outputs)) {
@@ -1402,11 +1439,26 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
     return res.status(400).json({ ok: false, error: 'outputs が空です' });
   }
   const wantAdvance = req.body?.advance === true; // truthy でなく厳密比較 (Codex R1 high)
+  // review へ進めるのは6項目そろったときだけ (Codex: 部分生成は原則書かない。
+  // advance=false での部分保存は再生成・試運転用に許す)
+  if (wantAdvance) {
+    const missing = AI_OUTPUT_KINDS.filter((k) => !cleaned[k]);
+    if (missing.length > 0) {
+      return res.status(400).json({ ok: false, error: `advance には全${AI_OUTPUT_KINDS.length}項目が必要です (不足: ${missing.join(', ')})` });
+    }
+  }
   const modelNote = cleanText(req.body?.model_note, 200);
 
   const write = db.transaction(() => {
+    // 書き込み権の原子的な再取得 (Codex R2 high): 事前チェックと書き込みの間に
+    // lease切れ・再claimが起きていたら、1バイトも書かずに中断する
+    if (!acquireGenerationWriteLock(db, id, runId)) {
+      return { conflict: true };
+    }
+    const skippedHumanEdited = [];
     for (const [kind, content] of Object.entries(cleaned)) {
-      db.prepare(`
+      // 人が編集済みの項目は AI で上書きしない (Codex: 人編集の保護)
+      const info = db.prepare(`
         INSERT INTO draft_ai_outputs (draft_id, kind, content, generated_at, model_note, edited_by_human)
         VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, 0)
         ON CONFLICT(draft_id, kind) DO UPDATE SET
@@ -1414,23 +1466,35 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
           generated_at = excluded.generated_at,
           model_note = excluded.model_note,
           edited_by_human = 0
+        WHERE draft_ai_outputs.edited_by_human = 0
       `).run(id, kind, content, modelNote);
+      if (info.changes === 0) skippedHumanEdited.push(kind);
     }
-    logEvent(db, id, 'ai_generated', Object.keys(cleaned).join(','), 'service-api');
+    logEvent(db, id, 'ai_generated', `${runId}: ${Object.keys(cleaned).join(',')}`, 'service-api');
     // CAS: changes を見て実際に遷移した時だけ advanced/ログ (Codex R1 medium: 監査ログを嘘にしない)
     let advanced = false;
     if (wantAdvance) {
       const info = db.prepare(`
         UPDATE product_drafts SET status = 'review', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ? AND status = 'ready_for_ai'
-      `).run(id);
+        WHERE id = ? AND status = 'ready_for_ai' AND generation_claim_run_id = ?
+      `).run(id, runId);
       if (info.changes === 1) {
         logEvent(db, id, 'status_changed', 'ready_for_ai -> review (ai_generated)', 'service-api');
         advanced = true;
       }
     }
-    return advanced;
+    // 書き終えたら claim は解放 (成功・部分保存どちらも。以降の再claimを妨げない)
+    releaseGenerationClaim(db, id, runId);
+    return { advanced, skippedHumanEdited };
   });
-  const advanced = write();
-  res.json({ ok: true, written: Object.keys(cleaned).length, advanced });
+  const r = write();
+  if (r.conflict) {
+    return res.status(409).json({ ok: false, error: 'claim が失効しています (別の実行が引き継いだ可能性)。何も書き込んでいません' });
+  }
+  res.json({
+    ok: true,
+    written: Object.keys(cleaned).length - r.skippedHumanEdited.length,
+    skipped_human_edited: r.skippedHumanEdited.length ? r.skippedHumanEdited : undefined,
+    advanced: r.advanced,
+  });
 });
