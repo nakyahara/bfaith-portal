@@ -1959,6 +1959,23 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   check('composeDescriptions: pc に特徴/仕様が入り sales に画像HTML・sp が連結',
     comp.pc.includes('F') && comp.pc.includes('S') && comp.sales.includes('/x/a.jpg')
     && comp.sp === comp.sales + '\n' + comp.pc, JSON.stringify(comp).slice(0, 200));
+
+  // XSS境界 (Codexレビュー提案): 3欄は画面で innerHTML レンダリングされるため、
+  // 素材にHTML/属性注入が混ざっても生成関数がすべてエスケープすることを固定する
+  const evil = composeDescriptions({
+    title: '<script>alert(1)</script>',
+    ai: { desc_features: '<img src=x onerror=alert(2)>', desc_notes: '</td><script>alert(3)</script>' },
+    specs: [{ spec_key: '<b>鍵</b>', spec_value: '"onmouseover="alert(4)' }],
+    pageInfo: null, shippingLabel: null,
+    cabinetLocations: ['/dir/"onerror="alert(5)/a.jpg'],
+  });
+  check('XSS境界: PC欄で素材の生タグが実行形で出ない (全てエスケープ)',
+    !evil.pc.includes('<script>') && !evil.pc.includes('<img src=x')
+    && !evil.pc.includes('<b>鍵</b>') && evil.pc.includes('&lt;script&gt;')
+    && evil.pc.includes('&lt;img src=x onerror=alert(2)&gt;'),
+    evil.pc.slice(0, 300));
+  check('XSS境界: 販売説明文の画像URLは属性エスケープされ src が閉じない',
+    !evil.sales.includes('"onerror="'), evil.sales.slice(0, 300));
 }
 
 const renders = [
