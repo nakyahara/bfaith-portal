@@ -390,6 +390,14 @@ export function initProductHubDB() {
   if (!draftCols.has('own_brand')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN own_brand INTEGER NOT NULL DEFAULT 0 CHECK (own_brand IN (0, 1))');
   }
+  // P2 (2026-08-03): AI生成の取り合い防止 (claim/lease)。
+  // 定期実行と手動、あるいは前夜のハングした実行が同じ draft を二重生成しないため (Codex設計相談 Critical)
+  if (!draftCols.has('generation_claim_run_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_claim_run_id TEXT');
+  }
+  if (!draftCols.has('generation_claim_until')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_claim_until TEXT');
+  }
   // Notion 取り込み (テスト検証用)。source='notion_import' の行は Notion 側が正であり、
   // ポータルから Notion へ書き戻してはならない (既存カードの破壊防止 — notion-card.js のガード参照)。
   //   注意: ALTER で足す列に CHECK は付けられない。そのため書き戻し判定は canWriteToNotion の
@@ -651,6 +659,62 @@ export function listGenerationQueue(db, { limit = 50 } = {}) {
     yahoo: yahooStmt.get(d.id) || null,
     image_count: imgStmt.get(d.id).c,
   }));
+}
+
+// ─── P2: AI生成の claim/lease (2026-08-03、Codex設計相談の Critical/High 対応) ───
+
+export const GENERATION_LEASE_MINUTES = 30;
+
+/**
+ * 生成待ち draft を run_id で claim して材料付きで返す (取得と排他を1回で)。
+ * 対象 = status='ready_for_ai' かつ (未claim or lease切れ)。CAS UPDATE の changes=1 だけ採用。
+ * ハングした実行の claim は lease (30分) が切れれば別 run が取り直せる。
+ */
+export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
+  const now = new Date().toISOString();
+  const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  const candidates = db.prepare(`
+    SELECT id FROM product_drafts
+    WHERE status = 'ready_for_ai'
+      AND (generation_claim_until IS NULL OR generation_claim_until < ?)
+    ORDER BY updated_at ASC LIMIT ?
+  `).all(now, limit);
+  const claimed = [];
+  for (const c of candidates) {
+    const info = db.prepare(`
+      UPDATE product_drafts SET generation_claim_run_id = ?, generation_claim_until = ?
+      WHERE id = ? AND status = 'ready_for_ai'
+        AND (generation_claim_until IS NULL OR generation_claim_until < ?)
+    `).run(runId, until, c.id, now);
+    if (info.changes === 1) claimed.push(c.id);
+  }
+  if (claimed.length === 0) return { claimed: [], leaseUntil: until };
+  const queue = listGenerationQueue(db, { limit: 200 }).filter((d) => claimed.includes(d.id));
+  return { claimed: queue, leaseUntil: until };
+}
+
+/**
+ * 書き込み前の claim 検証 (Codex: claimしていない draft には書けないこと)。
+ * @returns {null | string} null = OK / それ以外 = 拒否理由
+ */
+export function generationClaimError(draft, runId) {
+  if (!runId) return 'run_id が必要です (先に claim してください)';
+  if (draft.status !== 'ready_for_ai') {
+    return `status が ready_for_ai ではありません (${draft.status})。人がレビュー中の可能性があるため書き込みません`;
+  }
+  if (draft.generation_claim_run_id !== runId) return 'この draft は別の実行が claim しています';
+  if (!draft.generation_claim_until || draft.generation_claim_until < new Date().toISOString()) {
+    return 'claim の有効期限が切れています (claim し直してください)';
+  }
+  return null;
+}
+
+/** claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)。run_id 一致時のみ */
+export function releaseGenerationClaim(db, draftId, runId) {
+  return db.prepare(`
+    UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL
+    WHERE id = ? AND generation_claim_run_id = ?
+  `).run(draftId, runId).changes === 1;
 }
 
 /**
