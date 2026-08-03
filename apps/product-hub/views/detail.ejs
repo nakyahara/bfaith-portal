@@ -754,7 +754,7 @@
       <button class="btn btn-primary" id="pi-save-btn">ページ表記を保存</button>
       <button class="btn" id="pi-preview-btn">掲載HTMLを確認</button>
       <button class="btn" id="pi-copy-btn">HTMLをコピー</button>
-      <span class="muted" id="pi-result"></span>
+      <span class="muted" id="pi-result">入力は自動で保存されます (入力が止まって約1秒後)</span>
     </div>
     <div id="pi-warnings" style="margin-top:8px;"></div>
     <div id="pi-preview" style="display:none; margin-top:10px; border:1px solid #e2e8f0; border-radius:8px; padding:10px; background:#fff; overflow:auto; max-height:400px;"></div>
@@ -1963,9 +1963,23 @@
 
     const result = document.getElementById('pi-result');
     const warnBox = document.getElementById('pi-warnings');
-    async function savePageInfo() {
-      const json = await post(BASE + '/page-info', collect());
-      if (!json.ok) { alert(json.error || '保存に失敗しました'); return null; }
+    // 最後に保存へ送った内容 (差分が無ければ自動保存は送らない)
+    let piSavedSnapshot = JSON.stringify(collect());
+    async function savePageInfo(opts = {}) {
+      const body = collect();
+      const json = await post(BASE + '/page-info', body);
+      if (!json.ok) {
+        // 自動保存の失敗は alert で作業を止めない (次の入力/手動保存で再試行される)
+        if (opts.silent) {
+          result.style.color = '#dc2626';
+          result.textContent = '自動保存に失敗しました — 「ページ表記を保存」で再試行してください';
+          return null;
+        }
+        alert(json.error || '保存に失敗しました');
+        return null;
+      }
+      piSavedSnapshot = JSON.stringify(body);
+      result.style.color = '';
       document.getElementById('pi-html-src').value = json.html || '';
       warnBox.replaceChildren();
       if (json.warnings && json.warnings.length) {
@@ -1977,6 +1991,42 @@
       }
       return json;
     }
+
+    // ─── 自動保存: 入力停止1秒後 (セレクトは即時)。保存中の再変更は完了後にもう1回 ───
+    let piTimer = null;
+    let piSaving = false;
+    let piDirtyAgain = false;
+    async function autoSavePageInfo() {
+      if (piSaving) { piDirtyAgain = true; return; }
+      if (JSON.stringify(collect()) === piSavedSnapshot) return;
+      piSaving = true;
+      try {
+        const j = await savePageInfo({ silent: true });
+        if (j) {
+          result.textContent = '自動保存しました'
+            + (j.warnings.length ? ' (必須の不足あり)' : '')
+            + ' ' + new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+          updateTabBadges();
+        }
+      } finally {
+        piSaving = false;
+        if (piDirtyAgain) { piDirtyAgain = false; autoSavePageInfo(); }
+      }
+    }
+    function schedulePiAutoSave(delayMs) {
+      clearTimeout(piTimer);
+      piTimer = setTimeout(autoSavePageInfo, delayMs);
+    }
+    const piPanel = document.getElementById('tab-info');
+    piPanel.addEventListener('input', () => schedulePiAutoSave(1000));
+    piPanel.addEventListener('change', () => schedulePiAutoSave(0));
+    // タブを閉じる/離れるときに未保存分を送る (応答は見ない best-effort)
+    window.addEventListener('pagehide', () => {
+      const snap = JSON.stringify(collect());
+      if (snap === piSavedSnapshot || !navigator.sendBeacon) return;
+      try { navigator.sendBeacon(BASE + '/page-info', new Blob([snap], { type: 'application/json' })); } catch (_) { /* best-effort */ }
+    });
+
     document.getElementById('pi-save-btn').addEventListener('click', async () => {
       const j = await savePageInfo();
       if (j) result.textContent = j.warnings.length ? '保存しました (必須の不足あり)' : '保存しました';
