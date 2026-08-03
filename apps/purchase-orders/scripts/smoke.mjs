@@ -35,7 +35,7 @@ const db = getDB();
 db.prepare(`INSERT INTO mirror_pml_published (id, run_id, status, as_of_date, synced_at) VALUES (1, 'run_test', 'ok', ?, ?)`)
   .run(new Date(Date.now() - 86400000).toISOString().slice(0, 10), new Date().toISOString());
 const insRow = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
-  (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+  (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
   VALUES ('run_test', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
 // 実スプレッドシートの行を fixture 化 (発注量の期待値はシート実値)
 insRow.run('noflyersticker', 'チラシ お断り ステッカー', '0001', '取扱中', 2, 490, 0, 46, 368, 100, 1.5, 380, 70, '2026-07-02', '2020-05-24');
@@ -45,7 +45,7 @@ insRow.run('deaditem', '休眠商品', '0001', '取扱中', 2, 50, 0, 0, 0, 100,
 insRow.run('teishi-item', '取扱中止商品', '0001', '取扱中止', 2, 0, 0, 0, 10, 100, 1.5, 500, 200, '2025-01-01', '2020-01-01');
 insRow.run('horikoshi-item', '掘り起こし対象商品', '0001', '取扱中', 2, 0, 0, 0, 0, 100, 1.5, 500, 200, '2025-01-01', '2020-01-01');
 // セット商品 (商品区分='セット') は全リスト対象外
-db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 商品区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 商品区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計)
   VALUES ('run_test', 'set-2pack', '2個セット商品', '', '取扱中', 'セット', 2, 0, 0, 0, 0)`).run();
 insRow.run('gyoumuhandcream60-BI', 'プロ業務用ハンドクリーム 60g 微香', '0002', '取扱中', 3, 195, 178, 55, 258, 24, 1, 1236, 672, '2026-07-01', '2022-02-03');
 insRow.run('diyorangeoil100', '木工用オレンジオイル 100ml', '0001', '取扱中', 1, 1536, 900, 169, 808, 600, 1.5, 698, 270, '2026-06-30', '2021-05-23');
@@ -230,7 +230,7 @@ db.prepare(`UPDATE mirror_pml_snapshot_rows SET 取扱区分='取扱中' WHERE �
 await j('/api/supplier/1/draft', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: [] }) });
 
 console.log('── NEオーバーレイ (手動CSV) ──');
-// NE商品マスタCSV (実ヘッダー準拠)。noflyersticker: 在庫100 / 注残50 に更新 → 総在庫_引当なし=100+FBA(20)=120
+// NE商品マスタCSV (実ヘッダー準拠)。noflyersticker: 在庫100 / 注残50 に更新 → 総在庫=100+FBA(20)=120
 db.prepare(`UPDATE mirror_pml_snapshot_rows SET FBA在庫数=20 WHERE 商品コード='noflyersticker'`).run();
 const neCsv = '"商品コード","商品名","仕入先コード","原価","売価","取扱区分","代表商品コード","ロケーションコード","配送業者","発注ロット単位","最終仕入日","商品分類タグ","作成日","在庫数","引当数","最終更新日","消費税率（%）","発注残数"\r\n' +
   '"noflyersticker","チラシ お断り","0001","75.00","380.00","取扱中","","","","100","2026-07-04 12:00:00","","2020-05-24","100","0","2026-07-04 15:00:00","10","50"\r\n' +
@@ -2212,7 +2212,7 @@ console.log('── 注残SSoT (正本ビュー/GAS endpoint差替/商品管理�
   r = await j('/api/ledger/integrity');
   ok((r.body.warnings || []).some(w => w.kind === 'backorder_not_in_pml' && w.productKey === 'cardstand-silver-r'),
     'SSoT: PMLに無い台帳注残は警告 (backorder_not_in_pml)', (r.body.warnings || []).filter(w => w.kind === 'backorder_not_in_pml'));
-  insRow.run(savedRow.商品コード, savedRow.商品名, savedRow.仕入先, savedRow.取扱区分, savedRow.売上分類, savedRow.総在庫数_引当なし,
+  insRow.run(savedRow.商品コード, savedRow.商品名, savedRow.仕入先, savedRow.取扱区分, savedRow.売上分類, savedRow.総在庫数,
     savedRow.注残数, savedRow.販売数7日_合計, savedRow.販売数30日_合計, savedRow.発注ロット単位, savedRow.推奨保有月数,
     savedRow.売価, savedRow.原価, savedRow.最終仕入日, savedRow.登録日);
   db.prepare("UPDATE mirror_pml_snapshot_rows SET 注残数=0 WHERE 商品コード='noflyersticker'").run(); // ゾンビ値を戻す
@@ -2820,7 +2820,7 @@ console.log('── サロンジェ PO参照 (po_reference) ──');
   r = await jpS('/api/masters/suppliers', { supplier_code: '0107', name: 'サロンジェ', order_memo: '' });
   ok(r.status === 200 && r.body.ok, 'salonge: 仕入先マスタ登録 (0107→107)');
   const insSal = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
-    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
     VALUES ('run_test', ?, ?, '0107', '取扱中', 3, 100, 0, 7, 30, 10, 1.5, 800, ?, '2026-07-01', '2024-01-01')`);
   insSal.run('sal-towel3p', '16502 KBミニタオル3P', 300);
   insSal.run('sal-apron110', 'まいぜん子供エプロン110', 500);
@@ -3604,7 +3604,7 @@ console.log('── P17 欠品リスク ──');
 {
   const jstD = n => new Date(Date.now() + 9 * 3600000 + n * 86400000).toISOString().slice(0, 10);
   const insSr = db.prepare(`INSERT INTO mirror_pml_snapshot_rows
-    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
+    (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価, 最終仕入日, 登録日)
     VALUES ('run_test', ?, ?, '0001', '取扱中', 2, ?, 0, ?, ?, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01')`);
   // 加重日販は全て 70/7×0.5 + 300/30×0.5 = 10/日
   insSr.run('sr-high-item', '欠品ハイ (入荷が間に合わない)', 20, 70, 300);      // 2日分 → 欠品、入荷は10日後
@@ -3815,9 +3815,9 @@ console.log('── 商品紐付け: 全商品既定表示+フィルタ維持 �
   ok(ghost && ghost.linked === true && ghost.pmlMissing === true, 'attrs: PML外の紐付け済み商品はpmlMissingで残す', ghost && ghost.pmlMissing);
   ok(r.body.rows.every((x, i, a) => i === 0 || a[i - 1].product_key <= x.product_key), 'attrs: 商品コード順 (バイナリ順)');
   // PMLに同一コードが「取扱中止→取扱中」の順で重複していても取扱中を採用 (行順依存で消えない)
-  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計)
     VALUES ('run_test', 'dup-case-item', '重複コード旧', '0001', '取扱中止', 2, 0, 0, 0, 0)`).run();
-  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計)
+  db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計)
     VALUES ('run_test', 'DUP-CASE-ITEM', '重複コード新', '0001', '取扱中', 2, 5, 0, 0, 0)`).run();
   r = await j('/api/masters/attrs');
   const dup = r.body.rows.find(x => x.product_key === 'dup-case-item');
