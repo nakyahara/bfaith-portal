@@ -7,6 +7,7 @@
  * - SKUの一意性は照合設定に関わらず常に大小無視 (DBの LOWER(sku) 一意インデックス)
  */
 import { getDB, utcNow } from './db.js';
+import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { CSV_COLUMNS, CsvParseError, parseCsv, parseCsvBool, sanitizeExcelCell, toCsv } from './csv.js';
 
 export class EsError extends Error {
@@ -160,6 +161,49 @@ export function bulkLookup(skus) {
 
 // ---------- 管理 (CRUD) ----------
 
+/**
+ * SKU→商品名の解決 (warehouse-mirror の mirror_products。easy-shipのSKUは基本NE商品コード)。
+ * 表示専用の付加情報のため fail-soft: mirror未初期化・照会失敗時は空Mapを返し一覧表示を止めない。
+ * Amazon別名SKU (商品コードと不一致) は見つからず null 表示になる (仕様)。
+ */
+function productNamesFor(skus) {
+  const out = new Map();
+  const codes = [...new Set(skus.map((s) => str(s).trim().toLowerCase()).filter(Boolean))];
+  if (codes.length === 0) return out;
+  try {
+    const ph = codes.map(() => '?').join(',');
+    const rows = getMirrorDB()
+      .prepare(
+        `SELECT lower(trim(商品コード)) AS code, 商品名 AS name
+           FROM mirror_products
+          WHERE lower(trim(商品コード)) IN (${ph})`,
+      )
+      .all(...codes);
+    for (const r of rows) out.set(r.code, r.name ?? null);
+  } catch {
+    // mirror未初期化 (テスト等)・スキーマ差異は無視 (商品名なしで一覧は成立する)
+  }
+  return out;
+}
+
+/** 商品名の部分一致で mirror_products から商品コード (lower) を引く。fail-soft で空配列 */
+function productCodesByName(q) {
+  try {
+    // LIKEのワイルドカードを literal 化 (packing-dispatch searchRules と同方式)
+    const safe = q.replace(/[\\%_]/g, '\\$&').toLowerCase();
+    return getMirrorDB()
+      .prepare(
+        `SELECT lower(trim(商品コード)) AS code FROM mirror_products
+          WHERE lower(trim(商品名)) LIKE ? ESCAPE '\\' AND 商品コード IS NOT NULL
+          LIMIT 500`,
+      )
+      .all(`%${safe}%`)
+      .map((r) => r.code);
+  } catch {
+    return [];
+  }
+}
+
 export function listMaster(query = {}) {
   const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
   const perPage = Math.min(100, Math.max(1, Number.parseInt(query.perPage, 10) || 50));
@@ -171,8 +215,18 @@ export function listMaster(query = {}) {
   const where = [];
   const params = [];
   if (q) {
-    where.push('sku LIKE ? COLLATE NOCASE');
-    params.push(`%${q}%`);
+    // SKU部分一致に加え、商品名部分一致 (mirror_products) でもヒットさせる。
+    // LIKEワイルドカード (% _ \) は literal 化し、商品名検索側と semantics を揃える
+    const safeQ = q.replace(/[\\%_]/g, '\\$&');
+    const nameCodes = productCodesByName(q);
+    if (nameCodes.length > 0) {
+      const ph = nameCodes.map(() => '?').join(',');
+      where.push(`(sku COLLATE NOCASE LIKE ? ESCAPE '\\' OR lower(trim(sku)) IN (${ph}))`);
+      params.push(`%${safeQ}%`, ...nameCodes);
+    } else {
+      where.push(`sku COLLATE NOCASE LIKE ? ESCAPE '\\'`);
+      params.push(`%${safeQ}%`);
+    }
   }
   if (active !== 'all') {
     where.push('is_active = ?');
@@ -189,6 +243,11 @@ export function listMaster(query = {}) {
     )
     .all(...params, perPage, (page - 1) * perPage)
     .map(rowToApi);
+  // 表示用の商品名を付与 (見つからないSKUは null)
+  const names = productNamesFor(items.map((i) => i.sku));
+  for (const item of items) {
+    item.productName = names.get(item.sku.trim().toLowerCase()) ?? null;
+  }
   return { items, total, page, perPage };
 }
 
