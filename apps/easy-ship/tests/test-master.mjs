@@ -132,9 +132,44 @@ svc.createMaster({ sku: 'aaa-001', packageSizeCode: 'X', packageSizeLabel: 'Y' }
 svc.createMaster({ sku: 'aaa-002', packageSizeCode: 'X', packageSizeLabel: 'Y', isActive: false }, 'a');
 svc.createMaster({ sku: 'bbb-001', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a');
 ok(svc.listMaster({ q: 'AAA' }).total === 2, '一覧の検索は大小無視の部分一致');
+// LIKE特殊文字は literal として扱う
+svc.createMaster({ sku: 'esc_1', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a');
+svc.createMaster({ sku: 'escX1', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a');
+svc.createMaster({ sku: 'esc%2', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a');
+ok(svc.listMaster({ q: 'esc_1' }).total === 1, "SKU検索の '_' はワイルドカードにならない");
+ok(svc.listMaster({ q: 'esc%' }).total === 1, "SKU検索の '%' はワイルドカードにならない");
+ok(svc.listMaster({ q: 'esc\\' }).total === 0, "SKU検索の '\\' はエスケープとして誤爆しない");
 ok(svc.listMaster({ q: 'aaa', active: 'true' }).total === 1, '有効フィルター');
 const paged = svc.listMaster({ perPage: '2', page: '2', sort: 'sku', order: 'asc' });
 ok(paged.items.length === 2 && paged.items[0].sku === 'bbb-001', 'ページネーション+SKU順');
+
+// --- 商品名の付与 (mirror_products) ---
+// mirror未初期化の間は fail-soft で productName=null (一覧自体は成立する)
+ok(
+  svc.listMaster({ q: 'aaa-001' }).items[0].productName === null,
+  'mirror未初期化でも一覧が返り productName は null',
+);
+{
+  const mirrorMod = await import(pathToFileURL(path.join(repo, 'apps/warehouse-mirror/db.js')));
+  mirrorMod.initMirrorDB();
+  mirrorMod
+    .getMirrorDB()
+    .prepare(
+      'INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES (?, ?, ?, ?, ?)',
+    )
+    .run('AAA-001', '七色 お風呂のせっけん 柿渋', '通常', '確定', '2026-08-04T00:00:00Z');
+  ok(
+    svc.listMaster({ q: 'aaa-001' }).items[0].productName === '七色 お風呂のせっけん 柿渋',
+    '商品名が mirror_products から付与される (コードの大小文字差も吸収)',
+  );
+  ok(svc.listMaster({ q: 'bbb-001' }).items[0].productName === null, 'mirrorに無いSKUは productName null');
+  const byName = svc.listMaster({ q: 'せっけん' });
+  ok(
+    byName.total === 1 && byName.items[0].sku === 'aaa-001',
+    '商品名の部分一致でも検索できる',
+  );
+  ok(svc.listMaster({ q: '存在しない商品名zzz' }).total === 0, '商品名も一致しなければ0件');
+}
 
 // --- 拡張ログ ---
 svc.addExtLogs([

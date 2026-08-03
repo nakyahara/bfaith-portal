@@ -58,7 +58,7 @@
   <div class="es-wrap">
     <div class="card">
       <div class="toolbar">
-        <input type="text" id="q" placeholder="SKUで検索">
+        <input type="text" id="q" placeholder="SKU・商品名で検索">
         <button class="btn" id="btn-search">検索</button>
         <select id="active">
           <option value="all">すべて</option>
@@ -79,7 +79,7 @@
       <table class="es-table">
         <thead>
           <tr>
-            <th>SKU</th><th>コード</th><th>梱包サイズ名</th><th>Amazon option value</th>
+            <th>SKU</th><th>商品名</th><th>コード</th><th>梱包サイズ名</th><th>Amazon option value</th>
             <th>状態</th><th>備考</th><th>更新日時</th><th>操作</th>
           </tr>
         </thead>
@@ -177,6 +177,7 @@
         for (const r of data.items) {
           const tr = document.createElement('tr');
           tr.appendChild(td(r.sku, 'mono'));
+          tr.appendChild(td(r.productName ?? '', r.productName ? '' : 'muted'));
           tr.appendChild(td(r.packageSizeCode));
           tr.appendChild(td(r.packageSizeLabel));
           tr.appendChild(td(r.amazonOptionValue || '(未設定)', 'mono'));
@@ -207,7 +208,7 @@
         if (data.items.length === 0) {
           const tr = document.createElement('tr');
           const cell = td('データがありません', 'muted');
-          cell.colSpan = 8;
+          cell.colSpan = 9;
           tr.appendChild(cell);
           tbody.appendChild(tr);
         }
