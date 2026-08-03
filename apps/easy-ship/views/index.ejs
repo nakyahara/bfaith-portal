@@ -72,8 +72,8 @@
         <span style="flex:1"></span>
         <button class="btn primary" id="btn-new">新規登録</button>
         <button class="btn green" id="btn-import">CSVインポート</button>
-        <a class="btn" href="./api/export" title="再インポートに使える形式 (データそのまま)">CSVエクスポート</a>
-        <a class="btn link" href="./api/export?excel=1" title="Excelで開く用 (数式対策の ' 前置。再インポート不可)">Excel閲覧用</a>
+        <a class="btn" href="/apps/easy-ship/api/export" title="再インポートに使える形式 (データそのまま)">CSVエクスポート</a>
+        <a class="btn link" href="/apps/easy-ship/api/export?excel=1" title="Excelで開く用 (数式対策の ' 前置。再インポート不可)">Excel閲覧用</a>
       </div>
       <div id="list-msg" class="msg"></div>
       <table class="es-table">
@@ -135,7 +135,7 @@
   </dialog>
 
   <script>
-    const API = './api';
+    const API = '/apps/easy-ship/api';
     const $ = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? '');
     let page = 1;
