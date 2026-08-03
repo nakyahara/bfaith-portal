@@ -257,7 +257,7 @@ function computeProductRisk(p, pmlRow, today, settings) {
       predictionReason, reason: predictionReason + procurementText(base, settings) };
   }
 
-  const stock = num(pmlRow['総在庫数_引当なし']);
+  const stock = num(pmlRow['総在庫数']); // 引当済み含む (発注計算と同じ基準。logic.js参照)
   const s7 = num(pmlRow['販売数7日_合計']);
   const s30 = num(pmlRow['販売数30日_合計']);
   const d7 = s7 / 7, d30 = s30 / 30;

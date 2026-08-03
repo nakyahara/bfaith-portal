@@ -4248,7 +4248,7 @@ function membersTable(k, selfCode) {
 function accHtml(p) {
   var h = '<div class="accbox">';
   h += '<div class="kv">' +
-    kvHtml('在庫(引当なし) ', numFmt(p.stock)) + kvHtml('注残 ', numFmt(p.backOrder)) +
+    kvHtml('在庫(引当込み) ', numFmt(p.stock)) + kvHtml('注残 ', numFmt(p.backOrder)) +
     kvHtml('7日販売 ', numFmt(p.sales7)) + kvHtml('30日販売 ', numFmt(p.sales30)) +
     kvHtml('在庫月数 ', months(p)) + kvHtml('推奨保有月数 ', p.holdMonths != null ? p.holdMonths : '—') +
     kvHtml('ロット ', p.lot || '—') + kvHtml('原価 ', p.cost ? yen(p.cost) : '—') + kvHtml('売価 ', p.price ? yen(p.price) : '—') +
