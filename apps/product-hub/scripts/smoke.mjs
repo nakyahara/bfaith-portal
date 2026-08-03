@@ -1908,8 +1908,32 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   r = await call('POST', '/generation-queue/claim', { run_id: 'runE', limit: 5 });
   check('P2 release 後: 次の実行がすぐ拾える', r.json.drafts.some((d) => d.id === gdraft.id));
 
+  // 書き込み直前のレース (Codex R2 high): 事前チェック後に claim が奪われた状況を
+  // acquireGenerationWriteLock 直叩きで再現 — 条件を満たさない限り false = 1バイトも書かれない
+  // (gdraft は直前のテストで runE が claim 済み)
+  check('P2 原子性: 正しい run は書き込み権を取れて lease も延長される',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runE') === true);
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runG' WHERE id = ?`).run(gdraft.id);
+  check('P2 原子性: claim を奪われた旧 run は書き込み権を取れない (旧runが新runの結果を上書きできない)',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runE') === false);
+  db.prepare(`UPDATE product_drafts SET generation_claim_until = '2000-01-01T00:00:00Z' WHERE id = ?`).run(gdraft.id);
+  check('P2 原子性: lease 失効後も書き込み権を取れない',
+    dbmod.acquireGenerationWriteLock(db, gdraft.id, 'runG') === false);
+
+  // claim 応答の欠落防止 (Codex R2 medium): 他 run が lease 中の draft が多数あっても、
+  // 新しく claim できた draft は必ず応答に含まれる (一覧の LIMIT に依存しない ids 直接取得)
+  db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = 'runH',
+    generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft.id);
+  db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, amazon_url, status)
+    VALUES ('GEN-2', '生成テスト2', 'smoke', 'https://www.amazon.co.jp/dp/B0GEN2', 'ready_for_ai')`).run();
+  const gdraft2 = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-2'`).get();
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runI', limit: 5 });
+  check('P2 claim応答: 他runがlease中でも、自分がclaimしたdraftは必ず材料付きで返る',
+    r.json.drafts.some((d) => d.id === gdraft2.id) && !r.json.drafts.some((d) => d.id === gdraft.id),
+    JSON.stringify(r.json).slice(0, 200));
+
   // 後始末
-  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?`).run(gdraft.id);
+  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id IN (?, ?)`).run(gdraft.id, gdraft2.id);
   server.close();
 }
 

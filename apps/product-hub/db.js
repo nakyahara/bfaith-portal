@@ -641,13 +641,20 @@ export function upsertImageProduction(db, draftId, fields) {
  * 返す形: [{ id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url,
  *            reference_urls: [], specs: [{key,value}], yahoo: {...}|null, image_count }]
  */
-export function listGenerationQueue(db, { limit = 50 } = {}) {
+export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
   // amazon_url / asin も返す: ゲートは「公式URL / 参考URL / Amazon URL のどれか」なので
   // Amazon URL だけで通過した draft の参照元がキューから欠けないように (Codex R1 high)
-  const drafts = db.prepare(`
-    SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
-    FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
-  `).all(limit);
+  // ids 指定時はその draft を直接引く (claim 応答用。一覧の LIMIT に依存させない — Codex R2 medium)
+  const drafts = ids
+    ? db.prepare(`
+        SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
+        FROM product_drafts WHERE status = 'ready_for_ai' AND id IN (${ids.map(() => '?').join(',') || 'NULL'})
+        ORDER BY updated_at ASC
+      `).all(...ids)
+    : db.prepare(`
+        SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
+        FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
+      `).all(limit);
   const refStmt = db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id');
   const specStmt = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id');
   const yahooStmt = db.prepare('SELECT yahoo_price, yahoo_price_sagawa, delivery_label, tax_rate, yahoo_category_id, yahoo_path FROM draft_yahoo WHERE draft_id = ?');
@@ -689,8 +696,23 @@ export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
     if (info.changes === 1) claimed.push(c.id);
   }
   if (claimed.length === 0) return { claimed: [], leaseUntil: until };
-  const queue = listGenerationQueue(db, { limit: 200 }).filter((d) => claimed.includes(d.id));
-  return { claimed: queue, leaseUntil: until };
+  return { claimed: listGenerationQueue(db, { ids: claimed }), leaseUntil: until };
+}
+
+/**
+ * 書き込み直前の「書き込み権の原子的な再取得」(Codex R2 high)。
+ * 事前チェック (generationClaimError) と UPSERT の間に lease 切れ・再claim が起きても、
+ * この条件付き UPDATE (changes=1) を通らない限り一切書き込まない。
+ * 成功時は lease を延長する (書き込み中の失効を防ぐ)。
+ */
+export function acquireGenerationWriteLock(db, draftId, runId) {
+  const now = new Date().toISOString();
+  const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  return db.prepare(`
+    UPDATE product_drafts SET generation_claim_until = ?
+    WHERE id = ? AND status = 'ready_for_ai'
+      AND generation_claim_run_id = ? AND generation_claim_until >= ?
+  `).run(until, draftId, runId, now).changes === 1;
 }
 
 /**

@@ -14,7 +14,7 @@ import crypto from 'crypto';
 
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
-  claimGenerationDrafts, generationClaimError, releaseGenerationClaim,
+  claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -1450,6 +1450,11 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
   const modelNote = cleanText(req.body?.model_note, 200);
 
   const write = db.transaction(() => {
+    // 書き込み権の原子的な再取得 (Codex R2 high): 事前チェックと書き込みの間に
+    // lease切れ・再claimが起きていたら、1バイトも書かずに中断する
+    if (!acquireGenerationWriteLock(db, id, runId)) {
+      return { conflict: true };
+    }
     const skippedHumanEdited = [];
     for (const [kind, content] of Object.entries(cleaned)) {
       // 人が編集済みの項目は AI で上書きしない (Codex: 人編集の保護)
@@ -1483,6 +1488,9 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
     return { advanced, skippedHumanEdited };
   });
   const r = write();
+  if (r.conflict) {
+    return res.status(409).json({ ok: false, error: 'claim が失効しています (別の実行が引き継いだ可能性)。何も書き込んでいません' });
+  }
   res.json({
     ok: true,
     written: Object.keys(cleaned).length - r.skippedHumanEdited.length,
