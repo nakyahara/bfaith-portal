@@ -549,42 +549,92 @@
   </div><!-- /tab-images -->
 
   <!-- ═══ タブ3: 商品説明 ═══ -->
+  <!-- 2026-08-03 中原さん指示で再構成: 楽天の3欄をデフォルト表示の主役に、
+       AI素材 (特徴・仕様・注意書き) は折りたたみの裏方へ。タイトル系に店舗ルールの文字数制限 -->
   <div class="tab-panel" id="tab-desc">
-  <!-- AI出力 -->
+  <%
+    const aiMeta = {
+      rakuten_title: { label: '楽天タイトル', max: 128 },
+      yahoo_title: { label: 'Yahoo!タイトル', max: 65 },
+      desc_catch: { label: 'キャッチコピー', max: 30 },
+      desc_features: { label: '特徴 (箇条書き)' },
+      desc_spec: { label: '仕様 (説明文用)' },
+      desc_notes: { label: '注意書き' },
+    };
+    const aiBadge = (kind) => aiOutputs[kind] && aiOutputs[kind].generated_at && !aiOutputs[kind].edited_by_human;
+  %>
+
+  <!-- タイトル・キャッチコピー (店舗ルールの文字数制限つき) -->
   <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
-    <h2>🤖 AIが書く項目 <span class="muted" style="font-weight:400">(タイトル・説明文)</span></h2>
+    <h2>✏️ タイトル・キャッチコピー</h2>
     <p class="muted" style="margin-top:-6px">
-      <strong>ここは手で埋めなくて構いません。</strong>「生成待ち」にすると AI が下書きを作ります (P2 で稼働予定)。
-      できあがったものを直すのは自由です。
+      AI が下書きを作り、人が仕上げます。文字数は店舗ルール — 超えると赤くなります。
     </p>
-    <%
-      const aiLabels = {
-        rakuten_title: '楽天タイトル',
-        yahoo_title: 'Yahoo!タイトル',
-        desc_catch: 'キャッチコピー',
-        desc_features: '特徴 (箇条書き)',
-        desc_spec: '仕様 (説明文用)',
-        desc_notes: '注意書き',
-      };
-    %>
-    <div class="grid-2">
-    <% for (const kind of aiKinds) { %>
+    <% for (const kind of ['rakuten_title', 'yahoo_title', 'desc_catch']) { %>
       <div class="field">
         <label>
-          <%= aiLabels[kind] || kind %><span class="ftag ftag-ai">AI</span>
-          <% if (aiOutputs[kind] && aiOutputs[kind].generated_at && !aiOutputs[kind].edited_by_human) { %>
-            <span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span>
-          <% } %>
+          <%= aiMeta[kind].label %> <span class="muted">(<%= aiMeta[kind].max %>文字以内)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span>
+          <span class="ai-len muted" data-for="<%= kind %>" style="margin-left:6px; font-size:11px;"></span>
+          <% if (aiBadge(kind)) { %><span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span><% } %>
         </label>
-        <textarea class="ai-output" data-kind="<%= kind %>" rows="<%= kind.startsWith('desc_') ? 4 : 2 %>"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
+        <textarea class="ai-output" data-kind="<%= kind %>" data-max="<%= aiMeta[kind].max %>" rows="2"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
       </div>
     <% } %>
-    </div>
-    <button class="btn btn-primary" id="save-ai-btn">タイトル・説明文を保存</button>
+    <button class="btn btn-primary save-ai-btn">タイトル・説明文を保存</button>
   </div>
 
-  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start;">
-    <!-- 参考URLは 2026-08-01 に基本情報タブへ移動 -->
+  <!-- 楽天の説明文3欄 (最終形。デフォルト表示 — 2026-08-03 中原さん「3欄が主役、素材は裏方」) -->
+  <div class="card" style="margin-top:16px;">
+    <h2>🛒 楽天の説明文3欄 <span class="muted" style="font-weight:400">(送信される最終形。RMSの入力欄と同じ並び)</span><span class="ftag ftag-auto">自動</span></h2>
+    <p class="muted" style="margin-top:-6px;">
+      タイトル・下の「説明文の素材」・商品情報タブのページ表記・商品画像から<strong>自動で組み立てて送信</strong>されます。
+      直したいときは素材側を直して保存すると、ここも変わります。
+    </p>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button class="btn btn-sm" id="desc3-btn">再組み立て</button>
+      <span class="muted" id="desc3-status" style="font-size:12px;"></span>
+    </div>
+    <div id="desc3-result" style="display:none; margin-top:12px;">
+      <% for (const [key, label, note] of [
+        ['pc', 'PC用商品説明文', '表1枚: 説明 (商品名+特徴+仕様) / 注意事項 (注意書き+固定文) / 仕様表 / ページ表記 / 広告文責'],
+        ['sp', 'スマートフォン用商品説明文', '販売説明文 (画像) + PC用商品説明文 の連結'],
+        ['sales', 'PC用販売説明文', '商品画像を縦に並べた画像HTML (R-Cabinet転送済みの画像のみ)'],
+      ]) { %>
+        <div style="margin-bottom:14px;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <strong style="font-size:13px;"><%= label %></strong>
+            <span class="muted" style="font-size:11px;" id="desc3-len-<%= key %>"></span>
+            <button class="btn btn-sm desc3-copy" data-key="<%= key %>">HTMLをコピー</button>
+          </div>
+          <div class="muted" style="font-size:11px;"><%= note %></div>
+          <div id="desc3-render-<%= key %>"
+               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:320px; overflow:auto; background:#fff; font-size:13px;"></div>
+        </div>
+      <% } %>
+    </div>
+  </div>
+
+  <!-- 説明文の素材 (AIの裏方。折りたたみ) -->
+  <details style="margin-top:16px;">
+    <summary style="cursor:pointer; font-size:14px; font-weight:600; padding:8px 0;">
+      🤖 説明文の素材 (特徴・仕様・注意書き・仕様表) <span class="muted" style="font-weight:400">— 上の3欄の材料。直すと3欄が変わります</span>
+    </summary>
+  <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; margin-top:8px;">
+    <!-- AI素材 -->
+    <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
+      <h2>🤖 AIが書く素材</h2>
+      <p class="muted" style="margin-top:-6px">手で埋めなくて構いません。「生成待ち」にすると AI が書きます。直すのは自由です。</p>
+      <% for (const kind of ['desc_features', 'desc_spec', 'desc_notes']) { %>
+        <div class="field">
+          <label>
+            <%= aiMeta[kind].label %><span class="ftag ftag-ai">AI</span>
+            <% if (aiBadge(kind)) { %><span class="badge badge-ready_for_ai" style="margin-left:6px">AI生成・未レビュー</span><% } %>
+          </label>
+          <textarea class="ai-output" data-kind="<%= kind %>" rows="4"><%= aiOutputs[kind] ? (aiOutputs[kind].content || '') : '' %></textarea>
+        </div>
+      <% } %>
+      <button class="btn btn-primary save-ai-btn">タイトル・説明文を保存</button>
+    </div>
     <!-- 仕様表 -->
     <div class="card">
       <h2>✏️ 仕様表 <span class="muted" style="font-weight:400">(サイズ・素材・容量など。説明文と各モールのスペック欄に再利用)</span><span class="ftag ftag-m">手入力</span></h2>
@@ -609,34 +659,7 @@
       </div>
     </div>
   </div>
-
-  <!-- 楽天の説明文3欄 (最終形。2026-08-03 中原さん要望「楽天と同じ項目をアプリにも」) -->
-  <div class="card" style="margin-top:16px;">
-    <h2>🛒 楽天の説明文3欄 <span class="muted" style="font-weight:400">(送信される最終形。RMSの入力欄と同じ並び)</span><span class="ftag ftag-auto">自動</span></h2>
-    <p class="muted" style="margin-top:-6px;">
-      上の「AIが書く項目」(特徴・仕様・注意書き)・仕様表・商品情報タブのページ表記・商品画像から<strong>自動で組み立てて送信</strong>されます。
-      素材のどれかを直して保存すると、ここも変わります (この欄自体は直接編集しません)。
-    </p>
-    <button class="btn" id="desc3-btn">3欄を組み立てて確認</button>
-    <div id="desc3-result" style="display:none; margin-top:12px;">
-      <% for (const [key, label, note] of [
-        ['pc', 'PC用商品説明文', '表1枚: 説明 (商品名+特徴+仕様) / 注意事項 (注意書き+固定文) / 仕様表 / ページ表記 / 広告文責'],
-        ['sp', 'スマートフォン用商品説明文', '販売説明文 (画像) + PC用商品説明文 の連結'],
-        ['sales', 'PC用販売説明文', '商品画像を縦に並べた画像HTML (R-Cabinet転送済みの画像のみ)'],
-      ]) { %>
-        <div style="margin-bottom:14px;">
-          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-            <strong style="font-size:13px;"><%= label %></strong>
-            <span class="muted" style="font-size:11px;" id="desc3-len-<%= key %>"></span>
-            <button class="btn btn-sm desc3-copy" data-key="<%= key %>">HTMLをコピー</button>
-          </div>
-          <div class="muted" style="font-size:11px;"><%= note %></div>
-          <div id="desc3-render-<%= key %>"
-               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:320px; overflow:auto; background:#fff; font-size:13px;"></div>
-        </div>
-      <% } %>
-    </div>
-  </div>
+  </details><!-- /説明文の素材 -->
   </div><!-- /tab-desc -->
 
   <!-- ═══ タブ4: 商品情報 (商品ページ表記) ═══ -->
@@ -2050,18 +2073,19 @@
     showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
   });
 
-  // ─── 楽天の説明文3欄プレビュー (2026-08-03) ───
+  // ─── 楽天の説明文3欄プレビュー (2026-08-03。デフォルト表示 = ページを開いたら自動で組み立てる) ───
   (function initDesc3Preview() {
     const btn = document.getElementById('desc3-btn');
     if (!btn) return;
     let latest = null;
-    btn.addEventListener('click', async () => {
+    async function loadDesc3() {
+      const status = document.getElementById('desc3-status');
       btn.disabled = true;
-      btn.textContent = '組み立て中…';
+      status.textContent = '組み立て中…';
       try {
         const res = await fetch(BASE + '/rakuten/desc-preview');
         const j = await res.json();
-        if (!j.ok) { alert(j.error || '組み立てに失敗しました'); return; }
+        if (!j.ok) { status.textContent = '組み立てに失敗: ' + (j.error || ''); return; }
         latest = j;
         document.getElementById('desc3-result').style.display = '';
         for (const key of ['pc', 'sp', 'sales']) {
@@ -2084,14 +2108,18 @@
             '<div style="color:#b45309; font-size:12px;">⚠️ 未転送の画像が ' + (j.imageCount - j.transferredCount)
             + ' 枚あります (転送すると販売説明文に追加されます)</div>');
         }
+        status.textContent = '';
+      } catch (e) {
+        document.getElementById('desc3-status').textContent = '通信エラー: ' + e.message;
       } finally {
         btn.disabled = false;
-        btn.textContent = '3欄を組み立てて確認';
       }
-    });
+    }
+    btn.addEventListener('click', loadDesc3);
+    loadDesc3();   // デフォルト表示 (2026-08-03 中原さん指示)
     document.querySelectorAll('.desc3-copy').forEach((b) => {
       b.addEventListener('click', async () => {
-        if (!latest) { alert('先に「3欄を組み立てて確認」を押してください'); return; }
+        if (!latest) { alert('まだ組み立てられていません (「再組み立て」を押してください)'); return; }
         await navigator.clipboard.writeText(latest[b.dataset.key] || '');
         result.textContent = 'HTMLをコピーしました';
       });
@@ -2216,14 +2244,34 @@
     });
   });
 
-  document.getElementById('save-ai-btn').addEventListener('click', async () => {
-    const areas = document.querySelectorAll('.ai-output');
-    for (const ta of areas) {
-      const json = await post(BASE + '/ai-outputs', { kind: ta.dataset.kind, content: ta.value });
-      if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
-    }
-    result.textContent = '保存しました';
-    setTimeout(() => location.reload(), 600);
+  // タイトルカードと素材カードの両方に保存ボタンがある (どちらも全 .ai-output を保存)
+  document.querySelectorAll('.save-ai-btn').forEach((saveBtn) => {
+    saveBtn.addEventListener('click', async () => {
+      const areas = document.querySelectorAll('.ai-output');
+      for (const ta of areas) {
+        const json = await post(BASE + '/ai-outputs', { kind: ta.dataset.kind, content: ta.value });
+        if (!json.ok) { alert('保存失敗 (' + ta.dataset.kind + '): ' + (json.error || '')); return; }
+      }
+      result.textContent = '保存しました';
+      setTimeout(() => location.reload(), 600);
+    });
+  });
+
+  // 文字数カウンタ (店舗ルール: 楽天タイトル128 / Yahoo!タイトル65 / キャッチコピー30。超過は赤)
+  document.querySelectorAll('.ai-output[data-max]').forEach((ta) => {
+    const max = Number(ta.dataset.max);
+    const lenEl = document.querySelector('.ai-len[data-for="' + ta.dataset.kind + '"]');
+    const update = () => {
+      const n = ta.value.length;
+      if (lenEl) {
+        lenEl.textContent = n + ' / ' + max + '文字';
+        lenEl.style.color = n > max ? '#dc2626' : '';
+        lenEl.style.fontWeight = n > max ? '700' : '';
+      }
+      ta.style.borderColor = n > max ? '#dc2626' : '';
+    };
+    ta.addEventListener('input', update);
+    update();
   });
 
   // 初期表示のバッジ計算 (initPageInfo 内の applyTypeVisibility でも一度呼ばれるが、
