@@ -412,6 +412,16 @@ export function initProductHubDB() {
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');
   }
+  // ページ表記の自動保存 (#691): ページロードごとのトークン + 単調増加 seq。
+  // 自動保存とpagehideビーコンの到着順が逆転しても「古いリクエストが新しい保存を
+  // 上書きしない」ためのリビジョン (同一トークン内でのみ seq を比較する)
+  const pageInfoCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
+  if (!pageInfoCols.has('save_token')) {
+    db.exec('ALTER TABLE draft_page_info ADD COLUMN save_token TEXT');
+  }
+  if (!pageInfoCols.has('save_seq')) {
+    db.exec('ALTER TABLE draft_page_info ADD COLUMN save_seq INTEGER');
+  }
 
   // 店舗内カテゴリの枠番 (2026-08-02、RMS「表示先カテゴリ 1〜5」対応)
   migrateShopCategorySlots(db);

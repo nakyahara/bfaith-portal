@@ -1123,36 +1123,75 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     return res.status(400).json({ ok: false, error: '商品区分は選択肢から選んでください' });
   }
   const originType = ['日本製', '海外製'].includes(b.origin_type) ? b.origin_type : null;
-  db.prepare(`
-    INSERT INTO draft_page_info (
-      draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
-      origin_type, origin_country, category_label, seller_name, importer_name,
-      food_name, food_ingredients, food_expiry, food_storage
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(draft_id) DO UPDATE SET
-      product_type = excluded.product_type,
-      content_volume = excluded.content_volume, size_text = excluded.size_text,
-      ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
-      origin_type = excluded.origin_type, origin_country = excluded.origin_country,
-      category_label = excluded.category_label, seller_name = excluded.seller_name,
-      importer_name = excluded.importer_name,
-      food_name = excluded.food_name, food_ingredients = excluded.food_ingredients,
-      food_expiry = excluded.food_expiry, food_storage = excluded.food_storage,
-      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-  `).run(
-    draft.id, productType,
-    cleanText(b.content_volume, 200), cleanText(b.size_text, 300),
-    cleanText(b.ingredients, 3000), cleanText(b.usage_notes, 2000),
-    originType, cleanText(b.origin_country, 100),
-    categoryLabel, cleanText(b.seller_name, 200), cleanText(b.importer_name, 200),
-    cleanText(b.food_name, 200), cleanText(b.food_ingredients, 3000),
-    cleanText(b.food_expiry, 200), cleanText(b.food_storage, 300),
-  );
-  logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
-  const info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
+  const vals = {
+    product_type: productType,
+    content_volume: cleanText(b.content_volume, 200),
+    size_text: cleanText(b.size_text, 300),
+    ingredients: cleanText(b.ingredients, 3000),
+    usage_notes: cleanText(b.usage_notes, 2000),
+    origin_type: originType,
+    origin_country: cleanText(b.origin_country, 100),
+    category_label: categoryLabel,
+    seller_name: cleanText(b.seller_name, 200),
+    importer_name: cleanText(b.importer_name, 200),
+    food_name: cleanText(b.food_name, 200),
+    food_ingredients: cleanText(b.food_ingredients, 3000),
+    food_expiry: cleanText(b.food_expiry, 200),
+    food_storage: cleanText(b.food_storage, 300),
+  };
+  // リビジョン (#691 自動保存): 同一ページロード (save_token 一致) 内で seq が進んでいない
+  // リクエスト = 追い越された古い保存。到着順に依存させず古い方を破棄する
+  // (トークン無し・別ページロード・別ユーザーは従来どおり後勝ち)
+  const saveToken = cleanText(b.save_token, 64);
+  const saveSeq = Number.isSafeInteger(b.save_seq) && b.save_seq >= 0 ? b.save_seq : null;
+  const existing = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
+  const isStale = !!existing && saveToken !== null && saveSeq !== null
+    && existing.save_token === saveToken && existing.save_seq !== null && existing.save_seq >= saveSeq;
+  // 自動保存が同じ内容を送ってきたときは、書き込みも履歴 (draft_events) も増やさない
+  const unchanged = !!existing && Object.entries(vals).every(([k, v]) => (existing[k] ?? null) === v);
+  let info;
+  if (isStale) {
+    info = existing;
+  } else if (unchanged) {
+    // seq だけは前進させる (以後さらに古いリクエストが来ても stale 判定できるように)
+    if (saveToken !== null && saveSeq !== null) {
+      db.prepare('UPDATE draft_page_info SET save_token = ?, save_seq = ? WHERE draft_id = ?')
+        .run(saveToken, saveSeq, draft.id);
+    }
+    info = existing;
+  } else {
+    db.prepare(`
+      INSERT INTO draft_page_info (
+        draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
+        origin_type, origin_country, category_label, seller_name, importer_name,
+        food_name, food_ingredients, food_expiry, food_storage, save_token, save_seq
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(draft_id) DO UPDATE SET
+        product_type = excluded.product_type,
+        content_volume = excluded.content_volume, size_text = excluded.size_text,
+        ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
+        origin_type = excluded.origin_type, origin_country = excluded.origin_country,
+        category_label = excluded.category_label, seller_name = excluded.seller_name,
+        importer_name = excluded.importer_name,
+        food_name = excluded.food_name, food_ingredients = excluded.food_ingredients,
+        food_expiry = excluded.food_expiry, food_storage = excluded.food_storage,
+        save_token = excluded.save_token, save_seq = excluded.save_seq,
+        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(
+      draft.id, vals.product_type,
+      vals.content_volume, vals.size_text, vals.ingredients, vals.usage_notes,
+      vals.origin_type, vals.origin_country,
+      vals.category_label, vals.seller_name, vals.importer_name,
+      vals.food_name, vals.food_ingredients, vals.food_expiry, vals.food_storage,
+      saveToken, saveSeq,
+    );
+    logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
+    info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
+  }
   const neShip = mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
   res.json({
     ok: true,
+    ...(isStale ? { stale: true } : {}),
     warnings: validatePageInfo(info),
     html: buildPageInfoHtml({
       productName: draft.name, info,

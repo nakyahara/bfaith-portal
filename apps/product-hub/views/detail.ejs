@@ -754,7 +754,7 @@
       <button class="btn btn-primary" id="pi-save-btn">ページ表記を保存</button>
       <button class="btn" id="pi-preview-btn">掲載HTMLを確認</button>
       <button class="btn" id="pi-copy-btn">HTMLをコピー</button>
-      <span class="muted" id="pi-result"></span>
+      <span class="muted" id="pi-result">入力は自動で保存されます (入力が止まって約1秒後)</span>
     </div>
     <div id="pi-warnings" style="margin-top:8px;"></div>
     <div id="pi-preview" style="display:none; margin-top:10px; border:1px solid #e2e8f0; border-radius:8px; padding:10px; background:#fff; overflow:auto; max-height:400px;"></div>
@@ -1963,9 +1963,49 @@
 
     const result = document.getElementById('pi-result');
     const warnBox = document.getElementById('pi-warnings');
-    async function savePageInfo() {
-      const json = await post(BASE + '/page-info', collect());
-      if (!json.ok) { alert(json.error || '保存に失敗しました'); return null; }
+    // サーバー (cleanText: trim / 空→null / 上限切り詰め) と同じ正規化で保存済み内容と比較する。
+    // 生の入力値で比べると「 x 」vs「x」が永遠に差分扱いになり自動保存が止まらなくなるため
+    const PI_LIMITS = {
+      category_label: 50, origin_country: 100, seller_name: 200, importer_name: 200,
+      content_volume: 200, size_text: 300, ingredients: 3000, usage_notes: 2000,
+      food_name: 200, food_ingredients: 3000, food_expiry: 200, food_storage: 300,
+    };
+    function piSnapshot(body) {
+      const out = {};
+      for (const [k, v] of Object.entries(body)) {
+        const s = String(v ?? '').trim();
+        out[k] = PI_LIMITS[k] ? s.slice(0, PI_LIMITS[k]) : s;
+      }
+      return JSON.stringify(out);
+    }
+    let piSavedSnapshot = piSnapshot(collect());
+    let piSaveChain = Promise.resolve(); // 全保存経路を直列化 (並行POSTの後勝ち上書き防止)
+    // リビジョン: ページロードごとのトークン + 単調増加 seq。サーバーは同一トークン内で
+    // seq が進んでいないリクエストを破棄する (pagehide ビーコンとの到着順逆転対策)
+    const piToken = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    let piSeq = 0;
+
+    async function savePageInfoNow(opts) {
+      if (opts.skipIfUnchanged && piSnapshot(collect()) === piSavedSnapshot) return { skipped: true };
+      const fields = collect();
+      let json;
+      try {
+        json = await post(BASE + '/page-info', { ...fields, save_token: piToken, save_seq: ++piSeq });
+      } catch (_) {
+        json = { ok: false, error: '通信エラーで保存できませんでした' };
+      }
+      if (!json.ok) {
+        // 自動保存の失敗は alert で作業を止めない (次の入力/手動保存で再試行される)
+        if (opts.silent) {
+          result.style.color = '#dc2626';
+          result.textContent = '自動保存に失敗しました — 「ページ表記を保存」で再試行してください';
+          return null;
+        }
+        alert(json.error || '保存に失敗しました');
+        return null;
+      }
+      piSavedSnapshot = piSnapshot(fields);
+      result.style.color = '';
       document.getElementById('pi-html-src').value = json.html || '';
       warnBox.replaceChildren();
       if (json.warnings && json.warnings.length) {
@@ -1977,6 +2017,41 @@
       }
       return json;
     }
+    // 自動保存・手動保存・プレビュー・コピーのどれが同時に走っても POST は1本ずつ
+    function savePageInfo(opts = {}) {
+      const p = piSaveChain.then(() => savePageInfoNow(opts));
+      piSaveChain = p.then(() => {}, () => {});
+      return p;
+    }
+
+    // ─── 自動保存: 入力停止1秒後 (セレクトは即時)。差分があるときだけ送る ───
+    let piTimer = null;
+    async function autoSavePageInfo() {
+      const j = await savePageInfo({ silent: true, skipIfUnchanged: true });
+      if (j && !j.skipped) {
+        result.textContent = '自動保存しました'
+          + (j.warnings.length ? ' (必須の不足あり)' : '')
+          + ' ' + new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+        updateTabBadges();
+      }
+    }
+    function schedulePiAutoSave(delayMs) {
+      clearTimeout(piTimer);
+      piTimer = setTimeout(autoSavePageInfo, delayMs);
+    }
+    const piPanel = document.getElementById('tab-info');
+    piPanel.addEventListener('input', () => schedulePiAutoSave(1000));
+    piPanel.addEventListener('change', () => schedulePiAutoSave(0));
+    // タブを閉じる/離れるときに未保存分を送る (応答は見ない best-effort)。
+    // POST 進行中でも送ってよい: seq が進んでいるので、到着順がどちらでも
+    // サーバー側のリビジョン判定で新しい内容 (ビーコン) が勝つ
+    window.addEventListener('pagehide', () => {
+      if (!navigator.sendBeacon) return;
+      if (piSnapshot(collect()) === piSavedSnapshot) return;
+      const body = { ...collect(), save_token: piToken, save_seq: ++piSeq };
+      try { navigator.sendBeacon(BASE + '/page-info', new Blob([JSON.stringify(body)], { type: 'application/json' })); } catch (_) { /* best-effort */ }
+    });
+
     document.getElementById('pi-save-btn').addEventListener('click', async () => {
       const j = await savePageInfo();
       if (j) result.textContent = j.warnings.length ? '保存しました (必須の不足あり)' : '保存しました';
