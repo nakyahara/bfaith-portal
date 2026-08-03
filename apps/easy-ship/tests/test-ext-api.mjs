@@ -115,6 +115,50 @@ const log = db.prepare("SELECT * FROM es_operation_logs WHERE action='autofill' 
 ok(!String(log.message ?? '').includes('250-0000000'), '注文番号は既定で保存されない');
 ok(log.page_url === 'https://sellercentral.amazon.co.jp/easyship/bulkscheduling', 'pageUrlはクエリ除去');
 
+// 自動登録 (セラーセントラル手動選択の学習)
+r = await req('POST', '/api/v1/package-sizes/auto-register', {
+  key: 'test-token-1234567890',
+  body: {
+    sku: 'auto-reg-sku-1',
+    packageSizeLabel: 'メール便サイズnew (34 cm x 21 cm x 3 cm)',
+    amazonOptionValue: 'ebe77864-285b-41f9-83f1-b57e3d3831d5',
+  },
+});
+ok(
+  r.status === 200 && r.json?.data?.created === true && r.json?.data?.item?.packageSizeCode === 'mail',
+  '自動登録が成功しcode=mailが導出される',
+);
+r = await req('GET', '/api/v1/package-sizes/auto-reg-sku-1', { key: 'test-token-1234567890' });
+ok(r.status === 200 && r.json?.data?.packageSizeLabel?.startsWith('メール便サイズnew'), '自動登録直後に照会できる');
+r = await req('POST', '/api/v1/package-sizes/auto-register', {
+  key: 'test-token-1234567890',
+  body: {
+    sku: 'AUTO-REG-SKU-1',
+    packageSizeLabel: '50サイズ (20 cm x 17 cm x 10 cm)',
+    amazonOptionValue: '4ba79fc6-0cae-43b7-897c-6823215bb67f',
+  },
+});
+ok(
+  r.status === 200 && r.json?.data?.created === false && r.json?.data?.reason === 'already_exists',
+  '既存SKU (大小文字違い) は created:false で上書きしない',
+);
+{
+  const kept = db.prepare("SELECT package_size_code FROM es_package_size_master WHERE sku='auto-reg-sku-1'").get();
+  ok(kept?.package_size_code === 'mail', '重複時に既存行が変更されていない');
+}
+r = await req('POST', '/api/v1/package-sizes/auto-register', {
+  key: 'test-token-1234567890',
+  body: { sku: 'auto-reg-sku-2', packageSizeLabel: '60サイズ (26 cm x 19 cm x 11 cm)', amazonOptionValue: '' },
+});
+ok(r.status === 400 && r.json?.error?.code === 'VALIDATION_ERROR', 'amazonOptionValue無しは400');
+r = await req('POST', '/api/v1/package-sizes/auto-register', {
+  key: 'test-token-1234567890',
+  body: { sku: '=cmd', packageSizeLabel: '60サイズ (26 cm x 19 cm x 11 cm)', amazonOptionValue: 'uuid-x' },
+});
+ok(r.status === 400 && r.json?.error?.code === 'VALIDATION_ERROR', '数式接頭辞SKUは400 (CSVインジェクション対策)');
+ok(svc.deriveSizeCode('100サイズ (35 cm x 35 cm x 28 cm)') === '100', 'コード導出: 100サイズ→100');
+ok(svc.deriveSizeCode('特大パレット') === 'auto', 'コード導出: 不明な表示名→auto');
+
 // 認証がbody parserより先: 不正キー+巨大bodyは413ではなく401 (parseされずに拒否)
 {
   const big = 'x'.repeat(200 * 1024);
