@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .es-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 40px; }
+    .card { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+    .toolbar input[type=text] { padding: 6px 8px; width: 220px; }
+    .toolbar select { padding: 6px; }
+    .btn { padding: 6px 14px; cursor: pointer; border: 1px solid #ced4da; border-radius: 5px; background: #f8f9fa; font-size: 0.9em; }
+    .btn.primary { background: #1971c2; border-color: #1971c2; color: #fff; }
+    .btn.green { background: #2b8a3e; border-color: #2b8a3e; color: #fff; }
+    .btn.link { border: none; background: none; color: #1971c2; padding: 2px 4px; }
+    .btn.link.warn { color: #e67700; }
+    .btn.link.danger { color: #c92a2a; }
+    table.es-table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    .es-table th, .es-table td { border-bottom: 1px solid #e9ecef; padding: 6px 8px; text-align: left; }
+    .es-table th { background: #f8f9fa; }
+    .mono { font-family: Consolas, monospace; }
+    .muted { color: #868e96; }
+    .badge-on { color: #2b8a3e; } .badge-off { color: #adb5bd; }
+    .pager { display: flex; gap: 10px; align-items: center; margin-top: 10px; font-size: 0.9em; }
+    .msg { font-size: 0.9em; margin-left: 8px; }
+    .msg.ok { color: #2b8a3e; } .msg.err { color: #c92a2a; }
+    dialog { border: 1px solid #dee2e6; border-radius: 8px; padding: 18px; width: min(480px, 92vw); }
+    dialog::backdrop { background: rgba(0,0,0,.35); }
+    dialog .frow { margin-bottom: 10px; }
+    dialog .frow label { display: block; font-weight: bold; font-size: 0.85em; margin-bottom: 3px; }
+    dialog .frow input[type=text] { width: 100%; padding: 6px 8px; box-sizing: border-box; }
+    dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    #import-result { max-height: 260px; overflow-y: auto; margin-top: 10px; }
+    #import-result table { font-size: 0.82em; }
+    .imp-create { color: #2b8a3e; } .imp-update { color: #1971c2; }
+    .imp-skip { color: #868e96; } .imp-error { color: #c92a2a; }
+    .blocked-box { background: #fff5f5; border: 1px solid #ffc9c9; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 0.88em; color: #c92a2a; }
+    .hint { color: #868e96; font-size: 0.82em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 梱包サイズマスター (Easy Ship)</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/" class="btn-logout">ポータル</a>
+    </div>
+  </header>
+
+  <div class="es-wrap">
+    <div class="card">
+      <div class="toolbar">
+        <input type="text" id="q" placeholder="SKUで検索">
+        <button class="btn" id="btn-search">検索</button>
+        <select id="active">
+          <option value="all">すべて</option>
+          <option value="true">有効のみ</option>
+          <option value="false">無効のみ</option>
+        </select>
+        <select id="sort">
+          <option value="updatedAt">更新日順</option>
+          <option value="sku">SKU順</option>
+        </select>
+        <span style="flex:1"></span>
+        <button class="btn primary" id="btn-new">新規登録</button>
+        <button class="btn green" id="btn-import">CSVインポート</button>
+        <a class="btn" href="./api/export" title="再インポートに使える形式 (データそのまま)">CSVエクスポート</a>
+        <a class="btn link" href="./api/export?excel=1" title="Excelで開く用 (数式対策の ' 前置。再インポート不可)">Excel閲覧用</a>
+      </div>
+      <div id="list-msg" class="msg"></div>
+      <table class="es-table">
+        <thead>
+          <tr>
+            <th>SKU</th><th>コード</th><th>梱包サイズ名</th><th>Amazon option value</th>
+            <th>状態</th><th>備考</th><th>更新日時</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <div class="pager">
+        <span id="total" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="btn" id="prev">前へ</button>
+        <span id="page-label"></span>
+        <button class="btn" id="next">次へ</button>
+      </div>
+      <p class="hint">
+        拡張機能の照合: ① Amazon option value (UUID) の完全一致 → ② 梱包サイズ名の完全一致。
+        梱包サイズ名は Easy Ship 画面の表示名の全文 (例: 「60サイズ (26 cm x 19 cm x 11 cm)」) を登録してください。
+      </p>
+    </div>
+  </div>
+
+  <dialog id="edit-dialog">
+    <h3 id="edit-title" style="margin-top:0">新規登録</h3>
+    <form id="edit-form">
+      <input type="hidden" id="f-id">
+      <div class="frow"><label>SKU (必須)</label><input type="text" id="f-sku" required maxlength="100" class="mono"></div>
+      <div class="frow"><label>梱包サイズコード (必須・例: SIZE_60)</label><input type="text" id="f-code" required maxlength="50" class="mono"></div>
+      <div class="frow"><label>梱包サイズ名 (必須・Easy Ship画面の表示名全文)</label><input type="text" id="f-label" required maxlength="100"></div>
+      <div class="frow"><label>Amazon option value (UUID・空でも可)</label><input type="text" id="f-value" maxlength="200" class="mono"></div>
+      <div class="frow"><label>備考</label><input type="text" id="f-note" maxlength="500"></div>
+      <div class="frow"><label><input type="checkbox" id="f-active" checked> 有効 (拡張機能から参照可能)</label></div>
+      <div id="edit-msg" class="msg err"></div>
+      <div class="actions">
+        <button type="button" class="btn" id="edit-cancel">キャンセル</button>
+        <button type="submit" class="btn primary">保存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="import-dialog">
+    <h3 style="margin-top:0">CSVインポート</h3>
+    <p class="hint">形式: sku,package_size_code,package_size_label,amazon_option_value,is_active,note (1行目はヘッダー)</p>
+    <input type="file" id="imp-file" accept=".csv,text/csv">
+    <div id="import-summary" class="msg"></div>
+    <div id="import-result"></div>
+    <div id="import-blocked" class="blocked-box" style="display:none">
+      エラー行があるため、1件も反映していません。修正して再インポートするか、正常行だけ反映する場合は
+      <button type="button" class="btn" id="imp-partial">エラー行を除いて反映</button>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn" id="imp-close">閉じる</button>
+      <button type="button" class="btn" id="imp-preview" disabled>プレビュー</button>
+      <button type="button" class="btn green" id="imp-commit" disabled title="先にプレビューで内容を確認">インポート実行</button>
+    </div>
+  </dialog>
+
+  <script>
+    const API = './api';
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '');
+    let page = 1;
+    const perPage = 50;
+    let lastTotal = 0;
+
+    async function call(path, body) {
+      const res = await fetch(API + path, {
+        method: body === undefined ? 'GET' : 'POST',
+        headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const json = await res.json().catch(() => ({ error: 'サーバーの応答が不正です' }));
+      if (!res.ok) throw new Error(json.error || 'エラーが発生しました');
+      return json;
+    }
+
+    function td(text, cls) {
+      const el = document.createElement('td');
+      if (cls) el.className = cls;
+      el.textContent = text;
+      return el;
+    }
+
+    async function reload() {
+      $('list-msg').textContent = '';
+      try {
+        const params = new URLSearchParams({
+          page: String(page), perPage: String(perPage),
+          active: $('active').value, sort: $('sort').value,
+          order: $('sort').value === 'sku' ? 'asc' : 'desc',
+        });
+        const q = $('q').value.trim();
+        if (q) params.set('q', q);
+        const data = await call('/list?' + params.toString());
+        lastTotal = data.total;
+        const tbody = $('rows');
+        tbody.textContent = '';
+        for (const r of data.items) {
+          const tr = document.createElement('tr');
+          tr.appendChild(td(r.sku, 'mono'));
+          tr.appendChild(td(r.packageSizeCode));
+          tr.appendChild(td(r.packageSizeLabel));
+          tr.appendChild(td(r.amazonOptionValue || '(未設定)', 'mono'));
+          tr.appendChild(td(r.isActive ? '有効' : '無効', r.isActive ? 'badge-on' : 'badge-off'));
+          tr.appendChild(td(r.note ?? ''));
+          tr.appendChild(td((r.updatedAt || '').replace('T', ' ').replace('Z', ' UTC'), 'muted'));
+          const ops = document.createElement('td');
+          const btnEdit = document.createElement('button');
+          btnEdit.className = 'btn link';
+          btnEdit.textContent = '編集';
+          btnEdit.onclick = () => openEdit(r);
+          ops.appendChild(btnEdit);
+          if (r.isActive) {
+            const btnOff = document.createElement('button');
+            btnOff.className = 'btn link warn';
+            btnOff.textContent = '無効化';
+            btnOff.onclick = () => removeRow(r, false);
+            ops.appendChild(btnOff);
+          }
+          const btnDel = document.createElement('button');
+          btnDel.className = 'btn link danger';
+          btnDel.textContent = '削除';
+          btnDel.onclick = () => removeRow(r, true);
+          ops.appendChild(btnDel);
+          tr.appendChild(ops);
+          tbody.appendChild(tr);
+        }
+        if (data.items.length === 0) {
+          const tr = document.createElement('tr');
+          const cell = td('データがありません', 'muted');
+          cell.colSpan = 8;
+          tr.appendChild(cell);
+          tbody.appendChild(tr);
+        }
+        const pages = Math.max(1, Math.ceil(data.total / perPage));
+        $('total').textContent = '全 ' + data.total + ' 件';
+        $('page-label').textContent = page + ' / ' + pages;
+        $('prev').disabled = page <= 1;
+        $('next').disabled = page >= pages;
+      } catch (e) {
+        $('list-msg').className = 'msg err';
+        $('list-msg').textContent = e.message;
+      }
+    }
+
+    function openEdit(row) {
+      $('edit-title').textContent = row ? '編集: ' + row.sku : '新規登録';
+      $('f-id').value = row ? row.id : '';
+      $('f-sku').value = row ? row.sku : '';
+      $('f-code').value = row ? row.packageSizeCode : '';
+      $('f-label').value = row ? row.packageSizeLabel : '';
+      $('f-value').value = row ? row.amazonOptionValue : '';
+      $('f-note').value = row && row.note ? row.note : '';
+      $('f-active').checked = row ? row.isActive : true;
+      $('edit-msg').textContent = '';
+      $('edit-dialog').showModal();
+    }
+
+    async function removeRow(row, hard) {
+      const q = hard
+        ? 'SKU "' + row.sku + '" を完全に削除しますか？この操作は取り消せません。'
+        : 'SKU "' + row.sku + '" を無効化しますか？(拡張機能から参照されなくなります)';
+      if (!confirm(q)) return;
+      try {
+        await call('/remove/' + row.id, { hard });
+        await reload();
+      } catch (e) {
+        $('list-msg').className = 'msg err';
+        $('list-msg').textContent = e.message;
+      }
+    }
+
+    $('edit-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const id = $('f-id').value;
+      const body = {
+        sku: $('f-sku').value,
+        packageSizeCode: $('f-code').value,
+        packageSizeLabel: $('f-label').value,
+        amazonOptionValue: $('f-value').value,
+        note: $('f-note').value,
+        isActive: $('f-active').checked,
+      };
+      try {
+        await call(id ? '/update/' + id : '/create', body);
+        $('edit-dialog').close();
+        await reload();
+      } catch (e) {
+        $('edit-msg').textContent = e.message;
+      }
+    });
+
+    // ---- CSVインポート ----
+    let csvText = null;
+    let previewed = false;
+
+    function renderImport(result) {
+      const s = $('import-summary');
+      s.className = 'msg';
+      s.textContent =
+        '新規 ' + result.created + ' / 更新 ' + result.updated + ' / スキップ ' + result.skipped +
+        ' / エラー ' + result.errors +
+        (result.mode === 'preview' ? ' (プレビュー: 未反映)' : result.applied ? ' (反映済み)' : ' (未反映)');
+      const box = $('import-result');
+      box.textContent = '';
+      const table = document.createElement('table');
+      table.className = 'es-table';
+      const thead = document.createElement('thead');
+      thead.innerHTML = '<tr><th>行</th><th>SKU</th><th>結果</th><th>メッセージ</th></tr>';
+      table.appendChild(thead);
+      const tbody = document.createElement('tbody');
+      const labels = { create: '新規', update: '更新', skip: 'スキップ', error: 'エラー' };
+      for (const r of result.rows) {
+        const tr = document.createElement('tr');
+        tr.appendChild(td(String(r.line)));
+        tr.appendChild(td(r.sku, 'mono'));
+        tr.appendChild(td(labels[r.action] || r.action, 'imp-' + r.action));
+        tr.appendChild(td(r.message || ''));
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      box.appendChild(table);
+      $('import-blocked').style.display = result.blocked ? '' : 'none';
+    }
+
+    async function runImport(mode, allowPartial) {
+      if (!csvText) return;
+      try {
+        const result = await call('/import', { csv: csvText, mode, allowPartial: !!allowPartial });
+        renderImport(result);
+        if (mode === 'preview') {
+          previewed = true;
+          $('imp-commit').disabled = false;
+        }
+        if (result.applied) {
+          $('imp-commit').disabled = true;
+          await reload();
+        }
+      } catch (e) {
+        const s = $('import-summary');
+        s.className = 'msg err';
+        s.textContent = e.message;
+      }
+    }
+
+    $('imp-file').addEventListener('change', () => {
+      const file = $('imp-file').files[0];
+      csvText = null;
+      previewed = false;
+      $('imp-preview').disabled = true;
+      $('imp-commit').disabled = true;
+      $('import-summary').textContent = '';
+      $('import-result').textContent = '';
+      $('import-blocked').style.display = 'none';
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        csvText = String(reader.result ?? '');
+        $('imp-preview').disabled = false;
+      };
+      reader.readAsText(file, 'utf-8');
+    });
+
+    $('imp-preview').addEventListener('click', () => runImport('preview'));
+    $('imp-commit').addEventListener('click', () => { if (previewed) runImport('commit'); });
+    $('imp-partial').addEventListener('click', () => runImport('commit', true));
+    $('imp-close').addEventListener('click', () => $('import-dialog').close());
+    $('btn-import').addEventListener('click', () => $('import-dialog').showModal());
+
+    $('btn-new').addEventListener('click', () => openEdit(null));
+    $('edit-cancel').addEventListener('click', () => $('edit-dialog').close());
+    $('btn-search').addEventListener('click', () => { page = 1; reload(); });
+    $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') { page = 1; reload(); } });
+    $('active').addEventListener('change', () => { page = 1; reload(); });
+    $('sort').addEventListener('change', () => { page = 1; reload(); });
+    $('prev').addEventListener('click', () => { if (page > 1) { page--; reload(); } });
+    $('next').addEventListener('click', () => { page++; reload(); });
+
+    reload();
+  </script>
+</body>
+</html>

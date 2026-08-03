@@ -90,6 +90,7 @@ const TARGETS = [
   { key: 'ranking-checker', file: 'ranking-checker.db', mode: 'vacuum', required: false, sentinels: [] },
   { key: 'rakuten-yahoo-sync', file: 'rakuten-yahoo-sync.db', mode: 'vacuum', required: false, sentinels: [] },
   { key: 'mercari-settings', file: 'mercari-settings.db', mode: 'vacuum', required: false, sentinels: [] },
+  { key: 'easy-ship', file: 'easy-ship.db', mode: 'vacuum', required: false, sentinels: ['es_package_size_master'] },
   { key: 'users', file: 'users.json', mode: 'file', required: true, sentinels: [] },
 ];
 
