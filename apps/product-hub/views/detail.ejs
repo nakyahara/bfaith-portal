@@ -609,6 +609,34 @@
       </div>
     </div>
   </div>
+
+  <!-- 楽天の説明文3欄 (最終形。2026-08-03 中原さん要望「楽天と同じ項目をアプリにも」) -->
+  <div class="card" style="margin-top:16px;">
+    <h2>🛒 楽天の説明文3欄 <span class="muted" style="font-weight:400">(送信される最終形。RMSの入力欄と同じ並び)</span><span class="ftag ftag-auto">自動</span></h2>
+    <p class="muted" style="margin-top:-6px;">
+      上の「AIが書く項目」(特徴・仕様・注意書き)・仕様表・商品情報タブのページ表記・商品画像から<strong>自動で組み立てて送信</strong>されます。
+      素材のどれかを直して保存すると、ここも変わります (この欄自体は直接編集しません)。
+    </p>
+    <button class="btn" id="desc3-btn">3欄を組み立てて確認</button>
+    <div id="desc3-result" style="display:none; margin-top:12px;">
+      <% for (const [key, label, note] of [
+        ['pc', 'PC用商品説明文', '表1枚: 説明 (商品名+特徴+仕様) / 注意事項 (注意書き+固定文) / 仕様表 / ページ表記 / 広告文責'],
+        ['sp', 'スマートフォン用商品説明文', '販売説明文 (画像) + PC用商品説明文 の連結'],
+        ['sales', 'PC用販売説明文', '商品画像を縦に並べた画像HTML (R-Cabinet転送済みの画像のみ)'],
+      ]) { %>
+        <div style="margin-bottom:14px;">
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <strong style="font-size:13px;"><%= label %></strong>
+            <span class="muted" style="font-size:11px;" id="desc3-len-<%= key %>"></span>
+            <button class="btn btn-sm desc3-copy" data-key="<%= key %>">HTMLをコピー</button>
+          </div>
+          <div class="muted" style="font-size:11px;"><%= note %></div>
+          <div id="desc3-render-<%= key %>"
+               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:320px; overflow:auto; background:#fff; font-size:13px;"></div>
+        </div>
+      <% } %>
+    </div>
+  </div>
   </div><!-- /tab-desc -->
 
   <!-- ═══ タブ4: 商品情報 (商品ページ表記) ═══ -->
@@ -2021,6 +2049,54 @@
   document.getElementById('add-ref-btn').addEventListener('click', async () => {
     showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
   });
+
+  // ─── 楽天の説明文3欄プレビュー (2026-08-03) ───
+  (function initDesc3Preview() {
+    const btn = document.getElementById('desc3-btn');
+    if (!btn) return;
+    let latest = null;
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      btn.textContent = '組み立て中…';
+      try {
+        const res = await fetch(BASE + '/rakuten/desc-preview');
+        const j = await res.json();
+        if (!j.ok) { alert(j.error || '組み立てに失敗しました'); return; }
+        latest = j;
+        document.getElementById('desc3-result').style.display = '';
+        for (const key of ['pc', 'sp', 'sales']) {
+          const html = j[key] || '';
+          const lenEl = document.getElementById('desc3-len-' + key);
+          lenEl.textContent = html.length + '字 / 上限' + j.limit + '字';
+          lenEl.style.color = html.length > j.limit ? '#dc2626' : '';
+          const box = document.getElementById('desc3-render-' + key);
+          if (!html) {
+            box.innerHTML = '';
+            box.textContent = (key === 'sales' || key === 'sp')
+              ? '(まだ空です — 画像タブで「画像をR-Cabinetへ転送」すると画像HTMLが入ります)'
+              : '(まだ空です)';
+          } else {
+            box.innerHTML = html;   // 自前組み立てのHTML (素材はサーバー側でエスケープ済み)
+          }
+        }
+        if (j.imageCount > j.transferredCount) {
+          document.getElementById('desc3-render-sales').insertAdjacentHTML('afterbegin',
+            '<div style="color:#b45309; font-size:12px;">⚠️ 未転送の画像が ' + (j.imageCount - j.transferredCount)
+            + ' 枚あります (転送すると販売説明文に追加されます)</div>');
+        }
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '3欄を組み立てて確認';
+      }
+    });
+    document.querySelectorAll('.desc3-copy').forEach((b) => {
+      b.addEventListener('click', async () => {
+        if (!latest) { alert('先に「3欄を組み立てて確認」を押してください'); return; }
+        await navigator.clipboard.writeText(latest[b.dataset.key] || '');
+        result.textContent = 'HTMLをコピーしました';
+      });
+    });
+  })();
 
   // ─── ASIN ⇔ Amazon URL 連動 (2026-08-01 中原さん指示) ───
   // ・ASIN を入れると URL を https://www.amazon.co.jp/dp/<ASIN> で自動生成

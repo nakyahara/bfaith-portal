@@ -27,7 +27,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
@@ -1026,6 +1026,16 @@ router.get('/api/rakuten/genre-attributes', async (req, res) => {
     console.error('[product-hub] genre-attributes failed:', e);
     res.status(502).json({ ok: false, error: 'ジャンル情報の取得に失敗しました (miniPC 接続を確認)' });
   }
+});
+
+// 楽天の説明文3欄 (PC用商品説明文/スマホ用/PC用販売説明文) の最終形プレビュー (2026-08-03)。
+// 登録要件が未達でも現時点の素材で組み立てる (「楽天と同じ項目をアプリにも」への回答)
+router.get('/api/drafts/:id/rakuten/desc-preview', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const r = buildDescriptionPreview(getDB(), draft.id);
+  if (!r.ok) return res.status(404).json(r);
+  res.json(r);
 });
 
 router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
