@@ -603,6 +603,62 @@ export function trailingBannerLocations(shippingGroup) {
   ];
 }
 
+/**
+ * 説明文3欄の組み立て (§10 店舗フォーマット)。buildItemPayload と 3欄プレビューの共通部。
+ * 楽天の入力欄と1:1対応: pc=PC用商品説明文 / sales=PC用販売説明文 / sp=スマートフォン用商品説明文
+ */
+export function composeDescriptions({ title, ai, specs, pageInfo, shippingLabel, cabinetLocations }) {
+  // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
+  const descTexts = [title];
+  if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
+  if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
+  const pc = buildPageInfoHtml({
+    productName: title,
+    info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
+    shippingLabel,
+    descriptionText: descTexts.join('\n\n'),
+    notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
+    specs,
+  });
+  const sales = buildSalesDescriptionHtml(cabinetLocations);
+  const sp = [sales, pc].filter(Boolean).join('\n');
+  return { pc, sales, sp };
+}
+
+/**
+ * 楽天の説明文3欄のプレビュー (2026-08-03 中原さん要望「楽天と同じ項目をアプリにも」)。
+ * buildItemPayload と違い、登録要件 (ジャンル・画像転送など) が未達でも現時点の素材で組み立てて返す。
+ */
+export function buildDescriptionPreview(db, draftId) {
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'draft_not_found' };
+  const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId) || {};
+  const ai = {};
+  for (const r of db.prepare('SELECT kind, content FROM draft_ai_outputs WHERE draft_id = ?').all(draftId)) {
+    ai[r.kind] = r.content;
+  }
+  const specs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draftId);
+  const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draftId) || null;
+  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
+  // 転送済みの商品画像 (白抜き除く・バナーは §15 どおり salesDescription に入れない) — buildItemPayload と同じ突合
+  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
+  const byFile = new Map(cabinetAll.map((c) => [c.drive_file_id, c.cabinet_location]));
+  const whiteBgId = rk.white_bg_drive_file_id || null;
+  const current = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? ORDER BY sort, id')
+    .all(draftId).filter((i) => i.drive_file_id !== whiteBgId);
+  const locations = current.filter((i) => byFile.has(i.drive_file_id)).map((i) => byFile.get(i.drive_file_id));
+  const title = String(ai.rakuten_title || draft.name || '').trim();
+  const d = composeDescriptions({
+    title, ai, specs, pageInfo,
+    shippingLabel: effectiveShip.label, cabinetLocations: locations,
+  });
+  return {
+    ok: true, ...d,
+    imageCount: current.length, transferredCount: locations.length,
+    limit: DESC_LIMIT,
+  };
+}
+
 /** UI プレビュー用: location → 公開画像URL (buildSalesDescriptionHtml と同じベース解決) */
 export function cabinetImageUrl(location) {
   let base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
@@ -747,26 +803,16 @@ export function buildItemPayload(db, draftId) {
 
   if (reasons.length > 0) return { ok: false, reasons };
 
-  // ─── 説明文3欄 (2026-08-01 店舗フォーマット確定) ───
+  // ─── 説明文3欄 (2026-08-01 店舗フォーマット確定。組み立ては composeDescriptions に共通化) ───
   //   PC用商品説明文 (productDescription.pc) = 表1枚 (説明/注意事項/仕様表/商品ページ表記)
   //   PC用販売説明文 (salesDescription)      = 商品画像を width100% で並べた画像HTML
   //   スマホ用商品説明文 (productDescription.sp) = 販売説明文 + 商品説明文
   // 発送方法の表示名は上で解決済みの effectiveShip (アプリ指定 > NEマッピング)
-  const pageShippingLabel = effectiveShip.label;
-  // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
-  const descTexts = [title];
-  if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
-  if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
-  const pcHtml = buildPageInfoHtml({
-    productName: title,
-    info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
-    shippingLabel: pageShippingLabel,
-    descriptionText: descTexts.join('\n\n'),
-    notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
-    specs,
+  const { pc: pcHtml, sales: salesHtml, sp: spHtml } = composeDescriptions({
+    title, ai, specs, pageInfo,
+    shippingLabel: effectiveShip.label,
+    cabinetLocations: cabinet.map((c) => c.cabinet_location),
   });
-  const salesHtml = buildSalesDescriptionHtml(cabinet.map((c) => c.cabinet_location));
-  const spHtml = [salesHtml, pcHtml].filter(Boolean).join('\n');
   if (pcHtml.length > DESC_LIMIT) reasons.push(`PC用商品説明文が長すぎます (${pcHtml.length}字 / 上限${DESC_LIMIT}字)`);
   if (salesHtml.length > DESC_LIMIT) reasons.push(`PC用販売説明文 (画像HTML) が長すぎます (${salesHtml.length}字 / 上限${DESC_LIMIT}字 — 画像を減らしてください)`);
   if (spHtml.length > DESC_LIMIT) reasons.push(`スマホ用商品説明文 (販売説明文+商品説明文) が長すぎます (${spHtml.length}字 / 上限${DESC_LIMIT}字)`);

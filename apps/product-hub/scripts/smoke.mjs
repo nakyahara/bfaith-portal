@@ -1937,6 +1937,47 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── 説明文3欄プレビュー (2026-08-03: 楽天の入力欄と同じ最終形をアプリで見る) ───
+{
+  const { buildDescriptionPreview, composeDescriptions } = await import('../services/rakuten-listing.js');
+  const pdraft = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-1'`).get();
+  db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human) VALUES (?, 'desc_features', '・特徴A\n・特徴B', 0)
+    ON CONFLICT(draft_id, kind) DO UPDATE SET content = excluded.content`).run(pdraft.id);
+  const pv = buildDescriptionPreview(db, pdraft.id);
+  check('3欄プレビュー: 登録要件未達 (ジャンル無し・画像未転送) でも組み立てられる',
+    pv.ok === true && typeof pv.pc === 'string' && pv.pc.includes('特徴A'), JSON.stringify(pv).slice(0, 200));
+  check('3欄プレビュー: 画像未転送なら販売説明文は空 + 件数が分かる',
+    pv.sales === '' && pv.imageCount >= 1 && pv.transferredCount === 0,
+    JSON.stringify({ sales: pv.sales, i: pv.imageCount, t: pv.transferredCount }));
+  check('3欄プレビュー: スマホ用 = 販売+PC の連結 (販売が空ならPCと同じ)', pv.sp === pv.pc);
+  check('3欄プレビュー: 存在しないdraftはok:false', buildDescriptionPreview(db, 999999).ok === false);
+  // composeDescriptions が buildItemPayload と同じ入力形で pc/sales/sp を返す (共通化の回帰)
+  const comp = composeDescriptions({
+    title: 'T', ai: { desc_features: 'F', desc_spec: 'S', desc_notes: 'N' },
+    specs: [], pageInfo: null, shippingLabel: null, cabinetLocations: ['/x/a.jpg'],
+  });
+  check('composeDescriptions: pc に特徴/仕様が入り sales に画像HTML・sp が連結',
+    comp.pc.includes('F') && comp.pc.includes('S') && comp.sales.includes('/x/a.jpg')
+    && comp.sp === comp.sales + '\n' + comp.pc, JSON.stringify(comp).slice(0, 200));
+
+  // XSS境界 (Codexレビュー提案): 3欄は画面で innerHTML レンダリングされるため、
+  // 素材にHTML/属性注入が混ざっても生成関数がすべてエスケープすることを固定する
+  const evil = composeDescriptions({
+    title: '<script>alert(1)</script>',
+    ai: { desc_features: '<img src=x onerror=alert(2)>', desc_notes: '</td><script>alert(3)</script>' },
+    specs: [{ spec_key: '<b>鍵</b>', spec_value: '"onmouseover="alert(4)' }],
+    pageInfo: null, shippingLabel: null,
+    cabinetLocations: ['/dir/"onerror="alert(5)/a.jpg'],
+  });
+  check('XSS境界: PC欄で素材の生タグが実行形で出ない (全てエスケープ)',
+    !evil.pc.includes('<script>') && !evil.pc.includes('<img src=x')
+    && !evil.pc.includes('<b>鍵</b>') && evil.pc.includes('&lt;script&gt;')
+    && evil.pc.includes('&lt;img src=x onerror=alert(2)&gt;'),
+    evil.pc.slice(0, 300));
+  check('XSS境界: 販売説明文の画像URLは属性エスケープされ src が閉じない',
+    !evil.sales.includes('"onerror="'), evil.sales.slice(0, 300));
+}
+
 const renders = [
   ['index.ejs (banner+rows+import panel)', 'index.ejs', {
     title: 't', displayName: 'smoke',
