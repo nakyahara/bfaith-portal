@@ -115,6 +115,34 @@ const log = db.prepare("SELECT * FROM es_operation_logs WHERE action='autofill' 
 ok(!String(log.message ?? '').includes('250-0000000'), '注文番号は既定で保存されない');
 ok(log.page_url === 'https://sellercentral.amazon.co.jp/easyship/bulkscheduling', 'pageUrlはクエリ除去');
 
+// 認証がbody parserより先: 不正キー+巨大bodyは413ではなく401 (parseされずに拒否)
+{
+  const big = 'x'.repeat(200 * 1024);
+  const res = await fetch(base + '/api/v1/logs', {
+    method: 'POST',
+    headers: { connection: 'close', 'x-api-key': 'wrong', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entries: [{ action: 'a', result: 'b', message: big }] }),
+  });
+  ok(res.status === 401, '不正キー+巨大bodyは401 (認証がparserより先)');
+  await res.text();
+}
+
+// server.js の配線ガード: 認証前parser除外と mount 順序 (ext-api がセッション認証付き本体より先)
+{
+  const serverSrc = fs.readFileSync(path.join(repo, 'server.js'), 'utf8');
+  ok(
+    serverSrc.includes("normalizedPath.startsWith('/apps/easy-ship/ext-api')"),
+    'server.js: ext-api がグローバルJSON parserから除外されている',
+  );
+  const extPos = serverSrc.indexOf("app.use('/apps/easy-ship/ext-api'");
+  const mainPos = serverSrc.indexOf("app.use('/apps/easy-ship',");
+  ok(extPos > 0 && mainPos > 0 && extPos < mainPos, 'server.js: ext-api の mount がセッション認証付き本体より先');
+  ok(
+    /app\.use\('\/apps\/easy-ship',\s*requireAppAccess\('easy-ship'\)/.test(serverSrc),
+    "server.js: 管理画面は requireAppAccess('easy-ship') で保護されている",
+  );
+}
+
 // Windowsで handle close 中の process.exit が libuv assert になるため、
 // すべて閉じたうえで exitCode を設定して自然終了させる
 await new Promise((resolve) => server.close(resolve));

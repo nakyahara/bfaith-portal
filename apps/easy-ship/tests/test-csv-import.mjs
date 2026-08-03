@@ -121,8 +121,26 @@ throws(
   '構文不正は行番号付き400',
 );
 
+// --- CSVインジェクション対策 (入力時点で拒否) ---
+throws(
+  () => svc.createMaster({ sku: '=cmd', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a'),
+  (e) => e.code === 'VALIDATION_ERROR' && e.message.includes('数式'),
+  '=で始まるSKUは登録拒否',
+);
+throws(
+  () => svc.createMaster({ sku: 'OK-1', packageSizeCode: 'X', packageSizeLabel: 'Y', note: '  +1+cmd' }, 'a'),
+  (e) => e.code === 'VALIDATION_ERROR',
+  '空白を挟んで+で始まる備考も登録拒否',
+);
+const injImport = svc.importCsv(`${HEADER}\n@RISKY,SIZE_60,60サイズ,60,true,\n`, 'preview', false, 'a');
+ok(injImport.errors === 1, 'CSVインポート経由でも数式接頭辞は行エラー');
+
 // --- エクスポート ---
-svc.createMaster({ sku: 'EXP-001', packageSizeCode: 'SIZE_60', packageSizeLabel: '60サイズ', amazonOptionValue: '60', note: '=SUM(A1)' }, 'a');
+// 旧データ等でDBに危険な値が入っていても、Excel用は無害化されること (直接INSERTで再現)
+db.prepare(
+  `INSERT INTO es_package_size_master (sku, package_size_code, package_size_label, amazon_option_value, is_active, note, created_at, updated_at)
+   VALUES ('EXP-001', 'SIZE_60', '60サイズ', '60', 1, '=SUM(A1)', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+).run();
 const raw = svc.exportCsv(false);
 ok(raw.includes('EXP-001,SIZE_60,60サイズ,60,true,=SUM(A1)'), '再取込用エクスポートはデータそのまま');
 const excel = svc.exportCsv(true);

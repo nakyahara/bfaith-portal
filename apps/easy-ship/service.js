@@ -54,6 +54,11 @@ function str(v) {
   return typeof v === 'string' ? v : '';
 }
 
+/** Excelで数式として解釈される先頭文字 (CSVインジェクション対策: 入力時点で拒否する) */
+function hasFormulaPrefix(v) {
+  return /^\s*[=+@-]/.test(v) || /^[\t\r]/.test(v);
+}
+
 /** 登録・更新の入力検証。不正なら EsError(400) */
 export function validateInput(body) {
   const sku = str(body.sku).trim();
@@ -62,6 +67,22 @@ export function validateInput(body) {
   const amazonOptionValue = str(body.amazonOptionValue).trim();
   const noteRaw = body.note == null ? '' : str(body.note);
   const isActive = body.isActive === undefined ? true : body.isActive === true;
+
+  for (const [name, v] of [
+    ['SKU', sku],
+    ['梱包サイズコード', packageSizeCode],
+    ['梱包サイズ名', packageSizeLabel],
+    ['Amazon option value', amazonOptionValue],
+    ['備考', noteRaw],
+  ]) {
+    if (hasFormulaPrefix(v)) {
+      throw new EsError(
+        400,
+        'VALIDATION_ERROR',
+        `${name} が数式として解釈される文字 (= + @ など) で始まっています。先頭に別の文字を付けてください`,
+      );
+    }
+  }
 
   if (!sku || sku.length > 100) throw new EsError(400, 'VALIDATION_ERROR', 'SKUは1〜100文字で入力してください');
   if (!packageSizeCode || packageSizeCode.length > 50) {
@@ -292,6 +313,13 @@ export function importCsv(csvText, mode, allowPartial, userEmail) {
   };
 
   const ci = skuCaseInsensitive();
+
+  /**
+   * 行の検証と適用計画の作成。
+   * commit時は BEGIN IMMEDIATE トランザクション内から呼ぶことで、
+   * 判定(既存行の読み取り)と適用の間に別プロセスの書き込みが割り込まないようにする。
+   */
+  const analyze = () => {
   const results = [];
   const plans = [];
   const seen = new Set(); // ファイル内重複はDB制約に合わせて常に大小無視
@@ -347,42 +375,60 @@ export function importCsv(csvText, mode, allowPartial, userEmail) {
       }
     }
   }
+  return { results, plans };
+  };
 
-  const errorCount = results.filter((r) => r.action === 'error').length;
+  const db = getDB();
+  let results;
   let applied = false;
   let blocked = false;
 
-  if (mode === 'commit') {
-    if (errorCount > 0 && !allowPartial) {
-      blocked = true;
-    } else {
-      const db = getDB();
+  if (mode === 'preview') {
+    results = analyze().results;
+  } else {
+    // commit: 判定と適用を同一の BEGIN IMMEDIATE トランザクションで行う
+    // (Renderデプロイ時の新旧プロセス重複など、判定と適用の間の割り込み書き込みを防ぐ)
+    db.transaction(() => {
+      const plan = analyze();
+      results = plan.results;
+      const errorCount = results.filter((r) => r.action === 'error').length;
+      if (errorCount > 0 && !allowPartial) {
+        blocked = true;
+        return;
+      }
       const now = utcNow();
-      db.transaction(() => {
-        const ins = db.prepare(
-          `INSERT INTO es_package_size_master
-             (sku, package_size_code, package_size_label, amazon_option_value, is_active, note, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        );
-        const upd = db.prepare(
-          `UPDATE es_package_size_master SET
-             sku = ?, package_size_code = ?, package_size_label = ?, amazon_option_value = ?,
-             is_active = ?, note = ?, updated_at = ?
-           WHERE id = ?`,
-        );
-        for (const plan of plans) {
-          const p = plan.input;
-          if (plan.action === 'create') {
+      const ins = db.prepare(
+        `INSERT INTO es_package_size_master
+           (sku, package_size_code, package_size_label, amazon_option_value, is_active, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const upd = db.prepare(
+        `UPDATE es_package_size_master SET
+           sku = ?, package_size_code = ?, package_size_label = ?, amazon_option_value = ?,
+           is_active = ?, note = ?, updated_at = ?
+         WHERE id = ?`,
+      );
+      try {
+        for (const p2 of plan.plans) {
+          const p = p2.input;
+          if (p2.action === 'create') {
             ins.run(p.sku, p.packageSizeCode, p.packageSizeLabel, p.amazonOptionValue, p.isActive ? 1 : 0, p.note, now, now);
           } else {
-            upd.run(p.sku, p.packageSizeCode, p.packageSizeLabel, p.amazonOptionValue, p.isActive ? 1 : 0, p.note, now, plan.existingId);
+            upd.run(p.sku, p.packageSizeCode, p.packageSizeLabel, p.amazonOptionValue, p.isActive ? 1 : 0, p.note, now, p2.existingId);
           }
         }
-      })();
+      } catch (e) {
+        // BEGIN IMMEDIATE内では通常起こらないが、万一の一意制約違反は409へ (500にしない)
+        if (isUniqueViolation(e)) {
+          throw new EsError(409, 'DUPLICATE_SKU', 'SKUが既に登録されています (大文字小文字違いを含む)');
+        }
+        throw e;
+      }
       applied = true;
-    }
+    }).immediate();
   }
 
+  const errorCount = results.filter((r) => r.action === 'error').length;
   const summary = {
     mode,
     created: results.filter((r) => r.action === 'create').length,
