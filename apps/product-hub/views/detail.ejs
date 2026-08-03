@@ -1980,19 +1980,19 @@
     }
     let piSavedSnapshot = piSnapshot(collect());
     let piSaveChain = Promise.resolve(); // 全保存経路を直列化 (並行POSTの後勝ち上書き防止)
-    let piInFlight = false;
+    // リビジョン: ページロードごとのトークン + 単調増加 seq。サーバーは同一トークン内で
+    // seq が進んでいないリクエストを破棄する (pagehide ビーコンとの到着順逆転対策)
+    const piToken = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + '-' + Math.random().toString(36).slice(2));
+    let piSeq = 0;
 
     async function savePageInfoNow(opts) {
       if (opts.skipIfUnchanged && piSnapshot(collect()) === piSavedSnapshot) return { skipped: true };
-      const body = collect();
-      piInFlight = true;
+      const fields = collect();
       let json;
       try {
-        json = await post(BASE + '/page-info', body);
+        json = await post(BASE + '/page-info', { ...fields, save_token: piToken, save_seq: ++piSeq });
       } catch (_) {
         json = { ok: false, error: '通信エラーで保存できませんでした' };
-      } finally {
-        piInFlight = false;
       }
       if (!json.ok) {
         // 自動保存の失敗は alert で作業を止めない (次の入力/手動保存で再試行される)
@@ -2004,7 +2004,7 @@
         alert(json.error || '保存に失敗しました');
         return null;
       }
-      piSavedSnapshot = piSnapshot(body);
+      piSavedSnapshot = piSnapshot(fields);
       result.style.color = '';
       document.getElementById('pi-html-src').value = json.html || '';
       warnBox.replaceChildren();
@@ -2043,12 +2043,13 @@
     piPanel.addEventListener('input', () => schedulePiAutoSave(1000));
     piPanel.addEventListener('change', () => schedulePiAutoSave(0));
     // タブを閉じる/離れるときに未保存分を送る (応答は見ない best-effort)。
-    // POST 進行中は送らない: beacon が先に届くと古い内容が新しい内容を上書きし得るため
-    // (進行中の POST が実行時点の最新入力を運んでいる)
+    // POST 進行中でも送ってよい: seq が進んでいるので、到着順がどちらでも
+    // サーバー側のリビジョン判定で新しい内容 (ビーコン) が勝つ
     window.addEventListener('pagehide', () => {
-      if (piInFlight || !navigator.sendBeacon) return;
+      if (!navigator.sendBeacon) return;
       if (piSnapshot(collect()) === piSavedSnapshot) return;
-      try { navigator.sendBeacon(BASE + '/page-info', new Blob([JSON.stringify(collect())], { type: 'application/json' })); } catch (_) { /* best-effort */ }
+      const body = { ...collect(), save_token: piToken, save_seq: ++piSeq };
+      try { navigator.sendBeacon(BASE + '/page-info', new Blob([JSON.stringify(body)], { type: 'application/json' })); } catch (_) { /* best-effort */ }
     });
 
     document.getElementById('pi-save-btn').addEventListener('click', async () => {

@@ -1139,17 +1139,33 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     food_expiry: cleanText(b.food_expiry, 200),
     food_storage: cleanText(b.food_storage, 300),
   };
-  // 自動保存 (タブの入力停止ごとに飛んでくる) が同じ内容のときは、
-  // 書き込みも履歴 (draft_events) も増やさない
+  // リビジョン (#691 自動保存): 同一ページロード (save_token 一致) 内で seq が進んでいない
+  // リクエスト = 追い越された古い保存。到着順に依存させず古い方を破棄する
+  // (トークン無し・別ページロード・別ユーザーは従来どおり後勝ち)
+  const saveToken = cleanText(b.save_token, 64);
+  const saveSeq = Number.isSafeInteger(b.save_seq) && b.save_seq >= 0 ? b.save_seq : null;
   const existing = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
+  const isStale = !!existing && saveToken !== null && saveSeq !== null
+    && existing.save_token === saveToken && existing.save_seq !== null && existing.save_seq >= saveSeq;
+  // 自動保存が同じ内容を送ってきたときは、書き込みも履歴 (draft_events) も増やさない
   const unchanged = !!existing && Object.entries(vals).every(([k, v]) => (existing[k] ?? null) === v);
-  if (!unchanged) {
+  let info;
+  if (isStale) {
+    info = existing;
+  } else if (unchanged) {
+    // seq だけは前進させる (以後さらに古いリクエストが来ても stale 判定できるように)
+    if (saveToken !== null && saveSeq !== null) {
+      db.prepare('UPDATE draft_page_info SET save_token = ?, save_seq = ? WHERE draft_id = ?')
+        .run(saveToken, saveSeq, draft.id);
+    }
+    info = existing;
+  } else {
     db.prepare(`
       INSERT INTO draft_page_info (
         draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
         origin_type, origin_country, category_label, seller_name, importer_name,
-        food_name, food_ingredients, food_expiry, food_storage
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        food_name, food_ingredients, food_expiry, food_storage, save_token, save_seq
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
         product_type = excluded.product_type,
         content_volume = excluded.content_volume, size_text = excluded.size_text,
@@ -1159,6 +1175,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
         importer_name = excluded.importer_name,
         food_name = excluded.food_name, food_ingredients = excluded.food_ingredients,
         food_expiry = excluded.food_expiry, food_storage = excluded.food_storage,
+        save_token = excluded.save_token, save_seq = excluded.save_seq,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(
       draft.id, vals.product_type,
@@ -1166,13 +1183,15 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
       vals.origin_type, vals.origin_country,
       vals.category_label, vals.seller_name, vals.importer_name,
       vals.food_name, vals.food_ingredients, vals.food_expiry, vals.food_storage,
+      saveToken, saveSeq,
     );
     logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
+    info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   }
-  const info = unchanged ? existing : db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   const neShip = mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
   res.json({
     ok: true,
+    ...(isStale ? { stale: true } : {}),
     warnings: validatePageInfo(info),
     html: buildPageInfoHtml({
       productName: draft.name, info,

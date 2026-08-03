@@ -897,6 +897,10 @@ check('payload: スマホ用 (販売+PC連結) だけの超過も止める',
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = 'glong'`).run(rkId);
 
+// ページ表記の自動保存リビジョン列 (#691 冪等ALTER)
+const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
+check('draft_page_info に save_token/save_seq (冪等ALTER)', piCols.has('save_token') && piCols.has('save_seq'));
+
 // ─── サムネイルプロキシの取得対象ガード (Codex R1 high: confused-deputy 防止) ───
 const { isKnownImageFileId } = await import('../db.js');
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'thumb-known-test')`).run(rkId);
