@@ -10,7 +10,15 @@
 import { Router } from 'express';
 import crypto from 'crypto';
 import express from 'express';
-import { EsError, addExtLogs, autoRegisterFromExt, bulkLookup, lookupOne } from './service.js';
+import {
+  EsError,
+  addExtLogs,
+  autoRegisterCombo,
+  autoRegisterFromExt,
+  bulkLookup,
+  comboBulkLookup,
+  lookupOne,
+} from './service.js';
 
 const router = Router();
 
@@ -63,6 +71,12 @@ router.post('/api/v1/package-sizes/bulk-lookup', api((req) => bulkLookup(req.bod
 
 // セラーセントラルで担当者が手動選択したサイズの自動登録 (既存SKUは上書きしない)
 router.post('/api/v1/package-sizes/auto-register', api((req) => autoRegisterFromExt(req.body ?? {})));
+
+// 組み合わせ (数量2以上・同梱) の一括照会。リクエストと同じ並びで results を返す
+router.post('/api/v1/combos/bulk-lookup', api((req) => comboBulkLookup(req.body?.combos)));
+
+// 組み合わせの登録 (拡張の [登録して設定] から。既存の同一構成は上書きしない)
+router.post('/api/v1/combos/auto-register', api((req) => autoRegisterCombo(req.body ?? {})));
 
 router.post('/api/v1/logs', api((req) => addExtLogs(req.body?.entries)));
 

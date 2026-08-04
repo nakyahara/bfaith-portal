@@ -16,7 +16,7 @@ import path from 'path';
 export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'easy-ship.db');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 let db = null;
 
@@ -103,6 +103,27 @@ function createCoreTables() {
   `);
 }
 
+function createComboTable() {
+  // 組み合わせマスター (数量2以上・同梱注文用)。
+  // combo_key = 注文構成の正規化キー: 小文字sku*数量 を辞書順に '|' 連結 (例 "a-1*2|b-2*1")。
+  // 適用は構成の完全一致のみ (部分一致・類似構成には適用しない)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS es_combo_size_master (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      combo_key TEXT NOT NULL,
+      items_json TEXT NOT NULL,
+      package_size_label TEXT NOT NULL,
+      amazon_option_value TEXT NOT NULL DEFAULT '',
+      is_active INTEGER NOT NULL DEFAULT 1,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS es_csm_key_uq ON es_combo_size_master (combo_key);
+  `);
+}
+
 const MIGRATIONS = {
   1: createCoreTables,
+  2: createComboTable,
 };

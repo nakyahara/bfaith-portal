@@ -11,7 +11,9 @@ import {
   createMaster,
   exportCsv,
   importCsv,
+  listCombos,
   listMaster,
+  removeCombo,
   removeMaster,
   updateMaster,
 } from './service.js';
@@ -56,6 +58,15 @@ router.get('/', (req, res) => {
 });
 
 router.get('/api/list', api((req) => listMaster(req.query)));
+
+// ---- 組み合わせマスター (数量2以上・同梱) ----
+router.get('/api/combos/list', api((req) => listCombos(req.query)));
+// 既定は有効/無効トグル。hard=true で物理削除
+router.post('/api/combos/remove/:id', api((req) => {
+  const id = Number.parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) throw new EsError(400, 'VALIDATION_ERROR', 'idが不正です');
+  return removeCombo(id, req.body?.hard === true, req.session.email);
+}));
 
 router.post('/api/create', api((req) => createMaster(req.body, req.session.email)));
 

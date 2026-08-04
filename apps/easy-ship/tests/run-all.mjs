@@ -9,7 +9,7 @@ import { fileURLToPath } from 'url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(dir, '../../..');
-const suites = ['test-master.mjs', 'test-csv-import.mjs', 'test-ext-api.mjs'];
+const suites = ['test-master.mjs', 'test-csv-import.mjs', 'test-combo.mjs', 'test-ext-api.mjs'];
 
 let failed = 0;
 for (const f of suites) {

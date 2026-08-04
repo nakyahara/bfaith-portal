@@ -186,6 +186,37 @@ ok(svc.deriveSizeCode('特大パレット') === 'auto', 'コード導出: 不明
   );
 }
 
+// --- 組み合わせAPI (HTTP経由) ---
+{
+  const svcMod = await import(pathToFileURL(path.join(repo, 'apps/easy-ship/service.js')));
+  svcMod.autoRegisterCombo({
+    items: [{ sku: 'combo-x', qty: 2 }],
+    packageSizeLabel: '60サイズ (26 cm x 19 cm x 11 cm)',
+    amazonOptionValue: '84797239-91e6-4101-a8b8-9b86c45482e7',
+  });
+  let cr = await req('POST', '/api/v1/combos/bulk-lookup', {
+    key: 'test-token-1234567890',
+    body: { combos: [{ items: [{ sku: 'COMBO-X', qty: 2 }] }, { items: [{ sku: 'nope', qty: 1 }] }] },
+  });
+  ok(
+    cr.status === 200 &&
+      cr.json?.data?.results?.[0]?.status === 'found' &&
+      cr.json?.data?.results?.[1]?.status === 'notFound',
+    'combo bulk-lookup がHTTP経由で動く (大小無視)',
+  );
+  cr = await req('POST', '/api/v1/combos/auto-register', {
+    key: 'test-token-1234567890',
+    body: {
+      items: [{ sku: 'combo-y', qty: 1 }, { sku: 'combo-z', qty: 3 }],
+      packageSizeLabel: '80サイズ (37 cm x 17 cm x 10 cm)',
+      amazonOptionValue: 'uuid-80',
+    },
+  });
+  ok(cr.status === 200 && cr.json?.data?.created === true, 'combo auto-register がHTTP経由で動く');
+  cr = await req('POST', '/api/v1/combos/bulk-lookup', { key: 'wrong', body: { combos: [] } });
+  ok(cr.status === 401, 'comboエンドポイントも認証必須');
+}
+
 // Windowsで handle close 中の process.exit が libuv assert になるため、
 // すべて閉じたうえで exitCode を設定して自然終了させる
 await new Promise((resolve) => server.close(resolve));
