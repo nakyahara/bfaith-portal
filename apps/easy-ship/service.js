@@ -628,3 +628,199 @@ export function addExtLogs(entries) {
   })();
   return { saved };
 }
+
+// ---------- 組み合わせマスター (数量2以上・同梱注文用) ----------
+
+/**
+ * combo_key用のSKUエンコード。区切り文字 '*' '|' がSKU本文と衝突しないよう、
+ * encodeURIComponent (%自体も%25にエスケープされる) + '*'→'%2A' で一意にする
+ */
+function encodeComboSku(skuLower) {
+  return encodeURIComponent(skuLower).replace(/\*/g, '%2A');
+}
+
+/**
+ * 注文構成 [{sku, qty}] を検証し、正規化キーと表示用アイテムへ変換する。
+ * - SKUは trim (照合は常に大小無視 → キーは小文字化)
+ * - 同一SKUが複数行に分かれていたら数量を合算する (合算後も1〜999)
+ * - キーは「エンコード済み小文字sku*数量」を辞書順に '|' 連結 (順序に依存しない・衝突しない)
+ * - 単品 (1種×1個) はSKUマスターの領分のため組み合わせとしては扱わない
+ * 不正なら EsError(400)
+ */
+export function normalizeComboItems(rawItems) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > 20) {
+    throw new EsError(400, 'VALIDATION_ERROR', 'items は1〜20件の配列で指定してください');
+  }
+  const bySku = new Map(); // 小文字sku -> { sku(表示用の元表記), qty }
+  for (const it of rawItems) {
+    const sku = str(it?.sku).trim();
+    const qty = Number(it?.qty);
+    if (!sku || sku.length > 100) {
+      throw new EsError(400, 'VALIDATION_ERROR', 'items のSKUは1〜100文字で指定してください');
+    }
+    if (!Number.isInteger(qty) || qty < 1 || qty > 999) {
+      throw new EsError(400, 'VALIDATION_ERROR', 'items の数量は1〜999の整数で指定してください');
+    }
+    const key = sku.toLowerCase();
+    const cur = bySku.get(key);
+    if (cur) cur.qty += qty;
+    else bySku.set(key, { sku, qty });
+  }
+  for (const [, v] of bySku) {
+    if (v.qty > 999) {
+      throw new EsError(400, 'VALIDATION_ERROR', '同一SKUの合算数量は999までです');
+    }
+  }
+  if (bySku.size === 1 && [...bySku.values()][0].qty === 1) {
+    throw new EsError(
+      400,
+      'VALIDATION_ERROR',
+      '単品 (1種×1個) は組み合わせではなくSKUマスターで扱ってください',
+    );
+  }
+  const entries = [...bySku.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const comboKey = entries.map(([k, v]) => `${encodeComboSku(k)}*${v.qty}`).join('|');
+  const items = entries.map(([, v]) => ({ sku: v.sku, qty: v.qty }));
+  return { comboKey, items };
+}
+
+function comboRowToApi(r) {
+  let items = [];
+  try {
+    items = JSON.parse(r.items_json);
+  } catch {
+    // 破損していても一覧表示は続ける
+  }
+  return {
+    id: r.id,
+    comboKey: r.combo_key,
+    items,
+    packageSizeLabel: r.package_size_label,
+    amazonOptionValue: r.amazon_option_value,
+    isActive: r.is_active === 1,
+    note: r.note,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/**
+ * 拡張向け: 複数の注文構成を一括照会する。
+ * リクエストと同じ並びで results を返す (found/notFound/inactive/invalid)。
+ * invalid = 構成の検証エラー (その注文だけ照会不可として扱う)
+ */
+export function comboBulkLookup(combos) {
+  if (!Array.isArray(combos) || combos.length === 0 || combos.length > 50) {
+    throw new EsError(400, 'VALIDATION_ERROR', 'combos は1〜50件の配列で指定してください');
+  }
+  const db = getDB();
+  const stmt = db.prepare('SELECT * FROM es_combo_size_master WHERE combo_key = ?');
+  return {
+    results: combos.map((c) => {
+      let norm;
+      try {
+        norm = normalizeComboItems(c?.items);
+      } catch {
+        return { status: 'invalid' };
+      }
+      const row = stmt.get(norm.comboKey);
+      if (!row) return { status: 'notFound' };
+      if (row.is_active !== 1) return { status: 'inactive' };
+      return {
+        status: 'found',
+        packageSizeLabel: row.package_size_label,
+        amazonOptionValue: row.amazon_option_value,
+      };
+    }),
+  };
+}
+
+/**
+ * 拡張の [登録して設定] からの組み合わせ登録。
+ * 既存の組み合わせ (同一構成) は絶対に上書きしない (created:false を返すだけ)。
+ */
+export function autoRegisterCombo(body) {
+  const { comboKey, items } = normalizeComboItems(body?.items);
+  const packageSizeLabel = str(body?.packageSizeLabel).trim();
+  const amazonOptionValue = str(body?.amazonOptionValue).trim();
+  if (!packageSizeLabel || packageSizeLabel.length > 100) {
+    throw new EsError(400, 'VALIDATION_ERROR', '梱包サイズ名は1〜100文字で指定してください');
+  }
+  if (!amazonOptionValue || amazonOptionValue.length > 200) {
+    throw new EsError(400, 'VALIDATION_ERROR', 'amazonOptionValue は1〜200文字で指定してください');
+  }
+  for (const v of [packageSizeLabel, amazonOptionValue]) {
+    if (/^\s*[=+@-]/.test(v) || /^[\t\r]/.test(v)) {
+      throw new EsError(400, 'VALIDATION_ERROR', '数式として解釈される文字で始まる値は登録できません');
+    }
+  }
+  const db = getDB();
+  const existing = db.prepare('SELECT * FROM es_combo_size_master WHERE combo_key = ?').get(comboKey);
+  if (existing) return { created: false, reason: 'already_exists', item: comboRowToApi(existing) };
+  const now = utcNow();
+  try {
+    const info = db
+      .prepare(
+        `INSERT INTO es_combo_size_master
+           (combo_key, items_json, package_size_label, amazon_option_value, is_active, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, NULL, ?, ?)`,
+      )
+      .run(comboKey, JSON.stringify(items), packageSizeLabel, amazonOptionValue, now, now);
+    logAdmin(null, 'combo_auto_register', 'ok', null, `${comboKey} -> ${packageSizeLabel}`);
+    return {
+      created: true,
+      item: comboRowToApi(db.prepare('SELECT * FROM es_combo_size_master WHERE id = ?').get(info.lastInsertRowid)),
+    };
+  } catch (e) {
+    if (isUniqueViolation(e)) {
+      const row = db.prepare('SELECT * FROM es_combo_size_master WHERE combo_key = ?').get(comboKey);
+      return { created: false, reason: 'already_exists', item: row ? comboRowToApi(row) : undefined };
+    }
+    throw e;
+  }
+}
+
+// ---------- 組み合わせマスターの管理 (CRUD) ----------
+
+export function listCombos(query = {}) {
+  const page = Math.max(1, Number.parseInt(query.page, 10) || 1);
+  const perPage = Math.min(100, Math.max(1, Number.parseInt(query.perPage, 10) || 50));
+  const q = str(query.q).trim();
+  const active = ['true', 'false'].includes(query.active) ? query.active : 'all';
+
+  const where = [];
+  const params = [];
+  if (q) {
+    // 構成SKUでの検索 (items_json / combo_key どちらでも当たるように)
+    where.push('(combo_key LIKE ? COLLATE NOCASE OR items_json LIKE ? COLLATE NOCASE)');
+    params.push(`%${q}%`, `%${q}%`);
+  }
+  if (active !== 'all') {
+    where.push('is_active = ?');
+    params.push(active === 'true' ? 1 : 0);
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const db = getDB();
+  const total = db.prepare(`SELECT COUNT(*) AS c FROM es_combo_size_master ${whereSql}`).get(...params).c;
+  const items = db
+    .prepare(`SELECT * FROM es_combo_size_master ${whereSql} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+    .all(...params, perPage, (page - 1) * perPage)
+    .map(comboRowToApi);
+  return { items, total, page, perPage };
+}
+
+/** 有効/無効の切替。hard=true で物理削除 */
+export function removeCombo(id, hard, userEmail) {
+  const db = getDB();
+  const current = db.prepare('SELECT * FROM es_combo_size_master WHERE id = ?').get(id);
+  if (!current) throw new EsError(404, 'NOT_FOUND', '対象のデータが見つかりません');
+  if (hard) {
+    db.prepare('DELETE FROM es_combo_size_master WHERE id = ?').run(id);
+    logAdmin(userEmail, 'admin_combo_delete', 'ok', null, current.combo_key);
+    return { deleted: true };
+  }
+  const next = current.is_active === 1 ? 0 : 1;
+  db.prepare('UPDATE es_combo_size_master SET is_active = ?, updated_at = ? WHERE id = ?').run(next, utcNow(), id);
+  logAdmin(userEmail, next === 1 ? 'admin_combo_activate' : 'admin_combo_deactivate', 'ok', null, current.combo_key);
+  return comboRowToApi(db.prepare('SELECT * FROM es_combo_size_master WHERE id = ?').get(id));
+}

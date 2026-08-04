@@ -97,6 +97,39 @@
         梱包サイズ名は Easy Ship 画面の表示名の全文 (例: 「60サイズ (26 cm x 19 cm x 11 cm)」) を登録してください。
       </p>
     </div>
+
+    <div class="card">
+      <h2 style="font-size:1.0em; margin:0 0 10px;">組み合わせマスター (数量2以上・同梱注文)</h2>
+      <div class="toolbar">
+        <input type="text" id="combo-q" placeholder="SKUで検索">
+        <button class="btn" id="combo-search">検索</button>
+        <select id="combo-active">
+          <option value="all">すべて</option>
+          <option value="true">有効のみ</option>
+          <option value="false">無効のみ</option>
+        </select>
+      </div>
+      <div id="combo-msg" class="msg"></div>
+      <table class="es-table">
+        <thead>
+          <tr>
+            <th>構成 (SKU×数量)</th><th>梱包サイズ名</th><th>状態</th><th>更新日時</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="combo-rows"></tbody>
+      </table>
+      <div class="pager">
+        <span id="combo-total" class="muted"></span>
+        <span style="flex:1"></span>
+        <button class="btn" id="combo-prev">前へ</button>
+        <span id="combo-page-label"></span>
+        <button class="btn" id="combo-next">次へ</button>
+      </div>
+      <p class="hint">
+        登録は出荷画面の拡張機能パネル ([登録して設定]) から行います。構成が**完全に一致した**注文だけに
+        適用されます。間違えて登録した場合はここで削除し、次の注文で登録し直してください。
+      </p>
+    </div>
   </div>
 
   <dialog id="edit-dialog">
@@ -356,7 +389,77 @@
     $('prev').addEventListener('click', () => { if (page > 1) { page--; reload(); } });
     $('next').addEventListener('click', () => { page++; reload(); });
 
+    // ---- 組み合わせマスター ----
+    let comboPage = 1;
+
+    async function reloadCombos() {
+      $('combo-msg').textContent = '';
+      try {
+        const params = new URLSearchParams({
+          page: String(comboPage), perPage: String(perPage), active: $('combo-active').value,
+        });
+        const q = $('combo-q').value.trim();
+        if (q) params.set('q', q);
+        const data = await call('/combos/list?' + params.toString());
+        const tbody = $('combo-rows');
+        tbody.textContent = '';
+        for (const r of data.items) {
+          const tr = document.createElement('tr');
+          const composition = (r.items || [])
+            .map((it) => `${it.sku}×${it.qty}`)
+            .join(' + ');
+          tr.appendChild(td(composition, 'mono'));
+          tr.appendChild(td(r.packageSizeLabel));
+          tr.appendChild(td(r.isActive ? '有効' : '無効', r.isActive ? 'badge-on' : 'badge-off'));
+          tr.appendChild(td((r.updatedAt || '').replace('T', ' ').replace('Z', ' UTC'), 'muted'));
+          const ops = document.createElement('td');
+          const btnToggle = document.createElement('button');
+          btnToggle.className = 'btn link warn';
+          btnToggle.textContent = r.isActive ? '無効化' : '有効化';
+          btnToggle.onclick = async () => {
+            if (r.isActive && !confirm('この組み合わせを無効化しますか？(拡張から適用されなくなります)')) return;
+            try { await call('/combos/remove/' + r.id, { hard: false }); await reloadCombos(); }
+            catch (e) { $('combo-msg').className = 'msg err'; $('combo-msg').textContent = e.message; }
+          };
+          ops.appendChild(btnToggle);
+          const btnDel = document.createElement('button');
+          btnDel.className = 'btn link danger';
+          btnDel.textContent = '削除';
+          btnDel.onclick = async () => {
+            if (!confirm('この組み合わせを完全に削除しますか？この操作は取り消せません。')) return;
+            try { await call('/combos/remove/' + r.id, { hard: true }); await reloadCombos(); }
+            catch (e) { $('combo-msg').className = 'msg err'; $('combo-msg').textContent = e.message; }
+          };
+          ops.appendChild(btnDel);
+          tr.appendChild(ops);
+          tbody.appendChild(tr);
+        }
+        if (data.items.length === 0) {
+          const tr = document.createElement('tr');
+          const cell = td('データがありません (登録は出荷画面の拡張パネルから)', 'muted');
+          cell.colSpan = 5;
+          tr.appendChild(cell);
+          tbody.appendChild(tr);
+        }
+        const pages = Math.max(1, Math.ceil(data.total / perPage));
+        $('combo-total').textContent = '全 ' + data.total + ' 件';
+        $('combo-page-label').textContent = comboPage + ' / ' + pages;
+        $('combo-prev').disabled = comboPage <= 1;
+        $('combo-next').disabled = comboPage >= pages;
+      } catch (e) {
+        $('combo-msg').className = 'msg err';
+        $('combo-msg').textContent = e.message;
+      }
+    }
+
+    $('combo-search').addEventListener('click', () => { comboPage = 1; reloadCombos(); });
+    $('combo-q').addEventListener('keydown', (e) => { if (e.key === 'Enter') { comboPage = 1; reloadCombos(); } });
+    $('combo-active').addEventListener('change', () => { comboPage = 1; reloadCombos(); });
+    $('combo-prev').addEventListener('click', () => { if (comboPage > 1) { comboPage--; reloadCombos(); } });
+    $('combo-next').addEventListener('click', () => { comboPage++; reloadCombos(); });
+
     reload();
+    reloadCombos();
   </script>
 </body>
 </html>
