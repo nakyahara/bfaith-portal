@@ -198,9 +198,100 @@ function isConfigured() {
   );
 }
 
+/** env が揃っているか (未設定ならトークンAPIすら叩かない — fail-fast) */
+function adsIsConfigured() {
+  return !!(process.env.ADS_CLIENT_ID && process.env.ADS_CLIENT_SECRET
+    && process.env.ADS_REFRESH_TOKEN && process.env.ADS_PROFILE_ID);
+}
+
+/** v3 list系 API 用 (versioned media type が必要。既存 adsRequest は推奨API固定のため別建て) */
+async function adsRequestVersioned(method, path, body, mediaType) {
+  const token = await getAccessToken();
+  const res = await fetch(`${ADS_API_BASE}${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Amazon-Advertising-API-ClientId': process.env.ADS_CLIENT_ID,
+      'Amazon-Advertising-API-Scope': process.env.ADS_PROFILE_ID,
+      'Content-Type': mediaType,
+      'Accept': mediaType,
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Ads API ${res.status}: ${text.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// オートターゲティングのプレースホルダ (実測 2026-08-04: keywords/list に
+// "(_targeting_auto_)" が混ざる)。マニュアルで人が入れたKWだけを扱うため除外する
+const AUTO_PLACEHOLDER_RE = /^\(_.*_\)$/;
+
+/**
+ * pure: productAds と keywords を adGroupId で join して ASIN → マニュアルKW集合。
+ * オートのプレースホルダKWは除外 (中原さん指示: マニュアルでなければ参照しない)
+ */
+function joinSpKeywordsByAsin(productAds, keywords) {
+  const kwByAdGroup = new Map();
+  for (const k of keywords || []) {
+    const text = String(k?.keywordText || '').trim();
+    if (!k?.adGroupId || !text || AUTO_PLACEHOLDER_RE.test(text)) continue;
+    if (!kwByAdGroup.has(k.adGroupId)) kwByAdGroup.set(k.adGroupId, new Set());
+    kwByAdGroup.get(k.adGroupId).add(text);
+  }
+  const byAsin = new Map();
+  for (const ad of productAds || []) {
+    const asin = String(ad?.asin || '').trim().toUpperCase();
+    const kws = ad?.adGroupId ? kwByAdGroup.get(ad.adGroupId) : null;
+    if (!asin || !kws || kws.size === 0) continue;
+    if (!byAsin.has(asin)) byAsin.set(asin, new Set());
+    for (const kw of kws) byAsin.get(asin).add(kw);
+  }
+  return byAsin;
+}
+
+let spKwCache = null; // { fetchedAt, byAsin }
+const SP_KW_CACHE_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * SP広告に「人がマニュアルで設定している」キーワードを ASIN 別に返す (ENABLEDのみ)。
+ * アカウント全体を一括取得して30分キャッシュ (claim のたびに叩かない)。
+ * env 未設定なら null (呼び出し側は fail-soft で続行する)。
+ */
+async function listSpManualKeywordsByAsin({ force = false } = {}) {
+  if (!adsIsConfigured()) return null;
+  if (!force && spKwCache && (Date.now() - spKwCache.fetchedAt) < SP_KW_CACHE_TTL_MS) {
+    return spKwCache.byAsin;
+  }
+  const fetchAll = async (path, media, listKey) => {
+    const out = [];
+    let nextToken;
+    for (let page = 0; page < 60; page++) {
+      const body = { stateFilter: { include: ['ENABLED'] }, maxResults: 500, ...(nextToken ? { nextToken } : {}) };
+      const data = await adsRequestVersioned('POST', path, body, media);
+      out.push(...(data?.[listKey] || []));
+      nextToken = data?.nextToken;
+      if (!nextToken) break;
+    }
+    return out;
+  };
+  const [ads, kws] = await Promise.all([
+    fetchAll('/sp/productAds/list', 'application/vnd.spProductAd.v3+json', 'productAds'),
+    fetchAll('/sp/keywords/list', 'application/vnd.spKeyword.v3+json', 'keywords'),
+  ]);
+  const byAsin = joinSpKeywordsByAsin(ads, kws);
+  spKwCache = { fetchedAt: Date.now(), byAsin };
+  return byAsin;
+}
+
 export {
   getAccessToken,
   getKeywordRecommendations,
+  adsIsConfigured,
+  joinSpKeywordsByAsin,
+  listSpManualKeywordsByAsin,
   getKeywordRecommendationsByKeyword,
   getThemeRecommendations,
   testConnection,

@@ -1941,6 +1941,52 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── SP広告マニュアルKW: join ロジック (2026-08-04。実測: keywords/list はオートの
+// プレースホルダ "(_targeting_auto_)" を含む → マニュアルKWだけ残すのが要点) ───
+{
+  const { joinSpKeywordsByAsin } = await import('../../keyword-researcher/ads-api.js');
+  const byAsin = joinSpKeywordsByAsin(
+    [
+      { adGroupId: 'g1', asin: 'B0AAAAAAA1', sku: 's1', state: 'ENABLED' },
+      { adGroupId: 'g2', asin: 'B0AAAAAAA1', state: 'ENABLED' },   // 同一ASINが複数adGroup
+      { adGroupId: 'g3', asin: 'B0BBBBBBB2', state: 'ENABLED' },   // KWなしadGroup
+      { adGroupId: 'gX', asin: '', state: 'ENABLED' },
+    ],
+    [
+      { adGroupId: 'g1', keywordText: '平串 30cm', matchType: 'BROAD' },
+      { adGroupId: 'g1', keywordText: '(_targeting_auto_)', matchType: 'BROAD' },  // オート→除外
+      { adGroupId: 'g2', keywordText: '竹串 業務用', matchType: 'EXACT' },
+      { adGroupId: 'g2', keywordText: '平串 30cm', matchType: 'PHRASE' },          // 重複→1つに
+      { adGroupId: 'g9', keywordText: '孤児KW' },                                   // 広告なしadGroup
+    ],
+  );
+  const a1 = [...(byAsin.get('B0AAAAAAA1') || [])];
+  check('SP広告KW join: 同一ASINの複数adGroupを統合し重複除去',
+    a1.length === 2 && a1.includes('平串 30cm') && a1.includes('竹串 業務用'), JSON.stringify(a1));
+  check('SP広告KW join: オートのプレースホルダ (_targeting_auto_) は除外', !a1.includes('(_targeting_auto_)'));
+  check('SP広告KW join: KWの無いASINは含まれない', !byAsin.has('B0BBBBBBB2'), JSON.stringify([...byAsin.keys()]));
+  check('SP広告KW join: 空入力で落ちない', joinSpKeywordsByAsin(null, null).size === 0);
+}
+
+// ─── SP広告KWスナップショット (2026-08-04: 全件取得5〜10分→DBに保存して次回claimは即時) ───
+{
+  const m = new Map([['B0AAAAAAA1', new Set(['平串 30cm', '竹串'])], ['B0BBBBBBB2', new Set(['のぼり'])]]);
+  dbmod.saveSpKeywordSnapshot(db, m);
+  const loaded = dbmod.loadSpKeywordSnapshot(db);
+  check('SP広告KWスナップショット: 保存→読込で ASIN→KW配列が往復する',
+    loaded && Array.isArray(loaded.get('B0AAAAAAA1')) && loaded.get('B0AAAAAAA1').includes('平串 30cm')
+    && loaded.get('B0BBBBBBB2').length === 1, JSON.stringify([...(loaded || new Map())]));
+  // TTL 切れは null (古いKWで生成しない)
+  const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(dbmod.SP_KW_SNAPSHOT_KEY);
+  const stale = JSON.parse(row.value); stale.fetchedAt = '2020-01-01T00:00:00Z';
+  db.prepare('UPDATE ph_intake_state SET value = ? WHERE key = ?').run(JSON.stringify(stale), dbmod.SP_KW_SNAPSHOT_KEY);
+  check('SP広告KWスナップショット: TTL (7日) 切れは null', dbmod.loadSpKeywordSnapshot(db) === null);
+  check('SP広告KWスナップショット: 壊れたJSONでも落ちず null',
+    (() => { db.prepare('UPDATE ph_intake_state SET value = ? WHERE key = ?').run('{broken', dbmod.SP_KW_SNAPSHOT_KEY);
+             return dbmod.loadSpKeywordSnapshot(db) === null; })());
+  db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(dbmod.SP_KW_SNAPSHOT_KEY);
+}
+
 // ─── extractAsin (2026-08-04: 広告KWの材料化に使う ASIN 解決) ───
 check('extractAsin: asin列を優先', dbmod.extractAsin({ asin: 'b0abc12345', amazon_url: 'https://www.amazon.co.jp/dp/B0ZZZZZZZZ' }) === 'B0ABC12345');
 check('extractAsin: amazon_url の /dp/ から抽出', dbmod.extractAsin({ amazon_url: 'https://www.amazon.co.jp/dp/B0H5QKKD18?th=1' }) === 'B0H5QKKD18');

@@ -689,6 +689,34 @@ export function extractAsin(draft) {
   return m ? m[1].toUpperCase() : null;
 }
 
+/**
+ * SP広告マニュアルKWのスナップショット (2026-08-04)。
+ * Amazon Ads の全件取得は5〜10分かかり claim のタイムアウト (15s) に間に合わないため、
+ * 取得成功時に ph_intake_state へ保存し、以後の claim は即時に使う (stale-while-revalidate)。
+ * KW はめったに変わらないので TTL は7日。
+ */
+export const SP_KW_SNAPSHOT_KEY = 'sp_keywords_snapshot';
+export const SP_KW_SNAPSHOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function saveSpKeywordSnapshot(db, byAsin) {
+  const obj = {};
+  for (const [asin, kws] of byAsin) obj[asin] = [...kws];
+  db.prepare(`INSERT INTO ph_intake_state (key, value) VALUES (?, ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(SP_KW_SNAPSHOT_KEY, JSON.stringify({ fetchedAt: new Date().toISOString(), byAsin: obj }));
+}
+
+/** @returns {Map<string, string[]>|null} TTL内のスナップショット (無ければ null) */
+export function loadSpKeywordSnapshot(db, { ttlMs = SP_KW_SNAPSHOT_TTL_MS } = {}) {
+  const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SP_KW_SNAPSHOT_KEY);
+  if (!row?.value) return null;
+  try {
+    const parsed = JSON.parse(row.value);
+    if (!parsed?.fetchedAt || Date.now() - Date.parse(parsed.fetchedAt) > ttlMs) return null;
+    return new Map(Object.entries(parsed.byAsin || {}));
+  } catch (_) { return null; }
+}
+
 // ─── P2: AI生成の claim/lease (2026-08-03、Codex設計相談の Critical/High 対応) ───
 
 export const GENERATION_LEASE_MINUTES = 30;

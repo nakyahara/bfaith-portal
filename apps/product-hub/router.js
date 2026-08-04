@@ -15,7 +15,7 @@ import crypto from 'crypto';
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
-  extractAsin,
+  extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -34,7 +34,7 @@ import {
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
-import { getKeywordRecommendations } from '../keyword-researcher/ads-api.js';
+import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
   buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap,
@@ -1441,20 +1441,39 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
   for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
     logEvent(db, d.id, 'generation_claimed', runId, 'service-api');
   }
-  // Amazon 広告の推奨キーワードを材料に添付 (2026-08-04 中原さん要望「SP広告のKWも参考に」)。
-  // CONVERSIONS 順 = 実際に売れている検索語に近い。fail-soft: env 未設定・API 失敗でも claim は成功させる
-  //   (生成側は「楽天向けに取捨選択する候補プール」として使う。機械的に全部は入れない)
-  for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
-    const asin = extractAsin(d);
-    if (!asin) continue;
+  // 中原さんが SP広告に「マニュアルで」設定しているキーワードを材料に添付 (2026-08-04)。
+  // 人が選定・運用してきた実キーワードだけを参照する — 推奨KWやオートターゲティングの
+  // プレースホルダは使わない (中原さん指示「マニュアルでなければ参照しない」)。
+  // アカウント全体を30分キャッシュで一括取得するので claim ごとの外部呼び出しは高々1回。
+  // fail-soft: env 未設定 (null)・API 失敗・タイムアウトでも claim は成功させる。
+  // タイムアウト後も裏の取得は続きキャッシュに入る (次回 claim で使われるだけで無害)
+  const claimedList = Array.isArray(r.claimed) ? r.claimed : [];
+  if (claimedList.some((d) => extractAsin(d))) {
+    // 全件取得は5〜10分かかる (実測) → 生取得の完了を待たず、成功したらスナップショットへ保存し
+    // (fire-and-forget)、今回の応答には「スナップショット or 15s以内に取れた生データ」を使う
+    let byAsin = null;
+    let kwError = null;
     try {
-      const kws = await Promise.race([
-        getKeywordRecommendations([asin], 30),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('ads_kw_timeout')), 10_000)),
+      const live = listSpManualKeywordsByAsin();
+      live.then((m) => { if (m) try { saveSpKeywordSnapshot(getDB(), m); } catch (_) {} })
+          .catch(() => {});
+      byAsin = await Promise.race([
+        live,
+        new Promise((_, rej) => setTimeout(() => rej(new Error('sp_kw_timeout')), 15_000)),
       ]);
-      d.ad_keywords = (kws || []).map((k) => k.keyword).filter(Boolean).slice(0, 30);
     } catch (e) {
-      d.ad_keywords_error = String(e.message || e).slice(0, 120);
+      kwError = String(e.message || e).slice(0, 120);
+    }
+    if (!byAsin) byAsin = loadSpKeywordSnapshot(db);
+    if (byAsin) {
+      for (const d of claimedList) {
+        const asin = extractAsin(d);
+        const kws = asin ? byAsin.get(asin) : null;
+        const arr = kws ? (Array.isArray(kws) ? kws : [...kws]) : null;
+        if (arr && arr.length > 0) d.sp_keywords = arr.slice(0, 50);
+      }
+    } else if (kwError) {
+      for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
   res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
