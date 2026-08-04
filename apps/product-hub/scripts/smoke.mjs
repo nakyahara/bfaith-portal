@@ -1941,6 +1941,11 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   server.close();
 }
 
+// ─── extractAsin (2026-08-04: 広告KWの材料化に使う ASIN 解決) ───
+check('extractAsin: asin列を優先', dbmod.extractAsin({ asin: 'b0abc12345', amazon_url: 'https://www.amazon.co.jp/dp/B0ZZZZZZZZ' }) === 'B0ABC12345');
+check('extractAsin: amazon_url の /dp/ から抽出', dbmod.extractAsin({ amazon_url: 'https://www.amazon.co.jp/dp/B0H5QKKD18?th=1' }) === 'B0H5QKKD18');
+check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === null && dbmod.extractAsin({ asin: '短い', amazon_url: 'https://example.com/x' }) === null);
+
 // ─── 説明文3欄プレビュー (2026-08-03: 楽天の入力欄と同じ最終形をアプリで見る) ───
 {
   const { buildDescriptionPreview, composeDescriptions } = await import('../services/rakuten-listing.js');

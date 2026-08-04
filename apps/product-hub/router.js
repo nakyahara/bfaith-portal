@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
+  extractAsin,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -33,6 +34,7 @@ import {
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
+import { getKeywordRecommendations } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
   buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap,
@@ -1428,7 +1430,7 @@ serviceApiRouter.get('/generation-queue', (req, res) => {
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
 // 取得と排他を1回で行う: ready_for_ai かつ 未claim/lease切れ の draft を run_id で押さえて材料付きで返す。
 // 定期実行と手動、前夜のハングした実行が同じ draft を二重生成するのを防ぐ (lease 30分)
-serviceApiRouter.post('/generation-queue/claim', (req, res) => {
+serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
   const runId = cleanText(req.body?.run_id, 100);
   if (!runId) return res.status(400).json({ ok: false, error: 'run_id が必要です (例: 20260803-2200-a1b2)' });
   let limit = Number.parseInt(req.body?.limit, 10);
@@ -1438,6 +1440,22 @@ serviceApiRouter.post('/generation-queue/claim', (req, res) => {
   const r = claimGenerationDrafts(db, runId, { limit });
   for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
     logEvent(db, d.id, 'generation_claimed', runId, 'service-api');
+  }
+  // Amazon 広告の推奨キーワードを材料に添付 (2026-08-04 中原さん要望「SP広告のKWも参考に」)。
+  // CONVERSIONS 順 = 実際に売れている検索語に近い。fail-soft: env 未設定・API 失敗でも claim は成功させる
+  //   (生成側は「楽天向けに取捨選択する候補プール」として使う。機械的に全部は入れない)
+  for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
+    const asin = extractAsin(d);
+    if (!asin) continue;
+    try {
+      const kws = await Promise.race([
+        getKeywordRecommendations([asin], 30),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('ads_kw_timeout')), 10_000)),
+      ]);
+      d.ad_keywords = (kws || []).map((k) => k.keyword).filter(Boolean).slice(0, 30);
+    } catch (e) {
+      d.ad_keywords_error = String(e.message || e).slice(0, 120);
+    }
   }
   res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
 });

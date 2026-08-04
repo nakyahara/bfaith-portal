@@ -678,6 +678,17 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
   }));
 }
 
+/**
+ * draft から ASIN を取り出す (2026-08-04)。asin 列優先、無ければ amazon_url の /dp/ から抽出。
+ * AI 生成の材料として Amazon 広告の推奨キーワードを引くために使う。
+ */
+export function extractAsin(draft) {
+  const direct = String(draft?.asin || '').trim().toUpperCase();
+  if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
+  const m = String(draft?.amazon_url || '').match(/\/dp\/([A-Z0-9]{10})(?:[/?#]|$)/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
 // ─── P2: AI生成の claim/lease (2026-08-03、Codex設計相談の Critical/High 対応) ───
 
 export const GENERATION_LEASE_MINUTES = 30;
