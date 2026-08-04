@@ -99,7 +99,7 @@ await check('componentExists 省略時は存在扱い (既存呼び出し互換)
 // ─── 2. rebuildMProducts 統合 ───
 console.log('\n[2] rebuildMProducts (セット税率の反映)');
 
-const db = await initDB();
+let db = await initDB();
 const NOW = '2026-08-04 00:00:00';
 
 // 単品 (raw_ne_products): 税率 0 = NE未登録 のものと、NE に正しく入っているもの
@@ -187,6 +187,18 @@ await check('単品側の税率解決は従来どおり (手動フォールバ�
 // ─── 3. API 即時反映 (POST/DELETE /api/tax_rate → 親セットも追従) ───
 console.log('\n[3] /api/tax_rate の親セット即時反映');
 
+process.env.WAREHOUSE_API_KEY = ''; // 認証スキップ
+const routerModule = await import('../apps/warehouse/router.js');
+const router = routerModule.default;
+const { refreshSetTaxRates } = routerModule;
+
+// router.js は import 時に自前で initDB() を呼び、db.js のモジュール変数を張り替える。
+// テスト側が古い connection を掴んだままだと prepared statement とハンドルが二重になるので、
+// シードより前に router 側の connection へ統一し、古い方を閉じる
+await new Promise(r => setTimeout(r, 50)); // router の非同期 initDB() 完了待ち
+const routerDb = getDB();
+if (routerDb !== db) { db.close(); db = routerDb; }
+
 // staging は品質ゲートで本番反映されないので、API テスト用に m_products /
 // m_set_components を直接シードする (rebuild 後の状態を模した最小構成)
 db.exec('DELETE FROM m_products; DELETE FROM m_set_components; DELETE FROM product_tax_rate;');
@@ -199,10 +211,6 @@ db.prepare(`INSERT INTO m_set_components
   (セット商品コード, 構成商品コード, 数量, 構成商品名, 構成商品原価, updated_at)
   VALUES (?, ?, ?, ?, ?, ?)`).run('oat1kg-4', 'oat1kg', 4, 'オートミール 1kg', 648, NOW);
 
-process.env.WAREHOUSE_API_KEY = ''; // 認証スキップ
-const routerModule = await import('../apps/warehouse/router.js');
-const router = routerModule.default;
-const { refreshSetTaxRates } = routerModule;
 const app = express();
 app.use(express.json());
 app.use('/', router);

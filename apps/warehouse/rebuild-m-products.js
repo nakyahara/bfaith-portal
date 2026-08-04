@@ -522,9 +522,12 @@ export async function rebuildMProducts() {
 // ─── 単体実行 ───
 
 import { initDB } from './db.js';
+import { pathToFileURL } from 'url';
 
-const isMain = !process.argv[1] || process.argv[1].includes('rebuild-m-products');
-if (isMain && process.argv[1]?.includes('rebuild-m-products')) {
+// 部分一致だと「ファイル名に rebuild-m-products を含む別スクリプト」から import した
+// だけでバッチ本体が走ってしまうため、エントリポイントの URL 完全一致で判定する
+const isMain = !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
   await initDB();
   const result = await rebuildMProducts();
   console.log('\n結果:', JSON.stringify(result, null, 2));
