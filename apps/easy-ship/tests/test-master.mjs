@@ -13,7 +13,7 @@ const repo =
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'es-master-'));
 process.env.DATA_DIR = tmp; // DB初期化より前に必ず設定
-delete process.env.EASY_SHIP_SKU_CASE_INSENSITIVE;
+
 delete process.env.EASY_SHIP_ALLOW_ORDER_ID_LOGGING;
 
 const dbMod = await import(pathToFileURL(path.join(repo, 'apps/easy-ship/db.js')));
@@ -104,12 +104,11 @@ expectErr(() => svc.updateMaster(9999, { sku: 'x', packageSizeCode: 'y', package
 const hit = svc.lookupOne('nanairosks-2new');
 ok(hit.amazonOptionValue === '84797239-91e6-4101-a8b8-9b86c45482e7', 'lookupOneが登録値を返す');
 ok(svc.lookupOne(' nanairosks-2new ').sku === 'nanairosks-2new', '前後空白付きでも照合できる');
-expectErr(() => svc.lookupOne('NANAIROSKS-2NEW'), 404, 'SKU_NOT_FOUND', '既定 (大小区別) では大小違いは未登録扱い');
+ok(svc.lookupOne('NANAIROSKS-2NEW').sku === 'nanairosks-2new', 'SKUは常に大小無視で一致する');
 expectErr(() => svc.lookupOne('nope-999'), 404, 'SKU_NOT_FOUND', '未登録SKUはSKU_NOT_FOUND');
 
-process.env.EASY_SHIP_SKU_CASE_INSENSITIVE = '1';
-ok(svc.lookupOne('NANAIROSKS-2NEW').sku === 'nanairosks-2new', 'EASY_SHIP_SKU_CASE_INSENSITIVE=1 なら大小無視で一致');
-delete process.env.EASY_SHIP_SKU_CASE_INSENSITIVE;
+
+
 
 const dead = svc.createMaster({ sku: 'dead-001', packageSizeCode: 'X', packageSizeLabel: 'Y' }, 'a');
 svc.removeMaster(dead.id, false, 'a');

@@ -3,7 +3,7 @@
  * SKU → Easy Ship 梱包サイズ (寸法プリセット) マスターの管理と、Chrome拡張向け照会。
  *
  * 照合ルール (easy-ship-helper 仕様):
- * - SKUは前後trimして完全一致。大小無視は env EASY_SHIP_SKU_CASE_INSENSITIVE='1' のときのみ
+ * - SKUは前後trim+**常に大文字小文字を同一視**して完全一致 (2026-08-04 仕様として固定)
  * - SKUの一意性は照合設定に関わらず常に大小無視 (DBの LOWER(sku) 一意インデックス)
  */
 import { getDB, utcNow } from './db.js';
@@ -18,9 +18,7 @@ export class EsError extends Error {
   }
 }
 
-export function skuCaseInsensitive() {
-  return process.env.EASY_SHIP_SKU_CASE_INSENSITIVE === '1';
-}
+// SKUの大文字小文字は常に同一視する (2026-08-04 仕様として固定。設定切替は廃止)
 
 function isUniqueViolation(e) {
   return typeof e?.code === 'string' && e.code.startsWith('SQLITE_CONSTRAINT');
@@ -108,15 +106,14 @@ export function validateInput(body) {
 
 // ---------- 照会 (拡張向け) ----------
 
-/** 照合設定に応じた検索。見つからなければ null */
+/** SKU検索 (常に大小無視の完全一致)。見つからなければ null */
 export function findBySku(rawSku) {
   const sku = str(rawSku).trim();
   if (!sku) return null;
-  const db = getDB();
-  if (skuCaseInsensitive()) {
-    return db.prepare('SELECT * FROM es_package_size_master WHERE LOWER(sku) = LOWER(?)').get(sku) ?? null;
-  }
-  return db.prepare('SELECT * FROM es_package_size_master WHERE sku = ?').get(sku) ?? null;
+  return (
+    getDB().prepare('SELECT * FROM es_package_size_master WHERE LOWER(sku) = LOWER(?)').get(sku) ??
+    null
+  );
 }
 
 /** 重複チェック用: 照合設定に関わらず常に大小無視 (DB一意制約と同じ基準) */
@@ -140,7 +137,6 @@ export function bulkLookup(skus) {
   if (!Array.isArray(skus) || skus.length === 0 || skus.length > 200) {
     throw new EsError(400, 'VALIDATION_ERROR', 'skus は1〜200件の配列で指定してください');
   }
-  const ci = skuCaseInsensitive();
   const found = [];
   const notFound = [];
   const inactive = [];
@@ -148,7 +144,7 @@ export function bulkLookup(skus) {
   for (const raw of skus) {
     const sku = str(raw).trim();
     if (!sku || sku.length > 100) continue;
-    const key = ci ? sku.toLowerCase() : sku;
+    const key = sku.toLowerCase(); // SKUは常に大小無視
     if (seen.has(key)) continue;
     seen.add(key);
     const row = findBySku(sku);
@@ -371,8 +367,6 @@ export function importCsv(csvText, mode, allowPartial, userEmail) {
     return i >= 0 ? (row[i] ?? '') : '';
   };
 
-  const ci = skuCaseInsensitive();
-
   /**
    * 行の検証と適用計画の作成。
    * commit時は BEGIN IMMEDIATE トランザクション内から呼ぶことで、
@@ -415,9 +409,6 @@ export function importCsv(csvText, mode, allowPartial, userEmail) {
     if (!existing) {
       plans.push({ action: 'create', input });
       results.push({ line, sku: input.sku, action: 'create' });
-    } else if (!ci && existing.sku !== input.sku) {
-      // 大小区別モードでは、大小違いの既存SKUへの上書きは行わずエラーにする
-      results.push({ line, sku: input.sku, action: 'error', message: `大文字小文字違いの既存SKU "${existing.sku}" と衝突しています`, raw });
     } else {
       const unchanged =
         existing.sku === input.sku &&

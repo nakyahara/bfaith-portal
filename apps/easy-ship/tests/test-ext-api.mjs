@@ -14,7 +14,6 @@ const repo =
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'es-ext-'));
 process.env.DATA_DIR = tmp;
 delete process.env.EASY_SHIP_EXT_TOKEN;
-delete process.env.EASY_SHIP_SKU_CASE_INSENSITIVE;
 delete process.env.EASY_SHIP_ALLOW_ORDER_ID_LOGGING;
 
 const { default: express } = await import(pathToFileURL(path.join(repo, 'node_modules/express/index.js')));

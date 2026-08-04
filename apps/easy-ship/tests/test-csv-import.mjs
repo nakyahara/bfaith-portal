@@ -13,7 +13,6 @@ const repo =
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'es-csv-'));
 process.env.DATA_DIR = tmp;
-delete process.env.EASY_SHIP_SKU_CASE_INSENSITIVE;
 
 const dbMod = await import(pathToFileURL(path.join(repo, 'apps/easy-ship/db.js')));
 const csv = await import(pathToFileURL(path.join(repo, 'apps/easy-ship/csv.js')));
@@ -109,9 +108,12 @@ const dupRes = svc.importCsv(
 );
 ok(dupRes.errors === 1 && dupRes.rows.some((r) => r.action === 'error' && r.message.includes('重複')), 'ファイル内の大小違い重複はエラー');
 
-// 大小区別モードで既存SKUと大小違い衝突
+// 大小違いのSKUは同一SKUとして扱われ、更新になる (常に大小無視)
 const caseRes = svc.importCsv(`${HEADER}\nold-001,SIZE_80,80サイズ,80,true,\n`, 'preview', false, 'a');
-ok(caseRes.errors === 1 && caseRes.rows[0].message.includes('大文字小文字違い'), '大小違いの既存SKUへの上書きはエラー');
+ok(
+  caseRes.errors === 0 && caseRes.updated === 1,
+  '大小違いの既存SKUは同一SKUとして更新扱いになる',
+);
 
 // ヘッダー不正・構文不正
 throws(() => svc.importCsv('sku,note\nX,1\n', 'preview', false, 'a'), (e) => e.code === 'INVALID_CSV', '必須列欠落は400');
