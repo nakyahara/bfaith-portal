@@ -56,6 +56,27 @@ const merged = svc.normalizeComboItems([
 ]);
 ok(merged.comboKey === 'ccc-3*3', '同一SKU (大小違い含む) は数量を合算する');
 ok(merged.items.length === 1 && merged.items[0].qty === 3, 'items も合算される');
+// 区切り文字を含むSKUでもキーが衝突しない (Codexレビュー重大指摘)
+const tricky1 = svc.normalizeComboItems([
+  { sku: 'a', qty: 1 },
+  { sku: 'b', qty: 1 },
+]);
+const tricky2 = svc.normalizeComboItems([{ sku: 'a*1|b', qty: 2 }]);
+ok(tricky1.comboKey !== tricky2.comboKey, "SKUに '*' や '|' が含まれてもキーが衝突しない");
+
+throws(
+  () => svc.normalizeComboItems([{ sku: 'only-one', qty: 1 }]),
+  (e) => e.code === 'VALIDATION_ERROR' && e.message.includes('単品'),
+  '単品 (1種×1個) は組み合わせとして扱わない',
+);
+throws(
+  () => svc.normalizeComboItems([
+    { sku: 'big', qty: 500 },
+    { sku: 'BIG', qty: 500 },
+  ]),
+  (e) => e.code === 'VALIDATION_ERROR' && e.message.includes('合算'),
+  '合算後の数量も999上限',
+);
 throws(() => svc.normalizeComboItems([]), (e) => e.code === 'VALIDATION_ERROR', '空配列は400');
 throws(
   () => svc.normalizeComboItems([{ sku: 'x', qty: 0 }]),
@@ -117,7 +138,7 @@ const lookup = svc.comboBulkLookup([
   { items: [{ sku: 'aroma-b', qty: 1 }, { sku: 'AROMA-A', qty: 1 }] }, // 順序違いでも一致
   { items: [{ sku: 'unknown-x', qty: 3 }] },
   { items: [{ sku: 'sionetsu168g-le-2', qty: 3 }] }, // 数量違いは別構成
-  { items: [{ sku: '', qty: 1 }] }, // 不正
+  { items: [{ sku: 'single-x', qty: 1 }] }, // 単品構成は invalid
 ]);
 ok(lookup.results.length === 5, 'リクエストと同じ件数のresultsが返る');
 ok(
@@ -128,7 +149,7 @@ ok(
 ok(lookup.results[1].status === 'found', '順序違いでも一致する');
 ok(lookup.results[2].status === 'notFound', '未登録構成は notFound');
 ok(lookup.results[3].status === 'notFound', '数量が違えば別構成 (完全一致のみ)');
-ok(lookup.results[4].status === 'invalid', '不正な構成は invalid (他の照会は継続)');
+ok(lookup.results[4].status === 'invalid', '単品構成は invalid (他の照会は継続)');
 
 // --- 無効化・一覧 ---
 const listed = svc.listCombos({ q: 'sionetsu' });

@@ -196,7 +196,7 @@ ok(svc.deriveSizeCode('特大パレット') === 'auto', 'コード導出: 不明
   });
   let cr = await req('POST', '/api/v1/combos/bulk-lookup', {
     key: 'test-token-1234567890',
-    body: { combos: [{ items: [{ sku: 'COMBO-X', qty: 2 }] }, { items: [{ sku: 'nope', qty: 1 }] }] },
+    body: { combos: [{ items: [{ sku: 'COMBO-X', qty: 2 }] }, { items: [{ sku: 'nope', qty: 2 }] }] },
   });
   ok(
     cr.status === 200 &&

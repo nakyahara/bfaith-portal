@@ -632,10 +632,19 @@ export function addExtLogs(entries) {
 // ---------- 組み合わせマスター (数量2以上・同梱注文用) ----------
 
 /**
+ * combo_key用のSKUエンコード。区切り文字 '*' '|' がSKU本文と衝突しないよう、
+ * encodeURIComponent (%自体も%25にエスケープされる) + '*'→'%2A' で一意にする
+ */
+function encodeComboSku(skuLower) {
+  return encodeURIComponent(skuLower).replace(/\*/g, '%2A');
+}
+
+/**
  * 注文構成 [{sku, qty}] を検証し、正規化キーと表示用アイテムへ変換する。
  * - SKUは trim (照合は常に大小無視 → キーは小文字化)
- * - 同一SKUが複数行に分かれていたら数量を合算する
- * - キーは「小文字sku*数量」を辞書順に '|' 連結 (順序に依存しない)
+ * - 同一SKUが複数行に分かれていたら数量を合算する (合算後も1〜999)
+ * - キーは「エンコード済み小文字sku*数量」を辞書順に '|' 連結 (順序に依存しない・衝突しない)
+ * - 単品 (1種×1個) はSKUマスターの領分のため組み合わせとしては扱わない
  * 不正なら EsError(400)
  */
 export function normalizeComboItems(rawItems) {
@@ -657,8 +666,20 @@ export function normalizeComboItems(rawItems) {
     if (cur) cur.qty += qty;
     else bySku.set(key, { sku, qty });
   }
+  for (const [, v] of bySku) {
+    if (v.qty > 999) {
+      throw new EsError(400, 'VALIDATION_ERROR', '同一SKUの合算数量は999までです');
+    }
+  }
+  if (bySku.size === 1 && [...bySku.values()][0].qty === 1) {
+    throw new EsError(
+      400,
+      'VALIDATION_ERROR',
+      '単品 (1種×1個) は組み合わせではなくSKUマスターで扱ってください',
+    );
+  }
   const entries = [...bySku.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  const comboKey = entries.map(([k, v]) => `${k}*${v.qty}`).join('|');
+  const comboKey = entries.map(([k, v]) => `${encodeComboSku(k)}*${v.qty}`).join('|');
   const items = entries.map(([, v]) => ({ sku: v.sku, qty: v.qty }));
   return { comboKey, items };
 }
