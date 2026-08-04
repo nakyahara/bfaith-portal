@@ -27,7 +27,8 @@ RUN_ID="$(date +%Y%m%d-%H%M)-$RANDOM"
 POST /generation-queue/claim  body: { "run_id": RUN_ID, "limit": 2 }
 ```
 
-返ってきた `drafts[]` が処理対象 (材料付き: name / official_url / amazon_url / asin / reference_urls / specs / 画像数)。
+返ってきた `drafts[]` が処理対象 (材料付き: name / official_url / amazon_url / asin / reference_urls / specs / 画像数 /
+**sp_keywords** = 中原さんが Amazon SP広告に**マニュアルで設定している実キーワード**。無い場合もある)。
 0件なら「生成待ちはありません」と報告して終了。lease は30分 — 超えそうな場合も続行してよいが、
 書き戻しが 409 になったら claim し直さず skip して報告する (別の実行が拾っている)。
 
@@ -51,6 +52,12 @@ POST /generation-queue/claim  body: { "run_id": RUN_ID, "limit": 2 }
 | `desc_features` | 特徴 (箇条書き3〜6点。裏取りした事実のみ) |
 | `desc_spec` | 仕様 (説明文用。specs を自然文/表形式に) |
 | `desc_notes` | 注意書き (使用上の注意・免責。ページ表記と矛盾しないこと) |
+
+**タイトルの検索キーワード選定**: `sp_keywords` (中原さんが SP広告にマニュアルで入れている
+実キーワード) があれば**最優先で参考にする** — 人が選定して広告運用で使ってきた確定キーワード。
+推奨KW・オートターゲティング由来の語は使わない (中原さん指示: マニュアルでなければ参照しない)。
+Amazon と楽天は検索の癖が違うため**楽天向けに取捨選択**する (機械的に全部は入れない。
+商品と無関係な語・競合ブランド名は使わない)。sp_keywords が無い商品は従来どおり裏取り事実から選ぶ。
 
 生成後にセルフ lint: 景表法 (No.1・最上級表現の根拠なし使用)、薬機法 (効能効果の断定)、
 楽天禁止タグ、機種依存文字、文字数超過。違反があれば自分で直す。

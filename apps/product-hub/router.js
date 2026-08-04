@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
+  extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
@@ -33,6 +34,7 @@ import {
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
+import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
 import {
   PRODUCT_TYPES, CATEGORY_LABELS, CATEGORY_LABELS_BY_TYPE, adResponsibility, validatePageInfo,
   buildPageInfoHtml, mapNeShippingToRakuten, listShippingMethodMap, saveShippingMethodMap,
@@ -1428,7 +1430,7 @@ serviceApiRouter.get('/generation-queue', (req, res) => {
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
 // 取得と排他を1回で行う: ready_for_ai かつ 未claim/lease切れ の draft を run_id で押さえて材料付きで返す。
 // 定期実行と手動、前夜のハングした実行が同じ draft を二重生成するのを防ぐ (lease 30分)
-serviceApiRouter.post('/generation-queue/claim', (req, res) => {
+serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
   const runId = cleanText(req.body?.run_id, 100);
   if (!runId) return res.status(400).json({ ok: false, error: 'run_id が必要です (例: 20260803-2200-a1b2)' });
   let limit = Number.parseInt(req.body?.limit, 10);
@@ -1438,6 +1440,46 @@ serviceApiRouter.post('/generation-queue/claim', (req, res) => {
   const r = claimGenerationDrafts(db, runId, { limit });
   for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
     logEvent(db, d.id, 'generation_claimed', runId, 'service-api');
+  }
+  // 中原さんが SP広告に「マニュアルで」設定しているキーワードを材料に添付 (2026-08-04)。
+  // 人が選定・運用してきた実キーワードだけを参照する — 推奨KWやオートターゲティングの
+  // プレースホルダは使わない (中原さん指示「マニュアルでなければ参照しない」)。
+  // アカウント全体を30分キャッシュで一括取得するので claim ごとの外部呼び出しは高々1回。
+  // fail-soft: env 未設定 (null)・API 失敗・タイムアウトでも claim は成功させる。
+  // タイムアウト後も裏の取得は続きキャッシュに入る (次回 claim で使われるだけで無害)
+  const claimedList = Array.isArray(r.claimed) ? r.claimed : [];
+  if (claimedList.some((d) => extractAsin(d))) {
+    // 全件取得は5〜10分かかる (実測) → スナップショット優先で応答は待たせない (Codex R3 high):
+    // ①有効なスナップショットがあれば即時それを使う ②裏で最新化 (fire-and-forget・成功時に保存)
+    // ③スナップショットが無い初回だけ、15s を上限に生取得を待ってみる (それでも無ければ今回は無しで続行)
+    let byAsin = loadSpKeywordSnapshot(db);
+    let kwError = null;
+    const live = listSpManualKeywordsByAsin();
+    live.then((m) => { if (m) try { saveSpKeywordSnapshot(getDB(), m); } catch (_) {} })
+        .catch((e) => {
+          // 無音で握り潰さない (Codex R2: 運用で「なぜKWが付かないか」を追えるように)
+          console.error('[product-hub] SP広告KWの取得に失敗:', String(e?.message || e).slice(0, 200));
+        });
+    if (!byAsin) {
+      try {
+        byAsin = await Promise.race([
+          live,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('sp_kw_timeout')), 15_000)),
+        ]);
+      } catch (e) {
+        kwError = String(e.message || e).slice(0, 120);
+      }
+    }
+    if (byAsin) {
+      for (const d of claimedList) {
+        const asin = extractAsin(d);
+        const kws = asin ? byAsin.get(asin) : null;
+        const arr = kws ? (Array.isArray(kws) ? kws : [...kws]) : null;
+        if (arr && arr.length > 0) d.sp_keywords = arr.slice(0, 50);
+      }
+    } else if (kwError) {
+      for (const d of claimedList) d.sp_keywords_error = kwError;
+    }
   }
   res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
 });

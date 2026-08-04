@@ -678,6 +678,47 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
   }));
 }
 
+/**
+ * draft から ASIN を取り出す (2026-08-04)。asin 列優先、無ければ amazon_url の /dp/ から抽出。
+ * AI 生成の材料として Amazon 広告の推奨キーワードを引くために使う。
+ */
+export function extractAsin(draft) {
+  const direct = String(draft?.asin || '').trim().toUpperCase();
+  if (/^[A-Z0-9]{10}$/.test(direct)) return direct;
+  const m = String(draft?.amazon_url || '').match(/\/dp\/([A-Z0-9]{10})(?:[/?#]|$)/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+/**
+ * SP広告マニュアルKWのスナップショット (2026-08-04)。
+ * Amazon Ads の全件取得は5〜10分かかり claim のタイムアウト (15s) に間に合わないため、
+ * 取得成功時に ph_intake_state へ保存し、以後の claim は即時に使う (stale-while-revalidate)。
+ * KW はめったに変わらないので TTL は7日。
+ */
+export const SP_KW_SNAPSHOT_KEY = 'sp_keywords_snapshot';
+export const SP_KW_SNAPSHOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function saveSpKeywordSnapshot(db, byAsin) {
+  const obj = {};
+  for (const [asin, kws] of byAsin) obj[asin] = [...kws];
+  db.prepare(`INSERT INTO ph_intake_state (key, value) VALUES (?, ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(SP_KW_SNAPSHOT_KEY, JSON.stringify({ fetchedAt: new Date().toISOString(), byAsin: obj }));
+}
+
+/** @returns {Map<string, string[]>|null} TTL内のスナップショット (無ければ null) */
+export function loadSpKeywordSnapshot(db, { ttlMs = SP_KW_SNAPSHOT_TTL_MS } = {}) {
+  const row = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(SP_KW_SNAPSHOT_KEY);
+  if (!row?.value) return null;
+  try {
+    const parsed = JSON.parse(row.value);
+    const fetchedAt = Date.parse(parsed?.fetchedAt);
+    // NaN は比較が常に false になり無期限に受理されてしまう (Codex R2 low) → 明示的に弾く
+    if (!Number.isFinite(fetchedAt) || Date.now() - fetchedAt > ttlMs) return null;
+    return new Map(Object.entries(parsed.byAsin || {}));
+  } catch (_) { return null; }
+}
+
 // ─── P2: AI生成の claim/lease (2026-08-03、Codex設計相談の Critical/High 対応) ───
 
 export const GENERATION_LEASE_MINUTES = 30;
