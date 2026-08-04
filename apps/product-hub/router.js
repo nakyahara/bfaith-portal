@@ -1456,7 +1456,10 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
     try {
       const live = listSpManualKeywordsByAsin();
       live.then((m) => { if (m) try { saveSpKeywordSnapshot(getDB(), m); } catch (_) {} })
-          .catch(() => {});
+          .catch((e) => {
+            // 無音で握り潰さない (Codex R2: 運用で「なぜKWが付かないか」を追えるように)
+            console.error('[product-hub] SP広告KWの取得に失敗:', String(e?.message || e).slice(0, 200));
+          });
       byAsin = await Promise.race([
         live,
         new Promise((_, rej) => setTimeout(() => rej(new Error('sp_kw_timeout')), 15_000)),

@@ -252,12 +252,15 @@ function joinSpKeywordsByAsin(productAds, keywords) {
   return byAsin;
 }
 
-let spKwCache = null; // { fetchedAt, byAsin }
+let spKwCache = null;    // { fetchedAt, byAsin }
+let spKwInflight = null; // 進行中の取得 promise (Codex R2 high: 並行claimでの多重起動を防ぐ)
 const SP_KW_CACHE_TTL_MS = 30 * 60 * 1000;
+const SP_KW_MAX_PAGES = 60;
 
 /**
  * SP広告に「人がマニュアルで設定している」キーワードを ASIN 別に返す (ENABLEDのみ)。
- * アカウント全体を一括取得して30分キャッシュ (claim のたびに叩かない)。
+ * アカウント全体を一括取得して30分キャッシュ。取得は数分かかるため、進行中は
+ * 同じ promise を共有する (claim のたびに新しい取得を積まない)。
  * env 未設定なら null (呼び出し側は fail-soft で続行する)。
  */
 async function listSpManualKeywordsByAsin({ force = false } = {}) {
@@ -265,25 +268,38 @@ async function listSpManualKeywordsByAsin({ force = false } = {}) {
   if (!force && spKwCache && (Date.now() - spKwCache.fetchedAt) < SP_KW_CACHE_TTL_MS) {
     return spKwCache.byAsin;
   }
+  if (spKwInflight) return spKwInflight;
   const fetchAll = async (path, media, listKey) => {
     const out = [];
     let nextToken;
-    for (let page = 0; page < 60; page++) {
+    for (let page = 0; page < SP_KW_MAX_PAGES; page++) {
       const body = { stateFilter: { include: ['ENABLED'] }, maxResults: 500, ...(nextToken ? { nextToken } : {}) };
       const data = await adsRequestVersioned('POST', path, body, media);
       out.push(...(data?.[listKey] || []));
       nextToken = data?.nextToken;
       if (!nextToken) break;
     }
+    if (nextToken) {
+      // ページ上限に達してもまだ続きがある = 不完全な一覧。部分データを「完全」として
+      // キャッシュ・スナップショット保存すると欠けたKWが7日残る (Codex R2 high) → 失敗扱い
+      throw new Error(`sp_kw_pagination_overflow: ${path} が ${SP_KW_MAX_PAGES} ページを超過`);
+    }
     return out;
   };
-  const [ads, kws] = await Promise.all([
-    fetchAll('/sp/productAds/list', 'application/vnd.spProductAd.v3+json', 'productAds'),
-    fetchAll('/sp/keywords/list', 'application/vnd.spKeyword.v3+json', 'keywords'),
-  ]);
-  const byAsin = joinSpKeywordsByAsin(ads, kws);
-  spKwCache = { fetchedAt: Date.now(), byAsin };
-  return byAsin;
+  spKwInflight = (async () => {
+    const [ads, kws] = await Promise.all([
+      fetchAll('/sp/productAds/list', 'application/vnd.spProductAd.v3+json', 'productAds'),
+      fetchAll('/sp/keywords/list', 'application/vnd.spKeyword.v3+json', 'keywords'),
+    ]);
+    const byAsin = joinSpKeywordsByAsin(ads, kws);
+    spKwCache = { fetchedAt: Date.now(), byAsin };
+    return byAsin;
+  })();
+  try {
+    return await spKwInflight;
+  } finally {
+    spKwInflight = null;
+  }
 }
 
 export {

@@ -712,7 +712,9 @@ export function loadSpKeywordSnapshot(db, { ttlMs = SP_KW_SNAPSHOT_TTL_MS } = {}
   if (!row?.value) return null;
   try {
     const parsed = JSON.parse(row.value);
-    if (!parsed?.fetchedAt || Date.now() - Date.parse(parsed.fetchedAt) > ttlMs) return null;
+    const fetchedAt = Date.parse(parsed?.fetchedAt);
+    // NaN は比較が常に false になり無期限に受理されてしまう (Codex R2 low) → 明示的に弾く
+    if (!Number.isFinite(fetchedAt) || Date.now() - fetchedAt > ttlMs) return null;
     return new Map(Object.entries(parsed.byAsin || {}));
   } catch (_) { return null; }
 }
