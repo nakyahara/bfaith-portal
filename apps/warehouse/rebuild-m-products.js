@@ -39,6 +39,28 @@ export function resolveTaxRate(neTaxNum, manualTaxRate) {
   return { taxRate: null, taxCategory: 'UNKNOWN' };
 }
 
+// セット税率解決: 構成品を1つずつ resolveTaxRate に通し、全構成品が解決できたときだけ確定する。
+// 構成品の NE 消費税率だけを直接見ると、NE 未登録(0)を product_tax_rate で救済した構成品を持つ
+// セットが UNKNOWN に落ちる (単品は救済され、セットだけ税率 NULL になる非対称が起きる)。
+// components: [{ neTaxRate, manualTaxRate }]
+// 単一税率 → その税率 / 複数税率 → MIXED (最小値 = 軽減税率優先) / 1つでも未解決 → UNKNOWN
+export function resolveSetTaxRate(components) {
+  const decimals = new Set();
+  for (const c of components) {
+    const { taxRate } = resolveTaxRate(c.neTaxRate, c.manualTaxRate);
+    if (taxRate === null) return { taxRate: null, taxCategory: 'UNKNOWN' };
+    decimals.add(taxRate);
+  }
+  if (decimals.size === 0) return { taxRate: null, taxCategory: 'UNKNOWN' };
+  if (decimals.size === 1) {
+    const def = TAX_RATES.find(t => t.decimal === [...decimals][0]);
+    return def
+      ? { taxRate: def.decimal, taxCategory: def.category }
+      : { taxRate: null, taxCategory: 'UNKNOWN' };
+  }
+  return { taxRate: Math.min(...decimals), taxCategory: 'MIXED' };
+}
+
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
 // DELETE + INSERT INTO target (...) SELECT ... FROM staging で列名を明示する。
@@ -309,28 +331,26 @@ export async function rebuildMProducts() {
     let totalGenka = 0;
     let hasAllGenka = true;
     let hasAnyGenka = false;
-    const taxRates = new Set();
-    // 構成品税率に null/0 や TAX_RATES 未登録値が含まれるかを記録 (上流異常を握り潰さないため)
-    let hasUnknownTaxRate = false;
+    // 税率は単品と同じ解決順 (NE値優先 → NE未登録(null/0)時のみ product_tax_rate) を
+    // 構成品ごとに適用してから集約する
+    const componentTaxInputs = [];
 
     for (const comp of components) {
+      const compCode = comp.商品コード?.toLowerCase() || '';
       if (comp.原価 > 0) {
         totalGenka += comp.原価 * (comp.数量 || 1);
         hasAnyGenka = true;
       } else {
         hasAllGenka = false;
       }
-      if (comp.消費税率 == null || comp.消費税率 === 0) {
-        hasUnknownTaxRate = true;
-      } else if (TAX_RATES.find(t => t.neRate === comp.消費税率)) {
-        taxRates.add(comp.消費税率);
-      } else {
-        hasUnknownTaxRate = true;
-      }
+      componentTaxInputs.push({
+        neTaxRate: comp.消費税率,
+        manualTaxRate: taxRateMap.get(compCode),
+      });
 
       // 構成品staging投入
       insertComponentStaging.run(
-        setCode, comp.商品コード?.toLowerCase() || '', comp.数量 || 1,
+        setCode, compCode, comp.数量 || 1,
         comp.商品名 || '', comp.原価 || null, ts
       );
     }
@@ -349,16 +369,8 @@ export async function rebuildMProducts() {
     }
 
     // 税区分 (構成品の税率から導出。MIXED は taxRate に最小値を入れる既存仕様を踏襲)
-    // 構成品に null/0 や TAX_RATES 未登録値が1つでもあれば UNKNOWN に倒し、上流異常を握り潰さない
-    let taxCategory = 'UNKNOWN', taxRate = null;
-    if (!hasUnknownTaxRate && taxRates.size === 1) {
-      const def = TAX_RATES.find(t => t.neRate === [...taxRates][0]);
-      if (def) { taxRate = def.decimal; taxCategory = def.category; }
-    } else if (!hasUnknownTaxRate && taxRates.size > 1) {
-      const decs = [...taxRates].map(r => TAX_RATES.find(t => t.neRate === r).decimal);
-      taxCategory = 'MIXED';
-      taxRate = Math.min(...decs);
-    }
+    // 構成品が1つでも解決できなければ UNKNOWN に倒し、上流異常を握り潰さない
+    const { taxRate, taxCategory } = resolveSetTaxRate(componentTaxInputs);
 
     // 取扱区分: NEに存在すればそこから、なければ取扱中
     const status = neInfo?.取扱区分 || '取扱中';

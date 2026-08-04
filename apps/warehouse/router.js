@@ -23,7 +23,7 @@ import { initDB, getDB, getStats, saveToFile, updateSyncMeta } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import { mountSkuMasterApi } from './sku-master-api.js';
 import { importSkuMasterCSV } from './import-sku-master.js';
-import { resolveTaxRate, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
+import { resolveTaxRate, resolveSetTaxRate, KNOWN_DECIMAL_RATES } from './rebuild-m-products.js';
 
 const router = Router();
 const upload = multer({ dest: 'data/import/' });
@@ -824,6 +824,37 @@ router.get('/api/tax_rate/list', (req, res) => {
   res.json({ rows: execQuery(sql, params), total });
 });
 
+// 単品の手動税率を登録・削除した直後に、その単品を構成品に持つセット商品の
+// m_products.消費税率 / 税区分 も再計算する。
+// rebuild (日次) 任せにすると「単品は登録済みなのにセットだけ税率未登録」の状態が
+// 翌朝まで残り、確定ブロックの原因になる。算出ロジックは rebuild と同じ resolveSetTaxRate。
+function refreshSetTaxRatesFor(db, componentSku, now) {
+  const parents = db.prepare(
+    'SELECT DISTINCT セット商品コード FROM m_set_components WHERE 構成商品コード = ? COLLATE NOCASE'
+  ).all(componentSku).map(r => r.セット商品コード).filter(Boolean);
+  if (parents.length === 0) return 0;
+
+  const getComponents = db.prepare(`
+    SELECT p.消費税率 AS ne_tax, t.tax_rate AS manual_tax
+    FROM m_set_components sc
+    LEFT JOIN raw_ne_products p ON sc.構成商品コード = p.商品コード COLLATE NOCASE
+    LEFT JOIN product_tax_rate t ON sc.構成商品コード = t.sku COLLATE NOCASE
+    WHERE sc.セット商品コード = ?
+  `);
+  const updateMp = db.prepare(
+    'UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE'
+  );
+
+  let updated = 0;
+  for (const setCode of parents) {
+    const comps = getComponents.all(setCode)
+      .map(c => ({ neTaxRate: c.ne_tax, manualTaxRate: c.manual_tax }));
+    const { taxRate, taxCategory } = resolveSetTaxRate(comps);
+    updated += updateMp.run(taxRate, taxCategory, now, setCode).changes;
+  }
+  return updated;
+}
+
 // ─── DELETE /api/tax_rate/:sku ───
 // 削除時は m_products.消費税率 / 税区分 も NULL に戻して未登録一覧に再出現させる
 
@@ -835,7 +866,10 @@ router.delete('/api/tax_rate/:sku', (req, res) => {
   if (old) auditLog(db, 'product_tax_rate', sku, 'DELETE', old, null);
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   try { db.prepare('UPDATE m_products SET 消費税率 = NULL, 税区分 = NULL, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(now, sku); } catch {}
-  res.json({ ok: true, deleted: result.changes });
+  // この単品を構成品に持つセットも UNKNOWN に戻す (未登録一覧に再出現させる)
+  let setsUpdated = 0;
+  try { setsUpdated = refreshSetTaxRatesFor(db, sku, now); } catch {}
+  res.json({ ok: true, deleted: result.changes, sets_updated: setsUpdated });
 });
 
 // ─── GET /api/missing/prioritized ───
@@ -1226,7 +1260,10 @@ router.post('/api/tax_rate', (req, res) => {
   db.prepare('INSERT OR REPLACE INTO product_tax_rate (sku, tax_rate, 商品名, synced_at) VALUES (?, ?, ?, ?)').run(sku, tr, product_name || '', now);
   auditLog(db, 'product_tax_rate', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, tax_rate: tr });
   try { db.prepare('UPDATE m_products SET 消費税率 = ?, 税区分 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE').run(taxRate, taxCategory, now, sku); } catch {}
-  res.json({ ok: true, sku, tax_rate: tr, applied: { 消費税率: taxRate, 税区分: taxCategory } });
+  // この単品を構成品に持つセットの税率も即時反映する (rebuild を待たない)
+  let setsUpdated = 0;
+  try { setsUpdated = refreshSetTaxRatesFor(db, sku, now); } catch {}
+  res.json({ ok: true, sku, tax_rate: tr, applied: { 消費税率: taxRate, 税区分: taxCategory }, sets_updated: setsUpdated });
 });
 
 // ─── POST /api/csv/tax_rate ───
@@ -1250,6 +1287,7 @@ router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
   const getMp = db.prepare('SELECT 商品名, 商品区分 FROM m_products WHERE 商品コード = ? COLLATE NOCASE');
 
   let count = 0, skipped = 0, invalid = 0, setSkipped = 0, unresolvedSkipped = 0;
+  const touchedSkus = new Set(); // 取込後にセット税率を再計算する対象の単品
   const tx = db.transaction(() => {
     for (const row of dataRows) {
       const sku = (row[0] || '').toLowerCase().trim();
@@ -1265,8 +1303,11 @@ router.post('/api/csv/tax_rate', upload.single('file'), (req, res) => {
       if (taxRate === null) { unresolvedSkipped++; skipped++; continue; }
       stmt.run(sku, tr, mp?.商品名 || '', now);
       try { updateMp.run(taxRate, taxCategory, now, sku); } catch {}
+      touchedSkus.add(sku);
       count++;
     }
+    // 取込んだ単品を構成品に持つセットの税率も同じトランザクション内で反映する
+    for (const sku of touchedSkus) refreshSetTaxRatesFor(db, sku, now);
   });
   tx();
   res.json({ ok: true, imported: count, skipped, invalid, setSkipped, unresolvedSkipped, total: dataRows.length });
