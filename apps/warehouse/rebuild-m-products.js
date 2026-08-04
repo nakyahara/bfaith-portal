@@ -42,11 +42,14 @@ export function resolveTaxRate(neTaxNum, manualTaxRate) {
 // セット税率解決: 構成品を1つずつ resolveTaxRate に通し、全構成品が解決できたときだけ確定する。
 // 構成品の NE 消費税率だけを直接見ると、NE 未登録(0)を product_tax_rate で救済した構成品を持つ
 // セットが UNKNOWN に落ちる (単品は救済され、セットだけ税率 NULL になる非対称が起きる)。
-// components: [{ neTaxRate, manualTaxRate }]
+// components: [{ neTaxRate, manualTaxRate, componentExists }]
+//   componentExists=false (構成品が NE 商品マスタに存在しない) は上流異常なので、
+//   product_tax_rate に値が残っていても UNKNOWN に倒す (欠損を税率で隠さない)
 // 単一税率 → その税率 / 複数税率 → MIXED (最小値 = 軽減税率優先) / 1つでも未解決 → UNKNOWN
 export function resolveSetTaxRate(components) {
   const decimals = new Set();
   for (const c of components) {
+    if (c.componentExists === false) return { taxRate: null, taxCategory: 'UNKNOWN' };
     const { taxRate } = resolveTaxRate(c.neTaxRate, c.manualTaxRate);
     if (taxRate === null) return { taxRate: null, taxCategory: 'UNKNOWN' };
     decimals.add(taxRate);
@@ -306,7 +309,8 @@ export async function rebuildMProducts() {
   `).all();
 
   const setComponentsQuery = db.prepare(`
-    SELECT sp.商品コード, sp.数量, p.原価, p.消費税率, p.商品名
+    SELECT sp.商品コード, sp.数量, p.原価, p.消費税率, p.商品名,
+           p.商品コード IS NOT NULL AS ne_exists
     FROM raw_ne_set_products sp
     LEFT JOIN raw_ne_products p ON sp.商品コード = p.商品コード COLLATE NOCASE
     WHERE sp.セット商品コード = ?
@@ -346,6 +350,7 @@ export async function rebuildMProducts() {
       componentTaxInputs.push({
         neTaxRate: comp.消費税率,
         manualTaxRate: taxRateMap.get(compCode),
+        componentExists: !!comp.ne_exists,
       });
 
       // 構成品staging投入

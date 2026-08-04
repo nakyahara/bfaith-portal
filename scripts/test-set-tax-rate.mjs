@@ -85,6 +85,17 @@ await check('構成品ゼロ → UNKNOWN', () => {
   assert.deepStrictEqual(resolveSetTaxRate([]), { taxRate: null, taxCategory: 'UNKNOWN' });
 });
 
+await check('構成品が商品マスタに無い → 手動税率が残っていても UNKNOWN', () => {
+  assert.deepStrictEqual(
+    resolveSetTaxRate([{ neTaxRate: null, manualTaxRate: 0.1, componentExists: false }]),
+    { taxRate: null, taxCategory: 'UNKNOWN' });
+});
+
+await check('componentExists 省略時は存在扱い (既存呼び出し互換)', () => {
+  assert.deepStrictEqual(resolveSetTaxRate([{ neTaxRate: 10 }]),
+    { taxRate: 0.1, taxCategory: 'STANDARD_10' });
+});
+
 // ─── 2. rebuildMProducts 統合 ───
 console.log('\n[2] rebuildMProducts (セット税率の反映)');
 
@@ -116,6 +127,11 @@ insSet.run('mix-set',   '混在セット',            2000, 'oat1kg',   1, NOW);
 insSet.run('mix-set',   '混在セット',            2000, 'normal10', 1, NOW); // + 10% → MIXED
 insSet.run('ne-set',    'NE税率セット',          1000, 'normal10', 2, NOW); // NE値のみ
 insSet.run('broken-set','税率不明セット',        1000, 'nowhere',  2, NOW); // 解決不能
+insSet.run('ghost-set', '構成品欠損セット',      1000, 'ghost',    1, NOW); // 構成品がNEに無い
+
+// 構成品 'ghost' は raw_ne_products に存在しないが product_tax_rate には残っている
+// (マスタから消えた商品の手動税率が残るケース)。税率で欠損を隠さないことを確認する
+insTax.run('ghost', 0.1, '消えた商品', NOW);
 
 await rebuildMProducts();
 
@@ -156,6 +172,12 @@ await check('構成品の税率が解決できないセットは UNKNOWN のま�
   assert.strictEqual(r.税区分, 'UNKNOWN');
 });
 
+await check('構成品が商品マスタから消えたセットは UNKNOWN (手動税率で隠さない)', () => {
+  const r = getMp('ghost-set');
+  assert.strictEqual(r.消費税率, null);
+  assert.strictEqual(r.税区分, 'UNKNOWN');
+});
+
 await check('単品側の税率解決は従来どおり (手動フォールバック)', () => {
   assert.strictEqual(getMp('oat1kg').消費税率, 0.08);
   assert.strictEqual(getMp('normal10').消費税率, 0.1);
@@ -178,7 +200,9 @@ db.prepare(`INSERT INTO m_set_components
   VALUES (?, ?, ?, ?, ?, ?)`).run('oat1kg-4', 'oat1kg', 4, 'オートミール 1kg', 648, NOW);
 
 process.env.WAREHOUSE_API_KEY = ''; // 認証スキップ
-const router = (await import('../apps/warehouse/router.js')).default;
+const routerModule = await import('../apps/warehouse/router.js');
+const router = routerModule.default;
+const { refreshSetTaxRates } = routerModule;
 const app = express();
 app.use(express.json());
 app.use('/', router);
@@ -221,6 +245,42 @@ await check('セット商品コードへの直接登録は従来どおり拒否�
     method: 'POST', body: JSON.stringify({ sku: 'oat1kg-4', tax_rate: 0.08 }),
   });
   assert.strictEqual(r.status, 400);
+});
+
+await check('NE税率がある単品の手動登録を削除 → 単品もセットも NE 税率で解決し直す', async () => {
+  // normal10 は NE 側に 10% がある。手動登録を消しても NULL には戻らない
+  db.exec("DELETE FROM m_products; DELETE FROM m_set_components; DELETE FROM product_tax_rate;");
+  insMp.run('normal10', '通常商品', '単品', NOW);
+  insMp.run('normal10-2', '通常商品 2個セット', 'セット', NOW);
+  db.prepare(`INSERT INTO m_set_components
+    (セット商品コード, 構成商品コード, 数量, 構成商品名, 構成商品原価, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)`).run('normal10-2', 'normal10', 2, '通常商品', 100, NOW);
+  await api('/api/tax_rate', { method: 'POST', body: JSON.stringify({ sku: 'normal10', tax_rate: 0.1 }) });
+
+  const r = await api('/api/tax_rate/normal10', { method: 'DELETE' });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(mp('normal10').消費税率, 0.1, '単品はNE税率で残るべき');
+  assert.strictEqual(mp('normal10').税区分, 'STANDARD_10');
+  assert.strictEqual(mp('normal10-2').消費税率, 0.1, 'セットも単品と同じ解決結果になるべき');
+});
+
+await check('同じ親セットを持つ構成品が複数あっても親は1回だけ再計算される', () => {
+  // collectParentSets の重複排除。2構成品 → 親1件なので更新件数は 1
+  db.exec("DELETE FROM m_products; DELETE FROM m_set_components; DELETE FROM product_tax_rate;");
+  insMp.run('multi-set', '2構成品セット', 'セット', NOW);
+  const insComp = db.prepare(`INSERT INTO m_set_components
+    (セット商品コード, 構成商品コード, 数量, 構成商品名, 構成商品原価, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)`);
+  insComp.run('multi-set', 'oat1kg', 1, 'オートミール 1kg', 648, NOW);
+  insComp.run('multi-set', 'normal10', 1, '通常商品', 100, NOW);
+  db.prepare('INSERT INTO product_tax_rate (sku, tax_rate, 商品名, synced_at) VALUES (?, ?, ?, ?)')
+    .run('oat1kg', 0.08, 'オートミール 1kg', NOW);
+
+  const updated = refreshSetTaxRates(db, ['oat1kg', 'normal10'], NOW);
+  assert.strictEqual(updated, 1, `親セットの更新は1回であるべき (実際: ${updated})`);
+  // 8% と 10% の構成品なので MIXED / 0.08
+  assert.strictEqual(mp('multi-set').消費税率, 0.08);
+  assert.strictEqual(mp('multi-set').税区分, 'MIXED');
 });
 
 await new Promise(r => server.close(r));
