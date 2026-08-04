@@ -1449,25 +1449,27 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
   // タイムアウト後も裏の取得は続きキャッシュに入る (次回 claim で使われるだけで無害)
   const claimedList = Array.isArray(r.claimed) ? r.claimed : [];
   if (claimedList.some((d) => extractAsin(d))) {
-    // 全件取得は5〜10分かかる (実測) → 生取得の完了を待たず、成功したらスナップショットへ保存し
-    // (fire-and-forget)、今回の応答には「スナップショット or 15s以内に取れた生データ」を使う
-    let byAsin = null;
+    // 全件取得は5〜10分かかる (実測) → スナップショット優先で応答は待たせない (Codex R3 high):
+    // ①有効なスナップショットがあれば即時それを使う ②裏で最新化 (fire-and-forget・成功時に保存)
+    // ③スナップショットが無い初回だけ、15s を上限に生取得を待ってみる (それでも無ければ今回は無しで続行)
+    let byAsin = loadSpKeywordSnapshot(db);
     let kwError = null;
-    try {
-      const live = listSpManualKeywordsByAsin();
-      live.then((m) => { if (m) try { saveSpKeywordSnapshot(getDB(), m); } catch (_) {} })
-          .catch((e) => {
-            // 無音で握り潰さない (Codex R2: 運用で「なぜKWが付かないか」を追えるように)
-            console.error('[product-hub] SP広告KWの取得に失敗:', String(e?.message || e).slice(0, 200));
-          });
-      byAsin = await Promise.race([
-        live,
-        new Promise((_, rej) => setTimeout(() => rej(new Error('sp_kw_timeout')), 15_000)),
-      ]);
-    } catch (e) {
-      kwError = String(e.message || e).slice(0, 120);
+    const live = listSpManualKeywordsByAsin();
+    live.then((m) => { if (m) try { saveSpKeywordSnapshot(getDB(), m); } catch (_) {} })
+        .catch((e) => {
+          // 無音で握り潰さない (Codex R2: 運用で「なぜKWが付かないか」を追えるように)
+          console.error('[product-hub] SP広告KWの取得に失敗:', String(e?.message || e).slice(0, 200));
+        });
+    if (!byAsin) {
+      try {
+        byAsin = await Promise.race([
+          live,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('sp_kw_timeout')), 15_000)),
+        ]);
+      } catch (e) {
+        kwError = String(e.message || e).slice(0, 120);
+      }
     }
-    if (!byAsin) byAsin = loadSpKeywordSnapshot(db);
     if (byAsin) {
       for (const d of claimedList) {
         const asin = extractAsin(d);
