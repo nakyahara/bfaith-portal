@@ -309,7 +309,9 @@ export async function toCabinetJpeg(buf) {
 
 // ─── R-Cabinet フォルダ (app 専用の1フォルダを使い回す) ───
 
-const CABINET_DIR = 'app-newitems';
+// 2026-08-05 本番作成済み: /appnewitems (FolderId 13702390, 表示名「商品登録ハブ」)。
+// ハイフン入り directoryName は RMS 実機で未検証のため避けた
+const CABINET_DIR = 'appnewitems';
 
 async function ensureCabinetFolder(db) {
   const cached = db.prepare(`SELECT value FROM ph_intake_state WHERE key = 'cabinet_folder_id'`).get()?.value;
