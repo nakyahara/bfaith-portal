@@ -991,9 +991,11 @@ export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
   const categoryIds = rows.map((r) => String(r.category_id).trim());
   const syncedKey = categoryIds.join(',');
   const mn = String(draft.ne_code).trim().toLowerCase();
+  // mainPluralCategoryId は送らない (2026-08-05 平串の IE0128 で実測確定):
+  // これは「PLURAL 形式 (1ページ複数商品形式) のカテゴリ」のメインページ指定専用で、
+  // 通常の棚 (LIST/GALLERY 形式) の ID を渡すと IE0128 で拒否される。
+  // 「複数カテゴリなら必須」という #671 時の理解は誤りだった
   const body = { categoryIds };
-  // 複数のときは「メインの棚」= 先頭 (画面の並び順で最初に選ばれた棚) を指定する
-  if (categoryIds.length > 1) body.mainPluralCategoryId = categoryIds[0];
 
   let r;
   try {

@@ -920,13 +920,15 @@ router.put('/item-mappings/manage-numbers/:manageNumber', requireWrite, rateLimi
       return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'categoryIds が重複しています', requestId: req.requestId });
     }
     const body = { categoryIds: ids };
-    if (ids.length > 1) {
-      // 複数のときは「メインの棚」を必ず指定する (RMS 仕様)
-      const main = req.body?.mainPluralCategoryId != null ? String(req.body.mainPluralCategoryId) : '';
-      if (!main || !ids.includes(main)) {
+    // mainPluralCategoryId は「PLURAL 形式 (1ページ複数商品形式) カテゴリ」のメインページ指定専用。
+    // 通常カテゴリ (LIST/GALLERY) の ID を渡すと IE0128 で拒否される (2026-08-05 実測) ため
+    // 任意入力とし、指定時のみ categoryIds に含まれることを検証して透過する
+    if (req.body?.mainPluralCategoryId != null && String(req.body.mainPluralCategoryId).trim() !== '') {
+      const main = String(req.body.mainPluralCategoryId).trim();
+      if (!ids.includes(main)) {
         return errorResponse(res, {
           status: 400, error: 'INVALID_PAYLOAD',
-          message: '複数カテゴリのときは mainPluralCategoryId (categoryIds に含まれる値) が必要です',
+          message: 'mainPluralCategoryId は categoryIds に含まれる値で指定してください',
           requestId: req.requestId,
         });
       }
