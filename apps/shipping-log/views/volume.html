@@ -182,7 +182,7 @@ function drawCards(d) {
   const isMonth = d.granularity === 'month';
   $('cards').innerHTML = [
     { k: '合計', v: fmt(d.total), n: `${d.from} 〜 ${d.to}` },
-    ...(isMonth ? [{ k: '月平均', v: fmt(d.avgPerBucket), n: `${d.days.length}ヶ月分` }] : []),
+    ...(isMonth ? [{ k: '月平均', v: fmt(d.avgPerBucket), n: `${d.days.length}ヶ月で割った数 (端の月は部分月)` }] : []),
     { k: '1日平均', v: fmt(d.avgPerDay), n: `出荷があった ${fmt(d.workDays)}日で割った数` },
     { k: '最多モール', v: d.malls[0] ? d.malls[0].name : '—', n: d.malls[0] ? `${fmt(d.malls[0].n)}件` : '' },
     { k: '最多の配送方法', v: d.methods[0] ? d.methods[0].name : '—', n: d.methods[0] ? `${fmt(d.methods[0].n)}件` : '' },

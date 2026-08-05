@@ -30,6 +30,13 @@ function jstDate(offsetDays = 0) {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** 'YYYY-MM' の翌月 */
+function nextMonth(ym) {
+  let [y, m] = ym.split('-').map(Number);
+  if (++m > 12) { m = 1; y++; }
+  return `${String(y).padStart(4, '0')}-${String(m).padStart(2, '0')}`;
+}
+
 class BadRequest extends Error {}
 
 /** クエリの期間を検証して既定 (直近30日) を埋める。不正なら 400 で返す */
@@ -54,6 +61,12 @@ function parseRange(q) {
  * granularity='day' | 'month' … 集計の粒度。month のときは各期間に
  *   「出荷があった日数 (稼働日)」と「1日あたりの平均」を付ける
  *   (休業日を含めた暦日で割ると実感とズレるため、分母は出荷実績のある日)
+ *
+ * 稼働日の数え方: **選んだ数え方 (basis) で1件以上あった日**だけを数える。
+ *   basis=valid のときに「全部キャンセルされた日」を分母に入れると平均が過小になるため
+ *   (Codex 指摘)。
+ * 月バケット: 指定期間に重なる月は **0件の月も作る**。データのある月だけで割ると
+ *   「月平均」が実際より高く出る (出荷ゼロの月を無かったことにしてしまう)。
  */
 function loadVolume({ from, to, basis, malls, methods, granularity }) {
   const db = getMirrorDB();
@@ -83,7 +96,8 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
   const byBucket = new Map();
   const byMall = new Map();
   const byMethod = new Map();
-  const workDays = new Map(); // bucket → 出荷があった日の集合 (月の1日平均の分母)
+  const workDays = new Map();   // bucket → 出荷があった日の集合 (月の1日平均の分母)
+  const activeDays = new Set(); // 期間全体で出荷があった日
   let total = 0;
   let cancelled = 0;
   for (const r of rows) {
@@ -99,9 +113,19 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
     d.methods[method] = (d.methods[method] || 0) + r.n;
     byMall.set(mall, (byMall.get(mall) || 0) + r.n);
     byMethod.set(method, (byMethod.get(method) || 0) + r.n);
-    if (isMonth) {
-      if (!workDays.has(key)) workDays.set(key, new Set());
-      workDays.get(key).add(r.ship_date);
+    if (r.n > 0) {
+      activeDays.add(r.ship_date);
+      if (isMonth) {
+        if (!workDays.has(key)) workDays.set(key, new Set());
+        workDays.get(key).add(r.ship_date);
+      }
+    }
+  }
+
+  // 期間に重なる月は 0 件でもバケットを作る (「月平均」の分母を実際の月数に合わせる)
+  if (isMonth) {
+    for (let ym = from.slice(0, 7); ym <= to.slice(0, 7); ym = nextMonth(ym)) {
+      if (!byBucket.has(ym)) byBucket.set(ym, { date: ym, total: 0, malls: {}, methods: {} });
     }
   }
 
@@ -109,15 +133,12 @@ function loadVolume({ from, to, basis, malls, methods, granularity }) {
   const days = [...byBucket.values()].sort((a, b) => a.date.localeCompare(b.date));
   if (isMonth) {
     for (const d of days) {
-      d.work_days = workDays.get(d.date).size;
+      d.work_days = workDays.has(d.date) ? workDays.get(d.date).size : 0;
       d.avg_per_day = d.work_days ? Math.round(d.total / d.work_days) : 0;
     }
   }
 
-  // 全体の日数 (月別表示でも「1日あたり」の分母は実際に出荷があった日数)
-  const totalWorkDays = isMonth
-    ? days.reduce((a, d) => a + d.work_days, 0)
-    : days.length;
+  const totalWorkDays = activeDays.size;
 
   return {
     from, to, basis: basis === 'valid' ? 'valid' : 'shipped',
@@ -205,9 +226,11 @@ router.get('/api/volume.csv', (req, res) => {
         const a = agg.get(key);
         a.n += r.n;
         a.cancelled += r.cancelled_slips;
-        a.days.add(r.ship_date);
+        if (r.n > 0) a.days.add(r.ship_date); // 0件の日は分母に入れない (画面と同じ数え方)
       }
-      const lines = ['出荷月,モール,配送方法,件数,うちキャンセル,出荷があった日数,1日あたり平均'];
+      // 日数・平均は「その行 (モール×配送方法) が出荷された日」ベース。画面の月合計行にある
+      // 「日数」は月全体なので、CSV の各行とは分母が違う。列名で区別できるようにしておく
+      const lines = ['出荷月,モール,配送方法,件数,うちキャンセル,この組み合わせの出荷日数,1日あたり平均(この組み合わせ)'];
       for (const a of [...agg.values()].sort((x, y) => x.ym.localeCompare(y.ym) || x.mall.localeCompare(y.mall) || x.method.localeCompare(y.method))) {
         lines.push([a.ym, a.mall, a.method, a.n, a.cancelled, a.days.size,
           a.days.size ? Math.round(a.n / a.days.size) : 0].map(esc).join(','));
