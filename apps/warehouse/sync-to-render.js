@@ -151,6 +151,25 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   inv_daily_summary: 取得失敗（スキップ）: ${e.message}`);
   }
 
+  // 2b-3b. f_shipments_daily (日次出荷サマリ: 出荷日 × モール × 配送方法 の伝票件数)
+  //   1日あたり数十行 (モール × 配送方法) なので数年分でも数万行。毎回全件送って mirror を置換する
+  //   (miniPC 側は --all 再構築なので、出荷取消・出荷日訂正による「減り」も置換で反映される)。
+  //   shop_name / platform は shops を JOIN 済みの値で送る (mirror 側は shops を持たない)。
+  let shipments_daily = [];
+  try {
+    shipments_daily = db.prepare(`
+      SELECT f.ship_date, f.shop_code, s.shop_name, s.platform,
+             f.delivery_id, f.delivery_name, f.slips, f.cancelled_slips, f.updated_at
+      FROM f_shipments_daily f
+      LEFT JOIN shops s ON s.shop_code = f.shop_code
+      ORDER BY f.ship_date, f.shop_code, f.delivery_id
+    `).all();
+    console.log(`[Sync→Render]   shipments_daily: ${shipments_daily.length}件`);
+  } catch (e) {
+    // 表がまだ無い miniPC (デプロイ順の差) でも既存同期を止めない
+    console.log(`[Sync→Render]   shipments_daily: 取得失敗（スキップ）: ${e.message}`);
+  }
+
   // 2b-4. inv_daily_detail (D-1c: 詳細層、差分sync)
   //   毎回 直近7日分のみ送信 → Render側で UPSERT
   //   Render側は受信時に「365日より古い行 DELETE」も実行 (古い分は捨てる)
@@ -348,6 +367,9 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
+    // 出荷サマリは「取れたときだけ」送る。受信側は全件置換なので、空配列を送ると
+    // 取得失敗時に mirror を全消ししてしまう (前回分を残す方が安全)。
+    if (shipments_daily.length > 0) masterPart.shipments_daily = shipments_daily;
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
     // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
     //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が

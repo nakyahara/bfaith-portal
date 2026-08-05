@@ -59,6 +59,7 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import shippingLogRouter from './apps/shipping-log/router.js';
+import shippingLogViewRouter from './apps/shipping-log/view-router.js';
 import siteProductsRouter from './apps/site-products/router.js';
 import siteContactRouter from './apps/site-contact/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
@@ -707,6 +708,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'shipping-log',
+    name: '出荷件数',
+    description: '日ごとの出荷件数をモール別・配送方法別に集計 (伝票1件=発送1件、Amazon の AES を含む)',
+    icon: '📈',
+    path: '/apps/shipping-log',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'shipping-work',
     name: '出荷作業管理',
     description: 'Notionカンバン置き換え。ピッキング・梱包の作業時間をボタン操作で自動計測',
@@ -1241,6 +1251,9 @@ app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
 // 出荷実績ログ (apps/shipping-log): 出荷_no 掃除 GAS からの伝票取込。Bearer fail-closed のみ (session なし)
 app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
+// 出荷件数ダッシュボード (同じ apps/shipping-log)。こちらは session 認証配下。
+// GAS 用の /api を先に mount してあるので、Bearer 経路がこの requireAppAccess に飲まれることはない。
+app.use('/apps/shipping-log', requireAppAccess('shipping-log'), shippingLogViewRouter);
 // コーポレートサイト向け商品スナップショット (apps/site-products): 専用read token・読み取り専用 (session なし)
 app.use('/apps/site-products/api', siteProductsRouter);
 // コーポレートサイト問い合わせ受付 (apps/site-contact): Bearer service token・冪等 (session なし)

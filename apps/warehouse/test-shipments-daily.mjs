@@ -120,7 +120,8 @@ db.prepare('DELETE FROM raw_ne_order_base').run();
   for (const r of rows) upsert(r, 'T');
 
   const r1 = rebuildShipmentsDaily(db, { from: '2026-08-01', to: '2026-08-31' });
-  eq(r1.slips, 6, '有効伝票の合計 (全8件 − キャンセル1件 − 未出荷1件 = 6件)');
+  // slips = 出荷確定した伝票すべて (キャンセルは内数)。未出荷だけが対象外
+  eq(r1.slips, 7, '出荷確定伝票の合計 (全8件 − 未出荷1件 = 7件。キャンセルも発送1件として数える)');
 
   const get = (d, shop, dv) => db.prepare(
     'SELECT slips, cancelled_slips, delivery_name FROM f_shipments_daily WHERE ship_date=? AND shop_code=? AND delivery_id=?'
@@ -129,8 +130,8 @@ db.prepare('DELETE FROM raw_ne_order_base').run();
   eq(get('2026-08-04', '4', '71').slips, 2, '8/4 Amazon × AES = 2件');
   eq(get('2026-08-04', '4', '28').slips, 1, '8/4 Amazon × ネコポス = 1件 (Amazon でも AES 以外がある)');
   eq(get('2026-08-05', '4', '71').slips, 1, '8/5 Amazon × AES = 1件');
-  eq([get('2026-08-04', '1', '28').slips, get('2026-08-04', '1', '28').cancelled_slips], [1, 1],
-    '8/4 楽天 × ネコポス = 有効1件 / キャンセル1件 (別カウント)');
+  eq([get('2026-08-04', '1', '28').slips, get('2026-08-04', '1', '28').cancelled_slips], [2, 1],
+    '8/4 楽天 × ネコポス = 出荷2件・うちキャンセル1件 (cancelled_slips は slips の内数)');
   eq(get('2026-08-04', '2', '').delivery_name, '(未設定)', '配送方法なしは (未設定) で残す');
   ok(db.prepare("SELECT COUNT(*) n FROM f_shipments_daily WHERE ship_date='2026-08-06'").get().n === 0,
     '出荷確定日が無い伝票は集計されない');

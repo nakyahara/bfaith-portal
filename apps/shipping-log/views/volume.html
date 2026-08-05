@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>出荷件数 | B-Faith 社内ポータル</title>
+<!-- Chart.js (CDN)。SRI 付き = CDN が差し替えられたら読み込まない -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"
+        integrity="sha384-FcQlsUOd0TJjROrBxhJdUhXTUgNJQxTMcxZe6nHbaEfFL1zjQ+bq/uRoBQxb0KMo"
+        crossorigin="anonymous" defer></script>
+<style>
+  :root { --line:#e5e7eb; --muted:#6b7280; --bg:#f8fafc; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:#111827;
+         font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:14px 20px; display:flex;
+           align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .sub { color:var(--muted); font-size:12px; }
+  header a.back { margin-left:auto; color:var(--accent); text-decoration:none; font-size:13px; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  .panel { background:#fff; border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .filters { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; }
+  .filters label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input[type=date], select { padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:14px; background:#fff; }
+  select[multiple] { min-width:190px; height:110px; }
+  button { padding:8px 14px; border:1px solid var(--accent); background:var(--accent); color:#fff;
+           border-radius:6px; font-size:14px; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  .quick { display:flex; gap:6px; flex-wrap:wrap; }
+  .quick button { padding:5px 10px; font-size:12px; background:#fff; color:#374151; border-color:var(--line); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:12px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .card .k { font-size:12px; color:var(--muted); }
+  .card .v { font-size:26px; font-weight:700; margin-top:4px; }
+  .card .n { font-size:12px; color:var(--muted); margin-top:2px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width: 860px) { .grid2 { grid-template-columns:1fr; } }
+  h2 { font-size:14px; margin:0 0 12px; }
+  .tablewrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border-bottom:1px solid var(--line); padding:7px 10px; text-align:right; white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; position:sticky; left:0; background:#fff; }
+  thead th { background:#f9fafb; position:sticky; top:0; }
+  tbody tr:hover td { background:#f9fafb; }
+  .muted { color:var(--muted); font-size:12px; }
+  .err { background:#fef2f2; border:1px solid #fecaca; color:#991b1b; padding:10px 12px; border-radius:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📦 出荷件数</h1>
+  <span class="sub">伝票1件 = 発送1件。モール別・配送方法別 (Amazon の AES を含む)</span>
+  <a class="back" href="/">← ポータルへ</a>
+</header>
+
+<main>
+  <div class="panel">
+    <div class="filters">
+      <div>
+        <label for="from">開始日</label>
+        <input type="date" id="from">
+      </div>
+      <div>
+        <label for="to">終了日</label>
+        <input type="date" id="to">
+      </div>
+      <div>
+        <label for="basis">数え方</label>
+        <select id="basis">
+          <option value="shipped">出荷確定した伝票すべて</option>
+          <option value="valid">キャンセルを除く</option>
+        </select>
+      </div>
+      <div>
+        <label for="mall">モール (複数選択可)</label>
+        <select id="mall" multiple></select>
+      </div>
+      <div>
+        <label for="method">配送方法 (複数選択可)</label>
+        <select id="method" multiple></select>
+      </div>
+      <div>
+        <button id="apply">表示</button>
+        <button id="reset" class="ghost">絞り込み解除</button>
+      </div>
+      <div>
+        <label>&nbsp;</label>
+        <div class="quick">
+          <button data-days="7">直近7日</button>
+          <button data-days="30">直近30日</button>
+          <button data-days="90">直近90日</button>
+          <button data-days="365">直近1年</button>
+        </div>
+      </div>
+    </div>
+    <div class="muted" id="meta" style="margin-top:10px"></div>
+  </div>
+
+  <div id="error" style="display:none" class="panel err"></div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel" style="margin-top:16px">
+    <h2>日別の出荷件数</h2>
+    <div style="position:relative; height:320px"><canvas id="chartDaily"></canvas></div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>モール別</h2>
+      <div style="position:relative; height:260px"><canvas id="chartMall"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>配送方法別</h2>
+      <div style="position:relative; height:260px"><canvas id="chartMethod"></canvas></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>日 × モール <button id="csv" class="ghost" style="float:right">CSVダウンロード</button></h2>
+    <div class="tablewrap"><table id="tblMall"></table></div>
+  </div>
+
+  <div class="panel">
+    <h2>日 × 配送方法</h2>
+    <div class="tablewrap"><table id="tblMethod"></table></div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (n) => Number(n || 0).toLocaleString('ja-JP');
+// 色は固定パレットを順番に割り当てる (系列が日によって増減しても色が飛ばないよう名前順で決める)
+const PALETTE = ['#2563eb','#f59e0b','#10b981','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#64748b','#0ea5e9','#a855f7'];
+const colorOf = (name, i) => PALETTE[i % PALETTE.length];
+let charts = {};
+
+function jstToday(offset = 0) {
+  const t = Date.now() + 9 * 3600 * 1000 + offset * 86400 * 1000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+function selectedValues(sel) {
+  return Array.from(sel.selectedOptions).map(o => o.value);
+}
+
+function query() {
+  const p = new URLSearchParams();
+  p.set('from', $('from').value);
+  p.set('to', $('to').value);
+  p.set('basis', $('basis').value);
+  for (const v of selectedValues($('mall'))) p.append('mall', v);
+  for (const v of selectedValues($('method'))) p.append('method', v);
+  return p;
+}
+
+async function loadOptions() {
+  const r = await fetch('/apps/shipping-log/api/options').then(x => x.json());
+  if (!r.ok) throw new Error(r.error || '選択肢を取得できませんでした');
+  $('mall').innerHTML = r.malls.map(m => `<option value="${m.shop_code}">${m.shop_name}</option>`).join('');
+  $('method').innerHTML = r.methods.map(m => `<option value="${m.delivery_id}">${m.delivery_name}</option>`).join('');
+  const synced = r.synced_at ? new Date(r.synced_at).toLocaleString('ja-JP') : '—';
+  $('meta').textContent = `データ範囲: ${r.min_date || '—'} 〜 ${r.max_date || '—'} / 最終同期: ${synced}`;
+}
+
+function drawCards(d) {
+  const cancelNote = d.basis === 'shipped' ? `うちキャンセル ${fmt(d.cancelled)}件` : 'キャンセルを除いた数';
+  $('cards').innerHTML = [
+    { k: '合計', v: fmt(d.total), n: `${d.from} 〜 ${d.to}` },
+    { k: '1日平均', v: fmt(d.avgPerDay), n: `${d.days.length}日分` },
+    { k: '最多モール', v: d.malls[0] ? d.malls[0].name : '—', n: d.malls[0] ? `${fmt(d.malls[0].n)}件` : '' },
+    { k: '最多の配送方法', v: d.methods[0] ? d.methods[0].name : '—', n: d.methods[0] ? `${fmt(d.methods[0].n)}件` : '' },
+    { k: '数え方', v: d.basis === 'shipped' ? '出荷確定' : 'キャンセル除く', n: cancelNote },
+  ].map(c => `<div class="card"><div class="k">${c.k}</div><div class="v">${c.v}</div><div class="n">${c.n}</div></div>`).join('');
+}
+
+function seriesOf(days, key) {
+  const names = new Set();
+  for (const d of days) for (const n of Object.keys(d[key])) names.add(n);
+  const sorted = [...names].sort();
+  return sorted.map((name, i) => ({
+    label: name,
+    data: days.map(d => d[key][name] || 0),
+    backgroundColor: colorOf(name, i),
+    borderColor: colorOf(name, i),
+  }));
+}
+
+function drawChart(id, config) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($(id), config);
+}
+
+function drawCharts(d) {
+  const labels = d.days.map(x => x.date.slice(5));
+  drawChart('chartDaily', {
+    type: 'bar',
+    data: { labels, datasets: seriesOf(d.days, 'malls') },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+      plugins: { legend: { position: 'bottom' }, tooltip: { mode: 'index' } },
+    },
+  });
+  const pie = (id, arr) => drawChart(id, {
+    type: 'doughnut',
+    data: {
+      labels: arr.map(x => x.name),
+      datasets: [{ data: arr.map(x => x.n), backgroundColor: arr.map((x, i) => colorOf(x.name, i)) }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right' } } },
+  });
+  pie('chartMall', d.malls);
+  pie('chartMethod', d.methods);
+}
+
+function drawTable(el, days, key, totals) {
+  const cols = totals.map(t => t.name);
+  const head = `<thead><tr><th>出荷日</th>${cols.map(c => `<th>${c}</th>`).join('')}<th>合計</th></tr></thead>`;
+  const body = days.slice().reverse().map(d => {
+    const cells = cols.map(c => `<td>${fmt(d[key][c] || 0)}</td>`).join('');
+    return `<tr><td>${d.date}</td>${cells}<td><b>${fmt(d.total)}</b></td></tr>`;
+  }).join('');
+  const foot = `<tfoot><tr><th>合計</th>${cols.map(c => {
+    const s = days.reduce((a, d) => a + (d[key][c] || 0), 0);
+    return `<th>${fmt(s)}</th>`;
+  }).join('')}<th>${fmt(days.reduce((a, d) => a + d.total, 0))}</th></tr></tfoot>`;
+  el.innerHTML = head + `<tbody>${body}</tbody>` + foot;
+}
+
+async function load() {
+  $('error').style.display = 'none';
+  try {
+    const d = await fetch('/apps/shipping-log/api/volume?' + query().toString()).then(x => x.json());
+    if (!d.ok) throw new Error(d.error || '取得に失敗しました');
+    drawCards(d);
+    drawCharts(d);
+    drawTable($('tblMall'), d.days, 'malls', d.malls);
+    drawTable($('tblMethod'), d.days, 'methods', d.methods);
+  } catch (e) {
+    $('error').style.display = '';
+    $('error').textContent = 'データを取得できませんでした: ' + e.message
+      + '（ミニPCからの同期がまだなら、翌朝の daily-sync 後に表示されます）';
+  }
+}
+
+$('apply').addEventListener('click', load);
+$('basis').addEventListener('change', load);
+$('reset').addEventListener('click', () => {
+  for (const id of ['mall', 'method']) Array.from($(id).options).forEach(o => { o.selected = false; });
+  load();
+});
+$('csv').addEventListener('click', () => {
+  location.href = '/apps/shipping-log/api/volume.csv?' + query().toString();
+});
+document.querySelectorAll('.quick button').forEach(b => b.addEventListener('click', () => {
+  $('to').value = jstToday(0);
+  $('from').value = jstToday(-(Number(b.dataset.days) - 1));
+  load();
+}));
+
+(async () => {
+  $('to').value = jstToday(0);
+  $('from').value = jstToday(-29);
+  try { await loadOptions(); } catch (e) { /* 選択肢が無くても本体は出す */ }
+  await load();
+})();
+</script>
+</body>
+</html>

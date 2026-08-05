@@ -448,6 +448,11 @@ function jstDate(offsetDays = 0) {
   return new Date(t).toISOString().slice(0, 10);
 }
 
+/** JST の 'YYYY-MM-DD HH:MM:SS' (NE API の日時は JST。now() は UTC なので混ぜない) */
+function jstNow() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+}
+
 /**
  * 出荷確定日ベースで受注ベース（伝票粒度）を取得し raw_ne_order_base へ UPSERT する。
  *
@@ -475,13 +480,29 @@ async function fetchOrderBaseByShipDate(days = 14) {
  * @param {number} days 何日前まで遡るか (既定 3)
  */
 async function fetchOrderBaseByModified(days = 3) {
-  console.log(`[NE] 受注ベース取得開始（更新日ベース・直近${days}日）`);
-  const from = `${jstDate(-(days - 1))} 00:00:00`;
+  await initDB();
+  // 前回どこまで取れたか (watermark) を下限にする。固定 N 日窓だけだと、ミニPC 停止・
+  // 認証切れ・NE 障害が N 日続いたときに、その間の訂正を永久に取りこぼす (Codex R2 medium)。
+  // watermark は「取得を開始した時刻」を成功時にだけ進める。安全側に 1 日重ねて取り直す。
+  const db = getDB();
+  const wm = db.prepare("SELECT value FROM sync_meta WHERE key = 'ne_api_orderbase_modified_watermark'").get();
+  const startedAt = jstNow(); // NE の更新日は JST。UTC の now() を混ぜない
+  const defaultFrom = `${jstDate(-(days - 1))} 00:00:00`;
+  let from = defaultFrom;
+  if (wm && wm.value) {
+    const back = new Date(Date.parse(`${String(wm.value).replace(' ', 'T')}+09:00`) - 86400 * 1000);
+    const wmFrom = new Date(back.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    if (wmFrom < from) from = wmFrom; // 停止していた分は遡る
+  }
   const to = `${jstDate(0)} 23:59:59`;
-  return fetchOrderBase(
+  console.log(`[NE] 受注ベース取得開始（更新日ベース・${from} 〜 ${to}）`);
+  const stats = await fetchOrderBase(
     { 'receive_order_last_modified_date-gte': from, 'receive_order_last_modified_date-lte': to },
     { label: '更新日', splitRange: [from, to], splitKey: 'receive_order_last_modified_date' }
   );
+  // ここまで来たら成功。次回はこの実行開始時刻の 1 日前から取り直す
+  updateSyncMeta('ne_api_orderbase_modified_watermark', startedAt);
+  return stats;
 }
 
 const NE_BASE_LIMIT = 10000;

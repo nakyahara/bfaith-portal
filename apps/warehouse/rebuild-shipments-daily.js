@@ -6,10 +6,10 @@
  *
  * ・Amazon Easy Ship は NE 側の配送方法名が 'AES' なので、店舗=Amazon × 配送方法=AES で数えられる
  *   (Amazon でも AES 以外の便が数%あるため、モール軸だけでは AES 件数にならない)
- * ・出荷確定日が入っているのに現在キャンセル扱いの伝票は cancelled_slips に分けて持つ。
- *   slips から外すと「発送した実績」としては過小になるが (Codex R1 high)、実測では
- *   直近1年で 79 件 / 30.4 万件 = 0.026% しかないので既定は slips = 有効のみ。
- *   両方保存しているので「発送ベース (slips + cancelled_slips)」も画面側で出せる
+ * ・slips = 出荷確定した伝票すべての件数。cancelled_slips は **その内数** で、
+ *   出荷確定日が入っているのに現在キャンセル扱いになっている伝票 (実測: 直近1年で
+ *   79件 / 30.4万件 = 0.026%)。「伝票1件=発送1件」の定義に slips をそのまま合わせ、
+ *   キャンセルを除いた数が要るときは slips - cancelled_slips で引く (Codex R2 high)
  * ・期間内を DELETE → INSERT で置換。1トランザクションなので途中経過が見えることはない
  *
  * 使い方:
@@ -32,8 +32,13 @@ function parseArgs(argv) {
   const out = { all: false, days: 30, from: null, to: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--all') out.all = true;
-    else if (argv[i] === '--days') out.days = parseInt(argv[++i]) || 30;
-    else if (argv[i] === '--from') out.from = argv[++i];
+    else if (argv[i] === '--days') {
+      // parseInt(x) || 30 だと --days abc / --days 0 が黙って既定値になる (Codex R2 medium)
+      const raw = argv[++i];
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n <= 0) throw new Error(`--days が不正です: ${raw} (1以上の整数)`);
+      out.days = n;
+    } else if (argv[i] === '--from') out.from = argv[++i];
     else if (argv[i] === '--to') out.to = argv[++i];
   }
   return out;
@@ -57,7 +62,7 @@ export function rebuildShipmentsDaily(db, opts = {}) {
     SELECT substr(出荷確定日, 1, 10)                    AS ship_date,
            COALESCE(店舗コード, '')                      AS shop_code,
            COALESCE(配送方法ID, '')                      AS delivery_id,
-           SUM(CASE WHEN キャンセル区分 = 'キャンセル' THEN 0 ELSE 1 END) AS slips,
+           COUNT(*)                                      AS slips,
            SUM(CASE WHEN キャンセル区分 = 'キャンセル' THEN 1 ELSE 0 END) AS cancelled_slips
       FROM raw_ne_order_base
      WHERE 出荷確定日 >= ? AND 出荷確定日 < ?
@@ -66,14 +71,19 @@ export function rebuildShipmentsDaily(db, opts = {}) {
 
   // 配送方法IDごとの「最新の名称」。同じIDに複数の名称が現れたとき MAX(辞書順) を採ると
   // 最新でも代表でもない名前が出る (Codex R1 medium)。出荷確定日が一番新しい行の名称を正とする。
+  // 相関サブクエリだと 30 万伝票 × 再検索で毎朝の --all が重くなるため、window 関数で 1 スキャンにする。
+  // 同着 (同じ出荷確定日) のときに名前が揺れないよう 伝票番号 をタイブレーカーに入れる (Codex R2)。
   const nameSql = `
-    SELECT COALESCE(配送方法ID, '') AS delivery_id,
-           COALESCE(NULLIF(配送方法名, ''), '(未設定)') AS delivery_name
-      FROM raw_ne_order_base b
-     WHERE 出荷確定日 = (SELECT MAX(出荷確定日) FROM raw_ne_order_base x
-                          WHERE COALESCE(x.配送方法ID,'') = COALESCE(b.配送方法ID,'')
-                            AND x.出荷確定日 <> '')
-     GROUP BY delivery_id
+    SELECT delivery_id, delivery_name FROM (
+      SELECT COALESCE(配送方法ID, '') AS delivery_id,
+             COALESCE(NULLIF(配送方法名, ''), '(未設定)') AS delivery_name,
+             ROW_NUMBER() OVER (
+               PARTITION BY COALESCE(配送方法ID, '')
+               ORDER BY 出荷確定日 DESC, 伝票番号 DESC
+             ) AS rn
+        FROM raw_ne_order_base
+       WHERE 出荷確定日 <> ''
+    ) WHERE rn = 1
   `;
 
   // '' は '0000-01-01' より小さいので、空文字 (=未出荷) は範囲比較で自然に除外される。

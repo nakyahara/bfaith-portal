@@ -29,7 +29,9 @@ function jstDate(offsetDays = 0) {
 function parseArgs(argv) {
   const out = { months: 12, from: null, to: null, dryRun: false };
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--months') out.months = parseInt(argv[++i]) || 12;
+    // parseInt(x) || 12 だと --months abc / --months 0 / 値なしが黙って12ヶ月になり、
+    // 意図しない期間のAPI呼び出しになる (Codex R2 medium)。生値のまま validateRange へ渡す。
+    if (argv[i] === '--months') out.months = Number(argv[++i]);
     else if (argv[i] === '--from') out.from = argv[++i];
     else if (argv[i] === '--to') out.to = argv[++i];
     else if (argv[i] === '--dry-run') out.dryRun = true;
@@ -48,8 +50,8 @@ export function validateRange(from, to, months) {
   if (!isDate(from)) throw new Error(`--from が不正です: ${from} (YYYY-MM-DD)`);
   if (!isDate(to)) throw new Error(`--to が不正です: ${to} (YYYY-MM-DD)`);
   if (from > to) throw new Error(`--from が --to より後です: ${from} > ${to}`);
-  if (!Number.isFinite(months) || months <= 0 || months > 120) {
-    throw new Error(`--months が不正です: ${months} (1〜120)`);
+  if (!Number.isInteger(months) || months <= 0 || months > 120) {
+    throw new Error(`--months が不正です: ${months} (1〜120の整数)`);
   }
 }
 

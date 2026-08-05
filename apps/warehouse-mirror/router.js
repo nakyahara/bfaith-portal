@@ -331,6 +331,36 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`inv_daily_summary: ${rows.length}件`);
     }
 
+    // shipments_daily（全件置換、日次出荷サマリ）
+    //   1年分でも数千行なので毎回まるごと差し替える。miniPC 側で --all 再構築しているため、
+    //   出荷取消・出荷日訂正による「減り」も置換で正しく反映される。
+    if (req.body.shipments_daily && Array.isArray(req.body.shipments_daily)) {
+      const rows = req.body.shipments_daily;
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_shipments_daily');
+        const stmt = db.prepare(`INSERT INTO mirror_shipments_daily (
+          ship_date, shop_code, shop_name, platform, delivery_id, delivery_name,
+          slips, cancelled_slips, source_updated_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+        for (const r of rows) {
+          stmt.run(
+            r.ship_date,
+            String(r.shop_code ?? ''),
+            r.shop_name ?? null,
+            r.platform ?? null,
+            String(r.delivery_id ?? ''),
+            r.delivery_name ?? null,
+            r.slips ?? 0,
+            r.cancelled_slips ?? 0,
+            r.updated_at ?? null,
+            now
+          );
+        }
+      });
+      tx();
+      log.push(`shipments_daily: ${rows.length}件`);
+    }
+
     // rakuten_sku_map（全件置換）
     if (req.body.rakuten_sku_map && req.body.rakuten_sku_map.length > 0) {
       const rskmData = req.body.rakuten_sku_map;
