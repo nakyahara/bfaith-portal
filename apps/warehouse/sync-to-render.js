@@ -105,6 +105,28 @@ export function buildStockSnapshotSyncParts(db, monthCutoff, chunkSize = 20000) 
   return { fetched: true, parts, count: rows.length };
 }
 
+/** 出荷サマリ (f_shipments_daily) を Render へ送ってよいかの鮮度判定。
+ *
+ * Render へは表の全行をスナップショットとして送るので、送ってよいのは
+ * 「その日の daily-sync で --all 再構築が成功した」ときだけ。
+ *  - 再構築に失敗した日に古い表を送ると、中身は前日のままなのに synced_at だけ新しくなり、
+ *    画面上は最新に見えてしまう (Codex R4/R5 high)
+ *  - 窓を広く取る (26時間など) と「前日の再構築」が通ってしまうので、
+ *    JST の同日 かつ 12時間以内 (daily-sync 07:00 〜 retry 最終 11:30 + 実行時間) とする
+ *
+ * @param {string|null|undefined} rebuiltAtIso sync_meta.shipments_daily_full_rebuilt_at
+ * @param {number} [nowMs] 現在時刻 (テスト用)
+ */
+export function isShipmentsRebuildFresh(rebuiltAtIso, nowMs = Date.now()) {
+  const REBUILD_MAX_AGE_H = 12;
+  const jstDay = (ms) => new Date(ms + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  const ms = rebuiltAtIso ? Date.parse(rebuiltAtIso) : NaN;
+  if (Number.isNaN(ms)) return false;
+  const ageH = (nowMs - ms) / 3600000;
+  if (ageH < 0 || ageH > REBUILD_MAX_AGE_H) return false; // 未来日付も信用しない
+  return jstDay(ms) === jstDay(nowMs);
+}
+
 export async function syncToRender() {
   requireSyncKey();
   const db = getDB();
@@ -152,23 +174,25 @@ export async function syncToRender() {
   }
 
   // 2b-3b. f_shipments_daily (日次出荷サマリ: 出荷日 × モール × 配送方法 の伝票件数)
+  //   判定は isShipmentsRebuildFresh() (このファイル末尾) を参照
   //   1日あたり数十行 (モール × 配送方法) なので数年分でも数万行。毎回全件送って mirror を置換する
   //   (miniPC 側は --all 再構築なので、出荷取消・出荷日訂正による「減り」も置換で反映される)。
   //   shop_name / platform は shops を JOIN 済みの値で送る (mirror 側は shops を持たない)。
   //   ★ 送るのは「今日ちゃんと再構築された表」だけ。rebuild-shipments-daily が失敗した日は
   //     SELECT 自体は成功してしまい、古い表 (初回失敗なら空の表) を最新として送って
   //     mirror を壊す (Codex R4 high)。再構築時刻が REBUILD_MAX_AGE_H より古ければ送らない。
-  const REBUILD_MAX_AGE_H = 26; // 毎朝07:00 + retry (最終11:30) を跨いでも当日中に収まる幅
+  //     26時間のような広い窓だと「前日の再構築」も有効扱いになり、当日の再構築が失敗した日に
+  //     前日の表を送って synced_at だけ新しくしてしまう (Codex R5 high)。
+  //     「JST で今日」かつ「12時間以内」= その日の daily-sync (07:00〜、retry 最終11:30) の
+  //     再構築だけが通る条件にする。
   let shipments_daily = [];
   let shipments_daily_state = 'ok';
   try {
     // 全期間 (--all) の再構築だけを根拠にする。部分再構築 (--days/--from) の時刻では送らない
     const rebuiltAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_full_rebuilt_at'").get();
-    const ageH = rebuiltAt && rebuiltAt.value
-      ? (Date.now() - Date.parse(rebuiltAt.value)) / 3600000 : Infinity;
-    if (!(ageH <= REBUILD_MAX_AGE_H)) {
+    if (!isShipmentsRebuildFresh(rebuiltAt?.value)) {
       shipments_daily_state = 'stale';
-      console.log(`[Sync→Render]   shipments_daily: 再構築が古い/未実行のためスキップ (最終再構築: ${rebuiltAt?.value || 'なし'})`);
+      console.log(`[Sync→Render]   ⚠ shipments_daily: 今日の全期間再構築が無いためスキップ (最終: ${rebuiltAt?.value || 'なし'})。Render は前回分を保持します`);
     } else {
       shipments_daily = db.prepare(`
         SELECT f.ship_date, f.shop_code, s.shop_name, s.platform,
