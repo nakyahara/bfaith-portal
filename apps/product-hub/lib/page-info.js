@@ -33,7 +33,8 @@ export const CATEGORY_LABELS = [
  * 生の env を信頼済みHTMLとして流すと管理画面と商品説明の両方に効くため)
  */
 export function adResponsibility() {
-  const raw = (process.env.PH_AD_RESPONSIBILITY || 'B-Faith株式会社<br>（TEL:066334858）').trim();
+  // 既定TELは 06-4860-7868 (中原さん確認 2026-08-05。xlsm由来の旧値 066334858 は9桁の誤記だった)
+  const raw = (process.env.PH_AD_RESPONSIBILITY || 'B-Faith株式会社<br>（TEL:06-4860-7868）').trim();
   return esc(raw).replace(/&lt;br\s*\/?&gt;/gi, '<br>');
 }
 
