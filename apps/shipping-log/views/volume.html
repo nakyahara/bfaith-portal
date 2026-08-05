@@ -66,6 +66,13 @@
         <input type="date" id="to">
       </div>
       <div>
+        <label for="granularity">粒度</label>
+        <select id="granularity">
+          <option value="day">日別</option>
+          <option value="month">月別</option>
+        </select>
+      </div>
+      <div>
         <label for="basis">数え方</label>
         <select id="basis">
           <option value="shipped">出荷確定した伝票すべて</option>
@@ -91,6 +98,7 @@
           <button data-days="30">直近30日</button>
           <button data-days="90">直近90日</button>
           <button data-days="365">直近1年</button>
+          <button data-days="365" data-gran="month">直近1年 (月別)</button>
         </div>
       </div>
     </div>
@@ -102,7 +110,7 @@
   <div class="cards" id="cards"></div>
 
   <div class="panel" style="margin-top:16px">
-    <h2>日別の出荷件数</h2>
+    <h2><span class="gran-label">日</span>別の出荷件数</h2>
     <div style="position:relative; height:320px"><canvas id="chartDaily"></canvas></div>
   </div>
 
@@ -118,12 +126,12 @@
   </div>
 
   <div class="panel">
-    <h2>日 × モール <button id="csv" class="ghost" style="float:right">CSVダウンロード</button></h2>
+    <h2><span class="gran-label">日</span> × モール <button id="csv" class="ghost" style="float:right">CSVダウンロード</button></h2>
     <div class="tablewrap"><table id="tblMall"></table></div>
   </div>
 
   <div class="panel">
-    <h2>日 × 配送方法</h2>
+    <h2><span class="gran-label">日</span> × 配送方法</h2>
     <div class="tablewrap"><table id="tblMethod"></table></div>
   </div>
 </main>
@@ -154,6 +162,7 @@ function query() {
   p.set('from', $('from').value);
   p.set('to', $('to').value);
   p.set('basis', $('basis').value);
+  p.set('granularity', $('granularity').value);
   for (const v of selectedValues($('mall'))) p.append('mall', v);
   for (const v of selectedValues($('method'))) p.append('method', v);
   return p;
@@ -170,9 +179,11 @@ async function loadOptions() {
 
 function drawCards(d) {
   const cancelNote = d.basis === 'shipped' ? `うちキャンセル ${fmt(d.cancelled)}件` : 'キャンセルを除いた数';
+  const isMonth = d.granularity === 'month';
   $('cards').innerHTML = [
     { k: '合計', v: fmt(d.total), n: `${d.from} 〜 ${d.to}` },
-    { k: '1日平均', v: fmt(d.avgPerDay), n: `${d.days.length}日分` },
+    ...(isMonth ? [{ k: '月平均', v: fmt(d.avgPerBucket), n: `${d.days.length}ヶ月で割った数 (端の月は部分月)` }] : []),
+    { k: '1日平均', v: fmt(d.avgPerDay), n: `出荷があった ${fmt(d.workDays)}日で割った数` },
     { k: '最多モール', v: d.malls[0] ? d.malls[0].name : '—', n: d.malls[0] ? `${fmt(d.malls[0].n)}件` : '' },
     { k: '最多の配送方法', v: d.methods[0] ? d.methods[0].name : '—', n: d.methods[0] ? `${fmt(d.methods[0].n)}件` : '' },
     { k: '数え方', v: d.basis === 'shipped' ? '出荷確定' : 'キャンセル除く', n: cancelNote },
@@ -197,7 +208,8 @@ function drawChart(id, config) {
 }
 
 function drawCharts(d) {
-  const labels = d.days.map(x => x.date.slice(5));
+  // 日別は MM-DD、月別は YYYY-MM
+  const labels = d.days.map(x => (d.granularity === 'month' ? x.date : x.date.slice(5)));
   drawChart('chartDaily', {
     type: 'bar',
     data: { labels, datasets: seriesOf(d.days, 'malls') },
@@ -219,17 +231,26 @@ function drawCharts(d) {
   pie('chartMethod', d.methods);
 }
 
-function drawTable(el, days, key, totals) {
+function drawTable(el, days, key, totals, granularity) {
+  const isMonth = granularity === 'month';
   const cols = totals.map(t => t.name);
-  const head = `<thead><tr><th>出荷日</th>${cols.map(c => `<th>${esc(c)}</th>`).join('')}<th>合計</th></tr></thead>`;
+  // 月別は「出荷があった日数」と「1日あたり平均」を右端に足す (月の忙しさが件数だけだと
+  // 稼働日数の差で見えないため)
+  const extraHead = isMonth ? '<th>日数</th><th>1日平均</th>' : '';
+  const head = `<thead><tr><th>${isMonth ? '出荷月' : '出荷日'}</th>${cols.map(c => `<th>${esc(c)}</th>`).join('')}<th>合計</th>${extraHead}</tr></thead>`;
   const body = days.slice().reverse().map(d => {
     const cells = cols.map(c => `<td>${fmt(d[key][c] || 0)}</td>`).join('');
-    return `<tr><td>${esc(d.date)}</td>${cells}<td><b>${fmt(d.total)}</b></td></tr>`;
+    const extra = isMonth ? `<td>${fmt(d.work_days)}</td><td><b>${fmt(d.avg_per_day)}</b></td>` : '';
+    return `<tr><td>${esc(d.date)}</td>${cells}<td><b>${fmt(d.total)}</b></td>${extra}</tr>`;
   }).join('');
+  const grand = days.reduce((a, d) => a + d.total, 0);
+  const grandDays = isMonth ? days.reduce((a, d) => a + (d.work_days || 0), 0) : 0;
+  const extraFoot = isMonth
+    ? `<th>${fmt(grandDays)}</th><th>${fmt(grandDays ? Math.round(grand / grandDays) : 0)}</th>` : '';
   const foot = `<tfoot><tr><th>合計</th>${cols.map(c => {
     const s = days.reduce((a, d) => a + (d[key][c] || 0), 0);
     return `<th>${fmt(s)}</th>`;
-  }).join('')}<th>${fmt(days.reduce((a, d) => a + d.total, 0))}</th></tr></tfoot>`;
+  }).join('')}<th>${fmt(grand)}</th>${extraFoot}</tr></tfoot>`;
   el.innerHTML = head + `<tbody>${body}</tbody>` + foot;
 }
 
@@ -240,8 +261,11 @@ async function load() {
     if (!d.ok) throw new Error(d.error || '取得に失敗しました');
     drawCards(d);
     drawCharts(d);
-    drawTable($('tblMall'), d.days, 'malls', d.malls);
-    drawTable($('tblMethod'), d.days, 'methods', d.methods);
+    drawTable($('tblMall'), d.days, 'malls', d.malls, d.granularity);
+    drawTable($('tblMethod'), d.days, 'methods', d.methods, d.granularity);
+    document.querySelectorAll('.gran-label').forEach(el => {
+      el.textContent = d.granularity === 'month' ? '月' : '日';
+    });
   } catch (e) {
     $('error').style.display = '';
     $('error').textContent = 'データを取得できませんでした: ' + e.message
@@ -261,8 +285,10 @@ $('csv').addEventListener('click', () => {
 document.querySelectorAll('.quick button').forEach(b => b.addEventListener('click', () => {
   $('to').value = jstToday(0);
   $('from').value = jstToday(-(Number(b.dataset.days) - 1));
+  if (b.dataset.gran) $('granularity').value = b.dataset.gran;
   load();
 }));
+$('granularity').addEventListener('change', load);
 
 (async () => {
   $('to').value = jstToday(0);
