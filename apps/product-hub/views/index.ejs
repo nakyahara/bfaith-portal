@@ -243,10 +243,7 @@
   if (intakeBtn) {
     intakeBtn.addEventListener('click', async () => {
       const out = document.getElementById('intake-run-result');
-      if (!confirm('NE新商品の取込を今すぐ実行します。
-初回は「シード」(現在の全商品を既存として記録・ドラフトは作らない) になります。
-
-よろしいですか?')) return;
+      if (!confirm('NE新商品の取込を今すぐ実行します。\n初回は「シード」(現在の全商品を既存として記録・ドラフトは作らない) になります。\n\nよろしいですか?')) return;
       intakeBtn.disabled = true;
       out.textContent = '実行中…';
       try {
