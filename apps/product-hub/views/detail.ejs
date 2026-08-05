@@ -1823,7 +1823,7 @@
     }
     const cats = json.shopCategories || [];
     pre.textContent = '商品管理番号: ' + json.manageNumber
-      + (cats.length ? '\n店舗内カテゴリ (公開時にRMS画面で設定 — payloadには含まれません): ' + cats.join(' ／ ') : '')
+      + (cats.length ? '\n店舗内カテゴリ (登録時にアプリが自動で棚に反映 — この payload とは別API): ' + cats.join(' ／ ') : '')
       + '\n\n' + JSON.stringify(json.payload, null, 2);
   });
 
