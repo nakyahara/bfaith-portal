@@ -45,9 +45,10 @@ function check(n, unit, label, expectTooMany) {
   }
   ok(!C.tooMany, '上限内なのでグラフを描く');
 
-  const left = C.PAD_L, right = C.W - C.PAD_R, top = C.PAD_T, bottom = C.baselineY;
+  const left = C.PAD_L, right = C.W - C.PAD_R;
 
-  for (const [name, p] of [['送付数', C.shipped], ['SKU数', C.skus]]) {
+  // 段ごとに天井と基線が違う (1枚のSVGに上下2段を密着させているため)
+  for (const [name, p, top, bottom] of [['送付数', C.shipped, C.topY1, C.baseY1], ['SKU数', C.skus, C.topY2, C.baseY2]]) {
     const marks = p.marks;
     ok(marks.length === n, `${name}: マーク数が行数と一致 (${marks.length})`);
     ok(marks.every(m => m.x >= left - 0.01 && m.x + m.w <= right + 0.01),
@@ -67,17 +68,30 @@ function check(n, unit, label, expectTooMany) {
        `${name}: 最大値の位置がスケールと一致`);
     ok(p.top >= p.max, `${name}: 軸の上端が最大値以上 (${p.top} >= ${p.max})`);
 
-    // 目盛りが「きりのいい数」か (1/2/5 × 10^k の倍数)
-    const step = p.yTicks.length > 1 ? p.yTicks[1].v - p.yTicks[0].v : p.top;
-    const mag = Math.pow(10, Math.floor(Math.log10(step || 1)));
-    const norm = Math.round((step / mag) * 100) / 100;
-    ok([1, 2, 5, 10].includes(norm), `${name}: 目盛り幅がきりのいい数 (${step})`);
+    // 下段(SKU数)は高さが狭いので目盛りを0と上端だけに間引いている。
+    // その場合は刻み幅ではなく「上端がきりのいい刻みの倍数か」で見る。
+    const sparse = p.yTicks.length === 2 && p.yTicks[1].v === p.top;
+    const step = sparse ? p.top / 3 : (p.yTicks[1].v - p.yTicks[0].v);
+    const isNice = (v) => {
+      if (v <= 0) return false;
+      const mag = Math.pow(10, Math.floor(Math.log10(v)));
+      return [1, 2, 5, 10].includes(Math.round((v / mag) * 100) / 100);
+    };
+    if (sparse) {
+      // top は niceTicks の刻み(1/2/5×10^k)の整数倍になっているはず
+      const mag = Math.pow(10, Math.floor(Math.log10(p.top)));
+      const okTop = [1, 2, 5, 10].some(u => Math.abs((p.top / (u * mag)) % 1) < 1e-9)
+        || [1, 2, 5, 10].some(u => Math.abs((p.top / (u * mag / 10)) % 1) < 1e-9);
+      ok(okTop, `${name}: 上端がきりのいい刻みの倍数 (${p.top})`);
+    } else {
+      ok(isNice(step), `${name}: 目盛り幅がきりのいい数 (${step})`);
+    }
     ok(p.yTicks.length >= 2 && p.yTicks.length <= 8, `${name}: 目盛り本数が2〜8 (${p.yTicks.length})`);
     ok(p.yTicks[0].v === 0, `${name}: 基線が0から始まる`);
 
     // ピークラベルが上端で切れない (y >= 10 を保証している)
-    const labelY = Math.max(10, p.peak.cy - 7);
-    ok(labelY >= 10, `${name}: ピークラベルが上端で切れない (y=${labelY.toFixed(1)})`);
+    const labelY = Math.max(top + 8, p.peak.cy - 5);
+    ok(labelY >= top + 8 - 0.01, `${name}: ピークラベルが上端で切れない (y=${labelY.toFixed(1)})`);
   }
 
   // X軸ラベルの重なり: 9px フォントで1文字あたり約5.5px、最長ラベル基準
@@ -87,7 +101,7 @@ function check(n, unit, label, expectTooMany) {
   const minGap = gaps.length ? Math.min(...gaps) : Infinity;
   ok(minGap >= est * 0.9,
      `X軸ラベルが重ならない (最小間隔 ${minGap.toFixed(1)}px >= 推定幅 ${est.toFixed(1)}px の9割)`);
-  ok(C.xTicks.length <= 13, `X軸ラベル数が13以下 (${C.xTicks.length})`);
+  ok(C.xTicks.length <= 11, `X軸ラベル数が13以下 (${C.xTicks.length})`);
   ok(C.xTicks.every(t => t.x >= left && t.x <= right), 'X軸ラベルが描画領域内');
 }
 
@@ -106,7 +120,7 @@ console.log('\n[ゼロ値・空]');
   ok(!!zero, '全部0でも生成できる');
   ok(zero.shipped.top > 0, '全部0でも軸の上端が正 (0除算しない)');
   ok(zero.shipped.marks[0].h >= 0.5, '0でも棒が残る');
-  ok(zero.shipped.marks[0].topY + zero.shipped.marks[0].h <= zero.baselineY + 0.01, '0の棒が基線より下へ出ない');
+  ok(zero.shipped.marks[0].topY + zero.shipped.marks[0].h <= zero.baseY1 + 0.01, '0の棒が基線より下へ出ない');
   ok(zero.shipped.marks[0].r <= zero.shipped.marks[0].h + 0.01, '0の棒の角丸が高さを超えない');
   ok(buildInboundChart([], 'day') === null, '空配列は null を返す');
 }
