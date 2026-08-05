@@ -92,10 +92,26 @@ console.log('\n── 期間・不正入力 ──');
 {
   const r = await get('/api/volume?from=2026-08-05&to=2026-08-04');
   eq([r.json.from, r.json.to], ['2026-08-04', '2026-08-05'], 'from > to は入れ替えて解釈する');
-  const r2 = await get('/api/volume?from=abc&to=2026-08-05');
-  eq(r2.status, 200, '不正な日付でも 500 にしない (既定期間で返す)');
+  eq((await get('/api/volume?from=abc&to=2026-08-05')).status, 400, '日付の形式が不正 → 400');
+  eq((await get('/api/volume?from=2026-99-99&to=2026-08-05')).status, 400, '存在しない日付 → 400');
+  eq((await get('/api/volume?from=2026-02-31&to=2026-08-05')).status, 400, '2/31 → 400');
+  eq((await get('/api/volume?from=2000-01-01&to=2026-08-05')).status, 400, '期間が長すぎる → 400');
+  eq((await get('/api/volume')).status, 200, '未指定は既定期間 (直近30日)');
   const r3 = await get("/api/volume?from=2026-08-04&to=2026-08-05&mall=4') OR 1=1--");
   eq(r3.json.total, 0, 'SQL を仕込んだ mall 値は単に一致なし (プレースホルダ)');
+}
+
+console.log('\n── CSV の数式インジェクション対策 ──');
+{
+  // NE 由来の配送方法名に = で始まる値が入っても Excel が式として評価しないこと
+  db.prepare(`INSERT INTO mirror_shipments_daily
+    (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, source_updated_at, synced_at)
+    VALUES ('2026-08-06','1','=cmd|calc!A1','rakuten','99','@SUM(1+1)',3,0,NULL,'2026-08-06T07:00:00Z')`).run();
+  const r = await get('/api/volume.csv?from=2026-08-06&to=2026-08-06');
+  const line = r.text.trim().split('\r\n')[1];
+  ok(line.includes("'=cmd|calc!A1") || line.includes('"\'=cmd|calc!A1"'), '先頭 = のセルは \' で無害化される');
+  ok(line.includes("'@SUM(1+1)"), '先頭 @ のセルも無害化される');
+  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date='2026-08-06'").run();
 }
 
 console.log('\n── CSV ──');

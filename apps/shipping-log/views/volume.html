@@ -131,6 +131,10 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const fmt = (n) => Number(n || 0).toLocaleString('ja-JP');
+// モール名・配送方法名は NE / shops 由来の外部データ。innerHTML に入れる前に必ず通す
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
 // 色は固定パレットを順番に割り当てる (系列が日によって増減しても色が飛ばないよう名前順で決める)
 const PALETTE = ['#2563eb','#f59e0b','#10b981','#ef4444','#8b5cf6','#06b6d4','#ec4899','#84cc16','#f97316','#64748b','#0ea5e9','#a855f7'];
 const colorOf = (name, i) => PALETTE[i % PALETTE.length];
@@ -158,8 +162,8 @@ function query() {
 async function loadOptions() {
   const r = await fetch('/apps/shipping-log/api/options').then(x => x.json());
   if (!r.ok) throw new Error(r.error || '選択肢を取得できませんでした');
-  $('mall').innerHTML = r.malls.map(m => `<option value="${m.shop_code}">${m.shop_name}</option>`).join('');
-  $('method').innerHTML = r.methods.map(m => `<option value="${m.delivery_id}">${m.delivery_name}</option>`).join('');
+  $('mall').innerHTML = r.malls.map(m => `<option value="${esc(m.shop_code)}">${esc(m.shop_name)}</option>`).join('');
+  $('method').innerHTML = r.methods.map(m => `<option value="${esc(m.delivery_id)}">${esc(m.delivery_name)}</option>`).join('');
   const synced = r.synced_at ? new Date(r.synced_at).toLocaleString('ja-JP') : '—';
   $('meta').textContent = `データ範囲: ${r.min_date || '—'} 〜 ${r.max_date || '—'} / 最終同期: ${synced}`;
 }
@@ -172,7 +176,7 @@ function drawCards(d) {
     { k: '最多モール', v: d.malls[0] ? d.malls[0].name : '—', n: d.malls[0] ? `${fmt(d.malls[0].n)}件` : '' },
     { k: '最多の配送方法', v: d.methods[0] ? d.methods[0].name : '—', n: d.methods[0] ? `${fmt(d.methods[0].n)}件` : '' },
     { k: '数え方', v: d.basis === 'shipped' ? '出荷確定' : 'キャンセル除く', n: cancelNote },
-  ].map(c => `<div class="card"><div class="k">${c.k}</div><div class="v">${c.v}</div><div class="n">${c.n}</div></div>`).join('');
+  ].map(c => `<div class="card"><div class="k">${esc(c.k)}</div><div class="v">${esc(c.v)}</div><div class="n">${esc(c.n)}</div></div>`).join('');
 }
 
 function seriesOf(days, key) {
@@ -217,10 +221,10 @@ function drawCharts(d) {
 
 function drawTable(el, days, key, totals) {
   const cols = totals.map(t => t.name);
-  const head = `<thead><tr><th>出荷日</th>${cols.map(c => `<th>${c}</th>`).join('')}<th>合計</th></tr></thead>`;
+  const head = `<thead><tr><th>出荷日</th>${cols.map(c => `<th>${esc(c)}</th>`).join('')}<th>合計</th></tr></thead>`;
   const body = days.slice().reverse().map(d => {
     const cells = cols.map(c => `<td>${fmt(d[key][c] || 0)}</td>`).join('');
-    return `<tr><td>${d.date}</td>${cells}<td><b>${fmt(d.total)}</b></td></tr>`;
+    return `<tr><td>${esc(d.date)}</td>${cells}<td><b>${fmt(d.total)}</b></td></tr>`;
   }).join('');
   const foot = `<tfoot><tr><th>合計</th>${cols.map(c => {
     const s = days.reduce((a, d) => a + (d[key][c] || 0), 0);

@@ -16,17 +16,33 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_RANGE_DAYS = 1096; // 3年。これ以上は画面で扱えないので 400 で断る
+
+/** 実在する日付か (2026-99-99 / 2026-02-31 を弾く) */
+function isRealDate(s) {
+  if (!DATE_RE.test(String(s || ''))) return false;
+  const d = new Date(`${s}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
 
 function jstDate(offsetDays = 0) {
   const t = Date.now() + 9 * 3600 * 1000 + offsetDays * 86400 * 1000;
   return new Date(t).toISOString().slice(0, 10);
 }
 
-/** クエリの期間を検証して既定 (直近30日) を埋める */
+class BadRequest extends Error {}
+
+/** クエリの期間を検証して既定 (直近30日) を埋める。不正なら 400 で返す */
 function parseRange(q) {
-  const to = DATE_RE.test(String(q.to || '')) ? q.to : jstDate(0);
-  const from = DATE_RE.test(String(q.from || '')) ? q.from : jstDate(-29);
-  if (from > to) return { from: to, to: from };
+  const rawFrom = q.from == null || q.from === '' ? null : String(q.from);
+  const rawTo = q.to == null || q.to === '' ? null : String(q.to);
+  if (rawFrom !== null && !isRealDate(rawFrom)) throw new BadRequest(`from が不正です: ${rawFrom}`);
+  if (rawTo !== null && !isRealDate(rawTo)) throw new BadRequest(`to が不正です: ${rawTo}`);
+  let from = rawFrom || jstDate(-29);
+  let to = rawTo || jstDate(0);
+  if (from > to) [from, to] = [to, from];
+  const days = (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000 + 1;
+  if (days > MAX_RANGE_DAYS) throw new BadRequest(`期間が長すぎます (${MAX_RANGE_DAYS}日まで)`);
   return { from, to };
 }
 
@@ -131,6 +147,7 @@ router.get('/api/volume', (req, res) => {
     });
     res.json({ ok: true, ...summary }); // 明細は CSV 側で返す (画面は集計だけで足りる)
   } catch (e) {
+    if (e instanceof BadRequest) return res.status(400).json({ ok: false, error: String(e.message) });
     res.status(503).json({ ok: false, error: String(e.message || e) });
   }
 });
@@ -144,9 +161,12 @@ router.get('/api/volume.csv', (req, res) => {
       from, to, basis: String(req.query.basis || 'shipped'),
       malls: asArray(req.query.mall), methods: asArray(req.query.method),
     });
+    // Excel の数式インジェクション対策: 先頭が = + - @ (と制御文字) のセルは ' を付けて無害化する。
+    // モール名・配送方法名は NE 由来の外部データなので、そのまま出すと式として評価されうる。
     const esc = (v) => {
-      const s = String(v ?? '');
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      let s = String(v ?? '');
+      if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const lines = ['出荷日,モール,配送方法,件数,うちキャンセル'];
     for (const r of data.rows) {
@@ -159,6 +179,7 @@ router.get('/api/volume.csv', (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="shipments_${data.from}_${data.to}.csv"`);
     res.send('﻿' + lines.join('\r\n'));
   } catch (e) {
+    if (e instanceof BadRequest) return res.status(400).send(String(e.message));
     res.status(503).send(String(e.message || e));
   }
 });

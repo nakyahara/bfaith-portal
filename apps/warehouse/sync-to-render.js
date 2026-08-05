@@ -156,6 +156,7 @@ export async function syncToRender() {
   //   (miniPC 側は --all 再構築なので、出荷取消・出荷日訂正による「減り」も置換で反映される)。
   //   shop_name / platform は shops を JOIN 済みの値で送る (mirror 側は shops を持たない)。
   let shipments_daily = [];
+  let shipments_daily_state = 'ok';
   try {
     shipments_daily = db.prepare(`
       SELECT f.ship_date, f.shop_code, s.shop_name, s.platform,
@@ -167,6 +168,7 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   shipments_daily: ${shipments_daily.length}件`);
   } catch (e) {
     // 表がまだ無い miniPC (デプロイ順の差) でも既存同期を止めない
+    shipments_daily_state = 'failed';
     console.log(`[Sync→Render]   shipments_daily: 取得失敗（スキップ）: ${e.message}`);
   }
 
@@ -367,9 +369,10 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
-    // 出荷サマリは「取れたときだけ」送る。受信側は全件置換なので、空配列を送ると
-    // 取得失敗時に mirror を全消ししてしまう (前回分を残す方が安全)。
-    if (shipments_daily.length > 0) masterPart.shipments_daily = shipments_daily;
+    // 出荷サマリは SELECT が成功したときだけ送る。0件でも送るのが正しい
+    //   (元が正当に空になった = 全部消えたケースを mirror に反映できないと古い件数が残り続ける)。
+    //   SELECT 自体が失敗したときだけ payload に載せず、Render 側は前回分を保持する。
+    if (shipments_daily_state === 'ok') masterPart.shipments_daily = shipments_daily;
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
     // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
     //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が
