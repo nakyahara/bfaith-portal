@@ -20,7 +20,8 @@ process.env.DATA_DIR = tmpDir;
 const { initDB, getDB } = await import('./db.js');
 const { toOrderBaseRow, makeNeOrderBaseUpserter } = await import('./ne-order-base-upsert.js');
 const { rebuildShipmentsDaily } = await import('./rebuild-shipments-daily.js');
-const { splitMonths } = await import('./backfill-ne-order-base.js');
+const { splitMonths, validateRange } = await import('./backfill-ne-order-base.js');
+const { splitWindow } = await import('./ne-api.js');
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -84,10 +85,17 @@ const mkRow = (o) => ({
   eq(db.prepare('SELECT 配送方法名 FROM raw_ne_order_base WHERE 伝票番号=?').get('1000').配送方法名,
     'ヤマト(発払い)B2v6', '変更後の配送方法が保存されている');
 
-  // 識別系は初回スナップショットを保持する
+  // 識別系は初回スナップショットを保持する。ただし店舗コードは集計キーなので追随する
   upsert(mkRow({ 受注日: '1999-01-01 00:00:00', 店舗コード: '9', 受注番号: 'R-CHANGED', 出荷確定日: '2026-08-02 15:00:00', 受注状態区分: '50', 受注状態: '出荷確定済（完了）', 配送方法ID: '20', 配送方法名: 'ヤマト(発払い)B2v6' }), 'T5');
   const keep = db.prepare('SELECT 受注日, 店舗コード, 受注番号 FROM raw_ne_order_base WHERE 伝票番号=?').get('1000');
-  eq([keep.受注日, keep.店舗コード, keep.受注番号], ['2026-08-01 10:00:00', '1', 'R-1'], '識別系 (受注日/店舗/受注番号) は初回値を保持');
+  eq([keep.受注日, keep.受注番号], ['2026-08-01 10:00:00', 'R-1'], '識別系 (受注日/受注番号) は初回値を保持');
+  eq(keep.店舗コード, '9', '店舗コードは更新される (集計キーなので誤分類が自己修復しないと困る)');
+
+  // 出荷確定が取り消された = 出荷確定日が空に戻るケース (更新日ベース取得で拾う)
+  eq(upsert(mkRow({ 伝票番号: '1000', 店舗コード: '9', 出荷確定日: '', 受注状態区分: '20', 受注状態: '引当待ち', 配送方法ID: '20', 配送方法名: 'ヤマト(発払い)B2v6' }), 'T6'),
+    'updated', '出荷確定の取り消し → updated');
+  eq(db.prepare('SELECT 出荷確定日 FROM raw_ne_order_base WHERE 伝票番号=?').get('1000').出荷確定日, '',
+    '出荷確定日が空に戻る (件数から自動的に外れる)');
 }
 
 // ───────────────────────── 3. 集計 ─────────────────────────
@@ -143,6 +151,60 @@ db.prepare('DELETE FROM raw_ne_order_base').run();
   rebuildShipmentsDaily(db, { all: true });
   ok(db.prepare("SELECT COUNT(*) n FROM f_shipments_daily WHERE ship_date='2026-07-01'").get().n === 0,
     '--all は全期間を実データから作り直す');
+}
+
+// ─────────────── 3b. 集計の追加ケース (Codex R1 対応) ───────────────
+console.log('\n── 集計: 配送方法名の揺れ / 出荷取消 / 日付境界 ──');
+db.prepare('DELETE FROM raw_ne_order_base').run();
+db.prepare('DELETE FROM f_shipments_daily').run();
+{
+  // 同じ配送方法ID で名称が変わった (NE マスタの改名)。新しい方の名前を採用する
+  upsert(mkRow({ 伝票番号: 'M1', 店舗コード: '1', 出荷確定日: '2026-07-01 10:00:00', 配送方法ID: '28', 配送方法名: 'ヤマト(ネコポス)' }), 'T');
+  upsert(mkRow({ 伝票番号: 'M2', 店舗コード: '1', 出荷確定日: '2026-08-04 10:00:00', 配送方法ID: '28', 配送方法名: 'ネコポス(新名称)' }), 'T');
+  rebuildShipmentsDaily(db, { all: true });
+  const names = db.prepare("SELECT DISTINCT delivery_name FROM f_shipments_daily WHERE delivery_id='28'").all().map(r => r.delivery_name);
+  eq(names, ['ネコポス(新名称)'], '同一IDで名称が変わったら最新の名称に揃う (辞書順MAXではない)');
+
+  // 日付境界: 00:00:00 と 23:59:59 が正しく当日に入る
+  db.prepare('DELETE FROM raw_ne_order_base').run();
+  upsert(mkRow({ 伝票番号: 'B1', 店舗コード: '1', 出荷確定日: '2026-08-04 00:00:00', 配送方法ID: '28' }), 'T');
+  upsert(mkRow({ 伝票番号: 'B2', 店舗コード: '1', 出荷確定日: '2026-08-04 23:59:59', 配送方法ID: '28' }), 'T');
+  upsert(mkRow({ 伝票番号: 'B3', 店舗コード: '1', 出荷確定日: '2026-08-05 00:00:00', 配送方法ID: '28' }), 'T');
+  rebuildShipmentsDaily(db, { from: '2026-08-04', to: '2026-08-04' });
+  eq(db.prepare("SELECT slips FROM f_shipments_daily WHERE ship_date='2026-08-04'").get().slips, 2,
+    '00:00:00 と 23:59:59 は当日に入り、翌日 00:00:00 は入らない');
+  ok(db.prepare("SELECT COUNT(*) n FROM f_shipments_daily WHERE ship_date='2026-08-05'").get().n === 0,
+    '窓の外 (翌日) は作られない');
+
+  // 出荷確定が取り消されたら --all の再構築で件数から消える
+  upsert(mkRow({ 伝票番号: 'B1', 店舗コード: '1', 出荷確定日: '', 配送方法ID: '28' }), 'T');
+  rebuildShipmentsDaily(db, { all: true });
+  eq(db.prepare("SELECT slips FROM f_shipments_daily WHERE ship_date='2026-08-04'").get().slips, 1,
+    '出荷確定が取り消された伝票は再構築で件数から消える');
+}
+
+// ─────────────── 3c. 取得区間の二分割 ───────────────
+console.log('\n── splitWindow (1レスポンスに収まらない区間の二分割) ──');
+{
+  eq(splitWindow('2026-08-01 00:00:00', '2026-08-01 23:59:59'), null, '同一日は割れない → null');
+  eq(splitWindow('2026-08-01 00:00:00', '2026-08-02 23:59:59'),
+    [['2026-08-01 00:00:00', '2026-08-01 23:59:59'], ['2026-08-02 00:00:00', '2026-08-02 23:59:59']], '2日 → 1日ずつ');
+  const [a, b] = splitWindow('2026-08-01 00:00:00', '2026-08-31 23:59:59');
+  eq([a[0], b[1]], ['2026-08-01 00:00:00', '2026-08-31 23:59:59'], '1ヶ月を割っても両端は保たれる');
+  ok(a[1] < b[0], '前半の終わりと後半の始まりが重ならない (二重計上しない)');
+  eq([a[1].slice(0, 10), b[0].slice(0, 10)], ['2026-08-16', '2026-08-17'], '境界は日単位で連続する (欠けない)');
+}
+
+// ─────────────── 3d. バックフィルの引数検証 ───────────────
+console.log('\n── validateRange (不正な引数で NE API を叩かない) ──');
+{
+  const throws = (fn) => { try { fn(); return false; } catch { return true; } };
+  ok(throws(() => validateRange('2026-13-01', '2026-08-05', 12)), '存在しない月 → エラー');
+  ok(throws(() => validateRange('2026-02-31', '2026-08-05', 12)), '存在しない日 (2/31) → エラー');
+  ok(throws(() => validateRange('2026-08-05', '2026-08-01', 12)), 'from > to → エラー');
+  ok(throws(() => validateRange('2026-08-01', '2026-08-05', 0)), '--months 0 → エラー');
+  ok(throws(() => validateRange('2026-08-01', '2026-08-05', NaN)), '--months NaN → エラー');
+  ok(!throws(() => validateRange('2025-08-05', '2026-08-05', 12)), '正常な1年指定は通る');
 }
 
 // ───────────────────────── 4. 月分割 ─────────────────────────

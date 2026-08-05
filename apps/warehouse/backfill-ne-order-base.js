@@ -37,6 +37,22 @@ function parseArgs(argv) {
   return out;
 }
 
+/**
+ * 日付・期間の検証。不正な日付のまま splitMonths に入れると NaN で終了条件が壊れ、
+ * NE API を無限に叩きかねない (Codex R1 low)。実行前に必ず落とす。
+ */
+export function validateRange(from, to, months) {
+  const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s)
+    && !Number.isNaN(Date.parse(`${s}T00:00:00Z`))
+    && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s; // 2026-02-31 等を弾く
+  if (!isDate(from)) throw new Error(`--from が不正です: ${from} (YYYY-MM-DD)`);
+  if (!isDate(to)) throw new Error(`--to が不正です: ${to} (YYYY-MM-DD)`);
+  if (from > to) throw new Error(`--from が --to より後です: ${from} > ${to}`);
+  if (!Number.isFinite(months) || months <= 0 || months > 120) {
+    throw new Error(`--months が不正です: ${months} (1〜120)`);
+  }
+}
+
 /** [from, to] を月単位の区間に割る。返り値は 'YYYY-MM-DD' の組 */
 export function splitMonths(from, to) {
   const out = [];
@@ -65,8 +81,11 @@ async function main() {
     return d.toISOString().slice(0, 10);
   })();
 
+  validateRange(from, to, opts.months);
+
   const months = splitMonths(from, to);
   console.log(`[バックフィル] 出荷確定日 ${from} 〜 ${to} を ${months.length} ヶ月に分割して取得します`);
+  console.log(`[バックフィル] 想定 API 回数: 最低 ${months.length} 回 (1区間1万件を超えた月は日付で二分割されて増えます。NE 無料枠は月1,000回)`);
   if (opts.dryRun) {
     for (const [s, e] of months) console.log(`  ${s} 〜 ${e}`);
     console.log('[バックフィル] --dry-run のため API は呼びません');

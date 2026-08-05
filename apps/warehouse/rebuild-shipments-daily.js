@@ -6,7 +6,10 @@
  *
  * ・Amazon Easy Ship は NE 側の配送方法名が 'AES' なので、店舗=Amazon × 配送方法=AES で数えられる
  *   (Amazon でも AES 以外の便が数%あるため、モール軸だけでは AES 件数にならない)
- * ・キャンセルは除外せず cancelled_slips として別に持つ (どちらで見るかは画面側で選ぶ)
+ * ・出荷確定日が入っているのに現在キャンセル扱いの伝票は cancelled_slips に分けて持つ。
+ *   slips から外すと「発送した実績」としては過小になるが (Codex R1 high)、実測では
+ *   直近1年で 79 件 / 30.4 万件 = 0.026% しかないので既定は slips = 有効のみ。
+ *   両方保存しているので「発送ベース (slips + cancelled_slips)」も画面側で出せる
  * ・期間内を DELETE → INSERT で置換。1トランザクションなので途中経過が見えることはない
  *
  * 使い方:
@@ -47,23 +50,39 @@ export function rebuildShipmentsDaily(db, opts = {}) {
   const to = all ? '9999-12-31' : (opts.to || jstDate(0));
   const updatedAt = new Date().toISOString();
 
-  // 出荷確定日は 'YYYY-MM-DD HH:MM:SS'。日付部分だけで窓を切る。
+  // 出荷確定日は 'YYYY-MM-DD HH:MM:SS'。
+  // WHERE に substr() を使うと idx_ne_base_send が効かず毎回フルスキャンになるため
+  // 文字列の範囲比較で書く (Codex R1 medium)。'YYYY-MM-DD ...' は辞書順 = 時系列順。
   const selectSql = `
     SELECT substr(出荷確定日, 1, 10)                    AS ship_date,
            COALESCE(店舗コード, '')                      AS shop_code,
            COALESCE(配送方法ID, '')                      AS delivery_id,
-           MAX(COALESCE(NULLIF(配送方法名, ''), '(未設定)')) AS delivery_name,
            SUM(CASE WHEN キャンセル区分 = 'キャンセル' THEN 0 ELSE 1 END) AS slips,
            SUM(CASE WHEN キャンセル区分 = 'キャンセル' THEN 1 ELSE 0 END) AS cancelled_slips
       FROM raw_ne_order_base
-     WHERE 出荷確定日 IS NOT NULL AND 出荷確定日 <> ''
-       AND substr(出荷確定日, 1, 10) >= ?
-       AND substr(出荷確定日, 1, 10) <= ?
+     WHERE 出荷確定日 >= ? AND 出荷確定日 < ?
      GROUP BY ship_date, shop_code, delivery_id
   `;
 
+  // 配送方法IDごとの「最新の名称」。同じIDに複数の名称が現れたとき MAX(辞書順) を採ると
+  // 最新でも代表でもない名前が出る (Codex R1 medium)。出荷確定日が一番新しい行の名称を正とする。
+  const nameSql = `
+    SELECT COALESCE(配送方法ID, '') AS delivery_id,
+           COALESCE(NULLIF(配送方法名, ''), '(未設定)') AS delivery_name
+      FROM raw_ne_order_base b
+     WHERE 出荷確定日 = (SELECT MAX(出荷確定日) FROM raw_ne_order_base x
+                          WHERE COALESCE(x.配送方法ID,'') = COALESCE(b.配送方法ID,'')
+                            AND x.出荷確定日 <> '')
+     GROUP BY delivery_id
+  `;
+
+  // '' は '0000-01-01' より小さいので、空文字 (=未出荷) は範囲比較で自然に除外される。
+  const lo = `${from} 00:00:00`;
+  const hiExclusive = `${to} 99`; // 'YYYY-MM-DD 23:59:59' < 'YYYY-MM-DD 99' (数字 < '9')
+
   const tx = db.transaction(() => {
-    const rows = db.prepare(selectSql).all(from, to);
+    const rows = db.prepare(selectSql).all(lo, hiExclusive);
+    const nameMap = new Map(db.prepare(nameSql).all().map(r => [r.delivery_id, r.delivery_name]));
     db.prepare('DELETE FROM f_shipments_daily WHERE ship_date >= ? AND ship_date <= ?').run(from, to);
     const ins = db.prepare(`
       INSERT INTO f_shipments_daily
@@ -72,7 +91,8 @@ export function rebuildShipmentsDaily(db, opts = {}) {
     `);
     let slips = 0;
     for (const r of rows) {
-      ins.run(r.ship_date, r.shop_code, r.delivery_id, r.delivery_name, r.slips, r.cancelled_slips, updatedAt);
+      ins.run(r.ship_date, r.shop_code, r.delivery_id,
+        nameMap.get(r.delivery_id) || '(未設定)', r.slips, r.cancelled_slips, updatedAt);
       slips += r.slips;
     }
     return { rows: rows.length, slips };
