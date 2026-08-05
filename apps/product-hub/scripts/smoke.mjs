@@ -960,7 +960,7 @@ check('payload: 画像は CABINET location + 共通バナー3枚が末尾 (配�
   JSON.stringify(pl.images));
 check('payload: variants は ne_code キー + 属性 + 型番なし例外',
   pl.variants['rk-smoke-1'].standardPrice === 1980
-  && pl.variants['rk-smoke-1'].articleNumber.exemptionReason === 1
+  && pl.variants['rk-smoke-1'].articleNumber.exemptionReason === 5
   && pl.variants['rk-smoke-1'].attributes[0].name === 'ブランド名',
   JSON.stringify(pl.variants));
 
