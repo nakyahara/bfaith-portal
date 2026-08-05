@@ -623,8 +623,391 @@ export async function initDb() {
     )
   `);
 
+  // --- 22. fba_inbound_shipments: FBA納品実績 (SP-API Fulfillment Inbound v0 から取得) ---
+  //   「いつ・何SKU・何個 のプランを作ったか」を日別に集計するための実績台帳。
+  //   ⚠️ 5.shipment_plans は社内で作る補充ドラフト。こちらは Amazon 側に実在するシップメント。別物。
+  //   created_at は ShipmentName "FBA STA (YYYY/MM/DD HH:mm)-FC" から抽出 (v0 に作成日フィールドが無いため)。
+  //   Seller Central 表示の文字列をそのまま採るので、タイムゾーン変換はしない。
+  db.run(`
+    CREATE TABLE IF NOT EXISTS fba_inbound_shipments (
+      shipment_id TEXT PRIMARY KEY,
+      shipment_name TEXT,
+      created_at TEXT,              -- 'YYYY-MM-DD HH:MM' (名前から抽出、取れなければ NULL)
+      created_date TEXT,            -- 'YYYY-MM-DD' 集計キー
+      destination_fc TEXT,
+      shipment_status TEXT,
+      label_prep_type TEXT,
+      total_skus INTEGER DEFAULT 0,
+      total_shipped INTEGER DEFAULT 0,
+      total_received INTEGER DEFAULT 0,
+      items_synced_at TEXT,         -- 明細を最後に取得した時刻 (NULL = 未取得)
+      first_seen_at TEXT DEFAULT (datetime('now','+9 hours')),
+      updated_at TEXT DEFAULT (datetime('now','+9 hours'))
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_created_date ON fba_inbound_shipments(created_date)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_status ON fba_inbound_shipments(shipment_status)`);
+
+  // 明細。qty_shipped は送った数、qty_received は Amazon が受領した数。差が未受領。
+  db.run(`
+    CREATE TABLE IF NOT EXISTS fba_inbound_shipment_items (
+      shipment_id TEXT NOT NULL,
+      seller_sku TEXT NOT NULL,
+      fnsku TEXT,
+      qty_shipped INTEGER DEFAULT 0,
+      qty_received INTEGER DEFAULT 0,
+      qty_in_case INTEGER DEFAULT 0,
+      updated_at TEXT DEFAULT (datetime('now','+9 hours')),
+      PRIMARY KEY (shipment_id, seller_sku)
+    )
+  `);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_fba_inbound_items_sku ON fba_inbound_shipment_items(seller_sku)`);
+
   saveToFile();
   console.log('[FBA-DB] 初期化完了');
+}
+
+// ======================================================
+// FBA納品実績 (fba_inbound_shipments / _items)
+// ======================================================
+
+/**
+ * ShipmentName から作成日時を抽出。
+ * Send to Amazon の自動命名 "FBA STA (2026/06/16 05:49)-TPY1" が対象 (実測で 1318/1319 件が該当)。
+ * 手動で改名されたシップメントは抽出できないので null を返す (created_date は NULL のまま)。
+ * @returns {{createdAt: string|null, createdDate: string|null}}
+ */
+export function parseShipmentCreatedAt(shipmentName) {
+  const m = /\((\d{4})\/(\d{2})\/(\d{2})[ T](\d{2}):(\d{2})\)/.exec(shipmentName || '');
+  if (!m) return { createdAt: null, createdDate: null };
+  const date = `${m[1]}-${m[2]}-${m[3]}`;
+  return { createdAt: `${date} ${m[4]}:${m[5]}`, createdDate: date };
+}
+
+/**
+ * シップメント本体を upsert。明細の合計値と items_synced_at は触らない (別関数の担当)。
+ * @param {Array} shipments - v0 getShipments の ShipmentData
+ * @returns {{inserted: number, updated: number}}
+ */
+export function upsertInboundShipments(shipments) {
+  let inserted = 0;
+  let updated = 0;
+  for (const s of shipments) {
+    if (!s.ShipmentId) continue;
+    const { createdAt, createdDate } = parseShipmentCreatedAt(s.ShipmentName);
+    const exists = queryOne(`SELECT shipment_id FROM fba_inbound_shipments WHERE shipment_id = ?`, [s.ShipmentId]);
+    if (exists) {
+      db.run(
+        `UPDATE fba_inbound_shipments
+            SET shipment_name = ?, created_at = ?, created_date = ?, destination_fc = ?,
+                shipment_status = ?, label_prep_type = ?, updated_at = datetime('now','+9 hours')
+          WHERE shipment_id = ?`,
+        [s.ShipmentName || '', createdAt, createdDate, s.DestinationFulfillmentCenterId || '',
+         s.ShipmentStatus || '', s.LabelPrepType || '', s.ShipmentId]
+      );
+      updated += 1;
+    } else {
+      db.run(
+        `INSERT INTO fba_inbound_shipments
+           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status, label_prep_type)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [s.ShipmentId, s.ShipmentName || '', createdAt, createdDate,
+         s.DestinationFulfillmentCenterId || '', s.ShipmentStatus || '', s.LabelPrepType || '']
+      );
+      inserted += 1;
+    }
+  }
+  return { inserted, updated };
+}
+
+/**
+ * 1シップメント分の明細を置き換え、親の合計値を再計算する。
+ * 明細は「消えたSKU」も反映したいので DELETE→INSERT (件数が数十行なので安全)。
+ */
+export function replaceInboundItems(shipmentId, items) {
+  db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [shipmentId]);
+  let shipped = 0;
+  let received = 0;
+  const seen = new Set();
+  for (const it of items) {
+    const sku = it.SellerSKU || '';
+    if (!sku || seen.has(sku)) continue; // 同一SKUが複数行で来るケースの保険 (PK衝突回避)
+    seen.add(sku);
+    const qs = Number(it.QuantityShipped) || 0;
+    const qr = Number(it.QuantityReceived) || 0;
+    shipped += qs;
+    received += qr;
+    db.run(
+      `INSERT INTO fba_inbound_shipment_items
+         (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [shipmentId, sku, it.FulfillmentNetworkSKU || '', qs, qr, Number(it.QuantityInCase) || 0]
+    );
+  }
+  db.run(
+    `UPDATE fba_inbound_shipments
+        SET total_skus = ?, total_shipped = ?, total_received = ?,
+            items_synced_at = datetime('now','+9 hours'), updated_at = datetime('now','+9 hours')
+      WHERE shipment_id = ?`,
+    [seen.size, shipped, received, shipmentId]
+  );
+  return { skus: seen.size, shipped, received };
+}
+
+/**
+ * 明細を取り直すべきシップメントを返す。
+ * 毎回全件取ると 1300 リクエスト (約11分) かかるので、動きうるものだけに絞る。
+ *   - 明細が未取得         → 必ず取る
+ *   - 受領完了していない   → 受領数が増える可能性がある
+ *   - CLOSED でも未受領あり → 事後に受領されることがあるので graceDays 日間は追う
+ * @param {{graceDays?: number, all?: boolean}} opts
+ */
+export function getShipmentsNeedingItemSync(opts = {}) {
+  const graceDays = opts.graceDays ?? 60;
+  if (opts.all) {
+    return queryAll(`SELECT shipment_id, shipment_status FROM fba_inbound_shipments ORDER BY created_date DESC`);
+  }
+  return queryAll(
+    `SELECT shipment_id, shipment_status
+       FROM fba_inbound_shipments
+      WHERE items_synced_at IS NULL
+         OR shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED')
+         OR (total_shipped > total_received
+             AND (created_date IS NULL OR created_date >= date('now','+9 hours',?)))
+      ORDER BY created_date DESC`,
+    [`-${graceDays} days`]
+  );
+}
+
+/**
+ * 日別サマリ。「その日に作成したプラン」の SKU数と数量。
+ * total_skus は「シップメントをまたいだ重複を除いたSKU数」を出したいので明細から数え直す。
+ * @param {{from?: string, to?: string, includeCancelled?: boolean}} opts
+ */
+export function getInboundDailySummary(opts = {}) {
+  const where = [`s.created_date IS NOT NULL`];
+  const params = [];
+  if (opts.from) { where.push(`s.created_date >= ?`); params.push(opts.from); }
+  if (opts.to) { where.push(`s.created_date <= ?`); params.push(opts.to); }
+  if (!opts.includeCancelled) where.push(`s.shipment_status NOT IN ('CANCELLED', 'DELETED')`);
+
+  return queryAll(
+    `SELECT s.created_date,
+            COUNT(DISTINCT s.shipment_id)  AS shipment_count,
+            COUNT(DISTINCT i.seller_sku)   AS sku_count,
+            COALESCE(SUM(i.qty_shipped), 0)  AS qty_shipped,
+            COALESCE(SUM(i.qty_received), 0) AS qty_received,
+            COALESCE(SUM(CASE WHEN i.qty_shipped > i.qty_received
+                              THEN i.qty_shipped - i.qty_received ELSE 0 END), 0) AS qty_unreceived,
+            GROUP_CONCAT(DISTINCT s.destination_fc) AS fcs
+       FROM fba_inbound_shipments s
+       LEFT JOIN fba_inbound_shipment_items i ON i.shipment_id = s.shipment_id
+      WHERE ${where.join(' AND ')}
+      GROUP BY s.created_date
+      ORDER BY s.created_date DESC`,
+    params
+  );
+}
+
+/** 月別サマリ (日別と同じ定義を年月で丸めたもの)。 */
+export function getInboundMonthlySummary(opts = {}) {
+  const where = [`s.created_date IS NOT NULL`];
+  const params = [];
+  if (opts.from) { where.push(`s.created_date >= ?`); params.push(opts.from); }
+  if (opts.to) { where.push(`s.created_date <= ?`); params.push(opts.to); }
+  if (!opts.includeCancelled) where.push(`s.shipment_status NOT IN ('CANCELLED', 'DELETED')`);
+
+  return queryAll(
+    `SELECT substr(s.created_date, 1, 7) AS ym,
+            COUNT(DISTINCT s.shipment_id) AS shipment_count,
+            COUNT(DISTINCT i.seller_sku)  AS sku_count,
+            COALESCE(SUM(i.qty_shipped), 0)  AS qty_shipped,
+            COALESCE(SUM(i.qty_received), 0) AS qty_received,
+            COALESCE(SUM(CASE WHEN i.qty_shipped > i.qty_received
+                              THEN i.qty_shipped - i.qty_received ELSE 0 END), 0) AS qty_unreceived
+       FROM fba_inbound_shipments s
+       LEFT JOIN fba_inbound_shipment_items i ON i.shipment_id = s.shipment_id
+      WHERE ${where.join(' AND ')}
+      GROUP BY ym
+      ORDER BY ym DESC`,
+    params
+  );
+}
+
+/** 指定日に作成したシップメントの一覧 (日別サマリのドリルダウン)。 */
+export function getInboundShipmentsByDate(createdDate) {
+  return queryAll(
+    `SELECT * FROM fba_inbound_shipments
+      WHERE created_date = ?
+      ORDER BY created_at, shipment_id`,
+    [createdDate]
+  );
+}
+
+/** 1シップメントの明細。 */
+export function getInboundItems(shipmentId) {
+  return queryAll(
+    `SELECT * FROM fba_inbound_shipment_items WHERE shipment_id = ? ORDER BY seller_sku`,
+    [shipmentId]
+  );
+}
+
+/**
+ * 未受領一覧 (問い合わせ用)。送った数 > 受領数 の明細行を、経過日数付きで返す。
+ * CANCELLED/DELETED は送っていないので除外。
+ * @param {{minDays?: number, includeClosed?: boolean}} opts
+ */
+export function getInboundUnreceived(opts = {}) {
+  const minDays = opts.minDays ?? 0;
+  const where = [
+    `i.qty_shipped > i.qty_received`,
+    `s.shipment_status NOT IN ('CANCELLED', 'DELETED')`,
+  ];
+  const params = [];
+  if (minDays > 0) {
+    where.push(`(s.created_date IS NOT NULL AND julianday('now','+9 hours') - julianday(s.created_date) >= ?)`);
+    params.push(minDays);
+  }
+  return queryAll(
+    `SELECT s.shipment_id, s.shipment_name, s.created_date, s.destination_fc, s.shipment_status,
+            i.seller_sku, i.fnsku, i.qty_shipped, i.qty_received,
+            (i.qty_shipped - i.qty_received) AS qty_unreceived,
+            CAST(julianday('now','+9 hours') - julianday(s.created_date) AS INTEGER) AS days_elapsed
+       FROM fba_inbound_shipment_items i
+       JOIN fba_inbound_shipments s ON s.shipment_id = i.shipment_id
+      WHERE ${where.join(' AND ')}
+      ORDER BY days_elapsed DESC, qty_unreceived DESC`,
+    params
+  );
+}
+
+/** 取込状況 (画面ヘッダ表示・健全性確認用)。 */
+export function getInboundSyncStatus() {
+  const total = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments`)?.c || 0;
+  const noItems = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments WHERE items_synced_at IS NULL`)?.c || 0;
+  const noDate = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments WHERE created_date IS NULL`)?.c || 0;
+  const range = queryOne(`SELECT MIN(created_date) AS min_d, MAX(created_date) AS max_d FROM fba_inbound_shipments WHERE created_date IS NOT NULL`);
+  const lastSync = queryOne(`SELECT MAX(updated_at) AS t FROM fba_inbound_shipments`)?.t || null;
+  return {
+    total_shipments: total,
+    items_pending: noItems,
+    created_date_missing: noDate,
+    date_from: range?.min_d || null,
+    date_to: range?.max_d || null,
+    last_synced_at: lastSync,
+  };
+}
+
+/**
+ * ミニPC → Render の同期用エクスポート。
+ * SP-API を叩けるのはミニPCだけなので、取り込み済みの行をそのまま Render に渡す。
+ * @param {{since?: string, limit?: number}} opts - since は updated_at (JST文字列) 以降
+ */
+export function exportInboundRows(opts = {}) {
+  const limit = opts.limit ?? 5000;
+  const params = [];
+  let where = '';
+  if (opts.since) {
+    where = `WHERE updated_at > ?`;
+    params.push(opts.since);
+  }
+  const shipments = queryAll(
+    `SELECT shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
+            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at
+       FROM fba_inbound_shipments ${where}
+      ORDER BY updated_at, shipment_id
+      LIMIT ${limit}`,
+    params
+  );
+  if (shipments.length === 0) return { shipments: [], items: [], has_more: false };
+
+  const ids = shipments.map(s => s.shipment_id);
+  const placeholders = ids.map(() => '?').join(',');
+  const items = queryAll(
+    `SELECT shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case
+       FROM fba_inbound_shipment_items
+      WHERE shipment_id IN (${placeholders})`,
+    ids
+  );
+  return { shipments, items, has_more: shipments.length >= limit };
+}
+
+/**
+ * Render 側の取込。exportInboundRows の戻り値をそのまま受ける。
+ * items は「渡されたシップメントの分だけ」置き換える (部分同期でも整合が崩れない)。
+ */
+export function importInboundRows(payload) {
+  const shipments = payload?.shipments || [];
+  const items = payload?.items || [];
+  if (shipments.length === 0) return { shipments: 0, items: 0 };
+
+  const byShipment = new Map();
+  for (const it of items) {
+    if (!byShipment.has(it.shipment_id)) byShipment.set(it.shipment_id, []);
+    byShipment.get(it.shipment_id).push(it);
+  }
+
+  for (const s of shipments) {
+    db.run(
+      `INSERT INTO fba_inbound_shipments
+         (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
+          label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(shipment_id) DO UPDATE SET
+         shipment_name = excluded.shipment_name,
+         created_at = excluded.created_at,
+         created_date = excluded.created_date,
+         destination_fc = excluded.destination_fc,
+         shipment_status = excluded.shipment_status,
+         label_prep_type = excluded.label_prep_type,
+         total_skus = excluded.total_skus,
+         total_shipped = excluded.total_shipped,
+         total_received = excluded.total_received,
+         items_synced_at = excluded.items_synced_at,
+         updated_at = excluded.updated_at`,
+      [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
+       s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
+       s.total_received ?? 0, s.items_synced_at, s.updated_at]
+    );
+
+    // 明細が付いてきたシップメントだけ入れ替える。
+    // (items_synced_at はあるのに明細0行 = 本当に空のシップメント、というケースも通す)
+    if (s.items_synced_at) {
+      db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [s.shipment_id]);
+      for (const it of byShipment.get(s.shipment_id) || []) {
+        db.run(
+          `INSERT OR REPLACE INTO fba_inbound_shipment_items
+             (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [it.shipment_id, it.seller_sku, it.fnsku || '', it.qty_shipped ?? 0, it.qty_received ?? 0, it.qty_in_case ?? 0]
+        );
+      }
+    }
+  }
+  saveToFile();
+  return { shipments: shipments.length, items: items.length };
+}
+
+/** Render 側が「どこまで同期済みか」を知るための位置。 */
+export function getInboundSyncCursor() {
+  return queryOne(`SELECT MAX(updated_at) AS t FROM fba_inbound_shipments`)?.t || null;
+}
+
+/**
+ * 取込のチェックポイント保存。
+ * sql.js はメモリ上の DB なので、明示的に呼ばないとファイルに落ちない。
+ * upsert のたびに保存すると 1300 件で遅すぎるため、呼び出し側がまとめて呼ぶ。
+ */
+export function flushInboundDb() {
+  saveToFile();
+}
+
+/** 作成日が取れなかったシップメント (手動改名など)。画面で個別に確認できるように。 */
+export function getInboundShipmentsWithoutDate() {
+  return queryAll(
+    `SELECT shipment_id, shipment_name, shipment_status, destination_fc, total_skus, total_shipped, total_received
+       FROM fba_inbound_shipments WHERE created_date IS NULL ORDER BY shipment_id`
+  );
 }
 
 // ===== 発注推奨 健全性ログ (③ 観測性 / ④ 一律検知) =====

@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FBA納品実績 - B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png"><link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <style>
+    .ih-container { max-width: 1400px; margin: 0 auto; padding: 12px 20px; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: #fff; padding: 12px 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+    .toolbar label { font-size: 13px; color: #374151; }
+    .toolbar input[type="date"], .toolbar select, .toolbar input[type="number"] { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+    .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 500; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { background: #93c5fd; cursor: not-allowed; }
+    .btn-sec { background: #e5e7eb; color: #374151; text-decoration: none; display: inline-block; }
+    .btn-sec:hover { background: #d1d5db; }
+    .preset { padding: 5px 10px; font-size: 12px; border: 1px solid #d1d5db; background: #f9fafb; border-radius: 999px; cursor: pointer; }
+    .preset:hover { background: #eef2ff; border-color: #6366f1; }
+    .status-bar { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; margin-top: 12px; padding: 10px 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 12px; color: #475569; }
+    .status-bar b { color: #0f172a; }
+    .stats { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+    .stat { background: #fff; border-radius: 8px; padding: 12px 18px; min-width: 150px; box-shadow: 0 1px 3px rgba(0,0,0,.1); }
+    .stat .label { font-size: 12px; color: #6b7280; }
+    .stat .value { font-size: 22px; font-weight: bold; color: #111827; margin-top: 2px; }
+    .stat.warn .value { color: #b91c1c; }
+    .tabs { display: flex; gap: 4px; margin-top: 20px; }
+    .tab-btn { padding: 9px 22px; border: 1px solid #d1d5db; border-bottom: none; border-radius: 8px 8px 0 0; background: #f3f4f6; color: #666; font-size: 14px; font-weight: 500; cursor: pointer; }
+    .tab-btn.active { background: #fff; color: #1e40af; border-color: #2563eb; font-weight: bold; }
+    .tab-count { margin-left: 6px; background: #dc2626; color: #fff; font-size: 11px; padding: 1px 7px; border-radius: 10px; }
+    .panel { background: #fff; border: 1px solid #e5e7eb; border-radius: 0 8px 8px 8px; padding: 16px; }
+    table.dt { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.dt th, table.dt td { border: 1px solid #e5e7eb; padding: 5px 8px; text-align: left; white-space: nowrap; }
+    table.dt th { background: #f3f4f6; position: sticky; top: 0; z-index: 5; cursor: pointer; user-select: none; }
+    table.dt td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.dt tr:hover { background: #f9fafb; }
+    table.dt tfoot td { background: #eef2ff; font-weight: bold; border-top: 2px solid #6366f1; }
+    .table-wrap { max-height: calc(100vh - 420px); overflow: auto; }
+    .bar-cell { position: relative; min-width: 120px; }
+    .bar { position: absolute; left: 0; top: 3px; bottom: 3px; background: #bfdbfe; border-radius: 3px; z-index: 0; }
+    .bar-label { position: relative; z-index: 1; padding-left: 4px; }
+    .drill { color: #2563eb; cursor: pointer; text-decoration: underline; }
+    .unrecv { color: #b91c1c; font-weight: bold; }
+    .muted { color: #9ca3af; }
+    .msg { margin-top: 10px; padding: 10px 14px; border-radius: 6px; font-size: 13px; display: none; }
+    .msg.info { background: #eff6ff; color: #1e40af; border: 1px solid #bfdbfe; display: block; }
+    .msg.err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; display: block; }
+    .msg.ok { background: #f0fdf4; color: #166534; border: 1px solid #bbf7d0; display: block; }
+    dialog { border: none; border-radius: 10px; padding: 0; max-width: 900px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
+    dialog::backdrop { background: rgba(0,0,0,.4); }
+    .dlg-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid #e5e7eb; }
+    .dlg-head h3 { margin: 0; font-size: 15px; }
+    .dlg-body { padding: 14px 18px; max-height: 65vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <a href="/apps/fba-replenishment" class="back-link">&larr; FBA在庫補充</a>
+      <h1>FBA納品実績</h1>
+    </div>
+    <div class="header-right" style="display:flex;align-items:center;gap:12px;">
+      <span><%= displayName || username %></span>
+    </div>
+  </header>
+
+  <div class="ih-container">
+    <div class="toolbar">
+      <span style="font-size:12px;color:#6b7280;">期間</span>
+      <button class="preset" onclick="setPreset('thisMonth')">今月</button>
+      <button class="preset" onclick="setPreset('lastMonth')">先月</button>
+      <button class="preset" onclick="setPreset('d30')">直近30日</button>
+      <button class="preset" onclick="setPreset('d90')">直近90日</button>
+      <button class="preset" onclick="setPreset('thisYear')">今年</button>
+      <button class="preset" onclick="setPreset('all')">全期間</button>
+      <input type="date" id="from"> 〜 <input type="date" id="to">
+      <label><input type="radio" name="unit" value="day" checked onchange="load()"> 日別</label>
+      <label><input type="radio" name="unit" value="month" onchange="load()"> 月別</label>
+      <label title="キャンセル/削除したシップメントも数に含めます"><input type="checkbox" id="incCancelled" onchange="load()"> キャンセル含む</label>
+      <button class="btn btn-primary" onclick="load()">表示</button>
+      <a class="btn btn-sec" id="printLink" href="#" target="_blank">🖨 印刷</a>
+      <button class="btn btn-sec" onclick="downloadCsv()">CSV</button>
+    </div>
+
+    <div class="status-bar">
+      <span id="syncInfo">取込状況を確認中…</span>
+      <span style="flex:1"></span>
+      <button class="btn btn-primary" id="syncBtn" onclick="runSync(false)">Amazonから取込 (差分)</button>
+      <button class="btn btn-sec" id="fullSyncBtn" onclick="runSync(true)" title="2年分を取り直します。10分以上かかります">全期間を取り直す</button>
+    </div>
+    <div class="msg" id="msg"></div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="tabs">
+      <button class="tab-btn active" id="tabSummaryBtn" onclick="switchTab('summary')">納品サマリ</button>
+      <button class="tab-btn" id="tabUnrecvBtn" onclick="switchTab('unrecv')">未受領<span class="tab-count" id="unrecvCount" style="display:none;"></span></button>
+    </div>
+
+    <div class="panel" id="tabSummary">
+      <div class="table-wrap">
+        <table class="dt" id="summaryTable">
+          <thead>
+            <tr>
+              <th onclick="sortSummary('key')">日付</th>
+              <th onclick="sortSummary('shipment_count')">プラン数</th>
+              <th onclick="sortSummary('sku_count')">SKU数</th>
+              <th onclick="sortSummary('qty_shipped')">送付数</th>
+              <th>送付数の推移</th>
+              <th onclick="sortSummary('qty_received')">受領数</th>
+              <th onclick="sortSummary('qty_unreceived')">未受領</th>
+              <th>納品先FC</th>
+            </tr>
+          </thead>
+          <tbody id="summaryBody"></tbody>
+          <tfoot id="summaryFoot"></tfoot>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" id="tabUnrecv" style="display:none;">
+      <div style="margin-bottom:12px;font-size:13px;color:#475569;">
+        送った数より受領された数が少ない明細です。Amazonの受領には数日〜2週間かかるため、
+        <b>経過日数が長いもの</b>から問い合わせを検討してください。
+        <label style="margin-left:16px;">経過 <input type="number" id="minDays" value="14" min="0" style="width:60px;"> 日以上</label>
+        <button class="btn btn-sec" onclick="loadUnreceived()">絞り込み</button>
+      </div>
+      <div class="table-wrap">
+        <table class="dt" id="unrecvTable">
+          <thead>
+            <tr>
+              <th>作成日</th><th>経過</th><th>シップメントID</th><th>FC</th><th>状態</th>
+              <th>SKU</th><th>送付</th><th>受領</th><th>未受領</th>
+            </tr>
+          </thead>
+          <tbody id="unrecvBody"></tbody>
+          <tfoot id="unrecvFoot"></tfoot>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <dialog id="drillDlg">
+    <div class="dlg-head">
+      <h3 id="drillTitle">シップメント一覧</h3>
+      <button class="btn btn-sec" onclick="document.getElementById('drillDlg').close()">閉じる</button>
+    </div>
+    <div class="dlg-body" id="drillBody"></div>
+  </dialog>
+
+<script>
+const API = '/apps/fba-replenishment/api/inbound-history';
+let summaryRows = [];
+let unrecvRows = [];
+let sortKey = 'key';
+let sortDir = 'desc';
+
+function fmt(n) { return (n || 0).toLocaleString('ja-JP'); }
+function jstToday() { return new Date(Date.now() + 9*3600*1000).toISOString().slice(0,10); }
+function jstAgo(d) { return new Date(Date.now() + 9*3600*1000 - d*86400000).toISOString().slice(0,10); }
+function showMsg(text, kind) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.className = 'msg ' + (kind || 'info');
+}
+function clearMsg() { document.getElementById('msg').className = 'msg'; }
+
+function setPreset(p) {
+  const today = jstToday();
+  const d = new Date(today + 'T00:00:00');
+  let from, to = today;
+  if (p === 'thisMonth') from = today.slice(0,8) + '01';
+  else if (p === 'lastMonth') {
+    const y = d.getFullYear(), m = d.getMonth(); // 0-based
+    const prev = new Date(Date.UTC(y, m - 1, 1));
+    from = prev.toISOString().slice(0,10);
+    to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0,10);
+  }
+  else if (p === 'd30') from = jstAgo(30);
+  else if (p === 'd90') from = jstAgo(90);
+  else if (p === 'thisYear') from = today.slice(0,4) + '-01-01';
+  else if (p === 'all') { from = '2024-01-01'; }
+  document.getElementById('from').value = from;
+  document.getElementById('to').value = to;
+  load();
+}
+
+function currentParams() {
+  const q = new URLSearchParams();
+  const from = document.getElementById('from').value;
+  const to = document.getElementById('to').value;
+  if (from) q.set('from', from);
+  if (to) q.set('to', to);
+  q.set('unit', document.querySelector('input[name=unit]:checked').value);
+  if (document.getElementById('incCancelled').checked) q.set('includeCancelled', '1');
+  return q;
+}
+
+function updatePrintLink() {
+  const q = currentParams();
+  q.set('minDays', document.getElementById('minDays').value || '0');
+  document.getElementById('printLink').href = '/apps/fba-replenishment/inbound-history/print?' + q.toString();
+}
+
+async function load() {
+  updatePrintLink();
+  const q = currentParams();
+  try {
+    const r = await fetch(API + '/summary?' + q.toString());
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '取得に失敗');
+    summaryRows = (d.data || []).map(row => ({ ...row, key: row.created_date || row.ym }));
+    renderStatus(d.status);
+    renderSummary();
+  } catch (e) {
+    showMsg('サマリの取得に失敗: ' + e.message, 'err');
+  }
+  loadUnreceived();
+}
+
+function renderStatus(s) {
+  if (!s) return;
+  const parts = [];
+  parts.push(`シップメント <b>${fmt(s.total_shipments)}</b>件`);
+  if (s.date_from) parts.push(`期間 <b>${s.date_from}</b> 〜 <b>${s.date_to}</b>`);
+  if (s.items_pending > 0) parts.push(`<span style="color:#b45309">明細未取得 ${fmt(s.items_pending)}件</span>`);
+  if (s.created_date_missing > 0) parts.push(`<span style="color:#b45309">作成日不明 ${fmt(s.created_date_missing)}件</span>`);
+  if (s.last_synced_at) parts.push(`最終同期 <b>${s.last_synced_at}</b>`);
+  document.getElementById('syncInfo').innerHTML = parts.join(' ／ ');
+}
+
+function sortSummary(key) {
+  if (sortKey === key) sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+  else { sortKey = key; sortDir = 'desc'; }
+  renderSummary();
+}
+
+function renderSummary() {
+  const rows = [...summaryRows].sort((a, b) => {
+    const va = a[sortKey], vb = b[sortKey];
+    const c = (typeof va === 'string') ? String(va).localeCompare(String(vb)) : (va - vb);
+    return sortDir === 'desc' ? -c : c;
+  });
+  const maxQty = Math.max(1, ...rows.map(r => r.qty_shipped || 0));
+  const tot = rows.reduce((a, r) => ({
+    shipment_count: a.shipment_count + (r.shipment_count || 0),
+    qty_shipped: a.qty_shipped + (r.qty_shipped || 0),
+    qty_received: a.qty_received + (r.qty_received || 0),
+    qty_unreceived: a.qty_unreceived + (r.qty_unreceived || 0),
+  }), { shipment_count: 0, qty_shipped: 0, qty_received: 0, qty_unreceived: 0 });
+
+  const isDay = document.querySelector('input[name=unit]:checked').value === 'day';
+  document.getElementById('summaryBody').innerHTML = rows.map(r => {
+    const pct = Math.round((r.qty_shipped || 0) / maxQty * 100);
+    const dateCell = isDay
+      ? `<span class="drill" onclick="drill('${r.key}')">${r.key}</span>`
+      : r.key;
+    return `<tr>
+      <td>${dateCell}</td>
+      <td class="num">${fmt(r.shipment_count)}</td>
+      <td class="num">${fmt(r.sku_count)}</td>
+      <td class="num">${fmt(r.qty_shipped)}</td>
+      <td class="bar-cell"><div class="bar" style="width:${pct}%"></div><span class="bar-label">&nbsp;</span></td>
+      <td class="num">${fmt(r.qty_received)}</td>
+      <td class="num ${r.qty_unreceived > 0 ? 'unrecv' : 'muted'}">${fmt(r.qty_unreceived)}</td>
+      <td class="muted" style="font-size:11px;">${r.fcs || ''}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">データがありません</td></tr>';
+
+  // SKU数の合計は日をまたぐと重複するので、合計行では出さない (誤読を避ける)
+  document.getElementById('summaryFoot').innerHTML = rows.length ? `<tr>
+    <td>合計 (${rows.length}${isDay ? '日' : 'ヶ月'})</td>
+    <td class="num">${fmt(tot.shipment_count)}</td>
+    <td class="num muted" title="日をまたぐと同じSKUが重複するため合計しません">—</td>
+    <td class="num">${fmt(tot.qty_shipped)}</td>
+    <td></td>
+    <td class="num">${fmt(tot.qty_received)}</td>
+    <td class="num ${tot.qty_unreceived > 0 ? 'unrecv' : ''}">${fmt(tot.qty_unreceived)}</td>
+    <td></td>
+  </tr>` : '';
+
+  document.getElementById('stats').innerHTML = `
+    <div class="stat"><div class="label">プラン作成数</div><div class="value">${fmt(tot.shipment_count)}</div></div>
+    <div class="stat"><div class="label">送付数量</div><div class="value">${fmt(tot.qty_shipped)}</div></div>
+    <div class="stat"><div class="label">受領数量</div><div class="value">${fmt(tot.qty_received)}</div></div>
+    <div class="stat ${tot.qty_unreceived > 0 ? 'warn' : ''}"><div class="label">未受領</div><div class="value">${fmt(tot.qty_unreceived)}</div></div>
+  `;
+}
+
+async function loadUnreceived() {
+  updatePrintLink();
+  const minDays = document.getElementById('minDays').value || 0;
+  try {
+    const r = await fetch(API + '/unreceived?minDays=' + encodeURIComponent(minDays));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || '取得に失敗');
+    unrecvRows = d.data || [];
+    renderUnreceived();
+  } catch (e) {
+    showMsg('未受領一覧の取得に失敗: ' + e.message, 'err');
+  }
+}
+
+function renderUnreceived() {
+  const badge = document.getElementById('unrecvCount');
+  if (unrecvRows.length > 0) { badge.textContent = unrecvRows.length; badge.style.display = ''; }
+  else badge.style.display = 'none';
+
+  document.getElementById('unrecvBody').innerHTML = unrecvRows.map(r => `<tr>
+    <td>${r.created_date || '<span class="muted">不明</span>'}</td>
+    <td class="num">${r.days_elapsed != null ? r.days_elapsed + '日' : ''}</td>
+    <td style="font-size:11px;">${r.shipment_id}</td>
+    <td>${r.destination_fc || ''}</td>
+    <td style="font-size:11px;">${r.shipment_status || ''}</td>
+    <td>${r.seller_sku}</td>
+    <td class="num">${fmt(r.qty_shipped)}</td>
+    <td class="num">${fmt(r.qty_received)}</td>
+    <td class="num unrecv">${fmt(r.qty_unreceived)}</td>
+  </tr>`).join('') || '<tr><td colspan="9" class="muted" style="text-align:center;padding:20px;">未受領はありません</td></tr>';
+
+  const total = unrecvRows.reduce((a, r) => a + (r.qty_unreceived || 0), 0);
+  document.getElementById('unrecvFoot').innerHTML = unrecvRows.length
+    ? `<tr><td colspan="8">合計 ${unrecvRows.length}件</td><td class="num unrecv">${fmt(total)}</td></tr>` : '';
+}
+
+function switchTab(t) {
+  document.getElementById('tabSummaryBtn').classList.toggle('active', t === 'summary');
+  document.getElementById('tabUnrecvBtn').classList.toggle('active', t === 'unrecv');
+  document.getElementById('tabSummary').style.display = t === 'summary' ? '' : 'none';
+  document.getElementById('tabUnrecv').style.display = t === 'unrecv' ? '' : 'none';
+}
+
+async function drill(date) {
+  const dlg = document.getElementById('drillDlg');
+  document.getElementById('drillTitle').textContent = date + ' に作成したシップメント';
+  document.getElementById('drillBody').innerHTML = '<p class="muted">読み込み中…</p>';
+  dlg.showModal();
+  try {
+    const r = await fetch(API + '/shipments?date=' + encodeURIComponent(date));
+    const d = await r.json();
+    const rows = d.data || [];
+    document.getElementById('drillBody').innerHTML = `<table class="dt">
+      <thead><tr><th>作成時刻</th><th>シップメント</th><th>FC</th><th>状態</th><th>SKU数</th><th>送付</th><th>受領</th><th>未受領</th></tr></thead>
+      <tbody>${rows.map(s => {
+        const un = (s.total_shipped || 0) - (s.total_received || 0);
+        return `<tr>
+          <td>${(s.created_at || '').slice(11) || ''}</td>
+          <td style="font-size:11px;">${s.shipment_id}<br><span class="muted">${s.shipment_name || ''}</span></td>
+          <td>${s.destination_fc || ''}</td>
+          <td style="font-size:11px;">${s.shipment_status || ''}</td>
+          <td class="num">${fmt(s.total_skus)}</td>
+          <td class="num">${fmt(s.total_shipped)}</td>
+          <td class="num">${fmt(s.total_received)}</td>
+          <td class="num ${un > 0 ? 'unrecv' : 'muted'}">${fmt(un)}</td>
+        </tr>`;
+      }).join('')}</tbody></table>`;
+  } catch (e) {
+    document.getElementById('drillBody').innerHTML = '<p style="color:#b91c1c">取得に失敗: ' + e.message + '</p>';
+  }
+}
+
+function downloadCsv() {
+  const isDay = document.querySelector('input[name=unit]:checked').value === 'day';
+  const head = [isDay ? '日付' : '年月', 'プラン数', 'SKU数', '送付数', '受領数', '未受領', '納品先FC'];
+  const lines = [head.join(',')];
+  for (const r of summaryRows) {
+    lines.push([r.key, r.shipment_count, r.sku_count, r.qty_shipped, r.qty_received, r.qty_unreceived,
+                '"' + String(r.fcs || '').replace(/"/g, '""') + '"'].join(','));
+  }
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `fba_nouhin_${isDay ? 'daily' : 'monthly'}_${jstToday()}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ===== 取込 (ミニPC経由) =====
+async function runSync(full) {
+  const btn = document.getElementById('syncBtn');
+  const fullBtn = document.getElementById('fullSyncBtn');
+  if (full && !confirm('2年分を取り直します。10分以上かかりますが実行しますか？')) return;
+  btn.disabled = true; fullBtn.disabled = true;
+  showMsg('Amazonへの取込を開始しています…', 'info');
+  try {
+    const r = await fetch(API + '/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(full ? { full: true, allItems: true } : { sinceDays: 14, itemLimit: 400 }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || d.message || '起動に失敗');
+    if (d.status === 'already_running') {
+      showMsg('すでに取込が実行中です。完了までお待ちください。', 'info');
+    }
+    if (!d.jobId) throw new Error('ジョブIDが返りませんでした');
+    await pollJob(d.jobId);
+  } catch (e) {
+    showMsg('取込に失敗: ' + e.message, 'err');
+  } finally {
+    btn.disabled = false; fullBtn.disabled = false;
+  }
+}
+
+async function pollJob(jobId) {
+  const started = Date.now();
+  const LIMIT_MS = 45 * 60 * 1000;
+  while (Date.now() - started < LIMIT_MS) {
+    await new Promise(r => setTimeout(r, 5000));
+    let d;
+    try {
+      const r = await fetch('/apps/fba-replenishment/api/jobs/' + jobId);
+      d = await r.json();
+    } catch { continue; } // 一時的な通信断は無視して次の周期で再確認
+    const p = d.progress || {};
+    if (d.status === 'running') {
+      showMsg('取込中… ' + (p.message || ''), 'info');
+    } else if (d.status === 'completed') {
+      const res = d.result || {};
+      showMsg(`Amazon側の取込完了 (${res.elapsed_sec || '?'}秒, 明細${res.items_synced || 0}件)。ポータルへ反映しています…`, 'info');
+      await pullToPortal(res.items_synced > 500);
+      return;
+    } else if (d.status === 'failed') {
+      throw new Error(d.error || 'ジョブが失敗しました');
+    }
+  }
+  throw new Error('タイムアウト (45分)。ミニPC側のログを確認してください');
+}
+
+async function pullToPortal(full) {
+  const r = await fetch(API + '/pull', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ full: !!full }),
+  });
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || '反映に失敗');
+  showMsg(`完了: シップメント ${fmt(d.shipments)}件 / 明細 ${fmt(d.items)}件 を反映しました`, 'ok');
+  load();
+}
+
+// 初期表示
+setPreset('d30');
+</script>
+</body>
+</html>

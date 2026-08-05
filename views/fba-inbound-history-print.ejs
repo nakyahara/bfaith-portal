@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <style>
+    body { font-family: "Hiragino Sans", "Meiryo", sans-serif; margin: 12px; color: #111; }
+    h2 { font-size: 16px; margin: 4px 0 8px; }
+    h3 { font-size: 14px; margin: 18px 0 6px; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th, td { border: 1px solid #999; padding: 3px 5px; text-align: left; vertical-align: top; }
+    th { background: #e0e0e0; font-weight: bold; }
+    tbody tr:nth-child(even) { background: #f5f5f5; }
+    td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    tfoot td { background: #ddd; font-weight: bold; }
+    .meta { font-size: 11px; color: #555; margin-bottom: 10px; }
+    .toolbar { margin-bottom: 12px; }
+    .toolbar button, .toolbar a { padding: 8px 16px; font-size: 13px; border: 1px solid #ccc; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; text-decoration: none; }
+    .toolbar a.sec { background: #e5e7eb; color: #374151; }
+    .unrecv { color: #b91c1c; font-weight: bold; }
+    .muted { color: #777; }
+    .totals { display: flex; gap: 18px; font-size: 12px; margin: 8px 0 12px; }
+    .totals div { border: 1px solid #999; padding: 5px 12px; }
+    .totals b { font-size: 15px; }
+    .sec-unrecv { page-break-before: always; }
+    @media print {
+      .toolbar { display: none; }
+      body { margin: 0; }
+      thead { display: table-header-group; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button onclick="window.print()">🖨 印刷</button>
+    <a class="sec" href="/apps/fba-replenishment/inbound-history">← 画面に戻る</a>
+  </div>
+
+  <h2>FBA納品実績　<%= from %> 〜 <%= to %>（<%= unit === 'month' ? '月別' : '日別' %>）</h2>
+  <div class="meta">
+    出力日時: <%= printedAt %>
+    ／ 集計基準: 納品プランを<b>作成した日</b>
+    <% if (includeCancelled) { %>／ キャンセル・削除分を含む<% } else { %>／ キャンセル・削除分は除外<% } %>
+  </div>
+
+  <div class="totals">
+    <div>プラン作成数 <b><%= totals.shipment_count.toLocaleString('ja-JP') %></b></div>
+    <div>送付数量 <b><%= totals.qty_shipped.toLocaleString('ja-JP') %></b></div>
+    <div>受領数量 <b><%= totals.qty_received.toLocaleString('ja-JP') %></b></div>
+    <div>未受領 <b class="<%= totals.qty_unreceived > 0 ? 'unrecv' : '' %>"><%= totals.qty_unreceived.toLocaleString('ja-JP') %></b></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th><%= unit === 'month' ? '年月' : '日付' %></th>
+        <th>プラン数</th>
+        <th>SKU数</th>
+        <th>送付数</th>
+        <th>受領数</th>
+        <th>未受領</th>
+        <% if (unit !== 'month') { %><th>納品先FC</th><% } %>
+      </tr>
+    </thead>
+    <tbody>
+      <% if (summary.length === 0) { %>
+        <tr><td colspan="<%= unit === 'month' ? 6 : 7 %>" class="muted">該当データがありません</td></tr>
+      <% } %>
+      <% summary.forEach(function(r) { %>
+        <tr>
+          <td><%= r.created_date || r.ym %></td>
+          <td class="num"><%= (r.shipment_count || 0).toLocaleString('ja-JP') %></td>
+          <td class="num"><%= (r.sku_count || 0).toLocaleString('ja-JP') %></td>
+          <td class="num"><%= (r.qty_shipped || 0).toLocaleString('ja-JP') %></td>
+          <td class="num"><%= (r.qty_received || 0).toLocaleString('ja-JP') %></td>
+          <td class="num <%= (r.qty_unreceived || 0) > 0 ? 'unrecv' : '' %>"><%= (r.qty_unreceived || 0).toLocaleString('ja-JP') %></td>
+          <% if (unit !== 'month') { %><td class="muted"><%= r.fcs || '' %></td><% } %>
+        </tr>
+      <% }); %>
+    </tbody>
+    <% if (summary.length > 0) { %>
+    <tfoot>
+      <tr>
+        <td>合計 (<%= summary.length %><%= unit === 'month' ? 'ヶ月' : '日' %>)</td>
+        <td class="num"><%= totals.shipment_count.toLocaleString('ja-JP') %></td>
+        <td class="num muted">—</td>
+        <td class="num"><%= totals.qty_shipped.toLocaleString('ja-JP') %></td>
+        <td class="num"><%= totals.qty_received.toLocaleString('ja-JP') %></td>
+        <td class="num <%= totals.qty_unreceived > 0 ? 'unrecv' : '' %>"><%= totals.qty_unreceived.toLocaleString('ja-JP') %></td>
+        <% if (unit !== 'month') { %><td></td><% } %>
+      </tr>
+    </tfoot>
+    <% } %>
+  </table>
+  <div class="meta" style="margin-top:6px;">
+    ※ SKU数は同じ日の中で重複を除いた数です。日をまたぐと同じSKUが再登場するため、合計欄では出していません。
+  </div>
+
+  <% if (unreceived.length > 0) { %>
+  <div class="sec-unrecv">
+    <h3>未受領の明細（作成から <%= minDays %> 日以上経過 / 期間内のみ）　<%= unreceived.length %>件</h3>
+    <table>
+      <thead>
+        <tr><th>作成日</th><th>経過</th><th>シップメントID</th><th>FC</th><th>状態</th><th>SKU</th><th>送付</th><th>受領</th><th>未受領</th></tr>
+      </thead>
+      <tbody>
+        <% unreceived.forEach(function(r) { %>
+          <tr>
+            <td><%= r.created_date || '不明' %></td>
+            <td class="num"><%= r.days_elapsed != null ? r.days_elapsed + '日' : '' %></td>
+            <td><%= r.shipment_id %></td>
+            <td><%= r.destination_fc || '' %></td>
+            <td><%= r.shipment_status || '' %></td>
+            <td><%= r.seller_sku %></td>
+            <td class="num"><%= (r.qty_shipped || 0).toLocaleString('ja-JP') %></td>
+            <td class="num"><%= (r.qty_received || 0).toLocaleString('ja-JP') %></td>
+            <td class="num unrecv"><%= (r.qty_unreceived || 0).toLocaleString('ja-JP') %></td>
+          </tr>
+        <% }); %>
+      </tbody>
+      <tfoot>
+        <tr>
+          <td colspan="8">合計</td>
+          <td class="num unrecv"><%= unreceived.reduce(function(a, r) { return a + (r.qty_unreceived || 0); }, 0).toLocaleString('ja-JP') %></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+  <% } %>
+</body>
+</html>
