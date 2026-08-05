@@ -43,6 +43,23 @@
         <span class="muted" id="reg-result"></span>
       </div>
       <div id="reg-detail" style="margin-top:10px;"></div>
+      <% if (isAdmin) { %>
+      <div style="margin-top:12px; padding-top:10px; border-top:1px dashed #e2e8f0;">
+        <div class="muted" style="font-size:12px; margin-bottom:6px;">
+          自動取込 (毎日09:30):
+          <% if (intake.initialized) { %>
+            初回シード済み (<%= String(intake.seededAt).slice(0, 10) %>)。未取込の新商品 <%= intake.pending %> 件
+          <% } else { %>
+            <strong style="color:#b45309">初回シード未実施</strong> — 実行するとNEの現在の全商品 (<%= intake.mirrorSingles %>件) を「既存」として記録し、以後の新商品から自動でドラフト化します
+          <% } %>
+          ／ これまでの自動作成 <%= intake.autoCreated %> 件
+        </div>
+        <div style="display:flex; align-items:center; gap:10px;">
+          <button class="btn btn-sm" id="intake-run-btn">NE取込を今すぐ実行</button>
+          <span class="muted" id="intake-run-result" style="font-size:12px;"></span>
+        </div>
+      </div>
+      <% } %>
     </details>
   </div>
 
@@ -217,6 +234,35 @@
         document.getElementById('retry-all-result').textContent = '通信エラー: ' + e.message;
         retryAllBtn.disabled = false;
         retryAllBtn.textContent = 'まとめて再作成';
+      }
+    });
+  }
+
+  // ─── NE取込の手動実行 (admin。cron を待たずシード/取込を回す) ───
+  const intakeBtn = document.getElementById('intake-run-btn');
+  if (intakeBtn) {
+    intakeBtn.addEventListener('click', async () => {
+      const out = document.getElementById('intake-run-result');
+      if (!confirm('NE新商品の取込を今すぐ実行します。
+初回は「シード」(現在の全商品を既存として記録・ドラフトは作らない) になります。
+
+よろしいですか?')) return;
+      intakeBtn.disabled = true;
+      out.textContent = '実行中…';
+      try {
+        const res = await fetch('/apps/product-hub/api/intake/run', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        const j = await res.json();
+        if (!j.ok) { out.textContent = ''; alert(j.error || '実行に失敗しました'); return; }
+        out.textContent = j.mode === 'seed'
+          ? '✅ 初回シード完了 (' + j.seeded + '件を既存として記録)。明日以降の新商品から自動でドラフト化されます'
+          : '✅ 取込完了: 新規ドラフト ' + j.created + ' 件' + (j.merged ? ' / 既存グループへ集約 ' + j.merged + ' 件' : '');
+        setTimeout(() => location.reload(), 2500);
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        intakeBtn.disabled = false;
       }
     });
   }
