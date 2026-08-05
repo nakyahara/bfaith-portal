@@ -47,6 +47,16 @@ const VALID_HO = {
 ok(validateRegistry([{ ...VALID_HO, partial_max_days: 7 }]).some((e) => /partial_max_days/.test(e)), 'scheduled_job以外のpartial_max_daysを弾く');
 eq(validateRegistry([VALID_HO]), [], '正しいhuman_obligationは通る');
 ok(validateRegistry([{ ...VALID_HO, warn_days: -1 }]).some((e) => /warn_days/.test(e)), '負のwarn_daysを弾く');
+const VALID_HB = {
+  id: 'hb-1', type: 'heartbeat', importance: 'P1', owner: 'o', purpose: 'p', runbook: 'r',
+  where: 'w', schedule: '60秒ごと', max_age_hours: 3, lifecycle: 'permanent',
+};
+eq(validateRegistry([VALID_HB]), [], '正しいheartbeatは通る');
+ok(validateRegistry([{ ...VALID_HB, max_age_hours: undefined }]).some((e) => /max_age_hours/.test(e)), 'heartbeatのmax_age_hours必須');
+ok(validateRegistry([{ ...VALID_HB, max_age_hours: 0 }]).some((e) => /max_age_hours/.test(e)), 'max_age_hours=0を弾く');
+ok(validateRegistry([{ ...VALID_HB, anchor_hour_jst: 8 }]).some((e) => /anchor_hour_jst/.test(e)), 'heartbeatにアンカーを書いたら弾く (判定方式の取り違え防止)');
+ok(validateRegistry([{ ...VALID_HB, grace_hours: 4 }]).some((e) => /grace_hours/.test(e)), 'heartbeatにgrace_hoursを書いたら弾く');
+ok(validateRegistry([{ ...VALID_SJ, max_age_hours: 3 }]).some((e) => /max_age_hours/.test(e)), 'scheduled_jobにmax_age_hoursを書いたら弾く');
 const VALID_TA = {
   id: 'ta-1', type: 'temporary_asset', importance: 'TMP', owner: 'o', purpose: 'p', runbook: 'r',
   where: 'w', remove_by: '2026-09-01', lifecycle: 'temporary',
@@ -110,6 +120,26 @@ eq(evaluateEntry(SJP, { ...SEEN_OLD, lastOkAtMs: jst(2026, 8, 1, 9, 0) }, LATE_T
   '旧データ (alive列なし) は ok を生存の印として引き継ぐ');
 eq(evaluateEntry(SJP, { firstSeenAtMs: jst(2026, 8, 1, 5, 0) }, LATE_TODAY).status, 'late',
   'partial対応でもping未着なら初回締切でlate');
+
+// ── heartbeat (常駐ワーカーの生存監視) ──
+{
+  const HB_NOW = jst(2026, 8, 1, 12, 0);
+  const HB = { id: 'hb1', type: 'heartbeat', importance: 'P1', purpose: 'p', runbook: 'r', max_age_hours: 3 };
+  const seenOld = { firstSeenAtMs: HB_NOW - 30 * D };
+  eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 1 * H }, HB_NOW).status, 'ok', 'heartbeat: 1時間前の報告はok');
+  eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 3 * H }, HB_NOW).status, 'ok', 'heartbeat: ちょうど許容時間はok (境界)');
+  eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 3 * H - 1 }, HB_NOW).status, 'late', 'heartbeat: 許容を1ms超えたらlate');
+  // ⭐アンカー方式との違い: 報告直後に停止しても数時間で気づける (日次アンカーだと最大28時間見逃す)
+  eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 5 * H }, HB_NOW).status, 'late', 'heartbeat: 5時間途切れたらlate');
+  // 未初期化は firstSeen 起点で昇格 (配線忘れを無音にしない)
+  eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 1 * H }, HB_NOW).status, 'uninitialized', 'heartbeat: 導入直後はuninitialized');
+  eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 4 * H }, HB_NOW).status, 'late', 'heartbeat: ping未着のまま許容超過でlate');
+  // fail ping は last_ok_at を進めないので、失敗が続けば late になる
+  eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 4 * H, lastStatus: 'fail' }, HB_NOW).status, 'late',
+    'heartbeat: 失敗が続いて ok が途切れたらlate');
+  ok(needsImmediateAlert(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 5 * H }, HB_NOW)),
+    'heartbeat: P1のlateは即時通知の対象');
+}
 
 // ── human_obligation ──
 const NOW = jst(2026, 8, 1, 12, 0);

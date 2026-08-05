@@ -8,6 +8,7 @@
 import cron from 'node-cron';
 import { bootStart, bootEnd, bootNote } from '../observability/boot-log.js';
 import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 const HEALTH_PATH = '/service-api/health';
@@ -114,7 +115,7 @@ async function runCheck() {
 export function startWarehouseHealthcheck() {
   // ⚠ Render 限定。miniPC を外から監視するのが役目なので、miniPC 自身が走らせても意味がない
   //   (自分が落ちれば監視も一緒に落ちる)。実際 miniPC でも起動していた (2026-08-05 確認)。
-  if (!process.env.RENDER) {
+  if (!isRender()) {
     bootNote('healthcheck', 'RENDER未設定のため死活監視を起動しない (Render専用)');
     console.log('[Healthcheck] 非Render環境のため起動スキップ');
     return;

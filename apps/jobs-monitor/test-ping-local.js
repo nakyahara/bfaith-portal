@@ -61,7 +61,20 @@ eq(pingJobThrottled('warehouse-healthcheck', 'x', 60_000), false, '間引き: �
 eq(pingJobThrottled('po-email-dispatcher', 'x', 60_000), true, '間引き: id が違えば打つ');
 eq(pingJobThrottled('warehouse-healthcheck', 'x', 0), true, '間引き: 間隔0なら毎回打つ');
 
-// ── 5. 記録が失敗しても throw しない ──
+// ── 5. isRender の判定 ──
+{
+  const { isRender } = await import('../../lib/is-render.js');
+  ok(isRender({ RENDER: 'true' }), 'isRender: RENDER=true');
+  ok(isRender({ RENDER: '1' }), 'isRender: RENDER=1');
+  ok(!isRender({}), 'isRender: 未設定は false (miniPC)');
+  ok(!isRender({ RENDER: '' }), 'isRender: 空文字は false');
+  // truthy 判定だと "false"/"0" を Render 扱いしてしまう (Codexレビュー Medium)
+  ok(!isRender({ RENDER: 'false' }), 'isRender: "false" は false');
+  ok(!isRender({ RENDER: '0' }), 'isRender: "0" は false');
+  ok(!isRender({ RENDER: ' OFF ' }), 'isRender: 前後空白と大文字も拾う');
+}
+
+// ── 6. 記録が失敗しても throw しない / 間引きを進めない ──
 {
   const store = await import('./store.js');
   const db = store.getJobsDB();
@@ -70,9 +83,19 @@ eq(pingJobThrottled('warehouse-healthcheck', 'x', 0), true, '間引き: 間隔0�
   try { pingJob('fba-daily-sync', 'ok', 'after drop'); } catch { threw = true; }
   ok(!threw, '記録先が壊れていても pingJob は throw しない (ジョブ本体を巻き添えにしない)');
   eq(pingJob('fba-daily-sync', 'ok'), false, '記録に失敗したら false を返す');
+
+  // 失敗した周期で間引きの起点を進めてしまうと、生きているワーカーが締切超過に見える
+  _resetThrottleForTest();
+  eq(pingJobThrottled('mgmt-auto-sync', 'x', 60_000), false, '記録失敗時の throttled は false');
+  db.exec(`CREATE TABLE job_state (
+    job_id TEXT PRIMARY KEY, last_ok_at INTEGER, last_alive_at INTEGER,
+    last_ping_at INTEGER NOT NULL, last_status TEXT NOT NULL, last_note TEXT,
+    partial_streak INTEGER NOT NULL DEFAULT 0)`); // 記録先を復旧
+  eq(pingJobThrottled('mgmt-auto-sync', 'x', 60_000), true,
+    '記録が復旧したら間引き間隔を待たずに次の ping が通る (失敗周期で起点を進めない)');
 }
 
-// ── 6. コード内の ping 先 id が全部台帳にある ──
+// ── 7. コード内の ping 先 id が全部台帳にある ──
 const { JOBS_REGISTRY } = await import('../../config/jobs-registry.mjs');
 const registered = new Set(JOBS_REGISTRY.map((e) => e.id));
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');

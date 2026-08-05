@@ -114,6 +114,8 @@ export async function runDailyJob() {
   } catch (e) {
     console.error('[inbound-info] pdf export failed:', e.message);
     notes.push(`PDF失敗(${e.message})`);
+    // PDF は現場が印刷する成果物なので、ここで失敗した日は ok にしない
+    return { ok: false, note: notes.join(' ') };
   }
   return { ok: true, note: notes.join(' ') };
 }

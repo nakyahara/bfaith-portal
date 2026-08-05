@@ -126,6 +126,29 @@ export function evaluateEntry(def, state, nowMs) {
     return { ...base, status: 'ok', detail: `最終成功 ${fmtAge(nowMs - lastOk)} 前` };
   }
 
+  // heartbeat — 常駐ワーカー (数十秒〜数時間間隔) の生存監視。
+  //   scheduled_job のアンカー方式は「毎日決まった時刻に走るもの」用で、常駐ワーカーには合わない。
+  //   例: 1時間ごとに生存報告するワーカーを「毎朝08:00+猶予4h」で見ると、08:01 に報告した直後に
+  //   止まっても翌日12:00まで緑のまま = 最大28時間気づけない (Codexレビュー High)。
+  //   そこで「最後の生存報告からの経過時間」で直接判定する。
+  //   max_age_hours は ping 間隔より十分大きく取ること (間引き間隔の2倍以上が目安)。
+  if (def.type === 'heartbeat') {
+    const maxAgeMs = def.max_age_hours * HOUR_MS;
+    if (neverPinged) {
+      // 配線忘れ・DB消失を無音にしない。監視開始 (firstSeen) を起点に同じ物差しで late へ昇格
+      if (nowMs >= firstSeen + maxAgeMs) {
+        return { ...base, status: 'late', detail: `ping が一度も来ないまま ${def.max_age_hours}時間 経過。ping 配線かワーカー自体を確認` };
+      }
+      return { ...base, status: 'uninitialized', detail: 'ping がまだ来ていません (導入直後なら正常)' };
+    }
+    const age = nowMs - lastOk;
+    if (age > maxAgeMs) {
+      const note = state?.lastNote ? ` 直近の報告: ${state.lastNote}` : '';
+      return { ...base, status: 'late', detail: `最終生存報告から ${fmtAge(age)} (許容 ${def.max_age_hours}時間)。ワーカーが止まっている可能性${note}` };
+    }
+    return { ...base, status: 'ok', detail: `最終生存報告 ${fmtAge(age)} 前` };
+  }
+
   if (def.type === 'human_obligation') {
     // 未初期化でも firstSeen を起点に締切を数える (配線忘れ・記録忘れを無音にしない)
     const baseline = lastOk ?? firstSeen;

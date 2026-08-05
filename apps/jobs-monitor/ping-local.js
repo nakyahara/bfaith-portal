@@ -49,8 +49,11 @@ export function pingJobThrottled(id, note, minIntervalMs = 60 * 60 * 1000) {
   const now = Date.now();
   const prev = lastPingAtMs.get(id);
   if (prev !== undefined && now - prev < minIntervalMs) return false;
-  lastPingAtMs.set(id, now);
-  return pingJob(id, 'ok', note);
+  // 記録できた時だけ間引きの起点を進める。先に進めると、DB ロック等で1回失敗しただけで
+  // 次の1時間ぶん ping が止まり、生きているワーカーが締切超過に見える (Codexレビュー Medium)
+  const sent = pingJob(id, 'ok', note);
+  if (sent) lastPingAtMs.set(id, now);
+  return sent;
 }
 
 /** テスト用: 間引き状態を初期化する */

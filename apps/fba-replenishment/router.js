@@ -39,6 +39,7 @@ import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
 import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-log.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -125,7 +126,7 @@ initDb().then(() => {
   // ⚠ timezone を明示すること。以前は未指定で「コンテナが UTC だから結果的に 06:00 JST」
   //   という状態で、TZ env を入れた瞬間に9時間ずれる作りだった。
   //   実際 miniPC (ローカル TZ = JST) では 21:00 に走っていた。
-  if (!process.env.RENDER) {
+  if (!isRender()) {
     bootNote('fba-cron', 'RENDER未設定のため定期同期をスケジュールしない (Render専用)');
     console.log('[FBA] 非Render環境のため定期同期スケジュールをスキップ');
   } else {

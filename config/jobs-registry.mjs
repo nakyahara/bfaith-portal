@@ -15,6 +15,12 @@
  *                        「停滞 (stalled)」として要対応に出す (max = 許容する最大回数)。
  *                        これが無いと、実行時間の上限で毎回中断されるバッチは
  *                        「毎朝鳴りっぱなし」か「永遠に完走しなくても緑」の二択になる
+ *   heartbeat        — 常駐ワーカー (数十秒〜数時間間隔) の生存監視。max_age_hours を超えて
+ *                      生存 ping が途切れたら「止まっている」と判定する。
+ *                      ⭐毎日決まった時刻に走るものは scheduled_job を使うこと。
+ *                        常駐ワーカーをアンカー方式で見ると「報告直後に停止」を最大1日+猶予ぶん
+ *                        見逃す (2026-08-05 Codexレビュー High)。
+ *                      max_age_hours は ping 間引き間隔の2倍以上を目安に取る
  *   human_obligation — 人がやる期限つき作業 (OAuth再認可・APIキーローテ等)。完了時に ping。
  *                      次回期限 = 前回完了 + period_hours。warn_days 前から毎朝の要対応に出る
  *   temporary_asset  — 一時タスク・退避フォルダなど「いつか消すもの」。remove_by を過ぎたら要対応に出る
@@ -272,9 +278,12 @@ export const JOBS_REGISTRY = [
     schedule: '毎日 09:00 (画面「⚙️自動実行」で変更可 — 変えたらこの台帳も直す)',
     anchor_hour_jst: 9,
     anchor_minute_jst: 0,
-    grace_hours: 5,
+    // 画面設定で実行時刻を後ろへ動かせるので広めに取る (17:00 までの設定なら誤報しない)。
+    // それより遅い時刻にするなら anchor_hour_jst 側を直すこと
+    grace_hours: 8,
     lifecycle: 'permanent',
-    runbook: 'Render Logs で「inbound-info」を検索。ok の基準は nefuda.csv の取得成否 (CSVが取れない日はPDFを上書きしない設計)。'
+    runbook: 'Render Logs で「inbound-info」を検索。ok の基準は nefuda.csv 取得と PDF 保存の両方'
+      + ' (CSVが取れない日はPDFを上書きしない設計なので、CSV失敗はそのまま fail)。'
       + '手動実行 = 入庫情報管理画面の「最新の入荷予定を取得」「今すぐPDFを作成してDriveに保存」',
   },
   {
@@ -293,46 +302,44 @@ export const JOBS_REGISTRY = [
   },
   {
     id: 'mgmt-auto-sync',
-    type: 'scheduled_job',
+    type: 'heartbeat',
     importance: 'P3',
     owner: '中原さん',
     purpose: '売上分類別粗利の自動同期 (mirror の売上を管理会計テーブルへ取り込み + 未確定月の再計算)。'
       + '止まるとダッシュボードの数字だけが古くなる',
     where: 'Render bfaith-portal 内 setInterval (apps/mgmt-accounting/router.js、既定120分間隔)',
-    schedule: '120分ごと (MGMT_AUTOSYNC_INTERVAL_MIN)。監視は「毎朝までに1回は成功しているか」で見る',
-    anchor_hour_jst: 8,
-    anchor_minute_jst: 0,
-    grace_hours: 6,
+    schedule: '120分ごと (MGMT_AUTOSYNC_INTERVAL_MIN)',
+    // 既定120分の3倍。MGMT_AUTOSYNC_INTERVAL_MIN を 200分より長くするならここも広げること
+    max_age_hours: 6,
     lifecycle: 'permanent',
     runbook: 'Render Logs で「mgmt-auto-sync」を検索。確定済み月はスキップされる (それ自体は正常)。手動実行 = 管理会計画面の再計算',
   },
+  // ─────────────── heartbeat (常駐ワーカーの生存監視) ───────────────
+  // 毎日決まった時刻に走るものではないので、アンカーではなく「最終生存報告からの経過」で見る。
   {
     id: 'po-email-dispatcher',
-    type: 'scheduled_job',
+    type: 'heartbeat',
     importance: 'P1',
     owner: '中原さん',
     purpose: '発注メールの予約送信ワーカー。止まると予約したメールが送られないまま「予約済み」表示で残り、'
       + '仕入先に届いていないことに気づくのが遅れる',
     where: 'Render bfaith-portal 内 常駐ワーカー (apps/purchase-orders/email.js、60秒ごと)',
-    schedule: '60秒ごと (生存 ping は1時間に1回へ間引き)。監視は「毎朝までに生存報告があるか」で見る',
-    anchor_hour_jst: 8,
-    anchor_minute_jst: 0,
-    grace_hours: 4,
+    schedule: '60秒ごと (生存 ping は1時間に1回へ間引き)',
+    max_age_hours: 3,
     lifecycle: 'permanent',
     runbook: 'Render Logs で「po-email」を検索。ping は送信0件でも打つので、来ていない = ワーカー自体が止まっている。'
+      + '送信ジョブが失敗した周期は ping を打たないので、失敗が続いた場合もここに出る。'
       + 'Render の再デプロイで復帰する。未送信の予約は queued のまま残るので復帰後に自動で送られる',
   },
   {
     id: 'warehouse-healthcheck',
-    type: 'scheduled_job',
+    type: 'heartbeat',
     importance: 'P2',
     owner: '中原さん',
     purpose: 'miniPC warehouse (wh.bfaith-wh.uk) の死活監視ループ。これが止まると miniPC 障害の一次検知が消える',
     where: 'Render bfaith-portal 内 node-cron (apps/warehouse/healthcheck.js、5分ごと)',
-    schedule: '5分ごと (生存 ping は1時間に1回へ間引き)。監視は「毎朝までに生存報告があるか」で見る',
-    anchor_hour_jst: 8,
-    anchor_minute_jst: 0,
-    grace_hours: 4,
+    schedule: '5分ごと (生存 ping は1時間に1回へ間引き)',
+    max_age_hours: 3,
     lifecycle: 'permanent',
     runbook: 'Render Logs で「Healthcheck」を検索。⭐ここの ok は「監視ループが回っている」であって「miniPC が生きている」ではない'
       + ' (miniPC の異常はこのジョブ自身が GChat へ通知する)',
@@ -409,7 +416,7 @@ export function validateRegistry(registry = JOBS_REGISTRY) {
     if (!e.id || !ID_RE.test(e.id)) errs.push(`${label}: id が不正 (小文字英数とハイフンのみ)`);
     if (seen.has(e.id)) errs.push(`${label}: id が重複`);
     seen.add(e.id);
-    if (!['scheduled_job', 'human_obligation', 'temporary_asset'].includes(e.type)) errs.push(`${label}: type が不正 (${e.type})`);
+    if (!['scheduled_job', 'heartbeat', 'human_obligation', 'temporary_asset'].includes(e.type)) errs.push(`${label}: type が不正 (${e.type})`);
     if (!['P1', 'P2', 'P3', 'TMP'].includes(e.importance)) errs.push(`${label}: importance が不正 (${e.importance})`);
     for (const k of ['owner', 'purpose', 'runbook', 'where', 'schedule']) {
       if (e.type === 'temporary_asset' && k === 'schedule') continue; // 一時物に定期はない
@@ -434,6 +441,16 @@ export function validateRegistry(registry = JOBS_REGISTRY) {
     }
     if (e.type !== 'scheduled_job' && e.partial_max_days !== undefined) {
       errs.push(`${label}: partial_max_days は scheduled_job だけの設定`);
+    }
+    if (e.type === 'heartbeat') {
+      if (!(Number.isFinite(e.max_age_hours) && e.max_age_hours > 0)) {
+        errs.push(`${label}: max_age_hours は必須 (正の数。ping 間隔の2倍以上を目安に)`);
+      }
+      if (e.anchor_hour_jst !== undefined || e.grace_hours !== undefined) {
+        errs.push(`${label}: heartbeat に anchor_hour_jst / grace_hours は使わない (経過時間で判定する)`);
+      }
+    } else if (e.max_age_hours !== undefined) {
+      errs.push(`${label}: max_age_hours は heartbeat だけの設定`);
     }
     if (e.type === 'human_obligation') {
       if (!(Number.isFinite(e.period_hours) && e.period_hours > 0)) errs.push(`${label}: period_hours は必須`);
