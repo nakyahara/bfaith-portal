@@ -38,6 +38,7 @@ import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
 import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-log.js';
+import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
 
@@ -1961,6 +1962,8 @@ router.get('/inbound-history/print', (req, res) => {
     title: `FBA納品実績 ${from} 〜 ${to}`,
     from, to, unit, includeCancelled, minDays,
     summary, unreceived, totals,
+    chart: buildInboundChart(summary, unit),
+    showChart: req.query.chart !== '0',
     printedAt: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' '),
   });
 });
