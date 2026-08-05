@@ -216,6 +216,9 @@ console.log('\n── isShipmentsRebuildFresh (古い表を Render に送らな�
   ok(!isShipmentsRebuildFresh(iso('2026-08-03T22:20:00Z'), now), '前日の再構築 → 送らない (当日分が失敗した日)');
   ok(!isShipmentsRebuildFresh(null, now), 'メタが無い (初回・失敗) → 送らない');
   ok(!isShipmentsRebuildFresh('not-a-date', now), '壊れた値 → 送らない');
+  ok(!isShipmentsRebuildFresh('2026-08-05', now), '日付だけの値 → 送らない (保存形式と違う)');
+  ok(!isShipmentsRebuildFresh('2026-08-04T22:20:00+09:00', now), 'ISO でもオフセット表記 → 送らない');
+  ok(!isShipmentsRebuildFresh(iso('2026-08-04T22:20:00Z').replace('.000Z', 'Z'), now), 'ミリ秒なしの表記 → 送らない');
   ok(!isShipmentsRebuildFresh(iso('2026-08-05T02:00:00Z'), now), '未来の時刻 → 送らない');
   // JST 日付で判定する (UTC 日付だと 2026-08-04T22:20Z を「前日」と誤判定する)
   ok(isShipmentsRebuildFresh(iso('2026-08-04T15:10:00Z'), Date.parse('2026-08-04T23:00:00Z')),

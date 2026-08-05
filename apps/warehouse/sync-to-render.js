@@ -120,8 +120,11 @@ export function buildStockSnapshotSyncParts(db, monthCutoff, chunkSize = 20000) 
 export function isShipmentsRebuildFresh(rebuiltAtIso, nowMs = Date.now()) {
   const REBUILD_MAX_AGE_H = 12;
   const jstDay = (ms) => new Date(ms + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  // 保存形式 (new Date().toISOString()) と完全一致する値だけを受ける。
+  // Date.parse だけだと '2026-08-05' のような日付のみの値や正規化される値も通ってしまう
   const ms = rebuiltAtIso ? Date.parse(rebuiltAtIso) : NaN;
   if (Number.isNaN(ms)) return false;
+  if (new Date(ms).toISOString() !== rebuiltAtIso) return false;
   const ageH = (nowMs - ms) / 3600000;
   if (ageH < 0 || ageH > REBUILD_MAX_AGE_H) return false; // 未来日付も信用しない
   return jstDay(ms) === jstDay(nowMs);
