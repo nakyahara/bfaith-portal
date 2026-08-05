@@ -856,9 +856,13 @@ export function buildItemPayload(db, draftId) {
     variants: {
       [draft.ne_code]: {
         standardPrice: draft.price,
+        // カタログID免除理由 (2026-08-05 平串の IE0429 で実測確定):
+        //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=当店オリジナル商品
+        //   4=項目選択肢別在庫商品 / 5=該当商品コードなし / 6=頒布会商品
+        // JAN の無い単品仕入れ商品は 5 が正 (旧値 1 は IE0429 で登録拒否)
         articleNumber: rk.article_number && String(rk.article_number).trim() !== ''
           ? { value: String(rk.article_number).trim() }
-          : { exemptionReason: 1 },
+          : { exemptionReason: 5 },
         ...(attrs.length > 0 ? { attributes: attrs } : {}),
         ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
         ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
