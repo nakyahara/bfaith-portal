@@ -71,6 +71,16 @@ for (const [label, rows] of cases) {
 }
 eq(count(), 2, '拒否されても既存の2行は残っている (全消し前に検証している)');
 
+console.log('\n── /api/status に出荷サマリが出る ──');
+{
+  const res = await fetch(`${base}/api/status`);
+  const s = await res.json();
+  eq(s.shipments_daily_count, 2, '件数');
+  eq([s.shipments_daily_oldest_date, s.shipments_daily_latest_date], ['2026-08-04', '2026-08-05'], '期間');
+  eq(s.shipments_daily_slips, 795, '伝票合計 (同期が届いたかを同期直後に確認できる)');
+  ok(!!s.shipments_daily_synced_at, '最終同期時刻');
+}
+
 console.log('\n── 配列以外は 400 ──');
 for (const [label, v] of [['オブジェクト', {}], ['文字列', 'abc'], ['数値', 1]]) {
   const r = await post({ shipments_daily: v });
