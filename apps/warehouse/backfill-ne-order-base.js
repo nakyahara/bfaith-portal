@@ -110,8 +110,10 @@ async function main() {
 
   console.log(`[バックフィル] 取得完了: ${totalFetched}件処理, ${totalInserted}件挿入, ${totalUpdated}件更新`);
 
-  const rb = rebuildShipmentsDaily(db, { from, to });
-  console.log(`[バックフィル] 出荷サマリ再構築: ${rb.from} 〜 ${rb.to} → ${rb.rows}行 (有効伝票 ${rb.slips}件)`);
+  // バックフィル後は全期間を作り直す。部分再構築だと「全期間を作り直した」メタが立たず、
+  // 翌朝の daily-sync まで Render へ送られない (rebuild-shipments-daily の meta 参照)
+  const rb = rebuildShipmentsDaily(db, { all: true });
+  console.log(`[バックフィル] 出荷サマリ再構築 (全期間): ${rb.rows}行 (出荷確定伝票 ${rb.slips}件)`);
 }
 
 const isDirectRun = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);

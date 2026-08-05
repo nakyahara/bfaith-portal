@@ -112,8 +112,16 @@ export function rebuildShipmentsDaily(db, opts = {}) {
   // 再構築が成功した時刻を残す。sync-to-render はこれを見て「今日ちゃんと作り直された表か」を
   // 判定する。これが無いと、再構築に失敗した日でも SELECT 自体は成功するので、古い表や
   // (初回失敗なら) 空の表を「最新」として Render に送ってしまう (Codex R4 high)。
-  db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)')
-    .run('shipments_daily_rebuilt_at', new Date().toISOString(), updatedAt);
+  //
+  // ⭐ 全期間 (--all) と部分再構築でキーを分ける。Render へは表の全行をスナップショットとして
+  //    送るので、「全期間を作り直した」ことが確かめられたときだけ送りたい (Codex R5 high)。
+  //    部分再構築でも窓の外の行は残るため mirror が壊れるわけではないが、
+  //    保守で一部期間だけ直した状態を「今日の完全な結果」として送らない方が安全。
+  const meta = db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)');
+  const nowIso = new Date().toISOString();
+  meta.run('shipments_daily_rebuilt_at', nowIso, updatedAt);
+  meta.run('shipments_daily_rebuilt_range', all ? 'all' : `${from}~${to}`, updatedAt);
+  if (all) meta.run('shipments_daily_full_rebuilt_at', nowIso, updatedAt);
   return { from, to, ...res };
 }
 

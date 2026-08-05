@@ -162,7 +162,8 @@ export async function syncToRender() {
   let shipments_daily = [];
   let shipments_daily_state = 'ok';
   try {
-    const rebuiltAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_rebuilt_at'").get();
+    // 全期間 (--all) の再構築だけを根拠にする。部分再構築 (--days/--from) の時刻では送らない
+    const rebuiltAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_full_rebuilt_at'").get();
     const ageH = rebuiltAt && rebuiltAt.value
       ? (Date.now() - Date.parse(rebuiltAt.value)) / 3600000 : Infinity;
     if (!(ageH <= REBUILD_MAX_AGE_H)) {

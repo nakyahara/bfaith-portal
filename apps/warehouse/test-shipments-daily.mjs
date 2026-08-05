@@ -187,11 +187,22 @@ db.prepare('DELETE FROM f_shipments_daily').run();
 // ─────────────── 3e. 再構築時刻の記録 (Render 同期の鮮度判定に使う) ───────────────
 console.log('\n── 再構築時刻を sync_meta に残す ──');
 {
-  db.prepare("DELETE FROM sync_meta WHERE key = 'shipments_daily_rebuilt_at'").run();
+  const metaOf = (k) => db.prepare('SELECT value FROM sync_meta WHERE key = ?').get(k);
+  db.prepare("DELETE FROM sync_meta WHERE key LIKE 'shipments_daily%'").run();
+
   rebuildShipmentsDaily(db, { all: true });
-  const m = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_rebuilt_at'").get();
+  const m = metaOf('shipments_daily_rebuilt_at');
   ok(!!m && !Number.isNaN(Date.parse(m.value)), '再構築のたびに shipments_daily_rebuilt_at を更新する');
   ok(Math.abs(Date.now() - Date.parse(m.value)) < 60000, '記録される時刻は現在時刻');
+  eq(metaOf('shipments_daily_rebuilt_range').value, 'all', '--all の範囲が記録される');
+  const full1 = metaOf('shipments_daily_full_rebuilt_at').value;
+  ok(!!full1, '--all のときは shipments_daily_full_rebuilt_at も立つ');
+
+  // 部分再構築では「全期間を作り直した」印を更新しない
+  // (Render へは表の全行を送るので、部分再構築の時刻を根拠に送らない)
+  rebuildShipmentsDaily(db, { from: '2026-08-01', to: '2026-08-31' });
+  eq(metaOf('shipments_daily_rebuilt_range').value, '2026-08-01~2026-08-31', '部分再構築の範囲が記録される');
+  eq(metaOf('shipments_daily_full_rebuilt_at').value, full1, '部分再構築では full_rebuilt_at が進まない');
 }
 
 // ─────────────── 3c. 取得区間の二分割 ───────────────
