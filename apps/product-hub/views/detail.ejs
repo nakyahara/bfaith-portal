@@ -88,16 +88,97 @@
       (im) => cabinetImages.some((c) => c.drive_file_id === im.drive_file_id)
     ).length;
   %>
+  <!-- 楽天出品 (P3) -->
+  <div class="card" style="border-color:#fecaca; background:#fffbfa;">
+    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → アプリの公開ボタンで公開)</span></h2>
+    <div style="font-size:13px; margin-bottom:10px;">
+      🖼 画像転送:
+      <% if (images.length === 0) { %>
+        <span style="color:#b45309;">画像未登録 (画像タブでフォルダを取り込んでください)</span>
+      <% } else if (transferredImageCount >= images.length) { %>
+        <span style="color:#166534;">✅ <%= transferredImageCount %>/<%= images.length %> 枚 転送済み</span>
+      <% } else { %>
+        <span style="color:#b45309;">⚠️ 未転送 <%= images.length - transferredImageCount %> 枚 (<%= transferredImageCount %>/<%= images.length %> 済) — 画像タブの「画像をR-Cabinetへ転送」で送ってください</span>
+      <% } %>
+    </div>
+    <% const selectedShopCats = shopCategories.filter((c) => c.selected)
+         .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99) || a.id - b.id); // 枠順 (枠1=メイン) %>
+    <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
+      <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+        🟢 <strong>楽天で公開中</strong>
+        <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
+        問題があれば「非公開に戻す」で売り場から下げられます。
+        <div style="margin-top:8px;">
+          <button class="btn btn-sm" id="rk-unpublish-btn">非公開に戻す</button>
+        </div>
+      </div>
+    <% } else if (rakuten && rakuten.registered_at) { %>
+      <div style="background:#fefce8; border:1px solid #fde047; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
+        ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
+        <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
+        公開前チェック:
+        <ul style="margin:6px 0 0 18px; padding:0;">
+          <li>在庫は <strong>0 で登録</strong>されています (在庫は NE 連携 / 運用側で入れる)</li>
+          <% if (selectedShopCats.length > 0) { %>
+            <li>
+              店舗内カテゴリ: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
+              <%# 状態は「今の選択が反映済みか」で判定する (反映後に棚を変えたら stale) %>
+              <% if (shopCatSyncState === 'synced') { %>
+                <span style="color:#166534;">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
+              <% } else if (shopCatSyncState === 'stale') { %>
+                <span style="color:#b45309;">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
+              <% } else if (shopCatSyncState === 'failed') { %>
+                <span style="color:#dc2626;">❌ 反映に失敗</span>
+              <% } else { %>
+                <span class="muted">⏳ 未反映</span>
+              <% } %>
+              <button class="btn btn-sm" id="rk-syncshopcat-btn" style="margin-left:6px;">棚を反映</button>
+              <span class="muted" id="rk-syncshopcat-result" style="font-size:12px;"></span>
+              <% if (rakuten.shop_categories_error && shopCatSyncState !== 'synced') { %>
+                <div class="muted" style="font-size:11px; color:#b91c1c; white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
+              <% } %>
+            </li>
+          <% } else { %>
+            <li class="muted">店舗内カテゴリが未選択です (どの棚にも載りません)</li>
+          <% } %>
+          <li>「送信内容を確認」でページ内容を最終確認</li>
+        </ul>
+        <div style="margin-top:8px;">
+          <button class="btn btn-primary btn-sm" id="rk-publish-btn">楽天で公開する</button>
+          <span class="muted" style="font-size:12px;">アプリから公開に切り替えます (RMS画面を開く必要はありません)</span>
+        </div>
+      </div>
+    <% } %>
+    <% if (rakuten && rakuten.last_error) { %>
+      <div class="banner-warn" style="margin:0 0 12px; white-space:pre-wrap; font-size:12px;">⚠️ 前回のRMSエラー:
+<%= rakuten.last_error %></div>
+    <% } %>
+
+    <p class="muted" style="margin:0 0 10px; font-size:12px;">
+      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報・Yahoo!欄の値を自動で送ります。
+      在庫は常に 0 で登録します。<br>
+      配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
+      「出品情報を保存」はタブをまたいで全ての出品項目を保存します。
+    </p>
+
+    <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap;">
+      <button class="btn" id="rk-save-btn">出品情報を保存</button>
+      <button class="btn" id="rk-preview-btn">送信内容を確認</button>
+      <button class="btn btn-primary" id="rk-register-btn">非公開で登録</button>
+      <span class="muted" id="rk-result"></span>
+    </div>
+    <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
+  </div>
+
   <div class="tabbar" id="tabbar"
        data-image-count="<%= images.length %>" data-transferred-count="<%= transferredImageCount %>"
        data-ref-count="<%= refs.length %>">
-    <!-- 並び順 = 入力の流れ (中原さん指定 2026-08-01): 基本情報 → 商品情報 → カテゴリ → 説明 → 画像 → 出品 -->
+    <!-- 並び順 = 入力の流れ (中原さん指定 2026-08-01): 基本情報 → 商品情報 → カテゴリ → 説明 → 画像。出品カードとYahoo!欄はタブ廃止し上部/基本情報へ (2026-08-05) -->
     <button type="button" class="tab-btn" data-tab="tab-basic">✏️ 基本情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-info">📄 商品情報<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-category">🗂 カテゴリ・属性<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-desc">📝 商品説明<span class="tab-badge" hidden></span></button>
     <button type="button" class="tab-btn" data-tab="tab-images">🖼 画像<span class="tab-badge" hidden></span></button>
-    <button type="button" class="tab-btn" data-tab="tab-listing">🛒 出品<span class="tab-badge" hidden></span></button>
     <span class="muted" style="margin-left:6px;">赤い数字 = 未入力の主要な必須項目 (内訳はマウスオーバー。最終チェックは「送信内容を確認」で)</span>
   </div>
 
@@ -359,7 +440,45 @@
     </div>
     </div><!-- /右カラム -->
   </div>
+  <!-- Yahoo!向け追記項目 -->
+  <div class="card">
+    <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
+    <div class="grid-2">
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>Yahoo!売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
+      </div>
+      <div style="flex:1">
+        <label>Yahoo!売価 (佐川の場合)<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
+      </div>
+    </div>
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>配送方法<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
+      </div>
+      <div style="flex:1">
+        <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+      </div>
+    </div>
+    <div class="field" style="display:flex; gap:12px;">
+      <div style="flex:1">
+        <label>Yahoo!カテゴリID<span class="ftag ftag-m">手入力</span></label>
+        <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
+      </div>
+      <div style="flex:2">
+        <label>Yahoo!path (店カテゴリ)<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
+      </div>
+    </div>
+    </div>
+    <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
+  </div>
   </div><!-- /tab-basic -->
+
 
   <!-- ═══ タブ2: 画像 ═══ -->
   <div class="tab-panel" id="tab-images">
@@ -459,7 +578,7 @@
           <span class="muted" style="font-size:12px; white-space:nowrap;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送 (「画像を転送」で送る)' %></span>
         <% } %>
       </div>
-      <div class="muted" style="font-size:11px;">保存は「出品」タブの「出品情報を保存」か「基本情報を保存」で行われます</div>
+      <div class="muted" style="font-size:11px;">保存は上部の「出品情報を保存」か「基本情報を保存」で行われます</div>
     </div>
     <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
       <!-- 件数は drive_file_id 突合 (Codex R2: 履歴件数だと画像差し替え後や白抜き分でズレる) -->
@@ -847,118 +966,6 @@
   </div>
   </div><!-- /tab-category -->
 
-  <!-- ═══ タブ6: 出品 ═══ -->
-  <div class="tab-panel" id="tab-listing">
-  <!-- 楽天出品 (P3) -->
-  <div class="card" style="border-color:#fecaca; background:#fffbfa;">
-    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → アプリの公開ボタンで公開)</span></h2>
-    <% const selectedShopCats = shopCategories.filter((c) => c.selected)
-         .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99) || a.id - b.id); // 枠順 (枠1=メイン) %>
-    <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
-      <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
-        🟢 <strong>楽天で公開中</strong>
-        <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
-        問題があれば「非公開に戻す」で売り場から下げられます。
-        <div style="margin-top:8px;">
-          <button class="btn btn-sm" id="rk-unpublish-btn">非公開に戻す</button>
-        </div>
-      </div>
-    <% } else if (rakuten && rakuten.registered_at) { %>
-      <div style="background:#fefce8; border:1px solid #fde047; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
-        ✅ <strong>楽天に非公開 (倉庫指定) で登録済み</strong>
-        <span class="muted">(<%= rakuten.registered_at.replace('T',' ').slice(0,16) %>)</span><br>
-        公開前チェック:
-        <ul style="margin:6px 0 0 18px; padding:0;">
-          <li>在庫は <strong>0 で登録</strong>されています (在庫は NE 連携 / 運用側で入れる)</li>
-          <% if (selectedShopCats.length > 0) { %>
-            <li>
-              店舗内カテゴリ: <strong><%= selectedShopCats.map((c) => c.path).join(' ／ ') %></strong>
-              <%# 状態は「今の選択が反映済みか」で判定する (反映後に棚を変えたら stale) %>
-              <% if (shopCatSyncState === 'synced') { %>
-                <span style="color:#166534;">✅ 反映済み (<%= rakuten.shop_categories_synced_at.replace('T',' ').slice(0,16) %>)</span>
-              <% } else if (shopCatSyncState === 'stale') { %>
-                <span style="color:#b45309;">⚠️ 反映後に棚を変えました (もう一度反映してください)</span>
-              <% } else if (shopCatSyncState === 'failed') { %>
-                <span style="color:#dc2626;">❌ 反映に失敗</span>
-              <% } else { %>
-                <span class="muted">⏳ 未反映</span>
-              <% } %>
-              <button class="btn btn-sm" id="rk-syncshopcat-btn" style="margin-left:6px;">棚を反映</button>
-              <span class="muted" id="rk-syncshopcat-result" style="font-size:12px;"></span>
-              <% if (rakuten.shop_categories_error && shopCatSyncState !== 'synced') { %>
-                <div class="muted" style="font-size:11px; color:#b91c1c; white-space:pre-wrap;"><%= rakuten.shop_categories_error %></div>
-              <% } %>
-            </li>
-          <% } else { %>
-            <li class="muted">店舗内カテゴリが未選択です (どの棚にも載りません)</li>
-          <% } %>
-          <li>「送信内容を確認」でページ内容を最終確認</li>
-        </ul>
-        <div style="margin-top:8px;">
-          <button class="btn btn-primary btn-sm" id="rk-publish-btn">楽天で公開する</button>
-          <span class="muted" style="font-size:12px;">アプリから公開に切り替えます (RMS画面を開く必要はありません)</span>
-        </div>
-      </div>
-    <% } %>
-    <% if (rakuten && rakuten.last_error) { %>
-      <div class="banner-warn" style="margin:0 0 12px; white-space:pre-wrap; font-size:12px;">⚠️ 前回のRMSエラー:
-<%= rakuten.last_error %></div>
-    <% } %>
-
-    <p class="muted" style="margin:0 0 10px; font-size:12px;">
-      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報・Yahoo!欄の値を自動で送ります。
-      在庫は常に 0 で登録します。<br>
-      配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
-      「出品情報を保存」はタブをまたいで全ての出品項目を保存します。
-    </p>
-
-    <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap;">
-      <button class="btn" id="rk-save-btn">出品情報を保存</button>
-      <button class="btn" id="rk-preview-btn">送信内容を確認</button>
-      <button class="btn btn-primary" id="rk-register-btn">非公開で登録</button>
-      <span class="muted" id="rk-result"></span>
-    </div>
-    <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
-  </div>
-
-  <!-- Yahoo!向け追記項目 -->
-  <div class="card">
-    <h2>✏️ Yahoo!向け追記項目 <span class="muted" style="font-weight:400">(入力・楽天→Yahoo移行で使用)</span></h2>
-    <div class="grid-2">
-    <div class="field" style="display:flex; gap:12px;">
-      <div style="flex:1">
-        <label>Yahoo!売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
-        <input type="number" id="y-price" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price != null ? yahoo.yahoo_price : '' %>">
-      </div>
-      <div style="flex:1">
-        <label>Yahoo!売価 (佐川の場合)<span class="ftag ftag-m">手入力</span></label>
-        <input type="number" id="y-price-sagawa" min="0" step="1" value="<%= yahoo && yahoo.yahoo_price_sagawa != null ? yahoo.yahoo_price_sagawa : '' %>">
-      </div>
-    </div>
-    <div class="field" style="display:flex; gap:12px;">
-      <div style="flex:1">
-        <label>配送方法<span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
-      </div>
-      <div style="flex:1">
-        <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
-      </div>
-    </div>
-    <div class="field" style="display:flex; gap:12px;">
-      <div style="flex:1">
-        <label>Yahoo!カテゴリID<span class="ftag ftag-m">手入力</span></label>
-        <input type="number" id="y-category-id" value="<%= yahoo && yahoo.yahoo_category_id != null ? yahoo.yahoo_category_id : '' %>">
-      </div>
-      <div style="flex:2">
-        <label>Yahoo!path (店カテゴリ)<span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="y-path" value="<%= yahoo ? (yahoo.yahoo_path || '') : '' %>">
-      </div>
-    </div>
-    </div>
-    <button class="btn btn-primary" id="save-yahoo-btn">Yahoo!項目を保存</button>
-  </div>
-  </div><!-- /tab-listing -->
 
   <!-- ジャンル選択モーダル (RMS の「ジャンルID選択」と同じ操作感) -->
   <div id="genre-modal" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,.45); z-index:1000;">
@@ -1079,7 +1086,7 @@
   }
 
   function computeMissing() {
-    const m = { 'tab-basic': [], 'tab-images': [], 'tab-desc': [], 'tab-info': [], 'tab-category': [], 'tab-listing': [] };
+    const m = { 'tab-basic': [], 'tab-images': [], 'tab-desc': [], 'tab-info': [], 'tab-category': [] };
     if (!tv('f-name')) m['tab-basic'].push('商品名');
     // AI の参照元は「公式ページURL / 参考URL / Amazon URL のどれか1つ」でよい (サーバーの gateReasons と対応)
     if (!tv('f-official-url') && !tv('f-amazon-url') && Number(document.getElementById('tabbar').dataset.refCount || 0) === 0) {
