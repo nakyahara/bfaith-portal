@@ -225,6 +225,23 @@ export const JOBS_REGISTRY = [
   },
 
   // ─────────────── human_obligation (人がやる期限つき作業) ───────────────
+  // ─────────────── scheduled_job (Render 内 node-cron) ───────────────
+  {
+    id: 'ph-ne-intake',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'NE新商品 → product-hub ドラフト自動作成 (Notionカード自動作成停止後の新商品の入口)',
+    where: 'Render bfaith-portal 内 node-cron (apps/product-hub/intake-cron.js、PH_INTAKE_CRON_ENABLED=1)',
+    schedule: '毎日 09:30 (daily-sync の mirror 更新後)',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 30,
+    grace_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「intake」を検索。mirror_too_small/mirror_empty = daily-sync 未完か同期途中 (miniPC側を確認)。'
+      + '手動実行 = product-hub 一覧 (admin) の「NE取込を今すぐ実行」。2026-08-05 点火 (初回はシードのみ・翌日から自動作成)',
+  },
+
   {
     id: 'yahoo-oauth-reauth',
     type: 'human_obligation',

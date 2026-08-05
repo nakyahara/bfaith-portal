@@ -12,6 +12,14 @@
  */
 import cron from 'node-cron';
 import { syncNewProducts } from './services/new-product-intake.js';
+import { recordPing } from '../jobs-monitor/store.js';
+
+// dead-man 監視 (jobs-registry: ph-ne-intake)。同一プロセスなので内部関数を直接呼ぶ。
+// 監視の記録失敗で取込本体を巻き添えにしない
+function ping(status, note) {
+  try { recordPing('ph-ne-intake', status, note, Date.now()); }
+  catch (e) { console.error('[product-hub] intake ping failed:', e.message); }
+}
 
 const ON = new Set(['1', 'true', 'on', 'yes']);
 
@@ -28,11 +36,19 @@ export function startProductHubIntakeCron() {
   cron.schedule(expr, () => {
     try {
       const r = syncNewProducts({ actor: 'cron:ne-intake' });
-      if (!r.ok) console.warn(`[product-hub] intake skipped: ${r.error}`);
-      else if (r.mode === 'seed') console.log(`[product-hub] intake seeded: ${r.seeded} codes (初回カットオフ。ドラフトは作っていません)`);
-      else console.log(`[product-hub] intake done: created=${r.created} merged=${r.merged}${r.capped ? ' (上限到達)' : ''}`);
+      if (!r.ok) {
+        console.warn(`[product-hub] intake skipped: ${r.error}`);
+        ping('fail', String(r.error).slice(0, 180));
+      } else if (r.mode === 'seed') {
+        console.log(`[product-hub] intake seeded: ${r.seeded} codes (初回カットオフ。ドラフトは作っていません)`);
+        ping('ok', `seed ${r.seeded}`);
+      } else {
+        console.log(`[product-hub] intake done: created=${r.created} merged=${r.merged}${r.capped ? ' (上限到達)' : ''}`);
+        ping('ok', `created=${r.created} merged=${r.merged}`);
+      }
     } catch (e) {
       console.error('[product-hub] intake failed:', e.message);
+      ping('fail', String(e.message).slice(0, 180));
     }
   }, { timezone: 'Asia/Tokyo' });
   console.log(`[product-hub] intake cron: enabled (${expr} JST)`);
