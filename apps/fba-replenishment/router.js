@@ -37,7 +37,9 @@ import { createPickingCard, notionConfigured } from './notion-attach.js';
 import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
-import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
+import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-log.js';
+import { pingJob } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -116,33 +118,58 @@ initDb().then(() => {
   dbReady = true;
   bootEnd('fba-db', 'fba-replenishment.db');
 
-  // 毎日06:00 JST (21:00 UTC) にSKUマッピング同期（他CH売上スナップショット蓄積）
-  bootStart('fba-cron', 'fba-sku-sync-cron');
-  cron.schedule('0 21 * * *', async () => {
-    console.log('[FBA-Cron] SKUマッピング定期同期開始...');
-    try {
-      const result = await syncSkuMappings();
-      console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
-    } catch (e) {
-      console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
-    }
-    // 土台商品マスタ(ピッキング準備)も同期。失敗しても他処理に影響させない (best-effort)。
-    try {
-      const dr = await syncDodaiMaster();
-      console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
-    } catch (e) {
-      console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
-    }
-    // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
-    try {
-      const ih = await runInboundHistoryDailySync();
-      console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件`);
-    } catch (e) {
-      console.error('[FBA-Cron] 納品実績同期エラー:', e);
-    }
-  });
-  console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
-  bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 21 * * * UTC');
+  // 毎日06:00 JST にSKUマッピング同期（他CH売上スナップショット蓄積）
+  //
+  // ⚠ Render 限定。miniPC も同じ server.js を動かすため、無条件に登録すると
+  //   Google Sheets / SP-API を2箇所から叩き、miniPC 側のローカル DB にも書き込む
+  //   (2026-08-05 に実際に二重実行していたのを確認。feedback_minipc_shares_portal_server_js)。
+  // ⚠ timezone を明示すること。以前は未指定で「コンテナが UTC だから結果的に 06:00 JST」
+  //   という状態で、TZ env を入れた瞬間に9時間ずれる作りだった。
+  //   実際 miniPC (ローカル TZ = JST) では 21:00 に走っていた。
+  if (!isRender()) {
+    bootNote('fba-cron', 'RENDER未設定のため定期同期をスケジュールしない (Render専用)');
+    console.log('[FBA] 非Render環境のため定期同期スケジュールをスキップ');
+  } else {
+    bootStart('fba-cron', 'fba-sku-sync-cron');
+    cron.schedule('0 6 * * *', async () => {
+      console.log('[FBA-Cron] SKUマッピング定期同期開始...');
+      // dead-man 監視 (jobs-registry: fba-daily-sync)。
+      // 主目的の SKU マッピング同期が成功したかを ok/fail の基準にし、
+      // 後続2つ (best-effort) の結果は note に載せる。
+      let pingStatus = 'fail';
+      const notes = [];
+      try {
+        const result = await syncSkuMappings();
+        console.log(`[FBA-Cron] 完了: ${result.total}件 (スナップショット: ${result.snapshots}件)`);
+        pingStatus = 'ok';
+        notes.push(`sku=${result.total}`);
+      } catch (e) {
+        console.error('[FBA-Cron] SKUマッピング同期エラー:', e);
+        notes.push(`sku失敗: ${e.message}`);
+      }
+      // 土台商品マスタ(ピッキング準備)も同期。失敗しても他処理に影響させない (best-effort)。
+      try {
+        const dr = await syncDodaiMaster();
+        console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
+        notes.push(`土台=${dr.count}`);
+      } catch (e) {
+        console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
+        notes.push(`土台失敗: ${e.message}`);
+      }
+      // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
+      try {
+        const ih = await runInboundHistoryDailySync();
+        console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件`);
+        notes.push(`納品=${ih.shipments}/${ih.items}`);
+      } catch (e) {
+        console.error('[FBA-Cron] 納品実績同期エラー:', e);
+        notes.push(`納品失敗: ${e.message}`);
+      }
+      pingJob('fba-daily-sync', pingStatus, notes.join(' '));
+    }, { timezone: 'Asia/Tokyo' });
+    console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
+    bootEnd('fba-cron', 'fba-sku-sync-cron', 'cron=0 6 * * * JST');
+  }
 }).catch(e => {
   bootFail('fba-db', 'fba-replenishment.db', e);
   console.error('[FBA] DB初期化エラー:', e);

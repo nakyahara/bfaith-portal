@@ -14,6 +14,8 @@ import { runAutoCheck } from './auto-check.js';
 import { log } from './helpers.js';
 import { exportCSVToDrive } from './csv-export.js';
 import * as rdb from './db.js';
+import { pingJob } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 const DATA_RETENTION_DAYS = 365;
 const RUNMETA_RETENTION_DAYS = 60;
@@ -27,7 +29,18 @@ function cleanupOldData() {
 }
 
 export function startScheduler() {
+  // 自動チェックは元々 RANKCHECK_AUTO_ENABLED による明示 opt-in (dev/fallback 経路)。
+  // 本番は miniPC Runner (台帳 rankcheck-runner) が担当するので Render では false。
+  // 明示フラグは環境を問わず尊重する。
   const autoEnabled = process.env.RANKCHECK_AUTO_ENABLED === 'true';
+  // 一方 CSV 出力はフラグを持たない常時実行なので Render 限定にする。
+  // miniPC も同じ server.js を動かすため、無条件だと2箇所から同じ Drive フォルダへ書く
+  // (しかも miniPC 側は順位データを持たない)。
+  const csvEnabled = isRender();
+  if (!autoEnabled && !csvEnabled) {
+    console.log('[Scheduler] 非Render環境かつ自動チェック無効のためスケジュール登録をスキップ');
+    return;
+  }
   if (autoEnabled) {
     cron.schedule('0 4 * * *', async () => {
       log('--- スケジュール実行: 順位自動チェック (13:00 JST) ---');
@@ -40,14 +53,19 @@ export function startScheduler() {
     }, { timezone: 'UTC' });
   }
 
-  cron.schedule('0 0 * * *', async () => {
-    log('--- スケジュール実行: CSV出力 (09:00 JST) ---');
-    try {
-      await exportCSVToDrive();
-    } catch (e) {
-      log(`CSV出力エラー: ${e.message}`);
-    }
-  }, { timezone: 'UTC' });
+  if (csvEnabled) {
+    cron.schedule('0 9 * * *', async () => {
+      log('--- スケジュール実行: CSV出力 (09:00 JST) ---');
+      // dead-man 監視 (jobs-registry: rankcheck-csv-export)
+      try {
+        await exportCSVToDrive();
+        pingJob('rankcheck-csv-export', 'ok');
+      } catch (e) {
+        log(`CSV出力エラー: ${e.message}`);
+        pingJob('rankcheck-csv-export', 'fail', e.message);
+      }
+    }, { timezone: 'Asia/Tokyo' });
+  }
 
   console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了 (SQLite版)');
   if (autoEnabled) {
@@ -55,5 +73,7 @@ export function startScheduler() {
   } else {
     console.log('[Scheduler]   13:00 JST 自動チェックは無効化中 (RANKCHECK_AUTO_ENABLED=true で有効化)');
   }
-  console.log('[Scheduler]   09:00 JST → CSV出力 → Google Drive');
+  console.log(csvEnabled
+    ? '[Scheduler]   09:00 JST → CSV出力 → Google Drive'
+    : '[Scheduler]   09:00 JST CSV出力は非Render環境のためスキップ');
 }

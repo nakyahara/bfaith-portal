@@ -27,9 +27,13 @@ import cron from 'node-cron';
 import { syncNewProducts, getJobSettings, parseHhmm, savePdfState } from './db.js';
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
 import { exportSchedulePdfToDrive, PDF_FILENAME } from './schedule-pdf.js';
+import { pingJob } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 // 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
 const OFF = new Set(['false', '0', 'off', 'no']);
+// 非Render環境であえて動かす意図の書き方 (既定は Render のみ)
+const FORCE_ON = new Set(['true', '1', 'on', 'yes']);
 
 function isDisabled() {
   return OFF.has(String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase());
@@ -45,13 +49,22 @@ export function effectiveSchedule() {
 }
 
 // export はテスト (scripts/test-inbound-info.mjs) 用。cron からは下の schedule 経由で呼ぶ
+// 戻り値 { ok, note } は dead-man 監視の ping 用 (runDailyJobWithPing が使う)。
+// ok の基準は「入荷予定 CSV を取得できたか」— 現場が使う値札CSV/PDFの前提になるステップ。
 export async function runDailyJob() {
+  const notes = [];
   try {
     const r = syncNewProducts();
-    if (!r.ok) console.warn(`[inbound-info] sync skipped: ${r.error}`);
-    else console.log(`[inbound-info] sync done: inserted=${r.inserted} (mirror_products=${r.mirror_products})`);
+    if (!r.ok) {
+      console.warn(`[inbound-info] sync skipped: ${r.error}`);
+      notes.push(`新商品skip(${r.error})`);
+    } else {
+      console.log(`[inbound-info] sync done: inserted=${r.inserted} (mirror_products=${r.mirror_products})`);
+      notes.push(`新商品=${r.inserted}`);
+    }
   } catch (e) {
     console.error('[inbound-info] sync failed:', e.message);
+    notes.push(`新商品失敗(${e.message})`);
   }
   // ②③ 入荷予定 (nefuda.csv) の取得 + 値札印刷用CSV (nefudaprint.csv) の出力。
   // ③ は ② と同じダウンロード結果から同一ロック内で作られる (nefuda-fetch.js)。
@@ -60,9 +73,14 @@ export async function runDailyJob() {
   try {
     const s = await refreshNefudaSchedule('cron');
     // stale_file = 別経路がより新しいCSVを反映済み = DBの中身は最新なので PDF は出してよい
-    if (!s.ok) console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
-    else console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
-      + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+    if (!s.ok) {
+      console.warn(`[inbound-info] nefuda skipped: ${s.error} (反映済みの方が新しい)`);
+      notes.push(`nefuda skip(${s.error})`);
+    } else {
+      console.log(`[inbound-info] nefuda done: rows=${s.schedule_rows} added_to_master=${s.added_to_master}`
+        + (s.not_in_master.length ? ` not_in_master=${s.not_in_master.join(',')}` : ''));
+      notes.push(`nefuda=${s.schedule_rows}行`);
+    }
     const np = s.nefuda_print;
     if (np?.skipped) console.log(`[inbound-info] nefudaprint skipped (${np.skipped})`);
     else if (np?.ok) console.log(`[inbound-info] nefudaprint ${np.action}: ${np.filename}`
@@ -81,19 +99,37 @@ export async function runDailyJob() {
   //   代わりに失敗として記録し、画面に理由を出す (手動ボタンなら意図的に出せる)。
   if (!getJobSettings().pdf_enabled) {
     console.log('[inbound-info] pdf export skipped (画面設定で無効)');
-    return;
+    notes.push('PDF無効');
+    return { ok: !csvError, note: notes.join(' ') };
   }
   if (csvError) {
     const msg = `入荷予定(nefuda.csv)の取得に失敗したため、PDFは更新していません (Drive上のPDFは前回のまま): ${csvError}`;
     savePdfState({ ok: false, error: msg, filename: PDF_FILENAME(), user: 'cron' });
     console.warn(`[inbound-info] pdf export skipped: ${msg}`);
-    return;
+    return { ok: false, note: notes.join(' ') };
   }
   try {
     const p = await exportSchedulePdfToDrive('cron');
     console.log(`[inbound-info] pdf ${p.action}: ${p.filename} rows=${p.rows} bytes=${p.bytes}`);
+    notes.push(`PDF=${p.rows}行`);
   } catch (e) {
     console.error('[inbound-info] pdf export failed:', e.message);
+    notes.push(`PDF失敗(${e.message})`);
+    // PDF は現場が印刷する成果物なので、ここで失敗した日は ok にしない
+    return { ok: false, note: notes.join(' ') };
+  }
+  return { ok: true, note: notes.join(' ') };
+}
+
+/** cron から呼ぶ入口。本体の結果を dead-man 監視へ報告する (jobs-registry: inbound-info-daily) */
+async function runDailyJobWithPing() {
+  try {
+    const r = await runDailyJob();
+    pingJob('inbound-info-daily', r?.ok ? 'ok' : 'fail', r?.note);
+  } catch (e) {
+    // runDailyJob は内部で握り潰す作りだが、想定外の例外でも ping だけは残す
+    console.error('[inbound-info] daily job failed:', e.message);
+    pingJob('inbound-info-daily', 'fail', e.message);
   }
 }
 
@@ -122,6 +158,15 @@ export function applyInboundInfoSchedule() {
     console.log('[inbound-info] cron disabled (INBOUND_INFO_SYNC_ENABLED)');
     return { started: false, expr: null, source: null, reason: 'disabled_by_env' };
   }
+  // ⚠ Render 限定。miniPC も同じ server.js を動かすため、無条件だと同じ日次処理
+  //   (nefuda.csv 取得 → 値札CSV → 入荷予定PDF を Drive へ) が2箇所から走る。
+  //   miniPC 側は mirror_products も持たないので、書き込む内容も本番と揃わない。
+  //   意図的に miniPC で動かす場合だけ INBOUND_INFO_SYNC_ENABLED=true を明示する。
+  if (!isRender() && !FORCE_ON.has(String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase())) {
+    disposeOld();
+    console.log('[inbound-info] cron skipped (非Render環境。動かすなら INBOUND_INFO_SYNC_ENABLED=true)');
+    return { started: false, expr: null, source: null, reason: 'not_render' };
+  }
   // 先に式を検証してから旧タスクを破棄する。env に不正な cron 式が入っていた場合に、
   // 稼働中の予約まで失って「何も動かない」状態になるのを避ける (Codex pdf-R1 Medium)
   const { expr, source, time } = effectiveSchedule();
@@ -135,7 +180,7 @@ export function applyInboundInfoSchedule() {
   // ミラー同期完了前に走り得る)
   let next;
   try {
-    next = cron.schedule(expr, runDailyJob, { timezone: 'Asia/Tokyo' });
+    next = cron.schedule(expr, runDailyJobWithPing, { timezone: 'Asia/Tokyo' });
   } catch (e) {
     console.error(`[inbound-info] cron の登録に失敗 (${expr}): ${e.message} — 既存の予約を維持します`);
     return { started: !!task, expr, source, reason: 'schedule_failed' };

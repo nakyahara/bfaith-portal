@@ -15,6 +15,7 @@ import { loadDimMall } from '../../lib/dim-mall.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pingJob } from '../jobs-monitor/ping-local.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -816,8 +817,11 @@ function runMgmtAutoSyncSafely(label) {
   try {
     const r = runMgmtAutoSync(getMirrorDB());
     console.log(`[mgmt-auto-sync] ${label}: ${r.synced}ヶ月同期 / ${r.refreshed}ヶ月再計算`);
+    // dead-man 監視 (jobs-registry: mgmt-auto-sync)
+    pingJob('mgmt-auto-sync', 'ok', `${label}: ${r.synced}ヶ月同期/${r.refreshed}ヶ月再計算`);
   } catch (e) {
     console.error(`[mgmt-auto-sync] ${label} 失敗:`, e.message);
+    pingJob('mgmt-auto-sync', 'fail', e.message);
   } finally {
     _mgmtAutoSyncRunning = false;
   }

@@ -18,6 +18,8 @@ import { createHash, randomUUID } from 'crypto';
 import iconv from 'iconv-lite';
 import { getDB } from './db.js';
 import { getSetting, audit, jstToday, isYmd } from './ledger.js';
+import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -588,24 +590,42 @@ export async function dispatchDueEmailJobs() {
       AND ((scheduled_at IS NOT NULL AND scheduled_at <= ?) OR (scheduled_at IS NULL AND created_at <= ?))`)
     .all(now, orphanBefore);
   let processed = 0;
+  let failed = 0;
   for (const j of due) {
     try { await processEmailJob(j.id); processed++; }
-    catch (e) { console.error(`[po-email] ジョブ #${j.id} の処理に失敗:`, e.message); }
+    catch (e) { failed++; console.error(`[po-email] ジョブ #${j.id} の処理に失敗:`, e.message); }
   }
-  return { due: due.length, processed };
+  return { due: due.length, processed, failed };
 }
 
 let dispatcherStarted = false;
 export function startEmailDispatcher() {
   if (dispatcherStarted) return;
+  // ⚠ Render 限定。miniPC も同じ server.js を動かすため、無条件だと発注メールの
+  //   送信ワーカーが2箇所で回る (miniPC 側の DB に予約が残っていれば実送信し得る)。
+  if (!isRender()) {
+    console.log('[po-email] 非Render環境のためディスパッチャを起動しない');
+    return;
+  }
   dispatcherStarted = true;
   let consecutiveErrors = 0;
   const tick = async () => {
     try {
-      await dispatchDueEmailJobs();
+      const r = await dispatchDueEmailJobs();
       consecutiveErrors = 0;
+      // dead-man 監視 (jobs-registry: po-email-dispatcher)。
+      // 見たいのは「予約メールが実際に送られているか」。ループが回っていても個々の送信が
+      // 全部失敗していれば業務は止まっているので、失敗があった周期は生存として報告しない
+      // (processEmailJob の例外はジョブ単位で握り潰されるため、ここで拾わないと緑のままになる)。
+      // 60秒ごとに毎回打つ必要はないため1時間に1回へ間引く。
+      if (r.failed > 0) {
+        console.error(`[po-email] ${r.failed}/${r.due} 件の送信に失敗 (生存報告を保留)`);
+      } else {
+        pingJobThrottled('po-email-dispatcher', `直近: due=${r.due} 処理=${r.processed}`);
+      }
     } catch (e) {
       // 失敗の握り潰しは運用検知を殺す: ログを残し、連続失敗は目立たせる
+      // (ここで ping を打たない = 失敗が続けば dead-man 側で締切超過として現れる)
       consecutiveErrors++;
       console.error(`[po-email] ディスパッチャ失敗 (${consecutiveErrors}回連続):`, e.message);
     } finally {
