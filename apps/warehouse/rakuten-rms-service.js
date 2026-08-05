@@ -663,12 +663,12 @@ router.post('/cabinet/folder-ensure', requireWrite, rateLimitMiddleware('rakuten
       });
     }
 
-    // 無ければ作成
+    // 無ければ作成。トップ直下は upperFolderId を送らない
+    // (2026-08-05 実測: <upperFolderId>0</upperFolderId> は 3001 Input Parameter Error)
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <request><folderInsertRequest><folder>
 <folderName>${xmlEscape(folderName)}</folderName>
 <directoryName>${xmlEscape(directoryName)}</directoryName>
-<upperFolderId>0</upperFolderId>
 </folder></folderInsertRequest></request>`;
     const ins = await rakutenRequest({
       path: '/es/1.0/cabinet/folder/insert', method: 'POST',
