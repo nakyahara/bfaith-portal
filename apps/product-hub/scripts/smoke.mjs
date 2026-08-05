@@ -857,7 +857,10 @@ db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 
 built = listing.buildItemPayload(db, rkId);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
 const pl = built.payload;
-check('payload: hideItem=true 固定 (非公開登録のみ)', pl.hideItem === true);
+check('payload: hideItem=false (公開で登録 — 2026-08-05 中原さん指示)', pl.hideItem === false);
+check('payload: 商品番号 = 商品コード', pl.itemNumber === 'rk-smoke-1');
+check('payload: システム連携用SKU番号 = 商品コード',
+  pl.variants['rk-smoke-1'].merchantDefinedSkuId === 'rk-smoke-1');
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
 // 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
@@ -1747,7 +1750,7 @@ check('draft_rakuten に反映状態の列がある (冪等ALTER)',
   [...rkColsNow].join(','));
 const listing2 = await import('../services/rakuten-listing.js');
 check('syncShopCategoriesToRms がエクスポートされている', typeof listing2.syncShopCategoriesToRms === 'function');
-// 未登録ドラフトは反映できない (先に「非公開で登録」が必要)
+// 未登録ドラフトは反映できない (先に「楽天に登録」が必要)
 const unreg = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
 check('未登録ドラフトの棚反映は拒否される',
   unreg.ok === false && String(unreg.error).includes('登録した商品だけ'), JSON.stringify(unreg));

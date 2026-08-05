@@ -4,8 +4,8 @@
  * スコープ (中原さん決定):
  *   - ジャンルID・商品属性は**手入力** (雛形方式は採らない)
  *   - 画像は Drive → R-Cabinet 自動転送
- *   - 登録は**倉庫指定 (非公開) のみ**。公開は人が RMS 画面で行う
- *     (miniPC 側 route が hideItem=true を強制するので、ここで細工しても公開はできない)
+ *   - 登録は**公開状態で行う** (2026-08-05 中原さん指示。在庫0で登録するので売れることはなく、
+ *     在庫は NE 連携が入れる)。〜2026-08-05 は非公開登録→アプリの公開ボタンの二段階だった
  *   - まずは**単品ページのみ** (バリエーションページの variants/selector 構成は P3.5)
  *
  * 経路: Render (この service) → miniPC /service-api/rakuten-rms/* (Cloudflare Tunnel)。
@@ -755,7 +755,7 @@ export function buildItemPayload(db, draftId) {
   // 辞書キャッシュがある場合だけ検証する (無ければ RMS が最終検証する)。
   // genre_id をキーに引くので、ジャンルを変えた直後は辞書未取得 = 検証スキップになる
   // 鮮度 24h 以内の辞書だけ検証に使う。古い/無い場合は検証スキップ (RMS が最終検証)。
-  // 登録経路 (registerHidden/preview) は事前に fetchGenreAttributes で鮮度を回復させている
+  // 登録経路 (registerItem/preview) は事前に fetchGenreAttributes で鮮度を回復させている
   const genreDict = (rk.genre_id && /^\d+$/.test(String(rk.genre_id).trim()))
     ? getCachedGenreAttributes(db, String(rk.genre_id).trim(), { maxAgeMs: GENRE_CACHE_TTL_MS })
     : null;
@@ -840,11 +840,15 @@ export function buildItemPayload(db, draftId) {
 
   const payload = {
     title,
+    // 商品番号 = 商品コード (2026-08-05 中原さん指示)。バリエーションページ (P3.5) でも代表商品コードを入れる
+    itemNumber: String(draft.ne_code).trim(),
     ...(ai.desc_catch ? { tagline: String(ai.desc_catch).trim() } : {}),
     productDescription: { pc: pcHtml || title, ...(spHtml ? { sp: spHtml } : {}) },
     ...(salesHtml ? { salesDescription: salesHtml } : {}),
     genreId: String(rk.genre_id).trim(),
-    hideItem: true, // 登録は常に非公開。公開はアプリの「公開」ボタン (setItemVisibility) で行う
+    // 公開で登録 (2026-08-05 中原さん指示)。在庫0のまま公開 = 売り場には「売り切れ」で載り、
+    // 在庫は NE 連携が入れる。miniPC 側 route も hideItem=false を透過する (それ以前は true を強制)
+    hideItem: false,
     itemType: 'NORMAL',
     // 商品画像の末尾に店舗共通バナー (配送方法バナー + 共通3枚) を自動追加
     images: [
@@ -855,6 +859,8 @@ export function buildItemPayload(db, draftId) {
     ...(payment ? { payment } : {}),
     variants: {
       [draft.ne_code]: {
+        // システム連携用SKU番号 = 商品コード (2026-08-05 中原さん指示。NE との SKU 突合キー)
+        merchantDefinedSkuId: String(draft.ne_code).trim(),
         standardPrice: draft.price,
         // カタログID免除理由 (2026-08-05 平串の IE0429 で実測確定):
         //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=当店オリジナル商品
@@ -884,10 +890,11 @@ export function extractRmsErrors(data) {
 }
 
 /**
- * 非公開 (倉庫指定) で楽天に登録する。
+ * 楽天に公開状態で登録する (2026-08-05 中原さん指示。それ以前は非公開登録→公開ボタンの二段階)。
+ * 在庫0で登録するので公開でも売れない (在庫は NE 連携が入れる)。
  * 既存商品の上書きは miniPC 側が 409 で拒否する (稼働中ページを潰さない)。
  */
-export async function registerHidden(draftId, { actor = null } = {}) {
+export async function registerItem(draftId, { actor = null } = {}) {
   const db = getDB();
   // 登録直前に辞書の鮮度を回復する (24h キャッシュ内なら通信なし)。
   // 失敗しても登録は止めない — 辞書が無ければ検証スキップで RMS が最終検証する
@@ -902,18 +909,21 @@ export async function registerHidden(draftId, { actor = null } = {}) {
   const r = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`, {
     method: 'PUT', body: built.payload,
   });
+  // 公開登録なので published_at も登録時刻で埋める (公開/非公開ボタンの表示状態と整合させる)
   const saveResult = db.prepare(`
-    INSERT INTO draft_rakuten (draft_id, registered_at, last_error)
-    VALUES (?, ?, ?)
+    INSERT INTO draft_rakuten (draft_id, registered_at, published_at, last_error)
+    VALUES (?, ?, ?, ?)
     ON CONFLICT(draft_id) DO UPDATE SET
       registered_at = COALESCE(excluded.registered_at, draft_rakuten.registered_at),
+      published_at = COALESCE(excluded.published_at, draft_rakuten.published_at),
       last_error = excluded.last_error,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
   `);
 
   if (r.status === 201 || r.status === 200) {
-    saveResult.run(draftId, new Date().toISOString(), null);
-    logEvent(db, draftId, 'rakuten_registered_hidden', mn, actor);
+    const now = new Date().toISOString();
+    saveResult.run(draftId, now, now, null);
+    logEvent(db, draftId, 'rakuten_registered', mn, actor);
     // approved からの登録なら「楽天出品済み」へ進める (他ステータスからは変えない)
     const d = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draftId);
     if (d?.status === 'approved') {
@@ -932,7 +942,7 @@ export async function registerHidden(draftId, { actor = null } = {}) {
   }
 
   const errText = r.data?.message || extractRmsErrors(r.data) || `HTTP ${r.status}`;
-  saveResult.run(draftId, null, String(errText).slice(0, 1500));
+  saveResult.run(draftId, null, null, String(errText).slice(0, 1500));
   logEvent(db, draftId, 'rakuten_register_failed', String(errText).slice(0, 500), actor);
   return { ok: false, status: r.status, error: errText };
 }
@@ -954,7 +964,7 @@ export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   if (!rk?.registered_at) {
     // 未登録は「状態として自明」(画面に登録済みバッジが出ない) ので error 欄には残さない
-    return { ok: false, error: 'このアプリから楽天に登録した商品だけ棚を反映できます (先に「非公開で登録」)' };
+    return { ok: false, error: 'このアプリから楽天に登録した商品だけ棚を反映できます (先に「楽天に登録」)' };
   }
   // どの失敗経路でも理由を残す (Codex R1 medium: リロードすると原因が消えていた)
   const fail = (msg, extra = {}) => {
@@ -1054,7 +1064,7 @@ export async function setItemVisibility(draftId, { hide, actor = null } = {}) {
   if (!draft) return { ok: false, error: 'draft_not_found' };
   const rk = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   if (!rk?.registered_at) {
-    return { ok: false, error: 'このアプリから楽天に登録した商品だけ公開切替できます (先に「非公開で登録」)' };
+    return { ok: false, error: 'このアプリから楽天に登録した商品だけ公開切替できます (先に「楽天に登録」)' };
   }
   const mn = String(draft.ne_code).trim().toLowerCase();
   const r = await callWarehouse(

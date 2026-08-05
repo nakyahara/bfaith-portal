@@ -26,7 +26,7 @@ import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariati
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import {
-  transferImagesToCabinet, buildItemPayload, registerHidden, parseAttributes,
+  transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
@@ -1053,13 +1053,13 @@ router.get('/api/drafts/:id/rakuten/preview', async (req, res) => {
   if (!built.ok) return res.json({ ok: false, reasons: built.reasons });
   res.json({
     ok: true, manageNumber: String(draft.ne_code).toLowerCase(), payload: built.payload,
-    // 店舗内カテゴリは RMS payload に含まれない (Category API が別 = miniPC 対応待ち)。
-    // 公開時に RMS 画面で設定するものとしてプレビューに添える
+    // 店舗内カテゴリは RMS payload に含まれない (item-mappings API で登録成功後に自動反映)。
+    // プレビューには参考情報として添える
     shopCategories: selectedShopCategoryPaths(db, draft.id),
   });
 });
 
-// 非公開 (倉庫指定) で楽天に登録。公開は人が RMS 画面で行う
+// 楽天に公開状態で登録 (2026-08-05〜。在庫0なので公開でも売れない)
 router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -1067,7 +1067,7 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'confirm が必要です' });
   }
   try {
-    const r = await registerHidden(draft.id, { actor: actorOf(req) });
+    const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
     res.json(r);
   } catch (e) {
