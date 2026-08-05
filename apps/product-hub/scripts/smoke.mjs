@@ -974,8 +974,8 @@ check('payload: 型番があれば value で送る',
 
 // ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
 check('taxRateToPayment: 8% → payment.taxRate 0.08', listing.taxRateToPayment('8%')?.taxRate === 0.08);
-check('taxRateToPayment: 10%/未設定/変値は送らない (店舗デフォルト)',
-  listing.taxRateToPayment('10%') === null && listing.taxRateToPayment(null) === null && listing.taxRateToPayment('9.6') === null);
+check('taxRateToPayment: 10%/未設定も 0.1 を明示して送る (2026-08-05 平串実測: 送らないと税率未設定になる)',
+  listing.taxRateToPayment('10%')?.taxRate === 0.1 && listing.taxRateToPayment(null)?.taxRate === 0.1);
 
 check('isValidGtin: 正しいJAN-13を通す', listing.isValidGtin('4901234567894') === true);
 check('isValidGtin: チェックデジット不一致/桁数違い/非数字を弾く',
@@ -1034,7 +1034,8 @@ db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id LIKE '
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
 
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
-check('payload: 10% は payment を送らない', !('payment' in listing.buildItemPayload(db, rkId).payload));
+check('payload: 10% も payment.taxRate 0.1 を明示して送る (2026-08-05〜)',
+  listing.buildItemPayload(db, rkId).payload?.payment?.taxRate === 0.1);
 
 // 白抜き背景: 未転送なら理由を返し、転送済みなら whiteBgImage 別枠 (images には入れない)
 db.prepare(`UPDATE draft_rakuten SET white_bg_drive_file_id = 'gwhite', white_bg_drive_url = 'https://drive.google.com/file/d/gwhite/view' WHERE draft_id = ?`).run(rkId);

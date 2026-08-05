@@ -518,13 +518,14 @@ export const SHIPPING_METHOD_GROUPS = {
 
 /**
  * draft_yahoo.tax_rate ('8%' / '10%' の文字列) → RMS payment.taxRate。
- * RYS 実測 (2026-06-28): B-Faith 店舗は default 10% で、軽減税率 8% の商品だけ明示する運用。
- * → 8% のときだけ payment を送り、10%・未設定・想定外値は送らない (店舗デフォルトに任せる)
+ * 2026-08-05 平串の実登録で「送らない = 店舗デフォルト」のはずが RMS の消費税率が
+ * 未設定のままだった (中原さん指摘) → **常に明示して送る**。
+ * 8% は 0.08、それ以外 (10%・空欄) は 0.1。不正値は buildItemPayload の検証で事前に止まる
  */
 export function taxRateToPayment(taxRateText) {
   const m = String(taxRateText || '').trim().match(/^(\d+)\s*%?$/);
   if (m && Number(m[1]) === 8) return { taxRate: 0.08 };
-  return null;
+  return { taxRate: 0.1 };
 }
 
 /**
@@ -862,7 +863,8 @@ export function buildItemPayload(db, draftId) {
       ...trailingBanners.map((loc) => ({ type: 'CABINET', location: loc })),
     ],
     ...(whiteBg ? { whiteBgImage: { type: 'CABINET', location: whiteBg.cabinet_location } } : {}),
-    ...(payment ? { payment } : {}),
+    payment, // 消費税率は常に明示 (2026-08-05〜)
+
     variants: {
       [productCode]: {
         // システム連携用SKU番号 = 商品コード (2026-08-05 中原さん指示。NE との SKU 突合キー)
@@ -912,31 +914,40 @@ export async function registerItem(draftId, { actor = null } = {}) {
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
 
-  let r;
+  // PUT の「結果不明」をそのまま失敗にすると、実は登録が通っていた場合に公開ページの孤児
+  // (アプリは未登録扱い・再実行は 409) になる (Codex R1〜R3 High — 公開直行化で影響が大きい)。
+  // 結果不明 = transport 例外 / warehouse が RMS PUT を試みた後の 5xx (RMS_API_ERROR や
+  // ゲートウェイの生 502)。GET で実在を照合して成功/失敗を確定させる。
+  // PUT が RMS に届く前に確定失敗したと分かる 5xx (既存確認failや書込ゲートOFF) は照合不要
+  const itemPath = `/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`;
+  let r = null;
+  let transportError = null;
   try {
-    r = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`, {
-      method: 'PUT', body: built.payload,
-    });
-  } catch (e) {
-    // タイムアウト等の「結果不明」をそのまま失敗にすると、実は登録が通っていた場合に
-    // 公開ページの孤児 (アプリは未登録扱い・再実行は 409) になる (Codex R1 High —
-    // 公開直行化で従来の非公開孤児より影響が大きい)。GET で実在を照合して確定させる
+    r = await callWarehouse(itemPath, { method: 'PUT', body: built.payload });
+  } catch (e) { transportError = e; }
+
+  const definitiveFail = new Set(['RMS_PRECHECK_FAILED', 'RMS_WRITE_DISABLED']);
+  const outcomeUnknown = r === null || (r.status >= 500 && !definitiveFail.has(r.data?.error));
+  if (outcomeUnknown) {
     let probe = null;
-    try { probe = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`); } catch (_) { /* 照合も不通 */ }
+    try { probe = await callWarehouse(itemPath); } catch (_) { /* 照合も不通 */ }
     if (probe?.status === 404) {
       // 直後の 404 は失敗を確定しない (Codex R2 High): 元の PUT が warehouse 側でまだ処理中なら
       // この後に商品が作られ得る。warehouse→RMS のタイムアウト上限 (90s) を待てば PUT は必ず
       // 決着しているので、そこで再照合した結果だけを信じる (レアな経路なので待ち時間は許容)
       await new Promise((resolve) => setTimeout(resolve, 90_000));
       probe = null;
-      try { probe = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`); } catch (_) { /* 照合も不通 */ }
+      try { probe = await callWarehouse(itemPath); } catch (_) { /* 照合も不通 */ }
     }
     if (probe?.status === 200) {
       r = { status: 200, data: probe.data }; // 登録自体は通っていた → 成功として記録を続行
     } else if (probe?.status === 404) {
-      throw e; // 登録されていないことを確認できた → 元のエラーで失敗扱い (再実行で作り直せる)
+      // 登録されていないことを確認できた → 失敗扱い (再実行で作り直せる)。
+      // warehouse の 5xx レスポンスがあればそのまま下の失敗記録へ、transport 例外なら投げ直す
+      if (r === null) throw transportError;
     } else {
-      throw new Error(`楽天への登録結果が確認できませんでした (${String(e.message || e).slice(0, 120)})。RMS で商品管理番号 ${mn} の有無を確認してから再実行してください`);
+      const cause = transportError ? String(transportError.message || transportError) : `HTTP ${r?.status}`;
+      throw new Error(`楽天への登録結果が確認できませんでした (${String(cause).slice(0, 120)})。RMS で商品管理番号 ${mn} の有無を確認してから再実行してください`);
     }
   }
   // 公開登録なので published_at も登録時刻で埋める (公開/非公開ボタンの表示状態と整合させる)
