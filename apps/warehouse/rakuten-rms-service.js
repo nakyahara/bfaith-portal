@@ -632,20 +632,22 @@ router.post('/cabinet/folder-ensure', requireWrite, rateLimitMiddleware('rakuten
     }
 
     // 既存フォルダを探す (最大10ページ = 1000フォルダまで走査)。
-    // 検索失敗や走査上限到達は「存在しない」とみなさず fail-closed で返す
+    // 一覧は folders/get (2026-08-05 実測: folders/search は 405 NotApiFunction で存在しない。
+    // 応答は cabinetFoldersGetResult、識別は DirectoryName ではなく FolderPath = "/<directoryName>")
+    // 取得失敗や走査上限到達は「存在しない」とみなさず fail-closed で返す
     // (Codex medium: 見落として同名フォルダを二重作成しない)
     let searched = 0;
     let totalFolders = null;
     for (let offset = 1; offset <= 10; offset++) {
-      const r = await rakutenRequest({ path: `/es/1.0/cabinet/folders/search?offset=${offset}&limit=100` });
+      const r = await rakutenRequest({ path: `/es/1.0/cabinet/folders/get?offset=${offset}&limit=100` });
       if (r.status !== 200) {
-        return errorResponse(res, { status: 502, error: 'CABINET_SEARCH_FAILED', message: `folder search 失敗 (HTTP ${r.status})`, requestId: req.requestId });
+        return errorResponse(res, { status: 502, error: 'CABINET_SEARCH_FAILED', message: `folders/get 失敗 (HTTP ${r.status})`, requestId: req.requestId });
       }
       const parsed = await parseCabinetXml(r.data);
-      const resBlock = parsed?.result?.cabinetFoldersSearchResult;
+      const resBlock = parsed?.result?.cabinetFoldersGetResult;
       let folders = resBlock?.folders?.folder || [];
       if (!Array.isArray(folders)) folders = [folders];
-      const hit = folders.find((f) => String(f?.DirectoryName || '').trim() === directoryName);
+      const hit = folders.find((f) => String(f?.FolderPath || '').trim() === `/${directoryName}`);
       if (hit) {
         return okResponse(res, { folderId: Number(hit.FolderId), directoryName, existed: true });
       }
