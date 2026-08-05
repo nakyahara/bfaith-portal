@@ -34,6 +34,9 @@ export let qoo10DataInitError = null;
 // 楽天レビュー日次集計表も同様 (mall-csv-fetcher P2 PR-A)
 export let rakutenReviewInitError = null;
 
+// 日次出荷サマリ表も同様 (出荷件数の可視化、2026-08-05)
+export let shipmentsDailyInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -44,6 +47,7 @@ export function initMirrorDB() {
   aupayDataInitError = null;
   qoo10DataInitError = null;
   rakutenReviewInitError = null;
+  shipmentsDailyInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -1060,6 +1064,35 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] 楽天レビュー集計表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数、2026-08-05) ───
+  // 元: ミニPC warehouse.db.f_shipments_daily (raw_ne_order_base = NE受注ベースの派生)
+  // 件数の定義は「伝票1件 = 発送1件」。Amazon Easy Ship は delivery_name='AES' で入る。
+  // shop_name / platform は shops マスタを JOIN 済みの値 (mirror 側に shops を持たないため)
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_shipments_daily (
+      ship_date       TEXT NOT NULL CHECK(ship_date GLOB '????-??-??'),
+      shop_code       TEXT NOT NULL,
+      shop_name       TEXT,
+      platform        TEXT,
+      delivery_id     TEXT NOT NULL,
+      delivery_name   TEXT,
+      slips           INTEGER NOT NULL,
+      cancelled_slips INTEGER NOT NULL DEFAULT 0,
+      source_updated_at TEXT,
+      synced_at       TEXT NOT NULL,
+      PRIMARY KEY (ship_date, shop_code, delivery_id)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_msd_date ON mirror_shipments_daily(ship_date)');
+  } catch (e) {
+    shipmentsDailyInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] 日次出荷サマリ表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)

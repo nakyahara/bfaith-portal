@@ -449,7 +449,7 @@ async function main() {
   const rotateResult = runScript('apps/warehouse/rotate-order-logs.js', 'ログローテ', 1800000);
   results.push({ name: 'ログローテ', ...rotateResult });
 
-  // NE API（商品マスタ + セット商品 + 受注7日分）
+  // NE API（商品マスタ + セット商品 + 受注7日分 + 受注ベース14日分）
   const neResult = runScript('apps/warehouse/ne-api.js sync', 'NE API');
   results.push({ name: 'NE', ...neResult });
 
@@ -460,6 +460,18 @@ async function main() {
     results.push({ name: 'NE在庫snapshot', ...snapResult });
   } else {
     console.log('[DailySync] NE API 失敗のため在庫スナップショットをスキップ');
+  }
+
+  // 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数) を再構築。
+  // raw_ne_order_base からの純粋な再集計なので数秒。NE 失敗時は前日の値を残す
+  // (部分取得の raw から作り直すと当日の件数が過少に見える)。
+  // --all で毎回全期間を作り直す: 出荷日が訂正されて再集計窓の外へ動くと、窓を切った
+  // 再構築では移動先の日が更新されず件数がズレる (Codex R1 medium)。全期間でも数秒。
+  if (neResult.success) {
+    const shipDailyResult = runScript('apps/warehouse/rebuild-shipments-daily.js --all', '日次出荷サマリ', 120000);
+    results.push({ name: '出荷サマリ', ...shipDailyResult });
+  } else {
+    console.log('[DailySync] NE API 失敗のため出荷サマリ再構築をスキップ');
   }
 
   // SP-API
