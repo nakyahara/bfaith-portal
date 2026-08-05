@@ -288,11 +288,15 @@ router.post('/inbound-history/sync', rateLimitMiddleware('sp-api'), async (req, 
   okResponse(res, job, 202);
 });
 
-// Render が引き取るためのエクスポート。since は updated_at (JST文字列)。
+// Render が引き取るためのエクスポート。
+// カーソルは (updated_at, shipment_id) の複合。一括取込では同じ秒に何百件も並ぶので、
+// 時刻だけで区切るとページ境界の同秒行が二度と送られない。
 router.get('/sync/inbound-history', dbHandler(async (req, res, db) => {
-  const since = req.query.since || null;
-  const limit = Math.min(Number(req.query.limit) || 3000, 5000);
-  return db.exportInboundRows({ since, limit });
+  const sinceUpdatedAt = req.query.sinceUpdatedAt || null;
+  const since = sinceUpdatedAt
+    ? { updated_at: sinceUpdatedAt, shipment_id: req.query.sinceShipmentId || '' }
+    : null;
+  return db.exportInboundRows({ since, limit: req.query.limit });
 }));
 
 // ミニPC側の取込状況 (Render 画面のヘルスチェック用)

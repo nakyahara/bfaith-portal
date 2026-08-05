@@ -157,6 +157,12 @@ let unrecvRows = [];
 let sortKey = 'key';
 let sortDir = 'desc';
 
+// SKU名・シップメント名はAmazon側/人が付ける文字列。innerHTML に入れる前に必ず通す。
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 function fmt(n) { return (n || 0).toLocaleString('ja-JP'); }
 function jstToday() { return new Date(Date.now() + 9*3600*1000).toISOString().slice(0,10); }
 function jstAgo(d) { return new Date(Date.now() + 9*3600*1000 - d*86400000).toISOString().slice(0,10); }
@@ -224,10 +230,10 @@ function renderStatus(s) {
   if (!s) return;
   const parts = [];
   parts.push(`シップメント <b>${fmt(s.total_shipments)}</b>件`);
-  if (s.date_from) parts.push(`期間 <b>${s.date_from}</b> 〜 <b>${s.date_to}</b>`);
+  if (s.date_from) parts.push(`期間 <b>${esc(s.date_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
   if (s.items_pending > 0) parts.push(`<span style="color:#b45309">明細未取得 ${fmt(s.items_pending)}件</span>`);
   if (s.created_date_missing > 0) parts.push(`<span style="color:#b45309">作成日不明 ${fmt(s.created_date_missing)}件</span>`);
-  if (s.last_synced_at) parts.push(`最終同期 <b>${s.last_synced_at}</b>`);
+  if (s.last_synced_at) parts.push(`最終同期 <b>${esc(s.last_synced_at)}</b>`);
   document.getElementById('syncInfo').innerHTML = parts.join(' ／ ');
 }
 
@@ -255,8 +261,8 @@ function renderSummary() {
   document.getElementById('summaryBody').innerHTML = rows.map(r => {
     const pct = Math.round((r.qty_shipped || 0) / maxQty * 100);
     const dateCell = isDay
-      ? `<span class="drill" onclick="drill('${r.key}')">${r.key}</span>`
-      : r.key;
+      ? `<span class="drill" onclick="drill('${esc(r.key)}')">${esc(r.key)}</span>`
+      : esc(r.key);
     return `<tr>
       <td>${dateCell}</td>
       <td class="num">${fmt(r.shipment_count)}</td>
@@ -265,7 +271,7 @@ function renderSummary() {
       <td class="bar-cell"><div class="bar" style="width:${pct}%"></div><span class="bar-label">&nbsp;</span></td>
       <td class="num">${fmt(r.qty_received)}</td>
       <td class="num ${r.qty_unreceived > 0 ? 'unrecv' : 'muted'}">${fmt(r.qty_unreceived)}</td>
-      <td class="muted" style="font-size:11px;">${r.fcs || ''}</td>
+      <td class="muted" style="font-size:11px;">${esc(r.fcs)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="8" class="muted" style="text-align:center;padding:20px;">データがありません</td></tr>';
 
@@ -309,12 +315,12 @@ function renderUnreceived() {
   else badge.style.display = 'none';
 
   document.getElementById('unrecvBody').innerHTML = unrecvRows.map(r => `<tr>
-    <td>${r.created_date || '<span class="muted">不明</span>'}</td>
-    <td class="num">${r.days_elapsed != null ? r.days_elapsed + '日' : ''}</td>
-    <td style="font-size:11px;">${r.shipment_id}</td>
-    <td>${r.destination_fc || ''}</td>
-    <td style="font-size:11px;">${r.shipment_status || ''}</td>
-    <td>${r.seller_sku}</td>
+    <td>${r.created_date ? esc(r.created_date) : '<span class="muted">不明</span>'}</td>
+    <td class="num">${r.days_elapsed != null ? esc(r.days_elapsed) + '日' : ''}</td>
+    <td style="font-size:11px;">${esc(r.shipment_id)}</td>
+    <td>${esc(r.destination_fc)}</td>
+    <td style="font-size:11px;">${esc(r.shipment_status)}</td>
+    <td>${esc(r.seller_sku)}</td>
     <td class="num">${fmt(r.qty_shipped)}</td>
     <td class="num">${fmt(r.qty_received)}</td>
     <td class="num unrecv">${fmt(r.qty_unreceived)}</td>
@@ -338,18 +344,22 @@ async function drill(date) {
   document.getElementById('drillBody').innerHTML = '<p class="muted">読み込み中…</p>';
   dlg.showModal();
   try {
-    const r = await fetch(API + '/shipments?date=' + encodeURIComponent(date));
+    // キャンセルの扱いはサマリと揃える (揃えないと内訳の合計がサマリと合わない)
+    const q = new URLSearchParams({ date });
+    if (document.getElementById('incCancelled').checked) q.set('includeCancelled', '1');
+    const r = await fetch(API + '/shipments?' + q.toString());
     const d = await r.json();
     const rows = d.data || [];
     document.getElementById('drillBody').innerHTML = `<table class="dt">
       <thead><tr><th>作成時刻</th><th>シップメント</th><th>FC</th><th>状態</th><th>SKU数</th><th>送付</th><th>受領</th><th>未受領</th></tr></thead>
       <tbody>${rows.map(s => {
-        const un = (s.total_shipped || 0) - (s.total_received || 0);
+        // 未受領はサマリと同じ「SKUごとの不足の合計」(過受領のSKUで相殺しない)
+        const un = s.qty_unreceived || 0;
         return `<tr>
-          <td>${(s.created_at || '').slice(11) || ''}</td>
-          <td style="font-size:11px;">${s.shipment_id}<br><span class="muted">${s.shipment_name || ''}</span></td>
-          <td>${s.destination_fc || ''}</td>
-          <td style="font-size:11px;">${s.shipment_status || ''}</td>
+          <td>${esc((s.created_at || '').slice(11))}</td>
+          <td style="font-size:11px;">${esc(s.shipment_id)}<br><span class="muted">${esc(s.shipment_name)}</span></td>
+          <td>${esc(s.destination_fc)}</td>
+          <td style="font-size:11px;">${esc(s.shipment_status)}</td>
           <td class="num">${fmt(s.total_skus)}</td>
           <td class="num">${fmt(s.total_shipped)}</td>
           <td class="num">${fmt(s.total_received)}</td>
@@ -357,7 +367,7 @@ async function drill(date) {
         </tr>`;
       }).join('')}</tbody></table>`;
   } catch (e) {
-    document.getElementById('drillBody').innerHTML = '<p style="color:#b91c1c">取得に失敗: ' + e.message + '</p>';
+    document.getElementById('drillBody').innerHTML = '<p style="color:#b91c1c">取得に失敗: ' + esc(e.message) + '</p>';
   }
 }
 

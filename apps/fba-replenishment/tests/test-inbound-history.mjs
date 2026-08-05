@@ -73,13 +73,14 @@ console.log('\n[2] upsertInboundShipments / replaceInboundItems');
     { SellerSKU: 'sku-9', QuantityShipped: 999, QuantityReceived: 0 },
   ]);
 
-  // 同一SKUが複数行で来てもPK衝突で落ちない
+  // 同一SKUが複数行で来ても落ちない。行を捨てると数量が過少になるので合算する
   const rd = db.replaceInboundItems('FBA_D', [
     { SellerSKU: 'sku-5', QuantityShipped: 3, QuantityReceived: 3 },
     { SellerSKU: 'sku-5', QuantityShipped: 7, QuantityReceived: 7 },
   ]);
-  eq(rd.skus, 1, '重複SKUは1件に畳まれる');
-  eq(rd.shipped, 3, '重複SKUの2行目は無視 (先勝ち)');
+  eq(rd.skus, 1, '重複SKUは1行に畳まれる');
+  eq(rd.shipped, 10, '重複SKUの数量は合算される (3+7)');
+  eq(rd.received, 10, '受領数も合算される');
 
   // 明細の入れ替え: 古い行が残らない
   db.replaceInboundItems('FBA_A', [
@@ -165,13 +166,41 @@ console.log('\n[7] getInboundSyncStatus');
   eq(s.date_to, '2026-07-02', '期間の終了');
 }
 
+// ===== 7b. ドリルダウンがサマリと食い違わないこと =====
+console.log('\n[7b] getInboundShipmentsByDate');
+{
+  const rows = db.getInboundShipmentsByDate('2026-07-01');
+  eq(rows.length, 2, '7/1 は2件');
+  const b = rows.find(r => r.shipment_id === 'FBA_B');
+  eq(b.qty_unreceived, 8, '未受領はサマリと同じ「SKUごとの不足の合計」で返る');
+
+  // キャンセルの扱いをサマリと揃える
+  eq(db.getInboundShipmentsByDate('2026-07-02').length, 0, '既定でキャンセルは出ない');
+  eq(db.getInboundShipmentsByDate('2026-07-02', { includeCancelled: true }).length, 1, 'includeCancelledで出る');
+
+  // 過受領のSKUがあっても、不足しているSKUの分は相殺されない
+  db.upsertInboundShipments([
+    { ShipmentId: 'FBA_E', ShipmentName: 'FBA STA (2026/07/03 08:00)-TPY1', DestinationFulfillmentCenterId: 'TPY1', ShipmentStatus: 'CLOSED' },
+  ]);
+  db.replaceInboundItems('FBA_E', [
+    { SellerSKU: 'sku-a', QuantityShipped: 10, QuantityReceived: 4 },  // 6不足
+    { SellerSKU: 'sku-b', QuantityShipped: 10, QuantityReceived: 16 }, // 6過受領
+  ]);
+  const e = db.getInboundShipmentsByDate('2026-07-03')[0];
+  eq(e.total_shipped - e.total_received, 0, '総数の差は0 (過受領で相殺される)');
+  eq(e.qty_unreceived, 6, 'SKU別の不足は6として残る');
+  const day3 = db.getInboundDailySummary({ from: '2026-07-03', to: '2026-07-03' })[0];
+  eq(day3.qty_unreceived, e.qty_unreceived, 'サマリとドリルダウンの未受領が一致する');
+}
+
 // ===== 8. ミニPC → Render の同期 (export → import) =====
 console.log('\n[8] exportInboundRows / importInboundRows');
 {
   const exported = db.exportInboundRows({});
-  eq(exported.shipments.length, 4, '4シップメントをエクスポート');
+  eq(exported.shipments.length, 5, '5シップメントをエクスポート');
   ok(exported.items.length >= 5, '明細も一緒に出る');
-  eq(exported.has_more, false, '4件ならhas_moreはfalse');
+  eq(exported.has_more, false, '件数がlimit未満ならhas_moreはfalse');
+  ok(!!exported.next_cursor?.updated_at && !!exported.next_cursor?.shipment_id, 'next_cursorは複合キー');
 
   // 別DBに入れ直して同じ集計になるか (Render 側の再現)
   const tmp2 = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-ih2-'));
@@ -180,18 +209,19 @@ console.log('\n[8] exportInboundRows / importInboundRows');
   await db2.initDb();
 
   const imported = db2.importInboundRows(exported);
-  eq(imported.shipments, 4, '4件import');
+  eq(imported.shipments, 5, '5件import');
 
   const src = db.getInboundDailySummary({});
   const dst = db2.getInboundDailySummary({});
   eq(JSON.stringify(dst), JSON.stringify(src), '同期後の日別サマリが一致する');
-  eq(db2.getInboundUnreceived({}).length, 2, '同期後も未受領が一致');
+  eq(db2.getInboundUnreceived({}).length, db.getInboundUnreceived({}).length, '同期後も未受領が一致');
 
-  // カーソル: 同期済みの位置が取れる
-  ok(!!db2.getInboundSyncCursor(), '同期カーソルが取れる');
+  // カーソル: 取り込んだページの末尾がチェックポイントとして保存される
+  const cursor = db2.getInboundSyncCursor();
+  ok(!!cursor?.updated_at && !!cursor?.shipment_id, '同期カーソルは複合キーで取れる');
+  eq(cursor.shipment_id, exported.next_cursor.shipment_id, 'importで渡したnext_cursorが保存される');
 
   // 差分同期: カーソル以降だけ返る
-  const cursor = db2.getInboundSyncCursor();
   const delta = db.exportInboundRows({ since: cursor });
   eq(delta.shipments.length, 0, 'カーソル以降に更新がなければ0件');
 
@@ -199,10 +229,50 @@ console.log('\n[8] exportInboundRows / importInboundRows');
   const paged = db.exportInboundRows({ limit: 2 });
   eq(paged.shipments.length, 2, 'limitで2件に切れる');
   eq(paged.has_more, true, '続きがあればhas_more=true');
-  eq(paged.items.every(i => ['FBA_A', 'FBA_B', 'FBA_C', 'FBA_D'].includes(i.shipment_id)), true,
-     'ページ内の明細だけが返る');
+  const pageIds = new Set(paged.shipments.map(s => s.shipment_id));
+  eq(paged.items.every(i => pageIds.has(i.shipment_id)), true, 'ページ内の明細だけが返る');
+
+  // limit の防御: 負数で「無制限」にならない (SQLite は LIMIT -1 を無制限として扱う)
+  eq(db.exportInboundRows({ limit: -1 }).shipments.length, 1, 'limit=-1 は1件にクランプされる');
+  eq(db.exportInboundRows({ limit: 99999 }).shipments.length, 5, 'limit過大でも全件どまり');
 
   fs.rmSync(tmp2, { recursive: true, force: true });
+}
+
+// ===== 9. 同一 updated_at がページ境界に並んでも取りこぼさない =====
+//   一括取込では秒精度の updated_at が何百件も同じ値になる。
+//   カーソルが時刻だけだと、境界にいる同秒の行が二度と送られない (無言の欠落)。
+console.log('\n[9] 同秒の大量更新でもページングで全件渡る');
+{
+  const many = [];
+  for (let i = 0; i < 25; i++) {
+    many.push({
+      ShipmentId: `FBA_SAME_${String(i).padStart(3, '0')}`,
+      ShipmentName: `FBA STA (2026/07/10 12:00)-TPY1`,
+      DestinationFulfillmentCenterId: 'TPY1',
+      ShipmentStatus: 'CLOSED',
+    });
+  }
+  db.upsertInboundShipments(many); // 同一トランザクション内なので updated_at はほぼ同じ秒
+
+  const sameSec = db.exportInboundRows({ limit: 5000 }).shipments
+    .filter(s => s.shipment_id.startsWith('FBA_SAME_'));
+  const distinctTimes = new Set(sameSec.map(s => s.updated_at));
+  ok(sameSec.length === 25, '25件が入っている');
+  ok(distinctTimes.size <= 2, `updated_at がほぼ同一 (${distinctTimes.size}種類) — 取りこぼしが起きうる条件`);
+
+  // 3件ずつページングして全件届くか
+  const seen = new Set();
+  let cur = null;
+  for (let page = 0; page < 50; page++) {
+    const res = db.exportInboundRows({ since: cur, limit: 3 });
+    if (res.shipments.length === 0) break;
+    for (const s of res.shipments) seen.add(s.shipment_id);
+    if (!res.has_more) break;
+    cur = res.next_cursor;
+  }
+  const total = db.exportInboundRows({ limit: 5000 }).shipments.length;
+  eq(seen.size, total, `3件ずつページングして全${total}件を取得できる`);
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

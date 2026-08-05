@@ -1764,6 +1764,8 @@ router.post('/api/inbound-history/sync', async (req, res) => {
  * ミニPCから Render の fba.db へ引き取り。updated_at をカーソルに差分だけ取る。
  * 画面の「取込」ボタンと 06:00 の cron の両方から呼ぶ。
  */
+const PULL_MAX_PAGES = 30;
+
 async function pullInboundFromMiniPC(full = false) {
   let cursor = full ? null : getInboundSyncCursor();
   let shipments = 0;
@@ -1771,9 +1773,16 @@ async function pullInboundFromMiniPC(full = false) {
   let pages = 0;
 
   // 1ページ3000件。2年分でも数ページで終わる。上限は暴走防止。
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i <= PULL_MAX_PAGES; i++) {
+    if (i === PULL_MAX_PAGES) {
+      // 打ち切って正常終了すると「全部取れた」ように見えてしまう。取りこぼしは失敗として扱う。
+      throw new Error(`引き取りがページ上限 ${PULL_MAX_PAGES} に到達しました (${shipments}件まで反映済み)。もう一度実行してください`);
+    }
     const q = new URLSearchParams({ limit: '3000' });
-    if (cursor) q.set('since', cursor);
+    if (cursor?.updated_at) {
+      q.set('sinceUpdatedAt', cursor.updated_at);
+      q.set('sinceShipmentId', cursor.shipment_id || '');
+    }
     const data = await callMiniPC(`/sync/inbound-history?${q.toString()}`, { timeout: 120000 });
     if (!data?.ok) {
       throw new Error('ミニPCからの取得に失敗: ' + (data?.message || JSON.stringify(data)));
@@ -1781,16 +1790,20 @@ async function pullInboundFromMiniPC(full = false) {
     const batch = data.shipments || [];
     if (batch.length === 0) break;
 
-    const saved = importInboundRows({ shipments: batch, items: data.items || [] });
+    // next_cursor も一緒に渡す。取り込みが成功したときだけチェックポイントが進む。
+    const saved = importInboundRows({ shipments: batch, items: data.items || [], next_cursor: data.next_cursor });
     shipments += saved.shipments;
     items += saved.items;
     pages += 1;
 
     if (!data.has_more) break;
-    const nextCursor = batch[batch.length - 1]?.updated_at;
-    // カーソルが進まない場合は同じページを取り続けてしまうので打ち切る
-    if (!nextCursor || nextCursor === cursor) break;
-    cursor = nextCursor;
+    const next = data.next_cursor;
+    // カーソルが進まないのに続きがある = 取りこぼしが起きている。黙って止まらせない。
+    if (!next?.updated_at ||
+        (cursor && next.updated_at === cursor.updated_at && next.shipment_id === cursor.shipment_id)) {
+      throw new Error('同期カーソルが進みませんでした。取りこぼしの恐れがあるため中断します');
+    }
+    cursor = next;
   }
   return { shipments, items, pages, status: getInboundSyncStatus() };
 }
@@ -1857,10 +1870,11 @@ router.get('/api/inbound-history/summary', (req, res) => {
 });
 
 // 指定日のシップメント一覧 (日別サマリのドリルダウン)
+// includeCancelled はサマリ側と揃える (揃えないと内訳の合計がサマリと合わない)
 router.get('/api/inbound-history/shipments', (req, res) => {
   const date = req.query.date;
   if (!date) return res.status(400).json({ error: 'date が必要です' });
-  const shipments = getInboundShipmentsByDate(date);
+  const shipments = getInboundShipmentsByDate(date, { includeCancelled: req.query.includeCancelled === '1' });
   res.json({ date, count: shipments.length, data: shipments });
 });
 

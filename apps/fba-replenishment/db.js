@@ -725,33 +725,49 @@ export function upsertInboundShipments(shipments) {
  * 明細は「消えたSKU」も反映したいので DELETE→INSERT (件数が数十行なので安全)。
  */
 export function replaceInboundItems(shipmentId, items) {
-  db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [shipmentId]);
-  let shipped = 0;
-  let received = 0;
-  const seen = new Set();
+  // 同一SKUが複数行で返ることがある (prep違いなど)。PKは (shipment_id, seller_sku) なので
+  // 行を捨てるのではなく数量を合算する。捨てると送付数・未受領が過少になる。
+  const merged = new Map();
   for (const it of items) {
     const sku = it.SellerSKU || '';
-    if (!sku || seen.has(sku)) continue; // 同一SKUが複数行で来るケースの保険 (PK衝突回避)
-    seen.add(sku);
-    const qs = Number(it.QuantityShipped) || 0;
-    const qr = Number(it.QuantityReceived) || 0;
-    shipped += qs;
-    received += qr;
-    db.run(
-      `INSERT INTO fba_inbound_shipment_items
-         (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [shipmentId, sku, it.FulfillmentNetworkSKU || '', qs, qr, Number(it.QuantityInCase) || 0]
-    );
+    if (!sku) continue;
+    const cur = merged.get(sku) || { fnsku: '', shipped: 0, received: 0, inCase: 0 };
+    cur.fnsku = cur.fnsku || it.FulfillmentNetworkSKU || '';
+    cur.shipped += Number(it.QuantityShipped) || 0;
+    cur.received += Number(it.QuantityReceived) || 0;
+    cur.inCase += Number(it.QuantityInCase) || 0;
+    merged.set(sku, cur);
   }
-  db.run(
-    `UPDATE fba_inbound_shipments
-        SET total_skus = ?, total_shipped = ?, total_received = ?,
-            items_synced_at = datetime('now','+9 hours'), updated_at = datetime('now','+9 hours')
-      WHERE shipment_id = ?`,
-    [seen.size, shipped, received, shipmentId]
-  );
-  return { skus: seen.size, shipped, received };
+
+  let shipped = 0;
+  let received = 0;
+  // DELETE → INSERT → 親更新 は不可分。途中で落ちると明細だけ消えた状態が残るため。
+  db.run('BEGIN TRANSACTION');
+  try {
+    db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [shipmentId]);
+    for (const [sku, v] of merged) {
+      shipped += v.shipped;
+      received += v.received;
+      db.run(
+        `INSERT INTO fba_inbound_shipment_items
+           (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [shipmentId, sku, v.fnsku, v.shipped, v.received, v.inCase]
+      );
+    }
+    db.run(
+      `UPDATE fba_inbound_shipments
+          SET total_skus = ?, total_shipped = ?, total_received = ?,
+              items_synced_at = datetime('now','+9 hours'), updated_at = datetime('now','+9 hours')
+        WHERE shipment_id = ?`,
+      [merged.size, shipped, received, shipmentId]
+    );
+    db.run('COMMIT');
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
+  }
+  return { skus: merged.size, shipped, received };
 }
 
 /**
@@ -834,13 +850,25 @@ export function getInboundMonthlySummary(opts = {}) {
   );
 }
 
-/** 指定日に作成したシップメントの一覧 (日別サマリのドリルダウン)。 */
-export function getInboundShipmentsByDate(createdDate) {
+/**
+ * 指定日に作成したシップメントの一覧 (日別サマリのドリルダウン)。
+ * サマリと数字が食い違わないよう、キャンセル除外の条件と未受領の定義を集計側に揃える。
+ * 未受領は「SKUごとの不足の合計」= 過受領のSKUで相殺しない (親の総数差とは一致しないことがある)。
+ */
+export function getInboundShipmentsByDate(createdDate, opts = {}) {
+  const where = [`s.created_date = ?`];
+  const params = [createdDate];
+  if (!opts.includeCancelled) where.push(`s.shipment_status NOT IN ('CANCELLED', 'DELETED')`);
   return queryAll(
-    `SELECT * FROM fba_inbound_shipments
-      WHERE created_date = ?
-      ORDER BY created_at, shipment_id`,
-    [createdDate]
+    `SELECT s.*,
+            COALESCE((SELECT SUM(CASE WHEN i.qty_shipped > i.qty_received
+                                      THEN i.qty_shipped - i.qty_received ELSE 0 END)
+                        FROM fba_inbound_shipment_items i
+                       WHERE i.shipment_id = s.shipment_id), 0) AS qty_unreceived
+       FROM fba_inbound_shipments s
+      WHERE ${where.join(' AND ')}
+      ORDER BY s.created_at, s.shipment_id`,
+    params
   );
 }
 
@@ -904,12 +932,18 @@ export function getInboundSyncStatus() {
  * @param {{since?: string, limit?: number}} opts - since は updated_at (JST文字列) 以降
  */
 export function exportInboundRows(opts = {}) {
-  const limit = opts.limit ?? 5000;
+  // 負数や巨大値で LIMIT が無制限になるのを防ぐ (SQLite は LIMIT -1 を「制限なし」として扱う)
+  const raw = Number(opts.limit);
+  const limit = Number.isFinite(raw) ? Math.min(Math.max(Math.trunc(raw), 1), 5000) : 3000;
+
+  // カーソルは (updated_at, shipment_id) の複合。
+  // updated_at は秒精度で、一括取込では同じ秒に何百件も並ぶ。時刻だけで送ると
+  // ページ境界にいる同秒の行が二度と送られない (無言の欠落) ため。
   const params = [];
   let where = '';
-  if (opts.since) {
-    where = `WHERE updated_at > ?`;
-    params.push(opts.since);
+  if (opts.since?.updated_at) {
+    where = `WHERE (updated_at > ? OR (updated_at = ? AND shipment_id > ?))`;
+    params.push(opts.since.updated_at, opts.since.updated_at, opts.since.shipment_id || '');
   }
   const shipments = queryAll(
     `SELECT shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
@@ -919,7 +953,7 @@ export function exportInboundRows(opts = {}) {
       LIMIT ${limit}`,
     params
   );
-  if (shipments.length === 0) return { shipments: [], items: [], has_more: false };
+  if (shipments.length === 0) return { shipments: [], items: [], has_more: false, next_cursor: null };
 
   const ids = shipments.map(s => s.shipment_id);
   const placeholders = ids.map(() => '?').join(',');
@@ -929,7 +963,13 @@ export function exportInboundRows(opts = {}) {
       WHERE shipment_id IN (${placeholders})`,
     ids
   );
-  return { shipments, items, has_more: shipments.length >= limit };
+  const last = shipments[shipments.length - 1];
+  return {
+    shipments,
+    items,
+    has_more: shipments.length >= limit,
+    next_cursor: { updated_at: last.updated_at, shipment_id: last.shipment_id },
+  };
 }
 
 /**
@@ -947,50 +987,81 @@ export function importInboundRows(payload) {
     byShipment.get(it.shipment_id).push(it);
   }
 
-  for (const s of shipments) {
-    db.run(
-      `INSERT INTO fba_inbound_shipments
-         (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
-          label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(shipment_id) DO UPDATE SET
-         shipment_name = excluded.shipment_name,
-         created_at = excluded.created_at,
-         created_date = excluded.created_date,
-         destination_fc = excluded.destination_fc,
-         shipment_status = excluded.shipment_status,
-         label_prep_type = excluded.label_prep_type,
-         total_skus = excluded.total_skus,
-         total_shipped = excluded.total_shipped,
-         total_received = excluded.total_received,
-         items_synced_at = excluded.items_synced_at,
-         updated_at = excluded.updated_at`,
-      [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
-       s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
-       s.total_received ?? 0, s.items_synced_at, s.updated_at]
-    );
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const s of shipments) {
+      db.run(
+        `INSERT INTO fba_inbound_shipments
+           (shipment_id, shipment_name, created_at, created_date, destination_fc, shipment_status,
+            label_prep_type, total_skus, total_shipped, total_received, items_synced_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(shipment_id) DO UPDATE SET
+           shipment_name = excluded.shipment_name,
+           created_at = excluded.created_at,
+           created_date = excluded.created_date,
+           destination_fc = excluded.destination_fc,
+           shipment_status = excluded.shipment_status,
+           label_prep_type = excluded.label_prep_type,
+           total_skus = excluded.total_skus,
+           total_shipped = excluded.total_shipped,
+           total_received = excluded.total_received,
+           items_synced_at = excluded.items_synced_at,
+           updated_at = excluded.updated_at`,
+        [s.shipment_id, s.shipment_name || '', s.created_at, s.created_date, s.destination_fc || '',
+         s.shipment_status || '', s.label_prep_type || '', s.total_skus ?? 0, s.total_shipped ?? 0,
+         s.total_received ?? 0, s.items_synced_at, s.updated_at]
+      );
 
-    // 明細が付いてきたシップメントだけ入れ替える。
-    // (items_synced_at はあるのに明細0行 = 本当に空のシップメント、というケースも通す)
-    if (s.items_synced_at) {
-      db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [s.shipment_id]);
-      for (const it of byShipment.get(s.shipment_id) || []) {
-        db.run(
-          `INSERT OR REPLACE INTO fba_inbound_shipment_items
-             (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [it.shipment_id, it.seller_sku, it.fnsku || '', it.qty_shipped ?? 0, it.qty_received ?? 0, it.qty_in_case ?? 0]
-        );
+      // 明細が付いてきたシップメントだけ入れ替える。
+      // (items_synced_at はあるのに明細0行 = 本当に空のシップメント、というケースも通す)
+      if (s.items_synced_at) {
+        db.run(`DELETE FROM fba_inbound_shipment_items WHERE shipment_id = ?`, [s.shipment_id]);
+        for (const it of byShipment.get(s.shipment_id) || []) {
+          db.run(
+            `INSERT OR REPLACE INTO fba_inbound_shipment_items
+               (shipment_id, seller_sku, fnsku, qty_shipped, qty_received, qty_in_case)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [it.shipment_id, it.seller_sku, it.fnsku || '', it.qty_shipped ?? 0, it.qty_received ?? 0, it.qty_in_case ?? 0]
+          );
+        }
       }
     }
+    // カーソルは「このページを永続化できた後」にだけ進める。
+    // 途中で落ちたらロールバックされ、カーソルも進まないので次回同じページから再開する。
+    if (payload?.next_cursor?.updated_at) {
+      db.run(
+        `INSERT OR REPLACE INTO settings (key, value, updated_at)
+         VALUES ('inbound_sync_cursor', ?, datetime('now','localtime'))`,
+        [JSON.stringify(payload.next_cursor)]
+      );
+    }
+    db.run('COMMIT');
+  } catch (e) {
+    db.run('ROLLBACK');
+    throw e;
   }
   saveToFile();
   return { shipments: shipments.length, items: items.length };
 }
 
-/** Render 側が「どこまで同期済みか」を知るための位置。 */
+/**
+ * Render 側が「どこまで同期済みか」を知るための位置 (複合カーソル)。
+ * 正は settings に保存したチェックポイント。取り込みに成功したページの末尾だけが入る。
+ * 未設定 (機能追加前から動いている環境) のときだけ、既存行の最大値から推定する。
+ */
 export function getInboundSyncCursor() {
-  return queryOne(`SELECT MAX(updated_at) AS t FROM fba_inbound_shipments`)?.t || null;
+  const saved = queryOne(`SELECT value FROM settings WHERE key = 'inbound_sync_cursor'`)?.value;
+  if (saved) {
+    try {
+      const c = JSON.parse(saved);
+      if (c?.updated_at) return c;
+    } catch { /* 壊れていたら推定にフォールバック */ }
+  }
+  const row = queryOne(
+    `SELECT updated_at, shipment_id FROM fba_inbound_shipments
+      ORDER BY updated_at DESC, shipment_id DESC LIMIT 1`
+  );
+  return row?.updated_at ? { updated_at: row.updated_at, shipment_id: row.shipment_id } : null;
 }
 
 /**

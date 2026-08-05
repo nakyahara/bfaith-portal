@@ -29,8 +29,11 @@ const ALL_STATUSES = [
 
 // SP-API の Fulfillment Inbound v0 は rate 2req/sec。余裕を見て 600ms 間隔。
 const CALL_INTERVAL_MS = 600;
-// 明細取得の途中でもディスクに落とす間隔 (途中で落ちても取り直しが少なく済む)
-const FLUSH_EVERY = 50;
+// 明細取得の途中でもディスクに落とす間隔。
+// sql.js は保存のたびに DB 全体を書き直す (= その間イベントループが止まる) ので、
+// 頻繁すぎるとジョブ状態の応答まで詰まる。落ちた分は items_synced_at が NULL のまま
+// 残って次回取り直されるだけなので、間隔は広めでよい。
+const FLUSH_EVERY = 100;
 
 let spClient = null;
 function getClient() {
@@ -57,7 +60,32 @@ function marketplaceId() {
   return process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 }
 
-/** スロットリング時だけ指数バックオフで粘る。それ以外のエラーは呼び出し側に投げる。 */
+/**
+ * 一時的な失敗 (スロットル / 5xx / 通信断) だけ指数バックオフで粘る。
+ * それ以外 (認証・権限・不正パラメータ) は粘っても無駄なので即座に投げる。
+ */
+function retryableInfo(e) {
+  const status = e?.statusCode ?? e?.status ?? e?.response?.status ?? null;
+  const code = String(e?.code || '');
+  const msg = String(e?.message || e);
+  if (status === 429 || status === 408 || (status >= 500 && status < 600)) return { retryable: true, status };
+  if (/throttl|quota|too many requests|rate exceeded/i.test(msg)) return { retryable: true, status: 429 };
+  if (/ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|socket hang up|network/i.test(code + ' ' + msg)) {
+    return { retryable: true, status: null };
+  }
+  return { retryable: false, status };
+}
+
+/** Retry-After (秒 or HTTP-date) を尊重する。無ければ null。 */
+function retryAfterMs(e) {
+  const h = e?.headers?.['retry-after'] ?? e?.response?.headers?.['retry-after'];
+  if (!h) return null;
+  const sec = Number(h);
+  if (Number.isFinite(sec)) return Math.min(sec * 1000, 60000);
+  const at = Date.parse(h);
+  return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), 60000) : null;
+}
+
 async function callWithRetry(apiPath, label, maxRetries = 4) {
   const sp = getClient();
   let waitMs = 2000;
@@ -66,11 +94,12 @@ async function callWithRetry(apiPath, label, maxRetries = 4) {
       const res = await sp.callAPI({ api_path: apiPath, method: 'GET' });
       return res?.payload || res;
     } catch (e) {
-      const msg = String(e?.message || e);
-      const throttled = /throttl|quota|429|too many requests/i.test(msg);
-      if (!throttled || attempt === maxRetries) throw e;
-      console.log(`[InboundHistory] ${label} スロットル → ${waitMs / 1000}秒待機 (${attempt + 1}/${maxRetries})`);
-      await sleep(waitMs);
+      const { retryable } = retryableInfo(e);
+      if (!retryable || attempt === maxRetries) throw e;
+      // ジッタ: 複数プロセスが同時にリトライして再び詰まるのを避ける
+      const wait = retryAfterMs(e) ?? Math.round(waitMs * (0.8 + Math.random() * 0.4));
+      console.log(`[InboundHistory] ${label} 再試行 → ${Math.round(wait / 1000)}秒待機 (${attempt + 1}/${maxRetries}): ${e?.message || e}`);
+      await sleep(wait);
       waitMs *= 2;
     }
   }
@@ -107,16 +136,37 @@ export async function fetchShipmentList(opts) {
   } while (token && page < maxPages);
 
   if (token) {
-    console.log(`[InboundHistory] ⚠️ ページ上限 ${maxPages} に到達。まだ続きがある可能性`);
+    // 打ち切った結果をそのまま保存すると「取れた分が全部」に見えてしまう。
+    // 不完全な取得は成功として扱わない。
+    throw new Error(`シップメント一覧がページ上限 ${maxPages} に到達しました (取得済み ${all.length}件)。範囲を狭めて再実行してください`);
   }
   return all;
 }
 
-/** 1シップメントの明細を取得。 */
-export async function fetchShipmentItems(shipmentId) {
-  const qs = new URLSearchParams({ MarketplaceId: marketplaceId() }).toString();
-  const payload = await callWithRetry(`/fba/inbound/v0/shipments/${shipmentId}/items?${qs}`, `items ${shipmentId}`);
-  return payload?.ItemData || [];
+/**
+ * 1シップメントの明細を取得。
+ * ⚠️ v0 の items も NextToken でページングされる。1ページで打ち切ると
+ *    SKUが多い納品で明細が欠け、その不完全な結果で既存明細を置き換えてしまう。
+ */
+export async function fetchShipmentItems(shipmentId, maxPages = 50) {
+  const all = [];
+  let token = null;
+  let page = 0;
+  do {
+    const qs = token
+      ? new URLSearchParams({ MarketplaceId: marketplaceId(), QueryType: 'NEXT_TOKEN', NextToken: token }).toString()
+      : new URLSearchParams({ MarketplaceId: marketplaceId() }).toString();
+    const payload = await callWithRetry(`/fba/inbound/v0/shipments/${shipmentId}/items?${qs}`, `items ${shipmentId} p${page + 1}`);
+    all.push(...(payload?.ItemData || []));
+    token = payload?.NextToken || null;
+    page += 1;
+    if (token) await sleep(CALL_INTERVAL_MS);
+  } while (token && page < maxPages);
+
+  if (token) {
+    throw new Error(`${shipmentId} の明細がページ上限 ${maxPages} に到達しました (取得済み ${all.length}行)`);
+  }
+  return all;
 }
 
 /**
