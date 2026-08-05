@@ -1,5 +1,9 @@
 <%- include('_header') %>
 <style>
+  /* 説明文3欄プレビュー: 送信HTMLの画像は width=100% (楽天ページでは正)。
+     プレビュー枠で原寸表示すると巨大な帯になって読めないため、表示だけスマホ幅相当に
+     縮小して中央寄せする (コピーされるHTMLはそのまま — 2026-08-05 中原さん指摘) */
+  .desc3-render img { max-width: 420px !important; height: auto; display: block; margin: 0 auto; }
   /* タブ構成 (2026-07-29 中原さん要望: 項目をタブで整理し、必須未入力をバッジで見せる) */
   .tabbar { position: sticky; top: 0; z-index: 40; background: #f5f6f8; display: flex; gap: 6px;
             flex-wrap: wrap; align-items: center; padding: 10px 0; margin-bottom: 12px;
@@ -607,8 +611,8 @@
             <button class="btn btn-sm desc3-copy" data-key="<%= key %>">HTMLをコピー</button>
           </div>
           <div class="muted" style="font-size:11px;"><%= note %></div>
-          <div id="desc3-render-<%= key %>"
-               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:320px; overflow:auto; background:#fff; font-size:13px;"></div>
+          <div id="desc3-render-<%= key %>" class="desc3-render"
+               style="border:1px solid #e2e8f0; border-radius:8px; padding:10px; margin-top:4px; max-height:<%= key === 'pc' ? 320 : 480 %>px; overflow:auto; background:#fff; font-size:13px;"></div>
         </div>
       <% } %>
     </div>
