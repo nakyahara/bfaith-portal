@@ -25,6 +25,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
+import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -306,15 +307,19 @@ async function fetchOrders(days = 7) {
   const startStr = startDate.toISOString().slice(0, 10) + ' 00:00:00';
   const endStr = endDate.toISOString().slice(0, 10) + ' 23:59:59';
 
-  // Step 1: 受注ベース（伝票レベル）を取得 → Mapに保持
+  // Step 1: 受注ベース（伝票レベル）を取得 → Mapに保持 + raw_ne_order_base へ UPSERT
+  //   fields に配送方法 (delivery_id/name) を含むので、明細 JOIN 用の情報を取るついでに
+  //   伝票粒度テーブルも同じレスポンスから埋まる (API 呼び出しは増えない)。
   console.log('[NE] Step 1: 受注ベース取得');
-  const baseFields = 'receive_order_id,receive_order_shop_cut_form_id,receive_order_date,receive_order_shop_id,receive_order_order_status_id,receive_order_order_status_name,receive_order_send_date,receive_order_cancel_type_id,receive_order_cancel_date';
   const baseMap = new Map(); // 伝票番号 → base情報
+  const upsertOrderBase = makeNeOrderBaseUpserter(db);
+  let baseInserted = 0;
+  let baseUpdated = 0;
 
   let baseOffset = 0;
   while (true) {
     const data = await callNE('/api_v1_receiveorder_base/search', {
-      fields: baseFields,
+      fields: NE_ORDER_BASE_FIELDS,
       'receive_order_date-gte': startStr,
       'receive_order_date-lte': endStr,
       limit: '1000',
@@ -327,10 +332,21 @@ async function fetchOrders(days = 7) {
       const id = item.receive_order_id || '';
       if (id) baseMap.set(id, item);
     }
+    const tx = db.transaction(() => {
+      for (const item of items) {
+        const row = toOrderBaseRow(item);
+        if (!row) continue;
+        const outcome = upsertOrderBase(row, ts);
+        if (outcome === 'inserted') baseInserted++;
+        else if (outcome === 'updated') baseUpdated++;
+      }
+    });
+    tx();
     console.log(`[NE] 受注ベース: ${baseMap.size}件 (offset: ${baseOffset})`);
     baseOffset += 1000;
     if (items.length < 1000) break;
   }
+  console.log(`[NE] 受注ベース保存: ${baseInserted}件挿入, ${baseUpdated}件更新`);
 
   // Step 2: 受注明細を取得し、baseとJOINしてINSERT
   console.log('[NE] Step 2: 受注明細取得 + JOIN');
@@ -424,6 +440,88 @@ async function fetchOrders(days = 7) {
   return { total, inserted, updated, unchanged };
 }
 
+// ─── 受注ベース取得（出荷確定日ベース）───
+
+/** JST の YYYY-MM-DD (toISOString は UTC なので +9h してから切り出す) */
+function jstDate(offsetDays = 0) {
+  const t = Date.now() + 9 * 3600 * 1000 + offsetDays * 86400 * 1000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+/**
+ * 出荷確定日ベースで受注ベース（伝票粒度）を取得し raw_ne_order_base へ UPSERT する。
+ *
+ * fetchOrders は「受注日」窓なので、受注から日が空いて出荷確定した伝票を取りこぼす
+ * (2026-08-05 実測: 7月出荷確定分の 0.23% がラグ7日以上)。出荷件数を数える用途では
+ * この取りこぼしがそのまま日次件数の欠損になるため、出荷確定日ベースでも取り直す。
+ * 出荷確定済みの伝票は 1 日 800〜1,000 件程度なので、limit 10000 なら通常 API 1 回で済む。
+ *
+ * @param {number} days 何日前まで遡るか (既定 14。当日を含む)
+ */
+async function fetchOrderBaseByShipDate(days = 14) {
+  console.log(`[NE] 受注ベース取得開始（出荷確定日ベース・直近${days}日）`);
+  return fetchOrderBaseRange(`${jstDate(-(days - 1))} 00:00:00`, `${jstDate(0)} 23:59:59`);
+}
+
+/**
+ * 出荷確定日の任意区間で受注ベースを取得し raw_ne_order_base へ UPSERT する。
+ * バックフィル (backfill-ne-order-base.js) からも使う。
+ * @param {string} startStr 'YYYY-MM-DD HH:MM:SS'
+ * @param {string} endStr   'YYYY-MM-DD HH:MM:SS'
+ * @param {{ updateMeta?: boolean }} [opts] updateMeta=false で sync_meta を汚さない
+ *   (バックフィルは過去区間を舐めるだけなので「最終同期」を書き換えてはいけない)
+ */
+export async function fetchOrderBaseRange(startStr, endStr, opts = {}) {
+  const updateMeta = opts.updateMeta !== false;
+  await initDB();
+  const db = getDB();
+  const ts = now();
+  const upsertOrderBase = makeNeOrderBaseUpserter(db);
+
+  let offset = 0;
+  let fetched = 0;
+  let inserted = 0;
+  let updated = 0;
+  let unchanged = 0;
+  const LIMIT = 10000;
+
+  while (true) {
+    const data = await callNE('/api_v1_receiveorder_base/search', {
+      fields: NE_ORDER_BASE_FIELDS,
+      'receive_order_send_date-gte': startStr,
+      'receive_order_send_date-lte': endStr,
+      limit: String(LIMIT),
+      offset: String(offset),
+    });
+    const items = data.data || [];
+    if (items.length === 0) break;
+
+    const tx = db.transaction(() => {
+      for (const item of items) {
+        const row = toOrderBaseRow(item);
+        if (!row) continue;
+        const outcome = upsertOrderBase(row, ts);
+        if (outcome === 'inserted') inserted++;
+        else if (outcome === 'updated') updated++;
+        else unchanged++;
+        fetched++;
+      }
+    });
+    tx();
+
+    console.log(`[NE] 受注ベース(出荷確定日): ${fetched}件処理 (offset: ${offset})`);
+    if (items.length < LIMIT) break;
+    offset += LIMIT;
+  }
+
+  console.log(`[NE] 受注ベース取得完了: ${fetched}件処理, ${inserted}件挿入, ${updated}件更新, ${unchanged}件変化なし`);
+  if (updateMeta) {
+    updateSyncMeta('ne_api_orderbase_last', now());
+    updateSyncMeta('ne_api_orderbase_range', `${startStr} ~ ${endStr}`);
+  }
+  return { fetched, inserted, updated, unchanged };
+}
+
 // ─── メイン ───
 
 async function main() {
@@ -454,17 +552,23 @@ async function main() {
     await fetchOrders(days);
   } else if (command === 'setproducts') {
     await fetchSetProducts();
+  } else if (command === 'order-base') {
+    const days = parseInt(args[1]) || 14;
+    await fetchOrderBaseByShipDate(days);
   } else if (command === 'sync') {
     await fetchProducts();
     await fetchSetProducts();
     await fetchOrders(7);
+    // 出荷確定日ベースの取り直し (受注日窓から漏れた出荷を拾う。API 1回程度)
+    await fetchOrderBaseByShipDate(14);
   } else {
     console.log('使い方:');
     console.log('  node apps/warehouse/ne-api.js auth <callback_url>  → 初回認証');
     console.log('  node apps/warehouse/ne-api.js products             → 商品マスタ取得');
     console.log('  node apps/warehouse/ne-api.js setproducts          → セット商品取得');
     console.log('  node apps/warehouse/ne-api.js orders [days]        → 受注データ取得');
-    console.log('  node apps/warehouse/ne-api.js sync                 → 全て（商品+セット+受注7日分）');
+    console.log('  node apps/warehouse/ne-api.js order-base [days]    → 受注ベース取得（出荷確定日ベース、既定14日）');
+    console.log('  node apps/warehouse/ne-api.js sync                 → 全て（商品+セット+受注7日分+受注ベース14日分）');
     process.exit(1);
   }
 }
