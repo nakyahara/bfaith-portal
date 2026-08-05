@@ -98,10 +98,32 @@ ping ヘルパーは**絶対に本体を失敗させない** (常に exit 0 / �
 5. GAS 見張りを設置 (`scripts/gas/jobs-monitor-watchdog.gs` の冒頭コメント参照)
 6. 翌朝 08:50 のサマリが届くことを確認
 
+## テスト
+
+```
+node apps/jobs-monitor/test-evaluate.js           # 判定ロジック + 台帳バリデータ
+node apps/jobs-monitor/test-ping-local.js         # Render内ジョブの ping ヘルパー
+node apps/jobs-monitor/test-schedule-inventory.js # ⭐未登録スケジュールの検出
+```
+
+`test-schedule-inventory.js` は **コード上の `cron.schedule` / `setInterval` を全部数え、
+台帳 id か除外理由の宣言を強制する**。新しく定期実行を書くとこのテストが落ちるので、
+
+- 業務ジョブ → 台帳に登録して ping を配線し `job:` を書く
+- そうでない (プロセス内観測・ロック延命・CLI 等) → `exempt:` に理由を書く
+
+のどちらかを通らないとマージできない。**「新設したら台帳に足す」を人の規律から機械の検査へ
+移すためのもの。** 2026-08-01 の棚卸しが miniPC だけを見ていて Render 内 cron を
+カテゴリごと取りこぼした (6本が4ヶ月無監視) 再発防止 = PR #710 / #712。
+
 ## 今後 (PR-2 以降)
 
 - **data_freshness**: 「ジョブが動いたか」でなく「warehouse.db のデータが新しいか」を監視
-  (Yahoo の "毎日起動していたが認証切れで空振り" はこれで捕まえる)
+  (Yahoo の "毎日起動していたが認証切れで空振り" はこれで捕まえる)。
+  ⭐**今の dead-man では、ジョブが正常終了しながら中身が空だった場合を捕まえられない。
+  これが設計上の最大の残穴。**
 - **実構成の自動収集**: miniPC の Task Scheduler 一覧を毎日送り、台帳との差分
-  (未登録タスク / 消えたタスク) をサマリに出す
+  (未登録タスク / 消えたタスク) をサマリに出す。
+  Render 側はコードが正なので `test-schedule-inventory.js` が同じ役目を果たすが、
+  miniPC 側は「誰かが手で作ったタスク」を拾えないため実構成の収集が要る
 - ポータルに一覧画面 (`/status` を表示するだけ)
