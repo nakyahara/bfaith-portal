@@ -838,15 +838,21 @@ export function buildItemPayload(db, draftId) {
 
   const payment = taxRateToPayment(yahooRow.tax_rate);
 
+  // 商品コード (NE商品コード) は SKU管理番号 (variants キー)・商品番号・システム連携用SKU番号の
+  // 3ヶ所に同じ表記で入れる (Codex R1 medium: 正規化を1回にして揃える)。
+  // 商品管理番号だけは RMS 仕様で小文字必須のため呼び出し側で toLowerCase する
+  const productCode = String(draft.ne_code).trim();
+
   const payload = {
     title,
     // 商品番号 = 商品コード (2026-08-05 中原さん指示)。バリエーションページ (P3.5) でも代表商品コードを入れる
-    itemNumber: String(draft.ne_code).trim(),
+    itemNumber: productCode,
     ...(ai.desc_catch ? { tagline: String(ai.desc_catch).trim() } : {}),
     productDescription: { pc: pcHtml || title, ...(spHtml ? { sp: spHtml } : {}) },
     ...(salesHtml ? { salesDescription: salesHtml } : {}),
     genreId: String(rk.genre_id).trim(),
-    // 公開で登録 (2026-08-05 中原さん指示)。在庫0のまま公開 = 売り場には「売り切れ」で載り、
+    // 公開で登録 (2026-08-05 中原さん指示)。在庫は Item API では送れない (Inventory API 2.1 が別) ため
+    // 新規 SKU は在庫0 = 公開しても「売り切れ」で売れない (2026-08-05 平串の実測・中原さんスクショで確認)。
     // 在庫は NE 連携が入れる。miniPC 側 route も hideItem=false を透過する (それ以前は true を強制)
     hideItem: false,
     itemType: 'NORMAL',
@@ -858,9 +864,9 @@ export function buildItemPayload(db, draftId) {
     ...(whiteBg ? { whiteBgImage: { type: 'CABINET', location: whiteBg.cabinet_location } } : {}),
     ...(payment ? { payment } : {}),
     variants: {
-      [draft.ne_code]: {
+      [productCode]: {
         // システム連携用SKU番号 = 商品コード (2026-08-05 中原さん指示。NE との SKU 突合キー)
-        merchantDefinedSkuId: String(draft.ne_code).trim(),
+        merchantDefinedSkuId: productCode,
         standardPrice: draft.price,
         // カタログID免除理由 (2026-08-05 平串の IE0429 で実測確定):
         //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=当店オリジナル商品
@@ -906,9 +912,25 @@ export async function registerItem(draftId, { actor = null } = {}) {
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
 
-  const r = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`, {
-    method: 'PUT', body: built.payload,
-  });
+  let r;
+  try {
+    r = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`, {
+      method: 'PUT', body: built.payload,
+    });
+  } catch (e) {
+    // タイムアウト等の「結果不明」をそのまま失敗にすると、実は登録が通っていた場合に
+    // 公開ページの孤児 (アプリは未登録扱い・再実行は 409) になる (Codex R1 High —
+    // 公開直行化で従来の非公開孤児より影響が大きい)。GET で実在を照合して確定させる
+    let probe = null;
+    try { probe = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`); } catch (_) { /* 照合も不通 */ }
+    if (probe?.status === 200) {
+      r = { status: 200, data: probe.data }; // 登録自体は通っていた → 成功として記録を続行
+    } else if (probe?.status === 404) {
+      throw e; // 登録されていないことを確認できた → 元のエラーで失敗扱い (再実行で作り直せる)
+    } else {
+      throw new Error(`楽天への登録結果が確認できませんでした (${String(e.message || e).slice(0, 120)})。RMS で商品管理番号 ${mn} の有無を確認してから再実行してください`);
+    }
+  }
   // 公開登録なので published_at も登録時刻で埋める (公開/非公開ボタンの表示状態と整合させる)
   const saveResult = db.prepare(`
     INSERT INTO draft_rakuten (draft_id, registered_at, published_at, last_error)
