@@ -1910,10 +1910,14 @@ router.get('/api/inbound-history/items/:shipmentId', (req, res) => {
   res.json({ shipment_id: req.params.shipmentId, data: getInboundItems(req.params.shipmentId) });
 });
 
-// 未受領一覧 (問い合わせ用)
+// 未受領一覧 (問い合わせ用)。期間はサマリと揃える (揃えないと2年前の分まで並ぶ)
 router.get('/api/inbound-history/unreceived', (req, res) => {
   const minDays = Number(req.query.minDays) || 0;
-  const rows = getInboundUnreceived({ minDays });
+  const rows = getInboundUnreceived({
+    minDays,
+    from: req.query.from || null,
+    to: req.query.to || null,
+  });
   res.json({ count: rows.length, data: rows });
 });
 
@@ -1944,10 +1948,7 @@ router.get('/inbound-history/print', (req, res) => {
     ? getInboundMonthlySummary({ from, to, includeCancelled })
     : getInboundDailySummary({ from, to, includeCancelled });
 
-  // 印刷は期間内のシップメントに絞る (未受領は期間外の古いものも拾えるが、紙は期間で揃える)
-  const unreceived = withUnreceived
-    ? getInboundUnreceived({ minDays }).filter(r => !r.created_date || (r.created_date >= from && r.created_date <= to))
-    : [];
+  const unreceived = withUnreceived ? getInboundUnreceived({ minDays, from, to }) : [];
 
   const totals = summary.reduce((a, r) => ({
     shipment_count: a.shipment_count + (r.shipment_count || 0),

@@ -230,8 +230,14 @@ function renderStatus(s) {
   if (!s) return;
   const parts = [];
   parts.push(`シップメント <b>${fmt(s.total_shipments)}</b>件`);
-  if (s.date_from) parts.push(`期間 <b>${esc(s.date_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
+  // 明細がある範囲はシップメント自体の存在範囲より狭い。ただし「連続して揃っている」
+  // 保証はないので、断定的な「集計可能」とは書かず、未取得件数と併記して判断させる
+  if (s.detail_from) parts.push(`明細あり <b>${esc(s.detail_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
+  else if (s.date_from) parts.push(`期間 <b>${esc(s.date_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
   if (s.items_pending > 0) parts.push(`<span style="color:#b45309">明細未取得 ${fmt(s.items_pending)}件</span>`);
+  if (s.items_out_of_range > 0) {
+    parts.push(`<span class="muted" title="2年より前のシップメント。明細は取りに行かない設定のため、取り残しではありません">対象外 ${fmt(s.items_out_of_range)}件</span>`);
+  }
   if (s.created_date_missing > 0) parts.push(`<span style="color:#b45309">作成日不明 ${fmt(s.created_date_missing)}件</span>`);
   if (s.last_synced_at) parts.push(`最終同期 <b>${esc(s.last_synced_at)}</b>`);
   document.getElementById('syncInfo').innerHTML = parts.join(' ／ ');
@@ -297,9 +303,14 @@ function renderSummary() {
 
 async function loadUnreceived() {
   updatePrintLink();
-  const minDays = document.getElementById('minDays').value || 0;
+  // 期間はサマリと揃える。揃えないと2年前の未受領まで並び、問い合わせ対象が埋もれる
+  const q = new URLSearchParams({ minDays: document.getElementById('minDays').value || 0 });
+  const from = document.getElementById('from').value;
+  const to = document.getElementById('to').value;
+  if (from) q.set('from', from);
+  if (to) q.set('to', to);
   try {
-    const r = await fetch(API + '/unreceived?minDays=' + encodeURIComponent(minDays));
+    const r = await fetch(API + '/unreceived?' + q.toString());
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || '取得に失敗');
     unrecvRows = d.data || [];
