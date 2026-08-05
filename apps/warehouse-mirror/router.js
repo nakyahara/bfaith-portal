@@ -3482,6 +3482,21 @@ router.get('/api/status', (req, res) => {
     } catch {
       status.inv_daily_summary_count = 0;
     }
+    // shipments_daily (日次出荷サマリ)。届いたか・いつの分まで来ているかを同期直後に確認できるようにする
+    try {
+      const r = db.prepare(`
+        SELECT COUNT(*) AS cnt, MIN(ship_date) AS oldest, MAX(ship_date) AS latest,
+               SUM(slips) AS slips, MAX(synced_at) AS synced_at
+        FROM mirror_shipments_daily
+      `).get();
+      status.shipments_daily_count = r.cnt;
+      status.shipments_daily_oldest_date = r.oldest;
+      status.shipments_daily_latest_date = r.latest;
+      status.shipments_daily_slips = r.slips;
+      status.shipments_daily_synced_at = r.synced_at;
+    } catch {
+      status.shipments_daily_count = 0;
+    }
     // inv_daily_detail (D-1c 詳細層)
     try {
       const r = db.prepare(`
