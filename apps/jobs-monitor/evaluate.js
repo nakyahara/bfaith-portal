@@ -136,7 +136,7 @@ export function evaluateEntry(def, state, nowMs) {
     const maxAgeMs = def.max_age_hours * HOUR_MS;
     if (neverPinged) {
       // 配線忘れ・DB消失を無音にしない。監視開始 (firstSeen) を起点に同じ物差しで late へ昇格
-      if (nowMs >= firstSeen + maxAgeMs) {
+      if (nowMs - firstSeen > maxAgeMs) {
         return { ...base, status: 'late', detail: `ping が一度も来ないまま ${def.max_age_hours}時間 経過。ping 配線かワーカー自体を確認` };
       }
       return { ...base, status: 'uninitialized', detail: 'ping がまだ来ていません (導入直後なら正常)' };

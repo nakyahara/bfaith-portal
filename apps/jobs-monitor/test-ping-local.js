@@ -71,7 +71,10 @@ eq(pingJobThrottled('warehouse-healthcheck', 'x', 0), true, '間引き: 間隔0�
   // truthy 判定だと "false"/"0" を Render 扱いしてしまう (Codexレビュー Medium)
   ok(!isRender({ RENDER: 'false' }), 'isRender: "false" は false');
   ok(!isRender({ RENDER: '0' }), 'isRender: "0" は false');
-  ok(!isRender({ RENDER: ' OFF ' }), 'isRender: 前後空白と大文字も拾う');
+  ok(isRender({ RENDER: ' TRUE ' }), 'isRender: 前後空白と大文字も拾う');
+  // 許可リスト方式: 打ち間違いを Render 扱いしない (falsy 除外方式だと通ってしまう)
+  ok(!isRender({ RENDER: 'tru' }), 'isRender: 打ち間違い "tru" は false');
+  ok(!isRender({ RENDER: 'render' }), 'isRender: 想定外の値は false');
 }
 
 // ── 6. 記録が失敗しても throw しない / 間引きを進めない ──

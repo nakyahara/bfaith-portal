@@ -396,6 +396,9 @@ const afterFail = pdfState();
 ok(afterFail.ok === 0 && /取得に失敗したため、PDFは更新していません/.test(afterFail.error),
   'CSV取得失敗時: PDFを上書きせず理由を記録 (古い紙を刷らせない)');
 ok(afterFail.row_count === null, 'CSV取得失敗時: 前回の成功件数を「成功」として残さない');
+// 日次ジョブの戻り値 = dead-man 監視の ok/fail 基準 (2026-08-05)。
+// CSV が取れない日は当然 fail。ここではその値が呼び出し側に返ることを確かめる
+ok((await runDailyJob())?.ok === false, '日次ジョブ: CSV取得に失敗した日は ok=false を返す (fail ping になる)');
 // PDF出力が無効なら状態も触らない
 savePdfState({ ok: true, filename: 'x.pdf', rows: 5, bytes: 1, user: 'keep' });
 saveJobSettings({ time: '09:00', pdf_enabled: false }, 'tester');

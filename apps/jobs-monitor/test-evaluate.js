@@ -55,6 +55,7 @@ eq(validateRegistry([VALID_HB]), [], '正しいheartbeatは通る');
 ok(validateRegistry([{ ...VALID_HB, max_age_hours: undefined }]).some((e) => /max_age_hours/.test(e)), 'heartbeatのmax_age_hours必須');
 ok(validateRegistry([{ ...VALID_HB, max_age_hours: 0 }]).some((e) => /max_age_hours/.test(e)), 'max_age_hours=0を弾く');
 ok(validateRegistry([{ ...VALID_HB, anchor_hour_jst: 8 }]).some((e) => /anchor_hour_jst/.test(e)), 'heartbeatにアンカーを書いたら弾く (判定方式の取り違え防止)');
+ok(validateRegistry([{ ...VALID_HB, anchor_minute_jst: 30 }]).some((e) => /anchor_minute_jst/.test(e)), 'heartbeatにanchor_minute_jstだけ書いても弾く');
 ok(validateRegistry([{ ...VALID_HB, grace_hours: 4 }]).some((e) => /grace_hours/.test(e)), 'heartbeatにgrace_hoursを書いたら弾く');
 ok(validateRegistry([{ ...VALID_SJ, max_age_hours: 3 }]).some((e) => /max_age_hours/.test(e)), 'scheduled_jobにmax_age_hoursを書いたら弾く');
 const VALID_TA = {
@@ -131,8 +132,10 @@ eq(evaluateEntry(SJP, { firstSeenAtMs: jst(2026, 8, 1, 5, 0) }, LATE_TODAY).stat
   eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 3 * H - 1 }, HB_NOW).status, 'late', 'heartbeat: 許容を1ms超えたらlate');
   // ⭐アンカー方式との違い: 報告直後に停止しても数時間で気づける (日次アンカーだと最大28時間見逃す)
   eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 5 * H }, HB_NOW).status, 'late', 'heartbeat: 5時間途切れたらlate');
-  // 未初期化は firstSeen 起点で昇格 (配線忘れを無音にしない)
+  // 未初期化は firstSeen 起点で昇格 (配線忘れを無音にしない)。境界の扱いは ping 済みと揃える
   eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 1 * H }, HB_NOW).status, 'uninitialized', 'heartbeat: 導入直後はuninitialized');
+  eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 3 * H }, HB_NOW).status, 'uninitialized', 'heartbeat: ping未着でちょうど許容時間はまだuninitialized (境界)');
+  eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 3 * H - 1 }, HB_NOW).status, 'late', 'heartbeat: ping未着で許容を1ms超えたらlate');
   eq(evaluateEntry(HB, { firstSeenAtMs: HB_NOW - 4 * H }, HB_NOW).status, 'late', 'heartbeat: ping未着のまま許容超過でlate');
   // fail ping は last_ok_at を進めないので、失敗が続けば late になる
   eq(evaluateEntry(HB, { ...seenOld, lastOkAtMs: HB_NOW - 4 * H, lastStatus: 'fail' }, HB_NOW).status, 'late',
@@ -184,6 +187,14 @@ ok(/🟡 \*b\*/.test(dMix), 'due_soonは🟡で出る');
 ok(/🟠 \*c\*/.test(dMix), 'remove_dueは🟠で出る');
 ok(/mystery-job/.test(dMix), '未登録pingを警告する');
 ok(dMix.indexOf('🔴') < dMix.indexOf('🟠') && dMix.indexOf('🟠') < dMix.indexOf('🟡'), '深刻な順に並ぶ');
+// heartbeat も評価後は status だけで扱われる = 既存の通知経路にそのまま乗る
+const dHb = buildDigest([
+  { id: 'po-email-dispatcher', type: 'heartbeat', importance: 'P1', status: 'late', detail: '最終生存報告から 5時間', runbook: 'Renderを再デプロイ' },
+  { id: 'warehouse-healthcheck', type: 'heartbeat', importance: 'P2', status: 'ok', detail: '最終生存報告 1時間 前' },
+], [], jst(2026, 8, 5, 8, 50));
+ok(/🔴 \*po-email-dispatcher\*/.test(dHb), 'heartbeatのlateもサマリに出る');
+ok(/Renderを再デプロイ/.test(dHb), 'heartbeatのrunbookも出る');
+ok(!/warehouse-healthcheck/.test(dHb), 'heartbeatのokはサマリに出さない');
 const dStalled = buildDigest([{ id: 's', importance: 'P3', status: 'stalled', detail: '8回連続で未完走', runbook: 'logを見る' }], [], jst(2026, 8, 2, 8, 50));
 ok(/🟠 \*s\*/.test(dStalled), 'stalledは🟠でサマリに出る');
 ok(/logを見る/.test(dStalled), 'stalledにもrunbookを出す');

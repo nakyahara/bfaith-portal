@@ -446,8 +446,8 @@ export function validateRegistry(registry = JOBS_REGISTRY) {
       if (!(Number.isFinite(e.max_age_hours) && e.max_age_hours > 0)) {
         errs.push(`${label}: max_age_hours は必須 (正の数。ping 間隔の2倍以上を目安に)`);
       }
-      if (e.anchor_hour_jst !== undefined || e.grace_hours !== undefined) {
-        errs.push(`${label}: heartbeat に anchor_hour_jst / grace_hours は使わない (経過時間で判定する)`);
+      if (e.anchor_hour_jst !== undefined || e.anchor_minute_jst !== undefined || e.grace_hours !== undefined) {
+        errs.push(`${label}: heartbeat に anchor_hour_jst / anchor_minute_jst / grace_hours は使わない (経過時間で判定する)`);
       }
     } else if (e.max_age_hours !== undefined) {
       errs.push(`${label}: max_age_hours は heartbeat だけの設定`);

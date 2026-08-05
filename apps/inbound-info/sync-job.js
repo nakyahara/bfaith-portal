@@ -28,6 +28,7 @@ import { syncNewProducts, getJobSettings, parseHhmm, savePdfState } from './db.j
 import { refreshNefudaSchedule } from './nefuda-fetch.js';
 import { exportSchedulePdfToDrive, PDF_FILENAME } from './schedule-pdf.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
+import { isRender } from '../../lib/is-render.js';
 
 // 既定 ON なので、止めたい意図の書き方 (false / 0 / off / no) を全部拾う (Codex R4 Medium)
 const OFF = new Set(['false', '0', 'off', 'no']);
@@ -161,7 +162,7 @@ export function applyInboundInfoSchedule() {
   //   (nefuda.csv 取得 → 値札CSV → 入荷予定PDF を Drive へ) が2箇所から走る。
   //   miniPC 側は mirror_products も持たないので、書き込む内容も本番と揃わない。
   //   意図的に miniPC で動かす場合だけ INBOUND_INFO_SYNC_ENABLED=true を明示する。
-  if (!process.env.RENDER && !FORCE_ON.has(String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase())) {
+  if (!isRender() && !FORCE_ON.has(String(process.env.INBOUND_INFO_SYNC_ENABLED ?? '').trim().toLowerCase())) {
     disposeOld();
     console.log('[inbound-info] cron skipped (非Render環境。動かすなら INBOUND_INFO_SYNC_ENABLED=true)');
     return { started: false, expr: null, source: null, reason: 'not_render' };
