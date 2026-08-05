@@ -233,7 +233,7 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'NE新商品 → product-hub ドラフト自動作成 (Notionカード自動作成停止後の新商品の入口)',
     where: 'Render bfaith-portal 内 node-cron (apps/product-hub/intake-cron.js、PH_INTAKE_CRON_ENABLED=1)',
-    schedule: '毎日 09:30 (daily-sync の mirror 更新後)',
+    schedule: '毎日 09:30 (+10:30/12:00 に再実行 — daily-sync が retry で遅れた日も当日中に拾う)',
     anchor_hour_jst: 9,
     anchor_minute_jst: 30,
     grace_hours: 3,
