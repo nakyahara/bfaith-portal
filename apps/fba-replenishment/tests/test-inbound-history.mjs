@@ -142,6 +142,25 @@ console.log('\n[5] getInboundUnreceived');
   // 経過日数フィルタ: テストデータは2026-07-01 なので、大きすぎる閾値なら0件になる
   const far = db.getInboundUnreceived({ minDays: 100000 });
   eq(far.length, 0, 'minDays が大きければ0件');
+
+  // 期間フィルタ (揃えないと2年前の未受領まで並んで問い合わせ対象が埋もれる)
+  eq(db.getInboundUnreceived({ from: '2026-07-02' }).length, 0, 'from で範囲外は落ちる');
+  eq(db.getInboundUnreceived({ to: '2026-07-01' }).length, 2, 'to で範囲内だけ残る');
+  eq(db.getInboundUnreceived({ from: '2026-07-01', to: '2026-07-01' }).length, 2, 'from/to 併用');
+
+  // 作成日不明は期間で判定できない。画面が「作成日不明N件」と警告しているのに
+  // 一覧から黙って消えると気づけないので、期間指定しても残す。
+  db.replaceInboundItems('FBA_D', [
+    { SellerSKU: 'sku-5', QuantityShipped: 10, QuantityReceived: 4 }, // 6不足、FBA_Dは作成日不明
+  ]);
+  const withNull = db.getInboundUnreceived({ from: '2026-07-01', to: '2026-07-01' });
+  ok(withNull.some(r => r.shipment_id === 'FBA_D'), '作成日不明は期間指定でも残る');
+  ok(withNull.find(r => r.shipment_id === 'FBA_D').created_date === null, '作成日はnullのまま');
+  // 元に戻す (後続テストの数量前提を壊さないため)
+  db.replaceInboundItems('FBA_D', [
+    { SellerSKU: 'sku-5', QuantityShipped: 3, QuantityReceived: 3 },
+    { SellerSKU: 'sku-5', QuantityShipped: 7, QuantityReceived: 7 },
+  ]);
 }
 
 // ===== 6. 明細取り直し対象の判定 =====
@@ -166,12 +185,29 @@ console.log('\n[6] getShipmentsNeedingItemSync');
 // ===== 7. 取込状況 =====
 console.log('\n[7] getInboundSyncStatus');
 {
-  const s = db.getInboundSyncStatus();
+  const s = db.getInboundSyncStatus({ minCreatedDate: '2020-01-01' });
   eq(s.total_shipments, 4, '総シップメント数');
   eq(s.items_pending, 0, '明細未取得は0');
   eq(s.created_date_missing, 1, '作成日不明は1');
   eq(s.date_from, '2026-07-01', '期間の開始');
   eq(s.date_to, '2026-07-02', '期間の終了');
+  eq(s.detail_from, '2026-07-01', '明細まで揃っている範囲');
+
+  // 明細を取りに行かないと決めた範囲外は「取り残し」に数えない
+  db.upsertInboundShipments([
+    { ShipmentId: 'FBA_OLD', ShipmentName: 'FBA STA (2020/01/05 10:00)-TPY1', ShipmentStatus: 'CLOSED' },
+  ]);
+  const s2 = db.getInboundSyncStatus({ minCreatedDate: '2026-01-01' });
+  eq(s2.items_pending, 0, '範囲外の未取得は items_pending に入らない');
+  eq(s2.items_out_of_range, 1, '範囲外として別に数える');
+
+  // detail_from は取得対象範囲の内側だけを見る。
+  // 範囲外に取得済みが1件でも混じると、実際には集計できない古い日付まで伸びてしまう。
+  db.replaceInboundItems('FBA_OLD', [{ SellerSKU: 'sku-old', QuantityShipped: 1, QuantityReceived: 1 }]);
+  const s3 = db.getInboundSyncStatus({ minCreatedDate: '2026-01-01' });
+  eq(s3.detail_from, '2026-07-01', '範囲外の取得済み(2020年)に引きずられない');
+  const s4 = db.getInboundSyncStatus({ minCreatedDate: '2019-01-01' });
+  eq(s4.detail_from, '2020-01-05', '範囲を広げれば古い方が出る');
 }
 
 // ===== 7b. ドリルダウンがサマリと食い違わないこと =====
@@ -205,7 +241,7 @@ console.log('\n[7b] getInboundShipmentsByDate');
 console.log('\n[8] exportInboundRows / importInboundRows');
 {
   const exported = db.exportInboundRows({});
-  eq(exported.shipments.length, 5, '5シップメントをエクスポート');
+  eq(exported.shipments.length, 6, '6シップメントをエクスポート');
   ok(exported.items.length >= 5, '明細も一緒に出る');
   eq(exported.has_more, false, '件数がlimit未満ならhas_moreはfalse');
   ok(!!exported.next_cursor?.updated_at && !!exported.next_cursor?.shipment_id, 'next_cursorは複合キー');
@@ -217,7 +253,7 @@ console.log('\n[8] exportInboundRows / importInboundRows');
   await db2.initDb();
 
   const imported = db2.importInboundRows(exported);
-  eq(imported.shipments, 5, '5件import');
+  eq(imported.shipments, 6, '6件import');
 
   const src = db.getInboundDailySummary({});
   const dst = db2.getInboundDailySummary({});
@@ -242,7 +278,7 @@ console.log('\n[8] exportInboundRows / importInboundRows');
 
   // limit の防御: 負数で「無制限」にならない (SQLite は LIMIT -1 を無制限として扱う)
   eq(db.exportInboundRows({ limit: -1 }).shipments.length, 1, 'limit=-1 は1件にクランプされる');
-  eq(db.exportInboundRows({ limit: 99999 }).shipments.length, 5, 'limit過大でも全件どまり');
+  eq(db.exportInboundRows({ limit: 99999 }).shipments.length, 6, 'limit過大でも全件どまり');
 
   fs.rmSync(tmp2, { recursive: true, force: true });
 }
