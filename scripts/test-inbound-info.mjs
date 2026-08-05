@@ -366,6 +366,16 @@ ok(order.join(',') === 'A:start,A:end,B:start,B:end,C:start,C:end',
 
 // cron 張り替え: 不正な env 式では既存の予約を壊さない (Codex pdf-R1 Medium)
 const { applyInboundInfoSchedule } = await import('../apps/inbound-info/sync-job.js');
+// 日次処理は Render 専用 (miniPC も同じ server.js を動かすため。2026-08-05)。
+// 非Render環境で起動しないことを先に確かめてから、Render を模して張り替えロジックを見る。
+const notRender = applyInboundInfoSchedule();
+ok(!notRender.started && notRender.reason === 'not_render',
+  'cron: 非Render環境では起動しない (miniPC との二重実行を防ぐ)');
+process.env.INBOUND_INFO_SYNC_ENABLED = 'true';
+const forced = applyInboundInfoSchedule();
+ok(forced.started, 'cron: 非Renderでも INBOUND_INFO_SYNC_ENABLED=true なら明示的に動かせる');
+delete process.env.INBOUND_INFO_SYNC_ENABLED;
+process.env.RENDER = '1';
 const a1 = applyInboundInfoSchedule();
 ok(a1.started, 'cron: 起動');
 process.env.INBOUND_INFO_SYNC_CRON = 'これは cron 式ではない';

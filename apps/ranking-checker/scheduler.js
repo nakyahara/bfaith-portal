@@ -14,6 +14,7 @@ import { runAutoCheck } from './auto-check.js';
 import { log } from './helpers.js';
 import { exportCSVToDrive } from './csv-export.js';
 import * as rdb from './db.js';
+import { pingJob } from '../jobs-monitor/ping-local.js';
 
 const DATA_RETENTION_DAYS = 365;
 const RUNMETA_RETENTION_DAYS = 60;
@@ -27,6 +28,12 @@ function cleanupOldData() {
 }
 
 export function startScheduler() {
+  // ⚠ Render 限定。miniPC も同じ server.js を動かすため、無条件だと CSV 出力が
+  //   2箇所から同じ Drive フォルダへ走る (miniPC 側は順位データを持たない)。
+  if (!process.env.RENDER) {
+    console.log('[Scheduler] 非Render環境のためスケジュール登録をスキップ');
+    return;
+  }
   const autoEnabled = process.env.RANKCHECK_AUTO_ENABLED === 'true';
   if (autoEnabled) {
     cron.schedule('0 4 * * *', async () => {
@@ -40,14 +47,17 @@ export function startScheduler() {
     }, { timezone: 'UTC' });
   }
 
-  cron.schedule('0 0 * * *', async () => {
+  cron.schedule('0 9 * * *', async () => {
     log('--- スケジュール実行: CSV出力 (09:00 JST) ---');
+    // dead-man 監視 (jobs-registry: rankcheck-csv-export)
     try {
       await exportCSVToDrive();
+      pingJob('rankcheck-csv-export', 'ok');
     } catch (e) {
       log(`CSV出力エラー: ${e.message}`);
+      pingJob('rankcheck-csv-export', 'fail', e.message);
     }
-  }, { timezone: 'UTC' });
+  }, { timezone: 'Asia/Tokyo' });
 
   console.log('[Scheduler] 楽天順位チェッカー スケジュール登録完了 (SQLite版)');
   if (autoEnabled) {

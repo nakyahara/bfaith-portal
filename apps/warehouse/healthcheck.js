@@ -6,7 +6,8 @@
  * 失敗の種類 (認証/tunnel/app/ネットワーク) を区別する。
  */
 import cron from 'node-cron';
-import { bootStart, bootEnd } from '../observability/boot-log.js';
+import { bootStart, bootEnd, bootNote } from '../observability/boot-log.js';
+import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
 
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
 const HEALTH_PATH = '/service-api/health';
@@ -111,9 +112,32 @@ async function runCheck() {
 }
 
 export function startWarehouseHealthcheck() {
+  // ⚠ Render 限定。miniPC を外から監視するのが役目なので、miniPC 自身が走らせても意味がない
+  //   (自分が落ちれば監視も一緒に落ちる)。実際 miniPC でも起動していた (2026-08-05 確認)。
+  if (!process.env.RENDER) {
+    bootNote('healthcheck', 'RENDER未設定のため死活監視を起動しない (Render専用)');
+    console.log('[Healthcheck] 非Render環境のため起動スキップ');
+    return;
+  }
   bootStart('healthcheck', 'warehouse-healthcheck');
-  cron.schedule('*/5 * * * *', runCheck, { timezone: 'UTC' });
+  cron.schedule('*/5 * * * *', runCheckWithPing, { timezone: 'UTC' });
   console.log('[Healthcheck] warehouse死活監視開始 (5分毎、3回連続失敗でGChat通知)');
-  setTimeout(runCheck, 30000);
+  setTimeout(runCheckWithPing, 30000);
   bootEnd('healthcheck', 'warehouse-healthcheck', `target=${WAREHOUSE_URL}${HEALTH_PATH}`);
+}
+
+/**
+ * 監視ループ自身の生存を dead-man へ報告する (jobs-registry: warehouse-healthcheck)。
+ *
+ * ⭐ping の ok は「監視ループが回っていること」であって「miniPC が生きていること」ではない。
+ *   miniPC の異常は、このジョブ自身が GChat へ通知する役目を持っている。
+ *   ここで miniPC の生死を ok/fail に写すと、miniPC 障害のたびに二重に鳴る。
+ * 5分ごとに毎回打つ必要はないので1時間に1回へ間引く (grace_hours はこれより大きく取る)。
+ */
+async function runCheckWithPing() {
+  try {
+    await runCheck();
+  } finally {
+    pingJobThrottled('warehouse-healthcheck', `連続失敗=${consecutiveFailures}`);
+  }
 }

@@ -241,6 +241,102 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「intake」を検索。mirror_too_small/mirror_empty = daily-sync 未完か同期途中 (miniPC側を確認)。'
       + '手動実行 = product-hub 一覧 (admin) の「NE取込を今すぐ実行」。2026-08-05 点火 (初回はシードのみ・翌日から自動作成)',
   },
+  // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
+  //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
+  //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている
+  //   (ping も Render 側からしか飛ばない)。
+  {
+    id: 'fba-daily-sync',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'FBA SKUマッピング同期 (Sheets「商品コード変換テーブル」→ sku_mapping + 他CH売上スナップショット)'
+      + ' + 土台商品マスタ + 納品実績。補充計算の土台なので、止まると計算が古いマッピングのまま静かにズレる',
+    where: 'Render bfaith-portal 内 node-cron (apps/fba-replenishment/router.js)',
+    schedule: '毎日 06:00',
+    anchor_hour_jst: 6,
+    anchor_minute_jst: 0,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「FBA-Cron」を検索。ok の基準はSKUマッピング同期の成否 (土台/納品実績は best-effort で note に出る)。'
+      + 'GOOGLE_SERVICE_ACCOUNT_KEY 未設定/失効、Sheets の共有解除で落ちる。手動実行 = FBA在庫補充画面の同期ボタン',
+  },
+  {
+    id: 'inbound-info-daily',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '入庫情報の日次処理 (新商品追加 → 入荷予定 nefuda.csv 取得 → 値札印刷用CSV → 入荷予定リストPDF を Drive へ)。'
+      + '現場が朝に印刷する紙の元データ',
+    where: 'Render bfaith-portal 内 node-cron (apps/inbound-info/sync-job.js)',
+    schedule: '毎日 09:00 (画面「⚙️自動実行」で変更可 — 変えたらこの台帳も直す)',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 0,
+    grace_hours: 5,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「inbound-info」を検索。ok の基準は nefuda.csv の取得成否 (CSVが取れない日はPDFを上書きしない設計)。'
+      + '手動実行 = 入庫情報管理画面の「最新の入荷予定を取得」「今すぐPDFを作成してDriveに保存」',
+  },
+  {
+    id: 'rankcheck-csv-export',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '楽天順位データの CSV 生成 → Google Drive 保存。止まっても当日業務は回るが、履歴が静かに欠ける',
+    where: 'Render bfaith-portal 内 node-cron (apps/ranking-checker/scheduler.js)',
+    schedule: '毎日 09:00',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 0,
+    grace_hours: 12,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「CSV出力」を検索。順位取得そのものは miniPC 側 (rankcheck-runner) が担当 = そちらが先に止まっていないか確認',
+  },
+  {
+    id: 'mgmt-auto-sync',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '売上分類別粗利の自動同期 (mirror の売上を管理会計テーブルへ取り込み + 未確定月の再計算)。'
+      + '止まるとダッシュボードの数字だけが古くなる',
+    where: 'Render bfaith-portal 内 setInterval (apps/mgmt-accounting/router.js、既定120分間隔)',
+    schedule: '120分ごと (MGMT_AUTOSYNC_INTERVAL_MIN)。監視は「毎朝までに1回は成功しているか」で見る',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 0,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「mgmt-auto-sync」を検索。確定済み月はスキップされる (それ自体は正常)。手動実行 = 管理会計画面の再計算',
+  },
+  {
+    id: 'po-email-dispatcher',
+    type: 'scheduled_job',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: '発注メールの予約送信ワーカー。止まると予約したメールが送られないまま「予約済み」表示で残り、'
+      + '仕入先に届いていないことに気づくのが遅れる',
+    where: 'Render bfaith-portal 内 常駐ワーカー (apps/purchase-orders/email.js、60秒ごと)',
+    schedule: '60秒ごと (生存 ping は1時間に1回へ間引き)。監視は「毎朝までに生存報告があるか」で見る',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 0,
+    grace_hours: 4,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「po-email」を検索。ping は送信0件でも打つので、来ていない = ワーカー自体が止まっている。'
+      + 'Render の再デプロイで復帰する。未送信の予約は queued のまま残るので復帰後に自動で送られる',
+  },
+  {
+    id: 'warehouse-healthcheck',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'miniPC warehouse (wh.bfaith-wh.uk) の死活監視ループ。これが止まると miniPC 障害の一次検知が消える',
+    where: 'Render bfaith-portal 内 node-cron (apps/warehouse/healthcheck.js、5分ごと)',
+    schedule: '5分ごと (生存 ping は1時間に1回へ間引き)。監視は「毎朝までに生存報告があるか」で見る',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 0,
+    grace_hours: 4,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「Healthcheck」を検索。⭐ここの ok は「監視ループが回っている」であって「miniPC が生きている」ではない'
+      + ' (miniPC の異常はこのジョブ自身が GChat へ通知する)',
+  },
 
   {
     id: 'yahoo-oauth-reauth',

@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'crypto';
 import iconv from 'iconv-lite';
 import { getDB } from './db.js';
 import { getSetting, audit, jstToday, isYmd } from './ledger.js';
+import { pingJobThrottled } from '../jobs-monitor/ping-local.js';
 
 const nowIso = () => new Date().toISOString();
 const trimS = v => String(v == null ? '' : v).trim();
@@ -598,14 +599,25 @@ export async function dispatchDueEmailJobs() {
 let dispatcherStarted = false;
 export function startEmailDispatcher() {
   if (dispatcherStarted) return;
+  // ⚠ Render 限定。miniPC も同じ server.js を動かすため、無条件だと発注メールの
+  //   送信ワーカーが2箇所で回る (miniPC 側の DB に予約が残っていれば実送信し得る)。
+  if (!process.env.RENDER) {
+    console.log('[po-email] 非Render環境のためディスパッチャを起動しない');
+    return;
+  }
   dispatcherStarted = true;
   let consecutiveErrors = 0;
   const tick = async () => {
     try {
-      await dispatchDueEmailJobs();
+      const r = await dispatchDueEmailJobs();
       consecutiveErrors = 0;
+      // dead-man 監視 (jobs-registry: po-email-dispatcher)。
+      // 見たいのは「ワーカーが回っているか」なので、送信0件でも生存として報告する。
+      // 60秒ごとに毎回打つ必要はないため1時間に1回へ間引く。
+      pingJobThrottled('po-email-dispatcher', `直近: due=${r.due} 処理=${r.processed}`);
     } catch (e) {
       // 失敗の握り潰しは運用検知を殺す: ログを残し、連続失敗は目立たせる
+      // (ここで ping を打たない = 失敗が続けば dead-man 側で締切超過として現れる)
       consecutiveErrors++;
       console.error(`[po-email] ディスパッチャ失敗 (${consecutiveErrors}回連続):`, e.message);
     } finally {
