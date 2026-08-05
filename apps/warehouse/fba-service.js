@@ -23,6 +23,7 @@ import {
   checkInboundEligibility,
   fetchActiveInboundQuantities,
 } from '../fba-replenishment/inbound-plans.js';
+import { syncInboundHistory } from '../fba-replenishment/inbound-history.js';
 import { syncSkuMappings } from '../fba-replenishment/sheets-sync.js';
 import { generateRecommendations } from '../fba-replenishment/calculation-engine.js';
 
@@ -232,6 +233,76 @@ router.post('/pml/fba-refresh', rateLimitMiddleware('sp-api'), async (req, res) 
   pmlRefreshJobId = job.jobId;
   okResponse(res, job, 202);
 });
+
+// ==========================================
+// FBA納品実績 (Fulfillment Inbound v0)
+//   「いつ・何SKU・何個 のプランを作ったか」を日別に集計するための実績取込。
+//   SP-API を叩けるのはミニPCだけなので、取得と一次保存はここ。Render は下の /sync で引き取る。
+//   fetch-reports (Reports API) とは別のレート枠なので fba-fetch-lock は取らない。
+//   ただしプロセス内の二重起動だけは防ぐ (初回バックフィルが10分超のため)。
+// ==========================================
+let inboundHistoryJobId = null;
+
+router.post('/inbound-history/sync', rateLimitMiddleware('sp-api'), async (req, res) => {
+  if (inboundHistoryJobId) {
+    const { getJob } = await import('./job-manager.js');
+    const existing = getJob(inboundHistoryJobId);
+    if (existing && existing.status === 'running') {
+      return okResponse(res, {
+        jobId: inboundHistoryJobId,
+        status: 'already_running',
+        message: '納品実績の取込が既に実行中です',
+      }, 202);
+    }
+    inboundHistoryJobId = null;
+  }
+
+  const full = req.body?.full === true;
+  const allItems = req.body?.allItems === true;
+  const sinceDays = Number(req.body?.sinceDays) || 14;
+  const itemLimit = Number(req.body?.itemLimit) || 0;
+
+  const job = createJob('fba-inbound-history', async (updateProgress) => {
+    try {
+      updateProgress({ step: 'list', message: full ? '全期間のシップメント一覧を取得中…' : 'シップメント一覧を取得中…' });
+      const result = await syncInboundHistory({
+        full,
+        allItems,
+        sinceDays,
+        itemLimit,
+        onProgress: (p) => {
+          if (p.phase === 'list') {
+            updateProgress({ step: 'list', message: `一覧取得中… ${p.total}件` });
+          } else {
+            updateProgress({ step: 'items', message: `明細取得中… ${p.done}/${p.total}`, done: p.done, total: p.total });
+          }
+        },
+      });
+      return result;
+    } finally {
+      inboundHistoryJobId = null;
+    }
+  });
+
+  inboundHistoryJobId = job.jobId;
+  okResponse(res, job, 202);
+});
+
+// Render が引き取るためのエクスポート。
+// カーソルは (updated_at, shipment_id) の複合。一括取込では同じ秒に何百件も並ぶので、
+// 時刻だけで区切るとページ境界の同秒行が二度と送られない。
+router.get('/sync/inbound-history', dbHandler(async (req, res, db) => {
+  const sinceUpdatedAt = req.query.sinceUpdatedAt || null;
+  const since = sinceUpdatedAt
+    ? { updated_at: sinceUpdatedAt, shipment_id: req.query.sinceShipmentId || '' }
+    : null;
+  return db.exportInboundRows({ since, limit: req.query.limit });
+}));
+
+// ミニPC側の取込状況 (Render 画面のヘルスチェック用)
+router.get('/inbound-history/status', dbHandler(async (req, res, db) => {
+  return db.getInboundSyncStatus();
+}));
 
 // ==========================================
 // スナップショット（同期）

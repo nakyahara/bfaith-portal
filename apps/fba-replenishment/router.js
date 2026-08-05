@@ -20,7 +20,10 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows, getDodaiMaster,
          getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun,
-         getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns } from './db.js';
+         getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
+         getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
+         getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
+         importInboundRows, getInboundSyncCursor } from './db.js';
 import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
@@ -129,6 +132,13 @@ initDb().then(() => {
       console.log(`[FBA-Cron] 土台商品マスタ同期完了: ${dr.count}件`);
     } catch (e) {
       console.error('[FBA-Cron] 土台商品マスタ同期エラー:', e);
+    }
+    // 納品実績 (Fulfillment Inbound v0)。独立したスケジュールを増やさず、ここに1ステップとして載せる。
+    try {
+      const ih = await runInboundHistoryDailySync();
+      console.log(`[FBA-Cron] 納品実績同期完了: シップメント${ih.shipments}件 / 明細${ih.items}件`);
+    } catch (e) {
+      console.error('[FBA-Cron] 納品実績同期エラー:', e);
     }
   });
   console.log('[FBA] 定期同期スケジュール設定: 毎日06:00 JST');
@@ -1713,6 +1723,217 @@ router.get('/picking-prep/print/:id', (req, res) => {
     runAt: rec.run_at,
     planSheets: result.planSheets || [],
     isPublic: false,
+  });
+});
+
+// ==========================================
+// FBA納品実績
+//   日別に「何SKU・何個のプランを作ったか」を集計する画面。
+//   データは SP-API Fulfillment Inbound v0 から。取得はミニPC、ここは引き取りと表示。
+// ==========================================
+
+const JST_DAY_MS = 86400000;
+function jstToday() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+}
+function jstDaysAgo(days) {
+  return new Date(Date.now() + 9 * 3600 * 1000 - days * JST_DAY_MS).toISOString().slice(0, 10);
+}
+
+// ミニPC側の取込ジョブを起動 (完了は /api/jobs/:jobId でポーリング)
+router.post('/api/inbound-history/sync', async (req, res) => {
+  try {
+    const result = await callMiniPC('/inbound-history/sync', {
+      method: 'POST',
+      body: {
+        full: req.body?.full === true,
+        allItems: req.body?.allItems === true,
+        sinceDays: Number(req.body?.sinceDays) || 14,
+        itemLimit: Number(req.body?.itemLimit) || 0,
+      },
+      timeout: 30000,
+    });
+    res.json(result);
+  } catch (e) {
+    console.error('[FBA] 納品実績の取込起動エラー:', e);
+    res.status(502).json({ error: 'ミニPCへの接続に失敗: ' + e.message });
+  }
+});
+
+/**
+ * ミニPCから Render の fba.db へ引き取り。updated_at をカーソルに差分だけ取る。
+ * 画面の「取込」ボタンと 06:00 の cron の両方から呼ぶ。
+ */
+const PULL_MAX_PAGES = 30;
+
+async function pullInboundFromMiniPC(full = false) {
+  let cursor = full ? null : getInboundSyncCursor();
+  let shipments = 0;
+  let items = 0;
+  let pages = 0;
+
+  // 1ページ3000件。2年分でも数ページで終わる。上限は暴走防止。
+  for (let i = 0; i <= PULL_MAX_PAGES; i++) {
+    if (i === PULL_MAX_PAGES) {
+      // 打ち切って正常終了すると「全部取れた」ように見えてしまう。取りこぼしは失敗として扱う。
+      throw new Error(`引き取りがページ上限 ${PULL_MAX_PAGES} に到達しました (${shipments}件まで反映済み)。もう一度実行してください`);
+    }
+    const q = new URLSearchParams({ limit: '3000' });
+    if (cursor?.updated_at) {
+      q.set('sinceUpdatedAt', cursor.updated_at);
+      q.set('sinceShipmentId', cursor.shipment_id || '');
+    }
+    const data = await callMiniPC(`/sync/inbound-history?${q.toString()}`, { timeout: 120000 });
+    if (!data?.ok) {
+      throw new Error('ミニPCからの取得に失敗: ' + (data?.message || JSON.stringify(data)));
+    }
+    const batch = data.shipments || [];
+    if (batch.length === 0) break;
+
+    // next_cursor も一緒に渡す。取り込みが成功したときだけチェックポイントが進む。
+    const saved = importInboundRows({ shipments: batch, items: data.items || [], next_cursor: data.next_cursor });
+    shipments += saved.shipments;
+    items += saved.items;
+    pages += 1;
+
+    if (!data.has_more) break;
+    const next = data.next_cursor;
+    // カーソルが進まないのに続きがある = 取りこぼしが起きている。黙って止まらせない。
+    if (!next?.updated_at ||
+        (cursor && next.updated_at === cursor.updated_at && next.shipment_id === cursor.shipment_id)) {
+      throw new Error('同期カーソルが進みませんでした。取りこぼしの恐れがあるため中断します');
+    }
+    cursor = next;
+  }
+  return { shipments, items, pages, status: getInboundSyncStatus() };
+}
+
+router.post('/api/inbound-history/pull', async (req, res) => {
+  try {
+    const result = await pullInboundFromMiniPC(req.body?.full === true);
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[FBA] 納品実績の引き取りエラー:', e);
+    res.status(502).json({ error: '引き取りに失敗: ' + e.message });
+  }
+});
+
+/**
+ * 日次同期 (06:00 JST の cron から呼ぶ)。
+ * ミニPCで差分取込 → 完了を待つ → Render へ引き取り、までを1本で。
+ * 差分は直近14日 + 明細400件までに制限してあるので、通常は数分で終わる。
+ */
+async function runInboundHistoryDailySync() {
+  const start = await callMiniPC('/inbound-history/sync', {
+    method: 'POST',
+    body: { sinceDays: 14, itemLimit: 400 },
+    timeout: 30000,
+  });
+  if (start?.status === 'already_running') {
+    console.log('[FBA-Cron] 納品実績: ミニPC側で実行中のため今回はpullのみ');
+  } else if (!start?.jobId) {
+    throw new Error('取込ジョブの起動に失敗: ' + JSON.stringify(start));
+  } else {
+    const jobId = start.jobId;
+    const deadline = Date.now() + 25 * 60 * 1000;
+    let done = false;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 10000));
+      let job;
+      try {
+        const resp = await fetch(`${WAREHOUSE_URL}/service-api/jobs/${jobId}`, {
+          headers: getServiceHeaders(),
+          signal: AbortSignal.timeout(15000),
+        });
+        job = await resp.json();
+      } catch {
+        continue; // 一時的な通信断は次の周期で再確認
+      }
+      if (job.status === 'completed') { done = true; break; }
+      if (job.status === 'failed') throw new Error('ミニPC側のジョブが失敗: ' + (job.error || ''));
+    }
+    if (!done) throw new Error('取込ジョブがタイムアウト (25分)');
+  }
+  return pullInboundFromMiniPC(false);
+}
+
+// 日別 / 月別サマリ
+router.get('/api/inbound-history/summary', (req, res) => {
+  const unit = req.query.unit === 'month' ? 'month' : 'day';
+  const opts = {
+    from: req.query.from || null,
+    to: req.query.to || null,
+    includeCancelled: req.query.includeCancelled === '1',
+  };
+  const rows = unit === 'month' ? getInboundMonthlySummary(opts) : getInboundDailySummary(opts);
+  res.json({ unit, count: rows.length, data: rows, status: getInboundSyncStatus() });
+});
+
+// 指定日のシップメント一覧 (日別サマリのドリルダウン)
+// includeCancelled はサマリ側と揃える (揃えないと内訳の合計がサマリと合わない)
+router.get('/api/inbound-history/shipments', (req, res) => {
+  const date = req.query.date;
+  if (!date) return res.status(400).json({ error: 'date が必要です' });
+  const shipments = getInboundShipmentsByDate(date, { includeCancelled: req.query.includeCancelled === '1' });
+  res.json({ date, count: shipments.length, data: shipments });
+});
+
+// 1シップメントの明細
+router.get('/api/inbound-history/items/:shipmentId', (req, res) => {
+  res.json({ shipment_id: req.params.shipmentId, data: getInboundItems(req.params.shipmentId) });
+});
+
+// 未受領一覧 (問い合わせ用)
+router.get('/api/inbound-history/unreceived', (req, res) => {
+  const minDays = Number(req.query.minDays) || 0;
+  const rows = getInboundUnreceived({ minDays });
+  res.json({ count: rows.length, data: rows });
+});
+
+// 取込状況 + 作成日が取れなかったシップメント
+router.get('/api/inbound-history/status', (req, res) => {
+  res.json({ status: getInboundSyncStatus(), no_date: getInboundShipmentsWithoutDate() });
+});
+
+// 画面
+router.get('/inbound-history', (req, res) => {
+  res.render('fba-inbound-history', {
+    title: 'FBA納品実績',
+    username: req.session?.email,
+    displayName: req.session?.displayName,
+  });
+});
+
+// 印刷 (日別サマリ + 未受領の2部構成)
+router.get('/inbound-history/print', (req, res) => {
+  const from = req.query.from || jstDaysAgo(30);
+  const to = req.query.to || jstToday();
+  const unit = req.query.unit === 'month' ? 'month' : 'day';
+  const includeCancelled = req.query.includeCancelled === '1';
+  const withUnreceived = req.query.unreceived !== '0';
+  const minDays = Number(req.query.minDays) || 0;
+
+  const summary = unit === 'month'
+    ? getInboundMonthlySummary({ from, to, includeCancelled })
+    : getInboundDailySummary({ from, to, includeCancelled });
+
+  // 印刷は期間内のシップメントに絞る (未受領は期間外の古いものも拾えるが、紙は期間で揃える)
+  const unreceived = withUnreceived
+    ? getInboundUnreceived({ minDays }).filter(r => !r.created_date || (r.created_date >= from && r.created_date <= to))
+    : [];
+
+  const totals = summary.reduce((a, r) => ({
+    shipment_count: a.shipment_count + (r.shipment_count || 0),
+    qty_shipped: a.qty_shipped + (r.qty_shipped || 0),
+    qty_received: a.qty_received + (r.qty_received || 0),
+    qty_unreceived: a.qty_unreceived + (r.qty_unreceived || 0),
+  }), { shipment_count: 0, qty_shipped: 0, qty_received: 0, qty_unreceived: 0 });
+
+  res.render('fba-inbound-history-print', {
+    title: `FBA納品実績 ${from} 〜 ${to}`,
+    from, to, unit, includeCancelled, minDays,
+    summary, unreceived, totals,
+    printedAt: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' '),
   });
 });
 
