@@ -780,18 +780,29 @@ export function replaceInboundItems(shipmentId, items) {
  */
 export function getShipmentsNeedingItemSync(opts = {}) {
   const graceDays = opts.graceDays ?? 60;
+  // minCreatedDate: 明細は1シップメント1〜2リクエストかかるので、集計に使わない
+  // 古いシップメントまで取りに行かない。作成日不明 (NULL) は判断できないので対象に残す。
+  const dateGuard = opts.minCreatedDate ? ` AND (created_date IS NULL OR created_date >= ?)` : '';
+  const dateParam = opts.minCreatedDate ? [opts.minCreatedDate] : [];
+
   if (opts.all) {
-    return queryAll(`SELECT shipment_id, shipment_status FROM fba_inbound_shipments ORDER BY created_date DESC`);
+    return queryAll(
+      `SELECT shipment_id, shipment_status FROM fba_inbound_shipments
+        WHERE 1=1${dateGuard}
+        ORDER BY created_date DESC`,
+      dateParam
+    );
   }
   return queryAll(
     `SELECT shipment_id, shipment_status
        FROM fba_inbound_shipments
-      WHERE items_synced_at IS NULL
-         OR shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED')
-         OR (total_shipped > total_received
-             AND (created_date IS NULL OR created_date >= date('now','+9 hours',?)))
+      WHERE (items_synced_at IS NULL
+             OR shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED')
+             OR (total_shipped > total_received
+                 AND (created_date IS NULL OR created_date >= date('now','+9 hours',?))))
+            ${dateGuard}
       ORDER BY created_date DESC`,
-    [`-${graceDays} days`]
+    [`-${graceDays} days`, ...dateParam]
   );
 }
 
