@@ -47,13 +47,17 @@ function parseRange(q) {
 }
 
 /**
- * 集計本体。日 × モール × 配送方法の明細と、画面が使う集計軸をまとめて返す。
+ * 集計本体。日 or 月 × モール × 配送方法の明細と、画面が使う集計軸をまとめて返す。
  * slips は「出荷確定した伝票すべて」、cancelled_slips はその内数。
  * basis='shipped' … 出荷確定した伝票すべて = 発送1件として数える (既定)
  * basis='valid'   … そこからキャンセル扱いを引いた数
+ * granularity='day' | 'month' … 集計の粒度。month のときは各期間に
+ *   「出荷があった日数 (稼働日)」と「1日あたりの平均」を付ける
+ *   (休業日を含めた暦日で割ると実感とズレるため、分母は出荷実績のある日)
  */
-function loadVolume({ from, to, basis, malls, methods }) {
+function loadVolume({ from, to, basis, malls, methods, granularity }) {
   const db = getMirrorDB();
+  const isMonth = granularity === 'month';
   const countExpr = basis === 'valid' ? '(slips - cancelled_slips)' : 'slips';
 
   const where = ['ship_date >= ?', 'ship_date <= ?'];
@@ -76,36 +80,56 @@ function loadVolume({ from, to, basis, malls, methods }) {
     ORDER BY ship_date, shop_code, delivery_id
   `).all(...params);
 
-  const byDate = new Map();
+  const byBucket = new Map();
   const byMall = new Map();
   const byMethod = new Map();
+  const workDays = new Map(); // bucket → 出荷があった日の集合 (月の1日平均の分母)
   let total = 0;
   let cancelled = 0;
   for (const r of rows) {
     const mall = r.shop_name || `店舗${r.shop_code}`;
     const method = r.delivery_name || '(未設定)';
+    const key = isMonth ? r.ship_date.slice(0, 7) : r.ship_date;
     total += r.n;
     cancelled += r.cancelled_slips;
-    if (!byDate.has(r.ship_date)) byDate.set(r.ship_date, { date: r.ship_date, total: 0, malls: {}, methods: {} });
-    const d = byDate.get(r.ship_date);
+    if (!byBucket.has(key)) byBucket.set(key, { date: key, total: 0, malls: {}, methods: {} });
+    const d = byBucket.get(key);
     d.total += r.n;
     d.malls[mall] = (d.malls[mall] || 0) + r.n;
     d.methods[method] = (d.methods[method] || 0) + r.n;
     byMall.set(mall, (byMall.get(mall) || 0) + r.n);
     byMethod.set(method, (byMethod.get(method) || 0) + r.n);
+    if (isMonth) {
+      if (!workDays.has(key)) workDays.set(key, new Set());
+      workDays.get(key).add(r.ship_date);
+    }
   }
 
   const sortDesc = (m) => [...m.entries()].sort((a, b) => b[1] - a[1]).map(([name, n]) => ({ name, n }));
-  const days = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const days = [...byBucket.values()].sort((a, b) => a.date.localeCompare(b.date));
+  if (isMonth) {
+    for (const d of days) {
+      d.work_days = workDays.get(d.date).size;
+      d.avg_per_day = d.work_days ? Math.round(d.total / d.work_days) : 0;
+    }
+  }
+
+  // 全体の日数 (月別表示でも「1日あたり」の分母は実際に出荷があった日数)
+  const totalWorkDays = isMonth
+    ? days.reduce((a, d) => a + d.work_days, 0)
+    : days.length;
 
   return {
     from, to, basis: basis === 'valid' ? 'valid' : 'shipped',
+    granularity: isMonth ? 'month' : 'day',
     total, cancelled,
     days,
     rows,
     malls: sortDesc(byMall),
     methods: sortDesc(byMethod),
-    avgPerDay: days.length ? Math.round(total / days.length) : 0,
+    workDays: totalWorkDays,
+    avgPerDay: totalWorkDays ? Math.round(total / totalWorkDays) : 0,
+    avgPerBucket: days.length ? Math.round(total / days.length) : 0,
   };
 }
 
@@ -143,6 +167,7 @@ router.get('/api/volume', (req, res) => {
     const { from, to } = parseRange(req.query);
     const { rows, ...summary } = loadVolume({
       from, to, basis: String(req.query.basis || 'shipped'),
+      granularity: String(req.query.granularity || 'day'),
       malls: asArray(req.query.mall), methods: asArray(req.query.method),
     });
     res.json({ ok: true, ...summary }); // 明細は CSV 側で返す (画面は集計だけで足りる)
@@ -159,6 +184,7 @@ router.get('/api/volume.csv', (req, res) => {
     // 画面の絞り込みをそのまま反映した明細を出す (loadVolume が同じ条件で引いた rows を使う)
     const data = loadVolume({
       from, to, basis: String(req.query.basis || 'shipped'),
+      granularity: String(req.query.granularity || 'day'),
       malls: asArray(req.query.mall), methods: asArray(req.query.method),
     });
     // Excel の数式インジェクション対策: 先頭が = + - @ (と制御文字) のセルは ' を付けて無害化する。
@@ -168,6 +194,28 @@ router.get('/api/volume.csv', (req, res) => {
       if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
+    if (data.granularity === 'month') {
+      // 月別表示のときは月粒度に畳んで出す (画面と同じ粒度でないと突き合わせられない)
+      const agg = new Map();
+      for (const r of data.rows) {
+        const mall = r.shop_name || `店舗${r.shop_code}`;
+        const method = r.delivery_name || '(未設定)';
+        const key = `${r.ship_date.slice(0, 7)}${mall}${method}`;
+        if (!agg.has(key)) agg.set(key, { ym: r.ship_date.slice(0, 7), mall, method, n: 0, cancelled: 0, days: new Set() });
+        const a = agg.get(key);
+        a.n += r.n;
+        a.cancelled += r.cancelled_slips;
+        a.days.add(r.ship_date);
+      }
+      const lines = ['出荷月,モール,配送方法,件数,うちキャンセル,出荷があった日数,1日あたり平均'];
+      for (const a of [...agg.values()].sort((x, y) => x.ym.localeCompare(y.ym) || x.mall.localeCompare(y.mall) || x.method.localeCompare(y.method))) {
+        lines.push([a.ym, a.mall, a.method, a.n, a.cancelled, a.days.size,
+          a.days.size ? Math.round(a.n / a.days.size) : 0].map(esc).join(','));
+      }
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="shipments_monthly_${data.from}_${data.to}.csv"`);
+      return res.send('﻿' + lines.join('\r\n'));
+    }
     const lines = ['出荷日,モール,配送方法,件数,うちキャンセル'];
     for (const r of data.rows) {
       lines.push([

@@ -88,6 +88,39 @@ console.log('\n── 絞り込み (Amazon × AES = 中原さんの見たい軸)
   eq(r2.json.total, 802, 'モールだけの絞り込み (AES 以外の Amazon も含む)');
 }
 
+console.log('\n── 月別 (granularity=month) ──');
+{
+  // 7月分を足して月またぎを作る: 7/31 楽天 ネコポス 100 (1日だけ)
+  db.prepare(`INSERT INTO mirror_shipments_daily
+    (ship_date, shop_code, shop_name, platform, delivery_id, delivery_name, slips, cancelled_slips, source_updated_at, synced_at)
+    VALUES ('2026-07-31','1','雑貨イズム楽天市場店','rakuten','28','ヤマト(ネコポス)',100,0,NULL,'2026-08-05T07:00:00Z')`).run();
+
+  const r = await get('/api/volume?from=2026-07-01&to=2026-08-05&granularity=month');
+  eq(r.json.granularity, 'month', '粒度が month で返る');
+  eq(r.json.days.map(d => d.date), ['2026-07', '2026-08'], 'バケットは YYYY-MM');
+  eq(r.json.days.map(d => d.total), [100, 1186], '月ごとの合計');
+  eq(r.json.days.map(d => d.work_days), [1, 2], '出荷があった日数 (稼働日)');
+  eq(r.json.days.map(d => d.avg_per_day), [100, 593], '月ごとの1日平均 (稼働日で割る)');
+  eq(r.json.days[1].malls['雑貨イズムAmazon店'], 802, '月 × モール');
+  eq(r.json.days[1].methods['AES'], 795, '月 × 配送方法');
+  eq(r.json.total, 1286, '期間合計');
+  eq(r.json.avgPerBucket, 643, '月平均 (1286 / 2ヶ月)');
+  eq(r.json.workDays, 3, '期間内で出荷があった日数');
+  eq(r.json.avgPerDay, 429, '1日平均は稼働日3日で割る (暦日ではない)');
+
+  const day = await get('/api/volume?from=2026-07-01&to=2026-08-05');
+  eq(day.json.granularity, 'day', '既定は日別のまま');
+  eq(day.json.total, 1286, '粒度を変えても合計は同じ');
+
+  const csv = await get('/api/volume.csv?from=2026-07-01&to=2026-08-05&granularity=month');
+  const lines = csv.text.trim().split('\r\n');
+  eq(lines[0].replace('﻿', ''), '出荷月,モール,配送方法,件数,うちキャンセル,出荷があった日数,1日あたり平均', '月別CSVのヘッダ');
+  ok(lines.some(l => l.startsWith('2026-07,雑貨イズム楽天市場店,ヤマト(ネコポス),100,0,1,100')), '月別CSVの行 (平均つき)');
+  ok(lines.some(l => l.startsWith('2026-08,雑貨イズムAmazon店,AES,795,2,2,398')), '月にまたがる行が畳まれている');
+
+  db.prepare("DELETE FROM mirror_shipments_daily WHERE ship_date='2026-07-31'").run();
+}
+
 console.log('\n── 期間・不正入力 ──');
 {
   const r = await get('/api/volume?from=2026-08-05&to=2026-08-04');
