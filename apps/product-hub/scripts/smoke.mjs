@@ -2227,5 +2227,26 @@ for (const [name, file, data] of renders) {
   }
 }
 
+// ─── EJS 内クライアントJSの構文チェック ───
+// レンダリングは通っても <script> 内の構文エラー (例: 文字列リテラル内の生改行) は検出できず、
+// ボタン全滅の形で本番に出る (#700 の confirm 事故)。EJS タグを無害値に置換して構文だけ検証する。
+{
+  const fs = await import('node:fs');
+  const vm = await import('node:vm');
+  for (const f of fs.readdirSync(views).filter((n) => n.endsWith('.ejs'))) {
+    const src = fs.readFileSync(path.join(views, f), 'utf8');
+    const blocks = [...src.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    if (blocks.length === 0) continue;
+    const js = blocks.join('\n').replace(/<%[-=]?[\s\S]*?%>/g, '0');
+    try {
+      // vm.Script はコンパイルのみで実行しない = 構文チェック専用
+      new vm.Script(js, { filename: f });
+      check(`client-js syntax ${f}`, true);
+    } catch (e) {
+      check(`client-js syntax ${f}`, false, e.message);
+    }
+  }
+}
+
 console.log(failed === 0 ? '\nSMOKE: ALL PASS' : `\nSMOKE: ${failed} FAILED`);
 process.exit(failed === 0 ? 0 : 1);
