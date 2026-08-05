@@ -71,6 +71,13 @@ for (const [label, rows] of cases) {
 }
 eq(count(), 2, '拒否されても既存の2行は残っている (全消し前に検証している)');
 
+console.log('\n── 配列以外は 400 ──');
+for (const [label, v] of [['オブジェクト', {}], ['文字列', 'abc'], ['数値', 1]]) {
+  const r = await post({ shipments_daily: v });
+  ok(r.status === 400, `shipments_daily が${label} → 400 (成功扱いで無視しない)`);
+}
+eq(count(), 2, '400 のときも既存行は残る');
+
 console.log('\n── 正当な0件は反映する ──');
 {
   const r = await post({ shipments_daily: [] });

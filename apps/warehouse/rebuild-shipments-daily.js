@@ -109,6 +109,11 @@ export function rebuildShipmentsDaily(db, opts = {}) {
   });
 
   const res = tx();
+  // 再構築が成功した時刻を残す。sync-to-render はこれを見て「今日ちゃんと作り直された表か」を
+  // 判定する。これが無いと、再構築に失敗した日でも SELECT 自体は成功するので、古い表や
+  // (初回失敗なら) 空の表を「最新」として Render に送ってしまう (Codex R4 high)。
+  db.prepare('INSERT OR REPLACE INTO sync_meta (key, value, updated_at) VALUES (?, ?, ?)')
+    .run('shipments_daily_rebuilt_at', new Date().toISOString(), updatedAt);
   return { from, to, ...res };
 }
 

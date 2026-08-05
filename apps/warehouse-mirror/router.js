@@ -334,7 +334,12 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
     // shipments_daily（全件置換、日次出荷サマリ）
     //   1年分でも数千行なので毎回まるごと差し替える。miniPC 側で --all 再構築しているため、
     //   出荷取消・出荷日訂正による「減り」も置換で正しく反映される。
-    if (req.body.shipments_daily && Array.isArray(req.body.shipments_daily)) {
+    if (req.body.shipments_daily !== undefined) {
+      // キーがあるのに配列でない = 送信側の不具合。黙って無視すると「同期できていない」ことに
+      // 気付けないので 400 で落とす (Codex R4 medium)
+      if (!Array.isArray(req.body.shipments_daily)) {
+        return res.status(400).json({ error: 'shipments_daily は配列である必要があります' });
+      }
       const rows = req.body.shipments_daily;
       // 全消し前に全行を検証する。SQLite は INTEGER 列にも文字列を入れられるので、
       // 送信側の不具合で "abc" や 負数、cancelled > slips が入ると画面の集計が壊れる。

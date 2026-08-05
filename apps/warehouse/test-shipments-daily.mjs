@@ -184,6 +184,16 @@ db.prepare('DELETE FROM f_shipments_daily').run();
     '出荷確定が取り消された伝票は再構築で件数から消える');
 }
 
+// ─────────────── 3e. 再構築時刻の記録 (Render 同期の鮮度判定に使う) ───────────────
+console.log('\n── 再構築時刻を sync_meta に残す ──');
+{
+  db.prepare("DELETE FROM sync_meta WHERE key = 'shipments_daily_rebuilt_at'").run();
+  rebuildShipmentsDaily(db, { all: true });
+  const m = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_rebuilt_at'").get();
+  ok(!!m && !Number.isNaN(Date.parse(m.value)), '再構築のたびに shipments_daily_rebuilt_at を更新する');
+  ok(Math.abs(Date.now() - Date.parse(m.value)) < 60000, '記録される時刻は現在時刻');
+}
+
 // ─────────────── 3c. 取得区間の二分割 ───────────────
 console.log('\n── splitWindow (1レスポンスに収まらない区間の二分割) ──');
 {
