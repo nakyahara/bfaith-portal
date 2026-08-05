@@ -923,6 +923,14 @@ export async function registerItem(draftId, { actor = null } = {}) {
     // 公開直行化で従来の非公開孤児より影響が大きい)。GET で実在を照合して確定させる
     let probe = null;
     try { probe = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`); } catch (_) { /* 照合も不通 */ }
+    if (probe?.status === 404) {
+      // 直後の 404 は失敗を確定しない (Codex R2 High): 元の PUT が warehouse 側でまだ処理中なら
+      // この後に商品が作られ得る。warehouse→RMS のタイムアウト上限 (90s) を待てば PUT は必ず
+      // 決着しているので、そこで再照合した結果だけを信じる (レアな経路なので待ち時間は許容)
+      await new Promise((resolve) => setTimeout(resolve, 90_000));
+      probe = null;
+      try { probe = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`); } catch (_) { /* 照合も不通 */ }
+    }
     if (probe?.status === 200) {
       r = { status: 200, data: probe.data }; // 登録自体は通っていた → 成功として記録を続行
     } else if (probe?.status === 404) {
