@@ -87,8 +87,9 @@
     <div class="status-bar">
       <span id="syncInfo">取込状況を確認中…</span>
       <span style="flex:1"></span>
+      <button class="btn btn-sec" id="pullBtn" onclick="pullOnly()" title="Amazonへは問い合わせず、ミニPCが既に持っているデータをこの画面へ反映します (数十秒)">ポータルへ反映のみ</button>
       <button class="btn btn-primary" id="syncBtn" onclick="runSync(false)">Amazonから取込 (差分)</button>
-      <button class="btn btn-sec" id="fullSyncBtn" onclick="runSync(true)" title="2年分を取り直します。10分以上かかります">全期間を取り直す</button>
+      <button class="btn btn-sec" id="fullSyncBtn" onclick="runSync(true)" title="2年分を取り直します。50分ほどかかります">全期間を取り直す</button>
     </div>
     <div class="msg" id="msg"></div>
 
@@ -230,8 +231,14 @@ function renderStatus(s) {
   if (!s) return;
   const parts = [];
   parts.push(`シップメント <b>${fmt(s.total_shipments)}</b>件`);
-  if (s.date_from) parts.push(`期間 <b>${esc(s.date_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
+  // 明細がある範囲はシップメント自体の存在範囲より狭い。ただし「連続して揃っている」
+  // 保証はないので、断定的な「集計可能」とは書かず、未取得件数と併記して判断させる
+  if (s.detail_from) parts.push(`明細あり <b>${esc(s.detail_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
+  else if (s.date_from) parts.push(`期間 <b>${esc(s.date_from)}</b> 〜 <b>${esc(s.date_to)}</b>`);
   if (s.items_pending > 0) parts.push(`<span style="color:#b45309">明細未取得 ${fmt(s.items_pending)}件</span>`);
+  if (s.items_out_of_range > 0) {
+    parts.push(`<span class="muted" title="2年より前のシップメント。明細は取りに行かない設定のため、取り残しではありません">対象外 ${fmt(s.items_out_of_range)}件</span>`);
+  }
   if (s.created_date_missing > 0) parts.push(`<span style="color:#b45309">作成日不明 ${fmt(s.created_date_missing)}件</span>`);
   if (s.last_synced_at) parts.push(`最終同期 <b>${esc(s.last_synced_at)}</b>`);
   document.getElementById('syncInfo').innerHTML = parts.join(' ／ ');
@@ -297,9 +304,14 @@ function renderSummary() {
 
 async function loadUnreceived() {
   updatePrintLink();
-  const minDays = document.getElementById('minDays').value || 0;
+  // 期間はサマリと揃える。揃えないと2年前の未受領まで並び、問い合わせ対象が埋もれる
+  const q = new URLSearchParams({ minDays: document.getElementById('minDays').value || 0 });
+  const from = document.getElementById('from').value;
+  const to = document.getElementById('to').value;
+  if (from) q.set('from', from);
+  if (to) q.set('to', to);
   try {
-    const r = await fetch(API + '/unreceived?minDays=' + encodeURIComponent(minDays));
+    const r = await fetch(API + '/unreceived?' + q.toString());
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || '取得に失敗');
     unrecvRows = d.data || [];
@@ -388,6 +400,22 @@ function downloadCsv() {
 }
 
 // ===== 取込 (ミニPC経由) =====
+
+// Amazonへは問い合わせず、ミニPCが既に持っているデータを引き取るだけ。
+// 「差分取込」は明細の取り直しが入るので、反映だけしたいときはこちらが速い。
+async function pullOnly() {
+  const btns = ['pullBtn', 'syncBtn', 'fullSyncBtn'].map(id => document.getElementById(id));
+  btns.forEach(b => { b.disabled = true; });
+  showMsg('ミニPCからポータルへ反映しています…', 'info');
+  try {
+    await pullToPortal(false);
+  } catch (e) {
+    showMsg('反映に失敗: ' + esc(e.message), 'err');
+  } finally {
+    btns.forEach(b => { b.disabled = false; });
+  }
+}
+
 async function runSync(full) {
   const btn = document.getElementById('syncBtn');
   const fullBtn = document.getElementById('fullSyncBtn');

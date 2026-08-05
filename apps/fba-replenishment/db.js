@@ -780,18 +780,29 @@ export function replaceInboundItems(shipmentId, items) {
  */
 export function getShipmentsNeedingItemSync(opts = {}) {
   const graceDays = opts.graceDays ?? 60;
+  // minCreatedDate: 明細は1シップメント1〜2リクエストかかるので、集計に使わない
+  // 古いシップメントまで取りに行かない。作成日不明 (NULL) は判断できないので対象に残す。
+  const dateGuard = opts.minCreatedDate ? ` AND (created_date IS NULL OR created_date >= ?)` : '';
+  const dateParam = opts.minCreatedDate ? [opts.minCreatedDate] : [];
+
   if (opts.all) {
-    return queryAll(`SELECT shipment_id, shipment_status FROM fba_inbound_shipments ORDER BY created_date DESC`);
+    return queryAll(
+      `SELECT shipment_id, shipment_status FROM fba_inbound_shipments
+        WHERE 1=1${dateGuard}
+        ORDER BY created_date DESC`,
+      dateParam
+    );
   }
   return queryAll(
     `SELECT shipment_id, shipment_status
        FROM fba_inbound_shipments
-      WHERE items_synced_at IS NULL
-         OR shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED')
-         OR (total_shipped > total_received
-             AND (created_date IS NULL OR created_date >= date('now','+9 hours',?)))
+      WHERE (items_synced_at IS NULL
+             OR shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED')
+             OR (total_shipped > total_received
+                 AND (created_date IS NULL OR created_date >= date('now','+9 hours',?))))
+            ${dateGuard}
       ORDER BY created_date DESC`,
-    [`-${graceDays} days`]
+    [`-${graceDays} days`, ...dateParam]
   );
 }
 
@@ -892,6 +903,11 @@ export function getInboundUnreceived(opts = {}) {
     `s.shipment_status NOT IN ('CANCELLED', 'DELETED')`,
   ];
   const params = [];
+  // 期間で絞れないと2年前の未受領まで並び、問い合わせ対象が埋もれる (実データで1,226件出た)。
+  // 作成日不明の行は期間で判定できないので落とさない。落とすと画面が
+  // 「作成日不明 N件」と警告しているのに一覧から黙って消えることになる。
+  if (opts.from) { where.push(`(s.created_date IS NULL OR s.created_date >= ?)`); params.push(opts.from); }
+  if (opts.to) { where.push(`(s.created_date IS NULL OR s.created_date <= ?)`); params.push(opts.to); }
   if (minDays > 0) {
     where.push(`(s.created_date IS NOT NULL AND julianday('now','+9 hours') - julianday(s.created_date) >= ?)`);
     params.push(minDays);
@@ -909,19 +925,48 @@ export function getInboundUnreceived(opts = {}) {
   );
 }
 
-/** 取込状況 (画面ヘッダ表示・健全性確認用)。 */
-export function getInboundSyncStatus() {
+/**
+ * 取込状況 (画面ヘッダ表示・健全性確認用)。
+ * items_pending は「取り残し」として画面に出るので、明細を取りに行かないと決めた
+ * 範囲外 (既定2年より前) のシップメントは数えない。数えると 1,158件が
+ * 永遠に「未取得」として出続け、本当の取り残しと区別できなくなる。
+ */
+export function getInboundSyncStatus(opts = {}) {
+  const historyDays = opts.historyDays ?? 730;
+  const minCreatedDate = opts.minCreatedDate
+    ?? new Date(Date.now() + 9 * 3600 * 1000 - historyDays * 86400000).toISOString().slice(0, 10);
+
   const total = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments`)?.c || 0;
-  const noItems = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments WHERE items_synced_at IS NULL`)?.c || 0;
+  const noItems = queryOne(
+    `SELECT COUNT(*) AS c FROM fba_inbound_shipments
+      WHERE items_synced_at IS NULL AND (created_date IS NULL OR created_date >= ?)`,
+    [minCreatedDate]
+  )?.c || 0;
+  const outOfRange = queryOne(
+    `SELECT COUNT(*) AS c FROM fba_inbound_shipments
+      WHERE items_synced_at IS NULL AND created_date IS NOT NULL AND created_date < ?`,
+    [minCreatedDate]
+  )?.c || 0;
   const noDate = queryOne(`SELECT COUNT(*) AS c FROM fba_inbound_shipments WHERE created_date IS NULL`)?.c || 0;
   const range = queryOne(`SELECT MIN(created_date) AS min_d, MAX(created_date) AS max_d FROM fba_inbound_shipments WHERE created_date IS NOT NULL`);
+  // 「明細が取れている最古の日」。取得対象範囲の内側に限る (範囲外に1件でも
+  // 取得済みが混じると、実際には集計できない古い日付まで伸びてしまうため)。
+  // ⚠️ これは連続した期間の保証ではない。途中に未取得が混じる可能性があるので、
+  //    画面では items_pending と併記して判断させる。
+  const inRange = queryOne(
+    `SELECT MIN(created_date) AS min_d FROM fba_inbound_shipments
+      WHERE created_date IS NOT NULL AND items_synced_at IS NOT NULL AND created_date >= ?`,
+    [minCreatedDate]
+  );
   const lastSync = queryOne(`SELECT MAX(updated_at) AS t FROM fba_inbound_shipments`)?.t || null;
   return {
     total_shipments: total,
-    items_pending: noItems,
+    items_pending: noItems,             // 取りに行くべきなのに未取得 = 本当の取り残し
+    items_out_of_range: outOfRange,     // 取りに行かないと決めた範囲外 (異常ではない)
     created_date_missing: noDate,
-    date_from: range?.min_d || null,
+    date_from: range?.min_d || null,     // シップメントが存在する範囲
     date_to: range?.max_d || null,
+    detail_from: inRange?.min_d || null, // 明細が取れている最古の日 (連続性の保証はない)
     last_synced_at: lastSync,
   };
 }

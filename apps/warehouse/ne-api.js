@@ -25,6 +25,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { initDB, getDB, updateSyncMeta } from './db.js';
 import { makeNeOrdersUpserter } from './ne-orders-upsert.js';
+import { makeNeOrderBaseUpserter, toOrderBaseRow, NE_ORDER_BASE_FIELDS } from './ne-order-base-upsert.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
@@ -306,15 +307,19 @@ async function fetchOrders(days = 7) {
   const startStr = startDate.toISOString().slice(0, 10) + ' 00:00:00';
   const endStr = endDate.toISOString().slice(0, 10) + ' 23:59:59';
 
-  // Step 1: 受注ベース（伝票レベル）を取得 → Mapに保持
+  // Step 1: 受注ベース（伝票レベル）を取得 → Mapに保持 + raw_ne_order_base へ UPSERT
+  //   fields に配送方法 (delivery_id/name) を含むので、明細 JOIN 用の情報を取るついでに
+  //   伝票粒度テーブルも同じレスポンスから埋まる (API 呼び出しは増えない)。
   console.log('[NE] Step 1: 受注ベース取得');
-  const baseFields = 'receive_order_id,receive_order_shop_cut_form_id,receive_order_date,receive_order_shop_id,receive_order_order_status_id,receive_order_order_status_name,receive_order_send_date,receive_order_cancel_type_id,receive_order_cancel_date';
   const baseMap = new Map(); // 伝票番号 → base情報
+  const upsertOrderBase = makeNeOrderBaseUpserter(db);
+  let baseInserted = 0;
+  let baseUpdated = 0;
 
   let baseOffset = 0;
   while (true) {
     const data = await callNE('/api_v1_receiveorder_base/search', {
-      fields: baseFields,
+      fields: NE_ORDER_BASE_FIELDS,
       'receive_order_date-gte': startStr,
       'receive_order_date-lte': endStr,
       limit: '1000',
@@ -327,10 +332,21 @@ async function fetchOrders(days = 7) {
       const id = item.receive_order_id || '';
       if (id) baseMap.set(id, item);
     }
+    const tx = db.transaction(() => {
+      for (const item of items) {
+        const row = toOrderBaseRow(item);
+        if (!row) continue;
+        const outcome = upsertOrderBase(row, ts);
+        if (outcome === 'inserted') baseInserted++;
+        else if (outcome === 'updated') baseUpdated++;
+      }
+    });
+    tx();
     console.log(`[NE] 受注ベース: ${baseMap.size}件 (offset: ${baseOffset})`);
     baseOffset += 1000;
     if (items.length < 1000) break;
   }
+  console.log(`[NE] 受注ベース保存: ${baseInserted}件挿入, ${baseUpdated}件更新`);
 
   // Step 2: 受注明細を取得し、baseとJOINしてINSERT
   console.log('[NE] Step 2: 受注明細取得 + JOIN');
@@ -424,6 +440,192 @@ async function fetchOrders(days = 7) {
   return { total, inserted, updated, unchanged };
 }
 
+// ─── 受注ベース取得（出荷確定日ベース）───
+
+/** JST の YYYY-MM-DD (toISOString は UTC なので +9h してから切り出す) */
+function jstDate(offsetDays = 0) {
+  const t = Date.now() + 9 * 3600 * 1000 + offsetDays * 86400 * 1000;
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+/** JST の 'YYYY-MM-DD HH:MM:SS' (NE API の日時は JST。now() は UTC なので混ぜない) */
+function jstNow() {
+  return new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * 出荷確定日ベースで受注ベース（伝票粒度）を取得し raw_ne_order_base へ UPSERT する。
+ *
+ * fetchOrders は「受注日」窓なので、受注から日が空いて出荷確定した伝票を取りこぼす
+ * (2026-08-05 実測: 7月出荷確定分の 0.23% がラグ7日以上)。出荷件数を数える用途では
+ * この取りこぼしがそのまま日次件数の欠損になるため、出荷確定日ベースでも取り直す。
+ * 出荷確定済みの伝票は 1 日 800〜1,000 件程度なので、limit 10000 なら通常 API 1 回で済む。
+ *
+ * @param {number} days 何日前まで遡るか (既定 14。当日を含む)
+ */
+async function fetchOrderBaseByShipDate(days = 14) {
+  console.log(`[NE] 受注ベース取得開始（出荷確定日ベース・直近${days}日）`);
+  return fetchOrderBaseRange(`${jstDate(-(days - 1))} 00:00:00`, `${jstDate(0)} 23:59:59`);
+}
+
+/**
+ * 更新日ベースで受注ベースを取得し raw_ne_order_base へ UPSERT する。
+ *
+ * 出荷確定日ベースの取得だけでは「いったん出荷確定した後で確定を取り消された伝票」を
+ * 二度と拾えず、古い出荷確定日が残って件数が過大になる (Codex R1 high)。
+ * NE の受注ベースには receive_order_last_modified_date があり、確定取消・出荷日訂正・
+ * 配送方法変更のいずれでも更新されるので、更新日窓で取り直せば全部追随できる。
+ * 実測 (2026-08-05): 直近 1.5 日で 3,852 件 = API 1 回。
+ *
+ * @param {number} days 何日前まで遡るか (既定 3)
+ */
+async function fetchOrderBaseByModified(days = 3) {
+  await initDB();
+  // 前回どこまで取れたか (watermark) を下限にする。固定 N 日窓だけだと、ミニPC 停止・
+  // 認証切れ・NE 障害が N 日続いたときに、その間の訂正を永久に取りこぼす (Codex R2 medium)。
+  // watermark は「取得を開始した時刻」を成功時にだけ進める。安全側に 1 日重ねて取り直す。
+  const db = getDB();
+  const wm = db.prepare("SELECT value FROM sync_meta WHERE key = 'ne_api_orderbase_modified_watermark'").get();
+  const startedAt = jstNow(); // NE の更新日は JST。UTC の now() を混ぜない
+  const defaultFrom = `${jstDate(-(days - 1))} 00:00:00`;
+  let from = defaultFrom;
+  if (wm && wm.value) {
+    const back = new Date(Date.parse(`${String(wm.value).replace(' ', 'T')}+09:00`) - 86400 * 1000);
+    const wmFrom = new Date(back.getTime() + 9 * 3600 * 1000).toISOString().slice(0, 19).replace('T', ' ');
+    if (wmFrom < from) from = wmFrom; // 停止していた分は遡る
+  }
+  const to = `${jstDate(0)} 23:59:59`;
+  console.log(`[NE] 受注ベース取得開始（更新日ベース・${from} 〜 ${to}）`);
+  const stats = await fetchOrderBase(
+    { 'receive_order_last_modified_date-gte': from, 'receive_order_last_modified_date-lte': to },
+    { label: '更新日', splitRange: [from, to], splitKey: 'receive_order_last_modified_date' }
+  );
+  // ここまで来たら成功。次回はこの実行開始時刻の 1 日前から取り直す
+  updateSyncMeta('ne_api_orderbase_modified_watermark', startedAt);
+  return stats;
+}
+
+const NE_BASE_LIMIT = 10000;
+
+/**
+ * 出荷確定日の任意区間で受注ベースを取得し raw_ne_order_base へ UPSERT する。
+ * バックフィル (backfill-ne-order-base.js) からも使う。
+ *
+ * NE の受注検索はソート順を指定できない (実測: `-asc` 演算子は拒否される) ため、
+ * offset ページングは取得中の更新でページ境界がずれて取りこぼす恐れがある (Codex R1 medium)。
+ * そこで **1 レスポンスに収まらなかった区間は日付で二分割して取り直す**。
+ * 1 日あたり 800〜1,000 件なので、実運用では分割は起きない (バックフィルの繁忙月のみ)。
+ *
+ * @param {string} startStr 'YYYY-MM-DD HH:MM:SS'
+ * @param {string} endStr   'YYYY-MM-DD HH:MM:SS'
+ * @param {{ updateMeta?: boolean }} [opts] updateMeta=false で sync_meta を汚さない
+ *   (バックフィルは過去区間を舐めるだけなので「最終同期」を書き換えてはいけない)
+ */
+export async function fetchOrderBaseRange(startStr, endStr, opts = {}) {
+  return fetchOrderBase(
+    { 'receive_order_send_date-gte': startStr, 'receive_order_send_date-lte': endStr },
+    { ...opts, label: '出荷確定日', splitRange: [startStr, endStr] }
+  );
+}
+
+/**
+ * 受注ベース取得の共通処理 (検索条件だけ差し替える)。
+ * @param {Record<string,string>} where NE API の検索条件
+ * @param {{ updateMeta?: boolean, label?: string, splitRange?: [string, string] }} opts
+ */
+async function fetchOrderBase(where, opts = {}) {
+  const updateMeta = opts.updateMeta !== false;
+  const label = opts.label || '受注ベース';
+  await initDB();
+  const db = getDB();
+  const ts = now();
+  const upsertOrderBase = makeNeOrderBaseUpserter(db);
+
+  const stats = { fetched: 0, inserted: 0, updated: 0, unchanged: 0, requests: 0 };
+
+  const save = (items) => {
+    const tx = db.transaction(() => {
+      for (const item of items) {
+        const row = toOrderBaseRow(item);
+        if (!row) continue;
+        const outcome = upsertOrderBase(row, ts);
+        if (outcome === 'inserted') stats.inserted++;
+        else if (outcome === 'updated') stats.updated++;
+        else stats.unchanged++;
+        stats.fetched++;
+      }
+    });
+    tx();
+  };
+
+  /** 1区間を取得。LIMIT に達したら日付で二分割して取り直す */
+  const fetchWindow = async (cond, from, to, depth = 0) => {
+    const data = await callNE('/api_v1_receiveorder_base/search', {
+      fields: NE_ORDER_BASE_FIELDS, limit: String(NE_BASE_LIMIT), offset: '0', ...cond,
+    });
+    stats.requests++;
+    const items = data.data || [];
+
+    if (items.length < NE_BASE_LIMIT) {
+      save(items);
+      return;
+    }
+    // LIMIT ちょうど = 取りこぼしの可能性。日付で割れるなら割って取り直す
+    const halves = from && to ? splitWindow(from, to) : null;
+    if (!halves || depth >= 8) {
+      // これ以上割れない (同一日 or 深すぎ) → offset ページングで拾い切る。
+      // 順序保証がないので取りこぼしうる。起きたら日次件数が過少になるため必ず警告を出す。
+      console.warn(`[NE] ⚠ ${label} 区間 ${from}〜${to} が1回で取り切れません (${NE_BASE_LIMIT}件上限)。offset ページングにフォールバックします`);
+      save(items);
+      let offset = NE_BASE_LIMIT;
+      while (true) {
+        const more = await callNE('/api_v1_receiveorder_base/search', {
+          fields: NE_ORDER_BASE_FIELDS, limit: String(NE_BASE_LIMIT), offset: String(offset), ...cond,
+        });
+        stats.requests++;
+        const rows = more.data || [];
+        if (rows.length === 0) break;
+        save(rows);
+        if (rows.length < NE_BASE_LIMIT) break;
+        offset += NE_BASE_LIMIT;
+      }
+      return;
+    }
+    const [a, b] = halves;
+    console.log(`[NE] ${label} 区間を分割: ${a[0]}〜${a[1]} / ${b[0]}〜${b[1]}`);
+    await fetchWindow({ ...cond, [`${opts.splitKey || 'receive_order_send_date'}-gte`]: a[0], [`${opts.splitKey || 'receive_order_send_date'}-lte`]: a[1] }, a[0], a[1], depth + 1);
+    await fetchWindow({ ...cond, [`${opts.splitKey || 'receive_order_send_date'}-gte`]: b[0], [`${opts.splitKey || 'receive_order_send_date'}-lte`]: b[1] }, b[0], b[1], depth + 1);
+  };
+
+  const [rangeFrom, rangeTo] = opts.splitRange || [null, null];
+  await fetchWindow(where, rangeFrom, rangeTo);
+
+  console.log(`[NE] 受注ベース取得完了(${label}): ${stats.fetched}件処理, ${stats.inserted}件挿入, ${stats.updated}件更新, ${stats.unchanged}件変化なし (API ${stats.requests}回)`);
+  if (updateMeta) {
+    updateSyncMeta('ne_api_orderbase_last', now());
+    updateSyncMeta('ne_api_orderbase_range', `${label}: ${rangeFrom || where['receive_order_last_modified_date-gte'] || ''} ~ ${rangeTo || ''}`);
+  }
+  return stats;
+}
+
+/**
+ * 'YYYY-MM-DD HH:MM:SS' の区間を日付境界で2つに割る。同一日なら null (割れない)。
+ * @returns {[[string,string],[string,string]] | null}
+ */
+export function splitWindow(startStr, endStr) {
+  const d0 = startStr.slice(0, 10);
+  const d1 = endStr.slice(0, 10);
+  if (d0 === d1) return null;
+  const t0 = Date.parse(`${d0}T00:00:00Z`);
+  const t1 = Date.parse(`${d1}T00:00:00Z`);
+  const mid = new Date(t0 + Math.floor((t1 - t0) / 2 / 86400000) * 86400000).toISOString().slice(0, 10);
+  const midNext = new Date(Date.parse(`${mid}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+  return [
+    [startStr, `${mid} 23:59:59`],
+    [`${midNext} 00:00:00`, endStr],
+  ];
+}
+
 // ─── メイン ───
 
 async function main() {
@@ -454,17 +656,29 @@ async function main() {
     await fetchOrders(days);
   } else if (command === 'setproducts') {
     await fetchSetProducts();
+  } else if (command === 'order-base') {
+    const days = parseInt(args[1]) || 14;
+    await fetchOrderBaseByShipDate(days);
+  } else if (command === 'order-base-modified') {
+    const days = parseInt(args[1]) || 3;
+    await fetchOrderBaseByModified(days);
   } else if (command === 'sync') {
     await fetchProducts();
     await fetchSetProducts();
     await fetchOrders(7);
+    // 出荷確定日ベースの取り直し (受注日窓から漏れた出荷を拾う。API 1回程度)
+    await fetchOrderBaseByShipDate(14);
+    // 更新日ベースの取り直し (確定取消・出荷日訂正・配送方法変更を追随。API 1回程度)
+    await fetchOrderBaseByModified(3);
   } else {
     console.log('使い方:');
     console.log('  node apps/warehouse/ne-api.js auth <callback_url>  → 初回認証');
     console.log('  node apps/warehouse/ne-api.js products             → 商品マスタ取得');
     console.log('  node apps/warehouse/ne-api.js setproducts          → セット商品取得');
     console.log('  node apps/warehouse/ne-api.js orders [days]        → 受注データ取得');
-    console.log('  node apps/warehouse/ne-api.js sync                 → 全て（商品+セット+受注7日分）');
+    console.log('  node apps/warehouse/ne-api.js order-base [days]    → 受注ベース取得（出荷確定日ベース、既定14日）');
+    console.log('  node apps/warehouse/ne-api.js order-base-modified [days] → 受注ベース取得（更新日ベース、既定3日）');
+    console.log('  node apps/warehouse/ne-api.js sync                 → 全て（商品+セット+受注7日+受注ベース14日+更新分3日）');
     process.exit(1);
   }
 }

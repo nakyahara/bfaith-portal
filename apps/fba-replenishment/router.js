@@ -38,6 +38,7 @@ import { syncSkuMappings, syncDodaiMaster } from './sheets-sync.js';
 import { generateRecommendations } from './calculation-engine.js';
 import { normalizePlanningRow } from './sp-api-reports.js';
 import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-log.js';
+import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
 
@@ -1910,10 +1911,14 @@ router.get('/api/inbound-history/items/:shipmentId', (req, res) => {
   res.json({ shipment_id: req.params.shipmentId, data: getInboundItems(req.params.shipmentId) });
 });
 
-// 未受領一覧 (問い合わせ用)
+// 未受領一覧 (問い合わせ用)。期間はサマリと揃える (揃えないと2年前の分まで並ぶ)
 router.get('/api/inbound-history/unreceived', (req, res) => {
   const minDays = Number(req.query.minDays) || 0;
-  const rows = getInboundUnreceived({ minDays });
+  const rows = getInboundUnreceived({
+    minDays,
+    from: req.query.from || null,
+    to: req.query.to || null,
+  });
   res.json({ count: rows.length, data: rows });
 });
 
@@ -1944,10 +1949,7 @@ router.get('/inbound-history/print', (req, res) => {
     ? getInboundMonthlySummary({ from, to, includeCancelled })
     : getInboundDailySummary({ from, to, includeCancelled });
 
-  // 印刷は期間内のシップメントに絞る (未受領は期間外の古いものも拾えるが、紙は期間で揃える)
-  const unreceived = withUnreceived
-    ? getInboundUnreceived({ minDays }).filter(r => !r.created_date || (r.created_date >= from && r.created_date <= to))
-    : [];
+  const unreceived = withUnreceived ? getInboundUnreceived({ minDays, from, to }) : [];
 
   const totals = summary.reduce((a, r) => ({
     shipment_count: a.shipment_count + (r.shipment_count || 0),
@@ -1960,6 +1962,8 @@ router.get('/inbound-history/print', (req, res) => {
     title: `FBA納品実績 ${from} 〜 ${to}`,
     from, to, unit, includeCancelled, minDays,
     summary, unreceived, totals,
+    chart: buildInboundChart(summary, unit),
+    showChart: req.query.chart !== '0',
     printedAt: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 16).replace('T', ' '),
   });
 });

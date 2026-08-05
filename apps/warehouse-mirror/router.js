@@ -331,6 +331,71 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       log.push(`inv_daily_summary: ${rows.length}件`);
     }
 
+    // shipments_daily（全件置換、日次出荷サマリ）
+    //   1年分でも数千行なので毎回まるごと差し替える。miniPC 側で --all 再構築しているため、
+    //   出荷取消・出荷日訂正による「減り」も置換で正しく反映される。
+    if (req.body.shipments_daily !== undefined) {
+      // キーがあるのに配列でない = 送信側の不具合。黙って無視すると「同期できていない」ことに
+      // 気付けないので 400 で落とす (Codex R4 medium)
+      if (!Array.isArray(req.body.shipments_daily)) {
+        return res.status(400).json({ error: 'shipments_daily は配列である必要があります' });
+      }
+      const rows = req.body.shipments_daily;
+      // 全消し前に全行を検証する。SQLite は INTEGER 列にも文字列を入れられるので、
+      // 送信側の不具合で "abc" や 負数、cancelled > slips が入ると画面の集計が壊れる。
+      // 1行でもおかしければ payload ごと 400 で拒否し、mirror は前回状態のまま残す。
+      const isDate = (s) => {
+        if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+        const d = new Date(`${s}T00:00:00Z`);
+        // Invalid Date に toISOString() すると throw するので先に判定する
+        return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+      };
+      const seen = new Set();
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const where = `shipments_daily[${i}]`;
+        if (!r || typeof r !== 'object') return res.status(400).json({ error: `${where}: 行が不正です` });
+        if (!isDate(r.ship_date)) return res.status(400).json({ error: `${where}: ship_date が不正です (${r.ship_date})` });
+        const shop = String(r.shop_code ?? '');
+        const dlv = String(r.delivery_id ?? '');
+        if (shop.length > 32 || dlv.length > 32) return res.status(400).json({ error: `${where}: shop_code/delivery_id が長すぎます` });
+        if (String(r.shop_name ?? '').length > 200 || String(r.delivery_name ?? '').length > 200) {
+          return res.status(400).json({ error: `${where}: 名称が長すぎます` });
+        }
+        const slips = r.slips;
+        const cancelled = r.cancelled_slips ?? 0;
+        if (!Number.isInteger(slips) || slips < 0) return res.status(400).json({ error: `${where}: slips が非負整数ではありません (${slips})` });
+        if (!Number.isInteger(cancelled) || cancelled < 0) return res.status(400).json({ error: `${where}: cancelled_slips が非負整数ではありません (${cancelled})` });
+        if (cancelled > slips) return res.status(400).json({ error: `${where}: cancelled_slips > slips (${cancelled} > ${slips})` });
+        const key = `${r.ship_date}\u001f${shop}\u001f${dlv}`;
+        if (seen.has(key)) return res.status(400).json({ error: `${where}: キーが重複しています (${key.replace(/\u001f/g, '/')})` });
+        seen.add(key);
+      }
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_shipments_daily');
+        const stmt = db.prepare(`INSERT INTO mirror_shipments_daily (
+          ship_date, shop_code, shop_name, platform, delivery_id, delivery_name,
+          slips, cancelled_slips, source_updated_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+        for (const r of rows) {
+          stmt.run(
+            r.ship_date,
+            String(r.shop_code ?? ''),
+            r.shop_name ?? null,
+            r.platform ?? null,
+            String(r.delivery_id ?? ''),
+            r.delivery_name ?? null,
+            r.slips ?? 0,
+            r.cancelled_slips ?? 0,
+            r.updated_at ?? null,
+            now
+          );
+        }
+      });
+      tx();
+      log.push(`shipments_daily: ${rows.length}件`);
+    }
+
     // rakuten_sku_map（全件置換）
     if (req.body.rakuten_sku_map && req.body.rakuten_sku_map.length > 0) {
       const rskmData = req.body.rakuten_sku_map;

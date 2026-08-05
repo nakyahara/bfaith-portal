@@ -105,6 +105,31 @@ export function buildStockSnapshotSyncParts(db, monthCutoff, chunkSize = 20000) 
   return { fetched: true, parts, count: rows.length };
 }
 
+/** 出荷サマリ (f_shipments_daily) を Render へ送ってよいかの鮮度判定。
+ *
+ * Render へは表の全行をスナップショットとして送るので、送ってよいのは
+ * 「その日の daily-sync で --all 再構築が成功した」ときだけ。
+ *  - 再構築に失敗した日に古い表を送ると、中身は前日のままなのに synced_at だけ新しくなり、
+ *    画面上は最新に見えてしまう (Codex R4/R5 high)
+ *  - 窓を広く取る (26時間など) と「前日の再構築」が通ってしまうので、
+ *    JST の同日 かつ 12時間以内 (daily-sync 07:00 〜 retry 最終 11:30 + 実行時間) とする
+ *
+ * @param {string|null|undefined} rebuiltAtIso sync_meta.shipments_daily_full_rebuilt_at
+ * @param {number} [nowMs] 現在時刻 (テスト用)
+ */
+export function isShipmentsRebuildFresh(rebuiltAtIso, nowMs = Date.now()) {
+  const REBUILD_MAX_AGE_H = 12;
+  const jstDay = (ms) => new Date(ms + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  // 保存形式 (new Date().toISOString()) と完全一致する値だけを受ける。
+  // Date.parse だけだと '2026-08-05' のような日付のみの値や正規化される値も通ってしまう
+  const ms = rebuiltAtIso ? Date.parse(rebuiltAtIso) : NaN;
+  if (Number.isNaN(ms)) return false;
+  if (new Date(ms).toISOString() !== rebuiltAtIso) return false;
+  const ageH = (nowMs - ms) / 3600000;
+  if (ageH < 0 || ageH > REBUILD_MAX_AGE_H) return false; // 未来日付も信用しない
+  return jstDay(ms) === jstDay(nowMs);
+}
+
 export async function syncToRender() {
   requireSyncKey();
   const db = getDB();
@@ -149,6 +174,42 @@ export async function syncToRender() {
     console.log(`[Sync→Render]   inv_daily_summary: ${inv_daily_summary.length}件`);
   } catch (e) {
     console.log(`[Sync→Render]   inv_daily_summary: 取得失敗（スキップ）: ${e.message}`);
+  }
+
+  // 2b-3b. f_shipments_daily (日次出荷サマリ: 出荷日 × モール × 配送方法 の伝票件数)
+  //   判定は isShipmentsRebuildFresh() (このファイル末尾) を参照
+  //   1日あたり数十行 (モール × 配送方法) なので数年分でも数万行。毎回全件送って mirror を置換する
+  //   (miniPC 側は --all 再構築なので、出荷取消・出荷日訂正による「減り」も置換で反映される)。
+  //   shop_name / platform は shops を JOIN 済みの値で送る (mirror 側は shops を持たない)。
+  //   ★ 送るのは「今日ちゃんと再構築された表」だけ。rebuild-shipments-daily が失敗した日は
+  //     SELECT 自体は成功してしまい、古い表 (初回失敗なら空の表) を最新として送って
+  //     mirror を壊す (Codex R4 high)。再構築時刻が REBUILD_MAX_AGE_H より古ければ送らない。
+  //     26時間のような広い窓だと「前日の再構築」も有効扱いになり、当日の再構築が失敗した日に
+  //     前日の表を送って synced_at だけ新しくしてしまう (Codex R5 high)。
+  //     「JST で今日」かつ「12時間以内」= その日の daily-sync (07:00〜、retry 最終11:30) の
+  //     再構築だけが通る条件にする。
+  let shipments_daily = [];
+  let shipments_daily_state = 'ok';
+  try {
+    // 全期間 (--all) の再構築だけを根拠にする。部分再構築 (--days/--from) の時刻では送らない
+    const rebuiltAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'shipments_daily_full_rebuilt_at'").get();
+    if (!isShipmentsRebuildFresh(rebuiltAt?.value)) {
+      shipments_daily_state = 'stale';
+      console.log(`[Sync→Render]   ⚠ shipments_daily: 今日の全期間再構築が無いためスキップ (最終: ${rebuiltAt?.value || 'なし'})。Render は前回分を保持します`);
+    } else {
+      shipments_daily = db.prepare(`
+        SELECT f.ship_date, f.shop_code, s.shop_name, s.platform,
+               f.delivery_id, f.delivery_name, f.slips, f.cancelled_slips, f.updated_at
+        FROM f_shipments_daily f
+        LEFT JOIN shops s ON s.shop_code = f.shop_code
+        ORDER BY f.ship_date, f.shop_code, f.delivery_id
+      `).all();
+      console.log(`[Sync→Render]   shipments_daily: ${shipments_daily.length}件`);
+    }
+  } catch (e) {
+    // 表がまだ無い miniPC (デプロイ順の差) でも既存同期を止めない
+    shipments_daily_state = 'failed';
+    console.log(`[Sync→Render]   shipments_daily: 取得失敗（スキップ）: ${e.message}`);
   }
 
   // 2b-4. inv_daily_detail (D-1c: 詳細層、差分sync)
@@ -348,6 +409,10 @@ export async function syncToRender() {
     const masterPart = {
       products, set_components, amazon_sku_fees, rakuten_sku_map, inv_daily_summary,
     };
+    // 出荷サマリは「当日再構築された表を SELECT できたとき」だけ送る。そのときは 0 件でも送る
+    //   (元が正当に空になった = 全部消えたケースを mirror に反映できないと古い件数が残り続ける)。
+    //   SELECT 失敗 (failed) / 再構築が古い (stale) ときは payload に載せず、Render 側は前回分を保持する。
+    if (shipments_daily_state === 'ok') masterPart.shipments_daily = shipments_daily;
     // sku_resolved と sku_master は同一の m_sku_master スナップショット由来。
     // 「両方とも state=ok かつ N>0」のときだけ対で送る (Codex PR1 review round2 High)。
     //   片方だけ mirror を更新すると、recent-missing-candidates (GAS が読む) が

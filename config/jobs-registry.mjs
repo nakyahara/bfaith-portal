@@ -60,7 +60,7 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job',
     importance: 'P1',
     owner: '中原さん',
-    purpose: 'モール受注取込→fact build→DQ→Render mirror 同期 (約43ステップ)。全業務データの土台',
+    purpose: 'モール受注取込→fact build→DQ→Render mirror 同期 (約44ステップ)。全業務データの土台。日次出荷サマリ (出荷日×モール×配送方法) の再構築もここ',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

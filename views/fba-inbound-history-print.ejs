@@ -24,10 +24,22 @@
     .totals div { border: 1px solid #999; padding: 5px 12px; }
     .totals b { font-size: 15px; }
     .sec-unrecv { page-break-before: always; }
+    /* グラフ */
+    .chart-block { margin: 4px 0 16px; page-break-inside: avoid; break-inside: avoid-page; }
+    .chart-row + .chart-row { margin-top: 2px; }
+    .chart-title { font-size: 11px; font-weight: bold; color: #0b0b0b; margin-bottom: 2px; display: flex; align-items: center; gap: 6px; }
+    .chart-title .chart-sub { font-weight: normal; color: #898781; font-size: 10px; }
+    /* 系列キー: 棒は四角、折れ線は横棒。1系列ずつなので凡例ボックスは置かない */
+    .chart-title .key { display: inline-block; background: var(--c); }
+    .chart-title .key.bar { width: 9px; height: 9px; border-radius: 2px; }
+    .chart-title .key.line { width: 14px; height: 2px; border-radius: 1px; }
+    .chart-note { font-size: 10px; color: #777; margin-top: 4px; line-height: 1.5; }
     @media print {
       .toolbar { display: none; }
       body { margin: 0; }
       thead { display: table-header-group; }
+      /* 色付きの棒・線は印刷時も落とさない (グレースケール化されても形で読める) */
+      .chart-block { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     }
   </style>
 </head>
@@ -50,6 +62,90 @@
     <div>受領数量 <b><%= totals.qty_received.toLocaleString('ja-JP') %></b></div>
     <div>未受領 <b class="<%= totals.qty_unreceived > 0 ? 'unrecv' : '' %>"><%= totals.qty_unreceived.toLocaleString('ja-JP') %></b></div>
   </div>
+
+  <% if (showChart && chart && chart.tooMany) { %>
+    <div class="chart-note" style="border:1px solid #ccc;padding:8px 10px;margin-bottom:12px;">
+      グラフは <%= chart.maxPoints %> 点までです（今回 <%= chart.n %> 点）。
+      1本あたりが細くなりすぎて紙では読めないため省略しました。
+      グラフが必要な場合は「月別」に切り替えるか、期間を短くして印刷してください。
+    </div>
+  <% } %>
+  <% if (showChart && chart && !chart.tooMany) { %>
+  <div class="chart-block">
+    <%
+      // 送付数(数千)とSKU数(数十〜百)はスケールが50倍違う。1つの図に重ねると
+      // 折れ線が底に張り付いて読めないので、X軸を共有した上下2段にしている。
+      // 2軸チャートにすると値の大小を誤読させるため採らない。
+      const C = chart;
+      const panels = [
+        { p: C.shipped, title: '送付数', color: '#2a78d6', kind: 'bar' },
+        { p: C.skus,    title: 'SKU数',  color: '#eb6834', kind: 'line' },
+      ];
+    %>
+    <% panels.forEach(function(panel, pi) { %>
+      <div class="chart-row">
+        <div class="chart-title">
+          <span class="key <%= panel.kind %>" style="--c: <%= panel.color %>"></span><%= panel.title %>
+          <span class="chart-sub"><%= unit === 'month' ? '月別' : '日別' %>・最大 <%= panel.p.max.toLocaleString('ja-JP') %></span>
+        </div>
+        <svg viewBox="0 0 <%= C.W %> <%= C.H %>" width="100%" height="<%= C.H %>" role="img"
+             aria-label="<%= panel.title %>の推移">
+          <!-- 目盛り線: 1px 実線、面から一段だけ浮かせる -->
+          <% panel.p.yTicks.forEach(function(t) { %>
+            <line x1="<%= C.PAD_L %>" y1="<%= t.y %>" x2="<%= C.W - C.PAD_R %>" y2="<%= t.y %>"
+                  stroke="<%= t.v === 0 ? '#c3c2b7' : '#e1e0d9' %>" stroke-width="1" />
+            <text x="<%= C.PAD_L - 6 %>" y="<%= t.y + 3 %>" text-anchor="end"
+                  font-size="9" fill="#898781" style="font-variant-numeric: tabular-nums;"><%= t.label %></text>
+          <% }); %>
+
+          <% if (panel.kind === 'bar') { %>
+            <!-- 棒: 上端だけ丸め、基線側は角。帯を埋めず余りは余白に残す。
+                 角丸半径は幅と高さの両方に収めてある (値0や細い棒で退化しない) -->
+            <% panel.p.marks.forEach(function(m) { %>
+              <path d="M<%= m.x %>,<%= C.baselineY %> L<%= m.x %>,<%= (m.topY + m.r).toFixed(2) %>
+                       Q<%= m.x %>,<%= m.topY %> <%= (m.x + m.r).toFixed(2) %>,<%= m.topY %>
+                       L<%= (m.x + m.w - m.r).toFixed(2) %>,<%= m.topY %>
+                       Q<%= (m.x + m.w).toFixed(2) %>,<%= m.topY %> <%= (m.x + m.w).toFixed(2) %>,<%= (m.topY + m.r).toFixed(2) %>
+                       L<%= (m.x + m.w).toFixed(2) %>,<%= C.baselineY %> Z"
+                    fill="<%= panel.color %>" />
+            <% }); %>
+          <% } else { %>
+            <polyline points="<%= panel.p.polyline %>" fill="none" stroke="<%= panel.color %>"
+                      stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
+            <% if (C.n <= 40) { panel.p.marks.forEach(function(m) { %>
+              <circle cx="<%= m.cx %>" cy="<%= m.cy %>" r="2.5" fill="<%= panel.color %>"
+                      stroke="#fff" stroke-width="1.5" />
+            <% }); } %>
+          <% } %>
+
+          <!-- 直接ラベルは最大値の1点だけ (全点に置くと読まれない) -->
+          <% if (panel.p.peak) { %>
+            <circle cx="<%= panel.p.peak.cx %>" cy="<%= panel.p.peak.cy %>" r="3.5"
+                    fill="<%= panel.color %>" stroke="#fff" stroke-width="2" />
+            <text x="<%= panel.p.peak.cx %>" y="<%= Math.max(10, panel.p.peak.cy - 7) %>"
+                  text-anchor="middle" font-size="9" font-weight="bold" fill="#0b0b0b"
+                  style="font-variant-numeric: tabular-nums;"><%= panel.p.peak.value.toLocaleString('ja-JP') %></text>
+          <% } %>
+
+          <!-- 基線 -->
+          <line x1="<%= C.PAD_L %>" y1="<%= C.baselineY %>" x2="<%= C.W - C.PAD_R %>" y2="<%= C.baselineY %>"
+                stroke="#c3c2b7" stroke-width="1" />
+
+          <!-- X軸ラベルは下段だけ (上下でX軸を共有しているので二重に置かない) -->
+          <% if (pi === panels.length - 1) { %>
+            <% C.xTicks.forEach(function(t) { %>
+              <text x="<%= t.x %>" y="<%= C.H - 8 %>" text-anchor="middle" font-size="9" fill="#898781"><%= t.label %></text>
+            <% }); %>
+          <% } %>
+        </svg>
+      </div>
+    <% }); %>
+    <div class="chart-note">
+      ※ 送付数とSKU数は桁が違うため、同じ横軸で上下に分けています（重ねると折れ線が読めなくなるため）。
+      数値は各段の最大値のみ表示。詳細は下の表を参照してください。
+    </div>
+  </div>
+  <% } %>
 
   <table>
     <thead>

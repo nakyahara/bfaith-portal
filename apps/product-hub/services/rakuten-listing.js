@@ -856,9 +856,13 @@ export function buildItemPayload(db, draftId) {
     variants: {
       [draft.ne_code]: {
         standardPrice: draft.price,
+        // カタログID免除理由 (2026-08-05 平串の IE0429 で実測確定):
+        //   1=セット商品 (articleNumberForSet が必須になる) / 2=サービス商品 / 3=当店オリジナル商品
+        //   4=項目選択肢別在庫商品 / 5=該当商品コードなし / 6=頒布会商品
+        // JAN の無い単品仕入れ商品は 5 が正 (旧値 1 は IE0429 で登録拒否)
         articleNumber: rk.article_number && String(rk.article_number).trim() !== ''
           ? { value: String(rk.article_number).trim() }
-          : { exemptionReason: 1 },
+          : { exemptionReason: 5 },
         ...(attrs.length > 0 ? { attributes: attrs } : {}),
         ...(Object.keys(shipping).length > 0 ? { shipping } : {}),
         ...(deliveryDateId ? { normalDeliveryDateId: Number(deliveryDateId) } : {}),
@@ -987,9 +991,11 @@ export async function syncShopCategoriesToRms(draftId, { actor = null } = {}) {
   const categoryIds = rows.map((r) => String(r.category_id).trim());
   const syncedKey = categoryIds.join(',');
   const mn = String(draft.ne_code).trim().toLowerCase();
+  // mainPluralCategoryId は送らない (2026-08-05 平串の IE0128 で実測確定):
+  // これは「PLURAL 形式 (1ページ複数商品形式) のカテゴリ」のメインページ指定専用で、
+  // 通常の棚 (LIST/GALLERY 形式) の ID を渡すと IE0128 で拒否される。
+  // 「複数カテゴリなら必須」という #671 時の理解は誤りだった
   const body = { categoryIds };
-  // 複数のときは「メインの棚」= 先頭 (画面の並び順で最初に選ばれた棚) を指定する
-  if (categoryIds.length > 1) body.mainPluralCategoryId = categoryIds[0];
 
   let r;
   try {

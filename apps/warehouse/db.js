@@ -119,6 +119,46 @@ function createTables() {
   // PK 先頭列でも equality lookup は効くが、planner の選択が変わるのを避ける。
   db.exec('CREATE INDEX IF NOT EXISTS idx_orders_voucher ON raw_ne_orders(伝票番号)');
 
+  // 2b. NE受注ベース（伝票粒度。1伝票=1行）
+  //   raw_ne_orders は明細行粒度なので、伝票にしか無い属性 (配送方法・送り状番号) を
+  //   持たせると行数分だけ冗長になる。出荷件数の分析は「伝票=発送1件」で数えるため、
+  //   伝票粒度のテーブルを分けて持つ。
+  //   配送方法は NE 受注ベース API の receive_order_delivery_id / _name をそのまま保存する
+  //   (Amazon Easy Ship は 配送方法名 = 'AES' で入る)。
+  db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_order_base (
+    伝票番号            TEXT PRIMARY KEY,
+    受注番号            TEXT,
+    店舗コード          TEXT,
+    受注日              TEXT,
+    出荷確定日          TEXT,
+    受注状態区分        TEXT,
+    受注状態            TEXT,
+    キャンセル区分      TEXT,
+    受注キャンセル日    TEXT,
+    配送方法ID          TEXT,
+    配送方法名          TEXT,
+    送り状番号          TEXT,
+    synced_at           TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ne_base_send ON raw_ne_order_base(出荷確定日)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ne_base_order_date ON raw_ne_order_base(受注日)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ne_base_shop ON raw_ne_order_base(店舗コード)');
+
+  // 2c. 日次出荷サマリ（出荷日 × 店舗 × 配送方法 の伝票件数）
+  //   raw_ne_order_base から再構築する派生テーブル (rebuild-shipments-daily.js)。
+  //   Render mirror へはこの粒度で送る (伝票 30 万行を送らずに全ての切り口が出せる)。
+  db.exec(`CREATE TABLE IF NOT EXISTS f_shipments_daily (
+    ship_date           TEXT NOT NULL,
+    shop_code           TEXT NOT NULL,
+    delivery_id         TEXT NOT NULL,
+    delivery_name       TEXT,
+    slips               INTEGER NOT NULL,
+    cancelled_slips     INTEGER NOT NULL DEFAULT 0,
+    updated_at          TEXT,
+    PRIMARY KEY (ship_date, shop_code, delivery_id)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_shipments_daily_date ON f_shipments_daily(ship_date)');
+
   // 3. セット商品マスタ
   db.exec(`CREATE TABLE IF NOT EXISTS raw_ne_set_products (
     セット商品コード    TEXT,
