@@ -87,8 +87,9 @@
     <div class="status-bar">
       <span id="syncInfo">取込状況を確認中…</span>
       <span style="flex:1"></span>
+      <button class="btn btn-sec" id="pullBtn" onclick="pullOnly()" title="Amazonへは問い合わせず、ミニPCが既に持っているデータをこの画面へ反映します (数十秒)">ポータルへ反映のみ</button>
       <button class="btn btn-primary" id="syncBtn" onclick="runSync(false)">Amazonから取込 (差分)</button>
-      <button class="btn btn-sec" id="fullSyncBtn" onclick="runSync(true)" title="2年分を取り直します。10分以上かかります">全期間を取り直す</button>
+      <button class="btn btn-sec" id="fullSyncBtn" onclick="runSync(true)" title="2年分を取り直します。50分ほどかかります">全期間を取り直す</button>
     </div>
     <div class="msg" id="msg"></div>
 
@@ -399,6 +400,22 @@ function downloadCsv() {
 }
 
 // ===== 取込 (ミニPC経由) =====
+
+// Amazonへは問い合わせず、ミニPCが既に持っているデータを引き取るだけ。
+// 「差分取込」は明細の取り直しが入るので、反映だけしたいときはこちらが速い。
+async function pullOnly() {
+  const btns = ['pullBtn', 'syncBtn', 'fullSyncBtn'].map(id => document.getElementById(id));
+  btns.forEach(b => { b.disabled = true; });
+  showMsg('ミニPCからポータルへ反映しています…', 'info');
+  try {
+    await pullToPortal(false);
+  } catch (e) {
+    showMsg('反映に失敗: ' + esc(e.message), 'err');
+  } finally {
+    btns.forEach(b => { b.disabled = false; });
+  }
+}
+
 async function runSync(full) {
   const btn = document.getElementById('syncBtn');
   const fullBtn = document.getElementById('fullSyncBtn');
