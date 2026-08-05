@@ -408,7 +408,8 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
 // ==========================================
 // 書込系 (product-hub P3 楽天自動出品、2026-07-26 権限smoke実証済)
 //   - env RAKUTEN_RMS_WRITE_ENABLED が ON のときだけ有効 (fail-closed)
-//   - 商品の新規作成は **必ず倉庫指定 (hideItem=true) に強制** — 公開は人が RMS 画面で行う
+//   - 商品の新規作成の公開状態は payload の hideItem に従う (未指定なら倉庫指定=true に倒す fail-safe)。
+//     2026-08-05 中原さん指示で公開登録に変更 (それ以前は hideItem=true を強制していた)
 //   - 既存商品の上書きは拒否 (稼働中の商品ページを事故で潰さない)
 //   - 削除は非公開 (hideItem=true) の商品だけ許可
 // ==========================================
@@ -484,8 +485,9 @@ router.put('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddlew
       if (existing.status === 200) return { block: 409 };
       if (existing.status !== 404) return { block: 502, detail: existing.status };
 
-      // 公開状態はサーバー側で強制 (P3 スコープ: 非公開登録のみ。公開は人が RMS で)
-      payload.hideItem = true;
+      // 公開状態は payload の hideItem に従う (2026-08-05〜 公開登録)。
+      // boolean false のときだけ公開 — 未指定・不正値は倉庫指定 (非公開) に倒す fail-safe
+      payload.hideItem = payload.hideItem === false ? false : true;
 
       // 変更系は自動リトライしない (High-2: timeout 後の再送は既存確認を通らず
       // 上書きになりうる)。結果不明なら呼び出し側が GET で照合する

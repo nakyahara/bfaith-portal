@@ -857,7 +857,10 @@ db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 
 built = listing.buildItemPayload(db, rkId);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
 const pl = built.payload;
-check('payload: hideItem=true 固定 (非公開登録のみ)', pl.hideItem === true);
+check('payload: hideItem=false (公開で登録 — 2026-08-05 中原さん指示)', pl.hideItem === false);
+check('payload: 商品番号 = 商品コード', pl.itemNumber === 'rk-smoke-1');
+check('payload: システム連携用SKU番号 = 商品コード',
+  pl.variants['rk-smoke-1'].merchantDefinedSkuId === 'rk-smoke-1');
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
 // 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
@@ -971,8 +974,8 @@ check('payload: 型番があれば value で送る',
 
 // ─── 2026-07-27 出品仕様: 税率 / JAN / 配送 / 納期 / 白抜き / 画像20枚 ───
 check('taxRateToPayment: 8% → payment.taxRate 0.08', listing.taxRateToPayment('8%')?.taxRate === 0.08);
-check('taxRateToPayment: 10%/未設定/変値は送らない (店舗デフォルト)',
-  listing.taxRateToPayment('10%') === null && listing.taxRateToPayment(null) === null && listing.taxRateToPayment('9.6') === null);
+check('taxRateToPayment: 10%/未設定も 0.1 を明示して送る (2026-08-05 平串実測: 送らないと税率未設定になる)',
+  listing.taxRateToPayment('10%')?.taxRate === 0.1 && listing.taxRateToPayment(null)?.taxRate === 0.1);
 
 check('isValidGtin: 正しいJAN-13を通す', listing.isValidGtin('4901234567894') === true);
 check('isValidGtin: チェックデジット不一致/桁数違い/非数字を弾く',
@@ -1031,7 +1034,8 @@ db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id LIKE '
 db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id LIKE 'gcap%'`).run(rkId);
 
 dbmod.upsertDraftYahoo(db, rkId, { tax_rate: '10%' });
-check('payload: 10% は payment を送らない', !('payment' in listing.buildItemPayload(db, rkId).payload));
+check('payload: 10% も payment.taxRate 0.1 を明示して送る (2026-08-05〜)',
+  listing.buildItemPayload(db, rkId).payload?.payment?.taxRate === 0.1);
 
 // 白抜き背景: 未転送なら理由を返し、転送済みなら whiteBgImage 別枠 (images には入れない)
 db.prepare(`UPDATE draft_rakuten SET white_bg_drive_file_id = 'gwhite', white_bg_drive_url = 'https://drive.google.com/file/d/gwhite/view' WHERE draft_id = ?`).run(rkId);
@@ -1747,7 +1751,7 @@ check('draft_rakuten に反映状態の列がある (冪等ALTER)',
   [...rkColsNow].join(','));
 const listing2 = await import('../services/rakuten-listing.js');
 check('syncShopCategoriesToRms がエクスポートされている', typeof listing2.syncShopCategoriesToRms === 'function');
-// 未登録ドラフトは反映できない (先に「非公開で登録」が必要)
+// 未登録ドラフトは反映できない (先に「楽天に登録」が必要)
 const unreg = await listing2.syncShopCategoriesToRms(fdraft.id, { actor: 'smoke' });
 check('未登録ドラフトの棚反映は拒否される',
   unreg.ok === false && String(unreg.error).includes('登録した商品だけ'), JSON.stringify(unreg));

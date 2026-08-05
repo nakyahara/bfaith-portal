@@ -262,7 +262,7 @@ export function initProductHubDB() {
       genre_id       TEXT,
       attributes_json TEXT,                 -- [{name, values:[string]}]
       article_number TEXT,                  -- メーカー型番 (空 = exemptionReason で送る)
-      registered_at  TEXT,                  -- 非公開登録に成功した日時
+      registered_at  TEXT,                  -- 楽天への登録に成功した日時 (2026-08-05〜 公開直行。それ以前は非公開登録)
       last_error     TEXT,                  -- 直近の RMS エラー (人が直す材料)
       -- 2026-07-27 仕様確定: 「アプリが正、RMS手直しは最終手段」— 公開に必要な情報をアプリで持つ
       shipping_method_group  TEXT,          -- variants[].shipping.shippingMethodGroup (店舗の配送方法ID '1'〜'9')
@@ -270,7 +270,7 @@ export function initProductHubDB() {
       normal_delivery_date_id TEXT,         -- variants[].normalDeliveryDateId (RMS 納期情報ID = リードタイム)
       white_bg_drive_file_id TEXT,          -- 白抜き背景画像 (whiteBgImage) の Drive fileId
       white_bg_drive_url     TEXT,
-      published_at   TEXT,                  -- アプリから公開に切り替えた日時 (NULL = 非公開のまま)
+      published_at   TEXT,                  -- 公開になった日時 (2026-08-05〜 登録時に同時記録。NULL = 非公開)
       shop_categories_synced_at TEXT,       -- 店舗内カテゴリ (item-mappings) を RMS へ反映した日時
       shop_categories_synced_key TEXT,      -- そのとき反映した categoryId の並び (選択を変えたら「未反映」に戻すため)
       shop_categories_error     TEXT,       -- 直近の反映エラー (人が直す材料)

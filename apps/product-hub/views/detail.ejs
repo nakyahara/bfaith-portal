@@ -90,7 +90,7 @@
   %>
   <!-- 楽天出品 (P3) -->
   <div class="card" style="border-color:#fecaca; background:#fffbfa;">
-    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(非公開で登録 → アプリの公開ボタンで公開)</span></h2>
+    <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(公開で登録 — 在庫0なので売れません。在庫はNE連携)</span></h2>
     <div style="font-size:13px; margin-bottom:10px;">
       🖼 画像転送:
       <% if (images.length === 0) { %>
@@ -164,7 +164,7 @@
     <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap;">
       <button class="btn" id="rk-save-btn">出品情報を保存</button>
       <button class="btn" id="rk-preview-btn">送信内容を確認</button>
-      <button class="btn btn-primary" id="rk-register-btn">非公開で登録</button>
+      <button class="btn btn-primary" id="rk-register-btn">公開で登録</button>
       <span class="muted" id="rk-result"></span>
     </div>
     <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
@@ -1829,7 +1829,7 @@
 
   document.getElementById('rk-register-btn').addEventListener('click', async () => {
     if (!(await saveRakutenFields())) return;
-    if (!confirm('楽天に「非公開 (倉庫指定)」で登録します。\n売り場には表示されません。公開はRMS画面で行います。\n\nよろしいですか?')) return;
+    if (!confirm('楽天に「公開」で登録します。\n在庫0のまま売り場に載ります (在庫はNE連携が入れます)。\n\nよろしいですか?')) return;
     const btn = document.getElementById('rk-register-btn');
     btn.disabled = true;
     rkResult.textContent = '楽天に登録中…';
@@ -1843,9 +1843,9 @@
           alert('楽天への登録は成功しましたが、店舗内カテゴリ (棚) の反映に失敗しました:\n\n'
             + (cat.error || '') + '\n\n「棚を反映」ボタンでやり直せます。');
         } else if (cat && cat.ok) {
-          rkResult.textContent = '✅ 非公開で登録しました (棚 ' + cat.count + ' 件も反映)';
+          rkResult.textContent = '✅ 公開で登録しました (棚 ' + cat.count + ' 件も反映)';
         } else {
-          rkResult.textContent = '✅ 非公開で登録しました';
+          rkResult.textContent = '✅ 公開で登録しました';
         }
         setTimeout(() => location.reload(), cat && cat.ok === false ? 300 : 1200);
       } else {
