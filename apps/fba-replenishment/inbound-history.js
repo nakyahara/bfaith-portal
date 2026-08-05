@@ -145,25 +145,46 @@ export async function fetchShipmentList(opts) {
 
 /**
  * 1シップメントの明細を取得。
- * ⚠️ v0 の items も NextToken でページングされる。1ページで打ち切ると
- *    SKUが多い納品で明細が欠け、その不完全な結果で既存明細を置き換えてしまう。
+ *
+ * ⚠️ v0 のページングの癖 (2026-08-05 実測):
+ *   - /shipments/{id}/items は ItemData と一緒に NextToken を必ず返す。
+ *     が、その NextToken を**同じエンドポイントに渡しても同じ1ページ目が返る**。
+ *     しかも token の値は毎回変わるので「token が同じなら終わり」という判定も効かず、
+ *     素直にループを書くと同じ63件を延々と取り続ける。
+ *   - 続きは別エンドポイント /fba/inbound/v0/shipmentItems?QueryType=NEXT_TOKEN でしか取れない。
+ *     実測ではそちらが 0件 を返し、1ページ目の63件で完結していた。
+ * つまり「NextToken がある = 続きがある」ではない。続きの有無は shipmentItems 側で確かめる。
  */
-export async function fetchShipmentItems(shipmentId, maxPages = 50) {
-  const all = [];
-  let token = null;
-  let page = 0;
-  do {
-    const qs = token
-      ? new URLSearchParams({ MarketplaceId: marketplaceId(), QueryType: 'NEXT_TOKEN', NextToken: token }).toString()
-      : new URLSearchParams({ MarketplaceId: marketplaceId() }).toString();
-    const payload = await callWithRetry(`/fba/inbound/v0/shipments/${shipmentId}/items?${qs}`, `items ${shipmentId} p${page + 1}`);
-    all.push(...(payload?.ItemData || []));
+export async function fetchShipmentItems(shipmentId, maxPages = 20) {
+  const mp = marketplaceId();
+  const first = await callWithRetry(
+    `/fba/inbound/v0/shipments/${shipmentId}/items?${new URLSearchParams({ MarketplaceId: mp }).toString()}`,
+    `items ${shipmentId} p1`
+  );
+  const all = [...(first?.ItemData || [])];
+  const seen = new Set(all.map(i => i.SellerSKU));
+  let token = first?.NextToken || null;
+  let page = 1;
+
+  while (token && page < maxPages) {
+    await sleep(CALL_INTERVAL_MS);
+    const qs = new URLSearchParams({ MarketplaceId: mp, QueryType: 'NEXT_TOKEN', NextToken: token }).toString();
+    const payload = await callWithRetry(`/fba/inbound/v0/shipmentItems?${qs}`, `items ${shipmentId} p${page + 1}`);
+    // shipmentItems は他シップメントの行も返しうるので、対象のものだけ拾う
+    const batch = (payload?.ItemData || []).filter(i => !i.ShipmentId || i.ShipmentId === shipmentId);
+    if (batch.length === 0) break; // 続きなし = ここで完結
+
+    // 同じページが返り続けるAPIの癖に対する安全弁。新しいSKUが1件も無ければ進んでいない。
+    const fresh = batch.filter(i => !seen.has(i.SellerSKU));
+    if (fresh.length === 0) break;
+    for (const i of fresh) seen.add(i.SellerSKU);
+    all.push(...fresh);
+
     token = payload?.NextToken || null;
     page += 1;
-    if (token) await sleep(CALL_INTERVAL_MS);
-  } while (token && page < maxPages);
+  }
 
-  if (token) {
+  if (token && page >= maxPages) {
     throw new Error(`${shipmentId} の明細がページ上限 ${maxPages} に到達しました (取得済み ${all.length}行)`);
   }
   return all;
@@ -186,6 +207,7 @@ export async function syncInboundHistory(opts = {}) {
     sinceDays = 14,
     allItems = false,
     itemLimit = 0,
+    historyDays = 730,
     onProgress,
   } = opts;
 
@@ -207,7 +229,11 @@ export async function syncInboundHistory(opts = {}) {
   console.log(`[InboundHistory] 新規 ${inserted}件 / 更新 ${updated}件`);
 
   // --- 明細 ---
-  let targets = getShipmentsNeedingItemSync({ all: allItems });
+  // 明細は1シップメントあたり1〜2リクエスト。集計対象外の古いシップメントまで取ると
+  // 初回が1時間コースになるので、遡る範囲を切る (既定2年)。
+  const minCreatedDate = new Date(Date.now() + 9 * 3600 * 1000 - historyDays * 86400000)
+    .toISOString().slice(0, 10);
+  let targets = getShipmentsNeedingItemSync({ all: allItems, minCreatedDate });
   if (itemLimit > 0 && targets.length > itemLimit) {
     console.log(`[InboundHistory] 明細対象 ${targets.length}件 → 上限 ${itemLimit}件に制限 (残りは次回)`);
     targets = targets.slice(0, itemLimit);

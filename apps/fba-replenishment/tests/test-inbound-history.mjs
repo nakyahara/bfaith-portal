@@ -153,6 +153,14 @@ console.log('\n[6] getShipmentsNeedingItemSync');
   ok(!ids.includes('FBA_A'), 'CLOSED かつ 未受領なし は対象外');
 
   eq(db.getShipmentsNeedingItemSync({ all: true }).length, 4, 'all指定なら全件');
+
+  // 明細は1シップメント1〜2リクエストかかるので、古すぎるものは対象から外せること
+  const guarded = db.getShipmentsNeedingItemSync({ all: true, minCreatedDate: '2027-01-01' });
+  const guardedIds = guarded.map(t => t.shipment_id);
+  ok(!guardedIds.includes('FBA_A'), 'minCreatedDate より古いシップメントは対象外');
+  ok(guardedIds.includes('FBA_D'), '作成日不明は判断できないので対象に残す');
+  eq(db.getShipmentsNeedingItemSync({ all: true, minCreatedDate: '2020-01-01' }).length, 4,
+     'minCreatedDate が十分古ければ全件');
 }
 
 // ===== 7. 取込状況 =====
