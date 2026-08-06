@@ -28,7 +28,7 @@ import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } fr
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS,
-  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview,
+  fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
@@ -241,6 +241,7 @@ router.get('/detail/:id', (req, res) => {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
+    rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     gate: gateReasons(db, draft),
     nextStatuses,
     statusLabels: STATUS_LABELS,
@@ -392,6 +393,11 @@ router.post('/api/drafts/:id', async (req, res) => {
     req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : draft.own_brand,
     draft.id,
   );
+  // 税率は基本情報の項目として保存する (2026-08-06 中原さん指示で Yahoo!欄から移動。
+  // 格納先は従来どおり draft_yahoo.tax_rate — 楽天 payload.taxRate も Yahoo 移行もここを読む)
+  if (req.body?.tax_rate !== undefined) {
+    upsertDraftYahoo(db, draft.id, { tax_rate: cleanText(req.body.tax_rate, 20) });
+  }
   logEvent(db, draft.id, 'updated', null, actorOf(req));
   // ゲート必須項目 (公式URL等) を消したら ready_for_ai を draft に自動差し戻し (Codex R1 high)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));

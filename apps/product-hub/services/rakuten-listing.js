@@ -662,6 +662,12 @@ export function buildDescriptionPreview(db, draftId) {
   };
 }
 
+/** 楽天の商品ページURL (公開後のリンク表示用。店舗slugは cabinet と同じ b-faith) */
+export function rakutenItemPageUrl(manageNumber) {
+  const shop = (process.env.PH_RAKUTEN_SHOP_SLUG || 'b-faith').trim();
+  return `https://item.rakuten.co.jp/${encodeURIComponent(shop)}/${encodeURIComponent(String(manageNumber).trim().toLowerCase())}/`;
+}
+
 /** UI プレビュー用: location → 公開画像URL (buildSalesDescriptionHtml と同じベース解決) */
 export function cabinetImageUrl(location) {
   let base = (process.env.PH_CABINET_IMAGE_BASE || CABINET_IMAGE_BASE).replace(/\/+$/, '');
