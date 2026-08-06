@@ -517,6 +517,16 @@ export const SHIPPING_METHOD_GROUPS = {
 };
 
 /**
+ * 楽天=定形外のまま Yahoo! だけ別配送にする複合選択肢 (2026-08-06 中原さん指示)。
+ * 楽天側 (ページ表記・末尾バナー) は rakutenGroup として振る舞い、
+ * Yahoo!の配送方法プルダウンには yahooDelivery を初期セットする
+ */
+export const YAHOO_OVERRIDE_SHIPPING_GROUPS = {
+  '1y8': { label: '定形外（ヤフーのみ宅急便50サイズ）', rakutenGroup: '1', yahooDelivery: '宅急便50サイズ以上' },
+  '1y5': { label: '定形外（ヤフーのみネコポス）', rakutenGroup: '1', yahooDelivery: 'ネコポス' },
+};
+
+/**
  * draft_yahoo.tax_rate ('8%' / '10%' の文字列) → RMS payment.taxRate。
  * 2026-08-05 平串の実登録で「送らない = 店舗デフォルト」のはずが RMS の消費税率が
  * 未設定のままだった (中原さん指摘) → **常に明示して送る**。
@@ -590,6 +600,9 @@ export const COMMON_TRAILING_BANNERS = [
  */
 export function effectiveShippingForDraft(db, neCode, shippingMethodGroup) {
   const g = String(shippingMethodGroup ?? '').trim();
+  // 複合選択肢は楽天側では rakutenGroup として振る舞う (ページ表記・バナーとも定形外)
+  const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
+  if (ov) return { group: ov.rakutenGroup, label: SHIPPING_METHOD_GROUPS[ov.rakutenGroup], yahooDelivery: ov.yahooDelivery };
   if (g && SHIPPING_METHOD_GROUPS[g]) return { group: g, label: SHIPPING_METHOD_GROUPS[g] };
   // 不正な明示指定は NE へフォールバックして隠さない (buildItemPayload 側は理由で停止する。
   // プレビューも「配送バナーなし」に揃え、直すべき状態が見えるようにする — Codex R2)

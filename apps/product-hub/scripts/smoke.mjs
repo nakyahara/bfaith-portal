@@ -1020,6 +1020,15 @@ check('effectiveShippingForDraft: アプリ指定(9)が NE(定形外=1) より�
 check('effectiveShippingForDraft: 不正指定(99)はフォールバックせず未解決を返す',
   listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').group === null
   && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '99').invalid === true);
+// 複合選択肢 (2026-08-06): 楽天側は定形外(1) として振る舞い、Yahoo!配送だけ差し替わる
+check('effectiveShippingForDraft: 複合(1y8/1y5)は楽天=定形外 + yahooDelivery付き',
+  listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group === '1'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').label === '定形外'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').yahooDelivery === '宅急便50サイズ以上'
+  && listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y5').yahooDelivery === 'ネコポス');
+check('複合選択肢の末尾バナーは定形外と同一',
+  JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group))
+  === JSON.stringify(listing.trailingBannerLocations('1')));
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 
@@ -2076,7 +2085,7 @@ const renders = [
     rakuten: { genre_id: '205761', attributes_json: '[{"name":"ブランド名","values":["x"]}]', article_number: null, registered_at: null, last_error: null, shipping_method_group: '5', postage_included: 1, normal_delivery_date_id: '1000', white_bg_drive_file_id: 'gw', white_bg_drive_url: 'https://drive.google.com/file/d/gw/view', published_at: null }, cabinetImages: [],
     genreDict: { genreId: '205761', genreName: '入浴剤', genrePath: '美容・コスメ > 入浴剤', fixedAt: null, fetchedAt: '2026-07-28T00:00:00Z', attributes: [{ name: 'ブランド名', mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 3, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' }] },
     neCost: { costExTax: 660, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10 }, profitSim: { profit: 189, marginPct: 14.8, costIncTax: 726 }, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     // 商品ページ表記: 化粧品 + NE推測の配送で全分岐を描かせる
     pageInfo: { product_type: 'cosmetics', content_volume: '50ml', size_text: null, ingredients: '水', usage_notes: null, origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品', seller_name: 'メーカーA', importer_name: '輸入者B', food_name: null, food_ingredients: null, food_expiry: null, food_storage: null },
     pageInfoHtml: '<table><tr><td>x</td></tr></table>',
@@ -2104,7 +2113,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'gw' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     shopCategories: [
       { id: 1, category_id: null, path: '犬用品 > おやつ', is_active: 1, selected: 1 },
       { id: 2, category_id: null, path: '猫用品', is_active: 1, selected: 1 },
@@ -2123,7 +2132,7 @@ const renders = [
     cabinetImages: [{ id: 1, drive_file_id: 'g1' }],
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
-    shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     shopCategories: [],
     yahoo: { yahoo_price: null, yahoo_price_sagawa: null, delivery_label: null, tax_rate: '8%', yahoo_category_id: null, yahoo_path: null },
     imageProduction: null,
@@ -2136,7 +2145,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['approved', 'draft', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.single, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -2153,7 +2162,7 @@ const renders = [
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -2167,7 +2176,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -2180,7 +2189,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.withExcluded, hasVariation: { value: true, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -2193,7 +2202,7 @@ const renders = [
     events: [], gate: [], nextStatuses: ['ready_for_ai'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.detached, hasVariation: { value: false, source: 'ne' }, regroup: null,
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,
@@ -2207,7 +2216,7 @@ const renders = [
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.child, hasVariation: { value: true, source: 'ne' },
     regroup: 'Notionから取り込んだ商品はNotion側が正のため、ここでは商品コードを変更できません',
-    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, ...pageInfoVars,
+    rakuten: null, cabinetImages: [], shopCategories: [], shippingGroups: listing.SHIPPING_METHOD_GROUPS, yahooOverrideGroups: listing.YAHOO_OVERRIDE_SHIPPING_GROUPS, ...pageInfoVars,
     genreDict: null,
     neCost: null, profitSim: null, simTaxPercent: 10, profitTakeRate: 0.9,
     yahoo: null, imageProduction: null,

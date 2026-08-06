@@ -248,6 +248,10 @@
             <% for (const [gid, gname] of Object.entries(shippingGroups)) { %>
               <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= gname %></option>
             <% } %>
+            <%# 複合選択肢: 楽天=定形外のまま Yahoo! だけ別配送 (2026-08-06 中原さん指示) %>
+            <% for (const [gid, ov] of Object.entries(yahooOverrideGroups)) { %>
+              <option value="<%= gid %>" <%= shipDefault === gid ? 'selected' : '' %>><%= ov.label %></option>
+            <% } %>
           </select>
           <% if (!rakuten?.shipping_method_group && neShipping.group) { %>
             <div class="muted" style="font-size:11px;">NEの配送方法「<%= neCost?.shippingMethod %>」から自動選択 (保存で確定)</div>
@@ -459,8 +463,19 @@
     </div>
     <div class="field" style="display:flex; gap:12px;">
       <div style="flex:1">
+        <%# Yahoo!の配送方法はプルダウン (選択肢=楽天の配送方法グループと同じ)。
+            Yahoo!売価とともに、基本情報の配送方法で「定形外（ヤフーのみ…）」を選んだときだけ入力可 (2026-08-06 中原さん指示) %>
         <label>配送方法<span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
+        <select id="y-delivery" style="width:100%;">
+          <option value="">未設定</option>
+          <% for (const gname of Object.values(shippingGroups)) { %>
+            <option value="<%= gname %>" <%= (yahoo?.delivery_label || '') === gname ? 'selected' : '' %>><%= gname %></option>
+          <% } %>
+          <% if (yahoo?.delivery_label && !Object.values(shippingGroups).includes(yahoo.delivery_label)) { %>
+            <option value="<%= yahoo.delivery_label %>" selected><%= yahoo.delivery_label %> (旧値)</option>
+          <% } %>
+        </select>
+        <div class="muted" id="y-gate-hint" style="font-size:11px;"></div>
       </div>
     </div>
     <div class="field" style="display:flex; gap:12px;">
@@ -2136,6 +2151,31 @@
       yahoo_path: document.getElementById('y-path').value,
     }), 'Yahoo!項目を保存しました');
   });
+
+  // ─── Yahoo!売価・配送方法のゲート (2026-08-06 中原さん指示) ───
+  // 通常は楽天と同じ配送・売価で出すため入力不可。基本情報の配送方法で
+  // 「定形外（ヤフーのみ…）」を選んだときだけ入力可になり、対応する配送方法を初期セットする
+  const YAHOO_SHIP_OVERRIDES = <%- JSON.stringify(yahooOverrideGroups) %>;
+  (function () {
+    const rkShip = document.getElementById('rk-shipping-group');
+    const yPrice = document.getElementById('y-price');
+    const yDelivery = document.getElementById('y-delivery');
+    const hint = document.getElementById('y-gate-hint');
+    if (!rkShip || !yPrice || !yDelivery) return;
+    function updateYahooGate(fromChange) {
+      const ov = YAHOO_SHIP_OVERRIDES[rkShip.value];
+      yPrice.disabled = !ov;
+      yDelivery.disabled = !ov;
+      if (ov) {
+        if (fromChange || !yDelivery.value) yDelivery.value = ov.yahooDelivery;
+        hint.textContent = 'Yahoo!は「' + ov.yahooDelivery + '」で出す設定です (プルダウンで変更可。保存は「Yahoo!項目を保存」)';
+      } else {
+        hint.textContent = '楽天と同じ配送・売価で出すため入力不要です (基本情報の配送方法で「定形外（ヤフーのみ…）」を選ぶと入力できます)';
+      }
+    }
+    rkShip.addEventListener('change', () => updateYahooGate(true));
+    updateYahooGate(false);
+  })();
 
   const saveIpBtn = document.getElementById('save-ip-btn');
   if (saveIpBtn) {

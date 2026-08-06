@@ -27,7 +27,7 @@ import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
-  setItemVisibility, SHIPPING_METHOD_GROUPS,
+  setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
@@ -115,6 +115,9 @@ function loadDraftOr404(req, res) {
 function rakutenShippingLabelOf(db, draftId) {
   const rk = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   const g = rk?.shipping_method_group != null ? String(rk.shipping_method_group).trim() : '';
+  // 複合選択肢 (楽天=定形外/Yahoo!別配送) は楽天側ラベルに解決する
+  const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
+  if (ov) return SHIPPING_METHOD_GROUPS[ov.rakutenGroup];
   return g && SHIPPING_METHOD_GROUPS[g] ? SHIPPING_METHOD_GROUPS[g] : null;
 }
 
@@ -257,6 +260,7 @@ router.get('/detail/:id', (req, res) => {
     adResponsibilityText: adResponsibility(),
     shopCategories: listShopCategoriesForDraft(db, draft.id),
     shippingGroups: SHIPPING_METHOD_GROUPS,
+    yahooOverrideGroups: YAHOO_OVERRIDE_SHIPPING_GROUPS,
     trailingBanners,
   });
 });
@@ -759,7 +763,7 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   }
   // 配送・納期 (2026-07-27 仕様: 公開に必要な情報はアプリで持つ)
   const shippingGroup = cleanText(req.body?.shipping_method_group, 10);
-  if (shippingGroup && !SHIPPING_METHOD_GROUPS[shippingGroup]) {
+  if (shippingGroup && !SHIPPING_METHOD_GROUPS[shippingGroup] && !YAHOO_OVERRIDE_SHIPPING_GROUPS[shippingGroup]) {
     return res.status(400).json({ ok: false, error: '配送方法の指定が不正です' });
   }
   let postageIncluded = null;
