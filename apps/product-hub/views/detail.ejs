@@ -106,6 +106,7 @@
     <% if (rakuten && rakuten.registered_at && rakuten.published_at) { %>
       <div style="background:#dcfce7; border:1px solid #86efac; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:12px;">
         🟢 <strong>楽天で公開中</strong>
+        <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="margin-left:8px; font-weight:600;">🔗 楽天の商品ページを開く ↗</a>
         <span class="muted">(公開: <%= rakuten.published_at.replace('T',' ').slice(0,16) %> — アプリの記録。RMS画面で直接変更した場合はズレます)</span><br>
         問題があれば「非公開に戻す」で売り場から下げられます。
         <div style="margin-top:8px;">
@@ -155,7 +156,7 @@
     <% } %>
 
     <p class="muted" style="margin:0 0 10px; font-size:12px;">
-      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報・Yahoo!欄の値を自動で送ります。
+      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報タブの値を自動で送ります。
       在庫は常に 0 で登録します。<br>
       配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
       「出品情報を保存」はタブをまたいで全ての出品項目を保存します。
@@ -227,6 +228,11 @@
           <label>JANコード<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
         </div>
+        <div style="flex:1">
+          <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
+          <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
+          <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
+        </div>
       </div>
       <!-- 配送・納期。売価とセットで見たい (利益に効く) ため基本情報タブに配置 (2026-07-29 中原さん要望)。
            保存は下の「基本情報を保存」で出品情報 (/rakuten) にも書き込まれる -->
@@ -292,10 +298,7 @@
       <div class="field">
         <label><input type="checkbox" id="f-own-brand" style="width:auto" <%= draft.own_brand ? 'checked' : '' %>> 自社商品 (画像制作ワークフローを使う)</label>
       </div>
-      <div class="field">
-        <label>画像フォルダURL (共有ドライブ。「商品コード_商品名」規則を推奨)<span class="ftag ftag-m">手入力</span></label>
-        <input type="url" id="f-drive-folder" value="<%= draft.drive_folder_url || '' %>" placeholder="https://drive.google.com/drive/folders/...">
-      </div>
+      <!-- 画像フォルダURL は画像タブ「画像フォルダから自動セット」に一本化 (2026-08-06 中原さん指示: 二重入力欄の解消) -->
       <div class="field">
         <% if (hasVariation.source === 'ne') { %>
           <!-- NE にある商品は NE が正 (中原さん決定 2026-07-25)。手入力させず判定結果を出す -->
@@ -458,10 +461,6 @@
       <div style="flex:1">
         <label>配送方法<span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="y-delivery" value="<%= yahoo ? (yahoo.delivery_label || '') : '' %>" placeholder="例: ネコポス">
-      </div>
-      <div style="flex:1">
-        <label>税率 <span class="muted">(登録時にNEから初期値)</span><span class="ftag ftag-auto">自動(初期値)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="y-tax" value="<%= yahoo ? (yahoo.tax_rate || '') : '' %>" placeholder="例: 10%">
       </div>
     </div>
     <div class="field" style="display:flex; gap:12px;">
@@ -1163,7 +1162,8 @@
       own_brand: document.getElementById('f-own-brand').checked,
       // NE で判定できる商品はキーごと送らない (DB に焼かせない)
       ...hasVariationPayload(),
-      drive_folder_url: document.getElementById('f-drive-folder').value,
+      // drive_folder_url は画像タブの取込に一本化 (未送信 = サーバーは既存値を保持)
+      tax_rate: document.getElementById('y-tax').value,
       memo: document.getElementById('f-memo').value,
     }), '保存しました');
   });
