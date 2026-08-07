@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .ss-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 40px; }
+    .card { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .card h2 { font-size: 1.02em; margin: 0 0 10px; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+    .toolbar input[type=text], .toolbar input[type=number] { padding: 6px 8px; }
+    .toolbar select { padding: 6px; }
+    .btn { padding: 6px 14px; cursor: pointer; border: 1px solid #ced4da; border-radius: 5px; background: #f8f9fa; font-size: 0.9em; }
+    .btn.primary { background: #1971c2; border-color: #1971c2; color: #fff; }
+    .btn.danger { background: #fff; border-color: #ffc9c9; color: #c92a2a; }
+    .btn.link { border: none; background: none; color: #1971c2; padding: 2px 4px; cursor: pointer; }
+    .btn.link.danger { color: #c92a2a; }
+    table.ss-table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    .ss-table th, .ss-table td { border-bottom: 1px solid #e9ecef; padding: 6px 8px; text-align: left; vertical-align: top; }
+    .ss-table th { background: #f8f9fa; }
+    .mono { font-family: Consolas, monospace; }
+    .muted { color: #868e96; }
+    .hint { color: #868e96; font-size: 0.82em; }
+    .msg { font-size: 0.9em; margin-left: 8px; }
+    .msg.ok { color: #2b8a3e; } .msg.err { color: #c92a2a; }
+    textarea.op { width: 100%; box-sizing: border-box; height: 70px; font-family: Consolas, monospace; font-size: 0.85em; padding: 6px; }
+    .warnbox { background: #fff5f5; border: 1px solid #ffc9c9; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 0.88em; color: #c92a2a; }
+    .noticebox { background: #fff9db; border: 1px solid #ffe066; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 0.88em; color: #856404; }
+    .okbox { background: #ebfbee; border: 1px solid #b2f2bb; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 0.88em; }
+    .chosen { font-weight: bold; color: #2b8a3e; }
+    .zero { color: #c92a2a; }
+    .rank-list { list-style: none; padding: 0; margin: 0; }
+    .rank-list li { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-bottom: 1px solid #f1f3f5; font-size: 0.88em; }
+    .rank-list li .no { width: 28px; color: #868e96; }
+    .rank-list li .code { font-family: Consolas, monospace; width: 170px; }
+    .rank-list li .nm { flex: 1; color: #495057; }
+    .rank-list li .av { width: 110px; text-align: right; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🎁 選べるセットの明細展開</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/" class="btn-logout">ポータル</a>
+    </div>
+  </header>
+
+  <div class="ss-wrap">
+
+    <div class="card">
+      <h2>動作確認</h2>
+      <p class="hint">NEの商品OPをそのまま貼ると、どの明細行になるかを確認できます。拡張機能が実際に投入する内容と同じです。</p>
+      <div class="toolbar">
+        <select id="try-set"></select>
+        <label>受注数 <input type="number" id="try-qty" value="1" min="1" style="width:70px"></label>
+        <button class="btn primary" id="btn-try">展開してみる</button>
+        <span class="msg" id="try-msg"></span>
+      </div>
+      <textarea class="op" id="try-op" placeholder="1本目:プルメリア_ae-plumeria10|2本目:バーベナ_ae-verbena10|..."></textarea>
+      <div id="try-result"></div>
+    </div>
+
+    <div class="card">
+      <h2>おまけ (シークレットプレゼント) の優先順位</h2>
+      <p class="hint">上から順に見て、利用可能在庫があるものを1つ採用します。全セット共通。並びは原価の安い順にしてあります。<br>
+        ⚠ 在庫はNEの日次同期なので最大24時間古い値です。拡張の画面でも候補と在庫を出すので、その場で変更できます。</p>
+      <ul class="rank-list" id="omake-list"></ul>
+      <div class="toolbar" style="margin-top:10px">
+        <input type="text" id="omake-add" placeholder="商品コードを追加" style="width:220px">
+        <button class="btn" id="btn-omake-add">追加</button>
+        <button class="btn primary" id="btn-omake-save">保存</button>
+        <span class="msg" id="omake-msg"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>選べるセット</h2>
+      <p class="hint">ここに登録した商品コードの明細行にだけ、拡張機能が「展開」ボタンを出します。選択肢はRMSから自動で取得します。</p>
+      <div class="toolbar">
+        <input type="text" id="set-code" placeholder="セット商品コード (例 selectae10-5)" style="width:260px">
+        <input type="text" id="set-label" placeholder="メモ (任意)" style="width:220px">
+        <button class="btn" id="btn-set-add">追加</button>
+        <span class="msg" id="set-msg"></span>
+      </div>
+      <table class="ss-table">
+        <thead><tr><th>セット商品コード</th><th>選択枠</th><th>選択肢</th><th>手動</th><th>RMS取得</th><th></th></tr></thead>
+        <tbody id="set-body"><tr><td colspan="6" class="muted">読み込み中...</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>手動マッピング</h2>
+      <p class="hint">RMSだけでは商品コードに辿り着けない選択肢を補います。<br>
+        ・ganesh のように選択肢に商品コードが入っていないセット<br>
+        ・楽天の文字数制限でコードが切れているもの (hakka-eucaly → hakka-eucalyptus)<br>
+        ・モール側の表示名が商品マスタと違うもの (キンモクセイ(金木犀) など)</p>
+      <div class="toolbar">
+        <select id="map-filter"><option value="">すべてのセット</option></select>
+        <span class="muted" id="map-count"></span>
+      </div>
+      <div class="toolbar">
+        <select id="map-set"></select>
+        <input type="text" id="map-option" placeholder="選択肢 (商品OPに出る文字列)" style="width:300px">
+        <input type="text" id="map-code" placeholder="商品コード" style="width:180px">
+        <button class="btn" id="btn-map-add">追加・更新</button>
+        <span class="msg" id="map-msg"></span>
+      </div>
+      <table class="ss-table">
+        <thead><tr><th>セット</th><th>選択肢</th><th>商品コード</th><th>メモ</th><th></th></tr></thead>
+        <tbody id="map-body"><tr><td colspan="5" class="muted">読み込み中...</td></tr></tbody>
+      </table>
+    </div>
+
+  </div>
+
+<script>
+const API = '/apps/select-set/api';
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const msg = (id, text, cls) => { const el = document.getElementById(id); el.textContent = text; el.className = 'msg ' + (cls || ''); };
+
+async function jget(url) {
+  const r = await fetch(url);
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'エラー');
+  return j;
+}
+async function jsend(url, method, body) {
+  const r = await fetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || 'エラー');
+  return j;
+}
+
+let SETS = [];
+let OMAKE = [];
+
+async function loadSets() {
+  const j = await jget(API + '/sets');
+  SETS = j.sets;
+  const opts = SETS.map((s) => '<option value="' + esc(s.set_code) + '">' + esc(s.set_code) + '</option>').join('');
+  document.getElementById('try-set').innerHTML = opts;
+  document.getElementById('map-set').innerHTML = opts;
+  document.getElementById('map-filter').innerHTML = '<option value="">すべてのセット</option>' + opts;
+  document.getElementById('set-body').innerHTML = SETS.map((s) =>
+    '<tr data-code="' + esc(s.set_code) + '">'
+    + '<td class="mono">' + esc(s.set_code) + '</td>'
+    + '<td class="ins" colspan="4"><button class="btn link" data-act="inspect">選択肢を確認</button></td>'
+    + '<td><button class="btn link danger" data-act="delset">削除</button></td>'
+    + '</tr>').join('') || '<tr><td colspan="6" class="muted">未登録</td></tr>';
+}
+
+async function loadMappings() {
+  const setCode = document.getElementById('map-filter').value;
+  const j = await jget(API + '/mappings' + (setCode ? '?setCode=' + encodeURIComponent(setCode) : ''));
+  document.getElementById('map-count').textContent = j.mappings.length + '件';
+  document.getElementById('map-body').innerHTML = j.mappings.map((m) =>
+    '<tr>'
+    + '<td class="mono">' + esc(m.set_code) + '</td>'
+    + '<td>' + esc(m.option_text) + '</td>'
+    + '<td class="mono">' + esc(m.product_code) + '</td>'
+    + '<td class="muted">' + esc(m.note || '') + '</td>'
+    + '<td><button class="btn link danger" data-delmap="' + m.id + '">削除</button></td>'
+    + '</tr>').join('') || '<tr><td colspan="5" class="muted">なし</td></tr>';
+}
+
+async function loadOmake() {
+  const j = await jget(API + '/omake');
+  OMAKE = j.omake.map((o) => ({ code: o.product_code, name: o.name, available: o.available }));
+  renderOmake();
+}
+
+function renderOmake() {
+  document.getElementById('omake-list').innerHTML = OMAKE.map((o, i) =>
+    '<li><span class="no">' + (i + 1) + '</span>'
+    + '<span class="code">' + esc(o.code) + '</span>'
+    + '<span class="nm">' + esc(o.name || '') + '</span>'
+    + '<span class="av ' + (o.available > 0 ? '' : 'zero') + '">利用可能 ' + (o.available == null ? '?' : o.available) + '</span>'
+    + '<button class="btn link" data-up="' + i + '">↑</button>'
+    + '<button class="btn link" data-down="' + i + '">↓</button>'
+    + '<button class="btn link danger" data-rm="' + i + '">削除</button></li>').join('')
+    || '<li class="muted">未登録</li>';
+}
+
+function renderTry(d) {
+  const parts = [];
+  if (d.ok) {
+    parts.push('<div class="okbox"><b>展開できます</b> — ' + d.lines.length + '行'
+      + (d.omake && d.omake.code ? ' + おまけ1行' : '') + '</div>');
+  } else {
+    parts.push('<div class="warnbox"><b>展開できません (拡張機能も自動入力しません)</b><ul>'
+      + d.warnings.map((w) => '<li>' + esc(w) + '</li>').join('') + '</ul></div>');
+  }
+  if (d.notices && d.notices.length) {
+    parts.push('<div class="noticebox"><b>確認してください</b><ul>'
+      + d.notices.map((n) => '<li>' + esc(n) + '</li>').join('') + '</ul></div>');
+  }
+  if (d.lines.length) {
+    parts.push('<table class="ss-table" style="margin-top:10px"><thead><tr><th>枠</th><th>選択肢</th><th>商品コード</th><th>商品名</th><th>数量</th><th>解決</th></tr></thead><tbody>'
+      + d.lines.map((l) => '<tr><td>' + esc(l.label) + '</td><td>' + esc(l.value) + '</td>'
+        + '<td class="mono">' + esc(l.code) + '</td><td>' + esc(l.name) + '</td><td>' + l.quantity + '</td>'
+        + '<td class="muted">' + esc(l.via) + '</td></tr>').join('')
+      + '</tbody></table>');
+  }
+  if (d.omake) {
+    parts.push('<div style="margin-top:10px"><b>おまけ候補</b><ul class="rank-list">'
+      + d.omake.candidates.map((c) => '<li><span class="no">' + (c.chosen ? '▶' : '') + '</span>'
+        + '<span class="code ' + (c.chosen ? 'chosen' : '') + '">' + esc(c.code) + '</span>'
+        + '<span class="nm">' + esc(c.name || '') + '</span>'
+        + '<span class="av ' + (c.available > 0 ? '' : 'zero') + '">利用可能 ' + c.available + '</span></li>').join('')
+      + '</ul></div>');
+  }
+  if (d.paste) {
+    parts.push('<div style="margin-top:10px" class="hint">NEの明細入出力補助に貼る内容:</div>'
+      + '<div class="mono" style="font-size:0.85em;white-space:pre;background:#f8f9fa;padding:8px;border-radius:5px">'
+      + esc(d.paste.codes) + '</div>');
+  }
+  parts.push('<div class="hint" style="margin-top:8px">選択肢定義: RMS ' + d.source.rmsOptionCount + '枠'
+    + (d.source.rmsCached ? ' (キャッシュ)' : ' (取得)')
+    + ' / 手動 ' + d.source.manualCount + '件'
+    + (d.source.rmsError ? ' / ⚠RMS取得エラー: ' + esc(d.source.rmsError) : '') + '</div>');
+  document.getElementById('try-result').innerHTML = parts.join('');
+}
+
+document.getElementById('btn-try').addEventListener('click', async () => {
+  msg('try-msg', '展開中...', '');
+  try {
+    const d = await jsend(API + '/try', 'POST', {
+      setCode: document.getElementById('try-set').value,
+      op: document.getElementById('try-op').value,
+      quantity: Number(document.getElementById('try-qty').value) || 1,
+    });
+    msg('try-msg', '', '');
+    renderTry(d);
+  } catch (e) { msg('try-msg', e.message, 'err'); }
+});
+
+document.getElementById('set-body').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  const tr = btn.closest('tr');
+  const code = tr.dataset.code;
+  if (btn.dataset.act === 'delset') {
+    if (!confirm(code + ' を削除します。手動マッピングも一緒に消えます。よろしいですか?')) return;
+    await jsend(API + '/sets/' + encodeURIComponent(code), 'DELETE');
+    await loadSets();
+    await loadMappings();
+    return;
+  }
+  if (btn.dataset.act === 'inspect') {
+    btn.textContent = '取得中...';
+    try {
+      const d = await jget(API + '/sets/' + encodeURIComponent(code) + '/inspect');
+      const picks = d.labels.filter((l) => l.isPick).length;
+      let html = '<td>' + picks + '枠</td><td>' + d.optionCount + '</td><td>' + d.manualCount + '</td>'
+        + '<td class="muted">' + (d.rmsError ? '⚠' + esc(d.rmsError) : esc((d.rmsFetchedAt || '').slice(0, 16).replace('T', ' '))) + '</td>';
+      if (d.unresolved.length) {
+        html += '</tr><tr><td></td><td colspan="5"><div class="warnbox">RMSにあるが商品コードを特定できない選択肢 ('
+          + d.unresolved.length + '件) — 手動マッピングを足してください<br>'
+          + d.unresolved.map((u) => '<span class="mono">' + esc(u) + '</span>').join('<br>') + '</div></td>';
+      }
+      tr.querySelector('td.ins').outerHTML = html;
+    } catch (e) { btn.textContent = 'エラー: ' + e.message; }
+  }
+});
+
+document.getElementById('btn-set-add').addEventListener('click', async () => {
+  try {
+    await jsend(API + '/sets', 'POST', {
+      setCode: document.getElementById('set-code').value,
+      label: document.getElementById('set-label').value,
+    });
+    document.getElementById('set-code').value = '';
+    document.getElementById('set-label').value = '';
+    msg('set-msg', '追加しました', 'ok');
+    await loadSets();
+  } catch (e) { msg('set-msg', e.message, 'err'); }
+});
+
+document.getElementById('map-filter').addEventListener('change', loadMappings);
+
+document.getElementById('btn-map-add').addEventListener('click', async () => {
+  try {
+    await jsend(API + '/mappings', 'POST', {
+      setCode: document.getElementById('map-set').value,
+      optionText: document.getElementById('map-option').value,
+      productCode: document.getElementById('map-code').value,
+    });
+    document.getElementById('map-option').value = '';
+    document.getElementById('map-code').value = '';
+    msg('map-msg', '保存しました', 'ok');
+    await loadMappings();
+  } catch (e) { msg('map-msg', e.message, 'err'); }
+});
+
+document.getElementById('map-body').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-delmap]');
+  if (!btn) return;
+  if (!confirm('この行を削除しますか?')) return;
+  await jsend(API + '/mappings/' + btn.dataset.delmap, 'DELETE');
+  await loadMappings();
+});
+
+document.getElementById('omake-list').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button');
+  if (!btn) return;
+  if (btn.dataset.up != null) {
+    const i = Number(btn.dataset.up);
+    if (i > 0) { const t = OMAKE[i - 1]; OMAKE[i - 1] = OMAKE[i]; OMAKE[i] = t; renderOmake(); }
+  } else if (btn.dataset.down != null) {
+    const i = Number(btn.dataset.down);
+    if (i < OMAKE.length - 1) { const t = OMAKE[i + 1]; OMAKE[i + 1] = OMAKE[i]; OMAKE[i] = t; renderOmake(); }
+  } else if (btn.dataset.rm != null) {
+    OMAKE.splice(Number(btn.dataset.rm), 1); renderOmake();
+  }
+});
+
+document.getElementById('btn-omake-add').addEventListener('click', () => {
+  const code = document.getElementById('omake-add').value.trim();
+  if (!code) return;
+  if (OMAKE.some((o) => o.code.toLowerCase() === code.toLowerCase())) { msg('omake-msg', '既にあります', 'err'); return; }
+  OMAKE.push({ code, name: '(保存すると反映)', available: null });
+  document.getElementById('omake-add').value = '';
+  renderOmake();
+});
+
+document.getElementById('btn-omake-save').addEventListener('click', async () => {
+  try {
+    await jsend(API + '/omake', 'POST', { codes: OMAKE.map((o) => o.code) });
+    msg('omake-msg', '保存しました', 'ok');
+    await loadOmake();
+  } catch (e) { msg('omake-msg', e.message, 'err'); }
+});
+
+(async () => {
+  try {
+    await loadSets();
+    await loadMappings();
+    await loadOmake();
+  } catch (e) { alert('読み込みに失敗しました: ' + e.message); }
+})();
+</script>
+</body>
+</html>
