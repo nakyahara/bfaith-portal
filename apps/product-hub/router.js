@@ -559,7 +559,16 @@ router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
     `画像${assigned.slots.length}枚 / 白抜き${assigned.whiteBg ? 'あり' : 'なし'}`, actorOf(req));
   // 置換で必須項目が壊れた場合は ready_for_ai を差し戻す (個別削除と同じ扱い)
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
-  res.json({ ok: true, ...assigned, warnings, demoted: demoted || undefined });
+  // バリエーション商品なら SKU画像 (SKUコード名のファイル) も同じフォルダから一緒に取り込む
+  // (2026-08-07 中原さん指示。単品や該当ファイル無しは fail-soft でスキップ)
+  let skuImages = null;
+  try {
+    const sr = await importSkuImagesFromFolder(draft.id, { folderUrlOverride: raw });
+    if (sr.ok) skuImages = { matched: sr.matched.length, missing: sr.missing };
+  } catch (e) {
+    console.error('[product-hub] sku-images import (folder取込に同乗) failed:', e);
+  }
+  res.json({ ok: true, ...assigned, warnings, skuImages, demoted: demoted || undefined });
 });
 
 router.post('/api/drafts/:id/specs', (req, res) => {
@@ -905,7 +914,16 @@ router.post('/api/drafts/:id/rakuten/transfer-images', async (req, res) => {
     if (r.error === 'no_images') {
       return res.status(400).json({ ok: false, error: '商品画像 (Driveリンク) を先に追加してください' });
     }
-    res.json(r);
+    // SKU画像も同じボタンで一緒に転送する (2026-08-07 中原さん指示)。
+    // 取り込み済みが無ければ黙ってスキップ (fail-soft — 商品画像の転送結果は返す)
+    let sku = null;
+    try {
+      const sr = await transferSkuImagesToCabinet(draft.id, { actor: actorOf(req) });
+      if (sr.results) sku = { uploaded: sr.uploaded, failed: sr.failed, already: sr.results.filter((x) => x.outcome === 'already').length, results: sr.results };
+    } catch (e) {
+      sku = { uploaded: 0, failed: 1, already: 0, results: [{ sku: '-', outcome: 'failed', error: String(e.message || e).slice(0, 200) }] };
+    }
+    res.json({ ...r, sku });
   } catch (e) {
     console.error('[product-hub] cabinet transfer failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
