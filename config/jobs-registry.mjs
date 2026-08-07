@@ -229,6 +229,28 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
   },
+  {
+    id: 'fba-tracking-input',
+    type: 'scheduled_job',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: 'FBA納品の追跡番号をAmazonへ自動投入 (福山通運の出荷実績CSV → SP-API)。Seller Centralへの手入力を廃止',
+    where: 'miniPC TaskScheduler [FbaTrackingInput] → scripts\\run-fba-tracking.bat',
+    schedule: '毎日 22:00',
+    anchor_hour_jst: 22,
+    anchor_minute_jst: 0,
+    // 🚨SP-APIは「当日23:59 JSTまで」しか受け付けない (2026-08-07 実測。status ではなく期限が効く)。
+    // 22:00に走らなければ猶予は2時間しかないので、締切は短く取って早く気付く。
+    grace_hours: 2,
+    lifecycle: 'permanent',
+    runbook:
+      '① GChatの通知内容を見る (中断理由がそのまま書いてある)。' +
+      '② 箱数と伝票枚数の不一致なら、いろはからの箱数と納品プランを突き合わせる。' +
+      '③ 当日中に直せなければ翌日 Seller Central の「追跡情報の入力」から手入力する ' +
+      '(画面は期限後でも受け付けることを確認済み)。' +
+      '④ 手動再実行 = miniPCで scripts\\run-fba-tracking.bat (引数なし=プレビュー / --commit=本番)。' +
+      'CSVは共有ドライブ 福山通運_istar2_upload\\追跡出力\\fukutsu_tuiseki.csv',
+  },
 
   // ─────────────── human_obligation (人がやる期限つき作業) ───────────────
   // ─────────────── scheduled_job (Render 内 node-cron) ───────────────
