@@ -584,6 +584,45 @@
       </div>
     </div>
 
+    <%# SKU画像 (2026-08-07 中原さん指示): バリエーション商品のみ。フォルダに「SKUコード」名で
+        保存された画像を取り込み → R-Cabinet転送 → 楽天ページの variants[sku].images へ PATCH %>
+    <% if (variation.kind === 'variation' && variation.members.length > 0) { %>
+      <% const skuImgBySku = new Map(skuImages.map((r) => [r.sku_code, r])); %>
+      <div class="field" style="margin-top:16px; border-top:1px dashed #e2e8f0; padding-top:12px;">
+        <label>SKU画像 <span class="muted">(SKU選択時に切り替わる画像。楽天ページ登録後に紐づけ)</span></label>
+        <div class="muted" style="font-size:11px; margin-bottom:6px;">
+          画像フォルダに <b>SKUコード名</b> (例: <code><%= String(variation.members[0]?.商品コード || 'sku-code').toLowerCase() %>.jpg</code>) で保存 →
+          「取り込む」→「転送」→「紐づける」。紐づけは楽天ページの SKU画像だけを書き換えます (価格・選択肢など他の項目は触りません)
+        </div>
+        <table class="list" style="font-size:12px;">
+          <thead><tr><th>SKU</th><th>商品名 (NE)</th><th style="width:64px;">画像</th><th>状態</th></tr></thead>
+          <tbody>
+            <% for (const m of variation.members) { %>
+              <% const sku = String(m.商品コード || '').trim().toLowerCase(); const r = skuImgBySku.get(sku); %>
+              <tr>
+                <td><code><%= sku %></code></td>
+                <td class="muted" style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= m.商品名 || '' %></td>
+                <td><% if (r) { %><img src="<%= thumbnailUrl(r.drive_file_id, 160) %>" alt="" loading="lazy"
+                       style="width:56px; height:56px; object-fit:contain; border:1px solid #e2e8f0; border-radius:6px; background:#fff;"><% } else { %><span class="muted">—</span><% } %></td>
+                <td>
+                  <% if (!r) { %><span class="muted">未取込 (フォルダに <%= sku %>.jpg 等を置いて「取り込む」)</span>
+                  <% } else if (r.synced_at) { %><span style="color:#166534;">🔗 楽天へ反映済み (<%= r.synced_at.replace('T',' ').slice(0,16) %>)</span>
+                  <% } else if (r.cabinet_location) { %><span style="color:#166534;">✅ 転送済み</span> <span class="muted">(未紐づけ)</span>
+                  <% } else { %><span style="color:#b45309;">⏳ 未転送</span><% } %>
+                </td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:8px; flex-wrap:wrap;">
+          <button class="btn btn-sm" id="sku-img-import-btn">SKU画像を取り込む</button>
+          <button class="btn btn-sm" id="sku-img-transfer-btn">R-Cabinetへ転送</button>
+          <button class="btn btn-primary btn-sm" id="sku-img-sync-btn">楽天のSKUに紐づける</button>
+          <span class="muted" id="sku-img-result" style="font-size:12px;"></span>
+        </div>
+      </div>
+    <% } %>
+
     <div class="field" style="margin-top:14px;">
       <label>白抜き背景画像 <span class="muted">(検索サムネ用 whiteBgImage。Driveのファイルリンク)</span><span class="ftag ftag-m">手入力</span></label>
       <div style="display:flex; gap:8px; align-items:center;">
@@ -2393,6 +2432,37 @@
       setTimeout(() => location.reload(), 600);
     });
   });
+
+  // ─── SKU画像 (バリエーションのみボタンが存在する) ───
+  (function () {
+    const importBtn2 = document.getElementById('sku-img-import-btn');
+    if (!importBtn2) return;
+    const transferBtn = document.getElementById('sku-img-transfer-btn');
+    const syncBtn = document.getElementById('sku-img-sync-btn');
+    const out = document.getElementById('sku-img-result');
+    const busy = (b) => [importBtn2, transferBtn, syncBtn].forEach((x) => { x.disabled = b; });
+    async function run(path, confirmMsg, render) {
+      if (confirmMsg && !confirm(confirmMsg)) return;
+      busy(true);
+      out.textContent = '実行中…';
+      try {
+        const json = await post(BASE + path, {});
+        if (!json.ok && !(json.uploaded > 0)) { out.textContent = ''; alert(json.error || 'エラーが発生しました'); return; }
+        out.textContent = render(json);
+        setTimeout(() => location.reload(), 1500);
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally { busy(false); }
+    }
+    importBtn2.addEventListener('click', () => run('/sku-images/import-folder', null,
+      (j) => '取込 ' + j.matched.length + ' 件' + (j.missing.length ? ' / フォルダに無いSKU ' + j.missing.length + ' 件' : '')));
+    transferBtn.addEventListener('click', () => run('/sku-images/transfer', null,
+      (j) => '転送 ' + (j.uploaded || 0) + ' 件 / 済み ' + j.results.filter((r) => r.outcome === 'already').length + ' 件'
+        + (j.failed ? ' / 失敗 ' + j.failed + ' 件' : '')));
+    syncBtn.addEventListener('click', () => run('/rakuten/sync-sku-images',
+      '楽天ページの SKU画像を書き換えます (SKU画像以外は変更されません)。よろしいですか?',
+      (j) => '🔗 ' + j.synced.length + ' SKU に紐づけました' + (j.unmatched.length ? ' / ページ側に無いSKU: ' + j.unmatched.join(', ') : '')));
+  })();
 
   // 文字数カウンタ (全AI項目)。上限があるもの (楽天タイトル128 / Yahoo!タイトル65 / キャッチコピー30)
   // は「n / 上限文字」+ 超過で赤。上限なしの素材 (特徴・仕様・注意書き) は「n文字」の単純カウント

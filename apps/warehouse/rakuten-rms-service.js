@@ -466,6 +466,72 @@ router.get('/items/manage-numbers/:manageNumber', rateLimitMiddleware('rakuten')
   }
 });
 
+// SKU画像だけを variants[sku].images へ PATCH する限定ルート (2026-08-07 中原さん指示)。
+// PATCH は per-SKU マージ (zz- テスト商品で実測: 他SKU・価格・selectorValues は無傷) のため、
+// **台帳ガードは適用しない** — 対象は手動登録済みのバリエーションページが主で、
+// サーバー側で body を「images 1枚のみ」の形に作り直すので他フィールドには構造的に触れない
+router.patch('/items/manage-numbers/:manageNumber/sku-images', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  try {
+    const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+    if (!MANAGE_NUMBER_RE.test(mn)) {
+      return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+    }
+    const src = req.body?.variants;
+    const keys = src && typeof src === 'object' && !Array.isArray(src) ? Object.keys(src) : [];
+    if (keys.length === 0 || keys.length > 40) {
+      return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'variants は 1〜40 SKU で指定してください', requestId: req.requestId });
+    }
+    const variants = Object.create(null); // __proto__ 等の特殊キーで代入が化けないよう素のマップにする (Codex Low-7)
+    for (const key of keys) {
+      const k = String(key);
+      // SKU管理番号 (RMS側の実キー)。前後空白は呼び出し側の正規化ミスなので黙って直さず拒否する
+      const hasCtl = Array.from(k).some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127);
+      if (!k || k !== k.trim() || k.length > 96 || hasCtl) {
+        return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: `SKU番号の形式が不正です: ${String(key).slice(0, 40)}`, requestId: req.requestId });
+      }
+      const imgs = src[key]?.images;
+      const loc = Array.isArray(imgs) && imgs.length === 1 ? String(imgs[0]?.location || '') : '';
+      // R-Cabinet の location 形式に限定 (Codex Medium-5): /dir/…/file.<画像拡張子>
+      if (!/^\/(?:[A-Za-z0-9_\-]+\/)*[A-Za-z0-9_\-]+\.(?:jpg|jpeg|gif|png)$/.test(loc) || loc.length > 200) {
+        return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: `images は {type:'CABINET', location:'/dir/file.jpg'} を1枚だけ指定してください (SKU: ${k})`, requestId: req.requestId });
+      }
+      variants[k] = { images: [{ type: 'CABINET', location: loc }] };
+    }
+    const result = await withManageNumberLock(mn, async () => {
+      // 指定 SKU がその商品に実在するかを同一ロック内で検証してから送る (Codex Medium-4:
+      // このルートは書き込み境界なので、呼び出し側の GET 照合には依存しない)
+      const cur = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (cur.status !== 200) {
+        return { status: cur.status === 404 ? 404 : 502, data: { message: `商品の取得に失敗 (HTTP ${cur.status})` } };
+      }
+      const existing = new Set(Object.keys(cur.data?.variants || {}));
+      const unknown = Object.keys(variants).filter((k) => !existing.has(k));
+      if (unknown.length > 0) {
+        return { status: 400, data: { message: `この商品に存在しないSKUです: ${unknown.slice(0, 10).join(', ')}` } };
+      }
+      return rakutenRequest({
+        path: `/es/2.0/items/manage-numbers/${mn}`, method: 'PATCH',
+        body: { variants },
+        maxAttempts: 1, // 変更系は自動リトライしない
+      });
+    });
+    if (result.status < 200 || result.status >= 300) {
+      const err = extractRmsError(result.data);
+      return errorResponse(res, {
+        // 事前検証由来 (存在しないSKU/商品なし) は 400/404 のまま返す
+        status: result.status === 400 || result.status === 404 ? result.status : 502,
+        error: 'RMS_API_ERROR',
+        message: `SKU画像の反映に失敗 (HTTP ${result.status}${err.message ? ` / ${err.message}` : ''})`,
+        requestId: req.requestId,
+      });
+    }
+    console.log(`[rakuten-rms] sku-images patched mn=${mn} skus=${Object.keys(variants).length}`);
+    okResponse(res, { patched: Object.keys(variants).length });
+  } catch (e) {
+    errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
 // 新規作成 (倉庫指定固定)。既存商品なら 409 で拒否
 router.put('/items/manage-numbers/:manageNumber', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
   try {

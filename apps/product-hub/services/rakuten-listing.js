@@ -16,6 +16,7 @@
  *   - articleNumber は value か exemptionReason が必須 (IE0229)
  *   - 既存商品の attributes は GET の形のまま PUT に使える (= [{name, values:[..]}])
  */
+import crypto from 'node:crypto';
 import sharp from 'sharp';
 import { google } from 'googleapis';
 
@@ -388,6 +389,207 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
   const failed = results.filter((r) => r.outcome === 'failed').length;
   logEvent(db, draftId, 'cabinet_transfer', `uploaded=${uploaded} failed=${failed}`, actor);
   return { ok: failed === 0, uploaded, failed, results };
+}
+
+// ─── SKU画像 (バリエーションページの SKU 選択時に出る画像。2026-08-07 中原さん指示) ───
+// 運用: 画像フォルダに「SKUコード」名 (例 sueders-db.jpg) で保存されている。
+// 流れ: フォルダから取り込み → R-Cabinet 転送 → 楽天の variants[sku].images へ PATCH。
+// PATCH は per-SKU マージ (zz- テスト商品で実測 2026-08-07) なので、
+// 手動登録済みのバリエーションページにも SKU画像だけ安全に後付けできる。
+
+/** ファイル名から拡張子を落として SKU コード比較用に正規化 (pure・smoke対象) */
+export function skuImageKeyOfFileName(name) {
+  return String(name || '').trim().replace(/\.[A-Za-z0-9]{1,5}$/, '').trim().toLowerCase();
+}
+
+/**
+ * SKU画像の R-Cabinet ファイルパス (pure・smoke対象)。
+ * 単純な英数置換だと a_b / a.b が同じ a-b になり別SKUの画像を上書きし得る (Codex High-3)
+ * → 置換で情報が落ちる場合は元コードのハッシュ8桁を付けて一意にする。
+ * cabinet/upload の制約 (先頭英数・計31文字以内 + .jpg) に収まるよう切り詰める
+ */
+export function skuCabinetFilePath(skuCode) {
+  const sku = String(skuCode);
+  let safe = sku.replace(/[^a-z0-9\-]/g, '-').replace(/^-+/, '');
+  // 置換で情報が落ちる場合に加え、**切り詰めが必要な場合も**ハッシュを付ける
+  // (Codex R2 High: 先頭が同じ長いSKU同士が切り詰めで衝突する)
+  const lossless = safe === sku && safe.length <= 31 - '-sku'.length;
+  const tail = lossless ? '-sku' : `-${crypto.createHash('sha1').update(sku).digest('hex').slice(0, 8)}-sku`;
+  safe = (safe || 'x').slice(0, Math.max(1, 31 - tail.length));
+  if (!/^[a-z0-9]/.test(safe)) safe = `x${safe}`.slice(0, Math.max(1, 31 - tail.length));
+  return `${safe}${tail}.jpg`;
+}
+
+/** Drive フォルダから「SKUコード」名のファイルを draft_sku_images に取り込む */
+export async function importSkuImagesFromFolder(draftId, { folderUrlOverride = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'ドラフトが見つかりません' };
+  const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: true });
+  if (vari.kind !== 'variation' || vari.members.length === 0) {
+    return { ok: false, error: 'バリエーション商品ではありません (SKU画像は不要です)' };
+  }
+  const folderUrl = folderUrlOverride || draft.drive_folder_url;
+  if (!folderUrl) return { ok: false, error: '画像フォルダURLが未設定です (画像タブでフォルダを取り込んでください)' };
+  const m = String(folderUrl).match(/\/folders\/([\w-]+)/);
+  if (!m) return { ok: false, error: '画像フォルダURLがDriveのフォルダリンクではありません' };
+  let files;
+  try {
+    files = await listDriveFolderImages(m[1]);
+  } catch (e) {
+    return { ok: false, error: `フォルダ一覧の取得に失敗しました (${String(e.message || e).slice(0, 200)})` };
+  }
+  const byKey = new Map(); // sku(lower) → files[]
+  for (const f of files) {
+    const key = skuImageKeyOfFileName(f.name);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(f);
+  }
+  const matched = [];
+  const missing = [];
+  const conflicts = [];
+  for (const mem of vari.members) {
+    const sku = String(mem.商品コード || '').trim().toLowerCase();
+    if (!sku) continue;
+    const hits = byKey.get(sku) || [];
+    if (hits.length === 0) { missing.push(sku); continue; }
+    if (hits.length > 1) { conflicts.push({ sku, names: hits.map((h) => h.name) }); continue; }
+    matched.push({ sku, file: hits[0] });
+  }
+  if (conflicts.length > 0) {
+    return { ok: false, error: '同じSKUコード名のファイルが複数あります。フォルダを整理してからやり直してください', conflicts };
+  }
+  // 取り込みは「フォルダのスナップショット」として1トランザクションで反映する:
+  // 今回マッチしなかった既存行は削除 (Codex High-1: フォルダから消した画像が
+  // DB に残り、古い画像を楽天へ再同期できてしまう)
+  db.transaction(() => {
+    const keep = matched.map((x) => x.sku);
+    const del = db.prepare(
+      `DELETE FROM draft_sku_images WHERE draft_id = ? AND sku_code NOT IN (${keep.map(() => '?').join(',') || "''"})`,
+    ).run(draftId, ...keep);
+    for (const { sku, file } of matched) {
+      // ファイルが変わっていたら転送・紐づけ状態をリセット (古い画像のまま「済み」に見せない)
+      db.prepare(`
+        INSERT INTO draft_sku_images (draft_id, sku_code, drive_file_id, file_name)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+          drive_file_id = excluded.drive_file_id,
+          file_name = excluded.file_name,
+          cabinet_location = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.cabinet_location ELSE NULL END,
+          cabinet_file_id  = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.cabinet_file_id ELSE NULL END,
+          uploaded_at      = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.uploaded_at ELSE NULL END,
+          synced_at        = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.synced_at ELSE NULL END
+      `).run(draftId, sku, file.id, file.name);
+    }
+    if (del.changes > 0) logEvent(db, draftId, 'sku_images_removed', `removed=${del.changes} (フォルダに無いSKU)`, null);
+  })();
+  logEvent(db, draftId, 'sku_images_imported', `matched=${matched.length} missing=${missing.length}`, null);
+  return { ok: true, matched: matched.map((x) => ({ sku: x.sku, name: x.file.name })), missing };
+}
+
+/** 取り込み済み SKU画像を R-Cabinet へ転送する (転送済みはスキップ = 冪等) */
+export async function transferSkuImagesToCabinet(draftId, { actor = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'draft_not_found' };
+  const rows = db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draftId);
+  if (rows.length === 0) return { ok: false, error: 'SKU画像が未取り込みです (先に「SKU画像を取り込む」)' };
+  const folderId = await ensureCabinetFolder(db);
+  const results = [];
+  for (const row of rows) {
+    if (row.cabinet_location) {
+      results.push({ sku: row.sku_code, outcome: 'already', location: row.cabinet_location });
+      continue;
+    }
+    try {
+      const raw = await downloadDriveImage(row.drive_file_id);
+      const jpeg = await toCabinetJpeg(raw);
+      // 商品画像 (<代表>-N.jpg) と衝突しないよう "-sku" を付ける。同名は overWrite で置換 (再転送に安全)
+      const up = await callWarehouse('/service-api/rakuten-rms/cabinet/upload', {
+        method: 'POST',
+        body: { folderId, filePath: skuCabinetFilePath(row.sku_code), fileName: `${row.sku_code} SKU画像`, fileBase64: jpeg.toString('base64') },
+      });
+      const location = up.data?.location ?? up.data?.data?.location;
+      const fileId = up.data?.fileId ?? up.data?.data?.fileId;
+      if (up.status !== 200 || !location) throw new Error(up.data?.message || up.data?.error || `HTTP ${up.status}`);
+      // 読み出した drive_file_id を条件に含める (Codex High-2: 転送中に再取り込みで
+      // ファイルが差し替わっていたら 0 行更新 = 旧画像を新しい行へ紐付けない)
+      const upd = db.prepare(`
+        UPDATE draft_sku_images SET cabinet_location = ?, cabinet_file_id = ?,
+          uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE draft_id = ? AND sku_code = ? AND drive_file_id = ?
+      `).run(location, fileId ?? null, draftId, row.sku_code, row.drive_file_id);
+      if (upd.changes === 0) {
+        results.push({ sku: row.sku_code, outcome: 'failed', error: '転送中に画像が差し替わりました。もう一度「R-Cabinetへ転送」を実行してください' });
+      } else {
+        results.push({ sku: row.sku_code, outcome: 'uploaded', location });
+      }
+    } catch (e) {
+      results.push({ sku: row.sku_code, outcome: 'failed', error: String(e.message || e).slice(0, 300) });
+    }
+  }
+  const uploaded = results.filter((r) => r.outcome === 'uploaded').length;
+  const failed = results.filter((r) => r.outcome === 'failed').length;
+  logEvent(db, draftId, 'sku_images_transferred', `uploaded=${uploaded} failed=${failed}`, actor);
+  return { ok: failed === 0, uploaded, failed, results };
+}
+
+/**
+ * 転送済み SKU画像を楽天の variants[sku].images へ紐づける (PATCH)。
+ * 手動登録ページ対応のため、まず GET で実在の SKU キーを取り、
+ * 大文字小文字を RMS 側の表記に合わせてから一致した SKU だけ送る。
+ */
+export async function syncSkuImagesToRms(draftId, { actor = null } = {}) {
+  const db = getDB();
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
+  if (!draft) return { ok: false, error: 'draft_not_found' };
+  const rows = db.prepare(`SELECT * FROM draft_sku_images WHERE draft_id = ? AND cabinet_location IS NOT NULL ORDER BY sku_code`).all(draftId);
+  if (rows.length === 0) return { ok: false, error: '転送済みのSKU画像がありません (先に「R-Cabinetへ転送」)' };
+  const mn = String(draft.ne_code).trim().toLowerCase();
+  const got = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}`);
+  if (got.status === 404) {
+    return { ok: false, error: `楽天に ${mn} のページが見つかりません (先にバリエーションページを登録してください)` };
+  }
+  if (got.status !== 200) {
+    return { ok: false, error: `楽天ページの取得に失敗しました (HTTP ${got.status})` };
+  }
+  const rmsKeys = Object.keys(got.data?.variants || {});
+  const rmsByLower = new Map(rmsKeys.map((k) => [String(k).trim().toLowerCase(), k]));
+  const variants = Object.create(null);
+  const sent = []; // { sku, location } — synced_at の付与条件に使う
+  const unmatched = [];
+  for (const row of rows) {
+    const rmsKey = rmsByLower.get(row.sku_code);
+    if (!rmsKey) { unmatched.push(row.sku_code); continue; }
+    variants[rmsKey] = { images: [{ type: 'CABINET', location: row.cabinet_location }] };
+    sent.push({ sku: row.sku_code, location: row.cabinet_location });
+  }
+  if (sent.length === 0) {
+    return { ok: false, error: `楽天ページのSKUと一致しません (ページ側: ${rmsKeys.slice(0, 10).join(', ')})`, unmatched };
+  }
+  const r = await callWarehouse(`/service-api/rakuten-rms/items/manage-numbers/${encodeURIComponent(mn)}/sku-images`, {
+    method: 'PATCH', body: { variants },
+  });
+  if (r.status < 200 || r.status >= 300) {
+    const msg = r.data?.message || r.data?.error || `HTTP ${r.status}`;
+    logEvent(db, draftId, 'sku_images_sync_failed', String(msg).slice(0, 300), actor);
+    return { ok: false, error: String(msg).slice(0, 300) };
+  }
+  // 送った location と行が一致するときだけ synced 扱い (Codex R2 High: PATCH 中に
+  // 再取込で画像が差し替わった行へ synced_at を付けない。0行更新なら未同期のまま =
+  // 画面は「未紐づけ」に戻り、人がもう一度紐づけて新画像で上書きできる)
+  const stamp = db.prepare(`
+    UPDATE draft_sku_images SET synced_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = ? AND sku_code = ? AND cabinet_location = ?
+  `);
+  const synced = [];
+  const staleAfterPatch = [];
+  for (const s of sent) {
+    if (stamp.run(draftId, s.sku, s.location).changes > 0) synced.push(s.sku);
+    else staleAfterPatch.push(s.sku);
+  }
+  logEvent(db, draftId, 'sku_images_synced', `synced=${synced.length} unmatched=${unmatched.length}${staleAfterPatch.length ? ` stale=${staleAfterPatch.length}` : ''}`, actor);
+  return { ok: true, synced, unmatched, staleAfterPatch };
 }
 
 // ─── 出品 payload ───

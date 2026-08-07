@@ -1029,6 +1029,21 @@ check('effectiveShippingForDraft: 複合(1y8/1y5)は楽天=定形外 + yahooDeli
 check('複合選択肢の末尾バナーは定形外と同一',
   JSON.stringify(listing.trailingBannerLocations(listing.effectiveShippingForDraft(db, 'rk-smoke-1', '1y8').group))
   === JSON.stringify(listing.trailingBannerLocations('1')));
+// SKU画像 (2026-08-07): ファイル名→SKUコード照合キー
+check('skuImageKeyOfFileName: 拡張子除去+小文字化+trim',
+  listing.skuImageKeyOfFileName('Sueders-DB.JPG') === 'sueders-db'
+  && listing.skuImageKeyOfFileName(' sueders-db.png ') === 'sueders-db'
+  && listing.skuImageKeyOfFileName('sueders-db') === 'sueders-db'
+  && listing.skuImageKeyOfFileName('sueders-db.backup.jpg') === 'sueders-db.backup');
+// Cabinet ファイルパス: 情報が落ちる置換はハッシュ付与で一意化 (Codex High-3)
+check('skuCabinetFilePath: 素直なコードはそのまま / 特殊文字はハッシュ付与で衝突しない',
+  listing.skuCabinetFilePath('sueders-db') === 'sueders-db-sku.jpg'
+  && listing.skuCabinetFilePath('a_b') !== listing.skuCabinetFilePath('a.b')
+  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('a_b'))
+  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('とても長い日本語のSKUコード仮に置いたもの'))
+  && /^[a-z0-9][a-z0-9\-]{0,30}\.jpg$/.test(listing.skuCabinetFilePath('x'.repeat(96))));
+check('skuCabinetFilePath: 切り詰めが必要な長い同接頭辞SKUも衝突しない (R2 High)',
+  listing.skuCabinetFilePath('a'.repeat(40)) !== listing.skuCabinetFilePath('a'.repeat(40) + 'b'));
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 
@@ -2229,6 +2244,7 @@ for (const [name, file, data] of renders) {
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
+        skuImages: [],
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),

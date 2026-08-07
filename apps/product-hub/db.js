@@ -289,6 +289,21 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_draft_cabinet_draft ON draft_cabinet_images(draft_id);
 
+    -- SKU画像 (バリエーションページで SKU 選択時に出る画像。2026-08-07 中原さん指示)。
+    -- Drive フォルダに「SKUコード」名で置かれたファイルを取り込み、R-Cabinet 転送後に
+    -- 楽天の variants[sku].images へ PATCH で紐づける (PATCH は per-SKU マージ = 実測済)
+    CREATE TABLE IF NOT EXISTS draft_sku_images (
+      draft_id       INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code       TEXT NOT NULL,          -- LOWER(TRIM()) した SKU 商品コード
+      drive_file_id  TEXT NOT NULL,
+      file_name      TEXT,
+      cabinet_location TEXT,                 -- 転送後に /dir/file.jpg (未転送は NULL)
+      cabinet_file_id  INTEGER,
+      uploaded_at    TEXT,
+      synced_at      TEXT,                   -- RMS の variants[sku].images へ反映した日時
+      PRIMARY KEY (draft_id, sku_code)
+    );
+
     -- 楽天の店舗内カテゴリ (お店の棚) マスタ。RMS 画面からの貼り付けで取り込む
     -- (Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要 = 未実装)。
     -- 全置き換え取り込みでも行は消さず is_active で外す (draft_shop_categories が参照するため)
@@ -818,8 +833,9 @@ export function isKnownImageFileId(db, fileId) {
   return !!db.prepare(`
     SELECT 1 FROM draft_images WHERE drive_file_id = ?
     UNION SELECT 1 FROM draft_rakuten WHERE white_bg_drive_file_id = ?
+    UNION SELECT 1 FROM draft_sku_images WHERE drive_file_id = ?
     LIMIT 1
-  `).get(fileId, fileId);
+  `).get(fileId, fileId, fileId);
 }
 
 /**

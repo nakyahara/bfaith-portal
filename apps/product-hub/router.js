@@ -29,6 +29,7 @@ import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
+  importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
@@ -245,6 +246,7 @@ router.get('/detail/:id', (req, res) => {
     displayName: req.session?.displayName || req.session?.email || '',
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
+    skuImages: db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draft.id),
     gate: gateReasons(db, draft),
     nextStatuses,
     statusLabels: STATUS_LABELS,
@@ -1082,6 +1084,43 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+// SKU画像 (バリエーションページ用。2026-08-07): 取り込み → 転送 → RMSのSKUへ紐づけ
+router.post('/api/drafts/:id/sku-images/import-folder', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await importSkuImagesFromFolder(draft.id, { folderUrlOverride: cleanText(req.body?.url, 1000) || null });
+    res.status(r.ok ? 200 : 400).json(r);
+  } catch (e) {
+    console.error('[product-hub] sku-images import failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/drafts/:id/sku-images/transfer', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await transferSkuImagesToCabinet(draft.id, { actor: actorOf(req) });
+    res.status(r.ok || r.uploaded > 0 ? 200 : 400).json(r);
+  } catch (e) {
+    console.error('[product-hub] sku-images transfer failed:', e);
+    res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
+  }
+});
+
+router.post('/api/drafts/:id/rakuten/sync-sku-images', async (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = await syncSkuImagesToRms(draft.id, { actor: actorOf(req) });
+    res.status(r.ok ? 200 : 400).json(r);
+  } catch (e) {
+    console.error('[product-hub] sku-images sync failed:', e);
     res.status(502).json({ ok: false, error: String(e.message || e).slice(0, 300) });
   }
 });
