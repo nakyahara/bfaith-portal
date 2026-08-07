@@ -15,10 +15,10 @@ t('JST日付: UTC深夜でも日本の日付になる (toISOStringの罠)', () =
   assert.equal(jstYmd(new Date('2026-08-06T23:00:00Z')), '20260807');
 });
 
-const base = { runId: 'r', commit: true, expectYmd: '20260807', blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [] };
+const base = { runId: 'r', commit: true, severity: 'ok', expectYmd: '20260807', blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [] };
 
 t('中断時は「登録は一切していません」と明記する', () => {
-  const s = formatSummary({ ...base, blocked: ['個口合計 5 と輸送箱 6 が一致しません'] });
+  const s = formatSummary({ ...base, severity: 'blocked', blocked: ['個口合計 5 と輸送箱 6 が一致しません'] });
   assert.match(s, /🚨/);
   assert.match(s, /登録は一切していません/);
   assert.match(s, /個口合計 5 と輸送箱 6/);
@@ -26,13 +26,13 @@ t('中断時は「登録は一切していません」と明記する', () => {
 });
 
 t('成功時は納品ごとに箱数と照合方法を出す', () => {
-  const s = formatSummary({ ...base, registered: [{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', countBoxes: 5, matchedBy: '納品番号' }] });
+  const s = formatSummary({ ...base, severity: 'ok', registered: [{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', countBoxes: 5, matchedBy: '納品番号' }] });
   assert.match(s, /✅/);
   assert.match(s, /FBA15GGL5J2X \(HND2\) 5箱  照合=納品番号/);
 });
 
 t('期限切れは「画面から手入力してください」を添える', () => {
-  const s = formatSummary({ ...base, failed: [{ shipmentConfirmationId: 'FBA-A', error: '編集期限を過ぎています', needsManual: true }] });
+  const s = formatSummary({ ...base, severity: 'warn', failed: [{ shipmentConfirmationId: 'FBA-A', error: '編集期限を過ぎています', needsManual: true }] });
   assert.match(s, /⚠️/);
   assert.match(s, /画面から手入力してください/);
 });
@@ -41,6 +41,25 @@ t('🚨除外は黙って捨てず件数を必ず出す', () => {
   const s = formatSummary({ ...base, excluded: [{ fcCode: 'AMRC', 件数: 4, reason: 'FBA以外' }] });
   assert.match(s, /除外 4件/);
   assert.match(s, /AMRC/);
+});
+
+t('🚨納品が無い日 (CSV未設置) は情報どまり — 毎晩の誤警報を出さない', () => {
+  const s = formatSummary({ ...base, severity: 'info', note: ['本日の出荷実績CSVはまだ置かれていません。FBA納品が無い日なら正常です'] });
+  assert.match(s, /^ℹ️/);
+  assert.doesNotMatch(s, /🚨/);
+  assert.doesNotMatch(s, /登録は一切していません/);
+});
+
+t('対象の納品が無いだけなら警告どまり (中断にしない)', () => {
+  const s = formatSummary({ ...base, severity: 'warn', note: ['追跡番号の未登録な納品が見つかりません'] });
+  assert.match(s, /^⚠️/);
+  assert.doesNotMatch(s, /🚨/);
+});
+
+t('箱数不一致は中断 (severityで見分ける)', () => {
+  const s = formatSummary({ ...base, severity: 'blocked', blocked: ['個口合計 5 と輸送箱 6 が一致しません'] });
+  assert.match(s, /^🚨/);
+  assert.match(s, /登録は一切していません/);
 });
 
 t('プレビューはタイトルで分かる', () => {

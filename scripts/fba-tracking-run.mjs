@@ -19,7 +19,10 @@
  *   FBA_TRACKING_FILENAME             既定 fukutsu_tuiseki.csv
  *   GCHAT_WEBHOOK_JOBS                通知先 (要対応スペース)
  *
- * 終了コード: 0=正常 / 1=中断または失敗あり (呼び出し元の .bat が ping の status を分ける)
+ * 終了コード: 0=正常/警告 / 1=中断 (人が直すまで登録できない)
+ *   ⭐FBA納品が無い日は普通にあるので「対象なし」で 1 を返さない。
+ *     毎晩ニセの警報が鳴ると本当の異常が埋もれる (jobs-monitor の設計方針と同じ)。
+ *     期限切れ等の「人が画面で入力すべき件」は GChat の本文で伝え、終了コードは 0 にする。
  */
 import 'dotenv/config';
 import { runTrackingJob, formatSummary, notifySummary } from '../apps/fba-replenishment/tracking-runner.js';

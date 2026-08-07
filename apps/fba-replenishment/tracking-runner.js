@@ -67,18 +67,37 @@ export async function runTrackingJob(opts = {}) {
   const runId = `${jstYmd(now)}-${now.getTime().toString(36)}`;
   const summary = {
     runId, commit, expectYmd, source: null, sourceHash: null,
+    // ⭐severity は「人を呼ぶべきか」の段階。納品が無い日は普通にあるので、
+    //   それを blocked にすると毎晩ニセの警報が鳴って本当の異常が埋もれる。
+    //   ok   = 登録した / 何もすることが無かった
+    //   info = 出荷実績CSVが無い日 (FBA納品が無い日は正常)
+    //   warn = 気に留めてほしいが自動対応は不要 (既に手入力済み等)
+    //   blocked = 人が直すまで登録できない (箱数不一致・期限切れ・CSV不正)
+    severity: 'ok',
     blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [],
   };
 
   const miss = missingEnv();
-  if (miss.length) { summary.blocked.push(`SP-APIの環境変数が不足: ${miss.join(', ')}`); return summary; }
+  if (miss.length) {
+    summary.severity = 'blocked';
+    summary.blocked.push(`SP-APIの環境変数が不足: ${miss.join(', ')}`);
+    return summary;
+  }
 
   // 1. CSV取得
   let csv;
   try {
     csv = await fetchCsv({ file: opts.file, folderId: opts.folderId ?? process.env.FBA_TRACKING_DRIVE_FOLDER_ID, filename: opts.filename });
   } catch (e) {
-    summary.blocked.push(`CSVを取得できません: ${e.message}`);
+    // ファイルが置かれていないだけなら、FBA納品が無い日の正常な姿。
+    // 権限エラーや設定漏れは人を呼ぶ (VALIDATION = 対象ファイルが見つからない)
+    const notFound = e.code === 'VALIDATION' || e.code === 'TRACKING_CSV';
+    summary.severity = notFound ? 'info' : 'blocked';
+    (notFound ? summary.note : summary.blocked).push(
+      notFound
+        ? `本日の出荷実績CSVはまだ置かれていません (${e.message})。FBA納品が無い日なら正常です`
+        : `CSVを取得できません: ${e.message}`,
+    );
     return summary;
   }
   summary.source = csv.source;
@@ -91,31 +110,36 @@ export async function runTrackingJob(opts = {}) {
     rows = parsed.rows;
     if (parsed.problems.length) summary.blocked.push(...parsed.problems);
   } catch (e) {
+    summary.severity = 'blocked';
     summary.blocked.push(e.message);
     return summary;
   }
-  if (!rows.length) { summary.blocked.push('CSVにデータ行がありません'); return summary; }
+  if (!rows.length) { summary.severity = 'blocked'; summary.blocked.push('CSVにデータ行がありません'); return summary; }
 
   // 3. 🚨古いCSVの誤処理を防ぐ (固定ファイル名運用のため中身の出荷日で見る)
   const d = checkShipDate(rows, expectYmd);
-  if (!d.ok) { summary.blocked.push(d.problem); return summary; }
+  if (!d.ok) { summary.severity = 'blocked'; summary.blocked.push(d.problem); return summary; }
 
   // 4. 同じCSVを二度処理しない (出荷日チェックと二重の防御)
   const dup = store.findBySourceHash(summary.sourceHash);
   if (dup) summary.note.push(`このCSVは ${dup.at} に処理済みです (同一内容の納品はスキップされます)`);
 
-  if (summary.blocked.length) return summary;
+  if (summary.blocked.length) { summary.severity = 'blocked'; return summary; }
 
   // 5. 対象の納品を探す
   let shipments;
   try {
     shipments = await findOpenShipments();
   } catch (e) {
+    summary.severity = 'blocked';
     summary.blocked.push(`納品の取得に失敗: ${e.message}`);
     return summary;
   }
   if (!shipments.length) {
-    summary.blocked.push('追跡番号の未登録な納品が見つかりません (すでに入力済み、またはラベル未発行の可能性)');
+    // CSVはあるのに対象が無い = すでに人が画面で入れた / ラベル未発行 / 別便だけ。
+    // 自動では何もできないが「人を叩き起こす異常」でもないので warn に留める。
+    summary.severity = 'warn';
+    summary.note.push('追跡番号の未登録な納品が見つかりません (すでに画面で入力済み、ラベル未発行、またはFBA以外の便だけの可能性)');
     return summary;
   }
 
@@ -123,7 +147,11 @@ export async function runTrackingJob(opts = {}) {
   const { assignments, excluded, problems, skipped } = buildAssignments(rows, shipments);
   summary.excluded = excluded;
   summary.skipped = skipped;
-  if (problems.length) { summary.blocked.push(...problems); return summary; } // 1つでも怪しければ全部止める
+  if (problems.length) { // 1つでも怪しければ全部止める
+    summary.severity = 'blocked';
+    summary.blocked.push(...problems);
+    return summary;
+  }
 
   // 7. 納品ごとに投入
   for (const a of assignments) {
@@ -167,13 +195,15 @@ export async function runTrackingJob(opts = {}) {
     else summary.failed.push({ shipmentConfirmationId: a.shipmentConfirmationId, error: res.error, retryable: res.retryable });
   }
 
+  if (summary.failed.length) summary.severity = 'warn';
   return summary;
 }
 
 /** GChat 用の本文。読み手が「何をすればいいか」だけ分かるように書く。 */
 export function formatSummary(s) {
   const L = [];
-  const head = s.blocked.length ? '🚨' : s.failed.length ? '⚠️' : s.registered.length ? '✅' : 'ℹ️';
+  const sev = s.severity ?? (s.blocked.length ? 'blocked' : s.failed.length ? 'warn' : 'ok');
+  const head = { blocked: '🚨', warn: '⚠️', info: 'ℹ️', ok: s.registered.length ? '✅' : 'ℹ️' }[sev] ?? 'ℹ️';
   L.push(`${head} *FBA納品 追跡番号${s.commit ? '' : '(プレビュー)'}*  ${s.expectYmd}`);
 
   if (s.blocked.length) {
