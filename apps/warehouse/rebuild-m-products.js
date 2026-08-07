@@ -66,10 +66,21 @@ export function resolveSetTaxRate(components) {
 
 // 売上分類の値域 (1=自社商品 / 2=取引先限定 / 3=仕入れ商品 / 4=輸出)
 export const SALES_CLASSES = [1, 2, 3, 4];
+// 4=輸出 は「仕入区分」ではなく販売チャネル属性で、1〜3 と直交する。
+// amazon-accounting でも 4 は集計対象外 (excluded segment) として別扱いされている。
+export const EXPORT_SALES_CLASS = 4;
 
-// セット売上分類解決: 構成品の MIN を採用する。
-//   MIN の根拠 = amazon-accounting のセット按分と同じ業務ルール (階層論理 1 > 2 > 3)。
-//   「自社商品(1)を含むセットは自社商品セットと見なす」という運用に合わせる。
+// セット売上分類解決の決定表:
+//   構成品がすべて 1〜3      → MIN を採用 (階層論理 1 > 2 > 3)
+//   構成品がすべて 4         → 4
+//   4 と 1〜3 が混在         → null (導出しない)
+//   1つでも未登録 / NE に無い → null (導出しない)
+//
+// MIN の根拠 = amazon-accounting のセット按分と同じ業務ルール。
+// 「自社商品(1)を含むセットは自社商品セットと見なす」という運用に合わせる。
+// 4 混在を MIN で潰すと輸出セットが国内分類に落ちて会計処理を誤るため、
+// ここだけは MIN を適用せず人の判断に回す (= 未登録一覧に出る)。
+//   ※2026-08-07 時点の本番データに 売上分類=4 の商品は 0 件。将来の事故防止の予防線。
 //
 // 原価・税率はセットを構成品から導出しているのに、売上分類だけ手動登録のみだったため、
 // セットの登録漏れが m_products に NULL のまま残り、amazon-accounting 側で
@@ -80,6 +91,11 @@ export const SALES_CLASSES = [1, 2, 3, 4];
 //   欠けた構成品が実は 1(自社) だった場合に MIN が誤って 3 等に確定するのを防ぐため、
 //   「一部だけ分かる」状態では導出しない。componentExists=false (NE 商品マスタに無い)
 //   も上流異常なので、product_sales_class に値が残っていても null に倒す。
+//
+// ネストセット (構成品がそれ自体セット) について:
+//   呼び出し側は構成品の「手動登録値」(product_sales_class) だけを渡す。構成セットの
+//   導出値は伝播しないので、親セットは null = 未登録一覧に出る (誤った値が静かに入らない)。
+//   2026-08-07 時点の本番データにネストセットは 0 件。発生時は rebuild の品質チェックが警告する。
 export function resolveSetSalesClass(components) {
   if (!Array.isArray(components) || components.length === 0) return null;
   const classes = [];
@@ -89,6 +105,8 @@ export function resolveSetSalesClass(components) {
     if (!SALES_CLASSES.includes(sc)) return null;
     classes.push(sc);
   }
+  const uniq = new Set(classes);
+  if (uniq.has(EXPORT_SALES_CLASS) && uniq.size > 1) return null; // 輸出と国内分類の混在
   return Math.min(...classes);
 }
 
@@ -518,6 +536,21 @@ export async function rebuildMProducts() {
   if (setNoComp > 0) { checks.push(`⚠️ セットなのに構成品数0/NULL: ${setNoComp}件`); warn.push('セット構成品数不整合'); }
   const nonSetWithComp = db.prepare("SELECT COUNT(*) as cnt FROM m_products_staging WHERE 商品区分 != 'セット' AND セット構成品数 IS NOT NULL").get().cnt;
   if (nonSetWithComp > 0) { checks.push(`⚠️ セット以外なのに構成品数あり: ${nonSetWithComp}件`); warn.push('非セットに構成品数'); }
+
+  // B7b: ネストセット (構成品がそれ自体セット) の検知
+  //   売上分類の導出は構成品の手動登録値しか見ないので、ネストが発生すると
+  //   親セットは導出できず NULL (= 未登録一覧行き) になる。誤った値は入らないが、
+  //   件数が増え続けたら再帰導出を実装する判断材料になるので可視化しておく。
+  const nestedSets = db.prepare(`
+    SELECT COUNT(DISTINCT c.セット商品コード) as cnt
+    FROM m_set_components_staging c
+    JOIN m_products_staging p ON p.商品コード = c.構成商品コード COLLATE NOCASE
+    WHERE p.商品区分 = 'セット'
+  `).get().cnt;
+  if (nestedSets > 0) {
+    checks.push(`⚠️ ネストセット（構成品がセット）: ${nestedSets}件 → 売上分類は導出されず未登録一覧に出ます`);
+    warn.push('ネストセットあり（売上分類の導出対象外）');
+  }
 
   // B8: m_set_components_staging の孤児チェック
   const orphanParent = db.prepare(`

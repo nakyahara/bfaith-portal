@@ -44,7 +44,11 @@ console.log('\n── resolveSetSalesClass ──');
   eq(resolveSetSalesClass([C(3), C(1)]), 1, '1を含む → 1 (自社優先)');
   eq(resolveSetSalesClass([C(3), C(2)]), 2, '2と3 → 2');
   eq(resolveSetSalesClass([C(3), C(3)]), 3, '3のみ → 3');
-  eq(resolveSetSalesClass([C(4), C(2)]), 2, '4(輸出)混在でも MIN');
+
+  // 4=輸出 は 1〜3 (仕入区分) と直交するので MIN を適用しない (Codexレビュー High #2)
+  eq(resolveSetSalesClass([C(4), C(4)]), 4, '全部4(輸出) → 4');
+  eq(resolveSetSalesClass([C(4), C(2)]), null, '4(輸出)と国内分類の混在 → null (MINで潰さない)');
+  eq(resolveSetSalesClass([C(4), C(1)]), null, '4と1の混在も null');
 
   eq(resolveSetSalesClass([C(1), C(null)]), null, '一部NULL → null (誤確定させない)');
   eq(resolveSetSalesClass([C(1), C(undefined)]), null, '一部undefined → null');
@@ -102,6 +106,18 @@ insClass.run('set-manual', 2, NOW);
 insNe.run('set-orphan', '孤児構成セット', 0, 900, NOW);
 insSet.run('set-orphan', '孤児構成セット', 900, 'comp-nai', 1, NOW);
 
+// set-export-mix: 輸出(4) と国内分類(3) の混在 → 導出しない
+insNe.run('comp-yushutsu', '輸出商品', 100, 300, NOW);
+insClass.run('comp-yushutsu', 4, NOW);
+insNe.run('set-export-mix', '輸出混在セット', 0, 900, NOW);
+insSet.run('set-export-mix', '輸出混在セット', 900, 'comp-yushutsu', 1, NOW);
+insSet.run('set-export-mix', '輸出混在セット', 900, 'comp-shiire', 1, NOW);
+
+// set-nested: 構成品がそれ自体セット (ネストセット)
+//   構成セットに手動登録が無ければ導出できず NULL = 未登録一覧に出る
+insNe.run('set-nested', 'ネスト親セット', 0, 1800, NOW);
+insSet.run('set-nested', 'ネスト親セット', 1800, 'set-derive', 1, NOW);
+
 const result = await rebuildMProducts();
 ok(result.ok, `rebuild が成功する (${result.total}件)`);
 
@@ -112,7 +128,10 @@ eq(getMp.get('set-manual')?.売上分類, 2, 'set-manual: 手動登録が導出�
 eq(getMp.get('set-orphan')?.売上分類, null, 'set-orphan: 構成品がNEに無い → NULL');
 eq(getMp.get('comp-mitouroku')?.売上分類, null, '単品の未登録はそのまま NULL');
 eq(getMp.get('set-derive')?.商品区分, 'セット', 'セットとして投入されている');
+eq(getMp.get('set-export-mix')?.売上分類, null, 'set-export-mix: 輸出と国内分類の混在 → NULL');
+eq(getMp.get('set-nested')?.売上分類, null, 'set-nested: 構成セットに手動登録が無い → NULL (誤値を入れない)');
 ok(result.log.some(l => /売上分類を構成品から導出: \d+件/.test(l)), 'ログに導出件数が出る');
+ok(result.checks.some(c => /ネストセット（構成品がセット）: 1件/.test(c)), '品質チェックがネストセットを警告する');
 
 // ───────────────────────── 3. 未登録一覧がセットを含む ─────────────────────────
 console.log('\n── /api/missing/* のセット包含 ──');
@@ -126,6 +145,8 @@ console.log('\n── /api/missing/* のセット包含 ──');
 
   ok(missing.includes('set-partial'), '一部未登録セットが未登録一覧に出る');
   ok(missing.includes('set-orphan'), '孤児構成セットが未登録一覧に出る');
+  ok(missing.includes('set-export-mix'), '輸出混在セットが未登録一覧に出る');
+  ok(missing.includes('set-nested'), 'ネストセットが未登録一覧に出る');
   ok(missing.includes('comp-mitouroku'), '未登録の単品も従来どおり出る');
   ok(!missing.includes('set-derive'), '導出できたセットは一覧に出ない');
   ok(!missing.includes('set-manual'), '手動登録済みセットは一覧に出ない');
@@ -145,9 +166,13 @@ console.log('\n── refreshSetSalesClasses (rebuild を待たない即時反�
   insClass.run('comp-mitouroku', 2, NOW);
   db.prepare('UPDATE m_products SET 売上分類 = 2 WHERE 商品コード = ?').run('comp-mitouroku');
   const updated = refreshSetSalesClasses(db, ['comp-mitouroku'], NOW);
-  ok(updated >= 1, `親セットが更新される (${updated}件)`);
+  eq(updated, 1, '値が変わった親セットの件数だけを返す');
   eq(getMp.get('set-partial')?.売上分類, 1, 'set-partial が MIN(1,2)=1 に埋まる');
   eq(getMp.get('set-manual')?.売上分類, 2, '無関係なセットは変わらない');
+
+  // 同じ内容で再実行しても「変わった件数」は 0 (updated_at だけ動かさない)
+  eq(refreshSetSalesClasses(db, ['comp-mitouroku'], NOW), 0, '再実行しても変化なしなら 0 件');
+  eq(refreshSetSalesClasses(db, ['comp-jisha'], NOW), 0, '既に導出済みの親セットは 0 件');
 
   // 構成品の登録を外すと親セットも NULL に戻る (未登録一覧へ再出現)
   db.prepare('DELETE FROM product_sales_class WHERE sku = ?').run('comp-mitouroku');

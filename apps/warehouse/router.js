@@ -903,6 +903,9 @@ export function refreshSetTaxRates(db, componentSkus, now) {
 // 翌朝まで残り、amazon-accounting の「その他/未分類」に落ちる。
 //
 // 呼び出し側の責務: 構成品側の更新と同一トランザクションで呼ぶこと (refreshSetTaxRates と同じ)。
+// 戻り値は「売上分類の値が実際に変わったか」(0 or 1)。
+//   UPDATE の changes は同値でも 1 を返すため、UI が「解決したセットがあるか」の
+//   判断に使えるよう旧値と比較する。
 export function recalcSetSalesClass(db, setCode, now) {
   // 手動登録が最優先。セット自身に登録があればそれを使う
   const manual = db.prepare(
@@ -918,12 +921,20 @@ export function recalcSetSalesClass(db, setCode, now) {
     WHERE c.セット商品コード = ?
   `).all(setCode).map(r => ({ salesClass: r.sales_class, componentExists: !!r.ne_exists }));
 
-  const value = manual ?? resolveSetSalesClass(comps);
-  return db.prepare(
+  const value = manual ?? resolveSetSalesClass(comps) ?? null;
+  const before = db.prepare(
+    'SELECT 売上分類 FROM m_products WHERE 商品コード = ? COLLATE NOCASE'
+  ).get(setCode);
+  if (!before) return 0; // m_products にまだ無いセット (次の rebuild で入る)
+  if ((before.売上分類 ?? null) === value) return 0;
+
+  db.prepare(
     'UPDATE m_products SET 売上分類 = ?, updated_at = ? WHERE 商品コード = ? COLLATE NOCASE'
-  ).run(value ?? null, now, setCode).changes;
+  ).run(value, now, setCode);
+  return 1;
 }
 
+// 戻り値は「売上分類が実際に変わった親セットの件数」
 export function refreshSetSalesClasses(db, componentSkus, now) {
   const parents = collectParentSets(db, componentSkus);
   if (parents.size === 0) return 0;
@@ -1053,7 +1064,9 @@ router.get('/api/missing/prioritized', (req, res) => {
         -- 構成品も未登録なら NULL のまま残り、amazon-accounting で「その他/未分類」に落ちる。
         -- 以前は 単品/例外 のみを見ていたため、その漏れが画面から永久に不可視だった。
         WHERE m.商品区分 IN ('単品', '例外', 'セット') AND m.売上分類 IS NULL
-        ORDER BY priority, sales_7d DESC, sales_30d DESC
+        -- 商品コードを tie-break に入れる: セットが増えても LIMIT 200 の打ち切り位置が
+        -- 実行ごとにブレず、「登録したのに次に開くと別の行が消えている」を防ぐ
+        ORDER BY priority, sales_7d DESC, sales_30d DESC, m.商品コード
         LIMIT 200
       `).all(cutoff7Str, cutoff30Str));
     }
@@ -1213,7 +1226,10 @@ router.post('/api/csv/sales_class', upload.single('file'), (req, res) => {
       const sc = parseInt(row[colClass]);
       if (![1, 2, 3, 4].includes(sc)) { invalid++; skipped++; continue; }
       const name = db.prepare('SELECT 商品名 FROM m_products WHERE 商品コード = ? COLLATE NOCASE').get(sku)?.商品名 || '';
+      // 一括変更ほど追跡が要るので、単票 POST と同じく監査ログを残す
+      const old = db.prepare('SELECT * FROM product_sales_class WHERE sku = ?').get(sku);
       stmt.run(sku, sc, name, now);
+      auditLog(db, 'product_sales_class', sku, old ? 'UPDATE' : 'INSERT', old || null, { sku, sales_class: sc });
       updateMp.run(sc, now, sku);
       touched.push(sku);
       count++;
@@ -1931,11 +1947,15 @@ function renderRegisterPage(shippingRates, session = {}) {
         } else if (act === 'reg-class') {
           const sel = tr.querySelector('select');
           if (!sel?.value) { btn.disabled=false; return; }
-          await api('/api/sales_class', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,sales_class:sel.value,product_name:name})});
-          toast(sku+' の売上分類を登録');
+          const r = await api('/api/sales_class', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sku,sales_class:sel.value,product_name:name})});
+          const sets = r?.sets_updated || 0;
+          toast(sku+' の売上分類を登録' + (sets > 0 ? '（親セット'+sets+'件も自動解決）' : ''));
           tr.classList.add('done-row');
           setTimeout(() => tr.remove(), 600);
           updateCount('sales_class', -1);
+          // 構成品を登録すると親セットが自動解決されるが、その行は画面に残ったままになる。
+          // 件数バッジも実態とズレるので、解決があったときだけ一覧と件数を取り直す
+          if (sets > 0) setTimeout(() => { refreshCounts(); loadMissing(); }, 700);
         } else if (act === 'reg-tax') {
           const sel = tr.querySelector('select');
           if (!sel?.value) { btn.disabled=false; return; }
@@ -2104,6 +2124,19 @@ function renderRegisterPage(shippingRates, session = {}) {
       const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku',sales_class:'c-class',tax_rate:'c-tax',reorder:'c-reorder'};
       const el = document.getElementById(map[type]);
       if (el) el.textContent = Math.max(0, parseInt(el.textContent||'0') + delta);
+    }
+
+    // 1操作で複数行が解決したとき（構成品を登録して親セットが自動解決した等）は
+    // delta の加減算では追えないので、サーバから件数を取り直す
+    async function refreshCounts() {
+      try {
+        const c = await api('/api/missing/counts');
+        const map = {shipping:'c-ship',genka:'c-genka',sku_map:'c-sku',sales_class:'c-class',tax_rate:'c-tax',reorder:'c-reorder'};
+        for (const k of Object.keys(map)) {
+          const el = document.getElementById(map[k]);
+          if (el) el.textContent = c[k] || 0;
+        }
+      } catch(e) { console.error(e); }
     }
 
     // ── NE商品コードサジェスト ──
