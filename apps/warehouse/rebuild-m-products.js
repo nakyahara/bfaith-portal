@@ -64,6 +64,34 @@ export function resolveSetTaxRate(components) {
   return { taxRate: Math.min(...decimals), taxCategory: 'MIXED' };
 }
 
+// 売上分類の値域 (1=自社商品 / 2=取引先限定 / 3=仕入れ商品 / 4=輸出)
+export const SALES_CLASSES = [1, 2, 3, 4];
+
+// セット売上分類解決: 構成品の MIN を採用する。
+//   MIN の根拠 = amazon-accounting のセット按分と同じ業務ルール (階層論理 1 > 2 > 3)。
+//   「自社商品(1)を含むセットは自社商品セットと見なす」という運用に合わせる。
+//
+// 原価・税率はセットを構成品から導出しているのに、売上分類だけ手動登録のみだったため、
+// セットの登録漏れが m_products に NULL のまま残り、amazon-accounting 側で
+// 「その他/未分類」に落ちていた (2026-08-07 調査)。ここで同じ導出を入れて揃える。
+//
+// components: [{ salesClass, componentExists }]
+//   1つでも解決できない構成品があれば null を返す (= 未登録一覧に出して人に登録させる)。
+//   欠けた構成品が実は 1(自社) だった場合に MIN が誤って 3 等に確定するのを防ぐため、
+//   「一部だけ分かる」状態では導出しない。componentExists=false (NE 商品マスタに無い)
+//   も上流異常なので、product_sales_class に値が残っていても null に倒す。
+export function resolveSetSalesClass(components) {
+  if (!Array.isArray(components) || components.length === 0) return null;
+  const classes = [];
+  for (const c of components) {
+    if (c.componentExists === false) return null;
+    const sc = Number(c.salesClass);
+    if (!SALES_CLASSES.includes(sc)) return null;
+    classes.push(sc);
+  }
+  return Math.min(...classes);
+}
+
 // ─── 本番反映時の列リスト（Codex PR1 Round 3 High 反映: 明示列INSERT） ───
 // 物理的な列順が異なるDBでも値が正しくマップされるよう、
 // DELETE + INSERT INTO target (...) SELECT ... FROM staging で列名を明示する。
@@ -322,6 +350,7 @@ export async function rebuildMProducts() {
   `);
 
   let countSet = 0;
+  let countSetSalesDerived = 0; // 売上分類を構成品から導出したセット件数
   for (const sh of setHeaders) {
     const setCode = sh.セット商品コード?.toLowerCase();
     if (!setCode) continue;
@@ -338,6 +367,8 @@ export async function rebuildMProducts() {
     // 税率は単品と同じ解決順 (NE値優先 → NE未登録(null/0)時のみ product_tax_rate) を
     // 構成品ごとに適用してから集約する
     const componentTaxInputs = [];
+    // 売上分類は構成品の登録値 (product_sales_class) を集約する
+    const componentSalesInputs = [];
 
     for (const comp of components) {
       const compCode = comp.商品コード?.toLowerCase() || '';
@@ -350,6 +381,10 @@ export async function rebuildMProducts() {
       componentTaxInputs.push({
         neTaxRate: comp.消費税率,
         manualTaxRate: taxRateMap.get(compCode),
+        componentExists: !!comp.ne_exists,
+      });
+      componentSalesInputs.push({
+        salesClass: salesClassMap.get(compCode),
         componentExists: !!comp.ne_exists,
       });
 
@@ -377,6 +412,12 @@ export async function rebuildMProducts() {
     // 構成品が1つでも解決できなければ UNKNOWN に倒し、上流異常を握り潰さない
     const { taxRate, taxCategory } = resolveSetTaxRate(componentTaxInputs);
 
+    // 売上分類 (手動登録が最優先。無ければ構成品の MIN から導出)
+    //   導出も効かない (構成品が未登録 / NE に無い) セットだけが NULL で残り、
+    //   register の「分類未登録」に出る。
+    const setSalesClass = salesClassMap.get(setCode) ?? resolveSetSalesClass(componentSalesInputs);
+    if (salesClassMap.get(setCode) == null && setSalesClass != null) countSetSalesDerived++;
+
     // 取扱区分: NEに存在すればそこから、なければ取扱中
     const status = neInfo?.取扱区分 || '取扱中';
 
@@ -389,13 +430,13 @@ export async function rebuildMProducts() {
       ps?.ship_cost ?? null, ps?.shipping_code ?? null, ps?.ship_method ?? null,
       taxRate, taxCategory,
       neInfo?.在庫数 ?? null, neInfo?.引当数 ?? null, neInfo?.仕入先コード ?? null,
-      components.length, salesClassMap.get(setCode) ?? null,
+      components.length, setSalesClass,
       coSet.seasonality_flag, coSet.season_months, coSet.new_product_flag, setLaunchDate,
       ts
     );
     countSet++;
   }
-  log.push(`セット: ${countSet}件`);
+  log.push(`セット: ${countSet}件（売上分類を構成品から導出: ${countSetSalesDerived}件）`);
 
   // A3: 例外商品（NE・セットに無いもののみ）
   let countException = 0;
