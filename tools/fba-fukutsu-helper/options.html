@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>FBA納品 福通伝票CSV — 設定</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", "Meiryo", sans-serif; padding: 20px; max-width: 640px; font-size: 14px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.lead { color: #555; margin: 0 0 20px; }
+  label { display: block; margin: 14px 0 4px; font-weight: 600; }
+  input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; box-sizing: border-box; }
+  .hint { color: #666; font-size: 12px; margin-top: 4px; }
+  .btns { margin-top: 20px; display: flex; gap: 8px; }
+  button { padding: 8px 18px; border-radius: 4px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 14px; }
+  #save { background: #232f3e; color: #fff; border-color: #232f3e; font-weight: 700; }
+  #result { display: none; margin-top: 16px; padding: 10px; border-radius: 4px; white-space: pre-wrap; }
+  #result.ok { background: #e8f5e9; border-left: 4px solid #4caf50; }
+  #result.ng { background: #fdecea; border-left: 4px solid #d33; }
+</style>
+</head>
+<body>
+  <h1>FBA納品 福通伝票CSV</h1>
+  <p class="lead">Seller Central の納品プラン画面に「📦 福通伝票CSV」ボタンを出します。</p>
+
+  <label for="baseUrl">ポータルのURL</label>
+  <input id="baseUrl" type="text" placeholder="https://wh.bfaith-wh.uk">
+  <div class="hint">通常は変更不要です。</div>
+
+  <label for="token">APIトークン</label>
+  <input id="token" type="password" placeholder="FBA_TRACKING_EXT_TOKEN の値">
+  <div class="hint">ポータルの .env に設定した <code>FBA_TRACKING_EXT_TOKEN</code> と同じ値を入れてください。</div>
+
+  <div class="btns">
+    <button id="save">保存</button>
+    <button id="test">接続テスト</button>
+  </div>
+  <div id="result"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>
