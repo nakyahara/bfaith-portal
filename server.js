@@ -72,6 +72,7 @@ import easyShipRouter from './apps/easy-ship/router.js';
 import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import selectSetRouter from './apps/select-set/router.js';
 import selectSetExtRouter from './apps/select-set/ext-router.js';
+import fbaTrackingExtRouter from './apps/fba-replenishment/tracking-ext-router.js';
 import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
@@ -314,6 +315,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/aba-ext-api')) return next();
     // /apps/easy-ship/ext-api も同様に router 内で「x-api-key 認証 → 64KB parser」の順に処理
     if (normalizedPath.startsWith('/apps/easy-ship/ext-api')) return next();
+    // /apps/fba-replenishment/ext-api も同様 (x-api-key 認証 → 64KB parser の順に router 内で処理)
+    if (normalizedPath.startsWith('/apps/fba-replenishment/ext-api')) return next();
     // /apps/select-set/ext-api も同様 (NE伝票画面のChrome拡張向け)
     if (normalizedPath.startsWith('/apps/select-set/ext-api')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
@@ -1034,6 +1037,9 @@ app.use('/apps/rakuten-yahoo-sync', requireAppAccess('rakuten-yahoo-sync'), raku
 app.use('/apps/aes-pdf-sorter', requireAppAccess('aes-pdf-sorter'), aesRouter);
 app.use('/apps/ranking-checker', requireAppAccess('ranking-checker'), rankingRouter);
 app.use('/apps/profit-calculator', requireAppAccess('profit-calculator'), profitRouter);
+// FBA納品 → 福山通運の伝票CSV: Chrome拡張向けAPI (x-api-key 認証・fail-closed) は
+// セッション認証付き本体より先に mount する
+app.use('/apps/fba-replenishment/ext-api', fbaTrackingExtRouter);
 app.use('/apps/fba-replenishment', requireAppAccess('fba-replenishment'), fbaRouter);
 // 子会社向け公開印刷 (ログイン不要・トークン認可)。requireAppAccess の外側に置く。
 app.use('/print', fbaPublicPrintRouter);

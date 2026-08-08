@@ -30,6 +30,16 @@ export const COL = {
 
 const SENDER_CODE = '0648607868'; // 荷送人コード (ご依頼主) — 現行GASと同じ固定値
 
+/**
+ * マスタ未登録のFCへ伝票を出すときに使う電話番号。
+ * マニュアル付録1は「[荷受人コード] **または** [電話番号・住所・名前・郵便番号]」が必須としており、
+ * コードがマスタに無い場合は住所側を揃える必要がある。
+ * ⭐ iS-2 のお届け先マスタでは Amazon宛 74件のうち **70件がこの番号**で登録されている
+ *   (2026-08-07 実測)。実質の共通番号なので、新しいFCにも同じものを使う。
+ *   別の番号にしたくなったら env で差し替えられるようにしておく。
+ */
+const FALLBACK_TEL = () => process.env.FUKUTSU_FALLBACK_TEL || '(06)6333-4858';
+
 export function cErr(message) {
   const e = new Error(message);
   e.code = 'FUKUTSU_CSV';
@@ -79,6 +89,7 @@ export function buildRowsForShipment(shipment, ymd) {
       c[COL.住所1] = a1; c[COL.住所2] = a2; c[COL.住所3] = a3;
       c[COL.名前1] = `Amazon.co.jp ${fc}`.slice(0, 20);
       c[COL.郵便番号] = normPostal(a.postalCode);
+      c[COL.電話番号] = FALLBACK_TEL();
     }
     rows.push(c);
   }

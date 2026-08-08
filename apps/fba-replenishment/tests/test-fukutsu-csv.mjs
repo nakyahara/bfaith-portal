@@ -77,6 +77,12 @@ t('🚨マスタ未登録のFCは住所を書いて伝票を出せるように�
   assert.equal(rows[0][COL.名前1], 'Amazon.co.jp ZZZ9');
   assert.equal(rows[0][COL.郵便番号], '350-1301');
   assert.equal(rows[0][COL.荷受人コード], 'ZZZ9');
+  assert.equal(rows[0][COL.電話番号], '(06)6333-4858', 'マニュアルの「電話番号・住所・名前・郵便番号」を揃える');
+});
+
+t('登録済みFCには電話番号を入れない (マスタが正)', () => {
+  const { rows } = buildRowsForShipment(HND2, '20260807');
+  assert.equal(rows[0][COL.電話番号], '');
 });
 
 t('🚨TPFB は「無いもの」として扱う (マスタの登録内容がXHD1と食い違うため)', () => {

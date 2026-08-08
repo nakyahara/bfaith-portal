@@ -1,0 +1,37 @@
+#bf-fukutsu-btn {
+  position: fixed; right: 16px; bottom: 16px; z-index: 2147483646;
+  padding: 10px 16px; border: none; border-radius: 999px;
+  background: #232f3e; color: #fff; font-size: 14px; font-weight: 700;
+  cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  font-family: system-ui, "Segoe UI", "Meiryo", sans-serif;
+}
+#bf-fukutsu-btn:hover { background: #37475a; }
+
+#bf-fukutsu-panel {
+  position: fixed; right: 16px; bottom: 68px; z-index: 2147483647;
+  width: 560px; max-width: calc(100vw - 32px); max-height: 70vh; overflow: auto;
+  background: #fff; color: #111; border: 1px solid #ccc; border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.3);
+  font-family: system-ui, "Segoe UI", "Meiryo", sans-serif; font-size: 13px;
+}
+#bf-fukutsu-panel .bf-head {
+  padding: 10px 14px; background: #232f3e; color: #fff; font-weight: 700;
+  border-radius: 8px 8px 0 0; display: flex; justify-content: space-between; gap: 8px;
+}
+#bf-fukutsu-panel .bf-plan { font-weight: 400; opacity: .85; font-size: 12px; }
+#bf-fukutsu-panel .bf-body { padding: 12px 14px; }
+#bf-fukutsu-panel .bf-sum { margin-bottom: 8px; }
+#bf-fukutsu-panel .bf-warn { margin: 8px 0; padding: 8px; background: #fff4e5; border-left: 4px solid #e88; }
+#bf-fukutsu-panel .bf-ng { margin-top: 8px; padding: 8px; background: #fdecea; border-left: 4px solid #d33; }
+#bf-fukutsu-panel table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+#bf-fukutsu-panel th, #bf-fukutsu-panel td { border-bottom: 1px solid #eee; padding: 5px 6px; text-align: left; }
+#bf-fukutsu-panel th { background: #f6f6f6; font-weight: 600; }
+#bf-fukutsu-panel .bf-num { text-align: right; }
+#bf-fukutsu-panel .bf-foot {
+  padding: 10px 14px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 8px;
+}
+#bf-fukutsu-panel button {
+  padding: 7px 14px; border-radius: 4px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 13px;
+}
+#bf-fukutsu-panel .bf-go { background: #232f3e; color: #fff; border-color: #232f3e; font-weight: 700; }
+#bf-fukutsu-panel .bf-go:disabled { opacity: .6; cursor: default; }
