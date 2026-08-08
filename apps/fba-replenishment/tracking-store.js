@@ -80,6 +80,47 @@ export function append(entry) {
 }
 
 /**
+ * 納品ごとの**最後の**記録を返す (成否を問わない)。
+ * ⭐`pending` が最後に残っている = 「PUTは送ったが結果を書けずに落ちた」状態。
+ *   APIの trackingDetails は数時間反映されないので、自動で送り直すと二重投入になる。
+ *   人がSeller Central画面で確認するまで触らない。
+ */
+export function findLatest(shipmentConfirmationId) {
+  const { entries } = readAll();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i].shipmentConfirmationId === shipmentConfirmationId) return entries[i];
+  }
+  return null;
+}
+
+const LOCK_FILE = () => path.join(DATA_DIR, 'fba-tracking.lock');
+const LOCK_STALE_MS = 30 * 60 * 1000; // これを超えて残っていたら落ちた実行の置き土産とみなす
+
+/**
+ * 多重起動を止める。書き込みAPIを2本同時に走らせると、記録を確認してからPUTするまでの
+ * 隙間で同じ納品へ二重投入しうる (手動実行と定期実行が重なる等)。
+ * @returns {{ok: boolean, reason?: string}}
+ */
+export function acquireLock(runId) {
+  ensureDir();
+  const f = LOCK_FILE();
+  if (fs.existsSync(f)) {
+    let info = null;
+    try { info = JSON.parse(fs.readFileSync(f, 'utf-8')); } catch { /* 壊れていても古さで判断する */ }
+    const age = Date.now() - (Date.parse(info?.at ?? '') || fs.statSync(f).mtimeMs);
+    if (age < LOCK_STALE_MS) {
+      return { ok: false, reason: `別の実行が動いています (runId=${info?.runId ?? '不明'} / ${Math.round(age / 1000)}秒前に開始)` };
+    }
+  }
+  fs.writeFileSync(f, JSON.stringify({ runId, at: new Date().toISOString(), pid: process.pid }), 'utf-8');
+  return { ok: true };
+}
+
+export function releaseLock() {
+  try { fs.unlinkSync(LOCK_FILE()); } catch { /* 既に無ければよい */ }
+}
+
+/**
  * このCSVファイル(内容ハッシュ)を既に処理したか。
  * 固定ファイル名運用で「同じファイルが置きっぱなし」のときに二度処理しないための保険。
  * 出荷日チェックと二重の防御にする (日付が同じでも中身が増えている場合は別ハッシュになる)。

@@ -79,6 +79,15 @@
       });
     }
 
+    // 🚨同じ納品番号が2回読めた = 画面の重複表示か読み取りのズレ。
+    //   そのままCSVを作ると伝票を二重に発行してしまう (運賃が二重にかかる)
+    var seen = {};
+    for (var k = 0; k < shipments.length; k++) {
+      var id = shipments[k].shipmentConfirmationId;
+      if (seen[id]) problems.push(id + ' がこの画面に複数回出ています。伝票を二重に出さないよう確認してください');
+      seen[id] = true;
+    }
+
     if (!shipments.length && !problems.length) problems.push('納品が1件も読み取れませんでした');
     return { ok: problems.length === 0 && shipments.length > 0, ymd: ymd, shipments: shipments, problems: problems };
   }

@@ -93,11 +93,40 @@ export async function runTrackingJob(opts = {}) {
     return summary;
   }
 
+  // 🚨多重起動を止める。定期実行と手動実行が重なると、記録を確認してからPUTするまでの
+  //   隙間で同じ納品へ二重投入しうる
+  const lock = store.acquireLock(runId);
+  if (!lock.ok) {
+    summary.severity = 'blocked';
+    summary.blocked.push(lock.reason);
+    return summary;
+  }
+  try {
+    return await runInner(summary, { opts, now, commit, expectYmd, runId });
+  } finally {
+    store.releaseLock();
+  }
+}
+
+async function runInner(summary, ctx) {
+  const { opts, now, commit, expectYmd, runId } = ctx;
+
   // ── 1. まず Amazon 側を見る ────────────────────────────────
   // ここを先にやることで「納品が無い日の置きっぱなしCSV」を異常扱いしないで済む。
   let shipments;
   try {
-    shipments = await findOpenShipments();
+    const r = await findOpenShipments();
+    shipments = r.shipments;
+    // 🚨取得に失敗したプランがあると「今日は納品が無い」に化ける。書き込みジョブなので
+    //   一部でも見えていない状態では進めない (全体を止めて人に知らせる)
+    if (r.errors.length) {
+      summary.severity = 'blocked';
+      summary.blocked.push(
+        'Amazonの納品情報を一部取得できませんでした。見えていない納品がある可能性があるため中断します',
+        ...r.errors,
+      );
+      return summary;
+    }
   } catch (e) {
     summary.severity = 'blocked';
     summary.blocked.push(`納品の取得に失敗: ${e.message}`);
@@ -160,7 +189,9 @@ export async function runTrackingJob(opts = {}) {
   if (summary.blocked.length) { summary.severity = 'blocked'; return summary; }
 
   // ── 4. 割り当て ────────────────────────────────────────
-  const { assignments, excluded, problems, skipped } = buildAssignments(rows, shipments);
+  const { assignments, excluded, problems, skipped } = buildAssignments(rows, shipments, {
+    allowFcFallback: opts.allowFcFallback === true, // 既定OFF。移行期に手動実行するときだけ明示的に許す
+  });
   summary.excluded = excluded;
   summary.skipped = skipped;
   if (problems.length) { // 1つでも怪しければ全部止める
@@ -184,6 +215,20 @@ export async function runTrackingJob(opts = {}) {
       summary.failed.push({
         shipmentConfirmationId: a.shipmentConfirmationId,
         error: `過去に別の内容で投入済みです (${already.at})。取り違えの恐れがあるため自動では上書きしません`,
+        needsManual: true,
+      });
+      continue;
+    }
+
+    // 🚨前回「送ったが結果を書けずに落ちた」記録が残っている。APIの反映は数時間遅れるので
+    //   自動で送り直すと二重投入になる。人が画面で確認するまで触らない
+    const latest = store.findLatest(a.shipmentConfirmationId);
+    if (latest && (latest.result === 'pending' || latest.indeterminate)) {
+      summary.failed.push({
+        shipmentConfirmationId: a.shipmentConfirmationId,
+        error: `前回の投入が結果不明のまま残っています (${latest.at})。Seller Central画面で反映を確認し、` +
+          '未登録なら画面から入力してください。自動では送り直しません',
+        needsManual: true,
       });
       continue;
     }
@@ -199,16 +244,28 @@ export async function runTrackingJob(opts = {}) {
       continue;
     }
 
+    // ⭐**送る前に** pending を残す。ここを書いた直後に落ちても、次回は自動で送り直さない
+    const base = {
+      runId, shipmentConfirmationId: a.shipmentConfirmationId, shipmentId: ship.shipmentId,
+      inboundPlanId: ship.inboundPlanId, fcCode: a.fcCode, matchedBy: a.matchedBy,
+      items: a.items, sourceFile: summary.source, sourceHash: summary.sourceHash,
+    };
+    store.append({ ...base, result: 'pending' });
+
     const res = await putTrackingDetails({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId }, items);
     const rec = {
       runId, shipmentConfirmationId: a.shipmentConfirmationId, shipmentId: ship.shipmentId,
       inboundPlanId: ship.inboundPlanId, fcCode: a.fcCode, matchedBy: a.matchedBy,
       items: a.items, sourceFile: summary.source, sourceHash: summary.sourceHash,
       result: res.ok ? 'success' : 'failed', operationId: res.operationId ?? null, error: res.error ?? null,
+      indeterminate: res.indeterminate === true,
     };
     store.append(rec);
     if (res.ok) summary.registered.push(a);
-    else summary.failed.push({ shipmentConfirmationId: a.shipmentConfirmationId, error: res.error, retryable: res.retryable });
+    else summary.failed.push({
+      shipmentConfirmationId: a.shipmentConfirmationId, error: res.error,
+      retryable: res.retryable, needsManual: res.indeterminate === true,
+    });
   }
 
   if (summary.failed.length) summary.severity = 'warn';

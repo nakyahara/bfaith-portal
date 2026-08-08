@@ -176,7 +176,10 @@ export function checkShipDate(rows, expectedYmd) {
  * @returns {{assignments: Array, excluded: Array, problems: string[], skipped: Array}}
  */
 export function buildAssignments(rows, shipments, opts = {}) {
-  const allowFcFallback = opts.allowFcFallback !== false;
+  // ⭐既定OFF。拡張が お客様管理番号 に納品番号を入れるようになったので、
+  //   FCコードでの推測は「拡張導入前の移行期に手動実行するとき」だけに限る。
+  //   一意に見えても『その送り状がその納品のもの』である保証はない (Codex指摘)。
+  const allowFcFallback = opts.allowFcFallback === true;
   const problems = [];
   const excluded = [];
   const skipped = [];
@@ -250,11 +253,29 @@ export function buildAssignments(rows, shipments, opts = {}) {
   }
 
   // どの納品にも割り当てられなかった行 (納品番号が入っているのに該当shipmentが無い等)
+  // 🚨お客様管理番号に値があるのに該当する納品が無い = 転記違い・プラン取得漏れ・古い行の混入。
+  //   「FBA以外の便」と同じ扱い (黙って除外) にすると、取り違えたまま他の納品だけ登録してしまう。
+  const orphans = new Map();
   units.forEach((u, i) => {
-    if (usedUnits.has(i)) return;
-    if (!u.納品番号) return; // ②で excluded 済み
-    excluded.push({ 納品番号: u.納品番号, 送り状番号: u.送り状番号, reason: '該当する納品が見つからない' });
+    if (usedUnits.has(i) || !u.納品番号) return; // 管理番号が空の行は ② で excluded 済み
+    orphans.set(u.納品番号, (orphans.get(u.納品番号) ?? 0) + 1);
   });
+  for (const [no, n] of orphans) {
+    problems.push(
+      `CSVの「お客様管理番号」${no} (${n}件) に対応する納品が見つかりません。` +
+        '納品番号の打ち間違い、別のプランの伝票が混ざっている、などが考えられます',
+    );
+  }
+
+  // 🚨投入待ちの納品なのにCSVに1行も無い = 納品ごと数え漏らした可能性。
+  //   箱数の照合は「行があった納品」しか通らないので、ここで拾わないと素通りする。
+  for (const s of targets) {
+    if (assignments.some((a) => a.shipmentConfirmationId === s.shipmentConfirmationId)) continue;
+    problems.push(
+      `${s.shipmentConfirmationId} (${s.fcCode}, ${(s.boxIds ?? []).length}箱) の送り状がCSVにありません。` +
+        'この納品ぶんの伝票を出し忘れていないか確認してください',
+    );
+  }
 
   return { assignments, excluded, problems, skipped };
 }

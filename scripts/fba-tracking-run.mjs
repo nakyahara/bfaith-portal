@@ -11,6 +11,11 @@
  *
  *   --date YYYYMMDD  期待する出荷日 (既定 = 実行時のJST当日)
  *   --no-notify      GChat へ通知しない
+ *   --allow-fc-fallback
+ *       お客様管理番号が空の伝票を、FCコードだけで納品に割り当てる。
+ *       ⭐既定OFF。拡張が納品番号を入れるようになった今は不要で、
+ *       「一意に見えても、その送り状がその納品のものとは限らない」ため既定では推測しない。
+ *       拡張導入前の伝票を手動で処理するときだけ付ける。
  *
  * 環境変数:
  *   SP_API_* / AWS_*                  SP-API (既存)
@@ -40,6 +45,7 @@ const summary = await runTrackingJob({
   filename: value('--filename') || process.env.FBA_TRACKING_FILENAME,
   expectYmd: value('--date'),
   commit: flag('--commit'),
+  allowFcFallback: flag('--allow-fc-fallback'),
 });
 
 console.log(formatSummary(summary));

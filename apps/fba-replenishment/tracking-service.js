@@ -50,12 +50,40 @@ async function call(api_path, method = 'GET', body) {
   return getClient().callAPI(body ? { api_path, method, body } : { api_path, method });
 }
 
+/**
+ * pageToken を最後まで辿る (#7)。
+ * 先頭ページだけ見ていると、プランが20件を超えた日や箱が100個を超えた納品を黙って取りこぼす。
+ */
+async function callAllPages(basePath, key, { pageSize = 20, max = 50 } = {}) {
+  const out = [];
+  let token = null;
+  for (let i = 0; i < max; i++) {
+    const sep = basePath.includes('?') ? '&' : '?';
+    const url = `${basePath}${sep}pageSize=${pageSize}` + (token ? `&paginationToken=${encodeURIComponent(token)}` : '');
+    const res = await call(url);
+    if (Array.isArray(res?.[key])) out.push(...res[key]);
+    token = res?.pagination?.nextToken ?? res?.pagination?.token ?? null;
+    if (!token) return { items: out, truncated: false };
+  }
+  // max ページ見ても終わらない = 想定外。黙って打ち切らずに呼び出し側へ伝える
+  return { items: out, truncated: true };
+}
+
 export function missingEnv() {
   return ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
     .filter((k) => !process.env[k]);
 }
 
-/** 期限を過ぎていないか。過ぎていたらAPIは受け付けない (画面からは入るのでリカバリは人手)。 */
+/**
+ * 期限を過ぎていないか。過ぎていたらAPIは受け付けない (画面からは入るのでリカバリは人手)。
+ *
+ * ⭐**すべての期限を過ぎたときだけ「期限切れ」**とする (#5)。
+ *   readyToShipWindow.end (当日23:59 JST) と editableUntil (翌日09:00 JST) のどちらが
+ *   効くのかは未実測。片方でも残っていれば送ってみる。
+ *   ここは無駄なPUTを減らすための事前判定にすぎず、可否の最終判断はAmazon側にある。
+ *   拒否されても BadRequest が返るだけで実害は無いので、**緩い側に倒すほうが安全**
+ *   (厳しくすると、まだ入るはずの納品を人手に回してしまう)。
+ */
 export function checkDeadline(shipment, now = new Date()) {
   const rts = shipment?.dates?.readyToShipWindow?.end;
   const edit = shipment?.selectedDeliveryWindow?.editableUntil;
@@ -63,11 +91,11 @@ export function checkDeadline(shipment, now = new Date()) {
   if (!limits.length) return { ok: true, limits: [], expired: [], note: '期限の情報が取れませんでした' };
   const expired = limits.filter((x) => x.t <= now.getTime());
   return {
-    ok: expired.length === 0,
+    ok: expired.length < limits.length,
     limits: limits.map((x) => x.raw),
     expired: expired.map((x) => x.raw),
-    note: expired.length
-      ? 'この納品は編集期限を過ぎています。APIでは登録できません (Seller Central画面からは入力できます)'
+    note: expired.length === limits.length
+      ? 'この納品は編集期限をすべて過ぎています。APIでは登録できません (Seller Central画面からは入力できます)'
       : null,
   };
 }
@@ -81,32 +109,53 @@ export function checkDeadline(shipment, now = new Date()) {
  */
 export async function findOpenShipments(opts = {}) {
   const wantStatuses = opts.statuses ?? ['READY_TO_SHIP'];
-  const maxPlans = opts.maxPlans ?? 20;
-  const plans = await call(`${V}/inboundPlans?pageSize=${Math.min(maxPlans, 20)}&status=ACTIVE`);
   const out = [];
-  for (const p of plans.inboundPlans ?? []) {
+  const errors = [];
+
+  let plans;
+  try {
+    plans = await callAllPages(`${V}/inboundPlans?status=ACTIVE`, 'inboundPlans', { pageSize: 20 });
+  } catch (e) {
+    // プラン一覧そのものが取れない = 何も判断できない。呼び出し側で中断させる
+    throw new Error(`納品プラン一覧を取得できません: ${e?.message ?? e}`);
+  }
+  if (plans.truncated) errors.push('納品プランが多すぎて全部見られませんでした (ページ上限)');
+
+  for (const p of plans.items) {
+    // 🚨ここで例外を握り潰すと「取得に失敗した」が「今日は納品が無い」に化ける (#6)。
+    //   件数を集めて呼び出し側へ返し、1件でも失敗していたら人に知らせる
     let full;
-    try { full = await call(`${V}/inboundPlans/${p.inboundPlanId}`); } catch { continue; }
+    try {
+      full = await call(`${V}/inboundPlans/${p.inboundPlanId}`);
+    } catch (e) {
+      errors.push(`プラン ${p.inboundPlanId} の取得に失敗: ${e?.message ?? e}`);
+      continue;
+    }
     for (const s of full.shipments ?? []) {
       if (!wantStatuses.includes(s.status)) continue;
       const base = `${V}/inboundPlans/${p.inboundPlanId}/shipments/${s.shipmentId}`;
-      const d = await call(base);
-      const b = await call(`${base}/boxes?pageSize=100`);
-      out.push({
-        inboundPlanId: p.inboundPlanId,
-        planName: p.name || '',
-        shipmentId: s.shipmentId,
-        shipmentConfirmationId: d.shipmentConfirmationId,
-        fcCode: d.destination?.warehouseId ?? '',
-        status: d.status,
-        // ⭐boxIdは規則から生成せずAPIの返り値を正とする
-        boxIds: (b.boxes ?? []).map((x) => x.boxId),
-        hasTracking: Boolean(d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
-        deadline: checkDeadline(d),
-      });
+      try {
+        const d = await call(base);
+        const b = await callAllPages(`${base}/boxes`, 'boxes', { pageSize: 100 });
+        if (b.truncated) errors.push(`${d.shipmentConfirmationId}: 輸送箱が多すぎて全部見られませんでした`);
+        out.push({
+          inboundPlanId: p.inboundPlanId,
+          planName: p.name || '',
+          shipmentId: s.shipmentId,
+          shipmentConfirmationId: d.shipmentConfirmationId,
+          fcCode: d.destination?.warehouseId ?? '',
+          status: d.status,
+          // ⭐boxIdは規則から生成せずAPIの返り値を正とする
+          boxIds: b.items.map((x) => x.boxId),
+          hasTracking: Boolean(d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
+          deadline: checkDeadline(d),
+        });
+      } catch (e) {
+        errors.push(`納品 ${s.shipmentId} の取得に失敗: ${e?.message ?? e}`);
+      }
     }
   }
-  return out;
+  return { shipments: out, errors };
 }
 
 /**
@@ -142,12 +191,27 @@ export async function putTrackingDetails(target, items) {
   if (operationId) {
     for (let i = 0; i < 20; i++) {
       await sleep(3000);
-      const op = await call(`${V}/operations/${operationId}`);
+      let op;
+      try {
+        op = await call(`${V}/operations/${operationId}`);
+      } catch (e) {
+        // 🚨PUTは受け付けられているので、ここで throw すると「Amazonには入ったが記録が無い」
+        //   状態を作る (#11)。結果不明として返し、呼び出し側で人に確認させる
+        return {
+          ok: false, operationId, indeterminate: true, retryable: false,
+          error: `投入は受け付けられましたが結果を確認できませんでした (${e?.message ?? e})。Seller Central画面で反映を確認してください`,
+        };
+      }
       if (op.operationStatus === 'SUCCESS') break;
       if (op.operationStatus === 'FAILED') {
         return { ok: false, operationId, error: `operation FAILED: ${JSON.stringify(op.operationProblems ?? {})}`, retryable: false };
       }
-      if (i === 19) return { ok: false, operationId, error: 'operation が時間内に完了しませんでした', retryable: true };
+      if (i === 19) {
+        return {
+          ok: false, operationId, indeterminate: true, retryable: false,
+          error: '投入は受け付けられましたが時間内に完了しませんでした。Seller Central画面で反映を確認してください',
+        };
+      }
     }
   }
   return { ok: true, operationId: operationId ?? null };
