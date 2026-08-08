@@ -44,7 +44,17 @@ Amazon Seller Central の納品プラン画面から、福山通運 iS-2 に取�
 |---|---|
 | 呼び先 | `GET /apps/fba-replenishment/ext-api/plan` (下見) / `…/plan-csv` (CSV) |
 | 認証 | `x-api-key` (env `FBA_TRACKING_EXT_TOKEN`・未設定ならポータルが503で拒否) |
+| 向き先 | **Render** (`https://bfaith-portal.onrender.com`) |
 | サーバ側 | `apps/fba-replenishment/tracking-ext-router.js` |
+
+## 🚨 なぜ miniPC ではなく Render を向いているか
+
+miniPC の `https://wh.bfaith-wh.uk` は **Cloudflare Access** の後ろにある。
+認証Cookieもサービストークンも持たない拡張からの fetch は **302 でログイン画面へ**飛ばされる
+(2026-08-08 実測。`select-set` / `easy-ship` の ext-api も同じ)。
+Render 側は Access が無いので素通りする。easy-ship 拡張が `onrender.com` を向いているのも同じ理由。
+
+→ **`FBA_TRACKING_EXT_TOKEN` は Render の Environment に設定する** (miniPCの .env ではない)。
 
 ## 関連
 

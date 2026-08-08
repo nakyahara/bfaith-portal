@@ -4,7 +4,11 @@
 // APIトークンをページ側の world に置かない、という意味でもこの経路にしている。
 // (ne-select-set-helper と同じ作り)
 
-const DEFAULTS = { baseUrl: 'https://wh.bfaith-wh.uk', token: '' };
+// 🚨向き先は **Render**。miniPC の https://wh.bfaith-wh.uk は Cloudflare Access の
+// 後ろにあり、認証Cookieを持たない拡張の fetch は 302 でログイン画面へ飛ばされる
+// (2026-08-08 実測。select-set/easy-ship の ext-api も同じ)。
+// easy-ship 拡張が onrender.com を向いているのもこの理由。
+const DEFAULTS = { baseUrl: 'https://bfaith-portal.onrender.com', token: '' };
 const BASE_PATH = '/apps/fba-replenishment/ext-api';
 
 function getConfig() {
