@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>選べるセット展開 — 設定</title>
+  <style>
+    body { font-family: "Segoe UI", Meiryo, sans-serif; margin: 24px; max-width: 620px; color: #212529; }
+    h1 { font-size: 1.2em; }
+    label { display: block; font-weight: bold; font-size: 0.9em; margin: 14px 0 4px; }
+    input[type=text], input[type=password] { width: 100%; padding: 7px 9px; box-sizing: border-box; font-size: 0.95em; }
+    .actions { margin-top: 16px; display: flex; gap: 8px; }
+    button { padding: 7px 16px; cursor: pointer; border: 1px solid #ced4da; border-radius: 5px; background: #f8f9fa; }
+    button.primary { background: #1971c2; border-color: #1971c2; color: #fff; }
+    #result { display: none; margin-top: 14px; padding: 10px; border-radius: 6px; white-space: pre-wrap; font-size: 0.9em; }
+    #result.ok { background: #ebfbee; border: 1px solid #b2f2bb; }
+    #result.ng { background: #fff5f5; border: 1px solid #ffc9c9; color: #c92a2a; }
+    .hint { color: #868e96; font-size: 0.85em; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <h1>選べるセット展開 — 設定</h1>
+  <p class="hint">ネクストエンジンの受注伝票画面で「選べる〇種セット」を実SKUの明細行に展開します。<br>
+    マスターの管理はポータルの「🎁 選べるセットの明細展開」から行います。</p>
+
+  <label for="baseUrl">接続先</label>
+  <input type="text" id="baseUrl" placeholder="https://wh.bfaith-wh.uk">
+
+  <label for="token">APIトークン</label>
+  <input type="password" id="token" placeholder="SELECT_SET_EXT_TOKEN の値">
+  <div class="hint">分からないときは中原さんに聞いてください。</div>
+
+  <div class="actions">
+    <button class="primary" id="save">保存</button>
+    <button id="test">接続テスト</button>
+  </div>
+  <div id="result"></div>
+
+  <script src="options.js"></script>
+</body>
+</html>
