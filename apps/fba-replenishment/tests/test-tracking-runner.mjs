@@ -15,7 +15,7 @@ t('JST日付: UTC深夜でも日本の日付になる (toISOStringの罠)', () =
   assert.equal(jstYmd(new Date('2026-08-06T23:00:00Z')), '20260807');
 });
 
-const base = { runId: 'r', commit: true, severity: 'ok', expectYmd: '20260807', blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [] };
+const base = { runId: 'r', commit: true, severity: 'ok', openShipments: 0, expectYmd: '20260807', blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [] };
 
 t('中断時は「登録は一切していません」と明記する', () => {
   const s = formatSummary({ ...base, severity: 'blocked', blocked: ['個口合計 5 と輸送箱 6 が一致しません'] });
@@ -60,6 +60,33 @@ t('箱数不一致は中断 (severityで見分ける)', () => {
   const s = formatSummary({ ...base, severity: 'blocked', blocked: ['個口合計 5 と輸送箱 6 が一致しません'] });
   assert.match(s, /^🚨/);
   assert.match(s, /登録は一切していません/);
+});
+
+t('🚨投入待ちの納品が無い日は情報どまり — 置きっぱなしCSVで赤を出さない', () => {
+  const s = formatSummary({ ...base, severity: 'info', openShipments: 0,
+    note: ['追跡番号の投入を待っている納品はありません (納品が無い日、すでに画面で入力済み、またはラベル未発行)'] });
+  assert.match(s, /^ℹ️/);
+  assert.doesNotMatch(s, /🚨/);
+  assert.doesNotMatch(s, /登録は一切していません/);
+});
+
+t('🚨投入待ちがあるのにCSVが古いときは赤 + 対象を並べる', () => {
+  const s = formatSummary({ ...base, severity: 'blocked', openShipments: 2, blocked: [
+    'CSVの出荷日が期待 (20260808) と一致しません → 20260807:19件。古いCSVが残っていないか、出力時の日付指定を確認してください',
+    '追跡番号待ちの納品: FBA15GGL5J2X(HND2) 5箱 / FBA15GGLDVMG(XHD4) 14箱',
+  ] });
+  assert.match(s, /^🚨/);
+  assert.match(s, /FBA15GGL5J2X\(HND2\) 5箱/);
+});
+
+t('🚨投入待ちがあるのにCSVが無いときは、何をすべきか書く', () => {
+  const s = formatSummary({ ...base, severity: 'blocked', openShipments: 1, blocked: [
+    '追跡番号待ちの納品が 1件あるのに、出荷実績CSVが取得できません: ファイルが見つかりません',
+    '対象: FBA15GGL5J2X(HND2) 5箱',
+    'iS-2の「出荷実績印刷・CSV出力」から本日分を fukutsu_tuiseki.csv として保存してください',
+  ] });
+  assert.match(s, /出荷実績印刷・CSV出力/);
+  assert.match(s, /fukutsu_tuiseki\.csv/);
 });
 
 t('プレビューはタイトルで分かる', () => {

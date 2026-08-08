@@ -2,12 +2,20 @@
  * FBA納品 追跡番号の自動投入 — 実行本体 (毎日22:00 JST に走らせる想定)
  *
  * 流れ:
- *   1. 福山通運の出荷実績CSVを取る (Drive の固定フォルダ / またはローカルファイル)
- *   2. 解析して「納品ごとの boxId ← 送り状番号」を作る
+ *   1. **先に Amazon 側を見て「今日投入すべき納品があるか」を確かめる**
+ *   2. あれば福山通運の出荷実績CSVを取り、解析して boxId ← 送り状番号 を作る
  *   3. fail-closed の判定を通ったものだけ SP-API で投入する
  *   4. 何をしたかを自前記録へ残し、結果を GChat へ通知する
  *
- * ⭐22:00 に走らせる理由は2つ:
+ * ⭐なぜ「納品の確認」が先なのか (2026-08-08 に実運用で判明):
+ *   CSVを先に見ると、**FBA納品が無い日に前日のCSVが置きっぱなし**なだけで
+ *   「古いCSVがある」と赤で鳴ってしまう。納品が無い日は正常なので、
+ *   同じ「CSVが古い/無い」でも
+ *     - 投入待ちの納品がある → 🚨 人が今日の分を出力すべき
+ *     - 投入待ちの納品が無い → ℹ️ 何もすることが無い日
+ *   と結論が真逆になる。判定材料の順番がそのまま誤警報の有無を決める。
+ *
+ * ⭐22:00 に走らせる理由:
  *   - 追跡番号を入れると納品の修正が極端に面倒になるため、日中に箱数のズレが
  *     表面化する時間を作る (子会社いろはの数え間違いがまれに発生する)
  *   - APIの投入は **当日中でないと期限切れで拒否される** (2026-08-07 実測)。
@@ -39,7 +47,7 @@ const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex').sl
 async function fetchCsv({ file, folderId, filename }) {
   if (file) {
     if (!fs.existsSync(file)) throw tErr(`CSVが見つかりません: ${file}`);
-    return { buf: fs.readFileSync(file), source: `local:${file}`, modifiedAt: fs.statSync(file).mtime.toISOString() };
+    return { buf: fs.readFileSync(file), source: `local:${file}` };
   }
   if (!folderId) {
     throw tErr('CSVの取得先が未設定です (--file を指定するか FBA_TRACKING_DRIVE_FOLDER_ID を設定してください)');
@@ -47,7 +55,7 @@ async function fetchCsv({ file, folderId, filename }) {
   const { downloadDriveCsv } = await import('../../lib/drive-csv.js');
   const cfg = { folderId, filename: filename || DEFAULT_FILENAME, label: '福山通運 出荷実績CSV' };
   const buf = await downloadDriveCsv(cfg);
-  return { buf: Buffer.isBuffer(buf) ? buf : buf?.buffer ?? buf, source: `drive:${cfg.filename}`, modifiedAt: buf?.modified_time ?? null };
+  return { buf: Buffer.isBuffer(buf) ? buf : buf?.buffer ?? buf, source: `drive:${cfg.filename}` };
 }
 
 /**
@@ -69,11 +77,12 @@ export async function runTrackingJob(opts = {}) {
     runId, commit, expectYmd, source: null, sourceHash: null,
     // ⭐severity は「人を呼ぶべきか」の段階。納品が無い日は普通にあるので、
     //   それを blocked にすると毎晩ニセの警報が鳴って本当の異常が埋もれる。
-    //   ok   = 登録した / 何もすることが無かった
-    //   info = 出荷実績CSVが無い日 (FBA納品が無い日は正常)
-    //   warn = 気に留めてほしいが自動対応は不要 (既に手入力済み等)
-    //   blocked = 人が直すまで登録できない (箱数不一致・期限切れ・CSV不正)
+    //   ok      = 登録した
+    //   info    = 今日はすることが無い (投入待ちの納品が無い)
+    //   warn    = 気に留めてほしいが自動対応は不要 (期限切れ・過去に別内容で投入済み等)
+    //   blocked = 人が直すまで登録できない (箱数不一致・CSVが古い/無い・権限エラー)
     severity: 'ok',
+    openShipments: 0,
     blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [],
   };
 
@@ -84,26 +93,45 @@ export async function runTrackingJob(opts = {}) {
     return summary;
   }
 
-  // 1. CSV取得
+  // ── 1. まず Amazon 側を見る ────────────────────────────────
+  // ここを先にやることで「納品が無い日の置きっぱなしCSV」を異常扱いしないで済む。
+  let shipments;
+  try {
+    shipments = await findOpenShipments();
+  } catch (e) {
+    summary.severity = 'blocked';
+    summary.blocked.push(`納品の取得に失敗: ${e.message}`);
+    return summary;
+  }
+  summary.openShipments = shipments.length;
+
+  if (!shipments.length) {
+    // 追跡番号の投入を待っている納品が1つも無い = 今日はすることが無い。
+    // (納品が無い日 / すでに人が画面で入れた日 / まだラベル未発行)
+    summary.severity = 'info';
+    summary.note.push('追跡番号の投入を待っている納品はありません (納品が無い日、すでに画面で入力済み、またはラベル未発行)');
+    return summary;
+  }
+
+  // ── 2. ここから先は「投入すべき納品がある」= CSVが必要 ──────
+  const waiting = shipments.map((s) => `${s.shipmentConfirmationId}(${s.fcCode}) ${s.boxIds.length}箱`).join(' / ');
+
   let csv;
   try {
     csv = await fetchCsv({ file: opts.file, folderId: opts.folderId ?? process.env.FBA_TRACKING_DRIVE_FOLDER_ID, filename: opts.filename });
   } catch (e) {
-    // ファイルが置かれていないだけなら、FBA納品が無い日の正常な姿。
-    // 権限エラーや設定漏れは人を呼ぶ (VALIDATION = 対象ファイルが見つからない)
-    const notFound = e.code === 'VALIDATION' || e.code === 'TRACKING_CSV';
-    summary.severity = notFound ? 'info' : 'blocked';
-    (notFound ? summary.note : summary.blocked).push(
-      notFound
-        ? `本日の出荷実績CSVはまだ置かれていません (${e.message})。FBA納品が無い日なら正常です`
-        : `CSVを取得できません: ${e.message}`,
+    summary.severity = 'blocked';
+    summary.blocked.push(
+      `追跡番号待ちの納品が ${shipments.length}件あるのに、出荷実績CSVが取得できません: ${e.message}`,
+      `対象: ${waiting}`,
+      'iS-2の「出荷実績印刷・CSV出力」から本日分を fukutsu_tuiseki.csv として保存してください',
     );
     return summary;
   }
   summary.source = csv.source;
   summary.sourceHash = sha256(csv.buf);
 
-  // 2. 解析
+  // ── 3. 解析 ────────────────────────────────────────────
   let rows;
   try {
     const parsed = parseTrackingCsv(csv.buf);
@@ -116,34 +144,22 @@ export async function runTrackingJob(opts = {}) {
   }
   if (!rows.length) { summary.severity = 'blocked'; summary.blocked.push('CSVにデータ行がありません'); return summary; }
 
-  // 3. 🚨古いCSVの誤処理を防ぐ (固定ファイル名運用のため中身の出荷日で見る)
+  // 🚨古いCSVの誤処理を防ぐ (固定ファイル名運用のため中身の出荷日で見る)。
+  // ここに来ている時点で投入待ちの納品があるので、古いCSV = 人が本日分を出し忘れている
   const d = checkShipDate(rows, expectYmd);
-  if (!d.ok) { summary.severity = 'blocked'; summary.blocked.push(d.problem); return summary; }
+  if (!d.ok) {
+    summary.severity = 'blocked';
+    summary.blocked.push(d.problem, `追跡番号待ちの納品: ${waiting}`);
+    return summary;
+  }
 
-  // 4. 同じCSVを二度処理しない (出荷日チェックと二重の防御)
+  // 同じCSVを二度処理しない (出荷日チェックと二重の防御)
   const dup = store.findBySourceHash(summary.sourceHash);
   if (dup) summary.note.push(`このCSVは ${dup.at} に処理済みです (同一内容の納品はスキップされます)`);
 
   if (summary.blocked.length) { summary.severity = 'blocked'; return summary; }
 
-  // 5. 対象の納品を探す
-  let shipments;
-  try {
-    shipments = await findOpenShipments();
-  } catch (e) {
-    summary.severity = 'blocked';
-    summary.blocked.push(`納品の取得に失敗: ${e.message}`);
-    return summary;
-  }
-  if (!shipments.length) {
-    // CSVはあるのに対象が無い = すでに人が画面で入れた / ラベル未発行 / 別便だけ。
-    // 自動では何もできないが「人を叩き起こす異常」でもないので warn に留める。
-    summary.severity = 'warn';
-    summary.note.push('追跡番号の未登録な納品が見つかりません (すでに画面で入力済み、ラベル未発行、またはFBA以外の便だけの可能性)');
-    return summary;
-  }
-
-  // 6. 割り当て
+  // ── 4. 割り当て ────────────────────────────────────────
   const { assignments, excluded, problems, skipped } = buildAssignments(rows, shipments);
   summary.excluded = excluded;
   summary.skipped = skipped;
@@ -153,7 +169,7 @@ export async function runTrackingJob(opts = {}) {
     return summary;
   }
 
-  // 7. 納品ごとに投入
+  // ── 5. 納品ごとに投入 ──────────────────────────────────
   for (const a of assignments) {
     const ship = shipments.find((s) => s.shipmentConfirmationId === a.shipmentConfirmationId);
     const items = a.items.map((i) => ({ boxId: i.boxId, trackingId: i.trackingId }));
