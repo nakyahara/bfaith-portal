@@ -23,6 +23,9 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 
+/** 拡張機能のzipに入れない開発用ファイル (Googleに提出するパッケージに社内メモを混ぜないため) */
+const DEV_ONLY_FILES = new Set(['make-icons.mjs', 'STORE_LISTING.md']);
+
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗時は起動を止める
 initSelectSetDB();
 
@@ -187,7 +190,9 @@ router.get('/download/extension.zip', (req, res) => {
     res.destroy();
   });
   archive.pipe(res);
-  archive.directory(dir, false);
+  // 開発用ファイルは同梱しない。特に STORE_LISTING.md は提出手順の社内メモなので、
+  // Google に出すパッケージに入れたくない
+  archive.directory(dir, false, (entry) => (DEV_ONLY_FILES.has(entry.name) ? false : entry));
   archive.finalize();
 });
 
