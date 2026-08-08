@@ -5,6 +5,7 @@
   "description": "Amazon Seller Central の納品プラン画面から、福山通運 iS-2 に取り込む送り状CSVを作る (社内用)",
   "permissions": ["storage"],
   "host_permissions": [
+    "https://bfaith-portal.onrender.com/*",
     "https://wh.bfaith-wh.uk/*",
     "http://localhost/*"
   ],
