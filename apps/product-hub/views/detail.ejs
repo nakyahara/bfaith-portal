@@ -509,8 +509,11 @@
         <button class="btn btn-primary" id="import-folder-btn" style="white-space:nowrap">フォルダから自動セット</button>
       </div>
       <div class="muted" style="font-size:11px;">
-        ファイル名「<%= draft.ne_code %>_00」= 白抜き背景 / 「<%= draft.ne_code %>_01」〜「_20」= 楽天の画像1〜20 として自動で振り分けます (欠番は詰めて登録)。
-        _01〜_20 が1枚でも見つかると、現在の商品画像は<b>フォルダの内容で置き換わります</b> (_00 だけの場合は白抜きのみ更新)
+        ファイル名「<%= draft.ne_code %><b>_top</b>」= <b>商品画像1 (楽天のTOP画像/サムネイル)</b> /
+        「<%= draft.ne_code %>_01」〜「_19」= 商品画像2〜20 (<b>_top が1枠目なので1つずれます</b>) /
+        「<%= draft.ne_code %>_00」= 白抜き背景。欠番は前に詰めて登録されます。
+        _top・_01〜 が1枚でも見つかると、現在の商品画像は<b>フォルダの内容で置き換わります</b> (_00 だけの場合は白抜きのみ更新)。
+        <b>Driveで画像を差し替えたときも、このボタンを押すとサムネイルが最新になります</b>
       </div>
     </div>
 
@@ -518,15 +521,25 @@
       const whiteBgTransferred = rakuten?.white_bg_drive_file_id
         && cabinetImages.some((c) => c.drive_file_id === rakuten.white_bg_drive_file_id);
       const transferredIds = new Set(cabinetImages.map((c) => c.drive_file_id));
-      const slotCount = Math.max(20, images.length);
+      // 枠は sort (= 取り込み時のスロット番号-1) で引く。_top が無い商品は枠1が空のまま
+      // 表示され、「TOP画像が未設定」がひと目で分かる (2026-08-08 スタッフ指摘)
+      const imagesBySlot = new Map(images.map((im) => [Number(im.sort) + 1, im]));
+      const slotCount = Math.max(20, ...images.map((im) => Number(im.sort) + 1));
     %>
-    <!-- スロットグリッド: 白抜き (00) + 楽天の登録口20個 -->
+    <% if (images.length > 0 && !imagesBySlot.has(1)) { %>
+      <div class="banner-warn" style="margin:0 0 10px; font-size:12px;">
+        ⚠️ <b>TOP画像 (<%= draft.ne_code %>_top) がありません。</b>
+        枠1が空のため、楽天へは枠2以降が前に詰めて登録されます (_01 の画像がTOP画像になります)。
+        フォルダに <code><%= draft.ne_code %>_top.jpg</code> を置いて「フォルダから自動セット」を押してください
+      </div>
+    <% } %>
+    <!-- スロットグリッド: 白抜き (00) + 楽天の登録口20個 (枠1 = _top) -->
     <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr)); gap:10px;">
       <div style="text-align:center;">
         <div style="font-size:11px; color:#64748b; margin-bottom:2px;">00 白抜き</div>
         <% if (rakuten?.white_bg_drive_file_id) { %>
           <a href="<%= fileViewUrl(rakuten.white_bg_drive_file_id) %>" target="_blank" rel="noopener">
-            <img src="<%= thumbnailUrl(rakuten.white_bg_drive_file_id, 320) %>" alt="" loading="lazy" referrerpolicy="no-referrer"
+            <img src="<%= thumbnailUrl(rakuten.white_bg_drive_file_id, 320, rakuten.white_bg_modified_time) %>" alt="" loading="lazy" referrerpolicy="no-referrer"
                  style="width:100%; aspect-ratio:1; object-fit:cover; border-radius:8px; border:2px solid #c7d2fe; background:#f8fafc;">
           </a>
           <div style="font-size:11px;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送' %></div>
@@ -537,12 +550,15 @@
       <%# 上限は自動追加バナー込みで判定 (出品時に初めて弾かれないよう、超過をこの場で見せる)。
           白抜きと同じファイルのスロットは payload で除外されるため商品画像として数えない (Codex R2) %>
       <% let productImgCount = 0; %>
-      <% for (let i = 0; i < slotCount; i++) { const img = images[i];
+      <% for (let i = 0; i < slotCount; i++) { const img = imagesBySlot.get(i + 1);
            const isWhiteBgDup = !!img && !!rakuten?.white_bg_drive_file_id && img.drive_file_id === rakuten.white_bg_drive_file_id;
            if (img && !isWhiteBgDup) productImgCount++;
            const over = !!img && !isWhiteBgDup && productImgCount > 20 - trailingBanners.length; %>
         <div style="text-align:center;">
-          <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= over ? ' ⚠上限超え' : '' %></div>
+          <%# ファイル名は取り込み時に記録した source_label があるときだけ出す。
+              旧データ (NULL) は枠との対応が新仕様と違うため断定しない (Codex medium) %>
+          <div style="font-size:11px; color:<%= over ? '#dc2626' : '#64748b' %>; margin-bottom:2px;"><%= i + 1 %><%= i === 0 ? ' TOP' : '' %>
+            <% if (img && img.source_label) { %><span class="muted">(<%= img.source_label %>)</span><% } %><%= over ? ' ⚠上限超え' : '' %></div>
           <% if (img) { %>
             <a href="<%= img.view_url %>" target="_blank" rel="noopener">
               <img src="<%= img.thumb %>" alt="" loading="lazy" referrerpolicy="no-referrer"
@@ -602,7 +618,7 @@
               <tr>
                 <td><code><%= sku %></code></td>
                 <td class="muted" style="max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"><%= m.商品名 || '' %></td>
-                <td><% if (r) { %><img src="<%= thumbnailUrl(r.drive_file_id, 160) %>" alt="" loading="lazy"
+                <td><% if (r) { %><img src="<%= thumbnailUrl(r.drive_file_id, 160, r.drive_modified_time) %>" alt="" loading="lazy"
                        style="width:56px; height:56px; object-fit:contain; border:1px solid #e2e8f0; border-radius:6px; background:#fff;"><% } else { %><span class="muted">—</span><% } %></td>
                 <td>
                   <% if (!r) { %><span class="muted">未取込 (フォルダに <%= sku %>.jpg 等を置いて「フォルダから自動セット」)</span>
@@ -2388,7 +2404,7 @@
       const json = await post(BASE + '/images/import-folder', { url });
       if (!json.ok) {
         const details = []
-          .concat((json.conflicts || []).map((c) => '・_' + c.num + ' が複数あります: ' + c.names.join(' / ')))
+          .concat((json.conflicts || []).map((c) => '・' + c.label + ' が複数あります: ' + c.names.join(' / ')))
           .concat((json.skipped || []).map((s) => '・' + s.name + ' — ' + s.reason));
         alert((json.error || 'エラーが発生しました') + (details.length ? '\n\n' + details.join('\n') : ''));
         return;

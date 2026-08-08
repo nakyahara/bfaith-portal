@@ -46,9 +46,16 @@ export const THUMB_WIDTHS = [160, 320];
 // router の /api/thumb/:fileId が受け付ける ID 形式 (parseDriveLink と同じ文字種)
 export const DRIVE_FILE_ID_PATTERN = /^[-\w]{10,200}$/;
 
-export function thumbnailUrl(fileId, width = 320) {
+/**
+ * サムネイルURL。version (Drive の更新日時) を渡すと ?v= が付き、
+ * Drive で画像を上書きした際にブラウザ/サーバーのキャッシュを外せる (2026-08-08)。
+ * 値は epoch ms に丸める (URL を短く保ち、同一時刻なら同一キーになる)
+ */
+export function thumbnailUrl(fileId, width = 320, version = null) {
   const w = THUMB_WIDTHS.includes(width) ? width : 320;
-  return `/apps/product-hub/api/thumb/${encodeURIComponent(fileId)}?w=${w}`;
+  const t = version ? Date.parse(version) : NaN;
+  const v = Number.isFinite(t) ? `&v=${t}` : '';
+  return `/apps/product-hub/api/thumb/${encodeURIComponent(fileId)}?w=${w}${v}`;
 }
 
 export function fileViewUrl(fileId) {

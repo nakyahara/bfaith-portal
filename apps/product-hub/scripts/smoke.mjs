@@ -36,24 +36,42 @@ check('thumbnail url allowlist外の幅→320', thumbnailUrl('abc-123', 999).end
 check('thumbnail url 幅未指定→320', thumbnailUrl('abc-123').endsWith('?w=320'));
 
 // ─── folder-import (画像フォルダ→スロット割当、2026-08-01) ───
-const { assignImageSlots, parseNumberedName, MAX_IMAGE_SLOTS } = await import('../lib/folder-import.js');
-check('MAX_IMAGE_SLOTS = 楽天の登録口20', MAX_IMAGE_SLOTS === 20);
-check('parseNumberedName 基本形', JSON.stringify(parseNumberedName('abc_01.jpg')) === '{"base":"abc","num":1}');
-check('parseNumberedName 番号なし', parseNumberedName('abc.jpg') === null);
-check('parseNumberedName 拡張子なし', parseNumberedName('abc_01') === null);
-check('parseNumberedName ゼロ埋めなし _5', parseNumberedName('abc_5.png')?.num === 5);
+const { assignImageSlots, parseImageFileName, slotOfParsedName, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } =
+  await import('../lib/folder-import.js');
+check('MAX_IMAGE_SLOTS = 楽天の登録口20 / ファイル番号は _19 まで (_top が枠1)',
+  MAX_IMAGE_SLOTS === 20 && MAX_NUMBERED_IMAGE === 19);
+check('parseImageFileName 基本形', JSON.stringify(parseImageFileName('abc_01.jpg')) === '{"base":"abc","kind":"num","num":1,"label":"_01"}');
+check('parseImageFileName 番号なし', parseImageFileName('abc.jpg') === null);
+check('parseImageFileName 拡張子なし', parseImageFileName('abc_01') === null);
+check('parseImageFileName ゼロ埋めなし _5', parseImageFileName('abc_5.png')?.num === 5);
+check('parseImageFileName _top (大小無視)',
+  parseImageFileName('abc_top.jpg')?.kind === 'top' && parseImageFileName('abc_TOP.PNG')?.kind === 'top');
+check('parseImageFileName _00 は白抜き', parseImageFileName('abc_00.jpg')?.kind === 'white');
+// 2026-08-08 スタッフ指摘: TOP画像 = 商品画像1、_01 は商品画像2 へずれる
+check('slotOfParsedName: _top→1 / _01→2 / _19→20 / _00→null',
+  slotOfParsedName(parseImageFileName('a_top.jpg')) === 1
+  && slotOfParsedName(parseImageFileName('a_01.jpg')) === 2
+  && slotOfParsedName(parseImageFileName('a_19.jpg')) === 20
+  && slotOfParsedName(parseImageFileName('a_00.jpg')) === null);
 
-const fim = (name, mimeType = 'image/jpeg') => ({ id: 'id-' + name, name, mimeType });
-let asn = assignImageSlots([fim('code_02.png'), fim('code_00.jpg'), fim('code_01.jpg')], 'code');
-check('_00→白抜き / _01,_02→スロット1,2 (番号順)',
-  asn.whiteBg?.id === 'id-code_00.jpg' && asn.slots.length === 2
-  && asn.slots[0].slot === 1 && asn.slots[0].id === 'id-code_01.jpg' && asn.slots[1].slot === 2,
+const fim = (name, mimeType = 'image/jpeg', modifiedTime = null) => ({ id: 'id-' + name, name, mimeType, modifiedTime });
+let asn = assignImageSlots([fim('code_02.png'), fim('code_00.jpg'), fim('code_top.jpg'), fim('code_01.jpg')], 'code');
+check('_00→白抜き / _top→枠1 / _01,_02→枠2,3 (枠順)',
+  asn.whiteBg?.id === 'id-code_00.jpg' && asn.slots.length === 3
+  && asn.slots[0].slot === 1 && asn.slots[0].id === 'id-code_top.jpg'
+  && asn.slots[1].slot === 2 && asn.slots[1].id === 'id-code_01.jpg'
+  && asn.slots[2].slot === 3 && asn.slots[2].id === 'id-code_02.png',
   JSON.stringify(asn));
 
-asn = assignImageSlots([fim('code_01.jpg'), fim('メモ.jpg'), fim('code_21.jpg'), fim('code_02.txt', 'text/plain')], 'code');
+asn = assignImageSlots([fim('code_01.jpg'), fim('code_19.jpg'), fim('code_20.jpg')], 'code');
+check('_19 は枠20 (最終) / _20 は上限超えで skipped',
+  asn.slots.some((x) => x.slot === 20 && x.id === 'id-code_19.jpg')
+  && asn.skipped.some((x) => x.name === 'code_20.jpg'), JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('メモ.jpg'), fim('code_20.jpg'), fim('code_02.txt', 'text/plain')], 'code');
 check('番号なし/上限超え/非画像 → skipped',
   asn.slots.length === 1 && asn.skipped.length === 3
-  && asn.skipped.some((s) => s.name === 'code_21.jpg'), JSON.stringify(asn.skipped));
+  && asn.skipped.some((s) => s.name === 'code_20.jpg'), JSON.stringify(asn.skipped));
 
 asn = assignImageSlots([fim('code_01.jpg'), fim('other_01.jpg'), fim('other_02.jpg')], 'code');
 check('商品コード一致だけを採用 (他コードは除外・conflictにしない)',
@@ -65,13 +83,20 @@ check('コード一致ゼロは fail-closed (codeMatched=false・何も採用し
   asn.codeMatched === false && asn.slots.length === 0 && asn.whiteBg === null
   && asn.skipped.length === 2, JSON.stringify(asn));
 
-asn = assignImageSlots([fim('code_01.jpg'), fim('code_04.jpg')], 'code');
-check('欠番は missingNums で報告 (_02,_03)',
-  JSON.stringify(asn.missingNums) === '[2,3]' && asn.slots.length === 2, JSON.stringify(asn));
+asn = assignImageSlots([fim('code_top.jpg'), fim('code_01.jpg'), fim('code_04.jpg')], 'code');
+check('欠番はファイル名ラベルで報告 (_02,_03)',
+  JSON.stringify(asn.missingLabels) === '["_02","_03"]' && asn.slots.length === 3, JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_01.jpg'), fim('code_02.jpg')], 'code');
+check('_top が無ければ missingLabels に _top (TOP画像未設定が見える)',
+  asn.missingLabels[0] === '_top', JSON.stringify(asn));
 
 asn = assignImageSlots([fim('code_01.jpg'), fim('code_01.png')], 'code');
 check('同一番号の重複 → conflicts (セットしない)',
-  asn.slots.length === 0 && asn.conflicts.length === 1 && asn.conflicts[0].num === 1, JSON.stringify(asn));
+  asn.slots.length === 0 && asn.conflicts.length === 1 && asn.conflicts[0].label === '_01', JSON.stringify(asn));
+
+asn = assignImageSlots([fim('code_top.jpg'), fim('code_top.png')], 'code');
+check('_top の重複も conflicts', asn.conflicts.length === 1 && asn.conflicts[0].label === '_top', JSON.stringify(asn));
 
 asn = assignImageSlots([fim('code_01.jpg'), fim('code_21.jpg'), fim('code_21.png')], 'code');
 check('上限超え番号は重複でも conflicts にしない (skippedで_01は取り込める)',
@@ -80,8 +105,18 @@ check('上限超え番号は重複でも conflicts にしない (skippedで_01�
 asn = assignImageSlots([fim('CODE_01.JPG')], 'code');
 check('大文字小文字は同一視', asn.slots.length === 1, JSON.stringify(asn));
 
-asn = assignImageSlots([fim('code_0.jpg'), fim('code_20.jpg')], 'code');
-check('_0 は白抜き / _20 は最終スロット', asn.whiteBg?.id === 'id-code_0.jpg' && asn.slots[0]?.slot === 20, JSON.stringify(asn));
+asn = assignImageSlots([fim('code_0.jpg'), fim('code_19.jpg')], 'code');
+check('_0 は白抜き / _19 は最終スロット20', asn.whiteBg?.id === 'id-code_0.jpg' && asn.slots[0]?.slot === 20, JSON.stringify(asn));
+
+// サムネの版数 (2026-08-08): Drive の更新日時を拾って URL に載せる
+asn = assignImageSlots([fim('code_top.jpg', 'image/jpeg', '2026-08-08T01:02:03.000Z')], 'code');
+check('modifiedTime を slots に保持', asn.slots[0]?.modifiedTime === '2026-08-08T01:02:03.000Z', JSON.stringify(asn));
+
+const { thumbnailUrl: thumbUrlFn } = await import('../lib/drive-link.js');
+check('thumbnailUrl: 版数ありは ?v= 付き / 無効値は付けない',
+  thumbUrlFn('abc', 160, '2026-08-08T01:02:03.000Z') === '/apps/product-hub/api/thumb/abc?w=160&v=' + Date.parse('2026-08-08T01:02:03.000Z')
+  && thumbUrlFn('abc', 160) === '/apps/product-hub/api/thumb/abc?w=160'
+  && thumbUrlFn('abc', 160, 'not-a-date') === '/apps/product-hub/api/thumb/abc?w=160');
 
 // ─── shop-categories: AI 初期候補の採点 (2026-08-02) ───
 const { suggestShopCategories, SHOP_CATEGORY_AUTO_APPLY_MIN_SCORE, canAutoApplyShopCategory } =
@@ -913,6 +948,12 @@ db.prepare(`INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id) VALUES 
 check('isKnownImageFileId: draft_images 登録済み → true', isKnownImageFileId(db, 'thumb-known-test'));
 check('isKnownImageFileId: 白抜き背景 (draft_rakuten) → true', isKnownImageFileId(db, 'thumb-wb-test'));
 check('isKnownImageFileId: 未登録IDは false', !isKnownImageFileId(db, 'not-registered-file-id'));
+// 2026-08-08: サムネURLの版数は DB の期待値と照合する (任意の v でキャッシュを汚させない)
+const { imageRefOfFileId } = await import('../db.js');
+db.prepare(`UPDATE draft_images SET drive_modified_time = '2026-08-08T00:00:00.000Z' WHERE drive_file_id = 'thumb-known-test'`).run();
+check('imageRefOfFileId: 登録済みは期待バージョンを返す / 未登録は null',
+  imageRefOfFileId(db, 'thumb-known-test')?.modifiedTime === '2026-08-08T00:00:00.000Z'
+  && imageRefOfFileId(db, 'not-registered-file-id') === null);
 check('isKnownImageFileId: 空は false', !isKnownImageFileId(db, ''));
 // フィクスチャを元の状態へ (後続の白抜き/payload テストの前提を変えない)
 db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'thumb-known-test'`).run(rkId);
@@ -992,6 +1033,57 @@ check('payload: JAN欄だけではカタログID属性を自動付与しない (
   !(rkVar.attributes || []).some((a) => a.name === 'カタログID'),
   JSON.stringify(rkVar.attributes));
 check('payload: 8% は payment.taxRate で送る', built.payload?.payment?.taxRate === 0.08);
+
+// Drive 上書き後の「転送済み」誤判定 (Codex R2 high)。ID が同じでも更新日時が違えば未転送扱い
+check('freshCabinetMap/cabinetKeyOf: ID+更新日時で突合する',
+  listing.freshCabinetMap([{ drive_file_id: 'f1', cabinet_location: '/a/1.jpg', drive_modified_time: 'T1' }])
+    .get(listing.cabinetKeyOf({ drive_file_id: 'f1', drive_modified_time: 'T1' })) === '/a/1.jpg'
+  && listing.freshCabinetMap([{ drive_file_id: 'f1', cabinet_location: '/a/1.jpg', drive_modified_time: 'T1' }])
+    .has(listing.cabinetKeyOf({ drive_file_id: 'f1', drive_modified_time: 'T2' })) === false);
+{
+  // 転送履歴だけ古い更新日時にする → 未転送として登録が止まること。
+  // fixture を壊さないよう、対象行はスナップショットして最後に元へ戻す
+  const imgRow = db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ? ORDER BY sort, id LIMIT 1').get(rkId);
+  const cabBefore = db.prepare('SELECT * FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = ?')
+    .get(rkId, imgRow.drive_file_id) || null;
+  db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location, drive_modified_time)
+    VALUES (?, ?, '/appnewitems/stale.jpg', 'OLD')
+    ON CONFLICT(draft_id, drive_file_id) DO UPDATE SET cabinet_location = '/appnewitems/stale.jpg', drive_modified_time = 'OLD'`)
+    .run(rkId, imgRow.drive_file_id);
+  db.prepare(`UPDATE draft_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
+    .run(rkId, imgRow.drive_file_id);
+  const stale = listing.buildItemPayload(db, rkId);
+  check('payload: Driveで上書きされた画像は「未転送」に落ちて登録が止まる',
+    (stale.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(stale.reasons));
+  db.prepare(`UPDATE draft_cabinet_images SET drive_modified_time = 'NEW' WHERE draft_id = ? AND drive_file_id = ?`)
+    .run(rkId, imgRow.drive_file_id);
+  const okAgain = listing.buildItemPayload(db, rkId);
+  check('payload: 再転送 (更新日時が一致) すれば未転送の理由は消える',
+    !(okAgain.reasons || []).some((r) => r.includes('未転送')), JSON.stringify(okAgain.reasons));
+  // 復元
+  db.prepare('DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = ?').run(rkId, imgRow.drive_file_id);
+  if (cabBefore) {
+    db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location, cabinet_file_id, drive_modified_time)
+      VALUES (?, ?, ?, ?, ?)`).run(rkId, cabBefore.drive_file_id, cabBefore.cabinet_location, cabBefore.cabinet_file_id ?? null, cabBefore.drive_modified_time ?? null);
+  }
+  db.prepare(`UPDATE draft_images SET drive_modified_time = ? WHERE draft_id = ? AND drive_file_id = ?`)
+    .run(imgRow.drive_modified_time ?? null, rkId, imgRow.drive_file_id);
+}
+
+// TOP画像 (商品画像1 = <商品コード>_top) のゲート (2026-08-08 スタッフ指摘)。
+// 枠1 (sort 0) が空のまま登録すると別画像が繰り上がって TOP になるので止める
+{
+  const sortsBefore = db.prepare('SELECT id, sort FROM draft_images WHERE draft_id = ?').all(rkId);
+  db.prepare('UPDATE draft_images SET sort = sort + 1 WHERE draft_id = ?').run(rkId);
+  const noTop = listing.buildItemPayload(db, rkId);
+  check('payload: 枠1 (_top) が空なら登録を止める',
+    (noTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(noTop.reasons));
+  const restore = db.prepare('UPDATE draft_images SET sort = ? WHERE id = ?');
+  for (const r of sortsBefore) restore.run(r.sort, r.id);
+  const withTop = listing.buildItemPayload(db, rkId);
+  check('payload: 枠1が埋まっていれば TOP画像の理由は出ない',
+    !(withTop.reasons || []).some((r) => r.includes('TOP画像がありません')), JSON.stringify(withTop.reasons));
+}
 check('payload: 配送方法グループ + 送料込み', rkVar.shipping?.shippingMethodGroup === '5' && rkVar.shipping?.postageIncluded === true);
 check('payload: 納期情報ID は数値で送る', rkVar.normalDeliveryDateId === 1000);
 check('payload: ネコポス指定でバナー→共通3枚を商品画像の後ろに自動追加',

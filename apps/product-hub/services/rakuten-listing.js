@@ -109,7 +109,7 @@ export async function listDriveFolderImages(folderId) {
   do {
     const res = await drive.files.list({
       q: `'${folderId}' in parents and trashed = false and mimeType contains 'image/'`,
-      fields: 'nextPageToken, files(id, name, mimeType)',
+      fields: 'nextPageToken, files(id, name, mimeType, modifiedTime)',
       pageSize: 200,
       orderBy: 'name',
       supportsAllDrives: true,
@@ -134,6 +134,7 @@ export async function listDriveFolderImages(folderId) {
 const THUMB_CACHE_MAX = 300;
 const THUMB_CACHE_MAX_BYTES = 30 * 1024 * 1024; // 件数と総バイトの両方で上限 (Codex R1 medium)
 const THUMB_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const THUMB_CACHE_UNVERSIONED_TTL_MS = 2 * 60 * 1000; // 版数なし = 上書き検知不能なので短命
 const THUMB_SOURCE_MAX_BYTES = 40 * 1024 * 1024; // これを超える取得元は商品画像ではないとみなす
 const thumbCache = new Map(); // `${fileId}:${width}` → { buf, at } (Map 挿入順 = LRU)
 let thumbCacheBytes = 0;
@@ -186,11 +187,15 @@ export function isAllowedThumbnailHost(link) {
   }
 }
 
-export async function getDriveThumbnail(fileId, width) {
-  const key = `${fileId}:${width}`;
+export async function getDriveThumbnail(fileId, width, version = '') {
+  // version = Drive の更新日時。同じ fileId でも中身が差し替われば別キーになり、
+  // 古いサムネを返し続けない (2026-08-08 スタッフ指摘)。
+  // 版数が無い画像 (旧データ・個別追加) は上書きに追従できないので短命にする (Codex high)
+  const key = `${fileId}:${width}:${version}`;
+  const ttl = version ? THUMB_CACHE_TTL_MS : THUMB_CACHE_UNVERSIONED_TTL_MS;
   const hit = thumbCache.get(key);
   if (hit) {
-    if (Date.now() - hit.at <= THUMB_CACHE_TTL_MS) {
+    if (Date.now() - hit.at <= ttl) {
       thumbCache.delete(key);
       thumbCache.set(key, hit); // LRU 更新
       return hit;
@@ -341,19 +346,35 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
   const images = db.prepare('SELECT * FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draftId);
   // 白抜き背景画像 (whiteBgImage) も同じ転送に載せる。
   // ファイル名を "-white" にして商品画像と区別する (payload 側は drive_file_id で判別)
-  const rkRow = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  const rkRow = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draftId);
   const whiteBgId = rkRow?.white_bg_drive_file_id || null;
-  if (whiteBgId) images.push({ drive_file_id: whiteBgId, isWhiteBg: true });
+  if (whiteBgId) {
+    images.push({ drive_file_id: whiteBgId, isWhiteBg: true, drive_modified_time: rkRow?.white_bg_modified_time || null });
+  }
   if (images.length === 0) return { ok: false, error: 'no_images' };
 
+  // Drive で上書きされていないか確認してから転送する (再取込を忘れても追従する)
+  await refreshDriveModifiedTimes(draftId);
+  const refreshed = db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ?').all(draftId);
+  const mtimeNow = new Map(refreshed.map((r) => [r.drive_file_id, r.drive_modified_time]));
+  const rkNow = db.prepare('SELECT white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+  for (const img of images) {
+    img.drive_modified_time = img.isWhiteBg
+      ? (rkNow?.white_bg_modified_time || null)
+      : (mtimeNow.has(img.drive_file_id) ? mtimeNow.get(img.drive_file_id) : img.drive_modified_time || null);
+  }
   const folderId = await ensureCabinetFolder(db);
   const results = [];
   let n = 0;
   for (const img of images) {
     n += 1;
-    const done = db.prepare('SELECT cabinet_location FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = ?')
-      .get(draftId, img.drive_file_id);
-    if (done) {
+    const done = db.prepare(
+      'SELECT cabinet_location, drive_modified_time FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_id = ?',
+    ).get(draftId, img.drive_file_id);
+    // Drive で同じファイルを上書きした場合、ID は同じでも更新日時が変わる。
+    // 「転送済み」で素通りさせると R-Cabinet だけ旧画像のまま楽天へ出てしまう (Codex high)
+    const fresh = done && String(done.drive_modified_time || '') === String(img.drive_modified_time || '');
+    if (fresh) {
       results.push({ driveFileId: img.drive_file_id, outcome: 'already', location: done.cabinet_location });
       continue;
     }
@@ -373,12 +394,13 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
         throw new Error(up.data?.message || up.data?.error || `HTTP ${up.status}`);
       }
       db.prepare(`
-        INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location, cabinet_file_id)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location, cabinet_file_id, drive_modified_time)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(draft_id, drive_file_id) DO UPDATE SET
           cabinet_location = excluded.cabinet_location, cabinet_file_id = excluded.cabinet_file_id,
+          drive_modified_time = excluded.drive_modified_time,
           uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      `).run(draftId, img.drive_file_id, location, fileId ?? null);
+      `).run(draftId, img.drive_file_id, location, fileId ?? null, img.drive_modified_time || null);
       results.push({ driveFileId: img.drive_file_id, outcome: 'uploaded', location });
     } catch (e) {
       // Drive の権限エラーはここに落ちる (SA がフォルダに共有されていない等)。画像単位で報告
@@ -389,6 +411,77 @@ export async function transferImagesToCabinet(draftId, { actor = null } = {}) {
   const failed = results.filter((r) => r.outcome === 'failed').length;
   logEvent(db, draftId, 'cabinet_transfer', `uploaded=${uploaded} failed=${failed}`, actor);
   return { ok: failed === 0, uploaded, failed, results };
+}
+
+/**
+ * 画像フォルダを引き直して draft_images / 白抜き / SKU画像の Drive 更新日時を最新化する。
+ * これが無いと「Drive で上書きしたがフォルダ再取込はしていない」状態で日時が古いまま一致し、
+ * 転送済み判定をすり抜けて**旧画像で出品**される (Codex R3 high)。
+ * 転送・登録の直前に呼ぶ。フォルダ未設定や Drive エラーは fail-soft (呼び出し側の処理は続行)。
+ */
+export async function refreshDriveModifiedTimes(draftId) {
+  const db = getDB();
+  const draft = db.prepare('SELECT ne_code, drive_folder_url FROM product_drafts WHERE id = ?').get(draftId);
+  const m = String(draft?.drive_folder_url || '').match(/\/folders\/([\w-]+)/);
+  if (!m) return { ok: false, error: 'no_folder' };
+  let files;
+  try {
+    files = await listDriveFolderImages(m[1]);
+  } catch (e) {
+    console.error('[product-hub] refreshDriveModifiedTimes failed:', String(e.message || e).slice(0, 200));
+    return { ok: false, error: 'drive_unavailable' };
+  }
+  const mtimeById = new Map(files.map((f) => [f.id, f.modifiedTime || null]));
+  let changed = 0;
+  db.transaction(() => {
+    for (const row of db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ?').all(draftId)) {
+      if (!mtimeById.has(row.drive_file_id)) continue; // フォルダ外の個別追加は触らない
+      const t = mtimeById.get(row.drive_file_id);
+      if (String(t || '') === String(row.drive_modified_time || '')) continue;
+      db.prepare('UPDATE draft_images SET drive_modified_time = ? WHERE draft_id = ? AND drive_file_id = ?').run(t, draftId, row.drive_file_id);
+      changed += 1;
+    }
+    const rk = db.prepare('SELECT white_bg_drive_file_id, white_bg_modified_time FROM draft_rakuten WHERE draft_id = ?').get(draftId);
+    if (rk?.white_bg_drive_file_id && mtimeById.has(rk.white_bg_drive_file_id)) {
+      const t = mtimeById.get(rk.white_bg_drive_file_id);
+      if (String(t || '') !== String(rk.white_bg_modified_time || '')) {
+        db.prepare('UPDATE draft_rakuten SET white_bg_modified_time = ? WHERE draft_id = ?').run(t, draftId);
+        changed += 1;
+      }
+    }
+    for (const row of db.prepare('SELECT sku_code, drive_file_id, drive_modified_time FROM draft_sku_images WHERE draft_id = ?').all(draftId)) {
+      if (!mtimeById.has(row.drive_file_id)) continue;
+      const t = mtimeById.get(row.drive_file_id);
+      if (String(t || '') === String(row.drive_modified_time || '')) continue;
+      // SKU画像は転送状態を同じ行に持つ。更新日時だけ直すと cabinet_location が残り、
+      // 「転送済み」で素通りして旧画像を楽天へ紐づけてしまう (Codex R4 high) → 同時にクリア
+      db.prepare(`
+        UPDATE draft_sku_images
+        SET drive_modified_time = ?, cabinet_location = NULL, cabinet_file_id = NULL,
+            uploaded_at = NULL, synced_at = NULL
+        WHERE draft_id = ? AND sku_code = ?
+      `).run(t, draftId, row.sku_code);
+      changed += 1;
+    }
+  })();
+  if (changed > 0) logEvent(db, draftId, 'drive_images_updated', `Driveで更新された画像 ${changed} 件を検出`, null);
+  return { ok: true, changed };
+}
+
+/**
+ * 転送履歴 (draft_cabinet_images) を「ファイルID + Drive更新日時」で引ける Map にする。
+ * ID だけで突き合わせると、Drive で同じファイルを上書きした後も「転送済み」に見えてしまい、
+ * R-Cabinet に残る**旧画像のまま出品**される (Codex R2 high)。
+ */
+export function freshCabinetMap(cabinetRows) {
+  return new Map((cabinetRows || []).map((c) => [
+    `${c.drive_file_id}|${c.drive_modified_time || ''}`, c.cabinet_location,
+  ]));
+}
+
+/** freshCabinetMap のキー (画像行 → 転送履歴の照合キー) */
+export function cabinetKeyOf(row) {
+  return `${row.drive_file_id}|${row.drive_modified_time || ''}`;
 }
 
 // ─── SKU画像 (バリエーションページの SKU 選択時に出る画像。2026-08-07 中原さん指示) ───
@@ -470,16 +563,19 @@ export async function importSkuImagesFromFolder(draftId, { folderUrlOverride = n
     for (const { sku, file } of matched) {
       // ファイルが変わっていたら転送・紐づけ状態をリセット (古い画像のまま「済み」に見せない)
       db.prepare(`
-        INSERT INTO draft_sku_images (draft_id, sku_code, drive_file_id, file_name)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO draft_sku_images (draft_id, sku_code, drive_file_id, file_name, drive_modified_time)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(draft_id, sku_code) DO UPDATE SET
           drive_file_id = excluded.drive_file_id,
           file_name = excluded.file_name,
-          cabinet_location = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.cabinet_location ELSE NULL END,
-          cabinet_file_id  = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.cabinet_file_id ELSE NULL END,
-          uploaded_at      = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.uploaded_at ELSE NULL END,
-          synced_at        = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id THEN draft_sku_images.synced_at ELSE NULL END
-      `).run(draftId, sku, file.id, file.name);
+          drive_modified_time = excluded.drive_modified_time,
+          -- ファイルIDだけでなく**更新日時**も同じときにだけ転送/紐づけ状態を引き継ぐ
+          -- (同じIDへ上書きされた場合に古い Cabinet 画像を使い続けない。Codex high)
+          cabinet_location = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id AND IFNULL(draft_sku_images.drive_modified_time,'') = IFNULL(excluded.drive_modified_time,'') THEN draft_sku_images.cabinet_location ELSE NULL END,
+          cabinet_file_id  = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id AND IFNULL(draft_sku_images.drive_modified_time,'') = IFNULL(excluded.drive_modified_time,'') THEN draft_sku_images.cabinet_file_id ELSE NULL END,
+          uploaded_at      = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id AND IFNULL(draft_sku_images.drive_modified_time,'') = IFNULL(excluded.drive_modified_time,'') THEN draft_sku_images.uploaded_at ELSE NULL END,
+          synced_at        = CASE WHEN draft_sku_images.drive_file_id = excluded.drive_file_id AND IFNULL(draft_sku_images.drive_modified_time,'') = IFNULL(excluded.drive_modified_time,'') THEN draft_sku_images.synced_at ELSE NULL END
+      `).run(draftId, sku, file.id, file.name, file.modifiedTime || null);
     }
     if (del.changes > 0) logEvent(db, draftId, 'sku_images_removed', `removed=${del.changes} (フォルダに無いSKU)`, null);
   })();
@@ -492,6 +588,8 @@ export async function transferSkuImagesToCabinet(draftId, { actor = null } = {})
   const db = getDB();
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, error: 'draft_not_found' };
+  // Drive で上書きされていれば転送状態がクリアされ、下の「転送済みスキップ」を通り抜ける
+  await refreshDriveModifiedTimes(draftId);
   const rows = db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draftId);
   if (rows.length === 0) return { ok: false, error: 'SKU画像が未取り込みです (先に「SKU画像を取り込む」)' };
   const folderId = await ensureCabinetFolder(db);
@@ -512,13 +610,14 @@ export async function transferSkuImagesToCabinet(draftId, { actor = null } = {})
       const location = up.data?.location ?? up.data?.data?.location;
       const fileId = up.data?.fileId ?? up.data?.data?.fileId;
       if (up.status !== 200 || !location) throw new Error(up.data?.message || up.data?.error || `HTTP ${up.status}`);
-      // 読み出した drive_file_id を条件に含める (Codex High-2: 転送中に再取り込みで
-      // ファイルが差し替わっていたら 0 行更新 = 旧画像を新しい行へ紐付けない)
+      // 読み出した drive_file_id **と更新日時**を条件に含める (Codex: 転送中に再取り込みや
+      // Drive 上書きが起きていたら 0 行更新 = 旧画像の結果を新しい行へ書き戻さない)
       const upd = db.prepare(`
         UPDATE draft_sku_images SET cabinet_location = ?, cabinet_file_id = ?,
           uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         WHERE draft_id = ? AND sku_code = ? AND drive_file_id = ?
-      `).run(location, fileId ?? null, draftId, row.sku_code, row.drive_file_id);
+          AND IFNULL(drive_modified_time,'') = IFNULL(?,'')
+      `).run(location, fileId ?? null, draftId, row.sku_code, row.drive_file_id, row.drive_modified_time ?? null);
       if (upd.changes === 0) {
         results.push({ sku: row.sku_code, outcome: 'failed', error: '転送中に画像が差し替わりました。もう一度「R-Cabinetへ転送」を実行してください' });
       } else {
@@ -543,6 +642,8 @@ export async function syncSkuImagesToRms(draftId, { actor = null } = {}) {
   const db = getDB();
   const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
   if (!draft) return { ok: false, error: 'draft_not_found' };
+  // 上書きされた画像を楽天へ紐づけないよう、ここでも Drive の最新状態を反映してから引く
+  await refreshDriveModifiedTimes(draftId);
   const rows = db.prepare(`SELECT * FROM draft_sku_images WHERE draft_id = ? AND cabinet_location IS NOT NULL ORDER BY sku_code`).all(draftId);
   if (rows.length === 0) return { ok: false, error: '転送済みのSKU画像がありません (先に「R-Cabinetへ転送」)' };
   const mn = String(draft.ne_code).trim().toLowerCase();
@@ -859,12 +960,12 @@ export function buildDescriptionPreview(db, draftId) {
   const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draftId) || null;
   const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
   // 転送済みの商品画像 (白抜き除く・バナーは §15 どおり salesDescription に入れない) — buildItemPayload と同じ突合
-  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
-  const byFile = new Map(cabinetAll.map((c) => [c.drive_file_id, c.cabinet_location]));
+  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location, drive_modified_time FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
+  const byFile = freshCabinetMap(cabinetAll);
   const whiteBgId = rk.white_bg_drive_file_id || null;
-  const current = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? ORDER BY sort, id')
+  const current = db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ? ORDER BY sort, id')
     .all(draftId).filter((i) => i.drive_file_id !== whiteBgId);
-  const locations = current.filter((i) => byFile.has(i.drive_file_id)).map((i) => byFile.get(i.drive_file_id));
+  const locations = current.filter((i) => byFile.has(cabinetKeyOf(i))).map((i) => byFile.get(cabinetKeyOf(i)));
   const title = String(ai.rakuten_title || draft.name || '').trim();
   const d = composeDescriptions({
     title, ai, specs, pageInfo,
@@ -903,19 +1004,23 @@ export function buildItemPayload(db, draftId) {
     ai[r.kind] = r.content;
   }
   const specs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draftId);
-  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
+  const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location, drive_modified_time FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
   // 白抜き背景画像は images[] ではなく whiteBgImage で送る (検索サムネ用の別枠)
   const whiteBgId = rk.white_bg_drive_file_id || null;
-  const whiteBg = whiteBgId ? cabinetAll.find((c) => c.drive_file_id === whiteBgId) || null : null;
+  const whiteBg = whiteBgId
+    ? cabinetAll.find((c) => c.drive_file_id === whiteBgId
+        && String(c.drive_modified_time || '') === String(rk.white_bg_modified_time || '')) || null
+    : null;
   // 送る画像は「現在の draft_images」と転送履歴の JOIN (Codex R1 Medium-2:
   // 履歴だけから作ると、転送後に削除・差し替えた画像や旧白抜き画像が payload に残る)。
+  // 突合は ID + Drive更新日時 — 上書きされた画像は「未転送」に落として登録を止める (Codex R2 high)。
   // 並びも draft_images の sort に従う
-  const cabinetByFile = new Map(cabinetAll.map((c) => [c.drive_file_id, c.cabinet_location]));
-  const currentImages = db.prepare('SELECT drive_file_id FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draftId)
+  const cabinetByFile = freshCabinetMap(cabinetAll);
+  const currentImages = db.prepare('SELECT drive_file_id, sort, drive_modified_time FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draftId)
     .filter((i) => i.drive_file_id !== whiteBgId);
   const cabinet = currentImages
-    .filter((i) => cabinetByFile.has(i.drive_file_id))
-    .map((i) => ({ cabinet_location: cabinetByFile.get(i.drive_file_id) }));
+    .filter((i) => cabinetByFile.has(cabinetKeyOf(i)))
+    .map((i) => ({ cabinet_location: cabinetByFile.get(cabinetKeyOf(i)) }));
   const untransferredCount = currentImages.length - cabinet.length;
 
   // 発送方法 (アプリ指定 > NEマッピング)。商品ページ表記の表示名と末尾バナーの選択で共通
@@ -938,6 +1043,12 @@ export function buildItemPayload(db, draftId) {
   const attributes = parseAttributes(rk.attributes_json);
   if (attributes === null) reasons.push('商品属性の形式が不正です (name と value を埋めてください)');
   if (cabinet.length === 0) reasons.push('R-Cabinet へ転送済みの画像がありません (先に「画像を転送」)');
+  // TOP画像 (商品画像1) は <商品コード>_top を使う (2026-08-08 スタッフ指摘)。
+  // 枠1 = sort 0。フォルダ取込で _top が無いと枠1が空くので、詰めて別の画像が
+  // TOP になる前に止める (旧データは sort 0 から詰まっているため素通りする)
+  if (currentImages.length > 0 && !currentImages.some((i) => Number(i.sort) === 0)) {
+    reasons.push(`TOP画像がありません。画像フォルダに「${draft.ne_code}_top」を置いて「フォルダから自動セット」をやり直してください`);
+  }
   if (untransferredCount > 0) {
     reasons.push(`商品画像 ${untransferredCount} 枚が R-Cabinet に未転送です (「画像を転送」を実行)`);
   }
@@ -1131,6 +1242,8 @@ export async function registerItem(draftId, { actor = null } = {}) {
   if (rkRow?.genre_id && /^\d+$/.test(String(rkRow.genre_id).trim())) {
     try { await fetchGenreAttributes(db, String(rkRow.genre_id).trim()); } catch (_) { /* best-effort */ }
   }
+  // Drive 側で画像が差し替わっていたら「未転送」に落として登録を止める (Codex R3 high)
+  await refreshDriveModifiedTimes(draftId);
   const built = buildItemPayload(db, draftId);
   if (!built.ok) return { ok: false, reasons: built.reasons };
   const mn = String(built.draft.ne_code).trim().toLowerCase();
