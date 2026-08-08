@@ -1,6 +1,10 @@
 /**
  * select-set の管理画面 (ポータルセッション認証。mount側で requireAppAccess('select-set'))。
  * 選べるセットの登録・手動マッピング・おまけ優先順位の編集と、商品OPの動作確認。
+ *
+ * マスタの「正」は Render 側 (中原さんが普段開くポータル)。
+ * miniPC 側は Render から取得したコピーで動くため、この画面での編集は読み取り専用にする
+ * (miniPCで編集しても次の取得で上書きされるため、書けてしまう方が事故になる)。
  */
 import { Router } from 'express';
 import path from 'path';
@@ -9,7 +13,10 @@ import {
   deleteMapping, deleteSet, initSelectSetDB, listMappings, listOmake, listSets,
   replaceOmake, upsertMapping, upsertSet,
 } from './db.js';
-import { SsError, diagnose, expandForOrder, inspectSet, stockOf } from './service.js';
+import { masterMode, masterStatus, pullMaster } from './master-sync.js';
+import {
+  SsError, canValidateProducts, diagnose, environment, expandForOrder, inspectSet, stockOfSoft,
+} from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -29,6 +36,17 @@ function api(handler) {
   };
 }
 
+/** マスタを編集してよい環境か。miniPC (replica) では書かせない */
+function assertEditable() {
+  if (masterMode() === 'replica') {
+    throw new SsError(
+      'この画面はコピーです。セット・マッピング・おまけの編集は普段のポータル (Render側) で行ってください。'
+      + ' ここで編集しても次回の取得で上書きされます。',
+      { status: 409, code: 'READ_ONLY_REPLICA' },
+    );
+  }
+}
+
 router.get('/', (req, res) => {
   // 末尾スラッシュなしで開くと相対URLの解決基準がずれるため正規URLへ寄せる (easy-ship と同パターン)
   const qIdx = req.originalUrl.indexOf('?');
@@ -42,10 +60,32 @@ router.get('/', (req, res) => {
   });
 });
 
+// ---- 環境・診断 ----
+
+/** 画面が最初に叩く。マスタの正がどちらか・商品マスタが引けるかで表示を出し分ける */
+router.get('/api/env', api(() => environment()));
+
+/**
+ * 診断。「画面では解決できないのに手元のスクリプトでは解決できる」ときに、
+ * サーバープロセスが実際に何を見ているか (cwd / DATA_DIR / 商品マスタの件数 / 認証情報の有無) を出す。
+ * 値そのものは返さず、有無と件数だけ。
+ */
+router.get('/api/diag', api(() => diagnose()));
+
+/** miniPC側で「今すぐRenderからマスタを取り直す」 */
+router.post('/api/master/pull', api(async () => {
+  if (masterMode() !== 'replica') {
+    throw new SsError('この環境はマスタの取得元ではありません', { status: 409, code: 'NOT_REPLICA' });
+  }
+  const r = await pullMaster();
+  return { ...r, status: masterStatus() };
+}));
+
 // ---- セット ----
 router.get('/api/sets', api(() => ({ sets: listSets({ includeInactive: true }) })));
 
 router.post('/api/sets', api((req) => {
+  assertEditable();
   const setCode = String(req.body?.setCode || '').trim();
   if (!setCode) throw new SsError('セット商品コードを入力してください');
   upsertSet({
@@ -58,6 +98,7 @@ router.post('/api/sets', api((req) => {
 }));
 
 router.delete('/api/sets/:code', api((req) => {
+  assertEditable();
   deleteSet(String(req.params.code));
   return { ok: true };
 }));
@@ -71,44 +112,52 @@ router.get('/api/sets/:code/inspect', api((req) => inspectSet(String(req.params.
 router.get('/api/mappings', api((req) => ({ mappings: listMappings(req.query.setCode || null) })));
 
 router.post('/api/mappings', api((req) => {
+  assertEditable();
   const setCode = String(req.body?.setCode || '').trim();
   const optionText = String(req.body?.optionText || '').trim();
   const productCode = String(req.body?.productCode || '').trim();
   if (!setCode || !optionText || !productCode) throw new SsError('セット・選択肢・商品コードは必須です');
-  if (!stockOf(productCode)) {
-    throw new SsError(`商品コード「${productCode}」がNE商品マスタに見つかりません`, { code: 'UNKNOWN_PRODUCT' });
+  // 商品マスタが引ける環境でだけ実在チェックする。
+  // Render には warehouse.db が無いので、ここで弾くと登録そのものができなくなる
+  let warning = null;
+  if (canValidateProducts()) {
+    if (!stockOfSoft(productCode)) {
+      throw new SsError(`商品コード「${productCode}」がNE商品マスタに見つかりません`, { code: 'UNKNOWN_PRODUCT' });
+    }
+  } else {
+    warning = '商品コードの実在チェックはこの環境では行えません (登録は保存しました)';
   }
   const id = upsertMapping({ id: req.body?.id, setCode, optionText, productCode, note: req.body?.note || '' });
-  return { ok: true, id };
+  return { ok: true, id, warning };
 }));
 
 router.delete('/api/mappings/:id', api((req) => {
+  assertEditable();
   deleteMapping(Number(req.params.id));
   return { ok: true };
 }));
 
 // ---- おまけ優先順位 ----
 router.get('/api/omake', api(() => ({
-  omake: listOmake().map((r) => ({ ...r, ...(stockOf(r.product_code) || { name: '', available: null }) })),
+  omake: listOmake().map((r) => ({ ...r, ...(stockOfSoft(r.product_code) || { name: '', available: null }) })),
 })));
 
 router.post('/api/omake', api((req) => {
+  assertEditable();
   const codes = Array.isArray(req.body?.codes) ? req.body.codes : [];
   if (!codes.length) throw new SsError('おまけ候補が空です');
-  const unknown = codes.filter((c) => !stockOf(c));
-  if (unknown.length) {
-    throw new SsError(`NE商品マスタに無い商品コード: ${unknown.join(', ')}`, { code: 'UNKNOWN_PRODUCT' });
+  let warning = null;
+  if (canValidateProducts()) {
+    const unknown = codes.filter((c) => !stockOfSoft(c));
+    if (unknown.length) {
+      throw new SsError(`NE商品マスタに無い商品コード: ${unknown.join(', ')}`, { code: 'UNKNOWN_PRODUCT' });
+    }
+  } else {
+    warning = '商品コードの実在チェックはこの環境では行えません (並びは保存しました)';
   }
   const n = replaceOmake(codes);
-  return { ok: true, count: n };
+  return { ok: true, count: n, warning };
 }));
-
-/**
- * 診断。「画面では解決できないのに手元のスクリプトでは解決できる」ときに、
- * サーバープロセスが実際に何を見ているか (cwd / DATA_DIR / 商品マスタの件数 / 認証情報の有無) を出す。
- * 値そのものは返さず、有無と件数だけ。
- */
-router.get('/api/diag', api(() => diagnose()));
 
 // ---- 動作確認 ----
 router.post('/api/try', api((req) => expandForOrder({

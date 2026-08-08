@@ -9,6 +9,7 @@ import { Router } from 'express';
 import crypto from 'crypto';
 import express from 'express';
 import { SsError, expandForOrder } from './service.js';
+import { ensureMasterFresh } from './master-sync.js';
 import { listSets } from './db.js';
 
 const router = Router();
@@ -62,7 +63,11 @@ router.get('/api/v1/ping', api(() => ({ pong: true })));
  * 拡張はこれを使って「この明細行に展開ボタンを出すか」を判定する
  * (伝票画面を開くたびに展開APIを叩かないで済む)
  */
-router.get('/api/v1/sets', api(() => ({ setCodes: listSets().map((s) => s.set_code) })));
+router.get('/api/v1/sets', api(async () => {
+  // マスタは Render 側が正。必要なら取りに行く (失敗しても前回の内容で答える)
+  await ensureMasterFresh();
+  return { setCodes: listSets().map((s) => s.set_code) };
+}));
 
 /**
  * 商品OPを明細行に展開する。

@@ -23,7 +23,7 @@ import { MANUAL_MAPPINGS, OMAKE_PRIORITY, SET_CODES } from './seed-data.js';
 export const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'select-set.db');
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 let db = null;
 
@@ -123,7 +123,31 @@ const MIGRATIONS = {
     `);
     seedInitialData();
   },
+
+  // マスタ (セット・手動マッピング・おまけ) は Render 側が正で、miniPC は取りに行く。
+  // その取得状況を持つための入れ物 (2026-08-08)。
+  2: () => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS ss_meta (
+        key        TEXT PRIMARY KEY,
+        value      TEXT,
+        updated_at TEXT NOT NULL
+      );
+    `);
+  },
 };
+
+export function getMeta(key) {
+  const r = getDB().prepare('SELECT value FROM ss_meta WHERE key = ?').get(String(key));
+  return r ? r.value : null;
+}
+
+export function setMeta(key, value) {
+  getDB().prepare(`
+    INSERT INTO ss_meta (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(String(key), value == null ? null : String(value), utcNow());
+}
 
 /** 初回だけ seed-data.js の内容を投入する (以後は管理画面で編集する) */
 function seedInitialData() {
@@ -227,6 +251,63 @@ export function upsertMapping({ id, setCode, optionText, productCode, note = '' 
 
 export function deleteMapping(id) {
   getDB().prepare('DELETE FROM ss_mappings WHERE id = ?').run(id);
+}
+
+/**
+ * マスタ (セット・手動マッピング・おまけ) を丸ごと入れ替える。
+ * Render 側が正で miniPC が取りに行く運用のため、取得できた内容で完全に置き換える
+ * (差分マージにすると「Renderで消した行がminiPCに残る」が起きる)。
+ * ss_rms_cache は miniPC 側で育てるキャッシュなので触らない。
+ */
+export function replaceMaster({ sets = [], mappings = [], omake = [] }) {
+  const now = utcNow();
+  const d = getDB();
+  d.transaction(() => {
+    d.prepare('DELETE FROM ss_mappings').run();
+    d.prepare('DELETE FROM ss_sets').run();
+    d.prepare('DELETE FROM ss_omake').run();
+
+    const insSet = d.prepare(
+      'INSERT INTO ss_sets (set_code, label, is_active, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+    );
+    for (const s of sets) {
+      if (!s?.set_code) continue;
+      insSet.run(String(s.set_code), String(s.label || ''), s.is_active ? 1 : 0, String(s.note || ''),
+        s.created_at || now, s.updated_at || now);
+    }
+
+    const insMap = d.prepare(`
+      INSERT OR IGNORE INTO ss_mappings (set_code, option_text, option_key, product_code, note, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const m of mappings) {
+      if (!m?.set_code || !m?.option_text || !m?.product_code) continue;
+      insMap.run(String(m.set_code), String(m.option_text),
+        m.option_key || normalizeValue(m.option_text), String(m.product_code),
+        String(m.note || ''), m.created_at || now, m.updated_at || now);
+    }
+
+    const insOmake = d.prepare(
+      'INSERT OR IGNORE INTO ss_omake (rank, product_code, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+    );
+    omake.forEach((o, i) => {
+      const code = typeof o === 'string' ? o : o?.product_code;
+      if (!code) return;
+      insOmake.run(i + 1, String(code), typeof o === 'string' ? '' : String(o.note || ''), now, now);
+    });
+  })();
+  return { sets: sets.length, mappings: mappings.length, omake: omake.length };
+}
+
+/** マスタ配信用のスナップショット (Render → miniPC) */
+export function exportMaster() {
+  const d = getDB();
+  return {
+    sets: d.prepare('SELECT set_code, label, is_active, note, created_at, updated_at FROM ss_sets ORDER BY set_code').all(),
+    mappings: d.prepare('SELECT set_code, option_text, option_key, product_code, note, created_at, updated_at FROM ss_mappings ORDER BY set_code, option_text').all(),
+    omake: d.prepare('SELECT rank, product_code, note FROM ss_omake ORDER BY rank').all(),
+    exportedAt: utcNow(),
+  };
 }
 
 /** おまけ優先順位を丸ごと置き換える (並べ替えは順番の入れ替えなので全置換が素直) */
