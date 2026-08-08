@@ -43,6 +43,19 @@ process.env.RENDER = 'tru'; // 打ち間違い
 ok(ms.masterMode() === 'replica', 'RENDER の打ち間違いを Render 扱いしない');
 delete process.env.RENDER;
 
+console.log('\n=== 配信URLの組み立て ===');
+// 🚨 RENDER_MIRROR_URL は末尾にパスが付いている (実測 https://<host>/apps/mirror)。
+//   単純に連結すると /apps/mirror/apps/select-set/... になって404になる (2026-08-08 に実際に踏んだ)
+process.env.RENDER_MIRROR_URL = 'https://bfaith-portal.onrender.com/apps/mirror';
+ok(ms.masterStatus().remote === 'https://bfaith-portal.onrender.com/apps/select-set/master-api/export',
+  `取得先にパスが付いていてもホストだけを使う (実際: ${ms.masterStatus().remote})`);
+process.env.RENDER_MIRROR_URL = 'https://example.com/';
+ok(ms.masterStatus().remote === 'https://example.com/apps/select-set/master-api/export', '末尾スラッシュでも壊れない');
+process.env.SELECT_SET_MASTER_URL = 'https://other.example/custom';
+ok(ms.masterStatus().remote === 'https://other.example/custom', '明示指定があればそれを使う');
+delete process.env.SELECT_SET_MASTER_URL;
+process.env.RENDER_MIRROR_URL = 'https://example.invalid';
+
 console.log('\n=== 配信 (export) ===');
 const snap = db.exportMaster();
 ok(snap.sets.length === 9 && snap.mappings.length === 214 && snap.omake.length === 10,

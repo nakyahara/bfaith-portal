@@ -30,9 +30,22 @@ export function masterMode() {
   return 'replica';                                      // miniPC = Renderから取りに行く
 }
 
+/**
+ * マスタ配信のURL。
+ * 🚨 RENDER_MIRROR_URL は末尾にパスが付いている (実測: https://<host>/apps/mirror)。
+ *   そのまま連結すると /apps/mirror/apps/select-set/... になって404になる (2026-08-08 に踏んだ)。
+ *   絶対パスで解決して host だけを使う。
+ */
 function remoteUrl() {
-  const base = String(process.env.RENDER_MIRROR_URL || '').replace(/\/+$/, '');
-  return `${base}/apps/select-set/master-api/export`;
+  const explicit = String(process.env.SELECT_SET_MASTER_URL || '').trim();
+  if (explicit) return explicit;
+  const base = String(process.env.RENDER_MIRROR_URL || '').trim();
+  if (!base) return '';
+  try {
+    return new URL('/apps/select-set/master-api/export', base).toString();
+  } catch {
+    return '';
+  }
 }
 
 /**
