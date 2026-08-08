@@ -1,24 +1,17 @@
 {
   "manifest_version": 3,
   "name": "B-Faith FBA納品 福通伝票CSV",
-  "version": "0.1.0",
-  "description": "Amazon Seller Central の納品プラン画面から、福山通運 iS-2 に取り込む送り状CSVを作る (社内用)",
-  "permissions": ["storage"],
-  "host_permissions": [
-    "https://wh.bfaith-wh.uk/*",
-    "http://localhost/*"
-  ],
-  "background": { "service_worker": "sw.js" },
+  "version": "0.2.0",
+  "description": "Amazon Seller Central の納品プラン画面から、福山通運 iS-2 に取り込む送り状CSVを作る (社内用・通信なし)",
   "content_scripts": [
     {
       "matches": [
         "https://sellercentral.amazon.co.jp/*",
         "https://sellercentral-japan.amazon.com/*"
       ],
-      "js": ["content.js"],
+      "js": ["fukutsu-csv.js", "page-parse.js", "content.js"],
       "css": ["style.css"],
       "run_at": "document_idle"
     }
-  ],
-  "options_page": "options.html"
+  ]
 }
