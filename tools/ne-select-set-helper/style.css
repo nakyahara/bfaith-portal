@@ -1,0 +1,54 @@
+/* NEの伝票画面に差し込むパネル。NE側のCSSと衝突しないよう bf- で始まるクラスだけ使う */
+#bf-select-set-panel {
+  border: 2px solid #1971c2;
+  border-radius: 8px;
+  background: #fff;
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  font-family: "Segoe UI", Meiryo, sans-serif;
+  font-size: 13px;
+  color: #212529;
+}
+#bf-select-set-panel .bf-head {
+  font-weight: bold;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+#bf-select-set-panel .bf-head .bf-hint {
+  display: block;
+  font-weight: normal;
+  font-size: 12px;
+  color: #c92a2a;
+  background: #fff5f5;
+  border: 1px solid #ffc9c9;
+  border-radius: 5px;
+  padding: 6px 8px;
+  margin-top: 5px;
+}
+#bf-select-set-panel .bf-row { border-top: 1px solid #e9ecef; padding: 8px 0 4px; }
+#bf-select-set-panel .bf-row:first-of-type { border-top: none; }
+#bf-select-set-panel .bf-rowhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+#bf-select-set-panel .bf-hint { color: #868e96; font-size: 12px; }
+#bf-select-set-panel .bf-mono { font-family: Consolas, monospace; }
+#bf-select-set-panel .bf-btn {
+  padding: 4px 12px; cursor: pointer; border: 1px solid #1971c2; border-radius: 5px;
+  background: #1971c2; color: #fff; font-size: 12px;
+}
+#bf-select-set-panel .bf-btn:disabled { opacity: .5; cursor: default; }
+#bf-select-set-panel .bf-status { font-size: 12px; }
+#bf-select-set-panel .bf-status.bf-ok { color: #2b8a3e; }
+#bf-select-set-panel .bf-status.bf-err { color: #c92a2a; }
+#bf-select-set-panel .bf-box { border-radius: 6px; padding: 8px 10px; margin: 6px 0; font-size: 12px; }
+#bf-select-set-panel .bf-box.bf-err { background: #fff5f5; border: 1px solid #ffc9c9; color: #c92a2a; }
+#bf-select-set-panel .bf-box.bf-warn { background: #fff9db; border: 1px solid #ffe066; color: #856404; }
+#bf-select-set-panel .bf-box ul { margin: 4px 0 0; padding-left: 18px; }
+#bf-select-set-panel table.bf-table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+#bf-select-set-panel .bf-table th, #bf-select-set-panel .bf-table td {
+  border: 1px solid #e9ecef; padding: 3px 7px; text-align: left;
+}
+#bf-select-set-panel .bf-table th { background: #f8f9fa; }
+#bf-select-set-panel .bf-omake { margin: 6px 0; }
+#bf-select-set-panel .bf-cand { display: block; padding: 2px 0; font-size: 12px; cursor: pointer; }
+#bf-select-set-panel .bf-cand.bf-chosen { font-weight: bold; }
+#bf-select-set-panel .bf-zero { color: #c92a2a; }
+#bf-select-set-panel .bf-actions { margin-top: 6px; }
