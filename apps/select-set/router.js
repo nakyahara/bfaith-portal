@@ -23,8 +23,16 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 
-/** 拡張機能のzipに入れない開発用ファイル (Googleに提出するパッケージに社内メモを混ぜないため) */
+/**
+ * 拡張機能のzipに入れないもの (Googleに提出するパッケージに社内メモや素材を混ぜないため)。
+ * store/ にはストア掲載用のスクリーンショット素材が入っている。
+ */
 const DEV_ONLY_FILES = new Set(['make-icons.mjs', 'STORE_LISTING.md']);
+const DEV_ONLY_DIRS = ['store/'];
+
+function isDevOnly(name) {
+  return DEV_ONLY_FILES.has(name) || DEV_ONLY_DIRS.some((d) => name === d.slice(0, -1) || name.startsWith(d));
+}
 
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗時は起動を止める
 initSelectSetDB();
@@ -192,7 +200,7 @@ router.get('/download/extension.zip', (req, res) => {
   archive.pipe(res);
   // 開発用ファイルは同梱しない。特に STORE_LISTING.md は提出手順の社内メモなので、
   // Google に出すパッケージに入れたくない
-  archive.directory(dir, false, (entry) => (DEV_ONLY_FILES.has(entry.name) ? false : entry));
+  archive.directory(dir, false, (entry) => (isDevOnly(entry.name) ? false : entry));
   archive.finalize();
 });
 
