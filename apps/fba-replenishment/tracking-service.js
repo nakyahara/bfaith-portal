@@ -168,4 +168,40 @@ export async function verifyTracking(target, items) {
   return { visible: true, matched: a === b, status: d.status, got };
 }
 
+/** Seller Central のURL (…?wf=wfxxxx…) からもプランIDを受け取れるようにする */
+export function extractPlanId(input) {
+  const s = String(input ?? '').trim();
+  if (!s) return null;
+  const m = s.match(/[?&]wf=([^&\s]+)/i);
+  const id = m ? decodeURIComponent(m[1]) : s;
+  return /^wf[0-9a-f-]{8,}$/i.test(id) ? id : null;
+}
+
+/**
+ * 1つの納品プランの shipment 一覧を返す (伝票発行CSVを作るため)。
+ * findOpenShipments と違い **箱があるものは status を問わず全部返す**。
+ * 伝票は「ラベルを作った後・出荷前」に発行するので、READY_TO_SHIP に限ると早すぎて拾えない。
+ * @returns {Promise<{planName: string, shipments: Array}>}
+ */
+export async function getPlanShipments(inboundPlanId) {
+  const full = await call(`${V}/inboundPlans/${inboundPlanId}`);
+  const out = [];
+  for (const s of full.shipments ?? []) {
+    const base = `${V}/inboundPlans/${inboundPlanId}/shipments/${s.shipmentId}`;
+    const d = await call(base);
+    const b = await call(`${base}/boxes?pageSize=100`);
+    const boxes = b.boxes ?? [];
+    out.push({
+      shipmentId: s.shipmentId,
+      shipmentConfirmationId: d.shipmentConfirmationId,
+      fcCode: d.destination?.warehouseId ?? '',
+      address: d.destination?.address ?? null,
+      status: d.status,
+      boxCount: boxes.length,
+      hasTracking: Boolean(d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
+    });
+  }
+  return { planName: full.name || '', planStatus: full.status, shipments: out };
+}
+
 export const _internal = { MARKETPLACE };
