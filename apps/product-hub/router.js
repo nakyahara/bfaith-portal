@@ -16,7 +16,7 @@ import {
   getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, isKnownImageFileId,
+  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
 } from './db.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
@@ -32,7 +32,7 @@ import {
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
 } from './services/rakuten-listing.js';
-import { assignImageSlots, MAX_IMAGE_SLOTS } from './lib/folder-import.js';
+import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
 import { computeProfit, TAKE_RATE } from './lib/profit.js';
 import { listSpManualKeywordsByAsin } from '../keyword-researcher/ads-api.js';
@@ -138,7 +138,8 @@ router.get('/', (req, res) => {
   const params = statusFilter ? [statusFilter] : [];
   const drafts = db.prepare(`
     SELECT d.*,
-      (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id
+      (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
+      (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d ${where}
     ORDER BY d.updated_at DESC
     LIMIT 500
@@ -146,7 +147,7 @@ router.get('/', (req, res) => {
   // NE 判定は一覧では 2 クエリで一括解決する (行ごとに引くと N+1 になる)
   const variations = resolveVariationGroupsBatch(db, drafts.map((d) => d.ne_code));
   for (const d of drafts) {
-    d.thumb = d.first_image_id ? thumbnailUrl(d.first_image_id, 160) : null;
+    d.thumb = d.first_image_id ? thumbnailUrl(d.first_image_id, 160, d.first_image_mtime) : null;
     d.variation = variations.get(String(d.ne_code || '').trim().toLowerCase())
       || { kind: 'unknown', groupKey: d.ne_code, memberCount: 0, isChild: false };
   }
@@ -183,7 +184,7 @@ router.get('/detail/:id', (req, res) => {
   const refs = db.prepare('SELECT * FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
   const images = db.prepare('SELECT * FROM draft_images WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
   for (const img of images) {
-    img.thumb = thumbnailUrl(img.drive_file_id, 320);
+    img.thumb = thumbnailUrl(img.drive_file_id, 320, img.drive_modified_time);
     img.view_url = img.drive_url || fileViewUrl(img.drive_file_id);
   }
   const specs = db.prepare('SELECT * FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
@@ -480,14 +481,21 @@ router.get('/api/thumb/:fileId', async (req, res) => {
   if (!DRIVE_FILE_ID_PATTERN.test(fileId)) return res.status(400).json({ ok: false, error: 'invalid file id' });
   // product-hub に画像として登録済みの ID だけ取得を許す
   // (SA は Drive を広く読めるため、無制限だと任意 ID を覗ける confused-deputy になる)
-  if (!isKnownImageFileId(getDB(), fileId)) return res.status(404).json({ ok: false, error: 'unknown image' });
+  const imgRef = imageRefOfFileId(getDB(), fileId);
+  if (!imgRef) return res.status(404).json({ ok: false, error: 'unknown image' });
   const w = Number.parseInt(String(req.query.w || ''), 10);
   const width = THUMB_WIDTHS.includes(w) ? w : 320;
+  // v = Drive の更新日時 (epoch ms)。DB に記録された期待値と一致するときだけ採用する
+  // (任意の v を通すと、同じ画像を無数のキーで再生成させてキャッシュを汚せる。Codex low)。
+  // 一致すれば長期キャッシュ、無い/不一致なら上書きに追従できないため短命 (Codex high)
+  const expected = imgRef.modifiedTime ? Date.parse(imgRef.modifiedTime) : NaN;
+  const version = Number.isFinite(expected) && String(req.query.v || '') === String(expected)
+    ? String(expected) : '';
   try {
-    const { buf } = await getDriveThumbnail(fileId, width);
+    const { buf } = await getDriveThumbnail(fileId, width, version);
     res.set('Content-Type', 'image/jpeg'); // sharp 再エンコード済み (service 側で固定)
     res.set('X-Content-Type-Options', 'nosniff');
-    res.set('Cache-Control', 'private, max-age=86400');
+    res.set('Cache-Control', version ? 'private, max-age=86400, immutable' : 'private, max-age=120');
     res.send(buf);
   } catch (e) {
     // 詳細はログのみ。<img> は壊れ表示のままにする (SA 権限なしはフォルダ取込時に別途エラーが出る)
@@ -498,9 +506,9 @@ router.get('/api/thumb/:fileId', async (req, res) => {
   }
 });
 
-// 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_番号」ファイルをスロットへ自動セット。
-// _00 = 白抜き背景 (whiteBgImage) / _01〜_20 = 楽天商品画像 1〜20 (並び順 = sort)。
-// 番号付き画像が1枚でも見つかったら draft_images は全置き換え (フォルダが正)。
+// 画像フォルダ一括取り込み: フォルダ内の「<商品コード>_top / _番号」ファイルをスロットへ自動セット。
+// _00 = 白抜き背景 (whiteBgImage) / _top = 商品画像1 (楽天のTOP画像) / _01〜_19 = 商品画像2〜20。
+// 該当画像が1枚でも見つかったら draft_images は全置き換え (フォルダが正)。
 router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
@@ -525,7 +533,7 @@ router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
   if (!assigned.codeMatched) {
     return res.status(400).json({
       ok: false,
-      error: `「${draft.ne_code}_番号」で始まる画像が見つかりませんでした。ファイル名を「${draft.ne_code}_00 (白抜き)」「${draft.ne_code}_01〜_${MAX_IMAGE_SLOTS}」の形式にしてください`,
+      error: `「${draft.ne_code}_…」の画像が見つかりませんでした。ファイル名を「${draft.ne_code}_top (商品画像1=TOP)」「${draft.ne_code}_01〜_${MAX_NUMBERED_IMAGE} (商品画像2〜${MAX_IMAGE_SLOTS})」「${draft.ne_code}_00 (白抜き背景)」の形式にしてください`,
       skipped: assigned.skipped, conflicts: assigned.conflicts,
     });
   }
@@ -540,14 +548,15 @@ router.post('/api/drafts/:id/images/import-folder', async (req, res) => {
   if (!assigned.whiteBg && assigned.slots.length === 0) {
     return res.status(400).json({
       ok: false,
-      error: `_00〜_${MAX_IMAGE_SLOTS} の番号付き画像が見つかりませんでした`,
+      error: `_top / _00〜_${MAX_NUMBERED_IMAGE} の画像が見つかりませんでした`,
       skipped: assigned.skipped, conflicts: assigned.conflicts,
     });
   }
   const db = getDB();
   const warnings = [];
-  if (assigned.missingNums.length > 0) {
-    warnings.push(`_${assigned.missingNums.map((n) => String(n).padStart(2, '0')).join(' / _')} が欠番です。楽天へは番号順に詰めて登録されます`);
+  if (assigned.missingLabels.length > 0) {
+    warnings.push(`${assigned.missingLabels.join(' / ')} がありません。楽天へは前に詰めて登録されます`
+      + (assigned.missingLabels.includes('_top') ? ' (TOP画像=商品画像1 が未設定です)' : ''));
   }
   if (!assigned.whiteBg) {
     const existingWb = db.prepare('SELECT white_bg_drive_file_id FROM draft_rakuten WHERE draft_id = ?').get(draft.id)?.white_bg_drive_file_id;
