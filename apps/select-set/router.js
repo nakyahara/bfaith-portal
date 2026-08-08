@@ -9,7 +9,7 @@ import {
   deleteMapping, deleteSet, initSelectSetDB, listMappings, listOmake, listSets,
   replaceOmake, upsertMapping, upsertSet,
 } from './db.js';
-import { SsError, expandForOrder, inspectSet, stockOf } from './service.js';
+import { SsError, diagnose, expandForOrder, inspectSet, stockOf } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -102,6 +102,13 @@ router.post('/api/omake', api((req) => {
   const n = replaceOmake(codes);
   return { ok: true, count: n };
 }));
+
+/**
+ * 診断。「画面では解決できないのに手元のスクリプトでは解決できる」ときに、
+ * サーバープロセスが実際に何を見ているか (cwd / DATA_DIR / 商品マスタの件数 / 認証情報の有無) を出す。
+ * 値そのものは返さず、有無と件数だけ。
+ */
+router.get('/api/diag', api(() => diagnose()));
 
 // ---- 動作確認 ----
 router.post('/api/try', api((req) => expandForOrder({

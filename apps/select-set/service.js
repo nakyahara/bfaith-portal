@@ -14,7 +14,7 @@ import { rakutenRequest } from '../warehouse/rakuten-client.js';
 import { getDB as getWarehouseDB } from '../warehouse/db.js';
 import { buildCatalog, expandOp, toPasteBlocks } from './expand.js';
 import {
-  getRmsCache, listMappings, listOmake, listSets, putRmsCache,
+  getDB, getRmsCache, listMappings, listOmake, listSets, putRmsCache,
 } from './db.js';
 
 export class SsError extends Error {
@@ -157,6 +157,53 @@ export async function expandForOrder({ setCode, op, quantity = 1, force = false 
       stockAsOf: '日次同期 (最大24時間前)',
     },
   };
+}
+
+/**
+ * 診断: サーバープロセスが実際に何を見ているかを返す。
+ * 「手元のスクリプトでは解決できるのに画面では解決できない」ときの切り分け用。
+ * 秘密の値は返さず、有無と件数だけにする。
+ */
+export function diagnose() {
+  const out = {
+    cwd: process.cwd(),
+    dataDir: process.env.DATA_DIR || '(未設定 → cwd/data)',
+    rakutenCreds: !!process.env.RAKUTEN_SERVICE_SECRET && !!process.env.RAKUTEN_LICENSE_KEY,
+    extTokenSet: !!process.env.SELECT_SET_EXT_TOKEN,
+    rmsTtlMinutes: RMS_TTL_MS / 60000,
+  };
+  try {
+    const db = getWarehouseDB();
+    out.warehouse = {
+      file: db.name,
+      products: db.prepare('SELECT COUNT(*) AS n FROM raw_ne_products').get().n,
+      sampleStock: (() => {
+        const r = db.prepare('SELECT 商品名 AS n, 在庫数 AS z, 引当数 AS h FROM raw_ne_products WHERE 商品コード = ?').get('ae-plumeria10');
+        return r ? { name: r.n, available: (Number(r.z) || 0) - (Number(r.h) || 0) } : null;
+      })(),
+    };
+  } catch (e) {
+    out.warehouse = { error: String(e.message || e) };
+  }
+  try {
+    const p = loadProducts();
+    out.productCache = { codes: p.codes.size, stock: p.stock.size, loadedAtMsAgo: Date.now() - p.at };
+  } catch (e) {
+    out.productCache = { error: String(e.message || e) };
+  }
+  try {
+    const d = getDB();
+    out.selectSetDb = {
+      file: d.name,
+      sets: d.prepare('SELECT COUNT(*) AS n FROM ss_sets').get().n,
+      mappings: d.prepare('SELECT COUNT(*) AS n FROM ss_mappings').get().n,
+      omake: d.prepare('SELECT COUNT(*) AS n FROM ss_omake').get().n,
+      rmsCache: d.prepare('SELECT set_code, fetched_at, error, LENGTH(payload) AS len FROM ss_rms_cache').all(),
+    };
+  } catch (e) {
+    out.selectSetDb = { error: String(e.message || e) };
+  }
+  return out;
 }
 
 /** 管理画面用: セットの選択肢定義を人が読める形で返す */
