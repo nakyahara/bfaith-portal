@@ -189,9 +189,16 @@ function ensureDb(req, res, next) {
 
 router.use(ensureDb);
 
-// 開発用ファイルは配布zipに入れない。特に STORE_LISTING.md は提出手順の社内メモなので
-// Google に出すパッケージに含めたくない (select-set と同じ方針)
+/**
+ * 拡張機能のzipに入れないもの (Googleに提出するパッケージに社内メモや素材を混ぜないため)。
+ * store/ にはストア掲載用のスクリーンショット素材が入っている。select-set と同じ方針。
+ */
 const EXT_DEV_ONLY_FILES = new Set(['make-icons.mjs', 'STORE_LISTING.md']);
+const EXT_DEV_ONLY_DIRS = ['store/'];
+
+function isExtDevOnly(name) {
+  return EXT_DEV_ONLY_FILES.has(name) || EXT_DEV_ONLY_DIRS.some((d) => name === d.slice(0, -1) || name.startsWith(d));
+}
 
 /**
  * FBA納品 福通伝票CSV の Chrome拡張を zip で配る。
@@ -217,7 +224,7 @@ router.get('/download/extension.zip', (req, res) => {
     res.destroy();
   });
   archive.pipe(res);
-  archive.directory(dir, false, (entry) => (EXT_DEV_ONLY_FILES.has(entry.name) ? false : entry));
+  archive.directory(dir, false, (entry) => (isExtDevOnly(entry.name) ? false : entry));
   archive.finalize();
 });
 
