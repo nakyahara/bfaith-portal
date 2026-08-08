@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>store screenshot</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1280px; height: 800px; overflow: hidden;
+    font-family: "Meiryo", "Segoe UI", sans-serif;
+    background: #eef2f6; color: #212529;
+    display: flex; flex-direction: column; justify-content: center; padding: 34px 48px;
+  }
+  h1 { font-size: 37px; margin-bottom: 10px; }
+  .lead { font-size: 18px; color: #495057; margin-bottom: 30px; }
+  .cols { display: flex; gap: 22px; align-items: flex-start; }
+  .col { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+  .caption { font-size: 16.5px; font-weight: bold; margin-bottom: 8px; color: #343a40; }
+  .caption span { font-weight: normal; color: #868e96; }
+  .box { background: #fff; border: 1px solid #ced4da; border-radius: 8px; padding: 12px 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { border-bottom: 1px solid #e9ecef; padding: 7px 7px; text-align: left; white-space: nowrap; }
+  th { background: #f1f3f5; font-size: 12px; color: #495057; }
+  .mono { font-family: Consolas, monospace; }
+  .muted { color: #adb5bd; }
+  .warn-row td { background: #fff5f5; color: #c92a2a; }
+  .panel { border: 2px solid #1971c2; border-radius: 8px; background: #fff; padding: 10px 12px; margin-bottom: 12px; }
+  .panel-head { font-weight: bold; font-size: 16.5px; margin-bottom: 6px; }
+  .alert { font-size: 13px; color: #c92a2a; background: #fff5f5; border: 1px solid #ffc9c9;
+           border-radius: 5px; padding: 6px 8px; margin-bottom: 8px; }
+  .btn { display: inline-block; background: #1971c2; color: #fff; border-radius: 5px;
+         padding: 6px 18px; font-size: 14px; }
+  .arrow { font-size: 36px; color: #1971c2; width: 40px; text-align: center; margin-top: 90px; }
+  .foot { margin-top: 32px; font-size: 14px; color: #868e96; }
+  .tag { display:inline-block; background:#e7f5ff; color:#1971c2; border-radius:4px; padding:1px 7px; font-size:11.5px; }
+</style>
+</head>
+<body>
+  <h1>選べる〇種セットを、実際の商品の明細行に展開</h1>
+  <div class="lead">
+    お客様が選んだ内容は受注明細の「商品オプション」に記録されています。それを読み取って、実際の商品コードの行に変換します。
+  </div>
+
+  <div class="cols">
+    <div class="col">
+      <div class="caption">これまで <span>— 仮の商品コードのままで在庫を引き当てられない</span></div>
+      <div class="box">
+        <table>
+          <tr><th>商品コード</th><th>商品オプション</th><th>受注数</th><th>引当数</th></tr>
+          <tr class="warn-row">
+            <td class="mono">selectae10-5</td>
+            <td>1本目:プルメリア／2本目:バーベナ／3本目:…</td>
+            <td>1</td><td>0</td>
+          </tr>
+        </table>
+        <div style="margin-top:14px;font-size:14px;color:#c92a2a">
+          仮の商品コードは商品マスタに無いため、引当ができません。<br>
+          担当者が1行ずつ手で入力していました。
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow">▶</div>
+
+    <div class="col">
+      <div class="caption">この拡張機能を使うと <span>— ボタン1つで明細行を作成</span></div>
+      <div class="panel">
+        <div class="panel-head">選べるセット展開</div>
+        <div class="alert">保存時の「商品計が一致していません。再計算しますか?」は必ず【キャンセル】</div>
+        <span class="mono" style="font-size:14px">selectae10-5</span>
+        <span class="muted" style="font-size:14px">受注数 1</span>
+        <span class="btn">展開する</span>
+      </div>
+      <div class="box" style="flex:0">
+        <table>
+          <tr><th>枠</th><th>商品コード</th><th>商品名</th><th>数量</th></tr>
+          <tr><td>1本目</td><td class="mono">ae-plumeria10</td><td>アロマエッセンス プルメリア</td><td>1</td></tr>
+          <tr><td>2本目</td><td class="mono">ae-verbena10</td><td>アロマエッセンス バーベナ</td><td>1</td></tr>
+          <tr><td>3本目</td><td class="mono">ae-fruitmix10</td><td>アロマエッセンス フルーツミックス</td><td>1</td></tr>
+          <tr><td>4本目</td><td class="mono">ae-freesiapear10</td><td>アロマエッセンス フリージア＆ペア</td><td>1</td></tr>
+          <tr><td>5本目</td><td class="mono">jasminemusk10</td><td>アロマエッセンス ジャスミン&amp;ムスク</td><td>1</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="foot">
+    <span class="tag">社内専用</span>
+    　変換できない選択肢が1つでもある場合は、何も入力せずに停止します。保存は担当者が行います。
+    　個人情報は読み取りません（扱うのは商品コードと数量のみ）。
+  </div>
+</body>
+</html>
