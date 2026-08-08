@@ -30,6 +30,18 @@
    APIトークン (`SELECT_SET_EXT_TOKEN`) を入れて「接続テスト」
 3. NEの受注伝票を開くと、対象の明細行があればパネルが出る
 
+## 🚨 接続先は Cloudflare Access の後ろにある
+
+`wh.bfaith-wh.uk` は Cloudflare Access で保護されており、素で叩くと
+cloudflareaccess.com のログイン画面へ 302 される (2026-08-08 実測)。
+
+この拡張は `credentials: 'include'` で叩くことで、**ブラウザが持っている
+CF Access のログインクッキーを使う**。拡張自体に認証情報を持たせないための選択。
+
+そのため **同じブラウザで一度 https://wh.bfaith-wh.uk を開いてログインしておく**必要がある。
+セッションが切れると拡張が「ログインセッションが切れています」と出すので、
+サイトを開き直せば復帰する。
+
 ## マスターの管理
 
 選択肢の定義は **楽天RMS Item API 2.0 の customizationOptions から自動取得**するので、

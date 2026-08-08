@@ -13,13 +13,31 @@ function getConfig() {
 async function api(path, opts = {}) {
   const cfg = await getConfig();
   if (!cfg.token) throw new Error('APIトークン未設定 (拡張機能のオプションで設定してください)');
+  const base = cfg.baseUrl.replace(/\/+$/, '');
   const headers = { 'x-api-key': cfg.token };
   if (opts.body) headers['Content-Type'] = 'application/json';
-  const res = await fetch(cfg.baseUrl.replace(/\/+$/, '') + BASE_PATH + path, { ...opts, headers });
+
+  // 🚨 接続先 (miniPC) は Cloudflare Access の後ろにあり、素で叩くと
+  //    cloudflareaccess.com のログイン画面へ 302 される (2026-08-08 実測)。
+  //    credentials:'include' にすると、ブラウザが持っている CF_Authorization クッキーが乗って通る。
+  //    = 拡張に認証情報を持たせずに済む。代わりにCF Accessのセッションが切れると通らなくなるので、
+  //      そのときは「サイトを一度開いてログインしてください」と案内する。
+  const res = await fetch(base + BASE_PATH + path, { ...opts, headers, credentials: 'include' });
+
+  const ct = res.headers.get('content-type') || '';
+  if (/cloudflareaccess\.com/.test(res.url || '') || (!ct.includes('json') && (res.redirected || res.status === 302))) {
+    throw new Error(
+      `接続先のログインセッションが切れています。ブラウザで ${base} を開いてログインしてから、もう一度お試しください。`,
+    );
+  }
+
   let json = null;
   try { json = await res.json(); } catch { /* JSONでない */ }
-  if (!res.ok || !json || json.success === false) {
-    const msg = json && json.error && json.error.message ? json.error.message : `HTTP ${res.status}`;
+  if (!json) {
+    throw new Error(`応答がJSONではありません (HTTP ${res.status})。接続先URLを確認してください。`);
+  }
+  if (!res.ok || json.success === false) {
+    const msg = json.error && json.error.message ? json.error.message : `HTTP ${res.status}`;
     throw new Error(msg);
   }
   return json.data;
