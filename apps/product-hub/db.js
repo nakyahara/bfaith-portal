@@ -449,6 +449,8 @@ export function initProductHubDB() {
     ['normal_delivery_date_id', 'TEXT'],
     ['white_bg_drive_file_id', 'TEXT'],
     ['white_bg_drive_url', 'TEXT'],
+    // Drive の更新日時 (サムネURLの版数。上書き時にブラウザ/サーバーのキャッシュを外す)
+    ['white_bg_modified_time', 'TEXT'],
     ['published_at', 'TEXT'],
     // 店舗内カテゴリの RMS 反映 (2026-08-02、item-mappings API)。
     // 商品APIに棚のフィールドが無く登録とは別呼び出しになるため、結果を個別に持つ
@@ -457,6 +459,28 @@ export function initProductHubDB() {
     ['shop_categories_error', 'TEXT'],
   ]) {
     if (!rkCols.has(col)) db.exec(`ALTER TABLE draft_rakuten ADD COLUMN ${col} ${ddl}`);
+  }
+
+  // Drive 画像の更新日時 (2026-08-08 スタッフ指摘: Drive で画像を上書きしてもサムネが
+  // 古いまま表示される)。サムネURLに版数として載せ、ブラウザとサーバーのキャッシュを外す
+  const imgCols = new Set(db.prepare('PRAGMA table_info(draft_images)').all().map((c) => c.name));
+  if (!imgCols.has('drive_modified_time')) {
+    db.exec('ALTER TABLE draft_images ADD COLUMN drive_modified_time TEXT');
+  }
+  if (!imgCols.has('source_label')) {
+    // 取り込み元のファイル名末尾 ('_top' / '_01')。旧データ (NULL) は枠番との対応が
+    // 新旧で違う (旧: sort0=_01) ため、UI ではラベルを出さない (Codex medium)
+    db.exec('ALTER TABLE draft_images ADD COLUMN source_label TEXT');
+  }
+  // R-Cabinet 転送履歴にも更新日時を持たせる。Drive で同じファイルを上書きしたとき、
+  // 「転送済み」と誤判定して**古い画像のまま楽天へ出す**のを防ぐ (Codex high)
+  const cabCols = new Set(db.prepare('PRAGMA table_info(draft_cabinet_images)').all().map((c) => c.name));
+  if (!cabCols.has('drive_modified_time')) {
+    db.exec('ALTER TABLE draft_cabinet_images ADD COLUMN drive_modified_time TEXT');
+  }
+  const skuImgCols = new Set(db.prepare('PRAGMA table_info(draft_sku_images)').all().map((c) => c.name));
+  if (!skuImgCols.has('drive_modified_time')) {
+    db.exec('ALTER TABLE draft_sku_images ADD COLUMN drive_modified_time TEXT');
   }
 
   // 除外の一意性を「SKU単位グローバル」へ移行する (Codex R2 high)。
@@ -829,13 +853,24 @@ export function demoteIfGateBroken(db, draftId, actor) {
  * SA 権限で覗ける confused-deputy になる (Codex R1 high)。
  */
 export function isKnownImageFileId(db, fileId) {
-  if (!fileId) return false;
-  return !!db.prepare(`
-    SELECT 1 FROM draft_images WHERE drive_file_id = ?
-    UNION SELECT 1 FROM draft_rakuten WHERE white_bg_drive_file_id = ?
-    UNION SELECT 1 FROM draft_sku_images WHERE drive_file_id = ?
+  return !!imageRefOfFileId(db, fileId);
+}
+
+/**
+ * 登録済み画像なら { modifiedTime } を返す (未登録は null)。
+ * modifiedTime はサムネURLの版数 (?v=) の期待値。**DB の値と一致する v だけ**を
+ * キャッシュキーに採用することで、任意の v でキャッシュを汚されるのを防ぐ (Codex low)
+ */
+export function imageRefOfFileId(db, fileId) {
+  if (!fileId) return null;
+  return db.prepare(`
+    SELECT drive_modified_time AS modifiedTime FROM draft_images WHERE drive_file_id = ?
+    UNION ALL
+    SELECT white_bg_modified_time FROM draft_rakuten WHERE white_bg_drive_file_id = ?
+    UNION ALL
+    SELECT drive_modified_time FROM draft_sku_images WHERE drive_file_id = ?
     LIMIT 1
-  `).get(fileId, fileId, fileId);
+  `).get(fileId, fileId, fileId) || null;
 }
 
 /**
@@ -849,17 +884,20 @@ export function applyFolderImport(db, draftId, assigned, { folderUrl = null, cur
   db.transaction(() => {
     if (assigned.slots.length > 0) {
       db.prepare('DELETE FROM draft_images WHERE draft_id = ?').run(draftId);
-      const ins = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort) VALUES (?, ?, ?, ?)');
-      for (const s of assigned.slots) ins.run(draftId, s.id, fileViewUrl(s.id), s.slot - 1);
+      const ins = db.prepare(
+        'INSERT INTO draft_images (draft_id, drive_file_id, drive_url, sort, drive_modified_time, source_label) VALUES (?, ?, ?, ?, ?, ?)',
+      );
+      for (const s of assigned.slots) ins.run(draftId, s.id, fileViewUrl(s.id), s.slot - 1, s.modifiedTime || null, s.label || null);
     }
     if (assigned.whiteBg) {
       db.prepare(`
-        INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_drive_url) VALUES (?, ?, ?)
+        INSERT INTO draft_rakuten (draft_id, white_bg_drive_file_id, white_bg_drive_url, white_bg_modified_time) VALUES (?, ?, ?, ?)
         ON CONFLICT(draft_id) DO UPDATE SET
           white_bg_drive_file_id = excluded.white_bg_drive_file_id,
           white_bg_drive_url = excluded.white_bg_drive_url,
+          white_bg_modified_time = excluded.white_bg_modified_time,
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      `).run(draftId, assigned.whiteBg.id, fileViewUrl(assigned.whiteBg.id));
+      `).run(draftId, assigned.whiteBg.id, fileViewUrl(assigned.whiteBg.id), assigned.whiteBg.modifiedTime || null);
     }
     if (folderUrl && folderUrl !== currentFolderUrl) {
       db.prepare(`UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`)
