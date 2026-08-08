@@ -59,6 +59,24 @@
     <div id="env-banner"></div>
 
     <div class="card">
+      <h2>Chrome拡張機能</h2>
+      <p class="hint">NEの受注伝票画面で「選べる〇種セット」を実SKUの明細行に展開します。</p>
+      <div class="toolbar">
+        <a class="btn primary" href="/apps/select-set/download/extension.zip">拡張機能をダウンロード (zip)</a>
+        <span class="hint">入れ替えるときは、Chromeの拡張機能ページで一度「削除」してから入れ直してください。</span>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        <b>入れ方</b>（Chromeはストア外の拡張を直接インストールできないため、この手順が必要です）<br>
+        ① zipを<b>解凍</b>する（zipのまま読み込むことはできません）<br>
+        ② <span class="mono">chrome://extensions/</span> を開いて <b>デベロッパーモードをON</b><br>
+        ③「パッケージ化されていない拡張機能を読み込む」で<b>解凍したフォルダ</b>を選ぶ<br>
+        ④ 拡張の「オプション」で接続先とAPIトークンを入れて「接続テスト」<br>
+        ⑤ 🚨 同じブラウザで一度 <span class="mono">https://wh.bfaith-wh.uk</span> を開いてログインしておく
+        （拡張はそのログインを使って接続します）
+      </div>
+    </div>
+
+    <div class="card">
       <h2>動作確認</h2>
       <p class="hint">NEの商品OPをそのまま貼ると、どの明細行になるかを確認できます。拡張機能が実際に投入する内容と同じです。</p>
       <div class="toolbar">
