@@ -60,6 +60,14 @@ const sw = fs.readFileSync(path.join(dir, 'sw.js'), 'utf8');
 ok(/credentials:\s*'include'/.test(sw), 'Cloudflare Access を通すため credentials:include で叩いている');
 ok(/cloudflareaccess/.test(sw), 'CF Accessへ飛ばされたことを検知して案内している');
 
+// Codexレビュー (2026-08-08) で潰した事故シナリオが、コードから消えていないことを固定する
+ok(/findTargetRow/.test(content), '元行を商品コードだけで探さない (同じセットが複数行あるとき用)');
+ok(/r\.op === t\.op/.test(content), '商品opと受注数まで見て元行を一意に特定している');
+ok(/waitForRows/.test(content), '固定sleepではなく行数が増えるまで待っている');
+ok(/一致しません|missing/.test(content), '追加された明細を指示内容と照合している');
+ok(/保存しないでください/.test(content), '失敗時は保存させない強い警告を出している');
+ok(/let applying/.test(content), '同時実行を止めるロックがある');
+
 // Chromeウェブストアに出すのに必要なもの
 ok(!!mf.icons && ['16', '32', '48', '128'].every((k) => mf.icons[k]), 'ストア提出に必要なアイコンが揃っている');
 for (const f of Object.values(mf.icons || {})) {
