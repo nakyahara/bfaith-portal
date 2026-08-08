@@ -13,6 +13,7 @@
 import { rakutenRequest } from '../warehouse/rakuten-client.js';
 import { getDB as getWarehouseDB } from '../warehouse/db.js';
 import { buildCatalog, expandOp, toPasteBlocks } from './expand.js';
+import { ensureMasterFresh, masterStatus } from './master-sync.js';
 import {
   getDB, getRmsCache, listMappings, listOmake, listSets, putRmsCache,
 } from './db.js';
@@ -24,6 +25,19 @@ export class SsError extends Error {
     this.code = code;
   }
 }
+
+/**
+ * 🚨 同じコードが Render と miniPC の両方で動くが、持っているものが違う。
+ *   Render : マスタ (セット・マッピング・おまけ) の正。warehouse.db と楽天認証は無い
+ *   miniPC : warehouse.db (商品マスタ・在庫) と楽天認証がある。マスタはRenderから取得
+ * Render 側で「動作確認」ができてしまうと、商品名が出ない・おまけが全部在庫0扱い・
+ * マスタ照合が効かない、が黙って起きて正しく展開できたように見える (2026-08-08 に実際に踏んだ)。
+ * そのため商品マスタが引けない環境では、それを要する機能だけを止めて案内する。
+ */
+const WRONG_HOST_MESSAGE =
+  '商品マスタ (warehouse.db) が無い環境です。動作確認・在庫表示・RMSの選択肢確認は'
+  + ' miniPC側の https://wh.bfaith-wh.uk/apps/select-set/ で行ってください'
+  + ' (セット・マッピング・おまけの登録はこの画面のままで大丈夫です)。';
 
 const RMS_TTL_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_TTL_MIN) || 360) * 60 * 1000;
 const PRODUCT_CACHE_MS = 5 * 60 * 1000;
@@ -43,7 +57,13 @@ function loadProducts() {
   }
   const codes = new Set();
   const stock = new Map();
-  for (const r of db.prepare('SELECT 商品コード AS c, 商品名 AS n, 在庫数 AS z, 引当数 AS h, 取扱区分 AS k FROM raw_ne_products').all()) {
+  let rows = [];
+  try {
+    rows = db.prepare('SELECT 商品コード AS c, 商品名 AS n, 在庫数 AS z, 引当数 AS h, 取扱区分 AS k FROM raw_ne_products').all();
+  } catch {
+    throw new SsError(WRONG_HOST_MESSAGE, { status: 503, code: 'WAREHOUSE_UNAVAILABLE' });
+  }
+  for (const r of rows) {
     const code = String(r.c || '').trim();
     if (!code) continue;
     codes.add(code.toLowerCase());
@@ -53,8 +73,60 @@ function loadProducts() {
       status: String(r.k || ''),
     });
   }
+  // 🚨 商品マスタが空 = warehouse.db を持たない環境 (Render) で開いている。
+  //   ここで止めないと「商品名が出ない」「おまけが全部在庫0扱い」「マスタ照合が効かない」が
+  //   黙って起きて、正しく展開できたように見えてしまう (2026-08-08 実際に起きた)。
+  if (codes.size === 0) {
+    throw new SsError(WRONG_HOST_MESSAGE, { status: 503, code: 'WAREHOUSE_EMPTY' });
+  }
   productCache = { at: now, codes, stock };
   return productCache;
+}
+
+/**
+ * この環境で何ができるかを返す。画面はこれを見て出し分ける。
+ *   master.mode = 'source'   … Render。マスタの登録・編集はここ (中原さんが普段開く画面)
+ *              = 'replica'   … miniPC。マスタはRenderから取得。編集は読み取り専用
+ *   ready       … 商品マスタ (warehouse.db) が引けるか。
+ *                 動作確認・在庫表示・RMS確認・商品コードの実在チェックはこれが必要
+ */
+export function environment() {
+  const master = masterStatus();
+  const primaryUrl = process.env.SELECT_SET_PRIMARY_URL || 'https://wh.bfaith-wh.uk/apps/select-set/';
+  const base = {
+    master,
+    primaryUrl,
+    rakutenCreds: !!process.env.RAKUTEN_SERVICE_SECRET && !!process.env.RAKUTEN_LICENSE_KEY,
+    extTokenSet: !!process.env.SELECT_SET_EXT_TOKEN,
+  };
+  try {
+    const { codes } = loadProducts();
+    return { ...base, ready: true, productCount: codes.size };
+  } catch (e) {
+    return { ...base, ready: false, reason: e instanceof SsError ? e.code : 'UNKNOWN', message: String(e.message || e) };
+  }
+}
+
+/**
+ * 商品マスタが引ける環境なら在庫情報を返し、引けない環境なら null を返す (投げない)。
+ * Render 側でマスタ登録するときに「在庫が見られないから登録できない」とならないようにするため。
+ */
+export function stockOfSoft(code) {
+  try {
+    return stockOf(code);
+  } catch {
+    return null;
+  }
+}
+
+/** 商品マスタが引ける環境かどうか (実在チェックをするかの判定に使う) */
+export function canValidateProducts() {
+  try {
+    loadProducts();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function stockOf(code) {
@@ -118,6 +190,8 @@ export function isKnownSet(setCode) {
  */
 export async function expandForOrder({ setCode, op, quantity = 1, force = false }) {
   if (!op || !String(op).trim()) throw new SsError('商品OPが空です');
+  // マスタは Render 側が正。必要なら取りに行く (失敗しても前回の内容で続ける)
+  await ensureMasterFresh();
   if (!isKnownSet(setCode)) {
     throw new SsError(`「${setCode}」は選べるセットとして登録されていません`, { status: 404, code: 'UNKNOWN_SET' });
   }
