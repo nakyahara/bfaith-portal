@@ -56,6 +56,8 @@
 
   <div class="ss-wrap">
 
+    <div id="env-banner"></div>
+
     <div class="card">
       <h2>動作確認</h2>
       <p class="hint">NEの商品OPをそのまま貼ると、どの明細行になるかを確認できます。拡張機能が実際に投入する内容と同じです。</p>
@@ -340,7 +342,70 @@ document.getElementById('btn-omake-save').addEventListener('click', async () => 
   } catch (e) { msg('omake-msg', e.message, 'err'); }
 });
 
+let ENV = null;
+
+function renderEnv(e) {
+  const parts = [];
+  const replica = e.master && e.master.mode === 'replica';
+
+  if (replica) {
+    const last = e.master.lastPulledAt ? e.master.lastPulledAt.replace('T', ' ').replace('Z', '') : 'まだ取得していません';
+    const stale = !e.master.lastPulledAt;
+    parts.push('<div class="card" style="border-color:#ffd8a8;background:#fff9db">'
+      + '<b>この画面はコピーです（編集できません）</b><br>'
+      + 'セット・手動マッピング・おまけの登録は<b>普段のポータル（Render側）</b>で行ってください。'
+      + 'ここは拡張機能が実際に使う環境なので、動作確認・在庫・RMSの確認に使います。<br>'
+      + '<span class="hint">マスタ最終取得: ' + esc(last) + ' (UTC) / ' + esc(e.master.ttlMinutes) + '分ごとに自動取得'
+      + (e.master.lastError ? ' / <span style="color:#c92a2a">⚠ ' + esc(e.master.lastError) + '</span>' : '') + '</span> '
+      + '<button class="btn" id="btn-pull">今すぐ取得</button> <span class="msg" id="pull-msg"></span>'
+      + (stale ? '<div class="warnbox">まだ一度も取得できていません。「今すぐ取得」を押してください。</div>' : '')
+      + '</div>');
+  }
+
+  if (!e.ready) {
+    parts.push('<div class="card" style="border-color:#ffc9c9;background:#fff5f5">'
+      + '<b>この環境では動作確認・在庫表示・RMSの選択肢確認ができません</b><br>'
+      + esc(e.message || '商品マスタ (warehouse.db) がありません') + '<br>'
+      + '<span class="hint">セット・マッピング・おまけの<b>登録はこの画面のままで大丈夫です</b>。'
+      + '確認したいときは <a href="' + esc(e.primaryUrl) + '">' + esc(e.primaryUrl) + '</a> を開いてください。</span>'
+      + '</div>');
+  }
+  document.getElementById('env-banner').innerHTML = parts.join('');
+
+  // 編集できない環境ではボタンを落とす (押してから怒られるのは分かりにくい)
+  if (replica) {
+    for (const id of ['btn-set-add', 'btn-map-add', 'btn-omake-add', 'btn-omake-save']) {
+      const el = document.getElementById(id);
+      if (el) { el.disabled = true; el.title = '編集は普段のポータル (Render側) で行ってください'; }
+    }
+  }
+  if (!e.ready) {
+    const t = document.getElementById('btn-try');
+    if (t) { t.disabled = true; t.title = '商品マスタが無いため動作確認できません'; }
+  }
+
+  const pull = document.getElementById('btn-pull');
+  if (pull) {
+    pull.addEventListener('click', async () => {
+      msg('pull-msg', '取得中...', '');
+      try {
+        const r = await jsend(API + '/master/pull', 'POST');
+        if (r.ok) {
+          msg('pull-msg', '取得しました (' + JSON.stringify(r.counts) + ')', 'ok');
+          await loadSets(); await loadMappings(); await loadOmake();
+        } else {
+          msg('pull-msg', '失敗: ' + (r.error || '不明'), 'err');
+        }
+      } catch (e2) { msg('pull-msg', e2.message, 'err'); }
+    });
+  }
+}
+
 (async () => {
+  try {
+    ENV = await jget(API + '/env');
+    renderEnv(ENV);
+  } catch (e) { console.warn('環境判定に失敗', e); }
   try {
     await loadSets();
     await loadMappings();

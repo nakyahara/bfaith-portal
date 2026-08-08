@@ -11,7 +11,7 @@ import { fileURLToPath } from 'url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(dir, '../../..');
-const suites = ['test-expand.mjs', 'test-db.mjs', 'test-views.mjs', 'test-extension.mjs'];
+const suites = ['test-expand.mjs', 'test-db.mjs', 'test-master.mjs', 'test-views.mjs', 'test-extension.mjs'];
 
 let failed = 0;
 for (const f of suites) {

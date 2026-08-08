@@ -72,6 +72,7 @@ import easyShipRouter from './apps/easy-ship/router.js';
 import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import selectSetRouter from './apps/select-set/router.js';
 import selectSetExtRouter from './apps/select-set/ext-router.js';
+import selectSetMasterRouter from './apps/select-set/master-router.js';
 import inquiryHubAiApiRouter from './apps/inquiry-hub/ai-api.js';
 import aiInsightsRouter, { aiInsightsApiRouter } from './apps/ai-insights/router.js';
 import { startAiInsightsNotifyJob } from './apps/ai-insights/notify-job.js';
@@ -316,6 +317,8 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/easy-ship/ext-api')) return next();
     // /apps/select-set/ext-api も同様 (NE伝票画面のChrome拡張向け)
     if (normalizedPath.startsWith('/apps/select-set/ext-api')) return next();
+    // /apps/select-set/master-api は miniPC が x-sync-key で取りに来るマスタ配信 (Render側で有効)
+    if (normalizedPath.startsWith('/apps/select-set/master-api')) return next();
     if (LARGE_BODY_ROUTES.includes(normalizedPath)) return next();
   }
   return globalJsonParser(req, res, next);
@@ -1289,6 +1292,8 @@ app.use('/apps/easy-ship/ext-api', easyShipExtRouter);
 app.use('/apps/easy-ship', requireAppAccess('easy-ship'), express.json({ limit: '2mb' }), easyShipRouter);
 // select-set: NE伝票画面のChrome拡張向けAPI も同じく本体より先に mount
 app.use('/apps/select-set/ext-api', selectSetExtRouter);
+// マスタ配信 (Render → miniPC)。x-sync-key 認証なのでセッション認証より先に mount
+app.use('/apps/select-set/master-api', express.json({ limit: '64kb' }), selectSetMasterRouter);
 app.use('/apps/select-set', requireAppAccess('select-set'), express.json({ limit: '512kb' }), selectSetRouter);
 app.use('/apps/mgmt-accounting', (req, res, next) => {
   // 管理系API (x-sync-key 直呼び対象) はセッション認証の代わりに parser より前で key 認証。
