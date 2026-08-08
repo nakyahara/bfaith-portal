@@ -54,5 +54,20 @@ for (const sel of ['search_order_line_result', 'meisai_assist_input_syohin_code'
 }
 ok(/再計算/.test(content), '保存時の再計算ダイアログについて警告を出している');
 
+// 接続先 (miniPC) は Cloudflare Access の後ろにあるので、素の fetch では 302 される。
+// ブラウザのログインセッションを乗せるのが前提なので、そこが外れたら気づけるようにする
+const sw = fs.readFileSync(path.join(dir, 'sw.js'), 'utf8');
+ok(/credentials:\s*'include'/.test(sw), 'Cloudflare Access を通すため credentials:include で叩いている');
+ok(/cloudflareaccess/.test(sw), 'CF Accessへ飛ばされたことを検知して案内している');
+
+// Chromeウェブストアに出すのに必要なもの
+ok(!!mf.icons && ['16', '32', '48', '128'].every((k) => mf.icons[k]), 'ストア提出に必要なアイコンが揃っている');
+for (const f of Object.values(mf.icons || {})) {
+  ok(fs.existsSync(path.join(dir, f)), `アイコン ${f} が存在する`);
+}
+ok(/^\d+\.\d+\.\d+$/.test(mf.version), 'version がストアの形式 (x.y.z)');
+ok((mf.description || '').length > 0 && (mf.description || '').length <= 132, '説明が132文字以内 (ストアの上限)');
+ok(fs.existsSync(path.join(dir, 'STORE_LISTING.md')), '提出用の文面がある');
+
 console.log(`\n合計: ${pass} pass / ${fail} NG`);
 process.exit(fail === 0 ? 0 : 1);

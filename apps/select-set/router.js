@@ -7,6 +7,8 @@
  * (miniPCで編集しても次の取得で上書きされるため、書けてしまう方が事故になる)。
  */
 import { Router } from 'express';
+import archiver from 'archiver';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
@@ -20,6 +22,9 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
+
+/** 拡張機能のzipに入れない開発用ファイル (Googleに提出するパッケージに社内メモを混ぜないため) */
+const DEV_ONLY_FILES = new Set(['make-icons.mjs', 'STORE_LISTING.md']);
 
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗時は起動を止める
 initSelectSetDB();
@@ -158,6 +163,38 @@ router.post('/api/omake', api((req) => {
   const n = replaceOmake(codes);
   return { ok: true, count: n, warning };
 }));
+
+/**
+ * Chrome拡張の配布。
+ * ⚠ Chrome はストア外の拡張を .crx で直接インストールさせない (ドラッグ&ドロップも不可) ため、
+ *   「zipを落とす → 解凍 → デベロッパーモードで『パッケージ化されていない拡張機能を読み込む』」
+ *   という手順はどうしても残る。ここはその配布を楽にするだけ
+ *   (各PCにリポジトリを置かなくてよくする / 更新版を配れるようにする)。
+ */
+router.get('/download/extension.zip', (req, res) => {
+  const dir = path.resolve(__dirname, '../../tools/ne-select-set-helper');
+  let version = '';
+  try {
+    version = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8')).version || '';
+  } catch { /* バージョンが読めなくても配布は続ける */ }
+  if (!fs.existsSync(dir)) {
+    return res.status(404).json({ error: '拡張機能のファイルが見つかりません' });
+  }
+  res.set({
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename=ne-select-set-helper${version ? '-' + version : ''}.zip`,
+  });
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  archive.on('error', (e) => {
+    console.error('[select-set] 拡張機能のzip作成に失敗', e);
+    res.destroy();
+  });
+  archive.pipe(res);
+  // 開発用ファイルは同梱しない。特に STORE_LISTING.md は提出手順の社内メモなので、
+  // Google に出すパッケージに入れたくない
+  archive.directory(dir, false, (entry) => (DEV_ONLY_FILES.has(entry.name) ? false : entry));
+  archive.finalize();
+});
 
 // ---- 動作確認 ----
 router.post('/api/try', api((req) => expandForOrder({
