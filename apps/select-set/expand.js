@@ -131,8 +131,12 @@ export function buildCatalog({ setCode, rmsOptions = [], manualRows = [], knownP
     for (const sel of opt?.selections || []) {
       const dv = String(sel?.displayValue || '').trim();
       if (!dv) continue;
-      const code = extractCodeCandidates(dv).find((c) => knownProductCodes.has(c.toLowerCase()));
-      if (code) register(dv, code, { from: 'rms' });
+      // 🚨 候補が複数の実在コードに割れたら採らない。
+      //   以前は最初に見つかったものを採っていたため、取り違えの余地があった
+      //   (Codexレビュー2巡目 / 2026-08-08)。
+      const cands = [...new Set(extractCodeCandidates(dv).map((c) => c.toLowerCase()))]
+        .filter((c) => knownProductCodes.has(c));
+      if (cands.length === 1) register(dv, cands[0], { from: 'rms' });
       else unresolved.push(dv);
     }
   }
@@ -144,11 +148,19 @@ export function buildCatalog({ setCode, rmsOptions = [], manualRows = [], knownP
   }
 
   const skuList = [...skus];
+  // RMS側の選択枠ラベルが重複していると期待枠数を多く数えてしまい、正常な注文が
+  // 展開できなくなる。理由が分かるように明示しておく (Codexレビュー2巡目 / 2026-08-08)
+  const pickNames = labels.filter((l) => l.isPick).map((l) => normalizeValue(l.name));
+  const labelIssue = pickNames.length !== new Set(pickNames).size
+    ? '楽天の選択肢定義で選択枠のラベルが重複しています'
+    : null;
+
   return {
     setCode,
     labels,
+    labelIssue,
     /** 期待される選択枠の数。ここと実際に解決できた行数が一致しないと展開しない */
-    expectedPicks: labels.filter((l) => l.isPick).length,
+    expectedPicks: labelIssue ? 0 : pickNames.length,
     /** RMSが返したラベル名の集合。未知のラベルが出てきたら止めるために使う */
     labelNames: new Set(labels.map((l) => normalizeValue(l.name))),
     options,
@@ -252,23 +264,21 @@ export function resolveValue(catalog, value) {
   if (hit) return { code: hit, via: 'label' };
 
   const candidates = [...new Set(extractCodeCandidates(v).map((c) => c.toLowerCase()))];
-  const pick = (pool) => {
-    const found = [...new Set(candidates.filter((c) => pool.has(c)))];
-    return found.length === 1 ? found[0] : null;
-  };
+  const inSet = candidates.filter((c) => catalog.skuSet?.has(c));
+  const inMaster = candidates.filter((c) => catalog.knownProductCodes?.has(c));
 
-  if (catalog.skuSet?.size) {
-    const c = pick(catalog.skuSet);
-    if (c) {
-      // 大文字小文字を元の登録どおりに戻す
-      const canonical = catalog.skus.find((s) => s.toLowerCase() === c) || c;
-      return { code: canonical, via: 'embedded' };
-    }
+  // 🚨 一意性は「セットのSKU」と「商品マスタ」をまたいで見る。
+  //   段階ごとに見ると、片方がセットSKU・もう片方がマスタの実在コードだったときに
+  //   前者を勝手に採ってしまう (Codexレビュー2巡目 / 2026-08-08)。割れたら止める。
+  const union = [...new Set([...inSet, ...inMaster])];
+  if (union.length !== 1) return null;
+
+  if (inSet.length === 1) {
+    // 大文字小文字を元の登録どおりに戻す
+    const canonical = catalog.skus.find((s) => s.toLowerCase() === inSet[0]) || inSet[0];
+    return { code: canonical, via: 'embedded' };
   }
-  if (catalog.knownProductCodes?.size) {
-    const c = pick(catalog.knownProductCodes);
-    if (c) return { code: c, via: 'master' };
-  }
+  if (inMaster.length === 1) return { code: inMaster[0], via: 'master' };
   return null;
 }
 
@@ -317,7 +327,8 @@ export function expandOp({ catalog, op, quantity = 1, omakePriority = [], stockO
   //   認識できなくても ok=true になっていた (Codexレビュー #3 / 2026-08-08)。
   const expected = catalog?.expectedPicks || 0;
   if (!expected) {
-    return bail('このセットの選択枠の数を確認できません (楽天の選択肢定義が取得できていない可能性があります)');
+    return bail(catalog?.labelIssue
+      || 'このセットの選択枠の数を確認できません (楽天の選択肢定義が取得できていない可能性があります)');
   }
 
   const seen = new Set();

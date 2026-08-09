@@ -63,7 +63,9 @@ ok(/cloudflareaccess/.test(sw), 'CF Accessへ飛ばされたことを検知し�
 // Codexレビュー (2026-08-08) で潰した事故シナリオが、コードから消えていないことを固定する
 ok(/findTargetRow/.test(content), '元行を商品コードだけで探さない (同じセットが複数行あるとき用)');
 ok(/r\.op === t\.op/.test(content), '商品opと受注数まで見て元行を一意に特定している');
-ok(/waitForRows/.test(content), '固定sleepではなく行数が増えるまで待っている');
+ok(/waitForAdded/.test(content), '固定sleepではなく行が増えるまで待っている');
+ok(/diffRows/.test(content), '追加前後の差分で「今回増えた行」を見ている (既存行を成果に数えない)');
+ok(/parseQuantity/.test(content), '受注数を勝手に1に丸めない');
 ok(/一致しません|missing/.test(content), '追加された明細を指示内容と照合している');
 ok(/保存しないでください/.test(content), '失敗時は保存させない強い警告を出している');
 ok(/let applying/.test(content), '同時実行を止めるロックがある');
