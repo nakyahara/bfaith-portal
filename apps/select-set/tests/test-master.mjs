@@ -29,6 +29,8 @@ const ok = (c, n) => {
   if (c) { pass++; console.log(`  ok - ${n}`); }
   else { fail++; console.log(`  NG - ${n}`); }
 };
+const eq = (a, b, n) => ok(JSON.stringify(a) === JSON.stringify(b),
+  `${n}${JSON.stringify(a) === JSON.stringify(b) ? '' : `  期待=${JSON.stringify(b)} 実際=${JSON.stringify(a)}`}`);
 
 db.initSelectSetDB();
 
@@ -69,17 +71,56 @@ const counts = db.replaceMaster({
   sets: [{ set_code: 'newset-3', label: '新セット', is_active: 1 }],
   mappings: [
     { set_code: 'newset-3', option_text: 'いちご_strawberry10', product_code: 'strawberry10' },
-    { set_code: 'newset-3', option_text: '【いちご】strawberry10', product_code: 'strawberry10' },
+    { set_code: 'newset-3', option_text: 'めろん_melon10', product_code: 'melon10' },
   ],
   omake: [{ product_code: 'aaa-1' }, { product_code: 'bbb-2' }],
 });
 ok(db.listSets().length === 1 && db.listSets()[0].set_code === 'newset-3', '古いセットは消えて新しいものだけになる');
 ok(db.listMappings('ganesh-select3').length === 0, 'Render側で消えたセットのマッピングも消える');
-ok(db.listMappings('newset-3').length === 1, '正規化キーが同じ行は1件にまとまる (括弧違いの重複)');
-ok(counts.mappings === 2, '受け取った件数はそのまま報告する (実際に入るのは重複排除後)');
+ok(db.listMappings('newset-3').length === 2, '受け取った行がそのまま入る');
+ok(counts.mappings === 2, '実際に入った件数を返す');
 const om = db.listOmake();
 ok(om.length === 2 && om[0].rank === 1 && om[0].product_code === 'aaa-1', 'おまけも順位を振り直して全置換');
 ok(!!db.getRmsCache('selectae10-5'), '🚨 RMSキャッシュは miniPC 側で育てるものなので消さない');
+
+console.log('\n=== 🚨 壊れたマスタで既存を消さない (Codex4巡目の指摘) ===');
+db.replaceMaster({
+  sets: [{ set_code: 'keep-3' }],
+  mappings: [{ set_code: 'keep-3', option_text: 'あ', product_code: 'x-1' }],
+  omake: [{ product_code: 'o-1' }],
+});
+const snapshot = () => ({ s: db.listSets().length, m: db.listMappings().length, o: db.listOmake().length });
+const kept = snapshot();
+const mustThrow = (bad, name) => {
+  let threw = false;
+  try { db.replaceMaster(bad); } catch { threw = true; }
+  ok(threw, name);
+  eq(snapshot(), kept, `  → 既存マスタが無傷 (${name})`);
+};
+mustThrow({ sets: [{ set_code: 'a' }], mappings: [], omake: [] }, 'mappings が空なら弾く');
+mustThrow({ sets: [], mappings: [], omake: [] }, 'セットが1件も無ければ弾く');
+mustThrow({ sets: [{ set_code: 'a' }], mappings: [{ set_code: 'a', option_text: 'x' }], omake: [] },
+  '商品コードが欠けた行があれば弾く');
+mustThrow({ sets: [{ set_code: 'a' }], mappings: [{ set_code: 'zzz', option_text: 'x', product_code: 'y' }], omake: [] },
+  '参照先セットが無いマッピングがあれば弾く');
+mustThrow({ sets: [{ set_code: 'a' }, { set_code: 'a' }], mappings: [{ set_code: 'a', option_text: 'x', product_code: 'y' }], omake: [] },
+  'セットコードが重複していれば弾く');
+mustThrow({
+  sets: [{ set_code: 'a' }],
+  mappings: [{ set_code: 'a', option_text: 'ローズ', product_code: 'y' }, { set_code: 'a', option_text: '【ローズ】', product_code: 'z' }],
+  omake: [],
+}, '正規化すると同じ選択肢が重複していれば弾く');
+mustThrow({ sets: [{ set_code: 'a' }], mappings: [{ set_code: 'a', option_text: 'x', product_code: 'y' }], omake: [{ product_code: 'p' }, { product_code: 'P' }] },
+  'おまけの商品コードが重複していれば弾く');
+mustThrow({ sets: [{ set_code: 'a' }], mappings: 'なにか', omake: [] }, '配列でなければ弾く');
+mustThrow(null, '中身が無ければ弾く');
+
+const good = db.replaceMaster({
+  sets: [{ set_code: 'ok-3' }],
+  mappings: [{ set_code: 'ok-3', option_text: 'あ', product_code: 'x-1' }],
+  omake: [{ product_code: 'o-1' }],
+});
+eq(good, { sets: 1, mappings: 1, omake: 1 }, '正常なマスタは通り、実際に入った件数を返す');
 
 console.log('\n=== 取得状況の記録 ===');
 db.setMeta('master_last_pulled_at', '2026-08-08T01:00:00Z');

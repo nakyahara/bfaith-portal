@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "B-Faith 選べるセット展開",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "ネクストエンジンの受注伝票で「選べる〇種セット」を実SKUの明細行に展開します (B-Faith社内用)。",
   "icons": {
     "16": "icons/icon16.png",

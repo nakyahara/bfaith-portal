@@ -276,9 +276,14 @@
         return fail(statusEl, '元の行をキャンセルにできませんでした。手で入れてください。');
       }
 
-      // 🚨 キャンセル操作のあとにも、明細がまだ指示どおりのままか確かめる
-      //   (この間に遅れて行が増えている可能性がある)
-      const finalCmp = compareAdded(diffRows(before, currentRows()).added, expected.rows);
+      // 🚨 キャンセル操作のあとにも、明細がまだ指示どおりのままか確かめる。
+      //   この間に遅れて行が増えている可能性があるほか、
+      //   別の既存明細が消えていないかも見る (Codexレビュー4巡目 / 2026-08-08)
+      const finalDiff = diffRows(before, currentRows());
+      const finalCmp = compareAdded(finalDiff.added, expected.rows);
+      if (finalDiff.removed.length) {
+        return fail(statusEl, `最後の確認で消えた明細行があります (${finalDiff.removed.join(', ')})。`);
+      }
       if (!finalCmp.ok) {
         return fail(statusEl, '最後の確認で明細が指示と一致しなくなりました。');
       }
