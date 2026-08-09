@@ -20,9 +20,16 @@ import SellingPartner from 'amazon-sp-api';
 const V = '/inbound/fba/2024-03-20';
 const MARKETPLACE = () => process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
-// v2024-03-20 は全operationが restore_rate 0.5/秒 (SDKの定義で確認)。
-// これより速く投げるとバーストを使い切って429になり、SDKの再試行で結局遅くなる。
-const MIN_INTERVAL_MS = 2000;
+/**
+ * 呼び出し間隔。読み取りと書き込みで分ける。
+ * SDKの定義では全operationが restore_rate 0.5/秒 だが、実測では読み取りを
+ * 25回連続で投げても 10.7秒 (=0.43秒/回) で完走し、429は出なかった
+ * (2026-08-09 実測。バースト枠が広い)。
+ * 読み取りを2秒間隔にすると一覧だけで50秒かかり、22時の実行が長くなりすぎるので、
+ * **読み取りは0.5秒・書き込みは2秒**にする。読み取りは冪等で、429が出てもSDKが再試行する。
+ */
+const READ_INTERVAL_MS = 500;
+const WRITE_INTERVAL_MS = 2000;
 
 /**
  * 何日以内に更新されたプランを見るか。
@@ -55,7 +62,8 @@ function getClient() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function call(api_path, method = 'GET', body) {
-  const wait = MIN_INTERVAL_MS - (Date.now() - lastCallAt);
+  const min = method === 'GET' ? READ_INTERVAL_MS : WRITE_INTERVAL_MS;
+  const wait = min - (Date.now() - lastCallAt);
   if (wait > 0) await sleep(wait);
   lastCallAt = Date.now();
   return getClient().callAPI(body ? { api_path, method, body } : { api_path, method });
