@@ -13,7 +13,7 @@
 import { rakutenRequest } from '../warehouse/rakuten-client.js';
 import { getDB as getWarehouseDB } from '../warehouse/db.js';
 import { buildCatalog, expandOp, toPasteBlocks } from './expand.js';
-import { ensureMasterFresh, masterStatus } from './master-sync.js';
+import { ensureMasterFresh, masterFreshnessProblem, masterStatus } from './master-sync.js';
 import {
   getDB, getRmsCache, listMappings, listOmake, listSets, putRmsCache,
 } from './db.js';
@@ -40,6 +40,12 @@ const WRONG_HOST_MESSAGE =
   + ' (セット・マッピング・おまけの登録はこの画面のままで大丈夫です)。';
 
 const RMS_TTL_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_TTL_MIN) || 360) * 60 * 1000;
+/**
+ * RMSキャッシュをフォールバックとして使える上限。
+ * 🚨 取得失敗時に無期限で古い定義を使うと、楽天側で選択肢の割当先を変えた後に
+ *   古い対応で展開し続ける (Codexレビュー4巡目 / 2026-08-08)。
+ */
+const RMS_MAX_AGE_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_MAX_AGE_H) || 168) * 3600 * 1000;
 const PRODUCT_CACHE_MS = 5 * 60 * 1000;
 
 let productCache = { at: 0, codes: null, stock: null };
@@ -151,10 +157,18 @@ async function fetchRmsOptions(setCode, { force = false } = {}) {
   } catch (e) {
     const msg = String(e?.message || e).slice(0, 300);
     putRmsCache(setCode, cached?.payload ? JSON.parse(cached.payload) : null, msg);
-    // RMSが落ちていても手動マッピングだけで動かす (止めない)
+    // RMSが落ちていても、キャッシュが古すぎなければ前回の定義で動かす
     let options = [];
     if (cached?.payload) { try { options = JSON.parse(cached.payload); } catch {} }
-    return { options, fetchedAt: cached?.fetched_at || null, cached: true, error: msg };
+    const age = cached?.fetched_at ? Date.now() - Date.parse(cached.fetched_at) : Infinity;
+    const tooStale = !options.length || !Number.isFinite(age) || age > RMS_MAX_AGE_MS;
+    return {
+      options: tooStale ? [] : options,
+      fetchedAt: cached?.fetched_at || null,
+      cached: true,
+      error: msg,
+      tooStale,
+    };
   }
 }
 
@@ -192,10 +206,20 @@ export async function expandForOrder({ setCode, op, quantity = 1, force = false 
   if (!op || !String(op).trim()) throw new SsError('商品OPが空です');
   // マスタは Render 側が正。必要なら取りに行く (失敗しても前回の内容で続ける)
   await ensureMasterFresh();
+  // ただし古すぎるマスタでは展開しない (誤った対応のまま入れ続けるのを防ぐ)
+  const stale = masterFreshnessProblem();
+  if (stale) throw new SsError(stale, { status: 503, code: 'MASTER_STALE' });
   if (!isKnownSet(setCode)) {
     throw new SsError(`「${setCode}」は選べるセットとして登録されていません`, { status: 404, code: 'UNKNOWN_SET' });
   }
   const { catalog, rms, manualCount } = await getCatalog(setCode, { force });
+  if (rms.tooStale) {
+    throw new SsError(
+      '楽天の選択肢定義を取得できず、手元のキャッシュも古すぎるため展開できません'
+      + (rms.error ? ` (${rms.error})` : ''),
+      { status: 503, code: 'RMS_STALE' },
+    );
+  }
   const result = expandOp({
     catalog,
     op,
