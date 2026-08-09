@@ -20,8 +20,26 @@ import SellingPartner from 'amazon-sp-api';
 const V = '/inbound/fba/2024-03-20';
 const MARKETPLACE = () => process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 
-// updateShipmentTrackingDetails の restore_rate は 0.5/秒。連打防止に最低間隔を置く。
-const MIN_INTERVAL_MS = 1200;
+/**
+ * 呼び出し間隔。読み取りと書き込みで分ける。
+ * SDKの定義では全operationが restore_rate 0.5/秒 だが、実測では読み取りを
+ * 25回連続で投げても 10.7秒 (=0.43秒/回) で完走し、429は出なかった
+ * (2026-08-09 実測。バースト枠が広い)。
+ * 読み取りを2秒間隔にすると一覧だけで50秒かかり、22時の実行が長くなりすぎるので、
+ * **読み取りは0.5秒・書き込みは2秒**にする。読み取りは冪等で、429が出てもSDKが再試行する。
+ */
+const READ_INTERVAL_MS = 500;
+const WRITE_INTERVAL_MS = 2000;
+
+/**
+ * 何日以内に更新されたプランを見るか。
+ * ⭐ACTIVEのまま放置されたプランが478件あり (2026-08-09 実測)、全部の詳細を取ると
+ *   1件2秒 × 478 = 約16分かかって定期実行に収まらない。
+ *   輸送箱ラベルを発行すればプランは必ず更新されるので、
+ *   **直近に更新されていないプランに「今日投入すべき納品」は無い**。
+ *   黙って打ち切るのではなく、対象外にした件数を呼び出し側へ返して通知に出す。
+ */
+const PLAN_WINDOW_DAYS = () => Number(process.env.FBA_TRACKING_PLAN_WINDOW_DAYS || 14);
 let lastCallAt = 0;
 
 let spClient = null;
@@ -44,7 +62,8 @@ function getClient() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function call(api_path, method = 'GET', body) {
-  const wait = MIN_INTERVAL_MS - (Date.now() - lastCallAt);
+  const min = method === 'GET' ? READ_INTERVAL_MS : WRITE_INTERVAL_MS;
+  const wait = min - (Date.now() - lastCallAt);
   if (wait > 0) await sleep(wait);
   lastCallAt = Date.now();
   return getClient().callAPI(body ? { api_path, method, body } : { api_path, method });
@@ -136,19 +155,30 @@ export function checkDeadline(shipment, now = new Date()) {
  */
 export async function findOpenShipments(opts = {}) {
   const wantStatuses = opts.statuses ?? ['READY_TO_SHIP'];
+  const windowDays = opts.windowDays ?? PLAN_WINDOW_DAYS();
+  const now = opts.now ?? new Date();
   const out = [];
   const errors = [];
 
   let plans;
   try {
-    plans = await callAllPages(`${V}/inboundPlans?status=ACTIVE`, 'inboundPlans', { pageSize: 20 });
+    // ⭐一覧は全ページ取る (並び順を仮定して早期に打ち切ると取りこぼす)。
+    //   絞るのは「詳細を取るかどうか」の側で行う
+    plans = await callAllPages(`${V}/inboundPlans?status=ACTIVE`, 'inboundPlans', { pageSize: 20, max: 100 });
   } catch (e) {
     // プラン一覧そのものが取れない = 何も判断できない。呼び出し側で中断させる
     throw new Error(`納品プラン一覧を取得できません: ${e?.message ?? e}`);
   }
   if (plans.truncated) errors.push('納品プランが多すぎて全部見られませんでした (ページ上限)');
 
-  for (const p of plans.items) {
+  const cutoff = now.getTime() - windowDays * 24 * 3600 * 1000;
+  const recent = plans.items.filter((p) => {
+    const t = Date.parse(p.lastUpdatedAt ?? p.createdAt ?? '');
+    return Number.isNaN(t) ? true : t >= cutoff; // 日付が読めないものは念のため見る
+  });
+  const skipped = plans.items.length - recent.length;
+
+  for (const p of recent) {
     // 🚨ここで例外を握り潰すと「取得に失敗した」が「今日は納品が無い」に化ける (#6)。
     //   件数を集めて呼び出し側へ返し、1件でも失敗していたら人に知らせる
     let full;
@@ -186,7 +216,11 @@ export async function findOpenShipments(opts = {}) {
       }
     }
   }
-  return { shipments: out, errors };
+  return {
+    shipments: out,
+    errors,
+    scanned: { total: plans.items.length, checked: recent.length, skippedOld: skipped, windowDays },
+  };
 }
 
 /**
