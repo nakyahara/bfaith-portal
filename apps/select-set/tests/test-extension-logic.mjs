@@ -86,5 +86,43 @@ ok(!I.compareAdded(['S×1', 'S×1', 'S×1'], [{ code: 'S', quantity: 1 }, { code
   '余分に増えていても失敗');
 ok(!I.compareAdded(['S×2'], [{ code: 'S', quantity: 1 }]).ok, '数量が違えば失敗');
 
+console.log('\n=== 🚨 追加が落ち着くまで待つ (Codex3巡目の指摘) ===');
+// NEが段階的に行を足す場合、期待行数に達した瞬間に照合すると
+// 後から現れる余分な行を見逃す。中身が一定時間変わらないことを条件にする。
+const SET = { code: 'SET', quantity: 1 };
+const base = [SET];
+
+{
+  const res = await I.waitForStableAdded(base, 2, {
+    quietMs: 100, timeoutMs: 3000, readCurrent: () => [SET, A1, B1],
+  });
+  ok(res.stable, '変化がなければ安定と判定する');
+  eq(res.added.sort(), ['A×1', 'B×1'], '増えた行を返す');
+}
+
+{
+  // 期待の2行が先に出て、そのあと余分な3行目が遅れて追加されるケース
+  let calls = 0;
+  const res = await I.waitForStableAdded(base, 2, {
+    quietMs: 400,
+    timeoutMs: 5000,
+    readCurrent: () => (++calls <= 2 ? [SET, A1, B1] : [SET, A1, B1, X1]),
+  });
+  ok(res.stable, '最終的には安定する');
+  eq(res.added.sort(), ['A×1', 'B×1', 'X×1'], '🚨 遅れて増えた余分な行も拾う');
+  ok(!I.compareAdded(res.added, [A1, B1]).ok, '余分があるので照合は失敗する (成功表示にしない)');
+}
+
+{
+  // ずっと増え続けて落ち着かないケース
+  let n = 0;
+  const res = await I.waitForStableAdded(base, 2, {
+    quietMs: 400,
+    timeoutMs: 1200,
+    readCurrent: () => [SET, ...Array.from({ length: ++n }, (_, i) => ({ code: 'R' + i, quantity: 1 }))],
+  });
+  ok(!res.stable, '変化し続けるなら安定しないと判定する (成功にしない)');
+}
+
 console.log(`\n合計: ${pass} pass / ${fail} NG`);
 process.exit(fail === 0 ? 0 : 1);
