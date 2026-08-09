@@ -108,8 +108,8 @@ eq(expandOp({ catalog: aeCat, op: aupay }).lines.map((l) => l.code),
 console.log('\n=== 商品コードが埋まっていない場合 ===');
 eq(expandOp({ catalog: waCat, op: '1本目:カモミール|2本目:ローズ|3本目:サンダルウッド' }).lines.map((l) => l.code),
   ['wae10-ca', 'wae10-ro', 'wae10-sw'], '表示名だけでも辞書で引ける');
-ok(expandOp({ catalog: aeCat, op: '1本目:プルメリア' }).lines[0].code === 'ae-plumeria10'
-  && expandOp({ catalog: waCat, op: '1本目:プルメリア' }).lines[0].code === 'wae10ml-pl',
+ok(expandOp({ catalog: aeCat, op: '1本目:プルメリア|2本目:ローズ|3本目:サボン|4本目:ローズ|5本目:サボン' }).lines[0].code === 'ae-plumeria10'
+  && expandOp({ catalog: waCat, op: '1本目:プルメリア|2本目:カモミール|3本目:ローズ' }).lines[0].code === 'wae10ml-pl',
   '同じ「プルメリア」でもセットが違えば別SKUになる');
 
 console.log('\n=== ganesh (N種類目・値に空白が入る) ===');
@@ -138,9 +138,9 @@ ok(allOut.ok && !allOut.omake.code && allOut.warnings.some((w) => /在庫切れ/
   '候補が全滅ならおまけ行を入れず警告する (本体は展開する)');
 
 console.log('\n=== 無視すべき項目 / fail-closed ===');
-const withConsent = '文字数の関係でオイルを選択する項目の表示名を省略しております。ご了承ください。:確認しました。|1本目:プルメリア_ae-plumeria10|2本目:ローズ_ae-rose10|3本目:サボン_sabon10';
+const withConsent = '文字数の関係でオイルを選択する項目の表示名を省略しております。ご了承ください。:確認しました。|1本目:プルメリア_ae-plumeria10|2本目:ローズ_ae-rose10|3本目:サボン_sabon10|4本目:ローズ_ae-rose10|5本目:サボン_sabon10';
 const cRes = expandOp({ catalog: aeCat, op: withConsent });
-ok(cRes.ok && cRes.lines.length === 3, '同意確認の項目は無視して本体だけ展開する');
+ok(cRes.ok && cRes.lines.length === 5, '同意確認の項目は無視して本体だけ展開する');
 
 const bad = expandOp({ catalog: waCat, op: '1本目:カモミール|2本目:ローズローズ|3本目:サンダルウッド' });
 ok(!bad.ok, '解決できない選択枠があれば ok=false (自動投入させない)');
@@ -149,7 +149,7 @@ ok(!expandOp({ catalog: aeCat, op: '' }).ok, '商品OPが空なら ok=false');
 ok(!expandOp({ catalog: aeCat, op: 'ラッピング:あり' }).ok, '選択枠が1つも無ければ ok=false');
 
 console.log('\n=== 商品マスタ照合のフォールバック ===');
-const fb = expandOp({ catalog: aeCat, op: '1本目:7.ロ-ズマリ-シネオ-ル_cineole10|2本目:ローズ_ae-rose10|3本目:サボン_sabon10' });
+const fb = expandOp({ catalog: aeCat, op: '1本目:7.ロ-ズマリ-シネオ-ル_cineole10|2本目:ローズ_ae-rose10|3本目:サボン_sabon10|4本目:ローズ_ae-rose10|5本目:サボン_sabon10' });
 ok(fb.ok && fb.lines[0].code === 'cineole10', '選択肢定義に無くても商品マスタに実在すれば拾う');
 eq(fb.lines[0].via, 'master', 'どう解決したかが分かる');
 ok(fb.notices.some((n) => /商品マスタ照合/.test(n)), 'マスタ照合で拾ったことを人に見せる notice が出る');
@@ -167,6 +167,75 @@ eq(blocks.quantities.split('\n'), ['1', '1', '1', '1'], '受注数も改行区�
 console.log('\n=== splitOp 単体 ===');
 eq(splitOp('1本目:あ|2本目:い', [{ name: '1本目', isPick: true }, { name: '2本目', isPick: true }]).map((p) => p.value), ['あ', 'い'], 'ラベルで切って値だけ取る');
 eq(splitOp('1本目:あ', []).map((p) => p.label), ['1本目'], 'ラベル定義が無くても N本目 で拾える');
+
+// ===== Codexレビュー (2026-08-08) で指摘された事故シナリオの再現テスト =====
+// いずれも「誤った商品を明細に入れてしまう」経路なので、必ず止まることを固定する。
+
+console.log('\n=== #1 正規化キーの衝突 ===');
+const dupCat = buildCatalog({
+  setCode: 'dup-3',
+  rmsOptions: [
+    { displayName: '1本目', selections: [
+      { displayValue: 'ローズ_ae-rose10' },      // 表示名だけのキー「ローズ」を作る
+      { displayValue: 'ローズ_ae-amber10' },     // 同じ「ローズ」で別SKU → 曖昧
+      { displayValue: 'サボン_sabon10' },
+    ] },
+    { displayName: '2本目', selections: [] },
+    { displayName: '3本目', selections: [] },
+  ],
+  knownProductCodes: known,
+});
+ok(dupCat.conflicts.length > 0, '衝突を検出して記録する');
+ok(!dupCat.options.has(normalizeValue('ローズ')), '衝突したキーは辞書から消える (先勝ちさせない)');
+ok(!expandOp({ catalog: dupCat, op: '1本目:ローズ|2本目:サボン_sabon10|3本目:サボン_sabon10' }).ok,
+  '曖昧な選択肢は解決せず ok=false になる');
+eq(expandOp({ catalog: dupCat, op: '1本目:サボン_sabon10|2本目:サボン_sabon10|3本目:サボン_sabon10' }).lines.length,
+  3, '衝突と無関係な選択肢は今までどおり解決できる');
+
+console.log('\n=== #2 部分文字列での誤展開 ===');
+const subKnown = new Set(['abc10', 'abc100x', 'sabon10']);
+const subCat = buildCatalog({
+  setCode: 'sub-3',
+  rmsOptions: [
+    { displayName: '1本目', selections: [{ displayValue: 'テストA_abc10' }, { displayValue: 'サボン_sabon10' }] },
+    { displayName: '2本目', selections: [] },
+    { displayName: '3本目', selections: [] },
+  ],
+  knownProductCodes: subKnown,
+});
+ok(subCat.skus.includes('abc10'), '前提: abc10 はこのセットの許可SKU');
+const subRes = expandOp({ catalog: subCat, op: '1本目:別商品_abc100x|2本目:サボン_sabon10|3本目:サボン_sabon10' });
+ok(subRes.lines[0]?.code !== 'abc10', '🚨 abc100x を abc10 と誤解しない (部分一致で拾わない)');
+eq(subRes.lines[0]?.code, 'abc100x', '商品マスタに実在する abc100x として解決する');
+ok(!expandOp({ catalog: subCat, op: '1本目:未登録_abc10zzz|2本目:サボン_sabon10|3本目:サボン_sabon10' }).ok,
+  'どこにも実在しないコードは解決せず止まる');
+
+console.log('\n=== #3 選択枠の数の検証 ===');
+ok(!expandOp({ catalog: aeCat, op: '1本目:ローズ_ae-rose10|2本目:サボン_sabon10|3本目:サボン_sabon10' }).ok,
+  '🚨 5本セットで3枠しか読めなければ ok=false (全部解決できても通さない)');
+ok(expandOp({ catalog: aeCat, op: '1本目:ローズ_ae-rose10|2本目:サボン_sabon10|3本目:サボン_sabon10' })
+  .warnings.some((w) => /5個/.test(w)), '何個あるはずかを警告に書く');
+ok(!expandOp({ catalog: waCat, op: '1本目:カモミール|1本目:ローズ|3本目:サンダルウッド' }).ok,
+  '同じ枠が2回出てきたら ok=false');
+const noLabelCat = buildCatalog({ setCode: 'x', rmsOptions: [], manualRows: [{ option: 'あ', code: 'sabon10' }], knownProductCodes: known });
+ok(!expandOp({ catalog: noLabelCat, op: '1本目:あ' }).ok,
+  '選択枠の数が分からない (RMS定義なし) なら展開しない');
+
+console.log('\n=== #4 値の中の記号をラベルと誤認しない ===');
+const eqRes = expandOp({ catalog: waCat, op: '1本目:カモミール|2本目:ローズ|3本目:サンダルウッド' });
+ok(eqRes.ok, '前提: 通常の3枠は通る');
+eq(splitOp('1本目:あ=い|2本目:う|3本目:え', waCat.labels).map((p) => p.value), ['あ=い', 'う', 'え'],
+  '🚨 値の中の = をラベル区切りと誤認して値を切らない');
+eq(splitOp('1本目:A,B|2本目:う|3本目:え', waCat.labels).map((p) => p.value), ['A,B', 'う', 'え'],
+  '値の中の , でも切らない');
+
+console.log('\n=== #10 数量は補正せず拒否する ===');
+for (const q of [0, -10, 1.5, 'あ', '', null, 1000]) {
+  ok(!expandOp({ catalog: waCat, op: '1本目:カモミール|2本目:ローズ|3本目:サンダルウッド', quantity: q }).ok,
+    `受注数 ${JSON.stringify(q)} は拒否する`);
+}
+ok(expandOp({ catalog: waCat, op: '1本目:カモミール|2本目:ローズ|3本目:サンダルウッド', quantity: 3 }).lines
+  .every((l) => l.quantity === 3), '正しい数量はそのまま使う');
 
 console.log(`\n合計: ${pass} pass / ${fail} NG`);
 process.exit(fail === 0 ? 0 : 1);

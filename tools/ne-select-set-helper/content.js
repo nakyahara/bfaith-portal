@@ -25,6 +25,57 @@
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /**
+   * 受注数の読み取り。
+   * 🚨 `parseInt(...) || 1` は 0・空欄・非数値を全部 1 にしてしまい、
+   *   読み取り失敗が「受注数1」として通っていた (Codexレビュー2巡目 / 2026-08-08)。
+   *   きれいな整数でなければ null を返し、その行は展開させない。
+   */
+  function parseQuantity(text) {
+    const s = String(text == null ? '' : text).replace(/[,\s]/g, '');
+    if (!/^\d+$/.test(s)) return null;
+    const n = Number(s);
+    return Number.isInteger(n) && n >= 1 && n <= 999 ? n : null;
+  }
+
+  const rowKey = (code, quantity) => `${code}×${quantity}`; // 例: ae-rose10×2
+
+  function multiset(rows) {
+    const m = new Map();
+    for (const r of rows) {
+      const k = rowKey(r.code, r.quantity);
+      m.set(k, (m.get(k) || 0) + 1);
+    }
+    return m;
+  }
+
+  /**
+   * 貼付け前後の明細を突き合わせて「今回増えた行」だけを取り出す。
+   * 🚨 「全行の中に期待した行があるか」で見ると、貼付け前から在った行を
+   *   今回の成果として数えてしまう (Codexレビュー2巡目 / 2026-08-08)。
+   */
+  function diffRows(before, after) {
+    const b = multiset(before);
+    const a = multiset(after);
+    const added = [];
+    const removed = [];
+    for (const [k, n] of a) for (let i = 0; i < n - (b.get(k) || 0); i++) added.push(k);
+    for (const [k, n] of b) for (let i = 0; i < n - (a.get(k) || 0); i++) removed.push(k);
+    return { added, removed };
+  }
+
+  /** 増えた行が、こちらが指示した内容とぴったり一致するか (足りない・余分の両方を見る) */
+  function compareAdded(addedKeys, expectedRows) {
+    const want = multiset(expectedRows);
+    const got = new Map();
+    for (const k of addedKeys) got.set(k, (got.get(k) || 0) + 1);
+    const missing = [];
+    const extra = [];
+    for (const [k, n] of want) for (let i = 0; i < n - (got.get(k) || 0); i++) missing.push(k);
+    for (const [k, n] of got) for (let i = 0; i < n - (want.get(k) || 0); i++) extra.push(k);
+    return { ok: !missing.length && !extra.length, missing, extra };
+  }
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
   function send(msg) {
@@ -67,7 +118,7 @@
         tr,
         code: text(cols.code),
         op: text(cols.op),
-        quantity: parseInt(text(cols.qty), 10) || 1,
+        quantity: parseQuantity(text(cols.qty)),
         cancelled: (() => {
           const cb = cols.cancel != null && tds[cols.cancel] ? tds[cols.cancel].querySelector('input[type=checkbox]') : null;
           return cb ? cb.checked : null;
@@ -83,20 +134,77 @@
     el.dispatchEvent(new Event('change', { bubbles: true }));
   }
 
-  /** 元の架空SKU行のキャンセルにチェックを入れる (貼付け後にグリッドが再描画されるので引き直す) */
-  function tickCancel(setCode) {
+  /**
+   * 展開対象の元行を一意に特定する。
+   * 🚨 商品コードだけで探すと、同じセットを2行買われた伝票で別の行をキャンセルしてしまう
+   *   (Codexレビュー #6 / 2026-08-08)。商品コード+商品op+受注数で絞り、
+   *   それでも一意にならなければ、展開を始めたときの行位置が一致するかで確かめる。
+   *   どちらでも決まらないなら手を出さない。
+   */
+  function findTargetRow(t) {
     const { rows, cols } = readRows();
-    if (cols.cancel == null) return false;
-    const target = rows.find((r) => r.code === setCode);
-    if (!target) return false;
-    const tds = [...target.tr.querySelectorAll('td')];
-    const cb = tds[cols.cancel] ? tds[cols.cancel].querySelector('input[type=checkbox]') : null;
-    if (!cb || cb.checked) return !!cb;
-    cb.click();
-    return true;
+    const same = rows.filter((r) => r.code === t.code && r.op === t.op && r.quantity === t.quantity);
+    if (same.length === 1) return { row: same[0], cols };
+    const byIndex = rows[t.index];
+    if (byIndex && byIndex.code === t.code && byIndex.op === t.op && byIndex.quantity === t.quantity) {
+      return { row: byIndex, cols };
+    }
+    return { row: null, cols, reason: same.length === 0 ? '見つかりません' : '同じ内容の行が複数あって特定できません' };
   }
 
-  async function apply(setCode, paste, statusEl) {
+  function isCancelled(row, cols) {
+    if (cols.cancel == null) return null;
+    const tds = [...row.tr.querySelectorAll('td')];
+    const cb = tds[cols.cancel] ? tds[cols.cancel].querySelector('input[type=checkbox]') : null;
+    return cb ? cb.checked : null;
+  }
+
+  /**
+   * 期待した行数だけ増え、さらに「しばらく変化しない」ことを確認してから返す。
+   * 🚨 期待行数に達した瞬間に照合すると、NEが段階的に行を足す場合に
+   *   後から現れる余分な行を見逃す (Codexレビュー3巡目 / 2026-08-08)。
+   *   固定sleepではなく「増えた行の中身が一定時間ずっと同じ」を条件にする。
+   * @param {function} readCurrent テスト差し替え用。既定はDOMから読む
+   */
+  async function waitForStableAdded(before, count, opts = {}) {
+    const { timeoutMs = 12000, quietMs = 800, readCurrent = currentRows } = opts;
+    const started = Date.now();
+    let lastKey = null;
+    let stableSince = Date.now();
+    let added = [];
+    while (Date.now() - started < timeoutMs) {
+      added = diffRows(before, readCurrent()).added.slice().sort();
+      const key = added.join('|');
+      if (key !== lastKey) {
+        lastKey = key;
+        stableSince = Date.now();
+      } else if (added.length >= count && Date.now() - stableSince >= quietMs) {
+        return { added, stable: true };
+      }
+      await sleep(200);
+    }
+    return { added, stable: false };
+  }
+
+  /** 明細を「商品コード+受注数」だけの素の配列で読む (照合用) */
+  function currentRows() {
+    return readRows().rows.map((r) => ({ code: r.code, quantity: r.quantity }));
+  }
+
+  let applying = false; // ページ単位のロック。共通の貼付け欄を同時に触らせない
+
+  /**
+   * 明細を追加して元行をキャンセルする。
+   * 🚨 「追加」と「キャンセル」は1つの操作にできないので、やった結果を必ずDOMから確認する。
+   *   以前は固定900ms待って成功表示していたため、再描画が遅い・行の取り違え・例外のときに
+   *   「成功しました」と出たまま元行が残る可能性があった (Codexレビュー #5 / 2026-08-08)。
+   */
+  async function apply(t, expected, statusEl) {
+    if (applying) {
+      statusEl.textContent = '⚠ 別の行を処理中です。終わってからもう一度押してください。';
+      statusEl.className = 'bf-status bf-err';
+      return false;
+    }
     const codes = document.querySelector(A.codes);
     const qtys = document.querySelector(A.quantities);
     const btn = document.querySelector(A.paste);
@@ -105,19 +213,101 @@
       statusEl.className = 'bf-status bf-err';
       return false;
     }
-    setValue(codes, paste.codes);
-    setValue(qtys, paste.quantities);
-    // ここでNEが「貼り付けを完了しました」のalertを出す。拡張からは閉じられないので人がOKを押す
-    btn.click();
-    await sleep(900);
-    setValue(codes, '');
-    setValue(qtys, '');
-    const ticked = tickCancel(setCode);
-    statusEl.innerHTML = ticked
-      ? '✅ ' + paste.rowCount + '行を追加し、元の行をキャンセルにしました。<b>内容を確認して「更新保存」→「再計算しますか?」は必ず【キャンセル】</b>'
-      : '✅ ' + paste.rowCount + '行を追加しました。⚠ 元の行のキャンセルは自動で入りませんでした。手で入れてください。';
-    statusEl.className = 'bf-status ' + (ticked ? 'bf-ok' : 'bf-err');
-    return true;
+
+    // 照会したときと伝票の中身が変わっていないか、直前にもう一度確かめる
+    const pre = findTargetRow(t);
+    if (!pre.row) {
+      statusEl.textContent = `⚠ 対象の行を特定できません (${pre.reason})。画面を再読込してやり直してください。`;
+      statusEl.className = 'bf-status bf-err';
+      return false;
+    }
+    // 🚨 貼付け前の明細をそのまま控える。行数だけだと「元から在った行」を
+    //   今回追加された行として数えてしまう (Codexレビュー2巡目 / 2026-08-08)
+    const before = currentRows();
+
+    applying = true;
+    setBusy(true);
+    try {
+      setValue(codes, expected.codesText);
+      setValue(qtys, expected.qtysText);
+      // ここでNEが「貼り付けを完了しました」のalertを出す。拡張からは閉じられないので人がOKを押す
+      btn.click();
+
+      const wait = await waitForStableAdded(before, expected.rows.length);
+      setValue(codes, '');
+      setValue(qtys, '');
+      if (!wait.added.length) {
+        return fail(statusEl, '明細行が増えませんでした。貼り付けに失敗している可能性があります。');
+      }
+      if (!wait.stable) {
+        return fail(statusEl, '明細の追加が落ち着きません。画面を再読込して状態を確認してください。');
+      }
+
+      // 増えた行が、こちらが指示した内容とぴったり一致するか (足りない・余分の両方を見る)
+      const diff = diffRows(before, currentRows());
+      const cmp = compareAdded(diff.added, expected.rows);
+      if (diff.removed.length) {
+        return fail(statusEl, `消えた明細行があります (${diff.removed.join(', ')})。`);
+      }
+      if (!cmp.ok) {
+        const parts = [];
+        if (cmp.missing.length) parts.push(`足りない: ${cmp.missing.join(', ')}`);
+        if (cmp.extra.length) parts.push(`余分: ${cmp.extra.join(', ')}`);
+        return fail(statusEl, `追加された明細が指示と一致しません (${parts.join(' / ')})。`);
+      }
+
+      // 元の架空SKU行をキャンセルにする
+      const post = findTargetRow(t);
+      if (!post.row) {
+        return fail(statusEl, `元の行を特定できません (${post.reason})。元の行のキャンセルを手で入れてください。`);
+      }
+      if (post.cols.cancel == null) {
+        return fail(statusEl, 'キャンセル列が表示されていません。元の行のキャンセルを手で入れてください。');
+      }
+      if (!isCancelled(post.row, post.cols)) {
+        const tds = [...post.row.tr.querySelectorAll('td')];
+        const cb = tds[post.cols.cancel]?.querySelector('input[type=checkbox]');
+        if (!cb) return fail(statusEl, 'キャンセルのチェックボックスが見つかりません。手で入れてください。');
+        cb.click();
+        await sleep(400);
+      }
+      const verify = findTargetRow(t);
+      if (!verify.row || isCancelled(verify.row, verify.cols) !== true) {
+        return fail(statusEl, '元の行をキャンセルにできませんでした。手で入れてください。');
+      }
+
+      // 🚨 キャンセル操作のあとにも、明細がまだ指示どおりのままか確かめる
+      //   (この間に遅れて行が増えている可能性がある)
+      const finalCmp = compareAdded(diffRows(before, currentRows()).added, expected.rows);
+      if (!finalCmp.ok) {
+        return fail(statusEl, '最後の確認で明細が指示と一致しなくなりました。');
+      }
+
+      statusEl.innerHTML = '✅ ' + expected.rows.length + '行を追加し、元の行をキャンセルにしました。'
+        + '<b>内容を確認して「更新保存」→「再計算しますか?」は必ず【キャンセル】</b>';
+      statusEl.className = 'bf-status bf-ok';
+      return true;
+    } catch (e) {
+      return fail(statusEl, '処理中にエラーが起きました: ' + (e && e.message ? e.message : String(e)));
+    } finally {
+      applying = false;
+      setBusy(false);
+    }
+  }
+
+  /** 途中で失敗したときは「保存しないでください」を強く出す (中途半端な状態で保存されるのが一番まずい) */
+  function fail(statusEl, msg) {
+    statusEl.innerHTML = '⚠ ' + esc(msg)
+      + '<br><b>この伝票はまだ保存しないでください。</b>画面を再読込して状態を確認してから、手作業で直してください。';
+    statusEl.className = 'bf-status bf-err';
+    return false;
+  }
+
+  /** 処理中は全部のボタンを止める (共通の貼付け欄を別の行が上書きしないように) */
+  function setBusy(busy) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    for (const b of panel.querySelectorAll('button')) b.disabled = busy;
   }
 
   function renderPreview(d) {
@@ -160,8 +350,11 @@
       + targets.map((t, i) =>
         '<div class="bf-row" data-i="' + i + '">'
         + '<div class="bf-rowhead"><span class="bf-mono">' + esc(t.code) + '</span>'
-        + ' <span class="bf-hint">受注数 ' + t.quantity + '</span>'
-        + ' <button class="bf-btn bf-expand">展開する</button>'
+        + (t.quantity == null
+          // 受注数を読み取れない = 画面の見方が想定と違う。触らせない
+          ? ' <span class="bf-status bf-err">受注数を読み取れませんでした。手作業で入れてください。</span>'
+          : ' <span class="bf-hint">受注数 ' + t.quantity + '</span>'
+            + ' <button class="bf-btn bf-expand">展開する</button>')
         + ' <span class="bf-status"></span></div>'
         + '<div class="bf-preview"></div>'
         + '</div>').join('');
@@ -211,8 +404,13 @@
             qtys.push(String(d.omake.quantity));
           }
         }
-        btn.disabled = true;
-        await apply(t.code, { codes: codes.join('\n'), quantities: qtys.join('\n'), rowCount: codes.length }, statusEl);
+        const expected = {
+          rows: codes.map((c, i) => ({ code: c, quantity: parseInt(qtys[i], 10) || 0 })),
+          codesText: codes.join('\n'),
+          qtysText: qtys.join('\n'),
+        };
+        const okApplied = await apply(t, expected, statusEl);
+        if (okApplied) btn.disabled = true; // 成功したときだけ二度押しを止める
       }
     });
   }
@@ -238,4 +436,9 @@
   }
 
   init();
+
+  // テスト用に純粋な部品だけ公開する (拡張の isolated world 内なのでページ側からは見えない)
+  if (typeof globalThis !== 'undefined') {
+    globalThis.__bfSelectSetInternals = { parseQuantity, diffRows, compareAdded, multiset, rowKey, waitForStableAdded };
+  }
 })();

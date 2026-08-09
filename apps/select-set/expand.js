@@ -73,22 +73,40 @@ export function extractCodeCandidates(displayValue) {
  */
 export function buildCatalog({ setCode, rmsOptions = [], manualRows = [], knownProductCodes = new Set() }) {
   const options = new Map();
+  const source = new Map();          // 正規化キー → 'rms' | 'manual' (どちらが登録したか)
+  const ambiguousKeys = new Set();   // 別SKUがぶつかったキー。二度と登録しない
   const skus = new Set();
   const unresolved = [];
   const labels = [];
   const conflicts = [];
 
-  const put = (rawOption, code, { force = false } = {}) => {
+  /**
+   * 🚨 曖昧なキーは「登録しない」だけでは足りない。
+   *   先に入っていた方を消さないと、最初に出たSKUへ黙って展開されてしまう
+   *   (Codexレビュー #1 / 2026-08-08)。消したうえで、以後の再登録も禁止する。
+   * 優先順位: 手動 > RMS。同じ種類同士でぶつかったら曖昧として捨てる。
+   */
+  const put = (rawOption, code, { from = 'rms' } = {}) => {
     const key = normalizeValue(rawOption);
     if (!key || !code) return;
+    if (ambiguousKeys.has(key)) return;
     const prev = options.get(key);
     if (prev && prev !== code) {
-      if (!force) {
-        conflicts.push({ option: rawOption, a: prev, b: code });
-        return; // 曖昧なものは登録しない (誤展開より止まる方がよい)
+      const prevFrom = source.get(key);
+      if (prevFrom === 'rms' && from === 'manual') {
+        options.set(key, code);      // 手動でRMSを上書きするのは意図した動き
+        source.set(key, 'manual');
+        skus.add(code);
+        return;
       }
+      if (prevFrom === 'manual' && from === 'rms') return; // 手動を守る
+      conflicts.push({ option: rawOption, a: prev, b: code, from });
+      options.delete(key);
+      ambiguousKeys.add(key);
+      return;
     }
     options.set(key, code);
+    source.set(key, from);
     skus.add(code);
   };
 
@@ -113,8 +131,12 @@ export function buildCatalog({ setCode, rmsOptions = [], manualRows = [], knownP
     for (const sel of opt?.selections || []) {
       const dv = String(sel?.displayValue || '').trim();
       if (!dv) continue;
-      const code = extractCodeCandidates(dv).find((c) => knownProductCodes.has(c.toLowerCase()));
-      if (code) register(dv, code);
+      // 🚨 候補が複数の実在コードに割れたら採らない。
+      //   以前は最初に見つかったものを採っていたため、取り違えの余地があった
+      //   (Codexレビュー2巡目 / 2026-08-08)。
+      const cands = [...new Set(extractCodeCandidates(dv).map((c) => c.toLowerCase()))]
+        .filter((c) => knownProductCodes.has(c));
+      if (cands.length === 1) register(dv, cands[0], { from: 'rms' });
       else unresolved.push(dv);
     }
   }
@@ -122,14 +144,29 @@ export function buildCatalog({ setCode, rmsOptions = [], manualRows = [], knownP
   // 手動補完は RMS より優先度が高い (RMSの文字数制限で切れたコードの別名などを直せるように)
   for (const row of manualRows) {
     if (!row?.option || !row?.code) continue;
-    register(row.option, row.code, { force: true });
+    register(row.option, row.code, { from: 'manual' });
   }
+
+  const skuList = [...skus];
+  // RMS側の選択枠ラベルが重複していると期待枠数を多く数えてしまい、正常な注文が
+  // 展開できなくなる。理由が分かるように明示しておく (Codexレビュー2巡目 / 2026-08-08)
+  const pickNames = labels.filter((l) => l.isPick).map((l) => normalizeValue(l.name));
+  const labelIssue = pickNames.length !== new Set(pickNames).size
+    ? '楽天の選択肢定義で選択枠のラベルが重複しています'
+    : null;
 
   return {
     setCode,
     labels,
+    labelIssue,
+    /** 期待される選択枠の数。ここと実際に解決できた行数が一致しないと展開しない */
+    expectedPicks: labelIssue ? 0 : pickNames.length,
+    /** RMSが返したラベル名の集合。未知のラベルが出てきたら止めるために使う */
+    labelNames: new Set(labels.map((l) => normalizeValue(l.name))),
     options,
-    skus: [...skus].sort((a, b) => b.length - a.length), // 長い順 = 最長一致
+    ambiguousKeys,
+    skus: skuList,
+    skuSet: new Set(skuList.map((c) => c.toLowerCase())),
     knownProductCodes,
     unresolved,
     conflicts,
@@ -161,16 +198,25 @@ export function splitOp(op, labels = []) {
   // 例: RMSは「シークレットプレゼントについては」だが、過去の受注には
   //     「おまけについては」で入っているものがある。これを拾えないと、
   //     直前の選択枠の値に「真正ラベンダー|おまけについては:当店が…」と丸ごと吸われて解決に失敗する。
-  // ラベルに空白を含めないのが肝: ganesh の「スティック型_WHITE　MUSK」のように
-  // 値に空白が入るモール (Yahoo!は空白区切り) で、値の途中を誤ってラベルと見なさないため。
-  const generic = new RegExp('(?:^|[|,&\\s])([^|,&:：=＝\\s]{1,40})' + SEP + '\\s*', 'g');
-  let g;
-  while ((g = generic.exec(text)) !== null) {
-    const start = g.index + (g[0].length - g[0].replace(/^[|,&\s]+/, '').length);
-    const valueStart = g.index + g[0].length;
-    const covered = anchors.some((a) => (start >= a.start && start < a.valueStart) || a.valueStart === valueStart);
-    if (covered) continue;
-    anchors.push({ label: g[1], isPick: isPickLabel(g[1]), start, valueStart });
+  //
+  // 🚨 以前は「区切り文字と : を含まない40文字以内の塊」を全部ラベル候補にしていたが、
+  //   値の中に `xxx=yyy` が入ると xxx をラベルと誤認して値を途中で切る危険があった
+  //   (Codexレビュー #4 / 2026-08-08)。そこで拾う対象を次の2つだけに絞る:
+  //     ・「〜については」「〜について」で終わる補足ラベル (おまけ・同意確認の類)
+  //     ・「N本目」「N種類目」などの選択枠ラベル
+  //   どちらも業務上の定型で、商品名の途中に現れることはまずない。
+  const AUX = new RegExp('(?:^|[|,&\\s])([^|,&:：=＝\\s]{1,30}については?)\\s*' + SEP + '\\s*', 'g');
+  const PICK = new RegExp('(?:^|[|,&\\s])(\\d+\\s*(?:本|種類|個|点|品|色)?\\s*目)\\s*' + SEP + '\\s*', 'g');
+  for (const re of [AUX, PICK]) {
+    let g;
+    while ((g = re.exec(text)) !== null) {
+      const lead = g[0].length - g[0].replace(/^[|,&\s]+/, '').length;
+      const start = g.index + lead;
+      const valueStart = g.index + g[0].length;
+      const covered = anchors.some((a) => (start >= a.start && start < a.valueStart) || a.valueStart === valueStart);
+      if (covered) continue;
+      anchors.push({ label: g[1], isPick: isPickLabel(g[1]), start, valueStart, viaGuess: true });
+    }
   }
 
   anchors.sort((a, b) => a.start - b.start);
@@ -179,6 +225,7 @@ export function splitOp(op, labels = []) {
     return {
       label: a.label,
       isPick: a.isPick,
+      viaGuess: !!a.viaGuess,
       value: text.slice(a.valueStart, end).replace(/[|,&\s、]+$/g, '').trim(),
     };
   });
@@ -190,32 +237,48 @@ function escapeRe(s) {
 
 /**
  * 1つの選択肢の値 → 商品コード。次の順で解決する。
- *   1. embedded … このセットで許可されたSKUが値に埋まっている (最長一致)
- *   2. label    … 表示名の辞書引き (正規化して突き合わせ)
- *   3. master   … 選択肢定義には無いが、値から取り出したコードがNE商品マスタに実在する
+ *   1. label    … 選択肢定義との完全一致 (正規化して突き合わせ)。一番確実なのでこれを先に見る
+ *   2. embedded … 「_ の後ろ」「】の後ろ」「末尾の英数字塊」から取り出した候補が、
+ *                 そのセットで許可されたSKUと完全一致し、かつ候補が1つに定まるとき
+ *   3. master   … 選択肢定義には無いが、取り出した候補がNE商品マスタに実在するとき
  *
  * 3 が要る理由 (2026-08-07 実測): RMSは「楽天の・今の」選択肢しか持たないため、
  * 楽天で廃止した香りや他モール限定の選択肢が解決できない
  * (例: selecteo10ml3 の「7.ロ-ズマリ-シネオ-ル_cineole10」は cineole10 が在庫934で実在するのに
  *  楽天の現行ページには無い)。ただし 3 は選択肢定義の裏付けが無い推定なので、
  * 呼び出し側で「マスタ照合で拾った」と明示して人に見せること。
- * 値の中を総当たりで探すのではなく「_ の後ろ」「】の後ろ」「末尾の英数字塊」という
- * 位置から取り出した候補だけを照合するので、誤爆はしにくい。
+ *
+ * 🚨 以前は「許可SKUが値に含まれていれば採用」(部分文字列一致) を最優先にしていたが、
+ *   `abc10` が `abc100` や `xabc10-old` にも一致してしまい、別SKUへ誤展開する危険があった
+ *   (Codexレビュー #2 / 2026-08-08)。境界のない包含判定は廃止し、
+ *   構造化された位置から取り出した候補の完全一致だけを使う。
+ *   候補が複数のSKUに割れたときは、選ばずに null を返して止める。
  */
 export function resolveValue(catalog, value) {
   const v = String(value || '');
   if (!v.trim()) return null;
-  const lower = v.toLowerCase();
-  for (const sku of catalog.skus) {            // 長い順に見る
-    if (lower.includes(sku.toLowerCase())) return { code: sku, via: 'embedded' };
-  }
-  const hit = catalog.options.get(normalizeValue(v));
+
+  const key = normalizeValue(v);
+  if (catalog.ambiguousKeys?.has(key)) return null; // 曖昧と分かっているキーは触らない
+  const hit = catalog.options.get(key);
   if (hit) return { code: hit, via: 'label' };
-  const known = catalog.knownProductCodes;
-  if (known && known.size) {
-    const c = extractCodeCandidates(v).find((x) => known.has(x.toLowerCase()));
-    if (c) return { code: c, via: 'master' };
+
+  const candidates = [...new Set(extractCodeCandidates(v).map((c) => c.toLowerCase()))];
+  const inSet = candidates.filter((c) => catalog.skuSet?.has(c));
+  const inMaster = candidates.filter((c) => catalog.knownProductCodes?.has(c));
+
+  // 🚨 一意性は「セットのSKU」と「商品マスタ」をまたいで見る。
+  //   段階ごとに見ると、片方がセットSKU・もう片方がマスタの実在コードだったときに
+  //   前者を勝手に採ってしまう (Codexレビュー2巡目 / 2026-08-08)。割れたら止める。
+  const union = [...new Set([...inSet, ...inMaster])];
+  if (union.length !== 1) return null;
+
+  if (inSet.length === 1) {
+    // 大文字小文字を元の登録どおりに戻す
+    const canonical = catalog.skus.find((s) => s.toLowerCase() === inSet[0]) || inSet[0];
+    return { code: canonical, via: 'embedded' };
   }
+  if (inMaster.length === 1) return { code: inMaster[0], via: 'master' };
   return null;
 }
 
@@ -246,11 +309,46 @@ export function pickOmake(priority = [], stockOf = () => null) {
 export function expandOp({ catalog, op, quantity = 1, omakePriority = [], stockOf = () => null }) {
   const warnings = [];
   const notices = [];
-  const qty = Math.max(1, parseInt(quantity, 10) || 1);
-  const parts = splitOp(op, catalog?.labels || []);
+  const bail = (msg) => ({ ok: false, lines: [], omake: null, parts: [], warnings: [msg], notices });
 
-  if (!parts.length) {
-    return { ok: false, lines: [], omake: null, parts: [], warnings: ['商品OPを選択肢に分割できませんでした'], notices };
+  // 🚨 数量は補正せず、おかしければ止める。
+  //   以前は 0・負数・非数値をすべて 1 に丸めていたため、DOMの読み取り失敗が
+  //   「受注数1」として通ってしまった (Codexレビュー #10 / 2026-08-08)。
+  const qty = Number(quantity);
+  if (!Number.isInteger(qty) || qty < 1 || qty > 999) {
+    return bail(`受注数「${quantity}」が不正です (1〜999の整数のみ)`);
+  }
+
+  const parts = splitOp(op, catalog?.labels || []);
+  if (!parts.length) return bail('商品OPを選択肢に分割できませんでした');
+
+  // 🚨 選択枠の数が分からない状態では展開しない。
+  //   以前は「見つかった枠が全部解けたらOK」だったので、5本セットで4枠しか
+  //   認識できなくても ok=true になっていた (Codexレビュー #3 / 2026-08-08)。
+  const expected = catalog?.expectedPicks || 0;
+  if (!expected) {
+    return bail(catalog?.labelIssue
+      || 'このセットの選択枠の数を確認できません (楽天の選択肢定義が取得できていない可能性があります)');
+  }
+
+  const seen = new Set();
+  for (const p of parts) {
+    if (!p.isPick) continue;
+    const k = normalizeValue(p.label);
+    if (seen.has(k)) return bail(`「${p.label}」が商品OPに2回以上あります`);
+    seen.add(k);
+  }
+  const foundPicks = parts.filter((p) => p.isPick).length;
+  if (foundPicks !== expected) {
+    return bail(`選択枠が${expected}個のはずですが、商品OPからは${foundPicks}個しか読み取れませんでした`);
+  }
+
+  // RMSにも「〜については」形にも当てはまらないラベルが出てきたら、読み違えている可能性が高い
+  const unknownLabels = parts
+    .filter((p) => !p.isPick && p.viaGuess && !catalog.labelNames?.has(normalizeValue(p.label)))
+    .map((p) => p.label);
+  if (unknownLabels.length) {
+    notices.push(`見慣れない項目がありました: ${[...new Set(unknownLabels)].join(' / ')}`);
   }
 
   const lines = [];
@@ -286,13 +384,13 @@ export function expandOp({ catalog, op, quantity = 1, omakePriority = [], stockO
     // 解決できない非選択枠 (「文字数の関係で〜:確認しました。」等の同意確認) は無視する
   }
 
-  const pickCount = parts.filter((p) => p.isPick).length;
-  if (!failed && pickCount === 0) {
+  // 最終確認: 期待した枠の数だけ明細行ができているか
+  if (!failed && lines.length !== expected) {
     failed = true;
-    warnings.push('商品を選ぶ枠 (N本目) が見つかりませんでした');
+    warnings.push(`明細行が${expected}行になるはずですが${lines.length}行しか作れませんでした`);
   }
 
-  return { ok: !failed, lines, omake, parts, warnings, notices };
+  return { ok: !failed, lines, omake, parts, warnings, notices, expectedPicks: expected };
 }
 
 /** NEの「明細入出力補助」に貼る形 (商品コードと受注数を改行区切り) に整える */
