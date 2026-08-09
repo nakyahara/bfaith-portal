@@ -151,11 +151,11 @@ router.get('/', (req, res) => {
     <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
+      <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
+      <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
       <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
-      <td data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
-      <td data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
     </tr>`).join('');
 
@@ -188,7 +188,7 @@ router.get('/', (req, res) => {
   ${filterBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>担当</th><th>AI</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
       <tbody>${trs || `<tr><td colspan="7" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
