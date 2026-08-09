@@ -230,7 +230,8 @@ export async function findUnshippedOrders(opts = {}) {
   const ctx = { ...base, now, leadDays };
 
   const endDate = base.today;
-  const startDate = addDaysStr(base.today, -searchDays);
+  // 今日を含めて searchDays 日ぶん (両端を含むので -1)
+  const startDate = addDaysStr(base.today, -(searchDays - 1));
 
   const { numbers: orderNumbers, truncated } = await searchUnshippedOrderNumbers(startDate, endDate);
   console.log(`[rakuten-unshipped] 未発送の注文: ${orderNumbers.length}件 (${startDate}〜${endDate})`);
@@ -238,16 +239,17 @@ export async function findUnshippedOrders(opts = {}) {
   const alerts = [];
   const holds = [];
   let badDatetimes = 0;
-  let fetched = 0;
+  // getOrder が黙って返さなかった注文 (削除・権限etc) を注文番号単位で突合する
+  // (件数差だと「重複+欠落」が相殺して見逃す — Codexレビュー2巡目)
+  const unreturned = new Set(orderNumbers);
   for (let i = 0; i < orderNumbers.length; i += 100) {
     const batch = orderNumbers.slice(i, i + 100);
     const d = await callRMS('getOrder', {
       orderNumberList: batch,
       version: 7,
     });
-    const orders = d.OrderModelList || [];
-    fetched += orders.length;
-    for (const o of orders) {
+    for (const o of (d.OrderModelList || [])) {
+      unreturned.delete(o?.orderNumber);
       const kind = classifyOrder(o, ctx);
       if (kind === 'skip') continue;
       if (kind === 'bad_datetime') {
@@ -258,10 +260,9 @@ export async function findUnshippedOrders(opts = {}) {
       (kind === 'alert' ? alerts : holds).push(summarizeOrder(o, ctx));
     }
   }
-  // getOrder が黙って返さなかった注文 (削除・権限etc) も不完全さとして数える (Codexレビュー#6)
-  const missingDetails = Math.max(0, orderNumbers.length - fetched);
+  const missingDetails = unreturned.size;
   if (missingDetails > 0) {
-    console.warn(`[rakuten-unshipped] getOrder が ${missingDetails}件 返しませんでした`);
+    console.warn(`[rakuten-unshipped] getOrder が ${missingDetails}件 返しませんでした: ${[...unreturned].slice(0, 5).join(', ')}${missingDetails > 5 ? ' …' : ''}`);
   }
 
   const byFixedAt = (a, b) => (a.fixedAt?.getTime() ?? 0) - (b.fixedAt?.getTime() ?? 0);
