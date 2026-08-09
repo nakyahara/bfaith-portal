@@ -65,6 +65,7 @@ import siteContactRouter from './apps/site-contact/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
+import { startRakutenUnshippedCron } from './apps/rakuten-unshipped/notify-job.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
@@ -1507,6 +1508,10 @@ app.listen(PORT, () => {
   // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
   startProductHubIntakeCron();
+
+  // 楽天 未発送アラート (前日12時締めまでに入金確認済みなのに未発送の注文を毎朝08:00に通知。
+  // RAKUTEN_UNSHIPPED_ENABLED=1 で起動、Dark Launch)
+  startRakutenUnshippedCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();

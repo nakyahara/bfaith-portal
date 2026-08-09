@@ -269,6 +269,25 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「intake」を検索。mirror_too_small/mirror_empty = daily-sync 未完か同期途中 (miniPC側を確認)。'
       + '手動実行 = product-hub 一覧 (admin) の「NE取込を今すぐ実行」。2026-08-05 点火 (初回はシードのみ・翌日から自動作成)',
   },
+  {
+    id: 'rakuten-unshipped-alert',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '楽天の「入金確認済みなのに未発送」注文を朝イチで GChat 通知 (出荷漏れの発見)。'
+      + '12時締めなので、前日12:00までに受注確定 (=入金確認) した注文は当日出荷済みのはず。'
+      + '翌朝まだ未発送で残っていたら出荷漏れ',
+    where: 'Render bfaith-portal 内 node-cron (apps/rakuten-unshipped/notify-job.js、RAKUTEN_UNSHIPPED_ENABLED=1)',
+    schedule: '毎日 08:00',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 0,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「rakuten-unshipped」を検索。0件の日も「0件」を通知するので、'
+      + '通知が来ない = ジョブが落ちている。RMS API (searchOrder/getOrder) と GCHAT_WEBHOOK_SHIPPING に依存。'
+      + '手動実行 = Render Shell で node apps/rakuten-unshipped/notify-job.js --once '
+      + '(--dry-run を付けると GChat へ送らず本文だけ出す)',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている
