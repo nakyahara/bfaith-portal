@@ -191,6 +191,43 @@
     return readRows().rows.map((r) => ({ code: r.code, quantity: r.quantity }));
   }
 
+  // ---- 明細入出力補助ダイアログの操作 ----
+  // 🚨 貼付けボタンは、ダイアログを一度も開いていないページでは反応しないことがある
+  //   (2026-08-09 実機: 8/7の検証が通ったのは、直前に人が手でダイアログを開いていた伝票だったため。
+  //    未オープンの伝票では click しても行が増えなかった)。
+  //   まず静かに試し、増えなければ公式にダイアログを開いてから再試行する。
+
+  function assistDialog() {
+    return document.getElementById('meisaiAssist-Dlg');
+  }
+
+  function assistDialogVisible() {
+    const d = assistDialog();
+    return d ? getComputedStyle(d).visibility !== 'hidden' : null;
+  }
+
+  function openAssistDialog() {
+    const btn = document.getElementById('show-meisai_as-btn') || document.getElementById('sub_menu_01_07_lnk');
+    if (!btn) return false;
+    btn.click();
+    return true;
+  }
+
+  async function waitAssistVisible(timeoutMs = 4000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (assistDialogVisible()) return true;
+      await sleep(150);
+    }
+    return false;
+  }
+
+  /** 開いたダイアログを元の状態 (visibility:hidden) に戻す */
+  function hideAssistDialog() {
+    const d = assistDialog();
+    if (d) d.style.visibility = 'hidden';
+  }
+
   let applying = false; // ページ単位のロック。共通の貼付け欄を同時に触らせない
 
   /**
@@ -227,17 +264,36 @@
 
     applying = true;
     setBusy(true);
+    let openedDialog = false;
     try {
-      setValue(codes, expected.codesText);
-      setValue(qtys, expected.qtysText);
-      // ここでNEが「貼り付けを完了しました」のalertを出す。拡張からは閉じられないので人がOKを押す
-      btn.click();
+      const doPaste = () => {
+        setValue(codes, expected.codesText);
+        setValue(qtys, expected.qtysText);
+        // ここでNEが「貼り付けを完了しました」のalertを出す。拡張からは閉じられないので人がOKを押す
+        btn.click();
+      };
 
-      const wait = await waitForStableAdded(before, expected.rows.length);
+      // 1回目: ダイアログを開かず静かに試す (開いていた/初期化済みのページではこれで通る)
+      doPaste();
+      let wait = await waitForStableAdded(before, expected.rows.length, { timeoutMs: 5000 });
+
+      // 2回目: 1行も増えていなければ、ダイアログを公式に開いて初期化してから再試行。
+      //   「1行も増えていない」ときだけ再試行するので、二重貼りにはならない
+      //   (万一二重になっても、後段の差分照合が「余分」を検出して保存を止める)
+      if (!wait.added.length) {
+        console.info('[選べるセット展開] 貼付けが反応しないため、明細入出力補助を開いて再試行します');
+        if (openAssistDialog()) {
+          openedDialog = true;
+          await waitAssistVisible();
+          doPaste();
+          wait = await waitForStableAdded(before, expected.rows.length, { timeoutMs: 12000 });
+        }
+      }
+
       setValue(codes, '');
       setValue(qtys, '');
       if (!wait.added.length) {
-        return fail(statusEl, '明細行が増えませんでした。貼り付けに失敗している可能性があります。');
+        return fail(statusEl, '明細行が増えませんでした。メニューの「明細入出力補助」から手作業で入れてください。');
       }
       if (!wait.stable) {
         return fail(statusEl, '明細の追加が落ち着きません。画面を再読込して状態を確認してください。');
@@ -295,6 +351,7 @@
     } catch (e) {
       return fail(statusEl, '処理中にエラーが起きました: ' + (e && e.message ? e.message : String(e)));
     } finally {
+      if (openedDialog) hideAssistDialog();
       applying = false;
       setBusy(false);
     }
