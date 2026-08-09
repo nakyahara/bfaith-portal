@@ -211,5 +211,22 @@ eq(exitCodeFor({ partial: true }), 2, '不完全 → 2 (daily-syncで❌かつre
 eq(exitCodeFor({}), 0, 'partial 未指定 → 0');
 eq(exitCodeFor(null), 0, 'null でも落ちない');
 
+// daily-sync 側の前提: runScript (execFileSync) は非ゼロ終了で throw し、e.status に
+// 終了コードが入る。ここが崩れると exit 2 → blocked:true の判定が黙って効かなくなる
+{
+  const { execFileSync } = await import('node:child_process');
+  const statusOf = (code) => {
+    try {
+      execFileSync(process.execPath, ['-e', `process.exit(${code})`], { stdio: 'ignore' });
+      return 0;
+    } catch (e) {
+      return e.status;
+    }
+  };
+  eq(statusOf(0), 0, 'exit 0 は throw しない');
+  eq(statusOf(1), 1, 'exit 1 → e.status=1 (retry対象)');
+  eq(statusOf(2), 2, 'exit 2 → e.status=2 (blocked判定に使う)');
+}
+
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);
 process.exit(fail === 0 ? 0 : 1);
