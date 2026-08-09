@@ -94,10 +94,15 @@ eq(classifyOrder(order({ orderFixDatetime: null }), ctx), 'skip', '未入金 (�
 eq(classifyOrder(order({ orderFixDatetime: '2026-08-08T12:00:01+0900' }), ctx), 'skip', '締め1秒後の入金 → skip');
 eq(classifyOrder(order({ orderFixDatetime: '2026-08-08T12:00:00+0900' }), ctx), 'alert', '締めちょうどの入金 → alert');
 eq(classifyOrder(order({ orderFixDatetime: '2026-08-09T07:00:00+0900' }), ctx), 'skip', '今朝の入金 → skip');
-eq(classifyOrder(order({ deliveryDate: '2026-08-14' }), ctx), 'hold', 'お届け日が未来 → hold');
+eq(classifyOrder(order({ orderFixDatetime: 'garbage-value' }), ctx), 'bad_datetime', 'パース不能な確定日時 → bad_datetime (無音でskipしない)');
+eq(classifyOrder(order({ deliveryDate: '2026-08-14' }), ctx), 'hold', 'お届け日が5日先 → hold');
+eq(classifyOrder(order({ deliveryDate: '2026-08-12' }), ctx), 'hold', 'お届け日が3日先 (猶予2日の外) → hold');
+eq(classifyOrder(order({ deliveryDate: '2026-08-11' }), ctx), 'alert', 'お届け日が2日先 (猶予内) → alert (もう出荷すべき)');
 eq(classifyOrder(order({ deliveryDate: '2026-08-09' }), ctx), 'alert', 'お届け日が今日 → alert (出荷すべき)');
 eq(classifyOrder(order({ deliveryDate: '2026-08-07' }), ctx), 'alert', 'お届け日が過去 → alert (すでに遅れている)');
 eq(classifyOrder(order({ deliveryDate: '' }), ctx), 'alert', 'お届け日が空文字 → alert');
+eq(classifyOrder(order({ deliveryDate: '2026-08-14' }), { ...ctx, leadDays: 0 }, ), 'hold', 'leadDays=0 なら未来のお届け日は全部 hold');
+eq(classifyOrder(order({ deliveryDate: '2026-08-10' }), { ...ctx, leadDays: 0 }, ), 'hold', 'leadDays=0: 明日のお届け日も hold');
 eq(classifyOrder(order({ orderProgress: 400 }), ctx), 'alert', '変更確定待ち (400) も未発送として拾う');
 eq(classifyOrder(order({ orderProgress: 200 }), ctx), 'alert', '楽天処理中 (200) で確定済みなら拾う');
 eq(classifyOrder(order({ orderProgress: 600 }), ctx), 'skip', '支払手続き中 (600) は対象外');
@@ -156,6 +161,15 @@ const mkCtx = () => ({ ...ctx, now: new Date('2026-08-09T08:00:00+09:00') });
   ok(text.includes('✅ 出荷漏れはありません (0件)'), '0件でも本文を作る');
   ok(text.includes('08/08 12:00'.replace('08/', '8/')) || text.includes('8/8 12:00'), '締め時刻を明記');
   ok(text.includes('42件'), '走査件数を出す');
+  ok(!text.includes('結果が不完全'), '完全な結果に不完全の警告を出さない');
+}
+{
+  // 結果が不完全な日はそのことを本文に出す (黙って「0件」に見せない)
+  const text = buildMessage({ alerts: [], holds: [], ctx: mkCtx(), scanned: 42, truncated: true, badDatetimes: 2, missingDetails: 1 });
+  ok(text.includes('⚠️ 結果が不完全です'), '不完全の警告を出す');
+  ok(text.includes('打ち切られました'), '検索打ち切りを明示');
+  ok(text.includes('2件'), 'パース不能件数を出す');
+  ok(text.includes('1件'), '明細欠落件数を出す');
 }
 {
   const a = summarizeOrder(order(), mkCtx());
@@ -166,7 +180,7 @@ const mkCtx = () => ({ ...ctx, now: new Date('2026-08-09T08:00:00+09:00') });
   ok(text.includes('¥1,496'), '金額を3桁区切りで出す');
   ok(text.includes('クレジットカード'), '決済方法を出す');
   ok(text.includes('87.5時間経過'), '経過時間を出す');
-  ok(text.includes('お届け日指定のため保留中 1件'), '保留は別枠');
+  ok(text.includes('お届け日指定がまだ先のため保留中 1件'), '保留は別枠');
   ok(text.includes('2026-08-14'), '保留のお届け日を出す');
 }
 {

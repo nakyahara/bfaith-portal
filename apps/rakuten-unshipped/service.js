@@ -8,9 +8,10 @@
  * 判定に使うフィールド (2026-08-09 に本番データで実測して確定):
  *   orderProgress      100=注文確認待ち / 200=楽天処理中 / 300=発送待ち / 400=変更確定待ち
  *                      500=発送済 / 800,900=キャンセル
- *   orderFixDatetime   受注確定日時。**これが「入金確認できた時刻」**。
- *                      クレジットカードは注文の約30分後に入る。前払い(コンビニ・銀行振込)は
- *                      入金された時刻に入る (注文日時とは何日もズレる)。未入金なら null。
+ *   orderFixDatetime   受注確定日時。**これが「入金確認できた時刻」** — 実測根拠:
+ *                      当店の未発送431件で、前払い(コンビニ・銀行振込)は入金前は必ず null、
+ *                      入金後にその時刻で入っていた (注文日時とは何日もズレる)。
+ *                      クレジットカードは注文の約30分後 (与信確定時) に入る。
  *   shippingInstDatetime  発送指示日時。⚠️入金確認と同時刻で自動的に入るため
  *                      「発送済み」の判定には使えない。発送済み = orderProgress 500。
  *   deliveryDate       お届け日指定。未来日なら出荷しないのが正常 → 別枠 (hold) にする。
@@ -28,8 +29,19 @@ import { jstDateStr } from '../../lib/jst-date.js';
 
 /** 出荷の締め時刻 (時)。前日のこの時刻までに入金確認できた注文が対象 */
 export const DEFAULT_CUTOFF_HOUR = 12;
-/** searchOrder で遡る日数。前払いは注文から入金まで日が空くので広めに取る */
-export const DEFAULT_SEARCH_DAYS = 30;
+/**
+ * searchOrder で遡る日数 (注文日ベース)。RMS の期間上限は1回63日なので、
+ * これを超える分は60日窓に分割して複数回検索する (Codexレビュー#2: 30日だと
+ * それより古い注文の未発送が黙って対象から漏れる)。
+ */
+export const DEFAULT_SEARCH_DAYS = 180;
+/** searchOrder 1回あたりの窓の日数 (RMS 上限63日に対して余裕を持たせる) */
+export const SEARCH_WINDOW_DAYS = 60;
+/**
+ * お届け日指定を「保留」にできる猶予 (日)。お届け日が近い (今日+この日数以内) 注文は
+ * 配送日数を考えるともう出荷すべきなので alert に含める (Codexレビュー#5)。
+ */
+export const DEFAULT_DELIVERY_LEAD_DAYS = 2;
 /** 未発送とみなす orderProgress (500=発送済、800/900=キャンセルは含めない) */
 export const UNSHIPPED_PROGRESS = [100, 200, 300, 400];
 
@@ -83,22 +95,34 @@ export function buildContext(now = new Date(), cutoffHour = DEFAULT_CUTOFF_HOUR)
 
 /**
  * 注文1件を分類する。
- * @returns {'alert'|'hold'|'skip'} alert=出荷漏れの可能性 / hold=お届け日指定で保留中 / skip=対象外
+ * @returns {'alert'|'hold'|'skip'|'bad_datetime'}
+ *   alert=出荷漏れの可能性 / hold=お届け日指定でまだ余裕がある / skip=対象外 /
+ *   bad_datetime=確定日時が想定外の形式 (無音で skip にせず呼び出し側で数えて知らせる)
  */
 export function classifyOrder(order, ctx) {
   const progress = Number(order?.orderProgress);
   // 発送済み・キャンセルは対象外 (searchOrder 側でも絞っているが二重で守る)
   if (!UNSHIPPED_PROGRESS.includes(progress)) return 'skip';
 
-  const fixedAt = parseRmsDatetime(order?.orderFixDatetime);
-  // 受注未確定 = 入金確認がまだ = 発送できなくて当然
-  if (!fixedAt) return 'skip';
+  const raw = order?.orderFixDatetime;
+  const fixedAt = parseRmsDatetime(raw);
+  if (!fixedAt) {
+    // 値が入っているのにパースできない = 見落とし側に倒れるので通常の skip と区別する
+    // (Codexレビュー#7: 未知の日時形式が来た日に、全部「未入金」扱いで無音になるのを防ぐ)
+    if (raw != null && String(raw).trim() !== '') return 'bad_datetime';
+    // 受注未確定 = 入金確認がまだ = 発送できなくて当然
+    return 'skip';
+  }
   // 締め後に入金確認された注文は、まだ出荷期限が来ていない
   if (fixedAt.getTime() > ctx.cutoff.getTime()) return 'skip';
 
-  // お届け日指定が未来 = 今出荷しないのが正常。ただし消さずに参考として出す
+  // お届け日指定がまだ先 = 今出荷しないのが正常。ただし消さずに参考として出す。
+  // お届け日が近い (leadDays 以内) なら配送日数を考えるともう出荷すべき → alert に含める
   const deliveryDate = String(order?.deliveryDate || '').slice(0, 10);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate) && deliveryDate > ctx.today) return 'hold';
+  const leadDays = Number.isFinite(ctx.leadDays) ? ctx.leadDays : DEFAULT_DELIVERY_LEAD_DAYS;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(deliveryDate) && deliveryDate > addDaysStr(ctx.today, leadDays)) {
+    return 'hold';
+  }
 
   return 'alert';
 }
@@ -147,69 +171,104 @@ async function callRMS(endpoint, body) {
   return r.data;
 }
 
-/** 未発送の注文番号を集める (注文日ベースで過去 searchDays 日) */
+/**
+ * 未発送の注文番号を集める (注文日ベースで過去 searchDays 日)。
+ * RMS の期間上限 (63日) を超えないよう SEARCH_WINDOW_DAYS 日の窓に分割して検索する。
+ * @returns {{numbers:string[], truncated:boolean}} truncated=ページ上限で打ち切りが起きた
+ */
 async function searchUnshippedOrderNumbers(startDate, endDate) {
-  let numbers = [];
-  let page = 1;
-  let totalPages = 1;
-  while (page <= totalPages) {
-    const d = await callRMS('searchOrder', {
-      dateType: 1, // 注文日
-      startDatetime: `${startDate}T00:00:00+0900`,
-      endDatetime: `${endDate}T23:59:59+0900`,
-      orderProgressList: UNSHIPPED_PROGRESS,
-      PaginationRequestModel: { requestRecordsAmount: 1000, requestPage: page },
-    });
-    numbers = numbers.concat(d.orderNumberList || []);
-    totalPages = d.PaginationResponseModel?.totalPages || 1;
-    page++;
-    // 取り漏らしを黙って起こさないための保険 (1000件×20ページ = 2万件を超えることは無い想定)
-    if (page > 20) {
-      console.warn('[rakuten-unshipped] searchOrder のページ数が想定を超えたため打ち切りました');
-      break;
+  const seen = new Set();
+  let truncated = false;
+
+  // [startDate, endDate] を新しい側から SEARCH_WINDOW_DAYS 日ずつ切る
+  let winEnd = endDate;
+  while (winEnd >= startDate) {
+    const winStart0 = addDaysStr(winEnd, -(SEARCH_WINDOW_DAYS - 1));
+    const winStart = winStart0 < startDate ? startDate : winStart0;
+
+    let page = 1;
+    let totalPages = 1;
+    while (page <= totalPages) {
+      const d = await callRMS('searchOrder', {
+        dateType: 1, // 注文日
+        startDatetime: `${winStart}T00:00:00+0900`,
+        endDatetime: `${winEnd}T23:59:59+0900`,
+        orderProgressList: UNSHIPPED_PROGRESS,
+        PaginationRequestModel: { requestRecordsAmount: 1000, requestPage: page },
+      });
+      for (const n of (d.orderNumberList || [])) seen.add(n);
+      totalPages = d.PaginationResponseModel?.totalPages || 1;
+      page++;
+      // 保険 (1窓 1000件×20ページ = 2万件を超えることは無い想定)。
+      // 打ち切った場合は truncated として呼び出し側が partial 扱いにする (Codexレビュー#6)
+      if (page > 20 && page <= totalPages) {
+        console.warn(`[rakuten-unshipped] searchOrder のページ数が上限を超えたため打ち切り (${winStart}〜${winEnd})`);
+        truncated = true;
+        break;
+      }
     }
+    winEnd = addDaysStr(winStart, -1);
   }
-  return numbers;
+  return { numbers: [...seen], truncated };
 }
 
 /**
  * 検知本体。
- * @param {{now?:Date, cutoffHour?:number, searchDays?:number}} opts
- * @returns {Promise<{alerts:object[], holds:object[], scanned:number, ctx:object}>}
+ * @param {{now?:Date, cutoffHour?:number, searchDays?:number, leadDays?:number}} opts
+ * @returns {Promise<{alerts:object[], holds:object[], scanned:number, ctx:object,
+ *   truncated:boolean, badDatetimes:number, missingDetails:number}>}
+ *   truncated / badDatetimes / missingDetails が 0・false でない日は結果が不完全 =
+ *   呼び出し側は partial として扱い、本文にも出す
  */
 export async function findUnshippedOrders(opts = {}) {
   const now = opts.now || new Date();
   const cutoffHour = Number.isFinite(opts.cutoffHour) ? opts.cutoffHour : DEFAULT_CUTOFF_HOUR;
   const searchDays = Number.isFinite(opts.searchDays) ? opts.searchDays : DEFAULT_SEARCH_DAYS;
+  const leadDays = Number.isFinite(opts.leadDays) ? opts.leadDays : DEFAULT_DELIVERY_LEAD_DAYS;
 
   const base = buildContext(now, cutoffHour);
-  const ctx = { ...base, now };
+  const ctx = { ...base, now, leadDays };
 
   const endDate = base.today;
   const startDate = addDaysStr(base.today, -searchDays);
 
-  const orderNumbers = await searchUnshippedOrderNumbers(startDate, endDate);
+  const { numbers: orderNumbers, truncated } = await searchUnshippedOrderNumbers(startDate, endDate);
   console.log(`[rakuten-unshipped] 未発送の注文: ${orderNumbers.length}件 (${startDate}〜${endDate})`);
 
   const alerts = [];
   const holds = [];
+  let badDatetimes = 0;
+  let fetched = 0;
   for (let i = 0; i < orderNumbers.length; i += 100) {
+    const batch = orderNumbers.slice(i, i + 100);
     const d = await callRMS('getOrder', {
-      orderNumberList: orderNumbers.slice(i, i + 100),
+      orderNumberList: batch,
       version: 7,
     });
-    for (const o of (d.OrderModelList || [])) {
+    const orders = d.OrderModelList || [];
+    fetched += orders.length;
+    for (const o of orders) {
       const kind = classifyOrder(o, ctx);
       if (kind === 'skip') continue;
+      if (kind === 'bad_datetime') {
+        badDatetimes++;
+        console.warn(`[rakuten-unshipped] 確定日時をパースできません: ${o?.orderNumber} (${o?.orderFixDatetime})`);
+        continue;
+      }
       (kind === 'alert' ? alerts : holds).push(summarizeOrder(o, ctx));
     }
+  }
+  // getOrder が黙って返さなかった注文 (削除・権限etc) も不完全さとして数える (Codexレビュー#6)
+  const missingDetails = Math.max(0, orderNumbers.length - fetched);
+  if (missingDetails > 0) {
+    console.warn(`[rakuten-unshipped] getOrder が ${missingDetails}件 返しませんでした`);
   }
 
   const byFixedAt = (a, b) => (a.fixedAt?.getTime() ?? 0) - (b.fixedAt?.getTime() ?? 0);
   alerts.sort(byFixedAt);
   holds.sort((a, b) => String(a.deliveryDate).localeCompare(String(b.deliveryDate)) || byFixedAt(a, b));
 
-  return { alerts, holds, scanned: orderNumbers.length, ctx };
+  return { alerts, holds, scanned: orderNumbers.length, ctx, truncated, badDatetimes, missingDetails };
 }
 
 // ─── GChat 本文 ───
@@ -241,11 +300,19 @@ function itemLabel(o) {
  * GChat へ送る本文を組み立てる。
  * 0件の日も送る = 通知が来ないこと自体が「ジョブが止まった」のサインになる。
  */
-export function buildMessage({ alerts, holds, ctx, scanned }) {
+export function buildMessage({ alerts, holds, ctx, scanned, truncated, badDatetimes, missingDetails }) {
   const cutoffLabel = `${ctx.cutoffDate.slice(5).replace('-', '/')} ${pad2(ctx.cutoffHour ?? DEFAULT_CUTOFF_HOUR)}:00`;
   const lines = [];
   lines.push('*楽天 未発送アラート*');
   lines.push(`前日 ${cutoffLabel} までに入金確認できていて、まだ発送されていない注文です (未発送 ${scanned}件を確認)`);
+  // 結果が不完全な日はそのことを先頭で言う (黙って「0件でした」に見せない)
+  const gaps = [];
+  if (truncated) gaps.push('検索がページ上限で打ち切られました');
+  if (badDatetimes > 0) gaps.push(`確定日時を読めない注文が${badDatetimes}件`);
+  if (missingDetails > 0) gaps.push(`明細を取得できない注文が${missingDetails}件`);
+  if (gaps.length > 0) {
+    lines.push(`⚠️ 結果が不完全です: ${gaps.join(' / ')} — RMSでも確認してください`);
+  }
   lines.push('');
 
   if (alerts.length === 0) {
@@ -264,7 +331,7 @@ export function buildMessage({ alerts, holds, ctx, scanned }) {
 
   if (holds.length > 0) {
     lines.push('');
-    lines.push(`📅 お届け日指定のため保留中 ${holds.length}件 (参考・対応不要のことが多い)`);
+    lines.push(`📅 お届け日指定がまだ先のため保留中 ${holds.length}件 (お届け日が近づくと上の🚨に上がってきます)`);
     for (const o of holds.slice(0, MAX_LINES)) {
       lines.push(`・${o.orderNumber}  お届け日 ${o.deliveryDate}  ${yen(o.totalPrice)}  ${itemLabel(o)}`);
     }
