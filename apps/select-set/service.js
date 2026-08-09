@@ -14,6 +14,7 @@ import { rakutenRequest } from '../warehouse/rakuten-client.js';
 import { getDB as getWarehouseDB } from '../warehouse/db.js';
 import { buildCatalog, expandOp, toPasteBlocks } from './expand.js';
 import { ensureMasterFresh, masterFreshnessProblem, masterStatus } from './master-sync.js';
+import { fetchRemoteProducts, fetchRemoteRmsOptions, remoteConfigured } from './remote-sources.js';
 import {
   getDB, getRmsCache, listMappings, listOmake, listSets, putRmsCache,
 } from './db.js';
@@ -28,16 +29,16 @@ export class SsError extends Error {
 
 /**
  * 🚨 同じコードが Render と miniPC の両方で動くが、持っているものが違う。
- *   Render : マスタ (セット・マッピング・おまけ) の正。warehouse.db と楽天認証は無い
- *   miniPC : warehouse.db (商品マスタ・在庫) と楽天認証がある。マスタはRenderから取得
- * Render 側で「動作確認」ができてしまうと、商品名が出ない・おまけが全部在庫0扱い・
- * マスタ照合が効かない、が黙って起きて正しく展開できたように見える (2026-08-08 に実際に踏んだ)。
- * そのため商品マスタが引けない環境では、それを要する機能だけを止めて案内する。
+ *   Render : マスタ (セット・マッピング・おまけ) の正。拡張の接続先 (miniPCはCF Accessの後ろで
+ *            拡張から届かない = 2026-08-09 実測)。商品マスタとRMSは miniPC の service-api から取る
+ *   miniPC : warehouse.db (商品マスタ・在庫) と楽天認証を直接持つ
+ * どちらの環境でも「素材が揃わないまま黙って劣化する」ことだけは許さない
+ * (2026-08-08 に Render側で商品名が出ない・おまけが全部在庫0のまま正常に見える事故を踏んだ)。
  */
 const WRONG_HOST_MESSAGE =
-  '商品マスタ (warehouse.db) が無い環境です。動作確認・在庫表示・RMSの選択肢確認は'
-  + ' miniPC側の https://wh.bfaith-wh.uk/apps/select-set/ で行ってください'
-  + ' (セット・マッピング・おまけの登録はこの画面のままで大丈夫です)。';
+  '商品マスタを読めません (warehouse.db が無く、miniPCへの接続情報も未設定の環境です)。'
+  + ' この環境では動作確認・在庫表示・RMSの選択肢確認はできません'
+  + ' (セット・マッピング・おまけの登録は可能です)。';
 
 const RMS_TTL_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_TTL_MIN) || 360) * 60 * 1000;
 /**
@@ -48,45 +49,92 @@ const RMS_TTL_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_TTL_MIN) || 360
 const RMS_MAX_AGE_MS = Math.max(1, Number(process.env.SELECT_SET_RMS_MAX_AGE_H) || 168) * 3600 * 1000;
 const PRODUCT_CACHE_MS = 5 * 60 * 1000;
 
-let productCache = { at: 0, codes: null, stock: null };
+let productCache = { at: 0, codes: null, stock: null, source: null };
 
-function loadProducts() {
-  const now = Date.now();
-  if (productCache.codes && now - productCache.at < PRODUCT_CACHE_MS) return productCache;
+function cacheFresh() {
+  return !!productCache.codes && Date.now() - productCache.at < PRODUCT_CACHE_MS;
+}
+
+function buildCache(rows, source) {
+  const codes = new Set();
+  const stock = new Map();
+  for (const r of rows) {
+    const code = String(r.code || '').trim();
+    if (!code) continue;
+    codes.add(code.toLowerCase());
+    stock.set(code.toLowerCase(), {
+      name: String(r.name || ''),
+      available: Number.isFinite(Number(r.available)) ? Number(r.available) : 0,
+      status: String(r.status || ''),
+    });
+  }
+  if (codes.size === 0) {
+    // 🚨 空のまま通すと「商品名が出ない」「おまけが全部在庫0扱い」「マスタ照合が効かない」が
+    //   黙って起きて、正しく展開できたように見えてしまう (2026-08-08 実際に起きた)
+    throw new SsError('商品マスタが空です', { status: 503, code: 'WAREHOUSE_EMPTY' });
+  }
+  productCache = { at: Date.now(), codes, stock, source };
+  return productCache;
+}
+
+/** miniPC のローカル warehouse.db から読む (同期) */
+function loadLocalProducts() {
   let db;
   try {
     db = getWarehouseDB();
   } catch {
-    throw new SsError('warehouse.db が使えません (商品マスタ・在庫が引けない環境です)', {
-      status: 503, code: 'WAREHOUSE_UNAVAILABLE',
-    });
+    throw new SsError(WRONG_HOST_MESSAGE, { status: 503, code: 'WAREHOUSE_UNAVAILABLE' });
   }
-  const codes = new Set();
-  const stock = new Map();
   let rows = [];
   try {
-    rows = db.prepare('SELECT 商品コード AS c, 商品名 AS n, 在庫数 AS z, 引当数 AS h, 取扱区分 AS k FROM raw_ne_products').all();
+    rows = db.prepare(`
+      SELECT 商品コード AS code, 商品名 AS name,
+             (在庫数 - 引当数) AS available, 取扱区分 AS status
+      FROM raw_ne_products
+    `).all();
   } catch {
     throw new SsError(WRONG_HOST_MESSAGE, { status: 503, code: 'WAREHOUSE_UNAVAILABLE' });
   }
-  for (const r of rows) {
-    const code = String(r.c || '').trim();
-    if (!code) continue;
-    codes.add(code.toLowerCase());
-    stock.set(code.toLowerCase(), {
-      name: String(r.n || ''),
-      available: (Number(r.z) || 0) - (Number(r.h) || 0),
-      status: String(r.k || ''),
-    });
+  return buildCache(rows, 'local');
+}
+
+/**
+ * 商品マスタをキャッシュに用意する。ローカル (miniPC) を優先し、
+ * 無ければ miniPC の service-api から取る (Render)。
+ * 展開・動作確認・在庫表示など、商品マスタが要る処理の入口で必ず await すること。
+ * @param {object} o
+ * @param {boolean} o.soft true なら失敗時に null (投げない)。一覧表示などの飾り用途向け
+ */
+export async function ensureProducts({ soft = false } = {}) {
+  if (cacheFresh()) return productCache;
+  let localErr;
+  try {
+    return loadLocalProducts();
+  } catch (e) {
+    localErr = e;
   }
-  // 🚨 商品マスタが空 = warehouse.db を持たない環境 (Render) で開いている。
-  //   ここで止めないと「商品名が出ない」「おまけが全部在庫0扱い」「マスタ照合が効かない」が
-  //   黙って起きて、正しく展開できたように見えてしまう (2026-08-08 実際に起きた)。
-  if (codes.size === 0) {
-    throw new SsError(WRONG_HOST_MESSAGE, { status: 503, code: 'WAREHOUSE_EMPTY' });
+  if (remoteConfigured()) {
+    try {
+      const rows = await fetchRemoteProducts();
+      return buildCache(rows, 'remote');
+    } catch (e) {
+      // 🚨 取れなかったら古いキャッシュへ黙って落ちない。素材が欠けたまま
+      //   展開して誤った結果を出すより、理由を出して止まる
+      if (soft) return null;
+      throw new SsError(
+        `miniPCから商品マスタを取得できません: ${String(e?.message || e).slice(0, 200)}`,
+        { status: 503, code: 'REMOTE_PRODUCTS_UNAVAILABLE' },
+      );
+    }
   }
-  productCache = { at: now, codes, stock };
-  return productCache;
+  if (soft) return null;
+  throw localErr;
+}
+
+/** 同期版 (キャッシュ or ローカルDBのみ)。async にできない既存経路のために残す */
+function loadProducts() {
+  if (cacheFresh()) return productCache;
+  return loadLocalProducts();
 }
 
 /**
@@ -96,18 +144,19 @@ function loadProducts() {
  *   ready       … 商品マスタ (warehouse.db) が引けるか。
  *                 動作確認・在庫表示・RMS確認・商品コードの実在チェックはこれが必要
  */
-export function environment() {
+export async function environment() {
   const master = masterStatus();
-  const primaryUrl = process.env.SELECT_SET_PRIMARY_URL || 'https://wh.bfaith-wh.uk/apps/select-set/';
+  const primaryUrl = process.env.SELECT_SET_PRIMARY_URL || '';
   const base = {
     master,
     primaryUrl,
     rakutenCreds: !!process.env.RAKUTEN_SERVICE_SECRET && !!process.env.RAKUTEN_LICENSE_KEY,
+    remoteConfigured: remoteConfigured(),
     extTokenSet: !!process.env.SELECT_SET_EXT_TOKEN,
   };
   try {
-    const { codes } = loadProducts();
-    return { ...base, ready: true, productCount: codes.size };
+    const p = await ensureProducts();
+    return { ...base, ready: true, productCount: p.codes.size, productSource: p.source };
   } catch (e) {
     return { ...base, ready: false, reason: e instanceof SsError ? e.code : 'UNKNOWN', message: String(e.message || e) };
   }
@@ -150,8 +199,17 @@ async function fetchRmsOptions(setCode, { force = false } = {}) {
     }
   }
   try {
-    const r = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${encodeURIComponent(setCode)}` });
-    const options = (r?.body ?? r?.data ?? r)?.customizationOptions || [];
+    let options;
+    if (process.env.RAKUTEN_SERVICE_SECRET && process.env.RAKUTEN_LICENSE_KEY) {
+      // miniPC: 楽天RMSを直接叩く
+      const r = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${encodeURIComponent(setCode)}` });
+      options = (r?.body ?? r?.data ?? r)?.customizationOptions || [];
+    } else if (remoteConfigured()) {
+      // Render: 楽天認証を持たないので miniPC の service-api 経由で取る
+      options = await fetchRemoteRmsOptions(setCode);
+    } else {
+      throw new Error('楽天RMSの認証情報も miniPC への接続情報も無いため、選択肢定義を取得できません');
+    }
     putRmsCache(setCode, options, null);
     return { options, fetchedAt: new Date().toISOString(), cached: false };
   } catch (e) {
@@ -176,7 +234,7 @@ async function fetchRmsOptions(setCode, { force = false } = {}) {
 export async function getCatalog(setCode, { force = false } = {}) {
   const code = String(setCode || '').trim();
   if (!code) throw new SsError('セット商品コードが必要です');
-  const { codes } = loadProducts();
+  const { codes } = await ensureProducts();
   const rms = await fetchRmsOptions(code, { force });
   const manualRows = listMappings(code).map((m) => ({ option: m.option_text, code: m.product_code }));
   const catalog = buildCatalog({
@@ -269,6 +327,7 @@ export function diagnose() {
     rakutenCreds: !!process.env.RAKUTEN_SERVICE_SECRET && !!process.env.RAKUTEN_LICENSE_KEY,
     extTokenSet: !!process.env.SELECT_SET_EXT_TOKEN,
     rmsTtlMinutes: RMS_TTL_MS / 60000,
+    remoteConfigured: remoteConfigured(),
   };
   try {
     const db = getWarehouseDB();
@@ -285,7 +344,7 @@ export function diagnose() {
   }
   try {
     const p = loadProducts();
-    out.productCache = { codes: p.codes.size, stock: p.stock.size, loadedAtMsAgo: Date.now() - p.at };
+    out.productCache = { codes: p.codes.size, stock: p.stock.size, source: p.source, loadedAtMsAgo: Date.now() - p.at };
   } catch (e) {
     out.productCache = { error: String(e.message || e) };
   }
@@ -307,7 +366,7 @@ export function diagnose() {
 /** 管理画面用: セットの選択肢定義を人が読める形で返す */
 export async function inspectSet(setCode, { force = false } = {}) {
   const { catalog, rms, manualCount } = await getCatalog(setCode, { force });
-  const { codes } = loadProducts();
+  const { codes } = await ensureProducts();
   return {
     setCode,
     labels: catalog.labels,

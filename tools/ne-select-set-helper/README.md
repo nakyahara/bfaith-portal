@@ -26,21 +26,20 @@
 
 1. Chrome → `chrome://extensions/` → デベロッパーモードON → 「パッケージ化されていない拡張機能を読み込む」
    → このフォルダを選ぶ
-2. 拡張の「オプション」を開き、接続先 (既定 `https://wh.bfaith-wh.uk`) と
+2. 拡張の「オプション」を開き、接続先 (既定 `https://bfaith-portal.onrender.com`) と
    APIトークン (`SELECT_SET_EXT_TOKEN`) を入れて「接続テスト」
 3. NEの受注伝票を開くと、対象の明細行があればパネルが出る
 
-## 🚨 接続先は Cloudflare Access の後ろにある
+## 接続先は Render 側ポータル (2026-08-09〜)
 
-`wh.bfaith-wh.uk` は Cloudflare Access で保護されており、素で叩くと
-cloudflareaccess.com のログイン画面へ 302 される (2026-08-08 実測)。
+当初は miniPC (`wh.bfaith-wh.uk`) を向けていたが、そこは **Cloudflare Access の後ろ**で、
+拡張のService WorkerのfetchにはCFのログインクッキーが乗らず到達できなかった (実測)。
+Codexと協議し、**拡張は Render → Render が miniPC の `/service-api/` から
+商品マスタ・在庫・楽天RMSを取る**構成にした (fba-tracking 拡張と同じ形)。
 
-この拡張は `credentials: 'include'` で叩くことで、**ブラウザが持っている
-CF Access のログインクッキーを使う**。拡張自体に認証情報を持たせないための選択。
-
-そのため **同じブラウザで一度 https://wh.bfaith-wh.uk を開いてログインしておく**必要がある。
-セッションが切れると拡張が「ログインセッションが切れています」と出すので、
-サイトを開き直せば復帰する。
+- 拡張に入る秘密は `SELECT_SET_EXT_TOKEN` (このAPI 1本だけに効く) のみ
+- miniPCへの強い資格情報 (CF Accessサービストークン等) は **Render のサーバー側に閉じる**
+- 誤って miniPC のURLを設定した場合は、CFへ飛ばされたことを検知して案内を出す
 
 ## マスターの管理
 

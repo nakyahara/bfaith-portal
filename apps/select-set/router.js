@@ -17,7 +17,7 @@ import {
 } from './db.js';
 import { masterMode, masterStatus, pullMaster } from './master-sync.js';
 import {
-  SsError, canValidateProducts, diagnose, environment, expandForOrder, inspectSet, stockOfSoft,
+  SsError, canValidateProducts, diagnose, ensureProducts, environment, expandForOrder, inspectSet, stockOfSoft,
 } from './service.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -124,8 +124,9 @@ router.get('/api/sets/:code/inspect', api((req) => inspectSet(String(req.params.
 // ---- 手動マッピング ----
 router.get('/api/mappings', api((req) => ({ mappings: listMappings(req.query.setCode || null) })));
 
-router.post('/api/mappings', api((req) => {
+router.post('/api/mappings', api(async (req) => {
   assertEditable();
+  await ensureProducts({ soft: true }); // 実在チェック用 (取れない環境では警告に留める)
   const setCode = String(req.body?.setCode || '').trim();
   const optionText = String(req.body?.optionText || '').trim();
   const productCode = String(req.body?.productCode || '').trim();
@@ -151,12 +152,16 @@ router.delete('/api/mappings/:id', api((req) => {
 }));
 
 // ---- おまけ優先順位 ----
-router.get('/api/omake', api(() => ({
-  omake: listOmake().map((r) => ({ ...r, ...(stockOfSoft(r.product_code) || { name: '', available: null }) })),
-})));
+router.get('/api/omake', api(async () => {
+  await ensureProducts({ soft: true }); // Renderでは在庫をminiPCから取る (取れなくても一覧は出す)
+  return {
+    omake: listOmake().map((r) => ({ ...r, ...(stockOfSoft(r.product_code) || { name: '', available: null }) })),
+  };
+}));
 
-router.post('/api/omake', api((req) => {
+router.post('/api/omake', api(async (req) => {
   assertEditable();
+  await ensureProducts({ soft: true });
   const codes = Array.isArray(req.body?.codes) ? req.body.codes : [];
   if (!codes.length) throw new SsError('おまけ候補が空です');
   let warning = null;

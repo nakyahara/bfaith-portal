@@ -1,9 +1,9 @@
-// Service Worker — content script からの依頼で miniPC の portal API を叩く。
+// Service Worker — content script からの依頼で Render 側ポータルの API を叩く。
 // MV3 では host_permissions に載せた宛先への SW fetch は CORS 制約を受けないため、
 // サーバー側に CORS ヘッダを足さずに済む (content script から直接 fetch しないのはそのため)。
 // APIトークンをページ側の world に置かない、という意味でもこの経路にしている。
 
-const DEFAULTS = { baseUrl: 'https://wh.bfaith-wh.uk', token: '' };
+const DEFAULTS = { baseUrl: 'https://bfaith-portal.onrender.com', token: '' };
 const BASE_PATH = '/apps/select-set/ext-api';
 
 function getConfig() {
@@ -17,17 +17,17 @@ async function api(path, opts = {}) {
   const headers = { 'x-api-key': cfg.token };
   if (opts.body) headers['Content-Type'] = 'application/json';
 
-  // 🚨 接続先 (miniPC) は Cloudflare Access の後ろにあり、素で叩くと
-  //    cloudflareaccess.com のログイン画面へ 302 される (2026-08-08 実測)。
-  //    credentials:'include' にすると、ブラウザが持っている CF_Authorization クッキーが乗って通る。
-  //    = 拡張に認証情報を持たせずに済む。代わりにCF Accessのセッションが切れると通らなくなるので、
-  //      そのときは「サイトを一度開いてログインしてください」と案内する。
-  const res = await fetch(base + BASE_PATH + path, { ...opts, headers, credentials: 'include' });
+  // 接続先は Render 側のポータル (2026-08-09〜)。
+  // 🚨 miniPC (wh.bfaith-wh.uk) は Cloudflare Access の後ろにあり、拡張のSWからは
+  //    CFのログインクッキーが乗らず到達できない (実測)。誤ってminiPCへ向けたときに
+  //    黙って失敗しないよう、CFへ飛ばされたことは検知して案内する。
+  const res = await fetch(base + BASE_PATH + path, { ...opts, headers });
 
   const ct = res.headers.get('content-type') || '';
   if (/cloudflareaccess\.com/.test(res.url || '') || (!ct.includes('json') && (res.redirected || res.status === 302))) {
     throw new Error(
-      `接続先のログインセッションが切れています。ブラウザで ${base} を開いてログインしてから、もう一度お試しください。`,
+      `接続先 ${base} は Cloudflare Access で保護されていて拡張からは到達できません。`
+      + ' 接続先URLを Render 側ポータル (https://bfaith-portal.onrender.com) にしてください。',
     );
   }
 
