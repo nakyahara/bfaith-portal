@@ -1,4 +1,4 @@
-const DEFAULTS = { baseUrl: 'https://wh.bfaith-wh.uk', token: '' };
+const DEFAULTS = { baseUrl: 'https://bfaith-portal.onrender.com', token: '' };
 
 const $ = (id) => document.getElementById(id);
 

@@ -70,9 +70,7 @@
         ① zipを<b>解凍</b>する（zipのまま読み込むことはできません）<br>
         ② <span class="mono">chrome://extensions/</span> を開いて <b>デベロッパーモードをON</b><br>
         ③「パッケージ化されていない拡張機能を読み込む」で<b>解凍したフォルダ</b>を選ぶ<br>
-        ④ 拡張の「オプション」で接続先とAPIトークンを入れて「接続テスト」<br>
-        ⑤ 🚨 同じブラウザで一度 <span class="mono">https://wh.bfaith-wh.uk</span> を開いてログインしておく
-        （拡張はそのログインを使って接続します）
+        ④ 拡張の「オプション」で接続先とAPIトークンを入れて「接続テスト」
       </div>
     </div>
 
@@ -372,7 +370,7 @@ function renderEnv(e) {
     parts.push('<div class="card" style="border-color:#ffd8a8;background:#fff9db">'
       + '<b>この画面はコピーです（編集できません）</b><br>'
       + 'セット・手動マッピング・おまけの登録は<b>普段のポータル（Render側）</b>で行ってください。'
-      + 'ここは拡張機能が実際に使う環境なので、動作確認・在庫・RMSの確認に使います。<br>'
+      + '拡張機能の接続先もRender側です。ここ（miniPC）は診断用に残しています。<br>'
       + '<span class="hint">マスタ最終取得: ' + esc(last) + ' (UTC) / ' + esc(e.master.ttlMinutes) + '分ごとに自動取得'
       + (e.master.lastError ? ' / <span style="color:#c92a2a">⚠ ' + esc(e.master.lastError) + '</span>' : '') + '</span> '
       + '<button class="btn" id="btn-pull">今すぐ取得</button> <span class="msg" id="pull-msg"></span>'
@@ -385,8 +383,8 @@ function renderEnv(e) {
       + '<b>この環境では動作確認・在庫表示・RMSの選択肢確認ができません</b><br>'
       + esc(e.message || '商品マスタ (warehouse.db) がありません') + '<br>'
       + '<span class="hint">セット・マッピング・おまけの<b>登録はこの画面のままで大丈夫です</b>。'
-      + '確認したいときは <a href="' + esc(e.primaryUrl) + '">' + esc(e.primaryUrl) + '</a> を開いてください。</span>'
-      + '</div>');
+      + (e.primaryUrl ? '確認したいときは <a href="' + esc(e.primaryUrl) + '">' + esc(e.primaryUrl) + '</a> を開いてください。' : '')
+      + '</span></div>');
   }
   document.getElementById('env-banner').innerHTML = parts.join('');
 
