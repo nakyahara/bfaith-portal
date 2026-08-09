@@ -13,6 +13,7 @@ import {
   MAX_LINES,
   UNSHIPPED_PROGRESS,
 } from '../service.js';
+import { exitCodeFor } from '../notify-job.js';
 
 let pass = 0;
 let fail = 0;
@@ -201,6 +202,30 @@ const mkCtx = () => ({ ...ctx, now: new Date('2026-08-09T08:00:00+09:00') });
   ok(text.includes('…'), '長い商品名は省略記号付きで切る');
   ok(text.includes('ほか1点'), '2件目以降は点数で表す');
   ok(!text.includes('あ'.repeat(50)), '商品名を丸ごとは出さない');
+}
+
+// ─── exitCodeFor (daily-sync が失敗/blocked を判定する根拠) ───
+section('exitCodeFor');
+eq(exitCodeFor({ partial: false }), 0, '完全な結果 → 0 (成功)');
+eq(exitCodeFor({ partial: true }), 2, '不完全 → 2 (daily-syncで❌かつretryしない)');
+eq(exitCodeFor({}), 0, 'partial 未指定 → 0');
+eq(exitCodeFor(null), 0, 'null でも落ちない');
+
+// daily-sync 側の前提: runScript (execFileSync) は非ゼロ終了で throw し、e.status に
+// 終了コードが入る。ここが崩れると exit 2 → blocked:true の判定が黙って効かなくなる
+{
+  const { execFileSync } = await import('node:child_process');
+  const statusOf = (code) => {
+    try {
+      execFileSync(process.execPath, ['-e', `process.exit(${code})`], { stdio: 'ignore' });
+      return 0;
+    } catch (e) {
+      return e.status;
+    }
+  };
+  eq(statusOf(0), 0, 'exit 0 は throw しない');
+  eq(statusOf(1), 1, 'exit 1 → e.status=1 (retry対象)');
+  eq(statusOf(2), 2, 'exit 2 → e.status=2 (blocked判定に使う)');
 }
 
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);
