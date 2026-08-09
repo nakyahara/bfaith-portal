@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>FBA納品 福通伝票CSV — ストア掲載用</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1280px; height: 800px; overflow: hidden;
+    font-family: "Meiryo", "Yu Gothic UI", system-ui, sans-serif;
+    background: #eaeded; color: #0f1111;
+  }
+  .bar { height: 52px; background: #232f3e; color: #fff; display: flex; align-items: center; padding: 0 24px; gap: 14px; }
+  .bar .logo { width: 26px; height: 26px; background: #fff; border-radius: 5px; position: relative; }
+  .bar .logo::after { content: ''; position: absolute; right: 4px; bottom: 4px; width: 10px; height: 9px; background: #ff9900; }
+  .bar b { font-size: 16px; font-weight: 700; }
+  .bar span { font-size: 13px; opacity: .8; }
+
+  .wrap { padding: 22px 28px; display: flex; gap: 22px; }
+  .left { width: 660px; }
+  .right { flex: 1; }
+
+  .card { background: #fff; border: 1px solid #d5d9d9; border-radius: 8px; padding: 16px 18px; margin-bottom: 14px; }
+  .step { font-size: 15px; font-weight: 700; margin-bottom: 12px; color: #0f1111; }
+  .step .chk { color: #067d62; margin-right: 6px; }
+  .meta { font-size: 12.5px; color: #565959; line-height: 1.9; }
+  .meta b { color: #0f1111; }
+
+  .ship { border: 1px solid #d5d9d9; border-radius: 6px; padding: 11px 13px; margin-top: 10px; font-size: 12.5px; line-height: 1.85; }
+  .ship .t { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
+  .ship .k { color: #565959; display: inline-block; width: 74px; }
+
+  .callout { background: #fff8e5; border-left: 4px solid #ff9900; padding: 12px 14px; border-radius: 4px; font-size: 13px; line-height: 1.8; }
+  .callout b { color: #b12704; }
+
+  /* 拡張のパネル (実物と同じ見た目) */
+  .panel { background: #fff; border: 1px solid #ccc; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); overflow: hidden; }
+  .panel .head { padding: 10px 14px; background: #232f3e; color: #fff; font-weight: 700; font-size: 13.5px; display: flex; justify-content: space-between; }
+  .panel .head span { font-weight: 400; opacity: .85; font-size: 12px; }
+  .panel .body { padding: 12px 14px; font-size: 12.5px; }
+  .panel .sum { margin-bottom: 9px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border-bottom: 1px solid #eee; padding: 6px 6px; text-align: left; font-size: 12px; }
+  th { background: #f6f6f6; font-weight: 600; }
+  td.num { text-align: right; }
+  .note { margin-top: 10px; color: #565959; font-size: 11.5px; line-height: 1.7; }
+  .foot { padding: 10px 14px; border-top: 1px solid #eee; display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { padding: 7px 14px; border-radius: 4px; border: 1px solid #ccc; background: #fff; font-size: 12.5px; }
+  .btn.go { background: #232f3e; color: #fff; border-color: #232f3e; font-weight: 700; }
+
+  .fab { margin-top: 14px; display: flex; justify-content: flex-end; }
+  .fab .b { padding: 10px 18px; border-radius: 999px; background: #232f3e; color: #fff; font-size: 14px; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+  .caption { margin-top: 12px; font-size: 12.5px; color: #565959; line-height: 1.8; }
+  .caption b { color: #0f1111; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <div class="logo"></div>
+    <b>FBA納品 福通伝票CSV</b>
+    <span>Amazon Seller Central の納品プラン画面から配送業者の送り状CSVを作ります（社内専用）</span>
+  </div>
+
+  <div class="wrap">
+    <div class="left">
+      <div class="card">
+        <div class="step"><span class="chk">✓</span>ステップ3 – 印刷された輸送箱ラベル</div>
+        <div class="meta">
+          出荷日：<b>2026年8月7日金曜日</b><br>
+          方法：個口配送（SPD）　配送業者：<b>福山通運</b>
+        </div>
+
+        <div class="ship">
+          <div class="t">納品 ＃1</div>
+          <div><span class="k">納品番号</span><b>FBA15GGL5J2X</b></div>
+          <div><span class="k">納品先</span>HND2 – 350-1301 Japan 埼玉県狭山市 青柳 915</div>
+          <div><span class="k">出荷商品</span>輸送箱：<b>5</b>, SKU：9, ユニット：387</div>
+        </div>
+
+        <div class="ship">
+          <div class="t">納品 ＃2</div>
+          <div><span class="k">納品番号</span><b>FBA15GGLDVMG</b></div>
+          <div><span class="k">納品先</span>XHD4 – 270-0193 Japan 千葉県流山市 …</div>
+          <div><span class="k">出荷商品</span>輸送箱：<b>14</b>, SKU：26, ユニット：1687</div>
+        </div>
+      </div>
+
+      <div class="callout">
+        画面に出ているこの情報を読み取ってCSVを作ります。<br>
+        <b>外部との通信はありません。</b>お客様の氏名・住所などの個人情報は扱いません。
+      </div>
+
+      <div class="fab"><div class="b">📦 福通伝票CSV</div></div>
+      <div class="caption">
+        納品プラン画面の右下にボタンが出ます。<br>
+        <b>押したときだけ</b>CSVを作ります（自動では作りません）。
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="panel">
+        <div class="head">福通伝票CSV<span>画面から読み取り</span></div>
+        <div class="body">
+          <div class="sum">出荷日 <b>20260807</b> ／ 納品 <b>2</b>件 ／ 伝票 <b>19</b>枚</div>
+          <table>
+            <thead><tr><th>納品番号</th><th>宛先</th><th>箱</th><th>宛先の出し方</th></tr></thead>
+            <tbody>
+              <tr><td>FBA15GGL5J2X</td><td>HND2</td><td class="num">5</td><td>マスタ登録済み</td></tr>
+              <tr><td>FBA15GGLDVMG</td><td>XHD4</td><td class="num">14</td><td>マスタ登録済み</td></tr>
+            </tbody>
+          </table>
+          <div class="note">
+            この内容で1箱1伝票のCSVを作ります。取り込む前に箱数が実物と合っているか確認してください。<br>
+            読み取れない項目があるときは、CSVを作らずに理由を表示します。
+          </div>
+        </div>
+        <div class="foot">
+          <div class="btn">閉じる</div>
+          <div class="btn go">この内容でCSVを作る</div>
+        </div>
+      </div>
+
+      <div class="caption">
+        ダウンロードの前に<b>納品番号・宛先・箱数を必ず確認</b>できます。<br><br>
+        できたCSVは福山通運の送り状発行ソフトにそのまま取り込めます。
+        これまで別のスプレッドシートに宛先コードと箱数を手で書き写していた作業が不要になります。
+      </div>
+    </div>
+  </div>
+</body>
+</html>

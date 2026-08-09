@@ -109,21 +109,29 @@ t('🚨箱数と伝票枚数が合わなければ problem を立てる (いろ�
   assert.ok(problems.some((p) => /個口合計 1 と輸送箱 2 が一致しません/.test(p)), problems.join(' / '));
 });
 
-t('🚨同一FC宛の納品が複数あり管理番号が空なら中断する (推測しない)', () => {
+t('🚨管理番号が空なら既定では割り当てない (FCコードで推測しない)', () => {
+  const ships = [{ shipmentConfirmationId: 'FBA-X1', shipmentId: 's1', fcCode: 'HND2', boxIds: ['B1'], hasTracking: false }];
+  const { rows } = parseTrackingCsv(csv([row({ tracking: '663-9387-3162', fc: 'HND2' })]));
+  const { assignments, problems } = buildAssignments(rows, ships); // 既定 = フォールバックOFF
+  assert.equal(assignments.length, 0);
+  assert.ok(problems.some((p) => /納品番号を入れてください/.test(p)), problems.join(' / '));
+});
+
+t('🚨同一FC宛の納品が複数あるときは、明示的に許可しても中断する', () => {
   const ships = [
     { shipmentConfirmationId: 'FBA-X1', shipmentId: 's1', fcCode: 'HND2', boxIds: ['B1'], hasTracking: false },
     { shipmentConfirmationId: 'FBA-X2', shipmentId: 's2', fcCode: 'HND2', boxIds: ['B2'], hasTracking: false },
   ];
   const { rows } = parseTrackingCsv(csv([row({ tracking: '663-9387-3162', fc: 'HND2' })]));
-  const { assignments, problems } = buildAssignments(rows, ships);
+  const { assignments, problems } = buildAssignments(rows, ships, { allowFcFallback: true });
   assert.equal(assignments.length, 0);
   assert.ok(problems.some((p) => /どれに割り当てるか決まりません/.test(p)), problems.join(' / '));
 });
 
-t('管理番号が空でもFC宛の納品が1つだけなら割り当てる (過渡期)', () => {
+t('明示的に許可し、FC宛の納品が1つだけなら割り当てる (移行期の手動実行用)', () => {
   const ships = [{ shipmentConfirmationId: 'FBA-X1', shipmentId: 's1', fcCode: 'HND2', boxIds: ['B1'], hasTracking: false }];
   const { rows } = parseTrackingCsv(csv([row({ tracking: '663-9387-3162', fc: 'HND2' })]));
-  const { assignments } = buildAssignments(rows, ships);
+  const { assignments } = buildAssignments(rows, ships, { allowFcFallback: true });
   assert.equal(assignments.length, 1);
   assert.equal(assignments[0].matchedBy, 'FCコード');
 });
@@ -134,7 +142,7 @@ t('FBA以外の便 (amrc等) は除外として件数を残す', () => {
     row({ tracking: '663-9387-3173', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
     row({ tracking: '663-1111-2222', fc: 'AMRC', qty: 4, name: 'センコー株式会社' }),
   ]));
-  const { excluded, problems } = buildAssignments(rows, SHIPMENTS);
+  const { excluded, problems } = buildAssignments(rows, [SHIPMENTS[0]]);
   assert.equal(problems.filter((p) => /AMRC/.test(p)).length, 0); // エラーにはしない
   const ex = excluded.find((e) => e.fcCode === 'AMRC');
   assert.ok(ex, JSON.stringify(excluded));
@@ -159,11 +167,51 @@ t('🚨同じ送り状番号が別の宛先に現れたら取り違えを疑う'
 });
 
 t('1送り状=複数個口は個数分に展開される', () => {
-  const ships = [{ shipmentConfirmationId: 'FBA-Y', shipmentId: 'sY', fcCode: 'HND2', boxIds: ['B1', 'B2', 'B3'], hasTracking: false }];
-  const { rows } = parseTrackingCsv(csv([row({ tracking: '663-9387-3162', fc: 'HND2', qty: 3, kanri: 'FBA-Y' })]));
+  const ships = [{ shipmentConfirmationId: 'FBAY00000001', shipmentId: 'sY', fcCode: 'HND2', boxIds: ['B1', 'B2', 'B3'], hasTracking: false }];
+  const { rows } = parseTrackingCsv(csv([row({ tracking: '663-9387-3162', fc: 'HND2', qty: 3, kanri: 'FBAY00000001' })]));
   const { assignments, problems } = buildAssignments(rows, ships);
   assert.equal(problems.length, 0);
   assert.deepEqual(assignments[0].items.map((i) => i.trackingId), ['66393873162', '66393873162', '66393873162']);
+});
+
+t('🚨投入待ちの納品がCSVに1行も無ければ中断する (納品ごと数え漏らし)', () => {
+  // HND2 の行しか無いのに、XHD4 の納品も投入待ち
+  const { rows } = parseTrackingCsv(csv([
+    row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+    row({ tracking: '663-9387-3173', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+  ]));
+  const { problems } = buildAssignments(rows, SHIPMENTS);
+  assert.ok(
+    problems.some((p) => p.includes('FBA15GGLDVMG') && p.includes('送り状がCSVにありません')),
+    problems.join(' / '),
+  );
+});
+
+t('🚨CSVの管理番号に対応する納品が無ければ中断する (転記違い・別プランの混入)', () => {
+  const { rows } = parseTrackingCsv(csv([
+    row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+    row({ tracking: '663-9387-3173', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+    row({ tracking: '663-9999-0001', fc: 'HND2', kanri: 'FBA15WRONG01' }),
+  ]));
+  const { problems } = buildAssignments(rows, [SHIPMENTS[0]]);
+  assert.ok(
+    problems.some((p) => p.includes('FBA15WRONG01') && p.includes('対応する納品が見つかりません')),
+    problems.join(' / '),
+  );
+});
+
+t('🚨引用符を閉じたあとに文字が続く行も受け付けない ("abc"x)', () => {
+  const good = row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' });
+  const brokenLine = good.replace('"663-9387-3162"', '"663-9387-3162"x');
+  const { problems } = parseTrackingCsv(csv([good, brokenLine]));
+  assert.ok(problems.some((p) => p.includes('引用符が正しく閉じられていません')), problems.join(' / '));
+});
+
+t('🚨引用符が閉じられていない行は受け付けない (偶然34列でも通さない)', () => {
+  const good = row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' });
+  const brokenLine = good.replace('"663-9387-3162"', '"663-9387-3162');  // 閉じ忘れ
+  const { problems } = parseTrackingCsv(csv([good, brokenLine]));
+  assert.ok(problems.some((p) => p.includes('引用符が正しく閉じられていません')), problems.join(' / '));
 });
 
 console.log(`\n${pass} 件すべて通過`);
