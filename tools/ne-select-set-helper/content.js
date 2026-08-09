@@ -27,6 +27,38 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   /**
+   * MAIN world の page-agent.js に固定の操作を頼む。
+   * 🚨 isolated world からの疑似クリックは NE の「明細に貼付け」に効かない (2026-08-09 実機。
+   *   8/7 のCDP検証 = MAIN world では同じ操作が通っている)。値の設定とクリックだけを
+   *   ページ本体側で実行し、読み取り・照合・判断はこちら (isolated) に残す。
+   * dispatchEvent は同期なので、クリック中に NE の alert が出ても、
+   * 人が OK を押したあとに必ず結果が返る。
+   */
+  function pageExec(cmd, payload = {}) {
+    return new Promise((resolve) => {
+      const id = 'x' + Math.random().toString(36).slice(2);
+      let done = false;
+      const onResult = (ev) => {
+        let d = null;
+        try { d = JSON.parse(typeof ev.detail === 'string' ? ev.detail : '{}'); } catch { return; }
+        if (!d || d.id !== id) return;
+        done = true;
+        document.removeEventListener('bf-ss-result', onResult);
+        resolve(d);
+      };
+      document.addEventListener('bf-ss-result', onResult);
+      // page-agent が入っていない (拡張の入れ直し忘れ等) 場合に無言で固まらないための保険。
+      // 正常時は dispatchEvent が同期で完了するため、このタイマーは発火しない
+      setTimeout(() => {
+        if (done) return;
+        document.removeEventListener('bf-ss-result', onResult);
+        resolve({ ok: false, error: 'ページ側の実行係が応答しません。拡張を入れ直してください。' });
+      }, 3000);
+      document.dispatchEvent(new CustomEvent('bf-ss-exec', { detail: JSON.stringify({ id, cmd, ...payload }) }));
+    });
+  }
+
+  /**
    * 受注数の読み取り。
    * 🚨 `parseInt(...) || 1` は 0・空欄・非数値を全部 1 にしてしまい、
    *   読み取り失敗が「受注数1」として通っていた (Codexレビュー2巡目 / 2026-08-08)。
@@ -206,11 +238,9 @@
     return d ? getComputedStyle(d).visibility !== 'hidden' : null;
   }
 
-  function openAssistDialog() {
-    const btn = document.getElementById('show-meisai_as-btn') || document.getElementById('sub_menu_01_07_lnk');
-    if (!btn) return false;
-    btn.click();
-    return true;
+  async function openAssistDialog() {
+    const r = await pageExec('openDialog');
+    return r.ok;
   }
 
   async function waitAssistVisible(timeoutMs = 4000) {
@@ -222,10 +252,9 @@
     return false;
   }
 
-  /** 開いたダイアログを元の状態 (visibility:hidden) に戻す */
+  /** 開いたダイアログを閉じる (page-agent が閉じるボタンを探す) */
   function hideAssistDialog() {
-    const d = assistDialog();
-    if (d) d.style.visibility = 'hidden';
+    return pageExec('closeDialog');
   }
 
   let applying = false; // ページ単位のロック。共通の貼付け欄を同時に触らせない
@@ -266,15 +295,23 @@
     setBusy(true);
     let openedDialog = false;
     try {
-      const doPaste = () => {
-        setValue(codes, expected.codesText);
-        setValue(qtys, expected.qtysText);
-        // ここでNEが「貼り付けを完了しました」のalertを出す。拡張からは閉じられないので人がOKを押す
-        btn.click();
+      // ページ側の実行係 (MAIN world) が生きているか先に確かめる
+      const pong = await pageExec('ping');
+      if (!pong.ok) return fail(statusEl, pong.error || 'ページ側の実行係が応答しません。');
+
+      const doPaste = async () => {
+        // 値の設定とクリックは MAIN world で行う (isolated からのクリックはNEに効かない)。
+        // NEの「貼り付けを完了しました」alert中はここでブロックし、人がOKを押すと戻る
+        const r = await pageExec('fillAndPaste', {
+          codes: expected.codesText,
+          qtys: expected.qtysText,
+        });
+        if (!r.ok) console.warn('[選べるセット展開] 貼付け操作の失敗:', r.error);
+        return r.ok;
       };
 
       // 1回目: ダイアログを開かず静かに試す (開いていた/初期化済みのページではこれで通る)
-      doPaste();
+      await doPaste();
       let wait = await waitForStableAdded(before, expected.rows.length, { timeoutMs: 5000 });
 
       // 2回目: 1行も増えていなければ、ダイアログを公式に開いて初期化してから再試行。
@@ -282,16 +319,15 @@
       //   (万一二重になっても、後段の差分照合が「余分」を検出して保存を止める)
       if (!wait.added.length) {
         console.info('[選べるセット展開] 貼付けが反応しないため、明細入出力補助を開いて再試行します');
-        if (openAssistDialog()) {
+        if (await openAssistDialog()) {
           openedDialog = true;
           await waitAssistVisible();
-          doPaste();
+          await doPaste();
           wait = await waitForStableAdded(before, expected.rows.length, { timeoutMs: 12000 });
         }
       }
 
-      setValue(codes, '');
-      setValue(qtys, '');
+      await pageExec('clearInputs');
       if (!wait.added.length) {
         return fail(statusEl, '明細行が増えませんでした。メニューの「明細入出力補助」から手作業で入れてください。');
       }
@@ -324,7 +360,11 @@
         const tds = [...post.row.tr.querySelectorAll('td')];
         const cb = tds[post.cols.cancel]?.querySelector('input[type=checkbox]');
         if (!cb) return fail(statusEl, 'キャンセルのチェックボックスが見つかりません。手で入れてください。');
-        cb.click();
+        // クリックは MAIN world で。対象は data 属性で一意に印を付けて渡す (セレクタを外に渡さない)
+        cb.dataset.bfSsTarget = '1';
+        const clicked = await pageExec('clickMarked');
+        delete cb.dataset.bfSsTarget;
+        if (!clicked.ok) return fail(statusEl, 'キャンセルのチェック操作に失敗しました。手で入れてください。');
         await sleep(400);
       }
       const verify = findTargetRow(t);
@@ -351,7 +391,7 @@
     } catch (e) {
       return fail(statusEl, '処理中にエラーが起きました: ' + (e && e.message ? e.message : String(e)));
     } finally {
-      if (openedDialog) hideAssistDialog();
+      if (openedDialog) await hideAssistDialog();
       applying = false;
       setBusy(false);
     }
