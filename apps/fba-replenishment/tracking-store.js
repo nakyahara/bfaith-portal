@@ -35,7 +35,15 @@ export function readAll() {
   const entries = [];
   const brokenLines = [];
   lines.forEach((l, i) => {
-    try { entries.push(JSON.parse(l)); } catch { brokenLines.push(i + 1); }
+    let e = null;
+    try { e = JSON.parse(l); } catch { brokenLines.push(i + 1); return; }
+    // JSONとして読めても、必要な欄が欠けていれば「読めない行」と同じ扱いにする。
+    // 途中書きで {} だけが残る等を通すと、pending を見失って再送してしまう
+    if (!e || typeof e !== 'object' || !e.shipmentConfirmationId || !e.result) {
+      brokenLines.push(i + 1);
+      return;
+    }
+    entries.push(e);
   });
   return { entries, brokenLines };
 }
@@ -97,7 +105,11 @@ const LOCK_FILE = () => path.join(DATA_DIR, 'fba-tracking.lock');
 const LOCK_STALE_MS = 30 * 60 * 1000; // これを超えて残っていたら落ちた実行の置き土産とみなす
 
 function readLock() {
-  try { return JSON.parse(fs.readFileSync(LOCK_FILE(), 'utf-8')); } catch { return null; }
+  try {
+    const raw = fs.readFileSync(LOCK_FILE(), 'utf-8');
+    if (!raw.trim()) return null; // 作成直後で中身がまだ書かれていない
+    return JSON.parse(raw);
+  } catch { return null; }
 }
 
 /**
@@ -105,40 +117,62 @@ function readLock() {
  * 隙間で同じ納品へ二重投入しうる (手動実行と定期実行が重なる等)。
  *
  * ⭐**排他的作成 (wx) を使う。** 「存在を見てから書く」だと、2プロセスが同時に
- *   「無い」を見て両方ロックを取れてしまう (2026-08-08 Codex 2巡目の指摘)。
+ *   「無い」を見て両方ロックを取れてしまう。
+ * ⭐**古いロックの回収は rename でやる。** 「読んでから unlink」だと、その隙に別プロセスが
+ *   張り直した新しいロックを消してしまう。rename は原子的なので、
+ *   **回収に成功した1プロセスだけ**が先に進める (2026-08-09 Codex 3巡目の指摘)。
  * @returns {{ok: boolean, reason?: string}}
  */
 export function acquireLock(runId) {
   ensureDir();
-  const body = JSON.stringify({ runId, at: new Date().toISOString(), pid: process.pid });
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const body = () => JSON.stringify({ runId, at: new Date().toISOString(), pid: process.pid });
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const fd = fs.openSync(LOCK_FILE(), 'wx'); // 既にあれば EEXIST で失敗する = 原子的
-      fs.writeSync(fd, body);
-      fs.closeSync(fd);
+      const fd = fs.openSync(LOCK_FILE(), 'wx'); // 既にあれば EEXIST = 原子的
+      try { fs.writeSync(fd, body()); } finally { fs.closeSync(fd); }
       return { ok: true };
     } catch (e) {
       if (e?.code !== 'EEXIST') return { ok: false, reason: `ロックを作成できません: ${e?.message ?? e}` };
       const info = readLock();
-      let age = Infinity;
-      try { age = Date.now() - (Date.parse(info?.at ?? '') || fs.statSync(LOCK_FILE()).mtimeMs); } catch { /* 消えた */ }
+      let age = 0;
+      try { age = Date.now() - (Date.parse(info?.at ?? '') || fs.statSync(LOCK_FILE()).mtimeMs); } catch { continue; }
       if (age < LOCK_STALE_MS) {
         return { ok: false, reason: `別の実行が動いています (runId=${info?.runId ?? '不明'} / ${Math.round(age / 1000)}秒前に開始)` };
       }
-      // 落ちた実行の置き土産とみなして1回だけ消してやり直す
-      try { fs.unlinkSync(LOCK_FILE()); } catch { /* 他が先に消していればよい */ }
+      // 落ちた実行の置き土産とみなして回収する。rename に成功した者だけが消せる
+      const tomb = `${LOCK_FILE()}.stale.${runId}.${attempt}`;
+      try {
+        fs.renameSync(LOCK_FILE(), tomb);
+        fs.unlinkSync(tomb);
+      } catch { /* 他が先に回収した。次の試行でやり直す */ }
     }
   }
   return { ok: false, reason: 'ロックを取得できませんでした (競合)' };
 }
 
 /**
+ * 実行が長引いても stale と誤判定されないよう、ロックの時刻を更新する。
+ * これをしないと、納品が増えて30分を超えた実行が「落ちた」とみなされ、
+ * 別プロセスに追い越される。
+ */
+export function touchLock(runId) {
+  const info = readLock();
+  if (!info || info.runId !== runId) return false; // 自分のロックでなければ触らない
+  try {
+    fs.writeFileSync(LOCK_FILE(), JSON.stringify({ ...info, at: new Date().toISOString() }), 'utf-8');
+    return true;
+  } catch { return false; }
+}
+
+/**
  * ⭐**自分が取ったロックのときだけ消す。**
- * 無条件に消すと、stale判定で自分のロックを引き継いだ別プロセスのロックまで壊す。
+ * 無条件に消すと、stale回収でロックを引き継いだ別プロセスのロックまで壊す。
+ * 中身が読めないとき (作成途中の可能性) も触らない — 放置しても stale で回収される。
  */
 export function releaseLock(runId) {
   const info = readLock();
-  if (runId && info && info.runId !== runId) return; // 他人のロック — 触らない
+  if (!runId) return;                       // 誰のものか分からないなら触らない
+  if (!info || info.runId !== runId) return; // 他人のロック / 読めない = 触らない
   try { fs.unlinkSync(LOCK_FILE()); } catch { /* 既に無ければよい */ }
 }
 

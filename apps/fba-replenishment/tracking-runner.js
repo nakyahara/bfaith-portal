@@ -25,7 +25,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { parseTrackingCsv, buildAssignments, checkShipDate, tErr } from './tracking-csv.js';
-import { findOpenShipments, putTrackingDetails, checkDeadline, missingEnv } from './tracking-service.js';
+import { findOpenShipments, putTrackingDetails, checkDeadline, missingEnv, recheckBeforePut } from './tracking-service.js';
 import * as store from './tracking-store.js';
 import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
 
@@ -254,6 +254,17 @@ async function runInner(summary, ctx) {
       summary.registered.push({ ...a, dryRun: true });
       continue;
     }
+
+    // 🚨CSVを解析している間に、人が画面から入力していることがある (即SHIPPEDになる)。
+    //   入力直後は追跡番号がAPIに現れないので「未登録」に見える。送る直前にもう一度確かめる
+    const re = await recheckBeforePut({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId });
+    if (!re.ok) {
+      summary.failed.push({ shipmentConfirmationId: a.shipmentConfirmationId, error: re.reason, needsManual: true });
+      continue;
+    }
+
+    // 実行が長引いても「落ちた」と誤判定されないようロックの時刻を更新する
+    store.touchLock(runId);
 
     // ⭐**送る前に** pending を残す。ここを書いた直後に落ちても、次回は自動で送り直さない
     const base = {

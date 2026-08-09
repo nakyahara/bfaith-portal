@@ -44,24 +44,31 @@ export function tErr(message, detail) {
 function parseCsvLine(line) {
   const out = [];
   let cur = '';
-  let inQuotes = false;
-  let broken = false; // 引用符が閉じられていない / 裸フィールドの途中に " がある
+  let broken = false;
+  // フィールドの状態を3つに分けて見る。こうしないと `"abc"x` のような
+  // 「閉じたあとに文字が続く」壊れ方を通してしまう (2026-08-09 Codex 3巡目)
+  let state = 'start'; // start = 未確定 / bare = 裸 / quoted = 引用符内 / closed = 閉じた直後
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
-    if (inQuotes) {
+    if (state === 'quoted') {
       if (c === '"') {
-        if (line[i + 1] === '"') { cur += '"'; i++; } // "" = エスケープされた "
-        else inQuotes = false;
+        if (line[i + 1] === '"') { cur += '"'; i++; }  // "" = エスケープされた "
+        else state = 'closed';
       } else cur += c;
-    } else if (c === '"') {
-      if (cur !== '') broken = true; // 裸で始まったフィールドの途中に " が出た
-      inQuotes = true;
-    } else if (c === ',') {
-      out.push(cur); cur = '';
-    } else cur += c;
+      continue;
+    }
+    if (c === ',') { out.push(cur); cur = ''; state = 'start'; continue; }
+    if (state === 'closed') { broken = true; continue; } // 閉じたあとにカンマ以外が来た
+    if (c === '"') {
+      if (state === 'bare') { broken = true; continue; } // 裸フィールドの途中に " が出た
+      state = 'quoted';
+      continue;
+    }
+    cur += c;
+    state = 'bare';
   }
   out.push(cur);
-  if (inQuotes) broken = true; // 行末まで閉じられなかった
+  if (state === 'quoted') broken = true; // 行末まで閉じられなかった
   out.broken = broken;
   return out;
 }

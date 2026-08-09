@@ -142,5 +142,31 @@ t('🚨自分が取っていないロックは消さない (他プロセスの�
   store.releaseLock('next');
 });
 
+t('🚨作成途中(中身が空)のロックは他プロセスが消せない', () => {
+  const lockPath = path.join(process.env.DATA_DIR, 'fba-tracking.lock');
+  fs.writeFileSync(lockPath, '', 'utf-8');       // openSync直後・書き込み前を再現
+  store.releaseLock('someone');                  // 読めないロックには触らない
+  assert.equal(fs.existsSync(lockPath), true, '読めないロックを消してはいけない');
+  fs.unlinkSync(lockPath);
+});
+
+t('長い実行でも touchLock で stale と誤判定されない', () => {
+  assert.equal(store.acquireLock('long-run').ok, true);
+  const lockPath = path.join(process.env.DATA_DIR, 'fba-tracking.lock');
+  const before = JSON.parse(fs.readFileSync(lockPath, 'utf-8')).at;
+  assert.equal(store.touchLock('other-run'), false, '自分のロックでなければ触らない');
+  assert.equal(store.touchLock('long-run'), true);
+  const after = JSON.parse(fs.readFileSync(lockPath, 'utf-8')).at;
+  assert.ok(Date.parse(after) >= Date.parse(before));
+  store.releaseLock('long-run');
+});
+
+t('🚨必要な欄が欠けた記録は「読めない行」として扱う (pendingを見失わない)', () => {
+  fs.appendFileSync(store.storePath(), JSON.stringify({}) + String.fromCharCode(10), 'utf-8');
+  fs.appendFileSync(store.storePath(), JSON.stringify({ shipmentConfirmationId: 'FBA-Z' }) + String.fromCharCode(10), 'utf-8');
+  const { brokenLines } = store.readAll();
+  assert.ok(brokenLines.length >= 2, `brokenLines=${brokenLines}`);
+});
+
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 console.log(`\n${pass} 件すべて通過`);

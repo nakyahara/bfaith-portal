@@ -82,6 +82,8 @@ const DEFINITE_REJECT_CODES = new Set([
 function classifyPutError(e) {
   const code = e?.code ?? '';
   const msg = String(e?.message ?? e ?? '');
+  // レート超過は「明確に拒否された」が、内容は正しいので時間をおけば通る
+  if (code === 'QuotaExceeded') return { indeterminate: false, retryable: true };
   if (DEFINITE_REJECT_CODES.has(code)) return { indeterminate: false, retryable: false };
   // メッセージからも拾う (SDKがcodeを付けずに投げることがある)
   if (/is not in a state where tracking details can be provided|validation error/i.test(msg)) {
@@ -161,6 +163,10 @@ export async function findOpenShipments(opts = {}) {
       const base = `${V}/inboundPlans/${p.inboundPlanId}/shipments/${s.shipmentId}`;
       try {
         const d = await call(base);
+        // 🚨プラン一覧を見てから詳細を取るまでの間に、人が画面で追跡番号を入れて
+        //   SHIPPED になっていることがある。そのとき trackingDetails はまだ空なので
+        //   「未登録」に見えてしまう (反映が数時間遅れるため)。詳細でもう一度確認する
+        if (!wantStatuses.includes(d.status)) continue;
         const b = await callAllPages(`${base}/boxes`, 'boxes', { pageSize: 100 });
         if (b.truncated) errors.push(`${d.shipmentConfirmationId}: 輸送箱が多すぎて全部見られませんでした`);
         out.push({
@@ -181,6 +187,32 @@ export async function findOpenShipments(opts = {}) {
     }
   }
   return { shipments: out, errors };
+}
+
+/**
+ * PUTの直前に、まだ投入してよい状態かをもう一度確かめる。
+ * CSVの解析中に人が画面から入力していることがある (即 SHIPPED になる)。
+ * @returns {Promise<{ok: boolean, reason?: string, status?: string}>}
+ */
+export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHIP'] } = {}) {
+  const base = `${V}/inboundPlans/${target.inboundPlanId}/shipments/${target.shipmentId}`;
+  let d;
+  try {
+    d = await call(base);
+  } catch (e) {
+    return { ok: false, reason: `投入直前の確認に失敗しました: ${e?.message ?? e}` };
+  }
+  if (d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length) {
+    return { ok: false, status: d.status, reason: 'すでに追跡番号が入っています (この間に誰かが入力した可能性)' };
+  }
+  if (!expectStatuses.includes(d.status)) {
+    return {
+      ok: false, status: d.status,
+      reason: `状態が ${d.status} に変わりました。この間に画面から入力された可能性があります` +
+        ' (入力直後は追跡番号がAPIに現れないため、自動では投入しません)',
+    };
+  }
+  return { ok: true, status: d.status };
 }
 
 /**
