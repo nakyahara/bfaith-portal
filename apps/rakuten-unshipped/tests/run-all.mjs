@@ -13,6 +13,7 @@ import {
   MAX_LINES,
   UNSHIPPED_PROGRESS,
 } from '../service.js';
+import { exitCodeFor } from '../notify-job.js';
 
 let pass = 0;
 let fail = 0;
@@ -202,6 +203,13 @@ const mkCtx = () => ({ ...ctx, now: new Date('2026-08-09T08:00:00+09:00') });
   ok(text.includes('ほか1点'), '2件目以降は点数で表す');
   ok(!text.includes('あ'.repeat(50)), '商品名を丸ごとは出さない');
 }
+
+// ─── exitCodeFor (daily-sync が失敗/blocked を判定する根拠) ───
+section('exitCodeFor');
+eq(exitCodeFor({ partial: false }), 0, '完全な結果 → 0 (成功)');
+eq(exitCodeFor({ partial: true }), 2, '不完全 → 2 (daily-syncで❌かつretryしない)');
+eq(exitCodeFor({}), 0, 'partial 未指定 → 0');
+eq(exitCodeFor(null), 0, 'null でも落ちない');
 
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);
 process.exit(fail === 0 ? 0 : 1);

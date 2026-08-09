@@ -93,6 +93,18 @@ export async function runUnshippedAlert(opts = {}) {
   return { ok: true, partial, note, text, alerts: alerts.length, holds: holds.length };
 }
 
+/**
+ * 実行結果 → プロセス終了コード。
+ *   0 … 正常
+ *   2 … 通知は送れたが結果が不完全 (検索打ち切り・日時不正・明細欠落)。
+ *       daily-sync 側はこれを blocked (retry しない失敗) として扱い、サマリに ❌ を出す。
+ *       「不完全なのに ✅ で流れる」のを防ぐのが目的
+ * (完全な失敗 = 例外は呼び出し側で 1)
+ */
+export function exitCodeFor(result) {
+  return result?.partial ? 2 : 0;
+}
+
 // ─── CLI ───
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
@@ -105,7 +117,7 @@ if (isMain) {
     .then(r => {
       // daily-sync はこの行の末尾をサマリに載せる
       console.log(`[rakuten-unshipped] 完了: ${r.note}`);
-      process.exit(0);
+      process.exit(exitCodeFor(r));
     })
     .catch(e => {
       console.error('[rakuten-unshipped] 失敗:', e.message);
