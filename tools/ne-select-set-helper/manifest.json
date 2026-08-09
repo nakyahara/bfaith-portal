@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "B-Faith 選べるセット展開",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "ネクストエンジンの受注伝票で「選べる〇種セット」を実SKUの明細行に展開します (B-Faith社内用)。",
   "icons": {
     "16": "icons/icon16.png",
@@ -9,19 +9,39 @@
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": ["storage"],
+  "permissions": [
+    "storage"
+  ],
   "host_permissions": [
     "https://bfaith-portal.onrender.com/*",
     "https://wh.bfaith-wh.uk/*",
     "http://localhost/*"
   ],
-  "background": { "service_worker": "sw.js" },
+  "background": {
+    "service_worker": "sw.js"
+  },
   "content_scripts": [
     {
-      "matches": ["https://main.next-engine.com/Userjyuchu/*"],
-      "js": ["content.js"],
-      "css": ["style.css"],
+      "matches": [
+        "https://main.next-engine.com/Userjyuchu/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "style.css"
+      ],
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://main.next-engine.com/Userjyuchu/*"
+      ],
+      "js": [
+        "page-agent.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
     }
   ],
   "options_page": "options.html"
