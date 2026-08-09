@@ -78,7 +78,9 @@ function isAliveNodeProcess(pid) {
 //   07:00 の SP-API 混雑帯で一過性失敗しても同日 retry されず、TTL(168h) 超過した高額 SKU が
 //   数日累積して手数料カバー率が 69.84% まで崩壊した (incident_amazon_fee_coverage_no_retry)。
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ'];
+// '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
+// 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1198,6 +1200,15 @@ async function main() {
       results.push({ name: '月末確定値', success: true, skipped: true, summary: msg });
     }
   }
+
+  // ─── 楽天 未発送アラート (出荷漏れの通知) ───
+  // 前日12:00 (出荷の締め) までに入金確認できていたのに、まだ発送されていない注文を GChat へ。
+  // ・warehouse.db を見ず RMS API を直接読むので、他ステップの成否に影響されない
+  // ・楽天RMSは「同じキーで受注変更もできる」= API集約方針によりミニPC経由必須。
+  //   Render の node-cron ではなくこの日次ランナーの1ステップとして動かしている
+  // ・DBバックアップ (最大6h) より前に置く: バックアップ待ちで朝の通知が遅れないように
+  const unshippedResult = runScript('apps/rakuten-unshipped/notify-job.js --once', '楽天未発送アラート', 600000);
+  results.push({ name: '楽天未発送アラート', ...unshippedResult });
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。

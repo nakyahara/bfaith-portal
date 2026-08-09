@@ -64,12 +64,16 @@ const JOB_DEFINITIONS = {
   // DBバックアップ: 冪等 (当日分完成済み+元DB変化なしなら再利用し offsite 以降だけやり直す。
   // 先行ジョブの retry で DB が更新されていれば src_sig 不一致で自動的に作り直す)。月初最悪 ~5.5h
   'DBバックアップ':        { script: 'apps/warehouse/backup-warehouse.js',          args: [], timeoutMs: 21600000 },
+  // 楽天未発送アラート: RMS API を読んで GChat へ通知するだけ (DBに書かない) ので再実行安全。
+  // 朝の便が RMS の一時障害で落ちても、当日中に出荷漏れの通知が届くようにする
+  '楽天未発送アラート':    { script: 'apps/rakuten-unshipped/notify-job.js',        args: ['--once'], timeoutMs: 600000 },
 };
 
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
-const RETRY_ORDER = ['Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+// 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
+const RETRY_ORDER = ['楽天未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
