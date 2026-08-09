@@ -83,6 +83,7 @@ export async function runTrackingJob(opts = {}) {
     //   blocked = 人が直すまで登録できない (箱数不一致・CSVが古い/無い・権限エラー)
     severity: 'ok',
     openShipments: 0,
+    scanned: null,
     blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [],
   };
 
@@ -126,8 +127,9 @@ async function runInner(summary, ctx) {
   // ここを先にやることで「納品が無い日の置きっぱなしCSV」を異常扱いしないで済む。
   let shipments;
   try {
-    const r = await findOpenShipments();
+    const r = await findOpenShipments({ now });
     shipments = r.shipments;
+    summary.scanned = r.scanned;
     // 🚨取得に失敗したプランがあると「今日は納品が無い」に化ける。書き込みジョブなので
     //   一部でも見えていない状態では進めない (全体を止めて人に知らせる)
     if (r.errors.length) {
@@ -319,6 +321,11 @@ export function formatSummary(s) {
     // 黙って捨てない。FBA以外の便が混ざるのは正常だが、件数は必ず見せる
     const n = s.excluded.reduce((a, e) => a + (e.件数 ?? 1), 0);
     L.push('', `除外 ${n}件 (FBA以外の便など): ${s.excluded.map((e) => e.fcCode ?? e.納品番号).join(', ')}`);
+  }
+  if (s.scanned && s.scanned.skippedOld > 0) {
+    // 黙って絞らない。何件を対象外にしたかを必ず見せる
+    L.push('', `※ 直近${s.scanned.windowDays}日に更新された納品プラン ${s.scanned.checked}件を確認 ` +
+      `(それ以前の${s.scanned.skippedOld}件は対象外)`);
   }
   s.note.forEach((n) => L.push('', `※ ${n}`));
   return L.join('\n');
