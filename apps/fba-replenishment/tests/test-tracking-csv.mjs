@@ -200,4 +200,11 @@ t('🚨CSVの管理番号に対応する納品が無ければ中断する (転�
   );
 });
 
+t('🚨引用符が閉じられていない行は受け付けない (偶然34列でも通さない)', () => {
+  const good = row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' });
+  const brokenLine = good.replace('"663-9387-3162"', '"663-9387-3162');  // 閉じ忘れ
+  const { problems } = parseTrackingCsv(csv([good, brokenLine]));
+  assert.ok(problems.some((p) => p.includes('引用符が正しく閉じられていません')), problems.join(' / '));
+});
+
 console.log(`\n${pass} 件すべて通過`);

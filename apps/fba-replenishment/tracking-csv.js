@@ -45,6 +45,7 @@ function parseCsvLine(line) {
   const out = [];
   let cur = '';
   let inQuotes = false;
+  let broken = false; // 引用符が閉じられていない / 裸フィールドの途中に " がある
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (inQuotes) {
@@ -53,12 +54,15 @@ function parseCsvLine(line) {
         else inQuotes = false;
       } else cur += c;
     } else if (c === '"') {
+      if (cur !== '') broken = true; // 裸で始まったフィールドの途中に " が出た
       inQuotes = true;
     } else if (c === ',') {
       out.push(cur); cur = '';
     } else cur += c;
   }
   out.push(cur);
+  if (inQuotes) broken = true; // 行末まで閉じられなかった
+  out.broken = broken;
   return out;
 }
 
@@ -103,6 +107,7 @@ export function parseTrackingCsv(buf) {
   if (lines.length < 2) throw tErr('CSVにデータ行がありません (ヘッダーのみ)');
 
   const header = parseCsvLine(lines[0]);
+  if (header.broken) throw tErr('CSVのヘッダー行で引用符が正しく閉じられていません');
   if (header.length !== EXPECTED_COLUMNS) {
     throw tErr(
       `CSVの列数が想定と違います (期待 ${EXPECTED_COLUMNS} / 実際 ${header.length})。` +
@@ -119,6 +124,11 @@ export function parseTrackingCsv(buf) {
   for (let i = 1; i < lines.length; i++) {
     const c = parseCsvLine(lines[i]);
     const lineNo = i + 1;
+    if (c.broken) {
+      // 偶然34列になった壊れた行を通さない (列の中身がずれていても気付けないため)
+      problems.push(`${lineNo}行目: 引用符が正しく閉じられていません`);
+      continue;
+    }
     if (c.length !== EXPECTED_COLUMNS) {
       problems.push(`${lineNo}行目: 列数が ${c.length} (期待 ${EXPECTED_COLUMNS})`);
       continue;

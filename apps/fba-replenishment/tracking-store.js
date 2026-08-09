@@ -96,27 +96,49 @@ export function findLatest(shipmentConfirmationId) {
 const LOCK_FILE = () => path.join(DATA_DIR, 'fba-tracking.lock');
 const LOCK_STALE_MS = 30 * 60 * 1000; // これを超えて残っていたら落ちた実行の置き土産とみなす
 
+function readLock() {
+  try { return JSON.parse(fs.readFileSync(LOCK_FILE(), 'utf-8')); } catch { return null; }
+}
+
 /**
  * 多重起動を止める。書き込みAPIを2本同時に走らせると、記録を確認してからPUTするまでの
  * 隙間で同じ納品へ二重投入しうる (手動実行と定期実行が重なる等)。
+ *
+ * ⭐**排他的作成 (wx) を使う。** 「存在を見てから書く」だと、2プロセスが同時に
+ *   「無い」を見て両方ロックを取れてしまう (2026-08-08 Codex 2巡目の指摘)。
  * @returns {{ok: boolean, reason?: string}}
  */
 export function acquireLock(runId) {
   ensureDir();
-  const f = LOCK_FILE();
-  if (fs.existsSync(f)) {
-    let info = null;
-    try { info = JSON.parse(fs.readFileSync(f, 'utf-8')); } catch { /* 壊れていても古さで判断する */ }
-    const age = Date.now() - (Date.parse(info?.at ?? '') || fs.statSync(f).mtimeMs);
-    if (age < LOCK_STALE_MS) {
-      return { ok: false, reason: `別の実行が動いています (runId=${info?.runId ?? '不明'} / ${Math.round(age / 1000)}秒前に開始)` };
+  const body = JSON.stringify({ runId, at: new Date().toISOString(), pid: process.pid });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(LOCK_FILE(), 'wx'); // 既にあれば EEXIST で失敗する = 原子的
+      fs.writeSync(fd, body);
+      fs.closeSync(fd);
+      return { ok: true };
+    } catch (e) {
+      if (e?.code !== 'EEXIST') return { ok: false, reason: `ロックを作成できません: ${e?.message ?? e}` };
+      const info = readLock();
+      let age = Infinity;
+      try { age = Date.now() - (Date.parse(info?.at ?? '') || fs.statSync(LOCK_FILE()).mtimeMs); } catch { /* 消えた */ }
+      if (age < LOCK_STALE_MS) {
+        return { ok: false, reason: `別の実行が動いています (runId=${info?.runId ?? '不明'} / ${Math.round(age / 1000)}秒前に開始)` };
+      }
+      // 落ちた実行の置き土産とみなして1回だけ消してやり直す
+      try { fs.unlinkSync(LOCK_FILE()); } catch { /* 他が先に消していればよい */ }
     }
   }
-  fs.writeFileSync(f, JSON.stringify({ runId, at: new Date().toISOString(), pid: process.pid }), 'utf-8');
-  return { ok: true };
+  return { ok: false, reason: 'ロックを取得できませんでした (競合)' };
 }
 
-export function releaseLock() {
+/**
+ * ⭐**自分が取ったロックのときだけ消す。**
+ * 無条件に消すと、stale判定で自分のロックを引き継いだ別プロセスのロックまで壊す。
+ */
+export function releaseLock(runId) {
+  const info = readLock();
+  if (runId && info && info.runId !== runId) return; // 他人のロック — 触らない
   try { fs.unlinkSync(LOCK_FILE()); } catch { /* 既に無ければよい */ }
 }
 

@@ -102,9 +102,20 @@ export async function runTrackingJob(opts = {}) {
     return summary;
   }
   try {
+    // 🚨投入記録が壊れていると、pending や success を「無い」と見なして再送してしまう。
+    //   書き込みジョブなので、読めない行が1つでもあれば人が見るまで止める
+    const { brokenLines } = store.readAll();
+    if (brokenLines.length) {
+      summary.severity = 'blocked';
+      summary.blocked.push(
+        `投入記録に読めない行があります (${brokenLines.join(', ')}行目)。` +
+          `二重投入を避けるため中断します。${store.storePath()} を確認してください`,
+      );
+      return summary;
+    }
     return await runInner(summary, { opts, now, commit, expectYmd, runId });
   } finally {
-    store.releaseLock();
+    store.releaseLock(runId);
   }
 }
 

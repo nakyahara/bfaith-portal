@@ -69,6 +69,27 @@ async function callAllPages(basePath, key, { pageSize = 20, max = 50 } = {}) {
   return { items: out, truncated: true };
 }
 
+/**
+ * Amazonが「明確に拒否した」と断定できるエラーコード。
+ * ⭐これ以外 (タイムアウト・接続断・5xx・応答解析失敗) は
+ *   **受理されたのに応答だけ失った可能性がある**ので、確定失敗にしてはいけない。
+ *   確定失敗にすると次回の実行で再送され、二重投入になる。
+ */
+const DEFINITE_REJECT_CODES = new Set([
+  'BadRequest', 'InvalidInput', 'Unauthorized', 'Forbidden', 'NotFound', 'AccessDenied', 'QuotaExceeded',
+]);
+
+function classifyPutError(e) {
+  const code = e?.code ?? '';
+  const msg = String(e?.message ?? e ?? '');
+  if (DEFINITE_REJECT_CODES.has(code)) return { indeterminate: false, retryable: false };
+  // メッセージからも拾う (SDKがcodeを付けずに投げることがある)
+  if (/is not in a state where tracking details can be provided|validation error/i.test(msg)) {
+    return { indeterminate: false, retryable: false };
+  }
+  return { indeterminate: true, retryable: false };
+}
+
 export function missingEnv() {
   return ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']
     .filter((k) => !process.env[k]);
@@ -103,7 +124,11 @@ export function checkDeadline(shipment, now = new Date()) {
 /**
  * 追跡番号がまだ入っていない納品を探す。
  * ⭐無駄なAPI呼び出しを避けるため、プラン本体の shipments[].status を見てから詳細を取る。
- * @param {{statuses?: string[], maxPlans?: number}} [opts]
+ * @param {{statuses?: string[]}} [opts]
+ *   statuses の既定は READY_TO_SHIP のみ。
+ *   ⚠️ SHIPPED を足してはいけない: 人が画面で追跡番号を入れると即 SHIPPED になるが、
+ *   `trackingDetails` の反映は数時間遅れる。よって「SHIPPED かつ hasTracking=false」は
+ *   「未登録」ではなく「登録直後で見えていないだけ」のことがあり、拾うと二重投入になる。
  * @returns {Promise<Array>} [{inboundPlanId, planName, shipmentId, shipmentConfirmationId, fcCode,
  *                             status, boxIds, hasTracking, deadline, raw}]
  */
@@ -178,17 +203,30 @@ export async function putTrackingDetails(target, items) {
     res = await call(`${base}/trackingDetails`, 'PUT', body);
   } catch (e) {
     const msg = e?.message ?? String(e);
+    const c = classifyPutError(e);
     return {
       ok: false,
-      error: msg,
-      // 状態起因の400は再試行しても通らない。無限リトライしないことを呼び出し側へ伝える
-      retryable: !/is not in a state where tracking details can be provided|BadRequest/i.test(msg),
+      error: c.indeterminate
+        ? `投入が受理されたか判断できません (${msg})。Seller Central画面で反映を確認してください`
+        : msg,
+      // ⭐タイムアウトや接続断は「受理後に応答だけ失った」可能性がある。
+      //   確定失敗にすると次回の実行で再送され二重投入になるため indeterminate にする
+      indeterminate: c.indeterminate,
+      retryable: c.retryable,
     };
   }
 
   // ⭐202相当。operationId が返ったら SUCCESS まで追う (返り値だけで成功と判断しない)
   const operationId = res?.operationId;
-  if (operationId) {
+  if (!operationId) {
+    // 非同期APIなので operationId が返るのが正。返らないのは想定外で、
+    // 受理されたかも分からない。成功に倒さない (#6)
+    return {
+      ok: false, indeterminate: true, retryable: false,
+      error: `投入の応答に operationId がありません (${JSON.stringify(res ?? null).slice(0, 200)})。Seller Central画面で反映を確認してください`,
+    };
+  }
+  {
     for (let i = 0; i < 20; i++) {
       await sleep(3000);
       let op;
@@ -253,8 +291,9 @@ export async function getPlanShipments(inboundPlanId) {
   for (const s of full.shipments ?? []) {
     const base = `${V}/inboundPlans/${inboundPlanId}/shipments/${s.shipmentId}`;
     const d = await call(base);
-    const b = await call(`${base}/boxes?pageSize=100`);
-    const boxes = b.boxes ?? [];
+    const b = await callAllPages(`${base}/boxes`, 'boxes', { pageSize: 100 });
+    if (b.truncated) throw new Error(`${d.shipmentConfirmationId}: 輸送箱が多すぎて全部取得できませんでした`);
+    const boxes = b.items;
     out.push({
       shipmentId: s.shipmentId,
       shipmentConfirmationId: d.shipmentConfirmationId,
@@ -268,4 +307,4 @@ export async function getPlanShipments(inboundPlanId) {
   return { planName: full.name || '', planStatus: full.status, shipments: out };
 }
 
-export const _internal = { MARKETPLACE };
+export const _internal = { MARKETPLACE, classifyPutError };

@@ -128,9 +128,18 @@ t('🚨ロックが取れている間は二重起動できない', () => {
   const second = store.acquireLock('run-2');
   assert.equal(second.ok, false);
   assert.match(second.reason, /別の実行が動いています/);
-  store.releaseLock();
+  store.releaseLock('run-1');
   assert.equal(store.acquireLock('run-3').ok, true, '解放後は取れる');
-  store.releaseLock();
+  store.releaseLock('run-3');
+});
+
+t('🚨自分が取っていないロックは消さない (他プロセスのロックを壊さない)', () => {
+  assert.equal(store.acquireLock('owner').ok, true);
+  store.releaseLock('someone-else');                       // 他人のつもりで解放を試みる
+  assert.equal(store.acquireLock('intruder').ok, false, 'ロックは残っているべき');
+  store.releaseLock('owner');
+  assert.equal(store.acquireLock('next').ok, true);
+  store.releaseLock('next');
 });
 
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
