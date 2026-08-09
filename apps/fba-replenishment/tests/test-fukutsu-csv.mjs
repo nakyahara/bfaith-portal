@@ -87,7 +87,10 @@ t('登録済みFCには電話番号を入れない (マスタが正)', () => {
 
 t('🚨TPFB は「無いもの」として扱う (マスタの登録内容がXHD1と食い違うため)', () => {
   assert.equal(isRegisteredFc('TPFB'), false);
-  const { registered } = buildRowsForShipment({ shipmentConfirmationId: 'FBA15TPFB001', fcCode: 'TPFB', boxCount: 1, address: {} }, '20260807');
+  const { registered } = buildRowsForShipment({
+    shipmentConfirmationId: 'FBA15TPFB001', fcCode: 'TPFB', boxCount: 1,
+    address: { postalCode: '243-0213', stateOrProvinceCode: '神奈川県', city: '伊勢原市', addressLine1: '石田 100' },
+  }, '20260807');
   assert.equal(registered, false, '住所を出力する側に倒れる');
 });
 
@@ -107,7 +110,25 @@ t('不正な入力は投げる (箱数0・納品番号なし・FCなし)', () =>
   assert.throws(() => buildRowsForShipment({ ...HND2, boxCount: 0 }, '20260807'), /輸送箱の数/);
   assert.throws(() => buildRowsForShipment({ ...HND2, shipmentConfirmationId: '' }, '20260807'), /納品番号が不正/);
   assert.throws(() => buildRowsForShipment({ ...HND2, fcCode: '' }, '20260807'), /宛先FCコード/);
-  assert.throws(() => buildFukutsuCsv([HND2], '2026-08-07'), /出荷日の書式/);
+  assert.throws(() => buildFukutsuCsv([HND2], '2026-08-07'), /出荷日が不正です/);
+});
+
+t('🚨マスタ未登録なのに住所が欠けていれば作らない (届かない伝票を出さない)', () => {
+  const base = { shipmentConfirmationId: 'FBA15NEW0002', fcCode: 'ZZZ7', boxCount: 1 };
+  assert.throws(() => buildRowsForShipment({ ...base, address: {} }, '20260807'), /郵便番号が読み取れません/);
+  assert.throws(() => buildRowsForShipment({ ...base, address: { postalCode: '350-1301' } }, '20260807'), /住所が読み取れません/);
+  assert.throws(
+    () => buildRowsForShipment({ ...base, address: { postalCode: '350-1301', addressLine1: 'あ'.repeat(70) } }, '20260807'),
+    /60文字を超えています/,
+  );
+});
+
+t('🚨存在しない日付は弾く (書式だけ見ない)', () => {
+  const ships = [{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1 }];
+  assert.throws(() => buildFukutsuCsv(ships, '20261340'), /出荷日が不正です/);
+  assert.throws(() => buildFukutsuCsv(ships, '20260230'), /出荷日が不正です/);
+  assert.throws(() => buildFukutsuCsv(ships, '20260229'), /出荷日が不正です/); // 2026は閏年ではない
+  assert.equal(buildFukutsuCsv(ships, '20240229').summary.出荷日, '20240229'); // 2024は閏年
 });
 
 console.log(`\n${pass} 件すべて通過`);

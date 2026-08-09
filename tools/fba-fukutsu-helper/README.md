@@ -50,11 +50,26 @@ Amazon Seller Central の **「ステップ3 – 印刷された輸送箱ラベ�
 
 ## インストール
 
-1. Chrome の `chrome://extensions` を開く
-2. 右上の「デベロッパーモード」をON
-3. 「パッケージ化されていない拡張機能を読み込む」→ このフォルダを選ぶ
+**zipで配る (更新が楽)**
 
-以上。設定項目はない。
+```
+https://<ポータル>/apps/fba-replenishment/download/extension.zip
+```
+
+を落として解凍 → `chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」。
+`make-icons.mjs` と `STORE_LISTING.md` はzipに含まれない。
+
+**リポジトリから直接**
+
+`chrome://extensions` → デベロッパーモード → 「パッケージ化されていない拡張機能を読み込む」
+→ このフォルダを選ぶ。
+
+いずれも設定項目はない。
+
+## Chromeウェブストアへの提出
+
+`STORE_LISTING.md` に、掲載情報・プライバシー申告・手順の下書きがある (非公開・組織内のみ)。
+アイコンを作り直すときは `node tools/fba-fukutsu-helper/make-icons.mjs`。
 
 ## 構成
 
@@ -63,6 +78,8 @@ Amazon Seller Central の **「ステップ3 – 印刷された輸送箱ラベ�
 | `page-parse.js` | 画面テキストから納品番号・FCコード・住所・箱数・出荷日を読む |
 | `fukutsu-csv.js` | 26列CSVの組み立て (**サーバ側と同一実装**) |
 | `content.js` | ボタン・確認パネル・ダウンロード |
+| `icons/` | 拡張アイコン (`make-icons.mjs` で生成。図柄=輸送箱に送り状) |
+| `STORE_LISTING.md` | ウェブストア提出の下書き (**配布zipには入れない**) |
 
 ### 🚨 fukutsu-csv.js はサーバ側と同期している
 

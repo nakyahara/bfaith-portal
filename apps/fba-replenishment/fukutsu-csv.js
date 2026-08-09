@@ -40,6 +40,15 @@ const SENDER_CODE = '0648607868'; // 荷送人コード (ご依頼主) — 現�
  */
 const FALLBACK_TEL = () => process.env.FUKUTSU_FALLBACK_TEL || '(06)6333-4858';
 
+/** YYYYMMDD が実在する日付か (2026年13月40日 のような値を弾く) */
+export function isRealYmd(v) {
+  const t = String(v ?? '');
+  if (!/^\d{8}$/.test(t)) return false;
+  const y = Number(t.slice(0, 4)), m = Number(t.slice(4, 6)), d = Number(t.slice(6, 8));
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
 export function cErr(message) {
   const e = new Error(message);
   e.code = 'FUKUTSU_CSV';
@@ -85,10 +94,16 @@ export function buildRowsForShipment(shipment, ymd) {
     if (!registered) {
       // マスタ未登録のFC = 住所を直接書いて伝票を出せるようにする (出荷を止めない)
       const a = shipment.address ?? {};
-      const [a1, a2, a3] = splitAddress([a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join(''));
+      const parts = [a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join('');
+      // 🚨マスタに無いFCは住所で出すしかない。欠けたまま伝票を出すと届かないので必ず止める
+      const post = normPostal(a.postalCode);
+      if (!post) throw cErr(`${kanri} (${fc}): 郵便番号が読み取れません。マスタ未登録のFCは住所が必要です`);
+      if (parts.replace(/\s/g, '').length < 6) throw cErr(`${kanri} (${fc}): 住所が読み取れません`);
+      if (parts.length > 60) throw cErr(`${kanri} (${fc}): 住所が60文字を超えています (${parts.length}文字)。切り捨てると届きません`);
+      const [a1, a2, a3] = splitAddress(parts);
       c[COL.住所1] = a1; c[COL.住所2] = a2; c[COL.住所3] = a3;
       c[COL.名前1] = `Amazon.co.jp ${fc}`.slice(0, 20);
-      c[COL.郵便番号] = normPostal(a.postalCode);
+      c[COL.郵便番号] = post;
       c[COL.電話番号] = FALLBACK_TEL();
     }
     rows.push(c);
@@ -108,7 +123,7 @@ const q = (v) => {
  * @returns {{csv: string, summary: object}}
  */
 export function buildFukutsuCsv(shipments, ymd) {
-  if (!/^\d{8}$/.test(String(ymd ?? ''))) throw cErr(`出荷日の書式が不正です: ${ymd}`);
+  if (!isRealYmd(ymd)) throw cErr(`出荷日が不正です: ${ymd}`);
   if (!shipments?.length) throw cErr('対象の納品がありません');
 
   const all = [];

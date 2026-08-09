@@ -3,7 +3,19 @@
  *   node apps/fba-replenishment/tests/test-tracking-runner.mjs
  */
 import assert from 'node:assert/strict';
-import { jstYmd, formatSummary } from '../tracking-runner.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'fba-runner-test-'));
+// SP-APIの疎通はしない。missingEnv を通すためだけのダミー
+for (const k of ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOKEN', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY']) {
+  process.env[k] = process.env[k] || 'dummy-for-test';
+}
+
+const { jstYmd, formatSummary, runTrackingJob } = await import('../tracking-runner.js');
+const store = await import('../tracking-store.js');
+const { _internal } = await import('../tracking-service.js');
 
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log(`  ok  ${name}`); };
@@ -93,5 +105,39 @@ t('プレビューはタイトルで分かる', () => {
   assert.match(formatSummary({ ...base, commit: false }), /追跡番号\(プレビュー\)/);
   assert.doesNotMatch(formatSummary({ ...base, commit: true }), /プレビュー/);
 });
+
+// ── 2巡目レビューの修正 ──────────────────────────────
+t('🚨受理されたか断定できない例外は indeterminate にする (再送で二重投入しない)', () => {
+  const c = _internal.classifyPutError;
+  // Amazonが明確に拒否したもの = 確定失敗
+  assert.equal(c({ code: 'BadRequest', message: 'is not in a state where tracking details can be provided' }).indeterminate, false);
+  assert.equal(c({ code: 'InvalidInput', message: 'validation error detected' }).indeterminate, false);
+  // 通信起因 = 受理された可能性がある
+  assert.equal(c({ code: 'ETIMEDOUT', message: 'socket hang up' }).indeterminate, true);
+  assert.equal(c({ code: 'ECONNRESET', message: 'read ECONNRESET' }).indeterminate, true);
+  assert.equal(c(new Error('Internal Server Error')).indeterminate, true);
+  assert.equal(c(undefined).indeterminate, true);
+});
+
+await (async () => {
+  const name = '🚨投入記録に読めない行があれば中断する (pendingを見失って再送しない)';
+  fs.appendFileSync(store.storePath(), '{壊れたJSON' + String.fromCharCode(10), 'utf-8');
+  const s = await runTrackingJob({ file: 'これは読まれない.csv' });
+  assert.equal(s.severity, 'blocked', JSON.stringify(s));
+  assert.ok(s.blocked.some((b) => b.includes('投入記録に読めない行があります')), s.blocked.join(' / '));
+  fs.writeFileSync(store.storePath(), '', 'utf-8');
+  pass++; console.log(`  ok  ${name}`);
+})();
+
+await (async () => {
+  const name = 'ロックは実行後に解放される (次の実行が止まらない)';
+  const s = await runTrackingJob({ file: 'これは読まれない.csv' });
+  assert.ok(s.severity, JSON.stringify(s));
+  assert.equal(store.acquireLock('after').ok, true, '前の実行のロックが残っていない');
+  store.releaseLock('after');
+  pass++; console.log(`  ok  ${name}`);
+})();
+
+fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
 
 console.log(`\n${pass} 件すべて通過`);

@@ -41,6 +41,12 @@ import { bootStart, bootEnd, bootFail, bootNote } from '../observability/boot-lo
 import { buildInboundChart } from './inbound-chart.js';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { isRender } from '../../lib/is-render.js';
+import archiver from 'archiver';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // --- ミニPC接続（SP-API実行用） ---
 const WAREHOUSE_URL = process.env.WAREHOUSE_URL || 'https://wh.bfaith-wh.uk';
@@ -182,6 +188,46 @@ function ensureDb(req, res, next) {
 }
 
 router.use(ensureDb);
+
+/**
+ * 拡張機能のzipに入れないもの (Googleに提出するパッケージに社内メモや素材を混ぜないため)。
+ * store/ にはストア掲載用のスクリーンショット素材が入っている。select-set と同じ方針。
+ */
+const EXT_DEV_ONLY_FILES = new Set(['make-icons.mjs', 'STORE_LISTING.md']);
+const EXT_DEV_ONLY_DIRS = ['store/'];
+
+function isExtDevOnly(name) {
+  return EXT_DEV_ONLY_FILES.has(name) || EXT_DEV_ONLY_DIRS.some((d) => name === d.slice(0, -1) || name.startsWith(d));
+}
+
+/**
+ * FBA納品 福通伝票CSV の Chrome拡張を zip で配る。
+ * 各PCへ「フォルダを読み込む」で入れるより、zipを落として解凍するほうが更新が楽。
+ * Chromeウェブストアへ提出するパッケージもこれをそのまま使える。
+ */
+router.get('/download/extension.zip', (req, res) => {
+  const dir = path.resolve(__dirname, '../../tools/fba-fukutsu-helper');
+  if (!fs.existsSync(dir)) {
+    return res.status(404).json({ error: '拡張機能のファイルが見つかりません' });
+  }
+  let version = '';
+  try {
+    version = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8')).version || '';
+  } catch { /* バージョンが読めなくても配布は続ける */ }
+  res.set({
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename=fba-fukutsu-helper${version ? '-' + version : ''}.zip`,
+  });
+  const archive = archiver('zip', { zlib: { level: 9 } });
+  archive.on('error', (e) => {
+    console.error('[fba-replenishment] 拡張機能のzip作成に失敗', e);
+    res.destroy();
+  });
+  archive.pipe(res);
+  archive.directory(dir, false, (entry) => (isExtDevOnly(entry.name) ? false : entry));
+  archive.finalize();
+});
+
 
 // ===== メイン画面 =====
 router.get('/', (req, res) => {

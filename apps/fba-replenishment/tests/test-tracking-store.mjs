@@ -88,16 +88,84 @@ t('🚨翌日に回すと期限切れ (8/7の失敗を再現)', () => {
   assert.match(r.note, /Seller Central画面からは入力できます/);
 });
 
-t('当日23:59 JST を1分過ぎたら期限切れ扱い', () => {
+t('⭐当日23:59を過ぎても editableUntil が残っていれば送ってみる (可否の判断はAmazon側)', () => {
   const now = new Date('2026-08-07T15:00:00Z'); // 8/8 00:00 JST
   const r = checkDeadline(shipment('2026-08-07T14:59Z', '2026-08-08T00:00Z'), now);
+  assert.equal(r.ok, true, 'どちらの期限が効くかは未実測。緩い側に倒して人手に回さない');
+  assert.equal(r.expired.length, 1);
+});
+
+t('🚨すべての期限を過ぎたら期限切れ', () => {
+  const now = new Date('2026-08-08T01:00:00Z'); // 8/8 10:00 JST
+  const r = checkDeadline(shipment('2026-08-07T14:59Z', '2026-08-08T00:00Z'), now);
   assert.equal(r.ok, false);
+  assert.equal(r.expired.length, 2);
+  assert.match(r.note, /Seller Central画面からは入力できます/);
 });
 
 t('期限の情報が無いときは止めない (取れないだけで無効ではない)', () => {
   const r = checkDeadline({}, new Date());
   assert.equal(r.ok, true);
   assert.match(r.note, /期限の情報が取れませんでした/);
+});
+
+// ── #1 二重投入の防止 ────────────────────────────────
+t('🚨pending が最後に残っていたら「結果不明」として扱う (自動で送り直さない)', () => {
+  store.append({ runId: 'r9', shipmentConfirmationId: 'FBA-P', result: 'pending', items: [{ boxId: 'B1', trackingId: '12345678' }] });
+  const latest = store.findLatest('FBA-P');
+  assert.equal(latest.result, 'pending');
+  assert.equal(store.findSuccess('FBA-P'), null, 'pendingを成功扱いしない');
+});
+
+t('pending のあとに success を書けば解消する', () => {
+  store.append({ runId: 'r9', shipmentConfirmationId: 'FBA-P', result: 'success', items: [{ boxId: 'B1', trackingId: '12345678' }] });
+  assert.equal(store.findLatest('FBA-P').result, 'success');
+  assert.ok(store.findSuccess('FBA-P'));
+});
+
+t('🚨ロックが取れている間は二重起動できない', () => {
+  assert.equal(store.acquireLock('run-1').ok, true);
+  const second = store.acquireLock('run-2');
+  assert.equal(second.ok, false);
+  assert.match(second.reason, /別の実行が動いています/);
+  store.releaseLock('run-1');
+  assert.equal(store.acquireLock('run-3').ok, true, '解放後は取れる');
+  store.releaseLock('run-3');
+});
+
+t('🚨自分が取っていないロックは消さない (他プロセスのロックを壊さない)', () => {
+  assert.equal(store.acquireLock('owner').ok, true);
+  store.releaseLock('someone-else');                       // 他人のつもりで解放を試みる
+  assert.equal(store.acquireLock('intruder').ok, false, 'ロックは残っているべき');
+  store.releaseLock('owner');
+  assert.equal(store.acquireLock('next').ok, true);
+  store.releaseLock('next');
+});
+
+t('🚨作成途中(中身が空)のロックは他プロセスが消せない', () => {
+  const lockPath = path.join(process.env.DATA_DIR, 'fba-tracking.lock');
+  fs.writeFileSync(lockPath, '', 'utf-8');       // openSync直後・書き込み前を再現
+  store.releaseLock('someone');                  // 読めないロックには触らない
+  assert.equal(fs.existsSync(lockPath), true, '読めないロックを消してはいけない');
+  fs.unlinkSync(lockPath);
+});
+
+t('長い実行でも touchLock で stale と誤判定されない', () => {
+  assert.equal(store.acquireLock('long-run').ok, true);
+  const lockPath = path.join(process.env.DATA_DIR, 'fba-tracking.lock');
+  const before = JSON.parse(fs.readFileSync(lockPath, 'utf-8')).at;
+  assert.equal(store.touchLock('other-run'), false, '自分のロックでなければ触らない');
+  assert.equal(store.touchLock('long-run'), true);
+  const after = JSON.parse(fs.readFileSync(lockPath, 'utf-8')).at;
+  assert.ok(Date.parse(after) >= Date.parse(before));
+  store.releaseLock('long-run');
+});
+
+t('🚨必要な欄が欠けた記録は「読めない行」として扱う (pendingを見失わない)', () => {
+  fs.appendFileSync(store.storePath(), JSON.stringify({}) + String.fromCharCode(10), 'utf-8');
+  fs.appendFileSync(store.storePath(), JSON.stringify({ shipmentConfirmationId: 'FBA-Z' }) + String.fromCharCode(10), 'utf-8');
+  const { brokenLines } = store.readAll();
+  assert.ok(brokenLines.length >= 2, `brokenLines=${brokenLines}`);
 });
 
 fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true });
