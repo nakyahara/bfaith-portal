@@ -259,9 +259,20 @@ export function deleteMapping(id) {
  * (差分マージにすると「Renderで消した行がminiPCに残る」が起きる)。
  * ss_rms_cache は miniPC 側で育てるキャッシュなので触らない。
  */
-export function replaceMaster({ sets = [], mappings = [], omake = [] }) {
+export function replaceMaster(snapshot) {
+  const problems = validateMasterSnapshot(snapshot);
+  if (problems.length) {
+    // 🚨 検証してから消す。以前は「両方空でなければ反映」だけだったので、
+    //   mappings=[] の壊れた応答で既存マッピングとおまけを全消去できた
+    //   (Codexレビュー4巡目 / 2026-08-08)
+    throw new Error(`受け取ったマスタが不正です: ${problems.slice(0, 5).join(' / ')}`);
+  }
+  const { sets, mappings, omake } = snapshot;
   const now = utcNow();
   const d = getDB();
+
+  // INSERT OR IGNORE ではなく素の INSERT。制約に触れたらトランザクションごと巻き戻り、
+  // 既存マスタがそのまま残る (黙って行が欠けるより止まる方がよい)
   d.transaction(() => {
     d.prepare('DELETE FROM ss_mappings').run();
     d.prepare('DELETE FROM ss_sets').run();
@@ -271,32 +282,113 @@ export function replaceMaster({ sets = [], mappings = [], omake = [] }) {
       'INSERT INTO ss_sets (set_code, label, is_active, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
     );
     for (const s of sets) {
-      if (!s?.set_code) continue;
-      insSet.run(String(s.set_code), String(s.label || ''), s.is_active ? 1 : 0, String(s.note || ''),
-        s.created_at || now, s.updated_at || now);
+      insSet.run(String(s.set_code).trim(), String(s.label || ''),
+        s.is_active === 0 ? 0 : 1, String(s.note || ''), s.created_at || now, s.updated_at || now);
     }
 
     const insMap = d.prepare(`
-      INSERT OR IGNORE INTO ss_mappings (set_code, option_text, option_key, product_code, note, created_at, updated_at)
+      INSERT INTO ss_mappings (set_code, option_text, option_key, product_code, note, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
     for (const m of mappings) {
-      if (!m?.set_code || !m?.option_text || !m?.product_code) continue;
-      insMap.run(String(m.set_code), String(m.option_text),
-        m.option_key || normalizeValue(m.option_text), String(m.product_code),
+      insMap.run(String(m.set_code).trim(), String(m.option_text),
+        normalizeValue(m.option_text), String(m.product_code).trim(),
         String(m.note || ''), m.created_at || now, m.updated_at || now);
     }
 
     const insOmake = d.prepare(
-      'INSERT OR IGNORE INTO ss_omake (rank, product_code, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO ss_omake (rank, product_code, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
     );
     omake.forEach((o, i) => {
-      const code = typeof o === 'string' ? o : o?.product_code;
-      if (!code) return;
-      insOmake.run(i + 1, String(code), typeof o === 'string' ? '' : String(o.note || ''), now, now);
+      const code = typeof o === 'string' ? o : o.product_code;
+      insOmake.run(i + 1, String(code).trim(), typeof o === 'string' ? '' : String(o.note || ''), now, now);
     });
   })();
-  return { sets: sets.length, mappings: mappings.length, omake: omake.length };
+
+  // 実際に入った件数を返す (受け取った配列の長さではなく)
+  const count = (t) => d.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+  const actual = { sets: count('ss_sets'), mappings: count('ss_mappings'), omake: count('ss_omake') };
+  if (actual.sets !== sets.length || actual.mappings !== mappings.length || actual.omake !== omake.length) {
+    throw new Error(`マスタの投入件数が合いません (受信 ${sets.length}/${mappings.length}/${omake.length}`
+      + ` → 実際 ${actual.sets}/${actual.mappings}/${actual.omake})`);
+  }
+  return actual;
+}
+
+/**
+ * 受け取ったマスタが丸ごと入れ替えてよい形か検証する。
+ * 問題があれば理由の配列を返す (空なら正常)。
+ * 全置換は取り返しがつかないので、ここで弾いて既存マスタを守る。
+ */
+export function validateMasterSnapshot(s) {
+  const p = [];
+  if (!s || typeof s !== 'object') return ['中身がありません'];
+  for (const k of ['sets', 'mappings', 'omake']) {
+    if (!Array.isArray(s[k])) p.push(`${k} が配列ではありません`);
+  }
+  if (p.length) return p;
+  // このシステムでは手動マッピングもおまけも常に存在する。空で来たら異常とみなす
+  // (Codexレビュー4巡目: sets だけ正常で mappings=[] の応答で全消去できた)
+  if (!s.sets.length) p.push('セットが1件もありません');
+  if (!s.mappings.length) p.push('手動マッピングが1件もありません');
+  if (!s.omake.length) p.push('おまけ優先順位が1件もありません');
+  if (s.sets.length > 500 || s.mappings.length > 20000 || s.omake.length > 200) {
+    p.push('件数が想定を大きく超えています');
+  }
+
+  const setCodes = new Set();
+  for (const x of s.sets) {
+    const c = String(x?.set_code || '').trim();
+    if (!c) { p.push('セット商品コードが空の行があります'); continue; }
+    if (setCodes.has(c)) p.push(`セット商品コードが重複しています: ${c}`);
+    setCodes.add(c);
+  }
+
+  const keys = new Set();
+  for (const m of s.mappings) {
+    const set = String(m?.set_code || '').trim();
+    const opt = String(m?.option_text || '').trim();
+    const code = String(m?.product_code || '').trim();
+    if (!set || !opt || !code) { p.push('セット/選択肢/商品コードのいずれかが空の行があります'); continue; }
+    if (!setCodes.has(set)) p.push(`マッピングの参照先セットがありません: ${set}`);
+    const k = `${set}${normalizeValue(opt)}`;
+    if (keys.has(k)) p.push(`同じ選択肢が重複しています: ${set} / ${opt}`);
+    keys.add(k);
+  }
+
+  const codes = new Set();
+  for (const o of s.omake) {
+    const code = String(typeof o === 'string' ? o : o?.product_code || '').trim().toLowerCase();
+    if (!code) { p.push('おまけの商品コードが空の行があります'); continue; }
+    if (codes.has(code)) p.push(`おまけの商品コードが重複しています: ${code}`);
+    codes.add(code);
+  }
+  return [...new Set(p)];
+}
+
+/** 現在のマスタ件数 (取得前後の比較に使う) */
+export function masterCounts() {
+  const d = getDB();
+  const c = (t) => d.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+  return { sets: c('ss_sets'), mappings: c('ss_mappings'), omake: c('ss_omake') };
+}
+
+/**
+ * 取得したマスタが、今持っているものから不自然に減っていないか。
+ * 全置換なので、Render側の事故で件数が激減したスナップショットをそのまま反映すると
+ * 復旧が面倒になる。半分以下に減っていたら止めて人に判断させる。
+ * @returns {string|null} 問題の説明 (問題なければ null)
+ */
+export function shrinkProblem(current, incoming) {
+  const check = (name, before, after) => {
+    if (before >= 5 && after < before * 0.5) {
+      return `${name}が ${before} → ${after} と半分以下に減っています`;
+    }
+    return null;
+  };
+  return check('セット', current.sets, incoming.sets)
+    || check('手動マッピング', current.mappings, incoming.mappings)
+    || check('おまけ', current.omake, incoming.omake);
 }
 
 /** マスタ配信用のスナップショット (Render → miniPC) */

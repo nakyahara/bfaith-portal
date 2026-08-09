@@ -12,9 +12,11 @@
  * 認証は既存の RENDER_MIRROR_URL / MIRROR_SYNC_KEY に相乗り (新しい秘密を増やさない)。
  */
 import { isRender } from '../../lib/is-render.js';
-import { getMeta, replaceMaster, setMeta } from './db.js';
+import { getMeta, masterCounts, replaceMaster, setMeta, shrinkProblem } from './db.js';
 
 const PULL_TTL_MS = Math.max(1, Number(process.env.SELECT_SET_MASTER_TTL_MIN) || 10) * 60 * 1000;
+/** これより古いマスタでは展開しない (fail-soft の上限) */
+const MAX_AGE_H = Math.max(1, Number(process.env.SELECT_SET_MASTER_MAX_AGE_H) || 24);
 const FETCH_TIMEOUT_MS = 20_000;
 
 export const META = {
@@ -38,14 +40,42 @@ export function masterMode() {
  */
 function remoteUrl() {
   const explicit = String(process.env.SELECT_SET_MASTER_URL || '').trim();
-  if (explicit) return explicit;
   const base = String(process.env.RENDER_MIRROR_URL || '').trim();
-  if (!base) return '';
+  let url = '';
   try {
-    return new URL('/apps/select-set/master-api/export', base).toString();
+    if (explicit) url = new URL(explicit).toString();
+    else if (base) url = new URL('/apps/select-set/master-api/export', base).toString();
   } catch {
     return '';
   }
+  return url;
+}
+
+/**
+ * 取得先が安全か確かめる。
+ * 🚨 ここには強い権限を持つ MIRROR_SYNC_KEY を載せるので、環境変数の設定ミスで
+ *   平文や見知らぬホストへ送らないようにする (Codexレビュー4巡目 / 2026-08-08)。
+ *   既定では RENDER_MIRROR_URL と同じホストしか許さない。
+ *   別ホストを使いたいときは SELECT_SET_MASTER_ALLOWED_HOSTS にカンマ区切りで書く。
+ */
+export function checkRemoteUrl(url = remoteUrl()) {
+  if (!url) return '取得先URLが設定されていません';
+  let u;
+  try { u = new URL(url); } catch { return '取得先URLの形式が不正です'; }
+  if (u.protocol !== 'https:') return '取得先URLが https ではありません';
+  const allowed = String(process.env.SELECT_SET_MASTER_ALLOWED_HOSTS || '')
+    .split(',').map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (!allowed.length) {
+    try {
+      const base = String(process.env.RENDER_MIRROR_URL || '').trim();
+      if (base) allowed.push(new URL(base).host.toLowerCase());
+    } catch { /* 判定できなければ下で弾く */ }
+  }
+  if (!allowed.length) return '許可するホストが決められません';
+  if (!allowed.includes(u.host.toLowerCase())) {
+    return `取得先ホスト ${u.host} は許可されていません`;
+  }
+  return null;
 }
 
 /**
@@ -60,20 +90,27 @@ export async function pullMaster() {
     setMeta(META.lastError, msg);
     return { ok: false, error: msg };
   }
+  const urlProblem = checkRemoteUrl();
+  if (urlProblem) {
+    setMeta(META.lastError, urlProblem);
+    return { ok: false, error: urlProblem };
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     const res = await fetch(remoteUrl(), { headers: { 'x-sync-key': key }, signal: controller.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
-    if (!Array.isArray(body?.sets) || !Array.isArray(body?.mappings)) {
-      throw new Error('レスポンスの形が想定と違います');
-    }
-    // 空のマスタで上書きしない。Render側の事故 (DB初期化直後など) を miniPC に伝播させないため
-    if (body.sets.length === 0 && body.mappings.length === 0) {
-      throw new Error('取得したマスタが空だったので反映しません');
-    }
-    const counts = replaceMaster(body);
+    const snapshot = { sets: body?.sets, mappings: body?.mappings, omake: body?.omake };
+    // 件数が不自然に減っていないか (Render側の事故を丸ごと反映しない)
+    const shrink = Array.isArray(snapshot.sets) && Array.isArray(snapshot.mappings) && Array.isArray(snapshot.omake)
+      ? shrinkProblem(masterCounts(), {
+        sets: snapshot.sets.length, mappings: snapshot.mappings.length, omake: snapshot.omake.length,
+      })
+      : null;
+    if (shrink) throw new Error(`${shrink}。取り込みを見送りました`);
+    // 中身の検証は replaceMaster が行う (問題があれば投げるので既存マスタは残る)
+    const counts = replaceMaster(snapshot);
     setMeta(META.lastPulledAt, new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'));
     setMeta(META.lastError, '');
     setMeta(META.lastCounts, JSON.stringify(counts));
@@ -105,6 +142,28 @@ export async function ensureMasterFresh() {
   return inflight;
 }
 
+/**
+ * マスタが「使ってよい鮮度」か。
+ * 🚨 fail-soft を無期限にすると、Render側で誤ったマッピングを直した直後に同期が壊れた場合、
+ *   miniPC が修正前の商品へ展開し続ける (Codexレビュー4巡目 / 2026-08-08)。
+ *   一度も取得できていない場合と、既定24時間を超えて古い場合は展開を止める。
+ * @returns {string|null} 使えない理由 (使えるなら null)
+ */
+export function masterFreshnessProblem() {
+  if (masterMode() !== 'replica') return null;
+  const last = getMeta(META.lastPulledAt);
+  if (!last) {
+    return 'マスタをまだ一度も取得できていません (Render側との同期を確認してください)';
+  }
+  const ageH = (Date.now() - Date.parse(last)) / 3600000;
+  if (!Number.isFinite(ageH)) return 'マスタの取得日時が読めません';
+  if (ageH > MAX_AGE_H) {
+    return `マスタが${Math.floor(ageH)}時間前のものです (許容 ${MAX_AGE_H}時間)。`
+      + ' Render側との同期が止まっている可能性があるため展開を止めています';
+  }
+  return null;
+}
+
 /** 画面表示用の取得状況 */
 export function masterStatus() {
   const counts = getMeta(META.lastCounts);
@@ -115,5 +174,7 @@ export function masterStatus() {
     lastCounts: counts ? JSON.parse(counts) : null,
     remote: masterMode() === 'replica' ? remoteUrl() : null,
     ttlMinutes: PULL_TTL_MS / 60000,
+    maxAgeHours: MAX_AGE_H,
+    freshnessProblem: masterFreshnessProblem(),
   };
 }
