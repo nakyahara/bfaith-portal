@@ -409,7 +409,7 @@
   function setBusy(busy) {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
-    for (const b of panel.querySelectorAll('button')) b.disabled = busy;
+    for (const b of panel.querySelectorAll('.bf-btn')) b.classList.toggle('bf-disabled', busy);
   }
 
   function renderPreview(d) {
@@ -429,12 +429,15 @@
         + '<td class="bf-mono">' + esc(l.code) + '</td><td>' + esc(l.name) + '</td><td>' + l.quantity + '</td></tr>').join('')
       + '</tbody></table>');
     if (d.omake) {
+      // 🚨 <input>/<button> をここに置かない。パネルはNEの<form>の内側にあり、
+      //   NEの保存処理 (serializeElements2) がフォーム部品を巻き込んでクラッシュし、
+      //   更新保存が永久に終わらなくなる (2026-08-09 実機)。選択はリンクのクリックで行う
       parts.push('<div class="bf-omake"><b>おまけ</b> <span class="bf-hint">(在庫は最大24時間前の値です。変えたいときは選び直してください)</span><br>'
-        + d.omake.candidates.map((c, i) => '<label class="bf-cand' + (c.chosen ? ' bf-chosen' : '') + '">'
-          + '<input type="radio" name="bf-omake" value="' + esc(c.code) + '"' + (c.chosen ? ' checked' : '') + '>'
+        + d.omake.candidates.map((c) => '<a href="javascript:void(0)" class="bf-cand' + (c.chosen ? ' bf-chosen' : '') + '" data-code="' + esc(c.code) + '">'
+          + '<span class="bf-pick"></span>'
           + '<span class="bf-mono">' + esc(c.code) + '</span> '
           + esc(c.name || '') + ' <span class="' + (c.available > 0 ? '' : 'bf-zero') + '">利用可能 ' + c.available + '</span>'
-          + '</label>').join('')
+          + '</a>').join('')
         + (d.omake.code ? '' : '<div class="bf-box bf-warn">候補が全て在庫切れです。おまけ行は追加されません。</div>')
         + '</div>');
     }
@@ -456,7 +459,7 @@
           // 受注数を読み取れない = 画面の見方が想定と違う。触らせない
           ? ' <span class="bf-status bf-err">受注数を読み取れませんでした。手作業で入れてください。</span>'
           : ' <span class="bf-hint">受注数 ' + t.quantity + '</span>'
-            + ' <button class="bf-btn bf-expand">展開する</button>')
+            + ' <a href="javascript:void(0)" class="bf-btn bf-expand">展開する</a>')
         + ' <span class="bf-status"></span></div>'
         + '<div class="bf-preview"></div>'
         + '</div>').join('');
@@ -465,19 +468,27 @@
     container.parentNode.insertBefore(panel, container);
 
     panel.addEventListener('click', async (ev) => {
-      const btn = ev.target.closest('button.bf-expand, button.bf-apply');
-      if (!btn) return;
+      // おまけの選び直し (リンク方式。form部品を使わない)
+      const cand = ev.target.closest('a.bf-cand');
+      if (cand) {
+        const box = cand.closest('.bf-omake');
+        for (const el of box.querySelectorAll('a.bf-cand')) el.classList.remove('bf-chosen');
+        cand.classList.add('bf-chosen');
+        return;
+      }
+      const btn = ev.target.closest('a.bf-expand, a.bf-apply');
+      if (!btn || btn.classList.contains('bf-disabled')) return;
       const rowEl = btn.closest('.bf-row');
       const t = targets[Number(rowEl.dataset.i)];
       const statusEl = rowEl.querySelector('.bf-status');
       const prevEl = rowEl.querySelector('.bf-preview');
 
       if (btn.classList.contains('bf-expand')) {
-        btn.disabled = true;
+        btn.classList.add('bf-disabled');
         statusEl.textContent = '照会中...';
         statusEl.className = 'bf-status';
         const res = await send({ type: 'expand', setCode: t.code, op: t.op, quantity: t.quantity });
-        btn.disabled = false;
+        btn.classList.remove('bf-disabled');
         if (!res.ok) {
           statusEl.textContent = '⚠ ' + res.error;
           statusEl.className = 'bf-status bf-err';
@@ -486,7 +497,7 @@
         rowEl._data = res.data;
         statusEl.textContent = '';
         prevEl.innerHTML = renderPreview(res.data)
-          + (res.data.ok ? '<div class="bf-actions"><button class="bf-btn bf-apply">この内容でNEに入れる</button></div>' : '');
+          + (res.data.ok ? '<div class="bf-actions"><a href="javascript:void(0)" class="bf-btn bf-apply">この内容でNEに入れる</a></div>' : '');
         return;
       }
 
@@ -494,11 +505,11 @@
         const d = rowEl._data;
         if (!d || !d.ok) return;
         // おまけを選び直していたら差し替える
-        const picked = prevEl.querySelector('input[name=bf-omake]:checked');
+        const picked = prevEl.querySelector('a.bf-cand.bf-chosen');
         const codes = d.paste.codes.split('\n');
         const qtys = d.paste.quantities.split('\n');
         if (d.omake && picked) {
-          const chosen = picked.value;
+          const chosen = picked.dataset.code;
           if (d.omake.code && codes[codes.length - 1] === d.omake.code) {
             codes[codes.length - 1] = chosen;
           } else {
@@ -512,7 +523,7 @@
           qtysText: qtys.join('\n'),
         };
         const okApplied = await apply(t, expected, statusEl);
-        if (okApplied) btn.disabled = true; // 成功したときだけ二度押しを止める
+        if (okApplied) btn.classList.add('bf-disabled'); // 成功したときだけ二度押しを止める
       }
     });
   }
