@@ -24,7 +24,7 @@
  */
 import 'dotenv/config';
 import { fileURLToPath } from 'node:url';
-import { initDB } from '../warehouse/db.js';
+import { initDB, getDB } from '../warehouse/db.js';
 import {
   findUnshippedOrders,
   buildMessage,
@@ -111,6 +111,22 @@ export function exitCodeFor(result) {
   return 0;
 }
 
+/**
+ * 終了処理。
+ * 🚨process.exit() を即座に呼ぶと、SQLite のハンドルと GChat 送信で使った fetch の接続が
+ *   開いたまま libuv の teardown に入り、Windows で
+ *   `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` を出して abort することがある
+ *   (2026-08-10 の初回本番実行で実際に発生。通知は送れているのに終了コードが異常になり、
+ *    daily-sync がステップ失敗と誤判定して retry = 通知が重複する)。
+ *   → DB を閉じ、exitCode を立てて**自然終了**させる。万一終わらない時だけ強制終了する。
+ */
+function finish(code) {
+  try { getDB().close(); } catch { /* 開いていなければ何もしない */ }
+  process.exitCode = code;
+  // このタイマー自体は unref するのでイベントループの終了を妨げない
+  setTimeout(() => process.exit(code), 5000).unref();
+}
+
 // ─── CLI ───
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
@@ -123,10 +139,10 @@ if (isMain) {
     .then(r => {
       // daily-sync はこの行の末尾をサマリに載せる
       console.log(`[yahoo-unshipped] 完了: ${r.note}`);
-      process.exit(dryRun ? 0 : exitCodeFor(r));
+      finish(dryRun ? 0 : exitCodeFor(r));
     })
     .catch(e => {
       console.error('[yahoo-unshipped] 失敗:', e.message);
-      process.exit(1);
+      finish(1);
     });
 }
