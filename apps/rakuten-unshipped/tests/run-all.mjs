@@ -228,5 +228,28 @@ eq(exitCodeFor(null), 0, 'null でも落ちない');
   eq(statusOf(2), 2, 'exit 2 → e.status=2 (blocked判定に使う)');
 }
 
+// daily-sync 側の前提: 子プロセスが process.exit() ではなく **process.exitCode を立てて
+// 自然終了**した場合でも、execFileSync は非ゼロなら throw し e.status に値が入る。
+// finish() はこの形で終了するので、ここが崩れると blocked 判定 (exit 2) が黙って効かなくなる
+{
+  const { execFileSync } = await import('node:child_process');
+  const statusOf = (script) => {
+    try {
+      execFileSync(process.execPath, ['-e', script], { stdio: 'ignore' });
+      return 0;
+    } catch (e) {
+      return e.status;
+    }
+  };
+  eq(statusOf('process.exitCode = 0'), 0, 'exitCode=0 で自然終了 → throw しない');
+  eq(statusOf('process.exitCode = 1'), 1, 'exitCode=1 で自然終了 → e.status=1 (retry対象)');
+  eq(statusOf('process.exitCode = 2'), 2, 'exitCode=2 で自然終了 → e.status=2 (blocked判定に使う)');
+  // unref したタイマーがぶら下がっていても即座に終了すること (毎回5秒待たない)
+  const started = Date.now();
+  eq(statusOf('process.exitCode = 2; setTimeout(() => process.exit(2), 5000).unref()'), 2,
+    'unrefタイマーがあっても exitCode は保たれる');
+  ok(Date.now() - started < 4000, 'unrefタイマーは終了を遅らせない (5秒待たない)');
+}
+
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);
 process.exit(fail === 0 ? 0 : 1);

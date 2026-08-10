@@ -111,20 +111,37 @@ export function exitCodeFor(result) {
   return 0;
 }
 
+const TAG = 'yahoo-unshipped';
+
 /**
  * 終了処理。
- * 🚨process.exit() を即座に呼ぶと、SQLite のハンドルと GChat 送信で使った fetch の接続が
- *   開いたまま libuv の teardown に入り、Windows で
+ * 🚨process.exit() を即座に呼ぶと、開いたままのハンドル (GChat送信で使った fetch の接続、SQLite)
+ *   の終了処理と競合し、Windows で
  *   `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` を出して abort することがある
- *   (2026-08-10 の初回本番実行で実際に発生。通知は送れているのに終了コードが異常になり、
- *    daily-sync がステップ失敗と誤判定して retry = 通知が重複する)。
- *   → DB を閉じ、exitCode を立てて**自然終了**させる。万一終わらない時だけ強制終了する。
+ *   (2026-08-10 の Yahoo 版初回本番実行で実際に発生。通知は送れているのに終了コードが
+ *    0xC0000409 になり、daily-sync がステップ失敗と誤判定 → retry で通知が重複する)。
+ *   ⚠️原因のハンドルは特定できていない (楽天版は SQLite を使わないので fetch 側が本命)。
+ *     どちらであっても「開いているものを閉じてから自然終了させる」この形で回避できる。
+ *   → exitCode を立てて**自然終了**させ、万一終わらない時だけ強制終了する。
  */
+const FORCE_EXIT_AFTER_MS = 5000;
+
 function finish(code) {
-  try { getDB().close(); } catch { /* 開いていなければ何もしない */ }
+  try {
+    getDB().close();
+  } catch (e) {
+    // 開いていなければ何もしない。閉じられない場合も終了は続けるが、黙らせない
+    if (!/not open|closed/i.test(e.message)) console.warn(`[${TAG}] DBのclose に失敗: ${e.message}`);
+  }
   process.exitCode = code;
-  // このタイマー自体は unref するのでイベントループの終了を妨げない
-  setTimeout(() => process.exit(code), 5000).unref();
+  // このタイマー自体は unref するのでイベントループの終了を妨げない。
+  // 発火した = 何かのハンドルが残っている = この強制終了で元のクラッシュが再発しうるので、
+  // 「毎回ここを通っている」ことに気づけるよう必ず警告を残す
+  setTimeout(() => {
+    console.error(`[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します`
+      + ' (残っているハンドルを調べること)');
+    process.exit(code);
+  }, FORCE_EXIT_AFTER_MS).unref();
 }
 
 // ─── CLI ───
