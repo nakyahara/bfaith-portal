@@ -69,13 +69,15 @@ const JOB_DEFINITIONS = {
   '楽天未発送アラート':    { script: 'apps/rakuten-unshipped/notify-job.js',        args: ['--once'], timeoutMs: 600000 },
   // Yahoo未発送アラート: warehouse.db の候補を Yahoo受注API で最新確認して通知するだけ (DBに書かない)
   'Yahoo未発送アラート':   { script: 'apps/yahoo-unshipped/notify-job.js',          args: ['--once'], timeoutMs: 600000 },
+  // auPAY未発送アラート: warehouse.db の候補を auPAY受注API で最新確認して通知するだけ (DBに書かない)
+  'auPAY未発送アラート':   { script: 'apps/aupay-unshipped/notify-job.js',          args: ['--once'], timeoutMs: 900000 },
 };
 
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
