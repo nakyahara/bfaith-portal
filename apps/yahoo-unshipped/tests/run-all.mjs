@@ -292,14 +292,20 @@ section('shouldSkipByCache');
 {
   const row = (lut) => ({ order_id: 'A', last_update_time: lut });
   const cache = (lut) => ({ A: { resolvedAt: '2026-08-09', lastUpdateTime: lut } });
-  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('2026-08-06T17:32:06+09:00')), true,
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('2026-08-06T17:32:06+09:00'), '2026-08-10'), true,
     '解消を確認した時から動いていなければスキップ');
   // 🚨出荷取消・キャンセル解除で未発送に戻った場合、DBの last_update_time が進む
-  eq(shouldSkipByCache(row('2026-08-10T09:00:00+09:00'), cache('2026-08-06T17:32:06+09:00')), false,
+  eq(shouldSkipByCache(row('2026-08-10T09:00:00+09:00'), cache('2026-08-06T17:32:06+09:00'), '2026-08-10'), false,
     '確認後に動いていたら再確認する (状態が戻っても検出できる)');
-  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), {}), false, 'キャッシュに無ければ確認する');
-  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('')), false,
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), {}, '2026-08-10'), false, 'キャッシュに無ければ確認する');
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache(''), '2026-08-10'), false,
     '旧形式 (lastUpdateTime 空) は必ず再確認する');
+  // 🚨DB同期は7日窓なので、古い注文がYahoo側で未発送に戻ってもDBは動かない。
+  //   時間経過でも再確認しないと永久に見えなくなる (Codex 3巡目 High)
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('2026-08-06T17:32:06+09:00'), '2026-08-16'), false,
+    '確認から7日経ったらDBが動いていなくても再確認する');
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('2026-08-06T17:32:06+09:00'), '2026-08-15'), true,
+    '7日未満ならまだスキップ');
 }
 
 // ─── exitCodeFor ───

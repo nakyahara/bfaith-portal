@@ -40,6 +40,8 @@ export const DEFAULT_SEARCH_DAYS = 180;
 export const MAX_VERIFY = 60;
 /** 解消済みキャッシュの保持日数 (これを過ぎた記録は捨てる) */
 export const RESOLVED_KEEP_DAYS = 200;
+/** 解消済みでも、この日数が過ぎたら念のためもう一度APIで確認する */
+export const RESOLVED_RECHECK_DAYS = 7;
 
 export const ORDER_STATUS_LABEL = { 1: '予約中', 2: '処理中', 3: '保留', 4: 'キャンセル', 5: '完了' };
 export const SHIP_STATUS_LABEL = { 0: '出荷不可', 1: '出荷可能', 2: '出荷処理中', 3: '出荷済み', 4: '完了(旧)' };
@@ -145,16 +147,26 @@ export function saveResolved(map, today) {
 
 /**
  * キャッシュを見て、この候補をスキップしてよいか。
+ *
  * ⚠️「一度解消したら永久に無視」にはしない。出荷取消・キャンセル解除などで
- *   同じ注文が未発送に戻ることがあるため、**確認した時点より注文が動いていたら
- *   もう一度APIで見る** (Codexレビュー2巡目 High)。
+ *   同じ注文が未発送に戻ることがあるため、次の2つで再確認する:
+ *   (a) 確認した時点より DB の last_update_time が進んでいる
+ *   (b) 確認から RESOLVED_RECHECK_DAYS 日が過ぎた
+ *
+ * 🚨(b) が必要な理由: DBの同期は**注文日ベースの直近7日窓**なので、古い注文が
+ *   Yahoo側で未発送に戻っても DB の行は永久に更新されない。(a) だけだと
+ *   `current <= seen` が成立し続けて二度と確認されない (Codexレビュー3巡目 High)。
  */
-export function shouldSkipByCache(row, resolved) {
+export function shouldSkipByCache(row, resolved, today) {
   const rec = resolved?.[row.order_id];
   if (!rec) return false;
   const seen = String(rec.lastUpdateTime || '');
   const current = String(row.last_update_time || '');
-  return current <= seen && seen !== '';
+  if (seen === '' || current > seen) return false; // (a) 動いていた → 見直す
+  if (today && rec.resolvedAt && today >= addDaysStr(rec.resolvedAt, RESOLVED_RECHECK_DAYS)) {
+    return false; // (b) 一定期間が過ぎた → 念のため見直す
+  }
+  return true;
 }
 
 // ─── ① warehouse.db から候補を絞る ───
@@ -192,8 +204,16 @@ export function findCandidates(ctx, searchDays = DEFAULT_SEARCH_DAYS, resolved =
       AND order_status <> '4'    -- キャンセル以外
     ORDER BY order_time
   `).all(since, ctx.cutoffStr);
-  // 過去にAPIで「解消済み」と確認した注文は、その後に動きが無ければ除外する
-  return rows.filter(r => !shouldSkipByCache(r, resolved));
+  // 過去にAPIで「解消済み」と確認した注文は、その後に動きが無ければ除外する。
+  // 再確認組 (キャッシュはあるが期限切れ/動きあり) は**新規候補の後ろ**に置く。
+  // 先頭に混ざると MAX_VERIFY の枠を食い、新しい出荷漏れに到達できなくなるため
+  const fresh = [];
+  const recheck = [];
+  for (const r of rows) {
+    if (!resolved[r.order_id]) { fresh.push(r); continue; }
+    if (!shouldSkipByCache(r, resolved, ctx.today)) recheck.push(r);
+  }
+  return [...fresh, ...recheck];
 }
 
 // ─── ② 候補をAPIで最新確認 ───
