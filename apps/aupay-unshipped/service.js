@@ -43,6 +43,8 @@ export const MAX_VERIFY_DAYS = 20;
 export const RESOLVED_KEEP_DAYS = 200;
 /** 解消済みでも、この日数が過ぎたら念のためもう一度APIで確認する */
 export const RESOLVED_RECHECK_DAYS = 7;
+/** 直近この日数以内の注文は、解消済みでも毎回APIで確認する (発送取消などの巻き戻りに即気づくため) */
+export const CACHE_BYPASS_DAYS = 7;
 /** API 呼び出しの間隔 (aupay-orders.js と同じペース) */
 export const API_INTERVAL_MS = 900;
 
@@ -147,13 +149,22 @@ export function saveResolved(map, today) {
 
 /**
  * キャッシュを見て、この候補をスキップしてよいか。
+ *
  * ⚠️「一度解消したら永久に無視」にはしない。発送取消などで未発送に戻ることがあるため、
- *   確認から RESOLVED_RECHECK_DAYS 日過ぎたら必ずもう一度APIで見る。
+ *   次のどちらかに当たれば必ずもう一度APIで見る:
+ *   (a) その注文が**直近 CACHE_BYPASS_DAYS 日以内**のもの
+ *       — 直近の出荷漏れを見逃すのが一番痛い。件数も少ないので毎回確認してよい
+ *         (auPAY には Yahoo の LastUpdateTime に相当する「動いたか」の手がかりが無いため、
+ *          日付で代替する。Codexレビュー2巡目 High)
+ *   (b) 確認から RESOLVED_RECHECK_DAYS 日が過ぎた — 古い注文も見捨てない
  */
 export function shouldSkipByCache(row, resolved, today) {
   const rec = resolved?.[row.order_id];
   if (!rec?.resolvedAt) return false;
-  if (today && today >= addDaysStr(rec.resolvedAt, RESOLVED_RECHECK_DAYS)) return false;
+  if (!today) return true;
+  const orderYmd = String(row.order_date || '').slice(0, 10).replace(/\//g, '-');
+  if (orderYmd && orderYmd >= addDaysStr(today, -CACHE_BYPASS_DAYS)) return false; // (a)
+  if (today >= addDaysStr(rec.resolvedAt, RESOLVED_RECHECK_DAYS)) return false;    // (b)
   return true;
 }
 
@@ -297,7 +308,7 @@ export async function verifyCandidates(candidates, ctx, opts = {}) {
   const sleepImpl = opts.sleepImpl || (ms => new Promise(r => setTimeout(r, ms)));
 
   if (candidates.length === 0) {
-    return { alerts: [], resolvedIds: [], verifiedDays: 0, apiFailed: 0, truncated: false };
+    return { alerts: [], resolvedIds: [], verifiedDays: 0, apiFailed: 0, truncated: false, maxVerifyDays: maxDays };
   }
 
   // 注文日ごとにまとめる (同じ日の候補は1リクエストで確認できる)
@@ -365,7 +376,7 @@ export async function verifyCandidates(candidates, ctx, opts = {}) {
   }
 
   alerts.sort((a, b) => (a.orderedAt?.getTime() ?? 0) - (b.orderedAt?.getTime() ?? 0));
-  return { alerts, resolvedIds, verifiedDays: targetDays.length, apiFailed, truncated };
+  return { alerts, resolvedIds, verifiedDays: targetDays.length, apiFailed, truncated, maxVerifyDays: maxDays };
 }
 
 /**
@@ -434,7 +445,7 @@ function limitLabel(o) {
  * GChat へ送る本文を組み立てる。
  * 0件の日も送る = 通知が来ないこと自体が「止まった」のサインになる。
  */
-export function buildMessage({ alerts, candidates, apiFailed, truncated, ctx }) {
+export function buildMessage({ alerts, candidates, apiFailed, truncated, maxVerifyDays, ctx }) {
   const cutoffLabel = `${ctx.cutoffDate.slice(5).replace('-', '/')} ${pad2(ctx.cutoffHour ?? DEFAULT_CUTOFF_HOUR)}:00`;
   const lines = [];
   lines.push('*au PAY 未発送アラート*');
@@ -442,7 +453,12 @@ export function buildMessage({ alerts, candidates, apiFailed, truncated, ctx }) 
   lines.push('');
 
   if (alerts.length === 0) {
-    lines.push(`✅ 出荷漏れはありません (0件${candidates ? ` / 候補${candidates}件はすべて発送済み・キャンセル済みでした` : ''})`);
+    // 確認できなかった注文が残っている日に「ありません」と断定しない (Codexレビュー Medium)
+    if (apiFailed > 0 || truncated) {
+      lines.push('🔍 確認できた範囲では出荷漏れはありません (未確認分は下の注記を参照)');
+    } else {
+      lines.push(`✅ 出荷漏れはありません (0件${candidates ? ` / 候補${candidates}件はすべて発送済み・キャンセル済みでした` : ''})`);
+    }
   } else {
     lines.push(`🚨 出荷漏れの可能性 *${alerts.length}件*`);
     for (const o of alerts.slice(0, MAX_LINES)) {
@@ -461,7 +477,7 @@ export function buildMessage({ alerts, candidates, apiFailed, truncated, ctx }) 
   }
   if (truncated) {
     lines.push('');
-    lines.push(`⚠️ 候補の注文日が多いため、新しい方から ${MAX_VERIFY_DAYS}日分だけ確認しています`
+    lines.push(`⚠️ 候補の注文日が多いため、新しい方から ${maxVerifyDays ?? MAX_VERIFY_DAYS}日分だけ確認しています`
       + ' (古い注文日の分は未確認。長く放置されている注文が溜まっている可能性があります)');
   }
 

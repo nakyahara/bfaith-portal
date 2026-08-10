@@ -246,13 +246,26 @@ section('解消済みキャッシュ');
 }
 section('shouldSkipByCache');
 {
-  const row = { order_id: 'A' };
-  eq(shouldSkipByCache(row, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), true, '確認から間もなければスキップ');
+  // 古い注文 (直近7日より前) はキャッシュを効かせて確認枠を節約する
+  const old = { order_id: 'A', order_date: '2026/06/01 10:00' };
+  eq(shouldSkipByCache(old, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), true, '古い注文は確認から間もなければスキップ');
   // 🚨auPAY には更新日時が無いので、時間経過だけが再確認のきっかけになる
-  eq(shouldSkipByCache(row, { A: { resolvedAt: '2026-08-03' } }, '2026-08-10'), false,
+  eq(shouldSkipByCache(old, { A: { resolvedAt: '2026-08-03' } }, '2026-08-10'), false,
     '確認から7日経ったら再確認する (発送取消などで戻っていても検出できる)');
-  eq(shouldSkipByCache(row, {}, '2026-08-10'), false, 'キャッシュに無ければ確認する');
-  eq(shouldSkipByCache(row, { A: {} }, '2026-08-10'), false, '壊れた記録は確認する');
+  eq(shouldSkipByCache(old, {}, '2026-08-10'), false, 'キャッシュに無ければ確認する');
+  eq(shouldSkipByCache(old, { A: {} }, '2026-08-10'), false, '壊れた記録は確認する');
+  // 🚨直近の注文はキャッシュを無視して毎回確認する (見逃しが一番痛い。Codex 2巡目 High)
+  const recent = { order_id: 'A', order_date: '2026/08/08 10:00' };
+  eq(shouldSkipByCache(recent, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), false,
+    '直近7日以内の注文は解消済みでも毎回確認する');
+  const boundary = { order_id: 'A', order_date: '2026/08/03 10:00' };
+  eq(shouldSkipByCache(boundary, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), false,
+    '境界 (ちょうど7日前) は確認する');
+  const justOutside = { order_id: 'A', order_date: '2026/08/02 10:00' };
+  eq(shouldSkipByCache(justOutside, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), true,
+    '7日を1日超えた注文はスキップしてよい');
+  eq(shouldSkipByCache({ order_id: 'A', order_date: '' }, { A: { resolvedAt: '2026-08-09' } }, '2026-08-10'), true,
+    '注文日が空でも落ちない');
 }
 
 // ─── buildMessage ───
@@ -274,6 +287,7 @@ const mkAlert = (over = {}) => ({
   const text = buildMessage({ alerts: [], candidates: 7, apiFailed: 0, truncated: false, ctx: ctxNow });
   ok(text.includes('*au PAY 未発送アラート*'), 'モール名が分かる見出し');
   ok(text.includes('✅ 出荷漏れはありません'), '0件でも本文を作る');
+  ok(!text.includes('確認できた範囲'), '全部確認できた日は断定してよい');
   ok(text.includes('候補7件はすべて発送済み・キャンセル済み'), '候補があった日はその旨を出す');
   ok(text.includes('08/09 12:00'), '締め時刻を明記');
 }
@@ -293,6 +307,17 @@ const mkAlert = (over = {}) => ({
 {
   const text = buildMessage({ alerts: [mkAlert({ shippingTimelimit: '' })], candidates: 1, apiFailed: 0, truncated: false, ctx: ctxNow });
   ok(!text.includes('発送期限'), '発送期限が無ければ出さない');
+}
+{
+  // 未確認が残っている日は「ありません」と断定しない (Codexレビュー Medium)
+  const text = buildMessage({ alerts: [], candidates: 5, apiFailed: 3, truncated: false, ctx: ctxNow });
+  ok(text.includes('確認できた範囲では出荷漏れはありません'), '未確認があれば断定しない');
+  ok(!text.includes('✅ 出荷漏れはありません'), '断定表現を出さない');
+}
+{
+  const text = buildMessage({ alerts: [], candidates: 5, apiFailed: 0, truncated: true, maxVerifyDays: 5, ctx: ctxNow });
+  ok(text.includes('確認できた範囲では出荷漏れはありません'), '打ち切りでも断定しない');
+  ok(text.includes('新しい方から 5日分'), '実際に使った上限値を表示する (定数固定にしない)');
 }
 {
   const text = buildMessage({ alerts: [mkAlert()], candidates: 3, apiFailed: 2, truncated: true, ctx: ctxNow });
