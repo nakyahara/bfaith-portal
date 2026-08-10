@@ -175,10 +175,19 @@ const noSleep = async () => {};
   eq(r.verifiedDays, 0, 'API は呼ばない');
 }
 {
+  // 🚨上限で打ち切るときは**新しい日から**確認する。昇順だと古い放置注文が枠を占有し、
+  //   直近の出荷漏れに永久に到達できない (Codexレビュー High)
   const many = ['01', '02', '03', '04', '05'].map(d => cand(`C${d}`, `2026/08/${d} 10:00`));
-  const r = await verifyCandidates(many, ctxNow, { maxVerifyDays: 2, fetchImpl: fakeFetch({}), sleepImpl: noSleep });
+  const called = [];
+  const spyFetch = async (url) => {
+    called.push(/startDate=(\d{8})/.exec(url)?.[1]);
+    return { ok: true, text: async () => xmlFor([]) };
+  };
+  const r = await verifyCandidates(many, ctxNow, { maxVerifyDays: 2, fetchImpl: spyFetch, sleepImpl: noSleep });
   eq(r.verifiedDays, 2, '注文日の上限で打ち切る');
   eq(r.truncated, true, '打ち切りを記録する');
+  eq(called, ['20260805', '20260804'], '新しい注文日から確認する (古い順ではない)');
+  eq(r.apiFailed, 2, '確認した日の候補は「確認できず」に数える (空レスポンスのため)');
 }
 {
   const r = await verifyCandidates([], ctxNow, { fetchImpl: fakeFetch({}), sleepImpl: noSleep });
@@ -288,7 +297,7 @@ const mkAlert = (over = {}) => ({
 {
   const text = buildMessage({ alerts: [mkAlert()], candidates: 3, apiFailed: 2, truncated: true, ctx: ctxNow });
   ok(text.includes('2件は最新状態を確認できませんでした'), '確認不能を明示');
-  ok(text.includes('上限'), '打ち切りを明示');
+  ok(text.includes('新しい方から') && text.includes('古い注文日の分は未確認'), '打ち切りの内容を正しく明示');
 }
 {
   const many = Array.from({ length: MAX_LINES + 3 }, () => mkAlert());

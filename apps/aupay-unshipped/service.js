@@ -308,7 +308,11 @@ export async function verifyCandidates(candidates, ctx, opts = {}) {
     if (!byDay.has(ymd)) byDay.set(ymd, []);
     byDay.get(ymd).push(c);
   }
-  const days = [...byDay.keys()].sort();
+  // 🚨**新しい注文日から**確認する。昇順にすると、何年も放置されている古い注文が
+  //   毎回 maxDays の枠を占有し、直近の出荷漏れに永久に到達できない
+  //   (実測で 2020〜2022年の「発送待ち」が7件残っていた = まさにこのケース。Codexレビュー High)。
+  //   これらは API で確認しても「未発送」のままなので解消済みキャッシュにも入らない
+  const days = [...byDay.keys()].sort().reverse();
   const truncated = days.length > maxDays;
   const targetDays = truncated ? days.slice(0, maxDays) : days;
 
@@ -457,7 +461,8 @@ export function buildMessage({ alerts, candidates, apiFailed, truncated, ctx }) 
   }
   if (truncated) {
     lines.push('');
-    lines.push(`⚠️ 候補の注文日が多いため上限 ${MAX_VERIFY_DAYS}日分までしか確認していません (残りは次回へ)`);
+    lines.push(`⚠️ 候補の注文日が多いため、新しい方から ${MAX_VERIFY_DAYS}日分だけ確認しています`
+      + ' (古い注文日の分は未確認。長く放置されている注文が溜まっている可能性があります)');
   }
 
   return lines.join('\n');
