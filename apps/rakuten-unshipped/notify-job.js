@@ -26,6 +26,7 @@
  * 0件の日も通知する。「通知が来ない = 止まっている」と読めるようにするため。
  */
 import 'dotenv/config';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   findUnshippedOrders,
@@ -120,14 +121,15 @@ const TAG = 'rakuten-unshipped';
  */
 const FORCE_EXIT_AFTER_MS = 5000;
 
-function finish(code) {
+export function finish(code) {
   process.exitCode = code;
   // このタイマー自体は unref するのでイベントループの終了を妨げない。
   // 発火した = 何かのハンドルが残っている = この強制終了で元のクラッシュが再発しうるので、
-  // 「毎回ここを通っている」ことに気づけるよう必ず警告を残す
+  // 「毎回ここを通っている」ことに気づけるよう必ず警告を残す。
+  // console.error は非同期に流れることがあり直後の process.exit で捨てられうるため同期で書く
   setTimeout(() => {
-    console.error(`[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します`
-      + ' (残っているハンドルを調べること)');
+    const msg = `[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します (残っているハンドルを調べること)`;
+    try { fs.writeSync(2, msg + '\n'); } catch { /* 書けなくても終了は続ける */ }
     process.exit(code);
   }, FORCE_EXIT_AFTER_MS).unref();
 }

@@ -228,27 +228,28 @@ eq(exitCodeFor(null), 0, 'null でも落ちない');
   eq(statusOf(2), 2, 'exit 2 → e.status=2 (blocked判定に使う)');
 }
 
-// daily-sync 側の前提: 子プロセスが process.exit() ではなく **process.exitCode を立てて
-// 自然終了**した場合でも、execFileSync は非ゼロなら throw し e.status に値が入る。
-// finish() はこの形で終了するので、ここが崩れると blocked 判定 (exit 2) が黙って効かなくなる
+// daily-sync 側の契約: finish() で終了したプロセスの終了コードが、runScript (execFileSync) の
+// e.status に届くこと。ここが崩れると blocked 判定 (exit 2) や retry 判定 (exit 1) が黙って効かなくなる。
+// 実際の finish() を子プロセスで呼んで確かめる (一般的な Node の挙動確認では意味が無いため)
 {
   const { execFileSync } = await import('node:child_process');
-  const statusOf = (script) => {
+  const notifyUrl = new URL('../notify-job.js', import.meta.url).href;
+  const statusOfFinish = (code) => {
+    const script = `const m = await import(${JSON.stringify(notifyUrl)}); m.finish(${code});`;
     try {
-      execFileSync(process.execPath, ['-e', script], { stdio: 'ignore' });
+      execFileSync(process.execPath, ['--input-type=module', '-e', script], { stdio: 'pipe' });
       return 0;
     } catch (e) {
       return e.status;
     }
   };
-  eq(statusOf('process.exitCode = 0'), 0, 'exitCode=0 で自然終了 → throw しない');
-  eq(statusOf('process.exitCode = 1'), 1, 'exitCode=1 で自然終了 → e.status=1 (retry対象)');
-  eq(statusOf('process.exitCode = 2'), 2, 'exitCode=2 で自然終了 → e.status=2 (blocked判定に使う)');
-  // unref したタイマーがぶら下がっていても即座に終了すること (毎回5秒待たない)
+  eq(statusOfFinish(0), 0, 'finish(0) → 正常終了 (throw しない)');
+  eq(statusOfFinish(1), 1, 'finish(1) → e.status=1 (retry対象として daily-sync に届く)');
+  eq(statusOfFinish(2), 2, 'finish(2) → e.status=2 (blocked 判定に届く)');
+  // finish() は強制終了タイマーを張るが unref しているので、終了を遅らせないこと
   const started = Date.now();
-  eq(statusOf('process.exitCode = 2; setTimeout(() => process.exit(2), 5000).unref()'), 2,
-    'unrefタイマーがあっても exitCode は保たれる');
-  ok(Date.now() - started < 4000, 'unrefタイマーは終了を遅らせない (5秒待たない)');
+  eq(statusOfFinish(2), 2, 'finish(2) を再度');
+  ok(Date.now() - started < 4000, '強制終了タイマー (5秒) を待たずに終了する');
 }
 
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);

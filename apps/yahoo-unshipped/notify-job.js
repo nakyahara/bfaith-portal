@@ -23,6 +23,7 @@
  *   node apps/yahoo-unshipped/notify-job.js --dry-run    … 送らずに本文を標準出力へ
  */
 import 'dotenv/config';
+import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { initDB, getDB } from '../warehouse/db.js';
 import {
@@ -126,7 +127,7 @@ const TAG = 'yahoo-unshipped';
  */
 const FORCE_EXIT_AFTER_MS = 5000;
 
-function finish(code) {
+export function finish(code) {
   try {
     getDB().close();
   } catch (e) {
@@ -136,10 +137,11 @@ function finish(code) {
   process.exitCode = code;
   // このタイマー自体は unref するのでイベントループの終了を妨げない。
   // 発火した = 何かのハンドルが残っている = この強制終了で元のクラッシュが再発しうるので、
-  // 「毎回ここを通っている」ことに気づけるよう必ず警告を残す
+  // 「毎回ここを通っている」ことに気づけるよう必ず警告を残す。
+  // console.error は非同期に流れることがあり直後の process.exit で捨てられうるため同期で書く
   setTimeout(() => {
-    console.error(`[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します`
-      + ' (残っているハンドルを調べること)');
+    const msg = `[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します (残っているハンドルを調べること)`;
+    try { fs.writeSync(2, msg + '\n'); } catch { /* 書けなくても終了は続ける */ }
     process.exit(code);
   }, FORCE_EXIT_AFTER_MS).unref();
 }
