@@ -147,6 +147,33 @@ export function listFilterOptions() {
   return { shops, assignees, countMap: Object.fromEntries(counts.map(r => [r.internal_status, r.c])) };
 }
 
+/**
+ * 詳細画面の前後ナビ (2026-08-10 スタッフ要望)。一覧と同じ並び順
+ * (COALESCE(last_message_at, received_at) DESC, id DESC) で、いま表示中の問い合わせの
+ * 1つ上 (prev = より新しい) / 1つ下 (next = より古い) を返す。
+ * 詳細URLに引き継がれる文脈は view / folder のみなので、隣接判定もその2つに絞る
+ * (検索語・店舗などの絞り込みまでは追わない)。received_at は NOT NULL なのでキーは常に非NULL。
+ */
+export function getAdjacentInquiries(id, q = {}) {
+  const none = { prev: null, next: null };
+  if (!Number.isInteger(id)) return none;
+  const db = getDB();
+  const cur = db.prepare('SELECT COALESCE(last_message_at, received_at) AS sort_key FROM inquiries WHERE id = ?').get(id);
+  if (!cur || cur.sort_key == null) return none;
+  const where = ['i.is_archived = 0'];
+  const params = [];
+  const view = VIEWS[q.view] ? q.view : DEFAULT_VIEW;
+  where.push(VIEWS[view].where);
+  if (/^\d+$/.test(String(q.folder || ''))) { where.push('i.folder_id = ?'); params.push(Number(q.folder)); }
+  const KEY = 'COALESCE(i.last_message_at, i.received_at)';
+  const pick = (cmp, order) => db.prepare(`
+    SELECT i.id, i.subject FROM inquiries i
+    WHERE ${where.join(' AND ')} AND (${KEY} ${cmp} ? OR (${KEY} = ? AND i.id ${cmp} ?))
+    ORDER BY ${KEY} ${order}, i.id ${order} LIMIT 1`).get(...params, cur.sort_key, cur.sort_key, id);
+  // 一覧は降順なので「前 (上の行)」= キーが大きい方の最小、「次 (下の行)」= キーが小さい方の最大
+  return { prev: pick('>', 'ASC') || null, next: pick('<', 'DESC') || null };
+}
+
 /** 詳細画面データ一式。存在しなければ null */
 export function getInquiryDetail(id) {
   const db = getDB();

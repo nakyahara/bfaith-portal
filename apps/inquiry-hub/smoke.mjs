@@ -204,6 +204,49 @@ check('詳細: messages 昇順', detail.messages.length === 2 && detail.messages
 check('詳細: 存在しないid は null', getInquiryDetail(99999) === null);
 check('詳細: 非整数は null', getInquiryDetail(NaN) === null);
 
+// 詳細画面の前後ナビ (一覧と同じ並び順で隣を返す。2026-08-10 スタッフ要望)
+{
+  const { getAdjacentInquiries } = await import('./queries.js');
+  // all ビューの並び: inq2 (7/13) → inq1 (7/10) → inq3 (7/2)
+  const mid = getAdjacentInquiries(inq1, { view: 'all' });
+  check('前後ナビ: 中間行は両隣を返す', mid.prev?.id === inq2 && mid.next?.id === inq3);
+  const first = getAdjacentInquiries(inq2, { view: 'all' });
+  check('前後ナビ: 先頭行は prev なし', first.prev === null && first.next?.id === inq1);
+  const last = getAdjacentInquiries(inq3, { view: 'all' });
+  check('前後ナビ: 末尾行は next なし', last.prev?.id === inq1 && last.next === null);
+  const inbox = getAdjacentInquiries(inq1, { view: 'inbox' });
+  check('前後ナビ: ビュー絞り込みを反映 (完了は隣に出ない)', inbox.prev?.id === inq2 && inbox.next === null);
+  check('前後ナビ: 存在しないidは両方null',
+    JSON.stringify(getAdjacentInquiries(99999)) === JSON.stringify({ prev: null, next: null })
+    && JSON.stringify(getAdjacentInquiries(NaN)) === JSON.stringify({ prev: null, next: null }));
+
+  // 同一時刻は一覧と同じく id 降順でタイブレーク (並び: inq1 → tieB → tieA → inq3)
+  const tieT = T('2026-07-05T09:00:00+09:00');
+  const mkTie = ext => insInq.run('email', shopEmail, ext, 'タイ', 't@example.com', 'タイ同時刻',
+    'open', null, null, null, null, 0, 0, 0, tieT, tieT).lastInsertRowid;
+  const tieA = mkTie('th-tie-a');
+  const tieB = mkTie('th-tie-b');
+  const tb = getAdjacentInquiries(tieB, { view: 'all' });
+  const ta = getAdjacentInquiries(tieA, { view: 'all' });
+  check('前後ナビ: 同一時刻は id 降順でタイブレーク',
+    tb.prev?.id === inq1 && tb.next?.id === tieA && ta.prev?.id === tieB && ta.next?.id === inq3);
+
+  // アーカイブ済みは隣として飛ばされる
+  db.prepare('UPDATE inquiries SET is_archived = 1 WHERE id = ?').run(tieA);
+  check('前後ナビ: アーカイブ済みは飛ばす', getAdjacentInquiries(tieB, { view: 'all' }).next?.id === inq3);
+
+  // フォルダ文脈: 同じフォルダの中だけで隣を探す
+  const navFolder = db.prepare("INSERT INTO inquiry_folders (name) VALUES ('ナビ用')").run().lastInsertRowid;
+  db.prepare('UPDATE inquiries SET folder_id = ? WHERE id IN (?, ?)').run(navFolder, inq2, inq3);
+  const inFolder = getAdjacentInquiries(inq3, { view: 'all', folder: String(navFolder) });
+  check('前後ナビ: フォルダ内だけで隣を探す', inFolder.prev?.id === inq2 && inFolder.next === null);
+
+  // 後片付け (以降のテストに影響させない)
+  db.prepare('UPDATE inquiries SET folder_id = NULL WHERE folder_id = ?').run(navFolder);
+  db.prepare('DELETE FROM inquiry_folders WHERE id = ?').run(navFolder);
+  db.prepare("DELETE FROM inquiries WHERE external_inquiry_id IN ('th-tie-a', 'th-tie-b')").run();
+}
+
 // ─── 6. 操作ログ・メモ ───
 console.log('6. 操作ログ・メモ');
 logActivity(inq1, { userId: 'smoke-user', actionType: 'status_change', before: { status: 'open' }, after: { status: 'in_progress' } });
