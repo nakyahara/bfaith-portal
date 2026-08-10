@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Qoo10'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1250,8 +1250,19 @@ async function main() {
   // さらに**キャンセル済みは受注APIから消える (= last_seen_at が古くなる)** ので、
   // 「今日の同期で確認できた注文」に絞るだけで最新状態を判定できる (service.js 参照)。
   // 同期が失敗した日は判定を見送って exit 1 = retry で拾い直す
-  const qoo10UnshippedResult = runScript('apps/qoo10-unshipped/notify-job.js --once', 'Qoo10未発送アラート', 300000);
-  results.push({ name: 'Qoo10未発送アラート', ...qoo10UnshippedResult });
+  // ⚠️Qoo10同期が失敗した日は判定できない (DBが今日の状態になっていない)。
+  //   実行せず失敗として積み、retry (Qoo10同期 → このジョブの順) で拾い直す
+  if (qoo10Result.success) {
+    const qoo10UnshippedResult = runScript('apps/qoo10-unshipped/notify-job.js --once', 'Qoo10未発送アラート', 300000);
+    results.push({ name: 'Qoo10未発送アラート', ...qoo10UnshippedResult });
+  } else {
+    console.log('[DailySync] Qoo10未発送アラートは Qoo10受注同期の失敗によりスキップ (retryで拾う)');
+    results.push({
+      name: 'Qoo10未発送アラート',
+      success: false,
+      summary: '⏸️ Qoo10受注同期の失敗により未実行 (retryで Qoo10同期→判定 の順に再実行)',
+    });
+  }
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。

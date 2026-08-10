@@ -154,6 +154,9 @@ const mkCtx = () => ({ ...ctx });
   ok(text.includes('✅ 出荷漏れはありません'), '0件でも本文を作る');
   ok(text.includes('767件を確認'), '今朝の確認件数を出す (動いている証拠になる)');
   ok(text.includes('08/09 12:00'), '締め時刻を明記');
+  // 🚨「発送できる状態になった時刻」は取れないので、通知の意味を正確に書く (Codexレビュー High)
+  ok(text.includes('より前の注文で、まだ発送されていない'), '判定の意味を正確に書く');
+  ok(text.includes('前払い・後払いは締めの後に入金された可能性'), '誤検知しうることを明示');
 }
 {
   const text = buildMessage({ alerts: [mkAlert()], awaitingPayment: 3, seenToday: 767, stale: false, ctx: mkCtx() });
