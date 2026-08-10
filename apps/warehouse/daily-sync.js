@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1219,6 +1219,18 @@ async function main() {
     name: '楽天未発送アラート',
     ...unshippedResult,
     ...(unshippedResult.exitCode === 2 ? { blocked: true } : {}),
+  });
+
+  // ─── Yahoo! 未発送アラート ───
+  // 楽天と違い Yahoo受注APIは1件1秒 (VPSプロキシのレート制御) なので、
+  // 上の Yahoo 同期で入った warehouse.db から候補を絞り、候補だけAPIで最新確認する。
+  // ⚠️DBだけで判定してはいけない (同期は7日窓 = 古い注文の ship_status は更新されない。
+  //   実測では候補9件のうち7件が出荷済み・キャンセル済みだった)。終了コードは楽天版と同じ規約
+  const yahooUnshippedResult = runScript('apps/yahoo-unshipped/notify-job.js --once', 'Yahoo未発送アラート', 600000);
+  results.push({
+    name: 'Yahoo未発送アラート',
+    ...yahooUnshippedResult,
+    ...(yahooUnshippedResult.exitCode === 2 ? { blocked: true } : {}),
   });
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
