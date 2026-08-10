@@ -105,6 +105,21 @@ export function exitCodeFor(result) {
   return result?.partial ? 2 : 0;
 }
 
+/**
+ * 終了処理。
+ * 🚨process.exit() を即座に呼ぶと、GChat 送信で使った fetch の接続が開いたまま
+ *   libuv の teardown に入り、Windows で
+ *   `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` を出して abort することがある
+ *   (2026-08-10 に Yahoo 版で実際に発生。通知は送れているのに終了コードが異常になり、
+ *    daily-sync がステップ失敗と誤判定して retry = 通知が重複する)。
+ *   → exitCode を立てて**自然終了**させ、万一終わらない時だけ強制終了する。
+ */
+function finish(code) {
+  process.exitCode = code;
+  // このタイマー自体は unref するのでイベントループの終了を妨げない
+  setTimeout(() => process.exit(code), 5000).unref();
+}
+
 // ─── CLI ───
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
@@ -117,10 +132,10 @@ if (isMain) {
     .then(r => {
       // daily-sync はこの行の末尾をサマリに載せる
       console.log(`[rakuten-unshipped] 完了: ${r.note}`);
-      process.exit(exitCodeFor(r));
+      finish(exitCodeFor(r));
     })
     .catch(e => {
       console.error('[rakuten-unshipped] 失敗:', e.message);
-      process.exit(1);
+      finish(1);
     });
 }
