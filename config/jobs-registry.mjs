@@ -62,8 +62,8 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'モール受注取込→fact build→DQ→Render mirror 同期 (約45ステップ)。全業務データの土台。'
       + '日次出荷サマリ (出荷日×モール×配送方法) の再構築もここ。'
-      + '最後に「楽天未発送アラート」「Yahoo未発送アラート」(前日12時締めまでに入金確認済みなのに'
-      + '未発送の注文を GChat 通知) も走る',
+      + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」'
+      + '(前日12時締めまでに発送できる状態だったのに未発送の注文を GChat 通知) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,

@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1231,6 +1231,18 @@ async function main() {
     name: 'Yahoo未発送アラート',
     ...yahooUnshippedResult,
     ...(yahooUnshippedResult.exitCode === 2 ? { blocked: true } : {}),
+  });
+
+  // ─── au PAY 未発送アラート ───
+  // Yahoo と同じ二段構え (DBで候補を絞る → APIで最新確認)。auPAY の受注APIは注文ID指定が
+  // できないので、候補の**注文日**をピンポイントで検索して引き当てる。
+  // ⚠️auPAY の payment_status は「入金済み」ではなく発送後に Y になる値なので判定に使わない。
+  //   発送できる状態かどうかは order_status='発送待ち' が正 (service.js 参照)
+  const aupayUnshippedResult = runScript('apps/aupay-unshipped/notify-job.js --once', 'auPAY未発送アラート', 900000);
+  results.push({
+    name: 'auPAY未発送アラート',
+    ...aupayUnshippedResult,
+    ...(aupayUnshippedResult.exitCode === 2 ? { blocked: true } : {}),
   });
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
