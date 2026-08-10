@@ -20,7 +20,7 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, getInquiryDetail } from './queries.js';
+import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
@@ -386,9 +386,22 @@ router.get('/inquiries/:id', (req, res) => {
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
 
+  // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder) で隣へ移動。
+  // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
+  const adj = getAdjacentInquiries(id, { view: backView, folder: backFolder ? String(backFolder.id) : '' });
+  const navQs = `?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const navLink = (row, label) => row
+    ? `<a href="/apps/inquiry-hub/inquiries/${row.id}${navQs}" title="${he(row.subject || '(件名なし)')}">${label}</a>`
+    : `<span class="nav-off" aria-disabled="true">${label}</span>`;
   const body = `
   <div class="detail-head">
-    <a href="${backUrl}">← ${backFolder ? `📁${he(backFolder.name)}` : he(VIEWS[backView].label)}に戻る</a>
+    <div class="detail-nav">
+      <a href="${backUrl}">← ${backFolder ? `📁${he(backFolder.name)}` : he(VIEWS[backView].label)}に戻る</a>
+      <span class="detail-nav-adj">
+        ${navLink(adj.prev, '← 前の問い合わせ')}
+        ${navLink(adj.next, '次の問い合わせ →')}
+      </span>
+    </div>
     <h2>${chBadge(inq.channel_type)} ${he(inq.subject || '(件名なし)')}</h2>
   </div>
   <div class="detail-grid">
@@ -1831,6 +1844,9 @@ button:disabled { opacity: .5; cursor: default; }
 .pager { padding: 10px; display: flex; gap: 16px; justify-content: center; color: #475569; }
 .pager a { color: #1d4ed8; }
 .detail-head h2 { margin: 8px 0 12px; font-size: 18px; }
+.detail-nav { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.detail-nav-adj { display: flex; gap: 14px; }
+.detail-nav .nav-off { color: #cbd5e1; }
 .detail-grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
 @media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
 .thread { display: flex; flex-direction: column; gap: 10px; }
