@@ -67,13 +67,15 @@ const JOB_DEFINITIONS = {
   // 楽天未発送アラート: RMS API を読んで GChat へ通知するだけ (DBに書かない) ので再実行安全。
   // 朝の便が RMS の一時障害で落ちても、当日中に出荷漏れの通知が届くようにする
   '楽天未発送アラート':    { script: 'apps/rakuten-unshipped/notify-job.js',        args: ['--once'], timeoutMs: 600000 },
+  // Yahoo未発送アラート: warehouse.db の候補を Yahoo受注API で最新確認して通知するだけ (DBに書かない)
+  'Yahoo未発送アラート':   { script: 'apps/yahoo-unshipped/notify-job.js',          args: ['--once'], timeoutMs: 600000 },
 };
 
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
@@ -120,6 +122,13 @@ function runScript(scriptPath, label, timeoutMs, args = ['7']) {
     const lines = output.trim().split('\n');
     return { success: true, summary: lines[lines.length - 1] || '' };
   } catch (e) {
+    // exit 2 = 「通知は送れたが結果が不完全」(未発送アラート系の規約。daily-sync 側では blocked)。
+    // 通知そのものは届いているので、再試行を続けても同じ内容が重複するだけ → ここで打ち切る
+    if (e.status === 2) {
+      const lastLine = String(e.stdout ?? '').trim().split('\n').slice(-1)[0] || '';
+      console.log(`[${label}] 結果は不完全だが通知は送信済み (exit 2) — retry を打ち切ります`);
+      return { success: true, summary: `⚠不完全だが通知済み | ${lastLine}`.slice(0, 200) };
+    }
     console.error(`[${label}] エラー:`, e.message);
     return { success: false, summary: e.message.slice(0, 200) };
   }
