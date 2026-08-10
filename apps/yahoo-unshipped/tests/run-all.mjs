@@ -12,6 +12,9 @@ import {
   isStillUnshipped,
   verifyCandidates,
   buildMessage,
+  loadResolved,
+  saveResolved,
+  resolvedFilePath,
   MAX_LINES,
 } from '../service.js';
 import { exitCodeFor } from '../notify-job.js';
@@ -54,7 +57,7 @@ section('buildContext (JST基準)');
   const ctx = buildContext(new Date('2026-08-09T23:00:00Z'), 12); // = 8/10 08:00 JST
   eq(ctx.today, '2026-08-10', 'UTC実行でも today は JST');
   eq(ctx.cutoffDate, '2026-08-09', '締め日 = 前日');
-  eq(ctx.cutoffStr, '2026-08-09T12:00:00', 'DB比較用の文字列 (JSTのまま)');
+  eq(ctx.cutoffStr, '2026-08-09T12:00:00+09:00', 'DB比較用の文字列はDBと同じ +09:00 付き');
   eq(ctx.cutoff.toISOString(), '2026-08-09T03:00:00.000Z', '締め = 前日12:00 JST');
 }
 {
@@ -64,9 +67,13 @@ section('buildContext (JST基準)');
 // DBの order_time は '2026-08-06T17:16:34+09:00' 形式。cutoffStr との文字列比較が
 // 正しい大小関係になること (ここが崩れると SQL の絞り込みが黙って壊れる)
 section('DB文字列比較の前提');
-ok('2026-08-06T17:16:34+09:00' <= '2026-08-09T12:00:00', '締め前の注文は cutoffStr 以下');
-ok(!('2026-08-09T12:00:01+09:00' <= '2026-08-09T12:00:00'), '締め1秒後は cutoffStr を超える');
-ok('2026-08-09T11:59:59+09:00' <= '2026-08-09T12:00:00', '締め1秒前は cutoffStr 以下');
+const CUT = '2026-08-09T12:00:00+09:00';
+ok('2026-08-06T17:16:34+09:00' <= CUT, '締め前の注文は cutoffStr 以下');
+ok(!('2026-08-09T12:00:01+09:00' <= CUT), '締め1秒後は cutoffStr を超える');
+ok('2026-08-09T11:59:59+09:00' <= CUT, '締め1秒前は cutoffStr 以下');
+// 🚨オフセットを省くと '...12:00:00+09:00' > '...12:00:00' となり、ちょうど締め時刻の注文が漏れる
+ok('2026-08-09T12:00:00+09:00' <= CUT, '締めちょうどの注文が含まれる (オフセット付きで揃えた効果)');
+ok(!('2026-08-09T12:00:00+09:00' <= '2026-08-09T12:00:00'), '(参考) オフセット無しだと締めちょうどが漏れる');
 
 // ─── extractOrderInfo (実際のXML構造) ───
 section('extractOrderInfo');
@@ -198,16 +205,87 @@ const mkAlert = (over = {}) => ({
   ok(text.includes(`*${MAX_LINES + 3}件*`), '総件数は正しい');
 }
 {
+  const text = buildMessage({ alerts: [], recent: [mkAlert()], candidates: 3, apiFailed: 0, truncated: false, ctx: ctxNow });
+  ok(text.includes('🕒 未発送だが締め後に動きあり 1件'), '参考枠を本文に出す');
+  ok(text.includes('今朝の入金・変更かもしれません'), '参考枠の意味を書く');
+  ok(text.includes('✅ 出荷漏れはありません'), '🚨が0件なら0件と明記する');
+}
+{
   const long = mkAlert({ firstItemName: 'あ'.repeat(80), itemCount: 3 });
   const text = buildMessage({ alerts: [long], candidates: 1, apiFailed: 0, truncated: false, ctx: ctxNow });
   ok(text.includes('…'), '長い商品名は切る');
   ok(text.includes('ほか2点'), '2件目以降は点数で表す');
 }
 
+// ─── 締め後に動きがある注文の切り分け (Codexレビュー High) ───
+section('締め後に動きがある注文は落とさず参考枠へ');
+{
+  // LastUpdateTime は入金日時ではない。締め前に入金済みでも、締め後に住所変更などが
+  // あれば更新される。これで候補から外すと出荷漏れを見逃すため、参考枠に回す
+  const movedXml = XML.replace('<LastUpdateTime>2026-08-06T17:32:06+09:00</LastUpdateTime>',
+    '<LastUpdateTime>2026-08-10T07:00:00+09:00</LastUpdateTime>');
+  const r = await verifyCandidates(
+    [cand('b-faith01-10285999', '2026-08-06T17:16:34+09:00')],
+    ctxNow,
+    { fetchImpl: fakeFetch([{ orderId: 'b-faith01-10285999', xml: movedXml }]) },
+  );
+  eq(r.alerts.length, 0, '締め後に更新があれば 🚨 には出さない');
+  eq(r.recent.length, 1, '参考枠には残す (見逃さない)');
+  eq(r.recent[0].orderId, 'b-faith01-10285999', '参考枠の中身');
+}
+{
+  const r = await verifyCandidates(
+    [cand('b-faith01-10285999', '2026-08-06T17:16:34+09:00')],
+    ctxNow,
+    { fetchImpl: fakeFetch([{ orderId: 'b-faith01-10285999', xml: XML }]) },
+  );
+  eq(r.alerts.length, 1, '締め前の更新なら 🚨 に出す');
+  eq(r.recent.length, 0, '参考枠は空');
+}
+{
+  // 解消済み (出荷済み・キャンセル) は resolvedIds に入れて次回の候補から外す
+  const shipped = XML.replace('<ShipStatus>1</ShipStatus>', '<ShipStatus>3</ShipStatus>');
+  const r = await verifyCandidates([cand('S1', '2026-08-05T10:00:00+09:00')], ctxNow,
+    { fetchImpl: fakeFetch([{ orderId: 'S1', xml: shipped }]) });
+  eq(r.resolvedIds, ['S1'], '解消済みは記録して次回スキップできるようにする');
+}
+{
+  const r = await verifyCandidates([cand('F1', '2026-08-05T10:00:00+09:00')], ctxNow, { fetchImpl: fakeFetch([]) });
+  eq(r.resolvedIds, [], '確認できなかった注文は「解消済み」に入れない (次回また見る)');
+}
+
+// ─── 解消済みキャッシュ ───
+section('解消済みキャッシュ');
+{
+  const os = await import('node:os');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'yahoo-unshipped-'));
+  const prev = process.env.DATA_DIR;
+  process.env.DATA_DIR = tmp;
+  try {
+    eq(loadResolved(), {}, 'ファイルが無ければ空');
+    saveResolved({ A: '2026-08-10', B: '2026-01-01' }, '2026-08-10');
+    const loaded = loadResolved();
+    eq(loaded.A, '2026-08-10', '新しい記録は残る');
+    eq(loaded.B, undefined, '保持日数を過ぎた記録は捨てる');
+    fs.writeFileSync(resolvedFilePath(), '{壊れたJSON');
+    eq(loadResolved(), {}, '壊れていても空で続行する (判定は止めない)');
+    fs.writeFileSync(resolvedFilePath(), '[1,2,3]');
+    eq(loadResolved(), {}, '配列など想定外の形も空扱い');
+  } finally {
+    if (prev === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 // ─── exitCodeFor ───
 section('exitCodeFor');
-eq(exitCodeFor({ partial: false }), 0, '完全 → 0');
-eq(exitCodeFor({ partial: true }), 2, '不完全 → 2 (daily-syncで❌かつretryしない)');
+eq(exitCodeFor({ apiFailed: 0, truncated: false }), 0, '完全 → 0');
+eq(exitCodeFor({ apiFailed: 2, truncated: false }), 1, '確認できない注文がある → 1 (当日中にretryする)');
+eq(exitCodeFor({ apiFailed: 0, truncated: true }), 2, '上限打ち切り → 2 (retryしても同じ = blocked)');
+eq(exitCodeFor({ apiFailed: 1, truncated: true }), 1, '両方なら retry を優先する');
+eq(exitCodeFor({}), 0, '空でも 0');
 eq(exitCodeFor(null), 0, 'null でも落ちない');
 
 console.log(`\n${fail === 0 ? '全テスト pass' : `${fail}件 失敗`} (pass=${pass} fail=${fail})`);

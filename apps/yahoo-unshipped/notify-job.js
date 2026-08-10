@@ -59,7 +59,7 @@ async function sendWithRetry(webhook, text) {
 
 /**
  * 検知 → 通知。
- * @returns {Promise<{ok:boolean, partial:boolean, note:string, text:string, alerts:number}>}
+ * @returns {Promise<{ok:boolean, note:string, text:string, alerts:object[], recent:object[], apiFailed:number, truncated:boolean}>}
  */
 export async function runYahooUnshippedAlert(opts = {}) {
   const cutoffHour = numEnv('YAHOO_UNSHIPPED_CUTOFF_HOUR', DEFAULT_CUTOFF_HOUR, { min: 0, max: 23 });
@@ -73,31 +73,42 @@ export async function runYahooUnshippedAlert(opts = {}) {
   }
 
   initDB();
-  const result = await findUnshippedOrders({ now: opts.now, cutoffHour, searchDays, maxVerify });
-  const { alerts, candidates, apiFailed, truncated } = result;
+  // dry-run では解消済みキャッシュを書かない (確認だけのつもりが次回の候補を変えてしまわないように)
+  const result = await findUnshippedOrders({
+    now: opts.now, cutoffHour, searchDays, maxVerify, skipCacheWrite: Boolean(opts.dryRun),
+  });
+  const { alerts, recent, candidates, apiFailed, truncated } = result;
   const text = buildMessage(result);
-  // 確認できなかった注文・上限打ち切りがあった日は partial (結果が不完全)
-  const partial = apiFailed > 0 || Boolean(truncated);
   const note = `未発送${alerts.length}件 / 候補${candidates}件`
-    + (partial ? ` / ⚠不完全(確認不能=${apiFailed} 打切=${truncated ? 1 : 0})` : '');
+    + (recent.length ? ` / 締め後に動き${recent.length}件` : '')
+    + (apiFailed ? ` / ⚠確認不能${apiFailed}件` : '')
+    + (truncated ? ' / ⚠上限で打ち切り' : '');
 
   if (opts.dryRun) {
     console.log(`[yahoo-unshipped] dry-run (${note})\n${text}`);
-    return { ok: true, partial, note: `${note} (dry-run)`, text, alerts: alerts.length };
+    return { ...result, ok: true, note: `${note} (dry-run)`, text };
   }
 
   await sendWithRetry(webhook, text);
   console.log(`[yahoo-unshipped] 通知しました (${note})`);
-  return { ok: true, partial, note, text, alerts: alerts.length };
+  return { ...result, ok: true, note, text };
 }
 
 /**
  * 実行結果 → プロセス終了コード。
- *   0 … 正常 / 2 … 通知は送れたが結果が不完全 (daily-sync 側で blocked = retry しない失敗)
+ *   0 … 正常
+ *   1 … 一部の注文の最新状態を確認できなかった。**通知は送れているが retry したい** —
+ *       確認できなかった中に出荷漏れが隠れている可能性があるので、当日中 (08:30/10:00/11:30) に
+ *       もう一度確認する。再通知が重複するより、出荷漏れを翌日まで見逃す方が痛い
+ *       (Codexレビュー High)
+ *   2 … 候補が上限を超えて打ち切った。retry しても同じ結果なので daily-sync 側では blocked
+ *       (サマリに ❌ は出るが再試行しない)。残りは翌日以降に回る
  * (完全な失敗 = 例外は呼び出し側で 1)
  */
 export function exitCodeFor(result) {
-  return result?.partial ? 2 : 0;
+  if ((result?.apiFailed ?? 0) > 0) return 1;
+  if (result?.truncated) return 2;
+  return 0;
 }
 
 // ─── CLI ───
@@ -112,7 +123,7 @@ if (isMain) {
     .then(r => {
       // daily-sync はこの行の末尾をサマリに載せる
       console.log(`[yahoo-unshipped] 完了: ${r.note}`);
-      process.exit(exitCodeFor(r));
+      process.exit(dryRun ? 0 : exitCodeFor(r));
     })
     .catch(e => {
       console.error('[yahoo-unshipped] 失敗:', e.message);
