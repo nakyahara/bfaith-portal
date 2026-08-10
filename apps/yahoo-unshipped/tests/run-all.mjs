@@ -15,6 +15,7 @@ import {
   loadResolved,
   saveResolved,
   resolvedFilePath,
+  shouldSkipByCache,
   MAX_LINES,
 } from '../service.js';
 import { exitCodeFor } from '../notify-job.js';
@@ -265,10 +266,17 @@ section('解消済みキャッシュ');
   process.env.DATA_DIR = tmp;
   try {
     eq(loadResolved(), {}, 'ファイルが無ければ空');
-    saveResolved({ A: '2026-08-10', B: '2026-01-01' }, '2026-08-10');
+    saveResolved({
+      A: { resolvedAt: '2026-08-10', lastUpdateTime: '2026-08-06T17:32:06+09:00' },
+      B: { resolvedAt: '2026-01-01', lastUpdateTime: '2026-01-01T00:00:00+09:00' },
+    }, '2026-08-10');
     const loaded = loadResolved();
-    eq(loaded.A, '2026-08-10', '新しい記録は残る');
+    eq(loaded.A?.resolvedAt, '2026-08-10', '新しい記録は残る');
+    eq(loaded.A?.lastUpdateTime, '2026-08-06T17:32:06+09:00', '確認時点の last_update_time を保持');
     eq(loaded.B, undefined, '保持日数を過ぎた記録は捨てる');
+    // 旧形式 (値が文字列) も読める。lastUpdateTime が空 = 必ず再確認になる (安全側)
+    fs.writeFileSync(resolvedFilePath(), JSON.stringify({ OLD: '2026-08-10' }));
+    eq(loadResolved().OLD, { resolvedAt: '2026-08-10', lastUpdateTime: '' }, '旧形式も読める');
     fs.writeFileSync(resolvedFilePath(), '{壊れたJSON');
     eq(loadResolved(), {}, '壊れていても空で続行する (判定は止めない)');
     fs.writeFileSync(resolvedFilePath(), '[1,2,3]');
@@ -277,6 +285,21 @@ section('解消済みキャッシュ');
     if (prev === undefined) delete process.env.DATA_DIR; else process.env.DATA_DIR = prev;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+}
+
+// ─── shouldSkipByCache (状態が未発送に戻ったら再確認する) ───
+section('shouldSkipByCache');
+{
+  const row = (lut) => ({ order_id: 'A', last_update_time: lut });
+  const cache = (lut) => ({ A: { resolvedAt: '2026-08-09', lastUpdateTime: lut } });
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('2026-08-06T17:32:06+09:00')), true,
+    '解消を確認した時から動いていなければスキップ');
+  // 🚨出荷取消・キャンセル解除で未発送に戻った場合、DBの last_update_time が進む
+  eq(shouldSkipByCache(row('2026-08-10T09:00:00+09:00'), cache('2026-08-06T17:32:06+09:00')), false,
+    '確認後に動いていたら再確認する (状態が戻っても検出できる)');
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), {}), false, 'キャッシュに無ければ確認する');
+  eq(shouldSkipByCache(row('2026-08-06T17:32:06+09:00'), cache('')), false,
+    '旧形式 (lastUpdateTime 空) は必ず再確認する');
 }
 
 // ─── exitCodeFor ───

@@ -90,34 +90,71 @@ export function resolvedFilePath() {
   return path.join(dataDir(), 'yahoo-unshipped-resolved.json');
 }
 
-/** @returns {Record<string,string>} orderId → 解消を確認した日 (YYYY-MM-DD) */
+/**
+ * @returns {Record<string,{resolvedAt:string, lastUpdateTime:string}>}
+ *   orderId → { 解消を確認した日, その時点でDBが持っていた last_update_time }
+ * lastUpdateTime を持つのは「その後に注文が動いたか」を見るため。
+ * 旧形式 (値が文字列) も読めるようにしてある — その場合 lastUpdateTime は空 = 必ず再確認になる。
+ */
 export function loadResolved() {
   try {
     const raw = fs.readFileSync(resolvedFilePath(), 'utf-8');
     const obj = JSON.parse(raw);
-    return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+    const out = {};
+    for (const [id, v] of Object.entries(obj)) {
+      if (typeof v === 'string') out[id] = { resolvedAt: v, lastUpdateTime: '' };
+      else if (v && typeof v === 'object' && typeof v.resolvedAt === 'string') {
+        out[id] = { resolvedAt: v.resolvedAt, lastUpdateTime: String(v.lastUpdateTime || '') };
+      }
+    }
+    return out;
   } catch {
     // 無い/壊れている場合は空で続行 (キャッシュはあくまで最適化。判定の正しさには影響しない)
     return {};
   }
 }
 
-/** 古い記録を落として保存する。書けなくてもジョブは止めない */
+/**
+ * 古い記録を落として保存する。書けなくてもジョブは止めない。
+ * 書き込みは一時ファイル → rename の順で行う (途中で落ちても壊れたJSONを残さない)。
+ */
 export function saveResolved(map, today) {
   const cutoff = addDaysStr(today, -RESOLVED_KEEP_DAYS);
   const pruned = {};
-  for (const [id, day] of Object.entries(map)) {
-    if (typeof day === 'string' && day >= cutoff) pruned[id] = day;
+  for (const [id, v] of Object.entries(map)) {
+    const rec = typeof v === 'string' ? { resolvedAt: v, lastUpdateTime: '' } : v;
+    if (rec && typeof rec.resolvedAt === 'string' && rec.resolvedAt >= cutoff) {
+      pruned[id] = { resolvedAt: rec.resolvedAt, lastUpdateTime: String(rec.lastUpdateTime || '') };
+    }
   }
+  const file = resolvedFilePath();
+  const tmp = `${file}.tmp`;
   try {
     const dir = dataDir();
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(resolvedFilePath(), JSON.stringify(pruned, null, 2));
+    fs.writeFileSync(tmp, JSON.stringify(pruned, null, 2));
+    fs.renameSync(tmp, file);
     return { ok: true, kept: Object.keys(pruned).length };
   } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* 消せなくても次回上書きされる */ }
     console.warn(`[yahoo-unshipped] 解消済みキャッシュを保存できませんでした: ${e.message}`);
     return { ok: false, error: e.message };
   }
+}
+
+/**
+ * キャッシュを見て、この候補をスキップしてよいか。
+ * ⚠️「一度解消したら永久に無視」にはしない。出荷取消・キャンセル解除などで
+ *   同じ注文が未発送に戻ることがあるため、**確認した時点より注文が動いていたら
+ *   もう一度APIで見る** (Codexレビュー2巡目 High)。
+ */
+export function shouldSkipByCache(row, resolved) {
+  const rec = resolved?.[row.order_id];
+  if (!rec) return false;
+  const seen = String(rec.lastUpdateTime || '');
+  const current = String(row.last_update_time || '');
+  return current <= seen && seen !== '';
 }
 
 // ─── ① warehouse.db から候補を絞る ───
@@ -155,8 +192,8 @@ export function findCandidates(ctx, searchDays = DEFAULT_SEARCH_DAYS, resolved =
       AND order_status <> '4'    -- キャンセル以外
     ORDER BY order_time
   `).all(since, ctx.cutoffStr);
-  // 過去にAPIで「解消済み」と確認した注文は、DBが古いだけなので除外する
-  return rows.filter(r => !resolved[r.order_id]);
+  // 過去にAPIで「解消済み」と確認した注文は、その後に動きが無ければ除外する
+  return rows.filter(r => !shouldSkipByCache(r, resolved));
 }
 
 // ─── ② 候補をAPIで最新確認 ───
@@ -294,9 +331,16 @@ export async function findUnshippedOrders(opts = {}) {
     + (r.resolvedIds.length ? ` / 解消済み ${r.resolvedIds.length}件` : '')
     + (r.apiFailed ? ` / 確認できず ${r.apiFailed}件` : ''));
 
-  // 解消済みを記録して次回の候補から外す (これをしないと古い候補が枠を食い潰す)
+  // 解消済みを記録して次回の候補から外す (これをしないと古い候補が枠を食い潰す)。
+  // last_update_time も一緒に残し、その後に注文が動いたら再確認できるようにする
   if (!opts.skipCacheWrite && r.resolvedIds.length > 0) {
-    for (const id of r.resolvedIds) resolved[id] = ctx.today;
+    const byId = new Map(candidates.map(c => [c.order_id, c]));
+    for (const id of r.resolvedIds) {
+      resolved[id] = {
+        resolvedAt: ctx.today,
+        lastUpdateTime: String(byId.get(id)?.last_update_time || ''),
+      };
+    }
     saveResolved(resolved, ctx.today);
   }
 
