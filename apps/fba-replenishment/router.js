@@ -1750,13 +1750,24 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       delivery_date: deliveryDate,
     });
 
-    // PDF保存失敗時は履歴をロールバックして500 (PDFなしの不完全な回を公開一覧に残さない)
+    // PDF保存失敗時は履歴をロールバックして500 (PDFなしの不完全な回を公開一覧に残さない)。
+    // ディスク障害等でロールバック自体も失敗した場合は応答に明示する (再起動後に
+    // 履歴だけ復活しうるため、運用者が実行ID付きで判別できるように)。
     try {
       savePickingPdf(runId, annotatedPdfBuffer);
     } catch (e) {
       console.error('[Picking] 注番PDF保存失敗 — 履歴をロールバック:', e);
-      try { deletePickingRun(runId); } catch (e2) { console.error('[Picking] 履歴ロールバック失敗:', e2); }
-      return res.status(500).json({ error: `注番PDFの保存に失敗しました: ${e.message}` });
+      let rollbackFailed = false;
+      try { deletePickingRun(runId); } catch (e2) {
+        rollbackFailed = true;
+        console.error('[Picking] 履歴ロールバック失敗:', e2);
+      }
+      return res.status(500).json({
+        error: `注番PDFの保存に失敗しました: ${e.message}`
+          + (rollbackFailed ? ` (さらに実行履歴ID ${runId} のロールバックにも失敗 — PDFなしの履歴が残っている可能性があります)` : ''),
+        rollbackFailed,
+        runId: rollbackFailed ? runId : undefined,
+      });
     }
 
     // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。ここは外部保存のため
