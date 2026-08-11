@@ -15,7 +15,7 @@ for (const k of ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOK
 
 const { jstYmd, formatSummary, runTrackingJob } = await import('../tracking-runner.js');
 const store = await import('../tracking-store.js');
-const { _internal } = await import('../tracking-service.js');
+const { _internal, summarizeShipment, checkDeadline } = await import('../tracking-service.js');
 
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log(`  ok  ${name}`); };
@@ -117,6 +117,37 @@ t('🚨受理されたか断定できない例外は indeterminate にする (�
   assert.equal(c({ code: 'ECONNRESET', message: 'read ECONNRESET' }).indeterminate, true);
   assert.equal(c(new Error('Internal Server Error')).indeterminate, true);
   assert.equal(c(undefined).indeterminate, true);
+});
+
+// ── 2026-08-11 実測の修正: 期限切れガードの素通り ──────────────────
+// 8/10分をJST 10時に --commit したら、checkDeadline が要約オブジェクト (datesなし) を
+// 受け取って「期限の情報が取れませんでした→ok」と素通りし、Amazonの
+// "not in a state..." エラーで3件失敗した。要約が期限の生データを保持し、
+// runner の checkDeadline(ship, now) が期限切れを検出できることを固定する。
+t('🚨要約は期限の生データを保持する (checkDeadlineの再評価が素通りしない)', () => {
+  // 8/11 に実際に返ってきた getShipment の形 (FBA15GFZRWWR)
+  const raw = {
+    shipmentConfirmationId: 'FBA15GFZRWWR',
+    status: 'READY_TO_SHIP',
+    destination: { warehouseId: 'XJW1' },
+    dates: { readyToShipWindow: { start: '2026-08-10T14:59Z', end: '2026-08-10T14:59Z' } },
+    selectedDeliveryWindow: { editableUntil: '2026-08-11T00:00Z', startDate: '2026-08-11T00:00Z', endDate: '2026-08-14T00:00Z' },
+  };
+  const ship = summarizeShipment({ inboundPlanId: 'p1', name: 'n' }, { shipmentId: 's1' }, raw, [{ boxId: 'B1' }]);
+  // 22:00 JST (出荷当日) = 期限内 → 投入してよい
+  assert.equal(checkDeadline(ship, new Date('2026-08-10T13:00:00Z')).ok, true);
+  // 翌朝 10:00 JST = 両方の期限切れ → ガードで止まる (Amazonのエラーまで行かせない)
+  const dl = checkDeadline(ship, new Date('2026-08-11T01:00:00Z'));
+  assert.equal(dl.ok, false);
+  assert.match(dl.note, /画面からは入力できます/);
+  assert.equal(dl.expired.length, 2);
+});
+
+t('期限の情報が無い納品は緩い側に倒す (ok=true。最終判断はAmazon)', () => {
+  const ship = summarizeShipment({ inboundPlanId: 'p1', name: '' }, { shipmentId: 's1' },
+    { shipmentConfirmationId: 'FBA-X', status: 'READY_TO_SHIP', destination: { warehouseId: 'HND2' } }, []);
+  assert.equal(ship.dates, null);
+  assert.equal(checkDeadline(ship).ok, true);
 });
 
 await (async () => {

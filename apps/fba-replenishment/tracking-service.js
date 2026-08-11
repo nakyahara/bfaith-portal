@@ -143,6 +143,31 @@ export function checkDeadline(shipment, now = new Date()) {
 }
 
 /**
+ * getShipment の生レスポンスから runner に渡す要約を組み立てる。
+ * 🚨期限の生データ (dates / selectedDeliveryWindow) を必ず残すこと。
+ *   runner は投入直前に checkDeadline(ship) を呼び直すが、ここで落とすと
+ *   「期限の情報が取れませんでした→ok」で素通りし、期限切れをAmazonのエラーで
+ *   知ることになる (2026-08-11 実測。8/10分をJST 10時に投入したら3件とも
+ *   ガードを抜けて "not in a state..." で拒否された)
+ */
+export function summarizeShipment(plan, shipmentRef, detail, boxes, now = new Date()) {
+  return {
+    inboundPlanId: plan.inboundPlanId,
+    planName: plan.name || '',
+    shipmentId: shipmentRef.shipmentId,
+    shipmentConfirmationId: detail.shipmentConfirmationId,
+    fcCode: detail.destination?.warehouseId ?? '',
+    status: detail.status,
+    // ⭐boxIdは規則から生成せずAPIの返り値を正とする
+    boxIds: boxes.map((x) => x.boxId),
+    hasTracking: Boolean(detail.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
+    deadline: checkDeadline(detail, now),
+    dates: detail.dates ?? null,
+    selectedDeliveryWindow: detail.selectedDeliveryWindow ?? null,
+  };
+}
+
+/**
  * 追跡番号がまだ入っていない納品を探す。
  * ⭐無駄なAPI呼び出しを避けるため、プラン本体の shipments[].status を見てから詳細を取る。
  * @param {{statuses?: string[]}} [opts]
@@ -199,18 +224,7 @@ export async function findOpenShipments(opts = {}) {
         if (!wantStatuses.includes(d.status)) continue;
         const b = await callAllPages(`${base}/boxes`, 'boxes', { pageSize: 100 });
         if (b.truncated) errors.push(`${d.shipmentConfirmationId}: 輸送箱が多すぎて全部見られませんでした`);
-        out.push({
-          inboundPlanId: p.inboundPlanId,
-          planName: p.name || '',
-          shipmentId: s.shipmentId,
-          shipmentConfirmationId: d.shipmentConfirmationId,
-          fcCode: d.destination?.warehouseId ?? '',
-          status: d.status,
-          // ⭐boxIdは規則から生成せずAPIの返り値を正とする
-          boxIds: b.items.map((x) => x.boxId),
-          hasTracking: Boolean(d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
-          deadline: checkDeadline(d),
-        });
+        out.push(summarizeShipment(p, s, d, b.items));
       } catch (e) {
         errors.push(`納品 ${s.shipmentId} の取得に失敗: ${e?.message ?? e}`);
       }
