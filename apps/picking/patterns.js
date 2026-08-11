@@ -47,14 +47,17 @@ const COMPOSITION_MATCH = {
 
 /**
  * CSVから読める情報 (送り状発行ソフト名・配送方法名・数量構成) でパターン候補を絞る。
- * 完全一致候補 → 構成のみ不一致の候補 の順で返す (先頭が推定値)。
+ * softs/methods は distinct 配列 (LINEギフト等は1バッチに複数の配送方法が正当に混在するため、
+ * 先頭行決め打ちにしない)。完全一致候補 → 構成のみ不一致の候補 の順で返す (先頭が推定値)。
  * どれにも合わなければ空配列 (画面側は全パターンから選ばせる)。
  */
-export function suggestPatterns({ invoiceSoft, deliveryMethod, composition }) {
+export function suggestPatterns({ invoiceSofts, deliveryMethods, composition }) {
+  const softs = invoiceSofts || [];
+  const methods = deliveryMethods || [];
   const compatible = COMPOSITION_MATCH[composition] || ['all'];
   const bySoft = HIKIATE_PATTERNS.filter((p) =>
-    (p.soft === null || p.soft === invoiceSoft) &&
-    (p.methods === null || p.methods.includes(deliveryMethod)));
+    (p.soft === null || softs.includes(p.soft)) &&
+    (p.methods === null || p.methods.some((m) => methods.includes(m))));
   const exact = bySoft.filter((p) => compatible.includes(p.composition));
   const rest = bySoft.filter((p) => !compatible.includes(p.composition));
   // 具体的な候補ほど先頭に: 送り状ソフト・配送方法が明示一致 (+2) > ワイルドカード

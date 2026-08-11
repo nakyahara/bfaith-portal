@@ -8,6 +8,7 @@
  *
  * 列は名前で引く (ロジザードの列追加・順序変更に耐える)。必須列が無ければ fail-closed。
  */
+import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 import { getDB, getBatchByTbNo, utcNow, jstToday } from './db.js';
 import { suggestPatterns } from './patterns.js';
@@ -49,11 +50,21 @@ export function parseCs03002(buffer) {
 
   const header = rows[0];
   const col = {};
-  header.forEach((name, i) => { if (!(name in col)) col[name] = i; });
+  const dupCols = new Set();
+  header.forEach((name, i) => {
+    if (name in col) dupCols.add(name);
+    else col[name] = i;
+  });
   const missing = REQUIRED_COLUMNS.filter((name) => !(name in col));
   if (missing.length > 0) {
     throw new PkError(400, 'missing_columns',
       `必須列がありません: ${missing.join(', ')}。CS03002 (ピッキングリストCSV) か確認してください`);
+  }
+  // 参照する列名が重複していたら、どちらを読むべきか判断できないため fail-closed (Codex R1 low)
+  const dupRequired = REQUIRED_COLUMNS.filter((name) => dupCols.has(name));
+  if (dupRequired.length > 0) {
+    throw new PkError(400, 'duplicate_columns',
+      `同名の列が複数あります: ${dupRequired.join(', ')}。CSVの形式が変わった可能性があります`);
   }
 
   const dataRows = rows.slice(1).filter((r) => !(r.length === 1 && r[0] === ''));
@@ -76,6 +87,10 @@ export function parseCs03002(buffer) {
     if (!get('ロケーション')) throw new PkError(400, 'no_location', `行${rowNo}: ロケーションが空です`);
     if (!get('商品ID')) throw new PkError(400, 'no_sku', `行${rowNo}: 商品IDが空です`);
     if (!get('出荷伝票NO')) throw new PkError(400, 'no_slip', `行${rowNo}: 出荷伝票NOが空です`);
+    // TBが空の行を黙って有効TBに混ぜると、別引当・壊れ行の数量を取り込んでしまう (Codex R1 high)
+    if (!get('トータルピッキングバッチ番号')) {
+      throw new PkError(400, 'no_tb_no', `行${rowNo}: トータルピッキングバッチ番号が空です`);
+    }
     slipLines.push({
       tbNo: get('トータルピッキングバッチ番号'),
       instructDate: get('出荷指示日'),
@@ -95,10 +110,7 @@ export function parseCs03002(buffer) {
 
   // 1ファイル = 1引当 = 1TB が前提。複数TBが混ざるケース (まとめ引当の実データ) は
   // 未採取のため fail-closed (要件§10)。採取できたら分割取込に対応する
-  const tbNos = [...new Set(slipLines.map((l) => l.tbNo).filter(Boolean))];
-  if (tbNos.length === 0) {
-    throw new PkError(400, 'no_tb_no', 'トータルピッキングバッチ番号が入っていません');
-  }
+  const tbNos = [...new Set(slipLines.map((l) => l.tbNo))];
   if (tbNos.length > 1) {
     throw new PkError(400, 'multiple_tb_no',
       `複数のトータルピッキングバッチ番号が含まれています (${tbNos.join(', ')})。1引当=1ファイルで出力してください`);
@@ -124,23 +136,26 @@ export function parseCs03002(buffer) {
     a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
 
   const composition = classifyComposition(slipLines);
-  const first = slipLines[0];
+  // 共通項目は先頭行決め打ちにせず distinct を取る (Codex R1 medium)。
+  // LINEギフトの引当は複数の配送方法・送り状ソフトが正当に混在するため、混在=エラーにはせず
+  // 全値を保持して表示・推定の両方に使う
+  const distinct = (key) => [...new Set(slipLines.map((l) => l[key]).filter(Boolean))];
+  const invoiceSofts = distinct('invoiceSoft');
+  const deliveryMethods = distinct('deliveryMethod');
+  const instructDates = distinct('instructDate');
   const preview = {
     tbNo: tbNos[0],
-    instructDate: formatDate8(first.instructDate),
-    invoiceSoft: first.invoiceSoft,
-    deliveryMethod: first.deliveryMethod,
+    instructDate: instructDates.map(formatDate8).join(' / '),
+    invoiceSoft: invoiceSofts.join(' / '),
+    deliveryMethod: deliveryMethods.join(' / '),
     composition,
     lines,
     slipLines,
     slipCount: new Set(slipLines.map((l) => l.slipNo)).size,
     totalQty: slipLines.reduce((s, l) => s + l.qty, 0),
+    csvSha256: crypto.createHash('sha256').update(buffer).digest('hex'),
   };
-  preview.suggestions = suggestPatterns({
-    invoiceSoft: preview.invoiceSoft,
-    deliveryMethod: preview.deliveryMethod,
-    composition,
-  });
+  preview.suggestions = suggestPatterns({ invoiceSofts, deliveryMethods, composition });
   return preview;
 }
 
@@ -191,9 +206,12 @@ export function formatLocation(block, location) {
  * @returns {{batchId, replaced}}
  */
 export function importBatch(preview, { hikiateClass, folderName, overwrite }, actor) {
-  if (!hikiateClass || !String(hikiateClass).trim()) {
-    throw new PkError(400, 'no_class', '引当分類を選択してください');
-  }
+  const cls = String(hikiateClass ?? '').trim();
+  const folder = String(folderName ?? '').trim() || null;
+  if (!cls) throw new PkError(400, 'no_class', '引当分類を選択してください');
+  // 管理者入力にも長さ上限を置く (Codex R1 low)。パターン名の最長は約60文字
+  if (cls.length > 100) throw new PkError(400, 'class_too_long', '引当分類が長すぎます (100文字まで)');
+  if (folder && folder.length > 50) throw new PkError(400, 'folder_too_long', 'フォルダ名が長すぎます (50文字まで)');
   const db = getDB();
   const now = utcNow();
   return db.transaction(() => {
@@ -201,6 +219,11 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
     let batchId;
     let replaced = false;
     if (existing) {
+      // 同一CSV・同一分類の再confirmは「応答が届かなかった再送」なので成功済み結果を返す
+      // (Codex R1 medium: TB番号だけでは再送と意図的な再取込を区別できない)
+      if (existing.csv_sha256 === preview.csvSha256 && existing.hikiate_class === cls) {
+        return { batchId: existing.id, replaced: false, replayed: true };
+      }
       if (existing.status !== 'ready') {
         throw new PkError(409, 'already_started',
           `バッチ ${preview.tbNo} は既に作業が始まっています (${existing.status})。取り込み直しはできません`);
@@ -214,11 +237,12 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
       db.prepare(`
         UPDATE pk_batches SET hikiate_class=?, folder_name=?, work_date=?, instruct_date=?,
           composition=?, delivery_method=?, invoice_soft=?,
-          line_count=?, slip_count=?, total_qty=?, imported_by=?, updated_at=?
+          line_count=?, slip_count=?, total_qty=?, csv_sha256=?, imported_by=?, updated_at=?
         WHERE id=?
-      `).run(String(hikiateClass).trim(), folderName || null, jstToday(), preview.instructDate,
+      `).run(cls, folder, jstToday(), preview.instructDate,
         preview.composition, preview.deliveryMethod, preview.invoiceSoft,
-        preview.lines.length, preview.slipCount, preview.totalQty, actor, now, existing.id);
+        preview.lines.length, preview.slipCount, preview.totalQty, preview.csvSha256,
+        actor, now, existing.id);
       batchId = existing.id;
       replaced = true;
     } else {
@@ -226,13 +250,28 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
         INSERT INTO pk_batches
           (tb_no, hikiate_class, folder_name, work_date, instruct_date, composition,
            delivery_method, invoice_soft, line_count, slip_count, total_qty,
-           status, imported_by, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?)
-      `).run(preview.tbNo, String(hikiateClass).trim(), folderName || null, jstToday(),
+           status, csv_sha256, imported_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?)
+      `).run(preview.tbNo, cls, folder, jstToday(),
         preview.instructDate, preview.composition, preview.deliveryMethod, preview.invoiceSoft,
-        preview.lines.length, preview.slipCount, preview.totalQty, actor, now, now);
+        preview.lines.length, preview.slipCount, preview.totalQty, preview.csvSha256,
+        actor, now, now);
       batchId = Number(info.lastInsertRowid);
     }
+
+    // 取込の監査ログ (追記型)。上書きは変更前の集計値も残す (Codex R1 medium)
+    db.prepare(`
+      INSERT INTO pk_import_logs
+        (batch_id, tb_no, action, csv_sha256, hikiate_class, line_count, slip_count, total_qty,
+         before_json, actor, at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(batchId, preview.tbNo, replaced ? 'overwrite' : 'create', preview.csvSha256, cls,
+      preview.lines.length, preview.slipCount, preview.totalQty,
+      replaced ? JSON.stringify({
+        hikiate_class: existing.hikiate_class, folder_name: existing.folder_name,
+        line_count: existing.line_count, slip_count: existing.slip_count,
+        total_qty: existing.total_qty, csv_sha256: existing.csv_sha256,
+      }) : null, actor, now);
 
     const insLine = db.prepare(`
       INSERT INTO pk_lines (batch_id, seq, location, block, sku, product_name, barcode, qty)

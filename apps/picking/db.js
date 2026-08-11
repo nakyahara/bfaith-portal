@@ -114,6 +114,7 @@ function createCoreTables() {
     finished_at     TEXT,
     paused_total_sec INTEGER NOT NULL DEFAULT 0,
     validity        TEXT NOT NULL DEFAULT 'valid' CHECK(validity IN ('valid','invalid')),
+    csv_sha256      TEXT NOT NULL,          -- 取込CSVのハッシュ (同一内容の再送判定・監査)
     imported_by     TEXT NOT NULL,          -- 取込者 email
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
@@ -165,6 +166,23 @@ function createCoreTables() {
     at       TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_pk_events_batch ON pk_events(batch_id, id)');
+
+  // 取込の監査ログ (追記型・削除不可)。上書き取込で「誰が何件から何件へ変えたか」を残す
+  db.exec(`CREATE TABLE IF NOT EXISTS pk_import_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id    INTEGER NOT NULL REFERENCES pk_batches(id),
+    tb_no       TEXT NOT NULL,
+    action      TEXT NOT NULL CHECK(action IN ('create','overwrite')),
+    csv_sha256  TEXT NOT NULL,
+    hikiate_class TEXT NOT NULL,
+    line_count  INTEGER NOT NULL,
+    slip_count  INTEGER NOT NULL,
+    total_qty   INTEGER NOT NULL,
+    before_json TEXT,               -- 上書き時: 変更前の集計値・分類・ハッシュ
+    actor       TEXT NOT NULL,
+    at          TEXT NOT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_pk_import_logs_batch ON pk_import_logs(batch_id, id)');
 
   // 楽天白抜き画像キャッシュ (PR3 で書き込み)。ne_code = NE商品コード (小文字正規化)
   db.exec(`CREATE TABLE IF NOT EXISTS pk_product_images (

@@ -180,37 +180,36 @@ t('formatLocation: 確定形式 P3FB-002-016-04', () => {
   assert.equal(formatLocation('P3FB', 'ABC'), 'P3FB-ABC');   // 8桁数値以外はそのまま
 });
 
+const NEKOPOS = { invoiceSofts: ['B2(Ver6.0)'], deliveryMethods: ['ネコポス 陸便 元払い 営業所止めなし'] };
+
 t('suggestPatterns: ネコポスB2単品は単品パターンが先頭', () => {
-  const s = suggestPatterns({
-    invoiceSoft: 'B2(Ver6.0)',
-    deliveryMethod: 'ネコポス 陸便 元払い 営業所止めなし',
-    composition: '単品',
-  });
+  const s = suggestPatterns({ ...NEKOPOS, composition: '単品' });
   assert.ok(s.length > 0);
   assert.ok(s[0].includes('単品'), `先頭が単品パターンのはず: ${s[0]}`);
   assert.ok(!s[0].includes('全て'), '単品専用が全て系より先');
 });
 
 t('suggestPatterns: 混在は全て系のみ適合候補', () => {
-  const s = suggestPatterns({
-    invoiceSoft: 'B2(Ver6.0)',
-    deliveryMethod: 'ネコポス 陸便 元払い 営業所止めなし',
-    composition: '混在',
-  });
+  const s = suggestPatterns({ ...NEKOPOS, composition: '混在' });
   assert.ok(s[0].includes('全て'), `先頭が全て系のはず: ${s[0]}`);
 });
 
 t('suggestPatterns: ワイルドカード (LINEギフト) は明示一致より後ろ', () => {
-  const s = suggestPatterns({
-    invoiceSoft: 'B2(Ver6.0)',
-    deliveryMethod: 'ネコポス 陸便 元払い 営業所止めなし',
-    composition: '混在',
-  });
+  const s = suggestPatterns({ ...NEKOPOS, composition: '混在' });
   assert.ok(!s[0].includes('LINEギフト'), `先頭がLINEギフトではないはず: ${s[0]}`);
 });
 
+t('suggestPatterns: 複数配送方法の混在 (LINEギフト型) でも候補が出る', () => {
+  const s = suggestPatterns({
+    invoiceSofts: ['B2(Ver6.0)', 'ゆうプリR'],
+    deliveryMethods: ['ネコポス 陸便 元払い 営業所止めなし', 'ゆうパケット 陸便 元払い 営業所止めなし'],
+    composition: '混在',
+  });
+  assert.ok(s.some((n) => n.includes('LINEギフト')));
+});
+
 t('suggestPatterns: 未知の配送方法でも空配列で落ちない', () => {
-  const s = suggestPatterns({ invoiceSoft: 'X', deliveryMethod: 'Y', composition: '単品' });
+  const s = suggestPatterns({ invoiceSofts: ['X'], deliveryMethods: ['Y'], composition: '単品' });
   // LINEギフト (soft/methods 不問) だけは常に候補に残る
   assert.ok(Array.isArray(s));
 });
@@ -237,18 +236,30 @@ t('importBatch: 新規作成 → 明細とseqが保存される', () => {
   assert.equal(batches[0].composition, '1SKU複数個');   // qty3 と qty2 の2伝票 = どちらも1SKU複数個
 });
 
-t('importBatch: 同一TBの再取込は duplicate、overwrite=true で入れ替え', () => {
+t('importBatch: 同一CSV+同一分類の再confirmは再送として成功 (replayed)', () => {
+  const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_REPLAY' })]);
+  const p = parseCs03002(csv);
+  const r1 = importBatch(p, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz');
+  const r2 = importBatch(p, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz');
+  assert.equal(r2.replayed, true);
+  assert.equal(r2.batchId, r1.batchId);
+  assert.equal(listLines(r1.batchId).length, 1, '再送で明細が二重にならない');
+});
+
+t('importBatch: 内容が異なる再取込は duplicate、overwrite=true で入れ替え', () => {
   const csv1 = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_DUP' })]);
   const p1 = parseCs03002(csv1);
   const { batchId } = importBatch(p1, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz');
 
-  expectPkError(() => importBatch(p1, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz'), 'duplicate');
+  // 同一CSVでも分類が違えば再送ではない → duplicate
+  expectPkError(() => importBatch(p1, { hikiateClass: 'ネコポス手動1SKU複数個' }, 'test@b-faith.biz'), 'duplicate');
 
   const csv2 = makeCsv([
     row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_DUP' }),
     row({ loc: '00201703', sku: 'b', qty: 2, slip: '0002', tb: 'TB_DUP' }),
   ]);
   const p2 = parseCs03002(csv2);
+  expectPkError(() => importBatch(p2, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz'), 'duplicate');
   const r2 = importBatch(p2, { hikiateClass: 'ネコポス手動1SKU複数個', overwrite: true }, 'test@b-faith.biz');
   assert.equal(r2.replaced, true);
   assert.equal(r2.batchId, batchId, 'バッチIDは維持される');
@@ -256,21 +267,67 @@ t('importBatch: 同一TBの再取込は duplicate、overwrite=true で入れ替�
   const b = getDB().prepare('SELECT * FROM pk_batches WHERE id=?').get(batchId);
   assert.equal(b.hikiate_class, 'ネコポス手動1SKU複数個');
   assert.equal(b.total_qty, 3);
+  // 監査ログ: create + overwrite が追記され、before に変更前の集計が残る
+  const logs = getDB().prepare('SELECT * FROM pk_import_logs WHERE batch_id=? ORDER BY id').all(batchId);
+  assert.deepEqual(logs.map((l) => l.action), ['create', 'overwrite']);
+  const before = JSON.parse(logs[1].before_json);
+  assert.equal(before.line_count, 1);
+  assert.equal(before.hikiate_class, 'ネコポス手動単品');
 });
 
-t('importBatch: 作業開始後は overwrite でも already_started', () => {
+t('importBatch: 作業開始後の別内容は already_started (同一内容の再送は成功)', () => {
   const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_STARTED' })]);
   const p = parseCs03002(csv);
   const { batchId } = importBatch(p, { hikiateClass: 'ネコポス手動単品' }, 'test@b-faith.biz');
   getDB().prepare("UPDATE pk_batches SET status='picking' WHERE id=?").run(batchId);
-  expectPkError(() => importBatch(p, { hikiateClass: 'ネコポス手動単品', overwrite: true }, 'test@b-faith.biz'),
+  // 同一CSV+同一分類 = 応答喪失の再送 → 開始後でも成功済み結果を返す (明細は触らない)
+  const r = importBatch(p, { hikiateClass: 'ネコポス手動単品', overwrite: true }, 'test@b-faith.biz');
+  assert.equal(r.replayed, true);
+  // 内容が違えば開始後は overwrite でも不可
+  const csv2 = makeCsv([
+    row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_STARTED' }),
+    row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002', tb: 'TB_STARTED' }),
+  ]);
+  expectPkError(() => importBatch(parseCs03002(csv2), { hikiateClass: 'ネコポス手動単品', overwrite: true }, 'test@b-faith.biz'),
     'already_started');
 });
 
-t('importBatch: 引当分類が空なら no_class', () => {
+t('importBatch: 引当分類が空なら no_class・長すぎる入力は拒否', () => {
   const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_NOCLASS' })]);
   const p = parseCs03002(csv);
   expectPkError(() => importBatch(p, { hikiateClass: '  ' }, 'test@b-faith.biz'), 'no_class');
+  expectPkError(() => importBatch(p, { hikiateClass: 'x'.repeat(101) }, 'test@b-faith.biz'), 'class_too_long');
+  expectPkError(() => importBatch(p, { hikiateClass: 'ネコポス手動単品', folderName: 'y'.repeat(51) }, 'test@b-faith.biz'), 'folder_too_long');
+});
+
+t('TBが空の行があれば行番号つきで no_tb_no', () => {
+  const csv = makeCsv([
+    row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB001' }),
+    row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002', tb: '' }),
+  ]);
+  try {
+    parseCs03002(csv);
+    assert.fail('no_tb_no のはず');
+  } catch (e) {
+    assert.equal(e.code, 'no_tb_no');
+    assert.ok(e.message.includes('行3'), `行番号が入るはず: ${e.message}`);
+  }
+});
+
+t('必須列名が重複していたら duplicate_columns', () => {
+  const headers = [...HEADERS, 'ロケーション'];
+  const csv = makeCsv([{ ...row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001' }) }], { headers });
+  expectPkError(() => parseCs03002(csv), 'duplicate_columns');
+});
+
+t('配送方法が混在するCSVは distinct を保持して表示・推定に使う', () => {
+  const r1 = row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001' });
+  const r2 = row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002' });
+  r2['送り状発行ソフト名'] = 'ゆうプリR';
+  r2['配送方法名'] = 'ゆうパケット 陸便 元払い 営業所止めなし';
+  const p = parseCs03002(makeCsv([r1, r2]));
+  assert.ok(p.deliveryMethod.includes(' / '), `混在が表示に残るはず: ${p.deliveryMethod}`);
+  assert.ok(p.suggestions.some((n) => n.includes('LINEギフト')), 'ソフト混在=LINEギフトが候補に出る');
 });
 
 t('listBatches: 前日以前の未完了は持ち越し表示、完了は当日のみ', () => {
@@ -278,8 +335,8 @@ t('listBatches: 前日以前の未完了は持ち越し表示、完了は当日�
   const mk = (tb, workDate, status) => {
     db.prepare(`INSERT INTO pk_batches
       (tb_no, hikiate_class, work_date, composition, line_count, slip_count, total_qty,
-       status, imported_by, created_at, updated_at)
-      VALUES (?, 'テスト', ?, '単品', 1, 1, 1, ?, 't@b', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z')
+       status, csv_sha256, imported_by, created_at, updated_at)
+      VALUES (?, 'テスト', ?, '単品', 1, 1, 1, ?, 'x', 't@b', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z')
     `).run(tb, workDate, status);
   };
   mk('TB_Y1', '2000-01-01', 'ready');   // 持ち越し

@@ -138,7 +138,7 @@ router.post('/admin/import', requireAdmin, (req, res, next) => {
   }
   const result = importBatch(preview, {
     hikiateClass: req.body.hikiate_class,
-    folderName: String(req.body.folder_name || '').trim() || null,
+    folderName: req.body.folder_name,
     overwrite: String(req.body.overwrite) === '1',
   }, req.session.email);
   res.json({ ok: true, mode: 'confirm', ...summary, ...result });
