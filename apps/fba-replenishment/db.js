@@ -2807,10 +2807,12 @@ export function savePickingRun(rec) {
 }
 
 export function getPickingRuns(limit = 30) {
-  // has_label_v2: v2ラベルCSV (10列) を持つ実行か (v2対応前の履歴にDLリンクを出さないため)
+  // has_label_v2 / has_label_legacy: 各形式のラベルCSVを持つ実行か (無い形式のDLリンクを出さないため。
+  // 旧5列は2026-08-11に廃止 → 以後の実行は v2 のみ持つ)
   return queryAll(
     `SELECT id, run_at, run_by, plan_files, lz_filename, picking_count, label_count, plan_sheet_count, warning_count, delivery_date,
-            CASE WHEN result LIKE '%"labelCsvRowsV2"%' THEN 1 ELSE 0 END AS has_label_v2
+            CASE WHEN result LIKE '%"labelCsvRowsV2"%' THEN 1 ELSE 0 END AS has_label_v2,
+            CASE WHEN result LIKE '%"labelCsvRows"%' THEN 1 ELSE 0 END AS has_label_legacy
      FROM picking_run_history ORDER BY id DESC LIMIT ?`,
     [limit]
   );

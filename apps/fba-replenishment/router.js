@@ -1484,10 +1484,9 @@ const MAX_PLAN_ROWS = 20000;
 
 // 生成したラベルCSVを固定名で上書き保存する共有ドライブのフォルダ (GAS PL_FBA_NOUHIN_* 相当)。
 const FBA_NOUHIN_DRIVE_FOLDER_ID = process.env.FBA_NOUHIN_DRIVE_FOLDER_ID || '17SRNd4yOEX3Mr8aCEgkyXgOz5cvBcwK7';
+// 固定名にはロケ/数量/残数/期限入りの10列シールCSVを保存する
+// (P-touch新テンプレート実機検証済み・2026-08-11に旧5列から一本化。中原さん承認)。
 const FBA_NOUHIN_CSV_NAME = 'fbanouhinbangoulist.csv';
-// v2: ロケ/数量/残数/期限入りの10列シールCSV。P-touch新テンプレート移行が済むまで
-// 旧5列(上記固定名)と並行保存する (移行完了後に固定名を切替予定)。
-const FBA_NOUHIN_CSV_V2_NAME = 'fbanouhinbangoulist_v2.csv';
 
 // multer のエラー (サイズ超過/ファイル数超過) を JSON で返すラッパー (Codex #3)。
 function runUpload(mw) {
@@ -1677,8 +1676,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     }
     const mergedRows = recon.rows;
 
-    // P-touch ラベル行 — 旧5列 (現行テンプレート用) + v2 10列 (ロケ/数量/残数/期限入り)
-    const { csvRows: labelCsvRows, warnings: labelWarn } = pp.buildLabelRows(pickingRows, barcodeMap);
+    // P-touch ラベル行 (10列: ロケ/数量/残数/期限入り。旧5列は2026-08-11に廃止)
     const v2 = pp.buildLabelRowsV2(mergedRows, barcodeMap);
     // 期限は空欄なら警告継続だが、非空の不正値は元データ破損の可能性があるため 422 (Codex R2)
     if (v2.expiryErrors.length) {
@@ -1718,13 +1716,13 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       ? [`プランにあるが倉庫ピッキングリストに無い商品コード: ${notInPicking.length}件 (${notInPicking.slice(0, 10).map(x => x.code).join(', ')}${notInPicking.length > 10 ? ' …' : ''})`]
       : [];
 
-    const warnings = [...convWarn, ...pickWarn, ...labelWarn, ...v2.warnings, ...notInPickingWarn];
+    const warnings = [...convWarn, ...pickWarn, ...v2.warnings, ...notInPickingWarn];
     const summary = {
       planFiles: planFileMeta,
       planItemCount: allPlanItems.length,
       pickingRowCount: pickingRows.length,
       pickingMatchedCount: matchedRowCount,
-      labelRowCount: labelCsvRows.length - 1,
+      labelRowCount: v2.csvRows.length - 1,
       labelV2RowCount: v2.csvRows.length - 1,
       planlessCount: v2.planlessCount,
       unallocatedCount: v2.unallocatedCount,
@@ -1732,7 +1730,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       codeNotInPickingCount: notInPicking.length,
       mappingSource: getSkuMappingSourceMode(),
     };
-    const result = { pickingRows: mergedRows, planSheets, labelCsvRows, labelCsvRowsV2: v2.csvRows, notInPicking };
+    const result = { pickingRows: mergedRows, planSheets, labelCsvRowsV2: v2.csvRows, notInPicking };
 
     // ---- ここから永続化。全検証 (抽出/突合/数量/期限/注番) が成功した後にのみ実行する ----
     // (422 時に履歴・Drive・PDF・Notion を一切更新しないため。Codex R1 #1)
@@ -1770,24 +1768,18 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       });
     }
 
-    // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。ここは外部保存のため
-    // best-effort: 失敗しても処理は成功扱いで履歴は残す。
-    // 混在防止: 現場が使う v2 を先に保存し、v2 が失敗したら旧5列の上書きもスキップする
-    // (「旧=今回分 / v2=前回分」という取り違えを固定名上に作らない)。
-    const saveDrive = async (rows, filename) => {
-      try {
-        const buf = buildShiftJisCsv(rows, { guardFormula: false });
-        const up = await uploadCsvToDrive(buf, filename, FBA_NOUHIN_DRIVE_FOLDER_ID);
-        return { attempted: true, saved: true, action: up.action, filename };
-      } catch (e) {
-        console.error(`[Picking] 共有ドライブへのCSV保存失敗 (${filename}):`, e);
-        return { attempted: true, saved: false, filename, error: e.message };
-      }
-    };
-    const driveSaveV2 = await saveDrive(v2.csvRows, FBA_NOUHIN_CSV_V2_NAME);
-    const driveSave = driveSaveV2.saved
-      ? await saveDrive(labelCsvRows, FBA_NOUHIN_CSV_NAME)
-      : { attempted: false, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: 'v2の保存に失敗したため、混在防止で旧CSVの上書きを見送りました' };
+    // ラベルCSV(P-touch, 10列)を固定名で共有ドライブに上書き保存 (GAS同等)。ここは外部保存のため
+    // best-effort: 失敗しても処理は成功扱いで履歴は残す。UIメッセージで保存可否を伝える。
+    // ※ 移行期の並行保存ファイル fbanouhinbangoulist_v2.csv は更新を停止済み (Drive上の残骸は削除してよい)。
+    let driveSave;
+    try {
+      const buf = buildShiftJisCsv(v2.csvRows, { guardFormula: false });
+      const up = await uploadCsvToDrive(buf, FBA_NOUHIN_CSV_NAME, FBA_NOUHIN_DRIVE_FOLDER_ID);
+      driveSave = { attempted: true, saved: true, action: up.action, filename: FBA_NOUHIN_CSV_NAME };
+    } catch (e) {
+      console.error(`[Picking] 共有ドライブへのCSV保存失敗 (${FBA_NOUHIN_CSV_NAME}):`, e);
+      driveSave = { attempted: true, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: e.message };
+    }
 
     // 納品予定日(必須)で Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
     let notion = { attempted: false };
@@ -1818,7 +1810,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    res.json({ success: true, runId, summary, warnings, driveSave, driveSaveV2, annotate, notion, ...result });
+    res.json({ success: true, runId, summary, warnings, driveSave, annotate, notion, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });
@@ -1850,14 +1842,16 @@ router.get('/api/picking-prep/run/:id', (req, res) => {
   });
 });
 
-// ラベルCSV ダウンロード (保存済み結果から Shift_JIS で再生成)
+// 旧5列ラベルCSV ダウンロード (2026-08-11に10列へ一本化。旧5列を保存している過去実行のみ)
 router.get('/api/picking-prep/run/:id/label-csv', (req, res) => {
   const rec = getPickingRun(parseInt(req.params.id));
   if (!rec) return res.status(404).json({ error: '履歴が見つかりません' });
   const result = safeJsonParse(rec.result, {});
-  const rows = result.labelCsvRows || [['商品ID', '納品プランNo', '商品名', 'バーコード', '土台商品']];
+  if (!Array.isArray(result.labelCsvRows) || result.labelCsvRows.length === 0) {
+    return res.status(404).json({ error: '旧5列CSVはこの実行にはありません (10列版は label-csv-v2 から)' });
+  }
   // P-touch ラベル CSV: 式インジェクションガードは付けない (P-touch は式評価せず、' 前置は印字を壊す)
-  const buf = buildShiftJisCsv(rows, { guardFormula: false });
+  const buf = buildShiftJisCsv(result.labelCsvRows, { guardFormula: false });
   res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
   res.setHeader('Content-Disposition', `attachment; filename="fbanouhinbangoulist_${rec.id}.csv"`);
   res.send(buf);
