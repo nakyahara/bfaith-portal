@@ -316,11 +316,19 @@ export function getWorkState(batchId) {
     ...l, locationLabel: formatLocation(l.block, l.location),
   }));
   const pending = lines.filter((l) => l.status === 'pending');
+  // 明細ごとの「最後に完了させた next の op_id」。back の取り消し対象指定 (CAS) に使う
+  const lastNextOps = {};
+  for (const e of getDB().prepare(
+    "SELECT line_seq, op_id FROM pk_events WHERE batch_id=? AND event='next' ORDER BY id"
+  ).all(batchId)) {
+    lastNextOps[e.line_seq] = e.op_id;
+  }
   return {
     batch,
     lines,
     currentSeq: pending.length > 0 ? pending[0].seq : null,
     doneCount: lines.length - pending.length,
+    lastNextOps,
   };
 }
 
@@ -340,7 +348,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) {
+export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PkError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -353,8 +361,10 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
     // 冪等: 同一 op_id は同一内容の再送のみ成功扱い
     const prev = db.prepare('SELECT * FROM pk_events WHERE op_id = ?').get(opId);
     if (prev) {
+      const prevPayload = prev.payload_json ? JSON.parse(prev.payload_json) : {};
       if (prev.batch_id === batchId && prev.worker === worker
-          && prev.event === event && (prev.line_seq ?? null) === (lineSeq ?? null)) {
+          && prev.event === event && (prev.line_seq ?? null) === (lineSeq ?? null)
+          && (prevPayload.undoOpId ?? null) === (undoOpId ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
       throw new PkError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
@@ -440,6 +450,16 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
         if (lastDone !== lineSeq) {
           throw new PkError(409, 'out_of_order', `戻れるのは直前の明細 (${lastDone}) だけです`);
         }
+        // CAS: 「どの完了を取り消すか」を undo_op_id で特定する (Codex PR2-R2 high)。
+        // これが無いと、同一作業者の別端末に残っていた古い back が、再完了後に到着して
+        // 新しい完了まで取り消してしまう
+        const lastNextOp = db.prepare(
+          "SELECT op_id FROM pk_events WHERE batch_id=? AND event='next' AND line_seq=? ORDER BY id DESC LIMIT 1"
+        ).get(batchId, lineSeq)?.op_id ?? null;
+        if (!undoOpId || undoOpId !== lastNextOp) {
+          throw new PkError(409, 'stale_back',
+            '取り消し対象の完了が見つからないか、別の操作で上書きされています');
+        }
         // shown_at は now に更新 (この瞬間から再表示。再作業時間に前の明細の時間を混ぜない)
         db.prepare("UPDATE pk_lines SET status='pending', done_at=NULL, shown_at=? WHERE batch_id=? AND seq=?")
           .run(now, batchId, lineSeq);
@@ -456,7 +476,8 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
       INSERT INTO pk_events (op_id, batch_id, worker, event, line_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(opId, batchId, worker, event, lineSeq ?? null,
-      clientAt ? JSON.stringify({ clientAt }) : null, JSON.stringify(result), now);
+      (clientAt || undoOpId) ? JSON.stringify({ clientAt, undoOpId }) : null,
+      JSON.stringify(result), now);
     return result;
   })();
 }

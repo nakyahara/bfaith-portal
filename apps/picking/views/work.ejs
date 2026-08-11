@@ -147,6 +147,8 @@
       qty: l.qty, status: l.status, img: null,
     }))).replace(/</g, '\\u003c') %>;
     const ME = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
+    // 明細ごとの「最後に完了させた next の op_id」(backの取り消し対象指定に使う)
+    const NEXTOPS = <%- JSON.stringify(state.lastNextOps || {}).replace(/</g, '\\u003c') %>;
 
     const $ = (id) => document.getElementById(id);
     const QKEY = `pk_queue_${BATCH.id}`;
@@ -157,7 +159,7 @@
     for (const op of queue) {
       const line = LINES.find((l) => l.seq === op.line_seq);
       if (!line) continue;
-      if (op.event === 'next') line.status = 'done';
+      if (op.event === 'next') { line.status = 'done'; NEXTOPS[op.line_seq] = op.op_id; }
       if (op.event === 'back') line.status = 'pending';
     }
     let started = BATCH.status === 'picking' || queue.some((op) => op.event === 'start');
@@ -214,8 +216,13 @@
     // ── 操作 → ローカル即時反映 + キュー投入 (通信を待たない: 要件§6 <200ms) ──
     function opId() { return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`; }
 
-    function enqueue(event, lineSeq) {
-      queue.push({ op_id: opId(), event, line_seq: lineSeq ?? null, client_at: new Date().toISOString() });
+    function enqueue(event, lineSeq, undoOpId) {
+      const op = {
+        op_id: opId(), event, line_seq: lineSeq ?? null,
+        undo_op_id: undoOpId ?? null, client_at: new Date().toISOString(),
+      };
+      if (event === 'next') NEXTOPS[lineSeq] = op.op_id;
+      queue.push(op);
       localStorage.setItem(QKEY, JSON.stringify(queue));
       flush();
     }
@@ -241,7 +248,7 @@
       const last = doneLines[doneLines.length - 1];
       last.status = 'pending';
       if (BATCH.status === 'done') BATCH.status = 'picking';   // 完了直後の取り消し (サーバーも同挙動)
-      enqueue('back', last.seq);
+      enqueue('back', last.seq, NEXTOPS[last.seq] || null);
       render();
     }
     $('backBtn').addEventListener('click', doBack);

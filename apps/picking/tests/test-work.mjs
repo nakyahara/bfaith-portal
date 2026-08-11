@@ -129,9 +129,10 @@ t('back: 直前の完了明細だけ戻せる (done_atは消えstatusはpending�
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);
   applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
-  applyEvent(id, { opId: op(), event: 'next', lineSeq: 2 }, W1);
+  const nextOp2 = op();
+  applyEvent(id, { opId: nextOp2, event: 'next', lineSeq: 2 }, W1);
   expectPkError(() => applyEvent(id, { opId: op(), event: 'back', lineSeq: 1 }, W1), 'out_of_order');
-  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 2 }, W1);
+  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 2, undoOpId: nextOp2 }, W1);
   assert.equal(r.currentSeq, 2);
   assert.equal(r.doneCount, 1);
   const s = getWorkState(id);
@@ -143,9 +144,10 @@ t('back: 直前の完了明細だけ戻せる (done_atは消えstatusはpending�
 t('back: 完了直後 (batch=done) の取り消しでバッチがpickingに戻る', () => {
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);
-  for (const seq of [1, 2, 3]) applyEvent(id, { opId: op(), event: 'next', lineSeq: seq }, W1);
+  let lastOp;
+  for (const seq of [1, 2, 3]) applyEvent(id, { opId: (lastOp = op()), event: 'next', lineSeq: seq }, W1);
   assert.equal(getWorkState(id).batch.status, 'done');
-  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 3 }, W1);
+  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 3, undoOpId: lastOp }, W1);
   assert.equal(r.batchStatus, 'picking');
   assert.equal(r.currentSeq, 3);
   const s = getWorkState(id);
@@ -158,10 +160,11 @@ t('back: 完了直後 (batch=done) の取り消しでバッチがpickingに戻�
 t('next/back で shown_at は「直近に表示された時刻」に更新される', () => {
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);
-  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  const nextOp1 = op();
+  applyEvent(id, { opId: nextOp1, event: 'next', lineSeq: 1 }, W1);
   const shown2a = getWorkState(id).lines[1].shown_at;
   assert.ok(shown2a, '明細2に表示時刻');
-  applyEvent(id, { opId: op(), event: 'back', lineSeq: 1 }, W1);
+  applyEvent(id, { opId: op(), event: 'back', lineSeq: 1, undoOpId: nextOp1 }, W1);
   const line1 = getWorkState(id).lines[0];
   assert.ok(line1.shown_at, 'backした明細1に再表示時刻が入る');
   assert.equal(line1.done_at, null);
@@ -171,6 +174,24 @@ t('back: 完了していない明細へは not_done', () => {
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);
   expectPkError(() => applyEvent(id, { opId: op(), event: 'back', lineSeq: 1 }, W1), 'not_done');
+});
+
+t('back: undo_op_id 無し/古い完了を指す back は stale_back (別端末の遅延back対策)', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  const firstNext = op();
+  applyEvent(id, { opId: firstNext, event: 'next', lineSeq: 1 }, W1);
+  // undo_op_id 無しは拒否
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'back', lineSeq: 1 }, W1), 'stale_back');
+  // 端末Aが back→next で再完了
+  applyEvent(id, { opId: op(), event: 'back', lineSeq: 1, undoOpId: firstNext }, W1);
+  const secondNext = op();
+  applyEvent(id, { opId: secondNext, event: 'next', lineSeq: 1 }, W1);
+  // 端末Bに残っていた「最初の完了への back」が遅れて到着 → 新しい完了は取り消さない
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'back', lineSeq: 1, undoOpId: firstNext }, W1), 'stale_back');
+  // 正しい対象なら戻せる
+  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 1, undoOpId: secondNext }, W1);
+  assert.equal(r.currentSeq, 1);
 });
 
 t('op_conflict: 同一op_idを別内容で使い回すと409', () => {

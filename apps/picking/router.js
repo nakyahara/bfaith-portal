@@ -138,6 +138,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     event: req.body.event,
     lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
     clientAt: req.body.client_at,
+    undoOpId: req.body.undo_op_id || null,
   }, req.session.email);
   res.json({ ok: true, ...result });
 }));
