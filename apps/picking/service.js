@@ -10,7 +10,7 @@
  */
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
-import { getDB, getBatchByTbNo, utcNow, jstToday } from './db.js';
+import { getDB, getBatch, getBatchByTbNo, listLines, utcNow, jstToday } from './db.js';
 import { suggestPatterns } from './patterns.js';
 
 /** 業務エラー。router が status + message に変換する。 */
@@ -292,5 +292,159 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
       insSlip.run(batchId, l.slipNo, l.pickingNo || null, l.neSlipNo || null, l.sku, l.qty, l.location);
     }
     return { batchId, replaced };
+  })();
+}
+
+// ═══ 作業イベント (PR2) ═══════════════════════════════════════════════
+//
+// スマホ作業画面からの全操作はイベントとして POST され、ここで適用する。
+//   - 冪等: op_id (端末生成 ms+乱数)。同一 op_id + 同一内容の再送は保存済み結果を返す。
+//     内容が違う op_id の使い回しは 409 (sw_operations と同思想)
+//   - 順序: 端末側がキューを直列で送る前提。サーバーは現在状態と矛盾する適用を拒否する
+//   - 時刻: サーバー時刻を正とする (db.js の方針)。端末の発生時刻は payload に保持し分析用
+//
+// イベント種別 (PR2): start / next / back / complete は next の最終行で自動。
+// shortage / pause / resume / cancel は PR4 で追加する。
+
+const WORK_EVENTS = ['start', 'next', 'back'];
+
+/** 作業画面の現在状態。currentSeq = 次にピックする明細 (null = 全て完了)。 */
+export function getWorkState(batchId) {
+  const batch = getBatch(batchId);
+  if (!batch) throw new PkError(404, 'not_found', 'バッチが見つかりません');
+  const lines = listLines(batchId).map((l) => ({
+    ...l, locationLabel: formatLocation(l.block, l.location),
+  }));
+  const pending = lines.filter((l) => l.status === 'pending');
+  return {
+    batch,
+    lines,
+    currentSeq: pending.length > 0 ? pending[0].seq : null,
+    doneCount: lines.length - pending.length,
+  };
+}
+
+function eventResult(batchId) {
+  const s = getWorkState(batchId);
+  return {
+    batchStatus: s.batch.status,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    lineCount: s.lines.length,
+    startedAt: s.batch.started_at,
+    finishedAt: s.batch.finished_at,
+  };
+}
+
+/**
+ * 作業イベントの適用。1イベント = 1トランザクション。
+ * @returns {{replayed?: boolean, ...eventResult}}
+ */
+export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) {
+  if (!opId || typeof opId !== 'string' || opId.length > 64) {
+    throw new PkError(400, 'bad_op_id', 'op_id が不正です');
+  }
+  if (!WORK_EVENTS.includes(event)) {
+    throw new PkError(400, 'bad_event', `不明なイベントです: ${event}`);
+  }
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    // 冪等: 同一 op_id は同一内容の再送のみ成功扱い
+    const prev = db.prepare('SELECT * FROM pk_events WHERE op_id = ?').get(opId);
+    if (prev) {
+      if (prev.batch_id === batchId && prev.worker === worker
+          && prev.event === event && (prev.line_seq ?? null) === (lineSeq ?? null)) {
+        return { replayed: true, ...JSON.parse(prev.result_json) };
+      }
+      throw new PkError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
+    }
+
+    const batch = getBatch(batchId);
+    if (!batch) throw new PkError(404, 'not_found', 'バッチが見つかりません');
+    if (batch.validity !== 'valid' || batch.status === 'cancelled') {
+      throw new PkError(409, 'batch_invalid', 'このバッチは取消されています');
+    }
+
+    if (event === 'start') {
+      if (batch.status === 'picking') {
+        if (batch.worker !== worker) {
+          throw new PkError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+        }
+        // 同一作業者の再開 (リロード・端末復帰)。状態はそのまま返す
+      } else if (batch.status === 'done') {
+        throw new PkError(409, 'already_done', 'このバッチは完了済みです');
+      } else {
+        // ready → picking
+        const res = db.prepare(`
+          UPDATE pk_batches SET status='picking', worker=?, started_at=COALESCE(started_at, ?), updated_at=?
+          WHERE id=? AND status='ready'
+        `).run(worker, now, now, batchId);
+        if (res.changes === 0) throw new PkError(409, 'not_startable', `状態 ${batch.status} からは開始できません`);
+      }
+      // 先頭の未完了明細に表示時刻を刻む (初回のみ)
+      db.prepare(`
+        UPDATE pk_lines SET shown_at = COALESCE(shown_at, ?)
+        WHERE batch_id = ? AND seq = (SELECT MIN(seq) FROM pk_lines WHERE batch_id = ? AND status = 'pending')
+      `).run(now, batchId, batchId);
+    } else {
+      // next / back は自分が picking 中のバッチにのみ適用できる
+      if (batch.status !== 'picking') {
+        throw new PkError(409, 'not_picking', `バッチが作業中ではありません (${batch.status})`);
+      }
+      if (batch.worker !== worker) {
+        throw new PkError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+      }
+      if (!Number.isInteger(lineSeq) || lineSeq < 1) {
+        throw new PkError(400, 'bad_line_seq', 'line_seq が不正です');
+      }
+      const line = db.prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=?').get(batchId, lineSeq);
+      if (!line) throw new PkError(404, 'line_not_found', `明細 ${lineSeq} がありません`);
+
+      if (event === 'next') {
+        // 表示中の明細 (= 最小の pending) 以外への next は、キュー順序が壊れている兆候なので拒否
+        const cur = db.prepare(
+          "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
+        ).get(batchId).s;
+        if (cur !== lineSeq) {
+          throw new PkError(409, 'out_of_order', `明細 ${lineSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
+        }
+        db.prepare("UPDATE pk_lines SET status='done', done_at=? WHERE batch_id=? AND seq=?")
+          .run(now, batchId, lineSeq);
+        const nextSeq = db.prepare(
+          "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
+        ).get(batchId).s;
+        if (nextSeq != null) {
+          db.prepare('UPDATE pk_lines SET shown_at = COALESCE(shown_at, ?) WHERE batch_id=? AND seq=?')
+            .run(now, batchId, nextSeq);
+        } else {
+          // 最終明細の完了 = バッチ完了
+          db.prepare("UPDATE pk_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
+            .run(now, now, batchId);
+        }
+      } else if (event === 'back') {
+        // 直前に完了した明細を取り消して戻る。done_at は消すが shown_at は初回表示として残す
+        if (line.status !== 'done') {
+          throw new PkError(409, 'not_done', `明細 ${lineSeq} は完了していないため戻れません`);
+        }
+        // 戻れるのは「完了済みの中で最大の seq」だけ (途中の明細に飛び戻ると順序が壊れる)
+        const lastDone = db.prepare(
+          "SELECT MAX(seq) s FROM pk_lines WHERE batch_id=? AND status='done'"
+        ).get(batchId).s;
+        if (lastDone !== lineSeq) {
+          throw new PkError(409, 'out_of_order', `戻れるのは直前の明細 (${lastDone}) だけです`);
+        }
+        db.prepare("UPDATE pk_lines SET status='pending', done_at=NULL WHERE batch_id=? AND seq=?")
+          .run(batchId, lineSeq);
+      }
+    }
+
+    const result = eventResult(batchId);
+    db.prepare(`
+      INSERT INTO pk_events (op_id, batch_id, worker, event, line_seq, payload_json, result_json, at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(opId, batchId, worker, event, lineSeq ?? null,
+      clientAt ? JSON.stringify({ clientAt }) : null, JSON.stringify(result), now);
+    return result;
   })();
 }

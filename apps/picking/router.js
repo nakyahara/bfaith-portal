@@ -18,7 +18,9 @@ import multer from 'multer';
 import {
   initPickingDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
 } from './db.js';
-import { parseCs03002, importBatch, formatLocation, PkError } from './service.js';
+import {
+  parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
+} from './service.js';
 import { allPatternNames } from './patterns.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -90,6 +92,64 @@ router.get('/batches/:id(\\d+)', (req, res) => {
     batch,
     lines,
     statusLabels: STATUS_LABELS,
+  });
+});
+
+// ─── 作業画面 (PWA・スマホ前提。全員) ───
+router.get('/work/:id(\\d+)', (req, res) => {
+  let state;
+  try {
+    state = getWorkState(Number(req.params.id));
+  } catch (e) {
+    if (e instanceof PkError) return res.status(e.status).send(e.message);
+    throw e;
+  }
+  res.render(path.join(__dirname, 'views/work'), {
+    title: `ピッキング | ${state.batch.hikiate_class}`,
+    worker: req.session.email,
+    displayName: req.session.displayName,
+    state,
+  });
+});
+
+/**
+ * 作業イベントAPI。body: { op_id, event: start|next|back, line_seq?, client_at? }。
+ * 端末はオフラインキューから直列で送る。op_id 冪等なので再送は安全。
+ */
+router.post('/api/batches/:id(\\d+)/events', api(async (req, res) => {
+  const result = applyEvent(Number(req.params.id), {
+    opId: req.body.op_id,
+    event: req.body.event,
+    lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
+    clientAt: req.body.client_at,
+  }, req.session.email);
+  res.json({ ok: true, ...result });
+}));
+
+/** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
+router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
+  const s = getWorkState(Number(req.params.id));
+  res.json({
+    ok: true,
+    batchStatus: s.batch.status,
+    worker: s.batch.worker,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    lineCount: s.lines.length,
+  });
+}));
+
+// PWA manifest (ホーム画面追加用)。アイコンは portal 共通の favicon を流用
+router.get('/manifest.json', (req, res) => {
+  res.json({
+    name: 'ピッキング支援',
+    short_name: 'ピッキング',
+    start_url: '/apps/picking/',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#111418',
+    theme_color: '#111418',
+    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
   });
 });
 
