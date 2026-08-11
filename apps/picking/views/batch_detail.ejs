@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px; }
+    .pk-head { background: #f8f9fa; border-radius: 8px; padding: 12px 16px; margin-bottom: 14px;
+      display: flex; flex-wrap: wrap; gap: 6px 24px; font-size: 0.92em; }
+    .pk-head b { font-size: 1.05em; }
+    table.pk-lines { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+    table.pk-lines th, table.pk-lines td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    table.pk-lines th { background: #f1f3f5; }
+    table.pk-lines td.num { text-align: right; }
+    td.loc { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }
+    tr.done td { color: #adb5bd; }
+    tr.shortage td { background: #fff5f5; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📱 バッチ明細</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/" class="btn-logout">← 一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-head">
+      <span><b><%= batch.hikiate_class %></b></span>
+      <span>TB: <%= batch.tb_no %></span>
+      <span>出荷指示日: <%= batch.instruct_date || '-' %></span>
+      <span>フォルダ: <%= batch.folder_name || '-' %></span>
+      <span>構成: <%= batch.composition %></span>
+      <span>明細 <%= batch.line_count %> / 伝票 <%= batch.slip_count %> / 数量 <%= batch.total_qty %></span>
+      <span>状態: <%= statusLabels[batch.status] || batch.status %></span>
+    </div>
+
+    <table class="pk-lines">
+      <thead>
+        <tr><th>#</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>数量</th><th>状態</th></tr>
+      </thead>
+      <tbody>
+        <% for (const l of lines) { %>
+          <tr class="<%= l.status %>">
+            <td class="num"><%= l.seq %></td>
+            <td class="loc"><%= l.locationLabel %></td>
+            <td><%= l.sku %></td>
+            <td><%= l.product_name || '' %></td>
+            <td class="num"><%= l.qty %></td>
+            <td><%= l.status === 'pending' ? '' : (l.status === 'done' ? '✔' : `欠品${l.shortage_qty ?? ''}`) %></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
