@@ -189,31 +189,9 @@ export function buildPickingList(lzRows, codeIndex) {
   return { rows, warnings, matchedCodes };
 }
 
-/**
- * P-touch ラベル印刷用 CSV (旧5列) の行配列 (ヘッダ含む) を作る。
- * 「シール枚数 = ピッキングリスト行数」の絶対条件は旧CSVでも守る:
- * かつては商品ID/プランNo未解決行をスキップしていた (GAS準拠) が、シール欠落 =
- * ピッキング漏れの穴になるため全行出力し、未解決は「プランなし」と印字する。
- * @param {Array} pickingRows buildPickingList の rows
- * @param {Map<string,string>} barcodeMap normCode → バーコード
- * @returns {{ csvRows: string[][], warnings: string[] }}
- */
-export function buildLabelRows(pickingRows, barcodeMap) {
-  const csvRows = [['商品ID', '納品プランNo', '商品名', 'バーコード', '土台商品']];
-  const warnings = [];
-  const missingBarcode = new Set();
-  for (const row of pickingRows) {
-    const key = normCode(row.code);
-    const barcode = (key && barcodeMap.get(key)) || '';
-    if (!barcode) missingBarcode.add(key || '(商品ID空)');
-    const planNo = String(row.planNo || '').split('\n').map(p => p.trim()).filter(Boolean).join(' / ') || 'プランなし';
-    csvRows.push([row.code, planNo, row.name, barcode, row.dodai]);
-  }
-  if (missingBarcode.size) {
-    warnings.push(`バーコード未登録: ${missingBarcode.size}件 (${Array.from(missingBarcode).slice(0, 10).join(', ')}${missingBarcode.size > 10 ? ' …' : ''})`);
-  }
-  return { csvRows, warnings };
-}
+// 旧5列ラベルCSV (buildLabelRows) は 2026-08-11 に廃止 — 固定名 fbanouhinbangoulist.csv は
+// buildLabelRowsV2 の10列に一本化 (P-touch新テンプレート実機検証済み)。過去実行の旧5列DLは
+// 履歴の保存済み result.labelCsvRows から再生成する (関数は不要)。
 
 /**
  * プラン別 ラベル貼り作業シート行を作る。
