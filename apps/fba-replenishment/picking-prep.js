@@ -29,6 +29,15 @@ export function buildPickingCardTitle(ymd) {
   return d ? `${d}納品予定FBA納品ピッキング` : null;
 }
 
+// 'YYYY-MM-DD' が実在日付か (形式 + UTC往復検証。'2026-99-99' を弾く)
+export function isValidDateYmd(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? '').trim());
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
 // 商品コード正規化 (GAS PL_normCode_ 相当) — lib/sku-norm.js に全社共通化 (監査PR-10)。
 // 本ファイル内でも使用するため import + 既存の import { normCode } 互換の re-export
 import { normSku as normCode } from '../../lib/sku-norm.js';
@@ -43,10 +52,12 @@ const COL_QTY = 9;   // J: 数量
 const PLAN_DATA_START = 6; // 7行目から (index 6)
 
 // ロジザード ピッキングリスト(lzpickinglist.csv) の列インデックス (GAS PL_ 準拠)
-const LZ_BLOCK = 7;  // H: ブロック略称
-const LZ_LOC = 8;    // I: ロケーション
-const LZ_CODE = 9;   // J: 商品ID(=商品コード)
-const LZ_NAME = 10;  // K: 商品名
+const LZ_BLOCK = 7;   // H: ブロック略称
+const LZ_LOC = 8;     // I: ロケーション
+const LZ_CODE = 9;    // J: 商品ID(=商品コード)
+const LZ_NAME = 10;   // K: 商品名
+const LZ_QTY = 13;    // N: 出荷引当 = ロケ別ピック数 (TMP1 PDF の「数量」列と同値。実データで全行一致確認済)
+const LZ_EXPIRY = 17; // R: 有効期限 YYYYMMDD ('29991231'=無期限)
 const LZ_DATA_START = 1; // 1行目はヘッダ
 
 /**
@@ -168,14 +179,21 @@ export function buildPickingList(lzRows, codeIndex) {
     const dodai = entry ? entry.dodai : '';
     if (entry) matchedCodes.add(key);
 
-    rows.push({ block, location, code, name, planNo, dodai });
+    rows.push({
+      block, location, code, name, planNo, dodai,
+      qty: safe(row[LZ_QTY]),       // ロケ別ピック数 (文字列のまま。数値検証は reconcilePdfWithLz)
+      expiry: safe(row[LZ_EXPIRY]), // 有効期限 YYYYMMDD
+    });
   }
 
   return { rows, warnings, matchedCodes };
 }
 
 /**
- * P-touch ラベル印刷用 CSV の行配列 (ヘッダ含む) を作る。
+ * P-touch ラベル印刷用 CSV (旧5列) の行配列 (ヘッダ含む) を作る。
+ * 「シール枚数 = ピッキングリスト行数」の絶対条件は旧CSVでも守る:
+ * かつては商品ID/プランNo未解決行をスキップしていた (GAS準拠) が、シール欠落 =
+ * ピッキング漏れの穴になるため全行出力し、未解決は「プランなし」と印字する。
  * @param {Array} pickingRows buildPickingList の rows
  * @param {Map<string,string>} barcodeMap normCode → バーコード
  * @returns {{ csvRows: string[][], warnings: string[] }}
@@ -185,11 +203,10 @@ export function buildLabelRows(pickingRows, barcodeMap) {
   const warnings = [];
   const missingBarcode = new Set();
   for (const row of pickingRows) {
-    if (!row.code || !row.planNo) continue; // 商品ID と プランNo が揃う行のみ (GAS 準拠)
     const key = normCode(row.code);
-    const barcode = barcodeMap.get(key) || '';
-    if (!barcode) missingBarcode.add(key);
-    const planNo = row.planNo.split('\n').map(p => p.trim()).filter(Boolean).join(' / ');
+    const barcode = (key && barcodeMap.get(key)) || '';
+    if (!barcode) missingBarcode.add(key || '(商品ID空)');
+    const planNo = String(row.planNo || '').split('\n').map(p => p.trim()).filter(Boolean).join(' / ') || 'プランなし';
     csvRows.push([row.code, planNo, row.name, barcode, row.dodai]);
   }
   if (missingBarcode.size) {
@@ -231,4 +248,196 @@ export function findCodesNotInPicking(codeIndex, matchedCodes) {
     }
   }
   return missing;
+}
+
+// ==========================================================================
+// v2 シールCSV: TMP1 PDF の情報 (ブロック/ロケ/数量/残数/期限) を統合し、
+// 「シール枚数 = ピッキングリスト行数」を fail-closed で保証する。
+// 残数は lz CSV に存在しないため TMP1 PDF 抽出値を突合して取り込む。
+// 突合は matchKey(ブロック|ロケ|商品ID) ごとの FIFO キュー + 数量一致検証。
+// ==========================================================================
+
+// ZZZ (ロケ未引当) 行のセンチネル
+export const UNALLOCATED = 'UNALLOCATED';
+// 未引当行のロケーション表示 (TMP1 PDF と同じ見た目)
+export const UNALLOCATED_LOC_DISPLAY = 'ZZZ-ZZZ-ZZ';
+
+export function normalizeBlock(v) {
+  return String(v ?? '').trim().toUpperCase();
+}
+
+/**
+ * ロケーション正規化: 既知2形式のみ受理し 'NNN-NNN-NN' 表示形式へ揃える。
+ *  - lz CSV: '00101202' (8桁数字) / TMP1 PDF: '001-012-02'
+ *  - ZZZ 未引当 ('ZZZZZZZZ' / 'ZZZ-ZZZ-ZZ') は UNALLOCATED センチネル
+ *  - 未知形式は null (呼び出し側で fail-closed。数字だけに潰さない)
+ */
+export function normalizeLocation(v) {
+  const s = String(v ?? '').trim().toUpperCase().replace(/[－ー―‐]/g, '-');
+  if (!s) return null;
+  if (/^Z+$/.test(s.replace(/-/g, ''))) return UNALLOCATED;
+  if (/^\d{8}$/.test(s)) return `${s.slice(0, 3)}-${s.slice(3, 6)}-${s.slice(6, 8)}`;
+  if (/^\d{3}-\d{3}-\d{2}$/.test(s)) return s;
+  return null;
+}
+
+/** 突合キー。ロケが未知形式なら null。 */
+export function buildMatchKey(block, location, code) {
+  const loc = normalizeLocation(location);
+  return loc == null ? null : `${normalizeBlock(block)}|${loc}|${normCode(code)}`;
+}
+
+/** 非負整数の厳密パース。空・小数・単位付き等は null (0 扱いにしない)。 */
+export function parseStrictNonNegInt(v) {
+  const s = String(v ?? '').trim();
+  if (!/^(0|[1-9]\d*)$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * 有効期限 (lz CSV R列 YYYYMMDD) の表示変換。
+ *  - 空欄: 空表示 + 警告 (期限はピッキング突合の成立条件ではないため継続)
+ *  - '29991231': 無期限センチネル → 空表示
+ *  - 実在する8桁日付: 'YYYY/MM/DD'
+ *  - 非空の不正値 (形式不正/存在しない日付): error (呼び出し側で422。黙って空欄化しない)
+ */
+export function formatExpiry(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return { value: '', warn: 'empty' };
+  if (s === '29991231') return { value: '' };
+  if (!/^\d{8}$/.test(s)) return { error: `有効期限の形式が不正です: ${s}` };
+  const y = +s.slice(0, 4), m = +s.slice(4, 6), d = +s.slice(6, 8);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) {
+    return { error: `有効期限が存在しない日付です: ${s}` };
+  }
+  return { value: `${y}/${String(m).padStart(2, '0')}/${String(d).padStart(2, '0')}` };
+}
+
+/**
+ * TMP1 PDF 抽出行と lz ピッキング行の FIFO 突合。残数(zansu)を lz 行へ付与する。
+ * 行順同一は実測確認済みだが、帳票変更・ファイル取り違えに備えて
+ * ①総行数 ②キー毎件数 ③FIFO対応後の数量一致 の三段で fail-closed 検証する。
+ * 残余リスク: 同一キー・同一数量・異なる残数の複数行は誤対応を検出できない
+ * (行順が保たれる限り正しい。帳票のソート仕様変更時のみ影響)。
+ * @param {Array} pdfItems [{page,item,block,location,productId,qty,zansu}] (数値検証済み)
+ * @param {Array} lzRows2 buildPickingList の rows (qty/expiry 付き)
+ * @returns {{ rows: Array, errors: string[] }} rows は lz 行順を維持
+ */
+export function reconcilePdfWithLz(pdfItems, lzRows2) {
+  const errors = [];
+  if (pdfItems.length !== lzRows2.length) {
+    errors.push(`TMP1 PDFの行数(${pdfItems.length})とピッキングリストCSVの行数(${lzRows2.length})が一致しません`);
+    return { rows: [], errors };
+  }
+
+  // lz 側: matchKey ごとのキュー (行順維持)
+  const queues = new Map();
+  for (let i = 0; i < lzRows2.length; i++) {
+    const r = lzRows2[i];
+    const key = buildMatchKey(r.block, r.location, r.code);
+    if (key == null) {
+      errors.push(`ピッキングリストCSV ${i + 1}行目: ロケーション形式を解釈できません: ${r.location}`);
+      continue;
+    }
+    if (!queues.has(key)) queues.set(key, []);
+    queues.get(key).push({ idx: i, row: r });
+  }
+  if (errors.length) return { rows: [], errors };
+
+  // PDF 側キー化 + キー毎件数一致
+  const pdfKeyed = [];
+  const pdfKeyCount = new Map();
+  for (const it of pdfItems) {
+    const key = buildMatchKey(it.block, it.location, it.productId);
+    if (key == null) {
+      errors.push(`TMP1 PDF p${it.page + 1} ${it.item + 1}行目: ロケーション形式を解釈できません: ${it.location}`);
+      continue;
+    }
+    pdfKeyed.push({ it, key });
+    pdfKeyCount.set(key, (pdfKeyCount.get(key) || 0) + 1);
+  }
+  if (errors.length) return { rows: [], errors };
+  for (const [key, q] of queues) {
+    const c = pdfKeyCount.get(key) || 0;
+    if (c !== q.length) errors.push(`突合不一致: ${key} — CSV ${q.length}行 / PDF ${c}行`);
+  }
+  for (const [key, c] of pdfKeyCount) {
+    if (!queues.has(key)) errors.push(`PDFのみに存在する行: ${key} (${c}行)`);
+  }
+  if (errors.length) return { rows: [], errors };
+
+  // FIFO 対応 + 数量一致 (lz行順で出力)
+  const out = new Array(lzRows2.length);
+  for (const { it, key } of pdfKeyed) {
+    const { idx, row } = queues.get(key).shift();
+    const lzQty = parseStrictNonNegInt(row.qty);
+    if (lzQty == null) {
+      errors.push(`ピッキングリストCSV ${idx + 1}行目 (${key}): 数量(出荷引当)が不正です: ${JSON.stringify(row.qty)}`);
+      continue;
+    }
+    if (it.qty !== lzQty) {
+      errors.push(`数量不一致: ${key} — CSV ${lzQty} / PDF ${it.qty} (TMP1 p${it.page + 1} ${it.item + 1}行目)`);
+      continue;
+    }
+    out[idx] = { ...row, qty: lzQty, zansu: it.zansu, pdfPage: it.page, pdfItem: it.item };
+  }
+  if (errors.length) return { rows: [], errors };
+  return { rows: out, errors };
+}
+
+export const LABEL_V2_HEADER = ['商品ID', '納品プランNo', '商品名', 'バーコード', '土台商品', 'ブロック', 'ロケーション', '数量', '残数', '有効期限'];
+
+/**
+ * v2 シールCSV行 (10列)。全 lz 行を出力する = シール枚数保証。
+ *  - プランNo未解決行はスキップせず「プランなし」と印字 (中原さん決定)
+ *  - 未引当(ZZZ)行も出力し、通常行の後ろにまとめる (件数は unallocatedCount で返す)
+ * @param {Array} mergedRows reconcilePdfWithLz の rows
+ * @param {Map<string,string>} barcodeMap normCode → バーコード
+ */
+export function buildLabelRowsV2(mergedRows, barcodeMap) {
+  const warnings = [];
+  const expiryErrors = [];
+  const missingBarcode = new Set();
+  const normalRows = [];
+  const unallocRows = [];
+  let planlessCount = 0;
+  let expiryEmptyCount = 0;
+
+  for (const row of mergedRows) {
+    const key = normCode(row.code);
+    const barcode = barcodeMap.get(key) || '';
+    if (!barcode) missingBarcode.add(key);
+    let planNo = String(row.planNo || '').split('\n').map(p => p.trim()).filter(Boolean).join(' / ');
+    if (!planNo) { planNo = 'プランなし'; planlessCount++; }
+    const loc = normalizeLocation(row.location);
+    const isUnalloc = loc === UNALLOCATED;
+    const exp = formatExpiry(row.expiry);
+    if (exp.error) expiryErrors.push(`${row.code} (${row.block} ${row.location}): ${exp.error}`);
+    else if (exp.warn === 'empty') expiryEmptyCount++;
+    const rec = [
+      row.code, planNo, row.name, barcode, row.dodai,
+      normalizeBlock(row.block),
+      isUnalloc ? UNALLOCATED_LOC_DISPLAY : loc,
+      String(row.qty), String(row.zansu),
+      exp.error ? '' : exp.value,
+    ];
+    (isUnalloc ? unallocRows : normalRows).push(rec);
+  }
+
+  if (missingBarcode.size) {
+    warnings.push(`バーコード未登録: ${missingBarcode.size}件 (${Array.from(missingBarcode).slice(0, 10).join(', ')}${missingBarcode.size > 10 ? ' …' : ''})`);
+  }
+  if (planlessCount) warnings.push(`納品プランNo未解決行: ${planlessCount}件 — シールには「プランなし」と印字されます`);
+  if (unallocRows.length) warnings.push(`ロケ未引当(ZZZ)行: ${unallocRows.length}件 — シールCSV末尾にまとめています`);
+  if (expiryEmptyCount) warnings.push(`有効期限が空欄の行: ${expiryEmptyCount}件 (空欄のまま出力)`);
+
+  return {
+    csvRows: [LABEL_V2_HEADER, ...normalRows, ...unallocRows],
+    warnings,
+    expiryErrors,
+    planlessCount,
+    unallocatedCount: unallocRows.length,
+  };
 }

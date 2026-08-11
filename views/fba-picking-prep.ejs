@@ -365,15 +365,17 @@ async function runProcess(){
     renderResult(d);
     document.getElementById('runMsg').textContent = '完了';
     loadRuns();
-    // 共有ドライブへの fbanouhinbangoulist.csv 保存結果をメッセージ表示
-    const ds = d.driveSave;
-    if (ds && ds.saved){
-      alert(ds.action === 'updated'
-        ? '作成したラベルCSVを共有ドライブに上書き保存しました（'+ds.filename+'）'
-        : '作成したラベルCSVを共有ドライブに保存しました（'+ds.filename+' / 新規作成）');
-    } else if (ds){
-      alert('処理は完了しました。ただし共有ドライブへのCSV保存に失敗しました:\n'+(ds.error||'不明')+
-        '\n（必要なら「P-touchラベルCSV」ボタンから手動ダウンロードしてください）');
+    // 共有ドライブへの fbanouhinbangoulist.csv (旧5列) / _v2.csv (10列) 保存結果をメッセージ表示
+    const saves = [d.driveSave, d.driveSaveV2].filter(Boolean);
+    const okSaves = saves.filter(s=>s.saved).map(s=>s.filename);
+    const ngSaves = saves.filter(s=>!s.saved);
+    if (okSaves.length){
+      alert('作成したラベルCSVを共有ドライブに保存しました:\n'+okSaves.join('\n'));
+    }
+    if (ngSaves.length){
+      alert('処理は完了しました。ただし共有ドライブへのCSV保存に失敗しました:\n'+
+        ngSaves.map(s=>s.filename+': '+(s.error||'不明')).join('\n')+
+        '\n（必要なら「ラベルCSV」ボタンから手動ダウンロードしてください）');
     }
     // TMP1 PDF 注番の結果
     const an = d.annotate;
@@ -398,15 +400,19 @@ function renderResult(d){
   document.getElementById('resultStats').innerHTML =
     stat('ピッキング行', s.pickingRowCount) +
     stat('プランNo一致', s.pickingMatchedCount) +
-    stat('ラベル件数', s.labelRowCount) +
+    stat('ラベル件数(v2)', s.labelV2RowCount != null ? s.labelV2RowCount : s.labelRowCount) +
+    (s.unallocatedCount ? stat('⚠未引当(ZZZ)', s.unallocatedCount) : '') +
+    (s.planlessCount ? stat('⚠プランなし', s.planlessCount) : '') +
     stat('プラン別シート', (d.planSheets||[]).length) +
     stat('警告', (d.warnings||[]).length);
 
   const publicUrl = location.origin + '/print/picking'; // 固定URL(過去分も一覧から閲覧可)
   const an = d.annotate;
+  const hasV2 = Array.isArray(d.labelCsvRowsV2) && d.labelCsvRowsV2.length > 0;
   document.getElementById('resultActions').innerHTML =
     '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+d.runId+'" target="_blank">📄 プラン別シート印刷</a>' +
-    '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ P-touchラベルCSV</a>' +
+    (hasV2 ? '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv-v2">⬇ ラベルCSV v2 (ロケ・数量・残数入り)</a>' : '') +
+    '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/label-csv">⬇ ラベルCSV 旧5列</a>' +
     ((an && an.ok) ? '<a class="btn btn-primary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+d.runId+'/annotated-pdf">⬇ 納品プランNo付きPDF ('+an.matched+'/'+an.total+'行)</a>' : '') +
     '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+publicUrl+'\')">🔗 子会社用 公開印刷URL(固定)をコピー</button>';
 
@@ -417,10 +423,11 @@ function renderResult(d){
 
   const rows = (d.pickingRows||[]).slice(0,200);
   let html = '<h4 style="margin-top:16px;">ピッキングリスト (先頭'+rows.length+'件プレビュー)</h4><div class="table-wrap"><table class="data-table"><thead><tr>'+
-    '<th>ブロック</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>土台</th></tr></thead><tbody>';
+    '<th>ブロック</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>納品プランNo</th><th>数量</th><th>残数</th><th>土台</th></tr></thead><tbody>';
   for (const r of rows){
     html += '<tr><td>'+esc(r.block)+'</td><td>'+esc(r.location)+'</td><td>'+esc(r.code)+'</td><td>'+esc(r.name)+
-      '</td><td>'+esc(String(r.planNo||'').replace(/\n/g,' / '))+'</td><td>'+(r.dodai?'<span class="badge-dodai">土台</span>':'')+'</td></tr>';
+      '</td><td>'+esc(String(r.planNo||'').replace(/\n/g,' / ')||'プランなし')+'</td><td>'+esc(r.qty!=null?r.qty:'-')+'</td><td>'+esc(r.zansu!=null?r.zansu:'-')+
+      '</td><td>'+(r.dodai?'<span class="badge-dodai">土台</span>':'')+'</td></tr>';
   }
   html += '</tbody></table></div>';
   document.getElementById('pickingPreview').innerHTML = html;
@@ -443,7 +450,8 @@ async function loadRuns(){
         '</td><td>'+esc(run.label_count)+'</td><td>'+
         (run.warning_count>0 ? '<a class="warn-link" onclick="showWarnings('+run.id+')">'+esc(run.warning_count)+'件</a>' : '0')+
         '</td><td><a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+run.id+'" target="_blank">印刷</a> '+
-        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV</a> '+
+        (run.has_label_v2 ? '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv-v2">CSV v2</a> ' : '')+
+        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">'+(run.has_label_v2?'CSV旧':'CSV')+'</a> '+
         '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+location.origin+'/print/picking/'+run.id+'\')">🔗公開URL</button>'+
         '</td></tr>';
     }

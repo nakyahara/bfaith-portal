@@ -19,7 +19,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows, getDodaiMaster,
-         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun,
+         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun, deletePickingRun,
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
@@ -28,7 +28,7 @@ import { parseCsv, decodeCsvBuffer, buildShiftJisCsv } from './picking-csv.js';
 import { parseWarehouseCsv } from './warehouse-csv.js';
 import * as pp from './picking-prep.js';
 import { uploadCsvToDrive } from './drive-upload.js';
-import { annotatePickingPdf } from './annotate-pdf.js';
+import { annotatePickingPdf, extractPickingPdf } from './annotate-pdf.js';
 import { savePickingPdf, pickingPdfPath } from './picking-pdf-store.js';
 import { createPickingCard, notionConfigured } from './notion-attach.js';
 // SP-API関連はミニPC経由で実行（APIキーはミニPC側に一元管理）
@@ -1485,6 +1485,9 @@ const MAX_PLAN_ROWS = 20000;
 // 生成したラベルCSVを固定名で上書き保存する共有ドライブのフォルダ (GAS PL_FBA_NOUHIN_* 相当)。
 const FBA_NOUHIN_DRIVE_FOLDER_ID = process.env.FBA_NOUHIN_DRIVE_FOLDER_ID || '17SRNd4yOEX3Mr8aCEgkyXgOz5cvBcwK7';
 const FBA_NOUHIN_CSV_NAME = 'fbanouhinbangoulist.csv';
+// v2: ロケ/数量/残数/期限入りの10列シールCSV。P-touch新テンプレート移行が済むまで
+// 旧5列(上記固定名)と並行保存する (移行完了後に固定名を切替予定)。
+const FBA_NOUHIN_CSV_V2_NAME = 'fbanouhinbangoulist_v2.csv';
 
 // multer のエラー (サイズ超過/ファイル数超過) を JSON で返すラッパー (Codex #3)。
 function runUpload(mw) {
@@ -1552,10 +1555,10 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     const lzFile = files.lz?.[0];
     if (!lzFile) return res.status(400).json({ error: 'ピッキングリスト(lzpickinglist)CSV が必要です' });
 
-    // ⑤ 納品予定日 (YYYY-MM-DD) は必須。Notionカード名・公開ナビ表示に使用。
-    const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
-      ? String(req.body.delivery_date).trim() : null;
-    if (!deliveryDate) return res.status(400).json({ error: '納品予定日を入力してください' });
+    // ⑤ 納品予定日 (YYYY-MM-DD) は必須。実在日付のみ受理 (Notionカード名・公開ナビ表示に使用)。
+    const deliveryDateRaw = String(req.body?.delivery_date || '').trim();
+    const deliveryDate = pp.isValidDateYmd(deliveryDateRaw) ? deliveryDateRaw : null;
+    if (!deliveryDate) return res.status(400).json({ error: '納品予定日を正しい日付 (YYYY-MM-DD) で入力してください' });
 
     // ④ トータルピッキングリストPDF (TMP1) は必須。
     if (!files.tmp1?.[0]) return res.status(400).json({ error: 'トータルピッキングリストPDF(TMP1)をアップロードしてください' });
@@ -1636,9 +1639,6 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     }
     const { rows: pickingRows, warnings: pickWarn, matchedCodes } = pp.buildPickingList(lzRows, codeIndex);
 
-    // P-touch ラベル行
-    const { csvRows: labelCsvRows, warnings: labelWarn } = pp.buildLabelRows(pickingRows, barcodeMap);
-
     // 誤出力防止: プランとピッキングリストが1件も突合しない場合は中止 (Codex #2)。
     // (lz/プランの取り違え・別日のファイル等。プランNo空のピッキングリストは無意味)
     const matchedRowCount = pickingRows.filter(r => r.planNo).length;
@@ -1649,30 +1649,99 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       });
     }
 
+    // ---- TMP1 PDF 構造化抽出 (Python spawn 1回目: 抽出のみ) ----
+    // 残数は lz CSV に存在しないため PDF 抽出が唯一の取得元。構造検証 NG は 422。
+    const tmp1File = files.tmp1[0];
+    let pdfExtract;
+    try {
+      pdfExtract = await extractPickingPdf(tmp1File.buffer);
+    } catch (e) {
+      console.error('[Picking] TMP1 PDF抽出失敗:', e.message);
+      return res.status(422).json({
+        error: `TMP1 PDFを解析できませんでした: ${e.message}`,
+        warnings: [...convWarn, ...pickWarn],
+      });
+    }
+
+    // ---- PDF × lz CSV 突合 (総行数 → キー毎件数 → FIFO+数量一致 の fail-closed) ----
+    // シール枚数 = ピッキングリスト行数 の絶対条件をここで担保する。
+    const recon = pp.reconcilePdfWithLz(pdfExtract.items, pickingRows);
+    if (recon.errors.length) {
+      console.error('[Picking] PDF×CSV突合エラー:', JSON.stringify({
+        lzFile: lzFile.originalname, tmp1File: tmp1File.originalname, errors: recon.errors.slice(0, 30),
+      }));
+      return res.status(422).json({
+        error: 'TMP1 PDFとピッキングリストCSVの突合に失敗しました。別の回のファイルが混ざっていないか確認してください。',
+        warnings: [...recon.errors, ...convWarn, ...pickWarn],
+      });
+    }
+    const mergedRows = recon.rows;
+
+    // P-touch ラベル行 — 旧5列 (現行テンプレート用) + v2 10列 (ロケ/数量/残数/期限入り)
+    const { csvRows: labelCsvRows, warnings: labelWarn } = pp.buildLabelRows(pickingRows, barcodeMap);
+    const v2 = pp.buildLabelRowsV2(mergedRows, barcodeMap);
+    // 期限は空欄なら警告継続だが、非空の不正値は元データ破損の可能性があるため 422 (Codex R2)
+    if (v2.expiryErrors.length) {
+      console.error('[Picking] 有効期限不正:', JSON.stringify(v2.expiryErrors.slice(0, 30)));
+      return res.status(422).json({ error: '有効期限に不正な値の行があります。lzpickinglist.csv を確認してください。', warnings: v2.expiryErrors });
+    }
+    // 最終アサート: v2シール枚数 = ピッキングリスト行数 (絶対条件)
+    if (v2.csvRows.length - 1 !== pickingRows.length) {
+      console.error(`[Picking] 整合性エラー: v2=${v2.csvRows.length - 1} lz=${pickingRows.length}`);
+      return res.status(500).json({ error: `内部整合性エラー: シール行数(${v2.csvRows.length - 1})とピッキング行数(${pickingRows.length})が一致しません` });
+    }
+
+    // ---- 注番PDF生成 (Python spawn 2回目)。検証工程の一部なので失敗は保存前に 422 ----
+    // 割り当ては page/item 単位の専用JSON (商品ID辞書だと同一IDの上書き事故があるため)。
+    const planItems = mergedRows.map(r => {
+      const planNo = String(r.planNo || '').split('\n').map(p => p.trim()).filter(Boolean).join(' / ');
+      return {
+        page: r.pdfPage, item: r.pdfItem, productId: r.code,
+        planNo: planNo || 'プランなし',
+        status: planNo ? 'matched' : 'no-plan',
+      };
+    });
+    let annotate;
+    let annotatedPdfBuffer;
+    try {
+      const r = await annotatePickingPdf(tmp1File.buffer, planItems);
+      annotatedPdfBuffer = r.pdfBuffer;
+      annotate = { attempted: true, ok: true, matched: r.matched, total: r.total, unmatchedCount: r.total - r.matched };
+    } catch (e) {
+      console.error('[Picking] TMP1 PDF注番失敗:', e.message);
+      return res.status(422).json({ error: `納品プランNo注番PDFの生成に失敗しました: ${e.message}` });
+    }
+
     // 展開したが倉庫ピッキングに出てこなかった商品コード
     const notInPicking = pp.findCodesNotInPicking(codeIndex, matchedCodes);
     const notInPickingWarn = notInPicking.length
       ? [`プランにあるが倉庫ピッキングリストに無い商品コード: ${notInPicking.length}件 (${notInPicking.slice(0, 10).map(x => x.code).join(', ')}${notInPicking.length > 10 ? ' …' : ''})`]
       : [];
 
-    const warnings = [...convWarn, ...pickWarn, ...labelWarn, ...notInPickingWarn];
+    const warnings = [...convWarn, ...pickWarn, ...labelWarn, ...v2.warnings, ...notInPickingWarn];
     const summary = {
       planFiles: planFileMeta,
       planItemCount: allPlanItems.length,
       pickingRowCount: pickingRows.length,
-      pickingMatchedCount: pickingRows.filter(r => r.planNo).length,
+      pickingMatchedCount: matchedRowCount,
       labelRowCount: labelCsvRows.length - 1,
+      labelV2RowCount: v2.csvRows.length - 1,
+      planlessCount: v2.planlessCount,
+      unallocatedCount: v2.unallocatedCount,
+      pdfItemCount: pdfExtract.total,
       codeNotInPickingCount: notInPicking.length,
       mappingSource: getSkuMappingSourceMode(),
     };
-    const result = { pickingRows, planSheets, labelCsvRows, notInPicking };
+    const result = { pickingRows: mergedRows, planSheets, labelCsvRows, labelCsvRowsV2: v2.csvRows, notInPicking };
 
+    // ---- ここから永続化。全検証 (抽出/突合/数量/期限/注番) が成功した後にのみ実行する ----
+    // (422 時に履歴・Drive・PDF・Notion を一切更新しないため。Codex R1 #1)
     const runId = savePickingRun({
       run_by: req.session?.email,
       plan_files: planFileMeta,
       lz_filename: lzFile.originalname,
       picking_count: pickingRows.length,
-      label_count: labelCsvRows.length - 1,
+      label_count: v2.csvRows.length - 1, // 絶対条件を満たす件数 (= lz行数) を履歴の正とする
       plan_sheet_count: planSheets.length,
       warning_count: warnings.length,
       summary,
@@ -1681,34 +1750,44 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       delivery_date: deliveryDate,
     });
 
-    // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。best-effort:
-    // 失敗しても処理は成功扱いで履歴は残す。UIメッセージで保存可否を伝える。
-    let driveSave = { attempted: true, saved: false };
+    // PDF保存失敗時は履歴をロールバックして500 (PDFなしの不完全な回を公開一覧に残さない)。
+    // ディスク障害等でロールバック自体も失敗した場合は応答に明示する (再起動後に
+    // 履歴だけ復活しうるため、運用者が実行ID付きで判別できるように)。
     try {
-      const labelBuf = buildShiftJisCsv(labelCsvRows, { guardFormula: false });
-      const up = await uploadCsvToDrive(labelBuf, FBA_NOUHIN_CSV_NAME, FBA_NOUHIN_DRIVE_FOLDER_ID);
-      driveSave = { attempted: true, saved: true, action: up.action, filename: FBA_NOUHIN_CSV_NAME };
+      savePickingPdf(runId, annotatedPdfBuffer);
     } catch (e) {
-      console.error('[Picking] 共有ドライブへのCSV保存失敗:', e);
-      driveSave = { attempted: true, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: e.message };
+      console.error('[Picking] 注番PDF保存失敗 — 履歴をロールバック:', e);
+      let rollbackFailed = false;
+      try { deletePickingRun(runId); } catch (e2) {
+        rollbackFailed = true;
+        console.error('[Picking] 履歴ロールバック失敗:', e2);
+      }
+      return res.status(500).json({
+        error: `注番PDFの保存に失敗しました: ${e.message}`
+          + (rollbackFailed ? ` (さらに実行履歴ID ${runId} のロールバックにも失敗 — PDFなしの履歴が残っている可能性があります)` : ''),
+        rollbackFailed,
+        runId: rollbackFailed ? runId : undefined,
+      });
     }
 
-    // TMP1 PDF が指定されていれば 納品プランNo を注番した PDF を生成・保存 (best-effort)。
-    // マッピングはこの回のラベルCSV(商品ID→納品プランNo)を流用。失敗しても処理は成功扱い。
-    let annotate = { attempted: false };
-    const tmp1File = files.tmp1?.[0];
-    if (tmp1File) {
-      annotate = { attempted: true, ok: false };
+    // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。ここは外部保存のため
+    // best-effort: 失敗しても処理は成功扱いで履歴は残す。
+    // 混在防止: 現場が使う v2 を先に保存し、v2 が失敗したら旧5列の上書きもスキップする
+    // (「旧=今回分 / v2=前回分」という取り違えを固定名上に作らない)。
+    const saveDrive = async (rows, filename) => {
       try {
-        const mappingBuf = buildShiftJisCsv(labelCsvRows, { guardFormula: false });
-        const r = await annotatePickingPdf(tmp1File.buffer, mappingBuf);
-        savePickingPdf(runId, r.pdfBuffer);
-        annotate = { attempted: true, ok: true, matched: r.matched, total: r.total, unmatchedCount: r.unmatched.length };
+        const buf = buildShiftJisCsv(rows, { guardFormula: false });
+        const up = await uploadCsvToDrive(buf, filename, FBA_NOUHIN_DRIVE_FOLDER_ID);
+        return { attempted: true, saved: true, action: up.action, filename };
       } catch (e) {
-        console.error('[Picking] TMP1 PDF注番失敗:', e);
-        annotate = { attempted: true, ok: false, error: e.message };
+        console.error(`[Picking] 共有ドライブへのCSV保存失敗 (${filename}):`, e);
+        return { attempted: true, saved: false, filename, error: e.message };
       }
-    }
+    };
+    const driveSaveV2 = await saveDrive(v2.csvRows, FBA_NOUHIN_CSV_V2_NAME);
+    const driveSave = driveSaveV2.saved
+      ? await saveDrive(labelCsvRows, FBA_NOUHIN_CSV_NAME)
+      : { attempted: false, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: 'v2の保存に失敗したため、混在防止で旧CSVの上書きを見送りました' };
 
     // 納品予定日(必須)で Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
     let notion = { attempted: false };
@@ -1719,10 +1798,18 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       } else {
         notion = { attempted: true, ok: false, title };
         try {
-          const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
-          const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
+          // Notionに永続化する公開URLは未検証の Host ヘッダーから作らない:
+          // PUBLIC_BASE_URL を最優先し、無い場合は既知ホスト (onrender.com / localhost) のみ許可。
+          const hostRaw = String(req.get('host') || '');
+          const hostOk = /^(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.onrender\.com)$/.test(hostRaw);
+          const base = process.env.PUBLIC_BASE_URL || (hostOk ? `${req.protocol}://${hostRaw}` : null);
+          const pdfUrl = (annotate.ok && base) ? `${base}/print/picking/${runId}/pdf` : null;
           // ① FBA納品プランURL (冒頭で必須検証済み) を Notion URL_1/URL_2 に設定。
-          const card = await createPickingCard({ title, pdfUrl, plan1Url, plan2Url });
+          // 未引当(ZZZ)・プランNo未解決はカード本文にも件数を残す (現場が後から追跡できるように)。
+          const noteLines = [];
+          if (v2.unallocatedCount) noteLines.push(`⚠ ロケ未引当(ZZZ)行: ${v2.unallocatedCount}件 (シールCSV末尾)`);
+          if (v2.planlessCount) noteLines.push(`⚠ 納品プランNo未解決行: ${v2.planlessCount}件 (「プランなし」と印字)`);
+          const card = await createPickingCard({ title, pdfUrl, plan1Url, plan2Url, noteLines });
           notion = { attempted: true, ok: true, title, url: card.url, attached: !!pdfUrl, statusSet: card.statusSet };
         } catch (e) {
           console.error('[Picking] Notionカード作成失敗:', e);
@@ -1731,7 +1818,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       }
     }
 
-    res.json({ success: true, runId, summary, warnings, driveSave, annotate, notion, ...result });
+    res.json({ success: true, runId, summary, warnings, driveSave, driveSaveV2, annotate, notion, ...result });
   } catch (e) {
     console.error('[Picking] 処理エラー:', e);
     res.status(500).json({ error: e.message });
@@ -1773,6 +1860,20 @@ router.get('/api/picking-prep/run/:id/label-csv', (req, res) => {
   const buf = buildShiftJisCsv(rows, { guardFormula: false });
   res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
   res.setHeader('Content-Disposition', `attachment; filename="fbanouhinbangoulist_${rec.id}.csv"`);
+  res.send(buf);
+});
+
+// v2 ラベルCSV (10列: ロケ/数量/残数/期限入り) ダウンロード
+router.get('/api/picking-prep/run/:id/label-csv-v2', (req, res) => {
+  const rec = getPickingRun(parseInt(req.params.id));
+  if (!rec) return res.status(404).json({ error: '履歴が見つかりません' });
+  const result = safeJsonParse(rec.result, {});
+  if (!Array.isArray(result.labelCsvRowsV2) || result.labelCsvRowsV2.length === 0) {
+    return res.status(404).json({ error: 'この実行には v2 ラベルCSVがありません (v2対応前の実行)' });
+  }
+  const buf = buildShiftJisCsv(result.labelCsvRowsV2, { guardFormula: false });
+  res.setHeader('Content-Type', 'text/csv; charset=Shift_JIS');
+  res.setHeader('Content-Disposition', `attachment; filename="fbanouhinbangoulist_v2_${rec.id}.csv"`);
   res.send(buf);
 });
 
