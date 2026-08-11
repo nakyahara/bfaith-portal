@@ -68,6 +68,7 @@ import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
+import pickingRouter from './apps/picking/router.js';
 import easyShipRouter from './apps/easy-ship/router.js';
 import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import selectSetRouter from './apps/select-set/router.js';
@@ -736,6 +737,15 @@ const apps = [
     category: 'shipping',
   },
   {
+    id: 'picking',
+    name: 'ピッキング支援',
+    description: '紙のトータルピッキングリストをスマホ表示に置き換え。CS03002取込・明細単位の時間計測',
+    icon: '📱',
+    path: '/apps/picking',
+    status: 'active',
+    category: 'shipping',
+  },
+  {
     id: 'easy-ship',
     name: '梱包サイズマスター (Easy Ship)',
     description: 'Amazon Easy Ship画面でSKUごとの梱包サイズを自動選択するChrome拡張のマスター管理',
@@ -1293,6 +1303,8 @@ app.use('/apps/inquiry-hub/ai-api', express.json({ limit: '1mb' }), inquiryHubAi
 // limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
 app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/shipping-work', requireAppAccess('shipping-work'), express.json({ limit: '256kb' }), shippingWorkRouter);
+// picking: CS03002取込は multipart (router 内の multer が処理)。JSON body は作業API (PR2) 用
+app.use('/apps/picking', requireAppAccess('picking'), express.json({ limit: '256kb' }), pickingRouter);
 // easy-ship: Chrome拡張向けAPI (x-api-key 認証・fail-closed) はセッション認証付き本体より先に mount
 app.use('/apps/easy-ship/ext-api', easyShipExtRouter);
 app.use('/apps/easy-ship', requireAppAccess('easy-ship'), express.json({ limit: '2mb' }), easyShipRouter);

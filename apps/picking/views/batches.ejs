@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 1000px; margin: 0 auto; padding: 12px 16px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+    .pk-bar input[type=date] { padding: 5px; }
+    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 7px 8px; text-align: left; }
+    table.pk-list th { background: #f1f3f5; white-space: nowrap; }
+    table.pk-list td.num { text-align: right; }
+    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.92em; white-space: nowrap; }
+    .st.ready { background: #d0ebff; } .st.picking { background: #fff3bf; }
+    .st.paused { background: #ffe8cc; } .st.done { background: #d3f9d8; }
+    .st.cancelled { background: #f1f3f5; color: #868e96; }
+    .pk-empty { color: #868e96; padding: 30px 0; text-align: center; }
+    .muted { color: #868e96; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📱 ピッキング支援</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <% if (isAdmin) { %><a href="/apps/picking/admin/import" class="btn-logout">📥 CS03002取込</a><% } %>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-bar">
+      <form method="get" action="/apps/picking/">
+        <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
+      </form>
+      <span class="muted"><%= batches.length %> バッチ (前日以前の未完了を含む)</span>
+    </div>
+
+    <% if (batches.length === 0) { %>
+      <div class="pk-empty">
+        バッチがありません。<% if (isAdmin) { %><a href="/apps/picking/admin/import">CS03002 を取り込む</a><% } else { %>管理者が CS03002 を取り込むと表示されます。<% } %>
+      </div>
+    <% } else { %>
+      <table class="pk-list">
+        <thead>
+          <tr>
+            <th>作業日</th><th>引当分類</th><th>フォルダ</th><th>構成</th>
+            <th>明細</th><th>伝票</th><th>数量</th><th>進捗</th><th>状態</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% for (const b of batches) { %>
+            <tr>
+              <td><%= b.work_date %></td>
+              <td><%= b.hikiate_class %></td>
+              <td><%= b.folder_name || '-' %></td>
+              <td><%= b.composition %></td>
+              <td class="num"><%= b.line_count %></td>
+              <td class="num"><%= b.slip_count %></td>
+              <td class="num"><%= b.total_qty %></td>
+              <td class="num"><%= b.done_lines %> / <%= b.line_count %></td>
+              <td><span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %></span></td>
+              <td><a href="/apps/picking/batches/<%= b.id %>">明細</a></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+    <% } %>
+  </div>
+</body>
+</html>

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .pk-form h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .pk-row { margin-bottom: 10px; }
+    .pk-row label { display: block; font-size: 0.82em; color: #495057; margin-bottom: 3px; }
+    .pk-row input[type=file], .pk-row input[type=text], .pk-row select { width: 100%; max-width: 480px; padding: 6px; box-sizing: border-box; }
+    .pk-actions { margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .pk-actions button { padding: 8px 22px; font-size: 1em; cursor: pointer; }
+    .pk-actions button:disabled { opacity: 0.5; cursor: default; }
+    #confirmBtn { background: #2b8a3e; color: #fff; border: 1px solid #2b8a3e; border-radius: 4px; }
+    .pk-msg { font-size: 0.9em; white-space: pre-wrap; }
+    .pk-msg.err { color: #c92a2a; } .pk-msg.ok { color: #2b8a3e; }
+    .pk-preview { display: none; }
+    .pk-sum { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px 14px;
+      margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 0.92em; }
+    table.pk-lines { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-lines th, table.pk-lines td { border-bottom: 1px solid #dee2e6; padding: 5px 8px; text-align: left; }
+    table.pk-lines th { background: #f1f3f5; }
+    table.pk-lines td.num { text-align: right; }
+    td.loc { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; white-space: nowrap; }
+    .pk-overwrite { display: none; background: #fff3bf; border-radius: 6px; padding: 8px 12px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📥 CS03002 取込</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-form">
+      <h2>ピッキングリストCSV (CS03002_xxxx.csv) を取り込む</h2>
+      <div class="pk-row">
+        <label>ファイル (カンタン引当で出力したピッキングリストCSV・Shift-JIS)</label>
+        <input type="file" id="file" accept=".csv">
+      </div>
+      <div class="pk-actions">
+        <button id="previewBtn" type="button">解析してプレビュー</button>
+        <span id="msg" class="pk-msg"></span>
+      </div>
+    </div>
+
+    <div class="pk-preview" id="preview">
+      <div class="pk-sum" id="summary"></div>
+      <div class="pk-form">
+        <div class="pk-row">
+          <label>引当分類 (推定候補が先頭。違っていたら選び直す・自由入力も可)</label>
+          <input type="text" id="hikiateClass" list="patternList" autocomplete="off">
+          <datalist id="patternList"></datalist>
+        </div>
+        <div class="pk-row">
+          <label>出荷フォルダ名 (任意。例: 出荷_03)</label>
+          <input type="text" id="folderName" placeholder="出荷_XX">
+        </div>
+        <div class="pk-overwrite" id="overwriteBox">
+          ⚠ <span id="overwriteMsg"></span><br>
+          <label><input type="checkbox" id="overwriteChk"> 上書きして取り込み直す</label>
+        </div>
+        <div class="pk-actions">
+          <button id="confirmBtn" type="button">この内容で取り込む</button>
+          <span id="confirmMsg" class="pk-msg"></span>
+        </div>
+      </div>
+      <h3 style="font-size:1em">明細プレビュー (ロケーション順)</h3>
+      <table class="pk-lines">
+        <thead><tr><th>#</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>数量</th></tr></thead>
+        <tbody id="lineBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const ALL_PATTERNS = <%- JSON.stringify(patternNames) %>;
+    const $ = (id) => document.getElementById(id);
+    let currentFile = null;
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function post(mode, extra = {}) {
+      const fd = new FormData();
+      fd.append('file', currentFile);
+      fd.append('mode', mode);
+      for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+      const res = await fetch('/apps/picking/admin/import', { method: 'POST', body: fd });
+      const body = await res.json().catch(() => ({ error: '応答の解析に失敗しました' }));
+      return { status: res.status, body };
+    }
+
+    function fillDatalist(suggestions) {
+      const names = [...suggestions, ...ALL_PATTERNS.filter((p) => !suggestions.includes(p))];
+      $('patternList').innerHTML = names.map((n) => `<option value="${esc(n)}">`).join('');
+    }
+
+    $('previewBtn').addEventListener('click', async () => {
+      const f = $('file').files[0];
+      if (!f) { $('msg').textContent = 'ファイルを選択してください'; $('msg').className = 'pk-msg err'; return; }
+      currentFile = f;
+      $('msg').textContent = '解析中…'; $('msg').className = 'pk-msg';
+      $('previewBtn').disabled = true;
+      try {
+        const { status, body } = await post('preview');
+        if (status !== 200) {
+          $('msg').textContent = body.error || `エラー (${status})`; $('msg').className = 'pk-msg err';
+          $('preview').style.display = 'none';
+          return;
+        }
+        $('msg').textContent = '解析OK'; $('msg').className = 'pk-msg ok';
+        $('summary').innerHTML =
+          `<span><b>${esc(body.tbNo)}</b></span>` +
+          `<span>出荷指示日: ${esc(body.instructDate)}</span>` +
+          `<span>${esc(body.invoiceSoft)} / ${esc(body.deliveryMethod)}</span>` +
+          `<span>構成: <b>${esc(body.composition)}</b></span>` +
+          `<span>明細 ${body.lineCount} / 伝票 ${body.slipCount} / 数量 ${body.totalQty}</span>`;
+        fillDatalist(body.suggestions || []);
+        $('hikiateClass').value = (body.suggestions || [])[0] || '';
+        $('lineBody').innerHTML = body.lines.map((l, i) =>
+          `<tr><td class="num">${i + 1}</td><td class="loc">${esc(l.locationLabel)}</td>` +
+          `<td>${esc(l.sku)}</td><td>${esc(l.productName)}</td><td class="num">${l.qty}</td></tr>`).join('');
+        $('overwriteBox').style.display = 'none';
+        $('overwriteChk').checked = false;
+        $('confirmMsg').textContent = '';
+        $('preview').style.display = 'block';
+      } finally {
+        $('previewBtn').disabled = false;
+      }
+    });
+
+    $('confirmBtn').addEventListener('click', async () => {
+      if (!currentFile) return;
+      $('confirmMsg').textContent = '取込中…'; $('confirmMsg').className = 'pk-msg';
+      $('confirmBtn').disabled = true;
+      try {
+        const { status, body } = await post('confirm', {
+          hikiate_class: $('hikiateClass').value.trim(),
+          folder_name: $('folderName').value.trim(),
+          overwrite: $('overwriteChk').checked ? '1' : '0',
+        });
+        if (status === 409 && body.code === 'duplicate') {
+          $('overwriteMsg').textContent = body.error;
+          $('overwriteBox').style.display = 'block';
+          $('confirmMsg').textContent = '取込済みのバッチです。上書きする場合はチェックして再実行してください';
+          $('confirmMsg').className = 'pk-msg err';
+          return;
+        }
+        if (status !== 200) {
+          $('confirmMsg').textContent = body.error || `エラー (${status})`; $('confirmMsg').className = 'pk-msg err';
+          return;
+        }
+        $('confirmMsg').innerHTML =
+          `${body.replaced ? '上書き' : ''}取込完了 (${body.lineCount}明細) → <a href="/apps/picking/batches/${body.batchId}">バッチ明細を確認</a>`;
+        $('confirmMsg').className = 'pk-msg ok';
+      } finally {
+        $('confirmBtn').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
