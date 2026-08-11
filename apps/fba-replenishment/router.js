@@ -19,7 +19,7 @@ import { initDb, savePlanningData, savePlanningDataWithHistory, getLatestSnapsho
          saveRestockLatest, savePlanningLatest,
          getSkuMappingSourceMode,
          getWarehouseBarcodeRows, getDodaiMaster,
-         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun,
+         getPickingMasterStatus, savePickingRun, getPickingRuns, getPickingRun, deletePickingRun,
          getLastRecommendationRun, saveRecommendationRun, getRecentRecommendationRuns,
          getInboundDailySummary, getInboundMonthlySummary, getInboundShipmentsByDate, getInboundItems,
          getInboundUnreceived, getInboundSyncStatus, getInboundShipmentsWithoutDate,
@@ -1555,10 +1555,10 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
     const lzFile = files.lz?.[0];
     if (!lzFile) return res.status(400).json({ error: 'ピッキングリスト(lzpickinglist)CSV が必要です' });
 
-    // ⑤ 納品予定日 (YYYY-MM-DD) は必須。Notionカード名・公開ナビ表示に使用。
-    const deliveryDate = /^\d{4}-\d{2}-\d{2}$/.test(String(req.body?.delivery_date || '').trim())
-      ? String(req.body.delivery_date).trim() : null;
-    if (!deliveryDate) return res.status(400).json({ error: '納品予定日を入力してください' });
+    // ⑤ 納品予定日 (YYYY-MM-DD) は必須。実在日付のみ受理 (Notionカード名・公開ナビ表示に使用)。
+    const deliveryDateRaw = String(req.body?.delivery_date || '').trim();
+    const deliveryDate = pp.isValidDateYmd(deliveryDateRaw) ? deliveryDateRaw : null;
+    if (!deliveryDate) return res.status(400).json({ error: '納品予定日を正しい日付 (YYYY-MM-DD) で入力してください' });
 
     // ④ トータルピッキングリストPDF (TMP1) は必須。
     if (!files.tmp1?.[0]) return res.status(400).json({ error: 'トータルピッキングリストPDF(TMP1)をアップロードしてください' });
@@ -1741,7 +1741,7 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       plan_files: planFileMeta,
       lz_filename: lzFile.originalname,
       picking_count: pickingRows.length,
-      label_count: labelCsvRows.length - 1,
+      label_count: v2.csvRows.length - 1, // 絶対条件を満たす件数 (= lz行数) を履歴の正とする
       plan_sheet_count: planSheets.length,
       warning_count: warnings.length,
       summary,
@@ -1750,10 +1750,19 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       delivery_date: deliveryDate,
     });
 
-    savePickingPdf(runId, annotatedPdfBuffer);
+    // PDF保存失敗時は履歴をロールバックして500 (PDFなしの不完全な回を公開一覧に残さない)
+    try {
+      savePickingPdf(runId, annotatedPdfBuffer);
+    } catch (e) {
+      console.error('[Picking] 注番PDF保存失敗 — 履歴をロールバック:', e);
+      try { deletePickingRun(runId); } catch (e2) { console.error('[Picking] 履歴ロールバック失敗:', e2); }
+      return res.status(500).json({ error: `注番PDFの保存に失敗しました: ${e.message}` });
+    }
 
     // ラベルCSV(P-touch)を固定名で共有ドライブに上書き保存 (GAS同等)。ここは外部保存のため
-    // best-effort: 失敗しても処理は成功扱いで履歴は残す。旧5列と v2 10列を個別に保存・報告する。
+    // best-effort: 失敗しても処理は成功扱いで履歴は残す。
+    // 混在防止: 現場が使う v2 を先に保存し、v2 が失敗したら旧5列の上書きもスキップする
+    // (「旧=今回分 / v2=前回分」という取り違えを固定名上に作らない)。
     const saveDrive = async (rows, filename) => {
       try {
         const buf = buildShiftJisCsv(rows, { guardFormula: false });
@@ -1764,8 +1773,10 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
         return { attempted: true, saved: false, filename, error: e.message };
       }
     };
-    const driveSave = await saveDrive(labelCsvRows, FBA_NOUHIN_CSV_NAME);
     const driveSaveV2 = await saveDrive(v2.csvRows, FBA_NOUHIN_CSV_V2_NAME);
+    const driveSave = driveSaveV2.saved
+      ? await saveDrive(labelCsvRows, FBA_NOUHIN_CSV_NAME)
+      : { attempted: false, saved: false, filename: FBA_NOUHIN_CSV_NAME, error: 'v2の保存に失敗したため、混在防止で旧CSVの上書きを見送りました' };
 
     // 納品予定日(必須)で Notion カードを作成し、注番済みPDF(公開URL)を添付 (best-effort)。
     let notion = { attempted: false };
@@ -1776,8 +1787,12 @@ router.post('/api/picking-prep/process', runUpload(pickingUpload.fields(PICKING_
       } else {
         notion = { attempted: true, ok: false, title };
         try {
-          const base = process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get('host')}`;
-          const pdfUrl = annotate.ok ? `${base}/print/picking/${runId}/pdf` : null;
+          // Notionに永続化する公開URLは未検証の Host ヘッダーから作らない:
+          // PUBLIC_BASE_URL を最優先し、無い場合は既知ホスト (onrender.com / localhost) のみ許可。
+          const hostRaw = String(req.get('host') || '');
+          const hostOk = /^(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.onrender\.com)$/.test(hostRaw);
+          const base = process.env.PUBLIC_BASE_URL || (hostOk ? `${req.protocol}://${hostRaw}` : null);
+          const pdfUrl = (annotate.ok && base) ? `${base}/print/picking/${runId}/pdf` : null;
           // ① FBA納品プランURL (冒頭で必須検証済み) を Notion URL_1/URL_2 に設定。
           // 未引当(ZZZ)・プランNo未解決はカード本文にも件数を残す (現場が後から追跡できるように)。
           const noteLines = [];

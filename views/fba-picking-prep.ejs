@@ -450,8 +450,8 @@ async function loadRuns(){
         '</td><td>'+esc(run.label_count)+'</td><td>'+
         (run.warning_count>0 ? '<a class="warn-link" onclick="showWarnings('+run.id+')">'+esc(run.warning_count)+'件</a>' : '0')+
         '</td><td><a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/picking-prep/print/'+run.id+'" target="_blank">印刷</a> '+
-        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv-v2">CSV v2</a> '+
-        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">CSV旧</a> '+
+        (run.has_label_v2 ? '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv-v2">CSV v2</a> ' : '')+
+        '<a class="btn btn-secondary btn-sm" href="/apps/fba-replenishment/api/picking-prep/run/'+run.id+'/label-csv">'+(run.has_label_v2?'CSV旧':'CSV')+'</a> '+
         '<button class="btn btn-secondary btn-sm" onclick="copyPublicUrl(\''+location.origin+'/print/picking/'+run.id+'\')">🔗公開URL</button>'+
         '</td></tr>';
     }

@@ -29,6 +29,15 @@ export function buildPickingCardTitle(ymd) {
   return d ? `${d}納品予定FBA納品ピッキング` : null;
 }
 
+// 'YYYY-MM-DD' が実在日付か (形式 + UTC往復検証。'2026-99-99' を弾く)
+export function isValidDateYmd(ymd) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? '').trim());
+  if (!m) return false;
+  const y = +m[1], mo = +m[2], d = +m[3];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
 // 商品コード正規化 (GAS PL_normCode_ 相当) — lib/sku-norm.js に全社共通化 (監査PR-10)。
 // 本ファイル内でも使用するため import + 既存の import { normCode } 互換の re-export
 import { normSku as normCode } from '../../lib/sku-norm.js';
@@ -181,7 +190,10 @@ export function buildPickingList(lzRows, codeIndex) {
 }
 
 /**
- * P-touch ラベル印刷用 CSV の行配列 (ヘッダ含む) を作る。
+ * P-touch ラベル印刷用 CSV (旧5列) の行配列 (ヘッダ含む) を作る。
+ * 「シール枚数 = ピッキングリスト行数」の絶対条件は旧CSVでも守る:
+ * かつては商品ID/プランNo未解決行をスキップしていた (GAS準拠) が、シール欠落 =
+ * ピッキング漏れの穴になるため全行出力し、未解決は「プランなし」と印字する。
  * @param {Array} pickingRows buildPickingList の rows
  * @param {Map<string,string>} barcodeMap normCode → バーコード
  * @returns {{ csvRows: string[][], warnings: string[] }}
@@ -191,11 +203,10 @@ export function buildLabelRows(pickingRows, barcodeMap) {
   const warnings = [];
   const missingBarcode = new Set();
   for (const row of pickingRows) {
-    if (!row.code || !row.planNo) continue; // 商品ID と プランNo が揃う行のみ (GAS 準拠)
     const key = normCode(row.code);
-    const barcode = barcodeMap.get(key) || '';
-    if (!barcode) missingBarcode.add(key);
-    const planNo = row.planNo.split('\n').map(p => p.trim()).filter(Boolean).join(' / ');
+    const barcode = (key && barcodeMap.get(key)) || '';
+    if (!barcode) missingBarcode.add(key || '(商品ID空)');
+    const planNo = String(row.planNo || '').split('\n').map(p => p.trim()).filter(Boolean).join(' / ') || 'プランなし';
     csvRows.push([row.code, planNo, row.name, barcode, row.dodai]);
   }
   if (missingBarcode.size) {

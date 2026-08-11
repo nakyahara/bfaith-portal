@@ -32,7 +32,9 @@ function runPython(args, { timeoutMs, timeoutLabel }) {
     cp.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) return reject(new Error(`${timeoutLabel}に失敗 (exit ${code}): ${(err || out).slice(0, 500)}`));
-      try { resolve(JSON.parse(out || '{}')); } catch { resolve({}); }
+      // 成功時の stdout JSON は完全性検証に使うため、解析不能は成功扱いにしない (fail-closed)
+      try { resolve(JSON.parse(out)); }
+      catch { reject(new Error(`${timeoutLabel}の結果JSONを解析できません: ${(out || '(空)').slice(0, 200)}`)); }
     });
   });
 }
@@ -49,7 +51,8 @@ export async function extractPickingPdf(tmp1Buffer, { timeoutMs = 60000 } = {}) 
   const jsonOut = path.join(dir, 'extract.json');
   try {
     await fsp.writeFile(pdfIn, tmp1Buffer);
-    await runPython(['--pdf', pdfIn, '--extract-json', jsonOut], { timeoutMs, timeoutLabel: 'TMP1 PDF抽出' });
+    const stats = await runPython(['--pdf', pdfIn, '--extract-json', jsonOut], { timeoutMs, timeoutLabel: 'TMP1 PDF抽出' });
+    if (stats.mode !== 'extract') throw new Error(`TMP1 PDF抽出の結果が不正です (mode=${stats.mode})`);
     const payload = JSON.parse(await fsp.readFile(jsonOut, 'utf8'));
     const items = (payload.items || []).map(it => ({
       page: it.page, item: it.item,
@@ -78,8 +81,17 @@ export async function annotatePickingPdf(tmp1Buffer, planItems, { timeoutMs = 60
     await fsp.writeFile(pdfIn, tmp1Buffer);
     await fsp.writeFile(planJson, JSON.stringify({ items: planItems }));
     const stats = await runPython(['--pdf', pdfIn, '--plan-json', planJson, '--out', pdfOut], { timeoutMs, timeoutLabel: 'PDF注番' });
+    // 完全性検証: 注番件数が入力と一致しなければ成功扱いにしない (fail-closed)
+    if (stats.mode !== 'annotate') throw new Error(`PDF注番の結果が不正です (mode=${stats.mode})`);
+    if (stats.total !== planItems.length) {
+      throw new Error(`PDF注番の対象件数(${stats.total})が入力件数(${planItems.length})と一致しません`);
+    }
+    const expectedMatched = planItems.filter(it => it.status === 'matched').length;
+    if (stats.matched !== expectedMatched) {
+      throw new Error(`PDF注番の一致件数(${stats.matched})が期待値(${expectedMatched})と一致しません`);
+    }
     const pdfBuffer = await fsp.readFile(pdfOut);
-    return { pdfBuffer, matched: stats.matched || 0, total: stats.total || 0 };
+    return { pdfBuffer, matched: stats.matched, total: stats.total };
   } finally {
     await fsp.rm(dir, { recursive: true, force: true }).catch(() => {});
   }

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import {
   normalizeBlock, normalizeLocation, buildMatchKey, parseStrictNonNegInt,
-  formatExpiry, reconcilePdfWithLz, buildLabelRowsV2,
+  formatExpiry, reconcilePdfWithLz, buildLabelRows, buildLabelRowsV2, isValidDateYmd,
   UNALLOCATED, UNALLOCATED_LOC_DISPLAY, LABEL_V2_HEADER,
 } from '../picking-prep.js';
 
@@ -179,5 +179,23 @@ t('無期限29991231は空欄・空欄期限は警告のみ', () => {
   assert.equal(v2.expiryErrors.length, 0);
   assert.ok(v2.warnings.some(w => /期限が空欄/.test(w)));
 });
+
+// ---- buildLabelRows (旧5列) — 枚数保証は旧CSVでも守る ----
+console.log('--- buildLabelRows (旧5列) ---');
+t('プランNo未解決行もスキップせず「プランなし」で全行出力', () => {
+  const pickingRows = [
+    { block: 'P1FB', location: '00101202', code: 'a', name: 'A', planNo: '通常_1', dodai: '' },
+    { block: 'P1FB', location: '00101203', code: 'b', name: 'B', planNo: '', dodai: '' },
+  ];
+  const { csvRows } = buildLabelRows(pickingRows, new Map());
+  assert.equal(csvRows.length - 1, 2);
+  assert.equal(csvRows[2][1], 'プランなし');
+});
+
+console.log('--- isValidDateYmd ---');
+t('実在日付は true', () => assert.equal(isValidDateYmd('2026-08-11'), true));
+t('2026-99-99 は false', () => assert.equal(isValidDateYmd('2026-99-99'), false));
+t('2027-02-29 は false', () => assert.equal(isValidDateYmd('2027-02-29'), false));
+t('形式不正は false', () => assert.equal(isValidDateYmd('20260811'), false));
 
 console.log(`\n${passed} tests passed${process.exitCode ? ' (with FAILURES)' : ''}`);
