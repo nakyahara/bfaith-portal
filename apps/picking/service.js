@@ -219,9 +219,11 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
     let batchId;
     let replaced = false;
     if (existing) {
-      // 同一CSV・同一分類の再confirmは「応答が届かなかった再送」なので成功済み結果を返す
-      // (Codex R1 medium: TB番号だけでは再送と意図的な再取込を区別できない)
-      if (existing.csv_sha256 === preview.csvSha256 && existing.hikiate_class === cls) {
+      // 同一CSV・同一分類・同一フォルダの再confirmは「応答が届かなかった再送」なので
+      // 成功済み結果を返す (Codex R1 medium)。フォルダ名が違う要求は再送ではなく変更なので
+      // 通常の duplicate/overwrite 経路に落とす (Codex R2 medium)
+      if (existing.csv_sha256 === preview.csvSha256 && existing.hikiate_class === cls
+          && (existing.folder_name ?? null) === folder) {
         return { batchId: existing.id, replaced: false, replayed: true };
       }
       if (existing.status !== 'ready') {
@@ -262,10 +264,10 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
     // 取込の監査ログ (追記型)。上書きは変更前の集計値も残す (Codex R1 medium)
     db.prepare(`
       INSERT INTO pk_import_logs
-        (batch_id, tb_no, action, csv_sha256, hikiate_class, line_count, slip_count, total_qty,
-         before_json, actor, at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(batchId, preview.tbNo, replaced ? 'overwrite' : 'create', preview.csvSha256, cls,
+        (batch_id, tb_no, action, csv_sha256, hikiate_class, folder_name,
+         line_count, slip_count, total_qty, before_json, actor, at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(batchId, preview.tbNo, replaced ? 'overwrite' : 'create', preview.csvSha256, cls, folder,
       preview.lines.length, preview.slipCount, preview.totalQty,
       replaced ? JSON.stringify({
         hikiate_class: existing.hikiate_class, folder_name: existing.folder_name,

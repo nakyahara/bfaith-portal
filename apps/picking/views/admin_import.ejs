@@ -88,7 +88,9 @@
   </div>
 
   <script>
-    const ALL_PATTERNS = <%- JSON.stringify(patternNames) %>;
+    <%# JSON内の "<" を "\u003c" にエスケープし、script要素からのコンテキスト脱出を防ぐ
+        (現状はサーバー固定定数だが、将来DB管理化しても安全なように) %>
+    const ALL_PATTERNS = <%- JSON.stringify(patternNames).replace(/</g, '\\u003c') %>;
     const $ = (id) => document.getElementById(id);
     let currentFile = null;
 

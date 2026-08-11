@@ -275,6 +275,21 @@ t('importBatch: 内容が異なる再取込は duplicate、overwrite=true で入
   assert.equal(before.hikiate_class, 'ネコポス手動単品');
 });
 
+t('importBatch: 同一CSVでもフォルダ名が違えば再送扱いしない (duplicate)', () => {
+  const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_FOLDER' })]);
+  const p = parseCs03002(csv);
+  const { batchId } = importBatch(p, { hikiateClass: 'ネコポス手動単品', folderName: '出荷_01' }, 'test@b-faith.biz');
+  expectPkError(() => importBatch(p, { hikiateClass: 'ネコポス手動単品', folderName: '出荷_02' }, 'test@b-faith.biz'), 'duplicate');
+  // overwrite でフォルダ変更でき、監査ログに folder_name が残る
+  const r = importBatch(p, { hikiateClass: 'ネコポス手動単品', folderName: '出荷_02', overwrite: true }, 'test@b-faith.biz');
+  assert.equal(r.replaced, true);
+  const b = getDB().prepare('SELECT folder_name FROM pk_batches WHERE id=?').get(batchId);
+  assert.equal(b.folder_name, '出荷_02');
+  const log = getDB().prepare('SELECT * FROM pk_import_logs WHERE batch_id=? ORDER BY id DESC').get(batchId);
+  assert.equal(log.folder_name, '出荷_02');
+  assert.equal(JSON.parse(log.before_json).folder_name, '出荷_01');
+});
+
 t('importBatch: 作業開始後の別内容は already_started (同一内容の再送は成功)', () => {
   const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB_STARTED' })]);
   const p = parseCs03002(csv);

@@ -88,6 +88,8 @@ function migrate() {
   }
 }
 
+// v1 は PR1 マージまで自由に編集してよい (本番デプロイ前のため既存DBは存在しない)。
+// マージ後のスキーマ変更は必ず v2 以降の migration として追記する
 const MIGRATIONS = {
   1: createCoreTables,
 };
@@ -175,6 +177,7 @@ function createCoreTables() {
     action      TEXT NOT NULL CHECK(action IN ('create','overwrite')),
     csv_sha256  TEXT NOT NULL,
     hikiate_class TEXT NOT NULL,
+    folder_name TEXT,
     line_count  INTEGER NOT NULL,
     slip_count  INTEGER NOT NULL,
     total_qty   INTEGER NOT NULL,
