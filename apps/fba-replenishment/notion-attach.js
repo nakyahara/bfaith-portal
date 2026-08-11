@@ -99,7 +99,7 @@ export function pickStatusProp(props = {}) {
  * (カードは必ず作る)。
  * @returns {Promise<{ pageId: string, url: string, statusSet: boolean }>}
  */
-export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url }) {
+export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url, noteLines = [] }) {
   if (!getToken()) throw new Error('FBA_PICKING_NOTION_TOKEN が未設定です');
   if (!title) throw new Error('カード名(納品予定日)が空です');
   const dbId = getNotionDbId();
@@ -111,6 +111,14 @@ export async function createPickingCard({ title, pdfUrl, plan1Url, plan2Url }) {
       object: 'block',
       type: 'file',
       file: { type: 'external', external: { url: pdfUrl }, caption: [] },
+    });
+  }
+  // 未引当・プランなし等の注意書きを本文に残す (現場が後から件数を追跡できるように)
+  for (const line of noteLines) {
+    children.push({
+      object: 'block',
+      type: 'paragraph',
+      paragraph: { rich_text: [{ type: 'text', text: { content: String(line).slice(0, 1900) } }] },
     });
   }
   // 本文(メモ)に「送り状発行手順」リンクを残す (コメントではなくページ本文)
