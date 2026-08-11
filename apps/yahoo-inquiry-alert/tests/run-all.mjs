@@ -106,11 +106,11 @@ section('proxyConfig');
 section('validateListResponse');
 {
   const q = QUERIES[0]; // unanswered/shp
-  const good = listJson({ filter: 'unanswered', count: 3, headlines: [headline({ isNoAnswer: true })] });
+  const good = listJson({ filter: 'unanswered', count: 1, headlines: [headline({ isNoAnswer: true })] });
   const r = validateListResponse(good, q);
-  eq(r.count, 3, 'count を summary から読む');
+  eq(r.count, 1, 'count を summary から読む');
 
-  await throws(() => validateListResponse(listJson({ filter: 'all', count: 3, headlines: [] }), q),
+  await throws(() => validateListResponse(listJson({ filter: 'all', count: 0, headlines: [] }), q),
     /summary\.filter/, '旧プロキシ (filter=all) は contract error');
   await throws(() => validateListResponse({ summary: { filter: 'unanswered', topic: {} }, headlines: [] }, q),
     /count が読み取れません/, 'count 欠落は throw (0件と混同しない)');
@@ -122,6 +122,23 @@ section('validateListResponse');
   await throws(() => validateListResponse(
     listJson({ filter: 'unanswered', count: 1, headlines: [headline({ isNoAnswer: 'true' })] }), q),
     /真偽値/, 'isNoAnswer が文字列なら throw');
+
+  // count と明細数の整合性 (Codexレビュー High: 矛盾レスポンスを 0件=無通知 にしない)
+  await throws(() => validateListResponse(
+    listJson({ filter: 'unanswered', count: 0, headlines: [headline({ isNoAnswer: true })] }), q),
+    /明細が 1件/, 'count=0 なのに明細あり → throw');
+  await throws(() => validateListResponse(
+    listJson({ filter: 'unanswered', count: 5, headlines: [] }), q),
+    /明細が 0件/, 'count>0 なのに明細なし → throw');
+  await throws(() => validateListResponse(
+    listJson({ filter: 'unanswered', count: 1, headlines: [headline({ topicId: 'x1', isNoAnswer: true }), headline({ topicId: 'x2', isNoAnswer: true })] }), q),
+    /明細が 2件/, 'count より明細が多い → throw');
+  {
+    // count=30 (>20) のときは明細20件が期待値
+    const h20 = Array.from({ length: 20 }, (_, i) => headline({ topicId: `p${i}`, isNoAnswer: true }));
+    const r30 = validateListResponse(listJson({ filter: 'unanswered', count: 30, headlines: h20 }), q);
+    eq(r30.count, 30, 'count>20 は明細20件で正常 (ページング)');
+  }
 
   const qa = QUERIES[2]; // answered/shp → uncompleted
   await throws(() => validateListResponse(
@@ -235,6 +252,16 @@ section('buildMessage');
   });
   ok(!msg3.includes('未返信'), '0件セクションは表示しない');
   ok(msg3.includes('1件あります'), '合計は完了処理待ちのみ');
+
+  // 顧客入力タイトルの無害化 (Codexレビュー Medium)
+  const evil = '偽装\nセクション\t<users/all> こんにちは';
+  const msg5 = buildMessage({
+    unanswered: { count: 1, items: [{ serviceType: 'shp', title: evil, userPostTime: 1754870400, sellerPostTime: null }] },
+    uncompleted: { count: 0, items: [] },
+  });
+  ok(!/偽装\n/.test(msg5), '改行は除去される (セクション偽装防止)');
+  ok(!msg5.includes('<users/all>'), 'メンション記法は分断される');
+  ok(msg5.includes('偽装 セクション'), '本文自体は残る');
 
   // 長いタイトルの切り詰め
   const long = 'あ'.repeat(60);

@@ -1,0 +1,825 @@
+diff --git a/.env.example b/.env.example
+index fc2621c..578abd9 100644
+--- a/.env.example
++++ b/.env.example
+@@ -74,6 +74,13 @@ YAHOO_UNSHIPPED_SEARCH_DAYS=
+ YAHOO_UNSHIPPED_MAX_VERIFY=
+ # 通知先は GCHAT_WEBHOOK_SHIPPING (楽天版と共用)。API認証は YAHOO_PROXY_URL / YAHOO_PROXY_SECRET
+ 
++# Yahoo! 問い合わせ対応漏れチェック (apps/yahoo-inquiry-alert) — ⚠ミニPC専用
++# ① 未返信 (出店者回答待ち) ② 返信済みだが「完了する」処理がされていない問い合わせを
++# 問い合わせ管理API (VPSプロキシ経由) で検知し、1件以上あるときだけ通知する。
++# daily-sync の1ステップとして実行。API認証は YAHOO_PROXY_URL / YAHOO_PROXY_SECRET を共用
++# 通知先スペースの Google Chat Webhook URL (未設定ならステップが失敗する)
++GCHAT_WEBHOOK_YAHOO_INQUIRY=
++
+ # au PAY 未発送アラート (apps/aupay-unshipped) — ⚠ミニPC専用・通知先は楽天/Yahoo版と同じスペース
+ # warehouse.db で候補を絞り、auPAY受注API (VPSプロキシ経由) で最新確認してから通知する。
+ # ⚠auPAY の payment_status は「入金済み」ではない (発送後にYになる)。判定は order_status='発送待ち'
+diff --git a/apps/warehouse/daily-sync.js b/apps/warehouse/daily-sync.js
+index fb4aab3..52a4b20 100644
+--- a/apps/warehouse/daily-sync.js
++++ b/apps/warehouse/daily-sync.js
+@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
+ //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
+ // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
+ // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
+-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Qoo10'];
++const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10'];
+ 
+ const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
+ 
+@@ -1264,6 +1264,16 @@ async function main() {
+     });
+   }
+ 
++  // ─── Yahoo! 問い合わせ対応漏れチェック ───
++  // ① 未返信 (出店者回答待ち) ② 返信済みだが「完了する」処理がされていない問い合わせ
++  // (通常 + オークション落札前) を検知し、**1件以上あるときだけ**専用スペースへ通知する。
++  // 問い合わせ管理API (VPSプロキシの read-only passthrough) を直接読むだけで
++  // warehouse.db には依存しない → 他ステップの成否に影響されない。照会は4リクエストのみ。
++  // 該当ゼロ=無通知 の仕様なので、実行失敗はジョブ自身が同じ webhook に ❌ を送る
++  // (静かな停止と平和な0件を受け手が区別できるように)
++  const yahooInquiryResult = runScript('apps/yahoo-inquiry-alert/notify-job.js --once', 'Yahoo問い合わせ対応漏れ', 300000);
++  results.push({ name: 'Yahoo問い合わせ対応漏れ', ...yahooInquiryResult });
++
+   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
+   // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。
+   // 冪等 (当日分完成済み+元DB変化なしなら再利用して offsite 以降だけやり直す) なので retry 対象。
+diff --git a/apps/warehouse/retry-failed-jobs.js b/apps/warehouse/retry-failed-jobs.js
+index 8d370a4..0a22a6b 100644
+--- a/apps/warehouse/retry-failed-jobs.js
++++ b/apps/warehouse/retry-failed-jobs.js
+@@ -77,13 +77,16 @@ const JOB_DEFINITIONS = {
+   'Qoo10':                 { script: 'apps/warehouse/qoo10-orders.js',              args: ['90'], timeoutMs: 1800000 },
+   // Qoo10未発送アラート: DBだけで判定して通知する (API再確認なし)。上の Qoo10 同期の後に走らせる
+   'Qoo10未発送アラート':   { script: 'apps/qoo10-unshipped/notify-job.js',          args: ['--once'], timeoutMs: 300000 },
++  // Yahoo問い合わせ対応漏れ: 問い合わせ管理API を読んで通知するだけ (DBに書かない) ので再実行安全。
++  // 該当ゼロ=無通知 の仕様なので、朝の便が落ちたら当日中の retry で必ず結果を出す
++  'Yahoo問い合わせ対応漏れ': { script: 'apps/yahoo-inquiry-alert/notify-job.js',     args: ['--once'], timeoutMs: 300000 },
+ };
+ 
+ // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
+ // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
+ // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
+ // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
+-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10', 'Qoo10未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
++const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+ 
+ async function notify(text) {
+   if (!GCHAT_WEBHOOK) {
+diff --git a/apps/yahoo-inquiry-alert/notify-job.js b/apps/yahoo-inquiry-alert/notify-job.js
+new file mode 100644
+index 0000000..a90c763
+--- /dev/null
++++ b/apps/yahoo-inquiry-alert/notify-job.js
+@@ -0,0 +1,137 @@
++/**
++ * Yahoo!ショッピング 問い合わせ対応漏れチェック — 検知して GChat へ通知する (ミニPC実行)
++ *
++ * 何を見ているか (詳細は service.js の冒頭コメント):
++ *   ① 未返信 (出店者回答待ち) の問い合わせ
++ *   ② 返信済みだが「完了する」(回答済み) 処理がされていない問い合わせ
++ *   対象は「通常」と「オークション (落札前)」の両方。**該当が1件以上あるときだけ**通知する。
++ *
++ * どこで動くか:
++ *   ミニPC の daily-sync (毎朝07:00) の1ステップ (未発送アラート群の直後)。
++ *   warehouse.db には依存しない (Yahoo!の問い合わせAPIを直接読むだけ)。
++ *   失敗した日は retry-failed-jobs (08:30/10:00/11:30) が拾って当日中に再実行する。
++ *
++ * 安全設計:
++ *   - 照会のみ。返信・完了処理・既読化などデータ変更は一切しない
++ *     (VPSプロキシの read-only passthrough しか叩かない)
++ *   - 実行失敗 (認証切れ・API変更など) も同じ webhook に ❌ で通知する
++ *     (該当ゼロ=無通知 の仕様なので、静かに止まると気づけないため)
++ *   - 件数が読み取れないときは 0件と混同せずエラーにする (service.js の fail-closed 検証)
++ *
++ * 環境変数 (ミニPC の .env):
++ *   GCHAT_WEBHOOK_YAHOO_INQUIRY     … 通知先スペースの webhook (必須)
++ *   YAHOO_PROXY_URL / YAHOO_PROXY_SECRET … VPSプロキシ (既存のYahoo設定を使う)
++ *
++ * 使い方:
++ *   node apps/yahoo-inquiry-alert/notify-job.js --once       … 実行して該当があれば GChat へ送る
++ *   node apps/yahoo-inquiry-alert/notify-job.js --dry-run    … 送らずに結果を標準出力へ
++ */
++import 'dotenv/config';
++import fs from 'node:fs';
++import { fileURLToPath } from 'node:url';
++import { fetchInquiryStatus, buildMessage } from './service.js';
++import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
++
++const TAG = 'yahoo-inquiry';
++
++/** GChat 送信。一時障害に備えて1回だけリトライする */
++async function sendWithRetry(webhook, text) {
++  try {
++    await sendGChatMessage(webhook, text);
++  } catch (e) {
++    console.warn(`[${TAG}] GChat送信に失敗、10秒後に再試行: ${e.message}`);
++    await new Promise(r => setTimeout(r, 10_000));
++    await sendGChatMessage(webhook, text);
++  }
++}
++
++/**
++ * 検知 → 通知。
++ * @returns {Promise<{ok:boolean, note:string, text:string|null, unanswered:object, uncompleted:object}>}
++ */
++export async function runYahooInquiryAlert(opts = {}) {
++  // 送り先が無いのは設定漏れ。API を触る前に落とす (静かに無通知にしない)
++  const webhook = process.env.GCHAT_WEBHOOK_YAHOO_INQUIRY;
++  if (!opts.dryRun && !webhook) {
++    throw new Error('GCHAT_WEBHOOK_YAHOO_INQUIRY 未設定のため通知できません');
++  }
++
++  const result = await fetchInquiryStatus(opts);
++  const text = buildMessage(result);
++  const note = `未返信${result.unanswered.count}件 / 完了処理待ち${result.uncompleted.count}件`;
++
++  if (opts.dryRun) {
++    console.log(`[${TAG}] dry-run (${note})`);
++    console.log(text ?? '(該当0件 — 通知なし)');
++    return { ...result, ok: true, note: `${note} (dry-run)`, text };
++  }
++
++  if (text === null) {
++    // 該当ゼロは通知しない仕様。「実行されたか」は daily-sync のサマリと実行ログで確認できる
++    console.log(`[${TAG}] 該当0件のため通知なし (${note})`);
++    return { ...result, ok: true, note, text };
++  }
++
++  await sendWithRetry(webhook, text);
++  console.log(`[${TAG}] 通知しました (${note})`);
++  return { ...result, ok: true, note, text };
++}
++
++/**
++ * 実行失敗を同じ webhook へ知らせる (best effort — これ自体の失敗で元のエラーを隠さない)。
++ * 該当ゼロ=無通知 の仕様なので、失敗を通知しないと「静かな停止」と「平和な0件」を
++ * 受け手が区別できない。retry (08:30/10:00/11:30) が成功すればその日は正常に戻る。
++ */
++async function notifyFailure(error) {
++  const webhook = process.env.GCHAT_WEBHOOK_YAHOO_INQUIRY;
++  if (!webhook) return;
++  const text = `❌ Yahoo!問い合わせチェックの実行に失敗: ${String(error?.message || error).slice(0, 300)}\n`
++    + '(daily-sync の retry で当日中に自動再実行されます。連続して出る場合は要調査)';
++  try {
++    await sendGChatMessage(webhook, text);
++  } catch (e) {
++    console.warn(`[${TAG}] 失敗通知の送信もできませんでした: ${e.message}`);
++  }
++}
++
++/**
++ * 終了処理。
++ * 🚨process.exit() を即座に呼ぶと、開いたままの fetch 接続の終了処理と競合して
++ *   Windows で `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` abort になることがある
++ *   (2026-08-10 の yahoo-unshipped 初回本番で実発生。通知は送れているのに 0xC0000409 で
++ *    終了し、daily-sync が失敗と誤判定 → retry で通知が重複する)。
++ *   → exitCode を立てて自然終了させ、万一終わらない時だけ強制終了する (未発送アラート群と同じ形)。
++ */
++const FORCE_EXIT_AFTER_MS = 5000;
++
++export function finish(code) {
++  process.exitCode = code;
++  // unref するのでイベントループの終了は妨げない。発火した = 何かのハンドルが残っている
++  // 証拠なので、同期書き込みで必ず痕跡を残す (console.error は exit で捨てられうる)
++  setTimeout(() => {
++    const msg = `[${TAG}] ${FORCE_EXIT_AFTER_MS}ms 待っても終了しないため強制終了します (残っているハンドルを調べること)`;
++    try { fs.writeSync(2, msg + '\n'); } catch { /* 書けなくても終了は続ける */ }
++    process.exit(code);
++  }, FORCE_EXIT_AFTER_MS).unref();
++}
++
++// ─── CLI ───
++const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
++if (isMain) {
++  const dryRun = process.argv.includes('--dry-run');
++  if (!dryRun && !process.argv.includes('--once')) {
++    console.log('使い方: node apps/yahoo-inquiry-alert/notify-job.js --once | --dry-run');
++    process.exit(1);
++  }
++  runYahooInquiryAlert({ dryRun })
++    .then(r => {
++      // daily-sync はこの行の末尾をサマリに載せる
++      console.log(`[${TAG}] 完了: ${r.note}`);
++      finish(0);
++    })
++    .catch(async e => {
++      console.error(`[${TAG}] 失敗:`, e.message);
++      if (!dryRun) await notifyFailure(e);
++      finish(1);
++    });
++}
+diff --git a/apps/yahoo-inquiry-alert/service.js b/apps/yahoo-inquiry-alert/service.js
+new file mode 100644
+index 0000000..65fca29
+--- /dev/null
++++ b/apps/yahoo-inquiry-alert/service.js
+@@ -0,0 +1,249 @@
++/**
++ * Yahoo!ショッピング 問い合わせ対応漏れチェック — 検知ロジック
++ *
++ * 目的:
++ *   問い合わせ回答率の悪化を防ぐ。返信していても「完了する」(回答済み) 処理を忘れると
++ *   回答率に反映されないため、次の2種類を毎朝検知して GChat に通知する:
++ *     ① 未返信 (出店者回答待ち)                 … isNoAnswer=true
++ *     ② 返信済みだが完了処理されていない        … isNoAnswer=false かつ isCompleted=false
++ *   対象はストアクリエイターPro 問い合わせ管理ツールの「通常」(shp) と
++ *   「オークション (落札前)」(auc) の両方。
++ *
++ * データ源: 問い合わせ管理API 質問一覧 (externalTalkList)。
++ *   https://developer.yahoo.co.jp/webapi/shopping/question/list.html
++ *   - VPSプロキシ (vps-proxy/aupay-proxy.js) の read-only passthrough 経由
++ *     (Yahoo!システムAPIは登録済み固定IPからしか呼べない。Bearer+公開鍵署名はVPS側で付与)
++ *   - requestFilter=unanswered / answered をサーバー側で絞り、**1ページ目だけ**読む。
++ *     件数は summary.topic.count (絞り込み後の総件数) から取るので全ページ走査は不要。
++ *     一覧はソート指定の降順 → 1ページ目 (20件) = 最新の該当分 = 通知に載せる分
++ *
++ * 🚨fail-closed の考え方 (0件と「読めない」を混同しない):
++ *   - summary.filter が要求した requestFilter と一致しなければエラー
++ *     (旧プロキシがパラメータを転送していない場合、全件が返って summary.filter='all' になる。
++ *      そのまま进むと件数を誤読するので必ず止める)
++ *   - unanswered の結果に isNoAnswer=false が混ざる、answered の結果に isCompleted=true が
++ *     混ざる場合もエラー (フィルタ語義が想定 (相互排他な状態) と違う = 件数を信用できない)
++ *   - shp と auc の結果に同じ topicId が出たらエラー (serviceType が効いていない)
++ *
++ * 個人情報: 通知に載せるのはタイトルと日時のみ。注文者名・マスクIDは扱わない。
++ */
++
++/** 1リクエスト/秒のレート制限 (公式)。余裕を持って1.1秒 */
++export const SLEEP_MS = 1100;
++/** 通知に載せる明細の上限 (カテゴリごと)。超えた分は件数だけ伝える */
++export const MAX_SHOW = 10;
++/** externalTalkList の1ページ上限 (公式仕様) */
++const PAGE_SIZE = 20;
++
++export const SERVICE_LABEL = { shp: '通常', auc: 'オークション' };
++
++/**
++ * 実行する照会の一覧。
++ *   kind 'unanswered'  = ① 未返信 → 顧客の最終投稿 (userPostTime) が新しい順
++ *   kind 'uncompleted' = ② 返信済み・完了処理待ち → 店舗の最終返信 (sellerPostTime) が新しい順
++ */
++export const QUERIES = [
++  { serviceType: 'shp', requestFilter: 'unanswered', kind: 'unanswered', sort: 'userPostTime' },
++  { serviceType: 'auc', requestFilter: 'unanswered', kind: 'unanswered', sort: 'userPostTime' },
++  { serviceType: 'shp', requestFilter: 'answered', kind: 'uncompleted', sort: 'sellerPostTime' },
++  { serviceType: 'auc', requestFilter: 'answered', kind: 'uncompleted', sort: 'sellerPostTime' },
++];
++
++export function proxyConfig(env = process.env) {
++  const base = (env.YAHOO_PROXY_URL || 'http://133.167.122.198:8080').replace(/\/+$/, '');
++  const secret = env.YAHOO_PROXY_SECRET || env.AUPAY_PROXY_SECRET || '';
++  if (!secret) throw new Error('YAHOO_PROXY_SECRET (または AUPAY_PROXY_SECRET) が未設定です');
++  return { base, secret };
++}
++
++/** UNIX秒 → 'M/D HH:MM' (JST)。不正は null */
++export function fmtJstFromUnixSec(v) {
++  const n = Number(v);
++  if (!Number.isFinite(n) || n <= 0) return null;
++  const t = new Date(n * 1000 + 9 * 3600 * 1000);
++  const pad2 = x => String(x).padStart(2, '0');
++  return `${t.getUTCMonth() + 1}/${t.getUTCDate()} ${pad2(t.getUTCHours())}:${pad2(t.getUTCMinutes())}`;
++}
++
++function contractError(msg) {
++  const e = new Error(msg);
++  e.errorType = 'contract_violation';
++  return e;
++}
++
++/**
++ * 一覧レスポンス1ページ分を検証する。壊れていたら throw (握り潰さない)。
++ * @returns {{count:number, headlines:object[]}}
++ */
++export function validateListResponse(json, q) {
++  const label = `${q.requestFilter}/${q.serviceType}`;
++  const filter = json?.summary?.filter;
++  // 旧プロキシは requestFilter を転送しない → Yahoo!は全件を返し filter='all' になる。
++  // ここで止めないと「全問い合わせ数」を「対応漏れ数」と誤読する
++  if (filter !== q.requestFilter) {
++    throw contractError(`summary.filter='${filter}' が要求 '${q.requestFilter}' と一致しません`
++      + ` (VPSプロキシが絞り込みパラメータ未対応の可能性。${label})`);
++  }
++  const count = json?.summary?.topic?.count;
++  if (!Number.isFinite(count) || count < 0) {
++    throw contractError(`summary.topic.count が読み取れません (${label}: ${JSON.stringify(count)})`);
++  }
++  const headlines = json?.headlines;
++  if (!Array.isArray(headlines)) {
++    throw contractError(`headlines が配列でありません (${label})`);
++  }
++  for (const h of headlines) {
++    if (!h?.topicId) throw contractError(`topicId のない行があります (${label})`);
++    if (typeof h.isNoAnswer !== 'boolean' || typeof h.isCompleted !== 'boolean') {
++      throw contractError(`isNoAnswer/isCompleted が真偽値でありません (${label}: ${h.topicId})`);
++    }
++    // フィルタ語義の検証: unanswered に返信済みが混ざる / answered に未返信・完了済みが
++    // 混ざるなら、summary.topic.count を「その分類の件数」として信用できない
++    if (q.kind === 'unanswered' && h.isNoAnswer !== true) {
++      throw contractError(`unanswered の結果に返信済み (isNoAnswer=false) が混ざっています (${label}: ${h.topicId})`);
++    }
++    if (q.kind === 'uncompleted' && (h.isNoAnswer !== false || h.isCompleted !== false)) {
++      throw contractError(`answered の結果に想定外の状態が混ざっています`
++        + ` (${label}: ${h.topicId} isNoAnswer=${h.isNoAnswer} isCompleted=${h.isCompleted})`);
++    }
++    // serviceType が返ってくる場合は要求と一致すること (無指定転送の検出)
++    if (h.serviceType != null && h.serviceType !== q.serviceType) {
++      throw contractError(`serviceType='${h.serviceType}' が要求 '${q.serviceType}' と一致しません (${label}: ${h.topicId})`);
++    }
++  }
++  return { count, headlines };
++}
++
++/** 一覧行 → 通知に載せる1件 (タイトルと日時のみ。個人情報は持たない) */
++export function toItem(h, q) {
++  return {
++    topicId: String(h.topicId),
++    serviceType: q.serviceType,
++    title: String(h.title || '(タイトルなし)'),
++    userPostTime: Number(h.userPostTime) || null,
++    sellerPostTime: h.sellerPostTime == null ? null : Number(h.sellerPostTime) || null,
++    sortTime: Number(h[q.sort]) || 0,
++  };
++}
++
++/**
++ * 4照会 (shp/auc × unanswered/answered) を実行して分類する。
++ * @param {{fetchImpl?:Function, sleepMs?:number, timeoutMs?:number, env?:object}} opts
++ * @returns {Promise<{unanswered:{count:number, items:object[]}, uncompleted:{count:number, items:object[]}}>}
++ *   count = Yahoo!側の総件数 (summary.topic.count の合算)、items = 新しい順の明細 (最大20件/照会)
++ */
++export async function fetchInquiryStatus(opts = {}) {
++  const fetchImpl = opts.fetchImpl ?? fetch;
++  const sleepMs = opts.sleepMs ?? SLEEP_MS;
++  const timeoutMs = opts.timeoutMs ?? 45000;
++  const { base, secret } = proxyConfig(opts.env ?? process.env);
++
++  const out = {
++    unanswered: { count: 0, items: [] },
++    uncompleted: { count: 0, items: [] },
++  };
++  const seen = new Map(); // topicId → query label (serviceType が効いていない事故の検出)
++  let requests = 0;
++
++  for (const q of QUERIES) {
++    if (requests > 0) await new Promise(r => setTimeout(r, sleepMs));
++    requests++;
++
++    const u = new URL(`${base}/yahoo/externalTalkList`);
++    u.searchParams.set('start', '1');
++    u.searchParams.set('result', String(PAGE_SIZE));
++    u.searchParams.set('requestFilter', q.requestFilter);
++    u.searchParams.set('serviceType', q.serviceType);
++    u.searchParams.set('sort', q.sort);
++    u.searchParams.set('sortOrder', 'desc');
++
++    const label = `${q.requestFilter}/${q.serviceType}`;
++    let res;
++    try {
++      res = await fetchImpl(u.toString(), {
++        headers: { 'X-Proxy-Secret': secret },
++        signal: AbortSignal.timeout(timeoutMs),
++      });
++    } catch (err) {
++      const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
++      throw new Error(timedOut
++        ? `Yahooプロキシ タイムアウト (${timeoutMs}ms, ${label})`
++        : `Yahooプロキシ接続失敗 (${label}): ${err?.message || err}`);
++    }
++    const text = await res.text();
++    if (res.status !== 200) {
++      // Yahoo!のエラーはXML <Error><Code/>。コードだけ抜く (問い合わせ本文の露出防止)
++      const code = (text.match(/<Code>([^<]{1,40})<\/Code>/) || [])[1];
++      throw new Error(`Yahoo API HTTP ${res.status} (${label})${code ? ` code=${code}` : ''}`);
++    }
++    let json;
++    try { json = JSON.parse(text); } catch {
++      throw contractError(`Yahoo APIレスポンスがJSONでありません (${label}): ${text.length} bytes`);
++    }
++
++    const { count, headlines } = validateListResponse(json, q);
++    for (const h of headlines) {
++      const prev = seen.get(h.topicId);
++      if (prev) {
++        throw contractError(`同じ topicId が複数の照会に現れました (${prev} と ${label}: ${h.topicId})`
++          + ' — serviceType の絞り込みが効いていない可能性');
++      }
++      seen.set(h.topicId, label);
++    }
++    const bucket = out[q.kind];
++    bucket.count += count;
++    bucket.items.push(...headlines.map(h => toItem(h, q)));
++    console.log(`[yahoo-inquiry] ${label}: ${count}件`);
++  }
++
++  // shp と auc を混ぜて新しい順に (通知は最新のものから載せる)
++  out.unanswered.items.sort((a, b) => b.sortTime - a.sortTime);
++  out.uncompleted.items.sort((a, b) => b.sortTime - a.sortTime);
++  return out;
++}
++
++// ─── GChat 本文 ───
++
++function truncate(s, n) {
++  const str = String(s || '');
++  return str.length > n ? `${str.slice(0, n)}…` : str;
++}
++
++function itemLine(it, kind) {
++  const tag = SERVICE_LABEL[it.serviceType] || it.serviceType;
++  const received = fmtJstFromUnixSec(it.userPostTime) || '-';
++  const times = kind === 'uncompleted' && it.sellerPostTime
++    ? `受信 ${received} / 返信 ${fmtJstFromUnixSec(it.sellerPostTime)}`
++    : `受信 ${received}`;
++  return `・[${tag}] ${truncate(it.title, 40)} (${times})`;
++}
++
++/**
++ * 通知本文を組み立てる。**両方0件なら null** (該当ゼロは通知しない仕様 —
++ * 「通知が来た = 何か対応が必要」と分かるようにする。実行の生存確認は daily-sync 側が担う)。
++ */
++export function buildMessage({ unanswered, uncompleted }) {
++  const total = unanswered.count + uncompleted.count;
++  if (total === 0) return null;
++
++  const lines = [];
++  lines.push(`⚠️ *Yahoo!問い合わせに対応が必要なものが${total}件あります*`);
++
++  if (unanswered.count > 0) {
++    lines.push('');
++    lines.push(`🔴 未返信 (出店者回答待ち): *${unanswered.count}件*`);
++    for (const it of unanswered.items.slice(0, MAX_SHOW)) lines.push(itemLine(it, 'unanswered'));
++    if (unanswered.count > MAX_SHOW) lines.push(`  …他 ${unanswered.count - MAX_SHOW}件`);
++  }
++
++  if (uncompleted.count > 0) {
++    lines.push('');
++    lines.push(`🟡 返信済みだが「完了する」が押されていない: *${uncompleted.count}件*`);
++    for (const it of uncompleted.items.slice(0, MAX_SHOW)) lines.push(itemLine(it, 'uncompleted'));
++    if (uncompleted.count > MAX_SHOW) lines.push(`  …他 ${uncompleted.count - MAX_SHOW}件`);
++  }
++
++  lines.push('');
++  lines.push('ストアクリエイターPro「問い合わせ管理」で返信・完了処理をしてください');
++  return lines.join('\n');
++}
+diff --git a/apps/yahoo-inquiry-alert/tests/run-all.mjs b/apps/yahoo-inquiry-alert/tests/run-all.mjs
+new file mode 100644
+index 0000000..143b79b
+--- /dev/null
++++ b/apps/yahoo-inquiry-alert/tests/run-all.mjs
+@@ -0,0 +1,299 @@
++/**
++ * Yahoo!問い合わせ対応漏れチェック のテスト。
++ *   node apps/yahoo-inquiry-alert/tests/run-all.mjs
++ * Yahoo API もプロキシも叩かない (fetchImpl を差し替えて検証する)。
++ */
++process.env.YAHOO_PROXY_URL = 'http://proxy.test';
++process.env.YAHOO_PROXY_SECRET = 'test-secret';
++
++const {
++  QUERIES,
++  MAX_SHOW,
++  fmtJstFromUnixSec,
++  validateListResponse,
++  toItem,
++  fetchInquiryStatus,
++  buildMessage,
++  proxyConfig,
++} = await import('../service.js');
++
++let pass = 0;
++let fail = 0;
++function ok(cond, label) {
++  if (cond) { pass++; return; }
++  fail++;
++  console.error(`  ✗ ${label}`);
++}
++function eq(actual, expected, label) {
++  const a = JSON.stringify(actual);
++  const e = JSON.stringify(expected);
++  if (a === e) { pass++; return; }
++  fail++;
++  console.error(`  ✗ ${label}\n      期待: ${e}\n      実際: ${a}`);
++}
++async function throws(fn, re, label) {
++  try {
++    await fn();
++    fail++;
++    console.error(`  ✗ ${label} (throw されなかった)`);
++  } catch (e) {
++    if (re.test(e.message)) { pass++; return; }
++    fail++;
++    console.error(`  ✗ ${label}\n      期待パターン: ${re}\n      実際: ${e.message}`);
++  }
++}
++function section(name) { console.log(`\n── ${name}`); }
++
++// テスト用の一覧レスポンスを組み立てる
++function listJson({ filter, count, headlines }) {
++  return {
++    summary: { filter, unansweredCount: 0, topic: { start: 1, end: headlines.length, count } },
++    headlines,
++  };
++}
++function headline(over = {}) {
++  return {
++    topicId: over.topicId ?? 't-default',
++    isUnread: false,
++    isNoAnswer: false,
++    isCompleted: false,
++    title: 'テスト質問',
++    userPostTime: 1754870400, // 2026-08-11 09:00 JST
++    sellerPostTime: null,
++    ...over,
++  };
++}
++
++// fetchImpl スタブ: URLの requestFilter/serviceType を見て応答を返す
++function stubFetch(responses) {
++  const calls = [];
++  const impl = async (urlStr) => {
++    const u = new URL(urlStr);
++    const key = `${u.searchParams.get('requestFilter')}/${u.searchParams.get('serviceType')}`;
++    calls.push({ key, params: Object.fromEntries(u.searchParams) });
++    const r = responses[key];
++    if (!r) throw new Error(`スタブ未定義: ${key}`);
++    if (r.status && r.status !== 200) {
++      return { status: r.status, text: async () => r.body ?? '<Error><Code>px-test</Code></Error>' };
++    }
++    return { status: 200, text: async () => JSON.stringify(r.json) };
++  };
++  impl.calls = calls;
++  return impl;
++}
++
++const EMPTY = {
++  'unanswered/shp': { json: listJson({ filter: 'unanswered', count: 0, headlines: [] }) },
++  'unanswered/auc': { json: listJson({ filter: 'unanswered', count: 0, headlines: [] }) },
++  'answered/shp': { json: listJson({ filter: 'answered', count: 0, headlines: [] }) },
++  'answered/auc': { json: listJson({ filter: 'answered', count: 0, headlines: [] }) },
++};
++
++// ─── ユーティリティ ───
++section('fmtJstFromUnixSec');
++eq(fmtJstFromUnixSec(1754870400), '8/11 09:00', 'UNIX秒 → JST表記');
++eq(fmtJstFromUnixSec(0), null, '0 は null');
++eq(fmtJstFromUnixSec('abc'), null, '非数値は null');
++
++section('proxyConfig');
++{
++  const c = proxyConfig({ YAHOO_PROXY_URL: 'http://x/', YAHOO_PROXY_SECRET: 's' });
++  eq(c.base, 'http://x', '末尾スラッシュ除去');
++  await throws(() => proxyConfig({}), /未設定/, 'secret 無しは throw');
++}
++
++// ─── レスポンス検証 (fail-closed) ───
++section('validateListResponse');
++{
++  const q = QUERIES[0]; // unanswered/shp
++  const good = listJson({ filter: 'unanswered', count: 3, headlines: [headline({ isNoAnswer: true })] });
++  const r = validateListResponse(good, q);
++  eq(r.count, 3, 'count を summary から読む');
++
++  await throws(() => validateListResponse(listJson({ filter: 'all', count: 3, headlines: [] }), q),
++    /summary\.filter/, '旧プロキシ (filter=all) は contract error');
++  await throws(() => validateListResponse({ summary: { filter: 'unanswered', topic: {} }, headlines: [] }, q),
++    /count が読み取れません/, 'count 欠落は throw (0件と混同しない)');
++  await throws(() => validateListResponse({ summary: { filter: 'unanswered', topic: { count: 1 } } }, q),
++    /headlines/, 'headlines 欠落は throw');
++  await throws(() => validateListResponse(
++    listJson({ filter: 'unanswered', count: 1, headlines: [headline({ isNoAnswer: false })] }), q),
++    /返信済み.*が混ざって/, 'unanswered に isNoAnswer=false が混ざったら throw');
++  await throws(() => validateListResponse(
++    listJson({ filter: 'unanswered', count: 1, headlines: [headline({ isNoAnswer: 'true' })] }), q),
++    /真偽値/, 'isNoAnswer が文字列なら throw');
++
++  const qa = QUERIES[2]; // answered/shp → uncompleted
++  await throws(() => validateListResponse(
++    listJson({ filter: 'answered', count: 1, headlines: [headline({ isCompleted: true })] }), qa),
++    /想定外の状態/, 'answered に完了済みが混ざったら throw (件数を信用できない)');
++  await throws(() => validateListResponse(
++    listJson({ filter: 'answered', count: 1, headlines: [headline({ serviceType: 'auc' })] }), qa),
++    /serviceType/, 'serviceType 不一致は throw');
++}
++
++// ─── toItem ───
++section('toItem');
++{
++  const it = toItem(headline({ isNoAnswer: true, title: 'x', userPostTime: 100, sellerPostTime: '200' }), QUERIES[0]);
++  eq(it.userPostTime, 100, 'userPostTime 数値化');
++  eq(it.sellerPostTime, 200, 'sellerPostTime 文字列も数値化');
++  eq(it.sortTime, 100, 'sort キー (unanswered は userPostTime)');
++  const it2 = toItem(headline({ title: '', sellerPostTime: 300 }), QUERIES[2]);
++  eq(it2.title, '(タイトルなし)', '空タイトルの表示');
++  eq(it2.sortTime, 300, 'sort キー (answered は sellerPostTime)');
++}
++
++// ─── fetchInquiryStatus ───
++section('fetchInquiryStatus: 正常系');
++{
++  const impl = stubFetch({
++    'unanswered/shp': { json: listJson({ filter: 'unanswered', count: 2, headlines: [
++      headline({ topicId: 'u1', isNoAnswer: true, title: '在庫ありますか', userPostTime: 1754870400 }),
++      headline({ topicId: 'u2', isNoAnswer: true, title: '色違いは', userPostTime: 1754784000 }),
++    ] }) },
++    'unanswered/auc': { json: listJson({ filter: 'unanswered', count: 1, headlines: [
++      headline({ topicId: 'u3', isNoAnswer: true, title: '落札前質問', userPostTime: 1754956800 }),
++    ] }) },
++    'answered/shp': { json: listJson({ filter: 'answered', count: 1, headlines: [
++      headline({ topicId: 'a1', title: '返信済みの件', userPostTime: 1754697600, sellerPostTime: 1754701200 }),
++    ] }) },
++    'answered/auc': { json: listJson({ filter: 'answered', count: 0, headlines: [] }) },
++  });
++  const r = await fetchInquiryStatus({ fetchImpl: impl, sleepMs: 0 });
++  eq(r.unanswered.count, 3, '未返信 count 合算 (shp2 + auc1)');
++  eq(r.uncompleted.count, 1, '完了処理待ち count');
++  eq(r.unanswered.items.map(i => i.topicId), ['u3', 'u1', 'u2'], '新しい順に混ぜてソート');
++  eq(impl.calls.length, 4, '照会は4回 (shp/auc × unanswered/answered)');
++  ok(impl.calls.every(c => c.params.sortOrder === 'desc'), '全照会 desc');
++  ok(impl.calls.filter(c => c.key.startsWith('unanswered')).every(c => c.params.sort === 'userPostTime'),
++    'unanswered は userPostTime ソート');
++  ok(impl.calls.filter(c => c.key.startsWith('answered')).every(c => c.params.sort === 'sellerPostTime'),
++    'answered は sellerPostTime ソート');
++}
++
++section('fetchInquiryStatus: 異常系 (fail-closed)');
++{
++  await throws(
++    () => fetchInquiryStatus({ fetchImpl: stubFetch({ ...EMPTY, 'unanswered/shp': { status: 403 } }), sleepMs: 0 }),
++    /HTTP 403/, 'HTTP エラーは throw (0件にしない)');
++  // 非JSONボディを返すケース
++  const badJson = async () => ({ status: 200, text: async () => '<html>error</html>' });
++  await throws(() => fetchInquiryStatus({ fetchImpl: badJson, sleepMs: 0 }), /JSONでありません/, 'HTMLレスポンスは throw');
++  // 同じ topicId が shp と auc の両方に出る = serviceType が効いていない
++  const dup = headline({ topicId: 'dup', isNoAnswer: true });
++  await throws(
++    () => fetchInquiryStatus({
++      fetchImpl: stubFetch({
++        ...EMPTY,
++        'unanswered/shp': { json: listJson({ filter: 'unanswered', count: 1, headlines: [dup] }) },
++        'unanswered/auc': { json: listJson({ filter: 'unanswered', count: 1, headlines: [dup] }) },
++      }),
++      sleepMs: 0,
++    }),
++    /同じ topicId/, 'shp/auc 重複は throw (serviceType 未転送の検出)');
++  // fetch 自体の失敗
++  const netErr = async () => { const e = new Error('ECONNREFUSED'); throw e; };
++  await throws(() => fetchInquiryStatus({ fetchImpl: netErr, sleepMs: 0 }), /接続失敗/, 'ネットワーク失敗は throw');
++}
++
++// ─── buildMessage ───
++section('buildMessage');
++{
++  eq(buildMessage({ unanswered: { count: 0, items: [] }, uncompleted: { count: 0, items: [] } }), null,
++    '両方0件は null (通知しない)');
++
++  const msg = buildMessage({
++    unanswered: { count: 2, items: [
++      { serviceType: 'shp', title: '在庫ありますか', userPostTime: 1754870400, sellerPostTime: null },
++      { serviceType: 'auc', title: '落札前質問', userPostTime: 1754784000, sellerPostTime: null },
++    ] },
++    uncompleted: { count: 1, items: [
++      { serviceType: 'shp', title: '返信済みの件', userPostTime: 1754697600, sellerPostTime: 1754701200 },
++    ] },
++  });
++  ok(msg.includes('3件あります'), '合計件数');
++  ok(msg.includes('未返信 (出店者回答待ち): *2件*'), '未返信の件数');
++  ok(msg.includes('「完了する」が押されていない: *1件*'), '完了処理待ちの件数');
++  ok(msg.includes('[通常] 在庫ありますか'), '通常タグ+タイトル');
++  ok(msg.includes('[オークション] 落札前質問'), 'オークションタグ');
++  ok(msg.includes('受信 8/9') && msg.includes('返信 8/9'), '完了処理待ちは受信+返信の両時刻');
++  ok(!msg.includes('undefined') && !msg.includes('null'), 'undefined/null が漏れていない');
++
++  // 上限超え: 明細は MAX_SHOW 件まで + 「他N件」
++  const many = Array.from({ length: 25 }, (_, i) => (
++    { serviceType: 'shp', title: `質問${i}`, userPostTime: 1754870400 - i, sellerPostTime: null }
++  ));
++  const msg2 = buildMessage({ unanswered: { count: 25, items: many }, uncompleted: { count: 0, items: [] } });
++  eq((msg2.match(/^・/gm) || []).length, MAX_SHOW, `明細は ${MAX_SHOW} 件まで`);
++  ok(msg2.includes(`他 ${25 - MAX_SHOW}件`), '超過分は件数で明示 (黙って切らない)');
++
++  // 片方だけ0件ならそのセクションを出さない
++  const msg3 = buildMessage({
++    unanswered: { count: 0, items: [] },
++    uncompleted: { count: 1, items: [{ serviceType: 'shp', title: 'x', userPostTime: 1754697600, sellerPostTime: 1754701200 }] },
++  });
++  ok(!msg3.includes('未返信'), '0件セクションは表示しない');
++  ok(msg3.includes('1件あります'), '合計は完了処理待ちのみ');
++
++  // 長いタイトルの切り詰め
++  const long = 'あ'.repeat(60);
++  const msg4 = buildMessage({
++    unanswered: { count: 1, items: [{ serviceType: 'shp', title: long, userPostTime: 1754870400, sellerPostTime: null }] },
++    uncompleted: { count: 0, items: [] },
++  });
++  ok(msg4.includes('あ'.repeat(40) + '…'), 'タイトルは40文字で切り詰め');
++}
++
++// ─── notify-job (webhook ガード) ───
++section('notify-job: webhook ガード');
++{
++  delete process.env.GCHAT_WEBHOOK_YAHOO_INQUIRY;
++  const { runYahooInquiryAlert } = await import('../notify-job.js');
++  await throws(() => runYahooInquiryAlert({}), /GCHAT_WEBHOOK_YAHOO_INQUIRY/,
++    'webhook 未設定で --once は API を叩く前に throw');
++  // dry-run は webhook 無しでも動く
++  const r = await runYahooInquiryAlert({ dryRun: true, fetchImpl: stubFetch(EMPTY), sleepMs: 0 });
++  eq(r.text, null, 'dry-run: 0件は text=null');
++  ok(r.note.includes('dry-run'), 'dry-run 印字');
++}
++
++// ─── 通知送信 (fetch スタブで sendGChatMessage まで通す) ───
++section('notify-job: 送信経路');
++{
++  process.env.GCHAT_WEBHOOK_YAHOO_INQUIRY = 'https://chat.googleapis.com/dummy';
++  const { runYahooInquiryAlert } = await import('../notify-job.js');
++  const sent = [];
++  const origFetch = globalThis.fetch;
++  globalThis.fetch = async (u, init) => {
++    if (String(u).startsWith('https://chat.googleapis.com/')) {
++      sent.push(JSON.parse(init.body));
++      return { ok: true, status: 200, text: async () => '' };
++    }
++    return stubFetch({
++      ...EMPTY,
++      'unanswered/shp': { json: listJson({ filter: 'unanswered', count: 1, headlines: [
++        headline({ topicId: 'n1', isNoAnswer: true, title: '通知テスト', userPostTime: 1754870400 }),
++      ] }) },
++    })(u);
++  };
++  try {
++    const r = await runYahooInquiryAlert({ sleepMs: 0 });
++    eq(sent.length, 1, '該当ありは webhook へ 1回 POST');
++    ok(sent[0].text.includes('通知テスト'), '本文にタイトル');
++    ok(r.ok, 'ok=true');
++
++    sent.length = 0;
++    globalThis.fetch = async (u) => {
++      if (String(u).startsWith('https://chat.googleapis.com/')) throw new Error('通知先には行かないはず');
++      return stubFetch(EMPTY)(u);
++    };
++    const r0 = await runYahooInquiryAlert({ sleepMs: 0 });
++    eq(r0.text, null, '0件は通知なし (webhook POST されない)');
++  } finally {
++    globalThis.fetch = origFetch;
++  }
++}
++
++console.log(`\n結果: pass=${pass} fail=${fail}`);
++if (fail > 0) process.exit(1);
+diff --git a/config/jobs-registry.mjs b/config/jobs-registry.mjs
+index 1a88456..0977671 100644
+--- a/config/jobs-registry.mjs
++++ b/config/jobs-registry.mjs
+@@ -63,7 +63,8 @@ export const JOBS_REGISTRY = [
+     purpose: 'モール受注取込→fact build→DQ→Render mirror 同期 (約45ステップ)。全業務データの土台。'
+       + '日次出荷サマリ (出荷日×モール×配送方法) の再構築もここ。'
+       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
+-      + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) も走る',
++      + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
++      + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知) も走る',
+     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
+     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
+     anchor_hour_jst: 7,
+diff --git a/vps-proxy/aupay-proxy.js b/vps-proxy/aupay-proxy.js
+index e7eda4a..d10a1a6 100644
+--- a/vps-proxy/aupay-proxy.js
++++ b/vps-proxy/aupay-proxy.js
+@@ -836,14 +836,30 @@ const server = http.createServer(async (req, res) => {
+       return;
+     }
+ 
+-    // 問い合わせ管理API passthrough (inquiry-hub 受信同期用。read-onlyのみ、パラメータ許可リスト方式)
++    // 問い合わせ管理API passthrough (inquiry-hub 受信同期 + yahoo-inquiry-alert 用。
++    // read-onlyのみ、パラメータ許可リスト方式 — 指定されたものだけ検証して転送する)
+     if (pathname === '/yahoo/externalTalkList' && req.method === 'GET') {
+       const start = url.searchParams.get('start') || '1';
+       const result = url.searchParams.get('result') || '20';
+       if (!/^\d+$/.test(start) || Number(start) < 1) throw new Error('start は1以上の数値で指定してください');
+       if (!/^\d+$/.test(result) || Number(result) < 1 || Number(result) > 20) throw new Error('result は1〜20で指定してください (API上限20)');
+-      const r = await yahooCircusGet('/externalTalkList', { start, result });
+-      console.log(`[${ts()}] Yahoo externalTalkList start=${start} -> ${r.status} (${r.body.length} bytes)`);
++      const params = { start, result };
++      // 絞り込み系 (yahoo-inquiry-alert が使う)。値は公式仕様の列挙値のみ許可
++      const optional = {
++        requestFilter: /^(answered|unanswered|completed)(,(answered|unanswered|completed))*$/,
++        serviceType: /^(shp|auc)$/,
++        sort: /^(userPostTime|sellerPostTime)$/,
++        sortOrder: /^(asc|desc)$/,
++      };
++      for (const [name, re] of Object.entries(optional)) {
++        const v = url.searchParams.get(name);
++        if (v == null) continue;
++        if (!re.test(v)) throw new Error(`${name} が不正です`);
++        params[name] = v;
++      }
++      const filterLabel = params.requestFilter ? ` filter=${params.requestFilter}/${params.serviceType || '-'}` : '';
++      const r = await yahooCircusGet('/externalTalkList', params);
++      console.log(`[${ts()}] Yahoo externalTalkList start=${start}${filterLabel} -> ${r.status} (${r.body.length} bytes)`);
+       res.writeHead(r.status, { 'Content-Type': r.contentType });
+       res.end(r.body);
+       return;

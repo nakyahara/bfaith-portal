@@ -92,6 +92,14 @@ export function validateListResponse(json, q) {
   if (!Array.isArray(headlines)) {
     throw contractError(`headlines が配列でありません (${label})`);
   }
+  // count と明細数の整合性 (Codexレビュー High): start=1, result=20 の要求に対して
+  // 明細数は必ず min(count, 20) になるはず。count=0 なのに明細がある / count>0 なのに
+  // 明細が無い ようなレスポンスをそのまま通すと、該当があるのに「0件=無通知」で
+  // 正常終了してしまう。矛盾はエラーにする (0件と読み取り不能を混同しない)
+  const expected = Math.min(count, PAGE_SIZE);
+  if (headlines.length !== expected) {
+    throw contractError(`count=${count} に対して明細が ${headlines.length}件 (期待 ${expected}件) です (${label})`);
+  }
   for (const h of headlines) {
     if (!h?.topicId) throw contractError(`topicId のない行があります (${label})`);
     if (typeof h.isNoAnswer !== 'boolean' || typeof h.isCompleted !== 'boolean') {
@@ -204,8 +212,20 @@ export async function fetchInquiryStatus(opts = {}) {
 
 // ─── GChat 本文 ───
 
+/**
+ * 顧客入力 (タイトル) を通知へ載せる前の無害化 (Codexレビュー Medium)。
+ * 改行・制御文字で通知のセクション偽装をされない / GChat のメンション記法
+ * (<users/all> 等) を発動させない。装飾記法 (*) は見た目だけなので許容
+ */
+export function sanitizeForChat(s) {
+  return String(s || '')
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')            // 改行・タブ含む制御文字 → 空白
+    .replace(/<(users|rooms)\//gi, '<\u200b$1/')       // メンション記法をゼロ幅スペースで分断
+    .trim();
+}
+
 function truncate(s, n) {
-  const str = String(s || '');
+  const str = sanitizeForChat(s);
   return str.length > n ? `${str.slice(0, n)}…` : str;
 }
 
