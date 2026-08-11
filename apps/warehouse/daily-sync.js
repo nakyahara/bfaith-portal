@@ -80,7 +80,7 @@ function isAliveNodeProcess(pid) {
 //   amazon_sku_fees への INSERT OR REPLACE + TTL/差分フィルタで再実行安全 (成功済み SKU は次 run で skip)。
 // '楽天未発送アラート' も retry 対象: RMS API の一時障害で落ちた日でも、
 // 8:30/10:00/11:30 の retry で当日中に通知が出る (失敗時のみ再実行 = 重複通知にはならない)
-const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Qoo10'];
+const RETRYABLE_JOBS = ['f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon Settlement', 'Amazon finance build', 'Amazon手数料', 'ABA検索ワード', 'DBバックアップ', '楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10'];
 
 const GCHAT_WEBHOOK = process.env.GCHAT_WEBHOOK;
 
@@ -1263,6 +1263,16 @@ async function main() {
       summary: '⏸️ Qoo10受注同期の失敗により未実行 (retryで Qoo10同期→判定 の順に再実行)',
     });
   }
+
+  // ─── Yahoo! 問い合わせ対応漏れチェック ───
+  // ① 未返信 (出店者回答待ち) ② 返信済みだが「完了する」処理がされていない問い合わせ
+  // (通常 + オークション落札前) を検知し、**1件以上あるときだけ**専用スペースへ通知する。
+  // 問い合わせ管理API (VPSプロキシの read-only passthrough) を直接読むだけで
+  // warehouse.db には依存しない → 他ステップの成否に影響されない。照会は4リクエストのみ。
+  // 該当ゼロ=無通知 の仕様なので、実行失敗はジョブ自身が同じ webhook に ❌ を送る
+  // (静かな停止と平和な0件を受け手が区別できるように)
+  const yahooInquiryResult = runScript('apps/yahoo-inquiry-alert/notify-job.js --once', 'Yahoo問い合わせ対応漏れ', 300000);
+  results.push({ name: 'Yahoo問い合わせ対応漏れ', ...yahooInquiryResult });
 
   // ─── warehouse.db 日次バックアップ (VACUUM INTO → gzip → rclone offsite → 世代管理) ───
   // 全 build/sync の後に実行 (WarehouseServer の並行書き込み分は前後しうる = 厳密断面ではない)。
