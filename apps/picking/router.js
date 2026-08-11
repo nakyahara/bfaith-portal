@@ -20,8 +20,13 @@ import {
 } from './db.js';
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
+  deriveFolderName, isStaleInstructDate,
 } from './service.js';
 import { allPatternNames } from './patterns.js';
+import { listDriveFiles, downloadDriveFileById } from '../../lib/drive-csv.js';
+
+// 出荷_no フォルダ (中原さん共有 2026-08-12。SA bfaith-portal@… に閲覧者共有済み)
+const DRIVE_FOLDER_ID = process.env.PICKING_DRIVE_FOLDER_ID || '110ONn2xHzfEG5HPt1DRy4P64zv2hpGjh';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -187,15 +192,8 @@ router.get('/admin/import', requireAdmin, (req, res) => {
  *   mode=confirm  … hikiate_class 必須。overwrite=1 で取込済みバッチの入れ替えを許可
  * preview → confirm でファイルを2回送る (サーバーに中間状態を持たない。GAS取込等と同じ二段方式)
  */
-router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
-  uploadCsv.single('file')(req, res, (err) => {
-    if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
-    next();
-  });
-}, api(async (req, res) => {
-  if (!req.file) throw new PkError(400, 'no_file', 'ファイルを選択してください');
-  const preview = parseCs03002(req.file.buffer);
-  const summary = {
+function buildSummary(preview) {
+  return {
     tbNo: preview.tbNo,
     instructDate: preview.instructDate,
     invoiceSoft: preview.invoiceSoft,
@@ -205,19 +203,75 @@ router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
     slipCount: preview.slipCount,
     totalQty: preview.totalQty,
     suggestions: preview.suggestions,
+    // 前日ファイル取り込み事故のガード (出荷Noは毎日再利用されるため警告を出す。ブロックはしない)
+    dateWarning: isStaleInstructDate(preview.instructDate)
+      ? `出荷指示日 (${preview.instructDate}) が今日ではありません。前日のファイルの可能性があります`
+      : null,
     lines: preview.lines.map((l) => ({
       locationLabel: formatLocation(l.block, l.location),
       sku: l.sku, productName: l.productName, qty: l.qty,
     })),
   };
-  if (String(req.body.mode) !== 'confirm') {
-    return res.json({ ok: true, mode: 'preview', ...summary });
-  }
-  const result = importBatch(preview, {
+}
+
+function runImport(preview, req) {
+  return importBatch(preview, {
     hikiateClass: req.body.hikiate_class,
     folderName: req.body.folder_name,
     overwrite: String(req.body.overwrite) === '1',
   }, req.session.email);
+}
+
+router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
+  uploadCsv.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
+    next();
+  });
+}, api(async (req, res) => {
+  if (!req.file) throw new PkError(400, 'no_file', 'ファイルを選択してください');
+  const preview = parseCs03002(req.file.buffer);
+  const summary = buildSummary(preview);
+  if (String(req.body.mode) !== 'confirm') {
+    return res.json({ ok: true, mode: 'preview', ...summary });
+  }
+  const result = runImport(preview, req);
+  res.json({ ok: true, mode: 'confirm', ...summary, ...result });
+}));
+
+// ─── Drive取込 (出荷_no フォルダ・管理者) ───
+
+/** lib/drive-csv.js のエラーを業務エラーへ変換 (VALIDATION=入力起因400 / それ以外=Drive側502)。 */
+async function driveCall(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof PkError) throw e;
+    throw new PkError(e.code === 'VALIDATION' ? 400 : 502, 'drive_error', e.message);
+  }
+}
+
+router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
+  const files = await driveCall(() => listDriveFiles({ folderId: DRIVE_FOLDER_ID, nameContains: '.csv' }));
+  res.json({ ok: true, files: files.filter((f) => /\.csv$/i.test(f.filename)) });
+}));
+
+/**
+ * Driveファイルの取込。body(JSON): { file_id, mode: preview|confirm, hikiate_class, folder_name, overwrite }
+ * preview → confirm で同じ file_id を2回ダウンロードする (アップロード経路と同じ二段方式。
+ * confirm 時も最新の中身を取り直すため、間に差し替わっても古い内容を確定しない)
+ */
+router.post('/admin/import/drive', checkOrigin, requireAdmin, api(async (req, res) => {
+  const fileId = String(req.body.file_id || '').trim();
+  if (!fileId) throw new PkError(400, 'no_file', 'ファイルを選択してください');
+  const dl = await driveCall(() => downloadDriveFileById({ fileId, folderId: DRIVE_FOLDER_ID }));
+  const preview = parseCs03002(dl.buffer);
+  const summary = buildSummary(preview);
+  summary.filename = dl.filename;
+  summary.folderNameSuggestion = deriveFolderName(dl.filename);
+  if (String(req.body.mode) !== 'confirm') {
+    return res.json({ ok: true, mode: 'preview', ...summary });
+  }
+  const result = runImport(preview, req);
   res.json({ ok: true, mode: 'confirm', ...summary, ...result });
 }));
 

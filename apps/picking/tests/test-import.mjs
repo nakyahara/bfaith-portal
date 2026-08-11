@@ -12,8 +12,8 @@ import iconv from 'iconv-lite';
 // DB を一時ディレクトリへ (モジュール読み込み前に設定する)
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-test-'));
 
-const { parseCs03002, importBatch, classifyComposition, formatLocation, PkError } =
-  await import('../service.js');
+const { parseCs03002, importBatch, classifyComposition, formatLocation, PkError,
+  deriveFolderName, isStaleInstructDate } = await import('../service.js');
 const { suggestPatterns } = await import('../patterns.js');
 const { initPickingDB, getDB, listBatches, listLines, jstToday } = await import('../db.js');
 
@@ -343,6 +343,21 @@ t('配送方法が混在するCSVは distinct を保持して表示・推定に�
   const p = parseCs03002(makeCsv([r1, r2]));
   assert.ok(p.deliveryMethod.includes(' / '), `混在が表示に残るはず: ${p.deliveryMethod}`);
   assert.ok(p.suggestions.some((n) => n.includes('LINEギフト')), 'ソフト混在=LINEギフトが候補に出る');
+});
+
+t('deriveFolderName: Driveファイル名から出荷フォルダ名を導出', () => {
+  assert.equal(deriveFolderName('ピッキングリストデータ_出荷03.csv'), '出荷_03');
+  assert.equal(deriveFolderName('ピッキングリストデータ_出荷3.csv'), '出荷_03');
+  assert.equal(deriveFolderName('ピッキングリストデータ_出荷_12.csv'), '出荷_12');
+  assert.equal(deriveFolderName('CS03002_9eb48e3d.csv'), null);
+  assert.equal(deriveFolderName(''), null);
+});
+
+t('isStaleInstructDate: 出荷指示日が今日を含まなければ警告', () => {
+  assert.equal(isStaleInstructDate('2000-01-01', '2026-08-12'), true);
+  assert.equal(isStaleInstructDate('2026-08-12', '2026-08-12'), false);
+  assert.equal(isStaleInstructDate('2000-01-01 / 2026-08-12', '2026-08-12'), false);   // 混在で今日を含む
+  assert.equal(isStaleInstructDate('', '2026-08-12'), false);                          // 不明はブロックしない
 });
 
 t('listBatches: 前日以前の未完了は持ち越し表示、完了は当日のみ', () => {
