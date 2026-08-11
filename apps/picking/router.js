@@ -39,6 +39,22 @@ function isRealDate(s) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
+/**
+ * 状態変更APIのCSRF緩和策: Origin ヘッダがあれば自ホストと一致することを要求する
+ * (セッションCookieのSameSiteに加えた明示防御。Origin無しの同一サイトfetchは通す)。
+ */
+function checkOrigin(req, res, next) {
+  const origin = req.headers.origin;
+  if (origin) {
+    let host = null;
+    try { host = new URL(origin).host; } catch { /* 不正値は下で403 */ }
+    if (!host || host !== req.headers.host) {
+      return res.status(403).json({ error: '不正なオリジンからのリクエストです' });
+    }
+  }
+  next();
+}
+
 function requireAdmin(req, res, next) {
   if (req.session.role !== 'admin') {
     return res.status(403).json({ error: '管理者のみ実行できます' });
@@ -116,7 +132,7 @@ router.get('/work/:id(\\d+)', (req, res) => {
  * 作業イベントAPI。body: { op_id, event: start|next|back, line_seq?, client_at? }。
  * 端末はオフラインキューから直列で送る。op_id 冪等なので再送は安全。
  */
-router.post('/api/batches/:id(\\d+)/events', api(async (req, res) => {
+router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
   const result = applyEvent(Number(req.params.id), {
     opId: req.body.op_id,
     event: req.body.event,
@@ -170,7 +186,7 @@ router.get('/admin/import', requireAdmin, (req, res) => {
  *   mode=confirm  … hikiate_class 必須。overwrite=1 で取込済みバッチの入れ替えを許可
  * preview → confirm でファイルを2回送る (サーバーに中間状態を持たない。GAS取込等と同じ二段方式)
  */
-router.post('/admin/import', requireAdmin, (req, res, next) => {
+router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
   uploadCsv.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
     next();

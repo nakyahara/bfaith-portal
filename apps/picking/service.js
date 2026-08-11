@@ -388,8 +388,11 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
         WHERE batch_id = ? AND seq = (SELECT MIN(seq) FROM pk_lines WHERE batch_id = ? AND status = 'pending')
       `).run(now, batchId, batchId);
     } else {
-      // next / back は自分が picking 中のバッチにのみ適用できる
-      if (batch.status !== 'picking') {
+      // next は picking 中のみ。back は「最終明細のnextで完了した直後の誤タップ」を取り消せる
+      // 必要があるため、done からも受け付けてバッチを picking に戻す (Codex PR2-R1)。
+      // これが無いと、オフラインキュー [next(最終), back] の後半が 409 になりキューごと破棄される
+      const backFromDone = event === 'back' && batch.status === 'done';
+      if (batch.status !== 'picking' && !backFromDone) {
         throw new PkError(409, 'not_picking', `バッチが作業中ではありません (${batch.status})`);
       }
       if (batch.worker !== worker) {
@@ -415,7 +418,10 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
           "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
         ).get(batchId).s;
         if (nextSeq != null) {
-          db.prepare('UPDATE pk_lines SET shown_at = COALESCE(shown_at, ?) WHERE batch_id=? AND seq=?')
+          // shown_at = 「直近にこの明細が表示対象になった時刻」。done_at - shown_at が
+          // その明細の実表示時間になる (back で往復しても他明細の時間が混入しない。
+          // 初回表示がいつだったかは pk_events の履歴から復元できる — Codex PR2-R1 medium)
+          db.prepare('UPDATE pk_lines SET shown_at = ? WHERE batch_id=? AND seq=?')
             .run(now, batchId, nextSeq);
         } else {
           // 最終明細の完了 = バッチ完了
@@ -423,7 +429,7 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
             .run(now, now, batchId);
         }
       } else if (event === 'back') {
-        // 直前に完了した明細を取り消して戻る。done_at は消すが shown_at は初回表示として残す
+        // 直前に完了した明細を取り消して戻る
         if (line.status !== 'done') {
           throw new PkError(409, 'not_done', `明細 ${lineSeq} は完了していないため戻れません`);
         }
@@ -434,8 +440,14 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt }, worker) 
         if (lastDone !== lineSeq) {
           throw new PkError(409, 'out_of_order', `戻れるのは直前の明細 (${lastDone}) だけです`);
         }
-        db.prepare("UPDATE pk_lines SET status='pending', done_at=NULL WHERE batch_id=? AND seq=?")
-          .run(batchId, lineSeq);
+        // shown_at は now に更新 (この瞬間から再表示。再作業時間に前の明細の時間を混ぜない)
+        db.prepare("UPDATE pk_lines SET status='pending', done_at=NULL, shown_at=? WHERE batch_id=? AND seq=?")
+          .run(now, batchId, lineSeq);
+        if (backFromDone) {
+          // 完了直後の取り消し: バッチを作業中に戻す
+          db.prepare("UPDATE pk_batches SET status='picking', finished_at=NULL, updated_at=? WHERE id=?")
+            .run(now, batchId);
+        }
       }
     }
 
