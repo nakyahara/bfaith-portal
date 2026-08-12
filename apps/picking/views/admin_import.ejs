@@ -112,17 +112,17 @@
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
-    async function post(mode, extra = {}) {
+    async function post(source, mode, extra = {}) {
       let res;
-      if (currentSource.type === 'drive') {
+      if (source.type === 'drive') {
         res = await fetch('/apps/picking/admin/import/drive', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ file_id: currentSource.fileId, mode, ...extra }),
+          body: JSON.stringify({ file_id: source.fileId, mode, ...extra }),
         });
       } else {
         const fd = new FormData();
-        fd.append('file', currentSource.file);
+        fd.append('file', source.file);
         fd.append('mode', mode);
         for (const [k, v] of Object.entries(extra)) fd.append(k, v);
         res = await fetch('/apps/picking/admin/import', { method: 'POST', body: fd });
@@ -147,7 +147,8 @@
         (body.dateWarning ? `<span style="color:#e8590c; font-weight:600">⚠ ${esc(body.dateWarning)}</span>` : '');
       fillDatalist(body.suggestions || []);
       $('hikiateClass').value = (body.suggestions || [])[0] || '';
-      if (body.folderNameSuggestion) $('folderName').value = body.folderNameSuggestion;
+      // 前回プレビューの値を残さない (残すと別ファイルに古い出荷_XXが付いたまま確定できてしまう)
+      $('folderName').value = body.folderNameSuggestion || '';
       $('lineBody').innerHTML = body.lines.map((l, i) =>
         `<tr><td class="num">${i + 1}</td><td class="loc">${esc(l.locationLabel)}</td>` +
         `<td>${esc(l.sku)}</td><td>${esc(l.productName)}</td><td class="num">${l.qty}</td></tr>`).join('');
@@ -157,24 +158,30 @@
       $('preview').style.display = 'block';
     }
 
-    async function doPreview(msgEl) {
+    // プレビュー要求ごとにトークンを振り、最新の応答だけを画面と currentSource に反映する
+    // (連打・並行プレビューで「画面はA・確定対象はB」に食い違うのを防ぐ)
+    let previewToken = 0;
+    async function doPreview(source, msgEl) {
+      const token = ++previewToken;
       msgEl.textContent = '解析中…'; msgEl.className = 'pk-msg';
-      const { status, body } = await post('preview');
+      const { status, body } = await post(source, 'preview');
+      if (token !== previewToken) return;   // 後から始まったプレビューが優先
       if (status !== 200) {
         msgEl.textContent = body.error || `エラー (${status})`; msgEl.className = 'pk-msg err';
+        currentSource = null;
         $('preview').style.display = 'none';
         return;
       }
       msgEl.textContent = '解析OK'; msgEl.className = 'pk-msg ok';
+      currentSource = source;   // 画面に表示した内容とだけ結び付ける
       showPreview(body);
     }
 
     $('previewBtn').addEventListener('click', async () => {
       const f = $('file').files[0];
       if (!f) { $('msg').textContent = 'ファイルを選択してください'; $('msg').className = 'pk-msg err'; return; }
-      currentSource = { type: 'file', file: f };
       $('previewBtn').disabled = true;
-      try { await doPreview($('msg')); } finally { $('previewBtn').disabled = false; }
+      try { await doPreview({ type: 'file', file: f }, $('msg')); } finally { $('previewBtn').disabled = false; }
     });
 
     // ── Drive一覧 ──
@@ -196,9 +203,8 @@
         $('driveTable').style.display = files.length > 0 ? 'table' : 'none';
         document.querySelectorAll('.btn-drive-preview').forEach((btn) => {
           btn.addEventListener('click', async () => {
-            currentSource = { type: 'drive', fileId: btn.dataset.id };
             btn.disabled = true;
-            try { await doPreview($('driveMsg')); } finally { btn.disabled = false; }
+            try { await doPreview({ type: 'drive', fileId: btn.dataset.id }, $('driveMsg')); } finally { btn.disabled = false; }
           });
         });
       } finally {
@@ -211,7 +217,7 @@
       $('confirmMsg').textContent = '取込中…'; $('confirmMsg').className = 'pk-msg';
       $('confirmBtn').disabled = true;
       try {
-        const { status, body } = await post('confirm', {
+        const { status, body } = await post(currentSource, 'confirm', {
           hikiate_class: $('hikiateClass').value.trim(),
           folder_name: $('folderName').value.trim(),
           overwrite: $('overwriteChk').checked ? '1' : '0',
