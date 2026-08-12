@@ -146,7 +146,7 @@
   <div class="bar">
     <a href="/apps/picking/">← 一覧</a>
     <span id="progress"></span>
-    <span><button id="voiceBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🔇</button><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
+    <span><button id="micBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🎤</button><button id="voiceBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🔇</button><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
@@ -385,12 +385,13 @@
       if (!force && l.seq === lastSpokenSeq) return;   // 同じ明細の再render (画像後追い等) では繰り返さない
       const p = locParts(l.loc);
       let text;
+      // ロケと数量の間は句点で区切る (読点より長いポーズになり聞き分けやすい — 中原さん要望 8/12)
       if (p) {
         // ブロック名は1文字ずつ区切って「ピー サン エフ ビー」と読ませる
         const blockPart = (p.block && p.block !== lastSpokenBlock) ? `${p.block.split('').join(' ')}、` : '';
-        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${l.qty}個`;
+        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}。${l.qty}個`;
       } else {
-        text = `${l.loc}、${l.qty}個`;   // 形式外ラベルはそのまま
+        text = `${l.loc}。${l.qty}個`;   // 形式外ラベルはそのまま
       }
       speak(text);
       lastSpokenSeq = l.seq;
@@ -538,6 +539,80 @@
     });
     // 読み上げONのまま再読込した端末は、最初のタップ (capture=ボタン処理より先) で無音アンロック
     document.addEventListener('click', () => { if (voiceOn) speak(''); }, { once: true, capture: true });
+
+    // ── 音声コマンド (🎤・実験的機能 2026-08-12 中原さん要望): 「つぎ」で次へ /「もどる」で戻る ──
+    // iOS Safari の webkitSpeechRecognition を使用。実機検証前の既知の不確定要素:
+    //   - 倉庫の騒音下での認識精度 / ホーム画面PWAでの挙動 (iOSバージョン差の報告あり)
+    //   - 認識は一定時間で勝手に止まる → onend で自動再開ループ
+    //   - マイク常時ONのバッテリー消費 / TTS読み上げとのオーディオセッション競合
+    // 誤発火対策: 「つぎ」等の単独発話に完全一致した時だけ反応 (近くの会話の長文は不一致で無視)。
+    // 使えないと判明したら BTリングリモコン (キー入力) 方式に切り替える (Phase 3メモ)
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const CMD_NEXT = ['つぎ', '次', '次へ', 'つぎへ', 'ネクスト'];
+    const CMD_BACK = ['もどる', '戻る', 'バック', 'まえ', '前'];
+    let micOn = localStorage.getItem('pk_mic') === '1';
+    let rec = null;
+    let recRestartTimer = null;
+    function handleVoiceCmd(raw) {
+      // スワイプ操作と同じガード: ピック画面で作業中のみ受け付ける
+      if (!started || !$('scr-pick').classList.contains('active')) return;
+      const s = String(raw || '').replace(/[。、．\s]/g, '');
+      if (CMD_NEXT.includes(s)) { $('nextBtn').click(); }
+      else if (CMD_BACK.includes(s)) { doBack(); }
+    }
+    function startRec() {
+      if (!SR || !micOn || rec) return;
+      const r = new SR();
+      rec = r;
+      r.lang = 'ja-JP';
+      r.continuous = true;
+      r.interimResults = false;
+      r.onresult = (e) => {
+        const last = e.results[e.results.length - 1];
+        if (last && last.isFinal) handleVoiceCmd(last[0] && last[0].transcript);
+      };
+      r.onerror = (e) => {
+        // 権限拒否・サービス不可はOFFに落として通知 (毎回エラーループさせない)。それ以外は onend の再開に任せる
+        if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+          micOn = false;
+          localStorage.setItem('pk_mic', '0');
+          renderMicBtn();
+          alert('この端末では音声操作を利用できません (マイク権限または音声認識サービス)');
+        }
+      };
+      r.onend = () => {
+        if (rec === r) rec = null;
+        // iOSは無音が続くと勝手に止まるため自動再開 (OFF時・画面非表示時は再開しない)
+        if (micOn && document.visibilityState === 'visible') {
+          clearTimeout(recRestartTimer);
+          recRestartTimer = setTimeout(startRec, 400);
+        }
+      };
+      try { r.start(); } catch { rec = null; }
+    }
+    function stopRec() {
+      clearTimeout(recRestartTimer);
+      if (rec) { const r = rec; rec = null; try { r.abort(); } catch {} }
+    }
+    function renderMicBtn() {
+      if (!SR) { $('micBtn').style.display = 'none'; return; }   // 非対応端末はボタン自体を隠す
+      $('micBtn').style.opacity = micOn ? '1' : '0.4';
+    }
+    renderMicBtn();
+    if (SR) {
+      $('micBtn').addEventListener('click', () => {
+        micOn = !micOn;
+        localStorage.setItem('pk_mic', micOn ? '1' : '0');
+        renderMicBtn();
+        if (micOn) startRec(); else stopRec();   // ONにしたタップがマイク権限プロンプトの起点になる
+      });
+      // ONのまま再読込した端末は最初のタップで再開 (権限は許可済みなのでプロンプトは出ない)
+      document.addEventListener('click', () => { if (micOn) startRec(); }, { once: true, capture: true });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') { if (micOn) startRec(); }
+        else stopRec();
+      });
+    }
 
     // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
     let shortTarget = null;
