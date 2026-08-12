@@ -224,6 +224,12 @@ export function listTemplates(q = {}) {
   return { rows, categories };
 }
 
+/** テンプレート1件 (返信エディタの「テンプレートを本文へ反映」用)。無効・不存在は null */
+export function getTemplate(id) {
+  if (!Number.isInteger(id)) return null;
+  return getDB().prepare('SELECT * FROM reply_templates WHERE id = ? AND is_active = 1').get(id) || null;
+}
+
 /** Q&A一覧 (q: {category, q}) */
 export function listQa(q = {}) {
   const db = getDB();

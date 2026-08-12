@@ -20,8 +20,8 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, getInquiryDetail, getAdjacentInquiries } from './queries.js';
-import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { CHANNELS, CH_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, countByChTab, getInquiryDetail, getAdjacentInquiries } from './queries.js';
+import { importTemplatesCsv, importQaCsv, listTemplates, listQa, getTemplate } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
@@ -101,25 +101,39 @@ function fmtLogJson(json) {
 router.get('/', (req, res) => {
   const q = req.query || {};
   const kw = String(q.q || '').trim();
-  const { rows, total, page, pages, view } = listInquiries(q);
+  const { rows, total, page, pages, view, ch } = listInquiries(q);
   const { shops, assignees, countMap } = listFilterOptions();
   // 任意フォルダ (サイドバーから ?folder=<id> で来る。ビュー条件とはANDで重なる)
   const folders = listFolders();
   const curFolder = /^\d+$/.test(String(q.folder || '')) ? folders.find(f => f.id === Number(q.folder)) : null;
 
+  // 上部チャネルタブ (2026-08-12 スタッフ要望): メールディーラーと同じく
+  // 「✉️メール」「💬問い合わせ」×「新着/返信処理中/完了」を件数付きで常時表示。
+  // タブはビュー+チャネル群への直行リンク (フォルダ・検索条件はリセット = 迷子防止)
+  const tabCounts = countByChTab();
+  const chTabs = `<nav class="chtabs">${Object.entries(CH_GROUPS).map(([g, meta]) => `
+    <div class="chtab-grp">
+      <span class="chtab-cap">${meta.icon} ${he(meta.label)}</span>
+      ${['inbox', 'sent', 'done'].map(v => `<a class="chtab${!curFolder && ch === g && view === v ? ' on' : ''}"
+        href="/apps/inquiry-hub?view=${v}&amp;ch=${g}">${he(VIEWS[v].label)}<span class="chtab-n${v === 'inbox' && tabCounts[g][v] ? ' hot' : ''}">${tabCounts[g][v]}</span></a>`).join('')}
+    </div>`).join('')}</nav>`;
+
+  // 詳細リンク等に引き継ぐ一覧文脈 (view / チャネルタブ / フォルダ)
+  const ctxQs = `view=${view}${ch ? `&ch=${ch}` : ''}${curFolder ? `&folder=${curFolder.id}` : ''}`;
+
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
-  // view/page はビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
+  // view/ch/page はタブ・ビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
   // スマホで絞り込みが常に開いてしまう)
-  const filtering = Object.entries(q).some(([k, v]) => !['page', 'view'].includes(k) && v !== '' && v != null);
+  const filtering = Object.entries(q).some(([k, v]) => !['page', 'view', 'ch'].includes(k) && v !== '' && v != null);
   const filterBar = `
   <details class="fbox" open>
   <summary>🔍 絞り込み${filtering ? ' <span class="badge" style="background:#dbeafe;color:#1d4ed8">条件あり</span>' : ''}</summary>
   <div class="fbody">
   <form method="get" class="filters">
     <input type="hidden" name="view" value="${he(view)}">
+    ${ch ? `<input type="hidden" name="ch" value="${he(ch)}">` : ''}
     <select name="status"><option value="">状態: 全て</option>${Object.entries(STATUSES).map(([k, v]) => opt(k, `${v.label} (${countMap[k] || 0})`, q.status)).join('')}</select>
-    <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
     <select name="shop"><option value="">店舗: 全て</option>${shops.map(s => opt(s.id, `${(CHANNELS[s.channel_type] || {}).label || s.channel_type} / ${s.shop_name}`, q.shop)).join('')}</select>
     <select name="folder"><option value="">フォルダ: 全て</option>${opt('none', '未分類', q.folder)}${folders.map(f => opt(f.id, `📁 ${f.name}`, q.folder)).join('')}</select>
     <select name="assigned"><option value="">担当: 全て</option>${opt('none', '未割当', q.assigned)}${assignees.map(u => opt(u, u, q.assigned)).join('')}</select>
@@ -129,7 +143,7 @@ router.get('/', (req, res) => {
     <input type="date" name="from" value="${he(q.from || '')}" title="受信日 From">〜<input type="date" name="to" value="${he(q.to || '')}" title="受信日 To">
     <input type="search" name="q" value="${he(kw)}" placeholder="顧客名/件名/本文/注文番号/商品コード" style="min-width:240px">
     <button class="pri">検索</button>
-    <a href="/apps/inquiry-hub?view=${he(view)}${curFolder ? `&folder=${curFolder.id}` : ''}" class="ghost btn-link">クリア</a>
+    <a href="/apps/inquiry-hub?${ctxQs}" class="ghost btn-link">クリア</a>
   </form>
   </div>
   </details>`;
@@ -148,12 +162,12 @@ router.get('/', (req, res) => {
 
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
-    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}'">
+    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?${ctxQs}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?${ctxQs}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
@@ -162,6 +176,7 @@ router.get('/', (req, res) => {
   const pageLink = p => {
     const u = new URLSearchParams(Object.entries(q).filter(([, v]) => v !== '' && v != null));
     u.set('view', view);
+    if (ch) u.set('ch', ch); else u.delete('ch');   // 不正な ?ch= はURLから落とす (正規化)
     u.set('page', p);
     return `/apps/inquiry-hub?${u.toString()}`;
   };
@@ -182,8 +197,12 @@ router.get('/', (req, res) => {
        <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
     : q.folder === 'none'
       ? `🗃️ <b>未分類</b> — フォルダに入れていない問い合わせ <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
-      : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
+      : ch
+        ? `${CH_GROUPS[ch].icon} <b>${he(CH_GROUPS[ch].label)}の${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}
+           <a class="sub" href="/apps/inquiry-hub?view=${he(view)}">全チャネルを見る</a>`
+        : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
   const body = `
+  ${chTabs}
   <div class="view-hint">${hintLine}</div>
   ${filterBar}
   <div class="card">
@@ -209,7 +228,7 @@ router.get('/', (req, res) => {
     mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
   })();`;
   res.send(pageShell(
-    curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${VIEWS[view].label}`,
+    curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${ch ? `${CH_GROUPS[ch].label}の` : ''}${VIEWS[view].label}`,
     curFolder ? `folder:${curFolder.id}` : view, body, listScript));
 });
 
@@ -219,11 +238,13 @@ router.get('/inquiries/:id', (req, res) => {
   const detail = getInquiryDetail(id);
   if (!detail) return res.status(404).send(pageShell('問い合わせ管理', DEFAULT_VIEW, '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
-  // 戻り先のビュー (一覧から ?view=/?folder= を引き継ぐ。直リンク時は受信トレイ)
+  // 戻り先のビュー (一覧から ?view=/?ch=/?folder= を引き継ぐ。直リンク時は受信トレイ)
   const backView = VIEWS[req.query?.view] ? req.query.view : DEFAULT_VIEW;
+  const backCh = CH_GROUPS[req.query?.ch] ? req.query.ch : '';
   const backFolderId = /^\d+$/.test(String(req.query?.folder || '')) ? Number(req.query.folder) : null;
   const backFolder = backFolderId ? listFolders().find(f => f.id === backFolderId) : null;
-  const backUrl = `/apps/inquiry-hub?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const backQs = `view=${he(backView)}${backCh ? `&ch=${backCh}` : ''}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const backUrl = `/apps/inquiry-hub?${backQs}`;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
 
@@ -330,6 +351,20 @@ router.get('/inquiries/:id', (req, res) => {
       : !sendLive
         ? '<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px;margin-bottom:8px">🧪 DRYRUNモード: このチャネルの送信ジョブは検証のみで、実際には送信されません (動作確認用)</div>'
         : '';
+  // テンプレート選択 (2026-08-12 スタッフ要望: 📄タブへ行ってコピーして戻る手間をなくし、
+  // その場で選んで本文へ反映できるようにする)。本文は選択時にAPIで取る (一覧166件を全埋め込みしない)
+  let tplPicker = '';
+  if (replyEditorEnabled() && !activeJob) {
+    const tplByCat = {};
+    for (const t of listTemplates().rows) (tplByCat[t.category || 'その他'] = tplByCat[t.category || 'その他'] || []).push(t);
+    const tplOptions = Object.entries(tplByCat).map(([cat, list]) =>
+      `<optgroup label="${he(cat)}">${list.map(t => `<option value="${t.id}">${he(t.template_name)}</option>`).join('')}</optgroup>`).join('');
+    tplPicker = tplOptions ? `
+        <div class="row tpl-pick">
+          <select id="tplSel"><option value="">📄 テンプレートを選ぶ…</option>${tplOptions}</select>
+          <button class="ghost" id="tplBtn" type="button">本文へ反映</button>
+        </div>` : '';
+  }
   const replyPanel = replyEditorEnabled() ? `
       <div class="panel">
         <h3>✉️ 返信を作成</h3>
@@ -337,7 +372,7 @@ router.get('/inquiries/:id', (req, res) => {
         ${outboxHtml}
         ${activeJob
           ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
-          : `<textarea id="replyBody" rows="6" placeholder="返信本文 (テンプレートは📄タブからコピーして貼り付け)"></textarea>
+          : `${tplPicker}<textarea id="replyBody" rows="6" placeholder="返信本文${tplPicker ? ' (上でテンプレートを選んで反映できます)' : ''}"></textarea>
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
@@ -388,15 +423,15 @@ router.get('/inquiries/:id', (req, res) => {
 
   // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder) で隣へ移動。
   // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
-  const adj = getAdjacentInquiries(id, { view: backView, folder: backFolder ? String(backFolder.id) : '' });
-  const navQs = `?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const adj = getAdjacentInquiries(id, { view: backView, ch: backCh, folder: backFolder ? String(backFolder.id) : '' });
+  const navQs = `?${backQs}`;
   const navLink = (row, label) => row
     ? `<a href="/apps/inquiry-hub/inquiries/${row.id}${navQs}" title="${he(row.subject || '(件名なし)')}">${label}</a>`
     : `<span class="nav-off" aria-disabled="true">${label}</span>`;
   const body = `
   <div class="detail-head">
     <div class="detail-nav">
-      <a href="${backUrl}">← ${backFolder ? `📁${he(backFolder.name)}` : he(VIEWS[backView].label)}に戻る</a>
+      <a href="${backUrl}">← ${backFolder ? `📁${he(backFolder.name)}` : `${backCh ? he(CH_GROUPS[backCh].label) + 'の' : ''}${he(VIEWS[backView].label)}`}に戻る</a>
       <span class="detail-nav-adj">
         ${navLink(adj.prev, '← 前の問い合わせ')}
         ${navLink(adj.next, '次の問い合わせ →')}
@@ -512,6 +547,28 @@ router.get('/inquiries/:id', (req, res) => {
     ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
     ta.focus();
     toast('AI返信案をコピーしました。内容を確認・編集してから送信してください');
+  });
+  // 📄 テンプレート → 返信欄へ反映 (本文は選択時にAPIで取得。人間が必ず確認・編集してから送信)
+  var tplBtn = document.getElementById('tplBtn');
+  if (tplBtn) tplBtn.addEventListener('click', function() {
+    var sel = document.getElementById('tplSel');
+    var ta = document.getElementById('replyBody');
+    if (!sel.value) { toast('テンプレートを選んでください'); return; }
+    tplBtn.disabled = true;
+    fetch('/apps/inquiry-hub/api/templates/' + sel.value)
+      .then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); })
+      .then(function(t) {
+        tplBtn.disabled = false;
+        if (ta.value.trim() && !confirm('返信欄の内容をテンプレート「' + t.name + '」で置き換えますか?')) return;
+        ta.value = t.body;
+        ta.focus();
+        toast('テンプレートを反映しました。内容を確認・編集してから送信してください');
+        // 使用回数カウント (📄画面のコピーと同じ扱い。失敗しても反映は成立)
+        fetch('/apps/inquiry-hub/api/templates/' + t.id + '/copied', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+        }).catch(function() {});
+      })
+      .catch(function(e) { tplBtn.disabled = false; toast('テンプレート取得失敗: ' + e.message); });
   });
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
   var mrBtn = document.getElementById('mrBtn');
@@ -1160,6 +1217,15 @@ router.post('/api/templates', (req, res) => {
   getDB().prepare(`INSERT INTO reply_templates (template_name, category, subject, keywords, template_body, body_bottom, notes)
     VALUES (@template_name, @category, @subject, @keywords, @template_body, @body_bottom, @notes)`).run(f);
   res.json({ ok: true });
+});
+
+// 返信エディタの「テンプレートを本文へ反映」用 (read-only)。本文は📄画面のコピーと同じ
+// template_body + body_bottom の結合で返す (使用回数は反映確定時にクライアントが /copied を叩く)
+router.get('/api/templates/:id(\\d+)', (req, res) => {
+  const t = getTemplate(Number(req.params.id));
+  if (!t) return res.status(404).json({ error: 'テンプレートが見つかりません (削除された可能性)' });
+  res.json({ id: t.id, name: t.template_name,
+    body: String(t.template_body || '') + (t.body_bottom ? '\n\n' + t.body_bottom : '') });
 });
 
 router.post('/api/templates/:id(\\d+)', (req, res) => {
@@ -1947,6 +2013,26 @@ td.ops button { margin: 2px 4px 2px 0; }
 .nav-backdrop { display: none; }
 .layout > .wrap { flex: 1 1 auto; min-width: 0; padding: 16px; max-width: 1400px; }
 .view-hint { color: #64748b; font-size: 13px; margin: 0 0 10px; }
+.view-hint a { color: #1d4ed8; margin-left: 8px; }
+
+/* ═══ 上部チャネルタブ (メールディーラー風。2026-08-12 スタッフ要望):
+   「✉️メール」「💬問い合わせ」×「新着/返信処理中/完了」を件数付きで常時表示 ═══ */
+nav.chtabs { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.chtab-grp { display: flex; align-items: center; gap: 2px; background: #fff; border-radius: 12px;
+  padding: 5px 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.chtab-cap { font-size: 12px; font-weight: 700; color: #475569; padding: 0 8px 0 4px; white-space: nowrap; }
+a.chtab { display: inline-flex; align-items: center; gap: 6px; padding: 7px 12px; border-radius: 9px;
+  color: #334155; text-decoration: none; font-size: 13px; font-weight: 600; white-space: nowrap; }
+a.chtab:hover { background: #e2e8f0; }
+a.chtab.on { background: #1d4ed8; color: #fff; }
+.chtab-n { font-size: 12px; font-weight: 700; background: #e2e8f0; color: #475569; border-radius: 999px; padding: 1px 8px; }
+.chtab-n.hot { background: #fee2e2; color: #b91c1c; }   /* 新着>0 = 目立たせる */
+a.chtab.on .chtab-n { background: rgba(255,255,255,.28); color: #fff; }
+
+/* 返信エディタのテンプレート選択 (選ぶ→本文へ反映) */
+.panel .row.tpl-pick { margin-bottom: 8px; }
+.tpl-pick select { flex: 1 1 auto; min-width: 0; }
+.tpl-pick button { flex: 0 0 auto; white-space: nowrap; }
 
 /* ═══ 絞り込みボックス: PCは常時展開・スマホは折りたたみ (画面上半分をフィルタで潰さない) ═══ */
 details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性はサーバーが常に付与) */
@@ -1980,6 +2066,11 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   .expiry-edit button, .tpl-ops button, td.ops button { min-height: 40px; }
   .pager { gap: 10px; padding: 14px 10px; }
   .pager a { padding: 10px 14px; background: #fff; border: 1px solid #cbd5e1; border-radius: 8px; text-decoration: none; }
+
+  /* 上部チャネルタブ: 折り返さず横スクロール1行 (#618のタブ方針と同じ)。タップ40px確保 */
+  nav.chtabs { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 0 10px; }
+  .chtab-grp { flex: 0 0 auto; }
+  a.chtab { min-height: 40px; }
 
   /* 絞り込みは折りたたみ */
   details.fbox { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 10px; }
