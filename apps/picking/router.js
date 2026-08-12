@@ -187,6 +187,23 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   res.json({ ok: true, ...result });
 }));
 
+/**
+ * バッチ明細の画像URLマップ (作業画面のポーリング用)。
+ * 取込直後は解決がバックグラウンドで進行中のため、画面側が数回だけ取得しにくる
+ */
+router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
+  const batch = getBatch(Number(req.params.id));
+  if (!batch) throw new PkError(404, 'not_found', 'バッチが見つかりません');
+  const lines = listLines(batch.id);
+  const images = getImageMap(lines.map((l) => l.sku));
+  const bySeq = {};
+  for (const l of lines) {
+    const hit = images.get(String(l.sku ?? '').trim().toLowerCase());
+    if (hit?.url) bySeq[l.seq] = hit.url;
+  }
+  res.json({ ok: true, images: bySeq });
+}));
+
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
 router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
   const s = getWorkState(Number(req.params.id));

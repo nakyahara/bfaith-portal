@@ -16,7 +16,7 @@
  * (1バッチ数十SKU = bulk 1〜2回。定期ジョブは作らない)。失敗は not_found / error として
  * キャッシュし、翌日以降の取込で再試行する。画面は URL が無ければプレースホルダ表示。
  */
-import { getDB, utcNow } from './db.js';
+import { getDB, utcNow, jstToday } from './db.js';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { fetchItemDetailsBulkDetailed } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
 
@@ -26,17 +26,30 @@ const norm = (s) => String(s ?? '').trim().toLowerCase();
  * RMS の画像 location を完全URLへ (rakuten-yahoo-sync/lib/image-uploader.js の
  * normalizeRakutenImageUrl と同ロジック。あちらは sharp 等の重い依存を引き込むため転記)。
  */
+// <img src> に直挿しするURLは楽天の画像ドメインに限定する
+// (RMS応答が万一汚染されても、閲覧端末を任意ホストへ送信させない — Codex PR3.5 low)
+function isAllowedImageHost(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'rakuten.co.jp' || host.endsWith('.rakuten.co.jp')
+      || host === 'r10s.jp' || host.endsWith('.r10s.jp');
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeImageUrl(loc) {
   if (typeof loc !== 'string') return null;
   const s = loc.trim();
   if (!s) return null;
-  if (/^https?:\/\//i.test(s)) return s;
-  if (/^\/\//.test(s)) return 'https:' + s;
-  if (s.startsWith('/')) {
+  let url = null;
+  if (/^https?:\/\//i.test(s)) url = s;
+  else if (/^\/\//.test(s)) url = 'https:' + s;
+  else if (s.startsWith('/')) {
     const slug = (process.env.RAKUTEN_SHOP_SLUG || 'b-faith').trim();
-    return `https://image.rakuten.co.jp/${slug}/cabinet${s}`;
+    url = `https://image.rakuten.co.jp/${slug}/cabinet${s}`;
   }
-  return null;
+  return url && isAllowedImageHost(url) ? url : null;
 }
 
 /**
@@ -105,14 +118,17 @@ export function getImageMap(skus) {
 export async function ensureImagesFor(skus, deps = {}) {
   const db = getDB();
   const now = utcNow();
-  const today = now.slice(0, 10);
   const all = [...new Set(skus.map(norm).filter(Boolean))];
-  // ok はそのまま使う。not_found / error は当日中は再試行しない (翌日の取込で取り直す)
+  // ok は7日間キャッシュ (楽天側の画像差し替えに追従できるようTTLを置く)。
+  // not_found / error はJST当日中は再試行しない (翌日の取込・表示で取り直す)
   const need = all.filter((sku) => {
     const row = db.prepare('SELECT status, fetched_at FROM pk_product_images WHERE ne_code = ?').get(sku);
     if (!row) return true;
-    if (row.status === 'ok') return false;
-    return String(row.fetched_at).slice(0, 10) !== today;
+    const fetchedMs = Date.parse(row.fetched_at);
+    if (row.status === 'ok') {
+      return !Number.isFinite(fetchedMs) || (Date.now() - fetchedMs) > 7 * 24 * 3600 * 1000;
+    }
+    return !Number.isFinite(fetchedMs) || jstToday(new Date(fetchedMs)) !== jstToday();
   });
   const stats = { requested: all.length, fetched: need.length, ok: 0, notFound: 0, errors: 0 };
   if (need.length === 0) return stats;
@@ -137,7 +153,9 @@ export async function ensureImagesFor(skus, deps = {}) {
     const mn = it?.manageNumber || it?.itemNumber;
     if (mn) itemByMn.set(norm(mn), it);
   }
-  const failedMns = new Set(failed.map((f) => norm(f.manageNumber)));
+  if (failed.length > 0) {
+    console.warn(`[picking-images] RMS個別失敗 ${failed.length}件 (翌日再試行): ${failed.slice(0, 3).map((f) => f.manageNumber).join(', ')}…`);
+  }
 
   const upsert = db.prepare(`
     INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, status, fetched_at)
@@ -151,10 +169,10 @@ export async function ensureImagesFor(skus, deps = {}) {
     if (!mn) { upsert.run(sku, null, null, null, 'not_found', now); stats.notFound++; continue; }
     const item = itemByMn.get(norm(mn));
     if (!item) {
-      // RMS個別失敗 (一時障害) は error = 当日中の別バッチ取込では再試行しないが翌日取り直す
-      const status = failedMns.has(norm(mn)) ? 'error' : 'not_found';
-      upsert.run(sku, mn, null, null, status, now);
-      status === 'error' ? stats.errors++ : stats.notFound++;
+      // items にも failed にも無い欠落応答は「不存在」と断定できないため error 扱い
+      // (翌日再試行。not_found で恒久抑止すると部分応答・プロキシ不具合で永久に画像なしになる)
+      upsert.run(sku, mn, null, null, 'error', now);
+      stats.errors++;
       continue;
     }
     const { whiteBgUrl, topUrl } = extractImageUrls(item);

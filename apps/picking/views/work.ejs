@@ -314,6 +314,31 @@
       }
     }
 
+    // ── 画像の後追い反映 (取込直後は解決がバックグラウンド進行中のことがある) ──
+    // 画像なしの明細が残っている間だけ5秒間隔で最大12回ポーリングし、届き次第反映する
+    let imgPolls = 0;
+    async function pollImages() {
+      if (!LINES.some((l) => !l.img) || imgPolls >= 12) return;
+      imgPolls++;
+      try {
+        const res = await fetch(`/apps/picking/api/batches/${BATCH.id}/images`);
+        if (res.ok) {
+          const body = await res.json();
+          let updated = false;
+          for (const l of LINES) {
+            if (!l.img && body.images && body.images[l.seq]) { l.img = body.images[l.seq]; updated = true; }
+          }
+          if (updated) {
+            const idx = currentIdx();
+            if (idx !== -1 && started) renderImage(LINES[idx]);
+          }
+          if (!LINES.some((l) => !l.img)) return;   // 全部揃ったら終了
+        }
+      } catch { /* オフライン中は次回に任せる */ }
+      setTimeout(pollImages, 5000);
+    }
+    pollImages();
+
     // ── Wake Lock (iOS 16.4+)。タブ復帰時に再取得 ──
     let wakeLock = null;
     async function acquireWakeLock() {

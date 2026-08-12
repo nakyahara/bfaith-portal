@@ -12,7 +12,7 @@ import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 import { getDB, getBatch, getBatchByTbNo, listLines, utcNow, jstToday } from './db.js';
 import { suggestPatterns } from './patterns.js';
-import { getImageMap } from './images.js';
+import { getImageMap, queueEnsureImages } from './images.js';
 
 /** 業務エラー。router が status + message に変換する。 */
 export class PkError extends Error {
@@ -337,6 +337,12 @@ export function getWorkState(batchId) {
   if (!batch) throw new PkError(404, 'not_found', 'バッチが見つかりません');
   const rawLines = listLines(batchId);
   const images = getImageMap(rawLines.map((l) => l.sku));
+  // 取込直後の解決キューが再起動等で消えていても、画面を開いたときに自己修復する
+  // (キャッシュに行が無いSKUだけ再キュー。行があるSKUは ensureImagesFor 側のTTLに従う)
+  const missing = rawLines
+    .map((l) => String(l.sku ?? '').trim().toLowerCase())
+    .filter((sku) => sku && !images.has(sku));
+  if (missing.length > 0) queueEnsureImages(missing, `batch:${batchId}`);
   const lines = rawLines.map((l) => ({
     ...l,
     locationLabel: formatLocation(l.block, l.location),
