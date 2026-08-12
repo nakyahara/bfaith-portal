@@ -17,6 +17,8 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
   initPickingDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
+  createDevice, verifyDevice, revokeDevice, listDevices,
+  listWorkers, getWorker, addWorker, setWorkerActive,
 } from './db.js';
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
@@ -59,6 +61,62 @@ function isRealDate(s) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
+// ═══ アクセス制御 (2026-08-12 中原さん方針: 倉庫の共用端末は一度登録すればログイン不要) ═══
+//
+// 2系統の認証を受け付ける:
+//   ①ポータルセッション (従来どおり。管理画面はこちら必須)
+//   ②登録済み端末Cookie (pk_device) — 作業画面・作業APIのみ。作業者は名前タップで選択し、
+//     計測には選択した作業者名を記録する (個人アカウントは持たない)
+// server.js のマウントでは requireAppAccess を使わず、この router 内の pickingAccess で制御する。
+
+const DEVICE_COOKIE = 'pk_device';
+
+/** Cookieヘッダから1つ取り出す (cookie-parser 非依存の最小実装)。 */
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of String(header).split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return null;
+}
+
+function hasSessionAccess(req) {
+  if (!req.session?.email) return false;
+  const allowed = req.session.allowedApps;
+  return allowed === '*' || (Array.isArray(allowed) && allowed.includes('picking'));
+}
+
+/** 全ルート共通の入口。セッション or 登録端末のどちらかが必要。 */
+function pickingAccess(req, res, next) {
+  // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
+  if (req.path === '/manifest.json') return next();
+  if (hasSessionAccess(req)) return next();
+  const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
+  if (device) {
+    req.pickingDevice = device;   // 端末モード (作業画面のみ。admin系は requireAdmin で弾かれる)
+    return next();
+  }
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'ログインまたは端末登録が必要です' });
+  return res.redirect('/login');
+}
+
+/**
+ * 作業者の識別。セッションなら email、端末モードなら選択された作業者コード
+ * (body/query の worker_code。pk_workers の有効な作業者のみ受け付ける)。
+ * 計測の worker 列には「表示名」を入れる (現行Notionの担当者selectと同じ粒度)。
+ */
+function resolveWorker(req) {
+  if (req.session?.email) return { id: req.session.email, name: req.session.displayName || req.session.email };
+  const code = String(req.body?.worker_code || req.query?.worker_code || '').trim();
+  if (!code) throw new PkError(400, 'no_worker', '作業者を選択してください');
+  const w = getWorker(code);
+  if (!w || !w.active) throw new PkError(400, 'bad_worker', '作業者が無効です。切替から選び直してください');
+  return { id: w.name, name: w.name };
+}
+
 /**
  * 状態変更APIのCSRF緩和策: Origin ヘッダがあれば自ホストと一致することを要求する
  * (セッションCookieのSameSiteに加えた明示防御。Origin無しの同一サイトfetchは通す)。
@@ -76,11 +134,14 @@ function checkOrigin(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  if (req.session.role !== 'admin') {
+  if (req.session?.role !== 'admin') {
     return res.status(403).json({ error: '管理者のみ実行できます' });
   }
   next();
 }
+
+// router 全体に適用 (server.js は requireAppAccess を付けずに mount する)
+router.use(pickingAccess);
 
 /** PkError は業務エラーとして status + message を返す。それ以外は 500。 */
 function api(handler) {
@@ -97,16 +158,18 @@ function api(handler) {
   };
 }
 
-// ─── バッチ一覧 (全員) ───
+// ─── バッチ一覧 (セッション or 登録端末) ───
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
   res.render(path.join(__dirname, 'views/batches'), {
     title: 'ピッキング支援',
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: req.session.role === 'admin',
+    username: req.session?.email || req.pickingDevice?.label || '端末',
+    displayName: req.session?.displayName,
+    isAdmin: req.session?.role === 'admin',
+    deviceMode: !req.session?.email,
+    workers: listWorkers(),
     workDate,
     batches,
     statusLabels: STATUS_LABELS,
@@ -126,9 +189,9 @@ router.get('/batches/:id(\\d+)', (req, res) => {
   }));
   res.render(path.join(__dirname, 'views/batch_detail'), {
     title: `${batch.hikiate_class} | ピッキング支援`,
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: req.session.role === 'admin',
+    username: req.session?.email || req.pickingDevice?.label || '端末',
+    displayName: req.session?.displayName,
+    isAdmin: req.session?.role === 'admin',
     batch,
     lines,
     statusLabels: STATUS_LABELS,
@@ -146,8 +209,10 @@ router.get('/work/:id(\\d+)', (req, res) => {
   }
   res.render(path.join(__dirname, 'views/work'), {
     title: `ピッキング | ${state.batch.hikiate_class}`,
-    worker: req.session.email,
-    displayName: req.session.displayName,
+    // セッションなら worker は確定 (email)。端末モードは null = 画面側が作業者選択を出す
+    worker: req.session?.email || null,
+    displayName: req.session?.displayName,
+    workers: listWorkers(),
     state,
   });
 });
@@ -164,13 +229,14 @@ const NOTION_STATUS_BY_BATCH = {
 
 router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
   const batchId = Number(req.params.id);
+  const worker = resolveWorker(req);
   const result = applyEvent(batchId, {
     opId: req.body.op_id,
     event: req.body.event,
     lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
     clientAt: req.body.client_at,
     undoOpId: req.body.undo_op_id || null,
-  }, req.session.email);
+  }, worker.id);
   // Notion連携 (fail-soft)。replayed では動かさない。ラベルは送信直前にバッチの
   // 最新状態から決める (イベント時点のラベルだと並行PATCHの順序逆転で巻き戻る)
   if (!result.replayed && result.transition) {
@@ -230,6 +296,56 @@ router.get('/manifest.json', (req, res) => {
     icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
   });
 });
+
+// ─── 端末・作業者管理 (管理者・セッション必須) ───
+
+router.get('/admin/devices', requireAdmin, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_devices'), {
+    title: '端末・作業者管理 | ピッキング支援',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    devices: listDevices(),
+    workers: listWorkers(true),
+    registered: req.query.registered === '1',
+  });
+});
+
+/**
+ * この端末を登録する。発行したトークンは httpOnly Cookie としてこの端末にだけ渡す
+ * (画面にも他の誰にも見せない)。倉庫のiPhoneで管理者がログインして1回だけ実行する。
+ */
+router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
+  const label = String(req.body.label || '').trim();
+  if (!label || label.length > 40) throw new PkError(400, 'bad_label', '端末名を1〜40文字で入力してください');
+  const token = createDevice(label, req.session.email);
+  res.cookie(DEVICE_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。切れたら再登録
+    path: '/apps/picking',
+  });
+  res.json({ ok: true });
+}));
+
+router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {
+  if (!revokeDevice(Number(req.params.id))) throw new PkError(404, 'not_found', '端末が見つかりません');
+  res.json({ ok: true });
+}));
+
+router.post('/admin/workers', checkOrigin, requireAdmin, api(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  if (!name || name.length > 20) throw new PkError(400, 'bad_name', '作業者名を1〜20文字で入力してください');
+  res.json({ ok: true, code: addWorker(name) });
+}));
+
+router.post('/admin/workers/:code/toggle', checkOrigin, requireAdmin, api(async (req, res) => {
+  const w = getWorker(String(req.params.code));
+  if (!w) throw new PkError(404, 'not_found', '作業者が見つかりません');
+  setWorkerActive(w.code, !w.active);
+  res.json({ ok: true });
+}));
 
 // ─── 取込画面 (管理者) ───
 router.get('/admin/import', requireAdmin, (req, res) => {

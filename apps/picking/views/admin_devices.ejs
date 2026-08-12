@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 800px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; }
+    .pk-form h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .pk-form p.hint { font-size: 0.85em; color: #495057; margin: 0 0 10px; line-height: 1.6; }
+    .pk-row-inline { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .pk-row-inline input[type=text] { padding: 7px; width: 220px; }
+    .pk-row-inline button { padding: 7px 18px; cursor: pointer; }
+    .pk-msg { font-size: 0.9em; } .pk-msg.err { color: #c92a2a; } .pk-msg.ok { color: #2b8a3e; }
+    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    table.pk-list th { background: #f1f3f5; }
+    tr.revoked td, tr.inactive td { color: #adb5bd; text-decoration: line-through; }
+    .btn-sm { padding: 3px 10px; font-size: 0.85em; cursor: pointer; }
+    .ok-banner { background: #d3f9d8; border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 0.95em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📱 端末・作業者管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/admin/import" class="btn-logout">📥 取込</a>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <% if (registered) { %>
+      <div class="ok-banner">✅ この端末を登録しました。ログアウトしても、この端末からはピッキング画面を開けます。
+        ホーム画面に <b>/apps/picking/</b> を追加して使ってください。</div>
+    <% } %>
+
+    <div class="pk-form">
+      <h2>この端末を倉庫端末として登録</h2>
+      <p class="hint">
+        倉庫で使うiPhoneで管理者としてログインし、ここで登録すると、その端末は以後<b>ログイン不要</b>で
+        ピッキング作業画面を使えます (取込・管理画面は引き続きログイン必須)。
+        ⚠ ホーム画面に追加したアプリから開いて登録してください (Safari本体と保存領域が別のため)。
+      </p>
+      <div class="pk-row-inline">
+        <input type="text" id="deviceLabel" placeholder="端末名 (例: 倉庫iPhone1)" maxlength="40">
+        <button id="registerBtn" type="button">この端末を登録</button>
+        <span id="deviceMsg" class="pk-msg"></span>
+      </div>
+    </div>
+
+    <div class="pk-form">
+      <h2>登録済み端末</h2>
+      <table class="pk-list">
+        <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
+        <tbody>
+          <% for (const d of devices) { %>
+            <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
+              <td><%= d.id %></td>
+              <td><%= d.label %></td>
+              <td><%= d.created_by %></td>
+              <td><%= (d.created_at || '').slice(0, 10) %></td>
+              <td><%= (d.last_seen_at || '-').slice(0, 10) %></td>
+              <td><% if (!d.revoked_at) { %><button class="btn-sm btn-revoke" data-id="<%= d.id %>">失効</button><% } else { %>失効済み<% } %></td>
+            </tr>
+          <% } %>
+          <% if (devices.length === 0) { %><tr><td colspan="6" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pk-form">
+      <h2>作業者マスタ (作業画面で名前タップで選ぶリスト)</h2>
+      <div class="pk-row-inline" style="margin-bottom:10px">
+        <input type="text" id="workerName" placeholder="作業者名 (例: 星)" maxlength="20">
+        <button id="addWorkerBtn" type="button">追加</button>
+        <span id="workerMsg" class="pk-msg"></span>
+      </div>
+      <table class="pk-list">
+        <thead><tr><th>コード</th><th>名前</th><th></th></tr></thead>
+        <tbody>
+          <% for (const w of workers) { %>
+            <tr class="<%= w.active ? '' : 'inactive' %>">
+              <td><%= w.code %></td>
+              <td><%= w.name %></td>
+              <td><button class="btn-sm btn-toggle" data-code="<%= w.code %>"><%= w.active ? '無効化' : '有効化' %></button></td>
+            </tr>
+          <% } %>
+          <% if (workers.length === 0) { %><tr><td colspan="3" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    async function post(url, body) {
+      const res = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      return { ok: res.ok, body: await res.json().catch(() => ({})) };
+    }
+
+    $('registerBtn').addEventListener('click', async () => {
+      const label = $('deviceLabel').value.trim();
+      if (!label) { $('deviceMsg').textContent = '端末名を入力してください'; $('deviceMsg').className = 'pk-msg err'; return; }
+      const { ok, body } = await post('/apps/picking/admin/devices', { label });
+      if (!ok) { $('deviceMsg').textContent = body.error || '失敗しました'; $('deviceMsg').className = 'pk-msg err'; return; }
+      location.href = '/apps/picking/admin/devices?registered=1';
+    });
+
+    document.querySelectorAll('.btn-revoke').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm('この端末を失効させますか? (その端末はログインしないと使えなくなります)')) return;
+      const { ok } = await post(`/apps/picking/admin/devices/${btn.dataset.id}/revoke`);
+      if (ok) location.reload();
+    }));
+
+    $('addWorkerBtn').addEventListener('click', async () => {
+      const name = $('workerName').value.trim();
+      if (!name) return;
+      const { ok, body } = await post('/apps/picking/admin/workers', { name });
+      if (!ok) { $('workerMsg').textContent = body.error || '失敗しました'; $('workerMsg').className = 'pk-msg err'; return; }
+      location.reload();
+    });
+
+    document.querySelectorAll('.btn-toggle').forEach((btn) => btn.addEventListener('click', async () => {
+      const { ok } = await post(`/apps/picking/admin/workers/${btn.dataset.code}/toggle`);
+      if (ok) location.reload();
+    }));
+  </script>
+</body>
+</html>

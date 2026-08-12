@@ -136,6 +136,19 @@
     </div>
   </div>
 
+  <!-- 作業者選択 (共用端末モード) -->
+  <div id="workerPick" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
+    <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%;">
+      <h3 style="margin:0 0 12px; font-size:1.05em;">作業者を選んでください</h3>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <% for (const w of workers) { %>
+          <button class="worker-opt" data-code="<%= w.code %>" data-name="<%= w.name %>"
+            style="padding:16px 8px; font-size:1.05em; border:1px solid #343a40; border-radius:10px; background:#111418; color:#f1f3f5; cursor:pointer;"><%= w.name %></button>
+        <% } %>
+      </div>
+    </div>
+  </div>
+
   <script>
     const BATCH = <%- JSON.stringify({
       id: state.batch.id, status: state.batch.status, worker: state.batch.worker,
@@ -146,7 +159,12 @@
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
       qty: l.qty, status: l.status, img: l.imageUrl,
     }))).replace(/</g, '\\u003c') %>;
-    const ME = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
+    // セッションログイン時は email が入る。共用端末モードは null = localStorage の作業者を使う
+    const SESSION_WORKER = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
+    const DEVICE_MODE = !SESSION_WORKER;
+    // 計測の識別子: セッション=email / 端末=作業者の表示名 (サーバーは worker_code から名前を解決)
+    let ME = SESSION_WORKER || localStorage.getItem('pk_worker_name') || null;
+    function workerCode() { return DEVICE_MODE ? localStorage.getItem('pk_worker_code') : null; }
     // 明細ごとの「最後に完了させた next の op_id」(backの取り消し対象指定に使う)
     const NEXTOPS = <%- JSON.stringify(state.lastNextOps || {}).replace(/</g, '\\u003c') %>;
 
@@ -236,6 +254,7 @@
       const op = {
         op_id: opId(), event, line_seq: lineSeq ?? null,
         undo_op_id: undoOpId ?? null, client_at: new Date().toISOString(),
+        worker_code: workerCode(),   // 共用端末モードの作業者 (セッション時は null で無視される)
       };
       if (event === 'next') NEXTOPS[lineSeq] = op.op_id;
       queue.push(op);
@@ -359,13 +378,27 @@
     }, 1000);
 
     // ── 初期化 ──
-    if (BATCH.status === 'picking' && BATCH.worker && BATCH.worker !== ME && queue.length === 0) {
-      $('blockedMsg').textContent = `${BATCH.worker} さんが作業中です`;
-      show('scr-blocked');
-    } else {
+    function boot() {
+      if (BATCH.status === 'picking' && BATCH.worker && BATCH.worker !== ME && queue.length === 0) {
+        $('blockedMsg').textContent = `${BATCH.worker} さんが作業中です`;
+        show('scr-blocked');
+        return;
+      }
       acquireWakeLock();
       flush();
       render();
+    }
+    document.querySelectorAll('.worker-opt').forEach((btn) => btn.addEventListener('click', () => {
+      localStorage.setItem('pk_worker_code', btn.dataset.code);
+      localStorage.setItem('pk_worker_name', btn.dataset.name);
+      ME = btn.dataset.name;
+      $('workerPick').style.display = 'none';
+      boot();
+    }));
+    if (DEVICE_MODE && !ME) {
+      $('workerPick').style.display = 'flex';   // 作業者を選んでから boot する
+    } else {
+      boot();
     }
   </script>
 </body>

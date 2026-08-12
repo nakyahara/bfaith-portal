@@ -1306,8 +1306,9 @@ app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ lim
 app.use('/apps/shipping-work', requireAppAccess('shipping-work'), express.json({ limit: '256kb' }), shippingWorkRouter);
 // picking: 引当RPA (伝票出しPC) 向け取込API は x-api-key 認証・セッション外なので本体より先に mount
 app.use('/apps/picking/ingest-api', pickingIngestRouter);
-// picking: CS03002取込は multipart (router 内の multer が処理)。JSON body は作業API (PR2) 用
-app.use('/apps/picking', requireAppAccess('picking'), express.json({ limit: '256kb' }), pickingRouter);
+// picking: 倉庫の共用端末 (登録端末Cookie) でも使うため requireAppAccess は付けず、
+// router 内の pickingAccess (セッション or 登録端末) で制御する。管理系は router 内で admin 必須
+app.use('/apps/picking', express.json({ limit: '256kb' }), pickingRouter);
 // easy-ship: Chrome拡張向けAPI (x-api-key 認証・fail-closed) はセッション認証付き本体より先に mount
 app.use('/apps/easy-ship/ext-api', easyShipExtRouter);
 app.use('/apps/easy-ship', requireAppAccess('easy-ship'), express.json({ limit: '2mb' }), easyShipRouter);
