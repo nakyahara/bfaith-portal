@@ -108,13 +108,11 @@ export function parseCs03002(buffer) {
     });
   }
 
-  // 1ファイル = 1引当 = 1TB が前提。複数TBが混ざるケース (まとめ引当の実データ) は
-  // 未採取のため fail-closed (要件§10)。採取できたら分割取込に対応する
-  const tbNos = [...new Set(slipLines.map((l) => l.tbNo))];
-  if (tbNos.length > 1) {
-    throw new PkError(400, 'multiple_tb_no',
-      `複数のトータルピッキングバッチ番号が含まれています (${tbNos.join(', ')})。1引当=1ファイルで出力してください`);
-  }
+  // 1ファイル = 1引当 = 1バッチ。TB番号は1回の引当でも複数振られることがある
+  // (実測 2026-08-12: 出荷_01=2個・別の引当=13個。昨日のサンプル1個は偶然)。
+  // そのためTB単体ではなく「ソート済みTB一覧の組」をバッチの識別キーにする
+  // (同じ引当のCSVなら常に同じ組になる。順序はソートで正規化)
+  const tbNos = [...new Set(slipLines.map((l) => l.tbNo))].sort();
 
   // ロケーション×SKU で集約 (トータルピッキング)。表示順 = ロケーション昇順 → SKU昇順。
   // 紙のトータルピッキングリストPDFと同順である前提 (PR1完了時に実物と突合する — 実装計画§10)
@@ -144,7 +142,8 @@ export function parseCs03002(buffer) {
   const deliveryMethods = distinct('deliveryMethod');
   const instructDates = distinct('instructDate');
   const preview = {
-    tbNo: tbNos[0],
+    tbNo: tbNos.join(','),   // 識別キー (pk_batches.tb_no UNIQUE)。表示側は先頭+件数に整形する
+    tbCount: tbNos.length,
     instructDate: instructDates.map(formatDate8).join(' / '),
     invoiceSoft: invoiceSofts.join(' / '),
     deliveryMethod: deliveryMethods.join(' / '),

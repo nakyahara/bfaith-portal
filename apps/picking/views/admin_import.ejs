@@ -138,7 +138,7 @@
 
     function showPreview(body) {
       $('summary').innerHTML =
-        `<span><b>${esc(body.tbNo)}</b></span>` +
+        `<span><b>${esc(body.tbLabel || body.tbNo)}</b></span>` +
         (body.filename ? `<span>📂 ${esc(body.filename)}</span>` : '') +
         `<span>出荷指示日: ${esc(body.instructDate)}</span>` +
         `<span>${esc(body.invoiceSoft)} / ${esc(body.deliveryMethod)}</span>` +

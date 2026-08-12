@@ -38,7 +38,8 @@
   <div class="pk-wrap">
     <div class="pk-head">
       <span><b><%= batch.hikiate_class %></b></span>
-      <span>TB: <%= batch.tb_no %></span>
+      <% const tbs = String(batch.tb_no || '').split(','); %>
+      <span>TB: <%= tbs[0] %><%= tbs.length > 1 ? ` 他${tbs.length - 1}件` : '' %></span>
       <span>出荷指示日: <%= batch.instruct_date || '-' %></span>
       <span>フォルダ: <%= batch.folder_name || '-' %></span>
       <span>構成: <%= batch.composition %></span>
