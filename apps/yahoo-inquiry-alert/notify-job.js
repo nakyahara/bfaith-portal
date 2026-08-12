@@ -25,6 +25,9 @@
  * 環境変数 (ミニPC の .env):
  *   GCHAT_WEBHOOK_YAHOO_INQUIRY     … 通知先スペースの webhook (必須)
  *   YAHOO_PROXY_URL / YAHOO_PROXY_SECRET … VPSプロキシ (既存のYahoo設定を使う)
+ *   YAHOO_INQUIRY_WINDOW_DAYS       … ② 完了処理待ちを要対応として出す窓 (日、既定 30)。
+ *                                     窓外の過去分は件数だけ添える (実測で過去分が1,000件超
+ *                                     あり、全部出すと新しい要対応が埋もれるため)
  *
  * 使い方:
  *   node apps/yahoo-inquiry-alert/notify-job.js --once       … 実行して該当があれば GChat へ送る
@@ -33,10 +36,22 @@
 import 'dotenv/config';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { fetchInquiryStatus, buildMessage } from './service.js';
+import { fetchInquiryStatus, buildMessage, DEFAULT_WINDOW_DAYS } from './service.js';
 import { sendGChatMessage } from '../profit-analysis/gchat-client.js';
 
 const TAG = 'yahoo-inquiry';
+
+/** env の数値を読む (不正値は既定にフォールバックして警告) */
+function numEnv(name, fallback, { min, max }) {
+  const raw = String(process.env[name] ?? '').trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.warn(`[${TAG}] ${name}=${raw} は不正なため既定値 ${fallback} を使います`);
+    return fallback;
+  }
+  return n;
+}
 
 /** GChat 送信。一時障害に備えて1回だけリトライする */
 async function sendWithRetry(webhook, text) {
@@ -60,9 +75,12 @@ export async function runYahooInquiryAlert(opts = {}) {
     throw new Error('GCHAT_WEBHOOK_YAHOO_INQUIRY 未設定のため通知できません');
   }
 
-  const result = await fetchInquiryStatus(opts);
+  const windowDays = numEnv('YAHOO_INQUIRY_WINDOW_DAYS', DEFAULT_WINDOW_DAYS, { min: 1, max: 365 });
+  const result = await fetchInquiryStatus({ windowDays, ...opts });
   const text = buildMessage(result);
-  const note = `未返信${result.unanswered.count}件 / 完了処理待ち${result.uncompleted.count}件`;
+  const note = `未返信${result.unanswered.count}件 / 完了処理待ち${result.uncompleted.count}件 (${result.windowDays}日窓)`
+    + (result.uncompleted.olderCount ? ` / 窓外の過去分${result.uncompleted.olderCount}件` : '')
+    + (result.uncompleted.truncated ? ' / ⚠上限打ち切り' : '');
 
   if (opts.dryRun) {
     console.log(`[${TAG}] dry-run (${note})`);
