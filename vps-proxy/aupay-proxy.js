@@ -836,14 +836,30 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // 問い合わせ管理API passthrough (inquiry-hub 受信同期用。read-onlyのみ、パラメータ許可リスト方式)
+    // 問い合わせ管理API passthrough (inquiry-hub 受信同期 + yahoo-inquiry-alert 用。
+    // read-onlyのみ、パラメータ許可リスト方式 — 指定されたものだけ検証して転送する)
     if (pathname === '/yahoo/externalTalkList' && req.method === 'GET') {
       const start = url.searchParams.get('start') || '1';
       const result = url.searchParams.get('result') || '20';
       if (!/^\d+$/.test(start) || Number(start) < 1) throw new Error('start は1以上の数値で指定してください');
       if (!/^\d+$/.test(result) || Number(result) < 1 || Number(result) > 20) throw new Error('result は1〜20で指定してください (API上限20)');
-      const r = await yahooCircusGet('/externalTalkList', { start, result });
-      console.log(`[${ts()}] Yahoo externalTalkList start=${start} -> ${r.status} (${r.body.length} bytes)`);
+      const params = { start, result };
+      // 絞り込み系 (yahoo-inquiry-alert が使う)。値は公式仕様の列挙値のみ許可
+      const optional = {
+        requestFilter: /^(answered|unanswered|completed)(,(answered|unanswered|completed))*$/,
+        serviceType: /^(shp|auc)$/,
+        sort: /^(userPostTime|sellerPostTime)$/,
+        sortOrder: /^(asc|desc)$/,
+      };
+      for (const [name, re] of Object.entries(optional)) {
+        const v = url.searchParams.get(name);
+        if (v == null) continue;
+        if (!re.test(v)) throw new Error(`${name} が不正です`);
+        params[name] = v;
+      }
+      const filterLabel = params.requestFilter ? ` filter=${params.requestFilter}/${params.serviceType || '-'}` : '';
+      const r = await yahooCircusGet('/externalTalkList', params);
+      console.log(`[${ts()}] Yahoo externalTalkList start=${start}${filterLabel} -> ${r.status} (${r.body.length} bytes)`);
       res.writeHead(r.status, { 'Content-Type': r.contentType });
       res.end(r.body);
       return;

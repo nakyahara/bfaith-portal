@@ -24,3 +24,5 @@ vps-proxy/yahoo-tokens.json
 vps-proxy/*.pem
 vps-proxy/*.log
 vps-proxy/*.bak*
+.codex-diff.txt
+.codex-round2.log

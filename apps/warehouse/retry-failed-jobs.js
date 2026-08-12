@@ -77,13 +77,18 @@ const JOB_DEFINITIONS = {
   'Qoo10':                 { script: 'apps/warehouse/qoo10-orders.js',              args: ['90'], timeoutMs: 1800000 },
   // Qoo10未発送アラート: DBだけで判定して通知する (API再確認なし)。上の Qoo10 同期の後に走らせる
   'Qoo10未発送アラート':   { script: 'apps/qoo10-unshipped/notify-job.js',          args: ['--once'], timeoutMs: 300000 },
+  // Yahoo問い合わせ対応漏れ: 問い合わせ管理API を読んで通知するだけ (DBに書かない)。
+  // 通知は at-least-once = 送信後・終了判定前に落ちた場合 retry で同じ通知が重複しうる
+  // (見逃しより重複を取る割り切り。未発送アラート群と同じ)。
+  // 該当ゼロ=無通知 の仕様なので、朝の便が落ちたら当日中の retry で必ず結果を出す
+  'Yahoo問い合わせ対応漏れ': { script: 'apps/yahoo-inquiry-alert/notify-job.js',     args: ['--once'], timeoutMs: 300000 },
 };
 
 // 実行順序 (依存関係順)。sales_velocity → pml_snapshot は f_sales と同じ raw + マスタ依存なので直後。
 // Amazon系は他ジョブと独立なので先頭 (長時間ジョブを先に開始)
 // DBバックアップは最後 (f_sales 等が同時に失敗していた場合、復旧後の最新状態を保存するため)
 // 楽天未発送アラートは先頭 (出荷漏れの通知は早いほど価値があり、他ジョブに依存しない)
-const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Qoo10', 'Qoo10未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
+const RETRY_ORDER = ['楽天未発送アラート', 'Yahoo未発送アラート', 'auPAY未発送アラート', 'Yahoo問い合わせ対応漏れ', 'Qoo10', 'Qoo10未発送アラート', 'Amazon Settlement', 'Amazon Ads (campaign)', 'Amazon Ads (SKU)', 'Amazon手数料', 'ABA検索ワード', 'f_sales', 'sales_velocity', 'pml_snapshot', '楽天sku_map', 'Render同期', 'DBバックアップ'];
 
 async function notify(text) {
   if (!GCHAT_WEBHOOK) {
