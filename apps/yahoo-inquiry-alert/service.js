@@ -85,7 +85,7 @@ export function validateListResponse(json, q) {
       + ` (VPSプロキシが絞り込みパラメータ未対応の可能性。${label})`);
   }
   const count = json?.summary?.topic?.count;
-  if (!Number.isFinite(count) || count < 0) {
+  if (!Number.isSafeInteger(count) || count < 0) {
     throw contractError(`summary.topic.count が読み取れません (${label}: ${JSON.stringify(count)})`);
   }
   const headlines = json?.headlines;
@@ -191,12 +191,14 @@ export async function fetchInquiryStatus(opts = {}) {
 
     const { count, headlines } = validateListResponse(json, q);
     for (const h of headlines) {
-      const prev = seen.get(h.topicId);
+      // String() で正規化してから照合 (数値/文字列の揺れで重複検出をすり抜けないように)
+      const id = String(h.topicId);
+      const prev = seen.get(id);
       if (prev) {
-        throw contractError(`同じ topicId が複数の照会に現れました (${prev} と ${label}: ${h.topicId})`
+        throw contractError(`同じ topicId が複数の照会に現れました (${prev} と ${label}: ${id})`
           + ' — serviceType の絞り込みが効いていない可能性');
       }
-      seen.set(h.topicId, label);
+      seen.set(id, label);
     }
     const bucket = out[q.kind];
     bucket.count += count;
