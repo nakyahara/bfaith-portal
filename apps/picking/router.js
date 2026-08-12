@@ -24,6 +24,7 @@ import {
 } from './service.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, STATUS_PICKING, STATUS_PICKED } from './notion.js';
+import { queueEnsureImages, getImageMap } from './images.js';
 import {
   listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
 } from '../../lib/drive-csv.js';
@@ -116,8 +117,12 @@ router.get('/', (req, res) => {
 router.get('/batches/:id(\\d+)', (req, res) => {
   const batch = getBatch(Number(req.params.id));
   if (!batch) return res.status(404).send('バッチが見つかりません');
-  const lines = listLines(batch.id).map((l) => ({
-    ...l, locationLabel: formatLocation(l.block, l.location),
+  const rawLines = listLines(batch.id);
+  const images = getImageMap(rawLines.map((l) => l.sku));
+  const lines = rawLines.map((l) => ({
+    ...l,
+    locationLabel: formatLocation(l.block, l.location),
+    imageUrl: images.get(String(l.sku ?? '').trim().toLowerCase())?.url || null,
   }));
   res.render(path.join(__dirname, 'views/batch_detail'), {
     title: `${batch.hikiate_class} | ピッキング支援`,
@@ -271,6 +276,8 @@ router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
     return res.json({ ok: true, mode: 'preview', ...summary });
   }
   const result = runImport(preview, req);
+  // 楽天白抜き画像の解決はバックグラウンドで (取込応答を待たせない・失敗しても取込は成立)
+  queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
   res.json({ ok: true, mode: 'confirm', ...summary, ...result });
 }));
 
@@ -318,6 +325,7 @@ router.post('/admin/import/drive', checkOrigin, requireAdmin, api(async (req, re
     return res.json({ ok: true, mode: 'preview', ...summary });
   }
   const result = runImport(preview, req);
+  queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
   res.json({ ok: true, mode: 'confirm', ...summary, ...result });
 }));
 
