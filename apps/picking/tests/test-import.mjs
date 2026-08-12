@@ -82,6 +82,18 @@ t('実データ相当のCSVが解析できる (集約・ロケ昇順・合算)',
   assert.equal(p.totalQty, 7);
 });
 
+t('並び順はブロック優先 (紙PDFと同順: P3FA→P3FB→P3FD→P3FF、ブロック内はロケ昇順)', () => {
+  // 実データの並び (2026-08-12 出荷_01 で紙PDFと突合): P3FFの小さいロケ番号は最後に来る
+  const csv = makeCsv([
+    row({ loc: '00100303', sku: 'ana', qty: 1, slip: '0001', block: 'P3FF' }),
+    row({ loc: '00200904', sku: 'dotta', qty: 1, slip: '0002', block: 'P3FD' }),
+    row({ loc: '00100118', sku: 'reed', qty: 1, slip: '0003', block: 'P3FA' }),
+    row({ loc: '00202305', sku: 'jas', qty: 1, slip: '0004', block: 'P3FB' }),
+  ]);
+  const p = parseCs03002(csv);
+  assert.deepEqual(p.lines.map((l) => l.sku), ['reed', 'jas', 'dotta', 'ana']);
+});
+
 t('同一ロケの別SKUは別明細のまま (SKU昇順)', () => {
   const csv = makeCsv([
     row({ loc: '00201604', sku: 'bbb', qty: 1, slip: '0001' }),

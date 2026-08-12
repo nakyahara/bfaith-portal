@@ -114,8 +114,10 @@ export function parseCs03002(buffer) {
   // (同じ引当のCSVなら常に同じ組になる。順序はソートで正規化)
   const tbNos = [...new Set(slipLines.map((l) => l.tbNo))].sort();
 
-  // ロケーション×SKU で集約 (トータルピッキング)。表示順 = ロケーション昇順 → SKU昇順。
-  // 紙のトータルピッキングリストPDFと同順である前提 (PR1完了時に実物と突合する — 実装計画§10)
+  // ロケーション×SKU で集約 (トータルピッキング)。
+  // 表示順 = ブロック昇順 → ロケーション昇順 → SKU昇順。
+  // 紙のトータルピッキングリストPDFと実物突合済み (2026-08-12 出荷_01):
+  // 紙は P3FA→P3FB→P3FD→P3FF とブロックでまず並び、その中がロケーション順
   const aggMap = new Map();
   for (const l of slipLines) {
     const key = `${l.location}\u0000${l.sku}`;
@@ -129,9 +131,9 @@ export function parseCs03002(buffer) {
       });
     }
   }
+  const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
   const lines = [...aggMap.values()].sort((a, b) =>
-    a.location < b.location ? -1 : a.location > b.location ? 1 :
-    a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0);
+    cmp(a.block || '', b.block || '') || cmp(a.location, b.location) || cmp(a.sku, b.sku));
 
   const composition = classifyComposition(slipLines);
   // 共通項目は先頭行決め打ちにせず distinct を取る (Codex R1 medium)。
