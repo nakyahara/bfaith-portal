@@ -8,7 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-const suites = ['test-import.mjs', 'test-work.mjs', 'test-images.mjs'];
+const suites = ['test-import.mjs', 'test-work.mjs', 'test-images.mjs', 'test-device.mjs'];
 
 let failed = 0;
 for (const f of suites) {

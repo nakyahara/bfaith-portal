@@ -15,6 +15,7 @@
  *   - 取消は物理削除せず validity='invalid' で残す (計測の再現性を守る)
  */
 import Database from 'better-sqlite3';
+import crypto from 'node:crypto';
 import path from 'path';
 import fs from 'fs';
 
@@ -47,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -92,6 +93,28 @@ function migrate() {
 // マージ後のスキーマ変更は必ず v2 以降の migration として追記する
 const MIGRATIONS = {
   1: createCoreTables,
+  // v2: 共用端末認証 (2026-08-12 中原さん方針)。
+  // 倉庫のiPhoneは複数の作業者が使い回すため、個人ログインではなく
+  // 「端末を一度登録 → 作業者は名前タップで選択」方式にする。
+  2: () => {
+    // 登録済み端末。トークンは平文で保存せずハッシュのみ (漏えい時に使い回せない)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_devices (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash TEXT NOT NULL UNIQUE,
+      label      TEXT NOT NULL,        -- 端末名 (例: 倉庫iPhone1)
+      created_by TEXT NOT NULL,        -- 登録した管理者 email
+      created_at TEXT NOT NULL,
+      last_seen_at TEXT,
+      revoked_at TEXT                  -- 失効 (NULL = 有効)
+    )`);
+    // 作業者マスタ (現行Notionの担当者selectに相当)。アカウントは持たない
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_workers (
+      code   TEXT PRIMARY KEY,         -- 例 w01
+      name   TEXT NOT NULL,            -- 表示名 (例: 星)
+      sort   INTEGER NOT NULL DEFAULT 0,
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+    )`);
+  },
 };
 
 function createCoreTables() {
@@ -227,4 +250,74 @@ export function listLines(batchId) {
   return getDB().prepare(
     'SELECT * FROM pk_lines WHERE batch_id = ? ORDER BY seq'
   ).all(batchId);
+}
+
+// ─── 共用端末 (v2) ───
+
+const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+
+/** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
+export function createDevice(label, actor) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  getDB().prepare(`
+    INSERT INTO pk_devices (token_hash, label, created_by, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(hashToken(token), String(label).trim(), actor, utcNow());
+  return token;
+}
+
+// 端末トークンの有効期間 (サーバー側でも検証する。Cookie の Max-Age だけに頼ると
+// 盗まれたトークンを手動送信された場合に失効するまで無期限に使えてしまう)
+const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
+
+/** トークン検証。有効なら端末行を返し last_seen_at を更新 (1時間に1回程度に間引く)。 */
+export function verifyDevice(token) {
+  if (!token) return null;
+  const db = getDB();
+  const row = db.prepare(
+    'SELECT * FROM pk_devices WHERE token_hash = ? AND revoked_at IS NULL'
+  ).get(hashToken(token));
+  if (!row) return null;
+  const now = utcNow();
+  if (Date.parse(now) - Date.parse(row.created_at) > DEVICE_TTL_MS) return null;   // 期限切れ=再登録
+  if (!row.last_seen_at || Date.parse(now) - Date.parse(row.last_seen_at) > 3600_000) {
+    db.prepare('UPDATE pk_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
+  }
+  return row;
+}
+
+export function revokeDevice(id) {
+  return getDB().prepare(
+    'UPDATE pk_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'
+  ).run(utcNow(), id).changes > 0;
+}
+
+export function listDevices() {
+  return getDB().prepare('SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM pk_devices ORDER BY id').all();
+}
+
+// ─── 作業者マスタ (v2) ───
+
+export function listWorkers(includeInactive = false) {
+  return getDB().prepare(
+    `SELECT code, name, sort, active FROM pk_workers ${includeInactive ? '' : 'WHERE active = 1'} ORDER BY sort, code`
+  ).all();
+}
+
+export function getWorker(code) {
+  return getDB().prepare('SELECT code, name, active FROM pk_workers WHERE code = ?').get(code);
+}
+
+/** 作業者の追加。code は自動採番 (w01, w02, …)。 */
+export function addWorker(name) {
+  const db = getDB();
+  const n = db.prepare("SELECT COUNT(*) c FROM pk_workers").get().c + 1;
+  const code = `w${String(n).padStart(2, '0')}`;
+  db.prepare('INSERT INTO pk_workers (code, name, sort) VALUES (?, ?, ?)').run(code, String(name).trim(), n);
+  return code;
+}
+
+export function setWorkerActive(code, active) {
+  return getDB().prepare('UPDATE pk_workers SET active = ? WHERE code = ?')
+    .run(active ? 1 : 0, code).changes > 0;
 }

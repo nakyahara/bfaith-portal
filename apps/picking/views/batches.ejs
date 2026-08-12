@@ -32,10 +32,33 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
-      <% if (isAdmin) { %><a href="/apps/picking/admin/import" class="btn-logout">📥 CS03002取込</a><% } %>
-      <a href="/" class="btn-logout">ダッシュボード</a>
+      <% if (isAdmin) { %>
+        <a href="/apps/picking/admin/import" class="btn-logout">📥 CS03002取込</a>
+        <a href="/apps/picking/admin/devices" class="btn-logout">📱 端末・作業者</a>
+      <% } %>
+      <% if (!deviceMode) { %><a href="/" class="btn-logout">ダッシュボード</a><% } %>
     </div>
   </header>
+
+  <% if (deviceMode) { %>
+  <!-- 共用端末モード: 作業者を名前で選ぶ (端末に記憶) -->
+  <div id="workerBar" style="background:#e7f5ff; padding:8px 16px; display:flex; gap:12px; align-items:center; font-size:0.95em;">
+    <span>👤 作業者: <b id="workerName">未選択</b></span>
+    <button id="workerSwitch" style="padding:4px 14px; cursor:pointer;">切替</button>
+  </div>
+  <div id="workerPick" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:50; align-items:center; justify-content:center;">
+    <div style="background:#fff; border-radius:14px; padding:20px; max-width:340px; width:90%;">
+      <h3 style="margin:0 0 12px; font-size:1.05em;">作業者を選んでください</h3>
+      <div id="workerList" style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <% for (const w of workers) { %>
+          <button class="worker-opt" data-code="<%= w.code %>" data-name="<%= w.name %>"
+            style="padding:16px 8px; font-size:1.05em; border:1px solid #ced4da; border-radius:10px; background:#f8f9fa; cursor:pointer;"><%= w.name %></button>
+        <% } %>
+      </div>
+      <% if (workers.length === 0) { %><p style="color:#868e96; font-size:0.9em;">作業者が未登録です。管理者が「端末・作業者管理」から追加してください。</p><% } %>
+    </div>
+  </div>
+  <% } %>
 
   <div class="pk-wrap">
     <div class="pk-bar">
@@ -81,5 +104,25 @@
       </table>
     <% } %>
   </div>
+
+  <% if (deviceMode) { %>
+  <script>
+    // 作業者選択は端末の localStorage に記憶する (作業画面がイベント送信時に使う)
+    const $ = (id) => document.getElementById(id);
+    function refreshWorker() {
+      const name = localStorage.getItem('pk_worker_name');
+      $('workerName').textContent = name || '未選択';
+      if (!name) $('workerPick').style.display = 'flex';
+    }
+    $('workerSwitch').addEventListener('click', () => { $('workerPick').style.display = 'flex'; });
+    document.querySelectorAll('.worker-opt').forEach((btn) => btn.addEventListener('click', () => {
+      localStorage.setItem('pk_worker_code', btn.dataset.code);
+      localStorage.setItem('pk_worker_name', btn.dataset.name);
+      $('workerPick').style.display = 'none';
+      refreshWorker();
+    }));
+    refreshWorker();
+  </script>
+  <% } %>
 </body>
 </html>
