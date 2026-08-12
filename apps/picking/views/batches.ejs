@@ -6,22 +6,58 @@
   <title><%= title %> | B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="manifest" href="/apps/picking/manifest.json">
+  <link rel="apple-touch-icon" href="/favicon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/mobile.css">
   <style>
-    .pk-wrap { max-width: 1000px; margin: 0 auto; padding: 12px 16px; }
-    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
-    .pk-bar input[type=date] { padding: 5px; }
-    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 7px 8px; text-align: left; }
-    table.pk-list th { background: #f1f3f5; white-space: nowrap; }
-    table.pk-list td.num { text-align: right; }
-    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.92em; white-space: nowrap; }
+    /* スマホ前提のカード型一覧 (テーブルはやめる)。PCでも同じカードが並ぶ */
+    .pk-wrap { max-width: 720px; margin: 0 auto; padding: 10px 12px 40px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .pk-bar input[type=date] { padding: 7px; font-size: 16px; }
+    .muted { color: #868e96; font-size: 0.85em; }
+    .pk-empty { color: #868e96; padding: 40px 0; text-align: center; }
+
+    .card {
+      background: #fff; border: 1px solid #dee2e6; border-radius: 12px;
+      padding: 12px 14px; margin-bottom: 10px;
+      display: flex; gap: 12px; align-items: center;
+    }
+    .card.done { opacity: 0.55; }
+    .card-main { flex: 1 1 auto; min-width: 0; }
+    .card-title { font-weight: 700; font-size: 0.98em; line-height: 1.35; margin-bottom: 4px; }
+    .card-meta { color: #495057; font-size: 0.85em; display: flex; flex-wrap: wrap; gap: 2px 12px; }
+    .card-meta b { font-size: 1.05em; }
+    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.85em; white-space: nowrap; }
     .st.ready { background: #d0ebff; } .st.picking { background: #fff3bf; }
     .st.paused { background: #ffe8cc; } .st.done { background: #d3f9d8; }
     .st.cancelled { background: #f1f3f5; color: #868e96; }
-    .pk-empty { color: #868e96; padding: 30px 0; text-align: center; }
-    .muted { color: #868e96; font-size: 0.85em; }
+
+    .card-actions { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+    .btn-work {
+      display: block; padding: 14px 22px; border: none; border-radius: 10px;
+      background: #1971c2; color: #fff; font-size: 1.05em; font-weight: 700; cursor: pointer;
+      text-align: center; white-space: nowrap;
+    }
+    .btn-work.resume { background: #e8590c; }
+    .btn-detail { text-align: center; font-size: 0.85em; color: #495057; text-decoration: none; padding: 4px; }
+
+    /* 担当者選択オーバーレイ (作業ボタンを押したときに出す) */
+    #workerPick { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 50;
+      align-items: flex-end; justify-content: center; }
+    .sheet { background: #fff; border-radius: 16px 16px 0 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+      width: 100%; max-width: 520px; }
+    .sheet h3 { margin: 0 0 4px; font-size: 1.1em; }
+    .sheet .target { color: #495057; font-size: 0.9em; margin-bottom: 12px; }
+    .sheet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .worker-opt {
+      padding: 18px 8px; font-size: 1.15em; font-weight: 600;
+      border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer;
+    }
+    .worker-opt.last { border-color: #1971c2; background: #e7f5ff; }
+    .sheet-cancel { margin-top: 12px; width: 100%; padding: 12px; border: none; background: none;
+      color: #868e96; font-size: 1em; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -40,89 +76,85 @@
     </div>
   </header>
 
-  <% if (deviceMode) { %>
-  <!-- 共用端末モード: 作業者を名前で選ぶ (端末に記憶) -->
-  <div id="workerBar" style="background:#e7f5ff; padding:8px 16px; display:flex; gap:12px; align-items:center; font-size:0.95em;">
-    <span>👤 作業者: <b id="workerName">未選択</b></span>
-    <button id="workerSwitch" style="padding:4px 14px; cursor:pointer;">切替</button>
-  </div>
-  <div id="workerPick" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:50; align-items:center; justify-content:center;">
-    <div style="background:#fff; border-radius:14px; padding:20px; max-width:340px; width:90%;">
-      <h3 style="margin:0 0 12px; font-size:1.05em;">作業者を選んでください</h3>
-      <div id="workerList" style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
-        <% for (const w of workers) { %>
-          <button class="worker-opt" data-code="<%= w.code %>" data-name="<%= w.name %>"
-            style="padding:16px 8px; font-size:1.05em; border:1px solid #ced4da; border-radius:10px; background:#f8f9fa; cursor:pointer;"><%= w.name %></button>
-        <% } %>
-      </div>
-      <% if (workers.length === 0) { %><p style="color:#868e96; font-size:0.9em;">作業者が未登録です。管理者が「端末・作業者管理」から追加してください。</p><% } %>
-    </div>
-  </div>
-  <% } %>
-
   <div class="pk-wrap">
     <div class="pk-bar">
       <form method="get" action="/apps/picking/">
         <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
       </form>
-      <span class="muted"><%= batches.length %> バッチ (前日以前の未完了を含む)</span>
+      <span class="muted"><%= batches.length %> バッチ</span>
     </div>
 
     <% if (batches.length === 0) { %>
       <div class="pk-empty">
-        バッチがありません。<% if (isAdmin) { %><a href="/apps/picking/admin/import">CS03002 を取り込む</a><% } else { %>管理者が CS03002 を取り込むと表示されます。<% } %>
+        バッチがありません。<% if (isAdmin) { %><a href="/apps/picking/admin/import">CS03002 を取り込む</a><% } else { %>取込が済むとここに表示されます。<% } %>
       </div>
-    <% } else { %>
-      <table class="pk-list">
-        <thead>
-          <tr>
-            <th>作業日</th><th>引当分類</th><th>フォルダ</th><th>構成</th>
-            <th>明細</th><th>伝票</th><th>数量</th><th>進捗</th><th>状態</th><th></th>
-          </tr>
-        </thead>
-        <tbody>
-          <% for (const b of batches) { %>
-            <tr>
-              <td><%= b.work_date %></td>
-              <td><%= b.hikiate_class %></td>
-              <td><%= b.folder_name || '-' %></td>
-              <td><%= b.composition %></td>
-              <td class="num"><%= b.line_count %></td>
-              <td class="num"><%= b.slip_count %></td>
-              <td class="num"><%= b.total_qty %></td>
-              <td class="num"><%= b.done_lines %> / <%= b.line_count %></td>
-              <td><span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %></span></td>
-              <td>
-                <% if (b.status === 'ready' || b.status === 'picking') { %>
-                  <a href="/apps/picking/work/<%= b.id %>"><b><%= b.status === 'picking' ? '再開' : '作業' %></b></a> ·
-                <% } %>
-                <a href="/apps/picking/batches/<%= b.id %>">明細</a>
-              </td>
-            </tr>
+    <% } %>
+
+    <% for (const b of batches) { %>
+      <div class="card <%= b.status === 'done' ? 'done' : '' %>">
+        <div class="card-main">
+          <div class="card-title"><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
+          <div class="card-meta">
+            <span>明細 <b><%= b.line_count %></b></span>
+            <span>数量 <b><%= b.total_qty %></b></span>
+            <span><%= b.composition %></span>
+            <span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %><%
+              %><%= b.status === 'picking' && b.worker ? `: ${b.worker}` : '' %></span>
+            <% if (b.done_lines > 0 && b.status !== 'done') { %><span>進捗 <%= b.done_lines %>/<%= b.line_count %></span><% } %>
+          </div>
+        </div>
+        <div class="card-actions">
+          <% if (b.status === 'ready' || b.status === 'picking') { %>
+            <button class="btn-work <%= b.status === 'picking' ? 'resume' : '' %>" data-id="<%= b.id %>">
+              <%= b.status === 'picking' ? '再開' : '▶ 作業' %>
+            </button>
           <% } %>
-        </tbody>
-      </table>
+          <a class="btn-detail" href="/apps/picking/batches/<%= b.id %>">明細</a>
+        </div>
+      </div>
     <% } %>
   </div>
 
-  <% if (deviceMode) { %>
+  <!-- 担当者選択 (作業ボタン→誰がやるかをタップ→開始画面へ) -->
+  <div id="workerPick">
+    <div class="sheet">
+      <h3>だれがピッキングしますか?</h3>
+      <div class="target" id="pickTarget"></div>
+      <div class="sheet-grid" id="workerList">
+        <% for (const w of workers) { %>
+          <button class="worker-opt" data-code="<%= w.code %>" data-name="<%= w.name %>"><%= w.name %></button>
+        <% } %>
+      </div>
+      <% if (workers.length === 0) { %>
+        <p class="muted">作業者が未登録です。管理者が「端末・作業者」から追加してください。</p>
+      <% } %>
+      <button class="sheet-cancel" id="pickCancel">キャンセル</button>
+    </div>
+  </div>
+
   <script>
-    // 作業者選択は端末の localStorage に記憶する (作業画面がイベント送信時に使う)
     const $ = (id) => document.getElementById(id);
-    function refreshWorker() {
-      const name = localStorage.getItem('pk_worker_name');
-      $('workerName').textContent = name || '未選択';
-      if (!name) $('workerPick').style.display = 'flex';
-    }
-    $('workerSwitch').addEventListener('click', () => { $('workerPick').style.display = 'flex'; });
+    const DEVICE_MODE = <%- JSON.stringify(deviceMode) %>;
+    let targetBatchId = null;
+
+    function goWork() { location.href = `/apps/picking/work/${targetBatchId}`; }
+
+    document.querySelectorAll('.btn-work').forEach((btn) => btn.addEventListener('click', () => {
+      targetBatchId = btn.dataset.id;
+      if (!DEVICE_MODE) return goWork();   // 個人ログイン時は本人が担当なので選択不要
+      // 前回選んだ人をハイライト (タップは毎回必要 = 使い回し端末での選び忘れ防止)
+      const last = localStorage.getItem('pk_worker_code');
+      document.querySelectorAll('.worker-opt').forEach((o) => o.classList.toggle('last', o.dataset.code === last));
+      $('pickTarget').textContent = btn.closest('.card').querySelector('.card-title').textContent.trim();
+      $('workerPick').style.display = 'flex';
+    }));
+
     document.querySelectorAll('.worker-opt').forEach((btn) => btn.addEventListener('click', () => {
       localStorage.setItem('pk_worker_code', btn.dataset.code);
       localStorage.setItem('pk_worker_name', btn.dataset.name);
-      $('workerPick').style.display = 'none';
-      refreshWorker();
+      goWork();
     }));
-    refreshWorker();
+    $('pickCancel').addEventListener('click', () => { $('workerPick').style.display = 'none'; });
   </script>
-  <% } %>
 </body>
 </html>
