@@ -112,7 +112,7 @@ export async function syncPickingStatus(folderName, statusLabel, jstDate) {
   if (!folderName) return 'no_card';
   const card = await findTodayCard(folderName, jstDate);
   if (!card) {
-    console.warn(`[picking-notion] 今日の「${folderName}」カードが見つかりません (${statusLabel} へ変更なし)`);
+    console.warn(`[picking-notion] ${jstDate} の「${folderName}」カードが見つかりません (${statusLabel} へ変更なし)`);
     return 'no_card';
   }
   const { statusProp } = await getSchema();
@@ -128,4 +128,39 @@ export async function syncPickingStatus(folderName, statusLabel, jstDate) {
   });
   console.log(`[picking-notion] ${folderName} → ${statusLabel}`);
   return 'updated';
+}
+
+/**
+ * バッチの「現在の状態」をNotionへ反映する (状態はこの関数の実行時点で読み直す)。
+ *
+ * ⭐イベント時点のラベルを fire-and-forget で送ると、並行実行で PATCH の到着順が逆転し
+ * 「completed の後に遅れた started が届いて完了カードが戻る」事故が起きる (Codex PR3 high)。
+ * バッチごとに Promise チェーンで直列化し、送信直前に最新状態を読むことで
+ * 「最後に実行されたものが最新状態を送る」を保証する (途中の遷移はスキップされてよい)。
+ *
+ * @param getBatchState () => ({folderName, workDate, label|null}) — 実行時点の状態を返す
+ */
+const _batchQueues = new Map();   // batchId → Promise (直列化チェーン)
+export function enqueueBatchSync(batchId, getBatchState) {
+  if (!process.env.PICKING_NOTION_TOKEN) return;
+  const prev = _batchQueues.get(batchId) || Promise.resolve();
+  const next = prev
+    .then(async () => {
+      const state = getBatchState();
+      if (!state || !state.label) return;
+      try {
+        await syncPickingStatus(state.folderName, state.label, state.workDate);
+      } catch (e) {
+        // 一時障害向けに1回だけ再試行 (それでも失敗したらログのみ = fail-soft。
+        // Notion同期は暫定連携で、正本の計測データはpicking.db側にある)
+        await new Promise((r) => setTimeout(r, 5000));
+        const retryState = getBatchState();
+        if (!retryState || !retryState.label) return;
+        await syncPickingStatus(retryState.folderName, retryState.label, retryState.workDate);
+      }
+    })
+    .catch((e) => console.warn(`[picking-notion] 同期失敗 (batch=${batchId}): ${e.message}`));
+  _batchQueues.set(batchId, next);
+  // チェーンが伸び続けないよう、完了時に自分が最後尾なら片付ける
+  next.finally(() => { if (_batchQueues.get(batchId) === next) _batchQueues.delete(batchId); });
 }

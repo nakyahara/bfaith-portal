@@ -23,7 +23,7 @@ import {
   deriveFolderName, isStaleInstructDate,
 } from './service.js';
 import { allPatternNames } from './patterns.js';
-import { syncPickingStatus, STATUS_PICKING, STATUS_PICKED } from './notion.js';
+import { enqueueBatchSync, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import {
   listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
 } from '../../lib/drive-csv.js';
@@ -151,11 +151,10 @@ router.get('/work/:id(\\d+)', (req, res) => {
  * 作業イベントAPI。body: { op_id, event: start|next|back, line_seq?, client_at? }。
  * 端末はオフラインキューから直列で送る。op_id 冪等なので再送は安全。
  */
-// バッチ状態遷移 → Notion カードのステータス (要件: 開始=ピッキング中 / 完了=ピッキング完了)
-const NOTION_STATUS_BY_TRANSITION = {
-  started: STATUS_PICKING,
-  reopened: STATUS_PICKING,
-  completed: STATUS_PICKED,
+// バッチの現在状態 → Notion カードのステータス (要件: 開始=ピッキング中 / 完了=ピッキング完了)
+const NOTION_STATUS_BY_BATCH = {
+  picking: STATUS_PICKING,
+  done: STATUS_PICKED,
 };
 
 router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
@@ -167,11 +166,18 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     clientAt: req.body.client_at,
     undoOpId: req.body.undo_op_id || null,
   }, req.session.email);
-  // Notion連携は fire-and-forget (fail-soft)。replayed の再送では動かさない
-  if (!result.replayed && NOTION_STATUS_BY_TRANSITION[result.transition]) {
-    const folderName = getBatch(batchId)?.folder_name;
-    syncPickingStatus(folderName, NOTION_STATUS_BY_TRANSITION[result.transition], jstToday())
-      .catch((e) => console.warn(`[picking-notion] 更新失敗 (${folderName}): ${e.message}`));
+  // Notion連携 (fail-soft)。replayed では動かさない。ラベルは送信直前にバッチの
+  // 最新状態から決める (イベント時点のラベルだと並行PATCHの順序逆転で巻き戻る)
+  if (!result.replayed && result.transition) {
+    enqueueBatchSync(batchId, () => {
+      const b = getBatch(batchId);
+      if (!b) return null;
+      return {
+        folderName: b.folder_name,
+        workDate: b.work_date,   // 日跨ぎ作業でも取込日のカードを動かす
+        label: NOTION_STATUS_BY_BATCH[b.status] || null,
+      };
+    });
   }
   res.json({ ok: true, ...result });
 }));
