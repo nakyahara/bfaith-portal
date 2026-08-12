@@ -21,13 +21,16 @@ function t(name, fn) { fn(); passed++; console.log(`  ok: ${name}`); }
 
 // ─── 純関数 ───
 
-t('normalizeImageUrl: 完全URL/プロトコル相対/cabinet相対/不正値', () => {
-  assert.equal(normalizeImageUrl('https://a/b.jpg'), 'https://a/b.jpg');
+t('normalizeImageUrl: 完全URL/プロトコル相対/cabinet相対/不正値/ドメインallowlist', () => {
+  assert.equal(normalizeImageUrl('https://image.rakuten.co.jp/b/a.jpg'), 'https://image.rakuten.co.jp/b/a.jpg');
+  assert.equal(normalizeImageUrl('https://shop.r10s.jp/x.jpg'), 'https://shop.r10s.jp/x.jpg');
   assert.equal(normalizeImageUrl('//image.rakuten.co.jp/x.jpg'), 'https://image.rakuten.co.jp/x.jpg');
   assert.equal(normalizeImageUrl('/img/white_00.jpg'), 'https://image.rakuten.co.jp/b-faith/cabinet/img/white_00.jpg');
   assert.equal(normalizeImageUrl(''), null);
   assert.equal(normalizeImageUrl(null), null);
   assert.equal(normalizeImageUrl('relative.jpg'), null);
+  assert.equal(normalizeImageUrl('https://evil.example.com/a.jpg'), null, '楽天ドメイン以外は弾く');
+  assert.equal(normalizeImageUrl('https://evilrakuten.co.jp/a.jpg'), null, 'サフィックス偽装は弾く');
 });
 
 t('resolveManageNumber: 直接一致とハイフン削りfallback (最大3段)', () => {
