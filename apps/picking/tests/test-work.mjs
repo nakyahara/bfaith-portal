@@ -9,7 +9,7 @@ import iconv from 'iconv-lite';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-test-'));
 
-const { parseCs03002, importBatch, applyEvent, getWorkState, PkError } = await import('../service.js');
+const { parseCs03002, importBatch, applyEvent, getWorkState, getDailySummary, PkError } = await import('../service.js');
 const { initPickingDB, getDB } = await import('../db.js');
 
 initPickingDB();
@@ -263,6 +263,108 @@ t('bad_op_id / bad_event / bad_line_seq の入力検証', () => {
   applyEvent(id, { opId: op(), event: 'start' }, W1);
   expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: 0 }, W1), 'bad_line_seq');
   expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: null }, W1), 'bad_line_seq');
+});
+
+// ─── PR4: 欠品・中断・取消 ───
+
+t('shortage: 全量/一部欠品を記録して次へ進む・最終明細ならバッチ完了', () => {
+  // 明細: seq1=qty1 / seq2=qty2 / seq3=qty3
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  // 一部欠品 (指示2に対して欠品1)
+  let r = applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 1 }, W1);
+  assert.equal(r.currentSeq, 3);
+  const s1 = getWorkState(id);
+  assert.equal(s1.lines[1].status, 'shortage');
+  assert.equal(s1.lines[1].shortage_qty, 1);
+  // 全量欠品 (数量未指定=指示数)。最終明細なので完了
+  r = applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 3 }, W1);
+  assert.equal(r.batchStatus, 'done');
+  assert.equal(getWorkState(id).lines[2].shortage_qty, getWorkState(id).lines[2].qty);
+});
+
+t('shortage: 数量の範囲検証・表示中以外は out_of_order', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 0 }, W1), 'bad_shortage_qty');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 99 }, W1), 'bad_shortage_qty');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 1 }, W1), 'out_of_order');
+});
+
+t('back: 欠品明細も取り消せる (shortage_qtyがクリアされる)', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  const shortOp = op();
+  applyEvent(id, { opId: shortOp, event: 'shortage', lineSeq: 1, shortageQty: 1 }, W1);
+  const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 1, undoOpId: shortOp }, W1);
+  assert.equal(r.currentSeq, 1);
+  const line = getWorkState(id).lines[0];
+  assert.equal(line.status, 'pending');
+  assert.equal(line.shortage_qty, null);
+});
+
+t('pause/resume: 中断時間が paused_total_sec に積まれ、状態が往復する', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  let r = applyEvent(id, { opId: op(), event: 'pause', pauseReason: '休憩' }, W1);
+  assert.equal(r.batchStatus, 'paused');
+  let b = getWorkState(id).batch;
+  assert.equal(b.pause_reason, '休憩');
+  assert.ok(b.pause_started_at);
+  // 中断中は next 不可
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1), 'not_picking');
+  // 二重pauseは not_picking
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'pause', pauseReason: '休憩' }, W1), 'not_picking');
+  r = applyEvent(id, { opId: op(), event: 'resume' }, W1);
+  assert.equal(r.batchStatus, 'picking');
+  b = getWorkState(id).batch;
+  assert.equal(b.pause_started_at, null);
+  assert.ok(b.paused_total_sec >= 0);
+  // 再開前の resume は not_paused
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'resume' }, W1), 'not_paused');
+});
+
+t('pause中の takeover → 交代した人が resume できる', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'pause', pauseReason: '他作業への応援' }, W1);
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'resume' }, W2), 'taken');
+  applyEvent(id, { opId: op(), event: 'takeover' }, W2);
+  const r = applyEvent(id, { opId: op(), event: 'resume' }, W2);
+  assert.equal(r.batchStatus, 'picking');
+});
+
+t('cancel: 進捗・時間・担当を初期化して ready に戻す', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 1 }, W1);
+  const r = applyEvent(id, { opId: op(), event: 'cancel' }, W1);
+  assert.equal(r.batchStatus, 'ready');
+  const s = getWorkState(id);
+  assert.equal(s.batch.worker, null);
+  assert.equal(s.batch.started_at, null);
+  assert.ok(s.lines.every((l) => l.status === 'pending' && l.done_at === null && l.shortage_qty === null));
+  // 取り消し後にもう一度最初から開始できる
+  const r2 = applyEvent(id, { opId: op(), event: 'start' }, W2);
+  assert.equal(r2.batchStatus, 'picking');
+  assert.equal(r2.currentSeq, 1);
+});
+
+t('getDailySummary: 完了バッチの集計と欠品一覧', () => {
+  const today = (new Date()).toLocaleDateString('en-CA', { timeZone: 'Asia/Tokyo' });
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 2 }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 3 }, W1);
+  const sum = getDailySummary(today);
+  assert.ok(sum.total.doneCount >= 1);
+  const w = sum.byWorker.find((g) => g.key === W1);
+  assert.ok(w && w.lines >= 3);
+  assert.ok(sum.shortages.some((s) => s.shortage_qty === 2));
+  assert.ok(sum.shortages.every((s) => s.locationLabel.includes('-')));
 });
 
 console.log(`\ntest-work: ${passed} 件 pass`);

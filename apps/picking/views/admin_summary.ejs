@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 860px; margin: 0 auto; padding: 12px 16px 40px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+    .pk-bar input[type=date] { padding: 6px; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+    .tile { background: #f8f9fa; border-radius: 10px; padding: 12px 14px; }
+    .tile .v { font-size: 1.5em; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tile .k { font-size: 0.78em; color: #495057; }
+    h2 { font-size: 1.0em; margin: 18px 0 8px; }
+    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    table.pk-list th { background: #f1f3f5; }
+    table.pk-list td.num, table.pk-list th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: #868e96; }
+    .short { color: #c92a2a; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📊 ピッキングサマリ</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/admin/import" class="btn-logout">📥 取込</a>
+      <a href="/apps/picking/admin/devices" class="btn-logout">📱 端末・作業者</a>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-bar">
+      <form method="get" action="/apps/picking/admin/summary">
+        <input type="date" name="date" value="<%= summary.workDate %>" onchange="this.form.submit()">
+      </form>
+      <span class="muted">完了バッチのみ集計 (中断時間は除外)</span>
+    </div>
+
+    <% const t = summary.total; %>
+    <% const fmtMin = (s) => s != null ? `${Math.floor(s / 60)}分` : '-'; %>
+    <div class="tiles">
+      <div class="tile"><div class="v"><%= t.doneCount %> / <%= t.batchCount %></div><div class="k">完了バッチ / 取込</div></div>
+      <div class="tile"><div class="v"><%= t.lineCount %></div><div class="k">明細数</div></div>
+      <div class="tile"><div class="v"><%= t.qty %></div><div class="k">総数量</div></div>
+      <div class="tile"><div class="v"><%= fmtMin(t.activeSec) %></div><div class="k">総ピッキング時間</div></div>
+      <div class="tile"><div class="v"><%= t.secPerLine != null ? t.secPerLine.toFixed(1) : '-' %></div><div class="k">秒 / 明細</div></div>
+      <div class="tile"><div class="v"><%= t.linesPerHour != null ? Math.round(t.linesPerHour) : '-' %></div><div class="k">明細 / 時間</div></div>
+    </div>
+
+    <h2>作業者別</h2>
+    <table class="pk-list">
+      <thead><tr><th>作業者</th><th class="num">バッチ</th><th class="num">明細</th><th class="num">数量</th><th class="num">時間</th><th class="num">秒/明細</th></tr></thead>
+      <tbody>
+        <% for (const g of summary.byWorker) { %>
+          <tr><td><%= g.key %></td><td class="num"><%= g.batches %></td><td class="num"><%= g.lines %></td>
+            <td class="num"><%= g.qty %></td><td class="num"><%= fmtMin(g.activeSec) %></td>
+            <td class="num"><%= g.secPerLine != null ? g.secPerLine.toFixed(1) : '-' %></td></tr>
+        <% } %>
+        <% if (summary.byWorker.length === 0) { %><tr><td colspan="6" class="muted">完了バッチがまだありません</td></tr><% } %>
+      </tbody>
+    </table>
+
+    <h2>引当分類別</h2>
+    <table class="pk-list">
+      <thead><tr><th>引当分類</th><th class="num">バッチ</th><th class="num">明細</th><th class="num">数量</th><th class="num">時間</th><th class="num">秒/明細</th></tr></thead>
+      <tbody>
+        <% for (const g of summary.byClass) { %>
+          <tr><td><%= g.key %></td><td class="num"><%= g.batches %></td><td class="num"><%= g.lines %></td>
+            <td class="num"><%= g.qty %></td><td class="num"><%= fmtMin(g.activeSec) %></td>
+            <td class="num"><%= g.secPerLine != null ? g.secPerLine.toFixed(1) : '-' %></td></tr>
+        <% } %>
+        <% if (summary.byClass.length === 0) { %><tr><td colspan="6" class="muted">完了バッチがまだありません</td></tr><% } %>
+      </tbody>
+    </table>
+
+    <h2 class="short">⚠ 欠品 (<%= summary.shortages.length %>件)</h2>
+    <table class="pk-list">
+      <thead><tr><th>フォルダ</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th class="num">欠品/指示</th><th>作業者</th></tr></thead>
+      <tbody>
+        <% for (const s of summary.shortages) { %>
+          <tr><td><%= s.folder_name || '-' %></td><td style="font-family:ui-monospace,Consolas,monospace"><%= s.locationLabel %></td>
+            <td><%= s.sku %></td><td><%= s.product_name || '' %></td>
+            <td class="num short"><%= s.shortage_qty %> / <%= s.qty %></td><td><%= s.worker || '-' %></td></tr>
+        <% } %>
+        <% if (summary.shortages.length === 0) { %><tr><td colspan="6" class="muted">欠品はありません</td></tr><% } %>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

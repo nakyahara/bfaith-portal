@@ -22,8 +22,9 @@ import {
 } from './db.js';
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
-  deriveFolderName, isStaleInstructDate,
+  deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
 } from './service.js';
+import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { queueEnsureImages, getImageMap } from './images.js';
@@ -227,6 +228,7 @@ router.get('/work/:id(\\d+)', (req, res) => {
     worker: req.session?.email || null,
     displayName: req.session?.displayName,
     workers: listWorkers(),
+    pauseReasons: PAUSE_REASONS,
     state,
   });
 });
@@ -250,7 +252,22 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
     clientAt: req.body.client_at,
     undoOpId: req.body.undo_op_id || null,
+    shortageQty: req.body.shortage_qty == null ? null : Number(req.body.shortage_qty),
+    pauseReason: req.body.pause_reason || null,
   }, worker.id);
+  // 欠品は管理者チャットへ即時通知 (fail-soft・要件§5.6)。replayed の再送では通知しない
+  if (req.body.event === 'shortage' && !result.replayed) {
+    const batch = getBatch(batchId);
+    const line = listLines(batchId).find((l) => l.seq === Number(req.body.line_seq));
+    if (batch && line) {
+      notifyShortage({
+        batch,
+        line: { ...line, locationLabel: formatLocation(line.block, line.location) },
+        worker: worker.name,
+        shortageQty: line.shortage_qty ?? line.qty,
+      }).catch((e) => console.warn(`[picking-notify] 欠品通知失敗 (${line.sku}): ${e.message}`));
+    }
+  }
   // Notion連携 (fail-soft)。replayed では動かさない。ラベルは送信直前にバッチの
   // 最新状態から決める (イベント時点のラベルだと並行PATCHの順序逆転で巻き戻る)
   if (!result.replayed && result.transition) {
@@ -308,6 +325,18 @@ router.get('/manifest.json', (req, res) => {
     background_color: '#111418',
     theme_color: '#111418',
     icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+  });
+});
+
+// ─── 本日サマリ (管理者) ───
+router.get('/admin/summary', requireAdmin, (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  res.render(path.join(__dirname, 'views/admin_summary'), {
+    title: 'ピッキングサマリ',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    summary: getDailySummary(workDate),
   });
 });
 
