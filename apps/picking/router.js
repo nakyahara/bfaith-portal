@@ -113,12 +113,19 @@ function pickingAccess(req, res, next) {
  * 計測記録は監査証跡としては扱わない (中原さん了承の設計判断 2026-08-12)。
  */
 function resolveWorker(req) {
-  if (req.session?.email) return { id: req.session.email, name: req.session.displayName || req.session.email };
+  // 有効な worker_code があれば最優先 (ログイン中でも「実際にピッキングする人」を選ぶ運用 —
+  // 中原さん要望 8/12。計測はログイン者ではなく選択された作業者に紐づける)
   const code = String(req.body?.worker_code || req.query?.worker_code || '').trim();
-  if (!code) throw new PkError(400, 'no_worker', '作業者を選択してください');
-  const w = getWorker(code);
-  if (!w || !w.active) throw new PkError(400, 'bad_worker', '作業者が無効です。切替から選び直してください');
-  return { id: w.name, name: w.name };
+  if (code) {
+    const w = getWorker(code);
+    if (w && w.active) return { id: w.name, name: w.name };
+    // 無効コード: セッションがあれば本人として続行、端末モードは選び直しを要求
+    if (!req.session?.email) {
+      throw new PkError(400, 'bad_worker', '作業者が無効です。切替から選び直してください');
+    }
+  }
+  if (req.session?.email) return { id: req.session.email, name: req.session.displayName || req.session.email };
+  throw new PkError(400, 'no_worker', '作業者を選択してください');
 }
 
 /**

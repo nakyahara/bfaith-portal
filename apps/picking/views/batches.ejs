@@ -139,9 +139,12 @@
 
     function goWork() { location.href = `/apps/picking/work/${targetBatchId}`; }
 
+    const HAS_WORKERS = document.querySelectorAll('.worker-opt').length > 0;
     document.querySelectorAll('.btn-work').forEach((btn) => btn.addEventListener('click', () => {
       targetBatchId = btn.dataset.id;
-      if (!DEVICE_MODE) return goWork();   // 個人ログイン時は本人が担当なので選択不要
+      // ログイン中でも必ず担当者を選ぶ (中原さん要望 8/12。実際にピッキングする人 ≠ ログイン者のため)。
+      // 作業者マスタが空の場合のみ、ログインユーザー本人として直行する
+      if (!DEVICE_MODE && !HAS_WORKERS) return goWork();
       // 前回選んだ人をハイライト (タップは毎回必要 = 使い回し端末での選び忘れ防止)
       const last = localStorage.getItem('pk_worker_code');
       document.querySelectorAll('.worker-opt').forEach((o) => o.classList.toggle('last', o.dataset.code === last));

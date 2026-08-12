@@ -209,12 +209,13 @@
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
       qty: l.qty, status: l.status, img: l.imageUrl,
     }))).replace(/</g, '\\u003c') %>;
-    // セッションログイン時は email が入る。共用端末モードは null = localStorage の作業者を使う
+    // セッションログイン時は email が入る。共用端末モードは null
     const SESSION_WORKER = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
     const DEVICE_MODE = !SESSION_WORKER;
-    // 計測の識別子: セッション=email / 端末=作業者の表示名 (サーバーは worker_code から名前を解決)
-    let ME = SESSION_WORKER || localStorage.getItem('pk_worker_name') || null;
-    function workerCode() { return DEVICE_MODE ? localStorage.getItem('pk_worker_code') : null; }
+    // 計測の識別子: 選択された作業者名を最優先 (ログイン中でも「実際にピッキングする人」を選ぶ運用)。
+    // 未選択のセッションユーザーのみ本人 (email) として扱う
+    let ME = localStorage.getItem('pk_worker_name') || SESSION_WORKER || null;
+    function workerCode() { return localStorage.getItem('pk_worker_code') || null; }
     // 明細ごとの「最後に完了させた next の op_id」(backの取り消し対象指定に使う)
     const NEXTOPS = <%- JSON.stringify(state.lastNextOps || {}).replace(/</g, '\\u003c') %>;
 
