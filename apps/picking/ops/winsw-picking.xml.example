@@ -1,0 +1,35 @@
+<!--
+  picking スタンドアロンサーバの winsw サービス定義テンプレート (ミニPC用)
+
+  使い方 (詳細: AI_reference/システム設計/ピッキング支援システム_ミニPC移行手順_20260812.md):
+    1. winsw.exe を PickingServer.exe にリネームしてこのXMLと同じフォルダに置く
+       (例: C:\tools\picking-service\PickingServer.exe + PickingServer.xml)
+    2. このファイルを PickingServer.xml にリネームし、パスを実環境に合わせる
+    3. PickingServer.exe install → PickingServer.exe start
+
+  ⚠ env は workingdirectory の .env から standalone.js が読む (dotenv)。
+    .env を変更したら Restart-Service では反映されないことがあるため、
+    stop → start (またはサービス再起動) を必ず行うこと。
+-->
+<service>
+  <id>PickingServer</id>
+  <name>B-Faith Picking Server</name>
+  <description>スマホピッキング支援 (apps/picking standalone)。Render から分離した倉庫向け常駐サーバ。</description>
+
+  <executable>node</executable>
+  <arguments>apps\picking\standalone.js</arguments>
+  <workingdirectory>C:\tools\bfaith-picking</workingdirectory>
+
+  <!-- クラッシュ時は自動再起動 (feedback_インフラ運用: onfailure restart 必須) -->
+  <onfailure action="restart" delay="10 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- ログローテーション (肥大化防止) -->
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>8</keepFiles>
+  </log>
+
+  <!-- graceful shutdown: SIGTERM 相当を送って計測イベントの取りこぼしを防ぐ -->
+  <stoptimeout>15 sec</stoptimeout>
+</service>
