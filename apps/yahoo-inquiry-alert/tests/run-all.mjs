@@ -110,6 +110,10 @@ section('validateListResponse');
   const r = validateListResponse(good, q);
   eq(r.count, 1, 'count を summary から読む');
 
+  // 実測: Yahoo!は summary.filter を大文字で echo する ('UNANSWERED')
+  const upper = listJson({ filter: 'UNANSWERED', count: 1, headlines: [headline({ isNoAnswer: true })] });
+  eq(validateListResponse(upper, q).count, 1, '大文字の filter echo も受理する (実機実測)');
+
   await throws(() => validateListResponse(listJson({ filter: 'all', count: 0, headlines: [] }), q),
     /summary\.filter/, '旧プロキシ (filter=all) は contract error');
   await throws(() => validateListResponse({ summary: { filter: 'unanswered', topic: {} }, headlines: [] }, q),

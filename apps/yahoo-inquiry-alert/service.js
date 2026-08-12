@@ -79,8 +79,10 @@ export function validateListResponse(json, q) {
   const label = `${q.requestFilter}/${q.serviceType}`;
   const filter = json?.summary?.filter;
   // 旧プロキシは requestFilter を転送しない → Yahoo!は全件を返し filter='all' になる。
-  // ここで止めないと「全問い合わせ数」を「対応漏れ数」と誤読する
-  if (filter !== q.requestFilter) {
+  // ここで止めないと「全問い合わせ数」を「対応漏れ数」と誤読する。
+  // ⚠️実測 (2026-08-12 初回実機): Yahoo!は summary.filter を大文字 ('UNANSWERED') で
+  //   echo する。要求値と大文字小文字を無視して比較する
+  if (String(filter ?? '').toLowerCase() !== q.requestFilter) {
     throw contractError(`summary.filter='${filter}' が要求 '${q.requestFilter}' と一致しません`
       + ` (VPSプロキシが絞り込みパラメータ未対応の可能性。${label})`);
   }
