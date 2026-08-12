@@ -107,6 +107,10 @@ function pickingAccess(req, res, next) {
  * 作業者の識別。セッションなら email、端末モードなら選択された作業者コード
  * (body/query の worker_code。pk_workers の有効な作業者のみ受け付ける)。
  * 計測の worker 列には「表示名」を入れる (現行Notionの担当者selectと同じ粒度)。
+ *
+ * ⚠ 端末モードの作業者は自己申告 (名前タップ) であり、本人認証ではない。
+ * 現行Notionの担当者selectと同等の性善説運用 (社内10名) を前提とし、
+ * 計測記録は監査証跡としては扱わない (中原さん了承の設計判断 2026-08-12)。
  */
 function resolveWorker(req) {
   if (req.session?.email) return { id: req.session.email, name: req.session.displayName || req.session.email };
@@ -142,6 +146,9 @@ function requireAdmin(req, res, next) {
 
 // router 全体に適用 (server.js は requireAppAccess を付けずに mount する)
 router.use(pickingAccess);
+// admin系は個別の requireAdmin に加えて prefix 一括でも守る
+// (将来ルートを追加したときの付け忘れを構造的に防ぐ — Codex指摘)
+router.use('/admin', requireAdmin);
 
 /** PkError は業務エラーとして status + message を返す。それ以外は 500。 */
 function api(handler) {
@@ -307,13 +314,14 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
     isAdmin: true,
     devices: listDevices(),
     workers: listWorkers(true),
-    registered: req.query.registered === '1',
   });
 });
 
 /**
  * この端末を登録する。発行したトークンは httpOnly Cookie としてこの端末にだけ渡す
  * (画面にも他の誰にも見せない)。倉庫のiPhoneで管理者がログインして1回だけ実行する。
+ * ⭐登録と同時に管理者セッションを破棄する (「登録してログアウト」を原子化)。
+ *   共用端末に管理者セッションが残ると、渡した相手が取込・管理APIを触れてしまうため (Codex high)
  */
 router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
@@ -321,12 +329,13 @@ router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) =>
   const token = createDevice(label, req.session.email);
   res.cookie(DEVICE_COOKIE, token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)
+    secure: process.env.NODE_ENV !== 'development',
     sameSite: 'lax',
-    maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。切れたら再登録
+    maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。サーバー側でも同TTLを検証
     path: '/apps/picking',
   });
-  res.json({ ok: true });
+  req.session.destroy(() => res.json({ ok: true, loggedOut: true }));
 }));
 
 router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {

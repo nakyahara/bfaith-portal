@@ -266,6 +266,10 @@ export function createDevice(label, actor) {
   return token;
 }
 
+// 端末トークンの有効期間 (サーバー側でも検証する。Cookie の Max-Age だけに頼ると
+// 盗まれたトークンを手動送信された場合に失効するまで無期限に使えてしまう)
+const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
+
 /** トークン検証。有効なら端末行を返し last_seen_at を更新 (1時間に1回程度に間引く)。 */
 export function verifyDevice(token) {
   if (!token) return null;
@@ -275,6 +279,7 @@ export function verifyDevice(token) {
   ).get(hashToken(token));
   if (!row) return null;
   const now = utcNow();
+  if (Date.parse(now) - Date.parse(row.created_at) > DEVICE_TTL_MS) return null;   // 期限切れ=再登録
   if (!row.last_seen_at || Date.parse(now) - Date.parse(row.last_seen_at) > 3600_000) {
     db.prepare('UPDATE pk_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
   }

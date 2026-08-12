@@ -40,11 +40,6 @@
   </header>
 
   <div class="pk-wrap">
-    <% if (registered) { %>
-      <div class="ok-banner">✅ この端末を登録しました。ログアウトしても、この端末からはピッキング画面を開けます。
-        ホーム画面に <b>/apps/picking/</b> を追加して使ってください。</div>
-    <% } %>
-
     <div class="pk-form">
       <h2>この端末を倉庫端末として登録</h2>
       <p class="hint">
@@ -115,9 +110,11 @@
     $('registerBtn').addEventListener('click', async () => {
       const label = $('deviceLabel').value.trim();
       if (!label) { $('deviceMsg').textContent = '端末名を入力してください'; $('deviceMsg').className = 'pk-msg err'; return; }
+      if (!confirm('この端末を登録します。登録と同時にログアウトし、以後この端末はログイン不要の作業専用になります。よろしいですか?')) return;
       const { ok, body } = await post('/apps/picking/admin/devices', { label });
       if (!ok) { $('deviceMsg').textContent = body.error || '失敗しました'; $('deviceMsg').className = 'pk-msg err'; return; }
-      location.href = '/apps/picking/admin/devices?registered=1';
+      alert('登録しました。ログアウト済みなので、そのまま作業画面が使えます。');
+      location.href = '/apps/picking/';
     });
 
     document.querySelectorAll('.btn-revoke').forEach((btn) => btn.addEventListener('click', async () => {
