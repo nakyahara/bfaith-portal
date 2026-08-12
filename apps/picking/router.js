@@ -23,10 +23,24 @@ import {
   deriveFolderName, isStaleInstructDate,
 } from './service.js';
 import { allPatternNames } from './patterns.js';
-import { listDriveFiles, downloadDriveFileById } from '../../lib/drive-csv.js';
+import { enqueueBatchSync, STATUS_PICKING, STATUS_PICKED } from './notion.js';
+import {
+  listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
+} from '../../lib/drive-csv.js';
 
-// 出荷_no フォルダ (中原さん共有 2026-08-12。SA bfaith-portal@… に閲覧者共有済み)
+// 出荷_no フォルダ (中原さん共有 2026-08-12。SA bfaith-portal@… に閲覧者共有済み)。
+// CSVは各サブフォルダ (出荷_XX) に引当RPAが保存する運用のため、検索はサブフォルダ横断
 const DRIVE_FOLDER_ID = process.env.PICKING_DRIVE_FOLDER_ID || '110ONn2xHzfEG5HPt1DRy4P64zv2hpGjh';
+
+// サブフォルダ一覧 (出荷_01〜45) は増減しないので60秒キャッシュ (一覧・DL検証の両方で使う)
+let _subfoldersCache = { at: 0, list: null };
+async function getShippingFolders() {
+  if (_subfoldersCache.list && Date.now() - _subfoldersCache.at < 60_000) return _subfoldersCache.list;
+  const subs = await listDriveSubfolders({ folderId: DRIVE_FOLDER_ID });
+  const list = [{ folder_id: DRIVE_FOLDER_ID, name: '(出荷_no直下)' }, ...subs];
+  _subfoldersCache = { at: Date.now(), list };
+  return list;
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -137,14 +151,34 @@ router.get('/work/:id(\\d+)', (req, res) => {
  * 作業イベントAPI。body: { op_id, event: start|next|back, line_seq?, client_at? }。
  * 端末はオフラインキューから直列で送る。op_id 冪等なので再送は安全。
  */
+// バッチの現在状態 → Notion カードのステータス (要件: 開始=ピッキング中 / 完了=ピッキング完了)
+const NOTION_STATUS_BY_BATCH = {
+  picking: STATUS_PICKING,
+  done: STATUS_PICKED,
+};
+
 router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
-  const result = applyEvent(Number(req.params.id), {
+  const batchId = Number(req.params.id);
+  const result = applyEvent(batchId, {
     opId: req.body.op_id,
     event: req.body.event,
     lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
     clientAt: req.body.client_at,
     undoOpId: req.body.undo_op_id || null,
   }, req.session.email);
+  // Notion連携 (fail-soft)。replayed では動かさない。ラベルは送信直前にバッチの
+  // 最新状態から決める (イベント時点のラベルだと並行PATCHの順序逆転で巻き戻る)
+  if (!result.replayed && result.transition) {
+    enqueueBatchSync(batchId, () => {
+      const b = getBatch(batchId);
+      if (!b) return null;
+      return {
+        folderName: b.folder_name,
+        workDate: b.work_date,   // 日跨ぎ作業でも取込日のカードを動かす
+        label: NOTION_STATUS_BY_BATCH[b.status] || null,
+      };
+    });
+  }
   res.json({ ok: true, ...result });
 }));
 
@@ -251,7 +285,10 @@ async function driveCall(fn) {
 }
 
 router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
-  const files = await driveCall(() => listDriveFiles({ folderId: DRIVE_FOLDER_ID, nameContains: '.csv' }));
+  const files = await driveCall(async () => {
+    const folders = await getShippingFolders();
+    return listDriveFilesAcross({ folders, nameContains: '.csv' });
+  });
   res.json({ ok: true, files: files.filter((f) => /\.csv$/i.test(f.filename)) });
 }));
 
@@ -263,11 +300,17 @@ router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
 router.post('/admin/import/drive', checkOrigin, requireAdmin, api(async (req, res) => {
   const fileId = String(req.body.file_id || '').trim();
   if (!fileId) throw new PkError(400, 'no_file', 'ファイルを選択してください');
-  const dl = await driveCall(() => downloadDriveFileById({ fileId, folderId: DRIVE_FOLDER_ID }));
+  const dl = await driveCall(async () => {
+    const folders = await getShippingFolders();
+    return downloadDriveFileById({ fileId, folderIds: folders.map((f) => f.folder_id) });
+  });
   const preview = parseCs03002(dl.buffer);
   const summary = buildSummary(preview);
   summary.filename = dl.filename;
-  summary.folderNameSuggestion = deriveFolderName(dl.filename);
+  // フォルダ名はファイルの置かれたサブフォルダ名 (出荷_XX) を最優先、無ければファイル名から導出
+  const parentName = String(req.body.parent_name || '');
+  summary.folderNameSuggestion = (/^出荷_\d+$/.test(parentName) ? parentName : null)
+    || deriveFolderName(dl.filename);
   if (String(req.body.mode) !== 'confirm') {
     return res.json({ ok: true, mode: 'preview', ...summary });
   }

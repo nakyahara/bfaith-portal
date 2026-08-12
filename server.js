@@ -69,6 +69,7 @@ import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
 import pickingRouter from './apps/picking/router.js';
+import pickingIngestRouter from './apps/picking/ingest-router.js';
 import easyShipRouter from './apps/easy-ship/router.js';
 import easyShipExtRouter from './apps/easy-ship/ext-router.js';
 import selectSetRouter from './apps/select-set/router.js';
@@ -1303,6 +1304,8 @@ app.use('/apps/inquiry-hub/ai-api', express.json({ limit: '1mb' }), inquiryHubAi
 // limit 2mb = メールディーラーCSV取込 (テンプレート~150KB+JSONエスケープ膨張) を JSON body で受けるため
 app.use('/apps/inquiry-hub', requireAppAccess('inquiry-hub'), express.json({ limit: '2mb' }), inquiryHubRouter);
 app.use('/apps/shipping-work', requireAppAccess('shipping-work'), express.json({ limit: '256kb' }), shippingWorkRouter);
+// picking: 引当RPA (伝票出しPC) 向け取込API は x-api-key 認証・セッション外なので本体より先に mount
+app.use('/apps/picking/ingest-api', pickingIngestRouter);
 // picking: CS03002取込は multipart (router 内の multer が処理)。JSON body は作業API (PR2) 用
 app.use('/apps/picking', requireAppAccess('picking'), express.json({ limit: '256kb' }), pickingRouter);
 // easy-ship: Chrome拡張向けAPI (x-api-key 認証・fail-closed) はセッション認証付き本体より先に mount
