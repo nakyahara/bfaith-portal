@@ -227,8 +227,10 @@ router.get('/admin/import', requireAdmin, (req, res) => {
  * preview → confirm でファイルを2回送る (サーバーに中間状態を持たない。GAS取込等と同じ二段方式)
  */
 function buildSummary(preview) {
+  const tbFirst = preview.tbNo.split(',')[0];
   return {
     tbNo: preview.tbNo,
+    tbLabel: preview.tbCount > 1 ? `${tbFirst} 他${preview.tbCount - 1}件` : tbFirst,
     instructDate: preview.instructDate,
     invoiceSoft: preview.invoiceSoft,
     deliveryMethod: preview.deliveryMethod,

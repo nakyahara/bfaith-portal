@@ -153,12 +153,20 @@ t('数量が不正なら bad_qty', () => {
   expectPkError(() => parseCs03002(zero), 'bad_qty');
 });
 
-t('複数TBは multiple_tb_no (まとめ引当の実データ採取までfail-closed)', () => {
+t('複数TBは正常 (1引当で複数TBが振られる実仕様)。キーはソート済みTB一覧の組', () => {
   const csv = makeCsv([
-    row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB001' }),
-    row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002', tb: 'TB002' }),
+    row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB002' }),
+    row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002', tb: 'TB001' }),
   ]);
-  expectPkError(() => parseCs03002(csv), 'multiple_tb_no');
+  const p = parseCs03002(csv);
+  assert.equal(p.tbNo, 'TB001,TB002');   // 行順に依らずソートで正規化
+  assert.equal(p.tbCount, 2);
+  // 行順を入れ替えた同じ引当のCSVでも同一キーになる (冪等の前提)
+  const csv2 = makeCsv([
+    row({ loc: '00201703', sku: 'b', qty: 1, slip: '0002', tb: 'TB001' }),
+    row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001', tb: 'TB002' }),
+  ]);
+  assert.equal(parseCs03002(csv2).tbNo, 'TB001,TB002');
 });
 
 t('引用符が閉じていない壊れCSVは broken_csv', () => {
