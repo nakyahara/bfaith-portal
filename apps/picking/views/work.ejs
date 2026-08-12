@@ -15,13 +15,19 @@
        暗背景+高コントラスト・巨大文字。装飾は最小限 */
     * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100%; }
+    /* position:fixed でページ自体のスクロールを完全に殺す。
+       iOS SafariはURLバーの伸縮で 100% と可視領域がずれ、わずかに縦スクロールできて
+       画面上部 (ロケーション) が切れる (2026-08-12 実機写真で確認) */
     body {
+      position: fixed; inset: 0; width: 100%;
       background: #111418; color: #f1f3f5;
       font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
       display: flex; flex-direction: column;
       overflow: hidden; user-select: none; -webkit-user-select: none;
+      overscroll-behavior: none; touch-action: manipulation;
       padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
     }
+    @supports (height: 100dvh) { body { height: 100dvh; } }
     .bar {
       display: flex; justify-content: space-between; align-items: center;
       padding: 8px 14px; font-size: 15px; color: #adb5bd; flex: 0 0 auto;
@@ -48,14 +54,15 @@
       text-align: center; font-size: 15px; color: #74c0fc; padding: 0 8px;
       font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
     }
+    /* 画像は縦持ちでは高さ約28%に抑える (大きすぎると商品名・数量が窮屈になる — 実機FB) */
     #imgbox {
-      flex: 1 1 auto; min-height: 0; margin: 6px 14px;
+      flex: 0 0 auto; height: 28vh; min-height: 110px; margin: 4px 14px;
       display: flex; align-items: center; justify-content: center;
       background: #1c2127; border-radius: 12px; overflow: hidden;
     }
     #imgbox .noimg { color: #495057; font-size: 15px; }
     #imgbox img { max-width: 100%; max-height: 100%; object-fit: contain; }
-    #details { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; }
+    #details { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 2px; justify-content: center; }
     #qty {
       text-align: center; font-weight: 800; line-height: 1;
       font-size: clamp(52px, 18vw, 96px); font-variant-numeric: tabular-nums;
@@ -100,7 +107,7 @@
       #nextloc { grid-area: nextloc; }
       #details { grid-area: det; justify-content: center; min-height: 0; }
       #qty { font-size: clamp(48px, 16vh, 88px); }
-      #imgbox { grid-area: img; margin: 0; }
+      #imgbox { grid-area: img; margin: 0; height: auto; flex: none; }
       #nextBtn { grid-area: next; margin: 0 0 4px; font-size: 26px; }
       .subrow { grid-area: sub; padding: 0; align-items: end; }
     }
@@ -387,6 +394,24 @@
         flushing = false;
       }
     }
+
+    // ── スワイプ操作 (誤タップ対策の併用手段。ボタンはそのまま残す) ──
+    // 左スワイプ = 次へ / 右スワイプ = 前へ戻る。60px以上の水平移動で発火
+    let touchStart = null;
+    document.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) { touchStart = null; return; }
+      touchStart = { x: e.touches[0].clientX, y: e.touches[0].clientY, at: Date.now() };
+    }, { passive: true });
+    document.addEventListener('touchend', (e) => {
+      if (!touchStart || !started) return;
+      if (!$('scr-pick').classList.contains('active')) return;
+      const dx = e.changedTouches[0].clientX - touchStart.x;
+      const dy = e.changedTouches[0].clientY - touchStart.y;
+      touchStart = null;
+      if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;   // 縦振れ・短距離は無視
+      if (dx < 0) $('nextBtn').click();
+      else doBack();
+    }, { passive: true });
 
     // ── 画像の後追い反映 (取込直後は解決がバックグラウンド進行中のことがある) ──
     // 画像なしの明細が残っている間だけ5秒間隔で最大12回ポーリングし、届き次第反映する
