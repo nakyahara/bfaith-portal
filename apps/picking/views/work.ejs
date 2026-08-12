@@ -49,14 +49,14 @@
       font-size: 54px; line-height: 1.15; white-space: nowrap; overflow: hidden;
       font-variant-numeric: tabular-nums; padding: 2px 8px 0;
     }
-    /* 次のロケーションの予告 (歩き出す方向を先に決められる) */
+    /* 次のロケーションの予告 (歩き出す方向を先に決められる)。チラ見で読める太さ・大きさに */
     #nextloc {
-      text-align: center; font-size: 15px; color: #74c0fc; padding: 0 8px;
+      text-align: center; font-size: 21px; font-weight: 700; color: #74c0fc; padding: 0 8px 2px;
       font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
     }
-    /* 画像は縦持ちでは高さ約28%に抑える (大きすぎると商品名・数量が窮屈になる — 実機FB) */
+    /* 画像は縦持ちでは高さ約24%に抑える (商品名2行の確保が最優先 — 実機FB) */
     #imgbox {
-      flex: 0 0 auto; height: 28vh; min-height: 110px; margin: 4px 14px;
+      flex: 0 0 auto; height: 24vh; min-height: 100px; margin: 4px 14px;
       display: flex; align-items: center; justify-content: center;
       background: #1c2127; border-radius: 12px; overflow: hidden;
     }
@@ -65,7 +65,7 @@
     #details { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 2px; justify-content: center; }
     #qty {
       text-align: center; font-weight: 800; line-height: 1;
-      font-size: clamp(52px, 18vw, 96px); font-variant-numeric: tabular-nums;
+      font-size: clamp(44px, 14vw, 80px); font-variant-numeric: tabular-nums;
       padding: 2px 0;
     }
     #qty.multi { color: #ffd43b; }   /* 2個以上は強調 (取忘れ/取りすぎ防止) */
@@ -79,9 +79,17 @@
     #psku { text-align: center; font-size: 13px; color: #5c636a; padding-bottom: 4px; }
 
     #nextBtn {
-      flex: 0 0 30%; margin: 4px 10px 10px; border: none; border-radius: 16px;
+      flex: 0 0 26%; margin: 4px 10px 10px; border: none; border-radius: 16px;
       background: #1971c2; color: #fff; font-size: 30px; font-weight: 700;
       display: flex; align-items: center; justify-content: center; cursor: pointer;
+    }
+    /* 背の低い端末 (iPhone SE等) は更に詰めて商品名2行を死守する */
+    @media (orientation: portrait) and (max-height: 720px) {
+      #loc { font-size: 44px; }
+      #imgbox { height: 20vh; }
+      #qty { font-size: clamp(38px, 11vw, 60px); }
+      #pname { font-size: 17px; }
+      #nextBtn { flex-basis: 24%; font-size: 26px; }
     }
     #nextBtn:active { background: #1864ab; }
     .subrow { display: flex; gap: 10px; padding: 0 10px 4px; flex: 0 0 auto; }
@@ -280,7 +288,8 @@
 
     // 1行に収まるまでフォントを縮める (ロケーションの折り返し禁止。桁の見間違い防止)
     function fitText(el) {
-      const max = matchMedia('(orientation: landscape)').matches ? 44 : 54;
+      const landscape = matchMedia('(orientation: landscape)').matches;
+      const max = landscape ? 44 : (window.innerHeight <= 720 ? 44 : 54);   // CSSの段階縮小と揃える
       let size = max;
       el.style.fontSize = size + 'px';
       // scrollWidth が収まるまで2pxずつ縮小 (下限22px)
