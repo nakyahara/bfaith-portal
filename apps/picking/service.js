@@ -353,7 +353,7 @@ export function getWorkState(batchId) {
   };
 }
 
-function eventResult(batchId) {
+function eventResult(batchId, transition = null) {
   const s = getWorkState(batchId);
   return {
     batchStatus: s.batch.status,
@@ -362,6 +362,9 @@ function eventResult(batchId) {
     lineCount: s.lines.length,
     startedAt: s.batch.started_at,
     finishedAt: s.batch.finished_at,
+    // バッチ状態の遷移が起きたときだけ入る: started / completed / reopened。
+    // router がこれを見て Notion カードを動かす (replayed のときは動かさない)
+    transition,
   };
 }
 
@@ -397,6 +400,7 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }
       throw new PkError(409, 'batch_invalid', 'このバッチは取消されています');
     }
 
+    let transition = null;   // started / completed / reopened (Notion連携のトリガ)
     if (event === 'start') {
       if (batch.status === 'picking') {
         if (batch.worker !== worker) {
@@ -412,6 +416,7 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }
           WHERE id=? AND status='ready'
         `).run(worker, now, now, batchId);
         if (res.changes === 0) throw new PkError(409, 'not_startable', `状態 ${batch.status} からは開始できません`);
+        transition = 'started';
       }
       // 先頭の未完了明細に表示時刻を刻む (初回のみ)
       db.prepare(`
@@ -458,6 +463,7 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }
           // 最終明細の完了 = バッチ完了
           db.prepare("UPDATE pk_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
             .run(now, now, batchId);
+          transition = 'completed';
         }
       } else if (event === 'back') {
         // 直前に完了した明細を取り消して戻る
@@ -488,11 +494,12 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }
           // 完了直後の取り消し: バッチを作業中に戻す
           db.prepare("UPDATE pk_batches SET status='picking', finished_at=NULL, updated_at=? WHERE id=?")
             .run(now, batchId);
+          transition = 'reopened';
         }
       }
     }
 
-    const result = eventResult(batchId);
+    const result = eventResult(batchId, transition);
     db.prepare(`
       INSERT INTO pk_events (op_id, batch_id, worker, event, line_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)

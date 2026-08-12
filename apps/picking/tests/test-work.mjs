@@ -71,6 +71,7 @@ t('start: ready→picking・worker/started_at・先頭明細のshown_at', () => 
   const r = applyEvent(id, { opId: op(), event: 'start' }, W1);
   assert.equal(r.batchStatus, 'picking');
   assert.equal(r.currentSeq, 1);
+  assert.equal(r.transition, 'started');
   const s = getWorkState(id);
   assert.equal(s.batch.worker, W1);
   assert.ok(s.batch.started_at);
@@ -107,6 +108,7 @@ t('next: 順に完了し、最終明細でバッチ完了', () => {
   assert.equal(r.batchStatus, 'done');
   assert.equal(r.currentSeq, null);
   assert.ok(r.finishedAt);
+  assert.equal(r.transition, 'completed');
   const s = getWorkState(id);
   assert.ok(s.lines.every((l) => l.status === 'done' && l.done_at));
   assert.ok(s.lines[1].shown_at, '明細2は表示時刻が刻まれている');
@@ -150,6 +152,7 @@ t('back: 完了直後 (batch=done) の取り消しでバッチがpickingに戻�
   const r = applyEvent(id, { opId: op(), event: 'back', lineSeq: 3, undoOpId: lastOp }, W1);
   assert.equal(r.batchStatus, 'picking');
   assert.equal(r.currentSeq, 3);
+  assert.equal(r.transition, 'reopened');
   const s = getWorkState(id);
   assert.equal(s.batch.finished_at, null);
   // 再完了できる
