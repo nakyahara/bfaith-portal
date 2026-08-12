@@ -325,6 +325,23 @@ t('pause/resume: 中断時間が paused_total_sec に積まれ、状態が往復
   expectPkError(() => applyEvent(id, { opId: op(), event: 'resume' }, W1), 'not_paused');
 });
 
+t('pause/resume: オフライン再送でも client_at から中断時間を復元 (クランプ付き)', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  // 10分前に中断→今再開 (オフラインで積まれたキューが連続送信されたケース)
+  const tenMinAgo = new Date(Date.now() - 600_000).toISOString();
+  applyEvent(id, { opId: op(), event: 'pause', pauseReason: '休憩', clientAt: tenMinAgo }, W1);
+  applyEvent(id, { opId: op(), event: 'resume', clientAt: new Date().toISOString() }, W1);
+  const sec = getWorkState(id).batch.paused_total_sec;
+  assert.ok(sec >= 590 && sec <= 610, `中断時間が約600秒のはず: ${sec}`);
+  // 未来のclient_atは now に丸められる (細工防止)
+  const future = new Date(Date.now() + 3600_000).toISOString();
+  applyEvent(id, { opId: op(), event: 'pause', pauseReason: '休憩', clientAt: future }, W1);
+  applyEvent(id, { opId: op(), event: 'resume' }, W1);
+  const sec2 = getWorkState(id).batch.paused_total_sec;
+  assert.ok(sec2 - sec < 5, `未来時刻は採用されない: ${sec2 - sec}`);
+});
+
 t('pause中の takeover → 交代した人が resume できる', () => {
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);

@@ -273,6 +273,7 @@
     for (const op of queue) {
       if (op.event === 'pause') BATCH.status = 'paused';
       if (op.event === 'resume') BATCH.status = 'picking';
+      if (op.event === 'cancel') BATCH.cancelling = true;   // リロード後も flush が処理して一覧へ戻す
       const line = LINES.find((l) => l.seq === op.line_seq);
       if (!line) continue;
       if (op.event === 'next') { line.status = 'done'; NEXTOPS[op.line_seq] = op.op_id; }
@@ -462,24 +463,16 @@
       enqueue('resume', null, null);
       render();
     });
-    $('cancelBtn').addEventListener('click', async () => {
+    $('cancelBtn').addEventListener('click', () => {
       if (!confirm('このバッチのピッキングを取り消して最初に戻します。よろしいですか?\n(進捗と時間の記録は破棄されます)')) return;
-      try {
-        const res = await fetch(`/apps/picking/api/batches/${BATCH.id}/events`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ op_id: opId(), event: 'cancel', worker_code: workerCode() }),
-        });
-        if (!res.ok) {
-          const b = await res.json().catch(() => ({}));
-          alert(b.error || '取消に失敗しました');
-          return;
-        }
-        localStorage.removeItem(QKEY);
-        location.href = '/apps/picking/';
-      } catch {
-        alert('通信エラーです。電波のある場所でもう一度お試しください');
-      }
+      // 直接fetchせずキューに積む (先行する操作の順序を守る。オフラインでも復帰後に処理される
+      // — Codex PR4 high)。送信完了は flush() が検知して一覧へ戻す
+      $('syncerr').textContent = '取消を送信しています… (完了すると一覧に戻ります)';
+      $('syncerr').style.background = '#495057';
+      $('syncerr').style.display = 'block';
+      $('resumeBtn').disabled = true;
+      $('cancelBtn').disabled = true;
+      enqueue('cancel', null, null);
     });
 
     // ── キュー送信 (直列・冪等再送) ──
@@ -509,6 +502,12 @@
             if (body.startedAt) BATCH.startedAt = body.startedAt;
             queue.shift();
             localStorage.setItem(QKEY, JSON.stringify(queue));
+            if (op.event === 'cancel') {
+              // 取消がサーバーに届いたら一覧へ (それ以前の操作は上で順に確定済み)
+              localStorage.removeItem(QKEY);
+              location.href = '/apps/picking/';
+              return;
+            }
             if (BATCH.status === 'done' && queue.length === 0) render();
             continue;
           }

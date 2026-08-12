@@ -255,7 +255,9 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     shortageQty: req.body.shortage_qty == null ? null : Number(req.body.shortage_qty),
     pauseReason: req.body.pause_reason || null,
   }, worker.id);
-  // 欠品は管理者チャットへ即時通知 (fail-soft・要件§5.6)。replayed の再送では通知しない
+  // 欠品は管理者チャットへ即時通知 (fail-soft・要件§5.6)。replayed の再送では通知しない。
+  // outbox は持たない設計判断: 重複は「backして再度欠品にした」正当な操作のみ・
+  // 欠落は webhook 障害時のみ (warnログ)。正確な欠品一覧はサマリ画面が正
   if (req.body.event === 'shortage' && !result.replayed) {
     const batch = getBatch(batchId);
     const line = listLines(batchId).find((l) => l.seq === Number(req.body.line_seq));

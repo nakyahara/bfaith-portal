@@ -368,6 +368,18 @@ export function getWorkState(batchId) {
   };
 }
 
+/**
+ * 端末の発生時刻を「now以前・24時間以内」にクランプして採用する (中断時間の計測用)。
+ * 通常イベントの計測はサーバー時刻が正のままで、pause/resume だけこの値を使う。
+ */
+function clampedEventTime(clientAt, now) {
+  const t = Date.parse(clientAt || '');
+  const nowMs = Date.parse(now);
+  if (!Number.isFinite(t)) return now;
+  if (t > nowMs || t < nowMs - 24 * 3600 * 1000) return now;
+  return new Date(t).toISOString().slice(0, 19) + 'Z';
+}
+
 function eventResult(batchId, transition = null) {
   const s = getWorkState(batchId);
   return {
@@ -434,14 +446,19 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
       }
       if (batch.worker !== worker) throw new PkError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
       const reason = PAUSE_REASONS.includes(pauseReason) ? pauseReason : 'その他';
+      // pause/resume の時刻だけは端末の発生時刻 (clientAt) を採用する (クランプ付き)。
+      // オフラインで pause→resume を積むと、再接続時に連続でサーバーへ届くため、
+      // 受信時刻基準では実際30分の中断が数秒になってしまう (Codex PR4 high)。
+      // 未来・24時間より過去は now に丸め、細工や壊れた端末時計の影響を限定する
       db.prepare(`UPDATE pk_batches SET status='paused', pause_started_at=?, pause_reason=?, updated_at=? WHERE id=?`)
-        .run(now, reason, now, batchId);
+        .run(clampedEventTime(clientAt, now), reason, now, batchId);
     } else if (event === 'resume') {
       if (batch.status !== 'paused') {
         throw new PkError(409, 'not_paused', `中断中ではありません (${batch.status})`);
       }
       if (batch.worker !== worker) throw new PkError(409, 'taken', `このバッチは ${batch.worker} が中断中です (交代してから再開してください)`);
-      const pausedSec = Math.max(0, Math.round((Date.parse(now) - Date.parse(batch.pause_started_at || now)) / 1000));
+      const resumeAt = clampedEventTime(clientAt, now);
+      const pausedSec = Math.max(0, Math.round((Date.parse(resumeAt) - Date.parse(batch.pause_started_at || resumeAt)) / 1000));
       db.prepare(`
         UPDATE pk_batches SET status='picking', paused_total_sec = paused_total_sec + ?,
           pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
@@ -622,8 +639,14 @@ export function getDailySummary(workDate) {
     })).sort((a, b) => b.lines - a.lines);
   };
 
+  // 欠品の担当者はバッチの最終担当者ではなく「欠品操作をした時点の作業者」(pk_events) を使う
+  // (途中で takeover があると帰属がずれる — Codex PR4 medium)。
+  // なお作業者別の時間集計はバッチの最終担当者に全量計上する簡略化 (交代は稀・Notion運用と同等)
   const shortages = db.prepare(`
-    SELECT l.*, b.folder_name, b.hikiate_class, b.worker
+    SELECT l.*, b.folder_name, b.hikiate_class,
+      (SELECT e.worker FROM pk_events e
+        WHERE e.batch_id = l.batch_id AND e.line_seq = l.seq AND e.event = 'shortage'
+        ORDER BY e.id DESC LIMIT 1) AS worker
     FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
     WHERE b.work_date = ? AND b.validity = 'valid' AND l.status = 'shortage'
     ORDER BY b.id, l.seq
