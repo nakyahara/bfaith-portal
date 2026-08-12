@@ -37,10 +37,16 @@
     .screen.active { display: flex; }
 
     /* ── ピック画面 ── */
+    /* ロケーションは絶対に1行 (折り返すと桁の見間違いが起きる)。JSが幅に合わせて縮小する */
     #loc {
-      text-align: center; font-weight: 800; letter-spacing: 0.02em;
-      font-size: clamp(34px, 11vw, 58px); line-height: 1.1;
+      text-align: center; font-weight: 800; letter-spacing: 0.01em;
+      font-size: 54px; line-height: 1.15; white-space: nowrap; overflow: hidden;
       font-variant-numeric: tabular-nums; padding: 2px 8px 0;
+    }
+    /* 次のロケーションの予告 (歩き出す方向を先に決められる) */
+    #nextloc {
+      text-align: center; font-size: 15px; color: #74c0fc; padding: 0 8px;
+      font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
     }
     #imgbox {
       flex: 1 1 auto; min-height: 0; margin: 6px 14px;
@@ -49,28 +55,54 @@
     }
     #imgbox .noimg { color: #495057; font-size: 15px; }
     #imgbox img { max-width: 100%; max-height: 100%; object-fit: contain; }
+    #details { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; }
     #qty {
       text-align: center; font-weight: 800; line-height: 1;
-      font-size: clamp(56px, 20vw, 100px); font-variant-numeric: tabular-nums;
+      font-size: clamp(52px, 18vw, 96px); font-variant-numeric: tabular-nums;
       padding: 2px 0;
     }
     #qty.multi { color: #ffd43b; }   /* 2個以上は強調 (取忘れ/取りすぎ防止) */
     #qty .x { font-size: 0.45em; font-weight: 600; color: #868e96; margin-right: 6px; }
-    #pname { text-align: center; font-size: 17px; padding: 0 16px 4px; color: #dee2e6;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #pname .suffix { color: #5c636a; font-size: 0.85em; }
-    #psku { text-align: center; font-size: 13px; color: #5c636a; padding-bottom: 6px; }
+    /* 商品名は2行まで見せる (1行ellipsisだと肝心の商品名が読めない) */
+    #pname {
+      text-align: center; font-size: 19px; line-height: 1.35; padding: 0 14px; color: #f1f3f5;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    #pname .suffix { color: #5c636a; font-size: 0.8em; }
+    #psku { text-align: center; font-size: 13px; color: #5c636a; padding-bottom: 4px; }
 
     #nextBtn {
-      flex: 0 0 34%; margin: 0 10px 10px; border: none; border-radius: 16px;
+      flex: 0 0 30%; margin: 4px 10px 10px; border: none; border-radius: 16px;
       background: #1971c2; color: #fff; font-size: 30px; font-weight: 700;
       display: flex; align-items: center; justify-content: center; cursor: pointer;
     }
     #nextBtn:active { background: #1864ab; }
-    .subrow { display: flex; gap: 10px; padding: 0 10px 6px; flex: 0 0 auto; }
+    .subrow { display: flex; gap: 10px; padding: 0 10px 4px; flex: 0 0 auto; }
     .subrow button {
       flex: 1; padding: 10px 0; font-size: 16px; border-radius: 10px; border: 1px solid #343a40;
       background: #1c2127; color: #adb5bd; cursor: pointer;
+    }
+
+    /* ── 横向き (前腕ホルダーは横装着が実運用: 2026-08-12 実機確認) ──
+       左=数量・商品名・次ロケ / 中=画像 / 右=縦いっぱいの「次へ」 */
+    @media (orientation: landscape) {
+      #scr-pick.active {
+        display: grid; gap: 4px 10px; padding: 0 10px 8px;
+        grid-template-columns: 1.15fr 1fr minmax(96px, 16vw);
+        grid-template-rows: auto auto 1fr auto;
+        grid-template-areas:
+          "loc     loc  next"
+          "nextloc nextloc next"
+          "det     img  next"
+          "sub     img  next";
+      }
+      #loc { grid-area: loc; font-size: 44px; }
+      #nextloc { grid-area: nextloc; }
+      #details { grid-area: det; justify-content: center; min-height: 0; }
+      #qty { font-size: clamp(48px, 16vh, 88px); }
+      #imgbox { grid-area: img; margin: 0; }
+      #nextBtn { grid-area: next; margin: 0 0 4px; font-size: 26px; }
+      .subrow { grid-area: sub; padding: 0; align-items: end; }
     }
 
     /* ── 開始/完了/ブロック画面 ── */
@@ -110,10 +142,13 @@
   <!-- ピック画面 -->
   <div class="screen" id="scr-pick">
     <div id="loc"></div>
+    <div id="nextloc"></div>
     <div id="imgbox"><span class="noimg">画像なし</span></div>
-    <div id="qty"></div>
-    <div id="pname"></div>
-    <div id="psku"></div>
+    <div id="details">
+      <div id="qty"></div>
+      <div id="pname"></div>
+      <div id="psku"></div>
+    </div>
     <div class="subrow"><button id="backBtn">← 前へ戻る</button></div>
     <button id="nextBtn">次へ ▶</button>
   </div>
@@ -222,6 +257,9 @@
       if (!started) { show('scr-start'); return; }
       const l = LINES[idx];
       $('loc').textContent = l.loc;
+      fitText($('loc'));
+      const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
+      $('nextloc').textContent = next ? `次 → ${next.loc}` : 'これが最後の商品';
       renderImage(l);
       $('qty').innerHTML = `<span class="x">×</span>${l.qty}`;
       $('qty').className = l.qty >= 2 ? 'multi' : '';
@@ -230,7 +268,24 @@
       $('psku').textContent = l.sku;
       $('backBtn').style.visibility = LINES.some((x) => x.status === 'done') ? 'visible' : 'hidden';
       show('scr-pick');
+      fitText($('loc'));   // 表示後 (幅確定後) にもう一度フィットさせる
     }
+
+    // 1行に収まるまでフォントを縮める (ロケーションの折り返し禁止。桁の見間違い防止)
+    function fitText(el) {
+      const max = matchMedia('(orientation: landscape)').matches ? 44 : 54;
+      let size = max;
+      el.style.fontSize = size + 'px';
+      // scrollWidth が収まるまで2pxずつ縮小 (下限22px)
+      while (size > 22 && el.scrollWidth > el.clientWidth) {
+        size -= 2;
+        el.style.fontSize = size + 'px';
+      }
+    }
+    window.addEventListener('resize', () => {
+      const idx = currentIdx();
+      if (idx !== -1 && started) { $('loc').textContent = LINES[idx].loc; fitText($('loc')); }
+    });
 
     function renderDone() {
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;

@@ -297,7 +297,7 @@ router.get('/manifest.json', (req, res) => {
     short_name: 'ピッキング',
     start_url: '/apps/picking/',
     display: 'standalone',
-    orientation: 'portrait',
+    orientation: 'any',   // 前腕ホルダーは横装着が実運用 (2026-08-12 実機確認)
     background_color: '#111418',
     theme_color: '#111418',
     icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
