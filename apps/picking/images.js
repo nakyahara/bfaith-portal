@@ -1,0 +1,199 @@
+/**
+ * 楽天白抜き商品画像の解決とキャッシュ (ピッキング画面用)。
+ *
+ * 方針 (実装計画§4・中原さん決定 2026-08-11): 商品画像は楽天RMSの白抜き画像
+ * (whiteBgImage・検索サムネ用の別枠) を第一候補、無ければ1枚目 (images[0]) を使う。
+ *
+ * 解決チェーン (すべて既存部品の流用):
+ *   ne_code (CSVの商品ID)
+ *     → mirror_rakuten_sku_map で楽天SKUコード (無ければ ne_code をそのまま候補に)
+ *     → ハイフン末尾を削りながら mirror_rakuten_item_daily に実在する商品管理番号を探す
+ *       (apps/site-products/router.js resolveRakutenItemNumber と同方式)
+ *     → miniPC /service-api/rakuten-rms/items/details-bulk (rakuten-rms-proxy 経由)
+ *     → whiteBgImage.location → 完全URL化 → pk_product_images にキャッシュ
+ *
+ * 実行タイミング: CSV取込直後に「キャッシュに無いSKUだけ」fire-and-forget で解決
+ * (1バッチ数十SKU = bulk 1〜2回。定期ジョブは作らない)。失敗は not_found / error として
+ * キャッシュし、翌日以降の取込で再試行する。画面は URL が無ければプレースホルダ表示。
+ */
+import { getDB, utcNow, jstToday } from './db.js';
+import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { fetchItemDetailsBulkDetailed } from '../rakuten-yahoo-sync/lib/rakuten-rms-proxy.js';
+
+const norm = (s) => String(s ?? '').trim().toLowerCase();
+
+/**
+ * RMS の画像 location を完全URLへ (rakuten-yahoo-sync/lib/image-uploader.js の
+ * normalizeRakutenImageUrl と同ロジック。あちらは sharp 等の重い依存を引き込むため転記)。
+ */
+// <img src> に直挿しするURLは楽天の画像ドメインに限定する
+// (RMS応答が万一汚染されても、閲覧端末を任意ホストへ送信させない — Codex PR3.5 low)
+function isAllowedImageHost(url) {
+  try {
+    const host = new URL(url).hostname;
+    return host === 'rakuten.co.jp' || host.endsWith('.rakuten.co.jp')
+      || host === 'r10s.jp' || host.endsWith('.r10s.jp');
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeImageUrl(loc) {
+  if (typeof loc !== 'string') return null;
+  const s = loc.trim();
+  if (!s) return null;
+  let url = null;
+  if (/^https?:\/\//i.test(s)) url = s;
+  else if (/^\/\//.test(s)) url = 'https:' + s;
+  else if (s.startsWith('/')) {
+    const slug = (process.env.RAKUTEN_SHOP_SLUG || 'b-faith').trim();
+    url = `https://image.rakuten.co.jp/${slug}/cabinet${s}`;
+  }
+  return url && isAllowedImageHost(url) ? url : null;
+}
+
+/**
+ * SKUコード → 実在する楽天商品管理番号。ハイフン末尾を最大3段削りながら探す
+ * (SKU粒度のコードでは商品ページ・商品APIが404になるため。site-products で実測済み)。
+ * @param itemNumbers Map<norm(manage_number), manage_number>
+ */
+export function resolveManageNumber(itemNumbers, rakutenCode) {
+  if (!itemNumbers || !rakutenCode) return null;
+  const parts = String(rakutenCode).split('-');
+  const maxStrip = Math.min(3, parts.length - 1);
+  for (let i = 0; i <= maxStrip; i++) {
+    const candidate = parts.slice(0, parts.length - i).join('-');
+    if (!candidate) break;
+    const hit = itemNumbers.get(norm(candidate));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** RMS item payload から白抜き/1枚目のURLを取り出す。 */
+export function extractImageUrls(item) {
+  const white = normalizeImageUrl(item?.whiteBgImage?.location);
+  const top = normalizeImageUrl(Array.isArray(item?.images) ? item.images[0]?.location : null);
+  return { whiteBgUrl: white, topUrl: top };
+}
+
+/** mirror から解決用の索引を読む (デフォルト実装。テストでは差し替える)。 */
+function loadMirrorMaps() {
+  const mdb = getMirrorDB();
+  const rakutenByNe = new Map();
+  for (const r of mdb.prepare(
+    'SELECT ne_code, rakuten_code FROM mirror_rakuten_sku_map ORDER BY updated_at ASC'
+  ).all()) {
+    if (r.ne_code) rakutenByNe.set(norm(r.ne_code), r.rakuten_code);
+  }
+  const itemNumbers = new Map();
+  for (const r of mdb.prepare(
+    "SELECT DISTINCT item_manage_number FROM mirror_rakuten_item_daily WHERE item_manage_number IS NOT NULL AND trim(item_manage_number) <> ''"
+  ).all()) {
+    itemNumbers.set(norm(r.item_manage_number), r.item_manage_number);
+  }
+  return { rakutenByNe, itemNumbers };
+}
+
+/** キャッシュ済みSKUの画像URLマップ: norm(ne_code) → {url, status}。表示用。 */
+export function getImageMap(skus) {
+  const keys = [...new Set(skus.map(norm).filter(Boolean))];
+  if (keys.length === 0) return new Map();
+  const db = getDB();
+  const rows = db.prepare(
+    `SELECT ne_code, white_bg_url, top_image_url, status FROM pk_product_images
+     WHERE ne_code IN (${keys.map(() => '?').join(',')})`
+  ).all(...keys);
+  const map = new Map();
+  for (const r of rows) {
+    map.set(r.ne_code, { url: r.white_bg_url || r.top_image_url || null, status: r.status });
+  }
+  return map;
+}
+
+/**
+ * 指定SKU群のうち未解決のものを解決してキャッシュする。
+ * @returns {{requested, fetched, ok, notFound, errors}}
+ */
+export async function ensureImagesFor(skus, deps = {}) {
+  const db = getDB();
+  const now = utcNow();
+  const all = [...new Set(skus.map(norm).filter(Boolean))];
+  // ok は7日間キャッシュ (楽天側の画像差し替えに追従できるようTTLを置く)。
+  // not_found / error はJST当日中は再試行しない (翌日の取込・表示で取り直す)
+  const need = all.filter((sku) => {
+    const row = db.prepare('SELECT status, fetched_at FROM pk_product_images WHERE ne_code = ?').get(sku);
+    if (!row) return true;
+    const fetchedMs = Date.parse(row.fetched_at);
+    if (row.status === 'ok') {
+      return !Number.isFinite(fetchedMs) || (Date.now() - fetchedMs) > 7 * 24 * 3600 * 1000;
+    }
+    return !Number.isFinite(fetchedMs) || jstToday(new Date(fetchedMs)) !== jstToday();
+  });
+  const stats = { requested: all.length, fetched: need.length, ok: 0, notFound: 0, errors: 0 };
+  if (need.length === 0) return stats;
+
+  const { rakutenByNe, itemNumbers } = (deps.loadMaps || loadMirrorMaps)();
+  const mnBySku = new Map();
+  for (const sku of need) {
+    // 変換テーブルの楽天SKUコードを優先、無ければ ne_code 自体を候補にする
+    // (product-hub 出品分は manageNumber = ne_code 小文字)
+    const rakutenCode = rakutenByNe.get(sku) || sku;
+    mnBySku.set(sku, resolveManageNumber(itemNumbers, rakutenCode));
+  }
+
+  const manageNumbers = [...new Set([...mnBySku.values()].filter(Boolean))];
+  let items = [];
+  let failed = [];
+  if (manageNumbers.length > 0) {
+    ({ items, failed } = await (deps.fetchDetails || fetchItemDetailsBulkDetailed)(manageNumbers));
+  }
+  const itemByMn = new Map();
+  for (const it of items) {
+    const mn = it?.manageNumber || it?.itemNumber;
+    if (mn) itemByMn.set(norm(mn), it);
+  }
+  if (failed.length > 0) {
+    console.warn(`[picking-images] RMS個別失敗 ${failed.length}件 (翌日再試行): ${failed.slice(0, 3).map((f) => f.manageNumber).join(', ')}…`);
+  }
+
+  const upsert = db.prepare(`
+    INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, status, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(ne_code) DO UPDATE SET manage_number = excluded.manage_number,
+      white_bg_url = excluded.white_bg_url, top_image_url = excluded.top_image_url,
+      status = excluded.status, fetched_at = excluded.fetched_at
+  `);
+  for (const sku of need) {
+    const mn = mnBySku.get(sku);
+    if (!mn) { upsert.run(sku, null, null, null, 'not_found', now); stats.notFound++; continue; }
+    const item = itemByMn.get(norm(mn));
+    if (!item) {
+      // items にも failed にも無い欠落応答は「不存在」と断定できないため error 扱い
+      // (翌日再試行。not_found で恒久抑止すると部分応答・プロキシ不具合で永久に画像なしになる)
+      upsert.run(sku, mn, null, null, 'error', now);
+      stats.errors++;
+      continue;
+    }
+    const { whiteBgUrl, topUrl } = extractImageUrls(item);
+    if (!whiteBgUrl && !topUrl) { upsert.run(sku, mn, null, null, 'not_found', now); stats.notFound++; continue; }
+    upsert.run(sku, mn, whiteBgUrl, topUrl, 'ok', now);
+    stats.ok++;
+  }
+  return stats;
+}
+
+// 取込直後の fire-and-forget 用の直列キュー (連続取込で miniPC RMS を並列に叩かない。
+// rakuten-client は miniPC 側で直列化されるが、こちらでも並べておくとタイムアウトしにくい)
+let _chain = Promise.resolve();
+export function queueEnsureImages(skus, label = '') {
+  _chain = _chain
+    .then(() => ensureImagesFor(skus))
+    .then((stats) => {
+      if (stats.fetched > 0) {
+        console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: 白抜き/1枚目=${stats.ok} なし=${stats.notFound} 失敗=${stats.errors}`);
+      }
+    })
+    .catch((e) => console.warn(`[picking-images] ${label} 画像解決失敗 (作業は継続可能): ${e.message}`));
+  return _chain;
+}

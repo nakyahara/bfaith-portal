@@ -49,12 +49,13 @@
 
     <table class="pk-lines">
       <thead>
-        <tr><th>#</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>数量</th><th>状態</th></tr>
+        <tr><th>#</th><th>画像</th><th>ロケーション</th><th>商品ID</th><th>商品名</th><th>数量</th><th>状態</th></tr>
       </thead>
       <tbody>
         <% for (const l of lines) { %>
           <tr class="<%= l.status %>">
             <td class="num"><%= l.seq %></td>
+            <td><% if (l.imageUrl) { %><img src="<%= l.imageUrl %>" alt="" style="height:42px; max-width:60px; object-fit:contain" loading="lazy"><% } else { %><span style="color:#adb5bd">なし</span><% } %></td>
             <td class="loc"><%= l.locationLabel %></td>
             <td><%= l.sku %></td>
             <td><%= l.product_name || '' %></td>

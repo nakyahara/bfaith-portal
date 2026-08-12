@@ -144,7 +144,7 @@
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
-      qty: l.qty, status: l.status, img: null,
+      qty: l.qty, status: l.status, img: l.imageUrl,
     }))).replace(/</g, '\\u003c') %>;
     const ME = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
     // 明細ごとの「最後に完了させた next の op_id」(backの取り消し対象指定に使う)
@@ -172,6 +172,21 @@
       $(id).classList.add('active');
     }
 
+    // 楽天白抜き画像 (公開URL)。読み込み失敗時はプレースホルダに戻す。
+    // 次の明細を先読みしておく (棚間の移動中にロードを済ませる)
+    function renderImage(l) {
+      const box = $('imgbox');
+      if (!l.img) { box.innerHTML = '<span class="noimg">画像なし</span>'; return; }
+      const img = new Image();
+      img.onload = () => { box.innerHTML = ''; box.appendChild(img); };
+      img.onerror = () => { box.innerHTML = '<span class="noimg">画像なし</span>'; };
+      img.src = l.img;
+      if (!img.complete) box.innerHTML = '<span class="noimg">…</span>';
+      const idx = LINES.indexOf(l);
+      const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
+      if (next && next.img) { const pre = new Image(); pre.src = next.img; }
+    }
+
     function splitName(name) {
       // 商品名末尾の資材/ライン識別サフィックス (_梱機プ 等) は視認ノイズなので淡色で分離
       const m = name.match(/^(.*)(_[^_]{1,8})$/);
@@ -189,6 +204,7 @@
       if (!started) { show('scr-start'); return; }
       const l = LINES[idx];
       $('loc').textContent = l.loc;
+      renderImage(l);
       $('qty').innerHTML = `<span class="x">×</span>${l.qty}`;
       $('qty').className = l.qty >= 2 ? 'multi' : '';
       const n = splitName(l.name);
@@ -297,6 +313,31 @@
         flushing = false;
       }
     }
+
+    // ── 画像の後追い反映 (取込直後は解決がバックグラウンド進行中のことがある) ──
+    // 画像なしの明細が残っている間だけ5秒間隔で最大12回ポーリングし、届き次第反映する
+    let imgPolls = 0;
+    async function pollImages() {
+      if (!LINES.some((l) => !l.img) || imgPolls >= 12) return;
+      imgPolls++;
+      try {
+        const res = await fetch(`/apps/picking/api/batches/${BATCH.id}/images`);
+        if (res.ok) {
+          const body = await res.json();
+          let updated = false;
+          for (const l of LINES) {
+            if (!l.img && body.images && body.images[l.seq]) { l.img = body.images[l.seq]; updated = true; }
+          }
+          if (updated) {
+            const idx = currentIdx();
+            if (idx !== -1 && started) renderImage(LINES[idx]);
+          }
+          if (!LINES.some((l) => !l.img)) return;   // 全部揃ったら終了
+        }
+      } catch { /* オフライン中は次回に任せる */ }
+      setTimeout(pollImages, 5000);
+    }
+    pollImages();
 
     // ── Wake Lock (iOS 16.4+)。タブ復帰時に再取得 ──
     let wakeLock = null;

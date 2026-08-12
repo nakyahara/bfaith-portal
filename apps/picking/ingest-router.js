@@ -14,6 +14,7 @@ import { Router } from 'express';
 import crypto from 'node:crypto';
 import multer from 'multer';
 import { parseCs03002, importBatch, PkError, isStaleInstructDate } from './service.js';
+import { queueEnsureImages } from './images.js';
 
 const router = Router();
 
@@ -62,6 +63,8 @@ router.post('/import', (req, res, next) => {
       folderName: String(req.body.folder_name || '').trim() || null,
       overwrite: true,   // ready のバッチに限る (importBatch 内で enforce)。作業開始後は 409
     }, `ingest:${patternName.slice(0, 40)}`);
+    // 楽天白抜き画像の解決はバックグラウンドで (RPAの朝フローを待たせない)
+    queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
     res.json({
       ok: true,
       tbNo: preview.tbNo,
