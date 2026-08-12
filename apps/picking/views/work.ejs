@@ -51,8 +51,17 @@
     }
     /* 次のロケーションの予告 (歩き出す方向を先に決められる)。チラ見で読める太さ・大きさに */
     #nextloc {
-      text-align: center; font-size: 21px; font-weight: 700; color: #74c0fc; padding: 0 8px 2px;
+      text-align: center; font-size: 21px; font-weight: 700; color: #f1f3f5; padding: 2px 8px;
       font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
+    }
+    /* ロケ色分け (2026-08-12 中原さん採用):
+       背景色=棚 (今と次が同じ色=同じ棚=近い、色が違う=移動が来る、を読まずに判断できる)
+       左帯=ブロック (P3FA等は4つしかないので「この色=このブロック」を覚えられる。
+       棚色が変わって左帯まで変わったら別ブロックへの大移動の予告)
+       右帯は透明のダミー (左帯の分だけ中央がずれないよう左右対称にする) */
+    #loc, #nextloc {
+      margin: 0 10px; border-radius: 10px;
+      border-left: 10px solid transparent; border-right: 10px solid transparent;
     }
     /* 画像は縦持ちでは高さ約24%に抑える (商品名2行の確保が最優先 — 実機FB) */
     #imgbox {
@@ -137,7 +146,7 @@
   <div class="bar">
     <a href="/apps/picking/">← 一覧</a>
     <span id="progress"></span>
-    <span><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
+    <span><button id="voiceBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🔇</button><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
@@ -311,6 +320,83 @@
       return m ? { main: m[1], suffix: m[2] } : { main: name, suffix: '' };
     }
 
+    // ── ロケ色分け (2026-08-12 中原さん採用。ラベル形式 = ブロック-棚3桁-連3桁-段2桁) ──
+    // 背景色 = 棚番号 mod 8。連続する棚番号 (002→003) が必ず別色になるので、ルート上の
+    // 「棚が変わった」がほぼ確実に色変化として見える。8色では「色→棚」の暗記は成立しないが、
+    // 狙いは暗記ではなく「今と次が同じ色か」の比較判断 (色覚多様性を考慮し隣接indexは色相を離す)。
+    // 白太字 (大サイズ) が読めるようダーク寄りの色のみ。テキストが常に主役で色は補助。
+    const SHELF_BG = [
+      '#1864ab', // 青
+      '#9c5700', // 橙
+      '#6741d9', // 紫
+      '#6e6600', // オリーブ
+      '#0b7285', // ティール
+      '#a61e4d', // マゼンタ
+      '#2f7d32', // 緑
+      '#545b62', // グレー
+    ];
+    // 左帯 = ブロック。実在ブロックは4つ (2026-08-12 実データ) なので固定の明色で「覚える」が成立する。
+    // 未知のブロックが増えても文字列ハッシュで安定した色が付く (再デプロイ不要)
+    const KNOWN_BLOCKS = ['P3FA', 'P3FB', 'P3FD', 'P3FF'];
+    const BLOCK_COLORS = ['#ffa94d', '#4dabf7', '#69db7c', '#e599f7', '#ffd43b', '#ff8787'];
+    function blockColor(block) {
+      let i = KNOWN_BLOCKS.indexOf(block);
+      if (i === -1) {
+        let h = 5381;
+        for (const c of block) h = (h * 33 + c.charCodeAt(0)) >>> 0;
+        i = h % BLOCK_COLORS.length;
+      }
+      return BLOCK_COLORS[i % BLOCK_COLORS.length];
+    }
+    // 「次 → P3FB-002-016-04」のような接頭辞付きでも拾えるよう末尾アンカーのみ。
+    // 形式外のラベル (8桁でない生ロケ等) は null → 無着色・そのまま読み上げ (fail-soft)
+    function locParts(label) {
+      const m = /(?:^|[ →])(?:(\S+)-)?(\d{3})-(\d{3})-(\d{2})$/.exec(String(label || ''));
+      return m
+        ? { block: m[1] || null, shelf: parseInt(m[2], 10), ren: parseInt(m[3], 10), dan: parseInt(m[4], 10) }
+        : null;
+    }
+    function paintLoc(el, label) {
+      const p = locParts(label);
+      el.style.backgroundColor = p ? SHELF_BG[p.shelf % SHELF_BG.length] : '';
+      el.style.borderLeftColor = (p && p.block) ? blockColor(p.block) : 'transparent';
+    }
+
+    // ── 音声読み上げ (2026-08-12 中原さん要望): ロケと数量を耳で受け取り、画面を見ずに歩き出せる ──
+    // 読み上げ = 「(ブロックが変わった時だけ) ブロック名、」+「棚の連の段、N個」。
+    // 毎回フルコードを読むと冗長なので、色分けと同じ思想で「変わった時だけブロックを言う」。
+    // iOS制約: 初回speakはユーザー操作起点が必要 → トグル押下/最初のタップでアンロックする。
+    // ⚠ サイレントスイッチONのiPhoneは読み上げも消音される (倉庫端末は音量ON運用が前提)
+    let voiceOn = localStorage.getItem('pk_voice') === '1';
+    let lastSpokenSeq = null;
+    let lastSpokenBlock = null;
+    function speak(text) {
+      if (!('speechSynthesis' in window)) return;
+      try {
+        speechSynthesis.cancel();   // 前の読み上げが残っていたら打ち切って最新を優先
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'ja-JP';
+        u.rate = 1.1;
+        speechSynthesis.speak(u);
+      } catch { /* 読み上げは補助機能。失敗しても画面表示があるので無音のまま続行 */ }
+    }
+    function speakLine(l, force) {
+      if (!voiceOn || !l) return;
+      if (!force && l.seq === lastSpokenSeq) return;   // 同じ明細の再render (画像後追い等) では繰り返さない
+      const p = locParts(l.loc);
+      let text;
+      if (p) {
+        // ブロック名は1文字ずつ区切って「ピー サン エフ ビー」と読ませる
+        const blockPart = (p.block && p.block !== lastSpokenBlock) ? `${p.block.split('').join(' ')}、` : '';
+        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${l.qty}個`;
+      } else {
+        text = `${l.loc}、${l.qty}個`;   // 形式外ラベルはそのまま
+      }
+      speak(text);
+      lastSpokenSeq = l.seq;
+      if (p && p.block) lastSpokenBlock = p.block;
+    }
+
     function render() {
       const idx = currentIdx();
       const done = LINES.filter((l) => l.status !== 'pending').length;
@@ -327,9 +413,12 @@
       if (!started) { show('scr-start'); return; }
       const l = LINES[idx];
       $('loc').textContent = l.loc;
+      paintLoc($('loc'), l.loc);
+      speakLine(l);
       fitText($('loc'));
       const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
       $('nextloc').textContent = next ? `次 → ${next.loc}` : 'これが最後の商品';
+      paintLoc($('nextloc'), next ? next.loc : null);
       renderImage(l);
       $('qty').innerHTML = `<span class="x">×</span>${l.qty}`;
       $('qty').className = l.qty >= 2 ? 'multi' : '';
@@ -359,6 +448,8 @@
     });
 
     function renderDone() {
+      // 作業からの遷移時のみ完了を読み上げ (完了済みバッチを開いただけでは喋らない)
+      if (voiceOn && lastSpokenSeq != null) { speak('ピッキング完了'); lastSpokenSeq = null; }
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;
       const secs = startMs ? Math.max(0, Math.round((Date.now() - startMs) / 1000)) : null;
       const perLine = secs != null && LINES.length > 0 ? (secs / LINES.length).toFixed(1) : '-';
@@ -421,6 +512,32 @@
     }
     $('backBtn').addEventListener('click', doBack);
     $('undoDoneBtn').addEventListener('click', doBack);
+
+    // ── 読み上げトグル (端末ごとに localStorage 保存) ──
+    function renderVoiceBtn() {
+      $('voiceBtn').textContent = voiceOn ? '🔊' : '🔇';
+      $('voiceBtn').style.opacity = voiceOn ? '1' : '0.4';
+    }
+    renderVoiceBtn();
+    $('voiceBtn').addEventListener('click', () => {
+      voiceOn = !voiceOn;
+      localStorage.setItem('pk_voice', voiceOn ? '1' : '0');
+      renderVoiceBtn();
+      if (!voiceOn) { try { speechSynthesis.cancel(); } catch {} return; }
+      // ONにしたタップ自体が iOS のアンロックを兼ねる。作業中なら今の明細をすぐ読み上げて確認させる
+      lastSpokenSeq = null;
+      lastSpokenBlock = null;
+      const idx = currentIdx();
+      if (started && idx !== -1 && $('scr-pick').classList.contains('active')) speakLine(LINES[idx]);
+      else speak('読み上げオン');
+    });
+    // ロケ表示のタップで再読み上げ (聞き逃し対策。ブロック名も含めて読み直す)
+    $('loc').addEventListener('click', () => {
+      const idx = currentIdx();
+      if (voiceOn && started && idx !== -1) { lastSpokenBlock = null; speakLine(LINES[idx], true); }
+    });
+    // 読み上げONのまま再読込した端末は、最初のタップ (capture=ボタン処理より先) で無音アンロック
+    document.addEventListener('click', () => { if (voiceOn) speak(''); }, { once: true, capture: true });
 
     // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
     let shortTarget = null;
