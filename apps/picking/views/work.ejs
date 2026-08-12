@@ -164,8 +164,22 @@
       <div id="pname"></div>
       <div id="psku"></div>
     </div>
-    <div class="subrow"><button id="backBtn">← 前へ戻る</button></div>
+    <div class="subrow">
+      <button id="backBtn">← 前へ</button>
+      <button id="pauseBtn">⏸ 中断</button>
+      <button id="shortBtn" style="color:#ffa8a8; border-color:#5c2e2e;">⚠ 欠品</button>
+    </div>
     <button id="nextBtn">次へ ▶</button>
+  </div>
+
+  <!-- 中断中画面 -->
+  <div class="screen" id="scr-paused">
+    <div class="center">
+      <h2>⏸ 中断中</h2>
+      <div class="meta" id="pausedMeta"></div>
+      <button class="bigbtn" id="resumeBtn">▶ 再開する</button>
+      <button id="cancelBtn" style="background:none; border:1px solid #5c2e2e; color:#ffa8a8; border-radius:10px; padding:10px 18px; font-size:15px; cursor:pointer;">このバッチのピッキングを取消す (最初に戻す)</button>
+    </div>
   </div>
 
   <!-- 完了画面 -->
@@ -188,6 +202,34 @@
     </div>
   </div>
 
+  <!-- 欠品数量シート -->
+  <div id="shortSheet" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
+    <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%; text-align:center;">
+      <h3 style="margin:0 0 6px; font-size:1.05em;">⚠ 欠品の数量</h3>
+      <div id="shortInfo" style="color:#adb5bd; font-size:0.9em; margin-bottom:12px;"></div>
+      <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:16px;">
+        <button id="shortMinus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
+        <span id="shortQty" style="font-size:44px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
+        <button id="shortPlus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
+      </div>
+      <button id="shortConfirm" style="width:100%; padding:14px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.1em; font-weight:700; cursor:pointer;">欠品として記録して次へ</button>
+      <button id="shortCancel" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">キャンセル</button>
+    </div>
+  </div>
+
+  <!-- 中断理由シート -->
+  <div id="pauseSheet" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
+    <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%;">
+      <h3 style="margin:0 0 12px; font-size:1.05em; text-align:center;">中断の理由</h3>
+      <div style="display:grid; gap:10px;">
+        <% for (const r of pauseReasons) { %>
+          <button class="pause-opt" data-reason="<%= r %>" style="padding:16px 8px; font-size:1.05em; border:1px solid #343a40; border-radius:10px; background:#111418; color:#f1f3f5; cursor:pointer;"><%= r %></button>
+        <% } %>
+      </div>
+      <button id="pauseCancel" style="width:100%; margin-top:12px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">キャンセル</button>
+    </div>
+  </div>
+
   <!-- 作業者選択 (共用端末モード) -->
   <div id="workerPick" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
     <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%;">
@@ -206,6 +248,7 @@
       id: state.batch.id, status: state.batch.status, worker: state.batch.worker,
       startedAt: state.batch.started_at, lineCount: state.lines.length,
       totalQty: state.batch.total_qty, currentSeq: state.currentSeq,
+      pauseReason: state.batch.pause_reason || null,
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
@@ -228,10 +271,14 @@
     let queue = [];
     try { queue = JSON.parse(localStorage.getItem(QKEY) || '[]'); } catch {}
     for (const op of queue) {
+      if (op.event === 'pause') BATCH.status = 'paused';
+      if (op.event === 'resume') BATCH.status = 'picking';
+      if (op.event === 'cancel') BATCH.cancelling = true;   // リロード後も flush が処理して一覧へ戻す
       const line = LINES.find((l) => l.seq === op.line_seq);
       if (!line) continue;
       if (op.event === 'next') { line.status = 'done'; NEXTOPS[op.line_seq] = op.op_id; }
-      if (op.event === 'back') line.status = 'pending';
+      if (op.event === 'shortage') { line.status = 'shortage'; line.shortage_qty = op.shortage_qty; NEXTOPS[op.line_seq] = op.op_id; }
+      if (op.event === 'back') { line.status = 'pending'; line.shortage_qty = null; }
     }
     let started = BATCH.status === 'picking' || queue.some((op) => op.event === 'start');
 
@@ -268,6 +315,11 @@
       const idx = currentIdx();
       const done = LINES.filter((l) => l.status !== 'pending').length;
       $('progress').textContent = `${Math.min(done + 1, LINES.length)} / ${LINES.length}`;
+      if (BATCH.status === 'paused') {
+        $('pausedMeta').textContent = `理由: ${BATCH.pauseReason || '-'} (中断時間は計測から除外されます)`;
+        show('scr-paused');
+        return;
+      }
       if (BATCH.status === 'done' && queue.length === 0 || idx === -1) {
         renderDone();
         return;
@@ -310,9 +362,14 @@
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;
       const secs = startMs ? Math.max(0, Math.round((Date.now() - startMs) / 1000)) : null;
       const perLine = secs != null && LINES.length > 0 ? (secs / LINES.length).toFixed(1) : '-';
+      const shorts = LINES.filter((l) => l.status === 'shortage');
       $('doneStats').innerHTML =
         `明細 <b>${LINES.length}</b> 件 / 数量 <b>${BATCH.totalQty}</b><br>` +
-        (secs != null ? `所要 <b>${Math.floor(secs / 60)}</b> 分 ${secs % 60} 秒 (約${perLine}秒/明細)` : '');
+        (secs != null ? `所要 <b>${Math.floor(secs / 60)}</b> 分 ${secs % 60} 秒 (約${perLine}秒/明細)` : '') +
+        (shorts.length > 0
+          ? `<br><span style="color:#ffa8a8">⚠ 欠品 ${shorts.length} 件</span><br>` +
+            shorts.map((l) => `<span style="font-size:0.75em; color:#ffa8a8">${esc(l.loc)} ${esc(l.sku)} 欠品${l.shortage_qty}</span>`).join('<br>')
+          : '');
       show('scr-done');
     }
 
@@ -324,13 +381,14 @@
     // ── 操作 → ローカル即時反映 + キュー投入 (通信を待たない: 要件§6 <200ms) ──
     function opId() { return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`; }
 
-    function enqueue(event, lineSeq, undoOpId) {
+    function enqueue(event, lineSeq, undoOpId, extra) {
       const op = {
         op_id: opId(), event, line_seq: lineSeq ?? null,
         undo_op_id: undoOpId ?? null, client_at: new Date().toISOString(),
         worker_code: workerCode(),   // 共用端末モードの作業者 (セッション時は null で無視される)
+        ...(extra || {}),
       };
-      if (event === 'next') NEXTOPS[lineSeq] = op.op_id;
+      if (event === 'next' || event === 'shortage') NEXTOPS[lineSeq] = op.op_id;
       queue.push(op);
       localStorage.setItem(QKEY, JSON.stringify(queue));
       flush();
@@ -352,16 +410,70 @@
     });
 
     function doBack() {
-      const doneLines = LINES.filter((l) => l.status === 'done');
+      const doneLines = LINES.filter((l) => l.status === 'done' || l.status === 'shortage');
       if (doneLines.length === 0) return;
       const last = doneLines[doneLines.length - 1];
       last.status = 'pending';
+      last.shortage_qty = null;
       if (BATCH.status === 'done') BATCH.status = 'picking';   // 完了直後の取り消し (サーバーも同挙動)
       enqueue('back', last.seq, NEXTOPS[last.seq] || null);
       render();
     }
     $('backBtn').addEventListener('click', doBack);
     $('undoDoneBtn').addEventListener('click', doBack);
+
+    // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
+    let shortTarget = null;
+    let shortVal = 1;
+    $('shortBtn').addEventListener('click', () => {
+      const idx = currentIdx();
+      if (idx === -1) return;
+      shortTarget = LINES[idx];
+      shortVal = shortTarget.qty;
+      $('shortInfo').textContent = `${shortTarget.loc}｜${shortTarget.sku} (指示 ${shortTarget.qty}個)`;
+      $('shortQty').textContent = shortVal;
+      $('shortSheet').style.display = 'flex';
+    });
+    $('shortMinus').addEventListener('click', () => { if (shortVal > 1) $('shortQty').textContent = --shortVal; });
+    $('shortPlus').addEventListener('click', () => { if (shortTarget && shortVal < shortTarget.qty) $('shortQty').textContent = ++shortVal; });
+    $('shortCancel').addEventListener('click', () => { $('shortSheet').style.display = 'none'; });
+    $('shortConfirm').addEventListener('click', () => {
+      if (!shortTarget) return;
+      $('shortSheet').style.display = 'none';
+      shortTarget.status = 'shortage';
+      shortTarget.shortage_qty = shortVal;
+      enqueue('shortage', shortTarget.seq, null, { shortage_qty: shortVal });
+      if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
+      render();
+    });
+
+    // ── 中断 / 再開 / 取消 ──
+    $('pauseBtn').addEventListener('click', () => { $('pauseSheet').style.display = 'flex'; });
+    $('pauseCancel').addEventListener('click', () => { $('pauseSheet').style.display = 'none'; });
+    document.querySelectorAll('.pause-opt').forEach((btn) => btn.addEventListener('click', () => {
+      $('pauseSheet').style.display = 'none';
+      BATCH.status = 'paused';
+      BATCH.pauseReason = btn.dataset.reason;
+      enqueue('pause', null, null, { pause_reason: btn.dataset.reason });
+      render();
+    }));
+    $('resumeBtn').addEventListener('click', () => {
+      BATCH.status = 'picking';
+      BATCH.pauseReason = null;
+      enqueue('resume', null, null);
+      render();
+    });
+    $('cancelBtn').addEventListener('click', () => {
+      if (!confirm('このバッチのピッキングを取り消して最初に戻します。よろしいですか?\n(進捗と時間の記録は破棄されます)')) return;
+      // 直接fetchせずキューに積む (先行する操作の順序を守る。オフラインでも復帰後に処理される
+      // — Codex PR4 high)。送信完了は flush() が検知して一覧へ戻す
+      $('syncerr').textContent = '取消を送信しています… (完了すると一覧に戻ります)';
+      $('syncerr').style.background = '#495057';
+      $('syncerr').style.display = 'block';
+      $('resumeBtn').disabled = true;
+      $('cancelBtn').disabled = true;
+      enqueue('cancel', null, null);
+    });
 
     // ── キュー送信 (直列・冪等再送) ──
     let flushing = false;
@@ -390,6 +502,12 @@
             if (body.startedAt) BATCH.startedAt = body.startedAt;
             queue.shift();
             localStorage.setItem(QKEY, JSON.stringify(queue));
+            if (op.event === 'cancel') {
+              // 取消がサーバーに届いたら一覧へ (それ以前の操作は上で順に確定済み)
+              localStorage.removeItem(QKEY);
+              location.href = '/apps/picking/';
+              return;
+            }
             if (BATCH.status === 'done' && queue.length === 0) render();
             continue;
           }
@@ -475,8 +593,9 @@
     }
     function boot() {
       refreshWorkerTag();
-      if (BATCH.status === 'picking' && BATCH.worker && BATCH.worker !== ME && queue.length === 0) {
-        $('blockedMsg').textContent = `${BATCH.worker} さんが作業中です`;
+      if ((BATCH.status === 'picking' || BATCH.status === 'paused')
+          && BATCH.worker && BATCH.worker !== ME && queue.length === 0) {
+        $('blockedMsg').textContent = `${BATCH.worker} さんが${BATCH.status === 'paused' ? '中断中' : '作業中'}です`;
         show('scr-blocked');
         return;
       }

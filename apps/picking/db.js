@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -114,6 +114,12 @@ const MIGRATIONS = {
       sort   INTEGER NOT NULL DEFAULT 0,
       active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
     )`);
+  },
+  // v3: 中断 (PR4)。中断中は pause_started_at に開始時刻を持ち、再開時に
+  // paused_total_sec へ加算する (中断時間はピッキング時間から除外 — 要件§5.6)
+  3: () => {
+    db.exec('ALTER TABLE pk_batches ADD COLUMN pause_started_at TEXT');
+    db.exec('ALTER TABLE pk_batches ADD COLUMN pause_reason TEXT');
   },
 };
 

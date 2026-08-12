@@ -70,6 +70,7 @@
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
       <% if (isAdmin) { %>
         <a href="/apps/picking/admin/import" class="btn-logout">📥 CS03002取込</a>
+        <a href="/apps/picking/admin/summary" class="btn-logout">📊 サマリ</a>
         <a href="/apps/picking/admin/devices" class="btn-logout">📱 端末・作業者</a>
       <% } %>
       <% if (!deviceMode) { %><a href="/" class="btn-logout">ダッシュボード</a><% } %>
