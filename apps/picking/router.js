@@ -287,7 +287,8 @@ async function driveCall(fn) {
 router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
   const files = await driveCall(async () => {
     const folders = await getShippingFolders();
-    return listDriveFilesAcross({ folders, nameContains: '.csv' });
+    // ピッキングリストCSVだけに絞る (出荷_XXには送り状CSV okurijo_* 等も同居しているため)
+    return listDriveFilesAcross({ folders, nameContains: 'ピッキングリスト' });
   });
   res.json({ ok: true, files: files.filter((f) => /\.csv$/i.test(f.filename)) });
 }));
