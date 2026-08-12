@@ -18,7 +18,9 @@ import multer from 'multer';
 import {
   initPickingDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
 } from './db.js';
-import { parseCs03002, importBatch, formatLocation, PkError } from './service.js';
+import {
+  parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
+} from './service.js';
 import { allPatternNames } from './patterns.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +37,22 @@ function isRealDate(s) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
   const d = new Date(`${s}T00:00:00Z`);
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+/**
+ * 状態変更APIのCSRF緩和策: Origin ヘッダがあれば自ホストと一致することを要求する
+ * (セッションCookieのSameSiteに加えた明示防御。Origin無しの同一サイトfetchは通す)。
+ */
+function checkOrigin(req, res, next) {
+  const origin = req.headers.origin;
+  if (origin) {
+    let host = null;
+    try { host = new URL(origin).host; } catch { /* 不正値は下で403 */ }
+    if (!host || host !== req.headers.host) {
+      return res.status(403).json({ error: '不正なオリジンからのリクエストです' });
+    }
+  }
+  next();
 }
 
 function requireAdmin(req, res, next) {
@@ -93,6 +111,65 @@ router.get('/batches/:id(\\d+)', (req, res) => {
   });
 });
 
+// ─── 作業画面 (PWA・スマホ前提。全員) ───
+router.get('/work/:id(\\d+)', (req, res) => {
+  let state;
+  try {
+    state = getWorkState(Number(req.params.id));
+  } catch (e) {
+    if (e instanceof PkError) return res.status(e.status).send(e.message);
+    throw e;
+  }
+  res.render(path.join(__dirname, 'views/work'), {
+    title: `ピッキング | ${state.batch.hikiate_class}`,
+    worker: req.session.email,
+    displayName: req.session.displayName,
+    state,
+  });
+});
+
+/**
+ * 作業イベントAPI。body: { op_id, event: start|next|back, line_seq?, client_at? }。
+ * 端末はオフラインキューから直列で送る。op_id 冪等なので再送は安全。
+ */
+router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
+  const result = applyEvent(Number(req.params.id), {
+    opId: req.body.op_id,
+    event: req.body.event,
+    lineSeq: req.body.line_seq == null ? null : Number(req.body.line_seq),
+    clientAt: req.body.client_at,
+    undoOpId: req.body.undo_op_id || null,
+  }, req.session.email);
+  res.json({ ok: true, ...result });
+}));
+
+/** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
+router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
+  const s = getWorkState(Number(req.params.id));
+  res.json({
+    ok: true,
+    batchStatus: s.batch.status,
+    worker: s.batch.worker,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    lineCount: s.lines.length,
+  });
+}));
+
+// PWA manifest (ホーム画面追加用)。アイコンは portal 共通の favicon を流用
+router.get('/manifest.json', (req, res) => {
+  res.json({
+    name: 'ピッキング支援',
+    short_name: 'ピッキング',
+    start_url: '/apps/picking/',
+    display: 'standalone',
+    orientation: 'portrait',
+    background_color: '#111418',
+    theme_color: '#111418',
+    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+  });
+});
+
 // ─── 取込画面 (管理者) ───
 router.get('/admin/import', requireAdmin, (req, res) => {
   res.render(path.join(__dirname, 'views/admin_import'), {
@@ -110,7 +187,7 @@ router.get('/admin/import', requireAdmin, (req, res) => {
  *   mode=confirm  … hikiate_class 必須。overwrite=1 で取込済みバッチの入れ替えを許可
  * preview → confirm でファイルを2回送る (サーバーに中間状態を持たない。GAS取込等と同じ二段方式)
  */
-router.post('/admin/import', requireAdmin, (req, res, next) => {
+router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
   uploadCsv.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
     next();
