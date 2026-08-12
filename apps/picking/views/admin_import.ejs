@@ -47,7 +47,19 @@
 
   <div class="pk-wrap">
     <div class="pk-form">
-      <h2>ピッキングリストCSV (CS03002_xxxx.csv) を取り込む</h2>
+      <h2>📂 Driveから取り込む (出荷_no フォルダ)</h2>
+      <div class="pk-actions" style="margin-top:0">
+        <button id="driveListBtn" type="button">ファイル一覧を更新</button>
+        <span id="driveMsg" class="pk-msg"></span>
+      </div>
+      <table class="pk-lines" id="driveTable" style="display:none; margin-top:10px">
+        <thead><tr><th>ファイル名</th><th>更新日時</th><th></th></tr></thead>
+        <tbody id="driveBody"></tbody>
+      </table>
+    </div>
+
+    <div class="pk-form">
+      <h2>💻 ファイルをアップロードして取り込む</h2>
       <div class="pk-row">
         <label>ファイル (カンタン引当で出力したピッキングリストCSV・Shift-JIS)</label>
         <input type="file" id="file" accept=".csv">
@@ -92,19 +104,29 @@
         (現状はサーバー固定定数だが、将来DB管理化しても安全なように) %>
     const ALL_PATTERNS = <%- JSON.stringify(patternNames).replace(/</g, '\\u003c') %>;
     const $ = (id) => document.getElementById(id);
-    let currentFile = null;
+    // 取込元: {type:'file', file} (アップロード) | {type:'drive', fileId} (出荷_noフォルダ)
+    let currentSource = null;
 
     function esc(s) {
       return String(s ?? '').replace(/[&<>"']/g, (c) =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
-    async function post(mode, extra = {}) {
-      const fd = new FormData();
-      fd.append('file', currentFile);
-      fd.append('mode', mode);
-      for (const [k, v] of Object.entries(extra)) fd.append(k, v);
-      const res = await fetch('/apps/picking/admin/import', { method: 'POST', body: fd });
+    async function post(source, mode, extra = {}) {
+      let res;
+      if (source.type === 'drive') {
+        res = await fetch('/apps/picking/admin/import/drive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file_id: source.fileId, mode, ...extra }),
+        });
+      } else {
+        const fd = new FormData();
+        fd.append('file', source.file);
+        fd.append('mode', mode);
+        for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+        res = await fetch('/apps/picking/admin/import', { method: 'POST', body: fd });
+      }
       const body = await res.json().catch(() => ({ error: '応答の解析に失敗しました' }));
       return { status: res.status, body };
     }
@@ -114,46 +136,88 @@
       $('patternList').innerHTML = names.map((n) => `<option value="${esc(n)}">`).join('');
     }
 
+    function showPreview(body) {
+      $('summary').innerHTML =
+        `<span><b>${esc(body.tbNo)}</b></span>` +
+        (body.filename ? `<span>📂 ${esc(body.filename)}</span>` : '') +
+        `<span>出荷指示日: ${esc(body.instructDate)}</span>` +
+        `<span>${esc(body.invoiceSoft)} / ${esc(body.deliveryMethod)}</span>` +
+        `<span>構成: <b>${esc(body.composition)}</b></span>` +
+        `<span>明細 ${body.lineCount} / 伝票 ${body.slipCount} / 数量 ${body.totalQty}</span>` +
+        (body.dateWarning ? `<span style="color:#e8590c; font-weight:600">⚠ ${esc(body.dateWarning)}</span>` : '');
+      fillDatalist(body.suggestions || []);
+      $('hikiateClass').value = (body.suggestions || [])[0] || '';
+      // 前回プレビューの値を残さない (残すと別ファイルに古い出荷_XXが付いたまま確定できてしまう)
+      $('folderName').value = body.folderNameSuggestion || '';
+      $('lineBody').innerHTML = body.lines.map((l, i) =>
+        `<tr><td class="num">${i + 1}</td><td class="loc">${esc(l.locationLabel)}</td>` +
+        `<td>${esc(l.sku)}</td><td>${esc(l.productName)}</td><td class="num">${l.qty}</td></tr>`).join('');
+      $('overwriteBox').style.display = 'none';
+      $('overwriteChk').checked = false;
+      $('confirmMsg').textContent = '';
+      $('preview').style.display = 'block';
+    }
+
+    // プレビュー要求ごとにトークンを振り、最新の応答だけを画面と currentSource に反映する
+    // (連打・並行プレビューで「画面はA・確定対象はB」に食い違うのを防ぐ)
+    let previewToken = 0;
+    async function doPreview(source, msgEl) {
+      const token = ++previewToken;
+      msgEl.textContent = '解析中…'; msgEl.className = 'pk-msg';
+      const { status, body } = await post(source, 'preview');
+      if (token !== previewToken) return;   // 後から始まったプレビューが優先
+      if (status !== 200) {
+        msgEl.textContent = body.error || `エラー (${status})`; msgEl.className = 'pk-msg err';
+        currentSource = null;
+        $('preview').style.display = 'none';
+        return;
+      }
+      msgEl.textContent = '解析OK'; msgEl.className = 'pk-msg ok';
+      currentSource = source;   // 画面に表示した内容とだけ結び付ける
+      showPreview(body);
+    }
+
     $('previewBtn').addEventListener('click', async () => {
       const f = $('file').files[0];
       if (!f) { $('msg').textContent = 'ファイルを選択してください'; $('msg').className = 'pk-msg err'; return; }
-      currentFile = f;
-      $('msg').textContent = '解析中…'; $('msg').className = 'pk-msg';
       $('previewBtn').disabled = true;
+      try { await doPreview({ type: 'file', file: f }, $('msg')); } finally { $('previewBtn').disabled = false; }
+    });
+
+    // ── Drive一覧 ──
+    $('driveListBtn').addEventListener('click', async () => {
+      $('driveMsg').textContent = '取得中…'; $('driveMsg').className = 'pk-msg';
+      $('driveListBtn').disabled = true;
       try {
-        const { status, body } = await post('preview');
-        if (status !== 200) {
-          $('msg').textContent = body.error || `エラー (${status})`; $('msg').className = 'pk-msg err';
-          $('preview').style.display = 'none';
+        const res = await fetch('/apps/picking/admin/import/drive-files');
+        const body = await res.json().catch(() => ({ error: '応答の解析に失敗しました' }));
+        if (!res.ok) {
+          $('driveMsg').textContent = body.error || `エラー (${res.status})`; $('driveMsg').className = 'pk-msg err';
           return;
         }
-        $('msg').textContent = '解析OK'; $('msg').className = 'pk-msg ok';
-        $('summary').innerHTML =
-          `<span><b>${esc(body.tbNo)}</b></span>` +
-          `<span>出荷指示日: ${esc(body.instructDate)}</span>` +
-          `<span>${esc(body.invoiceSoft)} / ${esc(body.deliveryMethod)}</span>` +
-          `<span>構成: <b>${esc(body.composition)}</b></span>` +
-          `<span>明細 ${body.lineCount} / 伝票 ${body.slipCount} / 数量 ${body.totalQty}</span>`;
-        fillDatalist(body.suggestions || []);
-        $('hikiateClass').value = (body.suggestions || [])[0] || '';
-        $('lineBody').innerHTML = body.lines.map((l, i) =>
-          `<tr><td class="num">${i + 1}</td><td class="loc">${esc(l.locationLabel)}</td>` +
-          `<td>${esc(l.sku)}</td><td>${esc(l.productName)}</td><td class="num">${l.qty}</td></tr>`).join('');
-        $('overwriteBox').style.display = 'none';
-        $('overwriteChk').checked = false;
-        $('confirmMsg').textContent = '';
-        $('preview').style.display = 'block';
+        const files = body.files || [];
+        $('driveMsg').textContent = files.length === 0 ? 'CSVがありません' : `${files.length} 件`;
+        $('driveBody').innerHTML = files.map((f) =>
+          `<tr><td>${esc(f.filename)}</td><td>${esc(f.modified_time_jst || '')}</td>` +
+          `<td><button type="button" class="btn-drive-preview" data-id="${esc(f.file_id)}">プレビュー</button></td></tr>`).join('');
+        $('driveTable').style.display = files.length > 0 ? 'table' : 'none';
+        document.querySelectorAll('.btn-drive-preview').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            try { await doPreview({ type: 'drive', fileId: btn.dataset.id }, $('driveMsg')); } finally { btn.disabled = false; }
+          });
+        });
       } finally {
-        $('previewBtn').disabled = false;
+        $('driveListBtn').disabled = false;
       }
     });
 
     $('confirmBtn').addEventListener('click', async () => {
-      if (!currentFile) return;
+      if (!currentSource) return;
       $('confirmMsg').textContent = '取込中…'; $('confirmMsg').className = 'pk-msg';
       $('confirmBtn').disabled = true;
       try {
-        const { status, body } = await post('confirm', {
+        const { status, body } = await post(currentSource, 'confirm', {
           hikiate_class: $('hikiateClass').value.trim(),
           folder_name: $('folderName').value.trim(),
           overwrite: $('overwriteChk').checked ? '1' : '0',

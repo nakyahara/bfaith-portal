@@ -198,6 +198,27 @@ export function formatLocation(block, location) {
 }
 
 /**
+ * Driveファイル名から出荷フォルダ名を導出する。
+ * 運用ルール (2026-08-12 中原さん): 出荷_no フォルダに `ピッキングリストデータ_出荷XX.csv` で保存。
+ * 例: 'ピッキングリストデータ_出荷03.csv' → '出荷_03' / 該当なしは null (手入力に任せる)
+ */
+export function deriveFolderName(filename) {
+  const m = String(filename || '').match(/出荷_?(\d{1,2})/);
+  return m ? `出荷_${m[1].padStart(2, '0')}` : null;
+}
+
+/**
+ * 出荷指示日が今日を含まないか (前日ファイルの取り込み事故ガード)。
+ * 出荷Noは毎日1から再利用されるため、Driveに残った前日の同名ファイルを
+ * 翌朝取り込むと出荷済みバッチを再ピックしてしまう。警告表示に使う (ブロックはしない)。
+ * instructDate は 'YYYY-MM-DD' または 'YYYY-MM-DD / YYYY-MM-DD' (混在時)。
+ */
+export function isStaleInstructDate(instructDate, today = jstToday()) {
+  const dates = String(instructDate || '').split(' / ').filter(Boolean);
+  return dates.length > 0 && dates.every((d) => d !== today);
+}
+
+/**
  * 取込の確定。tb_no が冪等キー。
  *   - 既存なし → 新規作成
  *   - 既存あり (ready・overwrite=true) → 明細を入れ替えて更新 (取り込み直し)
