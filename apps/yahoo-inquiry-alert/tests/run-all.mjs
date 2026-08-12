@@ -64,14 +64,15 @@ function headline(over = {}) {
   };
 }
 
-// fetchImpl スタブ: URLの requestFilter/serviceType を見て応答を返す
+// fetchImpl スタブ: URLの requestFilter/serviceType (+start) を見て応答を返す。
+// 'answered/shp@21' のように start つきキーが優先、無ければ 'answered/shp' に落ちる
 function stubFetch(responses) {
   const calls = [];
   const impl = async (urlStr) => {
     const u = new URL(urlStr);
     const key = `${u.searchParams.get('requestFilter')}/${u.searchParams.get('serviceType')}`;
     calls.push({ key, params: Object.fromEntries(u.searchParams) });
-    const r = responses[key];
+    const r = responses[`${key}@${u.searchParams.get('start')}`] || responses[key];
     if (!r) throw new Error(`スタブ未定義: ${key}`);
     if (r.status && r.status !== 200) {
       return { status: r.status, text: async () => r.body ?? '<Error><Code>px-test</Code></Error>' };
@@ -146,11 +147,14 @@ section('validateListResponse');
 
   const qa = QUERIES[2]; // answered/shp → uncompleted
   await throws(() => validateListResponse(
-    listJson({ filter: 'answered', count: 1, headlines: [headline({ isCompleted: true })] }), qa),
+    listJson({ filter: 'answered', count: 1, headlines: [headline({ isCompleted: true, sellerPostTime: 100 })] }), qa),
     /想定外の状態/, 'answered に完了済みが混ざったら throw (件数を信用できない)');
   await throws(() => validateListResponse(
-    listJson({ filter: 'answered', count: 1, headlines: [headline({ serviceType: 'auc' })] }), qa),
+    listJson({ filter: 'answered', count: 1, headlines: [headline({ serviceType: 'auc', sellerPostTime: 100 })] }), qa),
     /serviceType/, 'serviceType 不一致は throw');
+  await throws(() => validateListResponse(
+    listJson({ filter: 'answered', count: 1, headlines: [headline({})] }), qa),
+    /sellerPostTime が不正/, 'answered の sellerPostTime null は throw (窓判定に使うため)');
 }
 
 // ─── toItem ───
@@ -166,6 +170,9 @@ section('toItem');
 }
 
 // ─── fetchInquiryStatus ───
+// 基準時刻: 1754956800 = 2025-08-12 09:00 JST。30日窓の floor = 2025-07-13 09:00 JST
+const NOW = new Date(1754956800 * 1000);
+
 section('fetchInquiryStatus: 正常系');
 {
   const impl = stubFetch({
@@ -181,9 +188,11 @@ section('fetchInquiryStatus: 正常系');
     ] }) },
     'answered/auc': { json: listJson({ filter: 'answered', count: 0, headlines: [] }) },
   });
-  const r = await fetchInquiryStatus({ fetchImpl: impl, sleepMs: 0 });
+  const r = await fetchInquiryStatus({ fetchImpl: impl, sleepMs: 0, now: NOW });
   eq(r.unanswered.count, 3, '未返信 count 合算 (shp2 + auc1)');
-  eq(r.uncompleted.count, 1, '完了処理待ち count');
+  eq(r.uncompleted.count, 1, '完了処理待ち count (窓内)');
+  eq(r.uncompleted.olderCount, 0, '窓外なし');
+  eq(r.windowDays, 30, '既定の窓は30日');
   eq(r.unanswered.items.map(i => i.topicId), ['u3', 'u1', 'u2'], '新しい順に混ぜてソート');
   eq(impl.calls.length, 4, '照会は4回 (shp/auc × unanswered/answered)');
   ok(impl.calls.every(c => c.params.sortOrder === 'desc'), '全照会 desc');
@@ -191,6 +200,76 @@ section('fetchInquiryStatus: 正常系');
     'unanswered は userPostTime ソート');
   ok(impl.calls.filter(c => c.key.startsWith('answered')).every(c => c.params.sort === 'sellerPostTime'),
     'answered は sellerPostTime ソート');
+}
+
+section('fetchInquiryStatus: 30日窓とページング');
+{
+  // 過去分バックログ: 窓内2件 + 窓外の古い返信。1ページ目の途中で floor に達したら打ち切る
+  const oldSec = 1754956800 - 40 * 86400; // 40日前 = 窓外
+  const impl = stubFetch({
+    ...EMPTY,
+    'answered/shp': { json: listJson({ filter: 'answered', count: 100, headlines: [
+      headline({ topicId: 'w1', title: '窓内1', userPostTime: 1754697600, sellerPostTime: 1754701200 }),
+      headline({ topicId: 'w2', title: '窓内2', userPostTime: 1754697600, sellerPostTime: 1754700000 }),
+      ...Array.from({ length: 18 }, (_, i) => headline({ topicId: `old${i}`, title: '過去分', userPostTime: oldSec, sellerPostTime: oldSec - i })),
+    ] }) },
+  });
+  const r = await fetchInquiryStatus({ fetchImpl: impl, sleepMs: 0, now: NOW });
+  eq(r.uncompleted.count, 2, '窓内だけ要対応に数える');
+  eq(r.uncompleted.olderCount, 98, '窓外は olderCount (100-2)');
+  eq(r.uncompleted.truncated, false, '打ち切りなし');
+  eq(impl.calls.filter(c => c.key === 'answered/shp').length, 1, 'floor到達でページングを止める');
+
+  // 窓内が1ページを超える場合は次ページを読む (start=21)
+  const inWin = i => headline({ topicId: `p${i}`, title: `窓内${i}`, userPostTime: 1754697600, sellerPostTime: 1754701200 - i });
+  const impl2 = stubFetch({
+    ...EMPTY,
+    'answered/shp': { json: listJson({ filter: 'answered', count: 25, headlines: Array.from({ length: 20 }, (_, i) => inWin(i)) }) },
+    'answered/shp@21': { json: {
+      summary: { filter: 'answered', unansweredCount: 0, topic: { start: 21, end: 25, count: 25 } },
+      headlines: Array.from({ length: 5 }, (_, i) => inWin(20 + i)),
+    } },
+  });
+  const r2 = await fetchInquiryStatus({ fetchImpl: impl2, sleepMs: 0, now: NOW });
+  eq(r2.uncompleted.count, 25, '窓内が20件超なら次ページも読む');
+  eq(r2.uncompleted.olderCount, 0, '全件窓内なら olderCount=0');
+  const starts = impl2.calls.filter(c => c.key === 'answered/shp').map(c => c.params.start);
+  eq(starts, ['1', '21'], 'start=1→21 でページング');
+
+  // ページ上限打ち切り: maxPages=1 で窓内がまだ続く → truncated
+  const r3 = await fetchInquiryStatus({ fetchImpl: stubFetch({
+    ...EMPTY,
+    'answered/shp': { json: listJson({ filter: 'answered', count: 25, headlines: Array.from({ length: 20 }, (_, i) => inWin(i)) }) },
+  }), sleepMs: 0, now: NOW, maxPages: 1 });
+  eq(r3.uncompleted.truncated, true, '上限打ち切りは truncated=true (黙って切らない)');
+  eq(r3.uncompleted.count, 20, '読めた分は数える');
+  eq(r3.uncompleted.olderCount, 0, '打ち切り時は未読分を窓外 (olderCount) に混ぜない (過少表示防止)');
+
+  // 走査中の総件数変動は fail-closed (どのページも信用できない)
+  await throws(() => fetchInquiryStatus({ fetchImpl: stubFetch({
+    ...EMPTY,
+    'answered/shp': { json: listJson({ filter: 'answered', count: 25, headlines: Array.from({ length: 20 }, (_, i) => inWin(i)) }) },
+    'answered/shp@21': { json: {
+      summary: { filter: 'answered', unansweredCount: 0, topic: { start: 21, end: 24, count: 24 } },
+      headlines: Array.from({ length: 4 }, (_, i) => inWin(20 + i)),
+    } },
+  }), sleepMs: 0, now: NOW }), /総件数が変動/, 'ページ間で count が動いたら throw');
+
+  // 不正な opts は入口で止める (NaN が floorSec を汚染して全件窓内になる事故防止)
+  await throws(() => fetchInquiryStatus({ fetchImpl: stubFetch(EMPTY), sleepMs: 0, now: NOW, windowDays: NaN }),
+    /windowDays が不正/, 'windowDays=NaN は throw');
+  await throws(() => fetchInquiryStatus({ fetchImpl: stubFetch(EMPTY), sleepMs: 0, now: NOW, maxPages: 0 }),
+    /maxPages が不正/, 'maxPages=0 は throw');
+  await throws(() => fetchInquiryStatus({ fetchImpl: stubFetch(EMPTY), sleepMs: 0, now: new Date('x') }),
+    /now が不正/, '不正な Date は throw');
+
+  // sellerPostTime 欠落は fail-closed (窓判定・打ち切り判定に使うため)
+  await throws(() => fetchInquiryStatus({ fetchImpl: stubFetch({
+    ...EMPTY,
+    'answered/shp': { json: listJson({ filter: 'answered', count: 1, headlines: [
+      headline({ topicId: 'x', title: 'x', userPostTime: 1754697600, sellerPostTime: null }),
+    ] }) },
+  }), sleepMs: 0, now: NOW }), /sellerPostTime が不正/, 'answered の sellerPostTime 欠落は throw');
 }
 
 section('fetchInquiryStatus: 異常系 (fail-closed)');
@@ -235,7 +314,7 @@ section('buildMessage');
   });
   ok(msg.includes('3件あります'), '合計件数');
   ok(msg.includes('未返信 (出店者回答待ち): *2件*'), '未返信の件数');
-  ok(msg.includes('「完了する」が押されていない: *1件*'), '完了処理待ちの件数');
+  ok(msg.includes('「完了する」が押されていない (直近30日): *1件*'), '完了処理待ちの件数 (窓表示つき)');
   ok(msg.includes('[通常] 在庫ありますか'), '通常タグ+タイトル');
   ok(msg.includes('[オークション] 落札前質問'), 'オークションタグ');
   ok(msg.includes('受信 8/9') && msg.includes('返信 8/9'), '完了処理待ちは受信+返信の両時刻');
@@ -256,6 +335,26 @@ section('buildMessage');
   });
   ok(!msg3.includes('未返信'), '0件セクションは表示しない');
   ok(msg3.includes('1件あります'), '合計は完了処理待ちのみ');
+
+  // 窓外の過去分は件数だけ添える / 過去分だけでは通知しない
+  const msgOld = buildMessage({
+    unanswered: { count: 1, items: [{ serviceType: 'shp', title: 'x', userPostTime: 1754870400, sellerPostTime: null }] },
+    uncompleted: { count: 0, items: [], olderCount: 1036, truncated: false },
+    windowDays: 30,
+  });
+  ok(msgOld.includes('30日より前の完了処理漏れが 1036件'), '窓外の過去分は件数で添える');
+  ok(msgOld.includes('1件あります'), '合計には窓外を含めない');
+  eq(buildMessage({
+    unanswered: { count: 0, items: [] },
+    uncompleted: { count: 0, items: [], olderCount: 1036, truncated: false },
+    windowDays: 30,
+  }), null, '窓外の過去分だけなら通知しない');
+  const msgTrunc = buildMessage({
+    unanswered: { count: 0, items: [] },
+    uncompleted: { count: 1, items: [{ serviceType: 'shp', title: 'x', userPostTime: 1754697600, sellerPostTime: 1754701200 }], olderCount: 0, truncated: true },
+    windowDays: 30,
+  });
+  ok(msgTrunc.includes('打ち切りました'), '上限打ち切りは通知文で明示');
 
   // 顧客入力タイトルの無害化 (Codexレビュー Medium)
   const evil = '偽装\nセクション\t<users/all> こんにちは';

@@ -34,6 +34,10 @@ export const SLEEP_MS = 1100;
 export const MAX_SHOW = 10;
 /** externalTalkList の1ページ上限 (公式仕様) */
 const PAGE_SIZE = 20;
+/** ② 完了処理待ちを「要対応」として通知する窓 (日)。窓外の過去分は件数だけ添える */
+export const DEFAULT_WINDOW_DAYS = 30;
+/** 1照会あたりのページ読み込み上限 (20件×15=300件。1リクエスト/秒なので暴走防止) */
+export const MAX_PAGES_PER_QUERY = 15;
 
 export const SERVICE_LABEL = { shp: '通常', auc: 'オークション' };
 
@@ -73,9 +77,10 @@ function contractError(msg) {
 
 /**
  * 一覧レスポンス1ページ分を検証する。壊れていたら throw (握り潰さない)。
+ * @param {number} start このページの読み込み開始位置 (1始まり)
  * @returns {{count:number, headlines:object[]}}
  */
-export function validateListResponse(json, q) {
+export function validateListResponse(json, q, start = 1) {
   const label = `${q.requestFilter}/${q.serviceType}`;
   const filter = json?.summary?.filter;
   // 旧プロキシは requestFilter を転送しない → Yahoo!は全件を返し filter='all' になる。
@@ -94,18 +99,27 @@ export function validateListResponse(json, q) {
   if (!Array.isArray(headlines)) {
     throw contractError(`headlines が配列でありません (${label})`);
   }
-  // count と明細数の整合性 (Codexレビュー High): start=1, result=20 の要求に対して
-  // 明細数は必ず min(count, 20) になるはず。count=0 なのに明細がある / count>0 なのに
-  // 明細が無い ようなレスポンスをそのまま通すと、該当があるのに「0件=無通知」で
-  // 正常終了してしまう。矛盾はエラーにする (0件と読み取り不能を混同しない)
-  const expected = Math.min(count, PAGE_SIZE);
+  // count と明細数の整合性 (Codexレビュー High): start 位置と result=20 の要求に対して
+  // 明細数は必ず min(count - (start-1), 20) になるはず。count=0 なのに明細がある /
+  // count>0 なのに明細が無い ようなレスポンスをそのまま通すと、該当があるのに
+  // 「0件=無通知」で正常終了してしまう。矛盾はエラーにする (0件と読み取り不能を混同しない)
+  const expected = Math.max(0, Math.min(count - (start - 1), PAGE_SIZE));
   if (headlines.length !== expected) {
-    throw contractError(`count=${count} に対して明細が ${headlines.length}件 (期待 ${expected}件) です (${label})`);
+    throw contractError(`count=${count} start=${start} に対して明細が ${headlines.length}件 (期待 ${expected}件) です (${label})`);
   }
   for (const h of headlines) {
     if (!h?.topicId) throw contractError(`topicId のない行があります (${label})`);
     if (typeof h.isNoAnswer !== 'boolean' || typeof h.isCompleted !== 'boolean') {
       throw contractError(`isNoAnswer/isCompleted が真偽値でありません (${label}: ${h.topicId})`);
+    }
+    // uncompleted は sellerPostTime で窓判定・ページ打ち切りをするため、欠落・不正は
+    // 「読めない」としてエラーにする (0扱いにすると走査が即打ち切られ、取りこぼしを
+    // 「成功」でコミットしてしまう)
+    if (q.kind === 'uncompleted') {
+      const sec = Number(h.sellerPostTime);
+      if (!Number.isFinite(sec) || sec <= 0) {
+        throw contractError(`sellerPostTime が不正です (${label}: ${h.topicId} = ${JSON.stringify(h.sellerPostTime)})`);
+      }
     }
     // フィルタ語義の検証: unanswered に返信済みが混ざる / answered に未返信・完了済みが
     // 混ざるなら、summary.topic.count を「その分類の件数」として信用できない
@@ -138,29 +152,52 @@ export function toItem(h, q) {
 
 /**
  * 4照会 (shp/auc × unanswered/answered) を実行して分類する。
- * @param {{fetchImpl?:Function, sleepMs?:number, timeoutMs?:number, env?:object}} opts
- * @returns {Promise<{unanswered:{count:number, items:object[]}, uncompleted:{count:number, items:object[]}}>}
- *   count = Yahoo!側の総件数 (summary.topic.count の合算)、items = 新しい順の明細 (最大20件/照会)
+ *
+ * ② 完了処理待ちには**直近 windowDays 日の窓**を設ける (実測 2026-08-12: 過去分の
+ * 完了処理漏れが1,036件あり、全件を毎朝通知すると新しい要対応が埋もれるため)。
+ * 窓判定は sellerPostTime (店舗の最終返信) 基準。窓外の件数は olderCount として返し、
+ * 通知には件数だけ添える。窓内が必要な分だけページを読み進める (sellerPostTime 降順)。
+ * ① 未返信は何日前のものでも要対応なので窓を設けない (件数は summary から取得)。
+ *
+ * @param {{fetchImpl?:Function, sleepMs?:number, timeoutMs?:number, env?:object,
+ *          windowDays?:number, now?:Date, maxPages?:number}} opts
+ * @returns {Promise<{
+ *   unanswered:{count:number, items:object[]},
+ *   uncompleted:{count:number, items:object[], olderCount:number, truncated:boolean},
+ *   windowDays:number}>}
+ *   unanswered.count = Yahoo!側の総件数 / uncompleted.count = 窓内の件数
+ *   items = 新しい順の明細 (unanswered は最大20件/照会)
  */
 export async function fetchInquiryStatus(opts = {}) {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const sleepMs = opts.sleepMs ?? SLEEP_MS;
   const timeoutMs = opts.timeoutMs ?? 45000;
+  const windowDays = opts.windowDays ?? DEFAULT_WINDOW_DAYS;
+  const maxPages = opts.maxPages ?? MAX_PAGES_PER_QUERY;
+  const now = opts.now ?? new Date();
+  // 入力の検証 (Codexレビュー3巡目 Medium): windowDays=NaN → floorSec=NaN → 全件窓内、
+  // maxPages=NaN → 無制限走査 のような静かな誤動作を入口で止める
+  if (!Number.isInteger(windowDays) || windowDays < 1) throw new Error(`windowDays が不正です (${windowDays})`);
+  if (!Number.isInteger(maxPages) || maxPages < 1) throw new Error(`maxPages が不正です (${maxPages})`);
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) throw new Error('now が不正な Date です');
+  const floorSec = Math.floor(now.getTime() / 1000) - windowDays * 86400;
   const { base, secret } = proxyConfig(opts.env ?? process.env);
 
   const out = {
     unanswered: { count: 0, items: [] },
-    uncompleted: { count: 0, items: [] },
+    uncompleted: { count: 0, items: [], olderCount: 0, truncated: false },
+    windowDays,
+    maxPages,
   };
   const seen = new Map(); // topicId → query label (serviceType が効いていない事故の検出)
   let requests = 0;
 
-  for (const q of QUERIES) {
+  async function fetchPage(q, start) {
     if (requests > 0) await new Promise(r => setTimeout(r, sleepMs));
     requests++;
 
     const u = new URL(`${base}/yahoo/externalTalkList`);
-    u.searchParams.set('start', '1');
+    u.searchParams.set('start', String(start));
     u.searchParams.set('result', String(PAGE_SIZE));
     u.searchParams.set('requestFilter', q.requestFilter);
     u.searchParams.set('serviceType', q.serviceType);
@@ -191,7 +228,7 @@ export async function fetchInquiryStatus(opts = {}) {
       throw contractError(`Yahoo APIレスポンスがJSONでありません (${label}): ${text.length} bytes`);
     }
 
-    const { count, headlines } = validateListResponse(json, q);
+    const { count, headlines } = validateListResponse(json, q, start);
     for (const h of headlines) {
       // String() で正規化してから照合 (数値/文字列の揺れで重複検出をすり抜けないように)
       const id = String(h.topicId);
@@ -202,10 +239,58 @@ export async function fetchInquiryStatus(opts = {}) {
       }
       seen.set(id, label);
     }
-    const bucket = out[q.kind];
-    bucket.count += count;
-    bucket.items.push(...headlines.map(h => toItem(h, q)));
-    console.log(`[yahoo-inquiry] ${label}: ${count}件`);
+    return { count, headlines };
+  }
+
+  for (const q of QUERIES) {
+    const label = `${q.requestFilter}/${q.serviceType}`;
+
+    if (q.kind === 'unanswered') {
+      // 窓なし: 件数は summary から、明細は最新20件で足りる (表示は MAX_SHOW 件)
+      const { count, headlines } = await fetchPage(q, 1);
+      out.unanswered.count += count;
+      out.unanswered.items.push(...headlines.map(h => toItem(h, q)));
+      console.log(`[yahoo-inquiry] ${label}: ${count}件`);
+      continue;
+    }
+
+    // uncompleted: sellerPostTime 降順で読み進め、窓 (floorSec) より古くなったら打ち切る
+    let start = 1;
+    let total = null;   // 1ページ目の count を基準に固定 (走査中の変動は fail-closed)
+    let inWindow = 0;
+    let truncated = false;
+    for (let page = 1; ; page++) {
+      if (page > maxPages) {
+        // ここまで読んだ分だけで通知する (打ち切りは通知文で明示する。黙って切らない)
+        truncated = true;
+        break;
+      }
+      const { count, headlines } = await fetchPage(q, start);
+      // ページ間で総件数が動いたら、どのページも信用できない (走査中に問い合わせが
+      // 増減した or レスポンス不正)。翌 retry でやり直す (Codexレビュー3巡目)
+      if (total === null) total = count;
+      else if (count !== total) {
+        throw contractError(`走査中に総件数が変動しました (${label}: ${total} → ${count})。retry で取り直します`);
+      }
+      let reachedFloor = false;
+      for (const h of headlines) {
+        const item = toItem(h, q);
+        if (item.sortTime < floorSec) { reachedFloor = true; break; }
+        out.uncompleted.items.push(item);
+        inWindow++;
+      }
+      if (reachedFloor || headlines.length === 0 || start + headlines.length > count) break;
+      start += headlines.length;
+    }
+    out.uncompleted.count += inWindow;
+    if (truncated) {
+      // 打ち切り時は「残りが窓内か窓外か」が分からない。未読の窓内案件を
+      // olderCount (過去分) に混ぜて過少表示しない (Codexレビュー3巡目 High)
+      out.uncompleted.truncated = true;
+    } else {
+      out.uncompleted.olderCount += Math.max(0, (total ?? 0) - inWindow);
+    }
+    console.log(`[yahoo-inquiry] ${label}: 窓内(${windowDays}日) ${inWindow}件 / 全体 ${total ?? 0}件${truncated ? ' (上限打ち切り)' : ''}`);
   }
 
   // shp と auc を混ぜて新しい順に (通知は最新のものから載せる)
@@ -243,10 +328,13 @@ function itemLine(it, kind) {
 }
 
 /**
- * 通知本文を組み立てる。**両方0件なら null** (該当ゼロは通知しない仕様 —
- * 「通知が来た = 何か対応が必要」と分かるようにする。実行の生存確認は daily-sync 側が担う)。
+ * 通知本文を組み立てる。**未返信と窓内の完了処理待ちが両方0件なら null**
+ * (該当ゼロは通知しない仕様 — 「通知が来た = 何か対応が必要」と分かるようにする。
+ * 実行の生存確認は daily-sync 側が担う)。
+ * 窓外の過去分 (olderCount) だけでは通知しない — 毎朝同じ件数を言い続けても
+ * 読み手が麻痺するだけなので、要対応が出た通知に件数だけ添える。
  */
-export function buildMessage({ unanswered, uncompleted }) {
+export function buildMessage({ unanswered, uncompleted, windowDays = DEFAULT_WINDOW_DAYS, maxPages = MAX_PAGES_PER_QUERY }) {
   const total = unanswered.count + uncompleted.count;
   if (total === 0) return null;
 
@@ -262,9 +350,17 @@ export function buildMessage({ unanswered, uncompleted }) {
 
   if (uncompleted.count > 0) {
     lines.push('');
-    lines.push(`🟡 返信済みだが「完了する」が押されていない: *${uncompleted.count}件*`);
+    lines.push(`🟡 返信済みだが「完了する」が押されていない (直近${windowDays}日): *${uncompleted.count}件*`);
     for (const it of uncompleted.items.slice(0, MAX_SHOW)) lines.push(itemLine(it, 'uncompleted'));
     if (uncompleted.count > MAX_SHOW) lines.push(`  …他 ${uncompleted.count - MAX_SHOW}件`);
+  }
+
+  if (uncompleted.truncated) {
+    lines.push(`  ⚠️ 読み込み上限 (1照会あたり${maxPages * 20}件) で打ち切りました。実際はこれより多い可能性があります`);
+  }
+  if (uncompleted.olderCount > 0) {
+    lines.push('');
+    lines.push(`※ このほか ${windowDays}日より前の完了処理漏れが ${uncompleted.olderCount}件あります (過去分はまとめて完了処理を)`);
   }
 
   lines.push('');
