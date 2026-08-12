@@ -51,8 +51,17 @@
     }
     /* 次のロケーションの予告 (歩き出す方向を先に決められる)。チラ見で読める太さ・大きさに */
     #nextloc {
-      text-align: center; font-size: 21px; font-weight: 700; color: #74c0fc; padding: 0 8px 2px;
+      text-align: center; font-size: 21px; font-weight: 700; color: #f1f3f5; padding: 2px 8px;
       font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
+    }
+    /* ロケ色分け (2026-08-12 中原さん採用):
+       背景色=棚 (今と次が同じ色=同じ棚=近い、色が違う=移動が来る、を読まずに判断できる)
+       左帯=ブロック (P3FA等は4つしかないので「この色=このブロック」を覚えられる。
+       棚色が変わって左帯まで変わったら別ブロックへの大移動の予告)
+       右帯は透明のダミー (左帯の分だけ中央がずれないよう左右対称にする) */
+    #loc, #nextloc {
+      margin: 0 10px; border-radius: 10px;
+      border-left: 10px solid transparent; border-right: 10px solid transparent;
     }
     /* 画像は縦持ちでは高さ約24%に抑える (商品名2行の確保が最優先 — 実機FB) */
     #imgbox {
@@ -311,6 +320,46 @@
       return m ? { main: m[1], suffix: m[2] } : { main: name, suffix: '' };
     }
 
+    // ── ロケ色分け (2026-08-12 中原さん採用。ラベル形式 = ブロック-棚3桁-連3桁-段2桁) ──
+    // 背景色 = 棚番号 mod 8。連続する棚番号 (002→003) が必ず別色になるので、ルート上の
+    // 「棚が変わった」がほぼ確実に色変化として見える。8色では「色→棚」の暗記は成立しないが、
+    // 狙いは暗記ではなく「今と次が同じ色か」の比較判断 (色覚多様性を考慮し隣接indexは色相を離す)。
+    // 白太字 (大サイズ) が読めるようダーク寄りの色のみ。テキストが常に主役で色は補助。
+    const SHELF_BG = [
+      '#1864ab', // 青
+      '#9c5700', // 橙
+      '#6741d9', // 紫
+      '#6e6600', // オリーブ
+      '#0b7285', // ティール
+      '#a61e4d', // マゼンタ
+      '#2f7d32', // 緑
+      '#545b62', // グレー
+    ];
+    // 左帯 = ブロック。実在ブロックは4つ (2026-08-12 実データ) なので固定の明色で「覚える」が成立する。
+    // 未知のブロックが増えても文字列ハッシュで安定した色が付く (再デプロイ不要)
+    const KNOWN_BLOCKS = ['P3FA', 'P3FB', 'P3FD', 'P3FF'];
+    const BLOCK_COLORS = ['#ffa94d', '#4dabf7', '#69db7c', '#e599f7', '#ffd43b', '#ff8787'];
+    function blockColor(block) {
+      let i = KNOWN_BLOCKS.indexOf(block);
+      if (i === -1) {
+        let h = 5381;
+        for (const c of block) h = (h * 33 + c.charCodeAt(0)) >>> 0;
+        i = h % BLOCK_COLORS.length;
+      }
+      return BLOCK_COLORS[i % BLOCK_COLORS.length];
+    }
+    // 「次 → P3FB-002-016-04」のような接頭辞付きでも拾えるよう末尾アンカーのみ。
+    // 形式外のラベル (8桁でない生ロケ等) は null → 無着色で従来表示のまま (fail-soft)
+    function locParts(label) {
+      const m = /(?:^|[ →])(?:(\S+)-)?(\d{3})-\d{3}-\d{2}$/.exec(String(label || ''));
+      return m ? { block: m[1] || null, shelf: parseInt(m[2], 10) } : null;
+    }
+    function paintLoc(el, label) {
+      const p = locParts(label);
+      el.style.backgroundColor = p ? SHELF_BG[p.shelf % SHELF_BG.length] : '';
+      el.style.borderLeftColor = (p && p.block) ? blockColor(p.block) : 'transparent';
+    }
+
     function render() {
       const idx = currentIdx();
       const done = LINES.filter((l) => l.status !== 'pending').length;
@@ -327,9 +376,11 @@
       if (!started) { show('scr-start'); return; }
       const l = LINES[idx];
       $('loc').textContent = l.loc;
+      paintLoc($('loc'), l.loc);
       fitText($('loc'));
       const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
       $('nextloc').textContent = next ? `次 → ${next.loc}` : 'これが最後の商品';
+      paintLoc($('nextloc'), next ? next.loc : null);
       renderImage(l);
       $('qty').innerHTML = `<span class="x">×</span>${l.qty}`;
       $('qty').className = l.qty >= 2 ? 'multi' : '';
