@@ -329,7 +329,7 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
 // イベント種別 (PR2): start / next / back / complete は next の最終行で自動。
 // shortage / pause / resume / cancel は PR4 で追加する。
 
-const WORK_EVENTS = ['start', 'next', 'back'];
+const WORK_EVENTS = ['start', 'next', 'back', 'takeover'];
 
 /** 作業画面の現在状態。currentSeq = 次にピックする明細 (null = 全て完了)。 */
 export function getWorkState(batchId) {
@@ -413,7 +413,16 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId }
     }
 
     let transition = null;   // started / completed / reopened (Notion連携のトリガ)
-    if (event === 'start') {
+    if (event === 'takeover') {
+      // 担当者の交代 (選び間違い・実際の引き継ぎ)。picking 中のみ。
+      // 排他 (taken) の唯一の正規の突破口で、イベントに交代の記録が残る
+      if (batch.status !== 'picking') {
+        throw new PkError(409, 'not_picking', `作業中ではないため交代できません (${batch.status})`);
+      }
+      if (batch.worker !== worker) {
+        db.prepare('UPDATE pk_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
+      }
+    } else if (event === 'start') {
       if (batch.status === 'picking') {
         if (batch.worker !== worker) {
           throw new PkError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);

@@ -137,7 +137,7 @@
   <div class="bar">
     <a href="/apps/picking/">← 一覧</a>
     <span id="progress"></span>
-    <span id="clock"></span>
+    <span><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
@@ -183,6 +183,8 @@
     <div class="center">
       <h2>作業中のバッチです</h2>
       <div class="meta" id="blockedMsg"></div>
+      <button class="bigbtn" id="takeoverBtn" style="background:#e8590c;">交代して続ける</button>
+      <div class="meta" style="font-size:13px;">担当を選び間違えたときや、実際に人が替わったときに使います</div>
     </div>
   </div>
 
@@ -467,8 +469,12 @@
       $('clock').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     }, 1000);
 
-    // ── 初期化 ──
+    // ── 初期化・作業者交代 ──
+    function refreshWorkerTag() {
+      $('workerTag').textContent = ME ? `👤${ME}` : '';
+    }
     function boot() {
+      refreshWorkerTag();
       if (BATCH.status === 'picking' && BATCH.worker && BATCH.worker !== ME && queue.length === 0) {
         $('blockedMsg').textContent = `${BATCH.worker} さんが作業中です`;
         show('scr-blocked');
@@ -478,15 +484,48 @@
       flush();
       render();
     }
+
+    // 選択シートは2モード: boot=これから作業する人を選ぶ / takeover=作業中の担当を交代する
+    let pickMode = 'boot';
+    function openPicker(mode) { pickMode = mode; $('workerPick').style.display = 'flex'; }
+
+    async function doTakeover() {
+      try {
+        const res = await fetch(`/apps/picking/api/batches/${BATCH.id}/events`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ op_id: opId(), event: 'takeover', worker_code: workerCode() }),
+        });
+        if (res.ok) {
+          BATCH.worker = ME;
+          boot();
+        } else {
+          const b = await res.json().catch(() => ({}));
+          alert(b.error || '交代に失敗しました');
+        }
+      } catch {
+        alert('通信エラーです。電波のある場所でもう一度お試しください');
+      }
+    }
+
     document.querySelectorAll('.worker-opt').forEach((btn) => btn.addEventListener('click', () => {
       localStorage.setItem('pk_worker_code', btn.dataset.code);
       localStorage.setItem('pk_worker_name', btn.dataset.name);
       ME = btn.dataset.name;
       $('workerPick').style.display = 'none';
-      boot();
+      refreshWorkerTag();
+      if (pickMode === 'takeover') doTakeover();
+      else boot();
     }));
+
+    $('takeoverBtn').addEventListener('click', () => openPicker('takeover'));
+    // 作業中に👤タグをタップ → 交代 (開始前なら単なる選び直し)
+    $('workerTag').addEventListener('click', () => {
+      openPicker(BATCH.status === 'picking' ? 'takeover' : 'boot');
+    });
+
     if (DEVICE_MODE && !ME) {
-      $('workerPick').style.display = 'flex';   // 作業者を選んでから boot する
+      openPicker('boot');   // 作業者を選んでから boot する
     } else {
       boot();
     }

@@ -197,6 +197,31 @@ t('back: undo_op_id 無し/古い完了を指す back は stale_back (別端末�
   assert.equal(r.currentSeq, 1);
 });
 
+t('takeover: 作業中の担当者を交代できる (選び間違いの救済)', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  // W2はそのままでは操作できない
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: 2 }, W2), 'taken');
+  // 交代 → W2が続きを操作でき、W1は逆にブロックされる
+  const r = applyEvent(id, { opId: op(), event: 'takeover' }, W2);
+  assert.equal(r.batchStatus, 'picking');
+  assert.equal(getWorkState(id).batch.worker, W2);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 2 }, W2);
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: 3 }, W1), 'taken');
+  // 同一人の takeover は無害 (no-op)
+  applyEvent(id, { opId: op(), event: 'takeover' }, W2);
+  assert.equal(getWorkState(id).batch.worker, W2);
+});
+
+t('takeover: 未開始/完了後は not_picking', () => {
+  const id = makeBatch();
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'takeover' }, W1), 'not_picking');
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  for (const seq of [1, 2, 3]) applyEvent(id, { opId: op(), event: 'next', lineSeq: seq }, W1);
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'takeover' }, W2), 'not_picking');
+});
+
 t('op_conflict: 同一op_idを別内容で使い回すと409', () => {
   const id = makeBatch();
   const o = op();
