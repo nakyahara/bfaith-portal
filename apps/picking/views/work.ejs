@@ -146,7 +146,7 @@
   <div class="bar">
     <a href="/apps/picking/">← 一覧</a>
     <span id="progress"></span>
-    <span><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
+    <span><button id="voiceBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🔇</button><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
@@ -349,15 +349,52 @@
       return BLOCK_COLORS[i % BLOCK_COLORS.length];
     }
     // 「次 → P3FB-002-016-04」のような接頭辞付きでも拾えるよう末尾アンカーのみ。
-    // 形式外のラベル (8桁でない生ロケ等) は null → 無着色で従来表示のまま (fail-soft)
+    // 形式外のラベル (8桁でない生ロケ等) は null → 無着色・そのまま読み上げ (fail-soft)
     function locParts(label) {
-      const m = /(?:^|[ →])(?:(\S+)-)?(\d{3})-\d{3}-\d{2}$/.exec(String(label || ''));
-      return m ? { block: m[1] || null, shelf: parseInt(m[2], 10) } : null;
+      const m = /(?:^|[ →])(?:(\S+)-)?(\d{3})-(\d{3})-(\d{2})$/.exec(String(label || ''));
+      return m
+        ? { block: m[1] || null, shelf: parseInt(m[2], 10), ren: parseInt(m[3], 10), dan: parseInt(m[4], 10) }
+        : null;
     }
     function paintLoc(el, label) {
       const p = locParts(label);
       el.style.backgroundColor = p ? SHELF_BG[p.shelf % SHELF_BG.length] : '';
       el.style.borderLeftColor = (p && p.block) ? blockColor(p.block) : 'transparent';
+    }
+
+    // ── 音声読み上げ (2026-08-12 中原さん要望): ロケと数量を耳で受け取り、画面を見ずに歩き出せる ──
+    // 読み上げ = 「(ブロックが変わった時だけ) ブロック名、」+「棚の連の段、N個」。
+    // 毎回フルコードを読むと冗長なので、色分けと同じ思想で「変わった時だけブロックを言う」。
+    // iOS制約: 初回speakはユーザー操作起点が必要 → トグル押下/最初のタップでアンロックする。
+    // ⚠ サイレントスイッチONのiPhoneは読み上げも消音される (倉庫端末は音量ON運用が前提)
+    let voiceOn = localStorage.getItem('pk_voice') === '1';
+    let lastSpokenSeq = null;
+    let lastSpokenBlock = null;
+    function speak(text) {
+      if (!('speechSynthesis' in window)) return;
+      try {
+        speechSynthesis.cancel();   // 前の読み上げが残っていたら打ち切って最新を優先
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = 'ja-JP';
+        u.rate = 1.1;
+        speechSynthesis.speak(u);
+      } catch { /* 読み上げは補助機能。失敗しても画面表示があるので無音のまま続行 */ }
+    }
+    function speakLine(l, force) {
+      if (!voiceOn || !l) return;
+      if (!force && l.seq === lastSpokenSeq) return;   // 同じ明細の再render (画像後追い等) では繰り返さない
+      const p = locParts(l.loc);
+      let text;
+      if (p) {
+        // ブロック名は1文字ずつ区切って「ピー サン エフ ビー」と読ませる
+        const blockPart = (p.block && p.block !== lastSpokenBlock) ? `${p.block.split('').join(' ')}、` : '';
+        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${l.qty}個`;
+      } else {
+        text = `${l.loc}、${l.qty}個`;   // 形式外ラベルはそのまま
+      }
+      speak(text);
+      lastSpokenSeq = l.seq;
+      if (p && p.block) lastSpokenBlock = p.block;
     }
 
     function render() {
@@ -377,6 +414,7 @@
       const l = LINES[idx];
       $('loc').textContent = l.loc;
       paintLoc($('loc'), l.loc);
+      speakLine(l);
       fitText($('loc'));
       const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
       $('nextloc').textContent = next ? `次 → ${next.loc}` : 'これが最後の商品';
@@ -410,6 +448,8 @@
     });
 
     function renderDone() {
+      // 作業からの遷移時のみ完了を読み上げ (完了済みバッチを開いただけでは喋らない)
+      if (voiceOn && lastSpokenSeq != null) { speak('ピッキング完了'); lastSpokenSeq = null; }
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;
       const secs = startMs ? Math.max(0, Math.round((Date.now() - startMs) / 1000)) : null;
       const perLine = secs != null && LINES.length > 0 ? (secs / LINES.length).toFixed(1) : '-';
@@ -472,6 +512,32 @@
     }
     $('backBtn').addEventListener('click', doBack);
     $('undoDoneBtn').addEventListener('click', doBack);
+
+    // ── 読み上げトグル (端末ごとに localStorage 保存) ──
+    function renderVoiceBtn() {
+      $('voiceBtn').textContent = voiceOn ? '🔊' : '🔇';
+      $('voiceBtn').style.opacity = voiceOn ? '1' : '0.4';
+    }
+    renderVoiceBtn();
+    $('voiceBtn').addEventListener('click', () => {
+      voiceOn = !voiceOn;
+      localStorage.setItem('pk_voice', voiceOn ? '1' : '0');
+      renderVoiceBtn();
+      if (!voiceOn) { try { speechSynthesis.cancel(); } catch {} return; }
+      // ONにしたタップ自体が iOS のアンロックを兼ねる。作業中なら今の明細をすぐ読み上げて確認させる
+      lastSpokenSeq = null;
+      lastSpokenBlock = null;
+      const idx = currentIdx();
+      if (started && idx !== -1 && $('scr-pick').classList.contains('active')) speakLine(LINES[idx]);
+      else speak('読み上げオン');
+    });
+    // ロケ表示のタップで再読み上げ (聞き逃し対策。ブロック名も含めて読み直す)
+    $('loc').addEventListener('click', () => {
+      const idx = currentIdx();
+      if (voiceOn && started && idx !== -1) { lastSpokenBlock = null; speakLine(LINES[idx], true); }
+    });
+    // 読み上げONのまま再読込した端末は、最初のタップ (capture=ボタン処理より先) で無音アンロック
+    document.addEventListener('click', () => { if (voiceOn) speak(''); }, { once: true, capture: true });
 
     // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
     let shortTarget = null;
