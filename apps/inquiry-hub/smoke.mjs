@@ -4,8 +4,9 @@
 import fs from 'fs';
 import path from 'path';
 import { initInquiryHubDB, getDB, logActivity, toUtcIso } from './db.js';
-import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE, STATUSES, INBOX_STATUSES } from './queries.js';
-import { parseCsv, importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE, STATUSES, INBOX_STATUSES,
+  CH_GROUPS, countByChTab } from './queries.js';
+import { parseCsv, importTemplatesCsv, importQaCsv, listTemplates, listQa, getTemplate } from './templates.js';
 import { purgeDemo } from './scripts/purge-demo.mjs';
 
 const T = s => toUtcIso(s); // fixture はJSTで書き、保存は正準形式 (UTC 'YYYY-MM-DDTHH:MM:SSZ')
@@ -191,6 +192,28 @@ console.log('4b. 受信箱ビュー');
   db.prepare('DELETE FROM shops WHERE id = ?').run(shopV);
 }
 
+// ─── 4c. 上部チャネルタブ (2026-08-12 スタッフ要望: メール/問い合わせ×新着を常時表示) ───
+console.log('4c. 上部チャネルタブ (?ch=)');
+{
+  // fixture: inq1=email/open, inq2=rakuten/in_progress, inq3=email/done
+  check('CH_GROUPS 定義 (mail=email / inq=楽天+Yahoo!)',
+    JSON.stringify(CH_GROUPS.mail.channels) === '["email"]'
+    && JSON.stringify(CH_GROUPS.inq.channels) === '["rakuten","yahoo"]');
+  check('ch=mail はメールのみ', listInquiries({ view: 'all', ch: 'mail' }).total === 2);
+  check('ch=inq はモール問い合わせのみ', listInquiries({ view: 'all', ch: 'inq' }).total === 1
+    && listInquiries({ view: 'all', ch: 'inq' }).rows[0].id === inq2);
+  check('ch=inq はビューとAND (対応中も新着タブに入る)', listInquiries({ view: 'inbox', ch: 'inq' }).total === 1);
+  check('不正な ch は全チャネル扱い + 正規化 (ch="")',
+    listInquiries({ view: 'all', ch: 'bogus' }).total === 3
+    && listInquiries({ view: 'all', ch: 'bogus' }).ch === ''
+    && listInquiries({ view: 'all', ch: 'mail' }).ch === 'mail');
+  const tc = countByChTab();
+  check('countByChTab: mail={新着1,処理中0,完了1}',
+    tc.mail.inbox === 1 && tc.mail.sent === 0 && tc.mail.done === 1);
+  check('countByChTab: inq={新着1,処理中0,完了0} (in_progressも新着に数える)',
+    tc.inq.inbox === 1 && tc.inq.sent === 0 && tc.inq.done === 0);
+}
+
 // ─── 5. フィルタ用マスタ・詳細 ───
 console.log('5. フィルタ用マスタ・詳細');
 const fo = listFilterOptions();
@@ -216,6 +239,9 @@ check('詳細: 非整数は null', getInquiryDetail(NaN) === null);
   check('前後ナビ: 末尾行は next なし', last.prev?.id === inq1 && last.next === null);
   const inbox = getAdjacentInquiries(inq1, { view: 'inbox' });
   check('前後ナビ: ビュー絞り込みを反映 (完了は隣に出ない)', inbox.prev?.id === inq2 && inbox.next === null);
+  // チャネルタブ (?ch=) も文脈として反映 (メールタブから開いたら隣もメールだけ)
+  const chMail = getAdjacentInquiries(inq1, { view: 'all', ch: 'mail' });
+  check('前後ナビ: ch=mail は楽天を飛ばす', chMail.prev === null && chMail.next?.id === inq3);
   check('前後ナビ: 存在しないidは両方null',
     JSON.stringify(getAdjacentInquiries(99999)) === JSON.stringify({ prev: null, next: null })
     && JSON.stringify(getAdjacentInquiries(NaN)) === JSON.stringify({ prev: null, next: null }));
@@ -305,6 +331,16 @@ check('手動追加分は再取込の影響なし (partial unique index)',
 
 const lt = listTemplates({ q: 'キャンセル' });
 check('listTemplates 検索', lt.rows.length === 1 && lt.categories.length === 1);
+
+// 返信エディタの「テンプレートを本文へ反映」用 (2026-08-12 スタッフ要望)
+{
+  const t977 = getTemplate(tpl977.id);
+  check('getTemplate: 本文と下部 (署名) を返す', t977 && t977.template_body === '本文です\n2行目' && t977.body_bottom === '署名');
+  check('getTemplate: 不存在/非整数は null', getTemplate(999999) === null && getTemplate(NaN) === null && getTemplate('977') === null);
+  db.prepare("UPDATE reply_templates SET is_active = 0 WHERE id = ?").run(tpl977.id);
+  check('getTemplate: 論理削除済みは null', getTemplate(tpl977.id) === null);
+  db.prepare("UPDATE reply_templates SET is_active = 1 WHERE id = ?").run(tpl977.id);
+}
 
 // 論理削除は再取込で復活する (is_active=1 に戻す仕様)
 db.prepare("UPDATE reply_templates SET is_active = 0 WHERE external_id = '977'").run();

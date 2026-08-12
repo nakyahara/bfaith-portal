@@ -9,6 +9,15 @@ export const CHANNELS = {
   yahoo:   { label: 'Yahoo!', badge: 'background:#fef3c7;color:#92400e' },
 };
 /**
+ * 上部タブのチャネル群 (2026-08-12 スタッフ要望: メールディーラーと同じく
+ * 「メールの新着」「問い合わせの新着」をタブで常時表示してワンクリック切替)。
+ * mail=メール / inq=モール問い合わせ (楽天R-Messe + Yahoo!)。?ch= で一覧に効く
+ */
+export const CH_GROUPS = {
+  mail: { label: 'メール',     icon: '✉️', channels: ['email'] },
+  inq:  { label: '問い合わせ', icon: '💬', channels: ['rakuten', 'yahoo'] },
+};
+/**
  * ステータス (メールディーラー準拠。2026-07-25 中原さん要望)
  *   新着       … 顧客から来てまだ返信していない = 自分のタスク
  *   対応中/保留 … 新着の内訳 (調査中・社内確認待ちなど。任意で使う)
@@ -87,6 +96,13 @@ export function listInquiries(q = {}) {
   const view = VIEWS[q.view] ? q.view : DEFAULT_VIEW;
   where.push(VIEWS[view].where);
 
+  // 上部タブのチャネル群 (mail/inq)。未知の値は「全チャネル」扱い
+  const ch = CH_GROUPS[q.ch] ? q.ch : '';
+  if (ch) {
+    where.push(`i.channel_type IN (${CH_GROUPS[ch].channels.map(() => '?').join(',')})`);
+    params.push(...CH_GROUPS[ch].channels);
+  }
+
   if (q.status && STATUSES[q.status]) { where.push('i.internal_status = ?'); params.push(q.status); }
   if (q.channel && CHANNELS[q.channel]) { where.push('i.channel_type = ?'); params.push(q.channel); }
   if (q.shop && /^\d+$/.test(String(q.shop))) { where.push('i.shop_id = ?'); params.push(Number(q.shop)); }
@@ -125,7 +141,27 @@ export function listInquiries(q = {}) {
     WHERE ${where.join(' AND ')}
     ORDER BY COALESCE(i.last_message_at, i.received_at) DESC, i.id DESC
     LIMIT ? OFFSET ?`).all(...params, PAGE_SIZE, (page - 1) * PAGE_SIZE);
-  return { rows, total, page, pages: Math.max(1, Math.ceil(total / PAGE_SIZE)), view };
+  return { rows, total, page, pages: Math.max(1, Math.ceil(total / PAGE_SIZE)), view, ch };
+}
+
+/**
+ * 上部タブの件数 ({ mail: {inbox, sent, done}, inq: {...} })。
+ * 「今どこに何件来ているか」を常時表示するため、一覧描画のたびに数える (単純GROUP BY 1本)
+ */
+export function countByChTab() {
+  const db = getDB();
+  const out = {};
+  for (const g of Object.keys(CH_GROUPS)) out[g] = { inbox: 0, sent: 0, done: 0 };
+  const rows = db.prepare(`SELECT channel_type, internal_status, COUNT(*) AS c
+    FROM inquiries WHERE is_archived = 0 GROUP BY channel_type, internal_status`).all();
+  for (const r of rows) {
+    const g = Object.keys(CH_GROUPS).find(k => CH_GROUPS[k].channels.includes(r.channel_type));
+    if (!g) continue;
+    if (INBOX_STATUSES.includes(r.internal_status)) out[g].inbox += r.c;
+    else if (r.internal_status === 'waiting_reply') out[g].sent += r.c;
+    else if (r.internal_status === 'done') out[g].done += r.c;
+  }
+  return out;
 }
 
 /** サイドバーのビュー別件数 (未アーカイブのみ) */
@@ -151,7 +187,7 @@ export function listFilterOptions() {
  * 詳細画面の前後ナビ (2026-08-10 スタッフ要望)。一覧と同じ並び順
  * (COALESCE(last_message_at, received_at) DESC, id DESC) で、いま表示中の問い合わせの
  * 1つ上 (prev = より新しい) / 1つ下 (next = より古い) を返す。
- * 詳細URLに引き継がれる文脈は view / folder のみなので、隣接判定もその2つに絞る
+ * 詳細URLに引き継がれる文脈は view / ch / folder のみなので、隣接判定もその3つに絞る
  * (検索語・店舗などの絞り込みまでは追わない)。received_at は NOT NULL なのでキーは常に非NULL。
  */
 export function getAdjacentInquiries(id, q = {}) {
@@ -164,6 +200,10 @@ export function getAdjacentInquiries(id, q = {}) {
   const params = [];
   const view = VIEWS[q.view] ? q.view : DEFAULT_VIEW;
   where.push(VIEWS[view].where);
+  if (CH_GROUPS[q.ch]) {
+    where.push(`i.channel_type IN (${CH_GROUPS[q.ch].channels.map(() => '?').join(',')})`);
+    params.push(...CH_GROUPS[q.ch].channels);
+  }
   if (/^\d+$/.test(String(q.folder || ''))) { where.push('i.folder_id = ?'); params.push(Number(q.folder)); }
   const KEY = 'COALESCE(i.last_message_at, i.received_at)';
   const pick = (cmp, order) => db.prepare(`
