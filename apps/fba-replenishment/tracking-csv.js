@@ -272,9 +272,12 @@ export function buildAssignments(rows, shipments, opts = {}) {
   // どの納品にも割り当てられなかった行 (納品番号が入っているのに該当shipmentが無い等)
   // 🚨お客様管理番号に値があるのに該当する納品が無い = 転記違い・プラン取得漏れ・古い行の混入。
   //   「FBA以外の便」と同じ扱い (黙って除外) にすると、取り違えたまま他の納品だけ登録してしまう。
+  //   ただし「登録済みでスキップした納品」の行は正常 (画面から入力済みなだけ) なので騒がない。
+  const skippedIds = new Set(skipped.map((s) => s.shipmentConfirmationId));
   const orphans = new Map();
   units.forEach((u, i) => {
     if (usedUnits.has(i) || !u.納品番号) return; // 管理番号が空の行は ② で excluded 済み
+    if (skippedIds.has(u.納品番号)) return; // skipped として通知に出るのでここでは中断しない
     orphans.set(u.納品番号, (orphans.get(u.納品番号) ?? 0) + 1);
   });
   for (const [no, n] of orphans) {
