@@ -13,6 +13,11 @@
  * Phase 2 (未実装): CSVが無いフォルダのピッキングリストPDF (TMP1) フォールバック (手動引当対応)。
  * ポーラーは standalone (ミニPC) だけが起動する。portal (Render) は手動ボタンのみ。
  * 定期実行の台帳: config/jobs-registry.mjs の picking-drive-poller を参照。
+ *
+ * ⚠ 多重プロセス排他は持たない (Codex指摘を設計判断として受容): PickingServer は
+ * winsw のシングルトンサービスで、再起動は stop→start (旧新プロセスが重ならない)。
+ * 万一並行しても importBatch 側の tb_no+ハッシュ冪等で二重バッチにはならない
+ * (台帳の attempts が実際より増えるだけ)。
  */
 import {
   listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
@@ -86,10 +91,15 @@ export async function pollOnce(deps = {}) {
     list({ folders, nameContains: 'ピッキングリスト' }),
     list({ folders, nameContains: '引当パターン_' }),
   ]);
+  // フォルダごとに「最新の」txtを採用する。一覧は更新日時降順なので最初の1件を保持
+  // (Map#setで上書きすると最古が勝ってしまい、POST済みの正しい分類と食い違って
+  // ready バッチを誤上書きし得る — Codex high)
   const patternByFolder = new Map();
   for (const t of txtFiles) {
     const p = patternFromTxtName(t.filename);
-    if (p && t.parent_name) patternByFolder.set(t.parent_name, p);
+    if (p && t.parent_name && !patternByFolder.has(t.parent_name)) {
+      patternByFolder.set(t.parent_name, p);
+    }
   }
 
   const candidates = pickPollCandidates(csvFiles);
@@ -115,6 +125,11 @@ export async function pollOnce(deps = {}) {
       const dl = await (deps.download || ((a) => downloadDriveFileById(a)))({
         fileId: f.file_id, folderIds: folders.map((x) => x.folder_id),
       });
+      // 選定後にファイルが更新されていたら、この周期では取り込まない
+      // (安定待ちのすり抜け防止 + 台帳に「旧版の時刻で新版の内容」を記録しない — Codex high)
+      if (dl.modified_time && dl.modified_time !== f.modified_time) {
+        continue;   // 次周期に新しい modified_time の版として改めて評価される
+      }
       const preview = parseCs03002(dl.buffer);
       const folderName = /^出荷_\d+$/.test(f.parent_name || '') ? f.parent_name : null;
       const pattern = (folderName && patternByFolder.get(folderName))
@@ -122,11 +137,13 @@ export async function pollOnce(deps = {}) {
       const result = importBatch(preview, {
         hikiateClass: pattern, folderName, overwrite: true,
       }, 'drive-poller');
-      queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
+      // 台帳の成功記録を画像キュー投入より先に行う (後段の例外で「取込済みなのにfailed」に
+      // ならないように — Codex medium)
       upsertLedger.run({
         drive_file_id: f.file_id, modified_time: f.modified_time, filename: f.filename,
         folder_name: folderName, status: 'imported', error: null, batch_id: result.batchId, now,
       });
+      queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
       if (result.replayed) stats.replayed++;
       else {
         stats.imported++;
