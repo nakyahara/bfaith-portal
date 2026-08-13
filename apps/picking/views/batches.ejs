@@ -83,6 +83,7 @@
         <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
       </form>
       <span class="muted"><%= batches.length %> バッチ</span>
+      <button id="refreshBtn" type="button" style="margin-left:auto; padding:8px 18px; font-size:15px; border:1px solid #ced4da; border-radius:8px; background:#fff; cursor:pointer;">🔄 更新</button>
     </div>
 
     <% if (batches.length === 0) { %>
@@ -159,6 +160,19 @@
       goWork();
     }));
     $('pickCancel').addEventListener('click', () => { $('workerPick').style.display = 'none'; });
+
+    // ── 一覧の更新 (RPA取込は随時来るため、開きっぱなしでも追従する) ──
+    $('refreshBtn').addEventListener('click', () => location.reload());
+    // 60秒ごとに自動リロード (画面が見えているとき・担当者選択シートが開いていないときだけ)
+    setInterval(() => {
+      const pickOpen = $('workerPick') && $('workerPick').style.display === 'flex';
+      if (document.visibilityState === 'visible' && !pickOpen) location.reload();
+    }, 60000);
+    // PWA復帰・タブ復帰の瞬間にも最新化 (読込から30秒以上経過時)
+    const loadedAt = Date.now();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && Date.now() - loadedAt > 30000) location.reload();
+    });
   </script>
 </body>
 </html>
