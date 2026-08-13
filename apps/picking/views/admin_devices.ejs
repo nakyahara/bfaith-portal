@@ -79,8 +79,12 @@
       <div class="pk-row-inline" style="margin-bottom:10px">
         <input type="text" id="workerName" placeholder="作業者名 (例: 星)" maxlength="20">
         <button id="addWorkerBtn" type="button">追加</button>
+        <button id="importNotionBtn" type="button">Notionから取込</button>
         <span id="workerMsg" class="pk-msg"></span>
       </div>
+      <p class="hint" style="font-size:0.82em; color:#495057; margin:0 0 10px;">
+        「Notionから取込」= スタッフ用デイリー業務の「ピッキング担当者」の選択肢を追加します
+        (表記をNotionと揃えると、カードの担当者が自動でセットされます)</p>
       <table class="pk-list">
         <thead><tr><th>コード</th><th>名前</th><th></th></tr></thead>
         <tbody>
@@ -122,6 +126,14 @@
       const { ok } = await post(`/apps/picking/admin/devices/${btn.dataset.id}/revoke`);
       if (ok) location.reload();
     }));
+
+    $('importNotionBtn').addEventListener('click', async () => {
+      $('workerMsg').textContent = '取込中…'; $('workerMsg').className = 'pk-msg';
+      const { ok, body } = await post('/apps/picking/admin/workers/import-notion');
+      if (!ok) { $('workerMsg').textContent = body.error || '失敗しました'; $('workerMsg').className = 'pk-msg err'; return; }
+      alert(body.added.length > 0 ? `追加: ${body.added.join('、')}` : '追加はありません (すべて登録済み)');
+      location.reload();
+    });
 
     $('addWorkerBtn').addEventListener('click', async () => {
       const name = $('workerName').value.trim();

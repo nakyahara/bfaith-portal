@@ -438,6 +438,7 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
       }
       if (batch.worker !== worker) {
         db.prepare('UPDATE pk_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
+        transition = 'takeover';   // Notionのピッキング担当者を追従させる (ステータスは現状維持)
       }
     } else if (event === 'pause') {
       // 中断: 中断時間はピッキング時間から除外する (要件§5.6)

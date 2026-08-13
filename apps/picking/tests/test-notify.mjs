@@ -106,4 +106,25 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: LINE webhook 署名検証 (secret必須・改ざん拒否) (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 5} 件 pass`);
+// ─── Notionカードのproperties組み立て (担当者連携) ───
+{
+  const { buildCardProperties } = await import('../notion.js');
+  const schema = {
+    titleProp: '名前',
+    statusProp: { name: 'ステータス', type: 'select' },
+    workerProp: { name: 'ピッキング担当者', type: 'select' },
+  };
+  const p1 = buildCardProperties(schema, 'ピッキング中', '星');
+  assert.deepEqual(p1['ステータス'], { select: { name: 'ピッキング中' } });
+  assert.deepEqual(p1['ピッキング担当者'], { select: { name: '星' } });
+  // email (セッションログイン) は選択肢を増殖させないため設定しない
+  const p2 = buildCardProperties(schema, 'ピッキング完了', 'd.nakahara@b-faith.biz');
+  assert.equal(p2['ピッキング担当者'], undefined);
+  // workerProp が無いDBでも動く / status型のDBにも対応
+  const p3 = buildCardProperties({ titleProp: '名前', statusProp: { name: 'ステータス', type: 'status' }, workerProp: null }, '完了', '星');
+  assert.deepEqual(p3['ステータス'], { status: { name: '完了' } });
+  assert.equal(Object.keys(p3).length, 1);
+  console.log('  ok: buildCardProperties (担当者select・email除外・status型対応) (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 6} 件 pass`);

@@ -26,7 +26,7 @@ import {
 } from './service.js';
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
-import { enqueueBatchSync, STATUS_PICKING, STATUS_PICKED } from './notion.js';
+import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { queueEnsureImages, getImageMap } from './images.js';
 import {
   listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
@@ -282,6 +282,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         folderName: b.folder_name,
         workDate: b.work_date,   // 日跨ぎ作業でも取込日のカードを動かす
         label: NOTION_STATUS_BY_BATCH[b.status] || null,
+        workerName: b.worker,    // ピッキング担当者selectへ (email形式は notion.js 側で除外)
       };
     });
   }
@@ -381,6 +382,26 @@ router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) =>
 router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {
   if (!revokeDevice(Number(req.params.id))) throw new PkError(404, 'not_found', '端末が見つかりません');
   res.json({ ok: true });
+}));
+
+/**
+ * Notionの「ピッキング担当者」selectの選択肢を作業者マスタへ取り込む
+ * (名前の表記をNotionと完全一致させる = カード連携で選択肢が増殖しない)。
+ */
+router.post('/admin/workers/import-notion', checkOrigin, requireAdmin, api(async (req, res) => {
+  if (!process.env.PICKING_NOTION_TOKEN) {
+    throw new PkError(400, 'notion_disabled', 'PICKING_NOTION_TOKEN が未設定です');
+  }
+  const names = await fetchNotionWorkerNames();
+  if (names.length === 0) {
+    throw new PkError(404, 'no_options', 'Notionの「ピッキング担当者」プロパティに選択肢が見つかりません');
+  }
+  const existing = new Set(listWorkers(true).map((w) => w.name));
+  const added = [];
+  for (const name of names) {
+    if (!existing.has(name)) { addWorker(name); added.push(name); }
+  }
+  res.json({ ok: true, total: names.length, added });
 }));
 
 router.post('/admin/workers', checkOrigin, requireAdmin, api(async (req, res) => {
