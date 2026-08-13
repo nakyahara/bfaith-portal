@@ -300,6 +300,18 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
 }));
 
 /**
+ * 一覧の変化検知用シグネチャ (バッチの増減・状態変化で変わる。明細単位の進捗では変えない
+ * = 他人の作業中に一覧がチラチラ再読込されない)。一覧画面が10秒間隔でポーリングする
+ */
+router.get('/api/batches-signature', api(async (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  const sig = listBatches(workDate)
+    .map((b) => `${b.id}:${b.status}`)
+    .join(',');
+  res.json({ ok: true, sig });
+}));
+
+/**
  * バッチ明細の画像URLマップ (作業画面のポーリング用)。
  * 取込直後は解決がバックグラウンドで進行中のため、画面側が数回だけ取得しにくる
  */
