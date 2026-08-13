@@ -101,6 +101,8 @@ function pickingAccess(req, res, next) {
     return next();
   }
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'ログインまたは端末登録が必要です' });
+  // ログイン後に元のURLへ戻す (portal/standalone 両方の /login が session.returnTo を見る)
+  if (req.session) req.session.returnTo = req.originalUrl;
   return res.redirect('/login');
 }
 

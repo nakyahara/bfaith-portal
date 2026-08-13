@@ -36,6 +36,7 @@ import { fileURLToPath } from 'url';
 // router の import 時に initPickingDB() が走る (migration 失敗はここで throw して起動を止める)
 import pickingRouter from './router.js';
 import pickingIngestRouter from './ingest-router.js';
+import { getDB as getPickingDB } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');   // リポジトリルート (public/ と views/login.ejs を流用)
@@ -53,6 +54,11 @@ if (process.env.NODE_ENV === 'production' && SESSION_SECRET === 'dev-secret-chan
   console.error('[FATAL] SESSION_SECRET 未設定で production 起動不可');
   process.exit(78);
 }
+// 初期管理者のパスワードも production では必須 (既知の既定値 changeme で外部公開しない — Codex high)
+if (process.env.NODE_ENV === 'production' && !process.env.PORTAL_PASS && !fs.existsSync(path.join(process.env.DATA_DIR || path.join(ROOT, 'data'), 'users.json'))) {
+  console.error('[FATAL] PORTAL_PASS 未設定で users.json も無いため production 起動不可 (初期管理者を作れない)');
+  process.exit(78);
+}
 
 // --- boot-id (コンテナ/サービス再起動の切り分け用。feedback_インフラ運用の教訓) ---
 const BOOT_ID = crypto.randomBytes(4).toString('hex');
@@ -65,12 +71,18 @@ function bootLog(msg) {
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 function loadUsers() {
+  // ファイルが「存在するのに読めない/壊れている」場合は起動を止める。
+  // 破損時に初期管理者で上書き再生成すると、登録済みユーザーが消えた上に
+  // 既知パスワードの管理者が出来てしまう (Codex high)
+  if (!fs.existsSync(USERS_FILE)) return null;
   try {
-    if (fs.existsSync(USERS_FILE)) return JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+    const parsed = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'));
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('users.json が空または配列ではない');
+    return parsed;
   } catch (e) {
-    console.warn('[Users] 読み込み失敗:', e.message);
+    console.error(`[FATAL] users.json の読み込みに失敗 (上書きせず停止): ${e.message}`);
+    process.exit(78);
   }
-  return null;
 }
 
 let users = loadUsers();
@@ -103,8 +115,13 @@ app.get('/livez', loopbackOnly, (req, res) => {
   res.status(200).json({ status: 'alive', pid: process.pid, bootId: BOOT_ID, uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000) });
 });
 app.get('/readyz', loopbackOnly, (req, res) => {
-  // picking.db は import 時 init 済み (失敗なら起動していない) ので、応答できる = ready
-  res.status(200).json({ status: 'ready', pid: process.pid, bootId: BOOT_ID });
+  // DBに実際に触れて確認する (ディスク満杯・ロック等で liveness と乖離しないように — Codex medium)
+  try {
+    getPickingDB().prepare('SELECT 1').get();
+    res.status(200).json({ status: 'ready', pid: process.pid, bootId: BOOT_ID });
+  } catch (e) {
+    res.status(503).json({ status: 'not_ready', error: e.message, bootId: BOOT_ID });
+  }
 });
 
 // --- セッション (server.js と同方式: connect-sqlite3 + WAL。DATA_DIR が別なので portal とは独立) ---
@@ -174,8 +191,12 @@ app.use('/apps/picking', express.json({ limit: '256kb' }), pickingRouter);
 app.get('/', (req, res) => res.redirect('/apps/picking/'));
 
 // --- 起動 ---
-const server = app.listen(PORT, () => {
-  bootLog(`picking standalone listening on http://localhost:${PORT} (DATA_DIR=${DATA_DIR})`);
+// 既定は loopback のみ (Cloudflare Tunnel が同一マシンから localhost を叩く構成)。
+// 全インターフェース待ち受けだと LAN から平文HTTPで直接届き、Tunnel/TLS を迂回できてしまう
+// (Codex high)。LAN公開が必要になったら PICKING_HOST=0.0.0.0 を明示する
+const HOST = process.env.PICKING_HOST || '127.0.0.1';
+const server = app.listen(PORT, HOST, () => {
+  bootLog(`picking standalone listening on http://${HOST}:${PORT} (DATA_DIR=${DATA_DIR})`);
 });
 
 // --- graceful shutdown (winsw の stop / 再起動で計測イベントを取りこぼさない) ---

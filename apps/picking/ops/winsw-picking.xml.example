@@ -16,9 +16,14 @@
   <name>B-Faith Picking Server</name>
   <description>スマホピッキング支援 (apps/picking standalone)。Render から分離した倉庫向け常駐サーバ。</description>
 
-  <executable>node</executable>
+  <!-- ⚠ サービスアカウント (SYSTEM等) のPATHにnodeが無い環境があるため絶対パス推奨
+       (実機のパスに合わせる。例: C:\Program Files\nodejs\node.exe) -->
+  <executable>C:\Program Files\nodejs\node.exe</executable>
   <arguments>apps\picking\standalone.js</arguments>
   <workingdirectory>C:\tools\bfaith-picking</workingdirectory>
+  <!-- ⚠ onfailure はプロセス「終了」時のみ。ハング (イベントループ停止) の復旧は
+       watchdog.ps1 に /livez /readyz を登録すること (移行手順書 §6) -->
+
 
   <!-- クラッシュ時は自動再起動 (feedback_インフラ運用: onfailure restart 必須) -->
   <onfailure action="restart" delay="10 sec"/>
