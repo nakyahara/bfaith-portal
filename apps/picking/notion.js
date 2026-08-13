@@ -54,7 +54,7 @@ async function notionFetch(path, { method = 'GET', body } = {}) {
 let _schemaCache = null;
 let _schemaCachedAt = 0;
 const SCHEMA_TTL_MS = 10 * 60 * 1000;
-async function getSchema() {
+export async function getSchema() {
   if (_schemaCache && Date.now() - _schemaCachedAt < SCHEMA_TTL_MS) return _schemaCache;
   const db = await notionFetch(`/databases/${NOTION_DB_ID}`);
   if (!db) return null;
@@ -68,16 +68,20 @@ async function getSchema() {
     minutesProp: { name: 'ピッキング時間(分)', type: 'number' },
     secPerLineProp: { name: '秒/明細', type: 'number' },
   };
+  // プロパティ名の照合は全角/半角の括弧・スラッシュ・空白のゆれを同一視する
+  // (実運用 2026-08-13: Notionで日本語入力すると「（分）」と全角になり検出されなかった)
+  const normName = (s) => String(s)
+    .replace(/（/g, '(').replace(/）/g, ')').replace(/／/g, '/').replace(/\s+/g, '');
   for (const [name, def] of Object.entries(db.properties || {})) {
     if (def.type === 'title') titleProp = name;
     if ((def.type === 'status' || def.type === 'select') && name === 'ステータス') {
       statusProp = { name, type: def.type };
     }
-    if (def.type === 'select' && name === 'ピッキング担当者') {
+    if (def.type === 'select' && normName(name) === 'ピッキング担当者') {
       workerProp = { name, type: def.type };
     }
     for (const [key, spec] of Object.entries(OPTIONAL_PROPS)) {
-      if (name === spec.name && def.type === spec.type) optional[key] = name;
+      if (normName(name) === normName(spec.name) && def.type === spec.type) optional[key] = name;
     }
   }
   // 「ステータス」が無ければ status 型の唯一のプロパティを採用 (改名への保険)
