@@ -177,4 +177,27 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: 時間系プロパティ (完了で記入・再作業でクリア・未作成はスキップ) (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 8} 件 pass`);
+// ─── プロパティ名の全角/半角ゆれ (実運用 8/13: （分） が検出されなかった) ───
+{
+  const { getSchema } = await import('../notion.js');
+  const dbMeta = {
+    properties: {
+      '名前': { type: 'title' },
+      'ステータス': { type: 'select' },
+      'ピッキング担当者': { type: 'select' },
+      'ピッキング時間（分）': { type: 'number' },   // 全角括弧
+      '秒／明細': { type: 'number' },               // 全角スラッシュ
+      'ピッキング開始': { type: 'date' },
+    },
+  };
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => dbMeta, text: async () => '' });
+  process.env.PICKING_NOTION_TOKEN = 'test';
+  const schema = await getSchema();
+  assert.equal(schema.minutesProp, 'ピッキング時間（分）', '全角括弧でも検出し、書込には実名を使う');
+  assert.equal(schema.secPerLineProp, '秒／明細');
+  assert.equal(schema.startProp, 'ピッキング開始');
+  assert.equal(schema.endProp, undefined, '未作成のものは書かない');
+  console.log('  ok: プロパティ名の全角/半角ゆれを同一視 (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 9} 件 pass`);
