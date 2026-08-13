@@ -38,6 +38,11 @@ import pickingRouter from './router.js';
 import pickingIngestRouter from './ingest-router.js';
 import { getDB as getPickingDB } from './db.js';
 import { handleLineWebhook } from './notify.js';
+// 画像解決 (images.js) が読む warehouse-mirror.db は明示 init が必要
+// (portal では server.js が init している。忘れると getMirrorDB() が throw し、
+// fail-soft のため「画像が永遠に解決されない」形で静かに壊れる)
+import { initMirrorDB } from '../warehouse-mirror/db.js';
+initMirrorDB();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');   // リポジトリルート (public/ と views/login.ejs を流用)
