@@ -146,7 +146,22 @@ export async function ensureImagesFor(skus, deps = {}) {
   let items = [];
   let failed = [];
   if (manageNumbers.length > 0) {
-    ({ items, failed } = await (deps.fetchDetails || fetchItemDetailsBulkDetailed)(manageNumbers));
+    try {
+      ({ items, failed } = await (deps.fetchDetails || fetchItemDetailsBulkDetailed)(manageNumbers));
+    } catch (e) {
+      // RMS呼び出し全体の失敗 (miniPCのrakutenキュー上限 "Too many pending requests" 等)。
+      // ここで throw すると台帳に何も残らず、画面を開くたびに再挑戦して連打してしまうため、
+      // 対象SKUを error として記録し、JST翌日の再試行に回す (Codex設計と同じ黙殺しない方針)
+      const upsertErr = db.prepare(`
+        INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, status, fetched_at)
+        VALUES (?, ?, NULL, NULL, 'error', ?)
+        ON CONFLICT(ne_code) DO UPDATE SET status='error', fetched_at=excluded.fetched_at
+      `);
+      for (const sku of need) upsertErr.run(sku, mnBySku.get(sku) || null, now);
+      console.warn(`[picking-images] RMS一括取得失敗 → ${need.length}件をerror記録 (翌日再試行): ${String(e.message).slice(0, 120)}`);
+      stats.errors = need.length;
+      return stats;
+    }
   }
   const itemByMn = new Map();
   for (const it of items) {

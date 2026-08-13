@@ -116,4 +116,21 @@ function fakeDeps({ items = [], failed = [] } = {}) {
   console.log('  ok: ensureImagesFor: RMS個別失敗はerrorでキャッシュ (async)');
 }
 
+{
+  // RMS呼び出し全体の失敗 (キュー上限等) も error 記録 → 画面を開くたびの連打にならない
+  const deps = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['qsku', 'qsku']]) }),
+    fetchDetails: async () => { throw new Error('Too many pending requests for rakuten'); },
+  };
+  const stats = await ensureImagesFor(['qsku'], deps);
+  assert.equal(stats.errors, 1);
+  const row = getDB().prepare("SELECT status FROM pk_product_images WHERE ne_code='qsku'").get();
+  assert.equal(row.status, 'error');
+  // 同日の再呼び出しは fetch 自体走らない
+  let called = 0;
+  await ensureImagesFor(['qsku'], { ...deps, fetchDetails: async () => { called++; return { items: [], failed: [] }; } });
+  assert.equal(called, 0);
+  console.log('  ok: ensureImagesFor: 一括失敗もerror記録し当日は再試行しない (async)');
+}
+
 console.log(`\ntest-images: ${passed + 3} 件 pass`);
