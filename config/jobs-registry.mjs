@@ -42,15 +42,17 @@
 export const JOBS_REGISTRY = [
   {
     id: 'picking-drive-poller',
-    type: 'in_process_loop',
+    type: 'heartbeat',
     importance: 'P2',
     owner: '中原さん',
     purpose: 'Drive出荷_noのピッキングリストCSVを2分間隔で自動取込 (RPAのPOST欠落・手動配置の自己回復)。PickingServer内の常駐ループで、独立したスケジュールタスクではない',
     where: 'miniPC PickingServer (apps/picking/drive-sync.js startDrivePoller)',
-    schedule: '常駐 (120秒間隔・env PICKING_POLL_INTERVAL_SEC)',
+    schedule: '常駐 (120秒間隔・env PICKING_POLL_INTERVAL_SEC。生存 ping は1時間に1回へ間引き)',
+    // ping間引き1時間の3倍。ポーリング失敗が続いた場合も ping が止まりここに出る
+    max_age_hours: 3,
     lifecycle: 'permanent',
-    monitoring: 'PickingWatchdog がプロセスを監視。ポーラー自体の状態は /apps/picking/admin/import の「自動取込」表示 (最終チェック時刻・失敗件数=pk_drive_imports)',
-    runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] を確認。失敗台帳は picking.db pk_drive_imports。復旧は Restart-Service PickingServer',
+    runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] を確認。失敗台帳は picking.db pk_drive_imports。'
+      + 'ping には miniPC の C:\\tools\\bfaith-picking\\.env に JOBS_MONITOR_TOKEN が必要。復旧は Restart-Service PickingServer',
   },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
   {

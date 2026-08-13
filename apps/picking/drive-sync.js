@@ -176,6 +176,35 @@ const POLL_INTERVAL_MS = Number(process.env.PICKING_POLL_INTERVAL_SEC || 120) * 
 let _status = { running: false, lastAt: null, lastError: null, lastStats: null };
 let _polling = false;
 
+// ─── jobs-monitor への生存 ping (dead-man方式・台帳 id=picking-drive-poller) ───
+// ポーリング成功時のみ打つ (Drive障害・取込失敗が続くと ping が止まり、監視側の
+// max_age_hours 超過で「止まっている」と出る)。1時間に1回へ間引き。
+const PING_THROTTLE_MS = 3600_000;
+let _lastPingAt = 0;
+let _warnedNoToken = false;
+async function pingJobsMonitor(fetchFn = fetch) {
+  const token = process.env.JOBS_MONITOR_TOKEN;
+  if (!token) {
+    if (!_warnedNoToken) {
+      _warnedNoToken = true;
+      console.warn('[picking-drive-poller] JOBS_MONITOR_TOKEN 未設定 → 生存pingなし (台帳の監視が効かない)');
+    }
+    return;
+  }
+  if (Date.now() - _lastPingAt < PING_THROTTLE_MS) return;
+  try {
+    const base = (process.env.JOBS_MONITOR_URL || 'https://bfaith-portal.onrender.com').replace(/\/+$/, '');
+    const res = await fetchFn(`${base}/apps/jobs-monitor/ping/picking-drive-poller?status=ok`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+    });
+    if (res.ok) _lastPingAt = Date.now();
+    else console.warn(`[picking-drive-poller] 生存ping失敗: HTTP ${res.status}`);
+  } catch (e) {
+    // ping はあくまで監視用 — 失敗してもポーリング本体は止めない
+    console.warn(`[picking-drive-poller] 生存ping失敗: ${e.message}`);
+  }
+}
+
 export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
@@ -190,6 +219,7 @@ export function startDrivePoller() {
       _status.lastStats = await pollOnce();
       _status.lastAt = utcNow();
       _status.lastError = null;
+      await pingJobsMonitor();
     } catch (e) {
       // Drive全体の失敗 (ネットワーク等)。次周期に自然リトライ
       _status.lastError = String(e.message).slice(0, 300);
