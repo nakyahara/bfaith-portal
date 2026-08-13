@@ -37,6 +37,7 @@ import { fileURLToPath } from 'url';
 import pickingRouter from './router.js';
 import pickingIngestRouter from './ingest-router.js';
 import { getDB as getPickingDB } from './db.js';
+import { handleLineWebhook } from './notify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');   // リポジトリルート (public/ と views/login.ejs を流用)
@@ -179,6 +180,12 @@ app.post('/login', (req, res) => {
 
 app.get('/logout', (req, res) => {
   req.session.destroy(() => res.redirect('/login'));
+});
+
+// --- LINE webhook (groupId取得用・署名検証つき)。raw body が必要なので json parser より先 ---
+app.post('/apps/picking/line-webhook', express.raw({ type: () => true, limit: '1mb' }), (req, res) => {
+  if (handleLineWebhook(req.body, req.headers['x-line-signature'])) return res.status(200).end();
+  res.status(403).end();
 });
 
 // --- picking 本体 (mount パスは server.js と同一) ---

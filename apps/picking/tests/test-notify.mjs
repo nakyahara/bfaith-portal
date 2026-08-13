@@ -89,4 +89,21 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: 片方失敗はsent・全滅はthrow (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 4} 件 pass`);
+// ─── webhook 署名検証 (groupId取得用) ───
+{
+  const { handleLineWebhook } = await import('../notify.js');
+  const cryptoMod = await import('node:crypto');
+  const body = Buffer.from(JSON.stringify({ events: [{ type: 'join', source: { type: 'group', groupId: 'Cxxxx' } }] }));
+  // secret未設定 → fail-closed
+  delete process.env.PICKING_LINE_CHANNEL_SECRET;
+  assert.equal(handleLineWebhook(body, 'sig'), false);
+  // 正しい署名 → true / 改ざん → false
+  process.env.PICKING_LINE_CHANNEL_SECRET = 'test-secret';
+  const sig = cryptoMod.createHmac('sha256', 'test-secret').update(body).digest('base64');
+  assert.equal(handleLineWebhook(body, sig), true);
+  assert.equal(handleLineWebhook(body, sig.slice(0, -2) + 'xx'), false);
+  assert.equal(handleLineWebhook(Buffer.from('tampered'), sig), false);
+  console.log('  ok: LINE webhook 署名検証 (secret必須・改ざん拒否) (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 5} 件 pass`);
