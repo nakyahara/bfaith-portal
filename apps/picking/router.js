@@ -278,11 +278,21 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     enqueueBatchSync(batchId, () => {
       const b = getBatch(batchId);
       if (!b) return null;
+      const activeSec = b.started_at && b.finished_at
+        ? Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0))
+        : null;
       return {
         folderName: b.folder_name,
         workDate: b.work_date,   // 日跨ぎ作業でも取込日のカードを動かす
         label: NOTION_STATUS_BY_BATCH[b.status] || null,
         workerName: b.worker,    // ピッキング担当者selectへ (email形式は notion.js 側で除外)
+        // 時間系プロパティ用 (Notion側に存在するものだけ書かれる)
+        times: {
+          startedAt: b.started_at,
+          finishedAt: b.finished_at,
+          activeSec,
+          lineCount: b.line_count,
+        },
       };
     });
   }
