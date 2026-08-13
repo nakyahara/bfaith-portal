@@ -206,6 +206,7 @@ t('takeover: 作業中の担当者を交代できる (選び間違いの救済)'
   // 交代 → W2が続きを操作でき、W1は逆にブロックされる
   const r = applyEvent(id, { opId: op(), event: 'takeover' }, W2);
   assert.equal(r.batchStatus, 'picking');
+  assert.equal(r.transition, 'takeover', 'Notion担当者の追従トリガ');
   assert.equal(getWorkState(id).batch.worker, W2);
   applyEvent(id, { opId: op(), event: 'next', lineSeq: 2 }, W2);
   expectPkError(() => applyEvent(id, { opId: op(), event: 'next', lineSeq: 3 }, W1), 'taken');

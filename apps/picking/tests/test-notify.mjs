@@ -106,4 +106,37 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: LINE webhook 署名検証 (secret必須・改ざん拒否) (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 5} 件 pass`);
+// ─── Notionカードのproperties組み立て (担当者連携) ───
+{
+  const { buildCardProperties } = await import('../notion.js');
+  const schema = {
+    titleProp: '名前',
+    statusProp: { name: 'ステータス', type: 'select' },
+    workerProp: { name: 'ピッキング担当者', type: 'select' },
+  };
+  const p1 = buildCardProperties(schema, 'ピッキング中', '星');
+  assert.deepEqual(p1['ステータス'], { select: { name: 'ピッキング中' } });
+  assert.deepEqual(p1['ピッキング担当者'], { select: { name: '星' } });
+  // email (セッションログイン) は選択肢を増殖させないため設定しない
+  const p2 = buildCardProperties(schema, 'ピッキング完了', 'd.nakahara@b-faith.biz');
+  assert.equal(p2['ピッキング担当者'], undefined);
+  // workerProp が無いDBでも動く / status型のDBにも対応
+  const p3 = buildCardProperties({ titleProp: '名前', statusProp: { name: 'ステータス', type: 'status' }, workerProp: null }, '完了', '星');
+  assert.deepEqual(p3['ステータス'], { status: { name: '完了' } });
+  assert.equal(Object.keys(p3).length, 1);
+  console.log('  ok: buildCardProperties (担当者select・email除外・status型対応) (async)');
+}
+
+// ─── カードタイトルの部分一致判定 ───
+{
+  const { titleMatchesFolder } = await import('../notion.js');
+  assert.equal(titleMatchesFolder('出荷_18', '出荷_18'), true, '完全一致');
+  assert.equal(titleMatchesFolder('8/13 出荷_18 ネコポス', '出荷_18'), true, 'タイトルに含む');
+  assert.equal(titleMatchesFolder('出荷_18', '出荷_1'), false, '出荷_1は出荷_18に誤マッチしない');
+  assert.equal(titleMatchesFolder('出荷_1 (AES)', '出荷_01'), true, 'ゼロ埋め表記ゆれを同一視');
+  assert.equal(titleMatchesFolder('出荷_01', '出荷_1'), true, '逆方向のゆれも同一視');
+  assert.equal(titleMatchesFolder('別のカード', '出荷_18'), false);
+  console.log('  ok: titleMatchesFolder (含む判定・番号境界・ゼロ埋めゆれ) (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 7} 件 pass`);
