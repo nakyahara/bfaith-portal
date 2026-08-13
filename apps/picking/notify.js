@@ -13,6 +13,8 @@
  * - 在庫修正・出荷保留の後続対応は通知を受けた管理者が行う (システムは記録と通知まで)
  */
 
+import crypto from 'node:crypto';
+
 const TIMEOUT_MS = 5000;
 
 /** 読み手ファースト (現場の管理者が次の行動を決められる形) の欠品メッセージ。 */
@@ -89,4 +91,40 @@ export async function notifyShortage(info) {
     console.warn(`[picking-notify] 一部経路の送信失敗: ${failures.map((f) => f.reason?.message).join(' / ')}`);
   }
   return 'sent';
+}
+
+/**
+ * LINE webhook の署名検証つき受け口 (groupId 取得用の最小実装)。
+ *
+ * 用途: グループ宛 push (グループは人数に関係なく1通カウント = 無料枠で十分) にするには
+ * bot をグループに招待して groupId を知る必要があり、それは webhook イベントでしか取れない。
+ * LINE Developers コンソールで Webhook URL に /apps/picking/line-webhook を設定し、
+ * bot をグループに招待 (またはグループで発言) すると、サーバーログに groupId が出る。
+ * PICKING_LINE_TO に設定したら Webhook 利用は終了してよい (設定は残しても無害)。
+ *
+ * @param rawBody Buffer (署名は生のボディで検証する)
+ * @param signature X-Line-Signature ヘッダ
+ * @returns 200を返してよければ true (署名不一致は false = 呼び出し側が403)
+ */
+export function handleLineWebhook(rawBody, signature) {
+  const secret = process.env.PICKING_LINE_CHANNEL_SECRET;
+  if (!secret) return false;   // 未設定なら受け付けない (fail-closed)
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+  const a = Buffer.from(String(signature || ''));
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  try {
+    const body = JSON.parse(rawBody.toString('utf8'));
+    for (const ev of body.events || []) {
+      const src = ev.source || {};
+      // 通知先設定に使うIDをログへ (groupId / roomId / userId)
+      const id = src.groupId || src.roomId || src.userId;
+      if (id) {
+        console.log(`[picking-line] webhook event type=${ev.type} sourceType=${src.type} id=${id} → PICKING_LINE_TO に設定してください`);
+      }
+    }
+  } catch (e) {
+    console.warn(`[picking-line] webhook body の解析失敗: ${e.message}`);
+  }
+  return true;
 }
