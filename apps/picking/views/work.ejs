@@ -211,18 +211,27 @@
     </div>
   </div>
 
-  <!-- 欠品数量シート -->
+  <!-- 欠品数量シート (2段階: 数量選択 → 送信確認。誤タップでの記録+LINE通知を防ぐ) -->
   <div id="shortSheet" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
     <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%; text-align:center;">
-      <h3 style="margin:0 0 6px; font-size:1.05em;">⚠ 欠品の数量</h3>
-      <div id="shortInfo" style="color:#adb5bd; font-size:0.9em; margin-bottom:12px;"></div>
-      <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:16px;">
-        <button id="shortMinus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
-        <span id="shortQty" style="font-size:44px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
-        <button id="shortPlus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
+      <div id="shortStep1">
+        <h3 style="margin:0 0 6px; font-size:1.05em;">⚠ 欠品の数量</h3>
+        <div id="shortInfo" style="color:#adb5bd; font-size:0.9em; margin-bottom:12px;"></div>
+        <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:16px;">
+          <button id="shortMinus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
+          <span id="shortQty" style="font-size:44px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
+          <button id="shortPlus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
+        </div>
+        <button id="shortConfirm" style="width:100%; padding:14px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.1em; font-weight:700; cursor:pointer;">欠品として記録する</button>
+        <button id="shortCancel" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">キャンセル</button>
       </div>
-      <button id="shortConfirm" style="width:100%; padding:14px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.1em; font-weight:700; cursor:pointer;">欠品として記録して次へ</button>
-      <button id="shortCancel" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">キャンセル</button>
+      <div id="shortStep2" style="display:none;">
+        <h3 style="margin:0 0 10px; font-size:1.05em;">⚠ 確認</h3>
+        <div id="shortStep2Info" style="color:#f1f3f5; font-size:1.0em; line-height:1.7; margin-bottom:16px;"></div>
+        <div style="color:#adb5bd; font-size:0.9em; margin-bottom:16px;">欠品として記録し、管理者へLINEで通知を送信しますか?</div>
+        <button id="shortYes" style="width:100%; padding:16px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.15em; font-weight:700; cursor:pointer;">はい、送信する</button>
+        <button id="shortNo" style="width:100%; margin-top:8px; padding:12px; border:1px solid #343a40; border-radius:12px; background:#111418; color:#adb5bd; font-size:1.05em; cursor:pointer;">いいえ、やめる</button>
+      </div>
     </div>
   </div>
 
@@ -553,16 +562,31 @@
     });
     $('shortMinus').addEventListener('click', () => { if (shortVal > 1) $('shortQty').textContent = --shortVal; });
     $('shortPlus').addEventListener('click', () => { if (shortTarget && shortVal < shortTarget.qty) $('shortQty').textContent = ++shortVal; });
-    $('shortCancel').addEventListener('click', () => { $('shortSheet').style.display = 'none'; });
+    function closeShortSheet() {
+      $('shortSheet').style.display = 'none';
+      $('shortStep1').style.display = 'block';
+      $('shortStep2').style.display = 'none';
+    }
+    $('shortCancel').addEventListener('click', closeShortSheet);
+    // 1段階目: 数量確定 → 確認画面へ (ここではまだ何も記録しない)
     $('shortConfirm').addEventListener('click', () => {
       if (!shortTarget) return;
-      $('shortSheet').style.display = 'none';
+      $('shortStep2Info').innerHTML =
+        `${esc(shortTarget.loc)}<br><b>${esc(splitName(shortTarget.name).main)}</b><br>欠品 <b style="font-size:1.4em">${shortVal}</b> 個 (指示 ${shortTarget.qty} 個)`;
+      $('shortStep1').style.display = 'none';
+      $('shortStep2').style.display = 'block';
+    });
+    // 2段階目: はい=記録+LINE通知 / いいえ=何もせず閉じる (誤タップ対策)
+    $('shortYes').addEventListener('click', () => {
+      if (!shortTarget) return;
+      closeShortSheet();
       shortTarget.status = 'shortage';
       shortTarget.shortage_qty = shortVal;
       enqueue('shortage', shortTarget.seq, null, { shortage_qty: shortVal });
       if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
       render();
     });
+    $('shortNo').addEventListener('click', closeShortSheet);
 
     // ── 中断 / 再開 / 取消 ──
     $('pauseBtn').addEventListener('click', () => { $('pauseSheet').style.display = 'flex'; });
