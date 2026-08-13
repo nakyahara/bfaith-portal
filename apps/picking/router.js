@@ -16,7 +16,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
-  initPickingDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
+  initPickingDB, getDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
   createDevice, verifyDevice, revokeDevice, listDevices,
   listWorkers, getWorker, addWorker, setWorkerActive,
 } from './db.js';
@@ -28,23 +28,9 @@ import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { queueEnsureImages, getImageMap } from './images.js';
-import {
-  listDriveSubfolders, listDriveFilesAcross, downloadDriveFileById,
-} from '../../lib/drive-csv.js';
-
-// 出荷_no フォルダ (中原さん共有 2026-08-12。SA bfaith-portal@… に閲覧者共有済み)。
-// CSVは各サブフォルダ (出荷_XX) に引当RPAが保存する運用のため、検索はサブフォルダ横断
-const DRIVE_FOLDER_ID = process.env.PICKING_DRIVE_FOLDER_ID || '110ONn2xHzfEG5HPt1DRy4P64zv2hpGjh';
-
-// サブフォルダ一覧 (出荷_01〜45) は増減しないので60秒キャッシュ (一覧・DL検証の両方で使う)
-let _subfoldersCache = { at: 0, list: null };
-async function getShippingFolders() {
-  if (_subfoldersCache.list && Date.now() - _subfoldersCache.at < 60_000) return _subfoldersCache.list;
-  const subs = await listDriveSubfolders({ folderId: DRIVE_FOLDER_ID });
-  const list = [{ folder_id: DRIVE_FOLDER_ID, name: '(出荷_no直下)' }, ...subs];
-  _subfoldersCache = { at: Date.now(), list };
-  return list;
-}
+import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
+// Drive共有ヘルパーと自動ポーリング (standaloneが起動。router は手動取込と状態表示に使う)
+import { getShippingFolders, driveCall, getPollerStatus } from './drive-sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -508,15 +494,19 @@ router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
 
 // ─── Drive取込 (出荷_no フォルダ・管理者) ───
 
-/** lib/drive-csv.js のエラーを業務エラーへ変換 (VALIDATION=入力起因400 / それ以外=Drive側502)。 */
-async function driveCall(fn) {
-  try {
-    return await fn();
-  } catch (e) {
-    if (e instanceof PkError) throw e;
-    throw new PkError(e.code === 'VALIDATION' ? 400 : 502, 'drive_error', e.message);
-  }
-}
+/** 自動ポーリングの状態 (standaloneで稼働。portalでは running:false)。 */
+router.get('/admin/import/poller-status', requireAdmin, api(async (req, res) => {
+  const s = getPollerStatus();
+  const db = getDB();
+  const recent = db.prepare(`
+    SELECT filename, folder_name, status, error, processed_at FROM pk_drive_imports
+    ORDER BY processed_at DESC LIMIT 10
+  `).all();
+  const failedCount = db.prepare(
+    "SELECT COUNT(*) c FROM pk_drive_imports WHERE status='failed'"
+  ).get().c;
+  res.json({ ok: true, poller: s, recent, failedCount });
+}));
 
 router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
   const files = await driveCall(async () => {

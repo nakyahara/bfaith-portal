@@ -43,6 +43,8 @@ import { handleLineWebhook } from './notify.js';
 // fail-soft のため「画像が永遠に解決されない」形で静かに壊れる)
 import { initMirrorDB } from '../warehouse-mirror/db.js';
 initMirrorDB();
+// Drive自動取込ポーラー (standaloneのみ。POSTを取りこぼしても数分で自己回復する — Codex設計 8/13)
+import { startDrivePoller } from './drive-sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');   // リポジトリルート (public/ と views/login.ejs を流用)
@@ -209,6 +211,7 @@ app.get('/', (req, res) => res.redirect('/apps/picking/'));
 const HOST = process.env.PICKING_HOST || '127.0.0.1';
 const server = app.listen(PORT, HOST, () => {
   bootLog(`picking standalone listening on http://${HOST}:${PORT} (DATA_DIR=${DATA_DIR})`);
+  startDrivePoller();
 });
 
 // --- graceful shutdown (winsw の stop / 再起動で計測イベントを取りこぼさない) ---

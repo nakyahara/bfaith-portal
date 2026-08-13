@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -120,6 +120,27 @@ const MIGRATIONS = {
   3: () => {
     db.exec('ALTER TABLE pk_batches ADD COLUMN pause_started_at TEXT');
     db.exec('ALTER TABLE pk_batches ADD COLUMN pause_reason TEXT');
+  },
+  // v4: Drive自動取込の台帳 (Codex設計相談 2026-08-13)。
+  // 「どのDriveファイルのどの版を取り込んだ/失敗した」を記録し、ポーリングの冪等と
+  // 失敗の可視化 (黙殺しない) を担う。(drive_file_id, modified_time) が版のキー
+  4: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_drive_imports (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      drive_file_id TEXT NOT NULL,
+      modified_time TEXT NOT NULL,     -- Drive側の更新時刻 (版の識別)
+      filename      TEXT NOT NULL,
+      folder_name   TEXT,
+      source_type   TEXT NOT NULL DEFAULT 'csv' CHECK(source_type IN ('csv','pdf')),
+      status        TEXT NOT NULL CHECK(status IN ('imported','failed','skipped')),
+      error         TEXT,
+      batch_id      INTEGER REFERENCES pk_batches(id),
+      attempts      INTEGER NOT NULL DEFAULT 1,
+      first_seen_at TEXT NOT NULL,
+      processed_at  TEXT NOT NULL,
+      UNIQUE (drive_file_id, modified_time)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_drive_imports_at ON pk_drive_imports(processed_at)');
   },
 };
 
