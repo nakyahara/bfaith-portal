@@ -143,6 +143,28 @@ t('🚨要約は期限の生データを保持する (checkDeadlineの再評価�
   assert.equal(dl.expired.length, 2);
 });
 
+// 🚨2026-08-12 22:00 の本番で実際に起きた形。READY_TO_SHIP なのに spdTrackingItems が
+// 「箱数ぶんの trackingId 空エントリ」で返り、hasTracking=true と誤認 →
+// 納品が照合対象から外れ、CSV行が宙に浮いて「対応する納品が見つかりません」で全件中断した。
+t('🚨trackingIdが空のエントリは「登録済み」と数えない (8/12の全件中断の原因)', () => {
+  const raw = {
+    shipmentConfirmationId: 'FBA15GG6BGX1',
+    status: 'READY_TO_SHIP',
+    destination: { warehouseId: 'XJE2' },
+    trackingDetails: { spdTrackingDetail: { spdTrackingItems: [
+      { boxId: 'FBA15GG6BGX1U000001' }, // trackingId 無し
+      { boxId: 'FBA15GG6BGX1U000002', trackingId: '' },
+      { boxId: 'FBA15GG6BGX1U000003', trackingId: '  ' },
+    ] } },
+  };
+  const ship = summarizeShipment({ inboundPlanId: 'p1', name: '' }, { shipmentId: 's1' }, raw, [{ boxId: 'B1' }]);
+  assert.equal(ship.hasTracking, false);
+  // 1件でも実値が入っていれば従来どおり「登録済み」
+  raw.trackingDetails.spdTrackingDetail.spdTrackingItems[0].trackingId = '66393873615';
+  const ship2 = summarizeShipment({ inboundPlanId: 'p1', name: '' }, { shipmentId: 's1' }, raw, [{ boxId: 'B1' }]);
+  assert.equal(ship2.hasTracking, true);
+});
+
 t('期限の情報が無い納品は緩い側に倒す (ok=true。最終判断はAmazon)', () => {
   const ship = summarizeShipment({ inboundPlanId: 'p1', name: '' }, { shipmentId: 's1' },
     { shipmentConfirmationId: 'FBA-X', status: 'READY_TO_SHIP', destination: { warehouseId: 'HND2' } }, []);

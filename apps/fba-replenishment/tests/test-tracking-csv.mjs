@@ -157,6 +157,18 @@ t('登録済みの納品はスキップする (二重投入しない)', () => {
   assert.equal(skipped[0].reason, '登録済み');
 });
 
+t('登録済みでスキップした納品のCSV行は「見つかりません」と騒がない (誤報防止)', () => {
+  const ships = [{ ...SHIPMENTS[0], hasTracking: true }];
+  const { rows } = parseTrackingCsv(csv([
+    row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }), // 登録済み納品の行 = 正常
+    row({ tracking: '663-9387-3173', fc: 'HND2', kanri: 'FBA15MISSING' }), // 本当に不明な行
+  ]));
+  const { problems, skipped } = buildAssignments(rows, ships);
+  assert.equal(skipped[0].shipmentConfirmationId, 'FBA15GGL5J2X');
+  assert.equal(problems.filter((p) => /FBA15GGL5J2X.*見つかりません/.test(p)).length, 0, problems.join(' / '));
+  assert.ok(problems.some((p) => /FBA15MISSING.*見つかりません/.test(p)), problems.join(' / '));
+});
+
 t('🚨同じ送り状番号が別の宛先に現れたら取り違えを疑う', () => {
   const { rows } = parseTrackingCsv(csv([
     row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),

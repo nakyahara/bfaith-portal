@@ -143,6 +143,19 @@ export function checkDeadline(shipment, now = new Date()) {
 }
 
 /**
+ * 追跡番号が**実際に入っている** spdTrackingItems だけを返す。
+ * 🚨(2026-08-12 22:00 本番で実測) READY_TO_SHIP の納品でも、spdTrackingItems が
+ *   「箱数ぶんの trackingId が空のエントリ」で返ってくることがある (8/12は15箱+3箱の2納品とも)。
+ *   エントリの有無 (length) で「登録済み」と判定すると、未登録の納品を照合対象から外してしまい、
+ *   CSV側の行が宙に浮いて「対応する納品が見つかりません」で全件中断する。
+ *   必ず trackingId の中身で判定すること。
+ */
+export function realTrackingItems(detail) {
+  const items = detail?.trackingDetails?.spdTrackingDetail?.spdTrackingItems ?? [];
+  return items.filter((i) => String(i?.trackingId ?? '').trim() !== '');
+}
+
+/**
  * getShipment の生レスポンスから runner に渡す要約を組み立てる。
  * 🚨期限の生データ (dates / selectedDeliveryWindow) を必ず残すこと。
  *   runner は投入直前に checkDeadline(ship) を呼び直すが、ここで落とすと
@@ -160,7 +173,7 @@ export function summarizeShipment(plan, shipmentRef, detail, boxes, now = new Da
     status: detail.status,
     // ⭐boxIdは規則から生成せずAPIの返り値を正とする
     boxIds: boxes.map((x) => x.boxId),
-    hasTracking: Boolean(detail.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
+    hasTracking: realTrackingItems(detail).length > 0,
     deadline: checkDeadline(detail, now),
     dates: detail.dates ?? null,
     selectedDeliveryWindow: detail.selectedDeliveryWindow ?? null,
@@ -250,7 +263,7 @@ export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHI
   } catch (e) {
     return { ok: false, reason: `投入直前の確認に失敗しました: ${e?.message ?? e}` };
   }
-  if (d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length) {
+  if (realTrackingItems(d).length) {
     return { ok: false, status: d.status, reason: 'すでに追跡番号が入っています (この間に誰かが入力した可能性)' };
   }
   if (!expectStatuses.includes(d.status)) {
@@ -343,7 +356,7 @@ export async function putTrackingDetails(target, items) {
 export async function verifyTracking(target, items) {
   const base = `${V}/inboundPlans/${target.inboundPlanId}/shipments/${target.shipmentId}`;
   const d = await call(base);
-  const got = d.trackingDetails?.spdTrackingDetail?.spdTrackingItems ?? [];
+  const got = realTrackingItems(d);
   if (!got.length) return { visible: false, matched: null, status: d.status, note: 'APIにはまだ反映されていません (反映に数時間かかることを確認済み)' };
   const a = got.map((x) => `${x.boxId}=${x.trackingId}`).sort().join(',');
   const b = items.map((x) => `${x.boxId}=${x.trackingId}`).sort().join(',');
@@ -381,7 +394,7 @@ export async function getPlanShipments(inboundPlanId) {
       address: d.destination?.address ?? null,
       status: d.status,
       boxCount: boxes.length,
-      hasTracking: Boolean(d.trackingDetails?.spdTrackingDetail?.spdTrackingItems?.length),
+      hasTracking: realTrackingItems(d).length > 0,
     });
   }
   return { planName: full.name || '', planStatus: full.status, shipments: out };
