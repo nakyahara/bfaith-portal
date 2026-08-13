@@ -139,4 +139,42 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: titleMatchesFolder (含む判定・番号境界・ゼロ埋めゆれ) (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 7} 件 pass`);
+// ─── 時間系プロパティ ───
+{
+  const { buildCardProperties, toJstDateValue } = await import('../notion.js');
+  assert.equal(toJstDateValue('2026-08-13T00:30:00Z'), '2026-08-13T09:30:00+09:00', 'JST変換');
+  assert.equal(toJstDateValue('invalid'), null);
+
+  const schema = {
+    titleProp: '名前',
+    statusProp: { name: 'ステータス', type: 'select' },
+    workerProp: { name: 'ピッキング担当者', type: 'select' },
+    startProp: 'ピッキング開始', endProp: 'ピッキング終了',
+    minutesProp: 'ピッキング時間(分)', secPerLineProp: '秒/明細',
+  };
+  // 完了時: 開始/終了/時間(分)/秒明細 が入る (中断5分は除外済みのactiveSecが渡る)
+  const done = buildCardProperties(schema, 'ピッキング完了', '星', {
+    startedAt: '2026-08-13T00:00:00Z', finishedAt: '2026-08-13T00:20:00Z',
+    activeSec: 900, lineCount: 30,
+  });
+  assert.equal(done['ピッキング開始'].date.start, '2026-08-13T09:00:00+09:00');
+  assert.equal(done['ピッキング終了'].date.start, '2026-08-13T09:20:00+09:00');
+  assert.equal(done['ピッキング時間(分)'].number, 15);
+  assert.equal(done['秒/明細'].number, 30);
+  // 作業中 (完了取消後): 終了・時間はクリア、開始は維持
+  const picking = buildCardProperties(schema, 'ピッキング中', '星', {
+    startedAt: '2026-08-13T00:00:00Z', finishedAt: null, activeSec: null, lineCount: 30,
+  });
+  assert.equal(picking['ピッキング終了'].date, null);
+  assert.equal(picking['ピッキング時間(分)'].number, null);
+  assert.ok(picking['ピッキング開始'].date.start);
+  // プロパティが無いDBでは時間系を一切書かない
+  const minimal = buildCardProperties(
+    { titleProp: '名前', statusProp: { name: 'ステータス', type: 'select' }, workerProp: null },
+    'ピッキング完了', '星',
+    { startedAt: '2026-08-13T00:00:00Z', finishedAt: '2026-08-13T00:20:00Z', activeSec: 900, lineCount: 30 });
+  assert.deepEqual(Object.keys(minimal), ['ステータス']);
+  console.log('  ok: 時間系プロパティ (完了で記入・再作業でクリア・未作成はスキップ) (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 8} 件 pass`);

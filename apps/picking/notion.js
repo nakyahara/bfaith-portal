@@ -49,15 +49,25 @@ async function notionFetch(path, { method = 'GET', body } = {}) {
   }
 }
 
-// DBメタデータ (title プロパティ名・ステータスプロパティ名/型) は起動中キャッシュ
+// DBメタデータ (プロパティ名/型) のキャッシュ。10分TTL —
+// Notion側にプロパティを後から足したとき、サービス再起動なしで検出できるように
 let _schemaCache = null;
+let _schemaCachedAt = 0;
+const SCHEMA_TTL_MS = 10 * 60 * 1000;
 async function getSchema() {
-  if (_schemaCache) return _schemaCache;
+  if (_schemaCache && Date.now() - _schemaCachedAt < SCHEMA_TTL_MS) return _schemaCache;
   const db = await notionFetch(`/databases/${NOTION_DB_ID}`);
   if (!db) return null;
   let titleProp = null;
   let statusProp = null;
   let workerProp = null;   // 「ピッキング担当者」(select)。無いDBでも動く (担当者連携だけスキップ)
+  const optional = {};     // 時間系 (作られているものだけ書き込む)
+  const OPTIONAL_PROPS = {
+    startProp: { name: 'ピッキング開始', type: 'date' },
+    endProp: { name: 'ピッキング終了', type: 'date' },
+    minutesProp: { name: 'ピッキング時間(分)', type: 'number' },
+    secPerLineProp: { name: '秒/明細', type: 'number' },
+  };
   for (const [name, def] of Object.entries(db.properties || {})) {
     if (def.type === 'title') titleProp = name;
     if ((def.type === 'status' || def.type === 'select') && name === 'ステータス') {
@@ -65,6 +75,9 @@ async function getSchema() {
     }
     if (def.type === 'select' && name === 'ピッキング担当者') {
       workerProp = { name, type: def.type };
+    }
+    for (const [key, spec] of Object.entries(OPTIONAL_PROPS)) {
+      if (name === spec.name && def.type === spec.type) optional[key] = name;
     }
   }
   // 「ステータス」が無ければ status 型の唯一のプロパティを採用 (改名への保険)
@@ -75,16 +88,29 @@ async function getSchema() {
   if (!titleProp || !statusProp) {
     throw new Error(`Notion DBのプロパティが見つかりません (title=${titleProp}, status=${statusProp?.name})`);
   }
-  _schemaCache = { titleProp, statusProp, workerProp };
+  _schemaCache = { titleProp, statusProp, workerProp, ...optional };
+  _schemaCachedAt = Date.now();
   return _schemaCache;
+}
+
+/** UTC ISO → Notion date 用の JST 表記 ('YYYY-MM-DDTHH:mm:00+09:00')。 */
+export function toJstDateValue(utcIso) {
+  const t = Date.parse(utcIso || '');
+  if (!Number.isFinite(t)) return null;
+  const d = new Date(t + 9 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:00+09:00`;
 }
 
 /**
  * PATCH する properties を組み立てる (テスト可能な純関数)。
  * 担当者は「メールアドレスでない表示名」のときだけ設定する
  * (セッションログインの email を select の選択肢に増殖させない)。
+ * 時間系プロパティは Notion 側に存在するものだけ書く。完了取消 (再作業中) は
+ * 終了・時間を null でクリアし、古い値が残らないようにする。
+ * @param times {startedAt, finishedAt, activeSec, lineCount} | null
  */
-export function buildCardProperties(schema, statusLabel, workerName) {
+export function buildCardProperties(schema, statusLabel, workerName, times = null) {
   const props = {
     [schema.statusProp.name]: schema.statusProp.type === 'status'
       ? { status: { name: statusLabel } }
@@ -92,6 +118,24 @@ export function buildCardProperties(schema, statusLabel, workerName) {
   };
   if (schema.workerProp && workerName && !workerName.includes('@')) {
     props[schema.workerProp.name] = { select: { name: workerName } };
+  }
+  if (times) {
+    if (schema.startProp && times.startedAt) {
+      props[schema.startProp] = { date: { start: toJstDateValue(times.startedAt) } };
+    }
+    const finished = !!times.finishedAt;
+    if (schema.endProp) {
+      props[schema.endProp] = { date: finished ? { start: toJstDateValue(times.finishedAt) } : null };
+    }
+    if (schema.minutesProp) {
+      props[schema.minutesProp] = { number: finished && times.activeSec != null ? Math.round(times.activeSec / 60 * 10) / 10 : null };
+    }
+    if (schema.secPerLineProp) {
+      props[schema.secPerLineProp] = {
+        number: finished && times.activeSec != null && times.lineCount > 0
+          ? Math.round(times.activeSec / times.lineCount * 10) / 10 : null,
+      };
+    }
   }
   return props;
 }
@@ -156,7 +200,7 @@ async function findTodayCard(folderName, jstDate) {
  * Notion側のカード作成が遅れている朝一などに作業を止めないため)。
  * @returns {'updated'|'no_card'|'disabled'}
  */
-export async function syncPickingStatus(folderName, statusLabel, jstDate, workerName = null) {
+export async function syncPickingStatus(folderName, statusLabel, jstDate, workerName = null, times = null) {
   if (!process.env.PICKING_NOTION_TOKEN) return 'disabled';
   if (!folderName) return 'no_card';
   const card = await findTodayCard(folderName, jstDate);
@@ -167,7 +211,7 @@ export async function syncPickingStatus(folderName, statusLabel, jstDate, worker
   const schema = await getSchema();
   await notionFetch(`/pages/${card.id}`, {
     method: 'PATCH',
-    body: { properties: buildCardProperties(schema, statusLabel, workerName) },
+    body: { properties: buildCardProperties(schema, statusLabel, workerName, times) },
   });
   console.log(`[picking-notion] ${folderName} → ${statusLabel}${workerName ? ` (担当: ${workerName})` : ''}`);
   return 'updated';
@@ -192,14 +236,14 @@ export function enqueueBatchSync(batchId, getBatchState) {
       const state = getBatchState();
       if (!state || !state.label) return;
       try {
-        await syncPickingStatus(state.folderName, state.label, state.workDate, state.workerName);
+        await syncPickingStatus(state.folderName, state.label, state.workDate, state.workerName, state.times);
       } catch (e) {
         // 一時障害向けに1回だけ再試行 (それでも失敗したらログのみ = fail-soft。
         // Notion同期は暫定連携で、正本の計測データはpicking.db側にある)
         await new Promise((r) => setTimeout(r, 5000));
         const retryState = getBatchState();
         if (!retryState || !retryState.label) return;
-        await syncPickingStatus(retryState.folderName, retryState.label, retryState.workDate, retryState.workerName);
+        await syncPickingStatus(retryState.folderName, retryState.label, retryState.workDate, retryState.workerName, retryState.times);
       }
     })
     .catch((e) => console.warn(`[picking-notion] 同期失敗 (batch=${batchId}): ${e.message}`));
