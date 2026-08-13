@@ -113,23 +113,42 @@ function jstDayRangeUtc(jstDate) {
 }
 
 /**
- * 「タイトル = folderName・今日 (JST) 作成」のカードを1枚探す。
- * 見つからない / 複数でも最新1枚 (同名の今日カードが2枚ある運用は無いが、あれば最新を正とする)。
+ * タイトルが出荷フォルダ名に対応するか (完全一致ではなく「含む」— 2026-08-13 中原さん指定)。
+ * カードは「出荷_18 ネコポス」のような命名もあるため部分一致で拾うが、
+ * 単純な contains だと「出荷_1」が「出荷_18」に誤マッチするので番号の境界を見る。
+ * 出荷_01 / 出荷_1 のゼロ埋め表記ゆれも同一視する。
+ */
+export function titleMatchesFolder(title, folderName) {
+  const t = String(title || '');
+  const m = String(folderName || '').match(/^出荷_0*(\d+)$/);
+  if (!m) return t.includes(String(folderName));
+  return new RegExp(`出荷_0*${m[1]}(?!\\d)`).test(t);
+}
+
+/**
+ * 「タイトルに folderName を含む・今日 (JST) 作成」のカードを1枚探す。
+ * 複数該当は最新1枚 (作成日時降順の先頭)。
  */
 async function findTodayCard(folderName, jstDate) {
   const schema = await getSchema();
   if (!schema) return null;
+  // クエリは Notion の contains で広めに取り (ゼロ埋め表記ゆれがあるため番号のみで検索)、
+  // 正確な判定は titleMatchesFolder で行う
+  const m = String(folderName).match(/^出荷_0*(\d+)$/);
   const q = await notionFetch(`/databases/${NOTION_DB_ID}/query`, {
     method: 'POST',
     body: {
-      filter: { property: schema.titleProp, title: { equals: folderName } },
+      filter: { property: schema.titleProp, title: { contains: m ? `出荷_` : String(folderName) } },
       sorts: [{ timestamp: 'created_time', direction: 'descending' }],
-      page_size: 5,
+      page_size: 100,
     },
   });
   if (!q) return null;
   const { start, end } = jstDayRangeUtc(jstDate);
-  return (q.results || []).find((p) => p.created_time >= start && p.created_time < end) || null;
+  const titleText = (p) => (p.properties?.[schema.titleProp]?.title || []).map((t) => t.plain_text).join('');
+  return (q.results || []).find((p) =>
+    p.created_time >= start && p.created_time < end && titleMatchesFolder(titleText(p), folderName)
+  ) || null;
 }
 
 /**

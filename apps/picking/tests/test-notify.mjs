@@ -127,4 +127,16 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: buildCardProperties (担当者select・email除外・status型対応) (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 6} 件 pass`);
+// ─── カードタイトルの部分一致判定 ───
+{
+  const { titleMatchesFolder } = await import('../notion.js');
+  assert.equal(titleMatchesFolder('出荷_18', '出荷_18'), true, '完全一致');
+  assert.equal(titleMatchesFolder('8/13 出荷_18 ネコポス', '出荷_18'), true, 'タイトルに含む');
+  assert.equal(titleMatchesFolder('出荷_18', '出荷_1'), false, '出荷_1は出荷_18に誤マッチしない');
+  assert.equal(titleMatchesFolder('出荷_1 (AES)', '出荷_01'), true, 'ゼロ埋め表記ゆれを同一視');
+  assert.equal(titleMatchesFolder('出荷_01', '出荷_1'), true, '逆方向のゆれも同一視');
+  assert.equal(titleMatchesFolder('別のカード', '出荷_18'), false);
+  console.log('  ok: titleMatchesFolder (含む判定・番号境界・ゼロ埋めゆれ) (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 7} 件 pass`);
