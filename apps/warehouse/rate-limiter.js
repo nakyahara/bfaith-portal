@@ -112,8 +112,10 @@ export function rateLimitMiddleware(mall) {
     };
     res.on('finish', releaseOnce);
     res.on('close', releaseOnce);
-    // acquire 待ちの間に切断済みなら、処理せず即返す ('close' は既に発火済みで拾えない)
-    if (res.destroyed || req.destroyed || res.writableEnded) {
+    // acquire 待ちの間に切断済みなら、処理せず即返す ('close' は既に発火済みで拾えない)。
+    // ⚠判定は res 側のみを見る。req.destroyed は Node 24 では「bodyを読み終えた正常な
+    //   POST」でも true になり (実測 2026-08-14)、全POSTを無応答で落とすバグになった
+    if (res.destroyed || res.writableEnded) {
       releaseOnce();
       return;
     }
