@@ -210,6 +210,9 @@ router.get('/work/:id(\\d+)', (req, res) => {
     if (e instanceof PkError) return res.status(e.status).send(e.message);
     throw e;
   }
+  // 取込時に画像解決が失敗していても、作業画面を開いた時点で取り直す
+  // (errorキャッシュは30分TTL — キュー混雑が収まっていればここで復活する)
+  queueEnsureImages(state.lines.map((l) => l.sku), `work#${state.batch.id}`);
   res.render(path.join(__dirname, 'views/work'), {
     title: `ピッキング | ${state.batch.hikiate_class}`,
     // セッションなら worker は確定 (email)。端末モードは null = 画面側が作業者選択を出す

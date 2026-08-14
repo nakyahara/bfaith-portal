@@ -117,20 +117,135 @@ function fakeDeps({ items = [], failed = [] } = {}) {
 }
 
 {
-  // RMS呼び出し全体の失敗 (キュー上限等) も error 記録 → 画面を開くたびの連打にならない
+  // RMS呼び出し全体の失敗 (キュー上限等): 429はバックオフ付きで4回まで粘り、
+  // それでもダメなら error 記録 → 画面を開くたびの連打にならない
+  let attempts = 0;
+  const sleeps = [];
   const deps = {
     loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['qsku', 'qsku']]) }),
-    fetchDetails: async () => { throw new Error('Too many pending requests for rakuten'); },
+    fetchDetails: async () => { attempts++; throw new Error('Too many pending requests for rakuten'); },
+    sleep: async (ms) => { sleeps.push(ms); },
   };
   const stats = await ensureImagesFor(['qsku'], deps);
+  assert.equal(attempts, 4, 'キュー混雑は4回まで再試行');
+  assert.equal(sleeps.length, 3, '再試行の間に3回待つ');
+  assert.ok(sleeps.every((ms) => ms >= 45_000), 'バックオフは45秒以上');
   assert.equal(stats.errors, 1);
   const row = getDB().prepare("SELECT status FROM pk_product_images WHERE ne_code='qsku'").get();
   assert.equal(row.status, 'error');
-  // 同日の再呼び出しは fetch 自体走らない
+  // 直後 (30分TTL内) の再呼び出しは fetch 自体走らない
   let called = 0;
   await ensureImagesFor(['qsku'], { ...deps, fetchDetails: async () => { called++; return { items: [], failed: [] }; } });
   assert.equal(called, 0);
-  console.log('  ok: ensureImagesFor: 一括失敗もerror記録し当日は再試行しない (async)');
+  console.log('  ok: ensureImagesFor: キュー混雑はバックオフ再試行→error記録・30分内は再試行しない (async)');
 }
 
-console.log(`\ntest-images: ${passed + 3} 件 pass`);
+{
+  // キュー混雑が途中で解消したら成功する / 混雑以外のエラーは即error記録 (リトライしない)
+  let n = 0;
+  const deps = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['rsku', 'rsku']]) }),
+    fetchDetails: async () => {
+      n++;
+      if (n < 3) throw new Error('[rakuten-rms-proxy] RATE_LIMIT_QUEUE_FULL');
+      return { items: [{ manageNumber: 'rsku', whiteBgImage: { location: '/r_00.jpg' } }], failed: [] };
+    },
+    sleep: async () => {},
+  };
+  const stats = await ensureImagesFor(['rsku'], deps);
+  assert.equal(n, 3, '2回混雑→3回目で成功');
+  assert.equal(stats.ok, 1);
+  let m = 0;
+  const deps2 = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['xsku', 'xsku']]) }),
+    fetchDetails: async () => { m++; throw new Error('ECONNREFUSED'); },
+    sleep: async () => { throw new Error('混雑以外で待ってはいけない'); },
+  };
+  const stats2 = await ensureImagesFor(['xsku'], deps2);
+  assert.equal(m, 1, '混雑以外は再試行しない');
+  assert.equal(stats2.errors, 1);
+  console.log('  ok: fetchWithQueueRetry: 混雑解消で成功・他エラーは即error (async)');
+}
+
+{
+  // 混雑判定は構造優先: statusCode=500は本文が混雑文言でも再試行しない /
+  // statusCode=429はメッセージが "HTTP 429" でも再試行する
+  let a = 0;
+  const e500 = Object.assign(new Error('Too many pending requests for rakuten'), { statusCode: 500 });
+  const deps500 = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['s500', 's500']]) }),
+    fetchDetails: async () => { a++; throw e500; },
+    sleep: async () => { throw new Error('500で待ってはいけない'); },
+  };
+  const st1 = await ensureImagesFor(['s500'], deps500);
+  assert.equal(a, 1, 'statusCode=500は文言が混雑でも即error');
+  assert.equal(st1.errors, 1);
+  let b = 0;
+  const e429 = Object.assign(new Error('HTTP 429'), { statusCode: 429 });
+  const deps429 = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['s429', 's429']]) }),
+    fetchDetails: async () => { b++; throw e429; },
+    sleep: async () => {},
+  };
+  await ensureImagesFor(['s429'], deps429);
+  assert.equal(b, 4, 'statusCode=429は文言に関わらず再試行');
+  // body.error は構造化マーカー: statusCodeが500でも混雑として再試行する
+  let c = 0;
+  const eBody = Object.assign(new Error('proxy relay error'), { statusCode: 500, body: { error: 'RATE_LIMIT_QUEUE_FULL' } });
+  const depsBody = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['sbody', 'sbody']]) }),
+    fetchDetails: async () => { c++; throw eBody; },
+    sleep: async () => {},
+  };
+  await ensureImagesFor(['sbody'], depsBody);
+  assert.equal(c, 4, 'body.error=RATE_LIMIT_QUEUE_FULLはstatusCodeに関わらず再試行');
+  console.log('  ok: isQueueFull: 構造 (statusCode/body) 優先で判定 (async)');
+}
+
+{
+  // 60件=2チャンク: 前半チャンク成功・後半チャンクだけ混雑 → 成功済みチャンクは再送しない
+  const skus = Array.from({ length: 60 }, (_, i) => `blk${String(i).padStart(2, '0')}`);
+  const itemNumbers = new Map(skus.map((s) => [s, s]));
+  const calls = [];
+  const deps = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers }),
+    fetchDetails: async (mns) => {
+      calls.push(mns.length);
+      if (mns.includes('blk50')) throw Object.assign(new Error('queue full'), { statusCode: 429 });
+      return { items: mns.map((mn) => ({ manageNumber: mn, whiteBgImage: { location: `/w_${mn}.jpg` } })), failed: [] };
+    },
+    sleep: async () => {},
+  };
+  const stats = await ensureImagesFor(skus, deps);
+  assert.equal(stats.ok, 50, '成功チャンクの50件は解決');
+  assert.equal(stats.errors, 10, '混雑チャンクの10件だけerror');
+  assert.deepEqual(calls, [50, 10, 10, 10, 10], '成功済みチャンクは再送されない');
+  const row = getDB().prepare("SELECT status FROM pk_product_images WHERE ne_code='blk55'").get();
+  assert.equal(row.status, 'error');
+  const okRow = getDB().prepare("SELECT status FROM pk_product_images WHERE ne_code='blk10'").get();
+  assert.equal(okRow.status, 'ok');
+  console.log('  ok: ensureImagesFor: チャンク単位リトライ・部分失敗は該当SKUのみerror (async)');
+}
+
+{
+  // 同一SKU集合がキューにいる間は積み直さない (作業画面の連続オープン対策)
+  const { queueEnsureImages } = await import('../images.js');
+  let runs = 0;
+  const deps = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['dupsku', 'dupsku']]) }),
+    fetchDetails: async () => { runs++; return { items: [], failed: [] }; },
+  };
+  queueEnsureImages(['dupsku'], 'a', deps);
+  queueEnsureImages(['dupsku'], 'b', deps);   // 同一集合 → skip
+  await queueEnsureImages(['DupSku '], 'c', deps);   // 正規化後も同一 → skip
+  assert.equal(runs, 1, '同一SKU集合はキュー内で1回だけ実行');
+  const deps2 = {
+    loadMaps: () => ({ rakutenByNe: new Map(), itemNumbers: new Map([['othersku', 'othersku']]) }),
+    fetchDetails: async () => { runs++; return { items: [], failed: [] }; },
+  };
+  await queueEnsureImages(['othersku'], 'd', deps2);   // 別集合は通る (キーが掃除されている)
+  assert.equal(runs, 2);
+  console.log('  ok: queueEnsureImages: 同一SKU集合の重複enqueueを排除 (async)');
+}
+
+console.log(`\ntest-images: ${passed + 8} 件 pass`);
