@@ -27,12 +27,16 @@ const stat = () => getRateLimitStatus()[mall];
 let passed = 0;
 const t = (name) => { passed++; console.log(`  ok: ${name}`); };
 
-// 1. 正常完了: finish + close が両方発火しても release は1回 (activeが負にならない)
+// 1. 正常完了: finish + close が両方発火しても release は1回 (activeが負にならない)。
+//    req.destroyed=true でも res が生きていれば処理する — Node 24 では body を読み終えた
+//    正常な POST でも req.destroyed が true になる (2026-08-14 実測。全POST無応答の回帰防止)
 {
   const res = fakeRes();
   let nexted = false;
-  await mw(fakeReq(), res, () => { nexted = true; });
-  assert.equal(nexted, true);
+  const req = fakeReq();
+  req.destroyed = true;   // 正常POSTのbody読了後の状態
+  await mw(req, res, () => { nexted = true; });
+  assert.equal(nexted, true, 'req.destroyed=trueでもresが生きていればnextへ進む');
   assert.equal(stat().active, 1);
   res.emit('finish');
   res.emit('close');
