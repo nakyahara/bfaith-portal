@@ -194,7 +194,8 @@
   <!-- 完了画面 -->
   <div class="screen" id="scr-done">
     <div class="center">
-      <h2>✅ ピッキング完了</h2>
+      <!-- どの出荷フォルダを終えたかを離れた場所からでも読めるサイズで出す (2026-08-14 中原さん要望) -->
+      <div id="doneTitle" style="font-size: clamp(28px, 9vw, 56px); font-weight: 800; color: #69db7c; line-height: 1.25; margin-bottom: 10px;">✅ ピッキング完了</div>
       <div class="stats" id="doneStats"></div>
       <a href="/apps/picking/" class="bigbtn" style="display:block; text-decoration:none; line-height:1.2; padding:20px 0;">一覧へ戻る</a>
       <button id="undoDoneBtn" style="background:#1c2127; color:#adb5bd; border:1px solid #343a40; border-radius:10px; padding:10px 18px; font-size:15px; cursor:pointer;">← 誤操作で完了した (最後の明細に戻る)</button>
@@ -267,6 +268,7 @@
       startedAt: state.batch.started_at, lineCount: state.lines.length,
       totalQty: state.batch.total_qty, currentSeq: state.currentSeq,
       pauseReason: state.batch.pause_reason || null,
+      folderName: state.batch.folder_name || null,
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
@@ -393,13 +395,16 @@
       if (!voiceOn || !l) return;
       if (!force && l.seq === lastSpokenSeq) return;   // 同じ明細の再render (画像後追い等) では繰り返さない
       const p = locParts(l.loc);
+      // 数量2以上は「複数」を前置して聞き逃しを防ぐ (2026-08-14 中原さん要望。
+      // 数字の聞き間違いより「複数かどうか」を先に耳で確定させる)
+      const qtyPart = l.qty >= 2 ? `複数、${l.qty}個` : `${l.qty}個`;
       let text;
       if (p) {
         // ブロック名は1文字ずつ区切って「ピー サン エフ ビー」と読ませる
         const blockPart = (p.block && p.block !== lastSpokenBlock) ? `${p.block.split('').join(' ')}、` : '';
-        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${l.qty}個`;
+        text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${qtyPart}`;
       } else {
-        text = `${l.loc}、${l.qty}個`;   // 形式外ラベルはそのまま
+        text = `${l.loc}、${qtyPart}`;   // 形式外ラベルはそのまま
       }
       speak(text);
       lastSpokenSeq = l.seq;
@@ -457,8 +462,14 @@
     });
 
     function renderDone() {
+      // 「出荷_28 完了しました。」— フォルダ名が無い手動取込バッチは従来表示のまま
+      const folderJa = BATCH.folderName ? BATCH.folderName.replace('_', ' ') : null;
+      if (folderJa) $('doneTitle').textContent = `✅ ${folderJa} 完了しました`;
       // 作業からの遷移時のみ完了を読み上げ (完了済みバッチを開いただけでは喋らない)
-      if (voiceOn && lastSpokenSeq != null) { speak('ピッキング完了'); lastSpokenSeq = null; }
+      if (voiceOn && lastSpokenSeq != null) {
+        speak(folderJa ? `${folderJa}、ピッキング完了` : 'ピッキング完了');
+        lastSpokenSeq = null;
+      }
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;
       const secs = startMs ? Math.max(0, Math.round((Date.now() - startMs) / 1000)) : null;
       const perLine = secs != null && LINES.length > 0 ? (secs / LINES.length).toFixed(1) : '-';
