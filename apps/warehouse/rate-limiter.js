@@ -95,8 +95,28 @@ export function rateLimitMiddleware(mall) {
     }
 
     await sem.acquire();
-    // レスポンス完了時にリリース
-    res.on('finish', () => sem.release());
+    // レスポンス完了時にリリース。'finish' だけだとクライアント切断 (タイムアウト等) で
+    // 発火せずセマフォが永久リークする — 2026-08-14 実測: rakuten が active=1/pending=5 の
+    // まま固着し、以後の全リクエストが429になった。'close' は正常完了でも発火するので
+    // 二重release しないようワンショットにする。
+    // ⭐切断時releaseでは処理本体 (ハンドラ) がまだ走っていて「同時1」が一瞬破れるが、
+    //   実際のAPIレート制御は各クライアント (rakuten-client.js の queueTail 直列+MIN_GAP等)
+    //   に一元化されており、このセマフォは入場制限にすぎないため許容する (Codexレビュー確認済み)
+    let released = false;
+    const releaseOnce = () => {
+      if (released) return;
+      released = true;
+      res.removeListener('finish', releaseOnce);
+      res.removeListener('close', releaseOnce);
+      sem.release();
+    };
+    res.on('finish', releaseOnce);
+    res.on('close', releaseOnce);
+    // acquire 待ちの間に切断済みなら、処理せず即返す ('close' は既に発火済みで拾えない)
+    if (res.destroyed || req.destroyed || res.writableEnded) {
+      releaseOnce();
+      return;
+    }
     next();
   };
 }
