@@ -695,6 +695,55 @@
       else doBack();
     }, { passive: true });
 
+    // ── Bluetoothリモコンのキー操作 (JX-05等のHIDリング 2026-08-15 中原さん要望) ──
+    // ページ送り系モードのリングはBluetoothキーボードとして矢印/PageUp/Down等を送る。
+    //   前進系キー = 次へ (画面下タップと同じ) / 後退系キー = 今のロケを再読み上げ
+    //   (誤押下で作業が巻き戻らないよう「戻る」はキーに割り当てない。戻るは画面ボタンで)
+    // ⚠ リングのカメラ/音量モードはiOSが音量キーとして消費し、ブラウザには届かない。
+    //   対応外キーは画面下に小さくキー名を出す = どのモードで何が届くかの現地調整用
+    const KEYS_NEXT = ['ArrowDown', 'ArrowRight', 'PageDown', ' ', 'Enter', 'MediaTrackNext'];
+    const KEYS_SPEAK = ['ArrowUp', 'ArrowLeft', 'PageUp', 'MediaTrackPrevious'];
+    let lastRemoteKeyAt = 0;
+    function sheetOpen() {
+      return ['shortSheet', 'pauseSheet', 'workerPick'].some((id) => {
+        const el = $(id);
+        return el && el.style.display !== 'none' && el.style.display !== '';
+      });
+    }
+    function keyToast(msg) {
+      let el = $('keyToast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'keyToast';
+        el.style.cssText = 'position:fixed; bottom:8px; left:50%; transform:translateX(-50%); background:#343a40; color:#dee2e6; padding:4px 12px; border-radius:8px; font-size:13px; z-index:99; opacity:0.9; pointer-events:none;';
+        document.body.appendChild(el);
+      }
+      el.textContent = msg;
+      el.style.display = 'block';
+      clearTimeout(el._t);
+      el._t = setTimeout(() => { el.style.display = 'none'; }, 2000);
+    }
+    document.addEventListener('keydown', (e) => {
+      if (e.repeat) return;                                    // 長押しの自動リピートで連打しない
+      const tag = (e.target && e.target.tagName) || '';
+      if (/INPUT|TEXTAREA|SELECT/.test(tag)) return;           // 入力欄への打鍵は素通し
+      if (sheetOpen()) return;                                  // 欠品/中断/作業者シート表示中は無効
+      if (!started || !$('scr-pick').classList.contains('active')) return;   // 作業中のみ
+      if (KEYS_NEXT.includes(e.key)) {
+        e.preventDefault();
+        const now = Date.now();
+        if (now - lastRemoteKeyAt < 350) return;               // チャタリング・二重送信ガード
+        lastRemoteKeyAt = now;
+        $('nextBtn').click();
+      } else if (KEYS_SPEAK.includes(e.key)) {
+        e.preventDefault();
+        const idx = currentIdx();
+        if (idx !== -1 && voiceOn) { lastSpokenBlock = null; speakLine(LINES[idx], true); }
+      } else if (e.key !== 'Unidentified') {
+        keyToast(`未割当キー: ${e.key}`);                       // リング設定調整の手がかり
+      }
+    });
+
     // ── 画像の後追い反映 (取込直後は解決がバックグラウンド進行中のことがある) ──
     // 画像なしの明細が残っている間だけ5秒間隔で最大12回ポーリングし、届き次第反映する
     let imgPolls = 0;
