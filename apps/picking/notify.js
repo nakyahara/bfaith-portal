@@ -6,6 +6,9 @@
  *     チャネルアクセストークン)。⚠ LINE Notify は2025-03終了のため Messaging API を使う。
  *     env PICKING_LINE_TO (カンマ区切りの userId/groupId) があれば push、
  *     無ければ broadcast (公式アカウントを友だち追加した全員に届く。社内専用アカウント前提)
+ *   - 土日祝 (JST) は env PICKING_LINE_TO_HOLIDAY があればそちらへ送る
+ *     (2026-08-15 中原さん要望: 休日は別の休日専用LINEグループに通知)。
+ *     未設定の土日祝は平日と同じ PICKING_LINE_TO へ (通知が消えるより誤配のほうがまし)
  *   - Google Chat: env PICKING_ALERT_WEBHOOK (旧経路。互換のため残す)
  *
  * - どちらも未設定なら何もしない (導入前でも動く)
@@ -14,8 +17,23 @@
  */
 
 import crypto from 'node:crypto';
+import { isJstWeekendOrHoliday } from './jp-holiday.js';
 
 const TIMEOUT_MS = 5000;
+
+const parseTo = (v) => String(v || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+/**
+ * LINEのpush宛先を決める。土日祝 (JST) は PICKING_LINE_TO_HOLIDAY を優先し、
+ * 未設定なら平日と同じ宛先へフォールバック (通知の取りこぼしを作らない)。
+ * @returns {{to: string[], holiday: boolean}} to が空なら broadcast
+ */
+export function resolveLineTo(now = new Date()) {
+  const holiday = isJstWeekendOrHoliday(now);
+  const holidayTo = parseTo(process.env.PICKING_LINE_TO_HOLIDAY);
+  if (holiday && holidayTo.length > 0) return { to: holidayTo, holiday };
+  return { to: parseTo(process.env.PICKING_LINE_TO), holiday };
+}
 
 /** 読み手ファースト (現場の管理者が次の行動を決められる形) の欠品メッセージ。 */
 export function buildShortageText({ batch, line, worker, shortageQty }) {
@@ -50,12 +68,12 @@ async function postJson(url, headers, body) {
 }
 
 /** LINE Messaging API へ送信。宛先指定 (push) か全友だち (broadcast)。 */
-async function sendLine(text) {
+async function sendLine(text, now = new Date()) {
   const token = process.env.PICKING_LINE_CHANNEL_TOKEN;
   if (!token) return false;
   const headers = { Authorization: `Bearer ${token}` };
   const messages = [{ type: 'text', text }];
-  const to = String(process.env.PICKING_LINE_TO || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const { to } = resolveLineTo(now);
   if (to.length > 0) {
     for (const id of to) {
       await postJson('https://api.line.me/v2/bot/message/push', headers, { to: id, messages });
@@ -78,10 +96,10 @@ async function sendGChat(text) {
  * 欠品通知。設定済みの経路すべてへ送る。片方の失敗でもう片方を止めない。
  * @returns {'disabled'|'sent'} 全経路失敗は throw (呼び出し側が warn ログ)
  */
-export async function notifyShortage(info) {
+export async function notifyShortage(info, now = new Date()) {
   if (!process.env.PICKING_LINE_CHANNEL_TOKEN && !process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
   const text = buildShortageText(info);
-  const results = await Promise.allSettled([sendLine(text), sendGChat(text)]);
+  const results = await Promise.allSettled([sendLine(text, now), sendGChat(text)]);
   const failures = results.filter((r) => r.status === 'rejected');
   const sent = results.some((r) => r.status === 'fulfilled' && r.value === true);
   if (!sent) {

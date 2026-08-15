@@ -89,6 +89,72 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: 片方失敗はsent・全滅はthrow (async)');
 }
 
+// ─── 祝日判定 (jp-holiday.js) ───
+{
+  const { isJpHolidayJst, isJstWeekendOrHoliday } = await import('../jp-holiday.js');
+  const jst = (s) => new Date(`${s}T10:00:00+09:00`);
+  t('jp-holiday: 2026年の固定祝日・ハッピーマンデー・春秋分', () => {
+    assert.equal(isJpHolidayJst(jst('2026-01-01')), true, '元日');
+    assert.equal(isJpHolidayJst(jst('2026-01-12')), true, '成人の日 (1月第2月曜)');
+    assert.equal(isJpHolidayJst(jst('2026-03-20')), true, '春分');
+    assert.equal(isJpHolidayJst(jst('2026-08-11')), true, '山の日');
+    assert.equal(isJpHolidayJst(jst('2026-09-21')), true, '敬老の日 (9月第3月曜)');
+    assert.equal(isJpHolidayJst(jst('2026-09-23')), true, '秋分');
+    assert.equal(isJpHolidayJst(jst('2025-03-20')), true, '2025春分 (別年の式検証)');
+  });
+  t('jp-holiday: 振替休日と国民の休日', () => {
+    assert.equal(isJpHolidayJst(jst('2026-05-06')), true, '5/3憲法記念日が日曜→5/4,5/5も祝日→振替は5/6');
+    assert.equal(isJpHolidayJst(jst('2026-09-22')), true, '敬老の日と秋分に挟まれた国民の休日');
+    assert.equal(isJpHolidayJst(jst('2026-05-07')), false, '振替の翌日は平日');
+  });
+  t('jp-holiday: 土日と平日・JST境界', () => {
+    assert.equal(isJstWeekendOrHoliday(jst('2026-08-15')), true, '土曜');
+    assert.equal(isJpHolidayJst(jst('2026-08-15')), false, '土曜は祝日ではない');
+    assert.equal(isJstWeekendOrHoliday(jst('2026-08-17')), false, '平日の月曜');
+    // UTCではまだ日曜でも、JSTで月曜朝なら平日 (2026-08-16 23:00Z = JST 8/17 08:00)
+    assert.equal(isJstWeekendOrHoliday(new Date('2026-08-16T23:00:00Z')), false, 'JST基準で判定');
+    assert.equal(isJstWeekendOrHoliday(new Date('2026-08-14T16:00:00Z')), true, 'JST 8/15(土) 01:00');
+  });
+  t('jp-holiday: サポート範囲 (2022〜) 外は平日扱い (五輪特例等の過去年を誤判定しない)', () => {
+    assert.equal(isJpHolidayJst(jst('2021-07-22')), false, '2021五輪特例 (海の日移動) は範囲外=判定しない');
+    assert.equal(isJpHolidayJst(jst('2020-08-10')), false, '2020特例も範囲外');
+    assert.equal(isJpHolidayJst(jst('2022-01-01')), true, '範囲の下限2022年は判定する');
+  });
+}
+
+// ─── 土日祝の送り分け (PICKING_LINE_TO_HOLIDAY) ───
+{
+  const { resolveLineTo } = await import('../notify.js');
+  const sat = new Date('2026-08-15T10:00:00+09:00');
+  const mon = new Date('2026-08-17T10:00:00+09:00');
+  const holiday = new Date('2026-09-22T10:00:00+09:00');   // 国民の休日 (火曜)
+  process.env.PICKING_LINE_TO = 'Cnormal';
+  process.env.PICKING_LINE_TO_HOLIDAY = 'Choliday';
+  t('resolveLineTo: 土日祝は休日宛先・平日は通常宛先', () => {
+    assert.deepEqual(resolveLineTo(sat).to, ['Choliday'], '土曜');
+    assert.deepEqual(resolveLineTo(holiday).to, ['Choliday'], '平日の祝日');
+    assert.deepEqual(resolveLineTo(mon).to, ['Cnormal'], '平日');
+  });
+  t('resolveLineTo: 休日宛先が未設定なら土日祝も通常宛先へフォールバック', () => {
+    delete process.env.PICKING_LINE_TO_HOLIDAY;
+    assert.deepEqual(resolveLineTo(sat).to, ['Cnormal']);
+  });
+  // エンドツーエンド: notifyShortage が土曜に休日グループへpushする
+  process.env.PICKING_LINE_TO_HOLIDAY = 'Choliday';
+  failUrls = new Set();
+  calls.length = 0;
+  await notifyShortage(INFO, sat);
+  const pushTos = calls.filter((c) => c.url.endsWith('/push')).map((c) => c.body.to);
+  assert.deepEqual(pushTos, ['Choliday'], '土曜の欠品は休日ラインのみへ');
+  calls.length = 0;
+  await notifyShortage(INFO, mon);
+  assert.deepEqual(calls.filter((c) => c.url.endsWith('/push')).map((c) => c.body.to), ['Cnormal']);
+  console.log('  ok: notifyShortage: 土曜=休日ライン・平日=通常ライン (async)');
+  // 後続テストへの影響を戻す
+  delete process.env.PICKING_LINE_TO_HOLIDAY;
+  process.env.PICKING_LINE_TO = 'Uaaa, Cbbb';
+}
+
 // ─── webhook 署名検証 (groupId取得用) ───
 {
   const { handleLineWebhook } = await import('../notify.js');
@@ -200,4 +266,4 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: プロパティ名の全角/半角ゆれを同一視 (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 9} 件 pass`);
+console.log(`\ntest-notify: ${passed + 10} 件 pass`);
