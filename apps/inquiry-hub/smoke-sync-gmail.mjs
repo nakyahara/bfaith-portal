@@ -321,6 +321,53 @@ console.log('5. 送信');
   try { await createGmailAdapter({ ...CRED, fetchImpl: f500, sendMode: 'live' }).sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: 'c@x.com', subject: 'a' }, bodyText: 'x' }); } catch (e) { e500 = e; }
   check('send 5xx は汎用エラー (→unknown)', e500 !== null && !(e500 instanceof SendRejectedError));
 
+  // 5c-2. 宛先フォールバック (2026-08-15 実測: customer_identifier='' の問い合わせで送信が
+  // send_failed になった)。スレッドの実効差出人 (自社ドメイン以外の最後の顧客) から宛先を復元する
+  {
+    const metaFb = { id: 'g1', messages: [
+      { id: 'm1', payload: { headers: [{ name: 'From', value: 'B-Faith <info@b-faith.biz>' }] } },
+      { id: 'm2', payload: { headers: [{ name: 'From', value: '復元 太郎 <Fukugen@Example.com>' }, { name: 'Message-ID', value: '<mid-2@x>' }] } },
+      { id: 'm3', payload: { headers: [{ name: 'From', value: 'B-Faith <info@b-faith.biz>' }, { name: 'Message-ID', value: '<mid-3@x>' }] } },
+    ] };
+    let fbBody = null;
+    const fFb = mockFetch((url) => url.includes('/threads/') ? { body: metaFb } : { body: { id: 'sent-fb', threadId: 'g1' } });
+    const fFbCap = async (url, opts) => { if (url.includes('messages/send')) fbBody = JSON.parse(opts.body); return fFb(url, opts); };
+    fFbCap.calls = fFb.calls;
+    const sentFb = await createGmailAdapter({ ...CRED, fetchImpl: fFbCap, sendMode: 'live' })
+      .sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: '', subject: 'a' }, bodyText: 'x' });
+    const mimeFb = Buffer.from(fbBody.raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    check('宛先フォールバック: スレッド末尾から顧客差出人を復元 (自社ドメインは飛ばす・小文字化)',
+      sentFb.externalReplyId === 'sent-fb' && mimeFb.includes('To: fukugen@example.com'));
+    check('宛先フォールバック: In-Reply-To は従来どおり最終メッセージ', mimeFb.includes('In-Reply-To: <mid-3@x>'));
+
+    // DMARC書き換え (via グループ) のメッセージからも X-Original-Sender で復元できる
+    const metaDm = { id: 'g1', messages: [
+      { id: 'm1', payload: { headers: [
+        { name: 'From', value: "'ある送信元' via B-Faith <info@b-faith.biz>" },
+        { name: 'X-Original-Sender', value: 'customer-x@example.net' },
+        { name: 'Message-ID', value: '<mid-dm@x>' },
+      ] } },
+    ] };
+    let dmBody = null;
+    const fDm = mockFetch((url) => url.includes('/threads/') ? { body: metaDm } : { body: { id: 'sent-dm', threadId: 'g1' } });
+    const fDmCap = async (url, opts) => { if (url.includes('messages/send')) dmBody = JSON.parse(opts.body); return fDm(url, opts); };
+    fDmCap.calls = fDm.calls;
+    await createGmailAdapter({ ...CRED, fetchImpl: fDmCap, sendMode: 'live' })
+      .sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: '', subject: 'a' }, bodyText: 'x' });
+    const mimeDm = Buffer.from(dmBody.raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    check('宛先フォールバック: DMARC書き換えは X-Original-Sender から復元', mimeDm.includes('To: customer-x@example.net'));
+
+    // 顧客が1人も居ないスレッド (自社発の通知のみ) は従来どおり拒否 (未送信確定)
+    const metaOwn = { id: 'g1', messages: [{ id: 'm1', payload: { headers: [{ name: 'From', value: 'B-Faith <info@b-faith.biz>' }] } }] };
+    const fOwn = mockFetch((url) => url.includes('/threads/') ? { body: metaOwn } : { body: {} });
+    let eOwn = null;
+    try {
+      await createGmailAdapter({ ...CRED, fetchImpl: fOwn, sendMode: 'dryrun' })
+        .sendReply({ inquiry: { external_inquiry_id: 'g1', customer_identifier: '', subject: 'a' }, bodyText: 'x' });
+    } catch (e) { eOwn = e; }
+    check('宛先フォールバック: 顧客不在スレッドは SendRejectedError のまま', eOwn instanceof SendRejectedError);
+  }
+
   // 5d-1. DRYRUNではジョブを一切消費しない (tick=プレビューのみ / runOutboxPass直呼びでもpendingへ戻す)
   const mailShop = db.prepare("SELECT id FROM shops WHERE channel_type = 'email'").get().id;
   const inqRow = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'g1'").get(mailShop);

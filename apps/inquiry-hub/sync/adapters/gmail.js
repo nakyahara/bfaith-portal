@@ -57,6 +57,32 @@ const headerOf = (payload, name) => {
   return h ? String(h.value) : '';
 };
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * From ヘッダから実効差出人を解決する (受信同期の顧客判定と送信時の宛先フォールバックで共用)。
+ * 厳格DMARCの送信元 (Amazon等) は Googleグループが From を
+ * 「'元差出人' via グループ名 <info@b-faith.biz>」に書き換える (2026-07-18実測)。
+ * そのまま判定すると自社ドメイン=店舗側メッセージと誤判定するため、
+ * グループが残す X-Original-Sender (無ければ Reply-To) から元の差出人を復元する
+ */
+export function effectiveFromOf(payload) {
+  let from = parseFromHeader(headerOf(payload, 'From'));
+  const looksRewritten = from.mailbox && from.mailbox.endsWith('@' + OWN_DOMAIN)
+    && (headerOf(payload, 'X-Original-Sender') || / via /i.test(headerOf(payload, 'From')));
+  if (looksRewritten) {
+    const orig = parseFromHeader(headerOf(payload, 'X-Original-Sender'));
+    const fallback = parseFromHeader(headerOf(payload, 'Reply-To'));
+    const eff = orig.mailbox ? orig : fallback;
+    if (eff.mailbox) {
+      // 表示名は「'元差出人' via グループ名」の via 以降を落とす
+      const cleanName = (from.name || '').replace(/\s*via\s.+$/i, '').replace(/^'(.*)'$/, '$1').trim();
+      from = { name: eff.name || cleanName || null, mailbox: eff.mailbox };
+    }
+  }
+  return from;
+}
+
 const b64urlToBuf = s => Buffer.from(String(s || '').replace(/-/g, '+').replace(/_/g, '/'), 'base64');
 
 /** ざっくりHTML→テキスト (text/plain が無いメール用。表示・ルール評価に十分な精度でよい) */
@@ -115,23 +141,8 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
   }
   const mapped = msgs.map(m => {
     const payload = m.payload || {};
-    let from = parseFromHeader(headerOf(payload, 'From'));
-    // Googleグループ (info@b-faith.biz) のDMARC書き換え対策 (2026-07-18実測):
-    // 厳格DMARCの送信元 (Amazon等) は From が「'元差出人' via グループ名 <info@b-faith.biz>」に
-    // 書き換えられる。そのまま判定すると自社ドメイン=店舗側メッセージと誤判定するため、
-    // グループが残す X-Original-Sender (無ければ Reply-To) から元の差出人を復元する
-    const looksRewritten = from.mailbox && from.mailbox.endsWith('@' + OWN_DOMAIN)
-      && (headerOf(payload, 'X-Original-Sender') || / via /i.test(headerOf(payload, 'From')));
-    if (looksRewritten) {
-      const orig = parseFromHeader(headerOf(payload, 'X-Original-Sender'));
-      const fallback = parseFromHeader(headerOf(payload, 'Reply-To'));
-      const eff = orig.mailbox ? orig : fallback;
-      if (eff.mailbox) {
-        // 表示名は「'元差出人' via グループ名」の via 以降を落とす
-        const cleanName = (from.name || '').replace(/\s*via\s.+$/i, '').replace(/^'(.*)'$/, '$1').trim();
-        from = { name: eff.name || cleanName || null, mailbox: eff.mailbox };
-      }
-    }
+    // DMARC書き換え復元込みの実効差出人 (effectiveFromOf 参照)
+    const from = effectiveFromOf(payload);
     const fromDomain = from.mailbox ? from.mailbox.slice(from.mailbox.indexOf('@') + 1) : '';
     const isShop = fromDomain === OWN_DOMAIN;
     const { text, html, attachments } = walkPayload(payload);
@@ -329,30 +340,47 @@ export function createGmailAdapter(cfg = {}) {
      */
     async sendReply({ inquiry, bodyText, dryRun = false }) {
       requests = 0;
-      const to = String(inquiry?.customer_identifier || '').trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
-        throw new SendRejectedError(`宛先メールアドレスを特定できません (customer_identifier='${inquiry?.customer_identifier || ''}')`);
-      }
-      headerSafe('宛先', to);
+      let to = String(inquiry?.customer_identifier || '').trim().toLowerCase();
       const threadId = String(inquiry?.external_inquiry_id || '');
       if (!threadId) throw new SendRejectedError('Gmailスレッド外部IDがありません');
       const subjectBase = headerSafe('件名', String(inquiry?.subject || 'お問い合わせについて').trim() || 'お問い合わせについて');
       const subject = /^re:/i.test(subjectBase) ? subjectBase : `Re: ${subjectBase}`;
 
-      // スレッド返信ヘッダの材料 (この時点の失敗 = 未送信確定)
+      // スレッド返信ヘッダの材料 + 宛先フォールバック (この時点の失敗 = 未送信確定)
       let inReplyTo = '', references = '';
       try {
-        const t = await apiGet(`threads/${encodeURIComponent(threadId)}?format=metadata&metadataHeaders=Message-ID&metadataHeaders=References`, 'send-thread-meta');
-        const last = (t.messages || [])[t.messages.length - 1];
+        const t = await apiGet(`threads/${encodeURIComponent(threadId)}?format=metadata`
+          + '&metadataHeaders=Message-ID&metadataHeaders=References'
+          + '&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=X-Original-Sender', 'send-thread-meta');
+        const msgs = t.messages || [];
+        const last = msgs[msgs.length - 1];
         const msgId = headerOf(last?.payload, 'Message-ID');
         const prevRefs = headerOf(last?.payload, 'References');
         if (msgId) {
           inReplyTo = headerSafe('In-Reply-To', msgId);
           references = headerSafe('References', prevRefs ? `${prevRefs} ${msgId}`.slice(-2000) : msgId);
         }
+        // 宛先フォールバック (2026-08-15 実測): customer_identifier が空の問い合わせがあり
+        // 送信できなかった — 店舗発のみで始まったスレッドや From 解析不能ケースで空になる。
+        // スレッド内の最後の顧客メッセージ (自社ドメイン以外の実効差出人) から宛先を復元する
+        if (!EMAIL_RE.test(to)) {
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const eff = effectiveFromOf(msgs[i].payload || {});
+            if (eff.mailbox && EMAIL_RE.test(eff.mailbox) && !eff.mailbox.endsWith('@' + OWN_DOMAIN)) {
+              to = eff.mailbox;
+              console.log(`[gmail-send] 宛先をスレッドから復元: ${to} (customer_identifier が空。thread=${threadId.slice(0, 12)}…)`);
+              break;
+            }
+          }
+        }
       } catch (e) {
         throw new SendRejectedError(`返信ヘッダの取得に失敗 (未送信): ${String(e?.message || e).slice(0, 200)}`);
       }
+      if (!EMAIL_RE.test(to)) {
+        throw new SendRejectedError(`宛先メールアドレスを特定できません (customer_identifier='${inquiry?.customer_identifier || ''}'。`
+          + 'スレッド内にも顧客の差出人が見つかりません — 顧客への送信手段がないメール (自社発の通知等) の可能性があります)');
+      }
+      headerSafe('宛先', to);
 
       const headers = [
         `From: ${mimeWord(fromName)} <${headerSafe('From', fromAddress)}>`,
