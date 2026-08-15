@@ -20,7 +20,7 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, getInquiryDetail, getAdjacentInquiries } from './queries.js';
+import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, countInboxByGroup, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
@@ -106,6 +106,28 @@ router.get('/', (req, res) => {
   // 任意フォルダ (サイドバーから ?folder=<id> で来る。ビュー条件とはANDで重なる)
   const folders = listFolders();
   const curFolder = /^\d+$/.test(String(q.folder || '')) ? folders.find(f => f.id === Number(q.folder)) : null;
+  // 上部タブ (メール / モール問い合わせ)。ビューやフォルダとはANDで重なる
+  const group = CHANNEL_GROUPS[q.group] ? q.group : '';
+
+  // ─── 上部タブ: すべて / メール / モール問い合わせ (2026-08-15 スタッフ要望) ───
+  // どのビュー・画面からでも「いまメール/モールに新着が何件あるか」が見え、1クリックで切り替える。
+  // バッジは常に「新着 (受信トレイ)」の件数 = いま自分が対応すべき件数 (表示中のビューとは独立)。
+  // タブ切替では channel (個別チャネルの絞り込み) と page をリセットし、他の条件は維持する
+  let inboxCounts = {};
+  try { inboxCounts = countInboxByGroup(); } catch { /* 初期化前などは件数なしで表示 */ }
+  const tabLink = (g) => {
+    const u = new URLSearchParams(Object.entries(q).filter(([k, v]) => !['group', 'channel', 'page'].includes(k) && v !== '' && v != null));
+    if (g) u.set('group', g);
+    const qs = u.toString();
+    return `/apps/inquiry-hub${qs ? `?${qs}` : ''}`;
+  };
+  const tabCnt = (n) => `<span class="tab-cnt${n ? '' : ' zero'}" title="新着 (受信トレイ) の件数">新着${n || 0}</span>`;
+  const chTabs = `
+  <nav class="ch-tabs">
+    <a class="${group === '' ? 'on' : ''}" href="${he(tabLink(''))}">🗂️ すべて ${tabCnt(inboxCounts.all)}</a>
+    ${Object.entries(CHANNEL_GROUPS).map(([key, g]) =>
+      `<a class="${group === key ? 'on' : ''}" href="${he(tabLink(key))}">${g.icon} ${he(g.label)} ${tabCnt(inboxCounts[key])}</a>`).join('')}
+  </nav>`;
 
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
@@ -118,6 +140,7 @@ router.get('/', (req, res) => {
   <div class="fbody">
   <form method="get" class="filters">
     <input type="hidden" name="view" value="${he(view)}">
+    ${group ? `<input type="hidden" name="group" value="${he(group)}">` : ''}
     <select name="status"><option value="">状態: 全て</option>${Object.entries(STATUSES).map(([k, v]) => opt(k, `${v.label} (${countMap[k] || 0})`, q.status)).join('')}</select>
     <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
     <select name="shop"><option value="">店舗: 全て</option>${shops.map(s => opt(s.id, `${(CHANNELS[s.channel_type] || {}).label || s.channel_type} / ${s.shop_name}`, q.shop)).join('')}</select>
@@ -129,7 +152,7 @@ router.get('/', (req, res) => {
     <input type="date" name="from" value="${he(q.from || '')}" title="受信日 From">〜<input type="date" name="to" value="${he(q.to || '')}" title="受信日 To">
     <input type="search" name="q" value="${he(kw)}" placeholder="顧客名/件名/本文/注文番号/商品コード" style="min-width:240px">
     <button class="pri">検索</button>
-    <a href="/apps/inquiry-hub?view=${he(view)}${curFolder ? `&folder=${curFolder.id}` : ''}" class="ghost btn-link">クリア</a>
+    <a href="/apps/inquiry-hub?view=${he(view)}${curFolder ? `&folder=${curFolder.id}` : ''}${group ? `&group=${he(group)}` : ''}" class="ghost btn-link">クリア</a>
   </form>
   </div>
   </details>`;
@@ -146,14 +169,16 @@ router.get('/', (req, res) => {
     return `返信待ち (${days === 0 ? '本日' : days + '日'})`;
   };
 
+  // 詳細画面へ引き継ぐ文脈 (戻るリンク・前後ナビが同じ一覧に沿う)
+  const detailQs = `?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}${group ? `&group=${group}` : ''}`;
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
-    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}'">
+    <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}${detailQs}'">
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
@@ -184,6 +209,7 @@ router.get('/', (req, res) => {
       ? `🗃️ <b>未分類</b> — フォルダに入れていない問い合わせ <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
       : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
   const body = `
+  ${chTabs}
   <div class="view-hint">${hintLine}</div>
   ${filterBar}
   <div class="card">
@@ -210,7 +236,7 @@ router.get('/', (req, res) => {
   })();`;
   res.send(pageShell(
     curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${VIEWS[view].label}`,
-    curFolder ? `folder:${curFolder.id}` : view, body, listScript));
+    curFolder ? `folder:${curFolder.id}` : view, body, listScript, { group }));
 });
 
 // ─── 詳細画面 ───
@@ -219,11 +245,12 @@ router.get('/inquiries/:id', (req, res) => {
   const detail = getInquiryDetail(id);
   if (!detail) return res.status(404).send(pageShell('問い合わせ管理', DEFAULT_VIEW, '<div class="card empty">問い合わせが見つかりません。<a href="/apps/inquiry-hub">一覧に戻る</a></div>', ''));
   const { inquiry: inq, messages, attachments, notes, logs, draft } = detail;
-  // 戻り先のビュー (一覧から ?view=/?folder= を引き継ぐ。直リンク時は受信トレイ)
+  // 戻り先のビュー (一覧から ?view=/?folder=/?group= を引き継ぐ。直リンク時は受信トレイ)
   const backView = VIEWS[req.query?.view] ? req.query.view : DEFAULT_VIEW;
   const backFolderId = /^\d+$/.test(String(req.query?.folder || '')) ? Number(req.query.folder) : null;
   const backFolder = backFolderId ? listFolders().find(f => f.id === backFolderId) : null;
-  const backUrl = `/apps/inquiry-hub?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const backGroup = CHANNEL_GROUPS[req.query?.group] ? req.query.group : '';
+  const backUrl = `/apps/inquiry-hub?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}${backGroup ? `&group=${he(backGroup)}` : ''}`;
   const attByMsg = {};
   for (const a of attachments) (attByMsg[a.inquiry_message_id] = attByMsg[a.inquiry_message_id] || []).push(a);
 
@@ -337,7 +364,12 @@ router.get('/inquiries/:id', (req, res) => {
         ${outboxHtml}
         ${activeJob
           ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
-          : `<textarea id="replyBody" rows="6" placeholder="返信本文 (テンプレートは📄タブからコピーして貼り付け)"></textarea>
+          : `<div class="row tpl-row" id="tplRow">
+          <select id="tplCat" title="テンプレートのカテゴリ"><option value="">📄 全カテゴリ</option></select>
+          <select id="tplSel" title="テンプレートを選ぶ"><option value="">テンプレートを選ぶ…</option></select>
+          <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
+        </div>
+        <textarea id="replyBody" rows="6" placeholder="返信本文 (上のテンプレート選択からも入れられます)"></textarea>
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
@@ -386,10 +418,10 @@ router.get('/inquiries/:id', (req, res) => {
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
 
-  // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder) で隣へ移動。
+  // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder/group) で隣へ移動。
   // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
-  const adj = getAdjacentInquiries(id, { view: backView, folder: backFolder ? String(backFolder.id) : '' });
-  const navQs = `?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}`;
+  const adj = getAdjacentInquiries(id, { view: backView, folder: backFolder ? String(backFolder.id) : '', group: backGroup });
+  const navQs = `?view=${he(backView)}${backFolder ? `&folder=${backFolder.id}` : ''}${backGroup ? `&group=${he(backGroup)}` : ''}`;
   const navLink = (row, label) => row
     ? `<a href="/apps/inquiry-hub/inquiries/${row.id}${navQs}" title="${he(row.subject || '(件名なし)')}">${label}</a>`
     : `<span class="nav-off" aria-disabled="true">${label}</span>`;
@@ -573,6 +605,66 @@ router.get('/inquiries/:id', (req, res) => {
         .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
     });
   }
+  // 📄 テンプレート選択 → 本文へ反映 (2026-08-15 スタッフ要望: 📄タブへ行き来せずその場で入れる)。
+  // 一覧は初回操作時に1回だけ取得 (全文を含むためページ埋め込みにしない)
+  var tplRow = document.getElementById('tplRow');
+  if (tplRow) (function() {
+    var tplCat = document.getElementById('tplCat');
+    var tplSel = document.getElementById('tplSel');
+    var TPLS = null, tplLoading = null;
+    function loadTpls() {
+      if (tplLoading) return tplLoading;
+      tplLoading = fetch('/apps/inquiry-hub/api/templates')
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(j) {
+          TPLS = j.templates || [];
+          (j.categories || []).forEach(function(c) {
+            var o = document.createElement('option');
+            o.value = c; o.textContent = '📁 ' + c;
+            tplCat.appendChild(o);
+          });
+          fillTplSel();
+        })
+        .catch(function(e) { tplLoading = null; toast('テンプレート取得失敗: ' + e.message); });
+      return tplLoading;
+    }
+    function fillTplSel() {
+      if (!TPLS) return;
+      var cat = tplCat.value;
+      var cur = tplSel.value;
+      tplSel.textContent = '';
+      var head = document.createElement('option');
+      head.value = ''; head.textContent = 'テンプレートを選ぶ… (' + TPLS.filter(function(t) { return !cat || t.category === cat; }).length + '件)';
+      tplSel.appendChild(head);
+      TPLS.forEach(function(t) {
+        if (cat && t.category !== cat) return;
+        var o = document.createElement('option');
+        o.value = String(t.id);
+        o.textContent = (cat ? '' : (t.category ? t.category + ' / ' : '')) + t.name;
+        tplSel.appendChild(o);
+      });
+      tplSel.value = cur;
+      if (tplSel.selectedIndex < 0) tplSel.value = '';
+    }
+    // マウスが返信パネルに乗った時点で先読みして、セレクトを開いた時には並んでいる状態にする
+    tplRow.addEventListener('pointerover', loadTpls, { once: true });
+    tplCat.addEventListener('focus', loadTpls);
+    tplSel.addEventListener('focus', loadTpls);
+    tplCat.addEventListener('change', fillTplSel);
+    function applyTpl() {
+      var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
+      if (!t) { toast('テンプレートを選んでください'); return; }
+      var ta = document.getElementById('replyBody');
+      var text = t.body + (t.bodyBottom ? '\\n\\n' + t.bodyBottom : '');
+      if (ta.value.trim() && !confirm('返信欄の内容をテンプレート「' + t.name + '」で置き換えますか?')) return;
+      ta.value = text;
+      ta.focus();
+      toast('テンプレート「' + t.name + '」を反映しました。内容を確認・編集してください');
+    }
+    document.getElementById('tplApplyBtn').addEventListener('click', applyTpl);
+    // セレクトで選んだだけでも反映する (ボタンは空欄時の説明・視認性のために残す)
+    tplSel.addEventListener('change', function() { if (tplSel.value) applyTpl(); });
+  })();
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
@@ -589,7 +681,7 @@ router.get('/inquiries/:id', (req, res) => {
   });`;
 
   res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`,
-    backFolder ? `folder:${backFolder.id}` : backView, body, script));
+    backFolder ? `folder:${backFolder.id}` : backView, body, script, { group: backGroup }));
 });
 
 // ─── 操作API (すべて操作ログを記録) ───
@@ -607,6 +699,22 @@ router.use('/api/', (req, res, next) => {
     if (!req.is('application/json')) return res.status(415).json({ error: 'Content-Type は application/json が必要です' });
   }
   next();
+});
+
+// 返信エディタのテンプレート選択用 (2026-08-15 スタッフ要望)。📄タブと同じ listTemplates を
+// JSONで返す。本文全文を含むため詳細ページには埋め込まず、初回操作時にここから取得する
+router.get('/api/templates', (req, res) => {
+  const { rows, categories } = listTemplates({});
+  res.json({
+    categories: categories.map(c => c.category),
+    templates: rows.map(t => ({
+      id: t.id,
+      name: t.template_name,
+      category: t.category || '',
+      body: t.template_body || '',
+      bodyBottom: t.body_bottom || '',
+    })),
+  });
 });
 
 const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"; // 日時の正準形式 (db.js toUtcIso と同形)
@@ -1843,6 +1951,16 @@ button.pri { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
 button:disabled { opacity: .5; cursor: default; }
 .pager { padding: 10px; display: flex; gap: 16px; justify-content: center; color: #475569; }
 .pager a { color: #1d4ed8; }
+/* ═══ 上部タブ (すべて / メール / モール問い合わせ)。バッジ=新着件数 ═══ */
+.ch-tabs { display: flex; gap: 6px; border-bottom: 2px solid #cbd5e1; margin-bottom: 14px; flex-wrap: wrap; }
+.ch-tabs a { padding: 9px 16px; border-radius: 10px 10px 0 0; color: #475569; font-weight: 600;
+  border: 1px solid transparent; border-bottom: none; margin-bottom: 0; white-space: nowrap; }
+.ch-tabs a:hover { background: #e2e8f0; text-decoration: none; }
+.ch-tabs a.on { background: #fff; color: #1d4ed8; border-color: #cbd5e1;
+  position: relative; top: 2px; padding-bottom: 11px; }
+.tab-cnt { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 999px;
+  padding: 1px 8px; font-size: 12px; margin-left: 2px; vertical-align: 1px; }
+.tab-cnt.zero { background: #f1f5f9; color: #94a3b8; }
 .detail-head h2 { margin: 8px 0 12px; font-size: 18px; }
 .detail-nav { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .detail-nav-adj { display: flex; gap: 14px; }
@@ -1883,6 +2001,10 @@ figure.att-img.att-err .att-fail { display: block; }
 .panel label { display: block; margin-bottom: 8px; font-size: 13px; color: #334155; }
 .panel select, .panel input[type=text], .panel textarea { width: 100%; padding: 6px 8px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 13px; margin-top: 2px; }
 .panel .row { display: flex; gap: 6px; }
+/* 返信パネルのテンプレート選択行 */
+.tpl-row { margin-bottom: 8px; flex-wrap: wrap; }
+.tpl-row #tplCat { max-width: 40%; }
+.tpl-row #tplSel { flex: 1; min-width: 160px; }
 .panel .row input { flex: 1; }
 .panel textarea { resize: vertical; }
 .note { border-top: 1px solid #e2e8f0; padding: 8px 0; }
@@ -2009,6 +2131,10 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   table.cardable td.ops { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
   table.cardable td.ops button { margin: 0; flex: 1 1 auto; }
 
+  /* 上部タブ: スマホでは詰めて全タブが1〜2行に収まるように */
+  .ch-tabs { gap: 4px; }
+  .ch-tabs a { padding: 8px 10px; font-size: 13px; }
+
   /* 詳細画面 */
   .detail-head h2 { font-size: 16px; }
   .msg { padding: 10px 12px; }
@@ -2032,7 +2158,7 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
  * active: 'inbox'|'sent'|'done'|'all'|'folder:<id>'|'folders'|'templates'|'qa'|'mailrules'|'admin'
  * PCではサイドバー常時表示、スマホでは ☰ で開くドロワー
  */
-function pageShell(title, active, body, script) {
+function pageShell(title, active, body, script, opts = {}) {
   // 受信箱の件数はサイドバーに出す (Gmailの「受信トレイ (12)」と同じ位置づけ)。
   // 一覧以外の画面でも出すが、失敗しても画面は出す (fail-soft)
   let counts = {};
@@ -2042,20 +2168,22 @@ function pageShell(title, active, body, script) {
       <span class="nav-icon">${icon}</span><span class="nav-label">${label}</span>
       ${count ? `<span class="nav-count">${count}</span>` : ''}
     </a>`;
+  // 上部タブ (メール/モール) を選択中はサイドバーのビュー移動でも維持する
+  const groupQs = CHANNEL_GROUPS[opts.group] ? `&group=${opts.group}` : '';
   // 任意フォルダ (スタッフが作る分類箱)。件数は「そのフォルダの未対応 (新着・対応中・保留)」を出す
   // = 受信トレイと同じ「自分のタスク」基準。失敗しても画面は出す (fail-soft)
   let folderNav = [];
   try { folderNav = listFolders({ withCounts: true }); } catch { /* 初期化前などは出さない */ }
   const folderItems = folderNav.map(f =>
-    navItem(`/apps/inquiry-hub?view=all&folder=${f.id}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
+    navItem(`/apps/inquiry-hub?view=all&folder=${f.id}${groupQs}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
 
   const sidebar = `
   <aside class="side-nav" id="sideNav">
     <div class="nav-group">
-      ${navItem('/apps/inquiry-hub?view=inbox', '📥', '受信トレイ', 'inbox', counts.inbox)}
-      ${navItem('/apps/inquiry-hub?view=sent', '📤', '送信済み', 'sent', counts.sent)}
-      ${navItem('/apps/inquiry-hub?view=done', '✅', '対応済み', 'done', 0)}
-      ${navItem('/apps/inquiry-hub?view=all', '🗂️', 'すべて', 'all', 0)}
+      ${navItem(`/apps/inquiry-hub?view=inbox${groupQs}`, '📥', '受信トレイ', 'inbox', counts.inbox)}
+      ${navItem(`/apps/inquiry-hub?view=sent${groupQs}`, '📤', '送信済み', 'sent', counts.sent)}
+      ${navItem(`/apps/inquiry-hub?view=done${groupQs}`, '✅', '対応済み', 'done', 0)}
+      ${navItem(`/apps/inquiry-hub?view=all${groupQs}`, '🗂️', 'すべて', 'all', 0)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">

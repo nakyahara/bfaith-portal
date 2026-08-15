@@ -20,6 +20,7 @@ import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAY
 import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DAYS } from './adapters/yahoo.js';
 import { createGmailAdapter, resolveGmailTransportFromEnv } from './adapters/gmail.js';
 import { sendGChatMessage } from '../../profit-analysis/gchat-client.js';
+import { pingJobThrottled } from '../../jobs-monitor/ping-local.js';
 
 export const DEFAULT_SYNC_CRON = '*/15 * * * *';
 // UTC 20:37 = JST 05:37。miniPC daily-sync (JST 07:00) 前の静かな時間帯で、かつ通常同期の
@@ -294,7 +295,11 @@ export function startInquiryHubOutboxCron() {
   const rkMode = process.env.INQUIRY_HUB_RAKUTEN_SEND_MODE === 'live' ? 'live' : 'dryrun';
   const yhMode = process.env.INQUIRY_HUB_YAHOO_SEND_MODE === 'live' ? 'live' : 'dryrun';
   const timer = setInterval(() => {
-    runInquiryHubOutboxTick().catch((e) => console.error('[inquiry-hub-outbox] 未捕捉例外:', e));
+    runInquiryHubOutboxTick()
+      // dead-man 生存 ping (台帳 config/jobs-registry.mjs)。tick 内の個別失敗は別経路で
+      // 通知されるため、ここは「ワーカーが回っていること」だけを1時間に1回報告する
+      .then(() => pingJobThrottled('inquiry-hub-outbox', `送信ワーカー稼働中 (メール:${mailMode}/楽天:${rkMode}/Yahoo:${yhMode})`))
+      .catch((e) => console.error('[inquiry-hub-outbox] 未捕捉例外:', e));
   }, intervalMs);
   timer.unref?.(); // プロセス終了を妨げない
   console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, モード= メール:${mailMode} / 楽天:${rkMode} / Yahoo:${yhMode} (dryrunは実送信しません)`);
@@ -323,7 +328,11 @@ export function startInquiryHubSyncCron() {
   // timezone 明示 (host TZ 依存を避ける。rys-cron と同型)
   const tasks = [
     cron.schedule(syncExpr, () => {
-      runInquiryHubSyncTick().catch((e) => console.error('[inquiry-hub-cron] 未捕捉例外:', e));
+      runInquiryHubSyncTick()
+        // dead-man 生存 ping (台帳 config/jobs-registry.mjs)。店舗単位の失敗は sync_errors +
+        // 3連続失敗GChat が担うので、ここは「同期cronが回っていること」だけを報告する
+        .then(() => pingJobThrottled('inquiry-hub-sync', '受信同期cron稼働中 (15分間隔)'))
+        .catch((e) => console.error('[inquiry-hub-cron] 未捕捉例外:', e));
     }, { timezone: 'UTC' }),
     cron.schedule(deepExpr, () => {
       runInquiryHubSyncTick({ deep: true }).catch((e) => console.error('[inquiry-hub-cron] 未捕捉例外 (deep):', e));

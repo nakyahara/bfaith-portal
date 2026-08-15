@@ -48,7 +48,8 @@ const KNOWN = {
   'apps/ai-insights/notify-job.js': { count: 1, exempt: 'Dark Launch (AI_INSIGHTS_NOTIFY_ENABLED)。点火時に要登録' },
   'apps/rakuten-yahoo-sync/services/rys-cron.js': { count: 1, exempt: 'Dark Launch (RYS_FULL_SYNC_CRON_ENABLED)。点火時に要登録' },
   'apps/shipping-log/notion-staff.js': { count: 1, exempt: 'Dark Launch (SHIPPING_STAFF_CRON_ENABLED)。点火時に要登録' },
-  'apps/inquiry-hub/sync/cron.js': { count: 3, exempt: 'Dark Launch (INQUIRY_HUB_*_CRON_ENABLED)。点火時に要登録' },
+  // 3箇所 = 受信同期 (inquiry-hub-sync: sync+deep) + 送信ワーカー (inquiry-hub-outbox)。台帳は2エントリ
+  'apps/inquiry-hub/sync/cron.js': { count: 3, job: 'inquiry-hub-sync' },
   'apps/render-backup/backup-render.js': { count: 2, exempt: 'Dark Launch (RENDER_BACKUP_CRON_ENABLED)。点火時に要登録' },
 
   // ── 業務ジョブではないもの ──
@@ -66,6 +67,7 @@ const KNOWN = {
 
   // ── miniPC 側で動く (Render では起動しない) ──
   'apps/warehouse/auto-import.js': { count: 1, exempt: 'miniPC の取込ウォッチャ。台帳では warehouse-daily-sync 側で見ている' },
+  'apps/picking/drive-sync.js': { count: 1, job: 'picking-drive-poller' },
 
   // ── 起動していない死にコード ──
   'apps/profit-calculator/price-scheduler.js': { count: 3, exempt: 'server.js の呼び出しがコメントアウト済み = 未起動 (2026-03-30〜)' },

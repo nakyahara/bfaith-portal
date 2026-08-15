@@ -54,6 +54,32 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] を確認。失敗台帳は picking.db pk_drive_imports。'
       + 'ping には miniPC の C:\\tools\\bfaith-picking\\.env に JOBS_MONITOR_TOKEN が必要。復旧は Restart-Service PickingServer',
   },
+  // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
+  {
+    id: 'inquiry-hub-sync',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '問い合わせ受信同期 (楽天R-Messe / Yahoo! / Gmail を15分間隔で取込)。止まると新着問い合わせが画面に出ず、スタッフが返信漏れに気づけない',
+    where: 'Render bfaith-portal 常駐 (apps/inquiry-hub/sync/cron.js startInquiryHubSyncCron。env INQUIRY_HUB_SYNC_CRON_ENABLED)',
+    schedule: '常駐 (15分間隔 + deep 日次JST05:37。生存 ping は1時間に1回へ間引き)',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render ログの [inquiry-hub-cron] を確認。店舗単位の失敗は ⚙️運用管理 (/apps/inquiry-hub/admin) の同期状態・sync_errors。復旧は Render 再デプロイ',
+  },
+  {
+    id: 'inquiry-hub-outbox',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '問い合わせ返信の送信ワーカー (outbox_replies を30秒間隔で処理)。止まると返信ジョブが送信されないまま滞留する (スタッフは送信済みのつもりになる)',
+    where: 'Render bfaith-portal 常駐 (apps/inquiry-hub/sync/cron.js startInquiryHubOutboxCron。env INQUIRY_HUB_OUTBOX_CRON_ENABLED)',
+    schedule: '常駐 (30秒間隔。生存 ping は1時間に1回へ間引き)',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render ログの [inquiry-hub-outbox] を確認。要対応ジョブ (unknown/needs_review) は ⚙️運用管理 (/apps/inquiry-hub/admin)。復旧は Render 再デプロイ。'
+      + '⚠️env INQUIRY_HUB_OUTBOX_CRON_ENABLED=true を入れるまでは ping が来ない (=有効化とこの台帳エントリはセット)',
+  },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
   {
     id: 'mall-csv-fetch-all',
