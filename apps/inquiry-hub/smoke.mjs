@@ -131,6 +131,20 @@ check('検索: 本文 (メッセージ横断)', listInquiries({ view: 'all', q: 
 check('検索: LIKE特殊文字がリテラル扱い (% は0件)', listInquiries({ view: 'all', q: '99%' }).total === 0);
 check('検索: _ を含む語の完全リテラル一致', listInquiries({ view: 'all', q: '100%オーガニックですか_特殊記号' }).total === 1);
 check('検索: ヒットなし', listInquiries({ view: 'all', q: '存在しない語ゼブラ' }).total === 0);
+// 上部タブ = チャネルグループ (mail=email / mall=rakuten+yahoo)
+{
+  const { CHANNEL_GROUPS, countInboxByGroup } = await import('./queries.js');
+  check('グループ定義: mail=email / mall=rakuten+yahoo',
+    JSON.stringify(CHANNEL_GROUPS.mail.channels) === JSON.stringify(['email'])
+    && JSON.stringify(CHANNEL_GROUPS.mall.channels) === JSON.stringify(['rakuten', 'yahoo']));
+  check('group=mail は email のみ', listInquiries({ view: 'all', group: 'mail' }).total === 2);
+  check('group=mall は 楽天+Yahoo!', listInquiries({ view: 'all', group: 'mall' }).total === 1);
+  check('不正な group は無視', listInquiries({ view: 'all', group: 'bogus' }).total === 3);
+  check('group と channel はAND (mall×email=0件)', listInquiries({ view: 'all', group: 'mall', channel: 'email' }).total === 0);
+  // 新着件数: inq1=email open / inq2=rakuten in_progress / inq3=email done (doneは新着に入らない)
+  const c = countInboxByGroup();
+  check('countInboxByGroup: mail=1 mall=1 all=2', c.mail === 1 && c.mall === 1 && c.all === 2);
+}
 check('likeEsc', likeEsc('a%b_c\\d') === 'a\\%b\\_c\\\\d');
 check('msg_count 付与', listInquiries({ view: 'all', q: 'ORD-200' }).rows[0].msg_count === 2);
 check('ページング: page=2 は空', listInquiries({ view: 'all', page: '2' }).rows.length === 0 && PAGE_SIZE === 50);
@@ -216,6 +230,11 @@ check('詳細: 非整数は null', getInquiryDetail(NaN) === null);
   check('前後ナビ: 末尾行は next なし', last.prev?.id === inq1 && last.next === null);
   const inbox = getAdjacentInquiries(inq1, { view: 'inbox' });
   check('前後ナビ: ビュー絞り込みを反映 (完了は隣に出ない)', inbox.prev?.id === inq2 && inbox.next === null);
+  // 上部タブ (group) の文脈: メールタブ中は email だけで隣を探す (楽天 inq2 は飛ばす)
+  const grpMail = getAdjacentInquiries(inq1, { view: 'all', group: 'mail' });
+  check('前後ナビ: group=mail はメールだけで隣を探す', grpMail.prev === null && grpMail.next?.id === inq3);
+  const grpMall = getAdjacentInquiries(inq2, { view: 'all', group: 'mall' });
+  check('前後ナビ: group=mall は1件のみ=両隣なし', grpMall.prev === null && grpMall.next === null);
   check('前後ナビ: 存在しないidは両方null',
     JSON.stringify(getAdjacentInquiries(99999)) === JSON.stringify({ prev: null, next: null })
     && JSON.stringify(getAdjacentInquiries(NaN)) === JSON.stringify({ prev: null, next: null }));
