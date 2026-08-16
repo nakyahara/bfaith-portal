@@ -523,7 +523,10 @@ const ep = parseCs03003(makeCsv([
 const er = importPackBatch(ep, { matchAck: true }, 'test');
 applyEvent(er.batchId, { opId: 'e-s1', event: 'start' }, '星');
 
-t('pause/resume: 中断時間が paused_total_sec に積まれる (clientAtクランプ)', () => {
+t('pause/resume: 中断時間が paused_total_sec に積まれる (clientAtクランプ・下限=開始時刻)', () => {
+  // クランプ下限がバッチ開始時刻のため、開始を10分前に遡らせてから5分前の中断を報告する
+  getDB().prepare('UPDATE pk_pack_batches SET started_at=? WHERE id=?')
+    .run(new Date(Date.now() - 600_000).toISOString().slice(0, 19) + 'Z', er.batchId);
   const t0 = new Date(Date.now() - 300_000).toISOString();   // 5分前に中断
   applyEvent(er.batchId, { opId: 'e-p1', event: 'pause', reason: '休憩', clientAt: t0 }, '星');
   assert.equal(getPackBatch(er.batchId).status, 'paused');
@@ -532,6 +535,16 @@ t('pause/resume: 中断時間が paused_total_sec に積まれる (clientAtク�
   const b = getPackBatch(er.batchId);
   assert.equal(b.status, 'packing');
   assert.ok(b.paused_total_sec >= 290 && b.paused_total_sec <= 310, `5分前後のはず: ${b.paused_total_sec}`);
+});
+
+t('pause: 開始時刻より前の clientAt は now に丸められる (時計ズレで計測が壊れない)', () => {
+  const p2 = parseCs03003(makeCsv([row({ slip: '0140', sku: 'cl1', tb: 'TB00000000003' })]));
+  const r2 = importPackBatch(p2, { matchAck: true }, 'test');
+  applyEvent(r2.batchId, { opId: 'cl-s', event: 'start' }, '星');
+  applyEvent(r2.batchId, { opId: 'cl-p', event: 'pause', reason: '休憩',
+    clientAt: new Date(Date.now() - 3600_000).toISOString() }, '星');   // 開始前=1時間前を主張
+  applyEvent(r2.batchId, { opId: 'cl-r', event: 'resume' }, '星');
+  assert.ok(getPackBatch(r2.batchId).paused_total_sec < 10, '丸められてほぼ0のはず');
 });
 
 t('ズレ回復ジャンプ: jumped=trueで順序外の完了ができ、飛ばした伝票が残ると完了しない', () => {

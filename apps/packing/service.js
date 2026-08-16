@@ -302,19 +302,19 @@ export function checkPickingMatch(preview) {
   for (const r of db.prepare(
     'SELECT slip_no, sku, SUM(qty) qty FROM pk_slip_lines WHERE batch_id = ? GROUP BY slip_no, sku'
   ).all(pk.id)) {
-    const key = `${r.slip_no} ${normSku(r.sku)}`;
+    const key = `${r.slip_no}\u0000${normSku(r.sku)}`;
     pickMap.set(key, (pickMap.get(key) || 0) + r.qty);
   }
   const packMap = new Map();
   for (const s of preview.slips) {
     for (const l of s.lines) {
-      const key = `${s.slipNo} ${normSku(l.sku)}`;
+      const key = `${s.slipNo}\u0000${normSku(l.sku)}`;
       packMap.set(key, (packMap.get(key) || 0) + l.qty);
     }
   }
 
   const diffs = [];
-  const fmt = (key) => key.replace(' ', ' × ');
+  const fmt = (key) => key.replace('\u0000', ' × ');
   for (const [key, qty] of packMap) {
     const pq = pickMap.get(key);
     if (pq == null) diffs.push(`納品書のみ: ${fmt(key)} (${qty}個) — ピッキング側にない`);
@@ -509,12 +509,17 @@ export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その
 // ④ 配送方法変更の理由 (要件§5.7)
 export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その他'];
 
-/** 端末の発生時刻を「now以前・24時間以内」にクランプ (中断時間の計測用。picking と同じ)。 */
-function clampedEventTime(clientAt, now) {
+/**
+ * 端末の発生時刻を [floor, now] にクランプ (中断時間の計測用)。
+ * floor = バッチ開始時刻等 (Codexレビュー medium: 端末時計のズレで開始前の時刻を
+ * pause_started_at に入れると、実作業時間以上の中断秒が加算されて計測が壊れる)
+ */
+function clampedEventTime(clientAt, now, floor = null) {
   const t = Date.parse(clientAt || '');
   const nowMs = Date.parse(now);
+  const floorMs = floor ? Date.parse(floor) : nowMs - 24 * 3600 * 1000;
   if (!Number.isFinite(t)) return now;
-  if (t > nowMs || t < nowMs - 24 * 3600 * 1000) return now;
+  if (t > nowMs || t < floorMs) return now;
   return new Date(t).toISOString().slice(0, 19) + 'Z';
 }
 
@@ -631,13 +636,13 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       requireOwner();
       const r = PAUSE_REASONS.includes(reason) ? reason : 'その他';
       db.prepare(`UPDATE pk_pack_batches SET status='paused', pause_started_at=?, pause_reason=?, updated_at=? WHERE id=?`)
-        .run(clampedEventTime(clientAt, now), r, now, batchId);
+        .run(clampedEventTime(clientAt, now, batch.started_at), r, now, batchId);
     } else if (event === 'resume') {
       if (batch.status !== 'paused') {
         throw new PackError(409, 'not_paused', `中断中ではありません (${batch.status})`);
       }
       requireOwner();
-      const resumeAt = clampedEventTime(clientAt, now);
+      const resumeAt = clampedEventTime(clientAt, now, batch.pause_started_at);
       const pausedSec = Math.max(0, Math.round((Date.parse(resumeAt) - Date.parse(batch.pause_started_at || resumeAt)) / 1000));
       db.prepare(`
         UPDATE pk_pack_batches SET status='packing', paused_total_sec = paused_total_sec + ?,
@@ -653,8 +658,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         UPDATE pk_pack_batches SET status='ready', worker=NULL, started_at=NULL, finished_at=NULL,
           paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
       `).run(now, batchId);
-      db.prepare("UPDATE pk_pack_slips SET status='pending', shown_at=NULL, done_at=NULL WHERE batch_id=?")
+      db.prepare("UPDATE pk_pack_slips SET status='pending', hold_reason=NULL, shown_at=NULL, done_at=NULL WHERE batch_id=?")
         .run(batchId);
+      // 未対応の配送変更依頼を孤児化させない (Codexレビュー high: 取消後に事務が変更を実施すると
+      // 梱包済み内容と配送方法が食い違う)。取消と同時に依頼も cancelled にする
+      db.prepare(`
+        UPDATE pk_pack_ship_changes SET status='cancelled', office_by='(バッチ取消)', updated_at=?
+        WHERE batch_id=? AND status IN ('requested','accepted')
+      `).run(now, batchId);
     } else if (event === 'undo') {
       // 完了取消 (理由必須・監査ログ=このイベント自体)。対象は「最後に完了した伝票」のみ
       // (途中の伝票に飛び戻ると納品書の束と画面の対応が壊れる)。バッチ完了直後も取り消せる

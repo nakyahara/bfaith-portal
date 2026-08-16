@@ -161,7 +161,7 @@ const MIGRATIONS = {
       reason          TEXT NOT NULL,
       requested_by    TEXT NOT NULL,
       status          TEXT NOT NULL DEFAULT 'requested'
-        CHECK(status IN ('requested','accepted','rejected','completed')),
+        CHECK(status IN ('requested','accepted','rejected','completed','cancelled')),
       office_by       TEXT,
       updated_at      TEXT NOT NULL,
       created_at      TEXT NOT NULL

@@ -276,7 +276,7 @@ router.get('/admin/ship-changes', requireAdmin, (req, res) => {
   });
 });
 
-router.post('/admin/ship-changes/:id(\d+)/status', checkOrigin, requireAdmin, api(async (req, res) => {
+router.post('/admin/ship-changes/:id(\\d+)/status', checkOrigin, requireAdmin, api(async (req, res) => {
   const status = String(req.body.status || '');
   if (!['accepted', 'rejected', 'completed'].includes(status)) {
     throw new PackError(400, 'bad_status', 'status が不正です');
@@ -296,6 +296,7 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     doneCount: s.doneCount,
     slipCount: s.slips.length,
     doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
+    heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
     lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
     pauseReason: s.batch.pause_reason || null,
   });
