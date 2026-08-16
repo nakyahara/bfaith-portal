@@ -66,18 +66,19 @@ export async function buildSearchReplyMessages(query, deps) {
   const q = String(query || '').trim();
   if (!q) return [{ type: 'text', text: USAGE }];
   if (q.length < 2) return [{ type: 'text', text: `キーワードは2文字以上で送ってください。${USAGE}` }];
+  if (q.length > 100) return [{ type: 'text', text: 'キーワードが長すぎます (100文字まで)。' }];
   const result = await deps.fetchStockSearch(q);
   if (!result) return [{ type: 'text', text: '在庫データを取得できませんでした。少し待ってもう一度送ってください。' }];
-  const items = result.items;
-  if (items.length === 0) return [{ type: 'text', text: `「${q}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` }];
+  // LINE側の上限対策: postback data 300文字 / label 20文字 / 本文はSKUごとの商品名を切り詰め。
+  // 異常に長いSKU (data上限を超える) は件数分岐の前に除外する (1件ヒットの経路にも通さない)
+  const items = result.items.filter((it) => String(it.sku).length <= 200);
+  const notFound = () => [{ type: 'text', text: `「${q.slice(0, 30)}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` }];
+  if (items.length === 0) return notFound();
   if (items.length === 1) {
     const text = await buildStockText(items[0].sku, deps);
-    return [{ type: 'text', text: text || `該当データが見つかりませんでした (${items[0].sku})。` }];
+    return [{ type: 'text', text: text || `該当データが見つかりませんでした (${String(items[0].sku).slice(0, 40)})。` }];
   }
-  // LINE側の上限対策: postback data 300文字 / label 20文字 / 本文はSKUごとの商品名を切り詰め。
-  // 異常に長いSKU (data上限を超える) は候補から外す (1件のために返信全体が400になるのを防ぐ)
-  const top = items.filter((it) => String(it.sku).length <= 200).slice(0, MAX_CANDIDATES);
-  if (top.length === 0) return [{ type: 'text', text: `「${q}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` }];
+  const top = items.slice(0, MAX_CANDIDATES);
   const shortName = (it) => String(it.name || it.sku).slice(0, 30);
   const lines = top.map((it, i) => `${CIRCLED[i]} ${shortName(it)} — フリー${it.free}`);
   if (items.length > MAX_CANDIDATES) lines.push(`…他にも候補があります (${MAX_CANDIDATES}件まで表示)。キーワードを絞ってください`);
@@ -111,34 +112,47 @@ export async function buildPostbackReplyMessages(data, deps) {
   return [{ type: 'text', text: text || `該当データが見つかりませんでした (${sku.slice(0, 40)})。在庫が動いた可能性があります。もう一度検索してください。` }];
 }
 
-// webhook再送 (LINE側リトライ) の重複処理よけ。webhookEventId を10分だけ記録する
+// webhook再送 (LINE側リトライ) の重複処理よけ。webhookEventId を10分だけ記録する。
+// 開始時に「予約」し、処理失敗・返信失敗なら予約を消す (再送での自己回復を妨げない)
 const DEDUP_TTL_MS = 10 * 60 * 1000;
-const _seenEvents = new Map();   // webhookEventId → 記録時刻
+const DEDUP_MAX = 5000;
+const _seenEvents = new Map();   // webhookEventId → 記録時刻 (Mapは挿入順=先頭が最古)
 
-function isDuplicateEvent(ev, nowMs = Date.now()) {
+function reserveEvent(ev, nowMs = Date.now()) {
   const id = ev?.webhookEventId;
-  if (!id) return false;   // IDが無いイベントは判定不能=処理する
-  for (const [k, at] of _seenEvents) { if (nowMs - at > DEDUP_TTL_MS) _seenEvents.delete(k); }
-  if (_seenEvents.has(id)) return true;
-  if (_seenEvents.size < 5000) _seenEvents.set(id, nowMs);
-  return false;
+  if (!id) return { duplicate: false, release: () => {} };   // IDが無いイベントは判定不能=処理する
+  // 期限切れ掃除は先頭 (最古) から、期限内に当たったら打ち切り (毎回の全件走査を避ける)
+  for (const [k, at] of _seenEvents) {
+    if (nowMs - at > DEDUP_TTL_MS) _seenEvents.delete(k);
+    else break;
+  }
+  if (_seenEvents.has(id)) return { duplicate: true, release: () => {} };
+  if (_seenEvents.size >= DEDUP_MAX) _seenEvents.delete(_seenEvents.keys().next().value);   // 最古を追い出す
+  _seenEvents.set(id, nowMs);
+  return { duplicate: false, release: () => _seenEvents.delete(id) };
 }
 
 async function handleOneEvent(ev, d) {
+  if (!ev || !ev.replyToken || !isSearchSource(ev.source)) return;
+  const dedup = reserveEvent(ev);
+  if (dedup.duplicate) return;   // 再送は無視 (reply token使用済みエラーのノイズ防止)
   try {
-    if (!ev || !ev.replyToken || !isSearchSource(ev.source)) return;
-    if (isDuplicateEvent(ev)) return;   // 再送は無視 (reply token使用済みエラーのノイズ防止)
+    let sent = true;   // 返信対象外のイベント種別は「処理済み」でよい
     if (ev.type === 'message' && ev.message?.type === 'text') {
-      const messages = await buildSearchReplyMessages(ev.message.text, d);
-      await d.reply(ev.replyToken, messages);
+      sent = await d.reply(ev.replyToken, await buildSearchReplyMessages(ev.message.text, d));
     } else if (ev.type === 'postback') {
       const messages = await buildPostbackReplyMessages(ev.postback?.data, d);
-      if (messages) await d.reply(ev.replyToken, messages);
+      if (messages) sent = await d.reply(ev.replyToken, messages);
     }
+    if (!sent) dedup.release();   // 返信失敗はLINEの再送で自己回復させる
   } catch (e) {
+    dedup.release();
     console.warn(`[line-search] イベント処理失敗 (スキップ): ${e.message}`);
   }
 }
+
+// 1 webhookに大量イベントが来ても下流 (warehouse / LINE reply) へ一斉に流さない
+const CONCURRENCY = 5;
 
 /**
  * webhook イベント列を処理して必要な返信を送る (fire-and-forget 前提・全 fail-soft)。
@@ -152,5 +166,8 @@ export async function processLineEvents(events, deps = {}) {
     reply: replyLine,
     ...deps,
   };
-  await Promise.allSettled((events || []).map((ev) => handleOneEvent(ev, d)));
+  const list = events || [];
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    await Promise.allSettled(list.slice(i, i + CONCURRENCY).map((ev) => handleOneEvent(ev, d)));
+  }
 }

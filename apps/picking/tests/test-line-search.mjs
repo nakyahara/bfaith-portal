@@ -102,12 +102,24 @@ await t('postback: 不正なdata (長すぎ/制御文字/空) は無視', async 
   assert.equal(await buildPostbackReplyMessages('stock:   ', deps()), null);
 });
 
-await t('検索: 異常に長いSKUは候補から除外 (1件のために返信全体を400にしない)', async () => {
+await t('検索: 異常に長いSKUは件数分岐の前に除外 (残り1件なら即ロケ表示)', async () => {
   const msgs = await buildSearchReplyMessages('テスト', deps({
     fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('x'.repeat(250), '変なSKU', 5), ITEM('okone', '正常な商品', 3)] }),
   }));
-  assert.equal(msgs[0].quickReply.items.length, 1);
-  assert.equal(msgs[0].quickReply.items[0].action.data, 'stock:okone');
+  assert.ok(msgs[0].text.includes('(okone)') && msgs[0].text.includes('在庫ロケーション'), msgs[0].text);
+  assert.equal(msgs[0].quickReply, undefined);
+  // 長大SKUしか無ければ「見つからない」扱い (locations照会にも本文にも載せない)
+  const onlyBad = await buildSearchReplyMessages('テスト', deps({
+    fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('x'.repeat(250), '変なSKU', 5)] }),
+  }));
+  assert.ok(onlyBad[0].text.includes('見つかりませんでした'), onlyBad[0].text);
+});
+
+await t('検索: 100文字超のキーワードは拒否・0件応答は入力を30文字に切り詰め', async () => {
+  const long = await buildSearchReplyMessages('あ'.repeat(101), deps());
+  assert.ok(long[0].text.includes('長すぎます'), long[0].text);
+  const echo = await buildSearchReplyMessages('か'.repeat(100), deps({ fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [] }) }));
+  assert.ok(!echo[0].text.includes('か'.repeat(31)), '0件応答に長い入力を全文エコーしない');
 });
 
 // ─── processLineEvents (e2e・応答場所の制御) ───
@@ -133,6 +145,26 @@ await t('processLineEvents: webhook再送 (同一webhookEventId) は1回だけ�
   await processLineEvents([ev], d);
   await processLineEvents([{ ...ev, replyToken: 'rd2' }], d);
   assert.deepEqual(sent, ['rd1'], '再送は2回目を処理しない');
+});
+
+await t('processLineEvents: 返信失敗・例外時は予約を解いて再送で自己回復できる', async () => {
+  let fail = true;
+  const sent = [];
+  const d = deps({ reply: async (token) => { if (fail) return false; sent.push(token); return true; } });
+  const ev = { type: 'postback', replyToken: 'rf1', webhookEventId: 'W-retry-1', source: { type: 'user', userId: 'U1' }, postback: { data: 'stock:teatree20' } };
+  await processLineEvents([ev], d);           // 返信失敗 → 予約解除
+  fail = false;
+  await processLineEvents([{ ...ev, replyToken: 'rf2' }], d);   // 再送は処理される
+  assert.deepEqual(sent, ['rf2'], '失敗後の再送が通る');
+
+  const d2 = deps({
+    fetchStockLocations: async () => { throw new Error('down'); },
+    reply: async (token) => { sent.push(token); return true; },
+  });
+  const ev2 = { type: 'postback', replyToken: 'rg1', webhookEventId: 'W-retry-2', source: { type: 'user', userId: 'U1' }, postback: { data: 'stock:teatree20' } };
+  await processLineEvents([ev2], d2);         // 例外 → 予約解除
+  await processLineEvents([{ ...ev2, replyToken: 'rg2' }], deps({ reply: async (token) => { sent.push(token); return true; } }));
+  assert.ok(sent.includes('rg2'), '例外後の再送も通る');
 });
 
 await t('processLineEvents: 処理中の例外はイベント単位で握りつぶす', async () => {
