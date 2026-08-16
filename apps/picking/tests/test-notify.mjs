@@ -158,21 +158,26 @@ globalThis.fetch = async (url, opts) => {
   process.env.PICKING_LINE_TO = 'Uaaa, Cbbb';
 }
 
-// ─── webhook 署名検証 (groupId取得用) ───
+// ─── webhook 署名検証 (groupId取得+在庫検索イベント供給) ───
 {
   const { handleLineWebhook } = await import('../notify.js');
   const cryptoMod = await import('node:crypto');
   const body = Buffer.from(JSON.stringify({ events: [{ type: 'join', source: { type: 'group', groupId: 'Cxxxx' } }] }));
-  // secret未設定 → fail-closed
+  // secret未設定 → fail-closed (null = 403)
   delete process.env.PICKING_LINE_CHANNEL_SECRET;
-  assert.equal(handleLineWebhook(body, 'sig'), false);
-  // 正しい署名 → true / 改ざん → false
+  assert.equal(handleLineWebhook(body, 'sig'), null);
+  // 正しい署名 → イベント配列 / 改ざん → null
   process.env.PICKING_LINE_CHANNEL_SECRET = 'test-secret';
   const sig = cryptoMod.createHmac('sha256', 'test-secret').update(body).digest('base64');
-  assert.equal(handleLineWebhook(body, sig), true);
-  assert.equal(handleLineWebhook(body, sig.slice(0, -2) + 'xx'), false);
-  assert.equal(handleLineWebhook(Buffer.from('tampered'), sig), false);
-  console.log('  ok: LINE webhook 署名検証 (secret必須・改ざん拒否) (async)');
+  const events = handleLineWebhook(body, sig);
+  assert.ok(Array.isArray(events) && events.length === 1 && events[0].type === 'join', '検証OKはイベント配列を返す');
+  assert.equal(handleLineWebhook(body, sig.slice(0, -2) + 'xx'), null);
+  assert.equal(handleLineWebhook(Buffer.from('tampered'), sig), null);
+  // 署名一致だがbodyが壊れている → 空配列 (200は返すが何もしない)
+  const broken = Buffer.from('not-json');
+  const brokenSig = cryptoMod.createHmac('sha256', 'test-secret').update(broken).digest('base64');
+  assert.deepEqual(handleLineWebhook(broken, brokenSig), []);
+  console.log('  ok: LINE webhook 署名検証 (secret必須・改ざん拒否・イベント配列返却) (async)');
 }
 
 // ─── Notionカードのproperties組み立て (担当者連携) ───
