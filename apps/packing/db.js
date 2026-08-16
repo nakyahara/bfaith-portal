@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -100,6 +100,23 @@ function migrate() {
 // マージ後のスキーマ変更は必ず v2 以降の migration として追記する
 const MIGRATIONS = {
   1: createCoreTables,
+  // v2: 作業画面 = 納品書PDF同等の1伝票1画面 (中原さん指示 2026-08-16)。
+  // 送り先 (名前・〒・住所) とサイト受注番号・注文日・納品書印字ヘッダを表示するため保存する。
+  // 表示不要と明示されたもの (電話番号・購入者情報・決済方法・金額系・コメント本文・のし内容) は
+  // 引き続き保存しない/表示しない (電話番号は列自体を持たない)
+  2: () => {
+    for (const col of [
+      'recipient_name TEXT',   // 配送先名
+      'recipient_zip TEXT',    // 配送先郵便番号
+      'recipient_pref TEXT',   // 配送先都道府県
+      'recipient_addr TEXT',   // 配送先住所1〜3 の連結
+      'site_order_no TEXT',    // サイト受注№
+      'order_date TEXT',       // 注文日 'YYYY-MM-DD'
+      'print_header1 TEXT',    // 納品書印字ヘッダ1 (例: レターパック500 — 資材指示)
+    ]) {
+      db.exec(`ALTER TABLE pk_pack_slips ADD COLUMN ${col}`);
+    }
+  },
 };
 
 function createCoreTables() {

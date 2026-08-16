@@ -18,14 +18,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
-  initPackingDB, jstToday, listPackBatches, getPackBatch, listPackSlips,
+  initPackingDB, getDB, jstToday, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, STATUS_LABELS, MATCH_LABELS,
 } from './db.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
-  deriveFolderName, isStaleSagyoDate, WARN_LABELS,
+  deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
 } from './service.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
+// 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
+import { getImageMap, queueEnsureImages } from '../picking/images.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -136,6 +138,104 @@ router.get('/batches/:id(\\d+)', (req, res) => {
   });
 });
 
+// ─── 作業画面 (iPad・1伝票1画面 = 納品書PDF同等表示) ───
+
+/** 作業者マスタは picking 所有の pk_workers を参照 (読み取りのみ — 要件§7.1 参照JOIN可)。 */
+function listWorkers() {
+  try {
+    return getDB().prepare(
+      'SELECT code, name FROM pk_workers WHERE active = 1 ORDER BY sort, code'
+    ).all();
+  } catch {
+    return [];   // picking 側が未初期化の環境 (単体テスト等) では空
+  }
+}
+
+/** state.slips に画像URLと表示用整形を付ける。 */
+function decorateSlips(state) {
+  const skus = [...new Set(state.slips.flatMap((s) => s.lines.map((l) => l.sku)))];
+  const images = getImageMap(skus);
+  // 取込時の解決キューが再起動等で消えていても、画面を開いた時点で自己修復する (picking と同じ)
+  const missing = skus.map((s) => String(s ?? '').trim().toLowerCase())
+    .filter((sku) => sku && !images.has(sku));
+  if (missing.length > 0) queueEnsureImages(missing, `packing-batch:${state.batch.id}`);
+  for (const s of state.slips) {
+    for (const l of s.lines) {
+      l.imageUrl = images.get(String(l.sku ?? '').trim().toLowerCase())?.url || null;
+    }
+  }
+  return state;
+}
+
+router.get('/work/:id(\\d+)', (req, res) => {
+  let state;
+  try {
+    state = decorateSlips(getWorkState(Number(req.params.id)));
+  } catch (e) {
+    if (e instanceof PackError) return res.status(e.status).send(e.message);
+    throw e;
+  }
+  res.render(path.join(__dirname, 'views/work'), {
+    title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
+    displayName: req.session?.displayName,
+    workers: listWorkers(),
+    state,
+    warnLabels: WARN_LABELS,
+  });
+});
+
+/**
+ * 作業イベントAPI。body: { op_id, event: start|next|takeover, slip_seq?, worker_name }
+ * 作業者はサーバー側で検証する (Codex PR2-R1 high: 任意文字列を信用しない)。
+ * 有効な値 = pk_workers の有効な作業者名 or ログインセッション本人。
+ * 名前タップは本人認証ではない (picking と同じ性善説・社内10名運用) が、
+ * 未登録名での操作・別担当者の無断続行はここで弾き、交代は takeover イベントに限定する
+ */
+router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
+  const name = String(req.body.worker_name || '').trim();
+  let worker = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    worker = name;
+  } else if (req.session?.email) {
+    worker = req.session.displayName || req.session.email;
+  }
+  const result = applyEvent(Number(req.params.id), {
+    opId: req.body.op_id,
+    event: req.body.event,
+    slipSeq: req.body.slip_seq == null ? null : Number(req.body.slip_seq),
+  }, worker);
+  res.json({ ok: true, ...result });
+}));
+
+/** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
+router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
+  const s = getWorkState(Number(req.params.id));
+  res.json({
+    ok: true,
+    batchStatus: s.batch.status,
+    worker: s.batch.worker,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    slipCount: s.slips.length,
+  });
+}));
+
+/** 明細画像URLマップ (作業画面のポーリング用。取込直後は解決がバックグラウンド進行中)。 */
+router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
+  const state = getWorkState(Number(req.params.id));
+  const skus = [...new Set(state.slips.flatMap((s) => s.lines.map((l) => l.sku)))];
+  const images = getImageMap(skus);
+  const bySku = {};
+  for (const sku of skus) {
+    const hit = images.get(String(sku ?? '').trim().toLowerCase());
+    if (hit?.url) bySku[sku] = hit.url;
+  }
+  res.json({ ok: true, images: bySku });
+}));
+
 // ─── 取込画面 (管理者) ───
 router.get('/admin/import', (req, res) => {
   res.render(path.join(__dirname, 'views/admin_import'), {
@@ -196,6 +296,11 @@ async function handleImport(req, res, buffer, extra = {}) {
     return res.json({ ok: true, mode: 'preview', ...summary });
   }
   const result = runImport(preview, req);
+  // 楽天白抜き画像の解決はバックグラウンドで (取込応答を待たせない・失敗しても取込は成立)
+  queueEnsureImages(
+    [...new Set(preview.slips.flatMap((s) => s.lines.map((l) => l.sku)))],
+    `packing:${preview.tbKey.split(',')[0]}`,
+  );
   res.json({
     ok: true, mode: 'confirm', ...summary,
     batchId: result.batchId, replaced: result.replaced, replayed: result.replayed || false,
