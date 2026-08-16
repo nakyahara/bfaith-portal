@@ -44,25 +44,43 @@ function getChatCerts(fetchFn = fetch) {
   return _certsPromise;
 }
 
+function jwtKid(token) {
+  try {
+    const header = JSON.parse(Buffer.from(String(token).split('.')[0], 'base64url').toString('utf8'));
+    return typeof header?.kid === 'string' && header.kid ? header.kid : null;
+  } catch {
+    return null;
+  }
+}
+
+// 鍵ローテーション対応の強制再取得は全体で1分に1回まで (でたらめな kid の連打で
+// Google への certs 取得を毎リクエスト強制させない)
+let _lastForcedRefetch = 0;
+
 async function verifyChatBearer(authorization) {
   const projectNumber = process.env.STOCK_BOT_PROJECT_NUMBER;
   if (!projectNumber) return false;   // mount gate があるので通常来ないが fail-closed
   const m = String(authorization || '').match(/^Bearer (.+)$/);
   if (!m) return false;
-  // 1回だけ certs を取り直して再検証 (鍵ローテーション直後の未知 kid で正規リクエストを
-  // 1時間 401 にしないため)
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const certs = await getChatCerts();
-      await getClient().verifySignedJwtWithCertsAsync(m[1], certs, projectNumber, [CHAT_ISSUER]);
-      return true;
-    } catch (e) {
-      if (attempt === 0) { _certsPromise = null; continue; }
-      console.warn(`[stock-bot] トークン検証失敗: ${e.message}`);
-      return false;
+  const kid = jwtKid(m[1]);
+  if (!kid) return false;
+  try {
+    let certs = await getChatCerts();
+    if (!certs[kid]) {
+      // 未知の kid = 鍵ローテーション直後の可能性のみ再取得。署名不正・audience不一致等の
+      // 検証失敗ではキャッシュを捨てない (即401)
+      if (Date.now() - _lastForcedRefetch < 60_000) return false;
+      _lastForcedRefetch = Date.now();
+      _certsPromise = null;
+      certs = await getChatCerts();
+      if (!certs[kid]) return false;
     }
+    await getClient().verifySignedJwtWithCertsAsync(m[1], certs, projectNumber, [CHAT_ISSUER]);
+    return true;
+  } catch (e) {
+    console.warn(`[stock-bot] トークン検証失敗: ${e.message}`);
+    return false;
   }
-  return false;
 }
 
 /**
@@ -203,9 +221,14 @@ const router = Router();
 // 認証 (stockBotAuth) は server.js で body parser より前に掛けている
 router.post('/chat-events', (req, res) => {
   const event = req.body || {};
-  // 社内ドメイン限定 (Chat アプリの公開設定と二重の防御)。email が取れないイベントは通す
+  // 社内ドメイン限定 (Chat アプリの公開設定と二重の防御)。検索・ボタン操作は発言者メール必須
+  // (fail-closed)。ADDED_TO_SPACE 等の管理イベントのみメール無しを許容
   const allowedDomain = (process.env.STOCK_BOT_ALLOWED_DOMAIN || 'b-faith.biz').toLowerCase();
   const email = String(event.user?.email || '').toLowerCase();
+  const needsUser = event.type === 'MESSAGE' || event.type === 'CARD_CLICKED';
+  if (needsUser && !email) {
+    return res.json({ text: '利用者を確認できなかったため処理できません。' });
+  }
   if (email && !email.endsWith(`@${allowedDomain}`)) {
     return res.json({ text: '社内ユーザーのみ利用できます。' });
   }

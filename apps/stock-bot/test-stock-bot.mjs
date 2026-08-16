@@ -149,6 +149,11 @@ console.log('\n── HTTPレベル (認証がparserより前・ドメイン制�
     { Authorization: 'Bearer good-token' });
   ok((await outsider.json()).text.includes('社内ユーザー'), '社外ドメインは拒否');
 
+  const noEmail = await post(
+    { type: 'MESSAGE', message: { text: 'ティーツリー' } },
+    { Authorization: 'Bearer good-token' });
+  ok((await noEmail.json()).text.includes('利用者を確認できなかった'), 'メール欠落のMESSAGEはfail-closed');
+
   const insider = await post(
     { type: 'MESSAGE', user: { email: 'd.nakahara@b-faith.biz' }, space: { name: 'spaces/test' }, message: { text: 'ティーツリー' } },
     { Authorization: 'Bearer good-token' });
