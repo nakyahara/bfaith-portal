@@ -26,7 +26,7 @@ import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
-  PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, lastDoneSeqOf, getDailySummary,
+  PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
   listShipChanges, setShipChangeStatus,
 } from './service.js';
 import { notifyShipChange } from './notify.js';
@@ -214,10 +214,8 @@ router.get('/work/:id(\\d+)', (req, res) => {
     pauseReasons: PAUSE_REASONS,
     undoReasons: UNDO_REASONS,
     shipChangeReasons: SHIP_CHANGE_REASONS,
-    // 提案候補 = 実在する配送方法 (最近の伝票からdistinct)。判定サービス委譲 (packing-dispatch) はPhase 3
-    methodOptions: getDB().prepare(
-      "SELECT DISTINCT delivery_method m FROM pk_pack_slips WHERE delivery_method IS NOT NULL ORDER BY m LIMIT 30"
-    ).all().map((r) => r.m),
+    // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
+    methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
   });
 });
 
