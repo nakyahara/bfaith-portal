@@ -141,6 +141,7 @@
     <span id="mall" class="muted"></span>
     <span class="done-tag" id="doneTag">✔ 完了済み</span>
     <span class="spacer"></span>
+    <span id="timer" class="muted" style="font-size:14px; font-variant-numeric: tabular-nums;"></span>
     <button id="searchBtn" type="button" class="tb-btn">🔎</button>
     <button id="pauseBtn" type="button" class="tb-btn">⏸</button>
     <button id="ttsBtn" type="button" class="tb-btn">🔊</button>
@@ -253,6 +254,8 @@
       folderName: state.batch.folder_name || '',
       hikiateClass: typeof hikiateClass === 'undefined' ? null : hikiateClass,
       pauseReason: state.batch.pause_reason || null,
+      startedAt: state.batch.started_at,
+      pausedTotalSec: state.batch.paused_total_sec || 0,
       currentSeq: state.currentSeq,
       heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
@@ -786,6 +789,27 @@
       setTimeout(pollImages, 5000);
     }
     setTimeout(pollImages, 5000);
+
+    // ── 梱包時間タイマー (小表示)。伝票=表示からの経過 / 計=バッチ実働 (中断除く・概算) ──
+    let slipSec = 0;
+    let batchSec = 0;
+    let timerSeq = null;
+    if (STATE.batchStatus === 'packing' && STATE.startedAt) {
+      batchSec = Math.max(0, Math.round((Date.now() - Date.parse(STATE.startedAt)) / 1000) - STATE.pausedTotalSec);
+    }
+    const fmtSec = (t) => `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+    setInterval(() => {
+      const working = worker && !paused && currentSeq != null
+        && $('doneOverlay').style.display !== 'flex' && $('workerOverlay').style.display !== 'flex';
+      if (working) {
+        // 表示中の梱包対象が変わったら伝票タイマーをリセット
+        const target = (!doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode)) ? viewSeq : null;
+        if (target !== timerSeq) { timerSeq = target; slipSec = 0; }
+        if (target != null) slipSec++;
+        batchSec++;
+        $('timer').textContent = `⏱ ${fmtSec(slipSec)}・計 ${fmtSec(batchSec)}`;
+      }
+    }, 1000);
 
     // ── Wake Lock (梱包台据置で画面を消さない) ──
     async function keepAwake() {
