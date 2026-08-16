@@ -140,8 +140,10 @@ export function buildStockLocationsText(data, {
   const lines = rows.slice(0, maxLines).map((r) => {
     const block = String(r.block || '');
     const loc = String(r.location || '');
-    // ZZZ ブロックはロケ名にもZZZが含まれる (ZZZ-ZZZ-ZZ) ため、重ねて「ZZZ-ZZZ-ZZZ-ZZ」にしない
-    const label = block && !loc.startsWith(block) ? `${block}-${loc}` : (loc || block);
+    // ZZZ ブロックはロケ名にもZZZが含まれる (ZZZ-ZZZ-ZZ) ため、重ねて「ZZZ-ZZZ-ZZZ-ZZ」にしない。
+    // 前方一致は「-」境界まで見る (ZZZ2-… のような別ブロックを誤って省略しない)
+    const dup = loc === block || loc.startsWith(`${block}-`);
+    const label = block && !dup ? `${block}-${loc}` : (loc || block);
     // 区切りは「→」— 「01: 200」のようなコロンはLINEが時刻と誤認してリンク化する
     return `・${label} → ${r.free}個${Number(r.allocated) > 0 ? ` (別途引当${r.allocated})` : ''}`;
   });
