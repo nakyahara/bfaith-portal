@@ -120,7 +120,10 @@ const MIGRATIONS = {
   // v3: 運用基盤 (2026-08-16)。
   //   - Drive自動取込の台帳 (picking pk_drive_imports と同設計。版=(file_id, modified_time))
   //   - iPad の登録端末 (picking pk_devices と同設計。Cookie path が /apps/packing のため専用表)
+  //   - 中断 (pause) の状態列 (中断時間は梱包時間から除外する — picking v3 と同じ)
   3: () => {
+    db.exec('ALTER TABLE pk_pack_batches ADD COLUMN pause_started_at TEXT');
+    db.exec('ALTER TABLE pk_pack_batches ADD COLUMN pause_reason TEXT');
     db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_drive_imports (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       drive_file_id TEXT NOT NULL,
@@ -315,11 +318,11 @@ const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
 /** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
 export function createDevice(label, actor) {
   const token = crypto.randomBytes(32).toString('base64url');
-  getDB().prepare(`
+  const info = getDB().prepare(`
     INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at)
     VALUES (?, ?, ?, ?)
   `).run(hashToken(token), String(label).trim(), actor, utcNow());
-  return token;
+  return { token, id: Number(info.lastInsertRowid) };
 }
 
 /** トークン検証。有効なら端末行を返し last_seen_at を更新 (1時間に1回程度に間引く)。 */

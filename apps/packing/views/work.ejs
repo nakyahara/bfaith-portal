@@ -111,6 +111,20 @@
     .worker-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
     .worker-opt { padding: 20px 8px; font-size: 20px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
     .done-big { font-size: clamp(30px, 6vw, 54px); font-weight: 800; color: #2b8a3e; }
+    .tb-btn { background: none; border: 1px solid #495057; border-radius: 8px; color: #fff; font-size: 18px; padding: 2px 12px; cursor: pointer; }
+    .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .reason-opt { padding: 16px 8px; font-size: 18px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
+    .sheet-cancel { margin-top: 14px; width: 100%; padding: 10px; border: none; background: none; color: #868e96; font-size: 16px; cursor: pointer; }
+    .jump-banner { display: none; background: #fff3bf; border: 1px solid #ffd43b; border-radius: 8px;
+      padding: 6px 12px; margin: 0 auto 8px; max-width: 980px; font-size: 15px; font-weight: 600; }
+    .undo-link { display: none; margin: 8px auto 0; max-width: 980px; text-align: right; }
+    .undo-link button { background: none; border: 1px solid #adb5bd; border-radius: 8px; color: #868e96; padding: 6px 14px; font-size: 14px; cursor: pointer; }
+    .slip-list { max-height: 50vh; overflow-y: auto; text-align: left; margin-top: 10px; }
+    .slip-row { display: flex; gap: 12px; padding: 10px 8px; border-top: 1px solid #e9ecef; cursor: pointer; font-size: 17px; align-items: baseline; }
+    .slip-row .no { font-family: ui-monospace, Consolas, monospace; font-weight: 700; }
+    .slip-row .st-mini { font-size: 13px; border-radius: 4px; padding: 0 8px; background: #e9ecef; }
+    .slip-row .st-mini.done { background: #d3f9d8; }
+    .search-input { width: 100%; padding: 10px; font-size: 20px; box-sizing: border-box; border: 1px solid #ced4da; border-radius: 8px; }
     .toast { position: fixed; left: 50%; bottom: 110px; transform: translateX(-50%);
       background: #212529; color: #fff; border-radius: 10px; padding: 10px 20px; font-size: 16px;
       opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 60; max-width: 90vw; }
@@ -127,14 +141,18 @@
     <span id="mall" class="muted"></span>
     <span class="done-tag" id="doneTag">✔ 完了済み</span>
     <span class="spacer"></span>
-    <button id="ttsBtn" type="button" style="background:none; border:1px solid #495057; border-radius:8px; color:#fff; font-size:18px; padding:2px 12px; cursor:pointer;">🔊</button>
+    <button id="searchBtn" type="button" class="tb-btn">🔎</button>
+    <button id="pauseBtn" type="button" class="tb-btn">⏸</button>
+    <button id="ttsBtn" type="button" class="tb-btn">🔊</button>
     <span class="offline-dot" id="netDot" title="通信状態"></span>
     <span id="workerTag" class="muted"></span>
     <a href="/apps/packing/">一覧へ</a>
   </div>
 
   <div class="sheet-area" id="sheetArea">
+    <div class="jump-banner" id="jumpBanner">⚠ ズレ回復モード: 順序から外れた伝票を表示中。「次へ」で完了すると、間の伝票は未処理のまま残ります (最後に必ず戻ります)</div>
     <div class="paper" id="paper"></div>
+    <div class="undo-link" id="undoLink"><button type="button" id="undoBtn">この伝票の完了を取り消す…</button></div>
   </div>
 
   <div class="controls">
@@ -157,6 +175,46 @@
     </div>
   </div>
 
+  <div class="overlay" id="pauseOverlay">
+    <div class="box">
+      <h2>中断の理由</h2>
+      <div class="reason-grid">
+        <% for (const r of pauseReasons) { %>
+          <button class="reason-opt pause-reason" data-reason="<%= r %>"><%= r %></button>
+        <% } %>
+      </div>
+      <button class="sheet-cancel" id="pauseCancel" type="button">やめる</button>
+    </div>
+  </div>
+
+  <div class="overlay" id="pausedOverlay">
+    <div class="box">
+      <h2>⏸ 中断中 <span id="pausedReason" style="color:#868e96; font-size:0.8em"></span></h2>
+      <button class="reason-opt" id="resumeBtn" type="button" style="width:100%; padding:22px; font-size:22px;">▶ 再開する</button>
+    </div>
+  </div>
+
+  <div class="overlay" id="undoOverlay">
+    <div class="box">
+      <h2>完了取消の理由</h2>
+      <div class="reason-grid">
+        <% for (const r of undoReasons) { %>
+          <button class="reason-opt undo-reason" data-reason="<%= r %>"><%= r %></button>
+        <% } %>
+      </div>
+      <button class="sheet-cancel" id="undoCancel" type="button">やめる</button>
+    </div>
+  </div>
+
+  <div class="overlay" id="searchOverlay">
+    <div class="box">
+      <h2>伝票を探す (ズレ回復)</h2>
+      <input class="search-input" id="searchInput" inputmode="numeric" placeholder="伝票番号の下数桁 (例: 7800)">
+      <div class="slip-list" id="slipList"></div>
+      <button class="sheet-cancel" id="searchCancel" type="button">閉じる</button>
+    </div>
+  </div>
+
   <div class="overlay" id="doneOverlay">
     <div class="box">
       <div class="done-big">✅ <%= state.batch.folder_name || '' %><br><%= state.slips.length %>伝票 完了しました</div>
@@ -173,7 +231,11 @@
       batchStatus: state.batch.status,
       worker: state.batch.worker,
       folderName: state.batch.folder_name || '',
+      pauseReason: state.batch.pause_reason || null,
       currentSeq: state.currentSeq,
+      lastDoneSeq: state.slips.filter((x) => x.status === 'done')
+        .sort((a, b) => (a.done_at || '').localeCompare(b.done_at || '') || a.seq - b.seq)
+        .at(-1)?.seq ?? null,
       slips: state.slips.map((s) => ({
         seq: s.seq, status: s.status, neSlipNo: s.ne_slip_no, mall: s.mall,
         deliveryMethod: s.delivery_method, material: s.material, printHeader1: s.print_header1,
@@ -198,7 +260,21 @@
     let viewSeq = null;                 // 表示中の伝票 seq
     const bySeq = new Map(STATE.slips.map((s) => [s.seq, s]));
     const doneSet = new Set(STATE.slips.filter((s) => s.status === 'done').map((s) => s.seq));
-    let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 (null=全完了)
+    let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
+    let jumpMode = false;               // 検索ジャンプで順序から外れた伝票を表示中
+    let paused = STATE.batchStatus === 'paused';
+    let lastDoneSeq = STATE.lastDoneSeq ?? null;   // 完了取消の対象 (最後に完了した伝票)
+
+    // 最小の未処理 seq (クライアント側の楽観計算。ズレ回復で順序外完了があっても正しい)
+    function minPending() {
+      for (const s of STATE.slips) if (!doneSet.has(s.seq)) return s.seq;
+      return null;
+    }
+    // 指定 seq の次に表示すべき未処理 (無ければ先頭の未処理へ戻る = 飛ばした伝票の回収)
+    function nextPendingAfter(seq) {
+      for (const s of STATE.slips) if (s.seq > seq && !doneSet.has(s.seq)) return s.seq;
+      return minPending();
+    }
 
     function showToast(msg) {
       $('toast').textContent = msg;
@@ -247,19 +323,29 @@
         <div class="lines-wrap">${lines}</div>`;
       $('sheetArea').scrollTop = 0;
 
-      // ボタン状態: 表示中が現在の対象なら「次へ=完了」、完了済み閲覧中なら「現在の伝票へ」
+      // ボタン状態: 未処理伝票を表示中なら「次へ=完了」(順序どおり or ズレ回復モード)。
+      // 完了済みの閲覧中は「現在の伝票へ」+ 完了取消リンク (最後に完了した伝票のみ)
+      const viewingPending = !doneSet.has(viewSeq);
       if (currentSeq == null) {
         $('nextBtn').textContent = '全伝票 完了';
         $('nextBtn').disabled = true;
-      } else if (viewSeq === currentSeq) {
+      } else if (viewingPending && (viewSeq === currentSeq || jumpMode)) {
         $('nextBtn').textContent = '次へ ▸';
         $('nextBtn').classList.remove('jump');
         $('nextBtn').disabled = false;
+      } else if (viewingPending) {
+        // 未処理だが順序外 (前へで戻りすぎた等)。現在の伝票へ誘導
+        $('nextBtn').textContent = `現在の伝票へ ▸`;
+        $('nextBtn').classList.add('jump');
+        $('nextBtn').disabled = false;
       } else {
-        $('nextBtn').textContent = `現在の伝票 (${doneSet.size + 1}件目) へ ▸`;
+        $('nextBtn').textContent = `現在の伝票へ ▸`;
         $('nextBtn').classList.add('jump');
         $('nextBtn').disabled = false;
       }
+      $('jumpBanner').style.display = (jumpMode && viewingPending && viewSeq !== currentSeq) ? 'block' : 'none';
+      // 完了取消リンク: 最後に完了した伝票を閲覧中のときだけ
+      $('undoLink').style.display = (!viewingPending && viewSeq === lastDoneSeq) ? 'block' : 'none';
       $('prevBtn').disabled = viewSeq <= 1;
       maybeSpeak();
     }
@@ -320,14 +406,15 @@
       speak(parts.join('。'));
     }
 
-    // 現在の梱包対象を新しく表示したときだけ読む。完了済みの閲覧 (前へ) は読まずに止め、
-    // 現在伝票へ戻ったら読み直す (途中キャンセルされた読み上げを聞き直せるように)
+    // 梱包対象 (未処理・順序どおり or ズレ回復モード) を新しく表示したときだけ読む。
+    // 完了済みの閲覧 (前へ) は読まずに止め、対象へ戻ったら読み直す
     function maybeSpeak() {
       if (!('speechSynthesis' in window)) return;
-      if (viewSeq === currentSeq && viewSeq !== lastSpokenSeq) {
+      const isTarget = !doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode) && !paused;
+      if (isTarget && viewSeq !== lastSpokenSeq) {
         lastSpokenSeq = viewSeq;
         speakSlip(bySeq.get(viewSeq));
-      } else if (viewSeq !== currentSeq) {
+      } else if (!isTarget) {
         speechSynthesis.cancel();
         lastSpokenSeq = null;
       }
@@ -352,9 +439,14 @@
     const saveQ = (q) => localStorage.setItem(QKEY, JSON.stringify(q));
     let sending = false;
 
-    function enqueue(event, slipSeq) {
+    function enqueue(event, slipSeq, extra = {}) {
       const q = loadQ();
-      q.push({ op_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, event, slip_seq: slipSeq, worker_name: worker });
+      q.push({
+        op_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        event, slip_seq: slipSeq, worker_name: worker,
+        client_at: new Date().toISOString(),   // pause/resume の中断時間計測に使う (サーバーでクランプ)
+        ...extra,
+      });
       saveQ(q);
       pump();
     }
@@ -407,21 +499,22 @@
       }
     }
 
-    // 伝票は厳密に順番どおり完了するため、doneSet はサーバーの currentSeq から再構築できる
-    function rebuildDone(cur) {
-      doneSet.clear();
-      for (const s of STATE.slips) if (cur == null || s.seq < cur) doneSet.add(s.seq);
-    }
-
     function applyServerResult(body) {
-      const before = `${currentSeq}|${doneSet.size}|${worker}`;
+      const before = `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`;
       currentSeq = body.currentSeq;
-      rebuildDone(currentSeq);
+      if (Array.isArray(body.doneSeqs)) {
+        // ズレ回復 (順序外完了) があるため、doneSet はサーバーの一覧から再構築する
+        doneSet.clear();
+        for (const q of body.doneSeqs) doneSet.add(q);
+      }
+      if (body.lastDoneSeq !== undefined) lastDoneSeq = body.lastDoneSeq;
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
+      paused = body.batchStatus === 'paused';
+      updatePausedOverlay(body.pauseReason);
       if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
       if (body.batchStatus === 'done') $('doneOverlay').style.display = 'flex';
       // 楽観更新と同じ結果なら再描画しない (タップのたびに紙面が描き直されてチラつかないように)
-      if (before !== `${currentSeq}|${doneSet.size}|${worker}`) render();
+      if (before !== `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`) render();
     }
 
     async function resync() {
@@ -437,21 +530,32 @@
 
     // ── 操作 ──
     function goNext() {
-      if (currentSeq == null) return;
-      if (viewSeq !== currentSeq) {
-        viewSeq = currentSeq;   // 完了済み閲覧から現在の伝票へジャンプ
+      if (currentSeq == null || paused) return;
+      const viewingPending = !doneSet.has(viewSeq);
+      const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
+      if (!canComplete) {
+        viewSeq = currentSeq;   // 閲覧から現在の伝票へジャンプ
+        jumpMode = false;
         render();
         return;
       }
-      // 現在伝票の完了宣言 + 次伝票へ (楽観的にUI更新・イベントはキュー送信)
-      enqueue('next', viewSeq);
+      // 表示中伝票の完了宣言 + 次伝票へ (楽観的にUI更新・イベントはキュー送信)。
+      // ズレ回復モード中は jumped フラグつきで順序外の完了を明示する
+      const wasJump = jumpMode && viewSeq !== currentSeq;
+      enqueue('next', viewSeq, wasJump ? { jumped: true } : {});
       doneSet.add(viewSeq);
-      const next = STATE.slips.find((s) => s.seq > viewSeq && !doneSet.has(s.seq));
-      currentSeq = next ? next.seq : null;
-      if (next) {
-        viewSeq = next.seq;
+      lastDoneSeq = viewSeq;
+      const next = nextPendingAfter(viewSeq);
+      currentSeq = minPending();
+      if (next != null) {
+        if (wasJump && next === minPending() && next < viewSeq) {
+          showToast('未処理の伝票が残っています。先頭に戻ります');
+          jumpMode = false;
+        }
+        viewSeq = next;
         render();
       } else {
+        jumpMode = false;
         $('doneOverlay').style.display = 'flex';
         render();
         // render 内の maybeSpeak (閲覧扱いの cancel) より後に完了を読み上げる
@@ -465,6 +569,90 @@
 
     $('nextBtn').addEventListener('click', goNext);
     $('prevBtn').addEventListener('click', goPrev);
+
+    // ── 中断 / 再開 ──
+    function updatePausedOverlay(reason) {
+      $('pausedOverlay').style.display = paused ? 'flex' : 'none';
+      if (paused) $('pausedReason').textContent = reason ? `(${reason})` : '';
+    }
+    $('pauseBtn').addEventListener('click', () => {
+      if (paused || currentSeq == null || !worker) return;
+      $('pauseOverlay').style.display = 'flex';
+    });
+    $('pauseCancel').addEventListener('click', () => { $('pauseOverlay').style.display = 'none'; });
+    document.querySelectorAll('.pause-reason').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        $('pauseOverlay').style.display = 'none';
+        paused = true;
+        updatePausedOverlay(btn.dataset.reason);
+        speechSynthesis.cancel?.();
+        enqueue('pause', null, { reason: btn.dataset.reason });
+      });
+    });
+    $('resumeBtn').addEventListener('click', () => {
+      paused = false;
+      updatePausedOverlay(null);
+      lastSpokenSeq = null;   // 再開時に現在伝票を読み直す
+      enqueue('resume', null);
+      render();
+    });
+
+    // ── 完了取消 (理由必須・監査ログ) ──
+    $('undoBtn').addEventListener('click', () => { $('undoOverlay').style.display = 'flex'; });
+    $('undoCancel').addEventListener('click', () => { $('undoOverlay').style.display = 'none'; });
+    document.querySelectorAll('.undo-reason').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        $('undoOverlay').style.display = 'none';
+        const target = lastDoneSeq;
+        if (target == null) return;
+        enqueue('undo', target, { reason: btn.dataset.reason });
+        doneSet.delete(target);
+        lastDoneSeq = null;   // 正確な値はサーバー応答 (lastDoneSeq) で入り直す
+        currentSeq = minPending();
+        viewSeq = target;
+        $('doneOverlay').style.display = 'none';
+        render();
+      });
+    });
+
+    // ── 伝票検索 (ズレ回復) ──
+    function renderSlipList(filter) {
+      const f = String(filter || '').trim();
+      const rows = STATE.slips
+        .filter((s) => !f || s.neSlipNo.endsWith(f) || s.neSlipNo.includes(f))
+        .slice(0, 60)
+        .map((s) => `<div class="slip-row" data-seq="${s.seq}">
+            <span class="no">${esc(s.neSlipNo)}</span>
+            <span>#${s.seq}</span>
+            <span class="st-mini ${doneSet.has(s.seq) ? 'done' : ''}">${doneSet.has(s.seq) ? '完了' : '未'}</span>
+            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${esc((s.lines[0] || {}).name || '')}</span>
+          </div>`).join('');
+      $('slipList').innerHTML = rows || '<div style="color:#868e96; padding:20px">該当なし</div>';
+      document.querySelectorAll('.slip-row').forEach((el) => {
+        el.addEventListener('click', () => {
+          const seq = Number(el.dataset.seq);
+          $('searchOverlay').style.display = 'none';
+          viewSeq = seq;
+          if (!doneSet.has(seq) && seq !== currentSeq) {
+            // 順序から外れた未処理伝票へのジャンプ = ズレ回復モード (記録を残し頻度を計測する)
+            jumpMode = true;
+            enqueue('jump', seq);
+          } else {
+            jumpMode = false;
+          }
+          render();
+        });
+      });
+    }
+    $('searchBtn').addEventListener('click', () => {
+      if (!worker) return;
+      $('searchInput').value = '';
+      renderSlipList('');
+      $('searchOverlay').style.display = 'flex';
+      $('searchInput').focus();
+    });
+    $('searchCancel').addEventListener('click', () => { $('searchOverlay').style.display = 'none'; });
+    $('searchInput').addEventListener('input', () => renderSlipList($('searchInput').value));
 
     // スワイプ (左=次へ / 右=前へ)。60px閾値・縦スクロールと干渉しない判定
     let touchX = null, touchY = null;
@@ -486,10 +674,16 @@
       worker = name;
       $('workerTag').textContent = `👤 ${worker}`;
       $('workerOverlay').style.display = 'none';
-      if (STATE.batchStatus === 'packing' && prevWorker && prevWorker !== name) {
+      const inProgress = STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused';
+      if (inProgress && prevWorker && prevWorker !== name) {
         enqueue('takeover', null);   // 交代の記録 (無断で元担当を名乗らない — Codex R1 high)
       }
-      enqueue('start', null);
+      if (STATE.batchStatus === 'paused') {
+        // 中断中の再開は resume 経由 (start は ready/packing 用)。再開ボタンを出す
+        updatePausedOverlay(STATE.pauseReason);
+      } else {
+        enqueue('start', null);
+      }
       viewSeq = currentSeq ?? 1;
       // 名前タップ=ユーザー操作なので、ここでの発声がブラウザの自動再生制限の有効化を兼ねる (要件§5.3)
       lastSpokenSeq = null;
@@ -537,8 +731,8 @@
     } else {
       viewSeq = currentSeq ?? 1;
       render();
-      if (STATE.batchStatus === 'packing' && worker) {
-        $('workerHint').textContent = `現在の担当: ${worker} — 別の人が続ける場合は自分の名前をタップ (交代として記録されます)`;
+      if ((STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused') && worker) {
+        $('workerHint').textContent = `現在の担当: ${worker}${STATE.batchStatus === 'paused' ? ' (中断中)' : ''} — 別の人が続ける場合は自分の名前をタップ (交代として記録されます)`;
       }
       $('workerOverlay').style.display = 'flex';
     }

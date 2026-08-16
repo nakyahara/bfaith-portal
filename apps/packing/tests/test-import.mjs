@@ -512,6 +512,67 @@ t('完了後の next / start は拒否される', () => {
   expectPackError(() => applyEvent(wr.batchId, { opId: 'op-s9', event: 'start' }, '星'), 'already_done');
 });
 
+// ─── 例外操作: 中断/再開・完了取消・ズレ回復ジャンプ・バッチ取消 ───
+
+const ep = parseCs03003(makeCsv([
+  row({ slip: '0110', lineNo: 1, sku: 'e1', tb: 'TB11111111111' }),
+  row({ slip: '0111', lineNo: 1, sku: 'e2', tb: 'TB11111111111' }),
+  row({ slip: '0112', lineNo: 1, sku: 'e3', tb: 'TB11111111111' }),
+]));
+const er = importPackBatch(ep, { matchAck: true }, 'test');
+applyEvent(er.batchId, { opId: 'e-s1', event: 'start' }, '星');
+
+t('pause/resume: 中断時間が paused_total_sec に積まれる (clientAtクランプ)', () => {
+  const t0 = new Date(Date.now() - 300_000).toISOString();   // 5分前に中断
+  applyEvent(er.batchId, { opId: 'e-p1', event: 'pause', reason: '休憩', clientAt: t0 }, '星');
+  assert.equal(getPackBatch(er.batchId).status, 'paused');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-n0', event: 'next', slipSeq: 1 }, '星'), 'not_packing');
+  applyEvent(er.batchId, { opId: 'e-r1', event: 'resume' }, '星');
+  const b = getPackBatch(er.batchId);
+  assert.equal(b.status, 'packing');
+  assert.ok(b.paused_total_sec >= 290 && b.paused_total_sec <= 310, `5分前後のはず: ${b.paused_total_sec}`);
+});
+
+t('ズレ回復ジャンプ: jumped=trueで順序外の完了ができ、飛ばした伝票が残ると完了しない', () => {
+  // 現在は seq1 だが、紙の束が seq3 から始まっていた想定
+  applyEvent(er.batchId, { opId: 'e-j1', event: 'jump', slipSeq: 3 }, '星');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-x1', event: 'next', slipSeq: 3 }, '星'), 'out_of_order');
+  const r = applyEvent(er.batchId, { opId: 'e-n1', event: 'next', slipSeq: 3, jumped: true }, '星');
+  assert.equal(r.batchStatus, 'packing');           // 1・2が未処理なので完了しない (完了ガード)
+  assert.deepEqual(r.doneSeqs, [3]);
+  assert.equal(r.currentSeq, 1);
+  assert.equal(r.lastDoneSeq, 3);
+});
+
+t('undo: 最後に完了した伝票 (done_at順) だけ理由つきで取り消せる', () => {
+  applyEvent(er.batchId, { opId: 'e-n2', event: 'next', slipSeq: 1 }, '星');
+  // 最後に完了したのは seq1 (done_at順)。seq3 は取り消せない
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-u0', event: 'undo', slipSeq: 3, reason: '誤タップ' }, '星'), 'out_of_order');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-u1', event: 'undo', slipSeq: 1 }, '星'), 'bad_reason');
+  const r = applyEvent(er.batchId, { opId: 'e-u2', event: 'undo', slipSeq: 1, reason: '誤タップ' }, '星');
+  assert.deepEqual(r.doneSeqs, [3]);
+  assert.equal(r.currentSeq, 1);
+});
+
+t('undo: バッチ完了直後も取り消して再開できる', () => {
+  applyEvent(er.batchId, { opId: 'e-n3', event: 'next', slipSeq: 1 }, '星');
+  applyEvent(er.batchId, { opId: 'e-n4', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(getPackBatch(er.batchId).status, 'done');
+  const r = applyEvent(er.batchId, { opId: 'e-u3', event: 'undo', slipSeq: 2, reason: 'その他' }, '星');
+  assert.equal(r.batchStatus, 'packing');
+  assert.equal(r.currentSeq, 2);
+});
+
+t('cancel: 未着手に戻り伝票進捗が初期化される', () => {
+  applyEvent(er.batchId, { opId: 'e-c1', event: 'cancel' }, '星');
+  const b = getPackBatch(er.batchId);
+  assert.equal(b.status, 'ready');
+  assert.equal(b.worker, null);
+  assert.equal(b.paused_total_sec, 0);
+  const slips = listPackSlips(er.batchId);
+  assert.ok(slips.every((s) => s.status === 'pending' && !s.done_at));
+});
+
 // ─── Drive自動ポーラー (deps注入・v3) ───
 
 const { pollOnce, pickPollCandidates } = await import('../drive-sync.js');
@@ -583,11 +644,12 @@ await (async () => {
 // ─── 登録端末 (v3) ───
 
 t('端末登録→検証→失効', () => {
-  const token = createDevice('梱包iPad1', 'test@example.com');
+  const { token, id } = createDevice('梱包iPad1', 'test@example.com');
   const d = verifyDevice(token);
   assert.equal(d.label, '梱包iPad1');
+  assert.equal(d.id, id);
   assert.equal(verifyDevice('bogus'), null);
-  assert.ok(revokeDevice(d.id));
+  assert.ok(revokeDevice(id));
   assert.equal(verifyDevice(token), null);
 });
 

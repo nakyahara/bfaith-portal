@@ -26,6 +26,7 @@ import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
+  PAUSE_REASONS, UNDO_REASONS, lastDoneSeqOf,
 } from './service.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
@@ -208,6 +209,8 @@ router.get('/work/:id(\\d+)', (req, res) => {
     workers: listWorkers(),
     state,
     warnLabels: WARN_LABELS,
+    pauseReasons: PAUSE_REASONS,
+    undoReasons: UNDO_REASONS,
   });
 });
 
@@ -233,6 +236,9 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     opId: req.body.op_id,
     event: req.body.event,
     slipSeq: req.body.slip_seq == null ? null : Number(req.body.slip_seq),
+    clientAt: req.body.client_at || null,
+    reason: req.body.reason || null,
+    jumped: !!req.body.jumped,
   }, worker);
   res.json({ ok: true, ...result });
 }));
@@ -247,6 +253,9 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     currentSeq: s.currentSeq,
     doneCount: s.doneCount,
     slipCount: s.slips.length,
+    doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
+    lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
+    pauseReason: s.batch.pause_reason || null,
   });
 }));
 
@@ -279,7 +288,7 @@ router.get('/manifest.json', (req, res) => {
 
 // ─── 端末管理 (管理者・セッション必須) ───
 
-router.get('/admin/devices', (req, res) => {
+router.get('/admin/devices', requireAdmin, (req, res) => {
   res.render(path.join(__dirname, 'views/admin_devices'), {
     title: '端末管理 | 梱包支援',
     username: req.session.email,
@@ -294,10 +303,10 @@ router.get('/admin/devices', (req, res) => {
  * ⭐登録と同時に管理者セッションを破棄する (共用端末に管理者権限を残さない — picking と同規約)。
  * 🚨ホーム画面に追加したPWA内で実行すること (SafariとPWAはCookie保存領域が別)
  */
-router.post('/admin/devices', checkOrigin, api(async (req, res) => {
+router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
   if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
-  const token = createDevice(label, req.session.email);
+  const { token, id: deviceId } = createDevice(label, req.session.email);
   res.cookie(DEVICE_COOKIE, token, {
     httpOnly: true,
     secure: process.env.NODE_ENV !== 'development',
@@ -309,8 +318,7 @@ router.post('/admin/devices', checkOrigin, api(async (req, res) => {
   // 「登録成功」を返すと、権限破棄の安全要件が満たされない)。失敗時は発行した端末も無効化する
   req.session.destroy((err) => {
     if (err) {
-      const issued = listDevices().at(-1);
-      if (issued && !issued.revoked_at) revokeDevice(issued.id);
+      revokeDevice(deviceId);   // 発行した端末を確実に無効化 (id直指定。一覧末尾頼みは並行登録で誤爆する)
       res.clearCookie(DEVICE_COOKIE, { path: '/apps/packing' });
       console.error('[packing] 端末登録時のセッション破棄に失敗:', err);
       return res.status(500).json({ error: 'セッションの破棄に失敗したため登録を取り消しました。もう一度実行してください' });
@@ -319,13 +327,13 @@ router.post('/admin/devices', checkOrigin, api(async (req, res) => {
   });
 }));
 
-router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, api(async (req, res) => {
+router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {
   if (!revokeDevice(Number(req.params.id))) throw new PackError(404, 'not_found', '端末が見つかりません');
   res.json({ ok: true });
 }));
 
 // ─── 取込画面 (管理者) ───
-router.get('/admin/import', (req, res) => {
+router.get('/admin/import', requireAdmin, (req, res) => {
   res.render(path.join(__dirname, 'views/admin_import'), {
     title: '納品書CSV取込 | 梱包支援',
     username: req.session.email,
@@ -335,7 +343,7 @@ router.get('/admin/import', (req, res) => {
 });
 
 /** 自動ポーリングの状態 (standaloneで稼働)。取込画面が表示に使う。 */
-router.get('/admin/import/poller-status', api(async (req, res) => {
+router.get('/admin/import/poller-status', requireAdmin, api(async (req, res) => {
   const s = getPollerStatus();
   const db = getDB();
   const recent = db.prepare(`
@@ -410,7 +418,7 @@ async function handleImport(req, res, buffer, extra = {}, onImported = null) {
   });
 }
 
-router.post('/admin/import', checkOrigin, (req, res, next) => {
+router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
   uploadCsv.single('file')(req, res, (err) => {
     if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
     next();
@@ -422,7 +430,7 @@ router.post('/admin/import', checkOrigin, (req, res, next) => {
 
 // ─── Drive取込 (出荷_no フォルダ・管理者) ───
 
-router.get('/admin/import/drive-files', api(async (req, res) => {
+router.get('/admin/import/drive-files', requireAdmin, api(async (req, res) => {
   const files = await driveCall(() => listNouhinCsvFiles());
   res.json({ ok: true, files });
 }));
@@ -431,7 +439,7 @@ router.get('/admin/import/drive-files', api(async (req, res) => {
  * Driveファイルの取込。body(JSON): { file_id, parent_name, mode, folder_name, overwrite, match_ack }
  * confirm 時も最新の中身を取り直す (間に差し替わっても古い内容を確定しない — picking と同方式)
  */
-router.post('/admin/import/drive', checkOrigin, api(async (req, res) => {
+router.post('/admin/import/drive', checkOrigin, requireAdmin, api(async (req, res) => {
   const fileId = String(req.body.file_id || '').trim();
   if (!fileId) throw new PackError(400, 'no_file', 'ファイルを選択してください');
   const dl = await driveCall(() => downloadNouhinCsv(fileId));
