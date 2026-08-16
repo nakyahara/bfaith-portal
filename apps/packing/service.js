@@ -9,7 +9,8 @@
  * 列仕様の正本: AI_reference/システム設計/梱包支援システム_要件定義_20260815.md §4
  *
  * 列は名前で引く (ロジザードの列追加・順序変更に耐える)。必須列が無ければ fail-closed。
- * 個人情報 (宛名・住所・電話・メール) は必須列に含めず、解析対象外 = DBに保存しない (要件§6)。
+ * 個人情報は作業画面=納品書PDF同等表示に必要な範囲 (配送先の名前・〒・住所) だけ保存する
+ * (中原さん指示 2026-08-16)。電話番号・購入者情報・メールは読まない=保存しない。
  */
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
@@ -27,10 +28,14 @@ export class PackError extends Error {
 }
 
 // CS03003 の必須列 (名前で参照する列のみ列挙。他の200列は読まない=保持しない)
+// 送り先 (名前・〒・住所) は作業画面=納品書PDF同等表示のため保存する (中原さん指示 2026-08-16)。
+// 電話番号・購入者情報・決済方法・金額系は表示不要のため読まない=保存しない
 const REQUIRED_COLUMNS = [
   '荷主出荷NO', '出荷伝票NO', 'ピッキングNO', 'トータルピッキングバッチ番号',
   '出荷予定行NO', 'マテハン用BC', '出荷作業日', '取引先名',
   '配送方法ID', '配送方法名', '引当抽出グループ1',
+  '配送先名', '配送先郵便番号', '配送先都道府県', '配送先住所1', '配送先住所2', '配送先住所3',
+  'サイト受注№', '注文日', '納品書印字ヘッダ1',
   '商品ID', '商品名', '出荷数', 'バーコード', '印字商品名', '送り状備考1',
   'ギフトフラグ', 'ギフトメッセージ', 'のし',
   '納品書ヘッダコメント', '納品書フッタコメント', '倉庫連絡事項', '顧客コメント',
@@ -132,6 +137,8 @@ export function parseCs03003(buffer) {
     '荷主出荷NO', 'ピッキングNO', 'トータルピッキングバッチ番号',
     '出荷作業日', '配送方法ID', '配送方法名', '箱数',
     'マテハン用BC', '取引先名', '引当抽出グループ1',
+    '配送先名', '配送先郵便番号', '配送先都道府県', '配送先住所1', '配送先住所2', '配送先住所3',
+    'サイト受注№', '注文日', '納品書印字ヘッダ1',
     'ギフトフラグ', 'ギフトメッセージ', 'のし',
     '納品書ヘッダコメント', '納品書フッタコメント', '倉庫連絡事項', '顧客コメント',
     '配達指定日', '配達時間帯',
@@ -189,6 +196,13 @@ export function parseCs03003(buffer) {
         deliveryMethodId: get('配送方法ID'),
         deliveryMethod: get('配送方法名'),
         material: get('引当抽出グループ1'),
+        recipientName: get('配送先名'),
+        recipientZip: get('配送先郵便番号'),
+        recipientPref: get('配送先都道府県'),
+        recipientAddr: [get('配送先住所1'), get('配送先住所2'), get('配送先住所3')].filter(Boolean).join(' '),
+        siteOrderNo: get('サイト受注№'),
+        orderDate: formatDate8(get('注文日')),
+        printHeader1: get('納品書印字ヘッダ1'),
         boxCount,
         giftFlag: get('ギフトフラグ'),
         giftMessage: get('ギフトメッセージ'),
@@ -443,8 +457,10 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
       INSERT INTO pk_pack_slips
         (batch_id, seq, ne_slip_no, slip_no, picking_no, matehan_bc, mall,
          delivery_method_id, delivery_method, material, box_count, warn_json,
-         gift_message, noshi, comments_json, delivery_date, delivery_time)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         gift_message, noshi, comments_json, delivery_date, delivery_time,
+         recipient_name, recipient_zip, recipient_pref, recipient_addr,
+         site_order_no, order_date, print_header1)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insLine = db.prepare(`
       INSERT INTO pk_pack_lines
@@ -460,6 +476,9 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
         s.giftMessage || null, s.noshi || null,
         Object.keys(s.comments).length ? JSON.stringify(s.comments) : null,
         s.deliveryDate || null, s.deliveryTime || null,
+        s.recipientName || null, s.recipientZip || null, s.recipientPref || null,
+        s.recipientAddr || null, s.siteOrderNo || null, s.orderDate || null,
+        s.printHeader1 || null,
       ).lastInsertRowid);
       for (const l of s.lines) {
         insLine.run(slipId, l.lineNo, l.sku, l.productName || null, l.qty,
@@ -468,5 +487,158 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
       }
     }
     return { batchId, replaced, match };
+  })();
+}
+
+// ═══ 作業イベント (PR2) ═══════════════════════════════════════════════
+//
+// iPad作業画面 = 納品書PDF同等の1伝票1画面 (中原さん指示 2026-08-16)。
+// タップ/スワイプ順送り (要件§5.1)。「次へ」1タップ = 現在伝票の梱包完了宣言 + 次伝票の表示。
+//   - 計測の分離 (要件§5.11): packing_completed = pk_pack_slips.done_at /
+//     slip_opened = 次伝票の shown_at として記録する (イベント行は 'next' 1行)
+//   - 「前へ」= 完了済み伝票の閲覧であり完了取消ではない (クライアント側で表示するだけ。
+//     完了取消は理由つき別操作として PR3 で追加する)
+//   - 冪等: op_id (端末生成 ms+乱数)。同一 op_id の再送は保存済み結果を返す (picking と同思想)
+
+const WORK_EVENTS = ['start', 'next', 'takeover'];
+
+/** 作業画面の現在状態。currentSeq = 次に梱包する伝票 (null = 全て完了)。 */
+export function getWorkState(batchId) {
+  const db = getDB();
+  const batch = db.prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(batchId);
+  if (!batch) throw new PackError(404, 'not_found', 'バッチが見つかりません');
+  const slips = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id = ? ORDER BY seq').all(batchId);
+  const linesBySlip = new Map();
+  for (const l of db.prepare(`
+    SELECT l.* FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+    WHERE s.batch_id = ? ORDER BY s.seq, l.id
+  `).all(batchId)) {
+    if (!linesBySlip.has(l.slip_id)) linesBySlip.set(l.slip_id, []);
+    linesBySlip.get(l.slip_id).push(l);
+  }
+  const full = slips.map((s) => ({
+    ...s,
+    warns: s.warn_json ? JSON.parse(s.warn_json) : [],
+    lines: linesBySlip.get(s.id) || [],
+  }));
+  const pending = full.filter((s) => s.status === 'pending');
+  return {
+    batch,
+    slips: full,
+    currentSeq: pending.length > 0 ? pending[0].seq : null,
+    doneCount: full.filter((s) => s.status === 'done').length,
+  };
+}
+
+function eventResult(batchId) {
+  const s = getWorkState(batchId);
+  return {
+    batchStatus: s.batch.status,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    slipCount: s.slips.length,
+    worker: s.batch.worker,
+    startedAt: s.batch.started_at,
+    finishedAt: s.batch.finished_at,
+  };
+}
+
+/**
+ * 作業イベントの適用。1イベント = 1トランザクション。
+ * @returns {{replayed?: boolean, ...eventResult}}
+ */
+export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
+  if (!opId || typeof opId !== 'string' || opId.length > 64) {
+    throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  }
+  if (!WORK_EVENTS.includes(event)) {
+    throw new PackError(400, 'bad_event', `不明なイベントです: ${event}`);
+  }
+  if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const prev = db.prepare('SELECT * FROM pk_pack_events WHERE op_id = ?').get(opId);
+    if (prev) {
+      if (prev.batch_id === batchId && prev.worker === worker
+          && prev.event === event && (prev.slip_seq ?? null) === (slipSeq ?? null)) {
+        return { replayed: true, ...JSON.parse(prev.result_json) };
+      }
+      throw new PackError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
+    }
+
+    const batch = db.prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(batchId);
+    if (!batch) throw new PackError(404, 'not_found', 'バッチが見つかりません');
+    if (batch.validity !== 'valid' || batch.status === 'cancelled') {
+      throw new PackError(409, 'batch_invalid', 'このバッチは取消されています');
+    }
+
+    if (event === 'takeover') {
+      // 担当者の交代 (選び間違い・実際の引き継ぎ)。作業中のみ・記録が残る唯一の正規突破口
+      if (batch.status !== 'packing') {
+        throw new PackError(409, 'not_packing', `作業中ではないため交代できません (${batch.status})`);
+      }
+      if (batch.worker !== worker) {
+        db.prepare('UPDATE pk_pack_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
+      }
+    } else if (event === 'start') {
+      if (batch.status === 'packing') {
+        if (batch.worker !== worker) {
+          throw new PackError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+        }
+        // 同一作業者の再開 (リロード・端末復帰)。状態はそのまま返す
+      } else if (batch.status === 'done') {
+        throw new PackError(409, 'already_done', 'このバッチは完了済みです');
+      } else {
+        const res = db.prepare(`
+          UPDATE pk_pack_batches SET status='packing', worker=?, started_at=COALESCE(started_at, ?), updated_at=?
+          WHERE id=? AND status='ready'
+        `).run(worker, now, now, batchId);
+        if (res.changes === 0) throw new PackError(409, 'not_startable', `状態 ${batch.status} からは開始できません`);
+      }
+      // 先頭の未完了伝票に表示時刻 (slip_opened) を刻む (初回のみ)
+      db.prepare(`
+        UPDATE pk_pack_slips SET shown_at = COALESCE(shown_at, ?)
+        WHERE batch_id = ? AND seq = (SELECT MIN(seq) FROM pk_pack_slips WHERE batch_id = ? AND status = 'pending')
+      `).run(now, batchId, batchId);
+    } else {
+      // next: 現在表示中の伝票 (= 最小の pending) のみ完了できる
+      if (batch.status !== 'packing') {
+        throw new PackError(409, 'not_packing', `バッチが作業中ではありません (${batch.status})`);
+      }
+      if (batch.worker !== worker) {
+        throw new PackError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+      }
+      if (!Number.isInteger(slipSeq) || slipSeq < 1) {
+        throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
+      }
+      const cur = db.prepare(
+        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
+      ).get(batchId).s;
+      if (cur !== slipSeq) {
+        throw new PackError(409, 'out_of_order', `伝票 ${slipSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
+      }
+      // packing_completed (現在伝票) — done_at がその記録
+      db.prepare("UPDATE pk_pack_slips SET status='done', done_at=? WHERE batch_id=? AND seq=?")
+        .run(now, batchId, slipSeq);
+      const nextSeq = db.prepare(
+        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
+      ).get(batchId).s;
+      if (nextSeq != null) {
+        // slip_opened (次伝票) — shown_at がその記録。done_at - shown_at = 伝票の実梱包時間
+        db.prepare('UPDATE pk_pack_slips SET shown_at = ? WHERE batch_id=? AND seq=?')
+          .run(now, batchId, nextSeq);
+      } else {
+        db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
+          .run(now, now, batchId);
+      }
+    }
+
+    const result = eventResult(batchId);
+    db.prepare(`
+      INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+    `).run(opId, batchId, worker, event, slipSeq ?? null, JSON.stringify(result), now);
+    return result;
   })();
 }

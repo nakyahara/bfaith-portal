@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title><%= title %></title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    /* iPad据置・納品書PDF同等の1伝票1画面。明るい紙面+大きな文字 */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      font-family: "Hiragino Sans", "Yu Gothic", Meiryo, sans-serif;
+      background: #e9ecef; color: #212529;
+      position: fixed; inset: 0; overflow: hidden;   /* SafariのURLバー伸縮対策 (picking #783) */
+      display: flex; flex-direction: column;
+      -webkit-user-select: none; user-select: none;
+    }
+
+    /* ── 上部バー ── */
+    .topbar {
+      flex: 0 0 auto; background: #212529; color: #fff;
+      display: flex; align-items: center; gap: 14px; padding: 6px 14px;
+      font-size: 15px; flex-wrap: wrap;
+    }
+    .topbar .prog { font-size: 22px; font-weight: 800; }
+    .topbar .slipno { font-size: 26px; font-weight: 800; font-family: ui-monospace, Consolas, monospace; letter-spacing: 1px; }
+    .topbar .muted { color: #adb5bd; }
+    .topbar .spacer { flex: 1 1 auto; }
+    .topbar a { color: #adb5bd; text-decoration: none; }
+    .done-tag { background: #2b8a3e; border-radius: 4px; padding: 1px 8px; font-weight: 700; display: none; }
+
+    /* ── 納品書カード ── */
+    .sheet-area { flex: 1 1 auto; overflow-y: auto; padding: 10px 12px; }
+    .paper {
+      background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+      max-width: 980px; margin: 0 auto; padding: 14px 18px;
+    }
+    .ship-row { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: baseline; margin-bottom: 8px; font-size: 15px; color: #495057; }
+    .ship-row .method { font-size: 19px; font-weight: 700; color: #212529; }
+    .ship-row .material { background: #edf2ff; border-radius: 6px; padding: 2px 10px; font-weight: 700; color: #364fc7; }
+    .ship-row .boxes { background: #ffe3e3; border-radius: 6px; padding: 2px 10px; font-weight: 800; color: #c92a2a; }
+    .warns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .warn-badge { background: #fff3bf; border: 1px solid #ffd43b; border-radius: 6px; padding: 2px 10px; font-size: 15px; font-weight: 700; }
+
+    .recipient { border: 2px solid #495057; border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; }
+    .recipient .name { font-size: 30px; font-weight: 800; line-height: 1.25; }
+    .recipient .addr { font-size: 18px; color: #343a40; margin-top: 2px; }
+
+    .order-row { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 14px; color: #495057; margin-bottom: 10px; }
+
+    /* ── 明細 ── */
+    .line {
+      display: flex; align-items: center; gap: 14px;
+      border-top: 1px solid #dee2e6; padding: 10px 2px;
+    }
+    .line .img {
+      flex: 0 0 auto; width: 128px; height: 128px; border: 1px solid #e9ecef; border-radius: 8px;
+      background: #f8f9fa center/contain no-repeat; display: flex; align-items: center; justify-content: center;
+      font-size: 30px; color: #ced4da;
+    }
+    .line .pname { flex: 1 1 auto; min-width: 0; font-size: 22px; font-weight: 700; line-height: 1.35; }
+    .line .pmeta { font-size: 14px; color: #868e96; font-weight: 400; margin-top: 4px; }
+    .line .qty { flex: 0 0 auto; font-size: 46px; font-weight: 800; white-space: nowrap; }
+    .line .qty small { font-size: 20px; font-weight: 700; }
+    .line .qty.multi { color: #e8590c; }
+
+    /* ── 下部操作 ── */
+    .controls { flex: 0 0 auto; display: flex; gap: 10px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); }
+    .btn-prev {
+      flex: 0 0 120px; border: 2px solid #adb5bd; border-radius: 14px; background: #f1f3f5;
+      font-size: 20px; font-weight: 700; color: #495057;
+    }
+    .btn-next {
+      flex: 1 1 auto; border: none; border-radius: 14px; background: #1971c2; color: #fff;
+      font-size: 30px; font-weight: 800; padding: 20px 0; cursor: pointer;
+    }
+    .btn-next.jump { background: #e8590c; font-size: 22px; }
+    .btn-next:disabled { opacity: 0.55; }
+
+    /* ── オーバーレイ (作業者選択・完了) ── */
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 40;
+      display: none; align-items: center; justify-content: center; }
+    .overlay .box { background: #fff; border-radius: 16px; padding: 24px 22px; width: min(560px, 92vw); text-align: center; }
+    .overlay h2 { margin: 0 0 14px; font-size: 22px; }
+    .worker-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .worker-opt { padding: 20px 8px; font-size: 20px; font-weight: 700; border: 1px solid #ced4da; border-radius: 12px; background: #f8f9fa; cursor: pointer; }
+    .done-big { font-size: clamp(30px, 6vw, 54px); font-weight: 800; color: #2b8a3e; }
+    .toast { position: fixed; left: 50%; bottom: 110px; transform: translateX(-50%);
+      background: #212529; color: #fff; border-radius: 10px; padding: 10px 20px; font-size: 16px;
+      opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 60; max-width: 90vw; }
+    .toast.show { opacity: 0.95; }
+    .offline-dot { width: 10px; height: 10px; border-radius: 50%; background: #2b8a3e; }
+    .offline-dot.ng { background: #e03131; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="prog"><span id="progDone">-</span> / <%= state.slips.length %></span>
+    <span class="muted"><%= state.batch.folder_name || '' %></span>
+    <span class="slipno" id="slipNo">—</span>
+    <span id="mall" class="muted"></span>
+    <span class="done-tag" id="doneTag">✔ 完了済み</span>
+    <span class="spacer"></span>
+    <span class="offline-dot" id="netDot" title="通信状態"></span>
+    <span id="workerTag" class="muted"></span>
+    <a href="/apps/packing/">一覧へ</a>
+  </div>
+
+  <div class="sheet-area" id="sheetArea">
+    <div class="paper" id="paper"></div>
+  </div>
+
+  <div class="controls">
+    <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
+    <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
+  </div>
+
+  <div class="overlay" id="workerOverlay">
+    <div class="box">
+      <h2>だれが梱包しますか？</h2>
+      <div id="workerHint" style="color:#868e96; font-size:15px; margin-bottom:12px;"></div>
+      <div class="worker-grid">
+        <% for (const w of workers) { %>
+          <button class="worker-opt" data-name="<%= w.name %>"><%= w.name %></button>
+        <% } %>
+        <% if (workers.length === 0) { %>
+          <div style="grid-column: 1 / -1; color:#868e96">作業者が未登録です。<br>ピッキングの端末・作業者管理から追加してください</div>
+        <% } %>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="doneOverlay">
+    <div class="box">
+      <div class="done-big">✅ <%= state.batch.folder_name || '' %><br><%= state.slips.length %>伝票 完了しました</div>
+      <div style="margin-top:18px"><a href="/apps/packing/" style="font-size:20px">一覧へ戻る</a></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    <%# JSON内の "<" エスケープでscript要素からの脱出を防ぐ (picking と同じ) %>
+    const STATE = <%- JSON.stringify({
+      batchId: state.batch.id,
+      batchStatus: state.batch.status,
+      worker: state.batch.worker,
+      currentSeq: state.currentSeq,
+      slips: state.slips.map((s) => ({
+        seq: s.seq, status: s.status, neSlipNo: s.ne_slip_no, mall: s.mall,
+        deliveryMethod: s.delivery_method, material: s.material, printHeader1: s.print_header1,
+        boxCount: s.box_count, warns: s.warns,
+        recipientName: s.recipient_name, recipientZip: s.recipient_zip,
+        recipientPref: s.recipient_pref, recipientAddr: s.recipient_addr,
+        siteOrderNo: s.site_order_no, orderDate: s.order_date,
+        deliveryDate: s.delivery_date, deliveryTime: s.delivery_time,
+        lines: s.lines.map((l) => ({
+          sku: l.sku, name: l.print_name || l.product_name, qty: l.qty, imageUrl: l.imageUrl,
+        })),
+      })),
+    }).replace(/</g, '\\u003c') %>;
+    const WARN_LABELS = <%- JSON.stringify(warnLabels).replace(/</g, '\\u003c') %>;
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    let worker = STATE.worker;          // 作業者名 (start 時に確定)
+    let viewSeq = null;                 // 表示中の伝票 seq
+    const bySeq = new Map(STATE.slips.map((s) => [s.seq, s]));
+    const doneSet = new Set(STATE.slips.filter((s) => s.status === 'done').map((s) => s.seq));
+    let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 (null=全完了)
+
+    function showToast(msg) {
+      $('toast').textContent = msg;
+      $('toast').classList.add('show');
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => $('toast').classList.remove('show'), 2500);
+    }
+
+    // ── 描画 ──
+    function render() {
+      const s = bySeq.get(viewSeq);
+      if (!s) return;
+      $('progDone').textContent = doneSet.size;
+      $('slipNo').textContent = s.neSlipNo;
+      $('mall').textContent = s.mall || '';
+      $('doneTag').style.display = doneSet.has(s.seq) ? 'inline-block' : 'none';
+
+      const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
+      const lines = s.lines.map((l) => `
+        <div class="line">
+          <div class="img" data-sku="${esc(l.sku)}" style="${l.imageUrl ? `background-image:url('${esc(l.imageUrl)}')` : ''}">${l.imageUrl ? '' : '📦'}</div>
+          <div class="pname">${esc(l.name)}<div class="pmeta">${esc(l.sku)}</div></div>
+          <div class="qty ${l.qty >= 2 ? 'multi' : ''}">${l.qty}<small> 個</small></div>
+        </div>`).join('');
+
+      $('paper').innerHTML = `
+        <div class="ship-row">
+          <span class="method">${esc(s.deliveryMethod || '')}</span>
+          ${s.material ? `<span class="material">${esc(s.material)}</span>` : ''}
+          ${s.printHeader1 ? `<span class="material">${esc(s.printHeader1)}</span>` : ''}
+          ${s.boxCount > 1 ? `<span class="boxes">箱数 ${s.boxCount}</span>` : ''}
+          ${s.deliveryDate ? `<span>配達指定 ${esc(s.deliveryDate)} ${esc(s.deliveryTime || '')}</span>` : ''}
+        </div>
+        ${warns ? `<div class="warns">${warns}</div>` : ''}
+        <div class="recipient">
+          <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
+          <div class="addr">〒${esc(s.recipientZip || '')} ${esc(s.recipientPref || '')}${esc(s.recipientAddr || '')}</div>
+        </div>
+        <div class="order-row">
+          <span>受注番号: ${esc(s.siteOrderNo || '-')}</span>
+          <span>注文日: ${esc(s.orderDate || '-')}</span>
+          <span>明細 ${s.lines.length} 件</span>
+        </div>
+        ${lines}`;
+      $('sheetArea').scrollTop = 0;
+
+      // ボタン状態: 表示中が現在の対象なら「次へ=完了」、完了済み閲覧中なら「現在の伝票へ」
+      if (currentSeq == null) {
+        $('nextBtn').textContent = '全伝票 完了';
+        $('nextBtn').disabled = true;
+      } else if (viewSeq === currentSeq) {
+        $('nextBtn').textContent = '次へ ▸';
+        $('nextBtn').classList.remove('jump');
+        $('nextBtn').disabled = false;
+      } else {
+        $('nextBtn').textContent = `現在の伝票 (${doneSet.size + 1}件目) へ ▸`;
+        $('nextBtn').classList.add('jump');
+        $('nextBtn').disabled = false;
+      }
+      $('prevBtn').disabled = viewSeq <= 1;
+    }
+
+    // ── イベント送信 (localStorage キュー直列送信 — picking と同型の簡易版) ──
+    const QKEY = `packing_q_${STATE.batchId}`;
+    const loadQ = () => { try { return JSON.parse(localStorage.getItem(QKEY) || '[]'); } catch { return []; } };
+    const saveQ = (q) => localStorage.setItem(QKEY, JSON.stringify(q));
+    let sending = false;
+
+    function enqueue(event, slipSeq) {
+      const q = loadQ();
+      q.push({ op_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, event, slip_seq: slipSeq, worker_name: worker });
+      saveQ(q);
+      pump();
+    }
+
+    async function pump() {
+      if (sending) return;
+      sending = true;
+      try {
+        let q = loadQ();
+        while (q.length > 0) {
+          const item = q[0];
+          let res;
+          try {
+            res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/events`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(item),
+            });
+          } catch {
+            $('netDot').classList.add('ng');
+            setTimeout(pump, 3000);   // オフライン: 3秒後に再送
+            return;
+          }
+          $('netDot').classList.remove('ng');
+          if (res.status === 401) { location.href = '/login'; return; }
+          if (res.status >= 500 || res.status === 429) {
+            // 一時的なサーバー障害: キューを保持したまま再試行 (Codex R1 high:
+            // 500系でキューを消すとオフライン中の完了操作が全滅する)
+            setTimeout(pump, 3000);
+            return;
+          }
+          if (!res.ok) {
+            // 業務エラー (taken / out_of_order 等): 問題の先頭項目だけを隔離して続行。
+            // 後続の完了操作 (next(2), next(3)…) はまだ有効なことがある
+            const body = await res.json().catch(() => ({}));
+            showToast(body.error || `エラー (${res.status})`);
+            q.shift(); saveQ(q);
+            continue;
+          }
+          const body = await res.json();
+          q.shift(); saveQ(q);
+          applyServerResult(body);
+        }
+        // キューが空になった時点でサーバーと画面を最終同期
+        await resync();
+      } finally {
+        sending = false;
+        // resync 中に enqueue された操作が滞留しないよう、残っていれば再起動 (Codex R2 medium)
+        if (loadQ().length > 0) setTimeout(pump, 0);
+      }
+    }
+
+    // 伝票は厳密に順番どおり完了するため、doneSet はサーバーの currentSeq から再構築できる
+    function rebuildDone(cur) {
+      doneSet.clear();
+      for (const s of STATE.slips) if (cur == null || s.seq < cur) doneSet.add(s.seq);
+    }
+
+    function applyServerResult(body) {
+      const before = `${currentSeq}|${doneSet.size}|${worker}`;
+      currentSeq = body.currentSeq;
+      rebuildDone(currentSeq);
+      if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
+      if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
+      if (body.batchStatus === 'done') $('doneOverlay').style.display = 'flex';
+      // 楽観更新と同じ結果なら再描画しない (タップのたびに紙面が描き直されてチラつかないように)
+      if (before !== `${currentSeq}|${doneSet.size}|${worker}`) render();
+    }
+
+    async function resync() {
+      // 未送信の操作が残っている間は同期しない (Codex R1 medium: 楽観状態を古いサーバー状態で
+      // 巻き戻すと、再タップで重複op → out_of_order を誘発する)。pump 完了後に呼ばれる
+      if (loadQ().length > 0) return;
+      try {
+        const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/state`);
+        if (!res.ok) return;
+        applyServerResult(await res.json());
+      } catch { /* 次の操作時に再試行 */ }
+    }
+
+    // ── 操作 ──
+    function goNext() {
+      if (currentSeq == null) return;
+      if (viewSeq !== currentSeq) {
+        viewSeq = currentSeq;   // 完了済み閲覧から現在の伝票へジャンプ
+        render();
+        return;
+      }
+      // 現在伝票の完了宣言 + 次伝票へ (楽観的にUI更新・イベントはキュー送信)
+      enqueue('next', viewSeq);
+      doneSet.add(viewSeq);
+      const next = STATE.slips.find((s) => s.seq > viewSeq && !doneSet.has(s.seq));
+      currentSeq = next ? next.seq : null;
+      if (next) {
+        viewSeq = next.seq;
+      } else {
+        $('doneOverlay').style.display = 'flex';
+      }
+      render();
+    }
+
+    function goPrev() {
+      if (viewSeq > 1) { viewSeq -= 1; render(); }
+    }
+
+    $('nextBtn').addEventListener('click', goNext);
+    $('prevBtn').addEventListener('click', goPrev);
+
+    // スワイプ (左=次へ / 右=前へ)。60px閾値・縦スクロールと干渉しない判定
+    let touchX = null, touchY = null;
+    document.addEventListener('touchstart', (e) => {
+      touchX = e.touches[0].clientX; touchY = e.touches[0].clientY;
+    }, { passive: true });
+    document.addEventListener('touchend', (e) => {
+      if (touchX == null) return;
+      const dx = e.changedTouches[0].clientX - touchX;
+      const dy = e.changedTouches[0].clientY - touchY;
+      touchX = null;
+      if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;
+      if (dx < 0) goNext(); else goPrev();
+    }, { passive: true });
+
+    // ── 開始 (作業者選択 → start イベント。作業中バッチを別の人が続ける場合は takeover を明示記録) ──
+    function begin(name) {
+      const prevWorker = worker;
+      worker = name;
+      $('workerTag').textContent = `👤 ${worker}`;
+      $('workerOverlay').style.display = 'none';
+      if (STATE.batchStatus === 'packing' && prevWorker && prevWorker !== name) {
+        enqueue('takeover', null);   // 交代の記録 (無断で元担当を名乗らない — Codex R1 high)
+      }
+      enqueue('start', null);
+      viewSeq = currentSeq ?? 1;
+      render();
+    }
+
+    document.querySelectorAll('.worker-opt').forEach((btn) => {
+      btn.addEventListener('click', () => begin(btn.dataset.name));
+    });
+
+    // ── 画像の後追い反映 (取込直後は解決がバックグラウンド進行中) ──
+    let imgPolls = 0;
+    async function pollImages() {
+      const missing = STATE.slips.some((s) => s.lines.some((l) => !l.imageUrl));
+      if (!missing || imgPolls++ > 12) return;
+      try {
+        const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/images`);
+        if (res.ok) {
+          const body = await res.json();
+          for (const s of STATE.slips) for (const l of s.lines) {
+            if (!l.imageUrl && body.images[l.sku]) l.imageUrl = body.images[l.sku];
+          }
+          render();
+        }
+      } catch { /* 次回 */ }
+      setTimeout(pollImages, 5000);
+    }
+    setTimeout(pollImages, 5000);
+
+    // ── Wake Lock (梱包台据置で画面を消さない) ──
+    async function keepAwake() {
+      try { await navigator.wakeLock?.request('screen'); } catch { /* 非対応は無視 */ }
+    }
+    // 復帰時は先にキューを流す (pump が空になった時点で resync が走る)
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) { keepAwake(); pump(); } });
+    keepAwake();
+
+    // ── 初期表示 ──
+    // 作業中バッチの再開でも必ず名前タップを求める (画面を開いただけの人が
+    // 元担当者を名乗って進めてしまわないように — Codex R1 high)
+    if (STATE.batchStatus === 'done') {
+      viewSeq = STATE.slips.length;
+      render();
+      $('doneOverlay').style.display = 'flex';
+    } else {
+      viewSeq = currentSeq ?? 1;
+      render();
+      if (STATE.batchStatus === 'packing' && worker) {
+        $('workerHint').textContent = `現在の担当: ${worker} — 別の人が続ける場合は自分の名前をタップ (交代として記録されます)`;
+      }
+      $('workerOverlay').style.display = 'flex';
+    }
+    pump();
+  </script>
+</body>
+</html>

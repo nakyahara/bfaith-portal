@@ -14,7 +14,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-test-'));
 
 const {
   parseCs03003, importPackBatch, checkPickingMatch, slipWarns, PackError,
-  deriveFolderName, isStaleSagyoDate,
+  deriveFolderName, isStaleSagyoDate, getWorkState, applyEvent,
 } = await import('../service.js');
 const {
   initPackingDB, getDB, listPackBatches, getPackBatch, listPackSlips,
@@ -33,6 +33,8 @@ const HEADERS = [
   '荷主出荷NO', '出荷伝票NO', 'ピッキングNO', 'トータルピッキングバッチ番号',
   '出荷予定行NO', 'マテハン用BC', '出荷作業日', '取引先名',
   '配送方法ID', '配送方法名', '引当抽出グループ1',
+  '配送先名', '配送先郵便番号', '配送先都道府県', '配送先住所1', '配送先住所2', '配送先住所3',
+  'サイト受注№', '注文日', '納品書印字ヘッダ1',
   '商品ID', '商品名', '出荷数', 'バーコード', '印字商品名', '送り状備考1',
   'ギフトフラグ', 'ギフトメッセージ', 'のし',
   '納品書ヘッダコメント', '納品書フッタコメント', '倉庫連絡事項', '顧客コメント',
@@ -61,6 +63,9 @@ function row({
     '取引先名': '雑貨イズム楽天市場店',
     '配送方法ID': '4', '配送方法名': 'ネコポス 営業所止めなし',
     '引当抽出グループ1': material,
+    '配送先名': `テスト太郎${slip}`, '配送先郵便番号': '5640038', '配送先都道府県': '大阪府',
+    '配送先住所1': '吹田市テスト町1-1', '配送先住所2': `建物${slip}号室`, '配送先住所3': '',
+    'サイト受注№': `ORD-${slip}`, '注文日': TODAY8, '納品書印字ヘッダ1': '',
     '商品ID': sku, '商品名': name, '出荷数': String(qty),
     'バーコード': 'X000TEST01', '印字商品名': `${name} (印字)`,
     '送り状備考1': `${sku}/${qty}`,
@@ -438,6 +443,73 @@ t('上書きの監査ログに旧版の伝票+明細スナップショットが�
   assert.equal(before.batch.tb_key, 'TB66666666666');
   assert.ok(before.batch.csv_sha256);
   assert.ok(before.batch.created_at);
+});
+
+// ─── 送り先・受注情報 (v2・納品書PDF同等表示) ───
+
+t('送り先 (名前・〒・住所連結) と受注番号・注文日が取り込まれる', () => {
+  const p = parseCs03003(makeCsv([row({ slip: '0080', sku: 'a', tb: 'TB55555555555' })]));
+  const s = p.slips[0];
+  assert.equal(s.recipientName, 'テスト太郎0080');
+  assert.equal(s.recipientZip, '5640038');
+  assert.equal(s.recipientPref, '大阪府');
+  assert.equal(s.recipientAddr, '吹田市テスト町1-1 建物0080号室');   // 住所1〜3を空白連結 (空は落ちる)
+  assert.equal(s.siteOrderNo, 'ORD-0080');
+  assert.equal(s.orderDate, jstToday());
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const dbSlip = getDB().prepare('SELECT * FROM pk_pack_slips WHERE batch_id=?').get(r.batchId);
+  assert.equal(dbSlip.recipient_name, 'テスト太郎0080');
+  assert.equal(dbSlip.site_order_no, 'ORD-0080');
+});
+
+// ─── 作業イベント (start / next / takeover) ───
+
+const wp = parseCs03003(makeCsv([
+  row({ slip: '0090', lineNo: 1, sku: 'w1', tb: 'TB44444444444' }),
+  row({ slip: '0091', lineNo: 1, sku: 'w2', tb: 'TB44444444444' }),
+  row({ slip: '0092', lineNo: 1, sku: 'w3', tb: 'TB44444444444' }),
+]));
+const wr = importPackBatch(wp, { matchAck: true }, 'test');
+
+t('start で packing になり先頭伝票に shown_at が付く', () => {
+  const r = applyEvent(wr.batchId, { opId: 'op-s1', event: 'start' }, '星');
+  assert.equal(r.batchStatus, 'packing');
+  assert.equal(r.currentSeq, 1);
+  const s = getWorkState(wr.batchId);
+  assert.ok(s.slips[0].shown_at);
+  assert.equal(s.batch.worker, '星');
+});
+
+t('同一op_idの再送は replayed', () => {
+  const r = applyEvent(wr.batchId, { opId: 'op-s1', event: 'start' }, '星');
+  assert.equal(r.replayed, true);
+});
+
+t('別作業者の start は taken (takeover で交代できる)', () => {
+  expectPackError(() => applyEvent(wr.batchId, { opId: 'op-s2', event: 'start' }, '月'), 'taken');
+  applyEvent(wr.batchId, { opId: 'op-t1', event: 'takeover' }, '月');
+  assert.equal(getWorkState(wr.batchId).batch.worker, '月');
+  applyEvent(wr.batchId, { opId: 'op-t2', event: 'takeover' }, '星');   // 戻す
+});
+
+t('next は現在の伝票のみ・順に完了して最後で batch done (計測タイムスタンプ分離)', () => {
+  expectPackError(() => applyEvent(wr.batchId, { opId: 'op-x1', event: 'next', slipSeq: 2 }, '星'), 'out_of_order');
+  let r = applyEvent(wr.batchId, { opId: 'op-n1', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(r.currentSeq, 2);
+  assert.equal(r.doneCount, 1);
+  const mid = getWorkState(wr.batchId);
+  assert.ok(mid.slips[0].done_at);      // packing_completed
+  assert.ok(mid.slips[1].shown_at);     // slip_opened
+  r = applyEvent(wr.batchId, { opId: 'op-n2', event: 'next', slipSeq: 2 }, '星');
+  r = applyEvent(wr.batchId, { opId: 'op-n3', event: 'next', slipSeq: 3 }, '星');
+  assert.equal(r.batchStatus, 'done');
+  assert.equal(r.currentSeq, null);
+  assert.ok(getWorkState(wr.batchId).batch.finished_at);
+});
+
+t('完了後の next / start は拒否される', () => {
+  expectPackError(() => applyEvent(wr.batchId, { opId: 'op-n9', event: 'next', slipSeq: 3 }, '星'), 'not_packing');
+  expectPackError(() => applyEvent(wr.batchId, { opId: 'op-s9', event: 'start' }, '星'), 'already_done');
 });
 
 console.log(`test-import: ${passed} 件 pass`);
