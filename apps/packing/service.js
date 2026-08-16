@@ -302,19 +302,19 @@ export function checkPickingMatch(preview) {
   for (const r of db.prepare(
     'SELECT slip_no, sku, SUM(qty) qty FROM pk_slip_lines WHERE batch_id = ? GROUP BY slip_no, sku'
   ).all(pk.id)) {
-    const key = `${r.slip_no} ${normSku(r.sku)}`;
+    const key = `${r.slip_no}\u0000${normSku(r.sku)}`;
     pickMap.set(key, (pickMap.get(key) || 0) + r.qty);
   }
   const packMap = new Map();
   for (const s of preview.slips) {
     for (const l of s.lines) {
-      const key = `${s.slipNo} ${normSku(l.sku)}`;
+      const key = `${s.slipNo}\u0000${normSku(l.sku)}`;
       packMap.set(key, (packMap.get(key) || 0) + l.qty);
     }
   }
 
   const diffs = [];
-  const fmt = (key) => key.replace(' ', ' × ');
+  const fmt = (key) => key.replace('\u0000', ' × ');
   for (const [key, qty] of packMap) {
     const pq = pickMap.get(key);
     if (pq == null) diffs.push(`納品書のみ: ${fmt(key)} (${qty}個) — ピッキング側にない`);
@@ -500,7 +500,28 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
 //     完了取消は理由つき別操作として PR3 で追加する)
 //   - 冪等: op_id (端末生成 ms+乱数)。同一 op_id の再送は保存済み結果を返す (picking と同思想)
 
-const WORK_EVENTS = ['start', 'next', 'takeover'];
+const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump', 'ship_change'];
+
+// 中断理由 (picking と同じ最小セット)
+export const PAUSE_REASONS = ['休憩', '他作業への応援', 'その他'];
+// 完了取消の理由 (監査ログ必須 — 要件§5.1)
+export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
+// ④ 配送方法変更の理由 (要件§5.7)
+export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その他'];
+
+/**
+ * 端末の発生時刻を [floor, now] にクランプ (中断時間の計測用)。
+ * floor = バッチ開始時刻等 (Codexレビュー medium: 端末時計のズレで開始前の時刻を
+ * pause_started_at に入れると、実作業時間以上の中断秒が加算されて計測が壊れる)
+ */
+function clampedEventTime(clientAt, now, floor = null) {
+  const t = Date.parse(clientAt || '');
+  const nowMs = Date.parse(now);
+  const floorMs = floor ? Date.parse(floor) : nowMs - 24 * 3600 * 1000;
+  if (!Number.isFinite(t)) return now;
+  if (t > nowMs || t < floorMs) return now;
+  return new Date(t).toISOString().slice(0, 19) + 'Z';
+}
 
 /** 作業画面の現在状態。currentSeq = 次に梱包する伝票 (null = 全て完了)。 */
 export function getWorkState(batchId) {
@@ -530,6 +551,19 @@ export function getWorkState(batchId) {
   };
 }
 
+/**
+ * 「最後に完了した伝票」= 完了順の正はイベント履歴 (done_at は秒精度で連打時にタイになる)。
+ * 現在も done のままの伝票のうち、最新の next イベントの対象を返す。
+ */
+export function lastDoneSeqOf(batchId) {
+  return getDB().prepare(`
+    SELECT e.slip_seq FROM pk_pack_events e
+    JOIN pk_pack_slips s ON s.batch_id = e.batch_id AND s.seq = e.slip_seq
+    WHERE e.batch_id = ? AND e.event = 'next' AND s.status = 'done'
+    ORDER BY e.id DESC LIMIT 1
+  `).get(batchId)?.slip_seq ?? null;
+}
+
 function eventResult(batchId) {
   const s = getWorkState(batchId);
   return {
@@ -537,6 +571,12 @@ function eventResult(batchId) {
     currentSeq: s.currentSeq,
     doneCount: s.doneCount,
     slipCount: s.slips.length,
+    // ズレ回復ジャンプ (順序外の完了) があると「currentSeqより前=完了」が成り立たないため、
+    // 完了済みseqの一覧を明示的に返す (画面はこれで doneSet を再構築する)
+    doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
+    heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+    // 完了取消の対象 = 最後に完了した伝票 (完了順の正はイベント履歴 — done_at は秒精度)
+    lastDoneSeq: lastDoneSeqOf(batchId),
     worker: s.batch.worker,
     startedAt: s.batch.started_at,
     finishedAt: s.batch.finished_at,
@@ -547,7 +587,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -560,8 +600,11 @@ export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
   return db.transaction(() => {
     const prev = db.prepare('SELECT * FROM pk_pack_events WHERE op_id = ?').get(opId);
     if (prev) {
+      const pp = prev.payload_json ? JSON.parse(prev.payload_json) : {};
       if (prev.batch_id === batchId && prev.worker === worker
-          && prev.event === event && (prev.slip_seq ?? null) === (slipSeq ?? null)) {
+          && prev.event === event && (prev.slip_seq ?? null) === (slipSeq ?? null)
+          && (pp.reason ?? null) === (reason ?? null) && !!pp.jumped === !!jumped
+          && (pp.proposedMethod ?? null) === (proposedMethod ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
       throw new PackError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
@@ -572,14 +615,120 @@ export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
     if (batch.validity !== 'valid' || batch.status === 'cancelled') {
       throw new PackError(409, 'batch_invalid', 'このバッチは取消されています');
     }
+    const requireOwner = () => {
+      if (batch.worker !== worker) throw new PackError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+    };
 
     if (event === 'takeover') {
-      // 担当者の交代 (選び間違い・実際の引き継ぎ)。作業中のみ・記録が残る唯一の正規突破口
-      if (batch.status !== 'packing') {
+      // 担当者の交代 (選び間違い・実際の引き継ぎ)。作業中・中断中のみ・記録が残る唯一の正規突破口
+      if (batch.status !== 'packing' && batch.status !== 'paused') {
         throw new PackError(409, 'not_packing', `作業中ではないため交代できません (${batch.status})`);
       }
       if (batch.worker !== worker) {
         db.prepare('UPDATE pk_pack_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
+      }
+    } else if (event === 'pause') {
+      // 中断: 中断時間は梱包時間から除外する。時刻は端末の発生時刻をクランプ採用
+      // (オフラインで pause→resume を積むと受信時刻基準では中断が数秒になる — picking と同じ)
+      if (batch.status !== 'packing') {
+        throw new PackError(409, 'not_packing', `作業中ではないため中断できません (${batch.status})`);
+      }
+      requireOwner();
+      const r = PAUSE_REASONS.includes(reason) ? reason : 'その他';
+      db.prepare(`UPDATE pk_pack_batches SET status='paused', pause_started_at=?, pause_reason=?, updated_at=? WHERE id=?`)
+        .run(clampedEventTime(clientAt, now, batch.started_at), r, now, batchId);
+    } else if (event === 'resume') {
+      if (batch.status !== 'paused') {
+        throw new PackError(409, 'not_paused', `中断中ではありません (${batch.status})`);
+      }
+      requireOwner();
+      const resumeAt = clampedEventTime(clientAt, now, batch.pause_started_at);
+      const pausedSec = Math.max(0, Math.round((Date.parse(resumeAt) - Date.parse(batch.pause_started_at || resumeAt)) / 1000));
+      db.prepare(`
+        UPDATE pk_pack_batches SET status='packing', paused_total_sec = paused_total_sec + ?,
+          pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
+      `).run(pausedSec, now, batchId);
+    } else if (event === 'cancel') {
+      // 誤開始の取消: バッチを未着手に戻し、伝票の進捗も初期化する (pk_pack_events は残る)
+      if (batch.status !== 'packing' && batch.status !== 'paused') {
+        throw new PackError(409, 'not_packing', `作業中ではないため取消できません (${batch.status})`);
+      }
+      requireOwner();
+      db.prepare(`
+        UPDATE pk_pack_batches SET status='ready', worker=NULL, started_at=NULL, finished_at=NULL,
+          paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
+      `).run(now, batchId);
+      db.prepare("UPDATE pk_pack_slips SET status='pending', hold_reason=NULL, shown_at=NULL, done_at=NULL WHERE batch_id=?")
+        .run(batchId);
+      // 未対応の配送変更依頼を孤児化させない (Codexレビュー high: 取消後に事務が変更を実施すると
+      // 梱包済み内容と配送方法が食い違う)。取消と同時に依頼も cancelled にする
+      db.prepare(`
+        UPDATE pk_pack_ship_changes SET status='cancelled', office_by='(バッチ取消)', updated_at=?
+        WHERE batch_id=? AND status IN ('requested','accepted')
+      `).run(now, batchId);
+    } else if (event === 'undo') {
+      // 完了取消 (理由必須・監査ログ=このイベント自体)。対象は「最後に完了した伝票」のみ
+      // (途中の伝票に飛び戻ると納品書の束と画面の対応が壊れる)。バッチ完了直後も取り消せる
+      if (batch.status !== 'packing' && batch.status !== 'done') {
+        throw new PackError(409, 'not_packing', `完了取消できる状態ではありません (${batch.status})`);
+      }
+      requireOwner();
+      if (!UNDO_REASONS.includes(reason)) {
+        throw new PackError(400, 'bad_reason', '取消理由を選択してください');
+      }
+      const lastSeq = lastDoneSeqOf(batchId);
+      if (lastSeq == null) throw new PackError(409, 'nothing_to_undo', '取り消せる完了がありません');
+      if (slipSeq != null && slipSeq !== lastSeq) {
+        throw new PackError(409, 'out_of_order', `取り消せるのは最後に完了した伝票 (${lastSeq}) だけです`);
+      }
+      db.prepare("UPDATE pk_pack_slips SET status='pending', done_at=NULL, shown_at=? WHERE batch_id=? AND seq=?")
+        .run(now, batchId, lastSeq);
+      if (batch.status === 'done') {
+        db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
+          .run(now, batchId);
+      }
+    } else if (event === 'jump') {
+      // ズレ回復 (要件§5.1): 紙の束と画面がズレたときの頭出し。状態は変えず記録のみ
+      // (頻度を計測し、多発するならスキャン再検討を含め対策を再協議する)
+      if (batch.status !== 'packing' && batch.status !== 'paused') {
+        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
+      }
+      requireOwner();
+    } else if (event === 'ship_change') {
+      // ④ 配送方法変更 (要件§5.7 最小構成): 伝票を保留 (held) にし、事務の対応キューへ積む。
+      // 通知 (GChat) は router 側が fail-soft で送る — DBの行が正本 (webhook成功を受付成功とみなさない)
+      if (batch.status !== 'packing') {
+        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
+      }
+      requireOwner();
+      const proposed = String(proposedMethod || '').trim();
+      if (!proposed || proposed.length > 60) {
+        throw new PackError(400, 'bad_method', '提案する配送方法を選択してください');
+      }
+      if (!SHIP_CHANGE_REASONS.includes(reason)) {
+        throw new PackError(400, 'bad_reason', '理由を選択してください');
+      }
+      const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
+      if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
+      if (slip.status !== 'pending') {
+        throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は処理済みです (${slip.status})`);
+      }
+      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='shipping_change' WHERE id=?`).run(slip.id);
+      db.prepare(`
+        INSERT INTO pk_pack_ship_changes
+          (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,
+           reason, requested_by, status, updated_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
+      `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
+        proposed, reason, worker, now, now);
+      // 次に表示する伝票 (slip_opened)
+      const nx = db.prepare(
+        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending' AND seq > ?"
+      ).get(batchId, slipSeq).s
+        ?? db.prepare("SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'").get(batchId).s;
+      if (nx != null) {
+        db.prepare('UPDATE pk_pack_slips SET shown_at = COALESCE(shown_at, ?) WHERE batch_id=? AND seq=?')
+          .run(now, batchId, nx);
       }
     } else if (event === 'start') {
       if (batch.status === 'packing') {
@@ -602,13 +751,14 @@ export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
         WHERE batch_id = ? AND seq = (SELECT MIN(seq) FROM pk_pack_slips WHERE batch_id = ? AND status = 'pending')
       `).run(now, batchId, batchId);
     } else {
-      // next: 現在表示中の伝票 (= 最小の pending) のみ完了できる
+      // next: 基本は現在表示中の伝票 (= 最小の pending) のみ完了できる。
+      // 例外 = ズレ回復ジャンプ後 (jumped): 任意の pending 伝票を完了できる。
+      // 飛ばされた伝票は pending のまま残り、全伝票 done になるまでバッチは完了しない
+      // (= 保留し忘れ・飛ばし忘れがバッチ末尾で必ず検知される完了ガード — 要件§5.1)
       if (batch.status !== 'packing') {
         throw new PackError(409, 'not_packing', `バッチが作業中ではありません (${batch.status})`);
       }
-      if (batch.worker !== worker) {
-        throw new PackError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
-      }
+      requireOwner();
       if (!Number.isInteger(slipSeq) || slipSeq < 1) {
         throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
       }
@@ -616,29 +766,169 @@ export function applyEvent(batchId, { opId, event, slipSeq }, worker) {
         "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
       ).get(batchId).s;
       if (cur !== slipSeq) {
-        throw new PackError(409, 'out_of_order', `伝票 ${slipSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
+        if (!jumped) {
+          throw new PackError(409, 'out_of_order', `伝票 ${slipSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
+        }
+        const st = db.prepare('SELECT status FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
+        if (!st) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
+        if (st.status !== 'pending') {
+          throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は処理済みです (${st.status})`);
+        }
       }
       // packing_completed (現在伝票) — done_at がその記録
       db.prepare("UPDATE pk_pack_slips SET status='done', done_at=? WHERE batch_id=? AND seq=?")
         .run(now, batchId, slipSeq);
+      // slip_opened (次伝票) — 紙の束は前から順なので「完了した伝票の次以降で最初の pending」を
+      // 優先し、無ければ先頭の pending (飛ばした伝票へ戻る)
       const nextSeq = db.prepare(
-        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
-      ).get(batchId).s;
+        'SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status=\'pending\' AND seq > ?'
+      ).get(batchId, slipSeq).s
+        ?? db.prepare("SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'").get(batchId).s;
       if (nextSeq != null) {
-        // slip_opened (次伝票) — shown_at がその記録。done_at - shown_at = 伝票の実梱包時間
         db.prepare('UPDATE pk_pack_slips SET shown_at = ? WHERE batch_id=? AND seq=?')
           .run(now, batchId, nextSeq);
       } else {
-        db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
-          .run(now, now, batchId);
+        // バッチ完了条件: 未処理ゼロ + 保留 (配送変更待ち等) ゼロ (要件§5.11 完了ガード)
+        const held = db.prepare(
+          "SELECT COUNT(*) c FROM pk_pack_slips WHERE batch_id=? AND status='held'"
+        ).get(batchId).c;
+        if (held === 0) {
+          db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
+            .run(now, now, batchId);
+        }
       }
     }
 
     const result = eventResult(batchId);
+    // eventResult はこのイベント行の INSERT より前に走るため、lastDoneSeq (イベント履歴由来) に
+    // いま完了させた伝票が反映されない。next のときはここで上書きする
+    if (event === 'next') result.lastDoneSeq = slipSeq;
+    const payload = (clientAt || reason || jumped || proposedMethod)
+      ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined }) : null;
     db.prepare(`
       INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
-      VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
-    `).run(opId, batchId, worker, event, slipSeq ?? null, JSON.stringify(result), now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(opId, batchId, worker, event, slipSeq ?? null, payload, JSON.stringify(result), now);
     return result;
+  })();
+}
+
+// ═══ 日次サマリ (⑦計測の集計・要件§5.11) ═══════════════════════════════
+
+/**
+ * 指定作業日のサマリ。
+ *   - バッチ単位: 実働 = (finished - started) - 中断合計
+ *   - 伝票単位: done_at - shown_at (表示〜完了)。伝票表示中の中断は現状含まれる
+ *     (中断はバッチ単位で記録のため。除外精度が必要になったらイベントから差し引く)
+ *   - ズレ回復 (jump)・完了取消 (undo) の回数も集計 (要件§5.1: 頻度を計測し多発なら再協議)
+ */
+export function getDailySummary(workDate) {
+  const db = getDB();
+  const batches = db.prepare(`
+    SELECT * FROM pk_pack_batches
+    WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+    ORDER BY id
+  `).all(workDate);
+
+  const activeSec = (b) => {
+    if (!b.started_at || !b.finished_at) return null;
+    return Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0));
+  };
+
+  const done = batches.filter((b) => b.status === 'done');
+  const total = {
+    batchCount: batches.length,
+    doneCount: done.length,
+    slipCount: done.reduce((s, b) => s + b.slip_count, 0),
+    qty: done.reduce((s, b) => s + b.total_qty, 0),
+    activeSec: done.reduce((s, b) => s + (activeSec(b) || 0), 0),
+  };
+  total.secPerSlip = total.slipCount > 0 ? total.activeSec / total.slipCount : null;
+  total.slipsPerHour = total.secPerSlip ? 3600 / total.secPerSlip : null;
+
+  // 作業者別 (バッチの最終担当者に全量計上する簡略化 — picking と同じ)
+  const byWorker = new Map();
+  for (const b of done) {
+    const k = b.worker || '(不明)';
+    if (!byWorker.has(k)) byWorker.set(k, { key: k, batches: 0, slips: 0, qty: 0, activeSec: 0 });
+    const g = byWorker.get(k);
+    g.batches++; g.slips += b.slip_count; g.qty += b.total_qty; g.activeSec += activeSec(b) || 0;
+  }
+  const workers = [...byWorker.values()].map((g) => ({
+    ...g, secPerSlip: g.slips > 0 ? g.activeSec / g.slips : null,
+  })).sort((a, b) => b.slips - a.slips);
+
+  // 伝票単位の実測 (表示〜完了秒)。バッチ横断の中央値・平均
+  const slipSecs = db.prepare(`
+    SELECT (unixepoch(s.done_at) - unixepoch(s.shown_at)) AS sec
+    FROM pk_pack_slips s JOIN pk_pack_batches b ON b.id = s.batch_id
+    WHERE b.work_date = ? AND b.validity = 'valid' AND s.status = 'done'
+      AND s.done_at IS NOT NULL AND s.shown_at IS NOT NULL
+      AND (unixepoch(s.done_at) - unixepoch(s.shown_at)) BETWEEN 0 AND 1800
+    ORDER BY sec
+  `).all(workDate).map((r) => r.sec);
+  const slipStats = slipSecs.length > 0 ? {
+    count: slipSecs.length,
+    median: slipSecs[Math.floor(slipSecs.length / 2)],
+    avg: slipSecs.reduce((a, x) => a + x, 0) / slipSecs.length,
+  } : null;
+
+  // 例外操作の頻度 (jump=紙ズレ回復・undo=完了取消)
+  const opCounts = {};
+  for (const r of db.prepare(`
+    SELECT e.event, COUNT(*) c FROM pk_pack_events e
+    JOIN pk_pack_batches b ON b.id = e.batch_id
+    WHERE b.work_date = ? AND e.event IN ('jump','undo','cancel','takeover','pause')
+    GROUP BY e.event
+  `).all(workDate)) {
+    opCounts[r.event] = r.c;
+  }
+
+  return {
+    workDate, total, workers, slipStats, opCounts,
+    batches: batches.map((b) => ({ ...b, activeSec: activeSec(b) })),
+  };
+}
+
+// ═══ ④ 配送方法変更の事務対応 (管理画面) ═══════════════════════════════
+
+export function listShipChanges(limit = 100) {
+  return getDB().prepare(`
+    SELECT c.*, b.folder_name AS batch_folder FROM pk_pack_ship_changes c
+    JOIN pk_pack_batches b ON b.id = c.batch_id
+    ORDER BY CASE c.status WHEN 'requested' THEN 0 WHEN 'accepted' THEN 1 ELSE 2 END, c.id DESC
+    LIMIT ?
+  `).all(limit);
+}
+
+const SHIP_CHANGE_TRANSITIONS = {
+  requested: ['accepted', 'rejected', 'completed'],
+  accepted: ['completed', 'rejected'],
+  rejected: [],
+  completed: [],
+};
+
+/**
+ * 事務側の状態遷移。completed (NE・ロジザード変更+送り状再発行済み) / rejected で
+ * 対象伝票の保留を解除して pending に戻す (梱包者は完了ガードで必ず戻ってくる)。
+ */
+export function setShipChangeStatus(id, status, actor) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM pk_pack_ship_changes WHERE id = ?').get(id);
+    if (!row) throw new PackError(404, 'not_found', '申請が見つかりません');
+    if (!(SHIP_CHANGE_TRANSITIONS[row.status] || []).includes(status)) {
+      throw new PackError(409, 'bad_transition', `${row.status} から ${status} へは変更できません`);
+    }
+    db.prepare('UPDATE pk_pack_ship_changes SET status=?, office_by=?, updated_at=? WHERE id=?')
+      .run(status, actor, now, id);
+    if (status === 'completed' || status === 'rejected') {
+      db.prepare(`
+        UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+        WHERE batch_id=? AND seq=? AND status='held'
+      `).run(row.batch_id, row.slip_seq);
+    }
+    return { ...row, status };
   })();
 }

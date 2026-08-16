@@ -12,10 +12,11 @@ import iconv from 'iconv-lite';
 // DB を一時ディレクトリへ (モジュール読み込み前に設定する)
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-test-'));
 
+const svc = await import('../service.js');
 const {
   parseCs03003, importPackBatch, checkPickingMatch, slipWarns, PackError,
   deriveFolderName, isStaleSagyoDate, getWorkState, applyEvent,
-} = await import('../service.js');
+} = svc;
 const {
   initPackingDB, getDB, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, jstToday,
@@ -510,6 +511,218 @@ t('next は現在の伝票のみ・順に完了して最後で batch done (計�
 t('完了後の next / start は拒否される', () => {
   expectPackError(() => applyEvent(wr.batchId, { opId: 'op-n9', event: 'next', slipSeq: 3 }, '星'), 'not_packing');
   expectPackError(() => applyEvent(wr.batchId, { opId: 'op-s9', event: 'start' }, '星'), 'already_done');
+});
+
+// ─── 例外操作: 中断/再開・完了取消・ズレ回復ジャンプ・バッチ取消 ───
+
+const ep = parseCs03003(makeCsv([
+  row({ slip: '0110', lineNo: 1, sku: 'e1', tb: 'TB11111111111' }),
+  row({ slip: '0111', lineNo: 1, sku: 'e2', tb: 'TB11111111111' }),
+  row({ slip: '0112', lineNo: 1, sku: 'e3', tb: 'TB11111111111' }),
+]));
+const er = importPackBatch(ep, { matchAck: true }, 'test');
+applyEvent(er.batchId, { opId: 'e-s1', event: 'start' }, '星');
+
+t('pause/resume: 中断時間が paused_total_sec に積まれる (clientAtクランプ・下限=開始時刻)', () => {
+  // クランプ下限がバッチ開始時刻のため、開始を10分前に遡らせてから5分前の中断を報告する
+  getDB().prepare('UPDATE pk_pack_batches SET started_at=? WHERE id=?')
+    .run(new Date(Date.now() - 600_000).toISOString().slice(0, 19) + 'Z', er.batchId);
+  const t0 = new Date(Date.now() - 300_000).toISOString();   // 5分前に中断
+  applyEvent(er.batchId, { opId: 'e-p1', event: 'pause', reason: '休憩', clientAt: t0 }, '星');
+  assert.equal(getPackBatch(er.batchId).status, 'paused');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-n0', event: 'next', slipSeq: 1 }, '星'), 'not_packing');
+  applyEvent(er.batchId, { opId: 'e-r1', event: 'resume' }, '星');
+  const b = getPackBatch(er.batchId);
+  assert.equal(b.status, 'packing');
+  assert.ok(b.paused_total_sec >= 290 && b.paused_total_sec <= 310, `5分前後のはず: ${b.paused_total_sec}`);
+});
+
+t('pause: 開始時刻より前の clientAt は now に丸められる (時計ズレで計測が壊れない)', () => {
+  const p2 = parseCs03003(makeCsv([row({ slip: '0140', sku: 'cl1', tb: 'TB00000000003' })]));
+  const r2 = importPackBatch(p2, { matchAck: true }, 'test');
+  applyEvent(r2.batchId, { opId: 'cl-s', event: 'start' }, '星');
+  applyEvent(r2.batchId, { opId: 'cl-p', event: 'pause', reason: '休憩',
+    clientAt: new Date(Date.now() - 3600_000).toISOString() }, '星');   // 開始前=1時間前を主張
+  applyEvent(r2.batchId, { opId: 'cl-r', event: 'resume' }, '星');
+  assert.ok(getPackBatch(r2.batchId).paused_total_sec < 10, '丸められてほぼ0のはず');
+});
+
+t('ズレ回復ジャンプ: jumped=trueで順序外の完了ができ、飛ばした伝票が残ると完了しない', () => {
+  // 現在は seq1 だが、紙の束が seq3 から始まっていた想定
+  applyEvent(er.batchId, { opId: 'e-j1', event: 'jump', slipSeq: 3 }, '星');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-x1', event: 'next', slipSeq: 3 }, '星'), 'out_of_order');
+  const r = applyEvent(er.batchId, { opId: 'e-n1', event: 'next', slipSeq: 3, jumped: true }, '星');
+  assert.equal(r.batchStatus, 'packing');           // 1・2が未処理なので完了しない (完了ガード)
+  assert.deepEqual(r.doneSeqs, [3]);
+  assert.equal(r.currentSeq, 1);
+  assert.equal(r.lastDoneSeq, 3);
+});
+
+t('undo: 最後に完了した伝票 (done_at順) だけ理由つきで取り消せる', () => {
+  applyEvent(er.batchId, { opId: 'e-n2', event: 'next', slipSeq: 1 }, '星');
+  // 最後に完了したのは seq1 (done_at順)。seq3 は取り消せない
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-u0', event: 'undo', slipSeq: 3, reason: '誤タップ' }, '星'), 'out_of_order');
+  expectPackError(() => applyEvent(er.batchId, { opId: 'e-u1', event: 'undo', slipSeq: 1 }, '星'), 'bad_reason');
+  const r = applyEvent(er.batchId, { opId: 'e-u2', event: 'undo', slipSeq: 1, reason: '誤タップ' }, '星');
+  assert.deepEqual(r.doneSeqs, [3]);
+  assert.equal(r.currentSeq, 1);
+});
+
+t('undo: バッチ完了直後も取り消して再開できる', () => {
+  applyEvent(er.batchId, { opId: 'e-n3', event: 'next', slipSeq: 1 }, '星');
+  applyEvent(er.batchId, { opId: 'e-n4', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(getPackBatch(er.batchId).status, 'done');
+  const r = applyEvent(er.batchId, { opId: 'e-u3', event: 'undo', slipSeq: 2, reason: 'その他' }, '星');
+  assert.equal(r.batchStatus, 'packing');
+  assert.equal(r.currentSeq, 2);
+});
+
+t('cancel: 未着手に戻り伝票進捗が初期化される', () => {
+  applyEvent(er.batchId, { opId: 'e-c1', event: 'cancel' }, '星');
+  const b = getPackBatch(er.batchId);
+  assert.equal(b.status, 'ready');
+  assert.equal(b.worker, null);
+  assert.equal(b.paused_total_sec, 0);
+  const slips = listPackSlips(er.batchId);
+  assert.ok(slips.every((s) => s.status === 'pending' && !s.done_at));
+});
+
+// ─── Drive自動ポーラー (deps注入・v3) ───
+
+const { pollOnce, pickPollCandidates } = await import('../drive-sync.js');
+const { createDevice, verifyDevice, revokeDevice } = await import('../db.js');
+
+t('pickPollCandidates: 納品書CSVのみ・60秒安定待ち・3日窓', () => {
+  const now = Date.parse('2026-08-16T03:00:00Z');
+  const files = [
+    { filename: '納品書_出荷_01.csv', modified_time: '2026-08-16T02:58:00Z' },   // ok
+    { filename: '納品書_出荷_02.csv', modified_time: '2026-08-16T02:59:30Z' },   // 30秒前 → 待つ
+    { filename: 'ピッキングリストデータ_出荷_01.csv', modified_time: '2026-08-16T02:00:00Z' },  // 対象外
+    { filename: '納品書_1.pdf', modified_time: '2026-08-16T02:00:00Z' },         // 対象外
+    { filename: '納品書_出荷_03.csv', modified_time: '2026-08-10T00:00:00Z' },   // 3日超
+  ];
+  assert.deepEqual(pickPollCandidates(files, now).map((f) => f.filename), ['納品書_出荷_01.csv']);
+});
+
+async function runPoll(csvBuf, { fileId = 'F1', mtime = '2026-08-16T00:00:00Z', filename = '納品書_出荷_77.csv', parent = '出荷_77' } = {}) {
+  return pollOnce({
+    listFiles: async () => [{ file_id: fileId, filename, parent_name: parent, modified_time: mtime }],
+    download: async () => ({ buffer: csvBuf, modified_time: mtime, filename }),
+    nowMs: Date.parse(mtime) + 120_000,
+  });
+}
+
+await (async () => {
+  // 突合ok → 自動取込
+  const okCsv = makeCsv([
+    { ...row({ slip: '0100', sku: 'pz', tb: 'TB33333333333' }) },
+  ]);
+  importPickingBatch(parseCs03002(makePickCsv([
+    pickRow({ slip: '0100', sku: 'pz', qty: 1, tb: 'TB33333333333' }),
+  ])), { hikiateClass: 'テスト', folderName: '出荷_77' }, 'test');
+  let s = await runPoll(okCsv);
+  assert.equal(s.imported, 1, `imported=1 のはずが ${JSON.stringify(s)}`);
+  // 同じ版はスキップ (台帳冪等)
+  s = await runPoll(okCsv);
+  assert.equal(s.checked + s.imported + s.failed, 1);   // checked=1, imported=0
+  assert.equal(s.imported, 0);
+  passed++; console.log('  ok: ポーラー: 突合okは自動取込・同一版は台帳で冪等 (async)');
+
+  // no_picking → failed (再試行対象)
+  const npCsv = makeCsv([
+    { ...row({ slip: '0101', sku: 'nq', tb: 'TB22222222222' }) },
+  ]);
+  s = await runPoll(npCsv, { fileId: 'F2', filename: '納品書_出荷_78.csv', parent: '出荷_78' });
+  assert.equal(s.failed, 1);
+  const led = getDB().prepare("SELECT * FROM pk_pack_drive_imports WHERE drive_file_id='F2'").get();
+  assert.equal(led.status, 'failed');
+  assert.ok(/no_picking/.test(led.error));
+  // picking 側が届いたら次周期で取り込まれる
+  importPickingBatch(parseCs03002(makePickCsv([
+    pickRow({ slip: '0101', sku: 'nq', qty: 1, tb: 'TB22222222222' }),
+  ])), { hikiateClass: 'テスト', folderName: '出荷_78' }, 'test');
+  s = await runPoll(npCsv, { fileId: 'F2', filename: '納品書_出荷_78.csv', parent: '出荷_78' });
+  assert.equal(s.imported, 1);
+  passed++; console.log('  ok: ポーラー: no_pickingは再試行→CS03002到着後に自動取込 (async)');
+
+  // mismatch → skipped (人の承認へ)
+  const mmCsv = makeCsv([
+    { ...row({ slip: '0100', sku: 'pz', qty: 3, tb: 'TB33333333333' }) },   // pickingは1個
+  ]);
+  s = await runPoll(mmCsv, { fileId: 'F3', mtime: '2026-08-16T01:00:00Z', filename: '納品書_出荷_77.csv', parent: '出荷_77' });
+  assert.equal(s.skipped, 1);
+  assert.ok(/mismatch/.test(getDB().prepare("SELECT error FROM pk_pack_drive_imports WHERE drive_file_id='F3'").get().error));
+  passed++; console.log('  ok: ポーラー: mismatchは取り込まずskipped=承認待ち (async)');
+})();
+
+// ─── ④ 配送方法変更 (保留→事務対応→解除) ───
+
+t('ship_change: 伝票がheldになり、保留が残る間はバッチが完了しない', () => {
+  const sp = parseCs03003(makeCsv([
+    row({ slip: '0120', lineNo: 1, sku: 's1', tb: 'TB00000000001' }),
+    row({ slip: '0121', lineNo: 1, sku: 's2', tb: 'TB00000000001' }),
+  ]));
+  const sr = importPackBatch(sp, { matchAck: true }, 'test');
+  applyEvent(sr.batchId, { opId: 's-s1', event: 'start' }, '星');
+  const r1 = applyEvent(sr.batchId, {
+    opId: 's-c1', event: 'ship_change', slipSeq: 1,
+    proposedMethod: '60サイズ', reason: '入らない',
+  }, '星');
+  assert.deepEqual(r1.heldSeqs, [1]);
+  assert.equal(r1.currentSeq, 2);
+  const chg = getDB().prepare('SELECT * FROM pk_pack_ship_changes ORDER BY id DESC LIMIT 1').get();
+  assert.equal(chg.status, 'requested');
+  assert.equal(chg.proposed_method, '60サイズ');
+  // 残り (seq2) を完了しても、保留が残る間はバッチ done にならない (完了ガード)
+  const r2 = applyEvent(sr.batchId, { opId: 's-n1', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(r2.batchStatus, 'packing');
+  assert.equal(r2.currentSeq, null);
+  // 事務が completed → 伝票が pending に戻り、完了できる
+  const { setShipChangeStatus } = svc;
+  setShipChangeStatus(chg.id, 'completed', 'office@test');
+  const r3 = applyEvent(sr.batchId, { opId: 's-n2', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(r3.batchStatus, 'done');
+});
+
+t('ship_change: 理由・提案は必須。処理済み伝票は保留にできない', () => {
+  const sp = parseCs03003(makeCsv([row({ slip: '0130', sku: 'q1', tb: 'TB00000000002' })]));
+  const sr = importPackBatch(sp, { matchAck: true }, 'test');
+  applyEvent(sr.batchId, { opId: 'q-s1', event: 'start' }, '星');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c1', event: 'ship_change', slipSeq: 1, reason: '入らない' }, '星'), 'bad_method');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c2', event: 'ship_change', slipSeq: 1, proposedMethod: 'x' }, '星'), 'bad_reason');
+  applyEvent(sr.batchId, { opId: 'q-n1', event: 'next', slipSeq: 1 }, '星');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c3', event: 'ship_change', slipSeq: 1, proposedMethod: 'x', reason: '入らない' }, '星'), 'not_packing');
+});
+
+t('setShipChangeStatus: 不正な遷移は拒否される', () => {
+  const { setShipChangeStatus } = svc;
+  const chg = getDB().prepare("SELECT * FROM pk_pack_ship_changes WHERE status='completed' ORDER BY id DESC LIMIT 1").get();
+  expectPackError(() => setShipChangeStatus(chg.id, 'accepted', 'x'), 'bad_transition');
+});
+
+// ─── 日次サマリ ───
+
+t('getDailySummary: 実働・秒/伝票・例外操作カウントが集計される', () => {
+  const { getDailySummary } = svc;
+  const s = getDailySummary(jstToday());
+  assert.ok(s.total.batchCount > 0);
+  assert.ok(s.opCounts.jump >= 1);      // ズレ回復テストで1回記録済み
+  assert.ok(s.opCounts.undo >= 2);
+  assert.ok(s.opCounts.pause >= 1);
+  assert.ok(Array.isArray(s.workers));
+  assert.ok(Array.isArray(s.batches));
+});
+
+// ─── 登録端末 (v3) ───
+
+t('端末登録→検証→失効', () => {
+  const { token, id } = createDevice('梱包iPad1', 'test@example.com');
+  const d = verifyDevice(token);
+  assert.equal(d.label, '梱包iPad1');
+  assert.equal(d.id, id);
+  assert.equal(verifyDevice('bogus'), null);
+  assert.ok(revokeDevice(id));
+  assert.equal(verifyDevice(token), null);
 });
 
 console.log(`test-import: ${passed} 件 pass`);

@@ -6,6 +6,9 @@
   <title><%= title %> | B-Faith Portal</title>
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="manifest" href="/apps/packing/manifest.json">
+  <link rel="apple-touch-icon" href="/favicon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/mobile.css">
   <style>
@@ -49,8 +52,10 @@
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
       <% if (isAdmin) { %>
         <a href="/apps/packing/admin/import" class="btn-logout">📥 納品書CSV取込</a>
+        <a href="/apps/packing/admin/summary" class="btn-logout">📊 サマリ</a>
+        <a href="/apps/packing/admin/devices" class="btn-logout">📱 端末</a>
       <% } %>
-      <a href="/apps/picking/" class="btn-logout">📱 ピッキング</a>
+      <% if (typeof deviceMode === 'undefined' || !deviceMode) { %><a href="/apps/picking/" class="btn-logout">📱 ピッキング</a><% } %>
     </div>
   </header>
 

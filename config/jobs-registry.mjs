@@ -54,6 +54,21 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [picking-drive-poller] を確認。失敗台帳は picking.db pk_drive_imports。'
       + 'ping には miniPC の C:\\tools\\bfaith-picking\\.env に JOBS_MONITOR_TOKEN が必要。復旧は Restart-Service PickingServer',
   },
+  {
+    id: 'packing-drive-poller',
+    type: 'heartbeat',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Drive出荷_noの納品書CSV (納品書_出荷_XX.csv) を2分間隔で自動取込 (梱包支援アプリの入力)。'
+      + 'ピッキング突合ok+出荷作業日=今日のみ自動確定し、mismatch/前日ファイルは台帳に残して手動承認へ回す。'
+      + 'PickingServer内の常駐ループで、独立したスケジュールタスクではない',
+    where: 'miniPC PickingServer (apps/packing/drive-sync.js startPackingDrivePoller。env PACKING_ENABLED)',
+    schedule: '常駐 (120秒間隔・env PACKING_POLL_INTERVAL_SEC。生存 ping は1時間に1回へ間引き)',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [packing-drive-poller] を確認。失敗台帳は picking.db pk_pack_drive_imports'
+      + ' (取込画面 /apps/packing/admin/import にも要確認一覧が出る)。復旧は Restart-Service PickingServer',
+  },
   // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
   {
     id: 'inquiry-hub-sync',
