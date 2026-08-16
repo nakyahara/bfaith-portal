@@ -205,11 +205,20 @@ router.get('/work/:id(\\d+)', (req, res) => {
     if (e instanceof PackError) return res.status(e.status).send(e.message);
     throw e;
   }
+  // 引当分類名 (picking の pk_batches.hikiate_class — 参照のみ)。梱包画面の作業方法表示に使う
+  let hikiateClass = null;
+  if (state.batch.pk_batch_id) {
+    try {
+      hikiateClass = getDB().prepare('SELECT hikiate_class FROM pk_batches WHERE id = ?')
+        .get(state.batch.pk_batch_id)?.hikiate_class ?? null;
+    } catch { /* picking未初期化環境では無視 */ }
+  }
   res.render(path.join(__dirname, 'views/work'), {
     title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
     displayName: req.session?.displayName,
     workers: listWorkers(),
     state,
+    hikiateClass,
     warnLabels: WARN_LABELS,
     pauseReasons: PAUSE_REASONS,
     undoReasons: UNDO_REASONS,

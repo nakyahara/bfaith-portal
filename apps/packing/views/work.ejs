@@ -251,6 +251,7 @@
       batchStatus: state.batch.status,
       worker: state.batch.worker,
       folderName: state.batch.folder_name || '',
+      hikiateClass: typeof hikiateClass === 'undefined' ? null : hikiateClass,
       pauseReason: state.batch.pause_reason || null,
       currentSeq: state.currentSeq,
       heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
@@ -330,7 +331,7 @@
 
       $('paper').innerHTML = `
         <div class="ship-row">
-          <span class="method">${esc(s.deliveryMethod || '')}</span>
+          <span class="method">${esc(STATE.hikiateClass || '')}</span>
           ${s.material ? `<span class="material">${esc(s.material)}</span>` : ''}
           ${s.printHeader1 ? `<span class="material">${esc(s.printHeader1)}</span>` : ''}
           ${s.boxCount > 1 ? `<span class="boxes">箱数 ${s.boxCount}</span>` : ''}
