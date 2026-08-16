@@ -42,7 +42,9 @@ export function buildShortageText({ batch, line, worker, shortageQty }) {
     '🚨 ピッキング欠品',
     `${batch.folder_name || ''}｜${batch.hikiate_class}`,
     `ロケ: ${line.locationLabel || line.location}`,
-    `商品: ${line.product_name || ''} (${line.sku})`,
+    `商品: ${line.product_name || ''}`,
+    // NE在庫修正でそのまま検索・コピーできるよう独立行 (2026-08-16 中原さん要望)
+    `商品コード: ${line.sku}`,
     `欠品 ${shortageQty}個 / 指示 ${line.qty}個${picked > 0 ? ` (${picked}個は確保済み)` : ''}`,
     `作業者: ${worker}`,
   ].join('\n');

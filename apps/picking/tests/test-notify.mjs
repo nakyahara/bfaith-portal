@@ -23,9 +23,9 @@ const INFO = {
   shortageQty: 2,
 };
 
-t('buildShortageText: バッチ/ロケ/商品/数量/作業者が入る (一部欠品は確保数も)', () => {
+t('buildShortageText: バッチ/ロケ/商品/商品コード/数量/作業者が入る (一部欠品は確保数も)', () => {
   const text = buildShortageText(INFO);
-  for (const s of ['出荷_03', 'P3FB-001-003-03', 'teatree10', '欠品 2個 / 指示 3個', '(1個は確保済み)', '星']) {
+  for (const s of ['出荷_03', 'P3FB-001-003-03', '商品コード: teatree10', '欠品 2個 / 指示 3個', '(1個は確保済み)', '星']) {
     assert.ok(text.includes(s), `"${s}" を含むはず:\n${text}`);
   }
   const full = buildShortageText({ ...INFO, shortageQty: 3 });
