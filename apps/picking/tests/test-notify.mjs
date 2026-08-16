@@ -10,6 +10,9 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-test-'));
 delete process.env.PICKING_LINE_CHANNEL_TOKEN;
 delete process.env.PICKING_LINE_TO;
 delete process.env.PICKING_ALERT_WEBHOOK;
+// 他ロケ在庫の warehouse 連携は未設定状態を既定にする (既存テストの通知本文・fetch回数を変えない)
+delete process.env.WAREHOUSE_URL;
+delete process.env.WAREHOUSE_SERVICE_TOKEN;
 
 const { buildShortageText, notifyShortage } = await import('../notify.js');
 
@@ -266,4 +269,110 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: プロパティ名の全角/半角ゆれを同一視 (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 10} 件 pass`);
+// ─── 他ロケ在庫 (stock-locations.js) ───
+{
+  const { buildStockLocationsText, normalizeLocationDigits, fetchStockLocations, stockLookupConfigured } = await import('../stock-locations.js');
+  t('normalizeLocationDigits: 区切りあり/なし8桁を同一視', () => {
+    assert.equal(normalizeLocationDigits('001-003-03'), '00100303');
+    assert.equal(normalizeLocationDigits('00100303'), '00100303');
+    assert.equal(normalizeLocationDigits(''), '');
+  });
+
+  const data = {
+    ok: true,
+    importedAt: '2026-08-16T03:03:00.000Z',   // JST 12:03
+    stockDate: '20260816',
+    locations: [
+      { block: 'P3FB', location: '001-003-03', quality: '良品', qty: 3, allocated: 0, free: 3 },      // 報告ロケ → 除外
+      { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 200, allocated: 0, free: 200 },
+      { block: 'R1FA', location: '002-002-01', quality: '良品', qty: 160, allocated: 10, free: 150 },
+      { block: 'P1FB', location: '001-004-02', quality: '不良品', qty: 50, allocated: 0, free: 50 },   // 良品以外 → 出さない
+      { block: 'P1FB', location: '001-009-01', quality: '良品', qty: 5, allocated: 5, free: 0 },       // フリー0 → 出さない
+      { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', quality: '良品', qty: 1000, allocated: 0, free: 1000 },  // 仮想ロケ → 合算行のみ
+    ],
+  };
+  const now = new Date('2026-08-16T03:30:00Z');   // JST 12:30 (取込27分後)
+
+  t('buildStockLocationsText: 良品のみ・フリー在庫降順・報告ロケ除外・仮想ロケは合算・HH:MM時点', () => {
+    const text = buildStockLocationsText(data, { excludeBlock: 'P3FB', excludeLocation: '00100303', now });
+    const lines = text.split('\n');
+    assert.ok(lines[0].startsWith('📍 他ロケ在庫 (12:03時点)'), text);
+    assert.equal(lines[1], '・R1FA-001-001-01: 200個');
+    assert.equal(lines[2], '・R1FA-002-002-01: 150個 (別途引当10)');
+    assert.equal(lines[3], '・棚以外 (仮想ロケ等): 1000個', 'ZZZ等の仮想ロケは棚として並べず合算');
+    assert.equal(lines.length, 4, `不良品/フリー0/報告ロケは出ないはず:\n${text}`);
+    assert.ok(!text.includes('⚠'), '新鮮なら警告なし');
+  });
+
+  t('buildStockLocationsText: 180分超のスナップショットは古い旨の警告', () => {
+    const later = new Date('2026-08-16T07:00:00Z');   // 取込から約4時間後
+    const text = buildStockLocationsText(data, { now: later });
+    assert.ok(text.includes('⚠古い可能性'), text);
+  });
+
+  t('buildStockLocationsText: 「なし」と「取得できず」は別表示 (0件と取得不能を混ぜない)', () => {
+    const none = buildStockLocationsText({ ok: true, importedAt: data.importedAt, locations: [] }, { now });
+    assert.ok(none.includes('時点): なし'), none);
+    assert.equal(buildStockLocationsText(null, { now }), '📍 他ロケ在庫: 取得できず');
+  });
+
+  t('stockLookupConfigured: env未設定なら false (通知に在庫行を出さない)', () => {
+    assert.equal(stockLookupConfigured(), false);
+  });
+
+  // fetchStockLocations: fail-soft と SKU 正規化
+  process.env.WAREHOUSE_URL = 'http://wh.local';
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'tkn';
+  assert.equal(await fetchStockLocations('abc', async () => ({ ok: false, status: 500 })), null, 'HTTPエラーは null');
+  assert.equal(await fetchStockLocations('abc', async () => { throw new Error('timeout'); }), null, '例外も null');
+  const got = await fetchStockLocations(' ABC ', async (url, opts) => {
+    assert.ok(String(url).startsWith('http://wh.local/service-api/logizard-stock/locations?code=abc'), url);
+    assert.equal(opts.headers.Authorization, 'Bearer tkn');
+    return { ok: true, status: 200, json: async () => ({ ok: true, importedAt: null, stockDate: null, locations: [] }) };
+  });
+  assert.ok(got && Array.isArray(got.locations), 'trim+小文字で照会して結果を返す');
+  delete process.env.WAREHOUSE_URL;
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  console.log('  ok: fetchStockLocations fail-soft + SKU正規化 (async)');
+}
+
+// ─── e2e: 欠品通知の本文に他ロケ在庫が載る ───
+{
+  process.env.WAREHOUSE_URL = 'http://wh.local';
+  process.env.WAREHOUSE_SERVICE_TOKEN = 'tkn';
+  process.env.PICKING_LINE_CHANNEL_TOKEN = 'test-token';
+  process.env.PICKING_LINE_TO = 'Cbbb';
+  delete process.env.PICKING_ALERT_WEBHOOK;
+  const sent = [];
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).startsWith('http://wh.local/service-api/logizard-stock/locations')) {
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          ok: true, importedAt: new Date().toISOString(), stockDate: '20260816',
+          locations: [{ block: 'R1FA', location: '001-001-01', quality: '良品', qty: 200, allocated: 0, free: 200 }],
+        }),
+      };
+    }
+    sent.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  await notifyShortage(INFO);
+  const text = sent[0].messages[0].text;
+  assert.ok(text.includes('📍 他ロケ在庫'), text);
+  assert.ok(text.includes('・R1FA-001-001-01: 200個'), text);
+  // warehouse 側が落ちていても通知は出る (取得できず表示)
+  sent.length = 0;
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).startsWith('http://wh.local/')) return { ok: false, status: 503, text: async () => '' };
+    sent.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, text: async () => '' };
+  };
+  await notifyShortage(INFO);
+  assert.ok(sent[0].messages[0].text.includes('他ロケ在庫: 取得できず'), sent[0].messages[0].text);
+  delete process.env.WAREHOUSE_URL;
+  delete process.env.WAREHOUSE_SERVICE_TOKEN;
+  console.log('  ok: 欠品通知本文に他ロケ在庫が載る / warehouse停止でも通知は出る (async)');
+}
+
+console.log(`\ntest-notify: ${passed + 12} 件 pass`);

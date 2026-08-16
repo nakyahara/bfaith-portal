@@ -18,6 +18,7 @@
 
 import crypto from 'node:crypto';
 import { isJstWeekendOrHoliday } from './jp-holiday.js';
+import { fetchStockLocations, buildStockLocationsText, stockLookupConfigured } from './stock-locations.js';
 
 const TIMEOUT_MS = 5000;
 
@@ -36,7 +37,7 @@ export function resolveLineTo(now = new Date()) {
 }
 
 /** 読み手ファースト (現場の管理者が次の行動を決められる形) の欠品メッセージ。 */
-export function buildShortageText({ batch, line, worker, shortageQty }) {
+export function buildShortageText({ batch, line, worker, shortageQty, stockText }) {
   const picked = line.qty - shortageQty;
   return [
     '🚨 ピッキング欠品',
@@ -47,7 +48,9 @@ export function buildShortageText({ batch, line, worker, shortageQty }) {
     `商品コード: ${line.sku}`,
     `欠品 ${shortageQty}個 / 指示 ${line.qty}個${picked > 0 ? ` (${picked}個は確保済み)` : ''}`,
     `作業者: ${worker}`,
-  ].join('\n');
+    // 他ロケ在庫 (ロジザード在庫スナップショット。取得失敗時も「取得できず」を必ず出す)
+    stockText || null,
+  ].filter((s) => s !== null).join('\n');
 }
 
 async function postJson(url, headers, body) {
@@ -100,7 +103,24 @@ async function sendGChat(text) {
  */
 export async function notifyShortage(info, now = new Date()) {
   if (!process.env.PICKING_LINE_CHANNEL_TOKEN && !process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
-  const text = buildShortageText(info);
+  // 同一SKUの他ロケ在庫 (ロジザード毎時スナップショット) を warehouse から取る。
+  // fail-soft: 取得・整形のどんな失敗でも通知本体は止めない (想定外レスポンス形状で
+  // 整形が throw しても「取得できず」に落とす)。呼び出し側は fire-and-forget なので待ってよい。
+  // warehouse連携が未設定の環境では在庫行そのものを出さない (「取得できず」のノイズ防止)
+  let stockText = null;
+  if (stockLookupConfigured()) {
+    try {
+      stockText = buildStockLocationsText(await fetchStockLocations(info.line?.sku), {
+        excludeBlock: info.line?.block,
+        excludeLocation: info.line?.location,
+        now,
+      });
+    } catch (e) {
+      console.warn(`[picking-notify] 他ロケ在庫の整形失敗 (通知は継続): ${e.message}`);
+      stockText = '📍 他ロケ在庫: 取得できず';
+    }
+  }
+  const text = buildShortageText({ ...info, stockText });
   const results = await Promise.allSettled([sendLine(text, now), sendGChat(text)]);
   const failures = results.filter((r) => r.status === 'rejected');
   const sent = results.some((r) => r.status === 'fulfilled' && r.value === true);

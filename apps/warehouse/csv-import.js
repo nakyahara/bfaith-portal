@@ -205,7 +205,25 @@ function importLogizard(filePath) {
   const db = getDB();
   const col = (name) => headers.indexOf(name);
 
-  db.exec('DELETE FROM raw_lz_inventory');
+  // ヘッダー検証: 列名変更・別CSVの混入で「全行スキップ→空のまま全消しコミット」しないよう先に落とす
+  const REQUIRED_HEADERS = ['商品ID', 'ブロック略称', 'ロケ', '品質区分名', '在庫数(引当数を含む)', '引当数', '在庫日'];
+  const missingHeaders = REQUIRED_HEADERS.filter((h) => col(h) === -1);
+  if (missingHeaders.length > 0) {
+    throw new Error(`ロジザード在庫CSVに必須列がありません: ${missingHeaders.join(', ')} (出力形式が変わった可能性。既存データを温存しました)`);
+  }
+  const minRowsRaw = String(process.env.LZ_IMPORT_MIN_ROWS ?? '1000').trim();
+  const minRows = Number(minRowsRaw);
+  if (!/^[1-9]\d*$/.test(minRowsRaw) || !Number.isSafeInteger(minRows)) {
+    throw new Error(`LZ_IMPORT_MIN_ROWS が不正です: "${process.env.LZ_IMPORT_MIN_ROWS}" (正の整数で指定してください)`);
+  }
+  // 壊れた数値を黙って0にしない (在庫0の誤案内は欠品通知の誤誘導になる)
+  const toInt = (v, label, rowNo) => {
+    const n = Number(String(v ?? '').replace(/,/g, '').trim() || '0');
+    if (!Number.isInteger(n)) {
+      throw new Error(`${rowNo}行目の${label}が整数ではありません: "${v}" (全行ロールバックし既存データを温存しました)`);
+    }
+    return n;
+  };
   const stmt = db.prepare(`
     INSERT INTO raw_lz_inventory (
       商品ID, 商品名, バーコード, ブロック略称, ロケ,
@@ -215,26 +233,33 @@ function importLogizard(filePath) {
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?)
   `);
 
+  // 欠品通知が毎時取込中に読んでも空テーブル・古い取得時刻を見ないよう、
+  // DELETE〜実挿入件数ガード〜sync_meta更新まで単一トランザクション (途中で throw = 全ロールバック)
   const tx = db.transaction(() => {
+    db.exec('DELETE FROM raw_lz_inventory');
     let count = 0;
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
       const productId = (row[col('商品ID')]?.trim() || '').toLowerCase();
       if (!productId) continue;
       stmt.run(productId, row[col('商品名')]||'', row[col('バーコード')]||'',
         row[col('ブロック略称')]||'', row[col('ロケ')]||'', row[col('品質区分名')]||'',
         row[col('有効期限')]||'', row[col('入荷日')]||'',
-        parseInt(row[col('在庫数(引当数を含む)')])||0, parseInt(row[col('引当数')])||0,
+        toInt(row[col('在庫数(引当数を含む)')], '在庫数', i + 2), toInt(row[col('引当数')], '引当数', i + 2),
         row[col('ロケ業務区分')]||'', row[col('商品予備項目００４')]||'',
         row[col('最終入荷日')]||'', row[col('最終出荷日')]||'',
         row[col('ブロック引当順')]||'', row[col('在庫日')]||'', now());
       count++;
     }
+    if (count < minRows) {
+      throw new Error(`実挿入件数が少なすぎます (${count}件 < 下限${minRows}件)。全行ロールバックし既存データを温存しました (意図的なら LZ_IMPORT_MIN_ROWS で下限を下げてください)`);
+    }
+    updateSyncMeta('logizard_last_import', new Date().toISOString());
+    updateSyncMeta('logizard_count', String(count));
     return count;
   });
 
   const count = tx();
-  updateSyncMeta('logizard_last_import', new Date().toISOString());
-  updateSyncMeta('logizard_count', String(count));
   console.log(`[Import] ロジザード在庫投入完了: ${count}件`);
   return count;
 }

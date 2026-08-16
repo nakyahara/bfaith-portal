@@ -37,6 +37,9 @@ export let rakutenReviewInitError = null;
 // 日次出荷サマリ表も同様 (出荷件数の可視化、2026-08-05)
 export let shipmentsDailyInitError = null;
 
+// ロジザード在庫スナップショット表も同様 (毎時mirror、2026-08-16)
+export let logizardStockInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -48,6 +51,7 @@ export function initMirrorDB() {
   qoo10DataInitError = null;
   rakutenReviewInitError = null;
   shipmentsDailyInitError = null;
+  logizardStockInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -1093,6 +1097,40 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] 日次出荷サマリ表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── ロジザード在庫スナップショット (SKU×ロケ×品質 粒度、毎時全置換、2026-08-16) ───
+  // 元: ミニPC warehouse.db.raw_lz_inventory (在庫CSVの毎時取込)。captured_at = miniPC取込時刻 (ISO)。
+  // 用途: ポータル各アプリからの在庫照会・他データとの突き合わせ
+  // (欠品LINE通知の参照は miniPC ローカルの service-api。この表は閲覧・分析用の複製)
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_logizard_stock (
+      商品ID        TEXT NOT NULL CHECK(trim(商品ID) <> ''),
+      商品名        TEXT,
+      バーコード    TEXT,
+      ブロック略称  TEXT,
+      ロケ          TEXT,
+      品質区分名    TEXT,
+      有効期限      TEXT,
+      入荷日        TEXT,
+      在庫数        INTEGER NOT NULL,
+      引当数        INTEGER NOT NULL,
+      ロケ業務区分  TEXT,
+      最終入荷日    TEXT,
+      最終出荷日    TEXT,
+      在庫日        TEXT,
+      captured_at   TEXT NOT NULL,
+      synced_at     TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mlz_sku ON mirror_logizard_stock(商品ID)');
+  } catch (e) {
+    logizardStockInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] ロジザード在庫表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // mirror_rakuten_finance_sku_daily — 楽天 Phase 1a #R-3b (Render 側 daily fact mirror)

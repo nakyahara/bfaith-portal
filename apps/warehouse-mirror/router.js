@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -86,6 +86,16 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
   const { products, set_components, sales_monthly, sales_daily, meta } = req.body;
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const log = [];
+
+  // logizard_stock は単独POST限定 (毎時の全置換 payload)。他表と相乗りすると、この分岐より
+  // 前の表だけ反映された状態で 400/503 になり「HTTP失敗なのに一部反映」の混在が残るため、
+  // 入口で拒否する (Codex R2 Low-1)
+  if (req.body.logizard_stock !== undefined) {
+    const others = Object.keys(req.body).filter((k) => k !== 'logizard_stock' && k !== 'meta');
+    if (others.length > 0) {
+      return res.status(400).json({ error: `logizard_stock は単独で送信してください (同時指定: ${others.join(', ')})` });
+    }
+  }
 
   try {
     // products（全件置換）
@@ -394,6 +404,76 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`shipments_daily: ${rows.length}件`);
+    }
+
+    // logizard_stock（全件置換、ロジザード在庫スナップショット・毎時）
+    //   送信側 = sync-to-render.js --logizard-only (毎時ランナー)。取込90分以内のときだけ送ってくる。
+    //   ⚠ この payload は logizard_stock 単独の POST で送ること。他表と相乗りすると、
+    //   この分岐の 400/503 でそれより前の表は反映済み・以降は未処理の混在状態になる
+    if (req.body.logizard_stock !== undefined) {
+      // fail-soft: この表のDDLが失敗していても他表を道連れにしない (2026-07-12 障害の教訓)。
+      // 同一POSTに相乗りした他テーブルを巻き込まないよう、この表だけ 503 で拒否する
+      if (logizardStockInitError) {
+        return res.status(503).json({ error: 'logizard_stock 表の初期化に失敗しています', init_error: logizardStockInitError });
+      }
+      const p = req.body.logizard_stock;
+      if (!p || typeof p !== 'object' || !Array.isArray(p.rows)) {
+        return res.status(400).json({ error: 'logizard_stock は { captured_at, rows[] } である必要があります' });
+      }
+      const capturedMs = typeof p.captured_at === 'string' ? Date.parse(p.captured_at) : NaN;
+      if (!Number.isFinite(capturedMs) || capturedMs > Date.now() + 24 * 3600 * 1000) {
+        return res.status(400).json({ error: 'logizard_stock.captured_at が日時として不正です (ISO形式・未来すぎない値が必要)' });
+      }
+      const rows = p.rows;
+      // 全置換なので空配列は受けない (取得失敗による全消しの防御。倉庫在庫ゼロは現実に起きない)
+      if (rows.length === 0) {
+        return res.status(400).json({ error: 'logizard_stock.rows が空です (全消しは受け付けません)' });
+      }
+      if (rows.length > 100000) {
+        return res.status(400).json({ error: `logizard_stock.rows が多すぎます (${rows.length}件)` });
+      }
+      // 全消し前に全行を検証する。1行でもおかしければ payload ごと 400 で拒否し、mirror は前回状態のまま残す
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        const where = `logizard_stock[${i}]`;
+        if (!r || typeof r !== 'object') return res.status(400).json({ error: `${where}: 行が不正です` });
+        if (typeof r['商品ID'] !== 'string' || !r['商品ID'].trim()) {
+          return res.status(400).json({ error: `${where}: 商品ID が不正です` });
+        }
+        if (!Number.isInteger(r['在庫数']) || !Number.isInteger(r['引当数'])) {
+          return res.status(400).json({ error: `${where}: 在庫数/引当数 が整数ではありません (${r['在庫数']}/${r['引当数']})` });
+        }
+      }
+      // 世代逆行の防止 (Codex R2 Medium-1): 手動再実行・遅延で古い snapshot が後から届いても
+      // 巻き戻さない。同一世代の再送は冪等成功 (リトライを 409 で失敗扱いにしない)
+      const currentCaptured = db.prepare('SELECT MAX(captured_at) AS c FROM mirror_logizard_stock').get()?.c || null;
+      const currentMs = currentCaptured ? Date.parse(currentCaptured) : NaN;
+      if (Number.isFinite(currentMs) && capturedMs < currentMs) {
+        return res.status(409).json({ error: `logizard_stock.captured_at が保存済みより古い snapshot です (${p.captured_at} < ${currentCaptured})` });
+      }
+      if (Number.isFinite(currentMs) && capturedMs === currentMs) {
+        log.push(`logizard_stock: 同一世代 (${p.captured_at}) のため変更なし`);
+      } else {
+      const tx = db.transaction(() => {
+        db.exec('DELETE FROM mirror_logizard_stock');
+        const stmt = db.prepare(`INSERT INTO mirror_logizard_stock (
+          商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
+          在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, captured_at, synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+        for (const r of rows) {
+          stmt.run(
+            r['商品ID'], r['商品名'] ?? null, r['バーコード'] ?? null,
+            r['ブロック略称'] ?? null, r['ロケ'] ?? null, r['品質区分名'] ?? null,
+            r['有効期限'] ?? null, r['入荷日'] ?? null,
+            r['在庫数'], r['引当数'],
+            r['ロケ業務区分'] ?? null, r['最終入荷日'] ?? null, r['最終出荷日'] ?? null,
+            r['在庫日'] ?? null, p.captured_at, now
+          );
+        }
+      });
+      tx();
+      log.push(`logizard_stock: ${rows.length}件`);
+      }
     }
 
     // rakuten_sku_map（全件置換）
@@ -3496,6 +3576,18 @@ router.get('/api/status', (req, res) => {
       status.shipments_daily_synced_at = r.synced_at;
     } catch {
       status.shipments_daily_count = 0;
+    }
+    // logizard_stock (ロジザード在庫スナップショット・毎時)。--logizard-only の送信後検証が読む
+    try {
+      const r = db.prepare(`
+        SELECT COUNT(*) AS cnt, MAX(captured_at) AS captured_at, MAX(synced_at) AS synced_at
+        FROM mirror_logizard_stock
+      `).get();
+      status.logizard_stock_count = r.cnt;
+      status.logizard_stock_captured_at = r.captured_at;
+      status.logizard_stock_synced_at = r.synced_at;
+    } catch {
+      status.logizard_stock_count = 0;
     }
     // inv_daily_detail (D-1c 詳細層)
     try {
