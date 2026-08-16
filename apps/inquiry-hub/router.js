@@ -418,6 +418,25 @@ router.get('/inquiries/:id', (req, res) => {
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
 
+  // ─── 注文リンク (2026-08-16 中原さん要望): NE個別受注明細 + モール側の注文詳細を直接開く ───
+  // NE: kensaku_denpyo_no で個別受注明細を検索表示できる (中原さん実証URL)。
+  // Yahoo!はNE側の受注番号に店舗プレフィックスが無い (例: b-faith01-10287187 → 10287187) ため
+  // account_identifier + '-' を剥がす。楽天は注文番号そのまま
+  const neOrderNo = (() => {
+    const raw = String(inq.order_number || '').trim();
+    if (!raw || !['rakuten', 'yahoo'].includes(inq.channel_type)) return null;
+    const prefix = `${String(inq.account_identifier || '')}-`;
+    return inq.channel_type === 'yahoo' && prefix.length > 1 && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+  })();
+  const neOrderUrl = neOrderNo
+    ? `https://main.next-engine.com/Userjyuchu/jyuchuInp?kensaku_denpyo_no=${encodeURIComponent(neOrderNo)}&jyuchu_meisai_order=jyuchu_meisai_gyo`
+    : null;
+  // モール側の注文詳細。楽天=RMS個別受注画面。
+  // ⚠️Yahoo!ストアクリエイターの注文詳細URLは形式未確認のため未対応 (実URLが確認でき次第ここに追加)
+  const mallOrderUrl = inq.channel_type === 'rakuten' && inq.order_number
+    ? `https://order-rp.rms.rakuten.co.jp/order-rb/individual-order-detail/init?orderNumber=${encodeURIComponent(String(inq.order_number).trim())}`
+    : null;
+
   // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder/group) で隣へ移動。
   // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
   const adj = getAdjacentInquiries(id, { view: backView, folder: backFolder ? String(backFolder.id) : '', group: backGroup });
@@ -447,7 +466,10 @@ router.get('/inquiries/:id', (req, res) => {
         <dl>
           <dt>店舗</dt><dd>${he(inq.shop_name)} <span class="sub">(${he(inq.account_identifier)})</span></dd>
           <dt>顧客</dt><dd>${he(inq.customer_name || '—')}${inq.customer_identifier ? `<div class="sub">${he(inq.customer_identifier)}</div>` : ''}</dd>
-          <dt>注文番号</dt><dd>${inq.order_number ? he(inq.order_number) : '—'}</dd>
+          <dt>注文番号</dt><dd>${inq.order_number
+            ? `${he(inq.order_number)}${mallOrderUrl ? `<div class="sub"><a href="${he(mallOrderUrl)}" target="_blank" rel="noopener" title="モールの注文詳細画面を開く">🛍️ モールで注文を開く ↗</a></div>` : ''}`
+            : '—'}</dd>
+          ${neOrderNo ? `<dt>NE受注</dt><dd><a href="${he(neOrderUrl)}" target="_blank" rel="noopener" title="ネクストエンジンの個別受注明細を開く">${he(neOrderNo)} ↗</a></dd>` : ''}
           <dt>商品</dt><dd>${he(inq.product_name || '—')}${inq.product_code ? `<div class="sub">${he(inq.product_code)}</div>` : ''}</dd>
           <dt>モール側状態</dt><dd class="sub" title="外部モール側のステータス (参考表示。同期が上書き)">${he(inq.external_status || '—')}${inq.external_is_read != null ? ` / ${inq.external_is_read ? '既読' : '未読'}` : ''}</dd>
           <dt>最終同期</dt><dd class="sub">${fmtJst(inq.last_external_synced_at)}</dd>
