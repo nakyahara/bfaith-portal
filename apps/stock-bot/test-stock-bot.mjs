@@ -14,7 +14,9 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'stockbot-test-'));
 process.env.DATA_DIR = tmpDir;
 
 const { initMirrorDB, getMirrorDB } = await import('../warehouse-mirror/db.js');
-const { searchProducts, buildStockReply, handleChatEvent } = await import('./router.js');
+const routerMod = await import('./router.js');
+const { searchProducts, buildStockReply, handleChatEvent, makeStockBotAuth, checkRateLimit } = routerMod;
+const stockBotRouter = routerMod.default;
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -107,6 +109,58 @@ console.log('\n── buildStockReply ──');
 {
   eq(buildStockReply(db, 'zzz-nothing', NOW), null, '存在しないSKUは null');
   ok(buildStockReply(db, ' TEATREE20 ', NOW)?.includes('(teatree20)') ?? false, 'SKUはtrim+小文字で照会');
+}
+
+console.log('\n── 1文字検索とレート制限 ──');
+{
+  const short = handleChatEvent({ type: 'MESSAGE', message: { text: '油' } }, db, NOW);
+  ok(short.text.includes('2文字以上'), '1文字は案内を返す (全表走査の無駄撃ち防止)');
+
+  const t0 = 1_000_000;
+  let first20 = true;
+  for (let i = 0; i < 20; i++) first20 = first20 && checkRateLimit('space-A', t0 + i * 100);
+  ok(first20, '同一スペース20回/分までは許可');
+  ok(!checkRateLimit('space-A', t0 + 5_000), '同一スペース21回目/分は制限');
+  ok(checkRateLimit('space-B', t0 + 5_000), '別スペースは独立');
+  ok(checkRateLimit('space-A', t0 + 61_000), '1分経過でリセット');
+}
+
+console.log('\n── HTTPレベル (認証がparserより前・ドメイン制限・413) ──');
+{
+  const { default: express } = await import('express');
+  const http = await import('node:http');
+  const app = express();
+  const auth = makeStockBotAuth(async (a) => a === 'Bearer good-token');
+  app.use('/apps/stock-bot', auth, express.json({ limit: '256kb' }), stockBotRouter);
+  const server = http.createServer(app);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (body, headers = {}) => fetch(`${base}/apps/stock-bot/chat-events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  });
+
+  eq((await post({ type: 'MESSAGE' })).status, 401, 'Bearerなしは401');
+  eq((await post({ type: 'MESSAGE' }, { Authorization: 'Bearer bad' })).status, 401, '検証失敗は401');
+
+  const outsider = await post(
+    { type: 'MESSAGE', user: { email: 'x@gmail.com' }, message: { text: 'ティーツリー' } },
+    { Authorization: 'Bearer good-token' });
+  ok((await outsider.json()).text.includes('社内ユーザー'), '社外ドメインは拒否');
+
+  const insider = await post(
+    { type: 'MESSAGE', user: { email: 'd.nakahara@b-faith.biz' }, space: { name: 'spaces/test' }, message: { text: 'ティーツリー' } },
+    { Authorization: 'Bearer good-token' });
+  const insiderBody = await insider.json();
+  ok(Array.isArray(insiderBody.cardsV2), '社内ユーザーの検索は候補カードが返る');
+
+  const big = await post(
+    `{"type":"MESSAGE","pad":"${'x'.repeat(300 * 1024)}"}`,
+    { Authorization: 'Bearer good-token' });
+  eq(big.status, 413, '256KB超のbodyは413');
+
+  await new Promise((r) => server.close(r));
 }
 
 db.close();

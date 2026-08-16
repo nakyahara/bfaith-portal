@@ -38,6 +38,9 @@
    - アプリ名: `在庫検索ボット` / 説明: 適当でOK / アバター: 任意
    - 機能: 「1:1のメッセージを受信する」「スペースとグループの会話に参加する」を ON
    - 接続設定: **HTTPエンドポイントURL** = `https://bfaith-portal.onrender.com/apps/stock-bot/chat-events`
+   - ⚠ **認証オーディエンス (Authentication Audience) は「HTTPエンドポイントURL」ではなく
+     「プロジェクト番号 (Project Number)」を選択** — サーバー側はプロジェクト番号を audience
+     として検証するため、URLを選ぶと全イベントが401になる
    - 公開設定: ドメイン内 (`b-faith.biz`) の全員 or 特定ユーザー
 3. **プロジェクト番号** (GCPコンソール「IAMと管理→設定」の数字のID) をコピーし、
    Render ダッシュボード → bfaith-portal → Environment に

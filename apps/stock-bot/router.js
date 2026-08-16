@@ -26,15 +26,22 @@ const MAX_CANDIDATES = 10;   // ボタンで並べる候補の上限
 
 let _client = null;
 const getClient = () => (_client ??= new OAuth2Client());
-let _certsCache = { at: 0, certs: null };
+// in-flight Promise を共有 (同時リクエストで certs 取得が重複しないように)。1時間で失効
+let _certsPromise = null;
+let _certsAt = 0;
 
-async function getChatCerts(fetchFn = fetch) {
-  if (!_certsCache.certs || Date.now() - _certsCache.at > 3600_000) {
-    const r = await fetchFn(CERTS_URL);
-    if (!r.ok) throw new Error(`certs取得失敗: HTTP ${r.status}`);
-    _certsCache = { at: Date.now(), certs: await r.json() };
+function getChatCerts(fetchFn = fetch) {
+  if (!_certsPromise || Date.now() - _certsAt > 3600_000) {
+    _certsAt = Date.now();
+    _certsPromise = fetchFn(CERTS_URL).then(async (r) => {
+      if (!r.ok) throw new Error(`certs取得失敗: HTTP ${r.status}`);
+      return r.json();
+    }).catch((e) => {
+      _certsPromise = null;   // 失敗をキャッシュしない
+      throw e;
+    });
   }
-  return _certsCache.certs;
+  return _certsPromise;
 }
 
 async function verifyChatBearer(authorization) {
@@ -42,15 +49,34 @@ async function verifyChatBearer(authorization) {
   if (!projectNumber) return false;   // mount gate があるので通常来ないが fail-closed
   const m = String(authorization || '').match(/^Bearer (.+)$/);
   if (!m) return false;
-  try {
-    const certs = await getChatCerts();
-    await getClient().verifySignedJwtWithCertsAsync(m[1], certs, projectNumber, [CHAT_ISSUER]);
-    return true;
-  } catch (e) {
-    console.warn(`[stock-bot] トークン検証失敗: ${e.message}`);
-    return false;
+  // 1回だけ certs を取り直して再検証 (鍵ローテーション直後の未知 kid で正規リクエストを
+  // 1時間 401 にしないため)
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const certs = await getChatCerts();
+      await getClient().verifySignedJwtWithCertsAsync(m[1], certs, projectNumber, [CHAT_ISSUER]);
+      return true;
+    } catch (e) {
+      if (attempt === 0) { _certsPromise = null; continue; }
+      console.warn(`[stock-bot] トークン検証失敗: ${e.message}`);
+      return false;
+    }
   }
+  return false;
 }
+
+/**
+ * Bearer 検証ミドルウェア。**body parser より前に mount する** (server.js 参照) —
+ * 未認可リクエストに body を読ませない (グローバル parser からも除外済み)。
+ * verifyFn 注入はテスト用 (実署名なしで 401/通過を検証できるように)。
+ */
+export function makeStockBotAuth(verifyFn = verifyChatBearer) {
+  return async (req, res, next) => {
+    if (await verifyFn(req.headers.authorization)) return next();
+    return res.status(401).json({ error: 'unauthorized' });
+  };
+}
+export const stockBotAuth = makeStockBotAuth();
 
 // ─── 検索 (mirror_logizard_stock) ───
 
@@ -142,6 +168,8 @@ export function handleChatEvent(event, db, now = new Date()) {
   if (type === 'MESSAGE') {
     const q = String(event.message?.argumentText ?? event.message?.text ?? '').trim();
     if (!q) return { text: USAGE };
+    // 1文字検索は候補が広すぎ+全表LIKE走査の無駄撃ちなので案内を返す
+    if (q.length < 2) return { text: `キーワードは2文字以上で送ってください。${USAGE}` };
     const found = searchProducts(db, q);
     if (found.length === 0) return { text: `「${q}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` };
     if (found.length === 1) return { text: buildStockReply(db, found[0].sku, now) };
@@ -151,20 +179,38 @@ export function handleChatEvent(event, db, now = new Date()) {
   return {};   // REMOVED_FROM_SPACE 等は黙って 200
 }
 
+// ─── レート制限 (スペース単位・in-memory) ───
+// 全表LIKE走査の連打対策。認証済み社内ユーザーしか来ない前提の軽いガード
+
+const RATE_LIMIT_PER_MIN = 20;
+const _rate = new Map();   // key → { windowStart, count }
+
+export function checkRateLimit(key, nowMs = Date.now()) {
+  if (_rate.size > 1000) _rate.clear();   // 異常な多スペースは丸ごとリセット (正常運用では数個)
+  const cur = _rate.get(key);
+  if (!cur || nowMs - cur.windowStart >= 60_000) {
+    _rate.set(key, { windowStart: nowMs, count: 1 });
+    return true;
+  }
+  cur.count++;
+  return cur.count <= RATE_LIMIT_PER_MIN;
+}
+
 // ─── ルーター ───
 
 const router = Router();
 
-router.post('/chat-events', async (req, res) => {
-  if (!(await verifyChatBearer(req.headers.authorization))) {
-    return res.status(401).json({ error: 'unauthorized' });
-  }
+// 認証 (stockBotAuth) は server.js で body parser より前に掛けている
+router.post('/chat-events', (req, res) => {
   const event = req.body || {};
   // 社内ドメイン限定 (Chat アプリの公開設定と二重の防御)。email が取れないイベントは通す
   const allowedDomain = (process.env.STOCK_BOT_ALLOWED_DOMAIN || 'b-faith.biz').toLowerCase();
   const email = String(event.user?.email || '').toLowerCase();
   if (email && !email.endsWith(`@${allowedDomain}`)) {
     return res.json({ text: '社内ユーザーのみ利用できます。' });
+  }
+  if (!checkRateLimit(event.space?.name || event.user?.name || 'unknown')) {
+    return res.json({ text: '検索が集中しています。1分ほどおいて再送してください。' });
   }
   try {
     return res.json(handleChatEvent(event, getMirrorDB()));

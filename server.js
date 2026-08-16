@@ -87,7 +87,7 @@ import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
-import stockBotRouter from './apps/stock-bot/router.js';
+import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -306,6 +306,9 @@ app.use((req, res, next) => {
     if (normalizedPath.startsWith('/apps/mirror/api/sync')) return next();
     // /api/ai-insights/service/* は AI_INSIGHT_SERVICE_TOKEN 認証後に専用 parser (2MB) が走る。
     if (normalizedPath.startsWith('/api/ai-insights/service')) return next();
+    // /apps/stock-bot は Chat Bearer 検証 (stockBotAuth) 後に専用 parser (256kb) が走る。
+    // 認証前に body を読まない (未認可 DoS 面を閉じる)
+    if (normalizedPath.startsWith('/apps/stock-bot')) return next();
     // mirror read API (GET専用、監査S-2で認証追加) への POST も認証前 body parse を避ける
     // (POST は router 側に route が無く 404 になるだけなので parse 不要)。
     if (/^\/apps\/mirror\/api\/(products|sales|status|download)(\/|$)/.test(normalizedPath)) return next();
@@ -1229,7 +1232,8 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
 // ある環境のみ mount — miniPC は同じ server.js を動かすため未設定=非mount (二重応答防止)。
 // 認証は router 内 (Google Chat の Bearer IDトークン検証 + 社内ドメイン制限、fail-closed)。
 if (process.env.STOCK_BOT_PROJECT_NUMBER) {
-  app.use('/apps/stock-bot', express.json({ limit: '256kb' }), stockBotRouter);
+  // stockBotAuth (Chat Bearer 検証) を parser より前に — 未認可リクエストに body を読ませない
+  app.use('/apps/stock-bot', stockBotAuth, express.json({ limit: '256kb' }), stockBotRouter);
   console.log('[server] stock-bot mounted');
 }
 app.use('/apps/amazon-accounting', (req, res, next) => {
