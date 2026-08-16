@@ -633,6 +633,13 @@ function renderPage() {
         <div id="mfTable"></div>
       </div>
 
+      <!-- MF振替伝票入力用 仕訳 -->
+      <div class="card">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: LINEコマース）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。金額0の行はMF側での入力不要です。</p>
+        <div id="mfJournalTable"><span class="meta">注文データCSVをアップロードすると表示されます</span></div>
+      </div>
+
       <!-- PF手数料（セグメント別の上に配置） -->
       <div class="card">
         <h2>工程2: PF手数料</h2>
@@ -831,6 +838,7 @@ function renderPage() {
 
       renderTaxTable(data);
       renderMfTable(data);
+      renderMfJournal();
       renderSegmentTable(data);
 
       if (data.resolvedByRepCode && data.resolvedByRepCode.length > 0) {
@@ -884,6 +892,74 @@ function renderPage() {
       html += '<td class="num" style="font-weight:bold">' + fmt(mf['商品売上(8%)']) + '</td>';
       html += '<td class="num" style="font-weight:bold">' + fmt(mf['合計']) + '</td></tr></table>';
       document.getElementById('mfTable').innerHTML = html;
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる。
+    // 対応関係（会計処理の実務ルール）:
+    //   貸方 売上高/課売10%    = 商品売上(10%)（税込）
+    //   貸方 売上高/課売(軽)8% = 商品売上(8%)（税込）
+    //   借方 支払手数料【原価】/課仕10% = PF手数料（工程2の入力値）
+    //   借方 広告宣伝費【原価】/課仕10% = 広告費（LINEギフトは通常0円）
+    //   借方 売掛金_EC売上/対象外      = 差し引き入金額（売上 − PF手数料 − 広告費）
+    function buildMfJournalRows(s10, s8, pf, ad) {
+      return [
+        { dc: 'credit', account: '売上高', sub: 'LINEコマース', tax: '課売10%', amount: s10, memo: 'LINEコマース 売上' },
+        { dc: 'credit', account: '売上高', sub: 'LINEコマース', tax: '課売(軽)8%', amount: s8, memo: 'LINEコマース 売上 軽減8%' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: 'LINEコマース', tax: '課仕10%', amount: pf, memo: 'LINEコマース PF手数料' },
+        { dc: 'debit', account: '広告宣伝費【原価】', sub: 'LINEコマース', tax: '課仕10%', amount: ad, memo: 'LINEコマース 広告費' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: 'LINEコマース', tax: '対象外', amount: s10 + s8 - pf - ad, memo: 'LINEコマース 差し引き入金額' },
+      ];
+    }
+
+    function mfJournalTableHtml(rows) {
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）※売掛金_EC売上は差引で自動算出のため、計算上必ず一致します。売上・費用の各金額が集計表と合っているかを確認してください</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 端数調整・按分ロジックを確認してください</div>';
+
+      if (rows.some(r => Math.round(r.amount) < 0)) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ マイナス金額の行があります。MFに入力する際は、その行だけ借方/貸方を入れ替えて絶対値で入力してください。</div>';
+      }
+
+      return html;
+    }
+
+    function renderMfJournal() {
+      const el = document.getElementById('mfJournalTable');
+      if (!lastData || !lastData.mfRow) {
+        el.innerHTML = '<span class="meta">注文データCSVをアップロードすると表示されます</span>';
+        return;
+      }
+      const s10 = Math.round(lastData.mfRow['商品売上(10%)'] || 0);
+      const s8 = Math.round(lastData.mfRow['商品売上(8%)'] || 0);
+      const pf = Math.round(pfFeeData.pfFee || 0);
+      const ad = Math.round(pfFeeData.adCost || 0);
+      let html = mfJournalTableHtml(buildMfJournalRows(s10, s8, pf, ad));
+      if (!pf) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ PF手数料が未入力です（0円で表示中）。工程2で入力して「反映」を押すと仕訳に反映されます。</div>';
+      }
+      el.innerHTML = html;
     }
 
     function allocateByRatio(amount, salesByKey, targets) {
@@ -945,7 +1021,7 @@ function renderPage() {
     function applyPfFee() {
       pfFeeData.pfFee = parseInt(document.getElementById('pfFeeInput').value.replace(/,/g, '')) || 0;
       pfFeeData.adCost = 0;
-      if (lastData) renderSegmentTable(lastData);
+      if (lastData) { renderSegmentTable(lastData); renderMfJournal(); }
       document.getElementById('costSummary').innerHTML = '<div class="ok">PF手数料 ' + fmt(pfFeeData.pfFee) + ' を反映しました</div>';
     }
 
@@ -1035,7 +1111,16 @@ function renderPage() {
             const rate = s > 0 ? (c / s * 100).toFixed(1) : '0.0';
             html += '<tr><td>' + k + ': ' + (segNames[k] || k) + '</td><td class="num">' + fmt(s) + '</td><td class="num">' + fmt(pfByKey[k] || 0) + '</td><td class="num">' + fmt(c) + '</td><td class="num">' + rate + '%</td></tr>';
           }
-          html += '</table></div>';
+          html += '</table>';
+
+          // MF振替伝票入力用 仕訳（アプリで確定した月のみ。ヒストリカル投入分はmf_rowが元Excelの概算値のため対象外）
+          const hmf = row.mf_row || {};
+          if (hmf['合計'] && !(row.confirmed_at || '').includes('[historical]')) {
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+            html += mfJournalTableHtml(buildMfJournalRows(Math.round(hmf['商品売上(10%)'] || 0), Math.round(hmf['商品売上(8%)'] || 0), Math.round(pf), Math.round(row.ad_cost || 0)));
+          }
+
+          html += '</div>';
         }
         document.getElementById('historyList').innerHTML = html;
       } catch(e) { document.getElementById('historyList').innerHTML = '<span class="meta">履歴取得エラー</span>'; }
