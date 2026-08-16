@@ -117,6 +117,9 @@
     .sheet-cancel { margin-top: 14px; width: 100%; padding: 10px; border: none; background: none; color: #868e96; font-size: 16px; cursor: pointer; }
     .jump-banner { display: none; background: #fff3bf; border: 1px solid #ffd43b; border-radius: 8px;
       padding: 6px 12px; margin: 0 auto 8px; max-width: 980px; font-size: 15px; font-weight: 600; }
+    .search-back { display: none; margin: 0 auto 8px; max-width: 980px; }
+    .search-back button { background: #edf2ff; border: 1px solid #748ffc; border-radius: 8px;
+      color: #364fc7; padding: 8px 16px; font-size: 15px; font-weight: 700; cursor: pointer; }
     .undo-link { display: none; margin: 8px auto 0; max-width: 980px; text-align: right; }
     .undo-link button { background: none; border: 1px solid #adb5bd; border-radius: 8px; color: #868e96; padding: 6px 14px; font-size: 14px; cursor: pointer; }
     .slip-list { max-height: 50vh; overflow-y: auto; text-align: left; margin-top: 10px; }
@@ -151,6 +154,7 @@
   </div>
 
   <div class="sheet-area" id="sheetArea">
+    <div class="search-back" id="searchBack"><button type="button" id="searchBackBtn">↩ 検索結果に戻る</button></div>
     <div class="jump-banner" id="jumpBanner">⚠ ズレ回復モード: 順序から外れた伝票を表示中。「次へ」で完了すると、間の伝票は未処理のまま残ります (最後に必ず戻ります)</div>
     <div class="paper" id="paper"></div>
     <div class="undo-link" id="undoLink"><button type="button" id="undoBtn">この伝票の完了を取り消す…</button></div>
@@ -578,6 +582,7 @@
       // 表示中伝票の完了宣言 + 次伝票へ (楽観的にUI更新・イベントはキュー送信)。
       // ズレ回復モード中は jumped フラグつきで順序外の完了を明示する
       const wasJump = jumpMode && viewSeq !== currentSeq;
+      $('searchBack').style.display = 'none';
       enqueue('next', viewSeq, wasJump ? { jumped: true } : {});
       doneSet.add(viewSeq);
       lastDoneSeq = viewSeq;
@@ -693,14 +698,18 @@
     });
 
     // ── 伝票検索 (ズレ回復) ──
+    let lastSearch = '';       // 直近の検索語 (複数候補を順に見るとき用に保持)
+    let lastSearchHits = 0;
     function renderSlipList(filter) {
       const f = String(filter || '').trim();
+      lastSearch = f;
       const fl = f.toLowerCase();
       // 伝票番号 (下桁一致含む) に加えて、商品名・SKUでも探せる (該当商品を含む伝票が全部並ぶ)
       const lineMatch = (s) => s.lines.find((l) =>
         (l.name || '').toLowerCase().includes(fl) || (l.sku || '').toLowerCase().includes(fl));
-      const rows = STATE.slips
-        .filter((s) => !f || s.neSlipNo.includes(f) || lineMatch(s))
+      const filtered = STATE.slips.filter((s) => !f || s.neSlipNo.includes(f) || lineMatch(s));
+      lastSearchHits = f ? filtered.length : 0;
+      const rows = filtered
         .slice(0, 60)
         .map((s) => {
           const hit = f ? lineMatch(s) : null;
@@ -717,6 +726,13 @@
         el.addEventListener('click', () => {
           const seq = Number(el.dataset.seq);
           $('searchOverlay').style.display = 'none';
+          // 複数候補があったときは「検索結果に戻る」チップを出す (検索語は保持)
+          if (lastSearchHits > 1) {
+            $('searchBackBtn').textContent = `↩ 検索結果に戻る (${lastSearch} · ${lastSearchHits}件)`;
+            $('searchBack').style.display = 'block';
+          } else {
+            $('searchBack').style.display = 'none';
+          }
           viewSeq = seq;
           if (!doneSet.has(seq) && seq !== currentSeq) {
             // 順序から外れた未処理伝票へのジャンプ = ズレ回復モード (記録を残し頻度を計測する)
@@ -731,10 +747,16 @@
     }
     $('searchBtn').addEventListener('click', () => {
       if (!worker) return;
-      $('searchInput').value = '';
-      renderSlipList('');
+      // 直近の検索語を保持したまま開く (複数候補を順に確認する運用のため)
+      $('searchInput').value = lastSearch;
+      renderSlipList(lastSearch);
       $('searchOverlay').style.display = 'flex';
       $('searchInput').focus();
+    });
+    $('searchBackBtn').addEventListener('click', () => {
+      $('searchInput').value = lastSearch;
+      renderSlipList(lastSearch);
+      $('searchOverlay').style.display = 'flex';
     });
     $('searchCancel').addEventListener('click', () => { $('searchOverlay').style.display = 'none'; });
     $('searchInput').addEventListener('input', () => renderSlipList($('searchInput').value));
