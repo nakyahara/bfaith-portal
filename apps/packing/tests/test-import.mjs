@@ -12,10 +12,11 @@ import iconv from 'iconv-lite';
 // DB を一時ディレクトリへ (モジュール読み込み前に設定する)
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-test-'));
 
+const svc = await import('../service.js');
 const {
   parseCs03003, importPackBatch, checkPickingMatch, slipWarns, PackError,
   deriveFolderName, isStaleSagyoDate, getWorkState, applyEvent,
-} = await import('../service.js');
+} = svc;
 const {
   initPackingDB, getDB, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, jstToday,
@@ -640,6 +641,19 @@ await (async () => {
   assert.ok(/mismatch/.test(getDB().prepare("SELECT error FROM pk_pack_drive_imports WHERE drive_file_id='F3'").get().error));
   passed++; console.log('  ok: ポーラー: mismatchは取り込まずskipped=承認待ち (async)');
 })();
+
+// ─── 日次サマリ ───
+
+t('getDailySummary: 実働・秒/伝票・例外操作カウントが集計される', () => {
+  const { getDailySummary } = svc;
+  const s = getDailySummary(jstToday());
+  assert.ok(s.total.batchCount > 0);
+  assert.ok(s.opCounts.jump >= 1);      // ズレ回復テストで1回記録済み
+  assert.ok(s.opCounts.undo >= 2);
+  assert.ok(s.opCounts.pause >= 1);
+  assert.ok(Array.isArray(s.workers));
+  assert.ok(Array.isArray(s.batches));
+});
 
 // ─── 登録端末 (v3) ───
 

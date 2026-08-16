@@ -26,7 +26,7 @@ import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
-  PAUSE_REASONS, UNDO_REASONS, lastDoneSeqOf,
+  PAUSE_REASONS, UNDO_REASONS, lastDoneSeqOf, getDailySummary,
 } from './service.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
@@ -271,6 +271,19 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
   }
   res.json({ ok: true, images: bySku });
 }));
+
+// ─── 日次サマリ (管理者) ───
+router.get('/admin/summary', requireAdmin, (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  res.render(path.join(__dirname, 'views/admin_summary'), {
+    title: '梱包サマリ',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    summary: getDailySummary(workDate),
+    statusLabels: STATUS_LABELS,
+  });
+});
 
 // ─── PWA manifest (ホーム画面追加用) ───
 router.get('/manifest.json', (req, res) => {

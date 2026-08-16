@@ -755,3 +755,80 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     return result;
   })();
 }
+
+// ═══ 日次サマリ (⑦計測の集計・要件§5.11) ═══════════════════════════════
+
+/**
+ * 指定作業日のサマリ。
+ *   - バッチ単位: 実働 = (finished - started) - 中断合計
+ *   - 伝票単位: done_at - shown_at (表示〜完了)。伝票表示中の中断は現状含まれる
+ *     (中断はバッチ単位で記録のため。除外精度が必要になったらイベントから差し引く)
+ *   - ズレ回復 (jump)・完了取消 (undo) の回数も集計 (要件§5.1: 頻度を計測し多発なら再協議)
+ */
+export function getDailySummary(workDate) {
+  const db = getDB();
+  const batches = db.prepare(`
+    SELECT * FROM pk_pack_batches
+    WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+    ORDER BY id
+  `).all(workDate);
+
+  const activeSec = (b) => {
+    if (!b.started_at || !b.finished_at) return null;
+    return Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0));
+  };
+
+  const done = batches.filter((b) => b.status === 'done');
+  const total = {
+    batchCount: batches.length,
+    doneCount: done.length,
+    slipCount: done.reduce((s, b) => s + b.slip_count, 0),
+    qty: done.reduce((s, b) => s + b.total_qty, 0),
+    activeSec: done.reduce((s, b) => s + (activeSec(b) || 0), 0),
+  };
+  total.secPerSlip = total.slipCount > 0 ? total.activeSec / total.slipCount : null;
+  total.slipsPerHour = total.secPerSlip ? 3600 / total.secPerSlip : null;
+
+  // 作業者別 (バッチの最終担当者に全量計上する簡略化 — picking と同じ)
+  const byWorker = new Map();
+  for (const b of done) {
+    const k = b.worker || '(不明)';
+    if (!byWorker.has(k)) byWorker.set(k, { key: k, batches: 0, slips: 0, qty: 0, activeSec: 0 });
+    const g = byWorker.get(k);
+    g.batches++; g.slips += b.slip_count; g.qty += b.total_qty; g.activeSec += activeSec(b) || 0;
+  }
+  const workers = [...byWorker.values()].map((g) => ({
+    ...g, secPerSlip: g.slips > 0 ? g.activeSec / g.slips : null,
+  })).sort((a, b) => b.slips - a.slips);
+
+  // 伝票単位の実測 (表示〜完了秒)。バッチ横断の中央値・平均
+  const slipSecs = db.prepare(`
+    SELECT (unixepoch(s.done_at) - unixepoch(s.shown_at)) AS sec
+    FROM pk_pack_slips s JOIN pk_pack_batches b ON b.id = s.batch_id
+    WHERE b.work_date = ? AND b.validity = 'valid' AND s.status = 'done'
+      AND s.done_at IS NOT NULL AND s.shown_at IS NOT NULL
+      AND (unixepoch(s.done_at) - unixepoch(s.shown_at)) BETWEEN 0 AND 1800
+    ORDER BY sec
+  `).all(workDate).map((r) => r.sec);
+  const slipStats = slipSecs.length > 0 ? {
+    count: slipSecs.length,
+    median: slipSecs[Math.floor(slipSecs.length / 2)],
+    avg: slipSecs.reduce((a, x) => a + x, 0) / slipSecs.length,
+  } : null;
+
+  // 例外操作の頻度 (jump=紙ズレ回復・undo=完了取消)
+  const opCounts = {};
+  for (const r of db.prepare(`
+    SELECT e.event, COUNT(*) c FROM pk_pack_events e
+    JOIN pk_pack_batches b ON b.id = e.batch_id
+    WHERE b.work_date = ? AND e.event IN ('jump','undo','cancel','takeover','pause')
+    GROUP BY e.event
+  `).all(workDate)) {
+    opCounts[r.event] = r.c;
+  }
+
+  return {
+    workDate, total, workers, slipStats, opCounts,
+    batches: batches.map((b) => ({ ...b, activeSec: activeSec(b) })),
+  };
+}
