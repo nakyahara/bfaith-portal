@@ -46,6 +46,21 @@ initMirrorDB();
 // Drive自動取込ポーラー (standaloneのみ。POSTを取りこぼしても数分で自己回復する — Codex設計 8/13)
 import { startDrivePoller } from './drive-sync.js';
 
+// ─── packing (梱包支援) の同居 (要件§7.2 案C: 1プロセス2アプリ) ───
+// PACKING_ENABLED=0 で個別に無効化できる。初期化失敗 (migration等) は packing だけ落とし、
+// picking は継続する (梱包の障害でピッキングを巻き添えにしない)
+let packingRouter = null;
+let packingState = 'disabled';   // readyz に載せて機能停止を監視から見えるようにする (Codexレビュー)
+if (process.env.PACKING_ENABLED !== '0') {
+  try {
+    packingRouter = (await import('../packing/router.js')).default;
+    packingState = 'ok';
+  } catch (e) {
+    packingState = 'failed';
+    console.error('[packing] 初期化失敗 — packing を無効化して picking のみで継続します:', e);
+  }
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..', '..');   // リポジトリルート (public/ と views/login.ejs を流用)
 
@@ -126,9 +141,11 @@ app.get('/readyz', loopbackOnly, (req, res) => {
   // DBに実際に触れて確認する (ディスク満杯・ロック等で liveness と乖離しないように — Codex medium)
   try {
     getPickingDB().prepare('SELECT 1').get();
-    res.status(200).json({ status: 'ready', pid: process.pid, bootId: BOOT_ID });
+    // packing の状態は情報として載せる (failed でも picking が生きていれば 200 のまま —
+    // 同居アプリの障害でピッキングの監視を巻き添えにしない。要件§7.2)
+    res.status(200).json({ status: 'ready', pid: process.pid, bootId: BOOT_ID, packing: packingState });
   } catch (e) {
-    res.status(503).json({ status: 'not_ready', error: e.message, bootId: BOOT_ID });
+    res.status(503).json({ status: 'not_ready', error: e.message, bootId: BOOT_ID, packing: packingState });
   }
 });
 
@@ -200,6 +217,11 @@ app.post('/apps/picking/line-webhook', express.raw({ type: () => true, limit: '1
 app.use('/apps/picking/ingest-api', pickingIngestRouter);
 // 認証は router 内の pickingAccess (セッション or 登録端末Cookie) が担う
 app.use('/apps/picking', express.json({ limit: '256kb' }), pickingRouter);
+
+// --- packing 本体 (同居アプリ。認証は router 内の packingAccess) ---
+if (packingRouter) {
+  app.use('/apps/packing', express.json({ limit: '256kb' }), packingRouter);
+}
 
 // ルートはポータルではなく picking 一覧へ (このサーバにダッシュボードは存在しない)
 app.get('/', (req, res) => res.redirect('/apps/picking/'));

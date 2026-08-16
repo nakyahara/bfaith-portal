@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 900px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .pk-form h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .pk-row { margin-bottom: 10px; }
+    .pk-row label { display: block; font-size: 0.82em; color: #495057; margin-bottom: 3px; }
+    .pk-row input[type=file], .pk-row input[type=text] { width: 100%; max-width: 480px; padding: 6px; box-sizing: border-box; }
+    .pk-actions { margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .pk-actions button { padding: 8px 22px; font-size: 1em; cursor: pointer; }
+    .pk-actions button:disabled { opacity: 0.5; cursor: default; }
+    #confirmBtn { background: #2b8a3e; color: #fff; border: 1px solid #2b8a3e; border-radius: 4px; }
+    .pk-msg { font-size: 0.9em; white-space: pre-wrap; }
+    .pk-msg.err { color: #c92a2a; } .pk-msg.ok { color: #2b8a3e; }
+    .pk-preview { display: none; }
+    .pk-sum { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px 14px;
+      margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 0.92em; }
+    table.pk-lines { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-lines th, table.pk-lines td { border-bottom: 1px solid #dee2e6; padding: 5px 8px; text-align: left; }
+    table.pk-lines th { background: #f1f3f5; }
+    table.pk-lines td.num { text-align: right; }
+    .ack-box { display: none; background: #fff3bf; border-radius: 6px; padding: 8px 12px; font-size: 0.9em; margin-bottom: 10px; }
+    .ack-box ul { margin: 6px 0; padding-left: 20px; max-height: 200px; overflow-y: auto; }
+    .warn-badge { display: inline-block; background: #fff3bf; border-radius: 4px; padding: 0 6px; font-size: 0.85em; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📥 納品書CSV (CS03003) 取込</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/packing/" class="btn-logout">← バッチ一覧</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-form">
+      <h2>📂 Driveから取り込む (出荷_no フォルダの 納品書_出荷_XX.csv)</h2>
+      <p class="pk-msg" style="color:#495057;">納品書CSVは別プログラムが毎朝各フォルダへ自動配置します。ここでは配置済みファイルを選んで取り込みます。</p>
+      <div class="pk-actions" style="margin-top:0">
+        <button id="driveListBtn" type="button">ファイル一覧を更新</button>
+        <span id="driveMsg" class="pk-msg"></span>
+      </div>
+      <table class="pk-lines" id="driveTable" style="display:none; margin-top:10px">
+        <thead><tr><th>フォルダ</th><th>ファイル名</th><th>更新日時</th><th></th></tr></thead>
+        <tbody id="driveBody"></tbody>
+      </table>
+    </div>
+
+    <div class="pk-form">
+      <h2>💻 ファイルをアップロードして取り込む</h2>
+      <div class="pk-row">
+        <label>ファイル (納品書データCSV・Shift-JIS)</label>
+        <input type="file" id="file" accept=".csv">
+      </div>
+      <div class="pk-actions">
+        <button id="previewBtn" type="button">解析してプレビュー</button>
+        <span id="msg" class="pk-msg"></span>
+      </div>
+    </div>
+
+    <div class="pk-preview" id="preview">
+      <div class="pk-sum" id="summary"></div>
+      <div class="pk-form">
+        <div class="pk-row">
+          <label>出荷フォルダ名 (例: 出荷_03)</label>
+          <input type="text" id="folderName" placeholder="出荷_XX">
+        </div>
+        <div class="ack-box" id="matchBox">
+          ⚠ <span id="matchMsg"></span>
+          <ul id="matchDiffs"></ul>
+          <label><input type="checkbox" id="matchAckChk"> 差分を確認した。この内容で取り込む</label>
+        </div>
+        <div class="ack-box" id="dateBox">
+          ⚠ <span id="dateMsg"></span><br>
+          <label><input type="checkbox" id="dateAckChk"> 前日以前のファイルと理解した。この内容で取り込む</label>
+        </div>
+        <div class="ack-box" id="overwriteBox">
+          ⚠ <span id="overwriteMsg"></span><br>
+          <label><input type="checkbox" id="overwriteChk"> 上書きして取り込み直す</label>
+        </div>
+        <div class="pk-actions">
+          <button id="confirmBtn" type="button">この内容で取り込む</button>
+          <span id="confirmMsg" class="pk-msg"></span>
+        </div>
+      </div>
+      <h3 style="font-size:1em">伝票プレビュー (納品書順)</h3>
+      <table class="pk-lines">
+        <thead><tr><th>#</th><th>伝票番号</th><th>モール</th><th>配送方法</th><th>明細</th><th>数量</th><th>警告</th></tr></thead>
+        <tbody id="slipBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    // 取込元: {type:'file', file} | {type:'drive', fileId, parentName}
+    let currentSource = null;
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    async function post(source, mode, extra = {}) {
+      let res;
+      if (source.type === 'drive') {
+        res = await fetch('/apps/packing/admin/import/drive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file_id: source.fileId, parent_name: source.parentName || '', mode, ...extra }),
+        });
+      } else {
+        const fd = new FormData();
+        fd.append('file', source.file);
+        fd.append('mode', mode);
+        for (const [k, v] of Object.entries(extra)) fd.append(k, v);
+        res = await fetch('/apps/packing/admin/import', { method: 'POST', body: fd });
+      }
+      const body = await res.json().catch(() => ({ error: '応答の解析に失敗しました' }));
+      return { status: res.status, body };
+    }
+
+    function showPreview(body) {
+      const warns = Object.entries(body.warnCounts || {})
+        .map(([k, n]) => `<span class="warn-badge">${esc((body.warnLabels || {})[k] || k)} ${n}</span>`).join(' ');
+      $('summary').innerHTML =
+        `<span><b>${esc(body.tbLabel || body.tbKey)}</b></span>` +
+        (body.filename ? `<span>📂 ${esc(body.filename)}</span>` : '') +
+        `<span>出荷作業日: ${esc(body.sagyoDate)}</span>` +
+        `<span>伝票 ${body.slipCount} / 明細 ${body.lineCount} / 数量 ${body.totalQty}</span>` +
+        (warns ? `<span>${warns}</span>` : '') +
+        (body.dateWarning ? `<span style="color:#e8590c; font-weight:600">⚠ ${esc(body.dateWarning)}</span>` : '');
+      $('folderName').value = body.folderNameSuggestion || '';
+      $('slipBody').innerHTML = body.slips.map((s) =>
+        `<tr><td class="num">${s.seq}</td><td>${esc(s.neSlipNo)}</td>` +
+        `<td>${esc(s.mall || '')}</td><td>${esc(s.deliveryMethod || '')}</td>` +
+        `<td class="num">${s.lineCount}</td><td class="num">${s.qty}</td>` +
+        `<td>${(s.warns || []).map((w) => `<span class="warn-badge">${esc((body.warnLabels || {})[w] || w)}</span>`).join(' ')}</td></tr>`).join('');
+
+      // 突合結果 (ok 以外は承認チェックを出す)
+      const m = body.match || { status: 'ok', diffs: [] };
+      if (m.status === 'ok') {
+        $('matchBox').style.display = 'none';
+      } else {
+        $('matchMsg').textContent = m.status === 'no_picking'
+          ? 'ピッキング側に同じバッチが見つかりません (CS03002が未取込か、別の時点のCSVです)'
+          : `ピッキングと内容が一致しません (差分 ${m.diffCount} 件)`;
+        $('matchDiffs').innerHTML = (m.diffs || []).map((d) => `<li>${esc(d)}</li>`).join('')
+          + (m.diffCount > (m.diffs || []).length ? `<li>… 他 ${m.diffCount - m.diffs.length} 件</li>` : '');
+        $('matchAckChk').checked = false;
+        $('matchBox').style.display = 'block';
+      }
+      // 前日ファイル (出荷作業日が今日でない) は別の明示承認が必要
+      if (body.dateWarning) {
+        $('dateMsg').textContent = body.dateWarning;
+        $('dateAckChk').checked = false;
+        $('dateBox').style.display = 'block';
+      } else {
+        $('dateBox').style.display = 'none';
+      }
+      $('overwriteBox').style.display = 'none';
+      $('overwriteChk').checked = false;
+      $('confirmMsg').textContent = '';
+      $('preview').style.display = 'block';
+    }
+
+    // プレビュー要求ごとにトークンを振り、最新の応答だけを画面と currentSource に反映する
+    let previewToken = 0;
+    async function doPreview(source, msgEl) {
+      const token = ++previewToken;
+      msgEl.textContent = '解析中…'; msgEl.className = 'pk-msg';
+      const { status, body } = await post(source, 'preview');
+      if (token !== previewToken) return;
+      if (status !== 200) {
+        msgEl.textContent = body.error || `エラー (${status})`; msgEl.className = 'pk-msg err';
+        currentSource = null;
+        $('preview').style.display = 'none';
+        return;
+      }
+      msgEl.textContent = '解析OK'; msgEl.className = 'pk-msg ok';
+      currentSource = source;
+      showPreview(body);
+    }
+
+    $('previewBtn').addEventListener('click', async () => {
+      const f = $('file').files[0];
+      if (!f) { $('msg').textContent = 'ファイルを選択してください'; $('msg').className = 'pk-msg err'; return; }
+      $('previewBtn').disabled = true;
+      try { await doPreview({ type: 'file', file: f }, $('msg')); } finally { $('previewBtn').disabled = false; }
+    });
+
+    // ── Drive一覧 ──
+    $('driveListBtn').addEventListener('click', async () => {
+      $('driveMsg').textContent = '取得中…'; $('driveMsg').className = 'pk-msg';
+      $('driveListBtn').disabled = true;
+      try {
+        const res = await fetch('/apps/packing/admin/import/drive-files');
+        const body = await res.json().catch(() => ({ error: '応答の解析に失敗しました' }));
+        if (!res.ok) {
+          $('driveMsg').textContent = body.error || `エラー (${res.status})`; $('driveMsg').className = 'pk-msg err';
+          return;
+        }
+        const files = body.files || [];
+        $('driveMsg').textContent = files.length === 0 ? '納品書CSVがありません' : `${files.length} 件`;
+        $('driveBody').innerHTML = files.map((f) =>
+          `<tr><td>${esc(f.parent_name || '')}</td><td>${esc(f.filename)}</td><td>${esc(f.modified_time_jst || '')}</td>` +
+          `<td><button type="button" class="btn-drive-preview" data-id="${esc(f.file_id)}" data-parent="${esc(f.parent_name || '')}">プレビュー</button></td></tr>`).join('');
+        $('driveTable').style.display = files.length > 0 ? 'table' : 'none';
+        document.querySelectorAll('.btn-drive-preview').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            try {
+              await doPreview({ type: 'drive', fileId: btn.dataset.id, parentName: btn.dataset.parent }, $('driveMsg'));
+            } finally { btn.disabled = false; }
+          });
+        });
+      } finally {
+        $('driveListBtn').disabled = false;
+      }
+    });
+
+    $('confirmBtn').addEventListener('click', async () => {
+      if (!currentSource) return;
+      $('confirmMsg').textContent = '取込中…'; $('confirmMsg').className = 'pk-msg';
+      $('confirmBtn').disabled = true;
+      try {
+        const { status, body } = await post(currentSource, 'confirm', {
+          folder_name: $('folderName').value.trim(),
+          overwrite: $('overwriteChk').checked ? '1' : '0',
+          match_ack: ($('matchBox').style.display !== 'none' && $('matchAckChk').checked) ? '1' : '0',
+          date_ack: ($('dateBox').style.display !== 'none' && $('dateAckChk').checked) ? '1' : '0',
+        });
+        if (status === 409 && body.code === 'duplicate') {
+          $('overwriteMsg').textContent = body.error;
+          $('overwriteBox').style.display = 'block';
+          $('confirmMsg').textContent = '取込済みのバッチです。上書きする場合はチェックして再実行してください';
+          $('confirmMsg').className = 'pk-msg err';
+          return;
+        }
+        if (status !== 200) {
+          $('confirmMsg').textContent = body.error || `エラー (${status})`; $('confirmMsg').className = 'pk-msg err';
+          return;
+        }
+        $('confirmMsg').innerHTML =
+          `${body.replaced ? '上書き' : ''}取込完了 (${body.slipCount}伝票) → <a href="/apps/packing/batches/${body.batchId}">伝票一覧を確認</a>`;
+        $('confirmMsg').className = 'pk-msg ok';
+      } finally {
+        $('confirmBtn').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
