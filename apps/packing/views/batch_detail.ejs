@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 860px; margin: 0 auto; padding: 10px 12px 40px; }
+    .pk-sum { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px 14px;
+      margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 0.92em; }
+    .match-box { border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; font-size: 0.9em; }
+    .match-box.ok { background: #d3f9d8; }
+    .match-box.warn { background: #fff3bf; }
+    .match-box ul { margin: 6px 0 0; padding-left: 20px; }
+    .slip { background: #fff; border: 1px solid #dee2e6; border-radius: 10px; padding: 10px 14px; margin-bottom: 8px; }
+    .slip-head { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; font-size: 0.9em; margin-bottom: 6px; }
+    .slip-no { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 700; font-size: 1.05em; }
+    .warn-badge { display: inline-block; background: #fff3bf; border-radius: 4px; padding: 0 6px; font-size: 0.85em; white-space: nowrap; }
+    .muted { color: #868e96; }
+    table.lines { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.lines td { border-top: 1px solid #f1f3f5; padding: 4px 8px; }
+    table.lines td.num { text-align: right; white-space: nowrap; }
+    .qty2 { color: #e8590c; font-weight: 700; }
+    .comment { background: #f8f9fa; border-radius: 6px; padding: 6px 10px; margin-top: 6px; font-size: 0.85em; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 梱包バッチ詳細</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/packing/" class="btn-logout">← バッチ一覧</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-sum">
+      <span><b><%= batch.folder_name || '' %></b></span>
+      <span class="muted"><%= batch.tb_key %></span>
+      <span>出荷作業日: <%= batch.sagyo_date %></span>
+      <span>伝票 <b><%= batch.slip_count %></b> / 明細 <b><%= batch.line_count %></b> / 数量 <b><%= batch.total_qty %></b></span>
+      <span><%= statusLabels[batch.status] || batch.status %></span>
+    </div>
+
+    <div class="match-box <%= batch.match_status === 'ok' ? 'ok' : 'warn' %>">
+      <b><%= matchLabels[batch.match_status] || batch.match_status %></b>
+      <% if (matchDiffs.length > 0) { %>
+        <ul>
+          <% for (const d of matchDiffs.slice(0, 30)) { %><li><%= d %></li><% } %>
+          <% if (matchDiffs.length > 30) { %><li>… 他 <%= matchDiffs.length - 30 %> 件</li><% } %>
+        </ul>
+      <% } %>
+    </div>
+
+    <% for (const s of slips) { %>
+      <div class="slip">
+        <div class="slip-head">
+          <span class="muted">#<%= s.seq %></span>
+          <span class="slip-no"><%= s.ne_slip_no %></span>
+          <span><%= s.mall || '' %></span>
+          <span class="muted"><%= s.delivery_method || '' %></span>
+          <% if (s.material) { %><span class="muted"><%= s.material %></span><% } %>
+          <% for (const w of s.warns) { %><span class="warn-badge"><%= warnLabels[w] || w %></span><% } %>
+          <% if (s.box_count > 1) { %><span class="warn-badge">箱数 <%= s.box_count %></span><% } %>
+          <% if (s.delivery_date) { %><span class="warn-badge">配達指定 <%= s.delivery_date %> <%= s.delivery_time || '' %></span><% } %>
+        </div>
+        <table class="lines">
+          <% for (const l of s.lines) { %>
+            <tr>
+              <td><%= l.sku %></td>
+              <td><%= l.print_name || l.product_name %></td>
+              <td class="num <%= l.qty >= 2 ? 'qty2' : '' %>"><%= l.qty %> 個</td>
+              <td class="num muted"><%= [l.expiry ? `期限 ${l.expiry}` : '', l.lot ? `ロット ${l.lot}` : ''].filter(Boolean).join(' / ') %></td>
+            </tr>
+          <% } %>
+        </table>
+        <% if (s.noshi) { %><div class="comment">🎀 のし: <%= s.noshi %></div><% } %>
+        <% if (s.gift_message) { %><div class="comment">🎁 ギフトメッセージ: <%= s.gift_message %></div><% } %>
+        <% for (const [k, v] of Object.entries(s.comments)) { %>
+          <div class="comment">📝 <%= { header: '納品書ヘッダ', footer: '納品書フッタ', warehouse: '倉庫連絡', customer: '顧客コメント' }[k] || k %>: <%= v %></div>
+        <% } %>
+      </div>
+    <% } %>
+  </div>
+</body>
+</html>

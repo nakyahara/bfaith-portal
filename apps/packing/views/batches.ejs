@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 760px; margin: 0 auto; padding: 10px 12px 40px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .pk-bar input[type=date] { padding: 7px; font-size: 16px; }
+    .muted { color: #868e96; font-size: 0.85em; }
+    .pk-empty { color: #868e96; padding: 40px 0; text-align: center; }
+    .card {
+      background: #fff; border: 1px solid #dee2e6; border-radius: 12px;
+      padding: 12px 14px; margin-bottom: 10px;
+      display: flex; gap: 12px; align-items: center;
+    }
+    .card.done { opacity: 0.55; }
+    .card-main { flex: 1 1 auto; min-width: 0; }
+    .card-title { font-weight: 700; font-size: 0.98em; line-height: 1.35; margin-bottom: 4px; }
+    .card-meta { color: #495057; font-size: 0.85em; display: flex; flex-wrap: wrap; gap: 2px 12px; }
+    .card-meta b { font-size: 1.05em; }
+    .st { display: inline-block; border-radius: 4px; padding: 1px 8px; background: #e9ecef; font-size: 0.85em; white-space: nowrap; }
+    .st.ready { background: #d0ebff; } .st.packing { background: #fff3bf; }
+    .st.paused { background: #ffe8cc; } .st.done { background: #d3f9d8; }
+    .st.cancelled { background: #f1f3f5; color: #868e96; }
+    .match-warn { color: #e8590c; font-weight: 600; }
+    .btn-detail {
+      display: block; padding: 12px 20px; border: 1px solid #1971c2; border-radius: 10px;
+      color: #1971c2; font-size: 0.95em; font-weight: 700; text-decoration: none; white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 梱包支援</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <% if (isAdmin) { %>
+        <a href="/apps/packing/admin/import" class="btn-logout">📥 納品書CSV取込</a>
+      <% } %>
+      <a href="/apps/picking/" class="btn-logout">📱 ピッキング</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-bar">
+      <form method="get" action="/apps/packing/">
+        <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
+      </form>
+      <span class="muted"><%= batches.length %> バッチ</span>
+    </div>
+
+    <% if (batches.length === 0) { %>
+      <div class="pk-empty">
+        バッチがありません。<% if (isAdmin) { %><a href="/apps/packing/admin/import">納品書CSV を取り込む</a><% } else { %>取込が済むとここに表示されます。<% } %>
+      </div>
+    <% } %>
+
+    <% for (const b of batches) { %>
+      <div class="card <%= b.status === 'done' ? 'done' : '' %>">
+        <div class="card-main">
+          <div class="card-title"><%= b.folder_name || b.tb_key %></div>
+          <div class="card-meta">
+            <span>伝票 <b><%= b.done_slips %></b>/<b><%= b.slip_count %></b></span>
+            <span>明細 <b><%= b.line_count %></b></span>
+            <span>数量 <b><%= b.total_qty %></b></span>
+            <span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %></span>
+            <% if (b.match_status !== 'ok') { %>
+              <span class="match-warn">⚠ <%= b.match_status === 'no_picking' ? 'ピッキング未取込' : 'ピッキング不一致' %></span>
+            <% } %>
+            <% if (b.worker) { %><span>👤 <%= b.worker %></span><% } %>
+          </div>
+        </div>
+        <a class="btn-detail" href="/apps/packing/batches/<%= b.id %>">伝票一覧</a>
+      </div>
+    <% } %>
+  </div>
+</body>
+</html>
