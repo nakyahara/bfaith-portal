@@ -508,6 +508,10 @@ export const PAUSE_REASONS = ['休憩', '他作業への応援', 'その他'];
 export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
 // ④ 配送方法変更の理由 (要件§5.7)
 export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その他'];
+// ④ 提案できる配送方法 (固定リスト — 中原さん指定 2026-08-16)
+export const SHIP_CHANGE_METHOD_OPTIONS = [
+  '定形外', 'ネコポス', 'ゆうパケットパフ', 'レターパック', '宅急便50サイズ', '宅急便60サイズ',
+];
 
 /**
  * 端末の発生時刻を [floor, now] にクランプ (中断時間の計測用)。
@@ -702,7 +706,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       requireOwner();
       const proposed = String(proposedMethod || '').trim();
-      if (!proposed || proposed.length > 60) {
+      if (!SHIP_CHANGE_METHOD_OPTIONS.includes(proposed)) {
         throw new PackError(400, 'bad_method', '提案する配送方法を選択してください');
       }
       if (!SHIP_CHANGE_REASONS.includes(reason)) {

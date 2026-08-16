@@ -666,13 +666,13 @@ t('ship_change: 伝票がheldになり、保留が残る間はバッチが完了
   applyEvent(sr.batchId, { opId: 's-s1', event: 'start' }, '星');
   const r1 = applyEvent(sr.batchId, {
     opId: 's-c1', event: 'ship_change', slipSeq: 1,
-    proposedMethod: '60サイズ', reason: '入らない',
+    proposedMethod: '宅急便60サイズ', reason: '入らない',
   }, '星');
   assert.deepEqual(r1.heldSeqs, [1]);
   assert.equal(r1.currentSeq, 2);
   const chg = getDB().prepare('SELECT * FROM pk_pack_ship_changes ORDER BY id DESC LIMIT 1').get();
   assert.equal(chg.status, 'requested');
-  assert.equal(chg.proposed_method, '60サイズ');
+  assert.equal(chg.proposed_method, '宅急便60サイズ');
   // 残り (seq2) を完了しても、保留が残る間はバッチ done にならない (完了ガード)
   const r2 = applyEvent(sr.batchId, { opId: 's-n1', event: 'next', slipSeq: 2 }, '星');
   assert.equal(r2.batchStatus, 'packing');
@@ -689,9 +689,10 @@ t('ship_change: 理由・提案は必須。処理済み伝票は保留にでき�
   const sr = importPackBatch(sp, { matchAck: true }, 'test');
   applyEvent(sr.batchId, { opId: 'q-s1', event: 'start' }, '星');
   expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c1', event: 'ship_change', slipSeq: 1, reason: '入らない' }, '星'), 'bad_method');
-  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c2', event: 'ship_change', slipSeq: 1, proposedMethod: 'x' }, '星'), 'bad_reason');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c2', event: 'ship_change', slipSeq: 1, proposedMethod: 'ネコポス' }, '星'), 'bad_reason');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c4', event: 'ship_change', slipSeq: 1, proposedMethod: '30サイズ', reason: '入らない' }, '星'), 'bad_method');   // リスト外は拒否
   applyEvent(sr.batchId, { opId: 'q-n1', event: 'next', slipSeq: 1 }, '星');
-  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c3', event: 'ship_change', slipSeq: 1, proposedMethod: 'x', reason: '入らない' }, '星'), 'not_packing');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c3', event: 'ship_change', slipSeq: 1, proposedMethod: 'ネコポス', reason: '入らない' }, '星'), 'not_packing');
 });
 
 t('setShipChangeStatus: 不正な遷移は拒否される', () => {
