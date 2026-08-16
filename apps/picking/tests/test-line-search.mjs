@@ -96,6 +96,20 @@ await t('postback: stock:sku はロケ表示・他のdataは無視 (null)', asyn
   assert.ok(gone[0].text.includes('見つかりませんでした'));
 });
 
+await t('postback: 不正なdata (長すぎ/制御文字/空) は無視', async () => {
+  assert.equal(await buildPostbackReplyMessages(`stock:${'x'.repeat(201)}`, deps()), null);
+  assert.equal(await buildPostbackReplyMessages('stock:abc\u0000def', deps()), null);
+  assert.equal(await buildPostbackReplyMessages('stock:   ', deps()), null);
+});
+
+await t('検索: 異常に長いSKUは候補から除外 (1件のために返信全体を400にしない)', async () => {
+  const msgs = await buildSearchReplyMessages('テスト', deps({
+    fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('x'.repeat(250), '変なSKU', 5), ITEM('okone', '正常な商品', 3)] }),
+  }));
+  assert.equal(msgs[0].quickReply.items.length, 1);
+  assert.equal(msgs[0].quickReply.items[0].action.data, 'stock:okone');
+});
+
 // ─── processLineEvents (e2e・応答場所の制御) ───
 await t('processLineEvents: 1:1と許可グループだけ返信・欠品通知グループは沈黙', async () => {
   const sent = [];
@@ -110,6 +124,15 @@ await t('processLineEvents: 1:1と許可グループだけ返信・欠品通知�
     { type: 'message', replyToken: 'r6', source: { type: 'user', userId: 'U1' }, message: { type: 'image' } },
   ], d);
   assert.deepEqual(sent.map((s) => s.token), ['r1', 'r3', 'r4'], '返信は 1:1検索・許可グループ・postback の3件だけ');
+});
+
+await t('processLineEvents: webhook再送 (同一webhookEventId) は1回だけ処理', async () => {
+  const sent = [];
+  const d = deps({ reply: async (token) => { sent.push(token); return true; } });
+  const ev = { type: 'postback', replyToken: 'rd1', webhookEventId: 'W-dup-1', source: { type: 'user', userId: 'U1' }, postback: { data: 'stock:teatree20' } };
+  await processLineEvents([ev], d);
+  await processLineEvents([{ ...ev, replyToken: 'rd2' }], d);
+  assert.deepEqual(sent, ['rd1'], '再送は2回目を処理しない');
 });
 
 await t('processLineEvents: 処理中の例外はイベント単位で握りつぶす', async () => {

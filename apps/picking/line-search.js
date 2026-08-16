@@ -74,8 +74,12 @@ export async function buildSearchReplyMessages(query, deps) {
     const text = await buildStockText(items[0].sku, deps);
     return [{ type: 'text', text: text || `該当データが見つかりませんでした (${items[0].sku})。` }];
   }
-  const top = items.slice(0, MAX_CANDIDATES);
-  const lines = top.map((it, i) => `${CIRCLED[i]} ${it.name || it.sku} — フリー${it.free}`);
+  // LINE側の上限対策: postback data 300文字 / label 20文字 / 本文はSKUごとの商品名を切り詰め。
+  // 異常に長いSKU (data上限を超える) は候補から外す (1件のために返信全体が400になるのを防ぐ)
+  const top = items.filter((it) => String(it.sku).length <= 200).slice(0, MAX_CANDIDATES);
+  if (top.length === 0) return [{ type: 'text', text: `「${q}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` }];
+  const shortName = (it) => String(it.name || it.sku).slice(0, 30);
+  const lines = top.map((it, i) => `${CIRCLED[i]} ${shortName(it)} — フリー${it.free}`);
   if (items.length > MAX_CANDIDATES) lines.push(`…他にも候補があります (${MAX_CANDIDATES}件まで表示)。キーワードを絞ってください`);
   return [{
     type: 'text',
@@ -88,7 +92,7 @@ export async function buildSearchReplyMessages(query, deps) {
           // ラベルは20文字制限。番号+名前の頭で識別できるようにする
           label: `${CIRCLED[i]} ${String(it.name || it.sku)}`.slice(0, 20),
           data: `stock:${it.sku}`,
-          displayText: `${CIRCLED[i]} ${String(it.name || it.sku).slice(0, 80)}`,
+          displayText: `${CIRCLED[i]} ${shortName(it)}`,
         },
       })),
     },
@@ -99,12 +103,46 @@ export async function buildSearchReplyMessages(query, deps) {
 export async function buildPostbackReplyMessages(data, deps) {
   const m = String(data || '').match(/^stock:(.+)$/);
   if (!m) return null;   // 在庫検索以外のpostbackには触らない
-  const text = await buildStockText(m[1], deps);
-  return [{ type: 'text', text: text || `該当データが見つかりませんでした (${m[1]})。在庫が動いた可能性があります。もう一度検索してください。` }];
+  // dataはLINE署名で「LINE経由」なのは保証されるが、このquickReply由来とまでは限らない。
+  // SKUとして妥当な形だけ通す (長さ・制御文字。文字種はロジザード側が自由なので縛らない)
+  const sku = m[1].trim();
+  if (!sku || sku.length > 200 || /[\x00-\x1F\x7F]/.test(sku)) return null;
+  const text = await buildStockText(sku, deps);
+  return [{ type: 'text', text: text || `該当データが見つかりませんでした (${sku.slice(0, 40)})。在庫が動いた可能性があります。もう一度検索してください。` }];
+}
+
+// webhook再送 (LINE側リトライ) の重複処理よけ。webhookEventId を10分だけ記録する
+const DEDUP_TTL_MS = 10 * 60 * 1000;
+const _seenEvents = new Map();   // webhookEventId → 記録時刻
+
+function isDuplicateEvent(ev, nowMs = Date.now()) {
+  const id = ev?.webhookEventId;
+  if (!id) return false;   // IDが無いイベントは判定不能=処理する
+  for (const [k, at] of _seenEvents) { if (nowMs - at > DEDUP_TTL_MS) _seenEvents.delete(k); }
+  if (_seenEvents.has(id)) return true;
+  if (_seenEvents.size < 5000) _seenEvents.set(id, nowMs);
+  return false;
+}
+
+async function handleOneEvent(ev, d) {
+  try {
+    if (!ev || !ev.replyToken || !isSearchSource(ev.source)) return;
+    if (isDuplicateEvent(ev)) return;   // 再送は無視 (reply token使用済みエラーのノイズ防止)
+    if (ev.type === 'message' && ev.message?.type === 'text') {
+      const messages = await buildSearchReplyMessages(ev.message.text, d);
+      await d.reply(ev.replyToken, messages);
+    } else if (ev.type === 'postback') {
+      const messages = await buildPostbackReplyMessages(ev.postback?.data, d);
+      if (messages) await d.reply(ev.replyToken, messages);
+    }
+  } catch (e) {
+    console.warn(`[line-search] イベント処理失敗 (スキップ): ${e.message}`);
+  }
 }
 
 /**
  * webhook イベント列を処理して必要な返信を送る (fire-and-forget 前提・全 fail-soft)。
+ * イベント単位で並行処理 (直列だと先頭の遅延で後続の reply token 期限を食い潰すため)。
  * deps はテスト用注入 (既定は実物)。
  */
 export async function processLineEvents(events, deps = {}) {
@@ -114,18 +152,5 @@ export async function processLineEvents(events, deps = {}) {
     reply: replyLine,
     ...deps,
   };
-  for (const ev of events || []) {
-    try {
-      if (!ev || !ev.replyToken || !isSearchSource(ev.source)) continue;
-      if (ev.type === 'message' && ev.message?.type === 'text') {
-        const messages = await buildSearchReplyMessages(ev.message.text, d);
-        await d.reply(ev.replyToken, messages);
-      } else if (ev.type === 'postback') {
-        const messages = await buildPostbackReplyMessages(ev.postback?.data, d);
-        if (messages) await d.reply(ev.replyToken, messages);
-      }
-    } catch (e) {
-      console.warn(`[line-search] イベント処理失敗 (スキップ): ${e.message}`);
-    }
-  }
+  await Promise.allSettled((events || []).map((ev) => handleOneEvent(ev, d)));
 }
