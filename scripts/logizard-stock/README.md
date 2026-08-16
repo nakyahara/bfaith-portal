@@ -29,9 +29,10 @@ C:\tools\logizard-automation\out\logizard_zaikosu.csv
 
 ## 台帳 (jobs-registry)
 
-`logizard-stock-hourly` (P2, anchor 09:00 +grace 3h, partial_max_days 2)。
-毎時ジョブだが dead-man 判定は「当日どれか1回成功したか」。日中の停止は
-欠品通知の「HH:MM時点」表示で現場からも見える。
+`logizard-stock-hourly` (P2, anchor 09:00 +grace 3h, partial_max_days 6)。
+毎時ジョブだが dead-man 判定は「当日どれか1回 alive (ok|partial) だったか」。
+partial_max_days は「連続 partial ping 回数」なので 6 = mirror push 失敗が
+7時間続いたら stalled (🟠)。日中の完全停止は欠品通知の「HH:MM時点」表示で現場からも見える。
 
 ## miniPC セットアップ (デプロイ手順)
 

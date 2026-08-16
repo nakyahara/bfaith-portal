@@ -50,6 +50,8 @@ export async function fetchStockLocations(sku, fetchFn = fetch) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (!data || data.ok !== true || !Array.isArray(data.locations)) throw new Error('想定外のレスポンス形式');
+    // 行の形が壊れていても整形側 (buildStockLocationsText) が throw しないよう、object 以外は落とす
+    data.locations = data.locations.filter((r) => r && typeof r === 'object');
     return data;
   } catch (e) {
     console.warn(`[picking-stock] 他ロケ在庫の取得失敗 (通知は在庫情報なしで送る): ${e.message}`);

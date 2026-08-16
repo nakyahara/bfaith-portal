@@ -398,6 +398,8 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
 
     // logizard_stock（全件置換、ロジザード在庫スナップショット・毎時）
     //   送信側 = sync-to-render.js --logizard-only (毎時ランナー)。取込90分以内のときだけ送ってくる。
+    //   ⚠ この payload は logizard_stock 単独の POST で送ること。他表と相乗りすると、
+    //   この分岐の 400/503 でそれより前の表は反映済み・以降は未処理の混在状態になる
     if (req.body.logizard_stock !== undefined) {
       // fail-soft: この表のDDLが失敗していても他表を道連れにしない (2026-07-12 障害の教訓)。
       // 同一POSTに相乗りした他テーブルを巻き込まないよう、この表だけ 503 で拒否する
@@ -408,8 +410,9 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       if (!p || typeof p !== 'object' || !Array.isArray(p.rows)) {
         return res.status(400).json({ error: 'logizard_stock は { captured_at, rows[] } である必要があります' });
       }
-      if (typeof p.captured_at !== 'string' || !p.captured_at) {
-        return res.status(400).json({ error: 'logizard_stock.captured_at が必要です' });
+      const capturedMs = typeof p.captured_at === 'string' ? Date.parse(p.captured_at) : NaN;
+      if (!Number.isFinite(capturedMs) || capturedMs > Date.now() + 24 * 3600 * 1000) {
+        return res.status(400).json({ error: 'logizard_stock.captured_at が日時として不正です (ISO形式・未来すぎない値が必要)' });
       }
       const rows = p.rows;
       // 全置換なので空配列は受けない (取得失敗による全消しの防御。倉庫在庫ゼロは現実に起きない)

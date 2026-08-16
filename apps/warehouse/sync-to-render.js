@@ -783,5 +783,7 @@ if (isMain) {
   console.log('\n結果:', JSON.stringify(result, null, 2));
   // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
   // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)
-  process.exitCode = result.ok === false ? 1 : 0;
+  // --logizard-only は skipped (未取込/古い/0件) も非0にする: 毎時ランナーは直前に取込成功して
+  // いるはずなので、skipped = 上流の不整合。成功扱いにすると mirror 未更新のまま ok ping が出る
+  process.exitCode = logizardOnly ? (result.state === 'sent' ? 0 : 1) : (result.ok === false ? 1 : 0);
 }

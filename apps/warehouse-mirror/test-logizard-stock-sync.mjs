@@ -65,6 +65,8 @@ console.log('\n── 不正な payload は 400 + mirror を消さない ──'
 const cases = [
   ['rows が空配列 (全消しは拒否)', { captured_at: CAPTURED, rows: [] }],
   ['captured_at 無し', { rows: [row()] }],
+  ['captured_at が日時でない', { captured_at: 'not-a-date', rows: [row()] }],
+  ['captured_at が未来すぎる', { captured_at: '2099-01-01T00:00:00.000Z', rows: [row()] }],
   ['rows がオブジェクト', { captured_at: CAPTURED, rows: {} }],
   ['商品ID が空', { captured_at: CAPTURED, rows: [row({ 商品ID: ' ' })] }],
   ['商品ID が数値', { captured_at: CAPTURED, rows: [row({ 商品ID: 123 })] }],

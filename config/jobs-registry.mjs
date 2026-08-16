@@ -166,7 +166,9 @@ export const JOBS_REGISTRY = [
     anchor_hour_jst: 9,
     anchor_minute_jst: 0,
     grace_hours: 3,
-    partial_max_days: 2,   // 取込ok・mirror push失敗が続いたら stalled (ローカルの欠品通知は生きている)
+    // partial_streak は「連続 partial ping 回数」(日数ではない)。毎時 ping なので 6 =
+    // mirror push 失敗が7時間 (ほぼ丸一日分) 続いたら stalled (ローカルの欠品通知は生きている)
+    partial_max_days: 6,
     lifecycle: 'permanent',
     runbook: 'C:\\Users\\bfaith\\bfaith-portal\\logs\\logizard-stock-hourly.log と C:\\tools\\logizard-automation\\logs を確認。手動再実行: powershell -File C:\\Users\\bfaith\\bfaith-portal\\scripts\\logizard-stock\\run-hourly.ps1',
   },

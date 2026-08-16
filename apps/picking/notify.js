@@ -104,15 +104,22 @@ async function sendGChat(text) {
 export async function notifyShortage(info, now = new Date()) {
   if (!process.env.PICKING_LINE_CHANNEL_TOKEN && !process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
   // 同一SKUの他ロケ在庫 (ロジザード毎時スナップショット) を warehouse から取る。
-  // fail-soft: 取れなくても通知は止めない (呼び出し側は fire-and-forget なので待ってよい)。
+  // fail-soft: 取得・整形のどんな失敗でも通知本体は止めない (想定外レスポンス形状で
+  // 整形が throw しても「取得できず」に落とす)。呼び出し側は fire-and-forget なので待ってよい。
   // warehouse連携が未設定の環境では在庫行そのものを出さない (「取得できず」のノイズ防止)
-  const stockText = stockLookupConfigured()
-    ? buildStockLocationsText(await fetchStockLocations(info.line?.sku), {
+  let stockText = null;
+  if (stockLookupConfigured()) {
+    try {
+      stockText = buildStockLocationsText(await fetchStockLocations(info.line?.sku), {
         excludeBlock: info.line?.block,
         excludeLocation: info.line?.location,
         now,
-      })
-    : null;
+      });
+    } catch (e) {
+      console.warn(`[picking-notify] 他ロケ在庫の整形失敗 (通知は継続): ${e.message}`);
+      stockText = '📍 他ロケ在庫: 取得できず';
+    }
+  }
   const text = buildShortageText({ ...info, stockText });
   const results = await Promise.allSettled([sendLine(text, now), sendGChat(text)]);
   const failures = results.filter((r) => r.status === 'rejected');
