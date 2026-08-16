@@ -102,6 +102,7 @@
     <span id="mall" class="muted"></span>
     <span class="done-tag" id="doneTag">✔ 完了済み</span>
     <span class="spacer"></span>
+    <button id="ttsBtn" type="button" style="background:none; border:1px solid #495057; border-radius:8px; color:#fff; font-size:18px; padding:2px 12px; cursor:pointer;">🔊</button>
     <span class="offline-dot" id="netDot" title="通信状態"></span>
     <span id="workerTag" class="muted"></span>
     <a href="/apps/packing/">一覧へ</a>
@@ -146,6 +147,7 @@
       batchId: state.batch.id,
       batchStatus: state.batch.status,
       worker: state.batch.worker,
+      folderName: state.batch.folder_name || '',
       currentSeq: state.currentSeq,
       slips: state.slips.map((s) => ({
         seq: s.seq, status: s.status, neSlipNo: s.ne_slip_no, mall: s.mall,
@@ -157,6 +159,7 @@
         deliveryDate: s.delivery_date, deliveryTime: s.delivery_time,
         lines: s.lines.map((l) => ({
           sku: l.sku, name: l.print_name || l.product_name, qty: l.qty, imageUrl: l.imageUrl,
+          shortName: l.short_name,   // 送り状備考1 = 読み上げ短縮名の第一候補 (要件§5.3)
         })),
       })),
     }).replace(/</g, '\\u003c') %>;
@@ -231,7 +234,86 @@
         $('nextBtn').disabled = false;
       }
       $('prevBtn').disabled = viewSeq <= 1;
+      maybeSpeak();
     }
+
+    // ── 音声読み上げ (要件§5.3。picking #790/#809 の読み上げ方針を踏襲) ──
+    // 内容 = 警告の先読み + 「短縮名 + 数量」のみ (商品名全文は読まない)。
+    // 伝票遷移で前の発声は必ず cancel。🔊トグルは localStorage に保持
+    let ttsOn = localStorage.getItem('packing_tts') !== '0';
+    let lastSpokenSeq = null;
+    const DAKU = { 'カ':'ガ','キ':'ギ','ク':'グ','ケ':'ゲ','コ':'ゴ','サ':'ザ','シ':'ジ','ス':'ズ','セ':'ゼ','ソ':'ゾ','タ':'ダ','チ':'ヂ','ツ':'ヅ','テ':'デ','ト':'ド','ハ':'バ','ヒ':'ビ','フ':'ブ','ヘ':'ベ','ホ':'ボ','ウ':'ヴ' };
+    const HANDAKU = { 'ハ':'パ','ヒ':'ピ','フ':'プ','ヘ':'ペ','ホ':'ポ' };
+
+    // 送り状備考1の正規化: 半角カナ・分離濁点 (カ+゛→ガ)・末尾「/数量」の二重読み・区切り記号を吸収。
+    // ⚠順序: 全角゛はNFKCで「空白+結合文字」に分解されるため、先にペア結合してからNFKC、
+    // NFKC後にも (半角カナ由来の) 結合文字ペアをもう一度結合する
+    function normalizeSpeech(s) {
+      const pair = (t) => t
+        .replace(/([カキクケコサシスセソタチツテトハヒフヘホウ])[゛゙]/g, (m, c) => DAKU[c] || m)
+        .replace(/([ハヒフヘホ])[゜゚]/g, (m, c) => HANDAKU[c] || m);
+      let t = pair(String(s || ''));
+      t = t.normalize('NFKC');
+      t = t.replace(/ (?=[゙゚])/g, '');   // NFKCが挿入する空白を除去して結合可能に
+      t = pair(t);
+      t = t.replace(/[゙゚]/g, '');        // 結合できなかった濁点は捨てる (読み崩れ防止)
+      t = t.replace(/\/\d+\s*$/, '');
+      t = t.replace(/[_\/]+/g, ' ').replace(/\s+/g, ' ').trim();
+      return t;
+    }
+
+    function speak(text) {
+      if (!ttsOn || !('speechSynthesis' in window)) return;
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'ja-JP';
+      u.rate = 1.1;
+      speechSynthesis.speak(u);
+    }
+
+    // 警告の読み上げ語。multi_qty は明細読み (「複数、N個」)・multi_box は箱数読みで
+    // 表現するため除外。未知の警告はバッジ表示名 (絵文字を除く) をそのまま読む
+    const WARN_SPEECH = { gift: 'ギフトあり', noshi: 'のしあり', comment: 'コメント確認', assort: 'アソート', expiry_lot: '期限ロットあり' };
+    function speakSlip(s) {
+      const parts = [];
+      for (const w of (s.warns || [])) {
+        if (w === 'multi_qty' || w === 'multi_box') continue;
+        parts.push(WARN_SPEECH[w] || String(WARN_LABELS[w] || w).replace(/^[^ぁ-ヿ一-龯A-Za-z0-9]+/, ''));
+      }
+      if (s.boxCount > 1) parts.push(`複数箱、${s.boxCount}箱`);
+      for (const l of s.lines) {
+        // 第一候補=送り状備考1の短縮名。無い商品のみ商品名の先頭25文字で代用 (全文は読まない — 要件§5.3)
+        const nm = normalizeSpeech(l.shortName) || [...normalizeSpeech(l.name)].slice(0, 25).join('');
+        parts.push(l.qty >= 2 ? `${nm}、複数、${l.qty}個` : `${nm}、1個`);
+      }
+      speak(parts.join('。'));
+    }
+
+    // 現在の梱包対象を新しく表示したときだけ読む。完了済みの閲覧 (前へ) は読まずに止め、
+    // 現在伝票へ戻ったら読み直す (途中キャンセルされた読み上げを聞き直せるように)
+    function maybeSpeak() {
+      if (!('speechSynthesis' in window)) return;
+      if (viewSeq === currentSeq && viewSeq !== lastSpokenSeq) {
+        lastSpokenSeq = viewSeq;
+        speakSlip(bySeq.get(viewSeq));
+      } else if (viewSeq !== currentSeq) {
+        speechSynthesis.cancel();
+        lastSpokenSeq = null;
+      }
+    }
+
+    function updateTtsBtn() {
+      $('ttsBtn').textContent = ttsOn ? '🔊' : '🔇';
+      $('ttsBtn').style.opacity = ttsOn ? '1' : '0.5';
+    }
+    $('ttsBtn').addEventListener('click', () => {
+      ttsOn = !ttsOn;
+      localStorage.setItem('packing_tts', ttsOn ? '1' : '0');
+      updateTtsBtn();
+      if (!ttsOn) speechSynthesis.cancel();
+      else { lastSpokenSeq = null; maybeSpeak(); }   // ONにした瞬間に現在伝票を読む (タップ=有効化操作)
+    });
+    updateTtsBtn();
 
     // ── イベント送信 (localStorage キュー直列送信 — picking と同型の簡易版) ──
     const QKEY = `packing_q_${STATE.batchId}`;
@@ -337,10 +419,13 @@
       currentSeq = next ? next.seq : null;
       if (next) {
         viewSeq = next.seq;
+        render();
       } else {
         $('doneOverlay').style.display = 'flex';
+        render();
+        // render 内の maybeSpeak (閲覧扱いの cancel) より後に完了を読み上げる
+        speak(`${STATE.folderName} ${STATE.slips.length}件、完了しました`);
       }
-      render();
     }
 
     function goPrev() {
@@ -375,6 +460,8 @@
       }
       enqueue('start', null);
       viewSeq = currentSeq ?? 1;
+      // 名前タップ=ユーザー操作なので、ここでの発声がブラウザの自動再生制限の有効化を兼ねる (要件§5.3)
+      lastSpokenSeq = null;
       render();
     }
 
