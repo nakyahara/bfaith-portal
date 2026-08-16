@@ -83,13 +83,13 @@ console.log('\n── handleChatEvent: CARD_CLICKED ──');
   eq(newFmt.actionResponse, { type: 'NEW_MESSAGE' }, '新形式: NEW_MESSAGE 応答');
   const lines = newFmt.text.split('\n');
   ok(lines[0] === 'ティーツリーオイル 20ml' && lines[1] === '(teatree20)', `商品名+SKU見出し:\n${newFmt.text}`);
-  ok(newFmt.text.includes('📍 在庫ロケーション (16:00時点)'), '取得時刻つき見出し');
-  ok(newFmt.text.includes('・R1FA-002-001-01: 200個') && newFmt.text.includes('・P1FB-001-002-01: 30個'), 'フリー降順のロケ行');
-  ok(newFmt.text.includes('・棚以外 (仮想ロケ等): 15個'), '仮想ロケZZZは合算');
+  ok(newFmt.text.includes('📍 在庫ロケーション (16時00分時点)'), '取得時刻つき見出し (コロン不使用=LINE/GChat共通整形)');
+  ok(newFmt.text.includes('・R1FA-002-001-01 → 200個') && newFmt.text.includes('・P1FB-001-002-01 → 30個'), 'フリー降順のロケ行');
+  ok(newFmt.text.includes('・ZZZ-ZZZ-ZZ → 15個'), '特殊ロケZZZは実名のまま末尾に表示');
   ok(!newFmt.text.includes('P2FA'), '不良品ロケは出ない');
 
   const oldFmt = handleChatEvent({ type: 'CARD_CLICKED', action: { actionMethodName: 'showStock', parameters: [{ key: 'sku', value: 'teatree10' }] } }, db, NOW);
-  ok(oldFmt.text.includes('(teatree10)') && oldFmt.text.includes('・R1FA-001-001-01: 40個 (別途引当10)'), `旧形式パラメータでも動く:\n${oldFmt.text}`);
+  ok(oldFmt.text.includes('(teatree10)') && oldFmt.text.includes('・R1FA-001-001-01 → 40個 (別途引当10)'), `旧形式パラメータでも動く:\n${oldFmt.text}`);
 
   const gone = handleChatEvent({ type: 'CARD_CLICKED', common: { invokedFunction: 'showStock', parameters: { sku: 'nolongerexists' } } }, db, NOW);
   ok(gone.text.includes('見つかりませんでした'), 'SKU消失は案内文');
@@ -132,6 +132,10 @@ console.log('\n── HTTPレベル (認証がparserより前・ドメイン制�
   const app = express();
   const auth = makeStockBotAuth(async (a) => a === 'Bearer good-token');
   app.use('/apps/stock-bot', auth, express.json({ limit: '256kb' }), stockBotRouter);
+  // 413 (PayloadTooLarge) を finalhandler に流すと Node 24 では非同期の再throwで
+  // プロセスが exit 255 になる (テストの後始末事故)。明示ハンドラで応答して閉じる
+  // eslint-disable-next-line no-unused-vars
+  app.use((err, req, res, next) => { res.status(err.status || 500).json({ error: err.type || 'error' }); });
   const server = http.createServer(app);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;

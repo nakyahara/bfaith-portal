@@ -57,7 +57,7 @@ async function replyLine(replyToken, messages, fetchFn = fetch) {
 async function buildStockText(sku, deps) {
   const data = await deps.fetchStockLocations(sku);
   if (!data || data.locations.length === 0) return null;
-  const body = buildStockLocationsText(data, { title: '在庫ロケーション', maxLines: 10 });
+  const body = buildStockLocationsText(data, { title: '在庫ロケーション' });
   return `${data.name || ''}\n(${String(sku).trim().toLowerCase()})\n${body}`;
 }
 

@@ -59,8 +59,9 @@ await t('検索: 1件は即ロケ表示 (仮想ロケ合算つき)', async () =>
   const msgs = await buildSearchReplyMessages('20ml', deps({ fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('teatree20', 'ティーツリーオイル 20ml', 245)] }) }));
   const text = msgs[0].text;
   assert.ok(text.startsWith('ティーツリーオイル 20ml\n(teatree20)'), text);
-  assert.ok(text.includes('📍 在庫ロケーション') && text.includes('・R1FA-002-001-01: 200個'), text);
-  assert.ok(text.includes('・棚以外 (仮想ロケ等): 15個'), text);
+  assert.ok(text.includes('📍 在庫ロケーション') && text.includes('・R1FA-002-001-01 → 200個'), text);
+  assert.ok(text.includes('・ZZZ-ZZZ-ZZ → 15個'), text);
+  assert.ok(!/\d: ?\d/.test(text), '「数字:数字」を含まない (LINEの時刻リンク化対策)');
   assert.equal(msgs[0].quickReply, undefined, '確定表示にボタンは付けない');
 });
 

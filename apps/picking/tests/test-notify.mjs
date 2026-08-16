@@ -298,15 +298,30 @@ globalThis.fetch = async (url, opts) => {
   };
   const now = new Date('2026-08-16T03:30:00Z');   // JST 12:30 (取込27分後)
 
-  t('buildStockLocationsText: 良品のみ・フリー在庫降順・報告ロケ除外・仮想ロケは合算・HH:MM時点', () => {
+  t('buildStockLocationsText: 良品のみ・棚ロケ先頭フリー降順・報告ロケ除外・特殊ロケは実名で末尾', () => {
     const text = buildStockLocationsText(data, { excludeBlock: 'P3FB', excludeLocation: '00100303', now });
     const lines = text.split('\n');
-    assert.ok(lines[0].startsWith('📍 他ロケ在庫 (12:03時点)'), text);
-    assert.equal(lines[1], '・R1FA-001-001-01: 200個');
-    assert.equal(lines[2], '・R1FA-002-002-01: 150個 (別途引当10)');
-    assert.equal(lines[3], '・棚以外 (仮想ロケ等): 1000個', 'ZZZ等の仮想ロケは棚として並べず合算');
+    // 「12:03」形式はLINEが時刻リンク化するので「12時03分」表記 (区切りも「→」でコロン不使用)
+    assert.ok(lines[0].startsWith('📍 他ロケ在庫 (12時03分時点)'), text);
+    assert.equal(lines[1], '・R1FA-001-001-01 → 200個');
+    assert.equal(lines[2], '・R1FA-002-002-01 → 150個 (別途引当10)');
+    assert.equal(lines[3], '・ZZZ-ZZZ-ZZ → 1000個', '特殊ロケは実際のロケコードのまま末尾に表示');
     assert.equal(lines.length, 4, `不良品/フリー0/報告ロケは出ないはず:\n${text}`);
     assert.ok(!text.includes('⚠'), '新鮮なら警告なし');
+    assert.ok(!/\d: ?\d/.test(text), '「数字:数字」を含まない (LINE時刻リンク化対策)');
+  });
+
+  t('buildStockLocationsText: ロケは丸めず全部表示 (「…他Nロケ」を出さない)', () => {
+    const many = {
+      ok: true, importedAt: data.importedAt, stockDate: '20260816',
+      locations: Array.from({ length: 15 }, (_, i) => ({
+        block: 'R1FA', location: `00${String(i + 1).padStart(2, '0')}-001-01`, quality: '良品',
+        qty: 10 + i, allocated: 0, free: 10 + i,
+      })),
+    };
+    const text = buildStockLocationsText(many, { now });
+    assert.equal(text.split('\n').length, 16, `見出し+15ロケ全部:\n${text}`);
+    assert.ok(!text.includes('…他'), '丸め表示を出さない');
   });
 
   t('buildStockLocationsText: 180分超のスナップショットは古い旨の警告', () => {
@@ -365,7 +380,7 @@ globalThis.fetch = async (url, opts) => {
   await notifyShortage(INFO);
   const text = sent[0].messages[0].text;
   assert.ok(text.includes('📍 他ロケ在庫'), text);
-  assert.ok(text.includes('・R1FA-001-001-01: 200個'), text);
+  assert.ok(text.includes('・R1FA-001-001-01 → 200個'), text);
   // warehouse 側が落ちていても通知は出る (取得できず表示)
   sent.length = 0;
   globalThis.fetch = async (url, opts) => {
