@@ -87,6 +87,16 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const log = [];
 
+  // logizard_stock は単独POST限定 (毎時の全置換 payload)。他表と相乗りすると、この分岐より
+  // 前の表だけ反映された状態で 400/503 になり「HTTP失敗なのに一部反映」の混在が残るため、
+  // 入口で拒否する (Codex R2 Low-1)
+  if (req.body.logizard_stock !== undefined) {
+    const others = Object.keys(req.body).filter((k) => k !== 'logizard_stock' && k !== 'meta');
+    if (others.length > 0) {
+      return res.status(400).json({ error: `logizard_stock は単独で送信してください (同時指定: ${others.join(', ')})` });
+    }
+  }
+
   try {
     // products（全件置換）
     //   Codex PR1 review High #2 反映: seasonality_flag/season_months/new_product_flag/
@@ -434,6 +444,16 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
           return res.status(400).json({ error: `${where}: 在庫数/引当数 が整数ではありません (${r['在庫数']}/${r['引当数']})` });
         }
       }
+      // 世代逆行の防止 (Codex R2 Medium-1): 手動再実行・遅延で古い snapshot が後から届いても
+      // 巻き戻さない。同一世代の再送は冪等成功 (リトライを 409 で失敗扱いにしない)
+      const currentCaptured = db.prepare('SELECT MAX(captured_at) AS c FROM mirror_logizard_stock').get()?.c || null;
+      const currentMs = currentCaptured ? Date.parse(currentCaptured) : NaN;
+      if (Number.isFinite(currentMs) && capturedMs < currentMs) {
+        return res.status(409).json({ error: `logizard_stock.captured_at が保存済みより古い snapshot です (${p.captured_at} < ${currentCaptured})` });
+      }
+      if (Number.isFinite(currentMs) && capturedMs === currentMs) {
+        log.push(`logizard_stock: 同一世代 (${p.captured_at}) のため変更なし`);
+      } else {
       const tx = db.transaction(() => {
         db.exec('DELETE FROM mirror_logizard_stock');
         const stmt = db.prepare(`INSERT INTO mirror_logizard_stock (
@@ -453,6 +473,7 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       });
       tx();
       log.push(`logizard_stock: ${rows.length}件`);
+      }
     }
 
     // rakuten_sku_map（全件置換）

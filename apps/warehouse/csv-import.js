@@ -211,10 +211,11 @@ function importLogizard(filePath) {
   if (missingHeaders.length > 0) {
     throw new Error(`ロジザード在庫CSVに必須列がありません: ${missingHeaders.join(', ')} (出力形式が変わった可能性。既存データを温存しました)`);
   }
-  const minRows = parseInt(process.env.LZ_IMPORT_MIN_ROWS || '1000', 10);
-  if (!Number.isInteger(minRows) || minRows < 1) {
+  const minRowsRaw = String(process.env.LZ_IMPORT_MIN_ROWS ?? '1000').trim();
+  if (!/^[1-9]\d*$/.test(minRowsRaw)) {
     throw new Error(`LZ_IMPORT_MIN_ROWS が不正です: "${process.env.LZ_IMPORT_MIN_ROWS}" (正の整数で指定してください)`);
   }
+  const minRows = Number(minRowsRaw);
   // 壊れた数値を黙って0にしない (在庫0の誤案内は欠品通知の誤誘導になる)
   const toInt = (v, label, rowNo) => {
     const n = Number(String(v ?? '').replace(/,/g, '').trim() || '0');

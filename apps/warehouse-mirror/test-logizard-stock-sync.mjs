@@ -84,6 +84,19 @@ for (const [label, v] of [['文字列', 'abc'], ['数値', 1], ['null', null]]) 
 }
 eq(count(), 1, '拒否されても既存行は残っている (全消し前に検証している)');
 
+console.log('\n── 世代逆行・冪等再送・相乗り ──');
+{
+  const r = await post({ logizard_stock: { captured_at: CAPTURED, rows: [row()] } });   // 03:00 < 保存済み04:00
+  ok(r.status === 409, `古い captured_at → 409 で巻き戻さない (実際 ${r.status})`);
+  eq(count(), 1, '409 でも既存行は残る');
+  const r2 = await post({ logizard_stock: { captured_at: '2026-08-16T04:00:00.000Z', rows: [row(), row({ ロケ: '009-009-09' })] } });
+  eq(r2.status, 200, '同一世代の再送は冪等成功 (リトライを失敗扱いにしない)');
+  eq(count(), 1, '同一世代では置換しない');
+  const r3 = await post({ logizard_stock: { captured_at: '2026-08-16T05:00:00.000Z', rows: [row()] }, products: [] });
+  ok(r3.status === 400, `他表と相乗り → 400 (単独POST限定) (実際 ${r3.status})`);
+  eq(count(), 1, '相乗り拒否でも既存行は残る');
+}
+
 console.log('\n── /api/status に件数と時刻が出る ──');
 {
   const res = await fetch(`${base}/api/status`);
