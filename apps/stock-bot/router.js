@@ -133,7 +133,7 @@ export function buildStockReply(db, sku, now = new Date()) {
   `).get(code);
   const body = buildStockLocationsText(
     { ok: true, importedAt: meta?.captured_at || null, stockDate: meta?.stock_date || null, locations },
-    { now, title: '在庫ロケーション', maxLines: 10 },
+    { now, title: '在庫ロケーション' },
   );
   return `${meta?.name || ''}\n(${code})\n${body}`;
 }

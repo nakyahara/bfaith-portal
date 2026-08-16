@@ -12,7 +12,9 @@
  */
 
 const TIMEOUT_MS = 5000;
-const MAX_LINES = 5;          // 通知に載せる他ロケの上限 (フリー在庫の多い順)
+// ロケは丸めず全部表示する (2026-08-16 中原さん要望「…他14ロケ にしない」)。
+// これは安全上限のみ — LINE本文5000字制限で返信ごと拒否されるのを防ぐ (通常は到達しない)
+const MAX_LINES = 80;
 const STALE_WARN_MIN = 180;   // これより古いスナップショットは警告付きで表示
 
 /**
@@ -89,13 +91,17 @@ export async function fetchStockSearch(query, fetchFn = fetch) {
   }
 }
 
-/** ISO時刻を JST の「HH:MM」(同日) / 「M/D HH:MM」(別日) にする。解釈できなければ null。 */
+/**
+ * ISO時刻を JST の「H時MM分」(同日) / 「M/D H時MM分」(別日) にする。解釈できなければ null。
+ * ⚠「16:05」形式にしない — LINE (iOS) が「数字:数字」を時刻と誤認して勝手にリンク化する
+ * (2026-08-16 実機で確認。ロケ行の「…01: 200個」も同様なので在庫表示はコロンを使わない)
+ */
 function jstStamp(iso, now = new Date()) {
   const t = Date.parse(iso || '');
   if (!Number.isFinite(t)) return null;
   const jst = new Date(t + 9 * 3600 * 1000);
   const nowJst = new Date(now.getTime() + 9 * 3600 * 1000);
-  const hm = `${String(jst.getUTCHours()).padStart(2, '0')}:${String(jst.getUTCMinutes()).padStart(2, '0')}`;
+  const hm = `${jst.getUTCHours()}時${String(jst.getUTCMinutes()).padStart(2, '0')}分`;
   if (jst.toISOString().slice(0, 10) === nowJst.toISOString().slice(0, 10)) return hm;
   return `${jst.getUTCMonth() + 1}/${jst.getUTCDate()} ${hm}`;
 }
@@ -119,23 +125,28 @@ export function buildStockLocationsText(data, {
       && String(r.block || '') === String(excludeBlock || '')
       && normalizeLocationDigits(r.location) === excludeDigits))
     .filter((r) => Number(r.free) > 0);
-  // 棚ロケ = 8桁数字に正規化できるもの。ZZZ-ZZZ-ZZ 等の仮想ロケは棚として案内できないので
-  // 個別に並べず「棚以外」として合算だけ見せる (実データ 2026-08-16 で確認)
+  // 棚ロケ (8桁数字に正規化できるもの) をフリー在庫降順で先に、それ以外
+  // (ロジザード上の特殊ロケ。実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。
+  // 特殊ロケも実在のロケコードなので、造語 (「仮想ロケ」等) にせずそのままの名前で見せる
   const isShelf = (r) => normalizeLocationDigits(r.location).length === 8;
-  const rows = candidates.filter(isShelf)
-    .sort((a, b) => (Number(b.free) - Number(a.free)) || String(a.location).localeCompare(String(b.location)));
-  const otherFree = candidates.filter((r) => !isShelf(r)).reduce((sum, r) => sum + Number(r.free), 0);
+  const byFree = (a, b) => (Number(b.free) - Number(a.free)) || String(a.location).localeCompare(String(b.location));
+  const rows = [...candidates.filter(isShelf).sort(byFree), ...candidates.filter((r) => !isShelf(r)).sort(byFree)];
 
   const stamp = jstStamp(data.importedAt, now);
   const ageMin = Number.isFinite(Date.parse(data.importedAt || '')) ? (now.getTime() - Date.parse(data.importedAt)) / 60000 : null;
   const stale = ageMin === null || ageMin > STALE_WARN_MIN;
   const header = `📍 ${title} (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
-  if (rows.length === 0 && otherFree <= 0) return `${header}: なし`;
+  if (rows.length === 0) return `${header}: なし`;
   const lines = rows.slice(0, maxLines).map((r) => {
-    const loc = `${r.block ? `${r.block}-` : ''}${r.location}`;
-    return `・${loc}: ${r.free}個${Number(r.allocated) > 0 ? ` (別途引当${r.allocated})` : ''}`;
+    const block = String(r.block || '');
+    const loc = String(r.location || '');
+    // ZZZ ブロックはロケ名にもZZZが含まれる (ZZZ-ZZZ-ZZ) ため、重ねて「ZZZ-ZZZ-ZZZ-ZZ」にしない。
+    // 前方一致は「-」境界まで見る (ZZZ2-… のような別ブロックを誤って省略しない)
+    const dup = loc === block || loc.startsWith(`${block}-`);
+    const label = block && !dup ? `${block}-${loc}` : (loc || block);
+    // 区切りは「→」— 「01: 200」のようなコロンはLINEが時刻と誤認してリンク化する
+    return `・${label} → ${r.free}個${Number(r.allocated) > 0 ? ` (別途引当${r.allocated})` : ''}`;
   });
   if (rows.length > maxLines) lines.push(`…他${rows.length - maxLines}ロケ`);
-  if (otherFree > 0) lines.push(`・棚以外 (仮想ロケ等): ${otherFree}個`);
   return [header, ...lines].join('\n');
 }
