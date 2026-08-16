@@ -512,4 +512,83 @@ t('完了後の next / start は拒否される', () => {
   expectPackError(() => applyEvent(wr.batchId, { opId: 'op-s9', event: 'start' }, '星'), 'already_done');
 });
 
+// ─── Drive自動ポーラー (deps注入・v3) ───
+
+const { pollOnce, pickPollCandidates } = await import('../drive-sync.js');
+const { createDevice, verifyDevice, revokeDevice } = await import('../db.js');
+
+t('pickPollCandidates: 納品書CSVのみ・60秒安定待ち・3日窓', () => {
+  const now = Date.parse('2026-08-16T03:00:00Z');
+  const files = [
+    { filename: '納品書_出荷_01.csv', modified_time: '2026-08-16T02:58:00Z' },   // ok
+    { filename: '納品書_出荷_02.csv', modified_time: '2026-08-16T02:59:30Z' },   // 30秒前 → 待つ
+    { filename: 'ピッキングリストデータ_出荷_01.csv', modified_time: '2026-08-16T02:00:00Z' },  // 対象外
+    { filename: '納品書_1.pdf', modified_time: '2026-08-16T02:00:00Z' },         // 対象外
+    { filename: '納品書_出荷_03.csv', modified_time: '2026-08-10T00:00:00Z' },   // 3日超
+  ];
+  assert.deepEqual(pickPollCandidates(files, now).map((f) => f.filename), ['納品書_出荷_01.csv']);
+});
+
+async function runPoll(csvBuf, { fileId = 'F1', mtime = '2026-08-16T00:00:00Z', filename = '納品書_出荷_77.csv', parent = '出荷_77' } = {}) {
+  return pollOnce({
+    listFiles: async () => [{ file_id: fileId, filename, parent_name: parent, modified_time: mtime }],
+    download: async () => ({ buffer: csvBuf, modified_time: mtime, filename }),
+    nowMs: Date.parse(mtime) + 120_000,
+  });
+}
+
+await (async () => {
+  // 突合ok → 自動取込
+  const okCsv = makeCsv([
+    { ...row({ slip: '0100', sku: 'pz', tb: 'TB33333333333' }) },
+  ]);
+  importPickingBatch(parseCs03002(makePickCsv([
+    pickRow({ slip: '0100', sku: 'pz', qty: 1, tb: 'TB33333333333' }),
+  ])), { hikiateClass: 'テスト', folderName: '出荷_77' }, 'test');
+  let s = await runPoll(okCsv);
+  assert.equal(s.imported, 1, `imported=1 のはずが ${JSON.stringify(s)}`);
+  // 同じ版はスキップ (台帳冪等)
+  s = await runPoll(okCsv);
+  assert.equal(s.checked + s.imported + s.failed, 1);   // checked=1, imported=0
+  assert.equal(s.imported, 0);
+  passed++; console.log('  ok: ポーラー: 突合okは自動取込・同一版は台帳で冪等 (async)');
+
+  // no_picking → failed (再試行対象)
+  const npCsv = makeCsv([
+    { ...row({ slip: '0101', sku: 'nq', tb: 'TB22222222222' }) },
+  ]);
+  s = await runPoll(npCsv, { fileId: 'F2', filename: '納品書_出荷_78.csv', parent: '出荷_78' });
+  assert.equal(s.failed, 1);
+  const led = getDB().prepare("SELECT * FROM pk_pack_drive_imports WHERE drive_file_id='F2'").get();
+  assert.equal(led.status, 'failed');
+  assert.ok(/no_picking/.test(led.error));
+  // picking 側が届いたら次周期で取り込まれる
+  importPickingBatch(parseCs03002(makePickCsv([
+    pickRow({ slip: '0101', sku: 'nq', qty: 1, tb: 'TB22222222222' }),
+  ])), { hikiateClass: 'テスト', folderName: '出荷_78' }, 'test');
+  s = await runPoll(npCsv, { fileId: 'F2', filename: '納品書_出荷_78.csv', parent: '出荷_78' });
+  assert.equal(s.imported, 1);
+  passed++; console.log('  ok: ポーラー: no_pickingは再試行→CS03002到着後に自動取込 (async)');
+
+  // mismatch → skipped (人の承認へ)
+  const mmCsv = makeCsv([
+    { ...row({ slip: '0100', sku: 'pz', qty: 3, tb: 'TB33333333333' }) },   // pickingは1個
+  ]);
+  s = await runPoll(mmCsv, { fileId: 'F3', mtime: '2026-08-16T01:00:00Z', filename: '納品書_出荷_77.csv', parent: '出荷_77' });
+  assert.equal(s.skipped, 1);
+  assert.ok(/mismatch/.test(getDB().prepare("SELECT error FROM pk_pack_drive_imports WHERE drive_file_id='F3'").get().error));
+  passed++; console.log('  ok: ポーラー: mismatchは取り込まずskipped=承認待ち (async)');
+})();
+
+// ─── 登録端末 (v3) ───
+
+t('端末登録→検証→失効', () => {
+  const token = createDevice('梱包iPad1', 'test@example.com');
+  const d = verifyDevice(token);
+  assert.equal(d.label, '梱包iPad1');
+  assert.equal(verifyDevice('bogus'), null);
+  assert.ok(revokeDevice(d.id));
+  assert.equal(verifyDevice(token), null);
+});
+
 console.log(`test-import: ${passed} 件 pass`);

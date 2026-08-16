@@ -50,10 +50,12 @@ import { startDrivePoller } from './drive-sync.js';
 // PACKING_ENABLED=0 で個別に無効化できる。初期化失敗 (migration等) は packing だけ落とし、
 // picking は継続する (梱包の障害でピッキングを巻き添えにしない)
 let packingRouter = null;
+let startPackingPoller = null;
 let packingState = 'disabled';   // readyz に載せて機能停止を監視から見えるようにする (Codexレビュー)
 if (process.env.PACKING_ENABLED !== '0') {
   try {
     packingRouter = (await import('../packing/router.js')).default;
+    ({ startPackingDrivePoller: startPackingPoller } = await import('../packing/drive-sync.js'));
     packingState = 'ok';
   } catch (e) {
     packingState = 'failed';
@@ -234,6 +236,7 @@ const HOST = process.env.PICKING_HOST || '127.0.0.1';
 const server = app.listen(PORT, HOST, () => {
   bootLog(`picking standalone listening on http://${HOST}:${PORT} (DATA_DIR=${DATA_DIR})`);
   startDrivePoller();
+  if (startPackingPoller) startPackingPoller();   // 納品書CSVの自動取込 (packing 有効時のみ)
 });
 
 // --- graceful shutdown (winsw の stop / 再起動で計測イベントを取りこぼさない) ---

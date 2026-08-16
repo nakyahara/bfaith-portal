@@ -48,7 +48,8 @@
   <div class="pk-wrap">
     <div class="pk-form">
       <h2>📂 Driveから取り込む (出荷_no フォルダの 納品書_出荷_XX.csv)</h2>
-      <p class="pk-msg" style="color:#495057;">納品書CSVは別プログラムが毎朝各フォルダへ自動配置します。ここでは配置済みファイルを選んで取り込みます。</p>
+      <p id="pollerStatus" class="pk-msg" style="color:#495057;">自動取込の状態を確認中…</p>
+      <p class="pk-msg" style="color:#495057;">納品書CSVは別プログラムが毎朝各フォルダへ自動配置され、上の自動取込が拾います。手動で取り込むのは差分承認 (mismatch/前日ファイル) や取り直しのときです。</p>
       <div class="pk-actions" style="margin-top:0">
         <button id="driveListBtn" type="button">ファイル一覧を更新</button>
         <span id="driveMsg" class="pk-msg"></span>
@@ -201,6 +202,32 @@
       $('previewBtn').disabled = true;
       try { await doPreview({ type: 'file', file: f }, $('msg')); } finally { $('previewBtn').disabled = false; }
     });
+
+    // ── 自動取込 (ポーラー) の状態表示 ──
+    (async () => {
+      try {
+        const res = await fetch('/apps/packing/admin/import/poller-status');
+        const body = await res.json();
+        const el = $('pollerStatus');
+        if (!res.ok) { el.textContent = ''; return; }
+        const p = body.poller;
+        if (!p.running) {
+          el.textContent = '⚠ 自動取込ポーラーはこのサーバーでは動いていません (手動取込のみ)';
+          el.className = 'pk-msg err';
+          return;
+        }
+        const last = p.lastAt ? new Date(p.lastAt).toLocaleTimeString('ja-JP') : 'まだ';
+        el.textContent = `🔁 自動取込: ${p.intervalSec}秒間隔で稼働中 (最終チェック ${last})`
+          + (p.lastError ? ` ⚠直近エラー: ${p.lastError}` : '')
+          + (body.failedCount > 0 ? ` ⚠取込失敗の記録 ${body.failedCount}件` : '');
+        if (p.lastError || body.failedCount > 0) el.className = 'pk-msg err';
+        // 直近の台帳 (mismatch等の承認待ちに気づけるように)
+        const waiting = (body.recent || []).filter((r) => r.status !== 'imported');
+        if (waiting.length > 0) {
+          el.textContent += ` / 要確認: ${waiting.slice(0, 3).map((r) => `${r.folder_name || r.filename}=${(r.error || r.status).slice(0, 40)}`).join(' , ')}`;
+        }
+      } catch { /* 表示だけの機能なので黙って諦める */ }
+    })();
 
     // ── Drive一覧 ──
     $('driveListBtn').addEventListener('click', async () => {

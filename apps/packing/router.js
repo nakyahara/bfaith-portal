@@ -20,7 +20,9 @@ import multer from 'multer';
 import {
   initPackingDB, getDB, jstToday, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, STATUS_LABELS, MATCH_LABELS,
+  createDevice, verifyDevice, revokeDevice, listDevices,
 } from './db.js';
+import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
@@ -45,15 +47,39 @@ function isRealDate(s) {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
-// ═══ アクセス制御 (PR1: ポータルセッションのみ) ═══
+// ═══ アクセス制御 (picking と同じ2系統: ポータルセッション or 登録端末Cookie) ═══
+//
+//   ①ポータルセッション (管理画面はこちら必須)
+//   ②登録済み端末Cookie (pk_pack_device) — 作業画面・作業APIのみ。作業者は名前タップで選択
+
+const DEVICE_COOKIE = 'pk_pack_device';
+
+/** Cookieヘッダから1つ取り出す (cookie-parser 非依存の最小実装)。 */
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return null;
+  for (const part of String(header).split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return null;
+}
 
 function packingAccess(req, res, next) {
+  // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
+  if (req.path === '/manifest.json') return next();
   if (req.session?.email) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('packing'))) return next();
     return res.status(403).send('packing へのアクセス権がありません');
   }
-  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'ログインが必要です' });
+  const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
+  if (device) {
+    req.packingDevice = device;   // 端末モード (作業画面のみ。admin系は requireAdmin で弾かれる)
+    return next();
+  }
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'ログインまたは端末登録が必要です' });
   if (req.session) req.session.returnTo = req.originalUrl;
   return res.redirect('/login');
 }
@@ -104,9 +130,10 @@ router.get('/', (req, res) => {
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
-    username: req.session?.email,
+    username: req.session?.email || req.packingDevice?.label || '端末',
     displayName: req.session?.displayName,
     isAdmin: req.session?.role === 'admin',
+    deviceMode: !req.session?.email,
     workDate,
     batches,
     statusLabels: STATUS_LABELS,
@@ -126,7 +153,7 @@ router.get('/batches/:id(\\d+)', (req, res) => {
   }));
   res.render(path.join(__dirname, 'views/batch_detail'), {
     title: `${batch.folder_name || batch.tb_key} | 梱包支援`,
-    username: req.session?.email,
+    username: req.session?.email || req.packingDevice?.label || '端末',
     displayName: req.session?.displayName,
     isAdmin: req.session?.role === 'admin',
     batch,
@@ -236,6 +263,67 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
   res.json({ ok: true, images: bySku });
 }));
 
+// ─── PWA manifest (ホーム画面追加用) ───
+router.get('/manifest.json', (req, res) => {
+  res.json({
+    name: '梱包支援',
+    short_name: '梱包',
+    start_url: '/apps/packing/',
+    display: 'standalone',
+    orientation: 'any',   // 梱包台は横向き据置が基本 (要件§6) だが縦でも使えるように
+    background_color: '#e9ecef',
+    theme_color: '#212529',
+    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+  });
+});
+
+// ─── 端末管理 (管理者・セッション必須) ───
+
+router.get('/admin/devices', (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_devices'), {
+    title: '端末管理 | 梱包支援',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    devices: listDevices(),
+  });
+});
+
+/**
+ * この端末 (iPad) を登録する。発行トークンは httpOnly Cookie としてこの端末にだけ渡す。
+ * ⭐登録と同時に管理者セッションを破棄する (共用端末に管理者権限を残さない — picking と同規約)。
+ * 🚨ホーム画面に追加したPWA内で実行すること (SafariとPWAはCookie保存領域が別)
+ */
+router.post('/admin/devices', checkOrigin, api(async (req, res) => {
+  const label = String(req.body.label || '').trim();
+  if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
+  const token = createDevice(label, req.session.email);
+  res.cookie(DEVICE_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    maxAge: 400 * 24 * 3600 * 1000,
+    path: '/apps/packing',
+  });
+  // セッション破棄の失敗を握り潰さない (Codex high: 共用端末に管理者セッションが残ったまま
+  // 「登録成功」を返すと、権限破棄の安全要件が満たされない)。失敗時は発行した端末も無効化する
+  req.session.destroy((err) => {
+    if (err) {
+      const issued = listDevices().at(-1);
+      if (issued && !issued.revoked_at) revokeDevice(issued.id);
+      res.clearCookie(DEVICE_COOKIE, { path: '/apps/packing' });
+      console.error('[packing] 端末登録時のセッション破棄に失敗:', err);
+      return res.status(500).json({ error: 'セッションの破棄に失敗したため登録を取り消しました。もう一度実行してください' });
+    }
+    res.json({ ok: true, loggedOut: true });
+  });
+}));
+
+router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, api(async (req, res) => {
+  if (!revokeDevice(Number(req.params.id))) throw new PackError(404, 'not_found', '端末が見つかりません');
+  res.json({ ok: true });
+}));
+
 // ─── 取込画面 (管理者) ───
 router.get('/admin/import', (req, res) => {
   res.render(path.join(__dirname, 'views/admin_import'), {
@@ -245,6 +333,20 @@ router.get('/admin/import', (req, res) => {
     isAdmin: true,
   });
 });
+
+/** 自動ポーリングの状態 (standaloneで稼働)。取込画面が表示に使う。 */
+router.get('/admin/import/poller-status', api(async (req, res) => {
+  const s = getPollerStatus();
+  const db = getDB();
+  const recent = db.prepare(`
+    SELECT filename, folder_name, status, error, attempts, processed_at FROM pk_pack_drive_imports
+    ORDER BY processed_at DESC LIMIT 12
+  `).all();
+  const failedCount = db.prepare(
+    "SELECT COUNT(*) c FROM pk_pack_drive_imports WHERE status='failed'"
+  ).get().c;
+  res.json({ ok: true, poller: s, recent, failedCount });
+}));
 
 /**
  * 取込のプレビュー整形。突合結果 (match) と警告集計を含む。
@@ -287,7 +389,7 @@ function runImport(preview, req) {
   }, req.session.email);
 }
 
-async function handleImport(req, res, buffer, extra = {}) {
+async function handleImport(req, res, buffer, extra = {}, onImported = null) {
   const preview = parseCs03003(buffer);
   // プレビュー表示用の突合 (confirm 時は importPackBatch がトランザクション内で再判定する)
   const match = checkPickingMatch(preview);
@@ -296,6 +398,7 @@ async function handleImport(req, res, buffer, extra = {}) {
     return res.json({ ok: true, mode: 'preview', ...summary });
   }
   const result = runImport(preview, req);
+  if (onImported) onImported(result.batchId);
   // 楽天白抜き画像の解決はバックグラウンドで (取込応答を待たせない・失敗しても取込は成立)
   queueEnsureImages(
     [...new Set(preview.slips.flatMap((s) => s.lines.map((l) => l.sku)))],
@@ -337,7 +440,11 @@ router.post('/admin/import/drive', checkOrigin, api(async (req, res) => {
     filename: dl.filename,
     folderNameSuggestion: (/^出荷_\d+$/.test(parentName) ? parentName : null)
       || deriveFolderName(dl.filename),
-  });
+  }, (batchId) => markLedgerImported({
+    fileId, modifiedTime: dl.modified_time, filename: dl.filename,
+    folderName: /^出荷_\d+$/.test(parentName) ? parentName : deriveFolderName(dl.filename),
+    batchId,
+  }));
 }));
 
 export default router;

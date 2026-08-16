@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 760px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .pk-form h2 { font-size: 1.0em; margin: 0 0 8px; }
+    .pk-note { font-size: 0.85em; color: #495057; margin-bottom: 10px; }
+    .pk-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .pk-actions input[type=text] { padding: 8px; font-size: 16px; width: 240px; }
+    .pk-actions button { padding: 8px 22px; font-size: 1em; cursor: pointer; }
+    .pk-msg { font-size: 0.9em; } .pk-msg.err { color: #c92a2a; } .pk-msg.ok { color: #2b8a3e; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+    th, td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    th { background: #f1f3f5; }
+    .revoked { color: #adb5bd; text-decoration: line-through; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📱 梱包・端末管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/packing/" class="btn-logout">← バッチ一覧</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-form">
+      <h2>この端末 (iPad) を登録する</h2>
+      <div class="pk-note">
+        🚨 <b>ホーム画面に追加したPWAの中で実行してください</b> (Safari本体とはCookieが別のため)。<br>
+        登録するとこの端末はログイン不要で梱包画面を使えるようになり、<b>あなたのログインは即座に解除されます</b> (共用端末に管理者権限を残さないため)。作業者の管理はピッキングの「端末・作業者管理」と共通です。
+      </div>
+      <div class="pk-actions">
+        <input type="text" id="label" placeholder="端末名 (例: 梱包iPad1)" maxlength="40">
+        <button id="registerBtn" type="button">登録してログアウト</button>
+        <span id="msg" class="pk-msg"></span>
+      </div>
+    </div>
+
+    <h2 style="font-size:1.05em">登録済み端末</h2>
+    <table>
+      <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終アクセス</th><th></th></tr></thead>
+      <tbody>
+        <% for (const d of devices) { %>
+          <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
+            <td><%= d.id %></td>
+            <td><%= d.label %></td>
+            <td><%= d.created_by %></td>
+            <td><%= (d.created_at || '').slice(0, 10) %></td>
+            <td><%= (d.last_seen_at || '-').slice(0, 16).replace('T', ' ') %></td>
+            <td>
+              <% if (!d.revoked_at) { %>
+                <button type="button" class="btn-revoke" data-id="<%= d.id %>">失効</button>
+              <% } else { %>失効済み<% } %>
+            </td>
+          </tr>
+        <% } %>
+        <% if (devices.length === 0) { %><tr><td colspan="6">登録された端末はありません</td></tr><% } %>
+      </tbody>
+    </table>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    $('registerBtn').addEventListener('click', async () => {
+      const label = $('label').value.trim();
+      if (!label) { $('msg').textContent = '端末名を入力してください'; $('msg').className = 'pk-msg err'; return; }
+      if (!confirm(`この端末を「${label}」として登録し、ログアウトします。よろしいですか?`)) return;
+      $('registerBtn').disabled = true;
+      try {
+        const res = await fetch('/apps/packing/admin/devices', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) { $('msg').textContent = body.error || `エラー (${res.status})`; $('msg').className = 'pk-msg err'; return; }
+        location.href = '/apps/packing/';
+      } finally { $('registerBtn').disabled = false; }
+    });
+    document.querySelectorAll('.btn-revoke').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (!confirm('この端末を失効させますか? (その端末は再登録が必要になります)')) return;
+        const res = await fetch(`/apps/packing/admin/devices/${btn.dataset.id}/revoke`, { method: 'POST' });
+        if (res.ok) location.reload();
+      });
+    });
+  </script>
+</body>
+</html>

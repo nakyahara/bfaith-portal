@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -116,6 +116,35 @@ const MIGRATIONS = {
     ]) {
       db.exec(`ALTER TABLE pk_pack_slips ADD COLUMN ${col}`);
     }
+  },
+  // v3: 運用基盤 (2026-08-16)。
+  //   - Drive自動取込の台帳 (picking pk_drive_imports と同設計。版=(file_id, modified_time))
+  //   - iPad の登録端末 (picking pk_devices と同設計。Cookie path が /apps/packing のため専用表)
+  3: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_drive_imports (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      drive_file_id TEXT NOT NULL,
+      modified_time TEXT NOT NULL,
+      filename      TEXT NOT NULL,
+      folder_name   TEXT,
+      status        TEXT NOT NULL CHECK(status IN ('imported','failed','skipped')),
+      error         TEXT,
+      batch_id      INTEGER REFERENCES pk_pack_batches(id),
+      attempts      INTEGER NOT NULL DEFAULT 1,
+      first_seen_at TEXT NOT NULL,
+      processed_at  TEXT NOT NULL,
+      UNIQUE (drive_file_id, modified_time)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_drive_imports_at ON pk_pack_drive_imports(processed_at)');
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_devices (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      token_hash   TEXT NOT NULL UNIQUE,
+      label        TEXT NOT NULL,
+      created_by   TEXT NOT NULL,
+      created_at   TEXT NOT NULL,
+      last_seen_at TEXT,
+      revoked_at   TEXT
+    )`);
   },
 };
 
@@ -275,4 +304,48 @@ export function listPackLinesBySlip(batchId) {
     map.get(l.slip_id).push(l);
   }
   return map;
+}
+
+// ─── 登録端末 (v3。picking pk_devices と同設計・packing 所有) ───
+
+import crypto from 'node:crypto';
+const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
+const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
+
+/** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
+export function createDevice(label, actor) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  getDB().prepare(`
+    INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at)
+    VALUES (?, ?, ?, ?)
+  `).run(hashToken(token), String(label).trim(), actor, utcNow());
+  return token;
+}
+
+/** トークン検証。有効なら端末行を返し last_seen_at を更新 (1時間に1回程度に間引く)。 */
+export function verifyDevice(token) {
+  if (!token) return null;
+  const db = getDB();
+  const row = db.prepare(
+    'SELECT * FROM pk_pack_devices WHERE token_hash = ? AND revoked_at IS NULL'
+  ).get(hashToken(token));
+  if (!row) return null;
+  const now = utcNow();
+  if (Date.parse(now) - Date.parse(row.created_at) > DEVICE_TTL_MS) return null;
+  if (!row.last_seen_at || Date.parse(now) - Date.parse(row.last_seen_at) > 3600_000) {
+    db.prepare('UPDATE pk_pack_devices SET last_seen_at = ? WHERE id = ?').run(now, row.id);
+  }
+  return row;
+}
+
+export function revokeDevice(id) {
+  return getDB().prepare(
+    'UPDATE pk_pack_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'
+  ).run(utcNow(), id).changes > 0;
+}
+
+export function listDevices() {
+  return getDB().prepare(
+    'SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM pk_pack_devices ORDER BY id'
+  ).all();
 }
