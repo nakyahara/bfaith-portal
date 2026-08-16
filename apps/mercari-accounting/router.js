@@ -639,6 +639,13 @@ function renderPage() {
         <div id="mfTable"></div>
       </div>
 
+      <!-- MF振替伝票入力用 仕訳 -->
+      <div class="card">
+        <h2>MF振替伝票入力用 仕訳</h2>
+        <p class="meta">MFクラウド会計の「振替伝票入力」（仕訳辞書: メルカリ）にそのまま転記できる形式です。取引日は集計月の月末日を入力してください。金額0の行はMF側での入力不要です。販売手数料・メルカリ便送料はCSVから自動反映されます。</p>
+        <div id="mfJournalTable"><span class="meta">CSVをアップロードすると表示されます</span></div>
+      </div>
+
       <div class="card">
         <h2>プラットフォーム費用（CSVから自動集計）</h2>
         <p class="meta">売上レポートCSVから自動計算されます。</p>
@@ -831,6 +838,7 @@ function renderPage() {
 
       renderTaxTable(data);
       renderMfTable(data);
+      renderMfJournal(data);
       renderPlatformCost(data);
       renderSegmentTable(data);
 
@@ -919,6 +927,73 @@ function renderPage() {
       html += '<td class="num" style="font-weight:bold">' + fmt(cp) + '</td>';
       html += '<td class="num" style="font-weight:bold">' + fmt(pf + ship + cp) + '</td></tr></table>';
       document.getElementById('platformCostTable').innerHTML = html;
+    }
+
+    // MF振替伝票用の仕訳行を組み立てる。
+    // 対応関係（会計処理の実務ルール）:
+    //   貸方 売上高/課売10%    = 商品売上(10%)（クーポン値引後・税込。税率未登録分もここに含め警告表示）
+    //   貸方 売上高/課売(軽)8% = 商品売上(8%)（クーポン値引後・税込）
+    //   借方 支払手数料【原価】/課仕10% = 販売手数料（CSVから自動集計）
+    //   借方 発送運賃【原価】/課仕10%   = メルカリ便送料・梱包手数料（CSVから自動集計）
+    //   借方 売掛金_EC売上/対象外      = 差し引き入金額（売上 − 販売手数料 − 送料）
+    function buildMfJournalRows(s10, s8, sOther, pf, ship) {
+      return [
+        { dc: 'credit', account: '売上高', sub: 'メルカリ', tax: '課売10%', amount: s10 + sOther, memo: 'メルカリ 売上(クーポン値引き後)' },
+        { dc: 'credit', account: '売上高', sub: 'メルカリ', tax: '課売(軽)8%', amount: s8, memo: 'メルカリ 売上(クーポン値引き後) 軽減8%' },
+        { dc: 'debit', account: '支払手数料【原価】', sub: 'メルカリ', tax: '課仕10%', amount: pf, memo: 'メルカリ 販売手数料' },
+        { dc: 'debit', account: '発送運賃【原価】', sub: 'メルカリ', tax: '課仕10%', amount: ship, memo: 'メルカリ便 送料・梱包手数料' },
+        { dc: 'debit', account: '売掛金_EC売上', sub: 'メルカリ', tax: '対象外', amount: s10 + sOther + s8 - pf - ship, memo: 'メルカリ 差し引き入金額' },
+      ];
+    }
+
+    function mfJournalTableHtml(rows) {
+      let debitTotal = 0, creditTotal = 0;
+      rows.forEach(r => { if (r.dc === 'debit') debitTotal += r.amount; else creditTotal += r.amount; });
+
+      let html = '<table><tr>';
+      html += '<th colspan="3" style="text-align:center">借方</th><th colspan="3" style="text-align:center">貸方</th><th>摘要</th></tr>';
+      html += '<tr><th>勘定科目</th><th>税区分</th><th>金額</th><th>勘定科目</th><th>税区分</th><th>金額</th><th></th></tr>';
+      for (const r of rows) {
+        const acctCell = '<td style="text-align:left">' + r.account + '<br><span class="meta">' + r.sub + '</span></td>';
+        const taxCell = '<td>' + r.tax + '</td>';
+        const amtCell = '<td class="num">' + fmt(r.amount) + '</td>';
+        const blank = '<td></td><td></td><td></td>';
+        html += '<tr>';
+        html += r.dc === 'debit' ? (acctCell + taxCell + amtCell + blank) : (blank + acctCell + taxCell + amtCell);
+        html += '<td style="text-align:left">' + r.memo + '</td>';
+        html += '</tr>';
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333">';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(debitTotal) + '</td>';
+      html += '<td colspan="2">合計金額</td><td class="num">' + fmt(creditTotal) + '</td><td></td>';
+      html += '</tr></table>';
+
+      const diff = Math.round(debitTotal) - Math.round(creditTotal);
+      html += diff === 0
+        ? '<div class="ok" style="margin-top:8px">✅ 借方・貸方 合計一致（' + fmt(debitTotal) + '円）※売掛金_EC売上は差引で自動算出のため、計算上必ず一致します。売上・費用の各金額が集計表と合っているかを確認してください</div>'
+        : '<div class="err" style="margin-top:8px">❌ 借方・貸方が一致しません（差額: ' + fmt(diff) + '円）— 端数調整・按分ロジックを確認してください</div>';
+
+      if (rows.some(r => Math.round(r.amount) < 0)) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ マイナス金額の行があります（キャンセル超過月など）。MFに入力する際は、その行だけ借方/貸方を入れ替えて絶対値で入力してください。</div>';
+      }
+
+      return html;
+    }
+
+    // 現在の集計・履歴の両方から使う共通ヘルパー
+    function mfJournalHtmlFor(mf, pf, ship) {
+      const s10 = Math.round(mf['商品売上(10%)'] || 0);
+      const s8 = Math.round(mf['商品売上(8%)'] || 0);
+      const sOther = Math.round(mf['商品売上(その他)'] || 0);
+      let html = mfJournalTableHtml(buildMfJournalRows(s10, s8, sOther, Math.round(pf || 0), Math.round(ship || 0)));
+      if (sOther) {
+        html += '<div class="warn" style="margin-top:8px">⚠️ 税率未登録の売上 ' + sOther.toLocaleString() + '円 を課売10%の行に含めています。「未登録情報」で税率を登録して再集計してください。</div>';
+      }
+      return html;
+    }
+
+    function renderMfJournal(data) {
+      document.getElementById('mfJournalTable').innerHTML = mfJournalHtmlFor(data.mfRow || {}, data.platformFee, data.shippingFee);
     }
 
     function allocateByRatio(amount, salesByKey, targets) {
@@ -1135,6 +1210,13 @@ function renderPage() {
           const excl = row.excluded || {};
           for (const [ek, er] of Object.entries(excl)) {
             if ((er.行数||0) > 0) html += '<div class="excluded"><b>除外: ' + ek + ': 輸出</b>（' + er.行数 + '行） — 売上: ' + fmt(er.売上合計||0) + '</div>';
+          }
+
+          // MF振替伝票入力用 仕訳（税率別売上が保存されている月のみ。ヒストリカル投入分はmf_row空のため対象外）
+          const hmf = row.mf_row || {};
+          if (hmf['合計']) {
+            html += '<h3 style="font-size:13px;color:#555;margin:12px 0 4px">MF振替伝票入力用 仕訳</h3>';
+            html += mfJournalHtmlFor(hmf, pf, ship);
           }
 
           html += '</div>';
