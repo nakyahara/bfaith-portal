@@ -49,7 +49,9 @@
 
     .order-row { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 14px; color: #495057; margin-bottom: 10px; }
 
-    /* ── 明細 ── */
+    /* ── 明細 ──
+       アソート (複数明細) でもスクロールなしで全明細が見えるよう、明細数で密度を変える
+       (data-density: 1=単品 / 2=2〜3明細 / 3=4明細以上は横2列グリッド) */
     .line {
       display: flex; align-items: center; gap: 14px;
       border-top: 1px solid #dee2e6; padding: 10px 2px;
@@ -64,6 +66,26 @@
     .line .qty { flex: 0 0 auto; font-size: 46px; font-weight: 800; white-space: nowrap; }
     .line .qty small { font-size: 20px; font-weight: 700; }
     .line .qty.multi { color: #e8590c; }
+
+    .paper[data-density="2"] .line { padding: 6px 2px; gap: 10px; }
+    .paper[data-density="2"] .line .img { width: 96px; height: 96px; }
+    .paper[data-density="2"] .line .pname { font-size: 19px; }
+    .paper[data-density="2"] .line .qty { font-size: 38px; }
+    .paper[data-density="3"] .line { padding: 5px 2px; gap: 8px; }
+    .paper[data-density="3"] .line .img { width: 76px; height: 76px; }
+    .paper[data-density="3"] .line .pname { font-size: 17px; }
+    .paper[data-density="3"] .line .pmeta { font-size: 12px; margin-top: 1px; }
+    .paper[data-density="3"] .line .qty { font-size: 30px; }
+    .paper[data-density="3"] .line .qty small { font-size: 15px; }
+    @media (min-width: 760px) {
+      .paper[data-density="3"] .lines-wrap { display: grid; grid-template-columns: 1fr 1fr; column-gap: 22px; }
+    }
+    /* 複数明細のときは送り先・受注情報も圧縮して明細のスペースを確保 */
+    .paper:not([data-density="1"]) .recipient { padding: 5px 12px; margin-bottom: 6px; }
+    .paper:not([data-density="1"]) .recipient .name { font-size: 22px; }
+    .paper:not([data-density="1"]) .recipient .addr { font-size: 15px; }
+    .paper:not([data-density="1"]) .ship-row { margin-bottom: 5px; }
+    .paper:not([data-density="1"]) .order-row { margin-bottom: 5px; }
 
     /* ── 下部操作 ── */
     .controls { flex: 0 0 auto; display: flex; gap: 10px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); }
@@ -192,6 +214,8 @@
       $('doneTag').style.display = doneSet.has(s.seq) ? 'inline-block' : 'none';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
+      // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
+      $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
       const lines = s.lines.map((l) => `
         <div class="line">
           <div class="img" data-sku="${esc(l.sku)}" style="${l.imageUrl ? `background-image:url('${esc(l.imageUrl)}')` : ''}">${l.imageUrl ? '' : '📦'}</div>
@@ -217,7 +241,7 @@
           <span>注文日: ${esc(s.orderDate || '-')}</span>
           <span>明細 ${s.lines.length} 件</span>
         </div>
-        ${lines}`;
+        <div class="lines-wrap">${lines}</div>`;
       $('sheetArea').scrollTop = 0;
 
       // ボタン状態: 表示中が現在の対象なら「次へ=完了」、完了済み閲覧中なら「現在の伝票へ」
@@ -271,19 +295,23 @@
       speechSynthesis.speak(u);
     }
 
-    // 警告の読み上げ語。multi_qty は明細読み (「複数、N個」)・multi_box は箱数読みで
-    // 表現するため除外。未知の警告はバッジ表示名 (絵文字を除く) をそのまま読む
-    const WARN_SPEECH = { gift: 'ギフトあり', noshi: 'のしあり', comment: 'コメント確認', assort: 'アソート', expiry_lot: '期限ロットあり' };
+    // 警告の読み上げ語。multi_qty は明細読み (「複数、N個」)・multi_box は箱数読みで表現、
+    // assort は種類数つきで冒頭に読むため個別処理。未知の警告はバッジ表示名 (絵文字を除く) を読む
+    const WARN_SPEECH = { gift: 'ギフトあり', noshi: 'のしあり', comment: 'コメント確認', expiry_lot: '期限ロットあり' };
     function speakSlip(s) {
       const parts = [];
+      if ((s.warns || []).includes('assort')) parts.push(`アソート、${s.lines.length}種類`);
       for (const w of (s.warns || [])) {
-        if (w === 'multi_qty' || w === 'multi_box') continue;
+        if (w === 'multi_qty' || w === 'multi_box' || w === 'assort') continue;
         parts.push(WARN_SPEECH[w] || String(WARN_LABELS[w] || w).replace(/^[^ぁ-ヿ一-龯A-Za-z0-9]+/, ''));
       }
       if (s.boxCount > 1) parts.push(`複数箱、${s.boxCount}箱`);
+      // ⚠送り状備考1は「伝票単位」の欄 (全明細で同じ値=全商品の連結文字列)。
+      // 複数明細の伝票でこれを明細ごとに読むと、全商品リストを明細の数だけ繰り返してしまう
+      // (実機フィードバック 2026-08-16)。短縮名を使うのは単一明細の伝票のみ
+      const useShort = s.lines.length === 1;
       for (const l of s.lines) {
-        // 第一候補=送り状備考1の短縮名。無い商品のみ商品名の先頭25文字で代用 (全文は読まない — 要件§5.3)
-        const nm = normalizeSpeech(l.shortName) || [...normalizeSpeech(l.name)].slice(0, 25).join('');
+        const nm = (useShort && normalizeSpeech(l.shortName)) || [...normalizeSpeech(l.name)].slice(0, 25).join('');
         parts.push(l.qty >= 2 ? `${nm}、複数、${l.qty}個` : `${nm}、1個`);
       }
       speak(parts.join('。'));
