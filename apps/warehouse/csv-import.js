@@ -205,7 +205,11 @@ function importLogizard(filePath) {
   const db = getDB();
   const col = (name) => headers.indexOf(name);
 
-  db.exec('DELETE FROM raw_lz_inventory');
+  // 欠品通知が毎時取込中に読んでも空テーブルを見ないよう、DELETEも同一トランザクションに含める
+  const minRows = parseInt(process.env.LZ_IMPORT_MIN_ROWS || '1000', 10);
+  if (rows.length < minRows) {
+    throw new Error(`ロジザード在庫CSVの行数が少なすぎます (${rows.length}行 < 下限${minRows}行)。既存データを温存しました (意図的なら LZ_IMPORT_MIN_ROWS で下限を下げてください)`);
+  }
   const stmt = db.prepare(`
     INSERT INTO raw_lz_inventory (
       商品ID, 商品名, バーコード, ブロック略称, ロケ,
@@ -216,6 +220,7 @@ function importLogizard(filePath) {
   `);
 
   const tx = db.transaction(() => {
+    db.exec('DELETE FROM raw_lz_inventory');
     let count = 0;
     for (const row of rows) {
       const productId = (row[col('商品ID')]?.trim() || '').toLowerCase();

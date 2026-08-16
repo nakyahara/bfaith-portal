@@ -723,13 +723,63 @@ export async function syncPmlSnapshotOnly() {
   return { state: 'sent', run_id: pmeta.run_id, count: rows.length, fba_source_kind: pmeta.fba_source_kind, fba_fetched_at: pmeta.fba_fetched_at };
 }
 
+// ─── ロジザード在庫スナップショットの単発同期 (毎時ランナー scripts/logizard-stock/run-hourly.ps1 から) ───
+// raw_lz_inventory (在庫CSV毎時取込の洗い替え表) を mirror_logizard_stock へ全置換 push する。
+// 鮮度ガード: 取込 (sync_meta.logizard_last_import) が90分より古いときは送らない
+// (古いスナップショットを再送して synced_at だけ新しく見せない — isShipmentsRebuildFresh と同じ思想の毎時版)
+const LOGIZARD_SYNC_MAX_AGE_MIN = 90;
+
+export async function syncLogizardStockOnly() {
+  requireSyncKey();
+  const db = getDB();
+  const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+  if (!importedAt) return { state: 'skipped', reason: 'logizard未取込 (sync_meta無し)' };
+  const ageMin = (Date.now() - Date.parse(importedAt)) / 60000;
+  if (!Number.isFinite(ageMin) || ageMin > LOGIZARD_SYNC_MAX_AGE_MIN) {
+    return { state: 'skipped', reason: `取込が古い (${Math.round(ageMin)}分前 > ${LOGIZARD_SYNC_MAX_AGE_MIN}分)` };
+  }
+  const rows = db.prepare(`
+    SELECT 商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
+           在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日
+    FROM raw_lz_inventory ORDER BY 商品ID, ブロック略称, ロケ
+  `).all();
+  // 0件は送らない (mirror温存。全置換 payload の空配列は受信側も 400 で拒否する)
+  if (rows.length === 0) return { state: 'skipped', reason: '0件 (mirror温存)' };
+
+  const headers = { 'Content-Type': 'application/json' };
+  if (SYNC_KEY) headers['x-sync-key'] = SYNC_KEY;
+  console.log(`[logizard-only-sync] 送信: rows=${rows.length} captured=${importedAt}`);
+  const resp = await fetch(`${RENDER_URL}/api/sync`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ logizard_stock: { captured_at: importedAt, rows } }),
+    signal: AbortSignal.timeout(120000),
+  });
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => '');
+    throw new Error(`logizard-only sync: HTTP ${resp.status} ${err.slice(0, 200)}`);
+  }
+  await resp.json().catch(() => ({}));
+
+  // 検証: mirror の件数 + captured_at が一致 (fail-closed)
+  const statusRes = await fetch(`${RENDER_URL}/api/status`, { headers, signal: AbortSignal.timeout(30000) });
+  const status = await statusRes.json();
+  if ((status.logizard_stock_count ?? 0) !== rows.length || status.logizard_stock_captured_at !== importedAt) {
+    throw new Error(`logizard-only sync 検証失敗: mirror ${status.logizard_stock_count}件@${status.logizard_stock_captured_at} / sent ${rows.length}件@${importedAt}`);
+  }
+  console.log(`[logizard-only-sync] ✅ 検証OK rows=${rows.length}`);
+  return { state: 'sent', count: rows.length, captured_at: importedAt };
+}
+
 // 単体実行
 import { initDB } from './db.js';
 const isMain = process.argv[1]?.includes('sync-to-render');
 if (isMain) {
   await initDB();
   const pmlOnly = process.argv.includes('--pml-only');
-  const result = pmlOnly ? await syncPmlSnapshotOnly() : await syncToRender();
+  const logizardOnly = process.argv.includes('--logizard-only');
+  const result = pmlOnly ? await syncPmlSnapshotOnly()
+    : logizardOnly ? await syncLogizardStockOnly()
+    : await syncToRender();
   console.log('\n結果:', JSON.stringify(result, null, 2));
   // 通信 (mirror POST / GChat通知) 直後の process.exit() は Windows node で libuv assertion
   // (UV_HANDLE_CLOSING / abort) を踏み、成功しているのに失敗扱いになる → exitCode + 自然終了 (#614 と同根)

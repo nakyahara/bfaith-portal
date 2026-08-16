@@ -60,12 +60,14 @@ import rakutenRmsServiceRouter from './rakuten-rms-service.js';
 import rankcheckServiceRouter from './rankcheck-service.js';
 import crossSellServiceRouter from './cross-sell-service.js';
 import selectSetServiceRouter from './select-set-service.js';
+import logizardStockServiceRouter from './logizard-stock-service.js';
 router.use('/fba', fbaServiceRouter);
 router.use('/research', researchServiceRouter);
 router.use('/rakuten-rms', rakutenRmsServiceRouter);
 router.use('/rankcheck', rankcheckServiceRouter);
 router.use('/cross-sell', crossSellServiceRouter);
 router.use('/select-set', selectSetServiceRouter);
+router.use('/logizard-stock', logizardStockServiceRouter);
 
 // --- エラーハンドラー（最後） ---
 router.use(serviceErrorHandler);

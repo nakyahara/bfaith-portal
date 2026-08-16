@@ -155,6 +155,21 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'C:\\tools\\logizard-automation のログ確認',
   },
+  {
+    id: 'logizard-stock-hourly',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'ロジザード在庫スナップショットの毎時取込 (欠品LINE通知の他ロケ在庫表示 + Render mirror_logizard_stock)',
+    where: 'miniPC TaskScheduler [LogizardZaikoHourly]',
+    schedule: '毎日 09:00-18:00 の毎時00分 (10回。どれか1回の成功で当日ok。日中の停止は欠品通知の「HH:MM時点」表示でも見える)',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 0,
+    grace_hours: 3,
+    partial_max_days: 2,   // 取込ok・mirror push失敗が続いたら stalled (ローカルの欠品通知は生きている)
+    lifecycle: 'permanent',
+    runbook: 'C:\\Users\\bfaith\\bfaith-portal\\logs\\logizard-stock-hourly.log と C:\\tools\\logizard-automation\\logs を確認。手動再実行: powershell -File C:\\Users\\bfaith\\bfaith-portal\\scripts\\logizard-stock\\run-hourly.ps1',
+  },
   // logizard-kinkyu-hokyu (miniPC 毎日08:50 の緊急在庫補充) は 2026-08-09 に台帳から撤去。
   //   miniPCのTaskScheduler [Logizard-KinkyuHokyu] は同日 /DISABLE 済み (削除はしていない)。
   //   運用は会社PCのStream Deck「朝一緊急補充」手動実行に移行 (紙印刷廃止→P-touchシールCSV+PDFを
