@@ -500,12 +500,14 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
 //     完了取消は理由つき別操作として PR3 で追加する)
 //   - 冪等: op_id (端末生成 ms+乱数)。同一 op_id の再送は保存済み結果を返す (picking と同思想)
 
-const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump'];
+const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump', 'ship_change'];
 
 // 中断理由 (picking と同じ最小セット)
 export const PAUSE_REASONS = ['休憩', '他作業への応援', 'その他'];
 // 完了取消の理由 (監査ログ必須 — 要件§5.1)
 export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
+// ④ 配送方法変更の理由 (要件§5.7)
+export const SHIP_CHANGE_REASONS = ['入らない', '資材が違う', 'その他'];
 
 /** 端末の発生時刻を「now以前・24時間以内」にクランプ (中断時間の計測用。picking と同じ)。 */
 function clampedEventTime(clientAt, now) {
@@ -567,6 +569,7 @@ function eventResult(batchId) {
     // ズレ回復ジャンプ (順序外の完了) があると「currentSeqより前=完了」が成り立たないため、
     // 完了済みseqの一覧を明示的に返す (画面はこれで doneSet を再構築する)
     doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
+    heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
     // 完了取消の対象 = 最後に完了した伝票 (完了順の正はイベント履歴 — done_at は秒精度)
     lastDoneSeq: lastDoneSeqOf(batchId),
     worker: s.batch.worker,
@@ -579,7 +582,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -595,7 +598,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       const pp = prev.payload_json ? JSON.parse(prev.payload_json) : {};
       if (prev.batch_id === batchId && prev.worker === worker
           && prev.event === event && (prev.slip_seq ?? null) === (slipSeq ?? null)
-          && (pp.reason ?? null) === (reason ?? null) && !!pp.jumped === !!jumped) {
+          && (pp.reason ?? null) === (reason ?? null) && !!pp.jumped === !!jumped
+          && (pp.proposedMethod ?? null) === (proposedMethod ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
       throw new PackError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
@@ -679,6 +683,42 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
       requireOwner();
+    } else if (event === 'ship_change') {
+      // ④ 配送方法変更 (要件§5.7 最小構成): 伝票を保留 (held) にし、事務の対応キューへ積む。
+      // 通知 (GChat) は router 側が fail-soft で送る — DBの行が正本 (webhook成功を受付成功とみなさない)
+      if (batch.status !== 'packing') {
+        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
+      }
+      requireOwner();
+      const proposed = String(proposedMethod || '').trim();
+      if (!proposed || proposed.length > 60) {
+        throw new PackError(400, 'bad_method', '提案する配送方法を選択してください');
+      }
+      if (!SHIP_CHANGE_REASONS.includes(reason)) {
+        throw new PackError(400, 'bad_reason', '理由を選択してください');
+      }
+      const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
+      if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
+      if (slip.status !== 'pending') {
+        throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は処理済みです (${slip.status})`);
+      }
+      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='shipping_change' WHERE id=?`).run(slip.id);
+      db.prepare(`
+        INSERT INTO pk_pack_ship_changes
+          (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,
+           reason, requested_by, status, updated_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
+      `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
+        proposed, reason, worker, now, now);
+      // 次に表示する伝票 (slip_opened)
+      const nx = db.prepare(
+        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending' AND seq > ?"
+      ).get(batchId, slipSeq).s
+        ?? db.prepare("SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'").get(batchId).s;
+      if (nx != null) {
+        db.prepare('UPDATE pk_pack_slips SET shown_at = COALESCE(shown_at, ?) WHERE batch_id=? AND seq=?')
+          .run(now, batchId, nx);
+      }
     } else if (event === 'start') {
       if (batch.status === 'packing') {
         if (batch.worker !== worker) {
@@ -737,8 +777,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         db.prepare('UPDATE pk_pack_slips SET shown_at = ? WHERE batch_id=? AND seq=?')
           .run(now, batchId, nextSeq);
       } else {
-        db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
-          .run(now, now, batchId);
+        // バッチ完了条件: 未処理ゼロ + 保留 (配送変更待ち等) ゼロ (要件§5.11 完了ガード)
+        const held = db.prepare(
+          "SELECT COUNT(*) c FROM pk_pack_slips WHERE batch_id=? AND status='held'"
+        ).get(batchId).c;
+        if (held === 0) {
+          db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
+            .run(now, now, batchId);
+        }
       }
     }
 
@@ -746,8 +792,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // eventResult はこのイベント行の INSERT より前に走るため、lastDoneSeq (イベント履歴由来) に
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
-    const payload = (clientAt || reason || jumped)
-      ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined }) : null;
+    const payload = (clientAt || reason || jumped || proposedMethod)
+      ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined }) : null;
     db.prepare(`
       INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -831,4 +877,47 @@ export function getDailySummary(workDate) {
     workDate, total, workers, slipStats, opCounts,
     batches: batches.map((b) => ({ ...b, activeSec: activeSec(b) })),
   };
+}
+
+// ═══ ④ 配送方法変更の事務対応 (管理画面) ═══════════════════════════════
+
+export function listShipChanges(limit = 100) {
+  return getDB().prepare(`
+    SELECT c.*, b.folder_name AS batch_folder FROM pk_pack_ship_changes c
+    JOIN pk_pack_batches b ON b.id = c.batch_id
+    ORDER BY CASE c.status WHEN 'requested' THEN 0 WHEN 'accepted' THEN 1 ELSE 2 END, c.id DESC
+    LIMIT ?
+  `).all(limit);
+}
+
+const SHIP_CHANGE_TRANSITIONS = {
+  requested: ['accepted', 'rejected', 'completed'],
+  accepted: ['completed', 'rejected'],
+  rejected: [],
+  completed: [],
+};
+
+/**
+ * 事務側の状態遷移。completed (NE・ロジザード変更+送り状再発行済み) / rejected で
+ * 対象伝票の保留を解除して pending に戻す (梱包者は完了ガードで必ず戻ってくる)。
+ */
+export function setShipChangeStatus(id, status, actor) {
+  const db = getDB();
+  const now = utcNow();
+  return db.transaction(() => {
+    const row = db.prepare('SELECT * FROM pk_pack_ship_changes WHERE id = ?').get(id);
+    if (!row) throw new PackError(404, 'not_found', '申請が見つかりません');
+    if (!(SHIP_CHANGE_TRANSITIONS[row.status] || []).includes(status)) {
+      throw new PackError(409, 'bad_transition', `${row.status} から ${status} へは変更できません`);
+    }
+    db.prepare('UPDATE pk_pack_ship_changes SET status=?, office_by=?, updated_at=? WHERE id=?')
+      .run(status, actor, now, id);
+    if (status === 'completed' || status === 'rejected') {
+      db.prepare(`
+        UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+        WHERE batch_id=? AND seq=? AND status='held'
+      `).run(row.batch_id, row.slip_seq);
+    }
+    return { ...row, status };
+  })();
 }

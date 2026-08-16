@@ -156,6 +156,7 @@
   </div>
 
   <div class="controls">
+    <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:104px">配送⚠</button>
     <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
   </div>
@@ -206,6 +207,25 @@
     </div>
   </div>
 
+  <div class="overlay" id="shipOverlay">
+    <div class="box">
+      <h2>配送方法の変更依頼</h2>
+      <div id="shipStep1">
+        <div style="color:#868e96; font-size:15px; margin-bottom:10px">この伝票を保留して事務へ変更を依頼します。どの配送方法にしますか?</div>
+        <div class="reason-grid" id="shipMethods"></div>
+      </div>
+      <div id="shipStep2" style="display:none">
+        <div style="color:#868e96; font-size:15px; margin-bottom:10px">理由は?</div>
+        <div class="reason-grid">
+          <% for (const r of shipChangeReasons) { %>
+            <button class="reason-opt ship-reason" data-reason="<%= r %>"><%= r %></button>
+          <% } %>
+        </div>
+      </div>
+      <button class="sheet-cancel" id="shipCancel" type="button">やめる</button>
+    </div>
+  </div>
+
   <div class="overlay" id="searchOverlay">
     <div class="box">
       <h2>伝票を探す (ズレ回復)</h2>
@@ -233,6 +253,9 @@
       folderName: state.batch.folder_name || '',
       pauseReason: state.batch.pause_reason || null,
       currentSeq: state.currentSeq,
+      heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+      methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
+      shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
         .sort((a, b) => (a.done_at || '').localeCompare(b.done_at || '') || a.seq - b.seq)
         .at(-1)?.seq ?? null,
@@ -260,6 +283,7 @@
     let viewSeq = null;                 // 表示中の伝票 seq
     const bySeq = new Map(STATE.slips.map((s) => [s.seq, s]));
     const doneSet = new Set(STATE.slips.filter((s) => s.status === 'done').map((s) => s.seq));
+    const heldSet = new Set(STATE.heldSeqs || []);
     let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
     let jumpMode = false;               // 検索ジャンプで順序から外れた伝票を表示中
     let paused = STATE.batchStatus === 'paused';
@@ -267,12 +291,12 @@
 
     // 最小の未処理 seq (クライアント側の楽観計算。ズレ回復で順序外完了があっても正しい)
     function minPending() {
-      for (const s of STATE.slips) if (!doneSet.has(s.seq)) return s.seq;
+      for (const s of STATE.slips) if (!doneSet.has(s.seq) && !heldSet.has(s.seq)) return s.seq;
       return null;
     }
     // 指定 seq の次に表示すべき未処理 (無ければ先頭の未処理へ戻る = 飛ばした伝票の回収)
     function nextPendingAfter(seq) {
-      for (const s of STATE.slips) if (s.seq > seq && !doneSet.has(s.seq)) return s.seq;
+      for (const s of STATE.slips) if (s.seq > seq && !doneSet.has(s.seq) && !heldSet.has(s.seq)) return s.seq;
       return minPending();
     }
 
@@ -291,6 +315,8 @@
       $('slipNo').textContent = s.neSlipNo;
       $('mall').textContent = s.mall || '';
       $('doneTag').style.display = doneSet.has(s.seq) ? 'inline-block' : 'none';
+      $('doneTag').textContent = heldSet.has(s.seq) ? '⏳ 保留中 (配送変更待ち)' : '✔ 完了済み';
+      if (heldSet.has(s.seq)) $('doneTag').style.display = 'inline-block';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
@@ -325,7 +351,8 @@
 
       // ボタン状態: 未処理伝票を表示中なら「次へ=完了」(順序どおり or ズレ回復モード)。
       // 完了済みの閲覧中は「現在の伝票へ」+ 完了取消リンク (最後に完了した伝票のみ)
-      const viewingPending = !doneSet.has(viewSeq);
+      const viewingHeld = heldSet.has(viewSeq);
+      const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
       if (currentSeq == null) {
         $('nextBtn').textContent = '全伝票 完了';
         $('nextBtn').disabled = true;
@@ -507,6 +534,10 @@
         doneSet.clear();
         for (const q of body.doneSeqs) doneSet.add(q);
       }
+      if (Array.isArray(body.heldSeqs)) {
+        heldSet.clear();
+        for (const q of body.heldSeqs) heldSet.add(q);
+      }
       if (body.lastDoneSeq !== undefined) lastDoneSeq = body.lastDoneSeq;
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
       paused = body.batchStatus === 'paused';
@@ -531,7 +562,8 @@
     // ── 操作 ──
     function goNext() {
       if (currentSeq == null || paused) return;
-      const viewingPending = !doneSet.has(viewSeq);
+      const viewingHeld = heldSet.has(viewSeq);
+      const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
       const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
       if (!canComplete) {
         viewSeq = currentSeq;   // 閲覧から現在の伝票へジャンプ
@@ -615,6 +647,47 @@
       });
     });
 
+    // ── ④ 配送方法変更 (伝票を保留して事務へ依頼) ──
+    let shipProposed = null;
+    $('shipBtn').addEventListener('click', () => {
+      if (paused || !worker) return;
+      if (doneSet.has(viewSeq) || heldSet.has(viewSeq)) { showToast('未処理の伝票でのみ使えます'); return; }
+      shipProposed = null;
+      const cur = bySeq.get(viewSeq);
+      $('shipMethods').innerHTML = (STATE.methodOptions || [])
+        .filter((m) => m !== cur.deliveryMethod)
+        .map((m) => `<button class="reason-opt ship-method" data-m="${esc(m)}">${esc(m)}</button>`).join('')
+        || '<div style="grid-column:1/-1; color:#868e96">候補がありません</div>';
+      $('shipStep1').style.display = 'block';
+      $('shipStep2').style.display = 'none';
+      $('shipOverlay').style.display = 'flex';
+      document.querySelectorAll('.ship-method').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          shipProposed = btn.dataset.m;
+          $('shipStep1').style.display = 'none';
+          $('shipStep2').style.display = 'block';
+        });
+      });
+    });
+    $('shipCancel').addEventListener('click', () => { $('shipOverlay').style.display = 'none'; });
+    document.querySelectorAll('.ship-reason').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        $('shipOverlay').style.display = 'none';
+        if (!shipProposed) return;
+        const seq = viewSeq;
+        enqueue('ship_change', seq, { proposed_method: shipProposed, reason: btn.dataset.reason });
+        heldSet.add(seq);
+        showToast(`伝票 ${bySeq.get(seq).neSlipNo} を保留し、事務へ依頼しました`);
+        currentSeq = minPending();
+        const next = nextPendingAfter(seq);
+        if (next != null) { viewSeq = next; render(); }
+        else {
+          render();
+          showToast('未処理の伝票がありません (保留の対応待ち)');
+        }
+      });
+    });
+
     // ── 伝票検索 (ズレ回復) ──
     function renderSlipList(filter) {
       const f = String(filter || '').trim();
@@ -624,7 +697,7 @@
         .map((s) => `<div class="slip-row" data-seq="${s.seq}">
             <span class="no">${esc(s.neSlipNo)}</span>
             <span>#${s.seq}</span>
-            <span class="st-mini ${doneSet.has(s.seq) ? 'done' : ''}">${doneSet.has(s.seq) ? '完了' : '未'}</span>
+            <span class="st-mini ${doneSet.has(s.seq) ? 'done' : ''}">${doneSet.has(s.seq) ? '完了' : heldSet.has(s.seq) ? '保留' : '未'}</span>
             <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${esc((s.lines[0] || {}).name || '')}</span>
           </div>`).join('');
       $('slipList').innerHTML = rows || '<div style="color:#868e96; padding:20px">該当なし</div>';

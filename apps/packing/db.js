@@ -148,6 +148,25 @@ const MIGRATIONS = {
       last_seen_at TEXT,
       revoked_at   TEXT
     )`);
+    // ④ 配送方法変更 (要件§5.7 最小構成): 梱包者の提案 → 事務の対応状態を持つ。
+    // 対象伝票は held (hold_reason='shipping_change') になり、completed/rejected で pending に戻る
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_ship_changes (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id        INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq        INTEGER NOT NULL,
+      ne_slip_no      TEXT NOT NULL,
+      folder_name     TEXT,
+      current_method  TEXT,
+      proposed_method TEXT NOT NULL,
+      reason          TEXT NOT NULL,
+      requested_by    TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'requested'
+        CHECK(status IN ('requested','accepted','rejected','completed')),
+      office_by       TEXT,
+      updated_at      TEXT NOT NULL,
+      created_at      TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_ship_changes ON pk_pack_ship_changes(status, id)');
   },
 };
 

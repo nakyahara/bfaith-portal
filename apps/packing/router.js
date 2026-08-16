@@ -26,8 +26,10 @@ import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
-  PAUSE_REASONS, UNDO_REASONS, lastDoneSeqOf, getDailySummary,
+  PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, lastDoneSeqOf, getDailySummary,
+  listShipChanges, setShipChangeStatus,
 } from './service.js';
+import { notifyShipChange } from './notify.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -211,6 +213,11 @@ router.get('/work/:id(\\d+)', (req, res) => {
     warnLabels: WARN_LABELS,
     pauseReasons: PAUSE_REASONS,
     undoReasons: UNDO_REASONS,
+    shipChangeReasons: SHIP_CHANGE_REASONS,
+    // 提案候補 = 実在する配送方法 (最近の伝票からdistinct)。判定サービス委譲 (packing-dispatch) はPhase 3
+    methodOptions: getDB().prepare(
+      "SELECT DISTINCT delivery_method m FROM pk_pack_slips WHERE delivery_method IS NOT NULL ORDER BY m LIMIT 30"
+    ).all().map((r) => r.m),
   });
 });
 
@@ -239,8 +246,43 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     clientAt: req.body.client_at || null,
     reason: req.body.reason || null,
     jumped: !!req.body.jumped,
+    proposedMethod: req.body.proposed_method || null,
   }, worker);
+  // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)
+  if (req.body.event === 'ship_change' && !result.replayed) {
+    const row = getDB().prepare(
+      'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
+    ).get(Number(req.params.id), Number(req.body.slip_seq));
+    if (row) {
+      notifyShipChange({
+        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+        currentMethod: row.current_method, proposedMethod: row.proposed_method,
+        reason: row.reason, worker,
+      }).catch((e) => console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`));
+    }
+  }
   res.json({ ok: true, ...result });
+}));
+
+// ─── ④ 配送方法変更の事務対応キュー (管理者) ───
+
+router.get('/admin/ship-changes', requireAdmin, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_ship_changes'), {
+    title: '配送方法変更 | 梱包支援',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    changes: listShipChanges(),
+  });
+});
+
+router.post('/admin/ship-changes/:id(\d+)/status', checkOrigin, requireAdmin, api(async (req, res) => {
+  const status = String(req.body.status || '');
+  if (!['accepted', 'rejected', 'completed'].includes(status)) {
+    throw new PackError(400, 'bad_status', 'status が不正です');
+  }
+  const row = setShipChangeStatus(Number(req.params.id), status, req.session.email);
+  res.json({ ok: true, id: row.id, status });
 }));
 
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */

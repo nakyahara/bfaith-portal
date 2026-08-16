@@ -642,6 +642,51 @@ await (async () => {
   passed++; console.log('  ok: ポーラー: mismatchは取り込まずskipped=承認待ち (async)');
 })();
 
+// ─── ④ 配送方法変更 (保留→事務対応→解除) ───
+
+t('ship_change: 伝票がheldになり、保留が残る間はバッチが完了しない', () => {
+  const sp = parseCs03003(makeCsv([
+    row({ slip: '0120', lineNo: 1, sku: 's1', tb: 'TB00000000001' }),
+    row({ slip: '0121', lineNo: 1, sku: 's2', tb: 'TB00000000001' }),
+  ]));
+  const sr = importPackBatch(sp, { matchAck: true }, 'test');
+  applyEvent(sr.batchId, { opId: 's-s1', event: 'start' }, '星');
+  const r1 = applyEvent(sr.batchId, {
+    opId: 's-c1', event: 'ship_change', slipSeq: 1,
+    proposedMethod: '60サイズ', reason: '入らない',
+  }, '星');
+  assert.deepEqual(r1.heldSeqs, [1]);
+  assert.equal(r1.currentSeq, 2);
+  const chg = getDB().prepare('SELECT * FROM pk_pack_ship_changes ORDER BY id DESC LIMIT 1').get();
+  assert.equal(chg.status, 'requested');
+  assert.equal(chg.proposed_method, '60サイズ');
+  // 残り (seq2) を完了しても、保留が残る間はバッチ done にならない (完了ガード)
+  const r2 = applyEvent(sr.batchId, { opId: 's-n1', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(r2.batchStatus, 'packing');
+  assert.equal(r2.currentSeq, null);
+  // 事務が completed → 伝票が pending に戻り、完了できる
+  const { setShipChangeStatus } = svc;
+  setShipChangeStatus(chg.id, 'completed', 'office@test');
+  const r3 = applyEvent(sr.batchId, { opId: 's-n2', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(r3.batchStatus, 'done');
+});
+
+t('ship_change: 理由・提案は必須。処理済み伝票は保留にできない', () => {
+  const sp = parseCs03003(makeCsv([row({ slip: '0130', sku: 'q1', tb: 'TB00000000002' })]));
+  const sr = importPackBatch(sp, { matchAck: true }, 'test');
+  applyEvent(sr.batchId, { opId: 'q-s1', event: 'start' }, '星');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c1', event: 'ship_change', slipSeq: 1, reason: '入らない' }, '星'), 'bad_method');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c2', event: 'ship_change', slipSeq: 1, proposedMethod: 'x' }, '星'), 'bad_reason');
+  applyEvent(sr.batchId, { opId: 'q-n1', event: 'next', slipSeq: 1 }, '星');
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c3', event: 'ship_change', slipSeq: 1, proposedMethod: 'x', reason: '入らない' }, '星'), 'not_packing');
+});
+
+t('setShipChangeStatus: 不正な遷移は拒否される', () => {
+  const { setShipChangeStatus } = svc;
+  const chg = getDB().prepare("SELECT * FROM pk_pack_ship_changes WHERE status='completed' ORDER BY id DESC LIMIT 1").get();
+  expectPackError(() => setShipChangeStatus(chg.id, 'accepted', 'x'), 'bad_transition');
+});
+
 // ─── 日次サマリ ───
 
 t('getDailySummary: 実働・秒/伝票・例外操作カウントが集計される', () => {
