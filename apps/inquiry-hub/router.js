@@ -431,11 +431,15 @@ router.get('/inquiries/:id', (req, res) => {
   const neOrderUrl = neOrderNo
     ? `https://main.next-engine.com/Userjyuchu/jyuchuInp?kensaku_denpyo_no=${encodeURIComponent(neOrderNo)}&jyuchu_meisai_order=jyuchu_meisai_gyo`
     : null;
-  // モール側の注文詳細。楽天=RMS個別受注画面。
-  // ⚠️Yahoo!ストアクリエイターの注文詳細URLは形式未確認のため未対応 (実URLが確認でき次第ここに追加)
-  const mallOrderUrl = inq.channel_type === 'rakuten' && inq.order_number
-    ? `https://order-rp.rms.rakuten.co.jp/order-rb/individual-order-detail/init?orderNumber=${encodeURIComponent(String(inq.order_number).trim())}`
-    : null;
+  // モール側の注文詳細。楽天=RMS個別受注画面、Yahoo!=ストアクリエイターProの注文詳細
+  // (Yahoo!のURL形式は中原さん実証 2026-08-16: pro.store.yahoo.co.jp/pro.{アカウント}/order/manage/detail/{注文番号})
+  const mallOrderNo = String(inq.order_number || '').trim();
+  const mallOrderUrl = !mallOrderNo ? null
+    : inq.channel_type === 'rakuten'
+      ? `https://order-rp.rms.rakuten.co.jp/order-rb/individual-order-detail/init?orderNumber=${encodeURIComponent(mallOrderNo)}`
+      : inq.channel_type === 'yahoo' && inq.account_identifier
+        ? `https://pro.store.yahoo.co.jp/pro.${encodeURIComponent(String(inq.account_identifier).trim())}/order/manage/detail/${encodeURIComponent(mallOrderNo)}`
+        : null;
 
   // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder/group) で隣へ移動。
   // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
