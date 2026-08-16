@@ -229,8 +229,8 @@
 
   <div class="overlay" id="searchOverlay">
     <div class="box">
-      <h2>伝票を探す (ズレ回復)</h2>
-      <input class="search-input" id="searchInput" inputmode="numeric" placeholder="伝票番号の下数桁 (例: 7800)">
+      <h2>伝票を探す</h2>
+      <input class="search-input" id="searchInput" placeholder="伝票番号の下数桁 or 商品名 (例: 7800 / ひのきマット)">
       <div class="slip-list" id="slipList"></div>
       <button class="sheet-cancel" id="searchCancel" type="button">閉じる</button>
     </div>
@@ -695,15 +695,23 @@
     // ── 伝票検索 (ズレ回復) ──
     function renderSlipList(filter) {
       const f = String(filter || '').trim();
+      const fl = f.toLowerCase();
+      // 伝票番号 (下桁一致含む) に加えて、商品名・SKUでも探せる (該当商品を含む伝票が全部並ぶ)
+      const lineMatch = (s) => s.lines.find((l) =>
+        (l.name || '').toLowerCase().includes(fl) || (l.sku || '').toLowerCase().includes(fl));
       const rows = STATE.slips
-        .filter((s) => !f || s.neSlipNo.endsWith(f) || s.neSlipNo.includes(f))
+        .filter((s) => !f || s.neSlipNo.includes(f) || lineMatch(s))
         .slice(0, 60)
-        .map((s) => `<div class="slip-row" data-seq="${s.seq}">
+        .map((s) => {
+          const hit = f ? lineMatch(s) : null;
+          const shown = hit || s.lines[0] || {};
+          return `<div class="slip-row" data-seq="${s.seq}">
             <span class="no">${esc(s.neSlipNo)}</span>
             <span>#${s.seq}</span>
             <span class="st-mini ${doneSet.has(s.seq) ? 'done' : ''}">${doneSet.has(s.seq) ? '完了' : heldSet.has(s.seq) ? '保留' : '未'}</span>
-            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${esc((s.lines[0] || {}).name || '')}</span>
-          </div>`).join('');
+            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${esc(shown.name || '')}${hit && s.lines.length > 1 ? ` <b>他${s.lines.length - 1}件</b>` : ''}</span>
+          </div>`;
+        }).join('');
       $('slipList').innerHTML = rows || '<div style="color:#868e96; padding:20px">該当なし</div>';
       document.querySelectorAll('.slip-row').forEach((el) => {
         el.addEventListener('click', () => {
