@@ -28,24 +28,30 @@ export function stockLookupConfigured() {
   return Boolean(String(process.env.WAREHOUSE_URL || '').trim() && process.env.WAREHOUSE_SERVICE_TOKEN);
 }
 
-/**
- * warehouse service-api から SKU の全ロケ在庫を取る。失敗は null (fail-soft)。
- * @returns {{importedAt: string|null, stockDate: string|null, locations: Array}|null}
- */
-export async function fetchStockLocations(sku, fetchFn = fetch) {
+function serviceApiConfig() {
   const base = String(process.env.WAREHOUSE_URL || '').trim().replace(/\/+$/, '');
   const token = process.env.WAREHOUSE_SERVICE_TOKEN;
-  const code = String(sku || '').trim().toLowerCase();
-  if (!base || !token || !code) return null;
+  if (!base || !token) return null;
   const headers = { Authorization: `Bearer ${token}` };
   // Cloudflare Access 越し (Render から呼ぶ構成) のときだけ必要。ローカル呼び出しでは無害
   if (process.env.CF_ACCESS_CLIENT_ID && process.env.CF_ACCESS_CLIENT_SECRET) {
     headers['CF-Access-Client-Id'] = process.env.CF_ACCESS_CLIENT_ID;
     headers['CF-Access-Client-Secret'] = process.env.CF_ACCESS_CLIENT_SECRET;
   }
+  return { base, headers };
+}
+
+/**
+ * warehouse service-api から SKU の全ロケ在庫を取る。失敗は null (fail-soft)。
+ * @returns {{importedAt: string|null, stockDate: string|null, name: string|null, locations: Array}|null}
+ */
+export async function fetchStockLocations(sku, fetchFn = fetch) {
+  const cfg = serviceApiConfig();
+  const code = String(sku || '').trim().toLowerCase();
+  if (!cfg || !code) return null;
   try {
-    const res = await fetchFn(`${base}/service-api/logizard-stock/locations?code=${encodeURIComponent(code)}`, {
-      headers, signal: AbortSignal.timeout(TIMEOUT_MS),
+    const res = await fetchFn(`${cfg.base}/service-api/logizard-stock/locations?code=${encodeURIComponent(code)}`, {
+      headers: cfg.headers, signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
@@ -55,6 +61,30 @@ export async function fetchStockLocations(sku, fetchFn = fetch) {
     return data;
   } catch (e) {
     console.warn(`[picking-stock] 他ロケ在庫の取得失敗 (通知は在庫情報なしで送る): ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * warehouse service-api で商品名/商品ID/バーコードから SKU 候補を検索する (LINE在庫検索ボット用)。
+ * 失敗は null (fail-soft)。
+ * @returns {{importedAt: string|null, items: Array<{sku,name,free}>}|null}
+ */
+export async function fetchStockSearch(query, fetchFn = fetch) {
+  const cfg = serviceApiConfig();
+  const q = String(query || '').trim();
+  if (!cfg || q.length < 2) return null;
+  try {
+    const res = await fetchFn(`${cfg.base}/service-api/logizard-stock/search?q=${encodeURIComponent(q)}`, {
+      headers: cfg.headers, signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data || data.ok !== true || !Array.isArray(data.items)) throw new Error('想定外のレスポンス形式');
+    data.items = data.items.filter((r) => r && typeof r === 'object' && r.sku);
+    return data;
+  } catch (e) {
+    console.warn(`[picking-stock] 在庫検索の取得失敗: ${e.message}`);
     return null;
   }
 }

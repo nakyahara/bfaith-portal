@@ -134,37 +134,37 @@ export async function notifyShortage(info, now = new Date()) {
 }
 
 /**
- * LINE webhook の署名検証つき受け口 (groupId 取得用の最小実装)。
+ * LINE webhook の署名検証つき受け口。
  *
- * 用途: グループ宛 push (グループは人数に関係なく1通カウント = 無料枠で十分) にするには
- * bot をグループに招待して groupId を知る必要があり、それは webhook イベントでしか取れない。
- * LINE Developers コンソールで Webhook URL に /apps/picking/line-webhook を設定し、
- * bot をグループに招待 (またはグループで発言) すると、サーバーログに groupId が出る。
- * PICKING_LINE_TO に設定したら Webhook 利用は終了してよい (設定は残しても無害)。
+ * 用途: ①groupId の取得 (グループ宛 push の設定用 — bot をグループに招待するとログに出る)
+ *       ②在庫検索ボット (line-search.js) へのイベント供給 (2026-08-16〜)
  *
  * @param rawBody Buffer (署名は生のボディで検証する)
  * @param signature X-Line-Signature ヘッダ
- * @returns 200を返してよければ true (署名不一致は false = 呼び出し側が403)
+ * @returns 検証OKならイベント配列 (bodyが壊れていても署名一致なら [])。署名不一致・secret未設定は null
+ *          (呼び出し側が403 = fail-closed)
  */
 export function handleLineWebhook(rawBody, signature) {
   const secret = process.env.PICKING_LINE_CHANNEL_SECRET;
-  if (!secret) return false;   // 未設定なら受け付けない (fail-closed)
+  if (!secret) return null;   // 未設定なら受け付けない (fail-closed)
   const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
   const a = Buffer.from(String(signature || ''));
   const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  let events = [];
   try {
     const body = JSON.parse(rawBody.toString('utf8'));
-    for (const ev of body.events || []) {
+    if (Array.isArray(body.events)) events = body.events;
+    for (const ev of events) {
       const src = ev.source || {};
-      // 通知先設定に使うIDをログへ (groupId / roomId / userId)
+      // 通知先/検索許可の設定に使うIDをログへ (groupId / roomId / userId)
       const id = src.groupId || src.roomId || src.userId;
       if (id) {
-        console.log(`[picking-line] webhook event type=${ev.type} sourceType=${src.type} id=${id} → PICKING_LINE_TO に設定してください`);
+        console.log(`[picking-line] webhook event type=${ev.type} sourceType=${src.type} id=${id} (通知先=PICKING_LINE_TO / 在庫検索許可=PICKING_LINE_SEARCH_TO)`);
       }
     }
   } catch (e) {
     console.warn(`[picking-line] webhook body の解析失敗: ${e.message}`);
   }
-  return true;
+  return events;
 }

@@ -28,12 +28,37 @@ router.get('/locations', (req, res) => {
       WHERE 商品ID = ?
       GROUP BY ブロック略称, ロケ, 品質区分名
     `).all(code);
+    const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
     const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
     const stockDate = db.prepare('SELECT 在庫日 AS d FROM raw_lz_inventory LIMIT 1').get()?.d || null;
-    res.json({ ok: true, importedAt, stockDate, count: locations.length, locations });
+    res.json({ ok: true, importedAt, stockDate, name, count: locations.length, locations });
   } catch (e) {
     console.error('[logizard-stock-service] locations error', e);
     // 上流のエラー文をそのまま返さない (呼び出し側は固定の形だけを期待する)
+    res.status(500).json({ ok: false, error: 'DB_ERROR' });
+  }
+});
+
+// SKU候補検索 (LINE在庫検索ボット用)。商品名/商品ID部分一致+バーコード完全一致、良品フリー降順
+router.get('/search', (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.status(400).json({ ok: false, error: 'QUERY_TOO_SHORT' });
+  try {
+    const db = getDB();
+    const like = `%${q.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    const items = db.prepare(`
+      SELECT 商品ID AS sku, MIN(商品名) AS name,
+             SUM(CASE WHEN 品質区分名 = '良品' THEN 在庫数 - 引当数 ELSE 0 END) AS free
+      FROM raw_lz_inventory
+      WHERE 商品名 LIKE ? ESCAPE '\\' OR 商品ID LIKE ? ESCAPE '\\' OR バーコード = ?
+      GROUP BY 商品ID
+      ORDER BY free DESC, 商品ID
+      LIMIT 11
+    `).all(like, like, q);
+    const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+    res.json({ ok: true, importedAt, count: items.length, items });
+  } catch (e) {
+    console.error('[logizard-stock-service] search error', e);
     res.status(500).json({ ok: false, error: 'DB_ERROR' });
   }
 });

@@ -38,6 +38,7 @@ import pickingRouter from './router.js';
 import pickingIngestRouter from './ingest-router.js';
 import { getDB as getPickingDB } from './db.js';
 import { handleLineWebhook } from './notify.js';
+import { processLineEvents } from './line-search.js';
 // 画像解決 (images.js) が読む warehouse-mirror.db は明示 init が必要
 // (portal では server.js が init している。忘れると getMirrorDB() が throw し、
 // fail-soft のため「画像が永遠に解決されない」形で静かに壊れる)
@@ -206,10 +207,14 @@ app.get('/logout', (req, res) => {
   req.session.destroy(() => res.redirect('/login'));
 });
 
-// --- LINE webhook (groupId取得用・署名検証つき)。raw body が必要なので json parser より先 ---
+// --- LINE webhook (署名検証つき)。raw body が必要なので json parser より先 ---
+// 用途: groupId取得ログ + 在庫検索ボット (line-search.js)。
+// LINEへは即200を返し、返信はreply token有効期限内に非同期で送る (fail-soft)
 app.post('/apps/picking/line-webhook', express.raw({ type: () => true, limit: '1mb' }), (req, res) => {
-  if (handleLineWebhook(req.body, req.headers['x-line-signature'])) return res.status(200).end();
-  res.status(403).end();
+  const events = handleLineWebhook(req.body, req.headers['x-line-signature']);
+  if (!events) return res.status(403).end();
+  res.status(200).end();
+  processLineEvents(events).catch((e) => console.warn(`[line-search] イベント処理失敗: ${e.message}`));
 });
 
 // --- picking 本体 (mount パスは server.js と同一) ---
