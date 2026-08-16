@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 delete process.env.PICKING_LINE_SEARCH_TO;
 delete process.env.PICKING_LINE_CHANNEL_TOKEN;
 
-const { isSearchSource, buildSearchReplyMessages, buildPostbackReplyMessages, processLineEvents } = await import('../line-search.js');
+const { isSearchSource, buildSearchReplyMessages, buildPostbackReplyMessages, processLineEvents, reserveEvent } = await import('../line-search.js');
 
 let passed = 0;
 const t = (name, fn) => Promise.resolve(fn()).then(() => { passed++; console.log(`  ok: ${name}`); });
@@ -165,6 +165,19 @@ await t('processLineEvents: 返信失敗・例外時は予約を解いて再送�
   await processLineEvents([ev2], d2);         // 例外 → 予約解除
   await processLineEvents([{ ...ev2, replyToken: 'rg2' }], deps({ reply: async (token) => { sent.push(token); return true; } }));
   assert.ok(sent.includes('rg2'), '例外後の再送も通る');
+});
+
+await t('reserveEvent: 追い出し後の再予約を古いreleaseが消さない (トークン照合)', () => {
+  const t0 = 9_000_000;
+  const first = reserveEvent({ webhookEventId: 'W-evict' }, t0);
+  assert.equal(first.duplicate, false);
+  // DEDUP_MAX (5000) を超えるダミーIDで W-evict を追い出す
+  for (let i = 0; i < 5001; i++) reserveEvent({ webhookEventId: `W-fill-${i}` }, t0 + 1);
+  const second = reserveEvent({ webhookEventId: 'W-evict' }, t0 + 2);
+  assert.equal(second.duplicate, false, '追い出し後は再予約できる');
+  first.release();   // 古い予約のrelease
+  const third = reserveEvent({ webhookEventId: 'W-evict' }, t0 + 3);
+  assert.equal(third.duplicate, true, '新しい予約は古いreleaseで消えない');
 });
 
 await t('processLineEvents: 処理中の例外はイベント単位で握りつぶす', async () => {

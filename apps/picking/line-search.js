@@ -118,18 +118,23 @@ const DEDUP_TTL_MS = 10 * 60 * 1000;
 const DEDUP_MAX = 5000;
 const _seenEvents = new Map();   // webhookEventId → 記録時刻 (Mapは挿入順=先頭が最古)
 
-function reserveEvent(ev, nowMs = Date.now()) {
+export function reserveEvent(ev, nowMs = Date.now()) {
   const id = ev?.webhookEventId;
   if (!id) return { duplicate: false, release: () => {} };   // IDが無いイベントは判定不能=処理する
   // 期限切れ掃除は先頭 (最古) から、期限内に当たったら打ち切り (毎回の全件走査を避ける)
-  for (const [k, at] of _seenEvents) {
-    if (nowMs - at > DEDUP_TTL_MS) _seenEvents.delete(k);
+  for (const [k, v] of _seenEvents) {
+    if (nowMs - v.at > DEDUP_TTL_MS) _seenEvents.delete(k);
     else break;
   }
   if (_seenEvents.has(id)) return { duplicate: true, release: () => {} };
   if (_seenEvents.size >= DEDUP_MAX) _seenEvents.delete(_seenEvents.keys().next().value);   // 最古を追い出す
-  _seenEvents.set(id, nowMs);
-  return { duplicate: false, release: () => _seenEvents.delete(id) };
+  // release は「自分の予約」だけ消す (追い出し後に同IDが再予約されたものを、古いreleaseが消さないように)
+  const tok = Symbol(id);
+  _seenEvents.set(id, { at: nowMs, tok });
+  return {
+    duplicate: false,
+    release: () => { if (_seenEvents.get(id)?.tok === tok) _seenEvents.delete(id); },
+  };
 }
 
 async function handleOneEvent(ev, d) {
@@ -156,8 +161,8 @@ const CONCURRENCY = 5;
 
 /**
  * webhook イベント列を処理して必要な返信を送る (fire-and-forget 前提・全 fail-soft)。
- * イベント単位で並行処理 (直列だと先頭の遅延で後続の reply token 期限を食い潰すため)。
- * deps はテスト用注入 (既定は実物)。
+ * ワーカープール方式で最大 CONCURRENCY 並行 (固定チャンクだと先頭の遅い1件が
+ * 空き枠を塞いで後続の reply token 期限を食い潰す)。deps はテスト用注入 (既定は実物)。
  */
 export async function processLineEvents(events, deps = {}) {
   const d = {
@@ -166,8 +171,11 @@ export async function processLineEvents(events, deps = {}) {
     reply: replyLine,
     ...deps,
   };
-  const list = events || [];
-  for (let i = 0; i < list.length; i += CONCURRENCY) {
-    await Promise.allSettled(list.slice(i, i + CONCURRENCY).map((ev) => handleOneEvent(ev, d)));
-  }
+  const queue = [...(events || [])];
+  const workers = Array.from({ length: Math.min(CONCURRENCY, queue.length) }, async () => {
+    while (queue.length > 0) {
+      await handleOneEvent(queue.shift(), d);   // handleOneEvent は throw しない
+    }
+  });
+  await Promise.all(workers);
 }
