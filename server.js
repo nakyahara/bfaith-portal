@@ -87,6 +87,7 @@ import abaExtRouter from './apps/aba-keywords/router.js';
 import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
+import stockBotRouter from './apps/stock-bot/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1223,6 +1224,13 @@ if (process.env.JOBS_MONITOR_ENABLED === '1') {
   app.use('/apps/jobs-monitor', jobsMonitorRouter);
   startJobsMonitor();
   console.log('[server] jobs-monitor mounted');
+}
+// Google Chat 在庫検索ボット (Render専用)。STOCK_BOT_PROJECT_NUMBER (GCPプロジェクト番号) が
+// ある環境のみ mount — miniPC は同じ server.js を動かすため未設定=非mount (二重応答防止)。
+// 認証は router 内 (Google Chat の Bearer IDトークン検証 + 社内ドメイン制限、fail-closed)。
+if (process.env.STOCK_BOT_PROJECT_NUMBER) {
+  app.use('/apps/stock-bot', express.json({ limit: '256kb' }), stockBotRouter);
+  console.log('[server] stock-bot mounted');
 }
 app.use('/apps/amazon-accounting', (req, res, next) => {
   if (req.path === '/import-history' && req.method === 'POST') return next();  // APIキー認証に委譲

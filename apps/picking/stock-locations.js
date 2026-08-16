@@ -76,8 +76,12 @@ function jstStamp(iso, now = new Date()) {
  * - フリー在庫の多い順に最大 MAX_LINES 件
  * @param data fetchStockLocations の戻り値 (null = 取得失敗)
  */
-export function buildStockLocationsText(data, { excludeBlock, excludeLocation, now = new Date() } = {}) {
-  if (!data) return '📍 他ロケ在庫: 取得できず';
+export function buildStockLocationsText(data, {
+  excludeBlock, excludeLocation, now = new Date(),
+  // stock-bot (GChat在庫検索) からの流用用: 見出しと表示行数を差し替えられる
+  title = '他ロケ在庫', maxLines = MAX_LINES,
+} = {}) {
+  if (!data) return `📍 ${title}: 取得できず`;
   const excludeDigits = normalizeLocationDigits(excludeLocation);
   const candidates = (data.locations || [])
     .filter((r) => String(r.quality || '') === '良品')
@@ -95,13 +99,13 @@ export function buildStockLocationsText(data, { excludeBlock, excludeLocation, n
   const stamp = jstStamp(data.importedAt, now);
   const ageMin = Number.isFinite(Date.parse(data.importedAt || '')) ? (now.getTime() - Date.parse(data.importedAt)) / 60000 : null;
   const stale = ageMin === null || ageMin > STALE_WARN_MIN;
-  const header = `📍 他ロケ在庫 (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
+  const header = `📍 ${title} (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
   if (rows.length === 0 && otherFree <= 0) return `${header}: なし`;
-  const lines = rows.slice(0, MAX_LINES).map((r) => {
+  const lines = rows.slice(0, maxLines).map((r) => {
     const loc = `${r.block ? `${r.block}-` : ''}${r.location}`;
     return `・${loc}: ${r.free}個${Number(r.allocated) > 0 ? ` (別途引当${r.allocated})` : ''}`;
   });
-  if (rows.length > MAX_LINES) lines.push(`…他${rows.length - MAX_LINES}ロケ`);
+  if (rows.length > maxLines) lines.push(`…他${rows.length - maxLines}ロケ`);
   if (otherFree > 0) lines.push(`・棚以外 (仮想ロケ等): ${otherFree}個`);
   return [header, ...lines].join('\n');
 }
