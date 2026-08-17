@@ -379,6 +379,14 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
     if (!/^\d{1,10}-\d{8}-\d{1,12}[a-z]?$/i.test(inquiryNumber)) {
       return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'inquiryNumber が実測形式ではありません', requestId: req.requestId });
     }
+    // shopId は返信APIの必須パラメータ (2026-08-17 初実送信の実測: 欠落だと IE001 bad parameter)。
+    // inquiryNumber の先頭セグメント = shopId。呼び出し元が未送信でもここで導出して補完する
+    // (Render/miniPC のデプロイ順序に依存させない)。指定があれば導出値との一致を要求 (店舗混入防止)
+    const derivedShopId = Number(inquiryNumber.split('-')[0]);
+    const shopId = req.body?.shopId != null ? Number(req.body.shopId) : derivedShopId;
+    if (!Number.isInteger(shopId) || shopId !== derivedShopId) {
+      return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'shopId が inquiryNumber と一致しません', requestId: req.requestId });
+    }
     if (!message.trim()) {
       return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'message が空です', requestId: req.requestId });
     }
@@ -391,7 +399,7 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
     const result = await rakutenRequest({
       path: '/es/1.0/inquirymng-api/inquiry/reply',
       method: 'POST',
-      body: { inquiryNumber, message },
+      body: { inquiryNumber, shopId, message },
       maxAttempts: 1,
     });
     console.log(`[rakuten-rms] inquiry-reply ${inquiryNumber} -> HTTP ${result.status}`);

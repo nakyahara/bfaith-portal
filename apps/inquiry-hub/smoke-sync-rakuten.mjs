@@ -320,8 +320,21 @@ console.log('6b. 返信送信');
   const live = await adLive.sendReply({ inquiry: okInq, bodyText: 'ご返金します' });
   check('live: passthrough URLへPOST+認証ヘッダ', sentReq.url === 'https://wh.example.com/service-api/rakuten-rms/inquiry-reply'
     && sentReq.opts.method === 'POST' && sentReq.opts.headers.Authorization === 'Bearer tok');
-  check('live: body={inquiryNumber, message}', JSON.parse(sentReq.opts.body).inquiryNumber === okInq.external_inquiry_id);
+  const liveBody = JSON.parse(sentReq.opts.body);
+  check('live: body={inquiryNumber, shopId, message}', liveBody.inquiryNumber === okInq.external_inquiry_id
+    && liveBody.shopId === 373343 && liveBody.message === 'ご返金します');
   check('live: 返信IDを r:<id> で返す', live.externalReplyId === 'r:5');
+
+  // shopId照合 (店舗混入防止): expectedShopId と inquiryNumber 先頭が食い違えば未送信で拒否
+  let eShop = null;
+  try {
+    await createRakutenAdapter({
+      transport: 'warehouse', warehouseUrl: 'https://wh.example.com', serviceToken: 'tok',
+      cfClientId: 'i', cfClientSecret: 'c', sleepMs: 0, fetchImpl: fLive, sendMode: 'live',
+      expectedShopId: '999999',
+    }).sendReply({ inquiry: okInq, bodyText: 'x' });
+  } catch (e) { eShop = e; }
+  check('expectedShopId 不一致は SendRejectedError (未送信確定)', eShop instanceof SendRejectedError && /shopId/.test(eShop.message));
   const dryOverride = await adLive.sendReply({ inquiry: okInq, bodyText: 'x', dryRun: true });
   check('liveアダプターでも dryRun:true 強制で実送信しない', dryOverride.dryRun === true);
 
