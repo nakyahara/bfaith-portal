@@ -309,6 +309,111 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
   res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
 }));
 
+/** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
+router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
+  const s = getWorkState(Number(req.params.id));
+  res.json({
+    ok: true,
+    batchStatus: s.batch.status,
+    worker: s.batch.worker,
+    currentSeq: s.currentSeq,
+    doneCount: s.doneCount,
+    slipCount: s.slips.length,
+    doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
+    heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+    repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+    incidents: s.incidents,
+    lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
+    pauseReason: s.batch.pause_reason || null,
+  });
+}));
+
+/** 明細画像URLマップ (作業画面のポーリング用。取込直後は解決がバックグラウンド進行中)。 */
+router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
+  const state = getWorkState(Number(req.params.id));
+  const skus = [...new Set(state.slips.flatMap((s) => s.lines.map((l) => l.sku)))];
+  const images = getImageMap(skus);
+  const bySku = {};
+  for (const sku of skus) {
+    const hit = images.get(String(sku ?? '').trim().toLowerCase());
+    if (hit?.url) bySku[sku] = hit.url;
+  }
+  res.json({ ok: true, images: bySku });
+}));
+
+// ─── 日次サマリ (管理者) ───
+router.get('/admin/summary', requireAdmin, (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  res.render(path.join(__dirname, 'views/admin_summary'), {
+    title: '梱包サマリ',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    summary: getDailySummary(workDate),
+    statusLabels: STATUS_LABELS,
+  });
+});
+
+// ─── PWA manifest (ホーム画面追加用) ───
+router.get('/manifest.json', (req, res) => {
+  res.json({
+    name: '梱包支援',
+    short_name: '梱包',
+    start_url: '/apps/packing/',
+    display: 'standalone',
+    orientation: 'any',   // 梱包台は横向き据置が基本 (要件§6) だが縦でも使えるように
+    background_color: '#e9ecef',
+    theme_color: '#212529',
+    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
+  });
+});
+
+// ─── 端末管理 (管理者・セッション必須) ───
+
+router.get('/admin/devices', requireAdmin, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_devices'), {
+    title: '端末管理 | 梱包支援',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    devices: listDevices(),
+  });
+});
+
+/**
+ * この端末 (iPad) を登録する。発行トークンは httpOnly Cookie としてこの端末にだけ渡す。
+ * ⭐登録と同時に管理者セッションを破棄する (共用端末に管理者権限を残さない — picking と同規約)。
+ * 🚨ホーム画面に追加したPWA内で実行すること (SafariとPWAはCookie保存領域が別)
+ */
+router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
+  const label = String(req.body.label || '').trim();
+  if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
+  const { token, id: deviceId } = createDevice(label, req.session.email);
+  res.cookie(DEVICE_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV !== 'development',
+    sameSite: 'lax',
+    maxAge: 400 * 24 * 3600 * 1000,
+    path: '/apps/packing',
+  });
+  // セッション破棄の失敗を握り潰さない (Codex high: 共用端末に管理者セッションが残ったまま
+  // 「登録成功」を返すと、権限破棄の安全要件が満たされない)。失敗時は発行した端末も無効化する
+  req.session.destroy((err) => {
+    if (err) {
+      revokeDevice(deviceId);   // 発行した端末を確実に無効化 (id直指定。一覧末尾頼みは並行登録で誤爆する)
+      res.clearCookie(DEVICE_COOKIE, { path: '/apps/packing' });
+      console.error('[packing] 端末登録時のセッション破棄に失敗:', err);
+      return res.status(500).json({ error: 'セッションの破棄に失敗したため登録を取り消しました。もう一度実行してください' });
+    }
+    res.json({ ok: true, loggedOut: true });
+  });
+}));
+
+router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {
+  if (!revokeDevice(Number(req.params.id))) throw new PackError(404, 'not_found', '端末が見つかりません');
+  res.json({ ok: true });
+}));
+
 // ─── 取込画面 (管理者) ───
 router.get('/admin/import', requireAdmin, (req, res) => {
   res.render(path.join(__dirname, 'views/admin_import'), {

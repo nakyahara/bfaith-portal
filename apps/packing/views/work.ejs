@@ -236,6 +236,27 @@
     </div>
   </div>
 
+  <div class="overlay" id="ruleOverlay">
+    <div class="box">
+      <h2>恒久ルール変更の申請</h2>
+      <div style="color:#868e96; font-size:14px; margin-bottom:10px" id="ruleDesc"></div>
+      <div style="display:grid; grid-template-columns: 110px 1fr; gap:10px; align-items:center; text-align:left">
+        <label>モール</label><select id="ruleMall" class="search-input" style="padding:8px"></select>
+        <label>数量帯</label>
+        <div style="display:flex; gap:8px; align-items:center">
+          <select id="ruleQmin" class="search-input" style="padding:8px; width:90px"></select>
+          <span>〜</span>
+          <select id="ruleQmax" class="search-input" style="padding:8px; width:110px"></select>
+        </div>
+        <label>配送方法</label><select id="ruleMethod" class="search-input" style="padding:8px"></select>
+        <label>梱包機</label><select id="ruleMachine" class="search-input" style="padding:8px"></select>
+      </div>
+      <div style="color:#c92a2a; font-size:13px; margin-top:8px; display:none" id="ruleWarn">梱包機を使う場合、配送方法はネコポスのみ選べます</div>
+      <button class="reason-opt" id="ruleSubmit" type="button" style="width:100%; margin-top:14px; background:#e03131; color:#fff; border:none">承認依頼を送信 (GChatに承認カードが届きます)</button>
+      <button class="sheet-cancel" id="ruleCancel" type="button">やめる</button>
+    </div>
+  </div>
+
   <div class="overlay" id="searchOverlay">
     <div class="box">
       <h2>伝票を探す</h2>
