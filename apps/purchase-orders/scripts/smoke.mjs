@@ -4009,9 +4009,9 @@ console.log('── ロジザード在庫 mirror 自動反映 ──');
     lzSet(t4, 120);
     r = await j('/api/supplier/1');
     ok(r.body.overlay && r.body.overlay.source === 'ne', 'mirror共存: NE手動が有効な間はmirrorが進んでもスキップ', r.body.overlay && r.body.overlay.source);
-    // 翌朝のPML同期でNEが失効したら自動反映が再開する
+    // 翌朝のPML同期でNEが失効したら自動反映が再開する (mirror t4=+10s は朝同期+8sより新しい)
     const oldSync = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
-    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date(Date.now() + 15000).toISOString());
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date(Date.now() + 8000).toISOString());
     r = await j('/api/supplier/1');
     ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && ovRow('noflyersticker').在庫数 === 180,
       'mirror共存: 朝同期でNE失効後は自動反映が再開 (120+60)', r.body.overlay && r.body.overlay.source);
@@ -4062,15 +4062,31 @@ console.log('── ロジザード在庫 mirror 自動反映 ──');
     db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync2);
   }
 
-  // 9) 負数在庫を含む mirror は反映しない (手動経路の stock<0 拒否と同等の防衛)
+  // 9) 負数在庫を含む mirror は反映しない (手動経路の stock<0 拒否と同等の防衛。
+  //    別ロケの正数とSUMで相殺されても行単位で検出する — Codex LZM-R2 Medium)
   {
     const capBefore = ovMeta().captured_at;
     const tNeg = new Date(Date.now() + 35000).toISOString();
     db.prepare('DELETE FROM mirror_logizard_stock').run();
     insLz.run('noflyersticker', 'チラシ', '001-001-01', '良品', -3, 0, '20260817', tNeg, tNeg);
+    insLz.run('noflyersticker', 'チラシ', '002-001-01', '良品', 10, 0, '20260817', tNeg, tNeg); // SUM=7>0 でも行の負数で拒否
     insLz.run('mirror-only-item', 'ミラーだけの商品', '003-001-01', '良品', 9, 0, '20260817', tNeg, tNeg);
     r = await j('/api/supplier/1');
-    ok(ovMeta().captured_at === capBefore, '負数在庫を含むmirrorは反映しない (overlay据え置き)', ovMeta());
+    ok(ovMeta().captured_at === capBefore, '負数在庫の行を含むmirrorは反映しない (ロケ間相殺でも検出・overlay据え置き)', ovMeta());
+  }
+
+  // 10) overlay が無い状態でも、朝のPML同期より古い mirror は適用しない
+  //     (初回・解除後に前日18時のmirrorで今朝のNE在庫を上書きしない — Codex LZM-R2 High)
+  {
+    db.prepare('DELETE FROM po_ne_overlay_meta').run();
+    db.prepare('DELETE FROM po_ne_overlay_rows').run();
+    db.prepare("DELETE FROM po_settings WHERE key='po_lz_mirror_suppress_capture'").run();
+    const oldSync3 = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date().toISOString());
+    lzSet(new Date(Date.now() - 60000).toISOString(), 160); // mirror = 朝同期より古い
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay === null, '朝同期より古いmirrorはoverlay無しでも適用しない (朝のNE在庫が正)', r.body.overlay);
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync3);
   }
 
   // 後片付け (以降のセクションに mirror 自動反映が影響しないように)

@@ -146,6 +146,10 @@ export function maybeRefreshFromLogizardMirror() {
     // 適用してよい状態か (集計前の早期スキップ用と、書込みtx内の再確認=CASの両方で使う。
     // チェック〜書込みの間に手動取込/解除が割り込んでも古い自動反映で上書きしない — Codex LZM-R1 Medium)
     const shouldApply = () => {
+      // mirror が朝のPML同期より古いなら適用しない — 朝のNE在庫の方が新しい (overlay無し=初回や
+      // 解除後でも、前日18時のmirrorで今朝の在庫を上書きしない。Codex LZM-R2 High)
+      const pubSync = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get();
+      if (pubSync && pubSync.src_ne_products_synced_at && !newerThan(cap, pubSync.src_ne_products_synced_at)) return false;
       const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get();
       // 後勝ち: 手動取込 (captured_at=取込時刻) の方が新しい間は上書きしない
       const metaCap = meta ? (meta.captured_at || meta.uploaded_at) : null;
@@ -165,24 +169,24 @@ export function maybeRefreshFromLogizardMirror() {
       return true;
     };
     if (!shouldApply()) return;
+    // 手動CSV経路の stock<0 拒否と同等の防衛 (mirror受信側は負数を拒否しない)。SUM後だとロケ間で
+    // 相殺されて見逃すため行単位で検査し、良品以外の行の負数も見逃さない (検証が除外より先 — Codex LZM-R2 Medium)
+    const negRow = db.prepare('SELECT 商品ID FROM mirror_logizard_stock WHERE 在庫数 < 0 OR 引当数 < 0 LIMIT 1').get();
+    if (negRow) {
+      console.warn(`[po] logizard mirror自動反映をスキップ: 負数在庫の行あり (${negRow.商品ID}・mirrorデータ異常の疑い)`);
+      return;
+    }
     // 集計はSQL一発 (手動CSV経路と同じルール: 良品のみ・商品IDごとにロケ横断SUM)
     const agg = db.prepare(`SELECT 商品ID AS code, SUM(在庫数) AS stock, SUM(引当数) AS alloc
       FROM mirror_logizard_stock WHERE 品質区分名='良品' GROUP BY 商品ID`).all();
     const byKey = new Map();
-    let negative = 0;
     for (const r of agg) {
       const key = normProductCode(r.code);
       if (!key) continue;
-      // 手動CSV経路の stock<0 拒否と同等の防衛 (mirror受信側は負数を拒否しないため — Codex LZM-R1 Medium)
-      if (r.stock < 0 || (r.alloc != null && r.alloc < 0)) { negative++; continue; }
       const cur = byKey.get(key) || { code: r.code, stock: 0, alloc: 0 };
       cur.stock += r.stock;
       cur.alloc += r.alloc == null ? 0 : r.alloc;
       byKey.set(key, cur);
-    }
-    if (negative > 0) {
-      console.warn(`[po] logizard mirror自動反映をスキップ: 負数在庫の商品が${negative}件 (mirrorデータ異常の疑い)`);
-      return;
     }
     // 異常データガード: mirror が極端に小さい (途中欠け等) 場合に大量の在庫0上書きをしない。
     // 手動経路のプレビュー確認に相当する安全弁 (実データ約2,900商品に対して既定500)
