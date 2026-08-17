@@ -7,7 +7,10 @@ import assert from 'node:assert/strict';
 delete process.env.PICKING_LINE_SEARCH_TO;
 delete process.env.PICKING_LINE_CHANNEL_TOKEN;
 
-const { isSearchSource, buildSearchReplyMessages, buildPostbackReplyMessages, processLineEvents, reserveEvent } = await import('../line-search.js');
+const {
+  isSearchSource, buildSearchReplyMessages, buildPostbackReplyMessages, processLineEvents, reserveEvent,
+  resolveBlockCommand, buildBlockListMessages, chunkTextMessages,
+} = await import('../line-search.js');
 
 let passed = 0;
 const t = (name, fn) => Promise.resolve(fn()).then(() => { passed++; console.log(`  ok: ${name}`); });
@@ -24,6 +27,8 @@ const LOCATIONS = {
 const deps = (over = {}) => ({
   fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('teatree20', 'ティーツリーオイル 20ml', 245), ITEM('teatree10', 'ティーツリーオイル 10ml', 40)] }),
   fetchStockLocations: async () => LOCATIONS,
+  // 既定は「どのブロックも在庫なし」= ブロック名直打ちは商品検索へフォールバックする
+  fetchStockBlock: async (code) => ({ ok: true, importedAt: FRESH, block: code, items: [] }),
   reply: async () => true,
   ...over,
 });
@@ -123,6 +128,84 @@ await t('検索: 100文字超のキーワードは拒否・0件応答は入力�
   assert.ok(!echo[0].text.includes('か'.repeat(31)), '0件応答に長い入力を全文エコーしない');
 });
 
+// ─── ブロック一覧コマンド (Z/A) ───
+const BLOCK_ROW = (o = {}) => ({
+  location: 'ZZZ-ZZZ-ZZ', sku: 'hakka200', name: 'ハッカ油 【200ml】 _パフ箱', quality: '良品',
+  expiry: '20280115', qty: 2600, allocated: 0, free: 2600, ...o,
+});
+
+await t('resolveBlockCommand: Z/A エイリアス・全角・ロケ付き・直打ち・非該当', () => {
+  assert.deepEqual(resolveBlockCommand('Z'), { block: 'ZZZ', explicit: true });
+  assert.deepEqual(resolveBlockCommand('z'), { block: 'ZZZ', explicit: true });
+  assert.deepEqual(resolveBlockCommand('Ｚ'), { block: 'ZZZ', explicit: true }, '全角も同一視');
+  assert.deepEqual(resolveBlockCommand('Zロケ'), { block: 'ZZZ', explicit: true });
+  assert.deepEqual(resolveBlockCommand('A'), { block: 'AAAA', explicit: true });
+  assert.deepEqual(resolveBlockCommand('YYY'), { block: 'YYY', explicit: false }, 'ブロック名直打ち');
+  assert.equal(resolveBlockCommand('ハッカ'), null);
+  assert.equal(resolveBlockCommand('teatree10'), null, '7文字以上は商品検索');
+});
+
+await t('ブロック一覧: 単一ロケはロケ省略・フリー降順・期限/品質/引当の補足・ヘッダ集計', async () => {
+  const d = deps({
+    fetchStockBlock: async (code) => ({
+      ok: true, importedAt: FRESH, block: code,
+      items: [
+        BLOCK_ROW({ sku: 'amaniyu100', name: '木工用 亜麻仁油 【100ml 】', quality: 'Ｂ品', expiry: '', qty: 6, free: 6 }),
+        BLOCK_ROW(),
+        BLOCK_ROW({ sku: 'byobin', name: '上敷鋲 【25本入り】', expiry: '', qty: 460, free: 460, allocated: 10 }),
+        BLOCK_ROW({ sku: 'zero', name: 'フリー0は出さない', free: 0 }),
+      ],
+    }),
+  });
+  const msgs = await buildSearchReplyMessages('Z', d);
+  assert.equal(msgs.length, 1);
+  const lines = msgs[0].text.split('\n');
+  assert.ok(lines[0].startsWith('📦 ZZZ の在庫一覧 ('), lines[0]);
+  assert.equal(lines[1], '3件・フリー計3,066個');
+  assert.equal(lines[2], '・ハッカ油 【200ml】 _パフ箱 → 2600個 (期限2028/01/15)');
+  assert.equal(lines[3], '・上敷鋲 【25本入り】 → 460個 (別途引当10)');
+  assert.equal(lines[4], '・木工用 亜麻仁油 【100ml 】 → 6個 (Ｂ品)');
+  assert.equal(lines.length, 5, '単一ロケなので [ロケ] プレフィックスなし');
+});
+
+await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付き', async () => {
+  const d = deps({
+    fetchStockBlock: async () => ({
+      ok: true, importedAt: FRESH, block: 'AAAA',
+      items: [
+        BLOCK_ROW({ location: '001-001-01', name: '商品X', expiry: '' }),
+        BLOCK_ROW({ location: '001-002-01', name: '商品Y', expiry: '', free: 10, qty: 10 }),
+      ],
+    }),
+  });
+  const msgs = await buildSearchReplyMessages('A', d);
+  assert.ok(msgs[0].text.includes('・[001-001-01] '), msgs[0].text);
+  assert.ok(msgs[0].text.includes('・[001-002-01] 商品Y → 10個'), msgs[0].text);
+});
+
+await t('ブロック一覧: エイリアスで在庫0=在庫なし案内・直打ちで在庫0=商品検索へフォールバック', async () => {
+  const d = deps({ fetchStockBlock: async () => ({ ok: true, importedAt: FRESH, block: 'AAAA', items: [] }) });
+  const empty = await buildSearchReplyMessages('A', d);
+  assert.ok(empty[0].text.includes('AAAA に現在在庫はありません'), empty[0].text);
+  // 直打ち 'YYY' が在庫0 → 商品検索が走る (deps既定のfetchStockSearchが返す候補が出る)
+  const fallthrough = await buildSearchReplyMessages('YYY', d);
+  assert.ok(fallthrough[0].quickReply, `商品検索へフォールバックするはず: ${fallthrough[0].text}`);
+  // エイリアスで取得失敗 → エラー案内
+  const fail = await buildSearchReplyMessages('Z', deps({ fetchStockBlock: async () => null }));
+  assert.ok(fail[0].text.includes('取得できませんでした'), fail[0].text);
+});
+
+await t('chunkTextMessages: 5,000字対策の分割と5通上限', () => {
+  const lines = Array.from({ length: 600 }, (_, i) => `・行${i} ${'あ'.repeat(50)}`);
+  const msgs = chunkTextMessages('HEADER', lines);
+  assert.ok(msgs.length <= 5, `最大5通: ${msgs.length}`);
+  for (const m of msgs) assert.ok(m.text.length <= 5000, `1通5,000字以内: ${m.text.length}`);
+  assert.ok(msgs[msgs.length - 1].text.includes('省略'), '溢れは明示');
+  const small = chunkTextMessages('H', ['・a', '・b']);
+  assert.equal(small.length, 1);
+  assert.equal(small[0].text, 'H\n・a\n・b');
+});
+
 // ─── processLineEvents (e2e・応答場所の制御) ───
 await t('processLineEvents: 1:1と許可グループだけ返信・欠品通知グループは沈黙', async () => {
   const sent = [];
@@ -136,7 +219,8 @@ await t('processLineEvents: 1:1と許可グループだけ返信・欠品通知�
     { type: 'message', source: { type: 'user', userId: 'U1' }, message: { type: 'text', text: 'tokenなし' } },
     { type: 'message', replyToken: 'r6', source: { type: 'user', userId: 'U1' }, message: { type: 'image' } },
   ], d);
-  assert.deepEqual(sent.map((s) => s.token), ['r1', 'r3', 'r4'], '返信は 1:1検索・許可グループ・postback の3件だけ');
+  // ワーカープール並行処理のため完了順は不定 → 順不同で比較
+  assert.deepEqual(sent.map((s) => s.token).sort(), ['r1', 'r3', 'r4'], '返信は 1:1検索・許可グループ・postback の3件だけ');
 });
 
 await t('processLineEvents: webhook再送 (同一webhookEventId) は1回だけ処理', async () => {

@@ -14,7 +14,10 @@
  * fail-soft: 検索失敗・warehouse停止でもエラー文を返信するだけで、他機能 (欠品通知) に影響しない。
  * データ源 = warehouse service-api (raw_lz_inventory、毎時9-18時更新)。
  */
-import { fetchStockLocations, fetchStockSearch, buildStockLocationsText } from './stock-locations.js';
+import {
+  fetchStockLocations, fetchStockSearch, fetchStockBlock,
+  buildStockLocationsText, formatExpiryLabel, jstStampLabel,
+} from './stock-locations.js';
 
 const REPLY_URL = 'https://api.line.me/v2/bot/message/reply';
 const TIMEOUT_MS = 5000;
@@ -53,6 +56,82 @@ async function replyLine(replyToken, messages, fetchFn = fetch) {
   }
 }
 
+// ─── ブロック一覧コマンド (「Z」「A」等でブロック内の全在庫を一覧) ───
+// 既定 Z→ZZZ / A→AAAA。env PICKING_LINE_BLOCK_ALIASES="Z=ZZZ,A=AAAA" で上書き可
+
+function blockAliases() {
+  const map = {};
+  for (const pair of String(process.env.PICKING_LINE_BLOCK_ALIASES || 'Z=ZZZ,A=AAAA').split(',')) {
+    const [k, v] = pair.split('=').map((s) => String(s || '').trim().toUpperCase());
+    if (k && v) map[k] = v;
+  }
+  return map;
+}
+
+/**
+ * メッセージがブロック一覧コマンドなら { block, explicit } を返す。それ以外は null。
+ * explicit=true はエイリアス (Z/A) 経由 = 在庫0でも「在庫なし」と答える。
+ * explicit=false はブロック名直打ち (YYY等) = 在庫が無ければ商品検索へフォールバック。
+ */
+export function resolveBlockCommand(text) {
+  const t = String(text || '').trim()
+    .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))   // 全角英数→半角
+    .toUpperCase()
+    .replace(/ロケ$/, '');
+  const aliases = blockAliases();
+  if (aliases[t]) return { block: aliases[t], explicit: true };
+  if (/^[A-Z0-9]{2,6}$/.test(t)) return { block: t, explicit: false };
+  return null;
+}
+
+/** LINEの1通5,000字・1返信5通の制限内で、行群を複数のtextメッセージに分割する。 */
+export function chunkTextMessages(header, lines, limit = 4500, maxMessages = 5) {
+  const messages = [];
+  let buf = header;
+  for (const line of lines) {
+    if (`${buf}\n${line}`.length > limit) {
+      messages.push(buf);
+      buf = line;
+    } else {
+      buf = `${buf}\n${line}`;
+    }
+  }
+  messages.push(buf);
+  const kept = messages.slice(0, maxMessages);
+  if (messages.length > maxMessages) kept[maxMessages - 1] += '\n…以降は文字数上限で省略しました。キーワード検索で絞ってください。';
+  return kept.map((text) => ({ type: 'text', text }));
+}
+
+/**
+ * ブロック在庫一覧の応答メッセージ配列。
+ * null = このコマンドでは応答しない (直打ちブロックに在庫なし → 呼び出し側が商品検索へ)
+ */
+export async function buildBlockListMessages(cmd, deps) {
+  const data = await deps.fetchStockBlock(cmd.block);
+  if (!data) {
+    return cmd.explicit ? [{ type: 'text', text: '在庫データを取得できませんでした。少し待ってもう一度送ってください。' }] : null;
+  }
+  const rows = data.items.filter((r) => Number(r.free) > 0);
+  if (rows.length === 0) {
+    return cmd.explicit ? [{ type: 'text', text: `📦 ${cmd.block} に現在在庫はありません (在庫CSVは在庫のある行だけが出ます)。` }] : null;
+  }
+  rows.sort((a, b) => (Number(b.free) - Number(a.free)) || String(a.name || '').localeCompare(String(b.name || '')));
+  const multiLoc = new Set(rows.map((r) => String(r.location))).size > 1;
+  const totalFree = rows.reduce((sum, r) => sum + Number(r.free), 0);
+  const lines = rows.map((r) => {
+    const notes = [];
+    const expiry = formatExpiryLabel(r.expiry);
+    if (expiry) notes.push(`期限${expiry}`);
+    if (String(r.quality || '') !== '良品') notes.push(String(r.quality || '品質不明'));
+    if (Number(r.allocated) > 0) notes.push(`別途引当${r.allocated}`);
+    const locPrefix = multiLoc ? `[${r.location}] ` : '';
+    return `・${locPrefix}${String(r.name || r.sku).slice(0, 40)} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
+  });
+  const stamp = jstStampLabel(data.importedAt);
+  const header = `📦 ${cmd.block} の在庫一覧 (${stamp || '取得時刻不明'}時点)\n${rows.length}件・フリー計${totalFree.toLocaleString('ja-JP')}個`;
+  return chunkTextMessages(header, lines);
+}
+
 /** SKU のロケーション別在庫の返信テキスト。データ無しは null。 */
 async function buildStockText(sku, deps) {
   const data = await deps.fetchStockLocations(sku);
@@ -65,6 +144,13 @@ async function buildStockText(sku, deps) {
 export async function buildSearchReplyMessages(query, deps) {
   const q = String(query || '').trim();
   if (!q) return [{ type: 'text', text: USAGE }];
+  // ブロック一覧コマンド (「Z」「A」「YYY」等) は文字数チェックより先に判定する
+  const blockCmd = resolveBlockCommand(q);
+  if (blockCmd) {
+    const blockMsgs = await buildBlockListMessages(blockCmd, deps);
+    if (blockMsgs) return blockMsgs;
+    // 直打ちブロック名に在庫なし → 商品検索として続行
+  }
   if (q.length < 2) return [{ type: 'text', text: `キーワードは2文字以上で送ってください。${USAGE}` }];
   if (q.length > 100) return [{ type: 'text', text: 'キーワードが長すぎます (100文字まで)。' }];
   const result = await deps.fetchStockSearch(q);
@@ -168,6 +254,7 @@ export async function processLineEvents(events, deps = {}) {
   const d = {
     fetchStockLocations,
     fetchStockSearch,
+    fetchStockBlock,
     reply: replyLine,
     ...deps,
   };
