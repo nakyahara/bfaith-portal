@@ -402,13 +402,47 @@ router.get('/board', (req, res) => {
 });
 
 /**
- * 掲示モードの解除。掲示端末Cookieを消すだけ (端末そのものの失効は管理画面から)。
- * 壁掛け端末を作業用に転用したくなったときの出口。
+ * 掲示モードの解除 (壁掛け端末を作業用に転用したいときの出口)。
+ *
+ * ⭐管理者セッション必須 + POST + 解除と同時にセッションも破棄する (Codexレビュー high)。
+ *   GETで無条件に消せると、掲示端末の前に立った人 (や外部サイトからの誘導) が
+ *   board Cookie だけを消し、残っている管理者セッションで作業・管理APIを開けてしまう。
+ *   掲示端末では /admin/* も塞がっているので、解除はこの画面が唯一の導線になる。
  */
 router.get('/board/exit', (req, res) => {
-  res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
-  res.send('掲示モードを解除しました。作業に使う場合は管理者としてログインし、端末を登録し直してください。');
+  const isAdmin = req.session?.role === 'admin';
+  res.type('html').send(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>掲示モードの解除</title>
+    <style>body{font-family:system-ui,sans-serif;max-width:36em;margin:3em auto;padding:0 1em;line-height:1.7}
+    button{padding:.6em 1.4em;font-size:1em;cursor:pointer}</style></head><body>
+    <h1>掲示モードの解除</h1>
+    <p>この端末は<b>掲示専用</b>として登録されています (実績ボードのみ表示できます)。</p>
+    ${isAdmin ? `<p>解除すると端末Cookieを削除し、同時にログアウトします。
+        作業用に使う場合は、そのあと改めて管理者でログインして「作業用」で登録し直してください。</p>
+      <button id="go" type="button">掲示モードを解除する</button>
+      <p id="msg"></p>
+      <script>
+        document.getElementById('go').addEventListener('click', function () {
+          fetch('/apps/picking/board/exit', { method: 'POST', credentials: 'same-origin' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              document.getElementById('msg').textContent = d.ok ? '解除しました。' : (d.error || '失敗しました');
+            })
+            .catch(function (e) { document.getElementById('msg').textContent = '失敗しました: ' + e.message; });
+        });
+      </script>`
+      : `<p><b>解除には管理者のログインが必要です。</b>
+        <a href="/login">ログイン</a>してから、この画面をもう一度開いてください。</p>`}
+    <p><a href="/apps/picking/board">← ボードへ戻る</a></p>
+    </body></html>`);
 });
+
+router.post('/board/exit', checkOrigin, requireAdmin, api(async (req, res) => {
+  res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
+  // 端末Cookieだけ消してセッションを残すと、まさにそのセッションで作業APIが開いてしまう
+  req.session.destroy(() => res.json({ ok: true, loggedOut: true }));
+}));
 
 // ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
 router.get('/api/board', api(async (req, res) => {

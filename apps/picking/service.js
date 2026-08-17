@@ -809,12 +809,23 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
     c.lines++; c.sec += r.sec; c.expectedSec += baselineByKey.get(ck) ?? r.sec;
   }
 
+  // 全明細が外れ値だった作業者は kept に1件も残らず一覧から消えてしまう
+  // (= 除外件数も誰にも見えない)。行だけは残して除外件数を出す (Codexレビュー medium)
+  for (const key of excludedByWorker.keys()) {
+    if (workerMap.has(key)) continue;
+    workerMap.set(key, {
+      worker: key, name: displayWorkerName(key),
+      lines: 0, sec: 0, expectedSec: 0, shortages: 0,
+      batches: new Set(), days: new Set(), classes: new Map(),
+    });
+  }
+
   const workers = [...workerMap.values()].map((w) => ({
     worker: w.worker,
     name: w.name,
     lines: w.lines,
     sec: w.sec,
-    secPerLine: w.sec / w.lines,
+    secPerLine: w.lines > 0 ? w.sec / w.lines : null,   // 全件除外の作業者は 0 除算になる
     expectedSec: w.expectedSec,
     // 速さ指数: 100 = 全体平均どおり。大きいほど速い (期待時間 ÷ 実測時間)
     index: w.sec > 0 ? Math.round((w.expectedSec / w.sec) * 100) : null,

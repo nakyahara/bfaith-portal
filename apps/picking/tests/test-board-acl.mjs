@@ -23,10 +23,16 @@ const router = (await import('../router.js')).default;
 
 // セッションは差し替え可能なスタブ (express-session を持ち込まない)
 let session = null;
+let sessionDestroyed = false;
 const app = express();
 app.set('view engine', 'ejs');   // router は res.render(絶対パス) を使う
 app.use(express.json());
-app.use((req, res, next) => { req.session = session ? { ...session, destroy: (cb) => cb() } : {}; next(); });
+app.use((req, res, next) => {
+  req.session = session
+    ? { ...session, destroy: (cb) => { sessionDestroyed = true; cb(); } }
+    : {};
+  next();
+});
 app.use('/apps/picking', router);
 
 const server = app.listen(0, '127.0.0.1');
@@ -88,11 +94,39 @@ await t('⭐掲示端末は管理者ログイン中でも閉じたまま (セッ
   }
 });
 
-await t('掲示モードの解除口がある (Cookie削除)', async () => {
-  const res = await req('GET', '/board/exit', { token: boardToken });
-  assert.equal(res.status, 200);
-  const setCookie = res.headers.get('set-cookie') || '';
-  assert.ok(/pk_device=/.test(setCookie), 'Cookieを消しにいく');
+await t('⭐解除はGETでは起きない (Cookieだけ消してセッションを残す穴を作らない)', async () => {
+  const anon = await req('GET', '/board/exit', { token: boardToken });
+  assert.equal(anon.status, 200);
+  assert.equal(anon.headers.get('set-cookie'), null, 'GETではCookieを消さない');
+  assert.ok(anon.text.includes('管理者のログインが必要'), '未ログインには案内だけ出す');
+
+  // 管理者ログイン中でもGETでは消えない (クロスサイト誘導で解除されない)
+  session = { email: 'admin@b-faith.biz', role: 'admin', allowedApps: '*' };
+  try {
+    const asAdmin = await req('GET', '/board/exit', { token: boardToken });
+    assert.equal(asAdmin.headers.get('set-cookie'), null);
+    assert.ok(asAdmin.text.includes('解除する'), '管理者には解除ボタンを出す');
+  } finally {
+    session = null;
+  }
+
+  // 管理者以外はPOSTしても解除できない
+  const denied = await req('POST', '/board/exit', { token: boardToken });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('set-cookie'), null);
+});
+
+await t('解除は管理者のPOSTのみ / 解除と同時にログアウトする', async () => {
+  session = { email: 'admin@b-faith.biz', role: 'admin', allowedApps: '*' };
+  sessionDestroyed = false;
+  try {
+    const res = await req('POST', '/board/exit', { token: boardToken });
+    assert.equal(res.status, 200);
+    assert.ok(/pk_device=/.test(res.headers.get('set-cookie') || ''), 'Cookieを消す');
+    assert.equal(sessionDestroyed, true, '端末Cookieだけ消してセッションを残さない');
+  } finally {
+    session = null;
+  }
 });
 
 await t('作業端末は従来どおり (一覧・作業画面OK / ボードも見られる)', async () => {

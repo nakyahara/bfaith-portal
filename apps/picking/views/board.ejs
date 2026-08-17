@@ -255,15 +255,26 @@
         clearTimeout(timer);
         if (done || myGen !== gen) return;   // 二重実行・古い応答は無視
         done = true;
-        fn();
-        // ページ自体の作り直しは「更新に成功している間だけ」行う。
-        // サーバー停止中に reload すると、保持していた最後の正常表示までブラウザの
-        // エラー画面に置き換わってしまう
-        if (lastOk && Date.now() - startedAt > HARD_RELOAD_MS && Date.now() - lastOk < RELOAD_MS * 2) {
-          location.reload();
-          return;
+        // ⭐描画で例外が出ても必ず次を予約する (finally)。ここで抜けると常時表示が
+        //   二度と更新されないまま古い数字を映し続ける (Codexレビュー medium)
+        try {
+          fn();
+        } catch (e) {
+          try {
+            document.getElementById('err').textContent = '表示エラー (' + e.message + ')';
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          } catch (ignored) { /* DOMごと壊れている場合は次の周期に賭ける */ }
+        } finally {
+          // ページ自体の作り直しは「更新に成功している間だけ」行う。
+          // サーバー停止中に reload すると、保持していた最後の正常表示までブラウザの
+          // エラー画面に置き換わってしまう
+          if (lastOk && Date.now() - startedAt > HARD_RELOAD_MS && Date.now() - lastOk < RELOAD_MS * 2) {
+            location.reload();
+          } else {
+            setTimeout(tick, RELOAD_MS);
+          }
         }
-        setTimeout(tick, RELOAD_MS);
       };
 
       fetch('/apps/picking/api/board?days=' + WINDOW_DAYS, { credentials: 'same-origin', signal: ctrl.signal })

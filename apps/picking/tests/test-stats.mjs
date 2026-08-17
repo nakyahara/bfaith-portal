@@ -182,6 +182,23 @@ t('外れ値: 上限超えの明細は除外し、件数を報告する', () => 
   assert.equal(s.outlierSec, STATS_OUTLIER_SEC);
 });
 
+t('全明細が外れ値だった作業者も行として残る (除外が誰にも見えなくならない)', () => {
+  db.exec('DELETE FROM pk_events; DELETE FROM pk_lines; DELETE FROM pk_batches;');
+  batchSeq = 0;
+  makeBatch({ workDate: '2026-08-16', cls: '分類R', worker: 'Q', secs: Array(12).fill(10) });
+  makeBatch({ workDate: '2026-08-16', cls: '分類R', worker: 'R', secs: [600, 900] });   // 全部放置
+  const s = getPickingStats({ until: '2026-08-16', days: 30 });
+  const r = s.workers.find((w) => w.name === 'R');
+  assert.ok(r, '一覧から消えない');
+  assert.equal(r.lines, 0);
+  assert.equal(r.secPerLine, null, '0除算でNaNにしない');
+  assert.equal(r.index, null);
+  assert.equal(r.excluded, 2);
+  assert.equal(r.provisional, true);
+  assert.equal(s.workers[0].name, 'Q', '実績のある人が先頭');
+  assert.equal(s.workers.find((w) => w.name === 'Q').excluded, 0);
+});
+
 t('母数不足は参考値 (provisional) として順位から外し末尾へ', () => {
   db.exec('DELETE FROM pk_events; DELETE FROM pk_lines; DELETE FROM pk_batches;');
   batchSeq = 0;
