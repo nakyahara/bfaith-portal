@@ -120,11 +120,13 @@ export async function buildBlockListMessages(cmd, deps) {
   rows.sort((a, b) => (Number(b.free) - Number(a.free)) || String(a.name || '').localeCompare(String(b.name || '')));
   const multiLoc = new Set(rows.map((r) => String(r.location))).size > 1;
   const totalFree = rows.reduce((sum, r) => sum + Number(r.free), 0);
-  // 表示は「数量が行頭」— 行末だと商品名の折り返しで数量が迷子になる (2026-08-17 中原さん「見にくい」)。
+  // 表示 (2026-08-17 中原さん指定): 商品名の行→数量の行、商品間は区切り線。
   // 商品名末尾の社内サフィックス (_パフ箱・_梱機プ・_K-44 等の梱包指示タグ) は一覧では省く。
   // 誤削除防止で「日本語1〜6文字」か「英字1文字-数字 (K-44型)」だけを対象にする (_Type-C 等は残す)
   const stripSuffix = (name) => String(name || '').replace(/\s*_(?:[^\x00-\x7F]{1,6}|[A-Z]-?\d{1,3})$/, '');
-  const lines = rows.map((r) => {
+  const SEP = '----------';
+  const lines = [];
+  for (const r of rows) {
     const notes = [];
     const expiry = formatExpiryLabel(r.expiry);
     if (expiry) notes.push(`期限${expiry}`);
@@ -132,11 +134,13 @@ export async function buildBlockListMessages(cmd, deps) {
     if (Number(r.allocated) > 0) notes.push(`別途引当${r.allocated}`);
     const locPrefix = multiLoc ? `[${r.location}] ` : '';
     const qty = Number(r.free).toLocaleString('ja-JP');
-    return `・${qty}個｜${locPrefix}${stripSuffix(r.name || r.sku).slice(0, 40)}${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
-  });
+    lines.push(SEP);
+    // 商品名と数量は1要素にまとめる (メッセージ分割で名前と数量が泣き別れしないように)
+    lines.push(`${locPrefix}${stripSuffix(r.name || r.sku).slice(0, 40)}\n${qty}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`);
+  }
   const stamp = jstStampLabel(data.importedAt);
   const header = `📦 ${cmd.block} の在庫一覧 (${stamp || '取得時刻不明'}時点)\n${rows.length}件・フリー計${totalFree.toLocaleString('ja-JP')}個`;
-  return chunkTextMessages(header, ['', ...lines]);
+  return chunkTextMessages(header, lines);
 }
 
 /** SKU のロケーション別在庫の返信テキスト。データ無しは null。 */
