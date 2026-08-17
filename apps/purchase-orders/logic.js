@@ -107,7 +107,9 @@ export function loadPml() {
 // - po_product_code_canonical を更新しない — mirror の商品IDは小文字化済みで
 //   ロジザード登録表記 (大小) が失われている (表記の正はCSV手動取込・NE取込のみ)
 
-/** mirror_logizard_stock の最新 captured_at (表が無い環境=init fail-soft でも落とさない) */
+/** mirror_logizard_stock の最新 captured_at (表が無い環境=init fail-soft でも落とさない)。
+ *  MAXは文字列順だが、mirror は毎時「全置換」で全行が同一 captured_at (単一世代) かつ
+ *  書込み元 (miniPC sync-to-render.js) は toISOString 固定のため表記ゆれは混在しない (Codex LZM-R3 Low回答) */
 export function logizardMirrorLatestCapture(db) {
   try {
     const r = db.prepare('SELECT MAX(captured_at) AS c FROM mirror_logizard_stock').get();
@@ -141,10 +143,14 @@ export function maybeRefreshFromLogizardMirror() {
   lzMirrorLastCheckMs = Date.now();
   try {
     const db = getDB();
+    // 世代チェック〜集計〜置換を単一の即時トランザクションで行う (mirror世代・meta・suppression を
+    // 同一スナップショットで読む。チェックと書込みの間に毎時push/手動取込/解除が割り込んで
+    // 旧capに新世代の集計を紐付けたり負数検査を迂回したりしない — Codex LZM-R1/R3 Medium)。
+    // 全体で実測50ms未満・60秒throttle付きのためロック保持は問題にならない
+    db.transaction(() => {
     const cap = logizardMirrorLatestCapture(db);
     if (!cap) return; // mirror未着 (初回push前・表なし)
-    // 適用してよい状態か (集計前の早期スキップ用と、書込みtx内の再確認=CASの両方で使う。
-    // チェック〜書込みの間に手動取込/解除が割り込んでも古い自動反映で上書きしない — Codex LZM-R1 Medium)
+    // 適用してよい状態か
     const shouldApply = () => {
       // mirror が朝のPML同期より古いなら適用しない — 朝のNE在庫の方が新しい (overlay無し=初回や
       // 解除後でも、前日18時のmirrorで今朝の在庫を上書きしない。Codex LZM-R2 High)
@@ -200,20 +206,18 @@ export function maybeRefreshFromLogizardMirror() {
       .map(r => [normProductCode(r['商品コード']), String(r['商品コード']).trim()]));
     const zeroFill = [...pmlActive].filter(([k]) => !byKey.has(k));
     const now = new Date().toISOString();
-    db.transaction(() => {
-      if (!shouldApply()) return; // CAS: 集計中に手動取込/解除が入っていたら書込み中止
-      db.prepare('DELETE FROM po_ne_overlay_rows').run();
-      const ins = db.prepare('INSERT INTO po_ne_overlay_rows (product_key, product_code, 在庫数, 引当数) VALUES (?,?,?,?)');
-      for (const [key, v] of byKey) ins.run(key, v.code, v.stock, v.alloc);
-      for (const [key, code] of zeroFill) ins.run(key, code, 0, null);
-      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source, captured_at)
-                  VALUES (1,?,?,NULL,'logizard_mirror',?)
-                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count,
-                    filename=excluded.filename, source=excluded.source, captured_at=excluded.captured_at`)
-        .run(now, byKey.size + zeroFill.length, cap);
-      audit(db, { actorType: 'system', actor: 'lz-mirror-auto', action: 'logizard_mirror_refresh', resource: 'ne_overlay',
-        detail: { captured_at: cap, products: byKey.size, zeroFill: zeroFill.length } });
-    })();
+    db.prepare('DELETE FROM po_ne_overlay_rows').run();
+    const ins = db.prepare('INSERT INTO po_ne_overlay_rows (product_key, product_code, 在庫数, 引当数) VALUES (?,?,?,?)');
+    for (const [key, v] of byKey) ins.run(key, v.code, v.stock, v.alloc);
+    for (const [key, code] of zeroFill) ins.run(key, code, 0, null);
+    db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source, captured_at)
+                VALUES (1,?,?,NULL,'logizard_mirror',?)
+                ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count,
+                  filename=excluded.filename, source=excluded.source, captured_at=excluded.captured_at`)
+      .run(now, byKey.size + zeroFill.length, cap);
+    audit(db, { actorType: 'system', actor: 'lz-mirror-auto', action: 'logizard_mirror_refresh', resource: 'ne_overlay',
+      detail: { captured_at: cap, products: byKey.size, zeroFill: zeroFill.length } });
+    }).immediate(); // 即時write lock取得 (読み→書きのロック昇格レースを避ける。markCycleFbaJobDone と同方式)
   } catch (e) {
     console.error('[po] logizard mirror自動反映エラー (発注画面は継続):', e.message);
   }
