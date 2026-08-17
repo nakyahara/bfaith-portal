@@ -14,6 +14,8 @@
  *       externalStatus?, externalIsRead?,        // モール側状態 (表示専用カラムへ)
  *       initialInternalStatus?,                  // 'done' のみ許可。新規作成時だけ適用 (メールルール
  *                                                //   import_done用。既存チケットの状態は変えない)
+ *       initialFolderId?,                        // 整数のみ。新規作成時だけ適用 (メールルールの
+ *                                                //   フォルダ振り分け用。既存チケットのフォルダは動かさない)
  *       receivedAt,                              // 必須 (新規作成時に使用)
  *       messages: [{
  *         externalMessageId?,                    // 無ければ syntheticMessageId() で決定的に採番
@@ -100,17 +102,19 @@ function ingestInquiry(db, shop, item, nowIso) {
 
   if (!inq) {
     // initialInternalStatus: 'done' のみ (メールルール import_done = 自動配信等を取り込みつつ完了扱い)。
-    // 適用は新規作成時のみで、以後の顧客新着では通常どおり done → open に再オープンされる
+    // initialFolderId: メールルールのフォルダ振り分け (2026-08-17)。
+    // どちらも適用は新規作成時のみで、以後の顧客新着では通常どおり done → open に再オープンされる
     const initDone = item.initialInternalStatus === 'done';
+    const initFolderId = Number.isInteger(item.initialFolderId) ? item.initialFolderId : null;
     const r = db.prepare(`INSERT INTO inquiries (
         channel_type, shop_id, external_inquiry_id, customer_name, customer_identifier, subject,
-        internal_status, is_unread, completed_at,
+        internal_status, is_unread, completed_at, folder_id,
         external_status, external_is_read, last_external_synced_at,
         order_number, product_code, product_name, received_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(shop.channel_type, shop.id, item.externalInquiryId,
         item.customerName ?? null, item.customerIdentifier ?? null, item.subject ?? null,
-        initDone ? 'done' : 'open', initDone ? 0 : 1, initDone ? nowIso : null,
+        initDone ? 'done' : 'open', initDone ? 0 : 1, initDone ? nowIso : null, initFolderId,
         extStatus, extRead, nowIso,
         item.orderNumber ?? null, item.productCode ?? null, item.productName ?? null,
         toUtcIso(item.receivedAt));

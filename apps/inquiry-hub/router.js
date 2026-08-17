@@ -412,9 +412,16 @@ router.get('/inquiries/:id', (req, res) => {
           <select id="mrAction">
             <option value="skip">取り込まない (問い合わせにしない)</option>
             <option value="import_done">取り込むが完了扱い (履歴には残す)</option>
+            <option value="import">📁フォルダに入れる (新着のまま)</option>
           </select>
         </div>
-        <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールも完了にする</label>
+        <div class="row rule-row">
+          <select id="mrFolder" title="取り込むメールを入れるフォルダ (「フォルダに入れる」では必須。完了扱いと組み合わせも可)">
+            <option value="">📁 フォルダ指定なし</option>
+            ${folderList.map(f => `<option value="${f.id}"${inq.folder_id === f.id ? ' selected' : ''}>📁 ${he(f.name)}</option>`).join('')}
+          </select>
+        </div>
+        <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールにも適用する</label>
         <div class="sub">※ 一括適用は差出人・件名の条件のみ対応 (Reply-To/To/本文は今後の取り込みから効きます)</div>
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
@@ -607,26 +614,37 @@ router.get('/inquiries/:id', (req, res) => {
       var conditions = collectConditions();
       if (!conditions.length) { toast('条件を1つ以上入力してください'); return; }
       var action = document.getElementById('mrAction').value;
+      var folderSel = document.getElementById('mrFolder');
+      var folderId = folderSel.value ? Number(folderSel.value) : null;
+      var folderName = folderSel.value ? folderSel.options[folderSel.selectedIndex].textContent.replace(/^\\s*📁\\s*/, '') : '';
+      if (action === 'import' && !folderId) { toast('「フォルダに入れる」はフォルダを選んでください'); return; }
+      if (action === 'skip') folderId = null; // 取り込まないルールにフォルダは無意味
+      var actionLabel = action === 'skip' ? '取り込まない'
+        : action === 'import' ? 'フォルダ「' + folderName + '」に入れる (新着のまま)'
+        : '取り込むが完了扱い' + (folderId ? ' + フォルダ「' + folderName + '」へ' : '');
       var matchMode = document.getElementById('mrMode').value;
       var applyExisting = document.getElementById('mrApplyExisting').checked;
       mrBtn.disabled = true;
-      // まず件数を数えてから確認する (いきなり大量を完了にしない)
-      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, applyToExisting: applyExisting, dryRun: true })
+      // まず件数を数えてから確認する (いきなり大量を変更しない)
+      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, applyToExisting: applyExisting, dryRun: true })
         .then(function(p) {
-          var msg = 'ルール: ' + p.description + '\\n扱い: ' + (action === 'skip' ? '取り込まない' : '取り込むが完了扱い');
+          var msg = 'ルール: ' + p.description + '\\n扱い: ' + actionLabel;
           if (applyExisting) {
             msg += p.canApplyToExisting
-              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も完了にします'
+              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も' + (action === 'import' ? 'フォルダに入れます' : '完了にします')
               : '\\n\\n⚠️ この条件は既存メールへの一括適用に対応していません (差出人・件名の条件のみ)。今後の取り込みからルールが効きます';
           }
           msg += '\\n\\n作成しますか?';
           if (!confirm(msg)) { mrBtn.disabled = false; return null; }
-          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action,
+          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId,
             applyToExisting: applyExisting && p.canApplyToExisting });
         })
         .then(function(r) {
           if (!r) return;
-          toast('ルールを作成しました' + (r.completed ? ' (既存' + r.completed + '件を完了に)' : ''));
+          var done = [];
+          if (r.completed) done.push('既存' + r.completed + '件を完了に');
+          if (r.foldered) done.push('既存' + r.foldered + '件をフォルダへ');
+          toast('ルールを作成しました' + (done.length ? ' (' + done.join('・') + ')' : ''));
           setTimeout(function(){ location.reload(); }, 1000);
         })
         .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
@@ -873,7 +891,13 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   if (inq.channel_type !== 'email') return res.status(400).json({ error: 'メール以外のチャネルでは使えません' });
   const b = req.body || {};
   const action = String(b.action || '');
-  if (!['skip', 'import_done'].includes(action)) return res.status(400).json({ error: '不正な扱いです' });
+  if (!['skip', 'import_done', 'import'].includes(action)) return res.status(400).json({ error: '不正な扱いです' });
+  // フォルダ振り分け (2026-08-17 中原さん要望: Gmailの振り分けのように、その場で「今後はこのフォルダへ」)
+  const folderId = b.folderId != null && b.folderId !== '' ? Number(b.folderId) : null;
+  if (folderId != null && !Number.isInteger(folderId)) return res.status(400).json({ error: 'フォルダ指定が不正です' });
+  const folder = folderId != null ? listFolders().find(f => f.id === folderId) : null;
+  if (folderId != null && !folder) return res.status(400).json({ error: '指定のフォルダが存在しません' });
+  if (action === 'import' && !folder) return res.status(400).json({ error: '「フォルダに入れる」はフォルダの指定が必要です' });
 
   // 条件は画面が組み立てて配列で渡す (メールディーラーと同じく複数条件の組み合わせが可能)。
   // 値の検証は mail-rules.js の validateConditions (フィールド/演算子のallow-list) に委ねる
@@ -890,6 +914,9 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
   }
+  const actionLabel = action === 'skip' ? '取り込まない'
+    : action === 'import' ? `📁${folder.name}へ`
+      : `完了扱い${folder ? ` + 📁${folder.name}へ` : ''}`;
 
   const applyToExisting = b.applyToExisting === true;
   const applicable = canApplyToExisting(conditions);
@@ -897,25 +924,25 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
     // 下見: ルールは作らず、既存で何件が対象になるかだけ返す
     if (b.dryRun === true) {
       const matched = applicable
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: false }).matched : 0;
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: false, action, folderId }).matched : 0;
       return res.json({ ok: true, description, canApplyToExisting: applicable, matched: applyToExisting ? matched : 0 });
     }
     // ルール作成と既存への一括適用は同一トランザクションで (途中で失敗したときに
     // ルールだけ残り、再試行で重複ルールができるのを防ぐ。Codexレビュー反映)
-    const { created, completed } = getDB().transaction(() => {
+    const { created, completed, foldered } = getDB().transaction(() => {
       const c = addMailRule({
-        name: `${description} → ${action === 'skip' ? '取り込まない' : '完了扱い'}`.slice(0, 200),
-        matchMode, conditions, action, priority: 50,
+        name: `${description} → ${actionLabel}`.slice(0, 200),
+        matchMode, conditions, action, priority: 50, folderId,
       });
       // 既存への一括適用は差出人・件名の条件のみ (Reply-To/To/本文は inquiries に無いため)。
       // 非対応の条件でも「今後の取り込み」からはルールが効く
-      const n = (applyToExisting && applicable)
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req) }).completed
-        : 0;
-      return { created: c, completed: n };
+      const r = (applyToExisting && applicable)
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req), action, folderId })
+        : { completed: 0, foldered: 0 };
+      return { created: c, completed: r.completed, foldered: r.foldered };
     }).immediate();
-    console.log(`[inquiry-hub] メールルール作成 (${description} → ${action}) by ${actorOf(req)} / 既存${completed}件を完了`);
-    res.json({ ok: true, id: created.id, description, completed });
+    console.log(`[inquiry-hub] メールルール作成 (${description} → ${actionLabel}) by ${actorOf(req)} / 既存 完了${completed}件・フォルダ${foldered}件`);
+    res.json({ ok: true, id: created.id, description, completed, foldered });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
   }
@@ -1371,10 +1398,13 @@ const RULE_OP_LABELS = {
 const RULE_ACTION_LABELS = {
   skip: { label: '🗑️取り込まない', style: 'background:#fee2e2;color:#b91c1c' },
   import_done: { label: '✅取込+完了扱い', style: 'background:#dcfce7;color:#166534' },
+  import: { label: '📁フォルダに入れる', style: 'background:#fef9c3;color:#854d0e' },
 };
 
 router.get('/mail-rules', (req, res) => {
   const rules = listMailRules();
+  const folders = listFolders();
+  const folderNameById = Object.fromEntries(folders.map(f => [f.id, f.name]));
   const fmtConds = (r) => {
     let conds;
     try { conds = JSON.parse(r.conditions_json); } catch { return '(解析不能)'; }
@@ -1383,12 +1413,13 @@ router.get('/mail-rules', (req, res) => {
   };
   const trs = rules.map(r => {
     const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
+    const folderTag = r.folder_id ? ` <span class="folder-chip">📁${he(folderNameById[r.folder_id] || `#${r.folder_id} (削除済み)`)}</span>` : '';
     return `
     <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
       <td class="nowrap" data-label="優先度">${r.priority}</td>
       <td data-full>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
       <td style="overflow-wrap:anywhere" data-full data-label="条件">${fmtConds(r)}</td>
-      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
+      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span>${folderTag}</td>
       <td class="nowrap ops">
         <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
         <button onclick="deleteRule(${r.id}, this)">削除</button>
@@ -1432,9 +1463,11 @@ router.get('/mail-rules', (req, res) => {
       </div>`).join('')}
       <div class="row rule-row" style="align-items:center">
         <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
-        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option></select>
+        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option><option value="import">📁フォルダに入れる (新着のまま)</option></select>
+        <select id="nFolder"><option value="">📁 フォルダ指定なし</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}</option>`).join('')}</select>
         <button class="pri" onclick="addRule(this)">追加</button>
       </div>
+      <div class="sub">フォルダは「取り込まない」以外で指定できます (「フォルダに入れる」では必須。取込+完了扱いとの組み合わせも可)</div>
     </div>
   </div>
   <div class="card">
@@ -1491,8 +1524,9 @@ async function testRule(btn) {
       from: document.getElementById('tFrom').value, subject: document.getElementById('tSubject').value,
       reply_to: document.getElementById('tReplyTo').value, body: document.getElementById('tBody').value,
     });
+    var actLabel = { skip: '🗑️取り込まない', import_done: '✅取込+完了扱い', import: '📁フォルダに入れる' };
     document.getElementById('testResult').textContent = r.match
-      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (r.match.action === 'skip' ? '🗑️取り込まない' : '✅取込+完了扱い')
+      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (actLabel[r.match.action] || r.match.action)
       : '→ どのルールにも一致しない = 通常どおり問い合わせとして取り込む';
   } catch (e) { toast('失敗: ' + e.message); }
   btn.disabled = false;
@@ -1511,6 +1545,7 @@ async function addRule(btn) {
     await post('/apps/inquiry-hub/api/mail-rules', {
       name: document.getElementById('nName').value, priority: Number(document.getElementById('nPriority').value),
       matchMode: document.getElementById('nMode').value, action: document.getElementById('nAction').value,
+      folderId: document.getElementById('nFolder').value || null,
       conditions: conditions,
     });
     toast('追加しました'); setTimeout(function(){ location.reload(); }, 700);
@@ -1528,7 +1563,7 @@ document.getElementById('ruleFilter').addEventListener('input', function() {
 router.post('/api/mail-rules', (req, res) => {
   try {
     const b = req.body || {};
-    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority) }) });
+    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority), folderId: b.folderId }) });
   } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
 });
 
