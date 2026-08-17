@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -167,6 +167,50 @@ const MIGRATIONS = {
       created_at      TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_ship_changes ON pk_pack_ship_changes(status, id)');
+  },
+  // v4: ①再ピック / ②棚戻し / ③ピッキングミス記録 (要件§5.4〜5.6・Phase 2)
+  4: () => {
+    // 再ピック・棚戻しタスク。DBの行が正本 (GChat通知はチャネル)。
+    // 実行UIは apps/picking (要件§7.1) だが、更新は packing の service (applyTaskAction) を通す
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_tasks (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id     INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq     INTEGER,               -- 依頼元伝票 (余りはバッチ単位でNULLあり)
+      kind         TEXT NOT NULL CHECK(kind IN ('repick','return')),
+      sku          TEXT NOT NULL,
+      product_name TEXT,
+      req_qty      INTEGER NOT NULL,
+      location     TEXT,                  -- pk_lines由来の参考ロケ (戻し先の正ではない — 要件§5.5)
+      block        TEXT,
+      folder_name  TEXT,                  -- 依頼元 出荷_XX (届け先の識別)
+      status       TEXT NOT NULL DEFAULT 'requested'
+        CHECK(status IN ('requested','claimed','fulfilled','returned','received','unavailable','cancelled')),
+      requested_by TEXT NOT NULL,
+      claimed_by   TEXT,
+      incident_id  INTEGER,               -- 対応するミス候補 (wrong_itemは2タスクが同じidを指す)
+      created_at   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_open ON pk_pack_tasks(status, id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_batch ON pk_pack_tasks(batch_id, slip_seq)');
+    // ピッキングミス候補 (③)。作業中=candidate → 梱包完了サマリで confirmed / withdrawn (要件§5.6 2段階)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_incidents (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id          INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq          INTEGER,
+      kind              TEXT NOT NULL CHECK(kind IN ('shortage','excess','wrong_item')),
+      sku               TEXT NOT NULL,     -- 期待SKU (excessは余った実SKU)
+      actual_sku        TEXT,              -- wrong_item: 実際に入っていたSKU
+      qty               INTEGER NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'candidate'
+        CHECK(status IN ('candidate','withdrawn','confirmed')),
+      attributed_worker TEXT,              -- 確定時: pk_batches.worker (ピッキング担当)
+      detected_by       TEXT NOT NULL,     -- 検知した梱包者
+      confirmed_by      TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_incidents_batch ON pk_pack_incidents(batch_id, status)');
   },
 };
 

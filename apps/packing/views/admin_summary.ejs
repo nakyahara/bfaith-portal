@@ -66,6 +66,39 @@
       </div>
     <% } %>
 
+    <% if (summary.incidents && (summary.incidents.confirmed.length > 0 || summary.incidents.candidateCount > 0)) { %>
+      <h2>③ ピッキングミス (確定分・帰責=ピッキング担当)</h2>
+      <% if (summary.incidents.candidateCount > 0) { %>
+        <div style="color:#e8590c; font-weight:600; margin-bottom:6px">⚠ 未確定の候補が <%= summary.incidents.candidateCount %> 件あります (梱包完了画面で確定/取下げ)</div>
+      <% } %>
+      <table>
+        <thead><tr><th>ピッキング担当</th><th class="num">計</th><th class="num">不足</th><th class="num">余り</th><th class="num">品違い</th></tr></thead>
+        <tbody>
+          <% for (const w of summary.incidents.byWorker) { %>
+            <tr><td><%= w.key %></td><td class="num"><%= w.count %></td><td class="num"><%= w.shortage %></td><td class="num"><%= w.excess %></td><td class="num"><%= w.wrong_item %></td></tr>
+          <% } %>
+          <% if (summary.incidents.byWorker.length === 0) { %><tr><td colspan="5">確定したミスはありません</td></tr><% } %>
+        </tbody>
+      </table>
+      <% if (summary.incidents.confirmed.length > 0) { %>
+        <table>
+          <thead><tr><th>種別</th><th>SKU</th><th class="num">数量</th><th>バッチ</th><th>担当</th><th>検知</th></tr></thead>
+          <tbody>
+            <% for (const i of summary.incidents.confirmed) { %>
+              <tr>
+                <td><%= { shortage: '📉不足', excess: '📈余り', wrong_item: '🔀品違い' }[i.kind] %></td>
+                <td><%= i.sku %><%= i.actual_sku ? ` (実際: ${i.actual_sku})` : '' %></td>
+                <td class="num"><%= i.qty %></td>
+                <td><%= i.folder_name || '-' %><%= i.slip_seq ? ` #${i.slip_seq}` : '' %></td>
+                <td><%= i.attributed_worker || '-' %></td>
+                <td><%= i.detected_by %></td>
+              </tr>
+            <% } %>
+          </tbody>
+        </table>
+      <% } %>
+    <% } %>
+
     <h2>作業者別 (完了バッチの最終担当者に全量計上)</h2>
     <table>
       <thead><tr><th>作業者</th><th class="num">バッチ</th><th class="num">伝票</th><th class="num">数量</th><th class="num">実働</th><th class="num">秒/伝票</th></tr></thead>

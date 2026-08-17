@@ -78,6 +78,11 @@
   </header>
 
   <div class="pk-wrap">
+    <% if (typeof openTasks !== 'undefined' && openTasks > 0) { %>
+      <a href="/apps/picking/tasks" style="display:block; background:#ffe3e3; border:2px solid #e03131; border-radius:12px; padding:12px 16px; margin-bottom:10px; font-size:1.1em; font-weight:800; color:#c92a2a; text-decoration:none;">
+        🔴 再ピック・棚戻し <%= openTasks %>件 — タップして対応
+      </a>
+    <% } %>
     <div class="pk-bar">
       <form method="get" action="/apps/picking/">
         <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">

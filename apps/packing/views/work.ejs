@@ -158,10 +158,15 @@
     <div class="jump-banner" id="jumpBanner">⚠ ズレ回復モード: 順序から外れた伝票を表示中。「次へ」で完了すると、間の伝票は未処理のまま残ります (最後に必ず戻ります)</div>
     <div class="paper" id="paper"></div>
     <div class="undo-link" id="undoLink"><button type="button" id="undoBtn">この伝票の完了を取り消す…</button></div>
+    <div class="undo-link" id="repickLink" style="text-align:center">
+      <button type="button" id="receiveBtn" style="border-color:#2b8a3e; color:#2b8a3e; font-weight:700; padding:10px 18px; font-size:16px">📦 再ピック品を受け取った (再開)</button>
+      <button type="button" id="foundBtn" style="margin-left:8px">見つかった (依頼取下げ)</button>
+    </div>
   </div>
 
   <div class="controls">
-    <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:104px">配送⚠</button>
+    <button class="btn-prev" id="issueBtn" type="button" style="flex-basis:104px">⚠不足/余り</button>
+    <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:96px">配送⚠</button>
     <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
   </div>
@@ -240,9 +245,34 @@
     </div>
   </div>
 
+  <div class="overlay" id="issueOverlay">
+    <div class="box">
+      <h2 id="issueTitle">どうしましたか？</h2>
+      <div id="issueStep1" class="reason-grid">
+        <button class="reason-opt" data-issue="shortage">📉 不足<br><small>商品が足りない</small></button>
+        <button class="reason-opt" data-issue="excess">📈 余り<br><small>商品が余った</small></button>
+        <button class="reason-opt" data-issue="wrong_item" style="grid-column:1/-1">🔀 品違い<br><small>違う商品が入っていた</small></button>
+      </div>
+      <div id="issueStep2" style="display:none">
+        <div id="issueSkuGrid" class="reason-grid" style="max-height:40vh; overflow-y:auto"></div>
+        <input class="search-input" id="issueSkuInput" placeholder="SKU or 商品名で検索" style="margin-top:10px; display:none" list="batchSkus">
+        <datalist id="batchSkus"></datalist>
+      </div>
+      <div id="issueStep3" style="display:none">
+        <div style="color:#868e96; margin-bottom:10px" id="issueQtyLabel">数量は?</div>
+        <div id="issueQtyGrid" class="reason-grid"></div>
+      </div>
+      <button class="sheet-cancel" id="issueCancel" type="button">やめる</button>
+    </div>
+  </div>
+
   <div class="overlay" id="doneOverlay">
     <div class="box">
       <div class="done-big">✅ <%= state.batch.folder_name || '' %><br><%= state.slips.length %>伝票 完了しました</div>
+      <div id="incBox" style="display:none; text-align:left; margin-top:16px; border-top:1px solid #dee2e6; padding-top:12px">
+        <div style="font-weight:800; margin-bottom:8px">⚠ ピッキングミス候補の確認 (残った不足・余り・品違い)</div>
+        <div id="incList"></div>
+      </div>
       <div style="margin-top:18px"><a href="/apps/packing/" style="font-size:20px">一覧へ戻る</a></div>
     </div>
   </div>
@@ -262,6 +292,9 @@
       pausedTotalSec: state.batch.paused_total_sec || 0,
       currentSeq: state.currentSeq,
       heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+      repickSeqs: state.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+      repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
+      incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
       shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
@@ -292,6 +325,9 @@
     const bySeq = new Map(STATE.slips.map((s) => [s.seq, s]));
     const doneSet = new Set(STATE.slips.filter((s) => s.status === 'done').map((s) => s.seq));
     const heldSet = new Set(STATE.heldSeqs || []);
+    const repickSet = new Set(STATE.repickSeqs || []);
+    const repickReadySet = new Set(STATE.repickReadySeqs || []);
+    let incidents = STATE.incidents || [];   // 未確定のミス候補 (完了サマリで確定/取下げ)
     let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
     let jumpMode = false;               // 検索ジャンプで順序から外れた伝票を表示中
     let paused = STATE.batchStatus === 'paused';
@@ -323,7 +359,8 @@
       $('slipNo').textContent = s.neSlipNo;
       $('mall').textContent = s.mall || '';
       $('doneTag').style.display = doneSet.has(s.seq) ? 'inline-block' : 'none';
-      $('doneTag').textContent = heldSet.has(s.seq) ? '⏳ 保留中 (配送変更待ち)' : '✔ 完了済み';
+      $('doneTag').textContent = heldSet.has(s.seq)
+        ? (repickSet.has(s.seq) ? '⏳ 保留中 (再ピック待ち)' : '⏳ 保留中 (配送変更待ち)') : '✔ 完了済み';
       if (heldSet.has(s.seq)) $('doneTag').style.display = 'inline-block';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
@@ -380,7 +417,12 @@
       }
       $('jumpBanner').style.display = (jumpMode && viewingPending && viewSeq !== currentSeq) ? 'block' : 'none';
       // 完了取消リンク: 最後に完了した伝票を閲覧中のときだけ
-      $('undoLink').style.display = (!viewingPending && viewSeq === lastDoneSeq) ? 'block' : 'none';
+      $('undoLink').style.display = (!viewingPending && !viewingHeld && viewSeq === lastDoneSeq) ? 'block' : 'none';
+      // 再ピック保留の伝票: 受領/取下げボタン (受領はピッカーが「持って行った」後のみ活性)
+      $('repickLink').style.display = (viewingHeld && repickSet.has(viewSeq)) ? 'block' : 'none';
+      const ready = repickReadySet.has(viewSeq);
+      $('receiveBtn').disabled = !ready;
+      $('receiveBtn').textContent = ready ? '📦 再ピック品を受け取った (再開)' : '⏳ 再ピック対応待ち…';
       $('prevBtn').disabled = viewSeq <= 1;
       maybeSpeak();
     }
@@ -546,12 +588,23 @@
         heldSet.clear();
         for (const q of body.heldSeqs) heldSet.add(q);
       }
+      if (Array.isArray(body.repickSeqs)) {
+        repickSet.clear();
+        for (const q of body.repickSeqs) repickSet.add(q);
+      }
+      if (Array.isArray(body.repickReadySeqs)) {
+        repickReadySet.clear();
+        for (const q of body.repickReadySeqs) repickReadySet.add(q);
+      }
+      if (Array.isArray(body.incidents)) {
+        incidents = body.incidents.map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku ?? i.actualSku, qty: i.qty, slipSeq: i.slip_seq ?? i.slipSeq }));
+      }
       if (body.lastDoneSeq !== undefined) lastDoneSeq = body.lastDoneSeq;
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
       paused = body.batchStatus === 'paused';
       updatePausedOverlay(body.pauseReason);
       if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
-      if (body.batchStatus === 'done') $('doneOverlay').style.display = 'flex';
+      if (body.batchStatus === 'done') showDoneOverlay();
       // 楽観更新と同じ結果なら再描画しない (タップのたびに紙面が描き直されてチラつかないように)
       if (before !== `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`) render();
     }
@@ -595,9 +648,12 @@
         }
         viewSeq = next;
         render();
+      } else if (heldSet.size > 0) {
+        render();
+        showToast('保留中の伝票が残っています (再ピック/配送変更の対応待ち)');
       } else {
         jumpMode = false;
-        $('doneOverlay').style.display = 'flex';
+        showDoneOverlay();
         render();
         // render 内の maybeSpeak (閲覧扱いの cancel) より後に完了を読み上げる
         speak(`${STATE.folderName} ${STATE.slips.length}件、完了しました`);
@@ -654,6 +710,168 @@
         $('doneOverlay').style.display = 'none';
         render();
       });
+    });
+
+    // ── 完了オーバーレイ (③ミス候補の確定つき — 要件§5.6) ──
+    const INC_LABEL = { shortage: '📉 不足', excess: '📈 余り', wrong_item: '🔀 品違い' };
+    function showDoneOverlay() {
+      $('doneOverlay').style.display = 'flex';
+      if (incidents.length === 0) { $('incBox').style.display = 'none'; return; }
+      $('incBox').style.display = 'block';
+      $('incList').innerHTML = incidents.map((i) => `
+        <div style="display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid #f1f3f5">
+          <span style="flex:1; font-size:15px">${INC_LABEL[i.kind] || i.kind} ${esc(i.sku)}${i.actualSku ? ` (実際: ${esc(i.actualSku)})` : ''} × ${i.qty}${i.slipSeq ? ` / #${i.slipSeq}` : ''}</span>
+          <button type="button" class="inc-confirm" data-id="${i.id}" style="padding:8px 14px; background:#e03131; color:#fff; border:none; border-radius:8px; font-weight:700">ミス確定</button>
+          <button type="button" class="inc-withdraw" data-id="${i.id}" style="padding:8px 14px; background:#f1f3f5; border:1px solid #ced4da; border-radius:8px">取下げ</button>
+        </div>`).join('');
+      document.querySelectorAll('.inc-confirm, .inc-withdraw').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const decision = btn.classList.contains('inc-confirm') ? 'confirm' : 'withdraw';
+          btn.disabled = true;
+          try {
+            const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/incidents/${btn.dataset.id}/resolve`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ decision, worker_name: worker }),
+            });
+            if (!res.ok) { const b = await res.json().catch(() => ({})); showToast(b.error || `エラー (${res.status})`); return; }
+            incidents = incidents.filter((i) => i.id !== Number(btn.dataset.id));
+            showDoneOverlay();
+          } finally { btn.disabled = false; }
+        });
+      });
+    }
+
+    // ── ①不足 / ②余り / 品違い (要件§5.4〜5.6) ──
+    let issue = null;   // { type, sku, actualSku, maxQty }
+    function issueReset() { issue = null; $('issueOverlay').style.display = 'none'; }
+    function slipSkuButtons(onPick) {
+      const s = bySeq.get(viewSeq);
+      $('issueSkuGrid').innerHTML = s.lines.map((l, i) =>
+        `<button class="reason-opt issue-sku" data-i="${i}" style="grid-column:1/-1; text-align:left">${esc(l.name)}<br><small>${esc(l.sku)} × ${l.qty}個</small></button>`).join('');
+      document.querySelectorAll('.issue-sku').forEach((btn) => {
+        btn.addEventListener('click', () => onPick(s.lines[Number(btn.dataset.i)]));
+      });
+    }
+    function qtyButtons(max, onPick) {
+      const n = Math.min(max, 9);
+      $('issueQtyGrid').innerHTML = Array.from({ length: n }, (_, i) =>
+        `<button class="reason-opt issue-qty" data-q="${i + 1}">${i + 1}個</button>`).join('');
+      document.querySelectorAll('.issue-qty').forEach((btn) => {
+        btn.addEventListener('click', () => onPick(Number(btn.dataset.q)));
+      });
+    }
+    function allBatchSkus() {
+      const seen = new Map();
+      for (const sl of STATE.slips) for (const l of sl.lines) if (!seen.has(l.sku)) seen.set(l.sku, l.name);
+      return [...seen.entries()];
+    }
+    function fillSkuDatalist() {
+      $('batchSkus').innerHTML = allBatchSkus().map(([sku, name]) => `<option value="${esc(sku)}">${esc(name)}</option>`).join('');
+    }
+    $('issueBtn').addEventListener('click', () => {
+      if (paused || !worker || currentSeq == null && doneSet.size === 0) return;
+      issue = null;
+      $('issueTitle').textContent = 'どうしましたか？';
+      $('issueStep1').style.display = 'grid';
+      $('issueStep2').style.display = 'none';
+      $('issueStep3').style.display = 'none';
+      $('issueOverlay').style.display = 'flex';
+    });
+    $('issueCancel').addEventListener('click', issueReset);
+    document.querySelectorAll('#issueStep1 .reason-opt').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const type = btn.dataset.issue;
+        if ((type === 'shortage' || type === 'wrong_item') && heldSet.has(viewSeq)) {
+          showToast('この伝票は保留中です'); issueReset(); return;
+        }
+        issue = { type };
+        $('issueStep1').style.display = 'none';
+        $('issueStep2').style.display = 'block';
+        if (type === 'excess') {
+          // バッチ内SKUから検索 (要件§5.5)。候補+自由入力
+          $('issueTitle').textContent = '余った商品は？';
+          $('issueSkuGrid').innerHTML = '';
+          $('issueSkuInput').style.display = 'block';
+          $('issueSkuInput').value = '';
+          fillSkuDatalist();
+          $('issueSkuInput').onchange = () => {
+            const v = $('issueSkuInput').value.trim();
+            if (!v) return;
+            issue.sku = v;
+            $('issueStep2').style.display = 'none';
+            $('issueStep3').style.display = 'block';
+            qtyButtons(9, (q) => { sendIssue({ ...issue, qty: q }); });
+          };
+        } else {
+          $('issueTitle').textContent = type === 'shortage' ? '足りない商品は？' : '本来入るはずの商品は？';
+          $('issueSkuInput').style.display = 'none';
+          slipSkuButtons((line) => {
+            issue.sku = line.sku;
+            issue.maxQty = line.qty;
+            if (type === 'wrong_item') {
+              // 実際に入っていた商品 (自由入力+バッチ内候補)
+              $('issueTitle').textContent = '実際に入っていた商品は？';
+              $('issueSkuGrid').innerHTML = '';
+              $('issueSkuInput').style.display = 'block';
+              $('issueSkuInput').value = '';
+              fillSkuDatalist();
+              $('issueSkuInput').onchange = () => {
+                const v = $('issueSkuInput').value.trim();
+                if (!v) return;
+                issue.actualSku = v;
+                $('issueStep2').style.display = 'none';
+                $('issueStep3').style.display = 'block';
+                qtyButtons(issue.maxQty, (q) => { sendIssue({ ...issue, qty: q }); });
+              };
+            } else {
+              $('issueStep2').style.display = 'none';
+              $('issueStep3').style.display = 'block';
+              qtyButtons(issue.maxQty, (q) => { sendIssue({ ...issue, qty: q }); });
+            }
+          });
+        }
+      });
+    });
+    function sendIssue({ type, sku, actualSku, qty }) {
+      issueReset();
+      const seq = viewSeq;
+      if (type === 'excess') {
+        enqueue('excess', seq, { sku, qty });
+        incidents.push({ id: `tmp-${Date.now()}`, kind: 'excess', sku, qty, slipSeq: null });
+        showToast(`余り ${sku} × ${qty} を棚戻し依頼しました`);
+        return;
+      }
+      enqueue(type, seq, type === 'wrong_item' ? { sku, actual_sku: actualSku, qty } : { sku, qty });
+      incidents.push({ id: `tmp-${Date.now()}`, kind: type, sku, actualSku: actualSku || null, qty, slipSeq: seq });
+      doneSet.delete(seq);
+      heldSet.add(seq);
+      repickSet.add(seq);
+      $('doneOverlay').style.display = 'none';
+      showToast(type === 'shortage'
+        ? `不足 ${sku} × ${qty} を再ピック依頼しました (伝票は保留)`
+        : '品違いを記録しました (正しい商品の再ピック+間違い品の棚戻し)');
+      currentSeq = minPending();
+      const next = nextPendingAfter(seq);
+      if (next != null) { viewSeq = next; }
+      render();
+    }
+    $('receiveBtn').addEventListener('click', () => {
+      const seq = viewSeq;
+      enqueue('receive', seq, {});
+      heldSet.delete(seq); repickSet.delete(seq);
+      currentSeq = minPending();
+      showToast('保留を解除しました。梱包を続けてください');
+      render();
+    });
+    $('foundBtn').addEventListener('click', () => {
+      if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
+      const seq = viewSeq;
+      enqueue('found', seq, {});
+      heldSet.delete(seq); repickSet.delete(seq);
+      incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');
+      currentSeq = minPending();
+      showToast('依頼を取り下げました');
+      render();
     });
 
     // ── ④ 配送方法変更 (伝票を保留して事務へ依頼) ──
