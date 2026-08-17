@@ -700,8 +700,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       requireOwner();
     } else if (event === 'ship_change') {
       // ④ 配送方法変更 (要件§5.7 最小構成): 伝票を保留 (held) にし、事務の対応キューへ積む。
-      // 通知 (GChat) は router 側が fail-soft で送る — DBの行が正本 (webhook成功を受付成功とみなさない)
-      if (batch.status !== 'packing') {
+      // 通知 (GChat) は router 側が fail-soft で送る — DBの行が正本 (webhook成功を受付成功とみなさない)。
+      // 完了済み伝票にも使える (中原さん指示 2026-08-17: 誤って次へを押した後に気づくケース) —
+      // その場合は完了を取り消して保留にし、バッチが完了済みなら作業中へ再オープンする
+      if (batch.status !== 'packing' && batch.status !== 'done') {
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
       requireOwner();
@@ -714,10 +716,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
-      if (slip.status !== 'pending') {
-        throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は処理済みです (${slip.status})`);
+      if (slip.status !== 'pending' && slip.status !== 'done') {
+        throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は保留/取消済みです (${slip.status})`);
       }
-      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='shipping_change' WHERE id=?`).run(slip.id);
+      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='shipping_change', done_at=NULL WHERE id=?`).run(slip.id);
+      if (batch.status === 'done') {
+        db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
+          .run(now, batchId);
+      }
       db.prepare(`
         INSERT INTO pk_pack_ship_changes
           (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,

@@ -660,7 +660,7 @@
     let shipProposed = null;
     $('shipBtn').addEventListener('click', () => {
       if (paused || !worker) return;
-      if (doneSet.has(viewSeq) || heldSet.has(viewSeq)) { showToast('未処理の伝票でのみ使えます'); return; }
+      if (heldSet.has(viewSeq)) { showToast('この伝票はすでに配送変更の依頼中です'); return; }
       shipProposed = null;
       const cur = bySeq.get(viewSeq);
       $('shipMethods').innerHTML = (STATE.methodOptions || [])
@@ -685,7 +685,9 @@
         if (!shipProposed) return;
         const seq = viewSeq;
         enqueue('ship_change', seq, { proposed_method: shipProposed, reason: btn.dataset.reason });
+        doneSet.delete(seq);   // 完了済みへの依頼は完了を取り消して保留になる
         heldSet.add(seq);
+        $('doneOverlay').style.display = 'none';
         showToast(`伝票 ${bySeq.get(seq).neSlipNo} を保留し、事務へ依頼しました`);
         currentSeq = minPending();
         const next = nextPendingAfter(seq);
