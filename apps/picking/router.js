@@ -439,9 +439,17 @@ router.get('/board/exit', (req, res) => {
 });
 
 router.post('/board/exit', checkOrigin, requireAdmin, api(async (req, res) => {
-  res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
-  // 端末Cookieだけ消してセッションを残すと、まさにそのセッションで作業APIが開いてしまう
-  req.session.destroy(() => res.json({ ok: true, loggedOut: true }));
+  // ⭐セッション破棄の成功を確認してから Cookie を消す (Codexレビュー high)。
+  //   端末Cookieだけ先に消えて管理者セッションが残ると、まさにそのセッションで
+  //   作業APIが開いてしまう = 塞いだはずの穴が破棄失敗時だけ再現する
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('[picking] 掲示モード解除: セッション破棄に失敗', err);
+      return res.status(500).json({ error: '解除できませんでした (セッションを破棄できません)' });
+    }
+    res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
+    res.json({ ok: true, loggedOut: true });
+  });
 }));
 
 // ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
@@ -509,15 +517,23 @@ router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) =>
   const kind = String(req.body.kind || 'worker').trim();
   if (!DEVICE_KINDS.includes(kind)) throw new PkError(400, 'bad_kind', '端末の用途が不正です');
   const token = createDevice(label, req.session.email, kind);
-  res.cookie(DEVICE_COOKIE, token, {
-    httpOnly: true,
-    // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)
-    secure: process.env.NODE_ENV !== 'development',
-    sameSite: 'lax',
-    maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。サーバー側でも同TTLを検証
-    path: '/apps/picking',
+  // 破棄が成功してから Cookie を渡す (破棄に失敗したまま端末Cookieを配ると、
+  // 共用端末に管理者セッションが残ったまま作業者に渡ることになる)
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('[picking] 端末登録: セッション破棄に失敗', err);
+      return res.status(500).json({ error: '登録を完了できませんでした (セッションを破棄できません)' });
+    }
+    res.cookie(DEVICE_COOKIE, token, {
+      httpOnly: true,
+      // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)
+      secure: process.env.NODE_ENV !== 'development',
+      sameSite: 'lax',
+      maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。サーバー側でも同TTLを検証
+      path: '/apps/picking',
+    });
+    res.json({ ok: true, loggedOut: true });
   });
-  req.session.destroy(() => res.json({ ok: true, loggedOut: true }));
 }));
 
 router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {

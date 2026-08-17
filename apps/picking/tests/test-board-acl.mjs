@@ -24,12 +24,20 @@ const router = (await import('../router.js')).default;
 // セッションは差し替え可能なスタブ (express-session を持ち込まない)
 let session = null;
 let sessionDestroyed = false;
+let destroyFails = false;   // セッションストア障害の再現用
 const app = express();
 app.set('view engine', 'ejs');   // router は res.render(絶対パス) を使う
 app.use(express.json());
 app.use((req, res, next) => {
   req.session = session
-    ? { ...session, destroy: (cb) => { sessionDestroyed = true; cb(); } }
+    ? {
+      ...session,
+      destroy: (cb) => {
+        if (destroyFails) return cb(new Error('store down'));
+        sessionDestroyed = true;
+        cb();
+      },
+    }
     : {};
   next();
 });
@@ -114,6 +122,23 @@ await t('⭐解除はGETでは起きない (Cookieだけ消してセッション
   const denied = await req('POST', '/board/exit', { token: boardToken });
   assert.equal(denied.status, 403);
   assert.equal(denied.headers.get('set-cookie'), null);
+});
+
+await t('⭐セッション破棄に失敗したら解除しない (Cookieだけ消して権限を残さない)', async () => {
+  session = { email: 'admin@b-faith.biz', role: 'admin', allowedApps: '*' };
+  destroyFails = true;
+  try {
+    const res = await req('POST', '/board/exit', { token: boardToken });
+    assert.equal(res.status, 500);
+    assert.equal(res.headers.get('set-cookie'), null, '破棄できないならCookieも消さない');
+    // 端末登録も同様 (破棄失敗のまま端末Cookieを配らない)
+    const reg = await req('POST', '/admin/devices', { body: { label: 'x', kind: 'worker' } });
+    assert.equal(reg.status, 500);
+    assert.equal(reg.headers.get('set-cookie'), null);
+  } finally {
+    destroyFails = false;
+    session = null;
+  }
 });
 
 await t('解除は管理者のPOSTのみ / 解除と同時にログアウトする', async () => {
