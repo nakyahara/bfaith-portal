@@ -101,7 +101,10 @@ export function initPurchaseOrders() {
     filename      TEXT
   )`);
   // 取込元: NULL/'ne'=NE商品マスタCSV (全項目上書き) / 'logizard'=ロジザード在庫CSV (在庫数のみ上書き)
+  //         'logizard_mirror'=mirror_logizard_stock からの自動反映 (毎時、2026-08-17)
   addCol(db, 'po_ne_overlay_meta', 'source', 'TEXT');
+  // 元データの時点 (自動反映=mirrorのcaptured_at / 手動取込=取込時刻)。mirrorとの新旧比較=後勝ち判定に使う
+  addCol(db, 'po_ne_overlay_meta', 'captured_at', 'TEXT');
   db.exec(`CREATE TABLE IF NOT EXISTS po_ne_overlay_rows (
     product_key   TEXT PRIMARY KEY,
     product_code  TEXT NOT NULL,

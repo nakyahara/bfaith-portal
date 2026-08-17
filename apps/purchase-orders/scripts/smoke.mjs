@@ -3939,6 +3939,165 @@ console.log('── P15b: FAX送信 (eFaxゲートウェイ) ──');
   ok(adminHtmlF.includes('fax_number') && adminHtmlF.includes('FAX番号'), '/admin 仕入先にFAX番号欄');
 }
 
+// ═══ ロジザード在庫 mirror 自動反映 (画面アクセス時に captured_at 比較 → 在庫オーバーレイ自動更新) ═══
+console.log('── ロジザード在庫 mirror 自動反映 ──');
+{
+  process.env.PO_LZ_MIRROR_CHECK_INTERVAL_MS = '0'; // テストでは毎回チェック (throttle無効)
+  process.env.PO_LZ_MIRROR_MIN_PRODUCTS = '1';      // fixtureは商品数が少ないため下限を下げる
+  await j('/api/ne-overlay', { method: 'DELETE' }); // 直前セクションの overlay 状態に依存しない
+  const insLz = db.prepare(`INSERT INTO mirror_logizard_stock
+    (商品ID, 商品名, ロケ, 品質区分名, 在庫数, 引当数, 在庫日, captured_at, synced_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`);
+  const lzSet = (capturedAt, noflyStock) => {
+    db.prepare('DELETE FROM mirror_logizard_stock').run();
+    insLz.run('noflyersticker', 'チラシ', '001-001-01', '良品', noflyStock, 5, '20260817', capturedAt, capturedAt);
+    insLz.run('noflyersticker', 'チラシ', '002-001-01', '良品', 60, 0, '20260817', capturedAt, capturedAt);
+    insLz.run('noflyersticker', 'チラシ', '002-002-01', '不良品', 7, 0, '20260817', capturedAt, capturedAt);
+    insLz.run('mirror-only-item', 'ミラーだけの商品', '003-001-01', '良品', 9, 0, '20260817', capturedAt, capturedAt);
+  };
+  const ovRow = key => db.prepare('SELECT * FROM po_ne_overlay_rows WHERE product_key=?').get(key);
+  const ovMeta = () => db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get();
+
+  // 1) mirror が新しければ画面アクセスだけで自動反映される (良品のみ・ロケ横断合算)
+  const t1 = new Date(Date.now() - 60000).toISOString();
+  lzSet(t1, 100);
+  r = await j('/api/supplier/1');
+  ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && r.body.overlay.applied === true,
+    'mirror自動反映: 画面アクセスで overlay 作成 (source=logizard_mirror)', r.body.overlay);
+  ok(ovRow('noflyersticker') && ovRow('noflyersticker').在庫数 === 160, 'mirror自動反映: 良品のみロケ横断合算 (100+60、不良品7除外)', ovRow('noflyersticker'));
+  ok(ovMeta().captured_at === t1, 'mirror自動反映: meta.captured_at=mirrorのcaptured_at', ovMeta());
+  {
+    const zf = db.prepare("SELECT 在庫数 FROM po_ne_overlay_rows WHERE product_key='gyoumuhandcream60-bi'").get();
+    ok(zf && zf.在庫数 === 0, 'mirror自動反映: mirrorに無い取扱中商品は在庫0扱い (売り切れ反映)', zf);
+  }
+  ok(!db.prepare("SELECT 1 FROM po_product_code_canonical WHERE product_key='mirror-only-item'").get(),
+    'mirror自動反映: canonical は更新しない (mirror商品IDは小文字化済みで表記が失われているため)');
+
+  // 2) 手動取込の方が新しい間は自動で上書きしない (後勝ち)
+  {
+    const mk = (csvText) => { const fd = new FormData(); fd.append('file', new Blob([iconv.encode(csvText, 'Shift_JIS')]), 'manual.csv'); return fd; };
+    const csvText = '"商品ID","品質区分名","在庫数(引当数を含む)","引当数"\r\n"noflyersticker","良品","70","0"\r\n';
+    const prev = await j('/api/logizard-stock/csv', { method: 'POST', body: mk(csvText) });
+    const fd2 = mk(csvText);
+    fd2.append('commit', '1'); fd2.append('fileHash', prev.body.fileHash); fd2.append('planHash', prev.body.planHash);
+    r = await j('/api/logizard-stock/csv', { method: 'POST', body: fd2 });
+    ok(r.body.ok, 'mirror共存: 手動ロジザードCSV取込は従来どおり成功', r.body);
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.source === 'logizard' && ovRow('noflyersticker').在庫数 === 70,
+      'mirror共存: 手動の方が新しい間は自動で上書きされない (後勝ち)', r.body.overlay && r.body.overlay.source);
+  }
+
+  // 3) mirror が進んだら自動が手動を上書きして再開
+  const t3 = new Date(Date.now() + 5000).toISOString();
+  lzSet(t3, 110);
+  r = await j('/api/supplier/1');
+  ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && ovRow('noflyersticker').在庫数 === 170,
+    'mirror共存: mirror更新で自動反映が再開 (110+60)', { src: r.body.overlay && r.body.overlay.source, row: ovRow('noflyersticker') });
+  {
+    const dashLz = await (await fetch(base + '/')).text();
+    ok(dashLz.includes('時点') && dashLz.includes('毎時自動反映'), '/ 鮮度表示: 「何時時点」+毎時自動反映ラベル');
+    ok(!dashLz.includes('3時間以上前の在庫です'), '/ 鮮度表示: 新しい在庫に⚠️は出ない');
+  }
+
+  // 4) NEマスタCSVが有効に適用されている間はスキップ (原価等の上書きを消さない)
+  {
+    const fdNe = new FormData();
+    fdNe.append('file', new Blob([iconv.encode('"商品コード","在庫数","発注残数"\r\n"noflyersticker","55","0"\r\n', 'Shift_JIS')]), 'ne-manual.csv');
+    r = await j('/api/ne-overlay/csv', { method: 'POST', body: fdNe });
+    ok(r.body.ok, 'mirror共存: NE手動CSV取込成功');
+    const t4 = new Date(Date.now() + 10000).toISOString();
+    lzSet(t4, 120);
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.source === 'ne', 'mirror共存: NE手動が有効な間はmirrorが進んでもスキップ', r.body.overlay && r.body.overlay.source);
+    // 翌朝のPML同期でNEが失効したら自動反映が再開する (mirror t4=+10s は朝同期+8sより新しい)
+    const oldSync = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date(Date.now() + 8000).toISOString());
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && ovRow('noflyersticker').在庫数 === 180,
+      'mirror共存: 朝同期でNE失効後は自動反映が再開 (120+60)', r.body.overlay && r.body.overlay.source);
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync);
+  }
+
+  // 5) 異常データガード: mirror の商品数が下限未満なら反映しない (大量の在庫0上書き防止)
+  {
+    process.env.PO_LZ_MIRROR_MIN_PRODUCTS = '999';
+    const capBefore = ovMeta().captured_at;
+    lzSet(new Date(Date.now() + 20000).toISOString(), 130);
+    r = await j('/api/supplier/1');
+    ok(ovMeta().captured_at === capBefore, 'mirrorガード: 商品数が下限未満のmirrorは反映しない (overlay据え置き)', ovMeta());
+    process.env.PO_LZ_MIRROR_MIN_PRODUCTS = '1';
+  }
+
+  // 6) 「CSV取込を解除」は同じmirror世代では復活しない (次の毎時更新で自動再開)
+  {
+    r = await j('/api/ne-overlay', { method: 'DELETE' });
+    ok(r.body.ok, '解除API成功');
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay === null, '解除サプレッション: 同じmirror世代では自動反映が復活しない', r.body.overlay);
+    lzSet(new Date(Date.now() + 25000).toISOString(), 140);
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && ovRow('noflyersticker').在庫数 === 200,
+      '解除サプレッション: 次のmirror更新 (新しいcaptured_at) で自動再開 (140+60)', r.body.overlay);
+  }
+
+  // 7) 3時間以上古い mirror は⚠️表示 (数字は使う)
+  {
+    db.prepare('DELETE FROM po_ne_overlay_meta').run();
+    db.prepare('DELETE FROM po_ne_overlay_rows').run();
+    db.prepare("DELETE FROM po_settings WHERE key='po_lz_mirror_suppress_capture'").run();
+    lzSet(new Date(Date.now() - 4 * 3600 * 1000).toISOString(), 150);
+    const dashStale = await (await fetch(base + '/')).text();
+    ok(dashStale.includes('3時間以上前の在庫です') && dashStale.includes('時点'), '/ 鮮度表示: 3時間超は⚠️+「何時時点」併記');
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.source === 'logizard_mirror' && ovRow('noflyersticker').在庫数 === 210,
+      '3時間超でも数字は使う (150+60・中原さん決定)', ovRow('noflyersticker'));
+  }
+
+  // 8) 夜間→翌朝: 朝のPML同期の方が新しければ mirror overlay は失効し朝同期の在庫へ (意図した設計・Codex LZM-R1 High回答)
+  {
+    const oldSync2 = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date(Date.now() + 30000).toISOString());
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.applied === false, '夜間→翌朝: 朝同期の方が新しければ overlay 失効 (朝のNE在庫が正・mirror再開は次の毎時更新)', r.body.overlay);
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync2);
+  }
+
+  // 9) 負数在庫を含む mirror は反映しない (手動経路の stock<0 拒否と同等の防衛。
+  //    別ロケの正数とSUMで相殺されても行単位で検出する — Codex LZM-R2 Medium)
+  {
+    const capBefore = ovMeta().captured_at;
+    const tNeg = new Date(Date.now() + 35000).toISOString();
+    db.prepare('DELETE FROM mirror_logizard_stock').run();
+    insLz.run('noflyersticker', 'チラシ', '001-001-01', '良品', -3, 0, '20260817', tNeg, tNeg);
+    insLz.run('noflyersticker', 'チラシ', '002-001-01', '良品', 10, 0, '20260817', tNeg, tNeg); // SUM=7>0 でも行の負数で拒否
+    insLz.run('mirror-only-item', 'ミラーだけの商品', '003-001-01', '良品', 9, 0, '20260817', tNeg, tNeg);
+    r = await j('/api/supplier/1');
+    ok(ovMeta().captured_at === capBefore, '負数在庫の行を含むmirrorは反映しない (ロケ間相殺でも検出・overlay据え置き)', ovMeta());
+  }
+
+  // 10) overlay が無い状態でも、朝のPML同期より古い mirror は適用しない
+  //     (初回・解除後に前日18時のmirrorで今朝のNE在庫を上書きしない — Codex LZM-R2 High)
+  {
+    db.prepare('DELETE FROM po_ne_overlay_meta').run();
+    db.prepare('DELETE FROM po_ne_overlay_rows').run();
+    db.prepare("DELETE FROM po_settings WHERE key='po_lz_mirror_suppress_capture'").run();
+    const oldSync3 = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date().toISOString());
+    lzSet(new Date(Date.now() - 60000).toISOString(), 160); // mirror = 朝同期より古い
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay === null, '朝同期より古いmirrorはoverlay無しでも適用しない (朝のNE在庫が正)', r.body.overlay);
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync3);
+  }
+
+  // 後片付け (以降のセクションに mirror 自動反映が影響しないように)
+  db.prepare('DELETE FROM mirror_logizard_stock').run();
+  db.prepare('DELETE FROM po_ne_overlay_meta').run();
+  db.prepare('DELETE FROM po_ne_overlay_rows').run();
+  db.prepare("DELETE FROM po_settings WHERE key='po_lz_mirror_suppress_capture'").run();
+  delete process.env.PO_LZ_MIRROR_CHECK_INTERVAL_MS;
+  delete process.env.PO_LZ_MIRROR_MIN_PRODUCTS;
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {

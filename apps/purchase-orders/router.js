@@ -20,7 +20,7 @@ import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition } from './logic.js';
+import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture } from './logic.js';
 import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
@@ -2887,9 +2887,10 @@ router.post('/api/ne-overlay/csv', upload.single('file'), (req, res) => {
         }
         if (errors.length > 0) throw new Error('validation');
         if (count === 0) throw new Error('有効な行がありません');
-        db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'ne')
-                    ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
-          .run(now, count, req.file.originalname || null);
+        // captured_at=取込時刻: mirror自動反映との後勝ち比較に使う (手動が新しい間は自動で上書きされない)
+        db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source, captured_at) VALUES (1,?,?,?,'ne',?)
+                    ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source, captured_at=excluded.captured_at`)
+          .run(now, count, req.file.originalname || null, now);
       })();
     } catch (e) {
       if (errors.length > 0) {
@@ -2993,9 +2994,10 @@ function importLogizardStockCsv(req, res, { buf, filename, extra = {} }) {
       }
       // 売り切れ扱いの商品は在庫0で上書き (canonicalはCSVで確認できていないため触らない)
       for (const p of zeroFill) ins.run(p.key, p.code, 0, null);
-      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source) VALUES (1,?,?,?,'logizard')
-                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source`)
-        .run(now, agg.size + zeroFill.length, filename || null);
+      // captured_at=取込時刻: mirror自動反映との後勝ち比較に使う (手動が新しい間は自動で上書きされない)
+      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source, captured_at) VALUES (1,?,?,?,'logizard',?)
+                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count, filename=excluded.filename, source=excluded.source, captured_at=excluded.captured_at`)
+        .run(now, agg.size + zeroFill.length, filename || null, now);
       audit(db, { actorType: 'user', actor: actorOf(req), action: 'logizard_stock_import', resource: 'ne_overlay',
         detail: { dataRows, products: agg.size, matched, zeroFill: zeroFill.length, skippedNonGood, ...extra } });
       // サイクルリセットも同一txn (在庫だけ更新されてバッジが残る片肺を防ぐ、Codex LZ-R1 Medium)
@@ -3053,6 +3055,10 @@ router.delete('/api/ne-overlay', (req, res) => {
     const db = getDB();
     const startedAt = nowIso();
     db.transaction(() => {
+      // 解除した瞬間にmirror自動反映で復活すると解除の意味がないため、現在のmirror世代までは
+      // 自動反映を抑止する (次の毎時更新=新しいcaptured_atで自動再開)
+      const cap = logizardMirrorLatestCapture(db);
+      if (cap) setSetting('po_lz_mirror_suppress_capture', cap, { actor: actorOf(req), reason: 'CSV取込解除 (次の毎時mirror更新まで自動反映を抑止)' });
       db.prepare('DELETE FROM po_ne_overlay_rows').run();
       db.prepare('DELETE FROM po_ne_overlay_meta').run();
     })();
@@ -3472,15 +3478,27 @@ ${script || ''}
 </body></html>`;
 }
 
-/** データ鮮度の表示テキスト (NE=朝同期 or 手動CSV / FBA=朝同期 or live) */
+/** データ鮮度の表示テキスト (NE=朝同期 or 手動CSV or mirror自動反映 / FBA=朝同期 or live) */
 function freshnessText(pub, overlay) {
-  const ovLabel = overlay && overlay.source === 'logizard' ? 'ロジザード在庫CSV' : '手動CSV';
-  const ovNote = overlay && overlay.source === 'logizard' ? '・在庫のみ上書き' : '';
-  const ne = overlay && overlay.applied
-    ? (overlay.mergedCount === 0
-      ? `NE: ⚠️${ovLabel} ${fmtJst(overlay.uploaded_at)} — 1件も一致していません (${overlay.row_count}件中0件)。CSVを確認してください`
-      : `NE: 🟢${ovLabel} ${fmtJst(overlay.uploaded_at)} 取込済 (反映 ${overlay.mergedCount}/${overlay.row_count}件${ovNote})`)
-    : `NE: ${pub && pub.src_ne_products_synced_at ? fmtJst(pub.src_ne_products_synced_at) + ' (朝同期)' : '—'}`;
+  let ne;
+  if (overlay && overlay.applied && overlay.source === 'logizard_mirror') {
+    // mirror自動反映: 「何時時点の在庫か」を必ず出す (captured_at=miniPC取込時刻)。
+    // 3時間以上古い (miniPC毎時取込の停止・夜間) は⚠️を出すが数字はそのまま使う (中原さん決定 2026-08-17)
+    const capMs = Date.parse(overlay.captured_at || overlay.uploaded_at);
+    const stale = Number.isFinite(capMs) && Date.now() - capMs > 3 * 3600 * 1000;
+    ne = overlay.mergedCount === 0
+      ? `在庫: ⚠️ロジザード自動反映 ${fmtJst(overlay.captured_at || overlay.uploaded_at)} 時点 — 1件も一致していません (${overlay.row_count}件中0件)`
+      : `在庫: ${stale ? '⚠️' : '🟢'}ロジザード ${fmtJst(overlay.captured_at || overlay.uploaded_at)} 時点 (毎時自動反映・反映 ${overlay.mergedCount}/${overlay.row_count}件)` +
+        (stale ? ' <span style="color:var(--danger)">⚠️ 3時間以上前の在庫です (miniPC毎時取込の状態を確認)</span>' : '');
+  } else {
+    const ovLabel = overlay && overlay.source === 'logizard' ? 'ロジザード在庫CSV' : '手動CSV';
+    const ovNote = overlay && overlay.source === 'logizard' ? '・在庫のみ上書き' : '';
+    ne = overlay && overlay.applied
+      ? (overlay.mergedCount === 0
+        ? `NE: ⚠️${ovLabel} ${fmtJst(overlay.uploaded_at)} — 1件も一致していません (${overlay.row_count}件中0件)。CSVを確認してください`
+        : `NE: 🟢${ovLabel} ${fmtJst(overlay.uploaded_at)} 取込済 (反映 ${overlay.mergedCount}/${overlay.row_count}件${ovNote})`)
+      : `NE: ${pub && pub.src_ne_products_synced_at ? fmtJst(pub.src_ne_products_synced_at) + ' (朝同期)' : '—'}`;
+  }
   const fba = pub && pub.fba_source_kind === 'live'
     ? `FBA: 🟢${fmtJst(pub.fba_fetched_at)} 取得(最新)`
     : `FBA: ${pub && pub.src_fba_business_date ? he(String(pub.src_fba_business_date)) + ' (朝同期)' : '—'}`;
@@ -3552,7 +3570,7 @@ router.get('/', (req, res) => {
         <input type="file" name="file" accept=".csv" required>
         <button type="submit">📥 NE最新CSVを取込</button>
       </form>
-      <span style="display:flex;gap:6px;align-items:center" title="Gドライブの logizard_zaikosu.csv (run-zaiko.bat が出力) をサーバが直接取得して取り込む。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)">
+      <span style="display:flex;gap:6px;align-items:center" title="Gドライブの logizard_zaikosu.csv (会社PCの run-zaiko.bat が出力) をサーバが直接取得して取り込む。在庫数だけを最新化 (原価・取扱区分等は朝同期のまま)。通常はminiPC毎時取込のmirrorから自動反映されるため、これはminiPC停止時のバックアップ経路">
         <button id="btnLzDrive">📥 ロジザード在庫CSVを取込</button>
         <span id="lzDriveInfo" class="muted">更新日時を確認中...</span>
       </span>
@@ -3562,7 +3580,7 @@ router.get('/', (req, res) => {
           <button type="submit">📥 選んだCSVを取込</button>
         </form>
       </details>
-      ${overlay ? '<button id="btnNeClear" title="手動CSVの上書きをやめて朝同期の値に戻す">✕ CSV取込を解除</button>' : ''}
+      ${overlay ? '<button id="btnNeClear" title="CSV取込/自動反映の上書きをやめて朝同期の値に戻す (在庫の自動反映は次の毎時mirror更新で再開)">✕ CSV取込を解除</button>' : ''}
       <span id="opStatus" class="muted"></span>
     </div>
     <div id="searchResult"></div>
@@ -3816,7 +3834,7 @@ document.getElementById('lzForm').addEventListener('submit', function(ev) {
 });
 var btnNeClear = document.getElementById('btnNeClear');
 if (btnNeClear) btnNeClear.addEventListener('click', function() {
-  if (!confirm('手動CSVの上書きを解除して、朝同期の値に戻しますか?')) return;
+  if (!confirm('CSV取込/自動反映の上書きを解除して、朝同期の値に戻しますか?\\n(在庫の自動反映は次の毎時mirror更新で再開します)')) return;
   confirmCycleReset(function() {
     fetch('/apps/purchase-orders/api/ne-overlay', { method: 'DELETE' })
       .then(function(r){ return r.json(); })
