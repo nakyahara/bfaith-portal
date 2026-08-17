@@ -364,8 +364,7 @@
       $('slipNo').textContent = s.neSlipNo;
       $('mall').textContent = s.mall || '';
       $('doneTag').style.display = doneSet.has(s.seq) ? 'inline-block' : 'none';
-      $('doneTag').textContent = heldSet.has(s.seq)
-        ? (repickSet.has(s.seq) ? '⏳ 保留中 (再ピック待ち)' : '⏳ 保留中 (配送変更待ち)') : '✔ 完了済み';
+      $('doneTag').textContent = heldSet.has(s.seq) ? '⏳ 保留中 (再ピック待ち)' : '✔ 完了済み';
       if (heldSet.has(s.seq)) $('doneTag').style.display = 'inline-block';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
@@ -901,7 +900,7 @@
     let shipProposed = null;
     $('shipBtn').addEventListener('click', () => {
       if (paused || !worker) return;
-      if (heldSet.has(viewSeq)) { showToast('この伝票はすでに配送変更の依頼中です'); return; }
+      if (heldSet.has(viewSeq)) { showToast('この伝票は再ピック保留中です'); return; }
       shipProposed = null;
       const cur = bySeq.get(viewSeq);
       $('shipMethods').innerHTML = (STATE.methodOptions || [])

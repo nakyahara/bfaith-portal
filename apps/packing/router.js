@@ -27,7 +27,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  listShipChanges, setShipChangeStatus, resolveIncident,
+  resolveIncident,
 } from './service.js';
 import { notifyShipChange, notifyTask } from './notify.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
@@ -263,16 +263,22 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     notifyTask(result.taskNotify, worker)
       .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
   }
-  // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)
+  // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)。
+  // 商品明細つき (中原さん指示 2026-08-17)。事務の画面管理は廃止 — 現物=変更待ち棚の運用
   if (req.body.event === 'ship_change' && !result.replayed) {
     const row = getDB().prepare(
       'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
     ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) {
+      const lines = getDB().prepare(`
+        SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
+        FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
+      `).all(Number(req.params.id), Number(req.body.slip_seq));
       notifyShipChange({
         folderName: row.folder_name, neSlipNo: row.ne_slip_no,
         currentMethod: row.current_method, proposedMethod: row.proposed_method,
-        reason: row.reason, worker,
+        reason: row.reason, worker, lines,
       }).catch((e) => console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`));
     }
   }
@@ -301,132 +307,6 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
     notifyTask(t, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
   }
   res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
-}));
-
-// ─── ④ 配送方法変更の事務対応キュー (管理者) ───
-
-router.get('/admin/ship-changes', requireAdmin, (req, res) => {
-  res.render(path.join(__dirname, 'views/admin_ship_changes'), {
-    title: '配送方法変更 | 梱包支援',
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: true,
-    changes: listShipChanges(),
-  });
-});
-
-router.post('/admin/ship-changes/:id(\\d+)/status', checkOrigin, requireAdmin, api(async (req, res) => {
-  const status = String(req.body.status || '');
-  if (!['accepted', 'rejected', 'completed'].includes(status)) {
-    throw new PackError(400, 'bad_status', 'status が不正です');
-  }
-  const row = setShipChangeStatus(Number(req.params.id), status, req.session.email);
-  res.json({ ok: true, id: row.id, status });
-}));
-
-/** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
-router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
-  const s = getWorkState(Number(req.params.id));
-  res.json({
-    ok: true,
-    batchStatus: s.batch.status,
-    worker: s.batch.worker,
-    currentSeq: s.currentSeq,
-    doneCount: s.doneCount,
-    slipCount: s.slips.length,
-    doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
-    heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
-    repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
-    incidents: s.incidents,
-    lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
-    pauseReason: s.batch.pause_reason || null,
-  });
-}));
-
-/** 明細画像URLマップ (作業画面のポーリング用。取込直後は解決がバックグラウンド進行中)。 */
-router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
-  const state = getWorkState(Number(req.params.id));
-  const skus = [...new Set(state.slips.flatMap((s) => s.lines.map((l) => l.sku)))];
-  const images = getImageMap(skus);
-  const bySku = {};
-  for (const sku of skus) {
-    const hit = images.get(String(sku ?? '').trim().toLowerCase());
-    if (hit?.url) bySku[sku] = hit.url;
-  }
-  res.json({ ok: true, images: bySku });
-}));
-
-// ─── 日次サマリ (管理者) ───
-router.get('/admin/summary', requireAdmin, (req, res) => {
-  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
-  res.render(path.join(__dirname, 'views/admin_summary'), {
-    title: '梱包サマリ',
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: true,
-    summary: getDailySummary(workDate),
-    statusLabels: STATUS_LABELS,
-  });
-});
-
-// ─── PWA manifest (ホーム画面追加用) ───
-router.get('/manifest.json', (req, res) => {
-  res.json({
-    name: '梱包支援',
-    short_name: '梱包',
-    start_url: '/apps/packing/',
-    display: 'standalone',
-    orientation: 'any',   // 梱包台は横向き据置が基本 (要件§6) だが縦でも使えるように
-    background_color: '#e9ecef',
-    theme_color: '#212529',
-    icons: [{ src: '/favicon.png', sizes: '192x192', type: 'image/png' }],
-  });
-});
-
-// ─── 端末管理 (管理者・セッション必須) ───
-
-router.get('/admin/devices', requireAdmin, (req, res) => {
-  res.render(path.join(__dirname, 'views/admin_devices'), {
-    title: '端末管理 | 梱包支援',
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: true,
-    devices: listDevices(),
-  });
-});
-
-/**
- * この端末 (iPad) を登録する。発行トークンは httpOnly Cookie としてこの端末にだけ渡す。
- * ⭐登録と同時に管理者セッションを破棄する (共用端末に管理者権限を残さない — picking と同規約)。
- * 🚨ホーム画面に追加したPWA内で実行すること (SafariとPWAはCookie保存領域が別)
- */
-router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
-  const label = String(req.body.label || '').trim();
-  if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
-  const { token, id: deviceId } = createDevice(label, req.session.email);
-  res.cookie(DEVICE_COOKIE, token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV !== 'development',
-    sameSite: 'lax',
-    maxAge: 400 * 24 * 3600 * 1000,
-    path: '/apps/packing',
-  });
-  // セッション破棄の失敗を握り潰さない (Codex high: 共用端末に管理者セッションが残ったまま
-  // 「登録成功」を返すと、権限破棄の安全要件が満たされない)。失敗時は発行した端末も無効化する
-  req.session.destroy((err) => {
-    if (err) {
-      revokeDevice(deviceId);   // 発行した端末を確実に無効化 (id直指定。一覧末尾頼みは並行登録で誤爆する)
-      res.clearCookie(DEVICE_COOKIE, { path: '/apps/packing' });
-      console.error('[packing] 端末登録時のセッション破棄に失敗:', err);
-      return res.status(500).json({ error: 'セッションの破棄に失敗したため登録を取り消しました。もう一度実行してください' });
-    }
-    res.json({ ok: true, loggedOut: true });
-  });
-}));
-
-router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {
-  if (!revokeDevice(Number(req.params.id))) throw new PackError(404, 'not_found', '端末が見つかりません');
-  res.json({ ok: true });
 }));
 
 // ─── 取込画面 (管理者) ───

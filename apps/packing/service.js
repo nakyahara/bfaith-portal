@@ -731,10 +731,9 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       requireOwner();
     } else if (event === 'ship_change') {
-      // ④ 配送方法変更 (要件§5.7 最小構成): 伝票を保留 (held) にし、事務の対応キューへ積む。
-      // 通知 (GChat) は router 側が fail-soft で送る — DBの行が正本 (webhook成功を受付成功とみなさない)。
-      // 完了済み伝票にも使える (中原さん指示 2026-08-17: 誤って次へを押した後に気づくケース) —
-      // その場合は完了を取り消して保留にし、バッチが完了済みなら作業中へ再オープンする
+      // ④ 配送方法変更 (簡素化 — 中原さん指示 2026-08-17): 記録+GChat通知 (明細つき) のみ。
+      // 伝票の保留や事務側の状態管理はしない — 現物を「変更待ちの棚」へ置く運用のため
+      // 放置されず、事務の画面操作 (1工程) も不要。梱包者はそのまま「次へ」で完了してよい
       if (batch.status !== 'packing' && batch.status !== 'done') {
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
@@ -748,14 +747,6 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
-      if (slip.status !== 'pending' && slip.status !== 'done') {
-        throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は保留/取消済みです (${slip.status})`);
-      }
-      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='shipping_change', done_at=NULL WHERE id=?`).run(slip.id);
-      if (batch.status === 'done') {
-        db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
-          .run(now, batchId);
-      }
       db.prepare(`
         INSERT INTO pk_pack_ship_changes
           (batch_id, slip_seq, ne_slip_no, folder_name, current_method, proposed_method,
@@ -763,15 +754,6 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
         proposed, reason, worker, now, now);
-      // 次に表示する伝票 (slip_opened)
-      const nx = db.prepare(
-        "SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending' AND seq > ?"
-      ).get(batchId, slipSeq).s
-        ?? db.prepare("SELECT MIN(seq) s FROM pk_pack_slips WHERE batch_id=? AND status='pending'").get(batchId).s;
-      if (nx != null) {
-        db.prepare('UPDATE pk_pack_slips SET shown_at = COALESCE(shown_at, ?) WHERE batch_id=? AND seq=?')
-          .run(now, batchId, nx);
-      }
     } else if (['shortage', 'excess', 'wrong_item', 'found', 'receive'].includes(event)) {
       // ①不足→再ピック / ②余り→棚戻し / 品違い / 見つかった / 受領 (要件§5.4〜5.6)。
       // 完了済み伝票への不足/品違いも許可 (誤タップ後の気づき) — バッチ完了済みなら再オープン
@@ -967,49 +949,6 @@ export function getDailySummary(workDate) {
     workDate, total, workers, slipStats, opCounts, incidents,
     batches: batches.map((b) => ({ ...b, activeSec: activeSec(b) })),
   };
-}
-
-// ═══ ④ 配送方法変更の事務対応 (管理画面) ═══════════════════════════════
-
-export function listShipChanges(limit = 100) {
-  return getDB().prepare(`
-    SELECT c.*, b.folder_name AS batch_folder FROM pk_pack_ship_changes c
-    JOIN pk_pack_batches b ON b.id = c.batch_id
-    ORDER BY CASE c.status WHEN 'requested' THEN 0 WHEN 'accepted' THEN 1 ELSE 2 END, c.id DESC
-    LIMIT ?
-  `).all(limit);
-}
-
-const SHIP_CHANGE_TRANSITIONS = {
-  requested: ['accepted', 'rejected', 'completed'],
-  accepted: ['completed', 'rejected'],
-  rejected: [],
-  completed: [],
-};
-
-/**
- * 事務側の状態遷移。completed (NE・ロジザード変更+送り状再発行済み) / rejected で
- * 対象伝票の保留を解除して pending に戻す (梱包者は完了ガードで必ず戻ってくる)。
- */
-export function setShipChangeStatus(id, status, actor) {
-  const db = getDB();
-  const now = utcNow();
-  return db.transaction(() => {
-    const row = db.prepare('SELECT * FROM pk_pack_ship_changes WHERE id = ?').get(id);
-    if (!row) throw new PackError(404, 'not_found', '申請が見つかりません');
-    if (!(SHIP_CHANGE_TRANSITIONS[row.status] || []).includes(status)) {
-      throw new PackError(409, 'bad_transition', `${row.status} から ${status} へは変更できません`);
-    }
-    db.prepare('UPDATE pk_pack_ship_changes SET status=?, office_by=?, updated_at=? WHERE id=?')
-      .run(status, actor, now, id);
-    if (status === 'completed' || status === 'rejected') {
-      db.prepare(`
-        UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
-        WHERE batch_id=? AND seq=? AND status='held'
-      `).run(row.batch_id, row.slip_seq);
-    }
-    return { ...row, status };
-  })();
 }
 
 // ═══ ①再ピック / ②棚戻し / ③ミス記録 (要件§5.4〜5.6・Phase 2) ═══════════

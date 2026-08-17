@@ -7,7 +7,7 @@
 
 let _warnedNoWebhook = false;
 
-export async function notifyShipChange({ folderName, neSlipNo, currentMethod, proposedMethod, reason, worker }) {
+export async function notifyShipChange({ folderName, neSlipNo, currentMethod, proposedMethod, reason, worker, lines = [] }) {
   const url = process.env.PACKING_SHIP_CHANGE_WEBHOOK;
   if (!url) {
     if (!_warnedNoWebhook) {
@@ -16,13 +16,14 @@ export async function notifyShipChange({ folderName, neSlipNo, currentMethod, pr
     }
     return false;
   }
-  // 読み手 (事務) ファースト: 何をすればいいかが1行目で分かる形 (feedback_gchat_report_reader_first)
+  // 読み手 (事務) ファースト: 何をすればいいかが1行目で分かる形 (feedback_gchat_report_reader_first)。
+  // 現物は「変更待ちの棚」にある — 画面での状態管理はしない (中原さん指示 2026-08-17)
   const text = [
-    `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします`,
+    `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします (現物は変更待ち棚)`,
     `伝票: *${neSlipNo}* (${folderName || '-'})`,
+    ...lines.map((l) => `・${l.name || l.sku} × ${l.qty}個`),
     `現行: ${currentMethod || '-'} → 提案: *${proposedMethod}*`,
     `理由: ${reason} / 依頼: ${worker}`,
-    `対応状況の更新: https://picking.bfaith-wh.uk/apps/packing/admin/ship-changes`,
   ].join('\n');
   const res = await fetch(url, {
     method: 'POST',
