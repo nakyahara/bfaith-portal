@@ -151,10 +151,12 @@
 
   <script>
     var WINDOW_DAYS = <%- JSON.stringify(windowDays) %>;
-    var RELOAD_MS = 20000;          // データ再取得
+    var RELOAD_MS = 20000;          // データ再取得の間隔 (前回の完了/失敗から数える)
+    var FETCH_TIMEOUT_MS = 12000;   // これを超えたら諦めて次の周期へ (ハングで更新が止まらないように)
     var HARD_RELOAD_MS = 6 * 3600 * 1000;   // 6時間ごとにページ自体を作り直す (長期表示のメモリ対策)
     var startedAt = Date.now();
     var lastOk = 0;
+    var gen = 0;                    // 応答の世代。古い応答が新しい表示を上書きしないように
 
     function esc(s) {
       return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -239,36 +241,61 @@
       document.getElementById('note').textContent = note;
     }
 
+    /**
+     * 1回だけ取得して、完了(成功/失敗)してから次を予約する。
+     * setInterval にしないのは、応答が遅いときにリクエストが積み上がるため。
+     * AbortController で必ず打ち切り、世代番号で古い応答を捨てる (Codexレビュー medium)。
+     */
     function tick() {
-      fetch('/apps/picking/api/board?days=' + WINDOW_DAYS, { credentials: 'same-origin' })
+      var myGen = ++gen;
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
+      var done = false;
+      var finish = function (fn) {
+        clearTimeout(timer);
+        if (done || myGen !== gen) return;   // 二重実行・古い応答は無視
+        done = true;
+        fn();
+        // ページ自体の作り直しは「更新に成功している間だけ」行う。
+        // サーバー停止中に reload すると、保持していた最後の正常表示までブラウザの
+        // エラー画面に置き換わってしまう
+        if (lastOk && Date.now() - startedAt > HARD_RELOAD_MS && Date.now() - lastOk < RELOAD_MS * 2) {
+          location.reload();
+          return;
+        }
+        setTimeout(tick, RELOAD_MS);
+      };
+
+      fetch('/apps/picking/api/board?days=' + WINDOW_DAYS, { credentials: 'same-origin', signal: ctrl.signal })
         .then(function (r) {
           if (!r.ok) throw new Error('HTTP ' + r.status);
           return r.json();
         })
         .then(function (d) {
           if (!d || !d.ok) throw new Error('bad payload');
-          render(d);
-          lastOk = Date.now();
-          document.getElementById('err').textContent = '';
-          document.getElementById('status').textContent = '●';
-          document.getElementById('status').className = '';
+          finish(function () {
+            render(d);
+            lastOk = Date.now();
+            document.getElementById('err').textContent = '';
+            document.getElementById('status').textContent = '●';
+            document.getElementById('status').className = '';
+          });
         })
         .catch(function (e) {
-          // 前回の表示はそのまま残す (真っ白にするより情報が多い)
-          document.getElementById('err').textContent =
-            '通信エラー (' + e.message + ')' + (lastOk ? ' 最終更新 ' + new Date(lastOk).toLocaleTimeString('ja-JP') : '');
-          document.getElementById('status').textContent = '○';
-          document.getElementById('status').className = 'stale';
-        })
-        .then(function () {
-          if (Date.now() - startedAt > HARD_RELOAD_MS) location.reload();
+          finish(function () {
+            // 前回の表示はそのまま残す (真っ白にするより情報が多い)
+            var msg = e.name === 'AbortError' ? '応答なし (タイムアウト)' : '通信エラー (' + e.message + ')';
+            document.getElementById('err').textContent =
+              msg + (lastOk ? ' / 最終更新 ' + new Date(lastOk).toLocaleTimeString('ja-JP') : '');
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          });
         });
     }
 
     renderClock();
     setInterval(renderClock, 10000);
     tick();
-    setInterval(tick, RELOAD_MS);
   </script>
 </body>
 </html>

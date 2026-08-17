@@ -78,22 +78,34 @@ function hasSessionAccess(req) {
 }
 
 // 掲示モニター端末 (kind='board') が触れてよいパス。倉庫に常時表示する画面は
-// 誰でも物理的に操作できるので、読み取り専用のここだけに閉じる (作業APIは叩かせない)
-const BOARD_ALLOWED_PATHS = ['/board', '/api/board'];
+// 誰でも物理的に操作できるので、読み取り専用のここだけに閉じる (作業APIは叩かせない)。
+// /board/exit は掲示モードの解除 (Cookie削除) — これが無いと、掲示端末を作業用に
+// 戻したくなったときにブラウザの設定からCookieを消すしか手がなくなる
+const BOARD_ALLOWED_PATHS = ['/board', '/api/board', '/board/exit'];
 
 /** 全ルート共通の入口。セッション or 登録端末のどちらかが必要。 */
 function pickingAccess(req, res, next) {
   // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
   if (req.path === '/manifest.json') return next();
-  if (hasSessionAccess(req)) return next();
+
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
-  if (device) {
-    if (device.kind === 'board' && !BOARD_ALLOWED_PATHS.includes(req.path)) {
-      const msg = 'この端末は掲示専用です (作業には使えません)';
+  // ⭐掲示端末は「セッションがあっても」読み取り専用に閉じる (Codexレビュー high)。
+  //   セッションを先に見ると、掲示端末で誰かが一度ログインしただけで作業APIが開いてしまう。
+  //   端末登録時のセッション破棄は登録の瞬間しか効かず、後日のログインを防げない
+  if (device && device.kind === 'board') {
+    if (!BOARD_ALLOWED_PATHS.includes(req.path)) {
+      const msg = 'この端末は掲示専用です (作業には使えません)。'
+        + '解除するには /apps/picking/board/exit を開いてください';
       return req.path.startsWith('/api/')
-        ? res.status(403).json({ error: msg })
+        ? res.status(403).json({ error: msg, code: 'board_only' })
         : res.status(403).send(msg);
     }
+    req.pickingDevice = device;
+    return next();
+  }
+
+  if (hasSessionAccess(req)) return next();
+  if (device) {
     req.pickingDevice = device;   // 端末モード (作業画面のみ。admin系は requireAdmin で弾かれる)
     return next();
   }
@@ -387,6 +399,15 @@ router.get('/board', (req, res) => {
     title: 'ピッキング実績ボード',
     windowDays: STATS_WINDOW_DAYS,
   });
+});
+
+/**
+ * 掲示モードの解除。掲示端末Cookieを消すだけ (端末そのものの失効は管理画面から)。
+ * 壁掛け端末を作業用に転用したくなったときの出口。
+ */
+router.get('/board/exit', (req, res) => {
+  res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
+  res.send('掲示モードを解除しました。作業に使う場合は管理者としてログインし、端末を登録し直してください。');
 });
 
 // ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)

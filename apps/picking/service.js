@@ -747,8 +747,12 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
   const range = statsRange(until, days);
   const rows = loadStatsLines(range.since, range.until);
 
-  // ── 外れ値の仕分け (捨てた件数は画面に出す。黙って捨てない) ──
+  // ── 外れ値の仕分け ──
+  // 捨てた件数は全体と作業者別の両方で出す。除外は「放置の多い人ほど悪い記録が消える」
+  // 非対称性を持つので、誰の分をどれだけ捨てたかが見えないと不公平を検知できない
+  // (Codexレビュー medium)。0秒は除外しない — 同一ロケの連続ピックで実際に起きる
   const kept = [];
+  const excludedByWorker = new Map();
   let excludedLines = 0;
   let excludedSec = 0;
   for (const r of rows) {
@@ -756,12 +760,19 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
     if (!Number.isFinite(sec) || sec < 0 || sec > STATS_OUTLIER_SEC) {
       excludedLines++;
       if (Number.isFinite(sec) && sec > 0) excludedSec += sec;
+      const k = r.worker || '(不明)';
+      excludedByWorker.set(k, (excludedByWorker.get(k) || 0) + 1);
       continue;
     }
     kept.push({ ...r, sec });
   }
 
   // ── 引当分類ごとの基準秒 (期間内の全員の平均) ──
+  // ⚠ 基準は本人の実績も含む相対値 (Codexレビュー medium)。固定基準や「本人を除く平均」も
+  // 検討したが、①稼働がまだ数日で固定基準を置ける実績が無い ②除いた側の母数が薄いと
+  // かえって暴れる ため、当面は全体平均に対する相対値と割り切り、画面にその旨を明記する。
+  // その分類を1人しか担当していない場合、その人の指数は構造的に100付近になる
+  // (baseline の workers 数を画面に出して見分けられるようにしてある)。
   const classMap = new Map();
   for (const r of kept) {
     const key = r.hikiate_class || '(不明)';
@@ -811,6 +822,7 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
     batches: w.batches.size,
     days: w.days.size,
     shortages: w.shortages,
+    excluded: excludedByWorker.get(w.worker) || 0,   // 外れ値として捨てた明細数
     classes: [...w.classes.values()]
       .map((c) => ({ ...c, secPerLine: c.sec / c.lines, index: c.sec > 0 ? Math.round((c.expectedSec / c.sec) * 100) : null }))
       .sort((a, b) => b.lines - a.lines),

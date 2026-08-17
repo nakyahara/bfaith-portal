@@ -70,13 +70,15 @@
     </div>
 
     <div class="note">
-      <b>速さ指数</b> = 引当分類の重さを補正した速さ (100 = 全体平均どおり・大きいほど速い)。
+      <b>速さ指数</b> = 引当分類の重さを補正した速さ (100 = <b>この期間の全体平均どおり</b>・大きいほど速い)。
       分類ごとの平均秒を基準に「この人が担当した明細なら本来かかるはずの時間 ÷ 実際にかかった時間」で算出。
       生の秒/明細だけで比べると、重い分類 (複数個系) を多く引いた人が不当に遅く見えるため。<br>
       集計は<b>明細1件ごと</b>に、その明細で「次へ」を押した本人へ帰属 (交代しても正しく分かれる)。
       <b><%= stats.outlierSec %>秒</b>を超えた明細は「開いたまま放置」とみなし除外
-      (<%= stats.total.excluded.lines %>件・<%= fmtMin(stats.total.excluded.sec) %>)。
-      明細<%= stats.minLines %>件未満は<b>参考値</b>として順位を付けない。
+      (<%= stats.total.excluded.lines %>件・<%= fmtMin(stats.total.excluded.sec) %>。作業者別の除外件数は右端の列)。
+      明細<%= stats.minLines %>件未満は<b>参考値</b>として順位を付けない。<br>
+      ⚠ 基準は<b>固定値ではなく期間内の全体平均</b>です。期間や担当の組み合わせが変われば指数も動きます。
+      担当者が1人しかいない分類 (下表「担当者数」= 1) では、その人の指数は構造的に100付近になります。
     </div>
 
     <div class="tiles">
@@ -94,7 +96,7 @@
         <tr>
           <th>#</th><th>作業者</th>
           <th class="num">速さ指数</th><th class="num">秒/明細</th><th class="num">明細</th>
-          <th class="num">バッチ</th><th class="num">稼働日</th><th class="num">実時間</th><th class="num">欠品</th>
+          <th class="num">バッチ</th><th class="num">稼働日</th><th class="num">実時間</th><th class="num">欠品</th><th class="num">除外</th>
         </tr>
       </thead>
       <tbody>
@@ -126,10 +128,11 @@
             <td class="num"><%= w.days %></td>
             <td class="num"><%= fmtMin(w.sec) %></td>
             <td class="num"><%= w.shortages || '' %></td>
+            <td class="num"><%= w.excluded || '' %></td>
           </tr>
         <% }) %>
         <% if (stats.workers.length === 0) { %>
-          <tr><td colspan="9" class="muted">この期間の完了バッチがありません</td></tr>
+          <tr><td colspan="10" class="muted">この期間の完了バッチがありません</td></tr>
         <% } %>
       </tbody>
     </table>
