@@ -56,12 +56,12 @@ async function replyLine(replyToken, messages, fetchFn = fetch) {
   }
 }
 
-// ─── ブロック一覧コマンド (「Z」「A」等でブロック内の全在庫を一覧) ───
-// 既定 Z→ZZZ / A→AAAA。env PICKING_LINE_BLOCK_ALIASES="Z=ZZZ,A=AAAA" で上書き可
+// ─── ブロック一覧コマンド (「Z」「A」「Y」等でブロック内の全在庫を一覧) ───
+// 既定 Z→ZZZ / A→AAAA / Y→YYY。env PICKING_LINE_BLOCK_ALIASES="Z=ZZZ,A=AAAA,Y=YYY" で上書き可
 
 function blockAliases() {
   const map = {};
-  for (const pair of String(process.env.PICKING_LINE_BLOCK_ALIASES || 'Z=ZZZ,A=AAAA').split(',')) {
+  for (const pair of String(process.env.PICKING_LINE_BLOCK_ALIASES || 'Z=ZZZ,A=AAAA,Y=YYY').split(',')) {
     const [k, v] = pair.split('=').map((s) => String(s || '').trim().toUpperCase());
     if (k && v) map[k] = v;
   }
@@ -120,6 +120,10 @@ export async function buildBlockListMessages(cmd, deps) {
   rows.sort((a, b) => (Number(b.free) - Number(a.free)) || String(a.name || '').localeCompare(String(b.name || '')));
   const multiLoc = new Set(rows.map((r) => String(r.location))).size > 1;
   const totalFree = rows.reduce((sum, r) => sum + Number(r.free), 0);
+  // 表示は「数量が行頭」— 行末だと商品名の折り返しで数量が迷子になる (2026-08-17 中原さん「見にくい」)。
+  // 商品名末尾の社内サフィックス (_パフ箱・_梱機プ・_K-44 等の梱包指示タグ) は一覧では省く。
+  // 誤削除防止で「日本語1〜6文字」か「英字1文字-数字 (K-44型)」だけを対象にする (_Type-C 等は残す)
+  const stripSuffix = (name) => String(name || '').replace(/\s*_(?:[^\x00-\x7F]{1,6}|[A-Z]-?\d{1,3})$/, '');
   const lines = rows.map((r) => {
     const notes = [];
     const expiry = formatExpiryLabel(r.expiry);
@@ -127,11 +131,12 @@ export async function buildBlockListMessages(cmd, deps) {
     if (String(r.quality || '') !== '良品') notes.push(String(r.quality || '品質不明'));
     if (Number(r.allocated) > 0) notes.push(`別途引当${r.allocated}`);
     const locPrefix = multiLoc ? `[${r.location}] ` : '';
-    return `・${locPrefix}${String(r.name || r.sku).slice(0, 40)} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
+    const qty = Number(r.free).toLocaleString('ja-JP');
+    return `・${qty}個｜${locPrefix}${stripSuffix(r.name || r.sku).slice(0, 40)}${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
   });
   const stamp = jstStampLabel(data.importedAt);
   const header = `📦 ${cmd.block} の在庫一覧 (${stamp || '取得時刻不明'}時点)\n${rows.length}件・フリー計${totalFree.toLocaleString('ja-JP')}個`;
-  return chunkTextMessages(header, lines);
+  return chunkTextMessages(header, ['', ...lines]);
 }
 
 /** SKU のロケーション別在庫の返信テキスト。データ無しは null。 */

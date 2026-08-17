@@ -140,6 +140,7 @@ await t('resolveBlockCommand: Z/A エイリアス・全角・ロケ付き・直�
   assert.deepEqual(resolveBlockCommand('Ｚ'), { block: 'ZZZ', explicit: true }, '全角も同一視');
   assert.deepEqual(resolveBlockCommand('Zロケ'), { block: 'ZZZ', explicit: true });
   assert.deepEqual(resolveBlockCommand('A'), { block: 'AAAA', explicit: true });
+  assert.deepEqual(resolveBlockCommand('Y'), { block: 'YYY', explicit: true }, 'YもYYYのエイリアス');
   assert.deepEqual(resolveBlockCommand('YYY'), { block: 'YYY', explicit: false }, 'ブロック名直打ち');
   assert.equal(resolveBlockCommand('ハッカ'), null);
   assert.equal(resolveBlockCommand('teatree10'), null, '7文字以上は商品検索');
@@ -162,10 +163,30 @@ await t('ブロック一覧: 単一ロケはロケ省略・フリー降順・期
   const lines = msgs[0].text.split('\n');
   assert.ok(lines[0].startsWith('📦 ZZZ の在庫一覧 ('), lines[0]);
   assert.equal(lines[1], '3件・フリー計3,066個');
-  assert.equal(lines[2], '・ハッカ油 【200ml】 _パフ箱 → 2600個 (期限2028/01/15)');
-  assert.equal(lines[3], '・上敷鋲 【25本入り】 → 460個 (別途引当10)');
-  assert.equal(lines[4], '・木工用 亜麻仁油 【100ml 】 → 6個 (Ｂ品)');
-  assert.equal(lines.length, 5, '単一ロケなので [ロケ] プレフィックスなし');
+  assert.equal(lines[2], '', 'ヘッダ後に空行');
+  // 数量が行頭 (行末だと商品名の折り返しで迷子)・千位カンマ・社内サフィックス (_パフ箱等) は省く
+  assert.equal(lines[3], '・2,600個｜ハッカ油 【200ml】 (期限2028/01/15)');
+  assert.equal(lines[4], '・460個｜上敷鋲 【25本入り】 (別途引当10)');
+  assert.equal(lines[5], '・6個｜木工用 亜麻仁油 【100ml 】 (Ｂ品)');
+  assert.equal(lines.length, 6, '単一ロケなので [ロケ] プレフィックスなし');
+});
+
+await t('ブロック一覧: サフィックス省略は社内タグ限定 (正当な _Type-C 等は残す)', async () => {
+  const d = deps({
+    fetchStockBlock: async () => ({
+      ok: true, importedAt: FRESH, block: 'ZZZ',
+      items: [
+        BLOCK_ROW({ name: 'ハッカ油 【500ml】_K-44', expiry: '', free: 400, qty: 400 }),
+        BLOCK_ROW({ sku: 'cable1', name: '充電ケーブル_Type-C', expiry: '', free: 30, qty: 30 }),
+        BLOCK_ROW({ sku: 'vitamin', name: 'ビタミン_C', expiry: '', free: 20, qty: 20 }),
+      ],
+    }),
+  });
+  const text = (await buildSearchReplyMessages('Z', d))[0].text;
+  assert.ok(text.includes('・400個｜ハッカ油 【500ml】'), `_K-44は省く: ${text}`);
+  assert.ok(!text.includes('_K-44'), text);
+  assert.ok(text.includes('充電ケーブル_Type-C'), '_Type-C は正当な名前として残す');
+  assert.ok(text.includes('ビタミン_C'), '_C も残す');
 });
 
 await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付き', async () => {
@@ -179,8 +200,8 @@ await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付�
     }),
   });
   const msgs = await buildSearchReplyMessages('A', d);
-  assert.ok(msgs[0].text.includes('・[001-001-01] '), msgs[0].text);
-  assert.ok(msgs[0].text.includes('・[001-002-01] 商品Y → 10個'), msgs[0].text);
+  assert.ok(msgs[0].text.includes('個｜[001-001-01] '), msgs[0].text);
+  assert.ok(msgs[0].text.includes('・10個｜[001-002-01] 商品Y'), msgs[0].text);
 });
 
 await t('ブロック一覧: エイリアス在庫0=在庫なし案内・直打ちは商品検索優先・商品0件でブロック照会', async () => {
