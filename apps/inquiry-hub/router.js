@@ -20,7 +20,7 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, countInboxByGroup, getInquiryDetail, getAdjacentInquiries } from './queries.js';
+import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { aiRewriteEnabled, rewriteReply, REWRITE_STYLES } from './ai-rewrite.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
@@ -130,6 +130,24 @@ router.get('/', (req, res) => {
       `<a class="${group === key ? 'on' : ''}" href="${he(tabLink(key))}">${g.icon} ${he(g.label)} ${tabCnt(inboxCounts[key])}</a>`).join('')}
   </nav>`;
 
+  // ─── 状態タブ (2026-08-17 スタッフ要望: モール問い合わせの中でも 新着/返信処理中/完了 を切替) ───
+  // 件数は「いま見ている文脈 (チャネルグループ・フォルダ) の中での件数」= タブを押した先の実件数。
+  // 切替では view と page だけ変え、他の絞り込みは維持する
+  let viewCounts = {};
+  try { viewCounts = countViewsInContext({ group, folder: q.folder }); } catch { /* 初期化前は件数なし */ }
+  const viewLink = (v) => {
+    const u = new URLSearchParams(Object.entries(q).filter(([k, val]) => !['view', 'page'].includes(k) && val !== '' && val != null));
+    u.set('view', v);
+    return `/apps/inquiry-hub?${u.toString()}`;
+  };
+  const viewTabs = `
+  <nav class="view-tabs">
+    ${Object.entries(VIEWS).map(([key, v]) => {
+      const n = viewCounts[key];
+      return `<a class="${view === key ? 'on' : ''}" href="${he(viewLink(key))}" title="${he(v.hint)}">${v.icon} ${he(v.label)}<span class="vt-cnt${n ? '' : ' zero'}">${n || 0}</span></a>`;
+    }).join('')}
+  </nav>`;
+
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
   // view/page はビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
@@ -175,6 +193,7 @@ router.get('/', (req, res) => {
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
     <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}${detailQs}'">
+      <td class="selcell" onclick="event.stopPropagation()"><input type="checkbox" class="rowchk" value="${r.id}" aria-label="選択"></td>
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
@@ -209,14 +228,30 @@ router.get('/', (req, res) => {
     : q.folder === 'none'
       ? `🗃️ <b>未分類</b> — フォルダに入れていない問い合わせ <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
       : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
+  // ─── 一括操作バー (2026-08-17 スタッフ要望。メールディーラー相当) ───
+  // チェックした行に対して 状態/フォルダ/担当/既読 をまとめて変更する。削除は提供しない
+  // (取り消せない操作は一括で出さない)。実行前に必ず確認ダイアログを出す
+  const bulkBar = `
+  <div class="bulkbar" id="bulkBar" hidden>
+    <span class="bulk-n"><b id="bulkCount">0</b>件を選択中</span>
+    <select id="bulkStatus"><option value="">状態: 変更なし</option>${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}">${he(v.label)}にする</option>`).join('')}</select>
+    <select id="bulkFolder"><option value="">フォルダ: 変更なし</option><option value="none">📁 未分類に戻す</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}へ</option>`).join('')}</select>
+    <select id="bulkAssign"><option value="">担当: 変更なし</option><option value="__me__">自分にする</option><option value="__none__">未割当にする</option>${assignees.map(u => `<option value="${he(u)}">${he(u)}</option>`).join('')}</select>
+    <select id="bulkRead"><option value="">既読: 変更なし</option><option value="read">既読にする</option><option value="unread">未読にする</option></select>
+    <button class="pri" id="bulkApply">選択した${''}件に適用</button>
+    <button class="ghost" id="bulkClear">選択を解除</button>
+  </div>`;
+
   const body = `
   ${chTabs}
+  ${viewTabs}
   <div class="view-hint">${hintLine}</div>
   ${filterBar}
+  ${bulkBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
-      <tbody>${trs || `<tr><td colspan="7" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
+      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <tbody>${trs || `<tr><td colspan="8" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
   </div>`;
@@ -234,6 +269,71 @@ router.get('/', (req, res) => {
     }
     sync();
     mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
+  })();
+  // ─── 一括操作 (2026-08-17 スタッフ要望) ───
+  (function() {
+    var bar = document.getElementById('bulkBar');
+    if (!bar) return;
+    var ME = ${JSON.stringify(String(actorOf(req))).replace(/</g, '\\u003c')};
+    var chkAll = document.getElementById('chkAll');
+    var countEl = document.getElementById('bulkCount');
+    var applyBtn = document.getElementById('bulkApply');
+    function rows() { return Array.prototype.slice.call(document.querySelectorAll('.rowchk')); }
+    function selected() { return rows().filter(function(c) { return c.checked; }).map(function(c) { return Number(c.value); }); }
+    function refresh() {
+      var n = selected().length;
+      countEl.textContent = n;
+      applyBtn.textContent = '選択した' + n + '件に適用';
+      bar.hidden = n === 0;
+      var all = rows();
+      chkAll.checked = all.length > 0 && n === all.length;
+      chkAll.indeterminate = n > 0 && n < all.length;
+    }
+    chkAll.addEventListener('change', function() {
+      rows().forEach(function(c) { c.checked = chkAll.checked; });
+      refresh();
+    });
+    rows().forEach(function(c) { c.addEventListener('change', refresh); });
+    document.getElementById('bulkClear').addEventListener('click', function() {
+      rows().forEach(function(c) { c.checked = false; });
+      refresh();
+    });
+    applyBtn.addEventListener('click', function() {
+      var ids = selected();
+      if (!ids.length) return;
+      var ops = {};
+      var desc = [];
+      var st = document.getElementById('bulkStatus');
+      if (st.value) { ops.status = st.value; desc.push('状態→' + st.options[st.selectedIndex].textContent); }
+      var fo = document.getElementById('bulkFolder');
+      if (fo.value) {
+        ops.folderId = fo.value === 'none' ? null : Number(fo.value);
+        desc.push('フォルダ→' + fo.options[fo.selectedIndex].textContent);
+      }
+      var asg = document.getElementById('bulkAssign');
+      if (asg.value) {
+        ops.assigned = asg.value === '__me__' ? ME : (asg.value === '__none__' ? '' : asg.value);
+        desc.push('担当→' + asg.options[asg.selectedIndex].textContent);
+      }
+      var rd = document.getElementById('bulkRead');
+      if (rd.value) { ops.isUnread = rd.value === 'unread'; desc.push(rd.value === 'unread' ? '未読にする' : '既読にする'); }
+      if (!desc.length) { toast('変更内容を選んでください'); return; }
+      if (!confirm(ids.length + '件をまとめて変更します。\\n\\n' + desc.join('\\n') + '\\n\\nよろしいですか?')) return;
+      applyBtn.disabled = true;
+      fetch('/apps/inquiry-hub/api/inquiries/bulk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids, ops: ops })
+      }).then(function(r) {
+        return r.json().catch(function(){ return {}; }).then(function(j) {
+          if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+          return j;
+        });
+      }).then(function(j) {
+        toast(j.updated + '件を変更しました' + (j.skipped ? ' (' + j.skipped + '件は変更なし)' : ''));
+        setTimeout(function(){ location.reload(); }, 800);
+      }).catch(function(e) { toast('失敗: ' + e.message); applyBtn.disabled = false; });
+    });
+    refresh();
   })();`;
   res.send(pageShell(
     curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${VIEWS[view].label}`,
@@ -806,6 +906,19 @@ router.get('/api/templates', (req, res) => {
       bodyBottom: t.body_bottom || '',
     })),
   });
+});
+
+// 一括操作 (2026-08-17 スタッフ要望)。一覧のチェックボックスから状態/フォルダ/担当/既読をまとめて変更。
+// 削除系は提供しない (取り消せない操作は一括にしない)。1件ずつ操作ログを残す
+router.post('/api/inquiries/bulk', (req, res) => {
+  const b = req.body || {};
+  try {
+    const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req) });
+    console.log(`[inquiry-hub] 一括操作 ${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
 });
 
 // ✨ 返信文のAI書き換え (2026-08-17 スタッフ要望)。OPENAI_API_KEY があるときだけUI表示・実行可。
@@ -2091,6 +2204,24 @@ button:disabled { opacity: .5; cursor: default; }
 .tab-cnt { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 999px;
   padding: 1px 8px; font-size: 12px; margin-left: 2px; vertical-align: 1px; }
 .tab-cnt.zero { background: #f1f5f9; color: #94a3b8; }
+/* ═══ 状態タブ (新着/返信処理中/完了/すべて)。上部タブの下に並ぶ ═══ */
+.view-tabs { display: flex; gap: 6px; margin: 0 0 12px; flex-wrap: wrap; }
+.view-tabs a { padding: 6px 12px; border-radius: 999px; color: #475569; font-size: 13px; font-weight: 600;
+  background: #f1f5f9; border: 1px solid transparent; white-space: nowrap; }
+.view-tabs a:hover { background: #e2e8f0; text-decoration: none; }
+.view-tabs a.on { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.vt-cnt { display: inline-block; margin-left: 6px; background: rgba(0,0,0,.08); border-radius: 999px;
+  padding: 0 7px; font-size: 12px; }
+.view-tabs a.on .vt-cnt { background: rgba(255,255,255,.25); }
+.vt-cnt.zero { opacity: .55; }
+/* ═══ 一括操作バー ═══ */
+.bulkbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; }
+.bulkbar .bulk-n { font-size: 13px; color: #1e40af; margin-right: 4px; }
+.bulkbar select { padding: 5px 8px; }
+.bulkbar button { margin: 0; }
+th.selcell, td.selcell { width: 34px; text-align: center; }
+td.selcell input, th.selcell input { width: 18px; height: 18px; cursor: pointer; }
 .detail-head h2 { margin: 8px 0 12px; font-size: 18px; }
 .detail-nav { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .detail-nav-adj { display: flex; gap: 14px; }
@@ -2267,6 +2398,12 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* 上部タブ: スマホでは詰めて全タブが1〜2行に収まるように */
   .ch-tabs { gap: 4px; }
   .ch-tabs a { padding: 8px 10px; font-size: 13px; }
+  .view-tabs a { padding: 6px 10px; font-size: 12px; }
+  /* 一括操作: スマホは各コントロールを全幅に (誤タップ防止) */
+  .bulkbar select, .bulkbar button { flex: 1 1 100%; }
+  /* カード表示でも選択チェックは先頭に出す (件名 order:-1 より前) */
+  table.cardable td.selcell { order: -2; width: auto; }
+  table.cardable td.selcell::before { content: none; }
 
   /* 詳細画面 */
   .detail-head h2 { font-size: 16px; }
