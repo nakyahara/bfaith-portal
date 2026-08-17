@@ -36,6 +36,22 @@ import { getShippingFolders, driveCall, getPollerStatus } from './drive-sync.js'
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
 
+// ─── 梱包 (packing) 連携: 再ピック・棚戻しキュー (要件§5.4/5.5) ───
+// pk_pack_tasks は packing 所有のため、更新は packing の service (更新API) を通す。
+// packing が無効/初期化失敗でも picking 本体に影響しないよう遅延import+fail-soft
+let _packingSvc;
+async function packingSvc() {
+  if (_packingSvc === undefined) {
+    try {
+      _packingSvc = await import('../packing/service.js');
+    } catch (e) {
+      _packingSvc = null;
+      console.warn('[picking] packing連携は無効 (packing初期化失敗):', e.message);
+    }
+  }
+  return _packingSvc;
+}
+
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗はここで throw して
 // 旧スキーマのまま起動を継続させない (shipping-work と同規約)
 initPickingDB();
@@ -185,11 +201,15 @@ function api(handler) {
 }
 
 // ─── バッチ一覧 (セッション or 登録端末) ───
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+  let openTasks = 0;
+  const psvc = await packingSvc();
+  if (psvc) { try { openTasks = psvc.countOpenTasks(); } catch { openTasks = 0; } }
   res.render(path.join(__dirname, 'views/batches'), {
+    openTasks,
     title: 'ピッキング支援',
     username: req.session?.email || req.pickingDevice?.label || '端末',
     displayName: req.session?.displayName,
@@ -200,6 +220,47 @@ router.get('/', (req, res) => {
     batches,
     statusLabels: STATUS_LABELS,
   });
+});
+
+// ─── 再ピック・棚戻しキュー (梱包からの依頼を消化する画面) ───
+router.get('/tasks', async (req, res) => {
+  const psvc = await packingSvc();
+  if (!psvc) return res.status(404).send('梱包連携は無効です');
+  let tasks = [];
+  try { tasks = psvc.listOpenTasks(); } catch { tasks = []; }
+  const images = getImageMap(tasks.map((t) => t.sku));
+  res.render(path.join(__dirname, 'views/tasks'), {
+    title: '再ピック・棚戻し',
+    workers: listWorkers(),
+    tasks: tasks.map((t) => ({
+      ...t,
+      locationLabel: t.location ? formatLocation(t.block, t.location) : null,
+      imageUrl: images.get(String(t.sku ?? '').trim().toLowerCase())?.url || null,
+    })),
+  });
+});
+
+/** タスク操作 (claim/fulfill/unavailable/cancel)。packing の更新APIへ委譲。 */
+router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
+  try {
+    const psvc = await packingSvc();
+    if (!psvc) return res.status(404).json({ error: '梱包連携は無効です' });
+    const worker = resolveWorker(req);
+    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
+    if (t._notifyUnavailable) {
+      import('../packing/notify.js')
+        .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
+        .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
+    }
+    res.json({ ok: true, id: t.id, status: t.status });
+  } catch (e) {
+    // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す
+    if (e && Number.isInteger(e.status) && e.code) {
+      return res.status(e.status).json({ error: e.message, code: e.code });
+    }
+    console.error('[picking-tasks]', e);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
 // ─── バッチ詳細 (明細確認・紙PDFとの突合用) ───

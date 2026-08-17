@@ -27,9 +27,9 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  listShipChanges, setShipChangeStatus,
+  listShipChanges, setShipChangeStatus, resolveIncident,
 } from './service.js';
-import { notifyShipChange } from './notify.js';
+import { notifyShipChange, notifyTask } from './notify.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -254,7 +254,15 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     reason: req.body.reason || null,
     jumped: !!req.body.jumped,
     proposedMethod: req.body.proposed_method || null,
+    sku: req.body.sku || null,
+    actualSku: req.body.actual_sku || null,
+    qty: req.body.qty == null ? null : Number(req.body.qty),
   }, worker);
+  // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)
+  if (result.taskNotify) {
+    notifyTask(result.taskNotify, worker)
+      .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
+  }
   // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)
   if (req.body.event === 'ship_change' && !result.replayed) {
     const row = getDB().prepare(
@@ -269,6 +277,15 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     }
   }
   res.json({ ok: true, ...result });
+}));
+
+/** ③ミス候補の確定/取下げ (梱包完了サマリから。確定=picking担当へ帰責)。 */
+router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, api(async (req, res) => {
+  const name = String(req.body.worker_name || '').trim();
+  const actor = name || req.session?.displayName || req.session?.email || '端末';
+  const decision = String(req.body.decision || '');
+  const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id));
+  res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
 }));
 
 // ─── ④ 配送方法変更の事務対応キュー (管理者) ───
@@ -304,6 +321,8 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     slipCount: s.slips.length,
     doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
     heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+    repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+    incidents: s.incidents,
     lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
     pauseReason: s.batch.pause_reason || null,
   });
