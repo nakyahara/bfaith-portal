@@ -17,11 +17,12 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-test-'));
 process.env.PICKING_STATS_MIN_DATE = '2026-08-15';
 process.env.PICKING_STATS_OUTLIER_SEC = '180';
 process.env.PICKING_STATS_MIN_LINES = '10';
+process.env.PICKING_STATS_MIN_CLASS_LINES = '5';
 
 const { initPickingDB, getDB } = await import('../db.js');
 const {
   getPickingStats, getTodayProgress, statsRange, shiftDate, displayWorkerName,
-  STATS_MIN_DATE, STATS_MIN_LINES, STATS_OUTLIER_SEC,
+  STATS_MIN_DATE, STATS_MIN_LINES, STATS_OUTLIER_SEC, STATS_MIN_CLASS_LINES,
 } = await import('../service.js');
 
 initPickingDB();
@@ -166,6 +167,42 @@ t('速さ指数: 引当分類の重さを補正する', () => {
   // (期待 30×10 + 10×10 = 400秒 ÷ 実測 360 + 80 = 440秒 → 91)
   const e = s.workers.find((w) => w.name === 'E');
   assert.equal(e.index, 91);
+});
+
+t('引当分類ごとに「誰が速いか」を出す (分類内は重さ補正なしの素の比較)', () => {
+  db.exec('DELETE FROM pk_events; DELETE FROM pk_lines; DELETE FROM pk_batches;');
+  batchSeq = 0;
+  // 重い分類: S=20秒 / T=40秒 (分類平均30秒) → 分類内では S が上位
+  makeBatch({ workDate: '2026-08-16', cls: '重い分類', worker: 'S', secs: Array(10).fill(20) });
+  makeBatch({ workDate: '2026-08-16', cls: '重い分類', worker: 'T', secs: Array(10).fill(40) });
+  // 軽い分類: T=8秒 / S=12秒 (分類平均10秒) → 分類内では T が上位 (総合順位とは別)
+  makeBatch({ workDate: '2026-08-16', cls: '軽い分類', worker: 'T', secs: Array(10).fill(8) });
+  makeBatch({ workDate: '2026-08-16', cls: '軽い分類', worker: 'S', secs: Array(10).fill(12) });
+
+  const s = getPickingStats({ until: '2026-08-16', days: 30 });
+  const heavy = s.baseline.find((c) => c.key === '重い分類');
+  const light = s.baseline.find((c) => c.key === '軽い分類');
+
+  assert.deepEqual(heavy.workers.map((w) => w.name), ['S', 'T'], '重い分類はSが速い');
+  assert.deepEqual(light.workers.map((w) => w.name), ['T', 'S'], '軽い分類はTが速い (分類ごとに順位が変わる)');
+  assert.equal(heavy.workers[0].secPerLine, 20);
+  assert.equal(heavy.workers[0].index, 150, '分類平均30秒 ÷ 実測20秒 = 150');
+  assert.equal(heavy.workers[1].index, 75);
+  assert.equal(light.workers[0].index, 125);
+  assert.equal(heavy.workerCount, 2);
+  assert.equal(s.minClassLines, STATS_MIN_CLASS_LINES);
+});
+
+t('分類別も母数不足は参考値として順位から外す', () => {
+  db.exec('DELETE FROM pk_events; DELETE FROM pk_lines; DELETE FROM pk_batches;');
+  batchSeq = 0;
+  makeBatch({ workDate: '2026-08-16', cls: '分類P', worker: 'U', secs: Array(8).fill(20) });
+  makeBatch({ workDate: '2026-08-16', cls: '分類P', worker: 'V', secs: [1, 1] });   // 速いが2明細だけ
+  const s = getPickingStats({ until: '2026-08-16', days: 30 });
+  const c = s.baseline.find((x) => x.key === '分類P');
+  assert.deepEqual(c.workers.map((w) => w.name), ['U', 'V'], '参考値は速くても下');
+  assert.equal(c.workers[0].provisional, false);
+  assert.equal(c.workers[1].provisional, true);
 });
 
 t('外れ値: 上限超えの明細は除外し、件数を報告する', () => {

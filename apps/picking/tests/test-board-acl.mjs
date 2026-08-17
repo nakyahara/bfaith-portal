@@ -66,7 +66,7 @@ async function t(name, fn) { await fn(); passed++; console.log(`  ok: ${name}`);
 await t('掲示端末: ボードと board API は開ける', async () => {
   const board = await req('GET', '/board', { token: boardToken });
   assert.equal(board.status, 200);
-  assert.ok(board.text.includes('速さランキング'));
+  assert.ok(board.text.includes('引当分類別'), 'ボードは分類別ランキングが主役');
 
   const api = await req('GET', '/api/board', { token: boardToken });
   assert.equal(api.status, 200);

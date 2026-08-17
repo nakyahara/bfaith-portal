@@ -683,6 +683,11 @@ export const STATS_OUTLIER_SEC = Number(process.env.PICKING_STATS_OUTLIER_SEC) |
  * 実測 (8/15〜8/17) の1人1日あたりは数十〜400明細。半日だけ応援に入った人を弾かない 30 とする。
  */
 export const STATS_MIN_LINES = Number(process.env.PICKING_STATS_MIN_LINES) || 30;
+/**
+ * 引当分類ごとの比較で実数として扱う最低明細数。分類別は1人あたりの母数が小さくなるため
+ * 総合 (STATS_MIN_LINES) より緩くする。これ未満は参考値。
+ */
+export const STATS_MIN_CLASS_LINES = Number(process.env.PICKING_STATS_MIN_CLASS_LINES) || 10;
 
 /** 'YYYY-MM-DD' に日数を足す (UTC基準で計算するのでJST日付文字列にそのまま使える)。 */
 export function shiftDate(dateStr, days) {
@@ -780,10 +785,44 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
     const c = classMap.get(key);
     c.lines++; c.sec += r.sec; c.workers.add(r.worker);
   }
-  const baseline = [...classMap.values()]
-    .map((c) => ({ key: c.key, lines: c.lines, sec: c.sec, avgSec: c.sec / c.lines, workers: c.workers.size }))
+  const baselineRaw = [...classMap.values()]
+    .map((c) => ({ key: c.key, lines: c.lines, sec: c.sec, avgSec: c.sec / c.lines, workerCount: c.workers.size }))
     .sort((a, b) => b.lines - a.lines);
-  const baselineByKey = new Map(baseline.map((c) => [c.key, c.avgSec]));
+  const baselineByKey = new Map(baselineRaw.map((c) => [c.key, c.avgSec]));
+
+  // ── 引当分類 × 作業者 (「この分類は誰が速いか」— 中原さん要望 2026-08-17) ──
+  // 分類によって速さが根本的に違う (AES《単品》11.9秒 vs AES《1SKU複数個》23.5秒) ので、
+  // 総合順位だけでなく分類ごとの比較を出す。指数は「その分類の平均 ÷ 本人の実測」=
+  // 同じ分類同士の比較なので、重さの補正を挟まない素直な比率になる
+  const classWorkerMap = new Map();
+  for (const r of kept) {
+    const ck = r.hikiate_class || '(不明)';
+    const wk = r.worker || '(不明)';
+    if (!classWorkerMap.has(ck)) classWorkerMap.set(ck, new Map());
+    const m = classWorkerMap.get(ck);
+    if (!m.has(wk)) m.set(wk, { worker: wk, name: displayWorkerName(wk), lines: 0, sec: 0 });
+    const e = m.get(wk);
+    e.lines++; e.sec += r.sec;
+  }
+
+  const baseline = baselineRaw.map((c) => ({
+    ...c,
+    workers: [...(classWorkerMap.get(c.key)?.values() ?? [])]
+      .map((w) => ({
+        worker: w.worker,
+        name: w.name,
+        lines: w.lines,
+        sec: w.sec,
+        secPerLine: w.sec / w.lines,
+        // 分類内の相対 (100 = その分類の平均どおり・大きいほど速い)
+        index: w.sec > 0 ? Math.round((c.avgSec * w.lines / w.sec) * 100) : null,
+        provisional: w.lines < STATS_MIN_CLASS_LINES,
+      }))
+      .sort((a, b) => {
+        if (a.provisional !== b.provisional) return a.provisional ? 1 : -1;
+        return a.secPerLine - b.secPerLine;   // 速い順
+      }),
+  }));
 
   // ── 作業者別 ──
   const workerMap = new Map();
@@ -870,9 +909,10 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
   return {
     ...range,
     minLines: STATS_MIN_LINES,
+    minClassLines: STATS_MIN_CLASS_LINES,
     outlierSec: STATS_OUTLIER_SEC,
     total,
-    baseline: baseline.map(({ key, lines, avgSec, workers: n }) => ({ key, lines, avgSec, workers: n })),
+    baseline,   // 引当分類ごとの基準秒 + その分類の作業者内訳 (誰が速いか)
     workers,
     byDate,
   };

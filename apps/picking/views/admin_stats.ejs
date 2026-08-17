@@ -28,6 +28,8 @@
     details.cls summary { cursor: pointer; color: #1971c2; font-size: 0.9em; }
     details.cls table { margin: 6px 0 10px; }
     .note { background: #fff9db; border-radius: 8px; padding: 10px 12px; font-size: 0.85em; margin-bottom: 16px; }
+    .wchip { display: inline-block; background: #f1f3f5; border-radius: 6px; padding: 2px 7px; margin: 2px 4px 2px 0; white-space: nowrap; }
+    .wchip.prov { background: #f8f9fa; color: #868e96; }
   </style>
 </head>
 <body>
@@ -137,15 +139,32 @@
       </tbody>
     </table>
 
-    <h2>引当分類別の基準 (全員の平均)</h2>
+    <h2>引当分類別 — この分類は誰が速いか</h2>
+    <p class="muted" style="font-size:0.85em; margin:0 0 8px">
+      分類ごとの比較なので重さの補正は入れていません (指数 = その分類の平均 ÷ 本人の実測)。
+      <%= stats.minClassLines %>明細未満は参考値として順位を付けません。
+    </p>
     <table class="pk-list">
-      <thead><tr><th>引当分類</th><th class="num">明細</th><th class="num">秒/明細</th><th class="num">担当者数</th></tr></thead>
+      <thead><tr><th>引当分類</th><th class="num">明細</th><th class="num">平均秒</th><th class="num">担当者数</th><th>速い順 (秒/明細・明細数)</th></tr></thead>
       <tbody>
         <% for (const c of stats.baseline) { %>
-          <tr><td><%= c.key %></td><td class="num"><%= c.lines %></td>
-            <td class="num"><%= fmt1(c.avgSec) %></td><td class="num"><%= c.workers %></td></tr>
+          <tr>
+            <td><%= c.key %></td>
+            <td class="num"><%= c.lines %></td>
+            <td class="num"><b><%= fmt1(c.avgSec) %></b></td>
+            <td class="num"><%= c.workerCount %></td>
+            <td>
+              <% c.workers.forEach((w, i) => { %>
+                <span class="wchip <%= w.provisional ? 'prov' : '' %>">
+                  <%= w.provisional ? '' : (i + 1) + '. ' %><%= w.name %>
+                  <b><%= fmt1(w.secPerLine) %></b>
+                  <span class="muted">(<%= w.lines %>)</span>
+                </span>
+              <% }) %>
+            </td>
+          </tr>
         <% } %>
-        <% if (stats.baseline.length === 0) { %><tr><td colspan="4" class="muted">データがありません</td></tr><% } %>
+        <% if (stats.baseline.length === 0) { %><tr><td colspan="5" class="muted">データがありません</td></tr><% } %>
       </tbody>
     </table>
 

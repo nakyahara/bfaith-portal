@@ -5,6 +5,9 @@
     chrome.exe --kiosk https://picking.bfaith-wh.uk/apps/picking/board
   端末は「掲示専用 (kind=board)」で登録する = このページ以外は開けない。
 
+  主役は「引当分類ごとに誰が速いか」(中原さん要望)。分類によって速さが根本的に違う
+  (AES《単品》11.9秒 / AES《1SKU複数個》23.5秒) ため、総合順位だけでは比較にならない。
+
   自動更新は fetch + DOM差し替え (location.reload() だと数秒ごとに画面が白く飛ぶ)。
 -->
 <html lang="ja">
@@ -15,7 +18,7 @@
   <link rel="icon" type="image/png" href="/favicon.png">
   <style>
     :root {
-      --bg: #0f1216; --panel: #171c22; --line: #2a323c;
+      --bg: #0f1216; --panel: #171c22; --card: #1d232b; --line: #2a323c;
       --fg: #f1f3f5; --muted: #93a0ad;
       --ok: #40c057; --warn: #fab005; --bad: #fa5252; --accent: #4dabf7;
     }
@@ -26,65 +29,82 @@
       font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
       font-variant-numeric: tabular-nums;
       padding: 1.2vh 1.2vw;
-      display: flex; flex-direction: column; gap: 1.2vh;
+      display: flex; flex-direction: column; gap: 1.1vh;
       overflow: hidden;
     }
     header { display: flex; align-items: baseline; gap: 1.4vw; flex: 0 0 auto; }
-    header h1 { font-size: 3.0vh; margin: 0; letter-spacing: 0.02em; }
-    header .range { font-size: 2.0vh; color: var(--muted); }
-    header .right { margin-left: auto; font-size: 1.9vh; color: var(--muted); display: flex; gap: 1vw; align-items: center; }
+    header h1 { font-size: 2.9vh; margin: 0; letter-spacing: 0.02em; }
+    header .range { font-size: 1.9vh; color: var(--muted); }
+    header .right { margin-left: auto; font-size: 1.8vh; color: var(--muted); display: flex; gap: 1vw; align-items: center; }
     .stale { color: var(--warn); }
 
-    main { flex: 1 1 auto; display: grid; grid-template-columns: 25fr 75fr; gap: 1.2vw; min-height: 0; }
+    main { flex: 1 1 auto; display: grid; grid-template-columns: 26fr 74fr; gap: 1.1vw; min-height: 0; }
     /* min-width:0 が無いと grid の auto 最小サイズ (中身の max-content) が勝ち、
-       右カラムのテーブルが左カラムを押し潰して右端の列が画面外に出る */
-    .col { display: flex; flex-direction: column; gap: 1.2vh; min-height: 0; min-width: 0; }
-    .panel { background: var(--panel); border-radius: 1.2vh; padding: 1.6vh 1.4vw; min-height: 0; min-width: 0; }
-    .panel h2 { font-size: 1.9vh; margin: 0 0 1.2vh; color: var(--muted); font-weight: 600; letter-spacing: 0.06em; }
+       右カラムの中身が左カラムを押し潰して端の列が画面外に出る */
+    .col { display: flex; flex-direction: column; gap: 1.1vh; min-height: 0; min-width: 0; }
+    .panel { background: var(--panel); border-radius: 1.2vh; padding: 1.4vh 1.2vw; min-height: 0; min-width: 0; }
+    .panel h2 { font-size: 1.8vh; margin: 0 0 1.1vh; color: var(--muted); font-weight: 600; letter-spacing: 0.05em; }
+    .panel h2 .sub { color: #6b7784; font-weight: 400; letter-spacing: 0; }
 
     /* 今日 */
-    .today-big { font-size: 8.5vh; font-weight: 800; line-height: 1; white-space: nowrap; }
-    .today-sub { font-size: 2.2vh; color: var(--muted); margin-top: 0.4vh; white-space: nowrap; }
-    .bar { height: 1.8vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin: 1.4vh 0 0.8vh; }
+    .today-big { font-size: 7.6vh; font-weight: 800; line-height: 1; white-space: nowrap; }
+    .today-sub { font-size: 2.0vh; color: var(--muted); margin-top: 0.3vh; white-space: nowrap; }
+    .bar { height: 1.6vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin: 1.1vh 0 0.6vh; }
     .bar > i { display: block; height: 100%; background: var(--ok); }
-    .kv { display: flex; justify-content: space-between; gap: 0.8vw; font-size: 2.0vh; padding: 0.5vh 0; white-space: nowrap; }
+    .kv { display: flex; justify-content: space-between; gap: 0.8vw; font-size: 1.9vh; padding: 0.35vh 0; white-space: nowrap; }
     .kv .k { color: var(--muted); }
-    .chips { display: flex; flex-wrap: wrap; gap: 0.6vw; margin-top: 0.6vh; }
-    .chip { background: #232a32; border-radius: 0.8vh; padding: 0.6vh 0.8vw; font-size: 2.0vh; }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.5vw; }
+    .chip { background: #232a32; border-radius: 0.8vh; padding: 0.5vh 0.7vw; font-size: 1.9vh; }
     .chip.paused { color: var(--warn); }
-    .chip .cls { color: var(--muted); font-size: 1.5vh; display: block; }
+    .chip .cls { color: var(--muted); font-size: 1.4vh; display: block; }
 
-    /* ランキング (列幅は % 固定 — vw 固定だと画面比率によって右端の列がはみ出る) */
-    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-    th { font-size: 1.7vh; color: var(--muted); font-weight: 600; text-align: right; padding: 0 0.6vw 1vh; }
-    th.l, td.l { text-align: left; }
-    td { font-size: 2.6vh; padding: 1.25vh 0.6vw; border-top: 1px solid var(--line); text-align: right; }
-    td.name { font-size: 3.0vh; font-weight: 700; white-space: nowrap; }
-    td.rank { color: var(--muted); font-size: 2.2vh; width: 3vw; }
-    .idx { font-weight: 800; }
-    .idx.up { color: var(--ok); } .idx.dn { color: var(--warn); }
-    .idxbar { height: 1.2vh; background: #232a32; border-radius: 1vh; overflow: hidden; min-width: 6vw; }
-    .idxbar > i { display: block; height: 100%; background: var(--accent); }
-    tr.prov td { color: var(--muted); }
-    tr.prov .idx { color: var(--muted); }
-    .tag { font-size: 1.5vh; color: var(--muted); margin-left: 0.4vw; }
+    /* 総合ランキング (左カラム・コンパクト) */
+    .rank-row { display: flex; align-items: center; gap: 0.5vw; padding: 0.6vh 0; border-top: 1px solid var(--line); font-size: 2.1vh; }
+    .rank-row:first-child { border-top: 0; }
+    .rank-row .r { color: var(--muted); width: 1.6vw; font-size: 1.7vh; }
+    .rank-row .n { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+    .rank-row .i { font-weight: 800; width: 3.2vw; text-align: right; }
+    .rank-row .s { color: var(--muted); width: 3.4vw; text-align: right; font-size: 1.7vh; }
+    .rank-row.prov { color: var(--muted); }
+    .rank-row.prov .i { color: var(--muted); }
+    .up { color: var(--ok); } .dn { color: var(--warn); }
 
-    /* 日別 */
-    .day { display: flex; align-items: center; gap: 0.4vw; font-size: 1.9vh; padding: 0.55vh 0; }
-    .day .d { color: var(--muted); width: 21%; }
-    .day .db { flex: 1 1 0; min-width: 0; height: 1.2vh; background: #232a32; border-radius: 1vh; overflow: hidden; }
+    /* 引当分類カード (メイン) */
+    /* パネルを flex にして grid に残り高さを渡し、3行を等分する
+       (行を内容任せにすると分類名が2行のカードで下段がはみ出す) */
+    .cls-panel { display: flex; flex-direction: column; overflow: hidden; }
+    .cls-grid {
+      flex: 1 1 auto; min-height: 0;
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-auto-rows: minmax(0, 1fr); gap: 1.0vh 1.0vw;
+    }
+    .ccard { background: var(--card); border-radius: 1vh; padding: 1.0vh 0.9vw; min-width: 0; overflow: hidden; }
+    .ccard .chead { display: flex; align-items: baseline; gap: 0.5vw; }
+    .ccard .cname {
+      flex: 1 1 0; min-width: 0; font-size: 1.9vh; font-weight: 700; line-height: 1.25;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+    }
+    .ccard .cavg { font-size: 2.6vh; font-weight: 800; white-space: nowrap; }
+    .ccard .cavg small { font-size: 1.5vh; color: var(--muted); font-weight: 600; margin-left: 0.15vw; }
+    .ccard .cmeta { font-size: 1.4vh; color: #6b7784; margin: 0.15vh 0 0.6vh; }
+    .crow { display: flex; align-items: center; gap: 0.5vw; font-size: 2.0vh; padding: 0.42vh 0; border-top: 1px solid #262e37; }
+    .crow .r { color: var(--muted); width: 1.1vw; font-size: 1.6vh; }
+    .crow .n { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .crow .s { font-weight: 700; width: 3.0vw; text-align: right; }
+    .crow .q { color: #6b7784; width: 3.0vw; text-align: right; font-size: 1.5vh; }
+    .crow.top .n { font-weight: 800; }
+    .crow.prov { color: var(--muted); }
+    .crow.prov .s { color: var(--muted); font-weight: 600; }
+
+    /* 日別 (右下・横並び) */
+    .days { display: flex; gap: 1.0vw; }
+    .day { flex: 1 1 0; min-width: 0; text-align: center; }
+    .day .d { font-size: 1.5vh; color: var(--muted); }
+    .day .v { font-size: 2.1vh; font-weight: 700; }
+    .day .db { height: 0.9vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin-top: 0.3vh; }
     .day .db > i { display: block; height: 100%; background: var(--accent); }
-    .day .v { font-weight: 700; width: 18%; text-align: right; }
-    .day .n { color: var(--muted); width: 20%; text-align: right; font-size: 1.6vh; }
 
-    /* 分類 */
-    .cls-list { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.4vh 1.4vw; }
-    .cls-row { display: flex; align-items: baseline; gap: 0.6vw; font-size: 1.9vh; padding: 0.35vh 0; border-top: 1px solid var(--line); }
-    .cls-row .nm { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cdd5de; }
-    .cls-row .sec { font-weight: 700; flex: 0 0 auto; }
-    .cls-row .n { color: var(--muted); font-size: 1.6vh; flex: 0 0 4.5vw; text-align: right; }
-
-    footer { flex: 0 0 auto; font-size: 1.6vh; color: var(--muted); display: flex; gap: 1.6vw; }
+    footer { flex: 0 0 auto; font-size: 1.5vh; color: var(--muted); display: flex; gap: 1.6vw; }
     .err { color: var(--bad); }
   </style>
 </head>
@@ -113,38 +133,24 @@
         <div class="chips" id="active"><span class="chip">-</span></div>
       </div>
       <div class="panel" style="flex:1 1 auto; overflow:hidden">
-        <h2>日別 (秒/明細)</h2>
-        <div id="byDate"></div>
+        <h2>総合 <span class="sub">(分類の重さを補正した指数)</span></h2>
+        <div id="rank"></div>
       </div>
     </div>
 
     <div class="col">
-      <div class="panel" style="flex:1 1 auto; overflow:hidden">
-        <h2 id="rankTitle">速さランキング</h2>
-        <table>
-          <thead>
-            <tr>
-              <th class="l" style="width:5%"></th>
-              <th class="l" style="width:30%">作業者</th>
-              <th style="width:11%">速さ指数</th>
-              <th style="width:19%"></th>
-              <th style="width:13%">秒/明細</th>
-              <th style="width:12%">明細</th>
-              <th style="width:10%">欠品</th>
-            </tr>
-          </thead>
-          <tbody id="rank"></tbody>
-        </table>
+      <div class="panel cls-panel" style="flex:1 1 auto">
+        <h2 id="clsTitle">引当分類別 — この分類は誰が速いか <span class="sub">(秒/明細)</span></h2>
+        <div class="cls-grid" id="classes"></div>
       </div>
       <div class="panel">
-        <h2>引当分類別の平均 (全員・秒/明細)</h2>
-        <div class="cls-list" id="classes"></div>
+        <h2>日別 <span class="sub">(全体の秒/明細)</span></h2>
+        <div class="days" id="byDate"></div>
       </div>
     </div>
   </main>
 
   <footer>
-    <span>速さ指数 100 = 全体平均どおり (引当分類の重さを補正した値)</span>
     <span id="note"></span>
     <span id="err" class="err"></span>
   </footer>
@@ -154,6 +160,7 @@
     var RELOAD_MS = 20000;          // データ再取得の間隔 (前回の完了/失敗から数える)
     var FETCH_TIMEOUT_MS = 12000;   // これを超えたら諦めて次の周期へ (ハングで更新が止まらないように)
     var HARD_RELOAD_MS = 6 * 3600 * 1000;   // 6時間ごとにページ自体を作り直す (長期表示のメモリ対策)
+    var TOP_PER_CLASS = 3;          // 各分類カードに載せる人数 (3列×3行が画面に収まる上限)
     var startedAt = Date.now();
     var lastOk = 0;
     var gen = 0;                    // 応答の世代。古い応答が新しい表示を上書きしないように
@@ -172,13 +179,7 @@
       document.getElementById('clock').textContent = p(d.getHours()) + ':' + p(d.getMinutes());
     }
 
-    function render(data) {
-      var t = data.today, s = data.stats;
-
-      document.getElementById('range').textContent =
-        mmdd(s.since) + '〜' + mmdd(s.until) + ' の' + s.days + '日間';
-
-      // 本日
+    function renderToday(t) {
       document.getElementById('todayDone').textContent = t.doneLines;
       document.getElementById('todayTotal').textContent = t.totalLines;
       document.getElementById('todayBatches').textContent = t.doneCount + ' / ' + t.batchCount;
@@ -197,46 +198,67 @@
             '<span class="cls">' + esc(a.folder || '') + ' ' + esc(a.hikiateClass || '') + '</span></span>';
         }).join('');
       }
+    }
 
-      // ランキング
-      document.getElementById('rankTitle').textContent =
-        '速さランキング (直近' + s.days + '日 ・ 全' + s.total.lines + '明細)';
-      var rows = s.workers.map(function (w, i) {
-        // 指数 60〜140 を 0〜100% の幅に写す (差が見えるように)
-        var width = Math.max(4, Math.min(100, ((w.index || 0) - 60) / 80 * 100));
+    function renderRank(s) {
+      document.getElementById('rank').innerHTML = s.workers.map(function (w, i) {
         var cls = w.index == null ? '' : (w.index >= 100 ? 'up' : (w.index < 85 ? 'dn' : ''));
-        return '<tr class="' + (w.provisional ? 'prov' : '') + '">' +
-          '<td class="rank l">' + (w.provisional ? '–' : (i + 1)) + '</td>' +
-          '<td class="name l">' + esc(w.name) +
-            (w.provisional ? '<span class="tag">参考</span>' : '') + '</td>' +
-          '<td class="idx ' + cls + '">' + (w.index == null ? '-' : w.index) + '</td>' +
-          '<td><div class="idxbar"><i style="width:' + width + '%"></i></div></td>' +
-          '<td>' + fmt1(w.secPerLine) + '</td>' +
-          '<td>' + w.lines + '</td>' +
-          '<td>' + (w.shortages > 0 ? w.shortages : '') + '</td>' +
-        '</tr>';
-      });
-      document.getElementById('rank').innerHTML = rows.join('') ||
-        '<tr><td colspan="7" class="l" style="color:var(--muted)">データがありません</td></tr>';
+        return '<div class="rank-row' + (w.provisional ? ' prov' : '') + '">' +
+          '<span class="r">' + (w.provisional ? '–' : (i + 1)) + '</span>' +
+          '<span class="n">' + esc(w.name) + '</span>' +
+          '<span class="i ' + cls + '">' + (w.index == null ? '-' : w.index) + '</span>' +
+          '<span class="s">' + fmt1(w.secPerLine) + '秒</span>' +
+        '</div>';
+      }).join('') || '<div style="color:var(--muted)">データがありません</div>';
+    }
 
-      // 分類別
+    function renderClasses(s) {
       document.getElementById('classes').innerHTML = s.baseline.map(function (c) {
-        return '<div class="cls-row"><span class="nm">' + esc(c.key) + '</span>' +
-          '<span class="sec">' + fmt1(c.avgSec) + '</span>' +
-          '<span class="n">' + c.lines + '件</span></div>';
-      }).join('');
+        var rows = c.workers.slice(0, TOP_PER_CLASS).map(function (w, i) {
+          return '<div class="crow' + (w.provisional ? ' prov' : (i === 0 ? ' top' : '')) + '">' +
+            '<span class="r">' + (w.provisional ? '–' : (i + 1)) + '</span>' +
+            '<span class="n">' + esc(w.name) + '</span>' +
+            '<span class="s">' + fmt1(w.secPerLine) + '</span>' +
+            '<span class="q">' + w.lines + '件</span>' +
+          '</div>';
+        }).join('');
+        var rest = c.workers.length - TOP_PER_CLASS;
+        return '<div class="ccard">' +
+          '<div class="chead"><span class="cname">' + esc(c.key) + '</span>' +
+            '<span class="cavg">' + fmt1(c.avgSec) + '<small>秒</small></span></div>' +
+          '<div class="cmeta">全体平均 / ' + c.lines + '件 ・ ' + c.workerCount + '名' +
+            (rest > 0 ? ' (他' + rest + '名)' : '') + '</div>' +
+          rows +
+        '</div>';
+      }).join('') || '<div style="color:var(--muted)">データがありません</div>';
+    }
 
-      // 日別 (直近7日ぶん・秒/明細を横バーで)
+    function renderDays(s) {
       var recent = s.byDate.slice(-7);
       var worst = recent.reduce(function (m, d) { return Math.max(m, d.secPerLine); }, 1);
       document.getElementById('byDate').innerHTML = recent.map(function (d) {
-        return '<div class="day"><span class="d">' + mmdd(d.date) + '</span>' +
-          '<span class="db"><i style="width:' + Math.round((d.secPerLine / worst) * 100) + '%"></i></span>' +
-          '<span class="v">' + fmt1(d.secPerLine) + '</span>' +
-          '<span class="n">' + d.lines + '</span></div>';
+        return '<div class="day"><div class="d">' + mmdd(d.date) + '</div>' +
+          '<div class="v">' + fmt1(d.secPerLine) + '</div>' +
+          '<div class="db"><i style="width:' + Math.round((d.secPerLine / worst) * 100) + '%"></i></div>' +
+          '<div class="d">' + d.lines + '件</div></div>';
       }).join('') || '<span style="color:var(--muted)">データがありません</span>';
+    }
 
-      var note = '母数' + s.minLines + '明細未満は参考値 / ' + s.outlierSec + '秒超の明細は除外';
+    function render(data) {
+      var s = data.stats;
+      document.getElementById('range').textContent =
+        mmdd(s.since) + '〜' + mmdd(s.until) + ' の' + s.days + '日間 ・ ' + s.total.lines + '明細';
+      document.getElementById('clsTitle').innerHTML =
+        '引当分類別 — この分類は誰が速いか <span class="sub">(秒/明細・上位' + TOP_PER_CLASS + '名)</span>';
+
+      renderToday(data.today);
+      renderRank(s);
+      renderClasses(s);
+      renderDays(s);
+
+      var note = '総合の指数 100 = 全体平均どおり (分類の重さを補正) / '
+        + '分類別は' + s.minClassLines + '明細未満・総合は' + s.minLines + '明細未満を参考値として順位から外す / '
+        + s.outlierSec + '秒超の明細は除外';
       if (s.total.excluded.lines > 0) note += ' (' + s.total.excluded.lines + '件)';
       document.getElementById('note').textContent = note;
     }
