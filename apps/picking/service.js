@@ -740,11 +740,12 @@ function loadStatsLines(since, until) {
  *
  * @param {{until?: string, days?: number}} opts
  * @returns {{
- *   since, until, days, clamped, minLines, outlierSec,
+ *   since, until, days, clamped, minLines, minClassLines, outlierSec,
  *   total: {lines, sec, secPerLine, linesPerHour, batches, workers, days, excluded},
- *   baseline: Map 相当の配列 [{key, lines, avgSec, workers}],   // 引当分類の基準秒
+ *   baseline: [{key, lines, sec, avgSec, workerCount,          // 引当分類の基準秒
+ *     workers: [{worker, name, lines, sec, secPerLine, index, provisional}]}],  // 分類内の速い順
  *   workers: [{worker, name, lines, sec, secPerLine, expectedSec, index, provisional,
- *              batches, days, shortages, best: {key, lines, secPerLine}}],
+ *              batches, days, shortages, excluded, classes: [...]}],
  *   byDate: [{date, lines, sec, secPerLine, workers}]
  * }}
  */
@@ -793,7 +794,11 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
   // ── 引当分類 × 作業者 (「この分類は誰が速いか」— 中原さん要望 2026-08-17) ──
   // 分類によって速さが根本的に違う (AES《単品》11.9秒 vs AES《1SKU複数個》23.5秒) ので、
   // 総合順位だけでなく分類ごとの比較を出す。指数は「その分類の平均 ÷ 本人の実測」=
-  // 同じ分類同士の比較なので、重さの補正を挟まない素直な比率になる
+  // 同じ分類同士の比較なので、重さの補正を挟まない素直な比率になる。
+  // ⚠ 分類平均は明細の加重平均 (= 実際の総時間ベース) であり、処理量の多い人へ基準が寄る
+  //   (Codexレビュー)。分類内の順位づけ自体は素の秒/明細で行うため順位には影響しない。
+  //   指数は「平均との差の目安」の補助表示と割り切る (作業者等重み平均は母数の薄い人に
+  //   引きずられるため採用しない)
   const classWorkerMap = new Map();
   for (const r of kept) {
     const ck = r.hikiate_class || '(不明)';
