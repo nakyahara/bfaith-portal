@@ -281,6 +281,90 @@ console.log('5. ルール作成API');
   srv.close();
 }
 
+// ─── 6. フォルダ自動振り分け (2026-08-17 中原さん要望: Gmail風「今後この送信元はこのフォルダへ」) ───
+console.log('6. フォルダ自動振り分け');
+{
+  const { applyRuleToExistingMails } = await import('./mail-rules.js');
+  const { toUtcIso } = await import('./db.js');
+  db.prepare('DELETE FROM mail_rules').run();
+  const folderId = Number(db.prepare("INSERT INTO inquiry_folders (name) VALUES ('Amazon通知')").run().lastInsertRowid);
+  const shopM = db.prepare("SELECT id FROM shops WHERE channel_type = 'email' LIMIT 1").get().id;
+
+  // 6a. addMailRule の検証
+  const okRule = addMailRule({ name: 'Amazonへ', matchMode: 'all', priority: 5, action: 'import', folderId,
+    conditions: [{ field: 'from', op: 'equals', value: 'folder-test@amazon.com' }] });
+  check('importルール作成 (フォルダ付き)', Number.isInteger(Number(okRule.id)));
+  let e1 = null;
+  try { addMailRule({ matchMode: 'all', action: 'import', conditions: [{ field: 'from', op: 'contains', value: 'a' }] }); } catch (e) { e1 = e; }
+  check('import + フォルダ無しはthrow', e1 !== null && /フォルダの指定が必要/.test(e1.message));
+  let e2 = null;
+  try { addMailRule({ matchMode: 'all', action: 'skip', folderId, conditions: [{ field: 'from', op: 'contains', value: 'a' }] }); } catch (e) { e2 = e; }
+  check('skip + フォルダ指定はthrow', e2 !== null);
+  let e3 = null;
+  try { addMailRule({ matchMode: 'all', action: 'import', folderId: 99999, conditions: [{ field: 'from', op: 'contains', value: 'a' }] }); } catch (e) { e3 = e; }
+  check('存在しないフォルダはthrow', e3 !== null);
+  const doneWithFolder = addMailRule({ name: '完了+フォルダ', matchMode: 'all', priority: 6, action: 'import_done', folderId,
+    conditions: [{ field: 'from', op: 'equals', value: 'done-folder@amazon.com' }] });
+  check('import_done + フォルダの組み合わせも作れる', Number.isInteger(Number(doneWithFolder.id)));
+
+  // 6b. 評価が folderId を返す / 壊れルールは fail-open
+  const ev = evaluateMailRules({ from: 'folder-test@amazon.com' });
+  check('評価: action=import + folderId', ev?.action === 'import' && ev.folderId === folderId);
+  db.prepare(`INSERT INTO mail_rules (priority, name, match_mode, conditions_json, action)
+    VALUES (1,'broken-import','all','[{"field":"from","op":"equals","value":"broken@example.com"}]','import')`).run();
+  check('import なのにフォルダ無しの壊れルールは評価されない (fail-open)', evaluateMailRules({ from: 'broken@example.com' }) === null);
+
+  // 6c. gmail mapThread → initialFolderId (通常取込のまま) / import_done は完了+フォルダ
+  const { mapThread } = await import('./sync/adapters/gmail.js');
+  const th = (id, from) => ({ id, messages: [{ id: `${id}-m1`, internalDate: '1755300000000', payload: { headers: [
+    { name: 'From', value: `送信元 <${from}>` }, { name: 'Subject', value: '通知' }] } }] });
+  const mapped = mapThread(th('th-f1', 'folder-test@amazon.com'));
+  check('mapThread: initialFolderId が付き通常取込のまま', mapped.initialFolderId === folderId && mapped.initialInternalStatus === undefined);
+  const mappedDone = mapThread(th('th-f2', 'done-folder@amazon.com'));
+  check('mapThread: import_done + フォルダは両方付く', mappedDone.initialFolderId === folderId && mappedDone.initialInternalStatus === 'done');
+
+  // 6d. engine が新規作成時に folder_id を保存する (既存チケットは動かさない)
+  const { runSync } = await import('./sync/engine.js');
+  const shopF = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','振り分け店','folder-smoke@b-faith.biz')").run().lastInsertRowid;
+  const mkAdapter = items => ({ channelType: 'email', fetchNew: async () => ({ inquiries: items }) });
+  const r1 = await runSync(shopF, mkAdapter([mapped, mappedDone]));
+  check('runSync 成功', r1.ok === true, JSON.stringify(r1));
+  const created = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'th-f1'").get(shopF);
+  check('新規作成でフォルダに入る (状態は新着)', created?.folder_id === folderId && created?.internal_status === 'open');
+  const createdDone = db.prepare("SELECT * FROM inquiries WHERE shop_id = ? AND external_inquiry_id = 'th-f2'").get(shopF);
+  check('import_done + フォルダ = 完了+フォルダ', createdDone?.folder_id === folderId && createdDone?.internal_status === 'done');
+  // 既存チケットのフォルダは再同期で動かさない (手で移動した分を上書きしない)
+  db.prepare('UPDATE inquiries SET folder_id = NULL WHERE id = ?').run(created.id);
+  await runSync(shopF, mkAdapter([mapped]));
+  check('再同期は既存のフォルダを動かさない', db.prepare('SELECT folder_id FROM inquiries WHERE id = ?').get(created.id).folder_id === null);
+
+  // 6e. 既存メールへの一括適用 (フォルダ入れ=ステータス不変・冪等)
+  const mkMail = (ext, from, status = 'open') => db.prepare(`INSERT INTO inquiries
+      (channel_type, shop_id, external_inquiry_id, subject, customer_identifier, internal_status, is_unread, received_at, conversation_rev)
+    VALUES ('email',?,?,?,?,?,1,?,1)`).run(shopM, ext, 'フォルダ一括テスト', from, status, toUtcIso(Date.now())).lastInsertRowid;
+  const f1 = mkMail('fb1', 'bulk-folder@example.com');
+  const f2 = mkMail('fb2', 'bulk-folder@example.com', 'done');   // 完了済みもフォルダには入れる対象
+  const cond = [{ field: 'from', op: 'equals', value: 'bulk-folder@example.com' }];
+  const dryF = applyRuleToExistingMails(cond, { apply: false, action: 'import', folderId });
+  check('下見 (フォルダ入れ): 完了済みも含めて数える', dryF.matched === 2, JSON.stringify(dryF));
+  const appF = applyRuleToExistingMails(cond, { apply: true, action: 'import', folderId, actorId: 'tester' });
+  check('適用: 2件をフォルダへ・ステータスは不変', appF.foldered === 2 && appF.completed === 0
+    && db.prepare('SELECT folder_id, internal_status FROM inquiries WHERE id = ?').get(f1).internal_status === 'open'
+    && db.prepare('SELECT folder_id FROM inquiries WHERE id = ?').get(f1).folder_id === folderId
+    && db.prepare('SELECT folder_id FROM inquiries WHERE id = ?').get(f2).folder_id === folderId);
+  check('再適用は冪等 (0件)', applyRuleToExistingMails(cond, { apply: true, action: 'import', folderId, actorId: 'tester' }).foldered === 0);
+  check('フォルダ変更が操作ログに残る', db.prepare(
+    "SELECT COUNT(*) c FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'folder_change'").get(f1).c >= 1);
+  // import_done + フォルダ: 完了とフォルダ入れの両方
+  const f3 = mkMail('fb3', 'bulk-done-folder@example.com');
+  const appDF = applyRuleToExistingMails([{ field: 'from', op: 'equals', value: 'bulk-done-folder@example.com' }],
+    { apply: true, action: 'import_done', folderId, actorId: 'tester' });
+  check('import_done + フォルダの一括適用は完了+フォルダ両方', appDF.completed === 1 && appDF.foldered === 1
+    && db.prepare('SELECT folder_id, internal_status FROM inquiries WHERE id = ?').get(f3).folder_id === folderId
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(f3).internal_status === 'done');
+  db.prepare('DELETE FROM mail_rules').run();
+}
+
 check('DBは一時サブディレクトリのみに作成', fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 
 console.log(`\n${passed} PASS / ${failed} FAIL`);

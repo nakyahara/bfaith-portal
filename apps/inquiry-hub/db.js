@@ -315,18 +315,35 @@ function createTables() {
   // AIジョブ (キュー。inquiriesのカラムではなく独立テーブル。処理系はStep 7)
   // メール取込ルール (メールチャネルのノイズ除去。メールディーラー振り分け設定の移行先)
   // action: skip=取り込まない / import_done=取り込んで対応完了扱い (通常取込はルール不要の既定動作)
-  db.exec(`CREATE TABLE IF NOT EXISTS mail_rules (
+  // action: skip=取り込まない / import_done=取り込むが完了扱い / import=通常取り込み (フォルダ振り分け用)
+  // folder_id: 取り込み時にこのフォルダへ入れる (import / import_done で有効。2026-08-17 Gmail風振り分け)
+  const MAIL_RULES_COLS = `
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     priority INTEGER NOT NULL DEFAULT 100,       -- 小さいほど先に評価 (先勝ち)
     name TEXT,
     match_mode TEXT NOT NULL DEFAULT 'all' CHECK(match_mode IN ('all','any')),
     conditions_json TEXT NOT NULL,               -- [{field: from|to|reply_to|subject|body, op: contains|not_contains|equals|not_equals|starts_with|ends_with, value}]
-    action TEXT NOT NULL CHECK(action IN ('skip','import_done')),
+    action TEXT NOT NULL CHECK(action IN ('skip','import_done','import')),
+    folder_id INTEGER REFERENCES inquiry_folders(id),
     is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
     external_key TEXT,                           -- メールディーラー条件ID (再取込の冪等キー。手動追加はNULL)
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
-  )`);
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))`;
+  db.exec(`CREATE TABLE IF NOT EXISTS mail_rules (${MAIL_RULES_COLS})`);
+  // 移行 (2026-08-17): 旧スキーマは action CHECK が ('skip','import_done') のみで folder_id 列も無い。
+  // SQLite は CHECK を変更できないためテーブルを作り直してコピーする (mail_rules を参照する表は無い)
+  {
+    const ddl = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='mail_rules'").get()?.sql || '';
+    if (ddl && !ddl.includes("'import'")) {
+      db.transaction(() => {
+        db.exec(`CREATE TABLE mail_rules_new (${MAIL_RULES_COLS})`);
+        db.exec(`INSERT INTO mail_rules_new (id, priority, name, match_mode, conditions_json, action, is_active, external_key, created_at, updated_at)
+          SELECT id, priority, name, match_mode, conditions_json, action, is_active, external_key, created_at, updated_at FROM mail_rules`);
+        db.exec('DROP TABLE mail_rules');
+        db.exec('ALTER TABLE mail_rules_new RENAME TO mail_rules');
+      })();
+    }
+  }
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_rules_external
     ON mail_rules(external_key) WHERE external_key IS NOT NULL`);
 
