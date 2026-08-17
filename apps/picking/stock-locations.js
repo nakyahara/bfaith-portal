@@ -112,6 +112,32 @@ function jstStamp(iso, now = new Date()) {
   return `${jst.getUTCMonth() + 1}/${jst.getUTCDate()} ${hm}`;
 }
 
+// ブロック一覧 (line-search) が同じ表示部品を使うための別名エクスポート
+export { formatExpiry as formatExpiryLabel, jstStamp as jstStampLabel };
+
+/**
+ * warehouse service-api でブロック別の在庫一覧を取る (「Z」「A」コマンド用)。失敗は null (fail-soft)。
+ * @returns {{importedAt: string|null, block: string, items: Array}|null}
+ */
+export async function fetchStockBlock(blockCode, fetchFn = fetch) {
+  const cfg = serviceApiConfig();
+  const code = String(blockCode || '').trim().toUpperCase();
+  if (!cfg || !/^[A-Z0-9]{2,6}$/.test(code)) return null;
+  try {
+    const res = await fetchFn(`${cfg.base}/service-api/logizard-stock/block?code=${encodeURIComponent(code)}`, {
+      headers: cfg.headers, signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (!data || data.ok !== true || !Array.isArray(data.items)) throw new Error('想定外のレスポンス形式');
+    data.items = data.items.filter((r) => r && typeof r === 'object');
+    return data;
+  } catch (e) {
+    console.warn(`[picking-stock] ブロック在庫の取得失敗: ${e.message}`);
+    return null;
+  }
+}
+
 /**
  * 通知メッセージ用の他ロケ在庫セクションを組み立てる。
  * - 良品のみ・フリー在庫 (在庫数-引当数) が正のロケのみ・欠品報告のあったロケは除外

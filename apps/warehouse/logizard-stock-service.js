@@ -39,6 +39,29 @@ router.get('/locations', (req, res) => {
   }
 });
 
+// ブロック別の在庫一覧 (LINE在庫検索ボットの「Z」「A」コマンド用)。
+// 在庫CSVは在庫のある行しか含まないため、空ブロックは0件で返る (エラーではない)
+router.get('/block', (req, res) => {
+  const code = String(req.query.code || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{2,6}$/.test(code)) return res.status(400).json({ ok: false, error: 'BLOCK_CODE_INVALID' });
+  try {
+    const db = getDB();
+    const items = db.prepare(`
+      SELECT ロケ AS location, 商品ID AS sku, MIN(商品名) AS name, 品質区分名 AS quality, 有効期限 AS expiry,
+             SUM(在庫数) AS qty, SUM(引当数) AS allocated, SUM(在庫数 - 引当数) AS free
+      FROM raw_lz_inventory
+      WHERE ブロック略称 = ?
+      GROUP BY ロケ, 商品ID, 品質区分名, 有効期限
+      ORDER BY ロケ, 商品ID
+    `).all(code);
+    const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+    res.json({ ok: true, importedAt, block: code, count: items.length, items });
+  } catch (e) {
+    console.error('[logizard-stock-service] block error', e);
+    res.status(500).json({ ok: false, error: 'DB_ERROR' });
+  }
+});
+
 // SKU候補検索 (LINE在庫検索ボット用)。商品名/商品ID部分一致+バーコード完全一致、良品フリー降順
 router.get('/search', (req, res) => {
   const q = String(req.query.q || '').trim();
