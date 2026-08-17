@@ -117,10 +117,23 @@ export function logizardMirrorLatestCapture(db) {
 
 let lzMirrorLastCheckMs = 0;
 
+/** 時刻文字列 a が b より新しいか (Date.parse可能ならepoch比較、不能なら文字列比較にフォールバック。
+ *  ISO表記ゆれ (+09:00等) でも辞書順に頼らない — Codex LZM-R1 Low) */
+function newerThan(a, b) {
+  const ta = Date.parse(a), tb = Date.parse(b);
+  if (Number.isFinite(ta) && Number.isFinite(tb)) return ta > tb;
+  return String(a) > String(b);
+}
+
 /**
  * mirror が進んでいたら在庫オーバーレイを自動更新する (computeAll の頭で毎回呼ぶ)。
  * チェック自体は MAX(captured_at) 1本 + 60秒throttle で軽い。失敗しても発注画面は落とさない
  * (fail-soft: 古いオーバーレイのまま表示され、鮮度表示の⚠️で気づける)。
+ *
+ * 夜間〜翌朝の挙動 (意図した設計・Codex LZM-R1 High回答): 前日18時のmirrorオーバーレイは
+ * 翌朝のPML同期 (src_ne_products_synced_at) で applied=false になり「朝同期」の在庫へ戻る。
+ * 朝のNE在庫の方が18時のロジザード在庫より新しいので、これが正 (既存オーバーレイ思想と同じ)。
+ * 9時以降の毎時更新で新しい captured_at が届いたら自動反映が再開する。
  */
 export function maybeRefreshFromLogizardMirror() {
   const intervalMs = Number(process.env.PO_LZ_MIRROR_CHECK_INTERVAL_MS ?? 60000);
@@ -130,33 +143,46 @@ export function maybeRefreshFromLogizardMirror() {
     const db = getDB();
     const cap = logizardMirrorLatestCapture(db);
     if (!cap) return; // mirror未着 (初回push前・表なし)
-    const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get();
-    // 後勝ち: 手動取込 (captured_at=取込時刻) の方が新しい間は上書きしない。ISO文字列は辞書順=時刻順
-    const metaCap = meta ? (meta.captured_at || meta.uploaded_at) : null;
-    if (metaCap && cap <= metaCap) return;
-    // 「CSV取込を解除」直後は同じ世代では復活させない (次の毎時更新で自動再開)
-    const suppressed = getSetting('po_lz_mirror_suppress_capture');
-    if (suppressed && cap <= suppressed) return;
-    // NEマスタCSV (全項目上書き) が有効に適用されている間はスキップ — 在庫だけの自動反映で
-    // その日の原価・取扱区分の上書きを消さない。翌朝のPML同期で applied=false になったら再開
-    if (meta && (meta.source == null || meta.source === 'ne')) {
-      const pub = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get();
-      const a = Date.parse(meta.uploaded_at);
-      const b = pub && pub.src_ne_products_synced_at ? Date.parse(pub.src_ne_products_synced_at) : NaN;
-      const neActive = !(Number.isFinite(a) && Number.isFinite(b) && a < b); // loadPmlMerged の applied と同じ判定
-      if (neActive) return;
-    }
+    // 適用してよい状態か (集計前の早期スキップ用と、書込みtx内の再確認=CASの両方で使う。
+    // チェック〜書込みの間に手動取込/解除が割り込んでも古い自動反映で上書きしない — Codex LZM-R1 Medium)
+    const shouldApply = () => {
+      const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get();
+      // 後勝ち: 手動取込 (captured_at=取込時刻) の方が新しい間は上書きしない
+      const metaCap = meta ? (meta.captured_at || meta.uploaded_at) : null;
+      if (metaCap && !newerThan(cap, metaCap)) return false;
+      // 「CSV取込を解除」直後は同じ世代では復活させない (次の毎時更新で自動再開)
+      const suppressed = getSetting('po_lz_mirror_suppress_capture');
+      if (suppressed && !newerThan(cap, suppressed)) return false;
+      // NEマスタCSV (全項目上書き) が有効に適用されている間はスキップ — 在庫だけの自動反映で
+      // その日の原価・取扱区分の上書きを消さない。翌朝のPML同期で applied=false になったら再開
+      if (meta && (meta.source == null || meta.source === 'ne')) {
+        const pub = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get();
+        const a = Date.parse(meta.uploaded_at);
+        const b = pub && pub.src_ne_products_synced_at ? Date.parse(pub.src_ne_products_synced_at) : NaN;
+        const neActive = !(Number.isFinite(a) && Number.isFinite(b) && a < b); // loadPmlMerged の applied と同じ判定
+        if (neActive) return false;
+      }
+      return true;
+    };
+    if (!shouldApply()) return;
     // 集計はSQL一発 (手動CSV経路と同じルール: 良品のみ・商品IDごとにロケ横断SUM)
     const agg = db.prepare(`SELECT 商品ID AS code, SUM(在庫数) AS stock, SUM(引当数) AS alloc
       FROM mirror_logizard_stock WHERE 品質区分名='良品' GROUP BY 商品ID`).all();
     const byKey = new Map();
+    let negative = 0;
     for (const r of agg) {
       const key = normProductCode(r.code);
       if (!key) continue;
+      // 手動CSV経路の stock<0 拒否と同等の防衛 (mirror受信側は負数を拒否しないため — Codex LZM-R1 Medium)
+      if (r.stock < 0 || (r.alloc != null && r.alloc < 0)) { negative++; continue; }
       const cur = byKey.get(key) || { code: r.code, stock: 0, alloc: 0 };
       cur.stock += r.stock;
       cur.alloc += r.alloc == null ? 0 : r.alloc;
       byKey.set(key, cur);
+    }
+    if (negative > 0) {
+      console.warn(`[po] logizard mirror自動反映をスキップ: 負数在庫の商品が${negative}件 (mirrorデータ異常の疑い)`);
+      return;
     }
     // 異常データガード: mirror が極端に小さい (途中欠け等) 場合に大量の在庫0上書きをしない。
     // 手動経路のプレビュー確認に相当する安全弁 (実データ約2,900商品に対して既定500)
@@ -171,6 +197,7 @@ export function maybeRefreshFromLogizardMirror() {
     const zeroFill = [...pmlActive].filter(([k]) => !byKey.has(k));
     const now = new Date().toISOString();
     db.transaction(() => {
+      if (!shouldApply()) return; // CAS: 集計中に手動取込/解除が入っていたら書込み中止
       db.prepare('DELETE FROM po_ne_overlay_rows').run();
       const ins = db.prepare('INSERT INTO po_ne_overlay_rows (product_key, product_code, 在庫数, 引当数) VALUES (?,?,?,?)');
       for (const [key, v] of byKey) ins.run(key, v.code, v.stock, v.alloc);

@@ -4053,6 +4053,26 @@ console.log('── ロジザード在庫 mirror 自動反映 ──');
       '3時間超でも数字は使う (150+60・中原さん決定)', ovRow('noflyersticker'));
   }
 
+  // 8) 夜間→翌朝: 朝のPML同期の方が新しければ mirror overlay は失効し朝同期の在庫へ (意図した設計・Codex LZM-R1 High回答)
+  {
+    const oldSync2 = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get().src_ne_products_synced_at;
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(new Date(Date.now() + 30000).toISOString());
+    r = await j('/api/supplier/1');
+    ok(r.body.overlay && r.body.overlay.applied === false, '夜間→翌朝: 朝同期の方が新しければ overlay 失効 (朝のNE在庫が正・mirror再開は次の毎時更新)', r.body.overlay);
+    db.prepare('UPDATE mirror_pml_published SET src_ne_products_synced_at=? WHERE id=1').run(oldSync2);
+  }
+
+  // 9) 負数在庫を含む mirror は反映しない (手動経路の stock<0 拒否と同等の防衛)
+  {
+    const capBefore = ovMeta().captured_at;
+    const tNeg = new Date(Date.now() + 35000).toISOString();
+    db.prepare('DELETE FROM mirror_logizard_stock').run();
+    insLz.run('noflyersticker', 'チラシ', '001-001-01', '良品', -3, 0, '20260817', tNeg, tNeg);
+    insLz.run('mirror-only-item', 'ミラーだけの商品', '003-001-01', '良品', 9, 0, '20260817', tNeg, tNeg);
+    r = await j('/api/supplier/1');
+    ok(ovMeta().captured_at === capBefore, '負数在庫を含むmirrorは反映しない (overlay据え置き)', ovMeta());
+  }
+
   // 後片付け (以降のセクションに mirror 自動反映が影響しないように)
   db.prepare('DELETE FROM mirror_logizard_stock').run();
   db.prepare('DELETE FROM po_ne_overlay_meta').run();
