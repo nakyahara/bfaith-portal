@@ -88,7 +88,9 @@ export function resolveBlockCommand(text) {
 export function chunkTextMessages(header, lines, limit = 4500, maxMessages = 5) {
   const messages = [];
   let buf = header;
-  for (const line of lines) {
+  for (const rawLine of lines) {
+    // 1行だけで上限を超える異常データは行内で切り詰める (未分割で持ち越すと1通5,000字超=返信ごと拒否)
+    const line = rawLine.length > limit ? `${rawLine.slice(0, limit - 1)}…` : rawLine;
     if (`${buf}\n${line}`.length > limit) {
       messages.push(buf);
       buf = line;
@@ -144,12 +146,12 @@ async function buildStockText(sku, deps) {
 export async function buildSearchReplyMessages(query, deps) {
   const q = String(query || '').trim();
   if (!q) return [{ type: 'text', text: USAGE }];
-  // ブロック一覧コマンド (「Z」「A」「YYY」等) は文字数チェックより先に判定する
+  // エイリアス (Z/A) のブロック一覧コマンドは文字数チェックより先に判定する。
+  // ブロック名の直打ち (YYY等) は通常の商品検索を優先し、0件のときだけ試す
+  // (「10ml」等の商品検索に毎回warehouse照会の遅延を足さない・商品検索を影で奪わない)
   const blockCmd = resolveBlockCommand(q);
-  if (blockCmd) {
-    const blockMsgs = await buildBlockListMessages(blockCmd, deps);
-    if (blockMsgs) return blockMsgs;
-    // 直打ちブロック名に在庫なし → 商品検索として続行
+  if (blockCmd?.explicit) {
+    return buildBlockListMessages(blockCmd, deps);
   }
   if (q.length < 2) return [{ type: 'text', text: `キーワードは2文字以上で送ってください。${USAGE}` }];
   if (q.length > 100) return [{ type: 'text', text: 'キーワードが長すぎます (100文字まで)。' }];
@@ -159,7 +161,14 @@ export async function buildSearchReplyMessages(query, deps) {
   // 異常に長いSKU (data上限を超える) は件数分岐の前に除外する (1件ヒットの経路にも通さない)
   const items = result.items.filter((it) => String(it.sku).length <= 200);
   const notFound = () => [{ type: 'text', text: `「${q.slice(0, 30)}」に一致する商品が見つかりませんでした。別のキーワードで試してください。` }];
-  if (items.length === 0) return notFound();
+  if (items.length === 0) {
+    // 商品0件で入力がブロック名の形 (YYY/R1FA等) なら、ブロック一覧として試す
+    if (blockCmd) {
+      const blockMsgs = await buildBlockListMessages(blockCmd, deps);
+      if (blockMsgs) return blockMsgs;
+    }
+    return notFound();
+  }
   if (items.length === 1) {
     const text = await buildStockText(items[0].sku, deps);
     return [{ type: 'text', text: text || `該当データが見つかりませんでした (${String(items[0].sku).slice(0, 40)})。` }];

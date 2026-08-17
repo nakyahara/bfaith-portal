@@ -183,13 +183,23 @@ await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付�
   assert.ok(msgs[0].text.includes('・[001-002-01] 商品Y → 10個'), msgs[0].text);
 });
 
-await t('ブロック一覧: エイリアスで在庫0=在庫なし案内・直打ちで在庫0=商品検索へフォールバック', async () => {
+await t('ブロック一覧: エイリアス在庫0=在庫なし案内・直打ちは商品検索優先・商品0件でブロック照会', async () => {
   const d = deps({ fetchStockBlock: async () => ({ ok: true, importedAt: FRESH, block: 'AAAA', items: [] }) });
   const empty = await buildSearchReplyMessages('A', d);
   assert.ok(empty[0].text.includes('AAAA に現在在庫はありません'), empty[0].text);
-  // 直打ち 'YYY' が在庫0 → 商品検索が走る (deps既定のfetchStockSearchが返す候補が出る)
-  const fallthrough = await buildSearchReplyMessages('YYY', d);
-  assert.ok(fallthrough[0].quickReply, `商品検索へフォールバックするはず: ${fallthrough[0].text}`);
+  // 直打ち 'YYY' は商品検索が優先 (deps既定のfetchStockSearchが2件返す → 候補ボタン。block照会しない)
+  let blockCalled = false;
+  const d2 = deps({ fetchStockBlock: async () => { blockCalled = true; return { ok: true, importedAt: FRESH, block: 'YYY', items: [BLOCK_ROW()] }; } });
+  const productFirst = await buildSearchReplyMessages('YYY', d2);
+  assert.ok(productFirst[0].quickReply, `商品検索が優先されるはず: ${productFirst[0].text}`);
+  assert.equal(blockCalled, false, '商品ヒット時はブロック照会しない (通常検索に遅延を足さない)');
+  // 商品0件 → ブロック照会にフォールバックして一覧を返す
+  const d3 = deps({
+    fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [] }),
+    fetchStockBlock: async () => ({ ok: true, importedAt: FRESH, block: 'YYY', items: [BLOCK_ROW()] }),
+  });
+  const blockHit = await buildSearchReplyMessages('YYY', d3);
+  assert.ok(blockHit[0].text.startsWith('📦 YYY の在庫一覧'), blockHit[0].text);
   // エイリアスで取得失敗 → エラー案内
   const fail = await buildSearchReplyMessages('Z', deps({ fetchStockBlock: async () => null }));
   assert.ok(fail[0].text.includes('取得できませんでした'), fail[0].text);
@@ -204,6 +214,10 @@ await t('chunkTextMessages: 5,000字対策の分割と5通上限', () => {
   const small = chunkTextMessages('H', ['・a', '・b']);
   assert.equal(small.length, 1);
   assert.equal(small[0].text, 'H\n・a\n・b');
+  // 1行だけで上限超の異常データは行内で切り詰める (1通5,000字超で返信ごと拒否されない)
+  const longLine = chunkTextMessages('H', [`・${'x'.repeat(6000)}`]);
+  for (const m of longLine) assert.ok(m.text.length <= 5000, `長い1行も上限内: ${m.text.length}`);
+  assert.ok(longLine.some((m) => m.text.includes('…')), '切り詰めを明示');
 });
 
 // ─── processLineEvents (e2e・応答場所の制御) ───
