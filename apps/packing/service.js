@@ -1092,20 +1092,20 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty 
     if (!slip || (slip.status !== 'pending' && slip.status !== 'done')) {
       throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は保留/取消済みです`);
     }
+    // ⭐候補方式 (中原さん指示 2026-08-17): 記録時はタスクを発行しない。
+    // 「途中で足りないと思っても最後までやると山の下から出てくる」ため、
+    // ピッキングへの送信は梱包終了時の候補一覧からまとめて行う (dispatchIncident)
     if (event === 'shortage') {
-      const incidentId = insertIncident(db, batch, { slipSeq, kind: 'shortage', sku: line.sku, qty: q }, worker, now);
-      insertTask(db, batch, { slipSeq, kind: 'repick', sku: line.sku, productName: line.print_name || line.product_name, qty: q, incidentId }, worker, now);
+      insertIncident(db, batch, { slipSeq, kind: 'shortage', sku: line.sku, qty: q }, worker, now);
       db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='repick', done_at=NULL WHERE id=?`).run(slip.id);
-      return { notify: { kind: 'repick', sku: line.sku, name: line.print_name || line.product_name, qty: q, folder: batch.folder_name, slipSeq } };
+      return {};
     }
-    // wrong_item: 期待SKUの再ピック + 実SKUの棚戻し (要件§5.6)
+    // wrong_item: 期待SKU+実SKUのペアを候補として保持 (要件§5.6)
     const act = String(actualSku || '').trim();
     if (!act) throw new PackError(400, 'bad_actual_sku', '実際に入っていた商品 (SKU) を指定してください');
-    const incidentId = insertIncident(db, batch, { slipSeq, kind: 'wrong_item', sku: line.sku, actualSku: act, qty: q }, worker, now);
-    insertTask(db, batch, { slipSeq, kind: 'repick', sku: line.sku, productName: line.print_name || line.product_name, qty: q, incidentId }, worker, now);
-    insertTask(db, batch, { slipSeq, kind: 'return', sku: act, productName: null, qty: q, incidentId }, worker, now);
+    insertIncident(db, batch, { slipSeq, kind: 'wrong_item', sku: line.sku, actualSku: act, qty: q }, worker, now);
     db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='repick', done_at=NULL WHERE id=?`).run(slip.id);
-    return { notify: { kind: 'wrong_item', sku: line.sku, actualSku: act, qty: q, folder: batch.folder_name, slipSeq } };
+    return {};
   }
 
   if (event === 'excess') {
@@ -1113,9 +1113,8 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty 
     const q = Number(qty);
     if (!s) throw new PackError(400, 'bad_sku', 'SKUを指定してください');
     if (!Number.isInteger(q) || q < 1 || q > 999) throw new PackError(400, 'bad_qty', '数量が不正です');
-    const incidentId = insertIncident(db, batch, { slipSeq: slipSeq ?? null, kind: 'excess', sku: s, qty: q }, worker, now);
-    insertTask(db, batch, { slipSeq: slipSeq ?? null, kind: 'return', sku: s, productName: null, qty: q, incidentId }, worker, now);
-    return { notify: { kind: 'return', sku: s, qty: q, folder: batch.folder_name } };
+    insertIncident(db, batch, { slipSeq: slipSeq ?? null, kind: 'excess', sku: s, qty: q }, worker, now);
+    return {};
   }
 
   if (event === 'found' || event === 'receive') {
@@ -1130,20 +1129,23 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty 
         AND status IN ('requested','claimed','fulfilled')
     `).all(batchId, slipSeq);
     if (event === 'found') {
+      // 商品が出てきた: この伝票の候補 (不足/品違い) を取り下げる。
+      // 送信済みなら repick タスクも取消 (棚戻しタスクは残す=間違い品が実在する場合)
       for (const t of open) {
         db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=?").run(now, t.id);
-        if (t.incident_id) {
-          // 取り下げるのは shortage 候補のみ。wrong_item は「品違い自体はあった」ので候補を残し、
-          // 間違い品の棚戻しタスクも有効なまま (Codex Phase2 medium)
-          db.prepare(`
-            UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?
-            WHERE id=? AND status='candidate' AND kind='shortage'
-          `).run(now, t.incident_id);
-        }
       }
+      db.prepare(`
+        UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?
+        WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')
+      `).run(now, batchId, slipSeq);
     } else {
       // receive は状態機械どおり fulfilled のみ (Codex Phase2 high: ピッカー未対応のまま
-      // 保留解除できると、商品が無いのに梱包を再開してしまう)
+      // 保留解除できると、商品が無いのに梱包を再開してしまう)。
+      // 依頼未送信 (候補のみ) の段階では受領は成立しない — 「見つかった」を使う
+      if (open.length === 0) {
+        throw new PackError(409, 'repick_not_ready',
+          '再ピック依頼がまだ送信されていません (商品が見つかった場合は「見つかった」を使ってください)');
+      }
       const notReady = open.filter((t) => t.status !== 'fulfilled');
       if (notReady.length > 0) {
         throw new PackError(409, 'repick_not_ready',
@@ -1217,8 +1219,12 @@ export function listIncidents(batchId, status = null) {
 }
 
 /**
- * ミス候補の確定/取下げ。確定時は picking 担当 (pk_batches.worker) へ帰責 (要件§5.6)。
- * candidate のみ遷移できる (確定後の訂正は管理者運用 — 当面SQL)。
+ * ミス候補の確定/取下げ (⭐候補方式 — 中原さん指示 2026-08-17)。
+ *   confirm = 「ピッキングへ送信」: ミス確定 (pk_batches.worker へ帰責) と同時に
+ *             再ピック/棚戻しタスクを発行する。梱包を一通り終えた時点 (未処理ゼロ) でのみ可
+ *             — 「途中で足りないと思っても最後までやると出てくる」ため途中送信を防ぐ (要件§5.6)
+ *   withdraw = 取下げ (出てきた・誤記録)。作業中でも可。対象伝票に他の候補が無ければ保留も解除
+ * @returns {{...inc, dispatchedTasks: [{kind, sku, name, qty, folder, slipSeq}]}}
  */
 export function resolveIncident(incidentId, decision, actor, expectBatchId = null) {
   if (!['confirm', 'withdraw'].includes(decision)) {
@@ -1233,25 +1239,64 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       throw new PackError(404, 'not_found', '候補が見つかりません (バッチ不一致)');
     }
     if (inc.status !== 'candidate') {
-      throw new PackError(409, 'already_resolved', `既に${inc.status === 'confirmed' ? '確定' : '取下げ'}済みです`);
+      throw new PackError(409, 'already_resolved', `既に${inc.status === 'confirmed' ? '送信' : '取下げ'}済みです`);
+    }
+    const batch = db.prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(inc.batch_id);
+    // 担当者チェック (Codex high: 任意の作業者名で他人のバッチの候補を送信・帰責できてしまう)
+    if (batch.worker && batch.worker !== actor) {
+      throw new PackError(409, 'taken', `このバッチは ${batch.worker} が担当です`);
     }
     let attributed = null;
+    const dispatchedTasks = [];
     if (decision === 'confirm') {
-      const packBatch = db.prepare('SELECT status FROM pk_pack_batches WHERE id = ?').get(inc.batch_id);
-      if (packBatch?.status !== 'done') {
-        // 「途中で確定しない」(要件§5.6: バッチ後半で商品が出てくるケースを誤記録しないため)
-        throw new PackError(409, 'batch_not_done', 'ミスの確定は梱包完了後にできます (作業中は取下げのみ)');
+      const pendingCount = db.prepare(
+        "SELECT COUNT(*) c FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
+      ).get(inc.batch_id).c;
+      // 許可状態を明示: 完了済み or 「作業中かつ未処理ゼロ」(=終了画面)。paused等からは不可 (Codex medium)
+      const allowed = batch.status === 'done' || (batch.status === 'packing' && pendingCount === 0);
+      if (!allowed) {
+        throw new PackError(409, 'batch_not_done',
+          '送信は梱包を一通り終えてからできます (途中で出てくることがあるため)。先に残りの伝票を進めてください');
       }
-      const batch = db.prepare('SELECT pk_batch_id FROM pk_pack_batches WHERE id = ?').get(inc.batch_id);
       try {
         attributed = batch?.pk_batch_id
           ? db.prepare('SELECT worker FROM pk_batches WHERE id = ?').get(batch.pk_batch_id)?.worker ?? null
           : null;
       } catch { attributed = null; }
+      // 種別に応じてタスクを発行 (ここが「ピッキングへの送信」)
+      const name = inc.slip_seq != null
+        ? (slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.print_name
+          ?? slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.product_name ?? null)
+        : null;
+      if (inc.kind === 'shortage' || inc.kind === 'wrong_item') {
+        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'repick', sku: inc.sku, productName: name, qty: inc.qty, incidentId: inc.id }, actor, now);
+        dispatchedTasks.push({ kind: 'repick', sku: inc.sku, name, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
+      }
+      if (inc.kind === 'wrong_item') {
+        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.actual_sku, productName: null, qty: inc.qty, incidentId: inc.id }, actor, now);
+        dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
+      }
+      if (inc.kind === 'excess') {
+        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.sku, productName: null, qty: inc.qty, incidentId: inc.id }, actor, now);
+        dispatchedTasks.push({ kind: 'return', sku: inc.sku, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
+      }
     }
     db.prepare(`
       UPDATE pk_pack_incidents SET status=?, attributed_worker=?, confirmed_by=?, updated_at=? WHERE id=?
     `).run(decision === 'confirm' ? 'confirmed' : 'withdrawn', attributed, actor, now, incidentId);
-    return { ...inc, status: decision === 'confirm' ? 'confirmed' : 'withdrawn', attributed_worker: attributed };
+    if (decision === 'withdraw' && inc.slip_seq != null) {
+      // 取下げで、その伝票に他の候補が無ければ保留を解除して梱包に戻す
+      const remain = db.prepare(`
+        SELECT COUNT(*) c FROM pk_pack_incidents
+        WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item') AND id != ?
+      `).get(inc.batch_id, inc.slip_seq, inc.id).c;
+      if (remain === 0) {
+        db.prepare(`
+          UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+          WHERE batch_id=? AND seq=? AND status='held' AND hold_reason='repick'
+        `).run(inc.batch_id, inc.slip_seq);
+      }
+    }
+    return { ...inc, status: decision === 'confirm' ? 'confirmed' : 'withdrawn', attributed_worker: attributed, dispatchedTasks };
   })();
 }

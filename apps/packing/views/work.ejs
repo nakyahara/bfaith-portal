@@ -165,8 +165,8 @@
   </div>
 
   <div class="controls">
-    <button class="btn-prev" id="issueBtn" type="button" style="flex-basis:104px">⚠不足/余り</button>
-    <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:96px">配送⚠</button>
+    <button class="btn-prev" id="issueBtn" type="button" style="flex-basis:118px; font-size:16px; line-height:1.25">不足/余り<br>かも？</button>
+    <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:112px; font-size:15px; line-height:1.25">配送方法<br>変更</button>
     <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
   </div>
@@ -268,12 +268,17 @@
 
   <div class="overlay" id="doneOverlay">
     <div class="box">
-      <div class="done-big">✅ <%= state.batch.folder_name || '' %><br><%= state.slips.length %>伝票 完了しました</div>
+      <div class="done-big" id="doneTitle">✅ <%= state.batch.folder_name || '' %><br><%= state.slips.length %>伝票 完了しました</div>
       <div id="incBox" style="display:none; text-align:left; margin-top:16px; border-top:1px solid #dee2e6; padding-top:12px">
-        <div style="font-weight:800; margin-bottom:8px">⚠ ピッキングミス候補の確認 (残った不足・余り・品違い)</div>
+        <div style="font-weight:800; margin-bottom:4px">⚠ 出てこなかった・余った・間違っていた商品</div>
+        <div style="color:#868e96; font-size:14px; margin-bottom:8px">「ピッキングへ送信」で再ピック/棚戻しを依頼し、ミスとして記録します。途中で出てきた分は「取下げ」</div>
         <div id="incList"></div>
       </div>
-      <div style="margin-top:18px"><a href="/apps/packing/" style="font-size:20px">一覧へ戻る</a></div>
+      <div id="endHint" style="display:none; color:#868e96; margin-top:12px; font-size:15px">保留中の伝票は、ピッカーが持ってきたら「📦受け取った」で再開できます</div>
+      <div style="margin-top:18px">
+        <a href="/apps/packing/" style="font-size:20px">一覧へ戻る</a>
+        <button id="endClose" type="button" style="display:none; margin-left:16px; padding:10px 22px; font-size:17px; border:1px solid #ced4da; border-radius:10px; background:#f8f9fa; cursor:pointer">閉じる (梱包画面へ)</button>
+      </div>
     </div>
   </div>
 
@@ -598,13 +603,15 @@
       }
       if (Array.isArray(body.incidents)) {
         incidents = body.incidents.map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku ?? i.actualSku, qty: i.qty, slipSeq: i.slip_seq ?? i.slipSeq }));
+        // 終了画面を開いたままなら候補一覧を更新 (tmp-*が実IDに置き換わりボタンが活性化する)
+        if (overlayMode && $('doneOverlay').style.display === 'flex') showEndOverlay(overlayMode === 'done');
       }
       if (body.lastDoneSeq !== undefined) lastDoneSeq = body.lastDoneSeq;
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
       paused = body.batchStatus === 'paused';
       updatePausedOverlay(body.pauseReason);
       if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
-      if (body.batchStatus === 'done') showDoneOverlay();
+      if (body.batchStatus === 'done') showEndOverlay(true);
       // 楽観更新と同じ結果なら再描画しない (タップのたびに紙面が描き直されてチラつかないように)
       if (before !== `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`) render();
     }
@@ -648,12 +655,14 @@
         }
         viewSeq = next;
         render();
-      } else if (heldSet.size > 0) {
+      } else if (heldSet.size > 0 || incidents.length > 0) {
+        // 一通り終えた (未処理ゼロ) — ここで候補をまとめてピッキングへ送信する (⭐候補方式)
+        jumpMode = false;
         render();
-        showToast('保留中の伝票が残っています (再ピック/配送変更の対応待ち)');
+        showEndOverlay(false);
       } else {
         jumpMode = false;
-        showDoneOverlay();
+        showEndOverlay(true);
         render();
         // render 内の maybeSpeak (閲覧扱いの cancel) より後に完了を読み上げる
         speak(`${STATE.folderName} ${STATE.slips.length}件、完了しました`);
@@ -664,6 +673,7 @@
       if (viewSeq > 1) { viewSeq -= 1; render(); }
     }
 
+    $('endClose').addEventListener('click', () => { overlayMode = null; $('doneOverlay').style.display = 'none'; });
     $('nextBtn').addEventListener('click', goNext);
     $('prevBtn').addEventListener('click', goPrev);
 
@@ -712,18 +722,29 @@
       });
     });
 
-    // ── 完了オーバーレイ (③ミス候補の確定つき — 要件§5.6) ──
+    // ── 終了オーバーレイ (⭐候補方式: 一通り終えたらここからまとめてピッキングへ送信 — 要件§5.6) ──
     const INC_LABEL = { shortage: '📉 不足', excess: '📈 余り', wrong_item: '🔀 品違い' };
-    function showDoneOverlay() {
+    let overlayMode = null;   // 'done' | 'end' | null (表示中の同期反映で使う)
+    function showEndOverlay(done) {
+      overlayMode = done ? 'done' : 'end';
       $('doneOverlay').style.display = 'flex';
+      $('doneTitle').innerHTML = done
+        ? `✅ ${esc(STATE.folderName)}<br>${STATE.slips.length}伝票 完了しました`
+        : `🏁 ひととおり処理しました`;
+      $('endClose').style.display = done ? 'none' : 'inline-block';
+      $('endHint').style.display = (!done && heldSet.size > 0) ? 'block' : 'none';
       if (incidents.length === 0) { $('incBox').style.display = 'none'; return; }
       $('incBox').style.display = 'block';
-      $('incList').innerHTML = incidents.map((i) => `
+      $('incList').innerHTML = incidents.map((i) => {
+        const syncing = String(i.id).startsWith('tmp');   // サーバー同期前はIDが仮 (Codex medium)
+        const dis = syncing ? 'disabled style="opacity:.5"' : '';
+        return `
         <div style="display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid #f1f3f5">
-          <span style="flex:1; font-size:15px">${INC_LABEL[i.kind] || i.kind} ${esc(i.sku)}${i.actualSku ? ` (実際: ${esc(i.actualSku)})` : ''} × ${i.qty}${i.slipSeq ? ` / #${i.slipSeq}` : ''}</span>
-          <button type="button" class="inc-confirm" data-id="${i.id}" style="padding:8px 14px; background:#e03131; color:#fff; border:none; border-radius:8px; font-weight:700">ミス確定</button>
-          <button type="button" class="inc-withdraw" data-id="${i.id}" style="padding:8px 14px; background:#f1f3f5; border:1px solid #ced4da; border-radius:8px">取下げ</button>
-        </div>`).join('');
+          <span style="flex:1; font-size:15px">${INC_LABEL[i.kind] || i.kind} ${esc(i.sku)}${i.actualSku ? ` (実際: ${esc(i.actualSku)})` : ''} × ${i.qty}${i.slipSeq ? ` / #${i.slipSeq}` : ''}${syncing ? ' <small>同期中…</small>' : ''}</span>
+          <button type="button" class="inc-confirm" data-id="${i.id}" ${dis} ${syncing ? '' : 'style="padding:8px 14px; background:#e03131; color:#fff; border:none; border-radius:8px; font-weight:700"'}>ピッキングへ送信</button>
+          <button type="button" class="inc-withdraw" data-id="${i.id}" ${dis} ${syncing ? '' : 'style="padding:8px 14px; background:#f1f3f5; border:1px solid #ced4da; border-radius:8px"'}>取下げ</button>
+        </div>`;
+      }).join('');
       document.querySelectorAll('.inc-confirm, .inc-withdraw').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const decision = btn.classList.contains('inc-confirm') ? 'confirm' : 'withdraw';
@@ -734,8 +755,10 @@
               body: JSON.stringify({ decision, worker_name: worker }),
             });
             if (!res.ok) { const b = await res.json().catch(() => ({})); showToast(b.error || `エラー (${res.status})`); return; }
+            if (decision === 'confirm') showToast('ピッキングへ送信しました');
             incidents = incidents.filter((i) => i.id !== Number(btn.dataset.id));
-            showDoneOverlay();
+            await resync();
+            showEndOverlay($('endClose').style.display === 'none');
           } finally { btn.disabled = false; }
         });
       });
@@ -838,7 +861,7 @@
       if (type === 'excess') {
         enqueue('excess', seq, { sku, qty });
         incidents.push({ id: `tmp-${Date.now()}`, kind: 'excess', sku, qty, slipSeq: null });
-        showToast(`余り ${sku} × ${qty} を棚戻し依頼しました`);
+        showToast(`余り候補に追加: ${sku} × ${qty} (最後にまとめて送信します)`);
         return;
       }
       enqueue(type, seq, type === 'wrong_item' ? { sku, actual_sku: actualSku, qty } : { sku, qty });
@@ -848,8 +871,8 @@
       repickSet.add(seq);
       $('doneOverlay').style.display = 'none';
       showToast(type === 'shortage'
-        ? `不足 ${sku} × ${qty} を再ピック依頼しました (伝票は保留)`
-        : '品違いを記録しました (正しい商品の再ピック+間違い品の棚戻し)');
+        ? `不足候補に追加: ${sku} × ${qty} — 伝票は保留。途中で出てきたら「見つかった」`
+        : '品違い候補に追加しました (最後にまとめて送信します)');
       currentSeq = minPending();
       const next = nextPendingAfter(seq);
       if (next != null) { viewSeq = next; }

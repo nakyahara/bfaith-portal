@@ -279,12 +279,27 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   res.json({ ok: true, ...result });
 }));
 
-/** ③ミス候補の確定/取下げ (梱包完了サマリから。確定=picking担当へ帰責)。 */
+/** ③ミス候補の確定/取下げ (終了画面から。確定=送信+picking担当へ帰責)。 */
 router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, api(async (req, res) => {
+  // 作業者はイベントAPIと同じ検証 (pk_workers の有効名 or セッション本人 — Codex high)
   const name = String(req.body.worker_name || '').trim();
-  const actor = name || req.session?.displayName || req.session?.email || '端末';
+  let actor = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    actor = name;
+  } else if (req.session?.email) {
+    actor = req.session.displayName || req.session.email;
+  } else {
+    throw new PackError(400, 'no_worker', '作業者を選択してください');
+  }
   const decision = String(req.body.decision || '');
   const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id));
+  // 送信 (confirm) したタスクをGChatへ (fail-soft・DBの行が正本)
+  for (const t of inc.dispatchedTasks || []) {
+    notifyTask(t, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
+  }
   res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
 }));
 
