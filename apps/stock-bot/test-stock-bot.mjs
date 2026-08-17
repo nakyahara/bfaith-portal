@@ -31,10 +31,10 @@ const ins = db.prepare(`INSERT INTO mirror_logizard_stock (
   商品ID, 商品名, バーコード, ブロック略称, ロケ, 品質区分名, 有効期限, 入荷日,
   在庫数, 引当数, ロケ業務区分, 最終入荷日, 最終出荷日, 在庫日, captured_at, synced_at
 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-const put = (sku, name, barcode, block, loc, quality, qty, alloc) =>
-  ins.run(sku, name, barcode, block, loc, quality, '', '', qty, alloc, '', '', '', '20260816', CAPTURED, '2026-08-16 16:00:00');
+const put = (sku, name, barcode, block, loc, quality, qty, alloc, expiry = '') =>
+  ins.run(sku, name, barcode, block, loc, quality, expiry, '', qty, alloc, '', '', '', '20260816', CAPTURED, '2026-08-16 16:00:00');
 
-put('teatree10', 'ティーツリーオイル 10ml', 'X000TEA10', 'R1FA', '001-001-01', '良品', 50, 10);
+put('teatree10', 'ティーツリーオイル 10ml', 'X000TEA10', 'R1FA', '001-001-01', '良品', 50, 10, '20280115');
 put('teatree20', 'ティーツリーオイル 20ml', 'X000TEA20', 'R1FA', '002-001-01', '良品', 200, 0);
 put('teatree20', 'ティーツリーオイル 20ml', 'X000TEA20', 'P1FB', '001-002-01', '良品', 30, 0);
 put('teatree20', 'ティーツリーオイル 20ml', 'X000TEA20', 'ZZZ', 'ZZZ-ZZZ-ZZ', '良品', 15, 0);
@@ -89,7 +89,7 @@ console.log('\n── handleChatEvent: CARD_CLICKED ──');
   ok(!newFmt.text.includes('P2FA'), '不良品ロケは出ない');
 
   const oldFmt = handleChatEvent({ type: 'CARD_CLICKED', action: { actionMethodName: 'showStock', parameters: [{ key: 'sku', value: 'teatree10' }] } }, db, NOW);
-  ok(oldFmt.text.includes('(teatree10)') && oldFmt.text.includes('・R1FA-001-001-01 → 40個 (別途引当10)'), `旧形式パラメータでも動く:\n${oldFmt.text}`);
+  ok(oldFmt.text.includes('(teatree10)') && oldFmt.text.includes('・R1FA-001-001-01 → 40個 (期限2028/01/15・別途引当10)'), `旧形式パラメータでも動く+期限表示:\n${oldFmt.text}`);
 
   const gone = handleChatEvent({ type: 'CARD_CLICKED', common: { invokedFunction: 'showStock', parameters: { sku: 'nolongerexists' } } }, db, NOW);
   ok(gone.text.includes('見つかりませんでした'), 'SKU消失は案内文');

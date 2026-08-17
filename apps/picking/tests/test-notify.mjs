@@ -290,7 +290,7 @@ globalThis.fetch = async (url, opts) => {
     locations: [
       { block: 'P3FB', location: '001-003-03', quality: '良品', qty: 3, allocated: 0, free: 3 },      // 報告ロケ → 除外
       { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 200, allocated: 0, free: 200 },
-      { block: 'R1FA', location: '002-002-01', quality: '良品', qty: 160, allocated: 10, free: 150 },
+      { block: 'R1FA', location: '002-002-01', quality: '良品', qty: 160, allocated: 10, free: 150, expiry: '20280115' },
       { block: 'P1FB', location: '001-004-02', quality: '不良品', qty: 50, allocated: 0, free: 50 },   // 良品以外 → 出さない
       { block: 'P1FB', location: '001-009-01', quality: '良品', qty: 5, allocated: 5, free: 0 },       // フリー0 → 出さない
       { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', quality: '良品', qty: 1000, allocated: 0, free: 1000 },  // 仮想ロケ → 合算行のみ
@@ -303,8 +303,8 @@ globalThis.fetch = async (url, opts) => {
     const lines = text.split('\n');
     // 「12:03」形式はLINEが時刻リンク化するので「12時03分」表記 (区切りも「→」でコロン不使用)
     assert.ok(lines[0].startsWith('📍 他ロケ在庫 (12時03分時点)'), text);
-    assert.equal(lines[1], '・R1FA-001-001-01 → 200個');
-    assert.equal(lines[2], '・R1FA-002-002-01 → 150個 (別途引当10)');
+    assert.equal(lines[1], '・R1FA-001-001-01 → 200個', '期限なしロットは補足なし');
+    assert.equal(lines[2], '・R1FA-002-002-01 → 150個 (期限2028/01/15・別途引当10)', '期限は補足括弧にまとめる');
     assert.equal(lines[3], '・ZZZ-ZZZ-ZZ → 1000個', '特殊ロケは実際のロケコードのまま末尾に表示');
     assert.equal(lines.length, 4, `不良品/フリー0/報告ロケは出ないはず:\n${text}`);
     assert.ok(!text.includes('⚠'), '新鮮なら警告なし');
@@ -322,6 +322,19 @@ globalThis.fetch = async (url, opts) => {
     const text = buildStockLocationsText(many, { now });
     assert.equal(text.split('\n').length, 16, `見出し+15ロケ全部:\n${text}`);
     assert.ok(!text.includes('…他'), '丸め表示を出さない');
+  });
+
+  t('buildStockLocationsText: 同ロケの期限違いロットは行を分け期限の近い順 (先入先出)', () => {
+    const lots = {
+      ok: true, importedAt: data.importedAt, stockDate: '20260816',
+      locations: [
+        { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 50, allocated: 0, free: 50, expiry: '20280115' },
+        { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 50, allocated: 0, free: 50, expiry: '20271210' },
+      ],
+    };
+    const lines = buildStockLocationsText(lots, { now }).split('\n');
+    assert.equal(lines[1], '・R1FA-001-001-01 → 50個 (期限2027/12/10)');
+    assert.equal(lines[2], '・R1FA-001-001-01 → 50個 (期限2028/01/15)');
   });
 
   t('buildStockLocationsText: 180分超のスナップショットは古い旨の警告', () => {

@@ -91,6 +91,12 @@ export async function fetchStockSearch(query, fetchFn = fetch) {
   }
 }
 
+/** ロジザードの有効期限 (YYYYMMDD) を「YYYY/MM/DD」にする。空・形式外は null (=表示しない)。 */
+function formatExpiry(v) {
+  const m = String(v || '').trim().match(/^(\d{4})(\d{2})(\d{2})$/);
+  return m ? `${m[1]}/${m[2]}/${m[3]}` : null;
+}
+
 /**
  * ISO時刻を JST の「H時MM分」(同日) / 「M/D H時MM分」(別日) にする。解釈できなければ null。
  * ⚠「16:05」形式にしない — LINE (iOS) が「数字:数字」を時刻と誤認して勝手にリンク化する
@@ -127,9 +133,12 @@ export function buildStockLocationsText(data, {
     .filter((r) => Number(r.free) > 0);
   // 棚ロケ (8桁数字に正規化できるもの) をフリー在庫降順で先に、それ以外
   // (ロジザード上の特殊ロケ。実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。
-  // 特殊ロケも実在のロケコードなので、造語 (「仮想ロケ」等) にせずそのままの名前で見せる
+  // 特殊ロケも実在のロケコードなので、造語 (「仮想ロケ」等) にせずそのままの名前で見せる。
+  // 同ロケに期限違いロットがある場合は行が分かれる → 同ロケ内は期限の近い順 (先入先出)
   const isShelf = (r) => normalizeLocationDigits(r.location).length === 8;
-  const byFree = (a, b) => (Number(b.free) - Number(a.free)) || String(a.location).localeCompare(String(b.location));
+  const byFree = (a, b) => (Number(b.free) - Number(a.free))
+    || String(a.location).localeCompare(String(b.location))
+    || String(a.expiry || '9999').localeCompare(String(b.expiry || '9999'));
   const rows = [...candidates.filter(isShelf).sort(byFree), ...candidates.filter((r) => !isShelf(r)).sort(byFree)];
 
   const stamp = jstStamp(data.importedAt, now);
@@ -144,8 +153,13 @@ export function buildStockLocationsText(data, {
     // 前方一致は「-」境界まで見る (ZZZ2-… のような別ブロックを誤って省略しない)
     const dup = loc === block || loc.startsWith(`${block}-`);
     const label = block && !dup ? `${block}-${loc}` : (loc || block);
+    // 補足は1つの括弧にまとめる: (期限2028/01/15・別途引当10)
+    const notes = [];
+    const expiry = formatExpiry(r.expiry);
+    if (expiry) notes.push(`期限${expiry}`);
+    if (Number(r.allocated) > 0) notes.push(`別途引当${r.allocated}`);
     // 区切りは「→」— 「01: 200」のようなコロンはLINEが時刻と誤認してリンク化する
-    return `・${label} → ${r.free}個${Number(r.allocated) > 0 ? ` (別途引当${r.allocated})` : ''}`;
+    return `・${label} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
   });
   if (rows.length > maxLines) lines.push(`…他${rows.length - maxLines}ロケ`);
   return [header, ...lines].join('\n');
