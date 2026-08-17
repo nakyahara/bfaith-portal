@@ -655,3 +655,319 @@ export function getDailySummary(workDate) {
 
   return { workDate, total, byWorker: groupBy('worker'), byClass: groupBy('hikiate_class'), shortages, batches };
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 作業実績の統計 (30日ローリング) — 倉庫の掲示モニターと管理画面が使う
+//
+// getDailySummary との違い:
+//   - 期間が「当日1日」ではなく「直近30日」(中原さん指定 2026-08-17)
+//   - 作業者の帰属が「バッチの最終担当者に全量計上」ではなく **明細1件ごと**
+//     (pk_events の next/shortage を打った本人。交代しても正しく分かれる)
+//   - 「速い/遅い」は生の秒/明細ではなく **引当分類の基準秒に対する比** で見る
+//     (AES《単品》10.9秒 と AES《1SKU複数個》23.7秒 では倍違うため、
+//      重い分類を引いた人が遅く見えてしまう)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 集計の開始下限。これ以前はテスト運用のため除外する (中原さん指定 2026-08-17)。 */
+export const STATS_MIN_DATE = process.env.PICKING_STATS_MIN_DATE || '2026-08-15';
+/** 既定の集計窓 (日)。当日を含む直近N日。 */
+export const STATS_WINDOW_DAYS = Number(process.env.PICKING_STATS_WINDOW_DAYS) || 30;
+/**
+ * 明細1件の所要秒がこれを超えたら「放置」とみなして集計から除外する。
+ * 作業画面を開いたまま別の用事に行って戻ってから「次へ」を押すと、その1件に
+ * 何分も乗って平均が壊れるため (中断⏸を使えば正しく除外されるが、実運用では押し忘れる)。
+ */
+export const STATS_OUTLIER_SEC = Number(process.env.PICKING_STATS_OUTLIER_SEC) || 180;
+/**
+ * ランキングを実数として扱う最低明細数。これ未満は「参考」扱いにする (数字が暴れるため)。
+ * 実測 (8/15〜8/17) の1人1日あたりは数十〜400明細。半日だけ応援に入った人を弾かない 30 とする。
+ */
+export const STATS_MIN_LINES = Number(process.env.PICKING_STATS_MIN_LINES) || 30;
+/**
+ * 引当分類ごとの比較で実数として扱う最低明細数。分類別は1人あたりの母数が小さくなるため
+ * 総合 (STATS_MIN_LINES) より緩くする。これ未満は参考値。
+ */
+export const STATS_MIN_CLASS_LINES = Number(process.env.PICKING_STATS_MIN_CLASS_LINES) || 10;
+
+/** 'YYYY-MM-DD' に日数を足す (UTC基準で計算するのでJST日付文字列にそのまま使える)。 */
+export function shiftDate(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** 集計期間 (until を含む直近 days 日。ただし STATS_MIN_DATE より前には遡らない)。 */
+export function statsRange(until = jstToday(), days = STATS_WINDOW_DAYS) {
+  const rawSince = shiftDate(until, -(Math.max(1, days) - 1));
+  const since = rawSince < STATS_MIN_DATE ? STATS_MIN_DATE : rawSince;
+  return { since, until, days, clamped: rawSince < STATS_MIN_DATE };
+}
+
+/** 掲示用の作業者表示名。email 形式はローカル部だけにする (モニターに社内メールを出さない)。 */
+export function displayWorkerName(worker) {
+  const s = String(worker ?? '').trim();
+  if (!s) return '(不明)';
+  const at = s.indexOf('@');
+  return at > 0 ? s.slice(0, at) : s;
+}
+
+/**
+ * 期間内の「完了バッチの明細」を1件ずつ返す。作業者は pk_events から明細単位で解決する。
+ * shown_at/done_at は PR2 で「直近表示時刻」を刻んでいるので、back で往復しても
+ * 他の明細の時間が混入しない (= この差がその明細の実所要時間)。
+ */
+function loadStatsLines(since, until) {
+  return getDB().prepare(`
+    SELECT b.work_date, b.hikiate_class, b.id AS batch_id, l.seq, l.status,
+      CAST(ROUND((julianday(l.done_at) - julianday(l.shown_at)) * 86400) AS INTEGER) AS sec,
+      COALESCE(
+        (SELECT e.worker FROM pk_events e
+          WHERE e.batch_id = l.batch_id AND e.line_seq = l.seq
+            AND e.event IN ('next','shortage')
+          ORDER BY e.id DESC LIMIT 1),
+        b.worker
+      ) AS worker
+    FROM pk_lines l
+    JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.work_date >= ? AND b.work_date <= ?
+      AND b.validity = 'valid' AND b.status = 'done'
+      AND l.shown_at IS NOT NULL AND l.done_at IS NOT NULL
+  `).all(since, until);
+}
+
+/**
+ * 作業実績の統計。
+ *
+ * @param {{until?: string, days?: number}} opts
+ * @returns {{
+ *   since, until, days, clamped, minLines, minClassLines, outlierSec,
+ *   total: {lines, sec, secPerLine, linesPerHour, batches, workers, days, excluded},
+ *   baseline: [{key, lines, sec, avgSec, workerCount,          // 引当分類の基準秒
+ *     workers: [{worker, name, lines, sec, secPerLine, index, provisional}]}],  // 分類内の速い順
+ *   workers: [{worker, name, lines, sec, secPerLine, expectedSec, index, provisional,
+ *              batches, days, shortages, excluded, classes: [...]}],
+ *   byDate: [{date, lines, sec, secPerLine, workers}]
+ * }}
+ */
+export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
+  const range = statsRange(until, days);
+  const rows = loadStatsLines(range.since, range.until);
+
+  // ── 外れ値の仕分け ──
+  // 捨てた件数は全体と作業者別の両方で出す。除外は「放置の多い人ほど悪い記録が消える」
+  // 非対称性を持つので、誰の分をどれだけ捨てたかが見えないと不公平を検知できない
+  // (Codexレビュー medium)。0秒は除外しない — 同一ロケの連続ピックで実際に起きる
+  const kept = [];
+  const excludedByWorker = new Map();
+  let excludedLines = 0;
+  let excludedSec = 0;
+  for (const r of rows) {
+    const sec = Number(r.sec);
+    if (!Number.isFinite(sec) || sec < 0 || sec > STATS_OUTLIER_SEC) {
+      excludedLines++;
+      if (Number.isFinite(sec) && sec > 0) excludedSec += sec;
+      const k = r.worker || '(不明)';
+      excludedByWorker.set(k, (excludedByWorker.get(k) || 0) + 1);
+      continue;
+    }
+    kept.push({ ...r, sec });
+  }
+
+  // ── 引当分類ごとの基準秒 (期間内の全員の平均) ──
+  // ⚠ 基準は本人の実績も含む相対値 (Codexレビュー medium)。固定基準や「本人を除く平均」も
+  // 検討したが、①稼働がまだ数日で固定基準を置ける実績が無い ②除いた側の母数が薄いと
+  // かえって暴れる ため、当面は全体平均に対する相対値と割り切り、画面にその旨を明記する。
+  // その分類を1人しか担当していない場合、その人の指数は構造的に100付近になる
+  // (baseline の workers 数を画面に出して見分けられるようにしてある)。
+  const classMap = new Map();
+  for (const r of kept) {
+    const key = r.hikiate_class || '(不明)';
+    if (!classMap.has(key)) classMap.set(key, { key, lines: 0, sec: 0, workers: new Set() });
+    const c = classMap.get(key);
+    c.lines++; c.sec += r.sec; c.workers.add(r.worker);
+  }
+  const baselineRaw = [...classMap.values()]
+    .map((c) => ({ key: c.key, lines: c.lines, sec: c.sec, avgSec: c.sec / c.lines, workerCount: c.workers.size }))
+    .sort((a, b) => b.lines - a.lines);
+  const baselineByKey = new Map(baselineRaw.map((c) => [c.key, c.avgSec]));
+
+  // ── 引当分類 × 作業者 (「この分類は誰が速いか」— 中原さん要望 2026-08-17) ──
+  // 分類によって速さが根本的に違う (AES《単品》11.9秒 vs AES《1SKU複数個》23.5秒) ので、
+  // 総合順位だけでなく分類ごとの比較を出す。指数は「その分類の平均 ÷ 本人の実測」=
+  // 同じ分類同士の比較なので、重さの補正を挟まない素直な比率になる。
+  // ⚠ 分類平均は明細の加重平均 (= 実際の総時間ベース) であり、処理量の多い人へ基準が寄る
+  //   (Codexレビュー)。分類内の順位づけ自体は素の秒/明細で行うため順位には影響しない。
+  //   指数は「平均との差の目安」の補助表示と割り切る (作業者等重み平均は母数の薄い人に
+  //   引きずられるため採用しない)
+  const classWorkerMap = new Map();
+  for (const r of kept) {
+    const ck = r.hikiate_class || '(不明)';
+    const wk = r.worker || '(不明)';
+    if (!classWorkerMap.has(ck)) classWorkerMap.set(ck, new Map());
+    const m = classWorkerMap.get(ck);
+    if (!m.has(wk)) m.set(wk, { worker: wk, name: displayWorkerName(wk), lines: 0, sec: 0 });
+    const e = m.get(wk);
+    e.lines++; e.sec += r.sec;
+  }
+
+  const baseline = baselineRaw.map((c) => ({
+    ...c,
+    workers: [...(classWorkerMap.get(c.key)?.values() ?? [])]
+      .map((w) => ({
+        worker: w.worker,
+        name: w.name,
+        lines: w.lines,
+        sec: w.sec,
+        secPerLine: w.sec / w.lines,
+        // 分類内の相対 (100 = その分類の平均どおり・大きいほど速い)
+        index: w.sec > 0 ? Math.round((c.avgSec * w.lines / w.sec) * 100) : null,
+        provisional: w.lines < STATS_MIN_CLASS_LINES,
+      }))
+      .sort((a, b) => {
+        if (a.provisional !== b.provisional) return a.provisional ? 1 : -1;
+        return a.secPerLine - b.secPerLine;   // 速い順
+      }),
+  }));
+
+  // ── 作業者別 ──
+  const workerMap = new Map();
+  for (const r of kept) {
+    const key = r.worker || '(不明)';
+    if (!workerMap.has(key)) {
+      workerMap.set(key, {
+        worker: key, name: displayWorkerName(key),
+        lines: 0, sec: 0, expectedSec: 0, shortages: 0,
+        batches: new Set(), days: new Set(), classes: new Map(),
+      });
+    }
+    const w = workerMap.get(key);
+    w.lines++;
+    w.sec += r.sec;
+    w.expectedSec += baselineByKey.get(r.hikiate_class || '(不明)') ?? r.sec;
+    if (r.status === 'shortage') w.shortages++;
+    w.batches.add(r.batch_id);
+    w.days.add(r.work_date);
+    const ck = r.hikiate_class || '(不明)';
+    if (!w.classes.has(ck)) w.classes.set(ck, { key: ck, lines: 0, sec: 0, expectedSec: 0 });
+    const c = w.classes.get(ck);
+    c.lines++; c.sec += r.sec; c.expectedSec += baselineByKey.get(ck) ?? r.sec;
+  }
+
+  // 全明細が外れ値だった作業者は kept に1件も残らず一覧から消えてしまう
+  // (= 除外件数も誰にも見えない)。行だけは残して除外件数を出す (Codexレビュー medium)
+  for (const key of excludedByWorker.keys()) {
+    if (workerMap.has(key)) continue;
+    workerMap.set(key, {
+      worker: key, name: displayWorkerName(key),
+      lines: 0, sec: 0, expectedSec: 0, shortages: 0,
+      batches: new Set(), days: new Set(), classes: new Map(),
+    });
+  }
+
+  const workers = [...workerMap.values()].map((w) => ({
+    worker: w.worker,
+    name: w.name,
+    lines: w.lines,
+    sec: w.sec,
+    secPerLine: w.lines > 0 ? w.sec / w.lines : null,   // 全件除外の作業者は 0 除算になる
+    expectedSec: w.expectedSec,
+    // 速さ指数: 100 = 全体平均どおり。大きいほど速い (期待時間 ÷ 実測時間)
+    index: w.sec > 0 ? Math.round((w.expectedSec / w.sec) * 100) : null,
+    provisional: w.lines < STATS_MIN_LINES,   // 母数不足 = 参考値
+    batches: w.batches.size,
+    days: w.days.size,
+    shortages: w.shortages,
+    excluded: excludedByWorker.get(w.worker) || 0,   // 外れ値として捨てた明細数
+    classes: [...w.classes.values()]
+      .map((c) => ({ ...c, secPerLine: c.sec / c.lines, index: c.sec > 0 ? Math.round((c.expectedSec / c.sec) * 100) : null }))
+      .sort((a, b) => b.lines - a.lines),
+  })).sort((a, b) => {
+    // 参考値は下へ。同区分内は速さ指数の降順 → 明細数の降順
+    if (a.provisional !== b.provisional) return a.provisional ? 1 : -1;
+    if ((b.index ?? 0) !== (a.index ?? 0)) return (b.index ?? 0) - (a.index ?? 0);
+    return b.lines - a.lines;
+  });
+
+  // ── 日別 (推移) ──
+  const dateMap = new Map();
+  for (const r of kept) {
+    if (!dateMap.has(r.work_date)) dateMap.set(r.work_date, { date: r.work_date, lines: 0, sec: 0, workers: new Set() });
+    const d = dateMap.get(r.work_date);
+    d.lines++; d.sec += r.sec; d.workers.add(r.worker);
+  }
+  const byDate = [...dateMap.values()]
+    .map((d) => ({ date: d.date, lines: d.lines, sec: d.sec, secPerLine: d.sec / d.lines, workers: d.workers.size }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const totalSec = kept.reduce((s, r) => s + r.sec, 0);
+  const total = {
+    lines: kept.length,
+    sec: totalSec,
+    secPerLine: kept.length > 0 ? totalSec / kept.length : null,
+    linesPerHour: totalSec > 0 ? (kept.length / totalSec) * 3600 : null,
+    batches: new Set(kept.map((r) => r.batch_id)).size,
+    workers: workerMap.size,
+    days: dateMap.size,
+    excluded: { lines: excludedLines, sec: excludedSec },
+  };
+
+  return {
+    ...range,
+    minLines: STATS_MIN_LINES,
+    minClassLines: STATS_MIN_CLASS_LINES,
+    outlierSec: STATS_OUTLIER_SEC,
+    total,
+    baseline,   // 引当分類ごとの基準秒 + その分類の作業者内訳 (誰が速いか)
+    workers,
+    byDate,
+  };
+}
+
+/**
+ * 掲示モニター用の当日進捗 (30日統計と違い「今どうなっているか」を出す)。
+ * 取込済みバッチの消化状況と、いま作業中の人が分かれば現場の目的は足りる。
+ */
+export function getTodayProgress(workDate = jstToday()) {
+  const db = getDB();
+  const batches = db.prepare(`
+    SELECT id, status, worker, hikiate_class, folder_name, line_count, started_at, finished_at, paused_total_sec
+    FROM pk_batches
+    WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+    ORDER BY id
+  `).all(workDate);
+
+  const doneLines = db.prepare(`
+    SELECT COUNT(*) AS n FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled' AND l.status != 'pending'
+  `).get(workDate).n;
+
+  const totalLines = batches.reduce((s, b) => s + b.line_count, 0);
+  const done = batches.filter((b) => b.status === 'done');
+  const active = batches
+    .filter((b) => b.status === 'picking' || b.status === 'paused')
+    .map((b) => ({
+      id: b.id,
+      folder: b.folder_name,
+      hikiateClass: b.hikiate_class,
+      name: displayWorkerName(b.worker),
+      paused: b.status === 'paused',
+    }));
+
+  const activeSec = done.reduce((s, b) => (
+    b.started_at && b.finished_at
+      ? s + Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0))
+      : s
+  ), 0);
+  const doneLineCount = done.reduce((s, b) => s + b.line_count, 0);
+
+  return {
+    workDate,
+    batchCount: batches.length,
+    doneCount: done.length,
+    totalLines,
+    doneLines,
+    remainingLines: Math.max(0, totalLines - doneLines),
+    secPerLine: doneLineCount > 0 ? activeSec / doneLineCount : null,
+    active,
+  };
+}
