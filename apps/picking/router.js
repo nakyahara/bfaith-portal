@@ -17,12 +17,13 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
   initPickingDB, getDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, DEVICE_KINDS,
   listWorkers, getWorker, addWorker, setWorkerActive,
 } from './db.js';
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
+  getPickingStats, getTodayProgress, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
@@ -76,6 +77,10 @@ function hasSessionAccess(req) {
   return allowed === '*' || (Array.isArray(allowed) && allowed.includes('picking'));
 }
 
+// 掲示モニター端末 (kind='board') が触れてよいパス。倉庫に常時表示する画面は
+// 誰でも物理的に操作できるので、読み取り専用のここだけに閉じる (作業APIは叩かせない)
+const BOARD_ALLOWED_PATHS = ['/board', '/api/board'];
+
 /** 全ルート共通の入口。セッション or 登録端末のどちらかが必要。 */
 function pickingAccess(req, res, next) {
   // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
@@ -83,6 +88,12 @@ function pickingAccess(req, res, next) {
   if (hasSessionAccess(req)) return next();
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
   if (device) {
+    if (device.kind === 'board' && !BOARD_ALLOWED_PATHS.includes(req.path)) {
+      const msg = 'この端末は掲示専用です (作業には使えません)';
+      return req.path.startsWith('/api/')
+        ? res.status(403).json({ error: msg })
+        : res.status(403).send(msg);
+    }
     req.pickingDevice = device;   // 端末モード (作業画面のみ。admin系は requireAdmin で弾かれる)
     return next();
   }
@@ -356,6 +367,67 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
   });
 });
 
+// ─── 作業実績 (30日ローリング) ───
+//
+// 掲示モニター (/board) と管理画面 (/admin/stats) が同じ集計を見る。
+// 中原さんの方針 (2026-08-17): 個人別スピードは全員に公開してよい。
+// ただし「重い分類を引いた人が遅く見える」のを避けるため速さ指数を主指標にし、
+// 欠品報告件数を併記する (止まって報告する方が損に見えないようにする)。
+
+/** クエリの days を安全な範囲へ (1〜365)。 */
+function parseDays(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return STATS_WINDOW_DAYS;
+  return Math.min(365, Math.max(1, Math.round(n)));
+}
+
+// 掲示モニター用ボード (端末Cookie可 = 壁掛け端末でログイン不要)
+router.get('/board', (req, res) => {
+  res.render(path.join(__dirname, 'views/board'), {
+    title: 'ピッキング実績ボード',
+    windowDays: STATS_WINDOW_DAYS,
+  });
+});
+
+// ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
+router.get('/api/board', api(async (req, res) => {
+  const stats = getPickingStats({ days: parseDays(req.query.days) });
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    today: getTodayProgress(),
+    stats: {
+      since: stats.since, until: stats.until, days: stats.days,
+      minDate: STATS_MIN_DATE,
+      minLines: stats.minLines,
+      outlierSec: stats.outlierSec,
+      total: stats.total,
+      // 掲示は上位のみ (画面に収まる範囲)。全量は管理画面で見る
+      baseline: stats.baseline.slice(0, 8),
+      workers: stats.workers.map((w) => ({
+        name: w.name, lines: w.lines, secPerLine: w.secPerLine,
+        index: w.index, provisional: w.provisional, shortages: w.shortages,
+        batches: w.batches, days: w.days,
+      })),
+      byDate: stats.byDate,
+    },
+  });
+}));
+
+// 管理画面 (全量・分類内訳つき)
+router.get('/admin/stats', requireAdmin, (req, res) => {
+  const until = isRealDate(String(req.query.until || '')) ? String(req.query.until) : jstToday();
+  res.render(path.join(__dirname, 'views/admin_stats'), {
+    title: 'ピッキング実績 (30日)',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    stats: getPickingStats({ until, days: parseDays(req.query.days) }),
+    minDate: STATS_MIN_DATE,
+  });
+});
+
 // ─── 端末・作業者管理 (管理者・セッション必須) ───
 
 router.get('/admin/devices', requireAdmin, (req, res) => {
@@ -378,7 +450,10 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
 router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
   if (!label || label.length > 40) throw new PkError(400, 'bad_label', '端末名を1〜40文字で入力してください');
-  const token = createDevice(label, req.session.email);
+  // 用途。board = 倉庫の掲示モニター (読み取り専用。作業画面・作業APIは pickingAccess が拒否)
+  const kind = String(req.body.kind || 'worker').trim();
+  if (!DEVICE_KINDS.includes(kind)) throw new PkError(400, 'bad_kind', '端末の用途が不正です');
+  const token = createDevice(label, req.session.email, kind);
   res.cookie(DEVICE_COOKIE, token, {
     httpOnly: true,
     // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)

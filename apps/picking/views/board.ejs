@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<!--
+  倉庫の掲示モニター用ボード (2026-08-17 中原さん指示)。
+  Chrome のキオスクモードで常時表示する前提:
+    chrome.exe --kiosk https://picking.bfaith-wh.uk/apps/picking/board
+  端末は「掲示専用 (kind=board)」で登録する = このページ以外は開けない。
+
+  自動更新は fetch + DOM差し替え (location.reload() だと数秒ごとに画面が白く飛ぶ)。
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    :root {
+      --bg: #0f1216; --panel: #171c22; --line: #2a323c;
+      --fg: #f1f3f5; --muted: #93a0ad;
+      --ok: #40c057; --warn: #fab005; --bad: #fa5252; --accent: #4dabf7;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+      font-variant-numeric: tabular-nums;
+      padding: 1.2vh 1.2vw;
+      display: flex; flex-direction: column; gap: 1.2vh;
+      overflow: hidden;
+    }
+    header { display: flex; align-items: baseline; gap: 1.4vw; flex: 0 0 auto; }
+    header h1 { font-size: 3.0vh; margin: 0; letter-spacing: 0.02em; }
+    header .range { font-size: 2.0vh; color: var(--muted); }
+    header .right { margin-left: auto; font-size: 1.9vh; color: var(--muted); display: flex; gap: 1vw; align-items: center; }
+    .stale { color: var(--warn); }
+
+    main { flex: 1 1 auto; display: grid; grid-template-columns: 25fr 75fr; gap: 1.2vw; min-height: 0; }
+    /* min-width:0 が無いと grid の auto 最小サイズ (中身の max-content) が勝ち、
+       右カラムのテーブルが左カラムを押し潰して右端の列が画面外に出る */
+    .col { display: flex; flex-direction: column; gap: 1.2vh; min-height: 0; min-width: 0; }
+    .panel { background: var(--panel); border-radius: 1.2vh; padding: 1.6vh 1.4vw; min-height: 0; min-width: 0; }
+    .panel h2 { font-size: 1.9vh; margin: 0 0 1.2vh; color: var(--muted); font-weight: 600; letter-spacing: 0.06em; }
+
+    /* 今日 */
+    .today-big { font-size: 8.5vh; font-weight: 800; line-height: 1; white-space: nowrap; }
+    .today-sub { font-size: 2.2vh; color: var(--muted); margin-top: 0.4vh; white-space: nowrap; }
+    .bar { height: 1.8vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin: 1.4vh 0 0.8vh; }
+    .bar > i { display: block; height: 100%; background: var(--ok); }
+    .kv { display: flex; justify-content: space-between; gap: 0.8vw; font-size: 2.0vh; padding: 0.5vh 0; white-space: nowrap; }
+    .kv .k { color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.6vw; margin-top: 0.6vh; }
+    .chip { background: #232a32; border-radius: 0.8vh; padding: 0.6vh 0.8vw; font-size: 2.0vh; }
+    .chip.paused { color: var(--warn); }
+    .chip .cls { color: var(--muted); font-size: 1.5vh; display: block; }
+
+    /* ランキング (列幅は % 固定 — vw 固定だと画面比率によって右端の列がはみ出る) */
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th { font-size: 1.7vh; color: var(--muted); font-weight: 600; text-align: right; padding: 0 0.6vw 1vh; }
+    th.l, td.l { text-align: left; }
+    td { font-size: 2.6vh; padding: 1.25vh 0.6vw; border-top: 1px solid var(--line); text-align: right; }
+    td.name { font-size: 3.0vh; font-weight: 700; white-space: nowrap; }
+    td.rank { color: var(--muted); font-size: 2.2vh; width: 3vw; }
+    .idx { font-weight: 800; }
+    .idx.up { color: var(--ok); } .idx.dn { color: var(--warn); }
+    .idxbar { height: 1.2vh; background: #232a32; border-radius: 1vh; overflow: hidden; min-width: 6vw; }
+    .idxbar > i { display: block; height: 100%; background: var(--accent); }
+    tr.prov td { color: var(--muted); }
+    tr.prov .idx { color: var(--muted); }
+    .tag { font-size: 1.5vh; color: var(--muted); margin-left: 0.4vw; }
+
+    /* 日別 */
+    .day { display: flex; align-items: center; gap: 0.4vw; font-size: 1.9vh; padding: 0.55vh 0; }
+    .day .d { color: var(--muted); width: 21%; }
+    .day .db { flex: 1 1 0; min-width: 0; height: 1.2vh; background: #232a32; border-radius: 1vh; overflow: hidden; }
+    .day .db > i { display: block; height: 100%; background: var(--accent); }
+    .day .v { font-weight: 700; width: 18%; text-align: right; }
+    .day .n { color: var(--muted); width: 20%; text-align: right; font-size: 1.6vh; }
+
+    /* 分類 */
+    .cls-list { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.4vh 1.4vw; }
+    .cls-row { display: flex; align-items: baseline; gap: 0.6vw; font-size: 1.9vh; padding: 0.35vh 0; border-top: 1px solid var(--line); }
+    .cls-row .nm { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cdd5de; }
+    .cls-row .sec { font-weight: 700; flex: 0 0 auto; }
+    .cls-row .n { color: var(--muted); font-size: 1.6vh; flex: 0 0 4.5vw; text-align: right; }
+
+    footer { flex: 0 0 auto; font-size: 1.6vh; color: var(--muted); display: flex; gap: 1.6vw; }
+    .err { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📦 ピッキング実績</h1>
+    <span class="range" id="range">読み込み中…</span>
+    <span class="right">
+      <span id="clock"></span>
+      <span id="status"></span>
+    </span>
+  </header>
+
+  <main>
+    <div class="col">
+      <div class="panel">
+        <h2>本日の進捗</h2>
+        <div class="today-big" id="todayDone">-</div>
+        <div class="today-sub">全 <span id="todayTotal">-</span> 明細中 (残り <span id="todayRemain">-</span>)</div>
+        <div class="bar"><i id="todayBar" style="width:0%"></i></div>
+        <div class="kv"><span class="k">バッチ</span><span><b id="todayBatches">-</b></span></div>
+        <div class="kv"><span class="k">秒/明細</span><span><b id="todaySpl">-</b></span></div>
+      </div>
+      <div class="panel">
+        <h2>いま作業中</h2>
+        <div class="chips" id="active"><span class="chip">-</span></div>
+      </div>
+      <div class="panel" style="flex:1 1 auto; overflow:hidden">
+        <h2>日別 (秒/明細)</h2>
+        <div id="byDate"></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel" style="flex:1 1 auto; overflow:hidden">
+        <h2 id="rankTitle">速さランキング</h2>
+        <table>
+          <thead>
+            <tr>
+              <th class="l" style="width:5%"></th>
+              <th class="l" style="width:30%">作業者</th>
+              <th style="width:11%">速さ指数</th>
+              <th style="width:19%"></th>
+              <th style="width:13%">秒/明細</th>
+              <th style="width:12%">明細</th>
+              <th style="width:10%">欠品</th>
+            </tr>
+          </thead>
+          <tbody id="rank"></tbody>
+        </table>
+      </div>
+      <div class="panel">
+        <h2>引当分類別の平均 (全員・秒/明細)</h2>
+        <div class="cls-list" id="classes"></div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <span>速さ指数 100 = 全体平均どおり (引当分類の重さを補正した値)</span>
+    <span id="note"></span>
+    <span id="err" class="err"></span>
+  </footer>
+
+  <script>
+    var WINDOW_DAYS = <%- JSON.stringify(windowDays) %>;
+    var RELOAD_MS = 20000;          // データ再取得
+    var HARD_RELOAD_MS = 6 * 3600 * 1000;   // 6時間ごとにページ自体を作り直す (長期表示のメモリ対策)
+    var startedAt = Date.now();
+    var lastOk = 0;
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function fmt1(n) { return n == null ? '-' : Number(n).toFixed(1); }
+    function mmdd(d) { return d ? d.slice(5).replace('-', '/') : '-'; }
+
+    function renderClock() {
+      var d = new Date();
+      var p = function (n) { return String(n).padStart(2, '0'); };
+      document.getElementById('clock').textContent = p(d.getHours()) + ':' + p(d.getMinutes());
+    }
+
+    function render(data) {
+      var t = data.today, s = data.stats;
+
+      document.getElementById('range').textContent =
+        mmdd(s.since) + '〜' + mmdd(s.until) + ' の' + s.days + '日間';
+
+      // 本日
+      document.getElementById('todayDone').textContent = t.doneLines;
+      document.getElementById('todayTotal').textContent = t.totalLines;
+      document.getElementById('todayBatches').textContent = t.doneCount + ' / ' + t.batchCount;
+      document.getElementById('todayRemain').textContent = t.remainingLines;
+      document.getElementById('todaySpl').textContent = fmt1(t.secPerLine);
+      var pct = t.totalLines > 0 ? Math.round((t.doneLines / t.totalLines) * 100) : 0;
+      document.getElementById('todayBar').style.width = pct + '%';
+
+      var active = document.getElementById('active');
+      if (!t.active.length) {
+        active.innerHTML = '<span class="chip" style="color:var(--muted)">作業中のバッチはありません</span>';
+      } else {
+        active.innerHTML = t.active.map(function (a) {
+          return '<span class="chip' + (a.paused ? ' paused' : '') + '">' +
+            (a.paused ? '⏸ ' : '▶ ') + esc(a.name) +
+            '<span class="cls">' + esc(a.folder || '') + ' ' + esc(a.hikiateClass || '') + '</span></span>';
+        }).join('');
+      }
+
+      // ランキング
+      document.getElementById('rankTitle').textContent =
+        '速さランキング (直近' + s.days + '日 ・ 全' + s.total.lines + '明細)';
+      var rows = s.workers.map(function (w, i) {
+        // 指数 60〜140 を 0〜100% の幅に写す (差が見えるように)
+        var width = Math.max(4, Math.min(100, ((w.index || 0) - 60) / 80 * 100));
+        var cls = w.index == null ? '' : (w.index >= 100 ? 'up' : (w.index < 85 ? 'dn' : ''));
+        return '<tr class="' + (w.provisional ? 'prov' : '') + '">' +
+          '<td class="rank l">' + (w.provisional ? '–' : (i + 1)) + '</td>' +
+          '<td class="name l">' + esc(w.name) +
+            (w.provisional ? '<span class="tag">参考</span>' : '') + '</td>' +
+          '<td class="idx ' + cls + '">' + (w.index == null ? '-' : w.index) + '</td>' +
+          '<td><div class="idxbar"><i style="width:' + width + '%"></i></div></td>' +
+          '<td>' + fmt1(w.secPerLine) + '</td>' +
+          '<td>' + w.lines + '</td>' +
+          '<td>' + (w.shortages > 0 ? w.shortages : '') + '</td>' +
+        '</tr>';
+      });
+      document.getElementById('rank').innerHTML = rows.join('') ||
+        '<tr><td colspan="7" class="l" style="color:var(--muted)">データがありません</td></tr>';
+
+      // 分類別
+      document.getElementById('classes').innerHTML = s.baseline.map(function (c) {
+        return '<div class="cls-row"><span class="nm">' + esc(c.key) + '</span>' +
+          '<span class="sec">' + fmt1(c.avgSec) + '</span>' +
+          '<span class="n">' + c.lines + '件</span></div>';
+      }).join('');
+
+      // 日別 (直近7日ぶん・秒/明細を横バーで)
+      var recent = s.byDate.slice(-7);
+      var worst = recent.reduce(function (m, d) { return Math.max(m, d.secPerLine); }, 1);
+      document.getElementById('byDate').innerHTML = recent.map(function (d) {
+        return '<div class="day"><span class="d">' + mmdd(d.date) + '</span>' +
+          '<span class="db"><i style="width:' + Math.round((d.secPerLine / worst) * 100) + '%"></i></span>' +
+          '<span class="v">' + fmt1(d.secPerLine) + '</span>' +
+          '<span class="n">' + d.lines + '</span></div>';
+      }).join('') || '<span style="color:var(--muted)">データがありません</span>';
+
+      var note = '母数' + s.minLines + '明細未満は参考値 / ' + s.outlierSec + '秒超の明細は除外';
+      if (s.total.excluded.lines > 0) note += ' (' + s.total.excluded.lines + '件)';
+      document.getElementById('note').textContent = note;
+    }
+
+    function tick() {
+      fetch('/apps/picking/api/board?days=' + WINDOW_DAYS, { credentials: 'same-origin' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function (d) {
+          if (!d || !d.ok) throw new Error('bad payload');
+          render(d);
+          lastOk = Date.now();
+          document.getElementById('err').textContent = '';
+          document.getElementById('status').textContent = '●';
+          document.getElementById('status').className = '';
+        })
+        .catch(function (e) {
+          // 前回の表示はそのまま残す (真っ白にするより情報が多い)
+          document.getElementById('err').textContent =
+            '通信エラー (' + e.message + ')' + (lastOk ? ' 最終更新 ' + new Date(lastOk).toLocaleTimeString('ja-JP') : '');
+          document.getElementById('status').textContent = '○';
+          document.getElementById('status').className = 'stale';
+        })
+        .then(function () {
+          if (Date.now() - startedAt > HARD_RELOAD_MS) location.reload();
+        });
+    }
+
+    renderClock();
+    setInterval(renderClock, 10000);
+    tick();
+    setInterval(tick, RELOAD_MS);
+  </script>
+</body>
+</html>

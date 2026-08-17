@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 1100px; margin: 0 auto; padding: 12px 16px 40px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 20px; }
+    .tile { background: #f8f9fa; border-radius: 10px; padding: 12px 14px; }
+    .tile .v { font-size: 1.5em; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tile .k { font-size: 0.78em; color: #495057; }
+    h2 { font-size: 1.0em; margin: 22px 0 8px; }
+    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; }
+    table.pk-list th { background: #f1f3f5; }
+    table.pk-list td.num, table.pk-list th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: #868e96; }
+    .up { color: #2b8a3e; font-weight: 700; }
+    .dn { color: #e67700; font-weight: 700; }
+    .prov td { color: #868e96; }
+    details.cls { margin: 0; }
+    details.cls summary { cursor: pointer; color: #1971c2; font-size: 0.9em; }
+    details.cls table { margin: 6px 0 10px; }
+    .note { background: #fff9db; border-radius: 8px; padding: 10px 12px; font-size: 0.85em; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📈 ピッキング実績</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/board" class="btn-logout" target="_blank">🖥 掲示ボード</a>
+      <a href="/apps/picking/admin/summary" class="btn-logout">📊 本日サマリ</a>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <% const fmt1 = (n) => n == null ? '-' : Number(n).toFixed(1); %>
+    <% const fmtMin = (s) => s != null ? `${Math.floor(s / 60)}分` : '-'; %>
+
+    <div class="pk-bar">
+      <form method="get" action="/apps/picking/admin/stats">
+        <label>集計終了日
+          <input type="date" name="until" value="<%= stats.until %>">
+        </label>
+        <label>期間
+          <select name="days">
+            <% for (const d of [7, 14, 30, 60, 90]) { %>
+              <option value="<%= d %>" <%= stats.days === d ? 'selected' : '' %>><%= d %>日</option>
+            <% } %>
+          </select>
+        </label>
+        <button type="submit">表示</button>
+      </form>
+      <span class="muted">
+        <%= stats.since %> 〜 <%= stats.until %>
+        <% if (stats.clamped) { %>(開始日は <%= minDate %> で床止め — それ以前はテスト運用)<% } %>
+      </span>
+    </div>
+
+    <div class="note">
+      <b>速さ指数</b> = 引当分類の重さを補正した速さ (100 = 全体平均どおり・大きいほど速い)。
+      分類ごとの平均秒を基準に「この人が担当した明細なら本来かかるはずの時間 ÷ 実際にかかった時間」で算出。
+      生の秒/明細だけで比べると、重い分類 (複数個系) を多く引いた人が不当に遅く見えるため。<br>
+      集計は<b>明細1件ごと</b>に、その明細で「次へ」を押した本人へ帰属 (交代しても正しく分かれる)。
+      <b><%= stats.outlierSec %>秒</b>を超えた明細は「開いたまま放置」とみなし除外
+      (<%= stats.total.excluded.lines %>件・<%= fmtMin(stats.total.excluded.sec) %>)。
+      明細<%= stats.minLines %>件未満は<b>参考値</b>として順位を付けない。
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="v"><%= stats.total.lines %></div><div class="k">明細 (集計対象)</div></div>
+      <div class="tile"><div class="v"><%= stats.total.batches %></div><div class="k">完了バッチ</div></div>
+      <div class="tile"><div class="v"><%= fmt1(stats.total.secPerLine) %></div><div class="k">秒 / 明細 (全体)</div></div>
+      <div class="tile"><div class="v"><%= stats.total.linesPerHour != null ? Math.round(stats.total.linesPerHour) : '-' %></div><div class="k">明細 / 時間</div></div>
+      <div class="tile"><div class="v"><%= fmtMin(stats.total.sec) %></div><div class="k">実作業時間 合計</div></div>
+      <div class="tile"><div class="v"><%= stats.total.workers %> 名 / <%= stats.total.days %> 日</div><div class="k">作業者 / 稼働日</div></div>
+    </div>
+
+    <h2>作業者別 (速さ指数の高い順・参考値は末尾)</h2>
+    <table class="pk-list">
+      <thead>
+        <tr>
+          <th>#</th><th>作業者</th>
+          <th class="num">速さ指数</th><th class="num">秒/明細</th><th class="num">明細</th>
+          <th class="num">バッチ</th><th class="num">稼働日</th><th class="num">実時間</th><th class="num">欠品</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% stats.workers.forEach((w, i) => { %>
+          <tr class="<%= w.provisional ? 'prov' : '' %>">
+            <td><%= w.provisional ? '–' : i + 1 %></td>
+            <td>
+              <%= w.name %><% if (w.provisional) { %> <span class="muted">(参考)</span><% } %>
+              <details class="cls">
+                <summary>分類別の内訳</summary>
+                <table class="pk-list">
+                  <thead><tr><th>引当分類</th><th class="num">明細</th><th class="num">秒/明細</th><th class="num">指数</th></tr></thead>
+                  <tbody>
+                    <% for (const c of w.classes) { %>
+                      <tr><td><%= c.key %></td><td class="num"><%= c.lines %></td>
+                        <td class="num"><%= fmt1(c.secPerLine) %></td>
+                        <td class="num"><%= c.index == null ? '-' : c.index %></td></tr>
+                    <% } %>
+                  </tbody>
+                </table>
+              </details>
+            </td>
+            <td class="num <%= w.index == null ? '' : (w.index >= 100 ? 'up' : (w.index < 85 ? 'dn' : '')) %>">
+              <%= w.index == null ? '-' : w.index %>
+            </td>
+            <td class="num"><%= fmt1(w.secPerLine) %></td>
+            <td class="num"><%= w.lines %></td>
+            <td class="num"><%= w.batches %></td>
+            <td class="num"><%= w.days %></td>
+            <td class="num"><%= fmtMin(w.sec) %></td>
+            <td class="num"><%= w.shortages || '' %></td>
+          </tr>
+        <% }) %>
+        <% if (stats.workers.length === 0) { %>
+          <tr><td colspan="9" class="muted">この期間の完了バッチがありません</td></tr>
+        <% } %>
+      </tbody>
+    </table>
+
+    <h2>引当分類別の基準 (全員の平均)</h2>
+    <table class="pk-list">
+      <thead><tr><th>引当分類</th><th class="num">明細</th><th class="num">秒/明細</th><th class="num">担当者数</th></tr></thead>
+      <tbody>
+        <% for (const c of stats.baseline) { %>
+          <tr><td><%= c.key %></td><td class="num"><%= c.lines %></td>
+            <td class="num"><%= fmt1(c.avgSec) %></td><td class="num"><%= c.workers %></td></tr>
+        <% } %>
+        <% if (stats.baseline.length === 0) { %><tr><td colspan="4" class="muted">データがありません</td></tr><% } %>
+      </tbody>
+    </table>
+
+    <h2>日別</h2>
+    <table class="pk-list">
+      <thead><tr><th>作業日</th><th class="num">明細</th><th class="num">秒/明細</th><th class="num">実時間</th><th class="num">作業者</th></tr></thead>
+      <tbody>
+        <% for (const d of stats.byDate) { %>
+          <tr><td><%= d.date %></td><td class="num"><%= d.lines %></td>
+            <td class="num"><%= fmt1(d.secPerLine) %></td><td class="num"><%= fmtMin(d.sec) %></td>
+            <td class="num"><%= d.workers %></td></tr>
+        <% } %>
+        <% if (stats.byDate.length === 0) { %><tr><td colspan="5" class="muted">データがありません</td></tr><% } %>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>
