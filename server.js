@@ -56,6 +56,7 @@ import inboundInfoRouter from './apps/inbound-info/router.js';
 import { startInboundInfoCron } from './apps/inbound-info/sync-job.js';
 import salesAnalyticsLinegiftRouter from './apps/sales-analytics-linegift/router.js';
 import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorkerRouter } from './apps/packing-dispatch/router.js';
+import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
 import shippingLogRouter from './apps/shipping-log/router.js';
@@ -1291,6 +1292,8 @@ app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-line
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
 app.use('/apps/packing-dispatch/api/ne-sync-worker', express.json({ limit: '2mb' }), packingDispatchNeSyncWorkerRouter);
+// 配送ルール変更の承認フロー (miniPC梱包画面→申請→GChat承認カード)。x-api-key 認証・セッション外
+app.use('/apps/packing-dispatch/rule-change-api', express.json({ limit: '256kb' }), packingDispatchRuleChangeApiRouter);
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);

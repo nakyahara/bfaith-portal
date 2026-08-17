@@ -174,6 +174,10 @@ export function handleChatEvent(event, db, now = new Date()) {
     const fn = event.common?.invokedFunction || event.action?.actionMethodName;
     const params = event.common?.parameters
       || Object.fromEntries((event.action?.parameters || []).map((p) => [p.key, p.value]));
+    // 配送ルール変更の承認カード (packing-dispatch/rule-change.js が投稿・同じChatアプリで受ける)
+    if ((fn === 'pdRuleApprove' || fn === 'pdRuleReject') && params.id) {
+      return handleRuleDecision(fn, params, event);
+    }
     if (fn !== 'showStock' || !params.sku) {
       return { actionResponse: { type: 'NEW_MESSAGE' }, text: 'このボタンは処理できませんでした。もう一度検索してください。' };
     }
@@ -195,6 +199,33 @@ export function handleChatEvent(event, db, now = new Date()) {
     return buildCandidatesCard(found.slice(0, MAX_CANDIDATES), hasMore);
   }
   return {};   // REMOVED_FROM_SPACE 等は黙って 200
+}
+
+// ─── 配送ルール変更の承認 (packing-dispatch連携・遅延import) ───
+
+// 承認者の制限 (任意)。env PD_RULE_APPROVERS="a@b-faith.biz,c@b-faith.biz" — 未設定なら
+// 社内ドメイン (既存チェック済み) の全員が承認できる
+function ruleApproverAllowed(email) {
+  const raw = String(process.env.PD_RULE_APPROVERS || '').trim();
+  if (!raw) return true;
+  return raw.toLowerCase().split(',').map((s) => s.trim()).includes(String(email || '').toLowerCase());
+}
+
+async function handleRuleDecision(fn, params, event) {
+  const email = String(event.user?.email || '');
+  if (!ruleApproverAllowed(email)) {
+    return { actionResponse: { type: 'NEW_MESSAGE' }, text: `承認権限がありません (${email})。PD_RULE_APPROVERS を確認してください。` };
+  }
+  try {
+    const { applyRuleChangeDecision } = await import('../packing-dispatch/rule-change.js');
+    const { decisionReplyText } = await import('../packing-dispatch/rule-change.js');
+    const row = applyRuleChangeDecision(Number(params.id), fn === 'pdRuleApprove' ? 'approve' : 'reject', email);
+    // 元カードを結果テキストへ差し替え (ボタンを消して二重押しを防ぐ。冪等ガードはDB側にもある)
+    return { actionResponse: { type: 'UPDATE_MESSAGE' }, text: decisionReplyText(row) };
+  } catch (e) {
+    console.error('[stock-bot] ルール変更の承認処理失敗:', e);
+    return { actionResponse: { type: 'NEW_MESSAGE' }, text: `処理に失敗しました: ${e.message}` };
+  }
 }
 
 // ─── レート制限 (スペース単位・in-memory) ───
@@ -236,7 +267,12 @@ router.post('/chat-events', (req, res) => {
     return res.json({ text: '検索が集中しています。1分ほどおいて再送してください。' });
   }
   try {
-    return res.json(handleChatEvent(event, getMirrorDB()));
+    return Promise.resolve(handleChatEvent(event, getMirrorDB()))
+      .then((out) => res.json(out))
+      .catch((e) => {
+        console.error('[stock-bot] 応答生成失敗:', e);
+        res.json({ text: '内部エラーが発生しました。時間をおいて再送してください。' });
+      });
   } catch (e) {
     // mirror 未初期化 (boot直後) や想定外の payload でも 500 にしない (Chat側の再送・エラー表示を避ける)
     console.error('[stock-bot] イベント処理失敗:', e);
