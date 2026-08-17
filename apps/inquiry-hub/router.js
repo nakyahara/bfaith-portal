@@ -22,7 +22,8 @@ import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
-import { aiRewriteEnabled, rewriteReply, REWRITE_STYLES } from './ai-rewrite.js';
+import { aiRewriteEnabled, rewriteReply, draftReply, REWRITE_STYLES } from './ai-rewrite.js';
+import { findRelevantKnowledge, formatKnowledgeForPrompt } from './knowledge.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
@@ -471,6 +472,11 @@ router.get('/inquiries/:id', (req, res) => {
           <select id="tplSel" title="テンプレートを選ぶ"><option value="">テンプレートを選ぶ…</option></select>
           <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
         </div>
+        ${aiRewriteEnabled() ? `<div class="row rw-row" id="draftRow">
+          <button class="pri" type="button" id="draftBtn">✨ AIで下書き</button>
+          <span class="sub">社内Q&amp;A・テンプレートを参照して返信案を作ります</span>
+        </div>
+        <div class="draft-warn" id="draftWarn" hidden></div>` : ''}
         <textarea id="replyBody" rows="6" placeholder="返信本文 (上のテンプレート選択からも入れられます)"></textarea>
         ${aiRewriteEnabled() ? `<div class="row rw-row" id="rwRow">
           <span class="sub">✨AIで整える:</span>
@@ -816,6 +822,58 @@ router.get('/inquiries/:id', (req, res) => {
     // セレクトで選んだだけでも反映する (ボタンは空欄時の説明・視認性のために残す)
     tplSel.addEventListener('change', function() { if (tplSel.value) applyTpl(); });
   })();
+  // ✨ AI下書き (2026-08-17 第1段階): 社内Q&A/テンプレートを参照して返信案を作る。
+  // AIが埋められなかった箇所は【要確認:】で残るので、警告を出して人が埋めてから送らせる
+  var PLACEHOLDER_RE = /【要確認[:：][^】]*】/g;
+  function updateDraftWarn() {
+    var warn = document.getElementById('draftWarn');
+    var ta = document.getElementById('replyBody');
+    if (!warn || !ta) return;
+    var hits = ta.value.match(PLACEHOLDER_RE) || [];
+    if (!hits.length) { warn.hidden = true; return; }
+    var uniq = hits.filter(function(v, i, a) { return a.indexOf(v) === i; });
+    warn.hidden = false;
+    // textContent で組み立てる (AI出力をそのまま innerHTML に入れない)
+    warn.textContent = '';
+    var head = document.createElement('b');
+    head.textContent = '⚠️ AIが確認を求めています (' + uniq.length + '箇所)';
+    warn.appendChild(head);
+    var body = document.createElement('div');
+    body.className = 'sub';
+    body.textContent = '送信前に、実際の内容を調べて置き換えてください: ';
+    uniq.forEach(function(s, i) {
+      if (i) body.appendChild(document.createTextNode(' '));
+      var c = document.createElement('code');
+      c.textContent = s;
+      body.appendChild(c);
+    });
+    warn.appendChild(body);
+  }
+  var draftBtn = document.getElementById('draftBtn');
+  if (draftBtn) {
+    var ta0 = document.getElementById('replyBody');
+    if (ta0) ta0.addEventListener('input', updateDraftWarn);
+    draftBtn.addEventListener('click', function() {
+      var ta = document.getElementById('replyBody');
+      if (ta.value.trim() && !confirm('返信欄の内容をAIの下書きで置き換えますか?')) return;
+      draftBtn.disabled = true;
+      var orig = draftBtn.textContent;
+      draftBtn.textContent = '✨ 下書き作成中…';
+      post('/ai-draft', {})
+        .then(function(r) {
+          ta.value = r.text;
+          updateDraftWarn();
+          ta.focus();
+          var src = [];
+          if (r.sources && r.sources.qa.length) src.push('Q&A ' + r.sources.qa.length + '件');
+          if (r.sources && r.sources.templates.length) src.push('テンプレ ' + r.sources.templates.length + '件');
+          toast('下書きを作成しました' + (src.length ? ' (' + src.join('・') + 'を参照)' : ' (参照できる社内Q&Aは見つかりませんでした)')
+            + (r.placeholders.length ? ' — 要確認' + r.placeholders.length + '箇所' : ''));
+        })
+        .catch(function(e) { toast('下書き失敗: ' + e.message); })
+        .then(function() { draftBtn.textContent = orig; draftBtn.disabled = false; });
+    });
+  }
   // ✨ AI書き換え (2026-08-17 スタッフ要望): 入力中の文章を丁寧に/やわらかく/簡潔に整える。
   // 書き換え前の文は保持して「元に戻す」で復元できる
   var rwRow = document.getElementById('rwRow');
@@ -860,6 +918,10 @@ router.get('/inquiries/:id', (req, res) => {
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
     if (!body) { toast('本文が空です'); return; }
+    // AI下書きの【要確認:】が残ったまま送ろうとしたら止める (未確認の事実が客に飛ぶ事故の防止)
+    var left = (body.match(PLACEHOLDER_RE) || []).filter(function(v, i, a) { return a.indexOf(v) === i; });
+    if (left.length && !confirm('⚠️ 未確認の箇所が' + left.length + '件残っています:\\n\\n' + left.join('\\n')
+      + '\\n\\nこのまま送信ジョブを作成しますか? (通常は実際の内容に置き換えてから送ります)')) return;
     var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
     var completeEl = document.getElementById('replyComplete');
     var complete = !!(completeEl && completeEl.checked);
@@ -916,6 +978,33 @@ router.post('/api/inquiries/bulk', (req, res) => {
     const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req) });
     console.log(`[inquiry-hub] 一括操作 ${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
     res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// ✨ AI下書き (2026-08-17 第1段階)。社内Q&A・返信テンプレートから関連するものを選んでAIに渡し、
+// 返信の下書きを作る。⚠️根拠のない事柄は AI に【要確認: ○○】で残させ、人が埋めてから送る運用。
+// 自動学習 (返信結果でナレッジを書き換える) は意図的に入れていない — まず「どこで詰まるか」を実データで見る
+router.post('/api/inquiries/:id(\\d+)/ai-draft', async (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  if (!aiRewriteEnabled()) return res.status(403).json({ error: 'AI下書きは未設定です (env OPENAI_API_KEY)' });
+  try {
+    const messages = getDB().prepare(`SELECT is_incoming, sender_name, message_body_text
+      FROM inquiry_messages WHERE inquiry_id = ?
+      ORDER BY COALESCE(received_at, sent_at, created_at), id`).all(inq.id);
+    const firstIncoming = messages.find(m => m.is_incoming)?.message_body_text || '';
+    const knowledge = findRelevantKnowledge({
+      subject: inq.subject, body: firstIncoming,
+      productName: inq.product_name, productCode: inq.product_code,
+    });
+    const r = await draftReply({
+      inquiry: inq, messages,
+      knowledgeText: formatKnowledgeForPrompt(knowledge),
+    });
+    console.log(`[inquiry-hub] AI下書き (model=${r.model}, Q&A${knowledge.qa.length}件/テンプレ${knowledge.templates.length}件参照, 要確認${r.placeholders.length}箇所) by ${actorOf(req)} inquiry=${inq.id}`);
+    res.json({ ok: true, text: r.text, placeholders: r.placeholders,
+      sources: { qa: knowledge.qa.map(q => q.title), templates: knowledge.templates.map(t => t.name) } });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
   }
@@ -2269,6 +2358,11 @@ figure.att-img.att-err .att-fail { display: block; }
 /* AI書き換えボタン行 */
 .rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .rw-row .rw-btn { margin: 0; }
+/* AI下書きの「要確認」警告 */
+.draft-warn { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px;
+  padding: 8px 10px; margin: 6px 0; font-size: 13px; color: #92400e; }
+.draft-warn code { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px;
+  padding: 1px 5px; font-family: inherit; }
 .panel .row input { flex: 1; }
 .panel textarea { resize: vertical; }
 .note { border-top: 1px solid #e2e8f0; padding: 8px 0; }

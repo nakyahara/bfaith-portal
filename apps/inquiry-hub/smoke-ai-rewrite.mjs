@@ -69,6 +69,86 @@ console.log('1. rewriteReply 単体');
   check('空応答は拒否', (await err({ style: 'polite', text: 'x', env: ENV, fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '' } }] }) }) }))?.includes('空の応答'));
 }
 
+// ─── 1b. ナレッジ検索 (社内Q&A/テンプレから関連するものを選ぶ) ───
+console.log('1b. knowledge.js');
+{
+  const { extractKeywords, findRelevantKnowledge, formatKnowledgeForPrompt, MAX_QA } = await import('./knowledge.js');
+
+  check('キーワード抽出: 助詞・定型句を落とす',
+    !extractKeywords('お世話になっております。よろしくお願いします。').includes('お世話'));
+  const kw = extractKeywords('ひまし油の抽出方法について教えてください');
+  check('キーワード抽出: 名詞が拾える', kw.includes('ひまし') || kw.includes('抽出方法') || kw.includes('抽出'));
+
+  db.prepare(`INSERT INTO qa_entries (category, title, question, answer) VALUES
+    ('商品について', 'ひまし油の抽出方法', '低温圧搾ですか?', '高温圧搾です。')`).run();
+  db.prepare(`INSERT INTO qa_entries (category, title, question, answer) VALUES
+    ('配送について', '配送日数の目安', '何日で届きますか', '発送から2〜5日です。')`).run();
+  db.prepare(`INSERT INTO qa_entries (category, title, question, answer, is_published) VALUES
+    ('内部', 'ひまし油の原価', '原価は?', '非公開', 0)`).run();
+  db.prepare(`INSERT INTO reply_templates (category, template_name, template_body, keywords) VALUES
+    ('商品説明', 'ひまし油の説明テンプレ', 'ひまし油は〜です。', 'ひまし油 抽出')`).run();
+
+  const found = findRelevantKnowledge({ subject: 'ひまし油について', body: 'ひまし油の抽出方法を教えてください' });
+  check('関連Q&Aを拾う', found.qa.some(q => q.title === 'ひまし油の抽出方法'), JSON.stringify(found.qa.map(q => q.title)));
+  check('無関係なQ&A (配送) は拾わない', !found.qa.some(q => q.title === '配送日数の目安'));
+  check('非公開Q&Aは除外', !found.qa.some(q => q.title === 'ひまし油の原価'));
+  check('関連テンプレも拾う', found.templates.some(t => t.name === 'ひまし油の説明テンプレ'));
+  check('スコア順に並ぶ', found.qa.length <= MAX_QA && (found.qa.length < 2 || found.qa[0].score >= found.qa[1].score));
+
+  const none = findRelevantKnowledge({ subject: '', body: 'zzz' });
+  check('該当なしなら空 (捏造材料を渡さない)', none.qa.length === 0 && none.templates.length === 0);
+  check('プロンプト整形: Q&Aとテンプレの見出しが入る', (() => {
+    const s = formatKnowledgeForPrompt(found);
+    return s.includes('社内Q&A') && s.includes('高温圧搾') && s.includes('返信テンプレート');
+  })());
+  check('プロンプト整形: 空なら空文字', formatKnowledgeForPrompt({ qa: [], templates: [] }) === '');
+}
+
+// ─── 1c. draftReply (下書き生成) ───
+console.log('1c. draftReply');
+{
+  const { draftReply, PLACEHOLDER_RE } = await import('./ai-rewrite.js');
+  const ENV = { OPENAI_API_KEY: 'sk-test' };
+  const mk = (content, captured = {}) => async (url, opts) => {
+    captured.body = JSON.parse(opts.body);
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content } }] }) };
+  };
+  const msgs = [
+    { is_incoming: 1, message_body_text: '在庫はいつ入りますか?' },
+    { is_incoming: 0, message_body_text: '確認いたします。' },
+  ];
+
+  const cap = {};
+  const r = await draftReply({
+    inquiry: { customer_name: '山田太郎', order_number: 'ORD-1', product_name: 'ひまし油', subject: '在庫について' },
+    messages: msgs, knowledgeText: '【社内Q&A】\n1. 在庫\n   A: 週次で入荷',
+    env: ENV, fetchImpl: mk('山田太郎様\n\n入荷は【要確認: 次回入荷予定日】です。\n【要確認: 数量】をご用意できます。', cap),
+  });
+  check('下書きを返す', r.text.includes('山田太郎様') && r.model === 'gpt-5.6-luna');
+  check('【要確認:】を抽出 (重複排除)', r.placeholders.length === 2
+    && r.placeholders.includes('【要確認: 次回入荷予定日】'), JSON.stringify(r.placeholders));
+  check('プロンプトに確定事実 (名前/注文番号/商品) が入る',
+    ['山田太郎', 'ORD-1', 'ひまし油'].every(s => cap.body.messages[1].content.includes(s)));
+  check('プロンプトに会話履歴が古い順で入る', (() => {
+    const c = cap.body.messages[1].content;
+    return c.indexOf('在庫はいつ入りますか') < c.indexOf('確認いたします');
+  })());
+  check('プロンプトに社内Q&Aが入る', cap.body.messages[1].content.includes('週次で入荷'));
+  check('システムプロンプトで推測禁止+要確認を指示',
+    cap.body.messages[0].content.includes('推測で書かず') && cap.body.messages[0].content.includes('【要確認'));
+  check('GPT-5系制約を踏襲 (temperature無し/max_completion_tokens)',
+    cap.body.temperature === undefined && cap.body.max_completion_tokens > 0);
+
+  const cap2 = {};
+  await draftReply({ inquiry: {}, messages: msgs, knowledgeText: '', env: ENV, fetchImpl: mk('x', cap2) });
+  check('ナレッジ無しは「該当なし」と明示 (捏造防止)', cap2.body.messages[1].content.includes('該当なし'));
+
+  const err = async (p) => { try { await draftReply(p); return null; } catch (e) { return e.message; } };
+  check('本文なしは拒否', (await err({ inquiry: {}, messages: [], env: ENV, fetchImpl: mk('x') }))?.includes('本文がない'));
+  check('キー未設定は拒否', (await err({ inquiry: {}, messages: msgs, env: {}, fetchImpl: mk('x') }))?.includes('未設定'));
+  check('PLACEHOLDER_RE が全角コロンにも効く', '【要確認：日付】'.match(PLACEHOLDER_RE)?.length === 1);
+}
+
 // ─── 2. HTTP (UI表示ゲート + API) ───
 console.log('2. HTTP');
 {
@@ -90,7 +170,9 @@ console.log('2. HTTP');
   delete process.env.OPENAI_API_KEY;
   const htmlOff = await (await fetch(`${base}/inquiries/${inq}`)).text();
   check('キー未設定: ✨ボタンを出さない (ダークローンチ)', !htmlOff.includes('id="rwRow"'));
+  check('キー未設定: 下書きボタンも出さない', !htmlOff.includes('id="draftBtn"'));
   check('キー未設定: APIは403', (await jp(`/api/inquiries/${inq}/ai-rewrite`, { style: 'polite', text: 'x' })).status === 403);
+  check('キー未設定: 下書きAPIも403', (await jp(`/api/inquiries/${inq}/ai-draft`, {})).status === 403);
 
   // キー設定後: ボタンが出る (envは起動後でも都度評価される設計)
   process.env.OPENAI_API_KEY = 'sk-test';
@@ -98,6 +180,12 @@ console.log('2. HTTP');
   check('キー設定後: ✨ボタン3種+元に戻すが出る', htmlOn.includes('id="rwRow"')
     && htmlOn.includes('丁寧に') && htmlOn.includes('やわらかく') && htmlOn.includes('簡潔に') && htmlOn.includes('元に戻す'));
   check('クライアントJSが載る', htmlOn.includes("post('/ai-rewrite'"));
+  check('キー設定後: ✨AIで下書きボタン+要確認警告枠が出る',
+    htmlOn.includes('id="draftBtn"') && htmlOn.includes('id="draftWarn"') && htmlOn.includes("post('/ai-draft'"));
+  check('送信前に【要確認】残存チェックが入る', htmlOn.includes('未確認の箇所が'));
+  check('警告表示は textContent 構築 (AI出力をinnerHTMLに入れない)',
+    htmlOn.includes('warn.textContent') && !htmlOn.includes('warn.innerHTML'));
+  check('下書きAPI: 存在しない問い合わせは404', (await jp('/api/inquiries/999999/ai-draft', {})).status === 404);
 
   // API 入力検証 (実fetchに到達する前に弾かれる系)
   check('API: 不正スタイルは400', (await jp(`/api/inquiries/${inq}/ai-rewrite`, { style: 'yolo', text: 'x' })).status === 400);
