@@ -1,7 +1,7 @@
 /**
  * inquiry-hub queries — 一覧/詳細のクエリロジック (router から分離、smoke.mjs で直接検証)
  */
-import { getDB, toUtcIso } from './db.js';
+import { getDB, toUtcIso, logActivity } from './db.js';
 
 export const CHANNELS = {
   email:   { label: 'メール', badge: 'background:#e0e7ff;color:#3730a3' },
@@ -153,6 +153,110 @@ export function countInboxByGroup() {
       WHERE ${base} AND i.channel_type IN (${g.channels.map(() => '?').join(',')})`).get(...g.channels).c;
   }
   return out;
+}
+
+/**
+ * 状態タブ用: いま見ている文脈 (チャネルグループ・フォルダ) でのビュー別件数
+ * (2026-08-17 スタッフ要望: モール問い合わせの中でも 新着/返信処理中/完了 を切り替えたい)。
+ * サイドバーの countByView は常に全体件数なので、タブ側はこちらを使う
+ */
+export function countViewsInContext(q = {}) {
+  const db = getDB();
+  const base = ['i.is_archived = 0'];
+  const params = [];
+  if (q.group && CHANNEL_GROUPS[q.group]) {
+    const chs = CHANNEL_GROUPS[q.group].channels;
+    base.push(`i.channel_type IN (${chs.map(() => '?').join(',')})`);
+    params.push(...chs);
+  }
+  if (q.folder === 'none') base.push('i.folder_id IS NULL');
+  else if (/^\d+$/.test(String(q.folder || ''))) { base.push('i.folder_id = ?'); params.push(Number(q.folder)); }
+  const out = {};
+  for (const [key, v] of Object.entries(VIEWS)) {
+    out[key] = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i
+      WHERE ${base.join(' AND ')} AND ${v.where}`).get(...params).c;
+  }
+  return out;
+}
+
+/** 一括操作の上限 (1ページ分=50件を想定。誤操作の被害を構造的に抑える) */
+export const BULK_MAX = 200;
+
+/**
+ * 一覧のチェックボックスからの一括操作 (2026-08-17 スタッフ要望。メールディーラー相当)。
+ * 状態変更・フォルダ移動・担当変更・既読/未読 を選択分にまとめて適用する。
+ * ⚠️ 削除はしない (取り消せない操作は一括で提供しない)。
+ * 全件を1トランザクションで処理し、1件ずつ操作ログを残す (誰が何をしたか後から追える)。
+ *
+ * @param {number[]} ids
+ * @param {object} ops { status?, folderId?: number|null|undefined, assigned?: string|null, isUnread?: boolean }
+ * @returns {{ updated: number, skipped: number }} skipped = 変更が無かった/存在しない件数
+ */
+export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal' } = {}) {
+  const list = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter(Number.isInteger))];
+  if (!list.length) throw new Error('対象が選択されていません');
+  if (list.length > BULK_MAX) throw new Error(`一度に処理できるのは${BULK_MAX}件までです`);
+
+  const hasStatus = ops.status != null && ops.status !== '';
+  const hasFolder = Object.prototype.hasOwnProperty.call(ops, 'folderId') && ops.folderId !== undefined;
+  const hasAssigned = ops.assigned != null;
+  const hasUnread = typeof ops.isUnread === 'boolean';
+  if (!hasStatus && !hasFolder && !hasAssigned && !hasUnread) throw new Error('変更内容が指定されていません');
+  if (hasStatus && !STATUSES[ops.status]) throw new Error(`不正なステータス: ${ops.status}`);
+
+  const db = getDB();
+  let folderName = null;
+  if (hasFolder && ops.folderId != null) {
+    const f = db.prepare('SELECT id, name, is_active FROM inquiry_folders WHERE id = ?').get(Number(ops.folderId));
+    if (!f || !f.is_active) throw new Error('指定のフォルダが存在しません');
+    folderName = f.name;
+  }
+  const assigned = hasAssigned ? String(ops.assigned).trim() : null;
+
+  let updated = 0;
+  const NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')";
+  db.transaction(() => {
+    const get = db.prepare('SELECT * FROM inquiries WHERE id = ? AND is_archived = 0');
+    // completed_at は done への遷移時のみ刻む (詳細画面の単体更新と同じ規則)
+    const updStatus = db.prepare(`UPDATE inquiries SET internal_status = ?,
+      completed_at = CASE WHEN ? = 'done' THEN COALESCE(completed_at, ${NOW}) ELSE NULL END,
+      updated_at = ${NOW} WHERE id = ?`);
+    const updFolder = db.prepare(`UPDATE inquiries SET folder_id = ?, updated_at = ${NOW} WHERE id = ?`);
+    const updAssign = db.prepare(`UPDATE inquiries SET assigned_user_id = ?, updated_at = ${NOW} WHERE id = ?`);
+    const updUnread = db.prepare(`UPDATE inquiries SET is_unread = ?, updated_at = ${NOW} WHERE id = ?`);
+    for (const id of list) {
+      const inq = get.get(id);
+      if (!inq) continue;
+      let touched = false;
+      if (hasStatus && inq.internal_status !== ops.status) {
+        updStatus.run(ops.status, ops.status, id);
+        logActivity(id, { userId: actorId, actionType: 'status_change',
+          before: { status: inq.internal_status }, after: { status: ops.status, reason: '一括操作' } });
+        touched = true;
+      }
+      const fid = hasFolder ? (ops.folderId == null ? null : Number(ops.folderId)) : undefined;
+      if (hasFolder && inq.folder_id !== fid) {
+        updFolder.run(fid, id);
+        logActivity(id, { userId: actorId, actionType: 'folder_change',
+          before: { folder: inq.folder_id }, after: { folder: folderName, reason: '一括操作' } });
+        touched = true;
+      }
+      if (hasAssigned && String(inq.assigned_user_id || '') !== assigned) {
+        updAssign.run(assigned || null, id);
+        logActivity(id, { userId: actorId, actionType: 'assign',
+          before: { assigned: inq.assigned_user_id }, after: { assigned, reason: '一括操作' } });
+        touched = true;
+      }
+      if (hasUnread && !!inq.is_unread !== ops.isUnread) {
+        updUnread.run(ops.isUnread ? 1 : 0, id);
+        logActivity(id, { userId: actorId, actionType: 'read_toggle',
+          before: { is_unread: !!inq.is_unread }, after: { is_unread: ops.isUnread, reason: '一括操作' } });
+        touched = true;
+      }
+      if (touched) updated++;
+    }
+  }).immediate();
+  return { updated, skipped: list.length - updated };
 }
 
 /** サイドバーのビュー別件数 (未アーカイブのみ) */
