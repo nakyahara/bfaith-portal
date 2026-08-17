@@ -28,8 +28,11 @@
     details.cls summary { cursor: pointer; color: #1971c2; font-size: 0.9em; }
     details.cls table { margin: 6px 0 10px; }
     .note { background: #fff9db; border-radius: 8px; padding: 10px 12px; font-size: 0.85em; margin-bottom: 16px; }
-    .wchip { display: inline-block; background: #f1f3f5; border-radius: 6px; padding: 2px 7px; margin: 2px 4px 2px 0; white-space: nowrap; }
-    .wchip.prov { background: #f8f9fa; color: #868e96; }
+    table.heatmap td.cell { text-align: center; }
+    table.heatmap td.cell .cellq { display: block; font-size: 0.72em; color: #495057; }
+    table.heatmap td.cell.prov { color: #868e96; }
+    table.heatmap td.cell.prov b { font-weight: 400; }
+    table.heatmap tr.totalrow td { border-top: 2px solid #adb5bd; }
   </style>
 </head>
 <body>
@@ -139,34 +142,65 @@
       </tbody>
     </table>
 
-    <h2>引当分類別 — この分類は誰が速いか</h2>
+    <h2>引当分類別 × 作業者 ヒートマップ</h2>
     <p class="muted" style="font-size:0.85em; margin:0 0 8px">
-      分類ごとの比較なので重さの補正は入れていません (指数 = その分類の平均 ÷ 本人の実測)。
-      <%= stats.minClassLines %>明細未満は参考値として順位を付けません。
+      セル = 秒/明細 (下段は明細数)。色は<b>その分類の全体平均との比</b> — 緑=速い / 黄=平均どおり / 赤=遅い。
+      分類ごとに基準が違うため行単位で正規化しています (縦に1人の列を見れば得意・不得意が分かる)。
+      薄いセルは<%= stats.minClassLines %>明細未満の参考値。最下行は分類の重さを補正した総合指数。
     </p>
-    <table class="pk-list">
-      <thead><tr><th>引当分類</th><th class="num">明細</th><th class="num">平均秒</th><th class="num">担当者数</th><th>速い順 (秒/明細・明細数)</th></tr></thead>
+    <%
+      // ヒートマップの色 (board.ejs と同じスケールのライトテーマ版)。
+      // ratio = 本人の秒/明細 ÷ 分類平均。0.75=濃緑 → 1.0=黄 → 1.35=濃赤
+      const heatColor = (ratio, provisional) => {
+        const r = Math.max(0.75, Math.min(1.35, ratio));
+        const t = r <= 1 ? ((r - 0.75) / 0.25) * 0.5 : 0.5 + ((r - 1) / 0.35) * 0.5;
+        const hue = Math.round(120 * (1 - t));
+        return provisional ? `hsl(${hue}, 45%, 94%)` : `hsl(${hue}, 70%, 85%)`;
+      };
+    %>
+    <div style="overflow-x:auto">
+    <table class="pk-list heatmap">
+      <thead>
+        <tr>
+          <th>引当分類</th><th class="num">平均</th>
+          <% stats.workers.forEach((w) => { %><th class="num"><%= w.name %></th><% }) %>
+        </tr>
+      </thead>
       <tbody>
-        <% for (const c of stats.baseline) { %>
+        <% for (const c of stats.baseline) { const byWorker = new Map(c.workers.map((x) => [x.worker, x])); %>
           <tr>
-            <td><%= c.key %></td>
-            <td class="num"><%= c.lines %></td>
+            <td><%= c.key %> <span class="muted">(<%= c.lines %>件)</span></td>
             <td class="num"><b><%= fmt1(c.avgSec) %></b></td>
-            <td class="num"><%= c.workerCount %></td>
-            <td>
-              <% c.workers.forEach((w, i) => { %>
-                <span class="wchip <%= w.provisional ? 'prov' : '' %>">
-                  <%= w.provisional ? '' : (i + 1) + '. ' %><%= w.name %>
-                  <b><%= fmt1(w.secPerLine) %></b>
-                  <span class="muted">(<%= w.lines %>)</span>
-                </span>
-              <% }) %>
-            </td>
+            <% stats.workers.forEach((col) => { const cell = byWorker.get(col.worker); %>
+              <% if (!cell) { %>
+                <td class="num muted">–</td>
+              <% } else { %>
+                <td class="num cell <%= cell.provisional ? 'prov' : '' %>"
+                    style="background:<%= heatColor(cell.secPerLine / c.avgSec, cell.provisional) %>">
+                  <b><%= fmt1(cell.secPerLine) %></b><span class="cellq"><%= cell.lines %>件</span>
+                </td>
+              <% } %>
+            <% }) %>
           </tr>
         <% } %>
-        <% if (stats.baseline.length === 0) { %><tr><td colspan="5" class="muted">データがありません</td></tr><% } %>
+        <tr class="totalrow">
+          <td><b>総合指数 (補正済)</b></td>
+          <td class="num"><b>100</b></td>
+          <% stats.workers.forEach((w) => { %>
+            <% if (w.index == null) { %>
+              <td class="num muted">–</td>
+            <% } else { %>
+              <td class="num cell <%= w.provisional ? 'prov' : '' %>"
+                  style="background:<%= heatColor(100 / w.index, w.provisional) %>">
+                <b><%= w.index %></b><span class="cellq"><%= fmt1(w.secPerLine) %>秒</span>
+              </td>
+            <% } %>
+          <% }) %>
+        </tr>
+        <% if (stats.baseline.length === 0) { %><tr><td colspan="<%= stats.workers.length + 2 %>" class="muted">データがありません</td></tr><% } %>
       </tbody>
     </table>
+    </div>
 
     <h2>日別</h2>
     <table class="pk-list">

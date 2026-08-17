@@ -467,16 +467,16 @@ router.get('/api/board', api(async (req, res) => {
       minClassLines: stats.minClassLines,
       outlierSec: stats.outlierSec,
       total: stats.total,
-      // 掲示は明細数上位の分類のみ (3列×3行で画面に収まる範囲)。全量は管理画面で見る
-      baseline: stats.baseline.slice(0, 9).map((c) => ({
+      // 掲示は明細数上位の分類のみ (ヒートマップの行数 = 画面に収まる範囲)。全量は管理画面で見る
+      baseline: stats.baseline.slice(0, 12).map((c) => ({
         key: c.key, lines: c.lines, avgSec: c.avgSec, workerCount: c.workerCount,
         workers: c.workers.map((w) => ({
-          name: w.name, lines: w.lines, secPerLine: w.secPerLine,
+          worker: w.worker, name: w.name, lines: w.lines, secPerLine: w.secPerLine,
           index: w.index, provisional: w.provisional,
         })),
       })),
       workers: stats.workers.map((w) => ({
-        name: w.name, lines: w.lines, secPerLine: w.secPerLine,
+        worker: w.worker, name: w.name, lines: w.lines, secPerLine: w.secPerLine,
         index: w.index, provisional: w.provisional, shortages: w.shortages,
         batches: w.batches, days: w.days,
       })),
