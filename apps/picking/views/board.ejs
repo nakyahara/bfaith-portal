@@ -170,6 +170,8 @@
      * 0.75以下=濃い緑 → 1.0=黄 → 1.35以上=濃い赤。母数不足は彩度を落とす (CSS側 opacity)。
      */
     function heatColor(ratio) {
+      // 0秒明細だけの分類では平均0で 0/0=NaN になる → 平均どおり (黄) として扱う
+      if (!isFinite(ratio)) ratio = 1;
       var r = Math.max(0.75, Math.min(1.35, ratio));
       var t = r <= 1 ? ((r - 0.75) / 0.25) * 0.5 : 0.5 + ((r - 1) / 0.35) * 0.5;   // 0..1 (0.5=平均)
       var hue = 120 * (1 - t);                                                      // 緑120 → 赤0
