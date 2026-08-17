@@ -56,12 +56,12 @@ async function replyLine(replyToken, messages, fetchFn = fetch) {
   }
 }
 
-// ─── ブロック一覧コマンド (「Z」「A」等でブロック内の全在庫を一覧) ───
-// 既定 Z→ZZZ / A→AAAA。env PICKING_LINE_BLOCK_ALIASES="Z=ZZZ,A=AAAA" で上書き可
+// ─── ブロック一覧コマンド (「Z」「A」「Y」等でブロック内の全在庫を一覧) ───
+// 既定 Z→ZZZ / A→AAAA / Y→YYY。env PICKING_LINE_BLOCK_ALIASES="Z=ZZZ,A=AAAA,Y=YYY" で上書き可
 
 function blockAliases() {
   const map = {};
-  for (const pair of String(process.env.PICKING_LINE_BLOCK_ALIASES || 'Z=ZZZ,A=AAAA').split(',')) {
+  for (const pair of String(process.env.PICKING_LINE_BLOCK_ALIASES || 'Z=ZZZ,A=AAAA,Y=YYY').split(',')) {
     const [k, v] = pair.split('=').map((s) => String(s || '').trim().toUpperCase());
     if (k && v) map[k] = v;
   }

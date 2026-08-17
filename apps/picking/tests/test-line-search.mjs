@@ -140,6 +140,7 @@ await t('resolveBlockCommand: Z/A エイリアス・全角・ロケ付き・直�
   assert.deepEqual(resolveBlockCommand('Ｚ'), { block: 'ZZZ', explicit: true }, '全角も同一視');
   assert.deepEqual(resolveBlockCommand('Zロケ'), { block: 'ZZZ', explicit: true });
   assert.deepEqual(resolveBlockCommand('A'), { block: 'AAAA', explicit: true });
+  assert.deepEqual(resolveBlockCommand('Y'), { block: 'YYY', explicit: true }, 'YもYYYのエイリアス');
   assert.deepEqual(resolveBlockCommand('YYY'), { block: 'YYY', explicit: false }, 'ブロック名直打ち');
   assert.equal(resolveBlockCommand('ハッカ'), null);
   assert.equal(resolveBlockCommand('teatree10'), null, '7文字以上は商品検索');
