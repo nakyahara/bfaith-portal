@@ -22,6 +22,7 @@ import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, countInboxByGroup, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { aiRewriteEnabled, rewriteReply, REWRITE_STYLES } from './ai-rewrite.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
@@ -371,6 +372,11 @@ router.get('/inquiries/:id', (req, res) => {
           <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
         </div>
         <textarea id="replyBody" rows="6" placeholder="返信本文 (上のテンプレート選択からも入れられます)"></textarea>
+        ${aiRewriteEnabled() ? `<div class="row rw-row" id="rwRow">
+          <span class="sub">✨AIで整える:</span>
+          ${Object.entries(REWRITE_STYLES).map(([k, v]) => `<button class="ghost rw-btn" type="button" data-style="${k}">${he(v.label)}</button>`).join('')}
+          <button class="ghost" type="button" id="rwUndoBtn" style="display:none">↩ 元に戻す</button>
+        </div>` : ''}
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
@@ -710,6 +716,46 @@ router.get('/inquiries/:id', (req, res) => {
     // セレクトで選んだだけでも反映する (ボタンは空欄時の説明・視認性のために残す)
     tplSel.addEventListener('change', function() { if (tplSel.value) applyTpl(); });
   })();
+  // ✨ AI書き換え (2026-08-17 スタッフ要望): 入力中の文章を丁寧に/やわらかく/簡潔に整える。
+  // 書き換え前の文は保持して「元に戻す」で復元できる
+  var rwRow = document.getElementById('rwRow');
+  if (rwRow) (function() {
+    var rwPrev = null;
+    var undoBtn = document.getElementById('rwUndoBtn');
+    var rwBtns = rwRow.querySelectorAll('.rw-btn');
+    function setBusy(busy) {
+      rwBtns.forEach(function(b) { b.disabled = busy; });
+      undoBtn.disabled = busy;
+    }
+    rwBtns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var ta = document.getElementById('replyBody');
+        var text = ta.value.trim();
+        if (!text) { toast('先に返信文を入力してください'); return; }
+        setBusy(true);
+        var orig = btn.textContent;
+        btn.textContent = '✨ 書き換え中…';
+        post('/ai-rewrite', { style: btn.dataset.style, text: text })
+          .then(function(r) {
+            rwPrev = ta.value;
+            ta.value = r.text;
+            undoBtn.style.display = '';
+            ta.focus();
+            toast('書き換えました。内容を確認してから送信してください (↩で元に戻せます)');
+          })
+          .catch(function(e) { toast('書き換え失敗: ' + e.message); })
+          .then(function() { btn.textContent = orig; setBusy(false); });
+      });
+    });
+    undoBtn.addEventListener('click', function() {
+      if (rwPrev == null) return;
+      var ta = document.getElementById('replyBody');
+      var cur = ta.value;
+      ta.value = rwPrev;
+      rwPrev = cur;  // もう一度押すと書き換え後に戻れる (トグル)
+      toast('戻しました (もう一度押すと書き換え後に戻ります)');
+    });
+  })();
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
@@ -760,6 +806,28 @@ router.get('/api/templates', (req, res) => {
       bodyBottom: t.body_bottom || '',
     })),
   });
+});
+
+// ✨ 返信文のAI書き換え (2026-08-17 スタッフ要望)。OPENAI_API_KEY があるときだけUI表示・実行可。
+// 最新の顧客メッセージを文脈として渡し、文体だけ整える (内容の追加はプロンプトで禁止)
+router.post('/api/inquiries/:id(\\d+)/ai-rewrite', async (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  if (!aiRewriteEnabled()) return res.status(403).json({ error: 'AI書き換えは未設定です (env OPENAI_API_KEY)' });
+  const b = req.body || {};
+  try {
+    const lastIncoming = getDB().prepare(`SELECT message_body_text FROM inquiry_messages
+      WHERE inquiry_id = ? AND is_incoming = 1
+      ORDER BY COALESCE(received_at, sent_at, created_at) DESC, id DESC LIMIT 1`).get(inq.id);
+    const r = await rewriteReply({
+      style: String(b.style || ''),
+      text: String(b.text || ''),
+      inquiryContext: lastIncoming?.message_body_text || '',
+    });
+    console.log(`[inquiry-hub] AI書き換え (${b.style}, model=${r.model}, ${String(b.text || '').length}→${r.text.length}文字) by ${actorOf(req)} inquiry=${inq.id}`);
+    res.json({ ok: true, text: r.text });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
 });
 
 const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"; // 日時の正準形式 (db.js toUtcIso と同形)
@@ -2067,6 +2135,9 @@ figure.att-img.att-err .att-fail { display: block; }
 .tpl-row { margin-bottom: 8px; flex-wrap: wrap; }
 .tpl-row #tplCat { max-width: 40%; }
 .tpl-row #tplSel { flex: 1; min-width: 160px; }
+/* AI書き換えボタン行 */
+.rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
+.rw-row .rw-btn { margin: 0; }
 .panel .row input { flex: 1; }
 .panel textarea { resize: vertical; }
 .note { border-top: 1px solid #e2e8f0; padding: 8px 0; }
