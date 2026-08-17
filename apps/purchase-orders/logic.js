@@ -20,7 +20,7 @@
  * データソース: mirror_pml_snapshot_rows (published run) + po_* マスタ。
  */
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { getSetting } from './ledger.js';
+import { getSetting, audit } from './ledger.js';
 
 const PML_COLS = [
   '商品コード', '商品名', '仕入先', '取扱区分', '商品区分', '売上分類',
@@ -95,6 +95,99 @@ export function loadPml() {
   })();
 }
 
+// ─── ロジザード在庫 mirror 自動反映 (2026-08-17 中原さん指示) ───
+// mirror_logizard_stock は miniPC 毎時取込 (9〜18時) の複製 (同じ warehouse-mirror.db 内)。
+// captured_at が進んでいたら、手動CSV取込と同じ「在庫数のみ上書き」のオーバーレイを自動で作り直す。
+// 発注画面を開けば常に最新 (最大1時間前) の在庫で計算される — 手動アップロードは miniPC 停止時の
+// バックアップとして残す (新しい方が勝つ: captured_at 比較の後勝ち)。
+//
+// やらないこと (意図的):
+// - bumpCycleReset しない — ✅発注確定済み・×非表示のサイクルは人がデータ更新したときだけ進める
+//   (毎時リセットされたら発注管理の目印が全部消えるため)
+// - po_product_code_canonical を更新しない — mirror の商品IDは小文字化済みで
+//   ロジザード登録表記 (大小) が失われている (表記の正はCSV手動取込・NE取込のみ)
+
+/** mirror_logizard_stock の最新 captured_at (表が無い環境=init fail-soft でも落とさない) */
+export function logizardMirrorLatestCapture(db) {
+  try {
+    const r = db.prepare('SELECT MAX(captured_at) AS c FROM mirror_logizard_stock').get();
+    return r && r.c ? r.c : null;
+  } catch { return null; }
+}
+
+let lzMirrorLastCheckMs = 0;
+
+/**
+ * mirror が進んでいたら在庫オーバーレイを自動更新する (computeAll の頭で毎回呼ぶ)。
+ * チェック自体は MAX(captured_at) 1本 + 60秒throttle で軽い。失敗しても発注画面は落とさない
+ * (fail-soft: 古いオーバーレイのまま表示され、鮮度表示の⚠️で気づける)。
+ */
+export function maybeRefreshFromLogizardMirror() {
+  const intervalMs = Number(process.env.PO_LZ_MIRROR_CHECK_INTERVAL_MS ?? 60000);
+  if (intervalMs > 0 && Date.now() - lzMirrorLastCheckMs < intervalMs) return;
+  lzMirrorLastCheckMs = Date.now();
+  try {
+    const db = getDB();
+    const cap = logizardMirrorLatestCapture(db);
+    if (!cap) return; // mirror未着 (初回push前・表なし)
+    const meta = db.prepare('SELECT * FROM po_ne_overlay_meta WHERE id=1').get();
+    // 後勝ち: 手動取込 (captured_at=取込時刻) の方が新しい間は上書きしない。ISO文字列は辞書順=時刻順
+    const metaCap = meta ? (meta.captured_at || meta.uploaded_at) : null;
+    if (metaCap && cap <= metaCap) return;
+    // 「CSV取込を解除」直後は同じ世代では復活させない (次の毎時更新で自動再開)
+    const suppressed = getSetting('po_lz_mirror_suppress_capture');
+    if (suppressed && cap <= suppressed) return;
+    // NEマスタCSV (全項目上書き) が有効に適用されている間はスキップ — 在庫だけの自動反映で
+    // その日の原価・取扱区分の上書きを消さない。翌朝のPML同期で applied=false になったら再開
+    if (meta && (meta.source == null || meta.source === 'ne')) {
+      const pub = db.prepare('SELECT src_ne_products_synced_at FROM mirror_pml_published WHERE id=1').get();
+      const a = Date.parse(meta.uploaded_at);
+      const b = pub && pub.src_ne_products_synced_at ? Date.parse(pub.src_ne_products_synced_at) : NaN;
+      const neActive = !(Number.isFinite(a) && Number.isFinite(b) && a < b); // loadPmlMerged の applied と同じ判定
+      if (neActive) return;
+    }
+    // 集計はSQL一発 (手動CSV経路と同じルール: 良品のみ・商品IDごとにロケ横断SUM)
+    const agg = db.prepare(`SELECT 商品ID AS code, SUM(在庫数) AS stock, SUM(引当数) AS alloc
+      FROM mirror_logizard_stock WHERE 品質区分名='良品' GROUP BY 商品ID`).all();
+    const byKey = new Map();
+    for (const r of agg) {
+      const key = normProductCode(r.code);
+      if (!key) continue;
+      const cur = byKey.get(key) || { code: r.code, stock: 0, alloc: 0 };
+      cur.stock += r.stock;
+      cur.alloc += r.alloc == null ? 0 : r.alloc;
+      byKey.set(key, cur);
+    }
+    // 異常データガード: mirror が極端に小さい (途中欠け等) 場合に大量の在庫0上書きをしない。
+    // 手動経路のプレビュー確認に相当する安全弁 (実データ約2,900商品に対して既定500)
+    const minProducts = Math.max(1, Number(process.env.PO_LZ_MIRROR_MIN_PRODUCTS) || 500);
+    if (byKey.size < minProducts) {
+      console.warn(`[po] logizard mirror自動反映をスキップ: 商品数${byKey.size} < 下限${minProducts} (mirror欠損の疑い)`);
+      return;
+    }
+    // CSVに行が無い取扱中商品は「売り切れ=在庫0」で上書き (手動経路と同じ前提: 自社在庫は全てロジザードにある)
+    const pmlActive = new Map(loadPml().rows.filter(r => String(r['取扱区分'] || '') === '取扱中')
+      .map(r => [normProductCode(r['商品コード']), String(r['商品コード']).trim()]));
+    const zeroFill = [...pmlActive].filter(([k]) => !byKey.has(k));
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      db.prepare('DELETE FROM po_ne_overlay_rows').run();
+      const ins = db.prepare('INSERT INTO po_ne_overlay_rows (product_key, product_code, 在庫数, 引当数) VALUES (?,?,?,?)');
+      for (const [key, v] of byKey) ins.run(key, v.code, v.stock, v.alloc);
+      for (const [key, code] of zeroFill) ins.run(key, code, 0, null);
+      db.prepare(`INSERT INTO po_ne_overlay_meta (id, uploaded_at, row_count, filename, source, captured_at)
+                  VALUES (1,?,?,NULL,'logizard_mirror',?)
+                  ON CONFLICT(id) DO UPDATE SET uploaded_at=excluded.uploaded_at, row_count=excluded.row_count,
+                    filename=excluded.filename, source=excluded.source, captured_at=excluded.captured_at`)
+        .run(now, byKey.size + zeroFill.length, cap);
+      audit(db, { actorType: 'system', actor: 'lz-mirror-auto', action: 'logizard_mirror_refresh', resource: 'ne_overlay',
+        detail: { captured_at: cap, products: byKey.size, zeroFill: zeroFill.length } });
+    })();
+  } catch (e) {
+    console.error('[po] logizard mirror自動反映エラー (発注画面は継続):', e.message);
+  }
+}
+
 /** NE商品マスタCSVオーバーレイをロード */
 export function loadNeOverlay() {
   const db = getDB();
@@ -128,7 +221,7 @@ export function loadPmlMerged() {
         const b = Date.parse(pub.src_ne_products_synced_at);
         if (!Number.isNaN(a) && !Number.isNaN(b) && a < b) applied = false; // 朝同期の方が新しい
       }
-      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, source: ov.meta.source || 'ne', applied, mergedCount: 0 };
+      overlay = { uploaded_at: ov.meta.uploaded_at, row_count: ov.meta.row_count, filename: ov.meta.filename, source: ov.meta.source || 'ne', captured_at: ov.meta.captured_at || null, applied, mergedCount: 0 };
     }
     const merged = !applied ? rows : rows.map(r => {
       const o = ov.rows.get(normProductCode(r['商品コード']));
@@ -215,6 +308,8 @@ export function loadLedgerBackorders() {
  * 注残はアプリ台帳 (loadLedgerBackorders) を正とする — NE CSVの発注残数は使わない。
  */
 export function computeAll() {
+  // 毎時mirrorが進んでいたら在庫オーバーレイを先に自動更新 (60秒throttle+fail-soft。read txの外で書く)
+  maybeRefreshFromLogizardMirror();
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
   const { pub, rows, overlay, masters, recentIssued, ledgerZan, useLedgerZan } = db.transaction(() => ({
