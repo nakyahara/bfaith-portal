@@ -121,8 +121,9 @@ export async function buildBlockListMessages(cmd, deps) {
   const multiLoc = new Set(rows.map((r) => String(r.location))).size > 1;
   const totalFree = rows.reduce((sum, r) => sum + Number(r.free), 0);
   // 表示は「数量が行頭」— 行末だと商品名の折り返しで数量が迷子になる (2026-08-17 中原さん「見にくい」)。
-  // 商品名末尾の社内サフィックス (_パフ箱・_梱機プ・_K-44 等) は一覧では省く
-  const stripSuffix = (name) => String(name || '').replace(/\s*_[^_\s]{1,8}$/, '');
+  // 商品名末尾の社内サフィックス (_パフ箱・_梱機プ・_K-44 等の梱包指示タグ) は一覧では省く。
+  // 誤削除防止で「日本語1〜6文字」か「英字1文字-数字 (K-44型)」だけを対象にする (_Type-C 等は残す)
+  const stripSuffix = (name) => String(name || '').replace(/\s*_(?:[^\x00-\x7F]{1,6}|[A-Z]-?\d{1,3})$/, '');
   const lines = rows.map((r) => {
     const notes = [];
     const expiry = formatExpiryLabel(r.expiry);

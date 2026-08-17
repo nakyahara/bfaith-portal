@@ -171,6 +171,24 @@ await t('ブロック一覧: 単一ロケはロケ省略・フリー降順・期
   assert.equal(lines.length, 6, '単一ロケなので [ロケ] プレフィックスなし');
 });
 
+await t('ブロック一覧: サフィックス省略は社内タグ限定 (正当な _Type-C 等は残す)', async () => {
+  const d = deps({
+    fetchStockBlock: async () => ({
+      ok: true, importedAt: FRESH, block: 'ZZZ',
+      items: [
+        BLOCK_ROW({ name: 'ハッカ油 【500ml】_K-44', expiry: '', free: 400, qty: 400 }),
+        BLOCK_ROW({ sku: 'cable1', name: '充電ケーブル_Type-C', expiry: '', free: 30, qty: 30 }),
+        BLOCK_ROW({ sku: 'vitamin', name: 'ビタミン_C', expiry: '', free: 20, qty: 20 }),
+      ],
+    }),
+  });
+  const text = (await buildSearchReplyMessages('Z', d))[0].text;
+  assert.ok(text.includes('・400個｜ハッカ油 【500ml】'), `_K-44は省く: ${text}`);
+  assert.ok(!text.includes('_K-44'), text);
+  assert.ok(text.includes('充電ケーブル_Type-C'), '_Type-C は正当な名前として残す');
+  assert.ok(text.includes('ビタミン_C'), '_C も残す');
+});
+
 await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付き', async () => {
   const d = deps({
     fetchStockBlock: async () => ({
