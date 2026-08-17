@@ -21,12 +21,12 @@ router.get('/locations', (req, res) => {
   try {
     const db = getDB();
     const locations = db.prepare(`
-      SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality,
+      SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality, 有効期限 AS expiry,
              SUM(在庫数) AS qty, SUM(引当数) AS allocated,
              SUM(在庫数 - 引当数) AS free
       FROM raw_lz_inventory
       WHERE 商品ID = ?
-      GROUP BY ブロック略称, ロケ, 品質区分名
+      GROUP BY ブロック略称, ロケ, 品質区分名, 有効期限
     `).all(code);
     const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
     const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;

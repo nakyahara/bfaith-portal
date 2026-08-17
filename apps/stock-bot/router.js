@@ -120,11 +120,11 @@ export function searchProducts(db, query, limit = MAX_CANDIDATES + 1) {
 export function buildStockReply(db, sku, now = new Date()) {
   const code = String(sku || '').trim().toLowerCase();   // mirror の商品ID は取込時に trim+小文字済み
   const locations = db.prepare(`
-    SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality,
+    SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality, 有効期限 AS expiry,
            SUM(在庫数) AS qty, SUM(引当数) AS allocated, SUM(在庫数 - 引当数) AS free
     FROM mirror_logizard_stock
     WHERE 商品ID = ?
-    GROUP BY ブロック略称, ロケ, 品質区分名
+    GROUP BY ブロック略称, ロケ, 品質区分名, 有効期限
   `).all(code);
   if (locations.length === 0) return null;
   const meta = db.prepare(`

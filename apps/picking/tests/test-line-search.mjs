@@ -17,7 +17,7 @@ const ITEM = (sku, name, free) => ({ sku, name, free });
 const LOCATIONS = {
   ok: true, importedAt: FRESH, stockDate: '20260816', name: 'ティーツリーオイル 20ml',
   locations: [
-    { block: 'R1FA', location: '002-001-01', quality: '良品', qty: 200, allocated: 0, free: 200 },
+    { block: 'R1FA', location: '002-001-01', quality: '良品', qty: 200, allocated: 0, free: 200, expiry: '20280115' },
     { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', quality: '良品', qty: 15, allocated: 0, free: 15 },
   ],
 };
@@ -59,7 +59,7 @@ await t('検索: 1件は即ロケ表示 (仮想ロケ合算つき)', async () =>
   const msgs = await buildSearchReplyMessages('20ml', deps({ fetchStockSearch: async () => ({ ok: true, importedAt: FRESH, items: [ITEM('teatree20', 'ティーツリーオイル 20ml', 245)] }) }));
   const text = msgs[0].text;
   assert.ok(text.startsWith('ティーツリーオイル 20ml\n(teatree20)'), text);
-  assert.ok(text.includes('📍 在庫ロケーション') && text.includes('・R1FA-002-001-01 → 200個'), text);
+  assert.ok(text.includes('📍 在庫ロケーション') && text.includes('・R1FA-002-001-01 → 200個 (期限2028/01/15)'), text);
   assert.ok(text.includes('・ZZZ-ZZZ-ZZ → 15個'), text);
   assert.ok(!/\d: ?\d/.test(text), '「数字:数字」を含まない (LINEの時刻リンク化対策)');
   assert.equal(msgs[0].quickReply, undefined, '確定表示にボタンは付けない');
