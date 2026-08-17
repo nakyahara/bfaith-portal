@@ -162,10 +162,12 @@ await t('ブロック一覧: 単一ロケはロケ省略・フリー降順・期
   const lines = msgs[0].text.split('\n');
   assert.ok(lines[0].startsWith('📦 ZZZ の在庫一覧 ('), lines[0]);
   assert.equal(lines[1], '3件・フリー計3,066個');
-  assert.equal(lines[2], '・ハッカ油 【200ml】 _パフ箱 → 2600個 (期限2028/01/15)');
-  assert.equal(lines[3], '・上敷鋲 【25本入り】 → 460個 (別途引当10)');
-  assert.equal(lines[4], '・木工用 亜麻仁油 【100ml 】 → 6個 (Ｂ品)');
-  assert.equal(lines.length, 5, '単一ロケなので [ロケ] プレフィックスなし');
+  assert.equal(lines[2], '', 'ヘッダ後に空行');
+  // 数量が行頭 (行末だと商品名の折り返しで迷子)・千位カンマ・社内サフィックス (_パフ箱等) は省く
+  assert.equal(lines[3], '・2,600個｜ハッカ油 【200ml】 (期限2028/01/15)');
+  assert.equal(lines[4], '・460個｜上敷鋲 【25本入り】 (別途引当10)');
+  assert.equal(lines[5], '・6個｜木工用 亜麻仁油 【100ml 】 (Ｂ品)');
+  assert.equal(lines.length, 6, '単一ロケなので [ロケ] プレフィックスなし');
 });
 
 await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付き', async () => {
@@ -179,8 +181,8 @@ await t('ブロック一覧: 複数ロケは [ロケ] プレフィックス付�
     }),
   });
   const msgs = await buildSearchReplyMessages('A', d);
-  assert.ok(msgs[0].text.includes('・[001-001-01] '), msgs[0].text);
-  assert.ok(msgs[0].text.includes('・[001-002-01] 商品Y → 10個'), msgs[0].text);
+  assert.ok(msgs[0].text.includes('個｜[001-001-01] '), msgs[0].text);
+  assert.ok(msgs[0].text.includes('・10個｜[001-002-01] 商品Y'), msgs[0].text);
 });
 
 await t('ブロック一覧: エイリアス在庫0=在庫なし案内・直打ちは商品検索優先・商品0件でブロック照会', async () => {
