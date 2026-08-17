@@ -354,6 +354,74 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
   });
 });
 
+// ─── ⑥ 配送ルール変更の申請 (Render packing-dispatch へ中継 — 要件⑥) ───
+// 承認は GChat カードのボタン (stock-bot 経由)。ここは申請の受付だけ
+const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
+  || 'https://bfaith-portal.onrender.com/apps/packing-dispatch/rule-change-api').replace(/\/+$/, '');
+let _ruleOptionsCache = { at: 0, data: null };
+
+router.get('/api/rule-change/options', api(async (req, res) => {
+  if (!process.env.PD_RULE_CHANGE_KEY) {
+    throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
+  }
+  if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
+    const r = await fetch(`${PD_RULE_URL}/options`, {
+      headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
+    });
+    if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
+    _ruleOptionsCache = { at: Date.now(), data: await r.json() };
+  }
+  res.json({ ok: true, ...(_ruleOptionsCache.data) });
+}));
+
+router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, res) => {
+  if (!process.env.PD_RULE_CHANGE_KEY) {
+    throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
+  }
+  // 作業者検証 (イベントAPIと同じ)
+  const name = String(req.body.worker_name || '').trim();
+  let worker = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    worker = name;
+  } else if (req.session?.email) {
+    worker = req.session.displayName || req.session.email;
+  } else {
+    throw new PackError(400, 'no_worker', '作業者を選択してください');
+  }
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) throw new PackError(404, 'not_found', 'バッチが見つかりません');
+  const slipSeq = Number(req.body.slip_seq);
+  const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
+  if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
+  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
+  const kind = lines.length === 1 ? 'single' : 'assort';
+  const payload = {
+    kind,
+    items: lines.map((l) => ({ sku: l.sku, name: l.print_name || l.product_name, qty: l.qty })),
+    mall_group: req.body.mall_group,
+    qty_min: req.body.qty_min == null ? null : Number(req.body.qty_min),
+    qty_max: req.body.qty_max == null || req.body.qty_max === '' ? null : Number(req.body.qty_max),
+    shipping_method_code: req.body.shipping_method_code,
+    packing_machine_code: req.body.packing_machine_code,
+    requested_by: worker,
+    context: `${batch.folder_name || ''} ${slip.ne_slip_no}`.trim(),
+  };
+  const r = await fetch(`${PD_RULE_URL}/requests`, {
+    method: 'POST',
+    headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new PackError(r.status === 400 ? 400 : 502, 'upstream', body.error || `申請に失敗しました (HTTP ${r.status})`);
+  }
+  res.json({ ok: true, id: body.id, cardPosted: body.cardPosted });
+}));
+
 // ─── PWA manifest (ホーム画面追加用) ───
 router.get('/manifest.json', (req, res) => {
   res.json({
