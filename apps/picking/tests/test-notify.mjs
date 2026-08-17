@@ -324,17 +324,33 @@ globalThis.fetch = async (url, opts) => {
     assert.ok(!text.includes('…他'), '丸め表示を出さない');
   });
 
-  t('buildStockLocationsText: 同ロケの期限違いロットは行を分け期限の近い順 (先入先出)', () => {
+  t('buildStockLocationsText: 同ロケの期限違いロットは隣接して期限の近い順 (先入先出)', () => {
     const lots = {
       ok: true, importedAt: data.importedAt, stockDate: '20260816',
       locations: [
-        { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 50, allocated: 0, free: 50, expiry: '20280115' },
+        // ロケA (合計150) のロットは数量がバラバラでも隣接し、期限昇順。ロケB (70) はその後
+        { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 100, allocated: 0, free: 100, expiry: '20280115' },
+        { block: 'R1FA', location: '002-002-02', quality: '良品', qty: 70, allocated: 0, free: 70, expiry: '20270601' },
         { block: 'R1FA', location: '001-001-01', quality: '良品', qty: 50, allocated: 0, free: 50, expiry: '20271210' },
       ],
     };
     const lines = buildStockLocationsText(lots, { now }).split('\n');
     assert.equal(lines[1], '・R1FA-001-001-01 → 50個 (期限2027/12/10)');
-    assert.equal(lines[2], '・R1FA-001-001-01 → 50個 (期限2028/01/15)');
+    assert.equal(lines[2], '・R1FA-001-001-01 → 100個 (期限2028/01/15)');
+    assert.equal(lines[3], '・R1FA-002-002-02 → 70個 (期限2027/06/01)');
+  });
+
+  t('buildStockLocationsText: 5,000字を超えそうなときだけ末尾を間引く (安全弁)', () => {
+    const huge = {
+      ok: true, importedAt: data.importedAt, stockDate: '20260816',
+      locations: Array.from({ length: 60 }, (_, i) => ({
+        block: 'X', location: `特殊ロケの長い名前テスト-${'あ'.repeat(80)}-${i}`, quality: '良品',
+        qty: 1, allocated: 0, free: 1,
+      })),
+    };
+    const text = buildStockLocationsText(huge, { now });
+    assert.ok(text.length <= 5000, `LINE上限内: ${text.length}`);
+    assert.ok(text.includes('文字数上限'), '間引いたことを明示');
   });
 
   t('buildStockLocationsText: 180分超のスナップショットは古い旨の警告', () => {

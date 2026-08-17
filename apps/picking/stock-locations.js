@@ -131,15 +131,18 @@ export function buildStockLocationsText(data, {
       && String(r.block || '') === String(excludeBlock || '')
       && normalizeLocationDigits(r.location) === excludeDigits))
     .filter((r) => Number(r.free) > 0);
-  // 棚ロケ (8桁数字に正規化できるもの) をフリー在庫降順で先に、それ以外
-  // (ロジザード上の特殊ロケ。実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。
-  // 特殊ロケも実在のロケコードなので、造語 (「仮想ロケ」等) にせずそのままの名前で見せる。
-  // 同ロケに期限違いロットがある場合は行が分かれる → 同ロケ内は期限の近い順 (先入先出)
+  // 棚ロケ (8桁数字に正規化できるもの) を先に、それ以外 (ロジザード上の特殊ロケ。
+  // 実データに ZZZ-ZZZ-ZZ が存在) を後ろに並べる。特殊ロケも実在のロケコードなので、
+  // 造語 (「仮想ロケ」等) にせずそのままの名前で見せる。
+  // 並び = ロケ合計フリー在庫の多い順。同ロケの期限違いロットは隣接させて期限の近い順 (先入先出)
   const isShelf = (r) => normalizeLocationDigits(r.location).length === 8;
-  const byFree = (a, b) => (Number(b.free) - Number(a.free))
+  const locKey = (r) => `${r.block}${r.location}`;
+  const locTotals = new Map();
+  for (const r of candidates) locTotals.set(locKey(r), (locTotals.get(locKey(r)) || 0) + Number(r.free));
+  const byLocThenExpiry = (a, b) => (locTotals.get(locKey(b)) - locTotals.get(locKey(a)))
     || String(a.location).localeCompare(String(b.location))
     || String(a.expiry || '9999').localeCompare(String(b.expiry || '9999'));
-  const rows = [...candidates.filter(isShelf).sort(byFree), ...candidates.filter((r) => !isShelf(r)).sort(byFree)];
+  const rows = [...candidates.filter(isShelf).sort(byLocThenExpiry), ...candidates.filter((r) => !isShelf(r)).sort(byLocThenExpiry)];
 
   const stamp = jstStamp(data.importedAt, now);
   const ageMin = Number.isFinite(Date.parse(data.importedAt || '')) ? (now.getTime() - Date.parse(data.importedAt)) / 60000 : null;
@@ -162,5 +165,14 @@ export function buildStockLocationsText(data, {
     return `・${label} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
   });
   if (rows.length > maxLines) lines.push(`…他${rows.length - maxLines}ロケ`);
-  return [header, ...lines].join('\n');
+  // LINEの本文上限5,000字を超えると返信ごと拒否される。超えそうなときだけ末尾から間引く
+  // (通常の在庫数では到達しない安全弁。丸めない方針の例外)
+  let text = [header, ...lines].join('\n');
+  if (text.length > 4500) {
+    let dropped = 0;
+    while (lines.length > 1 && [header, ...lines].join('\n').length > 4400) { lines.pop(); dropped++; }
+    lines.push(`…ほか${dropped}行 (文字数上限)`);
+    text = [header, ...lines].join('\n');
+  }
+  return text;
 }
