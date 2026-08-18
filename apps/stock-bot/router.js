@@ -184,14 +184,15 @@ export function buildStockReply(db, sku, now = new Date()) {
 const USAGE = '商品名の一部 (例: ティーツリー)、商品ID、またはバーコードを送ると在庫ロケーションを探します。';
 
 /**
- * MESSAGE から検索語を取り出す。旧形式は argumentText (メンション除去済み) が来るが、
- * アドオン形式では来ない → annotations の USER_MENTION 表示名で「@ボット名」を本文から除去。
- * (startIndex/length は文字数の数え方が環境依存のため使わない — 日本語名で中途切断の危険)
+ * MESSAGE から検索語を取り出す。旧形式の argumentText はメンション除去済みだが、
+ * アドオン形式では argumentText 自体が無い、または**メンションを含んだまま**届く
+ * (実機確認 2026-08-18) → どちらを採っても必ずメンション除去を通す。
+ * 除去は annotations の USER_MENTION 表示名ベース (startIndex/length は文字数の
+ * 数え方が環境依存のため使わない — 日本語名で中途切断の危険)
  */
 function messageQuery(message) {
   const arg = message?.argumentText;
-  if (typeof arg === 'string' && arg.trim()) return arg.trim();
-  let text = String(message?.text ?? '');
+  let text = (typeof arg === 'string' && arg.trim()) ? arg : String(message?.text ?? '');
   for (const a of (Array.isArray(message?.annotations) ? message.annotations : [])) {
     const dn = a?.type === 'USER_MENTION' ? a.userMention?.user?.displayName : null;
     // 1注釈 = 1除去 (最初の一致のみ)。全置換だと検索語側の同名文字列まで消える
@@ -199,7 +200,8 @@ function messageQuery(message) {
   }
   // annotations が無い/表示名が取れない場合の保険: 先頭の@トークンのみ除去。
   // 「@ボット名␣検索語」の空白区切り入力だけを想定した割り切り (メンションと検索語が
-  // 密着/句読点区切りの場合は除去しきれず0件応答になるが、本文が見えるので自己解決可能)
+  // 密着/句読点区切りの場合は除去しきれず0件応答になるが、本文が見えるので自己解決可能)。
+  // 旧形式で検索語自体が「@xxx 」で始まる場合も削られるが、商品検索に@始まりは実在しない前提
   return text.replace(/^\s*@\S+\s+/, '').trim();
 }
 
