@@ -77,6 +77,9 @@
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
           <div class="card-title"><%= b.folder_name || b.tb_key %></div>
+          <% if (b.hikiateClass) { %>
+            <div style="font-size:.8rem;color:#777;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;"><%= b.hikiateClass %></div>
+          <% } %>
           <div class="card-meta">
             <span>伝票 <b><%= b.done_slips %></b>/<b><%= b.slip_count %></b></span>
             <span>明細 <b><%= b.line_count %></b></span>

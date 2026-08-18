@@ -131,8 +131,11 @@ function api(handler) {
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listPackBatches(workDate);
-  // 梱包機ライン種別 (pas/melt/null)。梱包機バッチは作業ボタンをライン管理画面へ向ける
-  for (const b of batches) b.lineKind = lineKindOf(batchHikiateClass(getDB(), b));
+  // 引当分類名 (表示) とライン種別 (pas/melt/null — 作業ボタンの振り分け)
+  for (const b of batches) {
+    b.hikiateClass = batchHikiateClass(getDB(), b);
+    b.lineKind = lineKindOf(b.hikiateClass);
+  }
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
     username: req.session?.email || req.packingDevice?.label || '端末',
