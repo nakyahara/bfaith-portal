@@ -78,6 +78,35 @@ console.log('\n── handleChatEvent: MESSAGE ──');
 
   const empty = handleChatEvent({ type: 'MESSAGE', message: { text: '' } }, db, NOW);
   ok(empty.text.includes('商品名'), '空メッセージは使い方案内');
+
+  // アドオン形式: argumentText 無し+@メンション入り本文 → annotations の表示名で除去
+  const mentioned = handleChatEvent({ type: 'MESSAGE', message: {
+    text: '@在庫検索ボット ティーツリー',
+    annotations: [{ type: 'USER_MENTION', userMention: { user: { displayName: '在庫検索ボット' } } }],
+  } }, db, NOW);
+  ok(Array.isArray(mentioned.cardsV2), 'メンション除去して検索 (annotations経由)');
+
+  // annotations 無しでも先頭@トークンの保険で動く
+  const mentionedNoAnn = handleChatEvent({ type: 'MESSAGE', message: { text: '@在庫検索ボット ティーツリー' } }, db, NOW);
+  ok(Array.isArray(mentionedNoAnn.cardsV2), 'メンション除去して検索 (保険の正規表現)');
+
+  // メンションのみは使い方案内
+  const mentionOnly = handleChatEvent({ type: 'MESSAGE', message: {
+    text: '@在庫検索ボット',
+    annotations: [{ type: 'USER_MENTION', userMention: { user: { displayName: '在庫検索ボット' } } }],
+  } }, db, NOW);
+  ok(mentionOnly.text.includes('商品名'), 'メンションのみは使い方案内');
+
+  // ボット名と同じ文字列が検索語に含まれても消えない (1注釈=1除去)
+  const sameName = handleChatEvent({ type: 'MESSAGE', message: {
+    text: '@ティーツリー ティーツリー',
+    annotations: [{ type: 'USER_MENTION', userMention: { user: { displayName: 'ティーツリー' } } }],
+  } }, db, NOW);
+  ok(Array.isArray(sameName.cardsV2), 'ボット名=検索語でも検索語は残る');
+
+  // argumentText がある旧形式はそちらを優先 (@付き本文でも影響なし)
+  const withArg = handleChatEvent({ type: 'MESSAGE', message: { text: '@bot 10ml', argumentText: ' 10ml ' } }, db, NOW);
+  ok(withArg.text.includes('teatree10'), 'argumentText 優先は従来どおり');
 }
 
 console.log('\n── handleChatEvent: CARD_CLICKED ──');

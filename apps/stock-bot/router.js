@@ -177,6 +177,26 @@ export function buildStockReply(db, sku, now = new Date()) {
 
 const USAGE = '商品名の一部 (例: ティーツリー)、商品ID、またはバーコードを送ると在庫ロケーションを探します。';
 
+/**
+ * MESSAGE から検索語を取り出す。旧形式は argumentText (メンション除去済み) が来るが、
+ * アドオン形式では来ない → annotations の USER_MENTION 表示名で「@ボット名」を本文から除去。
+ * (startIndex/length は文字数の数え方が環境依存のため使わない — 日本語名で中途切断の危険)
+ */
+function messageQuery(message) {
+  const arg = message?.argumentText;
+  if (typeof arg === 'string' && arg.trim()) return arg.trim();
+  let text = String(message?.text ?? '');
+  for (const a of (Array.isArray(message?.annotations) ? message.annotations : [])) {
+    const dn = a?.type === 'USER_MENTION' ? a.userMention?.user?.displayName : null;
+    // 1注釈 = 1除去 (最初の一致のみ)。全置換だと検索語側の同名文字列まで消える
+    if (dn) text = text.replace(`@${dn}`, ' ');
+  }
+  // annotations が無い/表示名が取れない場合の保険: 先頭の@トークンのみ除去。
+  // 「@ボット名␣検索語」の空白区切り入力だけを想定した割り切り (メンションと検索語が
+  // 密着/句読点区切りの場合は除去しきれず0件応答になるが、本文が見えるので自己解決可能)
+  return text.replace(/^\s*@\S+\s+/, '').trim();
+}
+
 /** カード形式の候補リスト (ボタンタップで showStock を発火)。 */
 function buildCandidatesCard(candidates, hasMore) {
   const buttons = candidates.map((c) => ({
@@ -228,7 +248,7 @@ export function handleChatEvent(event, db, now = new Date()) {
     };
   }
   if (type === 'MESSAGE') {
-    const q = String(event.message?.argumentText ?? event.message?.text ?? '').trim();
+    const q = messageQuery(event.message);
     if (!q) return { text: USAGE };
     // 1文字検索は候補が広すぎ+全表LIKE走査の無駄撃ちなので案内を返す
     if (q.length < 2) return { text: `キーワードは2文字以上で送ってください。${USAGE}` };
