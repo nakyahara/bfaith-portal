@@ -107,6 +107,22 @@ console.log('\n── handleChatEvent: MESSAGE ──');
   // argumentText がある旧形式はそちらを優先 (@付き本文でも影響なし)
   const withArg = handleChatEvent({ type: 'MESSAGE', message: { text: '@bot 10ml', argumentText: ' 10ml ' } }, db, NOW);
   ok(withArg.text.includes('teatree10'), 'argumentText 優先は従来どおり');
+
+  // アドオン形式は argumentText がメンションを含んだまま届く (実機 2026-08-18) → 除去して検索
+  const argWithMention = handleChatEvent({ type: 'MESSAGE', message: {
+    text: '@在庫検索ボット ティーツリー',
+    argumentText: '@在庫検索ボット ティーツリー',
+    annotations: [{ type: 'USER_MENTION', userMention: { user: { displayName: '在庫検索ボット' } } }],
+  } }, db, NOW);
+  ok(JSON.stringify(argWithMention.cardsV2 || {}).includes('teatree20'),
+    'メンション入り argumentText でも除去して検索 (期待SKUの候補が返る)');
+
+  // annotations 無しでも保険の先頭@トークン除去が argumentText に効く
+  const argNoAnn = handleChatEvent({ type: 'MESSAGE', message: {
+    text: '@在庫検索ボット ティーツリー', argumentText: '@在庫検索ボット ティーツリー',
+  } }, db, NOW);
+  ok(JSON.stringify(argNoAnn.cardsV2 || {}).includes('teatree20'),
+    'annotations 無しの argumentText も保険で除去 (期待SKUの候補が返る)');
 }
 
 console.log('\n── handleChatEvent: CARD_CLICKED ──');
