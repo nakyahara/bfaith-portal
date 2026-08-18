@@ -4107,6 +4107,7 @@ console.log('── FBAサイクルリセット サーバ側検知 ──');
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, effective_at=excluded.effective_at`).run(v, v);
   const setFba = (kind, fetchedAt) => db.prepare('UPDATE mirror_pml_published SET fba_source_kind=?, fba_fetched_at=? WHERE id=1').run(kind, fetchedAt);
   const markerBackup = marker();
+  const fbaBackup = db.prepare('SELECT fba_source_kind, fba_fetched_at FROM mirror_pml_published WHERE id=1').get();
 
   // 1) live + fetched_at がサイクルより新しい → 任意のリクエストでサイクル前進 (at=fetched_at)
   const oldMarker = '2026-07-01T00:00:00.000Z';
@@ -4128,9 +4129,23 @@ console.log('── FBAサイクルリセット サーバ側検知 ──');
   await j('/api/cycle-issued');
   ok(marker() === oldMarker, 'FBA検知: サイクルより古いlive取得では発火しない', marker());
 
-  // 後片付け
-  setFba(null, null);
+  // 5) 既存ポーリング検知 (markCycleFbaJobDone) との共存: ポーリング検知は前進のみ・本検知は巻き戻さない
+  {
+    setMarker(oldMarker);
+    setFba('live', fetched);
+    await j('/api/cycle-issued'); // 本検知: marker=fetched
+    const { markCycleFbaJobDone } = await imp('apps/purchase-orders/ledger.js');
+    markCycleFbaJobDone('job-interplay-test', 'smoke'); // ポーリング検知: marker=now (>fetched)
+    const advanced = marker();
+    ok(Date.parse(advanced) > Date.parse(fetched), '共存: ポーリング検知はマーカーを前進させるだけ', advanced);
+    await j('/api/cycle-issued');
+    ok(marker() === advanced, '共存: 本検知は古いfetched_atでマーカーを巻き戻さない', marker());
+  }
+
+  // 後片付け (元のDB状態へ完全復元 — 後続テストへの順序依存を作らない)
+  setFba(fbaBackup ? fbaBackup.fba_source_kind : null, fbaBackup ? fbaBackup.fba_fetched_at : null);
   if (markerBackup != null) setMarker(markerBackup);
+  else db.prepare("DELETE FROM po_settings WHERE key='po_cycle_reset_at'").run();
   delete process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS;
 }
 
