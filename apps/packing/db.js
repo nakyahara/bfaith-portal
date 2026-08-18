@@ -331,16 +331,15 @@ export function getDB() {
   return db;
 }
 
-/** バッチ一覧: 指定作業日 + それ以前の未完了持ち越し。cancelled は当日分のみ。 */
+/** バッチ一覧: 指定作業日のみ (過去分は日付ピッカーで参照。中原さん指示 2026-08-18 で持ち越し表示を廃止)。 */
 export function listPackBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT COUNT(*) FROM pk_pack_slips s WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips
     FROM pk_pack_batches b
-    WHERE (b.work_date = ?
-        OR (b.work_date < ? AND b.status IN ('ready','packing','paused')))
-    ORDER BY b.work_date, b.id
-  `).all(workDate, workDate);
+    WHERE b.work_date = ?
+    ORDER BY b.id
+  `).all(workDate);
 }
 
 export function getPackBatch(id) {

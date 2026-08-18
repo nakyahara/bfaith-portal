@@ -129,8 +129,7 @@ function api(handler) {
 // ─── バッチ一覧 ───
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
-  const batches = listPackBatches(workDate)
-    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+  const batches = listPackBatches(workDate);
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
     username: req.session?.email || req.packingDevice?.label || '端末',
