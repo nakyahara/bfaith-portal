@@ -4098,6 +4098,42 @@ console.log('── ロジザード在庫 mirror 自動反映 ──');
   delete process.env.PO_LZ_MIRROR_MIN_PRODUCTS;
 }
 
+// ═══ FBA在庫更新のサイクルリセット サーバ側検知 (ポーリング5分打ち切りの取りこぼし対策) ═══
+console.log('── FBAサイクルリセット サーバ側検知 ──');
+{
+  process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS = '0'; // テストでは毎回チェック
+  const marker = () => db.prepare("SELECT value FROM po_settings WHERE key='po_cycle_reset_at'").get()?.value ?? null;
+  const setMarker = v => db.prepare(`INSERT INTO po_settings (key, value, effective_at, changed_by, reason) VALUES ('po_cycle_reset_at', ?, ?, NULL, 'test')
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, effective_at=excluded.effective_at`).run(v, v);
+  const setFba = (kind, fetchedAt) => db.prepare('UPDATE mirror_pml_published SET fba_source_kind=?, fba_fetched_at=? WHERE id=1').run(kind, fetchedAt);
+  const markerBackup = marker();
+
+  // 1) live + fetched_at がサイクルより新しい → 任意のリクエストでサイクル前進 (at=fetched_at)
+  const oldMarker = '2026-07-01T00:00:00.000Z';
+  const fetched = '2026-07-02T03:00:00.000Z';
+  setMarker(oldMarker);
+  setFba('live', fetched);
+  await j('/api/cycle-issued');
+  ok(marker() === fetched, 'FBA検知: live取得がサイクルより新しければ前進 (at=fba_fetched_at)', marker());
+  // 2) 冪等: 再アクセスしても変わらない
+  await j('/api/cycle-issued');
+  ok(marker() === fetched, 'FBA検知: 同じ取得時刻では二重リセットしない');
+  // 3) 朝同期 (daily) では発火しない
+  setMarker(oldMarker);
+  setFba('daily', fetched);
+  await j('/api/cycle-issued');
+  ok(marker() === oldMarker, 'FBA検知: fba_source_kind=daily (朝同期) では発火しない', marker());
+  // 4) fetched_at がサイクルより古い (検知済み) は発火しない
+  setFba('live', '2026-06-30T00:00:00.000Z');
+  await j('/api/cycle-issued');
+  ok(marker() === oldMarker, 'FBA検知: サイクルより古いlive取得では発火しない', marker());
+
+  // 後片付け
+  setFba(null, null);
+  if (markerBackup != null) setMarker(markerBackup);
+  delete process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS;
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
