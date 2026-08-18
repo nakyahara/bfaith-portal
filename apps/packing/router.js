@@ -27,7 +27,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns,
+  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal,
 } from './service.js';
 import { notifyShipChange, notifyTask } from './notify.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
@@ -250,6 +250,8 @@ router.get('/line/:id(\\d+)', (req, res) => {
     kind,
     hikiateClass,
     runs: listLineRuns(batch.id),
+    // 本日×同ラインの累計 (梱包機トータルカウンタとの突合用。日付でリセット)
+    dailyTotal: lineDailyTotal(batch.work_date, kind),
     statusLabels: STATUS_LABELS,
   });
 });
@@ -286,6 +288,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     // '' は未入力として null に落とす (Number('')===0 で「0件」と誤解釈しない — Codex medium)
     finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
     manualCount: req.body.manual_count == null || req.body.manual_count === '' ? null : Number(req.body.manual_count),
+    excludedCount: req.body.excluded_count == null || req.body.excluded_count === '' ? null : Number(req.body.excluded_count),
     note: req.body.note == null ? null : String(req.body.note).slice(0, 200),
   }, worker);
   // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため

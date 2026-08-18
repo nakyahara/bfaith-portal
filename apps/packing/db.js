@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -237,6 +237,14 @@ const MIGRATIONS = {
       updated_at    TEXT NOT NULL,
       UNIQUE (batch_id, phase)
     )`);
+  },
+  // v7: ライン運用改善 (中原さん指示 2026-08-18 実機フィードバック)。
+  // MELT仕分けは「他の方法で出荷する件数」を入力し、機械に流す件数=伝票数-除外を自動計算
+  7: () => {
+    db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN excluded_count INTEGER');
+    // v6時代の記録済み仕分け行をバックフィル (Codex medium: NULLのままだと「除外0件」と矛盾表示)
+    db.exec(`UPDATE pk_pack_line_runs SET excluded_count = planned_count - final_count
+      WHERE phase = 'sort' AND final_count IS NOT NULL AND excluded_count IS NULL`);
   },
 };
 

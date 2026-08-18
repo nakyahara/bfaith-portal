@@ -500,7 +500,7 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
 //     完了取消は理由つき別操作として PR3 で追加する)
 //   - 冪等: op_id (端末生成 ms+乱数)。同一 op_id の再送は保存済み結果を返す (picking と同思想)
 
-const LINE_EVENTS = ['line_sort_start', 'line_sort_done', 'line_start', 'line_done'];
+const LINE_EVENTS = ['line_sort_start', 'line_sort_done', 'line_start', 'line_stop', 'line_done'];
 // 伝票単位のイベント (梱包機バッチでは不可 — 伝票状態とライン工程の矛盾を作らない。Codex high)。
 // undo はライン専用の段階的取消として別実装、takeover/pause/resume/cancel は両方で使える
 const SLIP_ONLY_EVENTS = ['start', 'next', 'jump', 'ship_change',
@@ -533,6 +533,33 @@ export function batchHikiateClass(db, batch) {
 /** ライン工程の行 (sort/run)。 */
 export function listLineRuns(batchId) {
   return getDB().prepare('SELECT * FROM pk_pack_line_runs WHERE batch_id = ? ORDER BY phase DESC').all(batchId);
+}
+
+/**
+ * 本日 (作業日) ×同ライン種別の流し済み累計 — 梱包機のトータルカウンタとの突合用。
+ * 日付が変わるとリセット (中原さん指示 2026-08-18)。
+ * @returns { total: 出荷累計 (手動含む), machine: 機械通過累計 (=出荷-手動。カウンタと比較する数) }
+ */
+export function lineDailyTotal(workDate, kind) {
+  try {
+    const rows = getDB().prepare(`
+      SELECT r.final_count, COALESCE(r.manual_count, 0) AS manual_count, pb.hikiate_class
+      FROM pk_pack_line_runs r
+      JOIN pk_pack_batches b ON b.id = r.batch_id
+      LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
+      WHERE b.work_date = ? AND r.phase = 'run' AND r.final_count IS NOT NULL AND b.validity = 'valid'
+    `).all(workDate);
+    let total = 0;
+    let machine = 0;
+    for (const r of rows) {
+      if (lineKindOf(r.hikiate_class) !== kind) continue;
+      total += r.final_count;
+      machine += r.final_count - r.manual_count;
+    }
+    return { total, machine };
+  } catch {
+    return { total: 0, machine: 0 };   // pk_batches 未初期化環境
+  }
 }
 
 // 中断理由 (picking と同じ最小セット)
@@ -642,7 +669,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, qty, finalCount, manualCount, note }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, qty, finalCount, manualCount, excludedCount, note }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -664,6 +691,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
           && (pp.qty ?? null) === (qty ?? null)
           && (pp.finalCount ?? null) === (finalCount ?? null)
           && (pp.manualCount ?? null) === (manualCount ?? null)
+          && (pp.excludedCount ?? null) === (excludedCount ?? null)
           && (pp.note ?? null) === (note ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
@@ -763,16 +791,20 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         // 直近の記録から1段ずつ戻す: 流し終了→流し開始→仕分け完了→仕分け開始
         const sort = db.prepare("SELECT * FROM pk_pack_line_runs WHERE batch_id=? AND phase='sort'").get(batchId);
         const run = db.prepare("SELECT * FROM pk_pack_line_runs WHERE batch_id=? AND phase='run'").get(batchId);
-        if (run?.finished_at) {
-          db.prepare(`UPDATE pk_pack_line_runs SET finished_at=NULL, final_count=NULL, manual_count=NULL, updated_at=?
+        if (run?.final_count != null) {
+          // 件数記録の取消 → 入力画面へ戻す (停止時刻は保持)
+          db.prepare(`UPDATE pk_pack_line_runs SET final_count=NULL, manual_count=NULL, updated_at=?
             WHERE id=?`).run(now, run.id);
           db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
             .run(now, batchId);
+        } else if (run?.finished_at) {
+          // 停止の取消 → タイマー再開
+          db.prepare('UPDATE pk_pack_line_runs SET finished_at=NULL, updated_at=? WHERE id=?').run(now, run.id);
         } else if (run) {
           db.prepare('DELETE FROM pk_pack_line_runs WHERE id=?').run(run.id);
         } else if (sort?.finished_at) {
-          db.prepare(`UPDATE pk_pack_line_runs SET finished_at=NULL, final_count=NULL, updated_at=? WHERE id=?`)
-            .run(now, sort.id);
+          db.prepare(`UPDATE pk_pack_line_runs SET finished_at=NULL, final_count=NULL, excluded_count=NULL, updated_at=?
+            WHERE id=?`).run(now, sort.id);
         } else if (sort) {
           db.prepare('DELETE FROM pk_pack_line_runs WHERE id=?').run(sort.id);
         } else {
@@ -884,15 +916,16 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         if (!run) throw new PackError(409, 'not_started', '仕分けが開始されていません');
         if (run.finished_at) throw new PackError(409, 'already_done', '仕分けは完了済みです');
         requirePacking();
-        // 最終通過件数 = 仕分け中の配送変更で外れた分を差し引いた、機械に流す件数 (申し送り)。
+        // 入力は「他の方法で出荷する件数」(除外件数)。機械に流す件数 = 伝票数 - 除外 を
+        // 自動計算して final_count に持つ (中原さん指示 2026-08-18 — 現場は外した数を数えている)。
         // 未入力は 0 と区別して拒否 (Codex medium: Number(null)===0)
-        if (finalCount == null) throw new PackError(400, 'bad_count', '最終通過件数を入力してください');
-        const fc = Number(finalCount);
-        if (!Number.isInteger(fc) || fc < 0 || fc > run.planned_count) {
-          throw new PackError(400, 'bad_count', `最終通過件数は 0〜${run.planned_count} で入力してください`);
+        if (excludedCount == null) throw new PackError(400, 'bad_count', '他の方法で出荷する件数を入力してください (無ければ0)');
+        const ex = Number(excludedCount);
+        if (!Number.isInteger(ex) || ex < 0 || ex > run.planned_count) {
+          throw new PackError(400, 'bad_count', `他の方法で出荷する件数は 0〜${run.planned_count} で入力してください`);
         }
-        db.prepare(`UPDATE pk_pack_line_runs SET finished_at=?, final_count=?, note=?, worker=?, updated_at=?
-          WHERE id=?`).run(now, fc, note || run.note || null, worker, now, run.id);
+        db.prepare(`UPDATE pk_pack_line_runs SET finished_at=?, excluded_count=?, final_count=?, note=?, worker=?, updated_at=?
+          WHERE id=?`).run(now, ex, run.planned_count - ex, note || run.note || null, worker, now, run.id);
       } else if (event === 'line_start') {
         if (getRun('run')) throw new PackError(409, 'already_started', '機械流しは開始済みです');
         let planned = batch.slip_count;
@@ -904,10 +937,20 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         startBatchIfReady();
         db.prepare(`INSERT INTO pk_pack_line_runs (batch_id, phase, started_at, planned_count, worker, updated_at)
           VALUES (?, 'run', ?, ?, ?, ?)`).run(batchId, now, planned, worker, now);
-      } else {   // line_done
+      } else if (event === 'line_stop') {
+        // 流し終了 = まず時計を止めるだけ (件数はこの後の入力画面で。中原さん指示 2026-08-18:
+        // 終了の瞬間に時刻を確定し、それから件数を落ち着いて入力する)
         const run = getRun('run');
         if (!run) throw new PackError(409, 'not_started', '機械流しが開始されていません');
-        if (run.finished_at) throw new PackError(409, 'already_done', 'このラインは完了済みです');
+        if (run.finished_at) throw new PackError(409, 'already_done', 'すでに停止済みです');
+        requirePacking();
+        db.prepare('UPDATE pk_pack_line_runs SET finished_at=?, worker=?, updated_at=? WHERE id=?')
+          .run(clampedEventTime(clientAt, now, run.started_at), worker, now, run.id);
+      } else {   // line_done — 件数の記録 (line_stop 後のみ。入力するまでバッチは完了しない)
+        const run = getRun('run');
+        if (!run) throw new PackError(409, 'not_started', '機械流しが開始されていません');
+        if (!run.finished_at) throw new PackError(409, 'not_stopped', '先に「終了」で時間を止めてください');
+        if (run.final_count != null) throw new PackError(409, 'already_done', 'このラインは記録済みです');
         requirePacking();
         // 出荷完了件数 (紙台帳の「出荷完了件数」)。うち手動 = 機械を通さず手で流した分。
         // 未入力は 0 と区別して拒否 (Codex medium)
@@ -920,10 +963,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         if (!Number.isInteger(mc) || mc < 0 || mc > fc) {
           throw new PackError(400, 'bad_count', '手動で流した件数は完了件数以下で入力してください');
         }
-        db.prepare(`UPDATE pk_pack_line_runs SET finished_at=?, final_count=?, manual_count=?, note=?, worker=?, updated_at=?
-          WHERE id=?`).run(now, fc, mc, note || run.note || null, worker, now, run.id);
+        db.prepare(`UPDATE pk_pack_line_runs SET final_count=?, manual_count=?, note=?, worker=?, updated_at=?
+          WHERE id=?`).run(fc, mc, note || run.note || null, worker, now, run.id);
         db.prepare("UPDATE pk_pack_batches SET status='done', finished_at=?, updated_at=? WHERE id=?")
-          .run(now, now, batchId);
+          .run(run.finished_at, now, batchId);
       }
     } else if (event === 'start') {
       if (batch.status === 'packing') {
@@ -999,10 +1042,11 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
-        || finalCount != null || manualCount != null || note)
+        || finalCount != null || manualCount != null || excludedCount != null || note)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
           sku: sku || undefined, actualSku: actualSku || undefined, qty: qty ?? undefined,
-          finalCount: finalCount ?? undefined, manualCount: manualCount ?? undefined, note: note || undefined }) : null;
+          finalCount: finalCount ?? undefined, manualCount: manualCount ?? undefined,
+          excludedCount: excludedCount ?? undefined, note: note || undefined }) : null;
     db.prepare(`
       INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
