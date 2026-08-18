@@ -233,6 +233,14 @@ console.log('\n── Workspaceアドオン形式の互換 (adaptChatEvent / wra
   const legacy = adaptChatEvent({ type: 'MESSAGE', message: { text: 'a' } });
   ok(!legacy.addon && legacy.event.type === 'MESSAGE', '旧形式はそのまま');
 
+  // parameters のみ届くクリック (invokedFunction・buttonClickedPayload 無し) も CARD_CLICKED
+  const paramOnlyClick = adaptChatEvent({
+    chat: { user: { email: 'd.nakahara@b-faith.biz' } },
+    commonEventObject: { parameters: { method: 'showStock', sku: 'teatree20' } },
+  });
+  eq(paramOnlyClick.event.type, 'CARD_CLICKED', 'parameters.method だけでもクリックと判定');
+  ok(handleChatEvent(paramOnlyClick.event, db, NOW).text.includes('(teatree20)'), 'そのまま在庫応答まで通る');
+
   // wrapAddonResponse
   eq(wrapAddonResponse({}), {}, '空応答は空のまま');
   eq(wrapAddonResponse({ text: 'こんにちは' }),
@@ -242,6 +250,33 @@ console.log('\n── Workspaceアドオン形式の互換 (adaptChatEvent / wra
   ok(!!upd.hostAppDataAction.chatDataAction.updateMessageAction, 'UPDATE_MESSAGE は updateMessageAction');
   const card = wrapAddonResponse({ text: '候補', cardsV2: [{ cardId: 'x', card: {} }] });
   ok(Array.isArray(card.hostAppDataAction.chatDataAction.createMessageAction.message.cardsV2), 'cardsV2 も message に載る');
+
+  // カード内ボタンの function 名 → エンドポイントURLへ差し替え (アドオン形式の必須要件)
+  const btnCard = wrapAddonResponse({
+    text: '候補',
+    cardsV2: [{ cardId: 'x', card: { sections: [{ widgets: [{ buttonList: { buttons: [
+      { text: 'A', onClick: { action: { function: 'showStock', parameters: [{ key: 'method', value: 'showStock' }, { key: 'sku', value: 'teatree20' }] } } },
+      { text: 'B', onClick: { action: { function: 'noMethodParam', parameters: [{ key: 'id', value: '1' }] } } },
+    ] } }] }] } }],
+  });
+  const outButtons = btnCard.hostAppDataAction.chatDataAction.createMessageAction.message
+    .cardsV2[0].card.sections[0].widgets[0].buttonList.buttons;
+  ok(outButtons[0].onClick.action.function.startsWith('https://'), 'function は URL に差し替え');
+  eq(outButtons[0].onClick.action.parameters.filter((p) => p.key === 'method').length, 1, 'method 併記済みは重複追加しない');
+  eq(outButtons[1].onClick.action.parameters.find((p) => p.key === 'method')?.value, 'noMethodParam',
+    'method 未併記のボタンは function 名を method へ退避');
+  ok(outButtons[1].onClick.action.function.startsWith('https://'), '未併記側も URL に差し替え');
+
+  // 既存 method が function と食い違う場合は function 名で上書き (取り違え防止)
+  const mismatch = wrapAddonResponse({
+    cardsV2: [{ card: { sections: [{ widgets: [{ buttonList: { buttons: [
+      { text: 'C', onClick: { action: { function: 'realFn', parameters: [{ key: 'method', value: 'other' }] } } },
+    ] } }] }] } }],
+    text: 'x',
+  });
+  eq(mismatch.hostAppDataAction.chatDataAction.createMessageAction.message
+    .cardsV2[0].card.sections[0].widgets[0].buttonList.buttons[0].onClick.action.parameters
+    .find((p) => p.key === 'method')?.value, 'realFn', 'method 不一致は function 名で上書き');
 }
 
 console.log('\n── HTTPレベル (認証がparserより前・ドメイン制限・413) ──');

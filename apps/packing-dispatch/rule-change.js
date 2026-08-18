@@ -246,6 +246,12 @@ export function applyRuleChangeDecision(id, decision, email) {
 
 // ─── Chat カード ───
 
+// stock-bot のイベント受信URL (apps/stock-bot/router.js の CHAT_EVENTS_URL と同じ定義)。
+// アドオン形式のカードボタンは function にこのURLが必須。env は https URL のみ受け付ける
+const CHAT_EVENTS_URL = /^https:\/\//.test(process.env.STOCK_BOT_CHAT_EVENTS_URL || '')
+  ? process.env.STOCK_BOT_CHAT_EVENTS_URL
+  : 'https://bfaith-portal.onrender.com/apps/stock-bot/chat-events';
+
 const KIND_LABEL = { single: '単品ルール', assort: 'アソート学習' };
 const escHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -289,10 +295,11 @@ export async function postApprovalCard(row, { fetchFn = fetch } = {}) {
             {
               buttonList: {
                 buttons: [
-                  // method パラメータ併記: Workspaceアドオン形式のクリックイベントでは
-                  // function 名がそのまま届かないことがある (stock-bot/router.js の fn 解決参照)
-                  { text: '✅ 承認してDB反映', onClick: { action: { function: 'pdRuleApprove', parameters: [{ key: 'method', value: 'pdRuleApprove' }, { key: 'id', value: String(row.id) }] } } },
-                  { text: '却下', onClick: { action: { function: 'pdRuleReject', parameters: [{ key: 'method', value: 'pdRuleReject' }, { key: 'id', value: String(row.id) }] } } },
+                  // アドオン形式では function にエンドポイントURLが必須 (関数名だとクライアント側で
+                  // 「リクエストを処理できません」)。処理名は method パラメータで届ける
+                  // (受信側の解決順 = stock-bot/router.js 参照)
+                  { text: '✅ 承認してDB反映', onClick: { action: { function: CHAT_EVENTS_URL, parameters: [{ key: 'method', value: 'pdRuleApprove' }, { key: 'id', value: String(row.id) }] } } },
+                  { text: '却下', onClick: { action: { function: CHAT_EVENTS_URL, parameters: [{ key: 'method', value: 'pdRuleReject' }, { key: 'id', value: String(row.id) }] } } },
                 ],
               },
             },

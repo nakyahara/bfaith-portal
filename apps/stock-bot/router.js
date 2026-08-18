@@ -66,13 +66,19 @@ function jwtClaims(token) {
 const ADDON_ISSUERS = ['https://accounts.google.com', 'accounts.google.com'];
 const addonCallerEmail = (projectNumber) =>
   `service-${projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`;
+// このボットの公開エンドポイントURL。アドオン形式のカード内ボタン action.function は
+// エンドポイントURL必須 (関数名だとクライアント側で「リクエストを処理できません」になり、
+// サーバーに届かない)。上書き env は https URL のみ受け付ける (非URLだと全ボタンが壊れるため)
+const DEFAULT_CHAT_EVENTS_URL = 'https://bfaith-portal.onrender.com/apps/stock-bot/chat-events';
+export const CHAT_EVENTS_URL = /^https:\/\//.test(process.env.STOCK_BOT_CHAT_EVENTS_URL || '')
+  ? process.env.STOCK_BOT_CHAT_EVENTS_URL : DEFAULT_CHAT_EVENTS_URL;
 // audience は構成世代により「プロジェクト番号」か「エンドポイントURL」のどちらかで届く
-// (Codexレビュー high: 固定にすると構成次第で正規リクエストが全401)。両方を許可リストにする
-const addonAudiences = (projectNumber) => [
-  projectNumber,
-  process.env.STOCK_BOT_ADDON_AUDIENCE
-    || 'https://bfaith-portal.onrender.com/apps/stock-bot/chat-events',
-];
+// (Codexレビュー high: 固定にすると構成次第で正規リクエストが全401)。両方+任意の上書き値を許可
+const addonAudiences = (projectNumber) => {
+  const list = [projectNumber, CHAT_EVENTS_URL];
+  if (process.env.STOCK_BOT_ADDON_AUDIENCE) list.push(process.env.STOCK_BOT_ADDON_AUDIENCE);
+  return list;
+};
 
 // 鍵ローテーション対応の強制再取得は全体で1分に1回まで (でたらめな kid の連打で
 // Google への certs 取得を毎リクエスト強制させない)
@@ -361,7 +367,30 @@ export function adaptChatEvent(raw) {
     return p.message ? { event: { ...base, type: 'MESSAGE' }, addon: true } : { event: base, addon: true };
   }
   if (common.invokedFunction) return asClick();   // payload 無しでクリック情報のみの防御
+  // invokedFunction すら無く parameters だけ届く形もある (function=URL化した場合など)
+  if (common.parameters?.method || common.parameters?.__action_method_name__) return asClick();
   return { event: base, addon: true };   // 未知のpayloadは type 無し → handleChatEvent が空応答
+}
+
+/**
+ * アドオン形式ではカード内ボタンの onClick.action.function にエンドポイントURLが必須
+ * (関数名のままだとGoogleクライアント側で「リクエストを処理できません」になり、
+ * サーバーに届かない — 実機で確認)。関数名は method パラメータへ退避して URL に差し替える
+ */
+export function rewriteCardActionsForAddon(node) {
+  if (Array.isArray(node)) { node.forEach(rewriteCardActionsForAddon); return node; }
+  if (!node || typeof node !== 'object') return node;
+  const a = node.onClick?.action;
+  if (a && typeof a.function === 'string' && !/^https?:\/\//.test(a.function)) {
+    const params = Array.isArray(a.parameters) ? a.parameters : (a.parameters = []);
+    // function 名が処理名の正 — 既存 method が食い違っていても上書き (取り違え防止)
+    const existing = params.find((p) => p?.key === 'method');
+    if (existing) existing.value = a.function;
+    else params.push({ key: 'method', value: a.function });
+    a.function = CHAT_EVENTS_URL;
+  }
+  for (const v of Object.values(node)) rewriteCardActionsForAddon(v);
+  return node;
 }
 
 /** 旧形式の応答 → アドオン形式 (hostAppDataAction) に包む。空応答は空のまま。 */
@@ -369,7 +398,7 @@ export function wrapAddonResponse(out) {
   if (!out || (!out.text && !out.cardsV2)) return {};
   const message = {};
   if (out.text) message.text = out.text;
-  if (out.cardsV2) message.cardsV2 = out.cardsV2;
+  if (out.cardsV2) message.cardsV2 = rewriteCardActionsForAddon(out.cardsV2);
   const action = out.actionResponse?.type === 'UPDATE_MESSAGE'
     ? { updateMessageAction: { message } }
     : { createMessageAction: { message } };
@@ -391,8 +420,10 @@ router.post('/chat-events', async (req, res) => {
   }
   const send = (out) => res.json(addon ? wrapAddonResponse(out) : out);
   if (addon) {
-    // 新形式は形式差異を後から追えるように1行だけ残す (本文・メール値は出さない)
-    console.log(`[stock-bot] addonイベント type=${event.type || '不明'} email=${event.user?.email ? 'あり' : '無し'} space=${event.space?.name || '不明'}`);
+    // 新形式は形式差異を後から追えるように1行だけ残す (本文・メール値は出さない)。
+    // type 不明時は payload のキー構成も出す (形式差異の一次情報)
+    const shape = event.type ? '' : ` chatKeys=${Object.keys(raw.chat || {}).join('+') || '-'} commonKeys=${Object.keys(raw.commonEventObject || {}).join('+') || '-'}`;
+    console.log(`[stock-bot] addonイベント type=${event.type || '不明'} email=${event.user?.email ? 'あり' : '無し'} space=${event.space?.name || '不明'}${shape}`);
   }
   // 社内ドメイン限定 (Chat アプリの公開設定と二重の防御)。検索・ボタン操作は発言者メール必須
   // (fail-closed)。ADDED_TO_SPACE 等の管理イベントのみメール無しを許容
