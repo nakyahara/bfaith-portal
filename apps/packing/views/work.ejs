@@ -221,7 +221,7 @@
     <div class="box">
       <h2>配送方法の変更依頼</h2>
       <div id="shipStep1">
-        <div style="color:#868e96; font-size:15px; margin-bottom:10px">この伝票を保留して事務へ変更を依頼します。どの配送方法にしますか?</div>
+        <div style="color:#868e96; font-size:15px; margin-bottom:10px">事務へ変更を依頼します (商品と納品書は変更待ちの棚へ)。どの配送方法にしますか?</div>
         <div class="reason-grid" id="shipMethods"></div>
       </div>
       <div id="shipStep2" style="display:none">
@@ -602,6 +602,9 @@
     }
 
     function applyServerResult(body) {
+      if (body.shipNotify === 'failed') {
+        showToast('🚨 事務へのGChat通知に失敗しました。口頭かチャットで直接伝えてください (自動再送も試みます)');
+      }
       const before = `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`;
       currentSeq = body.currentSeq;
       if (Array.isArray(body.doneSeqs)) {
@@ -917,7 +920,7 @@
       render();
     });
 
-    // ── ④ 配送方法変更 (伝票を保留して事務へ依頼) ──
+    // ── ④ 配送方法変更 (記録+GChat通知のみ。現物は変更待ちの棚へ) ──
     let shipProposed = null;
     $('shipBtn').addEventListener('click', () => {
       if (paused || !worker) return;
@@ -944,20 +947,98 @@
       btn.addEventListener('click', () => {
         $('shipOverlay').style.display = 'none';
         if (!shipProposed) return;
-        const seq = viewSeq;
-        enqueue('ship_change', seq, { proposed_method: shipProposed, reason: btn.dataset.reason });
-        doneSet.delete(seq);   // 完了済みへの依頼は完了を取り消して保留になる
-        heldSet.add(seq);
-        $('doneOverlay').style.display = 'none';
-        showToast(`伝票 ${bySeq.get(seq).neSlipNo} を保留し、事務へ依頼しました`);
-        currentSeq = minPending();
-        const next = nextPendingAfter(seq);
-        if (next != null) { viewSeq = next; render(); }
-        else {
-          render();
-          showToast('未処理の伝票がありません (保留の対応待ち)');
-        }
+        enqueue('ship_change', viewSeq, { proposed_method: shipProposed, reason: btn.dataset.reason });
+        // 保留にはしない (#847): 商品と納品書を変更待ちの棚へ置き、伝票はそのまま「次へ」で完了する
+        showToast('事務へ依頼しました。商品と納品書は変更待ちの棚へ置き、「次へ」で完了してください');
+        // ⑥ この構成のルール自体も変える? (毎回この配送方法になるパターン)
+        setTimeout(() => {
+          if (confirm('この商品構成の「恒久ルール」も変更申請しますか?\n(承認されると次回から自動でその配送方法になります)')) {
+            openRuleOverlay();
+          }
+        }, 50);
       });
+    });
+
+
+    // ── ⑥ 恒久ルール変更の申請 (モール/数量帯/配送方法/梱包機をセレクト→GChat承認カード) ──
+    let ruleOptions = null;
+    let ruleSlipSeq = null;
+    async function loadRuleOptions() {
+      if (ruleOptions) return ruleOptions;
+      const res = await fetch('/apps/packing/api/rule-change/options');
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `選択肢の取得に失敗 (${res.status})`);
+      ruleOptions = body;
+      return body;
+    }
+    function guessMall(mallName) {
+      const m = String(mallName || '');
+      if (m.includes('楽天')) return 'rakuten';
+      if (m.includes('Amazon') || m.includes('amazon') || m.includes('アマゾン')) return 'amazon';
+      return 'yahoo';   // Yahoo/auPay/Qoo10 等は yahoo グループ運用
+    }
+    async function openRuleOverlay() {
+      const sl = bySeq.get(viewSeq);
+      ruleSlipSeq = viewSeq;
+      let opt;
+      try { opt = await loadRuleOptions(); }
+      catch (e) { showToast(e.message); return; }
+      const totalQty = sl.lines.reduce((a, l) => a + l.qty, 0);
+      $('ruleDesc').textContent = sl.lines.length === 1
+        ? `単品ルール: ${sl.lines[0].name} (この商品×モール×数量帯の配送方法を変更)`
+        : `アソート学習: この${sl.lines.length}種の組み合わせの配送方法を登録`;
+      $('ruleMall').innerHTML = (opt.mallGroups || []).map((m) =>
+        `<option value="${esc(m)}" ${m === guessMall(sl.mall) ? 'selected' : ''}>${esc(m)}</option>`).join('');
+      $('ruleQmin').innerHTML = Array.from({ length: 9 }, (_, i) =>
+        `<option value="${i + 1}" ${i + 1 === totalQty ? 'selected' : ''}>${i + 1}</option>`).join('');
+      $('ruleQmax').innerHTML = ['<option value="">∞ (以上)</option>']
+        .concat(Array.from({ length: 9 }, (_, i) =>
+          `<option value="${i + 1}" ${i + 1 === totalQty ? 'selected' : ''}>${i + 1}</option>`)).join('');
+      $('ruleMethod').innerHTML = (opt.methods || []).map((m) =>
+        `<option value="${esc(m.code)}">${esc(m.name)}</option>`).join('');
+      $('ruleMachine').innerHTML = (opt.machines || []).map((m) =>
+        `<option value="${esc(m.code)}" ${m.code === 'manual' ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
+      // 数量帯セレクトは単品のみ意味を持つ (アソートは組み合わせ単位)
+      $('ruleQmin').disabled = $('ruleQmax').disabled = sl.lines.length > 1;
+      $('ruleWarn').style.display = 'none';
+      $('ruleOverlay').style.display = 'flex';
+    }
+    function ruleConstraintCheck() {
+      // 「梱包機ならネコポス」制約の先回り表示 (サーバー側でも検証される)
+      const machine = $('ruleMachine').value;
+      const method = $('ruleMethod').value;
+      const bad = machine !== 'manual' && method !== 'nekopos';
+      $('ruleWarn').style.display = bad ? 'block' : 'none';
+      return !bad;
+    }
+    $('ruleMethod').addEventListener('change', ruleConstraintCheck);
+    $('ruleMachine').addEventListener('change', ruleConstraintCheck);
+    $('ruleCancel').addEventListener('click', () => { $('ruleOverlay').style.display = 'none'; });
+    $('ruleSubmit').addEventListener('click', async () => {
+      if (!ruleConstraintCheck()) { showToast('梱包機を使う場合はネコポスを選んでください'); return; }
+      $('ruleSubmit').disabled = true;
+      try {
+        const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/rule-change`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            slip_seq: ruleSlipSeq,
+            worker_name: worker,
+            mall_group: $('ruleMall').value,
+            qty_min: Number($('ruleQmin').value),
+            qty_max: $('ruleQmax').value === '' ? null : Number($('ruleQmax').value),
+            shipping_method_code: $('ruleMethod').value,
+            packing_machine_code: $('ruleMachine').value,
+          }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) { showToast(body.error || `申請に失敗しました (${res.status})`); return; }
+        $('ruleOverlay').style.display = 'none';
+        showToast(body.cardPosted
+          ? `承認依頼 #${body.id} を送信しました (GChatの承認カードから反映されます)`
+          : `承認依頼 #${body.id} を受け付けました (⚠GChatカードの投稿に失敗 — 管理者に連絡してください)`);
+      } finally {
+        $('ruleSubmit').disabled = false;
+      }
     });
 
     // ── 伝票検索 (ズレ回復) ──

@@ -203,18 +203,23 @@ export function handleChatEvent(event, db, now = new Date()) {
 
 // ─── 配送ルール変更の承認 (packing-dispatch連携・遅延import) ───
 
-// 承認者の制限 (任意)。env PD_RULE_APPROVERS="a@b-faith.biz,c@b-faith.biz" — 未設定なら
-// 社内ドメイン (既存チェック済み) の全員が承認できる
+// 承認者の制限 — fail-closed (Codexレビュー high: 本番の配送ルールを書き換える操作のため、
+// PD_RULE_APPROVERS 未設定なら誰も承認できない)。カンマ区切りメールで指定
 function ruleApproverAllowed(email) {
   const raw = String(process.env.PD_RULE_APPROVERS || '').trim();
-  if (!raw) return true;
+  if (!raw) return false;
   return raw.toLowerCase().split(',').map((s) => s.trim()).includes(String(email || '').toLowerCase());
 }
 
 async function handleRuleDecision(fn, params, event) {
   const email = String(event.user?.email || '');
+  // 承認カードを流すスペース以外からのボタンは受けない (別スペースへの転送・偽カード対策)
+  const expectSpace = String(process.env.PD_RULE_CHANGE_SPACE || '');
+  if (!expectSpace || event.space?.name !== expectSpace) {
+    return { actionResponse: { type: 'NEW_MESSAGE' }, text: 'このスペースでは承認操作を受け付けていません。' };
+  }
   if (!ruleApproverAllowed(email)) {
-    return { actionResponse: { type: 'NEW_MESSAGE' }, text: `承認権限がありません (${email})。PD_RULE_APPROVERS を確認してください。` };
+    return { actionResponse: { type: 'NEW_MESSAGE' }, text: `承認権限がありません (${email})。管理者が PD_RULE_APPROVERS に追加すると使えます。` };
   }
   try {
     const { applyRuleChangeDecision } = await import('../packing-dispatch/rule-change.js');
