@@ -15,7 +15,8 @@ process.env.DATA_DIR = tmpDir;
 
 const { initMirrorDB, getMirrorDB } = await import('../warehouse-mirror/db.js');
 const routerMod = await import('./router.js');
-const { searchProducts, buildStockReply, handleChatEvent, makeStockBotAuth, checkRateLimit } = routerMod;
+const { searchProducts, buildStockReply, handleChatEvent, makeStockBotAuth, checkRateLimit,
+  adaptChatEvent, wrapAddonResponse, userEmailFromIdToken } = routerMod;
 const stockBotRouter = routerMod.default;
 
 let failed = 0;
@@ -65,7 +66,9 @@ console.log('\n── handleChatEvent: MESSAGE ──');
   eq(buttons.length, 2, '2件はボタン2つ');
   ok(buttons[0].text.includes('20ml') && buttons[0].text.includes('フリー245'), `ボタン表記: ${buttons[0].text}`);
   eq(buttons[0].onClick.action.function, 'showStock', 'タップで showStock');
-  eq(buttons[0].onClick.action.parameters, [{ key: 'sku', value: 'teatree20' }], 'パラメータにSKU');
+  eq(buttons[0].onClick.action.parameters,
+    [{ key: 'method', value: 'showStock' }, { key: 'sku', value: 'teatree20' }],
+    'パラメータに method 併記+SKU (アドオン形式で function 名が届かない対策)');
 
   const many = handleChatEvent({ type: 'MESSAGE', message: { text: 'ハッカ油テスト' } }, db, NOW);
   const manyButtons = many.cardsV2[0].card.sections[0].widgets[0].buttonList.buttons;
@@ -96,6 +99,20 @@ console.log('\n── handleChatEvent: CARD_CLICKED ──');
 
   const badFn = handleChatEvent({ type: 'CARD_CLICKED', common: { invokedFunction: 'other' } }, db, NOW);
   ok(badFn.text.includes('もう一度'), '未知のボタンはエラー案内');
+
+  // アドオン形式: invokedFunction が URL で届いても method パラメータで解決できる
+  const byMethod = handleChatEvent({
+    type: 'CARD_CLICKED',
+    common: { invokedFunction: 'https://example.com/endpoint', parameters: { method: 'showStock', sku: 'teatree20' } },
+  }, db, NOW);
+  ok(byMethod.text.includes('(teatree20)'), 'method パラメータ優先で showStock 解決');
+
+  // アドオン移行時の旧 function 名の受け皿 (__action_method_name__)
+  const byLegacyName = handleChatEvent({
+    type: 'CARD_CLICKED',
+    common: { parameters: { __action_method_name__: 'showStock', sku: 'teatree10' } },
+  }, db, NOW);
+  ok(byLegacyName.text.includes('(teatree10)'), '__action_method_name__ でも解決');
 }
 
 console.log('\n── handleChatEvent: その他イベント ──');
@@ -123,6 +140,79 @@ console.log('\n── 1文字検索とレート制限 ──');
   ok(!checkRateLimit('space-A', t0 + 5_000), '同一スペース21回目/分は制限');
   ok(checkRateLimit('space-B', t0 + 5_000), '別スペースは独立');
   ok(checkRateLimit('space-A', t0 + 61_000), '1分経過でリセット');
+}
+
+console.log('\n── Workspaceアドオン形式の互換 (adaptChatEvent / wrapAddonResponse) ──');
+{
+  // MESSAGE: chat.messagePayload → 旧形式 MESSAGE (email 無しはそのまま = 補完はルート側で署名検証つき)
+  const msg = adaptChatEvent({
+    chat: {
+      user: { name: 'users/1', displayName: '中原', type: 'HUMAN' },
+      messagePayload: {
+        message: { text: '@在庫検索ボット ひのき', argumentText: ' ひのき' },
+        space: { name: 'spaces/AAQAoXoR0f4' },
+      },
+    },
+  });
+  ok(msg.addon, 'アドオン形式を検出');
+  eq(msg.event.type, 'MESSAGE', 'messagePayload → MESSAGE');
+  eq(msg.event.user.email, undefined, 'email 無しは補完しない (未検証decodeはしない)');
+  eq(msg.event.space.name, 'spaces/AAQAoXoR0f4', 'space を引き上げ');
+  eq(msg.event.message.argumentText, ' ひのき', 'message はそのまま');
+
+  // chat.user の email はそのまま通る
+  const withEmail = adaptChatEvent({
+    chat: { user: { email: 'x@b-faith.biz' }, messagePayload: { message: { text: 'a' }, space: { name: 'spaces/x' } } },
+  });
+  eq(withEmail.event.user.email, 'x@b-faith.biz', 'chat.user.email はそのまま');
+
+  // userIdToken の email は署名検証済みのみ採用 (fail-closed)
+  const b64u = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const fakeToken = `${b64u({ alg: 'RS256' })}.${b64u({ email: 'x@b-faith.biz', email_verified: true })}.sig`;
+  eq(await userEmailFromIdToken(fakeToken), '', '署名検証に通らないトークンは email 空 (fail-closed)');
+  eq(await userEmailFromIdToken(''), '', 'トークン無しは空');
+  const okClient = { verifyIdToken: async () => ({ getPayload: () => ({ email: 'y@b-faith.biz', email_verified: true }) }) };
+  eq(await userEmailFromIdToken('tok', okClient), 'y@b-faith.biz', '検証済みトークンの email を採用');
+  const unverified = { verifyIdToken: async () => ({ getPayload: () => ({ email: 'y@b-faith.biz', email_verified: false }) }) };
+  eq(await userEmailFromIdToken('tok', unverified), '', 'email_verified=false は不採用');
+
+  // CARD_CLICKED: buttonClickedPayload + commonEventObject (parameters は map 形式)
+  const click = adaptChatEvent({
+    chat: {
+      user: { email: 'd.nakahara@b-faith.biz' },
+      buttonClickedPayload: { message: { space: { name: 'spaces/AAQAoXoR0f4' } } },
+    },
+    commonEventObject: { invokedFunction: 'showStock', parameters: { sku: 'teatree20' } },
+  });
+  eq(click.event.type, 'CARD_CLICKED', 'buttonClickedPayload → CARD_CLICKED');
+  eq(click.event.common.invokedFunction, 'showStock', 'invokedFunction を common へ');
+  eq(click.event.common.parameters, { sku: 'teatree20' }, 'parameters map をそのまま');
+  eq(click.event.space.name, 'spaces/AAQAoXoR0f4', 'space は message.space からも補完');
+  const clickOut = handleChatEvent(click.event, db, NOW);
+  ok(clickOut.text.includes('(teatree20)'), '変換後イベントで既存ロジックが動く');
+
+  // ADDED_TO_SPACE / appCommand / 未知payload
+  eq(adaptChatEvent({ chat: { addedToSpacePayload: { space: { name: 'spaces/x' } } } }).event.type,
+    'ADDED_TO_SPACE', 'addedToSpacePayload → ADDED_TO_SPACE');
+  eq(adaptChatEvent({ chat: { appCommandPayload: {} } }).event.type, undefined, '本文なし appCommand は type 無し (空応答へ)');
+  eq(adaptChatEvent({
+    chat: { appCommandPayload: { message: { text: '/zaiko ひのき' }, space: { name: 'spaces/x' } } },
+    commonEventObject: { invokedFunction: 'https://example.com/x' },
+  }).event.type, 'MESSAGE', 'スラッシュコマンドは MESSAGE (invokedFunction 同居でも CARD_CLICKED に誤分類しない)');
+
+  // 旧形式は素通し
+  const legacy = adaptChatEvent({ type: 'MESSAGE', message: { text: 'a' } });
+  ok(!legacy.addon && legacy.event.type === 'MESSAGE', '旧形式はそのまま');
+
+  // wrapAddonResponse
+  eq(wrapAddonResponse({}), {}, '空応答は空のまま');
+  eq(wrapAddonResponse({ text: 'こんにちは' }),
+    { hostAppDataAction: { chatDataAction: { createMessageAction: { message: { text: 'こんにちは' } } } } },
+    'テキストは createMessageAction に包む');
+  const upd = wrapAddonResponse({ actionResponse: { type: 'UPDATE_MESSAGE' }, text: '✅承認済み' });
+  ok(!!upd.hostAppDataAction.chatDataAction.updateMessageAction, 'UPDATE_MESSAGE は updateMessageAction');
+  const card = wrapAddonResponse({ text: '候補', cardsV2: [{ cardId: 'x', card: {} }] });
+  ok(Array.isArray(card.hostAppDataAction.chatDataAction.createMessageAction.message.cardsV2), 'cardsV2 も message に載る');
 }
 
 console.log('\n── HTTPレベル (認証がparserより前・ドメイン制限・413) ──');
@@ -163,6 +253,34 @@ console.log('\n── HTTPレベル (認証がparserより前・ドメイン制�
     { Authorization: 'Bearer good-token' });
   const insiderBody = await insider.json();
   ok(Array.isArray(insiderBody.cardsV2), '社内ユーザーの検索は候補カードが返る');
+
+  // アドオン形式: 応答が hostAppDataAction に包まれる
+  const addonSearch = await post({
+    chat: {
+      user: { email: 'd.nakahara@b-faith.biz' },
+      messagePayload: { message: { text: 'ティーツリー' }, space: { name: 'spaces/addon-test' } },
+    },
+  }, { Authorization: 'Bearer good-token' });
+  const addonBody = await addonSearch.json();
+  const addonMsg = addonBody.hostAppDataAction?.chatDataAction?.createMessageAction?.message;
+  ok(Array.isArray(addonMsg?.cardsV2), 'アドオン形式の検索は createMessageAction で候補カードが返る');
+
+  const addonOutsider = await post({
+    chat: {
+      user: { email: 'x@gmail.com' },
+      messagePayload: { message: { text: 'ティーツリー' }, space: { name: 'spaces/addon-test' } },
+    },
+  }, { Authorization: 'Bearer good-token' });
+  const outText = (await addonOutsider.json()).hostAppDataAction?.chatDataAction?.createMessageAction?.message?.text;
+  ok(String(outText).includes('社内ユーザー'), 'アドオン形式でも社外ドメイン拒否 (応答も包まれる)');
+
+  // email 無し + 検証に通らない userIdToken → fail-closed の案内 (アドオン形式で包まれる)
+  const addonNoEmail = await post({
+    chat: { user: { name: 'users/9' }, messagePayload: { message: { text: 'ティーツリー' }, space: { name: 'spaces/addon-test' } } },
+    authorizationEventObject: { userIdToken: 'garbage.token.here' },
+  }, { Authorization: 'Bearer good-token' });
+  const noEmailText = (await addonNoEmail.json()).hostAppDataAction?.chatDataAction?.createMessageAction?.message?.text;
+  ok(String(noEmailText).includes('利用者を確認できなかった'), '未検証 userIdToken は email 扱いしない (fail-closed)');
 
   const big = await post(
     `{"type":"MESSAGE","pad":"${'x'.repeat(300 * 1024)}"}`,
