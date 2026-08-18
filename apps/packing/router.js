@@ -263,8 +263,8 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     notifyTask(result.taskNotify, worker)
       .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
   }
-  // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)。
-  // 商品明細つき (中原さん指示 2026-08-17)。事務の画面管理は廃止 — 現物=変更待ち棚の運用
+  // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
+  // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)
   if (req.body.event === 'ship_change' && !result.replayed) {
     const row = getDB().prepare(
       'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
@@ -275,11 +275,22 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(Number(req.params.id), Number(req.body.slip_seq));
-      notifyShipChange({
-        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
-        currentMethod: row.current_method, proposedMethod: row.proposed_method,
-        reason: row.reason, worker, lines,
-      }).catch((e) => console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`));
+      try {
+        const sent = await notifyShipChange({
+          folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+          currentMethod: row.current_method, proposedMethod: row.proposed_method,
+          reason: row.reason, worker, lines,
+        });
+        getDB().prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=? WHERE id=?')
+          .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null,
+            sent ? null : 'webhook未設定', row.id);
+        if (!sent) result.shipNotify = 'failed';
+      } catch (e) {
+        console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`);
+        getDB().prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
+          .run(String(e.message).slice(0, 200), row.id);
+        result.shipNotify = 'failed';
+      }
     }
   }
   res.json({ ok: true, ...result });

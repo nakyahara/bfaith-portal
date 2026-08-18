@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -211,6 +211,12 @@ const MIGRATIONS = {
       updated_at        TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_incidents_batch ON pk_pack_incidents(batch_id, status)');
+  },
+  // v5: ④通知の配送保証 (Codexレビュー high: 事務キュー廃止後、GChat失敗で依頼が事実上消える)。
+  // 通知成否を行に記録し、失敗分はポーラーが再送する
+  5: () => {
+    db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notified_at TEXT');
+    db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notify_error TEXT');
   },
 };
 

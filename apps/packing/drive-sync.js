@@ -16,6 +16,7 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
+import { notifyShipChange } from './notify.js';
 import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
 
@@ -176,6 +177,44 @@ async function pingJobsMonitor(fetchFn = fetch) {
   }
 }
 
+/**
+ * ④通知の再送 (直近2日・未通知のみ・1周期3件まで)。
+ * 事務キュー廃止後の配送保証 (Codexレビュー high) — DBの行が正本で、通知はここで追いつく
+ */
+async function retryShipChangeNotify() {
+  const db = getDB();
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT * FROM pk_pack_ship_changes
+      WHERE notified_at IS NULL AND created_at >= datetime('now', '-2 days')
+      ORDER BY id LIMIT 3
+    `).all();
+  } catch { return; }   // v5未適用
+  for (const row of rows) {
+    try {
+      const lines = db.prepare(`
+        SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
+        FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
+      `).all(row.batch_id, row.slip_seq);
+      const sent = await notifyShipChange({
+        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+        currentMethod: row.current_method, proposedMethod: row.proposed_method,
+        reason: `${row.reason} (再送)`, worker: row.requested_by, lines,
+      });
+      if (sent) {
+        db.prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=NULL WHERE id=?')
+          .run(utcNow(), row.id);
+        console.log(`[packing-drive-poller] 配送変更通知を再送: ${row.ne_slip_no}`);
+      }
+    } catch (e) {
+      db.prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
+        .run(String(e.message).slice(0, 200), row.id);
+    }
+  }
+}
+
 export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
@@ -190,6 +229,7 @@ export function startPackingDrivePoller() {
       _status.lastStats = await pollOnce();
       _status.lastAt = utcNow();
       _status.lastError = null;
+      await retryShipChangeNotify();
       await pingJobsMonitor();
     } catch (e) {
       _status.lastError = String(e.message).slice(0, 300);
