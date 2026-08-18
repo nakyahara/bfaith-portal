@@ -28,6 +28,11 @@
     details.cls summary { cursor: pointer; color: #1971c2; font-size: 0.9em; }
     details.cls table { margin: 6px 0 10px; }
     .note { background: #fff9db; border-radius: 8px; padding: 10px 12px; font-size: 0.85em; margin-bottom: 16px; }
+    /* スマホ: 列の多いテーブルは画面に収めず横スクロール */
+    .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .scroll-x table.pk-list th, .scroll-x table.pk-list td { white-space: nowrap; }
+    .scroll-x table.pk-list details.cls table th,
+    .scroll-x table.pk-list details.cls table td { white-space: normal; }
     table.heatmap td.cell { text-align: center; }
     table.heatmap td.cell .cellq { display: block; font-size: 0.72em; color: #495057; }
     table.heatmap td.cell.prov { color: #868e96; }
@@ -96,6 +101,7 @@
     </div>
 
     <h2>作業者別 (速さ指数の高い順・参考値は末尾)</h2>
+    <div class="scroll-x">
     <table class="pk-list">
       <thead>
         <tr>
@@ -141,6 +147,7 @@
         <% } %>
       </tbody>
     </table>
+    </div>
 
     <h2>引当分類別 × 作業者 ヒートマップ</h2>
     <p class="muted" style="font-size:0.85em; margin:0 0 8px">
@@ -160,7 +167,7 @@
         return provisional ? `hsl(${hue}, 45%, 94%)` : `hsl(${hue}, 70%, 85%)`;
       };
     %>
-    <div style="overflow-x:auto">
+    <div class="scroll-x">
     <table class="pk-list heatmap">
       <thead>
         <tr>

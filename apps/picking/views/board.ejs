@@ -99,6 +99,53 @@
 
     footer { flex: 0 0 auto; font-size: 1.5vh; color: var(--muted); display: flex; gap: 1.6vw; align-items: center; }
     .err { color: var(--bad); }
+
+    /* ─────────────────────────────────────────────────────────────
+       スマホ・縦画面 (手元での確認用)。
+       既定のレイアウトは横長モニター前提で vh/vw + overflow:hidden の
+       「1画面に収める」設計 — 縦画面ではカラムが潰れて読めないため、
+       縦積み + ページスクロールに切り替え、フォントも px 固定にする。
+       ヒートマップだけは収めるのを諦めて横スクロール (分類列は左に固定)。 */
+    @media (max-width: 900px), (orientation: portrait) {
+      html, body { height: auto; min-height: 100%; }
+      body { overflow: auto; padding: 12px; gap: 12px; }
+      header { flex-wrap: wrap; gap: 4px 12px; }
+      header h1 { font-size: 20px; }
+      header .range { font-size: 13px; }
+      header .right { font-size: 13px; gap: 10px; }
+      main { grid-template-columns: 1fr; gap: 12px; flex: none; }
+      .col { gap: 12px; }
+      .panel { border-radius: 10px; padding: 12px; }
+      .panel h2 { font-size: 13px; margin-bottom: 8px; }
+      .today-big { font-size: 44px; }
+      .today-sub { font-size: 14px; }
+      .bar { height: 10px; border-radius: 6px; margin: 8px 0 6px; }
+      .kv { font-size: 14px; gap: 8px; }
+      .chips { gap: 6px; }
+      .chip { font-size: 13px; padding: 4px 8px; border-radius: 6px; }
+      .chip .cls { font-size: 11px; }
+      .day { font-size: 13px; gap: 6px; padding: 4px 0; }
+      .day .db { height: 8px; }
+      .day .n { font-size: 11px; }
+      .heat-panel { overflow: visible; }
+      .heat-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      table.heat { table-layout: auto; height: auto; border-spacing: 2px 3px; }
+      .heat th { font-size: 12px; padding: 0 4px 3px; }
+      .heat th.w { min-width: 52px; }
+      .heat th.cls, .heat td.cls {
+        width: auto; min-width: 120px; max-width: 150px;
+        position: sticky; left: 0; background: var(--panel);
+      }
+      .heat th.avg { width: auto; min-width: 44px; }
+      .heat td { font-size: 13px; padding: 4px; border-radius: 4px; }
+      .heat td.cls { font-size: 12px; }
+      .heat td.cls .n { font-size: 10px; }
+      .heat td.cell .q { font-size: 9px; }
+      .heat tr.total td.cell { font-size: 14px; }
+      .legend { font-size: 11px; gap: 4px; }
+      .legend .sw { width: 22px; height: 10px; }
+      footer { font-size: 11px; flex-wrap: wrap; gap: 4px 12px; }
+    }
   </style>
 </head>
 <body>
