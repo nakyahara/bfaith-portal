@@ -53,6 +53,27 @@ function jwtKid(token) {
   }
 }
 
+function jwtClaims(token) {
+  try {
+    return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Workspaceアドオン形式の呼び出し元: accounts.google.com 発行の OIDC IDトークンで、
+// email = アドオン実行基盤のサービスアカウント (プロジェクト番号で一意)
+const ADDON_ISSUERS = ['https://accounts.google.com', 'accounts.google.com'];
+const addonCallerEmail = (projectNumber) =>
+  `service-${projectNumber}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`;
+// audience は構成世代により「プロジェクト番号」か「エンドポイントURL」のどちらかで届く
+// (Codexレビュー high: 固定にすると構成次第で正規リクエストが全401)。両方を許可リストにする
+const addonAudiences = (projectNumber) => [
+  projectNumber,
+  process.env.STOCK_BOT_ADDON_AUDIENCE
+    || 'https://bfaith-portal.onrender.com/apps/stock-bot/chat-events',
+];
+
 // 鍵ローテーション対応の強制再取得は全体で1分に1回まで (でたらめな kid の連打で
 // Google への certs 取得を毎リクエスト強制させない)
 let _lastForcedRefetch = 0;
@@ -62,6 +83,20 @@ async function verifyChatBearer(authorization) {
   if (!projectNumber) return false;   // mount gate があるので通常来ないが fail-closed
   const m = String(authorization || '').match(/^Bearer (.+)$/);
   if (!m) return false;
+  // アドオン形式 (2025年以降の新規Chatアプリ): accounts.google.com 発行の IDトークン。
+  // audience 許可リスト + 呼び出し元SAメールの完全一致で検証 (どちらも fail-closed)
+  const iss = jwtClaims(m[1])?.iss;
+  if (ADDON_ISSUERS.includes(iss)) {
+    try {
+      const ticket = await getClient().verifyIdToken({ idToken: m[1], audience: addonAudiences(projectNumber) });
+      const p = ticket.getPayload();
+      return p?.email_verified === true && p?.email === addonCallerEmail(projectNumber);
+    } catch (e) {
+      console.warn(`[stock-bot] アドオン形式トークン検証失敗: ${e.message}`);
+      return false;
+    }
+  }
+  // 旧形式: chat@system.gserviceaccount.com 発行 (x509証明書で自前検証)
   const kid = jwtKid(m[1]);
   if (!kid) return false;
   try {
@@ -146,7 +181,8 @@ const USAGE = '商品名の一部 (例: ティーツリー)、商品ID、また�
 function buildCandidatesCard(candidates, hasMore) {
   const buttons = candidates.map((c) => ({
     text: `${String(c.name || c.sku).slice(0, 40)} (フリー${c.free})`,
-    onClick: { action: { function: 'showStock', parameters: [{ key: 'sku', value: c.sku }] } },
+    // method 併記: アドオン形式では function 名がクリックイベントに入らないことがある
+    onClick: { action: { function: 'showStock', parameters: [{ key: 'method', value: 'showStock' }, { key: 'sku', value: c.sku }] } },
   }));
   const widgets = [{ buttonList: { buttons } }];
   if (hasMore) {
@@ -171,9 +207,13 @@ export function handleChatEvent(event, db, now = new Date()) {
   if (type === 'CARD_CLICKED') {
     // 形式ゆれ対応: 新形式 = common.invokedFunction + common.parameters (map)、
     // 旧形式 = action.actionMethodName + action.parameters ([{key,value}])
-    const fn = event.common?.invokedFunction || event.action?.actionMethodName;
     const params = event.common?.parameters
       || Object.fromEntries((event.action?.parameters || []).map((p) => [p.key, p.value]));
+    // 関数名の解決: アドオン形式では invokedFunction に function 名が入らないことがある
+    // (URL だったり空だったり) ため、カード側で併記した method パラメータを最優先。
+    // __action_method_name__ = Google のアドオン移行時の旧 function 名の受け皿
+    const fn = params.method || params.__action_method_name__
+      || event.common?.invokedFunction || event.action?.actionMethodName;
     // 配送ルール変更の承認カード (packing-dispatch/rule-change.js が投稿・同じChatアプリで受ける)
     if ((fn === 'pdRuleApprove' || fn === 'pdRuleReject') && params.id) {
       return handleRuleDecision(fn, params, event);
@@ -250,38 +290,115 @@ export function checkRateLimit(key, nowMs = Date.now()) {
   return cur.count <= RATE_LIMIT_PER_MIN;
 }
 
+// ─── Workspaceアドオン形式の互換 ───
+// 2025年以降に GCP コンソールで新規作成した Chat アプリは「Google Workspace アドオン」として
+// ビルドされ、イベントが event.chat.* に包まれて届き、応答も hostAppDataAction で包む必要がある
+// (旧形式 = event.type / 素の {text})。既存ロジックは旧形式のまま、入口と出口で変換する。
+
+/**
+ * アドオン形式の userIdToken (発言者本人のIDトークン) から署名検証済みの email を返す。
+ * 検証不能・email_verified でない場合は '' (fail-closed → ルート側で「利用者を確認
+ * できなかった」応答になる)。audience はアドオン構成の OAuth クライアントIDで不定のため
+ * 署名・発行者・期限のみ検証 (メールの真正性はGoogle署名で担保。権限判定はこの email +
+ * PD_RULE_APPROVERS の突合で行う)
+ */
+export async function userEmailFromIdToken(token, client = getClient()) {
+  if (!token) return '';
+  try {
+    const ticket = await client.verifyIdToken({ idToken: token });
+    const p = ticket.getPayload();
+    return p?.email_verified === true && typeof p?.email === 'string' ? p.email : '';
+  } catch (e) {
+    console.warn(`[stock-bot] userIdToken検証失敗: ${e.message}`);
+    return '';
+  }
+}
+
+/** アドオン形式イベント → 旧形式 (handleChatEvent が読める形)。旧形式はそのまま素通し。 */
+export function adaptChatEvent(raw) {
+  const chat = raw?.chat;
+  if (!chat || typeof chat !== 'object') return { event: raw || {}, addon: false };
+  const common = raw.commonEventObject || {};
+  const user = { ...(chat.user || {}) };
+  const p = chat.messagePayload || chat.addedToSpacePayload || chat.removedFromSpacePayload
+    || chat.buttonClickedPayload || chat.appCommandPayload || {};
+  const base = { user, space: p.space || p.message?.space || chat.space, message: p.message };
+  const asClick = () => ({
+    event: {
+      ...base,
+      type: 'CARD_CLICKED',
+      common: { invokedFunction: common.invokedFunction, parameters: common.parameters || {} },
+    },
+    addon: true,
+  });
+  if (chat.messagePayload) return { event: { ...base, type: 'MESSAGE' }, addon: true };
+  if (chat.addedToSpacePayload) return { event: { ...base, type: 'ADDED_TO_SPACE' }, addon: true };
+  if (chat.removedFromSpacePayload) return { event: { ...base, type: 'REMOVED_FROM_SPACE' }, addon: true };
+  if (chat.buttonClickedPayload) return asClick();
+  // スラッシュコマンドは本文つきの MESSAGE として扱う (invokedFunction が同居しても
+  // CARD_CLICKED に誤分類しない)。コマンド未定義のアプリでは通常来ない
+  if (chat.appCommandPayload) {
+    return p.message ? { event: { ...base, type: 'MESSAGE' }, addon: true } : { event: base, addon: true };
+  }
+  if (common.invokedFunction) return asClick();   // payload 無しでクリック情報のみの防御
+  return { event: base, addon: true };   // 未知のpayloadは type 無し → handleChatEvent が空応答
+}
+
+/** 旧形式の応答 → アドオン形式 (hostAppDataAction) に包む。空応答は空のまま。 */
+export function wrapAddonResponse(out) {
+  if (!out || (!out.text && !out.cardsV2)) return {};
+  const message = {};
+  if (out.text) message.text = out.text;
+  if (out.cardsV2) message.cardsV2 = out.cardsV2;
+  const action = out.actionResponse?.type === 'UPDATE_MESSAGE'
+    ? { updateMessageAction: { message } }
+    : { createMessageAction: { message } };
+  return { hostAppDataAction: { chatDataAction: action } };
+}
+
 // ─── ルーター ───
 
 const router = Router();
 
 // 認証 (stockBotAuth) は server.js で body parser より前に掛けている
-router.post('/chat-events', (req, res) => {
-  const event = req.body || {};
+router.post('/chat-events', async (req, res) => {
+  const raw = req.body || {};
+  const { event, addon } = adaptChatEvent(raw);
+  // アドオン形式は chat.user に email が無いことがある → 署名検証済みの userIdToken からのみ補完
+  if (addon && !event.user?.email && raw.authorizationEventObject?.userIdToken) {
+    const email = await userEmailFromIdToken(raw.authorizationEventObject.userIdToken);
+    if (email) event.user = { ...event.user, email };
+  }
+  const send = (out) => res.json(addon ? wrapAddonResponse(out) : out);
+  if (addon) {
+    // 新形式は形式差異を後から追えるように1行だけ残す (本文・メール値は出さない)
+    console.log(`[stock-bot] addonイベント type=${event.type || '不明'} email=${event.user?.email ? 'あり' : '無し'} space=${event.space?.name || '不明'}`);
+  }
   // 社内ドメイン限定 (Chat アプリの公開設定と二重の防御)。検索・ボタン操作は発言者メール必須
   // (fail-closed)。ADDED_TO_SPACE 等の管理イベントのみメール無しを許容
   const allowedDomain = (process.env.STOCK_BOT_ALLOWED_DOMAIN || 'b-faith.biz').toLowerCase();
   const email = String(event.user?.email || '').toLowerCase();
   const needsUser = event.type === 'MESSAGE' || event.type === 'CARD_CLICKED';
   if (needsUser && !email) {
-    return res.json({ text: '利用者を確認できなかったため処理できません。' });
+    return send({ text: '利用者を確認できなかったため処理できません。' });
   }
   if (email && !email.endsWith(`@${allowedDomain}`)) {
-    return res.json({ text: '社内ユーザーのみ利用できます。' });
+    return send({ text: '社内ユーザーのみ利用できます。' });
   }
   if (!checkRateLimit(event.space?.name || event.user?.name || 'unknown')) {
-    return res.json({ text: '検索が集中しています。1分ほどおいて再送してください。' });
+    return send({ text: '検索が集中しています。1分ほどおいて再送してください。' });
   }
   try {
     return Promise.resolve(handleChatEvent(event, getMirrorDB()))
-      .then((out) => res.json(out))
+      .then((out) => send(out))
       .catch((e) => {
         console.error('[stock-bot] 応答生成失敗:', e);
-        res.json({ text: '内部エラーが発生しました。時間をおいて再送してください。' });
+        send({ text: '内部エラーが発生しました。時間をおいて再送してください。' });
       });
   } catch (e) {
     // mirror 未初期化 (boot直後) や想定外の payload でも 500 にしない (Chat側の再送・エラー表示を避ける)
     console.error('[stock-bot] イベント処理失敗:', e);
-    return res.json({ text: '在庫データの準備中か、一時的なエラーです。少し待ってもう一度送ってください。' });
+    return send({ text: '在庫データの準備中か、一時的なエラーです。少し待ってもう一度送ってください。' });
   }
 });
 

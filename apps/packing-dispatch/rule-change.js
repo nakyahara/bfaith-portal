@@ -289,8 +289,10 @@ export async function postApprovalCard(row, { fetchFn = fetch } = {}) {
             {
               buttonList: {
                 buttons: [
-                  { text: '✅ 承認してDB反映', onClick: { action: { function: 'pdRuleApprove', parameters: [{ key: 'id', value: String(row.id) }] } } },
-                  { text: '却下', onClick: { action: { function: 'pdRuleReject', parameters: [{ key: 'id', value: String(row.id) }] } } },
+                  // method パラメータ併記: Workspaceアドオン形式のクリックイベントでは
+                  // function 名がそのまま届かないことがある (stock-bot/router.js の fn 解決参照)
+                  { text: '✅ 承認してDB反映', onClick: { action: { function: 'pdRuleApprove', parameters: [{ key: 'method', value: 'pdRuleApprove' }, { key: 'id', value: String(row.id) }] } } },
+                  { text: '却下', onClick: { action: { function: 'pdRuleReject', parameters: [{ key: 'method', value: 'pdRuleReject' }, { key: 'id', value: String(row.id) }] } } },
                 ],
               },
             },
