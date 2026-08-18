@@ -70,6 +70,43 @@ const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'da
 if (!fs.existsSync(UPLOAD_DIR)) { try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch {} }
 const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: 8 * 1024 * 1024 } });
 
+// ─── FBA在庫更新のサイクルリセット サーバ側検知 (2026-08-18 中原さん報告のバグ対応) ───
+// 従来はブラウザのポーリングが completed を見た瞬間 (markCycleFbaJobDone) だけが発火点だったが、
+// ポーリングは5分で打ち切り (pollFba)。Amazonレポート生成が5分を超えるとFBAデータは届くのに
+// サイクルが進まず、✅発注確定済みがリセットされない (8/18 実障害: FBA 17:56取得なのにサイクル8/12のまま)。
+// タブを閉じた場合・別画面 (商品管理リスト) からのFBA更新も同じ穴 → ポーリング非依存の安全網:
+// pub の fba_source_kind='live' かつ fba_fetched_at がサイクル開始より新しければ「FBA更新があった」
+// としてサイクルを進める。at=fba_fetched_at (データが変わった時刻。検知までの間に確定した新規POを
+// 旧サイクル扱いにしない — bumpCycleReset の at 原則と同じ)。マーカー前進で自然に冪等
+// 既存のポーリング検知 (markCycleFbaJobDone・at=検知時刻) は残置 — 先に本検知が at=fetched_at で
+// 進めた後にポーリング検知が数秒新しい時刻へ更新することはあるが、前進のみで巻き戻りはない
+let lastFbaCycleCheckMs = 0;
+function maybeCycleResetFromFbaLive() {
+  // env不正値 (NaN/負数/Infinity) は既定60秒へフォールバック (設定ミスで検知が無効化されない。0=毎回はテスト用)
+  const envMs = Number(process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS ?? 60000);
+  const intervalMs = Number.isFinite(envMs) && envMs >= 0 ? envMs : 60000;
+  if (intervalMs > 0 && Date.now() - lastFbaCycleCheckMs < intervalMs) return;
+  lastFbaCycleCheckMs = Date.now();
+  try {
+    const db = getDB();
+    // 読み→比較→更新を即時txで原子的に (別経路 markCycleFbaJobDone がより新しい時刻へ進めた直後に
+    // 古い fetched_at で巻き戻さない — Codex FBA-R1 Medium)
+    db.transaction(() => {
+      const pub = db.prepare('SELECT fba_source_kind, fba_fetched_at FROM mirror_pml_published WHERE id=1').get();
+      if (!pub || pub.fba_source_kind !== 'live' || !pub.fba_fetched_at) return; // 朝同期のみ=検知対象なし
+      const marker = getSetting('po_cycle_reset_at');
+      if (!marker) return; // サイクル未開始の環境では初回マーカーを勝手に作らない (従来経路に任せる)
+      const a = Date.parse(pub.fba_fetched_at), b = Date.parse(marker);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || a <= b) return; // 検知済み or 解析不能
+      setSetting('po_cycle_reset_at', pub.fba_fetched_at, {
+        actor: 'fba-live-detect', actorType: 'system',
+        reason: 'FBA在庫更新の完了検知 (サーバ側安全網・ポーリング5分打ち切り対策)',
+      });
+    }).immediate();
+  } catch (e) { console.error('[purchase-orders] FBAサイクル検知エラー:', e.message); }
+}
+router.use((req, res, next) => { maybeCycleResetFromFbaLive(); next(); });
+
 // ─── 共通ヘルパ ───
 const he = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const jsonEmbed = obj => JSON.stringify(obj).replace(/</g, '\\u003c');
