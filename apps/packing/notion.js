@@ -13,9 +13,11 @@
  */
 import { createNotionCardSync, DAILY_DB_ID } from '../picking/notion.js';
 import { getDB } from './db.js';
+import { lineKindOf, batchHikiateClass } from './service.js';
 
 export const STATUS_PACKING = '梱包作業中';
 export const STATUS_PACK_DONE = '完了';
+export const STATUS_SORTED = '仕分け完了';   // MELT-LINE: 仕分け完了〜機械流し開始まで
 
 const sync = createNotionCardSync({
   dbId: DAILY_DB_ID,
@@ -34,13 +36,19 @@ const sync = createNotionCardSync({
  * バッチ行 → Notion へ送る状態 (純関数・テスト対象)。
  * label=null はカードを触らない (ready/cancelled/invalid — 取消しても人の運用に任せる)。
  * activeSec = 実働秒 (中断時間を除外)。
+ * @param line 梱包機バッチのみ {kind, sortDone, runStarted, finalCount} (手梱包は null)
+ *   MELT: 仕分け完了〜機械流し開始の間だけ「仕分け完了」、それ以外の作業中は「梱包作業中」
  */
-export function packBatchNotionState(batch) {
+export function packBatchNotionState(batch, line = null) {
   if (!batch || batch.validity !== 'valid') return null;
   let label = null;
-  if (batch.status === 'packing' || batch.status === 'paused') label = STATUS_PACKING;
-  else if (batch.status === 'done') label = STATUS_PACK_DONE;
-  else return null;
+  if (batch.status === 'packing' || batch.status === 'paused') {
+    label = (line?.kind === 'melt' && line.sortDone && !line.runStarted) ? STATUS_SORTED : STATUS_PACKING;
+  } else if (batch.status === 'done') {
+    label = STATUS_PACK_DONE;
+  } else {
+    return null;
+  }
   const done = batch.status === 'done';
   let activeSec = null;
   if (done && batch.started_at && batch.finished_at) {
@@ -57,7 +65,8 @@ export function packBatchNotionState(batch) {
       startedAt: batch.started_at,
       finishedAt: done ? batch.finished_at : null,
       activeSec,
-      lineCount: batch.slip_count,
+      // 秒/伝票の分母: 梱包機は実際に流した件数 (無ければ伝票数)
+      lineCount: (done && line?.finalCount != null) ? line.finalCount : batch.slip_count,
     },
   };
 }
@@ -68,7 +77,21 @@ export function packBatchNotionState(batch) {
  */
 export function enqueuePackBatchNotionSync(batchId) {
   sync.enqueueBatchSync(batchId, () => {
-    const batch = getDB().prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(batchId);
-    return packBatchNotionState(batch);
+    const db = getDB();
+    const batch = db.prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(batchId);
+    let line = null;
+    const kind = lineKindOf(batchHikiateClass(db, batch));
+    if (kind) {
+      const runs = db.prepare('SELECT * FROM pk_pack_line_runs WHERE batch_id = ?').all(batchId);
+      const sort = runs.find((r) => r.phase === 'sort');
+      const run = runs.find((r) => r.phase === 'run');
+      line = {
+        kind,
+        sortDone: !!sort?.finished_at,
+        runStarted: !!run?.started_at,
+        finalCount: run?.final_count ?? null,
+      };
+    }
+    return packBatchNotionState(batch, line);
   });
 }

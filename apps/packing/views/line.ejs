@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title><%= title %></title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="manifest" href="/apps/packing/manifest.json">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    body { background: #f4f5f7; }
+    .line-wrap { max-width: 640px; margin: 0 auto; padding: 12px; }
+    .line-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .line-head h1 { font-size: 1.3rem; margin: 8px 0; }
+    .line-kind { font-size: .85rem; color: #555; }
+    .phase-card { background: #fff; border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    .phase-card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; justify-content: space-between; }
+    .phase-card.disabled { opacity: .55; }
+    .phase-meta { font-size: .95rem; color: #333; line-height: 1.9; }
+    .phase-meta b { font-size: 1.2rem; }
+    .big-btn { display: block; width: 100%; padding: 18px; font-size: 1.25rem; font-weight: 700; border: none;
+      border-radius: 10px; background: #1a73e8; color: #fff; margin-top: 10px; }
+    .big-btn.finish { background: #188038; }
+    .big-btn:disabled { background: #aaa; }
+    .done-note { background: #e6f4ea; border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: .95rem; }
+    .handover { background: #fef7e0; border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 1rem; }
+    .form-row { margin: 10px 0; }
+    .form-row label { display: block; font-size: .9rem; color: #555; margin-bottom: 4px; }
+    .form-row input[type=number], .form-row input[type=text] { width: 100%; padding: 12px; font-size: 1.2rem;
+      border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
+    .worker-row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
+    .worker-row select { flex: 1; padding: 10px; font-size: 1.05rem; border-radius: 8px; }
+    .timer { font-variant-numeric: tabular-nums; color: #1a73e8; font-weight: 700; }
+    .top-link { font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <%
+    const jst = (t) => t ? new Date(Date.parse(t) + 32400000).toISOString().slice(11, 16) : '—';
+    const sort = runs.find((r) => r.phase === 'sort') || null;
+    const run = runs.find((r) => r.phase === 'run') || null;
+    const runPlanned = run ? run.planned_count : (kind === 'melt' ? (sort?.final_count ?? null) : batch.slip_count);
+  %>
+  <div class="line-wrap">
+    <div class="line-head">
+      <div>
+        <h1>🏭 <%= batch.folder_name || batch.tb_key %> — <%= kind === 'melt' ? 'MELT-LINE' : 'PAS-LINE' %></h1>
+        <div class="line-kind"><%= hikiateClass %></div>
+      </div>
+      <a class="top-link" href="/apps/packing/">← 一覧へ</a>
+    </div>
+
+    <div class="phase-meta">
+      予定 <b><%= batch.slip_count %></b> 件
+      <span class="st <%= batch.status %>"><%= statusLabels[batch.status] || batch.status %></span>
+      <% if (batch.worker) { %> / 👤 <%= batch.worker %><% } %>
+    </div>
+
+    <div class="worker-row">
+      <label for="worker">作業者</label>
+      <select id="worker">
+        <option value="">選択してください</option>
+        <% for (const w of workers) { %><option value="<%= w.name %>"><%= w.name %></option><% } %>
+      </select>
+    </div>
+
+    <% if (kind === 'melt') { %>
+      <div class="phase-card">
+        <h2>① 仕分け <% if (sort?.finished_at) { %><span>✅</span><% } %></h2>
+        <% if (!sort) { %>
+          <p>機械に流す前の仕分けを開始します (<%= batch.slip_count %>件)。</p>
+          <button class="big-btn" onclick="send('line_sort_start')">仕分け開始</button>
+        <% } else if (!sort.finished_at) { %>
+          <div class="phase-meta">開始 <%= jst(sort.started_at) %> — 経過 <span class="timer" data-since="<%= sort.started_at %>"></span></div>
+          <div class="form-row">
+            <label>最終通過件数 (配送方法を変更して外した分を引いた、機械に流す件数)</label>
+            <input type="number" id="sortFinal" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="<%= sort.planned_count %>">
+          </div>
+          <div class="form-row">
+            <label>備考 (任意)</label>
+            <input type="text" id="sortNote" maxlength="200" placeholder="例: 2件をネコポス手動へ変更">
+          </div>
+          <button class="big-btn finish" onclick="sortDone()">仕分け完了</button>
+        <% } else { %>
+          <div class="done-note">
+            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> / 最終通過 <b><%= sort.final_count %></b> 件
+            (予定 <%= sort.planned_count %> 件)<% if (sort.note) { %> / 備考: <%= sort.note %><% } %>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+
+    <div class="phase-card <%= (kind === 'melt' && !sort?.finished_at) ? 'disabled' : '' %>">
+      <h2><%= kind === 'melt' ? '② 機械流し' : '機械流し' %> <% if (run?.finished_at) { %><span>✅</span><% } %></h2>
+      <% if (kind === 'melt' && sort?.finished_at && !run) { %>
+        <div class="handover">📋 申し送り: 仕分け後の最終通過は <b><%= sort.final_count %></b> 件です</div>
+      <% } %>
+      <% if (batch.status === 'done' && run?.finished_at) { %>
+        <div class="done-note">
+          🏁 完了 — <%= jst(run.started_at) %>〜<%= jst(run.finished_at) %> /
+          出荷完了 <b><%= run.final_count %></b> 件 (予定 <%= run.planned_count %> 件・うち手動 <%= run.manual_count || 0 %> 件)
+          <% if (run.note) { %> / 備考: <%= run.note %><% } %>
+        </div>
+      <% } else if (!run) { %>
+        <% if (kind === 'melt' && !sort?.finished_at) { %>
+          <p>先に仕分けを完了してください。</p>
+        <% } else { %>
+          <p>機械流しを開始します (<%= runPlanned %>件)。</p>
+          <button class="big-btn" onclick="send('line_start')">流し開始</button>
+        <% } %>
+      <% } else if (!run.finished_at) { %><!-- 流し作業中 -->
+        <div class="phase-meta">開始 <%= jst(run.started_at) %> — 経過 <span class="timer" data-since="<%= run.started_at %>"></span></div>
+        <div class="form-row">
+          <label>出荷完了件数 (手動で流した分も含む)</label>
+          <input type="number" id="runFinal" inputmode="numeric" min="0" max="<%= run.planned_count %>" value="<%= run.planned_count %>">
+        </div>
+        <div class="form-row">
+          <label>うち手動で流した件数</label>
+          <input type="number" id="runManual" inputmode="numeric" min="0" value="0">
+        </div>
+        <div class="form-row">
+          <label>備考 (任意 — ピッキングミス等)</label>
+          <input type="text" id="runNote" maxlength="200">
+        </div>
+        <button class="big-btn finish" onclick="runDone()">終了 (完了を記録)</button>
+      <% } %>
+    </div>
+
+    <% if (runs.length > 0) { %>
+      <div style="text-align:center; margin: 16px 0;">
+        <button style="background:none; border:none; color:#c5221f; font-size:.95rem; text-decoration:underline;"
+          onclick="lineUndo()">↩ 直前の記録を取り消す</button>
+      </div>
+    <% } %>
+  </div>
+
+  <script>
+    const BATCH_ID = <%= batch.id %>;
+    const workerSel = document.getElementById('worker');
+    const savedWorker = localStorage.getItem('packLineWorker');
+    if (savedWorker) workerSel.value = savedWorker;
+    workerSel.addEventListener('change', () => localStorage.setItem('packLineWorker', workerSel.value));
+
+    // 経過タイマー
+    setInterval(() => {
+      for (const el of document.querySelectorAll('.timer')) {
+        const sec = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.since)) / 1000));
+        el.textContent = `${Math.floor(sec / 60)}分${String(sec % 60).padStart(2, '0')}秒`;
+      }
+    }, 1000);
+
+    let sending = false;
+    async function send(event, extra = {}) {
+      if (sending) return;
+      const worker = workerSel.value;
+      if (!worker) { alert('作業者を選択してください'); return; }
+      sending = true;
+      try {
+        const res = await fetch(`/apps/packing/api/batches/${BATCH_ID}/events`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            op_id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            event, worker_name: worker, client_at: new Date().toISOString(), ...extra,
+          }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) { alert(body.error || `エラー (${res.status})`); return; }
+        location.reload();
+      } catch (e) {
+        alert(`通信エラー: ${e.message}`);
+      } finally {
+        sending = false;
+      }
+    }
+    function intOf(id, label) {
+      const raw = document.getElementById(id).value.trim();
+      if (raw === '') { alert(`${label}を入力してください`); return null; }
+      const v = Number(raw);
+      if (!Number.isInteger(v) || v < 0) { alert(`${label}が不正です`); return null; }
+      return v;
+    }
+    function sortDone() {
+      const v = intOf('sortFinal', '最終通過件数');
+      if (v == null) return;
+      if (!confirm(`最終通過 ${v} 件で仕分け完了にしますか?`)) return;
+      send('line_sort_done', { final_count: v, note: document.getElementById('sortNote').value || null });
+    }
+    function runDone() {
+      const v = intOf('runFinal', '出荷完了件数');
+      if (v == null) return;
+      const mRaw = document.getElementById('runManual').value.trim();
+      const m = mRaw === '' ? 0 : Number(mRaw);
+      if (!Number.isInteger(m) || m < 0) { alert('手動で流した件数が不正です'); return; }
+      if (!confirm(`出荷完了 ${v} 件 (うち手動 ${m} 件) で終了しますか?`)) return;
+      send('line_done', { final_count: v, manual_count: m, note: document.getElementById('runNote').value || null });
+    }
+    function lineUndo() {
+      if (!confirm('直前の記録 (終了→開始→仕分け完了→仕分け開始の順) を1段取り消します。よろしいですか?')) return;
+      send('undo', { reason: '誤タップ' });
+    }
+  </script>
+</body>
+</html>

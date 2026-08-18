@@ -27,7 +27,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  resolveIncident,
+  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns,
 } from './service.js';
 import { notifyShipChange, notifyTask } from './notify.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
@@ -131,6 +131,8 @@ function api(handler) {
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listPackBatches(workDate);
+  // 梱包機ライン種別 (pas/melt/null)。梱包機バッチは作業ボタンをライン管理画面へ向ける
+  for (const b of batches) b.lineKind = lineKindOf(batchHikiateClass(getDB(), b));
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
     username: req.session?.email || req.packingDevice?.label || '端末',
@@ -213,6 +215,8 @@ router.get('/work/:id(\\d+)', (req, res) => {
         .get(state.batch.pk_batch_id)?.hikiate_class ?? null;
     } catch { /* picking未初期化環境では無視 */ }
   }
+  // 梱包機バッチは1伝票1画面を使わない — ライン管理画面へ (Codex high: 混在は矛盾状態を作る)
+  if (lineKindOf(hikiateClass)) return res.redirect(`/apps/packing/line/${req.params.id}`);
   res.render(path.join(__dirname, 'views/work'), {
     title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
     displayName: req.session?.displayName,
@@ -225,6 +229,25 @@ router.get('/work/:id(\\d+)', (req, res) => {
     shipChangeReasons: SHIP_CHANGE_REASONS,
     // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
     methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+  });
+});
+
+// ─── ライン管理画面 (梱包機 PAS/MELT — 紙台帳の置き換え。要件v7) ───
+router.get('/line/:id(\\d+)', (req, res) => {
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) return res.status(404).send('バッチが見つかりません');
+  const hikiateClass = batchHikiateClass(getDB(), batch);
+  const kind = lineKindOf(hikiateClass);
+  if (!kind) return res.redirect(`/apps/packing/work/${batch.id}`);   // 手梱包は従来画面へ
+  res.render(path.join(__dirname, 'views/line'), {
+    title: `ライン | ${batch.folder_name || batch.tb_key}`,
+    displayName: req.session?.displayName,
+    workers: listWorkers(),
+    batch,
+    kind,
+    hikiateClass,
+    runs: listLineRuns(batch.id),
+    statusLabels: STATUS_LABELS,
   });
 });
 
@@ -257,12 +280,17 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     sku: req.body.sku || null,
     actualSku: req.body.actual_sku || null,
     qty: req.body.qty == null ? null : Number(req.body.qty),
+    // '' は未入力として null に落とす (Number('')===0 で「0件」と誤解釈しない — Codex medium)
+    finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
+    manualCount: req.body.manual_count == null || req.body.manual_count === '' ? null : Number(req.body.manual_count),
+    note: req.body.note == null ? null : String(req.body.note).slice(0, 200),
   }, worker);
   // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため
   // どのイベント経由でも「現在のバッチ状態」が届く)。対象=バッチ状態が変わり得るイベントのみ。
   // shortage/wrong_item は完了済みバッチを packing へ再オープンする経路がある (Codex P1)
   if (!result.replayed
-      && ['start', 'next', 'undo', 'takeover', 'shortage', 'wrong_item'].includes(req.body.event)) {
+      && ['start', 'next', 'undo', 'takeover', 'shortage', 'wrong_item',
+        'line_sort_start', 'line_sort_done', 'line_start', 'line_done'].includes(req.body.event)) {
     enqueuePackBatchNotionSync(Number(req.params.id));
   }
   // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)

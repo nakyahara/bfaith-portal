@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -217,6 +217,26 @@ const MIGRATIONS = {
   5: () => {
     db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notified_at TEXT');
     db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notify_error TEXT');
+  },
+  // v6: 梱包機ライン管理 (PAS-LINE/MELT-LINE — 紙台帳の置き換え。中原さん指示 2026-08-18)。
+  // 梱包機バッチは1伝票1画面ではなく工程単位で記録する:
+  //   sort = MELT-LINE の事前仕分け (final_count = 配送変更を差し引いた最終通過件数)
+  //   run  = 機械流し (final_count = 出荷完了件数 / manual_count = うち手動で流した件数)
+  6: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_line_runs (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      phase         TEXT NOT NULL CHECK(phase IN ('sort','run')),
+      started_at    TEXT,
+      finished_at   TEXT,
+      planned_count INTEGER,
+      final_count   INTEGER,
+      manual_count  INTEGER,
+      note          TEXT,
+      worker        TEXT,
+      updated_at    TEXT NOT NULL,
+      UNIQUE (batch_id, phase)
+    )`);
   },
 };
 
