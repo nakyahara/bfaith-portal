@@ -134,11 +134,14 @@
       .heat th.w { min-width: 52px; }
       .heat th.cls, .heat td.cls {
         width: auto; min-width: 120px; max-width: 150px;
-        position: sticky; left: 0; background: var(--panel);
+        position: sticky; left: 0; background: var(--panel); z-index: 1;
       }
+      .heat th.cls { z-index: 2; }
       .heat th.avg { width: auto; min-width: 44px; }
       .heat td { font-size: 13px; padding: 4px; border-radius: 4px; }
-      .heat td.cls { font-size: 12px; }
+      /* sticky と -webkit-box の併用は列幅・固定位置が不安定 → table-cell に戻して
+         2行clampの代わりに1行省略 (Codexレビュー medium) */
+      .heat td.cls { font-size: 12px; display: table-cell; white-space: nowrap; text-overflow: ellipsis; }
       .heat td.cls .n { font-size: 10px; }
       .heat td.cell .q { font-size: 9px; }
       .heat tr.total td.cell { font-size: 14px; }

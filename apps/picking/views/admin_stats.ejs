@@ -212,6 +212,7 @@
     </div>
 
     <h2>日別</h2>
+    <div class="scroll-x">
     <table class="pk-list">
       <thead><tr><th>作業日</th><th class="num">明細</th><th class="num">秒/明細</th><th class="num">実時間</th><th class="num">作業者</th></tr></thead>
       <tbody>
@@ -223,6 +224,7 @@
         <% if (stats.byDate.length === 0) { %><tr><td colspan="5" class="muted">データがありません</td></tr><% } %>
       </tbody>
     </table>
+    </div>
   </div>
 </body>
 </html>
