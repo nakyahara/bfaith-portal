@@ -38,6 +38,7 @@
 <body>
   <%
     const jst = (t) => t ? new Date(Date.parse(t) + 32400000).toISOString().slice(11, 16) : '—';
+    const durMin = (a, b) => (a && b) ? Math.round((Date.parse(b) - Date.parse(a)) / 6000) / 10 : null;
     const sort = runs.find((r) => r.phase === 'sort') || null;
     const run = runs.find((r) => r.phase === 'run') || null;
     const runPlanned = run ? run.planned_count : (kind === 'melt' ? (sort?.final_count ?? null) : batch.slip_count);
@@ -55,6 +56,10 @@
       予定 <b><%= batch.slip_count %></b> 件
       <span class="st <%= batch.status %>"><%= statusLabels[batch.status] || batch.status %></span>
       <% if (batch.worker) { %> / 👤 <%= batch.worker %><% } %>
+    </div>
+    <div class="done-note" style="background:#e8f0fe;">
+      📟 本日このラインの累計: 出荷 <b><%= dailyTotal.total %></b> 件
+      (機械通過 <b><%= dailyTotal.machine %></b> 件) — 日付が変わるとリセット
     </div>
 
     <div class="worker-row">
@@ -74,18 +79,22 @@
         <% } else if (!sort.finished_at) { %>
           <div class="phase-meta">開始 <%= jst(sort.started_at) %> — 経過 <span class="timer" data-since="<%= sort.started_at %>"></span></div>
           <div class="form-row">
-            <label>最終通過件数 (配送方法を変更して外した分を引いた、機械に流す件数)</label>
-            <input type="number" id="sortFinal" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="<%= sort.planned_count %>">
+            <label>他の方法で出荷する件数 (配送方法変更などで機械に流さない分。無ければ 0)</label>
+            <input type="number" id="sortExcluded" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="0"
+              oninput="sortCalc()">
           </div>
+          <div class="handover">🏭 機械に流す件数: <b id="sortFlowCount"><%= sort.planned_count %></b> 件
+            (伝票 <%= sort.planned_count %> − 除外 <span id="sortExShow">0</span>)</div>
           <div class="form-row">
             <label>備考 (任意)</label>
             <input type="text" id="sortNote" maxlength="200" placeholder="例: 2件をネコポス手動へ変更">
           </div>
-          <button class="big-btn finish" onclick="sortDone()">仕分け完了</button>
+          <button class="big-btn finish" onclick="sortDone(<%= sort.planned_count %>)">仕分け完了</button>
         <% } else { %>
           <div class="done-note">
-            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> / 最終通過 <b><%= sort.final_count %></b> 件
-            (予定 <%= sort.planned_count %> 件)<% if (sort.note) { %> / 備考: <%= sort.note %><% } %>
+            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> / 他の方法へ <b><%= sort.excluded_count ?? 0 %></b> 件
+            → 機械に流す件数 <b><%= sort.final_count %></b> 件 (伝票 <%= sort.planned_count %> 件)
+            <% if (sort.note) { %> / 備考: <%= sort.note %><% } %>
           </div>
         <% } %>
       </div>
@@ -109,8 +118,16 @@
           <p>機械流しを開始します (<%= runPlanned %>件)。</p>
           <button class="big-btn" onclick="send('line_start')">流し開始</button>
         <% } %>
-      <% } else if (!run.finished_at) { %><!-- 流し作業中 -->
+      <% } else if (!run.finished_at) { %><!-- 流し作業中: まず時間を止める (件数は次の画面) -->
         <div class="phase-meta">開始 <%= jst(run.started_at) %> — 経過 <span class="timer" data-since="<%= run.started_at %>"></span></div>
+        <button class="big-btn finish" onclick="send('line_stop')">⏱ 終了 (時間を止める)</button>
+      <% } else if (run.final_count == null) { %><!-- 停止済み: 件数を入力するまで完了しない -->
+        <div class="done-note" style="background:#fef7e0;">
+          ⏸ <%= jst(run.started_at) %>〜<%= jst(run.finished_at) %> で停止しました (所要 <%= durMin(run.started_at, run.finished_at) %> 分)。
+          <b>件数を入力すると完了になります。</b>
+        </div>
+        <div class="handover">📟 前回までの累計: 機械通過 <b><%= dailyTotal.machine %></b> 件
+          — 梱包機のカウンタ表示から <b><%= dailyTotal.machine %></b> を引いた数が今回の機械通過分です</div>
         <div class="form-row">
           <label>出荷完了件数 (手動で流した分も含む)</label>
           <input type="number" id="runFinal" inputmode="numeric" min="0" max="<%= run.planned_count %>" value="<%= run.planned_count %>">
@@ -123,7 +140,7 @@
           <label>備考 (任意 — ピッキングミス等)</label>
           <input type="text" id="runNote" maxlength="200">
         </div>
-        <button class="big-btn finish" onclick="runDone()">終了 (完了を記録)</button>
+        <button class="big-btn finish" onclick="runDone()">完了を記録</button>
       <% } %>
     </div>
 
@@ -156,20 +173,35 @@
       const worker = workerSel.value;
       if (!worker) { alert('作業者を選択してください'); return; }
       sending = true;
+      // op_id は1操作につき1回だけ生成し、通信失敗時は同じ内容で再送する
+      // (Codex high: タップごとの新op_idだと「保存成功+応答喪失→再タップ」が already_done になる。
+      //  特に line_stop はタップ時刻が正なので、同一op_idのreplayで時刻が守られる)
+      const payload = JSON.stringify({
+        op_id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        event, worker_name: worker, client_at: new Date().toISOString(), ...extra,
+      });
       try {
-        const res = await fetch(`/apps/packing/api/batches/${BATCH_ID}/events`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            op_id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-            event, worker_name: worker, client_at: new Date().toISOString(), ...extra,
-          }),
-        });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) { alert(body.error || `エラー (${res.status})`); return; }
-        location.reload();
-      } catch (e) {
-        alert(`通信エラー: ${e.message}`);
+        for (let attempt = 1; ; attempt++) {
+          let res;
+          try {
+            res = await fetch(`/apps/packing/api/batches/${BATCH_ID}/events`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload,
+            });
+          } catch (e) {
+            if (attempt >= 3) { alert(`通信エラー: ${e.message}\n電波の良い場所でもう一度お試しください。`); return; }
+            await new Promise((r) => setTimeout(r, 1500));
+            continue;   // 同一 op_id で再送 (サーバー側は replay として同じ結果を返す)
+          }
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            alert(body.error || `エラー (${res.status})`);
+            // 409 = 状態が進んでいる (別端末・応答喪失後の再タップ等) → 画面を実状態に同期
+            if (res.status === 409) location.reload();
+            return;
+          }
+          location.reload();
+          return;
+        }
       } finally {
         sending = false;
       }
@@ -181,11 +213,20 @@
       if (!Number.isInteger(v) || v < 0) { alert(`${label}が不正です`); return null; }
       return v;
     }
-    function sortDone() {
-      const v = intOf('sortFinal', '最終通過件数');
-      if (v == null) return;
-      if (!confirm(`最終通過 ${v} 件で仕分け完了にしますか?`)) return;
-      send('line_sort_done', { final_count: v, note: document.getElementById('sortNote').value || null });
+    function sortCalc() {
+      const el = document.getElementById('sortExcluded');
+      const planned = Number(el.max);
+      const ex = el.value.trim() === '' ? 0 : Number(el.value);
+      const valid = Number.isInteger(ex) && ex >= 0 && ex <= planned;
+      document.getElementById('sortFlowCount').textContent = valid ? planned - ex : '—';
+      document.getElementById('sortExShow').textContent = valid ? ex : '?';
+    }
+    function sortDone(planned) {
+      const raw = document.getElementById('sortExcluded').value.trim();
+      const ex = raw === '' ? 0 : Number(raw);   // 空欄=除外なし (0) 扱い
+      if (!Number.isInteger(ex) || ex < 0 || ex > planned) { alert('他の方法で出荷する件数が不正です'); return; }
+      if (!confirm(`他の方法へ ${ex} 件 → 機械に流す ${planned - ex} 件で仕分け完了にしますか?`)) return;
+      send('line_sort_done', { excluded_count: ex, note: document.getElementById('sortNote').value || null });
     }
     function runDone() {
       const v = intOf('runFinal', '出荷完了件数');
@@ -197,7 +238,7 @@
       send('line_done', { final_count: v, manual_count: m, note: document.getElementById('runNote').value || null });
     }
     function lineUndo() {
-      if (!confirm('直前の記録 (終了→開始→仕分け完了→仕分け開始の順) を1段取り消します。よろしいですか?')) return;
+      if (!confirm('直前の記録 (件数→停止→流し開始→仕分け完了→仕分け開始の順) を1段取り消します。よろしいですか?')) return;
       send('undo', { reason: '誤タップ' });
     }
   </script>

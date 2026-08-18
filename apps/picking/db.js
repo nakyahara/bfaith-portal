@@ -260,16 +260,16 @@ export function getDB() {
   return db;
 }
 
-/** バッチ一覧: 指定作業日 + それ以前の未完了持ち越し。cancelled は当日分のみ表示。 */
+/** バッチ一覧: 指定作業日のみ (日付が変わるとリセット — 中原さん指示 2026-08-18。
+ *  梱包 #852 と同じ仕様。過去分は日付ピッカーで参照)。 */
 export function listBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT COUNT(*) FROM pk_lines l WHERE l.batch_id = b.id AND l.status != 'pending') AS done_lines
     FROM pk_batches b
-    WHERE (b.work_date = ?
-        OR (b.work_date < ? AND b.status IN ('ready','picking','paused')))
+    WHERE b.work_date = ?
     ORDER BY b.work_date, b.id
-  `).all(workDate, workDate);
+  `).all(workDate);
 }
 
 export function getBatch(id) {
