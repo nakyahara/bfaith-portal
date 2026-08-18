@@ -4106,7 +4106,7 @@ console.log('── FBAサイクルリセット サーバ側検知 ──');
   const setMarker = v => db.prepare(`INSERT INTO po_settings (key, value, effective_at, changed_by, reason) VALUES ('po_cycle_reset_at', ?, ?, NULL, 'test')
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, effective_at=excluded.effective_at`).run(v, v);
   const setFba = (kind, fetchedAt) => db.prepare('UPDATE mirror_pml_published SET fba_source_kind=?, fba_fetched_at=? WHERE id=1').run(kind, fetchedAt);
-  const markerBackup = marker();
+  const markerRowBackup = db.prepare("SELECT * FROM po_settings WHERE key='po_cycle_reset_at'").get() || null; // 全列退避 (復元でeffective_at等を壊さない)
   const fbaBackup = db.prepare('SELECT fba_source_kind, fba_fetched_at FROM mirror_pml_published WHERE id=1').get();
 
   // 1) live + fetched_at がサイクルより新しい → 任意のリクエストでサイクル前進 (at=fetched_at)
@@ -4144,8 +4144,11 @@ console.log('── FBAサイクルリセット サーバ側検知 ──');
 
   // 後片付け (元のDB状態へ完全復元 — 後続テストへの順序依存を作らない)
   setFba(fbaBackup ? fbaBackup.fba_source_kind : null, fbaBackup ? fbaBackup.fba_fetched_at : null);
-  if (markerBackup != null) setMarker(markerBackup);
-  else db.prepare("DELETE FROM po_settings WHERE key='po_cycle_reset_at'").run();
+  if (markerRowBackup) {
+    db.prepare(`INSERT INTO po_settings (key, value, effective_at, changed_by, reason) VALUES (?,?,?,?,?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value, effective_at=excluded.effective_at, changed_by=excluded.changed_by, reason=excluded.reason`)
+      .run(markerRowBackup.key, markerRowBackup.value, markerRowBackup.effective_at, markerRowBackup.changed_by, markerRowBackup.reason);
+  } else db.prepare("DELETE FROM po_settings WHERE key='po_cycle_reset_at'").run();
   delete process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS;
 }
 
