@@ -30,6 +30,7 @@ import {
   resolveIncident,
 } from './service.js';
 import { notifyShipChange, notifyTask } from './notify.js';
+import { enqueuePackBatchNotionSync } from './notion.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -257,6 +258,13 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     actualSku: req.body.actual_sku || null,
     qty: req.body.qty == null ? null : Number(req.body.qty),
   }, worker);
+  // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため
+  // どのイベント経由でも「現在のバッチ状態」が届く)。対象=バッチ状態が変わり得るイベントのみ。
+  // shortage/wrong_item は完了済みバッチを packing へ再オープンする経路がある (Codex P1)
+  if (!result.replayed
+      && ['start', 'next', 'undo', 'takeover', 'shortage', 'wrong_item'].includes(req.body.event)) {
+    enqueuePackBatchNotionSync(Number(req.params.id));
+  }
   // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)
   if (result.taskNotify) {
     notifyTask(result.taskNotify, worker)
