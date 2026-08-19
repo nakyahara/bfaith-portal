@@ -348,6 +348,7 @@ function productDto(p) {
     capacityPerUnit: p.capacityPerUnit, caseGroup: p.caseGroup || '', caseLot: p.caseLot || null,
     recentIssued: p.recentIssued,
     selectableLow: p.selectableLow || null,
+    backOrderDates: p.backOrderDates || null,
   };
 }
 
@@ -3986,6 +3987,18 @@ function selBadge(p) {
   if (!p.selectableLow) return '';
   return ' <span class="badge" style="background:#ede9fe;color:#6d28d9" title="選べるセット構成商品 (' + esc(p.selectableLow.sets || '') + ')。在庫+注残が最低在庫 ' + p.selectableLow.minStock + ' 以下">🧩選べるセット構成の在庫減</span>';
 }
+// 注残の希望納期 (台帳由来、日付昇順)。最初の納期を表示し、複数納期は「他N」+title で内訳。過去日は赤 (入荷が遅れている)
+function boDateNote(p) {
+  if (!p.backOrderDates || !p.backOrderDates.length) return '';
+  var full = p.backOrderDates.map(function(d){ return d.date + ' ×' + Number(d.qty).toLocaleString('ja-JP'); }).join(' / ');
+  var first = p.backOrderDates[0];
+  var today = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
+  var overdue = first.date < today;
+  var more = p.backOrderDates.length > 1 ? ' 他' + (p.backOrderDates.length - 1) : '';
+  return ' <span class="muted" style="white-space:nowrap' + (overdue ? ';color:#b91c1c' : '') + '"' +
+    ' title="注残の希望納期: ' + esc(full) + (overdue ? ' (希望納期を過ぎても未入荷の注残があります)' : '') + '">📅' +
+    esc(String(first.date).slice(5).replace('-', '/')) + more + '</span>';
+}
 // 要発注リストに「発注数を入れたから並んでいる」行 (本来は追加候補/掘り起こし)。renderTargetsで再構築
 var ADDED = {};
 function addedBadge(p) {
@@ -3999,7 +4012,7 @@ function rowHtml(p, kind) {
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
-    '<td class="r">' + (p.stock + p.backOrder).toLocaleString('ja-JP') + (p.backOrder ? ' <span class="muted">(注残' + p.backOrder.toLocaleString('ja-JP') + ')</span>' : '') + '</td>' +
+    '<td class="r">' + (p.stock + p.backOrder).toLocaleString('ja-JP') + (p.backOrder ? ' <span class="muted">(注残' + p.backOrder.toLocaleString('ja-JP') + ')</span>' + boDateNote(p) : '') + '</td>' +
     '<td class="r">' + (p.lot || '—') + '</td>' +
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
@@ -4312,7 +4325,7 @@ function membersTable(k, selfCode) {
 function accHtml(p) {
   var h = '<div class="accbox">';
   h += '<div class="kv">' +
-    kvHtml('在庫(引当込み) ', numFmt(p.stock)) + kvHtml('注残 ', numFmt(p.backOrder)) +
+    kvHtml('在庫(引当込み) ', numFmt(p.stock)) + kvHtml('注残 ', numFmt(p.backOrder) + boDateNote(p)) +
     kvHtml('7日販売 ', numFmt(p.sales7)) + kvHtml('30日販売 ', numFmt(p.sales30)) +
     kvHtml('在庫月数 ', months(p)) + kvHtml('推奨保有月数 ', p.holdMonths != null ? p.holdMonths : '—') +
     kvHtml('ロット ', p.lot || '—') + kvHtml('原価 ', p.cost ? yen(p.cost) : '—') + kvHtml('売価 ', p.price ? yen(p.price) : '—') +
