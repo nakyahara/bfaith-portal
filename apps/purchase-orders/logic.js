@@ -338,6 +338,23 @@ export function loadLedgerBackorders() {
 }
 
 /**
+ * 商品別オープン注残の希望納期内訳 → Map(product_key → [{date:'YYYY-MM-DD', qty}] 日付昇順)。
+ * 母集合は loadLedgerBackorders と同じ (v_ledger_backorder_requested_dates)。納期未指定の注残は含まれない。
+ */
+export function loadBackorderRequestedDates() {
+  const db = getDB();
+  const map = new Map();
+  for (const r of db.prepare(
+    'SELECT product_key, requested_date, remaining_qty FROM v_ledger_backorder_requested_dates ORDER BY requested_date'
+  ).all()) {
+    let arr = map.get(r.product_key);
+    if (!arr) map.set(r.product_key, arr = []);
+    arr.push({ date: r.requested_date, qty: r.remaining_qty });
+  }
+  return map;
+}
+
+/**
  * 全体計算。仕入先別に 要発注 / ついで買い候補 / 掘り起こし を仕分けする。
  * 戻り値の products は PML 全行の computeProduct 結果 (attrs 情報を付与済み)。
  * 注残はアプリ台帳 (loadLedgerBackorders) を正とする — NE CSVの発注残数は使わない。
@@ -347,8 +364,9 @@ export function computeAll() {
   maybeRefreshFromLogizardMirror();
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, overlay, masters, recentIssued, ledgerZan, useLedgerZan } = db.transaction(() => ({
+  const { pub, rows, overlay, masters, recentIssued, ledgerZan, boDates, useLedgerZan } = db.transaction(() => ({
     ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(), ledgerZan: loadLedgerBackorders(),
+    boDates: loadBackorderRequestedDates(),
     // 既定 'app' = アプリ台帳。設定 backorder_source='ne' で旧挙動 (NE CSVの発注残数) へ戻せる
     useLedgerZan: getSetting('backorder_source') !== 'ne',
   }))();
@@ -366,6 +384,9 @@ export function computeAll() {
     p.caseLot = a ? (a.case_lot || null) : null;
     const ri = recentIssued.get(p.key);
     p.recentIssued = ri || null;
+    // 注残の希望納期内訳 (台帳由来)。注残0の商品や納期未指定の発注しかない商品は null
+    const bd = boDates.get(p.key);
+    p.backOrderDates = (p.backOrder > 0 && bd && bd.length) ? bd : null;
     // 選べる◯種セット構成商品: 在庫を切らさない前提のため、在庫+注残 が最低在庫以下なら要発注扱い
     const sel = masters.selectable.get(p.key);
     const selMin = sel ? (sel.min_stock != null ? sel.min_stock : SELECTABLE_DEFAULT_MIN) : null;

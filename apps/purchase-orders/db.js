@@ -896,6 +896,22 @@ function initLedgerSchema(db) {
       AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
     GROUP BY i.product_key`);
 
+  // 商品別オープン注残の希望納期内訳 (対象母集合は v_ledger_backorder_by_product と同一条件)。
+  // 発注ワークスペースの「注残がいつ入る予定か」表示用。希望納期は明細スナップショット優先、
+  // 旧形式PO (明細NULL・ヘッダのみ) はヘッダ値を実効値とする (draft互換と同じ規則)。納期なしの注残は行に出ない
+  db.exec('DROP VIEW IF EXISTS v_ledger_backorder_requested_dates');
+  db.exec(`CREATE VIEW v_ledger_backorder_requested_dates AS
+    SELECT i.product_key AS product_key,
+           COALESCE(NULLIF(i.requested_date, ''), NULLIF(o.requested_date, '')) AS requested_date,
+           SUM(b.remaining_qty) AS remaining_qty
+    FROM po_order_items i
+    JOIN po_orders o ON o.id = i.order_id
+    JOIN v_po_item_balance b ON b.order_item_id = i.id
+    WHERE o.status = 'issued' AND o.tracking_mode = 'tracked' AND o.closed_at IS NULL AND b.remaining_qty > 0
+      AND o.issued_at >= (SELECT value FROM po_settings WHERE key = 'tracking_started_at')
+      AND COALESCE(NULLIF(i.requested_date, ''), NULLIF(o.requested_date, '')) IS NOT NULL
+    GROUP BY i.product_key, COALESCE(NULLIF(i.requested_date, ''), NULLIF(o.requested_date, ''))`);
+
   // published PML + アプリ台帳注残 の正本ビュー。注残数はアプリ台帳値 (PMLに載るNE由来値は使わない)。
   // 由来がわかるよう backorder_source / 参考として ne_backorder_qty (legacy) も持つ
   db.exec('DROP VIEW IF EXISTS v_pml_rows_authoritative');

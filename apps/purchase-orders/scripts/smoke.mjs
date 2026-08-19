@@ -720,6 +720,18 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   ok(ord0.tracking_mode === 'tracked' && ord0.requested_date === '2026-07-20' && ord0.closed_at == null, 'issue: tracked+希望納期+オープン');
   const item = db.prepare('SELECT * FROM po_order_items WHERE order_id=?').get(ledgerOrderId);
   ok(item.requested_date === '2026-07-20', 'issue: 希望納期を明細へスナップショット');
+
+  // 注残の希望納期ビュー+仕入先WSへの表示 (発注残ある商品の納期希望を要発注リストに出す)。
+  // 既存のオープン注残 (issue 400+200) は納期なし → ビューに載らず、この issue の50だけが日付付き
+  const bod0 = db.prepare("SELECT remaining_qty FROM v_ledger_backorder_requested_dates WHERE product_key='noflyersticker' AND requested_date='2026-07-20'").get();
+  ok(bod0 && bod0.remaining_qty === 50, '注残希望納期ビュー: issue直後の残数が希望納期別に載る (納期なし注残は含まない)', bod0);
+  {
+    const { loadBackorderRequestedDates: lbd } = await imp('apps/purchase-orders/logic.js');
+    const arr = lbd().get('noflyersticker');
+    ok(arr && arr.length === 1 && arr[0].date === '2026-07-20' && arr[0].qty === 50, 'loadBackorderRequestedDates はビューと同値', arr);
+    const supHtml0 = await (await fetch(base + '/supplier/1')).text();
+    ok(supHtml0.includes('backOrderDates') && supHtml0.includes('2026-07-20'), '仕入先WS: 注残の希望納期をデータ埋め込み (backOrderDates)');
+  }
   r = await j('/api/supplier/1/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ items: [{ code: 'noflyersticker', qty: 1 }], requestedDate: '2026/07/20' }) });
   ok(r.status === 400, 'issue: 希望納期の形式不正は 400');
@@ -727,6 +739,10 @@ console.log('── P13a: 台帳 (イベント/逆仕訳/クローズ/整合性)
   // 部分入荷 40/50 → 残10
   const rc = L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 40, source: 'manual', actor: 'smoke' });
   ok(rc.remaining === 10 && !rc.orderClosed, '入荷40: 残10・オープン維持', rc);
+  {
+    const bod1 = db.prepare("SELECT remaining_qty FROM v_ledger_backorder_requested_dates WHERE product_key='noflyersticker' AND requested_date='2026-07-20'").get();
+    ok(bod1 && bod1.remaining_qty === 10, '注残希望納期ビュー: 入荷で残数が減る (50→10)', bod1);
+  }
   // 残数超過は拒否
   let threw = null;
   try { L.appendPoItemEvent({ orderItemId: item.id, eventType: 'receipt', qty: 11, source: 'manual' }); } catch (e) { threw = e.message; }
