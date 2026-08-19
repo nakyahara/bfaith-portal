@@ -580,9 +580,10 @@ function initLedgerSchema(db) {
   addCol(db, 'po_suppliers', 'email_to', 'TEXT');       // カンマ区切り複数可 (保存時に正規化・検証)
   addCol(db, 'po_suppliers', 'email_cc', 'TEXT');
   addCol(db, 'po_suppliers', 'contact_name', 'TEXT');   // 「様」は送信時に自動補完
-  addCol(db, 'po_suppliers', 'send_method', 'TEXT');    // email / fax / web / none (NULL=未設定)
+  addCol(db, 'po_suppliers', 'send_method', 'TEXT');    // email / fax / web / relay / none (NULL=未設定)
   addCol(db, 'po_suppliers', 'lead_days', 'INTEGER');   // 標準リードタイム (欠品リスクP17で使用)
   addCol(db, 'po_suppliers', 'fax_number', 'TEXT');     // FAX番号 (eFax送信用。国内0始まり10-11桁。保存時に検証)
+  addCol(db, 'po_suppliers', 'relay_to', 'TEXT');       // 社内転送先 (send_method='relay'。先方が受信拒否等でメールが届かない仕入先向け。カンマ区切り可)
 
   // 先方管理番号対応表 (アメージングクラフト/ビーフリー等。添付CSVに先方番号列を付与する)
   db.exec(`CREATE TABLE IF NOT EXISTS po_vendor_code_map (

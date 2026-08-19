@@ -3939,6 +3939,93 @@ console.log('── P15b: FAX送信 (eFaxゲートウェイ) ──');
   ok(adminHtmlF.includes('fax_number') && adminHtmlF.includes('FAX番号'), '/admin 仕入先にFAX番号欄');
 }
 
+// ═══ P15c: 社内転送 (channel='relay'。先方の受信拒否等でメールが届かない仕入先向け — フォーユー対応 2026-08-19) ═══
+console.log('── P15c: 社内転送 (relay) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: 'relay', ...body }) });
+
+  // 仕入先マスタ: 発注方法=社内転送は relay_to 必須 / 不正アドレスは保存拒否
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'relay' });
+  ok(r.status === 400 && r.body.error.includes('社内転送'), 'suppliers: send_method=relayで転送先未入力は拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'relay', relay_to: 'not-an-address' });
+  ok(r.status === 400 && r.body.error.includes('メールアドレスが不正'), 'suppliers: 不正な転送先は保存拒否', r.body.error);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'relay',
+    relay_to: 'nakahara@b-faith.biz', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: 社内転送仕入先の登録OK', r.body.error);
+
+  // 社内転送仕入先のPOを発行 → preview は channel=relay + 宛先=社内 + 本文ベタ打ち + PDF添付名
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 48 }], requestedDate: '2026-08-31' }) });
+  ok(r.body.ok, '社内転送仕入先のPO発行', r.body.error);
+  const relayOrderId = r.body.id;
+  r = await j('/api/orders/' + relayOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'relay' && r.body.relayOrigTo === 'ken-foryou@example.jp', 'preview: channel=relay + 本来の宛先', r.body);
+  ok(r.body.to.length === 1 && r.body.to[0] === 'nakahara@b-faith.biz' && r.body.cc.length === 0, 'preview: 宛先=社内転送先 (CCなし)', r.body.to);
+  ok(/\.pdf$/.test(r.body.attachmentName), 'preview: 添付=.pdf', r.body.attachmentName);
+  ok(r.body.body.startsWith('【社内転送用】') && r.body.body.includes('本来の宛先: ken-foryou@example.jp'), 'preview: 本文冒頭に転送案内+本来の宛先', r.body.body.slice(0, 120));
+  ok(r.body.body.includes('発注内容') && r.body.body.includes('gyoumuhandcream60-BI') && r.body.body.includes('数量: 48'), 'preview: 本文に発注内容ベタ打ち', r.body.body.slice(-300));
+
+  // PDFプレビュー配信 (fake PDF。FAXと同じエンドポイントを relay でも使える)
+  {
+    const pr = await fetch(base + '/api/orders/' + relayOrderId + '/fax/pdf');
+    const buf = Buffer.from(await pr.arrayBuffer());
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf') && buf.subarray(0, 5).toString() === '%PDF-',
+      'GET /orders/:id/fax/pdf (relay) → application/pdf', pr.status);
+  }
+
+  // プレビュー時とチャネルが変わっていたら拒否
+  r = await jsonPost('/api/orders/' + relayOrderId + '/email/send', { expectedChannel: 'email' }, 'relay-key-ch');
+  ok(r.status === 400 && r.body.error.includes('送信方法が変わっています'), 'send: expectedChannel不一致は拒否 (relay)', r.body.error);
+
+  // dry-run送信: 宛先は社内へ差し替え、ジョブは channel=relay + PDFスナップショット保存
+  r = await jsonPost('/api/orders/' + relayOrderId + '/email/send', {}, 'relay-key-1');
+  ok(r.body.ok && r.body.channel === 'relay' && r.body.status === 'sent' && r.body.dryRun === true, 'relay dry-run送信 → sent', r.body);
+  const relayJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC").get(relayOrderId);
+  ok(relayJob.channel === 'relay' && relayJob.attachment_pdf && relayJob.attachment_pdf.length > 20, 'ジョブ: channel=relay + attachment_pdf保存');
+  ok(relayJob.to_addr === 'me@b-faith.biz' && relayJob.subject.startsWith('【DRYRUN】') && /\.pdf$/.test(relayJob.attachment_name),
+    'ジョブ: dry-run宛先差し替え + .pdf添付名', relayJob.to_addr);
+  ok(relayJob.body.includes('本来の宛先: 社内転送 nakahara@b-faith.biz'), 'ジョブ: dry-run本文に転送先の案内', relayJob.body.slice(0, 120));
+
+  // MIME: application/pdf 添付で組み立てられる
+  {
+    const mime = emailMod.buildMime(relayJob);
+    ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${relayJob.attachment_name}"`),
+      'buildMime: application/pdf 添付 (relay)', relayJob.attachment_name);
+    const bad = { ...relayJob, attachment_name: 'PO-1.csv' };
+    let e2 = null; try { emailMod.buildMime(bad); } catch (e) { e2 = e.message; }
+    ok(e2 && e2.includes('.pdf'), 'buildMime: relayジョブの.csv添付名は拒否', e2);
+  }
+
+  // live: 宛先は社内転送先のまま (仕入先には送らない) + dedup
+  await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  r = await jsonPost('/api/orders/' + relayOrderId + '/email/send', { expectedMode: 'live' }, 'relay-key-2');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'relay live送信 → sent (fake)', r.body);
+  const relayLiveJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? AND is_dry_run=0 ORDER BY id DESC").get(relayOrderId);
+  ok(relayLiveJob.to_addr === 'nakahara@b-faith.biz' && relayLiveJob.channel === 'relay', 'liveジョブ: 宛先=社内転送先 (先方に送らない)', relayLiveJob.to_addr);
+  r = await jsonPost('/api/orders/' + relayOrderId + '/email/send', { expectedMode: 'live' }, 'relay-key-3');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), 'relay dedup: 同一内容の本送信は拒否', r.body.error);
+  await jsonPost('/api/email/mode', { mode: 'dry_run' });
+
+  // 送信済みジョブのPDF控え配信
+  {
+    const pr = await fetch(base + '/api/email-jobs/' + relayJob.id + '/pdf');
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf'), 'GET /email-jobs/:id/pdf (relay) → PDF控え', pr.status);
+  }
+
+  // /admin に社内転送の設定欄
+  const adminHtmlR = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlR.includes('relay_to') && adminHtmlR.includes('社内転送'), '/admin 仕入先に社内転送欄');
+
+  // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元', r.body.error);
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
