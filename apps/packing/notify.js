@@ -7,7 +7,7 @@
 
 let _warnedNoWebhook = false;
 
-export async function notifyShipChange({ folderName, neSlipNo, currentMethod, proposedMethod, reason, worker }) {
+export async function notifyShipChange({ folderName, neSlipNo, currentMethod, proposedMethod, reason, worker, lines = [] }) {
   const url = process.env.PACKING_SHIP_CHANGE_WEBHOOK;
   if (!url) {
     if (!_warnedNoWebhook) {
@@ -16,13 +16,14 @@ export async function notifyShipChange({ folderName, neSlipNo, currentMethod, pr
     }
     return false;
   }
-  // 読み手 (事務) ファースト: 何をすればいいかが1行目で分かる形 (feedback_gchat_report_reader_first)
+  // 読み手 (事務) ファースト: 何をすればいいかが1行目で分かる形 (feedback_gchat_report_reader_first)。
+  // 現物は「変更待ちの棚」にある — 画面での状態管理はしない (中原さん指示 2026-08-17)
   const text = [
-    `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします`,
+    `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします (現物は変更待ち棚)`,
     `伝票: *${neSlipNo}* (${folderName || '-'})`,
+    ...lines.map((l) => `・${l.name || l.sku} × ${l.qty}個`),
     `現行: ${currentMethod || '-'} → 提案: *${proposedMethod}*`,
     `理由: ${reason} / 依頼: ${worker}`,
-    `対応状況の更新: https://picking.bfaith-wh.uk/apps/packing/admin/ship-changes`,
   ].join('\n');
   const res = await fetch(url, {
     method: 'POST',
@@ -31,4 +32,49 @@ export async function notifyShipChange({ folderName, neSlipNo, currentMethod, pr
   });
   if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
   return true;
+}
+
+// ①再ピック / ②棚戻し / 品違いの現場通知。env: PACKING_TASK_WEBHOOK
+// (未設定時は PACKING_SHIP_CHANGE_WEBHOOK へフォールバック — 同じ事務/管理スペース運用を想定)
+let _warnedNoTaskWebhook = false;
+async function postTask(text) {
+  const url = process.env.PACKING_TASK_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK;
+  if (!url) {
+    if (!_warnedNoTaskWebhook) {
+      _warnedNoTaskWebhook = true;
+      console.warn('[packing-notify] PACKING_TASK_WEBHOOK 未設定 → 再ピック/棚戻しのGChat通知なし (pickingキュー画面のみ)');
+    }
+    return false;
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}
+
+export async function notifyTask(info, worker) {
+  const head = {
+    repick: '🔴 *再ピック依頼* — 棚から取ってきてください',
+    return: '↩ *棚戻し依頼* — 余った商品を棚へ (在庫差異の可能性あり・ロジザード在庫も確認)',
+    wrong_item: '🟠 *品違い* — 正しい商品の再ピック+間違い品の棚戻し',
+  }[info.kind] || info.kind;
+  const lines = [
+    head,
+    `商品: *${info.sku}*${info.name ? ` (${info.name})` : ''} × ${info.qty}個`,
+  ];
+  if (info.actualSku) lines.push(`間違って入っていた: ${info.actualSku}`);
+  lines.push(`依頼元: ${info.folder || '-'}${info.slipSeq ? ` #${info.slipSeq}` : ''} / 依頼: ${worker}`);
+  lines.push('ピッキングのタスク画面: https://picking.bfaith-wh.uk/apps/picking/tasks');
+  return postTask(lines.join('\n'));
+}
+
+export async function notifyTaskUnavailable(task, worker) {
+  return postTask([
+    '🚨 *再ピックできません (在庫なし等)* — 出荷可否の判断が必要です',
+    `商品: *${task.sku}* × ${task.req_qty}個 / 依頼元: ${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`,
+    `報告: ${worker}`,
+  ].join('\n'));
 }

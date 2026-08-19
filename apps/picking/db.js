@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -141,6 +141,13 @@ const MIGRATIONS = {
       UNIQUE (drive_file_id, modified_time)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_drive_imports_at ON pk_drive_imports(processed_at)');
+  },
+  // v5: 端末の用途 (2026-08-17)。倉庫の掲示モニターは常時表示のため物理的に誰でも触れる。
+  // 作業用iPhoneと同じ端末Cookieを持たせると、その画面から作業APIを叩けてしまうので
+  // kind='board' を作り、掲示ルート以外を router 側で拒否する (読み取り専用端末)
+  5: () => {
+    db.exec(`ALTER TABLE pk_devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'
+      CHECK(kind IN ('worker','board'))`);
   },
 };
 
@@ -253,16 +260,16 @@ export function getDB() {
   return db;
 }
 
-/** バッチ一覧: 指定作業日 + それ以前の未完了持ち越し。cancelled は当日分のみ表示。 */
+/** バッチ一覧: 指定作業日のみ (日付が変わるとリセット — 中原さん指示 2026-08-18。
+ *  梱包 #852 と同じ仕様。過去分は日付ピッカーで参照)。 */
 export function listBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT COUNT(*) FROM pk_lines l WHERE l.batch_id = b.id AND l.status != 'pending') AS done_lines
     FROM pk_batches b
-    WHERE (b.work_date = ?
-        OR (b.work_date < ? AND b.status IN ('ready','picking','paused')))
+    WHERE b.work_date = ?
     ORDER BY b.work_date, b.id
-  `).all(workDate, workDate);
+  `).all(workDate);
 }
 
 export function getBatch(id) {
@@ -283,13 +290,19 @@ export function listLines(batchId) {
 
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 
-/** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
-export function createDevice(label, actor) {
+export const DEVICE_KINDS = ['worker', 'board'];
+
+/**
+ * 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。
+ * kind='board' は掲示モニター用 = 読み取り専用 (作業画面・作業APIは router が拒否する)。
+ */
+export function createDevice(label, actor, kind = 'worker') {
+  if (!DEVICE_KINDS.includes(kind)) throw new Error(`不正な端末用途: ${kind}`);
   const token = crypto.randomBytes(32).toString('base64url');
   getDB().prepare(`
-    INSERT INTO pk_devices (token_hash, label, created_by, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(hashToken(token), String(label).trim(), actor, utcNow());
+    INSERT INTO pk_devices (token_hash, label, created_by, created_at, kind)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(hashToken(token), String(label).trim(), actor, utcNow(), kind);
   return token;
 }
 
@@ -320,7 +333,7 @@ export function revokeDevice(id) {
 }
 
 export function listDevices() {
-  return getDB().prepare('SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM pk_devices ORDER BY id').all();
+  return getDB().prepare('SELECT id, label, kind, created_by, created_at, last_seen_at, revoked_at FROM pk_devices ORDER BY id').all();
 }
 
 // ─── 作業者マスタ (v2) ───

@@ -380,7 +380,7 @@ t('isStaleInstructDate: 出荷指示日が今日を含まなければ警告', ()
   assert.equal(isStaleInstructDate('', '2026-08-12'), false);                          // 不明はブロックしない
 });
 
-t('listBatches: 前日以前の未完了は持ち越し表示、完了は当日のみ', () => {
+t('listBatches: 当日分のみ (日付が変わるとリセット — 2026-08-18 持ち越し廃止)', () => {
   const db = getDB();
   const mk = (tb, workDate, status) => {
     db.prepare(`INSERT INTO pk_batches
@@ -389,11 +389,11 @@ t('listBatches: 前日以前の未完了は持ち越し表示、完了は当日�
       VALUES (?, 'テスト', ?, '単品', 1, 1, 1, ?, 'x', 't@b', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z')
     `).run(tb, workDate, status);
   };
-  mk('TB_Y1', '2000-01-01', 'ready');   // 持ち越し
+  mk('TB_Y1', '2000-01-01', 'ready');   // 過去の未完了 → 出ない (日付ピッカーで参照)
   mk('TB_Y2', '2000-01-01', 'done');    // 過去の完了 → 出ない
   const list = listBatches(jstToday());
   const tbs = list.map((b) => b.tb_no);
-  assert.ok(tbs.includes('TB_Y1'));
+  assert.ok(!tbs.includes('TB_Y1'));
   assert.ok(!tbs.includes('TB_Y2'));
 });
 

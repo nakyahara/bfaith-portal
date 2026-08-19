@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 7;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -167,6 +167,84 @@ const MIGRATIONS = {
       created_at      TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_ship_changes ON pk_pack_ship_changes(status, id)');
+  },
+  // v4: ①再ピック / ②棚戻し / ③ピッキングミス記録 (要件§5.4〜5.6・Phase 2)
+  4: () => {
+    // 再ピック・棚戻しタスク。DBの行が正本 (GChat通知はチャネル)。
+    // 実行UIは apps/picking (要件§7.1) だが、更新は packing の service (applyTaskAction) を通す
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_tasks (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id     INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq     INTEGER,               -- 依頼元伝票 (余りはバッチ単位でNULLあり)
+      kind         TEXT NOT NULL CHECK(kind IN ('repick','return')),
+      sku          TEXT NOT NULL,
+      product_name TEXT,
+      req_qty      INTEGER NOT NULL,
+      location     TEXT,                  -- pk_lines由来の参考ロケ (戻し先の正ではない — 要件§5.5)
+      block        TEXT,
+      folder_name  TEXT,                  -- 依頼元 出荷_XX (届け先の識別)
+      status       TEXT NOT NULL DEFAULT 'requested'
+        CHECK(status IN ('requested','claimed','fulfilled','returned','received','unavailable','cancelled')),
+      requested_by TEXT NOT NULL,
+      claimed_by   TEXT,
+      incident_id  INTEGER,               -- 対応するミス候補 (wrong_itemは2タスクが同じidを指す)
+      created_at   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_open ON pk_pack_tasks(status, id)');
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_tasks_batch ON pk_pack_tasks(batch_id, slip_seq)');
+    // ピッキングミス候補 (③)。作業中=candidate → 梱包完了サマリで confirmed / withdrawn (要件§5.6 2段階)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_incidents (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id          INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq          INTEGER,
+      kind              TEXT NOT NULL CHECK(kind IN ('shortage','excess','wrong_item')),
+      sku               TEXT NOT NULL,     -- 期待SKU (excessは余った実SKU)
+      actual_sku        TEXT,              -- wrong_item: 実際に入っていたSKU
+      qty               INTEGER NOT NULL,
+      status            TEXT NOT NULL DEFAULT 'candidate'
+        CHECK(status IN ('candidate','withdrawn','confirmed')),
+      attributed_worker TEXT,              -- 確定時: pk_batches.worker (ピッキング担当)
+      detected_by       TEXT NOT NULL,     -- 検知した梱包者
+      confirmed_by      TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_incidents_batch ON pk_pack_incidents(batch_id, status)');
+  },
+  // v5: ④通知の配送保証 (Codexレビュー high: 事務キュー廃止後、GChat失敗で依頼が事実上消える)。
+  // 通知成否を行に記録し、失敗分はポーラーが再送する
+  5: () => {
+    db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notified_at TEXT');
+    db.exec('ALTER TABLE pk_pack_ship_changes ADD COLUMN notify_error TEXT');
+  },
+  // v6: 梱包機ライン管理 (PAS-LINE/MELT-LINE — 紙台帳の置き換え。中原さん指示 2026-08-18)。
+  // 梱包機バッチは1伝票1画面ではなく工程単位で記録する:
+  //   sort = MELT-LINE の事前仕分け (final_count = 配送変更を差し引いた最終通過件数)
+  //   run  = 機械流し (final_count = 出荷完了件数 / manual_count = うち手動で流した件数)
+  6: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_line_runs (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      phase         TEXT NOT NULL CHECK(phase IN ('sort','run')),
+      started_at    TEXT,
+      finished_at   TEXT,
+      planned_count INTEGER,
+      final_count   INTEGER,
+      manual_count  INTEGER,
+      note          TEXT,
+      worker        TEXT,
+      updated_at    TEXT NOT NULL,
+      UNIQUE (batch_id, phase)
+    )`);
+  },
+  // v7: ライン運用改善 (中原さん指示 2026-08-18 実機フィードバック)。
+  // MELT仕分けは「他の方法で出荷する件数」を入力し、機械に流す件数=伝票数-除外を自動計算
+  7: () => {
+    db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN excluded_count INTEGER');
+    // v6時代の記録済み仕分け行をバックフィル (Codex medium: NULLのままだと「除外0件」と矛盾表示)
+    db.exec(`UPDATE pk_pack_line_runs SET excluded_count = planned_count - final_count
+      WHERE phase = 'sort' AND final_count IS NOT NULL AND excluded_count IS NULL`);
   },
 };
 
@@ -287,16 +365,15 @@ export function getDB() {
   return db;
 }
 
-/** バッチ一覧: 指定作業日 + それ以前の未完了持ち越し。cancelled は当日分のみ。 */
+/** バッチ一覧: 指定作業日のみ (過去分は日付ピッカーで参照。中原さん指示 2026-08-18 で持ち越し表示を廃止)。 */
 export function listPackBatches(workDate) {
   return getDB().prepare(`
     SELECT b.*,
       (SELECT COUNT(*) FROM pk_pack_slips s WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips
     FROM pk_pack_batches b
-    WHERE (b.work_date = ?
-        OR (b.work_date < ? AND b.status IN ('ready','packing','paused')))
-    ORDER BY b.work_date, b.id
-  `).all(workDate, workDate);
+    WHERE b.work_date = ?
+    ORDER BY b.id
+  `).all(workDate);
 }
 
 export function getPackBatch(id) {

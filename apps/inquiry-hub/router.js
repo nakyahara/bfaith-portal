@@ -20,8 +20,10 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, listInquiries, listFilterOptions, countByView, countInboxByGroup, getInquiryDetail, getAdjacentInquiries } from './queries.js';
+import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
+import { aiRewriteEnabled, rewriteReply, draftReply, REWRITE_STYLES } from './ai-rewrite.js';
+import { findRelevantKnowledge, formatKnowledgeForPrompt } from './knowledge.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
@@ -129,6 +131,24 @@ router.get('/', (req, res) => {
       `<a class="${group === key ? 'on' : ''}" href="${he(tabLink(key))}">${g.icon} ${he(g.label)} ${tabCnt(inboxCounts[key])}</a>`).join('')}
   </nav>`;
 
+  // ─── 状態タブ (2026-08-17 スタッフ要望: モール問い合わせの中でも 新着/返信処理中/完了 を切替) ───
+  // 件数は「いま見ている文脈 (チャネルグループ・フォルダ) の中での件数」= タブを押した先の実件数。
+  // 切替では view と page だけ変え、他の絞り込みは維持する
+  let viewCounts = {};
+  try { viewCounts = countViewsInContext({ group, folder: q.folder }); } catch { /* 初期化前は件数なし */ }
+  const viewLink = (v) => {
+    const u = new URLSearchParams(Object.entries(q).filter(([k, val]) => !['view', 'page'].includes(k) && val !== '' && val != null));
+    u.set('view', v);
+    return `/apps/inquiry-hub?${u.toString()}`;
+  };
+  const viewTabs = `
+  <nav class="view-tabs">
+    ${Object.entries(VIEWS).map(([key, v]) => {
+      const n = viewCounts[key];
+      return `<a class="${view === key ? 'on' : ''}" href="${he(viewLink(key))}" title="${he(v.hint)}">${v.icon} ${he(v.label)}<span class="vt-cnt${n ? '' : ' zero'}">${n || 0}</span></a>`;
+    }).join('')}
+  </nav>`;
+
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
   // view/page はビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
@@ -174,6 +194,7 @@ router.get('/', (req, res) => {
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
   const trs = rows.map(r => `
     <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}${detailQs}'">
+      <td class="selcell" onclick="event.stopPropagation()"><input type="checkbox" class="rowchk" value="${r.id}" aria-label="選択"></td>
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
@@ -208,14 +229,30 @@ router.get('/', (req, res) => {
     : q.folder === 'none'
       ? `🗃️ <b>未分類</b> — フォルダに入れていない問い合わせ <span class="sub">(${he(VIEWS[view].label)}で絞り込み中)</span>`
       : `${VIEWS[view].icon} <b>${he(VIEWS[view].label)}</b> — ${he(VIEWS[view].hint)}`;
+  // ─── 一括操作バー (2026-08-17 スタッフ要望。メールディーラー相当) ───
+  // チェックした行に対して 状態/フォルダ/担当/既読 をまとめて変更する。削除は提供しない
+  // (取り消せない操作は一括で出さない)。実行前に必ず確認ダイアログを出す
+  const bulkBar = `
+  <div class="bulkbar" id="bulkBar" hidden>
+    <span class="bulk-n"><b id="bulkCount">0</b>件を選択中</span>
+    <select id="bulkStatus"><option value="">状態: 変更なし</option>${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}">${he(v.label)}にする</option>`).join('')}</select>
+    <select id="bulkFolder"><option value="">フォルダ: 変更なし</option><option value="none">📁 未分類に戻す</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}へ</option>`).join('')}</select>
+    <select id="bulkAssign"><option value="">担当: 変更なし</option><option value="__me__">自分にする</option><option value="__none__">未割当にする</option>${assignees.map(u => `<option value="${he(u)}">${he(u)}</option>`).join('')}</select>
+    <select id="bulkRead"><option value="">既読: 変更なし</option><option value="read">既読にする</option><option value="unread">未読にする</option></select>
+    <button class="pri" id="bulkApply">選択した${''}件に適用</button>
+    <button class="ghost" id="bulkClear">選択を解除</button>
+  </div>`;
+
   const body = `
   ${chTabs}
+  ${viewTabs}
   <div class="view-hint">${hintLine}</div>
   ${filterBar}
+  ${bulkBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
-      <tbody>${trs || `<tr><td colspan="7" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
+      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <tbody>${trs || `<tr><td colspan="8" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
   </div>`;
@@ -233,6 +270,71 @@ router.get('/', (req, res) => {
     }
     sync();
     mq.addEventListener ? mq.addEventListener('change', sync) : mq.addListener(sync);
+  })();
+  // ─── 一括操作 (2026-08-17 スタッフ要望) ───
+  (function() {
+    var bar = document.getElementById('bulkBar');
+    if (!bar) return;
+    var ME = ${JSON.stringify(String(actorOf(req))).replace(/</g, '\\u003c')};
+    var chkAll = document.getElementById('chkAll');
+    var countEl = document.getElementById('bulkCount');
+    var applyBtn = document.getElementById('bulkApply');
+    function rows() { return Array.prototype.slice.call(document.querySelectorAll('.rowchk')); }
+    function selected() { return rows().filter(function(c) { return c.checked; }).map(function(c) { return Number(c.value); }); }
+    function refresh() {
+      var n = selected().length;
+      countEl.textContent = n;
+      applyBtn.textContent = '選択した' + n + '件に適用';
+      bar.hidden = n === 0;
+      var all = rows();
+      chkAll.checked = all.length > 0 && n === all.length;
+      chkAll.indeterminate = n > 0 && n < all.length;
+    }
+    chkAll.addEventListener('change', function() {
+      rows().forEach(function(c) { c.checked = chkAll.checked; });
+      refresh();
+    });
+    rows().forEach(function(c) { c.addEventListener('change', refresh); });
+    document.getElementById('bulkClear').addEventListener('click', function() {
+      rows().forEach(function(c) { c.checked = false; });
+      refresh();
+    });
+    applyBtn.addEventListener('click', function() {
+      var ids = selected();
+      if (!ids.length) return;
+      var ops = {};
+      var desc = [];
+      var st = document.getElementById('bulkStatus');
+      if (st.value) { ops.status = st.value; desc.push('状態→' + st.options[st.selectedIndex].textContent); }
+      var fo = document.getElementById('bulkFolder');
+      if (fo.value) {
+        ops.folderId = fo.value === 'none' ? null : Number(fo.value);
+        desc.push('フォルダ→' + fo.options[fo.selectedIndex].textContent);
+      }
+      var asg = document.getElementById('bulkAssign');
+      if (asg.value) {
+        ops.assigned = asg.value === '__me__' ? ME : (asg.value === '__none__' ? '' : asg.value);
+        desc.push('担当→' + asg.options[asg.selectedIndex].textContent);
+      }
+      var rd = document.getElementById('bulkRead');
+      if (rd.value) { ops.isUnread = rd.value === 'unread'; desc.push(rd.value === 'unread' ? '未読にする' : '既読にする'); }
+      if (!desc.length) { toast('変更内容を選んでください'); return; }
+      if (!confirm(ids.length + '件をまとめて変更します。\\n\\n' + desc.join('\\n') + '\\n\\nよろしいですか?')) return;
+      applyBtn.disabled = true;
+      fetch('/apps/inquiry-hub/api/inquiries/bulk', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: ids, ops: ops })
+      }).then(function(r) {
+        return r.json().catch(function(){ return {}; }).then(function(j) {
+          if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+          return j;
+        });
+      }).then(function(j) {
+        toast(j.updated + '件を変更しました' + (j.skipped ? ' (' + j.skipped + '件は変更なし)' : ''));
+        setTimeout(function(){ location.reload(); }, 800);
+      }).catch(function(e) { toast('失敗: ' + e.message); applyBtn.disabled = false; });
+    });
+    refresh();
   })();`;
   res.send(pageShell(
     curFolder ? `問い合わせ管理 — 📁${curFolder.name}` : `問い合わせ管理 — ${VIEWS[view].label}`,
@@ -370,7 +472,17 @@ router.get('/inquiries/:id', (req, res) => {
           <select id="tplSel" title="テンプレートを選ぶ"><option value="">テンプレートを選ぶ…</option></select>
           <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
         </div>
+        ${aiRewriteEnabled() ? `<div class="row rw-row" id="draftRow">
+          <button class="pri" type="button" id="draftBtn">✨ AIで下書き</button>
+          <span class="sub">社内Q&amp;A・テンプレートを参照して返信案を作ります</span>
+        </div>
+        <div class="draft-warn" id="draftWarn" hidden></div>` : ''}
         <textarea id="replyBody" rows="6" placeholder="返信本文 (上のテンプレート選択からも入れられます)"></textarea>
+        ${aiRewriteEnabled() ? `<div class="row rw-row" id="rwRow">
+          <span class="sub">✨AIで整える:</span>
+          ${Object.entries(REWRITE_STYLES).map(([k, v]) => `<button class="ghost rw-btn" type="button" data-style="${k}">${he(v.label)}</button>`).join('')}
+          <button class="ghost" type="button" id="rwUndoBtn" style="display:none">↩ 元に戻す</button>
+        </div>` : ''}
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
@@ -412,9 +524,16 @@ router.get('/inquiries/:id', (req, res) => {
           <select id="mrAction">
             <option value="skip">取り込まない (問い合わせにしない)</option>
             <option value="import_done">取り込むが完了扱い (履歴には残す)</option>
+            <option value="import">📁フォルダに入れる (新着のまま)</option>
           </select>
         </div>
-        <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールも完了にする</label>
+        <div class="row rule-row">
+          <select id="mrFolder" title="取り込むメールを入れるフォルダ (「フォルダに入れる」では必須。完了扱いと組み合わせも可)">
+            <option value="">📁 フォルダ指定なし</option>
+            ${folderList.map(f => `<option value="${f.id}"${inq.folder_id === f.id ? ' selected' : ''}>📁 ${he(f.name)}</option>`).join('')}
+          </select>
+        </div>
+        <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールにも適用する</label>
         <div class="sub">※ 一括適用は差出人・件名の条件のみ対応 (Reply-To/To/本文は今後の取り込みから効きます)</div>
         <button class="pri" id="mrBtn" style="margin-top:6px">ルールを作成</button>
       </div>` : '';
@@ -607,26 +726,37 @@ router.get('/inquiries/:id', (req, res) => {
       var conditions = collectConditions();
       if (!conditions.length) { toast('条件を1つ以上入力してください'); return; }
       var action = document.getElementById('mrAction').value;
+      var folderSel = document.getElementById('mrFolder');
+      var folderId = folderSel.value ? Number(folderSel.value) : null;
+      var folderName = folderSel.value ? folderSel.options[folderSel.selectedIndex].textContent.replace(/^\\s*📁\\s*/, '') : '';
+      if (action === 'import' && !folderId) { toast('「フォルダに入れる」はフォルダを選んでください'); return; }
+      if (action === 'skip') folderId = null; // 取り込まないルールにフォルダは無意味
+      var actionLabel = action === 'skip' ? '取り込まない'
+        : action === 'import' ? 'フォルダ「' + folderName + '」に入れる (新着のまま)'
+        : '取り込むが完了扱い' + (folderId ? ' + フォルダ「' + folderName + '」へ' : '');
       var matchMode = document.getElementById('mrMode').value;
       var applyExisting = document.getElementById('mrApplyExisting').checked;
       mrBtn.disabled = true;
-      // まず件数を数えてから確認する (いきなり大量を完了にしない)
-      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, applyToExisting: applyExisting, dryRun: true })
+      // まず件数を数えてから確認する (いきなり大量を変更しない)
+      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, applyToExisting: applyExisting, dryRun: true })
         .then(function(p) {
-          var msg = 'ルール: ' + p.description + '\\n扱い: ' + (action === 'skip' ? '取り込まない' : '取り込むが完了扱い');
+          var msg = 'ルール: ' + p.description + '\\n扱い: ' + actionLabel;
           if (applyExisting) {
             msg += p.canApplyToExisting
-              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も完了にします'
+              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も' + (action === 'import' ? 'フォルダに入れます' : '完了にします')
               : '\\n\\n⚠️ この条件は既存メールへの一括適用に対応していません (差出人・件名の条件のみ)。今後の取り込みからルールが効きます';
           }
           msg += '\\n\\n作成しますか?';
           if (!confirm(msg)) { mrBtn.disabled = false; return null; }
-          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action,
+          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId,
             applyToExisting: applyExisting && p.canApplyToExisting });
         })
         .then(function(r) {
           if (!r) return;
-          toast('ルールを作成しました' + (r.completed ? ' (既存' + r.completed + '件を完了に)' : ''));
+          var done = [];
+          if (r.completed) done.push('既存' + r.completed + '件を完了に');
+          if (r.foldered) done.push('既存' + r.foldered + '件をフォルダへ');
+          toast('ルールを作成しました' + (done.length ? ' (' + done.join('・') + ')' : ''));
           setTimeout(function(){ location.reload(); }, 1000);
         })
         .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
@@ -692,10 +822,106 @@ router.get('/inquiries/:id', (req, res) => {
     // セレクトで選んだだけでも反映する (ボタンは空欄時の説明・視認性のために残す)
     tplSel.addEventListener('change', function() { if (tplSel.value) applyTpl(); });
   })();
+  // ✨ AI下書き (2026-08-17 第1段階): 社内Q&A/テンプレートを参照して返信案を作る。
+  // AIが埋められなかった箇所は【要確認:】で残るので、警告を出して人が埋めてから送らせる
+  var PLACEHOLDER_RE = /【要確認[:：][^】]*】/g;
+  function updateDraftWarn() {
+    var warn = document.getElementById('draftWarn');
+    var ta = document.getElementById('replyBody');
+    if (!warn || !ta) return;
+    var hits = ta.value.match(PLACEHOLDER_RE) || [];
+    if (!hits.length) { warn.hidden = true; return; }
+    var uniq = hits.filter(function(v, i, a) { return a.indexOf(v) === i; });
+    warn.hidden = false;
+    // textContent で組み立てる (AI出力をそのまま innerHTML に入れない)
+    warn.textContent = '';
+    var head = document.createElement('b');
+    head.textContent = '⚠️ AIが確認を求めています (' + uniq.length + '箇所)';
+    warn.appendChild(head);
+    var body = document.createElement('div');
+    body.className = 'sub';
+    body.textContent = '送信前に、実際の内容を調べて置き換えてください: ';
+    uniq.forEach(function(s, i) {
+      if (i) body.appendChild(document.createTextNode(' '));
+      var c = document.createElement('code');
+      c.textContent = s;
+      body.appendChild(c);
+    });
+    warn.appendChild(body);
+  }
+  var draftBtn = document.getElementById('draftBtn');
+  if (draftBtn) {
+    var ta0 = document.getElementById('replyBody');
+    if (ta0) ta0.addEventListener('input', updateDraftWarn);
+    draftBtn.addEventListener('click', function() {
+      var ta = document.getElementById('replyBody');
+      if (ta.value.trim() && !confirm('返信欄の内容をAIの下書きで置き換えますか?')) return;
+      draftBtn.disabled = true;
+      var orig = draftBtn.textContent;
+      draftBtn.textContent = '✨ 下書き作成中…';
+      post('/ai-draft', {})
+        .then(function(r) {
+          ta.value = r.text;
+          updateDraftWarn();
+          ta.focus();
+          var src = [];
+          if (r.sources && r.sources.qa.length) src.push('Q&A ' + r.sources.qa.length + '件');
+          if (r.sources && r.sources.templates.length) src.push('テンプレ ' + r.sources.templates.length + '件');
+          toast('下書きを作成しました' + (src.length ? ' (' + src.join('・') + 'を参照)' : ' (参照できる社内Q&Aは見つかりませんでした)')
+            + (r.placeholders.length ? ' — 要確認' + r.placeholders.length + '箇所' : ''));
+        })
+        .catch(function(e) { toast('下書き失敗: ' + e.message); })
+        .then(function() { draftBtn.textContent = orig; draftBtn.disabled = false; });
+    });
+  }
+  // ✨ AI書き換え (2026-08-17 スタッフ要望): 入力中の文章を丁寧に/やわらかく/簡潔に整える。
+  // 書き換え前の文は保持して「元に戻す」で復元できる
+  var rwRow = document.getElementById('rwRow');
+  if (rwRow) (function() {
+    var rwPrev = null;
+    var undoBtn = document.getElementById('rwUndoBtn');
+    var rwBtns = rwRow.querySelectorAll('.rw-btn');
+    function setBusy(busy) {
+      rwBtns.forEach(function(b) { b.disabled = busy; });
+      undoBtn.disabled = busy;
+    }
+    rwBtns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var ta = document.getElementById('replyBody');
+        var text = ta.value.trim();
+        if (!text) { toast('先に返信文を入力してください'); return; }
+        setBusy(true);
+        var orig = btn.textContent;
+        btn.textContent = '✨ 書き換え中…';
+        post('/ai-rewrite', { style: btn.dataset.style, text: text })
+          .then(function(r) {
+            rwPrev = ta.value;
+            ta.value = r.text;
+            undoBtn.style.display = '';
+            ta.focus();
+            toast('書き換えました。内容を確認してから送信してください (↩で元に戻せます)');
+          })
+          .catch(function(e) { toast('書き換え失敗: ' + e.message); })
+          .then(function() { btn.textContent = orig; setBusy(false); });
+      });
+    });
+    undoBtn.addEventListener('click', function() {
+      if (rwPrev == null) return;
+      var ta = document.getElementById('replyBody');
+      var cur = ta.value;
+      ta.value = rwPrev;
+      rwPrev = cur;  // もう一度押すと書き換え後に戻れる (トグル)
+      toast('戻しました (もう一度押すと書き換え後に戻ります)');
+    });
+  })();
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
     if (!body) { toast('本文が空です'); return; }
+    // AI下書きの【要確認:】が残ったまま送ろうとしたら止める (未確認の事実が客に飛ぶ事故の防止)
+    var left = (body.match(PLACEHOLDER_RE) || []).filter(function(v, i, a) { return a.indexOf(v) === i; });
+    if (left.length && !confirm('⚠️ 未確認の箇所が' + left.length + '件残っています:\\n\\n' + left.join('\\n')
+      + '\\n\\nこのまま送信ジョブを作成しますか? (通常は実際の内容に置き換えてから送ります)')) return;
     var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
     var completeEl = document.getElementById('replyComplete');
     var complete = !!(completeEl && completeEl.checked);
@@ -742,6 +968,68 @@ router.get('/api/templates', (req, res) => {
       bodyBottom: t.body_bottom || '',
     })),
   });
+});
+
+// 一括操作 (2026-08-17 スタッフ要望)。一覧のチェックボックスから状態/フォルダ/担当/既読をまとめて変更。
+// 削除系は提供しない (取り消せない操作は一括にしない)。1件ずつ操作ログを残す
+router.post('/api/inquiries/bulk', (req, res) => {
+  const b = req.body || {};
+  try {
+    const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req) });
+    console.log(`[inquiry-hub] 一括操作 ${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// ✨ AI下書き (2026-08-17 第1段階)。社内Q&A・返信テンプレートから関連するものを選んでAIに渡し、
+// 返信の下書きを作る。⚠️根拠のない事柄は AI に【要確認: ○○】で残させ、人が埋めてから送る運用。
+// 自動学習 (返信結果でナレッジを書き換える) は意図的に入れていない — まず「どこで詰まるか」を実データで見る
+router.post('/api/inquiries/:id(\\d+)/ai-draft', async (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  if (!aiRewriteEnabled()) return res.status(403).json({ error: 'AI下書きは未設定です (env OPENAI_API_KEY)' });
+  try {
+    const messages = getDB().prepare(`SELECT is_incoming, sender_name, message_body_text
+      FROM inquiry_messages WHERE inquiry_id = ?
+      ORDER BY COALESCE(received_at, sent_at, created_at), id`).all(inq.id);
+    const firstIncoming = messages.find(m => m.is_incoming)?.message_body_text || '';
+    const knowledge = findRelevantKnowledge({
+      subject: inq.subject, body: firstIncoming,
+      productName: inq.product_name, productCode: inq.product_code,
+    });
+    const r = await draftReply({
+      inquiry: inq, messages,
+      knowledgeText: formatKnowledgeForPrompt(knowledge),
+    });
+    console.log(`[inquiry-hub] AI下書き (model=${r.model}, Q&A${knowledge.qa.length}件/テンプレ${knowledge.templates.length}件参照, 要確認${r.placeholders.length}箇所) by ${actorOf(req)} inquiry=${inq.id}`);
+    res.json({ ok: true, text: r.text, placeholders: r.placeholders,
+      sources: { qa: knowledge.qa.map(q => q.title), templates: knowledge.templates.map(t => t.name) } });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// ✨ 返信文のAI書き換え (2026-08-17 スタッフ要望)。OPENAI_API_KEY があるときだけUI表示・実行可。
+// 最新の顧客メッセージを文脈として渡し、文体だけ整える (内容の追加はプロンプトで禁止)
+router.post('/api/inquiries/:id(\\d+)/ai-rewrite', async (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  if (!aiRewriteEnabled()) return res.status(403).json({ error: 'AI書き換えは未設定です (env OPENAI_API_KEY)' });
+  const b = req.body || {};
+  try {
+    const lastIncoming = getDB().prepare(`SELECT message_body_text FROM inquiry_messages
+      WHERE inquiry_id = ? AND is_incoming = 1
+      ORDER BY COALESCE(received_at, sent_at, created_at) DESC, id DESC LIMIT 1`).get(inq.id);
+    const r = await rewriteReply({
+      style: String(b.style || ''),
+      text: String(b.text || ''),
+      inquiryContext: lastIncoming?.message_body_text || '',
+    });
+    console.log(`[inquiry-hub] AI書き換え (${b.style}, model=${r.model}, ${String(b.text || '').length}→${r.text.length}文字) by ${actorOf(req)} inquiry=${inq.id}`);
+    res.json({ ok: true, text: r.text });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
 });
 
 const NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%SZ','now')"; // 日時の正準形式 (db.js toUtcIso と同形)
@@ -873,7 +1161,13 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   if (inq.channel_type !== 'email') return res.status(400).json({ error: 'メール以外のチャネルでは使えません' });
   const b = req.body || {};
   const action = String(b.action || '');
-  if (!['skip', 'import_done'].includes(action)) return res.status(400).json({ error: '不正な扱いです' });
+  if (!['skip', 'import_done', 'import'].includes(action)) return res.status(400).json({ error: '不正な扱いです' });
+  // フォルダ振り分け (2026-08-17 中原さん要望: Gmailの振り分けのように、その場で「今後はこのフォルダへ」)
+  const folderId = b.folderId != null && b.folderId !== '' ? Number(b.folderId) : null;
+  if (folderId != null && !Number.isInteger(folderId)) return res.status(400).json({ error: 'フォルダ指定が不正です' });
+  const folder = folderId != null ? listFolders().find(f => f.id === folderId) : null;
+  if (folderId != null && !folder) return res.status(400).json({ error: '指定のフォルダが存在しません' });
+  if (action === 'import' && !folder) return res.status(400).json({ error: '「フォルダに入れる」はフォルダの指定が必要です' });
 
   // 条件は画面が組み立てて配列で渡す (メールディーラーと同じく複数条件の組み合わせが可能)。
   // 値の検証は mail-rules.js の validateConditions (フィールド/演算子のallow-list) に委ねる
@@ -890,6 +1184,9 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
   }
+  const actionLabel = action === 'skip' ? '取り込まない'
+    : action === 'import' ? `📁${folder.name}へ`
+      : `完了扱い${folder ? ` + 📁${folder.name}へ` : ''}`;
 
   const applyToExisting = b.applyToExisting === true;
   const applicable = canApplyToExisting(conditions);
@@ -897,25 +1194,25 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
     // 下見: ルールは作らず、既存で何件が対象になるかだけ返す
     if (b.dryRun === true) {
       const matched = applicable
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: false }).matched : 0;
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: false, action, folderId }).matched : 0;
       return res.json({ ok: true, description, canApplyToExisting: applicable, matched: applyToExisting ? matched : 0 });
     }
     // ルール作成と既存への一括適用は同一トランザクションで (途中で失敗したときに
     // ルールだけ残り、再試行で重複ルールができるのを防ぐ。Codexレビュー反映)
-    const { created, completed } = getDB().transaction(() => {
+    const { created, completed, foldered } = getDB().transaction(() => {
       const c = addMailRule({
-        name: `${description} → ${action === 'skip' ? '取り込まない' : '完了扱い'}`.slice(0, 200),
-        matchMode, conditions, action, priority: 50,
+        name: `${description} → ${actionLabel}`.slice(0, 200),
+        matchMode, conditions, action, priority: 50, folderId,
       });
       // 既存への一括適用は差出人・件名の条件のみ (Reply-To/To/本文は inquiries に無いため)。
       // 非対応の条件でも「今後の取り込み」からはルールが効く
-      const n = (applyToExisting && applicable)
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req) }).completed
-        : 0;
-      return { created: c, completed: n };
+      const r = (applyToExisting && applicable)
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req), action, folderId })
+        : { completed: 0, foldered: 0 };
+      return { created: c, completed: r.completed, foldered: r.foldered };
     }).immediate();
-    console.log(`[inquiry-hub] メールルール作成 (${description} → ${action}) by ${actorOf(req)} / 既存${completed}件を完了`);
-    res.json({ ok: true, id: created.id, description, completed });
+    console.log(`[inquiry-hub] メールルール作成 (${description} → ${actionLabel}) by ${actorOf(req)} / 既存 完了${completed}件・フォルダ${foldered}件`);
+    res.json({ ok: true, id: created.id, description, completed, foldered });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
   }
@@ -1371,10 +1668,13 @@ const RULE_OP_LABELS = {
 const RULE_ACTION_LABELS = {
   skip: { label: '🗑️取り込まない', style: 'background:#fee2e2;color:#b91c1c' },
   import_done: { label: '✅取込+完了扱い', style: 'background:#dcfce7;color:#166534' },
+  import: { label: '📁フォルダに入れる', style: 'background:#fef9c3;color:#854d0e' },
 };
 
 router.get('/mail-rules', (req, res) => {
   const rules = listMailRules();
+  const folders = listFolders();
+  const folderNameById = Object.fromEntries(folders.map(f => [f.id, f.name]));
   const fmtConds = (r) => {
     let conds;
     try { conds = JSON.parse(r.conditions_json); } catch { return '(解析不能)'; }
@@ -1383,12 +1683,13 @@ router.get('/mail-rules', (req, res) => {
   };
   const trs = rules.map(r => {
     const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
+    const folderTag = r.folder_id ? ` <span class="folder-chip">📁${he(folderNameById[r.folder_id] || `#${r.folder_id} (削除済み)`)}</span>` : '';
     return `
     <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
       <td class="nowrap" data-label="優先度">${r.priority}</td>
       <td data-full>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
       <td style="overflow-wrap:anywhere" data-full data-label="条件">${fmtConds(r)}</td>
-      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span></td>
+      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span>${folderTag}</td>
       <td class="nowrap ops">
         <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
         <button onclick="deleteRule(${r.id}, this)">削除</button>
@@ -1432,9 +1733,11 @@ router.get('/mail-rules', (req, res) => {
       </div>`).join('')}
       <div class="row rule-row" style="align-items:center">
         <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
-        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option></select>
+        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option><option value="import">📁フォルダに入れる (新着のまま)</option></select>
+        <select id="nFolder"><option value="">📁 フォルダ指定なし</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}</option>`).join('')}</select>
         <button class="pri" onclick="addRule(this)">追加</button>
       </div>
+      <div class="sub">フォルダは「取り込まない」以外で指定できます (「フォルダに入れる」では必須。取込+完了扱いとの組み合わせも可)</div>
     </div>
   </div>
   <div class="card">
@@ -1491,8 +1794,9 @@ async function testRule(btn) {
       from: document.getElementById('tFrom').value, subject: document.getElementById('tSubject').value,
       reply_to: document.getElementById('tReplyTo').value, body: document.getElementById('tBody').value,
     });
+    var actLabel = { skip: '🗑️取り込まない', import_done: '✅取込+完了扱い', import: '📁フォルダに入れる' };
     document.getElementById('testResult').textContent = r.match
-      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (r.match.action === 'skip' ? '🗑️取り込まない' : '✅取込+完了扱い')
+      ? '→ ルール#' + r.match.ruleId + (r.match.ruleName ? ' (' + r.match.ruleName + ')' : '') + ' に一致: ' + (actLabel[r.match.action] || r.match.action)
       : '→ どのルールにも一致しない = 通常どおり問い合わせとして取り込む';
   } catch (e) { toast('失敗: ' + e.message); }
   btn.disabled = false;
@@ -1511,6 +1815,7 @@ async function addRule(btn) {
     await post('/apps/inquiry-hub/api/mail-rules', {
       name: document.getElementById('nName').value, priority: Number(document.getElementById('nPriority').value),
       matchMode: document.getElementById('nMode').value, action: document.getElementById('nAction').value,
+      folderId: document.getElementById('nFolder').value || null,
       conditions: conditions,
     });
     toast('追加しました'); setTimeout(function(){ location.reload(); }, 700);
@@ -1528,7 +1833,7 @@ document.getElementById('ruleFilter').addEventListener('input', function() {
 router.post('/api/mail-rules', (req, res) => {
   try {
     const b = req.body || {};
-    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority) }) });
+    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority), folderId: b.folderId }) });
   } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
 });
 
@@ -1988,6 +2293,24 @@ button:disabled { opacity: .5; cursor: default; }
 .tab-cnt { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 999px;
   padding: 1px 8px; font-size: 12px; margin-left: 2px; vertical-align: 1px; }
 .tab-cnt.zero { background: #f1f5f9; color: #94a3b8; }
+/* ═══ 状態タブ (新着/返信処理中/完了/すべて)。上部タブの下に並ぶ ═══ */
+.view-tabs { display: flex; gap: 6px; margin: 0 0 12px; flex-wrap: wrap; }
+.view-tabs a { padding: 6px 12px; border-radius: 999px; color: #475569; font-size: 13px; font-weight: 600;
+  background: #f1f5f9; border: 1px solid transparent; white-space: nowrap; }
+.view-tabs a:hover { background: #e2e8f0; text-decoration: none; }
+.view-tabs a.on { background: #1d4ed8; color: #fff; border-color: #1d4ed8; }
+.vt-cnt { display: inline-block; margin-left: 6px; background: rgba(0,0,0,.08); border-radius: 999px;
+  padding: 0 7px; font-size: 12px; }
+.view-tabs a.on .vt-cnt { background: rgba(255,255,255,.25); }
+.vt-cnt.zero { opacity: .55; }
+/* ═══ 一括操作バー ═══ */
+.bulkbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; padding: 10px 12px; margin-bottom: 12px; }
+.bulkbar .bulk-n { font-size: 13px; color: #1e40af; margin-right: 4px; }
+.bulkbar select { padding: 5px 8px; }
+.bulkbar button { margin: 0; }
+th.selcell, td.selcell { width: 34px; text-align: center; }
+td.selcell input, th.selcell input { width: 18px; height: 18px; cursor: pointer; }
 .detail-head h2 { margin: 8px 0 12px; font-size: 18px; }
 .detail-nav { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .detail-nav-adj { display: flex; gap: 14px; }
@@ -2032,6 +2355,14 @@ figure.att-img.att-err .att-fail { display: block; }
 .tpl-row { margin-bottom: 8px; flex-wrap: wrap; }
 .tpl-row #tplCat { max-width: 40%; }
 .tpl-row #tplSel { flex: 1; min-width: 160px; }
+/* AI書き換えボタン行 */
+.rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
+.rw-row .rw-btn { margin: 0; }
+/* AI下書きの「要確認」警告 */
+.draft-warn { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 8px;
+  padding: 8px 10px; margin: 6px 0; font-size: 13px; color: #92400e; }
+.draft-warn code { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px;
+  padding: 1px 5px; font-family: inherit; }
 .panel .row input { flex: 1; }
 .panel textarea { resize: vertical; }
 .note { border-top: 1px solid #e2e8f0; padding: 8px 0; }
@@ -2161,6 +2492,12 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* 上部タブ: スマホでは詰めて全タブが1〜2行に収まるように */
   .ch-tabs { gap: 4px; }
   .ch-tabs a { padding: 8px 10px; font-size: 13px; }
+  .view-tabs a { padding: 6px 10px; font-size: 12px; }
+  /* 一括操作: スマホは各コントロールを全幅に (誤タップ防止) */
+  .bulkbar select, .bulkbar button { flex: 1 1 100%; }
+  /* カード表示でも選択チェックは先頭に出す (件名 order:-1 より前) */
+  table.cardable td.selcell { order: -2; width: auto; }
+  table.cardable td.selcell::before { content: none; }
 
   /* 詳細画面 */
   .detail-head h2 { font-size: 16px; }

@@ -27,9 +27,10 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  listShipChanges, setShipChangeStatus,
+  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal,
 } from './service.js';
-import { notifyShipChange } from './notify.js';
+import { notifyShipChange, notifyTask } from './notify.js';
+import { enqueuePackBatchNotionSync } from './notion.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -129,8 +130,12 @@ function api(handler) {
 // ─── バッチ一覧 ───
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
-  const batches = listPackBatches(workDate)
-    .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+  const batches = listPackBatches(workDate);
+  // 引当分類名 (表示) とライン種別 (pas/melt/null — 作業ボタンの振り分け)
+  for (const b of batches) {
+    b.hikiateClass = batchHikiateClass(getDB(), b);
+    b.lineKind = lineKindOf(b.hikiateClass);
+  }
   res.render(path.join(__dirname, 'views/batches'), {
     title: '梱包支援',
     username: req.session?.email || req.packingDevice?.label || '端末',
@@ -213,6 +218,8 @@ router.get('/work/:id(\\d+)', (req, res) => {
         .get(state.batch.pk_batch_id)?.hikiate_class ?? null;
     } catch { /* picking未初期化環境では無視 */ }
   }
+  // 梱包機バッチは1伝票1画面を使わない — ライン管理画面へ (Codex high: 混在は矛盾状態を作る)
+  if (lineKindOf(hikiateClass)) return res.redirect(`/apps/packing/line/${req.params.id}`);
   res.render(path.join(__dirname, 'views/work'), {
     title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
     displayName: req.session?.displayName,
@@ -225,6 +232,27 @@ router.get('/work/:id(\\d+)', (req, res) => {
     shipChangeReasons: SHIP_CHANGE_REASONS,
     // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
     methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+  });
+});
+
+// ─── ライン管理画面 (梱包機 PAS/MELT — 紙台帳の置き換え。要件v7) ───
+router.get('/line/:id(\\d+)', (req, res) => {
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) return res.status(404).send('バッチが見つかりません');
+  const hikiateClass = batchHikiateClass(getDB(), batch);
+  const kind = lineKindOf(hikiateClass);
+  if (!kind) return res.redirect(`/apps/packing/work/${batch.id}`);   // 手梱包は従来画面へ
+  res.render(path.join(__dirname, 'views/line'), {
+    title: `ライン | ${batch.folder_name || batch.tb_key}`,
+    displayName: req.session?.displayName,
+    workers: listWorkers(),
+    batch,
+    kind,
+    hikiateClass,
+    runs: listLineRuns(batch.id),
+    // 本日×同ラインの累計 (梱包機トータルカウンタとの突合用。日付でリセット)
+    dailyTotal: lineDailyTotal(batch.work_date, kind),
+    statusLabels: STATUS_LABELS,
   });
 });
 
@@ -254,42 +282,83 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     reason: req.body.reason || null,
     jumped: !!req.body.jumped,
     proposedMethod: req.body.proposed_method || null,
+    sku: req.body.sku || null,
+    actualSku: req.body.actual_sku || null,
+    qty: req.body.qty == null ? null : Number(req.body.qty),
+    // '' は未入力として null に落とす (Number('')===0 で「0件」と誤解釈しない — Codex medium)
+    finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
+    manualCount: req.body.manual_count == null || req.body.manual_count === '' ? null : Number(req.body.manual_count),
+    excludedCount: req.body.excluded_count == null || req.body.excluded_count === '' ? null : Number(req.body.excluded_count),
+    note: req.body.note == null ? null : String(req.body.note).slice(0, 200),
   }, worker);
-  // ④ 配送方法変更は事務へ GChat 通知 (fail-soft・DBが正本。replayed の再送では送らない)
+  // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため
+  // どのイベント経由でも「現在のバッチ状態」が届く)。対象=バッチ状態が変わり得るイベントのみ。
+  // shortage/wrong_item は完了済みバッチを packing へ再オープンする経路がある (Codex P1)
+  if (!result.replayed
+      && ['start', 'next', 'undo', 'takeover', 'shortage', 'wrong_item',
+        'line_sort_start', 'line_sort_done', 'line_start', 'line_done'].includes(req.body.event)) {
+    enqueuePackBatchNotionSync(Number(req.params.id));
+  }
+  // ①②のGChat通知 (fail-soft・DBのタスク行が正本。replayでは taskNotify が付かない=再送しない)
+  if (result.taskNotify) {
+    notifyTask(result.taskNotify, worker)
+      .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
+  }
+  // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
+  // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)
   if (req.body.event === 'ship_change' && !result.replayed) {
     const row = getDB().prepare(
       'SELECT * FROM pk_pack_ship_changes WHERE batch_id=? AND slip_seq=? ORDER BY id DESC LIMIT 1'
     ).get(Number(req.params.id), Number(req.body.slip_seq));
     if (row) {
-      notifyShipChange({
-        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
-        currentMethod: row.current_method, proposedMethod: row.proposed_method,
-        reason: row.reason, worker,
-      }).catch((e) => console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`));
+      const lines = getDB().prepare(`
+        SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
+        FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
+      `).all(Number(req.params.id), Number(req.body.slip_seq));
+      try {
+        const sent = await notifyShipChange({
+          folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+          currentMethod: row.current_method, proposedMethod: row.proposed_method,
+          reason: row.reason, worker, lines,
+        });
+        getDB().prepare('UPDATE pk_pack_ship_changes SET notified_at=?, notify_error=? WHERE id=?')
+          .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null,
+            sent ? null : 'webhook未設定', row.id);
+        if (!sent) result.shipNotify = 'failed';
+      } catch (e) {
+        console.warn(`[packing-notify] 配送変更通知失敗 (${row.ne_slip_no}): ${e.message}`);
+        getDB().prepare('UPDATE pk_pack_ship_changes SET notify_error=? WHERE id=?')
+          .run(String(e.message).slice(0, 200), row.id);
+        result.shipNotify = 'failed';
+      }
     }
   }
   res.json({ ok: true, ...result });
 }));
 
-// ─── ④ 配送方法変更の事務対応キュー (管理者) ───
-
-router.get('/admin/ship-changes', requireAdmin, (req, res) => {
-  res.render(path.join(__dirname, 'views/admin_ship_changes'), {
-    title: '配送方法変更 | 梱包支援',
-    username: req.session.email,
-    displayName: req.session.displayName,
-    isAdmin: true,
-    changes: listShipChanges(),
-  });
-});
-
-router.post('/admin/ship-changes/:id(\\d+)/status', checkOrigin, requireAdmin, api(async (req, res) => {
-  const status = String(req.body.status || '');
-  if (!['accepted', 'rejected', 'completed'].includes(status)) {
-    throw new PackError(400, 'bad_status', 'status が不正です');
+/** ③ミス候補の確定/取下げ (終了画面から。確定=送信+picking担当へ帰責)。 */
+router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, api(async (req, res) => {
+  // 作業者はイベントAPIと同じ検証 (pk_workers の有効名 or セッション本人 — Codex high)
+  const name = String(req.body.worker_name || '').trim();
+  let actor = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    actor = name;
+  } else if (req.session?.email) {
+    actor = req.session.displayName || req.session.email;
+  } else {
+    throw new PackError(400, 'no_worker', '作業者を選択してください');
   }
-  const row = setShipChangeStatus(Number(req.params.id), status, req.session.email);
-  res.json({ ok: true, id: row.id, status });
+  const decision = String(req.body.decision || '');
+  const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id));
+  // 送信 (confirm) したタスクをGChatへ (fail-soft・DBの行が正本)
+  for (const t of inc.dispatchedTasks || []) {
+    notifyTask(t, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
+  }
+  res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
 }));
 
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
@@ -304,6 +373,8 @@ router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
     slipCount: s.slips.length,
     doneSeqs: s.slips.filter((x) => x.status === 'done').map((x) => x.seq),
     heldSeqs: s.slips.filter((x) => x.status === 'held').map((x) => x.seq),
+    repickSeqs: s.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
+    incidents: s.incidents,
     lastDoneSeq: lastDoneSeqOf(Number(req.params.id)),
     pauseReason: s.batch.pause_reason || null,
   });
@@ -334,6 +405,74 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
     statusLabels: STATUS_LABELS,
   });
 });
+
+// ─── ⑥ 配送ルール変更の申請 (Render packing-dispatch へ中継 — 要件⑥) ───
+// 承認は GChat カードのボタン (stock-bot 経由)。ここは申請の受付だけ
+const PD_RULE_URL = (process.env.PD_RULE_CHANGE_URL
+  || 'https://bfaith-portal.onrender.com/apps/packing-dispatch/rule-change-api').replace(/\/+$/, '');
+let _ruleOptionsCache = { at: 0, data: null };
+
+router.get('/api/rule-change/options', api(async (req, res) => {
+  if (!process.env.PD_RULE_CHANGE_KEY) {
+    throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
+  }
+  if (!_ruleOptionsCache.data || Date.now() - _ruleOptionsCache.at > 600_000) {
+    const r = await fetch(`${PD_RULE_URL}/options`, {
+      headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY },
+    });
+    if (!r.ok) throw new PackError(502, 'upstream', `選択肢の取得に失敗しました (HTTP ${r.status})`);
+    _ruleOptionsCache = { at: Date.now(), data: await r.json() };
+  }
+  res.json({ ok: true, ...(_ruleOptionsCache.data) });
+}));
+
+router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, res) => {
+  if (!process.env.PD_RULE_CHANGE_KEY) {
+    throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
+  }
+  // 作業者検証 (イベントAPIと同じ)
+  const name = String(req.body.worker_name || '').trim();
+  let worker = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    worker = name;
+  } else if (req.session?.email) {
+    worker = req.session.displayName || req.session.email;
+  } else {
+    throw new PackError(400, 'no_worker', '作業者を選択してください');
+  }
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) throw new PackError(404, 'not_found', 'バッチが見つかりません');
+  const slipSeq = Number(req.body.slip_seq);
+  const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
+  if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
+  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
+  const kind = lines.length === 1 ? 'single' : 'assort';
+  const payload = {
+    kind,
+    items: lines.map((l) => ({ sku: l.sku, name: l.print_name || l.product_name, qty: l.qty })),
+    mall_group: req.body.mall_group,
+    qty_min: req.body.qty_min == null ? null : Number(req.body.qty_min),
+    qty_max: req.body.qty_max == null || req.body.qty_max === '' ? null : Number(req.body.qty_max),
+    shipping_method_code: req.body.shipping_method_code,
+    packing_machine_code: req.body.packing_machine_code,
+    requested_by: worker,
+    context: `${batch.folder_name || ''} ${slip.ne_slip_no}`.trim(),
+  };
+  const r = await fetch(`${PD_RULE_URL}/requests`, {
+    method: 'POST',
+    headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    throw new PackError(r.status === 400 ? 400 : 502, 'upstream', body.error || `申請に失敗しました (HTTP ${r.status})`);
+  }
+  res.json({ ok: true, id: body.id, cardPosted: body.cardPosted });
+}));
 
 // ─── PWA manifest (ホーム画面追加用) ───
 router.get('/manifest.json', (req, res) => {

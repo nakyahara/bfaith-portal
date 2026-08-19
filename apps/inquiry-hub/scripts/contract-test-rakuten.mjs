@@ -131,7 +131,8 @@ if (args.includes('--error-probes')) {
 // ── 6. 変更系 (CONTRACT_TEST_CONFIRM=yes + 明示指定のみ) ──
 for (const [flag, name, make] of [
   ['--send-reply', 'reply送信', n => ({ url: `${BASE}/inquiry/reply`, method: 'POST',
-    body: { inquiryNumber: n, message: argOf('--message') || '契約テスト送信 (B-Faith社内テスト)' },
+    // shopId は必須 (2026-08-17 実測: 欠落だと IE001 bad parameter)。inquiryNumber 先頭セグメント
+    body: { inquiryNumber: n, shopId: Number(String(n).split('-')[0]), message: argOf('--message') || '契約テスト送信 (B-Faith社内テスト)' },
     note: '⚠️実返信。ReplyResultに返信IDが返るか = 二重送信照合の要 (§2.4)' })],
   ['--mark-read', '既読化', n => ({ url: `${BASE}/inquiries/read`, method: 'PATCH', body: { inquiryNumbers: [n] } })],
   ['--complete', '完了化', n => ({ url: `${BASE}/inquiries/complete`, method: 'PATCH', body: { inquiryNumbers: [n] } })],

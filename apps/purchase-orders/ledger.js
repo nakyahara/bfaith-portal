@@ -56,6 +56,7 @@ const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_t
   'po_cycle_reset_at',   // データ更新 (NE取込/FBA更新) 時刻 =「✅発注確定済み」「×非表示」のリセット基準 (サイクルID)
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
   'email_issuer_name',   // 発注書CSVの「発行担当者」列
+  'po_lz_mirror_suppress_capture', // 「CSV取込を解除」時のmirror世代 (この世代までは自動反映を復活させない)
   // P17 欠品リスクのしきい値 (数値範囲は下の SHORTAGE_SETTING_RULES で setSetting 自体が検証する)
   'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
 

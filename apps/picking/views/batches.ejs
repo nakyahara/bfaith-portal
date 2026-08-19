@@ -68,9 +68,11 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/board" class="btn-logout">🏆 実績</a>
       <% if (isAdmin) { %>
         <a href="/apps/picking/admin/import" class="btn-logout">📥 CS03002取込</a>
         <a href="/apps/picking/admin/summary" class="btn-logout">📊 サマリ</a>
+        <a href="/apps/picking/admin/stats" class="btn-logout">📈 実績(30日)</a>
         <a href="/apps/picking/admin/devices" class="btn-logout">📱 端末・作業者</a>
       <% } %>
       <% if (!deviceMode) { %><a href="/" class="btn-logout">ダッシュボード</a><% } %>
@@ -78,6 +80,11 @@
   </header>
 
   <div class="pk-wrap">
+    <% if (typeof openTasks !== 'undefined' && openTasks > 0) { %>
+      <a href="/apps/picking/tasks" style="display:block; background:#ffe3e3; border:2px solid #e03131; border-radius:12px; padding:12px 16px; margin-bottom:10px; font-size:1.1em; font-weight:800; color:#c92a2a; text-decoration:none;">
+        🔴 再ピック・棚戻し <%= openTasks %>件 — タップして対応
+      </a>
+    <% } %>
     <div class="pk-bar">
       <form method="get" action="/apps/picking/">
         <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">

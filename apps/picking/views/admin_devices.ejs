@@ -45,10 +45,16 @@
       <p class="hint">
         倉庫で使うiPhoneで管理者としてログインし、ここで登録すると、その端末は以後<b>ログイン不要</b>で
         ピッキング作業画面を使えます (取込・管理画面は引き続きログイン必須)。
-        ⚠ ホーム画面に追加したアプリから開いて登録してください (Safari本体と保存領域が別のため)。
+        ⚠ ホーム画面に追加したアプリから開いて登録してください (Safari本体と保存領域が別のため)。<br>
+        用途に<b>掲示専用</b>を選ぶと、実績ボード (<code>/apps/picking/board</code>) しか開けない読み取り専用端末になります。
+        倉庫の常時表示モニターはこちらで登録してください (誰でも触れる場所に置くため、作業データを書けないようにする)。
       </p>
       <div class="pk-row-inline">
         <input type="text" id="deviceLabel" placeholder="端末名 (例: 倉庫iPhone1)" maxlength="40">
+        <select id="deviceKind">
+          <option value="worker">作業用 (ピッキング画面)</option>
+          <option value="board">掲示専用 (実績ボードのみ)</option>
+        </select>
         <button id="registerBtn" type="button">この端末を登録</button>
         <span id="deviceMsg" class="pk-msg"></span>
       </div>
@@ -57,19 +63,20 @@
     <div class="pk-form">
       <h2>登録済み端末</h2>
       <table class="pk-list">
-        <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
+        <thead><tr><th>ID</th><th>端末名</th><th>用途</th><th>登録者</th><th>登録日</th><th>最終利用</th><th></th></tr></thead>
         <tbody>
           <% for (const d of devices) { %>
             <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
               <td><%= d.id %></td>
               <td><%= d.label %></td>
+              <td><%= d.kind === 'board' ? '🖥 掲示専用' : '作業用' %></td>
               <td><%= d.created_by %></td>
               <td><%= (d.created_at || '').slice(0, 10) %></td>
               <td><%= (d.last_seen_at || '-').slice(0, 10) %></td>
               <td><% if (!d.revoked_at) { %><button class="btn-sm btn-revoke" data-id="<%= d.id %>">失効</button><% } else { %>失効済み<% } %></td>
             </tr>
           <% } %>
-          <% if (devices.length === 0) { %><tr><td colspan="6" style="color:#868e96">まだ登録がありません</td></tr><% } %>
+          <% if (devices.length === 0) { %><tr><td colspan="7" style="color:#868e96">まだ登録がありません</td></tr><% } %>
         </tbody>
       </table>
     </div>
@@ -113,12 +120,14 @@
 
     $('registerBtn').addEventListener('click', async () => {
       const label = $('deviceLabel').value.trim();
+      const kind = $('deviceKind').value;
       if (!label) { $('deviceMsg').textContent = '端末名を入力してください'; $('deviceMsg').className = 'pk-msg err'; return; }
-      if (!confirm('この端末を登録します。登録と同時にログアウトし、以後この端末はログイン不要の作業専用になります。よろしいですか?')) return;
-      const { ok, body } = await post('/apps/picking/admin/devices', { label });
+      const what = kind === 'board' ? '掲示専用端末 (実績ボードのみ)' : 'ログイン不要の作業専用端末';
+      if (!confirm(`この端末を登録します。登録と同時にログアウトし、以後この端末は${what}になります。よろしいですか?`)) return;
+      const { ok, body } = await post('/apps/picking/admin/devices', { label, kind });
       if (!ok) { $('deviceMsg').textContent = body.error || '失敗しました'; $('deviceMsg').className = 'pk-msg err'; return; }
-      alert('登録しました。ログアウト済みなので、そのまま作業画面が使えます。');
-      location.href = '/apps/picking/';
+      alert('登録しました。ログアウト済みなので、そのまま使えます。');
+      location.href = kind === 'board' ? '/apps/picking/board' : '/apps/picking/';
     });
 
     document.querySelectorAll('.btn-revoke').forEach((btn) => btn.addEventListener('click', async () => {

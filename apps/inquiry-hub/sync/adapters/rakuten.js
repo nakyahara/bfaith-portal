@@ -242,6 +242,13 @@ export function createRakutenAdapter(cfg = {}) {
       if (!/^\d{1,10}-\d{8}-\d{1,12}[a-z]?$/i.test(inquiryNumber)) {
         throw new SendRejectedError(`楽天問い合わせ番号が不正です (external_inquiry_id='${inquiryNumber}')`);
       }
+      // shopId は返信APIの必須パラメータ (設計書のAPI表に明記。2026-08-17 初実送信の実測:
+      // 欠落だと IE001 bad parameter で拒否)。inquiryNumber の先頭セグメント = shopId (実測形式)。
+      // expectedShopId 設定時は照合する (店舗混入防止)
+      const shopId = Number(inquiryNumber.split('-')[0]);
+      if (expectedShopId != null && String(shopId) !== String(expectedShopId).trim()) {
+        throw new SendRejectedError(`shopId が店舗設定と一致しません (inquiryNumber=${inquiryNumber} / expected=${expectedShopId})`);
+      }
       const message = String(bodyText || '');
       if (!message.trim()) throw new SendRejectedError('本文が空です');
       if (message.length > 10000) throw new SendRejectedError('本文が長すぎます (10000文字まで)');
@@ -256,7 +263,7 @@ export function createRakutenAdapter(cfg = {}) {
         res = await fetchImpl(replyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...buildHeaders() },
-          body: JSON.stringify({ inquiryNumber, message }),
+          body: JSON.stringify({ inquiryNumber, shopId, message }),
           signal: AbortSignal.timeout(requestTimeoutMs),
         });
       } catch (err) {

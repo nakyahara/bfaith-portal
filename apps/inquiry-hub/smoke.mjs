@@ -144,6 +144,65 @@ check('検索: ヒットなし', listInquiries({ view: 'all', q: '存在しな�
   // 新着件数: inq1=email open / inq2=rakuten in_progress / inq3=email done (doneは新着に入らない)
   const c = countInboxByGroup();
   check('countInboxByGroup: mail=1 mall=1 all=2', c.mail === 1 && c.mall === 1 && c.all === 2);
+
+  // 状態タブ用: いま見ている文脈での ビュー別件数 (2026-08-17)
+  const { countViewsInContext } = await import('./queries.js');
+  const all = countViewsInContext({});
+  check('countViewsInContext (絞り込みなし): inbox=2 done=1 all=3',
+    all.inbox === 2 && all.done === 1 && all.all === 3, JSON.stringify(all));
+  const mall = countViewsInContext({ group: 'mall' });
+  check('countViewsInContext (mall): 楽天1件のみ', mall.all === 1 && mall.inbox === 1 && mall.done === 0);
+  const mail = countViewsInContext({ group: 'mail' });
+  check('countViewsInContext (mail): 新着1+完了1', mail.inbox === 1 && mail.done === 1 && mail.all === 2);
+}
+
+// 一括操作 (2026-08-17 スタッフ要望: 一覧のチェックボックスからまとめて変更)
+{
+  const { bulkUpdateInquiries, BULK_MAX } = await import('./queries.js');
+  const shopB = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','一括店','bulk@b-faith.biz')").run().lastInsertRowid;
+  const fid = Number(db.prepare("INSERT INTO inquiry_folders (name) VALUES ('一括テスト')").run().lastInsertRowid);
+  const mk = (ext, status = 'open') => db.prepare(`INSERT INTO inquiries
+      (channel_type, shop_id, external_inquiry_id, subject, internal_status, is_unread, received_at, conversation_rev)
+    VALUES ('email', ?, ?, '一括', ?, 1, ?, 1)`).run(shopB, ext, status, T('2026-08-17T10:00:00+09:00')).lastInsertRowid;
+  const b1 = mk('bk1'), b2 = mk('bk2'), b3 = mk('bk3', 'done');
+
+  const r1 = bulkUpdateInquiries([b1, b2], { status: 'done' }, { actorId: 'tester' });
+  check('一括: 状態変更 2件', r1.updated === 2 && r1.skipped === 0
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(b1).internal_status === 'done');
+  check('一括: done で completed_at が入る', !!db.prepare('SELECT completed_at FROM inquiries WHERE id = ?').get(b1).completed_at);
+  check('一括: 変更不要な件は skipped (冪等)', bulkUpdateInquiries([b1, b3], { status: 'done' }).updated === 0);
+
+  const r2 = bulkUpdateInquiries([b1, b2, b3], { folderId: fid, assigned: 'staff@b-faith.biz', isUnread: false }, { actorId: 'tester' });
+  check('一括: フォルダ+担当+既読をまとめて', r2.updated === 3
+    && db.prepare('SELECT folder_id, assigned_user_id, is_unread FROM inquiries WHERE id = ?').get(b2).folder_id === fid);
+  check('一括: 担当が入る', db.prepare('SELECT assigned_user_id FROM inquiries WHERE id = ?').get(b2).assigned_user_id === 'staff@b-faith.biz');
+  check('一括: 既読になる', db.prepare('SELECT is_unread FROM inquiries WHERE id = ?').get(b2).is_unread === 0);
+  check('一括: フォルダをnullで未分類へ戻せる',
+    bulkUpdateInquiries([b1], { folderId: null }).updated === 1
+    && db.prepare('SELECT folder_id FROM inquiries WHERE id = ?').get(b1).folder_id === null);
+  check('一括: 操作ログが1件ずつ残る', db.prepare(
+    "SELECT COUNT(*) c FROM inquiry_activity_logs WHERE inquiry_id = ? AND user_id = 'tester'").get(b1).c >= 2);
+
+  // 拒否系
+  const bad = (fn) => { try { fn(); return null; } catch (e) { return e.message; } };
+  check('一括: 対象なしは拒否', bad(() => bulkUpdateInquiries([], { status: 'done' }))?.includes('選択されていません'));
+  check('一括: 変更内容なしは拒否', bad(() => bulkUpdateInquiries([b1], {}))?.includes('変更内容'));
+  check('一括: 不正ステータスは拒否', bad(() => bulkUpdateInquiries([b1], { status: 'bogus' }))?.includes('不正なステータス'));
+  check('一括: 存在しないフォルダは拒否', bad(() => bulkUpdateInquiries([b1], { folderId: 99999 }))?.includes('フォルダが存在しません'));
+  check(`一括: 上限${BULK_MAX}件を超えたら拒否`,
+    bad(() => bulkUpdateInquiries(Array.from({ length: BULK_MAX + 1 }, (_, i) => i + 1), { status: 'done' }))?.includes('までです'));
+  check('一括: アーカイブ済みは対象外', (() => {
+    db.prepare('UPDATE inquiries SET is_archived = 1 WHERE id = ?').run(b3);
+    const r = bulkUpdateInquiries([b3], { status: 'open' });
+    db.prepare('UPDATE inquiries SET is_archived = 0 WHERE id = ?').run(b3);
+    return r.updated === 0 && r.skipped === 1;
+  })());
+
+  // 後片付け
+  db.prepare('DELETE FROM inquiry_activity_logs WHERE inquiry_id IN (?,?,?)').run(b1, b2, b3);
+  db.prepare('DELETE FROM inquiries WHERE shop_id = ?').run(shopB);
+  db.prepare('DELETE FROM shops WHERE id = ?').run(shopB);
+  db.prepare('DELETE FROM inquiry_folders WHERE id = ?').run(fid);
 }
 check('likeEsc', likeEsc('a%b_c\\d') === 'a\\%b\\_c\\\\d');
 check('msg_count 付与', listInquiries({ view: 'all', q: 'ORD-200' }).rows[0].msg_count === 2);

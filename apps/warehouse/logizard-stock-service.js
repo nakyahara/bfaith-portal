@@ -21,12 +21,12 @@ router.get('/locations', (req, res) => {
   try {
     const db = getDB();
     const locations = db.prepare(`
-      SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality,
+      SELECT ブロック略称 AS block, ロケ AS location, 品質区分名 AS quality, 有効期限 AS expiry,
              SUM(在庫数) AS qty, SUM(引当数) AS allocated,
              SUM(在庫数 - 引当数) AS free
       FROM raw_lz_inventory
       WHERE 商品ID = ?
-      GROUP BY ブロック略称, ロケ, 品質区分名
+      GROUP BY ブロック略称, ロケ, 品質区分名, 有効期限
     `).all(code);
     const name = db.prepare('SELECT MIN(商品名) AS n FROM raw_lz_inventory WHERE 商品ID = ?').get(code)?.n || null;
     const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
@@ -35,6 +35,29 @@ router.get('/locations', (req, res) => {
   } catch (e) {
     console.error('[logizard-stock-service] locations error', e);
     // 上流のエラー文をそのまま返さない (呼び出し側は固定の形だけを期待する)
+    res.status(500).json({ ok: false, error: 'DB_ERROR' });
+  }
+});
+
+// ブロック別の在庫一覧 (LINE在庫検索ボットの「Z」「A」コマンド用)。
+// 在庫CSVは在庫のある行しか含まないため、空ブロックは0件で返る (エラーではない)
+router.get('/block', (req, res) => {
+  const code = String(req.query.code || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{2,6}$/.test(code)) return res.status(400).json({ ok: false, error: 'BLOCK_CODE_INVALID' });
+  try {
+    const db = getDB();
+    const items = db.prepare(`
+      SELECT ロケ AS location, 商品ID AS sku, MIN(商品名) AS name, 品質区分名 AS quality, 有効期限 AS expiry,
+             SUM(在庫数) AS qty, SUM(引当数) AS allocated, SUM(在庫数 - 引当数) AS free
+      FROM raw_lz_inventory
+      WHERE ブロック略称 = ?
+      GROUP BY ロケ, 商品ID, 品質区分名, 有効期限
+      ORDER BY ロケ, 商品ID
+    `).all(code);
+    const importedAt = db.prepare("SELECT value FROM sync_meta WHERE key = 'logizard_last_import'").get()?.value || null;
+    res.json({ ok: true, importedAt, block: code, count: items.length, items });
+  } catch (e) {
+    console.error('[logizard-stock-service] block error', e);
     res.status(500).json({ ok: false, error: 'DB_ERROR' });
   }
 });

@@ -17,12 +17,13 @@ import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
   initPickingDB, getDB, jstToday, listBatches, listLines, getBatch, STATUS_LABELS,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, DEVICE_KINDS,
   listWorkers, getWorker, addWorker, setWorkerActive,
 } from './db.js';
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
+  getPickingStats, getTodayProgress, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
@@ -34,6 +35,22 @@ import { getShippingFolders, driveCall, getPollerStatus } from './drive-sync.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
+
+// ─── 梱包 (packing) 連携: 再ピック・棚戻しキュー (要件§5.4/5.5) ───
+// pk_pack_tasks は packing 所有のため、更新は packing の service (更新API) を通す。
+// packing が無効/初期化失敗でも picking 本体に影響しないよう遅延import+fail-soft
+let _packingSvc;
+async function packingSvc() {
+  if (_packingSvc === undefined) {
+    try {
+      _packingSvc = await import('../packing/service.js');
+    } catch (e) {
+      _packingSvc = null;
+      console.warn('[picking] packing連携は無効 (packing初期化失敗):', e.message);
+    }
+  }
+  return _packingSvc;
+}
 
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗はここで throw して
 // 旧スキーマのまま起動を継続させない (shipping-work と同規約)
@@ -76,12 +93,34 @@ function hasSessionAccess(req) {
   return allowed === '*' || (Array.isArray(allowed) && allowed.includes('picking'));
 }
 
+// 掲示モニター端末 (kind='board') が触れてよいパス。倉庫に常時表示する画面は
+// 誰でも物理的に操作できるので、読み取り専用のここだけに閉じる (作業APIは叩かせない)。
+// /board/exit は掲示モードの解除 (Cookie削除) — これが無いと、掲示端末を作業用に
+// 戻したくなったときにブラウザの設定からCookieを消すしか手がなくなる
+const BOARD_ALLOWED_PATHS = ['/board', '/api/board', '/board/exit'];
+
 /** 全ルート共通の入口。セッション or 登録端末のどちらかが必要。 */
 function pickingAccess(req, res, next) {
   // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
   if (req.path === '/manifest.json') return next();
-  if (hasSessionAccess(req)) return next();
+
   const device = verifyDevice(readCookie(req, DEVICE_COOKIE));
+  // ⭐掲示端末は「セッションがあっても」読み取り専用に閉じる (Codexレビュー high)。
+  //   セッションを先に見ると、掲示端末で誰かが一度ログインしただけで作業APIが開いてしまう。
+  //   端末登録時のセッション破棄は登録の瞬間しか効かず、後日のログインを防げない
+  if (device && device.kind === 'board') {
+    if (!BOARD_ALLOWED_PATHS.includes(req.path)) {
+      const msg = 'この端末は掲示専用です (作業には使えません)。'
+        + '解除するには /apps/picking/board/exit を開いてください';
+      return req.path.startsWith('/api/')
+        ? res.status(403).json({ error: msg, code: 'board_only' })
+        : res.status(403).send(msg);
+    }
+    req.pickingDevice = device;
+    return next();
+  }
+
+  if (hasSessionAccess(req)) return next();
   if (device) {
     req.pickingDevice = device;   // 端末モード (作業画面のみ。admin系は requireAdmin で弾かれる)
     return next();
@@ -162,11 +201,15 @@ function api(handler) {
 }
 
 // ─── バッチ一覧 (セッション or 登録端末) ───
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
+  let openTasks = 0;
+  const psvc = await packingSvc();
+  if (psvc) { try { openTasks = psvc.countOpenTasks(); } catch { openTasks = 0; } }
   res.render(path.join(__dirname, 'views/batches'), {
+    openTasks,
     title: 'ピッキング支援',
     username: req.session?.email || req.pickingDevice?.label || '端末',
     displayName: req.session?.displayName,
@@ -177,6 +220,47 @@ router.get('/', (req, res) => {
     batches,
     statusLabels: STATUS_LABELS,
   });
+});
+
+// ─── 再ピック・棚戻しキュー (梱包からの依頼を消化する画面) ───
+router.get('/tasks', async (req, res) => {
+  const psvc = await packingSvc();
+  if (!psvc) return res.status(404).send('梱包連携は無効です');
+  let tasks = [];
+  try { tasks = psvc.listOpenTasks(); } catch { tasks = []; }
+  const images = getImageMap(tasks.map((t) => t.sku));
+  res.render(path.join(__dirname, 'views/tasks'), {
+    title: '再ピック・棚戻し',
+    workers: listWorkers(),
+    tasks: tasks.map((t) => ({
+      ...t,
+      locationLabel: t.location ? formatLocation(t.block, t.location) : null,
+      imageUrl: images.get(String(t.sku ?? '').trim().toLowerCase())?.url || null,
+    })),
+  });
+});
+
+/** タスク操作 (claim/fulfill/unavailable/cancel)。packing の更新APIへ委譲。 */
+router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
+  try {
+    const psvc = await packingSvc();
+    if (!psvc) return res.status(404).json({ error: '梱包連携は無効です' });
+    const worker = resolveWorker(req);
+    const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
+    if (t._notifyUnavailable) {
+      import('../packing/notify.js')
+        .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
+        .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
+    }
+    res.json({ ok: true, id: t.id, status: t.status });
+  } catch (e) {
+    // packing 側の業務エラー (PackError) も picking の PkError と同じ形で返す
+    if (e && Number.isInteger(e.status) && e.code) {
+      return res.status(e.status).json({ error: e.message, code: e.code });
+    }
+    console.error('[picking-tasks]', e);
+    res.status(500).json({ error: 'サーバーエラーが発生しました' });
+  }
 });
 
 // ─── バッチ詳細 (明細確認・紙PDFとの突合用) ───
@@ -356,6 +440,125 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
   });
 });
 
+// ─── 作業実績 (30日ローリング) ───
+//
+// 掲示モニター (/board) と管理画面 (/admin/stats) が同じ集計を見る。
+// 中原さんの方針 (2026-08-17): 個人別スピードは全員に公開してよい。
+// ただし「重い分類を引いた人が遅く見える」のを避けるため速さ指数を主指標にし、
+// 欠品報告件数を併記する (止まって報告する方が損に見えないようにする)。
+
+/** クエリの days を安全な範囲へ (1〜365)。 */
+function parseDays(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return STATS_WINDOW_DAYS;
+  return Math.min(365, Math.max(1, Math.round(n)));
+}
+
+// 掲示モニター用ボード (端末Cookie可 = 壁掛け端末でログイン不要)
+router.get('/board', (req, res) => {
+  res.render(path.join(__dirname, 'views/board'), {
+    title: 'ピッキング実績ボード',
+    windowDays: STATS_WINDOW_DAYS,
+  });
+});
+
+/**
+ * 掲示モードの解除 (壁掛け端末を作業用に転用したいときの出口)。
+ *
+ * ⭐管理者セッション必須 + POST + 解除と同時にセッションも破棄する (Codexレビュー high)。
+ *   GETで無条件に消せると、掲示端末の前に立った人 (や外部サイトからの誘導) が
+ *   board Cookie だけを消し、残っている管理者セッションで作業・管理APIを開けてしまう。
+ *   掲示端末では /admin/* も塞がっているので、解除はこの画面が唯一の導線になる。
+ */
+router.get('/board/exit', (req, res) => {
+  const isAdmin = req.session?.role === 'admin';
+  res.type('html').send(`<!DOCTYPE html><html lang="ja"><head><meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>掲示モードの解除</title>
+    <style>body{font-family:system-ui,sans-serif;max-width:36em;margin:3em auto;padding:0 1em;line-height:1.7}
+    button{padding:.6em 1.4em;font-size:1em;cursor:pointer}</style></head><body>
+    <h1>掲示モードの解除</h1>
+    <p>この端末は<b>掲示専用</b>として登録されています (実績ボードのみ表示できます)。</p>
+    ${isAdmin ? `<p>解除すると端末Cookieを削除し、同時にログアウトします。
+        作業用に使う場合は、そのあと改めて管理者でログインして「作業用」で登録し直してください。</p>
+      <button id="go" type="button">掲示モードを解除する</button>
+      <p id="msg"></p>
+      <script>
+        document.getElementById('go').addEventListener('click', function () {
+          fetch('/apps/picking/board/exit', { method: 'POST', credentials: 'same-origin' })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              document.getElementById('msg').textContent = d.ok ? '解除しました。' : (d.error || '失敗しました');
+            })
+            .catch(function (e) { document.getElementById('msg').textContent = '失敗しました: ' + e.message; });
+        });
+      </script>`
+      : `<p><b>解除には管理者のログインが必要です。</b>
+        <a href="/login">ログイン</a>してから、この画面をもう一度開いてください。</p>`}
+    <p><a href="/apps/picking/board">← ボードへ戻る</a></p>
+    </body></html>`);
+});
+
+router.post('/board/exit', checkOrigin, requireAdmin, api(async (req, res) => {
+  // ⭐セッション破棄の成功を確認してから Cookie を消す (Codexレビュー high)。
+  //   端末Cookieだけ先に消えて管理者セッションが残ると、まさにそのセッションで
+  //   作業APIが開いてしまう = 塞いだはずの穴が破棄失敗時だけ再現する
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('[picking] 掲示モード解除: セッション破棄に失敗', err);
+      return res.status(500).json({ error: '解除できませんでした (セッションを破棄できません)' });
+    }
+    res.clearCookie(DEVICE_COOKIE, { path: '/apps/picking' });
+    res.json({ ok: true, loggedOut: true });
+  });
+}));
+
+// ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
+router.get('/api/board', api(async (req, res) => {
+  const stats = getPickingStats({ days: parseDays(req.query.days) });
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    today: getTodayProgress(),
+    stats: {
+      since: stats.since, until: stats.until, days: stats.days,
+      minDate: STATS_MIN_DATE,
+      minLines: stats.minLines,
+      minClassLines: stats.minClassLines,
+      outlierSec: stats.outlierSec,
+      total: stats.total,
+      // 掲示は明細数上位の分類のみ (ヒートマップの行数 = 画面に収まる範囲)。全量は管理画面で見る
+      baseline: stats.baseline.slice(0, 12).map((c) => ({
+        key: c.key, lines: c.lines, avgSec: c.avgSec, workerCount: c.workerCount,
+        workers: c.workers.map((w) => ({
+          worker: w.worker, name: w.name, lines: w.lines, secPerLine: w.secPerLine,
+          index: w.index, provisional: w.provisional,
+        })),
+      })),
+      workers: stats.workers.map((w) => ({
+        worker: w.worker, name: w.name, lines: w.lines, secPerLine: w.secPerLine,
+        index: w.index, provisional: w.provisional, shortages: w.shortages,
+        batches: w.batches, days: w.days,
+      })),
+      byDate: stats.byDate,
+    },
+  });
+}));
+
+// 管理画面 (全量・分類内訳つき)
+router.get('/admin/stats', requireAdmin, (req, res) => {
+  const until = isRealDate(String(req.query.until || '')) ? String(req.query.until) : jstToday();
+  res.render(path.join(__dirname, 'views/admin_stats'), {
+    title: 'ピッキング実績 (30日)',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    stats: getPickingStats({ until, days: parseDays(req.query.days) }),
+    minDate: STATS_MIN_DATE,
+  });
+});
+
 // ─── 端末・作業者管理 (管理者・セッション必須) ───
 
 router.get('/admin/devices', requireAdmin, (req, res) => {
@@ -378,16 +581,27 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
 router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
   if (!label || label.length > 40) throw new PkError(400, 'bad_label', '端末名を1〜40文字で入力してください');
-  const token = createDevice(label, req.session.email);
-  res.cookie(DEVICE_COOKIE, token, {
-    httpOnly: true,
-    // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)
-    secure: process.env.NODE_ENV !== 'development',
-    sameSite: 'lax',
-    maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。サーバー側でも同TTLを検証
-    path: '/apps/picking',
+  // 用途。board = 倉庫の掲示モニター (読み取り専用。作業画面・作業APIは pickingAccess が拒否)
+  const kind = String(req.body.kind || 'worker').trim();
+  if (!DEVICE_KINDS.includes(kind)) throw new PkError(400, 'bad_kind', '端末の用途が不正です');
+  const token = createDevice(label, req.session.email, kind);
+  // 破棄が成功してから Cookie を渡す (破棄に失敗したまま端末Cookieを配ると、
+  // 共用端末に管理者セッションが残ったまま作業者に渡ることになる)
+  req.session.destroy((err) => {
+    if (err) {
+      console.error('[picking] 端末登録: セッション破棄に失敗', err);
+      return res.status(500).json({ error: '登録を完了できませんでした (セッションを破棄できません)' });
+    }
+    res.cookie(DEVICE_COOKIE, token, {
+      httpOnly: true,
+      // 明示的に development と宣言された環境以外は常に Secure (NODE_ENV 未設定でも安全側)
+      secure: process.env.NODE_ENV !== 'development',
+      sameSite: 'lax',
+      maxAge: 400 * 24 * 3600 * 1000,   // ブラウザ上限 (~400日)。サーバー側でも同TTLを検証
+      path: '/apps/picking',
+    });
+    res.json({ ok: true, loggedOut: true });
   });
-  req.session.destroy(() => res.json({ ok: true, loggedOut: true }));
 }));
 
 router.post('/admin/devices/:id(\\d+)/revoke', checkOrigin, requireAdmin, api(async (req, res) => {

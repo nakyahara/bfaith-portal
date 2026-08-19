@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<!--
+  倉庫の掲示モニター用ボード (2026-08-17 中原さん指示)。
+  Chrome のキオスクモードで常時表示する前提:
+    chrome.exe --kiosk https://picking.bfaith-wh.uk/apps/picking/board
+  端末は「掲示専用 (kind=board)」で登録する = このページ以外は開けない。
+
+  主役は「引当分類 × 作業者」のヒートマップ (中原さん要望)。
+  セルの色は各分類の平均との比 (緑=速い / 黄=平均どおり / 赤=遅い)。分類によって
+  速さが根本的に違う (AES《単品》11.9秒 / AES《1SKU複数個》23.5秒) ため、行ごとの
+  正規化が必須 — これで「自分の列を縦に見て緑が多いか赤が多いか」が成立する。
+  順位色 (1位=緑・最下位=赤) にしないのは、全員速くても誰かが必ず真っ赤になるため。
+
+  自動更新は fetch + DOM差し替え (location.reload() だと数秒ごとに画面が白く飛ぶ)。
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    :root {
+      --bg: #0f1216; --panel: #171c22; --line: #2a323c;
+      --fg: #f1f3f5; --muted: #93a0ad;
+      --ok: #40c057; --warn: #fab005; --bad: #fa5252; --accent: #4dabf7;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+      font-variant-numeric: tabular-nums;
+      padding: 1.2vh 1.2vw;
+      display: flex; flex-direction: column; gap: 1.1vh;
+      overflow: hidden;
+    }
+    header { display: flex; align-items: baseline; gap: 1.4vw; flex: 0 0 auto; }
+    header h1 { font-size: 2.9vh; margin: 0; letter-spacing: 0.02em; }
+    header .range { font-size: 1.9vh; color: var(--muted); }
+    header .right { margin-left: auto; font-size: 1.8vh; color: var(--muted); display: flex; gap: 1vw; align-items: center; }
+    .stale { color: var(--warn); }
+
+    main { flex: 1 1 auto; display: grid; grid-template-columns: 22fr 78fr; gap: 1.1vw; min-height: 0; }
+    /* min-width:0 が無いと grid の auto 最小サイズ (中身の max-content) が勝ち、
+       右カラムのヒートマップが左カラムを押し潰して端の列が画面外に出る */
+    .col { display: flex; flex-direction: column; gap: 1.1vh; min-height: 0; min-width: 0; }
+    .panel { background: var(--panel); border-radius: 1.2vh; padding: 1.4vh 1.2vw; min-height: 0; min-width: 0; }
+    .panel h2 { font-size: 1.8vh; margin: 0 0 1.1vh; color: var(--muted); font-weight: 600; letter-spacing: 0.05em; }
+    .panel h2 .sub { color: #6b7784; font-weight: 400; letter-spacing: 0; }
+
+    /* 今日 */
+    .today-big { font-size: 7.2vh; font-weight: 800; line-height: 1; white-space: nowrap; }
+    .today-sub { font-size: 1.9vh; color: var(--muted); margin-top: 0.3vh; white-space: nowrap; }
+    .bar { height: 1.5vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin: 1.0vh 0 0.6vh; }
+    .bar > i { display: block; height: 100%; background: var(--ok); }
+    .kv { display: flex; justify-content: space-between; gap: 0.8vw; font-size: 1.9vh; padding: 0.3vh 0; white-space: nowrap; }
+    .kv .k { color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 0.5vw; }
+    .chip { background: #232a32; border-radius: 0.8vh; padding: 0.5vh 0.7vw; font-size: 1.8vh; }
+    .chip.paused { color: var(--warn); }
+    .chip .cls { color: var(--muted); font-size: 1.4vh; display: block; }
+
+    /* 日別 (左カラム縦リスト) */
+    .day { display: flex; align-items: center; gap: 0.4vw; font-size: 1.8vh; padding: 0.5vh 0; border-top: 1px solid var(--line); }
+    .day:first-child { border-top: 0; }
+    .day .d { color: var(--muted); width: 22%; }
+    .day .db { flex: 1 1 0; min-width: 0; height: 1.1vh; background: #232a32; border-radius: 1vh; overflow: hidden; }
+    .day .db > i { display: block; height: 100%; background: var(--accent); }
+    .day .v { font-weight: 700; width: 18%; text-align: right; }
+    .day .n { color: var(--muted); width: 20%; text-align: right; font-size: 1.5vh; }
+
+    /* ヒートマップ */
+    .heat-panel { display: flex; flex-direction: column; overflow: hidden; }
+    .heat-wrap { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+    table.heat { width: 100%; height: 100%; border-collapse: separate; border-spacing: 0.18vw 0.35vh; table-layout: fixed; }
+    .heat th { font-size: 1.7vh; color: var(--muted); font-weight: 600; padding: 0 0.3vw 0.4vh; }
+    .heat th.w { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .heat th.cls { text-align: left; width: 17vw; }
+    .heat th.avg { text-align: center; width: 4.2vw; }
+    .heat td { font-size: 2.0vh; text-align: center; padding: 0.55vh 0.2vw; border-radius: 0.5vh; }
+    .heat td.cls {
+      text-align: left; font-size: 1.75vh; line-height: 1.2; color: #cdd5de; padding-left: 0;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; white-space: normal;
+    }
+    .heat td.cls .n { color: #6b7784; font-size: 1.4vh; }
+    .heat td.avg { background: #232a32; font-weight: 800; }
+    .heat td.cell { font-weight: 700; }
+    .heat td.cell .q { display: block; font-size: 1.25vh; font-weight: 400; color: rgba(255,255,255,0.55); line-height: 1; }
+    .heat td.cell.prov { opacity: 0.55; font-weight: 400; }
+    .heat td.cell.empty { background: transparent; color: #3d4854; }
+    .heat tr.total td { border-top: 1px solid var(--line); }
+    .heat tr.total td.cell { font-weight: 800; font-size: 2.1vh; }
+    .heat tr.total td.cls { font-weight: 700; color: var(--fg); -webkit-line-clamp: 1; }
+
+    .legend { display: flex; align-items: center; gap: 0.5vw; font-size: 1.5vh; color: var(--muted); }
+    .legend .sw { display: inline-block; width: 2.2vw; height: 1.6vh; border-radius: 0.4vh; }
+
+    footer { flex: 0 0 auto; font-size: 1.5vh; color: var(--muted); display: flex; gap: 1.6vw; align-items: center; }
+    .err { color: var(--bad); }
+
+    /* ─────────────────────────────────────────────────────────────
+       スマホ・縦画面 (手元での確認用)。
+       既定のレイアウトは横長モニター前提で vh/vw + overflow:hidden の
+       「1画面に収める」設計 — 縦画面ではカラムが潰れて読めないため、
+       縦積み + ページスクロールに切り替え、フォントも px 固定にする。
+       ヒートマップだけは収めるのを諦めて横スクロール (分類列は左に固定)。 */
+    @media (max-width: 900px), (orientation: portrait) {
+      html, body { height: auto; min-height: 100%; }
+      body { overflow: auto; padding: 12px; gap: 12px; }
+      header { flex-wrap: wrap; gap: 4px 12px; }
+      header h1 { font-size: 20px; }
+      header .range { font-size: 13px; }
+      header .right { font-size: 13px; gap: 10px; }
+      main { grid-template-columns: 1fr; gap: 12px; flex: none; }
+      .col { gap: 12px; }
+      .panel { border-radius: 10px; padding: 12px; }
+      .panel h2 { font-size: 13px; margin-bottom: 8px; }
+      .today-big { font-size: 44px; }
+      .today-sub { font-size: 14px; }
+      .bar { height: 10px; border-radius: 6px; margin: 8px 0 6px; }
+      .kv { font-size: 14px; gap: 8px; }
+      .chips { gap: 6px; }
+      .chip { font-size: 13px; padding: 4px 8px; border-radius: 6px; }
+      .chip .cls { font-size: 11px; }
+      .day { font-size: 13px; gap: 6px; padding: 4px 0; }
+      .day .db { height: 8px; }
+      .day .n { font-size: 11px; }
+      .heat-panel { overflow: visible; }
+      .heat-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+      table.heat { table-layout: auto; height: auto; border-spacing: 2px 3px; }
+      .heat th { font-size: 12px; padding: 0 4px 3px; }
+      .heat th.w { min-width: 52px; }
+      .heat th.cls, .heat td.cls {
+        width: auto; min-width: 120px; max-width: 150px;
+        position: sticky; left: 0; background: var(--panel); z-index: 1;
+      }
+      .heat th.cls { z-index: 2; }
+      .heat th.avg { width: auto; min-width: 44px; }
+      .heat td { font-size: 13px; padding: 4px; border-radius: 4px; }
+      /* sticky と -webkit-box の併用は列幅・固定位置が不安定 → table-cell に戻して
+         2行clampの代わりに1行省略 (Codexレビュー medium) */
+      .heat td.cls { font-size: 12px; display: table-cell; white-space: nowrap; text-overflow: ellipsis; }
+      .heat td.cls .n { font-size: 10px; }
+      .heat td.cell .q { font-size: 9px; }
+      .heat tr.total td.cell { font-size: 14px; }
+      .legend { font-size: 11px; gap: 4px; }
+      .legend .sw { width: 22px; height: 10px; }
+      footer { font-size: 11px; flex-wrap: wrap; gap: 4px 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📦 ピッキング実績</h1>
+    <span class="range" id="range">読み込み中…</span>
+    <span class="right">
+      <span id="clock"></span>
+      <span id="status"></span>
+    </span>
+  </header>
+
+  <main>
+    <div class="col">
+      <div class="panel">
+        <h2>本日の進捗</h2>
+        <div class="today-big" id="todayDone">-</div>
+        <div class="today-sub">全 <span id="todayTotal">-</span> 明細中 (残り <span id="todayRemain">-</span>)</div>
+        <div class="bar"><i id="todayBar" style="width:0%"></i></div>
+        <div class="kv"><span class="k">バッチ</span><span><b id="todayBatches">-</b></span></div>
+        <div class="kv"><span class="k">秒/明細</span><span><b id="todaySpl">-</b></span></div>
+      </div>
+      <div class="panel">
+        <h2>いま作業中</h2>
+        <div class="chips" id="active"><span class="chip">-</span></div>
+      </div>
+      <div class="panel" style="flex:1 1 auto; overflow:hidden">
+        <h2>日別 <span class="sub">(全体の秒/明細)</span></h2>
+        <div id="byDate"></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <div class="panel heat-panel" style="flex:1 1 auto">
+        <h2 id="heatTitle">引当分類別 × 作業者 <span class="sub">(秒/明細 ・ 色 = その分類の平均との比)</span></h2>
+        <div class="heat-wrap"><table class="heat" id="heat"></table></div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <span class="legend">
+      速い <span class="sw" style="background:hsl(120,45%,26%)"></span><span class="sw" style="background:hsl(90,42%,25%)"></span><span class="sw" style="background:hsl(60,38%,24%)"></span><span class="sw" style="background:hsl(30,45%,25%)"></span><span class="sw" style="background:hsl(0,48%,27%)"></span> 遅い
+      (基準 = 各分類の全体平均)
+    </span>
+    <span id="note"></span>
+    <span id="err" class="err"></span>
+  </footer>
+
+  <script>
+    var WINDOW_DAYS = <%- JSON.stringify(windowDays) %>;
+    var RELOAD_MS = 20000;          // データ再取得の間隔 (前回の完了/失敗から数える)
+    var FETCH_TIMEOUT_MS = 12000;   // これを超えたら諦めて次の周期へ (ハングで更新が止まらないように)
+    var HARD_RELOAD_MS = 6 * 3600 * 1000;   // 6時間ごとにページ自体を作り直す (長期表示のメモリ対策)
+    var startedAt = Date.now();
+    var lastOk = 0;
+    var gen = 0;                    // 応答の世代。古い応答が新しい表示を上書きしないように
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function fmt1(n) { return n == null ? '-' : Number(n).toFixed(1); }
+    function mmdd(d) { return d ? d.slice(5).replace('-', '/') : '-'; }
+
+    /**
+     * ヒートマップの色。ratio = 本人の秒/明細 ÷ その分類の平均 (1.0 = 平均どおり)。
+     * 0.75以下=濃い緑 → 1.0=黄 → 1.35以上=濃い赤。母数不足は彩度を落とす (CSS側 opacity)。
+     */
+    function heatColor(ratio) {
+      // 0秒明細だけの分類では平均0で 0/0=NaN になる → 平均どおり (黄) として扱う
+      if (!isFinite(ratio)) ratio = 1;
+      var r = Math.max(0.75, Math.min(1.35, ratio));
+      var t = r <= 1 ? ((r - 0.75) / 0.25) * 0.5 : 0.5 + ((r - 1) / 0.35) * 0.5;   // 0..1 (0.5=平均)
+      var hue = 120 * (1 - t);                                                      // 緑120 → 赤0
+      return 'hsl(' + hue.toFixed(0) + ', 45%, ' + (24 + 3 * Math.abs(t - 0.5) * 2).toFixed(0) + '%)';
+    }
+
+    function renderClock() {
+      var d = new Date();
+      var p = function (n) { return String(n).padStart(2, '0'); };
+      document.getElementById('clock').textContent = p(d.getHours()) + ':' + p(d.getMinutes());
+    }
+
+    function renderToday(t) {
+      document.getElementById('todayDone').textContent = t.doneLines;
+      document.getElementById('todayTotal').textContent = t.totalLines;
+      document.getElementById('todayBatches').textContent = t.doneCount + ' / ' + t.batchCount;
+      document.getElementById('todayRemain').textContent = t.remainingLines;
+      document.getElementById('todaySpl').textContent = fmt1(t.secPerLine);
+      var pct = t.totalLines > 0 ? Math.round((t.doneLines / t.totalLines) * 100) : 0;
+      document.getElementById('todayBar').style.width = pct + '%';
+
+      var active = document.getElementById('active');
+      if (!t.active.length) {
+        active.innerHTML = '<span class="chip" style="color:var(--muted)">作業中のバッチはありません</span>';
+      } else {
+        active.innerHTML = t.active.map(function (a) {
+          return '<span class="chip' + (a.paused ? ' paused' : '') + '">' +
+            (a.paused ? '⏸ ' : '▶ ') + esc(a.name) +
+            '<span class="cls">' + esc(a.folder || '') + ' ' + esc(a.hikiateClass || '') + '</span></span>';
+        }).join('');
+      }
+    }
+
+    /** 分類×作業者ヒートマップ。列=作業者 (総合指数の高い順)・行=分類 (明細数の多い順)。 */
+    function renderHeat(s) {
+      var cols = s.workers;   // 総合順。参考値の人も全員載せる (中原さん要望)
+      var html = '<thead><tr><th class="cls">引当分類</th><th class="avg">平均</th>' +
+        cols.map(function (w) { return '<th class="w" title="' + esc(w.name) + '">' + esc(w.name) + '</th>'; }).join('') +
+        '</tr></thead><tbody>';
+
+      html += s.baseline.map(function (c) {
+        var byWorker = {};
+        c.workers.forEach(function (w) { byWorker[w.worker] = w; });
+        return '<tr>' +
+          '<td class="cls">' + esc(c.key) + ' <span class="n">' + c.lines + '件</span></td>' +
+          '<td class="avg">' + fmt1(c.avgSec) + '</td>' +
+          cols.map(function (col) {
+            var cell = byWorker[col.worker];
+            if (!cell) return '<td class="cell empty">–</td>';
+            var bg = heatColor(cell.secPerLine / c.avgSec);
+            return '<td class="cell' + (cell.provisional ? ' prov' : '') + '" style="background:' + bg + '">' +
+              fmt1(cell.secPerLine) + '<span class="q">' + cell.lines + '件</span></td>';
+          }).join('') +
+        '</tr>';
+      }).join('');
+
+      // 総合行 (分類の重さを補正した指数。色は同じ平均比スケール = 100/指数)
+      html += '<tr class="total"><td class="cls">総合指数 <span class="n">(補正済)</span></td><td class="avg">100</td>' +
+        cols.map(function (w) {
+          if (w.index == null) return '<td class="cell empty">–</td>';
+          var bg = heatColor(100 / w.index);
+          return '<td class="cell' + (w.provisional ? ' prov' : '') + '" style="background:' + bg + '">' + w.index +
+            '<span class="q">' + fmt1(w.secPerLine) + '秒</span></td>';
+        }).join('') +
+      '</tr></tbody>';
+
+      document.getElementById('heat').innerHTML = html;
+    }
+
+    function renderDays(s) {
+      var recent = s.byDate.slice(-7);
+      var worst = recent.reduce(function (m, d) { return Math.max(m, d.secPerLine); }, 1);
+      document.getElementById('byDate').innerHTML = recent.map(function (d) {
+        return '<div class="day"><span class="d">' + mmdd(d.date) + '</span>' +
+          '<span class="db"><i style="width:' + Math.round((d.secPerLine / worst) * 100) + '%"></i></span>' +
+          '<span class="v">' + fmt1(d.secPerLine) + '</span>' +
+          '<span class="n">' + d.lines + '件</span></div>';
+      }).join('') || '<span style="color:var(--muted)">データがありません</span>';
+    }
+
+    function render(data) {
+      var s = data.stats;
+      document.getElementById('range').textContent =
+        mmdd(s.since) + '〜' + mmdd(s.until) + ' の' + s.days + '日間 ・ ' + s.total.lines + '明細';
+      document.getElementById('heatTitle').innerHTML =
+        '引当分類別 × 作業者 <span class="sub">(秒/明細 ・ 色 = その分類の平均との比 ・ 明細数上位' + s.baseline.length + '分類)</span>';
+
+      renderToday(data.today);
+      renderHeat(s);
+      renderDays(s);
+
+      var note = '薄いセル = ' + s.minClassLines + '明細未満の参考値 / ' + s.outlierSec + '秒超の明細は除外';
+      if (s.total.excluded.lines > 0) note += ' (' + s.total.excluded.lines + '件)';
+      document.getElementById('note').textContent = note;
+    }
+
+    /**
+     * 1回だけ取得して、完了(成功/失敗)してから次を予約する。
+     * setInterval にしないのは、応答が遅いときにリクエストが積み上がるため。
+     * AbortController で必ず打ち切り、世代番号で古い応答を捨てる (Codexレビュー medium)。
+     */
+    function tick() {
+      var myGen = ++gen;
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
+      var done = false;
+      var finish = function (fn) {
+        clearTimeout(timer);
+        if (done || myGen !== gen) return;   // 二重実行・古い応答は無視
+        done = true;
+        // ⭐描画で例外が出ても必ず次を予約する (finally)。ここで抜けると常時表示が
+        //   二度と更新されないまま古い数字を映し続ける (Codexレビュー medium)
+        try {
+          fn();
+        } catch (e) {
+          try {
+            document.getElementById('err').textContent = '表示エラー (' + e.message + ')';
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          } catch (ignored) { /* DOMごと壊れている場合は次の周期に賭ける */ }
+        } finally {
+          // ページ自体の作り直しは「更新に成功している間だけ」行う。
+          // サーバー停止中に reload すると、保持していた最後の正常表示までブラウザの
+          // エラー画面に置き換わってしまう
+          if (lastOk && Date.now() - startedAt > HARD_RELOAD_MS && Date.now() - lastOk < RELOAD_MS * 2) {
+            location.reload();
+          } else {
+            setTimeout(tick, RELOAD_MS);
+          }
+        }
+      };
+
+      fetch('/apps/picking/api/board?days=' + WINDOW_DAYS, { credentials: 'same-origin', signal: ctrl.signal })
+        .then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function (d) {
+          if (!d || !d.ok) throw new Error('bad payload');
+          finish(function () {
+            render(d);
+            lastOk = Date.now();
+            document.getElementById('err').textContent = '';
+            document.getElementById('status').textContent = '●';
+            document.getElementById('status').className = '';
+          });
+        })
+        .catch(function (e) {
+          finish(function () {
+            // 前回の表示はそのまま残す (真っ白にするより情報が多い)
+            var msg = e.name === 'AbortError' ? '応答なし (タイムアウト)' : '通信エラー (' + e.message + ')';
+            document.getElementById('err').textContent =
+              msg + (lastOk ? ' / 最終更新 ' + new Date(lastOk).toLocaleTimeString('ja-JP') : '');
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          });
+        });
+    }
+
+    renderClock();
+    setInterval(renderClock, 10000);
+    tick();
+  </script>
+</body>
+</html>

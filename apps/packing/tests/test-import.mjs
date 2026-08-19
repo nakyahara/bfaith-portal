@@ -655,9 +655,9 @@ await (async () => {
   passed++; console.log('  ok: ポーラー: mismatchは取り込まずskipped=承認待ち (async)');
 })();
 
-// ─── ④ 配送方法変更 (保留→事務対応→解除) ───
+// ─── ④ 配送方法変更 (簡素化: 記録+GChat明細通知のみ・保留なし) ───
 
-t('ship_change: 伝票がheldになり、保留が残る間はバッチが完了しない', () => {
+t('ship_change: 記録のみ — 伝票・バッチの状態は変えない (変更待ち棚の運用)', () => {
   const sp = parseCs03003(makeCsv([
     row({ slip: '0120', lineNo: 1, sku: 's1', tb: 'TB00000000001' }),
     row({ slip: '0121', lineNo: 1, sku: 's2', tb: 'TB00000000001' }),
@@ -668,37 +668,145 @@ t('ship_change: 伝票がheldになり、保留が残る間はバッチが完了
     opId: 's-c1', event: 'ship_change', slipSeq: 1,
     proposedMethod: '宅急便60サイズ', reason: '入らない',
   }, '星');
-  assert.deepEqual(r1.heldSeqs, [1]);
-  assert.equal(r1.currentSeq, 2);
+  assert.deepEqual(r1.heldSeqs, []);          // 保留しない
+  assert.equal(r1.currentSeq, 1);             // 伝票はそのまま (梱包者が次へで完了する)
   const chg = getDB().prepare('SELECT * FROM pk_pack_ship_changes ORDER BY id DESC LIMIT 1').get();
-  assert.equal(chg.status, 'requested');
   assert.equal(chg.proposed_method, '宅急便60サイズ');
-  // 残り (seq2) を完了しても、保留が残る間はバッチ done にならない (完了ガード)
-  const r2 = applyEvent(sr.batchId, { opId: 's-n1', event: 'next', slipSeq: 2 }, '星');
-  assert.equal(r2.batchStatus, 'packing');
-  assert.equal(r2.currentSeq, null);
-  // 事務が completed → 伝票が pending に戻り、完了できる
-  const { setShipChangeStatus } = svc;
-  setShipChangeStatus(chg.id, 'completed', 'office@test');
-  const r3 = applyEvent(sr.batchId, { opId: 's-n2', event: 'next', slipSeq: 1 }, '星');
-  assert.equal(r3.batchStatus, 'done');
+  // そのまま完了できる
+  applyEvent(sr.batchId, { opId: 's-n1', event: 'next', slipSeq: 1 }, '星');
+  const r2 = applyEvent(sr.batchId, { opId: 's-n2', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(r2.batchStatus, 'done');
+  // 完了後の依頼も記録のみ (再オープンしない)
+  applyEvent(sr.batchId, { opId: 's-c2', event: 'ship_change', slipSeq: 2, proposedMethod: 'ネコポス', reason: 'その他' }, '星');
+  assert.equal(getPackBatch(sr.batchId).status, 'done');
 });
 
-t('ship_change: 理由・提案は必須。処理済み伝票は保留にできない', () => {
+t('ship_change: 理由・提案は必須。リスト外は拒否', () => {
   const sp = parseCs03003(makeCsv([row({ slip: '0130', sku: 'q1', tb: 'TB00000000002' })]));
   const sr = importPackBatch(sp, { matchAck: true }, 'test');
   applyEvent(sr.batchId, { opId: 'q-s1', event: 'start' }, '星');
   expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c1', event: 'ship_change', slipSeq: 1, reason: '入らない' }, '星'), 'bad_method');
   expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c2', event: 'ship_change', slipSeq: 1, proposedMethod: 'ネコポス' }, '星'), 'bad_reason');
-  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c4', event: 'ship_change', slipSeq: 1, proposedMethod: '30サイズ', reason: '入らない' }, '星'), 'bad_method');   // リスト外は拒否
+  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c4', event: 'ship_change', slipSeq: 1, proposedMethod: '30サイズ', reason: '入らない' }, '星'), 'bad_method');
   applyEvent(sr.batchId, { opId: 'q-n1', event: 'next', slipSeq: 1 }, '星');
-  expectPackError(() => applyEvent(sr.batchId, { opId: 'q-c3', event: 'ship_change', slipSeq: 1, proposedMethod: 'ネコポス', reason: '入らない' }, '星'), 'not_packing');
 });
 
-t('setShipChangeStatus: 不正な遷移は拒否される', () => {
-  const { setShipChangeStatus } = svc;
-  const chg = getDB().prepare("SELECT * FROM pk_pack_ship_changes WHERE status='completed' ORDER BY id DESC LIMIT 1").get();
-  expectPackError(() => setShipChangeStatus(chg.id, 'accepted', 'x'), 'bad_transition');
+// ─── ①再ピック / ②棚戻し / ③ミス記録 (⭐候補方式: 記録→梱包終了時にまとめて送信) ───
+
+const { applyTaskAction, listOpenTasks, countOpenTasks, resolveIncident, listIncidents } = svc;
+
+// picking側にロケ付きバッチを用意 (再ピックのロケ参照用)
+importPickingBatch(parseCs03002(makePickCsv([
+  pickRow({ slip: '0200', sku: 'p2a', qty: 2, tb: 'TB00000000010', loc: '00201604' }),
+  pickRow({ slip: '0201', sku: 'p2b', qty: 1, tb: 'TB00000000010', loc: '00300101' }),
+])), { hikiateClass: 'テスト', folderName: '出荷_88' }, 'test');
+const t2p = parseCs03003(makeCsv([
+  row({ slip: '0200', lineNo: 1, sku: 'p2a', qty: 2, tb: 'TB00000000010' }),
+  row({ slip: '0201', lineNo: 1, sku: 'p2b', qty: 1, tb: 'TB00000000010' }),
+]));
+const t2r = importPackBatch(t2p, { folderName: '出荷_88' }, 'test');
+applyEvent(t2r.batchId, { opId: 'p2-s', event: 'start' }, '星');
+
+t('①不足の記録 = 候補+保留のみ (タスクは発行しない・通知もしない)', () => {
+  const r = applyEvent(t2r.batchId, { opId: 'p2-sh1', event: 'shortage', slipSeq: 1, sku: 'p2a', qty: 1 }, '星');
+  assert.deepEqual(r.heldSeqs, [1]);
+  assert.deepEqual(r.repickSeqs, [1]);
+  assert.equal(r.taskNotify, undefined);   // ⭐送信は最後にまとめて
+  assert.equal(listOpenTasks().filter((t) => t.batch_id === t2r.batchId).length, 0);
+  assert.equal(listIncidents(t2r.batchId, 'candidate').length, 1);
+});
+
+t('送信前の receive は拒否 (見つかった場合は found)', () => {
+  expectPackError(() => applyEvent(t2r.batchId, { opId: 'p2-rc0', event: 'receive', slipSeq: 1 }, '星'), 'repick_not_ready');
+});
+
+t('未処理が残っている間は送信 (confirm) できない', () => {
+  const inc = listIncidents(t2r.batchId, 'candidate')[0];
+  expectPackError(() => resolveIncident(inc.id, 'confirm', '星'), 'batch_not_done');
+});
+
+t('梱包終了後の送信 = タスク発行 (ロケ付き)+帰責+通知情報', () => {
+  // picking側の担当を先に付ける (帰責先)
+  const pk = getDB().prepare("SELECT id FROM pk_batches WHERE tb_no='TB00000000010'").get();
+  getDB().prepare("UPDATE pk_batches SET worker='ピッカー花子' WHERE id=?").run(pk.id);
+  // 伝票2を完了 → 未処理ゼロ (保留1が残る=バッチは packing のまま)
+  const r1 = applyEvent(t2r.batchId, { opId: 'p2-n1', event: 'next', slipSeq: 2 }, '星');
+  assert.equal(r1.batchStatus, 'packing');
+  assert.equal(r1.currentSeq, null);
+  const inc = listIncidents(t2r.batchId, 'candidate')[0];
+  const done = resolveIncident(inc.id, 'confirm', '星');
+  assert.equal(done.status, 'confirmed');
+  assert.equal(done.attributed_worker, 'ピッカー花子');
+  assert.equal(done.dispatchedTasks.length, 1);
+  assert.equal(done.dispatchedTasks[0].kind, 'repick');
+  const task = listOpenTasks().find((t) => t.batch_id === t2r.batchId);
+  assert.equal(task.sku, 'p2a');
+  assert.equal(task.location, '00201604');
+  assert.equal(task.folder_name, '出荷_88');
+  expectPackError(() => resolveIncident(inc.id, 'withdraw', '星'), 'already_resolved');
+});
+
+t('タスク状態機械: claim→fulfill→受領で保留解除→完了でバッチ done', () => {
+  const task = listOpenTasks().find((t) => t.batch_id === t2r.batchId);
+  expectPackError(() => applyTaskAction(task.id, 'fulfill', '月'), 'bad_transition');   // claim前
+  applyTaskAction(task.id, 'claim', '月');
+  expectPackError(() => applyEvent(t2r.batchId, { opId: 'p2-rc1', event: 'receive', slipSeq: 1 }, '星'), 'repick_not_ready');
+  applyTaskAction(task.id, 'fulfill', '月');
+  applyEvent(t2r.batchId, { opId: 'p2-rc2', event: 'receive', slipSeq: 1 }, '星');
+  assert.equal(getDB().prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(task.id).status, 'received');
+  const r = applyEvent(t2r.batchId, { opId: 'p2-n2', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(r.batchStatus, 'done');
+});
+
+t('found = 候補取下げ+保留解除 (送信前ならタスク無しのまま消える)', () => {
+  const fp = parseCs03003(makeCsv([
+    row({ slip: '0210', lineNo: 1, sku: 'f1', tb: 'TB00000000011' }),
+    row({ slip: '0211', lineNo: 1, sku: 'f2', tb: 'TB00000000011' }),
+  ]));
+  const fr = importPackBatch(fp, { matchAck: true }, 'test');
+  applyEvent(fr.batchId, { opId: 'f-s', event: 'start' }, '星');
+  applyEvent(fr.batchId, { opId: 'f-sh', event: 'shortage', slipSeq: 1, sku: 'f1', qty: 1 }, '星');
+  applyEvent(fr.batchId, { opId: 'f-fd', event: 'found', slipSeq: 1 }, '星');
+  assert.equal(listIncidents(fr.batchId, 'candidate').length, 0);
+  assert.equal(getDB().prepare('SELECT status FROM pk_pack_incidents WHERE batch_id=?').get(fr.batchId).status, 'withdrawn');
+  assert.equal(listPackSlips(fr.batchId)[0].status, 'pending');
+  assert.equal(listOpenTasks().filter((t) => t.batch_id === fr.batchId).length, 0);
+});
+
+t('取下げ (withdraw) でも他候補が無ければ保留解除される', () => {
+  const wp3 = parseCs03003(makeCsv([row({ slip: '0215', sku: 'w3', tb: 'TB00000000014' })]));
+  const wr3 = importPackBatch(wp3, { matchAck: true }, 'test');
+  applyEvent(wr3.batchId, { opId: 'w3-s', event: 'start' }, '星');
+  applyEvent(wr3.batchId, { opId: 'w3-sh', event: 'shortage', slipSeq: 1, sku: 'w3', qty: 1 }, '星');
+  const inc = listIncidents(wr3.batchId, 'candidate')[0];
+  resolveIncident(inc.id, 'withdraw', '星');
+  assert.equal(listPackSlips(wr3.batchId)[0].status, 'pending');
+});
+
+t('品違いの送信 = 再ピック+棚戻しの2タスク / 余りの送信 = 棚戻しタスク', () => {
+  const gp = parseCs03003(makeCsv([row({ slip: '0220', sku: 'g0', tb: 'TB00000000012' })]));
+  const gr = importPackBatch(gp, { matchAck: true }, 'test');
+  applyEvent(gr.batchId, { opId: 'g-s', event: 'start' }, '星');
+  applyEvent(gr.batchId, { opId: 'g-wi', event: 'wrong_item', slipSeq: 1, sku: 'g0', actualSku: 'g-x', qty: 1 }, '星');
+  applyEvent(gr.batchId, { opId: 'g-ex', event: 'excess', slipSeq: 1, sku: 'zaiko-y', qty: 3 }, '星');
+  // 未処理ゼロ (伝票1は保留) → 送信可能
+  const cands = listIncidents(gr.batchId, 'candidate');
+  assert.equal(cands.length, 2);
+  const wi = cands.find((c) => c.kind === 'wrong_item');
+  const ex = cands.find((c) => c.kind === 'excess');
+  const wiDone = resolveIncident(wi.id, 'confirm', '星');
+  assert.deepEqual(wiDone.dispatchedTasks.map((t) => t.kind).sort(), ['repick', 'return']);
+  const exDone = resolveIncident(ex.id, 'confirm', '星');
+  assert.deepEqual(exDone.dispatchedTasks.map((t) => t.kind), ['return']);
+  assert.equal(exDone.dispatchedTasks[0].sku, 'zaiko-y');
+  // return タスクは claim→fulfill で returned 終端
+  const ret = listOpenTasks().find((t) => t.batch_id === gr.batchId && t.kind === 'return' && t.sku === 'zaiko-y');
+  applyTaskAction(ret.id, 'claim', '月');
+  assert.equal(applyTaskAction(ret.id, 'fulfill', '月').status, 'returned');
+});
+
+t('countOpenTasks が picking バッジ用の件数を返す', () => {
+  assert.ok(Number.isInteger(countOpenTasks()));
 });
 
 // ─── 日次サマリ ───
