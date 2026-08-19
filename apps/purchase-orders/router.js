@@ -29,7 +29,7 @@ import { importInboundCsv, previewInboundCsv, listInbound, candidatesFor, setInb
 import { importNeBackorderCsv } from './migration.js';
 import { listBarcodeOverview, upsertLabel, importBarcodeCsv, barcodeAttacher, barcodeTargetSupplier, loadLabelMap } from './barcode-labels.js';
 import {
-  buildOrderEmail, buildOrderFax, buildOrderRelay, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
+  buildOrderEmail, buildOrderFax, buildOrderRelay, buildOrderPdfMail, createEmailJob, processEmailJob, reconcileEmailJobs, listEmailJobs, emailSettings, parseAddresses,
   markUnsent, cancelEmailJob, startEmailDispatcher, csvCell, normalizeFaxNumber, contentHashOf,
 } from './email.js';
 import { renderOrderPdf } from './fax-pdf.js';
@@ -501,7 +501,7 @@ function cycleIssuedSuppliers(cycleStart) {
            GROUP_CONCAT(CASE WHEN is_unsent = 1 THEN po_label END) AS unsent_pos
     FROM (
       SELECT o.supplier_code AS code, o.supplier_name AS name, COALESCE(o.po_number, '#' || o.id) AS po_label,
-             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method IN ('email', 'fax', 'relay')
+             CASE WHEN COALESCE(o.send_blocked, 0) = 0 AND s.send_method IN ('email', 'fax', 'relay', 'email_pdf')
                    AND NOT EXISTS (SELECT 1 FROM po_email_jobs e WHERE e.order_id = o.id AND e.status = 'sent' AND e.is_dry_run = 0)
                   THEN 1 ELSE 0 END AS is_unsent
       FROM po_orders o LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code
@@ -1191,16 +1191,17 @@ router.post('/api/inbound/:id/ignore', (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
-// ─── P15: 発注書メール送信 (+FAX: eFaxゲートウェイ宛メール channel='fax' / 社内転送 channel='relay') ───
-/** POの仕入先の送信方法 ('fax'/'relay' はそのチャネル、それ以外はemailチャネルで既存の検証メッセージに任せる) */
+// ─── P15: 発注書メール送信 (+FAX channel='fax' / PDFメール channel='email_pdf' / 社内転送 channel='relay') ───
+/** POの仕入先の送信方法 ('fax'/'relay'/'email_pdf' はそのチャネル、それ以外はemailチャネルで既存の検証メッセージに任せる) */
 function sendChannelOf(orderId) {
   const r = getDB().prepare(`SELECT s.send_method FROM po_orders o
     LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code WHERE o.id=?`).get(orderId);
-  return r && (r.send_method === 'fax' || r.send_method === 'relay') ? r.send_method : 'email';
+  return r && ['fax', 'relay', 'email_pdf'].includes(r.send_method) ? r.send_method : 'email';
 }
 /** チャネル別のプレビュー組み立て (email/preview・PDF生成・send が同じ分岐を使う) */
 function buildOrderSendOf(orderId, channel) {
-  return channel === 'fax' ? buildOrderFax(orderId) : channel === 'relay' ? buildOrderRelay(orderId) : buildOrderEmail(orderId);
+  return channel === 'fax' ? buildOrderFax(orderId) : channel === 'relay' ? buildOrderRelay(orderId)
+    : channel === 'email_pdf' ? buildOrderPdfMail(orderId) : buildOrderEmail(orderId);
 }
 
 router.get('/api/orders/:id/email/preview', (req, res) => {
@@ -1241,7 +1242,7 @@ router.get('/api/email-jobs/:id/pdf', (req, res) => {
     const jobId = Number(req.params.id);
     if (!Number.isSafeInteger(jobId) || jobId <= 0) return res.status(400).json({ ok: false, error: 'idが不正です' });
     const job = getDB().prepare('SELECT channel, attachment_name, attachment_pdf FROM po_email_jobs WHERE id=?').get(jobId);
-    if (!job || !['fax', 'relay'].includes(job.channel) || !job.attachment_pdf) return res.status(404).json({ ok: false, error: 'このジョブのPDF控えが見つかりません' });
+    if (!job || !['fax', 'relay', 'email_pdf'].includes(job.channel) || !job.attachment_pdf) return res.status(404).json({ ok: false, error: 'このジョブのPDF控えが見つかりません' });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `inline; filename="${job.attachment_name}"`);
     res.send(Buffer.from(job.attachment_pdf));
@@ -2335,7 +2336,7 @@ const MASTER_DEFS = {
     validate: r => {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
-      if (r.send_method && !['email', 'fax', 'web', 'relay', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/relay/none';
+      if (r.send_method && !['email', 'fax', 'web', 'relay', 'email_pdf', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/relay/email_pdf/none';
       if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
       if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
       if (r.send_method === 'relay' && !r.relay_to) return '発注方法が社内転送の場合は社内転送先メールアドレスを入力してください';
@@ -6626,10 +6627,10 @@ document.getElementById('boBulkSend').addEventListener('click', function() {
     var labels = {}, channels = {};
     ids.forEach(function(id) {
       var o = null; DATA.orders.forEach(function(x){ if (String(x.id) === String(id)) o = x; });
-      channels[id] = (o && (o.sendMethod === 'fax' || o.sendMethod === 'relay')) ? o.sendMethod : 'email';
-      labels[id] = (o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id) + (channels[id] === 'fax' ? ' 📠FAX' : channels[id] === 'relay' ? ' 📨社内転送' : '');
+      channels[id] = (o && ['fax', 'relay', 'email_pdf'].indexOf(o.sendMethod) >= 0) ? o.sendMethod : 'email';
+      labels[id] = (o ? (o.poNumber || ('#' + o.id)) + ' (' + o.supplierName + ')' : '#' + id) + (channels[id] === 'fax' ? ' 📠FAX' : channels[id] === 'relay' ? ' 📨社内転送' : channels[id] === 'email_pdf' ? ' 📄PDFメール' : '');
     });
-    if (!confirm('選択した ' + ids.length + '件の発注書を' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します (📠FAX印はeFax経由でPDF送信、📨印は社内転送先へPDF発注書メール)。\\n' +
+    if (!confirm('選択した ' + ids.length + '件の発注書を' + (at ? '\\n⏰ ' + at.replace('T', ' ') + ' に予約' : '今すぐ') + '送信します (📠FAX印はeFax経由でPDF送信、📄印は先方へ本文ベタ打ち+PDF、📨印は社内転送先へPDF発注書メール)。\\n' +
       'モード: ' + (st.mode === 'live' ? '⚠️ 本番送信 (仕入先に届きます)' : '🔒 dry-run (社内 ' + (st.dryrunTo || '未設定') + ' に送信)') + '\\n\\n・' + ids.map(function(id){ return labels[id]; }).join('\\n・') + '\\n\\nよろしいですか?')) return;
     // 冪等キーは確定時に一括生成して保持 — 通信エラー行は「同じキーで再確認」で安全に再実行できる (replayなら二重送信なし)
     BULK_LAST = { at: at, mode: st.mode, entries: ids.map(function(id){ return { id: id, label: labels[id], channel: channels[id], key: 'bulk-' + id + '-' + newIdemKey() }; }) };
@@ -6954,6 +6955,8 @@ function supPanel(orderId) {
 function emPreviewModal(j, orderId) {
   var isFax = j.channel === 'fax';
   var isRelay = j.channel === 'relay';
+  var isPdfMail = j.channel === 'email_pdf';
+  var hasPdf = isFax || isRelay || isPdfMail;
   var old = document.getElementById('emModalBg');
   if (old) { if (old._close) old._close(); else old.remove(); } // 差し替え時も旧ESCリスナーごと片付ける (Codex modal-R2 Low)
   var rows = j.csvRows || [];
@@ -6969,7 +6972,7 @@ function emPreviewModal(j, orderId) {
   var bg = document.createElement('div');
   bg.className = 'pomodal-bg'; bg.id = 'emModalBg';
   bg.innerHTML = '<div class="pomodal">' +
-    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">' + (isFax ? '📠 FAX送信内容のプレビュー' : isRelay ? '📨 社内転送メールのプレビュー' : '📧 送信内容のプレビュー') + '</h2>' +
+    '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h2 style="margin:0">' + (isFax ? '📠 FAX送信内容のプレビュー' : isRelay ? '📨 社内転送メールのプレビュー' : isPdfMail ? '📄 PDFメール送信内容のプレビュー' : '📧 送信内容のプレビュー') + '</h2>' +
     (j.mode !== 'live'
       ? '<span class="badge b-draft">🔒 dry-run — 実際は ' + esc(j.dryrunTo || '未設定') + ' に届きます</span>'
       : '<span class="badge b-issued">本番送信 (live)</span>') +
@@ -6983,8 +6986,8 @@ function emPreviewModal(j, orderId) {
     '<pre class="copy" style="max-height:30vh;overflow:auto">' + esc(j.body) + '</pre>' +
     '<h3 style="margin:12px 0 4px">📎 添付: ' + esc(j.attachmentName) +
     ' <span class="muted" style="font-weight:400">(' + j.rows + '商品 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) + ')</span>' +
-    ((isFax || isRelay) && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (現在のデータから生成)</a>' : '') + '</h3>' +
-    ((isFax || isRelay) ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください (送信後の正式な控えは履歴の📄PDF)。</div>' : '') +
+    (hasPdf && orderId ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:13px;font-weight:600">📄 PDFを開く (現在のデータから生成)</a>' : '') + '</h3>' +
+    (hasPdf ? '<div class="muted" style="font-size:12px;margin-bottom:4px">下の表はPDF発注書と同じ明細データです。レイアウトは「PDFを開く」で確認してください (送信後の正式な控えは履歴の📄PDF)。</div>' : '') +
     '<div style="overflow-x:auto">' + tbl + '</div></div>';
   document.body.appendChild(bg);
   // どの閉じ方でもDOM削除とESCリスナー解除を必ず両方行う (リスナー蓄積防止、Codex modal-R1 Low)
@@ -7006,6 +7009,8 @@ function emailPanel(orderId, errBanner) {
     var dry = j.mode !== 'live';
     var isFax = j.channel === 'fax';
     var isRelay = j.channel === 'relay';
+    var isPdfMail = j.channel === 'email_pdf';
+    var hasPdf = isFax || isRelay || isPdfMail;
     // 文字列引数は受け付けない ({head, detail}のみ)。「未送信」断定文言は failed 確定経路だけが使う不変条件を守る (Codex vendor-R5 Low)
     var eb = (errBanner && errBanner.head) ? errBanner : null;
     if (!eb) {
@@ -7020,7 +7025,7 @@ function emailPanel(orderId, errBanner) {
       (eb
         ? '<div style="background:#fef2f2;border:2px solid #dc2626;color:#991b1b;border-radius:10px;padding:10px 14px;margin-bottom:8px;font-weight:600;font-size:14px">' + esc(eb.head) + '<div style="font-weight:400;font-size:12px;margin-top:4px">' + esc(eb.detail || '') + '</div></div>'
         : '') +
-      '<b>' + (isFax ? '📠 発注書FAX (eFax)' : isRelay ? '📨 発注書メール (社内転送)' : '📧 発注書メール') + '</b> ' +
+      '<b>' + (isFax ? '📠 発注書FAX (eFax)' : isRelay ? '📨 発注書メール (社内転送)' : isPdfMail ? '📄 発注書メール (PDF+本文ベタ打ち)' : '📧 発注書メール') + '</b> ' +
       (dry ? '<span class="badge b-draft" title="宛先を社内アドレスに差し替えて送ります。本番切替はマスタ管理→メール設定">🔒 dry-run中 → ' + esc(j.dryrunTo || '未設定') + '</span>'
            : '<span class="badge b-issued">本番送信 (live)</span>') +
       (!j.envReady ? ' <span class="warn" style="display:inline-block;padding:2px 6px">⚠️ Gmail env未設定 (送信不可)</span>' : '') +
@@ -7034,17 +7039,18 @@ function emailPanel(orderId, errBanner) {
       '<tr><th>添付</th><td>' + esc(j.attachmentName) + ' — ' + j.rows + '行 / 合計 ' + j.totalQty.toLocaleString('ja-JP') + '個 / ' + yen(j.totalAmount) +
         (j.vendorColUsed ? ' / 先方管理番号列つき' : '') +
         (j.missingVendorCodes.length ? ' <span class="badge b-issued" title="' + esc(j.missingVendorCodes.join(', ')) + '">⚠️ 先方番号なし ' + j.missingVendorCodes.length + '件</span>' : '') +
-        ((isFax || isRelay) ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:12px;font-weight:600">📄 PDFを開く</a>' : '') + '</td></tr>' +
+        (hasPdf ? ' <a class="ghost" href="' + API + '/orders/' + orderId + '/fax/pdf" target="_blank" rel="noopener" style="font-size:12px;font-weight:600">📄 PDFを開く</a>' : '') + '</td></tr>' +
       '</table>' +
       '<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
       '<button class="ghost" id="emPrev-' + orderId + '" style="font-weight:600">👁 送信内容をプレビュー (本文+添付)</button>' +
-      '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : isRelay ? (dry ? '📨 dry-run送信 (自分宛)' : '📨 社内転送先へ今すぐ送信') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
+      '<button class="pri" id="emGo-' + orderId + '">' + (isFax ? (dry ? '📠 dry-run送信 (自分宛)' : '📠 今すぐFAX送信') : isRelay ? (dry ? '📨 dry-run送信 (自分宛)' : '📨 社内転送先へ今すぐ送信') : isPdfMail ? (dry ? '📄 dry-run送信 (自分宛)' : '📄 今すぐ送信 (PDFメール)') : (dry ? '📧 dry-run送信 (自分宛)' : '📧 今すぐ送信')) + '</button>' +
       '<label class="muted">⏰ 日時指定 <input type="datetime-local" id="emWhen-' + orderId + '"></label>' +
       '<button class="ghost" id="emSched-' + orderId + '">⏰ 予約する</button>' +
       (j.jobs.some(function(x){ return x.status === 'sent' && !x.is_dry_run && (x.channel || 'email') === (j.channel || 'email'); }) ? '<button class="ghost" id="emResend-' + orderId + '">↪ 再送として送る</button>' : '') +
       '<button class="ghost" data-emclose="' + orderId + '">閉じる</button></div>' +
       (isFax ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 「送信済」はeFaxゲートウェイへの受け渡し完了です。相手FAX機への送達結果は、eFaxからの結果通知メール (送信元アドレス宛) で確認してください。</div>' : '') +
-      (isRelay ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 社内転送: このメールは仕入先には届きません。届いたメールの本文 (発注内容ベタ打ち) と添付PDFを、ご自身のメールソフトから仕入先へ転送してください。</div>' : '');
+      (isRelay ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ 社内転送: このメールは仕入先には届きません。届いたメールの本文 (発注内容ベタ打ち) と添付PDFを、ご自身のメールソフトから仕入先へ転送してください。</div>' : '') +
+      (isPdfMail ? '<div class="muted" style="font-size:11px;margin-top:4px">ℹ️ PDFメール: CSVの代わりに本文ベタ打ち+発注書PDFで先方へ直接送ります (不達対策)。過去に不達のあった仕入先のため、到着を電話等で確認してください。</div>' : '');
     if (j.jobs.length) {
       h += '<table class="t" style="margin-top:8px"><tr><th>#</th><th>状態</th><th>宛先</th><th>日時</th><th>結果/エラー</th><th></th></tr>';
       j.jobs.forEach(function(x) {
@@ -7054,11 +7060,11 @@ function emailPanel(orderId, errBanner) {
           x.status === 'sending' ? '⏳ 送信中' :
           x.status === 'cancelled' ? '🚫 取消' :
           (x.scheduled_at ? '⏰ 予約 ' + esc(String(new Date(new Date(x.scheduled_at).getTime() + 9 * 3600000).toISOString()).slice(0, 16).replace('T', ' ')) + ' (JST)' : x.status);
-        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + (x.channel === 'fax' ? '📠 ' : x.channel === 'relay' ? '📨 ' : '') + esc(x.to_addr) + '</td>' +
+        h += '<tr><td>' + x.id + (x.is_resend ? ' ↪' + (x.resend_of || '') : '') + (x.generation > 1 ? ' <span class="muted" title="送信試行の世代 (照合の競合検知に使用)">g' + x.generation + '</span>' : '') + '</td><td>' + st + '</td><td>' + (x.channel === 'fax' ? '📠 ' : x.channel === 'relay' ? '📨 ' : x.channel === 'email_pdf' ? '📄 ' : '') + esc(x.to_addr) + '</td>' +
           '<td class="muted" style="font-size:11px">' + esc(String(x.sent_at || x.created_at).slice(0, 16).replace('T', ' ')) + '</td>' +
           '<td style="font-size:11px">' + esc(x.gmail_message_id || x.error || '') + '</td>' +
           '<td style="white-space:nowrap">' +
-            ((x.channel === 'fax' || x.channel === 'relay') ? '<a class="ghost" href="' + API + '/email-jobs/' + x.id + '/pdf" target="_blank" rel="noopener" title="このジョブで送信された (される) PDFの控え">📄 PDF</a> ' : '') +
+            (['fax', 'relay', 'email_pdf'].indexOf(x.channel) >= 0 ? '<a class="ghost" href="' + API + '/email-jobs/' + x.id + '/pdf" target="_blank" rel="noopener" title="このジョブで送信された (される) PDFの控え">📄 PDF</a> ' : '') +
             (x.status === 'failed' ? '<button class="ghost" data-emretry="' + x.id + '" data-emorder="' + orderId + '">再試行</button> ' : '') +
             ((x.status === 'queued' || x.status === 'failed') ? '<button class="ghost" data-emcancel="' + x.id + '" data-emorder="' + orderId + '">取消</button> ' : '') +
             ((x.status === 'sending' || x.status === 'unknown') ? '<button class="ghost" data-emrec="' + orderId + '">照合</button> ' : '') +
@@ -7082,6 +7088,8 @@ function emailPanel(orderId, errBanner) {
           ? '⚠️ 本番FAX送信です。仕入先のFAX ' + (j.faxNumber || '') + ' に発注書PDFが届きます (eFax経由)' + when + '。送信しますか?\\n\\n※eFaxの送信結果 (成功/失敗) は送信元メールアドレスへの通知メールで確認できます'
           : isRelay
           ? '📨 社内転送メールを送信します。仕入先ではなく社内転送先 ' + j.to.join(', ') + ' に発注書 (本文ベタ打ち+PDF添付) が届きます' + when + '。\\n届いたメールをご自身のメールから仕入先へ転送してください。送信しますか?'
+          : isPdfMail
+          ? '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書 (本文ベタ打ち+PDF添付) を直接送ります' + when + '。\\n過去に不達のあった仕入先です — 送信後、到着を電話等で確認してください。送信しますか?'
           : '⚠️ 本番送信です。仕入先 ' + j.to.join(', ') + ' に発注書が届きます' + when + '。送信しますか?');
       // 先方管理番号の未登録は送信を止めない (中原さん決定 2026-07-13)。確認ダイアログで気づけるようにだけする
       if (j.missingVendorCodes.length) {
@@ -8005,7 +8013,7 @@ var TAB = 'suppliers';
 var GRP = 'suppliers';
 var SUBTAB = 'conditions'; // 発注条件グループ内で最後に見ていたサブタブ
 var GRP_HINTS = {
-  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📠FAX/🌐WEB/📨社内転送)、FAX番号 (eFax送信用)・社内転送先をここで設定します。',
+  suppliers: '🏭 新しい仕入先の登録、発注書メールの宛先 (To/CC/担当者名)、発注方法 (📧メール/📄PDFメール/📠FAX/🌐WEB/📨社内転送)、FAX番号 (eFax送信用)・社内転送先をここで設定します。',
   conditions: '📦 商品をどの発注条件・原料グループで発注するかの設定と、スプレッドシートCSVの一括取込。新商品の紐付け漏れチェックもここ。',
   vendormap: '📇 自社商品コードと先方管理番号 (アメージングクラフト/ビーフリーの発注書に載る番号) の対応をここで管理します。',
   barcode: '🏷️ 自社商品 (AMC製造×売上分類1) のラベルにAmazonバーコード (FNSKU) が印字設定済みかをここで管理します。未登録/未設定の商品は発注時に印字依頼が必要。',
@@ -8032,7 +8040,7 @@ var DEFS = {
     { k: 'supplier_code', l: '仕入先コード', pk: 1 }, { k: 'name', l: '仕入先名' }, { k: 'order_memo', l: '発注メモ (FAX/WEB/送料条件等)' },
     { k: 'email_to', l: '発注書メール宛先 (カンマ区切り可)' }, { k: 'email_cc', l: 'CC' },
     { k: 'contact_name', l: '担当者名 (様は自動付与)' },
-    { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['relay', '📨 社内転送 (社内宛メール→手動転送)'], ['none', '送信なし']] },
+    { k: 'send_method', l: '発注方法', sel: [['', '未設定'], ['email', '📧 メール'], ['email_pdf', '📄 メール (PDF+本文ベタ打ち・不達対策)'], ['fax', '📠 FAX'], ['web', '🌐 WEBサイト'], ['relay', '📨 社内転送 (社内宛メール→手動転送)'], ['none', '送信なし']] },
     { k: 'fax_number', l: 'FAX番号 (発注方法FAXで必須。例: 06-1234-5678)' },
     { k: 'relay_to', l: '社内転送先メール (発注方法=社内転送で必須。先方が受信拒否等の仕入先向け)' },
     { k: 'lead_days', l: '標準リードタイム日数', num: 1 } ] },

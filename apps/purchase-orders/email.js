@@ -9,8 +9,10 @@
  *  - 添付CSVはアプリの発注明細から生成 (Shift-JIS/CP932、Excel互換)。
  *    アメージングクラフト/ビーフリー等は対応表 (po_vendor_code_map) で先方管理番号列を付与
  *  - channel: email (先方宛+CSV添付) / fax (eFaxゲートウェイ宛+PDF添付) /
- *    relay (社内転送: 先方の受信拒否等でメールが届かない仕入先向け。宛先=社内 relay_to、
- *    本文に発注内容ベタ打ち+PDF添付 → 受信者が自分のメールから先方へ手動転送する。フォーユー対応 2026-08-19)
+ *    email_pdf (先方宛だがCSVではなく本文ベタ打ち+PDF添付。CSV添付が迷惑メール判定の一因になり得る
+ *    不達仕入先向けの直接送信。到着は電話等で確認する運用。フォーユー対応 2026-08-19) /
+ *    relay (社内転送: 宛先=社内 relay_to、本文に発注内容ベタ打ち+PDF添付 →
+ *    受信者が自分のメールから先方へ手動転送する。email_pdf でも届かない場合の保険)
  *
  * env (Renderに中原さんが設定。Claudeはsecret非接触):
  *  - PO_GMAIL_CLIENT_ID / PO_GMAIL_CLIENT_SECRET / PO_GMAIL_REFRESH_TOKEN
@@ -142,10 +144,15 @@ export function buildOrderFax(orderId) {
   return buildOrderSend(orderId, 'fax');
 }
 
-/** 発注書の社内転送プレビュー (先方の受信拒否等でメールが届かない仕入先向け。
- *  宛先=社内 relay_to、本文に発注内容ベタ打ち+PDF添付 → 受信者が自分のメールから先方へ手動転送する) */
+/** 発注書の社内転送プレビュー (宛先=社内 relay_to、本文ベタ打ち+PDF添付 → 受信者が手動で先方へ転送する) */
 export function buildOrderRelay(orderId) {
   return buildOrderSend(orderId, 'relay');
+}
+
+/** 発注書のPDFメールプレビュー (宛先=先方 email_to。CSVではなく本文ベタ打ち+PDF添付で直接送る。
+ *  CSV添付が迷惑メール判定の一因になり得る不達仕入先向け。到着は電話等で確認する運用) */
+export function buildOrderPdfMail(orderId) {
+  return buildOrderSend(orderId, 'email_pdf');
 }
 
 function buildOrderSend(orderId, channel) {
@@ -165,6 +172,11 @@ function buildOrderSend(orderId, channel) {
     if (!to.length) throw new Error(`仕入先に社内転送先が未登録です: ${sup.name} (マスタ管理→仕入先で「社内転送先」を登録してください)`);
     cc = []; // 社内転送メールに先方側CCを付けない (先方アドレスへの誤送信を作らない安全側)
     relayOrigTo = trimS(sup.email_to); // 本来の先方宛先 (表示・本文の案内用。未登録でも送信は可)
+  } else if (channel === 'email_pdf') {
+    if (sup.send_method !== 'email_pdf') throw new Error(`この仕入先の送信方法が email_pdf (PDFメール) に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
+    to = parseAddresses(sup.email_to || '');
+    if (!to.length) throw new Error(`仕入先にメールアドレスが未登録です: ${sup.name} (マスタ管理→仕入先で登録してください)`);
+    cc = parseAddresses(sup.email_cc || '');
   } else if (channel === 'fax') {
     if (sup.send_method !== 'fax') throw new Error(`この仕入先の送信方法が fax に設定されていません (現在: ${sup.send_method || '未設定'})。仕入先マスタで設定してください`);
     const digits = normalizeFaxNumber(sup.fax_number);
@@ -242,9 +254,10 @@ function buildOrderSend(orderId, channel) {
   if (noukiColUsed && !/\{\{\s*nouki\s*\}\}/.test(String(st.bodyTpl))) {
     body += `\n\n希望納期: ${noukiText}`;
   }
-  // 社内転送 (relay): 受信者がそのまま先方へ転送できるよう、冒頭に転送案内、末尾に発注内容をベタ打ちする
-  // (添付PDFと同じ明細スナップショット。CSV添付は付けない — 転送先=先方でCSVが迷惑メール判定の一因になり得るため)
-  if (channel === 'relay') {
+  // PDFメール (email_pdf) / 社内転送 (relay): 末尾に発注内容をベタ打ちする (添付PDFと同じ明細スナップショット。
+  // CSV添付は付けない — CSVが迷惑メール判定の一因になり得るため、本文とPDFだけで内容が伝わる形にする)。
+  // relay はさらに冒頭に転送案内 (受信者=社内が、そのまま先方へ手動転送できるように)
+  if (channel === 'relay' || channel === 'email_pdf') {
     const yen = v => '¥' + Math.round(v).toLocaleString('ja-JP');
     const lines = items.map(it => {
       const parts = [`数量: ${it.qty}`];
@@ -254,9 +267,12 @@ function buildOrderSend(orderId, channel) {
       if (vendor) parts.push(`先方管理番号: ${vendor}`);
       return `・${it.product_code} ${it.product_name || ''}\n　 ${parts.join(' / ')}`;
     });
-    body = `【社内転送用】このメールは仕入先には送られていません。以下の内容 (本文+添付PDF) を、ご自身のメールから仕入先へ転送してください (この案内部分は削除)。\n` +
-      `本来の宛先: ${relayOrigTo || '(仕入先マスタのメール宛先が未登録)'}\n` +
-      '────────────────────\n\n' + body + '\n\n' +
+    if (channel === 'relay') {
+      body = `【社内転送用】このメールは仕入先には送られていません。以下の内容 (本文+添付PDF) を、ご自身のメールから仕入先へ転送してください (この案内部分は削除)。\n` +
+        `本来の宛先: ${relayOrigTo || '(仕入先マスタのメール宛先が未登録)'}\n` +
+        '────────────────────\n\n' + body;
+    }
+    body += '\n\n' +
       `━━ 発注内容 (${order.po_number || '#' + order.id} / 発注日 ${issuedJst}) ━━\n` +
       lines.join('\n') + '\n' +
       `━━ 合計: ${items.length}商品 / ${totalQty.toLocaleString('ja-JP')}個 / ${yen(totalAmount)} ━━`;
@@ -336,10 +352,11 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
     throw new Error(`送信モードが変わっています (画面: ${expectedMode || '未指定'} / 現在: ${st.mode})。プレビューを開き直して内容を確認してください`);
   }
   if (!st.envReady) throw new Error('Gmail API のenv (PO_GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN) が未設定です。Renderの環境変数を設定してください');
-  if (!['email', 'fax', 'relay'].includes(channel)) throw new Error(`不明な送信チャネルです: ${channel}`);
-  const p = channel === 'fax' ? buildOrderFax(orderId) : channel === 'relay' ? buildOrderRelay(orderId) : buildOrderEmail(orderId);
+  if (!['email', 'fax', 'relay', 'email_pdf'].includes(channel)) throw new Error(`不明な送信チャネルです: ${channel}`);
+  const p = channel === 'fax' ? buildOrderFax(orderId) : channel === 'relay' ? buildOrderRelay(orderId)
+    : channel === 'email_pdf' ? buildOrderPdfMail(orderId) : buildOrderEmail(orderId);
   if (channel !== 'email' && (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length)) {
-    throw new Error(`${channel === 'fax' ? 'FAX' : '社内転送'}送信には発注書PDFが必要です (内部エラー: pdfBuffer未指定)`);
+    throw new Error(`このチャネル (${channel}) の送信には発注書PDFが必要です (内部エラー: pdfBuffer未指定)`);
   }
   // 完了済み (closed) POへの新規送信は拒否 — 一覧画面の選択が古いままでも送らない最終防衛 (Codex 一括R2 High)。
   // 再送 (resend) は送信済みの実績があるPOの控え再送なので完了後も許可
@@ -782,17 +799,17 @@ function encodeWord(s) {
   return words.map(w => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n '); // folding (継続行)
 }
 
-/** multipart/mixed MIME (本文UTF-8 + 添付。email=CSV(CP932) / fax・relay=PDF。ファイル名はASCII=PO番号.拡張子) */
+/** multipart/mixed MIME (本文UTF-8 + 添付。email=CSV(CP932) / fax・relay・email_pdf=PDF。ファイル名はASCII=PO番号.拡張子) */
 export function buildMime(job) {
   const boundary = 'b_' + job.delivery_key;
-  const isPdf = job.channel === 'fax' || job.channel === 'relay';
+  const isPdf = ['fax', 'relay', 'email_pdf'].includes(job.channel);
   assertHeaderSafe('宛先', job.to_addr);
   assertHeaderSafe('CC', job.cc_addr);
   assertHeaderSafe('件名', job.subject);
   assertHeaderSafe('添付ファイル名', job.attachment_name);
   if (isPdf) {
-    if (!/^[\x21-\x7e]+\.pdf$/.test(job.attachment_name)) throw new Error(`${job.channel === 'fax' ? 'FAX' : '社内転送'}添付ファイル名はASCIIの.pdfのみ: ${job.attachment_name}`);
-    if (!job.attachment_pdf || !job.attachment_pdf.length) throw new Error(`${job.channel === 'fax' ? 'FAX' : '社内転送'}ジョブに添付PDFがありません (内部エラー)`);
+    if (!/^[\x21-\x7e]+\.pdf$/.test(job.attachment_name)) throw new Error(`PDF添付ファイル名はASCIIの.pdfのみ (channel=${job.channel}): ${job.attachment_name}`);
+    if (!job.attachment_pdf || !job.attachment_pdf.length) throw new Error(`PDFチャネル (${job.channel}) のジョブに添付PDFがありません (内部エラー)`);
   } else if (!/^[\x21-\x7e]+\.csv$/.test(job.attachment_name)) {
     throw new Error(`添付ファイル名はASCIIの.csvのみ: ${job.attachment_name}`);
   }

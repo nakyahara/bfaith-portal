@@ -4026,6 +4026,80 @@ console.log('── P15c: 社内転送 (relay) ──');
   ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元', r.body.error);
 }
 
+// ═══ P15d: PDFメール (channel='email_pdf'。先方宛にCSVではなく本文ベタ打ち+PDFを直接送る — 不達対策・電話で到着確認する運用) ═══
+console.log('── P15d: PDFメール (email_pdf) ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: 'email_pdf', ...body }) });
+
+  // 仕入先マスタ: 発注方法=PDFメールを登録 (宛先は先方 email_to をそのまま使う)
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf',
+    email_to: 'ken-foryou@example.jp', email_cc: 'cc@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: PDFメール仕入先の登録OK', r.body.error);
+
+  // PO発行 → preview は channel=email_pdf + 宛先=先方 + 本文ベタ打ち + PDF添付名 (転送案内は無い)
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 36 }], requestedDate: '2026-09-05' }) });
+  ok(r.body.ok, 'PDFメール仕入先のPO発行', r.body.error);
+  const pmOrderId = r.body.id;
+  r = await j('/api/orders/' + pmOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'email_pdf', 'preview: channel=email_pdf', r.body);
+  ok(r.body.to.length === 1 && r.body.to[0] === 'ken-foryou@example.jp' && r.body.cc[0] === 'cc@example.jp', 'preview: 宛先=先方 (直接送信+CC維持)', r.body.to);
+  ok(/\.pdf$/.test(r.body.attachmentName), 'preview: 添付=.pdf', r.body.attachmentName);
+  ok(!r.body.body.includes('【社内転送用】') && r.body.body.startsWith('佐藤様'), 'preview: 転送案内なし・通常の書き出し', r.body.body.slice(0, 60));
+  ok(r.body.body.includes('発注内容') && r.body.body.includes('gyoumuhandcream60-BI') && r.body.body.includes('数量: 36'), 'preview: 本文に発注内容ベタ打ち', r.body.body.slice(-300));
+
+  // PDFプレビュー配信 (fake PDF。共用エンドポイント)
+  {
+    const pr = await fetch(base + '/api/orders/' + pmOrderId + '/fax/pdf');
+    const buf = Buffer.from(await pr.arrayBuffer());
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf') && buf.subarray(0, 5).toString() === '%PDF-',
+      'GET /orders/:id/fax/pdf (email_pdf) → application/pdf', pr.status);
+  }
+
+  // dry-run送信: ジョブは channel=email_pdf + PDFスナップショット保存
+  r = await jsonPost('/api/orders/' + pmOrderId + '/email/send', {}, 'pm-key-1');
+  ok(r.body.ok && r.body.channel === 'email_pdf' && r.body.status === 'sent' && r.body.dryRun === true, 'PDFメール dry-run送信 → sent', r.body);
+  const pmJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC").get(pmOrderId);
+  ok(pmJob.channel === 'email_pdf' && pmJob.attachment_pdf && pmJob.attachment_pdf.length > 20 && /\.pdf$/.test(pmJob.attachment_name),
+    'ジョブ: channel=email_pdf + attachment_pdf保存');
+  ok(pmJob.to_addr === 'me@b-faith.biz' && pmJob.body.includes('本来の宛先: TO=ken-foryou@example.jp'), 'ジョブ: dry-run宛先差し替え+本来の宛先', pmJob.body.slice(0, 100));
+
+  // MIME: application/pdf 添付
+  {
+    const mime = emailMod.buildMime(pmJob);
+    ok(mime.includes('Content-Type: application/pdf') && mime.includes(`filename="${pmJob.attachment_name}"`),
+      'buildMime: application/pdf 添付 (email_pdf)', pmJob.attachment_name);
+  }
+
+  // live: 宛先は先方のまま直接送信 + dedup
+  await jsonPost('/api/email/mode', { mode: 'live', confirm: 'LIVE' });
+  r = await jsonPost('/api/orders/' + pmOrderId + '/email/send', { expectedMode: 'live' }, 'pm-key-2');
+  ok(r.body.ok && r.body.status === 'sent' && r.body.dryRun === false, 'PDFメール live送信 → sent (fake)', r.body);
+  const pmLiveJob = db.prepare("SELECT * FROM po_email_jobs WHERE order_id=? AND is_dry_run=0 ORDER BY id DESC").get(pmOrderId);
+  ok(pmLiveJob.to_addr === 'ken-foryou@example.jp' && pmLiveJob.cc_addr === 'cc@example.jp' && pmLiveJob.channel === 'email_pdf',
+    'liveジョブ: 宛先=先方へ直接 (CC維持)', pmLiveJob.to_addr);
+  r = await jsonPost('/api/orders/' + pmOrderId + '/email/send', { expectedMode: 'live' }, 'pm-key-3');
+  ok(r.status === 400 && r.body.error.includes('送信済み'), 'PDFメール dedup: 同一内容の本送信は拒否', r.body.error);
+  await jsonPost('/api/email/mode', { mode: 'dry_run' });
+
+  // 送信済みジョブのPDF控え配信 + admin に選択肢
+  {
+    const pr = await fetch(base + '/api/email-jobs/' + pmJob.id + '/pdf');
+    ok(pr.status === 200 && pr.headers.get('content-type').includes('application/pdf'), 'GET /email-jobs/:id/pdf (email_pdf) → PDF控え', pr.status);
+  }
+  const adminHtmlP = await (await fetch(base + '/admin')).text();
+  ok(adminHtmlP.includes('email_pdf') && adminHtmlP.includes('PDF+本文ベタ打ち'), '/admin 発注方法にPDFメール選択肢');
+
+  // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15d)', r.body.error);
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {
