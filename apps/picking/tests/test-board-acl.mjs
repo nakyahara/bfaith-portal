@@ -73,6 +73,16 @@ await t('掲示端末: ボードと board API は開ける', async () => {
   assert.equal(JSON.parse(api.text).ok, true);
 });
 
+await t('掲示端末: フロアボードと floor API も開ける', async () => {
+  const floor = await req('GET', '/floor', { token: boardToken });
+  assert.equal(floor.status, 200);
+  assert.ok(floor.text.includes('完了予測'), 'フロアボードは完了予測が主役');
+
+  const api = await req('GET', '/api/floor', { token: boardToken });
+  assert.equal(api.status, 200);
+  assert.equal(JSON.parse(api.text).ok, true);
+});
+
 await t('掲示端末: 作業画面・一覧・作業APIは403 (書き込ませない)', async () => {
   assert.equal((await req('GET', '/', { token: boardToken })).status, 403);
   assert.equal((await req('GET', '/work/1', { token: boardToken })).status, 403);

@@ -28,6 +28,7 @@ import {
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
+import { getFloorData } from './floor.js';
 import { queueEnsureImages, getImageMap } from './images.js';
 import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
 // Drive共有ヘルパーと自動ポーリング (standaloneが起動。router は手動取込と状態表示に使う)
@@ -97,7 +98,7 @@ function hasSessionAccess(req) {
 // 誰でも物理的に操作できるので、読み取り専用のここだけに閉じる (作業APIは叩かせない)。
 // /board/exit は掲示モードの解除 (Cookie削除) — これが無いと、掲示端末を作業用に
 // 戻したくなったときにブラウザの設定からCookieを消すしか手がなくなる
-const BOARD_ALLOWED_PATHS = ['/board', '/api/board', '/board/exit'];
+const BOARD_ALLOWED_PATHS = ['/board', '/api/board', '/board/exit', '/floor', '/api/floor'];
 
 /** 全ルート共通の入口。セッション or 登録端末のどちらかが必要。 */
 function pickingAccess(req, res, next) {
@@ -544,6 +545,22 @@ router.get('/api/board', api(async (req, res) => {
       byDate: stats.byDate,
     },
   });
+}));
+
+// ─── 出荷フロアボード (43インチ統合掲示 — ピッキング/梱包実績 + 出荷進捗 + 完了予測) ───
+// /board と同じく掲示端末 (kind='board') で開ける。既存 /board は単機能表示用に残す
+
+router.get('/floor', (req, res) => {
+  res.render(path.join(__dirname, 'views/floor'), {
+    title: '出荷フロアボード',
+    windowDays: STATS_WINDOW_DAYS,
+    rotationSec: Number(process.env.FLOOR_ROTATION_SEC) || 30,
+  });
+});
+
+router.get('/api/floor', api(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json(await getFloorData({ days: parseDays(req.query.days) }));
 }));
 
 // 管理画面 (全量・分類内訳つき)

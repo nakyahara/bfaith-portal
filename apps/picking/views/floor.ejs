@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<!--
+  出荷フロアボード — 43インチ掲示モニター用の統合画面 (2026-08-20 中原さん指示)。
+  Chrome のキオスクモードで常時表示する前提:
+    chrome.exe - -kiosk https://picking.bfaith-wh.uk/apps/picking/floor
+  端末は「掲示専用 (kind=board)」で登録する (/board と同じゲート)。
+
+  設計 (Codex議論 2026-08-20):
+    左25% = 常時固定 (完了予測・工程の進み・バッチ位置・作業中・要対応・品質) —
+      「今日終わるか」「どこに手が要るか」を3秒で判断する側。
+    右75% = 実績ヒートマップ (ピッキング ↔ 梱包を30秒ローテーション) —
+      既存 /board の表を行数・色・注記そのままで載せる (中原さん要望「表をそのまま」)。
+      梱包ページには梱包機ライン (PAS/MELT) の別枠帯がつく (手梱包と土俵が違うため表に混ぜない)。
+
+  自動更新は fetch + DOM差し替え (board.ejs と同じ理由: reload だと画面が白く飛ぶ)。
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %></title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <style>
+    :root {
+      --bg: #0f1216; --panel: #171c22; --line: #2a323c;
+      --fg: #f1f3f5; --muted: #93a0ad;
+      --ok: #40c057; --warn: #fab005; --bad: #fa5252;
+      --pick: #4dabf7; --pack: #f0a03c;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+      font-variant-numeric: tabular-nums;
+      padding: 1.2vh 1.2vw;
+      display: flex; flex-direction: column; gap: 1.1vh;
+      overflow: hidden;
+    }
+    header { display: flex; align-items: baseline; gap: 1.4vw; flex: 0 0 auto; }
+    header h1 { font-size: 2.9vh; margin: 0; letter-spacing: 0.02em; }
+    header .range { font-size: 1.8vh; color: var(--muted); }
+    header .right { margin-left: auto; font-size: 1.8vh; color: var(--muted); display: flex; gap: 1vw; align-items: center; }
+    .stale { color: var(--warn); }
+
+    main { flex: 1 1 auto; display: grid; grid-template-columns: 25fr 75fr; gap: 1.1vw; min-height: 0; }
+    .col { display: flex; flex-direction: column; gap: 1.1vh; min-height: 0; min-width: 0; }
+    .panel { background: var(--panel); border-radius: 1.2vh; padding: 1.3vh 1.1vw; min-height: 0; min-width: 0; flex: 0 0 auto; }
+    .panel h2 { font-size: 1.7vh; margin: 0 0 1vh; color: var(--muted); font-weight: 600; letter-spacing: 0.05em; }
+    .panel h2 .sub { color: #6b7784; font-weight: 400; letter-spacing: 0; }
+
+    /* 完了予測 */
+    .eta-row { display: flex; align-items: baseline; gap: 0.9vw; }
+    .eta-big { font-size: 7.4vh; font-weight: 800; line-height: 1; letter-spacing: -0.02em; white-space: nowrap; }
+    .eta-big.ok { color: var(--fg); }
+    .eta-big.late { color: var(--bad); }
+    .eta-big.small { font-size: 4.4vh; }
+    .eta-tag { font-size: 1.9vh; font-weight: 700; padding: 0.4vh 0.7vw; border-radius: 0.8vh; white-space: nowrap; line-height: 1.3; }
+    .eta-tag.ok { background: rgba(64,192,87,0.16); color: var(--ok); }
+    .eta-tag.late { background: rgba(250,82,82,0.16); color: var(--bad); }
+    .eta-tag.mut { background: #232a32; color: var(--muted); }
+    .deadlines { display: flex; flex-direction: column; gap: 0.4vh; margin-top: 0.8vh; }
+    .dl { display: flex; align-items: baseline; gap: 0.7vw; font-size: 1.8vh; white-space: nowrap; }
+    .dl .g { color: var(--muted); flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+    .dl .e { font-weight: 800; }
+    .dl .e.ok { color: var(--ok); }
+    .dl .e.late { color: var(--bad); }
+    .dl .e.mut { color: var(--muted); font-weight: 600; }
+    .dl .c { color: #6b7784; font-size: 1.5vh; }
+    .eta-sub { font-size: 1.8vh; color: var(--muted); margin-top: 0.6vh; }
+
+    /* 工程の進み */
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 0.8vw; }
+    .metric .m-lab { font-size: 1.6vh; color: var(--muted); display: flex; justify-content: space-between; gap: 0.5vw; white-space: nowrap; }
+    .metric .m-val { font-size: 3.4vh; font-weight: 800; line-height: 1.15; white-space: nowrap; }
+    .metric .m-val small { font-size: 1.8vh; font-weight: 600; color: var(--muted); }
+    .bar { height: 1.2vh; background: #232a32; border-radius: 1vh; overflow: hidden; margin-top: 0.6vh; }
+    .bar > i { display: block; height: 100%; border-radius: 1vh; }
+    .bar.pick > i { background: var(--pick); }
+    .bar.pack > i { background: var(--pack); }
+
+    /* バッチ位置 (flow) */
+    .flow { display: flex; flex-direction: column; gap: 0.5vh; }
+    .flow-row { display: flex; align-items: center; gap: 0.6vw; font-size: 1.7vh; }
+    .flow-row .fl { color: var(--muted); width: 7.2vw; flex: 0 0 auto; white-space: nowrap; }
+    .flow-row .fb { flex: 1 1 0; min-width: 0; height: 1.0vh; background: #232a32; border-radius: 0.8vh; overflow: hidden; }
+    .flow-row .fb > i { display: block; height: 100%; }
+    .flow-row .fv { width: 2vw; text-align: right; font-weight: 700; flex: 0 0 auto; }
+
+    /* 作業中 */
+    .chips { display: flex; flex-wrap: wrap; gap: 0.4vw; overflow: hidden; }
+    .chip { background: #232a32; border-radius: 0.8vh; padding: 0.4vh 0.6vw; font-size: 1.6vh; line-height: 1.25; }
+    .chip.paused { color: var(--warn); }
+    .chip .cls { color: var(--muted); font-size: 1.25vh; display: block; }
+
+    /* 要対応 */
+    .alerts { display: flex; flex-direction: column; gap: 0.6vh; }
+    .alert { display: flex; gap: 0.6vw; align-items: baseline; font-size: 1.7vh; padding-left: 0.5vw; border-left: 0.35vw solid var(--line); white-space: nowrap; overflow: hidden; }
+    .alert.bad { border-left-color: var(--bad); }
+    .alert.warn { border-left-color: var(--warn); }
+    .alert .who { font-weight: 700; flex: 0 0 auto; }
+    .alert .what { color: var(--muted); overflow: hidden; text-overflow: ellipsis; }
+    .alert-none { font-size: 1.7vh; color: var(--muted); }
+
+    /* 品質 */
+    .quality { display: flex; gap: 1.4vw; }
+    .quality div { display: flex; flex-direction: column; }
+    .quality .q-v { font-size: 2.7vh; font-weight: 800; line-height: 1.15; }
+    .quality .q-v.good { color: var(--ok); }
+    .quality .q-l { font-size: 1.35vh; color: var(--muted); white-space: nowrap; }
+
+    /* 右: ヒートマップ (board.ejs の表をそのまま) */
+    .heat-panel { display: flex; flex-direction: column; overflow: hidden; flex: 1 1 auto; }
+    .heat-head { display: flex; align-items: baseline; gap: 0.7vw; margin-bottom: 1vh; flex: 0 0 auto; }
+    .heat-head h2 { margin: 0; font-size: 1.7vh; color: var(--muted); font-weight: 600; }
+    .badge { font-size: 1.5vh; font-weight: 700; padding: 0.25vh 0.55vw; border-radius: 0.7vh; letter-spacing: 0.04em; flex: 0 0 auto; }
+    .badge.pick { background: rgba(77,171,247,0.15); color: var(--pick); }
+    .badge.pack { background: rgba(240,160,60,0.15); color: var(--pack); }
+    .rot { margin-left: auto; display: flex; align-items: center; gap: 0.4vw; font-size: 1.4vh; color: #6b7784; flex: 0 0 auto; }
+    .dot { width: 0.9vh; height: 0.9vh; border-radius: 50%; background: #39424d; display: inline-block; }
+    .dot.on { background: var(--muted); }
+
+    .heat-wrap { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+    table.heat { width: 100%; height: 100%; border-collapse: separate; border-spacing: 0.18vw 0.35vh; table-layout: fixed; }
+    .heat th { font-size: 1.7vh; color: var(--muted); font-weight: 600; padding: 0 0.3vw 0.4vh; }
+    .heat th.w { text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .heat th.cls { text-align: left; width: 15vw; }
+    .heat th.avg { text-align: center; width: 3.8vw; }
+    .heat td { font-size: 2.0vh; text-align: center; padding: 0.55vh 0.2vw; border-radius: 0.5vh; }
+    .heat td.cls {
+      text-align: left; font-size: 1.7vh; line-height: 1.2; color: #cdd5de; padding-left: 0;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; white-space: normal;
+    }
+    .heat td.cls .n { color: #6b7784; font-size: 1.35vh; }
+    .heat td.avg { background: #232a32; font-weight: 800; }
+    .heat td.cell { font-weight: 700; }
+    .heat td.cell .q { display: block; font-size: 1.2vh; font-weight: 400; color: rgba(255,255,255,0.55); line-height: 1; }
+    .heat td.cell.prov { opacity: 0.55; font-weight: 400; }
+    .heat td.cell.empty { background: transparent; color: #3d4854; }
+    .heat tr.total td { border-top: 1px solid var(--line); }
+    .heat tr.total td.cell { font-weight: 800; font-size: 2.1vh; }
+    .heat tr.total td.cls { font-weight: 700; color: var(--fg); -webkit-line-clamp: 1; }
+
+    /* 梱包機ライン別枠帯 */
+    .line-strip { display: flex; align-items: center; gap: 1.3vw; }
+    .line-item { display: flex; align-items: baseline; gap: 0.5vw; font-size: 1.8vh; white-space: nowrap; }
+    .line-item b { font-size: 1.9vh; }
+    .line-item .st { font-weight: 700; }
+    .line-item .st.run { color: var(--pack); }
+    .line-item .st.wait { color: var(--muted); }
+    .line-item .st.done { color: var(--ok); }
+    .line-item .mut { color: #6b7784; font-size: 1.5vh; }
+
+    footer { flex: 0 0 auto; font-size: 1.45vh; color: var(--muted); display: flex; gap: 1.4vw; align-items: center; white-space: nowrap; overflow: hidden; }
+    .legend { display: flex; align-items: center; gap: 0.4vw; flex: 0 0 auto; }
+    .legend .sw { display: inline-block; width: 2.2vw; height: 1.5vh; border-radius: 0.4vh; }
+    .err { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>📦 出荷フロアボード</h1>
+    <span class="range" id="range">読み込み中…</span>
+    <span class="right">
+      <span id="packState"></span>
+      <span id="clock"></span>
+      <span id="status"></span>
+    </span>
+  </header>
+
+  <main>
+    <div class="col">
+      <div class="panel">
+        <h2>本日の完了予測</h2>
+        <div class="eta-row">
+          <span class="eta-big" id="etaBig">-</span>
+          <span class="eta-tag mut" id="etaTag">計測中</span>
+        </div>
+        <div class="deadlines" id="deadlines"></div>
+        <div class="eta-sub">残り <b id="etaRemain">-</b> 伝票 <span id="etaNote"></span></div>
+      </div>
+
+      <div class="panel">
+        <h2>工程の進み</h2>
+        <div class="split">
+          <div class="metric">
+            <div class="m-lab"><span>ピッキング (明細)</span><span id="pickPct">-</span></div>
+            <div class="m-val"><span id="pickDone">-</span><small> / <span id="pickTotal">-</span></small></div>
+            <div class="bar pick"><i id="pickBar" style="width:0%"></i></div>
+          </div>
+          <div class="metric">
+            <div class="m-lab"><span>梱包 (伝票)</span><span id="packPct">-</span></div>
+            <div class="m-val"><span id="packDone">-</span><small> / <span id="packTotal">-</span></small></div>
+            <div class="bar pack"><i id="packBar" style="width:0%"></i></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>出荷バッチの位置 <span class="sub" id="flowTotal"></span></h2>
+        <div class="flow" id="flow"></div>
+      </div>
+
+      <div class="panel">
+        <h2>いま動いている</h2>
+        <div class="chips" id="active"><span class="chip">-</span></div>
+      </div>
+
+      <div class="panel" style="flex:1 1 auto; overflow:hidden">
+        <h2>手が要るところ <span class="sub" id="alertCount"></span></h2>
+        <div class="alerts" id="alerts"></div>
+      </div>
+
+      <div class="panel">
+        <h2>今日の品質 <span class="sub">(件数のみ・個人は出しません)</span></h2>
+        <div class="quality">
+          <div><span class="q-v" id="qMis">-</span><span class="q-l">ピッキングミス確定</span></div>
+          <div><span class="q-v" id="qCand">-</span><span class="q-l">候補 (確認待ち)</span></div>
+          <div><span class="q-v" id="qShort">-</span><span class="q-l">欠品報告</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col" id="right"></div>
+  </main>
+
+  <footer>
+    <span class="legend">
+      速い <span class="sw" style="background:hsl(120,45%,26%)"></span><span class="sw" style="background:hsl(90,42%,25%)"></span><span class="sw" style="background:hsl(60,38%,24%)"></span><span class="sw" style="background:hsl(30,45%,25%)"></span><span class="sw" style="background:hsl(0,48%,27%)"></span> 遅い
+      (基準 = 各分類の全体平均)
+    </span>
+    <span id="note"></span>
+    <span id="err" class="err"></span>
+  </footer>
+
+  <script>
+    var WINDOW_DAYS = <%- JSON.stringify(windowDays) %>;
+    var ROTATION_MS = <%- JSON.stringify(rotationSec) %> * 1000;
+    var RELOAD_MS = 20000;
+    var FETCH_TIMEOUT_MS = 12000;
+    var HARD_RELOAD_MS = 6 * 3600 * 1000;   // 長期表示のメモリ対策 (更新成功中のみ)
+    var startedAt = Date.now();
+    var lastOk = 0;
+    var gen = 0;
+    var lastData = null;
+    var page = 0;                            // 右カラム: 0 = ピッキング / 1 = 梱包
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    function fmt1(n) { return n == null ? '-' : Number(n).toFixed(1); }
+    function pad(n) { return String(n).padStart(2, '0'); }
+    function hhmm(ms) { var d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+    function mmdd(d) { return d ? d.slice(5).replace('-', '/') : '-'; }
+
+    // board.ejs と同じ配色 (ratio = 本人 ÷ 分類平均。0.75緑 → 1.0黄 → 1.35赤)
+    function heatColor(ratio) {
+      if (!isFinite(ratio)) ratio = 1;
+      var r = Math.max(0.75, Math.min(1.35, ratio));
+      var t = r <= 1 ? ((r - 0.75) / 0.25) * 0.5 : 0.5 + ((r - 1) / 0.35) * 0.5;
+      var hue = 120 * (1 - t);
+      return 'hsl(' + hue.toFixed(0) + ', 45%, ' + (24 + 3 * Math.abs(t - 0.5) * 2).toFixed(0) + '%)';
+    }
+
+    function renderClock() {
+      var d = new Date();
+      document.getElementById('clock').textContent = pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+
+    // ─── 左カラム ───
+
+    function renderEta(eta) {
+      var big = document.getElementById('etaBig');
+      var tag = document.getElementById('etaTag');
+      var dls = document.getElementById('deadlines');
+      if (!eta) {
+        big.textContent = '-'; big.className = 'eta-big small';
+        tag.textContent = '梱包データなし'; tag.className = 'eta-tag mut';
+        dls.innerHTML = '';
+        document.getElementById('etaRemain').textContent = '-';
+        return;
+      }
+      var o = eta.overall;
+      if (o.status === 'done') {
+        big.textContent = '完了'; big.className = 'eta-big ok';
+        tag.textContent = '本日分 出荷完了'; tag.className = 'eta-tag ok';
+      } else if (o.status === 'measuring') {
+        big.textContent = '計測中'; big.className = 'eta-big small';
+        tag.textContent = '完了ペース待ち'; tag.className = 'eta-tag mut';
+      } else {
+        big.textContent = hhmm(o.etaMs);
+        big.className = 'eta-big ' + (o.status === 'late' ? 'late' : 'ok');
+        if (o.status === 'late') {
+          tag.textContent = String(-o.marginMin) + '分 超過見込み'; tag.className = 'eta-tag late';
+        } else {
+          tag.textContent = '締切まで余裕 ' + o.marginMin + '分'; tag.className = 'eta-tag ok';
+        }
+      }
+      dls.innerHTML = eta.groups.map(function (g) {
+        var e;
+        if (g.status === 'done') e = '<span class="e ok">完了</span>';
+        else if (g.status === 'measuring') e = '<span class="e mut">計測中</span>';
+        else e = '<span class="e ' + (g.status === 'late' ? 'late' : 'ok') + '">予測 ' + hhmm(g.etaMs) + '</span>';
+        return '<div class="dl"><span class="g">' + esc(g.label) + '</span>' + e +
+          '<span class="c">締切 ' + esc(g.deadline) + '</span></div>';
+      }).join('');
+      document.getElementById('etaRemain').textContent = eta.remaining;
+      document.getElementById('etaNote').textContent = '(直近' + eta.windowMin + '分のペースで予測)';
+    }
+
+    function renderProgress(pickToday, packProgress) {
+      var pd = pickToday.doneLines, pt = pickToday.totalLines;
+      var pct = pt > 0 ? Math.round((pd / pt) * 100) : 0;
+      document.getElementById('pickDone').textContent = pd;
+      document.getElementById('pickTotal').textContent = pt;
+      document.getElementById('pickPct').textContent = pct + '%';
+      document.getElementById('pickBar').style.width = pct + '%';
+      if (packProgress) {
+        var kd = packProgress.doneSlips, kt = packProgress.totalSlips;
+        var kpct = kt > 0 ? Math.round((kd / kt) * 100) : 0;
+        document.getElementById('packDone').textContent = kd;
+        document.getElementById('packTotal').textContent = kt;
+        document.getElementById('packPct').textContent = kpct + '%';
+        document.getElementById('packBar').style.width = kpct + '%';
+      } else {
+        document.getElementById('packDone').textContent = '-';
+        document.getElementById('packTotal').textContent = '-';
+        document.getElementById('packPct').textContent = '';
+        document.getElementById('packBar').style.width = '0%';
+      }
+    }
+
+    var FLOW_ROWS = [
+      { key: 'notStarted', label: '未着手', color: '#39424d' },
+      { key: 'picking', label: 'ピッキング中', color: '#4dabf7' },
+      { key: 'picked', label: 'ピッキング完了', color: '#3f8ac4' },
+      { key: 'packing', label: '梱包作業中', color: '#f0a03c' },
+      { key: 'done', label: '完了', color: '#40c057' }
+    ];
+    function renderFlow(flow) {
+      var max = FLOW_ROWS.reduce(function (m, r) { return Math.max(m, flow[r.key]); }, 1);
+      document.getElementById('flowTotal').textContent = '(全' + flow.total + '本)';
+      document.getElementById('flow').innerHTML = FLOW_ROWS.map(function (r) {
+        return '<div class="flow-row"><span class="fl">' + r.label + '</span>' +
+          '<span class="fb"><i style="width:' + Math.round((flow[r.key] / max) * 100) + '%;background:' + r.color + '"></i></span>' +
+          '<span class="fv">' + flow[r.key] + '</span></div>';
+      }).join('');
+    }
+
+    function renderActive(pickActive, packActive) {
+      var chips = [];
+      (pickActive || []).forEach(function (a) {
+        chips.push('<span class="chip' + (a.paused ? ' paused' : '') + '">' +
+          (a.paused ? '⏸ ' : '▶ ') + esc(a.name) +
+          '<span class="cls">' + esc(a.folder || '') + ' ピッキング</span></span>');
+      });
+      (packActive || []).forEach(function (a) {
+        chips.push('<span class="chip' + (a.paused ? ' paused' : '') + '">' +
+          (a.paused ? '⏸ ' : '▶ ') + esc(a.name) +
+          '<span class="cls">' + esc(a.folder || '') + ' 梱包' + (a.line ? ' (' + a.line.toUpperCase() + ')' : '') + '</span></span>');
+      });
+      document.getElementById('active').innerHTML =
+        chips.join('') || '<span class="chip" style="color:var(--muted)">作業中のバッチはありません</span>';
+    }
+
+    function renderAlerts(alerts) {
+      var el = document.getElementById('alerts');
+      document.getElementById('alertCount').textContent = alerts.length ? alerts.length + '件' : '';
+      el.innerHTML = alerts.length
+        ? alerts.map(function (a) {
+            return '<div class="alert ' + esc(a.severity) + '"><span class="who">' + esc(a.who) + '</span>' +
+              '<span class="what">' + esc(a.what) + '</span></div>';
+          }).join('')
+        : '<span class="alert-none">なし</span>';
+    }
+
+    function renderQuality(q) {
+      var mis = document.getElementById('qMis');
+      mis.textContent = q.misConfirmed == null ? '-' : q.misConfirmed;
+      mis.className = 'q-v' + (q.misConfirmed === 0 ? ' good' : '');
+      document.getElementById('qCand').textContent = q.misCandidate == null ? '-' : q.misCandidate;
+      document.getElementById('qShort').textContent = q.shortages;
+    }
+
+    // ─── 右カラム (ヒートマップ・ローテーション) ───
+
+    /** board.ejs の renderHeat と同じ表を、pick/pack 共通形 (count/secPerUnit) で描く。 */
+    function heatTableHtml(s) {
+      var cols = s.workers;
+      var html = '<thead><tr><th class="cls">引当分類</th><th class="avg">平均</th>' +
+        cols.map(function (w) { return '<th class="w" title="' + esc(w.name) + '">' + esc(w.name) + '</th>'; }).join('') +
+        '</tr></thead><tbody>';
+      html += s.baseline.map(function (c) {
+        var byWorker = {};
+        c.workers.forEach(function (w) { byWorker[w.worker] = w; });
+        return '<tr>' +
+          '<td class="cls">' + esc(c.key) + ' <span class="n">' + c.count + '件</span></td>' +
+          '<td class="avg">' + fmt1(c.avgSec) + '</td>' +
+          cols.map(function (col) {
+            var cell = byWorker[col.worker];
+            if (!cell) return '<td class="cell empty">–</td>';
+            var bg = heatColor(cell.secPerUnit / c.avgSec);
+            return '<td class="cell' + (cell.provisional ? ' prov' : '') + '" style="background:' + bg + '">' +
+              fmt1(cell.secPerUnit) + '<span class="q">' + cell.count + '件</span></td>';
+          }).join('') +
+        '</tr>';
+      }).join('');
+      html += '<tr class="total"><td class="cls">総合指数 <span class="n">(補正済)</span></td><td class="avg">100</td>' +
+        cols.map(function (w) {
+          if (w.index == null) return '<td class="cell empty">–</td>';
+          var bg = heatColor(100 / w.index);
+          return '<td class="cell' + (w.provisional ? ' prov' : '') + '" style="background:' + bg + '">' + w.index +
+            '<span class="q">' + fmt1(w.secPerUnit) + '秒</span></td>';
+        }).join('') +
+      '</tr></tbody>';
+      return html;
+    }
+
+    var LINE_STATES = {
+      running: { label: '流し中', cls: 'run' },
+      sorted: { label: '仕分け完了 (流し待ち)', cls: 'wait' },
+      sorting: { label: '仕分け中', cls: 'wait' },
+      done: { label: '本日分 完了', cls: 'done' },
+      idle: { label: '待機', cls: 'wait' }
+    };
+    function lineStripHtml(lines) {
+      if (!lines || (!lines.pas && !lines.melt)) return '';
+      var items = [['PAS-LINE', lines.pas], ['MELT-LINE', lines.melt]].map(function (p) {
+        var name = p[0], v = p[1];
+        if (!v) return '<span class="line-item"><b>' + name + '</b><span class="st wait">本日なし</span></span>';
+        var st = LINE_STATES[v.state] || LINE_STATES.idle;
+        return '<span class="line-item"><b>' + name + '</b>' +
+          '<span class="st ' + st.cls + '">' + st.label + '</span>' +
+          (v.planned != null ? ' ' + v.planned + '件' : '') +
+          (v.doneToday ? '<span class="mut">本日累計 ' + v.doneToday + '件</span>' : '') +
+          '</span>';
+      });
+      return '<div class="panel line-strip"><span class="badge pack">梱包機ライン</span>' + items.join('') + '</div>';
+    }
+
+    function heatPanelHtml(kind, s, extraNote) {
+      var isPick = kind === 'pick';
+      var unit = isPick ? '秒/明細' : '秒/伝票';
+      if (!s) {
+        return '<div class="panel heat-panel"><div class="heat-head">' +
+          '<span class="badge pack">梱包</span><h2>実績データを取得できません</h2>' + rotDots() + '</div>' +
+          '<div style="color:var(--muted);font-size:2vh;padding:2vh 0">' + esc(extraNote || '梱包システム停止中') + '</div></div>';
+      }
+      return '<div class="panel heat-panel">' +
+        '<div class="heat-head">' +
+          '<span class="badge ' + kind + '">' + (isPick ? 'ピッキング' : '梱包 (手梱包)') + '</span>' +
+          '<h2>引当分類別 × 作業者 <span class="sub">(' + unit + ' ・ 色 = その分類の平均との比 ・ 上位' + s.baseline.length + '分類 ・ ' +
+            mmdd(s.since) + '〜' + mmdd(s.until) + ')</span></h2>' +
+          rotDots() +
+        '</div>' +
+        '<div class="heat-wrap"><table class="heat">' + heatTableHtml(s) + '</table></div>' +
+      '</div>';
+    }
+
+    function rotDots() {
+      return '<span class="rot">' +
+        '<span class="dot' + (page === 0 ? ' on' : '') + '"></span>' +
+        '<span class="dot' + (page === 1 ? ' on' : '') + '"></span>' +
+        Math.round(ROTATION_MS / 1000) + '秒で切替</span>';
+    }
+
+    function renderRight() {
+      if (!lastData) return;
+      var right = document.getElementById('right');
+      if (page === 0) {
+        right.innerHTML = heatPanelHtml('pick', lastData.picking.stats);
+      } else {
+        var pk = lastData.packing;
+        right.innerHTML = heatPanelHtml('pack', pk && pk.stats, pk && pk.statsError) +
+          (pk ? lineStripHtml(pk.lines) : '');
+      }
+    }
+
+    function render(d) {
+      lastData = d;
+      document.getElementById('range').textContent = mmdd(d.workDate) + ' ・ 実績 直近' + d.picking.stats.days + '日間';
+      renderEta(d.eta);
+      renderProgress(d.picking.today, d.packing && d.packing.progress);
+      renderFlow(d.flow);
+      renderActive(d.picking.today.active, d.packing && d.packing.active);
+      renderAlerts(d.alerts);
+      renderQuality(d.quality);
+      renderRight();
+
+      document.getElementById('packState').textContent = d.packing ? '' : '梱包データなし';
+      document.getElementById('packState').className = d.packing ? '' : 'stale';
+      var s = d.picking.stats;
+      var note = '薄いセル = 母数不足の参考値 / ピッキング' + s.outlierSec + '秒超';
+      if (d.packing && d.packing.stats) note += '・梱包' + d.packing.stats.outlierSec + '秒超';
+      note += 'の明細は除外 ・ 分母は取込済みベース (追加取込で変わります)';
+      document.getElementById('note').textContent = note;
+    }
+
+    // board.ejs と同じ再取得ループ (世代番号 + Abort + 成功中のみ hard reload)
+    function tick() {
+      var myGen = ++gen;
+      var ctrl = new AbortController();
+      var timer = setTimeout(function () { ctrl.abort(); }, FETCH_TIMEOUT_MS);
+      var done = false;
+      var finish = function (fn) {
+        clearTimeout(timer);
+        if (done || myGen !== gen) return;
+        done = true;
+        try {
+          fn();
+        } catch (e) {
+          try {
+            document.getElementById('err').textContent = '表示エラー (' + e.message + ')';
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          } catch (ignored) { /* 次の周期に賭ける */ }
+        } finally {
+          if (lastOk && Date.now() - startedAt > HARD_RELOAD_MS && Date.now() - lastOk < RELOAD_MS * 2) {
+            location.reload();
+          } else {
+            setTimeout(tick, RELOAD_MS);
+          }
+        }
+      };
+
+      fetch('/apps/picking/api/floor?days=' + WINDOW_DAYS, { credentials: 'same-origin', signal: ctrl.signal })
+        .then(function (r) {
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function (d) {
+          if (!d || !d.ok) throw new Error('bad payload');
+          finish(function () {
+            render(d);
+            lastOk = Date.now();
+            document.getElementById('err').textContent = '';
+            document.getElementById('status').textContent = '●';
+            document.getElementById('status').className = '';
+          });
+        })
+        .catch(function (e) {
+          finish(function () {
+            var msg = e.name === 'AbortError' ? '応答なし (タイムアウト)' : '通信エラー (' + e.message + ')';
+            document.getElementById('err').textContent =
+              msg + (lastOk ? ' / 最終更新 ' + new Date(lastOk).toLocaleTimeString('ja-JP') : '');
+            document.getElementById('status').textContent = '○';
+            document.getElementById('status').className = 'stale';
+          });
+        });
+    }
+
+    renderClock();
+    setInterval(renderClock, 10000);
+    setInterval(function () { page = page === 0 ? 1 : 0; renderRight(); }, ROTATION_MS);
+    tick();
+  </script>
+</body>
+</html>
