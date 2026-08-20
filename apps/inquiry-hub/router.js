@@ -720,6 +720,15 @@ router.get('/inquiries/:id', (req, res) => {
         if (!v.value.trim() && MR_SEED[f.value]) v.value = MR_SEED[f.value];
       });
     });
+    // フォルダを選んだのに扱いが「取り込まない」のままだと矛盾する (2026-08-20 実事故) →
+    // フォルダ選択時に自動で「フォルダに入れる」へ切り替える (完了扱い+フォルダは正当なので触らない)
+    document.getElementById('mrFolder').addEventListener('change', function() {
+      var actSel = document.getElementById('mrAction');
+      if (this.value && actSel.value === 'skip') {
+        actSel.value = 'import';
+        toast('扱いを「📁フォルダに入れる (新着のまま)」に切り替えました');
+      }
+    });
     // 「ドメイン全体にする」: 1行目を From が @example.com で終わる に切り替える
     var mrUseDomain = document.getElementById('mrUseDomain');
     if (mrUseDomain) mrUseDomain.addEventListener('click', function(ev) {
@@ -747,7 +756,12 @@ router.get('/inquiries/:id', (req, res) => {
       var folderId = folderSel.value ? Number(folderSel.value) : null;
       var folderName = folderSel.value ? folderSel.options[folderSel.selectedIndex].textContent.replace(/^\\s*📁\\s*/, '') : '';
       if (action === 'import' && !folderId) { toast('「フォルダに入れる」はフォルダを選んでください'); return; }
-      if (action === 'skip') folderId = null; // 取り込まないルールにフォルダは無意味
+      // 🚨黙って捨てない (2026-08-20 実事故: フォルダを選んだまま扱い「取り込まない」で作成→
+      // フォルダ無しのskipルールになり、一括適用が既存95件を完了化した)
+      if (action === 'skip' && folderId) {
+        toast('「取り込まない」にはフォルダを指定できません。振り分けたい場合は扱いを「📁フォルダに入れる (新着のまま)」にしてください');
+        return;
+      }
       var actionLabel = action === 'skip' ? '取り込まない'
         : action === 'import' ? 'フォルダ「' + folderName + '」に入れる (新着のまま)'
         : '取り込むが完了扱い' + (folderId ? ' + フォルダ「' + folderName + '」へ' : '');
@@ -758,6 +772,9 @@ router.get('/inquiries/:id', (req, res) => {
       post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, applyToExisting: applyExisting, dryRun: true })
         .then(function(p) {
           var msg = 'ルール: ' + p.description + '\\n扱い: ' + actionLabel;
+          if (action === 'import_done' && folderId) {
+            msg += '\\n※ 今後のメールは完了扱いで取り込まれます (新着のまま振り分けたい場合はキャンセルして「📁フォルダに入れる」を選んでください)';
+          }
           if (applyExisting) {
             msg += p.canApplyToExisting
               ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も' + (action === 'import' ? 'フォルダに入れます' : '完了にします')
@@ -770,11 +787,15 @@ router.get('/inquiries/:id', (req, res) => {
         })
         .then(function(r) {
           if (!r) return;
+          // 優先度順の先勝ちで別ルールが先に当たる場合、新ルールは効かない (858件の移行ルールと衝突しやすい)
+          if (r.shadowedBy) {
+            alert('⚠️ ルールは作成しましたが、このメールには既存ルール「' + (r.shadowedBy.name || '(名称なし)') + '」(優先度' + r.shadowedBy.priority + ') が先に当たるため、新しいルールは効きません。\\n📧メールルールタブで既存ルールの無効化・削除、または優先度の調整をしてください。');
+          }
           var done = [];
           if (r.completed) done.push('既存' + r.completed + '件を完了に');
           if (r.foldered) done.push('既存' + r.foldered + '件をフォルダへ');
           toast('ルールを作成しました' + (done.length ? ' (' + done.join('・') + ')' : ''));
-          setTimeout(function(){ location.reload(); }, 1000);
+          setTimeout(function(){ location.reload(); }, r.shadowedBy ? 2500 : 1000);
         })
         .catch(function(e) { toast('失敗: ' + e.message); mrBtn.disabled = false; });
     });
@@ -1229,7 +1250,15 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
       return { created: c, completed: r.completed, foldered: r.foldered };
     }).immediate();
     console.log(`[inquiry-hub] メールルール作成 (${description} → ${actionLabel}) by ${actorOf(req)} / 既存 完了${completed}件・フォルダ${foldered}件`);
-    res.json({ ok: true, id: created.id, description, completed, foldered });
+    // 先勝ち衝突の検知 (2026-08-20 実事故対応): この問い合わせと同じメールを流したとき、
+    // 別の既存ルールが先に当たるなら新ルールは効かない。作成は成立させたうえで画面に警告を返す
+    // (移行ルール858件と重なりやすい。優先度はここで直させず、メールルールタブへ誘導する)
+    let shadowedBy = null;
+    const probe = evaluateMailRules({ from: inq.customer_identifier || '', subject: inq.subject || '' });
+    if (probe && probe.ruleId !== created.id) {
+      shadowedBy = { id: probe.ruleId, name: probe.ruleName, priority: probe.priority, action: probe.action };
+    }
+    res.json({ ok: true, id: created.id, description, completed, foldered, shadowedBy });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
   }
@@ -1843,6 +1872,14 @@ document.getElementById('ruleFilter').addEventListener('input', function() {
   document.querySelectorAll('#ruleRows tr').forEach(function(tr) {
     tr.style.display = !q || (tr.dataset.search || '').indexOf(q) >= 0 ? '' : 'none';
   });
+});
+// フォルダを選んだのに「取り込まない」のままは矛盾 (2026-08-20 実事故) → 自動で「フォルダに入れる」へ
+document.getElementById('nFolder').addEventListener('change', function() {
+  var actSel = document.getElementById('nAction');
+  if (this.value && actSel.value === 'skip') {
+    actSel.value = 'import';
+    toast('アクションを「📁フォルダに入れる (新着のまま)」に切り替えました');
+  }
 });`;
   res.send(pageShell('問い合わせ管理 — メールルール', 'mailrules', body, script));
 });

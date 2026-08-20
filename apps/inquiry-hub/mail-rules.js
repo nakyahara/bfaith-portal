@@ -83,7 +83,7 @@ export function evaluateMailRules(msg) {
     const hit = r.match_mode === 'any'
       ? conditions.some(c => condMatches(c, msg))
       : conditions.every(c => condMatches(c, msg));
-    if (hit) return { action: r.action, folderId: r.folder_id ?? null, ruleId: r.id, ruleName: r.name || null };
+    if (hit) return { action: r.action, folderId: r.folder_id ?? null, ruleId: r.id, ruleName: r.name || null, priority: r.priority };
   }
   return null;
 }
@@ -131,6 +131,7 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
   const fid = folderId != null && folderId !== '' ? Number(folderId) : null;
   if (fid != null && !Number.isInteger(fid)) throw new Error('フォルダ指定が不正です');
   if (action === 'import' && fid == null) throw new Error('「フォルダに入れる」はフォルダの指定が必要です');
+  if (action === 'skip' && fid != null) throw new Error('「取り込まない」にフォルダは指定できません');
   if (!canApplyToExisting(conditions)) {
     // Reply-To/To/本文は inquiries に保存しておらず正確に照合できない。
     // 差出人で代用すると取りこぼし・過剰完了のどちらも起こるため、明示的に断る
