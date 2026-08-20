@@ -14,7 +14,7 @@
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
 import { rakutenRequest } from './rakuten-client.js';
@@ -368,10 +368,45 @@ router.get('/inquiry-attachment', rateLimitMiddleware('rakuten'), async (req, re
   }
 });
 
+// 返信添付アップロード passthrough (2026-08-20 返信添付。中原さん指示: 楽天は添付対応)
+// - R-Messe の POST /attachment (multipart, フィールド名 'file') へ転送し {result:{label,path}} を返す。
+//   返信本体は /inquiry-reply が別途送る (このrouteだけでは顧客に何も届かない = リトライ安全)
+// - inquiry-hub 側で中身バイト検証済みだが、形式allow-listとサイズ上限は自分でも持つ (多層防御)
+const REPLY_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+const REPLY_ATTACHMENT_TYPES = /^(application\/pdf|image\/(png|jpeg|gif|webp|bmp))$/;
+router.post('/inquiry-attachment-upload', rateLimitMiddleware('rakuten'),
+  express.raw({ type: 'application/octet-stream', limit: REPLY_ATTACHMENT_MAX_BYTES + 1024 * 1024 }),
+  async (req, res) => {
+    try {
+      const buf = req.body;
+      if (!Buffer.isBuffer(buf) || buf.length === 0) {
+        return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'ファイルが空です (Content-Type: application/octet-stream で送ってください)', requestId: req.requestId });
+      }
+      if (buf.length > REPLY_ATTACHMENT_MAX_BYTES) {
+        return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: `ファイルが大きすぎます (上限${Math.round(REPLY_ATTACHMENT_MAX_BYTES / 1048576)}MB)`, requestId: req.requestId });
+      }
+      const contentType = String(req.headers['x-file-content-type'] || '');
+      if (!REPLY_ATTACHMENT_TYPES.test(contentType)) {
+        return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: `この形式は添付できません (${contentType || '未指定'})`, requestId: req.requestId });
+      }
+      let fileName = 'attachment';
+      try { fileName = decodeURIComponent(String(req.headers['x-file-name'] || '')).slice(0, 200) || 'attachment'; } catch { /* 不正エンコードは既定名 */ }
+      const fd = new FormData();
+      fd.append('file', new Blob([buf], { type: contentType }), fileName);
+      // アップロードは顧客可視の副作用が無いため rakutenRequest の既定リトライのままでよい
+      const result = await rakutenRequest({ path: '/es/1.0/inquirymng-api/attachment', method: 'POST', formData: fd });
+      console.log(`[rakuten-rms] inquiry-attachment-upload ${fileName} ${buf.length}bytes -> HTTP ${result.status}`);
+      res.status(result.status).json(result.data);
+    } catch (e) {
+      errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+    }
+  });
+
 // 問い合わせ返信 passthrough (inquiry-hub Step 4。変更系はこの1本のみ・厳重ガード)
 // - 呼び出し元は inquiry-hub の outbox worker のみ (Render→CF Tunnel→サービストークン認証の内側)
 // - inquiryNumber は実測形式 (shopId-日付-連番英字) の厳格検証。任意パス・任意ペイロードは通さない
-// - 既読化/完了化/添付アップロードの passthrough は作らない (必要になった時点で個別設計)
+// - 既読化/完了化の passthrough は作らない (必要になった時点で個別設計)。
+//   添付は上の /inquiry-attachment-upload が発行した {label, path} のみ受ける
 router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) => {
   try {
     const inquiryNumber = String(req.body?.inquiryNumber || '').trim();
@@ -393,13 +428,26 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
     if (message.length > 10000) {
       return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'message が長すぎます (10000文字まで)', requestId: req.requestId });
     }
+    // 返信添付 (2026-08-20): /inquiry-attachment-upload が発行した {label, path} のみ・3つまで。
+    // 任意構造は通さない (label/path以外のキーは落とす)
+    let attachments;
+    if (req.body?.attachments != null) {
+      const arr = req.body.attachments;
+      const valid = Array.isArray(arr) && arr.length <= 3 && arr.every(a => a
+        && typeof a.label === 'string' && a.label.length > 0 && a.label.length <= 300
+        && typeof a.path === 'string' && a.path.length > 0 && a.path.length <= 500);
+      if (!valid) {
+        return errorResponse(res, { status: 400, error: 'BAD_REQUEST', message: 'attachments が不正です ([{label, path}] を3つまで)', requestId: req.requestId });
+      }
+      attachments = arr.map(a => ({ label: a.label, path: a.path }));
+    }
     // ⚠️ maxAttempts:1 必須 — rakutenRequest の既定は 429/5xx を自動リトライ (計4回) するが、
     // 送信系でのリトライは二重送信になり得る (5xx=送信された可能性が残る)。結果不明の扱いは
     // inquiry-hub の outbox (unknown→人手解決) に委ねる
     const result = await rakutenRequest({
       path: '/es/1.0/inquirymng-api/inquiry/reply',
       method: 'POST',
-      body: { inquiryNumber, shopId, message },
+      body: { inquiryNumber, shopId, message, ...(attachments?.length ? { attachments } : {}) },
       maxAttempts: 1,
     });
     console.log(`[rakuten-rms] inquiry-reply ${inquiryNumber} -> HTTP ${result.status}`);
