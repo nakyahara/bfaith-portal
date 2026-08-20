@@ -87,8 +87,8 @@ export const likeEsc = s => String(s).replace(/[\\%_]/g, c => '\\' + c);
  * 一覧クエリ (設計書§7.2)。q = req.query 相当のプレーンオブジェクト。
  * 返り値: { rows, total, page, pages }
  */
-export function listInquiries(q = {}) {
-  const db = getDB();
+/** 一覧のフィルタ条件 → WHERE句 (listInquiries と「この条件の全件」一括操作で共用) */
+function buildListWhere(q = {}) {
   const where = ['i.is_archived = 0'];
   const params = [];
 
@@ -127,7 +127,12 @@ export function listInquiries(q = {}) {
       OR EXISTS (SELECT 1 FROM inquiry_messages m WHERE m.inquiry_id = i.id AND m.message_body_text LIKE ? ESCAPE '\\'))`);
     for (let k = 0; k < 7; k++) params.push(like);
   }
+  return { where, params, view };
+}
 
+export function listInquiries(q = {}) {
+  const db = getDB();
+  const { where, params, view } = buildListWhere(q);
   const page = Math.max(1, parseInt(q.page, 10) || 1);
   const total = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where.join(' AND ')}`).get(...params).c;
   const rows = db.prepare(`
@@ -181,6 +186,23 @@ export function countViewsInContext(q = {}) {
 
 /** 一括操作の上限 (1ページ分=50件を想定。誤操作の被害を構造的に抑える) */
 export const BULK_MAX = 200;
+/** 「この条件の全件を選択」の上限 (2026-08-20 中原さん要望: 新着1,500件超をまとめて完了に)。
+ * これを超える場合は期間などで絞ってもらう (無制限は誤操作の被害が大きすぎる) */
+export const FILTER_BULK_MAX = 3000;
+
+/**
+ * フィルタ条件に一致する全件のID (「この条件の全件を選択」用)。
+ * 一覧と同じ buildListWhere を使う = 画面に見えている条件とズレない。
+ * @throws 上限超過 (メッセージは画面に出せる日本語)
+ */
+export function listInquiryIdsByFilter(q = {}, { max = FILTER_BULK_MAX } = {}) {
+  const db = getDB();
+  const { where, params } = buildListWhere(q);
+  const rows = db.prepare(`SELECT i.id FROM inquiries i WHERE ${where.join(' AND ')} LIMIT ?`)
+    .all(...params, max + 1);
+  if (rows.length > max) throw new Error(`対象が多すぎます (${max}件まで。期間や状態で絞ってから実行してください)`);
+  return rows.map(r => r.id);
+}
 
 /**
  * 一覧のチェックボックスからの一括操作 (2026-08-17 スタッフ要望。メールディーラー相当)。
@@ -192,10 +214,10 @@ export const BULK_MAX = 200;
  * @param {object} ops { status?, folderId?: number|null|undefined, assigned?: string|null, isUnread?: boolean }
  * @returns {{ updated: number, skipped: number }} skipped = 変更が無かった/存在しない件数
  */
-export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal' } = {}) {
+export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItems = BULK_MAX } = {}) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter(Number.isInteger))];
   if (!list.length) throw new Error('対象が選択されていません');
-  if (list.length > BULK_MAX) throw new Error(`一度に処理できるのは${BULK_MAX}件までです`);
+  if (list.length > maxItems) throw new Error(`一度に処理できるのは${maxItems}件までです`);
 
   const hasStatus = ops.status != null && ops.status !== '';
   const hasFolder = Object.prototype.hasOwnProperty.call(ops, 'folderId') && ops.folderId !== undefined;
