@@ -233,6 +233,9 @@ console.log('5. ルール作成API');
   const html = await (await fetch(`${base2}/inquiries/${mailInq}`)).text();
   check('メール詳細に「今後の自動処理」パネル (複合条件3行+かつ/または)', html.includes('今後の自動処理')
     && html.includes('id="mrField1"') && html.includes('id="mrField3"') && html.includes('id="mrMode"'));
+  check('フォルダ選択で扱いをimportへ自動切替するJSが載る (2026-08-20 実事故対応)',
+    html.includes("getElementById('mrFolder').addEventListener")
+    && html.includes('フォルダに入れる (新着のまま)」にしてください'));
   // 🔎 NEで受注検索 (2026-08-20 スタッフ要望): 注文番号が無い問い合わせにアドレスコピー+NE検索画面の導線
   check('メール詳細に「NEで受注検索」導線 (アドレスをdata属性で持つ)',
     html.includes('id="neMailSearch"') && html.includes('data-mail="customer@gmail.com"'));
@@ -290,6 +293,26 @@ console.log('5. ルール作成API');
   const rule = listMailRules().find(r => r.id === made.id);
   check('作成されたルールが評価に効く', evaluateMailRules({ from: 'customer@gmail.com' })?.action === 'skip' && rule.action === 'skip');
   check('ルール名に条件が入る', String(rule.name).includes('customer@gmail.com'));
+
+  // ─── 2026-08-20 実事故対応: skip+フォルダの拒否と、先勝ちルールに遮られる警告 ───
+  const folder = db.prepare("INSERT INTO inquiry_folders (name) VALUES ('事故テスト')").run();
+  const fid = Number(folder.lastInsertRowid);
+  const rSkipFolder = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: [{ field: 'subject', op: 'contains', value: '在庫' }], action: 'skip', folderId: fid });
+  check('skip+フォルダはサーバーでも400 (黙って捨てない)', rSkipFolder.status === 400
+    && String((await rSkipFolder.json()).error).includes('フォルダは指定できません'));
+  // 上の 'customer@gmail.com → skip' ルール (priority 50) が既にこのメールに当たる状態で、
+  // 同じメールから import+フォルダのルールを作る → 作成はできるが shadowedBy で警告が返る
+  const rShadow = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: [{ field: 'subject', op: 'contains', value: '在庫について' }], action: 'import', folderId: fid });
+  const shadow = await rShadow.json();
+  check('先勝ちルールに遮られる場合は shadowedBy を返す', rShadow.status === 200
+    && shadow.shadowedBy && shadow.shadowedBy.id === made.id && Number.isInteger(shadow.shadowedBy.priority));
+  // 遮るルールを無効化すれば新ルールが効く (shadowedBy無し)
+  const { setMailRuleActive } = await import('./mail-rules.js');
+  setMailRuleActive(made.id, false);
+  setMailRuleActive(shadow.id, false);
+  const rClear = await jp(`/api/inquiries/${mailInq}/mail-rule`, { conditions: [{ field: 'subject', op: 'contains', value: '商品の在庫' }], action: 'import', folderId: fid });
+  const clear = await rClear.json();
+  check('遮るルールが無ければ shadowedBy 無し', rClear.status === 200 && !clear.shadowedBy);
 
   srv.close();
 }
