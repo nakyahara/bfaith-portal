@@ -260,7 +260,7 @@
   <div class="overlay" id="searchOverlay">
     <div class="box">
       <h2>伝票を探す</h2>
-      <input class="search-input" id="searchInput" placeholder="伝票番号の下数桁 or 商品名 (例: 7800 / ひのきマット)">
+      <input class="search-input" id="searchInput" placeholder="伝票番号 or 商品名 or お客様名 (例: 7800 / ひのき / 山田)">
       <div class="slip-list" id="slipList"></div>
       <button class="sheet-cancel" id="searchCancel" type="button">閉じる</button>
     </div>
@@ -1048,10 +1048,15 @@
       const f = String(filter || '').trim();
       lastSearch = f;
       const fl = f.toLowerCase();
-      // 伝票番号 (下桁一致含む) に加えて、商品名・SKUでも探せる (該当商品を含む伝票が全部並ぶ)
+      // 伝票番号 (下桁一致含む)・商品名・SKUに加えて、お客様名でも探せる (2026-08-20 中原さん指示:
+      // AESはNE伝票番号が載らないケースがあり、商品コードのアルファベット入力は現場で手間)。
+      // 名前は姓名間の空白 (全角/半角) のゆれを無視して照合する
+      const normName = (t) => String(t || '').toLowerCase().replace(/[\s　]/g, '');
+      const fn = normName(f);
       const lineMatch = (s) => s.lines.find((l) =>
         (l.name || '').toLowerCase().includes(fl) || (l.sku || '').toLowerCase().includes(fl));
-      const filtered = STATE.slips.filter((s) => !f || s.neSlipNo.includes(f) || lineMatch(s));
+      const nameMatch = (s) => fn && normName(s.recipientName).includes(fn);
+      const filtered = STATE.slips.filter((s) => !f || s.neSlipNo.includes(f) || lineMatch(s) || nameMatch(s));
       lastSearchHits = f ? filtered.length : 0;
       const rows = filtered
         .slice(0, 60)
@@ -1062,7 +1067,7 @@
             <span class="no">${esc(s.neSlipNo)}</span>
             <span>#${s.seq}</span>
             <span class="st-mini ${doneSet.has(s.seq) ? 'done' : ''}">${doneSet.has(s.seq) ? '完了' : heldSet.has(s.seq) ? '保留' : '未'}</span>
-            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${esc(shown.name || '')}${hit && s.lines.length > 1 ? ` <b>他${s.lines.length - 1}件</b>` : ''}</span>
+            <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#868e96">${s.recipientName ? `<b style="color:#495057">${esc(s.recipientName)}</b>｜` : ''}${esc(shown.name || '')}${hit && s.lines.length > 1 ? ` <b>他${s.lines.length - 1}件</b>` : ''}</span>
           </div>`;
         }).join('');
       $('slipList').innerHTML = rows || '<div style="color:#868e96; padding:20px">該当なし</div>';
