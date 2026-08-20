@@ -234,10 +234,12 @@ function buildAlerts(db, workDate, packBatches, nowMs, max = 6) {
     alerts.push({ severity: 'warn', who: '取込突合', what: `差分あり ${mismatch}バッチ (確認待ち)`, min: 0 });
   }
   try {
+    // 取消済み・旧版 (invalid) バッチのミス候補は数えない (Codexレビュー medium 2巡目)
     const cand = db.prepare(`
       SELECT COUNT(*) c FROM pk_pack_incidents i
       JOIN pk_pack_batches b ON b.id = i.batch_id
-      WHERE b.work_date = ? AND i.status = 'candidate'
+      WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+        AND i.status = 'candidate'
     `).get(workDate).c;
     if (cand > 0) alerts.push({ severity: 'warn', who: 'ミス記録', what: `候補 ${cand}件 確認待ち`, min: 0 });
   } catch { /* packing 未導入 */ }
@@ -250,16 +252,20 @@ function buildAlerts(db, workDate, packBatches, nowMs, max = 6) {
 /** 今日の品質 (件数のみ。個人名は出さない — 誰のミスかは管理画面の仕事)。 */
 function buildQuality(db, workDate) {
   const quality = { misConfirmed: null, misCandidate: null, shortages: 0 };
+  // 取消済み・旧版 (invalid) バッチの分は数えない (Codexレビュー medium 2巡目:
+  // 再取込やバッチ取消の後も件数が残ると、現場に不要な確認作業を促す)
   quality.shortages = db.prepare(`
     SELECT COUNT(*) c FROM pk_lines l
     JOIN pk_batches b ON b.id = l.batch_id
-    WHERE b.work_date = ? AND b.validity = 'valid' AND l.status = 'shortage'
+    WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND l.status = 'shortage'
   `).get(workDate).c;
   try {
     const rows = db.prepare(`
       SELECT i.status, COUNT(*) c FROM pk_pack_incidents i
       JOIN pk_pack_batches b ON b.id = i.batch_id
-      WHERE b.work_date = ? AND i.status IN ('confirmed','candidate')
+      WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+        AND i.status IN ('confirmed','candidate')
       GROUP BY i.status
     `).all(workDate);
     quality.misConfirmed = 0;

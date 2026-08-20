@@ -160,14 +160,14 @@ function makePick({ cls, status, folder, worker = 'w@test', lines = 10, doneLine
 
 let packId = 0;
 function makePack({ pkBatchId = null, status, folder, worker = 'p@test', slips = 10, doneSlips = 0,
-  cancelledSlips = 0, doneAt = '04:30', matchStatus = 'ok' }) {
+  cancelledSlips = 0, doneAt = '04:30', matchStatus = 'ok', validity = 'valid' }) {
   const id = ++packId;
   db.prepare(`
     INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count, total_qty,
       pk_batch_id, match_status, status, worker, finished_at, validity, csv_sha256, imported_by, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'valid', 'sha', 'test', ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'sha', 'test', ?, ?)
   `).run(id, `KEY${id}`, folder, D, slips, slips, slips, pkBatchId, matchStatus, status, worker,
-    status === 'done' ? iso(doneAt) : null, iso('00:00'), iso('00:00'));
+    status === 'done' ? iso(doneAt) : null, validity, iso('00:00'), iso('00:00'));
   for (let i = 1; i <= slips; i++) {
     const st = i <= doneSlips ? 'done' : (i > slips - cancelledSlips ? 'cancelled' : 'pending');
     db.prepare(`
@@ -206,6 +206,14 @@ db.prepare(`
   INSERT INTO pk_pack_incidents (batch_id, kind, sku, qty, status, attributed_worker, detected_by, confirmed_by, created_at, updated_at)
   VALUES (2, 'wrong_item', 'SKU2', 1, 'confirmed', 'w@test', 'p@test', 'admin', ?, ?)
 `).run(iso('04:00'), iso('04:00'));
+
+// 旧版 (invalid) バッチのミス候補と、取消済み picking バッチの欠品は数えない (Codex 2巡目)
+const invalidPack = makePack({ status: 'ready', folder: '出荷_90', validity: 'invalid', slips: 1 });
+db.prepare(`
+  INSERT INTO pk_pack_incidents (batch_id, kind, sku, qty, status, detected_by, created_at, updated_at)
+  VALUES (?, 'excess', 'SKU9', 1, 'candidate', 'p@test', ?, ?)
+`).run(invalidPack, iso('04:00'), iso('04:00'));
+makePick({ cls: 'ネコポス手動単品', status: 'cancelled', folder: '出荷_91', lines: 3, shortage: 3 });
 
 const data = await getFloorData({ now: NOW });
 
