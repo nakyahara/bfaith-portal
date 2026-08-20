@@ -20,7 +20,7 @@
 import crypto from 'crypto';
 import express, { Router } from 'express';
 import { getDB, logActivity } from './db.js';
-import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, getInquiryDetail, getAdjacentInquiries } from './queries.js';
+import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, FILTER_BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, listInquiryIdsByFilter, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { aiRewriteEnabled, rewriteReply, draftReply, REWRITE_STYLES } from './ai-rewrite.js';
 import { findRelevantKnowledge, formatKnowledgeForPrompt } from './knowledge.js';
@@ -242,6 +242,7 @@ router.get('/', (req, res) => {
     <select id="bulkAssign"><option value="">担当: 変更なし</option><option value="__me__">自分にする</option><option value="__none__">未割当にする</option>${assignees.map(u => `<option value="${he(u)}">${he(u)}</option>`).join('')}</select>
     <select id="bulkRead"><option value="">既読: 変更なし</option><option value="read">既読にする</option><option value="unread">未読にする</option></select>
     <button class="pri" id="bulkApply">選択した${''}件に適用</button>
+    <button class="ghost" id="bulkAll" hidden title="いまの検索条件・タブに一致する全件 (他のページの分も含む) を対象にします">📋 この条件の全${total}件を選択</button>
     <button class="ghost" id="bulkClear">選択を解除</button>
   </div>`;
 
@@ -281,14 +282,23 @@ router.get('/', (req, res) => {
     var chkAll = document.getElementById('chkAll');
     var countEl = document.getElementById('bulkCount');
     var applyBtn = document.getElementById('bulkApply');
+    var allBtn = document.getElementById('bulkAll');
+    // 「この条件の全件を選択」(2026-08-20 中原さん要望: 1ページ50件では足りない)。
+    // ページの全行を選択した状態でだけ提案し、全件モード中に1つでも外せば解除される
+    var allMode = false;
+    var TOTAL = ${Number(total) || 0};
+    var FILTER = ${JSON.stringify(Object.fromEntries(['view', 'status', 'group', 'channel', 'shop', 'folder', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q']
+      .map(k => [k, String(q[k] ?? '')]).filter(([, v]) => v !== ''))).replace(/</g, '\\u003c')};
     function rows() { return Array.prototype.slice.call(document.querySelectorAll('.rowchk')); }
     function selected() { return rows().filter(function(c) { return c.checked; }).map(function(c) { return Number(c.value); }); }
     function refresh() {
       var n = selected().length;
-      countEl.textContent = n;
-      applyBtn.textContent = '選択した' + n + '件に適用';
-      bar.hidden = n === 0;
       var all = rows();
+      if (allMode && n !== all.length) allMode = false;
+      countEl.textContent = allMode ? 'この条件の全' + TOTAL : n;
+      applyBtn.textContent = allMode ? '全' + TOTAL + '件に適用' : '選択した' + n + '件に適用';
+      bar.hidden = n === 0;
+      allBtn.hidden = allMode || TOTAL <= all.length || n !== all.length;
       chkAll.checked = all.length > 0 && n === all.length;
       chkAll.indeterminate = n > 0 && n < all.length;
     }
@@ -297,7 +307,9 @@ router.get('/', (req, res) => {
       refresh();
     });
     rows().forEach(function(c) { c.addEventListener('change', refresh); });
+    allBtn.addEventListener('click', function() { allMode = true; refresh(); });
     document.getElementById('bulkClear').addEventListener('click', function() {
+      allMode = false;
       rows().forEach(function(c) { c.checked = false; });
       refresh();
     });
@@ -321,20 +333,32 @@ router.get('/', (req, res) => {
       var rd = document.getElementById('bulkRead');
       if (rd.value) { ops.isUnread = rd.value === 'unread'; desc.push(rd.value === 'unread' ? '未読にする' : '既読にする'); }
       if (!desc.length) { toast('変更内容を選んでください'); return; }
-      if (!confirm(ids.length + '件をまとめて変更します。\\n\\n' + desc.join('\\n') + '\\n\\nよろしいですか?')) return;
-      applyBtn.disabled = true;
-      fetch('/apps/inquiry-hub/api/inquiries/bulk', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: ids, ops: ops })
-      }).then(function(r) {
-        return r.json().catch(function(){ return {}; }).then(function(j) {
-          if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-          return j;
-        });
-      }).then(function(j) {
+      function jp(url, data) {
+        return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
+          .then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j) {
+            if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+      }
+      function done(j) {
         toast(j.updated + '件を変更しました' + (j.skipped ? ' (' + j.skipped + '件は変更なし)' : ''));
         setTimeout(function(){ location.reload(); }, 800);
-      }).catch(function(e) { toast('失敗: ' + e.message); applyBtn.disabled = false; });
+      }
+      function fail(e) { toast('失敗: ' + e.message); applyBtn.disabled = false; }
+      if (allMode) {
+        // 全件モード: まずサーバーで最新の対象件数を数えてから確認する (表示後に増減していても正確)
+        applyBtn.disabled = true;
+        jp('/apps/inquiry-hub/api/inquiries/bulk-by-filter', { filter: FILTER, ops: ops, dryRun: true })
+          .then(function(p) {
+            if (!confirm('⚠️ いまの検索条件に一致する全' + p.matched + '件 (他のページの分も含む) をまとめて変更します。\\n\\n'
+              + desc.join('\\n') + '\\n\\nよろしいですか?')) { applyBtn.disabled = false; return null; }
+            return jp('/apps/inquiry-hub/api/inquiries/bulk-by-filter', { filter: FILTER, ops: ops });
+          })
+          .then(function(j) { if (j) done(j); })
+          .catch(fail);
+        return;
+      }
+      if (!confirm(ids.length + '件をまとめて変更します。\\n\\n' + desc.join('\\n') + '\\n\\nよろしいですか?')) return;
+      applyBtn.disabled = true;
+      jp('/apps/inquiry-hub/api/inquiries/bulk', { ids: ids, ops: ops }).then(done).catch(fail);
     });
     refresh();
   })();`;
@@ -1119,6 +1143,29 @@ router.post('/api/inquiries/bulk', (req, res) => {
   try {
     const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req) });
     console.log(`[inquiry-hub] 一括操作 ${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// 「この条件の全件を選択」一括操作 (2026-08-20 中原さん要望: 新着1,500件超をまとめて完了に。
+// ページの50件では足りない)。一覧と同じフィルタ条件をサーバーで再評価して全件に適用する。
+// dryRun=true は件数だけ返す (画面が確認ダイアログに出す)。上限 FILTER_BULK_MAX 件
+const BULK_FILTER_KEYS = ['view', 'status', 'group', 'channel', 'shop', 'folder', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q'];
+router.post('/api/inquiries/bulk-by-filter', (req, res) => {
+  const b = req.body || {};
+  // フィルタは許可キーのみ・文字列化して受ける (listInquiries と同じ解釈になる)
+  const filter = {};
+  for (const k of BULK_FILTER_KEYS) {
+    const v = (b.filter || {})[k];
+    if (v != null && v !== '') filter[k] = String(v);
+  }
+  try {
+    const ids = listInquiryIdsByFilter(filter);
+    if (b.dryRun === true) return res.json({ ok: true, matched: ids.length });
+    const r = bulkUpdateInquiries(ids, b.ops || {}, { actorId: actorOf(req), maxItems: FILTER_BULK_MAX });
+    console.log(`[inquiry-hub] 全件一括操作 filter=${JSON.stringify(filter)} ops=${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
     res.json({ ok: true, ...r });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });

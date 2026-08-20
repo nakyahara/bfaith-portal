@@ -198,6 +198,22 @@ check('検索: ヒットなし', listInquiries({ view: 'all', q: '存在しな�
     return r.updated === 0 && r.skipped === 1;
   })());
 
+  // 「この条件の全件を選択」(2026-08-20 中原さん要望: ページ50件では足りない → フィルタ全件)
+  const { listInquiryIdsByFilter } = await import('./queries.js');
+  {
+    db.prepare('UPDATE inquiries SET internal_status = ?, folder_id = NULL WHERE id IN (?,?)').run('open', b1, b2);
+    db.prepare('UPDATE inquiries SET internal_status = ? WHERE id = ?').run('done', b3);
+    const ids = listInquiryIdsByFilter({ view: 'inbox', shop: String(shopB) });
+    check('全件選択: 一覧と同じ条件で全IDを返す (新着=2件)', ids.length === 2 && ids.includes(b1) && ids.includes(b2));
+    check('全件選択: 完了ビューは1件', listInquiryIdsByFilter({ view: 'done', shop: String(shopB) }).length === 1);
+    check('全件選択: 検索語も効く', listInquiryIdsByFilter({ view: 'inbox', shop: String(shopB), q: '一括' }).length === 2
+      && listInquiryIdsByFilter({ view: 'inbox', shop: String(shopB), q: '存在しない語XYZ' }).length === 0);
+    check('全件選択: 上限超過は拒否', bad(() => listInquiryIdsByFilter({ view: 'inbox' }, { max: 1 }))?.includes('多すぎます'));
+    const rAll = bulkUpdateInquiries(ids, { status: 'done' }, { actorId: 'tester', maxItems: 3000 });
+    check('全件選択→一括完了 (maxItems拡張)', rAll.updated === 2
+      && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(b1).internal_status === 'done');
+  }
+
   // 後片付け
   db.prepare('DELETE FROM inquiry_activity_logs WHERE inquiry_id IN (?,?,?)').run(b1, b2, b3);
   db.prepare('DELETE FROM inquiries WHERE shop_id = ?').run(shopB);
@@ -462,6 +478,42 @@ console.log('8. デモデータ削除 (purge-demo)');
     && db.prepare("SELECT COUNT(*) c FROM inquiries WHERE external_inquiry_id = 'DEMO:not-a-demo'").get().c === 1);
 }
 
+// ─── HTTP: 「この条件の全件を選択」一括API (2026-08-20 中原さん要望) ───
+console.log('HTTP: 全件一括');
+{
+  const express = (await import('express')).default;
+  const routerModule = await import('./router.js');
+  const app = express();
+  app.use('/apps/inquiry-hub', express.json({ limit: '2mb' }), routerModule.default);
+  const srv = await new Promise(r => { const s = app.listen(0, '127.0.0.1', () => r(s)); });
+  const base = `http://127.0.0.1:${srv.address().port}/apps/inquiry-hub`;
+  const jp = (p, data) => fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) })
+    .then(r => r.json().then(j => ({ status: r.status, j })));
+
+  const shopH = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','全件一括店','ba@b-faith.biz')").run().lastInsertRowid;
+  const mkH = (ext, status) => db.prepare(`INSERT INTO inquiries
+      (channel_type, shop_id, external_inquiry_id, subject, internal_status, is_unread, received_at, conversation_rev)
+    VALUES ('email', ?, ?, '全件一括対象', ?, 1, ?, 1)`).run(shopH, ext, status, T('2026-08-20T10:00:00+09:00')).lastInsertRowid;
+  const h1 = mkH('ba1', 'open'), h2 = mkH('ba2', 'open');
+  mkH('ba3', 'done');
+
+  const html = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+  check('一覧に「この条件の全N件を選択」ボタンとFILTERが載る', html.includes('id="bulkAll"')
+    && html.includes('この条件の全') && html.includes('bulk-by-filter'));
+
+  const dry = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: { status: 'done' }, dryRun: true });
+  check('dryRun: 件数だけ返し状態は変えない', dry.status === 200 && dry.j.matched === 2
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(h1).internal_status === 'open');
+  const ap = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: { status: 'done' } });
+  check('適用: フィルタ一致の全件を完了に', ap.status === 200 && ap.j.updated === 2
+    && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(h2).internal_status === 'done');
+  const bad2 = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: {} });
+  check('変更内容なしは400', bad2.status === 400);
+
+  await new Promise(r => srv.close(r));
+}
+
 // ─── 結果 ───
 console.log(`\n${failed === 0 ? 'OK' : 'NG'}: ${passed} PASS / ${failed} FAIL`);
-process.exit(failed === 0 ? 0 : 1);
+// process.exit() は稼働中のasyncハンドルとぶつかりWindowsでlibuv abortし得るため exitCode で自然終了
+process.exitCode = failed === 0 ? 0 : 1;
