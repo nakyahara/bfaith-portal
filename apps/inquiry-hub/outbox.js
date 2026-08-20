@@ -18,6 +18,7 @@
  */
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from './db.js';
+import { claimAttachmentsForJob, loadJobAttachments } from './reply-attachments.js';
 
 export const DEFAULT_SEND_LEASE_MINUTES = 5;
 
@@ -32,12 +33,16 @@ export class SendRejectedError extends Error {
  *
  * @returns {{ id, created: boolean, conflict?: string }}
  */
-export function createReplyJob({ inquiryId, channelType, bodyText, attachmentsJson = null,
+export function createReplyJob({ inquiryId, channelType, bodyText, attachmentIds = [],
   createdBy, clientOperationId, baseConversationRev, completeOnSend = false }) {
   const db = getDB();
   if (!bodyText || !String(bodyText).trim()) throw new Error('本文が空です');
   if (!clientOperationId) throw new Error('clientOperationId は必須です');
   if (!Number.isInteger(baseConversationRev)) throw new Error('baseConversationRev は必須です');
+  // 送信用添付 (2026-08-20) はまずメールのみ (Gmail multipart送信を実装済み。モールはAPI仕様確認後)
+  if (attachmentIds.length && channelType !== 'email') {
+    throw new Error('添付はメール返信のみ対応しています');
+  }
 
   const tx = db.transaction(() => {
     const existing = db.prepare('SELECT id FROM outbox_replies WHERE client_operation_id = ?').get(clientOperationId);
@@ -61,9 +66,16 @@ export function createReplyJob({ inquiryId, channelType, bodyText, attachmentsJs
     const r = db.prepare(`INSERT INTO outbox_replies
         (inquiry_id, channel_type, client_operation_id, body_text, attachments_json, created_by, base_conversation_rev, complete_on_send)
       VALUES (?,?,?,?,?,?,?,?)`)
-      .run(inquiryId, channelType, clientOperationId, String(bodyText), attachmentsJson, createdBy, baseConversationRev, completeOnSend ? 1 : 0);
+      .run(inquiryId, channelType, clientOperationId, String(bodyText), null, createdBy, baseConversationRev, completeOnSend ? 1 : 0);
+    // 添付の紐付けと attachments_json の確定は同一トランザクション内で
+    // (途中で失敗したら丸ごとロールバック = ジョブだけ残って添付が無い、を作らない)
+    const atts = claimAttachmentsForJob(db, { inquiryId, outboxId: r.lastInsertRowid, attachmentIds });
+    if (atts.length) {
+      db.prepare('UPDATE outbox_replies SET attachments_json = ? WHERE id = ?')
+        .run(JSON.stringify(atts.map(a => ({ id: a.id, name: a.name, size: a.size }))), r.lastInsertRowid);
+    }
     logActivity(inquiryId, { actorType: 'user', userId: createdBy, actionType: 'reply_created',
-      operationId: clientOperationId, after: { outbox_id: r.lastInsertRowid } });
+      operationId: clientOperationId, after: { outbox_id: r.lastInsertRowid, ...(atts.length ? { attachments: atts.length } : {}) } });
     return { id: r.lastInsertRowid, created: true };
   });
   return tx.immediate();
@@ -180,8 +192,19 @@ export async function runOutboxPass(adapters, opts = {}) {
     }
 
     try {
+      // 送信用添付の実体を読み出す。記録 (attachments_json) と実体が食い違うときは
+      // 未送信確定の failed に落とす (添付漏れのまま送るより安全。実体はまだ送っていない)
+      let attachments = [];
+      if (job.attachments_json) {
+        let wanted = -1;
+        try { wanted = JSON.parse(job.attachments_json).length; } catch { /* 壊れた記録は下の不一致で拒否 */ }
+        attachments = loadJobAttachments(job.id);
+        if (attachments.length !== wanted) {
+          throw new SendRejectedError('添付の実体が見つかりません (未送信)。添付し直して新しいジョブを作成してください');
+        }
+      }
       const sent = await adapter.sendReply({
-        inquiry: inq, shop, bodyText: job.body_text, attachmentsJson: job.attachments_json,
+        inquiry: inq, shop, bodyText: job.body_text, attachmentsJson: job.attachments_json, attachments,
       });
       // DRYRUNアダプターの結果はジョブを消費しない (sent確定させると未送信メールが送信済み扱いに
       // なり顧客返信が欠落する。Codexレビュー反映)。pending に戻して pass を終了 (同一passでの再claim防止)

@@ -340,7 +340,7 @@ export function createGmailAdapter(cfg = {}) {
      * 引数 dryRun: true はアダプターのモード設定に関係なく実送信を禁止する
      * (プレビュー経路がliveアダプターを受け取っても安全なように、呼び出し単位で強制。Codexレビュー反映)
      */
-    async sendReply({ inquiry, bodyText, dryRun = false }) {
+    async sendReply({ inquiry, bodyText, attachments = [], dryRun = false }) {
       requests = 0;
       let to = String(inquiry?.customer_identifier || '').trim().toLowerCase();
       const threadId = String(inquiry?.external_inquiry_id || '');
@@ -384,24 +384,47 @@ export function createGmailAdapter(cfg = {}) {
       }
       headerSafe('宛先', to);
 
-      const headers = [
+      const commonHeaders = [
         `From: ${mimeWord(fromName)} <${headerSafe('From', fromAddress)}>`,
         `To: ${to}`,
         `Subject: ${mimeWord(subject)}`,
         inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
         references ? `References: ${references}` : null,
         'MIME-Version: 1.0',
-        'Content-Type: text/plain; charset="UTF-8"',
-        'Content-Transfer-Encoding: base64',
       ].filter(Boolean);
-      const mime = headers.join('\r\n') + '\r\n\r\n' +
-        Buffer.from(String(bodyText || ''), 'utf8').toString('base64').replace(/(.{76})/g, '$1\r\n');
+      const b64wrap = buf => buf.toString('base64').replace(/(.{76})/g, '$1\r\n');
+      const bodyB64 = b64wrap(Buffer.from(String(bodyText || ''), 'utf8'));
+      let mime;
+      if (attachments.length) {
+        // 送信用添付 (2026-08-20 スタッフ要望): multipart/mixed で本文+添付を組み立てる。
+        // 実体・形式・サイズの検証は reply-attachments.js 済み。ここでは合計サイズだけ防衛的に再確認
+        const total = attachments.reduce((s, a) => s + (a.buffer?.length || 0), 0);
+        if (total > 10 * 1024 * 1024) throw new SendRejectedError(`添付の合計が大きすぎます (${Math.round(total / 1048576)}MB。未送信)`);
+        // boundary の '=_' は base64 本文 (英数+/=のみ、= は末尾) に現れない並び
+        const boundary = `=_bfaith_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+        const attPart = (a) => {
+          const rawName = String(a.fileName || 'attachment').replace(/[\r\n\0"]/g, '_').slice(0, 150);
+          const ascii = rawName.replace(/[^\x20-\x7e]/g, '_');
+          const pct = encodeURIComponent(rawName).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+          return `--${boundary}\r\n`
+            + `Content-Type: ${headerSafe('添付Content-Type', a.contentType || 'application/octet-stream')}; name="${ascii}"\r\n`
+            + `Content-Disposition: attachment; filename="${ascii}"; filename*=UTF-8''${pct}\r\n`
+            + 'Content-Transfer-Encoding: base64\r\n\r\n' + b64wrap(a.buffer);
+        };
+        mime = [...commonHeaders, `Content-Type: multipart/mixed; boundary="${boundary}"`].join('\r\n')
+          + '\r\n\r\n'
+          + `--${boundary}\r\nContent-Type: text/plain; charset="UTF-8"\r\nContent-Transfer-Encoding: base64\r\n\r\n${bodyB64}\r\n`
+          + attachments.map(attPart).join('\r\n') + `\r\n--${boundary}--`;
+      } else {
+        mime = [...commonHeaders, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64'].join('\r\n')
+          + '\r\n\r\n' + bodyB64;
+      }
       const raw = Buffer.from(mime).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
       if (dryRun || sendMode !== 'live') {
         // dryRun: true を返す = outbox はジョブを消費しない (sent確定させると未送信メールが
         // 送信済み扱いになり顧客返信が欠落する。Codexレビュー反映)。実送信は一切しない
-        console.log(`[gmail-send DRYRUN] To=${to} Subject=${subject.slice(0, 40)} thread=${threadId.slice(0, 12)}… bytes=${mime.length} (実送信していません)`);
+        console.log(`[gmail-send DRYRUN] To=${to} Subject=${subject.slice(0, 40)} thread=${threadId.slice(0, 12)}… bytes=${mime.length} atts=${attachments.length} (実送信していません)`);
         return { dryRun: true, externalReplyId: `dryrun:${threadId}` };
       }
       const sent = await apiPost('messages/send', { raw, threadId }, 'send');

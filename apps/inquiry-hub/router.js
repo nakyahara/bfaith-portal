@@ -18,7 +18,7 @@
  * external_status / 最終同期日時 は表示のみ (同期実装前は seed 値がそのまま出る)。
  */
 import crypto from 'crypto';
-import { Router } from 'express';
+import express, { Router } from 'express';
 import { getDB, logActivity } from './db.js';
 import { CHANNELS, CHANNEL_GROUPS, STATUSES, AI_FLAGS, PAGE_SIZE, VIEWS, DEFAULT_VIEW, BULK_MAX, listInquiries, listFilterOptions, countByView, countInboxByGroup, countViewsInContext, bulkUpdateInquiries, getInquiryDetail, getAdjacentInquiries } from './queries.js';
 import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
@@ -30,6 +30,8 @@ import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './o
 import { listFolders, countUnfiled, createFolder, updateFolder, deleteFolder, setInquiryFolder,
   FOLDER_NAME_MAX } from './folders.js';
 import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
+import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
+  MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
 import { isImage, isInlineSafe, fmtBytes, resolveContentType } from './mime.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
@@ -443,11 +445,21 @@ router.get('/inquiries/:id', (req, res) => {
     const meta = OUTBOX_STATUS_LABELS[o.status] || { label: o.status, style: 'background:#f1f5f9;color:#475569' };
     return `<span class="badge" style="${meta.style}">${he(meta.label)}</span>`;
   };
+  const jobAtts = o => {
+    if (!o.attachments_json) return '';
+    try {
+      const names = JSON.parse(o.attachments_json).map(a => a.name).filter(Boolean);
+      return names.length ? ` <span class="sub" title="${he(names.join(' / '))}">📎${names.length}件</span>` : '';
+    } catch { return ''; }
+  };
   const outboxHtml = outboxJobs.length ? `
     <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
-    ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>
+    ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>${jobAtts(o)}
       <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span>
       ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 200))}</div>` : ''}</div>`).join('')}` : '';
+  // 📎 送信用添付: 未紐付け分 (ページ再読み込みしてもアップロード済みが消えないよう復元する)
+  const pendingAtts = (replyEditorEnabled() && inq.channel_type === 'email' && !activeJob)
+    ? listPendingAttachments(inq.id) : [];
   // 送信ワーカーの状態に応じたバナー (チャネル別モード。env は起動時固定なので都度読んでも軽い)
   const outboxOn = ['true', '1'].includes(process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED || '');
   const SEND_MODE_ENV = { email: 'INQUIRY_HUB_MAIL_SEND_MODE', rakuten: 'INQUIRY_HUB_RAKUTEN_SEND_MODE', yahoo: 'INQUIRY_HUB_YAHOO_SEND_MODE' };
@@ -483,6 +495,12 @@ router.get('/inquiries/:id', (req, res) => {
           ${Object.entries(REWRITE_STYLES).map(([k, v]) => `<button class="ghost rw-btn" type="button" data-style="${k}">${he(v.label)}</button>`).join('')}
           <button class="ghost" type="button" id="rwUndoBtn" style="display:none">↩ 元に戻す</button>
         </div>` : ''}
+        ${inq.channel_type === 'email' ? `<div class="row rw-row" id="attRow">
+          <button class="ghost" type="button" id="attBtn">📎 ファイルを添付</button>
+          <input type="file" id="attFile" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.bmp,application/pdf,image/*" style="display:none">
+          <span class="sub">${he(ALLOWED_LABEL)}・1ファイル${Math.round(MAX_FILE_BYTES / 1048576)}MB・最大${MAX_FILES_PER_REPLY}つ</span>
+        </div>
+        <div id="attList"></div>` : ''}
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
           <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
@@ -952,6 +970,55 @@ router.get('/inquiries/:id', (req, res) => {
       toast('戻しました (もう一度押すと書き換え後に戻ります)');
     });
   })();
+  // 📎 送信用添付 (2026-08-20 スタッフ要望「PDFなどを添付できるように」)。
+  // 一覧はDOMをtextContentで構築 (ファイル名はユーザー入力なのでinnerHTMLに入れない)
+  var ATT = ${JSON.stringify(pendingAtts).replace(/</g, '\\u003c')};
+  var attBtn = document.getElementById('attBtn');
+  if (attBtn) (function() {
+    var input = document.getElementById('attFile');
+    var list = document.getElementById('attList');
+    var MAXF = ${MAX_FILES_PER_REPLY}, MAXB = ${MAX_FILE_BYTES};
+    function fmtB(n) { return n < 1048576 ? Math.round(n / 1024) + 'KB' : (n / 1048576).toFixed(1) + 'MB'; }
+    function render() {
+      list.textContent = '';
+      ATT.forEach(function(a) {
+        var row = document.createElement('div');
+        row.className = 'att-chip';
+        var name = document.createElement('span');
+        name.textContent = '📎 ' + a.name + ' (' + fmtB(a.size) + ')';
+        var del = document.createElement('button');
+        del.type = 'button'; del.className = 'ghost'; del.textContent = '✕'; del.title = 'この添付を取り消す';
+        del.addEventListener('click', function() {
+          del.disabled = true;
+          post('/reply-attachments/' + a.id + '/delete', {}).then(function() {
+            ATT = ATT.filter(function(x) { return x.id !== a.id; }); render();
+          }).catch(function(e) { del.disabled = false; toast('削除失敗: ' + e.message); });
+        });
+        row.appendChild(name); row.appendChild(del);
+        list.appendChild(row);
+      });
+    }
+    render();
+    attBtn.addEventListener('click', function() { input.click(); });
+    input.addEventListener('change', function() {
+      var files = Array.prototype.slice.call(input.files || []);
+      input.value = '';
+      (function next() {
+        var f = files.shift();
+        if (!f) return;
+        if (ATT.length >= MAXF) { toast('添付は' + MAXF + 'つまでです'); return; }
+        if (f.size > MAXB) { toast(f.name + ' は大きすぎます (上限' + Math.round(MAXB / 1048576) + 'MB)'); next(); return; }
+        attBtn.disabled = true;
+        fetch('/apps/inquiry-hub/api/inquiries/' + ID + '/reply-attachments', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(f.name) },
+          body: f,
+        }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); })
+          .then(function(j) { ATT.push({ id: j.id, name: j.fileName, size: j.fileSize }); render(); attBtn.disabled = false; next(); })
+          .catch(function(e) { toast('添付失敗: ' + f.name + ' — ' + e.message); attBtn.disabled = false; next(); });
+      })();
+    });
+  })();
   var replyBtn = document.getElementById('replyBtn');
   if (replyBtn) replyBtn.addEventListener('click', function() {
     var body = document.getElementById('replyBody').value.trim();
@@ -963,10 +1030,12 @@ router.get('/inquiries/:id', (req, res) => {
     var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
     var completeEl = document.getElementById('replyComplete');
     var complete = !!(completeEl && completeEl.checked);
+    var attIds = ATT.map(function(a) { return a.id; });
     if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客'
+      + (attIds.length ? '\\n添付: ' + ATT.map(function(a) { return a.name; }).join(' / ') : '')
       + (complete ? '\\n送信後に「完了」にします' : '\\n送信後は「返信処理中」になります') + '\\n\\n' + preview)) return;
     replyBtn.disabled = true;
-    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV, completeOnSend: complete })
+    post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV, completeOnSend: complete, attachmentIds: attIds })
       .then(function(r) { toast(r.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました'); setTimeout(function(){ location.reload(); }, 900); })
       .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
   });`;
@@ -987,9 +1056,44 @@ router.use('/api/', (req, res, next) => {
       try { host = new URL(origin).host; } catch { /* 不正Originはhost不一致として拒否 */ }
       if (host !== req.headers.host) return res.status(403).json({ error: '不正なリクエスト元です' });
     }
-    if (!req.is('application/json')) return res.status(415).json({ error: 'Content-Type は application/json が必要です' });
+    // 送信用添付のアップロードだけはバイナリ (octet-stream) を許可 (Origin検証は上で共通に通過済み)
+    const isBinaryUpload = /^\/inquiries\/\d+\/reply-attachments$/.test(req.path) && req.is('application/octet-stream');
+    if (!req.is('application/json') && !isBinaryUpload) {
+      return res.status(415).json({ error: 'Content-Type は application/json が必要です' });
+    }
   }
   next();
+});
+
+/**
+ * 返信の送信用添付アップロード (2026-08-20 スタッフ要望「PDFなどを添付できるように」)。
+ * multerを増やさず、1リクエスト1ファイルの生バイナリで受ける (ファイル名は X-File-Name ヘッダ。
+ * URLエンコードで日本語対応)。検証 (形式・サイズ・件数) は reply-attachments.js。
+ */
+router.post('/api/inquiries/:id(\\d+)/reply-attachments',
+  express.raw({ type: 'application/octet-stream', limit: MAX_FILE_BYTES + 1024 * 1024 }),
+  (req, res) => {
+    const inq = loadInquiry(req, res); if (!inq) return;
+    if (!replyEditorEnabled()) return res.status(403).json({ error: '返信機能が有効になっていません' });
+    let fileName = 'attachment';
+    try { fileName = decodeURIComponent(String(req.headers['x-file-name'] || '')); } catch { /* 不正エンコードは既定名 */ }
+    try {
+      const saved = saveReplyAttachment({ inquiryId: inq.id, fileName, buffer: req.body, uploadedBy: actorOf(req) });
+      res.json({ ok: true, ...saved });
+    } catch (e) {
+      res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+    }
+  });
+
+/** ジョブ未紐付けの添付を取り消す (紐付け済みは消せない) */
+router.post('/api/inquiries/:id(\\d+)/reply-attachments/:attId(\\d+)/delete', (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  try {
+    deletePendingAttachment(inq.id, Number(req.params.attId));
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
 });
 
 // 返信エディタのテンプレート選択用 (2026-08-15 スタッフ要望)。📄タブと同じ listTemplates を
@@ -1176,11 +1280,18 @@ router.post('/api/inquiries/:id/reply', (req, res) => {
   if (completeOnSend !== undefined && typeof completeOnSend !== 'boolean') {
     return res.status(400).json({ error: '不正なリクエストです (completeOnSend は true/false)' });
   }
+  // 送信用添付 (2026-08-20)。ID配列のみ受け、実体・所属・件数・サイズの検証は createReplyJob 内の
+  // claimAttachmentsForJob (同一トランザクション) が行う
+  const attachmentIds = (req.body || {}).attachmentIds;
+  if (attachmentIds !== undefined && (!Array.isArray(attachmentIds) || !attachmentIds.every(n => Number.isInteger(n) && n > 0))) {
+    return res.status(400).json({ error: '不正なリクエストです (attachmentIds は数値の配列)' });
+  }
   try {
     const r = createReplyJob({
       inquiryId: inq.id, channelType: inq.channel_type, bodyText: body,
       createdBy: actorOf(req), clientOperationId: opId, baseConversationRev: baseRev,
       completeOnSend: completeOnSend === true,   // メールディーラーの「返信して完了」
+      attachmentIds: attachmentIds || [],
     });
     if (r.conflict) return res.status(409).json({ error: r.conflict });
     res.json({ ok: true, id: r.id, duplicate: !r.created });
@@ -2417,6 +2528,11 @@ figure.att-img.att-err .att-fail { display: block; }
   padding: 8px 10px; margin: 6px 0; font-size: 13px; color: #92400e; }
 .draft-warn code { background: #fff7ed; border: 1px solid #fed7aa; border-radius: 4px;
   padding: 1px 5px; font-family: inherit; }
+/* 📎 送信用添付のチップ */
+.att-chip { display: inline-flex; align-items: center; gap: 4px; background: #eef2ff;
+  border: 1px solid #c7d2fe; border-radius: 8px; padding: 2px 4px 2px 8px; margin: 4px 6px 0 0;
+  font-size: 13px; color: #3730a3; max-width: 100%; overflow-wrap: anywhere; }
+.att-chip button { margin: 0; padding: 0 6px; font-size: 12px; }
 .panel .row input { flex: 1; }
 .panel textarea { resize: vertical; }
 .note { border-top: 1px solid #e2e8f0; padding: 8px 0; }

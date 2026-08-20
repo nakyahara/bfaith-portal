@@ -213,6 +213,23 @@ function createTables() {
   // 送信と同時に完了にする (メールディーラーの「返信して完了」。2026-07-25 中原さん要望)
   addColumnIfMissing('outbox_replies', 'complete_on_send', 'INTEGER NOT NULL DEFAULT 0');
 
+  // 返信に付ける送信用添付 (2026-08-20 スタッフ要望「PDFなどを添付できるように」)。
+  // 受信添付 (inquiry_attachments) はオンデマンド取得だが、送信用はアップロード〜ワーカー送信の間
+  // 実体を保持する必要があるためBLOBで持つ (1ファイル5MB・1返信3つまで。reply-attachments.js が検証)。
+  // outbox_id NULL = ジョブ未紐付けの下書き添付 (24時間で掃除対象)
+  db.exec(`CREATE TABLE IF NOT EXISTS outbox_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    outbox_id INTEGER REFERENCES outbox_replies(id),
+    file_name TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    file_size INTEGER NOT NULL,
+    body BLOB NOT NULL,
+    uploaded_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_attachments_inquiry ON outbox_attachments(inquiry_id)');
+
   // 同期状態 (チャネル×店舗)
   db.exec(`CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
