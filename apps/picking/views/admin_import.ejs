@@ -145,7 +145,8 @@
         `<span>${esc(body.invoiceSoft)} / ${esc(body.deliveryMethod)}</span>` +
         `<span>構成: <b>${esc(body.composition)}</b></span>` +
         `<span>明細 ${body.lineCount} / 伝票 ${body.slipCount} / 数量 ${body.totalQty}</span>` +
-        (body.dateWarning ? `<span style="color:#e8590c; font-weight:600">⚠ ${esc(body.dateWarning)}</span>` : '');
+        (body.dateWarning ? `<span style="color:#e8590c; font-weight:600">⚠ ${esc(body.dateWarning)}</span>` : '') +
+        ((body.qtyWarnings || []).map((w) => `<span style="color:#e8590c; font-weight:600">⚠ 数量不一致: ${esc(w)}</span>`).join(''));
       fillDatalist(body.suggestions || []);
       $('hikiateClass').value = (body.suggestions || [])[0] || '';
       // 前回プレビューの値を残さない (残すと別ファイルに古い出荷_XXが付いたまま確定できてしまう)

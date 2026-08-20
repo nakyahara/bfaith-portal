@@ -147,7 +147,7 @@ export async function pollOnce(deps = {}) {
       if (result.replayed) stats.replayed++;
       else {
         stats.imported++;
-        console.log(`[picking-drive-poller] 取込: ${folderName || f.filename} (${pattern})${result.replaced ? ' 上書き' : ''}`);
+        console.log(`[picking-drive-poller] 取込: ${folderName || f.filename} (${pattern})${result.replaced ? ' 上書き' : ''}${preview.qtyWarningCount > 0 ? ` ⚠数量警告${preview.qtyWarningCount}件` : ''}`);
       }
     } catch (e) {
       // already_started (作業開始後の内容変更) は上書きしない仕様どおりの skip 扱い

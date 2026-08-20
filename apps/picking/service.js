@@ -25,18 +25,20 @@ export class PkError extends Error {
 
 // CS03002 の必須列 (名前で参照する列のみ列挙。他の列は保持しない)
 const REQUIRED_COLUMNS = [
-  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数',
+  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数', '出荷引当数',
   'ピッキングNO', '出荷伝票NO', '荷主出荷NO', 'バーコード',
   '送り状発行ソフト名', '配送方法名', 'トータルピッキングバッチ番号',
 ];
 
 /**
  * CS03002 のバッファを解析して取込プレビュー用の構造を返す。DB には触れない。
+ * qty は常に「出荷引当数」(そのロケーションから取る数)。「出荷指示数」ではない点に注意
+ * (指示数は分割引当の各行に明細総数が繰り返されるため、ピッキング数量には使えない)。
  * @returns {{
  *   tbNo, instructDate, invoiceSoft, deliveryMethod, composition,
  *   lines: [{location, block, sku, productName, barcode, qty}],   // 集約済み・ロケ昇順
  *   slipLines: [{slipNo, pickingNo, neSlipNo, sku, qty, location}],
- *   slipCount, totalQty, suggestions: string[]
+ *   slipCount, totalQty, qtyWarnings: string[], suggestions: string[]
  * }}
  * @throws {PkError} 400 — 形式不正 (列欠落・数量不正・複数TB等)
  */
@@ -81,9 +83,17 @@ export function parseCs03002(buffer) {
   for (const [i, r] of dataRows.entries()) {
     const rowNo = i + 2;
     const get = (name) => (r[col[name]] ?? '').trim();
-    const qty = Number(get('出荷指示数'));
-    if (!Number.isInteger(qty) || qty <= 0) {
+    const instructQty = Number(get('出荷指示数'));
+    if (!Number.isInteger(instructQty) || instructQty <= 0) {
       throw new PkError(400, 'bad_qty', `行${rowNo}: 出荷指示数「${get('出荷指示数')}」が正の整数ではありません`);
+    }
+    // ピッキングで取る数 = 出荷引当数 (そのロケーションからの引当数)。
+    // 出荷指示数は伝票明細のトータルで、1明細が複数ロケに分割引当されると
+    // 各行に同じ総数が繰り返される (実測 2026-08-20 出荷_11: 9個が8+1に分割され、
+    // 指示数は両行とも9 → 指示数を使うと各ロケで取りすぎる)
+    const qty = Number(get('出荷引当数'));
+    if (!Number.isInteger(qty) || qty <= 0) {
+      throw new PkError(400, 'bad_alloc_qty', `行${rowNo}: 出荷引当数「${get('出荷引当数')}」が正の整数ではありません`);
     }
     if (!get('ロケーション')) throw new PkError(400, 'no_location', `行${rowNo}: ロケーションが空です`);
     if (!get('商品ID')) throw new PkError(400, 'no_sku', `行${rowNo}: 商品IDが空です`);
@@ -97,6 +107,8 @@ export function parseCs03002(buffer) {
       instructDate: get('出荷指示日'),
       block: get('ブロック略称'),
       location: get('ロケーション'),
+      instructQty,                          // 出荷指示数 (伝票明細の総数。クロスチェック用)
+      instructLineNo: get('出荷指示行NO'),  // 分割行を同一明細にまとめるキー (任意列)
       sku: get('商品ID'),
       productName: get('商品名'),
       barcode: get('バーコード'),
@@ -114,6 +126,40 @@ export function parseCs03002(buffer) {
   // そのためTB単体ではなく「ソート済みTB一覧の組」をバッチの識別キーにする
   // (同じ引当のCSVなら常に同じ組になる。順序はソートで正規化)
   const tbNos = [...new Set(slipLines.map((l) => l.tbNo))].sort();
+
+  // 数量クロスチェック: 同一明細 (伝票×SKU×出荷指示行NO) の出荷引当数の合計は
+  // 出荷指示数と一致するはず (分割引当 8+1=9 で実測確認 2026-08-20)。
+  // ズレは列解釈の変化・部分引当の兆候なので、取込は止めず警告として返す。
+  // 出荷指示行NO が無い (列ごと欠落 or 値が空) 行は、同一伝票×SKUの別明細と
+  // 分割行を区別できず誤警告になるためチェック対象にしない (Codex R1 medium)
+  const QTY_WARNINGS_MAX = 20;   // ログ・応答・画面に載せるため上限を置く (Codex R1 low)
+  const qtyWarnings = [];
+  let qtyWarningCount = 0;       // 実件数 (qtyWarnings は上限で省略される — Codex R2 low)
+  {
+    const byInstruct = new Map();
+    for (const l of slipLines) {
+      if (!l.instructLineNo) continue;
+      const key = `${l.slipNo}\u0000${l.sku}\u0000${l.instructLineNo}`;
+      if (!byInstruct.has(key)) byInstruct.set(key, []);
+      byInstruct.get(key).push(l);
+    }
+    for (const group of byInstruct.values()) {
+      const instructSet = [...new Set(group.map((l) => l.instructQty))];
+      const allocSum = group.reduce((s, l) => s + l.qty, 0);
+      if (instructSet.length !== 1 || allocSum !== instructSet[0]) {
+        const g = group[0];
+        qtyWarningCount++;
+        if (qtyWarnings.length < QTY_WARNINGS_MAX) {
+          qtyWarnings.push(`${g.slipNo} × ${g.sku}: 出荷指示数${instructSet.join('/')}に対し出荷引当数合計${allocSum}`);
+        } else if (qtyWarnings.length === QTY_WARNINGS_MAX) {
+          qtyWarnings.push(`…他にも不一致があります (先頭${QTY_WARNINGS_MAX}件のみ表示)`);
+        }
+      }
+    }
+    if (qtyWarningCount > 0) {
+      console.warn(`[picking-import] 数量クロスチェック不一致 ${qtyWarningCount}件 (TB=${tbNos.join(',')}): ${qtyWarnings.join(' / ')}`);
+    }
+  }
 
   // ロケーション×SKU で集約 (トータルピッキング)。
   // 表示順 = ブロック昇順 → ロケーション昇順 → SKU昇順。
@@ -155,6 +201,8 @@ export function parseCs03002(buffer) {
     slipLines,
     slipCount: new Set(slipLines.map((l) => l.slipNo)).size,
     totalQty: slipLines.reduce((s, l) => s + l.qty, 0),
+    qtyWarnings,
+    qtyWarningCount,
     csvSha256: crypto.createHash('sha256').update(buffer).digest('hex'),
   };
   preview.suggestions = suggestPatterns({ invoiceSofts, deliveryMethods, composition });
