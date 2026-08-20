@@ -233,8 +233,21 @@ console.log('5. ルール作成API');
   const html = await (await fetch(`${base2}/inquiries/${mailInq}`)).text();
   check('メール詳細に「今後の自動処理」パネル (複合条件3行+かつ/または)', html.includes('今後の自動処理')
     && html.includes('id="mrField1"') && html.includes('id="mrField3"') && html.includes('id="mrMode"'));
+  // 🔎 NEで受注検索 (2026-08-20 スタッフ要望): 注文番号が無い問い合わせにアドレスコピー+NE検索画面の導線
+  check('メール詳細に「NEで受注検索」導線 (アドレスをdata属性で持つ)',
+    html.includes('id="neMailSearch"') && html.includes('data-mail="customer@gmail.com"'));
+  check('コピー→開くの順のクライアントJSが載る', html.includes("navigator.clipboard.writeText(neMailBtn.dataset.mail"));
+
+  // 注文番号があるとNE直リンクが出るので検索導線は出さない
+  db.prepare('UPDATE inquiries SET order_number = ? WHERE id = ?').run('123456-20260820-00001', rakutenInq);
   const htmlRk = await (await fetch(`${base2}/inquiries/${rakutenInq}`)).text();
   check('楽天詳細にはパネルを出さない', !htmlRk.includes('id="mrField1"'));
+  check('注文番号あり: NE直リンクが出て検索導線は出さない',
+    htmlRk.includes('kensaku_denpyo_no=123456-20260820-00001') && !htmlRk.includes('id="neMailSearch"'));
+  // 顧客識別子がメールアドレスでない場合も出さない
+  db.prepare('UPDATE inquiries SET order_number = NULL, customer_identifier = ? WHERE id = ?').run('member-9999', rakutenInq);
+  const htmlRk2 = await (await fetch(`${base2}/inquiries/${rakutenInq}`)).text();
+  check('識別子が@なし: 検索導線を出さない', !htmlRk2.includes('id="neMailSearch"'));
 
   const fromCond = [{ field: 'from', op: 'equals', value: 'customer@gmail.com' }];
   const rBad = await jp(`/api/inquiries/${rakutenInq}/mail-rule`, { conditions: fromCond, action: 'skip' });
