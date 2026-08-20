@@ -44,7 +44,8 @@ const uploadCsv = multer({ storage: multer.memoryStorage(), limits: { fileSize: 
 /**
  * POST /apps/picking/ingest-api/import
  *   multipart: file=CS03002, pattern_name=引当パターン表示名, folder_name=出荷_XX
- * 200: { ok, batchId, replaced, replayed, lineCount, slipCount, totalQty, tbNo, staleDate }
+ * 200: { ok, batchId, replaced, replayed, lineCount, slipCount, totalQty, tbNo, staleDate,
+ *        qtyWarnings (先頭20件+省略表示), qtyWarningCount (実件数) }
  */
 router.post('/import', (req, res, next) => {
   uploadCsv.single('file')(req, res, (err) => {
@@ -72,6 +73,8 @@ router.post('/import', (req, res, next) => {
       slipCount: preview.slipCount,
       totalQty: preview.totalQty,
       staleDate,
+      qtyWarnings: preview.qtyWarnings,
+      qtyWarningCount: preview.qtyWarningCount,
       ...result,
     });
   } catch (e) {

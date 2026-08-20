@@ -80,14 +80,15 @@ function row({
 
 // picking 側 fixture (CS03002)
 const PICK_HEADERS = [
-  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数',
+  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数', '出荷引当数',
   'ピッキングNO', '出荷伝票NO', '荷主出荷NO', 'バーコード',
   '送り状発行ソフト名', '配送方法名', 'トータルピッキングバッチ番号',
 ];
-function pickRow({ slip, sku, qty = 1, tb = 'TB00110023900', loc = '00201604' }) {
+// instruct = 出荷指示数 (明細総数)。分割引当ケースでは qty (引当数) と違う値を渡す
+function pickRow({ slip, sku, qty = 1, instruct = qty, tb = 'TB00110023900', loc = '00201604' }) {
   return {
     '出荷指示日': TODAY8, 'ブロック略称': 'P3FB', 'ロケーション': loc,
-    '商品ID': sku, '商品名': '商品', '出荷指示数': String(qty),
+    '商品ID': sku, '商品名': '商品', '出荷指示数': String(instruct), '出荷引当数': String(qty),
     'ピッキングNO': `PC${slip}`, '出荷伝票NO': `SP${slip}`,
     '荷主出荷NO': String(1527000 + Number(slip)), 'バーコード': 'X000TEST01',
     '送り状発行ソフト名': 'B2(Ver6.0)', '配送方法名': 'ネコポス 営業所止めなし',
@@ -295,6 +296,22 @@ t('突合: 数量差・伝票欠落・余剰を検出する', () => {
 t('突合: pickingにTBが無ければ no_picking', () => {
   const p = parseCs03003(makeCsv([row({ slip: '0001', sku: 'a', tb: 'TB99999999999' })]));
   assert.equal(checkPickingMatch(p).status, 'no_picking');
+});
+
+t('突合: 分割引当 (同一伝票×SKUが複数ロケ) は引当数の合算=納品書数で ok', () => {
+  // 2026-08-20 実障害: 指示数で取り込むと 9+9=18 vs 納品書9 の偽mismatchになり
+  // 梱包ポーラーの自動取込がブロックされていたケース
+  const pv = parseCs03002(makePickCsv([
+    pickRow({ slip: '0005', sku: 'uchiwa30', qty: 8, instruct: 9, tb: 'TB_SPLIT_PACK', loc: '00301401' }),
+    pickRow({ slip: '0005', sku: 'uchiwa30', qty: 1, instruct: 9, tb: 'TB_SPLIT_PACK', loc: '00600901' }),
+  ]));
+  importPickingBatch(pv, { hikiateClass: 'テスト分類', folderName: '出荷_05' }, 'test');
+  const p = parseCs03003(makeCsv([
+    row({ slip: '0005', lineNo: 1, sku: 'uchiwa30', qty: 9, tb: 'TB_SPLIT_PACK' }),
+  ]));
+  const m = checkPickingMatch(p);
+  assert.equal(m.status, 'ok');
+  assert.deepEqual(m.diffs, []);
 });
 
 // ─── 取込 ───

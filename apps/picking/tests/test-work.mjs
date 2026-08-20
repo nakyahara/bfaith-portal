@@ -15,7 +15,7 @@ const { initPickingDB, getDB } = await import('../db.js');
 initPickingDB();
 
 const HEADERS = [
-  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数',
+  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数', '出荷引当数',
   'ピッキングNO', '出荷伝票NO', '荷主出荷NO', 'バーコード',
   '送り状発行ソフト名', '配送方法名', 'トータルピッキングバッチ番号',
 ];
@@ -28,7 +28,7 @@ function makeCsv(rows) {
 function row({ loc, sku, qty = 1, slip, tb }) {
   return {
     '出荷指示日': '20260811', 'ブロック略称': 'P3FB', 'ロケーション': loc,
-    '商品ID': sku, '商品名': `商品${sku}_梱機プ`, '出荷指示数': String(qty),
+    '商品ID': sku, '商品名': `商品${sku}_梱機プ`, '出荷指示数': String(qty), '出荷引当数': String(qty),
     'ピッキングNO': `PC${slip}`, '出荷伝票NO': `SP${slip}`, '荷主出荷NO': slip,
     'バーコード': 'X1', '送り状発行ソフト名': 'B2(Ver6.0)',
     '配送方法名': 'ネコポス 陸便 元払い 営業所止めなし', 'トータルピッキングバッチ番号': tb,

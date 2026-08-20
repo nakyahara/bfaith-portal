@@ -693,6 +693,7 @@ function buildSummary(preview) {
     dateWarning: isStaleInstructDate(preview.instructDate)
       ? `出荷指示日 (${preview.instructDate}) が今日ではありません。前日のファイルの可能性があります`
       : null,
+    qtyWarnings: preview.qtyWarnings,
     lines: preview.lines.map((l) => ({
       locationLabel: formatLocation(l.block, l.location),
       sku: l.sku, productName: l.productName, qty: l.qty,

@@ -22,8 +22,8 @@ initPickingDB();
 // ─── fixture ───
 
 const HEADERS = [
-  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数',
-  'ピッキングNO', '出荷伝票NO', '荷主出荷NO', 'バーコード',
+  '出荷指示日', 'ブロック略称', 'ロケーション', '商品ID', '商品名', '出荷指示数', '出荷引当数',
+  '出荷指示行NO', 'ピッキングNO', '出荷伝票NO', '荷主出荷NO', 'バーコード',
   '送り状発行ソフト名', '配送方法名', 'トータルピッキングバッチ番号',
 ];
 
@@ -35,10 +35,13 @@ function makeCsv(rows, { headers = HEADERS } = {}) {
 }
 
 let slipSeq = 0;
-function row({ loc, sku, qty = 1, slip, name = '商品', block = 'P3FB', tb = 'TB00110023349', barcode = 'X000TEST01' }) {
+// qty = 出荷引当数 (この行のロケから取る数)。instruct = 出荷指示数 (明細総数・省略時は qty と同値)。
+// lineNo = 出荷指示行NO (分割行を同一明細にまとめるキー)
+function row({ loc, sku, qty = 1, instruct = qty, lineNo = '1', slip, name = '商品', block = 'P3FB', tb = 'TB00110023349', barcode = 'X000TEST01' }) {
   return {
     '出荷指示日': '20260811', 'ブロック略称': block, 'ロケーション': loc,
-    '商品ID': sku, '商品名': name, '出荷指示数': String(qty),
+    '商品ID': sku, '商品名': name, '出荷指示数': String(instruct), '出荷引当数': String(qty),
+    '出荷指示行NO': String(lineNo),
     'ピッキングNO': `PC${slip}`, '出荷伝票NO': `SP${slip}`, '荷主出荷NO': String(1500000 + Number(slip)),
     'バーコード': barcode, '送り状発行ソフト名': 'B2(Ver6.0)',
     '配送方法名': 'ネコポス 陸便 元払い 営業所止めなし', 'トータルピッキングバッチ番号': tb,
@@ -163,6 +166,87 @@ t('数量が不正なら bad_qty', () => {
   expectPkError(() => parseCs03002(csv), 'bad_qty');
   const zero = makeCsv([row({ loc: '00201604', sku: 'a', qty: 0, slip: '0001' })]);
   expectPkError(() => parseCs03002(zero), 'bad_qty');
+});
+
+t('出荷引当数が不正なら bad_alloc_qty (指示数は正常でも取り込まない)', () => {
+  const bad = makeCsv([row({ loc: '00201604', sku: 'a', qty: 'x', instruct: 3, slip: '0001' })]);
+  expectPkError(() => parseCs03002(bad), 'bad_alloc_qty');
+  const zero = makeCsv([row({ loc: '00201604', sku: 'a', qty: 0, instruct: 3, slip: '0001' })]);
+  expectPkError(() => parseCs03002(zero), 'bad_alloc_qty');
+});
+
+t('出荷引当数列が無い古い形式は missing_columns (指示数で黙って取り込まない)', () => {
+  const headers = HEADERS.filter((h) => h !== '出荷引当数');
+  const csv = makeCsv([row({ loc: '00201604', sku: 'a', qty: 1, slip: '0001' })], { headers });
+  expectPkError(() => parseCs03002(csv), 'missing_columns');
+});
+
+// ─── 分割引当 (2026-08-20 実障害: 出荷_11 uchiwa30 が2ロケとも総数9表示) ───
+
+t('分割引当: 各ロケの qty は出荷引当数 (指示数の総数ではない)', () => {
+  // 1伝票9個 → 8個+1個に分割。出荷指示数は両行とも9 (実CSVで確認済みの形)
+  const csv = makeCsv([
+    row({ loc: '00301401', sku: 'uchiwa30', qty: 8, instruct: 9, slip: '0001', block: 'P3FD' }),
+    row({ loc: '00600901', sku: 'uchiwa30', qty: 1, instruct: 9, slip: '0001', block: 'P3FD' }),
+  ]);
+  const p = parseCs03002(csv);
+  assert.deepEqual(p.lines.map((l) => [l.location, l.qty]), [['00301401', 8], ['00600901', 1]]);
+  assert.deepEqual(p.slipLines.map((l) => l.qty), [8, 1]);
+  assert.equal(p.totalQty, 9);           // 18 (指示数合算) ではない
+  assert.equal(p.slipCount, 1);
+  assert.deepEqual(p.qtyWarnings, []);   // 8+1=9 で指示数と一致
+});
+
+t('数量クロスチェック: 引当数合計≠指示数は警告 (取込は止めない)', () => {
+  const csv = makeCsv([
+    row({ loc: '00301401', sku: 'a', qty: 5, instruct: 9, slip: '0001' }),
+  ]);
+  const p = parseCs03002(csv);
+  assert.equal(p.qtyWarnings.length, 1);
+  assert.match(p.qtyWarnings[0], /SP0001 × a/);
+  assert.match(p.qtyWarnings[0], /出荷指示数9に対し出荷引当数合計5/);
+});
+
+t('同一伝票×同一SKUの別明細 (出荷指示行NO違い) は合算・警告なし', () => {
+  // 同じSKUを別明細で1個+2個注文したケース (実データ 8/19 BD-straw 型)
+  const csv = makeCsv([
+    row({ loc: '00201701', sku: 'straw', qty: 1, instruct: 1, lineNo: '1', slip: '0001' }),
+    row({ loc: '00201701', sku: 'straw', qty: 2, instruct: 2, lineNo: '2', slip: '0001' }),
+  ]);
+  const p = parseCs03002(csv);
+  assert.deepEqual(p.lines.map((l) => l.qty), [3]);   // 同一ロケ×SKUなので合算
+  assert.deepEqual(p.qtyWarnings, []);
+});
+
+t('出荷指示行NO列が無いCSVはクロスチェックをスキップ (誤警告を出さない)', () => {
+  const headers = HEADERS.filter((h) => h !== '出荷指示行NO');
+  const csv = makeCsv([
+    row({ loc: '00201701', sku: 'straw', qty: 1, instruct: 1, slip: '0001' }),
+    row({ loc: '00201701', sku: 'straw', qty: 2, instruct: 2, slip: '0001' }),
+  ], { headers });
+  const p = parseCs03002(csv);
+  assert.deepEqual(p.qtyWarnings, []);
+});
+
+t('出荷指示行NOが空の行はクロスチェック対象外 (列があっても値が空なら別明細と区別できない)', () => {
+  const csv = makeCsv([
+    row({ loc: '00201701', sku: 'straw', qty: 1, instruct: 1, lineNo: '', slip: '0001' }),
+    row({ loc: '00201701', sku: 'straw', qty: 2, instruct: 2, lineNo: '', slip: '0001' }),
+  ]);
+  const p = parseCs03002(csv);
+  assert.deepEqual(p.qtyWarnings, []);   // 空欄同士を同一グループにして誤警告しない
+  assert.equal(p.lines[0].qty, 3);       // 取込自体は引当数で行う
+});
+
+t('数量クロスチェックの警告は上限20件+超過表示', () => {
+  const rows = [];
+  for (let i = 0; i < 25; i++) {
+    rows.push(row({ loc: '00201604', sku: `sku${i}`, qty: 1, instruct: 2, slip: String(i).padStart(4, '0') }));
+  }
+  const p = parseCs03002(makeCsv(rows));
+  assert.equal(p.qtyWarnings.length, 21);   // 先頭20件 + 「他にも不一致があります」
+  assert.match(p.qtyWarnings[20], /他にも不一致/);
+  assert.equal(p.qtyWarningCount, 25);      // 実件数は省略に関係なく数える
 });
 
 t('複数TBは正常 (1引当で複数TBが振られる実仕様)。キーはソート済みTB一覧の組', () => {
@@ -333,6 +417,20 @@ t('importBatch: 引当分類が空なら no_class・長すぎる入力は拒否'
   expectPkError(() => importBatch(p, { hikiateClass: '  ' }, 'test@b-faith.biz'), 'no_class');
   expectPkError(() => importBatch(p, { hikiateClass: 'x'.repeat(101) }, 'test@b-faith.biz'), 'class_too_long');
   expectPkError(() => importBatch(p, { hikiateClass: 'ネコポス手動単品', folderName: 'y'.repeat(51) }, 'test@b-faith.biz'), 'folder_too_long');
+});
+
+t('importBatch: 分割引当は pk_lines / pk_slip_lines とも引当数で保存される', () => {
+  const csv = makeCsv([
+    row({ loc: '00301401', sku: 'uchiwa30', qty: 8, instruct: 9, slip: '0001', block: 'P3FD', tb: 'TB_SPLIT' }),
+    row({ loc: '00600901', sku: 'uchiwa30', qty: 1, instruct: 9, slip: '0001', block: 'P3FD', tb: 'TB_SPLIT' }),
+  ]);
+  const { batchId } = importBatch(parseCs03002(csv), { hikiateClass: 'テスト分類' }, 'test');
+  const lines = listLines(batchId);
+  assert.deepEqual(lines.map((l) => l.qty), [8, 1]);
+  const slips = getDB().prepare('SELECT qty FROM pk_slip_lines WHERE batch_id = ? ORDER BY id').all(batchId);
+  assert.deepEqual(slips.map((s) => s.qty), [8, 1]);
+  const batch = getDB().prepare('SELECT total_qty FROM pk_batches WHERE id = ?').get(batchId);
+  assert.equal(batch.total_qty, 9);
 });
 
 t('TBが空の行があれば行番号つきで no_tb_no', () => {
