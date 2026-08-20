@@ -716,6 +716,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       throw new PackError(409, 'not_line_batch', '梱包機バッチではありません');
     }
     let taskNotify = null;   // ①②のGChat通知情報 (routerがfail-softで送る。replayでは再送しない)
+    let switchedFrom = null; // ライン工程開始での担当交代 (payload に監査記録)
 
     if (event === 'takeover') {
       // 担当者の交代 (選び間違い・実際の引き継ぎ)。作業中・中断中のみ・記録が残る唯一の正規突破口
@@ -724,6 +725,15 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       if (batch.worker !== worker) {
         db.prepare('UPDATE pk_pack_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
+      }
+      // ライン工程中の交代は「進行中の工程行」の担当も引き継ぐ (工程途中の操作判定は
+      // 工程行の worker で行うため。完了済みの工程の担当記録は変えない)。
+      // batch.worker が既に本人でも実行する — 工程行だけ食い違う不整合の修復口 (Codex medium)
+      if (lineKind) {
+        db.prepare(`UPDATE pk_pack_line_runs SET worker=?, updated_at=?
+          WHERE batch_id=? AND started_at IS NOT NULL
+            AND (finished_at IS NULL OR (phase='run' AND final_count IS NULL))
+        `).run(worker, now, batchId);
       }
     } else if (event === 'pause') {
       // 中断: 中断時間は梱包時間から除外する。時刻は端末の発生時刻をクランプ採用
@@ -895,15 +905,27 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         if (batch.status === 'ready') {
           db.prepare(`UPDATE pk_pack_batches SET status='packing', worker=?,
             started_at=COALESCE(started_at, ?), updated_at=? WHERE id=?`).run(worker, now, now, batchId);
-        } else {
-          requireOwner();
+        } else if (batch.worker !== worker) {
+          // 工程の開始は担当交代を許可 (中原さん指示 2026-08-20: MELTは仕分けと流しが別人のことがある)。
+          // 誰がどの工程をやったかは pk_pack_line_runs.worker (工程別) とイベント履歴に残り、
+          // 交代自体もこのイベントの payload (switchedFrom) に監査記録する。
+          // 工程の途中操作 (仕分け完了・停止・件数記録) はその工程の担当者のみ (requirePhaseWorker)
+          switchedFrom = batch.worker;
+          db.prepare('UPDATE pk_pack_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
         }
       };
-      const requirePacking = () => {
+      const requirePackingStatus = () => {
         if (batch.status !== 'packing') {
           throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
         }
-        requireOwner();
+      };
+      // 工程途中の操作はその工程の担当者のみ。batch.worker は工程開始・takeover で動くため
+      // 判定は工程行の worker と直接比較する (Codexレビュー high: 第三者のtakeoverで
+      // 開始者が締め出される/横取りできる穴を塞ぐ)
+      const requirePhaseWorker = (row) => {
+        if (row.worker !== worker) {
+          throw new PackError(409, 'taken', `この工程は ${row.worker} が作業中です (交代は「引き継ぐ」で)`);
+        }
       };
       if (event === 'line_sort_start') {
         if (kind !== 'melt') throw new PackError(409, 'not_melt', '仕分け工程は MELT-LINE のみです');
@@ -915,7 +937,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         const run = getRun('sort');
         if (!run) throw new PackError(409, 'not_started', '仕分けが開始されていません');
         if (run.finished_at) throw new PackError(409, 'already_done', '仕分けは完了済みです');
-        requirePacking();
+        requirePackingStatus();
+        requirePhaseWorker(run);
         // 入力は「他の方法で出荷する件数」(除外件数)。機械に流す件数 = 伝票数 - 除外 を
         // 自動計算して final_count に持つ (中原さん指示 2026-08-18 — 現場は外した数を数えている)。
         // 未入力は 0 と区別して拒否 (Codex medium: Number(null)===0)
@@ -943,7 +966,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         const run = getRun('run');
         if (!run) throw new PackError(409, 'not_started', '機械流しが開始されていません');
         if (run.finished_at) throw new PackError(409, 'already_done', 'すでに停止済みです');
-        requirePacking();
+        requirePackingStatus();
+        requirePhaseWorker(run);
         db.prepare('UPDATE pk_pack_line_runs SET finished_at=?, worker=?, updated_at=? WHERE id=?')
           .run(clampedEventTime(clientAt, now, run.started_at), worker, now, run.id);
       } else {   // line_done — 件数の記録 (line_stop 後のみ。入力するまでバッチは完了しない)
@@ -951,7 +975,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         if (!run) throw new PackError(409, 'not_started', '機械流しが開始されていません');
         if (!run.finished_at) throw new PackError(409, 'not_stopped', '先に「終了」で時間を止めてください');
         if (run.final_count != null) throw new PackError(409, 'already_done', 'このラインは記録済みです');
-        requirePacking();
+        requirePackingStatus();
+        requirePhaseWorker(run);
         // 出荷完了件数 (紙台帳の「出荷完了件数」)。うち手動 = 機械を通さず手で流した分。
         // 未入力は 0 と区別して拒否 (Codex medium)
         if (finalCount == null) throw new PackError(400, 'bad_count', '出荷完了件数を入力してください');
@@ -1042,11 +1067,12 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
-        || finalCount != null || manualCount != null || excludedCount != null || note)
+        || finalCount != null || manualCount != null || excludedCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
           sku: sku || undefined, actualSku: actualSku || undefined, qty: qty ?? undefined,
           finalCount: finalCount ?? undefined, manualCount: manualCount ?? undefined,
-          excludedCount: excludedCount ?? undefined, note: note || undefined }) : null;
+          excludedCount: excludedCount ?? undefined, note: note || undefined,
+          switchedFrom: switchedFrom || undefined }) : null;
     db.prepare(`
       INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)

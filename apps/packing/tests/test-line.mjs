@@ -164,6 +164,47 @@ console.log('\n── 伝票イベントの相互排他 / 段階的取消 ──
   eq(lineDailyTotal('2026-08-18', 'pas'), { total: 109, machine: 107 }, '累計にバッチ6の10件が加算');
 }
 
+console.log('\n── 仕分けと流しの担当者分離 (中原さん指示 2026-08-20) ──');
+{
+  mkBatch(8, 2, 20);   // MELT
+  ev(8, 'line_sort_start', {}, '仕分A');
+  ev(8, 'line_sort_done', { excludedCount: 0 }, '仕分A');
+  // 流しは別人B: 工程の開始時は担当交代を許可 (作業者欄で自分を選んで開始するだけ)
+  ev(8, 'line_start', {}, '流しB');
+  eq(db.prepare('SELECT worker FROM pk_pack_batches WHERE id=8').get().worker, '流しB', '流し開始で現在の担当がBへ');
+  eq(listLineRuns(8).find((r) => r.phase === 'sort').worker, '仕分A', '仕分け担当Aは工程別に残る');
+  // 工程の途中操作はその工程の担当者のみ (誤操作防止は維持・判定は工程行のworker)
+  throws(() => ev(8, 'line_stop', {}, '仕分A'), 'taken', '停止は流し担当B以外は不可');
+  // 途中の実引き継ぎは明示の takeover — 進行中の工程行の担当も引き継ぐ (Codex high)
+  ev(8, 'takeover', {}, '交代C');
+  eq(listLineRuns(8).find((r) => r.phase === 'run').worker, '交代C', 'takeoverで流し工程の担当もCへ');
+  eq(listLineRuns(8).find((r) => r.phase === 'sort').worker, '仕分A', '完了済みの仕分け担当記録は変えない');
+  throws(() => ev(8, 'line_stop', {}, '流しB'), 'taken', '交代後は旧担当Bは操作不可');
+  ev(8, 'line_stop', {}, '交代C');
+  ev(8, 'line_done', { finalCount: 20 }, '交代C');
+  eq(listLineRuns(8).find((r) => r.phase === 'run').worker, '交代C', '最終の流し担当Cが工程に記録される');
+  eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=8').get().status, 'done', '完了');
+  // 工程開始での交代はイベントpayloadに監査記録 (switchedFrom)
+  const startEv = db.prepare(
+    "SELECT payload_json FROM pk_pack_events WHERE batch_id=8 AND event='line_start'").get();
+  eq(JSON.parse(startEv.payload_json).switchedFrom, '仕分A', 'line_startのpayloadに旧担当を記録');
+
+  // 工程行だけ担当が食い違う不整合は、本人の takeover で修復できる (Codex medium)
+  mkBatch(9, 2, 10);
+  ev(9, 'line_sort_start', {}, '担当D');
+  db.prepare("UPDATE pk_pack_line_runs SET worker='ズレE' WHERE batch_id=9 AND phase='sort'").run();
+  throws(() => ev(9, 'line_sort_done', { excludedCount: 0 }, '担当D'), 'taken', '不整合状態では操作不可');
+  ev(9, 'takeover', {}, '担当D');   // batch.worker は既にD (変更なし) でも工程行を修復
+  ev(9, 'line_sort_done', { excludedCount: 0 }, '担当D');
+  ok(true, '本人takeoverで工程行の担当を修復→操作再開');
+
+  // 手梱包バッチの担当ガードは従来どおり (非回帰)
+  ev(3, 'start', {}, '手梱A');
+  throws(() => ev(3, 'start', {}, '手梱B'), 'taken', '手梱包の別人startは拒否のまま');
+  ev(3, 'takeover', {}, '手梱B');
+  eq(db.prepare('SELECT worker FROM pk_pack_batches WHERE id=3').get().worker, '手梱B', '手梱包の交代はtakeoverで');
+}
+
 console.log('\n── replay ──');
 {
   const opId = `t${++op}`;
