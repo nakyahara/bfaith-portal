@@ -560,6 +560,12 @@ router.get('/inquiries/:id', (req, res) => {
       : inq.channel_type === 'yahoo' && inq.account_identifier
         ? `https://pro.store.yahoo.co.jp/pro.${encodeURIComponent(String(inq.account_identifier).trim())}/order/manage/detail/${encodeURIComponent(mallOrderNo)}`
         : null;
+  // 🔎 NEで受注検索 (2026-08-20 スタッフ要望): メール問い合わせには注文番号が無く受注に飛べない。
+  // メールディーラーはNE APIでアドレス→受注を突合していたが、ここはAPI連携なしで
+  // 「アドレスをコピーしてNEの受注検索画面を開く」導線にする (NEの検索条件はURLで渡せないため貼り付け方式)。
+  // 注文番号からNE直リンクが出るときは不要なので出さない
+  const neSearchMail = (!neOrderNo && String(inq.customer_identifier || '').includes('@'))
+    ? String(inq.customer_identifier).trim() : null;
 
   // 前後ナビ (2026-08-10 スタッフ要望): 一覧と同じ並び・同じ文脈 (view/folder/group) で隣へ移動。
   // 存在しない側はグレー表示のまま残す (ボタンが消えて位置がずれるより分かりやすい)
@@ -589,7 +595,7 @@ router.get('/inquiries/:id', (req, res) => {
         <h3>チケット情報</h3>
         <dl>
           <dt>店舗</dt><dd>${he(inq.shop_name)} <span class="sub">(${he(inq.account_identifier)})</span></dd>
-          <dt>顧客</dt><dd>${he(inq.customer_name || '—')}${inq.customer_identifier ? `<div class="sub">${he(inq.customer_identifier)}</div>` : ''}</dd>
+          <dt>顧客</dt><dd>${he(inq.customer_name || '—')}${inq.customer_identifier ? `<div class="sub">${he(inq.customer_identifier)}</div>` : ''}${neSearchMail ? `<div class="sub"><a href="#" id="neMailSearch" data-mail="${he(neSearchMail)}" title="メールアドレスをコピーして、ネクストエンジンの受注検索画面を新しいタブで開きます (検索欄に貼り付けて検索してください)">🔎 NEで受注検索 (アドレスをコピー) ↗</a></div>` : ''}</dd>
           <dt>注文番号</dt><dd>${inq.order_number
             ? `${he(inq.order_number)}${mallOrderUrl ? `<div class="sub"><a href="${he(mallOrderUrl)}" target="_blank" rel="noopener" title="モールの注文詳細画面を開く">🛍️ モールで注文を開く ↗</a></div>` : ''}`
             : '—'}</dd>
@@ -647,6 +653,17 @@ router.get('/inquiries/:id', (req, res) => {
     }).catch(function() {});
   }
   document.getElementById('asgMe').addEventListener('click', function() { document.getElementById('asgInput').value = ME; });
+  // 🔎 NEで受注検索: 先にコピー→それからNEを開く (逆順だとフォーカスが新タブへ移りコピーが失敗する)
+  var neMailBtn = document.getElementById('neMailSearch');
+  if (neMailBtn) neMailBtn.addEventListener('click', function(ev) {
+    ev.preventDefault();
+    var openNe = function() { window.open('https://main.next-engine.com/Userjyuchu/', '_blank', 'noopener'); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(neMailBtn.dataset.mail || '').then(function() {
+        toast('アドレスをコピーしました。NEの受注検索でメールアドレス欄に貼り付けて検索してください'); openNe();
+      }, function() { toast('コピーできませんでした。アドレスを選択して手動でコピーしてください'); openNe(); });
+    } else { toast('このブラウザではコピーできません。アドレスを選択してコピーしてください'); openNe(); }
+  });
   document.getElementById('saveBtn').addEventListener('click', function() {
     var btn = this; btn.disabled = true;
     var ops = [];
