@@ -26,6 +26,7 @@ const { initPackingDB } = await import('../../packing/db.js');
 const { lineKindOf } = await import('../../packing/service.js');
 const {
   getFloorData, computeEta, deadlineGroupOf, lineKindOfClass, deadlineToMs, packBatchCounts,
+  pickOverallEta,
 } = await import('../floor.js');
 
 initPickingDB();
@@ -86,12 +87,50 @@ t('deadlineToMs: JSTの時刻として解釈される', () => {
 
 t('packBatchCounts: ラインバッチは完了までまとめて残数扱い', () => {
   const cutoff = '2026-08-20T04:00:00Z';
-  const running = { cls: 'ネコポス【梱包機PAS-LINE《3つ折り》】単品', status: 'packing', slip_count: 100, remain_slips: 100, recent_done: 0, finished_at: null };
+  const running = { cls: 'ネコポス【梱包機PAS-LINE《3つ折り》】単品', status: 'packing', slip_count: 100, remain_slips: 100, done_slips: 0, cancelled_slips: 0, recent_done: 0, finished_at: null };
   assert.equal(packBatchCounts(running, cutoff).remaining, 100);
   const done = { ...running, status: 'done', finished_at: '2026-08-20T04:30:00Z' };
   const c = packBatchCounts(done, cutoff);
   assert.equal(c.remaining, 0);
   assert.equal(c.recentDone, 100);   // カットオフ後の完了 → 直近ペースに計上
+});
+
+t('packBatchCounts: cancelled は分母・完了のどちらにも入らない', () => {
+  const cutoff = '2026-08-20T04:00:00Z';
+  const b = { cls: 'ネコポス手動単品', status: 'packing', slip_count: 10, remain_slips: 3, done_slips: 5, cancelled_slips: 2, recent_done: 5, finished_at: null };
+  const c = packBatchCounts(b, cutoff);
+  assert.equal(c.total, 8);
+  assert.equal(c.done, 5);
+  assert.equal(c.remaining, 3);
+});
+
+t('pickOverallEta: 両方 late なら超過が深刻な方 (余裕最小) を採る', () => {
+  // AES 16:40予測 (40分超過) と 他 16:50予測 (20分超過) — ETAの遅い方ではなく超過の深い方
+  const o = pickOverallEta([
+    { status: 'late', etaMs: 100, marginMin: -40 },
+    { status: 'late', etaMs: 200, marginMin: -20 },
+  ]);
+  assert.equal(o.status, 'late');
+  assert.equal(o.marginMin, -40);
+  assert.equal(o.etaMs, 100);
+});
+
+t('pickOverallEta: measuring が混ざれば全体は measuring (安請け合いしない)', () => {
+  const o = pickOverallEta([
+    { status: 'ok', etaMs: 100, marginMin: 30 },
+    { status: 'measuring', etaMs: null, marginMin: null },
+  ]);
+  assert.equal(o.status, 'measuring');
+});
+
+t('pickOverallEta: ok 同士は余裕最小・全部 done なら done', () => {
+  const o = pickOverallEta([
+    { status: 'ok', etaMs: 100, marginMin: 60 },
+    { status: 'ok', etaMs: 90, marginMin: 10 },
+    { status: 'done', etaMs: null, marginMin: null },
+  ]);
+  assert.equal(o.marginMin, 10);
+  assert.equal(pickOverallEta([{ status: 'done', etaMs: null, marginMin: null }]).status, 'done');
 });
 
 // ─── データを組んで getFloorData ───
@@ -121,7 +160,7 @@ function makePick({ cls, status, folder, worker = 'w@test', lines = 10, doneLine
 
 let packId = 0;
 function makePack({ pkBatchId = null, status, folder, worker = 'p@test', slips = 10, doneSlips = 0,
-  doneAt = '04:30', matchStatus = 'ok' }) {
+  cancelledSlips = 0, doneAt = '04:30', matchStatus = 'ok' }) {
   const id = ++packId;
   db.prepare(`
     INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count, total_qty,
@@ -130,12 +169,12 @@ function makePack({ pkBatchId = null, status, folder, worker = 'p@test', slips =
   `).run(id, `KEY${id}`, folder, D, slips, slips, slips, pkBatchId, matchStatus, status, worker,
     status === 'done' ? iso(doneAt) : null, iso('00:00'), iso('00:00'));
   for (let i = 1; i <= slips; i++) {
-    const done = i <= doneSlips;
+    const st = i <= doneSlips ? 'done' : (i > slips - cancelledSlips ? 'cancelled' : 'pending');
     db.prepare(`
       INSERT INTO pk_pack_slips (batch_id, seq, ne_slip_no, slip_no, status, shown_at, done_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(id, i, `NE${id}-${i}`, `SP${id}-${i}`, done ? 'done' : 'pending',
-      done ? iso('04:00') : null, done ? iso(doneAt) : null);
+    `).run(id, i, `NE${id}-${i}`, `SP${id}-${i}`, st,
+      st === 'done' ? iso('04:00') : null, st === 'done' ? iso(doneAt) : null);
   }
   return id;
 }
@@ -151,9 +190,9 @@ const pickedPick = makePick({ cls: 'AES《単品》', status: 'done', folder: '�
 const packingPick = makePick({ cls: '50サイズ宅急便単品', status: 'done', folder: '出荷_04', doneLines: 10 });
 const donePick = makePick({ cls: 'AES《単品》', status: 'done', folder: '出荷_05', doneLines: 10 });
 
-// 梱包側: 出荷_03 = ready (梱包待ち)・出荷_04 = packing (5/10済・直近)・出荷_05 = done (直近完了)
+// 梱包側: 出荷_03 = ready (梱包待ち)・出荷_04 = packing (5/10済・cancelled2・直近)・出荷_05 = done (直近完了)
 makePack({ pkBatchId: pickedPick, status: 'ready', folder: '出荷_03' });                            // AES 残10
-makePack({ pkBatchId: packingPick, status: 'packing', folder: '出荷_04', doneSlips: 5 });           // std 残5・直近5
+makePack({ pkBatchId: packingPick, status: 'packing', folder: '出荷_04', doneSlips: 5, cancelledSlips: 2 }); // std 残3・直近5
 makePack({ pkBatchId: donePick, status: 'done', folder: '出荷_05', doneSlips: 10, doneAt: '04:40' }); // AES 完了・直近10
 // 突合差分 (ready) → 要対応
 makePack({ status: 'ready', folder: '出荷_99', matchStatus: 'mismatch', slips: 3 });
@@ -179,11 +218,11 @@ t('flow: 5列の導出 (未着手1・ピッキング中1・ピッキング完了
   assert.equal(data.flow.total, 6);
 });
 
-t('eta: AES と std に分かれ、残数が正しい', () => {
+t('eta: AES と std に分かれ、残数が正しい (cancelled は残数に入らない)', () => {
   const aes = data.eta.groups.find((g) => g.key === 'aes');
   const std = data.eta.groups.find((g) => g.key === 'std');
   assert.equal(aes.remaining, 10);          // 出荷_03 の10伝票 (ready)
-  assert.equal(std.remaining, 8);           // 出荷_04 残5 + 出荷_99 残3
+  assert.equal(std.remaining, 6);           // 出荷_04 残3 (pending) + 出荷_99 残3
   assert.equal(aes.deadline, '16:00');
   assert.equal(std.deadline, '16:30');
 });
@@ -196,11 +235,13 @@ t('eta: 直近ペースから予測が出る (AES=直近10件/60分 → 残10で
   assert.equal(aes.marginMin, 60);          // 締切16:00まで余裕60分
 });
 
-t('eta: overall は一番遅いグループ', () => {
-  // std: 残8 ÷ (5件/60分) = 96分 → 15:36。締切16:30 → 余裕54分 (=遅い方)
+t('eta: overall は余裕が一番小さいグループ', () => {
+  // std: 残6 ÷ (5件/60分) = 72分 → 15:12・余裕78分 / AES: 余裕60分 → overall = AES
+  const aes = data.eta.groups.find((g) => g.key === 'aes');
   assert.equal(data.eta.overall.status, 'ok');
-  assert.ok(data.eta.overall.etaMs >= data.eta.groups.find((g) => g.key === 'aes').etaMs);
-  assert.equal(data.eta.remaining, 18);
+  assert.equal(data.eta.overall.marginMin, 60);
+  assert.equal(data.eta.overall.etaMs, aes.etaMs);
+  assert.equal(data.eta.remaining, 16);
 });
 
 t('要対応: 中断30分 (bad)・突合差分・ミス候補', () => {
@@ -219,10 +260,10 @@ t('品質: 確定1・候補1・欠品2', () => {
   assert.equal(data.quality.shortages, 2);
 });
 
-t('梱包進捗: 伝票ベース (done=15 / total=33)', () => {
-  // 出荷_03: 0/10, 出荷_04: 5/10, 出荷_05: 10/10, 出荷_99: 0/3
+t('梱包進捗: 伝票ベースで cancelled は分母・完了から外れる (done=15 / total=31)', () => {
+  // 出荷_03: 0/10, 出荷_04: 5/8 (cancelled 2除外), 出荷_05: 10/10, 出荷_99: 0/3
   assert.equal(data.packing.progress.doneSlips, 15);
-  assert.equal(data.packing.progress.totalSlips, 33);
+  assert.equal(data.packing.progress.totalSlips, 31);
 });
 
 t('いま動いている: 梱包中バッチが載る', () => {

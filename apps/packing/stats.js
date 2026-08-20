@@ -39,8 +39,8 @@ export function packStatsRange(until = jstToday(), days = PACK_STATS_WINDOW_DAYS
  * 引当分類は picking の pk_batches から引く (同一DBファイル同居・要件§7.3)。
  * 突合できなかったバッチ (pk_batch_id NULL) は '(分類不明)'。
  */
-function loadStatsSlips(since, until) {
-  return getDB().prepare(`
+function loadStatsSlips(db, since, until) {
+  return db.prepare(`
     SELECT b.work_date, b.id AS batch_id, s.seq,
       COALESCE(pb.hikiate_class, '(分類不明)') AS hikiate_class,
       CAST(ROUND((julianday(s.done_at) - julianday(s.shown_at)) * 86400) AS INTEGER) AS sec,
@@ -65,11 +65,13 @@ function loadStatsSlips(since, until) {
  *   - workers: 分類の重さを補正した速さ指数つき (100 = 全体平均どおり)
  *   - 単位は伝票 (フィールド名も slips / secPerSlip — pk_pack_lines の「明細」と混同しない)
  *
- * @param {{until?: string, days?: number}} opts
+ * @param {{until?: string, days?: number, db?: import('better-sqlite3').Database}} opts
+ *   db: 呼び出し側の接続を使う (フロアボード用 — 掲示端末のGETで packing の
+ *   migration を走らせない。Codexレビュー high 2026-08-20)。省略時は packing の getDB()
  */
-export function getPackingStats({ until = jstToday(), days = PACK_STATS_WINDOW_DAYS } = {}) {
+export function getPackingStats({ until = jstToday(), days = PACK_STATS_WINDOW_DAYS, db } = {}) {
   const range = packStatsRange(until, days);
-  const rows = loadStatsSlips(range.since, range.until);
+  const rows = loadStatsSlips(db ?? getDB(), range.since, range.until);
 
   // ── 外れ値と梱包機ラインの仕分け ──
   // 捨てた件数は作業者別にも出す (picking と同じ: 黙って捨てると放置の多い人ほど

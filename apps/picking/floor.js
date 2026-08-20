@@ -72,6 +72,10 @@ function loadPackBatches(db, workDate, cutoffIso) {
         (SELECT COUNT(*) FROM pk_pack_slips s
           WHERE s.batch_id = b.id AND s.status IN ('pending','held')) AS remain_slips,
         (SELECT COUNT(*) FROM pk_pack_slips s
+          WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips,
+        (SELECT COUNT(*) FROM pk_pack_slips s
+          WHERE s.batch_id = b.id AND s.status = 'cancelled') AS cancelled_slips,
+        (SELECT COUNT(*) FROM pk_pack_slips s
           WHERE s.batch_id = b.id AND s.status = 'done' AND s.done_at >= ?) AS recent_done
       FROM pk_pack_batches b
       LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
@@ -83,23 +87,28 @@ function loadPackBatches(db, workDate, cutoffIso) {
 }
 
 /**
- * バッチ1件の 残り伝票数 / 直近完了数。
+ * バッチ1件の 残り/完了/対象の伝票数。
+ * cancelled は残数・完了・分母のどれにも入れない (完了扱いすると進捗が水増しされる —
+ * Codexレビュー medium 2026-08-20)。
  * 梱包機ライン: 伝票単位の完了が刻まれない (SLIP_ONLY_EVENTS 不可) ため、
- * バッチ完了で slip_count をまとめて計上する近似。
+ * バッチ完了で対象伝票をまとめて計上する近似。
  */
 export function packBatchCounts(b, cutoffIso) {
+  const total = Math.max(0, b.slip_count - (b.cancelled_slips || 0));
   if (lineKindOfClass(b.cls) !== null) {
     const done = b.status === 'done';
     return {
-      remaining: done ? 0 : b.slip_count,
-      recentDone: done && b.finished_at && b.finished_at >= cutoffIso ? b.slip_count : 0,
-      done: done ? b.slip_count : 0,
+      total,
+      remaining: done ? 0 : total,
+      recentDone: done && b.finished_at && b.finished_at >= cutoffIso ? total : 0,
+      done: done ? total : 0,
     };
   }
   return {
+    total,
     remaining: b.remain_slips,
     recentDone: b.recent_done,
-    done: Math.max(0, b.slip_count - b.remain_slips),
+    done: b.done_slips,
   };
 }
 
@@ -123,21 +132,29 @@ function buildEta(packBatches, workDate, nowMs, cutoffIso) {
       ...computeEta({ nowMs, remaining: g.remaining, recentDone: g.recentDone, windowMin: FLOOR_RATE_WINDOW_MIN, deadlineMs: dMs }),
     };
   });
-  // 全体 = 一番遅いグループの予測。late が1つでもあれば late
-  let overall = { status: 'done', etaMs: null, marginMin: null };
-  for (const g of groups) {
-    if (g.status === 'late' && (overall.status !== 'late' || (g.etaMs ?? 0) > (overall.etaMs ?? 0))) overall = g;
-    else if (overall.status !== 'late') {
-      if (g.status === 'measuring' && overall.status !== 'measuring') overall = g;
-      else if (g.status === 'ok' && overall.status !== 'measuring' && (overall.etaMs == null || (g.etaMs ?? 0) > overall.etaMs)) overall = g;
-    }
-  }
   return {
     groups,
-    overall: { status: overall.status, etaMs: overall.etaMs ?? null, marginMin: overall.marginMin ?? null },
+    overall: pickOverallEta(groups),
     remaining: groups.reduce((s, g) => s + g.remaining, 0),
     windowMin: FLOOR_RATE_WINDOW_MIN,
   };
+}
+
+/**
+ * 全体表示に使うグループの選定 (純関数)。
+ * 締切が便ごとに違うため「ETAが一番遅い」ではなく「余裕が一番小さい」を採る
+ * (Codexレビュー medium 2026-08-20: AES 40分超過 と 他 20分超過 が同時に起きたとき、
+ *  ETAの遅い方を選ぶと軽い方の20分が表に出て深刻な方が隠れる)。
+ * late > measuring > ok > done の順に深刻とみなす。
+ */
+export function pickOverallEta(groups) {
+  const minMargin = (list) => list.reduce((m, g) => (m == null || g.marginMin < m.marginMin ? g : m), null);
+  const late = groups.filter((g) => g.status === 'late');
+  if (late.length) { const g = minMargin(late); return { status: 'late', etaMs: g.etaMs, marginMin: g.marginMin }; }
+  if (groups.some((g) => g.status === 'measuring')) return { status: 'measuring', etaMs: null, marginMin: null };
+  const ok = groups.filter((g) => g.status === 'ok');
+  if (ok.length) { const g = minMargin(ok); return { status: 'ok', etaMs: g.etaMs, marginMin: g.marginMin }; }
+  return { status: 'done', etaMs: null, marginMin: null };
 }
 
 /** 出荷バッチの工程別本数 (Notionカンバンの5列を picking+packing の状態から導出)。 */
@@ -370,17 +387,21 @@ export async function getFloorData({ now = new Date(), days } = {}) {
   const workDate = jstToday(now);
   const cutoffIso = new Date(nowMs - FLOOR_RATE_WINDOW_MIN * 60000).toISOString();
 
-  const packBatches = loadPackBatches(db, workDate, cutoffIso);
+  // PACKING_ENABLED=0 = 梱包アプリを意図的に切り離した状態。ボードも読まない
+  // (無効化の理由が migration 失敗などのとき、古い/壊れたデータを現況として出さない)
+  const packingDisabled = process.env.PACKING_ENABLED === '0';
+  const packBatches = packingDisabled ? null : loadPackBatches(db, workDate, cutoffIso);
 
-  // 梱包の当日進捗 (伝票ベース)
+  // 梱包の当日進捗 (伝票ベース・cancelled は分母から除外)
   let packProgress = null;
   let packActive = null;
   if (packBatches) {
     let done = 0;
     let total = 0;
     for (const b of packBatches) {
-      total += b.slip_count;
-      done += packBatchCounts(b, cutoffIso).done;
+      const c = packBatchCounts(b, cutoffIso);
+      total += c.total;
+      done += c.done;
     }
     packProgress = { doneSlips: done, totalSlips: total, remainingSlips: Math.max(0, total - done) };
     packActive = packBatches
@@ -394,15 +415,21 @@ export async function getFloorData({ now = new Date(), days } = {}) {
       }));
   }
 
-  // 梱包ヒートマップ (動的 import — 失敗しても他は出す)
+  // 梱包ヒートマップ (動的 import — 失敗しても他は出す)。
+  // ⭐db を渡して picking の既存接続で読む (packing の getDB() は未初期化だと
+  //   migration を実行する = 掲示端末のGETがDB書き込みになる。Codexレビュー high)
   let packStats = null;
   let packStatsError = null;
-  try {
-    const mod = await packStatsMod();
-    // until を明示する (デフォルトの jstToday() と now 起点の workDate を一致させる)
-    packStats = toBoardStats(mod.getPackingStats({ until: workDate, ...(days ? { days } : {}) }), 'pack');
-  } catch (e) {
-    packStatsError = String(e?.message || e);
+  if (!packingDisabled) {
+    try {
+      const mod = await packStatsMod();
+      // until を明示する (デフォルトの jstToday() と now 起点の workDate を一致させる)
+      packStats = toBoardStats(mod.getPackingStats({ until: workDate, db, ...(days ? { days } : {}) }), 'pack');
+    } catch (e) {
+      // 詳細 (テーブル名・パス等) はログのみ。画面には固定文言 (Codexレビュー low)
+      console.error('[picking] floor: 梱包統計の取得に失敗', e);
+      packStatsError = '梱包実績を取得できません';
+    }
   }
 
   return {
