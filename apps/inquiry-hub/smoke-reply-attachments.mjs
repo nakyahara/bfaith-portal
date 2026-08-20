@@ -44,6 +44,7 @@ const TXT = Buffer.from('これはテキストです');
 
 const shopEmail = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','メール窓口','info@b-faith.biz')").run().lastInsertRowid;
 const shopRk = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','楽天店','rk-shop')").run().lastInsertRowid;
+const shopYh = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','Yahoo店','yh-shop')").run().lastInsertRowid;
 const mkInquiry = (shopId, channel, extId) => db.prepare(`INSERT INTO inquiries
     (channel_type, shop_id, external_inquiry_id, customer_name, customer_identifier, subject, conversation_rev, received_at)
   VALUES (?,?,?,?,?,?,0,?)`).run(channel, shopId, extId, '顧客', 'customer@example.com', '納品書がほしい', toUtcIso(Date.now())).lastInsertRowid;
@@ -51,7 +52,8 @@ const mkInquiry = (shopId, channel, extId) => db.prepare(`INSERT INTO inquiries
 // ─── 1. 保存の検証 (形式・サイズ・件数) ───
 console.log('1. 保存検証');
 const inqM = mkInquiry(shopEmail, 'email', 'th-att-1');
-const inqRk = mkInquiry(shopRk, 'rakuten', 'rk-att-1');
+const inqRk = mkInquiry(shopRk, 'rakuten', '242776-20260820-0000001');
+const inqYh = mkInquiry(shopYh, 'yahoo', 'yh-att-1');
 {
   const a1 = saveReplyAttachment({ inquiryId: inqM, fileName: '納品書_2026.pdf', buffer: PDF, uploadedBy: 'staff-a' });
   check('PDF保存 (中身の先頭バイトで形式確定)', a1.id > 0 && a1.contentType === 'application/pdf' && a1.fileSize === PDF.length);
@@ -61,7 +63,11 @@ const inqRk = mkInquiry(shopRk, 'rakuten', 'rk-att-1');
   throws('空ファイルは拒否', () => saveReplyAttachment({ inquiryId: inqM, fileName: 'a.pdf', buffer: Buffer.alloc(0), uploadedBy: 'x' }), '空');
   throws('サイズ超過は拒否', () => saveReplyAttachment({ inquiryId: inqM, fileName: 'big.pdf',
     buffer: Buffer.concat([Buffer.from('%PDF-'), Buffer.alloc(MAX_FILE_BYTES, 0x20)]), uploadedBy: 'x' }), '大きすぎます');
-  throws('メール以外のチャネルは拒否', () => saveReplyAttachment({ inquiryId: inqRk, fileName: 'a.pdf', buffer: PDF, uploadedBy: 'x' }), 'メール返信のみ');
+  // チャネル制限: メール+楽天=可 / Yahoo!=不可 (2026-08-20 中原さん指示。メールディーラーと同じ)
+  const aRk = saveReplyAttachment({ inquiryId: inqRk, fileName: '楽天用.pdf', buffer: PDF, uploadedBy: 'x' });
+  check('楽天チャネルは保存できる', aRk.id > 0 && aRk.contentType === 'application/pdf');
+  deletePendingAttachment(inqRk, aRk.id);
+  throws('Yahoo!チャネルは拒否 (API添付非対応)', () => saveReplyAttachment({ inquiryId: inqYh, fileName: 'a.pdf', buffer: PDF, uploadedBy: 'x' }), 'Yahoo');
   saveReplyAttachment({ inquiryId: inqM, fileName: '3つ目.pdf', buffer: PDF, uploadedBy: 'x' });
   throws(`${MAX_FILES_PER_REPLY + 1}つ目は拒否`, () => saveReplyAttachment({ inquiryId: inqM, fileName: '4つ目.pdf', buffer: PDF, uploadedBy: 'x' }), 'つまで');
   const list = listPendingAttachments(inqM);
@@ -80,8 +86,8 @@ const inqRk = mkInquiry(shopRk, 'rakuten', 'rk-att-1');
 console.log('2. ジョブ紐付け');
 {
   const atts = listPendingAttachments(inqM);
-  throws('楽天チャネルに添付は拒否', () => createReplyJob({ inquiryId: inqRk, channelType: 'rakuten', bodyText: 'x',
-    createdBy: 'u', clientOperationId: 'op-rk-att', baseConversationRev: 0, attachmentIds: [atts[0].id] }), 'メール返信のみ');
+  throws('Yahoo!チャネルに添付は拒否', () => createReplyJob({ inquiryId: inqYh, channelType: 'yahoo', bodyText: 'x',
+    createdBy: 'u', clientOperationId: 'op-yh-att', baseConversationRev: 0, attachmentIds: [atts[0].id] }), '対応していません');
   const r = createReplyJob({ inquiryId: inqM, channelType: 'email', bodyText: '納品書を添付します',
     createdBy: 'staff-a', clientOperationId: 'op-att-1', baseConversationRev: 0, attachmentIds: atts.map(a => a.id) });
   const job = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(r.id);
@@ -178,6 +184,81 @@ console.log('4. Gmail MIME');
     && Buffer.from(mimePlain.split('\r\n\r\n')[1].replace(/\r\n/g, ''), 'base64').toString('utf8') === 'テスト本文');
 }
 
+// ─── 4b. 楽天アダプター (R-Messe 2段送信: attachment登録→reply) ───
+console.log('4b. 楽天アダプター');
+{
+  const { createRakutenAdapter } = await import('./sync/adapters/rakuten.js');
+  const WH = { transport: 'warehouse', warehouseUrl: 'https://wh.example', serviceToken: 'tok',
+    cfClientId: 'cf-id', cfClientSecret: 'cf-secret', sleepMs: 0 };
+  const mkFetch = (uploadStatus = 200) => {
+    const calls = [];
+    const f = async (url, opts = {}) => {
+      calls.push({ url, opts });
+      const resp = (status, obj) => ({ ok: status < 400, status, json: async () => obj, text: async () => JSON.stringify(obj) });
+      if (url.includes('inquiry-attachment-upload')) {
+        if (uploadStatus !== 200) return resp(uploadStatus, { error: 'BAD_REQUEST', message: 'ng' });
+        const n = calls.filter(c => c.url.includes('inquiry-attachment-upload')).length;
+        return resp(200, { result: { label: decodeURIComponent(opts.headers['X-File-Name']), path: `rms/tmp/path-${n}` } });
+      }
+      if (url.includes('inquiry-reply')) return resp(200, { result: { id: 777 } });
+      return resp(200, {});
+    };
+    f.calls = calls;
+    return f;
+  };
+
+  const f1 = mkFetch();
+  const ad = createRakutenAdapter({ ...WH, sendMode: 'live', fetchImpl: f1 });
+  const sent = await ad.sendReply({
+    inquiry: { external_inquiry_id: '242776-20260820-0000001' },
+    bodyText: '納品書を添付いたします',
+    attachments: [
+      { fileName: '納品書_2026.pdf', contentType: 'application/pdf', buffer: PDF },
+      { fileName: 'photo.png', contentType: 'image/png', buffer: PNG },
+    ],
+  });
+  const upCalls = f1.calls.filter(c => c.url.includes('inquiry-attachment-upload'));
+  const replyCall = f1.calls.find(c => c.url.includes('inquiry-reply'));
+  check('添付を先にアップロードしてから返信 (2段・順序)', upCalls.length === 2 && replyCall
+    && f1.calls.indexOf(replyCall) > f1.calls.indexOf(upCalls[1]) && sent.externalReplyId === 'r:777');
+  check('アップロード: 生バイナリ+メタヘッダ+CF認証', Buffer.compare(upCalls[0].opts.body, PDF) === 0
+    && upCalls[0].opts.headers['X-File-Name'] === encodeURIComponent('納品書_2026.pdf')
+    && upCalls[0].opts.headers['X-File-Content-Type'] === 'application/pdf'
+    && upCalls[0].opts.headers['CF-Access-Client-Id'] === 'cf-id');
+  const replyBody = JSON.parse(replyCall.opts.body);
+  check('返信body: attachments=[{label,path}] (アップロードの発行値)', replyBody.inquiryNumber === '242776-20260820-0000001'
+    && replyBody.shopId === 242776
+    && replyBody.attachments.length === 2
+    && replyBody.attachments[0].label === '納品書_2026.pdf' && replyBody.attachments[0].path === 'rms/tmp/path-1'
+    && replyBody.attachments[1].path === 'rms/tmp/path-2');
+
+  // 添付なしは従来どおり attachments キー無し (回帰)
+  const f2 = mkFetch();
+  await createRakutenAdapter({ ...WH, sendMode: 'live', fetchImpl: f2 }).sendReply({
+    inquiry: { external_inquiry_id: '242776-20260820-0000002' }, bodyText: 'テキストのみ' });
+  const plainBody = JSON.parse(f2.calls.find(c => c.url.includes('inquiry-reply')).opts.body);
+  check('添付なしは attachments キーを送らない (回帰)', !('attachments' in plainBody)
+    && !f2.calls.some(c => c.url.includes('inquiry-attachment-upload')));
+
+  // アップロード失敗 = 未送信確定 (SendRejectedError)・返信は呼ばれない
+  const f3 = mkFetch(400);
+  let eUp = null;
+  try {
+    await createRakutenAdapter({ ...WH, sendMode: 'live', fetchImpl: f3 }).sendReply({
+      inquiry: { external_inquiry_id: '242776-20260820-0000003' }, bodyText: 'x',
+      attachments: [{ fileName: 'a.pdf', contentType: 'application/pdf', buffer: PDF }] });
+  } catch (e) { eUp = e; }
+  check('アップロード拒否は SendRejectedError + 返信API未呼び出し', eUp instanceof SendRejectedError
+    && String(eUp.message).includes('未送信') && !f3.calls.some(c => c.url.includes('inquiry-reply')));
+
+  // dryrun は一切呼ばない
+  const f4 = mkFetch();
+  const dry = await createRakutenAdapter({ ...WH, sendMode: 'dryrun', fetchImpl: f4 }).sendReply({
+    inquiry: { external_inquiry_id: '242776-20260820-0000004' }, bodyText: 'x',
+    attachments: [{ fileName: 'a.pdf', contentType: 'application/pdf', buffer: PDF }] });
+  check('dryrun: アップロードも返信もしない', dry.dryRun === true && f4.calls.length === 0);
+}
+
 // ─── 5. HTTP (アップロードAPI・画面・/reply連携) ───
 console.log('5. HTTP');
 {
@@ -197,15 +278,21 @@ console.log('5. HTTP');
   check('メール詳細に📎添付ボタン+ファイル入力', html.includes('id="attBtn"') && html.includes('id="attFile"') && html.includes('id="attList"'));
   check('一覧はtextContent構築 (ファイル名をinnerHTMLに入れない)', html.includes('name.textContent') && !html.includes('attList.innerHTML'));
   const htmlRk = await (await fetch(`${base}/inquiries/${inqRk}`)).text();
-  check('楽天詳細には添付ボタンを出さない', !htmlRk.includes('id="attBtn"'));
+  check('楽天詳細にも添付ボタンを出す', htmlRk.includes('id="attBtn"'));
+  const htmlYh = await (await fetch(`${base}/inquiries/${inqYh}`)).text();
+  check('Yahoo!詳細には添付ボタンを出さない', !htmlYh.includes('id="attBtn"'));
 
   const up1 = await upload(inqH, '請求書_8月分.pdf', PDF);
   const up1j = await up1.json();
   check('バイナリアップロード成功 (日本語ファイル名)', up1.status === 200 && up1j.ok && up1j.fileName === '請求書_8月分.pdf' && up1j.id > 0);
   const upBad = await upload(inqH, 'nise.pdf', TXT);
   check('偽装ファイルは400', upBad.status === 400 && String((await upBad.json()).error).includes('添付できません'));
-  const upRk = await upload(inqRk, 'a.pdf', PDF);
-  check('楽天へのアップロードは400', upRk.status === 400);
+  const upRk = await upload(inqRk, '楽天用.pdf', PDF);
+  const upRkJ = await upRk.json();
+  check('楽天へのアップロードは成功', upRk.status === 200 && upRkJ.ok);
+  await jp(`/api/inquiries/${inqRk}/reply-attachments/${upRkJ.id}/delete`, {});
+  const upYh = await upload(inqYh, 'a.pdf', PDF);
+  check('Yahoo!へのアップロードは400', upYh.status === 400 && String((await upYh.json()).error).includes('Yahoo'));
   const wrongCt = await fetch(`${base}/api/inquiries/${inqH}/status`, {
     method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: PDF });
   check('他のAPIはoctet-streamを415で拒否 (JSON必須のまま)', wrongCt.status === 415);

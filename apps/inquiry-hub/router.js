@@ -458,7 +458,7 @@ router.get('/inquiries/:id', (req, res) => {
       <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span>
       ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 200))}</div>` : ''}</div>`).join('')}` : '';
   // 📎 送信用添付: 未紐付け分 (ページ再読み込みしてもアップロード済みが消えないよう復元する)
-  const pendingAtts = (replyEditorEnabled() && inq.channel_type === 'email' && !activeJob)
+  const pendingAtts = (replyEditorEnabled() && ['email', 'rakuten'].includes(inq.channel_type) && !activeJob)
     ? listPendingAttachments(inq.id) : [];
   // 送信ワーカーの状態に応じたバナー (チャネル別モード。env は起動時固定なので都度読んでも軽い)
   const outboxOn = ['true', '1'].includes(process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED || '');
@@ -495,7 +495,7 @@ router.get('/inquiries/:id', (req, res) => {
           ${Object.entries(REWRITE_STYLES).map(([k, v]) => `<button class="ghost rw-btn" type="button" data-style="${k}">${he(v.label)}</button>`).join('')}
           <button class="ghost" type="button" id="rwUndoBtn" style="display:none">↩ 元に戻す</button>
         </div>` : ''}
-        ${inq.channel_type === 'email' ? `<div class="row rw-row" id="attRow">
+        ${['email', 'rakuten'].includes(inq.channel_type) ? `<div class="row rw-row" id="attRow">
           <button class="ghost" type="button" id="attBtn">📎 ファイルを添付</button>
           <input type="file" id="attFile" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.bmp,application/pdf,image/*" style="display:none">
           <span class="sub">${he(ALLOWED_LABEL)}・1ファイル${Math.round(MAX_FILE_BYTES / 1048576)}MB・最大${MAX_FILES_PER_REPLY}つ</span>

@@ -39,9 +39,10 @@ export function createReplyJob({ inquiryId, channelType, bodyText, attachmentIds
   if (!bodyText || !String(bodyText).trim()) throw new Error('本文が空です');
   if (!clientOperationId) throw new Error('clientOperationId は必須です');
   if (!Number.isInteger(baseConversationRev)) throw new Error('baseConversationRev は必須です');
-  // 送信用添付 (2026-08-20) はまずメールのみ (Gmail multipart送信を実装済み。モールはAPI仕様確認後)
-  if (attachmentIds.length && channelType !== 'email') {
-    throw new Error('添付はメール返信のみ対応しています');
+  // 送信用添付 (2026-08-20) はメール+楽天のみ (Gmail=multipart / 楽天=R-Messe添付API。
+  // Yahoo!は問い合わせAPIが添付非対応 — メールディーラーでも不可だった)
+  if (attachmentIds.length && !['email', 'rakuten'].includes(channelType)) {
+    throw new Error('このチャネルの返信は添付に対応していません (対応: メール・楽天)');
   }
 
   const tx = db.transaction(() => {

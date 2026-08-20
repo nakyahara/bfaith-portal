@@ -226,6 +226,51 @@ export function createRakutenAdapter(cfg = {}) {
   const attachmentUrlBase = transport === 'warehouse'
     ? `${cfg.warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiry-attachment`
     : `${BASE}/attachment`;
+  // 返信添付のアップロードURL (2026-08-20)。R-Messe は POST /attachment (multipart) で先に登録し、
+  // 返された {label, path} を /inquiry/reply の attachments に渡す2段構え
+  // (契約は JakeJP/Rakuten.RMS.Api の InquiryManagementAPI.PostAttachment/Reply 実装で確認)
+  const attachmentUploadUrl = transport === 'warehouse'
+    ? `${cfg.warehouseUrl.replace(/\/+$/, '')}/service-api/rakuten-rms/inquiry-attachment-upload`
+    : `${BASE}/attachment`;
+
+  /** 返信添付1件をR-Messeへ登録して {label, path} を得る。
+   * この段階の失敗はすべて未送信確定 (顧客への返信はまだ発生していない) → SendRejectedError */
+  async function uploadReplyAttachment(a) {
+    const fileName = String(a.fileName || 'attachment').slice(0, 200);
+    const contentType = String(a.contentType || 'application/octet-stream');
+    let res;
+    try {
+      if (transport === 'warehouse') {
+        // miniPC passthrough へは生バイナリ+メタヘッダで渡す (multipart化はminiPC側)
+        res = await fetchImpl(attachmentUploadUrl, {
+          method: 'POST',
+          headers: { ...buildHeaders(), 'Content-Type': 'application/octet-stream',
+            'X-File-Name': encodeURIComponent(fileName), 'X-File-Content-Type': contentType },
+          body: a.buffer,
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      } else {
+        const fd = new FormData();
+        fd.append('file', new Blob([a.buffer], { type: contentType }), fileName);
+        res = await fetchImpl(attachmentUploadUrl, {
+          method: 'POST', headers: buildHeaders(), body: fd,
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      }
+    } catch (err) {
+      const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+      throw new SendRejectedError(`添付アップロード${timedOut ? 'タイムアウト' : '接続失敗'} (${fileName}。未送信): ${String(err?.message || err).slice(0, 120)}`);
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new SendRejectedError(`添付アップロードが拒否されました (${fileName}, HTTP ${res.status}。未送信): ${await errorHead(res)}`);
+    }
+    const j = await res.json().catch(() => null);
+    const attPath = j?.result?.path;
+    if (!attPath || typeof attPath !== 'string') {
+      throw new SendRejectedError(`添付アップロードのレスポンスに path がありません (${fileName}。未送信)`);
+    }
+    return { label: typeof j?.result?.label === 'string' && j.result.label ? j.result.label : fileName, path: attPath };
+  }
 
   return {
     channelType: 'rakuten',
@@ -237,7 +282,7 @@ export function createRakutenAdapter(cfg = {}) {
      * miniPC passthrough 側も maxAttempts:1 でリトライ無効化済み)。
      * 引数 dryRun: true はアダプター設定に関係なく実送信を禁止 (プレビュー経路用)
      */
-    async sendReply({ inquiry, bodyText, dryRun = false }) {
+    async sendReply({ inquiry, bodyText, attachments = [], dryRun = false }) {
       const inquiryNumber = String(inquiry?.external_inquiry_id || '').trim();
       if (!/^\d{1,10}-\d{8}-\d{1,12}[a-z]?$/i.test(inquiryNumber)) {
         throw new SendRejectedError(`楽天問い合わせ番号が不正です (external_inquiry_id='${inquiryNumber}')`);
@@ -254,16 +299,22 @@ export function createRakutenAdapter(cfg = {}) {
       if (message.length > 10000) throw new SendRejectedError('本文が長すぎます (10000文字まで)');
 
       if (dryRun || sendMode !== 'live') {
-        console.log(`[rakuten-send DRYRUN] inquiry=${inquiryNumber} bytes=${message.length} (実送信していません)`);
+        console.log(`[rakuten-send DRYRUN] inquiry=${inquiryNumber} bytes=${message.length} atts=${attachments.length} (実送信していません)`);
         return { dryRun: true, externalReplyId: `dryrun:${inquiryNumber}` };
       }
+
+      // 返信添付 (2026-08-20): 先にR-Messeへ登録して {label, path} を得る。
+      // アップロード段階の失敗は顧客に何も届いていない = すべて SendRejectedError (安全に再作成できる)
+      const uploaded = [];
+      for (const a of attachments) uploaded.push(await uploadReplyAttachment(a));
 
       let res;
       try {
         res = await fetchImpl(replyUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...buildHeaders() },
-          body: JSON.stringify({ inquiryNumber, shopId, message }),
+          body: JSON.stringify({ inquiryNumber, shopId, message,
+            ...(uploaded.length ? { attachments: uploaded } : {}) }),
           signal: AbortSignal.timeout(requestTimeoutMs),
         });
       } catch (err) {

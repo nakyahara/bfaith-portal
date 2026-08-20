@@ -2,7 +2,9 @@
  * 返信の送信用添付 (2026-08-20 スタッフ要望「PDFなどを添付できるように」)
  *
  * 方針:
- *   - まずメールチャネルのみ (納品書PDF等の用途)。楽天/Yahoo!はAPIの添付仕様を確認してから
+ *   - 対応チャネル = メール + 楽天 (2026-08-20 中原さん指示: メールディーラーも楽天は添付可・Yahoo!は不可)。
+ *     楽天は R-Messe API の POST /attachment (multipart) → /inquiry/reply の attachments[{label,path}] の2段
+ *     (実装契約は JakeJP/Rakuten.RMS.Api の InquiryManagementAPI 実装で確認)。Yahoo!はAPI添付非対応
  *   - 実体はDBのBLOBに保持 (アップロード〜送信ワーカーの間だけ必要。Renderの永続ディスクに
  *     ファイルを撒かない・バックアップと整合)。上限を厳しくして肥大を防ぐ
  *   - 形式は中身の先頭バイトで判定 (mime.js sniffContentType)。拡張子・申告Content-Typeは信じない。
@@ -20,6 +22,9 @@ const ORPHAN_TTL_HOURS = 24;
 /** 添付を許す形式 = 中身から確実に判定できるもの (mime.js sniff の対象) */
 const ALLOWED_TYPES = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp']);
 export const ALLOWED_LABEL = 'PDF・画像 (png/jpg/gif/webp/bmp)';
+/** 添付を送れるチャネル (Yahoo!は問い合わせAPIが添付非対応) */
+export const ATTACH_CHANNELS = new Set(['email', 'rakuten']);
+const CHANNEL_MSG = '添付はメールと楽天の返信のみ対応しています (Yahoo!の問い合わせAPIは添付非対応)';
 
 /** ジョブ未紐付けのまま放置された添付を掃除 (アップロード・一覧時に呼ぶ) */
 export function pruneOrphanAttachments() {
@@ -37,7 +42,7 @@ export function saveReplyAttachment({ inquiryId, fileName, buffer, uploadedBy })
   pruneOrphanAttachments();
   const inq = db.prepare('SELECT id, channel_type FROM inquiries WHERE id = ?').get(inquiryId);
   if (!inq) throw new Error('問い合わせが見つかりません');
-  if (inq.channel_type !== 'email') throw new Error('添付はメール返信のみ対応しています (モールのAPI添付仕様を確認してから広げます)');
+  if (!ATTACH_CHANNELS.has(inq.channel_type)) throw new Error(CHANNEL_MSG);
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) throw new Error('ファイルが空です');
   if (buffer.length > MAX_FILE_BYTES) {
     throw new Error(`ファイルが大きすぎます (${(buffer.length / 1048576).toFixed(1)}MB。上限${Math.round(MAX_FILE_BYTES / 1048576)}MB)`);
