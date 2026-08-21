@@ -6,7 +6,7 @@
  */
 import { Router } from 'express';
 import crypto from 'node:crypto';
-import { createRuleChangeRequest, applyRuleChangeDecision, getRuleChangeOptions, postApprovalCard } from './rule-change.js';
+import { createRuleChangeRequest, applyRuleChangeDecision, getRuleChangeOptions, getCurrentRules, postApprovalCard } from './rule-change.js';
 
 const router = Router();
 
@@ -33,6 +33,17 @@ router.get('/options', (req, res) => {
   }
 });
 
+router.post('/current', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, ...getCurrentRules({ kind: b.kind, items: b.items }) });
+  } catch (e) {
+    if (e.code === 'VALIDATION') return res.status(400).json({ error: e.message });
+    console.error('[pd-rule-change] current失敗:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.post('/requests', async (req, res) => {
   try {
     const b = req.body || {};
@@ -46,6 +57,9 @@ router.post('/requests', async (req, res) => {
       packingMachineCode: b.packing_machine_code,
       requestedBy: b.requested_by,
       context: b.context,
+      expectMethodCode: b.expect_method_code ?? null,
+      expectMachineCode: b.expect_machine_code ?? null,
+      expectNone: b.expect_none === true,
     });
     // カード投稿は fail-soft (DBの申請行が正本。失敗しても申請は受理し、cardPosted=false を返す)
     let cardPosted = false;

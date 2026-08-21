@@ -581,6 +581,31 @@ router.get('/api/rule-change/options', api(async (req, res) => {
   res.json({ ok: true, ...(_ruleOptionsCache.data) });
 }));
 
+/** 現在の配送ルール登録の照会 (⑥フォームの表示用)。 */
+router.post('/api/batches/:id(\\d+)/rule-current', checkOrigin, api(async (req, res) => {
+  if (!process.env.PD_RULE_CHANGE_KEY) {
+    throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
+  }
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) throw new PackError(404, 'not_found', 'バッチが見つかりません');
+  const slipSeq = Number(req.body.slip_seq);
+  const slip = listPackSlips(batch.id).find((x) => x.seq === slipSeq);
+  if (!slip) throw new PackError(404, 'slip_not_found', '伝票が見つかりません');
+  const lines = listPackLinesBySlip(batch.id).get(slip.id) || [];
+  if (lines.length === 0) throw new PackError(404, 'no_lines', '明細がありません');
+  const r = await fetch(`${PD_RULE_URL}/current`, {
+    method: 'POST',
+    headers: { 'x-api-key': process.env.PD_RULE_CHANGE_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind: lines.length === 1 ? 'single' : 'assort',
+      items: lines.map((l) => ({ sku: l.sku, qty: l.qty })),
+    }),
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new PackError(502, 'upstream', body.error || `現在の登録の取得に失敗しました (HTTP ${r.status})`);
+  res.json(body);
+}));
+
 router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, res) => {
   if (!process.env.PD_RULE_CHANGE_KEY) {
     throw new PackError(503, 'disabled', 'ルール変更申請は未設定です (PD_RULE_CHANGE_KEY)');
@@ -616,6 +641,9 @@ router.post('/api/batches/:id(\\d+)/rule-change', checkOrigin, api(async (req, r
     packing_machine_code: req.body.packing_machine_code,
     requested_by: worker,
     context: `${batch.folder_name || ''} ${slip.ne_slip_no}`.trim(),
+    expect_method_code: req.body.expect_method_code ?? null,
+    expect_machine_code: req.body.expect_machine_code ?? null,
+    expect_none: req.body.expect_none === true,
   };
   const r = await fetch(`${PD_RULE_URL}/requests`, {
     method: 'POST',

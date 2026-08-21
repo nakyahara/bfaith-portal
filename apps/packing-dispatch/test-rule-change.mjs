@@ -14,7 +14,7 @@ const { initMirrorDB } = await import('../warehouse-mirror/db.js');
 initMirrorDB();
 const { ensureSchema } = await import('./db.js');
 const {
-  createRuleChangeRequest, applyRuleChangeDecision, getRuleChangeOptions, decisionReplyText,
+  createRuleChangeRequest, applyRuleChangeDecision, getRuleChangeOptions, decisionReplyText, getCurrentRules,
 } = await import('./rule-change.js');
 
 // ─── seed ───
@@ -80,15 +80,17 @@ t('単品: 該当帯が無ければ申請時に早期失敗 (帯構成は壊さ�
 });
 
 t('重複申請の拒否 + CAS (申請後にルールが変わったら failed)', () => {
+  // 現在値を既知の状態に固定 (前のテスト結果に依存しない)
+  db.prepare(`UPDATE pd_shipping_rule SET shipping_method_code='nekopos', packing_machine_code='manual' WHERE sku_key='hinokimat5l::::'`).run();
   const mk = () => createRuleChangeRequest({
     kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }],
     mallGroup: 'rakuten', qtyMin: 1, qtyMax: null,
-    shippingMethodCode: 'nekopos', packingMachineCode: 'manual', requestedBy: '星',
+    shippingMethodCode: 'takyu60', packingMachineCode: 'manual', requestedBy: '星',
   });
   const a = mk();
   expectErr(() => mk(), '未処理申請');   // 同一対象の重複
   // 申請後にルールが横から変わる → CASで failed
-  db.prepare(`UPDATE pd_shipping_rule SET shipping_method_code='nekopos' WHERE sku_key='hinokimat5l::::'`).run();
+  db.prepare(`UPDATE pd_shipping_rule SET shipping_method_code='letterpack' WHERE sku_key='hinokimat5l::::'`).run();
   const done = applyRuleChangeDecision(a.id, 'approve', 'a@b-faith.biz');
   assert.equal(done.status, 'failed');
   assert.ok(done.decide_note.includes('変更されています'));
@@ -96,6 +98,41 @@ t('重複申請の拒否 + CAS (申請後にルールが変わったら failed)'
   const b = mk();
   const ok = applyRuleChangeDecision(b.id, 'approve', 'a@b-faith.biz');
   assert.equal(ok.status, 'approved');
+});
+
+t('同値申請の拒否 + expect照合 (画面表示時の現在値とズレたら早期失敗)', () => {
+  // 直前のテストで rakuten 1〜∞ は takyu60/manual
+  expectErr(() => createRuleChangeRequest({
+    kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }],
+    mallGroup: 'rakuten', qtyMin: 1, qtyMax: null,
+    shippingMethodCode: 'takyu60', packingMachineCode: 'manual', requestedBy: '星',
+  }), '変更がありません');
+  expectErr(() => createRuleChangeRequest({
+    kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }],
+    mallGroup: 'rakuten', qtyMin: 1, qtyMax: null,
+    shippingMethodCode: 'nekopos', packingMachineCode: 'manual', requestedBy: '星',
+    expectMethodCode: 'letterpack', expectMachineCode: 'manual',   // 画面が見た値と現在値がズレ
+  }), '登録が変わっています');
+  const okReq = createRuleChangeRequest({
+    kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }],
+    mallGroup: 'rakuten', qtyMin: 1, qtyMax: null,
+    shippingMethodCode: 'nekopos', packingMachineCode: 'manual', requestedBy: '星',
+    expectMethodCode: 'takyu60', expectMachineCode: 'manual',
+  });
+  assert.ok(okReq.id > 0, 'expect一致なら受理');
+  applyRuleChangeDecision(okReq.id, 'reject', 'a@b-faith.biz');   // 後始末 (未処理を残さない)
+});
+
+t('getCurrentRules: 単品=全帯の実在行 / 未登録 / アソート学習', () => {
+  const cur = getCurrentRules({ kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }] });
+  assert.equal(cur.registered, true);
+  assert.ok(cur.rows.length >= 1);
+  assert.ok(cur.rows[0].method_name, '名前解決済み');
+  const none = getCurrentRules({ kind: 'single', items: [{ sku: 'zzz-nothing', qty: 1 }] });
+  assert.equal(none.registered, false);
+  const asr = getCurrentRules({ kind: 'assort', items: [{ sku: 'aaa', qty: 1 }, { sku: 'bbb', qty: 2 }] });
+  assert.equal(asr.decision, null, '未学習は null (学習後の照会は下のアソートテストで担保)');
+  assert.ok(asr.combo, 'combo_key は返る');
 });
 
 t('アソート: 承認で saveAssortDecision (combo登録) される', () => {
@@ -110,6 +147,8 @@ t('アソート: 承認で saveAssortDecision (combo登録) される', () => {
   assert.equal(dec.shipping_method_code, 'takyu60');
   const items = db.prepare('SELECT * FROM pd_assort_decision_item WHERE decision_id=? ORDER BY sku_key').all(dec.id);
   assert.equal(items.length, 2);
+  const asr = getCurrentRules({ kind: 'assort', items: [{ sku: 'aaa', qty: 1 }, { sku: 'bbb', qty: 2 }] });
+  assert.equal(asr.decision?.shipping_method_code, 'takyu60', '学習後は getCurrentRules で引ける');
 });
 
 t('アソート: レターパックは学習不可 → failed', () => {
@@ -123,6 +162,8 @@ t('アソート: レターパックは学習不可 → failed', () => {
 });
 
 t('却下: DBは変更されない', () => {
+  // 現在値を既知に固定 (同値拒否に当たらない組み合わせで申請)
+  db.prepare(`UPDATE pd_shipping_rule SET shipping_method_code='nekopos', packing_machine_code='manual' WHERE sku_key='hinokimat5l::::'`).run();
   const row = createRuleChangeRequest({
     kind: 'single', items: [{ sku: 'hinokimat5l', qty: 1 }],
     mallGroup: 'rakuten', qtyMin: 1, qtyMax: null,
@@ -131,7 +172,7 @@ t('却下: DBは変更されない', () => {
   const done = applyRuleChangeDecision(row.id, 'reject', 'a@b-faith.biz');
   assert.equal(done.status, 'rejected');
   const rule = db.prepare(`SELECT * FROM pd_shipping_rule WHERE sku_key='hinokimat5l::::'`).get();
-  assert.equal(rule.shipping_method_code, 'nekopos');   // 前のテスト (CAS再申請承認) の値のまま
+  assert.equal(rule.shipping_method_code, 'nekopos');   // 却下なので変わらない
 });
 
 console.log(`test-rule-change: ${passed} 件 pass`);
