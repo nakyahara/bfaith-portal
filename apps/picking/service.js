@@ -1117,24 +1117,28 @@ export const FLOOR_ALERT_KINDS = {
   trolley: { direction: 'to_packing', message: '🧺 台車を送ってください' },
   lift:    { direction: 'to_packing', message: '🛗 リフトの中身を出してください' },
   unload:  { direction: 'to_picking', message: '📦 ピッキング済みの商品を下してください' },
+  repick_done: { direction: 'to_packing', message: null },   // 不足分ピッキング完了 (メッセージは依頼ごとに動的)
 };
 
 /** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
-export function createFloorAlert(kind, requestedBy) {
+export function createFloorAlert(kind, requestedBy, customMessage = null) {
   const def = FLOOR_ALERT_KINDS[kind];
   if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
+  const message = def.message || String(customMessage || '').slice(0, 160);
+  if (!message) throw new PkError(400, 'no_message', 'メッセージが必要です');
   const db = getDB();
-  // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)
+  // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)。
+  // 集約キーは (kind, message) — repick_done は依頼ごとにメッセージが違うため別々に出る
   return db.transaction(() => {
     const dup = db.prepare(`
       SELECT id FROM pk_floor_alerts
-      WHERE kind = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
-    `).get(kind);
+      WHERE kind = ? AND message = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
+    `).get(kind, message);
     if (dup) return { id: dup.id, existed: true };
     const info = db.prepare(`
       INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at)
       VALUES (?, ?, ?, ?, ?)
-    `).run(def.direction, kind, def.message, requestedBy || null, utcNow());
+    `).run(def.direction, kind, message, requestedBy || null, utcNow());
     return { id: Number(info.lastInsertRowid), existed: false };
   }).immediate();
 }

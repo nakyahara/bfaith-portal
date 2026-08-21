@@ -480,14 +480,16 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
     let stock = null;
     try { stock = await import('../picking/stock-locations.js'); } catch { /* 同上 */ }
     for (const t of taskRows) {
-      const info = { kind: t.kind, sku: t.sku, name: t.product_name, qty: t.req_qty, folder: t.folder_name, slipSeq: t.slip_seq };
       if (t.kind === 'repick') {
+        // 再ピックはGChat通知しない (中原さん指示 2026-08-21 — 🔴バッチ+タスク画面で完結し、
+        // 完了時に梱包ヘッダーへバナーが出る)。バッチ生成のみ行う
         try {
-          info.repickBatchId = picking?.createRepickBatch ? picking.createRepickBatch(t).batchId : null;
+          if (picking?.createRepickBatch) picking.createRepickBatch(t);
         } catch (e) { console.warn(`[packing] ピッキング漏れバッチ作成失敗 (task=${t.id}): ${e.message}`); }
-        if (t.location) info.locationLabel = picking?.formatLocation ? picking.formatLocation(t.block, t.location) : t.location;
+        continue;
       }
-      if (t.kind === 'return' && stock?.stockLookupConfigured?.()) {
+      const info = { kind: t.kind, sku: t.sku, name: t.product_name, qty: t.req_qty, folder: t.folder_name, slipSeq: t.slip_seq };
+      if (stock?.stockLookupConfigured?.()) {
         try {
           info.stockText = stock.buildStockLocationsText(
             await stock.fetchStockLocations(t.sku), { title: '在庫ロケーション (戻し先の参考)' });

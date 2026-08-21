@@ -243,6 +243,17 @@ router.get('/tasks', async (req, res) => {
   });
 });
 
+/** 不足分ピッキング完了 → 梱包ヘッダーへバナー (fail-soft)。 */
+function notifyRepickDone(task, pickerName) {
+  try {
+    const ref = `${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`;
+    createFloorAlert('repick_done', pickerName,
+      `✅ ${ref}（依頼: ${task.requested_by || '-'}）の不足分のピッキングが完了しました`);
+  } catch (e) {
+    console.warn(`[picking] 完了バナー発報失敗 (task=${task.id}): ${e.message}`);
+  }
+}
+
 /** タスク操作 (claim/fulfill/unavailable/cancel)。packing の更新APIへ委譲。 */
 router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
   try {
@@ -250,6 +261,7 @@ router.post('/api/tasks/:id(\\d+)/:action', checkOrigin, async (req, res) => {
     if (!psvc) return res.status(404).json({ error: '梱包連携は無効です' });
     const worker = resolveWorker(req);
     const t = psvc.applyTaskAction(Number(req.params.id), String(req.params.action), worker.name);
+    if (t.kind === 'repick' && t.status === 'fulfilled') notifyRepickDone(t, worker.name);
     if (t._notifyUnavailable) {
       import('../packing/notify.js')
         .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
@@ -400,7 +412,8 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         }
         if (b.status === 'done') {
           act('claim');   // 開始同期が漏れていた場合の追いつき (claimed済みは失敗ログのみ=無害)
-          act('fulfill');
+          const t = act('fulfill');
+          if (t?.status === 'fulfilled') notifyRepickDone(t, worker.name);
         }
       }
     }

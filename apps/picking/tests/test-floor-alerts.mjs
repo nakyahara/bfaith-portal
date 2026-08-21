@@ -45,3 +45,14 @@ t('不明な種別は拒否', () => {
 });
 try { fs.rmSync(process.env.DATA_DIR, { recursive: true, force: true }); } catch { /* 無視 */ }
 console.log(`\ntest-floor-alerts: ${passed} 件 pass`);
+
+t('repick_done は動的メッセージ・依頼ごとに別バナー', () => {
+  const a = createFloorAlert('repick_done', '星', '✅ 出荷_04 #36（依頼: 大場）の不足分のピッキングが完了しました');
+  const b = createFloorAlert('repick_done', '星', '✅ 出荷_05 #2（依頼: 倉田）の不足分のピッキングが完了しました');
+  assert.equal(a.existed, false);
+  assert.equal(b.existed, false, 'メッセージが違えば別バナー');
+  const again = createFloorAlert('repick_done', '星', '✅ 出荷_04 #36（依頼: 大場）の不足分のピッキングが完了しました');
+  assert.equal(again.existed, true, '同一メッセージは集約');
+  assert.equal(listFloorAlerts('to_packing').filter((x) => x.kind === 'repick_done').length, 2);
+  assert.throws(() => createFloorAlert('repick_done', '星'), (e) => e.code === 'no_message', 'メッセージ必須');
+});
