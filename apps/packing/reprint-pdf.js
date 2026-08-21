@@ -78,8 +78,12 @@ export async function extractReprintPdf({ folderName, neSlipNo, recipientName })
   const fileSets = [];
   for (const f of files) {
     try {
-      const buf = await driveCall(() => downloadDriveFileById({ fileId: f.file_id, folderIds: folders.map((x) => x.folder_id) }));
-      fileSets.push({ filename: f.filename, buf, pages: await extractPageTexts(buf) });
+      // downloadDriveFileById は {buffer, filename, ...} を返す (生Bufferではない — 実機バグ 2026-08-21)。
+      // 送り状PDFは繁忙日に大きくなるため上限も CSV既定20MB から引き上げる
+      const dl = await driveCall(() => downloadDriveFileById({
+        fileId: f.file_id, folderIds: folders.map((x) => x.folder_id), maxBytes: 60 * 1024 * 1024,
+      }));
+      fileSets.push({ filename: f.filename, buf: dl.buffer, pages: await extractPageTexts(dl.buffer) });
     } catch (e) {
       console.warn(`[packing-reprint] ${f.filename} の読込失敗: ${e.message}`);
     }
