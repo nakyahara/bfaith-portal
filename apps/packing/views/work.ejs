@@ -683,6 +683,7 @@
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
       if (body.batchStatus) STATE.batchStatus = body.batchStatus;   // 名前開き直しの交代判定に使う (Codex)
       paused = body.batchStatus === 'paused';
+      if (autoResuming && !paused) { autoPaused = false; autoResuming = false; }   // 自動中断の解除完了
       updatePausedOverlay(body.pauseReason);
       if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
       if (body.batchStatus === 'done') showEndOverlay(true);
@@ -752,9 +753,27 @@
     $('prevBtn').addEventListener('click', goPrev);
 
     // ── 中断 / 再開 ──
+    // ④⑥フォームを開いている間の自動中断 (計測から除外)。中断オーバーレイは出さない。
+    // autoPaused は resume の**サーバー応答まで**維持する (Codexレビュー: 即時クリアすると
+    // 応答までの間に中断オーバーレイがフラッシュ表示され、再オープン時の計測漏れも生む)
+    let autoPaused = false;
+    let autoResuming = false;
+    function autoPauseStart() {
+      if (paused || autoPaused || !worker || STATE.batchStatus !== 'packing') return;
+      autoPaused = true;
+      autoResuming = false;
+      enqueue('pause', null, { reason: '配送変更の入力' });
+    }
+    function autoPauseEnd() {
+      if (!autoPaused || autoResuming) return;
+      // ④→⑥と連続で開くケースがあるため、両方閉じたときだけ再開する
+      if ($('shipOverlay').style.display === 'flex' || $('ruleOverlay').style.display === 'flex') return;
+      autoResuming = true;
+      enqueue('resume', null);
+    }
     function updatePausedOverlay(reason) {
-      $('pausedOverlay').style.display = paused ? 'flex' : 'none';
-      if (paused) $('pausedReason').textContent = reason ? `(${reason})` : '';
+      $('pausedOverlay').style.display = (paused && !autoPaused) ? 'flex' : 'none';
+      if (paused && !autoPaused) $('pausedReason').textContent = reason ? `(${reason})` : '';
     }
     $('pauseBtn').addEventListener('click', () => {
       if (paused || currentSeq == null || !worker) return;
@@ -1040,6 +1059,7 @@
       $('shipStep1').style.display = 'block';
       $('shipStep2').style.display = 'none';
       $('shipOverlay').style.display = 'flex';
+      autoPauseStart();
       document.querySelectorAll('.ship-method').forEach((btn) => {
         btn.addEventListener('click', () => {
           shipProposed = btn.dataset.m;
@@ -1048,7 +1068,7 @@
         });
       });
     });
-    $('shipCancel').addEventListener('click', () => { $('shipOverlay').style.display = 'none'; });
+    $('shipCancel').addEventListener('click', () => { $('shipOverlay').style.display = 'none'; autoPauseEnd(); });
     document.querySelectorAll('.ship-reason').forEach((btn) => {
       btn.addEventListener('click', () => {
         $('shipOverlay').style.display = 'none';
@@ -1060,6 +1080,8 @@
         setTimeout(() => {
           if (confirm('この商品構成の「恒久ルール」も変更申請しますか?\n(承認されると次回から自動でその配送方法になります)')) {
             openRuleOverlay();
+          } else {
+            autoPauseEnd();
           }
         }, 50);
       });
@@ -1089,6 +1111,7 @@
       $('rulePreview').textContent = '';
       $('ruleSubmit').disabled = true;
       $('ruleOverlay').style.display = 'flex';
+      autoPauseStart();
       let opt;
       let cur;
       try {
@@ -1193,7 +1216,7 @@
         });
       });
     }
-    $('ruleCancel').addEventListener('click', () => { $('ruleOverlay').style.display = 'none'; });
+    $('ruleCancel').addEventListener('click', () => { $('ruleOverlay').style.display = 'none'; autoPauseEnd(); });
     $('ruleSubmit').addEventListener('click', async () => {
       if (!ruleCtx || !ruleCtx.choice) return;
       $('ruleSubmit').disabled = true;
@@ -1222,6 +1245,7 @@
         const rb = await res.json().catch(() => ({}));
         if (!res.ok) { showToast(rb.error || `申請に失敗しました (${res.status})`); return; }
         $('ruleOverlay').style.display = 'none';
+        autoPauseEnd();
         showToast(rb.cardPosted
           ? `承認依頼 #${rb.id} を送信しました (GChatの承認カードから反映されます)`
           : `承認依頼 #${rb.id} を受け付けました (⚠GChatカードの投稿に失敗 — 管理者に連絡してください)`);

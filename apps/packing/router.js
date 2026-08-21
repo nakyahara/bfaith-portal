@@ -266,7 +266,7 @@ router.get('/work/:id(\\d+)', (req, res) => {
     state,
     hikiateClass,
     warnLabels: WARN_LABELS,
-    pauseReasons: PAUSE_REASONS,
+    pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 自動中断専用の理由は手動メニューに出さない
     undoReasons: UNDO_REASONS,
     shipChangeReasons: SHIP_CHANGE_REASONS,
     // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
