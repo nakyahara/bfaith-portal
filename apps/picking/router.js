@@ -23,7 +23,7 @@ import {
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
-  getPickingStats, getTodayProgress, STATS_WINDOW_DAYS, STATS_MIN_DATE,
+  getPickingStats, getTodayProgress, getMissStats, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
 import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert } from './service.js';
 import { notifyShortage } from './notify.js';
@@ -639,6 +639,7 @@ router.get('/admin/stats', requireAdmin, (req, res) => {
     displayName: req.session.displayName,
     isAdmin: true,
     stats: getPickingStats({ until, days: parseDays(req.query.days) }),
+    miss: getMissStats({ until, days: parseDays(req.query.days) }),
     minDate: STATS_MIN_DATE,
   });
 });
