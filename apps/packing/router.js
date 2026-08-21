@@ -374,6 +374,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         try {
           const r = await extractReprintPdf({
             folderName: row.folder_name, neSlipNo: row.ne_slip_no, recipientName: row.recipient_name,
+            slipSeq: row.slip_seq, slipCount: getPackBatch(row.batch_id)?.slip_count ?? null,
           });
           const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=? WHERE id=?').run(r.token, row.id);

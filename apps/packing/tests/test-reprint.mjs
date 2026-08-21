@@ -12,7 +12,7 @@ delete process.env.PACKING_REPRINT_WEBHOOK;
 
 const { initPackingDB, getDB, utcNow } = await import('../db.js');
 const { applyEvent, PackError } = await import('../service.js');
-const { findLabelPageAcross } = await import('../reprint-pdf.js');
+const { findLabelPageAcross, decideLabelPage } = await import('../reprint-pdf.js');
 const { notifyReprint } = await import('../notify.js');
 
 let failed = 0;
@@ -73,6 +73,24 @@ console.log('\n── 通知 (webhook未設定はfalse) ──');
 {
   const sent = await notifyReprint({ folderName: '出荷_02', slipSeq: 1, neSlipNo: '1507800', worker: '大場' });
   eq(sent, false, 'PACKING_REPRINT_WEBHOOK未設定は送らずfalse');
+}
+
+console.log('\n[decideLabelPage: 位置対応フォールバック (AES=テキスト層なし)]');
+{
+  const imgOnly = [{ filename: 'AES送り状_並び替え済.pdf', pages: ['', '', '', '', '', '', '', '', ''] }];
+  eq(decideLabelPage(imgOnly, { neSlipNo: '1532160', recipientName: '永寿', slipSeq: 8, slipCount: 9 }),
+    { file: 0, page: 7, by: 'position' }, '並び替え済+件数一致 → 伝票seq=ページ位置');
+  eq(decideLabelPage(imgOnly, { neSlipNo: '1532160', recipientName: '永寿', slipSeq: 8, slipCount: 10 }),
+    null, 'ページ数≠伝票数 (欠けあり) は位置対応しない');
+  eq(decideLabelPage([{ filename: 'ネコポス送り状.pdf', pages: ['', '', ''] }],
+    { neSlipNo: '1', recipientName: 'x', slipSeq: 2, slipCount: 3 }),
+    null, '並び替え済以外 (順序保証なし) は位置対応しない');
+  eq(decideLabelPage(imgOnly, { neSlipNo: '1532160', recipientName: '永寿', slipSeq: null, slipCount: 9 }),
+    null, 'slipSeq無しは不発動');
+  // テキスト照合が効く場合はそちらが優先
+  eq(decideLabelPage([{ filename: 'AES送り状_並び替え済.pdf', pages: ['a 1532160 b', '', ''] }],
+    { neSlipNo: '1532160', recipientName: '', slipSeq: 3, slipCount: 3 }),
+    { file: 0, page: 0, by: 'slip_no' }, 'テキスト一致が優先');
 }
 
 db.close();

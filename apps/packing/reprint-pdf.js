@@ -64,10 +64,27 @@ export function findLabelPageAcross(fileSets, { neSlipNo, recipientName }) {
 }
 
 /**
+ * 該当ページの決定 (純関数・テスト対象)。テキスト照合 → 位置対応フォールバックの順。
+ * 位置対応は「AES送り状_並び替え済」(並び替えツールが**納品書順**で出力・照合できたページのみ)
+ * かつ **ページ数=バッチ伝票数が完全一致** のときだけ (欠けがあると位置がズレるため fail-closed)。
+ * AESの送り状は画像のみでテキスト層が無い (実測 2026-08-21) — 位置対応が唯一の手段
+ */
+export function decideLabelPage(fileSets, { neSlipNo, recipientName, slipSeq = null, slipCount = null }) {
+  const hit = findLabelPageAcross(fileSets, { neSlipNo, recipientName });
+  if (hit) return hit;
+  const si = fileSets.findIndex((f) => String(f.filename || '').includes('並び替え済'));
+  if (si >= 0 && Number.isInteger(slipSeq) && Number.isInteger(slipCount)
+    && fileSets[si].pages.length === slipCount && slipSeq >= 1 && slipSeq <= slipCount) {
+    return { file: si, page: slipSeq - 1, by: 'position' };
+  }
+  return null;
+}
+
+/**
  * 出荷フォルダの送り状PDFから該当ページを抜き出して配信トークンを返す。
  * 特定できない・失敗は throw (呼び出し側が握って「手動で印刷して」通知にする)。
  */
-export async function extractReprintPdf({ folderName, neSlipNo, recipientName }) {
+export async function extractReprintPdf({ folderName, neSlipNo, recipientName, slipSeq = null, slipCount = null }) {
   const folders = (await getShippingFolders()).filter((f) => f.name === folderName);
   if (folders.length === 0) throw new Error(`Driveフォルダ ${folderName} が見つかりません`);
   const files = (await driveCall(() => listDriveFilesAcross({ folders, nameContains: '送り状' })))
@@ -89,8 +106,8 @@ export async function extractReprintPdf({ folderName, neSlipNo, recipientName })
     }
   }
   if (fileSets.length === 0) throw new Error('送り状PDFを読み込めませんでした');
-  const hit = findLabelPageAcross(fileSets, { neSlipNo, recipientName });
-  if (!hit) throw new Error('該当ページを一意に特定できません (0件または複数一致)');
+  const hit = decideLabelPage(fileSets, { neSlipNo, recipientName, slipSeq, slipCount });
+  if (!hit) throw new Error('該当ページを一意に特定できません (テキスト0件/複数一致・位置対応も条件不成立)');
   const src = await PDFDocument.load(fileSets[hit.file].buf);
   const out = await PDFDocument.create();
   const [page] = await out.copyPages(src, [hit.page]);
