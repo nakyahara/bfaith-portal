@@ -185,6 +185,9 @@
           <div style="grid-column: 1 / -1; color:#868e96">作業者が未登録です。<br>ピッキングの端末・作業者管理から追加してください</div>
         <% } %>
       </div>
+      <div style="text-align:center">
+        <button type="button" id="workerCancel" style="display:none; margin-top:12px; padding:10px 24px; border:none; background:none; color:#868e96; font-size:15px">そのまま (閉じる)</button>
+      </div>
     </div>
   </div>
 
@@ -636,6 +639,7 @@
       }
       if (body.lastDoneSeq !== undefined) lastDoneSeq = body.lastDoneSeq;
       if (body.worker) { worker = body.worker; $('workerTag').textContent = `👤 ${worker}`; }
+      if (body.batchStatus) STATE.batchStatus = body.batchStatus;   // 名前開き直しの交代判定に使う (Codex)
       paused = body.batchStatus === 'paused';
       updatePausedOverlay(body.pauseReason);
       if (viewSeq == null) viewSeq = currentSeq ?? STATE.slips.length;
@@ -1190,6 +1194,7 @@
       worker = name;
       $('workerTag').textContent = `👤 ${worker}`;
       $('workerOverlay').style.display = 'none';
+      $('workerCancel').style.display = 'none';
       const inProgress = STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused';
       if (inProgress && prevWorker && prevWorker !== name) {
         enqueue('takeover', null);   // 交代の記録 (無断で元担当を名乗らない — Codex R1 high)
@@ -1199,12 +1204,28 @@
         updatePausedOverlay(STATE.pauseReason);
       } else {
         enqueue('start', null);
+        STATE.batchStatus = 'packing';   // 楽観更新 — 直後に名前を開き直しても交代 (takeover) 経路に乗る
       }
       viewSeq = currentSeq ?? 1;
       // 名前タップ=ユーザー操作なので、ここでの発声がブラウザの自動再生制限の有効化を兼ねる (要件§5.3)
       lastSpokenSeq = null;
       render();
     }
+
+    // 作業中の担当変更 (中原さん指示 2026-08-21: 最初に選び間違えても後で直せるように)。
+    // 上部の「👤名前」タップで選択画面を開き直す。別名を選ぶと takeover として記録される
+    $('workerTag').style.cursor = 'pointer';
+    $('workerTag').style.textDecoration = 'underline';
+    $('workerTag').addEventListener('click', () => {
+      if (!worker) return;
+      $('workerHint').textContent = `現在の担当: ${worker} — 選び間違い・交代のときは正しい名前をタップ (交代として記録されます)`;
+      $('workerCancel').style.display = 'inline-block';
+      $('workerOverlay').style.display = 'flex';
+    });
+    $('workerCancel').addEventListener('click', () => {
+      $('workerOverlay').style.display = 'none';
+      $('workerCancel').style.display = 'none';
+    });
 
     document.querySelectorAll('.worker-opt').forEach((btn) => {
       btn.addEventListener('click', () => begin(btn.dataset.name));
