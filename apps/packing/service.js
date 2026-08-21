@@ -1413,6 +1413,22 @@ export function listIncidents(batchId, status = null) {
  *   withdraw = 取下げ (出てきた・誤記録)。作業中でも可。対象伝票に他の候補が無ければ保留も解除
  * @returns {{...inc, dispatchedTasks: [{kind, sku, name, qty, folder, slipSeq}]}}
  */
+/** 商品コード→ロジザード商品名 (picking pk_lines 参照のみ・最新行)。無ければ null。 */
+function logizardNameOf(db, sku) {
+  try {
+    // 通常取込行のみ参照 (Codex: 再ピックバッチ自身の行を拾うと、フォールバックした
+    // 納品書名が次回から「ロジザード名」と誤認されるループになる)
+    return db.prepare(`
+      SELECT l.product_name FROM pk_lines l
+      JOIN pk_batches b ON b.id = l.batch_id
+      WHERE l.sku = ? AND l.product_name IS NOT NULL AND b.origin != 'repick'
+      ORDER BY l.rowid DESC LIMIT 1
+    `).get(sku)?.product_name ?? null;
+  } catch {
+    return null;   // picking未初期化環境
+  }
+}
+
 export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null } = {}) {
   if (!['confirm', 'withdraw'].includes(decision)) {
     throw new PackError(400, 'bad_decision', 'decision が不正です');
@@ -1461,17 +1477,22 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
           ? db.prepare('SELECT worker FROM pk_batches WHERE id = ?').get(batch.pk_batch_id)?.worker ?? null
           : null;
       } catch { attributed = null; }
-      // 種別に応じてタスクを発行 (ここが「ピッキングへの送信」)
-      const name = inc.slip_seq != null
-        ? (slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.print_name
-          ?? slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.product_name ?? null)
-        : null;
+      // 種別に応じてタスクを発行 (ここが「ピッキングへの送信」)。
+      // 商品名は商品コード→ロジザード商品名 (picking pk_lines参照 = 通常ピッキングと同じ表記)。
+      // NEの印字商品名はセット表記 (「10本入り【1個】…」) で個数が誤読されるため使わない
+      // (中原さん指示 2026-08-21)。picking側に無いSKUのみ納品書の名前へフォールバック
+      const name = logizardNameOf(db, inc.sku)
+        ?? (inc.slip_seq != null
+          ? (slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.print_name
+            ?? slipLineOf(db, inc.batch_id, inc.slip_seq, inc.sku)?.product_name ?? null)
+          : null);
       if (inc.kind === 'shortage' || inc.kind === 'wrong_item') {
         insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'repick', sku: inc.sku, productName: name, qty: inc.qty, incidentId: inc.id }, actor, now);
         dispatchedTasks.push({ kind: 'repick', sku: inc.sku, name, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
       if (inc.kind === 'wrong_item') {
-        const aName = actualName ? String(actualName).slice(0, 120) : null;
+        const aName = (actualName ? String(actualName).slice(0, 120) : null)
+          ?? logizardNameOf(db, inc.actual_sku);
         insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.actual_sku, productName: aName, qty: inc.qty, incidentId: inc.id }, actor, now);
         dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, name: aName, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
