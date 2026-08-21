@@ -205,6 +205,19 @@ console.log('\n── 仕分けと流しの担当者分離 (中原さん指示 2
   eq(db.prepare('SELECT worker FROM pk_pack_batches WHERE id=3').get().worker, '手梱B', '手梱包の交代はtakeoverで');
 }
 
+console.log('\n[完了後の担当修正 (2026-08-21)]');
+{
+  // ライン: batch 8 は完了済み (流し=交代C)。完了後の takeover で流し担当を修正できる
+  ev(8, 'takeover', {}, '修正D');
+  eq(db.prepare('SELECT worker FROM pk_pack_batches WHERE id=8').get().worker, '修正D', '完了後もbatch担当を修正できる');
+  eq(listLineRuns(8).find((r) => r.phase === 'run').worker, '修正D', '流し担当も修正される');
+  eq(listLineRuns(8).find((r) => r.phase === 'sort').worker, '仕分A', '仕分け担当は変えない');
+  // 手梱包: batch 3 を done にして修正
+  db.prepare("UPDATE pk_pack_batches SET status='done' WHERE id=3").run();
+  ev(3, 'takeover', {}, '手梱C');
+  eq(db.prepare('SELECT worker FROM pk_pack_batches WHERE id=3').get().worker, '手梱C', '手梱包も完了後に修正できる');
+}
+
 console.log('\n── replay ──');
 {
   const opId = `t${++op}`;

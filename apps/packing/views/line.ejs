@@ -118,6 +118,8 @@
           出荷完了 <b><%= run.final_count %></b> 件 (予定 <%= run.planned_count %> 件・うち手動 <%= run.manual_count || 0 %> 件)
           <% if (run.worker) { %> / 👤 流し: <%= run.worker %><% } %>
           <% if (run.note) { %> / 備考: <%= run.note %><% } %>
+          <div style="margin-top:6px"><button type="button" style="border:none; background:none; color:#1a73e8; text-decoration:underline; font-size:.9rem"
+            onclick="if (confirm('上の「作業者」で選んだ人を流し担当に修正します。よろしいですか?')) send('takeover')">担当を修正 (作業者欄で選んでから)</button></div>
         </div>
       <% } else if (!run) { %>
         <% if (kind === 'melt' && !sort?.finished_at) { %>
