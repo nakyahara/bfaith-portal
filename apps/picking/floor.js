@@ -161,7 +161,7 @@ export function pickOverallEta(groups) {
 function buildFlow(db, workDate, packBatches) {
   const picks = db.prepare(`
     SELECT id, status FROM pk_batches
-    WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+    WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled' AND origin != 'repick'
   `).all(workDate);
   const pickIds = new Set(picks.map((p) => p.id));
   const packByPick = new Map();
@@ -208,7 +208,7 @@ function buildAlerts(db, workDate, packBatches, nowMs, max = 6) {
   const alerts = [];
   const pausedPicks = db.prepare(`
     SELECT id, folder_name FROM pk_batches
-    WHERE work_date = ? AND validity = 'valid' AND status = 'paused'
+    WHERE work_date = ? AND validity = 'valid' AND status = 'paused' AND origin != 'repick'
   `).all(workDate);
   for (const b of pausedPicks) {
     const min = pausedMinutes(db, 'pk_events', b.id, nowMs);

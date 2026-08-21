@@ -102,7 +102,12 @@
     <% for (const b of batches) { %>
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
-          <div class="card-title"><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
+          <div class="card-title"><%= b.origin === 'repick' ? '🔴' : '' %><%= b.folder_name || '' %> <%= b.hikiate_class %></div>
+          <% if (b.origin === 'repick') { %>
+            <div style="font-size:.85rem; color:#c5221f; font-weight:600;">
+              依頼元 <%= b.origin_ref || '-' %> / 依頼: <%= b.requested_by || '-' %> (計測対象外)
+            </div>
+          <% } %>
           <div class="card-meta">
             <span>明細 <b><%= b.line_count %></b></span>
             <span>数量 <b><%= b.total_qty %></b></span>

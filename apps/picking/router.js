@@ -25,6 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
+import { reconcileRepickBatches } from './service.js';
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
@@ -204,6 +205,7 @@ function api(handler) {
 // ─── バッチ一覧 (セッション or 登録端末) ───
 router.get('/', async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  reconcileRepickBatches();   // 梱包側で取消されたピッキング漏れバッチを畳む (fail-soft)
   const batches = listBatches(workDate)
     .filter((b) => b.status !== 'cancelled' || b.work_date === workDate);
   let openTasks = 0;
@@ -351,7 +353,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   if (!result.replayed && result.transition) {
     enqueueBatchSync(batchId, () => {
       const b = getBatch(batchId);
-      if (!b) return null;
+      if (!b || b.origin === 'repick') return null;   // ピッキング漏れはNotionカードを持たない
       const activeSec = b.started_at && b.finished_at
         ? Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0))
         : null;
@@ -369,6 +371,39 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         },
       };
     });
+  }
+  // 🔴ピッキング漏れバッチ → 梱包タスクの状態同期 (fail-soft・トランザクション外)。
+  // 開始=対応中 (claim) / 完了=持って行った (fulfill→梱包画面の「再ピック届いた」表示へ) /
+  // 欠品=在庫なしエスカレーション (unavailable)。
+  // replay でも実行する (Codexレビュー: 同期の一時失敗後、同一op_id再送で収束させる。
+  // 各アクションは遷移ガードつきで二重適用は失敗ログ止まり=無害)
+  {
+    const b = getBatch(batchId);
+    if (b?.origin === 'repick' && b.pack_task_id) {
+      const psvc = await packingSvc();
+      if (psvc) {
+        const act = (action) => {
+          try { return psvc.applyTaskAction(b.pack_task_id, action, worker.name); }
+          catch (e) {
+            console.warn(`[picking] 漏れバッチのタスク同期 (${action}) 失敗 (task=${b.pack_task_id}): ${e.message}`);
+            return null;
+          }
+        };
+        if (req.body.event === 'start') act('claim');
+        if (req.body.event === 'shortage') {
+          const t = act('unavailable');
+          if (t?._notifyUnavailable) {
+            import('../packing/notify.js')
+              .then(({ notifyTaskUnavailable }) => notifyTaskUnavailable(t, worker.name))
+              .catch((e) => console.warn(`[picking] 在庫なし通知失敗: ${e.message}`));
+          }
+        }
+        if (b.status === 'done') {
+          act('claim');   // 開始同期が漏れていた場合の追いつき (claimed済みは失敗ログのみ=無害)
+          act('fulfill');
+        }
+      }
+    }
   }
   res.json({ ok: true, ...result });
 }));

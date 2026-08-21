@@ -476,6 +476,19 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
     if (batch.validity !== 'valid' || batch.status === 'cancelled') {
       throw new PkError(409, 'batch_invalid', 'このバッチは取消されています');
     }
+    // 🔴ピッキング漏れバッチ: 梱包側でタスクが取下げられていたら操作させず、その場で畳む
+    // (一覧のreconcileを経ずに /work を直接開いている端末への即時ガード — Codexレビュー)
+    if (batch.origin === 'repick' && batch.pack_task_id && batch.status !== 'done') {
+      let ts = null;
+      try {
+        ts = db.prepare('SELECT status FROM pk_pack_tasks WHERE id = ?').get(batch.pack_task_id)?.status ?? null;
+      } catch { ts = null; }   // pk_pack_tasks が無い環境は無視
+      if (ts === 'cancelled') {
+        // ここで UPDATE しても throw でトランザクションごとロールバックされる (Codex 2巡目)。
+        // 操作は409で拒否し、実際の取消は一覧表示時の reconcileRepickBatches が行う
+        throw new PkError(409, 'repick_cancelled', 'この再ピック依頼は梱包側で取下げられました (一覧に戻ると整理されます)');
+      }
+    }
 
     let transition = null;   // started / completed / reopened (Notion連携のトリガ)
     if (event === 'takeover') {
@@ -655,6 +668,7 @@ export function getDailySummary(workDate) {
   const batches = db.prepare(`
     SELECT * FROM pk_batches
     WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+      AND origin != 'repick'   -- 🔴ピッキング漏れは計測対象外 (中原さん指示 2026-08-21)
     ORDER BY id
   `).all(workDate);
 
@@ -779,6 +793,7 @@ function loadStatsLines(since, until) {
     JOIN pk_batches b ON b.id = l.batch_id
     WHERE b.work_date >= ? AND b.work_date <= ?
       AND b.validity = 'valid' AND b.status = 'done'
+      AND b.origin != 'repick'
       AND l.shown_at IS NOT NULL AND l.done_at IS NOT NULL
   `).all(since, until);
 }
@@ -981,12 +996,14 @@ export function getTodayProgress(workDate = jstToday()) {
     SELECT id, status, worker, hikiate_class, folder_name, line_count, started_at, finished_at, paused_total_sec
     FROM pk_batches
     WHERE work_date = ? AND validity = 'valid' AND status != 'cancelled'
+      AND origin != 'repick'
     ORDER BY id
   `).all(workDate);
 
   const doneLines = db.prepare(`
     SELECT COUNT(*) AS n FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
-    WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled' AND l.status != 'pending'
+    WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND b.origin != 'repick' AND l.status != 'pending'
   `).get(workDate).n;
 
   const totalLines = batches.reduce((s, b) => s + b.line_count, 0);
@@ -1018,4 +1035,75 @@ export function getTodayProgress(workDate = jstToday()) {
     secPerLine: doneLineCount > 0 ? activeSec / doneLineCount : null,
     active,
   };
+}
+
+// ═══ 🔴ピッキング漏れバッチ (2026-08-21 中原さん指示) ═══════════════════════
+// 梱包からの再ピック依頼 (不足・品違い — pk_pack_tasks kind='repick') を、タスク一覧では
+// なく通常のピッキングバッチとして生成する。ロケ・依頼元 (出荷_XX #伝票)・依頼者を表示し、
+// 普段のピッキング画面で消化する。origin='repick' は計測 (サマリ/統計/ボード/フロア) の対象外。
+
+/**
+ * 再ピックタスク → ピッキング漏れバッチを生成 (タスク1つ=バッチ1つ・tb_no で冪等)。
+ * pk_batches / pk_lines は picking 所有のため、packing からはこの関数を呼ぶ (要件§7.1)。
+ * @param task pk_pack_tasks の行 (id/sku/product_name/req_qty/location/block/folder_name/slip_seq/requested_by)
+ */
+export function createRepickBatch(task) {
+  const db = getDB();
+  const now = utcNow();
+  const tbNo = `REPICK-${task.id}`;
+  return db.transaction(() => {
+    const existing = db.prepare('SELECT id FROM pk_batches WHERE tb_no = ?').get(tbNo);
+    if (existing) return { batchId: existing.id, existed: true };
+    const originRef = `${task.folder_name || '-'}${task.slip_seq ? ` #${task.slip_seq}` : ''}`;
+    // folder_name は入れない (Notionカード・shipping-log 突合を誤爆させない)。依頼元は origin_ref
+    const info = db.prepare(`
+      INSERT INTO pk_batches (tb_no, hikiate_class, folder_name, work_date, instruct_date, composition,
+        delivery_method, invoice_soft, line_count, slip_count, total_qty, status, validity,
+        csv_sha256, imported_by, created_at, updated_at, origin, origin_ref, requested_by, pack_task_id)
+      VALUES (?, 'ピッキング漏れ', NULL, ?, NULL, '単品', NULL, NULL, 1, 1, ?, 'ready', 'valid',
+        ?, ?, ?, ?, 'repick', ?, ?, ?)
+    `).run(tbNo, jstToday(), task.req_qty, `repick-task-${task.id}`,
+      task.requested_by || 'packing', now, now, originRef, task.requested_by || null, task.id);
+    const batchId = Number(info.lastInsertRowid);
+    db.prepare(`
+      INSERT INTO pk_lines (batch_id, seq, location, block, sku, product_name, barcode, qty)
+      VALUES (?, 1, ?, ?, ?, ?, NULL, ?)
+    `).run(batchId, task.location || '', task.block || null, task.sku, task.product_name || null, task.req_qty);
+    return { batchId, existed: false };
+  })();
+}
+
+/**
+ * ピッキング漏れバッチと梱包タスクの整合回復 (一覧表示のたびに軽く同期)。
+ * 梱包側でタスクが取消 (バッチ取消・「出てきた」取下げ) されたら、未着手/作業中の
+ * 漏れバッチも取消する。pk_pack_tasks は参照のみ (packing 所有)。
+ */
+export function reconcileRepickBatches() {
+  const db = getDB();
+  try {
+    // ①梱包側で取消されたタスクのバッチを畳む
+    const rows = db.prepare(`
+      SELECT b.id FROM pk_batches b JOIN pk_pack_tasks t ON t.id = b.pack_task_id
+      WHERE b.origin = 'repick' AND b.validity = 'valid'
+        AND b.status IN ('ready','picking','paused') AND t.status = 'cancelled'
+    `).all();
+    const now = utcNow();
+    for (const r of rows) {
+      db.prepare("UPDATE pk_batches SET status='cancelled', validity='invalid', updated_at=? WHERE id=?")
+        .run(now, r.id);
+    }
+    // ②バッチ未生成の再ピックタスクを拾って生成 (Codexレビュー: resolve時の生成が
+    // 一時障害で失敗しても、一覧を開くたびにここで必ず収束する。tb_no冪等)
+    const missing = db.prepare(`
+      SELECT t.* FROM pk_pack_tasks t
+      WHERE t.kind = 'repick' AND t.status IN ('requested','claimed')
+        AND NOT EXISTS (SELECT 1 FROM pk_batches b WHERE b.pack_task_id = t.id)
+    `).all();
+    for (const t of missing) {
+      try { createRepickBatch(t); } catch (e) { console.warn(`[picking] 漏れバッチ再生成失敗 (task=${t.id}): ${e.message}`); }
+    }
+    return rows.length + missing.length;
+  } catch {
+    return 0;   // pk_pack_tasks が無い環境 (packing無効・テスト) では何もしない
+  }
 }

@@ -66,8 +66,14 @@ export async function notifyTask(info, worker) {
     `商品: *${info.sku}*${info.name ? ` (${info.name})` : ''} × ${info.qty}個`,
   ];
   if (info.actualSku) lines.push(`間違って入っていた: ${info.actualSku}`);
+  if (info.locationLabel) lines.push(`ロケ: ${info.locationLabel}`);
   lines.push(`依頼元: ${info.folder || '-'}${info.slipSeq ? ` #${info.slipSeq}` : ''} / 依頼: ${worker}`);
-  lines.push('ピッキングのタスク画面: https://picking.bfaith-wh.uk/apps/picking/tasks');
+  if (info.kind === 'repick' && info.repickBatchId) {
+    lines.push('📦 ピッキング一覧に「🔴ピッキング漏れ」バッチを作成しました (計測対象外): https://picking.bfaith-wh.uk/apps/picking/');
+  } else {
+    lines.push('ピッキングのタスク画面: https://picking.bfaith-wh.uk/apps/picking/tasks');
+  }
+  if (info.stockText) lines.push(info.stockText);   // 棚戻し: 在庫ロケーション (戻し先の参考)
   return postTask(lines.join('\n'));
 }
 
