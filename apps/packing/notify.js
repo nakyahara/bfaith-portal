@@ -84,3 +84,44 @@ export async function notifyTaskUnavailable(task, worker) {
     `報告: ${worker}`,
   ].join('\n'));
 }
+
+// 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示)。env: PACKING_REPRINT_WEBHOOK (バックオフィス連絡)。
+// 通知はチャネル・DB (pk_pack_reprints) が正本。PDFリンクは抜き出せたときのみ付く
+export async function notifyReprint({ folderName, slipSeq, neSlipNo, siteOrderNo, recipientName, worker, lines = [], pdfUrl = null, pdfError = null }) {
+  const url = process.env.PACKING_REPRINT_WEBHOOK;
+  if (!url) {
+    console.warn('[packing-notify] PACKING_REPRINT_WEBHOOK 未設定 → 再印刷通知なし');
+    return false;
+  }
+  const text = [
+    '🖨 *伝票の再印刷をお願いします*',
+    `NE伝票番号: *${neSlipNo}* / モール伝票番号: ${siteOrderNo || '-'}`,
+    `出荷NO: ${folderName || '-'}${slipSeq ? ` #${slipSeq}` : ''} / 送り先: ${recipientName || '-'} / 依頼: ${worker}`,
+    ...lines.map((l) => `・${l.name || l.sku} × ${l.qty}個`),
+    pdfUrl ? `📄 送り状PDF (該当ページのみ): ${pdfUrl}`
+      : pdfError ? `⚠ 送り状PDFの自動抜き出しはできませんでした (${pdfError}) — フォルダから該当分を印刷してください`
+        : '📄 送り状PDFを抜き出し中です (できたらこのスペースに追送します)',
+  ].join('\n');
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}
+
+/** 再印刷スペースへの追送 (PDFリンク等の短文)。env未設定はfalse。 */
+export async function postReprintText(text) {
+  const url = process.env.PACKING_REPRINT_WEBHOOK;
+  if (!url) return false;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}
