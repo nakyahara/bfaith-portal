@@ -67,6 +67,45 @@ export function getRuleChangeOptions() {
 
 const cap = (v, n) => String(v ?? '').trim().slice(0, n);
 
+/**
+ * 現在の登録の照会 (⑥フォームの「今どう登録されているか」表示用 — 2026-08-21 Codex UX相談)。
+ * 単品 = 全モール×全帯の実在行 (名前解決込み)。アソート = 有効な学習1件 or null。
+ */
+export function getCurrentRules({ kind, items }) {
+  const d = db();
+  if (!['single', 'assort'].includes(kind)) throw vErr('kind が不正です');
+  if (!Array.isArray(items) || items.length === 0 || items.length > 30) throw vErr('明細が不正です');
+  if (kind === 'single') {
+    const code = normProductCode(items[0].sku);
+    const exact = buildSkuKey(items[0].sku, '', '');
+    const keys = d.prepare('SELECT DISTINCT sku_key FROM pd_shipping_rule WHERE product_code = ?')
+      .all(code).map((r) => r.sku_key);
+    if (keys.length === 0) return { kind, registered: false, rows: [] };
+    const skuKey = keys.includes(exact) ? exact : (keys.length === 1 ? keys[0] : null);
+    if (!skuKey) return { kind, registered: true, ambiguous: true, rows: [] };
+    const rows = d.prepare(`
+      SELECT r.mall_group, r.qty_min, r.qty_max, r.shipping_method_code, r.packing_machine_code,
+             m.name_csv AS method_name, p.name_csv AS machine_name
+      FROM pd_shipping_rule r
+      JOIN pd_shipping_method m ON m.code = r.shipping_method_code
+      JOIN pd_packing_machine p ON p.code = r.packing_machine_code
+      WHERE r.sku_key = ?
+      ORDER BY CASE r.mall_group WHEN 'rakuten' THEN 0 WHEN 'yahoo' THEN 1 ELSE 2 END, r.qty_min
+    `).all(skuKey);
+    return { kind, registered: rows.length > 0, skuKey, rows };
+  }
+  const combo = comboKeyOf(items.map((it) => ({ sku_key: buildSkuKey(cap(it?.sku, 80), '', ''), qty: Number(it?.qty) || 1 })));
+  const decision = d.prepare(`
+    SELECT a.shipping_method_code, a.packing_machine_code, a.decided_by, a.decided_at,
+           m.name_csv AS method_name, p.name_csv AS machine_name
+    FROM pd_assort_decision a
+    JOIN pd_shipping_method m ON m.code = a.shipping_method_code
+    JOIN pd_packing_machine p ON p.code = a.packing_machine_code
+    WHERE a.combo_key = ? AND a.is_active = 1 ORDER BY a.id DESC LIMIT 1
+  `).get(combo) || null;
+  return { kind, combo, decision };
+}
+
 /** 単品: 商品ID→sku_key の解決 (バリアントの曖昧さは早期失敗)。 */
 function resolveSingleSkuKey(d, sku, mallGroup) {
   const exact = buildSkuKey(sku, '', '');
@@ -89,7 +128,7 @@ function resolveSingleSkuKey(d, sku, mallGroup) {
  */
 export function createRuleChangeRequest({
   kind, items, mallGroup, qtyMin, qtyMax, shippingMethodCode, packingMachineCode,
-  requestedBy, context,
+  requestedBy, context, expectMethodCode = null, expectMachineCode = null, expectNone = false,
 }) {
   const d = db();
   if (!['single', 'assort'].includes(kind)) throw vErr('kind が不正です');
@@ -141,6 +180,24 @@ export function createRuleChangeRequest({
       WHERE combo_key=? AND is_active=1 ORDER BY id DESC LIMIT 1
     `).get(combo) || null;
     currentJson = JSON.stringify(cur);
+  }
+
+  // 同値申請の拒否 + 画面表示時の現在値との照合 (開いている間に変わっていたら申請させない
+  // — Codex UX相談 2026-08-21。承認時のCASに加えた申請時の早期検知)
+  {
+    const cur = currentJson ? JSON.parse(currentJson) : null;
+    if (cur && cur.shipping_method_code === sm && cur.packing_machine_code === pm) {
+      throw vErr('変更がありません (現在と同じ登録です)');
+    }
+    if (expectNone) {
+      // 画面が「未学習」を表示していた場合の照合 (Codex: 表示後に学習が入っても古い画面から上書きさせない)
+      if (cur) throw vErr('登録が変わっています。フォームを開き直して最新の状態から申請してください');
+    } else if (expectMethodCode != null || expectMachineCode != null) {
+      if ((cur?.shipping_method_code ?? null) !== (cap(expectMethodCode, 40) || null)
+        || (cur?.packing_machine_code ?? null) !== (cap(expectMachineCode, 40) || null)) {
+        throw vErr('登録が変わっています。フォームを開き直して最新の状態から申請してください');
+      }
+    }
   }
 
   // 同一対象の未処理申請は重複拒否 (古い申請が後から最新ルールを上書きしないように)

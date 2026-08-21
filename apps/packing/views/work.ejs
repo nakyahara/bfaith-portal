@@ -242,23 +242,14 @@
   </div>
 
   <div class="overlay" id="ruleOverlay">
-    <div class="box">
+    <div class="box" style="max-width:560px; text-align:left">
       <h2>恒久ルール変更の申請</h2>
-      <div style="color:#868e96; font-size:14px; margin-bottom:10px" id="ruleDesc"></div>
-      <div style="display:grid; grid-template-columns: 110px 1fr; gap:10px; align-items:center; text-align:left">
-        <label>モール</label><select id="ruleMall" class="search-input" style="padding:8px"></select>
-        <label>数量帯</label>
-        <div style="display:flex; gap:8px; align-items:center">
-          <select id="ruleQmin" class="search-input" style="padding:8px; width:90px"></select>
-          <span>〜</span>
-          <select id="ruleQmax" class="search-input" style="padding:8px; width:110px"></select>
-        </div>
-        <label>配送方法</label><select id="ruleMethod" class="search-input" style="padding:8px"></select>
-        <label>梱包機</label><select id="ruleMachine" class="search-input" style="padding:8px"></select>
-      </div>
-      <div style="color:#c92a2a; font-size:13px; margin-top:8px; display:none" id="ruleWarn">梱包機を使う場合、配送方法はネコポスのみ選べます</div>
-      <button class="reason-opt" id="ruleSubmit" type="button" style="width:100%; margin-top:14px; background:#e03131; color:#fff; border:none">承認依頼を送信 (GChatに承認カードが届きます)</button>
-      <button class="sheet-cancel" id="ruleCancel" type="button">やめる</button>
+      <div style="color:#868e96; font-size:14px; margin-bottom:8px" id="ruleDesc"></div>
+      <div id="ruleCurrent"></div>
+      <div id="ruleCombos"></div>
+      <div id="rulePreview" style="margin-top:10px; font-size:16px; font-weight:700"></div>
+      <button class="reason-opt" id="ruleSubmit" type="button" disabled style="width:100%; margin-top:14px; background:#e03131; color:#fff; border:none">この内容で承認依頼を送信</button>
+      <button class="sheet-cancel" id="ruleCancel" type="button" style="width:100%">やめる</button>
     </div>
   </div>
 
@@ -1075,17 +1066,13 @@
     });
 
 
-    // ── ⑥ 恒久ルール変更の申請 (モール/数量帯/配送方法/梱包機をセレクト→GChat承認カード) ──
-    let ruleOptions = null;
+    // ── ⑥ 恒久ルール変更の申請 (現在の登録を表示→実在行を選ぶ→変更後を大ボタンで選択 —
+    //     2026-08-21 中原さん指示+Codex UX相談。帯の当てずっぽう入力を構造的に排除) ──
     let ruleSlipSeq = null;
-    async function loadRuleOptions() {
-      if (ruleOptions) return ruleOptions;
-      const res = await fetch('/apps/packing/api/rule-change/options');
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.error || `選択肢の取得に失敗 (${res.status})`);
-      ruleOptions = body;
-      return body;
-    }
+    let ruleCtx = null;   // { kind, cur, options, selRow, choice }
+    const MALL_LABEL = { rakuten: '楽天', yahoo: 'Yahoo/その他', amazon: 'Amazon' };
+    const bandLabel = (r) => r.qty_max == null ? `${r.qty_min}個以上`
+      : (r.qty_min === r.qty_max ? `${r.qty_min}個` : `${r.qty_min}〜${r.qty_max}個`);
     function guessMall(mallName) {
       const m = String(mallName || '');
       if (m.includes('楽天')) return 'rakuten';
@@ -1095,62 +1082,149 @@
     async function openRuleOverlay() {
       const sl = bySeq.get(viewSeq);
       ruleSlipSeq = viewSeq;
-      let opt;
-      try { opt = await loadRuleOptions(); }
-      catch (e) { showToast(e.message); return; }
-      const totalQty = sl.lines.reduce((a, l) => a + l.qty, 0);
-      $('ruleDesc').textContent = sl.lines.length === 1
-        ? `単品ルール: ${sl.lines[0].name} (この商品×モール×数量帯の配送方法を変更)`
-        : `アソート学習: この${sl.lines.length}種の組み合わせの配送方法を登録`;
-      $('ruleMall').innerHTML = (opt.mallGroups || []).map((m) =>
-        `<option value="${esc(m)}" ${m === guessMall(sl.mall) ? 'selected' : ''}>${esc(m)}</option>`).join('');
-      $('ruleQmin').innerHTML = Array.from({ length: 9 }, (_, i) =>
-        `<option value="${i + 1}" ${i + 1 === totalQty ? 'selected' : ''}>${i + 1}</option>`).join('');
-      $('ruleQmax').innerHTML = ['<option value="">∞ (以上)</option>']
-        .concat(Array.from({ length: 9 }, (_, i) =>
-          `<option value="${i + 1}" ${i + 1 === totalQty ? 'selected' : ''}>${i + 1}</option>`)).join('');
-      $('ruleMethod').innerHTML = (opt.methods || []).map((m) =>
-        `<option value="${esc(m.code)}">${esc(m.name)}</option>`).join('');
-      $('ruleMachine').innerHTML = (opt.machines || []).map((m) =>
-        `<option value="${esc(m.code)}" ${m.code === 'manual' ? 'selected' : ''}>${esc(m.name)}</option>`).join('');
-      // 数量帯セレクトは単品のみ意味を持つ (アソートは組み合わせ単位)
-      $('ruleQmin').disabled = $('ruleQmax').disabled = sl.lines.length > 1;
-      $('ruleWarn').style.display = 'none';
+      ruleCtx = null;
+      $('ruleDesc').textContent = '現在の登録を読み込み中…';
+      $('ruleCurrent').innerHTML = '';
+      $('ruleCombos').innerHTML = '';
+      $('rulePreview').textContent = '';
+      $('ruleSubmit').disabled = true;
       $('ruleOverlay').style.display = 'flex';
+      let opt;
+      let cur;
+      try {
+        [opt, cur] = await Promise.all([
+          fetch('/apps/packing/api/rule-change/options').then((r) => r.json()),
+          fetch(`/apps/packing/api/batches/${STATE.batchId}/rule-current`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slip_seq: viewSeq }),
+          }).then((r) => r.json()),
+        ]);
+        if (opt.error || cur.error) throw new Error(cur.error || opt.error);
+      } catch (e) {
+        $('ruleDesc').textContent = `現在の登録を取得できませんでした: ${e.message}`;
+        return;
+      }
+      ruleCtx = { kind: cur.kind, cur, options: opt, selRow: null, choice: null };
+      const totalQty = sl.lines.reduce((a, l) => a + l.qty, 0);
+      if (cur.kind === 'single') {
+        $('ruleDesc').textContent = `単品ルール: ${sl.lines[0].name}`;
+        if (!cur.registered || cur.ambiguous || !(cur.rows || []).length) {
+          $('ruleCurrent').innerHTML = `<div style="color:#c92a2a; font-size:14px">${cur.ambiguous
+            ? 'この商品はカラー/サイズ違いのルールが複数あり、ここからは変更できません。'
+            : 'この商品の配送ルールは未登録です。'}packing-dispatch画面から操作してください</div>`;
+          return;
+        }
+        const gm = guessMall(sl.mall);
+        const inBand = (r) => r.qty_min <= totalQty && (r.qty_max == null || totalQty <= r.qty_max);
+        const pick = cur.rows.find((r) => r.mall_group === gm && inBand(r))
+          || cur.rows.find((r) => r.mall_group === 'rakuten' && inBand(r))
+          || cur.rows[0];
+        ruleSelectRow(pick, gm);
+      } else {
+        $('ruleDesc').textContent = `アソート学習: この${sl.lines.length}種の組み合わせ`;
+        const d = cur.decision;
+        $('ruleCurrent').innerHTML = `
+          <div style="border:2px solid #dee2e6; border-radius:10px; padding:10px 12px">
+            <div style="font-size:12px; color:#868e96">現在の学習</div>
+            <div style="font-size:17px; font-weight:800">${d ? `${esc(d.method_name)} (${esc(d.machine_name)})` : '未学習 — 今回の申請で新規登録されます'}</div>
+            <div style="font-size:13px; color:#868e96; margin-top:4px">${sl.lines.map((l) => `${esc(l.name)} × ${l.qty}`).join(' / ')}</div>
+          </div>`;
+        renderRuleCombos(d ? { method: d.shipping_method_code, machine: d.packing_machine_code } : null);
+      }
     }
-    function ruleConstraintCheck() {
-      // 「梱包機ならネコポス」制約の先回り表示 (サーバー側でも検証される)
-      const machine = $('ruleMachine').value;
-      const method = $('ruleMethod').value;
-      const bad = machine !== 'manual' && method !== 'nekopos';
-      $('ruleWarn').style.display = bad ? 'block' : 'none';
-      return !bad;
+    function ruleSelectRow(row, gm) {
+      ruleCtx.selRow = row;
+      const others = ruleCtx.cur.rows.length - 1;
+      const fallbackNote = (gm && gm !== row.mall_group)
+        ? `<div style="font-size:13px; color:#c92a2a; margin-top:4px">※ ${esc(MALL_LABEL[gm] || gm)} のモール別登録は無く、楽天の登録が使われています。変更は楽天登録に対して行われます</div>` : '';
+      const rakutenNote = row.mall_group === 'rakuten'
+        ? '<div style="font-size:12px; color:#868e96; margin-top:4px">楽天の登録は、モール別登録が無いモールにも使われます</div>' : '';
+      $('ruleCurrent').innerHTML = `
+        <div style="border:2px solid #1971c2; border-radius:10px; padding:10px 12px">
+          <div style="font-size:12px; color:#868e96">今回該当する登録</div>
+          <div style="font-size:17px; font-weight:800">${esc(MALL_LABEL[row.mall_group] || row.mall_group)} / ${bandLabel(row)} → ${esc(row.method_name)} (${esc(row.machine_name)})</div>
+          ${fallbackNote}${rakutenNote}
+          ${others > 0 ? `<button type="button" id="ruleMore" style="border:none; background:none; color:#1971c2; text-decoration:underline; font-size:13px; margin-top:6px; padding:0">ほかの帯・モールを見る (${others})</button><div id="ruleRows" style="display:none"></div>` : ''}
+        </div>`;
+      if (others > 0) {
+        $('ruleMore').addEventListener('click', () => {
+          const box = $('ruleRows');
+          if (!box.innerHTML) {
+            box.innerHTML = ruleCtx.cur.rows.map((r, i) => `
+              <button type="button" class="rule-row" data-i="${i}" style="display:block; width:100%; text-align:left; padding:12px; margin-top:6px; border:2px solid ${r === ruleCtx.selRow ? '#1971c2' : '#dee2e6'}; border-radius:10px; background:#fff; font-size:14px">
+                ${esc(MALL_LABEL[r.mall_group] || r.mall_group)} / ${bandLabel(r)} → ${esc(r.method_name)} (${esc(r.machine_name)})</button>`).join('');
+            box.querySelectorAll('.rule-row').forEach((btn) => btn.addEventListener('click',
+              () => ruleSelectRow(ruleCtx.cur.rows[Number(btn.dataset.i)], gm)));
+          }
+          box.style.display = box.style.display === 'none' ? 'block' : 'none';
+        });
+      }
+      renderRuleCombos({ method: row.shipping_method_code, machine: row.packing_machine_code });
     }
-    $('ruleMethod').addEventListener('change', ruleConstraintCheck);
-    $('ruleMachine').addEventListener('change', ruleConstraintCheck);
+    function renderRuleCombos(curCombo) {
+      // 有効な組み合わせだけを大ボタンで提示 (梱包機≠手動→ネコポス固定の制約をUIに織り込む)
+      const methods = ruleCtx.options.methods || [];
+      const machines = ruleCtx.options.machines || [];
+      const combos = [
+        ...machines.filter((m) => m.code !== 'manual').map((m) => ({ method: 'nekopos', machine: m.code, label: `ネコポス・${m.name}` })),
+        ...methods.map((mm) => ({ method: mm.code, machine: 'manual', label: `${mm.name}・手動` })),
+      ];
+      ruleCtx.choice = null;
+      $('rulePreview').textContent = '';
+      $('ruleSubmit').disabled = true;
+      $('ruleCombos').innerHTML = '<div style="font-size:12px; color:#868e96; margin:10px 0 4px">変更後を選ぶ</div>'
+        + combos.map((c, i) => {
+          const isCur = curCombo && c.method === curCombo.method && c.machine === curCombo.machine;
+          return `<button type="button" class="rule-combo" data-i="${i}" ${isCur ? 'disabled' : ''}
+            style="min-height:52px; margin:4px 6px 0 0; padding:10px 14px; border-radius:10px; font-size:15px; border:2px solid ${isCur ? '#adb5bd' : '#1971c2'}; background:${isCur ? '#f1f3f5' : '#fff'}; font-weight:700">${esc(c.label)}${isCur ? ' (現在)' : ''}</button>`;
+        }).join('');
+      $('ruleCombos').querySelectorAll('.rule-combo:not([disabled])').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const c = combos[Number(btn.dataset.i)];
+          ruleCtx.choice = c;
+          $('ruleCombos').querySelectorAll('.rule-combo').forEach((b) => {
+            b.style.background = b === btn ? '#e7f5ff' : (b.disabled ? '#f1f3f5' : '#fff');
+          });
+          const curTxt = ruleCtx.kind === 'single'
+            ? `${ruleCtx.selRow.method_name} (${ruleCtx.selRow.machine_name})`
+            : (ruleCtx.cur.decision ? `${ruleCtx.cur.decision.method_name} (${ruleCtx.cur.decision.machine_name})` : '未学習');
+          $('rulePreview').innerHTML = `${esc(curTxt)} → <span style="color:#e03131">${esc(c.label)}</span>`;
+          $('ruleSubmit').disabled = false;
+        });
+      });
+    }
     $('ruleCancel').addEventListener('click', () => { $('ruleOverlay').style.display = 'none'; });
     $('ruleSubmit').addEventListener('click', async () => {
-      if (!ruleConstraintCheck()) { showToast('梱包機を使う場合はネコポスを選んでください'); return; }
+      if (!ruleCtx || !ruleCtx.choice) return;
       $('ruleSubmit').disabled = true;
       try {
+        const body = {
+          slip_seq: ruleSlipSeq,
+          worker_name: worker,
+          shipping_method_code: ruleCtx.choice.method,
+          packing_machine_code: ruleCtx.choice.machine,
+        };
+        if (ruleCtx.kind === 'single') {
+          body.mall_group = ruleCtx.selRow.mall_group;
+          body.qty_min = ruleCtx.selRow.qty_min;
+          body.qty_max = ruleCtx.selRow.qty_max;
+          body.expect_method_code = ruleCtx.selRow.shipping_method_code;
+          body.expect_machine_code = ruleCtx.selRow.packing_machine_code;
+        } else if (ruleCtx.cur.decision) {
+          body.expect_method_code = ruleCtx.cur.decision.shipping_method_code;
+          body.expect_machine_code = ruleCtx.cur.decision.packing_machine_code;
+        } else {
+          body.expect_none = true;   // 「未学習」を見て申請 — 表示後に学習が入っていたら弾く
+        }
         const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/rule-change`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            slip_seq: ruleSlipSeq,
-            worker_name: worker,
-            mall_group: $('ruleMall').value,
-            qty_min: Number($('ruleQmin').value),
-            qty_max: $('ruleQmax').value === '' ? null : Number($('ruleQmax').value),
-            shipping_method_code: $('ruleMethod').value,
-            packing_machine_code: $('ruleMachine').value,
-          }),
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
-        const body = await res.json().catch(() => ({}));
-        if (!res.ok) { showToast(body.error || `申請に失敗しました (${res.status})`); return; }
+        const rb = await res.json().catch(() => ({}));
+        if (!res.ok) { showToast(rb.error || `申請に失敗しました (${res.status})`); return; }
         $('ruleOverlay').style.display = 'none';
-        showToast(body.cardPosted
-          ? `承認依頼 #${body.id} を送信しました (GChatの承認カードから反映されます)`
-          : `承認依頼 #${body.id} を受け付けました (⚠GChatカードの投稿に失敗 — 管理者に連絡してください)`);
+        showToast(rb.cardPosted
+          ? `承認依頼 #${rb.id} を送信しました (GChatの承認カードから反映されます)`
+          : `承認依頼 #${rb.id} を受け付けました (⚠GChatカードの投稿に失敗 — 管理者に連絡してください)`);
       } finally {
         $('ruleSubmit').disabled = false;
       }
