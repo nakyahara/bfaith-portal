@@ -1396,7 +1396,7 @@ export function listIncidents(batchId, status = null) {
  *   withdraw = 取下げ (出てきた・誤記録)。作業中でも可。対象伝票に他の候補が無ければ保留も解除
  * @returns {{...inc, dispatchedTasks: [{kind, sku, name, qty, folder, slipSeq}]}}
  */
-export function resolveIncident(incidentId, decision, actor, expectBatchId = null) {
+export function resolveIncident(incidentId, decision, actor, expectBatchId = null, { actualSku = null, actualName = null } = {}) {
   if (!['confirm', 'withdraw'].includes(decision)) {
     throw new PackError(400, 'bad_decision', 'decision が不正です');
   }
@@ -1428,6 +1428,17 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
         throw new PackError(409, 'batch_not_done',
           '送信は梱包を一通り終えてからできます (途中で出てくることがあるため)。先に残りの伝票を進めてください');
       }
+      // 品違いは「実際に入っていた商品」を特定してから送信 (終了画面の商品検索で指定 —
+      // 中原さん指示 2026-08-21)。特定作業はバッチ完了打刻の後のため梱包計測には入らない
+      if (inc.kind === 'wrong_item') {
+        const sku = String(actualSku ?? inc.actual_sku ?? '').trim();
+        if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してから送信してください');
+        if (sku.length > 80) throw new PackError(400, 'bad_sku', 'SKUが不正です');
+        if (sku !== inc.actual_sku) {
+          db.prepare('UPDATE pk_pack_incidents SET actual_sku=?, updated_at=? WHERE id=?').run(sku, now, incidentId);
+          inc.actual_sku = sku;
+        }
+      }
       try {
         attributed = batch?.pk_batch_id
           ? db.prepare('SELECT worker FROM pk_batches WHERE id = ?').get(batch.pk_batch_id)?.worker ?? null
@@ -1443,8 +1454,9 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
         dispatchedTasks.push({ kind: 'repick', sku: inc.sku, name, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
       if (inc.kind === 'wrong_item') {
-        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.actual_sku, productName: null, qty: inc.qty, incidentId: inc.id }, actor, now);
-        dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
+        const aName = actualName ? String(actualName).slice(0, 120) : null;
+        insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.actual_sku, productName: aName, qty: inc.qty, incidentId: inc.id }, actor, now);
+        dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, name: aName, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
       if (inc.kind === 'excess') {
         insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.sku, productName: null, qty: inc.qty, incidentId: inc.id }, actor, now);

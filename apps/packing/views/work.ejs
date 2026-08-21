@@ -748,6 +748,7 @@
     // ── 終了オーバーレイ (⭐候補方式: 一通り終えたらここからまとめてピッキングへ送信 — 要件§5.6) ──
     const INC_LABEL = { shortage: '📉 不足', excess: '📈 余り', wrong_item: '🔀 品違い' };
     let overlayMode = null;   // 'done' | 'end' | null (表示中の同期反映で使う)
+    const endActual = {};   // 品違いの実物特定 (incidentId → {sku,name})
     function showEndOverlay(done) {
       overlayMode = done ? 'done' : 'end';
       $('doneOverlay').style.display = 'flex';
@@ -761,13 +762,54 @@
       $('incList').innerHTML = incidents.map((i) => {
         const syncing = String(i.id).startsWith('tmp');   // サーバー同期前はIDが仮 (Codex medium)
         const dis = syncing ? 'disabled style="opacity:.5"' : '';
+        // 品違い: 実物 (梱包側にある間違い品) を商品検索で特定してから送信 (2026-08-21)。
+        // この特定作業はバッチ完了打刻の後 = 梱包計測には入らない
+        const chosen = endActual[i.id];
+        const identBlock = i.kind === 'wrong_item' ? `
+          <div style="padding:4px 0 8px; border-bottom:1px solid #f1f3f5; font-size:14px">
+            間違い品の特定: ${chosen
+              ? `<b style="color:#2b8a3e">${esc(chosen.sku)}</b> ${esc(chosen.name || '')}`
+              : (i.actualSku ? `${esc(i.actualSku)} (記録時の入力)` : '<b style="color:#c5221f">未特定 — 検索してください</b>')}
+            <input type="search" class="inc-search" data-id="${i.id}" placeholder="商品名で検索 (例: ひのき)"
+              style="width:100%; margin-top:6px; padding:10px; font-size:15px; border:1px solid #ced4da; border-radius:8px">
+            <div class="inc-search-res" data-id="${i.id}" style="display:flex; flex-direction:column; gap:4px; margin-top:4px"></div>
+          </div>` : '';
         return `
         <div style="display:flex; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid #f1f3f5">
           <span style="flex:1; font-size:15px">${INC_LABEL[i.kind] || i.kind} ${esc(i.sku)}${i.actualSku ? ` (実際: ${esc(i.actualSku)})` : ''} × ${i.qty}${i.slipSeq ? ` / #${i.slipSeq}` : ''}${syncing ? ' <small>同期中…</small>' : ''}</span>
           <button type="button" class="inc-confirm" data-id="${i.id}" ${dis} ${syncing ? '' : 'style="padding:8px 14px; background:#e03131; color:#fff; border:none; border-radius:8px; font-weight:700"'}>ピッキングへ送信</button>
           <button type="button" class="inc-withdraw" data-id="${i.id}" ${dis} ${syncing ? '' : 'style="padding:8px 14px; background:#f1f3f5; border:1px solid #ced4da; border-radius:8px"'}>取下げ</button>
-        </div>`;
+        </div>${identBlock}`;
       }).join('');
+      // 品違いの商品検索 (在庫検索と同じデータ源。300msデバウンス)
+      document.querySelectorAll('.inc-search').forEach((input) => {
+        let timer = null;
+        input.addEventListener('input', () => {
+          clearTimeout(timer);
+          timer = setTimeout(async () => {
+            const q = input.value.trim();
+            const box = document.querySelector(`.inc-search-res[data-id="${input.dataset.id}"]`);
+            if (q.length < 2) { box.innerHTML = ''; return; }
+            try {
+              const res = await fetch(`/apps/packing/api/stock-search?q=${encodeURIComponent(q)}`);
+              const body = await res.json();
+              box.innerHTML = (body.items || []).map((it, idx) =>
+                `<button type="button" class="inc-pick" data-id="${input.dataset.id}" data-idx="${idx}"
+                   style="text-align:left; padding:8px; border:1px solid #ced4da; border-radius:8px; background:#fff">
+                   ${esc(it.name || it.sku)}<br><small>${esc(it.sku)}${it.free != null ? ` / フリー${it.free}` : ''}</small></button>`).join('')
+                || '<small style="color:#868e96">該当なし</small>';
+              box._items = body.items || [];
+              box.querySelectorAll('.inc-pick').forEach((btn) => {
+                btn.addEventListener('click', () => {
+                  const it = box._items[Number(btn.dataset.idx)];
+                  endActual[btn.dataset.id] = { sku: it.sku, name: it.name || null };
+                  showEndOverlay($('endClose').style.display === 'none');
+                });
+              });
+            } catch { box.innerHTML = '<small style="color:#c5221f">検索エラー</small>'; }
+          }, 300);
+        });
+      });
       document.querySelectorAll('.inc-confirm, .inc-withdraw').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const decision = btn.classList.contains('inc-confirm') ? 'confirm' : 'withdraw';
@@ -775,7 +817,9 @@
           try {
             const res = await fetch(`/apps/packing/api/batches/${STATE.batchId}/incidents/${btn.dataset.id}/resolve`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ decision, worker_name: worker }),
+              body: JSON.stringify({ decision, worker_name: worker,
+                actual_sku: endActual[btn.dataset.id]?.sku ?? null,
+                actual_name: endActual[btn.dataset.id]?.name ?? null }),
             });
             if (!res.ok) { const b = await res.json().catch(() => ({})); showToast(b.error || `エラー (${res.status})`); return; }
             if (decision === 'confirm') showToast('ピッキングへ送信しました');

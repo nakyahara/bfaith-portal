@@ -353,12 +353,81 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
     throw new PackError(400, 'no_worker', '作業者を選択してください');
   }
   const decision = String(req.body.decision || '');
-  const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id));
-  // 送信 (confirm) したタスクをGChatへ (fail-soft・DBの行が正本)
-  for (const t of inc.dispatchedTasks || []) {
-    notifyTask(t, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
+  // 品違いの実物SKUはサーバー側で検証 (Codexレビュー: クライアント任意文字列を信用しない)。
+  // 形式チェック+在庫データへの実在照会。名前もサーバー由来のみ採用 (通知への注入防止)
+  let actualSku = req.body.actual_sku == null ? null : String(req.body.actual_sku).trim().toLowerCase();
+  let actualName = null;
+  // 確定時は「実際に使われるSKU」を必ず検証対象にする (保存済み actual_sku での迂回防止 — Codex 2巡目)
+  if (decision === 'confirm' && !actualSku) {
+    const incRow = getDB().prepare('SELECT kind, actual_sku FROM pk_pack_incidents WHERE id=?')
+      .get(Number(req.params.iid));
+    if (incRow?.kind === 'wrong_item' && incRow.actual_sku) {
+      actualSku = String(incRow.actual_sku).trim().toLowerCase();
+    }
+  }
+  if (actualSku) {
+    if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(actualSku)) {
+      throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
+    }
+    try {
+      const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
+      if (stockLookupConfigured()) {
+        const hit = (await fetchStockSearch(actualSku))?.items
+          ?.find((it) => String(it.sku).toLowerCase() === actualSku);
+        if (!hit) throw new PackError(400, 'unknown_sku', 'そのSKUは在庫データに見つかりません。検索から選び直してください');
+        actualName = hit.name || null;
+      }
+    } catch (e) {
+      if (e instanceof PackError) throw e;
+      // 在庫参照の一時障害では形式チェックのみで通す (現場の送信を止めない・fail-soft)
+      console.warn(`[packing] 実物SKUの在庫照会失敗 (形式チェックのみで続行): ${e.message}`);
+    }
+  }
+  const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id), {
+    actualSku, actualName,
+  });
+  // 送信 (confirm) したタスクの後処理 (fail-soft・DBの行が正本):
+  //   再ピック → 🔴ピッキング漏れバッチを生成 (picking所有の書き込みは picking service 経由) + ロケつき通知
+  //   棚戻し → その商品の在庫ロケーション (ロジザード) を通知に載せる (戻し先の参考 — 2026-08-21)
+  if (inc.dispatchedTasks?.length) {
+    const taskRows = getDB().prepare(
+      'SELECT * FROM pk_pack_tasks WHERE incident_id=? ORDER BY id').all(inc.id);
+    let picking = null;
+    try { picking = await import('../picking/service.js'); } catch { /* picking無効環境 */ }
+    let stock = null;
+    try { stock = await import('../picking/stock-locations.js'); } catch { /* 同上 */ }
+    for (const t of taskRows) {
+      const info = { kind: t.kind, sku: t.sku, name: t.product_name, qty: t.req_qty, folder: t.folder_name, slipSeq: t.slip_seq };
+      if (t.kind === 'repick') {
+        try {
+          info.repickBatchId = picking?.createRepickBatch ? picking.createRepickBatch(t).batchId : null;
+        } catch (e) { console.warn(`[packing] ピッキング漏れバッチ作成失敗 (task=${t.id}): ${e.message}`); }
+        if (t.location) info.locationLabel = picking?.formatLocation ? picking.formatLocation(t.block, t.location) : t.location;
+      }
+      if (t.kind === 'return' && stock?.stockLookupConfigured?.()) {
+        try {
+          info.stockText = stock.buildStockLocationsText(
+            await stock.fetchStockLocations(t.sku), { title: '在庫ロケーション (戻し先の参考)' });
+        } catch { /* fail-soft */ }
+      }
+      notifyTask(info, actor).catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${t.sku}): ${e.message}`));
+    }
   }
   res.json({ ok: true, id: inc.id, status: inc.status, attributedWorker: inc.attributed_worker });
+}));
+
+/** 商品検索 (品違いの現物特定用)。在庫検索ボットと同じ warehouse service-api を参照 (fail-soft)。 */
+router.get('/api/stock-search', api(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  if (q.length < 2) return res.json({ ok: true, items: [] });
+  try {
+    const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
+    if (!stockLookupConfigured()) return res.json({ ok: true, items: [], disabled: true });
+    const data = await fetchStockSearch(q);
+    res.json({ ok: true, items: (data?.items || []).slice(0, 10) });
+  } catch (e) {
+    res.json({ ok: true, items: [], error: e.message });
+  }
 }));
 
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */

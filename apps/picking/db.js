@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -148,6 +148,15 @@ const MIGRATIONS = {
   5: () => {
     db.exec(`ALTER TABLE pk_devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'worker'
       CHECK(kind IN ('worker','board'))`);
+  },
+  // v6: 🔴ピッキング漏れバッチ (2026-08-21 中原さん指示)。梱包からの再ピック依頼
+  // (不足・品違い) をタスク一覧ではなく通常のピッキングバッチとして生成する。
+  // origin='repick' は計測 (サマリ/ボード/フロア/Notion) の対象外
+  6: () => {
+    db.exec("ALTER TABLE pk_batches ADD COLUMN origin TEXT NOT NULL DEFAULT 'import'");
+    db.exec('ALTER TABLE pk_batches ADD COLUMN origin_ref TEXT');      // 依頼元 (例: 出荷_02 #95)
+    db.exec('ALTER TABLE pk_batches ADD COLUMN requested_by TEXT');    // 依頼者 (梱包担当)
+    db.exec('ALTER TABLE pk_batches ADD COLUMN pack_task_id INTEGER'); // pk_pack_tasks.id (状態同期キー)
   },
 };
 
