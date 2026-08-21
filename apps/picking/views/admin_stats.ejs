@@ -149,6 +149,49 @@
     </table>
     </div>
 
+    <h2>ピッキングミス (梱包検知・確定分)</h2>
+    <p class="muted" style="font-size:0.85em; margin:0 0 8px">
+      梱包で見つかり「ピッキングへ送信」で確定した 不足 (取り忘れ)・余り・品違い の件数
+      (取下げ=誤検知は除外)。帰責はそのバッチのピッキング担当。
+      <b>⚠欠品 (棚に在庫が無かった) はミスに含めません</b> (上の表の欠品列のまま)。
+      期間: <%= miss.since %> 〜 <%= miss.until %>
+    </p>
+    <div class="scroll-x">
+    <table class="pk-list">
+      <thead>
+        <tr>
+          <th>作業者</th>
+          <th class="num">合計</th><th class="num">不足 (取り忘れ)</th>
+          <th class="num">余り (取りすぎ)</th><th class="num">品違い</th><th class="num">数量計</th>
+        </tr>
+      </thead>
+      <tbody>
+        <% miss.byWorker.forEach((m) => { %>
+          <tr>
+            <td><%= m.worker %></td>
+            <td class="num"><b><%= m.total %></b></td>
+            <td class="num"><%= m.shortage || 0 %></td>
+            <td class="num"><%= m.excess || 0 %></td>
+            <td class="num"><%= m.wrong_item || 0 %></td>
+            <td class="num"><%= m.qty %></td>
+          </tr>
+        <% }) %>
+        <% if (miss.byWorker.length === 0) { %>
+          <tr><td colspan="6" class="muted">この期間の確定ミスはありません 🎉</td></tr>
+        <% } else { %>
+          <tr style="border-top:2px solid #adb5bd">
+            <td><b>合計</b></td>
+            <td class="num"><b><%= miss.total.total %></b></td>
+            <td class="num"><%= miss.total.shortage %></td>
+            <td class="num"><%= miss.total.excess %></td>
+            <td class="num"><%= miss.total.wrong_item %></td>
+            <td class="num"><%= miss.total.qty %></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+    </div>
+
     <h2>引当分類別 × 作業者 ヒートマップ</h2>
     <p class="muted" style="font-size:0.85em; margin:0 0 8px">
       セル = 秒/明細 (下段は明細数)。色は<b>その分類の全体平均との比</b> — 緑=速い / 黄=平均どおり / 赤=遅い。

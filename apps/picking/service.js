@@ -1164,3 +1164,49 @@ export function ackFloorAlert(id, worker, direction) {
   if (n === 0) throw new PkError(404, 'not_found', 'アラートが見つからないか確認済みです');
   return true;
 }
+
+// ═══ ピッキングミス集計 (2026-08-21 中原さん指示: ダッシュボード表示) ═══════════
+// 源泉 = pk_pack_incidents (packing所有・参照のみ)。梱包で検知され「ピッキングへ送信」で
+// 確定 (status='confirmed') したものだけを数える (取下げ=誤検知は除外)。
+// 帰責 = attributed_worker (確定時点のピッキングバッチ担当) — ヒストリカルに保存済み
+
+/**
+ * 期間内のミス集計 (作業者×種別)。
+ * @returns {{ byWorker: [{worker,total,shortage,excess,wrong_item,qty}], total: {...} }}
+ */
+export function getMissStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
+  const db = getDB();
+  const since = new Date(Date.parse(`${until}T00:00:00Z`) - (days - 1) * 864e5).toISOString().slice(0, 10);
+  // created_at は UTC → JST日付境界に変換して窓を切る (統計画面と同じ期間感覚)
+  const startUtc = new Date(`${since}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
+  const endUtc = new Date(new Date(`${until}T00:00:00+09:00`).getTime() + 864e5).toISOString().slice(0, 19) + 'Z';
+  const empty = { total: 0, shortage: 0, excess: 0, wrong_item: 0, qty: 0 };
+  try {
+    const rows = db.prepare(`
+      SELECT COALESCE(attributed_worker, '(担当不明)') AS worker, kind, COUNT(*) AS cnt, SUM(qty) AS qty
+      FROM pk_pack_incidents
+      WHERE status = 'confirmed' AND created_at >= ? AND created_at < ?
+      GROUP BY worker, kind
+    `).all(startUtc, endUtc);
+    const map = new Map();
+    const total = { ...empty };
+    for (const r of rows) {
+      if (!map.has(r.worker)) map.set(r.worker, { worker: r.worker, ...empty });
+      const w = map.get(r.worker);
+      w[r.kind] = (w[r.kind] || 0) + r.cnt;
+      w.total += r.cnt;
+      w.qty += r.qty || 0;
+      total[r.kind] = (total[r.kind] || 0) + r.cnt;
+      total.total += r.cnt;
+      total.qty += r.qty || 0;
+    }
+    return { since, until, byWorker: [...map.values()].sort((a, b) => b.total - a.total), total };
+  } catch (e) {
+    // テーブル未作成 (packing未初期化環境) のみ空扱い。それ以外のDB障害は隠さず投げる
+    // (Codex: 包括catchだと障害時に「ミス0件」という誤った正常値を表示してしまう)
+    if (/no such table: pk_pack_incidents/.test(String(e.message))) {
+      return { since, until, byWorker: [], total: empty };
+    }
+    throw e;
+  }
+}
