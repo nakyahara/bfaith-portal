@@ -2,8 +2,10 @@
  * picking — 出荷フロアボード (floor.js) のテスト。
  *
  * 検証の要点:
- *   - 完了予測 (computeEta): 残0=done / ペース0=measuring / 締切との余裕・超過
- *   - 締切グループ: AESだけ16:00、他は16:30
+ *   - 実働ペース (computeWorkRate): 休憩・段取りで空いた間隔を分母から落とす
+ *   - 完了予測 (computeEta): 残0=done / ペース無し=measuring / 締切との余裕・超過
+ *   - 締切グループ: AESだけ16:00、他は16:30。締切の早い便から順に片付ける前提の積み上げ
+ *   - 梱包機ラインは予測に入れず lineRemaining で別出し
  *   - lineKindOfClass が packing の lineKindOf と同じ判定 (複製のドリフト検知)
  *   - flow: picking+packing の状態から Notionカンバンの5列を導出
  *   - 要対応: 中断バッチ (pause イベントからの経過分)・突合差分・ミス候補
@@ -19,14 +21,15 @@ process.env.PICKING_STATS_MIN_DATE = '2026-08-01';
 process.env.PACKING_STATS_MIN_DATE = '2026-08-01';
 process.env.FLOOR_DEADLINE_AES = '16:00';
 process.env.FLOOR_DEADLINE_STD = '16:30';
-process.env.FLOOR_RATE_WINDOW_MIN = '60';
+process.env.FLOOR_IDLE_GAP_MIN = '5';
+process.env.FLOOR_RATE_MIN_SAMPLE = '10';
 
 const { initPickingDB, getDB } = await import('../db.js');
 const { initPackingDB } = await import('../../packing/db.js');
 const { lineKindOf } = await import('../../packing/service.js');
 const {
-  getFloorData, computeEta, deadlineGroupOf, lineKindOfClass, deadlineToMs, packBatchCounts,
-  pickOverallEta,
+  getFloorData, computeEta, computeWorkRate, deadlineGroupOf, lineKindOfClass, deadlineToMs,
+  packBatchCounts, pickOverallEta,
 } = await import('../floor.js');
 
 initPickingDB();
@@ -58,26 +61,72 @@ t('lineKindOfClass は packing の lineKindOf と同じ判定 (複製ドリフ�
 });
 
 t('computeEta: 残り0 = done', () => {
-  const r = computeEta({ nowMs: 0, remaining: 0, recentDone: 10, windowMin: 60, deadlineMs: 3600000 });
+  const r = computeEta({ nowMs: 0, remaining: 0, rate: 1, deadlineMs: 3600000 });
   assert.equal(r.status, 'done');
 });
 
 t('computeEta: ペース未計測 = measuring', () => {
-  const r = computeEta({ nowMs: 0, remaining: 100, recentDone: 0, windowMin: 60, deadlineMs: 3600000 });
-  assert.equal(r.status, 'measuring');
+  assert.equal(computeEta({ nowMs: 0, remaining: 100, rate: null, deadlineMs: 3600000 }).status, 'measuring');
+  assert.equal(computeEta({ nowMs: 0, remaining: 100, rate: 0, deadlineMs: 3600000 }).status, 'measuring');
 });
 
 t('computeEta: 残り60件を毎分1件 → 60分後。締切90分後なら余裕30分', () => {
-  const r = computeEta({ nowMs: 0, remaining: 60, recentDone: 60, windowMin: 60, deadlineMs: 90 * 60000 });
+  const r = computeEta({ nowMs: 0, remaining: 60, rate: 1, deadlineMs: 90 * 60000 });
   assert.equal(r.status, 'ok');
   assert.equal(r.etaMs, 60 * 60000);
   assert.equal(r.marginMin, 30);
 });
 
 t('computeEta: 締切を過ぎる見込みは late (マイナス余裕)', () => {
-  const r = computeEta({ nowMs: 0, remaining: 120, recentDone: 60, windowMin: 60, deadlineMs: 90 * 60000 });
+  const r = computeEta({ nowMs: 0, remaining: 120, rate: 1, deadlineMs: 90 * 60000 });
   assert.equal(r.status, 'late');
   assert.equal(r.marginMin, -30);
+});
+
+t('computeEta: queued (締切が先の便の残数) の分だけ後ろにずれる', () => {
+  // 自分の残は30件でも、先に片付ける便が30件あるなら終わるのは60分後
+  const r = computeEta({ nowMs: 0, remaining: 30, queued: 60, rate: 1, deadlineMs: 90 * 60000 });
+  assert.equal(r.etaMs, 60 * 60000);
+  assert.equal(r.marginMin, 30);
+});
+
+// ─── 実働ペース ───
+
+const min = (m) => m * 60000;
+
+t('computeWorkRate: 等間隔なら素直にその逆数 (30秒間隔 = 2伝票/分)', () => {
+  const ts = Array.from({ length: 21 }, (_, i) => i * 30000);
+  const r = computeWorkRate(ts);
+  assert.equal(r.sample, 20);
+  assert.ok(Math.abs(r.rate - 2) < 1e-9, `rate=${r.rate}`);
+});
+
+t('computeWorkRate: 🚨昼休憩を挟んでも実働ペースが保たれる (2026-08-21 実障害の回帰)', () => {
+  // 11:51〜12:05 に30秒間隔で29件 → 51分の空白 (昼休憩) → 12:56 に1件。13:07 が「今」
+  const ts = Array.from({ length: 29 }, (_, i) => min(0) + i * 30000);
+  ts.push(min(65));
+  const r = computeWorkRate(ts);
+  // 空白1区間は捨てられ、実働は30秒間隔の28区間だけ → 2伝票/分のまま
+  assert.equal(r.sample, 28);
+  assert.ok(Math.abs(r.rate - 2) < 1e-9, `rate=${r.rate}`);
+  // 旧実装 (直近60分の単純移動平均) なら 1件/60分 = 0.017伝票/分 → 残62件で62時間後だった
+  const eta = computeEta({ nowMs: min(76), remaining: 62, rate: r.rate, deadlineMs: min(76 + 173) });
+  assert.equal(eta.status, 'ok');
+  assert.equal(eta.marginMin, 142);          // 31分で終わる見込み → 締切16:00まで余裕142分
+});
+
+t('computeWorkRate: サンプルが足りなければ null (安請け合いしない)', () => {
+  assert.equal(computeWorkRate([1, 2, 3]).rate, null);
+  // 件数はあっても全部バラバラ (間隔が全て 5分超) なら実働区間が取れず null
+  const sparse = Array.from({ length: 20 }, (_, i) => i * min(10));
+  assert.equal(computeWorkRate(sparse).rate, null);
+  assert.equal(computeWorkRate([]).rate, null);
+  assert.equal(computeWorkRate(null).rate, null);
+});
+
+t('computeWorkRate: 同時刻に大量完了しても発散しない (1伝票3秒で頭打ち)', () => {
+  const r = computeWorkRate(Array.from({ length: 30 }, () => 1000));
+  assert.ok(r.rate <= 20 + 1e-9, `rate=${r.rate}`);   // 3秒/伝票 = 20伝票/分
 });
 
 t('deadlineToMs: JSTの時刻として解釈される', () => {
@@ -85,23 +134,23 @@ t('deadlineToMs: JSTの時刻として解釈される', () => {
   assert.equal(deadlineToMs('2026-08-20', '16:00'), Date.parse('2026-08-20T07:00:00Z'));
 });
 
-t('packBatchCounts: ラインバッチは完了までまとめて残数扱い', () => {
-  const cutoff = '2026-08-20T04:00:00Z';
-  const running = { cls: 'ネコポス【梱包機PAS-LINE《3つ折り》】単品', status: 'packing', slip_count: 100, remain_slips: 100, done_slips: 0, cancelled_slips: 0, recent_done: 0, finished_at: null };
-  assert.equal(packBatchCounts(running, cutoff).remaining, 100);
-  const done = { ...running, status: 'done', finished_at: '2026-08-20T04:30:00Z' };
-  const c = packBatchCounts(done, cutoff);
+t('packBatchCounts: ラインバッチは完了までまとめて残数扱い・line 種別が付く', () => {
+  const running = { cls: 'ネコポス【梱包機PAS-LINE《3つ折り》】単品', status: 'packing', slip_count: 100, remain_slips: 100, done_slips: 0, cancelled_slips: 0, finished_at: null };
+  const r = packBatchCounts(running);
+  assert.equal(r.remaining, 100);
+  assert.equal(r.line, 'pas');                 // 完了予測から外すための目印
+  const c = packBatchCounts({ ...running, status: 'done', finished_at: '2026-08-20T04:30:00Z' });
   assert.equal(c.remaining, 0);
-  assert.equal(c.recentDone, 100);   // カットオフ後の完了 → 直近ペースに計上
+  assert.equal(c.done, 100);
 });
 
 t('packBatchCounts: cancelled は分母・完了のどちらにも入らない', () => {
-  const cutoff = '2026-08-20T04:00:00Z';
-  const b = { cls: 'ネコポス手動単品', status: 'packing', slip_count: 10, remain_slips: 3, done_slips: 5, cancelled_slips: 2, recent_done: 5, finished_at: null };
-  const c = packBatchCounts(b, cutoff);
+  const b = { cls: 'ネコポス手動単品', status: 'packing', slip_count: 10, remain_slips: 3, done_slips: 5, cancelled_slips: 2, finished_at: null };
+  const c = packBatchCounts(b);
   assert.equal(c.total, 8);
   assert.equal(c.done, 5);
   assert.equal(c.remaining, 3);
+  assert.equal(c.line, null);
 });
 
 t('pickOverallEta: 両方 late なら超過が深刻な方 (余裕最小) を採る', () => {
@@ -160,8 +209,11 @@ function makePick({ cls, status, folder, worker = 'w@test', lines = 10, doneLine
 
 let packId = 0;
 function makePack({ pkBatchId = null, status, folder, worker = 'p@test', slips = 10, doneSlips = 0,
-  cancelledSlips = 0, doneAt = '04:30', matchStatus = 'ok', validity = 'valid' }) {
+  cancelledSlips = 0, doneAt = '04:30', doneSpacingSec = 60, matchStatus = 'ok', validity = 'valid' }) {
   const id = ++packId;
+  // 実働ペースは伝票の done_at 間隔から測るので、1件ずつずらして刻む (本番と同じ形)
+  const doneBase = Date.parse(iso(doneAt));
+  const slipDoneAt = (i) => new Date(doneBase + (i - 1) * doneSpacingSec * 1000).toISOString();
   db.prepare(`
     INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count, total_qty,
       pk_batch_id, match_status, status, worker, finished_at, validity, csv_sha256, imported_by, created_at, updated_at)
@@ -174,7 +226,7 @@ function makePack({ pkBatchId = null, status, folder, worker = 'p@test', slips =
       INSERT INTO pk_pack_slips (batch_id, seq, ne_slip_no, slip_no, status, shown_at, done_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(id, i, `NE${id}-${i}`, `SP${id}-${i}`, st,
-      st === 'done' ? iso('04:00') : null, st === 'done' ? iso(doneAt) : null);
+      st === 'done' ? iso('04:00') : null, st === 'done' ? slipDoneAt(i) : null);
   }
   return id;
 }
@@ -190,12 +242,17 @@ const pickedPick = makePick({ cls: 'AES《単品》', status: 'done', folder: '�
 const packingPick = makePick({ cls: '50サイズ宅急便単品', status: 'done', folder: '出荷_04', doneLines: 10 });
 const donePick = makePick({ cls: 'AES《単品》', status: 'done', folder: '出荷_05', doneLines: 10 });
 
-// 梱包側: 出荷_03 = ready (梱包待ち)・出荷_04 = packing (5/10済・cancelled2・直近)・出荷_05 = done (直近完了)
+// 梱包側: 出荷_03 = ready (梱包待ち)・出荷_04 = packing (5/10済・cancelled2)・出荷_05 = done
+// 完了は 13:25〜13:39 に1分間隔で15件 → 実働ペース 1伝票/分
 makePack({ pkBatchId: pickedPick, status: 'ready', folder: '出荷_03' });                            // AES 残10
-makePack({ pkBatchId: packingPick, status: 'packing', folder: '出荷_04', doneSlips: 5, cancelledSlips: 2 }); // std 残3・直近5
-makePack({ pkBatchId: donePick, status: 'done', folder: '出荷_05', doneSlips: 10, doneAt: '04:40' }); // AES 完了・直近10
+makePack({ pkBatchId: packingPick, status: 'packing', folder: '出荷_04', doneSlips: 5, cancelledSlips: 2, doneAt: '04:25' }); // std 残3
+makePack({ pkBatchId: donePick, status: 'done', folder: '出荷_05', doneSlips: 10, doneAt: '04:30' }); // AES 完了
 // 突合差分 (ready) → 要対応
 makePack({ status: 'ready', folder: '出荷_99', matchStatus: 'mismatch', slips: 3 });
+
+// 梱包機ライン (MELT) 20伝票が流し中 — 完了予測には入れず lineRemaining で別に出す
+const linePick = makePick({ cls: 'ネコポス【梱包機MELT-LINE】単品', status: 'done', folder: '出荷_06', doneLines: 10 });
+makePack({ pkBatchId: linePick, status: 'packing', folder: '出荷_06', slips: 20 });
 
 // ミス候補1件 (要対応 + 品質)・確定1件 (品質)
 db.prepare(`
@@ -217,13 +274,13 @@ makePick({ cls: 'ネコポス手動単品', status: 'cancelled', folder: '出荷
 
 const data = await getFloorData({ now: NOW });
 
-t('flow: 5列の導出 (未着手1・ピッキング中1・ピッキング完了1・梱包中1・完了1 + 突合なしready)', () => {
+t('flow: 5列の導出 (未着手1・ピッキング中1・ピッキング完了1・梱包中2・完了1 + 突合なしready)', () => {
   assert.equal(data.flow.notStarted, 1);
   assert.equal(data.flow.picking, 1);       // paused も「ピッキング中」
   assert.equal(data.flow.picked, 2);        // 出荷_03 (pack ready) + 出荷_99 (突合なし ready)
-  assert.equal(data.flow.packing, 1);
+  assert.equal(data.flow.packing, 2);       // 出荷_04 + 出荷_06 (ライン流し中)
   assert.equal(data.flow.done, 1);
-  assert.equal(data.flow.total, 6);
+  assert.equal(data.flow.total, 7);
 });
 
 t('eta: AES と std に分かれ、残数が正しい (cancelled は残数に入らない)', () => {
@@ -235,21 +292,34 @@ t('eta: AES と std に分かれ、残数が正しい (cancelled は残数に入
   assert.equal(std.deadline, '16:30');
 });
 
-t('eta: 直近ペースから予測が出る (AES=直近10件/60分 → 残10で約60分後 = 15:00頃)', () => {
+t('eta: 梱包機ラインは予測に入れず lineRemaining で別に出す', () => {
+  assert.equal(data.eta.lineRemaining.melt, 20);
+  assert.equal(data.eta.lineRemaining.pas, 0);
+  assert.equal(data.eta.lineRemaining.total, 20);
+  assert.equal(data.eta.remaining, 16);     // ライン20伝票は手梱包の残数に混ざらない
+});
+
+t('eta: 実働ペース (1伝票/分) から予測が出る — AES 残10 → 14:10', () => {
+  assert.ok(Math.abs(data.eta.rate - 1) < 1e-9, `rate=${data.eta.rate}`);
+  assert.equal(data.eta.rateSample, 14);    // 完了15件 = 間隔14区間 (全て1分 = 5分以内)
   const aes = data.eta.groups.find((g) => g.key === 'aes');
   assert.equal(aes.status, 'ok');
-  // 14:00 + 10件÷(10件/60分) = 15:00 JST = 06:00 UTC
-  assert.ok(Math.abs(aes.etaMs - Date.parse('2026-08-20T06:00:00Z')) < 60000, `etaMs=${new Date(aes.etaMs).toISOString()}`);
-  assert.equal(aes.marginMin, 60);          // 締切16:00まで余裕60分
+  assert.ok(Math.abs(aes.etaMs - Date.parse('2026-08-20T05:10:00Z')) < 1000, `etaMs=${new Date(aes.etaMs).toISOString()}`);
+  assert.equal(aes.marginMin, 110);         // 締切16:00まで余裕110分
+});
+
+t('eta: 締切の遅い便は先の便の残数だけ後ろにずれる (std は AES 10件を待つ)', () => {
+  const std = data.eta.groups.find((g) => g.key === 'std');
+  // 14:00 + (AES残10 + std残6) 件 ÷ 1伝票/分 = 14:16
+  assert.ok(Math.abs(std.etaMs - Date.parse('2026-08-20T05:16:00Z')) < 1000, `etaMs=${new Date(std.etaMs).toISOString()}`);
+  assert.equal(std.marginMin, 134);         // 締切16:30まで余裕134分
 });
 
 t('eta: overall は余裕が一番小さいグループ', () => {
-  // std: 残6 ÷ (5件/60分) = 72分 → 15:12・余裕78分 / AES: 余裕60分 → overall = AES
   const aes = data.eta.groups.find((g) => g.key === 'aes');
   assert.equal(data.eta.overall.status, 'ok');
-  assert.equal(data.eta.overall.marginMin, 60);
+  assert.equal(data.eta.overall.marginMin, 110);   // AES 110分 < std 134分
   assert.equal(data.eta.overall.etaMs, aes.etaMs);
-  assert.equal(data.eta.remaining, 16);
 });
 
 t('要対応: 中断30分 (bad)・突合差分・ミス候補', () => {
@@ -268,16 +338,18 @@ t('品質: 確定1・候補1・欠品2', () => {
   assert.equal(data.quality.shortages, 2);
 });
 
-t('梱包進捗: 伝票ベースで cancelled は分母・完了から外れる (done=15 / total=31)', () => {
-  // 出荷_03: 0/10, 出荷_04: 5/8 (cancelled 2除外), 出荷_05: 10/10, 出荷_99: 0/3
+t('梱包進捗: 伝票ベースで cancelled は分母・完了から外れる (done=15 / total=51)', () => {
+  // 出荷_03: 0/10, 出荷_04: 5/8 (cancelled 2除外), 出荷_05: 10/10, 出荷_99: 0/3, 出荷_06: 0/20
   assert.equal(data.packing.progress.doneSlips, 15);
-  assert.equal(data.packing.progress.totalSlips, 31);
+  assert.equal(data.packing.progress.totalSlips, 51);   // 進捗バーにはライン分も入れる
 });
 
 t('いま動いている: 梱包中バッチが載る', () => {
-  assert.equal(data.packing.active.length, 1);
-  assert.equal(data.packing.active[0].folder, '出荷_04');
-  assert.equal(data.packing.active[0].paused, false);
+  assert.equal(data.packing.active.length, 2);
+  const a = data.packing.active.find((x) => x.folder === '出荷_04');
+  assert.ok(a, JSON.stringify(data.packing.active));
+  assert.equal(a.paused, false);
+  assert.equal(data.packing.active.find((x) => x.folder === '出荷_06').line, 'melt');
 });
 
 t('統計は共通形 (count/secPerUnit) へ正規化される', () => {
