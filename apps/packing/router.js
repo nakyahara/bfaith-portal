@@ -15,6 +15,7 @@
  */
 import { Router } from 'express';
 import path from 'path';
+import fs from 'node:fs';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -29,7 +30,8 @@ import {
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
   resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal,
 } from './service.js';
-import { notifyShipChange, notifyTask } from './notify.js';
+import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
+import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR } from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
@@ -73,6 +75,9 @@ function readCookie(req, name) {
 function packingAccess(req, res, next) {
   // PWA manifest はブラウザが Cookie 無しで取りにくる (認証不要の無害な静的情報)
   if (req.path === '/manifest.json') return next();
+  // 🖨 抜き出した送り状PDFの配信 (事務がチャットのリンクから開く)。認証はセッションでなく
+  // 128bit推測不能トークン (capability URL)。ファイルは7日で自動削除
+  if (/^\/reprints\/[A-Za-z0-9_-]{16,}\.pdf$/.test(req.path)) return next();
   if (req.session?.email) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('packing'))) return next();
@@ -126,6 +131,18 @@ function api(handler) {
     }
   };
 }
+
+// ─── 🖨 抜き出した送り状PDFの配信 (capability URL・認証はトークンのみ) ───
+router.get('/reprints/:token([A-Za-z0-9_-]{16,}).pdf', (req, res) => {
+  const file = path.join(REPRINTS_DIR, `${req.params.token}.pdf`);
+  if (!file.startsWith(REPRINTS_DIR) || !fs.existsSync(file)) return res.status(404).send('見つかりません (7日で削除されます)');
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', 'inline');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  fs.createReadStream(file).pipe(res);
+});
 
 // ─── バッチ一覧 ───
 router.get('/', (req, res) => {
@@ -303,6 +320,50 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   if (result.taskNotify) {
     notifyTask(result.taskNotify, worker)
       .catch((e) => console.warn(`[packing-notify] タスク通知失敗 (${result.taskNotify.sku}): ${e.message}`));
+  }
+  // 🖨 再印刷依頼: 押した瞬間に即時通知 (中原さん指示 2026-08-21・梱包の途中でも飛ぶ)。
+  // テキスト通知を先に送り、送り状PDFの抜き出しは非同期で追送 (Codex high: Drive処理を
+  // await すると「即時」にならず応答も塞ぐ)。webhook成功→DB更新間のクラッシュでは
+  // 再送により同内容が重複し得る (NE伝票番号併記で判別可能・webhookにexactly-onceは無い)
+  if (req.body.event === 'reprint' && !result.replayed && result.reprintId) {
+    const row = getDB().prepare('SELECT * FROM pk_pack_reprints WHERE id=?').get(result.reprintId);
+    if (row) {
+      const lines = getDB().prepare(`
+        SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
+        FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
+      `).all(row.batch_id, row.slip_seq);
+      try {
+        const sent = await notifyReprint({
+          folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
+          siteOrderNo: row.site_order_no, recipientName: row.recipient_name, worker, lines,
+        });
+        getDB().prepare('UPDATE pk_pack_reprints SET notified_at=?, notify_error=? WHERE id=?')
+          .run(sent ? new Date().toISOString().slice(0, 19) + 'Z' : null, sent ? null : 'webhook未設定', row.id);
+        if (!sent) result.reprintNotify = 'failed';
+      } catch (e) {
+        console.warn(`[packing-notify] 再印刷通知失敗 (${row.ne_slip_no}): ${e.message}`);
+        getDB().prepare('UPDATE pk_pack_reprints SET notify_error=? WHERE id=?')
+          .run(String(e.message).slice(0, 200), row.id);
+        result.reprintNotify = 'failed';
+      }
+      // 送り状PDFの抜き出し→追送 (fire-and-forget・fail-soft)
+      (async () => {
+        try {
+          const r = await extractReprintPdf({
+            folderName: row.folder_name, neSlipNo: row.ne_slip_no, recipientName: row.recipient_name,
+          });
+          const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
+          getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=? WHERE id=?').run(r.token, row.id);
+          await postReprintText(`📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
+        } catch (e) {
+          getDB().prepare('UPDATE pk_pack_reprints SET pdf_error=? WHERE id=?')
+            .run(String(e.message).slice(0, 120), row.id);
+          postReprintText(`⚠ ${row.ne_slip_no} の送り状PDFは自動で抜き出せませんでした (${String(e.message).slice(0, 80)}) — フォルダから該当分を印刷してください`)
+            .catch(() => {});
+        }
+      })().catch((e) => console.warn(`[packing-reprint] PDF追送失敗 (${row.ne_slip_no}): ${e.message}`));
+    }
   }
   // ④ 配送方法変更は事務へ GChat 通知。事務キュー廃止後は通知が実質の伝達経路なので、
   // 成否を行に記録し (失敗はポーラーが再送)、失敗は現場にも表示する (Codexレビュー high)

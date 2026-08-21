@@ -16,7 +16,8 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange } from './notify.js';
+import { notifyShipChange, notifyReprint } from './notify.js';
+import { cleanupReprintPdfs } from './reprint-pdf.js';
 import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
 
@@ -215,6 +216,41 @@ async function retryShipChangeNotify() {
   }
 }
 
+/** 🖨再印刷通知の再送 (直近2日・未通知のみ・1周期3件まで — ④と同型)。 */
+async function retryReprintNotify() {
+  const db = getDB();
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT * FROM pk_pack_reprints
+      WHERE notified_at IS NULL AND created_at >= datetime('now', '-2 days')
+      ORDER BY id LIMIT 3
+    `).all();
+  } catch { return; }   // v8未適用
+  for (const row of rows) {
+    try {
+      const lines = db.prepare(`
+        SELECT COALESCE(l.print_name, l.product_name) AS name, l.sku, l.qty
+        FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
+        WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
+      `).all(row.batch_id, row.slip_seq);
+      const sent = await notifyReprint({
+        folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
+        siteOrderNo: row.site_order_no, recipientName: row.recipient_name,
+        worker: `${row.requested_by} (再送)`, lines,
+        pdfUrl: row.pdf_token ? `https://picking.bfaith-wh.uk/apps/packing/reprints/${row.pdf_token}.pdf` : null,
+        pdfError: row.pdf_error,
+      });
+      if (sent) {
+        db.prepare('UPDATE pk_pack_reprints SET notified_at=?, notify_error=NULL WHERE id=?').run(utcNow(), row.id);
+        console.log(`[packing-drive-poller] 再印刷通知を再送: ${row.ne_slip_no}`);
+      }
+    } catch (e) {
+      db.prepare('UPDATE pk_pack_reprints SET notify_error=? WHERE id=?').run(String(e.message).slice(0, 200), row.id);
+    }
+  }
+}
+
 export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
@@ -230,6 +266,8 @@ export function startPackingDrivePoller() {
       _status.lastAt = utcNow();
       _status.lastError = null;
       await retryShipChangeNotify();
+      await retryReprintNotify();
+      cleanupReprintPdfs();
       await pingJobsMonitor();
     } catch (e) {
       _status.lastError = String(e.message).slice(0, 300);

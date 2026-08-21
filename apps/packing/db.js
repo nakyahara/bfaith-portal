@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -245,6 +245,27 @@ const MIGRATIONS = {
     // v6時代の記録済み仕分け行をバックフィル (Codex medium: NULLのままだと「除外0件」と矛盾表示)
     db.exec(`UPDATE pk_pack_line_runs SET excluded_count = planned_count - final_count
       WHERE phase = 'sort' AND final_count IS NOT NULL AND excluded_count IS NULL`);
+  },
+  // v8: 🖨伝票再印刷依頼 (2026-08-21 中原さん指示)。現場→事務班への口頭指示をボタン化。
+  // 通知が実質の伝達経路 (④配送変更と同型: 成否記録+ポーラー再送)。
+  // pdf_token = 抜き出した送り状PDFの配信URL用 (推測不能・SAが閲覧者共有のためDrive保存は不可)
+  8: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_reprints (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id       INTEGER NOT NULL REFERENCES pk_pack_batches(id),
+      slip_seq       INTEGER NOT NULL,
+      ne_slip_no     TEXT NOT NULL,
+      site_order_no  TEXT,
+      folder_name    TEXT,
+      recipient_name TEXT,
+      requested_by   TEXT NOT NULL,
+      pdf_token      TEXT,
+      pdf_error      TEXT,
+      notified_at    TEXT,
+      notify_error   TEXT,
+      created_at     TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_reprints_at ON pk_pack_reprints(created_at)');
   },
 };
 

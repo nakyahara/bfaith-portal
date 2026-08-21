@@ -167,6 +167,7 @@
   <div class="controls">
     <button class="btn-prev" id="issueBtn" type="button" style="flex-basis:118px; font-size:16px; line-height:1.25">不足/余り<br>かも？</button>
     <button class="btn-prev" id="shipBtn" type="button" style="flex-basis:112px; font-size:15px; line-height:1.25">配送方法<br>変更</button>
+    <button class="btn-prev" id="reprintBtn" type="button" style="flex-basis:74px; font-size:15px; line-height:1.25">🖨 再<br>印刷</button>
     <button class="btn-prev" id="prevBtn" type="button">◂ 前へ</button>
     <button class="btn-next" id="nextBtn" type="button">次へ ▸</button>
   </div>
@@ -605,6 +606,9 @@
       if (body.shipNotify === 'failed') {
         showToast('🚨 事務へのGChat通知に失敗しました。口頭かチャットで直接伝えてください (自動再送も試みます)');
       }
+      if (body.reprintNotify === 'failed') {
+        showToast('🚨 再印刷の通知に失敗しました。口頭かチャットで直接伝えてください (自動再送も試みます)');
+      }
       const before = `${currentSeq}|${doneSet.size}|${worker}|${lastDoneSeq}|${paused}`;
       currentSeq = body.currentSeq;
       if (Array.isArray(body.doneSeqs)) {
@@ -962,6 +966,17 @@
       currentSeq = minPending();
       showToast('依頼を取り下げました');
       render();
+    });
+
+    // ── 🖨 伝票再印刷依頼 (2026-08-21): 押した瞬間に事務 (バックオフィス連絡) へ即時通知。
+    // 理由入力なし・画面に痕跡も残さない (記録はDB/イベントのみ)。送り状PDFの抜き出しはサーバー側 best-effort
+    $('reprintBtn').addEventListener('click', () => {
+      if (paused || !worker) return;
+      const sl = bySeq.get(viewSeq);
+      if (!confirm(`伝票 ${sl.neSlipNo} の再印刷を事務に依頼しますか?
+(送り先: ${sl.recipientName || '-'})`)) return;
+      enqueue('reprint', viewSeq);
+      showToast('🖨 再印刷を依頼しました (事務チャットへ通知)');
     });
 
     // ── ④ 配送方法変更 (記録+GChat通知のみ。現物は変更待ちの棚へ) ──
