@@ -354,6 +354,34 @@
     let worker = STATE.worker;          // 作業者名 (start 時に確定)
     let viewSeq = null;                 // 表示中の伝票 seq
     const bySeq = new Map(STATE.slips.map((s) => [s.seq, s]));
+
+    // ── 単品×同一SKU連続アシスト (中原さん指示 2026-08-21) ──
+    // 先読みはまとめるが処理はまとめない: 表示と読み上げの補助のみ。完了/次へ/計測は従来どおり。
+    // 単品 (明細1行×数量1) が連続する区間の中だけで、同一SKUの連続を数える
+    // (複数商品・数量2以上の伝票で区間は必ず切れる — またぎ判定禁止)
+    const CONTINUOUS_ITEM_THRESHOLD = 3;   // この件数以上の連続で発動 (設定値)
+    const RUNS = new Map();      // seq → { idx: n件目(1始まり), total, first, last }
+    const SWITCH_SEQS = new Set();   // 連続の直後にSKUが切り替わる伝票 (誤梱包ポイント)
+    (function computeRuns() {
+      const slips = STATE.slips;   // seq順 = 納品書の束の順
+      const isTanpin = (sl) => sl.lines.length === 1 && sl.lines[0].qty === 1;
+      let i = 0;
+      while (i < slips.length) {
+        if (!isTanpin(slips[i])) { i++; continue; }
+        let j = i;
+        while (j + 1 < slips.length && isTanpin(slips[j + 1])
+          && slips[j + 1].lines[0].sku === slips[i].lines[0].sku) j++;
+        const total = j - i + 1;
+        if (total >= CONTINUOUS_ITEM_THRESHOLD) {
+          for (let k = i; k <= j; k++) {
+            RUNS.set(slips[k].seq, { idx: k - i + 1, total, first: k === i, last: k === j });
+          }
+          // 連続の次の伝票 (別SKU or 複数商品) = 切り替わり注意
+          if (j + 1 < slips.length) SWITCH_SEQS.add(slips[j + 1].seq);
+        }
+        i = j + 1;
+      }
+    })();
     const doneSet = new Set(STATE.slips.filter((s) => s.status === 'done').map((s) => s.seq));
     const heldSet = new Set(STATE.heldSeqs || []);
     const repickSet = new Set(STATE.repickSeqs || []);
@@ -403,7 +431,19 @@
           <div class="qty ${l.qty >= 2 ? 'multi' : ''}">${l.qty}<small> 個</small></div>
         </div>`).join('');
 
+      const run = RUNS.get(s.seq);
+      // 切替警告と連続カウンタは併記する (連続→連続のSKU切替で警告が消えない — Codex指摘)
+      const switchHtml = SWITCH_SEQS.has(s.seq)
+        ? `<div style="background:#ffe3e3; border:2px solid #e03131; border-radius:10px; padding:8px 12px; margin-bottom:8px; font-size:16px; font-weight:800; color:#c92a2a;">⚠ 商品が切り替わりました — 前と違う商品です</div>`
+        : '';
+      const runHtml = switchHtml + (run
+        ? `<div style="background:${run.last ? '#fff3bf' : '#e7f5ff'}; border:2px solid ${run.last ? '#f08c00' : '#1971c2'}; border-radius:10px; padding:8px 12px; margin-bottom:8px; display:flex; align-items:center; gap:12px;">
+            <span style="font-size:26px; font-weight:800; font-variant-numeric:tabular-nums;">${run.idx} / ${run.total}</span>
+            <span style="font-size:15px; font-weight:700;">${run.first ? `🔁 同一商品が${run.total}件連続します` : run.last ? '最後の1件です' : '同一商品の連続中'}</span>
+          </div>`
+        : '');
       $('paper').innerHTML = `
+        ${runHtml}
         <div class="ship-row">
           <span class="method">${esc(STATE.hikiateClass || '')}</span>
           ${s.material ? `<span class="material">${esc(s.material)}</span>` : ''}
@@ -496,6 +536,17 @@
     const WARN_SPEECH = { gift: 'ギフトあり', noshi: 'のしあり', comment: 'コメント確認', expiry_lot: '期限ロットあり' };
     function speakSlip(s) {
       const parts = [];
+      // 単品×同一SKU連続アシスト (処理はまとめない — アナウンスのみ)
+      const run = RUNS.get(s.seq);
+      // 切替警告は連続開始と併読する (連続→連続の切替で警告が消えない — Codex指摘)
+      if (SWITCH_SEQS.has(s.seq)) parts.push('商品が変わります。ご注意ください');
+      if (run && run.first) {
+        const l0 = s.lines[0];
+        const nm0 = normalizeSpeech(l0.shortName) || [...normalizeSpeech(l0.name)].slice(0, 25).join('');
+        parts.push(`${nm0}が、このあと${run.total}件続きます`);
+      } else if (run && run.last) {
+        parts.push('最後の1件です');
+      }
       if ((s.warns || []).includes('assort')) parts.push(`アソート、${s.lines.length}種類`);
       for (const w of (s.warns || [])) {
         if (w === 'multi_qty' || w === 'multi_box' || w === 'assort') continue;
