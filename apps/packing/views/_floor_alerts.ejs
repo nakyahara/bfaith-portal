@@ -1,0 +1,31 @@
+<%# 現場間アラートバナー (2026-08-21)。12秒ポーリング・OKで全端末から消える %>
+<div id="floorAlerts" style="position:sticky; top:0; z-index:9999;"></div>
+<script>
+(function () {
+  var box = document.getElementById('floorAlerts');
+  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
+  function render(alerts) {
+    box.innerHTML = alerts.map(function (a) {
+      return '<div style="background:#e03131; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
+        + '<span style="flex:1">' + esc(a.message) + (a.requested_by ? '<small style="font-weight:400">（依頼: ' + esc(a.requested_by) + '）</small>' : '') + '</span>'
+        + '<button data-ack="' + a.id + '" style="padding:10px 20px; border:none; border-radius:10px; background:#fff; color:#e03131; font-weight:800; font-size:16px">OK</button>'
+        + '</div>';
+    }).join('');
+    box.querySelectorAll('[data-ack]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        fetch('/apps/packing/api/floor-alerts/' + btn.dataset.ack + '/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+          .then(poll).catch(function () {});
+      });
+    });
+  }
+  function poll() {
+    return fetch('/apps/packing/api/floor-alerts')
+      .then(function (r) { return r.json(); })
+      .then(function (b) { render(b.alerts || []); })
+      .catch(function () { /* 次のpollで回復 */ });
+  }
+  poll();
+  setInterval(poll, 12000);
+})();
+</script>

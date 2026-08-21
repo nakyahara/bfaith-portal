@@ -1107,3 +1107,56 @@ export function reconcileRepickBatches() {
     return 0;   // pk_pack_tasks が無い環境 (packing無効・テスト) では何もしない
   }
 }
+
+// ═══ 現場間アラート (ピッキング⇄梱包 — 2026-08-21 中原さん指示) ═══════════════
+// バッチ一覧のボタン → 相手システムの全画面ヘッダーにバナー表示。OKで消える。
+// テーブルは picking 所有 (pk_floor_alerts)。packing からもこの関数経由で読み書きする
+
+export const FLOOR_ALERT_KINDS = {
+  cart:    { direction: 'to_packing', message: '🛒 ピッキングカートを送ってください' },
+  trolley: { direction: 'to_packing', message: '🧺 台車を送ってください' },
+  lift:    { direction: 'to_packing', message: '🛗 リフトの中身を出してください' },
+  unload:  { direction: 'to_picking', message: '📦 ピッキング済みの商品を下してください' },
+};
+
+/** アラート発報。同種の未確認が生きていれば重ねない (連打・二重依頼の集約)。 */
+export function createFloorAlert(kind, requestedBy) {
+  const def = FLOOR_ALERT_KINDS[kind];
+  if (!def) throw new PkError(400, 'bad_kind', '不明なアラート種別です');
+  const db = getDB();
+  // 集約チェック+INSERTは同一トランザクション (Codex: 同時押下の重複防止)
+  return db.transaction(() => {
+    const dup = db.prepare(`
+      SELECT id FROM pk_floor_alerts
+      WHERE kind = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
+    `).get(kind);
+    if (dup) return { id: dup.id, existed: true };
+    const info = db.prepare(`
+      INSERT INTO pk_floor_alerts (direction, kind, message, requested_by, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(def.direction, kind, def.message, requestedBy || null, utcNow());
+    return { id: Number(info.lastInsertRowid), existed: false };
+  }).immediate();
+}
+
+/** 表示対象 (未確認・4時間以内 — 古いバナーを翌日まで残さない)。 */
+export function listFloorAlerts(direction) {
+  return getDB().prepare(`
+    SELECT id, kind, message, requested_by, created_at FROM pk_floor_alerts
+    WHERE direction = ? AND acked_at IS NULL AND created_at >= datetime('now', '-4 hours')
+    ORDER BY id
+  `).all(direction);
+}
+
+/** OKタップで確認済みに (全端末から消える)。direction=呼び出し側の表示方向 —
+ *  相手方向のアラートを勝手に消せない (Codex high)。 */
+export function ackFloorAlert(id, worker, direction) {
+  if (!['to_packing', 'to_picking'].includes(direction)) {
+    throw new PkError(400, 'bad_direction', '方向が不正です');
+  }
+  const n = getDB().prepare(
+    'UPDATE pk_floor_alerts SET acked_at=?, acked_by=? WHERE id=? AND acked_at IS NULL AND direction=?'
+  ).run(utcNow(), worker || null, id, direction).changes;
+  if (n === 0) throw new PkError(404, 'not_found', 'アラートが見つからないか確認済みです');
+  return true;
+}

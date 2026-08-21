@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -157,6 +157,21 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_batches ADD COLUMN origin_ref TEXT');      // 依頼元 (例: 出荷_02 #95)
     db.exec('ALTER TABLE pk_batches ADD COLUMN requested_by TEXT');    // 依頼者 (梱包担当)
     db.exec('ALTER TABLE pk_batches ADD COLUMN pack_task_id INTEGER'); // pk_pack_tasks.id (状態同期キー)
+  },
+  // v7: 現場間アラート (2026-08-21 中原さん指示)。ピッキング⇄梱包のヘッダーバナー
+  // (カート/台車/リフト/商品下ろし)。picking所有・両アプリからはpicking serviceの関数経由
+  7: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_floor_alerts (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction    TEXT NOT NULL CHECK(direction IN ('to_packing','to_picking')),
+      kind         TEXT NOT NULL,
+      message      TEXT NOT NULL,
+      requested_by TEXT,
+      created_at   TEXT NOT NULL,
+      acked_at     TEXT,
+      acked_by     TEXT
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_active ON pk_floor_alerts(direction, acked_at)');
   },
 };
 

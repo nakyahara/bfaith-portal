@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert } from './service.js';
 import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
@@ -412,6 +412,25 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
  * 一覧の変化検知用シグネチャ (バッチの増減・状態変化で変わる。明細単位の進捗では変えない
  * = 他人の作業中に一覧がチラチラ再読込されない)。一覧画面が10秒間隔でポーリングする
  */
+// ─── 現場間アラート (バッチ一覧のボタン → 梱包ヘッダーへ / 梱包からの通知を表示) ───
+function alertRequester(req) {
+  return req.session?.displayName || req.session?.email || req.pickingDevice?.label || 'ピッキング現場';
+}
+router.post('/api/floor-alerts', checkOrigin, api(async (req, res) => {
+  const kind = String(req.body.kind || '');
+  if (!['cart', 'trolley', 'lift'].includes(kind)) {
+    return res.status(400).json({ error: '不明なアラート種別です' });
+  }
+  res.json({ ok: true, ...createFloorAlert(kind, alertRequester(req)) });
+}));
+router.get('/api/floor-alerts', api(async (req, res) => {
+  res.json({ ok: true, alerts: listFloorAlerts('to_picking') });
+}));
+router.post('/api/floor-alerts/:id(\\d+)/ack', checkOrigin, api(async (req, res) => {
+  ackFloorAlert(Number(req.params.id), alertRequester(req), 'to_picking');
+  res.json({ ok: true });
+}));
+
 router.get('/api/batches-signature', api(async (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   const sig = listBatches(workDate)

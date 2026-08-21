@@ -36,6 +36,7 @@
   </style>
 </head>
 <body>
+  <%- include('_floor_alerts') %>
   <%
     const jst = (t) => t ? new Date(Date.parse(t) + 32400000).toISOString().slice(11, 16) : '—';
     const durMin = (a, b) => (a && b) ? Math.round((Date.parse(b) - Date.parse(a)) / 6000) / 10 : null;

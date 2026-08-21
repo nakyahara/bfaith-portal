@@ -61,6 +61,7 @@
   </style>
 </head>
 <body>
+  <%- include('_floor_alerts') %>
   <header class="portal-header">
     <div class="header-left">
       <h1>B-Faith Portal</h1>
@@ -99,6 +100,23 @@
       </div>
     <% } %>
 
+    <div style="display:flex; gap:8px; margin:10px 0; flex-wrap:wrap;">
+      <button type="button" class="fa-send" data-kind="cart" style="padding:12px 14px; border:1px solid #e03131; color:#e03131; background:#fff; border-radius:10px; font-weight:700">🛒 ピッキングカートを送って</button>
+      <button type="button" class="fa-send" data-kind="trolley" style="padding:12px 14px; border:1px solid #e03131; color:#e03131; background:#fff; border-radius:10px; font-weight:700">🧺 台車を送って</button>
+      <button type="button" class="fa-send" data-kind="lift" style="padding:12px 14px; border:1px solid #e03131; color:#e03131; background:#fff; border-radius:10px; font-weight:700">🛗 リフトの中身を出して</button>
+    </div>
+    <script>
+      document.querySelectorAll('.fa-send').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          btn.disabled = true;
+          fetch('/apps/picking/api/floor-alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: btn.dataset.kind }) })
+            .then(function (r) { return r.json(); })
+            .then(function (b) { alert(b.ok ? (b.existed ? 'すでに依頼中です (梱包の画面に表示中)' : '梱包の画面に表示しました') : (b.error || 'エラー')); })
+            .catch(function () { alert('通信エラー。もう一度お試しください'); })
+            .finally(function () { btn.disabled = false; });
+        });
+      });
+    </script>
     <% for (const b of batches) { %>
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
