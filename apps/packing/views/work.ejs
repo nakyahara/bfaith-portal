@@ -137,6 +137,7 @@
   </style>
 </head>
 <body>
+  <%- include('_floor_alerts') %>
   <div class="topbar">
     <span class="prog"><span id="progDone">-</span> / <%= state.slips.length %></span>
     <span class="muted"><%= state.batch.folder_name || '' %></span>

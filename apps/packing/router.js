@@ -144,6 +144,28 @@ router.get('/reprints/:token([A-Za-z0-9_-]{16,}).pdf', (req, res) => {
   fs.createReadStream(file).pipe(res);
 });
 
+// ─── 現場間アラート (「ピッキング済みの商品を下して」→ ピッキングヘッダーへ) ───
+// テーブルは picking 所有 — picking service の関数経由で読み書き (要件§7.1)
+function alertRequester(req) {
+  return req.session?.displayName || req.session?.email || req.packingDevice?.label || '梱包現場';
+}
+router.post('/api/floor-alerts', checkOrigin, api(async (req, res) => {
+  if (String(req.body.kind || '') !== 'unload') {
+    return res.status(400).json({ error: '不明なアラート種別です' });
+  }
+  const { createFloorAlert } = await import('../picking/service.js');
+  res.json({ ok: true, ...createFloorAlert('unload', alertRequester(req)) });
+}));
+router.get('/api/floor-alerts', api(async (req, res) => {
+  const { listFloorAlerts } = await import('../picking/service.js');
+  res.json({ ok: true, alerts: listFloorAlerts('to_packing') });
+}));
+router.post('/api/floor-alerts/:id(\\d+)/ack', checkOrigin, api(async (req, res) => {
+  const { ackFloorAlert } = await import('../picking/service.js');
+  ackFloorAlert(Number(req.params.id), alertRequester(req), 'to_packing');
+  res.json({ ok: true });
+}));
+
 // ─── バッチ一覧 ───
 router.get('/', (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();

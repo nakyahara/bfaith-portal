@@ -43,6 +43,7 @@
   </style>
 </head>
 <body>
+  <%- include('_floor_alerts') %>
   <header class="portal-header">
     <div class="header-left">
       <h1>B-Faith Portal</h1>
@@ -73,6 +74,19 @@
       </div>
     <% } %>
 
+    <div style="margin:10px 0;">
+      <button type="button" id="faUnload" style="padding:12px 14px; border:1px solid #1a73e8; color:#1a73e8; background:#fff; border-radius:10px; font-weight:700">📦 ピッキング済みの商品を下して</button>
+    </div>
+    <script>
+      document.getElementById('faUnload').addEventListener('click', function () {
+        var btn = this; btn.disabled = true;
+        fetch('/apps/packing/api/floor-alerts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind: 'unload' }) })
+          .then(function (r) { return r.json(); })
+          .then(function (b) { alert(b.ok ? (b.existed ? 'すでに依頼中です (ピッキングの画面に表示中)' : 'ピッキングの画面に表示しました') : (b.error || 'エラー')); })
+          .catch(function () { alert('通信エラー。もう一度お試しください'); })
+          .finally(function () { btn.disabled = false; });
+      });
+    </script>
     <% for (const b of batches) { %>
       <div class="card <%= b.status === 'done' ? 'done' : '' %>">
         <div class="card-main">
