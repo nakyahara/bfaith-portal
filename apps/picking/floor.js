@@ -12,10 +12,23 @@
  *     実績ヒートマップだけは packing モジュールを動的 import する (standalone の
  *     PACKING_ENABLED=0 分離を尊重 — 梱包側の障害でボード全体を落とさない)
  *
- * 完了予測 (中原さん決定 2026-08-20):
+ * 完了予測 (中原さん決定 2026-08-20 → ペース算出を 2026-08-21 に作り直し):
  *   締切は便ごとに2本 — AES 16:00 / その他 (ヤマト・日本郵便) 16:30。
- *   予測 = 残り伝票数 ÷ 直近60分の完了ペース (単純移動平均)。分母 (本日総量) は
- *   日中の追加取込で動くため、毎回取込済みベースで再計算する。
+ *   予測 = 残り伝票数 ÷ 実働ペース。分母 (本日総量) は日中の追加取込で動くため、
+ *   毎回取込済みベースで再計算する。
+ *
+ *   ⭐当初の「便ごと・直近60分の単純移動平均」は毎日壊れるので捨てた (2026-08-21 実障害):
+ *     昼休憩で完了ログが 12:05〜12:56 空き、13:07 時点の AES は「直近60分で1伝票」。
+ *     ペース 0.017伝票/分 × 残62伝票 = 62時間後 → 掲示に「予測 03:07 / 3548分 超過見込み」。
+ *     完了0件なら measuring に逃げるのに、1件だけ残ると最悪値が出る逆転構造だった。
+ *   現在の方式 (3点セット):
+ *     ① 実働ペース — 直近 FLOOR_RATE_SAMPLE 件の完了間隔のうち、FLOOR_IDLE_GAP_MIN を
+ *        超える間隔 (昼休憩・段取り替え・便の切り替え) は分母から除いて 伝票/分 を出す
+ *     ② 便ごとのペースを測らず全体スループット1本 — 現場は1チームが分類ごとに順番に
+ *        片付けるので、着手していない便のペースは構造的にほぼ0になる。締切の早い便から
+ *        片付ける前提で、締切順に残数を積み上げて各便の予測を出す
+ *     ③ 梱包機ライン (PAS/MELT) は予測に入れない — 伝票単位の完了が刻まれず、流し中は
+ *        「残り全件・ペース0」として効くだけ。残数は lineRemaining として別に出す
  */
 import { getDB, jstToday } from './db.js';
 import { getPickingStats, getTodayProgress, displayWorkerName } from './service.js';
@@ -24,7 +37,11 @@ export const FLOOR_DEADLINES = {
   aes: process.env.FLOOR_DEADLINE_AES || '16:00',
   std: process.env.FLOOR_DEADLINE_STD || '16:30',
 };
-export const FLOOR_RATE_WINDOW_MIN = Number(process.env.FLOOR_RATE_WINDOW_MIN) || 60;
+// 実働ペースの算出パラメータ
+export const FLOOR_RATE_SAMPLE = Number(process.env.FLOOR_RATE_SAMPLE) || 100;        // 直近何件の完了から測るか
+export const FLOOR_IDLE_GAP_MIN = Number(process.env.FLOOR_IDLE_GAP_MIN) || 5;        // これを超える完了間隔は「動いていない」とみなす
+export const FLOOR_RATE_MIN_SAMPLE = Number(process.env.FLOOR_RATE_MIN_SAMPLE) || 10; // これ未満のサンプルでは予測しない
+const MIN_SEC_PER_SLIP = 3;   // 1伝票3秒より速いペースはデータ異常 — 安全側 (遅め) に丸める
 export const GROUP_LABELS = { aes: 'AES', std: 'ヤマト・日本郵便' };
 
 /** 引当分類 → 締切グループ。AESだけ集荷が早い (16:00)。 */
@@ -47,14 +64,42 @@ export function deadlineToMs(workDate, hhmm) {
 }
 
 /**
+ * 実働ペース (伝票/分) の算出 (純関数)。
+ * 完了時刻の隣接間隔のうち idleGapMin 以内のものだけを「手が動いていた時間」として数え、
+ * 昼休憩・段取り替え・便の切り替えで空いた区間は分母からも件数からも落とす。
+ * @param {number[]} doneAtMs 完了時刻 (エポックms・順不同で可)
+ * @returns {{rate: number|null, sample: number, workedMin: number}} rate=null は計測不能
+ */
+export function computeWorkRate(doneAtMs, {
+  idleGapMin = FLOOR_IDLE_GAP_MIN, minSample = FLOOR_RATE_MIN_SAMPLE,
+} = {}) {
+  const ts = (doneAtMs || []).filter((t) => Number.isFinite(t)).sort((a, b) => a - b);
+  if (ts.length < minSample) return { rate: null, sample: ts.length, workedMin: 0 };
+  const gapCap = idleGapMin * 60000;
+  let workedMs = 0;
+  let counted = 0;
+  for (let i = 1; i < ts.length; i++) {
+    const gap = ts[i] - ts[i - 1];
+    if (gap > gapCap) continue;     // 動いていなかった区間 — この1件ごと捨てる
+    workedMs += gap;
+    counted++;
+  }
+  if (counted < minSample) return { rate: null, sample: counted, workedMin: 0 };
+  // 同秒に大量完了すると workedMs が 0 に潰れる。1伝票 MIN_SEC_PER_SLIP 未満は認めない
+  const workedMin = Math.max(workedMs, counted * MIN_SEC_PER_SLIP * 1000) / 60000;
+  return { rate: counted / workedMin, sample: counted, workedMin };
+}
+
+/**
  * 完了予測 (純関数)。remaining=0 → done / ペース未計測 → measuring。
+ * queued = この便が片付くまでに処理する伝票数 (締切がこれより早い便の残数も含む)。
+ * 締切の早い便から順に片付ける前提なので、後の便ほど前の便の分だけ後ろにずれる。
  * @returns {{status: 'done'|'measuring'|'ok'|'late', etaMs, marginMin}}
  */
-export function computeEta({ nowMs, remaining, recentDone, windowMin, deadlineMs }) {
+export function computeEta({ nowMs, remaining, queued, rate, deadlineMs }) {
   if (remaining <= 0) return { status: 'done', etaMs: null, marginMin: null };
-  const rate = recentDone / Math.max(1, windowMin);   // 伝票/分
-  if (rate <= 0) return { status: 'measuring', etaMs: null, marginMin: null };
-  const etaMs = nowMs + (remaining / rate) * 60000;
+  if (!(rate > 0)) return { status: 'measuring', etaMs: null, marginMin: null };
+  const etaMs = nowMs + ((queued ?? remaining) / rate) * 60000;
   const marginMin = Math.round((deadlineMs - etaMs) / 60000);
   return { status: marginMin >= 0 ? 'ok' : 'late', etaMs, marginMin };
 }
@@ -63,7 +108,7 @@ export function computeEta({ nowMs, remaining, recentDone, windowMin, deadlineMs
  * 本日の梱包バッチのスナップショット (pk_pack_* 直読み)。
  * packing 未導入 (テーブル無し) は null。
  */
-function loadPackBatches(db, workDate, cutoffIso) {
+function loadPackBatches(db, workDate) {
   try {
     return db.prepare(`
       SELECT b.id, b.pk_batch_id, b.status, b.slip_count, b.folder_name, b.worker,
@@ -74,13 +119,34 @@ function loadPackBatches(db, workDate, cutoffIso) {
         (SELECT COUNT(*) FROM pk_pack_slips s
           WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips,
         (SELECT COUNT(*) FROM pk_pack_slips s
-          WHERE s.batch_id = b.id AND s.status = 'cancelled') AS cancelled_slips,
-        (SELECT COUNT(*) FROM pk_pack_slips s
-          WHERE s.batch_id = b.id AND s.status = 'done' AND s.done_at >= ?) AS recent_done
+          WHERE s.batch_id = b.id AND s.status = 'cancelled') AS cancelled_slips
       FROM pk_pack_batches b
       LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
       WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
-    `).all(cutoffIso, workDate);
+    `).all(workDate);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 実働ペースの元になる完了時刻 (本日・手梱包のみ・新しい順に limit 件)。
+ * 梱包機ラインは伝票単位の完了が刻まれない (バッチ完了で一括) ので、混ぜるとペースが歪む。
+ */
+function loadRecentDoneAt(db, workDate, nowIso, limit) {
+  try {
+    return db.prepare(`
+      SELECT s.done_at
+      FROM pk_pack_slips s
+      JOIN pk_pack_batches b ON b.id = s.batch_id
+      LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
+      WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+        AND s.status = 'done' AND s.done_at IS NOT NULL AND s.done_at <= ?
+        AND COALESCE(pb.hikiate_class, '') NOT LIKE '%PAS-LINE%'
+        AND COALESCE(pb.hikiate_class, '') NOT LIKE '%MELT-LINE%'
+      ORDER BY s.done_at DESC
+      LIMIT ?
+    `).all(workDate, nowIso, limit).map((r) => Date.parse(r.done_at));
   } catch {
     return null;
   }
@@ -91,52 +157,60 @@ function loadPackBatches(db, workDate, cutoffIso) {
  * cancelled は残数・完了・分母のどれにも入れない (完了扱いすると進捗が水増しされる —
  * Codexレビュー medium 2026-08-20)。
  * 梱包機ライン: 伝票単位の完了が刻まれない (SLIP_ONLY_EVENTS 不可) ため、
- * バッチ完了で対象伝票をまとめて計上する近似。
+ * バッチ完了で対象伝票をまとめて計上する近似 (進捗バー用。完了予測では line で弾く)。
  */
-export function packBatchCounts(b, cutoffIso) {
+export function packBatchCounts(b) {
   const total = Math.max(0, b.slip_count - (b.cancelled_slips || 0));
-  if (lineKindOfClass(b.cls) !== null) {
+  const kind = lineKindOfClass(b.cls);
+  if (kind !== null) {
     const done = b.status === 'done';
-    return {
-      total,
-      remaining: done ? 0 : total,
-      recentDone: done && b.finished_at && b.finished_at >= cutoffIso ? total : 0,
-      done: done ? total : 0,
-    };
+    return { total, remaining: done ? 0 : total, done: done ? total : 0, line: kind };
   }
-  return {
-    total,
-    remaining: b.remain_slips,
-    recentDone: b.recent_done,
-    done: b.done_slips,
-  };
+  return { total, remaining: b.remain_slips, done: b.done_slips, line: null };
 }
 
-/** 締切グループ別の完了予測。 */
-function buildEta(packBatches, workDate, nowMs, cutoffIso) {
+/**
+ * 締切グループ別の完了予測。ペースは全体スループット1本 (rateInfo)。
+ * 締切の早い便から片付ける前提で残数を積み上げる (queued)。
+ * 梱包機ラインは予測に入れず、残数だけ lineRemaining で返す。
+ */
+function buildEta(packBatches, workDate, nowMs, rateInfo) {
   if (!packBatches) return null;
-  const agg = new Map([['aes', { remaining: 0, recentDone: 0 }], ['std', { remaining: 0, recentDone: 0 }]]);
+  const agg = new Map([['aes', 0], ['std', 0]]);
+  const lineRemaining = { pas: 0, melt: 0, total: 0 };
   for (const b of packBatches) {
-    const g = agg.get(deadlineGroupOf(b.cls));
-    const c = packBatchCounts(b, cutoffIso);
-    g.remaining += c.remaining;
-    g.recentDone += c.recentDone;
+    const c = packBatchCounts(b);
+    if (c.line) {
+      lineRemaining[c.line] += c.remaining;
+      lineRemaining.total += c.remaining;
+      continue;
+    }
+    const key = deadlineGroupOf(b.cls);
+    agg.set(key, agg.get(key) + c.remaining);
   }
-  const groups = [...agg.entries()].map(([key, g]) => {
-    const dMs = deadlineToMs(workDate, FLOOR_DEADLINES[key]);
+  const order = [...agg.keys()].sort(
+    (a, b) => deadlineToMs(workDate, FLOOR_DEADLINES[a]) - deadlineToMs(workDate, FLOOR_DEADLINES[b])
+  );
+  let queued = 0;
+  const groups = order.map((key) => {
+    const remaining = agg.get(key);
+    queued += remaining;
     return {
       key,
       label: GROUP_LABELS[key],
       deadline: FLOOR_DEADLINES[key],
-      remaining: g.remaining,
-      ...computeEta({ nowMs, remaining: g.remaining, recentDone: g.recentDone, windowMin: FLOOR_RATE_WINDOW_MIN, deadlineMs: dMs }),
+      remaining,
+      ...computeEta({ nowMs, remaining, queued, rate: rateInfo.rate, deadlineMs: deadlineToMs(workDate, FLOOR_DEADLINES[key]) }),
     };
   });
   return {
     groups,
     overall: pickOverallEta(groups),
     remaining: groups.reduce((s, g) => s + g.remaining, 0),
-    windowMin: FLOOR_RATE_WINDOW_MIN,
+    lineRemaining,
+    rate: rateInfo.rate,
+    rateSample: rateInfo.sample,
+    idleGapMin: FLOOR_IDLE_GAP_MIN,
   };
 }
 
@@ -391,12 +465,14 @@ export async function getFloorData({ now = new Date(), days } = {}) {
   const db = getDB();
   const nowMs = now.getTime();
   const workDate = jstToday(now);
-  const cutoffIso = new Date(nowMs - FLOOR_RATE_WINDOW_MIN * 60000).toISOString();
 
   // PACKING_ENABLED=0 = 梱包アプリを意図的に切り離した状態。ボードも読まない
   // (無効化の理由が migration 失敗などのとき、古い/壊れたデータを現況として出さない)
   const packingDisabled = process.env.PACKING_ENABLED === '0';
-  const packBatches = packingDisabled ? null : loadPackBatches(db, workDate, cutoffIso);
+  const packBatches = packingDisabled ? null : loadPackBatches(db, workDate);
+  const rateInfo = packBatches
+    ? computeWorkRate(loadRecentDoneAt(db, workDate, now.toISOString(), FLOOR_RATE_SAMPLE))
+    : { rate: null, sample: 0, workedMin: 0 };
 
   // 梱包の当日進捗 (伝票ベース・cancelled は分母から除外)
   let packProgress = null;
@@ -405,7 +481,7 @@ export async function getFloorData({ now = new Date(), days } = {}) {
     let done = 0;
     let total = 0;
     for (const b of packBatches) {
-      const c = packBatchCounts(b, cutoffIso);
+      const c = packBatchCounts(b);
       total += c.total;
       done += c.done;
     }
@@ -438,6 +514,15 @@ export async function getFloorData({ now = new Date(), days } = {}) {
     }
   }
 
+  const eta = buildEta(packBatches, workDate, nowMs, rateInfo);
+  const lines = packBatches ? buildLineStrip(db, workDate) : null;
+  // ラインは完了予測から外してある (伝票単位の完了が刻まれない) ので、残数はライン帯に出す
+  if (lines && eta) {
+    for (const k of ['pas', 'melt']) {
+      if (lines[k]) lines[k].remaining = eta.lineRemaining[k];
+    }
+  }
+
   return {
     ok: true,
     now: now.toISOString(),
@@ -452,10 +537,10 @@ export async function getFloorData({ now = new Date(), days } = {}) {
       active: packActive,
       stats: packStats,
       statsError: packStatsError,
-      lines: buildLineStrip(db, workDate),
+      lines,
     } : null,
     flow: buildFlow(db, workDate, packBatches),
-    eta: buildEta(packBatches, workDate, nowMs, cutoffIso),
+    eta,
     alerts: buildAlerts(db, workDate, packBatches, nowMs),
     quality: buildQuality(db, workDate),
   };

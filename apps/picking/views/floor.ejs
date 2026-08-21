@@ -178,7 +178,7 @@
           <span class="eta-tag mut" id="etaTag">計測中</span>
         </div>
         <div class="deadlines" id="deadlines"></div>
-        <div class="eta-sub">残り <b id="etaRemain">-</b> 伝票 <span id="etaNote"></span></div>
+        <div class="eta-sub">手梱包 残り <b id="etaRemain">-</b> 伝票 <span id="etaNote"></span></div>
       </div>
 
       <div class="panel">
@@ -254,6 +254,14 @@
     function fmt1(n) { return n == null ? '-' : Number(n).toFixed(1); }
     function pad(n) { return String(n).padStart(2, '0'); }
     function hhmm(ms) { var d = new Date(ms); return pad(d.getHours()) + ':' + pad(d.getMinutes()); }
+    // 予測が日をまたいだら日付も出す (「03:07」だけだと今日の早朝に見える)
+    function etaLabel(ms) {
+      var d = new Date(ms), n = new Date();
+      var sameDay = d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
+      return (sameDay ? '' : (d.getMonth() + 1) + '/' + d.getDate() + ' ') + hhmm(ms);
+    }
+    // これを超える超過は分数を出さず「本日中は困難」と言い切る (桁の大きい分数は現場に伝わらない)
+    var LATE_CAP_MIN = 180;
     function mmdd(d) { return d ? d.slice(5).replace('-', '/') : '-'; }
 
     // board.ejs と同じ配色 (ratio = 本人 ÷ 分類平均。0.75緑 → 1.0黄 → 1.35赤)
@@ -291,10 +299,12 @@
         big.textContent = '計測中'; big.className = 'eta-big small';
         tag.textContent = '完了ペース待ち'; tag.className = 'eta-tag mut';
       } else {
-        big.textContent = hhmm(o.etaMs);
+        big.textContent = etaLabel(o.etaMs);
         big.className = 'eta-big ' + (o.status === 'late' ? 'late' : 'ok');
         if (o.status === 'late') {
-          tag.textContent = String(-o.marginMin) + '分 超過見込み'; tag.className = 'eta-tag late';
+          tag.textContent = -o.marginMin >= LATE_CAP_MIN
+            ? '本日中は困難' : String(-o.marginMin) + '分 超過見込み';
+          tag.className = 'eta-tag late';
         } else {
           tag.textContent = '締切まで余裕 ' + o.marginMin + '分'; tag.className = 'eta-tag ok';
         }
@@ -303,12 +313,16 @@
         var e;
         if (g.status === 'done') e = '<span class="e ok">完了</span>';
         else if (g.status === 'measuring') e = '<span class="e mut">計測中</span>';
-        else e = '<span class="e ' + (g.status === 'late' ? 'late' : 'ok') + '">予測 ' + hhmm(g.etaMs) + '</span>';
+        else e = '<span class="e ' + (g.status === 'late' ? 'late' : 'ok') + '">予測 ' + etaLabel(g.etaMs) + '</span>';
         return '<div class="dl"><span class="g">' + esc(g.label) + '</span>' + e +
           '<span class="c">締切 ' + esc(g.deadline) + '</span></div>';
       }).join('');
       document.getElementById('etaRemain').textContent = eta.remaining;
-      document.getElementById('etaNote').textContent = '(直近' + eta.windowMin + '分のペースで予測)';
+      // ライン分は予測に入れていない (伝票単位の完了が刻まれない) ので、残数だけ添える
+      var lineRemain = eta.lineRemaining ? eta.lineRemaining.total : 0;
+      document.getElementById('etaNote').textContent =
+        (lineRemain > 0 ? '+ 梱包機ライン ' + lineRemain + '伝票 ' : '') +
+        (eta.rate > 0 ? '(実働ペース ' + eta.rate.toFixed(1) + '伝票/分で予測)' : '(完了ペース計測中)');
     }
 
     function renderProgress(pickToday, packProgress) {
@@ -435,6 +449,7 @@
         return '<span class="line-item"><b>' + name + '</b>' +
           '<span class="st ' + st.cls + '">' + st.label + '</span>' +
           (v.planned != null ? ' ' + v.planned + '件' : '') +
+          (v.remaining ? '<span class="mut">未完了 ' + v.remaining + '伝票</span>' : '') +
           (v.doneToday ? '<span class="mut">本日累計 ' + v.doneToday + '件</span>' : '') +
           '</span>';
       });
