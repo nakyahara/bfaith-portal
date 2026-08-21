@@ -719,21 +719,28 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     let switchedFrom = null; // ライン工程開始での担当交代 (payload に監査記録)
 
     if (event === 'takeover') {
-      // 担当者の交代 (選び間違い・実際の引き継ぎ)。作業中・中断中のみ・記録が残る唯一の正規突破口
-      if (batch.status !== 'packing' && batch.status !== 'paused') {
-        throw new PackError(409, 'not_packing', `作業中ではないため交代できません (${batch.status})`);
+      // 担当者の交代 (選び間違い・実際の引き継ぎ)。記録が残る唯一の正規突破口。
+      // 完了後も可 (中原さん指示 2026-08-21: 選び間違いに完了後に気づいても帰属を直せる)
+      if (!['packing', 'paused', 'done'].includes(batch.status)) {
+        throw new PackError(409, 'not_packing', `交代できる状態ではありません (${batch.status})`);
       }
       if (batch.worker !== worker) {
         db.prepare('UPDATE pk_pack_batches SET worker=?, updated_at=? WHERE id=?').run(worker, now, batchId);
       }
-      // ライン工程中の交代は「進行中の工程行」の担当も引き継ぐ (工程途中の操作判定は
-      // 工程行の worker で行うため。完了済みの工程の担当記録は変えない)。
-      // batch.worker が既に本人でも実行する — 工程行だけ食い違う不整合の修復口 (Codex medium)
       if (lineKind) {
-        db.prepare(`UPDATE pk_pack_line_runs SET worker=?, updated_at=?
-          WHERE batch_id=? AND started_at IS NOT NULL
-            AND (finished_at IS NULL OR (phase='run' AND final_count IS NULL))
-        `).run(worker, now, batchId);
+        if (batch.status === 'done') {
+          // 完了後の修正 = 最終帰属 (流し担当) を直す。仕分け担当の記録は別人の可能性があるため変えない
+          db.prepare(`UPDATE pk_pack_line_runs SET worker=?, updated_at=?
+            WHERE batch_id=? AND phase='run'`).run(worker, now, batchId);
+        } else {
+          // ライン工程中の交代は「進行中の工程行」の担当も引き継ぐ (工程途中の操作判定は
+          // 工程行の worker で行うため。完了済みの工程の担当記録は変えない)。
+          // batch.worker が既に本人でも実行する — 工程行だけ食い違う不整合の修復口 (Codex medium)
+          db.prepare(`UPDATE pk_pack_line_runs SET worker=?, updated_at=?
+            WHERE batch_id=? AND started_at IS NOT NULL
+              AND (finished_at IS NULL OR (phase='run' AND final_count IS NULL))
+          `).run(worker, now, batchId);
+        }
       }
     } else if (event === 'pause') {
       // 中断: 中断時間は梱包時間から除外する。時刻は端末の発生時刻をクランプ採用

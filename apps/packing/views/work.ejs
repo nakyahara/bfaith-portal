@@ -1195,9 +1195,16 @@
       $('workerTag').textContent = `👤 ${worker}`;
       $('workerOverlay').style.display = 'none';
       $('workerCancel').style.display = 'none';
-      const inProgress = STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused';
+      const inProgress = STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused'
+        || STATE.batchStatus === 'done';   // 完了後の帰属修正も交代として記録 (2026-08-21)
       if (inProgress && prevWorker && prevWorker !== name) {
         enqueue('takeover', null);   // 交代の記録 (無断で元担当を名乗らない — Codex R1 high)
+      }
+      if (STATE.batchStatus === 'done') {
+        // 完了済み: start は送らない (already_done)。交代の記録だけで完了
+        showToast(prevWorker !== name ? `担当者を ${name} に変更しました` : '担当者は変更されていません');
+        render();
+        return;
       }
       if (STATE.batchStatus === 'paused') {
         // 中断中の再開は resume 経由 (start は ready/packing 用)。再開ボタンを出す
