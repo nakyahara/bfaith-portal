@@ -285,6 +285,84 @@ export function setStepState(draftId, stepCode, patch, actor) {
 }
 
 /**
+ * かんばん 1 枚分のデータ。列 (工程) ごとにカードを振り分けて返す。
+ *
+ * 現在工程の判定は SQL でなく JS で行う。ph_steps.sort は管理画面から編集できる数値で
+ * 重複しうるため、「sort が最小の未完了行」を SQL で取ると同点のとき列が不定になる。
+ *
+ * @param {object} opts.assigneeId  この担当者のボールだけに絞る (null = 全部)
+ * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
+ * @returns {{columns: Array, imageColumns: Array, doneCards: Array, total: number, truncated: boolean}}
+ */
+export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800 } = {}) {
+  const steps = db.prepare(`
+    SELECT code, label, track, sort, role_code, stall_days FROM ph_steps
+    WHERE active = 1 ORDER BY track = 'image', sort, code
+  `).all();
+  // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
+  const drafts = db.prepare(`
+    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at,
+      (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
+      (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
+    FROM product_drafts d
+    WHERE d.status NOT IN ('on_hold', 'excluded')
+    ORDER BY d.updated_at DESC
+    LIMIT ?
+  `).all(limit + 1);
+  const truncated = drafts.length > limit;
+  if (truncated) drafts.length = limit;
+
+  ensureProgressForMany(db, drafts.map((d) => d.id));
+  const summary = progressSummaryFor(db, drafts.map((d) => d.id));
+
+  const columns = steps.filter((s) => s.track === 'main').map((s) => ({ ...s, cards: [] }));
+  const imageColumns = steps.filter((s) => s.track === 'image').map((s) => ({ ...s, cards: [] }));
+  const byCode = new Map([...columns, ...imageColumns].map((c) => [c.code, c]));
+  const doneCards = [];
+
+  for (const d of drafts) {
+    const p = summary.get(d.id);
+    if (!p) continue;
+    const card = {
+      id: d.id, ne_code: d.ne_code, name: d.name, status: d.status,
+      first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
+      current: p.current, imageCurrent: p.imageCurrent, imageDone: p.imageDone,
+      stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
+    };
+    // 絞り込みは本流・画像のどちらかのボールが一致すれば残す。
+    // 画像担当の人が「自分の分だけ」を見たとき、本流が別担当でも画像列に自分の札が要る
+    if (assigneeId != null) {
+      const hit = p.current?.assignee_id === assigneeId || p.imageCurrent?.assignee_id === assigneeId;
+      if (!hit) continue;
+    }
+    if (unassignedOnly) {
+      // システム工程 (担当ロールが無い = AI待ち) は「未割り当て」ではないので数えない
+      const mainUnassigned = p.current && p.current.role_code && p.current.assignee_id == null;
+      const imageUnassigned = p.imageCurrent && p.imageCurrent.role_code && p.imageCurrent.assignee_id == null;
+      if (!mainUnassigned && !imageUnassigned) continue;
+    }
+    if (p.current) byCode.get(p.current.step_code)?.cards.push(card);
+    else doneCards.push(card);
+    if (p.imageCurrent) byCode.get(p.imageCurrent.step_code)?.cards.push(card);
+  }
+
+  // 停滞しているものを上に出す (打ち手が要るカードを埋もれさせない)
+  const order = (a, b) => (b.stalledDays || 0) - (a.stalledDays || 0) || a.id - b.id;
+  for (const c of columns) c.cards.sort(order);
+  for (const c of imageColumns) c.cards.sort(order);
+
+  return {
+    columns,
+    imageColumns,
+    // 完了は溜まる一方なので直近だけ (全部見たいときは一覧から)
+    doneCards: doneCards.slice(0, 30),
+    doneTotal: doneCards.length,
+    total: drafts.length,
+    truncated,
+  };
+}
+
+/**
  * 一覧・かんばん用に複数ドラフトの進捗をまとめて引く (行ごとに引くと N+1)。
  * @returns {Map<number, {current, image, ...}>}
  */
@@ -295,10 +373,13 @@ export function progressSummaryFor(db, draftIds) {
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.done_at, p.started_at,
-           s.label, s.track, s.sort, s.stall_days,
-           st.name AS assignee_name, st.color AS assignee_color
+           s.label, s.track, s.sort, s.stall_days, s.role_code,
+           st.name AS assignee_name, st.color AS assignee_color,
+           -- 先頭工程が止まっている場合は前工程の完了日時が無いので、ドラフト作成日時を起点にする
+           d.created_at AS draft_created_at
     FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+    JOIN product_drafts d ON d.id = p.draft_id
     LEFT JOIN ph_staff st ON st.id = p.assignee_id
     WHERE p.draft_id IN (${placeholders})
     ORDER BY s.track = 'image', s.sort, s.code
@@ -314,11 +395,13 @@ export function progressSummaryFor(db, draftIds) {
     const image = all.filter((r) => r.track === 'image');
     const current = currentOf(main);
     const imageCurrent = currentOf(image);
+    const createdAt = all[0]?.draft_created_at || null;
     out.set(id, {
       current,
       imageCurrent,
       imageDone: image.length > 0 && !imageCurrent,
-      stalledDays: current ? stalledDaysOf(main, main.indexOf(current), null) : null,
+      stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
+      imageStalledDays: imageCurrent ? stalledDaysOf(image, image.indexOf(imageCurrent), createdAt) : null,
       doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
       totalCount: main.length,
     });

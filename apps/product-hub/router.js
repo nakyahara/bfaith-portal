@@ -20,12 +20,12 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
 } from './db.js';
 import {
-  listStaff, createStaff, updateStaff, setStaffActive, setStaffRoles,
+  listStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, staffByPortalEmail,
   listRoles, createRole, updateRole,
   listSteps, createStep, updateStep, workflowOverview,
 } from './lib/workflow.js';
 import {
-  progressOf, setStepState, progressSummaryFor, ensureProgressForMany, STEP_STATE_LABELS,
+  progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
 } from './lib/workflow-progress.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
@@ -1506,6 +1506,30 @@ function workflowError(res, e) {
   if (status >= 500) console.error('[product-hub] workflow:', e);
   res.status(status).json({ ok: false, error: status >= 500 ? 'サーバーエラーが発生しました' : e.message });
 }
+
+// かんばんボード = 「ステータスごとに誰が何をするか」の主画面 (中原さん 2026-08-23)。
+// 列 = 工程、カード = 商品。上段が本流、下段が画像トラック (基本情報の後から並行で走る)
+router.get('/board', (req, res) => {
+  const db = getDB();
+  const me = staffByPortalEmail(req.session?.email);
+  // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
+  const raw = String(req.query.assignee || '').trim();
+  const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
+  const unassignedOnly = String(req.query.filter || '') === 'unassigned';
+  const board = boardData(db, { assigneeId, unassignedOnly });
+  res.render(view('board.ejs'), {
+    title: '工程ボード',
+    displayName: req.session?.displayName || req.session?.email || '',
+    board,
+    staff: listStaff(),
+    me,
+    assigneeId,
+    assigneeParam: raw,
+    unassignedOnly,
+    thumbnailUrl,
+    stepStateLabels: STEP_STATE_LABELS,
+  });
+});
 
 router.get('/staff', (req, res) => {
   res.render(view('staff.ejs'), {

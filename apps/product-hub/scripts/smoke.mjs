@@ -1856,6 +1856,51 @@ let wfDraftId = null;
   check('工程を無効化すると進捗からも消える', !wfp.progressOf(idReview, { db }).main.some((s) => s.step_code === added));
 }
 
+// ─── かんばんボード (2026-08-23) ───
+{
+  const idHold = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-HOLD', '保留テスト', 'on_hold', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(idHold, { db });
+
+  // 停滞の再現: WF-STALL は上の一括修復テストで作り直したので、改めて前工程の完了日時をずらす
+  db.prepare(`
+    UPDATE draft_step_progress SET done_at = ?
+    WHERE step_code = 'basic_info'
+      AND draft_id = (SELECT id FROM product_drafts WHERE ne_code = 'WF-STALL')
+  `).run(new Date(Date.now() - 5 * 86400000).toISOString());
+
+  const b = wfp.boardData(db, {});
+  check('ボード: 本流6列 + 画像3列', b.columns.length === 6 && b.imageColumns.length === 3);
+  const onBoard = new Set(b.columns.flatMap((c) => c.cards.map((x) => x.id)).concat(b.doneCards.map((x) => x.id)));
+  check('ボード: 保留の商品は載せない', !onBoard.has(idHold));
+  check('ボード: 工程テストの商品が載る', onBoard.has(wfDraftId));
+  check('ボード: カードは1商品につき本流の1列だけ',
+    b.columns.reduce((n, c) => n + c.cards.filter((x) => x.id === wfDraftId).length, 0) === 1);
+  check('ボード: 画像列にも同じ商品が出る (並行トラック)',
+    b.imageColumns.some((c) => c.cards.some((x) => x.id === wfDraftId)));
+
+  // 停滞しているカードを先頭に出す (打ち手が要るものを埋もれさせない)
+  const aiCol = b.columns.find((c) => c.code === 'ai_generate');
+  check('ボード: 停滞カードが列の先頭', aiCol.cards.length > 0 && aiCol.cards[0].stalledDays >= 3,
+    JSON.stringify(aiCol.cards.map((c) => c.stalledDays)));
+
+  // 担当者で絞る
+  const mine = wfp.boardData(db, { assigneeId: wfTanakaId });
+  const mineIds = mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards.map((x) => x.id));
+  check('ボード: 担当者で絞れる', mineIds.length > 0 && mineIds.length <= onBoard.size + mine.imageColumns.length * 2);
+  const other = wfp.boardData(db, { assigneeId: wfOkawaId });
+  check('ボード: 担当していない人には出ない',
+    other.columns.flatMap((c) => c.cards).every((c) => c.current?.assignee_id === wfOkawaId || c.imageCurrent?.assignee_id === wfOkawaId));
+
+  // 未割り当てだけ (システム工程は「未割り当て」に数えない)
+  const un = wfp.boardData(db, { unassignedOnly: true });
+  check('ボード: 未割り当て絞り込みでAI待ちを拾わない',
+    !un.columns.find((c) => c.code === 'ai_generate').cards.some((c) => c.current?.role_code == null));
+
+  check('ボード: 件数が返る', b.total >= 3 && b.truncated === false);
+}
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -2542,6 +2587,21 @@ renders.push(
   ['staff.ejs (admin)', 'staff.ejs', { ...staffBase, isAdmin: true }],
   ['staff.ejs (閲覧のみ)', 'staff.ejs', { ...staffBase, isAdmin: false }],
   ['staff.ejs (担当者ゼロ)', 'staff.ejs', { ...staffBase, isAdmin: true, staff: [] }],
+);
+// かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
+const boardBase = {
+  title: '工程ボード', displayName: '中原 大輔',
+  board: wfp.boardData(db, {}), staff: wf.listStaff(),
+  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false,
+  stepStateLabels: wfp.STEP_STATE_LABELS,
+};
+renders.push(
+  ['board.ejs', 'board.ejs', boardBase],
+  ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
+  ['board.ejs (空)', 'board.ejs', {
+    ...boardBase,
+    board: { columns: [], imageColumns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
+  }],
 );
 for (const [name, file, data] of renders) {
   try {
