@@ -28,7 +28,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal,
+  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
 import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR } from './reprint-pdf.js';
@@ -159,7 +159,9 @@ router.post('/api/floor-alerts', checkOrigin, api(async (req, res) => {
 }));
 router.get('/api/floor-alerts', api(async (req, res) => {
   const { listFloorAlerts } = await import('../picking/service.js');
-  res.json({ ok: true, alerts: listFloorAlerts('to_packing') });
+  // repickReady = 再ピック完了で受領待ちのタスク (緑バナー「現物を受け取った」の元データ。
+  // 通知の既読 (OK) と業務上の受領を混同させない — 2026-08-23)
+  res.json({ ok: true, alerts: listFloorAlerts('to_packing'), repickReady: listRepickReady() });
 }));
 router.post('/api/floor-alerts/:id(\\d+)/ack', checkOrigin, api(async (req, res) => {
   const { ackFloorAlert } = await import('../picking/service.js');
@@ -337,6 +339,11 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   } else if (req.session?.email) {
     worker = req.session.displayName || req.session.email;
   }
+  // 品違いの実物SKUは記録時にサーバー検証 (形式+在庫実在・名前はサーバー由来 — 2026-08-23)。
+  // 終了画面で再入力させない代わりに、ここで確定させる
+  let actualSku = req.body.actual_sku || null;
+  let actualName = null;
+  if (req.body.event === 'wrong_item') ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku));
   const result = applyEvent(Number(req.params.id), {
     opId: req.body.op_id,
     event: req.body.event,
@@ -346,7 +353,8 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     jumped: !!req.body.jumped,
     proposedMethod: req.body.proposed_method || null,
     sku: req.body.sku || null,
-    actualSku: req.body.actual_sku || null,
+    actualSku,
+    actualName,
     qty: req.body.qty == null ? null : Number(req.body.qty),
     // '' は未入力として null に落とす (Number('')===0 で「0件」と誤解釈しない — Codex medium)
     finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
@@ -462,10 +470,9 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
   }
   const decision = String(req.body.decision || '');
   // 品違いの実物SKUはサーバー側で検証 (Codexレビュー: クライアント任意文字列を信用しない)。
-  // 形式チェック+在庫データへの実在照会。名前もサーバー由来のみ採用 (通知への注入防止)
+  // 記録時に検証済みでも、確定時は「実際に使われるSKU」を必ず再検証する (保存済み値での迂回防止 — Codex 2巡目)
   let actualSku = req.body.actual_sku == null ? null : String(req.body.actual_sku).trim().toLowerCase();
   let actualName = null;
-  // 確定時は「実際に使われるSKU」を必ず検証対象にする (保存済み actual_sku での迂回防止 — Codex 2巡目)
   if (decision === 'confirm' && !actualSku) {
     const incRow = getDB().prepare('SELECT kind, actual_sku FROM pk_pack_incidents WHERE id=?')
       .get(Number(req.params.iid));
@@ -473,24 +480,7 @@ router.post('/api/batches/:id(\\d+)/incidents/:iid(\\d+)/resolve', checkOrigin, 
       actualSku = String(incRow.actual_sku).trim().toLowerCase();
     }
   }
-  if (actualSku) {
-    if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(actualSku)) {
-      throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
-    }
-    try {
-      const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
-      if (stockLookupConfigured()) {
-        const hit = (await fetchStockSearch(actualSku))?.items
-          ?.find((it) => String(it.sku).toLowerCase() === actualSku);
-        if (!hit) throw new PackError(400, 'unknown_sku', 'そのSKUは在庫データに見つかりません。検索から選び直してください');
-        actualName = hit.name || null;
-      }
-    } catch (e) {
-      if (e instanceof PackError) throw e;
-      // 在庫参照の一時障害では形式チェックのみで通す (現場の送信を止めない・fail-soft)
-      console.warn(`[packing] 実物SKUの在庫照会失敗 (形式チェックのみで続行): ${e.message}`);
-    }
-  }
+  if (actualSku) ({ sku: actualSku, name: actualName } = await verifyActualSku(actualSku));
   const inc = resolveIncident(Number(req.params.iid), decision, actor, Number(req.params.id), {
     actualSku, actualName,
   });
@@ -539,6 +529,34 @@ router.get('/api/stock-search', api(async (req, res) => {
     res.json({ ok: true, items: [], error: e.message });
   }
 }));
+
+/**
+ * 品違いの「実際に入っていた商品」SKUをサーバー側で検証する (クライアント任意文字列を信用しない)。
+ * 形式チェック + 在庫データへの実在照会。名前はサーバー由来のみ採用 (通知への注入防止)。
+ * 在庫参照の一時障害では形式チェックのみで通す (現場の記録・送信を止めない・fail-soft)。
+ * 記録時 (wrong_item イベント) と確定時 (incidents/resolve) の両方で使う。
+ * @returns {{sku: string, name: string|null}}
+ */
+async function verifyActualSku(raw) {
+  const sku = String(raw ?? '').trim().toLowerCase();
+  if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してください');
+  if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) {
+    throw new PackError(400, 'bad_sku', 'SKUの形式が不正です。検索から選んでください');
+  }
+  let name = null;
+  try {
+    const { fetchStockSearch, stockLookupConfigured } = await import('../picking/stock-locations.js');
+    if (stockLookupConfigured()) {
+      const hit = (await fetchStockSearch(sku))?.items?.find((it) => String(it.sku).toLowerCase() === sku);
+      if (!hit) throw new PackError(400, 'unknown_sku', 'そのSKUは在庫データに見つかりません。検索から選び直してください');
+      name = hit.name || null;
+    }
+  } catch (e) {
+    if (e instanceof PackError) throw e;
+    console.warn(`[packing] 実物SKUの在庫照会失敗 (形式チェックのみで続行): ${e.message}`);
+  }
+  return { sku, name };
+}
 
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
 router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {

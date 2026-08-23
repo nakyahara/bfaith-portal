@@ -839,6 +839,175 @@ t('getDailySummary: 実働・秒/伝票・例外操作カウントが集計さ�
   assert.ok(Array.isArray(s.batches));
 });
 
+// ─── 再ピック運用の現場フィードバック対応 (2026-08-23) ───
+
+t('品違いの実物は記録時に actual_name 付きで保存され、10個以上の数量も通る', () => {
+  const { listIncidents } = svc;
+  const p = parseCs03003(makeCsv([row({ slip: '0300', sku: 'wi-a', qty: 12, tb: 'TB00000000031' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  applyEvent(r.batchId, { opId: 'wi-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'wi-1', event: 'wrong_item', slipSeq: 1, sku: 'wi-a', actualSku: 'other-1', actualName: '実物の商品名', qty: 11 }, '星');
+  const inc = listIncidents(r.batchId, 'candidate')[0];
+  assert.equal(inc.actual_sku, 'other-1');
+  assert.equal(inc.actual_name, '実物の商品名');
+  assert.equal(inc.qty, 11);
+  assert.equal(getWorkState(r.batchId).incidents[0].actual_name, '実物の商品名');
+  // 数量上限は明細数量のまま
+  expectPackError(() => applyEvent(r.batchId, { opId: 'wi-2', event: 'wrong_item', slipSeq: 1, sku: 'wi-a', actualSku: 'other-1', qty: 13 }, '星'), 'bad_qty');
+});
+
+t('再ピック待ち (未処理ゼロ+保留) は梱包時間から除外され、受領で伝票の表示時刻が打ち直される', () => {
+  const { listIncidents, resolveIncident, applyTaskAction, listOpenTasks, batchActiveSec, listRepickReady } = svc;
+  const p = parseCs03003(makeCsv([
+    row({ slip: '0310', sku: 'bk-1', tb: 'TB00000000032' }),
+    row({ slip: '0311', sku: 'bk-2', tb: 'TB00000000032' }),
+  ]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const db = getDB();
+  applyEvent(r.batchId, { opId: 'bk-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'bk-n1', event: 'next', slipSeq: 1 }, '星');
+  assert.equal(getPackBatch(r.batchId).blocked_since, null, '未処理が残る間は待ち区間ではない');
+  // 伝票2で不足 → 未処理ゼロ+保留1 = 梱包できない区間の開始
+  applyEvent(r.batchId, { opId: 'bk-sh', event: 'shortage', slipSeq: 2, sku: 'bk-2', qty: 1 }, '星');
+  let b = getPackBatch(r.batchId);
+  assert.ok(b.blocked_since, '区間開始が記録される');
+  assert.equal(b.blocked_total_sec, 0);
+  // 10分前に開始し、2分前から待っていたことにする
+  const iso = (ms) => new Date(Date.now() - ms).toISOString().slice(0, 19) + 'Z';
+  db.prepare('UPDATE pk_pack_batches SET blocked_since=?, started_at=? WHERE id=?').run(iso(120e3), iso(600e3), r.batchId);
+  db.prepare("UPDATE pk_pack_slips SET shown_at='2026-01-01T00:00:00Z' WHERE batch_id=? AND seq=2").run(r.batchId);
+  // 送信 → ピッカー完了 → 受領待ち一覧 → 受領
+  const inc = listIncidents(r.batchId, 'candidate')[0];
+  resolveIncident(inc.id, 'confirm', '星');
+  const task = listOpenTasks().find((t) => t.batch_id === r.batchId && t.kind === 'repick');
+  applyTaskAction(task.id, 'claim', '月');
+  applyTaskAction(task.id, 'fulfill', '月');
+  const ready = listRepickReady().find((g) => g.batch_id === r.batchId && g.slip_seq === 2);
+  assert.ok(ready, '受領待ち一覧に出る (伝票単位)');
+  assert.deepEqual(ready.tasks.map((t) => t.id), [task.id]);
+  assert.equal(ready.tasks[0].claimed_by, '月');
+  assert.equal(ready.requested_by, '星');
+  applyEvent(r.batchId, { opId: 'bk-rc', event: 'receive', slipSeq: 2 }, '星');
+  b = getPackBatch(r.batchId);
+  assert.equal(b.blocked_since, null, '受領で区間が閉じる');
+  assert.ok(b.blocked_total_sec >= 118 && b.blocked_total_sec <= 125, `待ち時間が累計される (${b.blocked_total_sec})`);
+  const s2 = listPackSlips(r.batchId)[1];
+  assert.equal(s2.status, 'pending');
+  assert.notEqual(s2.shown_at, '2026-01-01T00:00:00Z', '受領時に表示時刻が打ち直される');
+  assert.ok(!listRepickReady().some((g) => g.batch_id === r.batchId), '受領後は受領待ち一覧から消える');
+  applyEvent(r.batchId, { opId: 'bk-n2', event: 'next', slipSeq: 2 }, '星');
+  b = getPackBatch(r.batchId);
+  assert.equal(b.status, 'done');
+  const active = batchActiveSec(b);
+  const wall = Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000);
+  assert.ok(active <= wall - 118, `実働から待ち時間が引かれる (wall=${wall}, active=${active})`);
+  const summary = svc.getDailySummary(jstToday());
+  assert.ok(summary.total.blockedSec >= 118, '日次サマリに除外分が出る');
+});
+
+t('再ピック待ち中の中断は二重控除しない (中断で区間を閉じ、再開で再び開く)', () => {
+  const p = parseCs03003(makeCsv([row({ slip: '0320', sku: 'pz-1', tb: 'TB00000000033' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  applyEvent(r.batchId, { opId: 'pz-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'pz-sh', event: 'shortage', slipSeq: 1, sku: 'pz-1', qty: 1 }, '星');
+  assert.ok(getPackBatch(r.batchId).blocked_since);
+  applyEvent(r.batchId, { opId: 'pz-p', event: 'pause', reason: 'その他' }, '星');
+  assert.equal(getPackBatch(r.batchId).blocked_since, null, '中断中は待ち区間を閉じる');
+  applyEvent(r.batchId, { opId: 'pz-r', event: 'resume' }, '星');
+  assert.ok(getPackBatch(r.batchId).blocked_since, '再開で待ち区間が再び開く');
+  applyEvent(r.batchId, { opId: 'pz-f', event: 'found', slipSeq: 1 }, '星');
+  assert.equal(getPackBatch(r.batchId).blocked_since, null, '見つかった (保留解除) で閉じる');
+  applyEvent(r.batchId, { opId: 'pz-c', event: 'cancel' }, '星');
+  assert.equal(getPackBatch(r.batchId).blocked_total_sec, 0, '取消で累計もリセット');
+});
+
+t('中断の区間境界は端末時刻 (クランプ) — オフライン送信でも中断と待ちを二重控除しない', () => {
+  const p = parseCs03003(makeCsv([row({ slip: '0330', sku: 'ot-1', tb: 'TB00000000034' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const db = getDB();
+  const iso = (ms) => new Date(Date.now() - ms).toISOString().slice(0, 19) + 'Z';
+  applyEvent(r.batchId, { opId: 'ot-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'ot-sh', event: 'shortage', slipSeq: 1, sku: 'ot-1', qty: 1 }, '星');
+  // 10分前に開始・2分前から待ち。端末では1分前に中断していた (送信が遅れて今届いた)
+  db.prepare('UPDATE pk_pack_batches SET blocked_since=?, started_at=? WHERE id=?').run(iso(120e3), iso(600e3), r.batchId);
+  applyEvent(r.batchId, { opId: 'ot-p', event: 'pause', reason: 'その他', clientAt: iso(60e3) }, '星');
+  let b = getPackBatch(r.batchId);
+  assert.ok(b.blocked_total_sec >= 58 && b.blocked_total_sec <= 63, `待ちは中断開始 (端末時刻) までで閉じる (${b.blocked_total_sec})`);
+  // 30秒前に再開 (端末時刻) → 待ち区間は再開時刻から再び開く
+  applyEvent(r.batchId, { opId: 'ot-r', event: 'resume', clientAt: iso(30e3) }, '星');
+  b = getPackBatch(r.batchId);
+  assert.ok(b.paused_total_sec >= 28 && b.paused_total_sec <= 33, `中断は端末時刻どうしで計測 (${b.paused_total_sec})`);
+  assert.ok(Date.parse(b.blocked_since) <= Date.now() - 28e3, '待ち区間は再開時刻から');
+  applyEvent(r.batchId, { opId: 'ot-f', event: 'found', slipSeq: 1 }, '星');
+  b = getPackBatch(r.batchId);
+  assert.ok(b.blocked_total_sec >= 86 && b.blocked_total_sec <= 95, `合計 = 60 + 30 ≈ 90 (${b.blocked_total_sec})`);
+});
+
+t('終了画面からの取下げ (resolveIncident withdraw) でも待ち区間が閉じる', () => {
+  const { listIncidents, resolveIncident } = svc;
+  const p = parseCs03003(makeCsv([row({ slip: '0340', sku: 'wd-1', tb: 'TB00000000035' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const db = getDB();
+  const iso = (ms) => new Date(Date.now() - ms).toISOString().slice(0, 19) + 'Z';
+  applyEvent(r.batchId, { opId: 'wd-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'wd-sh', event: 'shortage', slipSeq: 1, sku: 'wd-1', qty: 1 }, '星');
+  db.prepare('UPDATE pk_pack_batches SET blocked_since=? WHERE id=?').run(iso(45e3), r.batchId);
+  db.prepare("UPDATE pk_pack_slips SET shown_at='2026-01-01T00:00:00Z' WHERE batch_id=? AND seq=1").run(r.batchId);
+  resolveIncident(listIncidents(r.batchId, 'candidate')[0].id, 'withdraw', '星');
+  const b = getPackBatch(r.batchId);
+  assert.equal(b.blocked_since, null, '取下げで保留が解けた時点で区間が閉じる');
+  assert.ok(b.blocked_total_sec >= 43 && b.blocked_total_sec <= 48, `累計される (${b.blocked_total_sec})`);
+  assert.notEqual(listPackSlips(r.batchId)[0].shown_at, '2026-01-01T00:00:00Z', '表示時刻も打ち直す');
+});
+
+t('送信済みの再ピックが残る伝票は、別候補を取り下げても保留のまま (現物未受領で再開しない)', () => {
+  const { listIncidents, resolveIncident } = svc;
+  const p = parseCs03003(makeCsv([row({ slip: '0345', sku: 'kp-1', tb: 'TB00000000037' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const db = getDB();
+  applyEvent(r.batchId, { opId: 'kp-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'kp-sh', event: 'shortage', slipSeq: 1, sku: 'kp-1', qty: 1 }, '星');
+  resolveIncident(listIncidents(r.batchId, 'candidate')[0].id, 'confirm', '星');   // 再ピックタスク発行
+  // 同じ伝票に別候補を直接追加 (イベント経由では保留中に追加できないため) → それを取り下げる
+  const now = new Date().toISOString().slice(0, 19) + 'Z';
+  const inc2 = Number(db.prepare(`
+    INSERT INTO pk_pack_incidents (batch_id, slip_seq, kind, sku, qty, status, detected_by, created_at, updated_at)
+    VALUES (?, 1, 'shortage', 'kp-1', 1, 'candidate', '星', ?, ?)
+  `).run(r.batchId, now, now).lastInsertRowid);
+  resolveIncident(inc2, 'withdraw', '星');
+  assert.equal(listPackSlips(r.batchId)[0].status, 'held', '未受領の再ピックが残るので保留のまま');
+  assert.ok(getPackBatch(r.batchId).blocked_since, '待ち区間も継続');
+});
+
+t('同じ伝票に再ピックが複数あるときは全部 fulfilled で初めて受領可 (一覧・状態とも)', () => {
+  const { listIncidents, resolveIncident, applyTaskAction, listOpenTasks, listRepickReady } = svc;
+  const p = parseCs03003(makeCsv([row({ slip: '0350', sku: 'mt-1', tb: 'TB00000000036' })]));
+  const r = importPackBatch(p, { matchAck: true }, 'test');
+  const db = getDB();
+  applyEvent(r.batchId, { opId: 'mt-s', event: 'start' }, '星');
+  applyEvent(r.batchId, { opId: 'mt-sh', event: 'shortage', slipSeq: 1, sku: 'mt-1', qty: 1 }, '星');
+  resolveIncident(listIncidents(r.batchId, 'candidate')[0].id, 'confirm', '星');
+  const t1 = listOpenTasks().find((t) => t.batch_id === r.batchId && t.kind === 'repick');
+  // 2件目の再ピックを同じ伝票に直接追加 (運用上は稀だが、受領条件と表示条件の整合を確認)
+  const now = new Date().toISOString().slice(0, 19) + 'Z';
+  const t2id = Number(db.prepare(`
+    INSERT INTO pk_pack_tasks (batch_id, slip_seq, kind, sku, product_name, req_qty, status, requested_by, created_at, updated_at)
+    VALUES (?, 1, 'repick', 'mt-2', NULL, 1, 'requested', '星', ?, ?)
+  `).run(r.batchId, now, now).lastInsertRowid);
+  applyTaskAction(t1.id, 'claim', '月');
+  applyTaskAction(t1.id, 'fulfill', '月');
+  assert.ok(!listRepickReady().some((g) => g.batch_id === r.batchId), '片方だけ完了では受領待ち一覧に出ない');
+  assert.notEqual(getWorkState(r.batchId).repickBySlip[1], 'fulfilled', '画面状態も未完了');
+  expectPackError(() => applyEvent(r.batchId, { opId: 'mt-rc0', event: 'receive', slipSeq: 1 }, '星'), 'repick_not_ready');
+  applyTaskAction(t2id, 'claim', '月');
+  applyTaskAction(t2id, 'fulfill', '月');
+  const g = listRepickReady().find((x) => x.batch_id === r.batchId);
+  assert.ok(g && g.slip_seq === 1 && g.tasks.length === 2, '両方完了で伝票単位に1件');
+  assert.equal(getWorkState(r.batchId).repickBySlip[1], 'fulfilled');
+  applyEvent(r.batchId, { opId: 'mt-rc', event: 'receive', slipSeq: 1 }, '星');
+  assert.equal(listPackSlips(r.batchId)[0].status, 'pending');
+});
+
 // ─── 登録端末 (v3) ───
 
 t('端末登録→検証→失効', () => {

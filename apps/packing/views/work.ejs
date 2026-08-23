@@ -137,6 +137,7 @@
   </style>
 </head>
 <body>
+  <script>window.__packingBatchId = <%= Number(state.batch.id) %>;</script>
   <%- include('_floor_alerts') %>
   <div class="topbar">
     <span class="prog"><span id="progDone">-</span> / <%= state.slips.length %></span>
@@ -274,6 +275,7 @@
         <div id="issueSkuGrid" class="reason-grid" style="max-height:40vh; overflow-y:auto"></div>
         <input class="search-input" id="issueSkuInput" placeholder="SKU or 商品名で検索" style="margin-top:10px; display:none" list="batchSkus">
         <datalist id="batchSkus"></datalist>
+        <div id="issueSearchRes" style="display:flex; flex-direction:column; gap:6px; margin-top:8px; max-height:36vh; overflow-y:auto"></div>
       </div>
       <div id="issueStep3" style="display:none">
         <div style="color:#868e96; margin-bottom:10px" id="issueQtyLabel">数量は?</div>
@@ -312,11 +314,12 @@
       pauseReason: state.batch.pause_reason || null,
       startedAt: state.batch.started_at,
       pausedTotalSec: state.batch.paused_total_sec || 0,
+      blockedTotalSec: state.batch.blocked_total_sec || 0,   // 再ピック待ち (梱包できない時間) の累計 — 除外
       currentSeq: state.currentSeq,
       heldSeqs: state.slips.filter((x) => x.status === 'held').map((x) => x.seq),
       repickSeqs: state.slips.filter((x) => x.status === 'held' && x.hold_reason === 'repick').map((x) => x.seq),
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
-      incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, qty: i.qty, slipSeq: i.slip_seq })),
+      incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, actualName: i.actual_name || null, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
       shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
@@ -594,19 +597,35 @@
 
     function enqueue(event, slipSeq, extra = {}) {
       const q = loadQ();
+      const opId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       q.push({
-        op_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        op_id: opId,
         event, slip_seq: slipSeq, worker_name: worker,
         client_at: new Date().toISOString(),   // pause/resume の中断時間計測に使う (サーバーでクランプ)
         ...extra,
       });
       saveQ(q);
       pump();
+      return opId;
+    }
+    // 同じ直列キューに載せつつ、その操作の確定 (成功/業務エラー) を待てる版 (受領用 — 楽観更新はしない。
+    // 直接 fetch だと送信中のキューと順序が逆転し、応答喪失時に同一 op_id で再送もできない — Codex)
+    const waiters = new Map();   // op_id → resolve
+    function enqueueAndWait(event, slipSeq, extra = {}) {
+      return new Promise((resolve) => {
+        const opId = enqueue(event, slipSeq, extra);
+        waiters.set(opId, resolve);
+      });
+    }
+    function settle(opId, result) {
+      const w = waiters.get(opId);
+      if (w) { waiters.delete(opId); w(result); }
     }
 
     async function pump() {
       if (sending) return;
       sending = true;
+      let retryLater = false;   // 一時障害で3秒後の再送を予約した (finally の即時再起動を抑止 — Codex)
       try {
         let q = loadQ();
         while (q.length > 0) {
@@ -620,6 +639,7 @@
             });
           } catch {
             $('netDot').classList.add('ng');
+            retryLater = true;
             setTimeout(pump, 3000);   // オフライン: 3秒後に再送
             return;
           }
@@ -628,6 +648,7 @@
           if (res.status >= 500 || res.status === 429) {
             // 一時的なサーバー障害: キューを保持したまま再試行 (Codex R1 high:
             // 500系でキューを消すとオフライン中の完了操作が全滅する)
+            retryLater = true;
             setTimeout(pump, 3000);
             return;
           }
@@ -635,20 +656,23 @@
             // 業務エラー (taken / out_of_order 等): 問題の先頭項目だけを隔離して続行。
             // 後続の完了操作 (next(2), next(3)…) はまだ有効なことがある
             const body = await res.json().catch(() => ({}));
-            showToast(body.error || `エラー (${res.status})`);
+            if (!waiters.has(item.op_id)) showToast(body.error || `エラー (${res.status})`);
             q.shift(); saveQ(q);
+            settle(item.op_id, { ok: false, status: res.status, body });
             continue;
           }
           const body = await res.json();
           q.shift(); saveQ(q);
           applyServerResult(body);
+          settle(item.op_id, { ok: true, body });
         }
         // キューが空になった時点でサーバーと画面を最終同期
         await resync();
       } finally {
         sending = false;
-        // resync 中に enqueue された操作が滞留しないよう、残っていれば再起動 (Codex R2 medium)
-        if (loadQ().length > 0) setTimeout(pump, 0);
+        // resync 中に enqueue された操作が滞留しないよう、残っていれば再起動 (Codex R2 medium)。
+        // ただし一時障害の再送予約中は即時再起動しない (3秒待ちが効かず連打になる)
+        if (!retryLater && loadQ().length > 0) setTimeout(pump, 0);
       }
     }
 
@@ -679,7 +703,7 @@
         for (const q of body.repickReadySeqs) repickReadySet.add(q);
       }
       if (Array.isArray(body.incidents)) {
-        incidents = body.incidents.map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku ?? i.actualSku, qty: i.qty, slipSeq: i.slip_seq ?? i.slipSeq }));
+        incidents = body.incidents.map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku ?? i.actualSku, actualName: i.actual_name ?? i.actualName ?? null, qty: i.qty, slipSeq: i.slip_seq ?? i.slipSeq }));
         // 終了画面を開いたままなら候補一覧を更新 (tmp-*が実IDに置き換わりボタンが活性化する)
         if (overlayMode && $('doneOverlay').style.display === 'flex') showEndOverlay(overlayMode === 'done');
       }
@@ -830,7 +854,16 @@
         ? `✅ ${esc(STATE.folderName)}<br>${STATE.slips.length}伝票 完了しました`
         : `🏁 ひととおり処理しました`;
       $('endClose').style.display = done ? 'none' : 'inline-block';
-      $('endHint').style.display = (!done && heldSet.size > 0) ? 'block' : 'none';
+      // 保留伝票の状態と受領ボタンを終了画面にも置く (受領のために伝票を探し回らない — 2026-08-23)
+      const heldList = [...heldSet].sort((a, b) => a - b);
+      $('endHint').style.display = (!done && heldList.length > 0) ? 'block' : 'none';
+      if (!done && heldList.length > 0) {
+        $('endHint').innerHTML = '保留中の伝票: ' + heldList.map((q) => repickReadySet.has(q)
+          ? `<button type="button" class="end-receive" data-seq="${q}" style="margin:4px; padding:10px 16px; background:#2b8a3e; color:#fff; border:none; border-radius:10px; font-weight:800; font-size:16px">📦 #${q} 届いた分を受け取る (再開)</button>`
+          : `<span style="display:inline-block; margin:4px; padding:8px 12px; background:#f1f3f5; border-radius:10px">⏳ #${q} 再ピック対応待ち</span>`).join('')
+          + '<div style="font-size:13px; margin-top:4px">ピッカーが持ってきたら「受け取る」で再開します (上の緑バナーからも可)</div>';
+        $('endHint').querySelectorAll('.end-receive').forEach((b) => b.addEventListener('click', () => receiveSlip(Number(b.dataset.seq))));
+      }
       if (incidents.length === 0) { $('incBox').style.display = 'none'; return; }
       $('incBox').style.display = 'block';
       $('incList').innerHTML = incidents.map((i) => {
@@ -838,14 +871,15 @@
         const dis = syncing ? 'disabled style="opacity:.5"' : '';
         // 品違い: 実物 (梱包側にある間違い品) を商品検索で特定してから送信 (2026-08-21)。
         // この特定作業はバッチ完了打刻の後 = 梱包計測には入らない
-        const chosen = endActual[i.id];
+        // 品違いの実物は記録時に特定済みが基本 (2026-08-23)。ここは確認のみで、必要なら「修正」で検索を開く
+        const known = endActual[i.id] || (i.actualSku ? { sku: i.actualSku, name: i.actualName || null } : null);
         const identBlock = i.kind === 'wrong_item' ? `
           <div style="padding:4px 0 8px; border-bottom:1px solid #f1f3f5; font-size:14px">
-            間違い品の特定: ${chosen
-              ? `<b style="color:#2b8a3e">${esc(chosen.sku)}</b> ${esc(chosen.name || '')}`
-              : (i.actualSku ? `${esc(i.actualSku)} (記録時の入力)` : '<b style="color:#c5221f">未特定 — 検索してください</b>')}
+            間違い品: ${known
+              ? `<b style="color:#2b8a3e">${esc(known.sku)}</b> ${esc(known.name || '')} <button type="button" class="inc-edit" data-id="${i.id}" style="margin-left:8px; padding:4px 10px; border:1px solid #ced4da; border-radius:8px; background:#fff">修正</button>`
+              : '<b style="color:#c5221f">未特定 — 検索してください</b>'}
             <input type="search" class="inc-search" data-id="${i.id}" placeholder="商品名で検索 (例: ひのき)"
-              style="width:100%; margin-top:6px; padding:10px; font-size:15px; border:1px solid #ced4da; border-radius:8px">
+              style="width:100%; margin-top:6px; padding:10px; font-size:15px; border:1px solid #ced4da; border-radius:8px; ${known ? 'display:none' : ''}">
             <div class="inc-search-res" data-id="${i.id}" style="display:flex; flex-direction:column; gap:4px; margin-top:4px"></div>
           </div>` : '';
         return `
@@ -884,6 +918,12 @@
           }, 300);
         });
       });
+      document.querySelectorAll('.inc-edit').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const input = document.querySelector(`.inc-search[data-id="${btn.dataset.id}"]`);
+          if (input) { input.style.display = 'block'; input.focus(); }
+        });
+      });
       document.querySelectorAll('.inc-confirm, .inc-withdraw').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const decision = btn.classList.contains('inc-confirm') ? 'confirm' : 'withdraw';
@@ -916,13 +956,83 @@
         btn.addEventListener('click', () => onPick(s.lines[Number(btn.dataset.i)]));
       });
     }
+    // 数量: 1〜9 はワンタップ、10以上は数値入力 (上限 = 明細数量 / 余りは999)。
+    // 「9個までしか選べない」欠陥の修正 (現場指摘 2026-08-23 — 誤った数量のままタスクとミス記録に流れていた)
     function qtyButtons(max, onPick) {
       const n = Math.min(max, 9);
+      const more = max > 9 ? `
+        <div style="grid-column:1/-1; display:flex; gap:8px; align-items:center; margin-top:6px">
+          <input type="number" inputmode="numeric" id="issueQtyInput" min="1" max="${max}" placeholder="10〜${max} を入力"
+            style="flex:1; padding:12px; font-size:20px; border:1px solid #ced4da; border-radius:10px">
+          <button type="button" class="reason-opt" id="issueQtyOk" style="min-width:96px">決定</button>
+        </div>` : '';
       $('issueQtyGrid').innerHTML = Array.from({ length: n }, (_, i) =>
-        `<button class="reason-opt issue-qty" data-q="${i + 1}">${i + 1}個</button>`).join('');
+        `<button class="reason-opt issue-qty" data-q="${i + 1}">${i + 1}個</button>`).join('') + more;
       document.querySelectorAll('.issue-qty').forEach((btn) => {
         btn.addEventListener('click', () => onPick(Number(btn.dataset.q)));
       });
+      if (max > 9) {
+        const ok = () => {
+          const v = Number($('issueQtyInput').value);
+          if (!Number.isInteger(v) || v < 1 || v > max) { showToast(`数量は 1〜${max} で入力してください`); return; }
+          onPick(v);
+        };
+        $('issueQtyOk').addEventListener('click', ok);
+        $('issueQtyInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); ok(); } });
+      }
+    }
+
+    // 品違いの「実際に入っていた商品」の特定 (記録時・2026-08-23)。
+    // 手に持っている瞬間が一番特定しやすく、終了画面での再入力をなくす (Codex/中原さん)。
+    // バッチ内の他商品を候補ボタン + 在庫検索 (サーバーで形式+実在を検証)。自由入力文字列は送らない
+    function pickActualItem(expected, onPick) {
+      $('issueTitle').textContent = '実際に入っていた商品は？ (候補をタップ or 検索)';
+      const cands = allBatchSkus().filter(([sku]) => sku !== expected.sku);
+      $('issueSkuGrid').innerHTML = cands.slice(0, 8).map(([sku, name], i) =>
+        `<button class="reason-opt issue-cand" data-i="${i}" style="grid-column:1/-1; text-align:left">${esc(name)}<br><small>${esc(sku)}</small></button>`).join('');
+      document.querySelectorAll('.issue-cand').forEach((btn) => {
+        btn.addEventListener('click', () => { const [sku, name] = cands[Number(btn.dataset.i)]; onPick({ sku, name }); });
+      });
+      const input = $('issueSkuInput');
+      const res = $('issueSearchRes');
+      input.style.display = 'block'; input.value = ''; input.removeAttribute('list');
+      input.placeholder = '商品名 or SKU で在庫検索 (例: ひのき)';
+      input.onchange = null;
+      res.innerHTML = '';
+      // 検索で出ないとき (未設定・障害・検索漏れ) の逃げ道: SKUをそのまま使う (形式はサーバーでも検証。名前は付けない)
+      const directHtml = (q) => `<button type="button" class="reason-opt issue-direct" data-sku="${esc(q)}" style="text-align:left; border-style:dashed">
+          検索に出ない → 入力した「${esc(q)}」をSKUとして使う<br><small>バーコード/商品コードを正確に入力した場合のみ</small></button>`;
+      const bindDirect = () => res.querySelectorAll('.issue-direct').forEach((b) => b.addEventListener('click', () => {
+        const sku = String(b.dataset.sku || '').trim().toLowerCase();
+        if (!/^[a-z0-9][a-z0-9_\-.]{0,79}$/.test(sku)) { showToast('SKUの形式が不正です (英数字・-_.)'); return; }
+        onPick({ sku, name: null });
+      }));
+      let timer = null;
+      input.oninput = () => {
+        clearTimeout(timer);
+        timer = setTimeout(async () => {
+          const q = input.value.trim();
+          if (q.length < 2) { res.innerHTML = ''; return; }
+          try {
+            const r = await fetch(`/apps/packing/api/stock-search?q=${encodeURIComponent(q)}`);
+            const body = await r.json();
+            const items = body.items || [];
+            res.innerHTML = items.map((it, idx) =>
+              `<button type="button" class="reason-opt issue-hit" data-idx="${idx}" style="text-align:left">${esc(it.name || it.sku)}<br><small>${esc(it.sku)}${it.free != null ? ` / フリー${it.free}` : ''}</small></button>`).join('')
+              + (items.length === 0 ? `<small style="color:#868e96">${body.disabled ? '在庫検索が設定されていません' : body.error ? '在庫検索に接続できません' : '該当なし'}</small>` : '')
+              + directHtml(q);
+            res.querySelectorAll('.issue-hit').forEach((b) => b.addEventListener('click', () => {
+              const it = items[Number(b.dataset.idx)];
+              onPick({ sku: it.sku, name: it.name || null });
+            }));
+            bindDirect();
+          } catch {
+            res.innerHTML = '<small style="color:#c5221f">検索エラー</small>' + directHtml(q);
+            bindDirect();
+          }
+        }, 300);
+      };
+      setTimeout(() => input.focus(), 50);
     }
     function allBatchSkus() {
       const seen = new Map();
@@ -955,8 +1065,12 @@
           // バッチ内SKUから検索 (要件§5.5)。候補+自由入力
           $('issueTitle').textContent = '余った商品は？';
           $('issueSkuGrid').innerHTML = '';
+          $('issueSearchRes').innerHTML = '';
           $('issueSkuInput').style.display = 'block';
           $('issueSkuInput').value = '';
+          $('issueSkuInput').setAttribute('list', 'batchSkus');   // 品違いの検索UIで外した属性を戻す
+          $('issueSkuInput').placeholder = 'SKU or 商品名で検索';
+          $('issueSkuInput').oninput = null;
           fillSkuDatalist();
           $('issueSkuInput').onchange = () => {
             const v = $('issueSkuInput').value.trim();
@@ -964,7 +1078,7 @@
             issue.sku = v;
             $('issueStep2').style.display = 'none';
             $('issueStep3').style.display = 'block';
-            qtyButtons(9, (q) => { sendIssue({ ...issue, qty: q }); });
+            qtyButtons(999, (q) => { sendIssue({ ...issue, qty: q }); });   // 余りはサーバー上限 (999) まで
           };
         } else {
           $('issueTitle').textContent = type === 'shortage' ? '足りない商品は？' : '本来入るはずの商品は？';
@@ -973,20 +1087,15 @@
             issue.sku = line.sku;
             issue.maxQty = line.qty;
             if (type === 'wrong_item') {
-              // 実際に入っていた商品 (自由入力+バッチ内候補)
-              $('issueTitle').textContent = '実際に入っていた商品は？';
-              $('issueSkuGrid').innerHTML = '';
-              $('issueSkuInput').style.display = 'block';
-              $('issueSkuInput').value = '';
-              fillSkuDatalist();
-              $('issueSkuInput').onchange = () => {
-                const v = $('issueSkuInput').value.trim();
-                if (!v) return;
-                issue.actualSku = v;
+              // 実際に入っていた商品 = 候補ボタン or 在庫検索で1件選択 (自由入力は廃止 — 2026-08-23)
+              pickActualItem(line, ({ sku, name }) => {
+                issue.actualSku = sku;
+                issue.actualName = name || null;
                 $('issueStep2').style.display = 'none';
                 $('issueStep3').style.display = 'block';
+                $('issueQtyLabel').textContent = `間違って入っていた数量は? (${name || sku})`;
                 qtyButtons(issue.maxQty, (q) => { sendIssue({ ...issue, qty: q }); });
-              };
+              });
             } else {
               $('issueStep2').style.display = 'none';
               $('issueStep3').style.display = 'block';
@@ -996,8 +1105,9 @@
         }
       });
     });
-    function sendIssue({ type, sku, actualSku, qty }) {
+    function sendIssue({ type, sku, actualSku, actualName, qty }) {
       issueReset();
+      $('issueQtyLabel').textContent = '数量は?';
       const seq = viewSeq;
       if (type === 'excess') {
         enqueue('excess', seq, { sku, qty });
@@ -1005,8 +1115,8 @@
         showToast(`余り候補に追加: ${sku} × ${qty} (最後にまとめて送信します)`);
         return;
       }
-      enqueue(type, seq, type === 'wrong_item' ? { sku, actual_sku: actualSku, qty } : { sku, qty });
-      incidents.push({ id: `tmp-${Date.now()}`, kind: type, sku, actualSku: actualSku || null, qty, slipSeq: seq });
+      enqueue(type, seq, type === 'wrong_item' ? { sku, actual_sku: actualSku, actual_name: actualName || null, qty } : { sku, qty });
+      incidents.push({ id: `tmp-${Date.now()}`, kind: type, sku, actualSku: actualSku || null, actualName: actualName || null, qty, slipSeq: seq });
       doneSet.delete(seq);
       heldSet.add(seq);
       repickSet.add(seq);
@@ -1019,14 +1129,39 @@
       if (next != null) { viewSeq = next; }
       render();
     }
-    $('receiveBtn').addEventListener('click', () => {
-      const seq = viewSeq;
-      enqueue('receive', seq, {});
-      heldSet.delete(seq); repickSet.delete(seq);
-      currentSeq = minPending();
-      showToast('保留を解除しました。梱包を続けてください');
-      render();
+    // 受領 = 状態遷移の要なのでサーバー応答を待ってから画面を進める (楽観更新しない — Codex 2026-08-23)。
+    // 入口は3つ: 伝票画面のボタン / ヘッダーの緑バナー / 終了画面の保留一覧。いずれも同じ処理
+    let receiving = false;
+    async function receiveSlip(seq) {
+      if (!worker) { showToast('先に作業者の名前を選んでください'); return; }
+      if (paused) { showToast('中断中です。再開してから受け取ってください'); return; }
+      if (receiving || !bySeq.has(seq)) return;
+      receiving = true;
+      showToast('受領を送信中…');
+      try {
+        // 通常操作と同じキューで直列に送る (先行の操作が届いてから受領が処理される)。
+        // 通信断はキューが同一 op_id で再送するので、二重受領や取りこぼしにならない
+        const r = await enqueueAndWait('receive', seq, {});
+        if (!r.ok) { showToast(r.body?.error || `エラー (${r.status})`); return; }
+        if ($('doneOverlay').style.display === 'flex') { $('doneOverlay').style.display = 'none'; overlayMode = null; }
+        viewSeq = seq; jumpMode = false;   // 受領した伝票へ自動ジャンプ (探し回らない)
+        render();
+        showToast(`伝票 #${seq} の保留を解除しました。梱包を続けてください`);
+        if (window.__floorAlertsPoll) window.__floorAlertsPoll();
+      } finally { receiving = false; }
+    }
+    $('receiveBtn').addEventListener('click', () => receiveSlip(viewSeq));
+    document.addEventListener('packing:receive', (e) => {
+      if (Number(e.detail.batchId) === STATE.batchId) receiveSlip(Number(e.detail.slipSeq));
     });
+    // ピッカーの完了を操作なしでも拾う: バナーの集合が変わったら同期 / 保留中は10秒ごとに同期
+    document.addEventListener('packing:repick-ready', (e) => {
+      // 受領可の伝票集合 (サーバー) と画面の repickReadySet がどちら向きにでもズレたら同期
+      const mine = new Set((e.detail.items || []).filter((t) => Number(t.batch_id) === STATE.batchId).map((t) => Number(t.slip_seq)));
+      const same = mine.size === repickReadySet.size && [...mine].every((q) => repickReadySet.has(q));
+      if (!same) resync();
+    });
+    setInterval(() => { if (repickSet.size > 0 && !sending && loadQ().length === 0) resync(); }, 10000);
     $('foundBtn').addEventListener('click', () => {
       if (!confirm('商品が見つかったため、再ピック依頼とミス候補を取り下げます。よろしいですか?')) return;
       const seq = viewSeq;
@@ -1415,7 +1550,7 @@
     let batchSec = 0;
     let timerSeq = null;
     if (STATE.batchStatus === 'packing' && STATE.startedAt) {
-      batchSec = Math.max(0, Math.round((Date.now() - Date.parse(STATE.startedAt)) / 1000) - STATE.pausedTotalSec);
+      batchSec = Math.max(0, Math.round((Date.now() - Date.parse(STATE.startedAt)) / 1000) - STATE.pausedTotalSec - STATE.blockedTotalSec);
     }
     const fmtSec = (t) => `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
     setInterval(() => {
@@ -1447,7 +1582,9 @@
       render();
       $('doneOverlay').style.display = 'flex';
     } else {
-      viewSeq = currentSeq ?? 1;
+      // ?seq=N (ヘッダーの「対象伝票を開く」から) はその伝票を先に表示する
+      const qSeq = Number(new URLSearchParams(location.search).get('seq'));
+      viewSeq = bySeq.has(qSeq) ? qSeq : (currentSeq ?? 1);
       render();
       if ((STATE.batchStatus === 'packing' || STATE.batchStatus === 'paused') && worker) {
         $('workerHint').textContent = `現在の担当: ${worker}${STATE.batchStatus === 'paused' ? ' (中断中)' : ''} — 別の人が続ける場合は自分の名前をタップ (交代として記録されます)`;

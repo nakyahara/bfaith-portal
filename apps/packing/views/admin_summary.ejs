@@ -48,7 +48,8 @@
       <div class="tile"><div class="v"><%= summary.total.doneCount %>/<%= summary.total.batchCount %></div><div class="l">完了バッチ</div></div>
       <div class="tile"><div class="v"><%= summary.total.slipCount %></div><div class="l">完了伝票</div></div>
       <div class="tile"><div class="v"><%= summary.total.qty %></div><div class="l">数量</div></div>
-      <div class="tile"><div class="v"><%= fmtMin(summary.total.activeSec) %></div><div class="l">実働 (中断除く)</div></div>
+      <div class="tile"><div class="v"><%= fmtMin(summary.total.activeSec) %></div><div class="l">実働 (中断・再ピック待ち除く)</div></div>
+      <% if (summary.total.blockedSec) { %><div class="tile"><div class="v"><%= fmtMin(summary.total.blockedSec) %></div><div class="l">再ピック待ち (除外分)</div></div><% } %>
       <div class="tile"><div class="v"><%= summary.total.secPerSlip == null ? '-' : summary.total.secPerSlip.toFixed(1) %></div><div class="l">秒/伝票 (バッチ実働÷伝票)</div></div>
       <% if (summary.slipStats) { %>
         <div class="tile"><div class="v"><%= summary.slipStats.median %></div><div class="l">秒/伝票 中央値 (表示〜完了実測 n=<%= summary.slipStats.count %>)</div></div>
