@@ -28,7 +28,7 @@ import {
   parseCs03003, importPackBatch, checkPickingMatch, PackError,
   deriveFolderName, isStaleSagyoDate, WARN_LABELS, getWorkState, applyEvent,
   PAUSE_REASONS, UNDO_REASONS, SHIP_CHANGE_REASONS, SHIP_CHANGE_METHOD_OPTIONS, lastDoneSeqOf, getDailySummary,
-  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal,
+  resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, logizardNamesFor,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
 import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR } from './reprint-pdf.js';
@@ -233,9 +233,13 @@ function decorateSlips(state) {
   const missing = skus.map((s) => String(s ?? '').trim().toLowerCase())
     .filter((sku) => sku && !images.has(sku));
   if (missing.length > 0) queueEnsureImages(missing, `packing-batch:${state.batch.id}`);
+  // 表示名 = ロジザード商品名 (通常ピッキングと同じ・NE印字名のSEO長文対策 — 2026-08-22)。
+  // picking側に無いSKUのみ従来の印字商品名へフォールバック (STATE組み立て側)
+  const logiNames = logizardNamesFor(skus);
   for (const s of state.slips) {
     for (const l of s.lines) {
       l.imageUrl = images.get(String(l.sku ?? '').trim().toLowerCase())?.url || null;
+      l.logi_name = logiNames.get(l.sku) || null;
     }
   }
   return state;

@@ -331,7 +331,7 @@
         siteOrderNo: s.site_order_no, orderDate: s.order_date,
         deliveryDate: s.delivery_date, deliveryTime: s.delivery_time,
         lines: s.lines.map((l) => ({
-          sku: l.sku, name: l.print_name || l.product_name, qty: l.qty, imageUrl: l.imageUrl,
+          sku: l.sku, name: l.logi_name || l.print_name || l.product_name, qty: l.qty, imageUrl: l.imageUrl,
           shortName: l.short_name,   // 送り状備考1 = 読み上げ短縮名の第一候補 (要件§5.3)
         })),
       })),

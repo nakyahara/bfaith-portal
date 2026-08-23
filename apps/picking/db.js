@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -172,6 +172,10 @@ const MIGRATIONS = {
       acked_by     TEXT
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_active ON pk_floor_alerts(direction, acked_at)');
+  },
+  // v8: SKU→ロジザード商品名の逆引き用 (梱包画面の表示名一括解決 — 2026-08-22)
+  8: () => {
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_lines_sku ON pk_lines(sku)');
   },
 };
 

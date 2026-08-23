@@ -1423,6 +1423,33 @@ export function listIncidents(batchId, status = null) {
  *   withdraw = 取下げ (出てきた・誤記録)。作業中でも可。対象伝票に他の候補が無ければ保留も解除
  * @returns {{...inc, dispatchedTasks: [{kind, sku, name, qty, folder, slipSeq}]}}
  */
+/** 商品コード→ロジザード商品名の一括解決 (作業画面の表示用 — 2026-08-22 中原さん指示:
+ *  NE印字名はモールのSEO長文になるため、通常ピッキングと同じロジザード名で表示する)。 */
+export function logizardNamesFor(skus) {
+  const db = getDB();
+  const map = new Map();
+  const uniq = [...new Set(skus)].filter(Boolean);
+  try {
+    // 1クエリでSKUごとの最新行を取る (Codex: SKU毎のget()はN+1+無索引全走査で
+    // 大バッチの画面表示を同期ブロックする)。SQLiteのIN上限対策で500件ずつ
+    for (let i = 0; i < uniq.length; i += 500) {
+      const chunk = uniq.slice(i, i + 500);
+      const rows = db.prepare(`
+        SELECT sku, product_name FROM (
+          SELECT l.sku, l.product_name,
+                 ROW_NUMBER() OVER (PARTITION BY l.sku ORDER BY l.rowid DESC) AS rn
+          FROM pk_lines l
+          JOIN pk_batches b ON b.id = l.batch_id
+          WHERE l.sku IN (${chunk.map(() => '?').join(',')})
+            AND l.product_name IS NOT NULL AND b.origin != 'repick'
+        ) WHERE rn = 1
+      `).all(...chunk);
+      for (const r of rows) map.set(r.sku, r.product_name);
+    }
+  } catch { /* picking未初期化環境では空 (フォールバック表示) */ }
+  return map;
+}
+
 /** 商品コード→ロジザード商品名 (picking pk_lines 参照のみ・最新行)。無ければ null。 */
 function logizardNameOf(db, sku) {
   try {
