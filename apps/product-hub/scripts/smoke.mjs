@@ -1675,13 +1675,22 @@ const wf = await import('../lib/workflow.js');
   check('役割シード: 画像作成承認者', roles0.some((r) => r.code === 'image_approver' && r.label === '画像作成承認者'));
   check('役割シード: 商品登録者', roles0.some((r) => r.code === 'registrar' && r.label === '商品登録者'));
   const steps0 = wf.listSteps();
-  check('工程シード: 本流6 + 画像4',
-    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 4);
+  check('工程シード: 本流6 + 画像8 (TOP/詳細 × 4段階)',
+    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 8,
+    `main=${steps0.filter((s) => s.track === 'main').length} image=${steps0.filter((s) => s.track === 'image').length}`);
   {
-    const img = steps0.filter((s) => s.track === 'image').map((s) => s.code);
-    check('工程シード: 画像承認は画像登録の後 (アプリでサムネを見て承認する)',
-      img.indexOf('img_approve') === img.indexOf('img_register') + 1 && img[img.length - 1] === 'img_approve', img.join(','));
-    check('工程シード: 画像承認の担当は画像作成承認者', steps0.find((s) => s.code === 'img_approve').role_code === 'image_approver');
+    for (const kind of ['top', 'detail']) {
+      const img = steps0.filter((s) => s.track === 'image' && s.image_kind === kind).map((s) => s.code);
+      check(`工程シード: ${kind} は 依頼→制作→登録→承認 の順`,
+        img.join(',') === `img_request_${kind},img_production_${kind},img_register_${kind},img_approve_${kind}`, img.join(','));
+    }
+    check('工程シード: 画像承認の担当は画像作成承認者 (両種別)',
+      steps0.find((s) => s.code === 'img_approve_top').role_code === 'image_approver'
+      && steps0.find((s) => s.code === 'img_approve_detail').role_code === 'image_approver');
+    check('工程シード: image_stage が入る (ボードの列まとめの安定キー)',
+      steps0.find((s) => s.code === 'img_request_top').image_stage === 'request'
+      && steps0.find((s) => s.code === 'img_approve_detail').image_stage === 'approve');
+    check('工程シード: 旧一本トラック工程はシードされない', !steps0.some((s) => ['img_request', 'img_production', 'img_register', 'img_approve'].includes(s.code)));
   }
   check('工程シード: AI待ちはシステム工程 (担当ロールなし)', steps0.find((s) => s.code === 'ai_generate').role_code === null);
   check('工程シード: 先頭は基本情報入力', steps0[0].code === 'basic_info');
@@ -1713,13 +1722,13 @@ const wf = await import('../lib/workflow.js');
   // 役割の割り当てと既定担当
   wf.setStaffRoles(okawa, [{ code: 'image', isDefault: true }]);
   wf.setStaffRoles(tanaka, [{ code: 'registrar', isDefault: true }, { code: 'image' }]);
-  check('既定担当が工程に出る', wf.listSteps().find((s) => s.code === 'img_request').default_staff_name === '大川さん');
-  check('工程に紐づく人数が出る', wf.listSteps().find((s) => s.code === 'img_request').member_count === 2);
+  check('既定担当が工程に出る', wf.listSteps().find((s) => s.code === 'img_request_top').default_staff_name === '大川さん');
+  check('工程に紐づく人数が出る', wf.listSteps().find((s) => s.code === 'img_request_top').member_count === 2);
   // 既定は役割ごとに 1 人 = 後から立てた方に付け替わる (UNIQUE 違反でエラーにしない)
   wf.setStaffRoles(tanaka, [{ code: 'registrar', isDefault: true }, { code: 'image', isDefault: true }]);
   check('既定は役割ごとに1人 (前任は外れる)',
     wf.getStaff(okawa).roles.find((r) => r.code === 'image').isDefault === false);
-  check('付け替え後の既定が反映される', wf.listSteps().find((s) => s.code === 'img_request').default_staff_name === '田中美祐');
+  check('付け替え後の既定が反映される', wf.listSteps().find((s) => s.code === 'img_request_top').default_staff_name === '田中美祐');
 
   // 無効化 = 退職者に自動割り当てしない。ただし役割の紐付け自体は履歴として残す
   wf.setStaffActive(tanaka, false);
@@ -1737,11 +1746,26 @@ const wf = await import('../lib/workflow.js');
   try { wf.updateStep('basic_info', { active: false }); } catch (e) { stepErr = e; }
   check('本流の工程は無効化できない', stepErr?.status === 400, stepErr?.message || '例外が出ていない');
 
-  // 運用で足した工程は無効化できる
-  const extra = wf.createStep({ label: '撮影', track: 'image', role_code: 'image' });
-  check('工程を追加できる', wf.listSteps({ track: 'image' }).some((s) => s.code === extra));
+  // 運用で足した工程は無効化できる。画像トラックは種別 (TOP/詳細) の指定が必須
+  let kindErr = null;
+  try { wf.createStep({ label: '撮影', track: 'image', role_code: 'image' }); } catch (e) { kindErr = e; }
+  check('画像トラックの工程は種別なしでは追加できない', kindErr?.status === 400, kindErr?.message || '例外が出ていない');
+  const extra = wf.createStep({ label: '撮影', track: 'image', image_kind: 'top', role_code: 'image' });
+  check('工程を追加できる (種別つき)', wf.listSteps({ track: 'image' }).find((s) => s.code === extra)?.image_kind === 'top');
   check('追加した工程は無効化できる', wf.updateStep(extra, { active: false }) === true);
   check('無効化した工程は既定の一覧に出ない', !wf.listSteps().some((s) => s.code === extra));
+
+  // 画像トラックの組み込み工程はラベル・並び順・滞留日数が TOP/詳細 で対 — 片方を変えると両方そろう
+  wf.updateStep('img_production_top', { label: '画像制作 (改)', stall_days: 9 });
+  const sib = wf.listSteps().find((s) => s.code === 'img_production_detail');
+  check('対の工程にラベルが伝播する', sib.label === '画像制作 (改)', sib.label);
+  check('対の工程に滞留日数が伝播する', sib.stall_days === 9, `= ${sib.stall_days}`);
+  wf.updateStep('img_production_top', { label: '画像制作', stall_days: 7 });
+  // 担当ロールは伝播しない (TOP と詳細で承認者を分けたい場合があるため)
+  wf.updateStep('img_approve_top', { role_code: 'approver' });
+  check('担当ロールは対に伝播しない',
+    wf.listSteps().find((s) => s.code === 'img_approve_detail').role_code === 'image_approver');
+  wf.updateStep('img_approve_top', { role_code: 'image_approver' });
 
   // 滞留日数
   let stallErr = null;
@@ -1758,7 +1782,8 @@ const wf = await import('../lib/workflow.js');
   // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
   const ov = wf.workflowOverview();
   check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
-  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 4);
+  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 8,
+    `main=${ov.main.length} image=${ov.image.length}`);
 }
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
@@ -1989,10 +2014,55 @@ let wfDraftId = null;
   const blocked = listing.buildItemPayload(db, idGate);
   check('画像トラック未完了なら出品を止める',
     (blocked.reasons || []).some((x) => /画像トラックが終わっていません/.test(x)), JSON.stringify(blocked.reasons || []).slice(0, 200));
-  check('止める理由に「いまの工程」が出る', (blocked.reasons || []).some((x) => /いま: 画像制作の依頼/.test(x)));
+  check('止める理由に種別といまの工程が出る',
+    (blocked.reasons || []).some((x) => /TOP画像: 画像制作の依頼/.test(x) && /詳細画像: 画像制作の依頼/.test(x)),
+    JSON.stringify(blocked.reasons || []).slice(0, 300));
+  // TOP画像の工程は admin でも「対象外」にできない (サムネイル無しの楽天出品はありえない)
+  let topSkipErr = null;
+  try { wfp.setStepState(idGate, 'img_request_top', { state: 'skip' }, 'admin', ADMIN); } catch (e) { topSkipErr = e; }
+  check('TOP画像の工程は対象外にできない', topSkipErr?.status === 400, topSkipErr?.message || '例外が出ていない');
+  check('詳細画像の工程は admin なら対象外にできる',
+    wfp.setStepState(idGate, 'img_request_detail', { state: 'skip' }, 'admin', ADMIN).changed === true);
+  wfp.setStepState(idGate, 'img_request_detail', { state: 'todo' }, 'admin', ADMIN);
+  // ガードをすり抜けて TOP が全部 skip になってもゲートは開かない (直 SQL で再現)
+  db.prepare(`
+    UPDATE draft_step_progress SET state = 'skip'
+    WHERE draft_id = ? AND step_code IN ('img_request_top','img_production_top','img_register_top','img_approve_top')
+  `).run(idGate);
+  check('TOP全対象外でもゲートは開かない (防御)',
+    /TOP画像.*必須/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
+  db.prepare(`
+    UPDATE draft_step_progress SET state = 'todo'
+    WHERE draft_id = ? AND step_code LIKE 'img_%_top'
+  `).run(idGate);
+
+  // 「詳細画像は対象外」(商品単位フラグ): TOP の承認だけでゲートが開く
+  wfp.setDetailImagesExcluded(idGate, true, 'admin', ADMIN);
+  check('対象外の切り替えがイベントに残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'detail_images_excluded'`).get(idGate).c === 1);
+  check('二重送信は no-op', wfp.setDetailImagesExcluded(idGate, true, 'admin', ADMIN).changed === false);
+  for (const s of wfp.progressOf(idGate, { db }).imageTop.rows) {
+    wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
+  }
+  check('詳細対象外なら TOP 承認だけで画像の理由が消える',
+    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)),
+    JSON.stringify((listing.buildItemPayload(db, idGate).reasons || []).filter((x) => /画像/.test(x))));
+  // 対象外を解除すると詳細側が未完了なのでまたブロックされる
+  wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
+  check('対象外を解除すると詳細側でまたブロック',
+    /詳細画像/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
+  // 権限: admin か詳細画像「依頼」工程の担当者本人だけ
+  let exErr = null;
+  try { wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }); } catch (e) { exErr = e; }
+  check('対象外の切り替えは担当外の人はできない', exErr?.status === 403, exErr?.message || '例外が出ていない');
+  wfp.setStepState(idGate, 'img_request_detail', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+  check('詳細画像の依頼担当なら対象外にできる',
+    wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }).changed === true);
+  wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
+
   // 画像トラックを全部完了にすると理由が消える (他の理由は残ってよい)
   for (const s of wfp.progressOf(idGate, { db }).image) {
-    wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
+    if (s.state !== 'done') wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
   }
   check('画像承認まで終われば画像の理由は消える',
     !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)));
@@ -2007,7 +2077,7 @@ let wfDraftId = null;
   ).run().lastInsertRowid);
   wfp.progressOf(idListedRk, { db });
   wfp.progressOf(idNotListed, { db });
-  const lateImg = wf.createStep({ label: '画像の最終チェック', track: 'image', role_code: 'image_approver' });
+  const lateImg = wf.createStep({ label: '画像の最終チェック', track: 'image', image_kind: 'top', role_code: 'image_approver' });
   wfp.ensureProgressForMany(db, [idListedRk, idNotListed]);
   check('後から足した画像工程: 楽天登録済みの商品は done で入る',
     wfp.progressOf(idListedRk, { db }).image.find((s) => s.step_code === lateImg)?.state === 'done');
@@ -2287,31 +2357,57 @@ let wfSetParentId = null;
   `).run(new Date(Date.now() - 5 * 86400000).toISOString());
 
   const b = wfp.boardData(db, {});
-  check('ボード: 本流6列 + 画像4列', b.columns.length === 6 && b.imageColumns.length === 4);
+  check('ボード(本流): 6列', b.view === 'main' && b.columns.length === 6, `view=${b.view} cols=${b.columns.length}`);
   const onBoard = new Set(b.columns.flatMap((c) => c.cards.map((x) => x.id)).concat(b.doneCards.map((x) => x.id)));
   check('ボード: 保留の商品は載せない', !onBoard.has(idHold));
   check('ボード: 工程テストの商品が載る', onBoard.has(wfDraftId));
   check('ボード: カードは1商品につき本流の1列だけ',
     b.columns.reduce((n, c) => n + c.cards.filter((x) => x.id === wfDraftId).length, 0) === 1);
-  check('ボード: 画像列にも同じ商品が出る (並行トラック)',
-    b.imageColumns.some((c) => c.cards.some((x) => x.id === wfDraftId)));
+  {
+    // 本流カードに画像 (TOP/詳細) の進捗が常時付く = ボードを行き来せずに読める (2重管理の解消)
+    const card = b.columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
+    check('ボード: カードに TOP/詳細 のステッパーが付く',
+      card.image?.top?.steps?.length === 4 && card.image?.detail?.steps?.length === 4,
+      JSON.stringify(card.image || null).slice(0, 120));
+  }
+
+  // 画像ビュー: 列は段階 (依頼→制作→登録→承認) でまとまり、カードは 商品×種別
+  const bi = wfp.boardData(db, { view: 'image' });
+  check('ボード(画像): 4列 (TOP/詳細が段階でまとまる)', bi.view === 'image' && bi.columns.length === 4,
+    `cols=${bi.columns.map((c) => c.key).join(',')}`);
+  {
+    const kindsOf = (id) => bi.columns.flatMap((c) => c.cards.filter((x) => x.id === id).map((x) => x.kind));
+    check('ボード(画像): 同じ商品が TOP と詳細で別カードになる',
+      kindsOf(wfDraftId).sort().join(',') === 'detail,top', kindsOf(wfDraftId).join(','));
+    // 詳細対象外の商品は詳細カードを出さない
+    const idNoDetail = Number(db.prepare(
+      `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-BOARD-EX', '詳細なし', 'review', 'smoke')`
+    ).run().lastInsertRowid);
+    wfp.progressOf(idNoDetail, { db });
+    wfp.setDetailImagesExcluded(idNoDetail, true, 'admin', ADMIN);
+    const bi2 = wfp.boardData(db, { view: 'image' });
+    const kinds2 = bi2.columns.flatMap((c) => c.cards.filter((x) => x.id === idNoDetail).map((x) => x.kind));
+    check('ボード(画像): 詳細対象外の商品は TOP カードだけ', kinds2.join(',') === 'top', kinds2.join(','));
+  }
 
   // 停滞しているカードを先頭に出す (打ち手が要るものを埋もれさせない)
   const aiCol = b.columns.find((c) => c.code === 'ai_generate');
   check('ボード: 停滞カードが列の先頭', aiCol.cards.length > 0 && aiCol.cards[0].stalledDays >= 3,
     JSON.stringify(aiCol.cards.map((c) => c.stalledDays)));
 
-  // 担当者で絞る
+  // 担当者で絞る (本流ビュー: 本流か画像のどこかがその人のボールなら残す)
   const mine = wfp.boardData(db, { assigneeId: wfTanakaId });
-  const mineIds = mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards.map((x) => x.id));
+  const mineCards = mine.columns.flatMap((c) => c.cards);
   check('ボード: 担当者で絞ると全部その人のボールになる',
-    mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards)
-      .every((c) => c.current?.assignee_id === wfTanakaId || c.imageCurrent?.assignee_id === wfTanakaId),
-    `件数=${mineIds.length}`);
-  check('ボード: 絞り込みは全件より少ない', mineIds.length < onBoard.size * 2, `${mineIds.length} / ${onBoard.size}`);
-  const other = wfp.boardData(db, { assigneeId: wfOkawaId });
-  check('ボード: 担当していない人には出ない',
-    other.columns.flatMap((c) => c.cards).every((c) => c.current?.assignee_id === wfOkawaId || c.imageCurrent?.assignee_id === wfOkawaId));
+    mineCards.length > 0 && mineCards.every((c) => c.current?.assignee_id === wfTanakaId
+      || c.image?.top?.current?.assignee_id === wfTanakaId
+      || c.image?.detail?.current?.assignee_id === wfTanakaId),
+    `件数=${mineCards.length}`);
+  check('ボード: 絞り込みは全件より少ない', mineCards.length < onBoard.size * 2, `${mineCards.length} / ${onBoard.size}`);
+  // 画像ビューの絞り込みは**その種別の**現在工程が基準 (他トラック一致で無関係な列に出さない)
+  const mineImg = wfp.boardData(db, { view: 'image', assigneeId: wfTanakaId });
+  check('ボード(画像): 絞り込みは種別自身の担当だけ',
+    mineImg.columns.flatMap((c) => c.cards).every((c) => c.kindCurrent?.assignee_id === wfTanakaId));
 
   // 未割り当てだけ (システム工程は「未割り当て」に数えない)
   const un = wfp.boardData(db, { unassignedOnly: true });
@@ -2319,6 +2415,45 @@ let wfSetParentId = null;
     !un.columns.find((c) => c.code === 'ai_generate').cards.some((c) => c.current?.role_code == null));
 
   check('ボード: 件数が返る', b.total >= 3 && b.truncated === false);
+}
+
+// ─── 画像トラック TOP/詳細 分割の移行 (2026-08-24) ───
+{
+  // #888/#890 デプロイ済み環境を再現: 旧一本トラックの工程 + 進捗行を作って移行を走らせる
+  db.prepare(`
+    INSERT OR IGNORE INTO ph_steps (code, label, track, role_code, sort, builtin, active)
+    VALUES ('img_request', '画像制作の依頼', 'image', 'image', 10, 1, 1),
+           ('img_approve', '画像承認', 'image', 'image_approver', 40, 1, 1)
+  `).run();
+  const mkMig = (code) => Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, 'review', 'smoke')`
+  ).run(code, `移行 ${code}`).lastInsertRowid);
+  const idHuman = mkMig('WF-MIG-HUMAN');   // 人が旧トラックを done にした
+  const idEst = mkMig('WF-MIG-EST');       // 初回推定で done (工程導入前から画像あり)
+  const idRk = mkMig('WF-MIG-RK');         // 楽天登録済み
+  const idOpen = mkMig('WF-MIG-OPEN');     // 作業中
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-20T00:00:00Z')`).run(idRk);
+  const insOld = db.prepare(`
+    INSERT INTO draft_step_progress (draft_id, step_code, state, done_at, done_by)
+    VALUES (?, 'img_request', ?, ?, ?)
+  `);
+  insOld.run(idHuman, 'done', '2026-08-23T00:00:00Z', 'okawa@b-faith.biz');
+  insOld.run(idEst, 'done', '2026-08-23T00:00:00Z', 'migration');
+  insOld.run(idRk, 'done', '2026-08-23T00:00:00Z', 'okawa@b-faith.biz');
+  insOld.run(idOpen, 'doing', null, null);
+  check('移行が走る (旧工程が active のとき)', dbmod.migrateImageKindSplit(db) === true);
+  const st = (id, code) => db.prepare(
+    'SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.state;
+  check('移行: TOP側は旧状態を引き継ぐ', st(idHuman, 'img_request_top') === 'done' && st(idOpen, 'img_request_top') === 'doing');
+  check('移行: 人が done にした商品の詳細側は todo (作っていない詳細画像を承認済みにしない)',
+    st(idHuman, 'img_request_detail') === 'todo');
+  check('移行: 初回推定 done (画像が既にあった) は詳細側も done', st(idEst, 'img_request_detail') === 'done');
+  check('移行: 楽天登録済みは詳細側も done', st(idRk, 'img_request_detail') === 'done');
+  check('移行: 旧工程は無効化される',
+    db.prepare(`SELECT COUNT(*) AS c FROM ph_steps WHERE code IN ('img_request','img_approve') AND active = 1`).get().c === 0);
+  check('移行: 再実行は no-op (冪等)', dbmod.migrateImageKindSplit(db) === false);
+  // 旧工程・旧進捗行は本番と同じく残置する (active=0 で全クエリから見えない)。
+  // DELETE しないのは draft_step_progress → ph_steps の FK を壊さないため
 }
 
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
@@ -3034,13 +3169,18 @@ const boardBase = {
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
   me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false,
   stepStateLabels: wfp.STEP_STATE_LABELS,
+  boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
+  ['board.ejs (画像ビュー)', 'board.ejs', {
+    ...boardBase, boardView: 'image',
+    board: wfp.boardData(db, { view: 'image' }),
+  }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
-    board: { columns: [], imageColumns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
+    board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
   }],
 );
 for (const [name, file, data] of renders) {

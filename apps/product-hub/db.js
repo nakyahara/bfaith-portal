@@ -125,23 +125,45 @@ export const STEP_SEEDS = [
     code: 'listing', label: '出品・展開', track: 'main', role_code: null, sort: 60,
     description: '楽天 / Yahoo / auPAY / メルカリ / Qoo10 をモールごとに進める (担当はモール別に持つ)',
   },
-  {
-    code: 'img_request', label: '画像制作の依頼', track: 'image', role_code: 'image', sort: 10,
-    description: '参考画像・レビュー収集、撮影商品の発送手配、外注への依頼',
-  },
-  {
-    code: 'img_production', label: '画像制作', track: 'image', role_code: 'image', sort: 20, stall_days: 7,
-    description: '外注/社内での画像制作。納品待ちがここで滞留する',
-  },
-  {
-    code: 'img_register', label: '画像登録', track: 'image', role_code: 'image', sort: 30,
-    description: 'Drive へ格納してアプリに取り込む',
-  },
-  {
-    // 2026-08-23 中原さん追加。登録の後に置くのは、アプリの画像タブでサムネを見て承認できるため
-    code: 'img_approve', label: '画像承認', track: 'image', role_code: 'image_approver', sort: 40, stall_days: 3,
-    description: '登録された画像を確認して承認する。楽天出品はこの工程の完了が前提 (出品ゲート)',
-  },
+  // 画像トラックは TOP画像 (サムネイル) と商品詳細画像で**別々に**進む (2026-08-24 中原さん:
+  // 依頼・制作・承認のタイミングも担当も分かれる。単純な仕入れ商品は詳細画像を作らないこともある)。
+  // 工程を kind ごとに複製する方式にしたのは、既存の権限・楽観ロック・イベント記録が
+  // 「1 工程 = 1 行」の前提でそのまま使えるため。ラベルは共通にし、画面側で TOP/詳細 の
+  // バッジを付けて区別する (ボードでは同じラベル同士が 1 列にまとまる)
+  // image_stage はボードで TOP/詳細 の同じ段階を 1 列にまとめるための**安定キー**。
+  // ラベルや sort でまとめると、管理画面で片方だけ改名・並べ替えした瞬間に列が分裂する (Codex設計相談)
+  ...['top', 'detail'].flatMap((kind) => [
+    {
+      code: `img_request_${kind}`, label: '画像制作の依頼', track: 'image', image_kind: kind, image_stage: 'request',
+      role_code: 'image', sort: 10,
+      description: '参考画像・レビュー収集、撮影商品の発送手配、外注への依頼',
+    },
+    {
+      code: `img_production_${kind}`, label: '画像制作', track: 'image', image_kind: kind, image_stage: 'production',
+      role_code: 'image', sort: 20, stall_days: 7,
+      description: '外注/社内での画像制作。納品待ちがここで滞留する',
+    },
+    {
+      code: `img_register_${kind}`, label: '画像登録', track: 'image', image_kind: kind, image_stage: 'register',
+      role_code: 'image', sort: 30,
+      description: 'Drive へ格納してアプリに取り込む',
+    },
+    {
+      // 2026-08-23 中原さん追加。登録の後に置くのは、アプリの画像タブでサムネを見て承認できるため
+      code: `img_approve_${kind}`, label: '画像承認', track: 'image', image_kind: kind, image_stage: 'approve',
+      role_code: 'image_approver', sort: 40, stall_days: 3,
+      description: '登録された画像を確認して承認する。楽天出品は対象の画像種別すべての承認が前提 (出品ゲート)',
+    },
+  ]),
+];
+
+/** kind 分割前の画像工程コード (2026-08-24 移行で active=0 にする。進捗行は残置) */
+export const LEGACY_IMAGE_STEP_CODES = ['img_request', 'img_production', 'img_register', 'img_approve'];
+
+/** 画像トラックの種別。TOP は楽天出品に必須なので「対象外」にできない (workflow-progress 側で拒否) */
+export const IMAGE_KINDS = [
+  { code: 'top', label: 'TOP画像' },
+  { code: 'detail', label: '詳細画像' },
 ];
 
 let initialized = false;
@@ -504,6 +526,11 @@ export function initProductHubDB() {
       -- main = かんばん上段 (直列に進む本流) / image = 画像トラック (基本情報の後から並行で走る)。
       -- 画像を本流に混ぜると外注のリードタイム分だけ全体が延びるため分けている (中原さん合意 2026-08-23)
       track       TEXT NOT NULL DEFAULT 'main' CHECK (track IN ('main', 'image')),
+      -- 画像トラックの種別 (2026-08-24 中原さん: TOP画像と商品詳細画像は別々に進む)。
+      -- 工程を kind ごとに複製する方式 — 進捗テーブルの PK・権限・楽観ロックが「1工程=1行」のまま使える
+      image_kind  TEXT CHECK (image_kind IN ('top', 'detail')),
+      -- ボードで TOP/詳細 の同じ段階を 1 列にまとめる安定キー (ラベル・sort でまとめると改名で分裂する)
+      image_stage TEXT,
       role_code   TEXT REFERENCES ph_roles(code),    -- NULL = システム工程 (担当者を置かない。例: AI待ち)
       sort        INTEGER NOT NULL DEFAULT 0,
       stall_days  INTEGER,                           -- この日数を超えて滞留したら警告 (NULL = 警告しない)
@@ -830,22 +857,110 @@ export function initProductHubDB() {
     try { db.exec(stmt); } catch (e) { console.warn('[product-hub] workflow index skip:', e.message); }
   }
 
+  // 画像トラックの TOP/詳細 分割 (2026-08-24)。#888 デプロイ済み環境の ph_steps に列を足す
+  const stepCols = new Set(db.prepare('PRAGMA table_info(ph_steps)').all().map((c) => c.name));
+  for (const [col, ddl] of [
+    ['image_kind', "ALTER TABLE ph_steps ADD COLUMN image_kind TEXT CHECK (image_kind IN ('top', 'detail'))"],
+    ['image_stage', 'ALTER TABLE ph_steps ADD COLUMN image_stage TEXT'],
+  ]) {
+    if (!stepCols.has(col)) {
+      try { db.exec(ddl); } catch (e) {
+        // ポータルと warehouse variant の同時起動レース (version 列の ALTER と同じ扱い)
+        if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+      }
+    }
+  }
+  // 詳細画像を作らない商品のフラグ (単純な仕入れ商品は TOP のみ — 2026-08-24 中原さん)。
+  // detail 側の工程行を skip に書き換える方式にしなかったのは、done の履歴を壊さず、
+  // 複数行更新の競合検出も不要になるため (Codex設計相談)。工程行はそのまま残し、
+  // ゲート・ボード・詳細画面がこのフラグを見て detail 側を「対象外」として扱う
+  const draftCols2 = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
+  if (!draftCols2.has('detail_images_excluded')) {
+    try {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN detail_images_excluded INTEGER NOT NULL DEFAULT 0 CHECK (detail_images_excluded IN (0, 1))');
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
+  }
+
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
   const roleSeed = db.prepare('INSERT OR IGNORE INTO ph_roles (code, label, sort, builtin) VALUES (?, ?, ?, 1)');
   const stepSeed = db.prepare(`
-    INSERT OR IGNORE INTO ph_steps (code, label, track, role_code, sort, stall_days, description, builtin)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    INSERT OR IGNORE INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, stall_days, description, builtin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
   `);
   db.transaction(() => {
     for (const r of ROLE_SEEDS) roleSeed.run(r.code, r.label, r.sort);
     for (const s of STEP_SEEDS) {
-      stepSeed.run(s.code, s.label, s.track, s.role_code ?? null, s.sort, s.stall_days ?? null, s.description ?? null);
+      stepSeed.run(
+        s.code, s.label, s.track, s.image_kind ?? null, s.image_stage ?? null,
+        s.role_code ?? null, s.sort, s.stall_days ?? null, s.description ?? null,
+      );
     }
+    migrateImageKindSplit(db);
   })();
 
   initialized = true;
   return db;
+}
+
+/**
+ * 画像トラックの一本 → TOP/詳細 分割の移行 (2026-08-24、冪等)。
+ * #888/#890 デプロイ済み環境には旧4工程 (img_request 等) の進捗行があるので:
+ *   - TOP 側: 旧行の状態をそのまま引き継ぐ (旧トラックの実体は TOP 中心の作業だったため)
+ *   - 詳細側: **無条件コピーはしない** (作っていない詳細画像が承認済み扱いになる — Codex設計相談 Critical)。
+ *     done を引き継ぐのは、(a) 楽天登録済みの商品 (出品済みに「承認して」を出さない #891 方針) と
+ *     (b) 旧行の done が初回推定 (done_by='migration' = 工程導入前から画像が登録済みだった) の場合のみ。
+ *     人が旧トラックを done にした商品は詳細側 todo で入り、詳細画像を作るか (対象外か) を改めて判断してもらう
+ *   - 旧4工程は active=0 (進捗行は残置 — 全クエリが active=1 join なので見えない)
+ * 呼び出し元 (シード) のトランザクション内で走る。コピーと無効化の間に別プロセスが
+ * 旧行を更新して変更が消えるレースを避ける (Codex設計相談 High)。
+ */
+export function migrateImageKindSplit(db) {
+  const placeholders = LEGACY_IMAGE_STEP_CODES.map(() => '?').join(',');
+  const legacyActive = db.prepare(
+    `SELECT COUNT(*) AS c FROM ph_steps WHERE code IN (${placeholders}) AND active = 1`
+  ).get(...LEGACY_IMAGE_STEP_CODES).c;
+  if (legacyActive === 0) return false;   // 新規 DB / 移行済み
+
+  const copyTop = db.prepare(`
+    INSERT OR IGNORE INTO draft_step_progress
+      (draft_id, step_code, state, assignee_id, due_date, started_at, done_at, done_by, note)
+    SELECT draft_id, ? , state, assignee_id, due_date, started_at, done_at, done_by, note
+    FROM draft_step_progress WHERE step_code = ?
+  `);
+  const copyDetail = db.prepare(`
+    INSERT OR IGNORE INTO draft_step_progress
+      (draft_id, step_code, state, assignee_id, due_date, started_at, done_at, done_by, note)
+    SELECT p.draft_id, ?,
+      CASE WHEN p.state IN ('done', 'skip') AND (
+             p.done_by = 'migration'
+             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
+           )
+           THEN p.state ELSE 'todo' END,
+      p.assignee_id, p.due_date, NULL,
+      CASE WHEN p.state IN ('done', 'skip') AND (
+             p.done_by = 'migration'
+             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
+           )
+           THEN COALESCE(p.done_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ELSE NULL END,
+      CASE WHEN p.state IN ('done', 'skip') AND (
+             p.done_by = 'migration'
+             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
+           )
+           THEN 'migration' ELSE NULL END,
+      p.note
+    FROM draft_step_progress p WHERE p.step_code = ?
+  `);
+  let copied = 0;
+  for (const legacy of LEGACY_IMAGE_STEP_CODES) {
+    copied += copyTop.run(`${legacy}_top`, legacy).changes;
+    copied += copyDetail.run(`${legacy}_detail`, legacy).changes;
+  }
+  db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${placeholders})`).run(...LEGACY_IMAGE_STEP_CODES);
+  console.log(`[product-hub] 画像工程を TOP/詳細 に分割しました (進捗コピー ${copied} 行)`);
+  return true;
 }
 
 export function getDB() {

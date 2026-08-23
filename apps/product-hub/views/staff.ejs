@@ -78,29 +78,34 @@
       <div class="flow-step flow-done"><div class="flow-label" style="margin:0">✅ 完了</div></div>
     </div>
 
-    <div class="track-title">画像トラック <span style="font-weight:400">— 基本情報が入った時点から本流と並行で走ります</span></div>
-    <div class="flow">
-      <% overview.image.forEach(function (st, i) { %>
-        <div class="flow-step">
-          <div class="flow-label"><%= st.label %></div>
-          <div class="flow-role"><%= st.role_label || 'システム' %></div>
-          <div class="flow-staff">
-            <% if (st.default_staff_name) { %>
-              <span class="dot" style="background:<%= st.default_staff_color || '#94a3b8' %>"></span>
-              <span><%= st.default_staff_name %></span>
-              <% if (st.member_count > 1) { %><span class="mini">他<%= st.member_count - 1 %>人</span><% } %>
-            <% } else if (st.member_count > 0) { %>
-              <span class="muted"><%= st.member_count %>人 (既定なし)</span>
-            <% } else { %>
-              <span class="warn-text">未割り当て</span>
-            <% } %>
+    <%# 画像トラックは TOP/詳細 で別々に進む (2026-08-24)。流れは同じなので種別ごとに 1 行ずつ出す %>
+    <% for (const [kindCode, kindLabel] of [['top', 'TOP画像 (サムネイル)'], ['detail', '商品詳細画像']]) { %>
+      <% const kindSteps = overview.image.filter((st) => (st.image_kind === 'detail') === (kindCode === 'detail')); %>
+      <div class="track-title">画像トラック【<%= kindLabel %>】<span style="font-weight:400">— 基本情報が入った時点から本流と並行で走ります</span></div>
+      <div class="flow">
+        <% kindSteps.forEach(function (st, i) { %>
+          <div class="flow-step">
+            <div class="flow-label"><%= st.label %></div>
+            <div class="flow-role"><%= st.role_label || 'システム' %></div>
+            <div class="flow-staff">
+              <% if (st.default_staff_name) { %>
+                <span class="dot" style="background:<%= st.default_staff_color || '#94a3b8' %>"></span>
+                <span><%= st.default_staff_name %></span>
+                <% if (st.member_count > 1) { %><span class="mini">他<%= st.member_count - 1 %>人</span><% } %>
+              <% } else if (st.member_count > 0) { %>
+                <span class="muted"><%= st.member_count %>人 (既定なし)</span>
+              <% } else { %>
+                <span class="warn-text">未割り当て</span>
+              <% } %>
+            </div>
           </div>
-        </div>
-        <% if (i < overview.image.length - 1) { %><div class="flow-arrow">→</div><% } %>
-      <% }); %>
-    </div>
+          <% if (i < kindSteps.length - 1) { %><div class="flow-arrow">→</div><% } %>
+        <% }); %>
+      </div>
+    <% } %>
     <p class="mini" style="margin:8px 0 0;">
-      画像が終わっていないと楽天出品には進めません (出品時のゲート)。
+      TOP画像と商品詳細画像の両方が承認されるまで楽天出品には進めません (出品時のゲート)。
+      詳細画像を作らない商品は、商品の詳細画面で「詳細画像は対象外」にすると TOP だけでゲートが開きます。
     </p>
   </div>
 
@@ -300,7 +305,7 @@
                 <% if (isAdmin) { %><input type="text" class="s-label" value="<%= st.label %>" maxlength="40">
                 <% } else { %><%= st.label %><% } %>
               </td>
-              <td class="muted"><%= st.track === 'image' ? '画像' : '本流' %></td>
+              <td class="muted"><%= st.track === 'image' ? `画像 ${st.image_kind === 'detail' ? '詳細' : 'TOP'}` : '本流' %></td>
               <td>
                 <% if (isAdmin) { %>
                   <select class="s-role">
@@ -336,7 +341,8 @@
           <input type="text" id="new-step-label" placeholder="新しい工程名" style="max-width:220px;" maxlength="40">
           <select id="new-step-track" style="width:auto;">
             <option value="main">本流</option>
-            <option value="image">画像トラック</option>
+            <option value="image:top">画像トラック (TOP画像)</option>
+            <option value="image:detail">画像トラック (詳細画像)</option>
           </select>
           <select id="new-step-role" style="width:auto;">
             <option value="">— システム (担当者なし)</option>
@@ -477,9 +483,13 @@
       const label = document.getElementById('new-step-label').value.trim();
       if (!label) { document.getElementById('step-result').textContent = '工程名を入力してください'; return; }
       addStepBtn.disabled = true;
+      // 画像トラックは "image:top" / "image:detail" 形式 (種別必須 — TOP/詳細で別々に進むため)
+      const trackRaw = document.getElementById('new-step-track').value;
+      const [track, imageKind] = trackRaw.split(':');
       const j = await post('/apps/product-hub/api/steps', {
         label: label,
-        track: document.getElementById('new-step-track').value,
+        track: track,
+        image_kind: imageKind || undefined,
         role_code: document.getElementById('new-step-role').value,
       });
       addStepBtn.disabled = false;
