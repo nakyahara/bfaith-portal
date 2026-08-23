@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 1000px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .pk-form h2 { font-size: 1.0em; margin: 0 0 10px; }
+    .pk-form p { font-size: 0.9em; color: #495057; line-height: 1.6; margin: 0 0 8px; }
+    .pk-row { margin-bottom: 10px; }
+    .pk-row label { display: block; font-size: 0.82em; color: #495057; margin-bottom: 3px; }
+    .pk-row input[type=file] { width: 100%; max-width: 480px; padding: 6px; box-sizing: border-box; }
+    .pk-actions { margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .pk-actions button { padding: 8px 22px; font-size: 1em; cursor: pointer; }
+    .pk-actions button:disabled { opacity: 0.5; cursor: default; }
+    #confirmBtn { background: #2b8a3e; color: #fff; border: 1px solid #2b8a3e; border-radius: 4px; display: none; }
+    .pk-msg { font-size: 0.9em; white-space: pre-wrap; }
+    .pk-msg.err { color: #c92a2a; } .pk-msg.ok { color: #2b8a3e; } .pk-msg.warn { color: #e67700; }
+    .pk-sum { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; padding: 10px 14px;
+      margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 0.92em; }
+    table.pk-lines { width: 100%; border-collapse: collapse; font-size: 0.86em; }
+    table.pk-lines th, table.pk-lines td { border-bottom: 1px solid #dee2e6; padding: 4px 8px; text-align: left; white-space: nowrap; }
+    table.pk-lines th { background: #f1f3f5; position: sticky; top: 0; }
+    table.pk-lines td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    table.pk-lines tr.unreliable td { color: #868e96; }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.85em; background: #e9ecef; }
+    .tag.heavy { background: #fff3bf; }
+    .scroll { max-height: 60vh; overflow: auto; border: 1px solid #dee2e6; border-radius: 8px; }
+    details summary { cursor: pointer; font-size: 0.95em; color: #1971c2; margin-bottom: 6px; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🧭 ロケーション動線マスタ</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-form">
+      <h2>これは何か</h2>
+      <p>ピッキング画面の「次はどう動くか」(振り向く / 折り返す / 3つ左 / 4段目 …) を出すための、3階ピッキングフロアの棚の並びです。
+        <b>「面」= 棚の片側</b> (表 / 裏 / 片面)。歩く順に面番号を振り、各面の連の範囲を持ちます。表示順 (ピッキングの順番) には影響しません。</p>
+      <p>直すときは「現在のマスタをCSVで保存」→ Excel で編集 → ここから取込。検証エラーがあれば取り込まれません (前の版が残ります)。
+        <b>信頼=0</b> の面へ行くときは相対表現 (3つ左 等) を出さずコードだけを出します (階段まわりなど、向きが確かでない場所)。</p>
+      <div class="pk-actions" style="margin-top:0">
+        <a href="/apps/picking/admin/locations/export.csv"><button type="button">⬇ 現在のマスタをCSVで保存</button></a>
+        <span class="pk-msg" style="color:#495057;">現在 <b><%= faces.length %></b> 面 / 通し位置 <b><%= faces.length ? faces[faces.length - 1].slot_to : 0 %></b> マス</span>
+      </div>
+    </div>
+
+    <div class="pk-form">
+      <h2>📤 CSVを取り込む (全置換)</h2>
+      <div class="pk-row">
+        <label>ファイル (列: 面番号, ブロック, 列, 連from, 連to, 面の種類, 棚ID, 前の面からの動き, 信頼, 向き, メモ)</label>
+        <input type="file" id="file" accept=".csv">
+      </div>
+      <div class="pk-actions">
+        <button id="previewBtn" type="button">検証してプレビュー</button>
+        <button id="confirmBtn" type="button">この内容で取り込む</button>
+        <span id="msg" class="pk-msg"></span>
+      </div>
+      <div id="preview" style="display:none; margin-top:12px;">
+        <div class="pk-sum" id="summary"></div>
+        <div id="errors" class="pk-msg err"></div>
+        <div id="warnings" class="pk-msg warn"></div>
+        <div class="scroll" style="margin-top:8px;">
+          <table class="pk-lines"><thead><tr><th>面</th><th>ブロック</th><th>列</th><th>連</th><th>種類</th><th>棚ID</th><th>前の面からの動き</th><th>信頼</th><th>向き</th></tr></thead>
+          <tbody id="previewBody"></tbody></table>
+        </div>
+      </div>
+    </div>
+
+    <div class="pk-form">
+      <h2>現在のマスタ</h2>
+      <div class="scroll">
+        <table class="pk-lines">
+          <thead><tr><th>面</th><th>ブロック</th><th>列</th><th>連</th><th>種類</th><th>棚ID</th><th>前の面からの動き</th><th>通し位置</th><th>信頼</th><th>向き</th><th>メモ</th></tr></thead>
+          <tbody>
+          <% const KIND = { front: '表', back: '裏', cont: '続き', single: '片面' };
+             const MOVE = { start: '開始', forward_turn: '折り返す', turn_around: '振り向く', around_stairs: '階段を回る', across_stairs: '階段の向こう', hang: '吊り下げ', move: '移動' };
+             const HEAVY = new Set(['forward_turn', 'around_stairs', 'across_stairs', 'move']);
+             for (const f of faces) { %>
+            <tr class="<%= f.reliable ? '' : 'unreliable' %>">
+              <td class="num"><%= f.seq_no %></td><td><%= f.block %></td><td><%= f.col %></td>
+              <td class="num"><%= f.ren_from %>〜<%= f.ren_to %></td><td><%= KIND[f.face_kind] || f.face_kind %></td><td><%= f.rack_id %></td>
+              <td><span class="tag <%= HEAVY.has(f.move_in) ? 'heavy' : '' %>"><%= MOVE[f.move_in] || f.move_in %></span></td>
+              <td class="num"><%= f.slot_from %>〜<%= f.slot_to %></td><td class="num"><%= f.reliable %></td><td><%= f.direction === 'right' ? '右' : '左' %></td><td><%= f.note || '' %></td>
+            </tr>
+          <% } %>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="pk-form">
+      <details>
+        <summary>取込履歴 (<%= imports.length %>件) — 前の版に戻すときはCSVを保存して取り込み直す</summary>
+        <table class="pk-lines">
+          <thead><tr><th>#</th><th>日時 (UTC)</th><th>取込者</th><th>ファイル</th><th>面</th><th>マス</th><th></th></tr></thead>
+          <tbody>
+          <% for (const im of imports) { %>
+            <tr><td class="num"><%= im.id %></td><td><%= im.imported_at %></td><td><%= im.actor %></td><td><%= im.filename || '' %></td>
+              <td class="num"><%= im.face_count %></td><td class="num"><%= im.total_slots %></td>
+              <td><a href="/apps/picking/admin/locations/imports/<%= im.id %>.csv">CSV</a></td></tr>
+          <% } %>
+          </tbody>
+        </table>
+      </details>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const KIND = { front: '表', back: '裏', cont: '続き', single: '片面' };
+    const MOVE = { start: '開始', forward_turn: '折り返す', turn_around: '振り向く', around_stairs: '階段を回る', across_stairs: '階段の向こう', hang: '吊り下げ', move: '移動' };
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    async function send(mode) {
+      const f = $('file').files[0];
+      if (!f) { $('msg').textContent = 'ファイルを選択してください'; $('msg').className = 'pk-msg err'; return null; }
+      const fd = new FormData(); fd.append('file', f); fd.append('mode', mode);
+      $('msg').textContent = mode === 'confirm' ? '取込中…' : '検証中…'; $('msg').className = 'pk-msg';
+      const res = await fetch('/apps/picking/admin/locations', { method: 'POST', body: fd });
+      const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      if (!res.ok) { $('msg').textContent = data.error || `HTTP ${res.status}`; $('msg').className = 'pk-msg err'; return null; }
+      return data;
+    }
+    $('previewBtn').addEventListener('click', async () => {
+      const d = await send('preview');
+      if (!d) return;
+      $('preview').style.display = 'block';
+      $('summary').innerHTML = `<span>面 <b>${d.faceCount}</b></span><span>棚 <b>${d.racks}</b></span><span>通し位置 <b>${d.totalSlots}</b> マス</span>`;
+      $('errors').textContent = d.errors.length ? `✗ 取り込めません:\n${d.errors.join('\n')}` : '';
+      $('warnings').textContent = d.warnings.length ? `⚠ 確認してください:\n${d.warnings.join('\n')}` : '';
+      $('previewBody').innerHTML = d.faces.map((f) => `<tr class="${f.reliable ? '' : 'unreliable'}"><td class="num">${f.seq_no}</td><td>${esc(f.block)}</td><td>${esc(f.col)}</td>
+        <td class="num">${f.ren_from}〜${f.ren_to}</td><td>${KIND[f.face_kind] || esc(f.face_kind)}</td><td>${esc(f.rack_id)}</td><td>${MOVE[f.move_in] || esc(f.move_in)}</td>
+        <td class="num">${f.reliable}</td><td>${f.direction === 'right' ? '右' : '左'}</td></tr>`).join('');
+      $('confirmBtn').style.display = d.ok ? 'inline-block' : 'none';
+      $('msg').textContent = d.ok ? '検証OK。内容を確認して「この内容で取り込む」を押してください' : '検証エラーがあります';
+      $('msg').className = d.ok ? 'pk-msg ok' : 'pk-msg err';
+    });
+    $('confirmBtn').addEventListener('click', async () => {
+      if (!confirm('現在のマスタをこのCSVで置き換えます。よろしいですか?')) return;
+      $('confirmBtn').disabled = true;
+      const d = await send('confirm');
+      $('confirmBtn').disabled = false;
+      if (!d) return;
+      $('msg').textContent = `✓ 取り込みました (${d.faceCount}面 / ${d.totalSlots}マス)。ページを再読み込みします`; $('msg').className = 'pk-msg ok';
+      setTimeout(() => location.reload(), 800);
+    });
+  </script>
+</body>
+</html>

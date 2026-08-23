@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -172,6 +172,43 @@ const MIGRATIONS = {
       acked_by     TEXT
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_floor_alerts_active ON pk_floor_alerts(direction, acked_at)');
+  },
+  // v8: ロケーション動線マスタ (NEXTサイン・2026-08-23 中原さん指示)。
+  // ピッキングフロア(P3F)を一筆書きに並べた「面」(棚の片側) の定義。表示順 (pk_lines.seq) には
+  // 一切影響させず、作業画面の「次はどう動くか」の見せ方にだけ使う。
+  // 取込は全置換 + 履歴 (CSV全文+sha256) で、間違った版は前の版を入れ直して戻せる。
+  // 中身の規約・検証は apps/picking/location-faces.js、判定は next-sign-core.cjs
+  8: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_location_face_imports (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      imported_at  TEXT NOT NULL,
+      actor        TEXT NOT NULL,          -- 取込者 email / 'seed' (同梱CSVによる初期化)
+      filename     TEXT,
+      sha256       TEXT NOT NULL,
+      face_count   INTEGER NOT NULL,
+      total_slots  INTEGER NOT NULL,       -- 総マス数 (一筆書きの長さ)
+      csv_text     TEXT NOT NULL           -- 取り込んだCSV全文 (復元用)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_location_faces (
+      seq_no       INTEGER PRIMARY KEY,    -- 面番号 = 歩く順 (1..N)
+      block        TEXT NOT NULL,          -- 'P3FA'
+      col          TEXT NOT NULL,          -- '001' (ロケ8桁の1〜3桁目 = 列 = 棚1本)
+      ren_from     INTEGER NOT NULL,       -- この面の最初の連 (歩き始める端)
+      ren_to       INTEGER NOT NULL,       -- この面の最後の連
+      face_kind    TEXT NOT NULL CHECK(face_kind IN ('front','back','cont','single')),
+      rack_id      TEXT NOT NULL,          -- 物理的な1本の棚。列をまたぐことがある (A008+B001)
+      move_in      TEXT NOT NULL           -- 前の面からこの面へ入る体の動き
+        CHECK(move_in IN ('start','forward_turn','turn_around','around_stairs','across_stairs','hang','move')),
+      reliable     INTEGER NOT NULL DEFAULT 1 CHECK(reliable IN (0,1)),   -- 0 = 相対表現を出さずコードのみ
+      direction    TEXT NOT NULL DEFAULT 'left' CHECK(direction IN ('left','right')), -- 棚に向かって連が増える側
+      storage_kind TEXT NOT NULL DEFAULT 'shelf' CHECK(storage_kind IN ('shelf','pocket')),
+      slot_from    INTEGER NOT NULL,       -- 一筆書きの通し位置
+      slot_to      INTEGER NOT NULL,
+      note         TEXT,
+      import_id    INTEGER NOT NULL REFERENCES pk_location_face_imports(id),
+      UNIQUE (block, col, ren_from)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_location_faces_col ON pk_location_faces(block, col)');
   },
 };
 
