@@ -1662,6 +1662,93 @@ db.prepare(`UPDATE mirror_products SET 配送方法 = '宅急便コンパクト'
 db.prepare(`DELETE FROM mirror_products WHERE product_id IN (9402, 9403)`).run();
 db.prepare(`DELETE FROM ph_shipping_method_map`).run();
 
+// ─── ワークフロー: 担当者 / 役割 / 工程 (2026-08-23) ───
+const wf = await import('../lib/workflow.js');
+{
+  const roles0 = wf.listRoles();
+  check('役割シード 4件', roles0.length === 4, `= ${roles0.length}`);
+  check('役割シード: 商品登録者', roles0.some((r) => r.code === 'registrar' && r.label === '商品登録者'));
+  const steps0 = wf.listSteps();
+  check('工程シード: 本流6 + 画像3',
+    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 3);
+  check('工程シード: AI待ちはシステム工程 (担当ロールなし)', steps0.find((s) => s.code === 'ai_generate').role_code === null);
+  check('工程シード: 先頭は基本情報入力', steps0[0].code === 'basic_info');
+
+  // 管理画面で改名したものが再 init で巻き戻らない (INSERT OR IGNORE の意図)
+  wf.updateStep('basic_info', { label: '基本情報入力 (改)' });
+  dbmod._resetInitForTest();
+  dbmod.getDB();
+  check('工程の改名が再initで戻らない', wf.listSteps().find((s) => s.code === 'basic_info').label === '基本情報入力 (改)');
+  wf.updateStep('basic_info', { label: '基本情報入力' });
+
+  // 担当者の登録
+  const okawa = wf.createStaff({ name: '大川さん', kind: 'outsource' });
+  const tanaka = wf.createStaff({ name: '田中美祐', kind: 'internal', portal_email: 'Tanaka@B-Faith.biz' });
+  check('担当者に色が自動で付く', /^#[0-9a-f]{6}$/i.test(wf.getStaff(okawa).color || ''));
+  check('ポータルメールは小文字で保存', wf.getStaff(tanaka).portal_email === 'tanaka@b-faith.biz');
+  check('ポータルメールで担当者を引ける', wf.staffByPortalEmail('TANAKA@b-faith.biz')?.id === tanaka);
+
+  let dup = null;
+  try { wf.createStaff({ name: ' 大川さん ' }); } catch (e) { dup = e; }
+  check('同名 (前後空白違い) は登録できない', dup?.status === 400, dup?.message || '例外が出ていない');
+  let dupMail = null;
+  try { wf.createStaff({ name: '別人さん', portal_email: 'tanaka@b-faith.biz' }); } catch (e) { dupMail = e; }
+  check('同じポータルメールを2人に付けられない', !!dupMail, '例外が出ていない');
+  let badMail = null;
+  try { wf.createStaff({ name: '書式違いさん', portal_email: 'not-an-email' }); } catch (e) { badMail = e; }
+  check('メール形式を検証する', badMail?.status === 400);
+
+  // 役割の割り当てと既定担当
+  wf.setStaffRoles(okawa, [{ code: 'image', isDefault: true }]);
+  wf.setStaffRoles(tanaka, [{ code: 'registrar', isDefault: true }, { code: 'image' }]);
+  check('既定担当が工程に出る', wf.listSteps().find((s) => s.code === 'img_request').default_staff_name === '大川さん');
+  check('工程に紐づく人数が出る', wf.listSteps().find((s) => s.code === 'img_request').member_count === 2);
+  // 既定は役割ごとに 1 人 = 後から立てた方に付け替わる (UNIQUE 違反でエラーにしない)
+  wf.setStaffRoles(tanaka, [{ code: 'registrar', isDefault: true }, { code: 'image', isDefault: true }]);
+  check('既定は役割ごとに1人 (前任は外れる)',
+    wf.getStaff(okawa).roles.find((r) => r.code === 'image').isDefault === false);
+  check('付け替え後の既定が反映される', wf.listSteps().find((s) => s.code === 'img_request').default_staff_name === '田中美祐');
+
+  // 無効化 = 退職者に自動割り当てしない。ただし役割の紐付け自体は履歴として残す
+  wf.setStaffActive(tanaka, false);
+  check('無効化で既定が外れる', wf.listSteps().find((s) => s.code === 'basic_info').default_staff_name == null);
+  check('無効化しても役割の紐付けは残る', wf.getStaff(tanaka).roles.length === 2);
+  check('無効化した人は一覧の既定から外れる', wf.listStaff().every((s) => s.id !== tanaka));
+  wf.setStaffActive(tanaka, true);
+
+  // builtin (工程が参照する定義) は無効化させない。改名は許す
+  let roleErr = null;
+  try { wf.updateRole('registrar', { active: false }); } catch (e) { roleErr = e; }
+  check('工程が使う役割は無効化できない', roleErr?.status === 400, roleErr?.message || '例外が出ていない');
+  check('役割の改名はできる', wf.updateRole('registrar', { label: '商品登録者' }) === true);
+  let stepErr = null;
+  try { wf.updateStep('basic_info', { active: false }); } catch (e) { stepErr = e; }
+  check('本流の工程は無効化できない', stepErr?.status === 400, stepErr?.message || '例外が出ていない');
+
+  // 運用で足した工程は無効化できる
+  const extra = wf.createStep({ label: '撮影', track: 'image', role_code: 'image' });
+  check('工程を追加できる', wf.listSteps({ track: 'image' }).some((s) => s.code === extra));
+  check('追加した工程は無効化できる', wf.updateStep(extra, { active: false }) === true);
+  check('無効化した工程は既定の一覧に出ない', !wf.listSteps().some((s) => s.code === extra));
+
+  // 滞留日数
+  let stallErr = null;
+  try { wf.updateStep('ai_generate', { stall_days: 0 }); } catch (e) { stallErr = e; }
+  check('滞留日数 0 は弾く', stallErr?.status === 400);
+  check('滞留日数を空にできる (警告しない)', wf.updateStep('ai_generate', { stall_days: '' }) === true);
+  wf.updateStep('ai_generate', { stall_days: 3 });
+
+  // 担当ロールを外してシステム工程にできる (将来の自動化に備える)
+  check('工程をシステム工程に変えられる', wf.updateStep('set_review', { role_code: '' }) === true);
+  check('システム工程は担当ロールが空', wf.listSteps().find((s) => s.code === 'set_review').role_code === null);
+  wf.updateStep('set_review', { role_code: 'set_planner' });
+
+  // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
+  const ov = wf.workflowOverview();
+  check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
+  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 3);
+}
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -2329,6 +2416,21 @@ const renders = [
     yahoo: null, imageProduction: null,
   }],
 ];
+// 担当者・工程の設定画面。admin / 閲覧のみ / 担当者ゼロ (初回起動時) の 3 分岐を実データで
+const staffBase = {
+  title: '担当者・工程の設定', displayName: '中原 大輔',
+  staff: wf.listStaff({ includeInactive: true }),
+  roles: wf.listRoles({ includeInactive: true }),
+  steps: wf.listSteps({ includeInactive: true }),
+  overview: wf.workflowOverview(),
+  staffKinds: dbmod.STAFF_KINDS, staffColors: dbmod.STAFF_COLORS,
+  myEmail: 'tanaka@b-faith.biz',
+};
+renders.push(
+  ['staff.ejs (admin)', 'staff.ejs', { ...staffBase, isAdmin: true }],
+  ['staff.ejs (閲覧のみ)', 'staff.ejs', { ...staffBase, isAdmin: false }],
+  ['staff.ejs (担当者ゼロ)', 'staff.ejs', { ...staffBase, isAdmin: true, staff: [] }],
+);
 for (const [name, file, data] of renders) {
   try {
     // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態・自動追加バナー)

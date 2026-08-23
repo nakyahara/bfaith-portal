@@ -17,8 +17,13 @@ import {
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
-  DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
+  DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
 } from './db.js';
+import {
+  listStaff, createStaff, updateStaff, setStaffActive, setStaffRoles,
+  listRoles, createRole, updateRole,
+  listSteps, createStep, updateStep, workflowOverview,
+} from './lib/workflow.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -1470,6 +1475,99 @@ router.post('/api/drafts/:id/delete', (req, res) => {
   // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
   res.json({ ok: true, deleted: draft.ne_code });
+});
+
+// ─── ワークフロー: 担当者 / 役割 / 工程マスタ (2026-08-23) ──────────
+// 「ステータスごとに誰が何をするか」の土台。閲覧は全員 (自分の役割を確認できる)、
+// 編集は admin のみ (マスタなので、誤操作すると全ドラフトの割り当てに波及する)。
+
+function requireAdminJson(req, res) {
+  if (req.session?.role !== 'admin') {
+    res.status(403).json({ ok: false, error: 'admin のみ操作できます' });
+    return false;
+  }
+  return true;
+}
+
+/** workflow.js の検証エラー (status=400) は文言をそのまま返し、それ以外は 500 に丸める */
+function workflowError(res, e) {
+  const status = Number(e?.status) || 500;
+  if (status >= 500) console.error('[product-hub] workflow:', e);
+  res.status(status).json({ ok: false, error: status >= 500 ? 'サーバーエラーが発生しました' : e.message });
+}
+
+router.get('/staff', (req, res) => {
+  res.render(view('staff.ejs'), {
+    title: '担当者・工程の設定',
+    displayName: req.session?.displayName || req.session?.email || '',
+    isAdmin: req.session?.role === 'admin',
+    staff: listStaff({ includeInactive: true }),
+    roles: listRoles({ includeInactive: true }),
+    steps: listSteps({ includeInactive: true }),
+    overview: workflowOverview(),
+    staffKinds: STAFF_KINDS,
+    staffColors: STAFF_COLORS,
+    myEmail: (req.session?.email || '').toLowerCase(),
+  });
+});
+
+router.post('/api/staff', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    const id = createStaff(req.body || {});
+    if (Array.isArray(req.body?.roles)) setStaffRoles(id, req.body.roles);
+    res.json({ ok: true, id });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/staff/:id', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    const ok = updateStaff(req.params.id, req.body || {});
+    if (!ok) return res.status(404).json({ ok: false, error: '担当者が見つかりません' });
+    if (Array.isArray(req.body?.roles)) setStaffRoles(req.params.id, req.body.roles);
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 削除は用意しない (割り当て履歴が壊れる)。無効化で運用から外す
+router.post('/api/staff/:id/active', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    const ok = setStaffActive(req.params.id, req.body?.active === true);
+    if (!ok) return res.status(404).json({ ok: false, error: '担当者が見つかりません' });
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/roles', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    res.json({ ok: true, code: createRole(req.body || {}) });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/roles/:code', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    updateRole(req.params.code, req.body || {});
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/steps', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    res.json({ ok: true, code: createStep(req.body || {}) });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/steps/:code', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    updateStep(req.params.code, req.body || {});
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
 });
 
 export default router;
