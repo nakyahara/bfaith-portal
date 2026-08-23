@@ -398,25 +398,27 @@ export function setStepState(
   }
   const where = `WHERE ${conds.join(' AND ')}`;
 
-  // UPDATE と監査ログを 1 トランザクションに閉じる (ログだけ残って本体が失敗する状態を作らない)
+  // UPDATE・監査ログ・**新しい版数の読み出し**を 1 トランザクションに閉じる。
+  // 読み出しを外に出すと、その隙に別プロセスが更新した版数を返してしまい、
+  // 画面が「自分が確認していない更新」の版数を持って次の楽観ロックをすり抜ける (Codex R4)
   const run = db.transaction(() => {
     const info = db.prepare(`
       UPDATE draft_step_progress
       SET ${sets.join(', ')}, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       ${where}
     `).run(params);
-    if (info.changes !== 1) return false;
+    if (info.changes !== 1) return null;
     if (event) logEvent(db, id, 'step_changed', event, actor);
-    return true;
+    return db.prepare(
+      'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
+    ).get(id, code);
   });
-  if (!run()) {
+  const fresh = run();
+  if (!fresh) {
     throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
   }
   // 続けて操作できるよう、新しい版数を返す (画面が次の楽観ロックに使う)
-  const fresh = db.prepare(
-    'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
-  ).get(id, code);
-  return { changed: true, version: fresh?.version ?? null, updated_at: fresh?.updated_at || null };
+  return { changed: true, version: fresh.version ?? null, updated_at: fresh.updated_at || null };
 }
 
 /**

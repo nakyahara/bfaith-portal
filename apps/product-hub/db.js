@@ -757,7 +757,13 @@ export function initProductHubDB() {
   // 楽観ロックの版数列。PR 途中の状態でデプロイした環境にも足せるよう冪等 ALTER にする
   const dspCols = new Set(db.prepare('PRAGMA table_info(draft_step_progress)').all().map((c) => c.name));
   if (!dspCols.has('version')) {
-    db.exec('ALTER TABLE draft_step_progress ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+    try {
+      db.exec('ALTER TABLE draft_step_progress ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+    } catch (e) {
+      // ポータルと warehouse variant が同時に起動すると、両方が「列なし」と判定して
+      // 後発が duplicate column で落ちる。列が既にあるなら成功と同義なので飲み込む
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
   }
 
   for (const stmt of [
