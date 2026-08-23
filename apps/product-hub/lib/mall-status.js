@@ -10,7 +10,7 @@
  *   - version をトークンにした楽観ロック。画面から来る操作はトークン必須
  */
 import { getDB, logEvent } from '../db.js';
-import { STEP_STATES, STEP_STATE_LABELS, progressOf } from './workflow-progress.js';
+import { STEP_STATES, STEP_STATE_LABELS } from './workflow-progress.js';
 import { MALLS, MALL_CODES, MALL_LABELS, LISTING_STEP_CODE } from './malls-def.js';
 
 // モール定義は lib/malls-def.js が正 (工程側からも参照するため切り出し)。
@@ -325,17 +325,3 @@ export function mallSummaryFor(db, draftIds) {
   return out;
 }
 
-/**
- * 出品ゲート: まだ出品してよい状態か (PR4 で追加予定のセット派生の仮コード対策と同じ入口)。
- * ここでは「工程の画像トラックが終わっているか」を見る。
- * 画像が揃っていない商品を楽天に出すと、後から差し替える手間の方が大きい。
- */
-export function listingBlockReason(draftId, { db = null } = {}) {
-  const conn = db || getDB();
-  const p = progressOf(draftId, { db: conn });
-  if (p.image.length > 0 && !p.imageDone) {
-    const cur = p.imageCurrent;
-    return `画像トラックが終わっていません (${cur ? cur.label : '未着手'})`;
-  }
-  return null;
-}

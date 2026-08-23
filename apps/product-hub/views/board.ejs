@@ -23,9 +23,9 @@
   .kb-assignee { display: inline-flex; align-items: center; gap: 4px; color: #475569; }
   .kb-unassigned { color: #b45309; font-weight: 600; }
   .kb-stall { color: #b91c1c; font-weight: 700; }
-  .kb-img { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #e2e8f0; color: #475569; }
-  .kb-img.done { background: #dcfce7; color: #166534; }
-  .kb-img.todo { background: #fef3c7; color: #92400e; }
+  .kb-kind { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+  .kb-kind.top { background: #dbeafe; color: #1d4ed8; }
+  .kb-kind.detail { background: #ede9fe; color: #6d28d9; }
   .kb-malls { display: flex; align-items: center; gap: 2px; margin-top: 5px; }
   .mall-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e2e8f0; }
   .mall-dot.mall-done { background: #16a34a; }
@@ -35,23 +35,56 @@
   .kb-progress { height: 3px; background: #e2e8f0; border-radius: 999px; margin-top: 6px; overflow: hidden; }
   .kb-progress > i { display: block; height: 100%; background: #60a5fa; }
   .kb-empty { font-size: 11px; color: #94a3b8; text-align: center; padding: 10px 0; }
-  .kb-track-title { font-size: 12px; font-weight: 700; color: #475569; margin: 14px 0 6px; }
   .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
   .chip { display: inline-block; border: 1px solid #cbd5e1; background: #fff; border-radius: 999px;
           padding: 4px 12px; font-size: 12px; text-decoration: none; color: #475569; }
   .chip.on { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+  /* ビュー切替タブ: ボードは 1 枚で「見る軸」だけを変える (本流の工程 / 画像の工程) */
+  .kb-tabs { display: inline-flex; border: 1px solid #cbd5e1; border-radius: 8px; overflow: hidden; }
+  .kb-tab { padding: 5px 14px; font-size: 12px; text-decoration: none; color: #475569; background: #fff; }
+  .kb-tab.on { background: #1d4ed8; color: #fff; font-weight: 700; }
+  /* 画像トラックのミニステッパー (依頼→制作→登録→承認)。カードに常時出す = 2重管理をなくす */
+  .kb-imgtracks { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; font-size: 10px; }
+  .kb-krow { display: flex; align-items: center; gap: 4px; color: #64748b; }
+  .kb-krow .kb-kname { flex: 0 0 26px; font-weight: 700; }
+  .kb-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #e2e8f0; }
+  .kb-dot.done { background: #16a34a; }
+  .kb-dot.doing { background: #f59e0b; }
+  .kb-klabel { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .kb-klabel.done { color: #166534; font-weight: 600; }
+  .kb-klabel.excluded { color: #94a3b8; }
+  .kb-kstall { color: #b91c1c; font-weight: 700; }
 </style>
+
+<%
+  // フィルタとタブの URL。切り替えても他の条件 (担当者・未割り当て・ビュー) を失わない
+  const boardUrl = (over = {}) => {
+    const p = new URLSearchParams();
+    const v = over.view !== undefined ? over.view : boardView;
+    if (v === 'image') p.set('view', 'image');
+    const a = over.assignee !== undefined ? over.assignee : assigneeParam;
+    if (a) p.set('assignee', a);
+    const f = over.filter !== undefined ? over.filter : (unassignedOnly ? 'unassigned' : '');
+    if (f) p.set('filter', f);
+    const s = p.toString();
+    return '/apps/product-hub/board' + (s ? '?' + s : '');
+  };
+%>
 
 <div class="wrap wide">
   <div class="filters">
     <span style="font-size:15px; font-weight:700;">🔁 工程ボード</span>
-    <a class="chip <%= !assigneeParam && !unassignedOnly ? 'on' : '' %>" href="/apps/product-hub/board">すべて</a>
+    <span class="kb-tabs">
+      <a class="kb-tab <%= boardView !== 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'main' }) %>">本流で並べる</a>
+      <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
+    </span>
+    <a class="chip <%= !assigneeParam && !unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <% if (me) { %>
-      <a class="chip <%= assigneeParam === 'me' ? 'on' : '' %>" href="/apps/product-hub/board?assignee=me">
+      <a class="chip <%= assigneeParam === 'me' ? 'on' : '' %>" href="<%= boardUrl({ assignee: 'me', filter: '' }) %>">
         自分のボール (<%= me.name %>)
       </a>
     <% } %>
-    <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="/apps/product-hub/board?filter=unassigned">未割り当て</a>
+    <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
     <select id="assignee-select" style="width:auto; font-size:12px;">
       <option value="">担当者で絞る…</option>
       <% for (const s of staff) { %>
@@ -70,7 +103,19 @@
     </div>
   <% } %>
 
-  <!-- 本流 -->
+  <%
+    // 画像トラック (TOP/詳細) のミニステッパー。どちらのビューでも同じものをカードに出す
+    const imgTrackRows = (c) => {
+      const rows = [];
+      for (const kind of ['top', 'detail']) {
+        const t = c.image && c.image[kind];
+        if (!t) continue;
+        rows.push({ kind, t });
+      }
+      return rows;
+    };
+  %>
+
   <div class="kb">
     <% for (const col of board.columns) { %>
       <div class="kb-col <%= col.role_code ? '' : 'system' %>">
@@ -86,7 +131,8 @@
             <div class="kb-empty">—</div>
           <% } %>
           <% for (const c of col.cards) { %>
-            <a class="kb-card <%= c.stalledDays ? 'stalled' : '' %>" href="/apps/product-hub/detail/<%= c.id %>">
+            <% const stalled = boardView === 'image' ? c.kindStalledDays : c.stalledDays; %>
+            <a class="kb-card <%= stalled ? 'stalled' : '' %>" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -99,19 +145,52 @@
                 </div>
               </div>
               <div class="kb-meta">
-                <% if (c.current && c.current.assignee_name) { %>
-                  <span class="kb-assignee">
-                    <span class="wf-dot" style="background:<%= c.current.assignee_color || '#94a3b8' %>"></span><%= c.current.assignee_name %>
-                  </span>
-                <% } else if (c.current && c.current.role_code) { %>
-                  <span class="kb-unassigned">未割り当て</span>
+                <% if (boardView === 'image') { %>
+                  <span class="kb-kind <%= c.kind %>"><%= imageKindLabels[c.kind] %></span>
+                  <% if (c.kindCurrent && c.kindCurrent.assignee_name) { %>
+                    <span class="kb-assignee">
+                      <span class="wf-dot" style="background:<%= c.kindCurrent.assignee_color || '#94a3b8' %>"></span><%= c.kindCurrent.assignee_name %>
+                    </span>
+                  <% } else if (c.kindCurrent && c.kindCurrent.role_code) { %>
+                    <span class="kb-unassigned">未割り当て</span>
+                  <% } %>
+                  <% if (c.kindStalledDays) { %><span class="kb-stall">⚠️<%= c.kindStalledDays %>日</span><% } %>
+                  <span class="mini">本流: <%= c.current ? c.current.label : '完了' %></span>
+                <% } else { %>
+                  <% if (c.current && c.current.assignee_name) { %>
+                    <span class="kb-assignee">
+                      <span class="wf-dot" style="background:<%= c.current.assignee_color || '#94a3b8' %>"></span><%= c.current.assignee_name %>
+                    </span>
+                  <% } else if (c.current && c.current.role_code) { %>
+                    <span class="kb-unassigned">未割り当て</span>
+                  <% } %>
+                  <% if (c.stalledDays) { %><span class="kb-stall">⚠️<%= c.stalledDays %>日</span><% } %>
                 <% } %>
-                <% if (c.stalledDays) { %><span class="kb-stall">⚠️<%= c.stalledDays %>日</span><% } %>
-                <span class="kb-img <%= c.imageDone ? 'done' : 'todo' %>">
-                  🖼 <%= c.imageDone ? '済' : (c.imageCurrent ? c.imageCurrent.label : '—') %>
-                </span>
               </div>
-              <% if (c.malls && col.code === 'listing') { %>
+              <!-- 画像トラック (TOP/詳細) の進み具合。ボードを行き来しなくてもここで読める -->
+              <div class="kb-imgtracks">
+                <% for (const { kind, t } of imgTrackRows(c)) { %>
+                  <div class="kb-krow">
+                    <span class="kb-kname"><%= kind === 'top' ? 'TOP' : '詳細' %></span>
+                    <% if (t.excluded) { %>
+                      <span class="kb-klabel excluded">対象外</span>
+                    <% } else { %>
+                      <% for (const s of t.steps) { %>
+                        <span class="kb-dot <%= s.state === 'done' || s.state === 'skip' ? 'done' : (s.state === 'doing' ? 'doing' : '') %>"></span>
+                      <% } %>
+                      <% if (t.done) { %>
+                        <span class="kb-klabel done">済</span>
+                      <% } else if (t.current) { %>
+                        <span class="kb-klabel"><%= t.current.label %></span>
+                        <% if (t.stalledDays) { %><span class="kb-kstall">⚠<%= t.stalledDays %>日</span><% } %>
+                      <% } else { %>
+                        <span class="kb-klabel">—</span>
+                      <% } %>
+                    <% } %>
+                  </div>
+                <% } %>
+              </div>
+              <% if (boardView !== 'image' && c.malls && col.code === 'listing') { %>
                 <%# 出品・展開の列だけ、どのモールまで並んだかを出す %>
                 <div class="kb-malls">
                   <% for (const m of c.malls) { %>
@@ -120,14 +199,16 @@
                   <span class="mini"><%= c.malls.filter((m) => m.state === 'done').length %>/<%= c.malls.length %></span>
                 </div>
               <% } %>
-              <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
+              <% if (boardView !== 'image') { %>
+                <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
+              <% } %>
             </a>
           <% } %>
         </div>
       </div>
     <% } %>
 
-    <!-- 終端列: 完了 -->
+    <!-- 終端列: 完了 (画像ビューでは「TOP済み・詳細も済みか対象外」の商品) -->
     <div class="kb-col" style="background:#f0fdf4;">
       <div class="kb-col-head">
         <span class="kb-col-title">✅ 完了</span>
@@ -153,48 +234,11 @@
     </div>
   </div>
 
-  <!-- 画像トラック -->
-  <div class="kb-track-title">🖼 画像トラック <span style="font-weight:400; color:#94a3b8;">— 基本情報が入った時点から本流と並行で走ります</span></div>
-  <div class="kb">
-    <% for (const col of board.imageColumns) { %>
-      <div class="kb-col">
-        <div class="kb-col-head">
-          <span class="kb-col-title"><%= col.label %></span>
-          <span class="kb-col-count"><%= col.cards.length %></span>
-        </div>
-        <div class="kb-col-role"><%= col.stall_days ? `${col.stall_days}日で警告` : '' %></div>
-        <div class="kb-body" style="max-height:40vh;">
-          <% if (col.cards.length === 0) { %><div class="kb-empty">—</div><% } %>
-          <% for (const c of col.cards) { %>
-            <a class="kb-card" href="/apps/product-hub/detail/<%= c.id %>?tab=tab-images">
-              <div class="kb-card-top">
-                <% if (c.first_image_id) { %>
-                  <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
-                <% } else { %><div class="kb-thumb"></div><% } %>
-                <div style="min-width:0;">
-                  <div class="kb-name"><%= c.name %></div>
-                  <div class="kb-code"><%= c.ne_code %></div>
-                </div>
-              </div>
-              <div class="kb-meta">
-                <% if (c.imageCurrent && c.imageCurrent.assignee_name) { %>
-                  <span class="kb-assignee">
-                    <span class="wf-dot" style="background:<%= c.imageCurrent.assignee_color || '#94a3b8' %>"></span><%= c.imageCurrent.assignee_name %>
-                  </span>
-                <% } else { %>
-                  <span class="kb-unassigned">未割り当て</span>
-                <% } %>
-                <span class="kb-img">本流: <%= c.current ? c.current.label : '完了' %></span>
-              </div>
-            </a>
-          <% } %>
-        </div>
-      </div>
-    <% } %>
-  </div>
-
   <p class="muted" style="margin-top:14px;">
     カードをクリックすると商品の詳細が開き、そこで工程を進められます。
+    <% if (boardView === 'image') { %>
+      カードは 商品 × 画像種別 (TOP / 詳細) です。詳細画像を作らない商品は「対象外」にするとここに出ません。
+    <% } %>
     保留・除外にした商品はこのボードには出ません（<a href="/apps/product-hub">一覧</a>で確認できます）。
   </p>
 </div>
@@ -203,8 +247,11 @@
   const sel = document.getElementById('assignee-select');
   if (sel) {
     sel.addEventListener('change', function () {
-      const v = sel.value;
-      location.href = v ? '/apps/product-hub/board?assignee=' + encodeURIComponent(v) : '/apps/product-hub/board';
+      const p = new URLSearchParams(location.search);
+      p.delete('filter');
+      if (sel.value) p.set('assignee', sel.value); else p.delete('assignee');
+      const s = p.toString();
+      location.href = '/apps/product-hub/board' + (s ? '?' + s : '');
     });
   }
 </script>

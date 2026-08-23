@@ -26,6 +26,7 @@ import {
 } from './lib/workflow.js';
 import {
   progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
+  setDetailImagesExcluded, IMAGE_KIND_LABELS,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -1528,7 +1529,8 @@ function workflowError(res, e) {
 }
 
 // かんばんボード = 「ステータスごとに誰が何をするか」の主画面 (中原さん 2026-08-23)。
-// 列 = 工程、カード = 商品。上段が本流、下段が画像トラック (基本情報の後から並行で走る)
+// ボードは 1 枚で、?view= で「本流の工程で並べる / 画像の工程で並べる」を切り替える
+// (2026-08-24: 上下 2 段だと同じ商品が 2 箇所に出て 2 重管理に見える、の対応)
 router.get('/board', (req, res) => {
   const db = getDB();
   const me = staffByPortalEmail(req.session?.email);
@@ -1536,12 +1538,14 @@ router.get('/board', (req, res) => {
   const raw = String(req.query.assignee || '').trim();
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
   const unassignedOnly = String(req.query.filter || '') === 'unassigned';
+  const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardData(db, { assigneeId, unassignedOnly, mallSummary: mallSummaryFor });
+  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
     board,
+    boardView,
     staff: listStaff(),
     me,
     assigneeId,
@@ -1549,6 +1553,7 @@ router.get('/board', (req, res) => {
     unassignedOnly,
     thumbnailUrl,
     stepStateLabels: STEP_STATE_LABELS,
+    imageKindLabels: IMAGE_KIND_LABELS,
   });
 });
 
@@ -1640,6 +1645,21 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
       requireVersion: true,
     });
     res.json({ ok: true, changed: r.changed, version: r.version });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 「詳細画像を作らない」フラグの切り替え (単純な仕入れ商品は TOP画像のみ — 2026-08-24 中原さん)。
+// 権限判定は setDetailImagesExcluded 側 (admin か詳細画像「依頼」工程の担当者本人)
+router.post('/api/drafts/:id/detail-images-excluded', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const r = setDetailImagesExcluded(draft.id, req.body?.excluded === true, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+    });
+    res.json({ ok: true, changed: r.changed });
   } catch (e) { workflowError(res, e); }
 });
 

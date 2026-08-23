@@ -22,6 +22,7 @@ import { google } from 'googleapis';
 
 import { getDB, logEvent } from '../db.js';
 import { resolveVariationGroup, getNeCost } from '../lib/variation.js';
+import { imageTrackBlockReason } from '../lib/workflow-progress.js';
 // ⚠️ page-info.js はこのファイルの SHIPPING_METHOD_GROUPS を import する (循環参照)。
 //    双方とも関数呼び出し時にしか使わないので ESM 的に安全。module 評価時に参照しないこと
 import { validatePageInfo, buildPageInfoHtml, mapNeShippingToRakuten } from '../lib/page-info.js';
@@ -1035,6 +1036,10 @@ export function buildItemPayload(db, draftId) {
       ? `商品コードが仮のままです (${draft.ne_code})。ネクストエンジンに登録した本コードへ差し替えてください`
       : `商品コード「${draft.ne_code}」がNE商品マスタに見つかりません (登録待ちか取込待ち)。取り込まれると自動で解除されます`);
   }
+  // 画像トラック (依頼 → 制作 → 登録 → 承認) が終わるまで出さない。
+  // #888 で「出品時のゲート」と画面に書いたまま配線が抜けていた。画像作成承認者の追加 (2026-08-23) で配線
+  const imageBlock = imageTrackBlockReason(db, draftId);
+  if (imageBlock) reasons.push(imageBlock);
   // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
   const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: false });
   if (vari.kind === 'variation' && vari.memberCount > 1) {

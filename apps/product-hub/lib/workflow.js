@@ -423,10 +423,26 @@ export function updateStep(code, input) {
     params.active = on;
   }
   if (sets.length === 0) return false;
-  const info = db.prepare(`
-    UPDATE ph_steps SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE code = @code
-  `).run(params);
-  return info.changes === 1;
+  const run = db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE ph_steps SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE code = @code
+    `).run(params);
+    // 画像トラックの組み込み工程は TOP/詳細 で対になっている。ラベル・並び順・滞留日数・説明は
+    // 対の片方だけ変えると、ボードの「同じ段階を 1 列にまとめる」表示が段階ごと分裂して見えるので
+    // **一括で**そろえる (Codex設計相談)。担当ロールと有効/無効は種別ごとに変えたい場合が
+    // ありうる (TOP と詳細で承認者を分ける等) ので伝播しない
+    if (step.track === 'image' && step.builtin === 1 && step.image_stage) {
+      const shared = sets.filter((s) => /^(label|sort|stall_days|description) =/.test(s));
+      if (shared.length > 0) {
+        db.prepare(`
+          UPDATE ph_steps SET ${shared.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE track = 'image' AND builtin = 1 AND image_stage = @image_stage AND code <> @code
+        `).run({ ...params, image_stage: step.image_stage });
+      }
+    }
+    return info.changes === 1;
+  });
+  return run();
 }
 
 /** 工程の追加 (運用で足りない作業が出たとき画面から足せるようにする) */
@@ -436,6 +452,15 @@ export function createStep(input) {
   if (!label) throw badRequest('工程名を入力してください');
   const track = trimOrNull(input?.track) || 'main';
   if (track !== 'main' && track !== 'image') throw badRequest('トラックの指定が不正です');
+  // 画像トラックは TOP/詳細 で別々に進むので、どちらの工程かを必ず指定させる。
+  // 未指定を許すとゲート・ボードの種別分けからこぼれる (fail-safe で TOP 扱いにはするが意図が残らない)
+  let imageKind = null;
+  if (track === 'image') {
+    imageKind = trimOrNull(input?.image_kind);
+    if (imageKind !== 'top' && imageKind !== 'detail') {
+      throw badRequest('画像トラックの工程は種別 (TOP画像 / 詳細画像) を指定してください');
+    }
+  }
   const rc = trimOrNull(input?.role_code);
   if (rc && !db.prepare('SELECT 1 FROM ph_roles WHERE code = ? AND active = 1').get(rc)) {
     throw badRequest('指定された役割は存在しません');
@@ -444,9 +469,9 @@ export function createStep(input) {
   const code = `step_${n + 1}_${Date.now().toString(36).slice(-4)}`;
   const sort = (db.prepare('SELECT COALESCE(MAX(sort), 0) AS m FROM ph_steps WHERE track = ?').get(track).m || 0) + 10;
   db.prepare(`
-    INSERT INTO ph_steps (code, label, track, role_code, sort, description, builtin)
-    VALUES (?, ?, ?, ?, ?, ?, 0)
-  `).run(code, label, track, rc, sort, trimOrNull(input?.description, MAX_DESC_LEN));
+    INSERT INTO ph_steps (code, label, track, image_kind, role_code, sort, description, builtin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+  `).run(code, label, track, imageKind, rc, sort, trimOrNull(input?.description, MAX_DESC_LEN));
   return code;
 }
 

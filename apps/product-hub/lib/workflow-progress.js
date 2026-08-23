@@ -139,7 +139,7 @@ function defaultAssigneeByRole(db) {
  */
 export function ensureProgress(db, draftId) {
   const id = Number(draftId);
-  const steps = db.prepare('SELECT code, track, role_code FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
+  const steps = db.prepare('SELECT code, track, image_kind, role_code FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
   if (steps.length === 0) return 0;
   const existing = new Set(
     db.prepare('SELECT step_code FROM draft_step_progress WHERE draft_id = ?').all(id).map((r) => r.step_code)
@@ -153,10 +153,26 @@ export function ensureProgress(db, draftId) {
   if (firstTime) {
     const draft = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id);
     doneSet = new Set(STATUS_DONE_STEPS[draft?.status] || []);
-    // 画像が既に登録されているなら画像トラックは終わっているとみなす。
-    // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない
+    // 画像が既に登録されているなら **TOP側**の画像トラックは終わっているとみなす。
+    // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない。
+    // 詳細側は推定しない — 画像が 1 枚あることは詳細画像が揃っている根拠にならず、
+    // done にすると TOP しか無い商品が出品ゲートを素通りする (Codex R1 critical と同じ穴)。
+    // 楽天登録済みの商品だけは詳細側も done (出品済みに「承認して」を出さない)
     const hasImages = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(id);
-    if (hasImages) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
+    if (hasImages) for (const s of steps) if (s.track === 'image' && s.image_kind !== 'detail') doneSet.add(s.code);
+    const listedRk = db.prepare(
+      'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
+    ).get(id);
+    if (listedRk) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
+  } else {
+    // 後から足した工程は原則 todo で入れる (過去分を勝手に done にしない)。
+    // 唯一の例外: **画像トラック**の工程で、その商品が既に楽天へ登録済みのとき。
+    // 画像トラックは出品のゲートなので、出品が済んだ商品に「画像承認 未着手」が出ると
+    // 承認者が「もう楽天に並んでいるのに何を承認するのか」と混乱する (2026-08-23 画像承認の追加時)
+    const listed = db.prepare(
+      'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
+    ).get(id);
+    if (listed) for (const s of missing) if (s.track === 'image') doneSet.add(s.code);
   }
 
   const byRole = defaultAssigneeByRole(db);
@@ -249,18 +265,45 @@ function stalledDaysOf(rows, idx, createdAt) {
   return days >= row.stall_days ? days : null;
 }
 
+/** 画像種別の表示名。ph_steps.image_kind ('top'/'detail') に対応する */
+export const IMAGE_KIND_LABELS = { top: 'TOP画像', detail: '詳細画像' };
+
+/**
+ * 画像トラックの行を種別ごとに分ける。image_kind が NULL のカスタム工程は
+ * TOP 側に寄せる (fail-safe: 出品ゲートから漏れる側には倒さない)
+ */
+function splitImageRows(imageRows) {
+  return {
+    top: imageRows.filter((r) => r.image_kind !== 'detail'),
+    detail: imageRows.filter((r) => r.image_kind === 'detail'),
+  };
+}
+
+/** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
+function kindSummaryOf(rows, createdAt, excluded = false) {
+  const current = excluded ? null : currentOf(rows);
+  return {
+    rows,
+    current,
+    excluded,
+    done: !excluded && rows.length > 0 && !current,
+    stalledDays: current ? stalledDaysOf(rows, rows.indexOf(current), createdAt) : null,
+  };
+}
+
 /**
  * 1 商品の工程進捗。画面 (詳細・かんばん) がそのまま描ける形に整えて返す。
+ * 画像トラックは TOP/詳細 で別々に進む (2026-08-24) ので、種別ごとのサマリーを返す。
  */
 export function progressOf(draftId, { db = null } = {}) {
   const conn = db || getDB();
   const id = Number(draftId);
   ensureProgress(conn, id);
-  const draft = conn.prepare('SELECT created_at FROM product_drafts WHERE id = ?').get(id);
+  const draft = conn.prepare('SELECT created_at, detail_images_excluded FROM product_drafts WHERE id = ?').get(id);
   const rows = conn.prepare(`
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.due_date, p.started_at,
            p.done_at, p.done_by, p.note, p.updated_at, p.version,
-           s.label, s.track, s.sort, s.role_code, s.stall_days, s.description,
+           s.label, s.track, s.image_kind, s.image_stage, s.sort, s.role_code, s.stall_days, s.description,
            r.label AS role_label,
            st.name AS assignee_name, st.color AS assignee_color, st.active AS assignee_active
     FROM draft_step_progress p
@@ -273,22 +316,103 @@ export function progressOf(draftId, { db = null } = {}) {
 
   const main = rows.filter((r) => r.track === 'main');
   const image = rows.filter((r) => r.track === 'image');
+  const kinds = splitImageRows(image);
+  const detailExcluded = draft?.detail_images_excluded === 1;
   const current = currentOf(main);
-  const imageCurrent = currentOf(image);
   const createdAt = draft?.created_at || null;
+  const imageTop = kindSummaryOf(kinds.top, createdAt);
+  const imageDetail = kindSummaryOf(kinds.detail, createdAt, detailExcluded);
   return {
     main,
     image,
+    imageTop,
+    imageDetail,
+    detailExcluded,
     current,
-    imageCurrent,
     // 滞留は「いま止まっている工程」だけ見る。過去の工程を今さら赤くしても打ち手がない
     stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
-    imageStalledDays: imageCurrent ? stalledDaysOf(image, image.indexOf(imageCurrent), createdAt) : null,
     mainDone: main.length > 0 && !current,
-    imageDone: image.length > 0 && !imageCurrent,
+    // 画像トラック全体の決着 = TOP が済み、詳細も済みか対象外 (出品ゲートと同じ見方)。
+    // 詳細工程 0 件は「済み」に数えない (対象外にしていないなら設定壊れ — Codex R2 high)
+    imageDone: imageTop.done && (detailExcluded || imageDetail.done),
     doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
     totalCount: main.length,
   };
+}
+
+/** ブロック理由の「いま: ○○ (担当: △△)」部分 */
+function kindBlockDetail(summary) {
+  const cur = summary.current;
+  if (!cur) return '未着手';
+  const who = cur.assignee_name ? ` / 担当: ${cur.assignee_name}` : (cur.role_label ? ` / ${cur.role_label} 未割り当て` : '');
+  return `${cur.label}${who}`;
+}
+
+/**
+ * 楽天出品のゲート: 画像トラック (依頼 → 制作 → 登録 → 承認) が TOP/詳細 とも終わっていなければ理由を返す。
+ * 詳細画像を作らない商品 (detail_images_excluded=1) は TOP だけで通る。
+ * buildItemPayload の reasons に載せるので、「送信内容を確認」でも止まる理由が見える。
+ * @returns {string|null} 止める理由 (通ってよければ null)
+ */
+export function imageTrackBlockReason(db, draftId) {
+  const p = progressOf(draftId, { db });
+  // fail-closed: TOP 側の工程が 1 つも無い状態 (工程の無効化・移行漏れ) で出品を通さない (Codex R1 high)。
+  // progressOf → ensureProgress が行を自己修復するので、ここに来るのは設定が壊れているときだけ
+  if (p.imageTop.rows.length === 0) {
+    return '画像トラック (TOP画像) の工程が見つかりません。担当者・工程の設定を確認してください';
+  }
+  // TOP 全部が「対象外」はゲートを開けない (サムネイル無しの楽天出品はありえない — Codex設計相談 High)。
+  // setStepState 側でも TOP の skip は拒否しているが、ゲートは独立に防御する
+  if (p.imageTop.rows.every((r) => r.state === 'skip')) {
+    return 'TOP画像の工程がすべて「対象外」になっています。TOP画像 (サムネイル) は楽天出品に必須です';
+  }
+  // 詳細側も同じ fail-closed (Codex R2 high): 対象外にしていないのに工程が 0 件なら
+  // 「揃っている」ではなく「設定が壊れている」— ここで通すと詳細画像の確認が丸ごと飛ぶ
+  if (!p.detailExcluded && p.imageDetail.rows.length === 0) {
+    return '画像トラック (詳細画像) の工程が見つかりません。詳細画像を作らない商品なら「詳細画像は対象外」にするか、担当者・工程の設定を確認してください';
+  }
+  const blocked = [];
+  if (!p.imageTop.done) {
+    blocked.push(`${IMAGE_KIND_LABELS.top}: ${kindBlockDetail(p.imageTop)}`);
+  }
+  if (!p.detailExcluded && !p.imageDetail.done) {
+    blocked.push(`${IMAGE_KIND_LABELS.detail}: ${kindBlockDetail(p.imageDetail)}`);
+  }
+  if (blocked.length === 0) return null;
+  return `画像トラックが終わっていません (${blocked.join(' ／ ')})。画像承認まで済ませるか、`
+    + '詳細画像を作らない商品なら詳細画面で「詳細画像は対象外」にしてください';
+}
+
+/**
+ * 「詳細画像を作らない」フラグの切り替え (2026-08-24 中原さん: 単純な仕入れ商品は TOP のみ)。
+ * detail 側の工程行は書き換えない — done の履歴を保ち、複数行更新の競合も避ける (Codex設計相談)。
+ * 権限: admin か、その商品の詳細画像「依頼」工程の担当者本人 (作るかどうかを判断するのは依頼担当のため、
+ * 工程の skip が admin 限定なのとは別に、このトグルだけ本人まで許す)
+ */
+export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = false, actorStaffId = null } = {}) {
+  const db = getDB();
+  const id = Number(draftId);
+  ensureProgress(db, id);
+  const on = excluded ? 1 : 0;
+  if (!isAdmin) {
+    const requester = db.prepare(`
+      SELECT p.assignee_id FROM draft_step_progress p
+      JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = ? AND s.track = 'image' AND s.image_kind = 'detail' AND s.image_stage = 'request'
+    `).get(id);
+    if (actorStaffId == null || requester?.assignee_id !== actorStaffId) {
+      throw forbidden('「詳細画像は対象外」を切り替えられるのは、管理者か詳細画像の依頼工程の担当者だけです');
+    }
+  }
+  const info = db.prepare(`
+    UPDATE product_drafts SET detail_images_excluded = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND detail_images_excluded = ?
+  `).run(on, id, on === 1 ? 0 : 1);
+  if (info.changes === 0) return { changed: false };   // 既に同じ値 (二重送信)
+  logEvent(db, id, 'detail_images_excluded',
+    on === 1 ? '詳細画像を「対象外」にしました (TOP画像のみで出品ゲートが開きます)' : '詳細画像の「対象外」を解除しました',
+    actor);
+  return { changed: true };
 }
 
 /**
@@ -306,12 +430,17 @@ export function setStepState(
   const row = db.prepare(`
     -- role_code は権限判定に使う (システム工程かどうか)。取り忘れると undefined になり、
     -- 通常の工程まで「システム工程」と誤判定して一般ユーザーが弾かれる
-    SELECT p.*, s.label, s.role_code FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
   if (!row) throw badRequest('この商品にその工程がありません');
   assertStepPermission(db, row, patch, { isAdmin, actorStaffId });
+  // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
+  // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
+  if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
+    throw badRequest('TOP画像の工程は「対象外」にできません (サムネイルは楽天出品に必須です)');
+  }
 
   const sets = [];
   const params = { draft_id: id, step_code: code };
@@ -451,16 +580,21 @@ export function setStepState(
 /**
  * かんばん 1 枚分のデータ。列 (工程) ごとにカードを振り分けて返す。
  *
+ * ボードは 1 枚で、view で「本流の工程で並べる」「画像の工程で並べる」を切り替える
+ * (2026-08-24 中原さん: 上下 2 段だと同じ商品が 2 箇所に出て 2 重管理に見える)。
+ * どちらのビューでもカードには本流・画像 (TOP/詳細) 両方の進捗を出す。
+ *
  * 現在工程の判定は SQL でなく JS で行う。ph_steps.sort は管理画面から編集できる数値で
  * 重複しうるため、「sort が最小の未完了行」を SQL で取ると同点のとき列が不定になる。
  *
+ * @param {'main'|'image'} opts.view 列の軸。main = 本流の工程、image = 画像の工程 (カードは 商品×種別)
  * @param {object} opts.assigneeId  この担当者のボールだけに絞る (null = 全部)
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
- * @returns {{columns: Array, imageColumns: Array, doneCards: Array, total: number, truncated: boolean}}
+ * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean}}
  */
-export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
+export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
-    SELECT code, label, track, sort, role_code, stall_days FROM ph_steps
+    SELECT code, label, track, image_kind, image_stage, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
   `).all();
 
@@ -471,17 +605,24 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
   // 絞り込みがあるときは **LIMIT の前に** 対象を絞る (Codex R1 medium)。
   // 全件から updated_at 順に 800 件取ってから絞ると、件数が増えたとき古い未完了商品が
   // 「自分の担当」「未割り当て」から消える = 担当漏れを探す画面として役に立たなくなる
-  // 「現在工程」= トラックごとに、未完了 (todo/doing) のうち sort→code が最小の行。
-  // JS 側の currentOf と**同じ並び順**を ROW_NUMBER() で再現する (Codex R2 medium)。
+  // 「現在工程」= 本流・画像TOP・画像詳細の系列ごとに、未完了 (todo/doing) のうち
+  // sort→code が最小の行。JS 側の currentOf と**同じ並び順**を ROW_NUMBER() で再現する (Codex R2 medium)。
   // 「未完了工程のどれかを担当している」で絞ると、将来工程だけ担当している商品が
   // LIMIT を食い潰し、いま担当している古い商品がボードから消える
+  // 画像ビューの候補は**画像工程だけ**から取る (Codex R1 medium):
+  // 本流だけが条件一致する商品が LIMIT を食い潰し、あとの JS 絞り込みで消えると
+  // 実際に画像を担当している商品がボードから欠落する
   const CURRENT_STEPS = `
     SELECT draft_id, assignee_id, role_code FROM (
       SELECT p.draft_id, p.assignee_id, s.role_code,
-             ROW_NUMBER() OVER (PARTITION BY p.draft_id, s.track ORDER BY s.sort, s.code) AS rn
+             ROW_NUMBER() OVER (
+               PARTITION BY p.draft_id, s.track, COALESCE(s.image_kind, '')
+               ORDER BY s.sort, s.code
+             ) AS rn
       FROM draft_step_progress p
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.state IN ('todo', 'doing')
+        ${view === 'image' ? "AND s.track = 'image'" : ''}
     ) WHERE rn = 1
   `;
   let candidateSql = '';
@@ -498,7 +639,7 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
 
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
-    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at,
+    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d
@@ -514,55 +655,120 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
   ensureProgressForMany(db, drafts.map((d) => d.id));
   const summary = progressSummaryFor(db, drafts.map((d) => d.id));
 
-  const columns = steps.filter((s) => s.track === 'main').map((s) => ({ ...s, cards: [] }));
-  const imageColumns = steps.filter((s) => s.track === 'image').map((s) => ({ ...s, cards: [] }));
-  const byCode = new Map([...columns, ...imageColumns].map((c) => [c.code, c]));
+  // 画像ビューの列は image_stage でまとめる (TOP/詳細 の同じ段階が 1 列)。
+  // stage の無いカスタム工程は code 単独で 1 列にする — 黙って消さない
+  let columns;
+  if (view === 'image') {
+    const byStage = new Map();
+    for (const s of steps.filter((x) => x.track === 'image')) {
+      const key = s.image_stage || `code:${s.code}`;
+      if (!byStage.has(key)) {
+        byStage.set(key, { key, label: s.label, sort: s.sort, role_code: s.role_code, stall_days: s.stall_days, stepCodes: [], cards: [] });
+      }
+      byStage.get(key).stepCodes.push(s.code);
+    }
+    columns = [...byStage.values()].sort((a, b) => a.sort - b.sort || String(a.key).localeCompare(String(b.key)));
+  } else {
+    columns = steps.filter((s) => s.track === 'main').map((s) => ({ ...s, cards: [] }));
+  }
+  const colByStep = new Map();
+  for (const c of columns) {
+    for (const code of (c.stepCodes || [c.code])) colByStep.set(code, c);
+  }
   const doneCards = [];
   // 表示に残ったカードだけ後からモール状況を足す (全件に足すと無駄なクエリになる)
   const cardsById = new Map();
 
+  // カードに常時出す画像側のサマリー (どちらのビューでも同じものを見せる = 2 重管理をなくす)
+  const imageSummaryOf = (p, d) => ({
+    top: {
+      steps: p.imageTop.rows.map((r) => ({ state: r.state, label: r.label })),
+      current: p.imageTop.current, done: p.imageTop.done, stalledDays: p.imageTop.stalledDays,
+    },
+    detail: d.detail_images_excluded === 1
+      ? { excluded: true, steps: [], current: null, done: false, stalledDays: null }
+      : {
+        steps: p.imageDetail.rows.map((r) => ({ state: r.state, label: r.label })),
+        current: p.imageDetail.current, done: p.imageDetail.done, stalledDays: p.imageDetail.stalledDays,
+      },
+  });
+
   for (const d of drafts) {
     const p = summary.get(d.id);
     if (!p) continue;
-    const card = {
+    const detailExcluded = d.detail_images_excluded === 1;
+    const kinds = [
+      { kind: 'top', s: p.imageTop, excluded: false },
+      { kind: 'detail', s: p.imageDetail, excluded: detailExcluded },
+    ];
+    const baseCard = {
       id: d.id, ne_code: d.ne_code, name: d.name, status: d.status,
       first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
-      current: p.current, imageCurrent: p.imageCurrent, imageDone: p.imageDone,
-      stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
+      current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
+      image: imageSummaryOf(p, d),
     };
-    // 絞り込みは本流・画像のどちらかのボールが一致すれば残す。
-    // 画像担当の人が「自分の分だけ」を見たとき、本流が別担当でも画像列に自分の札が要る
+
+    if (view === 'image') {
+      // カード = 商品 × 種別 (TOP/詳細 は別々に進むので別の列に出る)。
+      // 絞り込みは**その種別の**現在工程を基準にする — 本流や他種別の一致で
+      // 無関係な列にカードが出ると、担当者が自分の作業と誤読する (Codex設計相談)
+      let anyOpen = false;
+      for (const k of kinds) {
+        if (k.excluded || k.s.rows.length === 0) continue;
+        const cur = k.s.current;
+        if (!cur) continue;
+        anyOpen = true;
+        if (assigneeId != null && cur.assignee_id !== assigneeId) continue;
+        if (unassignedOnly && !(cur.role_code && cur.assignee_id == null)) continue;
+        const card = { ...baseCard, kind: k.kind, kindCurrent: cur, kindStalledDays: k.s.stalledDays };
+        colByStep.get(cur.step_code)?.cards.push(card);
+        cardsById.set(d.id, card);
+      }
+      // 完了列 = TOP が済み、詳細も済みか対象外の商品 (絞り込み中は出さない — 「終わった分」は全員共通)。
+      // TOP 全部 skip は「完了」に見せない (出品ゲートは拒否するので表示と食い違う — Codex R1 medium)
+      if (!anyOpen && assigneeId == null && !unassignedOnly) {
+        const topSettled = p.imageTop.rows.length > 0 && !p.imageTop.current
+          && !p.imageTop.rows.every((r) => r.state === 'skip');
+        // 詳細工程 0 件はゲートが拒否するので完了に見せない (Codex R2 high)
+        const detailSettled = detailExcluded || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
+        if (topSettled && detailSettled) doneCards.push(baseCard);
+      }
+      continue;
+    }
+
+    // 本流ビュー。絞り込みは本流・画像 (TOP/詳細) のどれかのボールが一致すれば残す。
+    // 画像担当の人が「自分の分だけ」を見たとき、本流が別担当でもカードが要る
+    const activeKindCurrents = kinds.filter((k) => !k.excluded).map((k) => k.s.current).filter(Boolean);
     if (assigneeId != null) {
-      const hit = p.current?.assignee_id === assigneeId || p.imageCurrent?.assignee_id === assigneeId;
+      const hit = p.current?.assignee_id === assigneeId
+        || activeKindCurrents.some((c) => c.assignee_id === assigneeId);
       if (!hit) continue;
     }
     if (unassignedOnly) {
       // システム工程 (担当ロールが無い = AI待ち) は「未割り当て」ではないので数えない
       const mainUnassigned = p.current && p.current.role_code && p.current.assignee_id == null;
-      const imageUnassigned = p.imageCurrent && p.imageCurrent.role_code && p.imageCurrent.assignee_id == null;
+      const imageUnassigned = activeKindCurrents.some((c) => c.role_code && c.assignee_id == null);
       if (!mainUnassigned && !imageUnassigned) continue;
     }
-    if (p.current) byCode.get(p.current.step_code)?.cards.push(card);
-    else doneCards.push(card);
-    if (p.imageCurrent) byCode.get(p.imageCurrent.step_code)?.cards.push(card);
-    cardsById.set(d.id, card);
+    if (p.current) colByStep.get(p.current.step_code)?.cards.push(baseCard);
+    else doneCards.push(baseCard);
+    cardsById.set(d.id, baseCard);
   }
 
   // 「出品・展開」のカードはモールの進み具合が要る (どこまで並んだかが本体なので)。
   // 循環 import を避けるため、呼び出し側から渡された関数で解決する
-  if (mallSummary && cardsById.size > 0) {
+  if (view === 'main' && mallSummary && cardsById.size > 0) {
     const malls = mallSummary(db, [...cardsById.keys()]);
     for (const [id, card] of cardsById) card.malls = malls.get(id) || null;
   }
 
   // 停滞しているものを上に出す (打ち手が要るカードを埋もれさせない)
-  const order = (a, b) => (b.stalledDays || 0) - (a.stalledDays || 0) || a.id - b.id;
+  const order = (a, b) => ((b.kindStalledDays ?? b.stalledDays) || 0) - ((a.kindStalledDays ?? a.stalledDays) || 0) || a.id - b.id;
   for (const c of columns) c.cards.sort(order);
-  for (const c of imageColumns) c.cards.sort(order);
 
   return {
+    view,
     columns,
-    imageColumns,
     // 完了は溜まる一方なので直近だけ (全部見たいときは一覧から)
     doneCards: doneCards.slice(0, 30),
     doneTotal: doneCards.length,
@@ -573,7 +779,7 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
 
 /**
  * 一覧・かんばん用に複数ドラフトの進捗をまとめて引く (行ごとに引くと N+1)。
- * @returns {Map<number, {current, image, ...}>}
+ * @returns {Map<number, {current, imageTop, imageDetail, ...}>}
  */
 export function progressSummaryFor(db, draftIds) {
   const ids = (Array.isArray(draftIds) ? draftIds : []).map(Number).filter(Number.isInteger);
@@ -582,10 +788,10 @@ export function progressSummaryFor(db, draftIds) {
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.done_at, p.started_at,
-           s.label, s.track, s.sort, s.stall_days, s.role_code,
+           s.label, s.track, s.image_kind, s.image_stage, s.sort, s.stall_days, s.role_code,
            st.name AS assignee_name, st.color AS assignee_color,
            -- 先頭工程が止まっている場合は前工程の完了日時が無いので、ドラフト作成日時を起点にする
-           d.created_at AS draft_created_at
+           d.created_at AS draft_created_at, d.detail_images_excluded
     FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     JOIN product_drafts d ON d.id = p.draft_id
@@ -602,15 +808,19 @@ export function progressSummaryFor(db, draftIds) {
     const all = byDraft.get(id) || [];
     const main = all.filter((r) => r.track === 'main');
     const image = all.filter((r) => r.track === 'image');
+    const kinds = splitImageRows(image);
+    const detailExcluded = all[0]?.detail_images_excluded === 1;
     const current = currentOf(main);
-    const imageCurrent = currentOf(image);
     const createdAt = all[0]?.draft_created_at || null;
+    const imageTop = kindSummaryOf(kinds.top, createdAt);
+    const imageDetail = kindSummaryOf(kinds.detail, createdAt, detailExcluded);
     out.set(id, {
       current,
-      imageCurrent,
-      imageDone: image.length > 0 && !imageCurrent,
+      imageTop,
+      imageDetail,
+      detailExcluded,
+      imageDone: imageTop.done && (detailExcluded || imageDetail.done),
       stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
-      imageStalledDays: imageCurrent ? stalledDaysOf(image, image.indexOf(imageCurrent), createdAt) : null,
       doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
       totalCount: main.length,
     });

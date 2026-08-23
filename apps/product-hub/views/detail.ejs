@@ -205,22 +205,29 @@
         <span class="badge" style="background:#fee2e2; color:#b91c1c;">⚠️ <%= workflow.stalledDays %>日 動いていません</span>
       <% } %>
       <span style="flex:1"></span>
-      <span style="font-size:12px;">
-        🖼 画像:
-        <% if (workflow.imageDone) { %>
-          <span style="color:#166534; font-weight:600;">完了</span>
-        <% } else if (workflow.imageCurrent) { %>
-          <%= workflow.imageCurrent.label %>
-          <% if (workflow.imageCurrent.assignee_name) { %>
-            <span class="wf-dot" style="background:<%= workflow.imageCurrent.assignee_color || '#94a3b8' %>"></span><%= workflow.imageCurrent.assignee_name %>
+      <%# 画像トラックは TOP/詳細 で別々に進む (2026-08-24)。両方の現在地をここに常時出す %>
+      <% const kindChip = (label, t) => { %>
+        <span style="font-size:12px;">
+          🖼 <%= label %>:
+          <% if (t.excluded) { %>
+            <span class="muted">対象外</span>
+          <% } else if (t.done) { %>
+            <span style="color:#166534; font-weight:600;">完了</span>
+          <% } else if (t.current) { %>
+            <%= t.current.label %>
+            <% if (t.current.assignee_name) { %>
+              <span class="wf-dot" style="background:<%= t.current.assignee_color || '#94a3b8' %>"></span><%= t.current.assignee_name %>
+            <% } %>
+            <% if (t.stalledDays) { %>
+              <span style="color:#b91c1c; font-weight:600;">／ <%= t.stalledDays %>日 滞留</span>
+            <% } %>
+          <% } else { %>
+            <span class="muted">—</span>
           <% } %>
-          <% if (workflow.imageStalledDays) { %>
-            <span style="color:#b91c1c; font-weight:600;">／ <%= workflow.imageStalledDays %>日 滞留</span>
-          <% } %>
-        <% } else { %>
-          <span class="muted">—</span>
-        <% } %>
-      </span>
+        </span>
+      <% }; %>
+      <% kindChip('TOP', workflow.imageTop); %>
+      <% kindChip('詳細', workflow.imageDetail); %>
     </div>
 
     <details style="margin-top:10px;">
@@ -237,19 +244,26 @@
             const canEditStep = (s) => isAdmin || (s.assignee_id != null && s.assignee_id === myStaffId);
             const canClaimStep = (s) => !isAdmin && !!myStaffId && !!s.role_code && s.assignee_id == null;
           %>
-          <% for (const s of workflow.main.concat(workflow.image)) { %>
-            <% const editable = canEditStep(s); %>
-            <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
+          <% for (const s of workflow.main.concat(workflow.imageTop.rows, workflow.imageDetail.rows)) { %>
+            <% const isDetailKind = s.track === 'image' && s.image_kind === 'detail'; %>
+            <%# 詳細画像が「対象外」の商品では detail 側の工程を触らせない (フラグが正) %>
+            <% const editable = canEditStep(s) && !(isDetailKind && workflow.detailExcluded); %>
+            <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>"
+                <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : (isDetailKind && workflow.detailExcluded ? 'style="opacity:.45"' : '') %>>
               <td>
-                <% if (s.track === 'image') { %><span class="muted" style="font-size:11px;">🖼</span> <% } %>
+                <% if (s.track === 'image') { %>
+                  <span class="badge" style="font-size:10px; padding:1px 6px; background:<%= isDetailKind ? '#ede9fe' : '#dbeafe' %>; color:<%= isDetailKind ? '#6d28d9' : '#1d4ed8' %>;">🖼 <%= isDetailKind ? '詳細' : 'TOP' %></span>
+                <% } %>
                 <%= s.label %>
                 <% if (s.description) { %><br><span class="mini-note" title="<%= s.description %>"><%= s.description.length > 34 ? s.description.slice(0, 34) + '…' : s.description %></span><% } %>
               </td>
               <td>
                 <select class="wf-state" <%= editable ? '' : 'disabled' %>
-                        title="<%= editable ? '' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')) %>">
+                        title="<%= editable ? '' : (isDetailKind && workflow.detailExcluded ? '詳細画像は対象外です' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です'))) %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
-                    <%# 「対象外」は工程を飛ばすので admin だけ %>
+                    <%# 「対象外」は工程を飛ばすので admin だけ。TOP画像の工程はサムネ必須のため admin でも不可、
+                        詳細画像を丸ごと作らない場合は下の「詳細画像は対象外」を使う (商品単位のフラグ) %>
+                    <% if (code === 'skip' && s.track === 'image' && s.image_kind !== 'detail' && s.state !== 'skip') continue; %>
                     <% if (code === 'skip' && !isAdmin && s.state !== 'skip') continue; %>
                     <option value="<%= code %>" <%= s.state === code ? 'selected' : '' %>><%= stepStateLabels[code] %></option>
                   <% } %>
@@ -288,6 +302,24 @@
           <% } %>
         </tbody>
       </table>
+      <%
+        // 「詳細画像は対象外」を切り替えられるのは admin か、詳細画像「依頼」工程の担当者本人
+        // (サーバー側 setDetailImagesExcluded と同じ条件)
+        const detailReqRow = workflow.imageDetail.rows.find((r) => r.image_stage === 'request');
+        const canToggleDetailExcluded = isAdmin
+          || (myStaffId != null && detailReqRow && detailReqRow.assignee_id === myStaffId);
+      %>
+      <p style="margin:10px 0 0; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+        <% if (workflow.detailExcluded) { %>
+          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像の承認だけで出品ゲートが開きます)</span>
+          <% if (canToggleDetailExcluded) { %>
+            <button type="button" class="btn btn-sm" id="wf-detail-excluded" data-next="false">対象外を解除する</button>
+          <% } %>
+        <% } else if (canToggleDetailExcluded) { %>
+          <button type="button" class="btn btn-sm" id="wf-detail-excluded" data-next="true">🖼 詳細画像は作らない (対象外にする)</button>
+          <span class="muted">単純な仕入れ商品など、TOP画像だけで出品する場合</span>
+        <% } %>
+      </p>
       <p class="muted" style="margin:8px 0 0; font-size:12px;">
         変更するとその場で保存されます。<span id="wf-result"></span>
       </p>
@@ -2850,6 +2882,25 @@
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
       if (note) note.addEventListener('change', function () { save(tr, { note: note.value }); });
     });
+
+    // 「詳細画像は対象外」トグル (商品単位のフラグ。工程行は書き換えない)
+    const exBtn = document.getElementById('wf-detail-excluded');
+    if (exBtn) {
+      exBtn.addEventListener('click', async function () {
+        const next = exBtn.dataset.next === 'true';
+        if (next && !confirm('この商品は詳細画像を作らない (TOP画像だけで出品ゲートを開く) 設定にします。よろしいですか?')) return;
+        exBtn.disabled = true;
+        try {
+          const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/detail-images-excluded', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ excluded: next }),
+          });
+          const j = await res.json();
+          if (!j.ok) { alert(j.error || '切り替えに失敗しました'); exBtn.disabled = false; return; }
+          location.reload();
+        } catch (e) { alert('通信エラー: ' + e.message); exBtn.disabled = false; }
+      });
+    }
 
     // ─── モール別の展開状況 ───
     const mlOut = document.getElementById('ml-result');
