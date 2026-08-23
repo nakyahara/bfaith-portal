@@ -266,7 +266,20 @@ function syncListingStep(db, draftId, actor) {
     const s = byCode.get(m.code);
     return s === 'done' || s === 'skip';
   });
-  if (!allSettled) return false;
+  if (!allSettled) {
+    // 決着が崩れたら工程も開き直す (Codex R2 medium)。
+    // モール側を正とする設計なので、「工程は完了なのに未展開のモールがある」を残さない
+    const reopen = db.prepare(`
+      UPDATE draft_step_progress
+      SET state = 'todo', done_at = NULL, done_by = NULL,
+          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ? AND step_code = ? AND state = 'done'
+    `).run(draftId, LISTING_STEP_CODE);
+    if (reopen.changes === 1) {
+      logEvent(db, draftId, 'step_changed', '出品・展開: 未展開のモールが出たので完了を取り消しました', actor);
+    }
+    return false;
+  }
   const info = db.prepare(`
     UPDATE draft_step_progress
     SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_by = ?,

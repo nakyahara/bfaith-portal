@@ -15,6 +15,13 @@
 import { getDB, logEvent } from '../db.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
+
+/**
+ * 工程「出品・展開」のコード。この工程の完了はモール状況 (draft_mall_status) が正で、
+ * 状態セレクトからの直接完了は禁じる。mall-status.js を import すると循環するので、
+ * 判定はここで直接 SQL を引く (定数は両方に置く)。
+ */
+const LISTING_STEP = 'listing';
 export const STEP_STATE_LABELS = {
   todo: '未着手',
   doing: '作業中',
@@ -318,6 +325,20 @@ export function setStepState(
   if (patch?.state !== undefined) {
     const state = String(patch.state);
     if (!STEP_STATES.includes(state)) throw badRequest('状態の指定が不正です');
+    // 「出品・展開」の完了はモール側が正 (Codex R2 medium)。
+    // ここを素通りさせると、状態セレクトから直接完了にして展開漏れを隠せてしまう
+    if (state === 'done' && code === LISTING_STEP) {
+      const prov = db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(id);
+      if (prov?.provisional_code === 1) {
+        throw badRequest('商品コードが仮のままです。ネクストエンジンの本コードに差し替えてから完了にしてください');
+      }
+      const pending = db.prepare(`
+        SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ? AND state NOT IN ('done', 'skip')
+      `).get(id).c;
+      if (pending > 0) {
+        throw badRequest(`まだ展開していないモールが ${pending} 件あります。「モール別の展開状況」で進めると自動で完了になります`);
+      }
+    }
     if (state !== row.state) {
       stateChanged = true;
       sets.push('state = @state');
@@ -374,8 +395,6 @@ export function setStepState(
     params.due_date = due === '' ? null : due;
   }
 
-  if (sets.length === 0) return { changed: false };
-
   // 楽観ロック (Codex R1 → R2 → R3)。**単調増加の version** をトークンにする。
   // updated_at (ミリ秒精度) だと同一ミリ秒内の連続更新で値が変わらず、古い画面からの
   // 上書きをすり抜けさせる。version なら必ず変わる。
@@ -396,6 +415,10 @@ export function setStepState(
     conds.push('state = @prev_state');
     params.prev_state = row.state;
   }
+  // 版数の検証は「更新する内容があるか」より**前**に済ませる (Codex R2 medium)。
+  // 後ろに置くと、既に done の工程へ同じ状態を送る操作 (= 更新なし) が版数検査を素通りし、
+  // 古い画面からの二重送信を CAS で止められない
+  if (sets.length === 0) return { changed: false };
   const where = `WHERE ${conds.join(' AND ')}`;
 
   // UPDATE・監査ログ・**新しい版数の読み出し**を 1 トランザクションに閉じる。

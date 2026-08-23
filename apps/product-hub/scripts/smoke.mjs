@@ -2037,10 +2037,17 @@ const ms = await import('../lib/mall-status.js');
   check('対象外は掲載済に数えない', ms.mallStatusOf(id, { db }).doneCount === 5);
   check('決着済みの判定', ms.mallStatusOf(id, { db }).allSettled === true);
 
-  // 差し戻すと工程も開くか (モール → 工程は一方向。工程は開かない設計)
+  // モール側が正。決着が崩れたら工程も開き直す (「完了なのに未展開が残る」を作らない)
   ms.setMallState(id, 'linegift', { state: 'todo' }, 'admin', ADMIN);
-  check('モールを戻しても工程は自動では開かない (人が差し戻す)',
-    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
+  check('モールを戻すと出品・展開の完了も取り消される',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'todo');
+  check('取り消しがイベントに残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND detail LIKE '%完了を取り消し%'`).get(id).c === 1);
+  // 状態セレクトから直接完了にはできない (モール側が正)
+  let directDone = null;
+  try { wfp.setStepState(id, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { directDone = e; }
+  check('未展開モールがあるうちは工程を直接完了にできない', directDone?.status === 400, directDone?.message || '例外が出ていない');
+  ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
 }
 
 // ─── セット商品の派生ドラフト (2026-08-23) ───
@@ -2053,6 +2060,8 @@ let wfSetParentId = null;
      VALUES ('WF-SET-P', 'セット元商品', 'approved', 1980, '4901234567894', 'https://example.com/p', 1, 'smoke')`
   ).run().lastInsertRowid);
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, 'サイズ', '10cm', 0)`).run(parentId);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', 'ステンレス', 1)`).run(parentId);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '50ml', 2)`).run(parentId);
   db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
   db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
   db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
@@ -2088,8 +2097,12 @@ let wfSetParentId = null;
   check('JANはコピーしない', set1.jan_code == null);
   check('公式URLはコピーする', set1.official_url === 'https://example.com/p');
   check('自社商品フラグはコピーする', set1.own_brand === 1);
-  check('仕様表はコピーする',
-    db.prepare('SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ?').get(r.draftId).c === 1);
+  check('仕様表: 数量に依存しない行はコピーする',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ? AND spec_key = '素材'`).get(r.draftId).c === 1);
+  check('仕様表: サイズ・内容量はコピーしない (2個セットに単品の値が残る)',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ? AND spec_key IN ('サイズ','内容量')`).get(r.draftId).c === 0);
+  check('落とした仕様表の件数をイベントに残す',
+    /仕様表 2 行/.test(db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'created_from_parent'`).get(r.draftId)?.detail || ''));
   check('参考URLはコピーする',
     db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(r.draftId).c === 1);
   check('楽天ジャンルはコピーする',
@@ -2215,7 +2228,11 @@ let wfSetParentId = null;
   // 担当者で絞る
   const mine = wfp.boardData(db, { assigneeId: wfTanakaId });
   const mineIds = mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards.map((x) => x.id));
-  check('ボード: 担当者で絞れる', mineIds.length > 0 && mineIds.length <= onBoard.size + mine.imageColumns.length * 2);
+  check('ボード: 担当者で絞ると全部その人のボールになる',
+    mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards)
+      .every((c) => c.current?.assignee_id === wfTanakaId || c.imageCurrent?.assignee_id === wfTanakaId),
+    `件数=${mineIds.length}`);
+  check('ボード: 絞り込みは全件より少ない', mineIds.length < onBoard.size * 2, `${mineIds.length} / ${onBoard.size}`);
   const other = wfp.boardData(db, { assigneeId: wfOkawaId });
   check('ボード: 担当していない人には出ない',
     other.columns.flatMap((c) => c.cards).every((c) => c.current?.assignee_id === wfOkawaId || c.imageCurrent?.assignee_id === wfOkawaId));

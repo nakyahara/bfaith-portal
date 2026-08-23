@@ -1693,7 +1693,10 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   // NE 商品マスタに無いコードでも差し替えは許すが、**仮フラグは落とさない** (Codex R1 medium)。
   // 登録直後で mirror 未取込のことがあるので入力自体は通し、出品ゲートは閉じたままにする。
   // NE に現れたら詳細画面を開いたときに自動で確定する (reconcileProvisionalCode)
-  const inNe = resolveVariationGroup(db, code, { withMembers: false }).kind !== 'unknown';
+  // 'conflict' (NE に同じコードが重複) や 'detached' は確認できたと見なさない。
+  // 曖昧なまま仮フラグを落とすと、誤ったコードで楽天に登録される
+  const neKind = resolveVariationGroup(db, code, { withMembers: false }).kind;
+  const inNe = neKind === 'single' || neKind === 'variation';
   const info = db.prepare(`
     UPDATE product_drafts SET ne_code = ?, provisional_code = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')

@@ -26,6 +26,25 @@ function badRequest(message) {
 }
 
 /**
+ * セットにすると値が変わる仕様表の行か (サイズ・内容量・入数・重量など)。
+ * 単品の値をそのまま持ち込むと商品ページの表示が誤るので、セット側では空にして
+ * 人に入れ直させる。素材・原産国・ブランドなどは数量に依存しないのでコピーする。
+ */
+const QUANTITY_DEPENDENT_SPEC = /(サイズ|寸法|大きさ|内容量|容量|入数|個数|本数|枚数|重量|重さ|質量|セット内容|梱包|外寸|size|volume|weight)/i;
+export function isQuantityDependentSpec(key) {
+  return QUANTITY_DEPENDENT_SPEC.test(String(key == null ? '' : key));
+}
+
+/**
+ * NE 商品マスタで実在が確認できたか。
+ * 'conflict' (同じコードが NE に重複) や 'detached' は「確認できた」に数えない (Codex R2)。
+ * 曖昧なまま確定すると、仮コードの出品ゲートが外れて誤ったコードで登録される
+ */
+function confirmedInNe(kind) {
+  return kind === 'single' || kind === 'variation';
+}
+
+/**
  * 仮コードを採番する。`SET-<親>-01` から順に空きを探す。
  * ne_code は正規化 UNIQUE なので、大文字小文字違いの衝突も避けて確認する。
  */
@@ -108,10 +127,16 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
       INSERT INTO draft_reference_urls (draft_id, url, sort)
       SELECT ?, url, sort FROM draft_reference_urls WHERE draft_id = ?
     `).run(setId, parentId);
-    db.prepare(`
-      INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort)
-      SELECT ?, spec_key, spec_value, sort FROM draft_specs WHERE draft_id = ?
-    `).run(setId, parentId);
+    // 仕様表も**数量で変わる行は落とす** (Codex R2 high)。
+    // ページ表記の内容量だけ除外しても、仕様表に「サイズ 10cm」「内容量 50ml」が残ると
+    // 2 個セットの商品ページに単品の値が出る。素材・原産国などはそのまま使える
+    const specs = db.prepare('SELECT spec_key, spec_value, sort FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(parentId);
+    const insSpec = db.prepare('INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, ?, ?, ?)');
+    let dropped = 0;
+    for (const sp of specs) {
+      if (isQuantityDependentSpec(sp.spec_key)) { dropped++; continue; }
+      insSpec.run(setId, sp.spec_key, sp.spec_value, sp.sort);
+    }
     // 売価・佐川売価はセットで変わるのでコピーしない (税率・配送・カテゴリだけ引き継ぐ)
     const py = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(parentId);
     if (py) {
@@ -179,7 +204,10 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
 
     const memberText = members.map((m) => `${m.code}×${m.qty}`).join(' + ');
     logEvent(db, parentId, 'set_draft_created', `${neCode} (${memberText}) を作成 [${mode === 'ai' ? 'AIに書き換え' : 'コピーして手直し'}]`, actor);
-    logEvent(db, setId, 'created_from_parent', `${parent.ne_code} から作成 (${memberText})`, actor);
+    logEvent(db, setId, 'created_from_parent',
+      `${parent.ne_code} から作成 (${memberText})`
+      + (dropped > 0 ? ` ／ 仕様表 ${dropped} 行はセットで値が変わるため引き継いでいません (要入力)` : ''),
+      actor);
     return { draftId: setId, neCode };
   })();
 }
@@ -193,7 +221,7 @@ export function reconcileProvisionalCode(db, draft) {
   if (!draft || draft.provisional_code !== 1) return false;
   // まだ仮コードそのもの (SET-xxx-01) なら確定しようがない
   if (/^SET-/i.test(String(draft.ne_code || ''))) return false;
-  if (resolveVariationGroup(db, draft.ne_code, { withMembers: false }).kind === 'unknown') return false;
+  if (!confirmedInNe(resolveVariationGroup(db, draft.ne_code, { withMembers: false }).kind)) return false;
   const info = db.prepare(`
     UPDATE product_drafts SET provisional_code = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = ? AND provisional_code = 1
