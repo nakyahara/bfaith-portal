@@ -215,6 +215,9 @@ export async function retryPendingCards({ actor = null, limit = 50 } = {}) {
     SELECT id FROM product_drafts
     WHERE notion_page_id IS NULL
       AND source = 'portal'
+      -- 仮コードのセット派生はカードを作らない (canWriteToNotion と条件を揃える。
+      -- ここで拾うと毎回 attemptCardCreation が skipped を返して空回りする)
+      AND provisional_code = 0
       AND (notion_card_status IN ('pending','failed')
            OR (notion_card_status = 'creating' AND updated_at < ?))
     ORDER BY id
@@ -236,5 +239,6 @@ export function pendingCardCount() {
     SELECT COUNT(*) AS c FROM product_drafts
     WHERE notion_page_id IS NULL AND notion_card_status != 'created'
       AND source = 'portal'
+      AND provisional_code = 0
   `).get().c;
 }

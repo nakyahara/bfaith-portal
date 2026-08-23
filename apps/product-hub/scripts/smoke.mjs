@@ -2056,9 +2056,26 @@ let wfSetParentId = null;
   db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
   db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
   db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
+  // 商品ページ表記: セットで変わるもの (内容量・サイズ・食品表示) が引き継がれないことを見る
+  db.prepare(`
+    INSERT INTO draft_page_info (draft_id, product_type, content_volume, size_text, ingredients,
+      seller_name, food_name, food_ingredients, food_expiry, food_storage)
+    VALUES (?, 'food', '50ml', '10cm×5cm', '水、香料', '株式会社B-Faith', '清涼飲料水', '果糖ぶどう糖液糖', 'ラベルに記載', '直射日光を避けて保存')
+  `).run(parentId);
   wfp.progressOf(parentId, { db });
 
-  const r = sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }] }, 'smoke');
+  // 親の「セット商品作成検討」を閉じる操作なので、版数と権限文脈が要る
+  const setReviewVersion = () => wfp.progressOf(parentId, { db }).main.find((x) => x.step_code === 'set_review').version;
+  let noPermErr = null;
+  try {
+    sd.createSetDraft(parentId, { mode: 'ai', parent_step_version: setReviewVersion() }, 'smoke',
+      { isAdmin: false, actorStaffId: null });
+  } catch (e) { noPermErr = e; }
+  check('担当者でない人はセットを作れない', noPermErr?.status === 403, noPermErr?.message || '例外が出ていない');
+  check('作れなかったときは派生ドラフトも残らない',
+    db.prepare(`SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ?`).get(parentId).c === 0);
+
+  const r = sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }], parent_step_version: setReviewVersion() }, 'smoke', ADMIN);
   wfSetDraftId = r.draftId; wfSetParentId = parentId;
   check('仮コードで作られる', r.neCode === 'SET-WF-SET-P-01', r.neCode);
   const set1 = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
@@ -2094,7 +2111,7 @@ let wfSetParentId = null;
     db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_draft_created'`).get(parentId).c === 1);
 
   // copy モードは説明文を持って商品説明確認から
-  const r2 = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'WF-SET-P', qty: 3 }] }, 'smoke');
+  const r2 = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'WF-SET-P', qty: 3 }], parent_step_version: setReviewVersion() }, 'smoke', ADMIN);
   check('2件目は連番になる', r2.neCode === 'SET-WF-SET-P-02', r2.neCode);
   check('copyモードは説明文をコピーする',
     db.prepare('SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = ?').get(r2.draftId, 'rakuten_title')?.content === '単品のタイトル');
@@ -2116,6 +2133,47 @@ let wfSetParentId = null;
   check('仮コードのままでは出品を止める',
     (payload.reasons || []).some((x) => /商品コードが仮のまま/.test(x)),
     JSON.stringify(payload.reasons || []).slice(0, 200));
+
+  // 商品ページ表記のコピー範囲 (Codex R1 high: 数量で変わるものと食品表示は引き継がない)
+  const spi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(r.draftId);
+  check('ページ表記: 区分はコピーする', spi?.product_type === 'food');
+  check('ページ表記: 販売者はコピーする', spi?.seller_name === '株式会社B-Faith');
+  check('ページ表記: 成分はコピーする', spi?.ingredients === '水、香料');
+  check('ページ表記: 内容量はコピーしない (50mlの2個セットが50mlになる)', spi?.content_volume == null);
+  check('ページ表記: サイズはコピーしない', spi?.size_text == null);
+  check('ページ表記: 食品表示はコピーしない (法定表示は人が確認する)',
+    spi?.food_name == null && spi?.food_ingredients == null && spi?.food_expiry == null && spi?.food_storage == null);
+
+  // 仮コードのまま外に漏れない (Notion カード / モール完了 / 工程の自動完了)
+  const setDraftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('仮コードは Notion カードを作らせない', dbmod.canWriteToNotion(setDraftRow) === false);
+  let mallProv = null;
+  try { ms.setMallState(r.draftId, 'yahoo', { state: 'done' }, 'admin', ADMIN); } catch (e) { mallProv = e; }
+  check('仮コードのままモールを掲載済にできない', mallProv?.status === 400, mallProv?.message || '例外が出ていない');
+  // 全部 skip にしても工程は閉じない (skip 経由の抜け道を塞ぐ)
+  for (const m of ms.MALLS) ms.setMallState(r.draftId, m.code, { state: 'skip' }, 'admin', ADMIN);
+  check('仮コードのままでは出品・展開工程が閉じない',
+    wfp.progressOf(r.draftId, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
+
+  // 本コードへの差し替え: NE に無ければ仮フラグは残る → NE に現れたら自動で確定する
+  db.prepare(`UPDATE product_drafts SET ne_code = 'WF-SET-REAL' WHERE id = ?`).run(r.draftId);
+  const notInNe = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('NE未確認なら仮フラグは残る', notInNe.provisional_code === 1);
+  check('NE未確認でも出品は止まる',
+    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
+  check('NEに無いうちは自動確定しない', sd.reconcileProvisionalCode(db, { ...notInNe }) === false);
+  // NE 商品マスタに現れたら確定する
+  db.prepare(`
+    INSERT INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+    VALUES (99401, 'WF-SET-REAL', 'セット商品 実コード', '1', '取扱中', '1', 'WF-SET-REAL', '2026-08-23T00:00:00Z')
+  `).run();
+  check('NEに現れたら自動で確定する', sd.reconcileProvisionalCode(db, { ...notInNe }) === true);
+  check('確定後は出品ゲートが開く',
+    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
+  check('確定後は Notion カードも作れる',
+    dbmod.canWriteToNotion(db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId)) === true);
+  db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
 
   // 親側・セット側の表示用データ
   check('親からセット一覧が引ける', sd.setDraftsOf(db, parentId).length === 2);

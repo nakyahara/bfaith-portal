@@ -11,7 +11,8 @@
  * buildItemPayload が provisional_code=1 を見て出品を止める (出品直前ゲート)。
  */
 import { getDB, logEvent } from '../db.js';
-import { ensureProgress } from '../lib/workflow-progress.js';
+import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
+import { resolveVariationGroup } from '../lib/variation.js';
 
 /** 生成モード: ai = AI 工程から / copy = 商品説明確認から */
 export const SET_MODES = ['ai', 'copy'];
@@ -46,10 +47,12 @@ export function nextProvisionalCode(db, parentCode) {
  *   → セットは価格も JAN も画像も別物。ここをコピーすると「直し忘れ」が一番危ない
  *
  * @param {number} parentDraftId 単品のドラフト
- * @param {{mode: 'ai'|'copy', members?: Array<{ne_code: string, qty: number}>, name?: string}} opts
+ * @param {{mode: 'ai'|'copy', members?: Array<{ne_code: string, qty: number}>, name?: string,
+ *   parent_step_version?: number}} opts  parent_step_version = 親の「セット商品作成検討」工程の版数 (CAS 用)
+ * @param {{isAdmin: boolean, actorStaffId: number|null}} ctx 権限判定の文脈 (親工程を閉じるため)
  * @returns {{draftId: number, neCode: string}}
  */
-export function createSetDraft(parentDraftId, opts, actor) {
+export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: false, actorStaffId: null }) {
   const db = getDB();
   const parentId = Number(parentDraftId);
   const mode = String(opts?.mode || '');
@@ -117,12 +120,19 @@ export function createSetDraft(parentDraftId, opts, actor) {
         VALUES (?, ?, ?, ?, ?)
       `).run(setId, py.delivery_label, py.tax_rate, py.yahoo_category_id, py.yahoo_path);
     }
+    // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
+    // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。
+    // 数量で変わるもの (内容量・サイズ) と食品表示は空にして、人に入れ直させる
     const pinfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(parentId);
     if (pinfo) {
-      const cols = Object.keys(pinfo).filter((c) => c !== 'draft_id' && c !== 'updated_at' && c !== 'save_token' && c !== 'save_seq');
       db.prepare(`
-        INSERT INTO draft_page_info (draft_id, ${cols.join(', ')})
-        SELECT ?, ${cols.join(', ')} FROM draft_page_info WHERE draft_id = ?
+        INSERT INTO draft_page_info (
+          draft_id, product_type, ingredients, usage_notes, origin_type, origin_country,
+          category_label, seller_name, importer_name
+        )
+        SELECT ?, product_type, ingredients, usage_notes, origin_type, origin_country,
+               category_label, seller_name, importer_name
+        FROM draft_page_info WHERE draft_id = ?
       `).run(setId, parentId);
     }
     // 楽天のジャンル・属性はそのまま使える (画像と登録状態は引き継がない)
@@ -160,18 +170,38 @@ export function createSetDraft(parentDraftId, opts, actor) {
     }
 
     // 親の「セット商品作成検討」を完了にする (判断が済んだので親は先へ進める)。
-    // done() は派生側 (setId) を対象にするので、親には専用の UPDATE を使う
-    db.prepare(`
-      UPDATE draft_step_progress SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-        done_by = ?, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE draft_id = ? AND step_code = 'set_review' AND state != 'done'
-    `).run(actor || 'system', parentId);
+    // 直接 UPDATE せず setStepState を通す (Codex R1 medium 2026-08-23):
+    // 権限判定と版数 CAS を迂回すると、他人がレビュー中の工程を古い画面から閉じられる
+    setStepState(parentId, 'set_review', {
+      state: 'done',
+      expected_version: opts?.parent_step_version,
+    }, actor, { isAdmin: ctx.isAdmin, actorStaffId: ctx.actorStaffId, requireVersion: true });
 
     const memberText = members.map((m) => `${m.code}×${m.qty}`).join(' + ');
     logEvent(db, parentId, 'set_draft_created', `${neCode} (${memberText}) を作成 [${mode === 'ai' ? 'AIに書き換え' : 'コピーして手直し'}]`, actor);
     logEvent(db, setId, 'created_from_parent', `${parent.ne_code} から作成 (${memberText})`, actor);
     return { draftId: setId, neCode };
   })();
+}
+
+/**
+ * 「本コードに差し替えたが NE にまだ無かった」商品を、NE に現れた時点で確定させる。
+ * 詳細画面を開くたびに呼ぶ自己修復 (mirror の毎時取込を待つ間、出品ゲートは閉じたまま)。
+ * @returns {boolean} この呼び出しで確定したか
+ */
+export function reconcileProvisionalCode(db, draft) {
+  if (!draft || draft.provisional_code !== 1) return false;
+  // まだ仮コードそのもの (SET-xxx-01) なら確定しようがない
+  if (/^SET-/i.test(String(draft.ne_code || ''))) return false;
+  if (resolveVariationGroup(db, draft.ne_code, { withMembers: false }).kind === 'unknown') return false;
+  const info = db.prepare(`
+    UPDATE product_drafts SET provisional_code = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND provisional_code = 1
+  `).run(draft.id);
+  if (info.changes !== 1) return false;
+  logEvent(db, draft.id, 'set_code_confirmed', `${draft.ne_code} をNE商品マスタで確認しました`, 'system');
+  draft.provisional_code = 0;
+  return true;
 }
 
 /** この商品から作られたセット (親側の画面に出す) */

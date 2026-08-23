@@ -30,7 +30,7 @@ import {
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
-import { createSetDraft, setDraftsOf, setInfoOf } from './services/set-derive.js';
+import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -195,6 +195,8 @@ router.get('/detail/:id', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  // 「本コードに差し替えたが NE 未取込だった」商品を、NE に現れていれば確定させる
+  reconcileProvisionalCode(db, draft);
   const yahoo = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draft.id) || null;
   const imageProduction = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
   const refs = db.prepare('SELECT * FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
@@ -1647,7 +1649,13 @@ router.post('/api/drafts/:id/set-drafts', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   try {
-    const r = createSetDraft(draft.id, req.body || {}, actorOf(req));
+    // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
+    // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
+    const me = staffByPortalEmail(req.session?.email);
+    const r = createSetDraft(draft.id, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+    });
     res.json({ ok: true, draftId: r.draftId, neCode: r.neCode });
   } catch (e) { workflowError(res, e); }
 });
@@ -1661,6 +1669,15 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
   if (draft.provisional_code !== 1) {
     return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
   }
+  // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)
+  const isAdmin = req.session?.role === 'admin';
+  if (!isAdmin) {
+    const me = staffByPortalEmail(req.session?.email);
+    const cur = progressOf(draft.id, { db }).current;
+    if (!cur || cur.assignee_id == null || cur.assignee_id !== (me?.id ?? null)) {
+      return res.status(403).json({ ok: false, error: '商品コードの差し替えは、いまの工程の担当者か管理者だけができます' });
+    }
+  }
   const code = cleanText(req.body?.ne_code, 100);
   if (!code) return res.status(400).json({ ok: false, error: '商品コードを入力してください' });
   if (/^SET-/i.test(code)) {
@@ -1673,22 +1690,20 @@ router.post('/api/drafts/:id/set-code', (req, res) => {
     .get(code.trim().toLowerCase(), draft.id);
   if (dup) return res.status(400).json({ ok: false, error: `商品コード「${code}」は別のドラフト (#${dup.id}) が使っています` });
 
-  // NE 商品マスタに無いコードで出品すると受注が紐づかない。ただし登録直後は mirror に
-  // 反映されていないこともあるので、警告して confirm で通す (fail-open だが人が判断する)
-  const vari = resolveVariationGroup(db, code, { withMembers: false });
-  if (vari.kind === 'unknown' && req.body?.confirm !== true) {
-    return res.status(409).json({
-      ok: false, error: 'not_in_ne',
-      message: `商品コード「${code}」はNE商品マスタに見つかりません。ネクストエンジンへの登録がまだか、取込前の可能性があります。それでも差し替えますか?`,
-    });
-  }
-  db.prepare(`
-    UPDATE product_drafts SET ne_code = ?, provisional_code = 0,
+  // NE 商品マスタに無いコードでも差し替えは許すが、**仮フラグは落とさない** (Codex R1 medium)。
+  // 登録直後で mirror 未取込のことがあるので入力自体は通し、出品ゲートは閉じたままにする。
+  // NE に現れたら詳細画面を開いたときに自動で確定する (reconcileProvisionalCode)
+  const inNe = resolveVariationGroup(db, code, { withMembers: false }).kind !== 'unknown';
+  const info = db.prepare(`
+    UPDATE product_drafts SET ne_code = ?, provisional_code = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE id = ? AND provisional_code = 1
-  `).run(code, draft.id);
-  logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}`, actorOf(req));
-  res.json({ ok: true, neCode: code });
+    WHERE id = ? AND provisional_code = 1 AND ne_code = ?
+  `).run(code, inNe ? 0 : 1, draft.id, draft.ne_code);
+  if (info.changes !== 1) {
+    return res.status(409).json({ ok: false, error: '別の操作が先に商品コードを変更しました。画面を読み直してください' });
+  }
+  logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}${inNe ? '' : ' (NE商品マスタに未確認)'}`, actorOf(req));
+  res.json({ ok: true, neCode: code, inNe });
 });
 
 // モール別の展開状況。権限・楽観ロックの約束は工程と同じ

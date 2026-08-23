@@ -50,6 +50,11 @@ function conflict(message) {
 
 const nowIso = () => new Date().toISOString();
 
+/** 商品コードがまだ仮 (セット派生で NE 未登録) か */
+function isProvisional(db, draftId) {
+  return db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(Number(draftId))?.provisional_code === 1;
+}
+
 /**
  * モール行の自己修復生成。工程と同じく表示時に足りない分だけ作る。
  * 既定担当は工程「出品・展開」の担当者 (モール別に後から差し替えられる)。
@@ -161,6 +166,12 @@ export function setMallState(
   if (patch?.state !== undefined) {
     const state = String(patch.state);
     if (!STEP_STATES.includes(state)) throw badRequest('状態の指定が不正です');
+    // 仮コード (セット派生で NE 未登録) のまま「掲載済」にさせない (Codex R1 high 2026-08-23)。
+    // 楽天 API だけ止めても、手で done にすれば工程が完了してしまい、
+    // Yahoo など下流の展開 (人手 or sync) を誘発する
+    if (state === 'done' && isProvisional(db, id)) {
+      throw badRequest('商品コードが仮のままです。ネクストエンジンの本コードに差し替えてから掲載済にしてください');
+    }
     if (state !== row.state) {
       stateChanged = true;
       sets.push('state = @state');
@@ -247,6 +258,8 @@ export function setMallState(
  * @returns {boolean} この呼び出しで工程を完了にしたか
  */
 function syncListingStep(db, draftId, actor) {
+  // 仮コードのまま工程を閉じない (全部 skip にすれば決着してしまうため、ここでも見る)
+  if (isProvisional(db, draftId)) return false;
   const rows = db.prepare('SELECT mall, state FROM draft_mall_status WHERE draft_id = ?').all(draftId);
   const byCode = new Map(rows.map((r) => [r.mall, r.state]));
   const allSettled = MALLS.every((m) => {

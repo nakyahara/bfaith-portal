@@ -36,7 +36,12 @@ export const SOURCE_NOTION_IMPORT = 'notion_import';
  * ALTER で足した列には CHECK を付けられないため、コード側を fail-closed にして担保する。
  */
 export function canWriteToNotion(draft) {
-  return !!draft && draft.source === SOURCE_PORTAL;
+  if (!draft || draft.source !== SOURCE_PORTAL) return false;
+  // セット派生の仮コード (SET-xxx-01) でカードを作らせない (Codex R1 high 2026-08-23)。
+  // 仮コードのカードが商品マスターに残ると、RYS など Notion を読む側が実在しない
+  // 商品コードを掴む。本コードに差し替わってから作る
+  if (draft.provisional_code === 1) return false;
+  return true;
 }
 
 /** Notion 取り込み由来か (削除許可など「取り込みだけ」を対象にする判定用) */

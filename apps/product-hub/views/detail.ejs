@@ -379,9 +379,15 @@
           <% } %>
         </div>
         <% if (setInfo.provisional) { %>
+          <% const stillTemp = /^SET-/i.test(String(draft.ne_code || '')); %>
           <div style="margin-top:8px; font-size:13px; color:#b45309;">
-            ⚠️ 商品コードが仮のままです（<code><%= draft.ne_code %></code>）。<strong>このままでは楽天に出品できません。</strong>
-            ネクストエンジンに登録した本コードへ差し替えてください。
+            <% if (stillTemp) { %>
+              ⚠️ 商品コードが仮のままです（<code><%= draft.ne_code %></code>）。<strong>このままでは楽天に出品できません。</strong>
+              ネクストエンジンに登録した本コードへ差し替えてください。
+            <% } else { %>
+              ⚠️ 商品コード「<code><%= draft.ne_code %></code>」がNE商品マスタに見つかりません（登録待ちか取込待ち）。
+              <strong>取り込まれるとこの画面を開いたときに自動で解除されます。</strong>それまで楽天には出品できません。
+            <% } %>
           </div>
           <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
             <input type="text" id="set-code-input" placeholder="ネクストエンジンの商品コード" style="max-width:280px;" maxlength="100">
@@ -2907,6 +2913,8 @@
           body: JSON.stringify({
             mode: mode, name: document.getElementById('set-name').value,
             members: [{ ne_code: '<%= draft.ne_code %>', qty: qty }],
+            // 親の「セット商品作成検討」を閉じる操作なので、その工程の版数を添える
+            parent_step_version: <%= (workflow.main.find((s) => s.step_code === 'set_review') || {}).version %>,
           }),
         });
         const j = await res.json();
@@ -2941,13 +2949,14 @@
           return { status: res.status, json: await res.json() };
         }
         try {
-          let r = await post(false);
-          // NE に無いコードは一度警告してから確認で通す (登録直後で取込前のことがある)
-          if (!r.json.ok && r.json.error === 'not_in_ne') {
-            if (!confirm(r.json.message)) { out.textContent = ''; setCodeBtn.disabled = false; return; }
-            r = await post(true);
-          }
+          const r = await post(false);
           if (!r.json.ok) { out.textContent = ''; alert(r.json.error || '差し替えに失敗しました'); setCodeBtn.disabled = false; return; }
+          // NE に見つからないコードでも差し替えは通す。ただし出品ゲートは閉じたままなので、
+          // その旨をはっきり伝える (黙って通すと「出せるはず」と思われる)
+          if (r.json.inNe === false) {
+            alert('差し替えました。ただしNE商品マスタにまだ見つかりません。'
+              + '\n取り込まれるまで楽天には出品できません (この画面を開いたときに自動で解除されます)。');
+          }
           out.textContent = '差し替えました';
           setTimeout(function () { location.reload(); }, 800);
         } catch (e) {
