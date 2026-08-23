@@ -364,6 +364,87 @@
         <span id="ml-result"></span>
       </p>
     </details>
+
+    <!-- セット商品 (工程「セット商品作成検討」の実務) -->
+    <% if (setInfo) { %>
+      <div style="margin-top:10px; padding:10px 12px; background:#fff7ed; border:1px solid #fed7aa; border-radius:8px;">
+        <div style="font-size:13px;">
+          🎁 これは
+          <% if (setInfo.parent) { %>
+            <a href="/apps/product-hub/detail/<%= setInfo.parent.id %>"><%= setInfo.parent.name %></a>
+          <% } else { %>元の商品<% } %>
+          から作ったセット商品です
+          <% if (setInfo.members.length) { %>
+            <span class="muted">（構成: <%= setInfo.members.map((m) => `${m.member_ne_code}×${m.qty}`).join(' ＋ ') %>）</span>
+          <% } %>
+        </div>
+        <% if (setInfo.provisional) { %>
+          <div style="margin-top:8px; font-size:13px; color:#b45309;">
+            ⚠️ 商品コードが仮のままです（<code><%= draft.ne_code %></code>）。<strong>このままでは楽天に出品できません。</strong>
+            ネクストエンジンに登録した本コードへ差し替えてください。
+          </div>
+          <div style="display:flex; gap:8px; align-items:center; margin-top:8px;">
+            <input type="text" id="set-code-input" placeholder="ネクストエンジンの商品コード" style="max-width:280px;" maxlength="100">
+            <button class="btn btn-primary btn-sm" id="set-code-btn">本コードに差し替える</button>
+            <span class="muted" id="set-code-result"></span>
+          </div>
+        <% } %>
+      </div>
+    <% } else { %>
+      <div style="margin-top:10px; padding:10px 12px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;">
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <span style="font-size:13px; font-weight:600;">🎁 セット商品</span>
+          <% if (setDrafts.length) { %>
+            <span class="muted"><%= setDrafts.length %> 件作成済み</span>
+          <% } else { %>
+            <span class="muted">この商品からセットを作れます（単品の出品は止まりません）</span>
+          <% } %>
+        </div>
+        <% if (setDrafts.length) { %>
+          <table class="list" style="margin-top:8px;">
+            <tbody>
+              <% for (const s of setDrafts) { %>
+                <tr>
+                  <td><a href="/apps/product-hub/detail/<%= s.id %>"><%= s.name %></a></td>
+                  <td style="width:180px;"><code style="font-size:11px;"><%= s.ne_code %></code>
+                    <% if (s.provisional_code === 1) { %><span style="color:#b45309; font-size:11px;">仮</span><% } %></td>
+                  <td class="muted" style="width:200px; font-size:11px;"><%= s.members || '' %></td>
+                  <td style="width:90px;"><span class="badge badge-<%= s.status %>"><%= statusLabels[s.status] || s.status %></span></td>
+                </tr>
+              <% } %>
+            </tbody>
+          </table>
+        <% } %>
+        <details style="margin-top:8px;">
+          <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">セット商品を作る</summary>
+          <div style="margin-top:8px;">
+            <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap;">
+              <div style="flex:0 0 90px;">
+                <label>個数</label>
+                <input type="number" id="set-qty" value="2" min="1" max="999">
+              </div>
+              <div style="flex:1; min-width:220px;">
+                <label>セット商品名 <span class="muted">(空なら自動)</span></label>
+                <input type="text" id="set-name" placeholder="<%= draft.name %> 2個セット" maxlength="300">
+              </div>
+            </div>
+            <p class="muted" style="margin:8px 0; font-size:12px;">
+              商品コードは <code>SET-<%= draft.ne_code %>-01</code> のような<strong>仮コード</strong>で作ります。
+              ネクストエンジンに登録したら本コードへ差し替えてください（差し替えるまで楽天出品はできません）。
+              画像・売価・JANはセット用に作り直しになるので引き継ぎません。
+            </p>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+              <button class="btn btn-primary btn-sm" id="set-ai-btn">AIに書き換えてもらう</button>
+              <button class="btn btn-sm" id="set-copy-btn">コピーしてすぐ直す</button>
+              <span class="muted" id="set-create-result"></span>
+            </div>
+            <p class="muted" style="margin:6px 0 0; font-size:11px;">
+              「AIに書き換えてもらう」＝ AI情報入力待ちから／「コピーしてすぐ直す」＝ 説明文をコピーして商品説明確認から始まります。
+            </p>
+          </div>
+        </details>
+      </div>
+    <% } %>
   </div>
 
   <div class="tabbar" id="tabbar"
@@ -2809,5 +2890,72 @@
         });
       }
     });
+
+    // ─── セット商品 ───
+    async function createSet(mode) {
+      const out = document.getElementById('set-create-result');
+      const qty = Number(document.getElementById('set-qty').value);
+      if (!Number.isInteger(qty) || qty < 1) { out.textContent = '個数を入れてください'; return; }
+      const label = mode === 'ai' ? 'AIに書き換えてもらう' : 'コピーしてすぐ直す';
+      if (!confirm('この商品からセット商品を作ります (' + label + ')。\n商品コードは仮コードになります。\n\nよろしいですか?')) return;
+      const btns = [document.getElementById('set-ai-btn'), document.getElementById('set-copy-btn')];
+      btns.forEach(function (b) { b.disabled = true; });
+      out.textContent = '作成中…';
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/set-drafts', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mode: mode, name: document.getElementById('set-name').value,
+            members: [{ ne_code: '<%= draft.ne_code %>', qty: qty }],
+          }),
+        });
+        const j = await res.json();
+        if (!j.ok) { out.textContent = ''; alert(j.error || '作成に失敗しました'); btns.forEach(function (b) { b.disabled = false; }); return; }
+        out.textContent = j.neCode + ' を作りました。開きます…';
+        setTimeout(function () { location.href = '/apps/product-hub/detail/' + j.draftId; }, 800);
+      } catch (e) {
+        out.textContent = '';
+        alert('通信エラー: ' + e.message);
+        btns.forEach(function (b) { b.disabled = false; });
+      }
+    }
+    const setAiBtn = document.getElementById('set-ai-btn');
+    if (setAiBtn) setAiBtn.addEventListener('click', function () { createSet('ai'); });
+    const setCopyBtn = document.getElementById('set-copy-btn');
+    if (setCopyBtn) setCopyBtn.addEventListener('click', function () { createSet('copy'); });
+
+    // 仮コード → 本コードの差し替え
+    const setCodeBtn = document.getElementById('set-code-btn');
+    if (setCodeBtn) {
+      setCodeBtn.addEventListener('click', async function () {
+        const out = document.getElementById('set-code-result');
+        const code = document.getElementById('set-code-input').value.trim();
+        if (!code) { out.textContent = '商品コードを入れてください'; return; }
+        setCodeBtn.disabled = true;
+        out.textContent = '差し替え中…';
+        async function post(confirmFlag) {
+          const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/set-code', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ne_code: code, confirm: confirmFlag === true }),
+          });
+          return { status: res.status, json: await res.json() };
+        }
+        try {
+          let r = await post(false);
+          // NE に無いコードは一度警告してから確認で通す (登録直後で取込前のことがある)
+          if (!r.json.ok && r.json.error === 'not_in_ne') {
+            if (!confirm(r.json.message)) { out.textContent = ''; setCodeBtn.disabled = false; return; }
+            r = await post(true);
+          }
+          if (!r.json.ok) { out.textContent = ''; alert(r.json.error || '差し替えに失敗しました'); setCodeBtn.disabled = false; return; }
+          out.textContent = '差し替えました';
+          setTimeout(function () { location.reload(); }, 800);
+        } catch (e) {
+          out.textContent = '';
+          alert('通信エラー: ' + e.message);
+          setCodeBtn.disabled = false;
+        }
+      });
+    }
   })();
 </script>

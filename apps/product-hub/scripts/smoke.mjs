@@ -2043,6 +2043,88 @@ const ms = await import('../lib/mall-status.js');
     wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
 }
 
+// ─── セット商品の派生ドラフト (2026-08-23) ───
+const sd = await import('../services/set-derive.js');
+let wfSetDraftId = null;
+let wfSetParentId = null;
+{
+  const parentId = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, jan_code, official_url, own_brand, created_by)
+     VALUES ('WF-SET-P', 'セット元商品', 'approved', 1980, '4901234567894', 'https://example.com/p', 1, 'smoke')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, 'サイズ', '10cm', 0)`).run(parentId);
+  db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
+  db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
+  wfp.progressOf(parentId, { db });
+
+  const r = sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }] }, 'smoke');
+  wfSetDraftId = r.draftId; wfSetParentId = parentId;
+  check('仮コードで作られる', r.neCode === 'SET-WF-SET-P-01', r.neCode);
+  const set1 = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('仮コードのフラグが立つ', set1.provisional_code === 1);
+  check('親が記録される', set1.parent_draft_id === parentId);
+  check('商品名が自動で付く', /セット/.test(set1.name), set1.name);
+
+  // コピーする/しないの切り分け (ここを間違えると直し忘れが一番危ない)
+  check('売価はコピーしない', set1.price == null);
+  check('JANはコピーしない', set1.jan_code == null);
+  check('公式URLはコピーする', set1.official_url === 'https://example.com/p');
+  check('自社商品フラグはコピーする', set1.own_brand === 1);
+  check('仕様表はコピーする',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ?').get(r.draftId).c === 1);
+  check('参考URLはコピーする',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(r.draftId).c === 1);
+  check('楽天ジャンルはコピーする',
+    db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.genre_id === '565004');
+  check('画像はコピーしない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(r.draftId).c === 0);
+  check('AIモードでは説明文をコピーしない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(r.draftId).c === 0);
+
+  // 工程の開始位置
+  const sp = wfp.progressOf(r.draftId, { db });
+  check('AIモードは AI情報入力待ち から', sp.current?.step_code === 'ai_generate');
+  check('セットの画像トラックは未着手', sp.image.every((s) => s.state === 'todo'));
+  check('構成が保存される',
+    db.prepare('SELECT qty FROM draft_set_members WHERE set_draft_id = ?').get(r.draftId).qty === 2);
+  check('親のセット検討工程が完了する',
+    wfp.progressOf(parentId, { db }).main.find((s) => s.step_code === 'set_review').state === 'done');
+  check('親のイベントに記録が残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_draft_created'`).get(parentId).c === 1);
+
+  // copy モードは説明文を持って商品説明確認から
+  const r2 = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'WF-SET-P', qty: 3 }] }, 'smoke');
+  check('2件目は連番になる', r2.neCode === 'SET-WF-SET-P-02', r2.neCode);
+  check('copyモードは説明文をコピーする',
+    db.prepare('SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = ?').get(r2.draftId, 'rakuten_title')?.content === '単品のタイトル');
+  check('copyモードは 商品説明確認 から', wfp.progressOf(r2.draftId, { db }).current?.step_code === 'desc_review');
+
+  // 検証
+  let modeErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'unknown' }, 'smoke'); } catch (e) { modeErr = e; }
+  check('作り方の指定を検証する', modeErr?.status === 400);
+  let qtyErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 0 }] }, 'smoke'); } catch (e) { qtyErr = e; }
+  check('個数を検証する', qtyErr?.status === 400);
+  let nestErr = null;
+  try { sd.createSetDraft(r.draftId, { mode: 'ai' }, 'smoke'); } catch (e) { nestErr = e; }
+  check('セットからさらにセットは作れない', nestErr?.status === 400);
+
+  // 出品ゲート: 仮コードのままでは出品できない
+  const payload = listing.buildItemPayload(db, r.draftId);
+  check('仮コードのままでは出品を止める',
+    (payload.reasons || []).some((x) => /商品コードが仮のまま/.test(x)),
+    JSON.stringify(payload.reasons || []).slice(0, 200));
+
+  // 親側・セット側の表示用データ
+  check('親からセット一覧が引ける', sd.setDraftsOf(db, parentId).length === 2);
+  const info = sd.setInfoOf(db, r.draftId);
+  check('セットから親が引ける', info?.parent?.id === parentId);
+  check('セットの構成が引ける', info.members[0].qty === 2);
+  check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+}
+
 // ─── かんばんボード (2026-08-23) ───
 {
   const idHold = Number(db.prepare(
@@ -2785,6 +2867,16 @@ renders.push(
       { ...d0[2], isAdmin: false, myStaffId: wfTanakaId }]);
   }
 }
+// セット商品まわり: 親 (作成済みセットの一覧あり) と セット側 (仮コード警告あり)
+{
+  const d0 = renders.find((r) => r[1] === 'detail.ejs');
+  if (d0 && wfSetDraftId) {
+    renders.push(['detail.ejs (セットの親・作成済み一覧)', 'detail.ejs',
+      { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
+    renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
+      { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+  }
+}
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
@@ -2814,6 +2906,7 @@ for (const [name, file, data] of renders) {
         stepStateLabels: wfp.STEP_STATE_LABELS,
         isAdmin: true, myStaffId: null,
         mallStatus: ms.mallStatusOf(wfDraftId, { db }),
+        setDrafts: [], setInfo: null,
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),

@@ -546,6 +546,17 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_dms_mall ON draft_mall_status(mall, state);
     CREATE INDEX IF NOT EXISTS idx_dms_assignee ON draft_mall_status(assignee_id, state);
 
+    -- セット商品の構成 (2026-08-23)。工程「セット商品作成検討」で単品から派生させたとき、
+    -- 「何を何個まとめたセットか」を持つ。AI に説明文を書かせるときの文脈にも使う
+    -- (これが無いと単品のコピーみたいなタイトルになる)
+    CREATE TABLE IF NOT EXISTS draft_set_members (
+      set_draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      member_ne_code TEXT NOT NULL,
+      qty            INTEGER NOT NULL DEFAULT 1 CHECK (qty BETWEEN 1 AND 999),
+      sort           INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (set_draft_id, member_ne_code)
+    );
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
@@ -598,6 +609,15 @@ export function initProductHubDB() {
   if (!draftCols.has('source_notion_status')) {
     // 取り込み時点の Notion Status (⓪新規商品_高島 等)。product_drafts.status とは別軸なので原文保持
     db.exec('ALTER TABLE product_drafts ADD COLUMN source_notion_status TEXT');
+  }
+  // セット派生 (2026-08-23): どの単品から作ったセットか / 商品コードがまだ仮か。
+  // 仮コードのまま楽天に出すと直せない (manage_number は登録後に変えられない) ので、
+  // 出品ゲートでこのフラグを見て止める
+  if (!draftCols.has('parent_draft_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN parent_draft_id INTEGER');
+  }
+  if (!draftCols.has('provisional_code')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN provisional_code INTEGER NOT NULL DEFAULT 0');
   }
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');

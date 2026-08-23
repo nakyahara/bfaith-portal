@@ -30,6 +30,7 @@ import {
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
+import { createSetDraft, setDraftsOf, setInfoOf } from './services/set-derive.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -289,6 +290,9 @@ router.get('/detail/:id', (req, res) => {
     myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
     // モール別の展開状況 (工程「出品・展開」の中身)
     mallStatus: mallStatusOf(draft.id, { db }),
+    // セット商品: 親なら作ったセットの一覧、セットなら親と構成
+    setDrafts: setDraftsOf(db, draft.id),
+    setInfo: setInfoOf(db, draft.id),
   });
 });
 
@@ -1635,6 +1639,56 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
     });
     res.json({ ok: true, changed: r.changed, version: r.version });
   } catch (e) { workflowError(res, e); }
+});
+
+// セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。
+// 単品の出品は止めず、セットは別カードとして並走させる (中原さん 2026-08-23)
+router.post('/api/drafts/:id/set-drafts', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = createSetDraft(draft.id, req.body || {}, actorOf(req));
+    res.json({ ok: true, draftId: r.draftId, neCode: r.neCode });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 仮コード (SET-xxx-01) を NE 登録後の本コードへ差し替える。
+// これをやらないと buildItemPayload が出品を止める (manage_number は後から変えられないため)
+router.post('/api/drafts/:id/set-code', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (draft.provisional_code !== 1) {
+    return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
+  }
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: '商品コードを入力してください' });
+  if (/^SET-/i.test(code)) {
+    return res.status(400).json({ ok: false, error: '仮コードのままにはできません (ネクストエンジンの商品コードを入れてください)' });
+  }
+  if (!isNeCodeUniqueEnforced()) {
+    return res.status(409).json({ ok: false, error: '商品コードの一意制約が張れていないため変更できません (管理者に連絡してください)' });
+  }
+  const dup = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? AND id != ?')
+    .get(code.trim().toLowerCase(), draft.id);
+  if (dup) return res.status(400).json({ ok: false, error: `商品コード「${code}」は別のドラフト (#${dup.id}) が使っています` });
+
+  // NE 商品マスタに無いコードで出品すると受注が紐づかない。ただし登録直後は mirror に
+  // 反映されていないこともあるので、警告して confirm で通す (fail-open だが人が判断する)
+  const vari = resolveVariationGroup(db, code, { withMembers: false });
+  if (vari.kind === 'unknown' && req.body?.confirm !== true) {
+    return res.status(409).json({
+      ok: false, error: 'not_in_ne',
+      message: `商品コード「${code}」はNE商品マスタに見つかりません。ネクストエンジンへの登録がまだか、取込前の可能性があります。それでも差し替えますか?`,
+    });
+  }
+  db.prepare(`
+    UPDATE product_drafts SET ne_code = ?, provisional_code = 0,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND provisional_code = 1
+  `).run(code, draft.id);
+  logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}`, actorOf(req));
+  res.json({ ok: true, neCode: code });
 });
 
 // モール別の展開状況。権限・楽観ロックの約束は工程と同じ

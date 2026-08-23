@@ -1028,6 +1028,11 @@ export function buildItemPayload(db, draftId) {
   const trailingBanners = trailingBannerLocations(effectiveShip.group);
 
   const reasons = [];
+  // セット派生の仮コードのまま出さない (2026-08-23)。manage_number は登録後に変えられないので、
+  // 仮コード (SET-xxx-01) で出すと商品ページを作り直す羽目になる。NE 登録後に本コードへ差し替える
+  if (draft.provisional_code === 1) {
+    reasons.push(`商品コードが仮のままです (${draft.ne_code})。ネクストエンジンに登録した本コードへ「基本情報」で差し替えてください`);
+  }
   // 単品のみ (バリエーションページの variants/selector 構成は P3.5)
   const vari = resolveVariationGroup(db, draft.ne_code, { draftId, withMembers: false });
   if (vari.kind === 'variation' && vari.memberCount > 1) {
