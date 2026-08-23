@@ -1968,6 +1968,81 @@ let wfDraftId = null;
     wfp.setStepState(id, 'set_review', { due_date: '2028-02-29' }, 'admin', ADMIN).changed === true);
 }
 
+// ─── モール別の展開状況 (2026-08-23 中原さん: 出品・展開はモールごと) ───
+const ms = await import('../lib/mall-status.js');
+{
+  check('モールは6つ (Amazon は含めない)', ms.MALLS.length === 6, ms.MALLS.map((m) => m.code).join(','));
+  check('LINEギフトが入っている', ms.MALLS.some((m) => m.code === 'linegift'));
+  check('Amazon は入れない', !ms.MALLS.some((m) => m.code === 'amazon'));
+
+  const id = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL', 'モールテスト', 'approved', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(id, { db });
+  // 出品・展開工程に担当を置くと、モールの初期担当がそこから入る
+  wfp.setStepState(id, 'listing', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+
+  const st = ms.mallStatusOf(id, { db });
+  check('モール行が自己修復で作られる', st.list.length === 6);
+  check('初期状態は未着手', st.list.every((m) => m.state === 'todo'));
+  check('モールの担当は出品・展開工程の担当を引き継ぐ', st.list.every((m) => m.assignee_id === wfOkawaId));
+  check('並びは MALLS 定義どおり', st.list[0].code === 'rakuten' && st.list[5].code === 'linegift');
+
+  // 楽天出品の成功で楽天モールが自動で完了になる
+  check('楽天出品を反映できる', ms.markRakutenListed(db, id, { itemUrl: 'https://item.rakuten.co.jp/b-faith/wf-mall/', actor: 'smoke' }) === true);
+  const st2 = ms.mallStatusOf(id, { db });
+  check('楽天が掲載済になる', st2.list.find((m) => m.code === 'rakuten').state === 'done');
+  check('掲載日が入る', !!st2.list.find((m) => m.code === 'rakuten').listed_at);
+  check('まだ工程は完了しない (他モールが残る)',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
+
+  // URL の検証
+  let urlErr = null;
+  try { ms.setMallState(id, 'yahoo', { item_url: 'javascript:alert(1)' }, 'admin', ADMIN); } catch (e) { urlErr = e; }
+  check('掲載URLは http(s) だけ通す', urlErr?.status === 400, urlErr?.message || '例外が出ていない');
+  check('http(s) の掲載URLは保存できる',
+    ms.setMallState(id, 'yahoo', { item_url: 'https://store.shopping.yahoo.co.jp/b-faith/wf-mall.html' }, 'admin', ADMIN).changed === true);
+
+  let mallErr = null;
+  try { ms.setMallState(id, 'amazon', { state: 'done' }, 'admin', ADMIN); } catch (e) { mallErr = e; }
+  check('未知のモールコードは弾く', mallErr?.status === 400);
+
+  // 権限 (工程と同じ約束)
+  let permErr = null;
+  try { ms.setMallState(id, 'yahoo', { state: 'done' }, 'tanaka', { isAdmin: false, actorStaffId: wfTanakaId }); } catch (e) { permErr = e; }
+  check('他人が担当のモールは動かせない', permErr?.status === 403, permErr?.message || '例外が出ていない');
+  check('担当者本人は動かせる',
+    ms.setMallState(id, 'yahoo', { state: 'done' }, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }).changed === true);
+
+  // 楽観ロック
+  const v0 = ms.mallStatusOf(id, { db }).list.find((m) => m.code === 'aupay').version;
+  const r1 = ms.setMallState(id, 'aupay', { state: 'doing' }, 'admin', ADMIN);
+  check('モールも版数が上がる', r1.version === v0 + 1);
+  let mlConflict = null;
+  try { ms.setMallState(id, 'aupay', { state: 'done', expected_version: v0 }, 'admin', ADMIN); } catch (e) { mlConflict = e; }
+  check('古い版数のモール更新を 409 で弾く', mlConflict?.status === 409);
+
+  // 全モールが決着すると工程「出品・展開」が自動で完了になる
+  ms.setMallState(id, 'aupay', { state: 'done' }, 'admin', ADMIN);
+  ms.setMallState(id, 'mercari', { state: 'done' }, 'admin', ADMIN);
+  ms.setMallState(id, 'qoo10', { state: 'skip' }, 'admin', ADMIN);
+  const last = ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
+  check('最後のモールで工程完了が返る', last.listingCompleted === true);
+  check('工程「出品・展開」が完了になる',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
+  // セット検討がまだ残っているので、この時点では全工程完了ではない
+  check('出品が終わってもセット検討が残る', wfp.progressOf(id, { db }).current?.step_code === 'set_review');
+  wfp.setStepState(id, 'set_review', { state: 'done' }, 'admin', ADMIN);
+  check('全工程が終わってボードの完了列へ', wfp.progressOf(id, { db }).mainDone === true);
+  check('対象外は掲載済に数えない', ms.mallStatusOf(id, { db }).doneCount === 5);
+  check('決着済みの判定', ms.mallStatusOf(id, { db }).allSettled === true);
+
+  // 差し戻すと工程も開くか (モール → 工程は一方向。工程は開かない設計)
+  ms.setMallState(id, 'linegift', { state: 'todo' }, 'admin', ADMIN);
+  check('モールを戻しても工程は自動では開かない (人が差し戻す)',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
+}
+
 // ─── かんばんボード (2026-08-23) ───
 {
   const idHold = Number(db.prepare(
@@ -2713,7 +2788,7 @@ renders.push(
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
-  board: wfp.boardData(db, {}), staff: wf.listStaff(),
+  board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
   me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false,
   stepStateLabels: wfp.STEP_STATE_LABELS,
 };
@@ -2738,6 +2813,7 @@ for (const [name, file, data] of renders) {
         workflowStaff: wf.listStaff(),
         stepStateLabels: wfp.STEP_STATE_LABELS,
         isAdmin: true, myStaffId: null,
+        mallStatus: ms.mallStatusOf(wfDraftId, { db }),
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),

@@ -527,6 +527,25 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_dsp_step ON draft_step_progress(step_code, state);
     CREATE INDEX IF NOT EXISTS idx_dsp_assignee ON draft_step_progress(assignee_id, state);
 
+    -- 商品 × モールの展開状況 (2026-08-23 中原さん: 「出品・展開はモールごとにステータスを作る」)。
+    -- 工程「出品・展開」の中身。全モールが done/skip になるとその工程が完了する。
+    -- mall コードは lib/mall-status.js の MALLS が正 (CHECK は将来のモール追加を
+    -- テーブル再作成なしでできるよう**あえて張らない**。値の検証はコード側)
+    CREATE TABLE IF NOT EXISTS draft_mall_status (
+      draft_id    INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      mall        TEXT NOT NULL,                  -- rakuten / yahoo / aupay / mercari / qoo10 / linegift
+      state       TEXT NOT NULL DEFAULT 'todo' CHECK (state IN ('todo', 'doing', 'done', 'skip')),
+      assignee_id INTEGER REFERENCES ph_staff(id),
+      listed_at   TEXT,                           -- 掲載できた日時
+      item_url    TEXT,                           -- 掲載ページ (確認用)
+      note        TEXT,
+      version     INTEGER NOT NULL DEFAULT 0,     -- 楽観ロック (工程と同じ方式)
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, mall)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dms_mall ON draft_mall_status(mall, state);
+    CREATE INDEX IF NOT EXISTS idx_dms_assignee ON draft_mall_status(assignee_id, state);
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)

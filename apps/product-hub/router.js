@@ -27,6 +27,9 @@ import {
 import {
   progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
 } from './lib/workflow-progress.js';
+import {
+  MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
+} from './lib/mall-status.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -284,6 +287,8 @@ router.get('/detail/:id', (req, res) => {
     // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
     isAdmin: req.session?.role === 'admin',
     myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
+    // モール別の展開状況 (工程「出品・展開」の中身)
+    mallStatus: mallStatusOf(draft.id, { db }),
   });
 });
 
@@ -1127,6 +1132,12 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   try {
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
+    // 楽天モールを完了にする (人に二度同じことを押させない)。
+    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す
+    markRakutenListed(getDB(), draft.id, {
+      itemUrl: rakutenItemPageUrl(draft.ne_code),
+      actor: actorOf(req),
+    });
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
@@ -1519,7 +1530,8 @@ router.get('/board', (req, res) => {
   const raw = String(req.query.assignee || '').trim();
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
   const unassignedOnly = String(req.query.filter || '') === 'unassigned';
-  const board = boardData(db, { assigneeId, unassignedOnly });
+  // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
+  const board = boardData(db, { assigneeId, unassignedOnly, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
@@ -1622,6 +1634,21 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
       requireVersion: true,
     });
     res.json({ ok: true, changed: r.changed, version: r.version });
+  } catch (e) { workflowError(res, e); }
+});
+
+// モール別の展開状況。権限・楽観ロックの約束は工程と同じ
+router.post('/api/drafts/:id/malls/:mall', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const r = setMallState(draft.id, req.params.mall, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+      requireVersion: true,
+    });
+    res.json({ ok: true, changed: r.changed, version: r.version, listingCompleted: r.listingCompleted });
   } catch (e) { workflowError(res, e); }
 });
 

@@ -20,6 +20,12 @@
   .tab-panel.active { display: block; }
   /* 工程パネル (誰のボールか)。.wf-dot は _header.ejs で共通定義 */
   .mini-note { font-size: 11px; color: #94a3b8; }
+  /* モール別の展開状況を折りたたみ見出しで一目にする点 */
+  .mall-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px;
+              background: #e2e8f0; vertical-align: middle; }
+  .mall-dot.mall-done { background: #16a34a; }
+  .mall-dot.mall-doing { background: #f59e0b; }
+  .mall-dot.mall-skip { background: #cbd5e1; opacity: .5; }
   #wf-card select, #wf-card input { font-size: 12px; padding: 4px 7px; }
 </style>
 <div class="wrap wide">
@@ -284,6 +290,78 @@
       </table>
       <p class="muted" style="margin:8px 0 0; font-size:12px;">
         変更するとその場で保存されます。<span id="wf-result"></span>
+      </p>
+    </details>
+
+    <!-- モール別の展開状況 (工程「出品・展開」の中身) -->
+    <details style="margin-top:8px;" id="mall-details">
+      <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">
+        モール別の展開状況
+        <span class="muted" style="margin-left:6px;">
+          <%= mallStatus.doneCount %>/<%= mallStatus.totalCount %> 掲載済<% if (mallStatus.skipCount) { %> ・対象外 <%= mallStatus.skipCount %><% } %>
+        </span>
+        <span style="margin-left:8px;">
+          <% for (const m of mallStatus.list) { %>
+            <span class="mall-dot mall-<%= m.state %>" title="<%= m.label %>: <%= stepStateLabels[m.state] %>"></span>
+          <% } %>
+        </span>
+      </summary>
+      <table class="list" style="margin-top:8px;">
+        <thead>
+          <tr><th style="width:150px">モール</th><th style="width:110px">状態</th><th style="width:170px">担当者</th>
+              <th style="width:100px">掲載日</th><th>掲載URL / メモ</th></tr>
+        </thead>
+        <tbody>
+          <% for (const m of mallStatus.list) { %>
+            <% const mEditable = isAdmin || (m.assignee_id != null && m.assignee_id === myStaffId); %>
+            <tr data-mall="<%= m.code %>" data-version="<%= m.version == null ? '' : m.version %>">
+              <td>
+                <%= m.label %>
+                <% if (m.hint) { %><br><span class="mini-note"><%= m.hint %></span><% } %>
+              </td>
+              <td>
+                <select class="ml-state" <%= mEditable ? '' : 'disabled' %>
+                        title="<%= mEditable ? '' : (m.assignee_name ? m.assignee_name + ' さんの担当です' : '「自分が担当する」を押すと操作できます') %>">
+                  <% for (const code of Object.keys(stepStateLabels)) { %>
+                    <% if (code === 'skip' && !isAdmin && m.state !== 'skip') continue; %>
+                    <option value="<%= code %>" <%= m.state === code ? 'selected' : '' %>><%= stepStateLabels[code] %></option>
+                  <% } %>
+                </select>
+              </td>
+              <td>
+                <% if (isAdmin) { %>
+                  <select class="ml-assignee">
+                    <option value="">未割り当て</option>
+                    <% for (const st of workflowStaff) { %>
+                      <option value="<%= st.id %>" <%= m.assignee_id === st.id ? 'selected' : '' %>><%= st.name %></option>
+                    <% } %>
+                  </select>
+                <% } else if (m.assignee_id == null) { %>
+                  <% if (myStaffId) { %>
+                    <button type="button" class="btn btn-sm ml-claim">自分が担当する</button>
+                  <% } else { %><span class="muted" style="font-size:12px;">未割り当て</span><% } %>
+                <% } else { %>
+                  <span style="font-size:12px; display:inline-flex; align-items:center; gap:4px;">
+                    <span class="wf-dot" style="background:<%= m.assignee_color || '#94a3b8' %>"></span><%= m.assignee_name %>
+                  </span>
+                <% } %>
+              </td>
+              <td class="muted" style="font-size:12px;"><%= m.listed_at ? String(m.listed_at).slice(0, 10) : '—' %></td>
+              <td>
+                <% if (m.code === 'rakuten' && m.state === 'done') { %>
+                  <a href="<%= rakutenItemUrl %>" target="_blank" rel="noopener" style="font-size:12px;">楽天の商品ページ</a><br>
+                <% } else if (m.item_url) { %>
+                  <a href="<%= m.item_url %>" target="_blank" rel="noopener" style="font-size:12px;">掲載ページ</a><br>
+                <% } %>
+                <input type="text" class="ml-note" value="<%= m.note || '' %>" placeholder="メモ (任意)" maxlength="300" <%= mEditable ? '' : 'disabled' %>>
+              </td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <p class="muted" style="margin:8px 0 0; font-size:12px;">
+        全モールが「掲載済」か「対象外」になると、工程「出品・展開」が自動で完了になります。
+        <span id="ml-result"></span>
       </p>
     </details>
   </div>
@@ -2684,6 +2762,52 @@
       }
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
       if (note) note.addEventListener('change', function () { save(tr, { note: note.value }); });
+    });
+
+    // ─── モール別の展開状況 ───
+    const mlOut = document.getElementById('ml-result');
+    async function saveMall(tr, patch) {
+      const mall = tr.dataset.mall;
+      mlOut.textContent = '保存中…';
+      try {
+        const body = Object.assign(
+          { expected_version: tr.dataset.version === '' ? null : Number(tr.dataset.version) }, patch);
+        const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/malls/' + encodeURIComponent(mall), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const j = await res.json();
+        if (!j.ok) {
+          mlOut.textContent = '';
+          alert(j.error || '保存に失敗しました');
+          if (res.status === 409) location.reload();
+          return false;
+        }
+        if (j.version != null) tr.dataset.version = String(j.version);
+        mlOut.textContent = '保存しました';
+        // 全モールが決着すると工程「出品・展開」が閉じる → 上部の表示が変わるので読み直す
+        if (j.listingCompleted) setTimeout(function () { location.reload(); }, 900);
+        return true;
+      } catch (e) {
+        mlOut.textContent = '';
+        alert('通信エラー: ' + e.message);
+        return false;
+      }
+    }
+    document.querySelectorAll('tr[data-mall]').forEach(function (tr) {
+      const st = tr.querySelector('.ml-state');
+      const asg = tr.querySelector('.ml-assignee');
+      const note = tr.querySelector('.ml-note');
+      const claim = tr.querySelector('.ml-claim');
+      if (st) st.addEventListener('change', function () { saveMall(tr, { state: st.value }); });
+      if (asg) asg.addEventListener('change', function () { saveMall(tr, { assignee_id: asg.value }); });
+      if (note) note.addEventListener('change', function () { saveMall(tr, { note: note.value }); });
+      if (claim) {
+        claim.addEventListener('click', async function () {
+          claim.disabled = true;
+          const ok = await saveMall(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
+          if (ok) location.reload(); else claim.disabled = false;
+        });
+      }
     });
   })();
 </script>

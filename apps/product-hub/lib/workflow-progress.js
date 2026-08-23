@@ -431,7 +431,7 @@ export function setStepState(
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
  * @returns {{columns: Array, imageColumns: Array, doneCards: Array, total: number, truncated: boolean}}
  */
-export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800 } = {}) {
+export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
     SELECT code, label, track, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -491,6 +491,8 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
   const imageColumns = steps.filter((s) => s.track === 'image').map((s) => ({ ...s, cards: [] }));
   const byCode = new Map([...columns, ...imageColumns].map((c) => [c.code, c]));
   const doneCards = [];
+  // 表示に残ったカードだけ後からモール状況を足す (全件に足すと無駄なクエリになる)
+  const cardsById = new Map();
 
   for (const d of drafts) {
     const p = summary.get(d.id);
@@ -516,6 +518,14 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
     if (p.current) byCode.get(p.current.step_code)?.cards.push(card);
     else doneCards.push(card);
     if (p.imageCurrent) byCode.get(p.imageCurrent.step_code)?.cards.push(card);
+    cardsById.set(d.id, card);
+  }
+
+  // 「出品・展開」のカードはモールの進み具合が要る (どこまで並んだかが本体なので)。
+  // 循環 import を避けるため、呼び出し側から渡された関数で解決する
+  if (mallSummary && cardsById.size > 0) {
+    const malls = mallSummary(db, [...cardsById.keys()]);
+    for (const [id, card] of cardsById) card.malls = malls.get(id) || null;
   }
 
   // 停滞しているものを上に出す (打ち手が要るカードを埋もれさせない)
