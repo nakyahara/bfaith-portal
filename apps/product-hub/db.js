@@ -87,6 +87,7 @@ export const STAFF_COLORS = [
 export const ROLE_SEEDS = [
   { code: 'registrar', label: '商品登録者', sort: 10 },
   { code: 'image', label: '画像登録者', sort: 20 },
+  { code: 'image_approver', label: '画像作成承認者', sort: 25 },   // 2026-08-23 中原さん追加
   { code: 'approver', label: '商品承認者', sort: 30 },
   { code: 'set_planner', label: 'セット商品登録販売企画者', sort: 40 },
 ];
@@ -134,7 +135,12 @@ export const STEP_SEEDS = [
   },
   {
     code: 'img_register', label: '画像登録', track: 'image', role_code: 'image', sort: 30,
-    description: 'Drive へ格納してアプリに取り込む。楽天出品はこの工程の完了が前提',
+    description: 'Drive へ格納してアプリに取り込む',
+  },
+  {
+    // 2026-08-23 中原さん追加。登録の後に置くのは、アプリの画像タブでサムネを見て承認できるため
+    code: 'img_approve', label: '画像承認', track: 'image', role_code: 'image_approver', sort: 40, stall_days: 3,
+    description: '登録された画像を確認して承認する。楽天出品はこの工程の完了が前提 (出品ゲート)',
   },
 ];
 

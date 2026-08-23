@@ -157,6 +157,15 @@ export function ensureProgress(db, draftId) {
     // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない
     const hasImages = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(id);
     if (hasImages) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
+  } else {
+    // 後から足した工程は原則 todo で入れる (過去分を勝手に done にしない)。
+    // 唯一の例外: **画像トラック**の工程で、その商品が既に楽天へ登録済みのとき。
+    // 画像トラックは出品のゲートなので、出品が済んだ商品に「画像承認 未着手」が出ると
+    // 承認者が「もう楽天に並んでいるのに何を承認するのか」と混乱する (2026-08-23 画像承認の追加時)
+    const listed = db.prepare(
+      'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
+    ).get(id);
+    if (listed) for (const s of missing) if (s.track === 'image') doneSet.add(s.code);
   }
 
   const byRole = defaultAssigneeByRole(db);
@@ -289,6 +298,20 @@ export function progressOf(draftId, { db = null } = {}) {
     doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
     totalCount: main.length,
   };
+}
+
+/**
+ * 楽天出品のゲート: 画像トラック (依頼 → 制作 → 登録 → 承認) が終わっていなければ理由を返す。
+ * buildItemPayload の reasons に載せるので、「送信内容を確認」でも止まる理由が見える。
+ * 画像が揃っていない・承認されていない商品を出すと、後から差し替える手間の方が大きい。
+ * @returns {string|null} 止める理由 (通ってよければ null)
+ */
+export function imageTrackBlockReason(db, draftId) {
+  const p = progressOf(draftId, { db });
+  if (p.image.length === 0 || p.imageDone) return null;
+  const cur = p.imageCurrent;
+  const who = cur?.assignee_name ? ` / 担当: ${cur.assignee_name}` : (cur?.role_label ? ` / ${cur.role_label} 未割り当て` : '');
+  return `画像トラックが終わっていません (いま: ${cur ? cur.label : '未着手'}${who})。画像承認まで済ませてから出品してください`;
 }
 
 /**

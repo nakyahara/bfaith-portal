@@ -888,6 +888,11 @@ db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gfile
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gfile1', '/app-newitems/rk-smoke-1-1.jpg')`).run(rkId);
 db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '楽天用タイトル'), (?, 'desc_catch', 'キャッチ'), (?, 'desc_features', '特徴文'), (?, 'desc_notes', 'AI注意書き文')`).run(rkId, rkId, rkId, rkId);
 db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value) VALUES (?, 'サイズ', 'W10cm')`).run(rkId);
+// 画像トラック (依頼→制作→登録→承認) は楽天出品のゲート (2026-08-23 配線)。
+// 上の 1 回目の buildItemPayload で工程行が「画像なし」の状態で作られているので、ここで済ませておく
+// (本番でも、詳細画面を開いてから画像を足した商品は人が画像トラックを進めるまで出せない = 意図どおり)
+db.prepare(`UPDATE draft_step_progress SET state = 'done', done_by = 'smoke'
+            WHERE draft_id = ? AND step_code IN (SELECT code FROM ph_steps WHERE track = 'image')`).run(rkId);
 
 built = listing.buildItemPayload(db, rkId);
 check('payload: 組み立て成功', built.ok === true, JSON.stringify(built.reasons || null));
@@ -1666,11 +1671,18 @@ db.prepare(`DELETE FROM ph_shipping_method_map`).run();
 const wf = await import('../lib/workflow.js');
 {
   const roles0 = wf.listRoles();
-  check('役割シード 4件', roles0.length === 4, `= ${roles0.length}`);
+  check('役割シード 5件', roles0.length === 5, `= ${roles0.length}`);
+  check('役割シード: 画像作成承認者', roles0.some((r) => r.code === 'image_approver' && r.label === '画像作成承認者'));
   check('役割シード: 商品登録者', roles0.some((r) => r.code === 'registrar' && r.label === '商品登録者'));
   const steps0 = wf.listSteps();
-  check('工程シード: 本流6 + 画像3',
-    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 3);
+  check('工程シード: 本流6 + 画像4',
+    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 4);
+  {
+    const img = steps0.filter((s) => s.track === 'image').map((s) => s.code);
+    check('工程シード: 画像承認は画像登録の後 (アプリでサムネを見て承認する)',
+      img.indexOf('img_approve') === img.indexOf('img_register') + 1 && img[img.length - 1] === 'img_approve', img.join(','));
+    check('工程シード: 画像承認の担当は画像作成承認者', steps0.find((s) => s.code === 'img_approve').role_code === 'image_approver');
+  }
   check('工程シード: AI待ちはシステム工程 (担当ロールなし)', steps0.find((s) => s.code === 'ai_generate').role_code === null);
   check('工程シード: 先頭は基本情報入力', steps0[0].code === 'basic_info');
 
@@ -1746,7 +1758,7 @@ const wf = await import('../lib/workflow.js');
   // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
   const ov = wf.workflowOverview();
   check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
-  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 3);
+  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 4);
 }
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
@@ -1966,6 +1978,47 @@ let wfDraftId = null;
   check('存在しない日付を弾く (2026-99-99)', e7?.status === 400);
   check('実在する日付は通る (うるう年)',
     wfp.setStepState(id, 'set_review', { due_date: '2028-02-29' }, 'admin', ADMIN).changed === true);
+}
+
+// ─── 楽天出品ゲート: 画像トラック (画像承認まで) が終わるまで出さない (2026-08-23) ───
+{
+  // 画像の無い商品を専用に作る (WF-REVIEW を使うと、後ろのボードのテストで画像列に出なくなる)
+  const idGate = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-IMG-GATE', '画像ゲート', 'approved', 'smoke')`
+  ).run().lastInsertRowid);
+  const blocked = listing.buildItemPayload(db, idGate);
+  check('画像トラック未完了なら出品を止める',
+    (blocked.reasons || []).some((x) => /画像トラックが終わっていません/.test(x)), JSON.stringify(blocked.reasons || []).slice(0, 200));
+  check('止める理由に「いまの工程」が出る', (blocked.reasons || []).some((x) => /いま: 画像制作の依頼/.test(x)));
+  // 画像トラックを全部完了にすると理由が消える (他の理由は残ってよい)
+  for (const s of wfp.progressOf(idGate, { db }).image) {
+    wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
+  }
+  check('画像承認まで終われば画像の理由は消える',
+    !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)));
+
+  // 後から足した画像工程: 既に楽天へ登録済みの商品だけ done で入る (承認者に「出品済みの承認」をさせない)
+  const idListedRk = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-IMG-LISTED', '出品済み', 'listed', 'smoke')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-20T00:00:00Z')`).run(idListedRk);
+  const idNotListed = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-IMG-OPEN', '未出品', 'review', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(idListedRk, { db });
+  wfp.progressOf(idNotListed, { db });
+  const lateImg = wf.createStep({ label: '画像の最終チェック', track: 'image', role_code: 'image_approver' });
+  wfp.ensureProgressForMany(db, [idListedRk, idNotListed]);
+  check('後から足した画像工程: 楽天登録済みの商品は done で入る',
+    wfp.progressOf(idListedRk, { db }).image.find((s) => s.step_code === lateImg)?.state === 'done');
+  check('後から足した画像工程: 未出品の商品は todo で入る',
+    wfp.progressOf(idNotListed, { db }).image.find((s) => s.step_code === lateImg)?.state === 'todo');
+  const lateMain = wf.createStep({ label: '本流の追加工程', track: 'main', role_code: 'registrar' });
+  wfp.ensureProgressForMany(db, [idListedRk]);
+  check('後から足した本流工程は楽天登録済みでも todo (例外は画像トラックだけ)',
+    wfp.progressOf(idListedRk, { db }).main.find((s) => s.step_code === lateMain)?.state === 'todo');
+  wf.updateStep(lateImg, { active: false });
+  wf.updateStep(lateMain, { active: false });
 }
 
 // ─── モール別の展開状況 (2026-08-23 中原さん: 出品・展開はモールごと) ───
@@ -2234,7 +2287,7 @@ let wfSetParentId = null;
   `).run(new Date(Date.now() - 5 * 86400000).toISOString());
 
   const b = wfp.boardData(db, {});
-  check('ボード: 本流6列 + 画像3列', b.columns.length === 6 && b.imageColumns.length === 3);
+  check('ボード: 本流6列 + 画像4列', b.columns.length === 6 && b.imageColumns.length === 4);
   const onBoard = new Set(b.columns.flatMap((c) => c.cards.map((x) => x.id)).concat(b.doneCards.map((x) => x.id)));
   check('ボード: 保留の商品は載せない', !onBoard.has(idHold));
   check('ボード: 工程テストの商品が載る', onBoard.has(wfDraftId));
