@@ -90,9 +90,10 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
   const seen = new Set();
   for (const m of rawMembers) {
     const code = String(m?.ne_code == null ? '' : m.ne_code).trim();
-    const qty = Math.round(Number(m?.qty));
+    // 丸めてから整数判定すると 1.5 が黙って 2 個になる (Codex R5)。小数はそのまま弾く
+    const qty = Number(m?.qty);
     if (!code) throw badRequest('構成の商品コードが空です');
-    if (!Number.isInteger(qty) || qty < 1 || qty > 999) throw badRequest(`「${code}」の個数が不正です (1〜999)`);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 999) throw badRequest(`「${code}」の個数が不正です (1〜999の整数)`);
     const key = code.toLowerCase();
     if (seen.has(key)) throw badRequest(`構成に「${code}」が重複しています`);
     seen.add(key);

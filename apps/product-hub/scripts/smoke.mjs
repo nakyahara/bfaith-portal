@@ -2157,6 +2157,9 @@ let wfSetParentId = null;
   let qtyErr = null;
   try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 0 }] }, 'smoke'); } catch (e) { qtyErr = e; }
   check('個数を検証する', qtyErr?.status === 400);
+  let fracErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 1.5 }] }, 'smoke'); } catch (e) { fracErr = e; }
+  check('小数の個数は黙って丸めず弾く', fracErr?.status === 400, fracErr?.message || '例外が出ていない');
   let nestErr = null;
   try { sd.createSetDraft(r.draftId, { mode: 'ai' }, 'smoke'); } catch (e) { nestErr = e; }
   check('セットからさらにセットは作れない', nestErr?.status === 400);
