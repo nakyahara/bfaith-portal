@@ -226,12 +226,14 @@
         </thead>
         <tbody>
           <%
-            // 動かせるのは admin / 自分の担当 / 未割り当て のみ (サーバー側の判定と同じ条件)
-            const canEditStep = (s) => isAdmin || s.assignee_id == null || s.assignee_id === myStaffId;
+            // 動かせるのは admin か担当者本人だけ (サーバー側 assertStepPermission と同じ条件)。
+            // 未割り当ての工程は「自分が担当する」で引き受けてから操作する
+            const canEditStep = (s) => isAdmin || (s.assignee_id != null && s.assignee_id === myStaffId);
+            const canClaimStep = (s) => !isAdmin && !!myStaffId && !!s.role_code && s.assignee_id == null;
           %>
           <% for (const s of workflow.main.concat(workflow.image)) { %>
             <% const editable = canEditStep(s); %>
-            <tr data-step="<%= s.step_code %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
+            <tr data-step="<%= s.step_code %>" data-updated="<%= s.updated_at || '' %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
               <td>
                 <% if (s.track === 'image') { %><span class="muted" style="font-size:11px;">🖼</span> <% } %>
                 <%= s.label %>
@@ -239,7 +241,7 @@
               </td>
               <td>
                 <select class="wf-state" <%= editable ? '' : 'disabled' %>
-                        title="<%= editable ? '' : (s.assignee_name || '他の人') + ' さんの担当です' %>">
+                        title="<%= editable ? '' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')) %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
                     <%# 「対象外」は工程を飛ばすので admin だけ %>
                     <% if (code === 'skip' && !isAdmin && s.state !== 'skip') continue; %>
@@ -261,8 +263,8 @@
                     <% } %>
                   </select>
                 <% } else if (s.assignee_id == null) { %>
-                  <%# 未割り当てなら自分で引き受けられる (放置を防ぐ) %>
-                  <% if (myStaffId) { %>
+                  <%# 未割り当ては引き受けだけ許す。引き受けてから状態を動かす %>
+                  <% if (canClaimStep(s)) { %>
                     <button type="button" class="btn btn-sm wf-claim">自分が担当する</button>
                   <% } else { %>
                     <span class="muted" style="font-size:12px;">未割り当て</span>
@@ -2628,8 +2630,10 @@
       const step = tr.dataset.step;
       out.textContent = '保存中…';
       try {
+        // 画面を開いた時点の updated_at を一緒に送る = 古い画面からの後勝ちをサーバーが弾ける
+        const body = Object.assign({ expected_updated_at: tr.dataset.updated || null }, patch);
         const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/steps/' + encodeURIComponent(step), {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
         const j = await res.json();
         if (!j.ok) {
@@ -2639,6 +2643,8 @@
           if (res.status === 409) location.reload();
           return false;
         }
+        // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
+        if (j.updated_at) tr.dataset.updated = j.updated_at;
         out.textContent = '保存しました';
         return true;
       } catch (e) {

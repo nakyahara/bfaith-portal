@@ -82,25 +82,38 @@ function isRealDate(s) {
  */
 function assertStepPermission(db, row, patch, { isAdmin, actorStaffId }) {
   if (isAdmin) return;
-  if (patch?.state === 'skip') {
-    throw forbidden('「対象外」にできるのは管理者だけです');
-  }
-  const isMine = row.assignee_id != null && row.assignee_id === actorStaffId;
-  const isUnassigned = row.assignee_id == null;
-  if (!isMine && !isUnassigned) {
-    const owner = db.prepare('SELECT name FROM ph_staff WHERE id = ?').get(row.assignee_id);
-    throw forbidden(`この工程は ${owner?.name || '他の人'} さんの担当です。管理者に依頼してください`);
-  }
-  if (patch?.assignee_id !== undefined) {
-    const to = patch.assignee_id === '' || patch.assignee_id == null ? null : Number(patch.assignee_id);
-    // 自分で引き受ける / 自分の担当を外す のみ。他人への付け替えは admin の操作
-    if (to !== null && to !== actorStaffId) {
-      throw forbidden('担当者を他の人に変更できるのは管理者だけです');
+
+  // 自分の担当工程
+  if (row.assignee_id != null && row.assignee_id === actorStaffId) {
+    if (patch?.state === 'skip') throw forbidden('「対象外」にできるのは管理者だけです');
+    if (patch?.assignee_id !== undefined) {
+      const to = patch.assignee_id === '' || patch.assignee_id == null ? null : Number(patch.assignee_id);
+      // 自分の担当を外す (未割り当てに戻す) のは可。他人への付け替えは admin の操作
+      if (to !== null && to !== actorStaffId) throw forbidden('担当者を他の人に変更できるのは管理者だけです');
     }
-    if (to !== null && actorStaffId == null) {
+    return;
+  }
+
+  // 未割り当ての工程: **引き受けだけ**を許す (Codex R2 high)。
+  // 状態や期限をいきなり変えられると「本人 + admin に限定」の方針が崩れ、
+  // 誰がやったのかも残らない。1 クリック増えるが、担当が明確になる方を採る
+  if (row.assignee_id == null) {
+    if (!row.role_code) {
+      // システム工程 (AI待ち)。手で進めるのは例外操作なので管理者に寄せる
+      throw forbidden('この工程はシステムが進めます。手で進める必要があるときは管理者に依頼してください');
+    }
+    if (actorStaffId == null) {
       throw forbidden('あなたのポータルアカウントに担当者が紐づいていません (担当者・工程の画面で設定してください)');
     }
+    const keys = Object.keys(patch || {}).filter((k) => patch[k] !== undefined && k !== 'expected_updated_at');
+    const onlyClaim = keys.length === 1 && keys[0] === 'assignee_id'
+      && Number(patch.assignee_id) === actorStaffId;
+    if (!onlyClaim) throw forbidden('先に「自分が担当する」を押してから操作してください');
+    return;
   }
+
+  const owner = db.prepare('SELECT name FROM ph_staff WHERE id = ?').get(row.assignee_id);
+  throw forbidden(`この工程は ${owner?.name || '他の人'} さんの担当です。管理者に依頼してください`);
 }
 
 /** 役割 → 既定担当者 id。無効化された人は既定から外れている (setStaffActive) */
@@ -285,7 +298,9 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
   const code = String(stepCode || '');
   ensureProgress(db, id);
   const row = db.prepare(`
-    SELECT p.*, s.label FROM draft_step_progress p
+    -- role_code は権限判定に使う (システム工程かどうか)。取り忘れると undefined になり、
+    -- 通常の工程まで「システム工程」と誤判定して一般ユーザーが弾かれる
+    SELECT p.*, s.label, s.role_code FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
@@ -358,13 +373,24 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
 
   if (sets.length === 0) return { changed: false };
 
-  // 状態を変えるときは楽観ロック (Codex R1 medium)。読んだ時点の state を WHERE に入れ、
-  // 別の人が先に動かしていたら書かずに 409 を返す。後勝ちで完了情報が消えるのを防ぐ。
-  // 期限・メモだけの更新は競合しても実害が無いので条件を付けない
-  const where = stateChanged
-    ? 'WHERE draft_id = @draft_id AND step_code = @step_code AND state = @prev_state'
-    : 'WHERE draft_id = @draft_id AND step_code = @step_code';
-  if (stateChanged) params.prev_state = row.state;
+  // 楽観ロック (Codex R1 medium → R2 で強化)。
+  // 画面が表示時に読んだ updated_at を送ってもらい、それを UPDATE の条件にする。
+  // サーバー内で読み直した state を条件にするだけでは、**古い画面から送られた操作**を
+  // 止められない (読み直すと最新値なので必ず一致してしまう)。
+  // expected_updated_at が無い呼び出し (API 直叩き・内部処理) は state ベースに退避する。
+  const expected = patch?.expected_updated_at == null ? null : String(patch.expected_updated_at);
+  const conds = ['draft_id = @draft_id', 'step_code = @step_code'];
+  if (expected) {
+    if (expected !== String(row.updated_at)) {
+      throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
+    }
+    conds.push('updated_at = @expected_updated_at');
+    params.expected_updated_at = expected;
+  } else if (stateChanged) {
+    conds.push('state = @prev_state');
+    params.prev_state = row.state;
+  }
+  const where = `WHERE ${conds.join(' AND ')}`;
 
   // UPDATE と監査ログを 1 トランザクションに閉じる (ログだけ残って本体が失敗する状態を作らない)
   const run = db.transaction(() => {
@@ -379,7 +405,11 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
   if (!run()) {
     throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
   }
-  return { changed: true };
+  // 続けて操作できるよう、新しい updated_at を返す (画面が次の楽観ロックに使う)
+  const fresh = db.prepare(
+    'SELECT updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
+  ).get(id, code);
+  return { changed: true, updated_at: fresh?.updated_at || null };
 }
 
 /**
@@ -405,19 +435,28 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
   // 絞り込みがあるときは **LIMIT の前に** 対象を絞る (Codex R1 medium)。
   // 全件から updated_at 順に 800 件取ってから絞ると、件数が増えたとき古い未完了商品が
   // 「自分の担当」「未割り当て」から消える = 担当漏れを探す画面として役に立たなくなる
+  // 「現在工程」= トラックごとに、未完了 (todo/doing) のうち sort→code が最小の行。
+  // JS 側の currentOf と**同じ並び順**を ROW_NUMBER() で再現する (Codex R2 medium)。
+  // 「未完了工程のどれかを担当している」で絞ると、将来工程だけ担当している商品が
+  // LIMIT を食い潰し、いま担当している古い商品がボードから消える
+  const CURRENT_STEPS = `
+    SELECT draft_id, assignee_id, role_code FROM (
+      SELECT p.draft_id, p.assignee_id, s.role_code,
+             ROW_NUMBER() OVER (PARTITION BY p.draft_id, s.track ORDER BY s.sort, s.code) AS rn
+      FROM draft_step_progress p
+      JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.state IN ('todo', 'doing')
+    ) WHERE rn = 1
+  `;
   let candidateSql = '';
   const candidateParams = [];
   if (assigneeId != null) {
-    candidateSql = `AND EXISTS (
-      SELECT 1 FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
-      WHERE p.draft_id = d.id AND p.assignee_id = ? AND p.state IN ('todo','doing')
-    )`;
+    candidateSql = `AND d.id IN (SELECT draft_id FROM (${CURRENT_STEPS}) WHERE assignee_id = ?)`;
     candidateParams.push(assigneeId);
   } else if (unassignedOnly) {
-    candidateSql = `AND EXISTS (
-      SELECT 1 FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
-      WHERE p.draft_id = d.id AND p.assignee_id IS NULL AND p.state IN ('todo','doing')
-        AND s.role_code IS NOT NULL
+    // システム工程 (担当ロールなし) は「未割り当て」ではないので拾わない
+    candidateSql = `AND d.id IN (
+      SELECT draft_id FROM (${CURRENT_STEPS}) WHERE assignee_id IS NULL AND role_code IS NOT NULL
     )`;
   }
 

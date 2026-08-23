@@ -1905,36 +1905,44 @@ let wfDraftId = null;
   try { wfp.setStepState(id, 'basic_info', { assignee_id: wfOkawaId }, 'tanaka', OWNER); } catch (e) { e3 = e; }
   check('他人への付け替えは admin だけ', e3?.status === 403, e3?.message || '例外が出ていない');
 
-  // 未割り当ての工程は誰でも引き受けられる (放置を防ぐ)
+  // 未割り当ての工程は「引き受け」だけ許す (状態をいきなり変えさせない)
   wfp.setStepState(id, 'set_review', { assignee_id: null }, 'admin', ADMIN);
+  let e4a = null;
+  try { wfp.setStepState(id, 'set_review', { state: 'doing' }, 'okawa', OTHER); } catch (e) { e4a = e; }
+  check('未割り当てでもいきなり状態は変えられない', e4a?.status === 403, e4a?.message || '例外が出ていない');
   check('未割り当ての工程は自分で引き受けられる',
     wfp.setStepState(id, 'set_review', { assignee_id: wfOkawaId }, 'okawa', OTHER).changed === true);
+  check('引き受けたあとは自分で動かせる',
+    wfp.setStepState(id, 'set_review', { state: 'doing' }, 'okawa', OTHER).changed === true);
   let e4 = null;
   try { wfp.setStepState(id, 'set_review', { state: 'done' }, 'tanaka', OWNER); } catch (e) { e4 = e; }
   check('引き受けたあとは他の人が動かせない', e4?.status === 403);
+  let e4b = null;
+  try { wfp.setStepState(id, 'title_approve', { assignee_id: wfTanakaId }, 'okawa', OTHER); } catch (e) { e4b = e; }
+  check('他人を担当に指名はできない (自分の引き受けだけ)', e4b?.status === 403, e4b?.message || '例外が出ていない');
 
-  // システム工程 (AI待ち) は担当者がいないので誰でも手で進められる
-  check('システム工程は誰でも進められる',
-    wfp.setStepState(id, 'ai_generate', { state: 'done' }, 'nobody', NOBODY).changed === true);
+  // システム工程 (AI待ち) は admin だけが手で進められる
+  let e5a = null;
+  try { wfp.setStepState(id, 'ai_generate', { state: 'done' }, 'nobody', NOBODY); } catch (e) { e5a = e; }
+  check('システム工程は一般ユーザーが進められない', e5a?.status === 403, e5a?.message || '例外が出ていない');
+  check('システム工程は admin なら進められる',
+    wfp.setStepState(id, 'ai_generate', { state: 'done' }, 'admin', ADMIN).changed === true);
 
-  // 楽観ロック: 読んだときの state と違えば書かない
-  const cur = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'desc_review'`).get(id);
-  check('前提の状態は未着手', cur.state === 'todo');
-  db.prepare(`UPDATE draft_step_progress SET state = 'doing' WHERE draft_id = ? AND step_code = 'desc_review'`).run(id);
-  // ここで「todo だと思って done にする」操作をぶつける = 別の人が先に doing にした状況
+  // 楽観ロック: 画面が読んだ updated_at を送る → 古い画面からの操作を弾く
+  const beforeRow = db.prepare(
+    `SELECT updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = 'desc_review'`
+  ).get(id);
+  // 別の人が先に動かした状況を作る (updated_at が変わる)
+  const r0 = wfp.setStepState(id, 'desc_review', { state: 'doing' }, 'admin', ADMIN);
+  check('更新すると新しい updated_at が返る', !!r0.updated_at && r0.updated_at !== beforeRow.updated_at);
   let e5 = null;
   try {
-    // setStepState は内部で読み直すので、競合を作るには UPDATE を挟んだ状態で
-    // 同じ state への遷移を試す (state が変わらない → 更新なし) ではなく、
-    // 直接 prev_state 不一致を作るため一度読んでから他所で書き換える必要がある。
-    // ここでは実装の WHERE 句が効いていることを、存在しない状態からの遷移で確認する
-    db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review'`).run(id);
-    const info = db.prepare(`
-      UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review' AND state = 'todo'
-    `).run(id);
-    check('楽観ロックの WHERE が効く (state 不一致なら 0 行)', info.changes === 0);
+    // 古い画面が「まだ未着手のはず」と思って done を送る
+    wfp.setStepState(id, 'desc_review', { state: 'done', expected_updated_at: beforeRow.updated_at }, 'admin', ADMIN);
   } catch (e) { e5 = e; }
-  check('楽観ロック検証で例外が出ない', e5 === null);
+  check('古い画面からの後勝ちを 409 で弾く', e5?.status === 409, e5?.message || '例外が出ていない');
+  check('最新の updated_at を送れば通る',
+    wfp.setStepState(id, 'desc_review', { state: 'done', expected_updated_at: r0.updated_at }, 'admin', ADMIN).changed === true);
 
   // 日付の実在検証
   let e6 = null;

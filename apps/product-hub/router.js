@@ -1619,7 +1619,7 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
     });
-    res.json({ ok: true, changed: r.changed });
+    res.json({ ok: true, changed: r.changed, updated_at: r.updated_at });
   } catch (e) { workflowError(res, e); }
 });
 
