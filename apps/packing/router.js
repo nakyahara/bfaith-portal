@@ -204,7 +204,12 @@ router.get('/batches/:id(\\d+)', async (req, res, next) => {
     // 作業画面と同じく、表示名はNE商品マスタの単品名を優先 (fail-soft)
     const neNames = await neNamesFor(slips.flatMap((s) => s.lines.map((l) => l.sku)));
     for (const s of slips) {
-      for (const l of s.lines) l.ne_name = neNames.get(String(l.sku ?? '').trim()) || null;
+      for (const l of s.lines) {
+        const info = neNames.get(String(l.sku ?? '').trim());
+        l.ne_name = info?.name || null;
+        l.ne_comps = info?.comps || null;
+        l.ne_set_unresolved = !!info?.isSet;
+      }
     }
     res.render(path.join(__dirname, 'views/batch_detail'), {
       title: `${batch.folder_name || batch.tb_key} | 梱包支援`,
@@ -248,7 +253,10 @@ async function decorateSlips(state) {
   for (const s of state.slips) {
     for (const l of s.lines) {
       l.imageUrl = images.get(String(l.sku ?? '').trim().toLowerCase())?.url || null;
-      l.ne_name = neNames.get(String(l.sku ?? '').trim()) || null;
+      const info = neNames.get(String(l.sku ?? '').trim());
+      l.ne_name = info?.name || null;     // 必ず単品名 (セット名は warehouse 側で構造的に排除)
+      l.ne_comps = info?.comps || null;   // セット展開されたときだけ [{sku, name, qty}]
+      l.ne_set_unresolved = !!info?.isSet;   // セットだが展開失敗 → CSV名 (セット名の可能性) を出さない
     }
   }
   return state;
