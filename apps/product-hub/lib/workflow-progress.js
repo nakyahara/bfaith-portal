@@ -332,8 +332,9 @@ export function progressOf(draftId, { db = null } = {}) {
     // 滞留は「いま止まっている工程」だけ見る。過去の工程を今さら赤くしても打ち手がない
     stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
     mainDone: main.length > 0 && !current,
-    // 画像トラック全体の決着 = TOP が済み、詳細も済みか対象外 (出品ゲートと同じ見方)
-    imageDone: imageTop.done && (detailExcluded || kinds.detail.length === 0 || imageDetail.done),
+    // 画像トラック全体の決着 = TOP が済み、詳細も済みか対象外 (出品ゲートと同じ見方)。
+    // 詳細工程 0 件は「済み」に数えない (対象外にしていないなら設定壊れ — Codex R2 high)
+    imageDone: imageTop.done && (detailExcluded || imageDetail.done),
     doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
     totalCount: main.length,
   };
@@ -365,11 +366,16 @@ export function imageTrackBlockReason(db, draftId) {
   if (p.imageTop.rows.every((r) => r.state === 'skip')) {
     return 'TOP画像の工程がすべて「対象外」になっています。TOP画像 (サムネイル) は楽天出品に必須です';
   }
+  // 詳細側も同じ fail-closed (Codex R2 high): 対象外にしていないのに工程が 0 件なら
+  // 「揃っている」ではなく「設定が壊れている」— ここで通すと詳細画像の確認が丸ごと飛ぶ
+  if (!p.detailExcluded && p.imageDetail.rows.length === 0) {
+    return '画像トラック (詳細画像) の工程が見つかりません。詳細画像を作らない商品なら「詳細画像は対象外」にするか、担当者・工程の設定を確認してください';
+  }
   const blocked = [];
   if (!p.imageTop.done) {
     blocked.push(`${IMAGE_KIND_LABELS.top}: ${kindBlockDetail(p.imageTop)}`);
   }
-  if (!p.detailExcluded && p.imageDetail.rows.length > 0 && !p.imageDetail.done) {
+  if (!p.detailExcluded && !p.imageDetail.done) {
     blocked.push(`${IMAGE_KIND_LABELS.detail}: ${kindBlockDetail(p.imageDetail)}`);
   }
   if (blocked.length === 0) return null;
@@ -723,7 +729,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       if (!anyOpen && assigneeId == null && !unassignedOnly) {
         const topSettled = p.imageTop.rows.length > 0 && !p.imageTop.current
           && !p.imageTop.rows.every((r) => r.state === 'skip');
-        const detailSettled = detailExcluded || p.imageDetail.rows.length === 0 || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
+        // 詳細工程 0 件はゲートが拒否するので完了に見せない (Codex R2 high)
+        const detailSettled = detailExcluded || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
         if (topSettled && detailSettled) doneCards.push(baseCard);
       }
       continue;
@@ -812,7 +819,7 @@ export function progressSummaryFor(db, draftIds) {
       imageTop,
       imageDetail,
       detailExcluded,
-      imageDone: imageTop.done && (detailExcluded || kinds.detail.length === 0 || imageDetail.done),
+      imageDone: imageTop.done && (detailExcluded || imageDetail.done),
       stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
       doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
       totalCount: main.length,

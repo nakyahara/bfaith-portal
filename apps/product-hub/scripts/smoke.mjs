@@ -2050,6 +2050,11 @@ let wfDraftId = null;
   check('TOP工程が無い設定壊れではゲートを閉じる (fail-closed)',
     /TOP画像.*見つかりません/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
   db.prepare(`UPDATE ph_steps SET active = 1 WHERE image_kind = 'top' AND builtin = 1`).run();
+  // 詳細側の工程 0 件も同じく fail-closed (対象外にしていない限り — Codex R2 high)
+  db.prepare(`UPDATE ph_steps SET active = 0 WHERE image_kind = 'detail'`).run();
+  check('詳細工程が無い設定壊れでもゲートを閉じる (fail-closed)',
+    /詳細画像.*見つかりません/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
+  db.prepare(`UPDATE ph_steps SET active = 1 WHERE image_kind = 'detail' AND builtin = 1`).run();
 
   // 「詳細画像は対象外」(商品単位フラグ): TOP の承認だけでゲートが開く
   wfp.setDetailImagesExcluded(idGate, true, 'admin', ADMIN);
