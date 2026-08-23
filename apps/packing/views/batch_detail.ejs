@@ -75,9 +75,9 @@
           <% for (const l of s.lines) { %>
             <tr>
               <td><%= l.sku %></td>
-              <td><%= l.ne_name || l.product_name || l.print_name %>
-                <% const dispName = l.ne_name || l.product_name; if (dispName && l.print_name && l.print_name.trim() !== dispName.trim()) { %>
-                  <div class="muted" style="font-size:.82em">印字: <%= l.print_name %></div>
+              <td><%= l.ne_name || (l.ne_set_unresolved ? '⚠ 商品名未解決 (セット構成を確認)' : (l.product_name || '(商品名なし)')) %>
+                <% if (l.ne_comps) { %>
+                  <div class="muted" style="font-size:.82em">セット構成: <%= l.ne_comps.map((c) => `${c.sku}×${c.qty}`).join(' / ') %></div>
                 <% } %>
               </td>
               <td class="num <%= l.qty >= 2 ? 'qty2' : '' %>"><%= l.qty %> 個</td>

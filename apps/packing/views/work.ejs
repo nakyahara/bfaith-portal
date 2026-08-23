@@ -331,8 +331,11 @@
         siteOrderNo: s.site_order_no, orderDate: s.order_date,
         deliveryDate: s.delivery_date, deliveryTime: s.delivery_time,
         lines: s.lines.map((l) => ({
-          // 商品名はNE商品マスタの単品名を最優先 (印字名はセット品受注でモールSEO長文になるため最後)
-          sku: l.sku, name: l.ne_name || l.product_name || l.print_name, qty: l.qty, imageUrl: l.imageUrl,
+          // 商品名は必ずNE商品マスタの単品名 (🚨セット名は使わない)。セットで展開に失敗したものは
+          // CSV名へ戻さず未解決表示。API不達/未登録はCSVの「商品名」列 (=NE単品名) へ。
+          // 印字商品名 (モール名・セットSEO長文) は表示に一切使わない
+          sku: l.sku, qty: l.qty, imageUrl: l.imageUrl,
+          name: l.ne_name || (l.ne_set_unresolved ? '⚠ 商品名未解決 (セット構成を確認)' : (l.product_name || '(商品名なし)')),
           shortName: l.short_name,   // 送り状備考1 = 読み上げ短縮名の第一候補 (要件§5.3)
         })),
       })),
