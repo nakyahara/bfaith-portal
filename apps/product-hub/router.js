@@ -24,6 +24,9 @@ import {
   listRoles, createRole, updateRole,
   listSteps, createStep, updateStep, workflowOverview,
 } from './lib/workflow.js';
+import {
+  progressOf, setStepState, progressSummaryFor, ensureProgressForMany, STEP_STATE_LABELS,
+} from './lib/workflow-progress.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -151,10 +154,14 @@ router.get('/', (req, res) => {
   `).all(...params);
   // NE 判定は一覧では 2 クエリで一括解決する (行ごとに引くと N+1 になる)
   const variations = resolveVariationGroupsBatch(db, drafts.map((d) => d.ne_code));
+  // 工程の進捗 (いま誰のボールか)。表示対象のうち行が足りないものだけ自己修復してから引く
+  ensureProgressForMany(db, drafts.map((d) => d.id));
+  const wfSummary = progressSummaryFor(db, drafts.map((d) => d.id));
   for (const d of drafts) {
     d.thumb = d.first_image_id ? thumbnailUrl(d.first_image_id, 160, d.first_image_mtime) : null;
     d.variation = variations.get(String(d.ne_code || '').trim().toLowerCase())
       || { kind: 'unknown', groupKey: d.ne_code, memberCount: 0, isChild: false };
+    d.workflow = wfSummary.get(d.id) || null;
   }
 
   res.render(view('index.ejs'), {
@@ -270,6 +277,10 @@ router.get('/detail/:id', (req, res) => {
     shippingGroups: SHIPPING_METHOD_GROUPS,
     yahooOverrideGroups: YAHOO_OVERRIDE_SHIPPING_GROUPS,
     trailingBanners,
+    // 工程パネル (誰のボールか)。行が無ければ表示時に自己修復で作られる
+    workflow: progressOf(draft.id, { db }),
+    workflowStaff: listStaff(),
+    stepStateLabels: STEP_STATE_LABELS,
   });
 });
 
@@ -1567,6 +1578,18 @@ router.post('/api/steps/:code', (req, res) => {
   try {
     updateStep(req.params.code, req.body || {});
     res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 工程の進捗更新 (状態・担当者・期限・メモ)。
+// **admin 限定にしない** — 自分の工程を「完了」にするのは作業者本人の操作なので、
+// 管理者しか押せないと運用が回らない。誰が押したかは draft_events に残る
+router.post('/api/drafts/:id/steps/:code', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const r = setStepState(draft.id, req.params.code, req.body || {}, actorOf(req));
+    res.json({ ok: true, changed: r.changed });
   } catch (e) { workflowError(res, e); }
 });
 

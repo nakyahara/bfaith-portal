@@ -503,6 +503,27 @@ export function initProductHubDB() {
     );
     CREATE INDEX IF NOT EXISTS idx_ph_steps_track ON ph_steps(track, sort);
 
+    -- 商品 × 工程の進捗。「いま誰のボールか」の実体。
+    -- 行は表示時に自己修復で作る (ensureProgress) — 工程を後から足しても既存ドラフトに行き渡る。
+    -- state: todo=未着手 / doing=作業中 / done=完了 / skip=この商品では不要
+    CREATE TABLE IF NOT EXISTS draft_step_progress (
+      draft_id    INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      step_code   TEXT NOT NULL REFERENCES ph_steps(code),
+      state       TEXT NOT NULL DEFAULT 'todo' CHECK (state IN ('todo', 'doing', 'done', 'skip')),
+      -- 担当者は工程の既定担当を初期値に入れ、商品ごとに差し替えられる (NULL = 未割り当て)
+      assignee_id INTEGER REFERENCES ph_staff(id),
+      due_date    TEXT,
+      started_at  TEXT,
+      done_at     TEXT,
+      done_by     TEXT,                          -- 完了操作をした人 (ポータルのログイン)
+      note        TEXT,
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, step_code)
+    );
+    -- 列 (工程) 別・担当者別の絞り込みがかんばんの主クエリなので、両方に索引を張る
+    CREATE INDEX IF NOT EXISTS idx_dsp_step ON draft_step_progress(step_code, state);
+    CREATE INDEX IF NOT EXISTS idx_dsp_assignee ON draft_step_progress(assignee_id, state);
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)

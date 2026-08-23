@@ -1749,6 +1749,113 @@ const wf = await import('../lib/workflow.js');
   check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 3);
 }
 
+// ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
+const wfp = await import('../lib/workflow-progress.js');
+const wfTanakaId = wf.listStaff().find((s) => s.name === '田中美祐').id;
+const wfOkawaId = wf.listStaff().find((s) => s.name === '大川さん').id;
+// 上のブロックで一度無効化したため既定が外れている (無効化で既定を落とす仕様)。
+// 有効化しても既定は自動で戻らない = 管理画面で付け直す運用なので、ここでも付け直す
+wf.setStaffRoles(wfTanakaId, [{ code: 'registrar', isDefault: true }, { code: 'image', isDefault: true }]);
+let wfDraftId = null;
+{
+  const mk = (code, status) => Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES (?, ?, ?, 'smoke')`
+  ).run(code, `工程テスト ${code}`, status).lastInsertRowid);
+
+  // 旧 status からの初期化 (既存ドラフトが全部先頭列に固まらないようにする推定)
+  const idReview = mk('WF-REVIEW', 'review');
+  wfDraftId = idReview;
+  const p = wfp.progressOf(idReview, { db });
+  check('初期化: review なら基本情報とAI待ちが done',
+    p.main.find((s) => s.step_code === 'basic_info').state === 'done'
+    && p.main.find((s) => s.step_code === 'ai_generate').state === 'done');
+  check('初期化: 現在工程は商品説明確認', p.current?.step_code === 'desc_review');
+  check('初期化: 進捗カウント 2/6', p.doneCount === 2 && p.totalCount === 6);
+  check('初期化: 画像が無ければ画像トラックは未着手', p.image.every((s) => s.state === 'todo'));
+  check('既定担当が自動で入る', p.current.assignee_id === wfTanakaId);
+  check('画像工程の担当は画像登録者の既定', p.image[0].assignee_id === wfTanakaId);
+  check('システム工程には担当者を置かない', p.main.find((s) => s.step_code === 'ai_generate').assignee_id === null);
+
+  // 画像が登録済みなら画像トラックは終わっているとみなす (外注への二重依頼を防ぐ)
+  const idListed = mk('WF-LISTED', 'listed');
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'wf-img-1', 0)`).run(idListed);
+  const pl = wfp.progressOf(idListed, { db });
+  check('初期化: 画像があれば画像トラックは done', pl.imageDone === true);
+  check('初期化: listed なら残りは出品・展開', pl.current?.step_code === 'listing');
+
+  // 工程を進める
+  const r1 = wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke@b-faith.biz');
+  check('工程を完了にできる', r1.changed === true);
+  const p2 = wfp.progressOf(idReview, { db });
+  check('完了すると次の工程にボールが移る', p2.current?.step_code === 'title_approve');
+  check('完了者と完了日時が残る',
+    p2.main.find((s) => s.step_code === 'desc_review').done_by === 'smoke@b-faith.biz'
+    && !!p2.main.find((s) => s.step_code === 'desc_review').done_at);
+  check('工程の変更が監査ログに残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'step_changed'`).get(idReview).c > 0);
+
+  // 差し戻し
+  wfp.setStepState(idReview, 'desc_review', { state: 'todo' }, 'smoke@b-faith.biz');
+  const p3 = wfp.progressOf(idReview, { db });
+  check('差し戻すと完了の痕跡が消える',
+    p3.main.find((s) => s.step_code === 'desc_review').done_at === null
+    && p3.main.find((s) => s.step_code === 'desc_review').done_by === null);
+  check('差し戻すとボールが戻る', p3.current?.step_code === 'desc_review');
+
+  // 「対象外」はボールを止めない (セット検討が不要な商品など)
+  wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke');
+  wfp.setStepState(idReview, 'title_approve', { state: 'skip' }, 'smoke');
+  check('対象外にした工程は飛ばされる', wfp.progressOf(idReview, { db }).current?.step_code === 'set_review');
+
+  // 担当者の付け替え
+  check('担当者を変えられる', wfp.setStepState(idReview, 'set_review', { assignee_id: wfOkawaId }, 'smoke').changed === true);
+  check('未割り当てに戻せる', wfp.setStepState(idReview, 'set_review', { assignee_id: '' }, 'smoke').changed === true);
+  let asgErr = null;
+  try { wfp.setStepState(idReview, 'set_review', { assignee_id: 999999 }, 'smoke'); } catch (e) { asgErr = e; }
+  check('存在しない担当者は弾く', asgErr?.status === 400);
+  // 無効化した人を新たに割り当てさせない (退職者に仕事を振らない)
+  const ghost = wf.createStaff({ name: '退職者さん' });
+  wf.setStaffActive(ghost, false);
+  let offErr = null;
+  try { wfp.setStepState(idReview, 'set_review', { assignee_id: ghost }, 'smoke'); } catch (e) { offErr = e; }
+  check('無効化した担当者は割り当てられない', offErr?.status === 400, offErr?.message || '例外が出ていない');
+
+  // 期限・メモ
+  let dueErr = null;
+  try { wfp.setStepState(idReview, 'set_review', { due_date: '2026/09/01' }, 'smoke'); } catch (e) { dueErr = e; }
+  check('期限の形式を検証する', dueErr?.status === 400);
+  wfp.setStepState(idReview, 'set_review', { due_date: '2026-09-01', note: 'セット候補あり' }, 'smoke');
+  const p4 = wfp.progressOf(idReview, { db });
+  check('期限とメモを保存できる',
+    p4.main.find((s) => s.step_code === 'set_review').due_date === '2026-09-01'
+    && p4.main.find((s) => s.step_code === 'set_review').note === 'セット候補あり');
+
+  // 滞留の検知 (AI待ちは 3 日で警告)。前工程の完了日時を 5 日前にずらして再現する
+  const idStall = mk('WF-STALL', 'ready_for_ai');
+  wfp.progressOf(idStall, { db });
+  db.prepare(`UPDATE draft_step_progress SET done_at = ? WHERE draft_id = ? AND step_code = 'basic_info'`)
+    .run(new Date(Date.now() - 5 * 86400000).toISOString(), idStall);
+  const ps = wfp.progressOf(idStall, { db });
+  check('滞留日数が出る (AI待ち5日)', ps.stalledDays === 5, `= ${ps.stalledDays}`);
+  check('滞留していない工程は null', wfp.progressOf(idListed, { db }).stalledDays === null);
+
+  // 一括自己修復: 足りないものだけ直す
+  db.prepare('DELETE FROM draft_step_progress WHERE draft_id = ?').run(idStall);
+  const fixed = wfp.ensureProgressForMany(db, [idReview, idListed, idStall]);
+  check('不足しているドラフトだけ修復する', fixed === 1, `= ${fixed}`);
+  check('修復後も工程が揃う', wfp.progressOf(idStall, { db }).totalCount === 6);
+
+  // 工程を後から足しても既存ドラフトに行き渡る (推定 done は初回だけ = 過去分を勝手に完了にしない)
+  const added = wf.createStep({ label: '検品', track: 'main', role_code: 'registrar' });
+  wfp.ensureProgressForMany(db, [idReview]);
+  const p5 = wfp.progressOf(idReview, { db });
+  check('後から足した工程が既存ドラフトに追加される', p5.main.some((s) => s.step_code === added));
+  check('後から足した工程は未着手で入る (勝手にdoneにしない)',
+    p5.main.find((s) => s.step_code === added).state === 'todo');
+  wf.updateStep(added, { active: false });
+  check('工程を無効化すると進捗からも消える', !wfp.progressOf(idReview, { db }).main.some((s) => s.step_code === added));
+}
+
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
 const views = path.join(__dirname, '..', 'views');
 const statuses = dbmod.DRAFT_STATUSES;
@@ -1765,6 +1872,11 @@ const pageInfoVars = {
 const draftRow = {
   ...after, thumb: 'https://drive.google.com/thumbnail?id=x&sz=w160', first_image_id: 'x',
   variation: { kind: 'single', groupKey: after.ne_code, memberCount: 0, isChild: false },
+  // 一覧の「工程 / 担当」列。担当者あり・停滞ありの分岐まで描かせる
+  workflow: {
+    ...wfp.progressSummaryFor(db, [wfDraftId]).get(wfDraftId),
+    stalledDays: 9,
+  },
 };
 // 詳細画面のバリエーションカードは 3 分岐 × 子SKU有無を全部描かせる
 const variationFixtures = {
@@ -2439,6 +2551,10 @@ for (const [name, file, data] of renders) {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
+        // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
+        workflow: wfp.progressOf(wfDraftId, { db }),
+        workflowStaff: wf.listStaff(),
+        stepStateLabels: wfp.STEP_STATE_LABELS,
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),
