@@ -44,13 +44,74 @@ function badRequest(message) {
   return e;
 }
 
+function forbidden(message) {
+  const e = new Error(message);
+  e.status = 403;
+  return e;
+}
+
+/** 競合 (別の人が先に動かした)。画面は読み直しを促す */
+function conflict(message) {
+  const e = new Error(message);
+  e.status = 409;
+  return e;
+}
+
 const nowIso = () => new Date().toISOString();
+
+/** YYYY-MM-DD かつ実在する日付か (2026-99-99 や 2026-02-31 を弾く) */
+function isRealDate(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return false;
+  const y = Number(m[1]); const mo = Number(m[2]); const d = Number(m[3]);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+/**
+ * 工程を操作してよいか (Codex R1 high)。
+ *
+ * 2026-08-23 中原さん確認: **外注は契約終了済みで、担当者は全員ポータルにログインする**。
+ * したがって「担当者本人か admin だけが動かせる」で運用が回る。
+ *   - admin            … 全部できる (代理で進める・担当を付け替える・対象外にする)
+ *   - 担当者本人        … 状態 (未着手/作業中/完了)・期限・メモ。対象外と他人への付け替えは不可
+ *   - 未割り当ての工程  … 誰でも「自分が担当する」形で引き受けられる (放置を防ぐ)
+ *   - 他人の担当工程    … 触れない
+ * 誰の担当でもないシステム工程 (AI待ち) は、生成が終わったのに進まないときに
+ * 人が手で進められるよう、未割り当てと同じ扱いにする。
+ */
+function assertStepPermission(db, row, patch, { isAdmin, actorStaffId }) {
+  if (isAdmin) return;
+  if (patch?.state === 'skip') {
+    throw forbidden('「対象外」にできるのは管理者だけです');
+  }
+  const isMine = row.assignee_id != null && row.assignee_id === actorStaffId;
+  const isUnassigned = row.assignee_id == null;
+  if (!isMine && !isUnassigned) {
+    const owner = db.prepare('SELECT name FROM ph_staff WHERE id = ?').get(row.assignee_id);
+    throw forbidden(`この工程は ${owner?.name || '他の人'} さんの担当です。管理者に依頼してください`);
+  }
+  if (patch?.assignee_id !== undefined) {
+    const to = patch.assignee_id === '' || patch.assignee_id == null ? null : Number(patch.assignee_id);
+    // 自分で引き受ける / 自分の担当を外す のみ。他人への付け替えは admin の操作
+    if (to !== null && to !== actorStaffId) {
+      throw forbidden('担当者を他の人に変更できるのは管理者だけです');
+    }
+    if (to !== null && actorStaffId == null) {
+      throw forbidden('あなたのポータルアカウントに担当者が紐づいていません (担当者・工程の画面で設定してください)');
+    }
+  }
+}
 
 /** 役割 → 既定担当者 id。無効化された人は既定から外れている (setStaffActive) */
 function defaultAssigneeByRole(db) {
   const rows = db.prepare(`
     SELECT sr.role_code, sr.staff_id
-    FROM ph_staff_roles sr JOIN ph_staff s ON s.id = sr.staff_id AND s.active = 1
+    FROM ph_staff_roles sr
+    JOIN ph_staff s ON s.id = sr.staff_id AND s.active = 1
+    -- 無効化された役割の既定担当は自動割り当てに使わない (Codex R1 medium:
+    -- 画面の候補からは消えているのに新しい進捗にだけ入り続ける、という食い違いを防ぐ)
+    JOIN ph_roles r ON r.code = sr.role_code AND r.active = 1
     WHERE sr.is_default = 1
   `).all();
   return new Map(rows.map((r) => [r.role_code, r.staff_id]));
@@ -130,6 +191,22 @@ export function ensureProgressForMany(db, draftIds) {
   return fixed;
 }
 
+/**
+ * 進捗行が 1 つも無いドラフトを埋める (ボードの絞り込みの前提)。
+ * 保留・除外はボードに載せないので対象外。初回だけまとまった件数になるが、
+ * 2 回目以降は該当 0 件なので 1 クエリで終わる。
+ */
+export function ensureMissingProgress(db, limit = 3000) {
+  const ids = db.prepare(`
+    SELECT d.id FROM product_drafts d
+    WHERE d.status NOT IN ('on_hold', 'excluded')
+      AND NOT EXISTS (SELECT 1 FROM draft_step_progress p WHERE p.draft_id = d.id)
+    LIMIT ?
+  `).all(limit).map((r) => r.id);
+  for (const id of ids) ensureProgress(db, id);
+  return ids.length;
+}
+
 /** state が done / skip でない最初の行 = いま進める番の工程 (全部終わっていれば null) */
 function currentOf(rows) {
   return rows.find((r) => r.state !== 'done' && r.state !== 'skip') || null;
@@ -202,7 +279,7 @@ export function progressOf(draftId, { db = null } = {}) {
  * 工程の状態・担当者・メモを更新する。
  * done にした時刻と操作者を残すのは、あとで「この工程は誰が何日で回しているか」を測るため。
  */
-export function setStepState(draftId, stepCode, patch, actor) {
+export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false, actorStaffId = null } = {}) {
   const db = getDB();
   const id = Number(draftId);
   const code = String(stepCode || '');
@@ -213,15 +290,18 @@ export function setStepState(draftId, stepCode, patch, actor) {
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
   if (!row) throw badRequest('この商品にその工程がありません');
+  assertStepPermission(db, row, patch, { isAdmin, actorStaffId });
 
   const sets = [];
   const params = { draft_id: id, step_code: code };
   let event = null;
+  let stateChanged = false;
 
   if (patch?.state !== undefined) {
     const state = String(patch.state);
     if (!STEP_STATES.includes(state)) throw badRequest('状態の指定が不正です');
     if (state !== row.state) {
+      stateChanged = true;
       sets.push('state = @state');
       params.state = state;
       // 作業中に入った時刻は最初の 1 回だけ記録する (往復しても起点を失わない)
@@ -270,17 +350,35 @@ export function setStepState(draftId, stepCode, patch, actor) {
 
   if (patch?.due_date !== undefined) {
     const due = String(patch.due_date == null ? '' : patch.due_date).trim();
-    if (due !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(due)) throw badRequest('期限は YYYY-MM-DD で指定してください');
+    // 書式だけでなく実在日付かも見る。2026-02-31 のような値は期限警告と並び替えを狂わせる
+    if (due !== '' && !isRealDate(due)) throw badRequest('期限は実在する日付を YYYY-MM-DD で指定してください');
     sets.push('due_date = @due_date');
     params.due_date = due === '' ? null : due;
   }
 
   if (sets.length === 0) return { changed: false };
-  db.prepare(`
-    UPDATE draft_step_progress SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE draft_id = @draft_id AND step_code = @step_code
-  `).run(params);
-  if (event) logEvent(db, id, 'step_changed', event, actor);
+
+  // 状態を変えるときは楽観ロック (Codex R1 medium)。読んだ時点の state を WHERE に入れ、
+  // 別の人が先に動かしていたら書かずに 409 を返す。後勝ちで完了情報が消えるのを防ぐ。
+  // 期限・メモだけの更新は競合しても実害が無いので条件を付けない
+  const where = stateChanged
+    ? 'WHERE draft_id = @draft_id AND step_code = @step_code AND state = @prev_state'
+    : 'WHERE draft_id = @draft_id AND step_code = @step_code';
+  if (stateChanged) params.prev_state = row.state;
+
+  // UPDATE と監査ログを 1 トランザクションに閉じる (ログだけ残って本体が失敗する状態を作らない)
+  const run = db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE draft_step_progress SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      ${where}
+    `).run(params);
+    if (info.changes !== 1) return false;
+    if (event) logEvent(db, id, 'step_changed', event, actor);
+    return true;
+  });
+  if (!run()) {
+    throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
+  }
   return { changed: true };
 }
 
@@ -299,6 +397,30 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
     SELECT code, label, track, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
   `).all();
+
+  // 進捗行がまだ 1 つも無いドラフトを先に埋める。これをやらないと、下の絞り込みが
+  // draft_step_progress を見る以上、新規ドラフトが「自分のボール」に永久に出てこない
+  ensureMissingProgress(db);
+
+  // 絞り込みがあるときは **LIMIT の前に** 対象を絞る (Codex R1 medium)。
+  // 全件から updated_at 順に 800 件取ってから絞ると、件数が増えたとき古い未完了商品が
+  // 「自分の担当」「未割り当て」から消える = 担当漏れを探す画面として役に立たなくなる
+  let candidateSql = '';
+  const candidateParams = [];
+  if (assigneeId != null) {
+    candidateSql = `AND EXISTS (
+      SELECT 1 FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = d.id AND p.assignee_id = ? AND p.state IN ('todo','doing')
+    )`;
+    candidateParams.push(assigneeId);
+  } else if (unassignedOnly) {
+    candidateSql = `AND EXISTS (
+      SELECT 1 FROM draft_step_progress p JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = d.id AND p.assignee_id IS NULL AND p.state IN ('todo','doing')
+        AND s.role_code IS NOT NULL
+    )`;
+  }
+
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at,
@@ -306,12 +428,14 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
+    ${candidateSql}
     ORDER BY d.updated_at DESC
     LIMIT ?
-  `).all(limit + 1);
+  `).all(...candidateParams, limit + 1);
   const truncated = drafts.length > limit;
   if (truncated) drafts.length = limit;
 
+  // 工程を後から足した場合の穴埋め (行はあるが足りないケース)
   ensureProgressForMany(db, drafts.map((d) => d.id));
   const summary = progressSummaryFor(db, drafts.map((d) => d.id));
 

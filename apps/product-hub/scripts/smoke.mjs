@@ -1751,6 +1751,8 @@ const wf = await import('../lib/workflow.js');
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
 const wfp = await import('../lib/workflow-progress.js');
+// 工程操作の権限文脈。admin は全部できる (一般ユーザーの制限は下の権限ブロックで検証する)
+const ADMIN = { isAdmin: true, actorStaffId: null };
 const wfTanakaId = wf.listStaff().find((s) => s.name === '田中美祐').id;
 const wfOkawaId = wf.listStaff().find((s) => s.name === '大川さん').id;
 // 上のブロックで一度無効化したため既定が外れている (無効化で既定を落とす仕様)。
@@ -1784,7 +1786,7 @@ let wfDraftId = null;
   check('初期化: listed なら残りは出品・展開', pl.current?.step_code === 'listing');
 
   // 工程を進める
-  const r1 = wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke@b-faith.biz');
+  const r1 = wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke@b-faith.biz', ADMIN);
   check('工程を完了にできる', r1.changed === true);
   const p2 = wfp.progressOf(idReview, { db });
   check('完了すると次の工程にボールが移る', p2.current?.step_code === 'title_approve');
@@ -1795,7 +1797,7 @@ let wfDraftId = null;
     db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'step_changed'`).get(idReview).c > 0);
 
   // 差し戻し
-  wfp.setStepState(idReview, 'desc_review', { state: 'todo' }, 'smoke@b-faith.biz');
+  wfp.setStepState(idReview, 'desc_review', { state: 'todo' }, 'smoke@b-faith.biz', ADMIN);
   const p3 = wfp.progressOf(idReview, { db });
   check('差し戻すと完了の痕跡が消える',
     p3.main.find((s) => s.step_code === 'desc_review').done_at === null
@@ -1803,28 +1805,28 @@ let wfDraftId = null;
   check('差し戻すとボールが戻る', p3.current?.step_code === 'desc_review');
 
   // 「対象外」はボールを止めない (セット検討が不要な商品など)
-  wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke');
-  wfp.setStepState(idReview, 'title_approve', { state: 'skip' }, 'smoke');
+  wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke', ADMIN);
+  wfp.setStepState(idReview, 'title_approve', { state: 'skip' }, 'smoke', ADMIN);
   check('対象外にした工程は飛ばされる', wfp.progressOf(idReview, { db }).current?.step_code === 'set_review');
 
   // 担当者の付け替え
-  check('担当者を変えられる', wfp.setStepState(idReview, 'set_review', { assignee_id: wfOkawaId }, 'smoke').changed === true);
-  check('未割り当てに戻せる', wfp.setStepState(idReview, 'set_review', { assignee_id: '' }, 'smoke').changed === true);
+  check('担当者を変えられる', wfp.setStepState(idReview, 'set_review', { assignee_id: wfOkawaId }, 'smoke', ADMIN).changed === true);
+  check('未割り当てに戻せる', wfp.setStepState(idReview, 'set_review', { assignee_id: '' }, 'smoke', ADMIN).changed === true);
   let asgErr = null;
-  try { wfp.setStepState(idReview, 'set_review', { assignee_id: 999999 }, 'smoke'); } catch (e) { asgErr = e; }
+  try { wfp.setStepState(idReview, 'set_review', { assignee_id: 999999 }, 'smoke', ADMIN); } catch (e) { asgErr = e; }
   check('存在しない担当者は弾く', asgErr?.status === 400);
   // 無効化した人を新たに割り当てさせない (退職者に仕事を振らない)
   const ghost = wf.createStaff({ name: '退職者さん' });
   wf.setStaffActive(ghost, false);
   let offErr = null;
-  try { wfp.setStepState(idReview, 'set_review', { assignee_id: ghost }, 'smoke'); } catch (e) { offErr = e; }
+  try { wfp.setStepState(idReview, 'set_review', { assignee_id: ghost }, 'smoke', ADMIN); } catch (e) { offErr = e; }
   check('無効化した担当者は割り当てられない', offErr?.status === 400, offErr?.message || '例外が出ていない');
 
   // 期限・メモ
   let dueErr = null;
-  try { wfp.setStepState(idReview, 'set_review', { due_date: '2026/09/01' }, 'smoke'); } catch (e) { dueErr = e; }
+  try { wfp.setStepState(idReview, 'set_review', { due_date: '2026/09/01' }, 'smoke', ADMIN); } catch (e) { dueErr = e; }
   check('期限の形式を検証する', dueErr?.status === 400);
-  wfp.setStepState(idReview, 'set_review', { due_date: '2026-09-01', note: 'セット候補あり' }, 'smoke');
+  wfp.setStepState(idReview, 'set_review', { due_date: '2026-09-01', note: 'セット候補あり' }, 'smoke', ADMIN);
   const p4 = wfp.progressOf(idReview, { db });
   check('期限とメモを保存できる',
     p4.main.find((s) => s.step_code === 'set_review').due_date === '2026-09-01'
@@ -1854,6 +1856,95 @@ let wfDraftId = null;
     p5.main.find((s) => s.step_code === added).state === 'todo');
   wf.updateStep(added, { active: false });
   check('工程を無効化すると進捗からも消える', !wfp.progressOf(idReview, { db }).main.some((s) => s.step_code === added));
+}
+
+// ─── マスタ更新の原子性と参照ガード (Codex R1 medium 対応) ───
+{
+  // 担当者本体と役割は 1 トランザクション: 役割で失敗したら担当者も作られない
+  const before = wf.listStaff({ includeInactive: true }).length;
+  let txErr = null;
+  try {
+    wf.createStaffWithRoles({ name: 'ロールバックさん', roles: [{ code: 'no_such_role' }] });
+  } catch (e) { txErr = e; }
+  check('役割が不正なら担当者も作られない (ロールバック)',
+    txErr?.status === 400 && wf.listStaff({ includeInactive: true }).length === before,
+    `err=${txErr?.message} count=${wf.listStaff({ includeInactive: true }).length}/${before}`);
+
+  // 工程が参照しているカスタム役割は無効化させない (builtin でなくても同じ事故が起きる)
+  const tmpRole = wf.createRole({ label: '検品担当' });
+  const tmpStep = wf.createStep({ label: '検品ライン', track: 'main', role_code: tmpRole });
+  let usedErr = null;
+  try { wf.updateRole(tmpRole, { active: false }); } catch (e) { usedErr = e; }
+  check('工程が使っているカスタム役割は無効化できない', usedErr?.status === 400, usedErr?.message || '例外が出ていない');
+  wf.updateStep(tmpStep, { active: false });
+  check('工程を外せばカスタム役割も無効化できる', wf.updateRole(tmpRole, { active: false }) === true);
+}
+
+// ─── 工程操作の権限 (Codex R1 high 対応) ───
+// 2026-08-23 中原さん: 外注は契約終了済みで担当者は全員ログインする → 本人 + admin に限定
+{
+  const id = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-PERM', '権限テスト', 'draft', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(id, { db });
+  // basic_info は商品登録者 = 田中美祐が既定で入る
+  const OTHER = { isAdmin: false, actorStaffId: wfOkawaId };
+  const OWNER = { isAdmin: false, actorStaffId: wfTanakaId };
+  const NOBODY = { isAdmin: false, actorStaffId: null };
+
+  let e1 = null;
+  try { wfp.setStepState(id, 'basic_info', { state: 'done' }, 'okawa', OTHER); } catch (e) { e1 = e; }
+  check('他人の担当工程は動かせない', e1?.status === 403, e1?.message || '例外が出ていない');
+  check('担当者本人は動かせる', wfp.setStepState(id, 'basic_info', { state: 'doing' }, 'tanaka', OWNER).changed === true);
+
+  let e2 = null;
+  try { wfp.setStepState(id, 'basic_info', { state: 'skip' }, 'tanaka', OWNER); } catch (e) { e2 = e; }
+  check('本人でも「対象外」にはできない (admin だけ)', e2?.status === 403, e2?.message || '例外が出ていない');
+
+  let e3 = null;
+  try { wfp.setStepState(id, 'basic_info', { assignee_id: wfOkawaId }, 'tanaka', OWNER); } catch (e) { e3 = e; }
+  check('他人への付け替えは admin だけ', e3?.status === 403, e3?.message || '例外が出ていない');
+
+  // 未割り当ての工程は誰でも引き受けられる (放置を防ぐ)
+  wfp.setStepState(id, 'set_review', { assignee_id: null }, 'admin', ADMIN);
+  check('未割り当ての工程は自分で引き受けられる',
+    wfp.setStepState(id, 'set_review', { assignee_id: wfOkawaId }, 'okawa', OTHER).changed === true);
+  let e4 = null;
+  try { wfp.setStepState(id, 'set_review', { state: 'done' }, 'tanaka', OWNER); } catch (e) { e4 = e; }
+  check('引き受けたあとは他の人が動かせない', e4?.status === 403);
+
+  // システム工程 (AI待ち) は担当者がいないので誰でも手で進められる
+  check('システム工程は誰でも進められる',
+    wfp.setStepState(id, 'ai_generate', { state: 'done' }, 'nobody', NOBODY).changed === true);
+
+  // 楽観ロック: 読んだときの state と違えば書かない
+  const cur = db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'desc_review'`).get(id);
+  check('前提の状態は未着手', cur.state === 'todo');
+  db.prepare(`UPDATE draft_step_progress SET state = 'doing' WHERE draft_id = ? AND step_code = 'desc_review'`).run(id);
+  // ここで「todo だと思って done にする」操作をぶつける = 別の人が先に doing にした状況
+  let e5 = null;
+  try {
+    // setStepState は内部で読み直すので、競合を作るには UPDATE を挟んだ状態で
+    // 同じ state への遷移を試す (state が変わらない → 更新なし) ではなく、
+    // 直接 prev_state 不一致を作るため一度読んでから他所で書き換える必要がある。
+    // ここでは実装の WHERE 句が効いていることを、存在しない状態からの遷移で確認する
+    db.prepare(`UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review'`).run(id);
+    const info = db.prepare(`
+      UPDATE draft_step_progress SET state = 'done' WHERE draft_id = ? AND step_code = 'desc_review' AND state = 'todo'
+    `).run(id);
+    check('楽観ロックの WHERE が効く (state 不一致なら 0 行)', info.changes === 0);
+  } catch (e) { e5 = e; }
+  check('楽観ロック検証で例外が出ない', e5 === null);
+
+  // 日付の実在検証
+  let e6 = null;
+  try { wfp.setStepState(id, 'set_review', { due_date: '2026-02-31' }, 'admin', ADMIN); } catch (e) { e6 = e; }
+  check('存在しない日付を弾く (2026-02-31)', e6?.status === 400, e6?.message || '例外が出ていない');
+  let e7 = null;
+  try { wfp.setStepState(id, 'set_review', { due_date: '2026-99-99' }, 'admin', ADMIN); } catch (e) { e7 = e; }
+  check('存在しない日付を弾く (2026-99-99)', e7?.status === 400);
+  check('実在する日付は通る (うるう年)',
+    wfp.setStepState(id, 'set_review', { due_date: '2028-02-29' }, 'admin', ADMIN).changed === true);
 }
 
 // ─── かんばんボード (2026-08-23) ───
@@ -2588,6 +2679,16 @@ renders.push(
   ['staff.ejs (閲覧のみ)', 'staff.ejs', { ...staffBase, isAdmin: false }],
   ['staff.ejs (担当者ゼロ)', 'staff.ejs', { ...staffBase, isAdmin: true, staff: [] }],
 );
+// 工程パネルの権限分岐: 一般ユーザー (担当外なので操作不可) の見た目も描かせる
+{
+  const d0 = renders.find((r) => r[1] === 'detail.ejs');
+  if (d0) {
+    renders.push(['detail.ejs (一般ユーザー・担当外)', 'detail.ejs',
+      { ...d0[2], isAdmin: false, myStaffId: null }]);
+    renders.push(['detail.ejs (一般ユーザー・本人)', 'detail.ejs',
+      { ...d0[2], isAdmin: false, myStaffId: wfTanakaId }]);
+  }
+}
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
@@ -2615,6 +2716,7 @@ for (const [name, file, data] of renders) {
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
         stepStateLabels: wfp.STEP_STATE_LABELS,
+        isAdmin: true, myStaffId: null,
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),

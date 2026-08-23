@@ -20,7 +20,7 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
 } from './db.js';
 import {
-  listStaff, createStaff, updateStaff, setStaffActive, setStaffRoles, staffByPortalEmail,
+  listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
   listRoles, createRole, updateRole,
   listSteps, createStep, updateStep, workflowOverview,
 } from './lib/workflow.js';
@@ -281,6 +281,9 @@ router.get('/detail/:id', (req, res) => {
     workflow: progressOf(draft.id, { db }),
     workflowStaff: listStaff(),
     stepStateLabels: STEP_STATE_LABELS,
+    // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
+    isAdmin: req.session?.role === 'admin',
+    myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
   });
 });
 
@@ -1549,18 +1552,16 @@ router.get('/staff', (req, res) => {
 router.post('/api/staff', (req, res) => {
   if (!requireAdminJson(req, res)) return;
   try {
-    const id = createStaff(req.body || {});
-    if (Array.isArray(req.body?.roles)) setStaffRoles(id, req.body.roles);
-    res.json({ ok: true, id });
+    // 担当者本体と役割は 1 トランザクション (途中失敗で担当者だけ残るのを防ぐ)
+    res.json({ ok: true, id: createStaffWithRoles(req.body || {}) });
   } catch (e) { workflowError(res, e); }
 });
 
 router.post('/api/staff/:id', (req, res) => {
   if (!requireAdminJson(req, res)) return;
   try {
-    const ok = updateStaff(req.params.id, req.body || {});
+    const ok = updateStaffWithRoles(req.params.id, req.body || {});
     if (!ok) return res.status(404).json({ ok: false, error: '担当者が見つかりません' });
-    if (Array.isArray(req.body?.roles)) setStaffRoles(req.params.id, req.body.roles);
     res.json({ ok: true });
   } catch (e) { workflowError(res, e); }
 });
@@ -1606,13 +1607,18 @@ router.post('/api/steps/:code', (req, res) => {
 });
 
 // 工程の進捗更新 (状態・担当者・期限・メモ)。
-// **admin 限定にしない** — 自分の工程を「完了」にするのは作業者本人の操作なので、
-// 管理者しか押せないと運用が回らない。誰が押したかは draft_events に残る
+// admin は全部できる。一般ユーザーは「自分の担当」または「未割り当て」の工程だけ動かせる
+// (2026-08-23 中原さん: 外注は契約終了済みで担当者は全員ログインするため、本人限定で運用が回る)。
+// 判定は setStepState 側 (assertStepPermission) で行う — API を増やしても穴が開かないように
 router.post('/api/drafts/:id/steps/:code', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   try {
-    const r = setStepState(draft.id, req.params.code, req.body || {}, actorOf(req));
+    const me = staffByPortalEmail(req.session?.email);
+    const r = setStepState(draft.id, req.params.code, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+    });
     res.json({ ok: true, changed: r.changed });
   } catch (e) { workflowError(res, e); }
 });

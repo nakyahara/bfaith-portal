@@ -225,7 +225,12 @@
               <th style="width:140px">期限</th><th style="width:100px">完了日</th><th>メモ</th></tr>
         </thead>
         <tbody>
+          <%
+            // 動かせるのは admin / 自分の担当 / 未割り当て のみ (サーバー側の判定と同じ条件)
+            const canEditStep = (s) => isAdmin || s.assignee_id == null || s.assignee_id === myStaffId;
+          %>
           <% for (const s of workflow.main.concat(workflow.image)) { %>
+            <% const editable = canEditStep(s); %>
             <tr data-step="<%= s.step_code %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
               <td>
                 <% if (s.track === 'image') { %><span class="muted" style="font-size:11px;">🖼</span> <% } %>
@@ -233,14 +238,19 @@
                 <% if (s.description) { %><br><span class="mini-note" title="<%= s.description %>"><%= s.description.length > 34 ? s.description.slice(0, 34) + '…' : s.description %></span><% } %>
               </td>
               <td>
-                <select class="wf-state">
+                <select class="wf-state" <%= editable ? '' : 'disabled' %>
+                        title="<%= editable ? '' : (s.assignee_name || '他の人') + ' さんの担当です' %>">
                   <% for (const code of Object.keys(stepStateLabels)) { %>
+                    <%# 「対象外」は工程を飛ばすので admin だけ %>
+                    <% if (code === 'skip' && !isAdmin && s.state !== 'skip') continue; %>
                     <option value="<%= code %>" <%= s.state === code ? 'selected' : '' %>><%= stepStateLabels[code] %></option>
                   <% } %>
                 </select>
               </td>
               <td>
-                <% if (s.role_code) { %>
+                <% if (!s.role_code) { %>
+                  <span class="muted" style="font-size:12px;">システム</span>
+                <% } else if (isAdmin) { %>
                   <select class="wf-assignee">
                     <option value="">未割り当て</option>
                     <% for (const st of workflowStaff) { %>
@@ -250,13 +260,22 @@
                       <option value="<%= s.assignee_id %>" selected><%= s.assignee_name %> (無効)</option>
                     <% } %>
                   </select>
+                <% } else if (s.assignee_id == null) { %>
+                  <%# 未割り当てなら自分で引き受けられる (放置を防ぐ) %>
+                  <% if (myStaffId) { %>
+                    <button type="button" class="btn btn-sm wf-claim">自分が担当する</button>
+                  <% } else { %>
+                    <span class="muted" style="font-size:12px;">未割り当て</span>
+                  <% } %>
                 <% } else { %>
-                  <span class="muted" style="font-size:12px;">システム</span>
+                  <span style="font-size:12px; display:inline-flex; align-items:center; gap:4px;">
+                    <span class="wf-dot" style="background:<%= s.assignee_color || '#94a3b8' %>"></span><%= s.assignee_name %>
+                  </span>
                 <% } %>
               </td>
-              <td><input type="date" class="wf-due" value="<%= s.due_date || '' %>"></td>
+              <td><input type="date" class="wf-due" value="<%= s.due_date || '' %>" <%= editable ? '' : 'disabled' %>></td>
               <td class="muted" style="font-size:12px;"><%= s.done_at ? String(s.done_at).slice(0, 10) : '—' %></td>
-              <td><input type="text" class="wf-note" value="<%= s.note || '' %>" placeholder="(任意)" maxlength="300"></td>
+              <td><input type="text" class="wf-note" value="<%= s.note || '' %>" placeholder="(任意)" maxlength="300" <%= editable ? '' : 'disabled' %>></td>
             </tr>
           <% } %>
         </tbody>
@@ -2613,7 +2632,13 @@
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch),
         });
         const j = await res.json();
-        if (!j.ok) { out.textContent = ''; alert(j.error || '保存に失敗しました'); return false; }
+        if (!j.ok) {
+          out.textContent = '';
+          alert(j.error || '保存に失敗しました');
+          // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
+          if (res.status === 409) location.reload();
+          return false;
+        }
         out.textContent = '保存しました';
         return true;
       } catch (e) {
@@ -2641,6 +2666,15 @@
       }
       if (assignee) {
         assignee.addEventListener('change', function () { save(tr, { assignee_id: assignee.value }); });
+      }
+      // 未割り当ての工程を自分で引き受ける (admin 以外はこのボタンだけ)
+      const claim = tr.querySelector('.wf-claim');
+      if (claim) {
+        claim.addEventListener('click', async function () {
+          claim.disabled = true;
+          const ok = await save(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
+          if (ok) location.reload(); else claim.disabled = false;
+        });
       }
       if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
       if (note) note.addEventListener('change', function () { save(tr, { note: note.value }); });

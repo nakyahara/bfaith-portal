@@ -224,6 +224,32 @@ export function setStaffRoles(id, roles) {
   return wanted.length;
 }
 
+/**
+ * 担当者の作成/更新と役割の置き換えを **1 トランザクション**で行う (Codex R1 medium)。
+ * 分けて実行すると、役割側で失敗したときに「担当者だけ作られた」「名前だけ変わって
+ * 役割は旧いまま」という中途半端な状態が残り、画面は失敗表示なのに DB は変わっている、になる。
+ * better-sqlite3 のトランザクションはネストすると savepoint になるので、
+ * 内側の setStaffRoles のトランザクションと併用して問題ない。
+ */
+export function createStaffWithRoles(input) {
+  const db = getDB();
+  return db.transaction(() => {
+    const id = createStaff(input);
+    if (Array.isArray(input?.roles)) setStaffRoles(id, input.roles);
+    return id;
+  })();
+}
+
+export function updateStaffWithRoles(id, input) {
+  const db = getDB();
+  return db.transaction(() => {
+    const ok = updateStaff(id, input);
+    if (!ok) return false;
+    if (Array.isArray(input?.roles)) setStaffRoles(id, input.roles);
+    return true;
+  })();
+}
+
 // ─── 役割 ───────────────────────────────────────────────
 
 export function listRoles({ includeInactive = false } = {}) {
@@ -293,6 +319,19 @@ export function updateRole(code, input) {
     // builtin は工程シードが参照する。無効化すると工程の担当ロールが空になり
     // 「誰のボールでもない工程」ができるので止める
     if (!on && role.builtin === 1) throw badRequest('この役割は工程が使っているため無効化できません (名前は変更できます)');
+    // builtin でなくても、稼働中の工程が参照していれば同じことが起きる (Codex R1 medium)。
+    // 「役割の候補からは消えているのに、その役割の既定担当だけ入り続ける」食い違いを作らない
+    if (!on) {
+      const used = db.prepare(`
+        SELECT label FROM ph_steps WHERE active = 1 AND role_code = ? ORDER BY sort LIMIT 3
+      `).all(role.code);
+      if (used.length > 0) {
+        throw badRequest(
+          `工程「${used.map((u) => u.label).join('」「')}」が使っているため無効化できません。`
+          + '先に工程の担当ロールを変えてください'
+        );
+      }
+    }
     sets.push('active = @active');
     params.active = on;
   }
