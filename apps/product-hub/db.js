@@ -517,6 +517,9 @@ export function initProductHubDB() {
       done_at     TEXT,
       done_by     TEXT,                          -- 完了操作をした人 (ポータルのログイン)
       note        TEXT,
+      -- 楽観ロック用の版数。updated_at (ミリ秒精度) をトークンにすると、同一ミリ秒内の
+      -- 連続更新で値が変わらず、古い画面からの上書きを検知できない (Codex R3)
+      version     INTEGER NOT NULL DEFAULT 0,
       updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
       PRIMARY KEY (draft_id, step_code)
     );
@@ -751,6 +754,12 @@ export function initProductHubDB() {
   `);
 
   // ─── ワークフロー (担当者/役割/工程) の索引とシード ─────────────────
+  // 楽観ロックの版数列。PR 途中の状態でデプロイした環境にも足せるよう冪等 ALTER にする
+  const dspCols = new Set(db.prepare('PRAGMA table_info(draft_step_progress)').all().map((c) => c.name));
+  if (!dspCols.has('version')) {
+    db.exec('ALTER TABLE draft_step_progress ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+  }
+
   for (const stmt of [
     // 担当者名の表記ゆれ防止。「大川さん」と「大川 さん」を別人として登録させない
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_ph_staff_name_norm ON ph_staff(LOWER(TRIM(name)))',

@@ -233,7 +233,7 @@
           %>
           <% for (const s of workflow.main.concat(workflow.image)) { %>
             <% const editable = canEditStep(s); %>
-            <tr data-step="<%= s.step_code %>" data-updated="<%= s.updated_at || '' %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
+            <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
               <td>
                 <% if (s.track === 'image') { %><span class="muted" style="font-size:11px;">🖼</span> <% } %>
                 <%= s.label %>
@@ -2631,7 +2631,7 @@
       out.textContent = '保存中…';
       try {
         // 画面を開いた時点の updated_at を一緒に送る = 古い画面からの後勝ちをサーバーが弾ける
-        const body = Object.assign({ expected_updated_at: tr.dataset.updated || null }, patch);
+        const body = Object.assign({ expected_version: tr.dataset.version === '' ? null : Number(tr.dataset.version) }, patch);
         const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/steps/' + encodeURIComponent(step), {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         });
@@ -2644,7 +2644,7 @@
           return false;
         }
         // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
-        if (j.updated_at) tr.dataset.updated = j.updated_at;
+        if (j.version != null) tr.dataset.version = String(j.version);
         out.textContent = '保存しました';
         return true;
       } catch (e) {

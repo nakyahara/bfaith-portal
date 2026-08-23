@@ -105,7 +105,7 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId }) {
     if (actorStaffId == null) {
       throw forbidden('あなたのポータルアカウントに担当者が紐づいていません (担当者・工程の画面で設定してください)');
     }
-    const keys = Object.keys(patch || {}).filter((k) => patch[k] !== undefined && k !== 'expected_updated_at');
+    const keys = Object.keys(patch || {}).filter((k) => patch[k] !== undefined && k !== 'expected_version');
     const onlyClaim = keys.length === 1 && keys[0] === 'assignee_id'
       && Number(patch.assignee_id) === actorStaffId;
     if (!onlyClaim) throw forbidden('先に「自分が担当する」を押してから操作してください');
@@ -256,7 +256,7 @@ export function progressOf(draftId, { db = null } = {}) {
   const draft = conn.prepare('SELECT created_at FROM product_drafts WHERE id = ?').get(id);
   const rows = conn.prepare(`
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.due_date, p.started_at,
-           p.done_at, p.done_by, p.note, p.updated_at,
+           p.done_at, p.done_by, p.note, p.updated_at, p.version,
            s.label, s.track, s.sort, s.role_code, s.stall_days, s.description,
            r.label AS role_label,
            st.name AS assignee_name, st.color AS assignee_color, st.active AS assignee_active
@@ -292,7 +292,10 @@ export function progressOf(draftId, { db = null } = {}) {
  * 工程の状態・担当者・メモを更新する。
  * done にした時刻と操作者を残すのは、あとで「この工程は誰が何日で回しているか」を測るため。
  */
-export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false, actorStaffId = null } = {}) {
+export function setStepState(
+  draftId, stepCode, patch, actor,
+  { isAdmin = false, actorStaffId = null, requireVersion = false } = {},
+) {
   const db = getDB();
   const id = Number(draftId);
   const code = String(stepCode || '');
@@ -373,20 +376,23 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
 
   if (sets.length === 0) return { changed: false };
 
-  // 楽観ロック (Codex R1 medium → R2 で強化)。
-  // 画面が表示時に読んだ updated_at を送ってもらい、それを UPDATE の条件にする。
-  // サーバー内で読み直した state を条件にするだけでは、**古い画面から送られた操作**を
-  // 止められない (読み直すと最新値なので必ず一致してしまう)。
-  // expected_updated_at が無い呼び出し (API 直叩き・内部処理) は state ベースに退避する。
-  const expected = patch?.expected_updated_at == null ? null : String(patch.expected_updated_at);
+  // 楽観ロック (Codex R1 → R2 → R3)。**単調増加の version** をトークンにする。
+  // updated_at (ミリ秒精度) だと同一ミリ秒内の連続更新で値が変わらず、古い画面からの
+  // 上書きをすり抜けさせる。version なら必ず変わる。
+  // 画面から来る操作 (requireVersion) はトークン必須にし、省略による回避を塞ぐ。
+  const expected = patch?.expected_version == null ? null : Number(patch.expected_version);
+  if (requireVersion && !Number.isInteger(expected)) {
+    throw conflict('画面が古い可能性があります。読み直してから操作してください');
+  }
   const conds = ['draft_id = @draft_id', 'step_code = @step_code'];
-  if (expected) {
-    if (expected !== String(row.updated_at)) {
+  if (Number.isInteger(expected)) {
+    if (expected !== row.version) {
       throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
     }
-    conds.push('updated_at = @expected_updated_at');
-    params.expected_updated_at = expected;
+    conds.push('version = @expected_version');
+    params.expected_version = expected;
   } else if (stateChanged) {
+    // トークン無しの内部呼び出し向けの保険 (状態の取り違えだけは防ぐ)
     conds.push('state = @prev_state');
     params.prev_state = row.state;
   }
@@ -395,7 +401,8 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
   // UPDATE と監査ログを 1 トランザクションに閉じる (ログだけ残って本体が失敗する状態を作らない)
   const run = db.transaction(() => {
     const info = db.prepare(`
-      UPDATE draft_step_progress SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      UPDATE draft_step_progress
+      SET ${sets.join(', ')}, version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
       ${where}
     `).run(params);
     if (info.changes !== 1) return false;
@@ -405,11 +412,11 @@ export function setStepState(draftId, stepCode, patch, actor, { isAdmin = false,
   if (!run()) {
     throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
   }
-  // 続けて操作できるよう、新しい updated_at を返す (画面が次の楽観ロックに使う)
+  // 続けて操作できるよう、新しい版数を返す (画面が次の楽観ロックに使う)
   const fresh = db.prepare(
-    'SELECT updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
+    'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
   ).get(id, code);
-  return { changed: true, updated_at: fresh?.updated_at || null };
+  return { changed: true, version: fresh?.version ?? null, updated_at: fresh?.updated_at || null };
 }
 
 /**

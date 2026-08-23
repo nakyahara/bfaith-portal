@@ -1618,8 +1618,10 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
     const r = setStepState(draft.id, req.params.code, req.body || {}, actorOf(req), {
       isAdmin: req.session?.role === 'admin',
       actorStaffId: me?.id ?? null,
+      // 画面から来る操作は版数トークン必須。省略で楽観ロックを回避されないようにする
+      requireVersion: true,
     });
-    res.json({ ok: true, changed: r.changed, updated_at: r.updated_at });
+    res.json({ ok: true, changed: r.changed, version: r.version });
   } catch (e) { workflowError(res, e); }
 });
 

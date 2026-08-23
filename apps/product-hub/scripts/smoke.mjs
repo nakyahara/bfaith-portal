@@ -1928,21 +1928,34 @@ let wfDraftId = null;
   check('システム工程は admin なら進められる',
     wfp.setStepState(id, 'ai_generate', { state: 'done' }, 'admin', ADMIN).changed === true);
 
-  // 楽観ロック: 画面が読んだ updated_at を送る → 古い画面からの操作を弾く
+  // 楽観ロック: 画面が読んだ version を送る → 古い画面からの操作を弾く。
+  // updated_at (ミリ秒) をトークンにすると同一ミリ秒の連続更新をすり抜ける (Codex R3)
   const beforeRow = db.prepare(
-    `SELECT updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = 'desc_review'`
+    `SELECT version FROM draft_step_progress WHERE draft_id = ? AND step_code = 'desc_review'`
   ).get(id);
-  // 別の人が先に動かした状況を作る (updated_at が変わる)
+  // 別の人が先に動かした状況を作る
   const r0 = wfp.setStepState(id, 'desc_review', { state: 'doing' }, 'admin', ADMIN);
-  check('更新すると新しい updated_at が返る', !!r0.updated_at && r0.updated_at !== beforeRow.updated_at);
+  check('更新すると版数が上がる', r0.version === beforeRow.version + 1, `${beforeRow.version} → ${r0.version}`);
   let e5 = null;
   try {
     // 古い画面が「まだ未着手のはず」と思って done を送る
-    wfp.setStepState(id, 'desc_review', { state: 'done', expected_updated_at: beforeRow.updated_at }, 'admin', ADMIN);
+    wfp.setStepState(id, 'desc_review', { state: 'done', expected_version: beforeRow.version }, 'admin', ADMIN);
   } catch (e) { e5 = e; }
   check('古い画面からの後勝ちを 409 で弾く', e5?.status === 409, e5?.message || '例外が出ていない');
-  check('最新の updated_at を送れば通る',
-    wfp.setStepState(id, 'desc_review', { state: 'done', expected_updated_at: r0.updated_at }, 'admin', ADMIN).changed === true);
+  // メモだけの更新でも版数が合わなければ弾く (状態が変わらない更新の抜け道を塞ぐ)
+  let e5b = null;
+  try {
+    wfp.setStepState(id, 'desc_review', { note: '古い画面から', expected_version: beforeRow.version }, 'admin', ADMIN);
+  } catch (e) { e5b = e; }
+  check('メモだけの更新も版数不一致なら弾く', e5b?.status === 409);
+  check('最新の版数を送れば通る',
+    wfp.setStepState(id, 'desc_review', { state: 'done', expected_version: r0.version }, 'admin', ADMIN).changed === true);
+  // 画面から来る操作 (requireVersion) はトークン省略を許さない
+  let e5c = null;
+  try {
+    wfp.setStepState(id, 'desc_review', { state: 'todo' }, 'admin', { ...ADMIN, requireVersion: true });
+  } catch (e) { e5c = e; }
+  check('版数を省略した画面操作は受け付けない', e5c?.status === 409, e5c?.message || '例外が出ていない');
 
   // 日付の実在検証
   let e6 = null;
