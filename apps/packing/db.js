@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -266,6 +266,16 @@ const MIGRATIONS = {
       created_at     TEXT NOT NULL
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_reprints_at ON pk_pack_reprints(created_at)');
+  },
+  // v9: 再ピック運用の現場フィードバック対応 (中原さん指示 2026-08-23)。
+  //   - actual_name: 品違いの「実際に入っていた商品」は記録時に在庫検索で特定 (自由入力文字列を
+  //     SKU列に入れない)。表示名はサーバー由来をここに保持する
+  //   - blocked_since / blocked_total_sec: 「ピッキングミスで梱包できない待ち時間」
+  //     (未処理ゼロ+保留あり=再ピック待ちで手が止まる区間) は梱包時間に含めない (中断と同型)
+  9: () => {
+    db.exec('ALTER TABLE pk_pack_incidents ADD COLUMN actual_name TEXT');
+    db.exec('ALTER TABLE pk_pack_batches ADD COLUMN blocked_since TEXT');
+    db.exec('ALTER TABLE pk_pack_batches ADD COLUMN blocked_total_sec INTEGER NOT NULL DEFAULT 0');
   },
 };
 

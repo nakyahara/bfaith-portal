@@ -1,30 +1,73 @@
-<%# 現場間アラートバナー (2026-08-21)。12秒ポーリング・OKで全端末から消える %>
+<%# 現場間バナー (2026-08-21 / 受領導線の改修 2026-08-23)。12秒ポーリング。
+    赤 = 通知 (「確認して閉じる」= 既読のみ・全端末から消える)
+    緑 = 再ピック完了で受領待ち (タスク状態から導出。「現物を受け取った」= 業務アクション。
+         対象バッチの作業画面なら受領ボタン、それ以外は対象伝票を開くリンク) %>
 <div id="floorAlerts" style="position:sticky; top:0; z-index:9999;"></div>
 <script>
 (function () {
   var box = document.getElementById('floorAlerts');
   var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); };
-  function render(alerts) {
-    box.innerHTML = alerts.map(function (a) {
+  var lastReadyKey = null;
+  function btn(attrs, label, fg, bg) {
+    return '<button ' + attrs + ' style="padding:10px 20px; border:none; border-radius:10px; background:' + bg + '; color:' + fg + '; font-weight:800; font-size:16px; white-space:nowrap">' + label + '</button>';
+  }
+  function render(alerts, ready) {
+    var html = alerts.map(function (a) {
       return '<div style="background:#e03131; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
         + '<span style="flex:1">' + esc(a.message) + (a.requested_by ? '<small style="font-weight:400">（依頼: ' + esc(a.requested_by) + '）</small>' : '') + '</span>'
-        + '<button data-ack="' + a.id + '" style="padding:10px 20px; border:none; border-radius:10px; background:#fff; color:#e03131; font-weight:800; font-size:16px">OK</button>'
+        + btn('data-ack="' + a.id + '"', '確認して閉じる', '#e03131', '#fff')
         + '</div>';
     }).join('');
-    box.querySelectorAll('[data-ack]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        fetch('/apps/packing/api/floor-alerts/' + btn.dataset.ack + '/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
+    // ready は伝票単位 (その伝票の再ピックが全部完了したものだけ = 受領処理の条件と同じ)
+    html += ready.map(function (g) {
+      var ref = (g.folder_name || '-') + (g.slip_seq != null ? ' #' + g.slip_seq : '');
+      var mine = window.__packingBatchId != null && Number(window.__packingBatchId) === Number(g.batch_id);
+      var seq = Number(g.slip_seq), bid = Number(g.batch_id);
+      var action = mine
+        ? btn('data-receive="1" data-seq="' + seq + '" data-batch="' + bid + '"', '📦 現物を受け取った (#' + seq + ' を再開)', '#2b8a3e', '#fff')
+        : '<a href="/apps/packing/work/' + bid + '?seq=' + seq + '" style="padding:10px 20px; border-radius:10px; background:#fff; color:#2b8a3e; font-weight:800; font-size:16px; text-decoration:none; white-space:nowrap">対象伝票を開く</a>';
+      var items = (g.tasks || []).map(function (t) { return esc(t.product_name || t.sku) + ' × ' + esc(t.req_qty); }).join(' / ');
+      var pickers = (g.tasks || []).map(function (t) { return t.claimed_by; }).filter(function (v, i, a) { return v && a.indexOf(v) === i; }).join(',');
+      return '<div style="background:#2b8a3e; color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; font-size:18px; font-weight:800; border-bottom:2px solid #fff">'
+        + '<span style="flex:1">✅ ' + esc(ref) + ' の不足分が届きます'
+        + '<small style="font-weight:400; display:block">' + items
+        + '（ピッカー: ' + esc(pickers || '-') + ' / 依頼: ' + esc(g.requested_by || '-') + '）</small></span>'
+        + action
+        + '</div>';
+    }).join('');
+    box.innerHTML = html;
+    box.querySelectorAll('[data-ack]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        fetch('/apps/packing/api/floor-alerts/' + b.dataset.ack + '/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' } })
           .then(poll).catch(function () {});
+      });
+    });
+    box.querySelectorAll('[data-receive]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        // 受領の本体は作業画面側 (作業者・キュー・再描画を持つ)。ここは依頼を投げるだけ
+        document.dispatchEvent(new CustomEvent('packing:receive', {
+          detail: { slipSeq: Number(b.dataset.seq), batchId: Number(b.dataset.batch) },
+        }));
       });
     });
   }
   function poll() {
     return fetch('/apps/packing/api/floor-alerts')
       .then(function (r) { return r.json(); })
-      .then(function (b) { render(b.alerts || []); })
+      .then(function (b) {
+        var ready = b.repickReady || [];
+        render(b.alerts || [], ready);
+        // 受領待ちの集合が変わったら作業画面へ知らせる (操作が無くても「⏳待ち」が解けるように)
+        var key = ready.map(function (g) { return g.batch_id + ':' + g.slip_seq + ':' + (g.tasks || []).map(function (t) { return t.id + t.status; }).join('+'); }).join(',');
+        if (key !== lastReadyKey) {
+          lastReadyKey = key;
+          document.dispatchEvent(new CustomEvent('packing:repick-ready', { detail: { items: ready } }));
+        }
+      })
       .catch(function () { /* 次のpollで回復 */ });
   }
+  window.__floorAlertsPoll = poll;   // 受領直後などに即時更新したいとき用
   poll();
   setInterval(poll, 12000);
 })();

@@ -616,10 +616,13 @@ export function getWorkState(batchId) {
     incidents = db.prepare(
       "SELECT * FROM pk_pack_incidents WHERE batch_id=? AND status='candidate' ORDER BY id"
     ).all(batchId);
+    // 伝票単位に集約: 同じ伝票に複数の再ピックがあれば「全部 fulfilled」のときだけ受領可 (Codex)
     for (const t of db.prepare(
-      "SELECT slip_seq, status FROM pk_pack_tasks WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled')"
+      "SELECT slip_seq, status FROM pk_pack_tasks WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id"
     ).all(batchId)) {
-      if (t.slip_seq != null) repickBySlip[t.slip_seq] = t.status;
+      if (t.slip_seq == null) continue;
+      const cur = repickBySlip[t.slip_seq];
+      repickBySlip[t.slip_seq] = (cur == null || cur === 'fulfilled') ? t.status : cur;
     }
   } catch { /* v4未適用環境 */ }
   return {
@@ -671,7 +674,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, qty, finalCount, manualCount, excludedCount, note }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, actualName, qty, finalCount, manualCount, excludedCount, note }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -719,6 +722,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     }
     let taskNotify = null;   // ①②のGChat通知情報 (routerがfail-softで送る。replayでは再送しない)
     let switchedFrom = null; // ライン工程開始での担当交代 (payload に監査記録)
+    // 再ピック待ち区間の境界時刻。中断/再開は端末時刻 (クランプ) を使い、中断計測と二重控除しない (Codex)
+    let blockedAt = now;
 
     if (event === 'takeover') {
       // 担当者の交代 (選び間違い・実際の引き継ぎ)。記録が残る唯一の正規突破口。
@@ -752,8 +757,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       requireOwner();
       const r = PAUSE_REASONS.includes(reason) ? reason : 'その他';
+      const pauseAt = clampedEventTime(clientAt, now, batch.started_at);
       db.prepare(`UPDATE pk_pack_batches SET status='paused', pause_started_at=?, pause_reason=?, updated_at=? WHERE id=?`)
-        .run(clampedEventTime(clientAt, now, batch.started_at), r, now, batchId);
+        .run(pauseAt, r, now, batchId);
+      blockedAt = pauseAt;
     } else if (event === 'resume') {
       if (batch.status !== 'paused') {
         throw new PackError(409, 'not_paused', `中断中ではありません (${batch.status})`);
@@ -765,6 +772,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         UPDATE pk_pack_batches SET status='packing', paused_total_sec = paused_total_sec + ?,
           pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
       `).run(pausedSec, now, batchId);
+      blockedAt = resumeAt;
     } else if (event === 'cancel') {
       // 誤開始の取消: バッチを未着手に戻し、伝票の進捗も初期化する (pk_pack_events は残る)
       if (batch.status !== 'packing' && batch.status !== 'paused') {
@@ -773,7 +781,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       requireOwner();
       db.prepare(`
         UPDATE pk_pack_batches SET status='ready', worker=NULL, started_at=NULL, finished_at=NULL,
-          paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
+          paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL,
+          blocked_total_sec=0, blocked_since=NULL, updated_at=? WHERE id=?
       `).run(now, batchId);
       db.prepare("UPDATE pk_pack_slips SET status='pending', hold_reason=NULL, shown_at=NULL, done_at=NULL WHERE batch_id=?")
         .run(batchId);
@@ -911,7 +920,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
       requireOwner();
-      taskNotify = applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty }, worker, now).notify || null;
+      taskNotify = applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty }, worker, now).notify || null;
       if (batch.status === 'done' && ['shortage', 'wrong_item'].includes(event)) {
         db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
           .run(now, batchId);
@@ -1088,6 +1097,9 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
     }
 
+    // 「ピッキングミスで梱包できない待ち時間」の区間更新 (中原さん指示 2026-08-23: 梱包時間に含めない)。
+    // 伝票状態が動くイベントの後に毎回評価する (手梱包バッチのみ。ライン工程は対象外)
+    if (!lineKind) syncBlockedState(db, batchId, blockedAt);
     const result = eventResult(batchId);
     // eventResult はこのイベント行の INSERT より前に走るため、lastDoneSeq (イベント履歴由来) に
     // いま完了させた伝票が反映されない。next のときはここで上書きする
@@ -1096,7 +1108,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
         || finalCount != null || manualCount != null || excludedCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
-          sku: sku || undefined, actualSku: actualSku || undefined, qty: qty ?? undefined,
+          sku: sku || undefined, actualSku: actualSku || undefined, actualName: actualName || undefined, qty: qty ?? undefined,
           finalCount: finalCount ?? undefined, manualCount: manualCount ?? undefined,
           excludedCount: excludedCount ?? undefined, note: note || undefined,
           switchedFrom: switchedFrom || undefined }) : null;
@@ -1109,11 +1121,43 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
   })();
 }
 
+/**
+ * 「ピッキングミスで梱包できない待ち時間」の計測 (中原さん指示 2026-08-23: 梱包時間に含めない)。
+ * 条件 = 作業中 (packing) かつ 未処理ゼロ かつ 保留あり (= 再ピック待ちで手が止まっている)。
+ * 中断 (paused) 中は中断側で除外するので、status != packing では区間を閉じて二重控除しない。
+ * 実装は中断と同型: blocked_since (区間開始) / blocked_total_sec (累計)。
+ */
+function syncBlockedState(db, batchId, at) {
+  const b = db.prepare('SELECT status, blocked_since FROM pk_pack_batches WHERE id = ?').get(batchId);
+  if (!b) return;
+  // 保留理由は再ピックに限定 (計測ルールを直接表現 — 将来の別種保留を巻き込まない。Codex)
+  const c = db.prepare(`
+    SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+           SUM(CASE WHEN status = 'held' AND hold_reason = 'repick' THEN 1 ELSE 0 END) AS held
+    FROM pk_pack_slips WHERE batch_id = ?
+  `).get(batchId);
+  const shouldBlock = b.status === 'packing' && (c.pending || 0) === 0 && (c.held || 0) > 0;
+  if (shouldBlock && !b.blocked_since) {
+    db.prepare('UPDATE pk_pack_batches SET blocked_since = ? WHERE id = ?').run(at, batchId);
+  } else if (!shouldBlock && b.blocked_since) {
+    const sec = Math.max(0, Math.round((Date.parse(at) - Date.parse(b.blocked_since)) / 1000));
+    db.prepare('UPDATE pk_pack_batches SET blocked_total_sec = blocked_total_sec + ?, blocked_since = NULL WHERE id = ?')
+      .run(sec, batchId);
+  }
+}
+
+/** バッチの実働秒 = (finished - started) - 中断合計 - 再ピック待ち合計。未完了は null。 */
+export function batchActiveSec(b) {
+  if (!b.started_at || !b.finished_at) return null;
+  return Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000)
+    - (b.paused_total_sec || 0) - (b.blocked_total_sec || 0));
+}
+
 // ═══ 日次サマリ (⑦計測の集計・要件§5.11) ═══════════════════════════════
 
 /**
  * 指定作業日のサマリ。
- *   - バッチ単位: 実働 = (finished - started) - 中断合計
+ *   - バッチ単位: 実働 = (finished - started) - 中断合計 - 再ピック待ち合計 (梱包できない時間)
  *   - 伝票単位: done_at - shown_at (表示〜完了)。伝票表示中の中断は現状含まれる
  *     (中断はバッチ単位で記録のため。除外精度が必要になったらイベントから差し引く)
  *   - ズレ回復 (jump)・完了取消 (undo) の回数も集計 (要件§5.1: 頻度を計測し多発なら再協議)
@@ -1126,10 +1170,7 @@ export function getDailySummary(workDate) {
     ORDER BY id
   `).all(workDate);
 
-  const activeSec = (b) => {
-    if (!b.started_at || !b.finished_at) return null;
-    return Math.max(0, Math.round((Date.parse(b.finished_at) - Date.parse(b.started_at)) / 1000) - (b.paused_total_sec || 0));
-  };
+  const activeSec = batchActiveSec;
 
   const done = batches.filter((b) => b.status === 'done');
   const total = {
@@ -1138,6 +1179,7 @@ export function getDailySummary(workDate) {
     slipCount: done.reduce((s, b) => s + b.slip_count, 0),
     qty: done.reduce((s, b) => s + b.total_qty, 0),
     activeSec: done.reduce((s, b) => s + (activeSec(b) || 0), 0),
+    blockedSec: done.reduce((s, b) => s + (b.blocked_total_sec || 0), 0),   // 除外した再ピック待ち
   };
   total.secPerSlip = total.slipCount > 0 ? total.activeSec / total.slipCount : null;
   total.slipsPerHour = total.secPerSlip ? 3600 / total.secPerSlip : null;
@@ -1253,12 +1295,12 @@ function insertTask(db, batch, { slipSeq, kind, sku, productName, qty, incidentI
     loc.location, loc.block, batch.folder_name, worker, incidentId ?? null, now, now).lastInsertRowid);
 }
 
-function insertIncident(db, batch, { slipSeq, kind, sku, actualSku, qty }, worker, now) {
+function insertIncident(db, batch, { slipSeq, kind, sku, actualSku, actualName, qty }, worker, now) {
   return Number(db.prepare(`
     INSERT INTO pk_pack_incidents
-      (batch_id, slip_seq, kind, sku, actual_sku, qty, status, detected_by, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'candidate', ?, ?, ?)
-  `).run(batch.id, slipSeq ?? null, kind, sku, actualSku ?? null, qty, worker, now, now).lastInsertRowid);
+      (batch_id, slip_seq, kind, sku, actual_sku, actual_name, qty, status, detected_by, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'candidate', ?, ?, ?)
+  `).run(batch.id, slipSeq ?? null, kind, sku, actualSku ?? null, actualName ?? null, qty, worker, now, now).lastInsertRowid);
 }
 
 /** 伝票内のSKU明細を引く (数量上限の検証用)。 */
@@ -1275,7 +1317,7 @@ function slipLineOf(db, batchId, slipSeq, sku) {
  * applyEvent から呼ばれる (op_id 冪等・トランザクションは呼び出し側)。
  * @returns {{notify?: object}} router が fail-soft でGChat通知に使う情報
  */
-export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty }, worker, now) {
+export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty }, worker, now) {
   const batchId = batch.id;
   if (event === 'shortage' || event === 'wrong_item') {
     if (!Number.isInteger(slipSeq) || slipSeq < 1) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
@@ -1297,10 +1339,13 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty 
       db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='repick', done_at=NULL WHERE id=?`).run(slip.id);
       return {};
     }
-    // wrong_item: 期待SKU+実SKUのペアを候補として保持 (要件§5.6)
+    // wrong_item: 期待SKU+実SKUのペアを候補として保持 (要件§5.6)。
+    // 実SKUは記録時に在庫検索で特定 (router で形式+実在検証・名前はサーバー由来 — 2026-08-23)
     const act = String(actualSku || '').trim();
-    if (!act) throw new PackError(400, 'bad_actual_sku', '実際に入っていた商品 (SKU) を指定してください');
-    insertIncident(db, batch, { slipSeq, kind: 'wrong_item', sku: line.sku, actualSku: act, qty: q }, worker, now);
+    if (!act) throw new PackError(400, 'bad_actual_sku', '実際に入っていた商品を検索で特定してください');
+    if (act.length > 80) throw new PackError(400, 'bad_actual_sku', 'SKUが不正です');
+    const aName = actualName ? String(actualName).trim().slice(0, 120) || null : null;
+    insertIncident(db, batch, { slipSeq, kind: 'wrong_item', sku: line.sku, actualSku: act, actualName: aName, qty: q }, worker, now);
     db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='repick', done_at=NULL WHERE id=?`).run(slip.id);
     return {};
   }
@@ -1352,7 +1397,9 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, qty 
         db.prepare("UPDATE pk_pack_tasks SET status='received', updated_at=? WHERE id=?").run(now, t.id);
       }
     }
-    db.prepare("UPDATE pk_pack_slips SET status='pending', hold_reason=NULL WHERE id=?").run(slip.id);
+    // 保留解除と同時に伝票の表示時刻を打ち直す = 待っていた時間をこの伝票の梱包時間に入れない
+    // (受領後は画面がこの伝票へ自動ジャンプする — 2026-08-23)
+    db.prepare("UPDATE pk_pack_slips SET status='pending', hold_reason=NULL, shown_at=? WHERE id=?").run(now, slip.id);
     return {};
   }
   throw new PackError(400, 'bad_event', `不明なタスクイベント: ${event}`);
@@ -1367,6 +1414,37 @@ export function listOpenTasks() {
     WHERE t.status IN ('requested','claimed')
     ORDER BY t.id
   `).all();
+}
+
+/**
+ * 再ピック完了 (fulfilled) で梱包側の受領待ちのタスク — 梱包ヘッダーの受領バナー用 (2026-08-23)。
+ * 旧: picking が完了時に「通知バナー (OK=既読のみ)」を出していたが、受領と混同されるため
+ * タスク状態そのものから導出する (受領すれば自然に消える)。
+ */
+export function listRepickReady() {
+  try {
+    const rows = getDB().prepare(`
+      SELECT t.id, t.batch_id, t.slip_seq, t.sku, t.product_name, t.req_qty, t.requested_by, t.claimed_by,
+             t.status, t.updated_at, b.folder_name
+      FROM pk_pack_tasks t JOIN pk_pack_batches b ON b.id = t.batch_id
+      WHERE t.kind = 'repick' AND t.slip_seq IS NOT NULL
+        AND t.status IN ('requested', 'claimed', 'fulfilled') AND b.status IN ('packing', 'paused')
+      ORDER BY t.updated_at DESC, t.id DESC
+    `).all();
+    // 伝票単位に集約し、未解決タスクが全部 fulfilled の伝票だけ (受領処理の条件と同じ — Codex)
+    const bySlip = new Map();
+    for (const r of rows) {
+      const k = `${r.batch_id}:${r.slip_seq}`;
+      if (!bySlip.has(k)) {
+        bySlip.set(k, { batch_id: r.batch_id, slip_seq: r.slip_seq, folder_name: r.folder_name,
+          requested_by: r.requested_by, updated_at: r.updated_at, tasks: [], ready: true });
+      }
+      const g = bySlip.get(k);
+      g.tasks.push({ id: r.id, sku: r.sku, product_name: r.product_name, req_qty: r.req_qty, claimed_by: r.claimed_by, status: r.status });
+      if (r.status !== 'fulfilled') g.ready = false;
+    }
+    return [...bySlip.values()].filter((g) => g.ready).map(({ ready, ...g }) => g);
+  } catch { return []; }
 }
 
 export function countOpenTasks() {
@@ -1477,9 +1555,11 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
         const sku = String(actualSku ?? inc.actual_sku ?? '').trim();
         if (!sku) throw new PackError(400, 'actual_sku_required', '間違って入っていた商品を検索で特定してから送信してください');
         if (sku.length > 80) throw new PackError(400, 'bad_sku', 'SKUが不正です');
-        if (sku !== inc.actual_sku) {
-          db.prepare('UPDATE pk_pack_incidents SET actual_sku=?, updated_at=? WHERE id=?').run(sku, now, incidentId);
+        if (sku !== inc.actual_sku || (actualName && actualName !== inc.actual_name)) {
+          db.prepare('UPDATE pk_pack_incidents SET actual_sku=?, actual_name=COALESCE(?, actual_name), updated_at=? WHERE id=?')
+            .run(sku, actualName ? String(actualName).slice(0, 120) : null, now, incidentId);
           inc.actual_sku = sku;
+          if (actualName) inc.actual_name = String(actualName).slice(0, 120);
         }
       }
       try {
@@ -1502,7 +1582,7 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       }
       if (inc.kind === 'wrong_item') {
         const aName = (actualName ? String(actualName).slice(0, 120) : null)
-          ?? logizardNameOf(db, inc.actual_sku);
+          ?? inc.actual_name ?? logizardNameOf(db, inc.actual_sku);
         insertTask(db, batch, { slipSeq: inc.slip_seq, kind: 'return', sku: inc.actual_sku, productName: aName, qty: inc.qty, incidentId: inc.id }, actor, now);
         dispatchedTasks.push({ kind: 'return', sku: inc.actual_sku, name: aName, qty: inc.qty, folder: batch.folder_name, slipSeq: inc.slip_seq });
       }
@@ -1515,18 +1595,26 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       UPDATE pk_pack_incidents SET status=?, attributed_worker=?, confirmed_by=?, updated_at=? WHERE id=?
     `).run(decision === 'confirm' ? 'confirmed' : 'withdrawn', attributed, actor, now, incidentId);
     if (decision === 'withdraw' && inc.slip_seq != null) {
-      // 取下げで、その伝票に他の候補が無ければ保留を解除して梱包に戻す
+      // 取下げで、その伝票に他の候補も未解決の再ピックタスクも無ければ保留を解除して梱包に戻す
+      // (送信済みの再ピックが残っていれば現物未受領 — 受領まで保留のまま。Codex)
       const remain = db.prepare(`
         SELECT COUNT(*) c FROM pk_pack_incidents
         WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item') AND id != ?
       `).get(inc.batch_id, inc.slip_seq, inc.id).c;
-      if (remain === 0) {
+      const openRepick = db.prepare(`
+        SELECT COUNT(*) c FROM pk_pack_tasks
+        WHERE batch_id=? AND slip_seq=? AND kind='repick' AND status IN ('requested','claimed','fulfilled')
+      `).get(inc.batch_id, inc.slip_seq).c;
+      if (remain === 0 && openRepick === 0) {
+        // 保留解除 = 梱包再開。表示時刻も打ち直す (待ちをこの伝票の時間に入れない)
         db.prepare(`
-          UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+          UPDATE pk_pack_slips SET status='pending', hold_reason=NULL, shown_at=?
           WHERE batch_id=? AND seq=? AND status='held' AND hold_reason='repick'
-        `).run(inc.batch_id, inc.slip_seq);
+        `).run(now, inc.batch_id, inc.slip_seq);
       }
     }
+    // 取下げで伝票が pending に戻ると再ピック待ち区間が終わる (applyEvent 外の状態変更 — Codex)
+    syncBlockedState(db, inc.batch_id, now);
     return { ...inc, status: decision === 'confirm' ? 'confirmed' : 'withdrawn', attributed_worker: attributed, dispatchedTasks };
   })();
 }
