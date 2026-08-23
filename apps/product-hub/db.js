@@ -909,10 +909,10 @@ export function initProductHubDB() {
  * 画像トラックの一本 → TOP/詳細 分割の移行 (2026-08-24、冪等)。
  * #888/#890 デプロイ済み環境には旧4工程 (img_request 等) の進捗行があるので:
  *   - TOP 側: 旧行の状態をそのまま引き継ぐ (旧トラックの実体は TOP 中心の作業だったため)
- *   - 詳細側: **無条件コピーはしない** (作っていない詳細画像が承認済み扱いになる — Codex設計相談 Critical)。
- *     done を引き継ぐのは、(a) 楽天登録済みの商品 (出品済みに「承認して」を出さない #891 方針) と
- *     (b) 旧行の done が初回推定 (done_by='migration' = 工程導入前から画像が登録済みだった) の場合のみ。
- *     人が旧トラックを done にした商品は詳細側 todo で入り、詳細画像を作るか (対象外か) を改めて判断してもらう
+ *   - 詳細側: done を引き継ぐのは**楽天登録済みの商品だけ** (出品済みに「承認して」を出さない #891 方針)。
+ *     旧行の done は「画像が 1 枚でもあれば done」の初回推定を含むため、それを根拠に詳細側を
+ *     done にすると TOP しか無い商品が出品ゲートを素通りする (Codex R1 critical)。
+ *     それ以外は todo で入り、詳細画像を作るか (対象外か) を改めて判断してもらう
  *   - 旧4工程は active=0 (進捗行は残置 — 全クエリが active=1 join なので見えない)
  * 呼び出し元 (シード) のトランザクション内で走る。コピーと無効化の間に別プロセスが
  * 旧行を更新して変更が消えるレースを避ける (Codex設計相談 High)。
@@ -934,21 +934,15 @@ export function migrateImageKindSplit(db) {
     INSERT OR IGNORE INTO draft_step_progress
       (draft_id, step_code, state, assignee_id, due_date, started_at, done_at, done_by, note)
     SELECT p.draft_id, ?,
-      CASE WHEN p.state IN ('done', 'skip') AND (
-             p.done_by = 'migration'
-             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
-           )
+      CASE WHEN p.state IN ('done', 'skip')
+             AND EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
            THEN p.state ELSE 'todo' END,
       p.assignee_id, p.due_date, NULL,
-      CASE WHEN p.state IN ('done', 'skip') AND (
-             p.done_by = 'migration'
-             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
-           )
+      CASE WHEN p.state IN ('done', 'skip')
+             AND EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
            THEN COALESCE(p.done_at, strftime('%Y-%m-%dT%H:%M:%fZ','now')) ELSE NULL END,
-      CASE WHEN p.state IN ('done', 'skip') AND (
-             p.done_by = 'migration'
-             OR EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
-           )
+      CASE WHEN p.state IN ('done', 'skip')
+             AND EXISTS (SELECT 1 FROM draft_rakuten dr WHERE dr.draft_id = p.draft_id AND dr.registered_at IS NOT NULL)
            THEN 'migration' ELSE NULL END,
       p.note
     FROM draft_step_progress p WHERE p.step_code = ?

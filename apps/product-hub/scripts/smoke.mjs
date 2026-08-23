@@ -1393,6 +1393,9 @@ db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json)
   VALUES (?, '900001', '[{"name":"ブランド名","values":["テストブランド"]},{"name":"代表カラー","values":["ブラック"]}]')`).run(gdId);
 db.prepare(`INSERT INTO draft_cabinet_images (draft_id, drive_file_id, cabinet_location) VALUES (?, 'gd1', '/x/gd1.jpg')`).run(gdId);
 db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'gd1')`).run(gdId);
+// 画像トラック: 画像ありの初回推定で TOP は done、詳細は「対象外」にしてゲートを通す
+// (ここの主題はジャンル辞書の検証。画像ゲート自体は専用ブロックで検証している)
+db.prepare(`UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?`).run(gdId);
 
 let gb = listing.buildItemPayload(db, gdId);
 check('genre: 必須が揃っていれば通り、カタログIDはJAN欄から自動付与 (辞書にあるジャンル)',
@@ -1819,8 +1822,15 @@ let wfDraftId = null;
   const idListed = mk('WF-LISTED', 'listed');
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'wf-img-1', 0)`).run(idListed);
   const pl = wfp.progressOf(idListed, { db });
-  check('初期化: 画像があれば画像トラックは done', pl.imageDone === true);
+  check('初期化: 画像があれば TOP側は done (二重依頼の防止)', pl.imageTop.done === true);
+  check('初期化: 画像があっても詳細側は todo (詳細画像が揃っている根拠にならない)',
+    pl.imageDetail.rows.every((s) => s.state === 'todo') && pl.imageDone === false);
   check('初期化: listed なら残りは出品・展開', pl.current?.step_code === 'listing');
+  // 楽天登録済みなら詳細側も done で入る (出品済みに「承認して」を出さない)
+  const idListedRk0 = mk('WF-LISTED-RK', 'listed');
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'wf-img-2', 0)`).run(idListedRk0);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-20T00:00:00Z')`).run(idListedRk0);
+  check('初期化: 楽天登録済みは詳細側も done', wfp.progressOf(idListedRk0, { db }).imageDone === true);
 
   // 工程を進める
   const r1 = wfp.setStepState(idReview, 'desc_review', { state: 'done' }, 'smoke@b-faith.biz', ADMIN);
@@ -2035,6 +2045,11 @@ let wfDraftId = null;
     UPDATE draft_step_progress SET state = 'todo'
     WHERE draft_id = ? AND step_code LIKE 'img_%_top'
   `).run(idGate);
+  // fail-closed: TOP側の工程が 1 つも無い (設定壊れ・移行漏れ) なら出品を通さない
+  db.prepare(`UPDATE ph_steps SET active = 0 WHERE image_kind = 'top'`).run();
+  check('TOP工程が無い設定壊れではゲートを閉じる (fail-closed)',
+    /TOP画像.*見つかりません/.test(wfp.imageTrackBlockReason(db, idGate) || ''), wfp.imageTrackBlockReason(db, idGate));
+  db.prepare(`UPDATE ph_steps SET active = 1 WHERE image_kind = 'top' AND builtin = 1`).run();
 
   // 「詳細画像は対象外」(商品単位フラグ): TOP の承認だけでゲートが開く
   wfp.setDetailImagesExcluded(idGate, true, 'admin', ADMIN);
@@ -2388,6 +2403,14 @@ let wfSetParentId = null;
     const bi2 = wfp.boardData(db, { view: 'image' });
     const kinds2 = bi2.columns.flatMap((c) => c.cards.filter((x) => x.id === idNoDetail).map((x) => x.kind));
     check('ボード(画像): 詳細対象外の商品は TOP カードだけ', kinds2.join(',') === 'top', kinds2.join(','));
+    // TOP全skip (ガードすり抜け) を完了列に見せない — 出品ゲートは拒否するので表示と食い違う
+    wfp.setDetailImagesExcluded(idNoDetail, true, 'admin', ADMIN);
+    db.prepare(`UPDATE draft_step_progress SET state = 'skip' WHERE draft_id = ? AND step_code LIKE 'img_%_top'`).run(idNoDetail);
+    const bi3 = wfp.boardData(db, { view: 'image' });
+    check('ボード(画像): TOP全対象外は完了列に出さない',
+      !bi3.doneCards.some((c) => c.id === idNoDetail)
+      && !bi3.columns.some((c) => c.cards.some((x) => x.id === idNoDetail)));
+    db.prepare(`UPDATE draft_step_progress SET state = 'todo' WHERE draft_id = ? AND step_code LIKE 'img_%_top'`).run(idNoDetail);
   }
 
   // 停滞しているカードを先頭に出す (打ち手が要るものを埋もれさせない)
@@ -2447,8 +2470,9 @@ let wfSetParentId = null;
   check('移行: TOP側は旧状態を引き継ぐ', st(idHuman, 'img_request_top') === 'done' && st(idOpen, 'img_request_top') === 'doing');
   check('移行: 人が done にした商品の詳細側は todo (作っていない詳細画像を承認済みにしない)',
     st(idHuman, 'img_request_detail') === 'todo');
-  check('移行: 初回推定 done (画像が既にあった) は詳細側も done', st(idEst, 'img_request_detail') === 'done');
-  check('移行: 楽天登録済みは詳細側も done', st(idRk, 'img_request_detail') === 'done');
+  check('移行: 初回推定 done (画像が既にあっただけ) も詳細側は todo (Codex R1 critical)',
+    st(idEst, 'img_request_detail') === 'todo');
+  check('移行: 楽天登録済みだけ詳細側も done', st(idRk, 'img_request_detail') === 'done');
   check('移行: 旧工程は無効化される',
     db.prepare(`SELECT COUNT(*) AS c FROM ph_steps WHERE code IN ('img_request','img_approve') AND active = 1`).get().c === 0);
   check('移行: 再実行は no-op (冪等)', dbmod.migrateImageKindSplit(db) === false);

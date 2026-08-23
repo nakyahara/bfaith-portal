@@ -139,7 +139,7 @@ function defaultAssigneeByRole(db) {
  */
 export function ensureProgress(db, draftId) {
   const id = Number(draftId);
-  const steps = db.prepare('SELECT code, track, role_code FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
+  const steps = db.prepare('SELECT code, track, image_kind, role_code FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
   if (steps.length === 0) return 0;
   const existing = new Set(
     db.prepare('SELECT step_code FROM draft_step_progress WHERE draft_id = ?').all(id).map((r) => r.step_code)
@@ -153,10 +153,17 @@ export function ensureProgress(db, draftId) {
   if (firstTime) {
     const draft = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id);
     doneSet = new Set(STATUS_DONE_STEPS[draft?.status] || []);
-    // 画像が既に登録されているなら画像トラックは終わっているとみなす。
-    // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない
+    // 画像が既に登録されているなら **TOP側**の画像トラックは終わっているとみなす。
+    // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない。
+    // 詳細側は推定しない — 画像が 1 枚あることは詳細画像が揃っている根拠にならず、
+    // done にすると TOP しか無い商品が出品ゲートを素通りする (Codex R1 critical と同じ穴)。
+    // 楽天登録済みの商品だけは詳細側も done (出品済みに「承認して」を出さない)
     const hasImages = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(id);
-    if (hasImages) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
+    if (hasImages) for (const s of steps) if (s.track === 'image' && s.image_kind !== 'detail') doneSet.add(s.code);
+    const listedRk = db.prepare(
+      'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
+    ).get(id);
+    if (listedRk) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
   } else {
     // 後から足した工程は原則 todo で入れる (過去分を勝手に done にしない)。
     // 唯一の例外: **画像トラック**の工程で、その商品が既に楽天へ登録済みのとき。
@@ -348,14 +355,18 @@ function kindBlockDetail(summary) {
  */
 export function imageTrackBlockReason(db, draftId) {
   const p = progressOf(draftId, { db });
-  if (p.image.length === 0) return null;
+  // fail-closed: TOP 側の工程が 1 つも無い状態 (工程の無効化・移行漏れ) で出品を通さない (Codex R1 high)。
+  // progressOf → ensureProgress が行を自己修復するので、ここに来るのは設定が壊れているときだけ
+  if (p.imageTop.rows.length === 0) {
+    return '画像トラック (TOP画像) の工程が見つかりません。担当者・工程の設定を確認してください';
+  }
   // TOP 全部が「対象外」はゲートを開けない (サムネイル無しの楽天出品はありえない — Codex設計相談 High)。
   // setStepState 側でも TOP の skip は拒否しているが、ゲートは独立に防御する
-  if (p.imageTop.rows.length > 0 && p.imageTop.rows.every((r) => r.state === 'skip')) {
+  if (p.imageTop.rows.every((r) => r.state === 'skip')) {
     return 'TOP画像の工程がすべて「対象外」になっています。TOP画像 (サムネイル) は楽天出品に必須です';
   }
   const blocked = [];
-  if (p.imageTop.rows.length > 0 && !p.imageTop.done) {
+  if (!p.imageTop.done) {
     blocked.push(`${IMAGE_KIND_LABELS.top}: ${kindBlockDetail(p.imageTop)}`);
   }
   if (!p.detailExcluded && p.imageDetail.rows.length > 0 && !p.imageDetail.done) {
@@ -592,6 +603,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // sort→code が最小の行。JS 側の currentOf と**同じ並び順**を ROW_NUMBER() で再現する (Codex R2 medium)。
   // 「未完了工程のどれかを担当している」で絞ると、将来工程だけ担当している商品が
   // LIMIT を食い潰し、いま担当している古い商品がボードから消える
+  // 画像ビューの候補は**画像工程だけ**から取る (Codex R1 medium):
+  // 本流だけが条件一致する商品が LIMIT を食い潰し、あとの JS 絞り込みで消えると
+  // 実際に画像を担当している商品がボードから欠落する
   const CURRENT_STEPS = `
     SELECT draft_id, assignee_id, role_code FROM (
       SELECT p.draft_id, p.assignee_id, s.role_code,
@@ -602,6 +616,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       FROM draft_step_progress p
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.state IN ('todo', 'doing')
+        ${view === 'image' ? "AND s.track = 'image'" : ''}
     ) WHERE rn = 1
   `;
   let candidateSql = '';
@@ -703,9 +718,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
         colByStep.get(cur.step_code)?.cards.push(card);
         cardsById.set(d.id, card);
       }
-      // 完了列 = TOP が済み、詳細も済みか対象外の商品 (絞り込み中は出さない — 「終わった分」は全員共通)
+      // 完了列 = TOP が済み、詳細も済みか対象外の商品 (絞り込み中は出さない — 「終わった分」は全員共通)。
+      // TOP 全部 skip は「完了」に見せない (出品ゲートは拒否するので表示と食い違う — Codex R1 medium)
       if (!anyOpen && assigneeId == null && !unassignedOnly) {
-        const topSettled = p.imageTop.rows.length > 0 && !p.imageTop.current;
+        const topSettled = p.imageTop.rows.length > 0 && !p.imageTop.current
+          && !p.imageTop.rows.every((r) => r.state === 'skip');
         const detailSettled = detailExcluded || p.imageDetail.rows.length === 0 || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
         if (topSettled && detailSettled) doneCards.push(baseCard);
       }
