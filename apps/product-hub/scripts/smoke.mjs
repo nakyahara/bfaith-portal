@@ -2058,6 +2058,15 @@ const ms = await import('../lib/mall-status.js');
   try { wfp.setStepState(idFresh, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { freshDone = e; }
   check('未初期化でも「6件残っています」で止まる',
     freshDone?.status === 400 && /6 件/.test(freshDone.message), freshDone?.message || '例外が出ていない');
+  // 廃止済みのモールコードで行数だけ埋めても通らない (Codex R4)
+  for (const code of ['old_mall_a', 'old_mall_b', 'old_mall_c', 'old_mall_d', 'old_mall_e', 'old_mall_f']) {
+    db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, ?, 'done')`).run(idFresh, code);
+  }
+  let staleDone = null;
+  try { wfp.setStepState(idFresh, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { staleDone = e; }
+  check('廃止済みモールの行で件数を埋めても完了にできない',
+    staleDone?.status === 400 && /6 件/.test(staleDone.message), staleDone?.message || '例外が出ていない');
+  db.prepare(`DELETE FROM draft_mall_status WHERE draft_id = ? AND mall LIKE 'old_mall_%'`).run(idFresh);
   ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
 }
 

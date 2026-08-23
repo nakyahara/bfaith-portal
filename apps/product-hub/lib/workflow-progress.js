@@ -330,10 +330,15 @@ export function setStepState(
       }
       // **未完了の行を数える**のではなく、決着した行が全モール分あるかを見る (Codex R3)。
       // 行がまだ作られていないドラフト (詳細画面を開いていない・API直叩き) では
-      // 「未完了 0 件」になり、1 モールも出していないのに完了できてしまう
+      // 「未完了 0 件」になり、1 モールも出していないのに完了できてしまう。
+      // さらに現行のモールコードに限定し、DISTINCT で数える (Codex R4):
+      // mall 列に CHECK を張っていない (将来の追加のため) ので、廃止済みのコードが
+      // 残っていると行数だけでは 6 件に達してしまう
       const settled = db.prepare(`
-        SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ? AND state IN ('done', 'skip')
-      `).get(id).c;
+        SELECT COUNT(DISTINCT mall) AS c FROM draft_mall_status
+        WHERE draft_id = ? AND state IN ('done', 'skip')
+          AND mall IN (${MALLS.map(() => '?').join(',')})
+      `).get(id, ...MALLS.map((m) => m.code)).c;
       if (settled < MALLS.length) {
         throw badRequest(`まだ展開していないモールが ${MALLS.length - settled} 件あります。「モール別の展開状況」で進めると自動で完了になります`);
       }
