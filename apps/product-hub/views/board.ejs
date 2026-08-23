@@ -26,6 +26,12 @@
   .kb-img { font-size: 10px; padding: 1px 6px; border-radius: 999px; background: #e2e8f0; color: #475569; }
   .kb-img.done { background: #dcfce7; color: #166534; }
   .kb-img.todo { background: #fef3c7; color: #92400e; }
+  .kb-malls { display: flex; align-items: center; gap: 2px; margin-top: 5px; }
+  .mall-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #e2e8f0; }
+  .mall-dot.mall-done { background: #16a34a; }
+  .mall-dot.mall-doing { background: #f59e0b; }
+  .mall-dot.mall-skip { background: #cbd5e1; opacity: .5; }
+  .mini { font-size: 10px; color: #94a3b8; margin-left: 3px; }
   .kb-progress { height: 3px; background: #e2e8f0; border-radius: 999px; margin-top: 6px; overflow: hidden; }
   .kb-progress > i { display: block; height: 100%; background: #60a5fa; }
   .kb-empty { font-size: 11px; color: #94a3b8; text-align: center; padding: 10px 0; }
@@ -105,6 +111,15 @@
                   🖼 <%= c.imageDone ? '済' : (c.imageCurrent ? c.imageCurrent.label : '—') %>
                 </span>
               </div>
+              <% if (c.malls && col.code === 'listing') { %>
+                <%# 出品・展開の列だけ、どのモールまで並んだかを出す %>
+                <div class="kb-malls">
+                  <% for (const m of c.malls) { %>
+                    <span class="mall-dot mall-<%= m.state %>" title="<%= m.label %>: <%= stepStateLabels[m.state] %>"></span>
+                  <% } %>
+                  <span class="mini"><%= c.malls.filter((m) => m.state === 'done').length %>/<%= c.malls.length %></span>
+                </div>
+              <% } %>
               <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
             </a>
           <% } %>

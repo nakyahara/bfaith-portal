@@ -36,7 +36,12 @@ export const SOURCE_NOTION_IMPORT = 'notion_import';
  * ALTER で足した列には CHECK を付けられないため、コード側を fail-closed にして担保する。
  */
 export function canWriteToNotion(draft) {
-  return !!draft && draft.source === SOURCE_PORTAL;
+  if (!draft || draft.source !== SOURCE_PORTAL) return false;
+  // セット派生の仮コード (SET-xxx-01) でカードを作らせない (Codex R1 high 2026-08-23)。
+  // 仮コードのカードが商品マスターに残ると、RYS など Notion を読む側が実在しない
+  // 商品コードを掴む。本コードに差し替わってから作る
+  if (draft.provisional_code === 1) return false;
+  return true;
 }
 
 /** Notion 取り込み由来か (削除許可など「取り込みだけ」を対象にする判定用) */
@@ -527,6 +532,36 @@ export function initProductHubDB() {
     CREATE INDEX IF NOT EXISTS idx_dsp_step ON draft_step_progress(step_code, state);
     CREATE INDEX IF NOT EXISTS idx_dsp_assignee ON draft_step_progress(assignee_id, state);
 
+    -- 商品 × モールの展開状況 (2026-08-23 中原さん: 「出品・展開はモールごとにステータスを作る」)。
+    -- 工程「出品・展開」の中身。全モールが done/skip になるとその工程が完了する。
+    -- mall コードは lib/mall-status.js の MALLS が正 (CHECK は将来のモール追加を
+    -- テーブル再作成なしでできるよう**あえて張らない**。値の検証はコード側)
+    CREATE TABLE IF NOT EXISTS draft_mall_status (
+      draft_id    INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      mall        TEXT NOT NULL,                  -- rakuten / yahoo / aupay / mercari / qoo10 / linegift
+      state       TEXT NOT NULL DEFAULT 'todo' CHECK (state IN ('todo', 'doing', 'done', 'skip')),
+      assignee_id INTEGER REFERENCES ph_staff(id),
+      listed_at   TEXT,                           -- 掲載できた日時
+      item_url    TEXT,                           -- 掲載ページ (確認用)
+      note        TEXT,
+      version     INTEGER NOT NULL DEFAULT 0,     -- 楽観ロック (工程と同じ方式)
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, mall)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dms_mall ON draft_mall_status(mall, state);
+    CREATE INDEX IF NOT EXISTS idx_dms_assignee ON draft_mall_status(assignee_id, state);
+
+    -- セット商品の構成 (2026-08-23)。工程「セット商品作成検討」で単品から派生させたとき、
+    -- 「何を何個まとめたセットか」を持つ。AI に説明文を書かせるときの文脈にも使う
+    -- (これが無いと単品のコピーみたいなタイトルになる)
+    CREATE TABLE IF NOT EXISTS draft_set_members (
+      set_draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      member_ne_code TEXT NOT NULL,
+      qty            INTEGER NOT NULL DEFAULT 1 CHECK (qty BETWEEN 1 AND 999),
+      sort           INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (set_draft_id, member_ne_code)
+    );
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
@@ -579,6 +614,15 @@ export function initProductHubDB() {
   if (!draftCols.has('source_notion_status')) {
     // 取り込み時点の Notion Status (⓪新規商品_高島 等)。product_drafts.status とは別軸なので原文保持
     db.exec('ALTER TABLE product_drafts ADD COLUMN source_notion_status TEXT');
+  }
+  // セット派生 (2026-08-23): どの単品から作ったセットか / 商品コードがまだ仮か。
+  // 仮コードのまま楽天に出すと直せない (manage_number は登録後に変えられない) ので、
+  // 出品ゲートでこのフラグを見て止める
+  if (!draftCols.has('parent_draft_id')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN parent_draft_id INTEGER');
+  }
+  if (!draftCols.has('provisional_code')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN provisional_code INTEGER NOT NULL DEFAULT 0');
   }
   if (!draftCols.has('imported_at')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN imported_at TEXT');

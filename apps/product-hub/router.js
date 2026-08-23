@@ -27,6 +27,10 @@ import {
 import {
   progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
 } from './lib/workflow-progress.js';
+import {
+  MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
+} from './lib/mall-status.js';
+import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -191,6 +195,8 @@ router.get('/detail/:id', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  // 「本コードに差し替えたが NE 未取込だった」商品を、NE に現れていれば確定させる
+  reconcileProvisionalCode(db, draft);
   const yahoo = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draft.id) || null;
   const imageProduction = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draft.id) || null;
   const refs = db.prepare('SELECT * FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id').all(draft.id);
@@ -284,6 +290,11 @@ router.get('/detail/:id', (req, res) => {
     // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
     isAdmin: req.session?.role === 'admin',
     myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
+    // モール別の展開状況 (工程「出品・展開」の中身)
+    mallStatus: mallStatusOf(draft.id, { db }),
+    // セット商品: 親なら作ったセットの一覧、セットなら親と構成
+    setDrafts: setDraftsOf(db, draft.id),
+    setInfo: setInfoOf(db, draft.id),
   });
 });
 
@@ -1127,6 +1138,12 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
   try {
     const r = await registerItem(draft.id, { actor: actorOf(req) });
     if (!r.ok) return res.status(400).json({ ok: false, error: r.error || (r.reasons || []).join(' / '), reasons: r.reasons });
+    // 楽天モールを完了にする (人に二度同じことを押させない)。
+    // fail-soft: ここで失敗しても出品は成功しているので、出品結果は返す
+    markRakutenListed(getDB(), draft.id, {
+      itemUrl: rakutenItemPageUrl(draft.ne_code),
+      actor: actorOf(req),
+    });
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
@@ -1519,7 +1536,8 @@ router.get('/board', (req, res) => {
   const raw = String(req.query.assignee || '').trim();
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
   const unassignedOnly = String(req.query.filter || '') === 'unassigned';
-  const board = boardData(db, { assigneeId, unassignedOnly });
+  // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
+  const board = boardData(db, { assigneeId, unassignedOnly, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
@@ -1622,6 +1640,87 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
       requireVersion: true,
     });
     res.json({ ok: true, changed: r.changed, version: r.version });
+  } catch (e) { workflowError(res, e); }
+});
+
+// セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。
+// 単品の出品は止めず、セットは別カードとして並走させる (中原さん 2026-08-23)
+router.post('/api/drafts/:id/set-drafts', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    // 権限判定は createSetDraft 内の setStepState (親の「セット商品作成検討」を閉じる操作) が行う。
+    // 判断した本人か admin だけが作れる = 誰かのレビュー中に横から作られない
+    const me = staffByPortalEmail(req.session?.email);
+    const r = createSetDraft(draft.id, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+    });
+    res.json({ ok: true, draftId: r.draftId, neCode: r.neCode });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 仮コード (SET-xxx-01) を NE 登録後の本コードへ差し替える。
+// これをやらないと buildItemPayload が出品を止める (manage_number は後から変えられないため)
+router.post('/api/drafts/:id/set-code', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const db = getDB();
+  if (draft.provisional_code !== 1) {
+    return res.status(400).json({ ok: false, error: 'この商品の商品コードは仮ではありません' });
+  }
+  // 出品先を決める不可逆な操作なので、担当者本人か admin だけに許す (Codex R1 high)
+  const isAdmin = req.session?.role === 'admin';
+  if (!isAdmin) {
+    const me = staffByPortalEmail(req.session?.email);
+    const cur = progressOf(draft.id, { db }).current;
+    if (!cur || cur.assignee_id == null || cur.assignee_id !== (me?.id ?? null)) {
+      return res.status(403).json({ ok: false, error: '商品コードの差し替えは、いまの工程の担当者か管理者だけができます' });
+    }
+  }
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: '商品コードを入力してください' });
+  if (/^SET-/i.test(code)) {
+    return res.status(400).json({ ok: false, error: '仮コードのままにはできません (ネクストエンジンの商品コードを入れてください)' });
+  }
+  if (!isNeCodeUniqueEnforced()) {
+    return res.status(409).json({ ok: false, error: '商品コードの一意制約が張れていないため変更できません (管理者に連絡してください)' });
+  }
+  const dup = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ? AND id != ?')
+    .get(code.trim().toLowerCase(), draft.id);
+  if (dup) return res.status(400).json({ ok: false, error: `商品コード「${code}」は別のドラフト (#${dup.id}) が使っています` });
+
+  // NE 商品マスタに無いコードでも差し替えは許すが、**仮フラグは落とさない** (Codex R1 medium)。
+  // 登録直後で mirror 未取込のことがあるので入力自体は通し、出品ゲートは閉じたままにする。
+  // NE に現れたら詳細画面を開いたときに自動で確定する (reconcileProvisionalCode)
+  // 'conflict' (NE に同じコードが重複) や 'detached' は確認できたと見なさない。
+  // 曖昧なまま仮フラグを落とすと、誤ったコードで楽天に登録される
+  const neKind = resolveVariationGroup(db, code, { withMembers: false }).kind;
+  const inNe = neKind === 'single' || neKind === 'variation';
+  const info = db.prepare(`
+    UPDATE product_drafts SET ne_code = ?, provisional_code = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND provisional_code = 1 AND ne_code = ?
+  `).run(code, inNe ? 0 : 1, draft.id, draft.ne_code);
+  if (info.changes !== 1) {
+    return res.status(409).json({ ok: false, error: '別の操作が先に商品コードを変更しました。画面を読み直してください' });
+  }
+  logEvent(db, draft.id, 'set_code_fixed', `${draft.ne_code} → ${code}${inNe ? '' : ' (NE商品マスタに未確認)'}`, actorOf(req));
+  res.json({ ok: true, neCode: code, inNe });
+});
+
+// モール別の展開状況。権限・楽観ロックの約束は工程と同じ
+router.post('/api/drafts/:id/malls/:mall', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const r = setMallState(draft.id, req.params.mall, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+      requireVersion: true,
+    });
+    res.json({ ok: true, changed: r.changed, version: r.version, listingCompleted: r.listingCompleted });
   } catch (e) { workflowError(res, e); }
 });
 

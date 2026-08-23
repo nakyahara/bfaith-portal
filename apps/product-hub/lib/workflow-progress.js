@@ -13,8 +13,11 @@
  *     見ているため、二重管理を承知で並行させる。status を工程から導出する切替は次段階 (PR4)
  */
 import { getDB, logEvent } from '../db.js';
+// モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
+import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
+
 export const STEP_STATE_LABELS = {
   todo: '未着手',
   doing: '作業中',
@@ -318,6 +321,28 @@ export function setStepState(
   if (patch?.state !== undefined) {
     const state = String(patch.state);
     if (!STEP_STATES.includes(state)) throw badRequest('状態の指定が不正です');
+    // 「出品・展開」の完了はモール側が正 (Codex R2 medium)。
+    // ここを素通りさせると、状態セレクトから直接完了にして展開漏れを隠せてしまう
+    if (state === 'done' && code === LISTING_STEP) {
+      const prov = db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(id);
+      if (prov?.provisional_code === 1) {
+        throw badRequest('商品コードが仮のままです。ネクストエンジンの本コードに差し替えてから完了にしてください');
+      }
+      // **未完了の行を数える**のではなく、決着した行が全モール分あるかを見る (Codex R3)。
+      // 行がまだ作られていないドラフト (詳細画面を開いていない・API直叩き) では
+      // 「未完了 0 件」になり、1 モールも出していないのに完了できてしまう。
+      // さらに現行のモールコードに限定し、DISTINCT で数える (Codex R4):
+      // mall 列に CHECK を張っていない (将来の追加のため) ので、廃止済みのコードが
+      // 残っていると行数だけでは 6 件に達してしまう
+      const settled = db.prepare(`
+        SELECT COUNT(DISTINCT mall) AS c FROM draft_mall_status
+        WHERE draft_id = ? AND state IN ('done', 'skip')
+          AND mall IN (${MALLS.map(() => '?').join(',')})
+      `).get(id, ...MALLS.map((m) => m.code)).c;
+      if (settled < MALLS.length) {
+        throw badRequest(`まだ展開していないモールが ${MALLS.length - settled} 件あります。「モール別の展開状況」で進めると自動で完了になります`);
+      }
+    }
     if (state !== row.state) {
       stateChanged = true;
       sets.push('state = @state');
@@ -374,8 +399,6 @@ export function setStepState(
     params.due_date = due === '' ? null : due;
   }
 
-  if (sets.length === 0) return { changed: false };
-
   // 楽観ロック (Codex R1 → R2 → R3)。**単調増加の version** をトークンにする。
   // updated_at (ミリ秒精度) だと同一ミリ秒内の連続更新で値が変わらず、古い画面からの
   // 上書きをすり抜けさせる。version なら必ず変わる。
@@ -396,6 +419,10 @@ export function setStepState(
     conds.push('state = @prev_state');
     params.prev_state = row.state;
   }
+  // 版数の検証は「更新する内容があるか」より**前**に済ませる (Codex R2 medium)。
+  // 後ろに置くと、既に done の工程へ同じ状態を送る操作 (= 更新なし) が版数検査を素通りし、
+  // 古い画面からの二重送信を CAS で止められない
+  if (sets.length === 0) return { changed: false };
   const where = `WHERE ${conds.join(' AND ')}`;
 
   // UPDATE・監査ログ・**新しい版数の読み出し**を 1 トランザクションに閉じる。
@@ -431,7 +458,7 @@ export function setStepState(
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
  * @returns {{columns: Array, imageColumns: Array, doneCards: Array, total: number, truncated: boolean}}
  */
-export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800 } = {}) {
+export function boardData(db, { assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
     SELECT code, label, track, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -491,6 +518,8 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
   const imageColumns = steps.filter((s) => s.track === 'image').map((s) => ({ ...s, cards: [] }));
   const byCode = new Map([...columns, ...imageColumns].map((c) => [c.code, c]));
   const doneCards = [];
+  // 表示に残ったカードだけ後からモール状況を足す (全件に足すと無駄なクエリになる)
+  const cardsById = new Map();
 
   for (const d of drafts) {
     const p = summary.get(d.id);
@@ -516,6 +545,14 @@ export function boardData(db, { assigneeId = null, unassignedOnly = false, limit
     if (p.current) byCode.get(p.current.step_code)?.cards.push(card);
     else doneCards.push(card);
     if (p.imageCurrent) byCode.get(p.imageCurrent.step_code)?.cards.push(card);
+    cardsById.set(d.id, card);
+  }
+
+  // 「出品・展開」のカードはモールの進み具合が要る (どこまで並んだかが本体なので)。
+  // 循環 import を避けるため、呼び出し側から渡された関数で解決する
+  if (mallSummary && cardsById.size > 0) {
+    const malls = mallSummary(db, [...cardsById.keys()]);
+    for (const [id, card] of cardsById) card.malls = malls.get(id) || null;
   }
 
   // 停滞しているものを上に出す (打ち手が要るカードを埋もれさせない)

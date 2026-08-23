@@ -1968,6 +1968,257 @@ let wfDraftId = null;
     wfp.setStepState(id, 'set_review', { due_date: '2028-02-29' }, 'admin', ADMIN).changed === true);
 }
 
+// ─── モール別の展開状況 (2026-08-23 中原さん: 出品・展開はモールごと) ───
+const ms = await import('../lib/mall-status.js');
+{
+  check('モールは6つ (Amazon は含めない)', ms.MALLS.length === 6, ms.MALLS.map((m) => m.code).join(','));
+  check('LINEギフトが入っている', ms.MALLS.some((m) => m.code === 'linegift'));
+  check('Amazon は入れない', !ms.MALLS.some((m) => m.code === 'amazon'));
+
+  const id = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL', 'モールテスト', 'approved', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(id, { db });
+  // 出品・展開工程に担当を置くと、モールの初期担当がそこから入る
+  wfp.setStepState(id, 'listing', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+
+  const st = ms.mallStatusOf(id, { db });
+  check('モール行が自己修復で作られる', st.list.length === 6);
+  check('初期状態は未着手', st.list.every((m) => m.state === 'todo'));
+  check('モールの担当は出品・展開工程の担当を引き継ぐ', st.list.every((m) => m.assignee_id === wfOkawaId));
+  check('並びは MALLS 定義どおり', st.list[0].code === 'rakuten' && st.list[5].code === 'linegift');
+
+  // 楽天出品の成功で楽天モールが自動で完了になる
+  check('楽天出品を反映できる', ms.markRakutenListed(db, id, { itemUrl: 'https://item.rakuten.co.jp/b-faith/wf-mall/', actor: 'smoke' }) === true);
+  const st2 = ms.mallStatusOf(id, { db });
+  check('楽天が掲載済になる', st2.list.find((m) => m.code === 'rakuten').state === 'done');
+  check('掲載日が入る', !!st2.list.find((m) => m.code === 'rakuten').listed_at);
+  check('まだ工程は完了しない (他モールが残る)',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
+
+  // URL の検証
+  let urlErr = null;
+  try { ms.setMallState(id, 'yahoo', { item_url: 'javascript:alert(1)' }, 'admin', ADMIN); } catch (e) { urlErr = e; }
+  check('掲載URLは http(s) だけ通す', urlErr?.status === 400, urlErr?.message || '例外が出ていない');
+  check('http(s) の掲載URLは保存できる',
+    ms.setMallState(id, 'yahoo', { item_url: 'https://store.shopping.yahoo.co.jp/b-faith/wf-mall.html' }, 'admin', ADMIN).changed === true);
+
+  let mallErr = null;
+  try { ms.setMallState(id, 'amazon', { state: 'done' }, 'admin', ADMIN); } catch (e) { mallErr = e; }
+  check('未知のモールコードは弾く', mallErr?.status === 400);
+
+  // 権限 (工程と同じ約束)
+  let permErr = null;
+  try { ms.setMallState(id, 'yahoo', { state: 'done' }, 'tanaka', { isAdmin: false, actorStaffId: wfTanakaId }); } catch (e) { permErr = e; }
+  check('他人が担当のモールは動かせない', permErr?.status === 403, permErr?.message || '例外が出ていない');
+  check('担当者本人は動かせる',
+    ms.setMallState(id, 'yahoo', { state: 'done' }, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }).changed === true);
+
+  // 楽観ロック
+  const v0 = ms.mallStatusOf(id, { db }).list.find((m) => m.code === 'aupay').version;
+  const r1 = ms.setMallState(id, 'aupay', { state: 'doing' }, 'admin', ADMIN);
+  check('モールも版数が上がる', r1.version === v0 + 1);
+  let mlConflict = null;
+  try { ms.setMallState(id, 'aupay', { state: 'done', expected_version: v0 }, 'admin', ADMIN); } catch (e) { mlConflict = e; }
+  check('古い版数のモール更新を 409 で弾く', mlConflict?.status === 409);
+
+  // 全モールが決着すると工程「出品・展開」が自動で完了になる
+  ms.setMallState(id, 'aupay', { state: 'done' }, 'admin', ADMIN);
+  ms.setMallState(id, 'mercari', { state: 'done' }, 'admin', ADMIN);
+  ms.setMallState(id, 'qoo10', { state: 'skip' }, 'admin', ADMIN);
+  const last = ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
+  check('最後のモールで工程完了が返る', last.listingCompleted === true);
+  check('工程「出品・展開」が完了になる',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'done');
+  // セット検討がまだ残っているので、この時点では全工程完了ではない
+  check('出品が終わってもセット検討が残る', wfp.progressOf(id, { db }).current?.step_code === 'set_review');
+  wfp.setStepState(id, 'set_review', { state: 'done' }, 'admin', ADMIN);
+  check('全工程が終わってボードの完了列へ', wfp.progressOf(id, { db }).mainDone === true);
+  check('対象外は掲載済に数えない', ms.mallStatusOf(id, { db }).doneCount === 5);
+  check('決着済みの判定', ms.mallStatusOf(id, { db }).allSettled === true);
+
+  // モール側が正。決着が崩れたら工程も開き直す (「完了なのに未展開が残る」を作らない)
+  ms.setMallState(id, 'linegift', { state: 'todo' }, 'admin', ADMIN);
+  check('モールを戻すと出品・展開の完了も取り消される',
+    wfp.progressOf(id, { db }).main.find((s) => s.step_code === 'listing').state === 'todo');
+  check('取り消しがイベントに残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND detail LIKE '%完了を取り消し%'`).get(id).c === 1);
+  // 状態セレクトから直接完了にはできない (モール側が正)
+  let directDone = null;
+  try { wfp.setStepState(id, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { directDone = e; }
+  check('未展開モールがあるうちは工程を直接完了にできない', directDone?.status === 400, directDone?.message || '例外が出ていない');
+  // モール行がまだ作られていないドラフトでも直接完了させない (Codex R3: 未完了0件の穴)
+  const idFresh = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL-FRESH', 'モール未初期化', 'approved', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(idFresh, { db });
+  check('モール行が無い商品も直接完了にできない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ?').get(idFresh).c === 0);
+  let freshDone = null;
+  try { wfp.setStepState(idFresh, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { freshDone = e; }
+  check('未初期化でも「6件残っています」で止まる',
+    freshDone?.status === 400 && /6 件/.test(freshDone.message), freshDone?.message || '例外が出ていない');
+  // 廃止済みのモールコードで行数だけ埋めても通らない (Codex R4)
+  for (const code of ['old_mall_a', 'old_mall_b', 'old_mall_c', 'old_mall_d', 'old_mall_e', 'old_mall_f']) {
+    db.prepare(`INSERT INTO draft_mall_status (draft_id, mall, state) VALUES (?, ?, 'done')`).run(idFresh, code);
+  }
+  let staleDone = null;
+  try { wfp.setStepState(idFresh, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { staleDone = e; }
+  check('廃止済みモールの行で件数を埋めても完了にできない',
+    staleDone?.status === 400 && /6 件/.test(staleDone.message), staleDone?.message || '例外が出ていない');
+  db.prepare(`DELETE FROM draft_mall_status WHERE draft_id = ? AND mall LIKE 'old_mall_%'`).run(idFresh);
+  ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
+}
+
+// ─── セット商品の派生ドラフト (2026-08-23) ───
+const sd = await import('../services/set-derive.js');
+let wfSetDraftId = null;
+let wfSetParentId = null;
+{
+  const parentId = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, price, jan_code, official_url, own_brand, created_by)
+     VALUES ('WF-SET-P', 'セット元商品', 'approved', 1980, '4901234567894', 'https://example.com/p', 1, 'smoke')`
+  ).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, 'サイズ', '10cm', 0)`).run(parentId);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', 'ステンレス', 1)`).run(parentId);
+  db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '50ml', 2)`).run(parentId);
+  db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
+  db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
+  // 商品ページ表記: セットで変わるもの (内容量・サイズ・食品表示) が引き継がれないことを見る
+  db.prepare(`
+    INSERT INTO draft_page_info (draft_id, product_type, content_volume, size_text, ingredients,
+      seller_name, food_name, food_ingredients, food_expiry, food_storage)
+    VALUES (?, 'food', '50ml', '10cm×5cm', '水、香料', '株式会社B-Faith', '清涼飲料水', '果糖ぶどう糖液糖', 'ラベルに記載', '直射日光を避けて保存')
+  `).run(parentId);
+  wfp.progressOf(parentId, { db });
+
+  // 親の「セット商品作成検討」を閉じる操作なので、版数と権限文脈が要る
+  const setReviewVersion = () => wfp.progressOf(parentId, { db }).main.find((x) => x.step_code === 'set_review').version;
+  let noPermErr = null;
+  try {
+    sd.createSetDraft(parentId, { mode: 'ai', parent_step_version: setReviewVersion() }, 'smoke',
+      { isAdmin: false, actorStaffId: null });
+  } catch (e) { noPermErr = e; }
+  check('担当者でない人はセットを作れない', noPermErr?.status === 403, noPermErr?.message || '例外が出ていない');
+  check('作れなかったときは派生ドラフトも残らない',
+    db.prepare(`SELECT COUNT(*) AS c FROM product_drafts WHERE parent_draft_id = ?`).get(parentId).c === 0);
+
+  const r = sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'WF-SET-P', qty: 2 }], parent_step_version: setReviewVersion() }, 'smoke', ADMIN);
+  wfSetDraftId = r.draftId; wfSetParentId = parentId;
+  check('仮コードで作られる', r.neCode === 'SET-WF-SET-P-01', r.neCode);
+  const set1 = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('仮コードのフラグが立つ', set1.provisional_code === 1);
+  check('親が記録される', set1.parent_draft_id === parentId);
+  check('商品名が自動で付く', /セット/.test(set1.name), set1.name);
+
+  // コピーする/しないの切り分け (ここを間違えると直し忘れが一番危ない)
+  check('売価はコピーしない', set1.price == null);
+  check('JANはコピーしない', set1.jan_code == null);
+  check('公式URLはコピーする', set1.official_url === 'https://example.com/p');
+  check('自社商品フラグはコピーする', set1.own_brand === 1);
+  check('仕様表: 数量に依存しない行はコピーする',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ? AND spec_key = '素材'`).get(r.draftId).c === 1);
+  check('仕様表: サイズ・内容量はコピーしない (2個セットに単品の値が残る)',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_specs WHERE draft_id = ? AND spec_key IN ('サイズ','内容量')`).get(r.draftId).c === 0);
+  check('落とした仕様表の件数をイベントに残す',
+    /仕様表 2 行/.test(db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'created_from_parent'`).get(r.draftId)?.detail || ''));
+  check('参考URLはコピーする',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(r.draftId).c === 1);
+  check('楽天ジャンルはコピーする',
+    db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.genre_id === '565004');
+  check('画像はコピーしない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(r.draftId).c === 0);
+  check('AIモードでは説明文をコピーしない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(r.draftId).c === 0);
+
+  // 工程の開始位置
+  const sp = wfp.progressOf(r.draftId, { db });
+  check('AIモードは AI情報入力待ち から', sp.current?.step_code === 'ai_generate');
+  check('セットの画像トラックは未着手', sp.image.every((s) => s.state === 'todo'));
+  check('構成が保存される',
+    db.prepare('SELECT qty FROM draft_set_members WHERE set_draft_id = ?').get(r.draftId).qty === 2);
+  check('親のセット検討工程が完了する',
+    wfp.progressOf(parentId, { db }).main.find((s) => s.step_code === 'set_review').state === 'done');
+  check('親のイベントに記録が残る',
+    db.prepare(`SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'set_draft_created'`).get(parentId).c === 1);
+
+  // copy モードは説明文を持って商品説明確認から
+  const r2 = sd.createSetDraft(parentId, { mode: 'copy', members: [{ ne_code: 'WF-SET-P', qty: 3 }], parent_step_version: setReviewVersion() }, 'smoke', ADMIN);
+  check('2件目は連番になる', r2.neCode === 'SET-WF-SET-P-02', r2.neCode);
+  check('copyモードは説明文をコピーする',
+    db.prepare('SELECT content FROM draft_ai_outputs WHERE draft_id = ? AND kind = ?').get(r2.draftId, 'rakuten_title')?.content === '単品のタイトル');
+  check('copyモードは 商品説明確認 から', wfp.progressOf(r2.draftId, { db }).current?.step_code === 'desc_review');
+
+  // 検証
+  let modeErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'unknown' }, 'smoke'); } catch (e) { modeErr = e; }
+  check('作り方の指定を検証する', modeErr?.status === 400);
+  let qtyErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 0 }] }, 'smoke'); } catch (e) { qtyErr = e; }
+  check('個数を検証する', qtyErr?.status === 400);
+  let fracErr = null;
+  try { sd.createSetDraft(parentId, { mode: 'ai', members: [{ ne_code: 'X', qty: 1.5 }] }, 'smoke'); } catch (e) { fracErr = e; }
+  check('小数の個数は黙って丸めず弾く', fracErr?.status === 400, fracErr?.message || '例外が出ていない');
+  let nestErr = null;
+  try { sd.createSetDraft(r.draftId, { mode: 'ai' }, 'smoke'); } catch (e) { nestErr = e; }
+  check('セットからさらにセットは作れない', nestErr?.status === 400);
+
+  // 出品ゲート: 仮コードのままでは出品できない
+  const payload = listing.buildItemPayload(db, r.draftId);
+  check('仮コードのままでは出品を止める',
+    (payload.reasons || []).some((x) => /商品コードが仮のまま/.test(x)),
+    JSON.stringify(payload.reasons || []).slice(0, 200));
+
+  // 商品ページ表記のコピー範囲 (Codex R1 high: 数量で変わるものと食品表示は引き継がない)
+  const spi = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(r.draftId);
+  check('ページ表記: 区分はコピーする', spi?.product_type === 'food');
+  check('ページ表記: 販売者はコピーする', spi?.seller_name === '株式会社B-Faith');
+  check('ページ表記: 成分はコピーする', spi?.ingredients === '水、香料');
+  check('ページ表記: 内容量はコピーしない (50mlの2個セットが50mlになる)', spi?.content_volume == null);
+  check('ページ表記: サイズはコピーしない', spi?.size_text == null);
+  check('ページ表記: 食品表示はコピーしない (法定表示は人が確認する)',
+    spi?.food_name == null && spi?.food_ingredients == null && spi?.food_expiry == null && spi?.food_storage == null);
+
+  // 仮コードのまま外に漏れない (Notion カード / モール完了 / 工程の自動完了)
+  const setDraftRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('仮コードは Notion カードを作らせない', dbmod.canWriteToNotion(setDraftRow) === false);
+  let mallProv = null;
+  try { ms.setMallState(r.draftId, 'yahoo', { state: 'done' }, 'admin', ADMIN); } catch (e) { mallProv = e; }
+  check('仮コードのままモールを掲載済にできない', mallProv?.status === 400, mallProv?.message || '例外が出ていない');
+  // 全部 skip にしても工程は閉じない (skip 経由の抜け道を塞ぐ)
+  for (const m of ms.MALLS) ms.setMallState(r.draftId, m.code, { state: 'skip' }, 'admin', ADMIN);
+  check('仮コードのままでは出品・展開工程が閉じない',
+    wfp.progressOf(r.draftId, { db }).main.find((s) => s.step_code === 'listing').state !== 'done');
+
+  // 本コードへの差し替え: NE に無ければ仮フラグは残る → NE に現れたら自動で確定する
+  db.prepare(`UPDATE product_drafts SET ne_code = 'WF-SET-REAL' WHERE id = ?`).run(r.draftId);
+  const notInNe = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId);
+  check('NE未確認なら仮フラグは残る', notInNe.provisional_code === 1);
+  check('NE未確認でも出品は止まる',
+    (listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /NE商品マスタに見つかりません/.test(x)));
+  check('NEに無いうちは自動確定しない', sd.reconcileProvisionalCode(db, { ...notInNe }) === false);
+  // NE 商品マスタに現れたら確定する
+  db.prepare(`
+    INSERT INTO mirror_products
+      (product_id, 商品コード, 商品名, 商品区分, 取扱区分, 原価状態, 代表商品コード, updated_at)
+    VALUES (99401, 'WF-SET-REAL', 'セット商品 実コード', '1', '取扱中', '1', 'WF-SET-REAL', '2026-08-23T00:00:00Z')
+  `).run();
+  check('NEに現れたら自動で確定する', sd.reconcileProvisionalCode(db, { ...notInNe }) === true);
+  check('確定後は出品ゲートが開く',
+    !(listing.buildItemPayload(db, r.draftId).reasons || []).some((x) => /商品コード/.test(x)));
+  check('確定後は Notion カードも作れる',
+    dbmod.canWriteToNotion(db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(r.draftId)) === true);
+  db.prepare(`DELETE FROM mirror_products WHERE product_id = 99401`).run();
+
+  // 親側・セット側の表示用データ
+  check('親からセット一覧が引ける', sd.setDraftsOf(db, parentId).length === 2);
+  const info = sd.setInfoOf(db, r.draftId);
+  check('セットから親が引ける', info?.parent?.id === parentId);
+  check('セットの構成が引ける', info.members[0].qty === 2);
+  check('単品では setInfo が null', sd.setInfoOf(db, parentId) === null);
+}
+
 // ─── かんばんボード (2026-08-23) ───
 {
   const idHold = Number(db.prepare(
@@ -2000,7 +2251,11 @@ let wfDraftId = null;
   // 担当者で絞る
   const mine = wfp.boardData(db, { assigneeId: wfTanakaId });
   const mineIds = mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards.map((x) => x.id));
-  check('ボード: 担当者で絞れる', mineIds.length > 0 && mineIds.length <= onBoard.size + mine.imageColumns.length * 2);
+  check('ボード: 担当者で絞ると全部その人のボールになる',
+    mine.columns.concat(mine.imageColumns).flatMap((c) => c.cards)
+      .every((c) => c.current?.assignee_id === wfTanakaId || c.imageCurrent?.assignee_id === wfTanakaId),
+    `件数=${mineIds.length}`);
+  check('ボード: 絞り込みは全件より少ない', mineIds.length < onBoard.size * 2, `${mineIds.length} / ${onBoard.size}`);
   const other = wfp.boardData(db, { assigneeId: wfOkawaId });
   check('ボード: 担当していない人には出ない',
     other.columns.flatMap((c) => c.cards).every((c) => c.current?.assignee_id === wfOkawaId || c.imageCurrent?.assignee_id === wfOkawaId));
@@ -2710,10 +2965,20 @@ renders.push(
       { ...d0[2], isAdmin: false, myStaffId: wfTanakaId }]);
   }
 }
+// セット商品まわり: 親 (作成済みセットの一覧あり) と セット側 (仮コード警告あり)
+{
+  const d0 = renders.find((r) => r[1] === 'detail.ejs');
+  if (d0 && wfSetDraftId) {
+    renders.push(['detail.ejs (セットの親・作成済み一覧)', 'detail.ejs',
+      { ...d0[2], setDrafts: sd.setDraftsOf(db, wfSetParentId), setInfo: null }]);
+    renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
+      { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
+  }
+}
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
-  board: wfp.boardData(db, {}), staff: wf.listStaff(),
+  board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
   me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false,
   stepStateLabels: wfp.STEP_STATE_LABELS,
 };
@@ -2738,6 +3003,8 @@ for (const [name, file, data] of renders) {
         workflowStaff: wf.listStaff(),
         stepStateLabels: wfp.STEP_STATE_LABELS,
         isAdmin: true, myStaffId: null,
+        mallStatus: ms.mallStatusOf(wfDraftId, { db }),
+        setDrafts: [], setInfo: null,
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),
