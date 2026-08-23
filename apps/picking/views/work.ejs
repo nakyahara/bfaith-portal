@@ -49,23 +49,18 @@
       font-size: 54px; line-height: 1.15; white-space: nowrap; overflow: hidden;
       font-variant-numeric: tabular-nums; padding: 2px 8px 0;
     }
-    /* 次のロケーションの予告 (歩き出す方向を先に決められる)。チラ見で読める太さ・大きさに */
-    #nextloc {
-      text-align: center; font-size: 21px; font-weight: 700; color: #f1f3f5; padding: 2px 8px;
-      font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden;
-    }
     /* ロケ色分け (2026-08-12 中原さん採用):
        背景色=棚 (今と次が同じ色=同じ棚=近い、色が違う=移動が来る、を読まずに判断できる)
        左帯=ブロック (P3FA等は4つしかないので「この色=このブロック」を覚えられる。
        棚色が変わって左帯まで変わったら別ブロックへの大移動の予告)
        右帯は透明のダミー (左帯の分だけ中央がずれないよう左右対称にする) */
-    #loc, #nextloc {
+    #loc {
       margin: 0 10px; border-radius: 10px;
       border-left: 10px solid transparent; border-right: 10px solid transparent;
     }
-    /* 画像は縦持ちでは高さ約24%に抑える (商品名2行の確保が最優先 — 実機FB) */
+    /* 画像は縦持ちでは高さ約20%に抑える (商品名2行 + NEXTサインの確保が優先 — 実機FB) */
     #imgbox {
-      flex: 0 0 auto; height: 24vh; min-height: 100px; margin: 4px 14px;
+      flex: 0 1 20vh; height: 20vh; min-height: 90px; margin: 4px 14px;
       display: flex; align-items: center; justify-content: center;
       background: #1c2127; border-radius: 12px; overflow: hidden;
     }
@@ -79,27 +74,93 @@
     }
     #qty.multi { color: #ffd43b; }   /* 2個以上は強調 (取忘れ/取りすぎ防止) */
     #qty .x { font-size: 0.45em; font-weight: 600; color: #868e96; margin-right: 6px; }
-    /* 商品名は2行まで見せる (1行ellipsisだと肝心の商品名が読めない) */
+    /* 商品名は2行まで見せる (1行ellipsisだと肝心の商品名が読めない)。
+       23px/700 — 同じロケに複数SKUがある現場では商品の取り違えが最大リスク (Codexレビュー 2026-08-23) */
     #pname {
-      text-align: center; font-size: 19px; line-height: 1.35; padding: 0 14px; color: #f1f3f5;
+      text-align: center; font-size: 23px; font-weight: 700; line-height: 1.3; padding: 0 14px; color: #f1f3f5;
       display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
     }
-    #pname .suffix { color: #5c636a; font-size: 0.8em; }
-    #psku { text-align: center; font-size: 13px; color: #5c636a; padding-bottom: 4px; }
+    #pname .suffix { color: #5c636a; font-size: 0.8em; font-weight: 500; }
+    /* 商品コードは通常画面では出さない (13pt は読めないのに注意を取る — 同上)。欠品シート等では使う */
+    #psku { display: none; }
 
     #nextBtn {
-      flex: 0 0 26%; margin: 4px 10px 10px; border: none; border-radius: 16px;
+      flex: 0 0 18%; min-height: 84px; margin: 0 10px 10px; border: none; border-radius: 16px;
       background: #1971c2; color: #fff; font-size: 30px; font-weight: 700;
       display: flex; align-items: center; justify-content: center; cursor: pointer;
     }
     /* 背の低い端末 (iPhone SE等) は更に詰めて商品名2行を死守する */
     @media (orientation: portrait) and (max-height: 720px) {
       #loc { font-size: 44px; }
-      #imgbox { height: 20vh; }
+      #imgbox { flex-basis: 16vh; height: 16vh; }
       #qty { font-size: clamp(38px, 11vw, 60px); }
-      #pname { font-size: 17px; }
-      #nextBtn { flex-basis: 24%; font-size: 26px; }
+      #pname { font-size: 20px; }
+      #nextBtn { flex-basis: 16%; min-height: 72px; font-size: 26px; }
+      .signbox { --sign-h: 120px; }
     }
+
+    /* ── NEXTサイン (2026-08-23 中原さん指示・要件定義 ピッキングNEXTサイン_要件定義_20260823.md) ──
+       「次へ」の直上に置く (目線は ロケ→商品→次へ と落ち、親指が次へへ向かう瞬間に読む)。
+       3ゾーン固定 [動作 | 連の移動 | 段]。動作が無いときは左ゾーンを消して2ゾーン。
+       重い移動 (折り返す/階段/大きく移動/案内できず) はアンバーの枠・左帯・動作語。
+       押せるのは青い「次へ」だけ (サインは情報。袖や手のひらが触れても進まない) */
+    #sign { margin: 0 10px 6px; height: var(--sign-h); flex: 0 0 auto; }
+    .signbox {
+      --sign-h: 136px;
+      --icon-h: 42px; --n-size: 56px; --verb-size: 24px; --dan-size: 34px; --rel-size: 46px; --code-size: 23px; --sub-size: 14px;
+      --heavy: #ffb020; --heavy-text: #ffc078; --ren-color: #4dabf7;
+      border-radius: 16px; background: #1c2127; border: 3px solid #3a4250; border-left-width: 10px;
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: 6px 10px 6px 8px; position: relative; overflow: hidden;
+      container-type: inline-size;
+    }
+    /* 狭い画面 (iPhone mini 等) はサイン幅に比例して縮める。container query 非対応でも上の固定値で動く */
+    @supports (width: 1cqw) {
+      .signbox {
+        --icon-h: clamp(30px, 12cqw, 42px); --n-size: clamp(38px, 16cqw, 56px); --verb-size: clamp(18px, 7cqw, 24px);
+        --dan-size: clamp(24px, 9.5cqw, 34px); --rel-size: clamp(32px, 13cqw, 46px); --code-size: clamp(18px, 6.4cqw, 23px);
+      }
+    }
+    .signbox.heavy { border-color: var(--heavy); }
+    .signbox .zones { display: grid; grid-template-columns: 30% 1fr 28%; flex: 1 1 auto; min-height: 0; }
+    .signbox .zones.two { grid-template-columns: 1fr 28%; }
+    .signbox .zone { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; min-width: 0; padding: 0 4px; }
+    .signbox .zone + .zone { border-left: 1px solid #3a4250; }
+    .signbox .zone .main { display: flex; align-items: center; justify-content: center; gap: 4px; min-width: 0; max-width: 100%; }
+    .signbox .zone .sub { font-size: var(--sub-size); font-weight: 700; color: #868e96; line-height: 1.1; text-align: center; white-space: nowrap; }
+    .signbox .act .icon { height: var(--icon-h); width: auto; max-width: 100%; }
+    .signbox .act .verb { font-size: var(--verb-size); font-weight: 800; line-height: 1.1; text-align: center; word-break: keep-all; overflow-wrap: normal; }
+    .signbox.heavy .act .verb { color: var(--heavy-text); }
+    .signbox.heavy .act svg .st { stroke: var(--heavy-text); } .signbox.heavy .act svg .hd { fill: var(--heavy-text); }
+    .signbox .ren .icon { height: calc(var(--icon-h) * .9); width: auto; flex: 0 1 auto; max-width: 45%; }
+    .signbox .ren .n { font-size: var(--n-size); font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--ren-color); }
+    .signbox .ren .n small { font-size: .47em; font-weight: 700; color: #d0d5dd; margin-left: 2px; }
+    .signbox .ren svg .st { stroke: var(--ren-color); } .signbox .ren svg .hd { fill: var(--ren-color); }
+    .signbox .ren .here { font-size: calc(var(--n-size) * .8); font-weight: 800; color: var(--ren-color); }
+    .signbox .ren .here::before { content: "●"; font-size: .55em; margin-right: 8px; vertical-align: middle; }
+    .signbox .ren .code { font-size: var(--code-size); font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; min-width: 0; }
+    .signbox .dan .v { font-size: var(--dan-size); font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .signbox .dan .v small { font-size: .78em; font-weight: 700; margin-left: 1px; }
+    .signbox .dan .v.pk small { font-size: .55em; margin-right: 2px; }   /* 「ポケット」は長いので控えめに */
+    .signbox .dan .rel { font-size: var(--rel-size); font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+    .signbox .dan .rel + .v { font-size: calc(var(--dan-size) * .8); color: #dee2e6; }
+    .signbox .row2 {
+      display: flex; align-items: baseline; gap: 8px; flex: 0 0 auto; padding: 2px 2px 0;
+      font-size: var(--code-size); font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .01em; color: #dee2e6;
+      white-space: nowrap; overflow: hidden;
+    }
+    .signbox .row2 .lbl { font-size: 14px; font-weight: 600; color: #868e96; letter-spacing: .06em; }
+    .signbox .last { flex: 1; display: flex; align-items: center; justify-content: center; font-size: 26px; font-weight: 800; color: #adb5bd; }
+    .signbox svg .st { stroke: #f1f3f5; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .signbox svg .hd { fill: #f1f3f5; } .signbox svg .mk { fill: var(--heavy); } .signbox svg .blk { fill: #343a40; stroke: #495057; stroke-width: 2; }
+    /* 直前の案内: 現在ロケのタップで、押す前に出ていたサインを 2.5 秒だけ呼び戻す (歩き出してからの再確認用) */
+    #recall {
+      display: none; position: absolute; left: 10px; right: 10px; bottom: calc(10px + 18% + 6px); z-index: 4;
+      height: var(--sign-h); background: #0d1117; border-color: #868e96; box-shadow: 0 10px 30px rgba(0,0,0,.7);
+      overflow: visible;   /* 「直前の案内」のキャプションを枠の上に出す */
+    }
+    #recall.on { display: flex; }
+    #recall::before { content: "直前の案内"; position: absolute; top: -14px; left: 12px; background: #868e96; color: #111; font-size: 13px; font-weight: 800; padding: 1px 8px; border-radius: 6px; letter-spacing: .06em; }
     #nextBtn:active { background: #1864ab; }
     .subrow { display: flex; gap: 10px; padding: 0 10px 4px; flex: 0 0 auto; }
     .subrow button {
@@ -113,19 +174,27 @@
       #scr-pick.active {
         display: grid; gap: 4px 10px; padding: 0 10px 8px;
         grid-template-columns: 1.15fr 1fr minmax(96px, 16vw);
-        grid-template-rows: auto auto 1fr auto;
+        grid-template-rows: auto 1fr auto auto;
         grid-template-areas:
-          "loc     loc  next"
-          "nextloc nextloc next"
-          "det     img  next"
-          "sub     img  next";
+          "loc  loc  next"
+          "det  img  next"
+          "sub  img  next"
+          "sign sign next";
       }
       #loc { grid-area: loc; font-size: 44px; }
-      #nextloc { grid-area: nextloc; }
+      /* 横向き: サインは左下 = 右の「次へ」の真横。96pt に各ゾーンを横並び1行 + コード行で圧縮 */
+      #sign { grid-area: sign; margin: 0; }
+      .signbox {
+        --sign-h: 96px; padding: 3px 10px 3px 8px;
+        --icon-h: 34px; --n-size: 40px; --verb-size: 19px; --dan-size: 26px; --rel-size: 36px; --code-size: 18px; --sub-size: 13px;
+      }
+      .signbox .zone { flex-direction: row; gap: 8px; }
+      .signbox .row2 { padding-top: 0; }
+      #recall { bottom: 8px; right: calc(10px + 16vw + 10px); }
       #details { grid-area: det; justify-content: center; min-height: 0; }
       #qty { font-size: clamp(48px, 16vh, 88px); }
       #imgbox { grid-area: img; margin: 0; height: auto; flex: none; }
-      #nextBtn { grid-area: next; margin: 0 0 4px; font-size: 26px; }
+      #nextBtn { grid-area: next; margin: 0 0 4px; min-height: 0; font-size: 26px; }
       .subrow { grid-area: sub; padding: 0; align-items: end; }
     }
 
@@ -147,7 +216,7 @@
   <div class="bar">
     <a href="/apps/picking/">← 一覧</a>
     <span id="progress"></span>
-    <span><button id="voiceBtn" style="background:none; border:none; font-size:20px; padding:4px 8px; cursor:pointer; vertical-align:middle;">🔇</button><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
+    <span><span id="workerTag" style="cursor:pointer; padding:4px;"></span> <span id="clock"></span></span>
   </div>
   <div id="offline">オフライン — 操作は保存され、復帰後に自動送信されます</div>
   <div id="syncerr"></div>
@@ -167,7 +236,6 @@
   <!-- ピック画面 -->
   <div class="screen" id="scr-pick">
     <div id="loc"></div>
-    <div id="nextloc"></div>
     <div id="imgbox"><span class="noimg">画像なし</span></div>
     <div id="details">
       <div id="qty"></div>
@@ -179,6 +247,8 @@
       <button id="pauseBtn">⏸ 中断</button>
       <button id="shortBtn" style="color:#ffa8a8; border-color:#5c2e2e;">⚠ 欠品</button>
     </div>
+    <div id="sign" class="signbox" aria-live="polite"></div>
+    <div id="recall" class="signbox" aria-hidden="true"></div>
     <button id="nextBtn">次へ ▶</button>
   </div>
 
@@ -263,6 +333,7 @@
     </div>
   </div>
 
+  <script src="/apps/picking/next-sign.js"></script>
   <script>
     const BATCH = <%- JSON.stringify({
       id: state.batch.id, status: state.batch.status, worker: state.batch.worker,
@@ -274,7 +345,11 @@
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
       qty: l.qty, status: l.status, img: l.imageUrl,
+      block: l.block || '', location: l.location || '',   // NEXTサインの判定用 (生のロケ)
     }))).replace(/</g, '\\u003c') %>;
+    // ロケーション動線マスタ (面)。判定は next-sign.js (サーバーと同じコード)
+    const FACES = <%- JSON.stringify(faces || []).replace(/</g, '\\u003c') %>;
+    const FACE_INDEX = window.NextSign ? NextSign.buildIndex(FACES) : null;
     // セッションログイン時は email が入る。共用端末モードは null
     const SESSION_WORKER = <%- JSON.stringify(worker).replace(/</g, '\\u003c') %>;
     const DEVICE_MODE = !SESSION_WORKER;
@@ -379,9 +454,13 @@
     // 毎回フルコードを読むと冗長なので、色分けと同じ思想で「変わった時だけブロックを言う」。
     // iOS制約: 初回speakはユーザー操作起点が必要 → トグル押下/最初のタップでアンロックする。
     // ⚠ サイレントスイッチONのiPhoneは読み上げも消音される (倉庫端末は音量ON運用が前提)
-    let voiceOn = localStorage.getItem('pk_voice') === '1';
+    // 読み上げは常時オン (2026-08-23 中原さん決定。トグルは撤去)。端末のサイレントスイッチで消音はできる
+    const voiceOn = true;
     let lastSpokenSeq = null;
     let lastSpokenBlock = null;
+    // NEXTサイン: 「次へ」を押す直前に出していた案内。押した後の明細の読み上げ先頭 (動作語) と
+    // 「直前の案内」(ロケのタップで呼び戻す) に使う
+    let pendingMove = null;   // { targetSeq, descriptor, html }
     function speak(text) {
       if (!('speechSynthesis' in window)) return;
       try {
@@ -406,6 +485,11 @@
         text = `${blockPart}${p.shelf}の${p.ren}の${p.dan}、${qtyPart}`;
       } else {
         text = `${l.loc}、${qtyPart}`;   // 形式外ラベルはそのまま
+      }
+      // 重い移動 (折り返す/階段/大きく移動/案内できず) だけ、動作語を先頭に足す
+      // (歩き出す瞬間に耳に入る順 = 画面の語順。軽い移動は従来どおり)
+      if (!force && pendingMove && pendingMove.targetSeq === l.seq && window.NextSign) {
+        text = NextSign.speechPrefix(pendingMove.descriptor) + text;
       }
       speak(text);
       lastSpokenSeq = l.seq;
@@ -432,8 +516,7 @@
       speakLine(l);
       fitText($('loc'));
       const next = LINES.slice(idx + 1).find((x) => x.status === 'pending');
-      $('nextloc').textContent = next ? `次 → ${next.loc}` : 'これが最後の商品';
-      paintLoc($('nextloc'), next ? next.loc : null);
+      renderSign(l, next);
       renderImage(l);
       $('qty').innerHTML = `<span class="x">×</span>${l.qty}`;
       $('qty').className = l.qty >= 2 ? 'multi' : '';
@@ -444,6 +527,76 @@
       show('scr-pick');
       fitText($('loc'));   // 表示後 (幅確定後) にもう一度フィットさせる
     }
+
+    // ── NEXTサイン描画 ──
+    // 矢印 (SVG)。高さは CSS の --icon-h、幅は viewBox 比
+    const SW = 14;
+    const head = (x, y, dir) => {
+      const s = SW * 1.25;
+      const pts = { l: `${x},${y} ${x + s},${y - s} ${x + s},${y + s}`, r: `${x},${y} ${x - s},${y - s} ${x - s},${y + s}`,
+                    u: `${x},${y} ${x - s},${y + s} ${x + s},${y + s}`, d: `${x},${y} ${x - s},${y - s} ${x + s},${y - s}` }[dir];
+      return `<polygon class="hd" points="${pts}"/>`;
+    };
+    const svg = (inner, vb = '0 0 120 80') => `<svg class="icon" viewBox="${vb}" aria-hidden="true">${inner}</svg>`;
+    const ICONS = {
+      left:    () => svg(`<path class="st" stroke-width="${SW}" d="M112 40 H28"/>${head(16, 40, 'l')}`),
+      right:   () => svg(`<path class="st" stroke-width="${SW}" d="M8 40 H92"/>${head(104, 40, 'r')}`),
+      // 振り向く: 右から上がって左へ降りる (棚に向かって左へ進む向き — 2026-08-23 中原さん)
+      turn:    () => svg(`<path class="st" stroke-width="${SW}" d="M66 68 V34 a20 20 0 0 0 -40 0 V56"/>${head(26, 68, 'd')}`, '0 0 90 80'),
+      // 折り返す: 右端で回って左へ戻るヘアピン
+      hairpin: () => svg(`<path class="st" stroke-width="${SW}" d="M20 22 H112 a18 18 0 0 1 0 36 H60"/>${head(48, 58, 'l')}<rect class="blk" x="16" y="36" width="100" height="8" rx="3"/>`, '0 0 160 80'),
+      around:  () => svg(`<polygon class="blk" points="60,64 60,48 72,48 72,36 84,36 84,24 100,24 100,64"/><path class="st" stroke-width="${SW}" d="M28 66 V16 H132 V50"/>${head(132, 64, 'd')}`, '0 0 160 80'),
+      across:  () => svg(`<polygon class="blk" points="44,68 44,52 58,52 58,38 72,38 72,24 86,24 86,68"/><path class="st" stroke-width="${SW}" d="M20 40 H104"/>${head(116, 40, 'r')}`, '0 0 140 80'),
+      far:     () => svg(`<path class="st" stroke-width="${SW}" d="M16 40 H128"/>${head(140, 40, 'r')}<circle class="mk" cx="160" cy="40" r="11"/>`, '0 0 180 80'),
+      pouch:   () => svg(`<path class="st" stroke-width="6" d="M22 28 H58 L62 66 H18 Z M30 28 a10 10 0 0 1 20 0"/><path class="st" stroke-width="4" d="M26 44 H54"/>`, '0 0 80 80'),
+      unknown: () => svg(`<path class="st" stroke-width="7" d="M40 70 C40 70 14 46 14 30 a26 26 0 0 1 52 0 C66 46 40 70 40 70 Z"/><text x="40" y="40" text-anchor="middle" font-size="30" font-weight="800" fill="#f1f3f5">?</text>`, '0 0 80 80'),
+    };
+    // descriptor (next-sign.js の describe) → サインのHTML。3ゾーン [動作|連|段]、動作なしは2ゾーン
+    function signHtml(d) {
+      const act = d.act && d.act.icon
+        ? `<div class="zone act"><div class="main">${ICONS[d.act.icon] ? ICONS[d.act.icon]() : ''}</div><div class="verb">${esc(d.act.verb)}</div></div>` : '';
+      let renMain = '', renSub = '';
+      const r = d.ren || {};
+      if (r.here) { renMain = `<span class="here">ここ</span>`; renSub = r.sub || ''; }
+      else if (r.code) { renMain = `<span class="code">${esc(r.code)}</span>`; renSub = r.words || ''; }
+      else { renMain = `${r.icon && ICONS[r.icon] ? ICONS[r.icon]() : ''}<span class="n">${r.n}${r.unit ? `<small>${esc(r.unit)}</small>` : ''}</span>`; renSub = r.words || ''; }
+      const ren = `<div class="zone ren"><div class="main">${renMain}</div>${renSub ? `<div class="sub">${esc(renSub)}</div>` : ''}</div>`;
+      let dan = '<div class="zone dan"><div class="sub">—</div></div>';
+      if (d.dan) {
+        const abs = d.dan.label === 'ポケット'
+          ? `<span class="v pk"><small>ポケット</small>${d.dan.abs}</span>`
+          : `<span class="v">${d.dan.abs}<small>段目</small></span>`;
+        dan = `<div class="zone dan">${d.dan.rel ? `<div class="main"><span class="rel">${esc(d.dan.rel)}</span></div>` : ''}<div class="main">${abs}</div></div>`;
+      }
+      const row2 = d.kind === 'unknown' ? '' : `<div class="row2"><span class="lbl">次</span><span>${esc(d.nextLabel)}</span></div>`;
+      return `<div class="zones${act ? '' : ' two'}">${act}${ren}${dan}</div>${row2}`;
+    }
+    function renderSign(cur, next) {
+      const el = $('sign');
+      if (!next) { el.className = 'signbox'; el.innerHTML = '<div class="last">これが最後の商品</div>'; pendingMove = null; return; }
+      if (!window.NextSign || !FACE_INDEX) {   // マスタ未取得・スクリプト未読込: 従来どおり次ロケだけ
+        el.className = 'signbox'; el.innerHTML = `<div class="last">次 → ${esc(next.loc)}</div>`; pendingMove = null; return;
+      }
+      const d = NextSign.describe(FACE_INDEX, cur ? { block: cur.block, location: cur.location } : null, { block: next.block, location: next.location });
+      el.className = d.heavy ? 'signbox heavy' : 'signbox';
+      el.innerHTML = signHtml(d);
+      pendingMove = { targetSeq: next.seq, descriptor: d, html: el.innerHTML, heavy: d.heavy };
+    }
+    // 直前の案内: 現在ロケのタップで 2.5 秒だけ呼び戻す (押した後に「折り返しだっけ?」を確認する用)
+    let recallTimer = null;
+    function showRecall() {
+      const r = $('recall');
+      // 「直前の案内」は今の明細へ向かう案内のときだけ出す (戻る・同期エラー等でずれたら出さない)
+      const idx = currentIdx();
+      if (!lastMove || !lastMove.html || idx === -1 || LINES[idx].seq !== lastMove.targetSeq) return;
+      r.innerHTML = lastMove.html;
+      r.className = `signbox on${lastMove.heavy ? ' heavy' : ''}`;
+      clearTimeout(recallTimer);
+      recallTimer = setTimeout(() => r.classList.remove('on'), 2500);
+    }
+    $('recall').addEventListener('click', () => { clearTimeout(recallTimer); $('recall').classList.remove('on'); });
+    // 自動で消える (タイマー) ときも同じ
+    let lastMove = null;   // 「次へ」を押した時点の pendingMove (= 今向かっている場所への案内)
 
     // 1行に収まるまでフォントを縮める (ロケーションの折り返し禁止。桁の見間違い防止)
     function fitText(el) {
@@ -515,6 +668,7 @@
     $('nextBtn').addEventListener('click', () => {
       const idx = currentIdx();
       if (idx === -1) return;
+      lastMove = pendingMove;   // これから向かう場所への案内 (ロケのタップで呼び戻せる)
       LINES[idx].status = 'done';
       enqueue('next', LINES[idx].seq);
       if (navigator.vibrate) navigator.vibrate(15);
@@ -527,6 +681,7 @@
       const last = doneLines[doneLines.length - 1];
       last.status = 'pending';
       last.shortage_qty = null;
+      lastMove = null;   // 戻った先への案内は持っていないので「直前の案内」は出さない (Codexレビュー P1)
       if (BATCH.status === 'done') BATCH.status = 'picking';   // 完了直後の取り消し (サーバーも同挙動)
       enqueue('back', last.seq, NEXTOPS[last.seq] || null);
       render();
@@ -534,31 +689,13 @@
     $('backBtn').addEventListener('click', doBack);
     $('undoDoneBtn').addEventListener('click', doBack);
 
-    // ── 読み上げトグル (端末ごとに localStorage 保存) ──
-    function renderVoiceBtn() {
-      $('voiceBtn').textContent = voiceOn ? '🔊' : '🔇';
-      $('voiceBtn').style.opacity = voiceOn ? '1' : '0.4';
-    }
-    renderVoiceBtn();
-    $('voiceBtn').addEventListener('click', () => {
-      voiceOn = !voiceOn;
-      localStorage.setItem('pk_voice', voiceOn ? '1' : '0');
-      renderVoiceBtn();
-      if (!voiceOn) { try { speechSynthesis.cancel(); } catch {} return; }
-      // ONにしたタップ自体が iOS のアンロックを兼ねる。作業中なら今の明細をすぐ読み上げて確認させる
-      lastSpokenSeq = null;
-      lastSpokenBlock = null;
-      const idx = currentIdx();
-      if (started && idx !== -1 && $('scr-pick').classList.contains('active')) speakLine(LINES[idx]);
-      else speak('読み上げオン');
-    });
-    // ロケ表示のタップで再読み上げ (聞き逃し対策。ブロック名も含めて読み直す)
+    // ロケ表示のタップ = 再読み上げ (聞き逃し対策。ブロック名も含めて読み直す) + 直前の案内を呼び戻す
     $('loc').addEventListener('click', () => {
       const idx = currentIdx();
-      if (voiceOn && started && idx !== -1) { lastSpokenBlock = null; speakLine(LINES[idx], true); }
+      if (started && idx !== -1) { lastSpokenBlock = null; speakLine(LINES[idx], true); showRecall(); }
     });
-    // 読み上げONのまま再読込した端末は、最初のタップ (capture=ボタン処理より先) で無音アンロック
-    document.addEventListener('click', () => { if (voiceOn) speak(''); }, { once: true, capture: true });
+    // iOS は最初のユーザー操作で speechSynthesis をアンロックする必要がある (capture=ボタン処理より先)
+    document.addEventListener('click', () => { speak(''); }, { once: true, capture: true });
 
     // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
     let shortTarget = null;
@@ -592,6 +729,7 @@
     $('shortYes').addEventListener('click', () => {
       if (!shortTarget) return;
       closeShortSheet();
+      lastMove = pendingMove;   // 欠品で進むときも「直前の案内」を更新する (Codexレビュー P1)
       shortTarget.status = 'shortage';
       shortTarget.shortage_qty = shortVal;
       enqueue('shortage', shortTarget.seq, null, { shortage_qty: shortVal });

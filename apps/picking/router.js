@@ -30,6 +30,12 @@ import { notifyShortage } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { getFloorData } from './floor.js';
+// ロケーション動線マスタ (NEXTサイン)。起動時にマスタが空なら同梱CSVで初期化する
+import {
+  listFaces, importFaces, parseFacesCsv, validateFaces, knownLocationsFromLines,
+  listFaceImports, getFaceImportCsv, exportFacesCsv, ensureLocationFacesSeeded,
+} from './location-faces.js';
+import fs from 'fs';
 import { queueEnsureImages, getImageMap } from './images.js';
 import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
 // Drive共有ヘルパーと自動ポーリング (standaloneが起動。router は手動取込と状態表示に使う)
@@ -57,6 +63,7 @@ async function packingSvc() {
 // import 時 (= server.js boot 時) に DB を初期化する。migration 失敗はここで throw して
 // 旧スキーマのまま起動を継続させない (shipping-work と同規約)
 initPickingDB();
+ensureLocationFacesSeeded();
 
 // CS03002 は実測 ~9行で13KB (1行 ~1.5KB)。大規模バッチ (数百伝票) でも数MBで収まる
 const uploadCsv = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -312,7 +319,24 @@ router.get('/work/:id(\\d+)', (req, res) => {
     workers: listWorkers(),
     pauseReasons: PAUSE_REASONS,
     state,
+    // NEXTサイン用の面マスタ (45行程度)。判定は端末側 (next-sign.js) で行う
+    faces: listFaces(),
   });
+});
+
+// NEXTサインの判定ロジック (next-sign-core.cjs) をブラウザ用に配信する。
+// サーバーとブラウザで同じコードを使い、判定がずれないようにする (CommonJS を window.NextSign に包む)
+const NEXT_SIGN_CORE_PATH = path.join(__dirname, 'next-sign-core.cjs');
+let nextSignJsCache = null;
+router.get('/next-sign.js', (req, res) => {
+  if (!nextSignJsCache || process.env.NODE_ENV !== 'production') {
+    const src = fs.readFileSync(NEXT_SIGN_CORE_PATH, 'utf8');
+    nextSignJsCache = `(function(){ const module = { exports: {} };
+${src}
+window.NextSign = module.exports; })();
+`;
+  }
+  res.type('application/javascript').set('Cache-Control', 'no-cache').send(nextSignJsCache);
 });
 
 /**
@@ -784,6 +808,63 @@ router.post('/admin/import', checkOrigin, requireAdmin, (req, res, next) => {
   // 楽天白抜き画像の解決はバックグラウンドで (取込応答を待たせない・失敗しても取込は成立)
   queueEnsureImages(preview.lines.map((l) => l.sku), preview.tbNo.split(',')[0]);
   res.json({ ok: true, mode: 'confirm', ...summary, ...result });
+}));
+
+// ─── ロケーション動線マスタ (NEXTサイン・管理者) ───
+
+router.get('/admin/locations', requireAdmin, (req, res) => {
+  res.render(path.join(__dirname, 'views/admin_locations'), {
+    title: 'ロケーション動線 | ピッキング支援',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    faces: listFaces(),
+    imports: listFaceImports(20),
+  });
+});
+
+/** 現在のマスタを CSV で返す (Excel で直して再取込する用)。 */
+router.get('/admin/locations/export.csv', requireAdmin, (req, res) => {
+  res.type('text/csv; charset=utf-8')
+    .set('Content-Disposition', `attachment; filename="location-faces-${jstToday()}.csv"`)
+    .send(exportFacesCsv());
+});
+
+/** 過去に取り込んだ版の CSV (戻したいときに再取込する)。 */
+router.get('/admin/locations/imports/:id(\d+).csv', requireAdmin, (req, res) => {
+  const row = getFaceImportCsv(Number(req.params.id));
+  if (!row) return res.status(404).send('見つかりません');
+  res.type('text/csv; charset=utf-8')
+    .set('Content-Disposition', `attachment; filename="location-faces-import-${req.params.id}.csv"`)
+    .send(row.csv_text);
+});
+
+/**
+ * 取込API (管理者)。multipart: file=CSV。
+ *   mode=preview … 解析+検証の結果 (エラー・警告・面一覧) を返すだけ
+ *   mode=confirm … 全置換して履歴に残す
+ * CS03002 取込と同じ二段方式 (サーバーに中間状態を持たない)
+ */
+router.post('/admin/locations', checkOrigin, requireAdmin, (req, res, next) => {
+  uploadCsv.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
+    next();
+  });
+}, api(async (req, res) => {
+  if (!req.file) throw new PkError(400, 'no_file', 'ファイルを選択してください');
+  const faces = parseFacesCsv(req.file.buffer);
+  const v = validateFaces(faces, { knownLocations: knownLocationsFromLines() });
+  const summary = {
+    faceCount: v.faces.length, totalSlots: v.totalSlots, errors: v.errors, warnings: v.warnings,
+    racks: new Set(v.faces.map((f) => f.rack_id)).size,
+    faces: v.faces.map((f) => ({
+      seq_no: f.seq_no, block: f.block, col: f.col, ren_from: f.ren_from, ren_to: f.ren_to,
+      face_kind: f.face_kind, rack_id: f.rack_id, move_in: f.move_in, reliable: f.reliable, direction: f.direction,
+    })),
+  };
+  if (String(req.body.mode) !== 'confirm') return res.json({ ok: v.ok, mode: 'preview', ...summary });
+  if (!v.ok) throw new PkError(400, 'invalid_faces', `検証エラーがあるため取り込めません:\n${v.errors.join('\n')}`);
+  const result = importFaces(req.file.buffer, { actor: req.session.email, filename: req.file.originalname });
+  res.json({ ok: true, mode: 'confirm', ...summary, importId: result.importId });
 }));
 
 // ─── Drive取込 (出荷_no フォルダ・管理者) ───
