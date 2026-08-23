@@ -161,6 +161,7 @@
             <th style="width:160px">商品コード</th>
             <th style="width:120px">バリエーション</th>
             <th style="width:110px">ステータス</th>
+            <th style="width:170px">工程 / 担当</th>
             <th style="width:90px">出自</th>
             <th style="width:90px">Notion</th>
             <th style="width:150px">更新日時</th>
@@ -193,6 +194,24 @@
                 <% } %>
               </td>
               <td><span class="badge badge-<%= d.status %>"><%= statusLabels[d.status] || d.status %></span></td>
+              <td style="font-size:12px;">
+                <% if (d.workflow && d.workflow.current) { %>
+                  <%= d.workflow.current.label %>
+                  <% if (d.workflow.current.assignee_name) { %>
+                    <br><span class="wf-dot" style="background:<%= d.workflow.current.assignee_color || '#94a3b8' %>"></span>
+                    <%= d.workflow.current.assignee_name %>
+                  <% } else { %>
+                    <br><span class="muted">未割り当て</span>
+                  <% } %>
+                  <% if (d.workflow.stalledDays) { %>
+                    <br><span style="color:#b91c1c; font-weight:600;">⚠️ <%= d.workflow.stalledDays %>日 停滞</span>
+                  <% } %>
+                <% } else if (d.workflow && d.workflow.totalCount > 0) { %>
+                  <span style="color:#166534; font-weight:600;">全工程 完了</span>
+                <% } else { %>
+                  <span class="muted">—</span>
+                <% } %>
+              </td>
               <td>
                 <% if (d.source === 'notion_import') { %>
                   <span class="muted" title="Notionから取り込み (Notion側が正・書き戻さない)">📥 取り込み</span>

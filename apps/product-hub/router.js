@@ -17,8 +17,16 @@ import {
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
-  DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS,
+  DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
 } from './db.js';
+import {
+  listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
+  listRoles, createRole, updateRole,
+  listSteps, createStep, updateStep, workflowOverview,
+} from './lib/workflow.js';
+import {
+  progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
+} from './lib/workflow-progress.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -146,10 +154,14 @@ router.get('/', (req, res) => {
   `).all(...params);
   // NE 判定は一覧では 2 クエリで一括解決する (行ごとに引くと N+1 になる)
   const variations = resolveVariationGroupsBatch(db, drafts.map((d) => d.ne_code));
+  // 工程の進捗 (いま誰のボールか)。表示対象のうち行が足りないものだけ自己修復してから引く
+  ensureProgressForMany(db, drafts.map((d) => d.id));
+  const wfSummary = progressSummaryFor(db, drafts.map((d) => d.id));
   for (const d of drafts) {
     d.thumb = d.first_image_id ? thumbnailUrl(d.first_image_id, 160, d.first_image_mtime) : null;
     d.variation = variations.get(String(d.ne_code || '').trim().toLowerCase())
       || { kind: 'unknown', groupKey: d.ne_code, memberCount: 0, isChild: false };
+    d.workflow = wfSummary.get(d.id) || null;
   }
 
   res.render(view('index.ejs'), {
@@ -265,6 +277,13 @@ router.get('/detail/:id', (req, res) => {
     shippingGroups: SHIPPING_METHOD_GROUPS,
     yahooOverrideGroups: YAHOO_OVERRIDE_SHIPPING_GROUPS,
     trailingBanners,
+    // 工程パネル (誰のボールか)。行が無ければ表示時に自己修復で作られる
+    workflow: progressOf(draft.id, { db }),
+    workflowStaff: listStaff(),
+    stepStateLabels: STEP_STATE_LABELS,
+    // 誰の工程を動かせるか。サーバー側でも弾くが、押せないものは触れない見た目にする
+    isAdmin: req.session?.role === 'admin',
+    myStaffId: staffByPortalEmail(req.session?.email)?.id ?? null,
   });
 });
 
@@ -1470,6 +1489,140 @@ router.post('/api/drafts/:id/delete', (req, res) => {
   // draft_events は append-only (削除 trigger) なので消さない。孤児として監査ログに残す
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft.id);
   res.json({ ok: true, deleted: draft.ne_code });
+});
+
+// ─── ワークフロー: 担当者 / 役割 / 工程マスタ (2026-08-23) ──────────
+// 「ステータスごとに誰が何をするか」の土台。閲覧は全員 (自分の役割を確認できる)、
+// 編集は admin のみ (マスタなので、誤操作すると全ドラフトの割り当てに波及する)。
+
+function requireAdminJson(req, res) {
+  if (req.session?.role !== 'admin') {
+    res.status(403).json({ ok: false, error: 'admin のみ操作できます' });
+    return false;
+  }
+  return true;
+}
+
+/** workflow.js の検証エラー (status=400) は文言をそのまま返し、それ以外は 500 に丸める */
+function workflowError(res, e) {
+  const status = Number(e?.status) || 500;
+  if (status >= 500) console.error('[product-hub] workflow:', e);
+  res.status(status).json({ ok: false, error: status >= 500 ? 'サーバーエラーが発生しました' : e.message });
+}
+
+// かんばんボード = 「ステータスごとに誰が何をするか」の主画面 (中原さん 2026-08-23)。
+// 列 = 工程、カード = 商品。上段が本流、下段が画像トラック (基本情報の後から並行で走る)
+router.get('/board', (req, res) => {
+  const db = getDB();
+  const me = staffByPortalEmail(req.session?.email);
+  // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
+  const raw = String(req.query.assignee || '').trim();
+  const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
+  const unassignedOnly = String(req.query.filter || '') === 'unassigned';
+  const board = boardData(db, { assigneeId, unassignedOnly });
+  res.render(view('board.ejs'), {
+    title: '工程ボード',
+    displayName: req.session?.displayName || req.session?.email || '',
+    board,
+    staff: listStaff(),
+    me,
+    assigneeId,
+    assigneeParam: raw,
+    unassignedOnly,
+    thumbnailUrl,
+    stepStateLabels: STEP_STATE_LABELS,
+  });
+});
+
+router.get('/staff', (req, res) => {
+  res.render(view('staff.ejs'), {
+    title: '担当者・工程の設定',
+    displayName: req.session?.displayName || req.session?.email || '',
+    isAdmin: req.session?.role === 'admin',
+    staff: listStaff({ includeInactive: true }),
+    roles: listRoles({ includeInactive: true }),
+    steps: listSteps({ includeInactive: true }),
+    overview: workflowOverview(),
+    staffKinds: STAFF_KINDS,
+    staffColors: STAFF_COLORS,
+    myEmail: (req.session?.email || '').toLowerCase(),
+  });
+});
+
+router.post('/api/staff', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    // 担当者本体と役割は 1 トランザクション (途中失敗で担当者だけ残るのを防ぐ)
+    res.json({ ok: true, id: createStaffWithRoles(req.body || {}) });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/staff/:id', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    const ok = updateStaffWithRoles(req.params.id, req.body || {});
+    if (!ok) return res.status(404).json({ ok: false, error: '担当者が見つかりません' });
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 削除は用意しない (割り当て履歴が壊れる)。無効化で運用から外す
+router.post('/api/staff/:id/active', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    const ok = setStaffActive(req.params.id, req.body?.active === true);
+    if (!ok) return res.status(404).json({ ok: false, error: '担当者が見つかりません' });
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/roles', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    res.json({ ok: true, code: createRole(req.body || {}) });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/roles/:code', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    updateRole(req.params.code, req.body || {});
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/steps', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    res.json({ ok: true, code: createStep(req.body || {}) });
+  } catch (e) { workflowError(res, e); }
+});
+
+router.post('/api/steps/:code', (req, res) => {
+  if (!requireAdminJson(req, res)) return;
+  try {
+    updateStep(req.params.code, req.body || {});
+    res.json({ ok: true });
+  } catch (e) { workflowError(res, e); }
+});
+
+// 工程の進捗更新 (状態・担当者・期限・メモ)。
+// admin は全部できる。一般ユーザーは「自分の担当」または「未割り当て」の工程だけ動かせる
+// (2026-08-23 中原さん: 外注は契約終了済みで担当者は全員ログインするため、本人限定で運用が回る)。
+// 判定は setStepState 側 (assertStepPermission) で行う — API を増やしても穴が開かないように
+router.post('/api/drafts/:id/steps/:code', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const r = setStepState(draft.id, req.params.code, req.body || {}, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+      // 画面から来る操作は版数トークン必須。省略で楽観ロックを回避されないようにする
+      requireVersion: true,
+    });
+    res.json({ ok: true, changed: r.changed, version: r.version });
+  } catch (e) { workflowError(res, e); }
 });
 
 export default router;

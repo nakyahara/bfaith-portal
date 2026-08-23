@@ -1,0 +1,503 @@
+<%- include('_header') %>
+<style>
+  /* 工程フロー: 「どの工程を誰がやるか」を横に並べて一目で見せる。
+     かんばん本体 (次PR) と同じ並び順なので、ここで作った定義がそのまま列になる */
+  .flow { display: flex; align-items: stretch; gap: 4px; overflow-x: auto; padding: 4px 2px 10px; }
+  .flow-step { flex: 0 0 auto; min-width: 148px; background: #fff; border: 1px solid #e2e8f0;
+               border-radius: 10px; padding: 10px 12px; }
+  .flow-step.inactive { opacity: .45; }
+  .flow-step.system { background: #f8fafc; border-style: dashed; }
+  .flow-done { background: #f0fdf4; border-color: #bbf7d0; display: flex; align-items: center; }
+  .flow-label { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+  .flow-role { font-size: 11px; color: #64748b; margin-bottom: 6px; }
+  .flow-staff { font-size: 12px; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .flow-arrow { flex: 0 0 auto; align-self: center; color: #cbd5e1; font-size: 18px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+  .warn-text { color: #b45309; font-weight: 600; }
+  .track-title { font-size: 12px; color: #64748b; font-weight: 700; margin: 10px 0 2px; }
+
+  /* 担当者カード */
+  .staff-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
+  .staff-card { border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px; background: #fff; }
+  .staff-card.off { background: #f8fafc; opacity: .7; }
+  .staff-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .staff-name { font-weight: 700; font-size: 14px; }
+  .kind-tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; background: #e2e8f0; color: #334155; }
+  .kind-outsource { background: #fef3c7; color: #92400e; }
+  .kind-iroha { background: #dcfce7; color: #166534; }
+  .role-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #cbd5e1;
+               border-radius: 999px; padding: 3px 10px; font-size: 12px; margin: 0 6px 6px 0; background: #fff; }
+  .role-chip input { width: auto; margin: 0; }
+  .role-chip.on { border-color: #2563eb; background: #eff6ff; }
+  .def-box { font-size: 11px; color: #64748b; display: inline-flex; align-items: center; gap: 3px;
+             border-left: 1px solid #e2e8f0; padding-left: 7px; margin-left: 2px; }
+  .row-2 { display: grid; grid-template-columns: 1fr 84px; gap: 8px; }
+  .mini { font-size: 11px; color: #94a3b8; }
+</style>
+
+<div class="wrap wide">
+  <h1 style="font-size:18px; margin:0 0 4px;">担当者・工程の設定</h1>
+  <p class="muted" style="margin:0 0 16px;">
+    工程は <strong>役割</strong> に紐づき、役割に <strong>人</strong> が紐づきます。
+    担当者が代わったときに触るのはここだけで、工程の定義はそのまま使えます。
+  </p>
+
+  <% if (overview.unassignedRoles.length > 0) { %>
+    <div class="banner-warn">
+      ⚠️ 担当者が 1 人もいない工程があります:
+      <strong><%= overview.unassignedRoles.map(u => `${u.step} (${u.role})`).join(' / ') %></strong>
+      — 下の「担当者」で役割を割り当ててください
+    </div>
+  <% } %>
+
+  <!-- ═══ 工程フロー ═══ -->
+  <div class="card">
+    <h2>🔁 工程の流れ <span class="muted" style="font-weight:400">(この並びがそのままボードの列になります)</span></h2>
+    <div class="track-title">本流</div>
+    <div class="flow">
+      <% overview.main.forEach(function (st, i) { %>
+        <div class="flow-step <%= st.role_code ? '' : 'system' %>">
+          <div class="flow-label"><%= st.label %></div>
+          <div class="flow-role"><%= st.role_label || 'システム (担当者なし)' %></div>
+          <div class="flow-staff">
+            <% if (!st.role_code) { %>
+              <span class="muted">夜間バッチ<%= st.stall_days ? ` / ${st.stall_days}日で警告` : '' %></span>
+            <% } else if (st.default_staff_name) { %>
+              <span class="dot" style="background:<%= st.default_staff_color || '#94a3b8' %>"></span>
+              <span><%= st.default_staff_name %></span>
+              <% if (st.member_count > 1) { %><span class="mini">他<%= st.member_count - 1 %>人</span><% } %>
+            <% } else if (st.member_count > 0) { %>
+              <span class="muted"><%= st.member_count %>人 (既定なし)</span>
+            <% } else { %>
+              <span class="warn-text">未割り当て</span>
+            <% } %>
+          </div>
+        </div>
+        <div class="flow-arrow">→</div>
+      <% }); %>
+      <div class="flow-step flow-done"><div class="flow-label" style="margin:0">✅ 完了</div></div>
+    </div>
+
+    <div class="track-title">画像トラック <span style="font-weight:400">— 基本情報が入った時点から本流と並行で走ります</span></div>
+    <div class="flow">
+      <% overview.image.forEach(function (st, i) { %>
+        <div class="flow-step">
+          <div class="flow-label"><%= st.label %></div>
+          <div class="flow-role"><%= st.role_label || 'システム' %></div>
+          <div class="flow-staff">
+            <% if (st.default_staff_name) { %>
+              <span class="dot" style="background:<%= st.default_staff_color || '#94a3b8' %>"></span>
+              <span><%= st.default_staff_name %></span>
+              <% if (st.member_count > 1) { %><span class="mini">他<%= st.member_count - 1 %>人</span><% } %>
+            <% } else if (st.member_count > 0) { %>
+              <span class="muted"><%= st.member_count %>人 (既定なし)</span>
+            <% } else { %>
+              <span class="warn-text">未割り当て</span>
+            <% } %>
+          </div>
+        </div>
+        <% if (i < overview.image.length - 1) { %><div class="flow-arrow">→</div><% } %>
+      <% }); %>
+    </div>
+    <p class="mini" style="margin:8px 0 0;">
+      画像が終わっていないと楽天出品には進めません (出品時のゲート)。
+    </p>
+  </div>
+
+  <!-- ═══ 担当者 ═══ -->
+  <div class="card">
+    <h2>👥 担当者 <span class="muted" style="font-weight:400">(<%= staff.filter(s => s.active === 1).length %>人が有効)</span></h2>
+
+    <% if (isAdmin) { %>
+      <details style="margin-bottom:14px;">
+        <summary style="cursor:pointer; font-size:14px; font-weight:600;">＋ 担当者を追加</summary>
+        <div style="margin-top:10px; padding:12px; background:#f8fafc; border-radius:8px;">
+          <div class="grid-2">
+            <div class="field">
+              <label class="req">名前</label>
+              <input type="text" id="new-name" placeholder="例: 大川さん" maxlength="40">
+            </div>
+            <div class="field">
+              <label>区分</label>
+              <select id="new-kind">
+                <% for (const k of staffKinds) { %><option value="<%= k.value %>"><%= k.label %></option><% } %>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label class="opt">ポータルのメールアドレス</label>
+            <input type="text" id="new-email" placeholder="ログインする人だけ。外注さんは空でOK">
+            <span class="mini">入れておくと、その人がログインしたとき「自分の作業」で絞り込めます</span>
+          </div>
+          <div class="field">
+            <label>役割</label>
+            <div id="new-roles">
+              <% for (const r of roles.filter(x => x.active === 1)) { %>
+                <label class="role-chip">
+                  <input type="checkbox" data-role="<%= r.code %>"> <%= r.label %>
+                </label>
+              <% } %>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="add-staff-btn">登録する</button>
+          <span class="muted" id="add-staff-result"></span>
+        </div>
+      </details>
+    <% } %>
+
+    <% if (staff.length === 0) { %>
+      <p class="muted">まだ担当者が登録されていません。<%= isAdmin ? '「＋ 担当者を追加」から登録してください。' : '' %></p>
+    <% } else { %>
+      <div class="staff-grid">
+        <% for (const s of staff) { %>
+          <div class="staff-card <%= s.active === 1 ? '' : 'off' %>" data-staff="<%= s.id %>">
+            <div class="staff-head">
+              <span class="dot" style="background:<%= s.color || '#94a3b8' %>; width:12px; height:12px;"></span>
+              <span class="staff-name"><%= s.name %></span>
+              <span class="kind-tag kind-<%= s.kind %>">
+                <%= (staffKinds.find(k => k.value === s.kind) || {}).label || s.kind %>
+              </span>
+              <% if (s.active !== 1) { %><span class="kind-tag" style="background:#fee2e2;color:#b91c1c;">無効</span><% } %>
+              <% if (s.portal_email && s.portal_email === myEmail) { %>
+                <span class="kind-tag" style="background:#dbeafe;color:#1d4ed8;">あなた</span>
+              <% } %>
+            </div>
+
+            <% if (isAdmin) { %>
+              <div class="row-2">
+                <div class="field" style="margin-bottom:8px;">
+                  <label>名前</label>
+                  <input type="text" class="f-name" value="<%= s.name %>" maxlength="40">
+                </div>
+                <div class="field" style="margin-bottom:8px;">
+                  <label>色</label>
+                  <input type="color" class="f-color" value="<%= s.color || '#94a3b8' %>" style="height:33px; padding:2px;">
+                </div>
+              </div>
+              <div class="row-2">
+                <div class="field" style="margin-bottom:8px;">
+                  <label>ポータルのメール</label>
+                  <input type="text" class="f-email" value="<%= s.portal_email || '' %>" placeholder="(任意)">
+                </div>
+                <div class="field" style="margin-bottom:8px;">
+                  <label>区分</label>
+                  <select class="f-kind">
+                    <% for (const k of staffKinds) { %>
+                      <option value="<%= k.value %>" <%= s.kind === k.value ? 'selected' : '' %>><%= k.label %></option>
+                    <% } %>
+                  </select>
+                </div>
+              </div>
+              <div class="field" style="margin-bottom:8px;">
+                <label>役割 (チェック) と 既定担当</label>
+                <div class="f-roles">
+                  <% for (const r of roles.filter(x => x.active === 1)) { %>
+                    <% const has = s.roles.find(x => x.code === r.code); %>
+                    <label class="role-chip <%= has ? 'on' : '' %>">
+                      <input type="checkbox" data-role="<%= r.code %>" <%= has ? 'checked' : '' %>>
+                      <%= r.label %>
+                      <span class="def-box">
+                        <input type="checkbox" data-default="<%= r.code %>" <%= has && has.isDefault ? 'checked' : '' %>>既定
+                      </span>
+                    </label>
+                  <% } %>
+                </div>
+                <span class="mini">「既定」は役割ごとに1人。他の人に付いていれば付け替わります</span>
+              </div>
+              <div style="display:flex; align-items:center; gap:8px; margin-top:10px;">
+                <button class="btn btn-primary btn-sm save-staff">保存</button>
+                <button class="btn btn-sm toggle-active" data-active="<%= s.active === 1 ? '1' : '0' %>">
+                  <%= s.active === 1 ? '無効にする' : '有効に戻す' %>
+                </button>
+                <span class="muted staff-result" style="font-size:12px;"></span>
+              </div>
+            <% } else { %>
+              <div>
+                <% if (s.roles.length === 0) { %>
+                  <span class="muted">役割なし</span>
+                <% } else { %>
+                  <% for (const r of s.roles) { %>
+                    <span class="role-chip on"><%= r.label %><% if (r.isDefault) { %> <span class="mini">既定</span><% } %></span>
+                  <% } %>
+                <% } %>
+              </div>
+            <% } %>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+  </div>
+
+  <!-- ═══ 役割マスタ ═══ -->
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer; font-size:15px; font-weight:600;">
+        🏷 役割 <span class="muted" style="font-weight:400">／ <%= roles.filter(r => r.active === 1).length %> 件</span>
+      </summary>
+      <table class="list" style="margin-top:10px;">
+        <thead>
+          <tr><th>役割名</th><th style="width:80px">人数</th><th style="width:140px">既定担当</th>
+              <th style="width:80px">並び順</th><th style="width:70px">有効</th><th style="width:80px"></th></tr>
+        </thead>
+        <tbody>
+          <% for (const r of roles) { %>
+            <tr data-role-row="<%= r.code %>">
+              <td>
+                <% if (isAdmin) { %>
+                  <input type="text" class="r-label" value="<%= r.label %>" maxlength="40">
+                <% } else { %><%= r.label %><% } %>
+              </td>
+              <td class="muted"><%= r.memberCount %>人</td>
+              <td class="muted"><%= r.defaultName || '—' %></td>
+              <td>
+                <% if (isAdmin) { %>
+                  <input type="number" class="r-sort" value="<%= r.sort %>" style="width:70px">
+                <% } else { %><%= r.sort %><% } %>
+              </td>
+              <td>
+                <% if (isAdmin) { %>
+                  <input type="checkbox" class="r-active" style="width:auto" <%= r.active === 1 ? 'checked' : '' %>
+                         <%= r.builtin === 1 ? 'disabled title="工程が使っている役割です"' : '' %>>
+                <% } else { %><%= r.active === 1 ? '✅' : '—' %><% } %>
+              </td>
+              <td>
+                <% if (isAdmin) { %><button class="btn btn-sm save-role">保存</button><% } %>
+              </td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <% if (isAdmin) { %>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+          <input type="text" id="new-role-label" placeholder="新しい役割名 (例: 撮影担当)" style="max-width:280px;" maxlength="40">
+          <button class="btn" id="add-role-btn">役割を追加</button>
+          <span class="muted" id="role-result"></span>
+        </div>
+      <% } %>
+    </details>
+  </div>
+
+  <!-- ═══ 工程マスタ ═══ -->
+  <div class="card">
+    <details>
+      <summary style="cursor:pointer; font-size:15px; font-weight:600;">
+        🔧 工程 <span class="muted" style="font-weight:400">／ <%= steps.filter(s => s.active === 1).length %> 件</span>
+      </summary>
+      <p class="muted" style="margin:10px 0;">
+        工程名・担当ロール・並び順をここで変えられます。並び順の小さいものが左の列になります。
+        滞留日数を入れると、その日数を超えて止まっているカードを赤く出します (空なら警告しません)。
+      </p>
+      <table class="list">
+        <thead>
+          <tr><th style="width:180px">工程名</th><th style="width:80px">トラック</th><th style="width:170px">担当ロール</th>
+              <th style="width:80px">並び順</th><th style="width:90px">滞留日数</th><th style="width:60px">有効</th>
+              <th>説明</th><th style="width:70px"></th></tr>
+        </thead>
+        <tbody>
+          <% for (const st of steps) { %>
+            <tr data-step-row="<%= st.code %>">
+              <td>
+                <% if (isAdmin) { %><input type="text" class="s-label" value="<%= st.label %>" maxlength="40">
+                <% } else { %><%= st.label %><% } %>
+              </td>
+              <td class="muted"><%= st.track === 'image' ? '画像' : '本流' %></td>
+              <td>
+                <% if (isAdmin) { %>
+                  <select class="s-role">
+                    <option value="">— システム (担当者なし)</option>
+                    <% for (const r of roles.filter(x => x.active === 1)) { %>
+                      <option value="<%= r.code %>" <%= st.role_code === r.code ? 'selected' : '' %>><%= r.label %></option>
+                    <% } %>
+                  </select>
+                <% } else { %><%= st.role_label || 'システム' %><% } %>
+              </td>
+              <td>
+                <% if (isAdmin) { %><input type="number" class="s-sort" value="<%= st.sort %>" style="width:70px">
+                <% } else { %><%= st.sort %><% } %>
+              </td>
+              <td>
+                <% if (isAdmin) { %><input type="number" class="s-stall" value="<%= st.stall_days == null ? '' : st.stall_days %>" style="width:70px" placeholder="—">
+                <% } else { %><%= st.stall_days == null ? '—' : st.stall_days + '日' %><% } %>
+              </td>
+              <td>
+                <% if (isAdmin) { %>
+                  <input type="checkbox" class="s-active" style="width:auto" <%= st.active === 1 ? 'checked' : '' %>
+                         <%= st.builtin === 1 ? 'disabled title="本流の定義に含まれる工程です"' : '' %>>
+                <% } else { %><%= st.active === 1 ? '✅' : '—' %><% } %>
+              </td>
+              <td class="mini"><%= st.description || '' %></td>
+              <td><% if (isAdmin) { %><button class="btn btn-sm save-step">保存</button><% } %></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <% if (isAdmin) { %>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
+          <input type="text" id="new-step-label" placeholder="新しい工程名" style="max-width:220px;" maxlength="40">
+          <select id="new-step-track" style="width:auto;">
+            <option value="main">本流</option>
+            <option value="image">画像トラック</option>
+          </select>
+          <select id="new-step-role" style="width:auto;">
+            <option value="">— システム (担当者なし)</option>
+            <% for (const r of roles.filter(x => x.active === 1)) { %>
+              <option value="<%= r.code %>"><%= r.label %></option>
+            <% } %>
+          </select>
+          <button class="btn" id="add-step-btn">工程を追加</button>
+          <span class="muted" id="step-result"></span>
+        </div>
+      <% } %>
+    </details>
+  </div>
+</div>
+
+<script>
+  async function post(url, body) {
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+    });
+    return res.json().catch(function () { return { ok: false, error: '応答を解釈できません' }; });
+  }
+  function collectRoles(scope) {
+    const out = [];
+    scope.querySelectorAll('input[data-role]').forEach(function (cb) {
+      if (!cb.checked) return;
+      const code = cb.dataset.role;
+      const def = scope.querySelector('input[data-default="' + code + '"]');
+      out.push({ code: code, isDefault: !!(def && def.checked) });
+    });
+    return out;
+  }
+
+  // ─── 担当者の追加 ───
+  const addBtn = document.getElementById('add-staff-btn');
+  if (addBtn) {
+    addBtn.addEventListener('click', async function () {
+      const out = document.getElementById('add-staff-result');
+      const name = document.getElementById('new-name').value.trim();
+      if (!name) { out.textContent = '名前を入力してください'; return; }
+      addBtn.disabled = true;
+      out.textContent = '登録中…';
+      const j = await post('/apps/product-hub/api/staff', {
+        name: name,
+        kind: document.getElementById('new-kind').value,
+        portal_email: document.getElementById('new-email').value,
+        roles: collectRoles(document.getElementById('new-roles')),
+      });
+      if (!j.ok) { out.textContent = ''; alert(j.error || '登録に失敗しました'); addBtn.disabled = false; return; }
+      location.reload();
+    });
+  }
+
+  // ─── 担当者の保存 / 有効切り替え ───
+  document.querySelectorAll('.staff-card').forEach(function (card) {
+    const id = card.dataset.staff;
+    const out = card.querySelector('.staff-result');
+    const saveBtn = card.querySelector('.save-staff');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', async function () {
+        saveBtn.disabled = true;
+        out.textContent = '保存中…';
+        const j = await post('/apps/product-hub/api/staff/' + id, {
+          name: card.querySelector('.f-name').value,
+          kind: card.querySelector('.f-kind').value,
+          portal_email: card.querySelector('.f-email').value,
+          color: card.querySelector('.f-color').value,
+          roles: collectRoles(card.querySelector('.f-roles')),
+        });
+        saveBtn.disabled = false;
+        if (!j.ok) { out.textContent = ''; alert(j.error || '保存に失敗しました'); return; }
+        location.reload();
+      });
+    }
+    const toggle = card.querySelector('.toggle-active');
+    if (toggle) {
+      toggle.addEventListener('click', async function () {
+        const turningOff = toggle.dataset.active === '1';
+        if (turningOff && !confirm('この担当者を無効にします。\n過去の割り当ては残りますが、新しい割り当ての候補から外れます。\n\nよろしいですか?')) return;
+        toggle.disabled = true;
+        const j = await post('/apps/product-hub/api/staff/' + id + '/active', { active: !turningOff });
+        if (!j.ok) { alert(j.error || '変更に失敗しました'); toggle.disabled = false; return; }
+        location.reload();
+      });
+    }
+  });
+
+  // ─── 役割 ───
+  document.querySelectorAll('[data-role-row]').forEach(function (tr) {
+    const btn = tr.querySelector('.save-role');
+    if (!btn) return;
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const j = await post('/apps/product-hub/api/roles/' + encodeURIComponent(tr.dataset.roleRow), {
+        label: tr.querySelector('.r-label').value,
+        sort: tr.querySelector('.r-sort').value,
+        active: tr.querySelector('.r-active').checked,
+      });
+      btn.disabled = false;
+      if (!j.ok) { alert(j.error || '保存に失敗しました'); return; }
+      location.reload();
+    });
+  });
+  const addRoleBtn = document.getElementById('add-role-btn');
+  if (addRoleBtn) {
+    addRoleBtn.addEventListener('click', async function () {
+      const label = document.getElementById('new-role-label').value.trim();
+      if (!label) { document.getElementById('role-result').textContent = '役割名を入力してください'; return; }
+      addRoleBtn.disabled = true;
+      const j = await post('/apps/product-hub/api/roles', { label: label });
+      addRoleBtn.disabled = false;
+      if (!j.ok) { alert(j.error || '追加に失敗しました'); return; }
+      location.reload();
+    });
+  }
+
+  // ─── 工程 ───
+  document.querySelectorAll('[data-step-row]').forEach(function (tr) {
+    const btn = tr.querySelector('.save-step');
+    if (!btn) return;
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      const j = await post('/apps/product-hub/api/steps/' + encodeURIComponent(tr.dataset.stepRow), {
+        label: tr.querySelector('.s-label').value,
+        role_code: tr.querySelector('.s-role').value,
+        sort: tr.querySelector('.s-sort').value,
+        stall_days: tr.querySelector('.s-stall').value,
+        active: tr.querySelector('.s-active').checked,
+      });
+      btn.disabled = false;
+      if (!j.ok) { alert(j.error || '保存に失敗しました'); return; }
+      location.reload();
+    });
+  });
+  const addStepBtn = document.getElementById('add-step-btn');
+  if (addStepBtn) {
+    addStepBtn.addEventListener('click', async function () {
+      const label = document.getElementById('new-step-label').value.trim();
+      if (!label) { document.getElementById('step-result').textContent = '工程名を入力してください'; return; }
+      addStepBtn.disabled = true;
+      const j = await post('/apps/product-hub/api/steps', {
+        label: label,
+        track: document.getElementById('new-step-track').value,
+        role_code: document.getElementById('new-step-role').value,
+      });
+      addStepBtn.disabled = false;
+      if (!j.ok) { alert(j.error || '追加に失敗しました'); return; }
+      location.reload();
+    });
+  }
+
+  // チェックの見た目 (役割チップ) を即時反映
+  document.addEventListener('change', function (ev) {
+    const cb = ev.target;
+    if (!cb.dataset || !cb.dataset.role) return;
+    const chip = cb.closest('.role-chip');
+    if (chip) chip.classList.toggle('on', cb.checked);
+    // 役割チェックを外したら「既定」も外す (役割が無いのに既定だけ残る不整合を防ぐ)
+    if (!cb.checked) {
+      const def = chip && chip.querySelector('input[data-default]');
+      if (def) def.checked = false;
+    }
+  });
+</script>

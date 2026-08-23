@@ -60,6 +60,79 @@ export const AI_OUTPUT_KINDS = [
   'rakuten_title', 'yahoo_title', 'desc_catch', 'desc_features', 'desc_spec', 'desc_notes',
 ];
 
+/** 担当者の区分 (表示順)。外注さんはポータルにログインしないので kind で見分ける */
+export const STAFF_KINDS = [
+  { value: 'internal', label: '社内' },
+  { value: 'outsource', label: '外注' },
+  { value: 'iroha', label: 'いろは' },
+  { value: 'other', label: 'その他' },
+];
+
+/** かんばんのバッジ色。登録順に自動割り当て (管理画面で選び直せる) */
+export const STAFF_COLORS = [
+  '#2563eb', '#16a34a', '#d97706', '#7c3aed', '#db2777',
+  '#0891b2', '#65a30d', '#dc2626', '#4f46e5', '#0d9488',
+];
+
+/**
+ * 役割の初期値 (中原さん 2026-08-23 の工程定義そのまま)。
+ * 人ではなく役割を工程に紐づけるので、担当者が変わっても工程定義は無変更で済む。
+ * 担当者 (人) は**シードしない** — 中原さんが管理画面から登録する (2026-08-23 決定)。
+ */
+export const ROLE_SEEDS = [
+  { code: 'registrar', label: '商品登録者', sort: 10 },
+  { code: 'image', label: '画像登録者', sort: 20 },
+  { code: 'approver', label: '商品承認者', sort: 30 },
+  { code: 'set_planner', label: 'セット商品登録販売企画者', sort: 40 },
+];
+
+/**
+ * 工程の初期値 (中原さん案 + 合意した修正)。
+ *   - main  … かんばん上段。直列に進む本流
+ *   - image … 画像トラック。基本情報が入った時点から**並行で**走る
+ *             (本流に混ぜると外注の制作リードタイム分だけ全体が延びるため)
+ * 「完了」は作業が無いので工程として持たず、かんばんの終端列として画面側で描く。
+ * ここはあくまで初期値で、管理画面から表示名・担当ロール・並び順・滞留日数を変えられる。
+ */
+export const STEP_SEEDS = [
+  {
+    code: 'basic_info', label: '基本情報入力', track: 'main', role_code: 'registrar', sort: 10,
+    description: '商品名・売価・JAN・公式/Amazon URL・バリエーション確認・カテゴリ/属性・ページ表記 (化粧品・食品)',
+  },
+  {
+    code: 'ai_generate', label: 'AI情報入力待ち', track: 'main', role_code: null, sort: 20, stall_days: 3,
+    description: 'タイトル・キャッチ・説明文3欄・仕様表を夜間バッチが生成する。担当者を置かない代わりに滞留を警告する',
+  },
+  {
+    code: 'desc_review', label: '商品説明確認', track: 'main', role_code: 'registrar', sort: 30,
+    description: 'AI が書いた説明文をレビュー・修正する',
+  },
+  {
+    code: 'title_approve', label: 'タイトル確認', track: 'main', role_code: 'approver', sort: 40,
+    description: '出品してよいかの承認ゲート',
+  },
+  {
+    code: 'set_review', label: 'セット商品作成検討', track: 'main', role_code: 'set_planner', sort: 50,
+    description: 'セットを作るか判断する。作る場合も派生ドラフトを別に立てるので単品の出品は止めない',
+  },
+  {
+    code: 'listing', label: '出品・展開', track: 'main', role_code: null, sort: 60,
+    description: '楽天 / Yahoo / auPAY / メルカリ / Qoo10 をモールごとに進める (担当はモール別に持つ)',
+  },
+  {
+    code: 'img_request', label: '画像制作の依頼', track: 'image', role_code: 'image', sort: 10,
+    description: '参考画像・レビュー収集、撮影商品の発送手配、外注への依頼',
+  },
+  {
+    code: 'img_production', label: '画像制作', track: 'image', role_code: 'image', sort: 20, stall_days: 7,
+    description: '外注/社内での画像制作。納品待ちがここで滞留する',
+  },
+  {
+    code: 'img_register', label: '画像登録', track: 'image', role_code: 'image', sort: 30,
+    description: 'Drive へ格納してアプリに取り込む。楽天出品はこの工程の完了が前提',
+  },
+];
+
 let initialized = false;
 
 /**
@@ -371,6 +444,89 @@ export function initProductHubDB() {
       updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
     );
 
+    -- ─── ワークフロー: 担当者 / 役割 / 工程 (2026-08-23 中原さん要件) ───────────
+    -- 「ステータスごとに誰が何をするか」を見えるようにするための土台。
+    -- **役割 (ロール) を人と工程の間に挟む**のが設計の肝 (中原さん指定):
+    --   工程「基本情報入力」→ 役割「商品登録者」→ 人 (複数可・既定1人)
+    -- 人が入れ替わっても工程定義を触らずに済み、担当者別の集計もできる。
+    -- 旧実装は draft_image_production.designer / page_composer の自由入力
+    -- (datalist 候補) だったため表記ゆれが起き、集計も絞り込みもできなかった。
+
+    CREATE TABLE IF NOT EXISTS ph_staff (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      name         TEXT NOT NULL,                    -- 表示名 (例: 大川さん)
+      kind         TEXT NOT NULL DEFAULT 'internal'
+                   CHECK (kind IN ('internal','outsource','iroha','other')),
+      portal_email TEXT,                             -- ポータルlog in との紐付け (任意・小文字で保存)
+      color        TEXT,                             -- かんばんのバッジ色 (#rrggbb)
+      note         TEXT,
+      -- 退職・契約終了は物理削除でなく active=0。担当履歴を壊さないため (取り消せない操作を作らない)
+      active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+      sort         INTEGER NOT NULL DEFAULT 0,
+      created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      updated_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ph_roles (
+      code       TEXT PRIMARY KEY,                   -- registrar / image / approver / set_planner …
+      label      TEXT NOT NULL,                      -- 商品登録者 / 画像登録者 …
+      sort       INTEGER NOT NULL DEFAULT 0,
+      -- builtin=1 は工程シードが参照するコード。改名はできるが無効化・削除はさせない
+      builtin    INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0, 1)),
+      active     INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS ph_staff_roles (
+      staff_id   INTEGER NOT NULL REFERENCES ph_staff(id) ON DELETE CASCADE,
+      role_code  TEXT NOT NULL REFERENCES ph_roles(code) ON DELETE CASCADE,
+      -- 既定担当 = 新しいドラフトの工程に自動で入る人。役割ごとに 1 人 (下の partial unique index)
+      is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1)),
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (staff_id, role_code)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_staff_roles_role ON ph_staff_roles(role_code);
+
+    CREATE TABLE IF NOT EXISTS ph_steps (
+      code        TEXT PRIMARY KEY,                  -- basic_info / ai_generate / …
+      label       TEXT NOT NULL,
+      -- main = かんばん上段 (直列に進む本流) / image = 画像トラック (基本情報の後から並行で走る)。
+      -- 画像を本流に混ぜると外注のリードタイム分だけ全体が延びるため分けている (中原さん合意 2026-08-23)
+      track       TEXT NOT NULL DEFAULT 'main' CHECK (track IN ('main', 'image')),
+      role_code   TEXT REFERENCES ph_roles(code),    -- NULL = システム工程 (担当者を置かない。例: AI待ち)
+      sort        INTEGER NOT NULL DEFAULT 0,
+      stall_days  INTEGER,                           -- この日数を超えて滞留したら警告 (NULL = 警告しない)
+      description TEXT,
+      builtin     INTEGER NOT NULL DEFAULT 0 CHECK (builtin IN (0, 1)),
+      active      INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_steps_track ON ph_steps(track, sort);
+
+    -- 商品 × 工程の進捗。「いま誰のボールか」の実体。
+    -- 行は表示時に自己修復で作る (ensureProgress) — 工程を後から足しても既存ドラフトに行き渡る。
+    -- state: todo=未着手 / doing=作業中 / done=完了 / skip=この商品では不要
+    CREATE TABLE IF NOT EXISTS draft_step_progress (
+      draft_id    INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      step_code   TEXT NOT NULL REFERENCES ph_steps(code),
+      state       TEXT NOT NULL DEFAULT 'todo' CHECK (state IN ('todo', 'doing', 'done', 'skip')),
+      -- 担当者は工程の既定担当を初期値に入れ、商品ごとに差し替えられる (NULL = 未割り当て)
+      assignee_id INTEGER REFERENCES ph_staff(id),
+      due_date    TEXT,
+      started_at  TEXT,
+      done_at     TEXT,
+      done_by     TEXT,                          -- 完了操作をした人 (ポータルのログイン)
+      note        TEXT,
+      -- 楽観ロック用の版数。updated_at (ミリ秒精度) をトークンにすると、同一ミリ秒内の
+      -- 連続更新で値が変わらず、古い画面からの上書きを検知できない (Codex R3)
+      version     INTEGER NOT NULL DEFAULT 0,
+      updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, step_code)
+    );
+    -- 列 (工程) 別・担当者別の絞り込みがかんばんの主クエリなので、両方に索引を張る
+    CREATE INDEX IF NOT EXISTS idx_dsp_step ON draft_step_progress(step_code, state);
+    CREATE INDEX IF NOT EXISTS idx_dsp_assignee ON draft_step_progress(assignee_id, state);
+
     -- 自動取込の状態 (シード完了の判定は seen 件数でなくここで行う — Codex critical:
     -- 一括登録も ph_ne_seen_codes に書くため、件数>0 を「シード済み」とすると
     -- シード前に手動登録1件しただけで既存3,723件が全部「新商品」扱いになる)
@@ -596,6 +752,47 @@ export function initProductHubDB() {
     BEFORE DELETE ON draft_events
     BEGIN SELECT RAISE(ABORT, 'draft_events is append-only'); END;
   `);
+
+  // ─── ワークフロー (担当者/役割/工程) の索引とシード ─────────────────
+  // 楽観ロックの版数列。PR 途中の状態でデプロイした環境にも足せるよう冪等 ALTER にする
+  const dspCols = new Set(db.prepare('PRAGMA table_info(draft_step_progress)').all().map((c) => c.name));
+  if (!dspCols.has('version')) {
+    try {
+      db.exec('ALTER TABLE draft_step_progress ADD COLUMN version INTEGER NOT NULL DEFAULT 0');
+    } catch (e) {
+      // ポータルと warehouse variant が同時に起動すると、両方が「列なし」と判定して
+      // 後発が duplicate column で落ちる。列が既にあるなら成功と同義なので飲み込む
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
+  }
+
+  for (const stmt of [
+    // 担当者名の表記ゆれ防止。「大川さん」と「大川 さん」を別人として登録させない
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_ph_staff_name_norm ON ph_staff(LOWER(TRIM(name)))',
+    // 既定担当は役割ごとに 1 人。DB で担保しないと、画面からの付け替えが競合したときに
+    // 「既定が 2 人いる役割」ができて、新規ドラフトへの自動割り当てが不定になる
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_ph_staff_roles_default ON ph_staff_roles(role_code) WHERE is_default = 1',
+    // 1 つのポータルアカウントを 2 人に紐づけない (「自分の作業」の絞り込みが二重になる)。
+    // 未設定 (NULL/空) は何人いてもよいので partial index にする
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_ph_staff_email_norm ON ph_staff(LOWER(TRIM(portal_email)))
+       WHERE portal_email IS NOT NULL AND TRIM(portal_email) <> ''`,
+  ]) {
+    try { db.exec(stmt); } catch (e) { console.warn('[product-hub] workflow index skip:', e.message); }
+  }
+
+  // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
+  // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
+  const roleSeed = db.prepare('INSERT OR IGNORE INTO ph_roles (code, label, sort, builtin) VALUES (?, ?, ?, 1)');
+  const stepSeed = db.prepare(`
+    INSERT OR IGNORE INTO ph_steps (code, label, track, role_code, sort, stall_days, description, builtin)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+  `);
+  db.transaction(() => {
+    for (const r of ROLE_SEEDS) roleSeed.run(r.code, r.label, r.sort);
+    for (const s of STEP_SEEDS) {
+      stepSeed.run(s.code, s.label, s.track, s.role_code ?? null, s.sort, s.stall_days ?? null, s.description ?? null);
+    }
+  })();
 
   initialized = true;
   return db;

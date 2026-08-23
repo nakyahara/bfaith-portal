@@ -18,6 +18,9 @@
   .tab-btn.active .tab-badge { background: #fff; color: #dc2626; }
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
+  /* 工程パネル (誰のボールか)。.wf-dot は _header.ejs で共通定義 */
+  .mini-note { font-size: 11px; color: #94a3b8; }
+  #wf-card select, #wf-card input { font-size: 12px; padding: 4px 7px; }
 </style>
 <div class="wrap wide">
 
@@ -169,6 +172,120 @@
       <span class="muted" id="rk-result"></span>
     </div>
     <pre id="rk-preview" style="display:none; margin-top:10px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; font-size:11px; max-height:340px; overflow:auto;"></pre>
+  </div>
+
+  <!-- ═══ 工程 (いま誰のボールか) ═══ 2026-08-23 -->
+  <div class="card" id="wf-card" style="border-color:#bfdbfe; background:#f8fbff;">
+    <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+      <span style="font-size:14px; font-weight:700;">🔁 工程</span>
+      <% if (workflow.current) { %>
+        <span class="badge" style="background:#dbeafe; color:#1d4ed8;"><%= workflow.current.label %></span>
+        <span style="font-size:13px; display:inline-flex; align-items:center; gap:5px;">
+          <% if (workflow.current.assignee_name) { %>
+            <span class="wf-dot" style="background:<%= workflow.current.assignee_color || '#94a3b8' %>"></span>
+            <%= workflow.current.assignee_name %>
+            <% if (workflow.current.assignee_active !== 1) { %><span class="muted">(無効)</span><% } %>
+          <% } else if (workflow.current.role_label) { %>
+            <span style="color:#b45309; font-weight:600;"><%= workflow.current.role_label %> — 未割り当て</span>
+          <% } else { %>
+            <span class="muted">システム (夜間バッチ)</span>
+          <% } %>
+        </span>
+      <% } else { %>
+        <span class="badge badge-approved">全工程 完了</span>
+      <% } %>
+      <span class="muted"><%= workflow.doneCount %>/<%= workflow.totalCount %> 完了</span>
+      <% if (workflow.stalledDays) { %>
+        <span class="badge" style="background:#fee2e2; color:#b91c1c;">⚠️ <%= workflow.stalledDays %>日 動いていません</span>
+      <% } %>
+      <span style="flex:1"></span>
+      <span style="font-size:12px;">
+        🖼 画像:
+        <% if (workflow.imageDone) { %>
+          <span style="color:#166534; font-weight:600;">完了</span>
+        <% } else if (workflow.imageCurrent) { %>
+          <%= workflow.imageCurrent.label %>
+          <% if (workflow.imageCurrent.assignee_name) { %>
+            <span class="wf-dot" style="background:<%= workflow.imageCurrent.assignee_color || '#94a3b8' %>"></span><%= workflow.imageCurrent.assignee_name %>
+          <% } %>
+          <% if (workflow.imageStalledDays) { %>
+            <span style="color:#b91c1c; font-weight:600;">／ <%= workflow.imageStalledDays %>日 滞留</span>
+          <% } %>
+        <% } else { %>
+          <span class="muted">—</span>
+        <% } %>
+      </span>
+    </div>
+
+    <details style="margin-top:10px;">
+      <summary style="cursor:pointer; font-size:13px; color:#1d4ed8;">工程を進める / 担当者を変える</summary>
+      <table class="list" style="margin-top:8px;">
+        <thead>
+          <tr><th style="width:210px">工程</th><th style="width:110px">状態</th><th style="width:170px">担当者</th>
+              <th style="width:140px">期限</th><th style="width:100px">完了日</th><th>メモ</th></tr>
+        </thead>
+        <tbody>
+          <%
+            // 動かせるのは admin か担当者本人だけ (サーバー側 assertStepPermission と同じ条件)。
+            // 未割り当ての工程は「自分が担当する」で引き受けてから操作する
+            const canEditStep = (s) => isAdmin || (s.assignee_id != null && s.assignee_id === myStaffId);
+            const canClaimStep = (s) => !isAdmin && !!myStaffId && !!s.role_code && s.assignee_id == null;
+          %>
+          <% for (const s of workflow.main.concat(workflow.image)) { %>
+            <% const editable = canEditStep(s); %>
+            <tr data-step="<%= s.step_code %>" data-version="<%= s.version == null ? '' : s.version %>" <%= workflow.current && workflow.current.step_code === s.step_code ? 'style="background:#eff6ff"' : '' %>>
+              <td>
+                <% if (s.track === 'image') { %><span class="muted" style="font-size:11px;">🖼</span> <% } %>
+                <%= s.label %>
+                <% if (s.description) { %><br><span class="mini-note" title="<%= s.description %>"><%= s.description.length > 34 ? s.description.slice(0, 34) + '…' : s.description %></span><% } %>
+              </td>
+              <td>
+                <select class="wf-state" <%= editable ? '' : 'disabled' %>
+                        title="<%= editable ? '' : (s.assignee_name ? s.assignee_name + ' さんの担当です' : (s.role_code ? '「自分が担当する」を押すと操作できます' : 'システムが進める工程です')) %>">
+                  <% for (const code of Object.keys(stepStateLabels)) { %>
+                    <%# 「対象外」は工程を飛ばすので admin だけ %>
+                    <% if (code === 'skip' && !isAdmin && s.state !== 'skip') continue; %>
+                    <option value="<%= code %>" <%= s.state === code ? 'selected' : '' %>><%= stepStateLabels[code] %></option>
+                  <% } %>
+                </select>
+              </td>
+              <td>
+                <% if (!s.role_code) { %>
+                  <span class="muted" style="font-size:12px;">システム</span>
+                <% } else if (isAdmin) { %>
+                  <select class="wf-assignee">
+                    <option value="">未割り当て</option>
+                    <% for (const st of workflowStaff) { %>
+                      <option value="<%= st.id %>" <%= s.assignee_id === st.id ? 'selected' : '' %>><%= st.name %></option>
+                    <% } %>
+                    <% if (s.assignee_id && !workflowStaff.some((x) => x.id === s.assignee_id)) { %>
+                      <option value="<%= s.assignee_id %>" selected><%= s.assignee_name %> (無効)</option>
+                    <% } %>
+                  </select>
+                <% } else if (s.assignee_id == null) { %>
+                  <%# 未割り当ては引き受けだけ許す。引き受けてから状態を動かす %>
+                  <% if (canClaimStep(s)) { %>
+                    <button type="button" class="btn btn-sm wf-claim">自分が担当する</button>
+                  <% } else { %>
+                    <span class="muted" style="font-size:12px;">未割り当て</span>
+                  <% } %>
+                <% } else { %>
+                  <span style="font-size:12px; display:inline-flex; align-items:center; gap:4px;">
+                    <span class="wf-dot" style="background:<%= s.assignee_color || '#94a3b8' %>"></span><%= s.assignee_name %>
+                  </span>
+                <% } %>
+              </td>
+              <td><input type="date" class="wf-due" value="<%= s.due_date || '' %>" <%= editable ? '' : 'disabled' %>></td>
+              <td class="muted" style="font-size:12px;"><%= s.done_at ? String(s.done_at).slice(0, 10) : '—' %></td>
+              <td><input type="text" class="wf-note" value="<%= s.note || '' %>" placeholder="(任意)" maxlength="300" <%= editable ? '' : 'disabled' %>></td>
+            </tr>
+          <% } %>
+        </tbody>
+      </table>
+      <p class="muted" style="margin:8px 0 0; font-size:12px;">
+        変更するとその場で保存されます。<span id="wf-result"></span>
+      </p>
+    </details>
   </div>
 
   <div class="tabbar" id="tabbar"
@@ -2499,4 +2616,74 @@
   // 初期表示のバッジ計算 (initPageInfo 内の applyTypeVisibility でも一度呼ばれるが、
   // pi-type が無い画面状態でも必ず一度は計算しておく)
   updateTabBadges();
+
+  // ─── 工程パネル (誰のボールか) ───
+  // 変更したその場で保存する。保存ボタン方式だと「状態だけ変えて押し忘れ」が起き、
+  // ボードに古い状態が出続けるため。押し間違いは選び直せば戻せる
+  (function initWorkflowPanel() {
+    const card = document.getElementById('wf-card');
+    if (!card) return;
+    const out = document.getElementById('wf-result');
+    let advanced = false;
+
+    async function save(tr, patch) {
+      const step = tr.dataset.step;
+      out.textContent = '保存中…';
+      try {
+        // 画面を開いた時点の updated_at を一緒に送る = 古い画面からの後勝ちをサーバーが弾ける
+        const body = Object.assign({ expected_version: tr.dataset.version === '' ? null : Number(tr.dataset.version) }, patch);
+        const res = await fetch('/apps/product-hub/api/drafts/<%= draft.id %>/steps/' + encodeURIComponent(step), {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const j = await res.json();
+        if (!j.ok) {
+          out.textContent = '';
+          alert(j.error || '保存に失敗しました');
+          // 409 = 別の人が先に動かした。古い画面のまま操作を続けさせない
+          if (res.status === 409) location.reload();
+          return false;
+        }
+        // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
+        if (j.version != null) tr.dataset.version = String(j.version);
+        out.textContent = '保存しました';
+        return true;
+      } catch (e) {
+        out.textContent = '';
+        alert('通信エラー: ' + e.message);
+        return false;
+      }
+    }
+
+    card.querySelectorAll('tr[data-step]').forEach(function (tr) {
+      const state = tr.querySelector('.wf-state');
+      const assignee = tr.querySelector('.wf-assignee');
+      const due = tr.querySelector('.wf-due');
+      const note = tr.querySelector('.wf-note');
+      if (state) {
+        state.addEventListener('change', async function () {
+          const ok = await save(tr, { state: state.value });
+          // 完了にすると次の工程へボールが移る = 上部の表示が変わるので読み直す。
+          // 連続で複数工程を片付けたい場合もあるので、少し待ってから 1 回だけ
+          if (ok && state.value === 'done' && !advanced) {
+            advanced = true;
+            setTimeout(function () { location.reload(); }, 900);
+          }
+        });
+      }
+      if (assignee) {
+        assignee.addEventListener('change', function () { save(tr, { assignee_id: assignee.value }); });
+      }
+      // 未割り当ての工程を自分で引き受ける (admin 以外はこのボタンだけ)
+      const claim = tr.querySelector('.wf-claim');
+      if (claim) {
+        claim.addEventListener('click', async function () {
+          claim.disabled = true;
+          const ok = await save(tr, { assignee_id: <%= myStaffId == null ? 'null' : myStaffId %> });
+          if (ok) location.reload(); else claim.disabled = false;
+        });
+      }
+      if (due) due.addEventListener('change', function () { save(tr, { due_date: due.value }); });
+      if (note) note.addEventListener('change', function () { save(tr, { note: note.value }); });
+    });
+  })();
 </script>
