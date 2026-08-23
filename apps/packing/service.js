@@ -563,7 +563,9 @@ export function lineDailyTotal(workDate, kind) {
 }
 
 // 中断理由 (picking と同じ最小セット)
-export const PAUSE_REASONS = ['休憩', '他作業への応援', 'その他'];
+// '配送変更の入力' = ④⑥フォームを開いている間の自動中断 (計測から除外 — 中原さん指示 2026-08-21)。
+// 手動の中断メニューには出さない (work.ejs側でフィルタ)
+export const PAUSE_REASONS = ['休憩', '他作業への応援', '配送変更の入力', 'その他'];
 // 完了取消の理由 (監査ログ必須 — 要件§5.1)
 export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
 // ④ 配送方法変更の理由 (要件§5.7)
@@ -864,8 +866,9 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     } else if (event === 'ship_change') {
       // ④ 配送方法変更 (簡素化 — 中原さん指示 2026-08-17): 記録+GChat通知 (明細つき) のみ。
       // 伝票の保留や事務側の状態管理はしない — 現物を「変更待ちの棚」へ置く運用のため
-      // 放置されず、事務の画面操作 (1工程) も不要。梱包者はそのまま「次へ」で完了してよい
-      if (batch.status !== 'packing' && batch.status !== 'done') {
+      // 放置されず、事務の画面操作 (1工程) も不要。梱包者はそのまま「次へ」で完了してよい。
+      // paused も許可 (④⑥フォーム表示中は自動中断で計測を止めるため — 2026-08-21)
+      if (!['packing', 'paused', 'done'].includes(batch.status)) {
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
       requireOwner();
