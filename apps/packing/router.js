@@ -36,6 +36,7 @@ import { enqueuePackBatchNotionSync } from './notion.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
+import { neNamesFor } from './ne-names.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -188,28 +189,36 @@ router.get('/', (req, res) => {
 });
 
 // ─── バッチ詳細 (伝票一覧・納品書の束との目視突合用) ───
-router.get('/batches/:id(\\d+)', (req, res) => {
-  const batch = getPackBatch(Number(req.params.id));
-  if (!batch) return res.status(404).send('バッチが見つかりません');
-  const linesBySlip = listPackLinesBySlip(batch.id);
-  const slips = listPackSlips(batch.id).map((s) => ({
-    ...s,
-    warns: s.warn_json ? JSON.parse(s.warn_json) : [],
-    comments: s.comments_json ? JSON.parse(s.comments_json) : {},
-    lines: linesBySlip.get(s.id) || [],
-  }));
-  res.render(path.join(__dirname, 'views/batch_detail'), {
-    title: `${batch.folder_name || batch.tb_key} | 梱包支援`,
-    username: req.session?.email || req.packingDevice?.label || '端末',
-    displayName: req.session?.displayName,
-    isAdmin: req.session?.role === 'admin',
-    batch,
-    slips,
-    matchDiffs: batch.match_json ? JSON.parse(batch.match_json) : [],
-    statusLabels: STATUS_LABELS,
-    matchLabels: MATCH_LABELS,
-    warnLabels: WARN_LABELS,
-  });
+// Express 4 は async ハンドラの reject を error middleware に渡さない → next(e) で明示的に流す
+router.get('/batches/:id(\\d+)', async (req, res, next) => {
+  try {
+    const batch = getPackBatch(Number(req.params.id));
+    if (!batch) return res.status(404).send('バッチが見つかりません');
+    const linesBySlip = listPackLinesBySlip(batch.id);
+    const slips = listPackSlips(batch.id).map((s) => ({
+      ...s,
+      warns: s.warn_json ? JSON.parse(s.warn_json) : [],
+      comments: s.comments_json ? JSON.parse(s.comments_json) : {},
+      lines: linesBySlip.get(s.id) || [],
+    }));
+    // 作業画面と同じく、表示名はNE商品マスタの単品名を優先 (fail-soft)
+    const neNames = await neNamesFor(slips.flatMap((s) => s.lines.map((l) => l.sku)));
+    for (const s of slips) {
+      for (const l of s.lines) l.ne_name = neNames.get(String(l.sku ?? '').trim()) || null;
+    }
+    res.render(path.join(__dirname, 'views/batch_detail'), {
+      title: `${batch.folder_name || batch.tb_key} | 梱包支援`,
+      username: req.session?.email || req.packingDevice?.label || '端末',
+      displayName: req.session?.displayName,
+      isAdmin: req.session?.role === 'admin',
+      batch,
+      slips,
+      matchDiffs: batch.match_json ? JSON.parse(batch.match_json) : [],
+      statusLabels: STATUS_LABELS,
+      matchLabels: MATCH_LABELS,
+      warnLabels: WARN_LABELS,
+    });
+  } catch (e) { next(e); }
 });
 
 // ─── 作業画面 (iPad・1伝票1画面 = 納品書PDF同等表示) ───
@@ -226,52 +235,59 @@ function listWorkers() {
 }
 
 /** state.slips に画像URLと表示用整形を付ける。 */
-function decorateSlips(state) {
+async function decorateSlips(state) {
   const skus = [...new Set(state.slips.flatMap((s) => s.lines.map((l) => l.sku)))];
   const images = getImageMap(skus);
   // 取込時の解決キューが再起動等で消えていても、画面を開いた時点で自己修復する (picking と同じ)
   const missing = skus.map((s) => String(s ?? '').trim().toLowerCase())
     .filter((sku) => sku && !images.has(sku));
   if (missing.length > 0) queueEnsureImages(missing, `packing-batch:${state.batch.id}`);
+  // 表示名 = NE商品マスタ名 (warehouse.db raw_ne_products・service-api経由・fail-soft)。
+  // 納品書CSVの印字名はセット品受注でモールSEO長文になるため、セットに関係なく単品の社内商品名を優先する
+  const neNames = await neNamesFor(skus);
   for (const s of state.slips) {
     for (const l of s.lines) {
       l.imageUrl = images.get(String(l.sku ?? '').trim().toLowerCase())?.url || null;
+      l.ne_name = neNames.get(String(l.sku ?? '').trim()) || null;
     }
   }
   return state;
 }
 
-router.get('/work/:id(\\d+)', (req, res) => {
-  let state;
+// Express 4 は async ハンドラの reject を error middleware に渡さない → next(e) で明示的に流す
+router.get('/work/:id(\\d+)', async (req, res, next) => {
   try {
-    state = decorateSlips(getWorkState(Number(req.params.id)));
-  } catch (e) {
-    if (e instanceof PackError) return res.status(e.status).send(e.message);
-    throw e;
-  }
-  // 引当分類名 (picking の pk_batches.hikiate_class — 参照のみ)。梱包画面の作業方法表示に使う
-  let hikiateClass = null;
-  if (state.batch.pk_batch_id) {
+    let state;
     try {
-      hikiateClass = getDB().prepare('SELECT hikiate_class FROM pk_batches WHERE id = ?')
-        .get(state.batch.pk_batch_id)?.hikiate_class ?? null;
-    } catch { /* picking未初期化環境では無視 */ }
-  }
-  // 梱包機バッチは1伝票1画面を使わない — ライン管理画面へ (Codex high: 混在は矛盾状態を作る)
-  if (lineKindOf(hikiateClass)) return res.redirect(`/apps/packing/line/${req.params.id}`);
-  res.render(path.join(__dirname, 'views/work'), {
-    title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
-    displayName: req.session?.displayName,
-    workers: listWorkers(),
-    state,
-    hikiateClass,
-    warnLabels: WARN_LABELS,
-    pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 自動中断専用の理由は手動メニューに出さない
-    undoReasons: UNDO_REASONS,
-    shipChangeReasons: SHIP_CHANGE_REASONS,
-    // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
-    methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
-  });
+      state = await decorateSlips(getWorkState(Number(req.params.id)));
+    } catch (e) {
+      if (e instanceof PackError) return res.status(e.status).send(e.message);
+      throw e;
+    }
+    // 引当分類名 (picking の pk_batches.hikiate_class — 参照のみ)。梱包画面の作業方法表示に使う
+    let hikiateClass = null;
+    if (state.batch.pk_batch_id) {
+      try {
+        hikiateClass = getDB().prepare('SELECT hikiate_class FROM pk_batches WHERE id = ?')
+          .get(state.batch.pk_batch_id)?.hikiate_class ?? null;
+      } catch { /* picking未初期化環境では無視 */ }
+    }
+    // 梱包機バッチは1伝票1画面を使わない — ライン管理画面へ (Codex high: 混在は矛盾状態を作る)
+    if (lineKindOf(hikiateClass)) return res.redirect(`/apps/packing/line/${req.params.id}`);
+    res.render(path.join(__dirname, 'views/work'), {
+      title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
+      displayName: req.session?.displayName,
+      workers: listWorkers(),
+      state,
+      hikiateClass,
+      warnLabels: WARN_LABELS,
+      pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 自動中断専用の理由は手動メニューに出さない
+      undoReasons: UNDO_REASONS,
+      shipChangeReasons: SHIP_CHANGE_REASONS,
+      // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
+      methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+    });
+  } catch (e) { next(e); }
 });
 
 // ─── ライン管理画面 (梱包機 PAS/MELT — 紙台帳の置き換え。要件v7) ───
