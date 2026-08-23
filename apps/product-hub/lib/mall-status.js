@@ -11,26 +11,11 @@
  */
 import { getDB, logEvent } from '../db.js';
 import { STEP_STATES, STEP_STATE_LABELS, progressOf } from './workflow-progress.js';
+import { MALLS, MALL_CODES, MALL_LABELS, LISTING_STEP_CODE } from './malls-def.js';
 
-/**
- * 展開先モール。
- * Amazon は FBA 側の別管理 (SKU は Pricetar 発行の pr_xxx) なので含めない (中原さん 2026-08-23)。
- * hint は運用の目安を画面に出すためのもので、実際の進み方は人が state で管理する。
- */
-export const MALLS = [
-  { code: 'rakuten', label: '楽天', sort: 10, hint: 'このアプリから出品できます (出品すると自動で完了になります)' },
-  { code: 'yahoo', label: 'Yahoo!', sort: 20, hint: 'RakutenYahooSync が楽天から同期します' },
-  { code: 'aupay', label: 'au PAY', sort: 30, hint: '' },
-  { code: 'mercari', label: 'メルカリShops', sort: 40, hint: 'mercari-sync が楽天から同期します' },
-  { code: 'qoo10', label: 'Qoo10', sort: 50, hint: '' },
-  { code: 'linegift', label: 'LINEギフト', sort: 60, hint: 'linegift-sync が楽天から同期します' },
-];
-
-export const MALL_CODES = new Set(MALLS.map((m) => m.code));
-const MALL_LABELS = new Map(MALLS.map((m) => [m.code, m.label]));
-
-/** 工程「出品・展開」のコード。モールが全部終わったらこの工程を完了にする */
-export const LISTING_STEP_CODE = 'listing';
+// モール定義は lib/malls-def.js が正 (工程側からも参照するため切り出し)。
+// 既存の import 元を変えずに済むよう、ここから再エクスポートする
+export { MALLS, MALL_CODES, LISTING_STEP_CODE } from './malls-def.js';
 
 function badRequest(message) {
   const e = new Error(message);

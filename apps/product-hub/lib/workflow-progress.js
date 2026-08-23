@@ -13,15 +13,11 @@
  *     見ているため、二重管理を承知で並行させる。status を工程から導出する切替は次段階 (PR4)
  */
 import { getDB, logEvent } from '../db.js';
+// モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
+import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
 export const STEP_STATES = ['todo', 'doing', 'done', 'skip'];
 
-/**
- * 工程「出品・展開」のコード。この工程の完了はモール状況 (draft_mall_status) が正で、
- * 状態セレクトからの直接完了は禁じる。mall-status.js を import すると循環するので、
- * 判定はここで直接 SQL を引く (定数は両方に置く)。
- */
-const LISTING_STEP = 'listing';
 export const STEP_STATE_LABELS = {
   todo: '未着手',
   doing: '作業中',
@@ -332,11 +328,14 @@ export function setStepState(
       if (prov?.provisional_code === 1) {
         throw badRequest('商品コードが仮のままです。ネクストエンジンの本コードに差し替えてから完了にしてください');
       }
-      const pending = db.prepare(`
-        SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ? AND state NOT IN ('done', 'skip')
+      // **未完了の行を数える**のではなく、決着した行が全モール分あるかを見る (Codex R3)。
+      // 行がまだ作られていないドラフト (詳細画面を開いていない・API直叩き) では
+      // 「未完了 0 件」になり、1 モールも出していないのに完了できてしまう
+      const settled = db.prepare(`
+        SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ? AND state IN ('done', 'skip')
       `).get(id).c;
-      if (pending > 0) {
-        throw badRequest(`まだ展開していないモールが ${pending} 件あります。「モール別の展開状況」で進めると自動で完了になります`);
+      if (settled < MALLS.length) {
+        throw badRequest(`まだ展開していないモールが ${MALLS.length - settled} 件あります。「モール別の展開状況」で進めると自動で完了になります`);
       }
     }
     if (state !== row.state) {

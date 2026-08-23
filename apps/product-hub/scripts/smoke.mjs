@@ -2047,6 +2047,17 @@ const ms = await import('../lib/mall-status.js');
   let directDone = null;
   try { wfp.setStepState(id, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { directDone = e; }
   check('未展開モールがあるうちは工程を直接完了にできない', directDone?.status === 400, directDone?.message || '例外が出ていない');
+  // モール行がまだ作られていないドラフトでも直接完了させない (Codex R3: 未完了0件の穴)
+  const idFresh = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('WF-MALL-FRESH', 'モール未初期化', 'approved', 'smoke')`
+  ).run().lastInsertRowid);
+  wfp.progressOf(idFresh, { db });
+  check('モール行が無い商品も直接完了にできない',
+    db.prepare('SELECT COUNT(*) AS c FROM draft_mall_status WHERE draft_id = ?').get(idFresh).c === 0);
+  let freshDone = null;
+  try { wfp.setStepState(idFresh, 'listing', { state: 'done' }, 'admin', ADMIN); } catch (e) { freshDone = e; }
+  check('未初期化でも「6件残っています」で止まる',
+    freshDone?.status === 400 && /6 件/.test(freshDone.message), freshDone?.message || '例外が出ていない');
   ms.setMallState(id, 'linegift', { state: 'done' }, 'admin', ADMIN);
 }
 
