@@ -138,6 +138,8 @@
       if (!res.ok) { $('msg').textContent = data.error || `HTTP ${res.status}`; $('msg').className = 'pk-msg err'; return null; }
       return data;
     }
+    // プレビューしたファイルと確定するファイルを一致させる: 選び直したら確定を無効化 (Codexレビュー P1)
+    $('file').addEventListener('change', () => { $('confirmBtn').style.display = 'none'; $('preview').style.display = 'none'; $('msg').textContent = ''; });
     $('previewBtn').addEventListener('click', async () => {
       const d = await send('preview');
       if (!d) return;

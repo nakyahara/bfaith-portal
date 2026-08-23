@@ -586,7 +586,9 @@
     let recallTimer = null;
     function showRecall() {
       const r = $('recall');
-      if (!lastMove || !lastMove.html) return;
+      // 「直前の案内」は今の明細へ向かう案内のときだけ出す (戻る・同期エラー等でずれたら出さない)
+      const idx = currentIdx();
+      if (!lastMove || !lastMove.html || idx === -1 || LINES[idx].seq !== lastMove.targetSeq) return;
       r.innerHTML = lastMove.html;
       r.className = `signbox on${lastMove.heavy ? ' heavy' : ''}`;
       clearTimeout(recallTimer);
@@ -679,6 +681,7 @@
       const last = doneLines[doneLines.length - 1];
       last.status = 'pending';
       last.shortage_qty = null;
+      lastMove = null;   // 戻った先への案内は持っていないので「直前の案内」は出さない (Codexレビュー P1)
       if (BATCH.status === 'done') BATCH.status = 'picking';   // 完了直後の取り消し (サーバーも同挙動)
       enqueue('back', last.seq, NEXTOPS[last.seq] || null);
       render();
@@ -726,6 +729,7 @@
     $('shortYes').addEventListener('click', () => {
       if (!shortTarget) return;
       closeShortSheet();
+      lastMove = pendingMove;   // 欠品で進むときも「直前の案内」を更新する (Codexレビュー P1)
       shortTarget.status = 'shortage';
       shortTarget.shortage_qty = shortVal;
       enqueue('shortage', shortTarget.seq, null, { shortage_qty: shortVal });

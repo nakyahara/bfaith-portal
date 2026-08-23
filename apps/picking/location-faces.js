@@ -37,14 +37,18 @@ const inv = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [v, k]))
 const FACE_KIND_TO_JA = inv(FACE_KIND_JA);
 const MOVE_TO_JA = inv(MOVE_JA);
 
-/** CSV (Buffer) → 面の配列。文字コードは BOM/UTF-8 判定、失敗したら Shift_JIS。 */
-export function parseFacesCsv(buffer) {
+/** CSV (Buffer) → 文字列。BOM付きUTF-8 (Excel/本システムの出力) → UTF-8 → それ以外は Shift_JIS とみなす。 */
+export function decodeFacesCsv(buffer) {
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer || '');
   if (buf.length === 0) throw new PkError(400, 'empty_file', 'ファイルが空です');
-  // 文字コード: BOM付きUTF-8 (Excel/本システムの出力) → UTF-8 → それ以外は Shift_JIS とみなす
-  let text;
-  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) text = buf.slice(3).toString('utf8');
-  else { const utf = buf.toString('utf8'); text = utf.includes('�') ? decodeCp932(buf) : utf; }
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return buf.slice(3).toString('utf8');
+  const utf = buf.toString('utf8');
+  return utf.includes('�') ? decodeCp932(buf) : utf;
+}
+
+/** CSV (Buffer) → 面の配列。 */
+export function parseFacesCsv(buffer) {
+  const text = decodeFacesCsv(buffer);
   const state = {};
   const table = parseCsv(text, state).filter((r) => !(r.length === 1 && r[0] === ''));
   if (state.unclosedQuote) throw new PkError(400, 'broken_csv', 'CSVの引用符が閉じていません');
@@ -201,7 +205,8 @@ export function importFaces(buffer, { actor, filename = null } = {}) {
   if (!v.ok) throw new PkError(400, 'invalid_faces', `検証エラー:\n${v.errors.join('\n')}`);
   const db = getDB();
   const sha = crypto.createHash('sha256').update(buffer).digest('hex');
-  const csvText = Buffer.isBuffer(buffer) ? buffer.toString('utf8') : String(buffer);
+  // 履歴はデコード済み (UTF-8) で残す。Shift_JIS の原本をそのまま utf8 で読むと化けて復元できない (Codexレビュー P1)
+  const csvText = decodeFacesCsv(buffer);
   const run = db.transaction(() => {
     const r = db.prepare(`
       INSERT INTO pk_location_face_imports (imported_at, actor, filename, sha256, face_count, total_slots, csv_text)
@@ -237,7 +242,12 @@ export function getFaceImportCsv(id) {
 
 /** 現在のマスタを CSV (UTF-8 BOM・日本語ヘッダ) に戻す (Excel で直して再取込する用)。 */
 export function exportFacesCsv(faces = listFaces()) {
-  const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  // Excel の数式インジェクション対策: = + - @ やタブ/改行で始まる値は先頭に ' を付けて文字列にする (Codexレビュー P2)
+  const q = (v) => {
+    let t = String(v ?? '');
+    if (/^[=+\-@\t\r]/.test(t)) t = `'${t}`;
+    return `"${t.replace(/"/g, '""')}"`;
+  };
   const lines = [CSV_HEADERS.map(q).join(',')];
   for (const f of faces) {
     lines.push([

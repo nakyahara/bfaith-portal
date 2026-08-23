@@ -251,4 +251,19 @@ t('Shift_JIS のCSVも読める', () => {
   assert.equal(faces[1].face_kind, 'back');
 });
 
+t('Shift_JIS で取り込んだ履歴も UTF-8 で残り、そのまま再取込できる (復元)', () => {
+  const header = ['面番号', 'ブロック', '列', '連from', '連to', '面の種類', '棚ID', '前の面からの動き', '信頼', '向き', 'メモ'];
+  const text = [header, ...base].map((r) => r.join(',')).join('\r\n');
+  const r = importFaces(iconv.encode(text, 'Shift_JIS'), { actor: 't', filename: 'sjis.csv' });
+  const saved = getDB().prepare('SELECT csv_text FROM pk_location_face_imports WHERE id=?').get(r.importId).csv_text;
+  assert.ok(saved.includes('折り返す'), '履歴が文字化けしていない');
+  assert.equal(parseFacesCsv(Buffer.from(saved, 'utf8')).length, 3);
+});
+
+t('書き出しは = + - @ 始まりの値を文字列化する (Excel数式インジェクション対策)', () => {
+  const csv = exportFacesCsv([{ seq_no: 1, block: 'P3FA', col: '001', ren_from: 1, ren_to: 12, face_kind: 'single', rack_id: '=1+1', move_in: 'start', reliable: 1, direction: 'left', note: '@x' }]);
+  assert.ok(csv.includes('"\'=1+1"'));
+  assert.ok(csv.includes('"\'@x"'));
+});
+
 console.log(`\ntest-next-sign: ${passed} passed${process.exitCode ? ' (with failures)' : ''}`);
