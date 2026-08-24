@@ -208,9 +208,10 @@ router.get('/', (req, res) => {
       <td class="selcell" onclick="event.stopPropagation()"><input type="checkbox" class="rowchk" value="${r.id}" aria-label="選択"></td>
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
+      <td class="nowrap" data-label="ラベル"${r.label_name ? '' : ' data-empty'}>${r.label_name ? labelChip(r.label_name, r.label_color) : '—'}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="subj" data-full>${r.label_name ? labelChip(r.label_name, r.label_color) + ' ' : ''}<a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
@@ -264,8 +265,8 @@ router.get('/', (req, res) => {
   ${bulkBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
-      <tbody>${trs || `<tr><td colspan="8" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
+      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th>ラベル</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <tbody>${trs || `<tr><td colspan="9" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
   </div>`;
