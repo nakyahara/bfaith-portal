@@ -740,20 +740,25 @@ router.post('/api/drafts/:id/status', (req, res) => {
     if (!isEscaped) {
       return res.status(400).json({ ok: false, error: '保留・除外中ではありません' });
     }
-    const run = db.transaction(() => {
-      const next = deriveWithGateCheck(db, draft.id, actorOf(req));
-      const info = db.prepare(`
-        UPDATE product_drafts
-        SET status = ?, generation_claim_run_id = NULL, generation_claim_until = NULL,
-            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ? AND status = ?
-      `).run(next, draft.id, draft.status);
-      if (info.changes !== 1) return null;
-      logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${next} (再開・工程から判定)`, actorOf(req));
-      return next;
-    });
-    const next = run();
-    if (next == null) {
+    // CAS 敗北は例外で抜けてトランザクション全体をロールバックする (Codex R2 medium):
+    // return で抜けると deriveWithGateCheck 内の basic_info 差し戻し・監査ログだけが
+    // コミットされ、「409 なのに工程とログが変わっている」状態になる
+    const casLost = new Error('cas_lost');
+    let next;
+    try {
+      db.transaction(() => {
+        next = deriveWithGateCheck(db, draft.id, actorOf(req));
+        const info = db.prepare(`
+          UPDATE product_drafts
+          SET status = ?, generation_claim_run_id = NULL, generation_claim_until = NULL,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE id = ? AND status = ?
+        `).run(next, draft.id, draft.status);
+        if (info.changes !== 1) throw casLost;
+        logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${next} (再開・工程から判定)`, actorOf(req));
+      })();
+    } catch (e) {
+      if (e !== casLost) throw e;
       return res.status(409).json({ ok: false, error: '別の操作が先に行われました。画面を読み直してください' });
     }
     return res.json({ ok: true, status: next });
