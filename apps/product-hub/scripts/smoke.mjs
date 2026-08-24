@@ -2814,6 +2814,22 @@ let wfSetParentId = null;
     && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
   r = await call('POST', `/api/drafts/${idE}/sku-prices`, { ne_code: 'vc-b', price: 1000 });
   check('SKU売価: バリエーションでないドラフトは 400', r.status === 400);
+  // R1対応: SKUを外すと売価行も掃除される
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 1980 });
+  check('SKU売価: 除外前は保存できる', r.status === 200, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/variation/exclude`, { ne_code: 'vc-b' });
+  check('SKU売価: SKUを外すと売価行も消える (孤児行を残さない)', r.status === 200
+    && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
+  db.prepare(`DELETE FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) = 'vc-b'`).run();
+  // R1対応: 原価が全SKU共通なら保存は 400 (UIと同じ条件をサーバーでも強制)・解除はいつでもできる
+  db.prepare(`UPDATE mirror_products SET 原価 = 300 WHERE product_id IN (9410, 9411)`).run();
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 1480 });
+  check('SKU売価: 原価が全SKU共通なら保存は 400', r.status === 400, JSON.stringify(r.json));
+  db.prepare(`INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, 'vc-b', 999)`).run(idP);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: '' });
+  check('SKU売価: 残った行の解除はいつでもできる (原価が同一に変わった後でも)', r.status === 200
+    && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
+  db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
 
   server.close();

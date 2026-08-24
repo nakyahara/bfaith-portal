@@ -1425,6 +1425,10 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
       if (/UNIQUE/i.test(String(e && e.message))) return { code: 200, already: true };
       throw e;
     }
+    // 外したSKUのSKU別売価も掃除する。残すと入力欄が消えて解除できず、
+    // 将来の出品処理が古い価格を適用する恐れがある (Codex R1 medium)
+    db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
     logEvent(db, draft.id, 'variation_sku_excluded', code, actorOf(req));
     return { code: 200 };
   })();
@@ -1476,6 +1480,13 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   const db = getDB();
   // 所属確認と書き込みを 1 トランザクションに閉じる (exclude と同じ方針)
   const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (clearing) {
+      // 解除はいつでも許可: SKU除外後や原価が全SKU同一に変わった後でも、残った行を消せるようにする (Codex R1 medium)
+      const info = db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_price_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
     const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
     if (v.kind !== 'variation') {
       return { code: 400, error: 'このドラフトはバリエーションではありません' };
@@ -1485,17 +1496,18 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
     if (!inGroup) {
       return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
     }
-    const key = code.trim().toLowerCase();
-    if (clearing) {
-      db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
-    } else {
-      db.prepare(`
-        INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)
-        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
-          price = excluded.price, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      `).run(draft.id, key, price);
+    // SKU別売価は「原価がSKUで異なる」場合だけ。UI と同じ条件をサーバー側でも強制する (Codex R1 medium:
+    // 全SKU同一原価の商品に保存できると、入力欄が出ないため保存値を確認・解除できなくなる)
+    const cost = getNeCost(db, draft.ne_code, { draftId: draft.id });
+    if (!cost?.costVaries) {
+      return { code: 400, error: 'この商品は原価が全SKU共通です。売価は基本情報のページ代表の売価で設定してください' };
     }
-    logEvent(db, draft.id, 'sku_price_saved', `${code} = ${clearing ? '(解除)' : price + '円'}`, actorOf(req));
+    db.prepare(`
+      INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)
+      ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+        price = excluded.price, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    `).run(draft.id, key, price);
+    logEvent(db, draft.id, 'sku_price_saved', `${code} = ${price}円`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });

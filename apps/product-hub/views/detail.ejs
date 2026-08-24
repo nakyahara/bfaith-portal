@@ -2603,12 +2603,15 @@
         cell.style.fontWeight = profit < 0 ? '600' : '';
       }
       let last = input.value;
-      input.addEventListener('input', render);
-      input.addEventListener('change', async () => {
-        if (input.value === last) return;
+      // 保存はSKU単位の単一チェーンで直列化する (Codex R1 high: 素早く2回変更したとき
+      // 先のPOSTが後から完了すると古い値に巻き戻る)。送信値は実行時点の最新値を読む
+      let saveChain = Promise.resolve();
+      async function save() {
+        const value = input.value;
+        if (value === last) return;
         const json = await post(BASE + '/sku-prices', {
           ne_code: input.dataset.code,
-          price: input.value === '' ? null : Number(input.value),
+          price: value === '' ? null : Number(value),
         });
         if (!json.ok) {
           alert(json.error || 'SKU売価の保存に失敗しました');
@@ -2616,8 +2619,12 @@
           render();
           return;
         }
-        last = input.value;
+        last = value;
         result.textContent = 'SKU売価を保存しました (' + input.dataset.code + ')';
+      }
+      input.addEventListener('input', render);
+      input.addEventListener('change', () => {
+        saveChain = saveChain.then(save).catch(() => {});
       });
       render();
     });
