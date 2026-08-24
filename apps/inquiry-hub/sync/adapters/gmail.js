@@ -195,6 +195,8 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     ...(rule?.action === 'import_done' ? { initialInternalStatus: 'done' } : {}),
     // メールルールのフォルダ振り分け (2026-08-17)。新規作成時のみ適用 (既存チケットのフォルダは動かさない)
     ...(rule?.folderId ? { initialFolderId: rule.folderId } : {}),
+    // メールルールのラベル付与 (2026-08-24)。同じく新規作成時のみ
+    ...(rule?.labelId ? { initialLabelId: rule.labelId } : {}),
     receivedAt: mapped[0].msg.sentAt,
     messages: mapped.map(x => x.msg),
   };

@@ -109,6 +109,9 @@ function buildListWhere(q = {}) {
   // = フォルダに入れても受信トレイからは消えない (2026-08-02 中原さん確認)
   if (q.folder === 'none') where.push('i.folder_id IS NULL');
   else if (/^\d+$/.test(String(q.folder || ''))) { where.push('i.folder_id = ?'); params.push(Number(q.folder)); }
+  // ラベル ('none'=ラベルなし / 数値=そのラベル。2026-08-24 メールディーラー相当)
+  if (q.label === 'none') where.push('i.label_id IS NULL');
+  else if (/^\d+$/.test(String(q.label || ''))) { where.push('i.label_id = ?'); params.push(Number(q.label)); }
   if (q.assigned === 'none') where.push("(i.assigned_user_id IS NULL OR i.assigned_user_id = '')");
   else if (q.assigned) { where.push('i.assigned_user_id = ?'); params.push(String(q.assigned)); }
   if (q.unread === '1') where.push('i.is_unread = 1');
@@ -136,12 +139,13 @@ export function listInquiries(q = {}) {
   const page = Math.max(1, parseInt(q.page, 10) || 1);
   const total = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where.join(' AND ')}`).get(...params).c;
   const rows = db.prepare(`
-    SELECT i.*, s.shop_name, f.name AS folder_name,
+    SELECT i.*, s.shop_name, f.name AS folder_name, l.name AS label_name, l.color AS label_color,
       (SELECT COUNT(*) FROM inquiry_messages m WHERE m.inquiry_id = i.id) AS msg_count,
       ${LAST_INCOMING_SQL} AS last_incoming,
       ${LAST_MESSAGE_AT_SQL} AS last_message_at_actual
     FROM inquiries i JOIN shops s ON s.id = i.shop_id
     LEFT JOIN inquiry_folders f ON f.id = i.folder_id
+    LEFT JOIN inquiry_labels l ON l.id = i.label_id
     WHERE ${where.join(' AND ')}
     ORDER BY COALESCE(i.last_message_at, i.received_at) DESC, i.id DESC
     LIMIT ? OFFSET ?`).all(...params, PAGE_SIZE, (page - 1) * PAGE_SIZE);
@@ -221,9 +225,10 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
 
   const hasStatus = ops.status != null && ops.status !== '';
   const hasFolder = Object.prototype.hasOwnProperty.call(ops, 'folderId') && ops.folderId !== undefined;
+  const hasLabel = Object.prototype.hasOwnProperty.call(ops, 'labelId') && ops.labelId !== undefined;
   const hasAssigned = ops.assigned != null;
   const hasUnread = typeof ops.isUnread === 'boolean';
-  if (!hasStatus && !hasFolder && !hasAssigned && !hasUnread) throw new Error('変更内容が指定されていません');
+  if (!hasStatus && !hasFolder && !hasLabel && !hasAssigned && !hasUnread) throw new Error('変更内容が指定されていません');
   if (hasStatus && !STATUSES[ops.status]) throw new Error(`不正なステータス: ${ops.status}`);
 
   const db = getDB();
@@ -232,6 +237,12 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
     const f = db.prepare('SELECT id, name, is_active FROM inquiry_folders WHERE id = ?').get(Number(ops.folderId));
     if (!f || !f.is_active) throw new Error('指定のフォルダが存在しません');
     folderName = f.name;
+  }
+  let labelName = null;
+  if (hasLabel && ops.labelId != null) {
+    const l = db.prepare('SELECT id, name, is_active FROM inquiry_labels WHERE id = ?').get(Number(ops.labelId));
+    if (!l || !l.is_active) throw new Error('指定のラベルが存在しません');
+    labelName = l.name;
   }
   const assigned = hasAssigned ? String(ops.assigned).trim() : null;
 
@@ -244,6 +255,7 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
       completed_at = CASE WHEN ? = 'done' THEN COALESCE(completed_at, ${NOW}) ELSE NULL END,
       updated_at = ${NOW} WHERE id = ?`);
     const updFolder = db.prepare(`UPDATE inquiries SET folder_id = ?, updated_at = ${NOW} WHERE id = ?`);
+    const updLabel = db.prepare(`UPDATE inquiries SET label_id = ?, updated_at = ${NOW} WHERE id = ?`);
     const updAssign = db.prepare(`UPDATE inquiries SET assigned_user_id = ?, updated_at = ${NOW} WHERE id = ?`);
     const updUnread = db.prepare(`UPDATE inquiries SET is_unread = ?, updated_at = ${NOW} WHERE id = ?`);
     for (const id of list) {
@@ -261,6 +273,13 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
         updFolder.run(fid, id);
         logActivity(id, { userId: actorId, actionType: 'folder_change',
           before: { folder: inq.folder_id }, after: { folder: folderName, reason: '一括操作' } });
+        touched = true;
+      }
+      const lid = hasLabel ? (ops.labelId == null ? null : Number(ops.labelId)) : undefined;
+      if (hasLabel && inq.label_id !== lid) {
+        updLabel.run(lid, id);
+        logActivity(id, { userId: actorId, actionType: 'label_change',
+          before: { label: inq.label_id }, after: { label: labelName, reason: '一括操作' } });
         touched = true;
       }
       if (hasAssigned && String(inq.assigned_user_id || '') !== assigned) {
@@ -338,9 +357,11 @@ export function getInquiryDetail(id) {
   if (!Number.isInteger(id)) return null;
   const inquiry = db.prepare(`
     SELECT i.*, s.shop_name, s.account_identifier, s.last_synced_at AS shop_last_synced_at,
-      f.name AS folder_name, f.is_active AS folder_is_active
+      f.name AS folder_name, f.is_active AS folder_is_active,
+      l.name AS label_name, l.color AS label_color
     FROM inquiries i JOIN shops s ON s.id = i.shop_id
     LEFT JOIN inquiry_folders f ON f.id = i.folder_id
+    LEFT JOIN inquiry_labels l ON l.id = i.label_id
     WHERE i.id = ?`).get(id);
   if (!inquiry) return null;
   const messages = db.prepare('SELECT * FROM inquiry_messages WHERE inquiry_id = ? ORDER BY COALESCE(received_at, sent_at, created_at), id').all(id);

@@ -88,6 +88,23 @@ function createTables() {
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_folders_namekey_active
     ON inquiry_folders(name_key) WHERE is_active = 1 AND name_key IS NOT NULL`);
 
+  // 色付きラベル (2026-08-24 中原さん要望。メールディーラーの「ラベルの設定」相当)。
+  // フォルダ (分類箱・1件1フォルダ) とは別軸の「目印」。1件1ラベル (メールディーラーと同じ運用)。
+  // メールルールの label_id からも参照され、条件一致で取り込み時に自動付与される
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_labels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    name_key TEXT,                  -- 重複判定用の正規化キー (NFKC + 小文字。labels.js が入れる)
+    color TEXT NOT NULL DEFAULT '#64748b',  -- チップ背景色 '#rrggbb' (labels.js が検証)
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),  -- 削除は論理削除のみ
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_labels_namekey_active
+    ON inquiry_labels(name_key) WHERE is_active = 1 AND name_key IS NOT NULL`);
+
   // 店舗・チャネル
   db.exec(`CREATE TABLE IF NOT EXISTS shops (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,6 +167,8 @@ function createTables() {
   )`);
   // 任意フォルダへの所属 (1件1フォルダ。NULL=未分類)。既存DBへの冪等migration
   addColumnIfMissing('inquiries', 'folder_id', 'INTEGER REFERENCES inquiry_folders(id)');
+  // ラベル (1件1ラベル。NULL=ラベルなし。2026-08-24)
+  addColumnIfMissing('inquiries', 'label_id', 'INTEGER REFERENCES inquiry_labels(id)');
 
   // メッセージ (受信・送信の両方)
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (
@@ -361,6 +380,8 @@ function createTables() {
       })();
     }
   }
+  // label_id: 取り込み時にこのラベルを付ける (skip 以外で有効。2026-08-24 メールディーラーのラベル振り分け相当)
+  addColumnIfMissing('mail_rules', 'label_id', 'INTEGER REFERENCES inquiry_labels(id)');
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_rules_external
     ON mail_rules(external_key) WHERE external_key IS NOT NULL`);
 
@@ -429,6 +450,7 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_product ON inquiries(product_code)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_customer ON inquiries(customer_identifier)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_folder ON inquiries(folder_id, last_message_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_inquiries_label ON inquiries(label_id, last_message_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_inquiry ON inquiry_messages(inquiry_id, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_replies(status, lease_until)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)');
