@@ -1720,14 +1720,18 @@ const wf = await import('../lib/workflow.js');
   check('役割シード: 画像作成承認者', roles0.some((r) => r.code === 'image_approver' && r.label === '画像作成承認者'));
   check('役割シード: 商品登録者', roles0.some((r) => r.code === 'registrar' && r.label === '商品登録者'));
   const steps0 = wf.listSteps();
-  check('工程シード: 本流6 + 画像8 (TOP/詳細 × 4段階)',
-    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 8,
+  check('工程シード: 本流6 + 画像9 (TOP 4段階 + 詳細 5段階 = 撮影依頼中は詳細のみ)',
+    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 9,
     `main=${steps0.filter((s) => s.track === 'main').length} image=${steps0.filter((s) => s.track === 'image').length}`);
   {
+    const expectedImgOrder = {
+      top: 'img_request_top,img_production_top,img_register_top,img_approve_top',
+      detail: 'img_request_detail,img_shoot_detail,img_production_detail,img_register_detail,img_approve_detail',
+    };
     for (const kind of ['top', 'detail']) {
       const img = steps0.filter((s) => s.track === 'image' && s.image_kind === kind).map((s) => s.code);
-      check(`工程シード: ${kind} は 依頼→制作→登録→承認 の順`,
-        img.join(',') === `img_request_${kind},img_production_${kind},img_register_${kind},img_approve_${kind}`, img.join(','));
+      check(`工程シード: ${kind} の段階の並び (詳細は依頼→撮影依頼中→制作→登録→承認)`,
+        img.join(',') === expectedImgOrder[kind], img.join(','));
     }
     check('工程シード: 画像承認の担当は画像作成承認者 (両種別)',
       steps0.find((s) => s.code === 'img_approve_top').role_code === 'image_approver'
@@ -1827,7 +1831,7 @@ const wf = await import('../lib/workflow.js');
   // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
   const ov = wf.workflowOverview();
   check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
-  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 8,
+  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 9,
     `main=${ov.main.length} image=${ov.image.length}`);
 }
 
@@ -2428,14 +2432,16 @@ let wfSetParentId = null;
   {
     // 本流カードに画像 (TOP/詳細) の進捗が常時付く = ボードを行き来せずに読める (2重管理の解消)
     const card = b.columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
-    check('ボード: カードに TOP/詳細 のステッパーが付く',
-      card.image?.top?.steps?.length === 4 && card.image?.detail?.steps?.length === 4,
+    check('ボード: カードに TOP/詳細 のステッパーが付く (詳細は撮影依頼中込みで5点)',
+      card.image?.top?.steps?.length === 4 && card.image?.detail?.steps?.length === 5,
       JSON.stringify(card.image || null).slice(0, 120));
   }
 
-  // 画像ビュー: 列は段階 (依頼→制作→登録→承認) でまとまり、カードは 商品×種別
+  // 画像ビュー: 列は段階 (依頼→撮影依頼中→制作→登録→承認) でまとまり、カードは 商品×種別
   const bi = wfp.boardData(db, { view: 'image' });
-  check('ボード(画像): 4列 (TOP/詳細が段階でまとまる)', bi.view === 'image' && bi.columns.length === 4,
+  check('ボード(画像): 5列 (TOP/詳細が段階でまとまる + 撮影依頼中は詳細のみの列)',
+    bi.view === 'image' && bi.columns.length === 5
+    && bi.columns.map((c) => c.key).join(',') === 'request,shoot,production,register,approve',
     `cols=${bi.columns.map((c) => c.key).join(',')}`);
   {
     const kindsOf = (id) => bi.columns.flatMap((c) => c.cards.filter((x) => x.id === id).map((x) => x.kind));
@@ -2805,6 +2811,43 @@ let wfSetParentId = null;
   check('画像ビュー: 詳細対象外でも kind=top には出る',
     wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.cards.some((x) => x.id === idKfx)));
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
+
+  // ─── 撮影依頼中 (2026-08-25 中原さん要望): 商品詳細画像だけの段階 ───
+  const shootStep = db.prepare(`SELECT * FROM ph_steps WHERE code = 'img_shoot_detail'`).get();
+  check('撮影依頼中: 詳細のみ・依頼と制作の間 (sort 15)・stage shoot で seed される',
+    shootStep && shootStep.image_kind === 'detail' && shootStep.image_stage === 'shoot'
+    && shootStep.sort === 15 && shootStep.active === 1 && shootStep.stall_days === 7,
+    JSON.stringify(shootStep));
+  const ibShoot = wfpEarly.boardData(db, { view: 'image' });
+  const shootColKeys = ibShoot.columns.map((c) => c.key);
+  check('撮影依頼中: ボードの列は 依頼 → 撮影依頼中 → 制作 の順',
+    shootColKeys.indexOf('request') < shootColKeys.indexOf('shoot')
+    && shootColKeys.indexOf('shoot') < shootColKeys.indexOf('production'), JSON.stringify(shootColKeys));
+  check('撮影依頼中: 列に居るのは詳細カードだけ (TOP側に工程が無い)',
+    (ibShoot.columns.find((c) => c.key === 'shoot')?.cards || []).every((x) => x.kind === 'detail'));
+  const idSh = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT', '撮影テスト', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idSh);
+  wfpEarly.moveBoardCard(idSh, { view: 'image', kind: 'detail', to: 'shoot', expectedCurrent: 'img_request_detail' }, 'smoke', ADMIN2);
+  const shootStOf = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSh, code)?.state;
+  check('撮影依頼中: 詳細カードを D&D で入れられる (依頼 done・撮影 todo)',
+    shootStOf('img_request_detail') === 'done' && shootStOf('img_shoot_detail') === 'todo');
+  let shootTopErr = null;
+  try { wfpEarly.moveBoardCard(idSh, { view: 'image', kind: 'top', to: 'shoot', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN2); } catch (e) { shootTopErr = e; }
+  check('撮影依頼中: TOPカードは撮影依頼中へ動かせない (400)', shootTopErr?.status === 400, shootTopErr?.message || '例外が出ていない');
+  check('撮影依頼中: 工程パネルで「対象外」にできる (撮影しない商品)',
+    wfpEarly.setStepState(idSh, 'img_shoot_detail', { state: 'skip' }, 'smoke', ADMIN2).changed === true);
+  // 楽天登録済みの既存商品には自動 done で入る (出品済みに「撮影待ち」を出さない)
+  const idShRk = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-SHOOT-RK', '撮影・登録済み', 'listed', 'smoke')
+  `).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-01T00:00:00Z')`).run(idShRk);
+  wfpEarly.ensureProgress(db, idShRk);
+  check('撮影依頼中: 楽天登録済みには自動 done で入る',
+    db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idShRk, 'img_shoot_detail')?.state === 'done');
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSh);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShRk);
 
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
