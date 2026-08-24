@@ -96,13 +96,32 @@ export function resolveNeDefaults(db, inputCode) {
  * 導出が済んだ値が mirror_products.送料 に入っている (例: ネコポス→237円)。
  * どの配送方法由来かを表示できるよう shippingMethod も返す。
  * 正規化重複で値が割れたら採用しない (getNeDefaults と同じ方針)。無ければ null
+ *
+ * バリエーションは**子SKUの行から集計**する (2026-08-24 中原さん要望)。
+ * 代表商品コードの93%は商品として実在しない = 自身の行だけ見ると原価が引けない。
+ *   - 全SKUで原価が同じ → その値を costExTax に採用
+ *   - SKUごとに違う → costExTax は null にし costVaries=true (売価をSKU別に設定する運用)
+ * draftId を渡すと、そのドラフトでバリエーションから外した SKU は集計に含めない。
  */
-export function getNeCost(db, neCode) {
+export function getNeCost(db, neCode, { draftId = null } = {}) {
   const code = String(neCode == null ? '' : neCode).trim();
   if (!code || !mirrorReady(db)) return null;
   let rows;
+  let source = 'self';
   try {
-    rows = db.prepare('SELECT 原価, 送料, 配送方法, 消費税率 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').all(norm(code));
+    const v = resolveVariationGroup(db, code, { withMembers: false, draftId });
+    if (v.kind === 'variation') {
+      const excluded = excludedSet(db, draftId);
+      rows = db.prepare(`
+        SELECT 商品コード, 原価, 送料, 配送方法, 消費税率 FROM mirror_products
+        WHERE LOWER(TRIM(代表商品コード)) = ? ORDER BY 商品コード
+      `).all(norm(v.groupKey)).filter((r) => !excluded.has(norm(r.商品コード)));
+      source = 'members';
+    }
+    if (!rows || rows.length === 0) {
+      rows = db.prepare('SELECT 商品コード, 原価, 送料, 配送方法, 消費税率 FROM mirror_products WHERE LOWER(TRIM(商品コード)) = ?').all(norm(code));
+      source = 'self';
+    }
   } catch (_) {
     return null;
   }
@@ -113,11 +132,18 @@ export function getNeCost(db, neCode) {
     return [...vals][0] ?? null;
   };
   const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  // null (未設定) も1種として数える: 「660円 / 未設定」の混在を「全SKU同じ」とは扱わない
+  const distinctCosts = new Set(rows.map((r) => num(r.原価)));
   return {
     costExTax: num(agreed((r) => r.原価)),
     shippingCost: num(agreed((r) => r.送料)),
     shippingMethod: agreed((r) => (r.配送方法 && String(r.配送方法).trim() !== '' ? String(r.配送方法).trim() : null)),
     taxPercent: taxToPercent(agreed((r) => r.消費税率)),
+    source, // 'members' = バリエーション子SKUから集計 / 'self' = 自身の行
+    costVaries: source === 'members' && distinctCosts.size > 1,
+    skuCosts: source === 'members'
+      ? rows.map((r) => ({ code: String(r.商品コード).trim(), costExTax: num(r.原価), shippingCost: num(r.送料) }))
+      : [],
   };
 }
 

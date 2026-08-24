@@ -218,8 +218,14 @@ router.get('/detail/:id', (req, res) => {
       .get(String(m.商品コード).trim().toLowerCase())?.id || null;
   }
 
-  // 利益シミュレーション (Notion 数式の移植)。原価・送料 (配送方法から自動算出済) ・税率は NE から
-  const neCost = getNeCost(db, draft.ne_code);
+  // 利益シミュレーション (Notion 数式の移植)。原価・送料 (配送方法から自動算出済) ・税率は NE から。
+  // バリエーションは子SKUから集計するので、外したSKUを除くため draftId を渡す
+  const neCost = getNeCost(db, draft.ne_code, { draftId: draft.id });
+  // SKU別売価 (原価がSKUで異なる場合に設定する)。キーは正規化済み sku_code
+  const skuPrices = {};
+  for (const r of db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?').all(draft.id)) {
+    skuPrices[r.sku_code] = r.price;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -267,7 +273,7 @@ router.get('/detail/:id', (req, res) => {
     rakuten, cabinetImages, genreDict,
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
-    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE,
+    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -1448,6 +1454,48 @@ router.post('/api/drafts/:id/variation/restore', (req, res) => {
     const info = db.prepare('DELETE FROM draft_variation_exclusions WHERE draft_id = ? AND LOWER(TRIM(ne_code)) = ?')
       .run(draft.id, code.trim().toLowerCase());
     if (info.changes > 0) logEvent(db, draft.id, 'variation_sku_restored', code, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// SKU別売価の保存 (2026-08-24 中原さん要望: 原価がSKUで異なる場合は売価もSKU別に)。
+// price が空 (null/'') なら行を消す = ページ代表の売価 (draft.price) に戻す
+router.post('/api/drafts/:id/sku-prices', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const rawPrice = req.body?.price;
+  const clearing = rawPrice == null || String(rawPrice).trim() === '';
+  const price = clearing ? null : Number(rawPrice);
+  if (!clearing && (!Number.isInteger(price) || price < 1 || price > 100_000_000)) {
+    return res.status(400).json({ ok: false, error: '売価は 1〜1億円 の整数で入力してください' });
+  }
+  const db = getDB();
+  // 所属確認と書き込みを 1 トランザクションに閉じる (exclude と同じ方針)
+  const r = db.transaction(() => {
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+    if (v.kind !== 'variation') {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    const inGroup = v.members
+      .some((m) => String(m.商品コード).trim().toLowerCase() === code.trim().toLowerCase());
+    if (!inGroup) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    const key = code.trim().toLowerCase();
+    if (clearing) {
+      db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+    } else {
+      db.prepare(`
+        INSERT INTO draft_sku_prices (draft_id, sku_code, price) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+          price = excluded.price, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run(draft.id, key, price);
+    }
+    logEvent(db, draft.id, 'sku_price_saved', `${code} = ${clearing ? '(解除)' : price + '円'}`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });

@@ -1546,6 +1546,43 @@ check('getNeCost: 原価/送料/配送方法/税率 (大小ゆらぎ吸収)',
 check('getNeCost: NEに無ければ null', vari.getNeCost(db, 'NO-SUCH-COST') === null);
 db.prepare(`DELETE FROM mirror_products WHERE product_id = 9401`).run();
 
+// getNeCost バリエーション対応 (2026-08-24 中原さん要望): 代表コードの行は93%実在しないので、
+// 子SKUの行から集計する。全SKU同じ原価 → 採用 / SKUで違う → costVaries=true で採用しない
+insProd.run(9410, 'vc-a', 'バリ原価A', 'vcost');
+insProd.run(9411, 'vc-b', 'バリ原価B', 'vcost');
+db.prepare(`UPDATE mirror_products SET 原価 = 300, 送料 = 237, 配送方法 = 'ネコポス', 消費税率 = 0.1 WHERE product_id IN (9410, 9411)`).run();
+const ncSame = vari.getNeCost(db, 'vcost'); // 'vcost' 自体は mirror に行が無い
+check('getNeCost: バリエーションは子SKUから集計 (全SKU同じ原価はその値を採用)',
+  ncSame && ncSame.source === 'members' && ncSame.costExTax === 300 && ncSame.costVaries === false
+  && ncSame.shippingCost === 237 && ncSame.taxPercent === 10 && ncSame.skuCosts.length === 2,
+  JSON.stringify(ncSame));
+db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
+const ncVary = vari.getNeCost(db, 'vcost');
+check('getNeCost: SKUで原価が違えば costVaries=true で原価は採用しない (skuCosts に個別値)',
+  ncVary && ncVary.costVaries === true && ncVary.costExTax === null
+  && JSON.stringify(ncVary.skuCosts.map((s) => s.costExTax)) === '[300,500]',
+  JSON.stringify(ncVary));
+check('getNeCost: 子SKUコードで引いても同じグループ集計になる',
+  vari.getNeCost(db, 'vc-a')?.costVaries === true);
+// 「500円 / 未設定」の混在も「全SKU同じ」とは扱わない
+db.prepare(`UPDATE mirror_products SET 原価 = NULL WHERE product_id = 9410`).run();
+check('getNeCost: 原価未設定と設定済みの混在も costVaries=true',
+  vari.getNeCost(db, 'vcost')?.costVaries === true && vari.getNeCost(db, 'vcost')?.costExTax === null);
+db.prepare(`UPDATE mirror_products SET 原価 = 300 WHERE product_id = 9410`).run();
+// draftId を渡すと、そのドラフトで外した SKU は集計から除かれる
+{
+  const idVc = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('vcost', 'バリ原価', 'smoke')
+  `).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, 'vc-b', 'smoke')`).run(idVc);
+  const ncEx = vari.getNeCost(db, 'vcost', { draftId: idVc });
+  check('getNeCost: 外したSKU (500円) は集計から除かれ残り (300円) で一致する',
+    ncEx && ncEx.costExTax === 300 && ncEx.costVaries === false && ncEx.skuCosts.length === 1,
+    JSON.stringify(ncEx));
+  db.prepare('DELETE FROM draft_variation_exclusions WHERE draft_id = ?').run(idVc);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idVc);
+}
+
 // ─── 商品ページ表記 (xlsm移植) ───
 const pinfo = await import('../lib/page-info.js');
 
@@ -2754,6 +2791,31 @@ let wfSetParentId = null;
   check('重要度: 空でクリアできる', r.status === 200
     && db.prepare('SELECT image_priority FROM product_drafts WHERE id = ?').get(idM).image_priority == null);
 
+  // ─── SKU別売価 (2026-08-24: 原価がSKUで異なる場合に売価もSKU別に) ───
+  // mirror の vc-a/vc-b (代表 'vcost') は getNeCost のテストで投入済み
+  const idP = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('vcost', 'SKU売価テスト', 'smoke')
+  `).run().lastInsertRowid);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 1480 });
+  check('SKU売価: 保存できる', r.status === 200
+    && db.prepare(`SELECT price FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP)?.price === 1480,
+    JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 2480 });
+  check('SKU売価: 上書きできる (UPSERT)', r.status === 200
+    && db.prepare(`SELECT price FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP)?.price === 2480);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 0 });
+  check('SKU売価: 範囲外 (0円) は 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: 1.5 });
+  check('SKU売価: 小数は 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'not-in-group', price: 1000 });
+  check('SKU売価: グループ外のSKUは 409', r.status === 409);
+  r = await call('POST', `/api/drafts/${idP}/sku-prices`, { ne_code: 'vc-b', price: null });
+  check('SKU売価: 空 (null) で解除 = 行が消えてページ代表の売価に戻る', r.status === 200
+    && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
+  r = await call('POST', `/api/drafts/${idE}/sku-prices`, { ne_code: 'vc-b', price: 1000 });
+  check('SKU売価: バリエーションでないドラフトは 400', r.status === 400);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
+
   server.close();
 }
 
@@ -3463,6 +3525,25 @@ renders.push(
     renders.push(['detail.ejs (セット商品・仮コード警告)', 'detail.ejs',
       { ...d0[2], setDrafts: [], setInfo: sd.setInfoOf(db, wfSetDraftId) }]);
   }
+  // SKU別原価・売価 (2026-08-24): 原価がSKUで異なる分岐 (原価列 + SKU別売価入力 + 保存済み値)
+  if (d0) {
+    renders.push(['detail.ejs (SKU別原価・売価: costVaries)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980 },
+      variation: variationFixtures.rep,
+      neCost: {
+        costExTax: null, shippingCost: 237, shippingMethod: 'ネコポス', taxPercent: 10,
+        source: 'members', costVaries: true,
+        skuCosts: [
+          { code: 'rooms-l-bk', costExTax: 300, shippingCost: 237 },
+          { code: 'rooms-l-wh', costExTax: 500, shippingCost: 237 },
+          { code: 'rooms-m-bk', costExTax: null, shippingCost: null }, // 原価未設定SKUの「—」分岐
+        ],
+      },
+      profitSim: null,
+      skuPrices: { 'rooms-l-bk': 1480 },
+    }]);
+  }
 }
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
 const boardBase = {
@@ -3500,6 +3581,7 @@ for (const [name, file, data] of renders) {
         isAdmin: true, myStaffId: null,
         mallStatus: ms.mallStatusOf(wfDraftId, { db }),
         setDrafts: [], setInfo: null,
+        skuPrices: {},
         trailingBanners: [
           { location: listing.SHIPPING_BANNER_LOCATIONS['5'], label: '配送: ネコポス', url: listing.cabinetImageUrl(listing.SHIPPING_BANNER_LOCATIONS['5']) },
           ...listing.COMMON_TRAILING_BANNERS.map((b) => ({ ...b, url: listing.cabinetImageUrl(b.location) })),
