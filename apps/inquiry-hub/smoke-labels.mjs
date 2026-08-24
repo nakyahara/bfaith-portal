@@ -176,7 +176,8 @@ console.log('4. HTTP');
 
   // 一覧: チップが色付きで出る + ラベル絞込select
   const list = await (await fetch(base + '/?view=all')).text();
-  check('一覧にラベルチップ (色style付き)', list.includes('class="lbl"') && list.includes('#123456'));
+  check('一覧: 状態の隣に「ラベル」列+色チップ (2026-08-25 メールディーラー同配置)',
+    list.includes('<th>状態</th><th>ラベル</th>') && list.includes('class="lbl"') && list.includes('#123456'));
   check('一覧の絞込にラベルselect', list.includes('name="label"') && list.includes('ラベル: 全て'));
 
   // 詳細: select + h2チップ + メールルールのラベルselect
