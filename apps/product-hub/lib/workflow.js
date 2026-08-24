@@ -458,7 +458,7 @@ export function createStep(input) {
   if (track === 'image') {
     imageKind = trimOrNull(input?.image_kind);
     if (imageKind !== 'top' && imageKind !== 'detail') {
-      throw badRequest('画像トラックの工程は種別 (TOP画像 / 詳細画像) を指定してください');
+      throw badRequest('画像トラックの工程は種別 (TOP画像 / 商品詳細画像) を指定してください');
     }
   }
   const rc = trimOrNull(input?.role_code);
