@@ -22,6 +22,7 @@
  *
  * 送受信の区別: From のドメインが b-faith.biz → shop (自社)、それ以外 → customer
  */
+import nodemailer from 'nodemailer';
 import { evaluateMailRules } from '../../mail-rules.js';
 import { SendRejectedError } from '../../outbox.js';
 
@@ -60,11 +61,25 @@ const headerOf = (payload, name) => {
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /** 楽天あんしんメルアドサービスのマスクアドレス (…@pc.fw.rakuten.ne.jp / @mb.fw.rakuten.ne.jp 等)。
- * 楽天側の中継サーバーは「店舗としてRMSに登録済みの送信元アドレス」以外からのメールを
- * `552 5.2.0 sender rejected` で拒否する (2026-08-24 実測: From が d.nakahara@ に
- * 置き換わった返信がバウンスした)。宛先がこれに該当し、かつ実効Fromの置き換わりが
- * 既知のときは送信前に止める (sendReply 参照) */
+ * 2026-08-24 実測: Gmail API経由の送信は send-as エイリアス (From=info@) があっても
+ * SMTPエンベロープに認証アカウント (d.nakahara@) が出るため、楽天中継が
+ * `552 5.2.0 <d.nakahara@…> sender rejected` で拒否する (RMS登録アドレス以外は不可)。
+ * → この宛先だけは楽天提供の公式SMTP (sub.fw.rakuten.ne.jp:587) 経由で送る (sendReply 参照)。
+ *   メールディーラー・メールワイズ・Re:lation 等の他ツールと同じ方式 */
 export const RAKUTEN_MASKED_RE = /@(?:[a-z0-9-]+\.)?fw\.rakuten\.ne\.jp$/i;
+
+/** 楽天あんしんメルアド公式SMTPの接続設定を env から解決。
+ * SMTP AUTH ID/パスワードは R-Login「あんしんメルアドサービスメニュー」→「メールサーバ設定情報」で確認。
+ * 未設定なら null (マスクアドレス宛の送信は明確な案内付きで拒否される) */
+export function resolveRakutenMaskSmtpFromEnv(env = process.env) {
+  const user = env.INQUIRY_RAKUTEN_SMTP_USER, pass = env.INQUIRY_RAKUTEN_SMTP_PASS;
+  if (!user || !pass) return null;
+  return {
+    host: env.INQUIRY_RAKUTEN_SMTP_HOST || 'sub.fw.rakuten.ne.jp',
+    port: Number(env.INQUIRY_RAKUTEN_SMTP_PORT) || 587,
+    user, pass,
+  };
+}
 
 /**
  * From ヘッダから実効差出人を解決する (受信同期の顧客判定と送信時の宛先フォールバックで共用)。
@@ -216,6 +231,9 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
  *                 未設定だとGmailが認証ユーザーのアドレスに置き換える → live送信のたびに読み戻しで
  *                 実Fromを検証し、置き換わっていたら warning を返す。sendReply 参照)
  *   fromName?: Fromの表示名 (既定 '雑貨イズム（B-Faith株式会社）' — メールディーラーのFrom表示名と同一)
+ *   rakutenSmtp?: 楽天あんしんメルアド公式SMTP設定 (resolveRakutenMaskSmtpFromEnv)。
+ *                 マスクアドレス (…@fw.rakuten.ne.jp) 宛はこの経路で送る。未設定なら明確な案内付きで拒否
+ *   smtpTransportFactory?: SMTPトランスポートの差し替え (テスト用。既定=nodemailer)
  */
 export function createGmailAdapter(cfg = {}) {
   const { clientId, clientSecret, refreshToken } = cfg;
@@ -231,11 +249,19 @@ export function createGmailAdapter(cfg = {}) {
   const sendMode = cfg.sendMode ?? 'dryrun';
   const fromAddress = cfg.fromAddress ?? 'info@b-faith.biz';
   const fromName = cfg.fromName ?? '雑貨イズム（B-Faith株式会社）';
+  // 楽天あんしんメルアド公式SMTP (resolveRakutenMaskSmtpFromEnv)。マスクアドレス宛の送信に必須
+  const rakutenSmtp = cfg.rakutenSmtp ?? null;
+  // テスト差し替え用。既定は nodemailer (STARTTLS必須・タイムアウトはGmailと同じ設定に揃える)
+  const smtpTransportFactory = cfg.smtpTransportFactory ?? (s => nodemailer.createTransport({
+    host: s.host, port: s.port, secure: false, requireTLS: true,
+    auth: { user: s.user, pass: s.pass },
+    connectionTimeout: requestTimeoutMs, greetingTimeout: requestTimeoutMs, socketTimeout: requestTimeoutMs,
+  }));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   // live送信後にSentメッセージを読み戻して実測したFrom (送信元の置き換わり検出)。
   // fromAddress の send-as エイリアスが未設定だと Gmail は From を認証ユーザーの
-  // アドレスに黙って置き換える — 通常宛先には届くが、楽天マスクアドレス宛は拒否される。
+  // アドレスに黙って置き換える (通常宛先には届くが表示上の事故になる)。
   // null=未観測 / 一致していれば fromAddress / 置き換わっていれば実測アドレス
   let observedActualFrom = null;
 
@@ -400,12 +426,52 @@ export function createGmailAdapter(cfg = {}) {
       }
       headerSafe('宛先', to);
 
-      // 楽天マスクアドレス宛ガード: 実効Fromの置き換わりが既知なら送るだけ無駄 (100%バウンス)
-      // なので未送信で止め、直し方をジョブ履歴に出す。初回は送信後の読み戻し検証で検出する
-      if (RAKUTEN_MASKED_RE.test(to) && observedActualFrom && observedActualFrom !== fromAddress.toLowerCase()) {
-        throw new SendRejectedError(`楽天マスクアドレス宛は送信元 ${fromAddress} 以外拒否されますが、`
-          + `実際の送信元が ${observedActualFrom} になっています (未送信)。`
-          + `Gmail (${observedActualFrom}) の設定「他のメールアドレスからメールを送信」に ${fromAddress} を追加してから再送してください`);
+      // ─── 楽天マスクアドレス宛: 楽天公式SMTP経由で送る (2026-08-24 実測+Web調査) ───
+      // Gmail API経由はSMTPエンベロープが認証アカウント (d.nakahara@) になり、楽天中継の
+      // 「RMS登録アドレス以外は拒否」に当たって 552 sender rejected でバウンスする。
+      // 楽天が店舗向けに提供する sub.fw.rakuten.ne.jp:587 (SMTP AUTH) なら
+      // From・エンベロープともRMS登録済みの info@ を名乗れる (メールディーラー等と同方式)
+      if (RAKUTEN_MASKED_RE.test(to)) {
+        if (!rakutenSmtp) {
+          // SMTP未設定でGmail経由に流すと100%バウンス+顧客に届かないため、未送信で止めて直し方を出す
+          throw new SendRejectedError('楽天マスクアドレス宛はGmail経由では楽天側に拒否されます (未送信)。'
+            + 'Render envに INQUIRY_RAKUTEN_SMTP_USER / INQUIRY_RAKUTEN_SMTP_PASS を設定してください'
+            + ' (R-Login「あんしんメルアドサービスメニュー」→「メールサーバ設定情報」のSMTP AUTH ID/パスワード)');
+        }
+        if (dryRun || sendMode !== 'live') {
+          console.log(`[gmail-send DRYRUN] 楽天SMTP経路 To=${to} Subject=${subject.slice(0, 40)} atts=${attachments.length} (実送信していません)`);
+          return { dryRun: true, externalReplyId: `dryrun:${threadId}` };
+        }
+        const transport = smtpTransportFactory(rakutenSmtp);
+        let info;
+        try {
+          info = await transport.sendMail({
+            from: { name: fromName, address: fromAddress },
+            to,
+            subject,
+            text: String(bodyText || ''),
+            // エンベロープ (MAIL FROM) を明示的に info@ にする — 楽天の許可判定はここを見る
+            envelope: { from: fromAddress, to: [to] },
+            ...(inReplyTo ? { inReplyTo } : {}),
+            ...(references ? { references: references.split(/\s+/).filter(Boolean) } : {}),
+            attachments: attachments.map(a => ({
+              filename: String(a.fileName || 'attachment').replace(/[\r\n\0]/g, '_').slice(0, 150),
+              content: a.buffer,
+              ...(a.contentType ? { contentType: a.contentType } : {}),
+            })),
+          });
+        } catch (err) {
+          const code = Number(err?.responseCode);
+          const msg = `楽天SMTP送信失敗 (${code || err?.code || '接続エラー'}): ${String(err?.message || err).slice(0, 200)}`;
+          // SMTPの4xx/5xx応答 = サーバーが受け付けなかった (未送信確定)。接続断・タイムアウト等は結果不明
+          if (code >= 400) throw new SendRejectedError(msg);
+          throw new Error(`${msg} — 結果不明`);
+        } finally {
+          try { transport.close?.(); } catch { /* 接続の後始末のみ */ }
+        }
+        const extId = String(info?.messageId || '').trim();
+        console.log(`[gmail-send] 楽天SMTP送信完了 To=${to} messageId=${extId || '(不明)'}`);
+        return extId ? { externalReplyId: extId } : {};
       }
 
       const commonHeaders = [
@@ -466,8 +532,7 @@ export function createGmailAdapter(cfg = {}) {
           observedActualFrom = actual;
           if (actual !== fromAddress.toLowerCase()) {
             warning = `⚠️実際の送信元が ${actual} でした (設定は ${fromAddress})。`
-              + `Gmailの「他のメールアドレスからメールを送信」に ${fromAddress} を追加してください`
-              + (RAKUTEN_MASKED_RE.test(to) ? '。楽天マスクアドレス宛のため不達 (バウンス) になります — 設定後に再送が必要です' : '');
+              + `Gmailの「他のメールアドレスからメールを送信」に ${fromAddress} を追加してください`;
             console.error(`[gmail-send] ${warning} (messageId=${sent.id})`);
           }
         }

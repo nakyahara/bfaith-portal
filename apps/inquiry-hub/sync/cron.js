@@ -18,7 +18,7 @@ import { runSync } from './engine.js';
 import { runOutboxPass } from '../outbox.js';
 import { createRakutenAdapter, resolveRakutenTransportFromEnv, DEEP_LOOKBACK_DAYS } from './adapters/rakuten.js';
 import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DAYS } from './adapters/yahoo.js';
-import { createGmailAdapter, resolveGmailTransportFromEnv } from './adapters/gmail.js';
+import { createGmailAdapter, resolveGmailTransportFromEnv, resolveRakutenMaskSmtpFromEnv } from './adapters/gmail.js';
 import { sendGChatMessage } from '../../profit-analysis/gchat-client.js';
 import { pingJobThrottled } from '../../jobs-monitor/ping-local.js';
 
@@ -204,7 +204,9 @@ export function buildSendAdapters() {
   const gmailT = resolveGmailTransportFromEnv();
   if (gmailT) {
     adapters.email = createGmailAdapter({ ...gmailT,
-      sendMode: process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun' });
+      sendMode: process.env.INQUIRY_HUB_MAIL_SEND_MODE === 'live' ? 'live' : 'dryrun',
+      // 楽天マスクアドレス (…@fw.rakuten.ne.jp) 宛だけ楽天公式SMTPで送る (2026-08-24 バウンス対策)
+      rakutenSmtp: resolveRakutenMaskSmtpFromEnv() });
   }
   const rkT = resolveRakutenTransportFromEnv();
   if (rkT) {
