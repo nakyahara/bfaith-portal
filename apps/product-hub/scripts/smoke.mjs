@@ -2838,6 +2838,76 @@ let wfSetParentId = null;
   db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
 
+  // ─── 工程ボードをデフォルトに (2026-08-24 中原さん要望) ───
+  const rawGet = async (p) => {
+    const res = await fetch(base + p, { redirect: 'manual' });
+    return { status: res.status, location: res.headers.get('location') || '' };
+  };
+  let rg = await rawGet('/');
+  check('ルート: / は工程ボードへリダイレクト',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/board'), JSON.stringify(rg));
+  rg = await rawGet('/?status=review');
+  check('ルート: 旧 ?status= 付きブックマークは一覧へ引き継ぐ',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/list?status=review'), JSON.stringify(rg));
+  rg = await rawGet('/?status=bogus');
+  check('ルート: 不正な status は素の一覧へ',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/list'), JSON.stringify(rg));
+  const listRes = await fetch(base + '/list');
+  check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
+
+  // ─── 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望) ───
+  // 不変条件: own_brand=1 ⟺ image_priority='自社商品（重要度：高）'
+  const idOb = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-OWNBRAND', '連動テスト', 'smoke')
+  `).run().lastInsertRowid);
+  const obRow = () => db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(idOb);
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '自社商品（重要度：高）' });
+  check('連動: 重要度「自社商品」を選ぶと own_brand=1',
+    r.status === 200 && r.json.own_brand === 1 && obRow().own_brand === 1, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '仕入商品（重要度：高）' });
+  check('連動: 他の重要度を選ぶと own_brand=0',
+    r.json.own_brand === 0 && obRow().own_brand === 0 && obRow().image_priority === '仕入商品（重要度：高）');
+  await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '自社商品（重要度：高）' });
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '' });
+  check('連動: 重要度を未設定に戻すと own_brand=0 (不整合を正式な操作で作らせない — Codex R1)',
+    r.json.own_brand === 0 && obRow().own_brand === 0 && obRow().image_priority == null);
+  // 専用エンドポイント (チェックボックスの即保存。Notion同期・ゲート再判定なし — Codex R1)
+  r = await call('POST', `/api/drafts/${idOb}/own-brand`, { value: true });
+  check('連動: チェックON → 重要度が「自社商品（重要度：高）」になる',
+    r.json.own_brand === 1 && r.json.image_priority === '自社商品（重要度：高）'
+    && obRow().own_brand === 1 && obRow().image_priority === '自社商品（重要度：高）', JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idOb}/own-brand`, { value: false });
+  check('連動: チェックOFF (重要度が自社商品) → 重要度は未設定に戻す',
+    r.json.own_brand === 0 && obRow().own_brand === 0 && obRow().image_priority == null);
+  await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '取扱先限定商品（重要度：高）' });
+  r = await call('POST', `/api/drafts/${idOb}/own-brand`, { value: false });
+  check('連動: チェックOFFでも自社商品以外の重要度は残す',
+    obRow().own_brand === 0 && obRow().image_priority === '取扱先限定商品（重要度：高）');
+  // 基本情報の保存経路でも同じ不変条件が強制される
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: true });
+  check('連動: 基本情報保存のチェックONでも重要度が自社商品になる',
+    r.json.image_priority === '自社商品（重要度：高）' && obRow().image_priority === '自社商品（重要度：高）' && obRow().own_brand === 1,
+    JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idOb}`, { name: '連動テスト2' });
+  check('連動: own_brand を送らない保存は状態を変えない',
+    obRow().own_brand === 1 && obRow().image_priority === '自社商品（重要度：高）');
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idOb);
+
+  // 起動時バックフィル (連動導入前の既存データの整合化。重要度が設定済みなら重要度が正)
+  const idBf = (ob, pr) => Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, own_brand, image_priority, created_by)
+    VALUES ('DRV-BF-' || abs(random() % 100000), '整合化', ?, ?, 'smoke')
+  `).run(ob, pr).lastInsertRowid);
+  const bf1 = idBf(0, '自社商品（重要度：高）');   // 重要度=自社 → own_brand=1 へ
+  const bf2 = idBf(1, '仕入商品（重要度：高）');   // 重要度=他社 → own_brand=0 へ
+  const bf3 = idBf(1, null);                        // own_brand=1 のみ → 重要度を自社へ
+  dbmod.syncOwnBrandImagePriority(db);
+  const bfRow = (id) => db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(id);
+  check('整合化: 重要度=自社なのに own_brand=0 → 1 に直す', bfRow(bf1).own_brand === 1);
+  check('整合化: 重要度=他社なのに own_brand=1 → 0 に直す', bfRow(bf2).own_brand === 0);
+  check('整合化: own_brand=1 で重要度未設定 → 自社商品を入れる', bfRow(bf3).image_priority === '自社商品（重要度：高）');
+  for (const id of [bf1, bf2, bf3]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+
   server.close();
 }
 

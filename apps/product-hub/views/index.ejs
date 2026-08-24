@@ -9,11 +9,11 @@
   <% } %>
 
   <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
-    <a class="btn <%= !statusFilter ? 'btn-primary' : '' %>" href="/apps/product-hub">
+    <a class="btn <%= !statusFilter ? 'btn-primary' : '' %>" href="/apps/product-hub/list">
       すべて (<%= Object.values(counts).reduce((a, b) => a + b, 0) %>)
     </a>
     <% for (const s of statuses) { %>
-      <a class="btn <%= statusFilter === s ? 'btn-primary' : '' %>" href="/apps/product-hub?status=<%= s %>">
+      <a class="btn <%= statusFilter === s ? 'btn-primary' : '' %>" href="/apps/product-hub/list?status=<%= s %>">
         <%= statusLabels[s] %> (<%= counts[s] %>)
       </a>
     <% } %>
