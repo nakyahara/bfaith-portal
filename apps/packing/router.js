@@ -629,8 +629,10 @@ router.post('/api/batches/:id(\\d+)/material', checkOrigin, api(async (req, res)
     throw new PackError(400, 'bad_contract', 'expected_rule_id / expected_version が不正です');
   }
   if (!posInt(b.slip_seq)) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
-  const opId = String(b.op_id || '');
-  if (!opId || opId.length > 80) throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  if (typeof b.op_id !== 'string' || b.op_id.length < 1 || b.op_id.length > 80) {
+    throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  }
+  const opId = b.op_id;
   if (!b.material_code || typeof b.material_code !== 'string' || b.material_code.length > 40) {
     throw new PackError(400, 'bad_material', 'material_code が不正です');
   }
@@ -667,8 +669,11 @@ router.post('/api/batches/:id(\\d+)/material/undo', checkOrigin, api(async (req,
   if (!Number.isInteger(req.body.event_id) || req.body.event_id < 1) {
     throw new PackError(400, 'bad_event', 'event_id が不正です');
   }
+  if (typeof req.body.op_id !== 'string' || req.body.op_id.length < 1 || req.body.op_id.length > 80) {
+    throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  }
   const result = undoMaterial({
-    opId: String(req.body.op_id || '').slice(0, 80),
+    opId: req.body.op_id,
     eventId: req.body.event_id,
     undoToken: String(req.body.undo_token || ''),
     worker,
@@ -744,7 +749,9 @@ const IMAGE_MAX_DIM = 4000;
 function sniffImage(buf) {
   if (!buf || buf.length < 32) return null;
   const ok = (w, h, kind) => (w > 0 && h > 0 && w <= IMAGE_MAX_DIM && h <= IMAGE_MAX_DIM ? kind : null);
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  if (buf.slice(0, 8).equals(PNG_SIG)) {
+    if (buf.slice(12, 16).toString('ascii') !== 'IHDR') return null;
     return ok(buf.readUInt32BE(16), buf.readUInt32BE(20), 'png');
   }
   if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {

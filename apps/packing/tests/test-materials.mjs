@@ -605,6 +605,29 @@ t('undo: バッチ不一致の URL からは取り消せない', () => {
     opId: 'opu-xb', eventId: r.eventId, undoToken: r.undoToken, worker: 'テスト', batchId: b.id + 999,
   }), 'event_not_found');
 });
+t('undo: 別バッチ URL では同一 op_id のリプレイも迂回できない (hash に batchId)', () => {
+  const b = makeBatch(CLS);
+  addLine(b.id, 1, 'sku-xb2', 1);
+  const c = judge(b.id, 1, CLS);
+  const r = registerMaterial({
+    batchId: b.id, slipSeq: 1, materialCode: 'vinyl_s',
+    expectedRuleId: null, expectedVersion: null, expectedDeliveryCode: c.deliveryCode,
+    opId: 'op-xb2', worker: 'テスト',
+  });
+  const u = undoMaterial({ opId: 'opu-xb2', eventId: r.eventId, undoToken: r.undoToken, worker: 'テスト', batchId: b.id });
+  assert.equal(u.undone, true);
+  // 同じ op_id を別バッチの URL で再送 → hash 不一致で op_conflict (成功応答を再現しない)
+  throwsCode(() => undoMaterial({
+    opId: 'opu-xb2', eventId: r.eventId, undoToken: r.undoToken, worker: 'テスト', batchId: b.id + 999,
+  }), 'op_conflict');
+});
+t('seed: 管理APIと同基準の検証 (分類名の長さ・候補件数)', () => {
+  assert.throws(() => seedMaterialsData({ classes: [{ class_value: 'x'.repeat(121) }] }, 'test'), /分類名/);
+  assert.throws(() => seedMaterialsData({
+    class_materials: [{ class_value: 'ネコポス手動単品', codes: Array.from({ length: 51 }, (_, i) => `c${i}`) }],
+  }, 'test'), /50件/);
+  assert.throws(() => seedMaterialsData({ header_map: [{ header_value: '', base_delivery_code: 'nekopos' }] }, 'test'), /header/);
+});
 t('完了スナップショット: view 行が無くても完了時に生成される', () => {
   const b = makeBatch(CLS);
   addLine(b.id, 1, 'sku-noview', 1);

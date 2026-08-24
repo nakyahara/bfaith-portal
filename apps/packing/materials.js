@@ -475,7 +475,7 @@ function PackErrorWithBody(status, code, message, body) {
 export function undoMaterial({ opId, eventId, undoToken, worker, batchId = null }) {
   const db = getDB();
   if (!opId) throw new PackError(400, 'bad_op_id', 'op_id が不正です');
-  const reqHash = requestHashOf({ kind: 'undo', eventId, worker });
+  const reqHash = requestHashOf({ kind: 'undo', eventId, worker, batchId });
   const now = utcNow();
   const tx = db.transaction(() => {
     const replay = opReplayOrConflict(db, opId, reqHash);
@@ -748,7 +748,7 @@ export function seedMaterialsData(seed, actor = 'seed') {
     }
     for (const c of seed.classes || []) {
       const cv = normalizeKeyText(c.class_value);
-      if (!cv) continue;
+      if (!cv || cv.length > 120) throw new Error(`seed: 分類名が不正 (${String(c.class_value).slice(0, 40)})`);
       db.prepare(`
         INSERT INTO pk_pack_classes (class_value, aes_kind, hide_card, sort_order, updated_at, updated_by)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -758,7 +758,8 @@ export function seedMaterialsData(seed, actor = 'seed') {
     }
     for (const cm of seed.class_materials || []) {
       const cv = normalizeKeyText(cm.class_value);
-      if (!cv) continue;
+      if (!cv) throw new Error('seed: class_materials の分類名が空');
+      if ((cm.codes || []).length > 50) throw new Error(`seed: 候補は50件まで (${cv})`);
       db.prepare('DELETE FROM pk_pack_class_materials WHERE class_value = ?').run(cv);
       (cm.codes || []).forEach((code, i) => {
         db.prepare(`
@@ -769,7 +770,7 @@ export function seedMaterialsData(seed, actor = 'seed') {
     }
     for (const h of seed.header_map || []) {
       const hv = normalizeKeyText(h.header_value);
-      if (!hv) continue;
+      if (!hv || hv.length > 120) throw new Error(`seed: header 値が不正 (${String(h.header_value).slice(0, 40)})`);
       db.prepare(`
         INSERT INTO pk_pack_header_map (header_value, base_delivery_code, material_code, updated_at, updated_by)
         VALUES (?, ?, ?, ?, ?)
