@@ -422,14 +422,12 @@ router.post('/api/drafts/:id', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
   }
   const ownBrandValue = req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : draft.own_brand;
-  // 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望)。
-  // このリクエストでチェックが**変わった**ときだけ動かす (毎回連動させると、自社商品のまま
-  // 重要度を手で変えた値が基本情報の保存のたびに巻き戻る)
+  // 自社商品チェック ⇄ 画像の重要度の連動 (2026-08-24 中原さん要望)。不変条件
+  // **own_brand=1 ⟺ 重要度=自社商品（重要度：高）** を保存のたびに強制する:
+  // ON → 重要度を自社商品へ / OFF → 自社商品の重要度なら未設定へ (他の重要度はそのまま)
   let imagePriorityValue = draft.image_priority;
-  if (ownBrandValue !== draft.own_brand) {
-    if (ownBrandValue === 1) imagePriorityValue = OWN_BRAND_IMAGE_PRIORITY;
-    else if (draft.image_priority === OWN_BRAND_IMAGE_PRIORITY) imagePriorityValue = null; // 外したら未設定に戻す (人が選び直す)
-  }
+  if (ownBrandValue === 1) imagePriorityValue = OWN_BRAND_IMAGE_PRIORITY;
+  else if (imagePriorityValue === OWN_BRAND_IMAGE_PRIORITY) imagePriorityValue = null;
   db.prepare(`
     UPDATE product_drafts SET
       name = ?, official_url = ?, price = ?, jan_code = ?, has_variation = ?,
@@ -1822,9 +1820,10 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
   }
   const value = raw === '' ? null : raw;
   const db = getDB();
-  // 自社商品チェックとの連動 (2026-08-24 中原さん要望): 重要度「自社商品」を選んだらチェックON、
-  // 他の重要度を選んだらOFF。未設定 (空) はどちらとも言えないので own_brand は触らない
-  const ownBrand = value == null ? draft.own_brand : (value === OWN_BRAND_IMAGE_PRIORITY ? 1 : 0);
+  // 自社商品チェックとの連動 (2026-08-24 中原さん要望)。不変条件は
+  // **own_brand=1 ⟺ 重要度=自社商品（重要度：高）** — 未設定も「自社商品でない」に倒す
+  // (未設定で own_brand を残すと不整合が正式な操作で作れてしまう — Codex R1 high)
+  const ownBrand = value === OWN_BRAND_IMAGE_PRIORITY ? 1 : 0;
   db.transaction(() => {
     if ((draft.image_priority || null) !== value) {
       db.prepare(`
@@ -1840,6 +1839,33 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
     }
   })();
   res.json({ ok: true, own_brand: ownBrand });
+});
+
+// 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:
+// チェック操作のたびに Notion カード同期 (外部通信) やゲート再判定まで走らせない (Codex R1 medium)。
+// 不変条件 own_brand=1 ⟺ 重要度=自社商品（重要度：高） は image-priority 側と同じ規則で保つ
+router.post('/api/drafts/:id/own-brand', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const value = req.body?.value ? 1 : 0;
+  const db = getDB();
+  const imagePriority = value === 1 ? OWN_BRAND_IMAGE_PRIORITY
+    : (draft.image_priority === OWN_BRAND_IMAGE_PRIORITY ? null : draft.image_priority);
+  db.transaction(() => {
+    if (value !== draft.own_brand) {
+      db.prepare(`
+        UPDATE product_drafts SET own_brand = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+      `).run(value, draft.id);
+      logEvent(db, draft.id, 'updated', `own_brand ${draft.own_brand} -> ${value}`, actorOf(req));
+    }
+    if ((imagePriority || null) !== (draft.image_priority || null)) {
+      db.prepare(`
+        UPDATE product_drafts SET image_priority = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+      `).run(imagePriority, draft.id);
+      logEvent(db, draft.id, 'image_priority_changed', `${draft.image_priority || '未設定'} -> ${imagePriority || '未設定'} (自社商品チェック連動)`, actorOf(req));
+    }
+  })();
+  res.json({ ok: true, own_brand: value, image_priority: imagePriority });
 });
 
 // セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。

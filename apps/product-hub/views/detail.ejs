@@ -1608,20 +1608,32 @@
       setTimeout(() => { note.textContent = ''; }, 2000);
     });
     // 自社商品チェック: 変更で即保存し、重要度「自社商品（重要度：高）」と連動する
-    // (サーバー側が正: ON→重要度を自社商品へ / OFF→自社商品の重要度なら未設定へ)
+    // (サーバー側が正: ON→重要度を自社商品へ / OFF→自社商品の重要度なら未設定へ)。
+    // 保存は単一チェーンで直列化し、失敗時は表示が失敗した値のままのときだけ戻す (SKU売価と同じ方針)
     if (ownBrandChk) {
-      ownBrandChk.addEventListener('change', async () => {
-        const json = await post(BASE, { own_brand: ownBrandChk.checked });
+      let obChain = Promise.resolve();
+      async function saveOwnBrand(value) {
+        let json;
+        try {
+          json = await post(BASE + '/own-brand', { value });
+        } catch (e) {
+          json = { ok: false, error: '通信エラーで自社商品を保存できませんでした' };
+        }
         if (!json.ok) {
           alert(json.error || '自社商品の保存に失敗しました');
-          ownBrandChk.checked = !ownBrandChk.checked;
+          if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
         }
-        if (json.image_priority !== undefined) {
+        // 後から操作されていなければ、重要度の表示をサーバー確定値に合わせる
+        if (ownBrandChk.checked === value && json.image_priority !== undefined) {
           imgPrioritySel.value = json.image_priority || '';
           applyPriorityColors();
         }
-        result.textContent = ownBrandChk.checked ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
+        result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
+      }
+      ownBrandChk.addEventListener('change', () => {
+        const value = ownBrandChk.checked;
+        obChain = obChain.then(() => saveOwnBrand(value));
       });
     }
   }

@@ -937,10 +937,29 @@ export function initProductHubDB() {
       );
     }
     migrateImageKindSplit(db);
+    syncOwnBrandImagePriority(db);
   })();
 
   initialized = true;
   return db;
+}
+
+/**
+ * own_brand ⇄ 画像の重要度「自社商品（重要度：高）」の整合 (2026-08-24 連動導入、冪等)。
+ * 不変条件: **own_brand=1 と image_priority=自社商品 は常に同値**。
+ * 連動導入前の既存データの整合化 + 万一の不整合の自己修復として毎起動で走らせる (Codex R1 medium)。
+ *   - 重要度が設定済み → 重要度を正として own_brand を合わせる (重要度の方が後から入った情報)
+ *   - 重要度が未設定で own_brand=1 → 自社の重要度は1種類しかないので「自社商品（重要度：高）」を入れる
+ */
+export function syncOwnBrandImagePriority(db) {
+  db.prepare(`
+    UPDATE product_drafts SET own_brand = CASE WHEN image_priority = ? THEN 1 ELSE 0 END
+    WHERE image_priority IS NOT NULL
+      AND own_brand != CASE WHEN image_priority = ? THEN 1 ELSE 0 END
+  `).run(OWN_BRAND_IMAGE_PRIORITY, OWN_BRAND_IMAGE_PRIORITY);
+  db.prepare(`
+    UPDATE product_drafts SET image_priority = ? WHERE image_priority IS NULL AND own_brand = 1
+  `).run(OWN_BRAND_IMAGE_PRIORITY);
 }
 
 /**
