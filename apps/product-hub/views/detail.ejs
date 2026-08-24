@@ -518,6 +518,19 @@
         <label>公式ページURL <span class="muted">(AI生成の参照元。無ければ参考URL / Amazon URL でも可)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="url" id="f-official-url" value="<%= draft.official_url || '' %>" placeholder="https://...">
       </div>
+      <div class="field">
+        <%# TOP画像の重要度 (どれぐらい力を入れて作るかの目安 — 2026-08-24 中原さん)。選ぶと即保存 %>
+        <label>画像の重要度 <span class="muted">(TOP画像をどれぐらい力を入れて作るかの目安。選ぶと即保存)</span><span class="ftag ftag-m">手入力</span></label>
+        <% const ipr = imagePriorities.find((p) => p.value === draft.image_priority) || null; %>
+        <select id="f-image-priority"
+                style="width:auto; min-width:280px; border-radius:6px; <%= ipr ? `background:${ipr.bg}; color:${ipr.fg}; font-weight:600;` : '' %>">
+          <option value="">未設定</option>
+          <% for (const p of imagePriorities) { %>
+            <option value="<%= p.value %>" <%= draft.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
+          <% } %>
+        </select>
+        <span class="muted" id="image-priority-note" style="font-size:11px; margin-left:6px;"></span>
+      </div>
       <div class="field" style="display:flex; gap:12px;">
         <div style="flex:1">
           <label class="req">売価 (税込・円)<span class="ftag ftag-m">手入力</span></label>
@@ -1529,6 +1542,24 @@
       const json = await post(BASE + '/notion-retry');
       showAndReload(json, 'Notionカードを作成しました');
       if (!json.ok) notionRetryBtn.disabled = false;
+    });
+  }
+
+  // 画像の重要度: 選択で即保存 (基本情報の保存ボタンとは独立。ボードのセレクトと同じ API)
+  const imgPrioritySel = document.getElementById('f-image-priority');
+  if (imgPrioritySel) {
+    const IMG_PRIORITIES = <%- JSON.stringify(imagePriorities) %>;
+    imgPrioritySel.addEventListener('change', async () => {
+      const note = document.getElementById('image-priority-note');
+      note.textContent = '保存中…';
+      const json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
+      if (!json.ok) { note.textContent = ''; alert(json.error || '保存に失敗しました'); return; }
+      note.textContent = '保存しました';
+      const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
+      imgPrioritySel.style.background = p ? p.bg : '';
+      imgPrioritySel.style.color = p ? p.fg : '';
+      imgPrioritySel.style.fontWeight = p ? '600' : '';
+      setTimeout(() => { note.textContent = ''; }, 2000);
     });
   }
 

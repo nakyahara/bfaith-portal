@@ -18,6 +18,7 @@ import {
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
+  IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES,
 } from './db.js';
 import {
   listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
@@ -28,6 +29,7 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
+  moveBoardCard,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -286,6 +288,7 @@ router.get('/detail/:id', (req, res) => {
     // セット商品: 親なら作ったセットの一覧、セットなら親と構成
     setDrafts: setDraftsOf(db, draft.id),
     setInfo: setInfoOf(db, draft.id),
+    imagePriorities: IMAGE_PRIORITIES,
   });
 });
 
@@ -1590,6 +1593,7 @@ router.get('/board', (req, res) => {
     thumbnailUrl,
     stepStateLabels: STEP_STATE_LABELS,
     imageKindLabels: IMAGE_KIND_LABELS,
+    imagePriorities: IMAGE_PRIORITIES,
   });
 });
 
@@ -1698,6 +1702,44 @@ router.post('/api/drafts/:id/detail-images-excluded', (req, res) => {
     });
     res.json({ ok: true, changed: r.changed });
   } catch (e) { workflowError(res, e); }
+});
+
+// かんばんカードの D&D 移動 (2026-08-24 中原さん要望)。ロジックと権限は moveBoardCard 側
+router.post('/api/drafts/:id/board-move', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  try {
+    const me = staffByPortalEmail(req.session?.email);
+    const r = moveBoardCard(draft.id, {
+      view: req.body?.view === 'image' ? 'image' : 'main',
+      kind: req.body?.kind === 'detail' ? 'detail' : 'top',
+      to: String(req.body?.to || ''),
+      expectedCurrent: req.body?.expected_current ? String(req.body.expected_current) : null,
+    }, actorOf(req), {
+      isAdmin: req.session?.role === 'admin',
+      actorStaffId: me?.id ?? null,
+    });
+    res.json({ ok: true, changed: r.changed });
+  } catch (e) { workflowError(res, e); }
+});
+
+// TOP画像の重要度 (どれぐらい力を入れて作るかの目安)。現場の目安情報なので誰でも変更可・履歴は残す
+router.post('/api/drafts/:id/image-priority', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const raw = String(req.body?.value ?? '').trim();
+  if (raw !== '' && !IMAGE_PRIORITY_VALUES.has(raw)) {
+    return res.status(400).json({ ok: false, error: '重要度の値が不正です' });
+  }
+  const value = raw === '' ? null : raw;
+  const db = getDB();
+  if ((draft.image_priority || null) !== value) {
+    db.prepare(`
+      UPDATE product_drafts SET image_priority = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+    `).run(value, draft.id);
+    logEvent(db, draft.id, 'image_priority_changed', `${draft.image_priority || '未設定'} -> ${value || '未設定'}`, actorOf(req));
+  }
+  res.json({ ok: true });
 });
 
 // セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。

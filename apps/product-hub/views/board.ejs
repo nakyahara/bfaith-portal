@@ -13,6 +13,14 @@
              padding: 8px; text-decoration: none; color: #1f2430; }
   .kb-card:hover { border-color: #93c5fd; box-shadow: 0 1px 4px rgba(15,23,42,.08); }
   .kb-card.stalled { border-color: #fca5a5; background: #fff7f7; }
+  /* D&D: カード = 掴んで列間を移動できる。リンク部分は中身だけ */
+  .kb-card[draggable="true"] { cursor: grab; }
+  .kb-card.dragging { opacity: .45; }
+  .kb-card-link { display: block; text-decoration: none; color: inherit; }
+  .kb-col.drop-ok { outline: 2px dashed #2563eb; outline-offset: -2px; background: #eff6ff; }
+  /* TOP画像の重要度 (どれぐらい力を入れて作るか)。Notion のタグ風に色を付ける */
+  .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
+                 border: 1px solid #e2e8f0; padding: 3px 4px; background: #f8fafc; color: #475569; }
   .kb-card-top { display: flex; gap: 7px; }
   .kb-thumb { width: 36px; height: 36px; object-fit: cover; border-radius: 5px; border: 1px solid #e2e8f0;
               background: #f8fafc; flex: 0 0 auto; }
@@ -118,7 +126,7 @@
 
   <div class="kb">
     <% for (const col of board.columns) { %>
-      <div class="kb-col <%= col.role_code ? '' : 'system' %>">
+      <div class="kb-col <%= col.role_code ? '' : 'system' %>" data-col="<%= col.code || col.key %>">
         <div class="kb-col-head">
           <span class="kb-col-title"><%= col.label %></span>
           <span class="kb-col-count"><%= col.cards.length %></span>
@@ -132,7 +140,11 @@
           <% } %>
           <% for (const c of col.cards) { %>
             <% const stalled = boardView === 'image' ? c.kindStalledDays : c.stalledDays; %>
-            <a class="kb-card <%= stalled ? 'stalled' : '' %>" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
+            <% const currentCode = boardView === 'image' ? (c.kindCurrent && c.kindCurrent.step_code) : (c.current && c.current.step_code); %>
+            <div class="kb-card <%= stalled ? 'stalled' : '' %>" draggable="true"
+                 data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>"
+                 data-current="<%= currentCode || '' %>">
+            <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -203,13 +215,26 @@
                 <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
               <% } %>
             </a>
+            <% if (boardView === 'image' && c.kind === 'top') { %>
+              <%# TOP画像をどれぐらい力を入れて作るかの目安 (リンクの外 = クリックで詳細に飛ばない) %>
+              <% const pr = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
+              <select class="kb-priority" data-draft="<%= c.id %>"
+                      style="<%= pr ? `background:${pr.bg}; color:${pr.fg}; border-color:${pr.fg}33; font-weight:600;` : '' %>">
+                <option value="">重要度: 未設定</option>
+                <% for (const p of imagePriorities) { %>
+                  <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
+                <% } %>
+              </select>
+            <% } %>
+            </div>
           <% } %>
         </div>
       </div>
     <% } %>
 
-    <!-- 終端列: 完了 (画像ビューでは「TOP済み・詳細も済みか対象外」の商品) -->
-    <div class="kb-col" style="background:#f0fdf4;">
+    <!-- 終端列: 完了 (画像ビューでは「TOP済み・詳細も済みか対象外」の商品)。
+         D&D で落とすと残りの工程をまとめて完了にする (本流は listing のモール決着チェックで止まる) -->
+    <div class="kb-col" style="background:#f0fdf4;" data-col="done">
       <div class="kb-col-head">
         <span class="kb-col-title">✅ 完了</span>
         <span class="kb-col-count"><%= board.doneTotal %></span>
@@ -254,4 +279,101 @@
       location.href = '/apps/product-hub/board' + (s ? '?' + s : '');
     });
   }
+
+  // ─── カードの D&D 移動: 落とした列がその商品の「いまやる工程」になる ───
+  const BOARD_VIEW = <%- JSON.stringify(boardView) %>;
+  let dragCard = null;
+
+  document.querySelectorAll('.kb-card[draggable="true"]').forEach(function (card) {
+    card.addEventListener('dragstart', function (e) {
+      dragCard = card;
+      card.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      try { e.dataTransfer.setData('text/plain', card.dataset.draft); } catch (_) {}
+    });
+    card.addEventListener('dragend', function () {
+      card.classList.remove('dragging');
+      document.querySelectorAll('.kb-col.drop-ok').forEach((c) => c.classList.remove('drop-ok'));
+      dragCard = null;
+    });
+    // ドラッグ中にリンクへ飛ばない (dragend 後の click は発火しないのが普通だが保険)
+    card.querySelector('.kb-card-link')?.addEventListener('click', function (e) {
+      if (card.classList.contains('dragging')) e.preventDefault();
+    });
+  });
+
+  document.querySelectorAll('.kb-col[data-col]').forEach(function (col) {
+    col.addEventListener('dragover', function (e) {
+      if (!dragCard) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      col.classList.add('drop-ok');
+    });
+    col.addEventListener('dragleave', function (e) {
+      // 子要素間の移動でチラつかないよう、列の外に出たときだけ消す
+      if (!col.contains(e.relatedTarget)) col.classList.remove('drop-ok');
+    });
+    col.addEventListener('drop', async function (e) {
+      e.preventDefault();
+      col.classList.remove('drop-ok');
+      if (!dragCard) return;
+      const card = dragCard;
+      const to = col.dataset.col;
+      // 同じ列へのドロップは何もしない
+      if (card.closest('.kb-col') === col) return;
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + card.dataset.draft + '/board-move', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            view: BOARD_VIEW,
+            kind: card.dataset.kind || 'top',
+            to: to,
+            expected_current: card.dataset.current || null,
+          }),
+        });
+        const j = await res.json();
+        if (!j.ok) {
+          alert(j.error || '移動できませんでした');
+        }
+      } catch (err) {
+        alert('通信エラー: ' + err.message);
+      }
+      // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)
+      location.reload();
+    });
+  });
+
+  // ─── TOP画像の重要度セレクト (その場で保存) ───
+  document.querySelectorAll('.kb-priority').forEach(function (s) {
+    // select の操作でカードのドラッグが始まらないようにする
+    s.addEventListener('mousedown', function () {
+      const card = s.closest('.kb-card');
+      if (card) card.setAttribute('draggable', 'false');
+    });
+    ['mouseup', 'mouseleave', 'blur'].forEach(function (ev) {
+      s.addEventListener(ev, function () {
+        const card = s.closest('.kb-card');
+        if (card) card.setAttribute('draggable', 'true');
+      });
+    });
+    s.addEventListener('change', async function () {
+      try {
+        const res = await fetch('/apps/product-hub/api/drafts/' + s.dataset.draft + '/image-priority', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: s.value }),
+        });
+        const j = await res.json();
+        if (!j.ok) { alert(j.error || '保存に失敗しました'); location.reload(); return; }
+        // 色を選択肢に追従させる (再読込なしで見た目だけ更新)
+        const PR = <%- JSON.stringify(imagePriorities) %>;
+        const p = PR.find((x) => x.value === s.value);
+        s.style.background = p ? p.bg : '';
+        s.style.color = p ? p.fg : '';
+        s.style.fontWeight = p ? '600' : '';
+      } catch (err) {
+        alert('通信エラー: ' + err.message);
+        location.reload();
+      }
+    });
+  });
 </script>

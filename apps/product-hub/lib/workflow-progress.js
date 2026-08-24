@@ -777,6 +777,70 @@ export function setStepState(
 }
 
 /**
+ * かんばんカードの D&D 移動 (2026-08-24 中原さん要望)。
+ * 「落とした列がその商品のいまやる工程になる」ように工程をまとめて更新する:
+ *   - 前方 (右) へ: 現在工程から移動先の手前までを順に done に (移動先は todo のまま = いまやる番)
+ *   - 後方 (左) へ: 移動先の工程を todo に開け直す (間の done は触らない = currentOf が移動先を指す)
+ *   - to='done' (完了列): 残りの工程を全部 done に。本流は listing の全モール決着チェックが効くので
+ *     モール未決着なら失敗する (出品・展開はモール別ステータスが正、のルールを D&D でも維持)
+ * 権限・ゲート (基本情報の材料チェック/システム工程は admin のみ/listing はモール正) は
+ * setStepState を1工程ずつ通すことでそのまま効く。途中で弾かれたら全体をロールバック。
+ * expectedCurrent = カードを掴んだ時点の現在工程 (ボード表示の CAS。ズレていたら 409)
+ */
+export function moveBoardCard(
+  draftId, { view = 'main', kind = 'top', to = '', expectedCurrent = null } = {},
+  actor, { isAdmin = false, actorStaffId = null } = {},
+) {
+  const db = getDB();
+  const id = Number(draftId);
+  const run = db.transaction(() => {
+    ensureProgress(db, id);
+    const rows = view === 'image'
+      ? db.prepare(`
+          SELECT p.step_code, p.state, s.image_stage FROM draft_step_progress p
+          JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+          WHERE p.draft_id = ? AND s.track = 'image'
+            AND ${kind === 'detail' ? "s.image_kind = 'detail'" : "(s.image_kind IS NULL OR s.image_kind != 'detail')"}
+          ORDER BY s.sort, s.code
+        `).all(id)
+      : db.prepare(`
+          SELECT p.step_code, p.state, NULL AS image_stage FROM draft_step_progress p
+          JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+          WHERE p.draft_id = ? AND s.track = 'main'
+          ORDER BY s.sort, s.code
+        `).all(id);
+    if (rows.length === 0) throw badRequest('工程が見つかりません');
+    const curIdx = rows.findIndex((r) => r.state !== 'done' && r.state !== 'skip');
+    const currentCode = curIdx === -1 ? null : rows[curIdx].step_code;
+    if ((expectedCurrent || null) !== currentCode) {
+      throw conflict('ボードの表示が古くなっています。ページを読み直してください');
+    }
+    if (curIdx === -1) throw badRequest('この商品の工程はすべて終わっています');
+
+    let tIdx;
+    if (to === 'done') {
+      tIdx = rows.length;
+    } else {
+      // 列キー: 本流 = 工程 code / 画像ビュー = image_stage (段階)。stage の無いカスタム工程は code:xxx
+      tIdx = rows.findIndex((r) => (view === 'image'
+        ? (r.image_stage ? r.image_stage === to : `code:${r.step_code}` === to)
+        : r.step_code === to));
+      if (tIdx === -1) throw badRequest('移動先の工程が見つかりません');
+    }
+    if (tIdx === curIdx) return { changed: false };
+    if (tIdx > curIdx) {
+      for (let i = curIdx; i < tIdx; i++) {
+        setStepState(id, rows[i].step_code, { state: 'done' }, actor, { isAdmin, actorStaffId });
+      }
+    } else {
+      setStepState(id, rows[tIdx].step_code, { state: 'todo' }, actor, { isAdmin, actorStaffId });
+    }
+    return { changed: true };
+  });
+  return run();
+}
+
+/**
  * かんばん 1 枚分のデータ。列 (工程) ごとにカードを振り分けて返す。
  *
  * ボードは 1 枚で、view で「本流の工程で並べる」「画像の工程で並べる」を切り替える
@@ -838,7 +902,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
 
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
-    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded,
+    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d
@@ -901,7 +965,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       { kind: 'detail', s: p.imageDetail, excluded: detailExcluded },
     ];
     const baseCard = {
-      id: d.id, ne_code: d.ne_code, name: d.name, status: d.status,
+      id: d.id, ne_code: d.ne_code, name: d.name, status: d.status, image_priority: d.image_priority,
       first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
       current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
       image: imageSummaryOf(p, d),
