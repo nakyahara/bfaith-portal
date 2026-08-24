@@ -438,7 +438,7 @@ function stalledDaysOf(rows, idx, createdAt) {
 }
 
 /** 画像種別の表示名。ph_steps.image_kind ('top'/'detail') に対応する */
-export const IMAGE_KIND_LABELS = { top: 'TOP画像', detail: '詳細画像' };
+export const IMAGE_KIND_LABELS = { top: 'TOP画像', detail: '商品詳細画像' };
 
 /**
  * 画像トラックの行を種別ごとに分ける。image_kind が NULL のカスタム工程は
