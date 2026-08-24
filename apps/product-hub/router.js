@@ -27,7 +27,7 @@ import {
 import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
-  ESCAPE_STATUSES, deriveDraftStatus, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
+  ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -714,25 +714,48 @@ router.post('/api/drafts/:id/status', (req, res) => {
     if (draft.status === to) {
       return res.status(400).json({ ok: false, error: `すでに${STATUS_LABELS[to]}です` });
     }
-    db.prepare(`
-      UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = ?
-    `).run(to, draft.id, draft.status);
-    logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${to}`, actorOf(req));
+    // 退避と同時に AI claim も無効化する (Codex R1 High: 退避→再開の間に旧ランナーの
+    // lease が生き残っていると、再開直後に古い生成結果が書き戻される)
+    const run = db.transaction(() => {
+      const info = db.prepare(`
+        UPDATE product_drafts
+        SET status = ?, generation_claim_run_id = NULL, generation_claim_until = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND status = ?
+      `).run(to, draft.id, draft.status);
+      if (info.changes !== 1) return false;   // 別の操作が先行 (CAS 敗北) — イベントは書かない
+      logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${to}`, actorOf(req));
+      return true;
+    });
+    if (!run()) {
+      return res.status(409).json({ ok: false, error: '別の操作が先に行われました。画面を読み直してください' });
+    }
     return res.json({ ok: true, status: to });
   }
 
   // 再開: 退避前の値には戻さず、工程の実態から導出し直す (退避中に工程が動いていても正しい列に着地する)。
-  // 旧UIの互換で to='draft' も再開として受ける
+  // ゲートも再検証する — 退避中は demoteIfGateBroken が効かないため、材料が壊れたまま
+  // AI キューへ入るのをここで止める (Codex R1 High)。旧UIの互換で to='draft' も再開として受ける
   if (to === 'resume' || (isEscaped && to === 'draft')) {
     if (!isEscaped) {
       return res.status(400).json({ ok: false, error: '保留・除外中ではありません' });
     }
-    ensureProgress(db, draft.id);
-    const next = deriveDraftStatus(db, draft.id);
-    db.prepare(`
-      UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = ?
-    `).run(next, draft.id, draft.status);
-    logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${next} (再開・工程から判定)`, actorOf(req));
+    const run = db.transaction(() => {
+      const next = deriveWithGateCheck(db, draft.id, actorOf(req));
+      const info = db.prepare(`
+        UPDATE product_drafts
+        SET status = ?, generation_claim_run_id = NULL, generation_claim_until = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ? AND status = ?
+      `).run(next, draft.id, draft.status);
+      if (info.changes !== 1) return null;
+      logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${next} (再開・工程から判定)`, actorOf(req));
+      return next;
+    });
+    const next = run();
+    if (next == null) {
+      return res.status(409).json({ ok: false, error: '別の操作が先に行われました。画面を読み直してください' });
+    }
     return res.json({ ok: true, status: next });
   }
 

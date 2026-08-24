@@ -2581,6 +2581,91 @@ let wfSetParentId = null;
     `status=${statusOf(idOldListed)}`);
   check('バックフィル: 変更件数が返る', changed >= 1, String(changed));
   check('バックフィル: 2回目は no-op (フラグ済み)', wfp.maybeBackfillDerivedStatus(db) === 0);
+
+  // ─── Codex R1 対応 (退避・再開まわりの穴) ───
+
+  // M1: skip でゲートを迂回できる工程は skip 禁止
+  const idSkip = mkFull('DRV-SKIP');
+  let skipErr = null;
+  try { wfp.setStepState(idSkip, 'basic_info', { state: 'skip' }, 'smoke', ADMIN); } catch (e) { skipErr = e; }
+  check('R1対応: basic_info は skip 不可 (材料チェックの迂回防止)', skipErr?.status === 400, skipErr?.message || '例外が出ていない');
+  let listSkipErr = null;
+  try { wfp.setStepState(idSkip, 'listing', { state: 'skip' }, 'smoke', ADMIN); } catch (e) { listSkipErr = e; }
+  check('R1対応: listing は skip 不可 (モール別の対象外を使う)', listSkipErr?.status === 400, listSkipErr?.message || '例外が出ていない');
+
+  // H2 (lib 単体): 材料が壊れた draft は deriveWithGateCheck が basic_info を差し戻す
+  const idGate = mkFull('DRV-GATE2');
+  wfp.setStepState(idGate, 'basic_info', { state: 'done' }, 'smoke', ADMIN);
+  db.prepare(`DELETE FROM draft_images WHERE draft_id = ?`).run(idGate);
+  db.prepare(`UPDATE product_drafts SET official_url = NULL WHERE id = ?`).run(idGate);
+  check('R1対応: deriveWithGateCheck は材料が無ければ draft へ差し戻す',
+    wfp.deriveWithGateCheck(db, idGate, 'smoke') === 'draft'
+    && db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'basic_info'`).get(idGate).state === 'todo');
+
+  // M2: 退避中で工程未生成の商品は、監査ログの退避前 status から seed される
+  const idHold = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-HOLD', '退避中', 'on_hold', 'smoke')
+  `).run().lastInsertRowid);
+  dbmod.logEvent(db, idHold, 'status_changed', 'approved -> on_hold', 'smoke');
+  wfp.ensureProgress(db, idHold);
+  check('R1対応: 退避中の初回 seed は退避前 status (approved) から推定する',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'title_approve'`).get(idHold).state === 'done'
+    && wfp.deriveDraftStatus(db, idHold) === 'approved');
+}
+
+// ─── 退避・再開の HTTP ルート (PR4: claim 無効化 / ゲート再検証 / CAS) ───
+{
+  const wfp = wfpEarly;
+  const express = (await import('express')).default;
+  const routerMod = await import('../router.js');
+  const app = express();
+  // セッションを偽装して直接マウント (本番は server.js の requireAppAccess を通る)
+  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  app.use('/ph', routerMod.default);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/ph`;
+  const call = async (method, p, body) => {
+    const res = await fetch(base + p, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+
+  const idE = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+    VALUES ('DRV-ESC', '退避テスト', 'https://example.com/item', 'smoke')
+  `).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'drv-esc-img')`).run(idE);
+  wfp.setStepState(idE, 'basic_info', { state: 'done' }, 'smoke', { isAdmin: true });
+  // AI ランナーが claim 中という状況を再現
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runOld', generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(idE);
+
+  let r = await call('POST', `/api/drafts/${idE}/status`, { to: 'on_hold' });
+  const afterHold = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(idE);
+  check('退避: on_hold になり AI claim が無効化される (Codex R1 High)',
+    r.status === 200 && afterHold.status === 'on_hold'
+    && afterHold.generation_claim_run_id == null && afterHold.generation_claim_until == null,
+    JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idE}/status`, { to: 'on_hold' });
+  check('退避: 二重の保留は 400', r.status === 400);
+
+  // 退避中に材料を壊す → 再開でゲート再検証されて draft へ (Codex R1 High)
+  db.prepare(`DELETE FROM draft_images WHERE draft_id = ?`).run(idE);
+  db.prepare(`UPDATE product_drafts SET official_url = NULL WHERE id = ?`).run(idE);
+  r = await call('POST', `/api/drafts/${idE}/status`, { to: 'resume' });
+  check('再開: 材料が壊れていれば ready_for_ai でなく draft に着地する',
+    r.status === 200 && r.json.status === 'draft'
+    && db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(idE).status === 'draft',
+    JSON.stringify(r.json));
+
+  r = await call('POST', `/api/drafts/${idE}/status`, { to: 'resume' });
+  check('再開: 退避中でなければ 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idE}/status`, { to: 'review' });
+  check('手動遷移の廃止: 導出ステータスへの直接遷移は 400', r.status === 400
+    && String(r.json.error || '').includes('自動で決まります'), JSON.stringify(r.json));
+
+  server.close();
 }
 
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───

@@ -100,6 +100,40 @@ export function recomputeDraftStatus(db, draftId, { actor = null } = {}) {
   return { changed: true, status: next };
 }
 
+/** 「基本情報入力」を todo に差し戻す (ゲートの根拠が壊れたとき)。@returns 差し戻したか */
+function resetBasicInfoStep(db, draftId, actor) {
+  const info = db.prepare(`
+    UPDATE draft_step_progress
+    SET state = 'todo', done_at = NULL, done_by = NULL,
+        version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE draft_id = ? AND step_code = 'basic_info' AND state IN ('done', 'skip')
+  `).run(Number(draftId));
+  if (info.changes === 1) {
+    logEvent(db, Number(draftId), 'step_changed', '基本情報入力: 完了 → 未着手 (必須項目が外れたため自動差し戻し)', actor);
+  }
+  return info.changes === 1;
+}
+
+/**
+ * 再開 (resume) 用: ゲートを再検証してから導出する。
+ * 退避中は demoteIfGateBroken が no-op (status が ready_for_ai でない) なので、
+ * 退避中に材料が壊された商品が再開の瞬間に AI キューへ入るのを防ぐ (Codex R1 High)。
+ * 導出結果が ready_for_ai になるのに材料が無ければ「基本情報入力」を差し戻して導出し直す。
+ * 呼び出し側のトランザクション内で使う想定。
+ */
+export function deriveWithGateCheck(db, draftId, actor) {
+  const id = Number(draftId);
+  ensureProgress(db, id);
+  const next = deriveDraftStatus(db, id);
+  if (next !== 'ready_for_ai') return next;
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
+  const reasons = draft ? gateReasons(db, draft) : [];
+  if (reasons.length === 0) return next;
+  resetBasicInfoStep(db, id, actor);
+  logEvent(db, id, 'auto_demoted_to_draft', reasons.join(' / '), actor);
+  return deriveDraftStatus(db, id);
+}
+
 /**
  * ゲート必須項目が後から壊された場合 (最後の画像削除など) の自動差し戻し。
  * PR4 で db.js から移設: status を直接書き換えるのではなく、根拠が壊れた
@@ -114,15 +148,7 @@ export function demoteIfGateBroken(db, draftId, actor) {
   const reasons = gateReasons(db, draft);
   if (reasons.length === 0) return null;
   const run = db.transaction(() => {
-    const info = db.prepare(`
-      UPDATE draft_step_progress
-      SET state = 'todo', done_at = NULL, done_by = NULL,
-          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-      WHERE draft_id = ? AND step_code = 'basic_info' AND state IN ('done', 'skip')
-    `).run(id);
-    if (info.changes === 1) {
-      logEvent(db, id, 'step_changed', '基本情報入力: 完了 → 未着手 (必須項目が外れたため自動差し戻し)', actor);
-    }
+    resetBasicInfoStep(db, id, actor);
     logEvent(db, id, 'auto_demoted_to_draft', reasons.join(' / '), actor);
     recomputeDraftStatus(db, id, { actor });
   });
@@ -284,7 +310,21 @@ export function ensureProgress(db, draftId) {
   let doneSet = new Set();
   if (firstTime) {
     const draft = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id);
-    doneSet = new Set(STATUS_DONE_STEPS[draft?.status] || []);
+    let statusKey = draft?.status;
+    // 退避中 (on_hold/excluded) は STATUS_DONE_STEPS が空 = 全工程 todo で作られ、
+    // 再開時に必ず draft へ巻き戻ってしまう (Codex R1 medium)。
+    // 退避直前の status を監査ログ (status_changed 'X -> on_hold') から復元して推定に使う
+    if (statusKey === 'on_hold' || statusKey === 'excluded') {
+      const evs = db.prepare(`
+        SELECT detail FROM draft_events
+        WHERE draft_id = ? AND event = 'status_changed' ORDER BY id DESC LIMIT 20
+      `).all(id);
+      for (const e of evs) {
+        const m = /^([a-z_]+) -> (on_hold|excluded)/.exec(e.detail || '');
+        if (m && !ESCAPE_STATUSES.includes(m[1]) && STATUS_DONE_STEPS[m[1]]) { statusKey = m[1]; break; }
+      }
+    }
+    doneSet = new Set(STATUS_DONE_STEPS[statusKey] || []);
     // 画像が既に登録されているなら **TOP側**の画像トラックは終わっているとみなす。
     // 登録済みの商品を「画像未依頼」で並べると、外注に二重依頼させかねない。
     // 詳細側は推定しない — 画像が 1 枚あることは詳細画像が揃っている根拠にならず、
@@ -572,6 +612,14 @@ export function setStepState(
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
     throw badRequest('TOP画像の工程は「対象外」にできません (サムネイルは楽天出品に必須です)');
+  }
+  // 導出は skip も「決着」に数えるので、ゲートを迂回できる工程は skip を禁止する (Codex R1 medium):
+  // basic_info の skip = 材料チェックなしで AI キュー入り / listing の skip = 展開せず「展開済み」表示
+  if (patch?.state === 'skip' && code === 'basic_info') {
+    throw badRequest('「基本情報入力」は対象外にできません (全商品で必須の工程です)');
+  }
+  if (patch?.state === 'skip' && code === LISTING_STEP) {
+    throw badRequest('「出品・展開」は対象外にできません (展開しないモールは「モール別の展開状況」で対象外にすると自動で完了になります)');
   }
 
   const sets = [];
