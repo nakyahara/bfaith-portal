@@ -885,7 +885,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     SELECT draft_id, assignee_id, role_code FROM (
       SELECT p.draft_id, p.assignee_id, s.role_code,
              ROW_NUMBER() OVER (
-               PARTITION BY p.draft_id, s.track, COALESCE(s.image_kind, '')
+               ${/* 系列の区分は splitImageRows と同じ「detail 以外は TOP」(Codex R3):
+                    COALESCE(image_kind,'') だと NULL のカスタム画像工程が別系列になり、
+                    JS 側の現在工程判定とズレて候補・total・LIMIT を誤消費する */''}
+               PARTITION BY p.draft_id, s.track,
+                 CASE WHEN s.track = 'image' AND s.image_kind = 'detail' THEN 'detail'
+                      WHEN s.track = 'image' THEN 'top' ELSE '' END
                ORDER BY s.sort, s.code
              ) AS rn
       FROM draft_step_progress p
