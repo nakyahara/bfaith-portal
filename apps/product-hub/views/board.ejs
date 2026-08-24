@@ -242,8 +242,12 @@
       <div class="kb-col-role"><%= board.doneTotal > board.doneCards.length ? `直近 ${board.doneCards.length} 件を表示` : '' %></div>
       <div class="kb-body">
         <% if (board.doneCards.length === 0) { %><div class="kb-empty">—</div><% } %>
+        <%# 完了カードもドラッグで差し戻せる (data-current 空 = 全工程決着の CAS 値)。
+            画像ビューは 商品×種別 なので、どちらを戻すかはカード自体が持っている %>
         <% for (const c of board.doneCards) { %>
-          <a class="kb-card" href="/apps/product-hub/detail/<%= c.id %>">
+          <div class="kb-card" draggable="true"
+               data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current="">
+          <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %>">
             <div class="kb-card-top">
               <% if (c.first_image_id) { %>
                 <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -253,7 +257,21 @@
                 <div class="kb-code"><%= c.ne_code %></div>
               </div>
             </div>
+            <% if (boardView === 'image' && c.kind) { %>
+              <div class="kb-meta"><span class="kb-kind <%= c.kind %>"><%= imageKindLabels[c.kind] %></span></div>
+            <% } %>
           </a>
+          <% if (boardView === 'image' && c.kind === 'top') { %>
+            <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
+            <select class="kb-priority" data-draft="<%= c.id %>"
+                    style="<%= prd ? `background:${prd.bg}; color:${prd.fg}; border-color:${prd.fg}33; font-weight:600;` : '' %>">
+              <option value="">重要度: 未設定</option>
+              <% for (const p of imagePriorities) { %>
+                <option value="<%= p.value %>" <%= c.image_priority === p.value ? 'selected' : '' %>><%= p.value %></option>
+              <% } %>
+            </select>
+          <% } %>
+          </div>
         <% } %>
       </div>
     </div>
@@ -283,10 +301,14 @@
   // ─── カードの D&D 移動: 落とした列がその商品の「いまやる工程」になる ───
   const BOARD_VIEW = <%- JSON.stringify(boardView) %>;
   let dragCard = null;
+  // ドラッグ直後の click でリンクへ飛ばない (Codex R1 medium: dragend の後に click を
+  // 発火するブラウザがある。drop の fetch を中断させないためにも一拍だけ抑止する)
+  let suppressClick = false;
 
   document.querySelectorAll('.kb-card[draggable="true"]').forEach(function (card) {
     card.addEventListener('dragstart', function (e) {
       dragCard = card;
+      suppressClick = true;
       card.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
       try { e.dataTransfer.setData('text/plain', card.dataset.draft); } catch (_) {}
@@ -295,10 +317,10 @@
       card.classList.remove('dragging');
       document.querySelectorAll('.kb-col.drop-ok').forEach((c) => c.classList.remove('drop-ok'));
       dragCard = null;
+      setTimeout(function () { suppressClick = false; }, 300);
     });
-    // ドラッグ中にリンクへ飛ばない (dragend 後の click は発火しないのが普通だが保険)
     card.querySelector('.kb-card-link')?.addEventListener('click', function (e) {
-      if (card.classList.contains('dragging')) e.preventDefault();
+      if (suppressClick) e.preventDefault();
     });
   });
 

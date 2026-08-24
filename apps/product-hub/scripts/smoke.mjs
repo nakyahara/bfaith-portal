@@ -2724,6 +2724,12 @@ let wfSetParentId = null;
   wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'done', expectedCurrent: 'img_register_top' }, 'smoke', ADMIN2);
   check('D&D 画像ビュー完了列: 残り (登録・承認) がまとめて done',
     stepOf(idM3, 'img_register_top') === 'done' && stepOf(idM3, 'img_approve_top') === 'done');
+  // 完了列からの差し戻し (Codex R1 medium): expectedCurrent=null が「全工程決着」の CAS 値
+  wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'approve', expectedCurrent: null }, 'smoke', ADMIN2);
+  check('D&D 完了列から差し戻し: 承認が開き直る', stepOf(idM3, 'img_approve_top') === 'todo');
+  let doneCas = null;
+  try { wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'production', expectedCurrent: null }, 'smoke', ADMIN2); } catch (e) { doneCas = e; }
+  check('D&D 完了カードの CAS: もう完了でなければ 409', doneCas?.status === 409, doneCas?.message || '例外が出ていない');
 
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });

@@ -810,12 +810,14 @@ export function moveBoardCard(
           ORDER BY s.sort, s.code
         `).all(id);
     if (rows.length === 0) throw badRequest('工程が見つかりません');
-    const curIdx = rows.findIndex((r) => r.state !== 'done' && r.state !== 'skip');
-    const currentCode = curIdx === -1 ? null : rows[curIdx].step_code;
+    const rawIdx = rows.findIndex((r) => r.state !== 'done' && r.state !== 'skip');
+    const currentCode = rawIdx === -1 ? null : rows[rawIdx].step_code;
     if ((expectedCurrent || null) !== currentCode) {
       throw conflict('ボードの表示が古くなっています。ページを読み直してください');
     }
-    if (curIdx === -1) throw badRequest('この商品の工程はすべて終わっています');
+    // 全工程決着 = 完了列のカード。expectedCurrent=null がその CAS 値で、
+    // 差し戻し (後方移動) だけができる (Codex R1 medium: 完了からも戻せるように)
+    const curIdx = rawIdx === -1 ? rows.length : rawIdx;
 
     let tIdx;
     if (to === 'done') {
@@ -994,7 +996,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
           && !p.imageTop.rows.every((r) => r.state === 'skip');
         // 詳細工程 0 件はゲートが拒否するので完了に見せない (Codex R2 high)
         const detailSettled = detailExcluded || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
-        if (topSettled && detailSettled) doneCards.push(baseCard);
+        if (topSettled && detailSettled) {
+          // 完了列も 商品×種別 で出す (D&D の差し戻しで TOP/詳細 のどちらを戻すか指定するため)
+          doneCards.push({ ...baseCard, kind: 'top' });
+          if (!detailExcluded) doneCards.push({ ...baseCard, kind: 'detail' });
+        }
       }
       continue;
     }
