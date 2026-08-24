@@ -56,6 +56,16 @@
       <% } %>
     </div>
 
+    <% if (typeof materialCounts !== 'undefined' && materialCounts && (materialCounts.registered || materialCounts.changed || materialCounts.undone || materialCounts.notifyFailed)) { %>
+      <h2>📦 梱包資材の登録 (初回登録はGChat通知なし — ここで確認)</h2>
+      <div style="margin-bottom:12px">
+        登録 <b><%= materialCounts.registered %></b> 件 /
+        変更 <b><%= materialCounts.changed %></b> 件 (GChat通知あり) /
+        取消 <b><%= materialCounts.undone %></b> 件
+        <% if (materialCounts.notifyFailed) { %> / <span style="color:#c92a2a; font-weight:700">🚨 通知失敗 <%= materialCounts.notifyFailed %> 件</span><% } %>
+        — <a href="/apps/packing/admin/materials">資材の管理画面へ</a>
+      </div>
+    <% } %>
     <% const oc = summary.opCounts; %>
     <% if (Object.keys(oc).length > 0) { %>
       <div class="tiles">

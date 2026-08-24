@@ -46,6 +46,26 @@
     .warns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
     .warn-badge { background: #fff3bf; border: 1px solid #ffd43b; border-radius: 6px; padding: 2px 10px; font-size: 15px; font-weight: 700; }
 
+    /* ── 📦 梱包資材カード (要件『梱包資材表示_要件定義_20260823.md』v1.7 §4.1) ── */
+    .mat-card { border: 2px solid #adb5bd; border-radius: 10px; padding: 8px 12px; margin-bottom: 8px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .mat-card.rule { border-color: #2b8a3e; background: #ebfbee; }
+    .mat-card.header { border-color: #1971c2; background: #e7f5ff; }
+    .mat-card.cand { border-color: #f08c00; background: #fff9db; }
+    .mat-card.gray { border-color: #adb5bd; background: #f1f3f5; color: #495057; }
+    .mat-img { width: 88px; height: 88px; border-radius: 8px; background: #fff center/contain no-repeat; border: 1px solid #dee2e6; flex: 0 0 auto; display: flex; align-items: center; justify-content: center; font-size: 34px; }
+    .mat-name { font-size: 24px; font-weight: 800; }
+    .mat-tag { display: inline-block; font-size: 14px; font-weight: 700; padding: 2px 10px; border-radius: 6px; }
+    .mat-sub { font-size: 14px; color: #495057; }
+    .mat-btn { padding: 12px 16px; font-size: 16px; font-weight: 700; border-radius: 10px; border: 2px solid #ced4da; background: #fff; cursor: pointer; }
+    .mat-mini { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; min-width: 120px; min-height: 110px; padding: 8px 10px; border: 2px solid #ced4da; border-radius: 12px; background: #fff; cursor: pointer; font-size: 15px; font-weight: 700; }
+    .mat-mini .mat-img { width: 60px; height: 60px; font-size: 24px; }
+    .mat-mini.other { opacity: .55; }
+    .mat-mini-row { display: flex; gap: 14px; flex-wrap: wrap; width: 100%; margin-top: 6px; }
+    .mat-busy .mat-mini, .mat-busy .mat-btn { pointer-events: none; opacity: .5; }
+    .mat-undo-chip { position: fixed; top: 52px; left: 50%; transform: translateX(-50%); z-index: 60; background: #212529; color: #fff; border-radius: 24px; padding: 10px 18px; font-size: 16px; display: none; align-items: center; gap: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.3); }
+    .mat-undo-chip button { background: #ffd43b; color: #212529; font-weight: 800; border: none; border-radius: 18px; padding: 8px 18px; font-size: 16px; cursor: pointer; }
+    .mat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(136px, 1fr)); gap: 12px; max-height: 56vh; overflow-y: auto; }
+
     .recipient { border: 2px solid #495057; border-radius: 8px; padding: 8px 14px; margin-bottom: 10px; }
     .recipient .name { font-size: 30px; font-weight: 800; line-height: 1.25; }
     .recipient .addr { font-size: 18px; color: #343a40; margin-top: 2px; }
@@ -155,6 +175,11 @@
     <a href="/apps/packing/">一覧へ</a>
   </div>
 
+  <div class="mat-undo-chip" id="matUndoChip">
+    <span id="matUndoText"></span>
+    <button type="button" id="matUndoBtn">取り消す</button>
+  </div>
+
   <div class="sheet-area" id="sheetArea">
     <div class="search-back" id="searchBack"><button type="button" id="searchBackBtn">↩ 検索結果に戻る</button></div>
     <div class="jump-banner" id="jumpBanner">⚠ ズレ回復モード: 順序から外れた伝票を表示中。「次へ」で完了すると、間の伝票は未処理のまま残ります (最後に必ず戻ります)</div>
@@ -254,6 +279,18 @@
     </div>
   </div>
 
+  <div class="overlay" id="matOverlay">
+    <div class="box" style="max-width:660px">
+      <h2>使った資材を選んでください</h2>
+      <div style="color:#868e96; font-size:14px; margin-bottom:8px; text-align:left">
+        タップした資材がこの商品構成の資材として登録され、次回から自動表示されます。
+        <b>資材切れの代替なら何も押さず「やめる」</b>。上段 (濃い色) がこの分類の候補です
+      </div>
+      <div class="mat-grid" id="matGrid"></div>
+      <button class="sheet-cancel" id="matCancel" type="button">やめる</button>
+    </div>
+  </div>
+
   <div class="overlay" id="searchOverlay">
     <div class="box">
       <h2>伝票を探す</h2>
@@ -321,6 +358,9 @@
       repickReadySeqs: Object.entries(state.repickBySlip || {}).filter(([, st]) => st === 'fulfilled').map(([q]) => Number(q)),
       incidents: (state.incidents || []).map((i) => ({ id: i.id, kind: i.kind, sku: i.sku, actualSku: i.actual_sku, actualName: i.actual_name || null, qty: i.qty, slipSeq: i.slip_seq })),
       methodOptions: typeof methodOptions === 'undefined' ? [] : methodOptions,
+      materials: typeof materials === 'undefined' ? null : materials,
+      materialOpts: typeof materialOpts === 'undefined' ? null : materialOpts,
+      materialUndoSec: typeof materialUndoSec === 'undefined' ? 15 : materialUndoSec,
       shipChangeReasons: typeof shipChangeReasons === 'undefined' ? [] : shipChangeReasons,
       lastDoneSeq: state.slips.filter((x) => x.status === 'done')
         .sort((a, b) => (a.done_at || '').localeCompare(b.done_at || '') || a.seq - b.seq)
@@ -449,6 +489,7 @@
           ${s.boxCount > 1 ? `<span class="boxes">箱数 ${s.boxCount}</span>` : ''}
           ${s.deliveryDate ? `<span>配達指定 ${esc(s.deliveryDate)} ${esc(s.deliveryTime || '')}</span>` : ''}
         </div>
+        ${matCardHtml(s.seq)}
         ${warns ? `<div class="warns">${warns}</div>` : ''}
         <div class="recipient">
           <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
@@ -677,6 +718,7 @@
     }
 
     function applyServerResult(body) {
+      if (body.materials) MATERIALS = body.materials;   // /state 応答のみ同梱 (資材の再照合)
       if (body.shipNotify === 'failed') {
         showToast('🚨 事務へのGChat通知に失敗しました。口頭かチャットで直接伝えてください (自動再送も試みます)');
       }
@@ -730,9 +772,180 @@
       } catch { /* 次の操作時に再試行 */ }
     }
 
+    // ── 📦 梱包資材 (表示 + 現場登録 — 要件『梱包資材表示』§3〜5) ──
+    let MATERIALS = STATE.materials;            // seq → 判定 (null = fail-soft)
+    const MATOPTS = STATE.materialOpts;         // { materials, candidateCodes }
+    let matUndo = null;                         // { eventId, token, expiresAt }
+    let matBusy = false;
+    let matOverlaySeq = null;
+
+    function matImgHtml(m) {
+      if (m && m.imageUrl) return `<div class="mat-img" style="background-image:url('${esc(m.imageUrl)}')"></div>`;
+      const color = (m && m.color) || '#ced4da';
+      return `<div class="mat-img" style="background:${esc(color)}22; border-color:${esc(color)}">📦</div>`;
+    }
+
+    function matCardHtml(seq) {
+      if (!MATERIALS) {
+        return `<div class="mat-card gray">❓ 資材情報を取得できません — <button type="button" class="mat-btn" data-mat-retry="1">再試行</button> / 責任者に確認</div>`;
+      }
+      const c = MATERIALS[seq];
+      if (!c || c.source === 'hidden') return '';
+      if (c.source === 'held') return `<div class="mat-card gray">⏸ 配送方法変更の依頼中 — 資材は変更後に決まります</div>`;
+      if (c.source === 'header') {
+        return `<div class="mat-card header">${matImgHtml(c.material)}<div>
+            <span class="mat-tag" style="background:#1971c2;color:#fff">📌 伝票指定</span>
+            <div class="mat-name">${esc(c.material.name)}</div>
+            <div class="mat-sub">この資材で梱包してください${c.headerRuleNote ? ` (登録ルールは ${esc(c.headerRuleNote)})` : ''}</div>
+          </div></div>`;
+      }
+      if (c.source === 'rule') {
+        return `<div class="mat-card rule ${matBusy ? 'mat-busy' : ''}">${matImgHtml(c.material)}
+          <div style="flex:1 1 auto">
+            <span class="mat-tag" style="background:#2b8a3e;color:#fff">✓ 登録済み</span>${c.material.inactive ? '<span class="mat-tag" style="background:#e03131;color:#fff">⚠ 廃止資材</span>' : ''}
+            <div class="mat-name">${esc(c.material.name)}</div>
+            <div class="mat-sub">この資材で梱包してください <span style="color:#868e96">(資材切れの代替は何も押さない)</span></div>
+          </div>
+          ${c.canRegister ? `<button type="button" class="mat-btn" data-mat-open="1">違う資材 → 変更</button>` : ''}
+        </div>`;
+      }
+      if (c.source === 'candidates') {
+        const minis = (c.candidates.length <= 5 && c.canRegister)
+          ? `<div class="mat-mini-row">${c.candidates.map((m) => `<button type="button" class="mat-mini" data-mat-register="${esc(m.code)}">${matImgHtml(m)}${esc(m.name)}</button>`).join('')}
+              <button type="button" class="mat-mini other" data-mat-open="1">その他の資材…</button></div>`
+          : `<div class="mat-mini-row"><button type="button" class="mat-btn" data-mat-open="1">資材を選ぶ</button></div>`;
+        return `<div class="mat-card cand ${matBusy ? 'mat-busy' : ''}"><div style="width:100%">
+            <span class="mat-tag" style="background:#f08c00;color:#fff">☆ 未登録</span>
+            <b>この中のどれかで梱包 → 使った資材をタップで登録</b>
+            <span style="color:#868e96; font-size:13px">(資材切れの代替なら押さない)</span></div>
+          ${minis}</div>`;
+      }
+      if (c.reason === 'no_candidates' && c.canRegister) {
+        return `<div class="mat-card cand ${matBusy ? 'mat-busy' : ''}"><div style="width:100%">
+            <span class="mat-tag" style="background:#f08c00;color:#fff">☆ 未登録</span> 使った資材を登録できます</div>
+          <div class="mat-mini-row"><button type="button" class="mat-btn" data-mat-open="1">資材を選ぶ</button></div></div>`;
+      }
+      if (c.reason === 'line_invalid') return `<div class="mat-card gray">❓ 明細の形式が不正のため資材を登録できません</div>`;
+      return `<div class="mat-card gray">❓ 配送方法を判定できません${c.headerRaw ? `: 「${esc(c.headerRaw)}」` : ''} → 責任者に確認してください</div>`;
+    }
+
+    /** 同一 op_id での自動再送付き POST (応答喪失はサーバー側 op_id 再現で二重登録にならない)。 */
+    async function matFetch(url, payload) {
+      for (let i = 0; i < 3; i += 1) {
+        try {
+          const r = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+          });
+          const body = await r.json().catch(() => ({}));
+          return { ok: r.ok, status: r.status, body };
+        } catch { await new Promise((rs) => setTimeout(rs, 1500)); }
+      }
+      return { ok: false, status: 0, body: { error: '通信エラー。もう一度タップしてください' } };
+    }
+
+    async function matRegister(seq, code) {
+      if (matBusy) return;
+      const c = MATERIALS && MATERIALS[seq];
+      if (!c) return;
+      if (!worker) { showToast('先に作業者を選んでください'); return; }
+      matBusy = true;
+      $('matGrid').classList.add('mat-busy');
+      render();
+      try {
+        const res = await matFetch(`/apps/packing/api/batches/${STATE.batchId}/material`, {
+          op_id: `mat-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+          slip_seq: seq,
+          material_code: code,
+          expected_rule_id: c.ruleId,
+          expected_version: c.ruleVersion,
+          expected_delivery_code: c.deliveryCode,
+          expected_before: c.material ? c.material.code : null,
+          worker_name: worker,
+        });
+        if (!res.ok) {
+          showToast((res.body && res.body.error) || `エラー (${res.status})`);
+          await resync();   // 409 (他端末の変更/文脈変化) は現在値で描き直す
+          return;
+        }
+        const b = res.body;
+        if (b.noop) { showToast('同じ資材が登録済みです'); await resync(); return; }
+        MATERIALS[seq] = {
+          ...c, source: 'rule', material: b.rule.material,
+          ruleId: b.rule.ruleId, ruleVersion: b.rule.ruleVersion, reason: null, canRegister: true,
+        };
+        matUndo = { eventId: b.eventId, token: b.undoToken, expiresAt: Date.parse(b.undoExpiresAt) };
+        $('matUndoText').textContent = `資材を登録しました: ${b.rule.material.name}`;
+        $('matUndoChip').style.display = 'flex';
+        tickMatUndo();
+        resync();   // 同一構成の他伝票にも反映 (非同期)
+      } finally {
+        matBusy = false;
+        $('matGrid').classList.remove('mat-busy');
+        closeMatOverlay();
+        render();
+      }
+    }
+
+    function tickMatUndo() {
+      if (!matUndo) return;
+      const left = Math.floor((matUndo.expiresAt - Date.now()) / 1000);
+      if (left <= 0) { matUndo = null; $('matUndoChip').style.display = 'none'; return; }
+      $('matUndoBtn').textContent = `取り消す (${left})`;
+      setTimeout(tickMatUndo, 500);
+    }
+
+    $('matUndoBtn').addEventListener('click', async () => {
+      if (!matUndo) return;
+      const u = matUndo;
+      matUndo = null;
+      $('matUndoChip').style.display = 'none';
+      const res = await matFetch(`/apps/packing/api/batches/${STATE.batchId}/material/undo`, {
+        op_id: `matundo-${u.eventId}-${Math.random().toString(36).slice(2, 8)}`,
+        event_id: u.eventId, undo_token: u.token, worker_name: worker || '',
+      });
+      showToast(res.ok ? '取り消しました' : ((res.body && res.body.error) || '取り消せませんでした'));
+      await resync();
+      render();
+    });
+
+    function openMatOverlay(seq) {
+      const c = MATERIALS && MATERIALS[seq];
+      if (!c || !MATOPTS) return;
+      matOverlaySeq = seq;
+      // 候補集合は分類単位 (candidateCodes)。rule 表示の伝票から開いても上段=候補になる
+      const candSet = new Set(MATOPTS.candidateCodes || []);
+      for (const m of c.candidates || []) candSet.add(m.code);
+      const ranked = [...(MATOPTS.materials || [])]
+        .sort((a, b) => (candSet.has(b.code) ? 1 : 0) - (candSet.has(a.code) ? 1 : 0));
+      $('matGrid').innerHTML = ranked.map((m) => `
+        <button type="button" class="mat-mini ${candSet.has(m.code) ? '' : 'other'}" data-mat-register="${esc(m.code)}">
+          ${matImgHtml(m)}${esc(m.name)}
+        </button>`).join('');
+      $('matOverlay').style.display = 'flex';
+      autoPauseStart();
+    }
+    function closeMatOverlay() {
+      if ($('matOverlay').style.display !== 'flex') return;
+      $('matOverlay').style.display = 'none';
+      matOverlaySeq = null;
+      autoPauseEnd();
+    }
+    $('matCancel').addEventListener('click', closeMatOverlay);
+    $('matGrid').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-mat-register]');
+      if (b && matOverlaySeq != null) matRegister(matOverlaySeq, b.dataset.matRegister);
+    });
+    $('paper').addEventListener('click', (e) => {
+      const reg = e.target.closest('[data-mat-register]');
+      if (reg) { matRegister(viewSeq, reg.dataset.matRegister); return; }
+      const open = e.target.closest('[data-mat-open]');
+      if (open) { openMatOverlay(viewSeq); return; }
+      if (e.target.closest('[data-mat-retry]')) resync().then(render);
+    });
+
     // ── 操作 ──
     function goNext() {
-      if (currentSeq == null || paused) return;
+      if (currentSeq == null || paused || matBusy) return;
       const viewingHeld = heldSet.has(viewSeq);
       const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
       const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
@@ -773,6 +986,7 @@
     }
 
     function goPrev() {
+      if (matBusy) return;
       if (viewSeq > 1) { viewSeq -= 1; render(); }
     }
 
@@ -795,7 +1009,8 @@
     function autoPauseEnd() {
       if (!autoPaused || autoResuming) return;
       // ④→⑥と連続で開くケースがあるため、両方閉じたときだけ再開する
-      if ($('shipOverlay').style.display === 'flex' || $('ruleOverlay').style.display === 'flex') return;
+      if ($('shipOverlay').style.display === 'flex' || $('ruleOverlay').style.display === 'flex'
+          || $('matOverlay').style.display === 'flex') return;
       autoResuming = true;
       enqueue('resume', null);
     }
@@ -1464,14 +1679,24 @@
 
     // スワイプ (左=次へ / 右=前へ)。60px閾値・縦スクロールと干渉しない判定
     let touchX = null, touchY = null;
+    // スワイプの除外 (Codex 実装R1 high): ボタン・オーバーレイ・資材カード上で始まった
+    // タッチはページ送りにしない (ボタンを少し滑らせて離すと登録+次へが同時に走る事故)。
+    // オーバーレイ表示中もページ送り停止
+    let touchOnControl = false;
+    const anyOverlayOpen = () => [...document.querySelectorAll('.overlay')]
+      .some((o) => o.style.display === 'flex');
     document.addEventListener('touchstart', (e) => {
       touchX = e.touches[0].clientX; touchY = e.touches[0].clientY;
+      const el = e.target;
+      touchOnControl = !!(el && el.closest
+        && el.closest('button, input, select, a, .overlay, .mat-card, .mat-undo-chip'));
     }, { passive: true });
     document.addEventListener('touchend', (e) => {
       if (touchX == null) return;
       const dx = e.changedTouches[0].clientX - touchX;
       const dy = e.changedTouches[0].clientY - touchY;
       touchX = null;
+      if (touchOnControl || anyOverlayOpen()) return;
       if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;
       if (dx < 0) goNext(); else goPrev();
     }, { passive: true });
