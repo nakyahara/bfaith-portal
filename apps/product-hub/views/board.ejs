@@ -65,7 +65,7 @@
 </style>
 
 <%
-  // フィルタとタブの URL。切り替えても他の条件 (担当者・未割り当て・ビュー) を失わない
+  // フィルタとタブの URL。切り替えても他の条件 (担当者・未割り当て・ビュー・種別) を失わない
   const boardUrl = (over = {}) => {
     const p = new URLSearchParams();
     const v = over.view !== undefined ? over.view : boardView;
@@ -74,6 +74,9 @@
     if (a) p.set('assignee', a);
     const f = over.filter !== undefined ? over.filter : (unassignedOnly ? 'unassigned' : '');
     if (f) p.set('filter', f);
+    // 種別 (TOP画像/商品詳細画像) は画像ビューだけの条件。本流へ切り替えたら落とす
+    const k = over.kind !== undefined ? over.kind : (imageKind || '');
+    if (k && v === 'image') p.set('kind', k);
     const s = p.toString();
     return '/apps/product-hub/board' + (s ? '?' + s : '');
   };
@@ -93,6 +96,13 @@
       </a>
     <% } %>
     <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
+    <% if (boardView === 'image') { %>
+      <%# 種別の絞り込み (2026-08-24 中原さん要望)。担当者の絞り込みとは独立に効く %>
+      <span style="border-left:1px solid #e2e8f0; align-self:stretch;"></span>
+      <a class="chip <%= !imageKind ? 'on' : '' %>" href="<%= boardUrl({ kind: '' }) %>">両方</a>
+      <a class="chip <%= imageKind === 'top' ? 'on' : '' %>" href="<%= boardUrl({ kind: 'top' }) %>">🖼 TOP画像</a>
+      <a class="chip <%= imageKind === 'detail' ? 'on' : '' %>" href="<%= boardUrl({ kind: 'detail' }) %>">📸 商品詳細画像</a>
+    <% } %>
     <select id="assignee-select" style="width:auto; font-size:12px;">
       <option value="">担当者で絞る…</option>
       <% for (const s of staff) { %>

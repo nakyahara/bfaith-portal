@@ -857,7 +857,7 @@ export function moveBoardCard(
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
  * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean}}
  */
-export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
+export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
     SELECT code, label, track, image_kind, image_stage, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -982,6 +982,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // D&D で差し戻せない。「商品として完了」ではなく「この種別が決着」が完了列の意味
       for (const k of kinds) {
         if (k.excluded || k.s.rows.length === 0) continue;
+        // 種別の絞り込み (2026-08-24 中原さん要望: TOP画像/商品詳細画像だけを見たい)。完了列にも効かせる
+        if (imageKind && k.kind !== imageKind) continue;
         const cur = k.s.current;
         if (!cur) {
           // この種別は決着済み → 完了列 (絞り込み中は出さない — 「終わった分」は全員共通)。
