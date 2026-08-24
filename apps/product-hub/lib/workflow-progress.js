@@ -892,7 +892,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.state IN ('todo', 'doing')
         ${view === 'image' ? "AND s.track = 'image'" : ''}
-        ${kindSafe ? `AND s.image_kind = '${kindSafe}'` : ''}
+        ${/* TOP系列は image_kind IS NULL のカスタム画像工程も含む (splitImageRows と同じ区分 — Codex R2) */''}
+        ${kindSafe === 'detail' ? "AND s.image_kind = 'detail'" : ''}
+        ${kindSafe === 'top' ? "AND (s.image_kind IS NULL OR s.image_kind != 'detail')" : ''}
     ) WHERE rn = 1
   `;
   let candidateSql = '';
