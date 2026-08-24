@@ -616,6 +616,12 @@ router.get('/inquiries/:id', (req, res) => {
   const navLink = (row, label) => row
     ? `<a href="/apps/inquiry-hub/inquiries/${row.id}${navQs}" title="${he(row.subject || '(件名なし)')}">${label}</a>`
     : `<span class="nav-off" aria-disabled="true">${label}</span>`;
+  // 1クリック対応完了 (2026-08-24 中原さん要望・メールディーラー踏襲): 右上のボタン1つで
+  // 「完了」にして次の問い合わせへ進む (次が無ければ一覧へ戻る)。既に完了なら押せない表示
+  const quickDoneNext = adj.next ? `/apps/inquiry-hub/inquiries/${adj.next.id}${navQs}` : backUrl;
+  const quickDoneBtn = inq.internal_status === 'done'
+    ? '<button class="ghost quick-done" disabled>✅ 完了済み</button>'
+    : '<button class="pri quick-done" id="quickDoneBtn" title="1クリックで「完了」にして、次の問い合わせへ移動します">✅ 対応完了</button>';
   const body = `
   <div class="detail-head">
     <div class="detail-nav">
@@ -624,6 +630,7 @@ router.get('/inquiries/:id', (req, res) => {
         ${navLink(adj.prev, '← 前の問い合わせ')}
         ${navLink(adj.next, '次の問い合わせ →')}
       </span>
+      ${quickDoneBtn}
     </div>
     <h2>${chBadge(inq.channel_type)} ${he(inq.subject || '(件名なし)')}</h2>
   </div>
@@ -705,6 +712,14 @@ router.get('/inquiries/:id', (req, res) => {
         toast('アドレスをコピーしました。NEの受注検索でメールアドレス欄に貼り付けて検索してください'); openNe();
       }, function() { toast('コピーできませんでした。アドレスを選択して手動でコピーしてください'); openNe(); });
     } else { toast('このブラウザではコピーできません。アドレスを選択してコピーしてください'); openNe(); }
+  });
+  // 1クリック対応完了 → 次の問い合わせへ (次が無ければ一覧へ)
+  var quickDoneBtn = document.getElementById('quickDoneBtn');
+  if (quickDoneBtn) quickDoneBtn.addEventListener('click', function() {
+    var btn = this; btn.disabled = true;
+    post('/status', { status: 'done' }).then(function() {
+      location.href = ${JSON.stringify(quickDoneNext).replace(/</g, '\\u003c')};
+    }).catch(function(e) { btn.disabled = false; toast('完了にできませんでした: ' + e.message); });
   });
   document.getElementById('saveBtn').addEventListener('click', function() {
     var btn = this; btn.disabled = true;
@@ -2527,6 +2542,7 @@ td.selcell input, th.selcell input { width: 18px; height: 18px; cursor: pointer;
 .detail-nav { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .detail-nav-adj { display: flex; gap: 14px; }
 .detail-nav .nav-off { color: #cbd5e1; }
+.detail-nav .quick-done { margin-left: auto; }
 .detail-grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
 @media (max-width: 900px) { .detail-grid { grid-template-columns: 1fr; } }
 .thread { display: flex; flex-direction: column; gap: 10px; }

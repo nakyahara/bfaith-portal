@@ -510,6 +510,17 @@ console.log('HTTP: 全件一括');
   const bad2 = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: {} });
   check('変更内容なしは400', bad2.status === 400);
 
+  // 1クリック対応完了ボタン (2026-08-24 中原さん要望・メールディーラーの右上「対応完了」踏襲)
+  const h4 = mkH('ba4', 'open'), h5 = mkH('ba5', 'done');
+  const dOpen = await (await fetch(`${base}/inquiries/${h4}?view=inbox`)).text();
+  check('詳細: 未完了は右上に「✅ 対応完了」1クリックボタン', dOpen.includes('id="quickDoneBtn"') && dOpen.includes('✅ 対応完了'));
+  const dDone = await (await fetch(`${base}/inquiries/${h5}?view=inbox`)).text();
+  check('詳細: 完了済みは押せない表示', !dDone.includes('id="quickDoneBtn"') && dDone.includes('✅ 完了済み'));
+  const qd = await jp(`/api/inquiries/${h4}/status`, { status: 'done' });
+  check('1クリック完了のAPI: done遷移+completed_at刻印', qd.status === 200
+    && db.prepare('SELECT internal_status, completed_at FROM inquiries WHERE id = ?').get(h4).internal_status === 'done'
+    && !!db.prepare('SELECT completed_at FROM inquiries WHERE id = ?').get(h4).completed_at);
+
   await new Promise(r => srv.close(r));
 }
 
