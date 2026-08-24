@@ -2604,19 +2604,24 @@
       }
       let last = input.value;
       // 保存はSKU単位の単一チェーンで直列化する (Codex R1 high: 素早く2回変更したとき
-      // 先のPOSTが後から完了すると古い値に巻き戻る)。送信値は実行時点の最新値を読む
+      // 先のPOSTが後から完了すると古い値に巻き戻る)。送信値は change 時点の値を渡す
       let saveChain = Promise.resolve();
-      async function save() {
-        const value = input.value;
+      async function save(value) {
         if (value === last) return;
-        const json = await post(BASE + '/sku-prices', {
-          ne_code: input.dataset.code,
-          price: value === '' ? null : Number(value),
-        });
+        let json;
+        try {
+          json = await post(BASE + '/sku-prices', {
+            ne_code: input.dataset.code,
+            price: value === '' ? null : Number(value),
+          });
+        } catch (e) {
+          // 通信例外も黙殺せずエラー扱いにする (Codex R2)
+          json = { ok: false, error: '通信エラーでSKU売価を保存できませんでした' };
+        }
         if (!json.ok) {
           alert(json.error || 'SKU売価の保存に失敗しました');
-          input.value = last;
-          render();
+          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す (Codex R2)
+          if (input.value === value) { input.value = last; render(); }
           return;
         }
         last = value;
@@ -2624,7 +2629,8 @@
       }
       input.addEventListener('input', render);
       input.addEventListener('change', () => {
-        saveChain = saveChain.then(save).catch(() => {});
+        const value = input.value;
+        saveChain = saveChain.then(() => save(value));
       });
       render();
     });

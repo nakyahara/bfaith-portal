@@ -1417,6 +1417,12 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
     if (!inGroup) {
       return { code: 409, error: `${code} はこのバリエーションに含まれていません。画面を再読み込みしてください` };
     }
+    // 外したSKUのSKU別売価も掃除する。残すと入力欄が消えて解除できず、
+    // 将来の出品処理が古い価格を適用する恐れがある (Codex R1 medium)。
+    // INSERT より前に置く: 既に除外済み (UNIQUE) の冪等リクエストでも掃除は必ず走らせる (Codex R2)。
+    // 非UNIQUEの例外時はトランザクションごと巻き戻るので、この DELETE だけが残ることはない
+    db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
     try {
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
         .run(draft.id, code, actorOf(req));
@@ -1425,10 +1431,6 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
       if (/UNIQUE/i.test(String(e && e.message))) return { code: 200, already: true };
       throw e;
     }
-    // 外したSKUのSKU別売価も掃除する。残すと入力欄が消えて解除できず、
-    // 将来の出品処理が古い価格を適用する恐れがある (Codex R1 medium)
-    db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?')
-      .run(draft.id, code.trim().toLowerCase());
     logEvent(db, draft.id, 'variation_sku_excluded', code, actorOf(req));
     return { code: 200 };
   })();
