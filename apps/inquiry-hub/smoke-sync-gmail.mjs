@@ -230,12 +230,18 @@ console.log('4. エンジン結合');
     conditions: [{ field: 'from', op: 'ends_with', value: '@spam.example' }] });
   addMailRule({ name: '自動配信は完了扱い', matchMode: 'all', priority: 20, action: 'import_done',
     conditions: [{ field: 'subject', op: 'contains', value: '注文キャンセル完了' }] });
+  // ラベル自動付与 (2026-08-24): 条件一致で取り込み時に色付きラベルが付く
+  const { createLabel } = await import('./labels.js');
+  const lblClaim = createLabel('クレーム', '#ef4444', 'tester');
+  addMailRule({ name: 'クレームにラベル', matchMode: 'all', priority: 30, action: 'import',
+    labelId: lblClaim.id, conditions: [{ field: 'subject', op: 'contains', value: '不足しています' }] });
 
   const shopId = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','メール','info@b-faith.biz')").run().lastInsertRowid;
   let threads = {
     'g1': { id: 'g1', messages: [gmailMsg({ id: 'a1', from: '顧客 <c1@gmail.com>' })] },
     'g2': { id: 'g2', messages: [gmailMsg({ id: 'a2', from: 'x <bot@spam.example>' })] },
     'g3': { id: 'g3', messages: [gmailMsg({ id: 'a3', from: 'no-reply@rakuten.co.jp', subject: '注文キャンセル完了のお知らせ' })] },
+    'g4': { id: 'g4', messages: [gmailMsg({ id: 'a5', from: '顧客 <c3@gmail.com>', subject: '商品が不足しています' })] },
   };
   const f = mockFetch((url) => {
     if (url.includes('/messages?')) return { body: { messages: Object.keys(threads).map(t => ({ id: 'x' + t, threadId: t })) } };
@@ -245,12 +251,14 @@ console.log('4. エンジン結合');
   const ad = createGmailAdapter({ clientId: 'c', clientSecret: 's', refreshToken: 'r', sleepMs: 0, fetchImpl: f });
 
   const r1 = await runSync(shopId, ad, { now: NOW_MS });
-  check('初回同期: skip除外で2問い合わせ', r1.ok && r1.stats.newInquiries === 2, JSON.stringify(r1));
+  check('初回同期: skip除外で3問い合わせ', r1.ok && r1.stats.newInquiries === 3, JSON.stringify(r1));
   const inqs = db.prepare('SELECT * FROM inquiries WHERE shop_id = ? ORDER BY external_inquiry_id').all(shopId);
   check('通常取込=open/未読', inqs.find(i => i.external_inquiry_id === 'g1').internal_status === 'open' && inqs.find(i => i.external_inquiry_id === 'g1').is_unread === 1);
   const g3 = inqs.find(i => i.external_inquiry_id === 'g3');
   check('import_done=done/既読/completed_at', g3.internal_status === 'done' && g3.is_unread === 0 && !!g3.completed_at);
   check('skipされたスレッドはDBに無い', !inqs.find(i => i.external_inquiry_id === 'g2'));
+  const g4 = inqs.find(i => i.external_inquiry_id === 'g4');
+  check('ラベルルール: 取込時に label_id が付く (新着のまま)', g4.label_id === lblClaim.id && g4.internal_status === 'open' && g4.is_unread === 1, JSON.stringify(g4));
 
   const r2 = await runSync(shopId, ad, { now: NOW_MS + 15 * 60000 });
   check('再同期は冪等 (新規0)', r2.ok && r2.stats.newInquiries === 0 && r2.stats.newMessages === 0, JSON.stringify(r2));

@@ -29,6 +29,8 @@ import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
 import { listFolders, countUnfiled, createFolder, updateFolder, deleteFolder, setInquiryFolder,
   FOLDER_NAME_MAX } from './folders.js';
+import { listLabels, createLabel, updateLabel, deleteLabel, setInquiryLabel,
+  labelTextColor, LABEL_NAME_MAX, LABEL_PALETTE } from './labels.js';
 import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
 import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
@@ -71,11 +73,14 @@ export function normalizeBodyText(text) {
 const badge = (meta, text) => meta ? `<span class="badge" style="${meta.badge}">${he(text != null ? text : meta.label)}</span>` : '';
 const chBadge = ch => badge(CHANNELS[ch], null) || he(ch);
 const stBadge = st => badge(STATUSES[st], null) || he(st);
+/** 色付きラベルチップ (2026-08-24 メールディーラーのラベル相当)。color は labels.js が '#rrggbb' に検証済み */
+const labelChip = (name, color) => name
+  ? `<span class="lbl" style="background:${he(color || '#64748b')};color:${labelTextColor(color)}">${he(name)}</span>` : '';
 
 // ─── 対応履歴の表示整形 (生JSONではなく日本語ラベルで出す) ───
 const ACTION_LABELS = {
   status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
-  folder_change: 'フォルダ変更',
+  folder_change: 'フォルダ変更', label_change: 'ラベル変更',
   attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
   reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
 };
@@ -87,6 +92,7 @@ function fmtLogValue(key, v) {
     case 'ai_needed': return Number(v) === 0 ? 'AI不要' : ((AI_FLAGS[v] || {}).label || String(v));
     case 'assigned': return v ? String(v) : '未割当';
     case 'folder': return v ? `📁${v}` : '未分類';
+    case 'label': return v ? `🏷️${v}` : 'ラベルなし';
     case 'length': return `${v}文字`;
     case 'source': return String(v);
     default: return typeof v === 'object' ? JSON.stringify(v) : String(v);
@@ -110,6 +116,8 @@ router.get('/', (req, res) => {
   // 任意フォルダ (サイドバーから ?folder=<id> で来る。ビュー条件とはANDで重なる)
   const folders = listFolders();
   const curFolder = /^\d+$/.test(String(q.folder || '')) ? folders.find(f => f.id === Number(q.folder)) : null;
+  // 色付きラベル (絞り込み・一括操作・行チップ表示。2026-08-24)
+  const labels = listLabels();
   // 上部タブ (メール / モール問い合わせ)。ビューやフォルダとはANDで重なる
   const group = CHANNEL_GROUPS[q.group] ? q.group : '';
 
@@ -167,6 +175,7 @@ router.get('/', (req, res) => {
     <select name="channel"><option value="">チャネル: 全て</option>${Object.entries(CHANNELS).map(([k, v]) => opt(k, v.label, q.channel)).join('')}</select>
     <select name="shop"><option value="">店舗: 全て</option>${shops.map(s => opt(s.id, `${(CHANNELS[s.channel_type] || {}).label || s.channel_type} / ${s.shop_name}`, q.shop)).join('')}</select>
     <select name="folder"><option value="">フォルダ: 全て</option>${opt('none', '未分類', q.folder)}${folders.map(f => opt(f.id, `📁 ${f.name}`, q.folder)).join('')}</select>
+    <select name="label"><option value="">ラベル: 全て</option>${opt('none', 'ラベルなし', q.label)}${labels.map(l => opt(l.id, `🏷️ ${l.name}`, q.label)).join('')}</select>
     <select name="assigned"><option value="">担当: 全て</option>${opt('none', '未割当', q.assigned)}${assignees.map(u => opt(u, u, q.assigned)).join('')}</select>
     <label class="chk"><input type="checkbox" name="unread" value="1"${q.unread === '1' ? ' checked' : ''}>未読</label>
     <label class="chk"><input type="checkbox" name="attention" value="1"${q.attention === '1' ? ' checked' : ''}>要確認</label>
@@ -201,7 +210,7 @@ router.get('/', (req, res) => {
       <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
-      <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
+      <td class="subj" data-full>${r.label_name ? labelChip(r.label_name, r.label_color) + ' ' : ''}<a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
@@ -239,6 +248,7 @@ router.get('/', (req, res) => {
     <span class="bulk-n"><b id="bulkCount">0</b>件を選択中</span>
     <select id="bulkStatus"><option value="">状態: 変更なし</option>${Object.entries(STATUSES).map(([k, v]) => `<option value="${k}">${he(v.label)}にする</option>`).join('')}</select>
     <select id="bulkFolder"><option value="">フォルダ: 変更なし</option><option value="none">📁 未分類に戻す</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}へ</option>`).join('')}</select>
+    <select id="bulkLabel"><option value="">ラベル: 変更なし</option><option value="none">🏷️ ラベルを外す</option>${labels.map(l => `<option value="${l.id}">🏷️ ${he(l.name)}</option>`).join('')}</select>
     <select id="bulkAssign"><option value="">担当: 変更なし</option><option value="__me__">自分にする</option><option value="__none__">未割当にする</option>${assignees.map(u => `<option value="${he(u)}">${he(u)}</option>`).join('')}</select>
     <select id="bulkRead"><option value="">既読: 変更なし</option><option value="read">既読にする</option><option value="unread">未読にする</option></select>
     <button class="pri" id="bulkApply">選択した${''}件に適用</button>
@@ -287,7 +297,7 @@ router.get('/', (req, res) => {
     // ページの全行を選択した状態でだけ提案し、全件モード中に1つでも外せば解除される
     var allMode = false;
     var TOTAL = ${Number(total) || 0};
-    var FILTER = ${JSON.stringify(Object.fromEntries(['view', 'status', 'group', 'channel', 'shop', 'folder', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q']
+    var FILTER = ${JSON.stringify(Object.fromEntries(['view', 'status', 'group', 'channel', 'shop', 'folder', 'label', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q']
       .map(k => [k, String(q[k] ?? '')]).filter(([, v]) => v !== ''))).replace(/</g, '\\u003c')};
     function rows() { return Array.prototype.slice.call(document.querySelectorAll('.rowchk')); }
     function selected() { return rows().filter(function(c) { return c.checked; }).map(function(c) { return Number(c.value); }); }
@@ -324,6 +334,11 @@ router.get('/', (req, res) => {
       if (fo.value) {
         ops.folderId = fo.value === 'none' ? null : Number(fo.value);
         desc.push('フォルダ→' + fo.options[fo.selectedIndex].textContent);
+      }
+      var lb = document.getElementById('bulkLabel');
+      if (lb.value) {
+        ops.labelId = lb.value === 'none' ? null : Number(lb.value);
+        desc.push('ラベル→' + lb.options[lb.selectedIndex].textContent);
       }
       var asg = document.getElementById('bulkAssign');
       if (asg.value) {
@@ -445,6 +460,10 @@ router.get('/inquiries/:id', (req, res) => {
   const folderList = listFolders();
   const folderOptions = `<option value="">未分類</option>` + folderList
     .map(f => `<option value="${f.id}"${inq.folder_id === f.id ? ' selected' : ''}>📁 ${he(f.name)}</option>`).join('');
+  // 色付きラベル (2026-08-24 メールディーラー相当。1件1ラベル)
+  const labelList = listLabels();
+  const labelOptions = `<option value="">ラベルなし</option>` + labelList
+    .map(l => `<option value="${l.id}"${inq.label_id === l.id ? ' selected' : ''}>🏷️ ${he(l.name)}</option>`).join('');
 
   const stOptions = Object.entries(STATUSES).map(([k, v]) => `<option value="${k}"${inq.internal_status === k ? ' selected' : ''}>${he(v.label)}</option>`).join('');
   const aiOptions = Object.entries(AI_FLAGS).map(([k, v]) => `<option value="${k}"${String(inq.ai_needed) === k ? ' selected' : ''}>${he(k === '0' ? 'AI不要' : v.label)}</option>`).join('');
@@ -566,13 +585,17 @@ router.get('/inquiries/:id', (req, res) => {
           <select id="mrAction">
             <option value="skip">取り込まない (問い合わせにしない)</option>
             <option value="import_done">取り込むが完了扱い (履歴には残す)</option>
-            <option value="import">📁フォルダに入れる (新着のまま)</option>
+            <option value="import">📁🏷️振り分けだけする (新着のまま)</option>
           </select>
         </div>
         <div class="row rule-row">
-          <select id="mrFolder" title="取り込むメールを入れるフォルダ (「フォルダに入れる」では必須。完了扱いと組み合わせも可)">
+          <select id="mrFolder" title="取り込むメールを入れるフォルダ (完了扱いと組み合わせも可)">
             <option value="">📁 フォルダ指定なし</option>
             ${folderList.map(f => `<option value="${f.id}"${inq.folder_id === f.id ? ' selected' : ''}>📁 ${he(f.name)}</option>`).join('')}
+          </select>
+          <select id="mrLabel" title="条件に一致したメールへ取り込み時に付けるラベル (一覧に色付きで表示)">
+            <option value="">🏷️ ラベルなし</option>
+            ${labelList.map(l => `<option value="${l.id}"${inq.label_id === l.id ? ' selected' : ''}>🏷️ ${he(l.name)}</option>`).join('')}
           </select>
         </div>
         <label class="chk"><input type="checkbox" id="mrApplyExisting" checked>すでに溜まっている同じメールにも適用する</label>
@@ -632,7 +655,7 @@ router.get('/inquiries/:id', (req, res) => {
       </span>
       ${quickDoneBtn}
     </div>
-    <h2>${chBadge(inq.channel_type)} ${he(inq.subject || '(件名なし)')}</h2>
+    <h2>${chBadge(inq.channel_type)} ${inq.label_name ? labelChip(inq.label_name, inq.label_color) + ' ' : ''}${he(inq.subject || '(件名なし)')}</h2>
   </div>
   <div class="detail-grid">
     <div class="thread">
@@ -665,6 +688,9 @@ router.get('/inquiries/:id', (req, res) => {
         <label>📁 フォルダ
           <select id="folderSel">${folderOptions}</select>
           <span class="sub">分類用。入れても未返信なら受信トレイに残ります (<a href="/apps/inquiry-hub/folders">フォルダ管理</a>)</span></label>
+        <label>🏷️ ラベル
+          <select id="labelSel">${labelOptions}</select>
+          <span class="sub">一覧で色付きの目印になります (<a href="/apps/inquiry-hub/labels">ラベル管理</a>)</span></label>
         <label>AIフラグ <select id="aiSel">${aiOptions}</select></label>
         <label class="chk"><input type="checkbox" id="attnChk"${inq.needs_attention ? ' checked' : ''}>⚠️要確認</label>
         <label class="chk"><input type="checkbox" id="unreadChk"${inq.is_unread ? ' checked' : ''}>未読に戻す</label>
@@ -687,7 +713,7 @@ router.get('/inquiries/:id', (req, res) => {
 
   const script = `
   var ID = ${id};
-  var CUR = ${JSON.stringify({ status: inq.internal_status, assigned: inq.assigned_user_id || '', ai: inq.ai_needed, attention: !!inq.needs_attention, unread: !!inq.is_unread, folder: inq.folder_id == null ? '' : String(inq.folder_id) }).replace(/</g, '\\u003c')};
+  var CUR = ${JSON.stringify({ status: inq.internal_status, assigned: inq.assigned_user_id || '', ai: inq.ai_needed, attention: !!inq.needs_attention, unread: !!inq.is_unread, folder: inq.folder_id == null ? '' : String(inq.folder_id), label: inq.label_id == null ? '' : String(inq.label_id) }).replace(/</g, '\\u003c')};
   var ME = ${JSON.stringify(String(actorOf(req))).replace(/</g, '\\u003c')};
   function post(path, data) {
     return fetch('/apps/inquiry-hub/api/inquiries/' + ID + path, {
@@ -730,9 +756,11 @@ router.get('/inquiries/:id', (req, res) => {
     var attn = document.getElementById('attnChk').checked;
     var unread = document.getElementById('unreadChk').checked;
     var folder = document.getElementById('folderSel').value;
+    var label = document.getElementById('labelSel').value;
     if (st !== CUR.status) ops.push(post('/status', { status: st }));
     if (asg !== CUR.assigned) ops.push(post('/assign', { user: asg }));
     if (folder !== CUR.folder) ops.push(post('/folder', { folder_id: folder === '' ? null : Number(folder) }));
+    if (label !== CUR.label) ops.push(post('/label', { label_id: label === '' ? null : Number(label) }));
     if (ai !== CUR.ai) ops.push(post('/ai-flag', { ai_needed: ai }));
     if (attn !== CUR.attention) ops.push(post('/attention', { needs_attention: attn }));
     if (unread !== CUR.unread) ops.push(post('/read', { is_unread: unread }));
@@ -777,14 +805,16 @@ router.get('/inquiries/:id', (req, res) => {
         if (!v.value.trim() && MR_SEED[f.value]) v.value = MR_SEED[f.value];
       });
     });
-    // フォルダを選んだのに扱いが「取り込まない」のままだと矛盾する (2026-08-20 実事故) →
-    // フォルダ選択時に自動で「フォルダに入れる」へ切り替える (完了扱い+フォルダは正当なので触らない)
-    document.getElementById('mrFolder').addEventListener('change', function() {
-      var actSel = document.getElementById('mrAction');
-      if (this.value && actSel.value === 'skip') {
-        actSel.value = 'import';
-        toast('扱いを「📁フォルダに入れる (新着のまま)」に切り替えました');
-      }
+    // フォルダ・ラベルを選んだのに扱いが「取り込まない」のままだと矛盾する (2026-08-20 実事故) →
+    // 選択時に自動で「振り分けだけする」へ切り替える (完了扱い+振り分けは正当なので触らない)
+    ['mrFolder', 'mrLabel'].forEach(function(selId) {
+      document.getElementById(selId).addEventListener('change', function() {
+        var actSel = document.getElementById('mrAction');
+        if (this.value && actSel.value === 'skip') {
+          actSel.value = 'import';
+          toast('扱いを「📁🏷️振り分けだけする (新着のまま)」に切り替えました');
+        }
+      });
     });
     // 「ドメイン全体にする」: 1行目を From が @example.com で終わる に切り替える
     var mrUseDomain = document.getElementById('mrUseDomain');
@@ -812,34 +842,40 @@ router.get('/inquiries/:id', (req, res) => {
       var folderSel = document.getElementById('mrFolder');
       var folderId = folderSel.value ? Number(folderSel.value) : null;
       var folderName = folderSel.value ? folderSel.options[folderSel.selectedIndex].textContent.replace(/^\\s*📁\\s*/, '') : '';
-      if (action === 'import' && !folderId) { toast('「フォルダに入れる」はフォルダを選んでください'); return; }
+      var labelSel = document.getElementById('mrLabel');
+      var labelId = labelSel.value ? Number(labelSel.value) : null;
+      var labelName = labelSel.value ? labelSel.options[labelSel.selectedIndex].textContent.replace(/^\\s*🏷️\\s*/, '') : '';
+      if (action === 'import' && !folderId && !labelId) { toast('「振り分けだけする」はフォルダかラベルを選んでください'); return; }
       // 🚨黙って捨てない (2026-08-20 実事故: フォルダを選んだまま扱い「取り込まない」で作成→
       // フォルダ無しのskipルールになり、一括適用が既存95件を完了化した)
-      if (action === 'skip' && folderId) {
-        toast('「取り込まない」にはフォルダを指定できません。振り分けたい場合は扱いを「📁フォルダに入れる (新着のまま)」にしてください');
+      if (action === 'skip' && (folderId || labelId)) {
+        toast('「取り込まない」にはフォルダ・ラベルを指定できません。振り分けたい場合は扱いを「📁🏷️振り分けだけする (新着のまま)」にしてください');
         return;
       }
+      var assignDesc = [];
+      if (folderId) assignDesc.push('フォルダ「' + folderName + '」へ');
+      if (labelId) assignDesc.push('ラベル「' + labelName + '」を付ける');
       var actionLabel = action === 'skip' ? '取り込まない'
-        : action === 'import' ? 'フォルダ「' + folderName + '」に入れる (新着のまま)'
-        : '取り込むが完了扱い' + (folderId ? ' + フォルダ「' + folderName + '」へ' : '');
+        : action === 'import' ? assignDesc.join(' + ') + ' (新着のまま)'
+        : '取り込むが完了扱い' + (assignDesc.length ? ' + ' + assignDesc.join(' + ') : '');
       var matchMode = document.getElementById('mrMode').value;
       var applyExisting = document.getElementById('mrApplyExisting').checked;
       mrBtn.disabled = true;
       // まず件数を数えてから確認する (いきなり大量を変更しない)
-      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, applyToExisting: applyExisting, dryRun: true })
+      post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, labelId: labelId, applyToExisting: applyExisting, dryRun: true })
         .then(function(p) {
           var msg = 'ルール: ' + p.description + '\\n扱い: ' + actionLabel;
-          if (action === 'import_done' && folderId) {
-            msg += '\\n※ 今後のメールは完了扱いで取り込まれます (新着のまま振り分けたい場合はキャンセルして「📁フォルダに入れる」を選んでください)';
+          if (action === 'import_done' && (folderId || labelId)) {
+            msg += '\\n※ 今後のメールは完了扱いで取り込まれます (新着のまま振り分けたい場合はキャンセルして「📁🏷️振り分けだけする」を選んでください)';
           }
           if (applyExisting) {
             msg += p.canApplyToExisting
-              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も' + (action === 'import' ? 'フォルダに入れます' : '完了にします')
+              ? '\\n\\nすでに溜まっている同じメール ' + p.matched + '件 も' + (action === 'import' ? assignDesc.join('・') + 'ようにします' : '完了にします')
               : '\\n\\n⚠️ この条件は既存メールへの一括適用に対応していません (差出人・件名の条件のみ)。今後の取り込みからルールが効きます';
           }
           msg += '\\n\\n作成しますか?';
           if (!confirm(msg)) { mrBtn.disabled = false; return null; }
-          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId,
+          return post('/mail-rule', { conditions: conditions, matchMode: matchMode, action: action, folderId: folderId, labelId: labelId,
             applyToExisting: applyExisting && p.canApplyToExisting });
         })
         .then(function(r) {
@@ -851,6 +887,7 @@ router.get('/inquiries/:id', (req, res) => {
           var done = [];
           if (r.completed) done.push('既存' + r.completed + '件を完了に');
           if (r.foldered) done.push('既存' + r.foldered + '件をフォルダへ');
+          if (r.labeled) done.push('既存' + r.labeled + '件にラベル付与');
           toast('ルールを作成しました' + (done.length ? ' (' + done.join('・') + ')' : ''));
           setTimeout(function(){ location.reload(); }, r.shadowedBy ? 2500 : 1000);
         })
@@ -1167,7 +1204,7 @@ router.post('/api/inquiries/bulk', (req, res) => {
 // 「この条件の全件を選択」一括操作 (2026-08-20 中原さん要望: 新着1,500件超をまとめて完了に。
 // ページの50件では足りない)。一覧と同じフィルタ条件をサーバーで再評価して全件に適用する。
 // dryRun=true は件数だけ返す (画面が確認ダイアログに出す)。上限 FILTER_BULK_MAX 件
-const BULK_FILTER_KEYS = ['view', 'status', 'group', 'channel', 'shop', 'folder', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q'];
+const BULK_FILTER_KEYS = ['view', 'status', 'group', 'channel', 'shop', 'folder', 'label', 'assigned', 'unread', 'attention', 'ai', 'from', 'to', 'q'];
 router.post('/api/inquiries/bulk-by-filter', (req, res) => {
   const b = req.body || {};
   // フィルタは許可キーのみ・文字列化して受ける (listInquiries と同じ解釈になる)
@@ -1310,6 +1347,21 @@ router.post('/api/inquiries/:id/folder', (req, res) => {
   }
 });
 
+// 色付きラベルの割当 (label_id: 数値 or null=ラベルなし)。ステータスには影響しない (2026-08-24)
+router.post('/api/inquiries/:id/label', (req, res) => {
+  const inq = loadInquiry(req, res); if (!inq) return;
+  const raw = (req.body || {}).label_id;
+  if (raw !== null && raw !== undefined && !Number.isInteger(raw)) {
+    return res.status(400).json({ error: '不正なラベル指定です' });
+  }
+  try {
+    const r = setInquiryLabel(inq.id, raw ?? null, actorOf(req));
+    res.json({ ok: true, label: r.label, unchanged: !!r.unchanged });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
+  }
+});
+
 router.post('/api/inquiries/:id/ai-flag', (req, res) => {
   const inq = loadInquiry(req, res); if (!inq) return;
   const v = Number((req.body || {}).ai_needed);
@@ -1378,7 +1430,12 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   if (folderId != null && !Number.isInteger(folderId)) return res.status(400).json({ error: 'フォルダ指定が不正です' });
   const folder = folderId != null ? listFolders().find(f => f.id === folderId) : null;
   if (folderId != null && !folder) return res.status(400).json({ error: '指定のフォルダが存在しません' });
-  if (action === 'import' && !folder) return res.status(400).json({ error: '「フォルダに入れる」はフォルダの指定が必要です' });
+  // ラベル付与 (2026-08-24 中原さん要望: メールディーラーのラベル振り分け相当)
+  const labelId = b.labelId != null && b.labelId !== '' ? Number(b.labelId) : null;
+  if (labelId != null && !Number.isInteger(labelId)) return res.status(400).json({ error: 'ラベル指定が不正です' });
+  const label = labelId != null ? listLabels().find(l => l.id === labelId) : null;
+  if (labelId != null && !label) return res.status(400).json({ error: '指定のラベルが存在しません' });
+  if (action === 'import' && !folder && !label) return res.status(400).json({ error: '「振り分けだけする」はフォルダかラベルの指定が必要です' });
 
   // 条件は画面が組み立てて配列で渡す (メールディーラーと同じく複数条件の組み合わせが可能)。
   // 値の検証は mail-rules.js の validateConditions (フィールド/演算子のallow-list) に委ねる
@@ -1395,9 +1452,10 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
   } catch (e) {
     return res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
   }
+  const assignDesc = [folder ? `📁${folder.name}へ` : null, label ? `🏷️${label.name}` : null].filter(Boolean).join(' + ');
   const actionLabel = action === 'skip' ? '取り込まない'
-    : action === 'import' ? `📁${folder.name}へ`
-      : `完了扱い${folder ? ` + 📁${folder.name}へ` : ''}`;
+    : action === 'import' ? assignDesc
+      : `完了扱い${assignDesc ? ` + ${assignDesc}` : ''}`;
 
   const applyToExisting = b.applyToExisting === true;
   const applicable = canApplyToExisting(conditions);
@@ -1405,24 +1463,24 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
     // 下見: ルールは作らず、既存で何件が対象になるかだけ返す
     if (b.dryRun === true) {
       const matched = applicable
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: false, action, folderId }).matched : 0;
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: false, action, folderId, labelId }).matched : 0;
       return res.json({ ok: true, description, canApplyToExisting: applicable, matched: applyToExisting ? matched : 0 });
     }
     // ルール作成と既存への一括適用は同一トランザクションで (途中で失敗したときに
     // ルールだけ残り、再試行で重複ルールができるのを防ぐ。Codexレビュー反映)
-    const { created, completed, foldered } = getDB().transaction(() => {
+    const { created, completed, foldered, labeled } = getDB().transaction(() => {
       const c = addMailRule({
         name: `${description} → ${actionLabel}`.slice(0, 200),
-        matchMode, conditions, action, priority: 50, folderId,
+        matchMode, conditions, action, priority: 50, folderId, labelId,
       });
       // 既存への一括適用は差出人・件名の条件のみ (Reply-To/To/本文は inquiries に無いため)。
       // 非対応の条件でも「今後の取り込み」からはルールが効く
       const r = (applyToExisting && applicable)
-        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req), action, folderId })
-        : { completed: 0, foldered: 0 };
-      return { created: c, completed: r.completed, foldered: r.foldered };
+        ? applyRuleToExistingMails(conditions, { matchMode, apply: true, actorId: actorOf(req), action, folderId, labelId })
+        : { completed: 0, foldered: 0, labeled: 0 };
+      return { created: c, completed: r.completed, foldered: r.foldered, labeled: r.labeled };
     }).immediate();
-    console.log(`[inquiry-hub] メールルール作成 (${description} → ${actionLabel}) by ${actorOf(req)} / 既存 完了${completed}件・フォルダ${foldered}件`);
+    console.log(`[inquiry-hub] メールルール作成 (${description} → ${actionLabel}) by ${actorOf(req)} / 既存 完了${completed}件・フォルダ${foldered}件・ラベル${labeled}件`);
     // 先勝ち衝突の検知 (2026-08-20 実事故対応): この問い合わせと同じメールを流したとき、
     // 別の既存ルールが先に当たるなら新ルールは効かない。作成は成立させたうえで画面に警告を返す
     // (移行ルール858件と重なりやすい。優先度はここで直させず、メールルールタブへ誘導する)
@@ -1431,7 +1489,7 @@ router.post('/api/inquiries/:id/mail-rule', (req, res) => {
     if (probe && probe.ruleId !== created.id) {
       shadowedBy = { id: probe.ruleId, name: probe.ruleName, priority: probe.priority, action: probe.action };
     }
-    res.json({ ok: true, id: created.id, description, completed, foldered, shadowedBy });
+    res.json({ ok: true, id: created.id, description, completed, foldered, labeled, shadowedBy });
   } catch (e) {
     res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
   }
@@ -1894,6 +1952,8 @@ router.get('/mail-rules', (req, res) => {
   const rules = listMailRules();
   const folders = listFolders();
   const folderNameById = Object.fromEntries(folders.map(f => [f.id, f.name]));
+  const labelsAll = listLabels();
+  const labelById = Object.fromEntries(labelsAll.map(l => [l.id, l]));
   const fmtConds = (r) => {
     let conds;
     try { conds = JSON.parse(r.conditions_json); } catch { return '(解析不能)'; }
@@ -1903,12 +1963,15 @@ router.get('/mail-rules', (req, res) => {
   const trs = rules.map(r => {
     const meta = RULE_ACTION_LABELS[r.action] || { label: r.action, style: '' };
     const folderTag = r.folder_id ? ` <span class="folder-chip">📁${he(folderNameById[r.folder_id] || `#${r.folder_id} (削除済み)`)}</span>` : '';
+    const labelTag = r.label_id ? ' ' + (labelById[r.label_id]
+      ? labelChip(labelById[r.label_id].name, labelById[r.label_id].color)
+      : `<span class="folder-chip">🏷️#${r.label_id} (削除済み)</span>`) : '';
     return `
     <tr data-search="${he((r.name || '') + ' ' + fmtConds(r)).toLowerCase()}"${r.is_active ? '' : ' style="opacity:.5"'}>
       <td class="nowrap" data-label="優先度">${r.priority}</td>
       <td data-full>${he(r.name || '—')}${r.external_key ? '<div class="sub">メールディーラー移行</div>' : '<div class="sub">手動追加</div>'}</td>
       <td style="overflow-wrap:anywhere" data-full data-label="条件">${fmtConds(r)}</td>
-      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span>${folderTag}</td>
+      <td data-label="アクション"><span class="badge" style="${meta.style}">${he(meta.label)}</span>${folderTag}${labelTag}</td>
       <td class="nowrap ops">
         <button onclick="toggleRule(${r.id}, ${r.is_active ? 0 : 1}, this)">${r.is_active ? '無効化' : '有効化'}</button>
         <button onclick="deleteRule(${r.id}, this)">削除</button>
@@ -1952,11 +2015,12 @@ router.get('/mail-rules', (req, res) => {
       </div>`).join('')}
       <div class="row rule-row" style="align-items:center">
         <select id="nMode"><option value="all">すべての条件を満たす (かつ)</option><option value="any">いずれかの条件を満たす (または)</option></select>
-        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option><option value="import">📁フォルダに入れる (新着のまま)</option></select>
+        <select id="nAction"><option value="skip">🗑️取り込まない</option><option value="import_done">✅取込+完了扱い</option><option value="import">📁🏷️振り分けだけする (新着のまま)</option></select>
         <select id="nFolder"><option value="">📁 フォルダ指定なし</option>${folders.map(f => `<option value="${f.id}">📁 ${he(f.name)}</option>`).join('')}</select>
+        <select id="nLabel"><option value="">🏷️ ラベルなし</option>${labelsAll.map(l => `<option value="${l.id}">🏷️ ${he(l.name)}</option>`).join('')}</select>
         <button class="pri" onclick="addRule(this)">追加</button>
       </div>
-      <div class="sub">フォルダは「取り込まない」以外で指定できます (「フォルダに入れる」では必須。取込+完了扱いとの組み合わせも可)</div>
+      <div class="sub">フォルダ・ラベルは「取り込まない」以外で指定できます (「振り分けだけする」ではどちらか必須。取込+完了扱いとの組み合わせも可)。ラベルは <a href="/apps/inquiry-hub/labels">🏷️ラベル管理</a> で作成できます</div>
     </div>
   </div>
   <div class="card">
@@ -2035,6 +2099,7 @@ async function addRule(btn) {
       name: document.getElementById('nName').value, priority: Number(document.getElementById('nPriority').value),
       matchMode: document.getElementById('nMode').value, action: document.getElementById('nAction').value,
       folderId: document.getElementById('nFolder').value || null,
+      labelId: document.getElementById('nLabel').value || null,
       conditions: conditions,
     });
     toast('追加しました'); setTimeout(function(){ location.reload(); }, 700);
@@ -2060,7 +2125,7 @@ document.getElementById('nFolder').addEventListener('change', function() {
 router.post('/api/mail-rules', (req, res) => {
   try {
     const b = req.body || {};
-    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority), folderId: b.folderId }) });
+    res.json({ ok: true, ...addMailRule({ name: b.name, matchMode: b.matchMode, conditions: b.conditions, action: b.action, priority: Number(b.priority), folderId: b.folderId, labelId: b.labelId }) });
   } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
 });
 
@@ -2191,6 +2256,123 @@ router.post('/api/folders/:id(\\d+)/delete', (req, res) => {
     const r = deleteFolder(Number(req.params.id), actorOf(req));
     console.log(`[inquiry-hub] フォルダ削除「${r.name}」 by ${actorOf(req)} / ${r.detached}件を未分類へ`);
     res.json({ ok: true, detached: r.detached });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 🏷️ ラベルの設定 (2026-08-24 中原さん要望。メールディーラーの「ラベルの設定」相当)
+//    色付きの目印。メールルールと組み合わせて条件一致で自動付与できる
+// ═══════════════════════════════════════════════════════════════
+
+router.get('/labels', (req, res) => {
+  const labelsAll = listLabels({ withCounts: true });
+  const swatches = id => LABEL_PALETTE.map(c =>
+    `<button type="button" class="swatch" data-for="${id}" data-color="${c}" style="background:${c}" title="${c}" aria-label="色 ${c}"></button>`).join('');
+  const rows = labelsAll.map(l => `
+    <tr>
+      <td data-full data-label="ラベル">${labelChip(l.name, l.color)}</td>
+      <td data-full data-label="名前 / 色">
+        <div class="row"><input type="text" class="l-name" data-id="${l.id}" value="${he(l.name)}" maxlength="${LABEL_NAME_MAX}">
+        <input type="color" class="l-color" data-id="${l.id}" value="${he(l.color)}" title="色を選ぶ"></div>
+        <div class="swatches">${swatches(l.id)}</div></td>
+      <td data-label="表示順"><input type="number" class="l-order" data-id="${l.id}" value="${l.sort_order}" style="width:80px"></td>
+      <td data-label="件数"><a href="/apps/inquiry-hub?view=all&label=${l.id}">${l.total}件</a></td>
+      <td class="ops">
+        <button class="pri l-save" data-id="${l.id}">保存</button>
+        <button class="l-del" data-id="${l.id}" data-name="${he(l.name)}" data-total="${l.total}">削除</button>
+      </td>
+    </tr>`).join('');
+
+  const body = `
+  <div class="view-hint">🏷️ <b>ラベル</b> — 問い合わせに色付きの目印を付けられます (1件につき1つ)。
+    付けても対応状況は変わりません。<b>📧メールルールと組み合わせると、条件に一致したメールへ取り込み時に自動で付きます</b>。</div>
+  <div class="filters">
+    <input type="text" id="newName" placeholder="新しいラベル名 (例: クレーム)" maxlength="${LABEL_NAME_MAX}" style="min-width:220px">
+    <input type="color" id="newColor" value="${LABEL_PALETTE[0]}" title="色を選ぶ">
+    <button class="pri" id="createBtn">➕ 作成</button>
+  </div>
+  <div class="filters swatches">${LABEL_PALETTE.map(c => `<button type="button" class="swatch" data-for="new" data-color="${c}" style="background:${c}" title="${c}" aria-label="色 ${c}"></button>`).join('')}</div>
+  <div class="card">
+    <table class="cardable">
+      <thead><tr><th>ラベル</th><th>名前 / 色</th><th>表示順</th><th>件数</th><th>操作</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5" class="empty">ラベルはまだありません。上の欄から作成してください</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/labels' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  // 色見本タップで color input に反映 (スマホでカラーピッカーを開かなくても選べる)
+  document.querySelectorAll('.swatch').forEach(function(s) {
+    s.addEventListener('click', function() {
+      var f = s.dataset.for;
+      var input = f === 'new' ? document.getElementById('newColor') : document.querySelector('.l-color[data-id="' + f + '"]');
+      if (input) input.value = s.dataset.color;
+    });
+  });
+  document.getElementById('createBtn').addEventListener('click', function() {
+    var el = document.getElementById('newName'), name = el.value.trim();
+    if (!name) { toast('ラベル名を入力してください'); return; }
+    this.disabled = true;
+    var btn = this;
+    api('', { name: name, color: document.getElementById('newColor').value }).then(function() { location.reload(); })
+      .catch(function(e) { toast('作成失敗: ' + e.message); btn.disabled = false; });
+  });
+  document.getElementById('newName').addEventListener('keydown', function(ev) {
+    if (ev.key === 'Enter') document.getElementById('createBtn').click();
+  });
+  document.querySelectorAll('.l-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var id = b.dataset.id;
+      var name = document.querySelector('.l-name[data-id="' + id + '"]').value.trim();
+      var color = document.querySelector('.l-color[data-id="' + id + '"]').value;
+      var order = Number(document.querySelector('.l-order[data-id="' + id + '"]').value);
+      b.disabled = true;
+      api('/' + id, { name: name, color: color, sortOrder: order }).then(function() { location.reload(); })
+        .catch(function(e) { toast('保存失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.l-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var n = Number(b.dataset.total);
+      if (!confirm('ラベル「' + b.dataset.name + '」を削除しますか?\\n\\n'
+        + (n ? '付いている ' + n + '件 からラベルが外れます。' : '使われていません。')
+        + '\\nこのラベルを付けるメールルールがあれば、ラベル付与だけ解除されます。\\n問い合わせそのものは消えません。')) return;
+      b.disabled = true;
+      api('/' + b.dataset.id + '/delete', {}).then(function(r) {
+        toast('削除しました' + (r.detached ? ' (' + r.detached + '件からラベルを外しました)' : ''));
+        setTimeout(function(){ location.reload(); }, 800);
+      }).catch(function(e) { toast('削除失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — ラベル', 'labels', body, script));
+});
+
+router.post('/api/labels', (req, res) => {
+  try {
+    const b = req.body || {};
+    const l = createLabel(b.name, b.color, actorOf(req));
+    console.log(`[inquiry-hub] ラベル作成「${l.name}」(${l.color}) by ${actorOf(req)}`);
+    res.json({ ok: true, id: l.id, name: l.name, color: l.color });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/labels/:id(\\d+)', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = updateLabel(Number(req.params.id), { name: b.name, color: b.color, sortOrder: b.sortOrder });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/labels/:id(\\d+)/delete', (req, res) => {
+  try {
+    const r = deleteLabel(Number(req.params.id), actorOf(req));
+    console.log(`[inquiry-hub] ラベル削除「${r.name}」 by ${actorOf(req)} / ${r.detached}件から解除・ルール${r.rulesDetached}件から解除`);
+    res.json({ ok: true, detached: r.detached, rulesDetached: r.rulesDetached });
   } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
 });
 
@@ -2571,6 +2753,9 @@ figure.att-img.att-err .att-fail { display: block; }
 .att-dl { margin-left: 6px; white-space: nowrap; }
 /* 一覧のフォルダ表示 */
 .folder-chip { background: #eef2ff; color: #3730a3; border-radius: 6px; padding: 1px 6px; }
+.lbl { display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px; font-weight: 600; white-space: nowrap; vertical-align: 1px; }
+.swatches { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.swatch { width: 22px; height: 22px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); cursor: pointer; padding: 0; }
 .panel { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 12px; }
 .panel h3 { margin: 0 0 10px; font-size: 14px; }
 .panel dl { margin: 0; display: grid; grid-template-columns: 90px 1fr; gap: 6px 8px; }
@@ -2786,6 +2971,7 @@ function pageShell(title, active, body, script, opts = {}) {
     <div class="nav-group">
       ${folderItems}
       ${navItem('/apps/inquiry-hub/folders', '⚙️', 'フォルダを作る・編集', 'folders', 0)}
+      ${navItem('/apps/inquiry-hub/labels', '🏷️', 'ラベルを作る・編集', 'labels', 0)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">

@@ -233,9 +233,9 @@ console.log('5. ルール作成API');
   const html = await (await fetch(`${base2}/inquiries/${mailInq}`)).text();
   check('メール詳細に「今後の自動処理」パネル (複合条件3行+かつ/または)', html.includes('今後の自動処理')
     && html.includes('id="mrField1"') && html.includes('id="mrField3"') && html.includes('id="mrMode"'));
-  check('フォルダ選択で扱いをimportへ自動切替するJSが載る (2026-08-20 実事故対応)',
-    html.includes("getElementById('mrFolder').addEventListener")
-    && html.includes('フォルダに入れる (新着のまま)」にしてください'));
+  check('フォルダ・ラベル選択で扱いをimportへ自動切替するJSが載る (2026-08-20 実事故対応)',
+    html.includes("['mrFolder', 'mrLabel'].forEach")
+    && html.includes('振り分けだけする (新着のまま)」にしてください'));
   // 🔎 NEで受注検索 (2026-08-20 スタッフ要望): 注文番号が無い問い合わせにアドレスコピー+NE検索画面の導線
   check('メール詳細に「NEで受注検索」導線 (アドレスをdata属性で持つ)',
     html.includes('id="neMailSearch"') && html.includes('data-mail="customer@gmail.com"'));
@@ -332,7 +332,7 @@ console.log('6. フォルダ自動振り分け');
   check('importルール作成 (フォルダ付き)', Number.isInteger(Number(okRule.id)));
   let e1 = null;
   try { addMailRule({ matchMode: 'all', action: 'import', conditions: [{ field: 'from', op: 'contains', value: 'a' }] }); } catch (e) { e1 = e; }
-  check('import + フォルダ無しはthrow', e1 !== null && /フォルダの指定が必要/.test(e1.message));
+  check('import + フォルダ・ラベル無しはthrow', e1 !== null && /フォルダかラベルの指定が必要/.test(e1.message));
   let e2 = null;
   try { addMailRule({ matchMode: 'all', action: 'skip', folderId, conditions: [{ field: 'from', op: 'contains', value: 'a' }] }); } catch (e) { e2 = e; }
   check('skip + フォルダ指定はthrow', e2 !== null);

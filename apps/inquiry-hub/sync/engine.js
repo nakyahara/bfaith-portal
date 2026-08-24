@@ -103,18 +103,20 @@ function ingestInquiry(db, shop, item, nowIso) {
   if (!inq) {
     // initialInternalStatus: 'done' のみ (メールルール import_done = 自動配信等を取り込みつつ完了扱い)。
     // initialFolderId: メールルールのフォルダ振り分け (2026-08-17)。
-    // どちらも適用は新規作成時のみで、以後の顧客新着では通常どおり done → open に再オープンされる
+    // initialLabelId: メールルールのラベル付与 (2026-08-24)。
+    // いずれも適用は新規作成時のみで、以後の顧客新着では通常どおり done → open に再オープンされる
     const initDone = item.initialInternalStatus === 'done';
     const initFolderId = Number.isInteger(item.initialFolderId) ? item.initialFolderId : null;
+    const initLabelId = Number.isInteger(item.initialLabelId) ? item.initialLabelId : null;
     const r = db.prepare(`INSERT INTO inquiries (
         channel_type, shop_id, external_inquiry_id, customer_name, customer_identifier, subject,
-        internal_status, is_unread, completed_at, folder_id,
+        internal_status, is_unread, completed_at, folder_id, label_id,
         external_status, external_is_read, last_external_synced_at,
         order_number, product_code, product_name, received_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(shop.channel_type, shop.id, item.externalInquiryId,
         item.customerName ?? null, item.customerIdentifier ?? null, item.subject ?? null,
-        initDone ? 'done' : 'open', initDone ? 0 : 1, initDone ? nowIso : null, initFolderId,
+        initDone ? 'done' : 'open', initDone ? 0 : 1, initDone ? nowIso : null, initFolderId, initLabelId,
         extStatus, extRead, nowIso,
         item.orderNumber ?? null, item.productCode ?? null, item.productName ?? null,
         toUtcIso(item.receivedAt));

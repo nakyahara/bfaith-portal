@@ -61,8 +61,8 @@ function condMatches(c, msg) {
 function parseRuleSafe(r) {
   if (!RULE_ACTIONS.includes(r.action)) return null;
   if (!['all', 'any'].includes(r.match_mode)) return null;
-  // 通常取り込み (import) はフォルダ指定とセットでしか意味を持たない。フォルダ無しは壊れたルール扱い
-  if (r.action === 'import' && !r.folder_id) return null;
+  // 通常取り込み (import) はフォルダかラベルの指定とセットでしか意味を持たない。両方無しは壊れたルール扱い
+  if (r.action === 'import' && !r.folder_id && !r.label_id) return null;
   let conditions;
   try { conditions = JSON.parse(r.conditions_json); } catch { return null; }
   if (!Array.isArray(conditions) || conditions.length === 0 || conditions.length > MAX_CONDITIONS) return null;
@@ -83,7 +83,7 @@ export function evaluateMailRules(msg) {
     const hit = r.match_mode === 'any'
       ? conditions.some(c => condMatches(c, msg))
       : conditions.every(c => condMatches(c, msg));
-    if (hit) return { action: r.action, folderId: r.folder_id ?? null, ruleId: r.id, ruleName: r.name || null, priority: r.priority };
+    if (hit) return { action: r.action, folderId: r.folder_id ?? null, labelId: r.label_id ?? null, ruleId: r.id, ruleName: r.name || null, priority: r.priority };
   }
   return null;
 }
@@ -94,7 +94,7 @@ export function listMailRules() {
   return getDB().prepare('SELECT * FROM mail_rules ORDER BY priority ASC, id ASC').all();
 }
 
-export function addMailRule({ name, matchMode = 'all', conditions, action, priority = 100, folderId = null }) {
+export function addMailRule({ name, matchMode = 'all', conditions, action, priority = 100, folderId = null, labelId = null }) {
   if (!RULE_ACTIONS.includes(action)) throw new Error(`不正なアクション: ${action}`);
   if (!['all', 'any'].includes(matchMode)) throw new Error(`不正なmatch_mode: ${matchMode}`);
   if (!Number.isInteger(priority) || priority < 0 || priority > 100000) throw new Error('優先度は0〜100000の整数で指定してください');
@@ -108,9 +108,18 @@ export function addMailRule({ name, matchMode = 'all', conditions, action, prior
     if (!f || !f.is_active) throw new Error('指定のフォルダが存在しません (削除済みの可能性があります)');
     if (action === 'skip') throw new Error('「取り込まない」にフォルダは指定できません');
   }
-  if (action === 'import' && fid == null) throw new Error('「フォルダに入れる」はフォルダの指定が必要です');
-  const r = getDB().prepare(`INSERT INTO mail_rules (priority, name, match_mode, conditions_json, action, folder_id)
-    VALUES (?,?,?,?,?,?)`).run(priority, String(name || '').slice(0, 200) || null, matchMode, JSON.stringify(conditions), action, fid);
+  // ラベル付与 (2026-08-24 メールディーラーのラベル振り分け相当): skip 以外で有効
+  let lid = null;
+  if (labelId != null && labelId !== '') {
+    lid = Number(labelId);
+    if (!Number.isInteger(lid)) throw new Error('ラベル指定が不正です');
+    const l = getDB().prepare('SELECT id, is_active FROM inquiry_labels WHERE id = ?').get(lid);
+    if (!l || !l.is_active) throw new Error('指定のラベルが存在しません (削除済みの可能性があります)');
+    if (action === 'skip') throw new Error('「取り込まない」にラベルは指定できません');
+  }
+  if (action === 'import' && fid == null && lid == null) throw new Error('「取り込んで振り分ける」はフォルダかラベルの指定が必要です');
+  const r = getDB().prepare(`INSERT INTO mail_rules (priority, name, match_mode, conditions_json, action, folder_id, label_id)
+    VALUES (?,?,?,?,?,?,?)`).run(priority, String(name || '').slice(0, 200) || null, matchMode, JSON.stringify(conditions), action, fid, lid);
   return { id: r.lastInsertRowid };
 }
 
@@ -119,19 +128,22 @@ export function addMailRule({ name, matchMode = 'all', conditions, action, prior
  * ルールは本来「次回の取込」からしか効かないが、自動配信メールが既に大量に溜まっている
  * ため、同じ条件の既存分をまとめて片付けられるようにする。
  * ⚠️ 削除はしない。アクションにより:
- *   - skip / import_done → 完了にする (受信トレイから外れるが履歴は残る)。folderId 指定があれば同時にフォルダへ
- *   - import (+folderId) → フォルダに入れるだけ (ステータスは変えない = 受信トレイに残る)
- * 対象はメールチャネルのみ。完了化は未完了のものだけ、フォルダ入れは「まだそのフォルダに無いもの」だけ。
+ *   - skip / import_done → 完了にする (受信トレイから外れるが履歴は残る)。folderId/labelId 指定があれば同時に適用
+ *   - import (+folderId/labelId) → フォルダ・ラベルを付けるだけ (ステータスは変えない = 受信トレイに残る)
+ * 対象はメールチャネルのみ。完了化は未完了のものだけ、フォルダ・ラベルは「まだ付いていないもの」だけ。
  *
- * @returns {{ matched: number, completed: number, foldered: number }}
+ * @returns {{ matched: number, completed: number, foldered: number, labeled: number }}
  */
-export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply = false, actorId = 'portal', action = 'import_done', folderId = null } = {}) {
+export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply = false, actorId = 'portal', action = 'import_done', folderId = null, labelId = null } = {}) {
   validateConditions(conditions);
   if (!RULE_ACTIONS.includes(action)) throw new Error(`不正なアクション: ${action}`);
   const fid = folderId != null && folderId !== '' ? Number(folderId) : null;
   if (fid != null && !Number.isInteger(fid)) throw new Error('フォルダ指定が不正です');
-  if (action === 'import' && fid == null) throw new Error('「フォルダに入れる」はフォルダの指定が必要です');
+  const lid = labelId != null && labelId !== '' ? Number(labelId) : null;
+  if (lid != null && !Number.isInteger(lid)) throw new Error('ラベル指定が不正です');
+  if (action === 'import' && fid == null && lid == null) throw new Error('「取り込んで振り分ける」はフォルダかラベルの指定が必要です');
   if (action === 'skip' && fid != null) throw new Error('「取り込まない」にフォルダは指定できません');
+  if (action === 'skip' && lid != null) throw new Error('「取り込まない」にラベルは指定できません');
   if (!canApplyToExisting(conditions)) {
     // Reply-To/To/本文は inquiries に保存しておらず正確に照合できない。
     // 差出人で代用すると取りこぼし・過剰完了のどちらも起こるため、明示的に断る
@@ -140,6 +152,8 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
   const db = getDB();
   const folderName = fid != null
     ? (db.prepare('SELECT name FROM inquiry_folders WHERE id = ?').get(fid)?.name ?? `#${fid}`) : null;
+  const labelName = lid != null
+    ? (db.prepare('SELECT name FROM inquiry_labels WHERE id = ?').get(lid)?.name ?? `#${lid}`) : null;
   // inquiries が持っているのは差出人 (customer_identifier) と件名だけ
   const clauses = [], params = [];
   for (const c of conditions) {
@@ -156,22 +170,33 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
     }
   }
   const completing = action !== 'import';
-  // 完了化は未完了のみ / フォルダ入れのみは「まだそのフォルダに無いもの」のみ (何度押しても冪等)
-  const extra = completing ? `i.internal_status != 'done'` : `(i.folder_id IS NULL OR i.folder_id != ?)`;
+  // 完了化は未完了のみ / フォルダ・ラベルは「まだ付いていないもの」のみ (何度押しても冪等)
+  const needParams = [];
+  let extra;
+  if (completing) {
+    extra = `i.internal_status != 'done'`;
+  } else {
+    const parts = [];
+    if (fid != null) { parts.push(`(i.folder_id IS NULL OR i.folder_id != ?)`); needParams.push(fid); }
+    if (lid != null) { parts.push(`(i.label_id IS NULL OR i.label_id != ?)`); needParams.push(lid); }
+    extra = `(${parts.join(' OR ')})`;
+  }
   const where = `i.channel_type = 'email' AND i.is_archived = 0 AND ${extra}
     AND (${clauses.join(matchMode === 'any' ? ' OR ' : ' AND ')})`;
-  const allParams = completing ? params : [fid, ...params];
+  const allParams = [...needParams, ...params];
   const matched = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where}`).get(...allParams).c;
-  if (!apply) return { matched, completed: 0, foldered: 0 };
+  if (!apply) return { matched, completed: 0, foldered: 0, labeled: 0 };
 
   const rows = db.prepare(`SELECT i.id FROM inquiries i WHERE ${where}`).all(...allParams);
-  let completed = 0, foldered = 0;
+  let completed = 0, foldered = 0, labeled = 0;
   const tx = db.transaction(() => {
     const updDone = db.prepare(`UPDATE inquiries SET internal_status = 'done', is_unread = 0,
       completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%SZ','now')),
       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ? AND internal_status != 'done'`);
     const updFolder = fid != null ? db.prepare(`UPDATE inquiries SET folder_id = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ? AND (folder_id IS NULL OR folder_id != ?)`) : null;
+    const updLabel = lid != null ? db.prepare(`UPDATE inquiries SET label_id = ?,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ? AND (label_id IS NULL OR label_id != ?)`) : null;
     for (const r of rows) {
       if (completing && updDone.run(r.id).changes > 0) {
         completed++;
@@ -183,10 +208,15 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
         logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'folder_change',
           after: { folder: folderName, reason: 'メールルールの一括適用' } });
       }
+      if (updLabel && updLabel.run(lid, r.id, lid).changes > 0) {
+        labeled++;
+        logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'label_change',
+          after: { label: labelName, reason: 'メールルールの一括適用' } });
+      }
     }
   });
   tx.immediate();
-  return { matched, completed, foldered };
+  return { matched, completed, foldered, labeled };
 }
 /** LIKE用エスケープ (小文字化込み。templates.js の likeEsc と同等) */
 const likeEscLocal = s => String(s).toLowerCase().replace(/[\\%_]/g, c => '\\' + c);
