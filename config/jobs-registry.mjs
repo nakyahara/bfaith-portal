@@ -61,6 +61,8 @@ export const JOBS_REGISTRY = [
     owner: '中原さん',
     purpose: 'Drive出荷_noの納品書CSV (納品書_出荷_XX.csv) を2分間隔で自動取込 (梱包支援アプリの入力)。'
       + 'ピッキング突合ok+出荷作業日=今日のみ自動確定し、mismatch/前日ファイルは台帳に残して手動承認へ回す。'
+      + '④配送変更/再印刷の通知再送に加え、梱包資材の変更通知 outbox (pk_pack_material_events・undo猶予後に'
+      + 'GChat送信・at-least-once) と観測ログ180日purgeもこのループの1ステップ (2026-08-24 PR#895)。'
       + 'PickingServer内の常駐ループで、独立したスケジュールタスクではない',
     where: 'miniPC PickingServer (apps/packing/drive-sync.js startPackingDrivePoller。env PACKING_ENABLED)',
     schedule: '常駐 (120秒間隔・env PACKING_POLL_INTERVAL_SEC。生存 ping は1時間に1回へ間引き)',
