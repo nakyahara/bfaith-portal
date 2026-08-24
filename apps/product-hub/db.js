@@ -149,6 +149,14 @@ export const STEP_SEEDS = [
   // バッジを付けて区別する (ボードでは同じラベル同士が 1 列にまとまる)
   // image_stage はボードで TOP/詳細 の同じ段階を 1 列にまとめるための**安定キー**。
   // ラベルや sort でまとめると、管理画面で片方だけ改名・並べ替えした瞬間に列が分裂する (Codex設計相談)
+  // 撮影依頼中 (2026-08-25 中原さん要望)。**商品詳細画像だけ**の段階 — 外部カメラマンへの
+  // 撮影依頼は商品詳細画像のみの運用のため、TOP側には作らない (ボードの列には詳細カードだけが載る)。
+  // 撮影しない商品 (メーカー素材を使う等) は工程パネルで「対象外」にするか、ボードで先の列へ D&D
+  {
+    code: 'img_shoot_detail', label: '撮影依頼中', track: 'image', image_kind: 'detail', image_stage: 'shoot',
+    role_code: 'image', sort: 15, stall_days: 7,
+    description: '外部カメラマンへ撮影を依頼中 (商品の発送〜撮影データの納品待ち)。撮影しない商品は「対象外」にする',
+  },
   ...['top', 'detail'].flatMap((kind) => [
     {
       code: `img_request_${kind}`, label: '画像制作の依頼', track: 'image', image_kind: kind, image_stage: 'request',

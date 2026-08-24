@@ -297,7 +297,7 @@ function defaultAssigneeByRole(db) {
  */
 export function ensureProgress(db, draftId) {
   const id = Number(draftId);
-  const steps = db.prepare('SELECT code, track, image_kind, role_code FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
+  const steps = db.prepare('SELECT code, track, image_kind, role_code, sort FROM ph_steps WHERE active = 1 ORDER BY track, sort').all();
   if (steps.length === 0) return 0;
   const existing = new Set(
     db.prepare('SELECT step_code FROM draft_step_progress WHERE draft_id = ?').all(id).map((r) => r.step_code)
@@ -345,6 +345,21 @@ export function ensureProgress(db, draftId) {
       'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
     ).get(id);
     if (listed) for (const s of missing) if (s.track === 'image') doneSet.add(s.code);
+    // 途中に挿した画像工程 (例: 撮影依頼中 2026-08-25) は、その系列 (TOP/詳細) で
+    // **先の工程に着手済み** (doing/done/skip) なら done で入れる (Codex R1 high:
+    // todo で入れると currentOf が新工程を現在扱いし、ボード・出品ゲート・滞留判定が
+    // 進行中のドラフトごと過去段階へ巻き戻る)。先が全部 todo なら従来どおり todo で入れる
+    const existingStates = db.prepare(`
+      SELECT p.state, s.sort, s.track, s.image_kind FROM draft_step_progress p
+      JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
+      WHERE p.draft_id = ? AND s.track = 'image'
+    `).all(id);
+    const seriesOf = (s) => (s.image_kind === 'detail' ? 'detail' : 'top');
+    for (const m of missing) {
+      if (m.track !== 'image' || doneSet.has(m.code)) continue;
+      const started = existingStates.some((e) => seriesOf(e) === seriesOf(m) && e.sort > m.sort && e.state !== 'todo');
+      if (started) doneSet.add(m.code);
+    }
   }
 
   const byRole = defaultAssigneeByRole(db);
@@ -938,7 +953,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   let columns;
   if (view === 'image') {
     const byStage = new Map();
-    for (const s of steps.filter((x) => x.track === 'image')) {
+    // 種別絞り込み時は、その系列に存在する工程だけから列を作る (Codex R1 medium:
+    // 片側にしか無い段階 (例: 撮影依頼中=詳細のみ) の列が kind=top でも出て、
+    // 落とせない空列になる)。区分は splitImageRows と同じ「detail 以外は TOP」
+    for (const s of steps.filter((x) => x.track === 'image'
+        && (!kindSafe || (kindSafe === 'detail' ? x.image_kind === 'detail' : x.image_kind !== 'detail')))) {
       const key = s.image_stage || `code:${s.code}`;
       if (!byStage.has(key)) {
         byStage.set(key, { key, label: s.label, sort: s.sort, role_code: s.role_code, stall_days: s.stall_days, stepCodes: [], cards: [] });
