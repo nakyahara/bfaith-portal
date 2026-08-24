@@ -2665,6 +2665,95 @@ let wfSetParentId = null;
   check('手動遷移の廃止: 導出ステータスへの直接遷移は 400', r.status === 400
     && String(r.json.error || '').includes('自動で決まります'), JSON.stringify(r.json));
 
+  // ─── かんばん D&D 移動 + TOP画像の重要度 (2026-08-24) ───
+  const ADMIN2 = { isAdmin: true };
+  const statusOf2 = (id) => db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id).status;
+  const stepOf = (id, code) => db.prepare(
+    'SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.state;
+  const idM = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+    VALUES ('DRV-MOVE', 'D&Dテスト', 'https://example.com/item', 'smoke')
+  `).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'drv-move-img')`).run(idM);
+
+  // 前方移動: 基本情報の列 → 商品説明確認の列 (basic_info と ai_generate をまとめて done に)
+  wfpEarly.moveBoardCard(idM, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'smoke', ADMIN2);
+  check('D&D 前方: 途中の工程がまとめて done になり status も導出される',
+    stepOf(idM, 'basic_info') === 'done' && stepOf(idM, 'ai_generate') === 'done' && statusOf2(idM) === 'review');
+
+  // CAS: 掴んだ時点の現在工程がズレていたら 409
+  let dndCas = null;
+  try { wfpEarly.moveBoardCard(idM, { view: 'main', to: 'title_approve', expectedCurrent: 'basic_info' }, 'smoke', ADMIN2); } catch (e) { dndCas = e; }
+  check('D&D CAS: ボードが古ければ 409', dndCas?.status === 409, dndCas?.message || '例外が出ていない');
+
+  // 後方移動: AI情報入力待ちの列へ戻す = ai_generate を開け直す → ready_for_ai (キュー再入)
+  wfpEarly.moveBoardCard(idM, { view: 'main', to: 'ai_generate', expectedCurrent: 'desc_review' }, 'smoke', ADMIN2);
+  check('D&D 後方: 工程が開き直り status が巻き戻る',
+    stepOf(idM, 'ai_generate') === 'todo' && statusOf2(idM) === 'ready_for_ai');
+
+  // 完了列 (本流) はモール未決着なら listing の完了チェックで止まる (全体ロールバック)
+  wfpEarly.moveBoardCard(idM, { view: 'main', to: 'set_review', expectedCurrent: 'ai_generate' }, 'smoke', ADMIN2);
+  let dndDone = null;
+  try { wfpEarly.moveBoardCard(idM, { view: 'main', to: 'done', expectedCurrent: 'set_review' }, 'smoke', ADMIN2); } catch (e) { dndDone = e; }
+  check('D&D 完了列 (本流): モール未決着なら 400 で全体ロールバック',
+    dndDone?.status === 400 && stepOf(idM, 'set_review') !== 'done', dndDone?.message || '例外が出ていない');
+
+  // ゲート: 材料の無い商品は基本情報の列を跨げない
+  const idM2 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-MOVE2', '材料なし', 'smoke')
+  `).run().lastInsertRowid);
+  let dndGate = null;
+  try { wfpEarly.moveBoardCard(idM2, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'smoke', ADMIN2); } catch (e) { dndGate = e; }
+  check('D&D ゲート: 材料なしでは基本情報を跨げない (400)', dndGate?.status === 400, dndGate?.message || '例外が出ていない');
+
+  // 権限: 一般ユーザー (未紐付け) はシステム工程 (AI待ち) を跨げない
+  let dndPerm = null;
+  try { wfpEarly.moveBoardCard(idM, { view: 'main', to: 'title_approve', expectedCurrent: 'set_review' }, 'x@b-faith.biz', { isAdmin: false, actorStaffId: null }); } catch (e) { dndPerm = e; }
+  check('D&D 権限: 後方移動でも他所の工程は権限チェックが効く', dndPerm?.status === 403 || dndPerm?.status === 400, dndPerm?.message || '例外が出ていない');
+
+  // 画像ビュー: TOP を 依頼 → 登録 へ (依頼・制作が done)、完了列で承認まで閉じる。
+  // idM は画像ありのため初回 seed で TOP側が done 済み (仕様) → 画像なしの別ドラフトで検証する
+  const idM3 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-MOVE3', '画像D&D', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idM3);
+  wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'register', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN2);
+  check('D&D 画像ビュー前方: 段階キーで移動できる',
+    stepOf(idM3, 'img_request_top') === 'done' && stepOf(idM3, 'img_production_top') === 'done'
+    && stepOf(idM3, 'img_register_top') === 'todo');
+  wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'done', expectedCurrent: 'img_register_top' }, 'smoke', ADMIN2);
+  check('D&D 画像ビュー完了列: 残り (登録・承認) がまとめて done',
+    stepOf(idM3, 'img_register_top') === 'done' && stepOf(idM3, 'img_approve_top') === 'done');
+  // 完了列からの差し戻し (Codex R1 medium): expectedCurrent=null が「全工程決着」の CAS 値
+  wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'approve', expectedCurrent: null }, 'smoke', ADMIN2);
+  check('D&D 完了列から差し戻し: 承認が開き直る', stepOf(idM3, 'img_approve_top') === 'todo');
+  let doneCas = null;
+  try { wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'production', expectedCurrent: null }, 'smoke', ADMIN2); } catch (e) { doneCas = e; }
+  check('D&D 完了カードの CAS: もう完了でなければ 409', doneCas?.status === 409, doneCas?.message || '例外が出ていない');
+
+  // 片方の種別だけ完了した商品がボードから消えない (Codex R2 medium):
+  // TOP だけ完了 → TOP カードは完了列・詳細カードは依頼の列に居る
+  const idM4 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-MOVE4', '片側完了', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idM4);
+  wfpEarly.moveBoardCard(idM4, { view: 'image', kind: 'top', to: 'done', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN2);
+  const ib = wfpEarly.boardData(db, { view: 'image' });
+  check('画像ビュー: TOPだけ完了 → 完了列に TOP カードが出る (差し戻し可能)',
+    ib.doneCards.some((c) => c.id === idM4 && c.kind === 'top'));
+  check('画像ビュー: 同じ商品の詳細カードは依頼の列に残る',
+    ib.columns.find((c) => c.key === 'request')?.cards.some((c2) => c2.id === idM4 && c2.kind === 'detail') === true);
+
+  // TOP画像の重要度 (HTTP)
+  r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
+  check('重要度: 保存できる', r.status === 200
+    && db.prepare('SELECT image_priority FROM product_drafts WHERE id = ?').get(idM).image_priority === '自社商品（重要度：高）');
+  r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '存在しない値' });
+  check('重要度: 不正な値は 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '' });
+  check('重要度: 空でクリアできる', r.status === 200
+    && db.prepare('SELECT image_priority FROM product_drafts WHERE id = ?').get(idM).image_priority == null);
+
   server.close();
 }
 
@@ -3403,6 +3492,7 @@ for (const [name, file, data] of renders) {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
+        imagePriorities: dbmod.IMAGE_PRIORITIES,
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),

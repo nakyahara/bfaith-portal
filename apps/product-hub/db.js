@@ -26,6 +26,19 @@ export const DRAFT_STATUSES = [
  *   notion_import … Notion 既存カードの取り込み。**Notion が正** → ポータルから書き戻さない
  * 中原さん方針 (2026-07-25): 既存カードは Notion 側で運用、新商品はアプリ、検証用に一部だけ取り込む。
  */
+/**
+ * TOP画像の重要度 (どれぐらい力を入れて作るかの目安。2026-08-24 中原さん指定・Notion の選択肢を踏襲)。
+ * value はそのまま DB (product_drafts.image_priority) に保存する。色は Notion のタグ風
+ */
+export const IMAGE_PRIORITIES = [
+  { value: '仕入れ商品（重要度：激低_白抜）', bg: '#ffe4e0', fg: '#9f1239' },
+  { value: '仕入商品（重要度：低）', bg: '#fdecec', fg: '#b91c1c' },
+  { value: '仕入商品（重要度：高）', bg: '#fce7f3', fg: '#be185d' },
+  { value: '取扱先限定商品（重要度：高）', bg: '#f3f0d1', fg: '#6d6413' },
+  { value: '自社商品（重要度：高）', bg: '#dbeafe', fg: '#1d4ed8' },
+];
+export const IMAGE_PRIORITY_VALUES = new Set(IMAGE_PRIORITIES.map((p) => p.value));
+
 export const DRAFT_SOURCES = ['portal', 'notion_import'];
 export const SOURCE_PORTAL = 'portal';
 export const SOURCE_NOTION_IMPORT = 'notion_import';
@@ -880,6 +893,15 @@ export function initProductHubDB() {
   if (!draftCols2.has('detail_images_excluded')) {
     try {
       db.exec('ALTER TABLE product_drafts ADD COLUMN detail_images_excluded INTEGER NOT NULL DEFAULT 0 CHECK (detail_images_excluded IN (0, 1))');
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
+  }
+  // TOP画像をどれぐらい力を入れて作るかの目安 (2026-08-24 中原さん。Notion 画像情報DB の分類を移植)。
+  // 自社商品限定の draft_image_production.importance_tier (枚数の目安) とは別物 — こちらは仕入商品にも付ける
+  if (!draftCols2.has('image_priority')) {
+    try {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN image_priority TEXT');
     } catch (e) {
       if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
     }
