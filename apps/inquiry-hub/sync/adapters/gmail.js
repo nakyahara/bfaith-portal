@@ -59,6 +59,13 @@ const headerOf = (payload, name) => {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/** 楽天あんしんメルアドサービスのマスクアドレス (…@pc.fw.rakuten.ne.jp / @mb.fw.rakuten.ne.jp 等)。
+ * 楽天側の中継サーバーは「店舗としてRMSに登録済みの送信元アドレス」以外からのメールを
+ * `552 5.2.0 sender rejected` で拒否する (2026-08-24 実測: From が d.nakahara@ に
+ * 置き換わった返信がバウンスした)。宛先がこれに該当し、かつ実効Fromの置き換わりが
+ * 既知のときは送信前に止める (sendReply 参照) */
+export const RAKUTEN_MASKED_RE = /@(?:[a-z0-9-]+\.)?fw\.rakuten\.ne\.jp$/i;
+
 /**
  * From ヘッダから実効差出人を解決する (受信同期の顧客判定と送信時の宛先フォールバックで共用)。
  * 厳格DMARCの送信元 (Amazon等) は Googleグループが From を
@@ -204,7 +211,8 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
  *   ruleEvaluator?: メールルール評価の差し替え (テスト用)
  *   sendMode?: 'dryrun' (既定) | 'live' — 返信送信 (sendReply)。dryrunは組み立てとログのみで実送信しない
  *   fromAddress?: 送信Fromアドレス (既定 info@b-faith.biz。d.nakahara側でinfo@のsend-asエイリアスが
- *                 未設定だとGmailが認証ユーザーのアドレスに置き換える → live初回で実Fromを確認すること)
+ *                 未設定だとGmailが認証ユーザーのアドレスに置き換える → live送信のたびに読み戻しで
+ *                 実Fromを検証し、置き換わっていたら warning を返す。sendReply 参照)
  *   fromName?: Fromの表示名 (既定 '雑貨イズム（B-Faith株式会社）' — メールディーラーのFrom表示名と同一)
  */
 export function createGmailAdapter(cfg = {}) {
@@ -222,6 +230,12 @@ export function createGmailAdapter(cfg = {}) {
   const fromAddress = cfg.fromAddress ?? 'info@b-faith.biz';
   const fromName = cfg.fromName ?? '雑貨イズム（B-Faith株式会社）';
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // live送信後にSentメッセージを読み戻して実測したFrom (送信元の置き換わり検出)。
+  // fromAddress の send-as エイリアスが未設定だと Gmail は From を認証ユーザーの
+  // アドレスに黙って置き換える — 通常宛先には届くが、楽天マスクアドレス宛は拒否される。
+  // null=未観測 / 一致していれば fromAddress / 置き換わっていれば実測アドレス
+  let observedActualFrom = null;
 
   let tokenCache = { token: null, exp: 0 };
   async function accessToken() {
@@ -384,6 +398,14 @@ export function createGmailAdapter(cfg = {}) {
       }
       headerSafe('宛先', to);
 
+      // 楽天マスクアドレス宛ガード: 実効Fromの置き換わりが既知なら送るだけ無駄 (100%バウンス)
+      // なので未送信で止め、直し方をジョブ履歴に出す。初回は送信後の読み戻し検証で検出する
+      if (RAKUTEN_MASKED_RE.test(to) && observedActualFrom && observedActualFrom !== fromAddress.toLowerCase()) {
+        throw new SendRejectedError(`楽天マスクアドレス宛は送信元 ${fromAddress} 以外拒否されますが、`
+          + `実際の送信元が ${observedActualFrom} になっています (未送信)。`
+          + `Gmail (${observedActualFrom}) の設定「他のメールアドレスからメールを送信」に ${fromAddress} を追加してから再送してください`);
+      }
+
       const commonHeaders = [
         `From: ${mimeWord(fromName)} <${headerSafe('From', fromAddress)}>`,
         `To: ${to}`,
@@ -430,7 +452,27 @@ export function createGmailAdapter(cfg = {}) {
       const sent = await apiPost('messages/send', { raw, threadId }, 'send');
       if (!sent?.id) throw new Error('Gmail送信レスポンスに id がありません — 結果不明');
       console.log(`[gmail-send] 送信完了 To=${to} messageId=${sent.id}`);
-      return { externalReplyId: sent.id };
+
+      // From実測検証 (2026-08-24 バウンス実測の再発防止): 送ったメッセージを読み戻し、
+      // Gmail が From を置き換えていないか確認する。置き換わっていたら warning を返して
+      // ジョブ履歴に表示 (送信自体は完了しているので throw はしない。検証失敗も fail-soft)
+      let warning = null;
+      try {
+        const m = await apiGet(`messages/${encodeURIComponent(sent.id)}?format=metadata&metadataHeaders=From`, 'send-verify-from');
+        const actual = parseFromHeader(headerOf(m?.payload, 'From')).mailbox;
+        if (actual) {
+          observedActualFrom = actual;
+          if (actual !== fromAddress.toLowerCase()) {
+            warning = `⚠️実際の送信元が ${actual} でした (設定は ${fromAddress})。`
+              + `Gmailの「他のメールアドレスからメールを送信」に ${fromAddress} を追加してください`
+              + (RAKUTEN_MASKED_RE.test(to) ? '。楽天マスクアドレス宛のため不達 (バウンス) になります — 設定後に再送が必要です' : '');
+            console.error(`[gmail-send] ${warning} (messageId=${sent.id})`);
+          }
+        }
+      } catch (e) {
+        console.warn(`[gmail-send] From実測検証をスキップ (送信は完了): ${String(e?.message || e).slice(0, 120)}`);
+      }
+      return warning ? { externalReplyId: sent.id, warning } : { externalReplyId: sent.id };
     },
 
     /**
