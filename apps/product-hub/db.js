@@ -1013,8 +1013,9 @@ export function gateReasons(db, draft) {
       reasons.push('AIが参照できるURLがありません (公式ページURL / 参考URL / Amazon URL のどれか1つ)');
     }
   }
-  const imgCount = db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(draft.id).c;
-  if (imgCount === 0) reasons.push('商品画像 (Driveリンク) が1枚もありません');
+  // 商品画像の有無はここでは見ない (2026-08-24 中原さん: 画像は画像トラックで並行して作る運用で、
+  // 白抜きだけの状態で登録を進めることもある。AIの説明文生成に画像は不要)。
+  // 楽天出品側のチェック (buildItemPayload の _top 必須・転送済み判定) は従来どおり効く
   return reasons;
 }
 

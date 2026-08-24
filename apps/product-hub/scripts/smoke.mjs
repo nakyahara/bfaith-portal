@@ -198,8 +198,9 @@ db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('SMOK
 const draft = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'SMOKE-1'`).get();
 check('draft inserted', draft && draft.status === 'draft' && draft.notion_card_status === 'pending');
 
+// 画像の有無はゲートで見ない (2026-08-24 中原さん: 白抜きだけで登録を進める運用がある)
 let reasons = dbmod.gateReasons(db, draft);
-check('gate blocks (no url/image)', reasons.length === 2, JSON.stringify(reasons));
+check('gate blocks (no url)', reasons.length === 1, JSON.stringify(reasons));
 
 // AI の参照元は「公式URL / 参考URL / Amazon URL のどれか1つ」でよい (2026-08-02 中原さん)
 db.prepare(`UPDATE product_drafts SET amazon_url = 'https://www.amazon.co.jp/dp/B0TEST' WHERE id = ?`).run(draft.id);
@@ -3365,7 +3366,7 @@ const renders = [
     },
     refs: [], images: [], specs: [],
     aiOutputs: Object.fromEntries(dbmod.AI_OUTPUT_KINDS.map((k) => [k, null])),
-    events: [], gate: ['商品画像 (Driveリンク) が1枚もありません'],
+    events: [], gate: ['AIが参照できるURLがありません (公式ページURL / 参考URL / Amazon URL のどれか1つ)'],
     nextStatuses: ['ready_for_ai', 'on_hold', 'excluded'],
     statusLabels, aiKinds: dbmod.AI_OUTPUT_KINDS,
     variation: variationFixtures.unknown, hasVariation: { value: false, source: 'manual' }, regroup: null,
