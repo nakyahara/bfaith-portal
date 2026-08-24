@@ -58,9 +58,9 @@
       margin: 0 10px; border-radius: 10px;
       border-left: 10px solid transparent; border-right: 10px solid transparent;
     }
-    /* 画像は縦持ちでは高さ約20%に抑える (商品名2行 + NEXTサインの確保が優先 — 実機FB) */
+    /* 画像は縦持ちでは高さ約17%に抑える (商品名3行 + 商品コード + NEXTサインの確保が優先 — 実機FB 2026-08-25) */
     #imgbox {
-      flex: 0 1 20vh; height: 20vh; min-height: 90px; margin: 4px 14px;
+      flex: 0 1 17vh; height: 17vh; min-height: 80px; margin: 4px 14px;
       display: flex; align-items: center; justify-content: center;
       background: #1c2127; border-radius: 12px; overflow: hidden;
     }
@@ -74,15 +74,18 @@
     }
     #qty.multi { color: #ffd43b; }   /* 2個以上は強調 (取忘れ/取りすぎ防止) */
     #qty .x { font-size: 0.45em; font-weight: 600; color: #868e96; margin-right: 6px; }
-    /* 商品名は2行まで見せる (1行ellipsisだと肝心の商品名が読めない)。
+    /* 商品名は3行まで見せる (2行だと長い商品名が「…」で切れて末尾のバリエーションが読めない — 現場FB 2026-08-25)。
        23px/700 — 同じロケに複数SKUがある現場では商品の取り違えが最大リスク (Codexレビュー 2026-08-23) */
     #pname {
       text-align: center; font-size: 23px; font-weight: 700; line-height: 1.3; padding: 0 14px; color: #f1f3f5;
-      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+      display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
     }
     #pname .suffix { color: #5c636a; font-size: 0.8em; font-weight: 500; }
-    /* 商品コードは通常画面では出さない (13pt は読めないのに注意を取る — 同上)。欠品シート等では使う */
-    #psku { display: none; }
+    /* 商品コードは商品名の下に控えめに出す (2026-08-25 中原さん指示。商品名だけでは特定しづらい品の照合用) */
+    #psku {
+      text-align: center; font-size: 16px; font-weight: 600; color: #868e96; font-variant-numeric: tabular-nums;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 14px; letter-spacing: .02em;
+    }
 
     #nextBtn {
       flex: 0 0 18%; min-height: 84px; margin: 0 10px 10px; border: none; border-radius: 16px;
@@ -92,9 +95,10 @@
     /* 背の低い端末 (iPhone SE等) は更に詰めて商品名2行を死守する */
     @media (orientation: portrait) and (max-height: 720px) {
       #loc { font-size: 44px; }
-      #imgbox { flex-basis: 16vh; height: 16vh; }
+      #imgbox { flex-basis: 13vh; height: 13vh; }
       #qty { font-size: clamp(38px, 11vw, 60px); }
       #pname { font-size: 20px; }
+      #psku { font-size: 14px; }
       #nextBtn { flex-basis: 16%; min-height: 72px; font-size: 26px; }
       .signbox { --sign-h: 120px; }
     }
@@ -107,7 +111,8 @@
     #sign { margin: 0 10px 6px; height: var(--sign-h); flex: 0 0 auto; }
     .signbox {
       --sign-h: 136px;
-      --icon-h: 42px; --n-size: 56px; --verb-size: 24px; --dan-size: 34px; --rel-size: 46px; --code-size: 23px; --sub-size: 14px;
+      /* 2026-08-25 現場FB: 次ロケのコード (--code-size) を主役に大きく、3ゾーン [動作|連|段] はその分小さく */
+      --icon-h: 32px; --n-size: 40px; --verb-size: 18px; --dan-size: 26px; --rel-size: 34px; --code-size: 32px; --sub-size: 13px;
       --heavy: #ffb020; --heavy-text: #ffc078; --ren-color: #4dabf7;
       border-radius: 16px; background: #1c2127; border: 3px solid #3a4250; border-left-width: 10px;
       display: flex; flex-direction: column; justify-content: space-between;
@@ -117,8 +122,8 @@
     /* 狭い画面 (iPhone mini 等) はサイン幅に比例して縮める。container query 非対応でも上の固定値で動く */
     @supports (width: 1cqw) {
       .signbox {
-        --icon-h: clamp(30px, 12cqw, 42px); --n-size: clamp(38px, 16cqw, 56px); --verb-size: clamp(18px, 7cqw, 24px);
-        --dan-size: clamp(24px, 9.5cqw, 34px); --rel-size: clamp(32px, 13cqw, 46px); --code-size: clamp(18px, 6.4cqw, 23px);
+        --icon-h: clamp(24px, 9cqw, 32px); --n-size: clamp(30px, 11.5cqw, 40px); --verb-size: clamp(15px, 5.2cqw, 18px);
+        --dan-size: clamp(20px, 7.5cqw, 26px); --rel-size: clamp(26px, 9.8cqw, 34px); --code-size: clamp(24px, 9cqw, 32px);
       }
     }
     .signbox.heavy { border-color: var(--heavy); }
@@ -146,7 +151,7 @@
     .signbox .dan .rel + .v { font-size: calc(var(--dan-size) * .8); color: #dee2e6; }
     .signbox .row2 {
       display: flex; align-items: baseline; gap: 8px; flex: 0 0 auto; padding: 2px 2px 0;
-      font-size: var(--code-size); font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .01em; color: #dee2e6;
+      font-size: var(--code-size); font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: .01em; color: #f1f3f5;
       white-space: nowrap; overflow: hidden;
     }
     .signbox .row2 .lbl { font-size: 14px; font-weight: 600; color: #868e96; letter-spacing: .06em; }
@@ -186,7 +191,7 @@
       #sign { grid-area: sign; margin: 0; }
       .signbox {
         --sign-h: 96px; padding: 3px 10px 3px 8px;
-        --icon-h: 34px; --n-size: 40px; --verb-size: 19px; --dan-size: 26px; --rel-size: 36px; --code-size: 18px; --sub-size: 13px;
+        --icon-h: 26px; --n-size: 30px; --verb-size: 15px; --dan-size: 20px; --rel-size: 27px; --code-size: 24px; --sub-size: 12px;
       }
       .signbox .zone { flex-direction: row; gap: 8px; }
       .signbox .row2 { padding-top: 0; }
@@ -458,8 +463,7 @@
     const voiceOn = true;
     let lastSpokenSeq = null;
     let lastSpokenBlock = null;
-    // NEXTサイン: 「次へ」を押す直前に出していた案内。押した後の明細の読み上げ先頭 (動作語) と
-    // 「直前の案内」(ロケのタップで呼び戻す) に使う
+    // NEXTサイン: 「次へ」を押す直前に出していた案内。「直前の案内」(ロケのタップで呼び戻す) に使う
     let pendingMove = null;   // { targetSeq, descriptor, html }
     function speak(text) {
       if (!('speechSynthesis' in window)) return;
@@ -486,11 +490,8 @@
       } else {
         text = `${l.loc}、${qtyPart}`;   // 形式外ラベルはそのまま
       }
-      // 重い移動 (折り返す/階段/大きく移動/案内できず) だけ、動作語を先頭に足す
-      // (歩き出す瞬間に耳に入る順 = 画面の語順。軽い移動は従来どおり)
-      if (!force && pendingMove && pendingMove.targetSeq === l.seq && window.NextSign) {
-        text = NextSign.speechPrefix(pendingMove.descriptor) + text;
-      }
+      // 動作語 (折り返す/N つ目/N 段目) は読まない — 2026-08-25 現場FB「情報量が多すぎる」。
+      // 読み上げは ロケ+個数 だけ。動線は画面のNEXTサインで見る
       speak(text);
       lastSpokenSeq = l.seq;
       if (p && p.block) lastSpokenBlock = p.block;
