@@ -45,15 +45,16 @@
       <span class="badge badge-<%= draft.status %>" style="font-size:13px"><%= statusLabels[draft.status] || draft.status %></span>
       <strong style="font-size:16px"><%= draft.name %></strong>
       <code class="muted"><%= draft.ne_code %></code>
+      <span class="muted" style="font-size:11px;">ステータスは工程から自動で変わります</span>
       <span style="flex:1"></span>
       <% for (const s of nextStatuses) { %>
-        <button class="btn btn-sm status-btn" data-to="<%= s %>"><%= statusLabels[s] %> にする</button>
+        <button class="btn btn-sm status-btn" data-to="<%= s %>"><%= s === 'resume' ? '▶ 再開する' : `${statusLabels[s]} にする` %></button>
       <% } %>
     </div>
     <% if (draft.status === 'draft' && gate.length > 0) { %>
       <div class="banner-warn" style="margin:12px 0 0;">
         <div>
-          「生成待ち」に進むには以下が必要です:
+          工程「基本情報入力」を完了にする (= AI生成の待ち行列に入れる) には以下が必要です:
           <ul style="margin:6px 0 0 18px; padding:0;">
             <% for (const r of gate) { %><li><%= r %></li><% } %>
           </ul>
@@ -1128,7 +1129,7 @@
     <!-- AI素材 -->
     <div class="card" style="border-color:#c7d2fe; background:#fbfbff;">
       <h2>🤖 AIが書く素材</h2>
-      <p class="muted" style="margin-top:-6px">手で埋めなくて構いません。「生成待ち」にすると AI が書きます。直すのは自由です。</p>
+      <p class="muted" style="margin-top:-6px">手で埋めなくて構いません。工程「基本情報入力」を完了にすると AI が書きます。直すのは自由です。</p>
       <% for (const kind of ['desc_features', 'desc_spec', 'desc_notes']) { %>
         <div class="field">
           <label>
@@ -2843,7 +2844,7 @@
         // 連続で操作できるよう、次の楽観ロック用に最新の updated_at を持ち直す
         if (j.version != null) tr.dataset.version = String(j.version);
         out.textContent = '保存しました';
-        return true;
+        return j;
       } catch (e) {
         out.textContent = '';
         alert('通信エラー: ' + e.message);
@@ -2858,10 +2859,12 @@
       const note = tr.querySelector('.wf-note');
       if (state) {
         state.addEventListener('change', async function () {
-          const ok = await save(tr, { state: state.value });
-          // 完了にすると次の工程へボールが移る = 上部の表示が変わるので読み直す。
-          // 連続で複数工程を片付けたい場合もあるので、少し待ってから 1 回だけ
-          if (ok && state.value === 'done' && !advanced) {
+          const r = await save(tr, { state: state.value });
+          // 完了で次の工程へボールが移る・工程からステータスが導出し直される (PR4) と
+          // 上部の表示が変わるので読み直す。連続で複数工程を片付けたい場合もあるので、
+          // 少し待ってから 1 回だけ
+          const statusChanged = r && r.draftStatus && r.draftStatus !== '<%= draft.status %>';
+          if (r && (state.value === 'done' || statusChanged) && !advanced) {
             advanced = true;
             setTimeout(function () { location.reload(); }, 900);
           }
