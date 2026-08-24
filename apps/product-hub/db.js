@@ -38,6 +38,8 @@ export const IMAGE_PRIORITIES = [
   { value: '自社商品（重要度：高）', bg: '#dbeafe', fg: '#1d4ed8' },
 ];
 export const IMAGE_PRIORITY_VALUES = new Set(IMAGE_PRIORITIES.map((p) => p.value));
+// 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
+export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 
 export const DRAFT_SOURCES = ['portal', 'notion_import'];
 export const SOURCE_PORTAL = 'portal';

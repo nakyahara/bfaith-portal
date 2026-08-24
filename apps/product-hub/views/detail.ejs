@@ -31,7 +31,7 @@
 <div class="wrap wide">
 
   <div style="margin-bottom:12px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-    <a class="btn" href="/apps/product-hub">← 一覧に戻る</a>
+    <a class="btn" href="/apps/product-hub/list">← 一覧に戻る</a>
     <span class="muted" style="font-size:12px;">
       項目の見方: <span class="ftag ftag-m" style="margin-left:0">手入力</span>=人が入れる /
       <span class="ftag ftag-ai" style="margin-left:0">AI</span>=AIが入れる (直してOK) /
@@ -1355,7 +1355,7 @@
       <label>店舗内カテゴリ <span class="muted">(RMSの「表示先カテゴリ」と同じ5枠。枠1がメインページ。RMSへは登録後に自動反映)</span><span class="ftag ftag-ai">AI</span><span class="ftag ftag-m">手入力</span></label>
       <% if (shopCategories.length === 0) { %>
         <p class="muted" style="margin:4px 0;">
-          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
+          カテゴリ一覧が未取り込みです。<a href="/apps/product-hub/list">一覧画面</a>の「楽天 店舗内カテゴリ一覧」から取り込むと選べるようになります。
         </p>
       <% } else { %>
         <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
@@ -1587,20 +1587,43 @@
 
   // 画像の重要度: 選択で即保存 (基本情報の保存ボタンとは独立。ボードのセレクトと同じ API)
   const imgPrioritySel = document.getElementById('f-image-priority');
+  const ownBrandChk = document.getElementById('f-own-brand');
   if (imgPrioritySel) {
     const IMG_PRIORITIES = <%- JSON.stringify(imagePriorities) %>;
+    const applyPriorityColors = () => {
+      const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
+      imgPrioritySel.style.background = p ? p.bg : '';
+      imgPrioritySel.style.color = p ? p.fg : '';
+      imgPrioritySel.style.fontWeight = p ? '600' : '';
+    };
     imgPrioritySel.addEventListener('change', async () => {
       const note = document.getElementById('image-priority-note');
       note.textContent = '保存中…';
       const json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
       if (!json.ok) { note.textContent = ''; alert(json.error || '保存に失敗しました'); return; }
       note.textContent = '保存しました';
-      const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
-      imgPrioritySel.style.background = p ? p.bg : '';
-      imgPrioritySel.style.color = p ? p.fg : '';
-      imgPrioritySel.style.fontWeight = p ? '600' : '';
+      applyPriorityColors();
+      // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
+      if (ownBrandChk && json.own_brand !== undefined) ownBrandChk.checked = !!json.own_brand;
       setTimeout(() => { note.textContent = ''; }, 2000);
     });
+    // 自社商品チェック: 変更で即保存し、重要度「自社商品（重要度：高）」と連動する
+    // (サーバー側が正: ON→重要度を自社商品へ / OFF→自社商品の重要度なら未設定へ)
+    if (ownBrandChk) {
+      ownBrandChk.addEventListener('change', async () => {
+        const json = await post(BASE, { own_brand: ownBrandChk.checked });
+        if (!json.ok) {
+          alert(json.error || '自社商品の保存に失敗しました');
+          ownBrandChk.checked = !ownBrandChk.checked;
+          return;
+        }
+        if (json.image_priority !== undefined) {
+          imgPrioritySel.value = json.image_priority || '';
+          applyPriorityColors();
+        }
+        result.textContent = ownBrandChk.checked ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
+      });
+    }
   }
 
   document.getElementById('save-basic-btn').addEventListener('click', async () => {
@@ -2643,7 +2666,7 @@
       if (!confirm('この取り込みドラフトをアプリから削除します。\nNotion側のカードは削除されません。\n\nよろしいですか?')) return;
       const json = await post(BASE + '/delete');
       if (json.ok) {
-        location.href = '/apps/product-hub';
+        location.href = '/apps/product-hub/list';
       } else {
         alert(json.error || '削除に失敗しました');
       }

@@ -101,7 +101,7 @@
     </select>
     <span style="flex:1"></span>
     <span class="muted"><%= board.total %> 件<%= board.truncated ? ' (上限まで表示)' : '' %></span>
-    <a class="btn btn-sm" href="/apps/product-hub">一覧で見る</a>
+    <a class="btn btn-sm" href="/apps/product-hub/list">一覧で見る</a>
   </div>
 
   <% if (!me && assigneeParam === 'me') { %>
@@ -282,7 +282,7 @@
     <% if (boardView === 'image') { %>
       カードは 商品 × 画像種別 (TOP / 詳細) です。詳細画像を作らない商品は「対象外」にするとここに出ません。
     <% } %>
-    保留・除外にした商品はこのボードには出ません（<a href="/apps/product-hub">一覧</a>で確認できます）。
+    保留・除外にした商品はこのボードには出ません（<a href="/apps/product-hub/list">一覧</a>で確認できます）。
   </p>
 </div>
 

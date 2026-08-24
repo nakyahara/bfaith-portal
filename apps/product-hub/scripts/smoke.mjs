@@ -2838,6 +2838,59 @@ let wfSetParentId = null;
   db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
 
+  // ─── 工程ボードをデフォルトに (2026-08-24 中原さん要望) ───
+  const rawGet = async (p) => {
+    const res = await fetch(base + p, { redirect: 'manual' });
+    return { status: res.status, location: res.headers.get('location') || '' };
+  };
+  let rg = await rawGet('/');
+  check('ルート: / は工程ボードへリダイレクト',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/board'), JSON.stringify(rg));
+  rg = await rawGet('/?status=review');
+  check('ルート: 旧 ?status= 付きブックマークは一覧へ引き継ぐ',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/list?status=review'), JSON.stringify(rg));
+  rg = await rawGet('/?status=bogus');
+  check('ルート: 不正な status は素の一覧へ',
+    rg.status === 302 && rg.location.endsWith('/apps/product-hub/list'), JSON.stringify(rg));
+  const listRes = await fetch(base + '/list');
+  check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
+
+  // ─── 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望) ───
+  const idOb = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-OWNBRAND', '連動テスト', 'smoke')
+  `).run().lastInsertRowid);
+  const obRow = () => db.prepare('SELECT own_brand, image_priority FROM product_drafts WHERE id = ?').get(idOb);
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '自社商品（重要度：高）' });
+  check('連動: 重要度「自社商品」を選ぶと own_brand=1',
+    r.status === 200 && r.json.own_brand === 1 && obRow().own_brand === 1, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '仕入商品（重要度：高）' });
+  check('連動: 他の重要度を選ぶと own_brand=0',
+    r.json.own_brand === 0 && obRow().own_brand === 0 && obRow().image_priority === '仕入商品（重要度：高）');
+  await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '自社商品（重要度：高）' });
+  r = await call('POST', `/api/drafts/${idOb}/image-priority`, { value: '' });
+  check('連動: 重要度を未設定に戻しても own_brand は触らない (どちらとも言えない)',
+    obRow().own_brand === 1 && obRow().image_priority == null);
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: false });
+  check('連動: チェックOFF (重要度が自社商品以外) は重要度を触らない',
+    obRow().own_brand === 0 && obRow().image_priority == null, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: true });
+  check('連動: チェックON → 重要度が「自社商品（重要度：高）」になる',
+    r.json.image_priority === '自社商品（重要度：高）' && obRow().image_priority === '自社商品（重要度：高）' && obRow().own_brand === 1,
+    JSON.stringify(r.json));
+  // チェックが変わらない保存は、手で選び直した重要度を巻き戻さない
+  db.prepare(`UPDATE product_drafts SET image_priority = '取扱先限定商品（重要度：高）' WHERE id = ?`).run(idOb);
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: true, name: '連動テスト' });
+  check('連動: チェックが変わらない保存は重要度を巻き戻さない',
+    obRow().image_priority === '取扱先限定商品（重要度：高）' && obRow().own_brand === 1);
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: false });
+  check('連動: チェックOFFでも自社商品以外の重要度は残す',
+    obRow().own_brand === 0 && obRow().image_priority === '取扱先限定商品（重要度：高）');
+  db.prepare(`UPDATE product_drafts SET own_brand = 1, image_priority = '自社商品（重要度：高）' WHERE id = ?`).run(idOb);
+  r = await call('POST', `/api/drafts/${idOb}`, { own_brand: false });
+  check('連動: チェックOFF (重要度が自社商品) → 重要度は未設定に戻す',
+    obRow().own_brand === 0 && obRow().image_priority == null);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idOb);
+
   server.close();
 }
 

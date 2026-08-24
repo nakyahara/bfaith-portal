@@ -18,7 +18,7 @@ import {
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
-  IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES,
+  IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
 import {
   listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
@@ -125,7 +125,17 @@ function rakutenShippingLabelOf(db, draftId) {
 
 // ─── 画面 ───────────────────────────────────────────────
 
+// 工程ボードが主画面 (2026-08-24 中原さん要望)。ドラフト一覧は /list へ。
+// 旧URLの ?status= 付きブックマーク・共有リンクは一覧へ引き継ぐ
 router.get('/', (req, res) => {
+  if (req.query.status !== undefined) {
+    const q = DRAFT_STATUSES.includes(req.query.status) ? `?status=${encodeURIComponent(req.query.status)}` : '';
+    return res.redirect(`/apps/product-hub/list${q}`);
+  }
+  res.redirect('/apps/product-hub/board');
+});
+
+router.get('/list', (req, res) => {
   const db = getDB();
   maybeBackfillDerivedStatus(db);   // PR4 切替の一回きりバックフィル (実施済みなら即 return)
   const statusFilter = DRAFT_STATUSES.includes(req.query.status) ? req.query.status : null;
@@ -411,10 +421,19 @@ router.post('/api/drafts/:id', async (req, res) => {
   if (amazonUrl && !isHttpUrl(amazonUrl)) {
     return res.status(400).json({ ok: false, error: 'Amazon URLの形式が不正です (http/https)' });
   }
+  const ownBrandValue = req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : draft.own_brand;
+  // 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望)。
+  // このリクエストでチェックが**変わった**ときだけ動かす (毎回連動させると、自社商品のまま
+  // 重要度を手で変えた値が基本情報の保存のたびに巻き戻る)
+  let imagePriorityValue = draft.image_priority;
+  if (ownBrandValue !== draft.own_brand) {
+    if (ownBrandValue === 1) imagePriorityValue = OWN_BRAND_IMAGE_PRIORITY;
+    else if (draft.image_priority === OWN_BRAND_IMAGE_PRIORITY) imagePriorityValue = null; // 外したら未設定に戻す (人が選び直す)
+  }
   db.prepare(`
     UPDATE product_drafts SET
       name = ?, official_url = ?, price = ?, jan_code = ?, has_variation = ?,
-      drive_folder_url = ?, memo = ?, asin = ?, amazon_url = ?, own_brand = ?,
+      drive_folder_url = ?, memo = ?, asin = ?, amazon_url = ?, own_brand = ?, image_priority = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     WHERE id = ?
   `).run(
@@ -427,9 +446,13 @@ router.post('/api/drafts/:id', async (req, res) => {
     req.body?.memo !== undefined ? cleanText(req.body.memo, 4000) : draft.memo,
     req.body?.asin !== undefined ? cleanText(req.body.asin, 20) : draft.asin,
     amazonUrl,
-    req.body?.own_brand !== undefined ? (req.body.own_brand ? 1 : 0) : draft.own_brand,
+    ownBrandValue,
+    imagePriorityValue,
     draft.id,
   );
+  if ((imagePriorityValue || null) !== (draft.image_priority || null)) {
+    logEvent(db, draft.id, 'image_priority_changed', `${draft.image_priority || '未設定'} -> ${imagePriorityValue || '未設定'} (自社商品チェック連動)`, actorOf(req));
+  }
   // 税率は基本情報の項目として保存する (2026-08-06 中原さん指示で Yahoo!欄から移動。
   // 格納先は従来どおり draft_yahoo.tax_rate — 楽天 payload.taxRate も Yahoo 移行もここを読む)
   if (req.body?.tax_rate !== undefined) {
@@ -440,7 +463,11 @@ router.post('/api/drafts/:id', async (req, res) => {
   const demoted = demoteIfGateBroken(db, draft.id, actorOf(req));
   // 既存 Notion カードへ URL 項目を再同期 (fail-soft — 失敗しても保存は成功のまま)
   const notionSync = await syncCardLinks(draft.id, { actor: actorOf(req) });
-  res.json({ ok: true, demoted: demoted || undefined, notion_sync: notionSync.outcome });
+  // own_brand / image_priority は連動して変わりうるので、リロードしない保存経路のために返す
+  res.json({
+    ok: true, demoted: demoted || undefined, notion_sync: notionSync.outcome,
+    own_brand: ownBrandValue, image_priority: imagePriorityValue,
+  });
 });
 
 // ─── API: 参考URL / 画像 / 仕様表 / AI出力 ─────────────────
@@ -1795,13 +1822,24 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
   }
   const value = raw === '' ? null : raw;
   const db = getDB();
-  if ((draft.image_priority || null) !== value) {
-    db.prepare(`
-      UPDATE product_drafts SET image_priority = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
-    `).run(value, draft.id);
-    logEvent(db, draft.id, 'image_priority_changed', `${draft.image_priority || '未設定'} -> ${value || '未設定'}`, actorOf(req));
-  }
-  res.json({ ok: true });
+  // 自社商品チェックとの連動 (2026-08-24 中原さん要望): 重要度「自社商品」を選んだらチェックON、
+  // 他の重要度を選んだらOFF。未設定 (空) はどちらとも言えないので own_brand は触らない
+  const ownBrand = value == null ? draft.own_brand : (value === OWN_BRAND_IMAGE_PRIORITY ? 1 : 0);
+  db.transaction(() => {
+    if ((draft.image_priority || null) !== value) {
+      db.prepare(`
+        UPDATE product_drafts SET image_priority = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+      `).run(value, draft.id);
+      logEvent(db, draft.id, 'image_priority_changed', `${draft.image_priority || '未設定'} -> ${value || '未設定'}`, actorOf(req));
+    }
+    if (ownBrand !== draft.own_brand) {
+      db.prepare(`
+        UPDATE product_drafts SET own_brand = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
+      `).run(ownBrand, draft.id);
+      logEvent(db, draft.id, 'updated', `own_brand ${draft.own_brand} -> ${ownBrand} (画像の重要度と連動)`, actorOf(req));
+    }
+  })();
+  res.json({ ok: true, own_brand: ownBrand });
 });
 
 // セット商品の派生ドラフト生成 (工程「セット商品作成検討」から)。
