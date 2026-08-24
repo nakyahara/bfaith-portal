@@ -425,6 +425,18 @@ export function initProductHubDB() {
       PRIMARY KEY (draft_id, sku_code)
     );
 
+    -- バリエーションSKUごとの売価 (2026-08-24 中原さん要望)。
+    -- NE 原価が SKU で異なる場合に売価も SKU 別に決める。原価が全SKU同じ商品は
+    -- draft.price (ページ代表の売価) のままでよく、この表には行を持たない。
+    -- P3.5 バリエーション出品の variants[sku].standardPrice の材料になる
+    CREATE TABLE IF NOT EXISTS draft_sku_prices (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,               -- LOWER(TRIM()) した SKU 商品コード
+      price      INTEGER NOT NULL,            -- 売価 (税込・円)
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code)
+    );
+
     -- 楽天の店舗内カテゴリ (お店の棚) マスタ。RMS 画面からの貼り付けで取り込む
     -- (Category API での自動取得/自動紐付けは miniPC service-api にルート追加が必要 = 未実装)。
     -- 全置き換え取り込みでも行は消さず is_active で外す (draft_shop_categories が参照するため)

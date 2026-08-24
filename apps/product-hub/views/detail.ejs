@@ -542,12 +542,19 @@
                data-ship="<%= neCost?.shippingCost ?? '' %>"
                data-tax="<%= simTaxPercent %>"
                data-take="<%= profitTakeRate %>">
-            <% if (!neCost || neCost.costExTax == null) { %>
+            <% const knownSkuCosts = (neCost?.skuCosts || []).map((s) => s.costExTax).filter((c) => c != null); %>
+            <% if (neCost && neCost.costVaries) { %>
+              <span class="ftag ftag-auto" style="margin-left:0">自動</span>
+              <span class="muted">原価がSKUごとに異なります<% if (knownSkuCosts.length) { %> (税抜 <%= Math.min(...knownSkuCosts).toLocaleString() %>〜<%= Math.max(...knownSkuCosts).toLocaleString() %>円)<% } %>
+                — 売価と利益は右の「NE商品マスタから自動取得」のSKU表でSKUごとに設定・確認してください</span>
+            <% } else if (!neCost || neCost.costExTax == null) { %>
               <span class="muted">利益計算: NEに原価が無いため計算できません (NE登録後に自動反映)</span>
             <% } else if (neCost.shippingCost == null) { %>
-              <span class="muted">利益計算: NEに送料 (配送方法からの自動算出値) が無いため計算できません</span>
+              <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE)</span></span>
+              <span class="muted"> — 送料 (配送方法からの自動算出値) が無いため利益計算できません</span>
             <% } else { %>
               <span class="ftag ftag-auto" style="margin-left:0">自動</span>
+              <span style="font-size:12px;">原価 <%= neCost.costExTax.toLocaleString() %>円<span class="muted"> (税抜・NE<%= neCost.source === 'members' ? '・全SKU共通' : '' %>)</span> — </span>
               <span id="profit-sim-body" class="muted"></span>
             <% } %>
           </div>
@@ -685,16 +692,49 @@
         <% } %>
         <details open>
           <summary style="cursor:pointer; font-size:13px; font-weight:600;">このページに載るSKU (<%= variation.members.length %>件)</summary>
+          <%
+            // NE原価をSKU別に表示 (2026-08-24 中原さん要望)。原価がSKUで異なる場合は売価もSKU別に設定する
+            const skuCostBy = {};
+            for (const s of (neCost?.skuCosts || [])) skuCostBy[String(s.code).trim().toLowerCase()] = s;
+            const showSkuPrices = !!(neCost && neCost.costVaries);
+          %>
+          <% if (showSkuPrices) { %>
+            <p class="muted" style="margin:8px 0 0; font-size:12px;">
+              💰 原価がSKUごとに異なります。<strong>売価もSKUごとに設定</strong>してください (空欄 = ページ代表の売価 <%= draft.price != null ? draft.price.toLocaleString() + '円' : '未設定' %> を使う。入力すると即保存)。
+            </p>
+          <% } %>
           <table class="list" style="margin-top:8px;">
-            <thead><tr><th style="width:190px">商品コード</th><th>商品名</th><th style="width:100px">取扱区分</th><th style="width:60px">在庫</th><th style="width:70px"></th></tr></thead>
+            <thead><tr>
+              <th style="width:170px">商品コード</th><th>商品名</th><th style="width:80px">取扱区分</th><th style="width:50px">在庫</th>
+              <th style="width:80px">原価<span class="muted" style="font-weight:400">(税抜)</span></th>
+              <% if (showSkuPrices) { %><th style="width:100px">売価<span class="muted" style="font-weight:400">(税込)</span></th><th style="width:110px">利益</th><% } %>
+              <th style="width:70px"></th>
+            </tr></thead>
             <tbody>
-              <% for (const m of variation.members) { %>
+              <% for (const [mi, m] of variation.members.entries()) { %>
                 <% const isSelf = String(m.商品コード || '').trim().toLowerCase() === String(draft.ne_code || '').trim().toLowerCase(); %>
+                <% const mKey = String(m.商品コード || '').trim().toLowerCase(); %>
+                <% const mCost = skuCostBy[mKey] || null; %>
                 <tr<%= isSelf ? ' style="background:#eff6ff"' : '' %>>
                   <td><code style="font-size:12px"><%= m.商品コード %></code></td>
                   <td><%= m.商品名 || '' %></td>
                   <td class="muted"><%= m.取扱区分 || '' %></td>
                   <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
+                  <td style="text-align:right;<%= mCost?.costExTax == null ? '' : 'font-variant-numeric:tabular-nums;' %>">
+                    <% if (mCost?.costExTax != null) { %><%= mCost.costExTax.toLocaleString() %>円<% } else { %><span class="muted" title="NEに原価がありません">—</span><% } %>
+                  </td>
+                  <% if (showSkuPrices) { %>
+                    <td>
+                      <input type="number" class="sku-price-input" min="1" step="1"
+                             style="width:90px; font-size:12px; padding:4px 6px;"
+                             data-code="<%= m.商品コード %>" data-key="<%= mi %>"
+                             data-cost="<%= mCost?.costExTax ?? '' %>"
+                             data-ship="<%= (mCost?.shippingCost ?? neCost?.shippingCost) ?? '' %>"
+                             value="<%= skuPrices[mKey] != null ? skuPrices[mKey] : '' %>"
+                             placeholder="<%= draft.price != null ? draft.price : '' %>">
+                    </td>
+                    <td class="muted" style="font-size:12px;" id="sku-profit-<%= mi %>">—</td>
+                  <% } %>
                   <td>
                     <% if (!isSelf) { %>
                       <button class="btn btn-sm exclude-sku-btn" data-code="<%= m.商品コード %>">外す</button>
@@ -2530,6 +2570,70 @@
     }
     priceInput.addEventListener('input', render);
     render();
+  })();
+
+  // ─── SKU別売価 (原価がSKUで異なる場合のみ表に出る)。入力で利益をライブ計算し、確定 (change) で即保存 ───
+  (function initSkuPrices() {
+    const inputs = document.querySelectorAll('.sku-price-input');
+    if (!inputs.length) return;
+    const simBox = document.getElementById('profit-sim');
+    const tax = Number(simBox?.dataset.tax ?? 10);
+    const take = Number(simBox?.dataset.take ?? 0.9);
+    inputs.forEach((input) => {
+      const cell = document.getElementById('sku-profit-' + input.dataset.key);
+      const cost = input.dataset.cost === '' ? null : Number(input.dataset.cost);
+      const ship = input.dataset.ship === '' ? null : Number(input.dataset.ship);
+      function render() {
+        if (!cell) return;
+        // 空欄はページ代表の売価 (placeholder) で計算 = 「設定しなければ draft.price」を可視化
+        const price = Number(input.value !== '' ? input.value : input.placeholder);
+        if (!Number.isFinite(price) || price <= 0 || cost == null || ship == null) {
+          cell.textContent = '—';
+          cell.title = cost == null ? 'NEに原価がありません' : (ship == null ? 'NEに送料がありません' : '売価を入れると利益が出ます');
+          cell.style.color = '';
+          return;
+        }
+        const profit = price * take - cost * (1 + tax / 100) - ship;
+        const margin = (profit / price) * 100;
+        cell.textContent = Math.round(profit).toLocaleString() + '円 / ' + margin.toFixed(1) + '%';
+        cell.title = '手取り' + Math.round(price * take).toLocaleString()
+          + ' − 税込原価' + Math.round(cost * (1 + tax / 100)).toLocaleString()
+          + ' − 配送費' + Math.round(ship).toLocaleString();
+        cell.style.color = profit < 0 ? '#dc2626' : '';
+        cell.style.fontWeight = profit < 0 ? '600' : '';
+      }
+      let last = input.value;
+      // 保存はSKU単位の単一チェーンで直列化する (Codex R1 high: 素早く2回変更したとき
+      // 先のPOSTが後から完了すると古い値に巻き戻る)。送信値は change 時点の値を渡す
+      let saveChain = Promise.resolve();
+      async function save(value) {
+        if (value === last) return;
+        let json;
+        try {
+          json = await post(BASE + '/sku-prices', {
+            ne_code: input.dataset.code,
+            price: value === '' ? null : Number(value),
+          });
+        } catch (e) {
+          // 通信例外も黙殺せずエラー扱いにする (Codex R2)
+          json = { ok: false, error: '通信エラーでSKU売価を保存できませんでした' };
+        }
+        if (!json.ok) {
+          alert(json.error || 'SKU売価の保存に失敗しました');
+          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す (Codex R2)
+          if (input.value === value) { input.value = last; render(); }
+          return;
+        }
+        last = value;
+        result.textContent = 'SKU売価を保存しました (' + input.dataset.code + ')';
+      }
+      input.addEventListener('input', render);
+      input.addEventListener('change', () => {
+        const value = input.value;
+        saveChain = saveChain.then(() => save(value));
+      });
+      render();
+    });
   })();
 
   // 取り込みテストデータの掃除 (取り込み由来のみ。Notion 側のカードには触らない)
