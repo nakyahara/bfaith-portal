@@ -17,6 +17,11 @@ import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
 import {
   getDB, getPackBatchByTbKey, utcNow, jstToday,
 } from './db.js';
+// 資材の完了スナップショット (循環 import だが実行時参照のみ = ESM で安全)
+import {
+  onSlipCompleted as materialOnSlipCompleted,
+  onSlipCompletionCleared as materialOnSlipCompletionCleared,
+} from './materials.js';
 
 /** 業務エラー。router が status + message に変換する。 */
 export class PackError extends Error {
@@ -861,6 +866,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       }
       db.prepare("UPDATE pk_pack_slips SET status='pending', done_at=NULL, shown_at=? WHERE batch_id=? AND seq=?")
         .run(now, batchId, lastSeq);
+      // 資材の完了スナップショットも解除 (再完了時に取り直す)
+      try { materialOnSlipCompletionCleared(db, batchId, lastSeq); } catch { /* fail-soft */ }
       if (batch.status === 'done') {
         db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
           .run(now, batchId);
@@ -1076,6 +1083,8 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       // packing_completed (現在伝票) — done_at がその記録
       db.prepare("UPDATE pk_pack_slips SET status='done', done_at=? WHERE batch_id=? AND seq=?")
         .run(now, batchId, slipSeq);
+      // 資材の表示観測ログ: 完了時点の判定をスナップショット固定 (v10 未適用環境は無視)
+      try { materialOnSlipCompleted(db, batchId, slipSeq, now); } catch { /* fail-soft */ }
       // slip_opened (次伝票) — 紙の束は前から順なので「完了した伝票の次以降で最初の pending」を
       // 優先し、無ければ先頭の pending (飛ばした伝票へ戻る)
       const nextSeq = db.prepare(

@@ -16,7 +16,8 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange, notifyReprint } from './notify.js';
+import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured } from './notify.js';
+import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
 import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
 import { getShippingFolders, listNouhinCsvFiles, downloadNouhinCsv } from './drive.js';
@@ -267,6 +268,10 @@ export function startPackingDrivePoller() {
       _status.lastError = null;
       await retryShipChangeNotify();
       await retryReprintNotify();
+      // 資材変更の通知 outbox (undo 猶予後に送信・at-least-once — 要件『梱包資材表示』§5.3)。
+      // webhook 未設定時は claim しない (管理画面に構成エラー表示)
+      await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);
+      purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
       cleanupReprintPdfs();
       await pingJobsMonitor();
     } catch (e) {

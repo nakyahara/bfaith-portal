@@ -37,6 +37,14 @@ import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
 import { neNamesFor } from './ne-names.js';
+// 梱包資材の表示・現場登録 (要件 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7)
+import {
+  materialsForState, materialOptions, registerMaterial, undoMaterial,
+  manualResend as materialManualResend, materialDailyCounts,
+  seedMaterialsData, normalizeKeyText, classCandidates,
+  BASE_DELIVERY_CODES, DELIVERY_CODES, UNDO_SEC as MATERIAL_UNDO_SEC,
+} from './materials.js';
+import { DATA_DIR } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -125,7 +133,8 @@ function api(handler) {
       await handler(req, res);
     } catch (e) {
       if (e instanceof PackError) {
-        return res.status(e.status).json({ error: e.message, code: e.code });
+        // e.body = 409 応答に同梱する追加情報 (資材の現在値など — 要件『梱包資材表示』§5.1)
+        return res.status(e.status).json({ error: e.message, code: e.code, ...(e.body || {}) });
       }
       console.error('[packing]', e);
       res.status(500).json({ error: 'サーバーエラーが発生しました' });
@@ -284,6 +293,13 @@ router.get('/work/:id(\\d+)', async (req, res, next) => {
     }
     // 梱包機バッチは1伝票1画面を使わない — ライン管理画面へ (Codex high: 混在は矛盾状態を作る)
     if (lineKindOf(hikiateClass)) return res.redirect(`/apps/packing/line/${req.params.id}`);
+    // 梱包資材の判定 (fail-soft: 失敗してもカード無しで梱包は継続 — 要件§4.1)
+    let materials = null;
+    let materialOpts = null;
+    try {
+      materials = materialsForState(state, hikiateClass);
+      materialOpts = materialOptions(hikiateClass);
+    } catch (e) { console.warn(`[packing-materials] 判定失敗 (fail-soft): ${e.message}`); }
     res.render(path.join(__dirname, 'views/work'), {
       title: `梱包 | ${state.batch.folder_name || state.batch.tb_key}`,
       displayName: req.session?.displayName,
@@ -296,6 +312,9 @@ router.get('/work/:id(\\d+)', async (req, res, next) => {
       shipChangeReasons: SHIP_CHANGE_REASONS,
       // 提案候補 = 固定リスト (中原さん指定 2026-08-16)。判定サービス委譲 (packing-dispatch) はPhase 3
       methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+      materials,                       // seq → 資材判定 (null = fail-soft)
+      materialOpts,                    // { materials: [...], candidateCodes: [...] }
+      materialUndoSec: MATERIAL_UNDO_SEC,
     });
   } catch (e) { next(e); }
 });
@@ -558,10 +577,80 @@ async function verifyActualSku(raw) {
   return { sku, name };
 }
 
+// ─── 📦 梱包資材 (表示・現場登録 — 要件『梱包資材表示_要件定義_20260823.md』v1.7) ───
+
+const MATERIALS_DIR = path.join(DATA_DIR, 'materials');
+
+/** 資材画像の配信 (端末認証の内側・immutable — 差し替えはファイル名が変わる)。 */
+router.get('/materials/:file([a-z0-9_-]+\\.(?:jpg|jpeg|png|webp))', (req, res) => {
+  const file = path.join(MATERIALS_DIR, req.params.file);
+  if (!file.startsWith(MATERIALS_DIR) || !fs.existsSync(file)) return res.status(404).send('not found');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.sendFile(file);
+});
+
+/** 登録・変更グリッド用の資材一覧 (active・分類候補コード付き)。 */
+router.get('/api/batches/:id(\\d+)/material-options', api(async (req, res) => {
+  const batch = getPackBatch(Number(req.params.id));
+  if (!batch) throw new PackError(404, 'batch_not_found', 'バッチがありません');
+  const hikiateClass = batchHikiateClass(getDB(), batch);
+  res.json({ ok: true, ...materialOptions(hikiateClass), undoSec: MATERIAL_UNDO_SEC });
+}));
+
+/**
+ * 資材の登録/変更。body: { op_id, slip_seq, material_code,
+ *   expected_rule_id, expected_version, expected_delivery_code, expected_before, worker_name }
+ * 409 = 現在値同梱 (conflict / context_changed) — 画面はカードを描き直す (§5.1)
+ */
+router.post('/api/batches/:id(\\d+)/material', checkOrigin, api(async (req, res) => {
+  const name = String(req.body.worker_name || '').trim();
+  let worker = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    worker = name;
+  } else if (req.session?.email) {
+    worker = req.session.displayName || req.session.email;
+  }
+  if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
+  const result = registerMaterial({
+    batchId: Number(req.params.id),
+    slipSeq: Number(req.body.slip_seq),
+    materialCode: String(req.body.material_code || ''),
+    expectedRuleId: req.body.expected_rule_id == null ? null : Number(req.body.expected_rule_id),
+    expectedVersion: req.body.expected_version == null ? null : Number(req.body.expected_version),
+    expectedDeliveryCode: String(req.body.expected_delivery_code || ''),
+    expectedBefore: req.body.expected_before == null ? null : String(req.body.expected_before),
+    opId: String(req.body.op_id || ''),
+    worker,
+  });
+  res.json(result);
+}));
+
+/** 資材登録の取り消し (猶予内・§5.2)。body: { op_id, event_id, undo_token, worker_name } */
+router.post('/api/batches/:id(\\d+)/material/undo', checkOrigin, api(async (req, res) => {
+  const result = undoMaterial({
+    opId: String(req.body.op_id || ''),
+    eventId: Number(req.body.event_id),
+    undoToken: String(req.body.undo_token || ''),
+    worker: String(req.body.worker_name || '').trim() || null,
+  });
+  res.json(result);
+}));
+
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
 router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
   const s = getWorkState(Number(req.params.id));
+  // 資材判定も同期する (④/受領/構成変化の再照合・fail-soft)
+  let materials = null;
+  try {
+    const batch = getPackBatch(Number(req.params.id));
+    materials = materialsForState(s, batchHikiateClass(getDB(), batch));
+  } catch { /* fail-soft */ }
   res.json({
+    materials,
     ok: true,
     batchStatus: s.batch.status,
     worker: s.batch.worker,
@@ -599,9 +688,245 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
     displayName: req.session.displayName,
     isAdmin: true,
     summary: getDailySummary(workDate),
+    // 資材の登録/変更/取消/通知失敗 (初回登録は GChat 通知しない代わりにここで確認 — 要件§5.3)
+    materialCounts: materialDailyCounts(workDate),
     statusLabels: STATUS_LABELS,
   });
 });
+
+// ─── 📦 資材の管理画面 (要件§9・requireAdmin は prefix 一括) ───
+
+const uploadImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
+
+/** 画像のマジックバイト検証 (拡張子/MIME 申告は信用しない)。SVG は不可 (要件§6.3)。 */
+function sniffImage(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  return null;
+}
+
+function adminActor(req) { return req.session?.displayName || req.session?.email || 'admin'; }
+
+/** 管理画面の rules 変更 (admin_edit / admin_disable) の監査イベント。 */
+function insertAdminRuleEvent(db, action, rule, beforeCode, admin) {
+  db.prepare(`
+    INSERT INTO pk_pack_material_events
+      (op_id, request_hash, action, rule_id, rule_version, combo_key, delivery_code,
+       before_code, after_code, worker, created_at, notify_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'none')
+  `).run(
+    `admin-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`, 'admin', action,
+    rule.id, rule.version, rule.combo_key, rule.delivery_code,
+    beforeCode, rule.material_code, admin, utcNowRouter(),
+  );
+}
+function utcNowRouter() { return new Date().toISOString().slice(0, 19) + 'Z'; }
+
+router.get('/admin/materials', requireAdmin, (req, res) => {
+  const db = getDB();
+  const q = String(req.query.q || '').trim();
+  const materials = db.prepare('SELECT * FROM pk_pack_materials ORDER BY sort_order, code').all();
+  const classes = db.prepare('SELECT * FROM pk_pack_classes ORDER BY sort_order, class_value').all()
+    .map((c) => ({
+      ...c,
+      candidates: db.prepare(`
+        SELECT cm.material_code, m.name, m.is_active FROM pk_pack_class_materials cm
+        LEFT JOIN pk_pack_materials m ON m.code = cm.material_code
+        WHERE cm.class_value = ? ORDER BY cm.sort_order
+      `).all(c.class_value),
+    }));
+  const headerMap = db.prepare(`
+    SELECT h.*, m.name AS material_name FROM pk_pack_header_map h
+    LEFT JOIN pk_pack_materials m ON m.code = h.material_code ORDER BY h.header_value
+  `).all();
+  // 未レビュー: ①観測された header が辞書に無い ②観測された分類がマスタに無い
+  // ③AES ヘッダで観測された分類の aes_kind 未設定 (要件§9-3・Codex 6巡目)
+  const unreviewedHeaders = db.prepare(`
+    SELECT header_raw, COUNT(*) c, MAX(last_shown_at) last_at FROM pk_pack_material_views
+    WHERE header_raw IS NOT NULL AND header_raw <> ''
+      AND header_raw NOT IN (SELECT header_value FROM pk_pack_header_map)
+    GROUP BY header_raw ORDER BY c DESC LIMIT 50
+  `).all();
+  const unreviewedClasses = db.prepare(`
+    SELECT hikiate_class, COUNT(*) c, MAX(last_shown_at) last_at FROM pk_pack_material_views
+    WHERE hikiate_class IS NOT NULL AND hikiate_class <> ''
+      AND (hikiate_class NOT IN (SELECT class_value FROM pk_pack_classes)
+           OR (header_raw IN (SELECT header_value FROM pk_pack_header_map WHERE base_delivery_code='aes')
+               AND hikiate_class IN (SELECT class_value FROM pk_pack_classes WHERE aes_kind IS NULL)))
+    GROUP BY hikiate_class ORDER BY c DESC LIMIT 50
+  `).all();
+  const rules = db.prepare(`
+    SELECT r.*, m.name AS material_name, m.is_active AS material_active,
+      (SELECT COUNT(*) FROM pk_pack_material_events e
+        WHERE e.rule_id = r.id AND e.action='change' AND e.undone_at IS NULL
+          AND e.created_at >= datetime('now', '-7 days')) AS recent_changes
+    FROM pk_pack_material_rules r LEFT JOIN pk_pack_materials m ON m.code = r.material_code
+    ${q ? "WHERE r.combo_key LIKE @like OR r.combo_detail LIKE @like OR r.material_code LIKE @like" : ''}
+    ORDER BY r.updated_at DESC LIMIT 100
+  `).all(q ? { like: `%${q}%` } : {});
+  const events = db.prepare(`
+    SELECT e.*, m.name AS after_name FROM pk_pack_material_events e
+    LEFT JOIN pk_pack_materials m ON m.code = e.after_code
+    ORDER BY e.id DESC LIMIT 60
+  `).all();
+  const notifyIssues = db.prepare(`
+    SELECT * FROM pk_pack_material_events
+    WHERE notify_status IN ('pending','sending','failed') ORDER BY id DESC LIMIT 30
+  `).all();
+  const webhookConfigured = !!(process.env.PACKING_MATERIAL_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK);
+  res.render(path.join(__dirname, 'views/admin_materials'), {
+    title: '梱包資材の管理',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    q, materials, classes, headerMap, unreviewedHeaders, unreviewedClasses,
+    rules, events, notifyIssues, webhookConfigured,
+    baseDeliveryCodes: BASE_DELIVERY_CODES,
+  });
+});
+
+/** 資材マスタの追加・編集。body: { code, name, color, sort_order, is_active } */
+router.post('/admin/materials/master', checkOrigin, requireAdmin, api(async (req, res) => {
+  const code = String(req.body.code || '').trim();
+  const name = String(req.body.name || '').trim();
+  if (!/^[a-z0-9_]{2,40}$/.test(code)) throw new PackError(400, 'bad_code', 'code は英小文字/数字/_ (2〜40文字)');
+  if (!name) throw new PackError(400, 'bad_name', '名前は必須です');
+  const now = utcNowRouter();
+  getDB().prepare(`
+    INSERT INTO pk_pack_materials (code, name, color, sort_order, is_active, created_at, updated_at, updated_by)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(code) DO UPDATE SET name=excluded.name, color=excluded.color, sort_order=excluded.sort_order,
+      is_active=excluded.is_active, updated_at=excluded.updated_at, updated_by=excluded.updated_by
+  `).run(code, name, String(req.body.color || '') || null,
+    Math.min(9999, Math.max(0, Number(req.body.sort_order) || 100)),
+    req.body.is_active === '0' ? 0 : 1, now, now, adminActor(req));
+  res.json({ ok: true });
+}));
+
+/** 資材画像のアップロード/差し替え。multipart: code + file (png/jpg/webp・2MB・マジックバイト検証)。 */
+router.post('/admin/materials/master/image', checkOrigin, requireAdmin, (req, res, next) => {
+  uploadImage.single('file')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: `アップロード失敗: ${err.message}` });
+    next();
+  });
+}, api(async (req, res) => {
+  const code = String(req.body.code || '').trim();
+  const db = getDB();
+  const m = db.prepare('SELECT code FROM pk_pack_materials WHERE code = ?').get(code);
+  if (!m) throw new PackError(404, 'not_found', '資材がありません');
+  const kind = sniffImage(req.file?.buffer);
+  if (!kind) throw new PackError(400, 'bad_image', 'png / jpg / webp のみアップロードできます (SVG不可)');
+  fs.mkdirSync(MATERIALS_DIR, { recursive: true });
+  const name = `${code}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.${kind}`;
+  fs.writeFileSync(path.join(MATERIALS_DIR, name), req.file.buffer);
+  db.prepare('UPDATE pk_pack_materials SET image_file=?, updated_at=?, updated_by=? WHERE code=?')
+    .run(name, utcNowRouter(), adminActor(req), code);
+  res.json({ ok: true, image_file: name });
+}));
+
+/** 分類マスタの追加・編集。body: { class_value, aes_kind, hide_card, sort_order } */
+router.post('/admin/materials/class', checkOrigin, requireAdmin, api(async (req, res) => {
+  const cv = normalizeKeyText(req.body.class_value);
+  if (!cv) throw new PackError(400, 'bad_class', '分類名は必須です');
+  const aesKind = ['mail', 'other'].includes(req.body.aes_kind) ? req.body.aes_kind : null;
+  const now = utcNowRouter();
+  getDB().prepare(`
+    INSERT INTO pk_pack_classes (class_value, aes_kind, hide_card, sort_order, updated_at, updated_by)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(class_value) DO UPDATE SET aes_kind=excluded.aes_kind, hide_card=excluded.hide_card,
+      sort_order=excluded.sort_order, updated_at=excluded.updated_at, updated_by=excluded.updated_by
+  `).run(cv, aesKind, req.body.hide_card === '1' ? 1 : 0,
+    Math.min(9999, Math.max(0, Number(req.body.sort_order) || 100)), now, adminActor(req));
+  res.json({ ok: true, class_value: cv });
+}));
+
+/** 分類の候補資材の入れ替え。body: { class_value, codes: "a,b,c" } */
+router.post('/admin/materials/class/candidates', checkOrigin, requireAdmin, api(async (req, res) => {
+  const cv = normalizeKeyText(req.body.class_value);
+  const db = getDB();
+  if (!db.prepare('SELECT 1 FROM pk_pack_classes WHERE class_value=?').get(cv)) {
+    throw new PackError(404, 'not_found', '分類がありません (先に分類を登録してください)');
+  }
+  const codes = String(req.body.codes || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const uniq = [...new Set(codes)];
+  for (const c of uniq) {
+    if (!db.prepare('SELECT 1 FROM pk_pack_materials WHERE code=?').get(c)) {
+      throw new PackError(400, 'bad_material', `資材 ${c} がありません`);
+    }
+  }
+  const now = utcNowRouter();
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM pk_pack_class_materials WHERE class_value=?').run(cv);
+    uniq.forEach((code, i) => db.prepare(`
+      INSERT INTO pk_pack_class_materials (class_value, material_code, sort_order, updated_at, updated_by)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(cv, code, (i + 1) * 10, now, adminActor(req)));
+  });
+  tx.immediate();
+  res.json({ ok: true, count: uniq.length });
+}));
+
+/** 伝票指定辞書 (header_map) の追加・編集。body: { header_value, base_delivery_code, material_code } */
+router.post('/admin/materials/header', checkOrigin, requireAdmin, api(async (req, res) => {
+  const hv = normalizeKeyText(req.body.header_value);
+  if (!hv) throw new PackError(400, 'bad_header', 'header 値は必須です');
+  const base = String(req.body.base_delivery_code || '');
+  if (!BASE_DELIVERY_CODES.includes(base)) throw new PackError(400, 'bad_code', '基底コードが不正です');
+  const mc = String(req.body.material_code || '').trim() || null;
+  const db = getDB();
+  if (mc && !db.prepare('SELECT 1 FROM pk_pack_materials WHERE code=?').get(mc)) {
+    throw new PackError(400, 'bad_material', `資材 ${mc} がありません`);
+  }
+  const now = utcNowRouter();
+  db.prepare(`
+    INSERT INTO pk_pack_header_map (header_value, base_delivery_code, material_code, updated_at, updated_by)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(header_value) DO UPDATE SET base_delivery_code=excluded.base_delivery_code,
+      material_code=excluded.material_code, updated_at=excluded.updated_at, updated_by=excluded.updated_by
+  `).run(hv, base, mc, now, adminActor(req));
+  res.json({ ok: true, header_value: hv });
+}));
+
+/** 登録ルールの修正・無効化 (CAS — §5.1 管理者も同じ)。body: { action: set_material|disable, version, material_code? } */
+router.post('/admin/materials/rules/:id(\\d+)', checkOrigin, requireAdmin, api(async (req, res) => {
+  const db = getDB();
+  const now = utcNowRouter();
+  const admin = adminActor(req);
+  const tx = db.transaction(() => {
+    const rule = db.prepare('SELECT * FROM pk_pack_material_rules WHERE id = ?').get(Number(req.params.id));
+    if (!rule) throw new PackError(404, 'not_found', 'ルールがありません');
+    const version = Number(req.body.version);
+    if (rule.version !== version) throw new PackError(409, 'conflict', '他で変更されています。再読み込みしてください');
+    const before = rule.material_code;
+    if (req.body.action === 'disable') {
+      const u = db.prepare(`
+        UPDATE pk_pack_material_rules SET status='disabled', version=version+1, updated_by=?, updated_at=?
+        WHERE id=? AND version=?`).run(admin, now, rule.id, version);
+      if (u.changes !== 1) throw new PackError(409, 'conflict', '他で変更されています');
+      insertAdminRuleEvent(db, 'admin_disable', { ...rule, version: version + 1 }, before, admin);
+    } else if (req.body.action === 'set_material') {
+      const mc = String(req.body.material_code || '');
+      const m = db.prepare('SELECT code, is_active FROM pk_pack_materials WHERE code=?').get(mc);
+      if (!m || !m.is_active) throw new PackError(400, 'bad_material', 'その資材は選択できません');
+      if (rule.status !== 'active') throw new PackError(409, 'not_active', '無効化済みルールは変更できません');
+      const u = db.prepare(`
+        UPDATE pk_pack_material_rules SET material_code=?, version=version+1, updated_by=?, updated_at=?
+        WHERE id=? AND version=? AND status='active'`).run(mc, admin, now, rule.id, version);
+      if (u.changes !== 1) throw new PackError(409, 'conflict', '他で変更されています');
+      insertAdminRuleEvent(db, 'admin_edit', { ...rule, version: version + 1, material_code: mc }, before, admin);
+    } else {
+      throw new PackError(400, 'bad_action', 'action が不正です');
+    }
+  });
+  tx.immediate();
+  res.json({ ok: true });
+}));
+
+/** 通知の手動再送 (failed のみ — §5.3)。 */
+router.post('/admin/materials/notify/:id(\\d+)/resend', checkOrigin, requireAdmin, api(async (req, res) => {
+  res.json(materialManualResend(Number(req.params.id), adminActor(req)));
+}));
 
 // ─── ⑥ 配送ルール変更の申請 (Render packing-dispatch へ中継 — 要件⑥) ───
 // 承認は GChat カードのボタン (stock-bot 経由)。ここは申請の受付だけ

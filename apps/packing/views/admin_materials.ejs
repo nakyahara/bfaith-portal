@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 1080px; margin: 0 auto; padding: 12px 16px; }
+    .pk-form { background: #f8f9fa; border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+    .pk-form h2 { font-size: 1.05em; margin: 0 0 8px; }
+    .pk-note { font-size: 0.85em; color: #495057; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    th, td { border-bottom: 1px solid #dee2e6; padding: 5px 8px; text-align: left; vertical-align: middle; }
+    th { background: #f1f3f5; }
+    .inactive { color: #adb5bd; text-decoration: line-through; }
+    .mat-thumb { width: 44px; height: 44px; object-fit: contain; background: #fff; border: 1px solid #dee2e6; border-radius: 6px; }
+    .chip { display: inline-block; background: #e9ecef; border-radius: 10px; padding: 1px 8px; margin: 1px; font-size: 0.85em; }
+    .warn { color: #c92a2a; font-weight: 700; }
+    .cfg-err { background: #fff5f5; border: 2px solid #e03131; border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; color: #c92a2a; font-weight: 700; }
+    input[type=text], input[type=number], select { padding: 5px 6px; font-size: 0.95em; }
+    button { padding: 5px 12px; cursor: pointer; }
+    .row-form { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    details { margin-bottom: 10px; }
+    summary { cursor: pointer; font-weight: 700; }
+    .msg { font-size: 0.9em; margin-left: 8px; }
+    .msg.err { color: #c92a2a; } .msg.ok { color: #2b8a3e; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">📦 梱包資材の管理</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/packing/admin/summary" class="btn-logout">📊 サマリ</a>
+      <a href="/apps/packing/" class="btn-logout">← バッチ一覧</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <% if (!webhookConfigured) { %>
+      <div class="cfg-err">🚨 通知先未設定: PACKING_MATERIAL_WEBHOOK (または PACKING_SHIP_CHANGE_WEBHOOK) が .env にありません。
+        資材変更のGChat通知は送信されず pending のまま溜まります。</div>
+    <% } %>
+
+    <% if (unreviewedHeaders.length > 0 || unreviewedClasses.length > 0) { %>
+      <div class="pk-form" style="border: 2px solid #f08c00">
+        <h2>⚠ 未レビュー (現場で「判定できません」表示になっているもの)</h2>
+        <% if (unreviewedHeaders.length > 0) { %>
+          <div class="pk-note">印字ヘッダ1 (伝票指定辞書に無い値) — 下の「伝票指定辞書」へ追加すると解消します:</div>
+          <table><tr><th>値</th><th>伝票数</th><th>最終観測</th></tr>
+          <% for (const h of unreviewedHeaders) { %>
+            <tr><td><code><%= h.header_raw %></code></td><td><%= h.c %></td><td><%= h.last_at %></td></tr>
+          <% } %></table>
+        <% } %>
+        <% if (unreviewedClasses.length > 0) { %>
+          <div class="pk-note" style="margin-top:8px">引当分類 (マスタ未登録 or AESの mail/other 未設定) — 下の「分類マスタ」へ追加/設定してください:</div>
+          <table><tr><th>分類</th><th>伝票数</th><th>最終観測</th></tr>
+          <% for (const c of unreviewedClasses) { %>
+            <tr><td><code><%= c.hikiate_class %></code></td><td><%= c.c %></td><td><%= c.last_at %></td></tr>
+          <% } %></table>
+        <% } %>
+      </div>
+    <% } %>
+
+    <% if (notifyIssues.length > 0) { %>
+      <div class="pk-form">
+        <h2>🔔 通知 (未送信 / 失敗)</h2>
+        <table><tr><th>#</th><th>状態</th><th>試行</th><th>伝票</th><th>変更</th><th>エラー</th><th></th></tr>
+        <% for (const n of notifyIssues) { %>
+          <tr id="event-<%= n.id %>">
+            <td><%= n.id %></td>
+            <td><%= n.notify_status %><% if (n.notify_status === 'failed') { %> <span class="warn">🚨</span><% } %></td>
+            <td><%= n.attempt_count %></td>
+            <td><%= n.folder_name %> #<%= n.slip_seq %></td>
+            <td><%= n.before_code %> → <%= n.after_code %> (<%= n.worker %>)</td>
+            <td style="max-width:220px; overflow:hidden; text-overflow:ellipsis"><%= n.notify_error || '' %></td>
+            <td><% if (n.notify_status === 'failed') { %><button onclick="post(`/apps/packing/admin/materials/notify/<%= n.id %>/resend`, {}, this)">再送</button><% } %></td>
+          </tr>
+        <% } %></table>
+      </div>
+    <% } %>
+
+    <div class="pk-form">
+      <h2>資材マスタ (<%= materials.length %>)</h2>
+      <div class="pk-note">名前・色・並び順の変更は行の「保存」。無効化した資材は新規選択に出なくなります (登録済みルールは⚠付きで表示継続)。画像は png/jpg/webp・2MBまで (SVG不可)。</div>
+      <table>
+        <tr><th>画像</th><th>code</th><th>名前</th><th>色</th><th>並び</th><th>有効</th><th></th></tr>
+        <% for (const m of materials) { %>
+          <tr class="<%= m.is_active ? '' : 'inactive' %>">
+            <td><% if (m.image_file) { %><img class="mat-thumb" src="/apps/packing/materials/<%= m.image_file %>" alt=""><% } else { %><span class="chip" style="background:<%= m.color || '#e9ecef' %>22">画像なし</span><% } %>
+              <input type="file" id="img-<%= m.code %>" accept="image/png,image/jpeg,image/webp" style="width:90px; font-size:0.8em"
+                onchange="uploadImage('<%= m.code %>', this)"></td>
+            <td><code><%= m.code %></code></td>
+            <td><input type="text" id="name-<%= m.code %>" value="<%= m.name %>" style="width:220px"></td>
+            <td><input type="text" id="color-<%= m.code %>" value="<%= m.color || '' %>" style="width:80px" placeholder="#8a6d1f"></td>
+            <td><input type="number" id="sort-<%= m.code %>" value="<%= m.sort_order %>" style="width:64px"></td>
+            <td><select id="active-<%= m.code %>"><option value="1" <%= m.is_active ? 'selected' : '' %>>有効</option><option value="0" <%= m.is_active ? '' : 'selected' %>>無効</option></select></td>
+            <td><button onclick="saveMaterial('<%= m.code %>', this)">保存</button></td>
+          </tr>
+        <% } %>
+      </table>
+      <details style="margin-top:8px"><summary>+ 資材を追加</summary>
+        <div class="row-form" style="margin-top:6px">
+          <input type="text" id="new-code" placeholder="code (英小文字/数字/_)" style="width:180px">
+          <input type="text" id="new-name" placeholder="名前" style="width:220px">
+          <input type="text" id="new-color" placeholder="#色" style="width:80px">
+          <button onclick="addMaterial(this)">追加</button>
+        </div>
+      </details>
+    </div>
+
+    <div class="pk-form">
+      <h2>分類マスタ + 候補資材 (<%= classes.length %>)</h2>
+      <div class="pk-note">引当分類名は<b>完全一致</b>。AES分類は mail (メール便) / other (メール便以外) の設定が必須 (未設定=現場で「判定できません」)。
+        「カード非表示」= LINEギフトなど資材カード自体を出さない分類。候補はカンマ区切りの code 一覧で入れ替え。</div>
+      <table>
+        <tr><th>分類</th><th>AES</th><th>非表示</th><th>候補 (順に表示・5件以下はカード内ボタン)</th><th></th></tr>
+        <% for (const c of classes) { %>
+          <tr>
+            <td style="max-width:280px"><code><%= c.class_value %></code></td>
+            <td><select data-class="<%= c.class_value %>" class="aes-sel">
+              <option value="" <%= !c.aes_kind ? 'selected' : '' %>>—</option>
+              <option value="mail" <%= c.aes_kind === 'mail' ? 'selected' : '' %>>mail</option>
+              <option value="other" <%= c.aes_kind === 'other' ? 'selected' : '' %>>other</option></select></td>
+            <td><input type="checkbox" class="hide-chk" data-class="<%= c.class_value %>" <%= c.hide_card ? 'checked' : '' %>></td>
+            <td>
+              <% for (const cd of c.candidates) { %><span class="chip <%= cd.is_active ? '' : 'inactive' %>"><%= cd.name || cd.material_code %></span><% } %>
+              <div class="row-form" style="margin-top:4px">
+                <input type="text" class="cand-input" data-class="<%= c.class_value %>"
+                  value="<%= c.candidates.map((x) => x.material_code).join(',') %>" style="width:100%; max-width:520px; font-size:0.85em">
+              </div>
+            </td>
+            <td><button onclick="saveClass('<%= encodeURIComponent(c.class_value) %>', this)">保存</button></td>
+          </tr>
+        <% } %>
+      </table>
+      <details style="margin-top:8px"><summary>+ 分類を追加</summary>
+        <div class="row-form" style="margin-top:6px">
+          <input type="text" id="new-class" placeholder="引当分類名 (完全一致)" style="width:360px">
+          <select id="new-class-aes"><option value="">AES区分なし</option><option value="mail">mail</option><option value="other">other</option></select>
+          <label><input type="checkbox" id="new-class-hide"> カード非表示</label>
+          <button onclick="addClass(this)">追加</button>
+        </div>
+      </details>
+    </div>
+
+    <div class="pk-form">
+      <h2>伝票指定辞書 (印字ヘッダ1 → 配送種別 / 指定資材)</h2>
+      <div class="pk-note">全伝票の印字ヘッダ1をここで判定します。指定資材を設定した値 (例: レターパック500) は現場で「📌伝票指定」として最優先表示・変更不可。
+        「資材指示ではない」値は指定資材を空にして登録 (配送種別の判定のみに使う)。base=aes は分類マスタの mail/other で分岐。</div>
+      <table>
+        <tr><th>印字ヘッダ1 (正規化値)</th><th>基底コード</th><th>指定資材</th><th></th></tr>
+        <% for (const h of headerMap) { %>
+          <tr>
+            <td><code><%= h.header_value %></code></td>
+            <td><%= h.base_delivery_code %></td>
+            <td><%= h.material_name || '' %></td>
+            <td></td>
+          </tr>
+        <% } %>
+        <tr>
+          <td><input type="text" id="hm-value" placeholder="印字ヘッダ1の値" style="width:240px"></td>
+          <td><select id="hm-base"><% for (const b of baseDeliveryCodes) { %><option value="<%= b %>"><%= b %></option><% } %></select></td>
+          <td><select id="hm-material"><option value="">(指定なし)</option><% for (const m of materials.filter((x) => x.is_active)) { %><option value="<%= m.code %>"><%= m.name %></option><% } %></select></td>
+          <td><button onclick="addHeader(this)">追加/更新</button></td>
+        </tr>
+      </table>
+    </div>
+
+    <div class="pk-form">
+      <h2>登録ルール (最新100件)</h2>
+      <form method="get" class="row-form" style="margin-bottom:8px">
+        <input type="text" name="q" value="<%= q %>" placeholder="SKU / 商品名 / 資材code で検索" style="width:280px">
+        <button type="submit">検索</button>
+      </form>
+      <table>
+        <tr><th>id</th><th>商品構成</th><th>配送</th><th>資材</th><th>状態</th><th>更新</th><th>修正</th></tr>
+        <% for (const r of rules) { %>
+          <% let detail = []; try { detail = JSON.parse(r.combo_detail); } catch {} %>
+          <tr class="<%= r.status === 'active' ? '' : 'inactive' %>">
+            <td><%= r.id %><% if (r.recent_changes >= 2) { %><div class="warn">⚠7日<%= r.recent_changes %>回変更</div><% } %></td>
+            <td style="max-width:300px"><% for (const d of detail) { %><div><%= d.name || d.sku %> × <%= d.qty %></div><% } %></td>
+            <td><%= r.delivery_code %></td>
+            <td><%= r.material_name || r.material_code %><% if (r.material_active === 0) { %> <span class="warn">⚠廃止資材</span><% } %></td>
+            <td><%= r.status %> v<%= r.version %><div style="font-size:0.8em; color:#868e96"><%= r.updated_by %></div></td>
+            <td style="font-size:0.8em"><%= r.updated_at %></td>
+            <td>
+              <% if (r.status === 'active') { %>
+                <div class="row-form">
+                  <select id="rule-mat-<%= r.id %>"><% for (const m of materials.filter((x) => x.is_active)) { %><option value="<%= m.code %>" <%= m.code === r.material_code ? 'selected' : '' %>><%= m.name %></option><% } %></select>
+                  <button onclick="ruleAction(<%= r.id %>, <%= r.version %>, 'set_material', this)">変更</button>
+                  <button onclick="if (confirm('このルールを無効化しますか? (次回は未登録として候補提示)')) ruleAction(<%= r.id %>, <%= r.version %>, 'disable', this)">無効化</button>
+                </div>
+              <% } %>
+            </td>
+          </tr>
+        <% } %>
+      </table>
+    </div>
+
+    <div class="pk-form">
+      <h2>変更履歴 (最新60件)</h2>
+      <table>
+        <tr><th>#</th><th>日時(UTC)</th><th>操作</th><th>伝票</th><th>変更</th><th>作業者</th><th>通知</th></tr>
+        <% for (const e of events) { %>
+          <tr id="event-<%= e.id %>">
+            <td><%= e.id %></td>
+            <td style="font-size:0.85em"><%= e.created_at %><% if (e.undone_at) { %> <span class="chip">取消済</span><% } %></td>
+            <td><%= e.action %></td>
+            <td><%= e.folder_name || '' %><% if (e.slip_seq) { %> #<%= e.slip_seq %><% } %></td>
+            <td><%= e.before_code || '—' %> → <%= e.after_code || '—' %></td>
+            <td><%= e.worker %></td>
+            <td style="font-size:0.85em"><%= e.notify_status === 'none' ? '' : e.notify_status %></td>
+          </tr>
+        <% } %>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    function msg(btn, ok, text) {
+      let m = btn.nextElementSibling;
+      if (!m || !m.classList || !m.classList.contains('msg')) {
+        m = document.createElement('span'); m.className = 'msg'; btn.after(m);
+      }
+      m.className = 'msg ' + (ok ? 'ok' : 'err');
+      m.textContent = text;
+      if (ok) setTimeout(() => location.reload(), 600);
+    }
+    async function post(url, body, btn) {
+      try {
+        const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json().catch(() => ({}));
+        msg(btn, r.ok, r.ok ? '✔' : (j.error || 'エラー'));
+      } catch { msg(btn, false, '通信エラー'); }
+    }
+    function saveMaterial(code, btn) {
+      post('/apps/packing/admin/materials/master', {
+        code,
+        name: document.getElementById('name-' + code).value,
+        color: document.getElementById('color-' + code).value,
+        sort_order: document.getElementById('sort-' + code).value,
+        is_active: document.getElementById('active-' + code).value,
+      }, btn);
+    }
+    function addMaterial(btn) {
+      post('/apps/packing/admin/materials/master', {
+        code: document.getElementById('new-code').value.trim(),
+        name: document.getElementById('new-name').value.trim(),
+        color: document.getElementById('new-color').value.trim(),
+      }, btn);
+    }
+    async function uploadImage(code, input) {
+      if (!input.files || !input.files[0]) return;
+      const fd = new FormData();
+      fd.append('code', code);
+      fd.append('file', input.files[0]);
+      const r = await fetch('/apps/packing/admin/materials/master/image', { method: 'POST', body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok) location.reload(); else alert(j.error || 'アップロード失敗');
+    }
+    async function saveClass(encoded, btn) {
+      const cv = decodeURIComponent(encoded);
+      const aes = document.querySelector(`.aes-sel[data-class="${CSS.escape(cv)}"]`).value;
+      const hide = document.querySelector(`.hide-chk[data-class="${CSS.escape(cv)}"]`).checked;
+      const codes = document.querySelector(`.cand-input[data-class="${CSS.escape(cv)}"]`).value;
+      try {
+        const opts = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const r1 = await fetch('/apps/packing/admin/materials/class', opts({ class_value: cv, aes_kind: aes, hide_card: hide ? '1' : '0' }));
+        if (!r1.ok) { const j1 = await r1.json().catch(() => ({})); msg(btn, false, j1.error || 'エラー'); return; }
+        const r2 = await fetch('/apps/packing/admin/materials/class/candidates', opts({ class_value: cv, codes }));
+        const j2 = await r2.json().catch(() => ({}));
+        msg(btn, r2.ok, r2.ok ? '✔' : (j2.error || 'エラー'));
+      } catch { msg(btn, false, '通信エラー'); }
+    }
+    function addClass(btn) {
+      post('/apps/packing/admin/materials/class', {
+        class_value: document.getElementById('new-class').value,
+        aes_kind: document.getElementById('new-class-aes').value,
+        hide_card: document.getElementById('new-class-hide').checked ? '1' : '0',
+      }, btn);
+    }
+    function addHeader(btn) {
+      post('/apps/packing/admin/materials/header', {
+        header_value: document.getElementById('hm-value').value,
+        base_delivery_code: document.getElementById('hm-base').value,
+        material_code: document.getElementById('hm-material').value,
+      }, btn);
+    }
+    function ruleAction(id, version, action, btn) {
+      post(`/apps/packing/admin/materials/rules/${id}`, {
+        action, version,
+        material_code: action === 'set_material' ? document.getElementById('rule-mat-' + id).value : undefined,
+      }, btn);
+    }
+  </script>
+</body>
+</html>

@@ -125,3 +125,26 @@ export async function postReprintText(text) {
   if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
   return true;
 }
+
+// ─── 📦 梱包資材の変更通知 (要件『梱包資材表示_要件定義_20260823.md』§5.3) ───
+// 送り先 = 「配送ルール承認」スペースの incoming webhook (中原さん決定 2026-08-24: 相乗り)。
+// env: PACKING_MATERIAL_WEBHOOK → fallback PACKING_SHIP_CHANGE_WEBHOOK。
+// 両方未設定 = 構成エラー (outbox は claim しない — 管理画面に常時表示)
+
+export function materialWebhookConfigured() {
+  return !!(process.env.PACKING_MATERIAL_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK);
+}
+
+/** outbox の sendFn。true=送信成功 / throw=失敗 (outbox がバックオフ再試行)。 */
+export async function postMaterialText(text) {
+  const url = process.env.PACKING_MATERIAL_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK;
+  if (!url) return false;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`GChat webhook HTTP ${res.status}`);
+  return true;
+}

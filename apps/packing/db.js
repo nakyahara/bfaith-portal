@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -276,6 +276,111 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_pack_incidents ADD COLUMN actual_name TEXT');
     db.exec('ALTER TABLE pk_pack_batches ADD COLUMN blocked_since TEXT');
     db.exec('ALTER TABLE pk_pack_batches ADD COLUMN blocked_total_sec INTEGER NOT NULL DEFAULT 0');
+  },
+  // v10: 梱包資材の表示・現場登録 (要件定義 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7)。
+  //   - 判定順: hidden (分類 hide_card) → held (④依頼中) → header (伝票指定) → rule (登録) →
+  //     candidates (分類別候補) → unknown。配送種別は print_header1 の完全一致辞書から導出
+  //   - ルールは version CAS + active 部分一意。イベントは追記型で通知 outbox を兼ねる
+  //   - views は伝票1行の表示観測ログ (未レビュー値の検出・採用実績。意図的に FK なし)
+  10: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_materials (
+      code         TEXT PRIMARY KEY CHECK(code NOT GLOB '*[^a-z0-9_]*' AND length(code) BETWEEN 2 AND 40),
+      name         TEXT NOT NULL,
+      color        TEXT,
+      image_file   TEXT,
+      sort_order   INTEGER NOT NULL DEFAULT 100 CHECK(sort_order BETWEEN 0 AND 9999),
+      is_active    INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_header_map (
+      header_value  TEXT PRIMARY KEY,
+      base_delivery_code TEXT NOT NULL CHECK(base_delivery_code IN
+        ('nekopos','yupacket_puff','teikeigai','letterpack','takkyubin50','takkyubin60plus','aes','unsupported')),
+      material_code TEXT REFERENCES pk_pack_materials(code),
+      updated_at TEXT NOT NULL, updated_by TEXT
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_classes (
+      class_value TEXT PRIMARY KEY,
+      aes_kind    TEXT CHECK(aes_kind IN ('mail','other')),
+      hide_card   INTEGER NOT NULL DEFAULT 0 CHECK(hide_card IN (0,1)),
+      sort_order  INTEGER NOT NULL DEFAULT 100,
+      updated_at TEXT NOT NULL, updated_by TEXT
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_class_materials (
+      class_value   TEXT NOT NULL REFERENCES pk_pack_classes(class_value),
+      material_code TEXT NOT NULL REFERENCES pk_pack_materials(code),
+      sort_order    INTEGER NOT NULL DEFAULT 100,
+      updated_at TEXT NOT NULL, updated_by TEXT,
+      PRIMARY KEY (class_value, material_code)
+    )`);
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_material_rules (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      combo_key     TEXT NOT NULL CHECK(combo_key GLOB 'v[0-9]*|*' AND length(combo_key) <= 4000),
+      combo_detail  TEXT NOT NULL,
+      delivery_code TEXT NOT NULL CHECK(delivery_code IN
+        ('nekopos','yupacket_puff','teikeigai','letterpack','takkyubin50','takkyubin60plus','aes_mail','aes_other')),
+      material_code TEXT NOT NULL REFERENCES pk_pack_materials(code),
+      status        TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+      version       INTEGER NOT NULL DEFAULT 1 CHECK(version >= 1),
+      created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+      updated_by TEXT, updated_at TEXT NOT NULL
+    )`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_pack_material_rules_active
+      ON pk_pack_material_rules(combo_key, delivery_code) WHERE status='active'`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_material_rules_key ON pk_pack_material_rules(combo_key, delivery_code)');
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_material_events (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      op_id           TEXT NOT NULL UNIQUE,
+      request_hash    TEXT NOT NULL,
+      response_json   TEXT,
+      action          TEXT NOT NULL CHECK(action IN ('register','change','undo','admin_edit','admin_disable')),
+      rule_id         INTEGER NOT NULL REFERENCES pk_pack_material_rules(id),
+      rule_version    INTEGER NOT NULL CHECK(rule_version >= 1),
+      combo_key TEXT NOT NULL, delivery_code TEXT NOT NULL,
+      delivery_raw TEXT, hikiate_class TEXT, header_raw TEXT,
+      batch_id INTEGER, slip_seq INTEGER, ne_slip_no TEXT, folder_name TEXT,
+      shown_source    TEXT CHECK(shown_source IN ('header','rule','candidates','unknown','held','hidden')),
+      before_code TEXT, after_code TEXT,
+      worker          TEXT NOT NULL,
+      created_at      TEXT NOT NULL,
+      undo_expires_at TEXT, undone_at TEXT,
+      target_event_id INTEGER REFERENCES pk_pack_material_events(id),
+      notify_status   TEXT NOT NULL DEFAULT 'none'
+        CHECK(notify_status IN ('none','pending','sending','sent','cancelled','failed')),
+      notify_due_at TEXT, next_attempt_at TEXT, claimed_at TEXT, claim_token TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+      resend_requested_at TEXT, resend_by TEXT,
+      undo_key_version INTEGER NOT NULL DEFAULT 1,
+      notified_at TEXT, notify_error TEXT,
+      CHECK ((action IN ('register','change')) = (undo_expires_at IS NOT NULL)),
+      CHECK ((action IN ('register','change')) <= (after_code IS NOT NULL)),
+      CHECK ((action = 'change') <= (before_code IS NOT NULL)),
+      CHECK ((action = 'undo') = (target_event_id IS NOT NULL)),
+      CHECK ((action = 'change') = (notify_status <> 'none')),
+      CHECK ((notify_status NOT IN ('pending','sending')) OR (notify_due_at IS NOT NULL AND next_attempt_at IS NOT NULL)),
+      CHECK ((notify_status <> 'sending') OR (claim_token IS NOT NULL AND claimed_at IS NOT NULL)),
+      CHECK ((notify_status <> 'sent') OR (notified_at IS NOT NULL))
+    )`);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_pack_material_events_undo
+      ON pk_pack_material_events(target_event_id) WHERE target_event_id IS NOT NULL`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_pk_pack_material_events_outbox
+      ON pk_pack_material_events(next_attempt_at) WHERE notify_status='pending'`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_pk_pack_material_events_sending
+      ON pk_pack_material_events(claimed_at) WHERE notify_status='sending'`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_material_events_rule ON pk_pack_material_events(rule_id, id)');
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_pack_material_views (
+      batch_id INTEGER NOT NULL, slip_seq INTEGER NOT NULL,
+      delivery_raw TEXT, hikiate_class TEXT, delivery_code TEXT NOT NULL,
+      header_raw TEXT,
+      combo_key TEXT,
+      source TEXT NOT NULL CHECK(source IN ('header','rule','candidates','unknown','held','hidden')),
+      material_code TEXT, rule_id INTEGER,
+      first_shown_at TEXT NOT NULL, last_shown_at TEXT NOT NULL,
+      completed_at TEXT,
+      completed_source TEXT, completed_material_code TEXT, completed_rule_id INTEGER,
+      PRIMARY KEY (batch_id, slip_seq)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_material_views_src ON pk_pack_material_views(source, last_shown_at)');
   },
 };
 
