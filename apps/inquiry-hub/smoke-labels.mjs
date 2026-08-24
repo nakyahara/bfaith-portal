@@ -137,6 +137,15 @@ console.log('3. メールルール連携');
     { matchMode: 'all', apply: true, action: 'import', labelId: claim.id });
   check('再適用は冪等 (0件)', ap2.matched === 0 && ap2.labeled === 0, JSON.stringify(ap2));
 
+  // 「完了扱い+ラベル」の一括適用は、すでに完了済みのメールにもラベルを付ける
+  // (2026-08-25 実運用: 完了済みだけが残っているとラベルが1件も付かなかった)
+  const tDone = mkInq('t-refund-done', 'done');
+  db.prepare("UPDATE inquiries SET subject = '返金希望2' WHERE id = ?").run(tDone);
+  const apDone = applyRuleToExistingMails([{ field: 'subject', op: 'contains', value: '返金希望2' }],
+    { matchMode: 'all', apply: true, action: 'import_done', labelId: claim.id });
+  check('完了済みメールにも一括適用でラベルが付く (完了化は0件)', apDone.labeled === 1 && apDone.completed === 0
+    && db.prepare('SELECT label_id FROM inquiries WHERE id = ?').get(tDone).label_id === claim.id, JSON.stringify(apDone));
+
   // ラベル削除でルールのラベル参照も外れる (壊れたルールを残さない)
   const tmp = createLabel('一時', '#111111');
   const rid = addMailRule({ conditions: [{ field: 'from', op: 'contains', value: 'tmp' }], action: 'import', labelId: tmp.id }).id;

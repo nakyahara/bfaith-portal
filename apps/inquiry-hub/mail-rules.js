@@ -170,17 +170,17 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
     }
   }
   const completing = action !== 'import';
-  // 完了化は未完了のみ / フォルダ・ラベルは「まだ付いていないもの」のみ (何度押しても冪等)
+  // 対象 = 何かしら変更が必要なもののみ (何度押しても冪等):
+  //   完了化 → 未完了 / フォルダ・ラベル → まだ付いていないもの。
+  // ⚠️完了化とフォルダ・ラベルは OR で重ねる — 「完了扱い+ラベル」のルールを既存へ適用したとき、
+  //   すでに完了済みのメールにもラベルは付ける (2026-08-25 実運用: 完了済みだけが残っていて
+  //   ラベルが1件も付かない事象。更新は行ごとの条件付きUPDATEなので二重適用はない)
   const needParams = [];
-  let extra;
-  if (completing) {
-    extra = `i.internal_status != 'done'`;
-  } else {
-    const parts = [];
-    if (fid != null) { parts.push(`(i.folder_id IS NULL OR i.folder_id != ?)`); needParams.push(fid); }
-    if (lid != null) { parts.push(`(i.label_id IS NULL OR i.label_id != ?)`); needParams.push(lid); }
-    extra = `(${parts.join(' OR ')})`;
-  }
+  const parts = [];
+  if (completing) parts.push(`i.internal_status != 'done'`);
+  if (fid != null) { parts.push(`(i.folder_id IS NULL OR i.folder_id != ?)`); needParams.push(fid); }
+  if (lid != null) { parts.push(`(i.label_id IS NULL OR i.label_id != ?)`); needParams.push(lid); }
+  const extra = parts.length > 1 ? `(${parts.join(' OR ')})` : parts[0];
   const where = `i.channel_type = 'email' AND i.is_archived = 0 AND ${extra}
     AND (${clauses.join(matchMode === 'any' ? ' OR ' : ' AND ')})`;
   const allParams = [...needParams, ...params];
