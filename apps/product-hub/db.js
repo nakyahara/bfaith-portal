@@ -7,9 +7,11 @@
  *   - 金額は整数 (円)。REAL 禁止
  *   - draft_events は append-only の監査ログ
  *
- * ステータス遷移 (§3):
+ * ステータス (§3 → PR4 2026-08-24 で工程からの導出値に切替):
  *   draft(下書き) → ready_for_ai(生成待ち) → review(レビュー待ち) → approved(承認済み)
  *   → listed(楽天出品済み) → expanded(展開済み)。どこからでも on_hold / excluded へ退避可。
+ *   値は lib/workflow-progress.js の recomputeDraftStatus が工程・モール状態から再計算して書く。
+ *   手で遷移させるのは 保留/除外/再開 のみ (それ以外の手動遷移 API は廃止)。
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { fileViewUrl } from './lib/drive-link.js';
@@ -1185,23 +1187,8 @@ export function releaseGenerationClaim(db, draftId, runId) {
   `).run(draftId, runId).changes === 1;
 }
 
-/**
- * ゲート必須項目が後から壊された場合 (公式URL削除・最後の画像削除など) に
- * ready_for_ai を draft に自動差し戻す (Codex R1 high 対応: ゲートすり抜け防止)。
- * @returns {string[]|null} 差し戻した場合はその理由、しなかった場合は null
- */
-export function demoteIfGateBroken(db, draftId, actor) {
-  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(draftId);
-  if (!draft || draft.status !== 'ready_for_ai') return null;
-  const reasons = gateReasons(db, draft);
-  if (reasons.length === 0) return null;
-  db.prepare(`
-    UPDATE product_drafts SET status = 'draft', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-    WHERE id = ? AND status = 'ready_for_ai'
-  `).run(draftId);
-  logEvent(db, draftId, 'auto_demoted_to_draft', reasons.join(' / '), actor);
-  return reasons;
-}
+// demoteIfGateBroken は lib/workflow-progress.js へ移設 (PR4):
+// status を直接書かず「基本情報入力」工程を差し戻して導出に任せる形に変わったため
 
 /**
  * サムネイルプロキシ (/api/thumb) の取得対象を「product-hub が管理している画像」に限定する。

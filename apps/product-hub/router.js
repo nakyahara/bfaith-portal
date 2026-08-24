@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import crypto from 'crypto';
 
 import {
-  getDB, logEvent, gateReasons, demoteIfGateBroken, applyFolderImport,
+  getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
   upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
@@ -25,8 +25,9 @@ import {
   listSteps, createStep, updateStep, workflowOverview,
 } from './lib/workflow.js';
 import {
-  progressOf, setStepState, progressSummaryFor, ensureProgressForMany, boardData, STEP_STATE_LABELS,
+  progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
+  ESCAPE_STATUSES, deriveDraftStatus, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -68,24 +69,9 @@ router.use(express.json({ limit: '512kb' }));
 const view = (name) => path.join(__dirname, 'views', name);
 const actorOf = (req) => req.session?.email || req.session?.displayName || null;
 
-// ステータス遷移の許可表 (§3)。on_hold/excluded へは全ステータスから退避可
-const TRANSITIONS = {
-  draft: ['ready_for_ai'],
-  ready_for_ai: ['draft', 'review'],
-  review: ['approved', 'draft'],
-  approved: ['listed', 'review'],
-  listed: ['expanded'],
-  expanded: [],
-  on_hold: ['draft'],
-  excluded: ['draft'],
-};
-const ESCAPE_STATUSES = ['on_hold', 'excluded'];
-
-function canTransition(from, to) {
-  if (!DRAFT_STATUSES.includes(to)) return false;
-  if (ESCAPE_STATUSES.includes(to)) return from !== to;
-  return (TRANSITIONS[from] || []).includes(to);
-}
+// ステータス遷移表は PR4 (2026-08-24) で廃止。status は工程からの導出値になり、
+// 手で動かせるのは 保留 (on_hold) / 除外 (excluded) への退避と、そこからの再開 (resume) だけ。
+// ESCAPE_STATUSES は lib/workflow-progress.js から import している
 
 // 金額 sanitize (非有限→null、0〜1兆 clamp、整数化)。
 // 売価に負数は無意味なので 0 に clamp — DB の CHECK (0..1e12) と必ず整合させる (Codex R2 medium)
@@ -139,6 +125,7 @@ function rakutenShippingLabelOf(db, draftId) {
 
 router.get('/', (req, res) => {
   const db = getDB();
+  maybeBackfillDerivedStatus(db);   // PR4 切替の一回きりバックフィル (実施済みなら即 return)
   const statusFilter = DRAFT_STATUSES.includes(req.query.status) ? req.query.status : null;
 
   const counts = {};
@@ -196,6 +183,7 @@ router.get('/detail/:id', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const db = getDB();
+  maybeBackfillDerivedStatus(db);
   // 「本コードに差し替えたが NE 未取込だった」商品を、NE に現れていれば確定させる
   reconcileProvisionalCode(db, draft);
   const yahoo = db.prepare('SELECT * FROM draft_yahoo WHERE draft_id = ?').get(draft.id) || null;
@@ -212,8 +200,10 @@ router.get('/detail/:id', (req, res) => {
   for (const k of AI_OUTPUT_KINDS) aiOutputs[k] = aiRows.find((r) => r.kind === k) || null;
   const events = db.prepare('SELECT * FROM draft_events WHERE draft_id = ? ORDER BY id DESC LIMIT 30').all(draft.id);
 
-  const nextStatuses = (TRANSITIONS[draft.status] || [])
-    .concat(ESCAPE_STATUSES.filter((s) => s !== draft.status));
+  // PR4: 手動遷移は退避と再開だけ。導出 status の押し上げは工程パネルから行う
+  const nextStatuses = ESCAPE_STATUSES.includes(draft.status)
+    ? ['resume']
+    : ESCAPE_STATUSES.filter((s) => s !== draft.status);
 
   // NE の代表商品コードでバリエーション判定 (NE が正・DB には焼かない)
   const variation = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
@@ -711,28 +701,45 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── API: ステータス遷移 (§4 ゲート) ───────────────────────
+// ─── API: 保留・除外・再開 (PR4: それ以外の手動遷移は廃止 = 工程からの導出) ──────
 
 router.post('/api/drafts/:id/status', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
   const to = String(req.body?.to || '');
-  if (!canTransition(draft.status, to)) {
-    return res.status(400).json({ ok: false, error: `${STATUS_LABELS[draft.status] || draft.status} から ${STATUS_LABELS[to] || to} へは遷移できません` });
-  }
   const db = getDB();
-  // review へ進むときも再チェック (ready_for_ai 到達後に必須項目が壊された場合のすり抜け防止)
-  if (to === 'ready_for_ai' || to === 'review') {
-    const reasons = gateReasons(db, draft);
-    if (reasons.length > 0) {
-      return res.status(400).json({ ok: false, error: '必須項目が未入力です', reasons });
+  const isEscaped = ESCAPE_STATUSES.includes(draft.status);
+
+  if (ESCAPE_STATUSES.includes(to)) {
+    if (draft.status === to) {
+      return res.status(400).json({ ok: false, error: `すでに${STATUS_LABELS[to]}です` });
     }
+    db.prepare(`
+      UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = ?
+    `).run(to, draft.id, draft.status);
+    logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${to}`, actorOf(req));
+    return res.json({ ok: true, status: to });
   }
-  db.prepare(`
-    UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?
-  `).run(to, draft.id);
-  logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${to}`, actorOf(req));
-  res.json({ ok: true, status: to });
+
+  // 再開: 退避前の値には戻さず、工程の実態から導出し直す (退避中に工程が動いていても正しい列に着地する)。
+  // 旧UIの互換で to='draft' も再開として受ける
+  if (to === 'resume' || (isEscaped && to === 'draft')) {
+    if (!isEscaped) {
+      return res.status(400).json({ ok: false, error: '保留・除外中ではありません' });
+    }
+    ensureProgress(db, draft.id);
+    const next = deriveDraftStatus(db, draft.id);
+    db.prepare(`
+      UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = ?
+    `).run(next, draft.id, draft.status);
+    logEvent(db, draft.id, 'status_changed', `${draft.status} -> ${next} (再開・工程から判定)`, actorOf(req));
+    return res.json({ ok: true, status: next });
+  }
+
+  return res.status(400).json({
+    ok: false,
+    error: 'ステータスは工程の進捗から自動で決まります。手で動かせるのは保留・除外・再開だけです (進めたいときは工程パネルを操作してください)',
+  });
 });
 
 // ─── API: Notion カードリトライ ───────────────────────────
@@ -1533,6 +1540,7 @@ function workflowError(res, e) {
 // (2026-08-24: 上下 2 段だと同じ商品が 2 箇所に出て 2 重管理に見える、の対応)
 router.get('/board', (req, res) => {
   const db = getDB();
+  maybeBackfillDerivedStatus(db);
   const me = staffByPortalEmail(req.session?.email);
   // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
   const raw = String(req.query.assignee || '').trim();
@@ -1644,7 +1652,8 @@ router.post('/api/drafts/:id/steps/:code', (req, res) => {
       // 画面から来る操作は版数トークン必須。省略で楽観ロックを回避されないようにする
       requireVersion: true,
     });
-    res.json({ ok: true, changed: r.changed, version: r.version });
+    // draftStatus = 工程から導出し直した status (PR4)。画面がバッジを追従させるのに使う
+    res.json({ ok: true, changed: r.changed, version: r.version, draftStatus: r.draftStatus || null });
   } catch (e) { workflowError(res, e); }
 });
 
@@ -1772,6 +1781,9 @@ serviceApiRouter.use(requireServiceToken);
 // 生成待ち一覧 (AI 生成の材料つき、読み取り専用 = プレビュー用)
 serviceApiRouter.get('/generation-queue', (req, res) => {
   const db = getDB();
+  // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
+  // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
+  maybeBackfillDerivedStatus(db);
   res.json({ ok: true, drafts: listGenerationQueue(db) });
 });
 
@@ -1785,6 +1797,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
   if (!Number.isInteger(limit) || limit < 1) limit = 2;
   if (limit > 10) limit = 10;   // 1回の実行で押さえられる上限 (Codex: サーバー側上限)
   const db = getDB();
+  maybeBackfillDerivedStatus(db);
   const r = claimGenerationDrafts(db, runId, { limit });
   for (const d of Array.isArray(r.claimed) ? r.claimed : []) {
     logEvent(db, d.id, 'generation_claimed', runId, 'service-api');
@@ -1910,17 +1923,24 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
       if (info.changes === 0) skippedHumanEdited.push(kind);
     }
     logEvent(db, id, 'ai_generated', `${runId}: ${Object.keys(cleaned).join(',')}`, 'service-api');
-    // CAS: changes を見て実際に遷移した時だけ advanced/ログ (Codex R1 medium: 監査ログを嘘にしない)
+    // PR4: status を直接動かさず、工程「AI情報入力待ち」を完了にして導出に任せる。
+    // CAS: changes を見て実際に進めた時だけ advanced/ログ (Codex R1 medium: 監査ログを嘘にしない)。
+    // 書き込み権 (acquireGenerationWriteLock = status が ready_for_ai のまま) は上で取得済みなので、
+    // ここで ai_generate が todo/doing であることは通常一致する
     let advanced = false;
     if (wantAdvance) {
+      ensureProgress(db, id);
       const info = db.prepare(`
-        UPDATE product_drafts SET status = 'review', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        WHERE id = ? AND status = 'ready_for_ai' AND generation_claim_run_id = ?
-      `).run(id, runId);
+        UPDATE draft_step_progress
+        SET state = 'done', done_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), done_by = ?,
+            version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE draft_id = ? AND step_code = 'ai_generate' AND state IN ('todo', 'doing')
+      `).run(`ai:${runId}`, id);
       if (info.changes === 1) {
-        logEvent(db, id, 'status_changed', 'ready_for_ai -> review (ai_generated)', 'service-api');
+        logEvent(db, id, 'step_changed', 'AI情報入力待ち: 完了 (AI生成)', 'service-api');
         advanced = true;
       }
+      recomputeDraftStatus(db, id, { actor: 'service-api' });
     }
     // 書き終えたら claim は解放 (成功・部分保存どちらも。以降の再claimを妨げない)
     releaseGenerationClaim(db, id, runId);

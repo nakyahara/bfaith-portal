@@ -9,10 +9,12 @@
  *   - 初回生成のときだけ、旧 status と画像の有無から「もう終わっている工程」を推定する。
  *     途中で足した工程まで done にしないよう、推定は**初回に限る**
  *   - 担当者は工程の既定担当を初期値に入れ、商品ごとに差し替えられる
- *   - product_drafts.status は**このPRでは触らない**。既存の出品ゲートや AI キューが status を
- *     見ているため、二重管理を承知で並行させる。status を工程から導出する切替は次段階 (PR4)
+ *   - **product_drafts.status は工程からの導出値** (2026-08-24 PR4 で切替)。
+ *     手で遷移させるのは 保留/除外/再開 だけで、それ以外は工程・モールの変化時に
+ *     recomputeDraftStatus が再計算して書く。status 列を残すのは、AI キュー (ready_for_ai) の
+ *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
-import { getDB, logEvent } from '../db.js';
+import { getDB, logEvent, gateReasons } from '../db.js';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -40,6 +42,136 @@ const STATUS_DONE_STEPS = {
   on_hold: [],
   excluded: [],
 };
+
+/** 工程の外に退避している状態 (再開するまで導出の対象外) */
+export const ESCAPE_STATUSES = ['on_hold', 'excluded'];
+
+/**
+ * 工程 → status の導出 (PR4 2026-08-24)。STATUS_DONE_STEPS の逆写像。
+ *
+ * 判定に使うのは**組み込みの本流工程だけ**。管理画面から足したカスタム工程や
+ * セット商品作成検討 (set_review) は status を左右しない — set_review は出品と並走する
+ * 「検討」であって、止まっていても楽天出品や展開の妨げにならないため
+ * (STATUS_DONE_STEPS で listed に set_review が入っているのは「listed まで進んだ商品なら
+ * 検討も済んでいるはず」という初回推定であり、導出の必要条件ではない)。
+ *
+ * listed (楽天出品済み) だけは工程でなく実態で判定する: 楽天モールが done か、
+ * draft_rakuten.registered_at (アプリからの登録記録) のどちらか。
+ * 工程「出品・展開」は全モール決着で閉じるので expanded に対応する。
+ */
+export function deriveDraftStatus(db, draftId) {
+  const id = Number(draftId);
+  const rows = db.prepare(`
+    SELECT step_code, state FROM draft_step_progress
+    WHERE draft_id = ? AND step_code IN ('basic_info', 'ai_generate', 'desc_review', 'title_approve', 'listing')
+  `).all(id);
+  const settled = new Set(rows.filter((r) => r.state === 'done' || r.state === 'skip').map((r) => r.step_code));
+  if (!settled.has('basic_info')) return 'draft';
+  if (!settled.has('ai_generate')) return 'ready_for_ai';
+  if (!settled.has('desc_review') || !settled.has('title_approve')) return 'review';
+  if (settled.has('listing')) return 'expanded';
+  const rakuten = db.prepare(`
+    SELECT 1 FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten' AND state = 'done'
+  `).get(id) || db.prepare(`
+    SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL
+  `).get(id);
+  return rakuten ? 'listed' : 'approved';
+}
+
+/**
+ * status を工程から再計算して書く。工程・モールを動かしたトランザクションの中から呼ぶ。
+ * 保留・除外 (退避中) は触らない — 再開 (router の resume) だけが導出に戻す。
+ * CAS (status = 読んだ値) で書くので、並行する別の再計算と競合しても後勝ちの取り違えは起きない。
+ * @returns {{changed: boolean, status: string|null}}
+ */
+export function recomputeDraftStatus(db, draftId, { actor = null } = {}) {
+  const id = Number(draftId);
+  const draft = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id);
+  if (!draft) return { changed: false, status: null };
+  if (ESCAPE_STATUSES.includes(draft.status)) return { changed: false, status: draft.status };
+  const next = deriveDraftStatus(db, id);
+  if (next === draft.status) return { changed: false, status: draft.status };
+  const info = db.prepare(`
+    UPDATE product_drafts SET status = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    WHERE id = ? AND status = ?
+  `).run(next, id, draft.status);
+  if (info.changes !== 1) return { changed: false, status: draft.status };
+  logEvent(db, id, 'status_changed', `${draft.status} -> ${next} (工程から自動判定)`, actor || 'system');
+  return { changed: true, status: next };
+}
+
+/**
+ * ゲート必須項目が後から壊された場合 (最後の画像削除など) の自動差し戻し。
+ * PR4 で db.js から移設: status を直接書き換えるのではなく、根拠が壊れた
+ * 「基本情報入力」工程を todo に戻し、status は導出で draft に落とす。
+ * 対象は AI 生成前 (ready_for_ai) だけ — 生成後 (review 以降) は文章が既にあるので巻き戻さない。
+ * @returns {string[]|null} 差し戻した場合はその理由、しなかった場合は null
+ */
+export function demoteIfGateBroken(db, draftId, actor) {
+  const id = Number(draftId);
+  const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
+  if (!draft || draft.status !== 'ready_for_ai') return null;
+  const reasons = gateReasons(db, draft);
+  if (reasons.length === 0) return null;
+  const run = db.transaction(() => {
+    const info = db.prepare(`
+      UPDATE draft_step_progress
+      SET state = 'todo', done_at = NULL, done_by = NULL,
+          version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ? AND step_code = 'basic_info' AND state IN ('done', 'skip')
+    `).run(id);
+    if (info.changes === 1) {
+      logEvent(db, id, 'step_changed', '基本情報入力: 完了 → 未着手 (必須項目が外れたため自動差し戻し)', actor);
+    }
+    logEvent(db, id, 'auto_demoted_to_draft', reasons.join(' / '), actor);
+    recomputeDraftStatus(db, id, { actor });
+  });
+  run();
+  return reasons;
+}
+
+/**
+ * 切替時の一回きりバックフィル (遅延実行)。画面表示・AIキューの入口から呼ばれ、
+ * 未実施なら全ドラフトの status を工程から再計算して以後は何もしない。
+ * 旧・手動遷移で listed/expanded になっていた商品は、楽天モール行に done の根拠を先に残す
+ * (残さないと導出が approved へ巻き戻り、「楽天出品済み」の実態と食い違う)。
+ */
+const STATUS_BACKFILL_KEY = 'status_derive_backfilled';
+export function maybeBackfillDerivedStatus(db) {
+  const flag = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(STATUS_BACKFILL_KEY);
+  if (flag?.value) return 0;
+  const drafts = db.prepare(`
+    SELECT id, status FROM product_drafts WHERE status NOT IN ('on_hold', 'excluded')
+  `).all();
+  let changed = 0;
+  const now = nowIso();
+  for (const d of drafts) {
+    try {
+      ensureProgress(db, d.id);
+      if (d.status === 'listed' || d.status === 'expanded') {
+        db.prepare(`
+          INSERT OR IGNORE INTO draft_mall_status (draft_id, mall, state, listed_at)
+          VALUES (?, 'rakuten', 'done', ?)
+        `).run(d.id, now);
+        db.prepare(`
+          UPDATE draft_mall_status
+          SET state = 'done', listed_at = COALESCE(listed_at, ?),
+              version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE draft_id = ? AND mall = 'rakuten' AND state IN ('todo', 'doing')
+        `).run(now, d.id);
+      }
+      if (recomputeDraftStatus(db, d.id, { actor: 'status-derive-backfill' }).changed) changed++;
+    } catch (e) {
+      // 1件の失敗で全体を止めない (次回呼び出しで再試行される)
+      console.warn(`[product-hub] status backfill failed for draft ${d.id}:`, e.message);
+      return changed;
+    }
+  }
+  db.prepare(`INSERT INTO ph_intake_state (key, value) VALUES (?, ?)
+              ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+    .run(STATUS_BACKFILL_KEY, nowIso());
+  return changed;
+}
 
 function badRequest(message) {
   const e = new Error(message);
@@ -452,6 +584,16 @@ export function setStepState(
     if (!STEP_STATES.includes(state)) throw badRequest('状態の指定が不正です');
     // 「出品・展開」の完了はモール側が正 (Codex R2 medium)。
     // ここを素通りさせると、状態セレクトから直接完了にして展開漏れを隠せてしまう
+    // 「基本情報入力」の完了 = AI 生成キューの入口 (PR4)。完了にした瞬間に status が
+    // ready_for_ai へ導出されて夜間バッチが拾うので、生成の材料が揃っていなければ止める
+    // (旧・手動遷移の「生成待ちにする」ボタンと同じゲートを工程側に引き継ぐ)
+    if (state === 'done' && code === 'basic_info') {
+      const draft = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(id);
+      const reasons = draft ? gateReasons(db, draft) : [];
+      if (reasons.length > 0) {
+        throw badRequest(`完了にはまだ足りません: ${reasons.join(' / ')}`);
+      }
+    }
     if (state === 'done' && code === LISTING_STEP) {
       const prov = db.prepare('SELECT provisional_code FROM product_drafts WHERE id = ?').get(id);
       if (prov?.provisional_code === 1) {
@@ -565,16 +707,25 @@ export function setStepState(
     `).run(params);
     if (info.changes !== 1) return null;
     if (event) logEvent(db, id, 'step_changed', event, actor);
-    return db.prepare(
+    // 本流工程の状態が動いたら status を導出し直す (同一トランザクション = 食い違いを残さない)
+    let draftStatus = null;
+    if (stateChanged && row.track === 'main') {
+      draftStatus = recomputeDraftStatus(db, id, { actor }).status;
+    }
+    const freshRow = db.prepare(
       'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
     ).get(id, code);
+    return { ...freshRow, draftStatus };
   });
   const fresh = run();
   if (!fresh) {
     throw conflict('別の人がこの工程を先に更新しました。画面を読み直してください');
   }
   // 続けて操作できるよう、新しい版数を返す (画面が次の楽観ロックに使う)
-  return { changed: true, version: fresh.version ?? null, updated_at: fresh.updated_at || null };
+  return {
+    changed: true, version: fresh.version ?? null, updated_at: fresh.updated_at || null,
+    draftStatus: fresh.draftStatus || null,
+  };
 }
 
 /**

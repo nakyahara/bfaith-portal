@@ -1311,11 +1311,8 @@ export async function registerItem(draftId, { actor = null } = {}) {
     const now = new Date().toISOString();
     saveResult.run(draftId, now, now, null);
     logEvent(db, draftId, 'rakuten_registered', mn, actor);
-    // approved からの登録なら「楽天出品済み」へ進める (他ステータスからは変えない)
-    const d = db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draftId);
-    if (d?.status === 'approved') {
-      db.prepare(`UPDATE product_drafts SET status = 'listed', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ? AND status = 'approved'`).run(draftId);
-    }
+    // status の更新はここではしない (PR4): 呼び出し元 (router) の markRakutenListed が
+    // 楽天モールを done にし、その中で工程からの導出 (recomputeDraftStatus) が listed へ進める
     // 店舗内カテゴリ (お店の棚) は商品 payload に載らない別 API なので、登録成功後に続けて反映する。
     // ここで失敗しても登録自体は成功しているので止めない (結果は shopCategories として返し、
     // draft_rakuten.shop_categories_error にも残るので画面から再実行できる)

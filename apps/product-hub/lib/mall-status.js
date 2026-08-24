@@ -10,7 +10,7 @@
  *   - version をトークンにした楽観ロック。画面から来る操作はトークン必須
  */
 import { getDB, logEvent } from '../db.js';
-import { STEP_STATES, STEP_STATE_LABELS } from './workflow-progress.js';
+import { STEP_STATES, STEP_STATE_LABELS, recomputeDraftStatus } from './workflow-progress.js';
 import { MALLS, MALL_CODES, MALL_LABELS, LISTING_STEP_CODE } from './malls-def.js';
 
 // モール定義は lib/malls-def.js が正 (工程側からも参照するため切り出し)。
@@ -226,6 +226,9 @@ export function setMallState(
     if (info.changes !== 1) return null;
     if (event) logEvent(db, id, 'mall_changed', event, actor);
     const settled = syncListingStep(db, id, actor);
+    // 楽天モールの done/undone と工程「出品・展開」の開閉は status (listed/expanded) を
+    // 左右するので、同じトランザクションで導出し直す (PR4)
+    if (stateChanged) recomputeDraftStatus(db, id, { actor });
     const fresh = db.prepare(
       'SELECT version FROM draft_mall_status WHERE draft_id = ? AND mall = ?'
     ).get(id, code);
@@ -294,6 +297,9 @@ export function markRakutenListed(db, draftId, { itemUrl = null, actor = null } 
         WHERE draft_id = @draft_id AND mall = 'rakuten' AND state != 'done'
       `).run({ draft_id: Number(draftId), item_url: itemUrl });
       syncListingStep(db, Number(draftId), actor);
+      // 楽天出品済みの実態を status に反映する (approved → listed など)。
+      // 旧・rakuten-listing.js の「approved なら listed へ」の直接更新はここに一本化 (PR4)
+      recomputeDraftStatus(db, Number(draftId), { actor });
     })();
     return true;
   } catch (e) {

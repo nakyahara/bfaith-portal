@@ -233,13 +233,17 @@ let checkErr = null;
 try { db.prepare(`INSERT INTO product_drafts (ne_code, name, status) VALUES ('SMOKE-BAD', 'x', 'bogus')`).run(); } catch (e) { checkErr = e; }
 check('status CHECK enforced', checkErr && String(checkErr.message).includes('CHECK'));
 
-// ─── 自動差し戻し (Codex R1 high: ゲートすり抜け防止) ───
+// ─── 自動差し戻し (Codex R1 high: ゲートすり抜け防止。PR4 で workflow-progress へ移設) ───
+const wfpEarly = await import('../lib/workflow-progress.js');
 db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai' WHERE id = ?`).run(draft.id);
-check('demote no-op while gate ok', dbmod.demoteIfGateBroken(db, draft.id, 'smoke') === null);
+check('demote no-op while gate ok', wfpEarly.demoteIfGateBroken(db, draft.id, 'smoke') === null);
 db.prepare(`UPDATE product_drafts SET official_url = NULL WHERE id = ?`).run(draft.id);
-const demoteReasons = dbmod.demoteIfGateBroken(db, draft.id, 'smoke');
+const demoteReasons = wfpEarly.demoteIfGateBroken(db, draft.id, 'smoke');
 check('demote fires when url cleared', Array.isArray(demoteReasons) && demoteReasons.length === 1);
 check('demoted back to draft', db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(draft.id).status === 'draft');
+check('demote resets basic_info step', (db.prepare(
+  `SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'basic_info'`
+).get(draft.id)?.state ?? 'todo') !== 'done');
 db.prepare(`UPDATE product_drafts SET official_url = 'https://example.com/item' WHERE id = ?`).run(draft.id);
 
 // ─── P1.5: draft_yahoo / draft_image_production / 新列 / 生成キュー ───
@@ -2483,6 +2487,100 @@ let wfSetParentId = null;
   check('移行: 再実行は no-op (冪等)', dbmod.migrateImageKindSplit(db) === false);
   // 旧工程・旧進捗行は本番と同じく残置する (active=0 で全クエリから見えない)。
   // DELETE しないのは draft_step_progress → ph_steps の FK を壊さないため
+}
+
+// ─── status の工程からの導出 (PR4 2026-08-24) ───
+{
+  const wfp = wfpEarly;
+  const ms2 = await import('../lib/mall-status.js');
+  const ADMIN = { isAdmin: true };
+  const statusOf = (id) => db.prepare('SELECT status FROM product_drafts WHERE id = ?').get(id).status;
+
+  // 材料が揃った draft (基本情報の完了ゲートを通れる)
+  const mkFull = (code) => {
+    const id = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+      VALUES (?, ?, 'https://example.com/item', 'smoke')
+    `).run(code, `導出 ${code}`).lastInsertRowid);
+    db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)`).run(id, `drv-${code}`);
+    return id;
+  };
+
+  const idD = mkFull('DRV-1');
+  check('導出: 工程行なし = draft', wfp.deriveDraftStatus(db, idD) === 'draft');
+
+  // 材料が無い draft は「基本情報入力」を完了にできない (AIキュー入口のゲート)
+  const idBare = Number(db.prepare(
+    `INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-BARE', '材料なし', 'smoke')`
+  ).run().lastInsertRowid);
+  let gateErr = null;
+  try { wfp.setStepState(idBare, 'basic_info', { state: 'done' }, 'smoke', ADMIN); } catch (e) { gateErr = e; }
+  check('導出: 材料なしでは基本情報を完了にできない (400+理由)',
+    gateErr?.status === 400 && String(gateErr.message).includes('足りません'), gateErr?.message || '例外が出ていない');
+  check('導出: ゲートで止まった draft は draft のまま', statusOf(idBare) === 'draft');
+
+  // 本流工程を進めると status が導出で進む
+  wfp.setStepState(idD, 'basic_info', { state: 'done' }, 'smoke', ADMIN);
+  check('導出: 基本情報 done → ready_for_ai (AIキュー入り)', statusOf(idD) === 'ready_for_ai');
+  check('導出: AIキューにも載る', dbmod.listGenerationQueue(db).some((q) => q.id === idD));
+  wfp.setStepState(idD, 'ai_generate', { state: 'done' }, 'smoke', ADMIN);
+  check('導出: AI生成 done → review', statusOf(idD) === 'review');
+  wfp.setStepState(idD, 'desc_review', { state: 'done' }, 'smoke', ADMIN);
+  check('導出: 説明確認だけでは review のまま (タイトル確認待ち)', statusOf(idD) === 'review');
+  wfp.setStepState(idD, 'title_approve', { state: 'done' }, 'smoke', ADMIN);
+  check('導出: 説明+タイトル確認 done → approved', statusOf(idD) === 'approved');
+  check('導出: set_review は status を左右しない (approved のまま検討中)',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'set_review'`).get(idD).state === 'todo');
+
+  // 楽天出品 (モール done) → listed
+  ms2.markRakutenListed(db, idD, { actor: 'smoke' });
+  check('導出: 楽天モール done → listed', statusOf(idD) === 'listed');
+
+  // 全モール決着 → 工程「出品・展開」が閉じて expanded
+  for (const m of ms2.MALLS.map((x) => x.code).filter((c) => c !== 'rakuten')) {
+    ms2.setMallState(idD, m, { state: 'done' }, 'smoke', ADMIN);
+  }
+  check('導出: 全モール決着 → expanded', statusOf(idD) === 'expanded');
+
+  // モールの決着が崩れる → 工程が開き直り listed へ戻る (モール側が正)
+  ms2.setMallState(idD, 'yahoo', { state: 'todo' }, 'smoke', ADMIN);
+  check('導出: モール決着が崩れると listed へ戻る (楽天は done のまま)', statusOf(idD) === 'listed');
+
+  // AI生成をやり直す = 工程を開けるとキューへ戻る
+  wfp.setStepState(idD, 'ai_generate', { state: 'todo' }, 'smoke', ADMIN);
+  check('導出: AI生成を開け直すと ready_for_ai (再生成キュー入り)', statusOf(idD) === 'ready_for_ai');
+  wfp.setStepState(idD, 'ai_generate', { state: 'done' }, 'smoke', ADMIN);
+  check('導出: 閉じ直すと listed へ復帰 (楽天 done の実態が残っている)', statusOf(idD) === 'listed');
+
+  // 保留中は導出が触らない (再開だけが戻す)
+  db.prepare(`UPDATE product_drafts SET status = 'on_hold' WHERE id = ?`).run(idD);
+  wfp.setStepState(idD, 'desc_review', { state: 'todo' }, 'smoke', ADMIN);
+  check('導出: 保留中は工程を動かしても status を書き換えない', statusOf(idD) === 'on_hold');
+  check('導出: 保留中の deriveDraftStatus は再開後の値を返す (review)', wfp.deriveDraftStatus(db, idD) === 'review');
+  wfp.setStepState(idD, 'desc_review', { state: 'done' }, 'smoke', ADMIN);
+  db.prepare(`UPDATE product_drafts SET status = 'listed' WHERE id = ?`).run(idD);
+
+  // ─── 切替バックフィル (一回きり・遅延) ───
+  db.prepare(`DELETE FROM ph_intake_state WHERE key = 'status_derive_backfilled'`).run();
+  // 食い違い例1: 工程は AI 済みなのに status が古いまま (旧・二重管理のずれ)
+  const idLag = mkFull('DRV-LAG');
+  wfp.ensureProgress(db, idLag);
+  db.prepare(`
+    UPDATE draft_step_progress SET state = 'done', done_at = '2026-08-23T00:00:00Z', done_by = 'smoke'
+    WHERE draft_id = ? AND step_code IN ('basic_info', 'ai_generate')
+  `).run(idLag);
+  // 食い違い例2: 旧・手動遷移で listed (draft_rakuten もモール行も無い)
+  const idOldListed = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-OLDLS', '旧listed', 'listed', 'smoke')
+  `).run().lastInsertRowid);
+  const changed = wfp.maybeBackfillDerivedStatus(db);
+  check('バックフィル: 工程が進んでいた draft は status が追いつく (review)', statusOf(idLag) === 'review');
+  check('バックフィル: 旧 listed は楽天モール行に根拠が残り listed のまま',
+    statusOf(idOldListed) === 'listed'
+    && db.prepare(`SELECT state FROM draft_mall_status WHERE draft_id = ? AND mall = 'rakuten'`).get(idOldListed)?.state === 'done',
+    `status=${statusOf(idOldListed)}`);
+  check('バックフィル: 変更件数が返る', changed >= 1, String(changed));
+  check('バックフィル: 2回目は no-op (フラグ済み)', wfp.maybeBackfillDerivedStatus(db) === 0);
 }
 
 // ─── EJS 実 render (RYS教訓: 全分岐を実データで) ───
