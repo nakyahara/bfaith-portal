@@ -30,9 +30,28 @@ import { rakutenRequest } from './rakuten-client.js';
 
 const MN = process.env.M0_MANAGE_NUMBER || 'zz-price-m0-0824';
 const OUT_DIR = process.env.DATA_DIR || tmpdir();
-const SNAP_BEFORE = join(OUT_DIR, 'm0-rakuten-before.json');
-const SNAP_AFTER = join(OUT_DIR, 'm0-rakuten-after.json');
+// スナップショットは商品ごとに分ける。共通ファイルだと M0_MANAGE_NUMBER を変えた後に
+// 別商品の SKU を PATCH 本文に入れてしまう (存在しないキー = 新規SKU作成として解釈される)
+const SNAP_BEFORE = join(OUT_DIR, `m0-rakuten-before.${MN}.json`);
+const SNAP_AFTER = join(OUT_DIR, `m0-rakuten-after.${MN}.json`);
 const LOG = join(OUT_DIR, 'm0-rakuten-log.jsonl');
+
+/** 失敗を終了コードに出す (成功時だけ 0 で終わる) */
+function fail(msg) {
+  console.error(`❌ ${msg}`);
+  process.exitCode = 1;
+}
+
+/** snapshot が今の対象商品のものかを確かめる */
+function loadSnapshot() {
+  if (!existsSync(SNAP_BEFORE)) { fail(`先に snapshot を実行してください (${SNAP_BEFORE} が無い)`); return null; }
+  const snap = JSON.parse(readFileSync(SNAP_BEFORE, 'utf8'));
+  if (String(snap?.manageNumber || '') !== MN) {
+    fail(`snapshot の商品が違います: snapshot=${snap?.manageNumber} 対象=${MN}`);
+    return null;
+  }
+  return snap;
+}
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -152,7 +171,7 @@ function buildTestPayload() {
 async function main() {
   if (cmd === 'probe') {
     const target = argOf(1);
-    if (!target) { console.error('probe には manageNumber が必要です'); process.exitCode = 1; return; }
+    if (!target) { fail('probe には manageNumber が必要です'); return; }
     const r = await getItem(target);
     console.log('status:', r.status);
     if (r.status !== 200) { console.log(JSON.stringify(r.data).slice(0, 800)); return; }
@@ -166,11 +185,7 @@ async function main() {
       console.log(`既に ${MN} が存在します。snapshot から続行してください。`);
       return;
     }
-    if (existing.status !== 404) {
-      console.log(`既存確認に失敗 (HTTP ${existing.status}) — 中断`);
-      process.exitCode = 1;
-      return;
-    }
+    if (existing.status !== 404) { fail(`既存確認に失敗 (HTTP ${existing.status}) — 中断`); return; }
     const payload = buildTestPayload();
     console.log('--- PUT payload ---');
     console.log(JSON.stringify(payload, null, 2));
@@ -185,7 +200,7 @@ async function main() {
 
   if (cmd === 'snapshot') {
     const r = await getItem(MN);
-    if (r.status !== 200) { console.log(`GET 失敗 HTTP ${r.status}`); process.exitCode = 1; return; }
+    if (r.status !== 200) { fail(`GET 失敗 HTTP ${r.status}`); return; }
     writeFileSync(SNAP_BEFORE, JSON.stringify(r.data, null, 2));
     console.log(`before を保存: ${SNAP_BEFORE}`);
     console.log(JSON.stringify(summarize(r.data), null, 2));
@@ -193,14 +208,18 @@ async function main() {
   }
 
   if (cmd === 'patch') {
-    if (!existsSync(SNAP_BEFORE)) { console.log('先に snapshot を実行してください'); process.exitCode = 1; return; }
-    const before = JSON.parse(readFileSync(SNAP_BEFORE, 'utf8'));
+    const before = loadSnapshot();
+    if (!before) return;
     const keys = Object.keys(before?.variants || {}).sort();
-    if (keys.length === 0) { console.log('variants がありません'); process.exitCode = 1; return; }
+    if (keys.length === 0) { fail('variants がありません'); return; }
     const targetSku = keys[0];
     const curRaw = before.variants[targetSku]?.standardPrice;
     const cur = parseInt(String(curRaw ?? ''), 10);
+    if (!Number.isFinite(cur)) { fail(`現在価格が読めません: ${JSON.stringify(curRaw)}`); return; }
     const next = cur + 111; // 値上げ方向・分かりやすい差分
+    // verify が「期待どおりに変わったか」を確かめられるよう、意図を残しておく
+    writeFileSync(join(OUT_DIR, `m0-rakuten-expect.${MN}.json`),
+      JSON.stringify({ manageNumber: MN, sku: targetSku, from: cur, to: next }, null, 2));
     // ★ 本番実装と同じ形: サーバ側で body を組み立て直し、standardPrice 以外は一切入れない
     const body = { variants: { [targetSku]: { standardPrice: next } } };
     console.log(`対象SKU: ${targetSku}  ${curRaw} (${typeof curRaw}) -> ${next}`);
@@ -217,35 +236,75 @@ async function main() {
   }
 
   if (cmd === 'verify') {
-    if (!existsSync(SNAP_BEFORE)) { console.log('先に snapshot を実行してください'); process.exitCode = 1; return; }
-    const before = JSON.parse(readFileSync(SNAP_BEFORE, 'utf8'));
+    const before = loadSnapshot();
+    if (!before) return;
     const r = await getItem(MN);
-    if (r.status !== 200) { console.log(`GET 失敗 HTTP ${r.status}`); process.exitCode = 1; return; }
+    if (r.status !== 200) { fail(`GET 失敗 HTTP ${r.status}`); return; }
     writeFileSync(SNAP_AFTER, JSON.stringify(r.data, null, 2));
     const d = diff(before, r.data);
     console.log(`=== 全項目 deep diff: ${d.length} 件 (updated は除外) ===`);
     for (const x of d) console.log(fmtDiff(x));
 
-    const priceDiffs = d.filter((x) => /^variants\.[^.]+\.standardPrice$/.test(x.path));
-    const otherDiffs = d.filter((x) => !/^variants\.[^.]+\.standardPrice$/.test(x.path));
+    const isPrice = (x) => /^variants\.[^.]+\.standardPrice$/.test(x.path);
+    const priceDiffs = d.filter(isPrice);
+    const otherDiffs = d.filter((x) => !isPrice(x));
+
+    // patch が残した「意図」と突き合わせる。差分ゼロでも「価格が変わっていない」なら失敗
+    const expectPath = join(OUT_DIR, `m0-rakuten-expect.${MN}.json`);
+    const expect = existsSync(expectPath) ? JSON.parse(readFileSync(expectPath, 'utf8')) : null;
+
+    const problems = [];
+    if (otherDiffs.length > 0) problems.push(`価格以外が ${otherDiffs.length} 件変化している`);
+    if (!expect) {
+      problems.push('期待値ファイルが無い (patch を実行していない)');
+    } else {
+      if (priceDiffs.length !== 1) {
+        problems.push(`価格の変化が ${priceDiffs.length} 件 (期待は 1 件)`);
+      } else {
+        const got = priceDiffs[0];
+        const gotSku = got.path.replace(/^variants\.(.+)\.standardPrice$/, '$1');
+        const num = (v) => parseInt(String(v ?? ''), 10);
+        if (gotSku !== expect.sku) problems.push(`変化したSKUが違う: ${gotSku} (期待 ${expect.sku})`);
+        if (num(got.before) !== expect.from) problems.push(`変更前が違う: ${got.before} (期待 ${expect.from})`);
+        if (num(got.after) !== expect.to) problems.push(`変更後が違う: ${got.after} (期待 ${expect.to})`);
+      }
+      // 期待した SKU 以外の価格が動いていないことも直接確かめる
+      for (const [sku, v] of Object.entries(before.variants || {})) {
+        if (sku === expect.sku) continue;
+        const b = parseInt(String(v?.standardPrice ?? ''), 10);
+        const a = parseInt(String(r.data?.variants?.[sku]?.standardPrice ?? ''), 10);
+        if (b !== a) problems.push(`他SKU ${sku} の価格が変化: ${b} → ${a}`);
+      }
+    }
+
     console.log('\n=== 判定 ===');
     console.log(`  価格の変化      : ${priceDiffs.length} 件 ${priceDiffs.map((p) => `${p.path}(${p.before}→${p.after})`).join(', ')}`);
     console.log(`  価格以外の変化  : ${otherDiffs.length} 件`);
-    console.log(otherDiffs.length === 0
-      ? '  ✅ standardPrice の PATCH は他項目・他SKUを壊さない (per-SKUマージ確認)'
-      : '  ❌ 価格以外にも変化あり — 上の差分を確認');
-    log({ step: 'verify', mn: MN, diffCount: d.length, priceDiffs, otherDiffs });
+    if (problems.length === 0) {
+      console.log('  ✅ 対象SKUの standardPrice だけが期待どおり変わり、他項目・他SKUは無傷 (per-SKUマージ確認)');
+    } else {
+      for (const p of problems) console.log(`  ❌ ${p}`);
+      process.exitCode = 1;
+    }
+    log({ step: 'verify', mn: MN, diffCount: d.length, priceDiffs, otherDiffs, expect, problems });
     return;
   }
 
   // 追加検証: 複数SKU同時 / 存在しないSKU混在時の原子性 / 冪等性 / 異常値
   if (cmd === 'probe-patch') {
     const cur = await getItem(MN);
-    if (cur.status !== 200) { console.log(`GET 失敗 HTTP ${cur.status}`); process.exitCode = 1; return; }
+    if (cur.status !== 200) { fail(`GET 失敗 HTTP ${cur.status}`); return; }
     const keys = Object.keys(cur.data?.variants || {}).sort();
     const [skuA, skuB] = keys;
     const priceOf = (k) => parseInt(String(cur.data.variants[k]?.standardPrice ?? ''), 10);
     const which = argOf(1);
+    if (!skuA || !Number.isFinite(priceOf(skuA))) { fail('SKUまたは現在価格が読めません'); return; }
+    // SKU が足りないまま multi を投げると変数が undefined になり、
+    // キー "undefined" の PATCH = 新規SKU作成として解釈されるので事前に止める
+    if (which === 'multi' && (!skuB || !Number.isFinite(priceOf(skuB)))) {
+      fail('multi には2SKU以上必要です');
+      return;
+    }
 
     const cases = {
       // 2SKUを1回のPATCHで同時更新できるか
@@ -279,10 +338,20 @@ async function main() {
       path: `/es/2.0/items/manage-numbers/${MN}`, method: 'PATCH', body: c.body, maxAttempts: 1,
     });
     console.log(`PATCH status=${r.status}`, r.data ? JSON.stringify(r.data).slice(0, 500) : '');
-    // 送信後の実際の値を読み戻す
+    // 送信後の実際の値を読み戻す。読み戻せなければ「実際どうなったか不明」なので失敗にする
     const after = await getItem(MN);
-    const nowPrices = Object.fromEntries(keys.map((k) => [k, after.data?.variants?.[k]?.standardPrice]));
+    if (after.status !== 200) { fail(`読み戻しGET 失敗 HTTP ${after.status} — 実際の状態が不明`); return; }
+    const afterKeys = Object.keys(after.data?.variants || {}).sort();
+    const nowPrices = Object.fromEntries(afterKeys.map((k) => [k, after.data?.variants?.[k]?.standardPrice]));
     console.log('送信後の価格:', JSON.stringify(nowPrices));
+    const lostSkus = keys.filter((k) => !afterKeys.includes(k));
+    const newSkus = afterKeys.filter((k) => !keys.includes(k));
+    if (lostSkus.length || newSkus.length) {
+      fail(`SKU構成が変わった: 消えた=[${lostSkus.join(',')}] 増えた=[${newSkus.join(',')}]`);
+    }
+    if (afterKeys.some((k) => !Number.isFinite(parseInt(String(nowPrices[k] ?? ''), 10)))) {
+      fail('読み戻した価格に読めない値がある');
+    }
     log({ step: `probe-patch:${which}`, mn: MN, status: r.status, data: r.data, before: Object.fromEntries(keys.map((k) => [k, priceOf(k)])), after: nowPrices });
     return;
   }
@@ -290,13 +359,9 @@ async function main() {
   if (cmd === 'cleanup') {
     const cur = await getItem(MN);
     if (cur.status === 404) { console.log('既に存在しません'); return; }
-    if (cur.status !== 200) { console.log(`GET 失敗 HTTP ${cur.status}`); process.exitCode = 1; return; }
-    if (cur.data?.hideItem !== true) {
-      console.log('⚠ 非公開ではありません。削除前に hideItem:true にしてください');
-      process.exitCode = 1;
-      return;
-    }
-    if (!MN.startsWith('zz-')) { console.log('zz- 以外は削除しません'); process.exitCode = 1; return; }
+    if (cur.status !== 200) { fail(`GET 失敗 HTTP ${cur.status}`); return; }
+    if (cur.data?.hideItem !== true) { fail('非公開ではありません。削除前に hideItem:true にしてください'); return; }
+    if (!MN.startsWith('zz-')) { fail('zz- 以外は削除しません'); return; }
     if (!LIVE) { console.log(`(dry-run) DELETE /es/2.0/items/manage-numbers/${MN}`); return; }
     const r = await rakutenRequest({
       path: `/es/2.0/items/manage-numbers/${MN}`, method: 'DELETE', maxAttempts: 1,

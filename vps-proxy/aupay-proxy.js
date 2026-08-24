@@ -59,6 +59,10 @@ const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.bi
 // (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
 const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-tokens.json');
 
+// --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
+// PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
+if (process.argv.includes('--self-test')) { runSelfTest(); }
+
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
 function ts() { return new Date().toISOString().slice(0, 19); }
@@ -565,14 +569,31 @@ function parseGetItemDetailXml(xml) {
   const withoutVariationBlocks = xml
     .replace(/<SubCodeInfo\b[\s\S]*?<\/SubCodeInfo>/gi, '')
     .replace(/<Options\b[\s\S]*?<\/Options>/gi, '');
-  const priceIn = (scope, name = 'Price') => {
-    const m = scope.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+  // この値は「更新前価格の照合 (楽観ロック)」に使うので、読めない形は黙って数値化せず null にする。
+  // parseInt だと "1080abc" が 1080 に、"1,2,3" が 123 に化けて安全確認が無効になるため、
+  // カンマ・空白を除いたうえで全文が整数 (または .00 のような無害な小数) であることを検証する。
+  const toIntPrice = (raw) => {
+    if (typeof raw !== 'string') return null;
+    const s = raw.replace(/\s/g, '');
+    if (s === '') return null;
+    // 末尾の .00 のような無害な小数部だけ許して切り離す (.99 のような端数は読めない扱い)
+    const m = s.match(/^([\d,]+)(?:\.0+)?$/);
     if (!m) return null;
-    const raw = decodeXmlEntities(unwrapCdata(m[1])).trim();
-    if (raw === '') return null;
-    // 「1,080」「1080.00」等の表記ゆれを整数円へ寄せる (呼び出し側の照合は整数で行うため)
-    const n = parseInt(raw.replace(/[,\s]/g, ''), 10);
-    return Number.isFinite(n) ? n : null;
+    const digits = m[1];
+    // カンマは3桁区切りとしてのみ許容する。"1,2,3" を 123 と読むと照合が無意味になる
+    const valid = digits.includes(',')
+      ? /^([1-9]\d{0,2})(,\d{3})+$/.test(digits)
+      : /^(0|[1-9]\d*)$/.test(digits);
+    if (!valid) return null;
+    const n = Number(digits.replace(/,/g, ''));
+    return Number.isSafeInteger(n) ? n : null;
+  };
+  const priceIn = (scope, name = 'Price') => {
+    // 同じスコープに Price が複数あるのは想定外の構造。取り違えるくらいなら読めない扱いにする (fail closed)
+    const all = scope.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'gi')) || [];
+    if (all.length !== 1) return null;
+    const m = all[0].match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+    return toIntPrice(decodeXmlEntities(unwrapCdata(m[1])).trim());
   };
   out.Price = priceIn(withoutVariationBlocks);
 
@@ -1487,7 +1508,8 @@ const server = http.createServer(async (req, res) => {
 // ─── self-test ───
 // `node aupay-proxy.js --self-test` でパーサだけを検証する (サーバは起動しない)。
 // 外部通信も secret も要らないので、デプロイ前の手元でも VPS 上でも同じコードを確かめられる。
-if (process.argv.includes('--self-test')) {
+// 呼び出しはファイル冒頭 (PROXY_SECRET チェックの前)。function 宣言なのでホイスティングで届く。
+function runSelfTest() {
   let failed = 0;
   const check = (label, actual, expected) => {
     const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -1529,12 +1551,25 @@ if (process.argv.includes('--self-test')) {
 
   // 4) 表記ゆれ (カンマ・小数・空白) と欠落
   check('カンマ表記', parseGetItemDetailXml('<Result><Price>1,080</Price></Result>').Price, 1080);
-  check('小数表記', parseGetItemDetailXml('<Result><Price>1080.00</Price></Result>').Price, 1080);
+  check('小数表記(.00)', parseGetItemDetailXml('<Result><Price>1080.00</Price></Result>').Price, 1080);
+  check('0円', parseGetItemDetailXml('<Result><Price>0</Price></Result>').Price, 0);
   check('Price欠落', parseGetItemDetailXml('<Result><Name>x</Name></Result>').Price, null);
   check('空Price', parseGetItemDetailXml('<Result><Price></Price></Result>').Price, null);
   check('空XML', parseGetItemDetailXml('').Price, null);
 
-  // 5) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
+  // 5) 読めない形は「それらしい数値」に化けさせず null にする (照合に使う値なので fail closed)
+  check('末尾ゴミ', parseGetItemDetailXml('<Result><Price>1080abc</Price></Result>').Price, null);
+  check('区切り誤り', parseGetItemDetailXml('<Result><Price>1,2,3</Price></Result>').Price, null);
+  check('区切り誤り2', parseGetItemDetailXml('<Result><Price>12,34</Price></Result>').Price, null);
+  check('大きい桁の区切り', parseGetItemDetailXml('<Result><Price>1,234,567</Price></Result>').Price, 1234567);
+  check('端数あり小数', parseGetItemDetailXml('<Result><Price>1080.99</Price></Result>').Price, null);
+  check('負数', parseGetItemDetailXml('<Result><Price>-100</Price></Result>').Price, null);
+  check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
+  check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
+  // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  check('Price重複', parseGetItemDetailXml('<Result><Price>100</Price><Price>200</Price></Result>').Price, null);
+
+  // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
   const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
   check('Path: origFlag優先', parseGetItemDetailXml(paths).Path, '本命');
 
