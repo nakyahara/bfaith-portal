@@ -857,7 +857,7 @@ export function moveBoardCard(
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
  * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean}}
  */
-export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, limit = 800, mallSummary = null } = {}) {
+export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
     SELECT code, label, track, image_kind, image_stage, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -876,18 +876,30 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // LIMIT を食い潰し、いま担当している古い商品がボードから消える
   // 画像ビューの候補は**画像工程だけ**から取る (Codex R1 medium):
   // 本流だけが条件一致する商品が LIMIT を食い潰し、あとの JS 絞り込みで消えると
-  // 実際に画像を担当している商品がボードから欠落する
+  // 実際に画像を担当している商品がボードから欠落する。
+  // 種別絞り込み時は候補もその種別に限定する (Codex R1 medium: kind=top&assignee=X で
+  // 「詳細側だけ X 担当」の商品が候補・total・LIMIT を消費し、表示と件数がズレる)。
+  // imageKind はホワイトリスト検証済みの値だけをリテラル展開する
+  const kindSafe = view === 'image' && (imageKind === 'top' || imageKind === 'detail') ? imageKind : null;
   const CURRENT_STEPS = `
     SELECT draft_id, assignee_id, role_code FROM (
       SELECT p.draft_id, p.assignee_id, s.role_code,
              ROW_NUMBER() OVER (
-               PARTITION BY p.draft_id, s.track, COALESCE(s.image_kind, '')
+               ${/* 系列の区分は splitImageRows と同じ「detail 以外は TOP」(Codex R3):
+                    COALESCE(image_kind,'') だと NULL のカスタム画像工程が別系列になり、
+                    JS 側の現在工程判定とズレて候補・total・LIMIT を誤消費する */''}
+               PARTITION BY p.draft_id, s.track,
+                 CASE WHEN s.track = 'image' AND s.image_kind = 'detail' THEN 'detail'
+                      WHEN s.track = 'image' THEN 'top' ELSE '' END
                ORDER BY s.sort, s.code
              ) AS rn
       FROM draft_step_progress p
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.state IN ('todo', 'doing')
         ${view === 'image' ? "AND s.track = 'image'" : ''}
+        ${/* TOP系列は image_kind IS NULL のカスタム画像工程も含む (splitImageRows と同じ区分 — Codex R2) */''}
+        ${kindSafe === 'detail' ? "AND s.image_kind = 'detail'" : ''}
+        ${kindSafe === 'top' ? "AND (s.image_kind IS NULL OR s.image_kind != 'detail')" : ''}
     ) WHERE rn = 1
   `;
   let candidateSql = '';
@@ -910,6 +922,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
+    ${kindSafe === 'detail' ? 'AND d.detail_images_excluded = 0' : ''}
     ORDER BY d.updated_at DESC
     LIMIT ?
   `).all(...candidateParams, limit + 1);
@@ -982,6 +995,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // D&D で差し戻せない。「商品として完了」ではなく「この種別が決着」が完了列の意味
       for (const k of kinds) {
         if (k.excluded || k.s.rows.length === 0) continue;
+        // 種別の絞り込み (2026-08-24 中原さん要望: TOP画像/商品詳細画像だけを見たい)。完了列にも効かせる
+        if (imageKind && k.kind !== imageKind) continue;
         const cur = k.s.current;
         if (!cur) {
           // この種別は決着済み → 完了列 (絞り込み中は出さない — 「終わった分」は全員共通)。

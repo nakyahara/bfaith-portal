@@ -2782,6 +2782,30 @@ let wfSetParentId = null;
   check('画像ビュー: 同じ商品の詳細カードは依頼の列に残る',
     ib.columns.find((c) => c.key === 'request')?.cards.some((c2) => c2.id === idM4 && c2.kind === 'detail') === true);
 
+  // 種別の絞り込み (2026-08-24 中原さん要望): kind 指定で段階列・完了列とも片方だけになる
+  const ibTop = wfpEarly.boardData(db, { view: 'image', imageKind: 'top' });
+  check('画像ビュー: kind=top は TOP カードだけ (完了列も対象)',
+    ibTop.columns.every((c) => c.cards.every((x) => x.kind === 'top'))
+    && ibTop.doneCards.every((x) => x.kind === 'top')
+    && ibTop.doneCards.some((c) => c.id === idM4));
+  const ibDet = wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' });
+  check('画像ビュー: kind=detail は商品詳細カードだけ (idM4 の詳細は依頼列に居る)',
+    ibDet.columns.every((c) => c.cards.every((x) => x.kind === 'detail'))
+    && ibDet.doneCards.every((x) => x.kind === 'detail')
+    && ibDet.columns.find((c) => c.key === 'request')?.cards.some((c2) => c2.id === idM4) === true);
+  // R1対応: 詳細対象外の商品は kind=detail の候補 (total/LIMIT) を消費しない
+  const idKfx = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-KFEX', '詳細対象外の絞り込み', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idKfx);
+  db.prepare('UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?').run(idKfx);
+  const ibDet2 = wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' });
+  check('画像ビュー: kind=detail は詳細対象外の商品を候補に数えない',
+    ibDet2.total === ibDet.total && !ibDet2.columns.some((c) => c.cards.some((x) => x.id === idKfx)));
+  check('画像ビュー: 詳細対象外でも kind=top には出る',
+    wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.cards.some((x) => x.id === idKfx)));
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
+
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
   check('重要度: 保存できる', r.status === 200
@@ -3641,7 +3665,7 @@ renders.push(
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
-  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false,
+  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, imageKind: null,
   stepStateLabels: wfp.STEP_STATE_LABELS,
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
 };
@@ -3650,6 +3674,10 @@ renders.push(
   ['board.ejs (画像ビュー)', 'board.ejs', {
     ...boardBase, boardView: 'image',
     board: wfp.boardData(db, { view: 'image' }),
+  }],
+  ['board.ejs (画像ビュー・TOPのみ)', 'board.ejs', {
+    ...boardBase, boardView: 'image', imageKind: 'top',
+    board: wfp.boardData(db, { view: 'image', imageKind: 'top' }),
   }],
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
   ['board.ejs (空)', 'board.ejs', {

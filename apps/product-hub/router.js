@@ -1670,8 +1670,11 @@ router.get('/board', (req, res) => {
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
   const unassignedOnly = String(req.query.filter || '') === 'unassigned';
   const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
+  // 画像ビューの種別絞り込み (TOP画像 / 商品詳細画像 — 2026-08-24 中原さん要望)
+  const imageKind = boardView === 'image' && ['top', 'detail'].includes(String(req.query.kind || ''))
+    ? String(req.query.kind) : null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, mallSummary: mallSummaryFor });
+  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, imageKind, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
@@ -1682,6 +1685,7 @@ router.get('/board', (req, res) => {
     assigneeId,
     assigneeParam: raw,
     unassignedOnly,
+    imageKind,
     thumbnailUrl,
     stepStateLabels: STEP_STATE_LABELS,
     imageKindLabels: IMAGE_KIND_LABELS,
