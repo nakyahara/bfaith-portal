@@ -977,30 +977,26 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // カード = 商品 × 種別 (TOP/詳細 は別々に進むので別の列に出る)。
       // 絞り込みは**その種別の**現在工程を基準にする — 本流や他種別の一致で
       // 無関係な列にカードが出ると、担当者が自分の作業と誤読する (Codex設計相談)
-      let anyOpen = false;
+      // 完了列も**種別ごと**に判定する (Codex R2 medium): TOP だけ先に終わった商品の
+      // TOP カードはどの段階の列にも出ないので、完了列に出さないとボードから消えて
+      // D&D で差し戻せない。「商品として完了」ではなく「この種別が決着」が完了列の意味
       for (const k of kinds) {
         if (k.excluded || k.s.rows.length === 0) continue;
         const cur = k.s.current;
-        if (!cur) continue;
-        anyOpen = true;
+        if (!cur) {
+          // この種別は決着済み → 完了列 (絞り込み中は出さない — 「終わった分」は全員共通)。
+          // TOP 全部 skip は「完了」に見せない (出品ゲートは拒否するので表示と食い違う — Codex R1 medium)
+          if (assigneeId == null && !unassignedOnly
+            && !(k.kind === 'top' && k.s.rows.every((r) => r.state === 'skip'))) {
+            doneCards.push({ ...baseCard, kind: k.kind });
+          }
+          continue;
+        }
         if (assigneeId != null && cur.assignee_id !== assigneeId) continue;
         if (unassignedOnly && !(cur.role_code && cur.assignee_id == null)) continue;
         const card = { ...baseCard, kind: k.kind, kindCurrent: cur, kindStalledDays: k.s.stalledDays };
         colByStep.get(cur.step_code)?.cards.push(card);
         cardsById.set(d.id, card);
-      }
-      // 完了列 = TOP が済み、詳細も済みか対象外の商品 (絞り込み中は出さない — 「終わった分」は全員共通)。
-      // TOP 全部 skip は「完了」に見せない (出品ゲートは拒否するので表示と食い違う — Codex R1 medium)
-      if (!anyOpen && assigneeId == null && !unassignedOnly) {
-        const topSettled = p.imageTop.rows.length > 0 && !p.imageTop.current
-          && !p.imageTop.rows.every((r) => r.state === 'skip');
-        // 詳細工程 0 件はゲートが拒否するので完了に見せない (Codex R2 high)
-        const detailSettled = detailExcluded || (p.imageDetail.rows.length > 0 && !p.imageDetail.current);
-        if (topSettled && detailSettled) {
-          // 完了列も 商品×種別 で出す (D&D の差し戻しで TOP/詳細 のどちらを戻すか指定するため)
-          doneCards.push({ ...baseCard, kind: 'top' });
-          if (!detailExcluded) doneCards.push({ ...baseCard, kind: 'detail' });
-        }
       }
       continue;
     }

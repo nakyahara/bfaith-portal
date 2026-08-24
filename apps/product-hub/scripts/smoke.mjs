@@ -2731,6 +2731,19 @@ let wfSetParentId = null;
   try { wfpEarly.moveBoardCard(idM3, { view: 'image', kind: 'top', to: 'production', expectedCurrent: null }, 'smoke', ADMIN2); } catch (e) { doneCas = e; }
   check('D&D 完了カードの CAS: もう完了でなければ 409', doneCas?.status === 409, doneCas?.message || '例外が出ていない');
 
+  // 片方の種別だけ完了した商品がボードから消えない (Codex R2 medium):
+  // TOP だけ完了 → TOP カードは完了列・詳細カードは依頼の列に居る
+  const idM4 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-MOVE4', '片側完了', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idM4);
+  wfpEarly.moveBoardCard(idM4, { view: 'image', kind: 'top', to: 'done', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN2);
+  const ib = wfpEarly.boardData(db, { view: 'image' });
+  check('画像ビュー: TOPだけ完了 → 完了列に TOP カードが出る (差し戻し可能)',
+    ib.doneCards.some((c) => c.id === idM4 && c.kind === 'top'));
+  check('画像ビュー: 同じ商品の詳細カードは依頼の列に残る',
+    ib.columns.find((c) => c.key === 'request')?.cards.some((c2) => c2.id === idM4 && c2.kind === 'detail') === true);
+
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
   check('重要度: 保存できる', r.status === 200
