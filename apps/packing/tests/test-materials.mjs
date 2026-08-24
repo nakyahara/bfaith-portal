@@ -585,6 +585,34 @@ t('DDL: 資材 code は2文字目以降の不正文字も拒否', () => {
     INSERT INTO pk_pack_materials (code, name, created_at, updated_at) VALUES ('a漢字', 'x', ?, ?)
   `).run(utcNow(), utcNow()), /CHECK/);
 });
+t('op_id: 別 worker の同一 op_id は op_conflict (hash に worker を含む)', () => {
+  throwsCode(() => registerMaterial({
+    batchId: bReg.id, slipSeq: 1, materialCode: 'nekopos_box',
+    expectedRuleId: null, expectedVersion: null, expectedDeliveryCode: ctx0.deliveryCode,
+    opId: 'op-reg-1', worker: '別人',
+  }), 'op_conflict');
+});
+t('undo: バッチ不一致の URL からは取り消せない', () => {
+  const b = makeBatch(CLS);
+  addLine(b.id, 1, 'sku-xbatch', 1);
+  const c = judge(b.id, 1, CLS);
+  const r = registerMaterial({
+    batchId: b.id, slipSeq: 1, materialCode: 'vinyl_s',
+    expectedRuleId: null, expectedVersion: null, expectedDeliveryCode: c.deliveryCode,
+    opId: 'op-xb', worker: 'テスト',
+  });
+  throwsCode(() => undoMaterial({
+    opId: 'opu-xb', eventId: r.eventId, undoToken: r.undoToken, worker: 'テスト', batchId: b.id + 999,
+  }), 'event_not_found');
+});
+t('完了スナップショット: view 行が無くても完了時に生成される', () => {
+  const b = makeBatch(CLS);
+  addLine(b.id, 1, 'sku-noview', 1);
+  onSlipCompleted(db, b.id, 1, utcNow());   // 一度も表示していない
+  const v = db.prepare('SELECT * FROM pk_pack_material_views WHERE batch_id=? AND slip_seq=1').get(b.id);
+  assert.ok(v, 'view 行が作られていない');
+  assert.equal(v.completed_source, 'candidates');
+});
 t('foreign_key_check: 参照整合性エラーなし', () => {
   assert.deepEqual(db.pragma('foreign_key_check'), []);
 });

@@ -849,6 +849,7 @@
       if (!c) return;
       if (!worker) { showToast('先に作業者を選んでください'); return; }
       matBusy = true;
+      $('matGrid').classList.add('mat-busy');
       render();
       try {
         const res = await matFetch(`/apps/packing/api/batches/${STATE.batchId}/material`, {
@@ -879,6 +880,7 @@
         resync();   // 同一構成の他伝票にも反映 (非同期)
       } finally {
         matBusy = false;
+        $('matGrid').classList.remove('mat-busy');
         closeMatOverlay();
         render();
       }
@@ -910,7 +912,9 @@
       const c = MATERIALS && MATERIALS[seq];
       if (!c || !MATOPTS) return;
       matOverlaySeq = seq;
-      const candSet = new Set((c.candidates || []).map((m) => m.code));
+      // 候補集合は分類単位 (candidateCodes)。rule 表示の伝票から開いても上段=候補になる
+      const candSet = new Set(MATOPTS.candidateCodes || []);
+      for (const m of c.candidates || []) candSet.add(m.code);
       const ranked = [...(MATOPTS.materials || [])]
         .sort((a, b) => (candSet.has(b.code) ? 1 : 0) - (candSet.has(a.code) ? 1 : 0));
       $('matGrid').innerHTML = ranked.map((m) => `
@@ -941,7 +945,7 @@
 
     // ── 操作 ──
     function goNext() {
-      if (currentSeq == null || paused) return;
+      if (currentSeq == null || paused || matBusy) return;
       const viewingHeld = heldSet.has(viewSeq);
       const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
       const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
@@ -982,6 +986,7 @@
     }
 
     function goPrev() {
+      if (matBusy) return;
       if (viewSeq > 1) { viewSeq -= 1; render(); }
     }
 
@@ -1674,14 +1679,24 @@
 
     // スワイプ (左=次へ / 右=前へ)。60px閾値・縦スクロールと干渉しない判定
     let touchX = null, touchY = null;
+    // スワイプの除外 (Codex 実装R1 high): ボタン・オーバーレイ・資材カード上で始まった
+    // タッチはページ送りにしない (ボタンを少し滑らせて離すと登録+次へが同時に走る事故)。
+    // オーバーレイ表示中もページ送り停止
+    let touchOnControl = false;
+    const anyOverlayOpen = () => [...document.querySelectorAll('.overlay')]
+      .some((o) => o.style.display === 'flex');
     document.addEventListener('touchstart', (e) => {
       touchX = e.touches[0].clientX; touchY = e.touches[0].clientY;
+      const el = e.target;
+      touchOnControl = !!(el && el.closest
+        && el.closest('button, input, select, a, .overlay, .mat-card, .mat-undo-chip'));
     }, { passive: true });
     document.addEventListener('touchend', (e) => {
       if (touchX == null) return;
       const dx = e.changedTouches[0].clientX - touchX;
       const dy = e.changedTouches[0].clientY - touchY;
       touchX = null;
+      if (touchOnControl || anyOverlayOpen()) return;
       if (Math.abs(dx) < 60 || Math.abs(dy) > Math.abs(dx)) return;
       if (dx < 0) goNext(); else goPrev();
     }, { passive: true });

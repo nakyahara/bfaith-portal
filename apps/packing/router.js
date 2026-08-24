@@ -42,7 +42,7 @@ import {
   materialsForState, materialOptions, registerMaterial, undoMaterial,
   manualResend as materialManualResend, materialDailyCounts,
   seedMaterialsData, normalizeKeyText, classCandidates,
-  BASE_DELIVERY_CODES, DELIVERY_CODES, UNDO_SEC as MATERIAL_UNDO_SEC,
+  BASE_DELIVERY_CODES, DELIVERY_CODES, UNDO_SEC as MATERIAL_UNDO_SEC, UNDO_SECRET_CONFIGURED,
 } from './materials.js';
 import { DATA_DIR } from './db.js';
 
@@ -615,15 +615,37 @@ router.post('/api/batches/:id(\\d+)/material', checkOrigin, api(async (req, res)
     worker = req.session.displayName || req.session.email;
   }
   if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
+  // CAS 契約の厳密検証 (要件§5.1・Codex 実装R1 high): 「欠落」と「明示 null」を区別する。
+  // expected_rule_id / expected_version は両方 null (未登録表示) か両方正整数、
+  // expected_delivery_code は必須。数値項目は正整数のみ
+  const b = req.body || {};
+  for (const k of ['expected_rule_id', 'expected_version', 'expected_delivery_code']) {
+    if (!(k in b)) throw new PackError(400, 'bad_contract', `${k} がありません (画面を更新してください)`);
+  }
+  const posInt = (v) => Number.isInteger(v) && v > 0;
+  const ruleId = b.expected_rule_id;
+  const ruleVer = b.expected_version;
+  if ((ruleId == null) !== (ruleVer == null) || (ruleId != null && (!posInt(ruleId) || !posInt(ruleVer)))) {
+    throw new PackError(400, 'bad_contract', 'expected_rule_id / expected_version が不正です');
+  }
+  if (!posInt(b.slip_seq)) throw new PackError(400, 'bad_slip_seq', 'slip_seq が不正です');
+  const opId = String(b.op_id || '');
+  if (!opId || opId.length > 80) throw new PackError(400, 'bad_op_id', 'op_id が不正です');
+  if (!b.material_code || typeof b.material_code !== 'string' || b.material_code.length > 40) {
+    throw new PackError(400, 'bad_material', 'material_code が不正です');
+  }
+  if (typeof b.expected_delivery_code !== 'string' || !b.expected_delivery_code || b.expected_delivery_code.length > 30) {
+    throw new PackError(400, 'bad_contract', 'expected_delivery_code が不正です');
+  }
   const result = registerMaterial({
     batchId: Number(req.params.id),
-    slipSeq: Number(req.body.slip_seq),
-    materialCode: String(req.body.material_code || ''),
-    expectedRuleId: req.body.expected_rule_id == null ? null : Number(req.body.expected_rule_id),
-    expectedVersion: req.body.expected_version == null ? null : Number(req.body.expected_version),
-    expectedDeliveryCode: String(req.body.expected_delivery_code || ''),
-    expectedBefore: req.body.expected_before == null ? null : String(req.body.expected_before),
-    opId: String(req.body.op_id || ''),
+    slipSeq: b.slip_seq,
+    materialCode: b.material_code,
+    expectedRuleId: ruleId == null ? null : ruleId,
+    expectedVersion: ruleVer == null ? null : ruleVer,
+    expectedDeliveryCode: b.expected_delivery_code,
+    expectedBefore: b.expected_before == null ? null : String(b.expected_before).slice(0, 40),
+    opId,
     worker,
   });
   res.json(result);
@@ -631,11 +653,26 @@ router.post('/api/batches/:id(\\d+)/material', checkOrigin, api(async (req, res)
 
 /** 資材登録の取り消し (猶予内・§5.2)。body: { op_id, event_id, undo_token, worker_name } */
 router.post('/api/batches/:id(\\d+)/material/undo', checkOrigin, api(async (req, res) => {
+  // worker は登録APIと同じ検証 (任意文字列を監査ログに入れない — Codex 実装R1 medium)
+  const name = String(req.body.worker_name || '').trim();
+  let worker = null;
+  if (name) {
+    if (!listWorkers().some((w) => w.name === name)) {
+      throw new PackError(400, 'bad_worker', '作業者が無効です。選び直してください');
+    }
+    worker = name;
+  } else if (req.session?.email) {
+    worker = req.session.displayName || req.session.email;
+  }
+  if (!Number.isInteger(req.body.event_id) || req.body.event_id < 1) {
+    throw new PackError(400, 'bad_event', 'event_id が不正です');
+  }
   const result = undoMaterial({
-    opId: String(req.body.op_id || ''),
-    eventId: Number(req.body.event_id),
+    opId: String(req.body.op_id || '').slice(0, 80),
+    eventId: req.body.event_id,
     undoToken: String(req.body.undo_token || ''),
-    worker: String(req.body.worker_name || '').trim() || null,
+    worker,
+    batchId: Number(req.params.id),   // 別バッチURLからの取り消しを拒否
   });
   res.json(result);
 }));
@@ -698,12 +735,45 @@ router.get('/admin/summary', requireAdmin, (req, res) => {
 
 const uploadImage = multer({ storage: multer.memoryStorage(), limits: { fileSize: 2 * 1024 * 1024 } });
 
-/** 画像のマジックバイト検証 (拡張子/MIME 申告は信用しない)。SVG は不可 (要件§6.3)。 */
+/**
+ * 画像のマジックバイト+寸法ヘッダ検証 (拡張子/MIME 申告は信用しない)。SVG は不可 (要件§6.3)。
+ * 完全デコードはしない (画像ライブラリを増やさない方針) — 形式・寸法上限 (4000px) までを防御し、
+ * 表示は <img>/background-image のみ (ブラウザのデコーダ任せ・サーバーでは処理しない)
+ */
+const IMAGE_MAX_DIM = 4000;
 function sniffImage(buf) {
-  if (!buf || buf.length < 12) return null;
-  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'jpg';
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'png';
-  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') return 'webp';
+  if (!buf || buf.length < 32) return null;
+  const ok = (w, h, kind) => (w > 0 && h > 0 && w <= IMAGE_MAX_DIM && h <= IMAGE_MAX_DIM ? kind : null);
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) {
+    return ok(buf.readUInt32BE(16), buf.readUInt32BE(20), 'png');
+  }
+  if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) {
+    // JPEG: SOF0/1/2 マーカーを走査して寸法を読む
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xFF) return null;
+      const marker = buf[i + 1];
+      const len = buf.readUInt16BE(i + 2);
+      if (marker >= 0xC0 && marker <= 0xC2) return ok(buf.readUInt16BE(i + 7), buf.readUInt16BE(i + 5), 'jpg');
+      if (len < 2) return null;
+      i += 2 + len;
+    }
+    return null;
+  }
+  if (buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WEBP') {
+    const fmt = buf.slice(12, 16).toString('ascii');
+    if (fmt === 'VP8 ' && buf.length >= 30) return ok(buf.readUInt16LE(26) & 0x3FFF, buf.readUInt16LE(28) & 0x3FFF, 'webp');
+    if (fmt === 'VP8L' && buf.length >= 25) {
+      const b0 = buf.readUInt32LE(21);
+      return ok((b0 & 0x3FFF) + 1, ((b0 >> 14) & 0x3FFF) + 1, 'webp');
+    }
+    if (fmt === 'VP8X' && buf.length >= 30) {
+      const w = 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16));
+      const h = 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16));
+      return ok(w, h, 'webp');
+    }
+    return null;
+  }
   return null;
 }
 
@@ -777,6 +847,7 @@ router.get('/admin/materials', requireAdmin, (req, res) => {
   `).all();
   const webhookConfigured = !!(process.env.PACKING_MATERIAL_WEBHOOK || process.env.PACKING_SHIP_CHANGE_WEBHOOK);
   res.render(path.join(__dirname, 'views/admin_materials'), {
+    undoSecretConfigured: UNDO_SECRET_CONFIGURED,
     title: '梱包資材の管理',
     username: req.session.email,
     displayName: req.session.displayName,
@@ -791,14 +862,18 @@ router.post('/admin/materials/master', checkOrigin, requireAdmin, api(async (req
   const code = String(req.body.code || '').trim();
   const name = String(req.body.name || '').trim();
   if (!/^[a-z0-9_]{2,40}$/.test(code)) throw new PackError(400, 'bad_code', 'code は英小文字/数字/_ (2〜40文字)');
-  if (!name) throw new PackError(400, 'bad_name', '名前は必須です');
+  if (!name || name.length > 60) throw new PackError(400, 'bad_name', '名前は必須です (60文字まで)');
+  const colorIn = String(req.body.color || '').trim();
+  if (colorIn && !/^#[0-9a-fA-F]{6}$/.test(colorIn)) {
+    throw new PackError(400, 'bad_color', '色は #rrggbb 形式で入力してください');
+  }
   const now = utcNowRouter();
   getDB().prepare(`
     INSERT INTO pk_pack_materials (code, name, color, sort_order, is_active, created_at, updated_at, updated_by)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(code) DO UPDATE SET name=excluded.name, color=excluded.color, sort_order=excluded.sort_order,
       is_active=excluded.is_active, updated_at=excluded.updated_at, updated_by=excluded.updated_by
-  `).run(code, name, String(req.body.color || '') || null,
+  `).run(code, name, colorIn || null,
     Math.min(9999, Math.max(0, Number(req.body.sort_order) || 100)),
     req.body.is_active === '0' ? 0 : 1, now, now, adminActor(req));
   res.json({ ok: true });
@@ -828,7 +903,7 @@ router.post('/admin/materials/master/image', checkOrigin, requireAdmin, (req, re
 /** 分類マスタの追加・編集。body: { class_value, aes_kind, hide_card, sort_order } */
 router.post('/admin/materials/class', checkOrigin, requireAdmin, api(async (req, res) => {
   const cv = normalizeKeyText(req.body.class_value);
-  if (!cv) throw new PackError(400, 'bad_class', '分類名は必須です');
+  if (!cv || cv.length > 120) throw new PackError(400, 'bad_class', '分類名は必須です (120文字まで)');
   const aesKind = ['mail', 'other'].includes(req.body.aes_kind) ? req.body.aes_kind : null;
   const now = utcNowRouter();
   getDB().prepare(`
@@ -850,6 +925,7 @@ router.post('/admin/materials/class/candidates', checkOrigin, requireAdmin, api(
   }
   const codes = String(req.body.codes || '').split(',').map((s) => s.trim()).filter(Boolean);
   const uniq = [...new Set(codes)];
+  if (uniq.length > 50) throw new PackError(400, 'bad_codes', '候補は50件までです');
   for (const c of uniq) {
     if (!db.prepare('SELECT 1 FROM pk_pack_materials WHERE code=?').get(c)) {
       throw new PackError(400, 'bad_material', `資材 ${c} がありません`);
@@ -870,7 +946,7 @@ router.post('/admin/materials/class/candidates', checkOrigin, requireAdmin, api(
 /** 伝票指定辞書 (header_map) の追加・編集。body: { header_value, base_delivery_code, material_code } */
 router.post('/admin/materials/header', checkOrigin, requireAdmin, api(async (req, res) => {
   const hv = normalizeKeyText(req.body.header_value);
-  if (!hv) throw new PackError(400, 'bad_header', 'header 値は必須です');
+  if (!hv || hv.length > 120) throw new PackError(400, 'bad_header', 'header 値は必須です (120文字まで)');
   const base = String(req.body.base_delivery_code || '');
   if (!BASE_DELIVERY_CODES.includes(base)) throw new PackError(400, 'bad_code', '基底コードが不正です');
   const mc = String(req.body.material_code || '').trim() || null;

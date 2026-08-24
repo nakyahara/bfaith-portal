@@ -31,11 +31,13 @@ export const BASE_DELIVERY_CODES = Object.freeze([
 
 export const UNDO_SEC = Math.max(5, Number(process.env.PACKING_MATERIAL_UNDO_SEC) || 15);
 
-// undo token の HMAC 鍵。未設定ならプロセス毎ランダム (再起動で undo 不能になるだけ・登録機能は無傷)
+// undo token の HMAC 鍵。未設定はプロセス毎ランダムで動作は継続する (登録機能は無傷・
+// 再起動を跨ぐ op_id 再送での undo token 再現だけ不可)。構成エラーとして管理画面に常時表示する
+export const UNDO_SECRET_CONFIGURED = !!process.env.PACKING_MATERIAL_UNDO_SECRET;
 let UNDO_SECRET = process.env.PACKING_MATERIAL_UNDO_SECRET || '';
 if (!UNDO_SECRET) {
   UNDO_SECRET = crypto.randomBytes(32).toString('hex');
-  console.warn('[packing-materials] PACKING_MATERIAL_UNDO_SECRET 未設定 → プロセス毎のランダム鍵 (再起動を跨ぐ undo 再現は不可)');
+  console.warn('[packing-materials] 構成エラー: PACKING_MATERIAL_UNDO_SECRET 未設定 → プロセス毎のランダム鍵で継続 (再起動を跨ぐ undo 再現は不可。.env に設定してください)');
 }
 
 /** 正規化: NFKC → trim → 連続空白を1つに。辞書キー (header/分類/配送方法生値) は全てこれを通す。 */
@@ -259,6 +261,8 @@ export function materialsForState(state, hikiateClass) {
   const db = getDB();
   const now = utcNow();
   const out = {};
+  // BEGIN IMMEDIATE: 読み→書き (views upsert) の昇格を避ける (deferred だと他ライタと競合時に
+  // SQLITE_BUSY が busy_timeout を待たずに出るケースがある)
   const tx = db.transaction(() => {
     for (const slip of state.slips) {
       const ctx = judgeSlip(db, { batchId: state.batch.id, slip, hikiateClass });
@@ -277,7 +281,7 @@ export function materialsForState(state, hikiateClass) {
       };
     }
   });
-  tx();
+  tx.immediate();
   return out;
 }
 
@@ -333,7 +337,7 @@ export function registerMaterial({
   if (!worker) throw new PackError(400, 'no_worker', '作業者を選択してください');
   const reqHash = requestHashOf({
     kind: 'register', batchId, slipSeq, materialCode,
-    expectedRuleId, expectedVersion, expectedDeliveryCode, expectedBefore,
+    expectedRuleId, expectedVersion, expectedDeliveryCode, expectedBefore, worker,
   });
   const now = utcNow();
   const tx = db.transaction(() => {
@@ -468,10 +472,10 @@ function PackErrorWithBody(status, code, message, body) {
 }
 
 /** 取り消し (§5.2)。成立条件を全て同一 txn 内で検証。 */
-export function undoMaterial({ opId, eventId, undoToken, worker }) {
+export function undoMaterial({ opId, eventId, undoToken, worker, batchId = null }) {
   const db = getDB();
   if (!opId) throw new PackError(400, 'bad_op_id', 'op_id が不正です');
-  const reqHash = requestHashOf({ kind: 'undo', eventId });
+  const reqHash = requestHashOf({ kind: 'undo', eventId, worker });
   const now = utcNow();
   const tx = db.transaction(() => {
     const replay = opReplayOrConflict(db, opId, reqHash);
@@ -479,6 +483,9 @@ export function undoMaterial({ opId, eventId, undoToken, worker }) {
     const ev = db.prepare('SELECT * FROM pk_pack_material_events WHERE id = ?').get(Number(eventId));
     if (!ev || (ev.action !== 'register' && ev.action !== 'change')) {
       throw new PackError(404, 'event_not_found', '取り消し対象がありません');
+    }
+    if (batchId != null && ev.batch_id !== batchId) {
+      throw new PackError(404, 'event_not_found', '取り消し対象がありません (バッチ不一致)');
     }
     if (!timingSafeEq(undoTokenFor(ev.id), undoToken)) throw new PackError(403, 'bad_token', '取り消しトークンが不正です');
     if (ev.undone_at) throw new PackError(409, 'already_undone', 'すでに取り消し済みです');
@@ -534,6 +541,26 @@ export function undoMaterial({ opId, eventId, undoToken, worker }) {
 // ─── 完了スナップショット (service.applyEvent から呼ばれる — fail-soft) ───
 
 export function onSlipCompleted(db, batchId, slipSeq, now) {
+  // view 行が無い場合 (初回表示 fail-soft 等) はその場で判定して upsert してから固定する
+  // (呼び出し元 = applyEvent の txn 内・全て同期)
+  const exists = db.prepare(
+    'SELECT 1 FROM pk_pack_material_views WHERE batch_id=? AND slip_seq=?'
+  ).get(batchId, slipSeq);
+  if (!exists) {
+    const batch = db.prepare('SELECT pk_batch_id FROM pk_pack_batches WHERE id=?').get(batchId);
+    const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
+    if (!slip) return;
+    slip.lines = db.prepare('SELECT sku, qty, product_name FROM pk_pack_lines WHERE slip_id=? ORDER BY id').all(slip.id);
+    let hikiateClass = null;
+    if (batch?.pk_batch_id) {
+      try {
+        hikiateClass = db.prepare('SELECT hikiate_class FROM pk_batches WHERE id=?')
+          .get(batch.pk_batch_id)?.hikiate_class ?? null;
+      } catch { /* picking 未初期化 */ }
+    }
+    const ctx = judgeSlip(db, { batchId, slip, hikiateClass });
+    upsertView(db, { batchId, slip, hikiateClass, ctx, now });
+  }
   db.prepare(`
     UPDATE pk_pack_material_views
     SET completed_at=?, completed_source=source, completed_material_code=material_code, completed_rule_id=rule_id
@@ -554,10 +581,10 @@ export function onSlipCompletionCleared(db, batchId, slipSeq) {
 const RETRY_MAX = 10;
 const RETRY_WINDOW_H = 48;
 const STALE_CLAIM_MIN = 5;
-/** attempt_count (claim 時に加算済み) → 次回までの待ち秒。30s,1m,2m,5m,10m,…上限30m */
+/** attempt_count (claim 時に加算済み) → 次回までの待ち秒。30s,1m,2m,5m,10m,30m (以降30m)。 */
 function backoffSec(attempt) {
-  const table = [30, 60, 120, 300, 600];
-  return table[Math.min(attempt - 1, table.length - 1)] ?? 1800;
+  const table = [30, 60, 120, 300, 600, 1800];
+  return table[Math.min(Math.max(attempt, 1) - 1, table.length - 1)];
 }
 
 const LIMIT_SQL = `(attempt_count < ${RETRY_MAX}
@@ -692,7 +719,7 @@ export function materialDailyCounts(workDateJst) {
 export function purgeOldViews() {
   const db = getDB();
   try {
-    db.prepare("DELETE FROM pk_pack_material_views WHERE last_shown_at < datetime('now', '-180 days')").run();
+    db.prepare("DELETE FROM pk_pack_material_views WHERE datetime(replace(last_shown_at,'Z','')) < datetime('now', '-180 days')").run();
   } catch { /* v10 未適用 */ }
 }
 
@@ -708,6 +735,8 @@ export function seedMaterialsData(seed, actor = 'seed') {
   const now = utcNow();
   const tx = db.transaction(() => {
     for (const m of seed.materials || []) {
+      if (!m.name || String(m.name).length > 60) throw new Error(`seed: 資材名が不正 (${m.code})`);
+      if (m.color && !/^#[0-9a-fA-F]{6}$/.test(m.color)) throw new Error(`seed: 色が不正 (${m.code}: ${m.color})`);
       db.prepare(`
         INSERT INTO pk_pack_materials (code, name, color, image_file, sort_order, is_active, created_at, updated_at, updated_by)
         VALUES (@code, @name, @color, @image_file, @sort_order, 1, @now, @now, @actor)

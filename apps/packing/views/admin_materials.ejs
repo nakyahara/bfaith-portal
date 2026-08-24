@@ -47,6 +47,10 @@
       <div class="cfg-err">🚨 通知先未設定: PACKING_MATERIAL_WEBHOOK (または PACKING_SHIP_CHANGE_WEBHOOK) が .env にありません。
         資材変更のGChat通知は送信されず pending のまま溜まります。</div>
     <% } %>
+    <% if (typeof undoSecretConfigured !== 'undefined' && !undoSecretConfigured) { %>
+      <div class="cfg-err">🚨 構成エラー: PACKING_MATERIAL_UNDO_SECRET が .env にありません。
+        取り消しトークンがプロセス毎のランダム鍵になり、サーバー再起動を跨ぐと「取り消す」が効かなくなります。</div>
+    <% } %>
 
     <% if (unreviewedHeaders.length > 0 || unreviewedClasses.length > 0) { %>
       <div class="pk-form" style="border: 2px solid #f08c00">
