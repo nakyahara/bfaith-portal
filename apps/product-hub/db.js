@@ -180,7 +180,7 @@ export const LEGACY_IMAGE_STEP_CODES = ['img_request', 'img_production', 'img_re
 /** 画像トラックの種別。TOP は楽天出品に必須なので「対象外」にできない (workflow-progress 側で拒否) */
 export const IMAGE_KINDS = [
   { code: 'top', label: 'TOP画像' },
-  { code: 'detail', label: '詳細画像' },
+  { code: 'detail', label: '商品詳細画像' },
 ];
 
 let initialized = false;
