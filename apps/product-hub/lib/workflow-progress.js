@@ -876,7 +876,11 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // LIMIT を食い潰し、いま担当している古い商品がボードから消える
   // 画像ビューの候補は**画像工程だけ**から取る (Codex R1 medium):
   // 本流だけが条件一致する商品が LIMIT を食い潰し、あとの JS 絞り込みで消えると
-  // 実際に画像を担当している商品がボードから欠落する
+  // 実際に画像を担当している商品がボードから欠落する。
+  // 種別絞り込み時は候補もその種別に限定する (Codex R1 medium: kind=top&assignee=X で
+  // 「詳細側だけ X 担当」の商品が候補・total・LIMIT を消費し、表示と件数がズレる)。
+  // imageKind はホワイトリスト検証済みの値だけをリテラル展開する
+  const kindSafe = view === 'image' && (imageKind === 'top' || imageKind === 'detail') ? imageKind : null;
   const CURRENT_STEPS = `
     SELECT draft_id, assignee_id, role_code FROM (
       SELECT p.draft_id, p.assignee_id, s.role_code,
@@ -888,6 +892,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
       WHERE p.state IN ('todo', 'doing')
         ${view === 'image' ? "AND s.track = 'image'" : ''}
+        ${kindSafe ? `AND s.image_kind = '${kindSafe}'` : ''}
     ) WHERE rn = 1
   `;
   let candidateSql = '';
@@ -910,6 +915,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
+    ${kindSafe === 'detail' ? 'AND d.detail_images_excluded = 0' : ''}
     ORDER BY d.updated_at DESC
     LIMIT ?
   `).all(...candidateParams, limit + 1);

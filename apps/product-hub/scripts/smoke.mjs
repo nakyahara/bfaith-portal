@@ -2793,6 +2793,18 @@ let wfSetParentId = null;
     ibDet.columns.every((c) => c.cards.every((x) => x.kind === 'detail'))
     && ibDet.doneCards.every((x) => x.kind === 'detail')
     && ibDet.columns.find((c) => c.key === 'request')?.cards.some((c2) => c2.id === idM4) === true);
+  // R1対応: 詳細対象外の商品は kind=detail の候補 (total/LIMIT) を消費しない
+  const idKfx = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-KFEX', '詳細対象外の絞り込み', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idKfx);
+  db.prepare('UPDATE product_drafts SET detail_images_excluded = 1 WHERE id = ?').run(idKfx);
+  const ibDet2 = wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' });
+  check('画像ビュー: kind=detail は詳細対象外の商品を候補に数えない',
+    ibDet2.total === ibDet.total && !ibDet2.columns.some((c) => c.cards.some((x) => x.id === idKfx)));
+  check('画像ビュー: 詳細対象外でも kind=top には出る',
+    wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.cards.some((x) => x.id === idKfx)));
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
 
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
