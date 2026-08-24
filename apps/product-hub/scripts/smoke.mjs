@@ -2846,6 +2846,34 @@ let wfSetParentId = null;
   wfpEarly.ensureProgress(db, idShRk);
   check('撮影依頼中: 楽天登録済みには自動 done で入る',
     db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idShRk, 'img_shoot_detail')?.state === 'done');
+  // R1対応: 種別絞り込み時は片側にしか無い段階の列を出さない
+  check('撮影依頼中: kind=top では撮影依頼中の列が出ない',
+    !wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.key === 'shoot'));
+  check('撮影依頼中: kind=detail では撮影依頼中の列が出る',
+    wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.some((c) => c.key === 'shoot'));
+  // R1対応: 途中挿入のバックフィル — 先の工程に着手済みの既存ドラフトへは done で入る (巻き戻さない)
+  const idBk = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-BK', '撮影・進行中', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idBk);
+  wfpEarly.setStepState(idBk, 'img_request_detail', { state: 'done' }, 'smoke', ADMIN2);
+  wfpEarly.setStepState(idBk, 'img_production_detail', { state: 'doing' }, 'smoke', ADMIN2);
+  db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).run(idBk);
+  wfpEarly.ensureProgress(db, idBk);
+  check('撮影依頼中: 制作に着手済みの既存ドラフトへは done で入る (現在工程を巻き戻さない)',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).get(idBk)?.state === 'done');
+  // 先が全部 todo (依頼だけ done) なら従来どおり todo で入る = 撮影から順に進める
+  const idBk2 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-BK2', '撮影・未着手', 'smoke')
+  `).run().lastInsertRowid);
+  wfpEarly.ensureProgress(db, idBk2);
+  wfpEarly.setStepState(idBk2, 'img_request_detail', { state: 'done' }, 'smoke', ADMIN2);
+  db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).run(idBk2);
+  wfpEarly.ensureProgress(db, idBk2);
+  check('撮影依頼中: 先が全部 todo なら todo で入る (これから進む商品は撮影から)',
+    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).get(idBk2)?.state === 'todo');
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBk);
+  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBk2);
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSh);
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShRk);
 
