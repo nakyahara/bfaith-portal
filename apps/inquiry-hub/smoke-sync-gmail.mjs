@@ -406,8 +406,7 @@ console.log('5. 送信');
   check('会話に送信メッセージ追加+rev++/waiting_reply', inqAfter.conversation_rev === inqRow.conversation_rev + 1 && inqAfter.internal_status === 'waiting_reply'
     && !!db.prepare("SELECT 1 FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = 'sent-001'").get(inqRow.id));
 
-  // 5f. From実測検証 + 楽天マスクアドレス宛ガード (2026-08-24 実測: send-asエイリアス未設定で
-  // Gmail が From を d.nakahara@ に置き換え → 楽天中継が 552 sender rejected でバウンス)
+  // 5f. From実測検証 (2026-08-24: send-asエイリアスの状態によらず、実際に送られたFromを読み戻して警告)
   {
     const metaMask = { id: 'g9', messages: [{ id: 'm1', payload: { headers: [{ name: 'Message-ID', value: '<mid-9@x>' }] } }] };
     // 読み戻し (send-verify-from) が「置き換わったFrom」を返すモック
@@ -417,30 +416,18 @@ console.log('5. 送信');
       return { body: { id: 'sent-mask', payload: { headers: [{ name: 'From', value: 'D Nakahara <d.nakahara@b-faith.biz>' }] } } };
     });
     const adMask = createGmailAdapter({ ...CRED, fetchImpl: fMask, sendMode: 'live' });
-    const rMask = await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'abc123@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' });
+    const rMask = await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
     check('From置き換わり検出: sent+warning (実測アドレス入り)', rMask.externalReplyId === 'sent-mask' && /d\.nakahara@b-faith\.biz/.test(rMask.warning || ''), JSON.stringify(rMask));
-    check('マスクアドレス宛のwarningは不達 (バウンス) を明記', /バウンス/.test(rMask.warning || ''));
 
-    // 置き換わりが既知になった後のマスクアドレス宛は送信前に止める (送るだけ100%バウンス)
-    const sendCalls0 = fMask.calls.filter(c => c.url.includes('messages/send')).length;
-    let eMask = null;
-    try { await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'xyz@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' }); } catch (e) { eMask = e; }
-    check('置き換わり既知後のマスクアドレス宛は SendRejectedError (未送信+直し方入り)',
-      eMask instanceof SendRejectedError && /他のメールアドレスからメールを送信/.test(eMask.message)
-      && fMask.calls.filter(c => c.url.includes('messages/send')).length === sendCalls0, String(eMask?.message));
-    // 通常宛先は届く (楽天中継を通らない) ので警告付きで送れる
-    const rPlain = await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
-    check('置き換わり既知でも通常宛先は送信可 (warning付き)', rPlain.externalReplyId === 'sent-mask' && !!rPlain.warning);
-
-    // 設定が直った (実測From=info@) 後はマスクアドレス宛も再び通る+warningなし
+    // 実測From=info@ (正常) なら warning なし
     const fOk = mockFetch((url) => {
       if (url.includes('/threads/')) return { body: metaMask };
       if (url.includes('messages/send')) return { body: { id: 'sent-ok', threadId: 'g9' } };
       return { body: { id: 'sent-ok', payload: { headers: [{ name: 'From', value: '雑貨イズム <info@b-faith.biz>' }] } } };
     });
-    const adOk = createGmailAdapter({ ...CRED, fetchImpl: fOk, sendMode: 'live' });
-    const rOk = await adOk.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'abc123@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' });
-    check('From=info@ならマスクアドレス宛OK+warningなし', rOk.externalReplyId === 'sent-ok' && !rOk.warning);
+    const rOk = await createGmailAdapter({ ...CRED, fetchImpl: fOk, sendMode: 'live' })
+      .sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
+    check('From=info@ならwarningなし', rOk.externalReplyId === 'sent-ok' && !rOk.warning);
     // 読み戻し自体の失敗は fail-soft (送信は完了扱い・warningなし)
     const fVerifyNg = mockFetch((url) => {
       if (url.includes('/threads/')) return { body: metaMask };
@@ -457,6 +444,72 @@ console.log('5. 送信');
     await runOutboxPass({ email: adMask }, { executor: 'server' });
     const jobWarnRow = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(jobWarn.id);
     check('outbox: sent+warningがerror_messageに保存', jobWarnRow.status === 'sent' && /実際の送信元/.test(jobWarnRow.error_message || ''), JSON.stringify({ s: jobWarnRow.status, e: jobWarnRow.error_message }));
+  }
+
+  // 5g. 楽天マスクアドレス宛 = 楽天公式SMTP経路 (2026-08-24 バウンス対策。sub.fw.rakuten.ne.jp:587)
+  // Gmail API経由だとSMTPエンベロープが認証アカウントになり 552 sender rejected でバウンスするため、
+  // この宛先だけ楽天提供SMTP (エンベロープ=info@) で送る (メールディーラー等と同方式)
+  {
+    const { resolveRakutenMaskSmtpFromEnv } = await import('./sync/adapters/gmail.js');
+    check('env解決: 未設定はnull', resolveRakutenMaskSmtpFromEnv({}) === null);
+    const smtpEnv = resolveRakutenMaskSmtpFromEnv({ INQUIRY_RAKUTEN_SMTP_USER: 'u1', INQUIRY_RAKUTEN_SMTP_PASS: 'p1' });
+    check('env解決: 既定=sub.fw.rakuten.ne.jp:587', smtpEnv.host === 'sub.fw.rakuten.ne.jp' && smtpEnv.port === 587 && smtpEnv.user === 'u1');
+
+    const metaMask = { id: 'g9', messages: [{ id: 'm1', payload: { headers: [{ name: 'Message-ID', value: '<mid-9@x>' }] } }] };
+    const MASKED = 'abc123@pc.fw.rakuten.ne.jp';
+
+    // SMTP未設定: 未送信で止めて直し方を出す (Gmailに流すと100%バウンスするため)
+    const fNoSend = mockFetch((url) => url.includes('/threads/') ? { body: metaMask } : { body: {} });
+    let eNoSmtp = null;
+    try {
+      await createGmailAdapter({ ...CRED, fetchImpl: fNoSend, sendMode: 'live' })
+        .sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: MASKED, subject: 'a' }, bodyText: 'x' });
+    } catch (e) { eNoSmtp = e; }
+    check('SMTP未設定のマスクアドレス宛は SendRejectedError (env名入り・Gmail未送信)',
+      eNoSmtp instanceof SendRejectedError && /INQUIRY_RAKUTEN_SMTP_USER/.test(eNoSmtp.message)
+      && !fNoSend.calls.some(c => c.url.includes('messages/send')), String(eNoSmtp?.message));
+
+    // SMTP設定あり: nodemailer相当のモックで送信内容を検証
+    const sentMails = [];
+    let factorySeen = null, closed = 0;
+    const mockFactory = (s) => { factorySeen = s; return {
+      sendMail: async (opts) => { sentMails.push(opts); return { messageId: '<smtp-1@b-faith.biz>' }; },
+      close: () => { closed++; },
+    }; };
+    const rakutenSmtp = { host: 'sub.fw.rakuten.ne.jp', port: 587, user: 'u1', pass: 'p1' };
+    const fSmtp = mockFetch((url) => url.includes('/threads/') ? { body: metaMask } : { body: { id: 'gm-x', threadId: 'g9' } });
+    const adSmtp = createGmailAdapter({ ...CRED, fetchImpl: fSmtp, sendMode: 'live', rakutenSmtp, smtpTransportFactory: mockFactory });
+    const rSmtp = await adSmtp.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: MASKED, subject: '発送についてのご案内' }, bodyText: '再送します' });
+    const mail = sentMails[0];
+    check('マスクアドレス宛は楽天SMTPで送信 (Gmail send API不使用)',
+      sentMails.length === 1 && !fSmtp.calls.some(c => c.url.includes('messages/send')), JSON.stringify(rSmtp));
+    check('エンベロープ (MAIL FROM) = info@b-faith.biz を明示', mail.envelope?.from === 'info@b-faith.biz' && mail.envelope?.to?.[0] === MASKED, JSON.stringify(mail?.envelope));
+    check('From表示/宛先/スレッド返信ヘッダ', mail.from?.address === 'info@b-faith.biz' && mail.to === MASKED && mail.inReplyTo === '<mid-9@x>');
+    check('externalReplyId=SMTPのmessageId', rSmtp.externalReplyId === '<smtp-1@b-faith.biz>');
+    check('接続設定がfactoryに渡る+close呼び出し', factorySeen?.host === 'sub.fw.rakuten.ne.jp' && closed === 1);
+    // 通常宛先は従来どおりGmail経路
+    await adSmtp.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
+    check('通常宛先はGmail経路のまま', fSmtp.calls.some(c => c.url.includes('messages/send')) && sentMails.length === 1);
+
+    // dryrun: SMTPも呼ばない
+    const adSmtpDry = createGmailAdapter({ ...CRED, fetchImpl: fSmtp, sendMode: 'dryrun', rakutenSmtp, smtpTransportFactory: mockFactory });
+    const rDry = await adSmtpDry.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: MASKED, subject: 'a' }, bodyText: 'x' });
+    check('dryrun: 楽天SMTPも実送信しない', rDry.dryRun === true && sentMails.length === 1);
+
+    // SMTPの5xx応答 = 未送信確定 / 接続断 = 結果不明
+    const errFactory = err => () => ({ sendMail: async () => { throw err; }, close: () => {} });
+    let e552 = null;
+    try {
+      await createGmailAdapter({ ...CRED, fetchImpl: fSmtp, sendMode: 'live', rakutenSmtp, smtpTransportFactory: errFactory(Object.assign(new Error('552 sender rejected'), { responseCode: 552 })) })
+        .sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: MASKED, subject: 'a' }, bodyText: 'x' });
+    } catch (e) { e552 = e; }
+    check('SMTP 552応答は SendRejectedError (未送信確定)', e552 instanceof SendRejectedError && /552/.test(e552.message));
+    let eNet = null;
+    try {
+      await createGmailAdapter({ ...CRED, fetchImpl: fSmtp, sendMode: 'live', rakutenSmtp, smtpTransportFactory: errFactory(Object.assign(new Error('socket hang up'), { code: 'ECONNECTION' })) })
+        .sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: MASKED, subject: 'a' }, bodyText: 'x' });
+    } catch (e) { eNet = e; }
+    check('SMTP接続断は汎用エラー (→unknown・自動再送しない)', eNet !== null && !(eNet instanceof SendRejectedError) && /結果不明/.test(eNet.message));
   }
 
   // 5e. cron dark launch
