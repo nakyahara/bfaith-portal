@@ -398,6 +398,59 @@ console.log('5. 送信');
   check('会話に送信メッセージ追加+rev++/waiting_reply', inqAfter.conversation_rev === inqRow.conversation_rev + 1 && inqAfter.internal_status === 'waiting_reply'
     && !!db.prepare("SELECT 1 FROM inquiry_messages WHERE inquiry_id = ? AND external_message_id = 'sent-001'").get(inqRow.id));
 
+  // 5f. From実測検証 + 楽天マスクアドレス宛ガード (2026-08-24 実測: send-asエイリアス未設定で
+  // Gmail が From を d.nakahara@ に置き換え → 楽天中継が 552 sender rejected でバウンス)
+  {
+    const metaMask = { id: 'g9', messages: [{ id: 'm1', payload: { headers: [{ name: 'Message-ID', value: '<mid-9@x>' }] } }] };
+    // 読み戻し (send-verify-from) が「置き換わったFrom」を返すモック
+    const fMask = mockFetch((url) => {
+      if (url.includes('/threads/')) return { body: metaMask };
+      if (url.includes('messages/send')) return { body: { id: 'sent-mask', threadId: 'g9' } };
+      return { body: { id: 'sent-mask', payload: { headers: [{ name: 'From', value: 'D Nakahara <d.nakahara@b-faith.biz>' }] } } };
+    });
+    const adMask = createGmailAdapter({ ...CRED, fetchImpl: fMask, sendMode: 'live' });
+    const rMask = await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'abc123@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' });
+    check('From置き換わり検出: sent+warning (実測アドレス入り)', rMask.externalReplyId === 'sent-mask' && /d\.nakahara@b-faith\.biz/.test(rMask.warning || ''), JSON.stringify(rMask));
+    check('マスクアドレス宛のwarningは不達 (バウンス) を明記', /バウンス/.test(rMask.warning || ''));
+
+    // 置き換わりが既知になった後のマスクアドレス宛は送信前に止める (送るだけ100%バウンス)
+    const sendCalls0 = fMask.calls.filter(c => c.url.includes('messages/send')).length;
+    let eMask = null;
+    try { await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'xyz@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' }); } catch (e) { eMask = e; }
+    check('置き換わり既知後のマスクアドレス宛は SendRejectedError (未送信+直し方入り)',
+      eMask instanceof SendRejectedError && /他のメールアドレスからメールを送信/.test(eMask.message)
+      && fMask.calls.filter(c => c.url.includes('messages/send')).length === sendCalls0, String(eMask?.message));
+    // 通常宛先は届く (楽天中継を通らない) ので警告付きで送れる
+    const rPlain = await adMask.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
+    check('置き換わり既知でも通常宛先は送信可 (warning付き)', rPlain.externalReplyId === 'sent-mask' && !!rPlain.warning);
+
+    // 設定が直った (実測From=info@) 後はマスクアドレス宛も再び通る+warningなし
+    const fOk = mockFetch((url) => {
+      if (url.includes('/threads/')) return { body: metaMask };
+      if (url.includes('messages/send')) return { body: { id: 'sent-ok', threadId: 'g9' } };
+      return { body: { id: 'sent-ok', payload: { headers: [{ name: 'From', value: '雑貨イズム <info@b-faith.biz>' }] } } };
+    });
+    const adOk = createGmailAdapter({ ...CRED, fetchImpl: fOk, sendMode: 'live' });
+    const rOk = await adOk.sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'abc123@pc.fw.rakuten.ne.jp', subject: 'a' }, bodyText: 'x' });
+    check('From=info@ならマスクアドレス宛OK+warningなし', rOk.externalReplyId === 'sent-ok' && !rOk.warning);
+    // 読み戻し自体の失敗は fail-soft (送信は完了扱い・warningなし)
+    const fVerifyNg = mockFetch((url) => {
+      if (url.includes('/threads/')) return { body: metaMask };
+      if (url.includes('messages/send')) return { body: { id: 'sent-vng', threadId: 'g9' } };
+      return { status: 500, body: { error: { message: 'boom' } } };
+    });
+    const rVng = await createGmailAdapter({ ...CRED, fetchImpl: fVerifyNg, sendMode: 'live' })
+      .sendReply({ inquiry: { external_inquiry_id: 'g9', customer_identifier: 'c@example.com', subject: 'a' }, bodyText: 'x' });
+    check('From読み戻し失敗はfail-soft (sent扱い・warningなし)', rVng.externalReplyId === 'sent-vng' && !rVng.warning);
+
+    // warning は outbox の error_message に保存される (status=sentのまま。詳細画面のジョブ履歴に出る)
+    const inqRow2 = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inqRow.id);
+    const jobWarn = createReplyJob({ inquiryId: inqRow.id, channelType: 'email', bodyText: '警告テスト', createdBy: 'tester', clientOperationId: 'op-send-warn', baseConversationRev: inqRow2.conversation_rev });
+    await runOutboxPass({ email: adMask }, { executor: 'server' });
+    const jobWarnRow = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(jobWarn.id);
+    check('outbox: sent+warningがerror_messageに保存', jobWarnRow.status === 'sent' && /実際の送信元/.test(jobWarnRow.error_message || ''), JSON.stringify({ s: jobWarnRow.status, e: jobWarnRow.error_message }));
+  }
+
   // 5e. cron dark launch
   delete process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED;
   check('outbox cron: flag未設定は起動しない', startInquiryHubOutboxCron() === null);

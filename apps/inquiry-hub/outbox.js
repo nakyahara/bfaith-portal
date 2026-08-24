@@ -12,7 +12,8 @@
  *   pending ──rev競合──▶ needs_review (workerは二度と拾わない。人間が新しいジョブとして再作成)
  *
  * 送信アダプター契約 (設計書§5.2 最小IF):
- *   await adapter.sendReply({ inquiry, shop, bodyText, attachmentsJson }) → { externalReplyId? }
+ *   await adapter.sendReply({ inquiry, shop, bodyText, attachmentsJson }) → { externalReplyId?, warning? }
+ *   - warning = 送信は成功したが人が確認すべき事象 (例: Gmailの送信元From置き換え)。sentのままerror_messageに表示
  *   - 外部APIが「受け付けなかった」と明確に分かる失敗は SendRejectedError を throw (→ failed。再送は安全)
  *   - それ以外の失敗 (タイムアウト・5xx・切断等、送信された可能性が残るもの) は通常の throw (→ unknown)
  */
@@ -218,8 +219,10 @@ export async function runOutboxPass(adapters, opts = {}) {
       const extReplyId = sent?.externalReplyId || `op:${job.client_operation_id}`;
       const sentIso = toUtcIso(tick()); // 完了時刻は送信後に取り直す (長い送信でもsent_atを正確に)
       const tx = db.transaction(() => {
+        // warning = 送信は成功したが要注意 (例: Gmailが送信元Fromを置き換えた → 楽天マスク
+        // アドレス宛はバウンスする)。ジョブ履歴の error_message として表示して気付けるようにする
         if (!finishJob(db, job, { status: 'sent', external_reply_id: extReplyId, sent_at: sentIso,
-          lease_token: null, lease_until: null, error_message: null })) {
+          lease_token: null, lease_until: null, error_message: sent?.warning ? String(sent.warning).slice(0, 500) : null })) {
           // リースを失っていた (ゾンビ扱いでunknown化済み等) → メッセージ二重挿入を避けて何もしない
           return false;
         }
