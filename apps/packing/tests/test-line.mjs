@@ -229,6 +229,36 @@ console.log('\n── replay ──');
   eq(listLineRuns(7).length, 0, 'cancel で line_runs も初期化');
 }
 
+console.log('\n── 一時中断 (2026-08-25 現場意見: 資材交換で止めたいのに「終了」しかなかった) ──');
+{
+  mkBatch(10, 1, 40);   // PAS
+  throws(() => ev(10, 'pause', { reason: '資材の交換' }), 'not_packing', '未開始の中断は拒否');
+  ev(10, 'line_start');
+  ev(10, 'pause', { reason: '資材の交換' });
+  let b = db.prepare('SELECT * FROM pk_pack_batches WHERE id=10').get();
+  eq([b.status, b.pause_reason], ['paused', '資材の交換'], '中断でバッチは paused + 理由');
+  throws(() => ev(10, 'line_stop'), 'not_packing', '中断中の「流し終了」は拒否 (作業終了にならない)');
+  throws(() => ev(10, 'line_done', { finalCount: 40 }), 'not_stopped', '中断中の件数記録も拒否');
+  throws(() => ev(10, 'resume', {}, '別人'), 'taken', '別人の再開は拒否');
+  // 中断開始を2分前に巻き戻して再開 → 工程行に中断秒が積まれる
+  db.prepare("UPDATE pk_pack_batches SET pause_started_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-120 seconds') WHERE id=10").run();
+  ev(10, 'resume');
+  b = db.prepare('SELECT * FROM pk_pack_batches WHERE id=10').get();
+  const run = listLineRuns(10).find((r) => r.phase === 'run');
+  eq([b.status, b.pause_started_at], ['packing', null], '再開で packing に戻る');
+  ok(b.paused_total_sec >= 119 && b.paused_total_sec <= 122, `バッチの中断秒 (${b.paused_total_sec})`);
+  ok(run.paused_total_sec >= 119 && run.paused_total_sec <= 122 && run.finished_at == null, `工程行 run にも中断秒 (${run.paused_total_sec})・停止はされていない`);
+  ev(10, 'line_stop');
+  throws(() => ev(10, 'pause', { reason: '休憩' }), 'no_phase', '停止後 (件数入力待ち) の中断は拒否');
+  ev(10, 'line_done', { finalCount: 40, manualCount: 0 });
+  eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=10').get().status, 'done', '件数記録で完了');
+  // 停止の取消 (undo) で中断秒は保持される
+  ev(10, 'undo', { reason: '誤タップ' });
+  ev(10, 'undo', { reason: '誤タップ' });
+  const run2 = listLineRuns(10).find((r) => r.phase === 'run');
+  ok(run2.finished_at == null && run2.paused_total_sec === run.paused_total_sec, '停止取消後も工程行の中断秒は保持');
+}
+
 db.close();
 try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* 後始末失敗は無視 */ }
 console.log(`\n${failed === 0 ? '✅ 全テスト PASS' : `❌ ${failed} 件失敗`}`);

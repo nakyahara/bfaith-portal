@@ -570,7 +570,7 @@ export function lineDailyTotal(workDate, kind) {
 // 中断理由 (picking と同じ最小セット)
 // '配送変更の入力' = ④⑥フォームを開いている間の自動中断 (計測から除外 — 中原さん指示 2026-08-21)。
 // 手動の中断メニューには出さない (work.ejs側でフィルタ)
-export const PAUSE_REASONS = ['休憩', '他作業への応援', '配送変更の入力', 'その他'];
+export const PAUSE_REASONS = ['資材の交換', '休憩', '他作業への応援', '配送変更の入力', 'その他'];
 // 完了取消の理由 (監査ログ必須 — 要件§5.1)
 export const UNDO_REASONS = ['誤タップ', '入れ間違いの確認', 'その他'];
 // ④ 配送方法変更の理由 (要件§5.7)
@@ -585,6 +585,12 @@ export const SHIP_CHANGE_METHOD_OPTIONS = [
  * floor = バッチ開始時刻等 (Codexレビュー medium: 端末時計のズレで開始前の時刻を
  * pause_started_at に入れると、実作業時間以上の中断秒が加算されて計測が壊れる)
  */
+/** ライン: 進行中 (開始済み・未停止) の工程行。仕分け→流しの順で高々1行。 */
+function inProgressLineRun(db, batchId) {
+  return db.prepare(`SELECT * FROM pk_pack_line_runs WHERE batch_id=? AND started_at IS NOT NULL AND finished_at IS NULL
+    ORDER BY id DESC LIMIT 1`).get(batchId) || null;
+}
+
 function clampedEventTime(clientAt, now, floor = null) {
   const t = Date.parse(clientAt || '');
   const nowMs = Date.parse(now);
@@ -761,6 +767,11 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         throw new PackError(409, 'not_packing', `作業中ではないため中断できません (${batch.status})`);
       }
       requireOwner();
+      if (lineKind && !inProgressLineRun(db, batchId)) {
+        // ライン: 進行中の工程 (仕分け中 / 流し中) があるときだけ中断できる。
+        // 停止後の件数入力待ちや工程間で中断すると差し引く先の工程が無く、計測が壊れる
+        throw new PackError(409, 'no_phase', '進行中の工程がありません (中断できるのは仕分け中・流し中のみ)');
+      }
       const r = PAUSE_REASONS.includes(reason) ? reason : 'その他';
       const pauseAt = clampedEventTime(clientAt, now, batch.started_at);
       db.prepare(`UPDATE pk_pack_batches SET status='paused', pause_started_at=?, pause_reason=?, updated_at=? WHERE id=?`)
@@ -777,6 +788,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         UPDATE pk_pack_batches SET status='packing', paused_total_sec = paused_total_sec + ?,
           pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
       `).run(pausedSec, now, batchId);
+      if (lineKind) {
+        // 進行中の工程行にも中断秒を積む (工程の所要時間 = finished - started - paused_total_sec)
+        const run = inProgressLineRun(db, batchId);
+        if (run) {
+          db.prepare('UPDATE pk_pack_line_runs SET paused_total_sec = paused_total_sec + ?, updated_at=? WHERE id=?')
+            .run(pausedSec, now, run.id);
+        }
+      }
       blockedAt = resumeAt;
     } else if (event === 'cancel') {
       // 誤開始の取消: バッチを未着手に戻し、伝票の進捗も初期化する (pk_pack_events は残る)

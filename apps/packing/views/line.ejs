@@ -33,13 +33,26 @@
     .worker-row select { flex: 1; padding: 10px; font-size: 1.05rem; border-radius: 8px; }
     .timer { font-variant-numeric: tabular-nums; color: #1a73e8; font-weight: 700; }
     .top-link { font-size: .9rem; }
+    .big-btn.pause { background: #f9ab00; color: #202124; }
+    .big-btn.resume { background: #1a73e8; padding: 22px; font-size: 1.4rem; }
+    .paused-card { background: #fff3cd; border: 2px solid #f9ab00; }
+    .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+    .reason-grid button { padding: 16px 8px; font-size: 1.1rem; border: 1px solid #ccc; border-radius: 10px; background: #fff; }
+    .reason-grid .cancel { grid-column: 1 / -1; background: none; border: none; color: #868e96; }
+    .stop-hint { font-size: .9rem; color: #555; margin-top: 8px; }
   </style>
 </head>
 <body>
   <%- include('_floor_alerts') %>
   <%
     const jst = (t) => t ? new Date(Date.parse(t) + 32400000).toISOString().slice(11, 16) : '—';
-    const durMin = (a, b) => (a && b) ? Math.round((Date.parse(b) - Date.parse(a)) / 6000) / 10 : null;
+    // 所要 = 終了 - 開始 - 一時中断の合計 (工程行 paused_total_sec)
+    const durMin = (a, b, pausedSec = 0) => (a && b)
+      ? Math.max(0, Math.round((Date.parse(b) - Date.parse(a) - (pausedSec || 0) * 1000) / 6000) / 10) : null;
+    const isPaused = batch.status === 'paused';
+    // 経過タイマー: 中断中は pause_started_at で止めて見せる。積み上がった中断秒は差し引く
+    const timerAttrs = (r) => `data-since="${r.started_at}" data-paused="${r.paused_total_sec || 0}"`
+      + (isPaused && batch.pause_started_at ? ` data-frozen="${batch.pause_started_at}"` : '');
     const sort = runs.find((r) => r.phase === 'sort') || null;
     const run = runs.find((r) => r.phase === 'run') || null;
     const runPlanned = run ? run.planned_count : (kind === 'melt' ? (sort?.final_count ?? null) : batch.slip_count);
@@ -63,6 +76,14 @@
       (機械通過 <b><%= dailyTotal.machine %></b> 件) — 日付が変わるとリセット
     </div>
 
+    <% if (isPaused) { %>
+      <div class="phase-card paused-card">
+        <h2>⏸ 一時中断中 <span style="color:#868e96; font-size:.9em"><%= batch.pause_reason ? `(${batch.pause_reason})` : '' %></span></h2>
+        <div class="phase-meta">経過時間は止まっています。作業を続けるときは再開してください (出荷は終了していません)。</div>
+        <button class="big-btn resume" onclick="send('resume')">▶ 再開する</button>
+      </div>
+    <% } %>
+
     <div class="worker-row">
       <label for="worker">作業者</label>
       <select id="worker">
@@ -78,8 +99,11 @@
           <p>機械に流す前の仕分けを開始します (<%= batch.slip_count %>件)。</p>
           <button class="big-btn" onclick="send('line_sort_start')">仕分け開始</button>
         <% } else if (!sort.finished_at) { %>
-          <div class="phase-meta">開始 <%= jst(sort.started_at) %> — 経過 <span class="timer" data-since="<%= sort.started_at %>"></span>
+          <div class="phase-meta">開始 <%= jst(sort.started_at) %> — 経過 <span class="timer" <%- timerAttrs(sort) %>></span>
             <% if (sort.worker) { %> / 👤 仕分け: <%= sort.worker %><% } %></div>
+          <% if (!isPaused) { %>
+            <button class="big-btn pause" type="button" onclick="openPause()">⏸ 一時中断 (資材交換・休憩など → あとで再開)</button>
+          <% } %>
           <div class="form-row">
             <label>他の方法で出荷する件数 (配送方法変更などで機械に流さない分。無ければ 0)</label>
             <input type="number" id="sortExcluded" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="0"
@@ -91,10 +115,10 @@
             <label>備考 (任意)</label>
             <input type="text" id="sortNote" maxlength="200" placeholder="例: 2件をネコポス手動へ変更">
           </div>
-          <button class="big-btn finish" onclick="sortDone(<%= sort.planned_count %>)">仕分け完了</button>
+          <button class="big-btn finish" onclick="sortDone(<%= sort.planned_count %>)" <%= isPaused ? 'disabled' : '' %>>仕分け完了</button>
         <% } else { %>
           <div class="done-note">
-            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> / 他の方法へ <b><%= sort.excluded_count ?? 0 %></b> 件
+            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> (所要 <%= durMin(sort.started_at, sort.finished_at, sort.paused_total_sec) %> 分) / 他の方法へ <b><%= sort.excluded_count ?? 0 %></b> 件
             → 機械に流す件数 <b><%= sort.final_count %></b> 件 (伝票 <%= sort.planned_count %> 件)
             <% if (sort.worker) { %> / 👤 仕分け: <%= sort.worker %><% } %>
             <% if (sort.note) { %> / 備考: <%= sort.note %><% } %>
@@ -129,12 +153,17 @@
           <button class="big-btn" onclick="send('line_start')">流し開始</button>
         <% } %>
       <% } else if (!run.finished_at) { %><!-- 流し作業中: まず時間を止める (件数は次の画面) -->
-        <div class="phase-meta">開始 <%= jst(run.started_at) %> — 経過 <span class="timer" data-since="<%= run.started_at %>"></span>
-          <% if (run.worker) { %> / 👤 流し: <%= run.worker %><% } %></div>
-        <button class="big-btn finish" onclick="send('line_stop')">⏱ 終了 (時間を止める)</button>
+        <div class="phase-meta">開始 <%= jst(run.started_at) %> — 経過 <span class="timer" <%- timerAttrs(run) %>></span>
+          <% if (run.worker) { %> / 👤 流し: <%= run.worker %><% } %>
+          <% if (run.paused_total_sec) { %> / 中断 <%= Math.round(run.paused_total_sec / 60) %> 分<% } %></div>
+        <% if (!isPaused) { %>
+          <button class="big-btn pause" type="button" onclick="openPause()">⏸ 一時中断 (資材交換・休憩など → あとで再開)</button>
+          <button class="big-btn finish" onclick="stopRun()">⏹ 流し終了 (このバッチを終わる → 件数入力へ)</button>
+          <div class="stop-hint">資材の交換などで少し止めるだけなら「一時中断」。「流し終了」はこのバッチの機械流しを終えるときだけ押してください。</div>
+        <% } %>
       <% } else if (run.final_count == null) { %><!-- 停止済み: 件数を入力するまで完了しない -->
         <div class="done-note" style="background:#fef7e0;">
-          ⏸ <%= jst(run.started_at) %>〜<%= jst(run.finished_at) %> で停止しました (所要 <%= durMin(run.started_at, run.finished_at) %> 分)。
+          ⏸ <%= jst(run.started_at) %>〜<%= jst(run.finished_at) %> で停止しました (所要 <%= durMin(run.started_at, run.finished_at, run.paused_total_sec) %> 分<%= run.paused_total_sec ? `・中断 ${Math.round(run.paused_total_sec / 60)} 分を除く` : '' %>)。
           <% if (run.worker) { %>👤 流し: <%= run.worker %> — <% } %><b>件数を入力すると完了になります。</b>
         </div>
         <div class="handover">📟 前回までの累計: 機械通過 <b><%= dailyTotal.machine %></b> 件
@@ -163,6 +192,16 @@
     <% } %>
   </div>
 
+  <div id="pauseBox" class="phase-card" style="display:none; position:fixed; left:12px; right:12px; bottom:12px; max-width:616px; margin:0 auto; box-shadow:0 4px 16px rgba(0,0,0,.25); z-index:50">
+    <h2>一時中断の理由</h2>
+    <div class="reason-grid">
+      <% for (const r of pauseReasons) { %>
+        <button type="button" onclick="pauseWith(<%- JSON.stringify(r) %>)"><%= r %></button>
+      <% } %>
+      <button type="button" class="cancel" onclick="document.getElementById('pauseBox').style.display='none'">やめる</button>
+    </div>
+  </div>
+
   <script>
     const BATCH_ID = <%= batch.id %>;
     const workerSel = document.getElementById('worker');
@@ -173,7 +212,8 @@
     // 経過タイマー
     setInterval(() => {
       for (const el of document.querySelectorAll('.timer')) {
-        const sec = Math.max(0, Math.floor((Date.now() - Date.parse(el.dataset.since)) / 1000));
+        const end = el.dataset.frozen ? Date.parse(el.dataset.frozen) : Date.now();   // 中断中は止めて見せる
+        const sec = Math.max(0, Math.floor((end - Date.parse(el.dataset.since)) / 1000) - Number(el.dataset.paused || 0));
         el.textContent = `${Math.floor(sec / 60)}分${String(sec % 60).padStart(2, '0')}秒`;
       }
     }, 1000);
@@ -247,6 +287,17 @@
       if (!Number.isInteger(m) || m < 0) { alert('手動で流した件数が不正です'); return; }
       if (!confirm(`出荷完了 ${v} 件 (うち手動 ${m} 件) で終了しますか?`)) return;
       send('line_done', { final_count: v, manual_count: m, note: document.getElementById('runNote').value || null });
+    }
+    function openPause() { document.getElementById('pauseBox').style.display = 'block'; }
+    function pauseWith(reason) {
+      document.getElementById('pauseBox').style.display = 'none';
+      send('pause', { reason });
+    }
+    function stopRun() {
+      if (!confirm('このバッチの機械流しを終了して件数入力へ進みます。
+(資材交換などで少し止めるだけなら「一時中断」を使ってください)
+よろしいですか?')) return;
+      send('line_stop');
     }
     function lineUndo() {
       if (!confirm('直前の記録 (件数→停止→流し開始→仕分け完了→仕分け開始の順) を1段取り消します。よろしいですか?')) return;
