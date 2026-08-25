@@ -381,7 +381,9 @@
       if (op.event === 'shortage') { line.status = 'shortage'; line.shortage_qty = op.shortage_qty; NEXTOPS[op.line_seq] = op.op_id; }
       if (op.event === 'back') { line.status = 'pending'; line.shortage_qty = null; }
     }
-    let started = BATCH.status === 'picking' || queue.some((op) => op.event === 'start');
+    // 中断中 (paused) も「開始済み」。中断中に画面を開き直してから再開すると、これが false のままで
+    // render() が開始画面に飛び「再開できない」ように見えた (2026-08-25 出荷_02 中原さん報告)
+    let started = BATCH.status === 'picking' || BATCH.status === 'paused' || queue.some((op) => op.event === 'start');
 
     function currentIdx() { return LINES.findIndex((l) => l.status === 'pending'); }
 
