@@ -422,6 +422,92 @@ try {
 } catch (e) { overErr = e; }
 check('import rejects over MAX_IMPORT_CODES', !!overErr);
 
+// ─── ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
+{
+  const schema = {
+    properties: {
+      Status: {
+        type: 'select',
+        select: {
+          options: [
+            { name: '⓪新規商品_高島' }, { name: '①ページ作成中' }, { name: '③画像待ち' },
+            { name: '⑥完了' }, { name: 'アーカイブ' },
+          ],
+        },
+      },
+    },
+  };
+  let capturedFilter = null;
+  const mkPage = (code, status) => {
+    const p = fakePage(code);
+    p.id = `page-mig-${code}-${status}`;
+    p.properties.Status.select.name = status;
+    return p;
+  };
+  const migPages = [
+    mkPage('MIG-NEW-1', '①ページ作成中'),
+    mkPage('IMP-1', '③画像待ち'),   // 既にアプリに居る (上の取り込みテストで作成済み)
+    mkPage('MIG-NEW-1', '⑥完了'),    // Notion 側の重複カード
+    { id: 'page-mig-nocode', properties: { Name: { type: 'title', title: [{ plain_text: 'コード無し' }] } } },
+  ];
+  let capturedOpts = null;
+  const di = {
+    config: () => ({ databaseId: 'db-test' }),
+    request: async () => schema,
+    query: async (opts) => { capturedFilter = opts.filter; capturedOpts = opts; return { pages: migPages }; },
+  };
+  const prev = await imp.importByNotionStatus({ actor: 'smoke', ...di });   // dryRun 既定
+  check('一括移植: フィルタは ①〜⑥ で始まる選択肢だけ (⓪・その他を含まない) + ページ上限を拡張',
+    capturedFilter.or.length === 3 && capturedFilter.or.every((f) => /^[①③⑥]/.test(f.select.equals))
+    && capturedOpts.maxPages === 200,
+    JSON.stringify(capturedFilter));
+  check('一括移植: dryRun 既定では書き込まず対象とスナップショットを返す',
+    prev.summary.would_import === 1 && prev.summary.already_exists === 1
+    && prev.summary.duplicate === 1 && prev.summary.failed === 1 && prev.total === 4
+    && typeof prev.snapshot === 'string' && prev.snapshot.length > 0
+    && !db.prepare(`SELECT 1 FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).get(),
+    JSON.stringify(prev.summary));
+  // 実行はプレビューのスナップショット必須 (無し・不一致は書き込まず止める — Codex R1 high)
+  let misErr = null;
+  try { await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, ...di }); } catch (e) { misErr = e; }
+  check('一括移植: スナップショット無しの実行は拒否 (プレビュー必須)',
+    misErr?.code === 'snapshot_mismatch'
+    && !db.prepare(`SELECT 1 FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).get());
+  const migRun = await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: prev.snapshot, ...di });
+  const migRow = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).get();
+  check('一括移植: 実行でカードの無い商品だけ入る (source=notion_import・status=draft・原文ステータス保持)',
+    migRun.summary.imported === 1 && migRow && migRow.source === 'notion_import'
+    && migRow.status === 'draft' && migRow.source_notion_status === '①ページ作成中',
+    JSON.stringify(migRun.summary));
+  // 対象が変わった後の古いスナップショットは 409 相当で止まる
+  let misErr2 = null;
+  try { await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: prev.snapshot, ...di }); } catch (e) { misErr2 = e; }
+  check('一括移植: プレビュー後に対象が変わったら実行を止める', misErr2?.code === 'snapshot_mismatch');
+  const prev2 = await imp.importByNotionStatus({ actor: 'smoke', ...di });
+  check('一括移植: 再プレビューは already_exists になり二重取り込みしない',
+    prev2.summary.would_import === 0 && prev2.summary.already_exists === 2, JSON.stringify(prev2.summary));
+  // R2対応: 対象の中身 (値) が変わっても古いスナップショットは止まる (コード+IDだけの照合では素通りする)
+  const valPages = [mkPage('MIG-VAL-1', '①ページ作成中')];
+  const diVal = { ...di, query: async () => ({ pages: valPages }) };
+  const valPrev = await imp.importByNotionStatus({ actor: 'smoke', ...diVal });
+  valPages[0].properties['売価'].number = 2980;   // プレビュー後に価格が変わった
+  let valErr = null;
+  try { await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: valPrev.snapshot, ...diVal }); } catch (e) { valErr = e; }
+  check('一括移植: プレビュー後に値が変わった商品も実行を止める (保存内容全体のハッシュ照合)',
+    valErr?.code === 'snapshot_mismatch'
+    && !db.prepare(`SELECT 1 FROM product_drafts WHERE ne_code = 'MIG-VAL-1'`).get());
+  // 1回の実行上限: 超えた分は deferred で報告し、再プレビュー→実行で続きから入る
+  const capPages = [mkPage('MIG-CAP-1', '①ページ作成中'), mkPage('MIG-CAP-2', '③画像待ち')];
+  const diCap = { ...di, query: async () => ({ pages: capPages }) };
+  const capPrev = await imp.importByNotionStatus({ actor: 'smoke', ...diCap });
+  const capRun = await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: capPrev.snapshot, maxPerRun: 1, ...diCap });
+  check('一括移植: 1回の上限を超えた分は deferred (再実行で続きから)',
+    capRun.summary.imported === 1 && capRun.summary.deferred === 1
+    && db.prepare(`SELECT COUNT(*) c FROM product_drafts WHERE ne_code LIKE 'MIG-CAP-%'`).get().c === 1,
+    JSON.stringify(capRun.summary));
+  db.prepare(`DELETE FROM product_drafts WHERE ne_code IN ('MIG-NEW-1', 'MIG-CAP-1', 'MIG-CAP-2')`).run();
+}
+
 // 取り込み由来は Notion へ書き戻さない (これが無いと既存カードの URL が消える)
 check('syncCardLinks skips imported',
   (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');

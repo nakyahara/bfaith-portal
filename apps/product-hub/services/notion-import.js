@@ -18,7 +18,8 @@
  *
  * 関連: RYS lib/notion-property.js (プロパティ抽出は既存実装を流用、二重定義しない)
  */
-import { findPageByManageNumber } from '../../rakuten-yahoo-sync/lib/notion-client.js';
+import crypto from 'node:crypto';
+import { findPageByManageNumber, queryDatabaseAll, notionRequest, getConfig } from '../../rakuten-yahoo-sync/lib/notion-client.js';
 import { extractTitle, extractRow } from '../../rakuten-yahoo-sync/lib/notion-property.js';
 import { getDB, logEvent, upsertDraftYahoo, SOURCE_NOTION_IMPORT } from '../db.js';
 
@@ -250,13 +251,115 @@ export async function importFromNotion(neCodes, { actor = null, finder = findPag
   return { results, summary: summarize(results) };
 }
 
+/** ステータス一括移植の対象: Status が ①〜⑥ で始まる選択肢 (2026-08-25 中原さん指示) */
+export const MIGRATE_STATUS_RE = /^[①②③④⑤⑥]/;
+
+/**
+ * Notion 商品マスターの Status ①〜⑥ の商品のうち、**このアプリにカードが無い商品だけ**を移植する
+ * (2026-08-25 中原さん指示)。既にある商品は由来 (portal / notion_import) を問わず触らない =
+ * already_exists で報告のみ。dryRun (既定) は書き込みせず対象一覧だけ返す — 実行は明示が必要。
+ * Notion の select filter は equals しか無いので、DB スキーマから選択肢名を列挙して OR で問い合わせる。
+ */
+/** 1回の実行で取り込む上限 (同期HTTPを長引かせない)。残りは deferred で報告し、再実行で続きから入る */
+export const MAX_MIGRATE_PER_RUN = 300;
+
+export async function importByNotionStatus({
+  actor = null, dryRun = true, expectedSnapshot = null, maxPerRun = MAX_MIGRATE_PER_RUN,
+  query = queryDatabaseAll, request = notionRequest, config = getConfig,
+} = {}) {
+  const cfg = config();
+  const schema = await request(`/databases/${cfg.databaseId}`, { method: 'GET', cfg });
+  const statusProp = schema?.properties?.Status;
+  const options = (statusProp?.select?.options || statusProp?.status?.options || [])
+    .map((o) => (o && o.name ? String(o.name) : null)).filter(Boolean);
+  const targets = options.filter((n) => MIGRATE_STATUS_RE.test(n));
+  if (targets.length === 0) {
+    throw new Error('Notion の Status に ①〜⑥ で始まる選択肢が見つかりません');
+  }
+  const filterType = statusProp?.type === 'status' ? 'status' : 'select';
+  const { pages } = await query({
+    filter: { or: targets.map((name) => ({ property: 'Status', [filterType]: { equals: name } })) },
+    // ①〜⑥全対象の一括照会。既定の50ページ (5,000件) だと超えた時点で機能ごと使えなくなる (Codex R1 medium)
+    maxPages: 200,
+  });
+
+  // ── 分類 (書き込みなし)。dryRun / 実行で同じ判定を通る ──
+  const db = getDB();
+  const results = [];
+  const toImport = []; // { rec, result } — would_import の実体
+  const seen = new Set();
+  for (const page of pages) {
+    const rec = buildImportRecord(page);
+    if (!rec) {
+      results.push({
+        ne_code: '(商品コードなし)', outcome: 'failed',
+        error: `Notion カードに商品コードがありません (page ${page?.id || '?'})`,
+      });
+      continue;
+    }
+    const key = rec.ne_code.trim().toLowerCase();
+    // Notion 側の重複カード: 最初の 1 枚だけを対象にし、2 枚目以降は取り込まず報告する
+    if (seen.has(key)) {
+      results.push({
+        ne_code: rec.ne_code, outcome: 'duplicate', notion_status: rec.notion_status,
+        error: '同じ商品コードのカードが Notion に複数あります',
+      });
+      continue;
+    }
+    seen.add(key);
+    const existing = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(key);
+    if (existing) {
+      results.push({ ne_code: rec.ne_code, outcome: 'already_exists', draftId: existing.id, notion_status: rec.notion_status });
+      continue;
+    }
+    const result = { ne_code: rec.ne_code, outcome: 'would_import', notion_status: rec.notion_status };
+    results.push(result);
+    toImport.push({ rec, result });
+  }
+
+  // プレビューと実行を同じ対象集合に固定する (Codex R1 high): 対象の**保存内容全体**
+  // (buildImportRecord の結果 = 商品名・売価・JAN・URL・Status・Yahoo欄・AI出力まで) のハッシュを返し、
+  // 実行時に一致しなければ書き込まず再プレビューを要求する。コード+ページIDだけだと、
+  // プレビュー後に値が書き換わった商品を見ていないまま保存してしまう (Codex R2 high)。
+  // rec はオブジェクトリテラル構築でキー順が固定なので JSON.stringify は決定的
+  const snapshot = crypto.createHash('sha256')
+    .update(toImport.map(({ rec }) => JSON.stringify(rec)).sort().join('\n'))
+    .digest('hex').slice(0, 32);
+
+  if (!dryRun) {
+    if (expectedSnapshot !== snapshot) {
+      const e = new Error('プレビュー後に Notion 側の対象が変わりました。もう一度「対象を確認」からやり直してください');
+      e.code = 'snapshot_mismatch';
+      throw e;
+    }
+    let processed = 0;
+    for (const t of toImport) {
+      if (processed >= maxPerRun) { t.result.outcome = 'deferred'; continue; }
+      processed += 1;
+      try {
+        const persisted = persist(db, t.rec, actor);
+        t.result.outcome = persisted.outcome;
+        t.result.draftId = persisted.draftId;
+        t.result.skipped_fields = t.rec.skipped_fields;
+      } catch (e) {
+        t.result.outcome = 'failed';
+        t.result.error = truncate(e);
+      }
+    }
+  }
+  return { statuses: targets, total: pages.length, snapshot, results, summary: summarize(results) };
+}
+
 function truncate(e) {
   const msg = e && e.message ? String(e.message) : String(e);
   return msg.length > 500 ? `${msg.slice(0, 500)}…` : msg;
 }
 
 function emptySummary() {
-  return { imported: 0, updated: 0, not_found: 0, conflict_portal: 0, conflict_page_id: 0, failed: 0 };
+  return {
+    imported: 0, updated: 0, not_found: 0, conflict_portal: 0, conflict_page_id: 0, failed: 0,
+    already_exists: 0, would_import: 0, duplicate: 0, deferred: 0,
+  };
 }
 
 export function summarize(results) {

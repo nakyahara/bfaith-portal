@@ -37,7 +37,7 @@ import {
 import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
-import { importFromNotion, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
+import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -1622,6 +1622,30 @@ router.post('/api/notion-import', async (req, res) => {
     // 詳細はサーバーログに残し、クライアントには内部情報を返さない (Codex R1 low-7)
     console.error('[product-hub] notion-import failed:', e);
     res.status(500).json({ ok: false, error: '取り込みに失敗しました (詳細はサーバーログを確認してください)' });
+  }
+});
+
+// ─── API: Notion ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
+// Status が ①〜⑥ の商品のうち**このアプリにカードが無いものだけ**を取り込む。
+// 既定は dry_run (書き込みなしのプレビュー)。実行は dry_run: false の明示が必要。
+router.post('/api/notion-import-by-status', async (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
+  try {
+    const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
+    const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
+    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    // 一覧は大きくなりうるので 300 件で打ち切る (全体の件数は summary / total にある)
+    res.json({
+      ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary, snapshot: r.snapshot,
+      results: r.results.slice(0, 300), truncated: r.results.length > 300,
+    });
+  } catch (e) {
+    // プレビュー後に Notion 側が変わった → 書き込まず再プレビューを要求 (Codex R1 high)
+    if (e && e.code === 'snapshot_mismatch') {
+      return res.status(409).json({ ok: false, error: e.message });
+    }
+    console.error('[product-hub] notion-import-by-status failed:', e);
+    res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }
 });
 
