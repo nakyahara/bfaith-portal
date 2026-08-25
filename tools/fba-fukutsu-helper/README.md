@@ -122,6 +122,8 @@ iS-2 は Shift_JIS で読む。旧 GAS 時代の fukutu.csv は UTF-8 だった�
 
 住所が60文字を超える・郵便番号が読めない場合も同様に止める (欠けた伝票を出さない)。
 
+🚨 旧 GAS の fukutu.csv にあった「ヘッダー直後の空行」は iS-2 で必須項目なしのエラー1件になる (2026-08-25 実機確認) ので出さない。
+
 ## サーバ側のAPIについて
 
 `/apps/fba-replenishment/ext-api/plan-csv` に同じCSVを返すAPIがあるが、

@@ -71,13 +71,13 @@ await t('⭐CSVが落ちてくる (Shift_JIS)。U列に納品番号、宛先は�
   const bytes = Buffer.from(await r.arrayBuffer());
   assert.notEqual(iconv.decode(bytes, 'utf-8').indexOf('�'), -1, '🚨UTF-8 として読むと壊れる = Shift_JIS で出ている');
   const lines = iconv.decode(bytes, 'cp932').trimEnd().split('\n');
-  assert.equal(lines.length, 2 + 7, 'ヘッダー + 空行 + 7行');
-  const c = lines[2].split(',');
+  assert.equal(lines.length, 1 + 7, 'ヘッダー + 7行 (空行なし)');
+  const c = lines[1].split(',');
   assert.equal(c[0], 'HND2');
   assert.equal(c[2], '埼玉県狭山市青柳 915', '登録済みだったFCでも画面の住所を書く');
   assert.equal(c[20], 'FBA15GGL5J2X'); // お客様管理番号
   assert.equal(c[24], '20260810');
-  const neo = lines[7].split(',');   // XJE1 の1行目
+  const neo = lines[6].split(',');   // XJE1 の1行目
   assert.equal(neo[0], 'XJE1');
   assert.equal(neo[2], '神奈川県 海老名市 中新田3290 MF'); // 20文字 (空白込み)
   assert.equal(neo[3], 'LP海老名I 2階');

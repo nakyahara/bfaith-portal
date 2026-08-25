@@ -115,8 +115,8 @@
       });
     }
 
-    // 現行GASと同じ形: ヘッダー + 空行 + データ (この形で取込に通っている実績がある)
-    var lines = [HEADER.map(q).join(','), new Array(26).fill('').join(',')];
+    // ヘッダー + データ。🚨旧GASにあった「ヘッダー直後の空行」は iS-2 でエラー1件になる (2026-08-25 実機) ので出さない
+    var lines = [HEADER.map(q).join(',')];
     for (var k = 0; k < all.length; k++) lines.push(all[k].map(q).join(','));
 
     return {
