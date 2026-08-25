@@ -132,14 +132,15 @@
             <span>数量 <b><%= b.total_qty %></b></span>
             <span><%= b.composition %></span>
             <span class="st <%= b.status %>"><%= statusLabels[b.status] || b.status %><%
-              %><%= b.status === 'picking' && b.worker ? `: ${b.worker}` : '' %></span>
+              %><%= (b.status === 'picking' || b.status === 'paused') && b.worker ? `: ${b.worker}` : '' %></span>
             <% if (b.done_lines > 0 && b.status !== 'done') { %><span>進捗 <%= b.done_lines %>/<%= b.line_count %></span><% } %>
           </div>
         </div>
         <div class="card-actions">
-          <% if (b.status === 'ready' || b.status === 'picking') { %>
-            <button class="btn-work <%= b.status === 'picking' ? 'resume' : '' %>" data-id="<%= b.id %>">
-              <%= b.status === 'picking' ? '再開' : '▶ 作業' %>
+          <%# 中断中 (paused) も再開ボタンを出す。出ていないと一覧から戻れず「再開できない」(2026-08-25 出荷_02 中原さん報告) %>
+          <% if (b.status === 'ready' || b.status === 'picking' || b.status === 'paused') { %>
+            <button class="btn-work <%= b.status !== 'ready' ? 'resume' : '' %>" data-id="<%= b.id %>">
+              <%= b.status !== 'ready' ? '再開' : '▶ 作業' %>
             </button>
           <% } %>
           <a class="btn-detail" href="/apps/picking/batches/<%= b.id %>">明細</a>
