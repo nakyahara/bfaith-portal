@@ -117,6 +117,9 @@
         <option value="<%= s.id %>" <%= String(assigneeId) === String(s.id) && assigneeParam !== 'me' ? 'selected' : '' %>><%= s.name %></option>
       <% } %>
     </select>
+    <%# 検索 (2026-08-25 中原さん要望): 商品名・商品コードでカードを即時絞り込み (入力のたび・リロード不要) %>
+    <input type="search" id="kb-search" placeholder="🔍 商品名・商品コード"
+           style="width:190px; font-size:12px; padding:5px 9px; border:1px solid #cbd5e1; border-radius:8px;">
     <span style="flex:1"></span>
     <span class="muted"><%= board.total %> 件<%= board.truncated ? ' (上限まで表示)' : '' %></span>
     <a class="btn btn-sm" href="/apps/product-hub/list">一覧で見る</a>
@@ -161,7 +164,8 @@
             <% const currentCode = boardView === 'image' ? (c.kindCurrent && c.kindCurrent.step_code) : (c.current && c.current.step_code); %>
             <div class="kb-card <%= stalled ? 'stalled' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
                  data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>"
-                 data-current="<%= currentCode || '' %>">
+                 data-current="<%= currentCode || '' %>"
+                 data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
             <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
               <% if (boardView === 'image') { %>
                 <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
@@ -267,7 +271,8 @@
             画像ビューは 商品×種別 なので、どちらを戻すかはカード自体が持っている %>
         <% for (const c of board.doneCards) { %>
           <div class="kb-card<%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
-               data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current="">
+               data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
+               data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %>">
             <% if (boardView === 'image' && c.kind) { %>
               <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
@@ -318,6 +323,35 @@
       location.href = '/apps/product-hub/board' + (s ? '?' + s : '');
     });
   }
+
+  // ─── 検索 (2026-08-25 中原さん要望): 商品名・商品コードでカードを即時絞り込み ───
+  // D&D や重要度変更でページが再読込されるので、検索語は sessionStorage で持ち越す
+  (function initBoardSearch() {
+    const input = document.getElementById('kb-search');
+    if (!input) return;
+    const KEY = 'ph-board-search';
+    function apply() {
+      const q = input.value.trim().toLowerCase();
+      try { sessionStorage.setItem(KEY, q); } catch (e) { /* プライベートモード等は保持なしで動く */ }
+      document.querySelectorAll('.kb-card[data-search]').forEach(function (c) {
+        c.style.display = (!q || (c.dataset.search || '').indexOf(q) !== -1) ? '' : 'none';
+      });
+      // 列の件数は「表示中/全体」に。解除したら元の数字へ戻す
+      document.querySelectorAll('.kb-col').forEach(function (col) {
+        const cnt = col.querySelector('.kb-col-count');
+        if (!cnt) return;
+        if (cnt.dataset.total === undefined) cnt.dataset.total = cnt.textContent;
+        let visible = 0;
+        col.querySelectorAll('.kb-card[data-search]').forEach(function (c) { if (c.style.display !== 'none') visible++; });
+        cnt.textContent = q ? (visible + '/' + cnt.dataset.total) : cnt.dataset.total;
+      });
+    }
+    input.addEventListener('input', apply);
+    try {
+      const saved = sessionStorage.getItem(KEY);
+      if (saved) { input.value = saved; apply(); }
+    } catch (e) { /* 保持なしで動く */ }
+  })();
 
   // ─── カードの D&D 移動: 落とした列がその商品の「いまやる工程」になる ───
   const BOARD_VIEW = <%- JSON.stringify(boardView) %>;
