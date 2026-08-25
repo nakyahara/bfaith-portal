@@ -196,7 +196,7 @@
     <h2>一時中断の理由</h2>
     <div class="reason-grid">
       <% for (const r of pauseReasons) { %>
-        <button type="button" onclick="pauseWith(<%- JSON.stringify(r) %>)"><%= r %></button>
+        <button type="button" class="pause-reason" data-reason="<%= r %>"><%= r %></button>
       <% } %>
       <button type="button" class="cancel" onclick="document.getElementById('pauseBox').style.display='none'">やめる</button>
     </div>
@@ -289,14 +289,13 @@
       send('line_done', { final_count: v, manual_count: m, note: document.getElementById('runNote').value || null });
     }
     function openPause() { document.getElementById('pauseBox').style.display = 'block'; }
+    document.querySelectorAll('.pause-reason').forEach((b) => b.addEventListener('click', () => pauseWith(b.dataset.reason)));
     function pauseWith(reason) {
       document.getElementById('pauseBox').style.display = 'none';
       send('pause', { reason });
     }
     function stopRun() {
-      if (!confirm('このバッチの機械流しを終了して件数入力へ進みます。
-(資材交換などで少し止めるだけなら「一時中断」を使ってください)
-よろしいですか?')) return;
+      if (!confirm('このバッチの機械流しを終了して件数入力へ進みます。\n(資材交換などで少し止めるだけなら「一時中断」を使ってください)\nよろしいですか?')) return;
       send('line_stop');
     }
     function lineUndo() {
