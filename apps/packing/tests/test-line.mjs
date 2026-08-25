@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-line-test-'));
 process.env.DATA_DIR = tmpDir;
@@ -257,6 +258,30 @@ console.log('\n── 一時中断 (2026-08-25 現場意見: 資材交換で止�
   ev(10, 'undo', { reason: '誤タップ' });
   const run2 = listLineRuns(10).find((r) => r.phase === 'run');
   ok(run2.finished_at == null && run2.paused_total_sec === run.paused_total_sec, '停止取消後も工程行の中断秒は保持');
+}
+
+console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-25 事故: confirm文字列に改行が混入し全ボタン無反応) ──');
+{
+  const ejs = (await import('ejs')).default;
+  const vm = await import('node:vm');
+  const src = fs.readFileSync(new URL('../views/line.ejs', import.meta.url), 'utf8');
+  const base = { title: 't', workers: [{ name: 'A' }], statusLabels: {}, dailyTotal: { total: 0, machine: 0 },
+    hikiateClass: 'x', pauseReasons: ['資材の交換', '休憩', 'その他'], floorAlerts: [] };
+  const cases = [
+    ['MELT ready', { kind: 'melt', batch: { id: 1, status: 'ready', slip_count: 3 }, runs: [] }],
+    ['PAS running', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, paused_total_sec: 0 }] }],
+    ['PAS paused', { kind: 'pas', batch: { id: 1, status: 'paused', slip_count: 3, pause_reason: '資材の交換', pause_started_at: now }, runs: [{ phase: 'run', started_at: now, paused_total_sec: 30 }] }],
+    ['PAS stopped', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, finished_at: now, paused_total_sec: 0, planned_count: 3 }] }],
+  ];
+  for (const [label, locals] of cases) {
+    let html = null;
+    try { html = ejs.render(src, { ...base, ...locals }, { filename: fileURLToPath(new URL('../views/line.ejs', import.meta.url)) }); } catch (e) { ok(false, `${label}: 描画失敗 ${e.message}`); continue; }
+    const js = html.split('<script>').pop().split('</script>')[0];
+    let syntaxOk = true;
+    try { new vm.Script(js); } catch (e) { syntaxOk = false; console.log('   ', e.message); }
+    ok(syntaxOk, `${label}: インラインJSが構文エラーでない`);
+    ok(!/onclick="[^"]*"[^ >]/.test(html), `${label}: onclick 属性の引用符が壊れていない`);
+  }
 }
 
 db.close();
