@@ -41,8 +41,10 @@
   }
 
   function download(filename, text) {
-    // UTF-8 で保存する (現行の fukutu.csv と同じ。iS-2 の取込はこれで通っている)
-    var blob = new Blob([text], { type: 'text/csv;charset=utf-8' });
+    // 🚨Shift_JIS で保存する。iS-2 は Shift_JIS で読むので UTF-8 だと住所が化ける (2026-08-25 実害)。
+    //   変換できない文字があれば投げる → 呼び出し側で「作らない」
+    var bytes = BF_SJIS.encodeSjis(text);
+    var blob = new Blob([bytes], { type: 'text/csv;charset=shift_jis' });
     var url = URL.createObjectURL(blob);
     var a = document.createElement('a');
     a.href = url;
@@ -85,21 +87,22 @@
         '<td class="bf-num">' + esc(d.箱数) + '</td><td>' + esc(d.宛先) + '</td></tr>';
     }).join('');
 
-    var unreg = built.summary.detail.filter(function (d) { return /未登録/.test(d.宛先); });
-    var warn = unreg.length
-      ? '<div class="bf-warn">⚠️ ' + esc(unreg.map(function (d) { return d.fcCode; }).join(', ')) +
-        ' は iS-2 のお届け先マスタに無いため、住所を書き出しています。取込後に宛先を目視で確認してください</div>'
-      : '';
+    // 🚨Shift_JIS にできない文字 (環境依存文字など) が住所にあると伝票が化けるので、ここで先に弾く
+    try {
+      BF_SJIS.encodeSjis(built.csv);
+    } catch (e) {
+      showError(el, 'CSVを組み立てられませんでした', [e && e.message ? e.message : String(e), '住所に環境依存文字が含まれています。iS-2 に手入力してください']);
+      return;
+    }
 
     el.innerHTML =
       '<div class="bf-head">福通伝票CSV<span class="bf-plan">画面から読み取り</span></div>' +
       '<div class="bf-body">' +
       '<div class="bf-sum">出荷日 <b>' + esc(built.summary.出荷日) + '</b> ／ 納品 <b>' +
       esc(built.summary.納品数) + '</b>件 ／ 伝票 <b>' + esc(built.summary.伝票枚数) + '</b>枚</div>' +
-      warn +
-      '<table><thead><tr><th>納品番号</th><th>宛先</th><th>箱</th><th>宛先の出し方</th></tr></thead>' +
+      '<table><thead><tr><th>納品番号</th><th>FC</th><th>箱</th><th>宛先 (画面の住所)</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table>' +
-      '<div class="bf-note">この内容で1箱1伝票のCSVを作ります。取り込む前に箱数が実物と合っているか確認してください。</div>' +
+      '<div class="bf-note">この内容で1箱1伝票のCSVを作ります (宛先は画面の住所をそのまま書きます)。取り込む前に箱数が実物と合っているか確認してください。</div>' +
       '</div>' +
       '<div class="bf-foot"><button class="bf-close">閉じる</button>' +
       '<button class="bf-go">この内容でCSVを作る</button></div>';

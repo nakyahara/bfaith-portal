@@ -5,6 +5,11 @@
  *   `apps/fba-replenishment/fukutsu-csv.js` (サーバ側) と**同じ結果**を出さなければならず、
  *   `apps/fba-replenishment/tests/test-fukutsu-csv-parity.mjs` が両者の一致を検証する。
  *   片方だけ直すとテストが落ちる。
+ *
+ * ⭐宛先は **常に画面 (Seller Central) に出ている住所をそのまま書く**。
+ *   iS-2 のお届け先マスタには頼らない (2026-08-25 中原さんの判断)。
+ *   理由: Amazonは新しいFCを開くので、マスタ側のコード一覧を保守し続けると必ずズレる。
+ *   Amazonが「ここへ送れ」と表示している住所が正。
  */
 (function (root) {
   'use strict';
@@ -24,31 +29,7 @@
 
   var NL = String.fromCharCode(10);
   var SENDER_CODE = '0648607868';   // 荷送人コード (ご依頼主) — 現行GASと同じ固定値
-  var FALLBACK_TEL = '(06)6333-4858'; // マスタ未登録FC用。iS-2マスタ74件中70件がこの番号
-
-  /**
-   * iS-2 のお届け先マスタに登録済みの Amazon FCコード。
-   * 🚨TPFB は除外 (マスタ上の名前・住所が XHD1 のもので、このコードで出すと XHD1 へ届く)。
-   * ズレても安全側に倒れる = 未登録扱いなら住所を書き出すので伝票は出せる。
-   */
-  var REGISTERED_FC_CODES = [
-    'FSZ1', 'HND2', 'HND3', 'HND6', 'HND9', 'HSG1', 'KIX1', 'KIX2',
-    'KIX3', 'KIX4', 'KIX5', 'KIX6', 'NGO2', 'NGO3', 'NRT1', 'NRT2',
-    'NRT5', 'QCB1', 'QCB3', 'QCB4', 'QCB5', 'QCB6', 'TPB1', 'TPB2',
-    'TPB3', 'TPB5', 'TPB6', 'TPB7', 'TPB8', 'TPF2', 'TPF3', 'TPF4',
-    'TPF6', 'TPF9', 'TPFA', 'TPFC', 'TPFD', 'TPFI', 'TPX1', 'TPX2',
-    'TPY1', 'TPY2', 'TPY3', 'TPY5', 'TPZ2', 'TPZ3', 'TPZ4', 'TPZ5',
-    'TPZ6', 'TPZ7', 'TPZ8', 'TPZ9', 'TYO1', 'TYO2', 'TYO3', 'TYO4',
-    'TYO6', 'TYO7', 'TYO8', 'TYO9', 'VJGT', 'VJNA', 'VJNB', 'VJNC',
-    'VJND', 'VJNE', 'VJWB', 'XHD1', 'XHD4', 'XJE2', 'XJW1', 'XKX2',
-    'XKX4',
-  ];
-  var REG = {};
-  for (var i = 0; i < REGISTERED_FC_CODES.length; i++) REG[REGISTERED_FC_CODES[i]] = true;
-
-  function isRegisteredFc(code) {
-    return REG[String(code == null ? '' : code).trim().toUpperCase()] === true;
-  }
+  var AMAZON_TEL = '(06)6333-4858'; // Amazon FC宛の電話番号 (画面に無い唯一の項目。iS-2マスタ74件中70件がこの番号)
 
   /** YYYYMMDD が実在する日付か (2026年13月40日 のような値を弾く) */
   function isRealYmd(v) {
@@ -86,35 +67,32 @@
     if (!/^[A-Z0-9]{1,16}$/.test(kanri)) throw cErr('納品番号が不正です: ' + kanri);
     if (!(n === Math.floor(n)) || !isFinite(n) || n < 1) throw cErr(kanri + ': 輸送箱の数が取れませんでした');
 
-    var registered = isRegisteredFc(fc);
+    // 宛先 = 画面の住所。欠けたまま伝票を出すと届かないので必ず止める
+    var a = shipment.address || {};
+    var parts = [a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join('');
+    var post = normPostal(a.postalCode);
+    if (!post) throw cErr(kanri + ' (' + fc + '): 郵便番号が読み取れません');
+    if (parts.replace(/\s/g, '').length < 6) throw cErr(kanri + ' (' + fc + '): 住所が読み取れません');
+    if (parts.length > 60) throw cErr(kanri + ' (' + fc + '): 住所が60文字を超えています (' + parts.length + '文字)。切り捨てると届きません');
+    var sp = splitAddress(parts);
+
     var rows = [];
     for (var i = 0; i < n; i++) {
       var c = [];
       for (var j = 0; j < 26; j++) c.push('');
       c[COL.荷受人コード] = fc;
+      c[COL.電話番号] = AMAZON_TEL;
+      c[COL.住所1] = sp[0]; c[COL.住所2] = sp[1]; c[COL.住所3] = sp[2];
+      c[COL.名前1] = ('Amazon.co.jp ' + fc).slice(0, 20);
+      c[COL.郵便番号] = post;
       c[COL.荷送人コード] = SENDER_CODE;
       c[COL.個数] = '1';      // 1箱1伝票
       c[COL.元払区分] = '1';   // 元払
       c[COL.出荷日付] = ymd;
       c[COL.お客様管理番号] = kanri; // ⭐追跡番号の突合の鍵
-      if (!registered) {
-        // マスタ未登録のFC = 住所を直接書いて伝票を出せるようにする (出荷を止めない)
-        var a = shipment.address || {};
-        var parts = [a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join('');
-        // 🚨マスタに無いFCは住所で出すしかない。欠けたまま伝票を出すと届かないので必ず止める
-        var post = normPostal(a.postalCode);
-        if (!post) throw cErr(kanri + ' (' + fc + '): 郵便番号が読み取れません。マスタ未登録のFCは住所が必要です');
-        if (parts.replace(/\s/g, '').length < 6) throw cErr(kanri + ' (' + fc + '): 住所が読み取れません');
-        if (parts.length > 60) throw cErr(kanri + ' (' + fc + '): 住所が60文字を超えています (' + parts.length + '文字)。切り捨てると届きません');
-        var sp = splitAddress(parts);
-        c[COL.住所1] = sp[0]; c[COL.住所2] = sp[1]; c[COL.住所3] = sp[2];
-        c[COL.名前1] = ('Amazon.co.jp ' + fc).slice(0, 20);
-        c[COL.郵便番号] = post;
-        c[COL.電話番号] = FALLBACK_TEL;
-      }
       rows.push(c);
     }
-    return { rows: rows, registered: registered };
+    return { rows: rows, address: parts, postalCode: post };
   }
 
   function q(v) {
@@ -133,7 +111,7 @@
       all = all.concat(r.rows);
       detail.push({
         納品番号: shipments[i].shipmentConfirmationId, fcCode: shipments[i].fcCode, 箱数: r.rows.length,
-        宛先: r.registered ? 'マスタ登録済み (コードのみ)' : '⚠️ マスタ未登録のため住所を出力'
+        宛先: '〒' + r.postalCode + ' ' + r.address
       });
     }
 
@@ -149,7 +127,6 @@
 
   root.BF_FUKUTSU = {
     HEADER: HEADER, COL: COL,
-    isRegisteredFc: isRegisteredFc,
     splitAddress: splitAddress,
     normPostal: normPostal,
     buildRowsForShipment: buildRowsForShipment,

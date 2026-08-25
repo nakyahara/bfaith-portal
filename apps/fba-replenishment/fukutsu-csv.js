@@ -9,11 +9,12 @@
  *   あわせて、人が宛先コードと箱数を手入力する転記もなくなる。
  *
  * 出力は現行GAS (fukutu.csv) と同じ形に揃える:
- *   - UTF-8 / ヘッダー行 + 空行 + データ行 (この形で実運用の取込に通っている)
+ *   - ヘッダー行 + 空行 + データ行 (この形で実運用の取込に通っている)
+ *   - 🚨文字コードは **Shift_JIS** で出す (呼び出し側の責務)。UTF-8 だと iS-2 で住所が化ける (2026-08-25 実害)
+ *   - 宛先は常に画面の住所を書く (iS-2 マスタに頼らない・2026-08-25)
  *   - 1箱1伝票 (個数=1)。福山の運賃は10個口までと11個口以上で表が変わるが、
  *     現行運用は例外なく1箱1伝票なのでそれに合わせる
  */
-import { isRegisteredFc } from './fukutsu-master.js';
 
 /** 付録1-1-1「CSVエントリフォーマット (記事3行)」26列 */
 export const HEADER = [
@@ -31,14 +32,10 @@ export const COL = {
 const SENDER_CODE = '0648607868'; // 荷送人コード (ご依頼主) — 現行GASと同じ固定値
 
 /**
- * マスタ未登録のFCへ伝票を出すときに使う電話番号。
- * マニュアル付録1は「[荷受人コード] **または** [電話番号・住所・名前・郵便番号]」が必須としており、
- * コードがマスタに無い場合は住所側を揃える必要がある。
- * ⭐ iS-2 のお届け先マスタでは Amazon宛 74件のうち **70件がこの番号**で登録されている
- *   (2026-08-07 実測)。実質の共通番号なので、新しいFCにも同じものを使う。
- *   別の番号にしたくなったら env で差し替えられるようにしておく。
+ * Amazon FC宛の電話番号。画面に出ていない唯一の項目。
+ * iS-2 のお届け先マスタでは Amazon宛 74件のうち 70件がこの番号 (2026-08-07 実測)。
  */
-const FALLBACK_TEL = () => process.env.FUKUTSU_FALLBACK_TEL || '(06)6333-4858';
+const AMAZON_TEL = '(06)6333-4858';
 
 /** YYYYMMDD が実在する日付か (2026年13月40日 のような値を弾く) */
 export function isRealYmd(v) {
@@ -69,7 +66,7 @@ export function normPostal(s) {
 
 /**
  * 納品1件ぶんの行を作る。
- * @param {object} shipment {shipmentConfirmationId, fcCode, boxCount, address?}
+ * @param {object} shipment {shipmentConfirmationId, fcCode, boxCount, address} — address は必須 (画面の住所)
  * @param {string} ymd 出荷日 YYYYMMDD
  */
 export function buildRowsForShipment(shipment, ymd) {
@@ -81,34 +78,32 @@ export function buildRowsForShipment(shipment, ymd) {
   if (!/^[A-Z0-9]{1,16}$/.test(kanri)) throw cErr(`納品番号が不正です: ${kanri}`);
   if (!Number.isInteger(n) || n < 1) throw cErr(`${kanri}: 輸送箱の数が取れませんでした`);
 
-  const registered = isRegisteredFc(fc);
+  // 宛先 = 画面 (Seller Central) の住所をそのまま書く。iS-2 のマスタには頼らない。
+  // 欠けたまま伝票を出すと届かないので必ず止める
+  const a = shipment.address ?? {};
+  const parts = [a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join('');
+  const post = normPostal(a.postalCode);
+  if (!post) throw cErr(`${kanri} (${fc}): 郵便番号が読み取れません`);
+  if (parts.replace(/\s/g, '').length < 6) throw cErr(`${kanri} (${fc}): 住所が読み取れません`);
+  if (parts.length > 60) throw cErr(`${kanri} (${fc}): 住所が60文字を超えています (${parts.length}文字)。切り捨てると届きません`);
+  const [a1, a2, a3] = splitAddress(parts);
+
   const rows = [];
   for (let i = 0; i < n; i++) {
     const c = new Array(26).fill('');
     c[COL.荷受人コード] = fc;
+    c[COL.電話番号] = AMAZON_TEL;
+    c[COL.住所1] = a1; c[COL.住所2] = a2; c[COL.住所3] = a3;
+    c[COL.名前1] = `Amazon.co.jp ${fc}`.slice(0, 20);
+    c[COL.郵便番号] = post;
     c[COL.荷送人コード] = SENDER_CODE;
     c[COL.個数] = '1';           // 1箱1伝票
     c[COL.元払区分] = '1';        // 元払
     c[COL.出荷日付] = ymd;
     c[COL.お客様管理番号] = kanri; // ⭐これが追跡番号の突合の鍵
-    if (!registered) {
-      // マスタ未登録のFC = 住所を直接書いて伝票を出せるようにする (出荷を止めない)
-      const a = shipment.address ?? {};
-      const parts = [a.stateOrProvinceCode, a.city, a.addressLine1].filter(Boolean).join('');
-      // 🚨マスタに無いFCは住所で出すしかない。欠けたまま伝票を出すと届かないので必ず止める
-      const post = normPostal(a.postalCode);
-      if (!post) throw cErr(`${kanri} (${fc}): 郵便番号が読み取れません。マスタ未登録のFCは住所が必要です`);
-      if (parts.replace(/\s/g, '').length < 6) throw cErr(`${kanri} (${fc}): 住所が読み取れません`);
-      if (parts.length > 60) throw cErr(`${kanri} (${fc}): 住所が60文字を超えています (${parts.length}文字)。切り捨てると届きません`);
-      const [a1, a2, a3] = splitAddress(parts);
-      c[COL.住所1] = a1; c[COL.住所2] = a2; c[COL.住所3] = a3;
-      c[COL.名前1] = `Amazon.co.jp ${fc}`.slice(0, 20);
-      c[COL.郵便番号] = post;
-      c[COL.電話番号] = FALLBACK_TEL();
-    }
     rows.push(c);
   }
-  return { rows, registered };
+  return { rows, address: parts, postalCode: post };
 }
 
 const q = (v) => {
@@ -129,11 +124,11 @@ export function buildFukutsuCsv(shipments, ymd) {
   const all = [];
   const detail = [];
   for (const s of shipments) {
-    const { rows, registered } = buildRowsForShipment(s, ymd);
+    const { rows, address, postalCode } = buildRowsForShipment(s, ymd);
     all.push(...rows);
     detail.push({
       納品番号: s.shipmentConfirmationId, fcCode: s.fcCode, 箱数: rows.length,
-      宛先: registered ? 'マスタ登録済み (コードのみ)' : '⚠️ マスタ未登録のため住所を出力',
+      宛先: `〒${postalCode} ${address}`,
     });
   }
 

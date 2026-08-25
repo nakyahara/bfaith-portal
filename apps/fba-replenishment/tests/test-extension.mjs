@@ -24,7 +24,7 @@ const ok = (c, n) => {
 };
 
 // --- 構文 ---
-for (const f of ['content.js', 'fukutsu-csv.js', 'page-parse.js']) {
+for (const f of ['content.js', 'fukutsu-csv.js', 'page-parse.js', 'sjis.js']) {
   try {
     new vm.Script(fs.readFileSync(path.join(dir, f), 'utf8'), { filename: f });
     ok(true, `構文 ${f}`);
@@ -50,7 +50,7 @@ ok(matches.some((m) => m.includes('sellercentral.amazon.co.jp')), 'Seller Centra
 ok(matches.every((m) => /sellercentral/.test(m)), '対象を Seller Central 以外へ広げていない');
 
 const js = mf.content_scripts?.[0]?.js ?? [];
-ok(js.indexOf('fukutsu-csv.js') < js.indexOf('content.js') && js.indexOf('page-parse.js') < js.indexOf('content.js'),
+ok(js.indexOf('fukutsu-csv.js') < js.indexOf('content.js') && js.indexOf('page-parse.js') < js.indexOf('content.js') && js.indexOf('sjis.js') >= 0 && js.indexOf('sjis.js') < js.indexOf('content.js'),
   'content.js より先に依存ファイルを読み込む');
 for (const f of js.concat(mf.content_scripts?.[0]?.css ?? [])) {
   ok(fs.existsSync(path.join(dir, f)), `参照ファイルが存在する: ${f}`);

@@ -6,7 +6,6 @@
  */
 import assert from 'node:assert/strict';
 import * as server from '../fukutsu-csv.js';
-import { REGISTERED_FC_CODES, isRegisteredFc as serverIsRegisteredFc } from '../fukutsu-master.js';
 await import('../../../tools/fba-fukutsu-helper/fukutsu-csv.js'); // globalThis.BF_FUKUTSU を立てる
 const ext = globalThis.BF_FUKUTSU;
 
@@ -17,30 +16,17 @@ console.log('fukutsu-csv parity (拡張 ⇔ サーバ)');
 t('ヘッダーが完全一致', () => assert.deepEqual(ext.HEADER, server.HEADER));
 t('列位置が完全一致', () => assert.deepEqual(ext.COL, server.COL));
 
-t('登録済みFCコードの集合が完全一致', () => {
-  const s = [...REGISTERED_FC_CODES].sort();
-  const e = s.filter((c) => ext.isRegisteredFc(c));
-  assert.deepEqual(e, s, '拡張側に足りないコードがある');
-  // 逆向き: 拡張だけが登録済みと言うコードが無いか (代表例で確認)
-  for (const c of ['TPFB', 'ZZZ9', 'QQQ1', '']) {
-    assert.equal(ext.isRegisteredFc(c), serverIsRegisteredFc(c), `不一致: ${c}`);
-  }
-});
-
+const ADDR_SAYAMA = { postalCode: '350-1301', stateOrProvinceCode: '埼玉県', city: '狭山市', addressLine1: '青柳 915' };
 const CASES = [
-  { name: '登録済みFC・複数箱', ships: [{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 5 }], ymd: '20260807' },
+  { name: '複数箱', ships: [{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 5, address: ADDR_SAYAMA }], ymd: '20260807' },
   { name: '複数納品', ships: [
-      { shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 5 },
-      { shipmentConfirmationId: 'FBA15GGLDVMG', fcCode: 'XHD4', boxCount: 14 },
+      { shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 5, address: ADDR_SAYAMA },
+      { shipmentConfirmationId: 'FBA15GGLDVMG', fcCode: 'XHD4', boxCount: 14, address: { postalCode: '2430213', addressLine1: '神奈川県 伊勢原市 石田 100' } },
     ], ymd: '20260808' },
-  { name: '未登録FC (住所を出す)', ships: [{
-      shipmentConfirmationId: 'FBA15NEW0001', fcCode: 'ZZZ9', boxCount: 2,
-      address: { postalCode: '350-1301', stateOrProvinceCode: '埼玉県', city: '狭山市', addressLine1: '青柳 915' },
-    }], ymd: '20260810' },
-  { name: 'TPFB (無いもの扱い→住所)', ships: [{
-      shipmentConfirmationId: 'FBA15TPFB001', fcCode: 'TPFB', boxCount: 1,
-      address: { postalCode: '2430213', stateOrProvinceCode: '神奈川県', city: '伊勢原市', addressLine1: '石田 100' },
-    }], ymd: '20260810' },
+  { name: '画面パーサの形 (住所が1本の文字列)', ships: [{
+      shipmentConfirmationId: 'FBA15GH9C0L0', fcCode: 'XJE1', boxCount: 35,
+      address: { postalCode: '243-0488', addressLine1: '神奈川県 海老名市 中新田3290 MFLP海老名I 2階' },
+    }], ymd: '20260825' },
   { name: '長い住所 (20文字ずつ分割)', ships: [{
       shipmentConfirmationId: 'FBA15LONG001', fcCode: 'ZZZ8', boxCount: 1,
       address: { postalCode: '270-0193', stateOrProvinceCode: '千葉県', city: '流山市', addressLine1: '森のロジスティクスパーク一丁目383番地の11 DPL 流山IV 1F・2F（南棟）' },
@@ -58,10 +44,13 @@ for (const c of CASES) {
 
 t('不正入力の弾き方も同じ', () => {
   for (const bad of [
-    [[{ shipmentConfirmationId: 'FBA-X', fcCode: 'HND2', boxCount: 1 }], '20260807'],
-    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: '', boxCount: 1 }], '20260807'],
-    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 0 }], '20260807'],
-    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1 }], '2026-08-07'],
+    [[{ shipmentConfirmationId: 'FBA-X', fcCode: 'HND2', boxCount: 1, address: ADDR_SAYAMA }], '20260807'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: '', boxCount: 1, address: ADDR_SAYAMA }], '20260807'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 0, address: ADDR_SAYAMA }], '20260807'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1, address: ADDR_SAYAMA }], '2026-08-07'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1 }], '20260807'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1, address: { postalCode: '350-1301' } }], '20260807'],
+    [[{ shipmentConfirmationId: 'FBA15GGL5J2X', fcCode: 'HND2', boxCount: 1, address: { postalCode: '350-1301', addressLine1: 'あ'.repeat(70) } }], '20260807'],
   ]) {
     let ea = null, eb = null;
     try { ext.buildFukutsuCsv(...bad); } catch (e) { ea = e.message; }

@@ -18,7 +18,7 @@ import crypto from 'crypto';
 import express from 'express';
 import { extractPlanId, getPlanShipments as realGetPlanShipments, missingEnv as realMissingEnv } from './tracking-service.js';
 import { buildFukutsuCsv } from './fukutsu-csv.js';
-import { isRegisteredFc } from './fukutsu-master.js';
+import iconv from 'iconv-lite';
 import { jstYmd } from './tracking-runner.js';
 
 function timingSafeEq(a, b) {
@@ -101,7 +101,6 @@ export function createTrackingExtRouter(deps = {}) {
         箱数: s.boxCount,
         status: s.status,
         追跡番号: s.hasTracking ? '登録済み' : '未登録',
-        宛先: isRegisteredFc(s.fcCode) ? 'マスタ登録済み' : '⚠️ マスタ未登録 (住所を出力します)',
       })),
     }));
   });
@@ -123,9 +122,15 @@ export function createTrackingExtRouter(deps = {}) {
     // 拡張が中身を見ずに保存できるよう、要点はヘッダーで返す (本文はCSVそのもの)
     res.setHeader('X-Fukutsu-Rows', String(built.summary.伝票枚数));
     res.setHeader('X-Fukutsu-Shipments', String(built.summary.納品数));
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    // 🚨iS-2 は Shift_JIS で読む。UTF-8 だと住所が化ける (2026-08-25 実害)。
+    //   変換できない文字は '?' に化けるので、往復して一致しなければ作らない
+    const sjis = iconv.encode(built.csv, 'cp932');
+    if (iconv.decode(sjis, 'cp932') !== built.csv) {
+      return res.status(422).json(fail('VALIDATION', 'Shift_JISにできない文字が住所に含まれています'));
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=shift_jis');
     res.setHeader('Content-Disposition', `attachment; filename="fukutu_${planId.slice(0, 10)}_${ymd}.csv"`);
-    res.send(built.csv);
+    res.send(sjis);
   });
 
   return router;
