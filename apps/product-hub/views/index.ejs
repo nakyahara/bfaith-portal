@@ -85,6 +85,23 @@
         <span class="muted" id="import-result"></span>
       </div>
       <div id="import-detail" style="margin-top:10px;"></div>
+
+      <% if (isAdmin) { %>
+        <!-- ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示)。アプリにカードが無い商品だけ -->
+        <div style="margin-top:14px; padding:10px 12px; background:#fffbeb; border:1px solid #fde68a; border-radius:8px;">
+          <div style="font-size:13px; margin-bottom:8px;">
+            <strong>ステータス①〜⑥の一括移植</strong> — Notion の Status が ①〜⑥ の商品のうち、
+            <strong>このアプリにカードが無いものだけ</strong>を取り込みます (既にある商品・Notion側のカードには触りません)。
+            まず「対象を確認」で件数を見てから実行してください。
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button class="btn" id="mig-preview-btn">対象を確認 (プレビュー)</button>
+            <button class="btn btn-primary" id="mig-run-btn" disabled>移植を実行</button>
+            <span class="muted" id="mig-result"></span>
+          </div>
+          <div id="mig-detail" style="margin-top:10px; max-height:320px; overflow-y:auto;"></div>
+        </div>
+      <% } %>
     </details>
   </div>
 
@@ -507,6 +524,72 @@
       importBtn.textContent = '取り込む';
     }
   });
+
+  // ─── ステータス①〜⑥の一括移植 (admin のみ表示。プレビュー → 実行の2段階) ───
+  const migPreviewBtn = document.getElementById('mig-preview-btn');
+  const migRunBtn = document.getElementById('mig-run-btn');
+  if (migPreviewBtn && migRunBtn) {
+    const MIG_LABELS = {
+      would_import: '取り込み予定',
+      imported: '取り込み',
+      already_exists: '既にあります (スキップ)',
+      duplicate: 'Notion側で重複 (要確認)',
+      conflict_portal: 'アプリ起点の商品 (スキップ)',
+      conflict_page_id: '別のNotionカードが紐づいています (要確認)',
+      failed: '失敗',
+    };
+    async function runMigrate(dryRun) {
+      const out = document.getElementById('mig-result');
+      migPreviewBtn.disabled = true;
+      migRunBtn.disabled = true;
+      out.textContent = dryRun ? '対象を確認中… (Notion照会に少し時間がかかります)' : '移植中…';
+      document.getElementById('mig-detail').innerHTML = '';
+      try {
+        const res = await fetch('/apps/product-hub/api/notion-import-by-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dry_run: dryRun }),
+        });
+        const json = await res.json();
+        if (!json.ok) { out.textContent = 'エラー: ' + (json.error || '不明'); return; }
+        const s = json.summary;
+        out.textContent = (dryRun
+          ? '対象 ' + json.total + ' 件 → 取り込み予定 ' + s.would_import
+          : '対象 ' + json.total + ' 件 → 取り込み ' + s.imported)
+          + ' / 既にあり ' + s.already_exists + ' / 重複 ' + s.duplicate + ' / 失敗 ' + s.failed
+          + ' (対象ステータス: ' + (json.statuses || []).join(', ') + ')';
+        const rows = json.results.map(function (r) {
+          var link = Number.isSafeInteger(r.draftId)
+            ? '<a href="/apps/product-hub/detail/' + r.draftId + '">開く</a>' : '';
+          return '<tr><td><code>' + escapeHtml(r.ne_code) + '</code></td><td class="muted">'
+            + escapeHtml(r.notion_status || '') + '</td><td>'
+            + escapeHtml(MIG_LABELS[r.outcome] || r.outcome) + '</td><td class="muted">'
+            + escapeHtml(r.error || '') + '</td><td>' + link + '</td></tr>';
+        }).join('');
+        document.getElementById('mig-detail').innerHTML =
+          '<table class="list"><tbody>' + rows + '</tbody></table>'
+          + (json.truncated ? '<p class="muted">…一覧は300件まで表示 (件数は上の集計が正)</p>' : '');
+        if (dryRun) {
+          migRunBtn.disabled = s.would_import === 0;
+          if (s.would_import === 0) out.textContent += ' — 取り込むものはありません';
+        } else if (s.imported > 0) {
+          setTimeout(function () { location.reload(); }, 3000);
+        }
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        migPreviewBtn.disabled = false;
+      }
+    }
+    migPreviewBtn.addEventListener('click', function () { runMigrate(true); });
+    migRunBtn.addEventListener('click', function () {
+      if (!confirm('プレビューの「取り込み予定」の商品をこのアプリに移植します。\nNotion側のカードには書き戻しません。\n\nよろしいですか?')) {
+        migRunBtn.disabled = false;
+        return;
+      }
+      runMigrate(false);
+    });
+  }
 
   // ─── 商品コードから一括登録 ───
   const REG_LABELS = {

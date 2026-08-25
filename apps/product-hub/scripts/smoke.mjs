@@ -422,6 +422,61 @@ try {
 } catch (e) { overErr = e; }
 check('import rejects over MAX_IMPORT_CODES', !!overErr);
 
+// ─── ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
+{
+  const schema = {
+    properties: {
+      Status: {
+        type: 'select',
+        select: {
+          options: [
+            { name: '⓪新規商品_高島' }, { name: '①ページ作成中' }, { name: '③画像待ち' },
+            { name: '⑥完了' }, { name: 'アーカイブ' },
+          ],
+        },
+      },
+    },
+  };
+  let capturedFilter = null;
+  const mkPage = (code, status) => {
+    const p = fakePage(code);
+    p.id = `page-mig-${code}-${status}`;
+    p.properties.Status.select.name = status;
+    return p;
+  };
+  const migPages = [
+    mkPage('MIG-NEW-1', '①ページ作成中'),
+    mkPage('IMP-1', '③画像待ち'),   // 既にアプリに居る (上の取り込みテストで作成済み)
+    mkPage('MIG-NEW-1', '⑥完了'),    // Notion 側の重複カード
+    { id: 'page-mig-nocode', properties: { Name: { type: 'title', title: [{ plain_text: 'コード無し' }] } } },
+  ];
+  const di = {
+    config: () => ({ databaseId: 'db-test' }),
+    request: async () => schema,
+    query: async ({ filter }) => { capturedFilter = filter; return { pages: migPages }; },
+  };
+  const prev = await imp.importByNotionStatus({ actor: 'smoke', ...di });   // dryRun 既定
+  check('一括移植: フィルタは ①〜⑥ で始まる選択肢だけ (⓪・その他を含まない)',
+    capturedFilter.or.length === 3 && capturedFilter.or.every((f) => /^[①③⑥]/.test(f.select.equals)),
+    JSON.stringify(capturedFilter));
+  check('一括移植: dryRun 既定では書き込まず対象だけ返す',
+    prev.summary.would_import === 1 && prev.summary.already_exists === 1
+    && prev.summary.duplicate === 1 && prev.summary.failed === 1 && prev.total === 4
+    && !db.prepare(`SELECT 1 FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).get(),
+    JSON.stringify(prev.summary));
+  const migRun = await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, ...di });
+  const migRow = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).get();
+  check('一括移植: 実行でカードの無い商品だけ入る (source=notion_import・status=draft・原文ステータス保持)',
+    migRun.summary.imported === 1 && migRow && migRow.source === 'notion_import'
+    && migRow.status === 'draft' && migRow.source_notion_status === '①ページ作成中',
+    JSON.stringify(migRun.summary));
+  const migAgain = await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, ...di });
+  check('一括移植: 再実行は already_exists になり二重取り込みしない',
+    migAgain.summary.imported === 0 && migAgain.summary.already_exists === 2,
+    JSON.stringify(migAgain.summary));
+  db.prepare(`DELETE FROM product_drafts WHERE ne_code = 'MIG-NEW-1'`).run();
+}
+
 // 取り込み由来は Notion へ書き戻さない (これが無いと既存カードの URL が消える)
 check('syncCardLinks skips imported',
   (await notionCard.syncCardLinks(imported.id, { actor: 'smoke' })).outcome === 'skipped_not_portal');
