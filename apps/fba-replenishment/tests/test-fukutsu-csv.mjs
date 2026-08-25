@@ -48,8 +48,7 @@ t('箱数ぶんの行が出る (1箱1伝票)', () => {
 
 t('⭐お客様管理番号(21列目)に納品番号が入る', () => {
   const { csv } = buildFukutsuCsv([HND2], '20260807');
-  const first = csv.trimEnd().split('
-')[1].split(',');
+  const first = csv.trimEnd().split('\n')[1].split(',');
   assert.equal(first[COL.お客様管理番号], 'FBA15GGL5J2X');
   assert.equal(first[COL.荷受人コード], 'HND2');
   assert.equal(first[COL.荷送人コード], '0648607868');
@@ -63,8 +62,7 @@ t('⭐実物の fukutu.csv (コードのみ時代) が埋めていた列は、�
   if (!fs.existsSync(p)) { console.log('     (実ファイルが無いのでスキップ)'); return; }
   const realRow = fs.readFileSync(p, 'utf-8').split(/\r?\n/)[2].split(',');
   const realFilled = realRow.map((v, i) => (v !== '' ? i : -1)).filter((i) => i >= 0);
-  const mine = buildFukutsuCsv([HND2], '20260806').csv.trimEnd().split('
-')[1].split(',');
+  const mine = buildFukutsuCsv([HND2], '20260806').csv.trimEnd().split('\n')[1].split(',');
   for (const i of realFilled) {
     if (i === COL.お客様管理番号) continue;
     assert.notEqual(mine[i], '', `実物が埋めていた ${i} 列目が空`);
