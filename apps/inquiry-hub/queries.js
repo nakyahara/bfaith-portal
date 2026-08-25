@@ -313,7 +313,8 @@ export function countByView() {
 /** 一覧画面のフィルタ用マスタ (店舗・担当者・状態別件数) */
 export function listFilterOptions() {
   const db = getDB();
-  const shops = db.prepare('SELECT id, shop_name, channel_type FROM shops WHERE is_active = 1 ORDER BY channel_type, shop_name').all();
+  // account_identifier はモール管理画面への外部リンク (Yahoo!のストアアカウント別URL) にも使う
+  const shops = db.prepare('SELECT id, shop_name, channel_type, account_identifier FROM shops WHERE is_active = 1 ORDER BY channel_type, shop_name').all();
   const assignees = db.prepare("SELECT DISTINCT assigned_user_id AS u FROM inquiries WHERE assigned_user_id IS NOT NULL AND assigned_user_id != '' ORDER BY 1").all().map(r => r.u);
   const counts = db.prepare('SELECT internal_status, COUNT(*) AS c FROM inquiries WHERE is_archived = 0 GROUP BY internal_status').all();
   return { shops, assignees, countMap: Object.fromEntries(counts.map(r => [r.internal_status, r.c])) };

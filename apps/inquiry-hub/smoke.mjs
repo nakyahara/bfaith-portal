@@ -501,6 +501,21 @@ console.log('HTTP: 全件一括');
   check('一覧に「この条件の全N件を選択」ボタンとFILTERが載る', html.includes('id="bulkAll"')
     && html.includes('この条件の全') && html.includes('bulk-by-filter'));
 
+  // モール管理画面への外部リンク (2026-08-25 中原さん要望)。登録済みチャネルの分だけ出す
+  check('上部タブ行にGmailリンク (メール店舗があるため)',
+    html.includes('class="mall-links"') && html.includes('https://mail.google.com/') && html.includes('target="_blank"'));
+  const shopR = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','リンク楽天店','999888')").run().lastInsertRowid;
+  db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','リンクY店','b-faith-link')").run();
+  const html2 = await (await fetch(`${base}/?view=inbox&shop=${shopR}`)).text();
+  check('楽天R-Messe + Yahoo!ストアクリエイターPro (ストアアカウント別URL) が出る',
+    html2.includes('https://rmesse.rms.rakuten.co.jp/')
+    && html2.includes('https://pro.store.yahoo.co.jp/pro.b-faith-link'), 'mall links');
+  // 無効化した店舗のリンクは出さない (使っていないモールを並べない)
+  db.prepare("UPDATE shops SET is_active = 0 WHERE account_identifier = 'b-faith-link'").run();
+  const html3 = await (await fetch(`${base}/?view=inbox&shop=${shopR}`)).text();
+  check('無効化した店舗のリンクは消える', !html3.includes('pro.store.yahoo.co.jp/pro.b-faith-link')
+    && html3.includes('https://rmesse.rms.rakuten.co.jp/'));
+
   const dry = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: { status: 'done' }, dryRun: true });
   check('dryRun: 件数だけ返し状態は変えない', dry.status === 200 && dry.j.matched === 2
     && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(h1).internal_status === 'open');

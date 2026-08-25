@@ -134,11 +134,34 @@ router.get('/', (req, res) => {
     return `/apps/inquiry-hub${qs ? `?${qs}` : ''}`;
   };
   const tabCnt = (n) => `<span class="tab-cnt${n ? '' : ' zero'}" title="新着 (受信トレイ) の件数">新着${n || 0}</span>`;
+  // ─── モール側の問い合わせ画面への外部リンク (2026-08-25 中原さん要望) ───
+  // このアプリで完結しない操作 (モール独自機能・仕様変更の確認・アプリ側の同期を待たずに直接見る) の逃げ道。
+  // 楽天=R-Messe / Yahoo!=ストアクリエイターPro (ストアアカウント別URL) / メール=Gmail。
+  // 登録済みの店舗があるチャネルだけ出す (使っていないモールのリンクを並べない)
+  const mallLinks = (() => {
+    const active = shops; // listFilterOptions は is_active=1 の店舗のみ返す
+    const out = [];
+    if (active.some(s => s.channel_type === 'rakuten')) {
+      out.push({ url: 'https://rmesse.rms.rakuten.co.jp/', icon: '🛍️', label: '楽天 R-Messe' });
+    }
+    for (const s of active.filter(s => s.channel_type === 'yahoo')) {
+      const acct = String(s.account_identifier || '').trim();
+      if (acct) out.push({ url: `https://pro.store.yahoo.co.jp/pro.${encodeURIComponent(acct)}`, icon: '🟡', label: 'Yahoo! ストアクリエイターPro' });
+    }
+    if (active.some(s => s.channel_type === 'email')) {
+      out.push({ url: 'https://mail.google.com/', icon: '📧', label: 'Gmail' });
+    }
+    return out.length
+      ? `<span class="mall-links">${out.map(l =>
+        `<a href="${he(l.url)}" target="_blank" rel="noopener" title="${he(l.label)}の管理画面を新しいタブで開きます">${l.icon} ${he(l.label)} ↗</a>`).join('')}</span>`
+      : '';
+  })();
   const chTabs = `
   <nav class="ch-tabs">
     <a class="${group === '' ? 'on' : ''}" href="${he(tabLink(''))}">🗂️ すべて ${tabCnt(inboxCounts.all)}</a>
     ${Object.entries(CHANNEL_GROUPS).map(([key, g]) =>
       `<a class="${group === key ? 'on' : ''}" href="${he(tabLink(key))}">${g.icon} ${he(g.label)} ${tabCnt(inboxCounts[key])}</a>`).join('')}
+    ${mallLinks}
   </nav>`;
 
   // ─── 状態タブ (2026-08-17 スタッフ要望: モール問い合わせの中でも 新着/返信処理中/完了 を切替) ───
@@ -2700,6 +2723,11 @@ button:disabled { opacity: .5; cursor: default; }
 .ch-tabs a:hover { background: #e2e8f0; text-decoration: none; }
 .ch-tabs a.on { background: #fff; color: #1d4ed8; border-color: #cbd5e1;
   position: relative; top: 2px; padding-bottom: 11px; }
+/* モール管理画面への外部リンク (タブ行の右端。タブと見分けがつくよう控えめな見た目) */
+.mall-links { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.mall-links a { padding: 6px 10px; border-radius: 8px; color: #475569; font-weight: 600; font-size: 13px;
+  background: #e2e8f0; white-space: nowrap; }
+.mall-links a:hover { background: #cbd5e1; text-decoration: none; }
 .tab-cnt { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 999px;
   padding: 1px 8px; font-size: 12px; margin-left: 2px; vertical-align: 1px; }
 .tab-cnt.zero { background: #f1f5f9; color: #94a3b8; }
@@ -2911,6 +2939,9 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* 上部タブ: スマホでは詰めて全タブが1〜2行に収まるように */
   .ch-tabs { gap: 4px; }
   .ch-tabs a { padding: 8px 10px; font-size: 13px; }
+  /* モールリンクはタブの下に折り返す (右寄せをやめてタブを押しやすく保つ) */
+  .mall-links { margin-left: 0; flex-basis: 100%; }
+  .mall-links a { padding: 8px 10px; font-size: 12px; }
   .view-tabs a { padding: 6px 10px; font-size: 12px; }
   /* 一括操作: スマホは各コントロールを全幅に (誤タップ防止) */
   .bulkbar select, .bulkbar button { flex: 1 1 100%; }
