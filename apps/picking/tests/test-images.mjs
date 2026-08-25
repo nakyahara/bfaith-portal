@@ -33,6 +33,25 @@ t('normalizeImageUrl: 完全URL/プロトコル相対/cabinet相対/不正値/�
   assert.equal(normalizeImageUrl('https://evilrakuten.co.jp/a.jpg'), null, 'サフィックス偽装は弾く');
 });
 
+t('extractImageUrls: バリエーション画像はSKUに一致したものだけ・無ければ白抜き', () => {
+  const item = {
+    manageNumber: 'ganeshisc20',
+    whiteBgImage: { location: '/ganeshisc20_00.jpg' },
+    images: [{ location: '/ganeshisc20_top.jpg' }],
+    variants: {
+      'ganeshisc20-no04': { merchantDefinedSkuId: 'ganeshisc20-no04', images: [{ location: '/ganeshisc20-no04_00.jpg' }] },
+      'ganeshisc20-no08': { merchantDefinedSkuId: 'ganeshisc20-no08', images: [{ location: '/ganeshisc20-no08_00.jpg' }] },
+      'ganeshisc20-noimg': { merchantDefinedSkuId: 'ganeshisc20-noimg', images: [] },
+    },
+  };
+  assert.ok(extractImageUrls(item, ['GANESHISC20-NO08']).variantUrl.endsWith('/ganeshisc20-no08_00.jpg'), '大文字小文字を吸収してそのSKUの画像');
+  assert.ok(extractImageUrls(item, ['ganeshisc20-no04']).variantUrl.endsWith('/ganeshisc20-no04_00.jpg'));
+  assert.equal(extractImageUrls(item, ['ganeshisc20-noimg']).variantUrl, null, 'SKU画像が未登録なら null (白抜きへ)');
+  assert.equal(extractImageUrls(item, ['other']).variantUrl, null);
+  assert.ok(extractImageUrls(item, ['other']).whiteBgUrl.endsWith('/ganeshisc20_00.jpg'));
+  assert.equal(extractImageUrls(item).variantUrl, null, 'codes 省略でも壊れない');
+});
+
 t('resolveManageNumber: 直接一致とハイフン削りfallback (最大3段)', () => {
   const nums = new Map([['whitesage10', 'whitesage10'], ['0726-000629', '0726-000629']]);
   assert.equal(resolveManageNumber(nums, 'whitesage10'), 'whitesage10');
@@ -78,16 +97,19 @@ function fakeDeps({ items = [], failed = [] } = {}) {
 {
   const deps = fakeDeps({
     items: [
-      { manageNumber: 'rk-item-a', whiteBgImage: { location: '/a_00.jpg' }, images: [{ location: '/a_top.jpg' }] },
+      { manageNumber: 'rk-item-a', whiteBgImage: { location: '/a_00.jpg' }, images: [{ location: '/a_top.jpg' }],
+        variants: { 'rk-item-a-red': { merchantDefinedSkuId: 'rk-item-a-red', images: [{ location: '/a_red_00.jpg' }] },
+                    'rk-item-a-blue': { merchantDefinedSkuId: 'rk-item-a-blue', images: [{ location: '/a_blue_00.jpg' }] } } },
       { manageNumber: 'whitesage10', images: [{ location: '/ws_top.jpg' }] },   // 白抜き未登録→1枚目
     ],
   });
   const stats = await ensureImagesFor(['csvsku-a', 'WhiteSage10', 'no-such-sku'], deps);
   assert.equal(stats.ok, 2);
   assert.equal(stats.notFound, 1);
+  assert.equal(stats.variant, 1);
   assert.deepEqual(deps.calls, [['rk-item-a', 'whitesage10']]);
   const map = getImageMap(['csvsku-a', 'whitesage10', 'no-such-sku']);
-  assert.ok(map.get('csvsku-a').url.endsWith('/cabinet/a_00.jpg'), '白抜きが優先');
+  assert.ok(map.get('csvsku-a').url.endsWith('/cabinet/a_red_00.jpg'), '変換テーブルの楽天SKUコードで variants を引き、そのSKUの画像 (白抜きより優先)');
   assert.ok(map.get('whitesage10').url.endsWith('/cabinet/ws_top.jpg'), 'フォールバックで1枚目');
   assert.equal(map.get('no-such-sku').url, null);
   assert.equal(map.get('no-such-sku').status, 'not_found');
