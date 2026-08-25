@@ -1632,13 +1632,18 @@ router.post('/api/notion-import-by-status', async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {
     const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
-    const r = await importByNotionStatus({ actor: actorOf(req), dryRun });
+    const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
+    const r = await importByNotionStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
     // 一覧は大きくなりうるので 300 件で打ち切る (全体の件数は summary / total にある)
     res.json({
-      ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary,
+      ok: true, dryRun, statuses: r.statuses, total: r.total, summary: r.summary, snapshot: r.snapshot,
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
+    // プレビュー後に Notion 側が変わった → 書き込まず再プレビューを要求 (Codex R1 high)
+    if (e && e.code === 'snapshot_mismatch') {
+      return res.status(409).json({ ok: false, error: e.message });
+    }
     console.error('[product-hub] notion-import-by-status failed:', e);
     res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
   }

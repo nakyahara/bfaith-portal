@@ -154,7 +154,9 @@ export async function queryDatabaseAll(opts = {}) {
   const pages = [];
   let cursor = null;
   const pageSize = opts.pageSize || 100;
-  for (let i = 0; i < 50; i += 1) {
+  // 既定 50 ページ (=5,000件) は同期処理の暴走ガード。大きな一括照会は呼び出し側が明示して広げる
+  const maxPages = Number.isInteger(opts.maxPages) && opts.maxPages > 0 ? opts.maxPages : 50;
+  for (let i = 0; i < maxPages; i += 1) {
     const body = { page_size: pageSize };
     if (cursor) body.start_cursor = cursor;
     if (opts.filter) body.filter = opts.filter;
@@ -169,7 +171,7 @@ export async function queryDatabaseAll(opts = {}) {
     }
     cursor = res.next_cursor;
   }
-  throw new NotionApiError('queryDatabase', `pagination did not complete in 50 iterations (got ${pages.length} pages)`);
+  throw new NotionApiError('queryDatabase', `pagination did not complete in ${maxPages} iterations (got ${pages.length} pages)`);
 }
 
 /**

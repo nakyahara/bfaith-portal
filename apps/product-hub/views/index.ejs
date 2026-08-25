@@ -536,8 +536,11 @@
       duplicate: 'Notion側で重複 (要確認)',
       conflict_portal: 'アプリ起点の商品 (スキップ)',
       conflict_page_id: '別のNotionカードが紐づいています (要確認)',
+      deferred: '今回は見送り (再度プレビュー→実行で続きから)',
       failed: '失敗',
     };
+    // プレビューと実行を同じ対象集合に固定するトークン (サーバー側で照合。ズレたら409で再プレビュー)
+    let migSnapshot = null;
     async function runMigrate(dryRun) {
       const out = document.getElementById('mig-result');
       migPreviewBtn.disabled = true;
@@ -548,15 +551,21 @@
         const res = await fetch('/apps/product-hub/api/notion-import-by-status', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ dry_run: dryRun }),
+          body: JSON.stringify({ dry_run: dryRun, expected_snapshot: migSnapshot }),
         });
         const json = await res.json();
-        if (!json.ok) { out.textContent = 'エラー: ' + (json.error || '不明'); return; }
+        if (!json.ok) {
+          migSnapshot = null;
+          out.textContent = 'エラー: ' + (json.error || '不明');
+          return;
+        }
+        migSnapshot = json.snapshot || null;
         const s = json.summary;
         out.textContent = (dryRun
           ? '対象 ' + json.total + ' 件 → 取り込み予定 ' + s.would_import
           : '対象 ' + json.total + ' 件 → 取り込み ' + s.imported)
           + ' / 既にあり ' + s.already_exists + ' / 重複 ' + s.duplicate + ' / 失敗 ' + s.failed
+          + (s.deferred ? ' / 上限見送り ' + s.deferred : '')
           + ' (対象ステータス: ' + (json.statuses || []).join(', ') + ')';
         const rows = json.results.map(function (r) {
           var link = Number.isSafeInteger(r.draftId)
@@ -572,6 +581,8 @@
         if (dryRun) {
           migRunBtn.disabled = s.would_import === 0;
           if (s.would_import === 0) out.textContent += ' — 取り込むものはありません';
+        } else if (s.deferred > 0) {
+          out.textContent += ' — 1回の上限に達しました。もう一度「対象を確認」→「実行」で続きが入ります';
         } else if (s.imported > 0) {
           setTimeout(function () { location.reload(); }, 3000);
         }
