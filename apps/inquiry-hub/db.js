@@ -455,6 +455,30 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_replies(status, lease_until)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)');
 
+  // 一括操作のバッチ記録 (2026-08-25 Codex議論の採用: 滞留整理の安全装置)。
+  // チェック行への一括・「この条件の全件」・メールルールの既存一括適用を1回=1バッチとして記録し、
+  // バッチ単位で取り消せるようにする。items には変更したフィールドの変更前後だけを持つ (batches.js)
+  db.exec(`CREATE TABLE IF NOT EXISTS bulk_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT,
+    source TEXT NOT NULL CHECK(source IN ('bulk','bulk_filter','rule_apply')),
+    ops_json TEXT NOT NULL,          -- 適用した変更内容 (表示用)
+    filter_json TEXT,                -- 対象の条件 (bulk_filter/rule_apply。表示用)
+    target_count INTEGER NOT NULL,   -- 対象にした件数
+    changed_count INTEGER NOT NULL,  -- 実際に変更した件数 (=items件数)
+    reverted_at TEXT,                -- 取り消し済みなら日時 (取り消しは1回だけ)
+    reverted_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS bulk_batch_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES bulk_batches(id),
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    before_json TEXT NOT NULL,       -- 変更したフィールドの変更前値 (取り消し時に戻す値)
+    after_json TEXT NOT NULL         -- 変更後値 (取り消し時に「今もその値のままか」を確認する)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON bulk_batch_items(batch_id)');
+
   // クイックリンク (2026-08-25 中原さん要望「リンク先はこっちで登録して自動で設定できるように」)。
   // 一覧上部に出す外部サイトへの導線 (楽天R-Messe・Yahoo!ストアクリエイターPro・Gmail 等) を
   // コードに直書きせず画面から登録・編集する。URLの検証は links.js (http/https のみ)

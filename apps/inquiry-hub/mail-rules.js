@@ -16,6 +16,7 @@
  */
 import { getDB, logActivity } from './db.js';
 import { parseCsv } from './templates.js';
+import { recordBulkBatch } from './batches.js';
 
 export const RULE_FIELDS = ['from', 'to', 'reply_to', 'subject', 'body'];
 export const RULE_OPS = ['contains', 'not_contains', 'equals', 'not_equals', 'starts_with', 'ends_with'];
@@ -132,7 +133,8 @@ export function addMailRule({ name, matchMode = 'all', conditions, action, prior
  *   - import (+folderId/labelId) → フォルダ・ラベルを付けるだけ (ステータスは変えない = 受信トレイに残る)
  * 対象はメールチャネルのみ。完了化は未完了のものだけ、フォルダ・ラベルは「まだ付いていないもの」だけ。
  *
- * @returns {{ matched: number, completed: number, foldered: number, labeled: number }}
+ * 適用はバッチとして記録され、⚙️運用管理から取り消せる (batches.js。2026-08-25 安全装置)。
+ * @returns {{ matched: number, completed: number, foldered: number, labeled: number, batchId: number|null }}
  */
 export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply = false, actorId = 'portal', action = 'import_done', folderId = null, labelId = null } = {}) {
   validateConditions(conditions);
@@ -187,8 +189,10 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
   const matched = db.prepare(`SELECT COUNT(*) AS c FROM inquiries i WHERE ${where}`).get(...allParams).c;
   if (!apply) return { matched, completed: 0, foldered: 0, labeled: 0 };
 
-  const rows = db.prepare(`SELECT i.id FROM inquiries i WHERE ${where}`).all(...allParams);
-  let completed = 0, foldered = 0, labeled = 0;
+  const rows = db.prepare(`SELECT i.id, i.internal_status, i.completed_at, i.is_unread, i.folder_id, i.label_id
+    FROM inquiries i WHERE ${where}`).all(...allParams);
+  let completed = 0, foldered = 0, labeled = 0, batchId = null;
+  const batchItems = [];   // 取り消し用: 変更したフィールドの変更前後 (batches.js)
   const tx = db.transaction(() => {
     const updDone = db.prepare(`UPDATE inquiries SET internal_status = 'done', is_unread = 0,
       completed_at = COALESCE(completed_at, strftime('%Y-%m-%dT%H:%M:%SZ','now')),
@@ -198,25 +202,36 @@ export function applyRuleToExistingMails(conditions, { matchMode = 'all', apply 
     const updLabel = lid != null ? db.prepare(`UPDATE inquiries SET label_id = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ? AND (label_id IS NULL OR label_id != ?)`) : null;
     for (const r of rows) {
+      const before = {}, after = {};
       if (completing && updDone.run(r.id).changes > 0) {
         completed++;
         logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'status_change',
           after: { internal_status: 'done', reason: 'メールルールの一括適用' } });
+        before.internal_status = r.internal_status; after.internal_status = 'done';
+        before.completed_at = r.completed_at;
+        before.is_unread = r.is_unread; after.is_unread = 0;
       }
       if (updFolder && updFolder.run(fid, r.id, fid).changes > 0) {
         foldered++;
         logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'folder_change',
           after: { folder: folderName, reason: 'メールルールの一括適用' } });
+        before.folder_id = r.folder_id; after.folder_id = fid;
       }
       if (updLabel && updLabel.run(lid, r.id, lid).changes > 0) {
         labeled++;
         logActivity(r.id, { actorType: 'user', userId: actorId, actionType: 'label_change',
           after: { label: labelName, reason: 'メールルールの一括適用' } });
+        before.label_id = r.label_id; after.label_id = lid;
       }
+      if (Object.keys(after).length) batchItems.push({ inquiryId: r.id, before, after });
     }
+    batchId = recordBulkBatch(db, { actor: actorId, source: 'rule_apply',
+      ops: { action, folderId: fid, labelId: lid },
+      filter: { matchMode, conditions },
+      targetCount: rows.length, items: batchItems });
   });
   tx.immediate();
-  return { matched, completed, foldered, labeled };
+  return { matched, completed, foldered, labeled, batchId };
 }
 /** LIKE用エスケープ (小文字化込み。templates.js の likeEsc と同等) */
 const likeEscLocal = s => String(s).toLowerCase().replace(/[\\%_]/g, c => '\\' + c);

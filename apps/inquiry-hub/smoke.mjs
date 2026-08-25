@@ -214,7 +214,9 @@ check('検索: ヒットなし', listInquiries({ view: 'all', q: '存在しな�
       && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(b1).internal_status === 'done');
   }
 
-  // 後片付け
+  // 後片付け (バッチ記録は inquiries をFK参照するので先に消す。本番は物理削除しないためテストのみの都合)
+  db.prepare('DELETE FROM bulk_batch_items WHERE inquiry_id IN (?,?,?)').run(b1, b2, b3);
+  db.prepare('DELETE FROM bulk_batches WHERE id NOT IN (SELECT DISTINCT batch_id FROM bulk_batch_items)').run();
   db.prepare('DELETE FROM inquiry_activity_logs WHERE inquiry_id IN (?,?,?)').run(b1, b2, b3);
   db.prepare('DELETE FROM inquiries WHERE shop_id = ?').run(shopB);
   db.prepare('DELETE FROM shops WHERE id = ?').run(shopB);
