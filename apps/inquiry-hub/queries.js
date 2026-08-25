@@ -59,6 +59,13 @@ const LAST_INCOMING_SQL = `(SELECT m.is_incoming FROM inquiry_messages m
  * メッセージ本体から取る (Codexレビュー反映) */
 const LAST_MESSAGE_AT_SQL = `(SELECT COALESCE(m.received_at, m.sent_at, m.created_at) FROM inquiry_messages m
   WHERE m.inquiry_id = i.id ORDER BY COALESCE(m.received_at, m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1)`;
+/** 一覧の本文プレビュー用: 最後の「顧客からの」メッセージ本文 (2026-08-25)。
+ * 件名だけでは仕分けできない (「Re: お問い合わせ」等) ため、最新の顧客メッセージ冒頭を出す。
+ * 最初の1通ではなく最新にするのは、追い返信が来たときに「いま何を聞かれているか」を出すため。
+ * 整形 (引用・署名の除去、文字数制限) は表示側で行う (router.js previewOf) */
+const LAST_INCOMING_BODY_SQL = `(SELECT m.message_body_text FROM inquiry_messages m
+  WHERE m.inquiry_id = i.id AND m.is_incoming = 1
+  ORDER BY COALESCE(m.received_at, m.sent_at, m.created_at) DESC, m.id DESC LIMIT 1)`;
 
 export const VIEWS = {
   inbox: {
@@ -142,7 +149,8 @@ export function listInquiries(q = {}) {
     SELECT i.*, s.shop_name, f.name AS folder_name, l.name AS label_name, l.color AS label_color,
       (SELECT COUNT(*) FROM inquiry_messages m WHERE m.inquiry_id = i.id) AS msg_count,
       ${LAST_INCOMING_SQL} AS last_incoming,
-      ${LAST_MESSAGE_AT_SQL} AS last_message_at_actual
+      ${LAST_MESSAGE_AT_SQL} AS last_message_at_actual,
+      ${LAST_INCOMING_BODY_SQL} AS last_incoming_body
     FROM inquiries i JOIN shops s ON s.id = i.shop_id
     LEFT JOIN inquiry_folders f ON f.id = i.folder_id
     LEFT JOIN inquiry_labels l ON l.id = i.label_id

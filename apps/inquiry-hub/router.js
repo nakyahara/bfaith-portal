@@ -75,6 +75,24 @@ export function normalizeBodyText(text) {
 const badge = (meta, text) => meta ? `<span class="badge" style="${meta.badge}">${he(text != null ? text : meta.label)}</span>` : '';
 const chBadge = ch => badge(CHANNELS[ch], null) || he(ch);
 const stBadge = st => badge(STATUSES[st], null) || he(st);
+/**
+ * 一覧の本文プレビュー (2026-08-25)。件名だけでは仕分けできないため最新の顧客メッセージ冒頭を出す。
+ * 引用 (>、"On … wrote:"、「〜さんは書きました」)・区切り線以降・URL羅列を落として要点だけ残す。
+ * 表示は1行 (CSSで省略) なので改行は空白に畳む
+ */
+export function previewOf(text, max = 110) {
+  const cut = String(text || '')
+    // 引用ヘッダ以降は落とす (返信の下にぶら下がる過去のやり取り)
+    .split(/\n(?:[-–—_]{3,}|={3,}|\d{4}年\d{1,2}月\d{1,2}日.*?:|On .{0,60}wrote:|.{0,40}さんは書きました)/)[0];
+  const body = cut.split('\n')
+    .filter(l => !/^\s*[>|｜]/.test(l))          // 引用行
+    .join(' ')
+    .replace(/https?:\/\/\S+/g, '')             // URLは仕分けの役に立たない
+    .replace(/\s+/g, ' ')
+    .trim();
+  return body.length > max ? body.slice(0, max) + '…' : body;
+}
+
 /** 色付きラベルチップ (2026-08-24 メールディーラーのラベル相当)。color は labels.js が '#rrggbb' に検証済み */
 const labelChip = (name, color) => name
   ? `<span class="lbl" style="background:${he(color || '#64748b')};color:${labelTextColor(color)}">${he(name)}</span>` : '';
@@ -171,6 +189,41 @@ router.get('/', (req, res) => {
     }).join('')}
   </nav>`;
 
+  // ─── クイック入口 (2026-08-25): 「今日の新着」と「古い滞留」を同じ入口に置かない ───
+  // 6,400件の滞留の中から毎回新着を探すのは現実的でないため、よく使う出発点を1タップで出す。
+  // 既存の絞り込みパラメータ (from/to/attention/assigned) の組み合わせなので、押した後も
+  // 通常の絞り込みとして編集できる (専用の隠しモードを作らない)
+  const jstDate = (offsetDays = 0) => {
+    const j = new Date(Date.now() + 9 * 3600e3 + offsetDays * 86400e3);
+    return `${j.getUTCFullYear()}-${String(j.getUTCMonth() + 1).padStart(2, '0')}-${String(j.getUTCDate()).padStart(2, '0')}`;
+  };
+  const me = String(actorOf(req));
+  const quickEntries = [
+    { key: 'recent', icon: '🆕', label: '今日・昨日の新着', params: { view: 'inbox', from: jstDate(-1) },
+      title: '直近2日に届いた未対応。まずはここから' },
+    { key: 'attention', icon: '⚠️', label: '要確認', params: { view: 'inbox', attention: '1' },
+      title: '⚠️要確認を付けた未対応' },
+    { key: 'mine', icon: '🙋', label: '自分の対応中', params: { view: 'inbox', assigned: me },
+      title: `担当が ${me} の未対応` },
+    { key: 'unassigned', icon: '📭', label: '未割当', params: { view: 'inbox', assigned: 'none' },
+      title: '担当が決まっていない未対応' },
+    { key: 'backlog', icon: '🗄️', label: '14日以前の滞留', params: { view: 'inbox', to: jstDate(-14) },
+      title: '14日より前に届いた未対応 (滞留整理用。新着とは別の作業として扱う)' },
+  ];
+  const quickBar = `
+  <nav class="quick-bar" aria-label="よく使う絞り込み">
+    <span class="qb-label">よく使う:</span>
+    ${quickEntries.map(e => {
+      // 押した状態の判定は「その入口のパラメータが今の絞り込みに全部入っているか」
+      const on = Object.entries(e.params).every(([k, v]) => String(q[k] ?? (k === 'view' ? view : '')) === String(v));
+      const u = new URLSearchParams();
+      if (group) u.set('group', group);
+      if (q.folder) u.set('folder', String(q.folder));
+      for (const [k, v] of Object.entries(e.params)) u.set(k, v);
+      return `<a class="${on ? 'on' : ''}" href="/apps/inquiry-hub?${u.toString()}" title="${he(e.title)}">${e.icon} ${he(e.label)}</a>`;
+    }).join('')}
+  </nav>`;
+
   const opt = (v, label, cur) => `<option value="${he(v)}"${String(cur || '') === String(v) ? ' selected' : ''}>${he(label)}</option>`;
   // 絞り込み: PCは常時展開、スマホは折りたたみ (CSS details.fbox。絞り込み中は開いた状態で表示)
   // view/page はビュー切替・ページ送りであって「絞り込み条件」ではない (これを条件扱いすると
@@ -224,6 +277,7 @@ router.get('/', (req, res) => {
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
       <td class="subj" data-full><a href="/apps/inquiry-hub/inquiries/${r.id}${detailQs}">${he(r.subject || '(件名なし)')}</a>
+        ${(() => { const p = previewOf(r.last_incoming_body); return p ? `<div class="preview" title="${he(p)}">${he(p)}</div>` : ''; })()}
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
       <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
@@ -273,6 +327,7 @@ router.get('/', (req, res) => {
   ${chTabs}
   ${viewTabs}
   <div class="view-hint">${hintLine}</div>
+  ${quickBar}
   ${filterBar}
   ${bulkBar}
   <div class="card">
@@ -2882,6 +2937,16 @@ figure.att-img.att-err .att-fail { display: block; }
 .att-dl { margin-left: 6px; white-space: nowrap; }
 /* 一覧のフォルダ表示 */
 .folder-chip { background: #eef2ff; color: #3730a3; border-radius: 6px; padding: 1px 6px; }
+/* 一覧の本文プレビュー (最新の顧客メッセージ冒頭)。1行で切って一覧のスキャン速度を落とさない */
+.preview { color: #475569; font-size: 12.5px; margin-top: 2px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+/* クイック入口 (今日の新着 / 要確認 / 自分の対応中 / 未割当 / 滞留) */
+.quick-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.quick-bar .qb-label { color: #64748b; font-size: 12px; }
+.quick-bar a { padding: 5px 11px; border-radius: 999px; background: #fff; border: 1px solid #cbd5e1;
+  color: #334155; font-size: 13px; font-weight: 600; white-space: nowrap; }
+.quick-bar a:hover { background: #e2e8f0; text-decoration: none; }
+.quick-bar a.on { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
 .lbl { display: inline-block; border-radius: 6px; padding: 1px 8px; font-size: 12px; font-weight: 600; white-space: nowrap; vertical-align: 1px; }
 .swatches { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .swatch { width: 22px; height: 22px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); cursor: pointer; padding: 0; }
@@ -3042,6 +3107,12 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* モールリンクはタブの下に折り返す (右寄せをやめてタブを押しやすく保つ) */
   .mall-links { margin-left: 0; flex-basis: 100%; }
   .mall-links a { padding: 8px 10px; font-size: 12px; }
+  /* クイック入口: 横スクロール1行 (折り返して縦に伸びると一覧が押し出される) */
+  .quick-bar { flex-wrap: nowrap; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .quick-bar a { padding: 8px 12px; font-size: 13px; }
+  /* カード表示では本文プレビューを2行まで見せる (1行だと情報が足りない) */
+  table.cardable td.subj .preview { white-space: normal; display: -webkit-box;
+    -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .view-tabs a { padding: 6px 10px; font-size: 12px; }
   /* 一括操作: スマホは各コントロールを全幅に (誤タップ防止) */
   .bulkbar select, .bulkbar button { flex: 1 1 100%; }

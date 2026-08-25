@@ -522,6 +522,29 @@ console.log('HTTP: 全件一括');
   const bad2 = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: {} });
   check('変更内容なしは400', bad2.status === 400);
 
+  // クイック入口 + 本文プレビュー (2026-08-25 Codex議論の採用分)
+  const { previewOf } = routerModule;
+  check('previewOf: 引用行・URL・改行を落として1行に',
+    previewOf('商品が届きません\nhttps://example.com/track\n> 前回のメール\n引用の続き') === '商品が届きません 引用の続き',
+    JSON.stringify(previewOf('商品が届きません\nhttps://example.com/track\n> 前回のメール\n引用の続き')));
+  check('previewOf: 引用ヘッダ以降を落とす',
+    previewOf('返品したいです\n2026年8月20日(木) 18:20 雑貨イズム:\n> 元の本文') === '返品したいです');
+  check('previewOf: 長文は…で切る', previewOf('あ'.repeat(200)).endsWith('…'));
+  check('previewOf: 空・nullは空文字', previewOf(null) === '' && previewOf('') === '');
+
+  const inqPv = mkH('ba-preview', 'open');
+  db.prepare(`INSERT INTO inquiry_messages (inquiry_id, external_message_id, sender_type, message_body_text, is_incoming, received_at)
+    VALUES (?,?,'customer','届いた商品が不足しています。至急ご対応ください',1,?)`).run(inqPv, 'pv-1', T('2026-08-21T10:00:00+09:00'));
+  const htmlPv = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+  check('一覧に最新の顧客メッセージのプレビューが出る',
+    htmlPv.includes('class="preview"') && htmlPv.includes('届いた商品が不足しています'));
+  check('クイック入口5種が出る (新着/要確認/自分の対応中/未割当/滞留)',
+    htmlPv.includes('class="quick-bar"') && htmlPv.includes('今日・昨日の新着') && htmlPv.includes('要確認')
+    && htmlPv.includes('自分の対応中') && htmlPv.includes('未割当') && htmlPv.includes('14日以前の滞留'));
+  const htmlQb = await (await fetch(`${base}/?view=inbox&attention=1`)).text();
+  check('押した入口は選択状態 (on) になる', /class="on" href="[^"]*attention=1/.test(htmlQb));
+
+
   // 1クリック対応完了ボタン (2026-08-24 中原さん要望・メールディーラーの右上「対応完了」踏襲)
   const h4 = mkH('ba4', 'open'), h5 = mkH('ba5', 'done');
   const dOpen = await (await fetch(`${base}/inquiries/${h4}?view=inbox`)).text();
