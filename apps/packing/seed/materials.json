@@ -1,9 +1,10 @@
 {
-  "_comment": "梱包資材の本番 seed (中原さん提供 2026-08-24: 写真10点 + 無題のスプレッドシート.xlsx)。投入 = node apps/packing/tools/materials-seed.mjs --file apps/packing/seed/materials.json --images apps/packing/seed/materials。要件定義 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7 §6",
+  "_comment": "梱包資材の本番 seed (中原さん提供 2026-08-24: 写真10点 + 無題のスプレッドシート.xlsx / 2026-08-25 厚紙封筒 追加 = 写真 + 無題のスプレッドシート (1).xlsx)。投入 = node apps/packing/tools/materials-seed.mjs --file apps/packing/seed/materials.json --images apps/packing/seed/materials。要件定義 = AI_reference『梱包資材表示_要件定義_20260823.md』v1.7 §6",
   "materials": [
     { "code": "nekopos_box",       "name": "ネコポス段ボール",             "color": "#c9a227", "image_file": "nekopos_box.jpg",       "sort_order": 10 },
     { "code": "tate_kraft_env",    "name": "縦長茶封筒",                   "color": "#b08d57", "image_file": "tate_kraft_env.jpg",    "sort_order": 20 },
     { "code": "shiro_puchi_env",   "name": "白プチ封筒",                   "color": "#adb5bd", "image_file": "shiro_puchi_env.jpg",   "sort_order": 30 },
+    { "code": "atsugami_env",      "name": "厚紙封筒",                     "color": "#ced4da", "image_file": "atsugami_env.jpg",      "sort_order": 35 },
     { "code": "vinyl_s",           "name": "小サイズ白ビニール",           "color": "#74c0fc", "image_file": "vinyl_s.jpg",           "sort_order": 40 },
     { "code": "vinyl_m",           "name": "中サイズ白ビニール",           "color": "#4dabf7", "image_file": "vinyl_m.jpg",           "sort_order": 50 },
     { "code": "vinyl_l",           "name": "大サイズ白ビニール",           "color": "#1c7ed6", "image_file": "vinyl_l.jpg",           "sort_order": 60 },
@@ -37,13 +38,13 @@
   ],
   "class_materials": [
     { "class_value": "AES《単品》",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
     { "class_value": "AES《単品》【メール便以外】",
-      "codes": ["shiro_puchi_env", "vinyl_s", "vinyl_m", "vinyl_l", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
+      "codes": ["shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "vinyl_l", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
     { "class_value": "AES《1SKU複数個》",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "vinyl_l", "nekopos_box", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "vinyl_l", "nekopos_box", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
     { "class_value": "AES《複数SKU複数個》《単品、複数個を含む全て》",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "vinyl_l", "nekopos_box", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "vinyl_l", "nekopos_box", "yupacket_puff_box", "box50", "box60", "box80", "puchi_roll", "stretch_film", "box60_custom", "box80_custom", "other"] },
     { "class_value": "ゆうパケットパフ《単品、複数個を含む全て》",
       "codes": ["vinyl_s", "yupacket_puff_box"] },
     { "class_value": "50サイズ宅急便単品",
@@ -57,11 +58,11 @@
     { "class_value": "定形外手動《単品、複数個を含む全て》",
       "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s"] },
     { "class_value": "ネコポス手動単品",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
     { "class_value": "ネコポス手動1SKU複数個",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "nekopos_box"] },
     { "class_value": "ネコポス手動複数SKU複数個",
-      "codes": ["tate_kraft_env", "shiro_puchi_env", "vinyl_s", "vinyl_m", "nekopos_box"] }
+      "codes": ["tate_kraft_env", "shiro_puchi_env", "atsugami_env", "vinyl_s", "vinyl_m", "nekopos_box"] }
   ],
   "header_map": [
     { "header_value": "ヤマト(ネコポス)",           "base_delivery_code": "nekopos" },

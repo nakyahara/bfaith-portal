@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -381,6 +381,12 @@ const MIGRATIONS = {
       PRIMARY KEY (batch_id, slip_seq)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_pack_material_views_src ON pk_pack_material_views(source, last_shown_at)');
+  },
+  // v11: ライン工程の一時中断 (2026-08-25 現場意見: 「終了」を中断のつもりで押して作業終了扱いになった)。
+  //   中断そのものはバッチ単位 (pause/resume・status='paused') を流用し、工程行にも中断秒を持たせて
+  //   工程の所要時間 (started→finished) から差し引けるようにする
+  11: () => {
+    db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN paused_total_sec INTEGER NOT NULL DEFAULT 0');
   },
 };
 

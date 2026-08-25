@@ -327,6 +327,7 @@ router.get('/line/:id(\\d+)', (req, res) => {
   const kind = lineKindOf(hikiateClass);
   if (!kind) return res.redirect(`/apps/packing/work/${batch.id}`);   // 手梱包は従来画面へ
   res.render(path.join(__dirname, 'views/line'), {
+    pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 一時中断の理由 (自動中断専用は出さない)
     title: `ライン | ${batch.folder_name || batch.tb_key}`,
     displayName: req.session?.displayName,
     workers: listWorkers(),
