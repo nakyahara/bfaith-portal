@@ -501,6 +501,18 @@ console.log('HTTP: 全件一括');
   check('一覧に「この条件の全N件を選択」ボタンとFILTERが載る', html.includes('id="bulkAll"')
     && html.includes('この条件の全') && html.includes('bulk-by-filter'));
 
+  // 上部の外部リンクバー (2026-08-25 中原さん要望)。🔗リンク管理で登録した分が自動で並ぶ
+  // (登録・検証・削除の詳細は smoke-links.mjs)
+  const { createQuickLink, deleteQuickLink } = await import('./links.js');
+  const qk = createQuickLink({ name: '一覧バー確認', url: 'https://example.com/quick-bar', icon: '🧪' }, 'tester');
+  const html2 = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+  check('登録したリンクが一覧上部に自動で出る',
+    html2.includes('class="mall-links"') && html2.includes('https://example.com/quick-bar')
+    && html2.includes('一覧バー確認') && html2.includes('target="_blank"'));
+  deleteQuickLink(qk.id);
+  const html3 = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+  check('削除したリンクは上部から消える', !html3.includes('https://example.com/quick-bar'));
+
   const dry = await jp('/api/inquiries/bulk-by-filter', { filter: { view: 'inbox', shop: String(shopH) }, ops: { status: 'done' }, dryRun: true });
   check('dryRun: 件数だけ返し状態は変えない', dry.status === 200 && dry.j.matched === 2
     && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(h1).internal_status === 'open');

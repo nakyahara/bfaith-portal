@@ -454,6 +454,45 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_messages_inquiry ON inquiry_messages(inquiry_id, received_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox_replies(status, lease_until)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status)');
+
+  // クイックリンク (2026-08-25 中原さん要望「リンク先はこっちで登録して自動で設定できるように」)。
+  // 一覧上部に出す外部サイトへの導線 (楽天R-Messe・Yahoo!ストアクリエイターPro・Gmail 等) を
+  // コードに直書きせず画面から登録・編集する。URLの検証は links.js (http/https のみ)
+  const linksExisted = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inquiry_quick_links'").get();
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_quick_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    icon TEXT,                      -- 絵文字1〜2字 (links.js が検証)
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),  -- 削除は論理削除のみ
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  // 初回作成時だけ、登録済み店舗に合わせた既定リンクを入れておく (すぐ使える状態にする)。
+  // 以後は画面での編集が正 — 全部消しても復活しない (2回目以降は何もしない)
+  if (!linksExisted) seedDefaultQuickLinks();
+}
+
+/** 既定のクイックリンク投入 (テーブル新規作成時のみ)。店舗が登録されているチャネルの分だけ入れる */
+function seedDefaultQuickLinks() {
+  const shops = db.prepare('SELECT channel_type, account_identifier FROM shops WHERE is_active = 1').all();
+  const rows = [];
+  if (shops.some(s => s.channel_type === 'rakuten')) {
+    rows.push({ name: '楽天 R-Messe', url: 'https://rmesse.rms.rakuten.co.jp/', icon: '🛍️' });
+  }
+  for (const s of shops.filter(s => s.channel_type === 'yahoo')) {
+    const acct = String(s.account_identifier || '').trim();
+    rows.push({ name: 'Yahoo! ストアクリエイターPro', icon: '🟡',
+      url: acct ? `https://pro.store.yahoo.co.jp/pro.${encodeURIComponent(acct)}` : 'https://pro.store.yahoo.co.jp/' });
+  }
+  if (shops.some(s => s.channel_type === 'email')) {
+    rows.push({ name: 'Gmail', url: 'https://mail.google.com/', icon: '📧' });
+  }
+  const ins = db.prepare('INSERT INTO inquiry_quick_links (name, url, icon, sort_order, created_by) VALUES (?,?,?,?,?)');
+  rows.forEach((r, i) => ins.run(r.name, r.url, r.icon, (i + 1) * 10, 'system:default'));
+  if (rows.length) console.log(`[inquiry-hub] クイックリンクの既定 ${rows.length}件を投入しました (🔗リンク管理で編集できます)`);
 }
 
 /** 操作ログ記録 (設計書§6 inquiry_activity_logs。本文全量・秘密情報は入れない) */

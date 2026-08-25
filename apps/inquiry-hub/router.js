@@ -31,6 +31,8 @@ import { listFolders, countUnfiled, createFolder, updateFolder, deleteFolder, se
   FOLDER_NAME_MAX } from './folders.js';
 import { listLabels, createLabel, updateLabel, deleteLabel, setInquiryLabel,
   labelTextColor, LABEL_NAME_MAX, LABEL_PALETTE } from './labels.js';
+import { listQuickLinks, createQuickLink, updateQuickLink, deleteQuickLink,
+  LINK_NAME_MAX, LINK_URL_MAX, MAX_ACTIVE_LINKS } from './links.js';
 import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
 import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
@@ -134,11 +136,21 @@ router.get('/', (req, res) => {
     return `/apps/inquiry-hub${qs ? `?${qs}` : ''}`;
   };
   const tabCnt = (n) => `<span class="tab-cnt${n ? '' : ' zero'}" title="新着 (受信トレイ) の件数">新着${n || 0}</span>`;
+  // ─── モール等への外部リンク (2026-08-25 中原さん要望。🔗リンク管理で登録した分を自動で出す) ───
+  // このアプリで完結しない操作 (モール独自機能・同期を待たず直接見る) の逃げ道。
+  // 楽天R-Messe / Yahoo!ストアクリエイターPro / Gmail は初回に既定として入る (db.js)。
+  // 以後の追加・変更は画面から (コードに直書きしない)
+  const quickLinks = listQuickLinks();
+  const mallLinks = quickLinks.length
+    ? `<span class="mall-links">${quickLinks.map(l =>
+      `<a href="${he(l.url)}" target="_blank" rel="noopener" title="${he(l.name)} を新しいタブで開きます (${he(l.url)})">${he(l.icon || '🔗')} ${he(l.name)} ↗</a>`).join('')}</span>`
+    : '';
   const chTabs = `
   <nav class="ch-tabs">
     <a class="${group === '' ? 'on' : ''}" href="${he(tabLink(''))}">🗂️ すべて ${tabCnt(inboxCounts.all)}</a>
     ${Object.entries(CHANNEL_GROUPS).map(([key, g]) =>
       `<a class="${group === key ? 'on' : ''}" href="${he(tabLink(key))}">${g.icon} ${he(g.label)} ${tabCnt(inboxCounts[key])}</a>`).join('')}
+    ${mallLinks}
   </nav>`;
 
   // ─── 状態タブ (2026-08-17 スタッフ要望: モール問い合わせの中でも 新着/返信処理中/完了 を切替) ───
@@ -2378,6 +2390,117 @@ router.post('/api/labels/:id(\\d+)/delete', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// 🔗 リンクの設定 (2026-08-25 中原さん要望「リンク先はこっちで登録して自動で設定できるように」)
+//    一覧上部に出す外部サイトへの導線。登録した分がそのまま上部バーに並ぶ
+// ═══════════════════════════════════════════════════════════════
+
+router.get('/links', (req, res) => {
+  const links = listQuickLinks({ includeInactive: false });
+  const rows = links.map(l => `
+    <tr>
+      <td data-label="表示" data-full><a href="${he(l.url)}" target="_blank" rel="noopener">${he(l.icon || '🔗')} ${he(l.name)} ↗</a></td>
+      <td data-label="アイコン"><input type="text" class="k-icon" data-id="${l.id}" value="${he(l.icon || '')}" placeholder="🔗" style="width:60px;text-align:center"></td>
+      <td data-label="リンク名"><input type="text" class="k-name" data-id="${l.id}" value="${he(l.name)}" maxlength="${LINK_NAME_MAX}"></td>
+      <td data-full data-label="URL"><input type="text" class="k-url" data-id="${l.id}" value="${he(l.url)}" maxlength="${LINK_URL_MAX}" style="width:100%"></td>
+      <td data-label="表示順"><input type="number" class="k-order" data-id="${l.id}" value="${l.sort_order}" style="width:80px"></td>
+      <td class="ops">
+        <button class="pri k-save" data-id="${l.id}">保存</button>
+        <button class="k-del" data-id="${l.id}" data-name="${he(l.name)}">削除</button>
+      </td>
+    </tr>`).join('');
+
+  const body = `
+  <div class="view-hint">🔗 <b>リンク</b> — ここで登録したリンクが<b>一覧画面の上部にそのまま並びます</b>。
+    楽天R-Messe・Yahoo!ストアクリエイターPro・Gmail は初回に登録済み (自由に変更・削除できます)。
+    ネクストエンジンやロジザードなど、よく開くページを追加してください。</div>
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">➕ リンクを追加 <span class="sub">(${links.length}/${MAX_ACTIVE_LINKS}件)</span></div>
+    <div style="padding:12px 14px">
+      <div class="filters">
+        <input type="text" id="newIcon" placeholder="🔗" maxlength="8" style="width:70px;text-align:center" title="アイコン (絵文字1〜2字)">
+        <input type="text" id="newName" placeholder="リンク名 (例: ネクストエンジン)" maxlength="${LINK_NAME_MAX}" style="min-width:220px">
+        <input type="text" id="newUrl" placeholder="https://…" maxlength="${LINK_URL_MAX}" style="min-width:320px;flex:1">
+        <button class="pri" id="createBtn">➕ 追加</button>
+      </div>
+      <div class="sub">URLは https:// から始まるものを貼り付けてください (http/https以外は登録できません)</div>
+    </div>
+  </div>
+  <div class="card">
+    <table class="cardable">
+      <thead><tr><th>表示</th><th>アイコン</th><th>リンク名</th><th>URL</th><th>表示順</th><th>操作</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="empty">リンクはまだありません。上の欄から追加してください</td></tr>`}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/links' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.getElementById('createBtn').addEventListener('click', function() {
+    var name = document.getElementById('newName').value.trim();
+    var url = document.getElementById('newUrl').value.trim();
+    if (!name) { toast('リンク名を入力してください'); return; }
+    if (!url) { toast('URLを入力してください'); return; }
+    var btn = this; btn.disabled = true;
+    api('', { name: name, url: url, icon: document.getElementById('newIcon').value })
+      .then(function() { location.reload(); })
+      .catch(function(e) { toast('追加失敗: ' + e.message); btn.disabled = false; });
+  });
+  ['newName', 'newUrl'].forEach(function(id) {
+    document.getElementById(id).addEventListener('keydown', function(ev) {
+      if (ev.key === 'Enter') document.getElementById('createBtn').click();
+    });
+  });
+  document.querySelectorAll('.k-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var id = b.dataset.id;
+      var v = function(cls) { return document.querySelector('.' + cls + '[data-id="' + id + '"]').value; };
+      b.disabled = true;
+      api('/' + id, { name: v('k-name').trim(), url: v('k-url').trim(), icon: v('k-icon'), sortOrder: Number(v('k-order')) })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('保存失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.k-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm('リンク「' + b.dataset.name + '」を削除しますか?\\n\\n上部バーから消えます (リンク先のサイトには影響しません)。')) return;
+      b.disabled = true;
+      api('/' + b.dataset.id + '/delete', {}).then(function() {
+        toast('削除しました');
+        setTimeout(function(){ location.reload(); }, 600);
+      }).catch(function(e) { toast('削除失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — リンク', 'links', body, script));
+});
+
+router.post('/api/links', (req, res) => {
+  try {
+    const b = req.body || {};
+    const l = createQuickLink({ name: b.name, url: b.url, icon: b.icon }, actorOf(req));
+    console.log(`[inquiry-hub] リンク追加「${l.name}」 ${l.url} by ${actorOf(req)}`);
+    res.json({ ok: true, ...l });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/links/:id(\\d+)', (req, res) => {
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, ...updateQuickLink(Number(req.params.id), { name: b.name, url: b.url, icon: b.icon, sortOrder: b.sortOrder }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/links/:id(\\d+)/delete', (req, res) => {
+  try {
+    const r = deleteQuickLink(Number(req.params.id));
+    console.log(`[inquiry-hub] リンク削除「${r.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // 📎 添付ファイルの配信 (2026-08-02 スタッフ要望「添付された写真や画像を確認したい」)
 //    実体はDBに持たず、都度チャネル (Gmail/楽天/Yahoo!) から取って返す (attachments.js)
 // ═══════════════════════════════════════════════════════════════
@@ -2700,6 +2823,11 @@ button:disabled { opacity: .5; cursor: default; }
 .ch-tabs a:hover { background: #e2e8f0; text-decoration: none; }
 .ch-tabs a.on { background: #fff; color: #1d4ed8; border-color: #cbd5e1;
   position: relative; top: 2px; padding-bottom: 11px; }
+/* モール管理画面への外部リンク (タブ行の右端。タブと見分けがつくよう控えめな見た目) */
+.mall-links { margin-left: auto; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.mall-links a { padding: 6px 10px; border-radius: 8px; color: #475569; font-weight: 600; font-size: 13px;
+  background: #e2e8f0; white-space: nowrap; }
+.mall-links a:hover { background: #cbd5e1; text-decoration: none; }
 .tab-cnt { display: inline-block; background: #fee2e2; color: #b91c1c; border-radius: 999px;
   padding: 1px 8px; font-size: 12px; margin-left: 2px; vertical-align: 1px; }
 .tab-cnt.zero { background: #f1f5f9; color: #94a3b8; }
@@ -2911,6 +3039,9 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
   /* 上部タブ: スマホでは詰めて全タブが1〜2行に収まるように */
   .ch-tabs { gap: 4px; }
   .ch-tabs a { padding: 8px 10px; font-size: 13px; }
+  /* モールリンクはタブの下に折り返す (右寄せをやめてタブを押しやすく保つ) */
+  .mall-links { margin-left: 0; flex-basis: 100%; }
+  .mall-links a { padding: 8px 10px; font-size: 12px; }
   .view-tabs a { padding: 6px 10px; font-size: 12px; }
   /* 一括操作: スマホは各コントロールを全幅に (誤タップ防止) */
   .bulkbar select, .bulkbar button { flex: 1 1 100%; }
@@ -2938,7 +3069,7 @@ details.fbox > summary { display: none; }   /* PCでは常に展開 (open属性�
 
 /**
  * ページ共通シェル (Gmail風の左サイドバー)。
- * active: 'inbox'|'sent'|'done'|'all'|'folder:<id>'|'folders'|'templates'|'qa'|'mailrules'|'admin'
+ * active: 'inbox'|'sent'|'done'|'all'|'folder:<id>'|'folders'|'labels'|'links'|'templates'|'qa'|'mailrules'|'admin'
  * PCではサイドバー常時表示、スマホでは ☰ で開くドロワー
  */
 function pageShell(title, active, body, script, opts = {}) {
@@ -2973,6 +3104,7 @@ function pageShell(title, active, body, script, opts = {}) {
       ${folderItems}
       ${navItem('/apps/inquiry-hub/folders', '⚙️', 'フォルダを作る・編集', 'folders', 0)}
       ${navItem('/apps/inquiry-hub/labels', '🏷️', 'ラベルを作る・編集', 'labels', 0)}
+      ${navItem('/apps/inquiry-hub/links', '🔗', 'リンクを作る・編集', 'links', 0)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">
