@@ -486,6 +486,16 @@ check('import rejects over MAX_IMPORT_CODES', !!overErr);
   const prev2 = await imp.importByNotionStatus({ actor: 'smoke', ...di });
   check('一括移植: 再プレビューは already_exists になり二重取り込みしない',
     prev2.summary.would_import === 0 && prev2.summary.already_exists === 2, JSON.stringify(prev2.summary));
+  // R2対応: 対象の中身 (値) が変わっても古いスナップショットは止まる (コード+IDだけの照合では素通りする)
+  const valPages = [mkPage('MIG-VAL-1', '①ページ作成中')];
+  const diVal = { ...di, query: async () => ({ pages: valPages }) };
+  const valPrev = await imp.importByNotionStatus({ actor: 'smoke', ...diVal });
+  valPages[0].properties['売価'].number = 2980;   // プレビュー後に価格が変わった
+  let valErr = null;
+  try { await imp.importByNotionStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: valPrev.snapshot, ...diVal }); } catch (e) { valErr = e; }
+  check('一括移植: プレビュー後に値が変わった商品も実行を止める (保存内容全体のハッシュ照合)',
+    valErr?.code === 'snapshot_mismatch'
+    && !db.prepare(`SELECT 1 FROM product_drafts WHERE ne_code = 'MIG-VAL-1'`).get());
   // 1回の実行上限: 超えた分は deferred で報告し、再プレビュー→実行で続きから入る
   const capPages = [mkPage('MIG-CAP-1', '①ページ作成中'), mkPage('MIG-CAP-2', '③画像待ち')];
   const diCap = { ...di, query: async () => ({ pages: capPages }) };

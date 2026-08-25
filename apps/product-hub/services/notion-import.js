@@ -317,11 +317,13 @@ export async function importByNotionStatus({
     toImport.push({ rec, result });
   }
 
-  // プレビューと実行を同じ対象集合に固定する (Codex R1 high): 対象 (商品コード+NotionページID) の
-  // ハッシュを返し、実行時に一致しなければ書き込まず再プレビューを要求する。
-  // プレビュー後に Status が変わった・カードが増えた商品を、見ていないまま取り込ませない
+  // プレビューと実行を同じ対象集合に固定する (Codex R1 high): 対象の**保存内容全体**
+  // (buildImportRecord の結果 = 商品名・売価・JAN・URL・Status・Yahoo欄・AI出力まで) のハッシュを返し、
+  // 実行時に一致しなければ書き込まず再プレビューを要求する。コード+ページIDだけだと、
+  // プレビュー後に値が書き換わった商品を見ていないまま保存してしまう (Codex R2 high)。
+  // rec はオブジェクトリテラル構築でキー順が固定なので JSON.stringify は決定的
   const snapshot = crypto.createHash('sha256')
-    .update(toImport.map(({ rec }) => `${rec.ne_code}|${rec.notion_page_id}`).sort().join('\n'))
+    .update(toImport.map(({ rec }) => JSON.stringify(rec)).sort().join('\n'))
     .digest('hex').slice(0, 32);
 
   if (!dryRun) {
