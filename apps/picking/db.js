@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -210,6 +210,17 @@ const MIGRATIONS = {
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_pk_location_faces_col ON pk_location_faces(block, col)');
   },
+  // v9: バリエーション (楽天SKU) ごとの画像 (2026-08-25 中原さん指摘: 白抜きは商品共通なので
+  // 「香りNo.4」の行に「No.8」の写真が出る)。variants[SKU].images[0] を第一候補にする。
+  // 既存キャッシュのうち SKU粒度のコード (ne_code ≠ 商品管理番号) は取り直し対象にする
+  9: () => {
+    const cols = db.prepare('PRAGMA table_info(pk_product_images)').all().map((c) => c.name);
+    if (!cols.includes('variant_image_url')) {
+      db.exec('ALTER TABLE pk_product_images ADD COLUMN variant_image_url TEXT');
+    }
+    db.exec(`UPDATE pk_product_images SET fetched_at = '2000-01-01T00:00:00Z'
+      WHERE status = 'ok' AND manage_number IS NOT NULL AND lower(ne_code) <> lower(manage_number)`);
+  },
 };
 
 function createCoreTables() {
@@ -309,8 +320,9 @@ function createCoreTables() {
   db.exec(`CREATE TABLE IF NOT EXISTS pk_product_images (
     ne_code       TEXT PRIMARY KEY,
     manage_number TEXT,               -- 解決した楽天商品管理番号
-    white_bg_url  TEXT,               -- 白抜き画像 (第一候補)
+    white_bg_url  TEXT,               -- 白抜き画像 (商品共通・第二候補)
     top_image_url TEXT,               -- images[0] (フォールバック)
+    variant_image_url TEXT,           -- バリエーション画像 variants[SKU].images[0] (第一候補・v9)
     status        TEXT NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','not_found','error')),
     fetched_at    TEXT NOT NULL
   )`);

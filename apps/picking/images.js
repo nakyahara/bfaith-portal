@@ -1,8 +1,11 @@
 /**
  * 楽天白抜き商品画像の解決とキャッシュ (ピッキング画面用)。
  *
- * 方針 (実装計画§4・中原さん決定 2026-08-11): 商品画像は楽天RMSの白抜き画像
- * (whiteBgImage・検索サムネ用の別枠) を第一候補、無ければ1枚目 (images[0]) を使う。
+ * 方針 (実装計画§4・中原さん決定 2026-08-11 → 2026-08-25 改訂): 商品画像は
+ *   ① バリエーション画像 variants[SKU].images[0] (そのSKU自身の写真。香り違い・色違いで別写真)
+ *   ② 楽天RMSの白抜き画像 (whiteBgImage・商品共通。バリエーションがある商品ではどれか1つの写真)
+ *   ③ 1枚目 (images[0])
+ * の順。②を全SKUに使うと「No.4 の行に No.8 の写真」が出て取り違えの原因になる (2026-08-25 現場指摘)。
  *
  * 解決チェーン (すべて既存部品の流用):
  *   ne_code (CSVの商品ID)
@@ -70,11 +73,25 @@ export function resolveManageNumber(itemNumbers, rakutenCode) {
   return null;
 }
 
-/** RMS item payload から白抜き/1枚目のURLを取り出す。 */
-export function extractImageUrls(item) {
+/**
+ * RMS item payload からバリエーション/白抜き/1枚目のURLを取り出す。
+ * @param codes このSKUを指し得るコード群 (楽天SKUコード・ne_code)。variants のキー (variantId) または
+ *              merchantDefinedSkuId と大文字小文字を無視して一致したものをそのSKUの画像とする
+ */
+export function extractImageUrls(item, codes = []) {
   const white = normalizeImageUrl(item?.whiteBgImage?.location);
   const top = normalizeImageUrl(Array.isArray(item?.images) ? item.images[0]?.location : null);
-  return { whiteBgUrl: white, topUrl: top };
+  let variant = null;
+  const variants = item?.variants;
+  if (variants && typeof variants === 'object') {
+    const wanted = new Set((Array.isArray(codes) ? codes : [codes]).map(norm).filter(Boolean));
+    for (const [vid, v] of Object.entries(variants)) {
+      if (!wanted.has(norm(vid)) && !wanted.has(norm(v?.merchantDefinedSkuId))) continue;
+      variant = normalizeImageUrl(Array.isArray(v?.images) ? v.images[0]?.location : null);
+      if (variant) break;
+    }
+  }
+  return { variantUrl: variant, whiteBgUrl: white, topUrl: top };
 }
 
 /**
@@ -141,12 +158,12 @@ export function getImageMap(skus) {
   if (keys.length === 0) return new Map();
   const db = getDB();
   const rows = db.prepare(
-    `SELECT ne_code, white_bg_url, top_image_url, status FROM pk_product_images
+    `SELECT ne_code, variant_image_url, white_bg_url, top_image_url, status FROM pk_product_images
      WHERE ne_code IN (${keys.map(() => '?').join(',')})`
   ).all(...keys);
   const map = new Map();
   for (const r of rows) {
-    map.set(r.ne_code, { url: r.white_bg_url || r.top_image_url || null, status: r.status });
+    map.set(r.ne_code, { url: r.variant_image_url || r.white_bg_url || r.top_image_url || null, status: r.status });
   }
   return map;
 }
@@ -179,11 +196,13 @@ export async function ensureImagesFor(skus, deps = {}) {
 
   const { rakutenByNe, itemNumbers } = (deps.loadMaps || loadMirrorMaps)();
   const mnBySku = new Map();
+  const codesBySku = new Map();   // バリエーション照合用: このSKUを指し得るコード群
   for (const sku of need) {
     // 変換テーブルの楽天SKUコードを優先、無ければ ne_code 自体を候補にする
     // (product-hub 出品分は manageNumber = ne_code 小文字)
     const rakutenCode = rakutenByNe.get(sku) || sku;
     mnBySku.set(sku, resolveManageNumber(itemNumbers, rakutenCode));
+    codesBySku.set(sku, [rakutenCode, sku]);
   }
 
   const manageNumbers = [...new Set([...mnBySku.values()].filter(Boolean))];
@@ -203,8 +222,8 @@ export async function ensureImagesFor(skus, deps = {}) {
   const chunkFailedSkus = new Set();
   const fetchDetails = deps.fetchDetails || fetchItemDetailsBulkDetailed;
   const upsertErr = db.prepare(`
-    INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, status, fetched_at)
-    VALUES (?, ?, NULL, NULL, 'error', ?)
+    INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
+    VALUES (?, ?, NULL, NULL, NULL, 'error', ?)
     ON CONFLICT(ne_code) DO UPDATE SET manage_number = excluded.manage_number,
       status='error', fetched_at=excluded.fetched_at
   `);
@@ -239,10 +258,11 @@ export async function ensureImagesFor(skus, deps = {}) {
   }
 
   const upsert = db.prepare(`
-    INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, status, fetched_at)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO pk_product_images (ne_code, manage_number, white_bg_url, top_image_url, variant_image_url, status, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(ne_code) DO UPDATE SET manage_number = excluded.manage_number,
       white_bg_url = excluded.white_bg_url, top_image_url = excluded.top_image_url,
+      variant_image_url = excluded.variant_image_url,
       status = excluded.status, fetched_at = excluded.fetched_at
   `);
   // fetched_at は取得後の「今」(リトライ待機で処理開始から数分経ち得るため now を使い回さない)
@@ -250,19 +270,20 @@ export async function ensureImagesFor(skus, deps = {}) {
   for (const sku of need) {
     if (chunkFailedSkus.has(sku)) continue;   // チャンク失敗として記録済み
     const mn = mnBySku.get(sku);
-    if (!mn) { upsert.run(sku, null, null, null, 'not_found', stamp); stats.notFound++; continue; }
+    if (!mn) { upsert.run(sku, null, null, null, null, 'not_found', stamp); stats.notFound++; continue; }
     const item = itemByMn.get(norm(mn));
     if (!item) {
       // items にも failed にも無い欠落応答は「不存在」と断定できないため error 扱い
       // (30分後再試行。not_found で恒久抑止すると部分応答・プロキシ不具合で永久に画像なしになる)
-      upsert.run(sku, mn, null, null, 'error', stamp);
+      upsert.run(sku, mn, null, null, null, 'error', stamp);
       stats.errors++;
       continue;
     }
-    const { whiteBgUrl, topUrl } = extractImageUrls(item);
-    if (!whiteBgUrl && !topUrl) { upsert.run(sku, mn, null, null, 'not_found', stamp); stats.notFound++; continue; }
-    upsert.run(sku, mn, whiteBgUrl, topUrl, 'ok', stamp);
+    const { variantUrl, whiteBgUrl, topUrl } = extractImageUrls(item, codesBySku.get(sku) || [sku]);
+    if (!variantUrl && !whiteBgUrl && !topUrl) { upsert.run(sku, mn, null, null, null, 'not_found', stamp); stats.notFound++; continue; }
+    upsert.run(sku, mn, whiteBgUrl, topUrl, variantUrl, 'ok', stamp);
     stats.ok++;
+    if (variantUrl) stats.variant = (stats.variant || 0) + 1;
   }
   return stats;
 }
@@ -282,7 +303,7 @@ export function queueEnsureImages(skus, label = '', deps = undefined) {
     .then(() => ensureImagesFor(skus, deps))
     .then((stats) => {
       if (stats.fetched > 0) {
-        console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: 白抜き/1枚目=${stats.ok} なし=${stats.notFound} 失敗=${stats.errors}`);
+        console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: ok=${stats.ok} (うちバリエーション画像=${stats.variant || 0}) なし=${stats.notFound} 失敗=${stats.errors}`);
       }
     })
     .catch((e) => console.warn(`[picking-images] ${label} 画像解決失敗 (作業は継続可能): ${e.message}`))
