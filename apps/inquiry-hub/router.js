@@ -33,6 +33,7 @@ import { listLabels, createLabel, updateLabel, deleteLabel, setInquiryLabel,
   labelTextColor, LABEL_NAME_MAX, LABEL_PALETTE } from './labels.js';
 import { listQuickLinks, createQuickLink, updateQuickLink, deleteQuickLink,
   LINK_NAME_MAX, LINK_URL_MAX, MAX_ACTIVE_LINKS } from './links.js';
+import { listBulkBatches, revertBulkBatch, BATCH_SOURCE_LABELS } from './batches.js';
 import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
 import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
@@ -100,7 +101,7 @@ const labelChip = (name, color) => name
 // ─── 対応履歴の表示整形 (生JSONではなく日本語ラベルで出す) ───
 const ACTION_LABELS = {
   status_change: '状態変更', assign: '担当変更', note_add: 'メモ追加', read_toggle: '既読/未読',
-  folder_change: 'フォルダ変更', label_change: 'ラベル変更',
+  folder_change: 'フォルダ変更', label_change: 'ラベル変更', bulk_revert: '一括操作の取り消し',
   attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
   reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
 };
@@ -422,8 +423,9 @@ router.get('/', (req, res) => {
             if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
       }
       function done(j) {
-        toast(j.updated + '件を変更しました' + (j.skipped ? ' (' + j.skipped + '件は変更なし)' : ''));
-        setTimeout(function(){ location.reload(); }, 800);
+        toast(j.updated + '件を変更しました' + (j.skipped ? ' (' + j.skipped + '件は変更なし)' : '')
+          + (j.batchId ? '。間違えたら⚙️運用管理から取り消せます' : ''));
+        setTimeout(function(){ location.reload(); }, j.batchId ? 1200 : 800);
       }
       function fail(e) { toast('失敗: ' + e.message); applyBtn.disabled = false; }
       if (allMode) {
@@ -1261,7 +1263,7 @@ router.get('/api/templates', (req, res) => {
 router.post('/api/inquiries/bulk', (req, res) => {
   const b = req.body || {};
   try {
-    const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req) });
+    const r = bulkUpdateInquiries(b.ids, b.ops || {}, { actorId: actorOf(req), source: 'bulk' });
     console.log(`[inquiry-hub] 一括操作 ${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
     res.json({ ok: true, ...r });
   } catch (e) {
@@ -1284,7 +1286,8 @@ router.post('/api/inquiries/bulk-by-filter', (req, res) => {
   try {
     const ids = listInquiryIdsByFilter(filter);
     if (b.dryRun === true) return res.json({ ok: true, matched: ids.length });
-    const r = bulkUpdateInquiries(ids, b.ops || {}, { actorId: actorOf(req), maxItems: FILTER_BULK_MAX });
+    const r = bulkUpdateInquiries(ids, b.ops || {}, { actorId: actorOf(req), maxItems: FILTER_BULK_MAX,
+      source: 'bulk_filter', filter });
     console.log(`[inquiry-hub] 全件一括操作 filter=${JSON.stringify(filter)} ops=${JSON.stringify(b.ops)} by ${actorOf(req)} — ${r.updated}件変更 / ${r.skipped}件変更なし`);
     res.json({ ok: true, ...r });
   } catch (e) {
@@ -2699,8 +2702,44 @@ router.get('/admin', (req, res) => {
       : '<div class="empty">まだAIバッチが実行されていません (ai-draft-runner.mjs を定時実行すると履歴が出ます)</div>'}
   </div>`;
 
+  // 一括操作の履歴 (2026-08-25 安全装置: バッチ単位の取り消し)
+  const bulkBatches = listBulkBatches({ limit: 20 });
+  const folderNames = Object.fromEntries(listFolders({ includeInactive: true }).map(f => [f.id, f.name]));
+  const labelNames = Object.fromEntries(listLabels({ includeInactive: true }).map(l => [l.id, l.name]));
+  const batchOpsSummary = (b) => {
+    let o = {};
+    try { o = JSON.parse(b.ops_json) || {}; } catch { /* 表示用なので握りつぶす */ }
+    const parts = [];
+    if (o.status) parts.push(`状態→${(STATUSES[o.status] || {}).label || o.status}`);
+    if (o.action === 'skip' || o.action === 'import_done') parts.push('完了扱い');
+    if (o.folderId !== undefined && o.folderId !== null) parts.push(`📁${folderNames[o.folderId] || `#${o.folderId}`}へ`);
+    else if (o.folderId === null && 'folderId' in o && !o.action) parts.push('フォルダ解除');
+    if (o.labelId !== undefined && o.labelId !== null) parts.push(`🏷️${labelNames[o.labelId] || `#${o.labelId}`}`);
+    else if (o.labelId === null && 'labelId' in o && !o.action) parts.push('ラベル解除');
+    if (o.assigned !== undefined && o.assigned !== null) parts.push(`担当→${o.assigned || '未割当'}`);
+    if (typeof o.isUnread === 'boolean') parts.push(o.isUnread ? '未読にする' : '既読にする');
+    return parts.join(' / ') || '—';
+  };
+  const batchTrs = bulkBatches.map(b => `
+    <tr${b.reverted_at ? ' style="opacity:.55"' : ''}>
+      <td class="nowrap" data-label="実行">${fmtJst(b.created_at)}<div class="sub">#${b.id} ${he(b.actor || '—')}</div></td>
+      <td data-label="種別"><span class="badge" style="background:#f1f5f9;color:#475569">${he(BATCH_SOURCE_LABELS[b.source] || b.source)}</span></td>
+      <td data-full data-label="内容">${he(batchOpsSummary(b))}</td>
+      <td class="nowrap" data-label="件数">${b.changed_count}件変更<div class="sub">対象${b.target_count}件</div></td>
+      <td class="nowrap ops">${b.reverted_at
+        ? `<span class="sub">↩️取り消し済み (${fmtJst(b.reverted_at)})</span>`
+        : `<button onclick="revertBatch(${b.id}, ${b.changed_count}, this)">↩️ このバッチを取り消す</button>`}</td>
+    </tr>`).join('');
+  const batchCard = `
+  <div class="card" style="margin-bottom:16px">
+    <div class="card-title">🧺 一括操作の履歴 <span class="sub">(直近20件。誤った一括変更はバッチ単位で取り消せます — 後から手で変えた分は上書きしません)</span></div>
+    ${bulkBatches.length ? `<table class="cardable"><thead><tr><th>実行</th><th>種別</th><th>内容</th><th>件数</th><th>操作</th></tr></thead><tbody>${batchTrs}</tbody></table>`
+      : '<div class="empty">まだ一括操作は実行されていません</div>'}
+  </div>`;
+
   const body = `
   ${aiCard}
+  ${batchCard}
   <div class="card" style="margin-bottom:16px">
     <div class="card-title">🔄 受信同期の状態 <span class="sub">(cron: 15分間隔 + 深掘り 毎朝5:37。手動実行してもcronと衝突しません)</span></div>
     <table class="cardable">
@@ -2730,6 +2769,17 @@ async function post(url, data) {
   const j = await r.json().catch(function(){ return {}; });
   if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
+}
+async function revertBatch(id, changed, btn) {
+  if (!confirm('バッチ #' + id + ' (' + changed + '件変更) を取り消しますか?\\n\\n'
+    + '変更したフィールドだけを元の値に戻します。\\nバッチの後に手で変えた分は上書きしません。\\nこの操作は1回だけ実行できます。')) return;
+  btn.disabled = true;
+  try {
+    const r = await post('/apps/inquiry-hub/api/bulk-batches/' + id + '/revert', {});
+    toast(r.alreadyReverted ? '既に取り消し済みです'
+      : r.reverted + '件を元に戻しました' + (r.skipped ? ' (' + r.skipped + '件は後から変更されていたため対象外)' : ''));
+    setTimeout(function(){ location.reload(); }, 1200);
+  } catch (e) { toast('取り消し失敗: ' + e.message); btn.disabled = false; }
 }
 async function manualSync(shopId, deep, btn) {
   btn.disabled = true; var old = btn.textContent; btn.textContent = '同期中…';
@@ -2831,6 +2881,15 @@ router.post('/api/admin/sync-errors/:id(\\d+)/resolve', (req, res) => {
     .run(Number(req.params.id));
   if (!r.changes) return res.status(404).json({ error: '対象のエラーがありません (解決済みの可能性)' });
   res.json({ ok: true });
+});
+
+// 一括操作の取り消し (2026-08-25 安全装置。取り消しは1バッチ1回だけ・再送は成功扱い)
+router.post('/api/bulk-batches/:id(\\d+)/revert', (req, res) => {
+  try {
+    const r = revertBulkBatch(Number(req.params.id), actorOf(req));
+    console.log(`[inquiry-hub] 一括操作の取り消し #${req.params.id} by ${actorOf(req)} — ${r.reverted}件を復元 / ${r.skipped}件対象外${r.alreadyReverted ? ' (取り消し済みだった)' : ''}`);
+    res.json(r);
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 300) }); }
 });
 
 // ─── ページシェル ───

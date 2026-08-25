@@ -2,6 +2,7 @@
  * inquiry-hub queries — 一覧/詳細のクエリロジック (router から分離、smoke.mjs で直接検証)
  */
 import { getDB, toUtcIso, logActivity } from './db.js';
+import { recordBulkBatch } from './batches.js';
 
 export const CHANNELS = {
   email:   { label: 'メール', badge: 'background:#e0e7ff;color:#3730a3' },
@@ -224,9 +225,10 @@ export function listInquiryIdsByFilter(q = {}, { max = FILTER_BULK_MAX } = {}) {
  *
  * @param {number[]} ids
  * @param {object} ops { status?, folderId?: number|null|undefined, assigned?: string|null, isUnread?: boolean }
- * @returns {{ updated: number, skipped: number }} skipped = 変更が無かった/存在しない件数
+ * 実行はバッチとして記録され、⚙️運用管理から取り消せる (batches.js。2026-08-25 安全装置)。
+ * @returns {{ updated: number, skipped: number, batchId: number|null }} skipped = 変更が無かった/存在しない件数
  */
-export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItems = BULK_MAX } = {}) {
+export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItems = BULK_MAX, source = 'bulk', filter = null } = {}) {
   const list = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter(Number.isInteger))];
   if (!list.length) throw new Error('対象が選択されていません');
   if (list.length > maxItems) throw new Error(`一度に処理できるのは${maxItems}件までです`);
@@ -254,7 +256,8 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
   }
   const assigned = hasAssigned ? String(ops.assigned).trim() : null;
 
-  let updated = 0;
+  let updated = 0, batchId = null;
+  const batchItems = [];   // 取り消し用: 変更したフィールドの変更前後 (batches.js)
   const NOW = "strftime('%Y-%m-%dT%H:%M:%SZ','now')";
   db.transaction(() => {
     const get = db.prepare('SELECT * FROM inquiries WHERE id = ? AND is_archived = 0');
@@ -269,43 +272,49 @@ export function bulkUpdateInquiries(ids, ops = {}, { actorId = 'portal', maxItem
     for (const id of list) {
       const inq = get.get(id);
       if (!inq) continue;
-      let touched = false;
+      const before = {}, after = {};
       if (hasStatus && inq.internal_status !== ops.status) {
         updStatus.run(ops.status, ops.status, id);
         logActivity(id, { userId: actorId, actionType: 'status_change',
           before: { status: inq.internal_status }, after: { status: ops.status, reason: '一括操作' } });
-        touched = true;
+        before.internal_status = inq.internal_status; after.internal_status = ops.status;
+        before.completed_at = inq.completed_at;   // ステータスの取り消し時に一緒に戻す
       }
       const fid = hasFolder ? (ops.folderId == null ? null : Number(ops.folderId)) : undefined;
       if (hasFolder && inq.folder_id !== fid) {
         updFolder.run(fid, id);
         logActivity(id, { userId: actorId, actionType: 'folder_change',
           before: { folder: inq.folder_id }, after: { folder: folderName, reason: '一括操作' } });
-        touched = true;
+        before.folder_id = inq.folder_id; after.folder_id = fid;
       }
       const lid = hasLabel ? (ops.labelId == null ? null : Number(ops.labelId)) : undefined;
       if (hasLabel && inq.label_id !== lid) {
         updLabel.run(lid, id);
         logActivity(id, { userId: actorId, actionType: 'label_change',
           before: { label: inq.label_id }, after: { label: labelName, reason: '一括操作' } });
-        touched = true;
+        before.label_id = inq.label_id; after.label_id = lid;
       }
       if (hasAssigned && String(inq.assigned_user_id || '') !== assigned) {
         updAssign.run(assigned || null, id);
         logActivity(id, { userId: actorId, actionType: 'assign',
           before: { assigned: inq.assigned_user_id }, after: { assigned, reason: '一括操作' } });
-        touched = true;
+        before.assigned_user_id = inq.assigned_user_id; after.assigned_user_id = assigned || null;
       }
       if (hasUnread && !!inq.is_unread !== ops.isUnread) {
         updUnread.run(ops.isUnread ? 1 : 0, id);
         logActivity(id, { userId: actorId, actionType: 'read_toggle',
           before: { is_unread: !!inq.is_unread }, after: { is_unread: ops.isUnread, reason: '一括操作' } });
-        touched = true;
+        before.is_unread = inq.is_unread; after.is_unread = ops.isUnread ? 1 : 0;
       }
-      if (touched) updated++;
+      if (Object.keys(after).length) {
+        updated++;
+        batchItems.push({ inquiryId: id, before, after });
+      }
     }
+    batchId = recordBulkBatch(db, { actor: actorId, source, ops, filter,
+      targetCount: list.length, items: batchItems });
   }).immediate();
-  return { updated, skipped: list.length - updated };
+  return { updated, skipped: list.length - updated, batchId };
 }
 
 /** サイドバーのビュー別件数 (未アーカイブのみ) */
