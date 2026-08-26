@@ -16,7 +16,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -38,6 +38,7 @@ import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
+import { importImageDbByStatus } from './services/notion-image-import.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -722,6 +723,10 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (urlVal && !isHttpUrl(urlVal)) {
     return res.status(400).json({ ok: false, error: '撮影指示URLの形式が不正です (http/https)' });
   }
+  const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
+  if (canvaVal && !isHttpUrl(canvaVal)) {
+    return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
+  }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
@@ -735,9 +740,25 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     designer: clean(b.designer, 100),
     page_composer: clean(b.page_composer, 100),
     request_text: clean(b.request_text, 10000),
+    canva_url: canvaVal,
   });
   logEvent(db, draft.id, 'image_production_updated', null, actorOf(req));
   res.json({ ok: true });
+});
+
+// 画像制作だけの保留 / 解除 (2026-08-26 中原さん決定: Notion 画像DB の「保留」= 画像制作の保留)。
+// 商品本流 (product_drafts.status) は動かさない。楽天出品ゲート (imageTrackBlockReason) だけが閉じる
+router.post('/api/drafts/:id/image-hold', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const onHold = req.body?.on_hold === true || req.body?.on_hold === 'true' || req.body?.on_hold === 1;
+  const note = req.body?.note !== undefined ? cleanText(req.body.note, 300) : null;
+  try {
+    const r = setImageWorkflowState(getDB(), draft.id, onHold ? 'on_hold' : 'active', { note, actor: actorOf(req) });
+    res.json({ ok: true, changed: r.changed, workflow_state: onHold ? 'on_hold' : 'active' });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
 });
 
 // ─── API: 保留・除外・再開 (PR4: それ以外の手動遷移は廃止 = 工程からの導出) ──────
@@ -1628,6 +1649,31 @@ router.post('/api/notion-import', async (req, res) => {
 // ─── API: Notion ステータス①〜⑥の一括移植 (2026-08-25 中原さん指示) ───
 // Status が ①〜⑥ の商品のうち**このアプリにカードが無いものだけ**を取り込む。
 // 既定は dry_run (書き込みなしのプレビュー)。実行は dry_run: false の明示が必要。
+// Notion 画像DB (商品ページ商品画像登録) の対象ステータスを移植 (2026-08-26 中原さん指示)。
+// #922 と同じ admin 限定・dryRun 既定・snapshot 一致必須。要件定義 = AI_reference『Notion画像DB移植_要件定義_20260826.md』
+router.post('/api/notion-image-import', async (req, res) => {
+  if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
+  try {
+    const dryRun = req.body?.dry_run !== false; // 安全側デフォルト
+    const expectedSnapshot = typeof req.body?.expected_snapshot === 'string' ? req.body.expected_snapshot : null;
+    const r = await importImageDbByStatus({ actor: actorOf(req), dryRun, expectedSnapshot });
+    res.json({
+      ok: true, dryRun, statuses: r.statuses, missingStatuses: r.missingStatuses, total: r.total,
+      summary: r.summary, snapshot: r.snapshot,
+      results: r.results.slice(0, 300), truncated: r.results.length > 300,
+    });
+  } catch (e) {
+    if (e && e.code === 'snapshot_mismatch') {
+      return res.status(409).json({ ok: false, error: e.message });
+    }
+    if (/NOTION_IMAGE_DB_ID|RYS_NOTION_TOKEN/.test(String(e?.message || ''))) {
+      return res.status(503).json({ ok: false, error: '画像DBの Notion 設定 (NOTION_IMAGE_DB_ID / RYS_NOTION_TOKEN) が未設定です' });
+    }
+    console.error('[product-hub] notion-image-import failed:', e);
+    res.status(500).json({ ok: false, error: '移植に失敗しました (詳細はサーバーログを確認してください)' });
+  }
+});
+
 router.post('/api/notion-import-by-status', async (req, res) => {
   if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin のみ実行できます' });
   try {

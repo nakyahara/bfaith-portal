@@ -17,6 +17,7 @@
   .kb-card[draggable="true"] { cursor: grab; }
   .kb-card.dragging { opacity: .45; }
   .kb-card-link { display: block; text-decoration: none; color: inherit; }
+  .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-col.drop-ok { outline: 2px dashed #2563eb; outline-offset: -2px; background: #eff6ff; }
   /* TOP画像の重要度 (どれぐらい力を入れて作るか)。Notion のタグ風に色を付ける */
   .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
@@ -169,6 +170,7 @@
             <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
               <% if (boardView === 'image') { %>
                 <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
+              <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
               <% } %>
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
@@ -276,6 +278,7 @@
           <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %>">
             <% if (boardView === 'image' && c.kind) { %>
               <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
+              <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
             <% } %>
             <div class="kb-card-top">
               <% if (c.first_image_id) { %>

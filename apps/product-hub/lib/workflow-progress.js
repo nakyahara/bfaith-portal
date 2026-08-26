@@ -527,6 +527,12 @@ export function progressOf(draftId, { db = null } = {}) {
   };
 }
 
+/** 画像制作だけの保留 (draft_image_production.workflow_state)。行が無ければ active 扱い */
+export function imageHoldOf(db, draftId) {
+  const r = db.prepare('SELECT workflow_state, hold_note FROM draft_image_production WHERE draft_id = ?').get(Number(draftId));
+  return { onHold: r?.workflow_state === 'on_hold', note: r?.hold_note || null };
+}
+
 /** ブロック理由の「いま: ○○ (担当: △△)」部分 */
 function kindBlockDetail(summary) {
   const cur = summary.current;
@@ -543,6 +549,11 @@ function kindBlockDetail(summary) {
  */
 export function imageTrackBlockReason(db, draftId) {
   const p = progressOf(draftId, { db });
+  // 画像制作だけの保留 (2026-08-26)。工程が進んでいても保留中は出品しない
+  const hold = imageHoldOf(db, draftId);
+  if (hold.onHold) {
+    return `画像制作が保留中です${hold.note ? ` (${hold.note})` : ''}。詳細画面の「画像制作」カードで保留を解除してください`;
+  }
   // fail-closed: TOP 側の工程が 1 つも無い状態 (工程の無効化・移行漏れ) で出品を通さない (Codex R1 high)。
   // progressOf → ensureProgress が行を自己修復するので、ここに来るのは設定が壊れているときだけ
   if (p.imageTop.rows.length === 0) {
@@ -932,6 +943,8 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority,
+      (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
+      (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d
@@ -1003,6 +1016,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       first_image_id: d.first_image_id, first_image_mtime: d.first_image_mtime,
       current: p.current, stalledDays: p.stalledDays, doneCount: p.doneCount, totalCount: p.totalCount,
       image: imageSummaryOf(p, d),
+      // 画像制作だけの保留 (2026-08-26)。画像ビューではバッジを出し、滞留の赤枠は付けない (止めているのは意図)
+      imageOnHold: d.image_workflow_state === 'on_hold',
+      imageHoldNote: d.image_hold_note || null,
     };
 
     if (view === 'image') {
@@ -1028,7 +1044,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
         }
         if (assigneeId != null && cur.assignee_id !== assigneeId) continue;
         if (unassignedOnly && !(cur.role_code && cur.assignee_id == null)) continue;
-        const card = { ...baseCard, kind: k.kind, kindCurrent: cur, kindStalledDays: k.s.stalledDays };
+        const card = { ...baseCard, kind: k.kind, kindCurrent: cur, kindStalledDays: baseCard.imageOnHold ? null : k.s.stalledDays };
         colByStep.get(cur.step_code)?.cards.push(card);
         cardsById.set(d.id, card);
       }
