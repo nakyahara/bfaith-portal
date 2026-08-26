@@ -430,6 +430,10 @@
     let paused = STATE.batchStatus === 'paused';
     let lastDoneSeq = STATE.lastDoneSeq ?? null;   // 完了取消の対象 (最後に完了した伝票)
 
+    // 未処理ゼロでも残っている「片付け待ち」= 保留伝票 + 未確定のミス候補 (0ならバッチ完了)
+    function unfinishedCount() {
+      return heldSet.size + incidents.filter((i) => i.slipSeq == null || !heldSet.has(i.slipSeq)).length;
+    }
     // 最小の未処理 seq (クライアント側の楽観計算。ズレ回復で順序外完了があっても正しい)
     function minPending() {
       for (const s of STATE.slips) if (!doneSet.has(s.seq) && !heldSet.has(s.seq)) return s.seq;
@@ -507,7 +511,14 @@
       // 完了済みの閲覧中は「現在の伝票へ」+ 完了取消リンク (最後に完了した伝票のみ)
       const viewingHeld = heldSet.has(viewSeq);
       const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
-      if (currentSeq == null) {
+      if (currentSeq == null && unfinishedCount() > 0) {
+        // 未処理ゼロだが保留/未確定候補が残る = バッチ未完了。終了処理 (候補送信・受領) へ
+        // 戻る入口。以前はここが押せない「全伝票 完了」固定で、終了オーバーレイを閉じたり
+        // リロードすると候補を送れず・バッチも完了できずに詰んだ (2026-08-26 出荷_06)
+        $('nextBtn').textContent = `🏁 終了処理へ (保留 ${unfinishedCount()} 件)`;
+        $('nextBtn').classList.add('jump');
+        $('nextBtn').disabled = false;
+      } else if (currentSeq == null) {
         $('nextBtn').textContent = '全伝票 完了';
         $('nextBtn').disabled = true;
       } else if (viewingPending && (viewSeq === currentSeq || jumpMode)) {
@@ -945,7 +956,12 @@
 
     // ── 操作 ──
     function goNext() {
-      if (currentSeq == null || paused || matBusy) return;
+      if (paused || matBusy) return;
+      if (currentSeq == null) {
+        // 未処理ゼロ: 保留/候補が残っていれば終了処理へ戻る (閉じた・リロードした後の再入口)
+        if (STATE.batchStatus !== 'done' && unfinishedCount() > 0) { jumpMode = false; showEndOverlay(false); }
+        return;
+      }
       const viewingHeld = heldSet.has(viewSeq);
       const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
       const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
@@ -1730,6 +1746,8 @@
       // 名前タップ=ユーザー操作なので、ここでの発声がブラウザの自動再生制限の有効化を兼ねる (要件§5.3)
       lastSpokenSeq = null;
       render();
+      // 一通り終えた後に開き直した場合は終了処理 (候補送信・受領) をそのまま出す
+      if (currentSeq == null && STATE.batchStatus !== 'paused' && unfinishedCount() > 0) showEndOverlay(false);
     }
 
     // 作業中の担当変更 (中原さん指示 2026-08-21: 最初に選び間違えても後で直せるように)。
