@@ -18,6 +18,7 @@
  *                            (らくらくーぽん最終稼働日の10日前 23:59:59 = 空白も二重送信も出ない境目)
  *              --coupon-at : 同じくクーポンメールの境目 (省略時 = --follow-at)。らくらくーぽんの
  *                            クーポンメールが止まった日以降を早く引き取るために別指定できる
+ *            ⭐境目を過ぎてから実行する (未来の境目は拒否。ownership は一度決めたら覆らないため)。
  *            live 後は毎日 12:05 の RakutenReviewMailSend (scripts/mall-csv-fetcher/run-rakuten-review-send.ps1)
  *            が実送信する。cutover を戻す手段は CLI に無い (rakuten_campaign_meta を手で直す)
  *

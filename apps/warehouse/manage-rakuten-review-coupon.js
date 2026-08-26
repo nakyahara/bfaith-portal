@@ -125,10 +125,26 @@ try {
     let problem = false;
     for (const month of targets) {
       const existing = getRegisteredCoupon(db, month);
-      if (existing?.status === 'issued') { console.log(`[ensure] ${month}: 発行済み (code=${maskCode(existing.coupon_code)})`); continue; }
+      if (existing?.status === 'issued') {
+        // 発行済み行の健全性 (Codex C5-R1 Medium: sender は coupon_start/coupon_end/pc_get_url を
+        // fail-closed で見るため、台帳が壊れていると「発行済みなのに送れない」が静かに続く)
+        const bad = [];
+        if (!existing.pc_get_url) bad.push('pc_get_url なし');
+        if (!Number.isFinite(Date.parse(existing.coupon_start))) bad.push(`coupon_start 不正 (${existing.coupon_start})`);
+        if (!Number.isFinite(Date.parse(existing.coupon_end))) bad.push(`coupon_end 不正 (${existing.coupon_end})`);
+        if (bad.length) {
+          console.error(`[ensure] ⚠️${month}: 発行済みだが台帳が不完全 (${bad.join(' / ')})。sender はこの月のクーポンを使わない。RMS で確認して台帳を手動修正して`);
+          problem = true;
+        } else {
+          console.log(`[ensure] ${month}: 発行済み (code=${maskCode(existing.coupon_code)}、${existing.coupon_start}〜${existing.coupon_end})`);
+        }
+        continue;
+      }
       if (existing?.status === 'pending') {
+        // dry-run は確認目的なので失敗扱いにしない (Codex C5-R1 Low)。--live では人の解決待ち=exit 1
         console.error(`[ensure] ⚠️${month}: pending 残留 (前回の結果不明)。coupon.search で実発行有無を確認し台帳を手動解決して (note: ${existing.note || '-'})`);
-        problem = true; continue;
+        if (hasFlag('--live')) problem = true;
+        continue;
       }
       const params = monthlyCouponParams(month, nowIso);
       const built = buildIssueXml(params);

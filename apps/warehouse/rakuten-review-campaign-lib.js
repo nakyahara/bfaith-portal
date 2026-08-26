@@ -570,10 +570,14 @@ export function applyCutover(db, { cutoverAt, couponCutoverAt, nowIso = new Date
   const tx = db.transaction(() => {
     const cur = getCutover(db);
     if (cur.cutoverAt) throw new Error(`CUTOVER: 既に cutover_at=${cur.cutoverAt} が設定済み。やり直しは rakuten_campaign_meta を手で直してから`);
-    // 未来の境目は許可 (例: 9/2 23:59:59 を 9/1 に設定 → 9/3 以降の発送だけが self になる)。
-    // ただし ±60日を超える値は指定ミスとみなす
-    const dT = Date.parse(cutoverAt) - Date.parse(nowIso);
-    if (!(Math.abs(dT) <= 60 * DAY_MS)) throw new Error('CUTOVER: cutover_at が現在から60日以上離れている (指定ミス?)');
+    // 未来の境目は拒否 (Codex C5-R1 High: ownership は INSERT OR IGNORE で一度決めたら覆らない。
+    // 境目到達前に発送→vendor 確定した注文が、境目後の再発送で最終発送日が動いても vendor のまま
+    // 取りこぼす)。境目を過ぎてから実行する = 「その時点までの発送は全部 vendor」で矛盾が出ない。
+    // 60日より前は指定ミスとみなす (両方の境目)
+    const nowT = Date.parse(nowIso);
+    if (Date.parse(cutoverAt) > nowT) throw new Error('CUTOVER: cutover_at は現在時刻以前を指定 (境目を過ぎてから実行する。未来の先取りは不可)');
+    if (Date.parse(cutoverAt) < nowT - 60 * DAY_MS) throw new Error('CUTOVER: cutover_at が60日以上前 (指定ミス?)');
+    if (Date.parse(couponCutoverAt) < nowT - 60 * DAY_MS) throw new Error('CUTOVER: coupon_cutover_at が60日以上前 (指定ミス? 規約上21日より前の発送には送れない)');
     if (Date.parse(couponCutoverAt) > Date.parse(cutoverAt)) throw new Error('CUTOVER: coupon_cutover_at はフォローの境目以前であること (クーポンは早く引き取る側)');
     const ins = db.prepare(`INSERT INTO rakuten_campaign_meta (key, value) VALUES (?, ?)`);
     ins.run('cutover_at', cutoverAt);

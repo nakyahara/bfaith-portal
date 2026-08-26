@@ -516,10 +516,14 @@ console.log('=== 11. PR-C5: cutover (shadow → LIVE、フォロー/クーポン
   check('preview 後も cutover 未設定 (読み取りのみ)', getCutover(db3).cutoverAt === null);
 
   // 不正な組合せは適用前に拒否 (tx ロールバック)
-  let cpnAfter = false, tooFar = false;
+  let cpnAfter = false, future = false, tooOld = false, cpnTooOld = false;
   try { applyCutover(db3, { cutoverAt, couponCutoverAt: parseCutoverArg('2026-09-10T00:00:00+09:00'), nowIso: NOW }); } catch { cpnAfter = true; }
-  try { applyCutover(db3, { cutoverAt: parseCutoverArg('2026-12-31T00:00:00+09:00'), couponCutoverAt, nowIso: NOW }); } catch { tooFar = true; }
-  check('coupon 境目がフォローより後 / 60日以上先は拒否 (meta 未変更)', cpnAfter && tooFar && getCutover(db3).cutoverAt === null
+  // 未来の境目は拒否 (Codex C5-R1 High: ownership は覆らないので境目前に vendor 確定した注文を取りこぼす)
+  try { applyCutover(db3, { cutoverAt: parseCutoverArg('2026-09-14T00:00:00+09:00'), couponCutoverAt, nowIso: NOW }); } catch { future = true; }
+  try { applyCutover(db3, { cutoverAt: parseCutoverArg('2026-06-01T00:00:00+09:00'), couponCutoverAt: parseCutoverArg('2026-06-01T00:00:00+09:00'), nowIso: NOW }); } catch { tooOld = true; }
+  try { applyCutover(db3, { cutoverAt, couponCutoverAt: parseCutoverArg('2025-01-01T00:00:00+09:00'), nowIso: NOW }); } catch { cpnTooOld = true; }
+  check('coupon 境目がフォローより後 / 未来の境目 / 60日以上前 (follow・coupon とも) は拒否 (meta 未変更)',
+    cpnAfter && future && tooOld && cpnTooOld && getCutover(db3).cutoverAt === null
     && db3.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).get().n === 4);
 
   const r = applyCutover(db3, { cutoverAt, couponCutoverAt, nowIso: NOW });
