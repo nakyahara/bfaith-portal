@@ -121,10 +121,12 @@ try {
     } finally { transport.close(); }
   } else if (mode === 'send') {
     const limitRaw = getArg('--limit');
-    if (limitRaw != null && (!/^\d+$/.test(limitRaw) || +limitRaw < 1 || +limitRaw > 200)) {
-      console.error('FATAL: --limit は 1〜200 の整数'); process.exit(2);
+    if (limitRaw != null && (!/^\d+$/.test(limitRaw) || +limitRaw < 1 || +limitRaw > 2000)) {
+      console.error('FATAL: --limit は 1〜2000 の整数'); process.exit(2);
     }
+    // 上限 2000 (PR-C5: 正午の定時運転はフォロー ~250-900件/日)。既定 5 は手動の極小運転用
     const limit = limitRaw != null ? +limitRaw : 5;
+    const notifySummary = args.includes('--notify');
     const db = openDb();
     const keys = loadContactKeys();
     const transport = await createAnshinTransport();
@@ -144,6 +146,14 @@ try {
         process.exitCode = 1;
       } else {
         console.log(`[send] 送信 ${result.sent} / 明確な失敗 ${result.failedSafe} / 結果不明 ${result.ambiguous} / skip ${result.skipped} / ゲート再評価落ち ${result.gateFailed} / claim競り負け ${result.claimLost}`);
+        // 定時運転の日次サマリ (PR-C5、--notify)。何か送った/失敗した日だけ通知 (0件の日は静か)
+        if (notifySummary && (result.sent > 0 || result.failedSafe > 0 || result.finalizeConflict > 0)) {
+          const byType = { follow: 0, coupon: 0 };
+          for (const d of result.details) if (d.result === 'sent') byType[d.type] = (byType[d.type] || 0) + 1;
+          await notifyOperator(`📮 楽天レビューメール (自作) 送信: フォロー ${byType.follow}件 / クーポン ${byType.coupon}件`
+            + (result.failedSafe > 0 ? ` / 明確な失敗 ${result.failedSafe}件 (delivery_attempts を確認)` : '')
+            + (result.limitHit ? ` / ⚠️上限 ${limit} 件に到達 (残りは翌日の正午)` : ''));
+        }
         if (result.finalizeConflict > 0) {
           console.error(`[send] ⚠️確定競合 ${result.finalizeConflict}件 (送信後に claim を失った=別プロセスの介入痕跡)。delivery_attempts を確認してください`);
           process.exitCode = 1;

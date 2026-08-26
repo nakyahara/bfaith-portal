@@ -289,11 +289,43 @@ console.log('=== 5. R1対応: TOCTOU / claimed残留回収 / クーポンURL検�
 
   // クーポンURL検証 (楽天ドメイン https のみ)
   check('couponUsableCheck: 楽天以外・http は拒否',
-    couponUsableCheck({ status: 'issued', pc_get_url: 'https://evil.example.com/x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
-    && couponUsableCheck({ status: 'issued', pc_get_url: 'http://coupon.rakuten.co.jp/getCoupon?getkey=x', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
-    && couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === true);
+    couponUsableCheck({ status: 'issued', pc_get_url: 'https://evil.example.com/x', coupon_start: '2026-07-01T00:00:00+09:00', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
+    && couponUsableCheck({ status: 'issued', pc_get_url: 'http://coupon.rakuten.co.jp/getCoupon?getkey=x', coupon_start: '2026-07-01T00:00:00+09:00', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
+    && couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_start: '2026-07-01T00:00:00+09:00', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === true);
+  check('couponUsableCheck: 開始前のクーポンは配らない (PR-C5) / coupon_start 欠落は fail-closed',
+    couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_start: '2026-07-18T15:00:00+09:00', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false
+    && couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_end: '2026-09-30T23:59:59+09:00' }, NOW) === false);
   const rEmpty = recoverStaleClaims(db, NOW);
   check('recoverStaleClaims: claimed なしなら 0/0', rEmpty.recovered === 0 && rEmpty.inFlight === 0);
+}
+
+console.log('=== 6. PR-C5: coupon_owner (フォローとクーポンで担当が違う注文) ===');
+{
+  // フォロー=vendor / クーポン=self の注文 (らくらくーぽんのクーポン故障期に発送された注文の救済)
+  const mixed = makeOrder({ owner: 'vendor' });
+  db.prepare(`UPDATE rakuten_order_campaign_ownership SET coupon_owner = 'self' WHERE order_number = ?`).run(mixed.orderNumber);
+  addReview(mixed.orderNumber);
+  const fId = makeAction({ orderNumber: mixed.orderNumber, type: 'follow' });
+  const cId = makeAction({ orderNumber: mixed.orderNumber, type: 'coupon' });
+  const sel = selectEligibleActions(db, { nowIso: NOW, limit: 100 });
+  check('クーポンは coupon_owner=self で eligible', sel.eligible.some((e) => e.id === cId));
+  check('同じ注文のフォローは owner=vendor で skip', sel.skipped.some((k) => k.id === fId && k.reason === 'not_self_ownership'));
+  // coupon_owner=NULL は owner と同じ扱い (shadow 期に作られた行・旧スキーマ)
+  const nullCpn = makeOrder({ owner: 'self' });
+  addReview(nullCpn.orderNumber);
+  const c2 = makeAction({ orderNumber: nullCpn.orderNumber, type: 'coupon' });
+  const vendorCpn = makeOrder({ owner: 'vendor' });
+  addReview(vendorCpn.orderNumber);
+  const c3 = makeAction({ orderNumber: vendorCpn.orderNumber, type: 'coupon' });
+  const sel2 = selectEligibleActions(db, { nowIso: NOW, limit: 100 });
+  check('coupon_owner=NULL → owner を継承 (self=送る / vendor=送らない)',
+    sel2.eligible.some((e) => e.id === c2) && sel2.skipped.some((k) => k.id === c3 && k.reason === 'not_self_ownership'));
+  check('limitHit: 上限到達を報告', selectEligibleActions(db, { nowIso: NOW, limit: 1 }).limitHit === true
+    && selectEligibleActions(db, { nowIso: NOW, limit: 100 }).limitHit === false);
+  // claim 時の再評価でも coupon_owner を見る (TOCTOU)
+  db.prepare(`UPDATE rakuten_order_campaign_ownership SET coupon_owner = 'vendor' WHERE order_number = ?`).run(mixed.orderNumber);
+  const claim = claimActionGuarded(db, cId, NOW);
+  check('claim 直前に coupon_owner が vendor に変わったら送らない', claim.gateFailed === 'not_self_ownership');
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);

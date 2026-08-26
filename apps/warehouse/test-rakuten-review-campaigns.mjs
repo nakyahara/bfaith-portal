@@ -13,6 +13,7 @@ import {
   ensureCampaignTables, planCampaigns, campaignStats, dedupeKeyFor,
   jstDateOf, jstNoonUtcIso, nextNoonJstAfter, followScheduleFor, postedAtToUtcIso,
   recordVendorDaily, recordVendorDailyBatch, shadowComparisonReport, isValidJstDate,
+  getCutover, parseCutoverArg, cutoverPreview, applyCutover,
 } from './rakuten-review-campaign-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey,
@@ -454,6 +455,96 @@ console.log('=== 10. PR-C2: vendor実績記録+shadow突合レポート ===');
   check('batch転記: 1件不正で全体ロールバック (部分更新なし)',
     batchFail && db2.prepare(`SELECT COUNT(*) n FROM rakuten_vendor_send_daily WHERE date_jst = '2026-07-20'`).get().n === 0);
   db2.close();
+}
+
+console.log('=== 11. PR-C5: cutover (shadow → LIVE、フォロー/クーポン別境目) ===');
+{
+  const db3 = new Database(path.join(tmp, 'w3.db'));
+  db3.pragma('foreign_keys = ON');
+  ensureRakutenReviewTables(db3); ensureContactTables(db3); ensureCampaignTables(db3);
+  ensureCampaignTables(db3); // 冪等 (ALTER TABLE の二重適用なし)
+  check('coupon_owner 列がある', db3.prepare(`PRAGMA table_info(rakuten_order_campaign_ownership)`).all().some((c) => c.name === 'coupon_owner'));
+  // 旧スキーマ (coupon_owner なし) からの移行
+  const db4 = new Database(path.join(tmp, 'w4.db'));
+  db4.exec(`CREATE TABLE rakuten_order_campaign_ownership (order_number TEXT PRIMARY KEY, owner TEXT NOT NULL, reason TEXT, decided_at TEXT NOT NULL)`);
+  db4.prepare(`INSERT INTO rakuten_order_campaign_ownership VALUES ('legacy', 'vendor', 'shadow', 'x')`).run();
+  ensureRakutenReviewTables(db4); ensureContactTables(db4); ensureCampaignTables(db4);
+  check('旧スキーマへ coupon_owner を後付け (既存行は NULL=owner と同じ扱い)',
+    db4.prepare(`SELECT coupon_owner FROM rakuten_order_campaign_ownership WHERE order_number = 'legacy'`).get().coupon_owner === null);
+  db4.close();
+
+  let seq3 = 0;
+  const mk = (shippingIso) => {
+    const orderNumber = `373343-20260801-${String(++seq3).padStart(10, '0')}`;
+    upsertContacts(db3, [{
+      order_number: orderNumber, order_key_hmac: hmacOrderKey(orderNumber, keys),
+      masked_email_enc: encryptEmail('u@anshin.rakuten.co.jp', keys, orderNumber), masked_email_hash: hmacEmail('u@anshin.rakuten.co.jp', keys),
+      order_datetime: '2026-08-01T10:00:00+09:00', shipping_datetime: shippingIso, order_progress: 700,
+      contact_delete_at: '2099-01-01T00:00:00.000Z',
+    }]);
+    return orderNumber;
+  };
+  const oOld = mk('2026-07-20T12:00:00+09:00');   // 両方 vendor
+  const oMid = mk('2026-08-20T12:00:00+09:00');   // フォロー vendor / クーポン self
+  const oNew = mk('2026-09-05T12:00:00+09:00');   // 両方 self
+  const oNoShip = mk(null);
+  // shadow 期の plan (全件 vendor、coupon_owner は NULL)
+  const SHADOW_NOW = '2026-09-01T00:00:00.000Z';
+  planCampaigns(db3, { nowIso: SHADOW_NOW, couponEpochOverride: '2026-07-17T00:00:00.000Z' });
+  insertReview(db3, { orderNumber: oMid, firstSeenAt: '2026-09-02T00:00:00.000Z', postedAt: '2026-09-01 20:00:00' });
+  planCampaigns(db3, { nowIso: '2026-09-02T01:00:00.000Z' });
+  const own = (o) => db3.prepare(`SELECT owner, coupon_owner, reason FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(o);
+  check('shadow 期: 全件 vendor・coupon_owner=NULL', ['shadow'].includes(own(oOld).reason) && own(oOld).owner === 'vendor' && own(oOld).coupon_owner === null
+    && own(oNew).owner === 'vendor');
+  check('getCutover: 未設定なら両方 null', getCutover(db3).cutoverAt === null && getCutover(db3).couponCutoverAt === null);
+
+  // 引数検証
+  let naive = false, bad = false;
+  try { parseCutoverArg('2026-09-02T23:59:59'); } catch { naive = true; }
+  try { parseCutoverArg('2026-13-40T00:00:00+09:00'); } catch { bad = true; }
+  check('parseCutoverArg: オフセット無し・不正日時は拒否 / +09:00 は UTC ISO に正規化',
+    naive && bad && parseCutoverArg('2026-09-02T23:59:59+09:00') === '2026-09-02T14:59:59.000Z');
+
+  const NOW = '2026-09-13T03:00:00.000Z'; // 9/13 12:00 JST (らくらくーぽん解約翌日の正午)
+  const cutoverAt = parseCutoverArg('2026-09-02T23:59:59+09:00');
+  const couponCutoverAt = parseCutoverArg('2026-07-25T00:00:00+09:00');
+  const pv = cutoverPreview(db3, { cutoverAt, couponCutoverAt, nowIso: NOW });
+  // 8/20発送のクーポンは 9/13 時点で発送+21日の規約期限を過ぎている → 救済対象に数えない (期限内のみ)
+  check('preview: shadow行数・self件数 (フォロー1/クーポン2/両方vendor 1)・期限内 action (フォロー planned 1 / クーポン 0)',
+    pv.shadowRows === 4 && pv.followSelf === 1 && pv.couponSelf === 2 && pv.vendorBoth === 1
+    && pv.followPlanned === 1 && pv.couponReady + pv.couponPlanned === 0, JSON.stringify(pv));
+  check('preview 後も cutover 未設定 (読み取りのみ)', getCutover(db3).cutoverAt === null);
+
+  // 不正な組合せは適用前に拒否 (tx ロールバック)
+  let cpnAfter = false, tooFar = false;
+  try { applyCutover(db3, { cutoverAt, couponCutoverAt: parseCutoverArg('2026-09-10T00:00:00+09:00'), nowIso: NOW }); } catch { cpnAfter = true; }
+  try { applyCutover(db3, { cutoverAt: parseCutoverArg('2026-12-31T00:00:00+09:00'), couponCutoverAt, nowIso: NOW }); } catch { tooFar = true; }
+  check('coupon 境目がフォローより後 / 60日以上先は拒否 (meta 未変更)', cpnAfter && tooFar && getCutover(db3).cutoverAt === null
+    && db3.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).get().n === 4);
+
+  const r = applyCutover(db3, { cutoverAt, couponCutoverAt, nowIso: NOW });
+  check('applyCutover: shadow 行を全削除して再判定', r.shadowDeleted === 4 && r.ownershipInserted >= 3, JSON.stringify(r));
+  const cut = getCutover(db3);
+  check('meta に follow/coupon 両方の境目', cut.cutoverAt === cutoverAt && cut.couponCutoverAt === couponCutoverAt
+    && db3.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'cutover_applied_at'`).get().value === NOW);
+  check('7/20発送: フォロー vendor / クーポン vendor', own(oOld).owner === 'vendor' && own(oOld).coupon_owner === 'vendor' && own(oOld).reason === 'cutover_shipping');
+  check('8/20発送: フォロー vendor / クーポン self (境目が別)', own(oMid).owner === 'vendor' && own(oMid).coupon_owner === 'self');
+  check('9/5発送: フォロー self / クーポン self', own(oNew).owner === 'self' && own(oNew).coupon_owner === 'self');
+  check('未発送は行なし (fail-closed)', !own(oNoShip));
+  let twice = false;
+  try { applyCutover(db3, { cutoverAt, couponCutoverAt, nowIso: NOW }); } catch { twice = true; }
+  check('二度目の cutover は拒否', twice);
+  // 以後の plan は cutover ルールを維持 (shadow 行を作らない)
+  const oLater = mk('2026-09-14T12:00:00+09:00');
+  planCampaigns(db3, { nowIso: '2026-09-15T00:00:00.000Z' });
+  check('cutover 後に発送された注文は plan で self/self', own(oLater).owner === 'self' && own(oLater).coupon_owner === 'self'
+    && db3.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).get().n === 0);
+  // action があるのに contacts が無い注文 (orphan) は両方 vendor
+  db3.prepare(`INSERT INTO rakuten_campaign_actions (action_type, dedupe_key, order_number, status, template_version, scheduled_at, expires_at, created_at, updated_at)
+               VALUES ('coupon', 'orphan-key', 'ORPHAN-1', 'ready', 'v1', ?, '2099-01-01T00:00:00.000Z', ?, ?)`).run(NOW, NOW, NOW);
+  planCampaigns(db3, { nowIso: '2026-09-15T01:00:00.000Z' });
+  check('contacts の無い注文は両方 vendor (cutover_no_contact)', own('ORPHAN-1').owner === 'vendor' && own('ORPHAN-1').coupon_owner === 'vendor');
+  db3.close();
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);

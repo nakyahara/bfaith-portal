@@ -63,6 +63,9 @@ export function classifySendError(e) {
 export function couponUsableCheck(monthlyCoupon, nowIso) {
   if (!monthlyCoupon || monthlyCoupon.status !== 'issued' || !monthlyCoupon.pc_get_url) return false;
   if (!(Date.parse(monthlyCoupon.coupon_end) > Date.parse(nowIso))) return false;
+  // PR-C5: 開始前のクーポンURLは配らない (当月途中に発行すると開始=発行+90分。その日の正午バッチが
+  // 開始前のURLを送ると顧客が獲得できない → 翌日の正午まで待つ)
+  if (!(Date.parse(monthlyCoupon.coupon_start) <= Date.parse(nowIso))) return false;
   try {
     const u = new URL(monthlyCoupon.pc_get_url);
     return u.protocol === 'https:' && u.hostname === 'coupon.rakuten.co.jp';
@@ -74,7 +77,7 @@ export function couponUsableCheck(monthlyCoupon, nowIso) {
 const GATE_SQL = `
     SELECT a.id, a.action_type, a.dedupe_key, a.order_number, a.scheduled_at, a.expires_at, a.status,
            c.masked_email_enc, c.masked_email_hash, c.purged_at, c.shipping_datetime,
-           o.owner,
+           o.owner, o.coupon_owner,
            EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed,
            EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = a.order_number) AS has_review_any,
            EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = a.order_number AND r.is_deleted = 0) AS has_active_review,
@@ -87,7 +90,9 @@ const GATE_SQL = `
 export function gateReason(a, { nowIso, couponUsable }) {
   if (a.status !== 'ready') return 'not_ready';
   if (!(a.scheduled_at <= nowIso && a.expires_at > nowIso)) return 'out_of_window';
-  if (a.owner !== 'self') return 'not_self_ownership'; // 行なし (null) も vendor も送らない (fail-closed)
+  // 行なし (null) も vendor も送らない (fail-closed)。クーポンは coupon_owner (PR-C5、NULL なら owner と同じ)
+  const owner = a.action_type === 'coupon' ? (a.coupon_owner ?? a.owner) : a.owner;
+  if (owner !== 'self') return 'not_self_ownership';
   if (a.purged_at || !a.masked_email_enc) return 'contact_unavailable';
   if (a.is_suppressed) return 'suppressed';
   if (a.action_type === 'follow' && a.has_review_any) return 'review_exists';
@@ -114,13 +119,14 @@ export function selectEligibleActions(db, { nowIso = new Date().toISOString(), l
   `).all(nowIso, nowIso);
 
   const eligible = [], skipped = [];
+  let limitHit = false;
   for (const a of rows) {
-    if (eligible.length >= limit) break;
+    if (eligible.length >= limit) { limitHit = true; break; }
     const reason = gateReason(a, { nowIso, couponUsable });
     if (reason) { skipped.push({ id: a.id, action_type: a.action_type, reason }); continue; }
     eligible.push({ ...a, monthlyCoupon: a.action_type === 'coupon' ? monthlyCoupon : null });
   }
-  return { eligible, skipped, monthlyCouponReady: couponUsable };
+  return { eligible, skipped, monthlyCouponReady: couponUsable, limitHit };
 }
 
 /**
@@ -245,8 +251,9 @@ export async function processReadyActions(db, { keys, sendFn, nowIso = new Date(
     out.details.push({ result: staleRecovered > 0 ? 'stale_claims_recovered' : 'in_flight_claims_present', count: staleRecovered || inFlight });
     return out;
   }
-  const { eligible, skipped } = selectEligibleActions(db, { nowIso, limit });
+  const { eligible, skipped, limitHit } = selectEligibleActions(db, { nowIso, limit });
   out.skipped = skipped.length;
+  out.limitHit = limitHit;
   for (const action of eligible) {
     // claim は tx 内で全ゲート再評価 (TOCTOU 防止)。文面・宛先とも tx 内の最新スナップショットを使う
     const claim = claimActionGuarded(db, action.id, nowIso);
