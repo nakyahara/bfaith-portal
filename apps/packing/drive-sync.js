@@ -236,7 +236,7 @@ async function retryReprintNotify() {
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(row.batch_id, row.slip_seq);
       const sent = await notifyReprint({
-        folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
+        kind: row.kind, folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
         siteOrderNo: row.site_order_no, recipientName: row.recipient_name,
         worker: `${row.requested_by} (再送)`, lines,
         pdfUrl: row.pdf_token ? `https://picking.bfaith-wh.uk/apps/packing/reprints/${row.pdf_token}.pdf` : null,

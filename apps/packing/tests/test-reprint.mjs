@@ -47,6 +47,18 @@ console.log('── reprint イベント ──');
     '伝票状態は変えない');
   throws(() => ev('reprint', { slipSeq: 99 }), 'slip_not_found', '存在しない伝票は404');
   throws(() => ev('reprint', {}, '別人'), 'taken', '担当者以外は不可');
+  eq(row.kind, 'reprint', 'kind=reprint');
+}
+
+console.log('── label_missing イベント (📭送り状がない・2026-08-26) ──');
+{
+  const r = ev('label_missing');
+  ok(Number.isInteger(r.reprintId), '記録される (reprintId返却・再印刷と同じ表)');
+  const row = db.prepare('SELECT * FROM pk_pack_reprints WHERE id=?').get(r.reprintId);
+  eq([row.kind, row.ne_slip_no, row.requested_by], ['label_missing', '1507800', '大場'], 'kind=label_missing で保存');
+  ok(db.prepare('SELECT status FROM pk_pack_slips WHERE batch_id=1 AND seq=1').get().status === 'pending',
+    '伝票状態は変えない');
+  throws(() => ev('label_missing', {}, '別人'), 'taken', '担当者以外は不可');
 }
 
 console.log('\n── findLabelPageAcross (全ファイル横断・全体で一意のみ採用) ──');
