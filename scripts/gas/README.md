@@ -2,6 +2,17 @@
 
 このディレクトリは、bfaith-portal の API を叩く Google Apps Script (.gs) を版管理するためのもの。
 
+## `shipping-folder-cleanup.gs`
+
+**用途**: Drive「出荷_no」(ID `110ONn2xHzfEG5HPt1DRy4P64zv2hpGjh`) 直下の `出荷_XX` フォルダを毎晩空にする (18:16 トリガー、関数 `trashAllFilesInFolder`)。前日のファイルが残ると翌朝の出荷作業と混ざるため、掃除そのものが業務要件。
+
+- ファイルは `setTrashed(true)` でゴミ箱へ (共有ドライブでは完全削除に管理者ロールが要るため)
+- `_要確認/<yyyyMMdd-HHmmss>_出荷_XX/` (旧版の隔離フォルダ) が残っていれば併せて片付ける。人が手で置いたフォルダには触らない
+- スクリプトプロパティ `DRY_RUN=1` で件数を数えるだけ (ゴミ箱に入れない)
+- 失敗時は throw する → Apps Script 標準の実行失敗通知メールで気づく。残ったファイルは翌晩の実行で再試行される
+
+**⚠️ 2026-08-26 に「吸い上げ」を全廃**: 旧 `shipping-trash-ingest.gs` は削除直前に納品書PDF・ピッキングリストPDF を OCR して Render の `apps/shipping-log` へ送っていたが、納品書・ピッキングの情報は梱包支援 (`apps/packing`) / スマホピッキング (`apps/picking`) の Drive 取込が本番系になったため役目終了 (中原さん判断)。隔離・GChat 通知・Render 側取込 API・`sl_*` テーブルも同時に撤去した。Render env `SHIPPING_LOG_INGEST_TOKEN` / `SHIPPING_STAFF_CRON_ENABLED` と、GAS スクリプトプロパティ `SHIPPING_INGEST_BASE` / `SHIPPING_INGEST_TOKEN` / `SHIPPING_GCHAT_WEBHOOK` は不要 (削除してよい)。旧実装は git 履歴を参照。
+
 ## `sku-master-missing-checker.gs`
 
 **用途**: bfaith-portal「マスタ登録」(`m_sku_master`) に登録済みで、Google Sheets「商品コード変換テーブル」(A列に SKU) にまだ載っていない SKU を、毎朝 1 回検出して **「商品コード変換テーブル」本体に直接追記** する (A=SKU / C=商品名 / D=NE商品コード / E=数量)。セット商品は components.length 行に展開。

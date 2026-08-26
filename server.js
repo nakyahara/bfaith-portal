@@ -24,7 +24,6 @@ import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js'
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
 import { startInquiryHubSyncCron, startInquiryHubOutboxCron } from './apps/inquiry-hub/sync/cron.js';
-import { startShippingStaffCron } from './apps/shipping-log/notion-staff.js';
 import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
@@ -59,7 +58,6 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
-import shippingLogRouter from './apps/shipping-log/router.js';
 import shippingLogViewRouter from './apps/shipping-log/view-router.js';
 import siteProductsRouter from './apps/site-products/router.js';
 import siteContactRouter from './apps/site-contact/router.js';
@@ -1297,10 +1295,8 @@ app.use('/apps/packing-dispatch/rule-change-api', express.json({ limit: '256kb' 
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
-// 出荷実績ログ (apps/shipping-log): 出荷_no 掃除 GAS からの伝票取込。Bearer fail-closed のみ (session なし)
-app.use('/apps/shipping-log/api', express.json({ limit: '2mb' }), shippingLogRouter);
-// 出荷件数ダッシュボード (同じ apps/shipping-log)。こちらは session 認証配下。
-// GAS 用の /api を先に mount してあるので、Bearer 経路がこの requireAppAccess に飲まれることはない。
+// 出荷件数ダッシュボード (apps/shipping-log)。
+// GAS からの伝票取込 API (/apps/shipping-log/api) は 2026-08-26 に廃止 (吸い上げ全廃)。
 app.use('/apps/shipping-log', requireAppAccess('shipping-log'), shippingLogViewRouter);
 // コーポレートサイト向け商品スナップショット (apps/site-products): 専用read token・読み取り専用 (session なし)
 app.use('/apps/site-products/api', siteProductsRouter);
@@ -1545,10 +1541,6 @@ app.listen(PORT, () => {
   // inquiry-hub 送信ワーカー (outbox 30秒。INQUIRY_HUB_OUTBOX_CRON_ENABLED=true で起動、
   // メール実送信はさらに INQUIRY_HUB_MAIL_SEND_MODE=live が必要。既定=dryrun)
   startInquiryHubOutboxCron();
-
-  // 出荷カード担当者スナップショット (Notion→sl_batch_staff、毎日19:30 JST。
-  // SHIPPING_STAFF_CRON_ENABLED=true で起動、Dark Launch)
-  startShippingStaffCron();
 
   // Render 一次データ自己バックアップ (JST 03:30、Google Drive へ外向き送信のみ =
   // DB ダウンロード用の公開エンドポイントは作らない。RENDER_BACKUP_CRON_ENABLED=1 で起動、Dark Launch)

@@ -121,6 +121,21 @@ function createTables() {
   // (冪等。sku_map 本体の DROP は SKU統合Step7 の判断に従う)
   db.exec('DROP TABLE IF EXISTS mirror_sku_map');
 
+  // shipping-log 吸い上げ廃止 (2026-08-26 中原さん判断)。納品書PDF/ピッキングリストPDFの OCR 再抽出は
+  // 梱包支援 (apps/packing) / スマホピッキング (apps/picking) の Drive 取込が本番系になったため役目終了。
+  // 取込 API・Notion担当者cronごと撤去したので受け皿の表も落とす (冪等。append-only trigger も一緒に消える)。
+  // fail-soft: DROP でこけても mirror 本体の初期化は止めない (2026-07-12 障害の教訓)
+  try {
+    db.exec(`
+      DROP VIEW IF EXISTS v_sl_slips_staff;
+      DROP TABLE IF EXISTS sl_shipping_slips;
+      DROP TABLE IF EXISTS sl_picking_batches;
+      DROP TABLE IF EXISTS sl_batch_staff;
+    `);
+  } catch (e) {
+    console.error('[mirror] sl_* (shipping-log 旧取込) の DROP に失敗 (続行):', e.message);
+  }
+
   // ─── dim_mall: モールマスタ (設計監査 2026-07-06 PR-11) ───
   // MALL_ORDER/MALL_LABEL/TAX_INCLUDED_MALLS/MALL_FEE_RATES 等の散在ハードコードの正本。
   // code-owned config なので boot 時に seed で全置換 (手編集しない。変更はこの配列を直す)。
