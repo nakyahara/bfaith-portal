@@ -267,26 +267,50 @@
     </div>
   </div>
 
-  <!-- 欠品数量シート (2段階: 数量選択 → 送信確認。誤タップでの記録+LINE通知を防ぐ) -->
-  <div id="shortSheet" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:50; align-items:center; justify-content:center;">
-    <div style="background:#1c2127; border-radius:14px; padding:20px; max-width:340px; width:90%; text-align:center;">
+  <!-- 欠品シート v2 (要件『ピッキング欠品フローv2_要件定義_20260826.md』):
+       ⚠欠品 を押した瞬間から計測停止 → ①足りない数 → ②他ロケ一覧 (行タップ=そこで確保した / 後で取りに行く / どこにもない)
+       → ③確保した数 → (残りがあれば) ④残りの扱い。確認ダイアログは置かない (中原さん方針: ガードを重ねない) -->
+  <div id="shortSheet" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.78); z-index:50; align-items:center; justify-content:center;">
+    <div style="background:#1c2127; border-radius:14px; padding:18px 16px; max-width:400px; width:94%; max-height:92vh; overflow:auto; text-align:center;">
       <div id="shortStep1">
-        <h3 style="margin:0 0 6px; font-size:1.05em;">⚠ 欠品の数量</h3>
+        <h3 style="margin:0 0 6px; font-size:1.1em;">⚠ このロケで足りない数</h3>
         <div id="shortInfo" style="color:#adb5bd; font-size:0.9em; margin-bottom:12px;"></div>
         <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:16px;">
-          <button id="shortMinus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
-          <span id="shortQty" style="font-size:44px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
-          <button id="shortPlus" style="width:56px; height:56px; font-size:28px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
+          <button id="shortMinus" style="width:60px; height:60px; font-size:30px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
+          <span id="shortQty" style="font-size:46px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
+          <button id="shortPlus" style="width:60px; height:60px; font-size:30px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
         </div>
-        <button id="shortConfirm" style="width:100%; padding:14px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.1em; font-weight:700; cursor:pointer;">欠品として記録する</button>
-        <button id="shortCancel" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">キャンセル</button>
+        <button id="shortConfirm" style="width:100%; padding:16px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.15em; font-weight:700; cursor:pointer;">足りない → 他のロケを見る</button>
+        <button id="shortCancel" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">やめる (欠品ではなかった)</button>
       </div>
       <div id="shortStep2" style="display:none;">
-        <h3 style="margin:0 0 10px; font-size:1.05em;">⚠ 確認</h3>
-        <div id="shortStep2Info" style="color:#f1f3f5; font-size:1.0em; line-height:1.7; margin-bottom:16px;"></div>
-        <div style="color:#adb5bd; font-size:0.9em; margin-bottom:16px;">欠品として記録し、管理者へLINEで通知を送信しますか?</div>
-        <button id="shortYes" style="width:100%; padding:16px; border:none; border-radius:12px; background:#e03131; color:#fff; font-size:1.15em; font-weight:700; cursor:pointer;">はい、送信する</button>
-        <button id="shortNo" style="width:100%; margin-top:8px; padding:12px; border:1px solid #343a40; border-radius:12px; background:#111418; color:#adb5bd; font-size:1.05em; cursor:pointer;">いいえ、やめる</button>
+        <h3 style="margin:0 0 4px; font-size:1.1em;">📍 他のロケにある在庫</h3>
+        <div id="shortStockMeta" style="color:#868e96; font-size:0.8em; margin-bottom:10px;"></div>
+        <div id="shortLocs" style="display:grid; gap:8px; text-align:left;"></div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px;">
+          <button id="shortLater" style="padding:16px 6px; border:none; border-radius:12px; background:#e8590c; color:#fff; font-size:1.1em; font-weight:800; line-height:1.3; cursor:pointer;">🕒 後で<br>取りに行く</button>
+          <button id="shortNone" style="padding:16px 6px; border:2px solid #868e96; border-radius:12px; background:#111418; color:#f1f3f5; font-size:1.1em; font-weight:800; line-height:1.3; cursor:pointer;">❌ どこにも<br>ない</button>
+        </div>
+        <button id="shortCancel2" style="width:100%; margin-top:10px; padding:10px; border:none; background:none; color:#868e96; font-size:0.95em; cursor:pointer;">やめる (欠品ではなかった)</button>
+      </div>
+      <div id="shortStep3" style="display:none;">
+        <h3 style="margin:0 0 6px; font-size:1.1em;">📦 このロケで確保した数</h3>
+        <div id="shortAltInfo" style="color:#f1f3f5; font-size:1.05em; line-height:1.6; margin-bottom:12px;"></div>
+        <div style="display:flex; align-items:center; justify-content:center; gap:18px; margin-bottom:16px;">
+          <button id="altMinus" style="width:60px; height:60px; font-size:30px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">−</button>
+          <span id="altQty" style="font-size:46px; font-weight:800; min-width:70px; font-variant-numeric:tabular-nums;">1</span>
+          <button id="altPlus" style="width:60px; height:60px; font-size:30px; border-radius:12px; border:1px solid #343a40; background:#111418; color:#f1f3f5;">＋</button>
+        </div>
+        <button id="altOk" style="width:100%; padding:16px; border:none; border-radius:12px; background:#2f9e44; color:#fff; font-size:1.15em; font-weight:700; cursor:pointer;">この数で確保した</button>
+        <button id="altBack" style="width:100%; margin-top:8px; padding:10px; border:none; background:none; color:#868e96; font-size:1em; cursor:pointer;">← ロケ一覧に戻る</button>
+      </div>
+      <div id="shortStep4" style="display:none;">
+        <h3 id="shortRestTitle" style="margin:0 0 12px; font-size:1.1em;">残り 1 個は?</h3>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+          <button id="restLater" style="padding:16px 6px; border:none; border-radius:12px; background:#e8590c; color:#fff; font-size:1.1em; font-weight:800; line-height:1.3; cursor:pointer;">🕒 後で<br>取りに行く</button>
+          <button id="restNone" style="padding:16px 6px; border:2px solid #868e96; border-radius:12px; background:#111418; color:#f1f3f5; font-size:1.1em; font-weight:800; line-height:1.3; cursor:pointer;">❌ どこにも<br>ない</button>
+        </div>
+        <button id="restBack" style="width:100%; margin-top:10px; padding:10px; border:none; background:none; color:#868e96; font-size:0.95em; cursor:pointer;">← 確保した数を直す</button>
       </div>
     </div>
   </div>
@@ -325,10 +349,12 @@
       totalQty: state.batch.total_qty, currentSeq: state.currentSeq,
       pauseReason: state.batch.pause_reason || null,
       folderName: state.batch.folder_name || null,
+      shortageOpenSeq: state.batch.shortage_open_seq ?? null,   // 欠品対応シートを開いたまま閉じた/リロードしたときの復帰用
     }).replace(/</g, '\\u003c') %>;
     const LINES = <%- JSON.stringify(state.lines.map((l) => ({
       seq: l.seq, loc: l.locationLabel, sku: l.sku, name: l.product_name || '',
-      qty: l.qty, status: l.status, img: l.imageUrl,
+      qty: l.qty, status: l.status, img: l.imageUrl, shortage_qty: l.shortage_qty ?? null,
+      remaining_qty: l.remaining_qty ?? null, alt_qty: l.alt_qty ?? null,
       block: l.block || '', location: l.location || '',   // NEXTサインの判定用 (生のロケ)
     }))).replace(/</g, '\\u003c') %>;
     // ロケーション動線マスタ (面)。判定は next-sign.js (サーバーと同じコード)
@@ -357,8 +383,13 @@
       const line = LINES.find((l) => l.seq === op.line_seq);
       if (!line) continue;
       if (op.event === 'next') { line.status = 'done'; NEXTOPS[op.line_seq] = op.op_id; }
-      if (op.event === 'shortage') { line.status = 'shortage'; line.shortage_qty = op.shortage_qty; NEXTOPS[op.line_seq] = op.op_id; }
-      if (op.event === 'back') { line.status = 'pending'; line.shortage_qty = null; }
+      if (op.event === 'shortage') {
+        line.status = 'shortage'; line.shortage_qty = op.shortage_qty; NEXTOPS[op.line_seq] = op.op_id; BATCH.shortageOpenSeq = null;
+        line.alt_qty = op.alt_qty || null; line.remaining_qty = Math.max(0, (op.shortage_qty || 0) - (op.alt_qty || 0));
+      }
+      if (op.event === 'shortage_open') BATCH.shortageOpenSeq = op.line_seq;
+      if (op.event === 'shortage_cancel') BATCH.shortageOpenSeq = null;
+      if (op.event === 'back') { line.status = 'pending'; line.shortage_qty = null; line.alt_qty = null; line.remaining_qty = null; }
     }
     // 中断中 (paused) も「開始済み」。中断中に画面を開き直してから再開すると、これが false のままで
     // render() が開始画面に飛び「再開できない」ように見えた (2026-08-25 出荷_02 中原さん報告)
@@ -602,13 +633,19 @@
       const startMs = BATCH.startedAt ? Date.parse(BATCH.startedAt) : null;
       const secs = startMs ? Math.max(0, Math.round((Date.now() - startMs) / 1000)) : null;
       const perLine = secs != null && LINES.length > 0 ? (secs / LINES.length).toFixed(1) : '-';
-      const shorts = LINES.filter((l) => l.status === 'shortage');
+      // 欠品 = 残りがある明細だけ (他ロケで全量確保した分は「他ロケから確保」として別に出す — 要件v2 Q3)
+      const remOf = (l) => l.remaining_qty ?? l.shortage_qty ?? 0;
+      const shorts = LINES.filter((l) => l.status === 'shortage' && remOf(l) > 0);
+      const alts = LINES.filter((l) => l.status === 'shortage' && remOf(l) === 0);
       $('doneStats').innerHTML =
         `明細 <b>${LINES.length}</b> 件 / 数量 <b>${BATCH.totalQty}</b><br>` +
         (secs != null ? `所要 <b>${Math.floor(secs / 60)}</b> 分 ${secs % 60} 秒 (約${perLine}秒/明細)` : '') +
         (shorts.length > 0
           ? `<br><span style="color:#ffa8a8">⚠ 欠品 ${shorts.length} 件</span><br>` +
-            shorts.map((l) => `<span style="font-size:0.75em; color:#ffa8a8">${esc(l.loc)} ${esc(l.sku)} 欠品${l.shortage_qty}</span>`).join('<br>')
+            shorts.map((l) => `<span style="font-size:0.75em; color:#ffa8a8">${esc(l.loc)} ${esc(l.sku)} 欠品${remOf(l)}</span>`).join('<br>')
+          : '') +
+        (alts.length > 0
+          ? `<br><span style="color:#69db7c">📦 他ロケから確保 ${alts.length} 件</span>`
           : '');
       show('scr-done');
     }
@@ -670,45 +707,114 @@
     // iOS は最初のユーザー操作で speechSynthesis をアンロックする必要がある (capture=ボタン処理より先)
     document.addEventListener('click', () => { speak(''); }, { once: true, capture: true });
 
-    // ── 欠品 (数量ステッパー: 既定=全量欠品。一部だけ取れたときは減らす) ──
-    let shortTarget = null;
-    let shortVal = 1;
-    $('shortBtn').addEventListener('click', () => {
+    // ── 欠品フローv2 (2026-08-26 中原さん承認・要件『ピッキング欠品フローv2_要件定義_20260826.md』) ──
+    // 「⚠ 欠品」を押した瞬間に shortage_open (計測停止) → 判断確定で shortage (計測再開) を1回送る。
+    // 途中で閉じた/リロードしても BATCH.shortageOpenSeq から同じシートに戻る (聞かない)
+    let shortTarget = null;   // 対象明細
+    let shortVal = 1;         // このロケで足りない数
+    let shortAlt = null;      // 確保するロケ {block, location, label, free}
+    let altVal = 1;           // そのロケで確保した数
+    function showShortStep(n) {
+      for (const k of [1, 2, 3, 4]) $(`shortStep${k}`).style.display = k === n ? 'block' : 'none';
+      $('shortSheet').style.display = 'flex';
+      $('shortSheet').querySelector('div').scrollTop = 0;
+    }
+    function openShortSheet(sendOpen) {
       const idx = currentIdx();
       if (idx === -1) return;
       shortTarget = LINES[idx];
       shortVal = shortTarget.qty;
-      $('shortInfo').textContent = `${shortTarget.loc}｜${shortTarget.sku} (指示 ${shortTarget.qty}個)`;
+      shortAlt = null;
+      $('shortInfo').textContent = `${shortTarget.loc}｜${splitName(shortTarget.name).main} (指示 ${shortTarget.qty}個)`;
       $('shortQty').textContent = shortVal;
-      $('shortSheet').style.display = 'flex';
-    });
+      if (sendOpen) { BATCH.shortageOpenSeq = shortTarget.seq; enqueue('shortage_open', shortTarget.seq); }
+      showShortStep(1);
+    }
+    function closeShortSheet() { $('shortSheet').style.display = 'none'; }
+    function cancelShort() {
+      // 誤タップ: 計測を再開して元の画面へ (記録は残らない)
+      if (shortTarget) { BATCH.shortageOpenSeq = null; enqueue('shortage_cancel', shortTarget.seq); }
+      closeShortSheet();
+    }
+    $('shortBtn').addEventListener('click', () => openShortSheet(true));
     $('shortMinus').addEventListener('click', () => { if (shortVal > 1) $('shortQty').textContent = --shortVal; });
     $('shortPlus').addEventListener('click', () => { if (shortTarget && shortVal < shortTarget.qty) $('shortQty').textContent = ++shortVal; });
-    function closeShortSheet() {
-      $('shortSheet').style.display = 'none';
-      $('shortStep1').style.display = 'block';
-      $('shortStep2').style.display = 'none';
-    }
-    $('shortCancel').addEventListener('click', closeShortSheet);
-    // 1段階目: 数量確定 → 確認画面へ (ここではまだ何も記録しない)
-    $('shortConfirm').addEventListener('click', () => {
+    $('shortCancel').addEventListener('click', cancelShort);
+    $('shortCancel2').addEventListener('click', cancelShort);
+
+    // ② 他ロケ一覧 (ロジザード毎時スナップショット)。取得失敗と候補ゼロは別表示
+    $('shortConfirm').addEventListener('click', () => { showShortStep(2); loadShortLocs(); });
+    async function loadShortLocs() {
       if (!shortTarget) return;
-      $('shortStep2Info').innerHTML =
-        `${esc(shortTarget.loc)}<br><b>${esc(splitName(shortTarget.name).main)}</b><br>欠品 <b style="font-size:1.4em">${shortVal}</b> 個 (指示 ${shortTarget.qty} 個)`;
-      $('shortStep1').style.display = 'none';
-      $('shortStep2').style.display = 'block';
+      $('shortStockMeta').textContent = '在庫を確認中…';
+      $('shortLocs').innerHTML = '';
+      let body = null;
+      try {
+        const res = await fetch(`/apps/picking/api/batches/${BATCH.id}/stock-locations?seq=${shortTarget.seq}`, { cache: 'no-store' });
+        body = await res.json();
+      } catch { body = null; }
+      if (!body || !body.ok || !body.fetched) {
+        $('shortStockMeta').innerHTML = body && body.configured === false
+          ? '在庫情報は使えません (連携未設定)'
+          : `在庫情報を取得できませんでした <button id="shortReload" style="margin-left:6px; padding:6px 12px; border:1px solid #495057; border-radius:8px; background:#111418; color:#f1f3f5; font-size:0.95em;">再読込</button>`;
+        const rb = $('shortReload');
+        if (rb) rb.addEventListener('click', loadShortLocs);
+        return;
+      }
+      const rows = body.rows || [];
+      $('shortStockMeta').textContent = rows.length === 0
+        ? `他のロケに在庫なし (${body.stamp || '時刻不明'} 時点${body.stale ? '・古い可能性' : ''})`
+        : `${body.stamp || '時刻不明'} 時点のロジザード在庫${body.stale ? ' (古い可能性あり)' : ''} — タップ＝そこで確保した`;
+      $('shortLocs').innerHTML = rows.map((r, k) => `
+        <button class="short-loc" data-k="${k}" style="display:flex; align-items:center; justify-content:space-between; gap:10px; padding:14px 12px; border:2px solid #2b8a3e; border-radius:12px; background:#0f1b13; color:#f1f3f5; font-size:1.05em; cursor:pointer; text-align:left;">
+          <span style="font-weight:800; font-size:1.15em; letter-spacing:0.02em;">${esc(r.label)}</span>
+          <span style="white-space:nowrap;"><b style="font-size:1.3em;">${r.free}</b> 個${r.expiry ? `<br><small style="color:#adb5bd">期限 ${esc(r.expiry)}</small>` : ''}</span>
+        </button>`).join('');
+      $('shortLocs').querySelectorAll('.short-loc').forEach((btn) => btn.addEventListener('click', () => {
+        shortAlt = rows[Number(btn.dataset.k)];
+        altVal = Math.max(1, Math.min(shortVal, shortAlt.free || shortVal));
+        $('shortAltInfo').innerHTML = `<b style="font-size:1.2em;">${esc(shortAlt.label)}</b><br><small style="color:#adb5bd">表示在庫 ${shortAlt.free} 個 / 足りない数 ${shortVal} 個</small>`;
+        $('altQty').textContent = altVal;
+        showShortStep(3);
+      }));
+    }
+
+    // ③ 確保した数 (上限=足りない数。表示在庫は超えてよい — 本人が数えた数が正・確認は出さない)
+    $('altMinus').addEventListener('click', () => { if (altVal > 1) $('altQty').textContent = --altVal; });
+    $('altPlus').addEventListener('click', () => { if (altVal < shortVal) $('altQty').textContent = ++altVal; });
+    $('altBack').addEventListener('click', () => showShortStep(2));
+    $('altOk').addEventListener('click', () => {
+      if (altVal >= shortVal) { resolveShort({ alt: shortAlt, altQty: altVal, remaining: null }); return; }
+      $('shortRestTitle').textContent = `残り ${shortVal - altVal} 個は?`;
+      showShortStep(4);
     });
-    // 2段階目: はい=記録+LINE通知 / いいえ=何もせず閉じる (誤タップ対策)
-    $('shortYes').addEventListener('click', () => {
+    // ④ 残りの扱い
+    $('restBack').addEventListener('click', () => showShortStep(3));
+    $('restLater').addEventListener('click', () => resolveShort({ alt: shortAlt, altQty: altVal, remaining: 'later' }));
+    $('restNone').addEventListener('click', () => resolveShort({ alt: shortAlt, altQty: altVal, remaining: 'none' }));
+    // ② 直接: 他ロケを使わない
+    $('shortLater').addEventListener('click', () => resolveShort({ alt: null, altQty: 0, remaining: 'later' }));
+    $('shortNone').addEventListener('click', () => resolveShort({ alt: null, altQty: 0, remaining: 'none' }));
+
+    function resolveShort({ alt, altQty, remaining }) {
       if (!shortTarget) return;
       closeShortSheet();
       shortTarget.status = 'shortage';
       shortTarget.shortage_qty = shortVal;
-      enqueue('shortage', shortTarget.seq, null, { shortage_qty: shortVal });
+      shortTarget.alt_qty = altQty || null;
+      shortTarget.remaining_qty = Math.max(0, shortVal - (altQty || 0));
+      BATCH.shortageOpenSeq = null;
+      enqueue('shortage', shortTarget.seq, null, {
+        shortage_qty: shortVal,
+        alt_block: alt ? alt.block : null,
+        alt_location: alt ? alt.location : null,
+        alt_qty: altQty || 0,
+        alt_free: alt ? alt.free : null,   // 通知の一言用 (表示在庫より多く確保したとき)。記録はしない
+        remaining: remaining || null,
+      });
       if (navigator.vibrate) navigator.vibrate([30, 50, 30]);
       render();
-    });
-    $('shortNo').addEventListener('click', closeShortSheet);
+    }
 
     // ── 中断 / 再開 / 取消 ──
     $('pauseBtn').addEventListener('click', () => { $('pauseSheet').style.display = 'flex'; });
@@ -798,6 +904,7 @@
     document.addEventListener('touchend', (e) => {
       if (!touchStart || !started) return;
       if (!$('scr-pick').classList.contains('active')) return;
+      if (sheetOpen()) { touchStart = null; return; }   // 欠品シート内のスワイプで背面の「次へ」を押さない (Codex R2)
       const dx = e.changedTouches[0].clientX - touchStart.x;
       const dy = e.changedTouches[0].clientY - touchStart.y;
       touchStart = null;
@@ -914,6 +1021,9 @@
       acquireWakeLock();
       flush();
       render();
+      // 欠品対応の途中で閉じた/リロードした → 同じ明細ならシートを開き直す (計測は止まったまま)
+      const ci = currentIdx();
+      if (started && ci !== -1 && BATCH.shortageOpenSeq === LINES[ci].seq) openShortSheet(false);
     }
 
     // 選択シートは2モード: boot=これから作業する人を選ぶ / takeover=作業中の担当を交代する

@@ -144,12 +144,18 @@ export async function fetchStockBlock(blockCode, fetchFn = fetch) {
  * - フリー在庫の多い順に最大 MAX_LINES 件
  * @param data fetchStockLocations の戻り値 (null = 取得失敗)
  */
-export function buildStockLocationsText(data, {
+/**
+ * 他ロケ候補を配列で返す (欠品フローv2 の画面表示用。通知本文の整形と同じ絞り込み・並び)。
+ * 良品・free>0・現ロケ除外。棚ロケ先・ロケ合計フリーの多い順・同ロケは期限の近い順。
+ * @returns {{fetched: boolean, stamp: string|null, stale: boolean, rows: Array<{block,location,label,free,expiry,allocated}>}}
+ */
+export function listStockCandidates(data, {
   excludeBlock, excludeLocation, now = new Date(),
-  // stock-bot (GChat在庫検索) からの流用用: 見出しと表示行数を差し替えられる
-  title = '他ロケ在庫', maxLines = MAX_LINES,
+  // 画面用: 同一ロケのロット/期限違いを1行にまとめ (free合計・期限は最も近いもの)、件数上限をかける。
+  // 通知本文 (LINE/GChat) は従来どおり期限ロットごとの行
+  groupByLocation = false, maxRows = null,
 } = {}) {
-  if (!data) return `📍 ${title}: 取得できず`;
+  if (!data) return { fetched: false, stamp: null, stale: true, rows: [] };
   const excludeDigits = normalizeLocationDigits(excludeLocation);
   const candidates = (data.locations || [])
     .filter((r) => String(r.quality || '') === '良品')
@@ -162,33 +168,59 @@ export function buildStockLocationsText(data, {
   // 造語 (「仮想ロケ」等) にせずそのままの名前で見せる。
   // 並び = ロケ合計フリー在庫の多い順。同ロケの期限違いロットは隣接させて期限の近い順 (先入先出)
   const isShelf = (r) => normalizeLocationDigits(r.location).length === 8;
-  const locKey = (r) => `${r.block}${r.location}`;
+  const locKey = (r) => `${r.block}\u001f${r.location}`;   // 区切り無しだと block=A/loc=BC と block=AB/loc=C が衝突する
   const locTotals = new Map();
   for (const r of candidates) locTotals.set(locKey(r), (locTotals.get(locKey(r)) || 0) + Number(r.free));
   const byLocThenExpiry = (a, b) => (locTotals.get(locKey(b)) - locTotals.get(locKey(a)))
     || String(a.location).localeCompare(String(b.location))
     || String(a.expiry || '9999').localeCompare(String(b.expiry || '9999'));
-  const rows = [...candidates.filter(isShelf).sort(byLocThenExpiry), ...candidates.filter((r) => !isShelf(r)).sort(byLocThenExpiry)];
-
+  const sorted = [...candidates.filter(isShelf).sort(byLocThenExpiry), ...candidates.filter((r) => !isShelf(r)).sort(byLocThenExpiry)];
   const stamp = jstStamp(data.importedAt, now);
   const ageMin = Number.isFinite(Date.parse(data.importedAt || '')) ? (now.getTime() - Date.parse(data.importedAt)) / 60000 : null;
   const stale = ageMin === null || ageMin > STALE_WARN_MIN;
-  const header = `📍 ${title} (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
-  if (rows.length === 0) return `${header}: なし`;
-  const lines = rows.slice(0, maxLines).map((r) => {
+  const rows = sorted.map((r) => {
     const block = String(r.block || '');
     const loc = String(r.location || '');
     // ZZZ ブロックはロケ名にもZZZが含まれる (ZZZ-ZZZ-ZZ) ため、重ねて「ZZZ-ZZZ-ZZZ-ZZ」にしない。
     // 前方一致は「-」境界まで見る (ZZZ2-… のような別ブロックを誤って省略しない)
     const dup = loc === block || loc.startsWith(`${block}-`);
     const label = block && !dup ? `${block}-${loc}` : (loc || block);
+    return { block, location: loc, label, free: Number(r.free), expiry: formatExpiry(r.expiry), allocated: Number(r.allocated) || 0 };
+  });
+  let out = rows;
+  if (groupByLocation) {
+    const m = new Map();
+    for (const r of rows) {
+      const k = `${r.block}\u001f${r.location}`;
+      if (!m.has(k)) { m.set(k, { ...r }); continue; }
+      const g = m.get(k);
+      g.free += r.free;
+      g.allocated += r.allocated;
+      if (r.expiry && (!g.expiry || r.expiry < g.expiry)) g.expiry = r.expiry;
+    }
+    out = [...m.values()];
+  }
+  const truncated = maxRows != null && out.length > maxRows ? out.length - maxRows : 0;
+  if (truncated) out = out.slice(0, maxRows);
+  return { fetched: true, stamp: stamp || (data.stockDate ? `在庫日${data.stockDate}` : null), stale, rows: out, truncated };
+}
+
+export function buildStockLocationsText(data, {
+  excludeBlock, excludeLocation, now = new Date(),
+  // stock-bot (GChat在庫検索) からの流用用: 見出しと表示行数を差し替えられる
+  title = '他ロケ在庫', maxLines = MAX_LINES,
+} = {}) {
+  if (!data) return `📍 ${title}: 取得できず`;
+  const { stamp, stale, rows } = listStockCandidates(data, { excludeBlock, excludeLocation, now });
+  const header = `📍 ${title} (${stamp || `在庫日${data.stockDate || '不明'}`}時点${stale ? ' ⚠古い可能性' : ''})`;
+  if (rows.length === 0) return `${header}: なし`;
+  const lines = rows.slice(0, maxLines).map((r) => {
     // 補足は1つの括弧にまとめる: (期限2028/01/15・別途引当10)
     const notes = [];
-    const expiry = formatExpiry(r.expiry);
-    if (expiry) notes.push(`期限${expiry}`);
-    if (Number(r.allocated) > 0) notes.push(`別途引当${r.allocated}`);
+    if (r.expiry) notes.push(`期限${r.expiry}`);
+    if (r.allocated > 0) notes.push(`別途引当${r.allocated}`);
     // 区切りは「→」— 「01: 200」のようなコロンはLINEが時刻と誤認してリンク化する
-    return `・${label} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
+    return `・${r.label} → ${r.free}個${notes.length > 0 ? ` (${notes.join('・')})` : ''}`;
   });
   if (rows.length > maxLines) lines.push(`…他${rows.length - maxLines}ロケ`);
   // LINEの本文上限5,000字を超えると返信ごと拒否される。超えそうなときだけ末尾から間引く

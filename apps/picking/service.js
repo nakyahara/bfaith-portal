@@ -377,7 +377,7 @@ export function importBatch(preview, { hikiateClass, folderName, overwrite }, ac
 // イベント種別 (PR2): start / next / back / complete は next の最終行で自動。
 // shortage / pause / resume / cancel は PR4 で追加する。
 
-const WORK_EVENTS = ['start', 'next', 'back', 'takeover', 'shortage', 'pause', 'resume', 'cancel'];
+const WORK_EVENTS = ['start', 'next', 'back', 'takeover', 'shortage', 'shortage_open', 'shortage_cancel', 'pause', 'resume', 'cancel'];
 
 // 中断理由 (要件§5.6。shipping-work の保留理由マスタと粒度を揃えた最小セット)
 export const PAUSE_REASONS = ['休憩', '他作業への応援', 'その他'];
@@ -417,6 +417,25 @@ export function getWorkState(batchId) {
 }
 
 /**
+ * 欠品対応セッションを閉じる。開いていた区間 (open_at〜at) を paused_total_sec に加算する
+ * (= 中断と同じ扱いで実働から除外。サマリ/ボード/フロア/Notion の実働秒は既存計算のまま)。
+ * 別の明細で開いていた/開いていなければ、列を消すだけ。
+ */
+function closeShortageSession(db, batch, lineSeq, at, now) {
+  // その明細で開いているときだけ閉じる (二重タップ・別明細のセッションは触らない — Codex R2)
+  if (!batch.shortage_open_at || batch.shortage_open_seq !== lineSeq) return;
+  const sec = Math.max(0, Math.round((Date.parse(at) - Date.parse(batch.shortage_open_at)) / 1000));
+  db.prepare(`UPDATE pk_batches SET paused_total_sec = paused_total_sec + ?,
+    shortage_open_at=NULL, shortage_open_seq=NULL, updated_at=? WHERE id=?`).run(sec, now, batch.id);
+  // 明細単位の所要時間 (done_at - shown_at: 作業者別/分類別/ボード) からも同じ秒数を除く。
+  // shown_at を後ろへずらす = 「欠品対応の分だけ表示が遅く始まった」とみなす (Codex R2 critical)
+  if (sec > 0) {
+    db.prepare(`UPDATE pk_lines SET shown_at = strftime('%Y-%m-%dT%H:%M:%SZ', shown_at, '+' || ? || ' seconds')
+      WHERE batch_id=? AND seq=? AND shown_at IS NOT NULL`).run(sec, batch.id, lineSeq);
+  }
+}
+
+/**
  * 端末の発生時刻を「now以前・24時間以内」にクランプして採用する (中断時間の計測用)。
  * 通常イベントの計測はサーバー時刻が正のままで、pause/resume だけこの値を使う。
  */
@@ -447,7 +466,7 @@ function eventResult(batchId, transition = null) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, shortageQty, pauseReason }, worker) {
+export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, shortageQty, pauseReason, altBlock, altLocation, altQty, remaining }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PkError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -465,7 +484,11 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
           && prev.event === event && (prev.line_seq ?? null) === (lineSeq ?? null)
           && (prevPayload.undoOpId ?? null) === (undoOpId ?? null)
           && (prevPayload.shortageQty ?? null) === (shortageQty ?? null)
-          && (prevPayload.pauseReason ?? null) === (pauseReason ?? null)) {
+          && (prevPayload.pauseReason ?? null) === (pauseReason ?? null)
+          && (prevPayload.altBlock ?? null) === (altBlock ?? null)
+          && (prevPayload.altLocation ?? null) === (altLocation ?? null)
+          && (prevPayload.altQty ?? null) === (altQty ?? null)
+          && (prevPayload.remaining ?? null) === (remaining ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
       throw new PkError(409, 'op_conflict', '同じ操作IDが別の内容で使われています');
@@ -537,8 +560,10 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
           paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
       `).run(now, batchId);
       db.prepare(`
-        UPDATE pk_lines SET status='pending', shown_at=NULL, done_at=NULL, shortage_qty=NULL WHERE batch_id=?
+        UPDATE pk_lines SET status='pending', shown_at=NULL, done_at=NULL, shortage_qty=NULL,
+          alt_block=NULL, alt_location=NULL, alt_qty=NULL, remaining_qty=NULL, remaining=NULL WHERE batch_id=?
       `).run(batchId);
+      db.prepare('UPDATE pk_batches SET shortage_open_at=NULL, shortage_open_seq=NULL WHERE id=?').run(batchId);
     } else if (event === 'start') {
       if (batch.status === 'picking') {
         if (batch.worker !== worker) {
@@ -578,7 +603,25 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
       const line = db.prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=?').get(batchId, lineSeq);
       if (!line) throw new PkError(404, 'line_not_found', `明細 ${lineSeq} がありません`);
 
-      if (event === 'next' || event === 'shortage') {
+      if (event === 'shortage_open' || event === 'shortage_cancel') {
+        // 欠品フローv2: 「⚠ 欠品」を押した瞬間から判断確定までを欠品対応セッションとして
+        // 計測から除外する (探しに行く時間で個人スピードが落ちない — 中原さん指示 2026-08-26)。
+        // open は既に同じ明細で開いていればそのまま (開き直し・再送で開始時刻を後ろにずらさない)
+        const cur = db.prepare(
+          "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
+        ).get(batchId).s;
+        if (cur !== lineSeq) {
+          throw new PkError(409, 'out_of_order', `明細 ${lineSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
+        }
+        if (event === 'shortage_open') {
+          if (batch.shortage_open_seq !== lineSeq) {
+            db.prepare('UPDATE pk_batches SET shortage_open_at=?, shortage_open_seq=?, updated_at=? WHERE id=?')
+              .run(clampedEventTime(clientAt, now), lineSeq, now, batchId);
+          }
+        } else {
+          closeShortageSession(db, batch, lineSeq, clampedEventTime(clientAt, now), now);
+        }
+      } else if (event === 'next' || event === 'shortage') {
         // 表示中の明細 (= 最小の pending) 以外への操作は、キュー順序が壊れている兆候なので拒否
         const cur = db.prepare(
           "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
@@ -587,16 +630,35 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
           throw new PkError(409, 'out_of_order', `明細 ${lineSeq} は現在の対象 (${cur ?? 'なし'}) ではありません`);
         }
         if (event === 'shortage') {
-          // 欠品: 数量は 1〜指示数 (未指定は全量欠品)。一部欠品 = 取れた分だけ取って残りを欠品
+          // 欠品: 数量は 1〜指示数 (未指定は全量欠品)。一部欠品 = 取れた分だけ取って残りを欠品。
+          // v2: 他ロケで確保した数 (alt_qty) と、残りをどうするか (remaining: later/none) を同時に記録する。
+          // 旧クライアント (alt無し・remaining無し) は「残り全量=欠品確定 (none)」として扱う
           const q = shortageQty == null ? line.qty : Number(shortageQty);
           if (!Number.isInteger(q) || q < 1 || q > line.qty) {
             throw new PkError(400, 'bad_shortage_qty', `欠品数量は1〜${line.qty}で指定してください`);
           }
-          db.prepare("UPDATE pk_lines SET status='shortage', done_at=?, shortage_qty=? WHERE batch_id=? AND seq=?")
-            .run(now, q, batchId, lineSeq);
+          const a = altQty == null ? 0 : Number(altQty);
+          if (!Number.isInteger(a) || a < 0 || a > q) {
+            throw new PkError(400, 'bad_alt_qty', `他ロケで確保した数は0〜${q}で指定してください`);
+          }
+          const altLoc = a > 0 ? String(altLocation || '').trim().slice(0, 40) : null;
+          if (a > 0 && !altLoc) throw new PkError(400, 'bad_alt_location', '確保したロケーションを指定してください');
+          const altBlk = a > 0 ? (String(altBlock || '').trim().slice(0, 20) || null) : null;
+          const remQty = q - a;
+          const rem = remQty > 0 ? (remaining || 'none') : null;
+          if (rem != null && !['later', 'none'].includes(rem)) {
+            throw new PkError(400, 'bad_remaining', '残りの扱いは later か none です');
+          }
+          db.prepare(`UPDATE pk_lines SET status='shortage', done_at=?, shortage_qty=?,
+              alt_block=?, alt_location=?, alt_qty=?, remaining_qty=?, remaining=?
+            WHERE batch_id=? AND seq=?`)
+            .run(now, q, altBlk, altLoc, a > 0 ? a : null, remQty, rem, batchId, lineSeq);
+          closeShortageSession(db, batch, lineSeq, clampedEventTime(clientAt, now), now);
         } else {
           db.prepare("UPDATE pk_lines SET status='done', done_at=? WHERE batch_id=? AND seq=?")
             .run(now, batchId, lineSeq);
+          // 欠品シートを開いたまま「次へ」は画面上できないが、セッションが残っていれば閉じる
+          if (batch.shortage_open_seq === lineSeq) closeShortageSession(db, batch, lineSeq, now, now);
         }
         const nextSeq = db.prepare(
           "SELECT MIN(seq) s FROM pk_lines WHERE batch_id=? AND status='pending'"
@@ -636,7 +698,9 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
             '取り消し対象の完了が見つからないか、別の操作で上書きされています');
         }
         // shown_at は now に更新 (この瞬間から再表示。再作業時間に前の明細の時間を混ぜない)
-        db.prepare("UPDATE pk_lines SET status='pending', done_at=NULL, shortage_qty=NULL, shown_at=? WHERE batch_id=? AND seq=?")
+        db.prepare(`UPDATE pk_lines SET status='pending', done_at=NULL, shortage_qty=NULL, shown_at=?,
+            alt_block=NULL, alt_location=NULL, alt_qty=NULL, remaining_qty=NULL, remaining=NULL
+          WHERE batch_id=? AND seq=?`)
           .run(now, batchId, lineSeq);
         if (backFromDone) {
           // 完了直後の取り消し: バッチを作業中に戻す
@@ -652,8 +716,8 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
       INSERT INTO pk_events (op_id, batch_id, worker, event, line_seq, payload_json, result_json, at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `).run(opId, batchId, worker, event, lineSeq ?? null,
-      (clientAt || undoOpId || shortageQty != null || pauseReason)
-        ? JSON.stringify({ clientAt, undoOpId, shortageQty, pauseReason }) : null,
+      (clientAt || undoOpId || shortageQty != null || pauseReason || altQty != null || remaining)
+        ? JSON.stringify({ clientAt, undoOpId, shortageQty, pauseReason, altBlock, altLocation, altQty, remaining }) : null,
       JSON.stringify(result), now);
     return result;
   })();
@@ -712,6 +776,7 @@ export function getDailySummary(workDate) {
         ORDER BY e.id DESC LIMIT 1) AS worker
     FROM pk_lines l JOIN pk_batches b ON b.id = l.batch_id
     WHERE b.work_date = ? AND b.validity = 'valid' AND l.status = 'shortage'
+      AND COALESCE(l.remaining_qty, l.shortage_qty, 1) > 0   -- 他ロケで全量確保した分は欠品に数えない (Q3・2026-08-26)
     ORDER BY b.id, l.seq
   `).all(workDate).map((l) => ({ ...l, locationLabel: formatLocation(l.block, l.location) }));
 
@@ -780,7 +845,7 @@ export function displayWorkerName(worker) {
  */
 function loadStatsLines(since, until) {
   return getDB().prepare(`
-    SELECT b.work_date, b.hikiate_class, b.id AS batch_id, l.seq, l.status,
+    SELECT b.work_date, b.hikiate_class, b.id AS batch_id, l.seq, l.status, l.shortage_qty, l.remaining_qty,
       CAST(ROUND((julianday(l.done_at) - julianday(l.shown_at)) * 86400) AS INTEGER) AS sec,
       COALESCE(
         (SELECT e.worker FROM pk_events e
@@ -907,7 +972,7 @@ export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS }
     w.lines++;
     w.sec += r.sec;
     w.expectedSec += baselineByKey.get(r.hikiate_class || '(不明)') ?? r.sec;
-    if (r.status === 'shortage') w.shortages++;
+    if (r.status === 'shortage' && (r.remaining_qty ?? r.shortage_qty ?? 1) > 0) w.shortages++;   // 他ロケで全量確保は数えない
     w.batches.add(r.batch_id);
     w.days.add(r.work_date);
     const ck = r.hikiate_class || '(不明)';
