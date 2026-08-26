@@ -82,7 +82,8 @@ const TARGETS = [
     file: 'warehouse-mirror.db',
     mode: 'logical',
     required: true,
-    sentinels: ['po_orders', 'sl_shipping_slips', 'f_mis_shipments', 'inv_snapshot'],
+    // sl_shipping_slips は 2026-08-26 の shipping-log 吸い上げ廃止で DROP 済みのため sentinel から外した
+    sentinels: ['po_orders', 'f_mis_shipments', 'inv_snapshot'],
   },
   { key: 'inquiry-hub', file: 'inquiry-hub.db', mode: 'vacuum', required: true, sentinels: ['inquiries', 'inquiry_messages'] },
   { key: 'fba', file: 'fba.db', mode: 'vacuum', required: false, sentinels: [] },

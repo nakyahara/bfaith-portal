@@ -22,7 +22,6 @@ delete process.env.GCHAT_WEBHOOK;
     CREATE TABLE mart_pl (id INTEGER PRIMARY KEY, v REAL);
     CREATE TABLE sync_run_ledger (id INTEGER PRIMARY KEY, note TEXT);
     CREATE TABLE po_orders (id INTEGER PRIMARY KEY, supplier TEXT, status TEXT);
-    CREATE TABLE sl_shipping_slips (id INTEGER PRIMARY KEY, slip_no TEXT);
     CREATE TABLE f_mis_shipments (id INTEGER PRIMARY KEY, detail TEXT);
     CREATE TABLE inv_snapshot (id INTEGER PRIMARY KEY, month TEXT);
     CREATE TABLE ai_reports (id INTEGER PRIMARY KEY, body TEXT);
@@ -33,7 +32,6 @@ delete process.env.GCHAT_WEBHOOK;
   const insPo = db.prepare('INSERT INTO po_orders (supplier, status) VALUES (?, ?)');
   for (let i = 0; i < 500; i++) insPo.run(`sup${i % 7}`, i % 2 ? 'open' : 'done');
   db.prepare('INSERT INTO mirror_products (name) VALUES (?)').run('should-be-excluded');
-  db.prepare('INSERT INTO sl_shipping_slips (slip_no) VALUES (?)').run('S-1');
   db.prepare('INSERT INTO f_mis_shipments (detail) VALUES (?)').run('m-1');
   db.prepare('INSERT INTO inv_snapshot (month) VALUES (?)').run('2026-06');
   db.prepare('INSERT INTO ai_reports (body) VALUES (?)').run('r-1');
@@ -107,18 +105,19 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   check('T3 sentinel 記録', mp.sentinels.po_orders === 500);
 }
 
-// ── T4: sentinel 0件 → 失敗 + staging即時掃除 (失敗経路で .tmp を残さない) ──
+// ── T4: sentinel 0件 → 失敗 + staging即時掃除 (失敗経路で .tmp を残さない)
+//        (対象は inv_snapshot。f_mis_shipments は append-only trigger で DELETE できない) ──
 {
   const db = new Database(path.join(TEST_DIR, 'warehouse-mirror.db'));
-  db.exec('DELETE FROM sl_shipping_slips');
+  db.exec('DELETE FROM inv_snapshot');
   db.close();
   let threw = false;
-  try { await runRenderBackup(); } catch (e) { threw = /sl_shipping_slips/.test(e.message); }
+  try { await runRenderBackup(); } catch (e) { threw = /inv_snapshot/.test(e.message); }
   check('T4 sentinel 0件で失敗', threw);
   check('T4 失敗後も staging ゴミなし', !fs.readdirSync(dailyDir).some((f) => f.endsWith('.tmp')));
   check('T4 失敗後も run.lock 解放済み', !fs.existsSync(path.join(TEST_DIR, 'backup-render', 'run.lock')));
   const db2 = new Database(path.join(TEST_DIR, 'warehouse-mirror.db'));
-  db2.prepare('INSERT INTO sl_shipping_slips (slip_no) VALUES (?)').run('S-2');
+  db2.prepare('INSERT INTO inv_snapshot (month) VALUES (?)').run('2026-06');
   db2.close();
 }
 
@@ -162,11 +161,10 @@ check('T1 小物DB欠如は警告扱い', summary.includes('🟡 fba なし'));
   {
     const db = new Database(path.join(T10, 'warehouse-mirror.db'));
     db.exec(`CREATE TABLE po_orders (id INTEGER PRIMARY KEY, s TEXT);
-      CREATE TABLE sl_shipping_slips (id INTEGER PRIMARY KEY);
       CREATE TABLE f_mis_shipments (id INTEGER PRIMARY KEY);
       CREATE TABLE inv_snapshot (id INTEGER PRIMARY KEY);`);
     db.prepare('INSERT INTO po_orders (s) VALUES (?)').run('x');
-    db.exec('INSERT INTO sl_shipping_slips DEFAULT VALUES; INSERT INTO f_mis_shipments DEFAULT VALUES; INSERT INTO inv_snapshot DEFAULT VALUES;');
+    db.exec('INSERT INTO f_mis_shipments DEFAULT VALUES; INSERT INTO inv_snapshot DEFAULT VALUES;');
     db.close();
     const db2 = new Database(path.join(T10, 'inquiry-hub.db'));
     db2.exec('CREATE TABLE inquiries (id INTEGER PRIMARY KEY); CREATE TABLE inquiry_messages (id INTEGER PRIMARY KEY);');
