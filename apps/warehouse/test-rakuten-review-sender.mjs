@@ -328,6 +328,28 @@ console.log('=== 6. PR-C5: coupon_owner (フォローとクーポンで担当が
   check('claim 直前に coupon_owner が vendor に変わったら送らない', claim.gateFailed === 'not_self_ownership');
 }
 
+console.log('=== 7. ensureCouponRegistry: 旧スキーマ (PR-C3 初期ドラフト) からの移行 ===');
+{
+  const dbOld = new Database(path.join(tmp, 'old-coupons.db'));
+  dbOld.exec(`CREATE TABLE rakuten_campaign_coupons (month TEXT PRIMARY KEY, coupon_code TEXT NOT NULL UNIQUE, pc_get_url TEXT NOT NULL,
+    coupon_start TEXT NOT NULL, coupon_end TEXT NOT NULL, issued_at TEXT NOT NULL, note TEXT)`);
+  ensureCouponRegistry(dbOld);
+  const cols = dbOld.prepare(`PRAGMA table_info(rakuten_campaign_coupons)`).all().map((c) => c.name);
+  check('0行の旧表は作り直され status/reserved_at を持つ', cols.includes('status') && cols.includes('reserved_at'));
+  check('作り直し後は reserveMonth が通る', reserveMonth(dbOld, { month: '2026-09', couponStart: '2026-09-01T00:00:00+09:00', couponEnd: '2026-11-30T23:59:59+09:00', nowIso: NOW }) === true);
+  ensureCouponRegistry(dbOld); // 冪等
+  check('新スキーマでは再実行しても行が残る', dbOld.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_coupons`).get().n === 1);
+  dbOld.close();
+  const dbOld2 = new Database(path.join(tmp, 'old-coupons2.db'));
+  dbOld2.exec(`CREATE TABLE rakuten_campaign_coupons (month TEXT PRIMARY KEY, coupon_code TEXT NOT NULL UNIQUE, pc_get_url TEXT NOT NULL,
+    coupon_start TEXT NOT NULL, coupon_end TEXT NOT NULL, issued_at TEXT NOT NULL, note TEXT)`);
+  dbOld2.prepare(`INSERT INTO rakuten_campaign_coupons VALUES ('2026-07','C','https://coupon.rakuten.co.jp/getCoupon?getkey=x','2026-07-01T00:00:00+09:00','2026-09-30T23:59:59+09:00','2026-07-01T00:00:00Z',NULL)`).run();
+  let refused = false;
+  try { ensureCouponRegistry(dbOld2); } catch { refused = true; }
+  check('行のある旧表は捨てずに人へ返す (throw)', refused && dbOld2.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_coupons`).get().n === 1);
+  dbOld2.close();
+}
+
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 db.close();
 fs.rmSync(tmp, { recursive: true, force: true });

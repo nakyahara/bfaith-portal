@@ -221,8 +221,7 @@ export function monthlyCouponParams(month, nowIso = new Date().toISOString()) {
 //   ② API 呼び出し (リトライなし — 非冪等 POST を自動再送すると多重発行する)
 //   ③ 成功 → markIssued / 明確な失敗 → releaseReservation / 結果不明 (timeout等)
 //      → pending を残して人が coupon.search で確認 (自動再発行させない)
-export function ensureCouponRegistry(db) {
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_coupons (
+const COUPON_REGISTRY_DDL = `CREATE TABLE IF NOT EXISTS rakuten_campaign_coupons (
     month        TEXT PRIMARY KEY CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'),
     status       TEXT NOT NULL CHECK (status IN ('pending','issued')),
     coupon_code  TEXT UNIQUE,
@@ -232,7 +231,23 @@ export function ensureCouponRegistry(db) {
     reserved_at  TEXT NOT NULL,
     issued_at    TEXT,
     note         TEXT
-  )`);
+  )`;
+
+export function ensureCouponRegistry(db) {
+  db.exec(COUPON_REGISTRY_DDL);
+  // 移行 (2026-08-26 miniPC 本番で発覚): PR-C3 の初期ドラフト (status/reserved_at なし・coupon_code NOT NULL)
+  // で作られた表が CREATE IF NOT EXISTS で残っていた。旧表のままだと reserveMonth が「no such column:
+  // status」で落ち、sender は永久に no_monthly_coupon。行が無ければ作り直す。行があれば人が移行する
+  // (自動で捨てない — 発行済みクーポンの正本を失わないため)
+  const cols = db.prepare(`PRAGMA table_info(rakuten_campaign_coupons)`).all().map((c) => c.name);
+  if (!cols.includes('status') || !cols.includes('reserved_at')) {
+    const n = db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_coupons`).get().n;
+    if (n > 0) {
+      throw new Error(`rakuten_campaign_coupons が旧スキーマ (${cols.join(',')}) で ${n} 行あります。手動で移行してください (status='issued', reserved_at=issued_at を補う)`);
+    }
+    db.exec(`DROP TABLE rakuten_campaign_coupons`);
+    db.exec(COUPON_REGISTRY_DDL);
+  }
 }
 
 export function getRegisteredCoupon(db, month) {
