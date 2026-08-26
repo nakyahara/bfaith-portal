@@ -1481,8 +1481,12 @@
       if (remember) history.replaceState(null, '', '#' + id);
     }
     btns.forEach((b) => b.addEventListener('click', () => activate(b.dataset.tab, true)));
-    const initial = (location.hash || '').slice(1);
-    activate(btns.some((b) => b.dataset.tab === initial) ? initial : 'tab-basic', false);
+    // 初期タブ: ?tab= (工程ボードの画像ビューからのリンク等) > #hash (保存後 reload の復元)。
+    // ボードは ?tab=tab-images を付けて飛ばすが、hash しか見ていなかったため基本情報タブが開いていた (2026-08-26)
+    const wanted = (new URLSearchParams(location.search).get('tab') || '') || (location.hash || '').slice(1);
+    const initial = btns.some((b) => b.dataset.tab === wanted) ? wanted : 'tab-basic';
+    activate(initial, false);
+    if (initial !== 'tab-basic' && !location.hash) history.replaceState(null, '', '#' + initial);
   })();
 
   // ─── 必須未入力バッジ。楽天登録・AI生成ゲートで必要な「入力もの」を数える。
