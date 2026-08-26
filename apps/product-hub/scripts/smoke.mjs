@@ -3951,6 +3951,10 @@ for (const [name, file, data] of renders) {
     VALUES (?, ?, 'draft', 'portal', ?, ?)`);
   const existId = Number(insDraft.run('IMG-EXIST-1', '既存商品', null, 0).lastInsertRowid);
   const confId = Number(insDraft.run('IMG-CONF-1', '重要度衝突', '仕入商品（重要度：低）', 0).lastInsertRowid);
+  const conf2Id = Number(insDraft.run('IMG-CONF-2', '逆方向の不整合', '自社商品（重要度：高）', 0).lastInsertRowid);
+  insProd.run(9101, 'IMG-VCONF', '表記ゆれ A', null);
+  insProd.run(9102, 'img-vconf', '表記ゆれ B', null);
+  check('画像DB: 前提 = mirror 表記ゆれは conflict', vari.resolveVariationGroup(db, 'IMG-VCONF').kind === 'conflict');
   db.prepare("UPDATE product_drafts SET amazon_url = 'https://www.amazon.co.jp/dp/B0EXIST' WHERE id = ?").run(existId);
 
   const schemaImg = { properties: { Status: { type: 'select', select: { options: [
@@ -3962,7 +3966,10 @@ for (const [name, file, data] of renders) {
     imgPage('IMG-MASTER-1', '画像確認（田中）'),
     imgPage('rooms-l-wh', '保留'),
     imgPage('IMG-CONF-1', '構成作成中'),
-    imgPage('IMG-NEW-1', '保留'),
+    imgPage('IMG-DUP-1', '構成作成中'),
+    imgPage('IMG-DUP-1', '保留'),
+    imgPage('IMG-VCONF', '構成作成中'),   // NE 側に同じコードが複数 (mirror の表記ゆれ) → 止める
+    imgPage('IMG-CONF-2', '構成作成中'),
     { id: 'img-page-nocode', properties: { Name: { type: 'title', title: [{ plain_text: 'コード無し' }] } } },
   ];
   let capImg = null;
@@ -3982,11 +3989,16 @@ for (const [name, file, data] of renders) {
   const byCode = (res, code, status) => res.results.find((r) => r.ne_code === code && (!status || r.notion_status === status));
   check('画像DB: dryRun は書き込まず分類だけ返す',
     prevImg.summary.would_create === 2 && prevImg.summary.would_update === 1
-    && prevImg.summary.needs_master_import === 1 && prevImg.summary.brand_priority_conflict === 1
-    && prevImg.summary.duplicate === 1 && prevImg.summary.failed === 1 && prevImg.total === 7
+    && prevImg.summary.needs_master_import === 1 && prevImg.summary.brand_priority_conflict === 2
+    && prevImg.summary.duplicate === 2 && prevImg.summary.variation_conflict === 1
+    && prevImg.summary.failed === 1 && prevImg.total === 10
     && db.prepare('SELECT COUNT(*) c FROM product_drafts').get().c === beforeDrafts
     && db.prepare('SELECT COUNT(*) c FROM draft_image_notion_imports').get().c === 0,
     JSON.stringify(prevImg.summary));
+  check('画像DB: 重複コードは全カード止める・NE 表記ゆれは variation_conflict・own_brand=0×重要度自社も止める',
+    prevImg.results.filter((r) => r.ne_code === 'IMG-DUP-1').every((r) => r.outcome === 'duplicate')
+    && byCode(prevImg, 'IMG-VCONF').outcome === 'variation_conflict'
+    && byCode(prevImg, 'IMG-CONF-2').outcome === 'brand_priority_conflict');
   check('画像DB: 商品マスターに居る商品は本体取り込みを先に (ブロック)',
     byCode(prevImg, 'IMG-MASTER-1').outcome === 'needs_master_import' && byCode(prevImg, 'IMG-MASTER-1').master_status === '②商品タイトル_大輔');
   check('画像DB: 子SKU は detach の予告が出る',
@@ -4004,7 +4016,10 @@ for (const [name, file, data] of renders) {
     mis?.code === 'snapshot_mismatch' && db.prepare('SELECT COUNT(*) c FROM draft_image_notion_imports').get().c === 0);
 
   const runImg = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: prevImg.snapshot, ...diImg });
-  check('画像DB: 実行 → 新規2・補完1', runImg.summary.created === 2 && runImg.summary.updated === 1 && runImg.summary.failed === 1,
+  check('画像DB: 実行 → 新規2・補完1 (衝突・重複は書かない)',
+    runImg.summary.created === 2 && runImg.summary.updated === 1 && runImg.summary.failed === 1
+    && !db.prepare('SELECT 1 FROM product_drafts WHERE ne_code IN (?, ?)').get('IMG-DUP-1', 'IMG-VCONF')
+    && db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(conf2Id).own_brand === 0,
     JSON.stringify(runImg.results.map((r) => [r.ne_code, r.outcome, r.error, r.warnings])));
   const newRow = db.prepare('SELECT * FROM product_drafts WHERE ne_code = ?').get('IMG-NEW-1');
   check('画像DB: 新規は最小情報 + 自社商品 + 画像フォルダ',
@@ -4076,6 +4091,37 @@ for (const [name, file, data] of renders) {
   check('画像DB: 担当・メモが入っている画像工程は書かない (警告)',
     byCode(prev4, 'IMG-TOUCHED-1').outcome === 'would_update'
     && byCode(prev4, 'IMG-TOUCHED-1').warnings.some((w) => w.includes('工程は書きません')));
+
+  // 保留: プレビュー後に人が保留状態を変えたら実行は止まる (snapshot 不一致)
+  {
+    const holdId = Number(insDraft.run('IMG-HOLD-1', '保留テスト', null, 0).lastInsertRowid);
+    const diHold = { ...diImg, query: async () => ({ pages: [imgPage('IMG-HOLD-1', '保留')] }) };
+    const ph = await iimp.importImageDbByStatus({ actor: 'smoke', ...diHold });
+    dbmod.setImageWorkflowState(db, holdId, 'on_hold', { note: '人が保留', actor: 'smoke' });
+    let holdMis = null;
+    try { await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: ph.snapshot, ...diHold }); } catch (e) { holdMis = e; }
+    check('画像DB: プレビュー後に保留状態が変わったら実行を止める', holdMis?.code === 'snapshot_mismatch');
+    const ph2 = await iimp.importImageDbByStatus({ actor: 'smoke', ...diHold });
+    check('画像DB: 既に保留中なら「台帳に記録だけ」',
+      byCode(ph2, 'IMG-HOLD-1').outcome === 'would_ledger_only' || byCode(ph2, 'IMG-HOLD-1').outcome === 'would_update',
+      byCode(ph2, 'IMG-HOLD-1').outcome);
+    const ph3 = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: ph2.snapshot, ...diHold });
+    check('画像DB: 保留中のまま実行 → 保留を維持 (人の理由を上書きしない)',
+      (ph3.summary.ledger_only + ph3.summary.updated) === 1
+      && db.prepare('SELECT hold_note FROM draft_image_production WHERE draft_id = ?').get(holdId).hold_note === '人が保留');
+  }
+
+  // 対象ステータスの一部が Notion に無い → プレビューは通るが実行は止める
+  {
+    const partial = { properties: { Status: { type: 'select', select: { options: [{ name: '構成作成中' }, { name: '完了' }] } } } };
+    const diPart = { ...diImg, request: async () => partial, query: async () => ({ pages: [imgPage('IMG-PART-1', '構成作成中')] }) };
+    const pp = await iimp.importImageDbByStatus({ actor: 'smoke', ...diPart });
+    let partErr = null;
+    try { await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: pp.snapshot, ...diPart }); } catch (e) { partErr = e; }
+    check('画像DB: 選択肢が一部欠けていたらプレビューで報告し実行は止める',
+      pp.missingStatuses.length === 3 && partErr?.code === 'missing_statuses'
+      && !db.prepare('SELECT 1 FROM product_drafts WHERE ne_code = ?').get('IMG-PART-1'));
+  }
 
   // Status の選択肢が全部消えていたら fail-closed
   let noOpt = null;

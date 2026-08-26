@@ -627,8 +627,11 @@
     const IMIG_LABELS = {
       would_create: '新規作成 (予定)',
       would_update: '既存に補完 (予定)',
+      would_ledger_only: '補完なし・台帳に記録だけ (予定)',
       created: '新規作成',
       updated: '既存に補完',
+      ledger_only: '補完なし・台帳に記録だけ',
+      variation_conflict: 'NE に同じコードが複数 (要確認)',
       already_migrated: '移植済み (スキップ)',
       source_changed_after_migration: '移植済み・Notion側が変更あり (追従しません)',
       needs_master_import: '先に商品マスターから本体を取り込んでください',
@@ -658,11 +661,11 @@
         }
         imigSnapshot = json.snapshot || null;
         const s = json.summary;
-        const planned = dryRun ? (s.would_create + s.would_update) : (s.created + s.updated);
+        const planned = dryRun ? (s.would_create + s.would_update + s.would_ledger_only) : (s.created + s.updated + s.ledger_only);
         out.textContent = '対象 ' + json.total + ' 件 → ' + (dryRun ? '移植予定 ' : '移植 ') + planned
           + ' (新規 ' + (dryRun ? s.would_create : s.created) + ' / 補完 ' + (dryRun ? s.would_update : s.updated) + ')'
           + ' / 移植済み ' + s.already_migrated + ' / 本体未取込 ' + s.needs_master_import
-          + ' / 要確認 ' + (s.brand_priority_conflict + s.duplicate + s.source_changed_after_migration)
+          + ' / 要確認 ' + (s.brand_priority_conflict + s.variation_conflict + s.duplicate + s.source_changed_after_migration)
           + ' / 失敗 ' + s.failed + (s.deferred ? ' / 上限見送り ' + s.deferred : '')
           + ((json.missingStatuses || []).length ? ' ⚠ Notionに無い選択肢: ' + json.missingStatuses.join(', ') : '');
         const rows = json.results.map(function (r) {

@@ -751,8 +751,16 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
 router.post('/api/drafts/:id/image-hold', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
-  const onHold = req.body?.on_hold === true || req.body?.on_hold === 'true' || req.body?.on_hold === 1;
-  const note = req.body?.note !== undefined ? cleanText(req.body.note, 300) : null;
+  // 画像制作情報 (image-production) と同じく自社商品だけ (Codex R2 medium)
+  if (!draft.own_brand) {
+    return res.status(400).json({ ok: false, error: '画像制作の保留は自社商品のみ使えます (基本情報で「自社商品」をONにしてください)' });
+  }
+  // boolean の true/false だけ受ける。欠落・文字列・typo を「解除」に倒さない (Codex R2 medium)
+  if (typeof req.body?.on_hold !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'on_hold は true / false で指定してください' });
+  }
+  const onHold = req.body.on_hold;
+  const note = req.body?.note !== undefined && req.body?.note !== null ? cleanText(req.body.note, 300) : null;
   try {
     const r = setImageWorkflowState(getDB(), draft.id, onHold ? 'on_hold' : 'active', { note, actor: actorOf(req) });
     res.json({ ok: true, changed: r.changed, workflow_state: onHold ? 'on_hold' : 'active' });
@@ -1663,7 +1671,7 @@ router.post('/api/notion-image-import', async (req, res) => {
       results: r.results.slice(0, 300), truncated: r.results.length > 300,
     });
   } catch (e) {
-    if (e && e.code === 'snapshot_mismatch') {
+    if (e && (e.code === 'snapshot_mismatch' || e.code === 'missing_statuses')) {
       return res.status(409).json({ ok: false, error: e.message });
     }
     if (/NOTION_IMAGE_DB_ID|RYS_NOTION_TOKEN/.test(String(e?.message || ''))) {

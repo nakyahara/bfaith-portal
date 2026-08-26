@@ -201,6 +201,13 @@ export async function importImageDbByStatus({
   if (targets.length === 0) {
     throw new Error(`Notion 画像DB の Status に対象の選択肢が見つかりません (${IMAGE_MIGRATE_STATUSES.join(' / ')})`);
   }
+  // 実行 (書き込み) は選択肢が全部揃っているときだけ (Codex R2 high: 「保留」だけ改名されると
+  // そのカードを欠落させたまま正常終了する)。プレビューは残りだけで見せて欠落を報告する
+  if (!dryRun && missingStatuses.length > 0) {
+    const e = new Error(`Notion 画像DB の Status に無い選択肢があります (${missingStatuses.join(' / ')})。選択肢名を確認してから実行してください`);
+    e.code = 'missing_statuses';
+    throw e;
+  }
   const filterType = statusProp?.type === 'status' ? 'status' : 'select';
   const { pages } = await query({
     cfg,
@@ -211,9 +218,11 @@ export async function importImageDbByStatus({
   const db = getDB();
   const results = [];
   const planned = []; // { rec, plan, result }
-  const seen = new Set();
-  for (const page of pages) {
-    const rec = buildImageRecord(page);
+  // 同じ商品コードのカードが複数あるときは**全カード**を止める (Codex R2 medium: 「最初の1枚」は取得順依存)
+  const codeCount = new Map();
+  const recs = pages.map((page) => ({ page, rec: buildImageRecord(page) }));
+  for (const { rec } of recs) if (rec) codeCount.set(norm(rec.ne_code), (codeCount.get(norm(rec.ne_code)) || 0) + 1);
+  for (const { page, rec } of recs) {
     if (!rec) {
       results.push({ ne_code: '(商品コードなし)', outcome: 'failed', warnings: [], error: `Notion カードに商品コードがありません (page ${page?.id || '?'})` });
       continue;
@@ -221,12 +230,11 @@ export async function importImageDbByStatus({
     const key = norm(rec.ne_code);
     const result = { ne_code: rec.ne_code, notion_status: rec.status, notion_page_id: rec.notion_page_id, name: rec.name, warnings: [] };
     results.push(result);
-    if (seen.has(key)) {
+    if (codeCount.get(key) > 1) {
       result.outcome = 'duplicate';
-      result.error = '同じ商品コードのカードが Notion 画像DB に複数あります (1 枚目だけ対象)';
+      result.error = '同じ商品コードのカードが Notion 画像DB に複数あります。Notion 側で 1 枚にしてから再実行してください';
       continue;
     }
-    seen.add(key);
 
     // 台帳: 同じカードは二度取り込まない。内容が変わっていても追従しない (Notion 側は停止する運用) — 報告のみ
     const led = ledgerOf(db, rec.notion_page_id);
@@ -263,17 +271,32 @@ export async function importImageDbByStatus({
       result.outcome = 'brand_priority_conflict';
       result.error = `画像の重要度が「${existing.image_priority}」で登録済みです (自社商品に変えるなら詳細画面で重要度を直してから再実行)`;
       continue;
+    } else if (existing.image_priority === OWN_BRAND_IMAGE_PRIORITY && existing.own_brand !== 1) {
+      // 逆方向の不整合 (重要度=自社なのに own_brand=0) も素通りさせない (Codex R2 medium)。起動時補正に任せず止めて報告
+      result.draftId = existing.id;
+      result.outcome = 'brand_priority_conflict';
+      result.error = '重要度は自社商品なのに「自社商品」チェックが OFF です (詳細画面で基本情報を保存して整合させてから再実行)';
+      continue;
     }
 
     // バリエーション: 子SKU なら detach して独立ページにする (決定 2)
-    const plan = { create: !existing, draftId: existing?.id || null, detach: null, fill: {}, ip: {}, steps: [], hold: false, assignee: null };
+    const plan = {
+      create: !existing, draftId: existing?.id || null, detach: null, fill: {}, ip: {}, steps: [], hold: false,
+      holdFrom: null, assignee: null,
+    };
     const v = resolveVariationGroup(db, rec.ne_code, { withMembers: false });
+    if (v.kind === 'conflict') {
+      // NE に同じコードが複数 (表記ゆれ) → どのグループに属するか決められない。detach の要否を誤ると
+      // 代表ページに残したまま独立ページも作る二重掲載になるので、何も書かず止める (Codex R2 high)
+      result.draftId = existing?.id;
+      result.outcome = 'variation_conflict';
+      result.error = 'NE 商品マスタに同じ商品コードが複数あります (表記ゆれ)。NE 側を直してから再実行してください';
+      continue;
+    }
     if (v.kind === 'variation' && v.isChild && !isDetached(db, rec.ne_code)) {
       const rep = db.prepare('SELECT id FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(norm(v.groupKey));
       plan.detach = { groupKey: v.groupKey, repDraftId: rep?.id || null };
       result.warnings.push(`NE では ${v.groupKey} のバリエーション子SKU → 独立ページとして外します${rep ? ` (代表 #${rep.id} の SKU 一覧から外れます)` : ''}`);
-    } else if (v.kind === 'conflict') {
-      result.warnings.push('NE 商品マスタに同じコードが複数あります (表記ゆれ)。バリエーション判定は保留');
     }
 
     // 商品本体の空欄補完 (画像関連の明示列だけ)
@@ -301,7 +324,10 @@ export async function importImageDbByStatus({
     const sp = planStepsFor(rec.status, { shippingStatus: rec.shipping_status, hasImages });
     plan.hold = sp.hold;
     if (sp.hold) {
-      if (ipCur.workflow_state === 'on_hold') result.warnings.push('既に画像制作が保留中です');
+      // 現在の保留状態を plan (= snapshot) に載せる: プレビュー後に人が解除していたら snapshot 不一致で止まる
+      // (Codex R2 high: 無条件に on_hold へ戻すと人の解除を上書きする)
+      plan.holdFrom = ipCur.workflow_state || 'active';
+      if (plan.holdFrom === 'on_hold') result.warnings.push('既に画像制作が保留中です (そのまま)');
     } else if (sp.steps.length > 0) {
       const untouched = existing ? imageTrackUntouchedReason(db, existing.id) : null;
       if (untouched) {
@@ -317,7 +343,9 @@ export async function importImageDbByStatus({
     }
     if (plan.create) result.warnings.push('商品マスターに無いため最小情報で作成 (売価・JAN・税率は未入力)');
 
-    result.outcome = plan.create ? 'would_create' : 'would_update';
+    plan.ledgerOnly = !plan.create && !plan.detach && Object.keys(plan.fill).length === 0
+      && Object.keys(plan.ip).length === 0 && plan.steps.length === 0 && !(plan.hold && plan.holdFrom !== 'on_hold');
+    result.outcome = plan.create ? 'would_create' : (plan.ledgerOnly ? 'would_ledger_only' : 'would_update');
     result.plan_summary = summarizePlan(plan);
     planned.push({ rec, plan, result });
   }
@@ -341,7 +369,7 @@ export async function importImageDbByStatus({
       try {
         const r = applyPlan(db, t.rec, t.plan, { actor, runId: run });
         t.result.draftId = r.draftId;
-        t.result.outcome = t.plan.create ? 'created' : 'updated';
+        t.result.outcome = t.plan.create ? 'created' : (t.plan.ledgerOnly ? 'ledger_only' : 'updated');
         t.result.warnings.push(...r.warnings);
       } catch (e) {
         t.result.outcome = 'failed';
@@ -410,8 +438,11 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       if (sets.length > 0) {
         db.prepare(`UPDATE product_drafts SET ${sets.join(', ')}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = @id`).run(params);
       }
-      logEvent(db, draftId, 'image_db_imported',
-        `Notion 画像DB「${rec.status || ''}」から画像情報を補完 (${Object.keys(plan.fill).concat(Object.keys(plan.ip)).join(', ') || '補完なし'}) page=${rec.notion_page_id}`, actor);
+      // 補完するものが無い (台帳に記録だけ) ときはイベントを残さない — 「補完済み」と誤読させない (Codex R2 low)
+      if (!plan.ledgerOnly) {
+        logEvent(db, draftId, 'image_db_imported',
+          `Notion 画像DB「${rec.status || ''}」から画像情報を補完 (${Object.keys(plan.fill).concat(Object.keys(plan.ip)).join(', ') || '工程/保留のみ'}) page=${rec.notion_page_id}`, actor);
+      }
     }
 
     // 画像制作情報 (空のときだけ — 実行時点の値で再判定)
@@ -431,9 +462,11 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       logEvent(db, fromId, 'variation_sku_excluded', `${rec.ne_code} (Notion 画像DB移植: 色ごとに別ページ)`, actor);
     }
 
-    // 画像制作だけの保留
+    // 画像制作だけの保留。プレビュー時点の状態と違っていたら (人が解除/保留した) 書かずに失敗させる
     if (plan.hold) {
-      setImageWorkflowState(db, draftId, 'on_hold', { note: 'Notion 画像DB: 保留', actor });
+      const nowState = db.prepare('SELECT workflow_state FROM draft_image_production WHERE draft_id = ?').get(draftId)?.workflow_state || 'active';
+      if (nowState !== plan.holdFrom) throw new Error('プレビュー後に画像制作の保留状態が変わりました。再プレビューしてください');
+      if (nowState !== 'on_hold') setImageWorkflowState(db, draftId, 'on_hold', { note: 'Notion 画像DB: 保留', actor });
     }
 
     // 工程 (まっさらなときだけ — 実行時点で再確認)
@@ -472,8 +505,9 @@ function truncate(e) {
 }
 
 export const IMAGE_OUTCOMES = [
-  'would_create', 'would_update', 'created', 'updated', 'already_migrated', 'source_changed_after_migration',
-  'needs_master_import', 'brand_priority_conflict', 'duplicate', 'deferred', 'failed',
+  'would_create', 'would_update', 'would_ledger_only', 'created', 'updated', 'ledger_only',
+  'already_migrated', 'source_changed_after_migration',
+  'needs_master_import', 'brand_priority_conflict', 'variation_conflict', 'duplicate', 'deferred', 'failed',
 ];
 
 export function summarize(results) {
