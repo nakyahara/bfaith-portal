@@ -154,9 +154,11 @@ export function planStepsFor(status, { shippingStatus = null, hasImages = false 
 }
 
 /** 画像トラックが「まっさら」か (工程を書いてよい条件)。人が動かした痕跡があれば理由を返す */
-export function imageTrackUntouchedReason(db, draftId) {
+export function imageTrackUntouchedReason(db, draftId, { ensure = true } = {}) {
   const id = Number(draftId);
-  ensureProgress(db, id);
+  // プレビュー (ensure=false) は DB を書かない (Codex R4 medium: 工程行の自己修復も書き込み)。
+  // 行が 1 つも無い = まだ誰も触っていない、として扱う。実行時 (ensure=true) は行を作ってから判定する
+  if (ensure) ensureProgress(db, id);
   // 担当は「役割の既定担当」が ensureProgress で自動で入るので、既定と同じ担当は人の痕跡とみなさない
   const rows = db.prepare(`
     SELECT p.state, p.assignee_id, p.note, p.due_date,
@@ -165,7 +167,7 @@ export function imageTrackUntouchedReason(db, draftId) {
     JOIN ph_steps s ON s.code = p.step_code AND s.active = 1
     WHERE p.draft_id = ? AND s.track = 'image'
   `).all(id);
-  if (rows.length === 0) return '画像トラックの工程がありません';
+  if (rows.length === 0) return ensure ? '画像トラックの工程がありません' : null;
   if (rows.some((r) => r.state !== 'todo')) return '画像工程が既に動いています';
   if (rows.some((r) => (r.assignee_id != null && r.assignee_id !== r.default_staff_id) || !blank(r.note) || !blank(r.due_date))) {
     return '画像工程に担当・メモ・期限が入っています';
@@ -345,7 +347,7 @@ export async function importImageDbByStatus({
       plan.holdFrom = ipCur.workflow_state || 'active';
       if (plan.holdFrom === 'on_hold') result.warnings.push('既に画像制作が保留中です (そのまま)');
     } else if (sp.steps.length > 0) {
-      const untouched = existing ? imageTrackUntouchedReason(db, existing.id) : null;
+      const untouched = existing ? imageTrackUntouchedReason(db, existing.id, { ensure: false }) : null;
       if (untouched) {
         result.warnings.push(`工程は書きません (${untouched})`);
       } else {
