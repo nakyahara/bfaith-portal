@@ -269,6 +269,14 @@ router.get('/', (req, res) => {
     return `返信待ち (${days === 0 ? '本日' : days + '日'})`;
   };
 
+  // 受信日時セルの2行目 (2026-08-26 中原さん要望で受信日時を左側=常に見える位置へ移動)。
+  // 「更新」は初回受信と最終メッセージが違うときだけ出す (1通だけの行を2行に膨らませない)
+  const dtSub = (r) => {
+    if (view === 'sent') return waitingLabel(r);
+    const upd = fmtJst(r.last_message_at || r.received_at);
+    return upd === fmtJst(r.received_at) ? '' : `更新 ${upd}`;
+  };
+
   // 詳細画面へ引き継ぐ文脈 (戻るリンク・前後ナビが同じ一覧に沿う)
   const detailQs = `?view=${view}${curFolder ? `&folder=${curFolder.id}` : ''}${group ? `&group=${group}` : ''}`;
   // data-label / data-full = スマホでのカード表示用 (CSS table.cardable。PC表示には影響しない)
@@ -277,6 +285,7 @@ router.get('/', (req, res) => {
       <td class="selcell" onclick="event.stopPropagation()"><input type="checkbox" class="rowchk" value="${r.id}" aria-label="選択"></td>
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
       <td>${stBadge(r.internal_status)}${r.delivery_failed_at ? ' <span class="badge" style="background:#b91c1c;color:#fff" title="返信メールが宛先に届きませんでした">🔴配信失敗</span>' : ''}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
+      <td class="nowrap dtcol" data-label="受信日時">${fmtJst(r.received_at)}${dtSub(r) ? `<div class="sub">${dtSub(r)}</div>` : ''}</td>
       <td class="nowrap" data-label="ラベル"${r.label_name ? '' : ' data-empty'}>${r.label_name ? labelChip(r.label_name, r.label_color) : '—'}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
@@ -284,7 +293,6 @@ router.get('/', (req, res) => {
         ${(() => { const p = previewOf(r.last_incoming_body); return p ? `<div class="preview" title="${he(p)}">${he(p)}</div>` : ''; })()}
         <div class="sub">${he(r.customer_name || '')}${r.customer_identifier ? ' &lt;' + he(r.customer_identifier) + '&gt;' : ''} ・ ${r.msg_count}通${r.folder_name ? ` ・ <span class="folder-chip">📁${he(r.folder_name)}</span>` : ''}</div></td>
       <td data-full data-label="注文 / 商品"${r.order_number || r.product_name || r.product_code ? '' : ' data-empty'}>${r.order_number ? he(r.order_number) : '—'}<div class="sub">${he(r.product_name || r.product_code || '')}</div></td>
-      <td class="nowrap" data-label="受信">${fmtJst(r.received_at)}<div class="sub">${view === 'sent' ? waitingLabel(r) : `更新 ${fmtJst(r.last_message_at || r.received_at)}`}</div></td>
     </tr>`).join('');
 
   const pageLink = p => {
@@ -336,7 +344,7 @@ router.get('/', (req, res) => {
   ${bulkBar}
   <div class="card">
     <table class="cardable">
-      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th>ラベル</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th><th>${view === 'sent' ? '受信 / 返信待ち' : '受信'}</th></tr></thead>
+      <thead><tr><th class="selcell"><input type="checkbox" id="chkAll" aria-label="すべて選択"></th><th>チャネル/店舗</th><th>状態</th><th class="dtcol">${view === 'sent' ? '受信日時 / 返信待ち' : '受信日時'}</th><th>ラベル</th><th>担当</th><th>AI</th><th>件名 / 顧客</th><th>注文 / 商品</th></tr></thead>
       <tbody>${trs || `<tr><td colspan="9" class="empty">${he(emptyMsg)}</td></tr>`}</tbody>
     </table>
     ${pager}
@@ -2947,6 +2955,8 @@ tr.unread:hover { background: #fef9c3; }
 td.subj a { color: #1d4ed8; text-decoration: none; font-weight: 600; }
 .sub { color: #64748b; font-size: 12px; }
 .nowrap { white-space: nowrap; }
+/* 受信日時列 (2026-08-26): 桁を揃えて必要最小幅に。件名欄を圧迫しないよう width:1% で内容幅にする */
+.dtcol { width: 1%; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #f59e0b; vertical-align: middle; }
 .empty { color: #94a3b8; text-align: center; padding: 24px; }

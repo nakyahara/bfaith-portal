@@ -546,6 +546,38 @@ console.log('HTTP: 全件一括');
   const htmlQb = await (await fetch(`${base}/?view=inbox&attention=1`)).text();
   check('押した入口は選択状態 (on) になる', /class="on" href="[^"]*attention=1/.test(htmlQb));
 
+  // 受信日時を一覧の左側 (状態の直後) に出す (2026-08-26 中原さん要望
+  // 「一覧に受信したメールの日付と時間を表示してほしい」。右端だと横スクロールしないと見えなかった)
+  {
+    const inqDt = mkH('ba-datetime', 'open');
+    const htmlDt = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+    check('一覧の見出しが「受信日時」', htmlDt.includes('>受信日時</th>'));
+    check('受信日時セルに日付+時刻が出る (JST)',
+      htmlDt.includes('data-label="受信日時">2026-08-20 10:00'), '2026-08-20 10:00 が見つからない');
+    // 列順: 状態 → 受信日時 → ラベル (右端のままだと画面外で見えない、が今回の要望)
+    const head = htmlDt.slice(htmlDt.indexOf('<thead>'), htmlDt.indexOf('</thead>'));
+    check('列順は 状態 → 受信日時 → ラベル',
+      head.indexOf('>状態<') < head.indexOf('>受信日時<') && head.indexOf('>受信日時<') < head.indexOf('>ラベル<'), head);
+    check('注文/商品より前に出る (右端ではない)', head.indexOf('>受信日時<') < head.indexOf('注文 / 商品'));
+
+    // 1通だけの行は「更新」を出さない (行が2行に膨らまないように)
+    check('初回受信と最終メッセージが同じ行は「更新」を出さない',
+      !/data-label="受信日時">2026-08-20 10:00<div class="sub">更新/.test(htmlDt));
+
+    // 追い返信が来た行は「更新 <日時>」を併記する
+    db.prepare('UPDATE inquiries SET last_message_at = ? WHERE id = ?').run(T('2026-08-25T09:30:00+09:00'), inqDt);
+    const htmlDt2 = await (await fetch(`${base}/?view=inbox&shop=${shopH}`)).text();
+    check('最終メッセージが違う行は「更新 日時」を併記', htmlDt2.includes('更新 2026-08-25 09:30'));
+
+    // 返信処理中ビューでは従来どおり「返信待ち」を出す
+    db.prepare("UPDATE inquiries SET internal_status = 'waiting_reply' WHERE id = ?").run(inqDt);
+    const htmlSent = await (await fetch(`${base}/?view=sent&shop=${shopH}`)).text();
+    check('返信処理中ビューは見出しが「受信日時 / 返信待ち」', htmlSent.includes('受信日時 / 返信待ち'));
+    check('返信処理中ビューは日時と返信待ちを両方出す',
+      htmlSent.includes('data-label="受信日時">2026-08-20 10:00') && /返信なし|返信待ち/.test(htmlSent));
+    db.prepare("UPDATE inquiries SET internal_status = 'open', last_message_at = NULL WHERE id = ?").run(inqDt);
+  }
+
 
   // 1クリック対応完了ボタン (2026-08-24 中原さん要望・メールディーラーの右上「対応完了」踏襲)
   const h4 = mkH('ba4', 'open'), h5 = mkH('ba5', 'done');
