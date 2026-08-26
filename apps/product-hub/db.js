@@ -1201,8 +1201,9 @@ export function migrateDetailTrackV2(db) {
         doneUpTo = DETAIL_V2_CODES.indexOf('imgd_design'); rule = '旧 登録/承認 済み → ⑤まで done・⑥-1 (田中確認) から再確認';
       } else if (settled(old.img_production_detail)) {
         doneUpTo = DETAIL_V2_CODES.indexOf('imgd_ai'); rule = '旧 制作 済み → ④まで done・⑤から';
-      } else if (settled(old.img_request_detail)) {
-        doneUpTo = DETAIL_V2_CODES.indexOf('imgd_request'); rule = '旧 依頼 済み → ①done・②から';
+      } else if (settled(old.img_request_detail) || settled(old.img_shoot_detail)) {
+        // 旧 撮影依頼中 が済み = 依頼は当然済み (Codex R3 high: 依頼行が無くても拾う)
+        doneUpTo = DETAIL_V2_CODES.indexOf('imgd_request'); rule = '旧 依頼/撮影 済み → ①done・②から';
       } else {
         rule = '旧 未着手 → 全工程 todo';
       }
@@ -1211,10 +1212,11 @@ export function migrateDetailTrackV2(db) {
         const st = i <= doneUpTo ? 'done' : 'todo';
         ins.run(id, code, st, st === 'done' ? now : null, st === 'done' ? 'migration_v2' : null);
       });
-      // 旧 撮影依頼中 が「対象外」なら撮影不要
-      if (old.img_shoot_detail === 'skip') {
+      // 旧 撮影依頼中: 「対象外」= 撮影不要 / 「完了」= 撮影データ納品済み = 素材完了 (空のときだけ)
+      if (old.img_shoot_detail === 'skip' || old.img_shoot_detail === 'done') {
         db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
-        db.prepare("UPDATE draft_image_production SET material_status = 'not_required' WHERE draft_id = ? AND material_status IS NULL").run(id);
+        db.prepare('UPDATE draft_image_production SET material_status = ? WHERE draft_id = ? AND material_status IS NULL')
+          .run(old.img_shoot_detail === 'skip' ? 'not_required' : 'ready', id);
       }
       const oldDesc = LEGACY_DETAIL_V1_CODES.map((c) => `${c}=${old[c] || '-'}`).join(' ');
       logEvent(db, id, 'image_track_v2_migrated', `${rule} (旧: ${oldDesc})`, 'migration_v2');

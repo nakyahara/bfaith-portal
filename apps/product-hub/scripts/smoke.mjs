@@ -1958,13 +1958,14 @@ let wfDraftId = null;
   check('システム工程には担当者を置かない', p.main.find((s) => s.step_code === 'ai_generate').assignee_id === null);
 
   // 画像が登録済みなら画像トラックは終わっているとみなす (外注への二重依頼を防ぐ)
-  const idListed = mk('WF-LISTED', 'listed');
+  // status=listed は楽天登録済みの根拠 (v2) なので、ここは approved で「画像があるだけ」を再現する
+  const idListed = mk('WF-LISTED', 'approved');
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'wf-img-1', 0)`).run(idListed);
   const pl = wfp.progressOf(idListed, { db });
   check('初期化: 画像があれば TOP側は done (二重依頼の防止)', pl.imageTop.done === true);
   check('初期化: 画像があっても詳細側は todo (詳細画像が揃っている根拠にならない)',
     pl.imageDetail.rows.every((s) => s.state === 'todo') && pl.imageDone === false);
-  check('初期化: listed なら残りは出品・展開', pl.current?.step_code === 'listing');
+  check('初期化: approved なら残りはセット検討から', pl.current?.step_code === 'set_review');
   // 楽天登録済みなら詳細側も done で入る (出品済みに「承認して」を出さない)
   const idListedRk0 = mk('WF-LISTED-RK', 'listed');
   db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'wf-img-2', 0)`).run(idListedRk0);
@@ -3035,7 +3036,17 @@ let wfSetParentId = null;
     db.prepare("UPDATE product_drafts SET status = 'listed' WHERE id = ?").run(idM7);
     dbmod.migrateDetailTrackV2(db);
     check('v2 移行: status=listed も楽天登録済みとみなして全部 done', stM(idM7, 'imgd_aplus') === 'done');
-    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idM6, idM7);
+    // 旧 撮影依頼中 done だけ (依頼行なし) → ① done・素材完了
+    const idM8 = mk('DRV-M-SHOOT', false); insV1.run(idM8, 'img_shoot_detail', 'done');
+    dbmod.migrateDetailTrackV2(db);
+    check('v2 移行: 旧 撮影依頼中 done → ① done・②から・素材完了',
+      stM(idM8, 'imgd_request') === 'done' && stM(idM8, 'imgd_compose') === 'todo'
+      && db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(idM8)?.material_status === 'ready');
+    // 工程行がまだ無い既存商品: status=listed なら初回生成で画像側が全部 done
+    const idM9 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-M-NOROWS', 'listed・行なし', 'listed', 'smoke')`).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idM9);
+    check('v2: 工程行の無い出品済み商品 (status=listed) は初回生成で詳細 v2 も全部 done', stM(idM9, 'imgd_aplus') === 'done' && stM(idM9, 'img_approve_top') === 'done');
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?, ?, ?)').run(idM6, idM7, idM8, idM9);
     check('v2 移行: 旧詳細工程は active=0',
       db.prepare(`SELECT COUNT(*) c FROM ph_steps WHERE code IN ('img_shoot_detail','img_request_detail') AND active = 1`).get().c === 0);
     for (const id of [idV2, idV2Rk, idM1, idM2, idM3, idM4, idM5]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);

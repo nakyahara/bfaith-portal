@@ -332,9 +332,13 @@ export function ensureProgress(db, draftId) {
     // 楽天登録済みの商品だけは詳細側も done (出品済みに「承認して」を出さない)
     const hasImages = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(id);
     if (hasImages) for (const s of steps) if (s.track === 'image' && s.image_kind !== 'detail') doneSet.add(s.code);
-    const listedRk = db.prepare(
-      'SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL'
-    ).get(id);
+    // 楽天登録済みの根拠は registered_at だけでなく 導出 status / モール別状況の楽天 done も見る (Codex v2 R3 high:
+    // 工程行がまだ無い既存の出品済み商品が、初回生成で詳細 v2 を全 todo で始めてしまう)
+    const listedRk = db.prepare(`
+      SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
+         OR EXISTS (SELECT 1 FROM product_drafts WHERE id = @id AND status IN ('listed', 'expanded'))
+         OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
+    `).get({ id });
     if (listedRk) for (const s of steps) if (s.track === 'image') doneSet.add(s.code);
   } else {
     // 後から足した工程は原則 todo で入れる (過去分を勝手に done にしない)。
