@@ -39,6 +39,7 @@ import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
 import { isImage, isInlineSafe, fmtBytes, resolveContentType } from './mime.js';
 import { blockedReplyDestination } from './no-reply.js';
+import { linkifyText, urlSafeCut } from './linkify.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
 
@@ -502,9 +503,12 @@ router.get('/inquiries/:id', (req, res) => {
     // 長文 (メールの自動配信・署名込みの長い問い合わせ) はスレッドを追いやすいよう畳む
     const FOLD_LINES = 14, FOLD_CHARS = 700;
     const folded = lines.length > FOLD_LINES || bodyText.length > FOLD_CHARS;
-    const headPart = folded ? lines.slice(0, 8).join('\n').slice(0, 400) : bodyText;
-    const restPart = folded ? bodyText.slice(headPart.length) : '';
-    const br = s => he(s).replace(/\n/g, '<br>');
+    // headPart は必ず bodyText の先頭部分 (lines は bodyText.split(改行))。
+    // URLの途中で切るとリンクが畳みの前後に割れるので urlSafeCut で境目をずらす
+    const headLen = folded ? urlSafeCut(bodyText, lines.slice(0, 8).join('\n').slice(0, 400).length) : bodyText.length;
+    const headPart = bodyText.slice(0, headLen);
+    const restPart = folded ? bodyText.slice(headLen) : '';
+    const br = s => linkifyText(s).replace(/\n/g, '<br>');
     return `
     <div class="msg ${m.is_incoming ? 'in' : 'out'}">
       <div class="msg-head">
@@ -519,7 +523,7 @@ router.get('/inquiries/:id', (req, res) => {
 
   const noteHtml = notes.map(n => `
     <div class="note"><div class="note-head"><b>${he(n.user_id)}</b> <span class="msg-date">${fmtJst(n.created_at)}</span></div>
-    <div>${he(n.body).replace(/\n/g, '<br>')}</div></div>`).join('') || '<div class="empty">メモはありません</div>';
+    <div>${linkifyText(n.body).replace(/\n/g, '<br>')}</div></div>`).join('') || '<div class="empty">メモはありません</div>';
 
   const logHtml = logs.map(l => {
     const b = fmtLogJson(l.before_json);
@@ -3001,6 +3005,7 @@ td.selcell input, th.selcell input { width: 18px; height: 18px; cursor: pointer;
 .msg-head { display: flex; gap: 8px; align-items: baseline; margin-bottom: 6px; flex-wrap: wrap; }
 .msg-date { color: #94a3b8; font-size: 12px; }
 .msg-body { white-space: normal; line-height: 1.7; overflow-wrap: anywhere; }
+.msg-body a, .note a { color: #1d4ed8; text-decoration: underline; overflow-wrap: anywhere; }
 /* 長文メール (自動配信・署名込み) はスレッドを追いやすいよう畳む */
 .msg-body details.more > summary { cursor: pointer; color: #1d4ed8; font-size: 13px; margin-top: 6px;
   list-style: none; padding: 4px 0; }
