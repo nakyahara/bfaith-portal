@@ -4136,6 +4136,35 @@ for (const [name, file, data] of renders) {
   check('画像DB: canva_url の部分更新で他列・保留状態を消さない',
     ip2.canva_url === 'https://canva.link/new' && ip2.importance_tier === 'そこそこ力を入れる（6〜8枚）' && ip2.workflow_state === 'active');
 
+  // 保留中は画像工程を動かせない (本流は動く)。解除で動く
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'on_hold', { note: 'テスト保留', actor: 'smoke' });
+  let holdStep = null;
+  try { wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'doing' }, 'smoke', ADMIN); } catch (e) { holdStep = e; }
+  check('画像DB: 保留中は画像工程を動かせない (400)', holdStep?.status === 400 && /保留中/.test(holdStep.message)
+    && stepOf(roomsRow.id, 'img_request_top')?.state === 'todo', holdStep?.message);
+  let holdMove = null;
+  try { wfp2.moveBoardCard(roomsRow.id, { view: 'image', kind: 'top', to: 'production', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN); } catch (e) { holdMove = e; }
+  check('画像DB: 保留中はボード D&D も止まる', !!holdMove && /保留中/.test(holdMove.message), holdMove?.message);
+  check('画像DB: 保留中でも本流工程は動く', wfp2.setStepState(roomsRow.id, 'basic_info', { note: '本流メモ' }, 'smoke', ADMIN).changed === true);
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' });
+  check('画像DB: 解除後は画像工程が動く', wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'doing' }, 'smoke', ADMIN).changed === true);
+  wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'todo' }, 'smoke', ADMIN);
+
+  // プレビュー後に人が空欄を埋めた → 実行はそのカードだけ失敗し台帳に載らない
+  {
+    const raceId = Number(insDraft.run('IMG-RACE-1', '競合テスト', null, 0).lastInsertRowid);
+    const diRace = { ...diImg, query: async () => ({ pages: [imgPage('IMG-RACE-1', '構成作成中')] }) };
+    const pr = await iimp.importImageDbByStatus({ actor: 'smoke', ...diRace });
+    db.prepare("UPDATE product_drafts SET drive_folder_url = 'https://drive.google.com/drive/folders/HUMAN' WHERE id = ?").run(raceId);
+    let raceRun = null;
+    try { raceRun = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: pr.snapshot, ...diRace }); } catch (e) { raceRun = { err: e }; }
+    check('画像DB: プレビュー後に人が入力した項目があれば snapshot 不一致か、そのカードだけ失敗 (台帳に載らない)',
+      (raceRun.err?.code === 'snapshot_mismatch' || byCode(raceRun, 'IMG-RACE-1')?.outcome === 'failed')
+      && !db.prepare('SELECT 1 FROM draft_image_notion_imports WHERE draft_id = ?').get(raceId)
+      && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(raceId).drive_folder_url.endsWith('HUMAN'),
+      JSON.stringify(raceRun.err ? raceRun.err.code : raceRun.results));
+  }
+
   // ボード: 保留カードにフラグ (画像ビュー)
   dbmod.setImageWorkflowState(db, roomsRow.id, 'on_hold', { note: 'テスト保留', actor: 'smoke' });
   const bImg = wfp2.boardData(db, { view: 'image' });

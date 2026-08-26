@@ -633,6 +633,11 @@ export function setStepState(
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
   if (!row) throw badRequest('この商品にその工程がありません');
+  // 画像制作だけの保留 (2026-08-26): 保留中は画像トラックの工程を動かせない (ボードの D&D も詳細画面もここを通る)。
+  // 解除は詳細画面の「保留を解除」だけ (Codex R3 high: ゲートだけ閉じても工程が進むと「止める」にならない)
+  if (row.track === 'image' && patch && Object.keys(patch).some((k) => k !== 'expected_version') && imageHoldOf(db, id).onHold) {
+    throw badRequest('画像制作が保留中です。詳細画面の「画像制作」カードで保留を解除してから操作してください');
+  }
   assertStepPermission(db, row, patch, { isAdmin, actorStaffId });
   // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う

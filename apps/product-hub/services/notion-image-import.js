@@ -222,6 +222,24 @@ export async function importImageDbByStatus({
   const codeCount = new Map();
   const recs = pages.map((page) => ({ page, rec: buildImageRecord(page) }));
   for (const { rec } of recs) if (rec) codeCount.set(norm(rec.ne_code), (codeCount.get(norm(rec.ne_code)) || 0) + 1);
+
+  // 外部照会 (商品マスター) は**先に全部**済ませる。判定ループの途中で await すると、その間に
+  // 判定済みのドラフトが変わっても plan (= snapshot) に写らない (Codex R3 medium)。
+  // 以降の DB 判定は同期で一気に通す = 判定と snapshot が同じ瞬間の DB を見る
+  const masterHits = new Map(); // key -> master page | null | Error
+  for (const { rec } of recs) {
+    if (!rec) continue;
+    const key = norm(rec.ne_code);
+    if (codeCount.get(key) > 1 || masterHits.has(key)) continue;
+    if (ledgerOf(db, rec.notion_page_id)) continue;
+    if (db.prepare('SELECT 1 FROM product_drafts WHERE LOWER(TRIM(ne_code)) = ?').get(key)) continue;
+    try {
+      masterHits.set(key, await masterFinder(rec.ne_code));
+    } catch (e) {
+      masterHits.set(key, e instanceof Error ? e : new Error(String(e)));
+    }
+  }
+
   for (const { page, rec } of recs) {
     if (!rec) {
       results.push({ ne_code: '(商品コードなし)', outcome: 'failed', warnings: [], error: `Notion カードに商品コードがありません (page ${page?.id || '?'})` });
@@ -251,12 +269,10 @@ export async function importImageDbByStatus({
 
     if (!existing) {
       // 商品マスターに居る商品は、先に本体を取り込ませる (最小情報カードを先に作らない — Codex R1)
-      let master = null;
-      try {
-        master = await masterFinder(rec.ne_code);
-      } catch (e) {
+      const master = masterHits.has(key) ? masterHits.get(key) : null;
+      if (master instanceof Error) {
         result.outcome = 'failed';
-        result.error = `商品マスターの照会に失敗: ${truncate(e)}`;
+        result.error = `商品マスターの照会に失敗: ${truncate(master)}`;
         continue;
       }
       if (master) {
@@ -422,17 +438,22 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       logEvent(db, draftId, 'image_db_imported',
         `Notion 画像DB「${rec.status || ''}」から最小情報で作成 (missing: price, jan_code, tax_rate) page=${rec.notion_page_id}`, actor);
     } else {
+      // プレビュー時に「空」と判定した項目が実行時点で埋まっていたら、そのカードは書かずに失敗させる
+      // (Codex R3 medium: 黙って据え置くと台帳だけ「移植済み」になり、以後補完されない)
+      const nowRow = db.prepare('SELECT drive_folder_url, amazon_url, asin, image_priority, own_brand FROM product_drafts WHERE id = ?').get(draftId);
+      if (!nowRow) throw new Error('ドラフトが見つかりません (プレビュー後に削除された可能性)');
+      const changedNow = Object.keys(plan.fill).filter((k) => !blank(nowRow[k]));
+      if (changedNow.length > 0) throw new Error(`プレビュー後に ${changedNow.join('/')} が入力されました。再プレビューしてください`);
+      if (plan.fill.image_priority && nowRow.own_brand !== 0 && nowRow.own_brand !== 1) throw new Error('own_brand が不正です');
       const sets = [];
       const params = { id: draftId };
       for (const [k, v] of Object.entries(plan.fill)) {
         if (k === 'image_priority') continue;
-        // 空のときだけ (プレビュー後に人が入れていたら触らない)
-        sets.push(`${k} = CASE WHEN ${k} IS NULL OR TRIM(${k}) = '' THEN @${k} ELSE ${k} END`);
+        sets.push(`${k} = @${k}`);
         params[k] = v;
       }
       if (plan.fill.image_priority) {
-        sets.push('own_brand = CASE WHEN image_priority IS NULL THEN 1 ELSE own_brand END');
-        sets.push('image_priority = COALESCE(image_priority, @image_priority)');
+        sets.push('own_brand = 1', 'image_priority = @image_priority');
         params.image_priority = plan.fill.image_priority;
       }
       if (sets.length > 0) {
@@ -445,12 +466,12 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       }
     }
 
-    // 画像制作情報 (空のときだけ — 実行時点の値で再判定)
+    // 画像制作情報 (プレビュー時に空だった項目だけ。実行時点で埋まっていたらカード失敗)
     if (Object.keys(plan.ip).length > 0) {
       const ipCur = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(draftId) || {};
-      const fields = {};
-      for (const [k, v] of Object.entries(plan.ip)) if (blank(ipCur[k])) fields[k] = v;
-      if (Object.keys(fields).length > 0) upsertImageProduction(db, draftId, fields);
+      const filledNow = Object.keys(plan.ip).filter((k) => !blank(ipCur[k]));
+      if (filledNow.length > 0) throw new Error(`プレビュー後に画像制作情報 (${filledNow.join('/')}) が入力されました。再プレビューしてください`);
+      upsertImageProduction(db, draftId, plan.ip);
     }
 
     // 子SKU → 独立ページ (detach)。代表ドラフトが無いときは自分自身を記録元にする
@@ -469,11 +490,11 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       if (nowState !== 'on_hold') setImageWorkflowState(db, draftId, 'on_hold', { note: 'Notion 画像DB: 保留', actor });
     }
 
-    // 工程 (まっさらなときだけ — 実行時点で再確認)
+    // 工程 (まっさらなときだけ — 実行時点で再確認。動いていたらカード失敗 = 台帳に載せない)
     if (plan.steps.length > 0) {
       const untouched = imageTrackUntouchedReason(db, draftId);
       if (untouched) {
-        warnings.push(`工程は書きませんでした (${untouched})`);
+        throw new Error(`プレビュー後に画像工程が動きました (${untouched})。再プレビューしてください`);
       } else {
         const assigneeCodes = plan.assignee
           ? new Set(['top', 'detail'].map((k) => `img_${plan.assignee.stage}_${k}`)) : new Set();
