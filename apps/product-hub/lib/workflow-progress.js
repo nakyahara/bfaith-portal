@@ -14,7 +14,7 @@
  *     recomputeDraftStatus が再計算して書く。status 列を残すのは、AI キュー (ready_for_ai) の
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
-import { getDB, logEvent, gateReasons } from '../db.js';
+import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS } from '../db.js';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -469,11 +469,15 @@ function splitImageRows(imageRows) {
 /** 1 種別分のサマリー (current / done / 滞留)。excluded の種別は current を出さない */
 function kindSummaryOf(rows, createdAt, excluded = false) {
   const current = excluded ? null : currentOf(rows);
+  // 楽天出品ゲートに数える工程 (listing_gate=1) だけの決着。詳細 v2 の ⑦⑧⑨ は出品の後工程なので含めない
+  const gateRows = rows.filter((r) => r.listing_gate !== 0);
   return {
     rows,
     current,
     excluded,
     done: !excluded && rows.length > 0 && !current,
+    gateDone: !excluded && gateRows.length > 0 && !currentOf(gateRows),
+    gateCurrent: excluded ? null : currentOf(gateRows),
     stalledDays: current ? stalledDaysOf(rows, rows.indexOf(current), createdAt) : null,
   };
 }
@@ -491,6 +495,7 @@ export function progressOf(draftId, { db = null } = {}) {
     SELECT p.draft_id, p.step_code, p.state, p.assignee_id, p.due_date, p.started_at,
            p.done_at, p.done_by, p.note, p.updated_at, p.version,
            s.label, s.track, s.image_kind, s.image_stage, s.sort, s.role_code, s.stall_days, s.description,
+           s.skippable, s.listing_gate,
            r.label AS role_label,
            st.name AS assignee_name, st.color AS assignee_color, st.active AS assignee_active
     FROM draft_step_progress p
@@ -573,8 +578,8 @@ export function imageTrackBlockReason(db, draftId) {
   if (!p.imageTop.done) {
     blocked.push(`${IMAGE_KIND_LABELS.top}: ${kindBlockDetail(p.imageTop)}`);
   }
-  if (!p.detailExcluded && !p.imageDetail.done) {
-    blocked.push(`${IMAGE_KIND_LABELS.detail}: ${kindBlockDetail(p.imageDetail)}`);
+  if (!p.detailExcluded && !p.imageDetail.gateDone) {
+    blocked.push(`${IMAGE_KIND_LABELS.detail}: ${kindBlockDetail({ ...p.imageDetail, current: p.imageDetail.gateCurrent })}`);
   }
   if (blocked.length === 0) return null;
   return `画像トラックが終わっていません (${blocked.join(' ／ ')})。画像承認まで済ませるか、`
@@ -619,7 +624,7 @@ export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = fa
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -628,7 +633,7 @@ export function setStepState(
   const row = db.prepare(`
     -- role_code は権限判定に使う (システム工程かどうか)。取り忘れると undefined になり、
     -- 通常の工程まで「システム工程」と誤判定して一般ユーザーが弾かれる
-    SELECT p.*, s.label, s.role_code, s.track, s.image_kind FROM draft_step_progress p
+    SELECT p.*, s.label, s.role_code, s.track, s.image_kind, s.skippable FROM draft_step_progress p
     JOIN ph_steps s ON s.code = p.step_code
     WHERE p.draft_id = ? AND p.step_code = ?
   `).get(id, code);
@@ -643,6 +648,10 @@ export function setStepState(
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
     throw badRequest('TOP画像の工程は「対象外」にできません (サムネイルは楽天出品に必須です)');
+  }
+  // 2026-08-26 v2: 工程属性 skippable=0 は「対象外」にできない (詳細 ①〜⑥。⑦⑧⑨ は可)
+  if (patch?.state === 'skip' && row.skippable === 0 && row.track === 'image') {
+    throw badRequest(`「${row.label}」は対象外にできません`);
   }
   // 導出は skip も「決着」に数えるので、ゲートを迂回できる工程は skip を禁止する (Codex R1 medium):
   // basic_info の skip = 材料チェックなしで AI キュー入り / listing の skip = 展開せず「展開済み」表示
@@ -671,6 +680,32 @@ export function setStepState(
       const reasons = draft ? gateReasons(db, draft) : [];
       if (reasons.length > 0) {
         throw badRequest(`完了にはまだ足りません: ${reasons.join(' / ')}`);
+      }
+    }
+    // 画像工程 v2 の完了条件 (2026-08-26)
+    // ①③ の材料チェックは自社商品だけ (撮影・素材/商品情報は自社商品の画像制作カードでしか入力できない。
+    // 仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品
+    const ownBrandDraft = (code === 'imgd_request' || code === 'imgd_material')
+      ? db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1 : false;
+    // bypassGates = 移行 (Notion 画像DB 取り込み等) が「Notion 側で既に済んでいる段階」を写すときだけ。画面・D&D は必ずゲートを通る
+    if (!bypassGates && state === 'done' && ((ownBrandDraft && (code === 'imgd_request' || code === 'imgd_material')) || code === 'imgd_review_2')) {
+      const ip = db.prepare('SELECT material_status, product_info_text FROM draft_image_production WHERE draft_id = ?').get(id) || {};
+      if (code === 'imgd_request') {
+        // ① = 撮影要否の判断 + 商品情報 (1.5)。商品情報は v2 切替後に作られた商品だけ必須 (移行データは例外 — 中原さん決定 7)
+        if (!ip.material_status) throw badRequest('完了にはまだ足りません: 撮影・素材ステータス (撮影不要/未発送/…) を設定してください');
+        const v2At = imageTrackV2At(db);
+        const created = db.prepare('SELECT created_at FROM product_drafts WHERE id = ?').get(id)?.created_at || '';
+        if (v2At && created > v2At && !String(ip.product_info_text || '').trim()) {
+          throw badRequest('完了にはまだ足りません: 商品情報 (Amazon やパッケージを見て手入力) を入れてください');
+        }
+      }
+      if (code === 'imgd_material' && ip.material_status !== 'ready' && ip.material_status !== 'not_required') {
+        throw badRequest(`完了にはまだ足りません: 撮影・素材ステータスが「${MATERIAL_STATUS_LABELS[ip.material_status] || '未設定'}」です (素材完了 か 撮影不要 にしてください)`);
+      }
+      if (code === 'imgd_review_2') {
+        // ⑥ は 田中確認 → 中原確認 の順 (サーバーで担保 — Codex R1)
+        const r1 = db.prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_review_1'").get(id);
+        if (r1 && r1.state !== 'done' && r1.state !== 'skip') throw badRequest('先に「社内確認 (田中)」を完了にしてください');
       }
     }
     if (state === 'done' && code === LISTING_STEP) {
@@ -790,6 +825,22 @@ export function setStepState(
     let draftStatus = null;
     if (stateChanged && row.track === 'main') {
       draftStatus = recomputeDraftStatus(db, id, { actor }).status;
+    }
+    // 自社商品の TOP は ⑤デザイン修正で作る (2026-08-26 中原さん): ⑤ done → TOP の 依頼/制作/登録、
+    // ⑥-2 中原確認 done → TOP の承認 を自動で done にして二重操作をなくす。差し戻しは追随しない (人が判断)
+    if (stateChanged && params.state === 'done' && (code === 'imgd_design' || code === 'imgd_review_2')) {
+      const own = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1;
+      if (own) {
+        const follow = code === 'imgd_design'
+          ? ['img_request_top', 'img_production_top', 'img_register_top'] : ['img_approve_top'];
+        for (const fc of follow) {
+          const fr = db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, fc);
+          if (fr && fr.state !== 'done' && fr.state !== 'skip') {
+            setStepState(id, fc, { state: 'done' }, actor, { isAdmin: true });
+            logEvent(db, id, 'step_changed', `TOP画像: 「${row.label}」の完了に追随して完了`, actor);
+          }
+        }
+      }
     }
     const freshRow = db.prepare(
       'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
@@ -947,9 +998,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
 
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
-    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority,
+    SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
+      (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
+      (SELECT canva_url FROM draft_image_production ip WHERE ip.draft_id = d.id) AS canva_url,
+      (SELECT CASE WHEN TRIM(COALESCE(product_info_text, '')) = '' THEN 0 ELSE 1 END FROM draft_image_production ip WHERE ip.draft_id = d.id) AS has_product_info,
       (SELECT drive_file_id FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_id,
       (SELECT drive_modified_time FROM draft_images i WHERE i.draft_id = d.id ORDER BY i.sort, i.id LIMIT 1) AS first_image_mtime
     FROM product_drafts d
@@ -1024,6 +1078,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       // 画像制作だけの保留 (2026-08-26)。画像ビューではバッジを出し、滞留の赤枠は付けない (止めているのは意図)
       imageOnHold: d.image_workflow_state === 'on_hold',
       imageHoldNote: d.image_hold_note || null,
+      // 画像工程 v2 のカード情報 (2026-08-26): 撮影・素材ステータス / Canva / 商品情報の有無
+      materialStatus: d.material_status || null,
+      materialLabel: d.material_status ? (MATERIAL_STATUS_LABELS[d.material_status] || d.material_status) : null,
+      canvaUrl: d.canva_url || null,
+      hasProductInfo: d.has_product_info === 1,
+      ownBrand: d.own_brand === 1,
     };
 
     if (view === 'image') {

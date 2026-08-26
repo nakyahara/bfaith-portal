@@ -152,12 +152,7 @@ export const STEP_SEEDS = [
   // 撮影依頼中 (2026-08-25 中原さん要望)。**商品詳細画像だけ**の段階 — 外部カメラマンへの
   // 撮影依頼は商品詳細画像のみの運用のため、TOP側には作らない (ボードの列には詳細カードだけが載る)。
   // 撮影しない商品 (メーカー素材を使う等) は工程パネルで「対象外」にするか、ボードで先の列へ D&D
-  {
-    code: 'img_shoot_detail', label: '撮影依頼中', track: 'image', image_kind: 'detail', image_stage: 'shoot',
-    role_code: 'image', sort: 15, stall_days: 7,
-    description: '外部カメラマンへ撮影を依頼中 (商品の発送〜撮影データの納品待ち)。撮影しない商品は「対象外」にする',
-  },
-  ...['top', 'detail'].flatMap((kind) => [
+  ...['top'].flatMap((kind) => [
     {
       code: `img_request_${kind}`, label: '画像制作の依頼', track: 'image', image_kind: kind, image_stage: 'request',
       role_code: 'image', sort: 10,
@@ -165,22 +160,101 @@ export const STEP_SEEDS = [
     },
     {
       code: `img_production_${kind}`, label: '画像制作', track: 'image', image_kind: kind, image_stage: 'production',
-      role_code: 'image', sort: 20, stall_days: 7,
+      // sort は詳細 v2 (①10 … ⑤50 / ⑥60,61 / ⑦70…) と同じ物差し。自社商品の TOP は ⑤で作るので、その直後に並べる (2026-08-26)
+      role_code: 'image', sort: 51, stall_days: 7,
       description: '外注/社内での画像制作。納品待ちがここで滞留する',
     },
     {
       code: `img_register_${kind}`, label: '画像登録', track: 'image', image_kind: kind, image_stage: 'register',
-      role_code: 'image', sort: 30,
+      role_code: 'image', sort: 52,
       description: 'Drive へ格納してアプリに取り込む',
     },
     {
       // 2026-08-23 中原さん追加。登録の後に置くのは、アプリの画像タブでサムネを見て承認できるため
       code: `img_approve_${kind}`, label: '画像承認', track: 'image', image_kind: kind, image_stage: 'approve',
-      role_code: 'image_approver', sort: 40, stall_days: 3,
+      role_code: 'image_approver', sort: 62, stall_days: 3,
       description: '登録された画像を確認して承認する。楽天出品は対象の画像種別すべての承認が前提 (出品ゲート)',
     },
   ]),
+  // ── 商品詳細画像 v2 (2026-08-26 現場要望・中原さん決定。要件定義 = AI_reference『画像工程v2_要件定義_20260826.md』) ──
+  // 自社商品の詳細画像の流れ ①〜⑨ (⑩完了 = ボードの終端列)。TOP 画像は全商品で作るので TOP 系列は上のまま。
+  // 自社商品の TOP は ⑤デザイン修正で作る → ⑤ done で TOP 系列の依頼/制作/登録、⑥中原確認 done で TOP 承認が自動 done
+  // (workflow-progress.js setStepState の追随)。skippable=0 の工程は「対象外」にできない。listing_gate=0 の工程
+  // (⑦⑧⑨) は楽天出品の前提にしない (⑧は楽天出品そのもの = 出品成功で自動完了)。
+  // 旧詳細 5 工程 (img_shoot_detail / img_*_detail) は LEGACY_DETAIL_V1_CODES で active=0 にし、進捗は migrateDetailTrackV2 で写す
+  {
+    code: 'imgd_request', label: '画像制作の依頼', track: 'image', image_kind: 'detail', image_stage: 'request',
+    role_code: 'image', sort: 10, skippable: 0, listing_gate: 1,
+    description: '① 新商品が自動で入る。撮影要否を判断して「撮影・素材」を設定し、商品情報 (Amazon やパッケージを見て手入力) を入れる',
+  },
+  {
+    code: 'imgd_compose', label: '構成', track: 'image', image_kind: 'detail', image_stage: 'compose',
+    role_code: 'image', sort: 20, skippable: 0, listing_gate: 1,
+    description: '② 商品画像の構成を作る',
+  },
+  {
+    code: 'imgd_material', label: '素材待ち', track: 'image', image_kind: 'detail', image_stage: 'material',
+    role_code: 'image', sort: 30, stall_days: 7, skippable: 0, listing_gate: 1,
+    description: '③ 撮影・社内準備した素材が揃うのを待つ (「撮影・素材」が 素材完了 か 撮影不要 で完了できる)',
+  },
+  {
+    code: 'imgd_ai', label: 'AI制作', track: 'image', image_kind: 'detail', image_stage: 'ai',
+    role_code: 'image', sort: 40, skippable: 0, listing_gate: 1,
+    description: '④ 構成 + 素材から AI 画像を制作',
+  },
+  {
+    code: 'imgd_design', label: 'デザイン修正', track: 'image', image_kind: 'detail', image_stage: 'design',
+    role_code: 'image', sort: 50, stall_days: 7, skippable: 0, listing_gate: 1,
+    description: '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)',
+  },
+  {
+    code: 'imgd_review_1', label: '社内確認 (田中)', track: 'image', image_kind: 'detail', image_stage: 'review',
+    role_code: 'image', sort: 60, stall_days: 3, skippable: 0, listing_gate: 1,
+    description: '⑥-1 画像の責任者の確認。カードの「確認者」はここが未完了なら田中',
+  },
+  {
+    code: 'imgd_review_2', label: '社内確認 (中原)', track: 'image', image_kind: 'detail', image_stage: 'review',
+    role_code: 'image_approver', sort: 61, stall_days: 3, skippable: 0, listing_gate: 1,
+    description: '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で TOP 側の承認も自動で済みになる = 楽天出品ゲートが開く',
+  },
+  {
+    code: 'imgd_amazon', label: 'Amazon登録依頼', track: 'image', image_kind: 'detail', image_stage: 'amazon',
+    role_code: 'image', sort: 70, stall_days: 7, skippable: 1, listing_gate: 0,
+    description: '⑦ 大畑さんへ登録依頼 + 最終デザイン確認。Amazon に出さない商品は「対象外」',
+  },
+  {
+    code: 'imgd_rakuten', label: '楽天登録', track: 'image', image_kind: 'detail', image_stage: 'rakuten',
+    role_code: null, sort: 80, skippable: 1, listing_gate: 0,
+    description: '⑧ このアプリから楽天に出品すると自動で完了。他モールは本流「出品・展開」のモール別状況で見る',
+  },
+  {
+    code: 'imgd_aplus', label: 'A+登録', track: 'image', image_kind: 'detail', image_stage: 'aplus',
+    role_code: 'image', sort: 90, stall_days: 14, skippable: 1, listing_gate: 0,
+    description: '⑨ Amazon A+ コンテンツ登録。作らない商品は「対象外」',
+  },
 ];
+
+/** 詳細系列 v1 (2026-08-24〜26) の工程コード。v2 で active=0 (進捗行は残置。migrateDetailTrackV2 が v2 へ写す) */
+export const LEGACY_DETAIL_V1_CODES = ['img_shoot_detail', 'img_request_detail', 'img_production_detail', 'img_register_detail', 'img_approve_detail'];
+/** 詳細系列 v2 の工程コード (順序どおり) */
+export const DETAIL_V2_CODES = ['imgd_request', 'imgd_compose', 'imgd_material', 'imgd_ai', 'imgd_design', 'imgd_review_1', 'imgd_review_2', 'imgd_amazon', 'imgd_rakuten', 'imgd_aplus'];
+/** 撮影・素材ステータス (2026-08-26 現場要望の 6 値。DB には安定コードで保存) */
+export const MATERIAL_STATUSES = [
+  { code: 'not_required', label: '撮影不要' },
+  { code: 'not_shipped', label: '商品未発送' },
+  { code: 'shipped', label: '商品発送済み' },
+  { code: 'shooting', label: '撮影中' },
+  { code: 'internal_prep', label: '社内準備' },
+  { code: 'ready', label: '素材完了' },
+];
+export const MATERIAL_STATUS_CODES = new Set(MATERIAL_STATUSES.map((m) => m.code));
+export const MATERIAL_STATUS_LABELS = Object.fromEntries(MATERIAL_STATUSES.map((m) => [m.code, m.label]));
+/** 旧 Notion 5 値 (shipping_status) → material_status の写像 */
+export const SHIPPING_TO_MATERIAL = {
+  '撮影依頼不要': 'not_required', '撮影商品未発送': 'not_shipped', '撮影商品発送手配済み': 'shipped',
+  '社内準備': 'internal_prep', '社内画質上げる': 'internal_prep',
+};
+export const IMAGE_TRACK_V2_KEY = 'image_track_v2_migrated_at';
 
 /** kind 分割前の画像工程コード (2026-08-24 移行で active=0 にする。進捗行は残置) */
 export const LEGACY_IMAGE_STEP_CODES = ['img_request', 'img_production', 'img_register', 'img_approve'];
@@ -899,6 +973,9 @@ export function initProductHubDB() {
   for (const [col, ddl] of [
     ['image_kind', "ALTER TABLE ph_steps ADD COLUMN image_kind TEXT CHECK (image_kind IN ('top', 'detail'))"],
     ['image_stage', 'ALTER TABLE ph_steps ADD COLUMN image_stage TEXT'],
+    // 2026-08-26 v2: 「対象外」にできるか / 楽天出品ゲートに数えるか を工程属性で持つ (kind 依存をやめる — Codex 設計相談)
+    ['skippable', 'ALTER TABLE ph_steps ADD COLUMN skippable INTEGER NOT NULL DEFAULT 1 CHECK (skippable IN (0, 1))'],
+    ['listing_gate', 'ALTER TABLE ph_steps ADD COLUMN listing_gate INTEGER NOT NULL DEFAULT 1 CHECK (listing_gate IN (0, 1))'],
   ]) {
     if (!stepCols.has(col)) {
       try { db.exec(ddl); } catch (e) {
@@ -937,6 +1014,11 @@ export function initProductHubDB() {
   const ipCols = new Set(db.prepare('PRAGMA table_info(draft_image_production)').all().map((c) => c.name));
   const ipAlters = [
     ['canva_url', 'ALTER TABLE draft_image_production ADD COLUMN canva_url TEXT'],
+    // 2026-08-26 画像工程 v2: 撮影・素材ステータス (安定コード) / 手入力の商品情報 (1.5・定型文ボタンの材料)
+    ['material_status', 'ALTER TABLE draft_image_production ADD COLUMN material_status TEXT'],
+    ['product_info_text', 'ALTER TABLE draft_image_production ADD COLUMN product_info_text TEXT'],
+    ['product_info_updated_at', 'ALTER TABLE draft_image_production ADD COLUMN product_info_updated_at TEXT'],
+    ['product_info_updated_by', 'ALTER TABLE draft_image_production ADD COLUMN product_info_updated_by TEXT'],
     ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
     ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
   ];
@@ -969,18 +1051,26 @@ export function initProductHubDB() {
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
   const roleSeed = db.prepare('INSERT OR IGNORE INTO ph_roles (code, label, sort, builtin) VALUES (?, ?, ?, 1)');
   const stepSeed = db.prepare(`
-    INSERT OR IGNORE INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, stall_days, description, builtin)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    INSERT OR IGNORE INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, stall_days, description, builtin, skippable, listing_gate)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
   `);
+  // 属性 (skippable / listing_gate) は管理画面で変えられないので、既存行も seed の値に揃える (列追加の後追いを含む)
+  const stepAttr = db.prepare('UPDATE ph_steps SET skippable = ?, listing_gate = ? WHERE code = ? AND (skippable != ? OR listing_gate != ?)');
   db.transaction(() => {
     for (const r of ROLE_SEEDS) roleSeed.run(r.code, r.label, r.sort);
     for (const s of STEP_SEEDS) {
+      // 既定: 画像 TOP 系列と basic_info / listing は対象外にできない (従来ルールを属性に写す)
+      const skippable = s.skippable ?? ((s.track === 'image' && s.image_kind !== 'detail') || s.code === 'basic_info' || s.code === 'listing' ? 0 : 1);
+      const gate = s.listing_gate ?? 1;
       stepSeed.run(
         s.code, s.label, s.track, s.image_kind ?? null, s.image_stage ?? null,
         s.role_code ?? null, s.sort, s.stall_days ?? null, s.description ?? null,
+        skippable, gate,
       );
+      stepAttr.run(skippable, gate, s.code, skippable, gate);
     }
     migrateImageKindSplit(db);
+    migrateDetailTrackV2(db);
     syncOwnBrandImagePriority(db);
   })();
 
@@ -1049,13 +1139,93 @@ export function migrateImageKindSplit(db) {
     FROM draft_step_progress p WHERE p.step_code = ?
   `);
   let copied = 0;
+  const stepExists = db.prepare('SELECT 1 FROM ph_steps WHERE code = ?');
   for (const legacy of LEGACY_IMAGE_STEP_CODES) {
     copied += copyTop.run(`${legacy}_top`, legacy).changes;
-    copied += copyDetail.run(`${legacy}_detail`, legacy).changes;
+    // 詳細 v1 工程は 2026-08-26 の v2 以降シードされない (新規 DB には無い) → 行が無ければコピーしない (FK)
+    if (stepExists.get(`${legacy}_detail`)) copied += copyDetail.run(`${legacy}_detail`, legacy).changes;
   }
   db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${placeholders})`).run(...LEGACY_IMAGE_STEP_CODES);
   console.log(`[product-hub] 画像工程を TOP/詳細 に分割しました (進捗コピー ${copied} 行)`);
   return true;
+}
+
+/**
+ * 詳細系列 v1 (依頼/撮影/制作/登録/承認) → v2 (①〜⑨) の一回きり移行 (2026-08-26)。
+ * 要件定義 §3.6 (中原さん決定 4): 楽天登録済み = 全部 done / 未登録 = 旧で最も進んだ段階まで done、
+ * 旧「登録/承認」done でも ⑥-1 (田中確認) から再確認 (田中確認済みを DB から証明できないため — Codex R1)。
+ * 旧進捗行は残す。新行にはイベントで元工程・元 state を記録。実行済みは ph_intake_state に記録 (再実行しない)。
+ * 旧 shipping_status → material_status も、空のときだけ写す。
+ * @returns {{ migrated: number, skipped: boolean }}
+ */
+export function migrateDetailTrackV2(db) {
+  const done = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(IMAGE_TRACK_V2_KEY);
+  if (done) return { migrated: 0, skipped: true };
+  const ph = LEGACY_DETAIL_V1_CODES.map(() => '?').join(',');
+  const run = db.transaction(() => {
+    // 1. 旧詳細工程を無効化 (新規 DB では行が無いので no-op)
+    db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${ph})`).run(...LEGACY_DETAIL_V1_CODES);
+    // 2. 旧詳細の進捗を持つドラフトを写す
+    const drafts = db.prepare(`
+      SELECT DISTINCT p.draft_id AS id FROM draft_step_progress p WHERE p.step_code IN (${ph})
+    `).all(...LEGACY_DETAIL_V1_CODES).map((r) => r.id);
+    const oldRows = db.prepare(`SELECT step_code, state FROM draft_step_progress WHERE draft_id = ? AND step_code IN (${ph})`);
+    const listedQ = db.prepare('SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL');
+    const ins = db.prepare(`
+      INSERT OR IGNORE INTO draft_step_progress (draft_id, step_code, state, done_at, done_by)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const settled = (st) => st === 'done' || st === 'skip';
+    let migrated = 0;
+    for (const id of drafts) {
+      const old = Object.fromEntries(oldRows.all(id, ...LEGACY_DETAIL_V1_CODES).map((r) => [r.step_code, r.state]));
+      const listed = !!listedQ.get(id);
+      let doneUpTo = -1;   // DETAIL_V2_CODES の index。-1 = 何も済んでいない
+      let rule;
+      if (listed) {
+        doneUpTo = DETAIL_V2_CODES.length - 1; rule = '楽天登録済み → 全工程 done';
+      } else if (settled(old.img_register_detail) || settled(old.img_approve_detail)) {
+        doneUpTo = DETAIL_V2_CODES.indexOf('imgd_design'); rule = '旧 登録/承認 済み → ⑤まで done・⑥-1 (田中確認) から再確認';
+      } else if (settled(old.img_production_detail)) {
+        doneUpTo = DETAIL_V2_CODES.indexOf('imgd_ai'); rule = '旧 制作 済み → ④まで done・⑤から';
+      } else if (settled(old.img_request_detail)) {
+        doneUpTo = DETAIL_V2_CODES.indexOf('imgd_request'); rule = '旧 依頼 済み → ①done・②から';
+      } else {
+        rule = '旧 未着手 → 全工程 todo';
+      }
+      const now = new Date().toISOString();
+      DETAIL_V2_CODES.forEach((code, i) => {
+        const st = i <= doneUpTo ? 'done' : 'todo';
+        ins.run(id, code, st, st === 'done' ? now : null, st === 'done' ? 'migration_v2' : null);
+      });
+      // 旧 撮影依頼中 が「対象外」なら撮影不要
+      if (old.img_shoot_detail === 'skip') {
+        db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+        db.prepare("UPDATE draft_image_production SET material_status = 'not_required' WHERE draft_id = ? AND material_status IS NULL").run(id);
+      }
+      const oldDesc = LEGACY_DETAIL_V1_CODES.map((c) => `${c}=${old[c] || '-'}`).join(' ');
+      logEvent(db, id, 'image_track_v2_migrated', `${rule} (旧: ${oldDesc})`, 'migration_v2');
+      migrated += 1;
+    }
+    // 2b. TOP 系列の並び (管理画面で変えていない = 旧既定値のままなら、v2 の物差しに揃える)
+    for (const [code, from, to] of [['img_production_top', 20, 51], ['img_register_top', 30, 52], ['img_approve_top', 40, 62]]) {
+      db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ? AND sort = ?').run(to, code, from);
+    }
+    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ)
+    for (const [from, to] of Object.entries(SHIPPING_TO_MATERIAL)) {
+      db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shipping_status = ?').run(to, from);
+    }
+    db.prepare('INSERT INTO ph_intake_state (key, value) VALUES (?, ?)').run(IMAGE_TRACK_V2_KEY, new Date().toISOString());
+    return migrated;
+  });
+  const migrated = run();
+  if (migrated > 0) console.log(`[product-hub] 商品詳細画像の工程を v2 (①〜⑨) へ移行しました (${migrated} 件)`);
+  return { migrated, skipped: false };
+}
+
+/** 画像工程 v2 に切り替えた日時 (この日時より後に作られた商品は ①の完了に商品情報が必須) */
+export function imageTrackV2At(db) {
+  return db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(IMAGE_TRACK_V2_KEY)?.value || null;
 }
 
 export function getDB() {
@@ -1154,6 +1324,7 @@ const IMAGE_PRODUCTION_FIELDS = [
   'camera_instruction_url', 'shipping_status', 'reference_collection',
   'designer', 'page_composer', 'request_text',
   'canva_url',   // 2026-08-26 Notion 画像DB の「Canva」(制作中デザインのリンク) 移植で追加
+  'material_status', 'product_info_text', 'product_info_updated_at', 'product_info_updated_by',   // 画像工程 v2
 ];
 
 /** draft_image_production の upsert (部分更新)。自社商品のみ呼ぶ想定 (router 側でガード) */

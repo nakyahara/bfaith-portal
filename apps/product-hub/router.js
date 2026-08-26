@@ -16,7 +16,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -39,6 +39,7 @@ import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
+import { buildPromptTemplates } from './lib/prompt-templates.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -306,6 +307,8 @@ router.get('/detail/:id', (req, res) => {
     setDrafts: setDraftsOf(db, draft.id),
     setInfo: setInfoOf(db, draft.id),
     imagePriorities: IMAGE_PRIORITIES,
+    materialStatuses: MATERIAL_STATUSES,
+    promptTemplates: buildPromptTemplates(draft, imageProduction),
   });
 });
 
@@ -727,6 +730,23 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
   }
+  // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
+  let materialVal;
+  if (b.material_status !== undefined) {
+    materialVal = cleanText(b.material_status, 40) || null;
+    if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
+      return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
+    }
+  }
+  let infoVal; let infoAt; let infoBy;
+  if (b.product_info_text !== undefined) {
+    infoVal = cleanText(b.product_info_text, 20000) || null;
+    const cur = db.prepare('SELECT product_info_text FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+    if ((cur?.product_info_text || null) !== infoVal) {
+      infoAt = new Date().toISOString();
+      infoBy = actorOf(req);
+    }
+  }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
@@ -741,8 +761,12 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     page_composer: clean(b.page_composer, 100),
     request_text: clean(b.request_text, 10000),
     canva_url: canvaVal,
+    material_status: materialVal,
+    product_info_text: infoVal,
+    product_info_updated_at: infoAt,
+    product_info_updated_by: infoBy,
   });
-  logEvent(db, draft.id, 'image_production_updated', null, actorOf(req));
+  logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
   res.json({ ok: true });
 });
 
@@ -1248,6 +1272,15 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
       itemUrl: rakutenItemPageUrl(draft.ne_code),
       actor: actorOf(req),
     });
+    // 画像工程 v2 ⑧「楽天登録」も自動で完了 (fail-soft: 出品は成功している)
+    try {
+      const st = getDB().prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(draft.id);
+      if (st && st.state !== 'done' && st.state !== 'skip') {
+        setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actorOf(req), { isAdmin: true });
+      }
+    } catch (e) {
+      console.warn('[product-hub] imgd_rakuten auto-done failed:', e?.message || e);
+    }
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);

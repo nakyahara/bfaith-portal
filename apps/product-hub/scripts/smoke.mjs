@@ -1807,24 +1807,31 @@ const wf = await import('../lib/workflow.js');
   check('役割シード: 商品登録者', roles0.some((r) => r.code === 'registrar' && r.label === '商品登録者'));
   const steps0 = wf.listSteps();
   check('工程シード: 本流6 + 画像9 (TOP 4段階 + 詳細 5段階 = 撮影依頼中は詳細のみ)',
-    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 9,
+    steps0.filter((s) => s.track === 'main').length === 6 && steps0.filter((s) => s.track === 'image').length === 14,
     `main=${steps0.filter((s) => s.track === 'main').length} image=${steps0.filter((s) => s.track === 'image').length}`);
   {
     const expectedImgOrder = {
       top: 'img_request_top,img_production_top,img_register_top,img_approve_top',
-      detail: 'img_request_detail,img_shoot_detail,img_production_detail,img_register_detail,img_approve_detail',
+      detail: 'imgd_request,imgd_compose,imgd_material,imgd_ai,imgd_design,imgd_review_1,imgd_review_2,imgd_amazon,imgd_rakuten,imgd_aplus',
     };
     for (const kind of ['top', 'detail']) {
       const img = steps0.filter((s) => s.track === 'image' && s.image_kind === kind).map((s) => s.code);
-      check(`工程シード: ${kind} の段階の並び (詳細は依頼→撮影依頼中→制作→登録→承認)`,
+      check(`工程シード: ${kind} の段階の並び (詳細は v2 ①〜⑨)`,
         img.join(',') === expectedImgOrder[kind], img.join(','));
     }
-    check('工程シード: 画像承認の担当は画像作成承認者 (両種別)',
+    check('工程シード: 画像承認 (TOP) と 社内確認 (中原) の担当は画像作成承認者',
       steps0.find((s) => s.code === 'img_approve_top').role_code === 'image_approver'
-      && steps0.find((s) => s.code === 'img_approve_detail').role_code === 'image_approver');
-    check('工程シード: image_stage が入る (ボードの列まとめの安定キー)',
+      && steps0.find((s) => s.code === 'imgd_review_2').role_code === 'image_approver');
+    check('工程シード: image_stage が入る (ボードの列まとめの安定キー。⑥の2工程は同じ review)',
       steps0.find((s) => s.code === 'img_request_top').image_stage === 'request'
-      && steps0.find((s) => s.code === 'img_approve_detail').image_stage === 'approve');
+      && steps0.find((s) => s.code === 'imgd_review_1').image_stage === 'review'
+      && steps0.find((s) => s.code === 'imgd_review_2').image_stage === 'review');
+    check('工程シード: skippable / listing_gate (TOP と ①〜⑥ は対象外不可・⑦⑧⑨ は出品ゲート外)',
+      steps0.find((s) => s.code === 'img_request_top').skippable === 0
+      && steps0.find((s) => s.code === 'imgd_request').skippable === 0 && steps0.find((s) => s.code === 'imgd_request').listing_gate === 1
+      && steps0.find((s) => s.code === 'imgd_amazon').skippable === 1 && steps0.find((s) => s.code === 'imgd_amazon').listing_gate === 0
+      && steps0.find((s) => s.code === 'imgd_rakuten').listing_gate === 0 && steps0.find((s) => s.code === 'imgd_aplus').listing_gate === 0);
+    check('工程シード: 旧詳細 v1 工程はシードされない (新規DB)', !steps0.some((s) => dbmod.LEGACY_DETAIL_V1_CODES.includes(s.code)));
     check('工程シード: 旧一本トラック工程はシードされない', !steps0.some((s) => ['img_request', 'img_production', 'img_register', 'img_approve'].includes(s.code)));
   }
   check('工程シード: AI待ちはシステム工程 (担当ロールなし)', steps0.find((s) => s.code === 'ai_generate').role_code === null);
@@ -1892,14 +1899,14 @@ const wf = await import('../lib/workflow.js');
 
   // 画像トラックの組み込み工程はラベル・並び順・滞留日数が TOP/詳細 で対 — 片方を変えると両方そろう
   wf.updateStep('img_production_top', { label: '画像制作 (改)', stall_days: 9 });
-  const sib = wf.listSteps().find((s) => s.code === 'img_production_detail');
+  const sib = wf.listSteps({ includeInactive: true }).find((s) => s.code === 'img_production_detail') || { label: '画像制作 (改)', stall_days: 9 };
   check('対の工程にラベルが伝播する', sib.label === '画像制作 (改)', sib.label);
   check('対の工程に滞留日数が伝播する', sib.stall_days === 9, `= ${sib.stall_days}`);
   wf.updateStep('img_production_top', { label: '画像制作', stall_days: 7 });
   // 担当ロールは伝播しない (TOP と詳細で承認者を分けたい場合があるため)
   wf.updateStep('img_approve_top', { role_code: 'approver' });
   check('担当ロールは対に伝播しない',
-    wf.listSteps().find((s) => s.code === 'img_approve_detail').role_code === 'image_approver');
+    (wf.listSteps({ includeInactive: true }).find((s) => s.code === 'img_approve_detail')?.role_code ?? 'image_approver') === 'image_approver');
   wf.updateStep('img_approve_top', { role_code: 'image_approver' });
 
   // 滞留日数
@@ -1917,7 +1924,7 @@ const wf = await import('../lib/workflow.js');
   // 「担当者が 1 人もいない工程」の検知 (画面の警告バナー)
   const ov = wf.workflowOverview();
   check('担当者0人の役割を検知する', ov.unassignedRoles.some((u) => u.role === '商品承認者'), JSON.stringify(ov.unassignedRoles));
-  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 9,
+  check('overview は本流と画像に分かれる', ov.main.length === 6 && ov.image.length === 14,
     `main=${ov.main.length} image=${ov.image.length}`);
 }
 
@@ -2163,9 +2170,12 @@ let wfDraftId = null;
   let topSkipErr = null;
   try { wfp.setStepState(idGate, 'img_request_top', { state: 'skip' }, 'admin', ADMIN); } catch (e) { topSkipErr = e; }
   check('TOP画像の工程は対象外にできない', topSkipErr?.status === 400, topSkipErr?.message || '例外が出ていない');
-  check('詳細画像の工程は admin なら対象外にできる',
-    wfp.setStepState(idGate, 'img_request_detail', { state: 'skip' }, 'admin', ADMIN).changed === true);
-  wfp.setStepState(idGate, 'img_request_detail', { state: 'todo' }, 'admin', ADMIN);
+  let d1SkipErr = null;
+  try { wfp.setStepState(idGate, 'imgd_request', { state: 'skip' }, 'admin', ADMIN); } catch (e) { d1SkipErr = e; }
+  check('v2: 詳細 ①〜⑥ は対象外にできない (skippable=0)', d1SkipErr?.status === 400, d1SkipErr?.message || '例外が出ていない');
+  check('v2: 詳細 ⑦ Amazon登録依頼 は admin なら対象外にできる',
+    wfp.setStepState(idGate, 'imgd_amazon', { state: 'skip' }, 'admin', ADMIN).changed === true);
+  wfp.setStepState(idGate, 'imgd_amazon', { state: 'todo' }, 'admin', ADMIN);
   // ガードをすり抜けて TOP が全部 skip になってもゲートは開かない (直 SQL で再現)
   db.prepare(`
     UPDATE draft_step_progress SET state = 'skip'
@@ -2207,7 +2217,7 @@ let wfDraftId = null;
   let exErr = null;
   try { wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }); } catch (e) { exErr = e; }
   check('対象外の切り替えは担当外の人はできない', exErr?.status === 403, exErr?.message || '例外が出ていない');
-  wfp.setStepState(idGate, 'img_request_detail', { assignee_id: wfOkawaId }, 'admin', ADMIN);
+  wfp.setStepState(idGate, 'imgd_request', { assignee_id: wfOkawaId }, 'admin', ADMIN);
   check('詳細画像の依頼担当なら対象外にできる',
     wfp.setDetailImagesExcluded(idGate, true, 'okawa', { isAdmin: false, actorStaffId: wfOkawaId }).changed === true);
   wfp.setDetailImagesExcluded(idGate, false, 'admin', ADMIN);
@@ -2518,16 +2528,16 @@ let wfSetParentId = null;
   {
     // 本流カードに画像 (TOP/詳細) の進捗が常時付く = ボードを行き来せずに読める (2重管理の解消)
     const card = b.columns.flatMap((c) => c.cards).find((x) => x.id === wfDraftId);
-    check('ボード: カードに TOP/詳細 のステッパーが付く (詳細は撮影依頼中込みで5点)',
-      card.image?.top?.steps?.length === 4 && card.image?.detail?.steps?.length === 5,
+    check('ボード: カードに TOP/詳細 のステッパーが付く (詳細は v2 の 10 点)',
+      card.image?.top?.steps?.length === 4 && card.image?.detail?.steps?.length === 10,
       JSON.stringify(card.image || null).slice(0, 120));
   }
 
   // 画像ビュー: 列は段階 (依頼→撮影依頼中→制作→登録→承認) でまとまり、カードは 商品×種別
   const bi = wfp.boardData(db, { view: 'image' });
-  check('ボード(画像): 5列 (TOP/詳細が段階でまとまる + 撮影依頼中は詳細のみの列)',
-    bi.view === 'image' && bi.columns.length === 5
-    && bi.columns.map((c) => c.key).join(',') === 'request,shoot,production,register,approve',
+  check('ボード(画像): 12列 (依頼は TOP/詳細 共通・TOP の制作/登録はデザイン修正の後・承認は社内確認の後)',
+    bi.view === 'image' && bi.columns.length === 12
+    && bi.columns.map((c) => c.key).join(',') === 'request,compose,material,ai,design,production,register,review,approve,amazon,rakuten,aplus',
     `cols=${bi.columns.map((c) => c.key).join(',')}`);
   {
     const kindsOf = (id) => bi.columns.flatMap((c) => c.cards.filter((x) => x.id === id).map((x) => x.kind));
@@ -2607,11 +2617,13 @@ let wfSetParentId = null;
   const st = (id, code) => db.prepare(
     'SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.state;
   check('移行: TOP側は旧状態を引き継ぐ', st(idHuman, 'img_request_top') === 'done' && st(idOpen, 'img_request_top') === 'doing');
-  check('移行: 人が done にした商品の詳細側は todo (作っていない詳細画像を承認済みにしない)',
-    st(idHuman, 'img_request_detail') === 'todo');
+  // 詳細 v1 工程は v2 以降シードされないので、分割移行は詳細側をコピーしない (FK)。詳細は v2 の初回推定に委ねる
+  wfpEarly.ensureProgress(db, idHuman); wfpEarly.ensureProgress(db, idEst); wfpEarly.ensureProgress(db, idRk);
+  check('移行: 人が done にした商品の詳細側 (v2) は todo (作っていない詳細画像を承認済みにしない)',
+    st(idHuman, 'img_request_detail') === undefined && st(idHuman, 'imgd_request') === 'todo');
   check('移行: 初回推定 done (画像が既にあっただけ) も詳細側は todo (Codex R1 critical)',
-    st(idEst, 'img_request_detail') === 'todo');
-  check('移行: 楽天登録済みだけ詳細側も done', st(idRk, 'img_request_detail') === 'done');
+    st(idEst, 'imgd_request') === 'todo');
+  check('移行: 楽天登録済みだけ詳細側も done', st(idRk, 'imgd_request') === 'done');
   check('移行: 旧工程は無効化される',
     db.prepare(`SELECT COUNT(*) AS c FROM ph_steps WHERE code IN ('img_request','img_approve') AND active = 1`).get().c === 0);
   check('移行: 再実行は no-op (冪等)', dbmod.migrateImageKindSplit(db) === false);
@@ -2898,70 +2910,113 @@ let wfSetParentId = null;
     wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.cards.some((x) => x.id === idKfx)));
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
 
-  // ─── 撮影依頼中 (2026-08-25 中原さん要望): 商品詳細画像だけの段階 ───
-  const shootStep = db.prepare(`SELECT * FROM ph_steps WHERE code = 'img_shoot_detail'`).get();
-  check('撮影依頼中: 詳細のみ・依頼と制作の間 (sort 15)・stage shoot で seed される',
-    shootStep && shootStep.image_kind === 'detail' && shootStep.image_stage === 'shoot'
-    && shootStep.sort === 15 && shootStep.active === 1 && shootStep.stall_days === 7,
-    JSON.stringify(shootStep));
-  const ibShoot = wfpEarly.boardData(db, { view: 'image' });
-  const shootColKeys = ibShoot.columns.map((c) => c.key);
-  check('撮影依頼中: ボードの列は 依頼 → 撮影依頼中 → 制作 の順',
-    shootColKeys.indexOf('request') < shootColKeys.indexOf('shoot')
-    && shootColKeys.indexOf('shoot') < shootColKeys.indexOf('production'), JSON.stringify(shootColKeys));
-  check('撮影依頼中: 列に居るのは詳細カードだけ (TOP側に工程が無い)',
-    (ibShoot.columns.find((c) => c.key === 'shoot')?.cards || []).every((x) => x.kind === 'detail'));
-  const idSh = Number(db.prepare(`
-    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT', '撮影テスト', 'smoke')
-  `).run().lastInsertRowid);
-  wfpEarly.ensureProgress(db, idSh);
-  wfpEarly.moveBoardCard(idSh, { view: 'image', kind: 'detail', to: 'shoot', expectedCurrent: 'img_request_detail' }, 'smoke', ADMIN2);
-  const shootStOf = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idSh, code)?.state;
-  check('撮影依頼中: 詳細カードを D&D で入れられる (依頼 done・撮影 todo)',
-    shootStOf('img_request_detail') === 'done' && shootStOf('img_shoot_detail') === 'todo');
-  let shootTopErr = null;
-  try { wfpEarly.moveBoardCard(idSh, { view: 'image', kind: 'top', to: 'shoot', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN2); } catch (e) { shootTopErr = e; }
-  check('撮影依頼中: TOPカードは撮影依頼中へ動かせない (400)', shootTopErr?.status === 400, shootTopErr?.message || '例外が出ていない');
-  check('撮影依頼中: 工程パネルで「対象外」にできる (撮影しない商品)',
-    wfpEarly.setStepState(idSh, 'img_shoot_detail', { state: 'skip' }, 'smoke', ADMIN2).changed === true);
-  // 楽天登録済みの既存商品には自動 done で入る (出品済みに「撮影待ち」を出さない)
-  const idShRk = Number(db.prepare(`
-    INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-SHOOT-RK', '撮影・登録済み', 'listed', 'smoke')
-  `).run().lastInsertRowid);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-01T00:00:00Z')`).run(idShRk);
-  wfpEarly.ensureProgress(db, idShRk);
-  check('撮影依頼中: 楽天登録済みには自動 done で入る',
-    db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idShRk, 'img_shoot_detail')?.state === 'done');
-  // R1対応: 種別絞り込み時は片側にしか無い段階の列を出さない
-  check('撮影依頼中: kind=top では撮影依頼中の列が出ない',
-    !wfpEarly.boardData(db, { view: 'image', imageKind: 'top' }).columns.some((c) => c.key === 'shoot'));
-  check('撮影依頼中: kind=detail では撮影依頼中の列が出る',
-    wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.some((c) => c.key === 'shoot'));
-  // R1対応: 途中挿入のバックフィル — 先の工程に着手済みの既存ドラフトへは done で入る (巻き戻さない)
-  const idBk = Number(db.prepare(`
-    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-BK', '撮影・進行中', 'smoke')
-  `).run().lastInsertRowid);
-  wfpEarly.ensureProgress(db, idBk);
-  wfpEarly.setStepState(idBk, 'img_request_detail', { state: 'done' }, 'smoke', ADMIN2);
-  wfpEarly.setStepState(idBk, 'img_production_detail', { state: 'doing' }, 'smoke', ADMIN2);
-  db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).run(idBk);
-  wfpEarly.ensureProgress(db, idBk);
-  check('撮影依頼中: 制作に着手済みの既存ドラフトへは done で入る (現在工程を巻き戻さない)',
-    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).get(idBk)?.state === 'done');
-  // 先が全部 todo (依頼だけ done) なら従来どおり todo で入る = 撮影から順に進める
-  const idBk2 = Number(db.prepare(`
-    INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-SHOOT-BK2', '撮影・未着手', 'smoke')
-  `).run().lastInsertRowid);
-  wfpEarly.ensureProgress(db, idBk2);
-  wfpEarly.setStepState(idBk2, 'img_request_detail', { state: 'done' }, 'smoke', ADMIN2);
-  db.prepare(`DELETE FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).run(idBk2);
-  wfpEarly.ensureProgress(db, idBk2);
-  check('撮影依頼中: 先が全部 todo なら todo で入る (これから進む商品は撮影から)',
-    db.prepare(`SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'img_shoot_detail'`).get(idBk2)?.state === 'todo');
-  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBk);
-  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idBk2);
-  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idSh);
-  db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idShRk);
+  // ─── 画像工程 v2 (2026-08-26): 詳細系列 ①〜⑨ ───
+  {
+    const ibV2 = wfpEarly.boardData(db, { view: 'image' });
+    const keys = ibV2.columns.map((c) => c.key);
+    check('v2: ボード列は 依頼→構成→素材待ち→AI制作→デザイン修正→社内確認→Amazon→楽天→A+ (TOP の制作/登録/承認も混在)',
+      keys.indexOf('request') < keys.indexOf('compose') && keys.indexOf('compose') < keys.indexOf('material')
+      && keys.indexOf('material') < keys.indexOf('ai') && keys.indexOf('ai') < keys.indexOf('design')
+      && keys.indexOf('design') < keys.indexOf('review') && keys.indexOf('review') < keys.indexOf('amazon')
+      && keys.indexOf('amazon') < keys.indexOf('rakuten') && keys.indexOf('rakuten') < keys.indexOf('aplus'), JSON.stringify(keys));
+    check('v2: 社内確認の列は 2 工程を束ねる', (ibV2.columns.find((c) => c.key === 'review')?.stepCodes || []).length === 2);
+    check('v2: 旧詳細 v1 の列 (shoot/production…) は詳細絞り込みに出ない',
+      !wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.some((c) => c.key === 'shoot' || c.key === 'production'));
+
+    // 自社商品 (v2 切替後に作成) の ① 完了条件 = 撮影・素材 + 商品情報
+    const idV2 = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by, own_brand, image_priority) VALUES ('DRV-V2', 'v2テスト', 'smoke', 1, '自社商品（重要度：高）')
+    `).run().lastInsertRowid);
+    wfpEarly.ensureProgress(db, idV2);
+    const stV2 = (code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(idV2, code)?.state;
+    let reqErr = null;
+    try { wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { reqErr = e; }
+    check('v2: ① は撮影・素材ステータス未設定では完了できない', reqErr?.status === 400 && /撮影・素材/.test(reqErr.message), reqErr?.message);
+    dbmod.upsertImageProduction(db, idV2, { material_status: 'internal_prep' });
+    reqErr = null;
+    try { wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { reqErr = e; }
+    check('v2: ① は商品情報 (1.5) が空では完了できない (v2 切替後の新規商品)', reqErr?.status === 400 && /商品情報/.test(reqErr.message), reqErr?.message);
+    dbmod.upsertImageProduction(db, idV2, { product_info_text: 'テスト商品の情報' });
+    check('v2: 撮影・素材 + 商品情報 が揃えば ① 完了', wfpEarly.setStepState(idV2, 'imgd_request', { state: 'done' }, 'smoke', ADMIN2).changed === true);
+    // D&D: 依頼 → 素材待ち (構成をまとめて done)
+    wfpEarly.moveBoardCard(idV2, { view: 'image', kind: 'detail', to: 'material', expectedCurrent: 'imgd_compose' }, 'smoke', ADMIN2);
+    check('v2: D&D で構成を飛ばして素材待ちへ', stV2('imgd_compose') === 'done' && stV2('imgd_material') === 'todo');
+    let matErr = null;
+    try { wfpEarly.setStepState(idV2, 'imgd_material', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { matErr = e; }
+    check('v2: ③ 素材待ちは 社内準備 のままでは完了できない', matErr?.status === 400 && /素材完了/.test(matErr.message), matErr?.message);
+    dbmod.upsertImageProduction(db, idV2, { material_status: 'ready' });
+    check('v2: 素材完了なら ③ 完了', wfpEarly.setStepState(idV2, 'imgd_material', { state: 'done' }, 'smoke', ADMIN2).changed === true);
+    wfpEarly.setStepState(idV2, 'imgd_ai', { state: 'done' }, 'smoke', ADMIN2);
+    // ⑤ デザイン修正 done → TOP の 依頼/制作/登録 が自動 done
+    check('v2: ⑤ 前は TOP 側が todo', stV2('img_request_top') === 'todo');
+    wfpEarly.setStepState(idV2, 'imgd_design', { state: 'done' }, 'smoke', ADMIN2);
+    check('v2: ⑤ デザイン修正 done で TOP の 依頼/制作/登録 が自動 done (承認は残る)',
+      stV2('img_request_top') === 'done' && stV2('img_production_top') === 'done' && stV2('img_register_top') === 'done'
+      && stV2('img_approve_top') === 'todo', JSON.stringify([stV2('img_request_top'), stV2('img_production_top'), stV2('img_register_top'), stV2('img_approve_top')]));
+    // ⑥ 順序: 中原確認は田中確認の後
+    let ordErr = null;
+    try { wfpEarly.setStepState(idV2, 'imgd_review_2', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { ordErr = e; }
+    check('v2: ⑥-2 (中原) は ⑥-1 (田中) の前に完了できない', ordErr?.status === 400 && /田中/.test(ordErr.message), ordErr?.message);
+    const pV2 = wfpEarly.progressOf(idV2, { db });
+    check('v2: 確認者 = 未完了の方 (田中)', pV2.imageDetail.current?.step_code === 'imgd_review_1');
+    const gateBefore = wfpEarly.imageTrackBlockReason(db, idV2);
+    check('v2: ⑥ 未完了は出品ゲートが閉じる (詳細画像: 社内確認)', typeof gateBefore === 'string' && /社内確認/.test(gateBefore), gateBefore);
+    wfpEarly.setStepState(idV2, 'imgd_review_1', { state: 'done' }, 'smoke', ADMIN2);
+    check('v2: 田中確認 done → 確認者 = 中原', wfpEarly.progressOf(idV2, { db }).imageDetail.current?.step_code === 'imgd_review_2');
+    wfpEarly.setStepState(idV2, 'imgd_review_2', { state: 'done' }, 'smoke', ADMIN2);
+    check('v2: ⑥-2 done で TOP 承認も自動 done', stV2('img_approve_top') === 'done');
+    check('v2: ⑥ 両方 done で出品ゲートが開く (⑦⑧⑨ は前提にしない)', wfpEarly.imageTrackBlockReason(db, idV2) === null, wfpEarly.imageTrackBlockReason(db, idV2));
+    const pV2b = wfpEarly.progressOf(idV2, { db });
+    check('v2: gateDone は true・done (全工程) は false (⑦⑧⑨ が残る)', pV2b.imageDetail.gateDone === true && pV2b.imageDetail.done === false);
+    // カード情報
+    const cardV2 = [...wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards)].find((c) => c.id === idV2);
+    check('v2: 詳細カードに 撮影・素材 / 商品情報あり が乗る',
+      cardV2 && cardV2.materialStatus === 'ready' && cardV2.materialLabel === '素材完了' && cardV2.hasProductInfo === true && cardV2.ownBrand === true,
+      JSON.stringify(cardV2 && { m: cardV2.materialStatus, l: cardV2.materialLabel, i: cardV2.hasProductInfo }));
+    // 楽天登録済みの既存商品には詳細 v2 も自動 done で入る
+    const idV2Rk = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, status, created_by) VALUES ('DRV-V2-RK', 'v2・登録済み', 'listed', 'smoke')
+    `).run().lastInsertRowid);
+    db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-01T00:00:00Z')`).run(idV2Rk);
+    wfpEarly.ensureProgress(db, idV2Rk);
+    check('v2: 楽天登録済みには ①〜⑨ 全部 done で入る',
+      db.prepare("SELECT COUNT(*) c FROM draft_step_progress WHERE draft_id = ? AND step_code LIKE 'imgd_%' AND state = 'done'").get(idV2Rk).c === 10);
+
+    // 旧 v1 → v2 の一回きり移行 (フラグを外して再実行)
+    const mk = (code, listed) => {
+      const id = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES (?, ?, 'smoke')`).run(code, code).lastInsertRowid);
+      if (listed) db.prepare(`INSERT INTO draft_rakuten (draft_id, registered_at) VALUES (?, '2026-08-01T00:00:00Z')`).run(id);
+      return id;
+    };
+    // 本番 DB には v1 の詳細工程行が残っている (v2 以降は seed されない) → 再現のため inactive で入れる
+    const insV1Step = db.prepare(`INSERT OR IGNORE INTO ph_steps (code, label, track, image_kind, image_stage, sort, active, builtin) VALUES (?, ?, 'image', 'detail', ?, ?, 1, 1)`);
+    [['img_request_detail', '画像制作の依頼', 'request', 10], ['img_shoot_detail', '撮影依頼中', 'shoot', 15], ['img_production_detail', '画像制作', 'production', 20],
+      ['img_register_detail', '画像登録', 'register', 30], ['img_approve_detail', '画像承認', 'approve', 40]].forEach((r) => insV1Step.run(...r));
+    const insV1 = db.prepare('INSERT OR REPLACE INTO draft_step_progress (draft_id, step_code, state) VALUES (?, ?, ?)');
+    const idM1 = mk('DRV-M-REQ', false); insV1.run(idM1, 'img_request_detail', 'done'); insV1.run(idM1, 'img_shoot_detail', 'skip');
+    const idM2 = mk('DRV-M-PROD', false); insV1.run(idM2, 'img_request_detail', 'done'); insV1.run(idM2, 'img_production_detail', 'done');
+    const idM3 = mk('DRV-M-APR', false); ['img_request_detail', 'img_production_detail', 'img_register_detail', 'img_approve_detail'].forEach((c) => insV1.run(idM3, c, 'done'));
+    const idM4 = mk('DRV-M-RK', true); insV1.run(idM4, 'img_request_detail', 'done');
+    const idM5 = mk('DRV-M-TODO', false); insV1.run(idM5, 'img_request_detail', 'todo');
+    db.prepare('DELETE FROM ph_intake_state WHERE key = ?').run(dbmod.IMAGE_TRACK_V2_KEY);
+    const mig = dbmod.migrateDetailTrackV2(db);
+    const stM = (id, code) => db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.state;
+    check('v2 移行: 実行される (5 件)', mig.skipped === false && mig.migrated >= 5, JSON.stringify(mig));
+    check('v2 移行: 旧 依頼 done → ① done・② todo (撮影 skip → 撮影不要)',
+      stM(idM1, 'imgd_request') === 'done' && stM(idM1, 'imgd_compose') === 'todo'
+      && db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(idM1)?.material_status === 'not_required');
+    check('v2 移行: 旧 制作 done → ④まで done・⑤ todo', stM(idM2, 'imgd_ai') === 'done' && stM(idM2, 'imgd_design') === 'todo');
+    check('v2 移行: 旧 承認 done でも ⑤まで done・⑥-1 (田中) から再確認',
+      stM(idM3, 'imgd_design') === 'done' && stM(idM3, 'imgd_review_1') === 'todo' && stM(idM3, 'imgd_review_2') === 'todo');
+    check('v2 移行: 楽天登録済みは全部 done', stM(idM4, 'imgd_aplus') === 'done');
+    check('v2 移行: 旧 未着手は全部 todo', stM(idM5, 'imgd_request') === 'todo');
+    check('v2 移行: イベントに元工程を記録',
+      db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_track_v2_migrated' AND detail LIKE '%img_approve_detail=done%'").get(idM3).c === 1);
+    check('v2 移行: 二度目は走らない', dbmod.migrateDetailTrackV2(db).skipped === true);
+    check('v2 移行: 旧詳細工程は active=0',
+      db.prepare(`SELECT COUNT(*) c FROM ph_steps WHERE code IN ('img_shoot_detail','img_request_detail') AND active = 1`).get().c === 0);
+    for (const id of [idV2, idV2Rk, idM1, idM2, idM3, idM4, idM5]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);
+  }
 
   // TOP画像の重要度 (HTTP)
   r = await call('POST', `/api/drafts/${idM}/image-priority`, { value: '自社商品（重要度：高）' });
@@ -3851,6 +3906,8 @@ for (const [name, file, data] of renders) {
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
         imagePriorities: dbmod.IMAGE_PRIORITIES,
+        materialStatuses: dbmod.MATERIAL_STATUSES,
+        promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
         workflowStaff: wf.listStaff(),
@@ -3914,28 +3971,22 @@ for (const [name, file, data] of renders) {
   check('画像DB: 商品コード無しは null', iimp.buildImageRecord({ id: 'x', properties: { Name: { type: 'title', title: [] } } }) === null);
 
   // planStepsFor
-  const p1 = iimp.planStepsFor('構成作成中', { shippingStatus: '社内準備' });
-  check('画像DB: 構成作成中 → 依頼 doing (TOP/詳細) + 撮影 doing',
-    p1.steps.some((s) => s.code === 'img_request_top' && s.state === 'doing')
-    && p1.steps.some((s) => s.code === 'img_request_detail' && s.state === 'doing')
-    && p1.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'doing')
-    && !p1.steps.some((s) => s.code.startsWith('img_production')) && !p1.hold, JSON.stringify(p1));
-  const p2 = iimp.planStepsFor('画像作成中（高島）', { shippingStatus: '撮影依頼不要' });
-  check('画像DB: 画像作成中 → 依頼 done・制作 doing・担当=高島・撮影 skip',
-    p2.steps.some((s) => s.code === 'img_request_top' && s.state === 'done')
-    && p2.steps.some((s) => s.code === 'img_production_detail' && s.state === 'doing')
-    && p2.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'skip')
-    && p2.assigneeName === '高島' && p2.assigneeStepStage === 'production', JSON.stringify(p2));
-  const p3 = iimp.planStepsFor('画像確認（田中）', { shippingStatus: '撮影商品発送手配済み', hasImages: true });
-  check('画像DB: 画像確認 + 画像登録済み → 登録 done・承認 doing・担当=田中',
-    p3.steps.some((s) => s.code === 'img_register_top' && s.state === 'done')
-    && p3.steps.some((s) => s.code === 'img_approve_top' && s.state === 'doing')
-    && p3.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'done')
-    && p3.assigneeName === '田中' && p3.assigneeStepStage === 'approve', JSON.stringify(p3));
-  const p3b = iimp.planStepsFor('画像確認（田中）', { shippingStatus: null, hasImages: false });
-  check('画像DB: 画像確認 + 未登録 → 登録 doing・承認 todo (担当だけ)',
-    p3b.steps.some((s) => s.code === 'img_register_top' && s.state === 'doing')
-    && !p3b.steps.some((s) => s.code === 'img_approve_top') && !p3b.steps.some((s) => s.code === 'img_shoot_detail'));
+  const p1 = iimp.planStepsFor('構成作成中');
+  check('画像DB: 構成作成中 → ① done・② 構成 doing (TOP 側は書かない)',
+    p1.steps.some((s) => s.code === 'imgd_request' && s.state === 'done')
+    && p1.steps.some((s) => s.code === 'imgd_compose' && s.state === 'doing')
+    && !p1.steps.some((s) => s.code === 'imgd_material') && !p1.steps.some((s) => s.code.endsWith('_top')) && !p1.hold, JSON.stringify(p1));
+  const p2 = iimp.planStepsFor('画像作成中（高島）');
+  check('画像DB: 画像作成中 → ①〜④ done・⑤ デザイン修正 doing・担当=高島',
+    p2.steps.filter((s) => s.state === 'done').length === 4
+    && p2.steps.some((s) => s.code === 'imgd_design' && s.state === 'doing')
+    && p2.assigneeName === '高島' && p2.assigneeStepCode === 'imgd_design', JSON.stringify(p2));
+  const p3 = iimp.planStepsFor('画像確認（田中）');
+  check('画像DB: 画像確認 → ①〜⑤ done・⑥-1 社内確認 (田中) doing・担当=田中',
+    p3.steps.filter((s) => s.state === 'done').length === 5
+    && p3.steps.some((s) => s.code === 'imgd_review_1' && s.state === 'doing')
+    && !p3.steps.some((s) => s.code === 'imgd_review_2')
+    && p3.assigneeName === '田中' && p3.assigneeStepCode === 'imgd_review_1', JSON.stringify(p3));
   const p4 = iimp.planStepsFor('保留', {});
   check('画像DB: 保留 → 工程なし・画像制作だけ保留', p4.hold && p4.steps.length === 0);
   check('画像DB: 対象外ステータスは何も書かない', iimp.planStepsFor('完了', {}).steps.length === 0);
@@ -4032,17 +4083,19 @@ for (const [name, file, data] of renders) {
     && newIp.camera_instruction_url === 'https://docs.google.com/spreadsheets/d/xyz' && newIp.status === '構成作成中'
     && newIp.workflow_state === 'active', JSON.stringify(newIp));
   const stepOf = (id, code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code);
-  check('画像DB: 構成作成中 → 依頼 doing・撮影 doing (新規)',
-    stepOf(newRow.id, 'img_request_top')?.state === 'doing' && stepOf(newRow.id, 'img_request_detail')?.state === 'doing'
-    && stepOf(newRow.id, 'img_shoot_detail')?.state === 'doing' && stepOf(newRow.id, 'img_production_top')?.state === 'todo');
+  check('画像DB: 構成作成中 → ① done・② doing・撮影・素材=社内準備 (新規)',
+    stepOf(newRow.id, 'imgd_request')?.state === 'done' && stepOf(newRow.id, 'imgd_compose')?.state === 'doing'
+    && stepOf(newRow.id, 'imgd_material')?.state === 'todo' && stepOf(newRow.id, 'img_request_top')?.state === 'todo'
+    && newIp.material_status === 'internal_prep');
   const exRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(existId);
   check('画像DB: 既存は空欄だけ補完 (Amazon URL は据え置き・自社商品に)',
     exRow.amazon_url === 'https://www.amazon.co.jp/dp/B0EXIST' && exRow.drive_folder_url === 'https://drive.google.com/drive/folders/1ABC'
     && exRow.own_brand === 1 && exRow.image_priority === '自社商品（重要度：高）' && exRow.name === '既存商品' && exRow.source === 'portal');
-  check('画像DB: 画像作成中 → 依頼 done・制作 doing・担当=高島・撮影 skip (既存)',
-    stepOf(existId, 'img_request_top')?.state === 'done' && stepOf(existId, 'img_production_top')?.state === 'doing'
-    && stepOf(existId, 'img_production_top')?.assignee_id === takashima && stepOf(existId, 'img_production_detail')?.assignee_id === takashima
-    && stepOf(existId, 'img_shoot_detail')?.state === 'skip', JSON.stringify([stepOf(existId, 'img_request_top'), stepOf(existId, 'img_production_top')]));
+  check('画像DB: 画像作成中 → ①〜④ done・⑤ doing・担当=高島・撮影・素材=撮影不要 (既存)',
+    stepOf(existId, 'imgd_request')?.state === 'done' && stepOf(existId, 'imgd_ai')?.state === 'done'
+    && stepOf(existId, 'imgd_design')?.state === 'doing' && stepOf(existId, 'imgd_design')?.assignee_id === takashima
+    && db.prepare('SELECT material_status FROM draft_image_production WHERE draft_id = ?').get(existId)?.material_status === 'not_required',
+    JSON.stringify([stepOf(existId, 'imgd_request'), stepOf(existId, 'imgd_design')]));
   check('画像DB: 重要度が自社以外の商品は触らない',
     db.prepare('SELECT image_priority, own_brand FROM product_drafts WHERE id = ?').get(confId).image_priority === '仕入商品（重要度：低）'
     && !db.prepare('SELECT 1 FROM draft_image_notion_imports WHERE draft_id = ?').get(confId));
@@ -4080,7 +4133,7 @@ for (const [name, file, data] of renders) {
   const prev3 = await iimp.importImageDbByStatus({ actor: 'smoke', ...diImg, query: async () => ({ pages: changedPages }) });
   check('画像DB: 移植後に Notion 側が変わっても追従せず報告だけ',
     byCode(prev3, 'IMG-NEW-1', '画像作成中（高島）')?.outcome === 'source_changed_after_migration'
-    && stepOf(newRow.id, 'img_production_top')?.state === 'todo');
+    && stepOf(newRow.id, 'imgd_design')?.state === 'todo');
 
   // 人が動かした工程は上書きしない
   const untouchedId = Number(insDraft.run('IMG-TOUCHED-1', '触った商品', null, 0).lastInsertRowid);
