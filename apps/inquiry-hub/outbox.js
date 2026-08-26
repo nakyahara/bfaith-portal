@@ -20,6 +20,7 @@
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from './db.js';
 import { claimAttachmentsForJob, loadJobAttachments } from './reply-attachments.js';
+import { blockedReplyDestination } from './no-reply.js';
 
 export const DEFAULT_SEND_LEASE_MINUTES = 5;
 
@@ -53,6 +54,13 @@ export function createReplyJob({ inquiryId, channelType, bodyText, attachmentIds
     const inq = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(inquiryId);
     if (!inq) throw new Error(`inquiry ${inquiryId} が存在しません`);
     if (inq.channel_type !== channelType) throw new Error('channelType が問い合わせと一致しません');
+    // 返信不可アドレス宛は作成時点で断る (2026-08-26 本番事故。no-reply.js 参照)。
+    // 送信ワーカーにも同じガードがあるが、ここで止めれば「送信ジョブは作れたのに届かない」
+    // という分かりにくい失敗を避けられる
+    if (channelType === 'email') {
+      const dest = blockedReplyDestination(inq.customer_identifier);
+      if (dest) return { id: null, created: false, conflict: `${dest.reason}。${dest.guide}` };
+    }
     // 同一問い合わせに未決着ジョブがある間は新規作成不可 (並行ワーカーでも1問い合わせ1送信を保証。Codexレビュー反映)
     // 未決着 = pending/sending/needs_review、および人手解決前の unknown
     const active = db.prepare(`SELECT id, status FROM outbox_replies
@@ -239,12 +247,14 @@ export async function runOutboxPass(adapters, opts = {}) {
           db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
               last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
               internal_status = 'done', completed_at = COALESCE(completed_at, ?), is_unread = 0,
+              delivery_failed_at = NULL,
               updated_at = ? WHERE id = ?`)
             .run(sentIso, sentIso, sentIso, sentIso, job.inquiry_id);
         } else {
           db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
               last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
               internal_status = CASE WHEN internal_status IN ('open','in_progress','pending') THEN 'waiting_reply' ELSE internal_status END,
+              delivery_failed_at = NULL,
               updated_at = ? WHERE id = ?`)
             .run(sentIso, sentIso, sentIso, job.inquiry_id);
         }

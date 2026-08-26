@@ -24,6 +24,7 @@
  */
 import nodemailer from 'nodemailer';
 import { evaluateMailRules } from '../../mail-rules.js';
+import { classifyReplyDestination, isBounceSignature } from '../../no-reply.js';
 import { SendRejectedError } from '../../outbox.js';
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -153,6 +154,16 @@ export function walkPayload(payload, out = { text: '', html: '', attachments: []
   return out;
 }
 
+/** Gmailメッセージ1通がバウンス (配信失敗通知) かどうか。判定ロジックの本体は no-reply.js */
+export function isBounceMessage(payload) {
+  return isBounceSignature({
+    from: parseFromHeader(headerOf(payload, 'From')).mailbox || headerOf(payload, 'From'),
+    contentType: headerOf(payload, 'Content-Type'),
+    subject: headerOf(payload, 'Subject'),
+    hasFailedRecipients: !!headerOf(payload, 'X-Failed-Recipients'),
+  });
+}
+
 /** Gmailスレッド1件 → エンジン契約 inquiry (メールルール適用込み)。skip判定なら null (エクスポートはテスト用) */
 export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
   const msgs = thread?.messages;
@@ -167,6 +178,10 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     const from = effectiveFromOf(payload);
     const fromDomain = from.mailbox ? from.mailbox.slice(from.mailbox.indexOf('@') + 1) : '';
     const isShop = fromDomain === OWN_DOMAIN;
+    // バウンス (配信失敗通知)。返信が顧客に届かなかったことを示す唯一の手掛かりなので、
+    // 顧客メッセージと混ぜずに system として記録し、チケットに「配信失敗」の印を付ける
+    // (2026-08-26 no-reply@mercari-shops.com 宛の返信が黙って消えた事故。no-reply.js 参照)
+    const isBounce = isBounceMessage(payload);
     const { text, html, attachments } = walkPayload(payload);
     const bodyText = normalizeMailBody(text || htmlToText(html)).slice(0, BODY_MAX_CHARS);
     const atMs = Number(m.internalDate) || null;
@@ -177,12 +192,15 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     }
     return {
       raw: { from, subject: headerOf(payload, 'Subject'), to: headerOf(payload, 'To'), replyTo: headerOf(payload, 'Reply-To') },
+      isBounce,
       msg: {
         externalMessageId: m.id,
-        senderType: isShop ? 'shop' : 'customer',
+        // バウンスは顧客の発言ではないので sender_type='system'。ただし is_incoming は 1 のまま
+        // にして未読化・「新着」への復帰を効かせる (気付かないまま埋もれるのが一番まずい)
+        senderType: isBounce ? 'system' : (isShop ? 'shop' : 'customer'),
         senderName: from.name ?? from.mailbox ?? null,
         bodyText: bodyText || null,
-        isIncoming: isShop ? 0 : 1,
+        isIncoming: isShop && !isBounce ? 0 : 1,
         sentAt: atMs, receivedAt: atMs,
         attachments,
       },
@@ -190,7 +208,16 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
   });
   mapped.sort((a, b) => a.msg.sentAt - b.msg.sentAt);
 
-  const firstIncoming = mapped.find(x => x.msg.isIncoming) || mapped[0];
+  // 顧客の同一性・メールルール評価には「バウンス以外の」最初の受信メッセージを使う。
+  // バウンスを拾うと customer_identifier が mailer-daemon@… になり、以後の返信が
+  // 配信通知サーバー宛に飛ぶ (2026-08-26)
+  // バウンスしか受信が無いスレッド (店舗発 → 配信失敗) では mapped[0] に落とす。
+  // customerIdentifier は「受信メッセージのとき」だけ入るので、結果として NULL になり
+  // mailer-daemon@… が顧客として登録されない
+  const firstIncoming = mapped.find(x => x.msg.isIncoming && !x.isBounce) || mapped[0];
+  // 配信失敗が観測された最新時刻 (engine が inquiries.delivery_failed_at に反映する)
+  const bounceAts = mapped.filter(x => x.isBounce).map(x => x.msg.sentAt).filter(Boolean);
+  const deliveryFailedAt = bounceAts.length ? Math.max(...bounceAts) : null;
   const rule = ruleEvaluator({
     from: firstIncoming.raw.from.mailbox || '',
     to: firstIncoming.raw.to,
@@ -207,6 +234,7 @@ export function mapThread(thread, { ruleEvaluator = evaluateMailRules } = {}) {
     subject: firstIncoming.raw.subject || null,
     orderNumber: null, productCode: null, productName: null,
     externalStatus: null, externalIsRead: null,
+    ...(deliveryFailedAt ? { deliveryFailedAt } : {}),
     ...(rule?.action === 'import_done' ? { initialInternalStatus: 'done' } : {}),
     // メールルールのフォルダ振り分け (2026-08-17)。新規作成時のみ適用 (既存チケットのフォルダは動かさない)
     ...(rule?.folderId ? { initialFolderId: rule.folderId } : {}),
@@ -407,10 +435,13 @@ export function createGmailAdapter(cfg = {}) {
         // 宛先フォールバック (2026-08-15 実測): customer_identifier が空の問い合わせがあり
         // 送信できなかった — 店舗発のみで始まったスレッドや From 解析不能ケースで空になる。
         // スレッド内の最後の顧客メッセージ (自社ドメイン以外の実効差出人) から宛先を復元する
+        // 2026-08-26: 配信失敗通知 (mailer-daemon@…) や no-reply アドレスは候補から外す。
+        // バウンスはスレッドの最後に付くため、素直に遡ると配信通知サーバー宛に返信してしまう
         if (!EMAIL_RE.test(to)) {
           for (let i = msgs.length - 1; i >= 0; i--) {
             const eff = effectiveFromOf(msgs[i].payload || {});
-            if (eff.mailbox && EMAIL_RE.test(eff.mailbox) && !eff.mailbox.endsWith('@' + OWN_DOMAIN)) {
+            if (eff.mailbox && EMAIL_RE.test(eff.mailbox) && !eff.mailbox.endsWith('@' + OWN_DOMAIN)
+              && classifyReplyDestination(eff.mailbox).sendable) {
               to = eff.mailbox;
               console.log(`[gmail-send] 宛先をスレッドから復元: ${to} (customer_identifier が空。thread=${threadId.slice(0, 12)}…)`);
               break;
@@ -423,6 +454,13 @@ export function createGmailAdapter(cfg = {}) {
       if (!EMAIL_RE.test(to)) {
         throw new SendRejectedError(`宛先メールアドレスを特定できません (customer_identifier='${inquiry?.customer_identifier || ''}'。`
           + 'スレッド内にも顧客の差出人が見つかりません — 顧客への送信手段がないメール (自社発の通知等) の可能性があります)');
+      }
+      // ─── 返信不可アドレス宛は未送信で止める (2026-08-26 本番事故。no-reply.js 参照) ───
+      // no-reply@mercari-shops.com 宛の返信が Gmail のリトライ後にバウンスし、画面上は
+      // 「送信済み」なのに顧客には何も届いていなかった。送る前に止めて返信先を案内する
+      const destination = classifyReplyDestination(to);
+      if (!destination.sendable) {
+        throw new SendRejectedError(`${destination.reason} (未送信)。${destination.guide}`);
       }
       headerSafe('宛先', to);
 
