@@ -16,6 +16,9 @@
  *   - warning = 送信は成功したが人が確認すべき事象 (例: Gmailの送信元From置き換え)。sentのままerror_messageに表示
  *   - 外部APIが「受け付けなかった」と明確に分かる失敗は SendRejectedError を throw (→ failed。再送は安全)
  *   - それ以外の失敗 (タイムアウト・5xx・切断等、送信された可能性が残るもの) は通常の throw (→ unknown)
+ *   await adapter.completeInquiry?.({ inquiry }) → { ok } (任意。2026-08-26「送信して回答完了」)
+ *   - complete_on_send のジョブで sendReply 成功の直後に呼ぶ = モール側も「回答完了」にする (Yahoo!)
+ *   - 失敗しても返信は届いているので sent のまま。error_message に警告を残し、人がモール画面で完了にする
  */
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from './db.js';
@@ -225,12 +228,24 @@ export async function runOutboxPass(adapters, opts = {}) {
         break;
       }
       const extReplyId = sent?.externalReplyId || `op:${job.client_operation_id}`;
+      // モール側の「回答完了」(2026-08-26)。返信は確定しているので、ここの失敗は sent を崩さず警告に留める
+      let externalCompleted = false, completeWarning = null;
+      if (job.complete_on_send && typeof adapter.completeInquiry === 'function') {
+        try {
+          const c = await adapter.completeInquiry({ inquiry: inq, shop });
+          externalCompleted = !!c?.ok;
+        } catch (e) {
+          completeWarning = `返信は送信済みですが、モール側の回答完了に失敗しました (モールの管理画面で「回答完了」にしてください): ${String(e?.message || e).slice(0, 200)}`;
+          console.warn(`[outbox] #${job.id} completeInquiry 失敗 (sentは維持): ${e?.message || e}`);
+        }
+      }
+      const warnings = [sent?.warning, completeWarning].filter(Boolean).map(String);
       const sentIso = toUtcIso(tick()); // 完了時刻は送信後に取り直す (長い送信でもsent_atを正確に)
       const tx = db.transaction(() => {
         // warning = 送信は成功したが要注意 (例: Gmailが送信元Fromを置き換えた → 楽天マスク
         // アドレス宛はバウンスする)。ジョブ履歴の error_message として表示して気付けるようにする
         if (!finishJob(db, job, { status: 'sent', external_reply_id: extReplyId, sent_at: sentIso,
-          lease_token: null, lease_until: null, error_message: sent?.warning ? String(sent.warning).slice(0, 500) : null })) {
+          lease_token: null, lease_until: null, error_message: warnings.length ? warnings.join(' / ').slice(0, 500) : null })) {
           // リースを失っていた (ゾンビ扱いでunknown化済み等) → メッセージ二重挿入を避けて何もしない
           return false;
         }
@@ -248,8 +263,9 @@ export async function runOutboxPass(adapters, opts = {}) {
               last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
               internal_status = 'done', completed_at = COALESCE(completed_at, ?), is_unread = 0,
               delivery_failed_at = NULL,
+              external_status = CASE WHEN ? THEN 'completed' ELSE external_status END,
               updated_at = ? WHERE id = ?`)
-            .run(sentIso, sentIso, sentIso, sentIso, job.inquiry_id);
+            .run(sentIso, sentIso, sentIso, externalCompleted ? 1 : 0, sentIso, job.inquiry_id);
         } else {
           db.prepare(`UPDATE inquiries SET conversation_rev = conversation_rev + 1,
               last_message_at = CASE WHEN last_message_at IS NULL OR last_message_at < ? THEN ? ELSE last_message_at END,
@@ -259,7 +275,8 @@ export async function runOutboxPass(adapters, opts = {}) {
             .run(sentIso, sentIso, sentIso, job.inquiry_id);
         }
         logActivity(job.inquiry_id, { actorType: 'system', actionType: 'reply_sent',
-          operationId: job.client_operation_id, after: { outbox_id: job.id, external_reply_id: extReplyId } });
+          operationId: job.client_operation_id, after: { outbox_id: job.id, external_reply_id: extReplyId,
+            ...(externalCompleted ? { external_completed: true } : {}), ...(completeWarning ? { external_complete_failed: true } : {}) } });
         return true;
       });
       results.push({ id: job.id, outcome: tx.immediate() ? 'sent' : 'lease_lost' });

@@ -617,6 +617,10 @@ router.get('/inquiries/:id', (req, res) => {
         送信済みに見えていても顧客には届いていません — 別の手段で連絡してください</div>
     </div>` : '';
 
+  // モール側の「回答完了」を返信と同時に打てるチャネル (2026-08-26 スタッフ要望。いまは Yahoo! のみ。
+  // 楽天 R-Messe にも完了APIはあるが miniPC passthrough 未整備 → 追加時はここと adapter.completeInquiry)
+  const mallCompleteSupported = inq.channel_type === 'yahoo';
+
   const replyPanel = replyEditorEnabled() ? `
       <div class="panel">
         <h3>✉️ 返信を作成</h3>
@@ -627,8 +631,7 @@ router.get('/inquiries/:id', (req, res) => {
         ${activeJob
           ? `<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px">この問い合わせには未決着の送信ジョブ (#${activeJob.id}) があります。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消してから新しい返信を作成してください</div>`
           : `<div class="row tpl-row" id="tplRow">
-          <select id="tplCat" title="テンプレートのカテゴリ"><option value="">📄 全カテゴリ</option></select>
-          <select id="tplSel" title="テンプレートを選ぶ"><option value="">テンプレートを選ぶ…</option></select>
+          <select id="tplSel" title="テンプレートを選ぶ (カテゴリごとにまとまっています)"><option value="">📄 テンプレートを選ぶ…</option></select>
           <button class="ghost" id="tplApplyBtn" type="button">本文に反映</button>
         </div>
         ${aiRewriteEnabled() ? `<div class="row rw-row" id="draftRow">
@@ -648,9 +651,14 @@ router.get('/inquiries/:id', (req, res) => {
           <span class="sub">${he(ALLOWED_LABEL)}・1ファイル${Math.round(MAX_FILE_BYTES / 1048576)}MB・最大${MAX_FILES_PER_REPLY}つ</span>
         </div>
         <div id="attList"></div>` : ''}
-        <div class="row" style="margin-top:8px; justify-content:flex-end">
-          <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
-          <button class="pri" id="replyBtn"${replyBlocked ? ' disabled title="返信不可のアドレスのため送信できません"' : ''}>${replyBlocked ? '🚫 このアドレスには送信できません' : '内容を確認して送信ジョブを作成'}</button>
+        <div class="row" style="margin-top:8px; justify-content:flex-end; gap:8px">
+          ${replyBlocked
+            ? `<button class="pri" id="replyBtn" disabled title="返信不可のアドレスのため送信できません">🚫 このアドレスには送信できません</button>`
+            : `<span class="sub" style="margin-right:auto">${mallCompleteSupported
+                ? '「送信して回答完了」= 返信の投稿と同時にモール側 (ストアクリエイターPro) も回答完了にします'
+                : '「送信して完了」= 返信後にこの画面の状態を完了にします'}</span>
+          <button class="ghost" id="replyBtn" type="button" title="送信後は「返信処理中」になります">✉️ 送信</button>
+          <button class="pri" id="replyCompleteBtn" type="button" title="${mallCompleteSupported ? '送信と同時にモール側も回答完了にします' : '送信後に完了にします'}">✅ 送信して${mallCompleteSupported ? '回答完了' : '完了'}</button>`}
         </div>`}
       </div>` : `
       <div class="panel reply-note">${bouncedBanner}${blockedBanner}✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
@@ -1002,48 +1010,47 @@ router.get('/inquiries/:id', (req, res) => {
   // 一覧は初回操作時に1回だけ取得 (全文を含むためページ埋め込みにしない)
   var tplRow = document.getElementById('tplRow');
   if (tplRow) (function() {
-    var tplCat = document.getElementById('tplCat');
     var tplSel = document.getElementById('tplSel');
     var TPLS = null, tplLoading = null;
     function loadTpls() {
       if (tplLoading) return tplLoading;
       tplLoading = fetch('/apps/inquiry-hub/api/templates')
         .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .then(function(j) {
-          TPLS = j.templates || [];
-          (j.categories || []).forEach(function(c) {
-            var o = document.createElement('option');
-            o.value = c; o.textContent = '📁 ' + c;
-            tplCat.appendChild(o);
-          });
-          fillTplSel();
-        })
+        .then(function(j) { TPLS = j.templates || []; fillTplSel(j.categories || []); })
         .catch(function(e) { tplLoading = null; toast('テンプレート取得失敗: ' + e.message); });
       return tplLoading;
     }
-    function fillTplSel() {
+    // カテゴリ = <optgroup> (太字の見出し) にまとめ、その下にテンプレートを並べる
+    // (2026-08-26 スタッフ要望「テンプレートが増えて探しにくい。カテゴリ見出しの下にまとめて」= メールディーラーと同じ見え方)
+    function fillTplSel(categories) {
       if (!TPLS) return;
-      var cat = tplCat.value;
       var cur = tplSel.value;
       tplSel.textContent = '';
       var head = document.createElement('option');
-      head.value = ''; head.textContent = 'テンプレートを選ぶ… (' + TPLS.filter(function(t) { return !cat || t.category === cat; }).length + '件)';
+      head.value = ''; head.textContent = '📄 テンプレートを選ぶ… (' + TPLS.length + '件)';
       tplSel.appendChild(head);
-      TPLS.forEach(function(t) {
-        if (cat && t.category !== cat) return;
-        var o = document.createElement('option');
-        o.value = String(t.id);
-        o.textContent = (cat ? '' : (t.category ? t.category + ' / ' : '')) + t.name;
-        tplSel.appendChild(o);
+      var order = categories.slice();
+      TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+      order.push('');   // 未分類は最後に「その他」
+      order.forEach(function(cat) {
+        var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
+        if (!items.length) return;
+        var g = document.createElement('optgroup');
+        g.label = cat || 'その他';
+        items.forEach(function(t) {
+          var o = document.createElement('option');
+          o.value = String(t.id);
+          o.textContent = t.name;
+          g.appendChild(o);
+        });
+        tplSel.appendChild(g);
       });
       tplSel.value = cur;
       if (tplSel.selectedIndex < 0) tplSel.value = '';
     }
     // マウスが返信パネルに乗った時点で先読みして、セレクトを開いた時には並んでいる状態にする
     tplRow.addEventListener('pointerover', loadTpls, { once: true });
-    tplCat.addEventListener('focus', loadTpls);
     tplSel.addEventListener('focus', loadTpls);
-    tplCat.addEventListener('change', fillTplSel);
     function applyTpl() {
       var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
       if (!t) { toast('テンプレートを選んでください'); return; }
@@ -1199,8 +1206,11 @@ router.get('/inquiries/:id', (req, res) => {
       })();
     });
   })();
+  var MALL_COMPLETE = ${mallCompleteSupported ? 'true' : 'false'};
   var replyBtn = document.getElementById('replyBtn');
-  if (replyBtn) replyBtn.addEventListener('click', function() {
+  var replyCompleteBtn = document.getElementById('replyCompleteBtn');
+  // 「送信」と「送信して回答完了」の2ボタン (2026-08-26 スタッフ要望: ストクリで別途「回答完了」を押す手間をなくす)
+  function submitReply(complete) {
     var body = document.getElementById('replyBody').value.trim();
     if (!body) { toast('本文が空です'); return; }
     // AI下書きの【要確認:】が残ったまま送ろうとしたら止める (未確認の事実が客に飛ぶ事故の防止)
@@ -1208,17 +1218,19 @@ router.get('/inquiries/:id', (req, res) => {
     if (left.length && !confirm('⚠️ 未確認の箇所が' + left.length + '件残っています:\\n\\n' + left.join('\\n')
       + '\\n\\nこのまま送信ジョブを作成しますか? (通常は実際の内容に置き換えてから送ります)')) return;
     var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
-    var completeEl = document.getElementById('replyComplete');
-    var complete = !!(completeEl && completeEl.checked);
     var attIds = ATT.map(function(a) { return a.id; });
     if (!confirm('以下の内容で送信ジョブを作成しますか?\\n\\n宛先: ' + REPLY_CH + ' の顧客'
       + (attIds.length ? '\\n添付: ' + ATT.map(function(a) { return a.name; }).join(' / ') : '')
-      + (complete ? '\\n送信後に「完了」にします' : '\\n送信後は「返信処理中」になります') + '\\n\\n' + preview)) return;
-    replyBtn.disabled = true;
+      + (complete ? (MALL_COMPLETE ? '\\n送信と同時にモール側も「回答完了」にします' : '\\n送信後に「完了」にします') : '\\n送信後は「返信処理中」になります') + '\\n\\n' + preview)) return;
+    replyBtn.disabled = true; replyCompleteBtn.disabled = true;
     post('/reply', { body: body, clientOperationId: REPLY_OP_ID, baseConversationRev: REPLY_BASE_REV, completeOnSend: complete, attachmentIds: attIds })
       .then(function(r) { toast(r.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました'); setTimeout(function(){ location.reload(); }, 900); })
-      .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; });
-  });`;
+      .catch(function(e) { toast('作成失敗: ' + e.message); replyBtn.disabled = false; replyCompleteBtn.disabled = false; });
+  }
+  if (replyBtn && replyCompleteBtn) {
+    replyBtn.addEventListener('click', function() { submitReply(false); });
+    replyCompleteBtn.addEventListener('click', function() { submitReply(true); });
+  }`;
 
   res.send(pageShell(`問い合わせ — ${inq.subject || inq.external_inquiry_id}`,
     backFolder ? `folder:${backFolder.id}` : backView, body, script, { group: backGroup }));
@@ -3058,8 +3070,10 @@ figure.att-img.att-err .att-fail { display: block; }
 .panel .row { display: flex; gap: 6px; }
 /* 返信パネルのテンプレート選択行 */
 .tpl-row { margin-bottom: 8px; flex-wrap: wrap; }
-.tpl-row #tplCat { max-width: 40%; }
 .tpl-row #tplSel { flex: 1; min-width: 160px; }
+/* カテゴリ見出し (optgroup) は太字・テンプレートは1段下げて、一目で区別がつくように */
+.tpl-row #tplSel optgroup { font-weight: 700; font-style: normal; color: #0f172a; }
+.tpl-row #tplSel option { font-weight: 400; padding-left: 1.2em; }
 /* AI書き換えボタン行 */
 .rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .rw-row .rw-btn { margin: 0; }

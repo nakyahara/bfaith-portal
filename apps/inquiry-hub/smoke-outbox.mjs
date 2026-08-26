@@ -271,6 +271,59 @@ console.log('8b. 送信して完了');
     && db.prepare('SELECT complete_on_send FROM outbox_replies WHERE id = ?').get(jobW.id).complete_on_send === 0);
 }
 
+// ─── 8c. 送信と同時にモール側も回答完了 (completeInquiry。2026-08-26 スタッフ要望) ───
+console.log('8c. 送信してモール側も回答完了');
+{
+  const shopYh = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','Yahoo店(server)','yh-srv')").run().lastInsertRowid;
+  const mkYh = (ext) => mkInquiry(shopYh, 'yahoo', ext);
+  const mkAdapter = (completeImpl) => ({
+    calls: [],
+    sendReply: async () => ({ externalReplyId: 'm:9' }),
+    ...(completeImpl ? { completeInquiry: async (a) => { const r = await completeImpl(a); return r; } } : {}),
+  });
+
+  // 成功: sent + internal done + external_status=completed
+  const iOk = mkYh('yh-c-ok');
+  let calledWith = null;
+  const adOk = mkAdapter(async (a) => { calledWith = a; return { ok: true }; });
+  const jOk = createReplyJob({ inquiryId: iOk, channelType: 'yahoo', bodyText: '回答です', createdBy: 'u', clientOperationId: 'op-yc-ok', baseConversationRev: 0, completeOnSend: true });
+  await runOutboxPass({ yahoo: adOk }, { now: T0 });
+  const rowOk = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(iOk);
+  const jobOk = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(jOk.id);
+  check('completeInquiry が inquiry 付きで呼ばれる', calledWith && calledWith.inquiry && calledWith.inquiry.id === iOk);
+  check('成功: sent + internal done + external_status=completed',
+    jobOk.status === 'sent' && rowOk.internal_status === 'done' && rowOk.external_status === 'completed' && jobOk.error_message == null,
+    JSON.stringify({ st: jobOk.status, i: rowOk.internal_status, e: rowOk.external_status, m: jobOk.error_message }));
+  check('履歴に external_completed', /external_completed/.test(db.prepare("SELECT after_json FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'reply_sent'").get(iOk).after_json));
+
+  // 失敗: 返信は届いているので sent のまま。internal done は維持し、警告を error_message に残す
+  const iNg = mkYh('yh-c-ng');
+  const adNg = mkAdapter(async () => { throw new Error('Yahoo!回答完了が拒否されました (HTTP 400) reason=x'); });
+  const jNg = createReplyJob({ inquiryId: iNg, channelType: 'yahoo', bodyText: '回答です', createdBy: 'u', clientOperationId: 'op-yc-ng', baseConversationRev: 0, completeOnSend: true });
+  await runOutboxPass({ yahoo: adNg }, { now: T0 });
+  const rowNg = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(iNg);
+  const jobNg = db.prepare('SELECT * FROM outbox_replies WHERE id = ?').get(jNg.id);
+  check('失敗: sent は維持 (unknown/failed にしない)', jobNg.status === 'sent');
+  check('失敗: 画面の状態は完了 (スタッフの意図どおり) + external_status は触らない', rowNg.internal_status === 'done' && rowNg.external_status == null);
+  check('失敗: 警告が error_message に残る (モール画面で完了にする案内)', /回答完了に失敗/.test(jobNg.error_message || '') && /HTTP 400/.test(jobNg.error_message || ''), jobNg.error_message);
+  check('失敗: 送信済みメッセージは記録される', !!db.prepare('SELECT 1 FROM inquiry_messages WHERE outbox_id = ?').get(jNg.id));
+
+  // completeOnSend=false なら呼ばない
+  const iNo = mkYh('yh-c-no');
+  let called = 0;
+  const adNo = mkAdapter(async () => { called++; return { ok: true }; });
+  createReplyJob({ inquiryId: iNo, channelType: 'yahoo', bodyText: 'x', createdBy: 'u', clientOperationId: 'op-yc-no', baseConversationRev: 0, completeOnSend: false });
+  await runOutboxPass({ yahoo: adNo }, { now: T0 });
+  check('「送信」だけなら completeInquiry を呼ばない', called === 0 && db.prepare('SELECT internal_status FROM inquiries WHERE id = ?').get(iNo).internal_status === 'waiting_reply');
+
+  // completeInquiry を持たないアダプター (メール等) は従来どおり
+  const iPlain = mkYh('yh-c-plain');
+  createReplyJob({ inquiryId: iPlain, channelType: 'yahoo', bodyText: 'x', createdBy: 'u', clientOperationId: 'op-yc-plain', baseConversationRev: 0, completeOnSend: true });
+  await runOutboxPass({ yahoo: mkAdapter(null) }, { now: T0 });
+  const rowPlain = db.prepare('SELECT * FROM inquiries WHERE id = ?').get(iPlain);
+  check('completeInquiry 非対応アダプターは内部完了のみ (external_status 不変)', rowPlain.internal_status === 'done' && rowPlain.external_status == null);
+}
+
 // ─── 9. issues一覧 ───
 console.log('9. issues一覧');
 {

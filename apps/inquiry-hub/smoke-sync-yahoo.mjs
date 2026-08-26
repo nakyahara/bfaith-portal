@@ -306,6 +306,38 @@ console.log('7. 返信送信');
   }
 }
 
+// ─── 7b. 回答完了 (completeInquiry) — 2026-08-26 スタッフ要望「返信して回答完了」 ───
+console.log('7b. 回答完了');
+{
+  const okInq = { external_inquiry_id: '33c2dfab10ef4a' };
+  const fNone = (() => { const fn = async () => { fn.calls.push(1); return { status: 200, text: async () => '{"status":"ok"}' }; }; fn.calls = []; return fn; })();
+  const dry = await createYahooAdapter({ ...CFG, fetchImpl: fNone }).completeInquiry({ inquiry: okInq });
+  check('dryrun (既定): dryRun:true + API未呼び出し', dry.dryRun === true && fNone.calls.length === 0);
+  const dryOverride = await createYahooAdapter({ ...CFG, fetchImpl: fNone, sendMode: 'live' }).completeInquiry({ inquiry: okInq, dryRun: true });
+  check('liveアダプターでも dryRun:true 強制', dryOverride.dryRun === true && fNone.calls.length === 0);
+
+  let putReq = null;
+  const fPut = async (url, opts) => { putReq = { url, opts }; return { status: 200, text: async () => JSON.stringify({ status: 'ok' }) }; };
+  const done = await createYahooAdapter({ ...CFG, fetchImpl: fPut, sendMode: 'live' }).completeInquiry({ inquiry: okInq });
+  check('live: PUT /yahoo/externalTalkComplete + X-Proxy-Secret + {topicId}', done.ok === true
+    && putReq.url === 'http://localhost:18080/yahoo/externalTalkComplete' && putReq.opts.method === 'PUT'
+    && putReq.opts.headers['X-Proxy-Secret'] === 'ps' && JSON.parse(putReq.opts.body).topicId === okInq.external_inquiry_id,
+    JSON.stringify(putReq && { url: putReq.url, method: putReq.opts.method }));
+  check('completeConditionId は送らない (未指定=通常完了。返信直後にだけ呼ぶ前提)', !('completeConditionId' in JSON.parse(putReq.opts.body)));
+
+  let eBad = null;
+  try { await createYahooAdapter({ ...CFG, fetchImpl: fPut, sendMode: 'live' }).completeInquiry({ inquiry: { external_inquiry_id: 'bad topic!' } }); } catch (e) { eBad = e; }
+  check('topicId不正は throw', eBad !== null);
+  const f400 = async () => ({ status: 400, text: async () => JSON.stringify({ error: { reason: 'no seller reply' } }) });
+  let e400 = null;
+  try { await createYahooAdapter({ ...CFG, fetchImpl: f400, sendMode: 'live' }).completeInquiry({ inquiry: okInq }); } catch (e) { e400 = e; }
+  check('4xx は throw (reason抽出。outbox側で警告化)', e400 !== null && /no seller reply/.test(e400.message));
+  const fNg = async () => ({ status: 200, text: async () => JSON.stringify({ status: 'ng' }) });
+  let eNg = null;
+  try { await createYahooAdapter({ ...CFG, fetchImpl: fNg, sendMode: 'live' }).completeInquiry({ inquiry: okInq }); } catch (e) { eNg = e; }
+  check('200でも status!=ok は throw', eNg !== null && /想定外/.test(eNg.message));
+}
+
 check('DBは一時サブディレクトリのみに作成 (ベース直下に漏れない)',
   fs.existsSync(path.join(workDir, 'inquiry-hub.db')) && fs.existsSync(path.join(baseDir, 'inquiry-hub.db')) === baseDbExistedAtStart);
 

@@ -271,10 +271,10 @@ console.log('7. 画面描画');
 
   const htmlOk = await (await fetch(`${base}/inquiries/${idOk}`)).text();
   check('通常アドレス: バナーは出ず送信ボタンは有効',
-    !htmlOk.includes('このアドレスにメール返信はできません') && /id="replyBtn">/.test(htmlOk));
+    !htmlOk.includes('このアドレスにメール返信はできません') && /id="replyBtn"(?! disabled)/.test(htmlOk));
   const htmlEmpty = await (await fetch(`${base}/inquiries/${idEmpty}`)).text();
   check('アドレス空: 塞がない (送信ボタンは有効)',
-    !htmlEmpty.includes('このアドレスにメール返信はできません') && /id="replyBtn">/.test(htmlEmpty));
+    !htmlEmpty.includes('このアドレスにメール返信はできません') && /id="replyBtn"(?! disabled)/.test(htmlEmpty));
 
   const list = await (await fetch(`${base}/?view=inbox`)).text();
   check('一覧に配信失敗バッジが出る', list.includes('配信失敗'));

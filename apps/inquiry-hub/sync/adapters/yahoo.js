@@ -227,6 +227,52 @@ export function createYahooAdapter(cfg = {}) {
     },
 
     /**
+     * 回答完了 (2026-08-26 スタッフ要望「返信して回答完了」を1操作で)。
+     * outbox が sendReply 成功の直後にだけ呼ぶ (Yahoo!公式: 通常完了は出店者の返信が1回以上ある場合のみ)。
+     * 公式: PUT externalTalkComplete?topicId= body={sellerId} → {status:'ok'}。
+     * ⚠️ 返信は既に顧客へ届いているので、ここでの失敗は throw するが outbox 側は
+     *    ジョブを sent のまま警告表示にする (unknown化しない。completeInquiry は冪等なので手動再実行も安全)。
+     * レート制限 1req/秒 → 直前の投稿から1.1秒あける
+     */
+    async completeInquiry({ inquiry, dryRun = false }) {
+      const topicId = String(inquiry?.external_inquiry_id || '').trim();
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(topicId)) {
+        throw new Error(`Yahoo!トピックIDが不正です (external_inquiry_id='${topicId}')`);
+      }
+      if (dryRun || sendMode !== 'live') {
+        console.log(`[yahoo-complete DRYRUN] topic=${topicId.slice(0, 12)}… (実行していません)`);
+        return { dryRun: true };
+      }
+      await sleep(sleepMs);
+      let res;
+      try {
+        res = await fetchImpl(`${base}/yahoo/externalTalkComplete`, {
+          method: 'PUT',
+          headers: { 'X-Proxy-Secret': proxySecret, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ topicId }),
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        });
+      } catch (err) {
+        const timedOut = err?.name === 'TimeoutError' || err?.name === 'AbortError';
+        throw new Error(timedOut ? `Yahoo!回答完了タイムアウト (${requestTimeoutMs}ms)` : `Yahoo!回答完了の接続失敗: ${err?.message || err}`);
+      }
+      const text = await res.text().catch(() => '');
+      if (res.status !== 200) {
+        let reason;
+        try { reason = JSON.parse(text)?.error?.reason ?? JSON.parse(text)?.error; } catch { /* XML等 */ }
+        const code = (text.match(/<Code>([^<]{1,40})<\/Code>/) || [])[1];
+        throw new Error(`Yahoo!回答完了が拒否されました (HTTP ${res.status})${code ? ` code=${code}` : ''}${reason ? ` reason=${String(reason).slice(0, 120)}` : ''}`);
+      }
+      let data = null;
+      try { data = JSON.parse(text); } catch { /* 下で判定 */ }
+      if (String(data?.status || '').toLowerCase() !== 'ok') {
+        throw new Error(`Yahoo!回答完了の応答が想定外です (HTTP ${res.status}、status='${data?.status ?? ''}')`);
+      }
+      console.log(`[yahoo-complete] 回答完了 topic=${topicId.slice(0, 12)}…`);
+      return { ok: true };
+    },
+
+    /**
      * 添付の実体取得 (画面の添付表示用。attachments.js から呼ばれる)。
      * VPSプロキシの /yahoo/externalTalkFile passthrough (公式: ファイル取得API
      * externalTalkFileDownload?key=<objectKey>) を叩き、投稿時の Content-Type のまま受け取る。
