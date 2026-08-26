@@ -605,6 +605,8 @@ console.log('=== 12. PR-C5b: 段階1 (クーポン先行) → 段階2 (フォロ
   check('段階1中の新規発送: フォロー vendor / クーポン self', own(oSep).owner === 'vendor' && own(oSep).coupon_owner === 'self' && own(oSep).reason === 'coupon_cutover');
   // クーポン action は段階1で送信対象になり得る (ownership 上)。フォローは vendor で止まる (sender 側テストで確認済み)
 
+  // 段階1の後に最終発送日が境目の反対側へ動いた注文 (再発送): coupon_owner は覆らない (Codex C5b-R1 Medium)
+  db5.prepare(`UPDATE rakuten_order_contacts SET shipping_datetime = '2026-09-06T12:00:00+09:00' WHERE order_number = ?`).run(oOld);
   // 段階2: フォロー切替。coupon-at を違う値で指定すると拒否、省略で引き継ぎ
   const NOW2 = '2026-09-13T03:00:00.000Z';
   const fol = parseCutoverArg('2026-09-02T23:59:59+09:00');
@@ -613,8 +615,10 @@ console.log('=== 12. PR-C5b: 段階1 (クーポン先行) → 段階2 (フォロ
   check('段階2: 段階1と違う coupon 境目は拒否', diffRej && getCutover(db5).stage === 'coupon_only');
   const r2 = applyCutover(db5, { cutoverAt: fol, couponCutoverAt: null, nowIso: NOW2 });
   const cut2 = getCutover(db5);
-  check('段階2: LIVE・coupon 境目は段階1の値を引き継ぐ・段階1の行を全部再判定',
-    cut2.stage === 'live' && cut2.cutoverAt === fol && cut2.couponCutoverAt === cpn && r2.shadowDeleted === 3, JSON.stringify({ cut2, r2 }));
+  check('段階2: LIVE・coupon 境目は段階1の値を引き継ぐ・段階1の行3件は削除せず引き継ぎ (shadow 削除 0)',
+    cut2.stage === 'live' && cut2.cutoverAt === fol && cut2.couponCutoverAt === cpn && r2.shadowDeleted === 0 && r2.stage1Migrated === 3, JSON.stringify({ cut2, r2 }));
+  check('段階2: 段階1後に再発送で境目を跨いだ注文 = フォローは新しい発送日で self、coupon_owner は vendor のまま (覆らない)',
+    own(oOld).owner === 'self' && own(oOld).coupon_owner === 'vendor' && own(oOld).reason === 'cutover_shipping');
   check('段階2: 9/5発送 = フォロー self / クーポン self (reason=cutover_shipping)',
     own(oSep).owner === 'self' && own(oSep).coupon_owner === 'self' && own(oSep).reason === 'cutover_shipping');
   check('段階2: 8/20発送 = フォロー vendor / クーポン self のまま', own(oAug).owner === 'vendor' && own(oAug).coupon_owner === 'self');

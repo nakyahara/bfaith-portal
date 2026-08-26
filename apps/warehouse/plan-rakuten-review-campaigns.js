@@ -160,7 +160,7 @@ try {
       console.log('[cutover] dry-run のため何も変更していない。実行は --live を付ける (一度だけ・戻せない)');
     } else {
       const r = couponOnly ? applyCouponCutover(db, { couponCutoverAt }) : applyCutover(db, { cutoverAt, couponCutoverAt });
-      console.log(`[cutover] ✅ 適用: 旧 ownership 行削除 ${r.shadowDeleted} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
+      console.log(`[cutover] ✅ 適用: shadow 行削除 ${r.shadowDeleted} / 段階1行の引き継ぎ ${r.stage1Migrated ?? 0} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
       console.log('[cutover] 次の 12:05 (RakutenReviewMailSend) から自作が送信する。当月の月次クーポンが未発行なら manage-rakuten-review-coupon.js ensure-monthly --live を先に');
     }
   } else {

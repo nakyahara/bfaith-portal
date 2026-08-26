@@ -635,10 +635,26 @@ export function applyCutover(db, { cutoverAt, couponCutoverAt, nowIso = new Date
     ins.run('cutover_at', cutoverAt);
     ins.run('coupon_cutover_at', couponCutoverAt);
     ins.run('cutover_applied_at', nowIso);
-    // shadow 行と段階1の行を消して LIVE ルールで再判定 (coupon_owner は同じ境目なので同じ結果になる)
-    const del = db.prepare(`DELETE FROM rakuten_order_campaign_ownership WHERE reason IN ${PRE_LIVE_REASONS}`).run();
+    // shadow 行は消して LIVE ルールで再判定。段階1の行は消さず coupon_owner を保持したまま
+    // owner (フォロー担当) と reason だけ更新する (Codex C5b-R1 Medium: 削除→再作成だと段階1以降に
+    // 最終発送日が動いた注文の coupon_owner が覆り「一度決めた担当は覆らない」に反する)
+    const del = db.prepare(`DELETE FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).run();
+    const cutT = Date.parse(cutoverAt);
+    const stage1 = db.prepare(`
+      SELECT o.order_number, c.shipping_datetime FROM rakuten_order_campaign_ownership o
+        LEFT JOIN rakuten_order_contacts c ON c.order_number = o.order_number
+       WHERE o.reason = 'coupon_cutover'
+    `).all();
+    const upd = db.prepare(`UPDATE rakuten_order_campaign_ownership SET owner = ?, reason = 'cutover_shipping', decided_at = ? WHERE order_number = ? AND reason = 'coupon_cutover'`);
+    let stage1Migrated = 0;
+    for (const o of stage1) {
+      const t = Date.parse(o.shipping_datetime);
+      // 発送日時が消えている/壊れている行は判定不能 → vendor (fail-closed)
+      stage1Migrated += upd.run(Number.isFinite(t) && t > cutT ? 'self' : 'vendor', nowIso, o.order_number).changes;
+    }
+    stage1Migrated += db.prepare(`UPDATE rakuten_order_campaign_ownership SET reason = 'cutover_no_contact', decided_at = ? WHERE reason = 'coupon_cutover_no_contact'`).run(nowIso).changes;
     const counts = planCampaigns(db, { nowIso });
-    return { shadowDeleted: del.changes, ...counts };
+    return { shadowDeleted: del.changes, stage1Migrated, ...counts };
   });
   return tx.immediate();
 }
