@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>証憑リンク集</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; background: #f5f6f8; color: #1f2933; font-size: 14px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 16px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  header h1 { font-size: 20px; }
+  header .back { color: #4b5563; text-decoration: none; font-size: 13px; }
+  header .back:hover { text-decoration: underline; }
+  .count { color: #6b7280; font-size: 13px; }
+  .spacer { flex: 1; }
+  .btn { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #f3f4f6; }
+  .btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.primary:hover { background: #1d4ed8; }
+  .btn.danger { color: #b91c1c; border-color: #fca5a5; }
+  .btn.danger:hover { background: #fef2f2; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  #search { flex: 1; min-width: 220px; padding: 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
+  #search:focus { outline: 2px solid #93c5fd; border-color: #2563eb; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip { border: 1px solid #d1d5db; background: #fff; border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 12px; color: #374151; }
+  .chip.on { background: #2563eb; border-color: #2563eb; color: #fff; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  th { text-align: left; font-size: 12px; color: #6b7280; font-weight: 600; padding: 8px 10px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
+  tr:hover td { background: #f8fafc; }
+  .name { font-weight: 600; max-width: 320px; word-break: break-all; }
+  .open a { display: inline-block; background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 6px; padding: 3px 10px; text-decoration: none; font-size: 12px; white-space: nowrap; }
+  .open a:hover { background: #dbeafe; }
+  .path { max-width: 300px; }
+  .path .p { font-size: 11px; color: #6b7280; word-break: break-all; font-family: Consolas, monospace; }
+  .copy { border: none; background: none; cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 4px; }
+  .copy:hover { background: #e5e7eb; }
+  .tag { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 11px; white-space: nowrap; }
+  .day, .src { font-size: 12px; color: #374151; white-space: nowrap; }
+  .edit-btn { border: none; background: none; cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; }
+  .edit-btn:hover { background: #e5e7eb; }
+  .empty { padding: 30px; text-align: center; color: #9ca3af; }
+  dialog { border: none; border-radius: 10px; padding: 0; width: min(560px, 92vw); box-shadow: 0 10px 40px rgba(0,0,0,.2); }
+  dialog::backdrop { background: rgba(0,0,0,.35); }
+  .dlg-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid #e5e7eb; }
+  .dlg-head h2 { font-size: 16px; }
+  .dlg-body { padding: 14px 18px; display: grid; gap: 10px; }
+  .field label { display: block; font-size: 12px; color: #6b7280; margin-bottom: 3px; }
+  .field input { width: 100%; padding: 7px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
+  .field input:focus { outline: 2px solid #93c5fd; border-color: #2563eb; }
+  .dlg-foot { display: flex; gap: 8px; padding: 14px 18px; border-top: 1px solid #e5e7eb; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #111827; color: #fff; padding: 8px 18px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: .92; }
+  @media (max-width: 720px) { .path, th:nth-child(3) { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a class="back" href="/">← ポータル</a>
+    <h1>🧾 証憑リンク集</h1>
+    <span class="count" id="count"></span>
+    <span class="spacer"></span>
+    <button class="btn primary" id="addBtn">＋ 追加</button>
+  </header>
+
+  <div class="toolbar">
+    <input id="search" type="text" placeholder="検索：支払い先名・URL・保存先・用途…" autocomplete="off">
+  </div>
+  <div class="chips" id="chips"></div>
+
+  <table>
+    <thead>
+      <tr><th>支払い先</th><th>マイページ</th><th>証憑の保存先</th><th>用途</th><th>引落日</th><th>領収書取得</th><th></th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">該当なし</div>
+</div>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <div class="dlg-head"><h2 id="dlgTitle">編集</h2><button class="btn" value="cancel">✕</button></div>
+    <div class="dlg-body">
+      <div class="field"><label>支払い先名 *</label><input id="f_name" required></div>
+      <div class="field"><label>マイページURL（証憑取得先）</label><input id="f_url" placeholder="https://..."></div>
+      <div class="field"><label>証憑の保存先（フォルダパス）</label><input id="f_storage_path" placeholder="G:\共有ドライブ\..."></div>
+      <div class="field"><label>用途（カード種類）</label><input id="f_card_type" list="cardTypes" placeholder="webの月額利用料 など"></div>
+      <datalist id="cardTypes"></datalist>
+      <div class="field"><label>支払いタイミング</label><input id="f_payment_timing" placeholder="毎月 / 年1回"></div>
+      <div class="field"><label>毎月引き落とし日</label><input id="f_debit_day" placeholder="例: 15"></div>
+      <div class="field"><label>領収書取得先</label><input id="f_receipt_source" placeholder="サイトからダウンロード / メールに添付"></div>
+      <div class="field"><label>メモ</label><input id="f_note"></div>
+    </div>
+    <div class="dlg-foot">
+      <button class="btn danger" value="delete" id="delBtn">削除</button>
+      <span class="spacer" style="flex:1"></span>
+      <button class="btn" value="cancel">キャンセル</button>
+      <button class="btn primary" value="save" id="saveBtn">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = 'api/links';
+const FIELDS = ['name', 'url', 'storage_path', 'card_type', 'payment_timing', 'debit_day', 'receipt_source', 'note'];
+const TAG_COLORS = [
+  ['#eff6ff', '#1d4ed8'], ['#f0fdf4', '#15803d'], ['#fef3c7', '#b45309'], ['#fce7f3', '#be185d'],
+  ['#f3e8ff', '#7e22ce'], ['#ecfeff', '#0e7490'], ['#fff7ed', '#c2410c'], ['#f1f5f9', '#475569'],
+];
+let links = [];
+let filterType = null; // null = すべて
+let editingId = null;  // null = 新規
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function tagColor(t) {
+  let h = 0;
+  for (const c of t) h = (h * 31 + c.codePointAt(0)) >>> 0;
+  return TAG_COLORS[h % TAG_COLORS.length];
+}
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 1800);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  return body.result;
+}
+
+function cardTypes() {
+  return [...new Set(links.map(l => l.card_type).filter(Boolean))];
+}
+
+function visible() {
+  const q = $('search').value.trim().toLowerCase();
+  return links.filter(l => {
+    if (filterType !== null && l.card_type !== filterType) return false;
+    if (!q) return true;
+    return [l.name, l.url, l.storage_path, l.card_type, l.receipt_source, l.note]
+      .some(v => (v || '').toLowerCase().includes(q));
+  });
+}
+
+function render() {
+  const list = visible();
+  $('count').textContent = list.length === links.length ? `${links.length}件` : `${list.length} / ${links.length}件`;
+  $('empty').style.display = list.length ? 'none' : 'block';
+  $('rows').innerHTML = list.map(l => {
+    const [bg, fg] = l.card_type ? tagColor(l.card_type) : ['', ''];
+    return `<tr>
+      <td class="name">${esc(l.name)}</td>
+      <td class="open">${l.url ? `<a href="${esc(l.url)}" target="_blank" rel="noopener">開く ↗</a>` : ''}</td>
+      <td class="path">${l.storage_path ? `<span class="p">${esc(l.storage_path)}</span> <button class="copy" data-copy="${esc(l.storage_path)}" title="パスをコピー">📋</button>` : ''}</td>
+      <td>${l.card_type ? `<span class="tag" style="background:${bg};color:${fg}">${esc(l.card_type)}</span>` : ''}</td>
+      <td class="day">${l.debit_day ? esc(l.debit_day) + '日' : ''}${l.payment_timing && l.payment_timing !== '毎月' ? ` <span style="color:#9ca3af">(${esc(l.payment_timing)})</span>` : ''}</td>
+      <td class="src">${esc(l.receipt_source)}</td>
+      <td><button class="edit-btn" data-edit="${l.id}" title="編集">✏️</button></td>
+    </tr>`;
+  }).join('');
+  renderChips();
+}
+
+function renderChips() {
+  const types = cardTypes();
+  $('chips').innerHTML = [`<button class="chip ${filterType === null ? 'on' : ''}" data-type="">すべて</button>`]
+    .concat(types.map(t => `<button class="chip ${filterType === t ? 'on' : ''}" data-type="${esc(t)}">${esc(t)}</button>`))
+    .join('');
+  $('cardTypes').innerHTML = types.map(t => `<option value="${esc(t)}">`).join('');
+}
+
+function openDialog(id) {
+  editingId = id;
+  const l = id === null ? {} : links.find(x => x.id === id) || {};
+  $('dlgTitle').textContent = id === null ? '新規追加' : '編集';
+  $('delBtn').style.display = id === null ? 'none' : '';
+  for (const f of FIELDS) $('f_' + f).value = l[f] || '';
+  $('dlg').showModal();
+  $('f_name').focus();
+}
+
+$('dlg').addEventListener('close', async () => {
+  const val = $('dlg').returnValue;
+  try {
+    if (val === 'save') {
+      const body = {};
+      for (const f of FIELDS) body[f] = $('f_' + f).value.trim();
+      if (!body.name) return toast('支払い先名は必須です');
+      if (editingId === null) {
+        links.push(await api(API, { method: 'POST', body: JSON.stringify(body) }));
+        toast('追加しました');
+      } else {
+        const updated = await api(`${API}/${editingId}`, { method: 'PATCH', body: JSON.stringify(body) });
+        links = links.map(l => l.id === editingId ? updated : l);
+        toast('保存しました');
+      }
+      render();
+    } else if (val === 'delete' && editingId !== null) {
+      const l = links.find(x => x.id === editingId);
+      if (!confirm(`「${l?.name}」を削除しますか？`)) return;
+      await api(`${API}/${editingId}`, { method: 'DELETE' });
+      links = links.filter(x => x.id !== editingId);
+      toast('削除しました');
+      render();
+    }
+  } catch (e) {
+    toast('エラー: ' + e.message);
+  }
+});
+
+document.addEventListener('click', async (ev) => {
+  const copy = ev.target.closest('[data-copy]');
+  if (copy) {
+    try {
+      await navigator.clipboard.writeText(copy.dataset.copy);
+      toast('保存先パスをコピーしました');
+    } catch { toast('コピーできませんでした'); }
+    return;
+  }
+  const edit = ev.target.closest('[data-edit]');
+  if (edit) return openDialog(Number(edit.dataset.edit));
+  const chip = ev.target.closest('.chip');
+  if (chip) {
+    filterType = chip.dataset.type === '' ? null : chip.dataset.type;
+    render();
+  }
+});
+
+$('addBtn').addEventListener('click', () => openDialog(null));
+$('search').addEventListener('input', render);
+
+(async function init() {
+  try {
+    links = await api(API);
+    render();
+    $('search').focus();
+  } catch (e) {
+    $('empty').style.display = 'block';
+    $('empty').textContent = '読み込みに失敗しました: ' + e.message;
+  }
+})();
+</script>
+</body>
+</html>
