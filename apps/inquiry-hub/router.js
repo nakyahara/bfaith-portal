@@ -38,6 +38,7 @@ import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } fr
 import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
 import { isImage, isInlineSafe, fmtBytes, resolveContentType } from './mime.js';
+import { blockedReplyDestination } from './no-reply.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
 
@@ -104,6 +105,7 @@ const ACTION_LABELS = {
   folder_change: 'フォルダ変更', label_change: 'ラベル変更', bulk_revert: '一括操作の取り消し',
   attention_toggle: '要確認フラグ', ai_flag: 'AIフラグ', seed: 'テストデータ投入',
   reply_created: '返信ジョブ作成', reply_resolved: '送信結果の解決', reply_cancelled: '送信ジョブ取消',
+  delivery_failed: '🔴配信失敗を検知',
 };
 function fmtLogValue(key, v) {
   switch (key) {
@@ -273,7 +275,7 @@ router.get('/', (req, res) => {
     <tr class="${r.is_unread ? 'unread' : ''}" onclick="location.href='/apps/inquiry-hub/inquiries/${r.id}${detailQs}'">
       <td class="selcell" onclick="event.stopPropagation()"><input type="checkbox" class="rowchk" value="${r.id}" aria-label="選択"></td>
       <td>${chBadge(r.channel_type)}<div class="sub">${he(r.shop_name)}</div></td>
-      <td>${stBadge(r.internal_status)}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
+      <td>${stBadge(r.internal_status)}${r.delivery_failed_at ? ' <span class="badge" style="background:#b91c1c;color:#fff" title="返信メールが宛先に届きませんでした">🔴配信失敗</span>' : ''}${r.needs_attention ? ' <span class="badge" style="background:#fee2e2;color:#b91c1c">⚠️要確認</span>' : ''}${r.is_unread ? ' <span class="dot" title="未読"></span>' : ''}</td>
       <td class="nowrap" data-label="ラベル"${r.label_name ? '' : ' data-empty'}>${r.label_name ? labelChip(r.label_name, r.label_color) : '—'}</td>
       <td class="nowrap" data-label="担当"${r.assigned_user_id ? '' : ' data-empty'}>${he(r.assigned_user_id || '—')}</td>
       <td class="nowrap" data-label="AI"${r.ai_needed ? '' : ' data-empty'}>${r.ai_needed ? badge(AI_FLAGS[r.ai_needed], null) : '—'}</td>
@@ -585,9 +587,29 @@ router.get('/inquiries/:id', (req, res) => {
       : !sendLive
         ? '<div class="sub" style="background:#e0e7ff;border-radius:8px;padding:8px 10px;margin-bottom:8px">🧪 DRYRUNモード: このチャネルの送信ジョブは検証のみで、実際には送信されません (動作確認用)</div>'
         : '';
+  // ─── 返信不可アドレス / 配信失敗の警告 (2026-08-26 no-reply@mercari-shops.com 事故) ───
+  // メールチャネルの返信先は customer_identifier。通知専用アドレスだと送っても顧客に届かない
+  // 空・解析不能なアドレスは塞がない (送信時にスレッドから復元される。no-reply.js 参照)
+  const replyBlocked = inq.channel_type === 'email' ? blockedReplyDestination(inq.customer_identifier) : null;
+  const blockedBanner = !replyBlocked ? '' : `
+    <div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:10px 12px;margin-bottom:8px;color:#7f1d1d">
+      <b>🚫 このアドレスにメール返信はできません</b>
+      <div class="sub" style="color:#7f1d1d">${he(replyBlocked.reason)}</div>
+      <div class="sub" style="color:#7f1d1d;margin-top:4px"><b>➡ ${he(replyBlocked.guide)}</b></div>
+      <div class="sub" style="color:#7f1d1d;margin-top:4px">下の欄で文面だけ作って、返信先の画面に貼り付けることはできます</div>
+    </div>`;
+  const bouncedBanner = inq.delivery_failed_at ? `
+    <div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:8px;padding:10px 12px;margin-bottom:8px;color:#7f1d1d">
+      <b>🔴 前の返信が届いていません (配信失敗)</b>
+      <div class="sub" style="color:#7f1d1d">${he(fmtJst(inq.delivery_failed_at))} に配信失敗通知 (バウンス) を受け取りました。
+        送信済みに見えていても顧客には届いていません — 別の手段で連絡してください</div>
+    </div>` : '';
+
   const replyPanel = replyEditorEnabled() ? `
       <div class="panel">
         <h3>✉️ 返信を作成</h3>
+        ${bouncedBanner}
+        ${blockedBanner}
         ${workerBanner}
         ${outboxHtml}
         ${activeJob
@@ -616,10 +638,10 @@ router.get('/inquiries/:id', (req, res) => {
         <div id="attList"></div>` : ''}
         <div class="row" style="margin-top:8px; justify-content:flex-end">
           <label class="chk" style="margin-right:auto"><input type="checkbox" id="replyComplete">送信して<b>完了</b>にする</label>
-          <button class="pri" id="replyBtn">内容を確認して送信ジョブを作成</button>
+          <button class="pri" id="replyBtn"${replyBlocked ? ' disabled title="返信不可のアドレスのため送信できません"' : ''}>${replyBlocked ? '🚫 このアドレスには送信できません' : '内容を確認して送信ジョブを作成'}</button>
         </div>`}
       </div>` : `
-      <div class="panel reply-note">✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
+      <div class="panel reply-note">${bouncedBanner}${blockedBanner}✉️ 返信機能はまだ有効になっていません (いまはメールディーラーから返信してください)。
         <span class="sub">管理者が env <code>INQUIRY_HUB_REPLY_EDITOR_ENABLED=true</code> を設定すると、この画面から返信できます</span></div>`;
 
   // 📧 このメールを今後どう扱うか (メールチャネルのみ)。自動配信メールが受信トレイを
@@ -2832,7 +2854,9 @@ router.post('/api/admin/sync/:shopId(\\d+)', async (req, res) => {
   if (!adapter) return res.status(503).json({ error: `${shop.channel_type} の同期用環境変数が未設定です` });
   try {
     console.log(`[inquiry-hub] 手動同期 ${shop.shop_name}${deep ? ' (deep)' : ''} by ${actorOf(req)}`);
-    const r = await runSync(shop.id, adapter);
+    // deep のときは直近数日の強制再照合 (repair) も併せて行う。取り込み済みスレッドに後から
+    // 付いた情報 (配信失敗通知の検知など) を拾い直すための入口 (2026-08-26)
+    const r = await runSync(shop.id, adapter, { repair: deep });
     await refreshShopAuthStatus(shop, adapter); // Yahoo!は認証期限も自動反映 (fail-soft)
     res.json(r);
   } catch (e) {

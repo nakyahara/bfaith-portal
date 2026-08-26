@@ -169,6 +169,10 @@ function createTables() {
   addColumnIfMissing('inquiries', 'folder_id', 'INTEGER REFERENCES inquiry_folders(id)');
   // ラベル (1件1ラベル。NULL=ラベルなし。2026-08-24)
   addColumnIfMissing('inquiries', 'label_id', 'INTEGER REFERENCES inquiry_labels(id)');
+  // 配信失敗 (バウンス) を最後に観測した日時。NULL=失敗なし (2026-08-26)。
+  // 「返信したのに顧客へ届いていない」を画面で気付けるようにするための印。
+  // 同期がバウンス通知を検知したときに立ち、その後の返信が実際に送信できた時点で消える
+  addColumnIfMissing('inquiries', 'delivery_failed_at', 'TEXT');
 
   // メッセージ (受信・送信の両方)
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (

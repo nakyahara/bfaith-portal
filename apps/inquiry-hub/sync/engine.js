@@ -16,6 +16,8 @@
  *                                                //   import_done用。既存チケットの状態は変えない)
  *       initialFolderId?,                        // 整数のみ。新規作成時だけ適用 (メールルールの
  *                                                //   フォルダ振り分け用。既存チケットのフォルダは動かさない)
+ *       deliveryFailedAt?,                       // バウンス (配信失敗通知) を観測した最新時刻。
+ *                                                //   inquiries.delivery_failed_at へ前進のみで反映
  *       receivedAt,                              // 必須 (新規作成時に使用)
  *       messages: [{
  *         externalMessageId?,                    // 無ければ syntheticMessageId() で決定的に採番
@@ -92,7 +94,7 @@ function releaseLease(db, shopId, token) {
 function ingestInquiry(db, shop, item, nowIso) {
   if (!item.externalInquiryId) throw new Error('adapter bug: externalInquiryId がありません');
   const stats = { newInquiry: false, newMessages: 0, newCustomerMessages: 0, reopened: false, movedToWaiting: false,
-    lastNewMessageAt: null, lastNewIsIncoming: null };
+    deliveryFailed: false, lastNewMessageAt: null, lastNewIsIncoming: null };
 
   let inq = db.prepare('SELECT * FROM inquiries WHERE channel_type = ? AND shop_id = ? AND external_inquiry_id = ?')
     .get(shop.channel_type, shop.id, item.externalInquiryId);
@@ -228,6 +230,21 @@ function ingestInquiry(db, shop, item, nowIso) {
       WHERE id = ?`).run(stats.newMessages, maxMsgAt, maxMsgAt, nowIso, inq.id);
     db.prepare('UPDATE ai_drafts SET is_stale = 1 WHERE inquiry_id = ? AND is_stale = 0').run(inq.id);
   }
+  // 配信失敗 (バウンス) の記録 (2026-08-26)。newMessages に関係なく毎回照合するのは、
+  // バウンスが既に取り込み済みの古いチケットも修復同期 (repair) で拾えるようにするため。
+  // 前進のみ (古いバウンスで新しい記録を巻き戻さない)。⚠️要確認も立てて一覧の既存導線に乗せる
+  if (item.deliveryFailedAt) {
+    const failedIso = toUtcIso(item.deliveryFailedAt);
+    const r = db.prepare(`UPDATE inquiries SET delivery_failed_at = ?, needs_attention = 1, updated_at = ?
+      WHERE id = ? AND (delivery_failed_at IS NULL OR delivery_failed_at < ?)`)
+      .run(failedIso, nowIso, inq.id, failedIso);
+    if (r.changes > 0) {
+      stats.deliveryFailed = true;
+      logActivity(inq.id, { actorType: 'system', actionType: 'delivery_failed',
+        after: { delivery_failed_at: failedIso, reason: '配信失敗通知 (バウンス) を検知 — 顧客に届いていません' } });
+    }
+  }
+
   // ステータス自動遷移 (メールディーラー準拠。2026-07-25)。
   // ⚠️ 件数ではなく「取り込んだ新規メッセージのうち時系列で最後のもの」の向きで決める。
   // 1回の同期で 顧客返信→店舗返信 をまとめて取り込むことがあり (同期間隔中に往復した場合や
@@ -303,7 +320,7 @@ export async function runSync(shopId, adapter, opts = {}) {
     const committedIso = st.committed_until && st.committed_until > boundedObservedIso
       ? st.committed_until : boundedObservedIso;
 
-    const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0, movedToWaiting: 0 };
+    const totals = { inquiries: items.length, newInquiries: 0, newMessages: 0, reopened: 0, movedToWaiting: 0, deliveryFailed: 0 };
     const tx = db.transaction(() => {
       // 所有権確認: リースを奪われていたら (fetchNew がリース期間超過) コミットを破棄 (Codexレビュー反映)
       const cur = db.prepare('SELECT lease_token FROM sync_state WHERE shop_id = ?').get(shopId);
@@ -318,6 +335,7 @@ export async function runSync(shopId, adapter, opts = {}) {
         totals.newMessages += s.newMessages;
         totals.reopened += s.reopened ? 1 : 0;
         totals.movedToWaiting += s.movedToWaiting ? 1 : 0;
+        totals.deliveryFailed += s.deliveryFailed ? 1 : 0;
       }
       // 全件取り込み成功時のみ high-water mark を前進 (§8.1)
       db.prepare(`UPDATE sync_state SET
