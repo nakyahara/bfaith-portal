@@ -113,6 +113,24 @@ export const JOBS_REGISTRY = [
     runbook: 'scripts/mall-csv-fetcher/logs/fetch-all-*.log を確認。認証切れなら各モールの再ログイン手順 (Yahoo=デスクトップのYahoo-Relogin.bat)',
   },
   {
+    id: 'rakuten-review-mail-send',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: '楽天レビュー フォロー/クーポンメールの正午送信 (らくらくーぽん置換 PR-C5)。'
+      + '月次5%クーポンの自動発行 (ensure-monthly) → 当日12:00予定の action を ready 昇格 (plan) → at-most-once 送信 (send)。'
+      + 'cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)',
+    where: 'miniPC TaskScheduler [RakutenReviewMailSend] (scripts/mall-csv-fetcher/run-rakuten-review-send.ps1)',
+    schedule: '毎日 12:05',
+    anchor_hour_jst: 12,
+    anchor_minute_jst: 5,
+    grace_hours: 3, // 15:00 までに ok が無ければ締切超過 (フォローは発送+21日の規約期限があるため翌日には気づきたい)
+    lifecycle: 'permanent',
+    runbook: 'AI_reference『らくらくーぽん置換_経緯引き継ぎ_20260717.md』§PR-C5。'
+      + '手動再実行: DATA_DIR を設定して node apps/warehouse/send-rakuten-review-mails.js plan → send --limit N。'
+      + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決',
+  },
+  {
     id: 'warehouse-daily-sync',
     type: 'scheduled_job',
     importance: 'P1',

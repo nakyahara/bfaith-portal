@@ -12,6 +12,15 @@
  *   vendor   らくらくーぽん実績の日次件数を転記 (PR-C2 突合の材料)
  *            例: vendor --date 2026-07-18 --follow 512 --coupon 14
  *   report   shadow 突合レポート (--days 14 既定 / --from --to 指定可)
+ *   cutover  shadow → LIVE の切替 (PR-C5、一度だけ)。既定は dry-run (影響件数の表示のみ)
+ *            例: cutover --follow-at 2026-09-02T23:59:59+09:00 --coupon-at 2026-07-25T00:00:00+09:00 [--live]
+ *              --follow-at : この時刻より後に最終発送された注文のフォローメールを自作が送る
+ *                            (らくらくーぽん最終稼働日の10日前 23:59:59 = 空白も二重送信も出ない境目)
+ *              --coupon-at : 同じくクーポンメールの境目 (省略時 = --follow-at)。らくらくーぽんの
+ *                            クーポンメールが止まった日以降を早く引き取るために別指定できる
+ *            ⭐境目を過ぎてから実行する (未来の境目は拒否。ownership は一度決めたら覆らないため)。
+ *            live 後は毎日 12:05 の RakutenReviewMailSend (scripts/mall-csv-fetcher/run-rakuten-review-send.ps1)
+ *            が実送信する。cutover を戻す手段は CLI に無い (rakuten_campaign_meta を手で直す)
  *
  * env: DATA_DIR (必須)
  * exit code: 0=成功 / 1=失敗 / 2=env・引数エラー
@@ -23,6 +32,7 @@ import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats,
   recordVendorDailyBatch, shadowComparisonReport, jstDateOf, REPORT_MAX_DAYS,
+  getCutover, parseCutoverArg, cutoverPreview, applyCutover,
 } from './rakuten-review-campaign-lib.js';
 import { ensureContactTables } from './rakuten-review-contacts-lib.js';
 import { ensureRakutenReviewTables } from './rakuten-review-lib.js';
@@ -50,12 +60,15 @@ ensureCampaignTables(db);
 try {
   if (mode === 'plan') {
     const c = planCampaigns(db);
-    console.log(`[campaign] plan完了 (shadow): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
+    const phase = getCutover(db).cutoverAt ? 'LIVE' : 'shadow';
+    console.log(`[campaign] plan完了 (${phase}): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
       `ready昇格 ${c.promotedReady} / 抑止 ${c.suppressed} / 期限切れ ${c.expired} / 取消 ${c.cancelled} / ` +
       `再スケジュール ${c.rescheduled} / ownership追加 ${c.ownershipInserted}`);
   } else if (mode === 'stats') {
     const s = campaignStats(db);
+    const cut = getCutover(db);
     console.log(`coupon_epoch: ${s.epoch || '(未設定=plan未実行)'}`);
+    console.log(`cutover: ${cut.cutoverAt ? `LIVE (follow=${cut.cutoverAt} / coupon=${cut.couponCutoverAt})` : 'shadow (未実施)'}`);
     console.log(`予定超過で待機中 (planned): ${s.dueOverdue}件 / 今後24時間の送信予定 (planned): ${s.dueNext24h}件 / 本日(JST) ready昇格: ${s.readyTodayJst}件`);
     for (const row of s.byStatus) {
       console.log(`  ${row.action_type} ${row.status}${row.reason ? ` (${row.reason})` : ''}: ${row.n}件`);
@@ -111,8 +124,35 @@ try {
       console.log(`  ${r.action_type} ${r.status}${r.reason ? ` (${r.reason})` : ''}: ${r.n}件`);
     }
     console.log('※ vendor件数は「vendor --date ... --follow N --coupon N」で転記 (らくらくーぽん メール配信履歴画面)');
+  } else if (mode === 'cutover') {
+    const followRaw = getArg('--follow-at');
+    if (!followRaw) {
+      console.error('FATAL: cutover には --follow-at <ISO日時+オフセット> が必要 (例: 2026-09-02T23:59:59+09:00)');
+      process.exitCode = 2;
+      throw Object.assign(new Error('usage'), { silent: true });
+    }
+    const cutoverAt = parseCutoverArg(followRaw);
+    const couponCutoverAt = getArg('--coupon-at') ? parseCutoverArg(getArg('--coupon-at')) : cutoverAt;
+    const live = args.includes('--live');
+    const cur = getCutover(db);
+    const fmt = (iso) => `${iso} (JST ${new Date(Date.parse(iso) + 9 * 3600000).toISOString().slice(0, 19).replace('T', ' ')})`;
+    console.log(`[cutover] ${live ? '🔴 LIVE' : 'dry-run'} — 現在: ${cur.cutoverAt ? `LIVE 済み (follow=${cur.cutoverAt})` : 'shadow'}`);
+    console.log(`[cutover] フォロー境目: ${fmt(cutoverAt)} より後の最終発送 → self`);
+    console.log(`[cutover] クーポン境目: ${fmt(couponCutoverAt)} より後の最終発送 → self`);
+    const pv = cutoverPreview(db, { cutoverAt, couponCutoverAt });
+    console.log(`[cutover] 影響: shadow ownership 行 ${pv.shadowRows} 件を削除して再判定 / 発送済み contacts ${pv.shipped} 件のうち ` +
+      `フォロー self ${pv.followSelf} / クーポン self ${pv.couponSelf} / 両方 vendor ${pv.vendorBoth}`);
+    console.log(`[cutover] 切替後に自作の送信対象になる action (期限内): フォロー ready ${pv.followReady} + planned ${pv.followPlanned} / ` +
+      `クーポン ready ${pv.couponReady} + planned ${pv.couponPlanned}`);
+    if (!live) {
+      console.log('[cutover] dry-run のため何も変更していない。実行は --live を付ける (一度だけ・戻せない)');
+    } else {
+      const r = applyCutover(db, { cutoverAt, couponCutoverAt });
+      console.log(`[cutover] ✅ 適用: shadow 行削除 ${r.shadowDeleted} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
+      console.log('[cutover] 次の 12:05 (RakutenReviewMailSend) から自作が送信する。当月の月次クーポンが未発行なら manage-rakuten-review-coupon.js ensure-monthly --live を先に');
+    }
   } else {
-    console.error(`FATAL: unknown mode '${mode}' (plan / stats / vendor / report)`);
+    console.error(`FATAL: unknown mode '${mode}' (plan / stats / vendor / report / cutover)`);
     process.exitCode = 2;
   }
 } catch (e) {

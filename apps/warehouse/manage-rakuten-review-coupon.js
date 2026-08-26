@@ -14,6 +14,9 @@
  *   test-cycle                               テストクーポンで発行→検索確認→削除の疎通確認
  *                                            (開始3日後・issueCount 1・非公開。実発行するが即削除)
  *   status                                   台帳 (rakuten_campaign_coupons) の一覧
+ *   ensure-monthly [--live]                  PR-C5 定時用: 当月が未発行なら発行、JST 25日以降は翌月も発行
+ *                                            (翌月分は月初 00:00 開始で発行できる = 開始前URL配布を避ける)。
+ *                                            発行済みなら何もしない (exit 0)。pending 残留は exit 1 (人が解決)
  *
  * env: DATA_DIR (必須) / RAKUTEN_SERVICE_SECRET / RAKUTEN_LICENSE_KEY (API呼び出し時)
  * exit code: 0=成功 / 1=失敗 / 2=env・引数エラー
@@ -110,6 +113,77 @@ try {
         }
       }
     }
+  } else if (mode === 'ensure-monthly') {
+    // 定時運転 (12:05 の送信ジョブの先頭) から毎日呼ばれる。冪等: 台帳に issued があれば何もしない。
+    // 発行は issue-monthly と同じ at-most-once 契約 (予約→API 1回→確定/解放/pending 滞留)
+    const nowIso = new Date().toISOString();
+    const jst = new Date(Date.parse(nowIso) + 9 * 3600 * 1000);
+    const curMonth = jst.toISOString().slice(0, 7);
+    const nextMonth = new Date(Date.UTC(jst.getUTCFullYear(), jst.getUTCMonth() + 1, 1)).toISOString().slice(0, 7);
+    const targets = [curMonth];
+    if (jst.getUTCDate() >= 25) targets.push(nextMonth); // 月初の30日前以降なら翌月分を先行発行できる
+    let problem = false;
+    for (const month of targets) {
+      const existing = getRegisteredCoupon(db, month);
+      if (existing?.status === 'issued') {
+        // 発行済み行の健全性 (Codex C5-R1 Medium: sender は coupon_start/coupon_end/pc_get_url を
+        // fail-closed で見るため、台帳が壊れていると「発行済みなのに送れない」が静かに続く)
+        const bad = [];
+        if (!existing.pc_get_url) bad.push('pc_get_url なし');
+        if (!Number.isFinite(Date.parse(existing.coupon_start))) bad.push(`coupon_start 不正 (${existing.coupon_start})`);
+        if (!Number.isFinite(Date.parse(existing.coupon_end))) bad.push(`coupon_end 不正 (${existing.coupon_end})`);
+        if (bad.length) {
+          console.error(`[ensure] ⚠️${month}: 発行済みだが台帳が不完全 (${bad.join(' / ')})。sender はこの月のクーポンを使わない。RMS で確認して台帳を手動修正して`);
+          problem = true;
+        } else {
+          console.log(`[ensure] ${month}: 発行済み (code=${maskCode(existing.coupon_code)}、${existing.coupon_start}〜${existing.coupon_end})`);
+        }
+        continue;
+      }
+      if (existing?.status === 'pending') {
+        // dry-run は確認目的なので失敗扱いにしない (Codex C5-R1 Low)。--live では人の解決待ち=exit 1
+        console.error(`[ensure] ⚠️${month}: pending 残留 (前回の結果不明)。coupon.search で実発行有無を確認し台帳を手動解決して (note: ${existing.note || '-'})`);
+        if (hasFlag('--live')) problem = true;
+        continue;
+      }
+      const params = monthlyCouponParams(month, nowIso);
+      const built = buildIssueXml(params);
+      if (!built.ok) throw new Error(`パラメータ検証NG (${month}): ${built.errors.join(' / ')}`);
+      if (!hasFlag('--live')) { console.log(`[ensure] ${month}: 未発行 → dry-run (発行するには --live)。開始 ${params.couponStartDate} / 終了 ${params.couponEndDate}`); continue; }
+      if (!reserveMonth(db, { month, couponStart: params.couponStartDate, couponEnd: params.couponEndDate })) {
+        console.error(`[ensure] ⚠️${month}: 他プロセスが予約済み`); problem = true; continue;
+      }
+      let r;
+      try {
+        r = await issueCoupon(built.xml);
+      } catch (e) {
+        notePendingAmbiguous(db, month, `結果不明 (${String(e.message).slice(0, 120)})。coupon.search で確認要`);
+        console.error(`[ensure] ⚠️${month}: 発行結果が不明 (${e.message})。台帳は pending。自動再発行はしない`);
+        problem = true; continue;
+      }
+      const clearFailure = !r.ok && r.http >= 400 && r.http < 500 && (r.systemStatus === 'NG' || r.errors.length > 0);
+      if (r.ok && r.couponCode && r.pcGetUrl) {
+        let marked = false, markError = null;
+        try { marked = markIssued(db, { month, couponCode: r.couponCode, pcGetUrl: r.pcGetUrl }); } catch (e) { markError = e; }
+        if (!marked) {
+          const recovery = `発行成功済みだが台帳確定失敗${markError ? ` (${String(markError.message).slice(0, 80)})` : ''}。code=${r.couponCode} url=${r.pcGetUrl}`;
+          try { notePendingAmbiguous(db, month, recovery); }
+          catch { console.error(`[ensure] ⚠️台帳への復旧情報記録も失敗。手動控え用フル値: month=${month} code=${r.couponCode} url=${r.pcGetUrl}`); }
+          console.error(`[ensure] ⚠️${month}: 発行は成功したが台帳確定に失敗。台帳 note を見て手動修正して`);
+          problem = true; continue;
+        }
+        console.log(`[ensure] ✅${month}: 発行成功 code=${maskCode(r.couponCode)} 期間 ${params.couponStartDate}〜${params.couponEndDate}`);
+      } else if (clearFailure) {
+        releaseReservation(db, month);
+        console.error(`[ensure] ⚠️${month}: 発行失敗 (未発行確定・予約解放): HTTP ${r.http} / ${r.errors.map((e) => `${e.code}:${e.message}`).join(', ') || r.message}`);
+        problem = true;
+      } else {
+        notePendingAmbiguous(db, month, `結果不明 (HTTP ${r.http} ${r.message || ''} code=${r.couponCode || '-'})。coupon.search で確認要`);
+        console.error(`[ensure] ⚠️${month}: 発行結果が不明 (HTTP ${r.http})。台帳は pending。人が確認するまで自動再発行しない`);
+        problem = true;
+      }
+    }
+    if (problem) { process.exitCode = 1; }
   } else if (mode === 'test-cycle') {
     // 開始3日後 (編集不可制約=開始60分前を回避)・issueCount 1・非公開。発行→検索→削除
     const jstNow = new Date(Date.now() + 9 * 3600 * 1000);
@@ -167,7 +241,7 @@ try {
       console.log(`${r.month}: [${r.status}] code=${maskCode(r.coupon_code)} 期間=${r.coupon_start}〜${r.coupon_end} 発行=${r.issued_at || '-'}${r.note ? ` ⚠️${r.note}` : ''}`);
     }
   } else {
-    console.error(`FATAL: unknown mode '${mode ?? '(なし)'}' (issue-monthly / test-cycle / status)`);
+    console.error(`FATAL: unknown mode '${mode ?? '(なし)'}' (issue-monthly / ensure-monthly / test-cycle / status)`);
     process.exitCode = 2;
   }
 } catch (e) {

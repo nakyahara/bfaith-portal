@@ -154,6 +154,14 @@ export function ensureCampaignTables(db) {
     reason       TEXT,
     decided_at   TEXT NOT NULL
   )`);
+  // PR-C5: クーポンの担当者はフォローと別に持つ (らくらくーぽんのクーポンメールは 2026年7月末から
+  // 故障しており、フォローより早い境目で自作が引き取る)。NULL = owner (フォロー) と同じ扱い。
+  // 既存DBへは ALTER で後付け (CREATE IF NOT EXISTS は既存テーブルに列を足さない)
+  const ownCols = db.prepare(`PRAGMA table_info(rakuten_order_campaign_ownership)`).all().map((c) => c.name);
+  if (!ownCols.includes('coupon_owner')) {
+    db.exec(`ALTER TABLE rakuten_order_campaign_ownership
+               ADD COLUMN coupon_owner TEXT CHECK (coupon_owner IN ('vendor','self','none'))`);
+  }
 
   db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_meta (
     key   TEXT PRIMARY KEY,
@@ -453,7 +461,7 @@ export function planCampaigns(db, opts = {}) {
     // INSERT OR IGNORE のため一度決めた owner は覆らない (境界注文は vendor のまま =
     // 重複より取りこぼしを選ぶ)。PR-C4 の送信ゲートは「ownership 行が無い or owner != 'self'
     // = 送らない (fail-closed)」とすること。cutover_at は PR-C5 の cutover 手順だけが設定する
-    const cutoverAt = db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'cutover_at'`).get()?.value || null;
+    const { cutoverAt, couponCutoverAt } = getCutover(db);
     if (!cutoverAt) {
       const r1 = db.prepare(`
         INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
@@ -466,10 +474,13 @@ export function planCampaigns(db, opts = {}) {
       counts.ownershipInserted = r1.changes + r2.changes;
     } else {
       // shipping_datetime は '+09:00' 表記、cutover_at は UTC ISO のため文字列比較不可 → epoch 比較
+      // PR-C5: フォローは cutover_at、クーポンは coupon_cutover_at (未設定なら cutover_at) で
+      // それぞれ「最終発送がその後なら self」。どちらも INSERT OR IGNORE = 一度決めたら覆らない
       const cutT = Date.parse(cutoverAt);
+      const cpnT = Date.parse(couponCutoverAt);
       const ownStmt = db.prepare(`
-        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-        VALUES (?, ?, ?, ?)
+        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, coupon_owner, reason, decided_at)
+        VALUES (?, ?, ?, ?, ?)
       `);
       const shipped = db.prepare(`
         SELECT order_number, shipping_datetime FROM rakuten_order_contacts WHERE shipping_datetime IS NOT NULL
@@ -478,7 +489,7 @@ export function planCampaigns(db, opts = {}) {
         const t = Date.parse(c.shipping_datetime);
         if (!Number.isFinite(t)) continue;
         counts.ownershipInserted += ownStmt.run(
-          c.order_number, t > cutT ? 'self' : 'vendor', 'cutover_shipping', now).changes;
+          c.order_number, t > cutT ? 'self' : 'vendor', t > cpnT ? 'self' : 'vendor', 'cutover_shipping', now).changes;
       }
       // action があるのに contacts が無い注文 (no_contact 経路の古い注文) は安全側で vendor
       const orphans = db.prepare(`
@@ -487,12 +498,109 @@ export function planCampaigns(db, opts = {}) {
          WHERE c.order_number IS NULL
       `).all();
       for (const o of orphans) {
-        counts.ownershipInserted += ownStmt.run(o.order_number, 'vendor', 'cutover_no_contact', now).changes;
+        counts.ownershipInserted += ownStmt.run(o.order_number, 'vendor', 'vendor', 'cutover_no_contact', now).changes;
       }
     }
   });
   tx();
   return counts;
+}
+
+// ─── PR-C5: cutover (shadow → LIVE を一度だけ) ───
+/** meta の cutover 時刻。coupon_cutover_at 未設定時はフォローと同じ境目 */
+export function getCutover(db) {
+  const get = (k) => db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = ?`).get(k)?.value || null;
+  const cutoverAt = get('cutover_at');
+  const couponCutoverAt = get('coupon_cutover_at') || cutoverAt;
+  return { cutoverAt, couponCutoverAt };
+}
+
+/** オフセット付き ISO 日時 → UTC ISO。オフセット無し (naive) は JST か UTC か曖昧なので拒否 */
+export function parseCutoverArg(s) {
+  const str = String(s || '').trim();
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:\d{2})$/.exec(str);
+  if (!m) {
+    throw new Error(`CUTOVER: 日時は 'YYYY-MM-DDTHH:MM:SS+09:00' 形式 (オフセット必須) で指定 (${str || '(空)'})`);
+  }
+  // 存在しない暦日・時刻 (02-30 / 24:00 / 23:60) は Date.parse が翌日等へ正規化し得る
+  // (Codex C5-R2 High: cutover は覆せないので境目が数日ずれると二重送信/取りこぼし)。
+  // Date.UTC で組み立てて各要素が round-trip するかで実在を確認する
+  const [Y, Mo, D, h, mi, sec] = [m[1], m[2], m[3], m[4], m[5], m[6] || '00'].map(Number);
+  const wall = new Date(Date.UTC(Y, Mo - 1, D, h, mi, sec));
+  const roundTrip = wall.getUTCFullYear() === Y && wall.getUTCMonth() === Mo - 1 && wall.getUTCDate() === D
+    && wall.getUTCHours() === h && wall.getUTCMinutes() === mi && wall.getUTCSeconds() === sec;
+  if (!roundTrip) throw new Error(`CUTOVER: 実在しない日時 (${str})`);
+  let offsetMin = 0;
+  if (m[7] !== 'Z') {
+    const [, sign, oh, om] = /^([+-])(\d{2}):(\d{2})$/.exec(m[7]);
+    if (Number(oh) > 23 || Number(om) > 59) throw new Error(`CUTOVER: オフセットが不正 (${str})`);
+    offsetMin = (sign === '-' ? -1 : 1) * (Number(oh) * 60 + Number(om));
+  }
+  return new Date(wall.getTime() - offsetMin * 60000).toISOString();
+}
+
+/**
+ * cutover の影響を数える (読み取りのみ)。dry-run 表示と live 前の確認に共用。
+ * 「self になる注文」= contacts で最終発送が境目より後。件数のみ (PII なし)
+ */
+export function cutoverPreview(db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
+  const cutT = Date.parse(cutoverAt), cpnT = Date.parse(couponCutoverAt);
+  const shadowRows = db.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).get().n;
+  const shipped = db.prepare(`SELECT order_number, shipping_datetime FROM rakuten_order_contacts WHERE shipping_datetime IS NOT NULL`).all();
+  let followSelf = 0, couponSelf = 0, vendorBoth = 0;
+  const followSelfSet = new Set(), couponSelfSet = new Set();
+  for (const c of shipped) {
+    const t = Date.parse(c.shipping_datetime);
+    if (!Number.isFinite(t)) continue;
+    const fs = t > cutT, cs = t > cpnT;
+    if (fs) { followSelf++; followSelfSet.add(c.order_number); }
+    if (cs) { couponSelf++; couponSelfSet.add(c.order_number); }
+    if (!fs && !cs) vendorBoth++;
+  }
+  // 今すぐ (cutover 直後の次の送信) 対象になり得る action: ready/planned・期限内・self 側
+  const live = db.prepare(`
+    SELECT action_type, order_number, status FROM rakuten_campaign_actions
+     WHERE status IN ('ready','planned') AND expires_at > ?
+  `).all(nowIso);
+  let followReady = 0, followPlanned = 0, couponReady = 0, couponPlanned = 0;
+  for (const a of live) {
+    if (a.action_type === 'follow' && followSelfSet.has(a.order_number)) { if (a.status === 'ready') followReady++; else followPlanned++; }
+    if (a.action_type === 'coupon' && couponSelfSet.has(a.order_number)) { if (a.status === 'ready') couponReady++; else couponPlanned++; }
+  }
+  return { shadowRows, shipped: shipped.length, followSelf, couponSelf, vendorBoth, followReady, followPlanned, couponReady, couponPlanned };
+}
+
+/**
+ * cutover 本体 (一度だけ)。単一トランザクションで
+ *   ① meta に cutover_at / coupon_cutover_at を記録 (既に設定済みなら拒否 = 二度目は手動SQLの領域)
+ *   ② shadow 期の ownership 行 (reason='shadow'、全件 vendor) を削除 → 直後の planCampaigns が
+ *      cutover ルールで再判定する (INSERT OR IGNORE のため削除しないと永久に vendor のまま)
+ *   ③ planCampaigns を同一 tx 内で実行して ownership を埋め直す
+ * vendor が送信済みの action の取消はしない: 境目より前に発送した注文は ownership=vendor に
+ * なるため送信ゲートで構造的に止まり、期限で expired になる (重複より取りこぼしを選ぶ)
+ */
+export function applyCutover(db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
+  const tx = db.transaction(() => {
+    const cur = getCutover(db);
+    if (cur.cutoverAt) throw new Error(`CUTOVER: 既に cutover_at=${cur.cutoverAt} が設定済み。やり直しは rakuten_campaign_meta を手で直してから`);
+    // 未来の境目は拒否 (Codex C5-R1 High: ownership は INSERT OR IGNORE で一度決めたら覆らない。
+    // 境目到達前に発送→vendor 確定した注文が、境目後の再発送で最終発送日が動いても vendor のまま
+    // 取りこぼす)。境目を過ぎてから実行する = 「その時点までの発送は全部 vendor」で矛盾が出ない。
+    // 60日より前は指定ミスとみなす (両方の境目)
+    const nowT = Date.parse(nowIso);
+    if (Date.parse(cutoverAt) > nowT) throw new Error('CUTOVER: cutover_at は現在時刻以前を指定 (境目を過ぎてから実行する。未来の先取りは不可)');
+    if (Date.parse(cutoverAt) < nowT - 60 * DAY_MS) throw new Error('CUTOVER: cutover_at が60日以上前 (指定ミス?)');
+    if (Date.parse(couponCutoverAt) < nowT - 60 * DAY_MS) throw new Error('CUTOVER: coupon_cutover_at が60日以上前 (指定ミス? 規約上21日より前の発送には送れない)');
+    if (Date.parse(couponCutoverAt) > Date.parse(cutoverAt)) throw new Error('CUTOVER: coupon_cutover_at はフォローの境目以前であること (クーポンは早く引き取る側)');
+    const ins = db.prepare(`INSERT INTO rakuten_campaign_meta (key, value) VALUES (?, ?)`);
+    ins.run('cutover_at', cutoverAt);
+    ins.run('coupon_cutover_at', couponCutoverAt);
+    ins.run('cutover_applied_at', nowIso);
+    const del = db.prepare(`DELETE FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).run();
+    const counts = planCampaigns(db, { nowIso });
+    return { shadowDeleted: del.changes, ...counts };
+  });
+  return tx.immediate();
 }
 
 // ─── PR-C2: vendor 実績記録と shadow 突合 ───
