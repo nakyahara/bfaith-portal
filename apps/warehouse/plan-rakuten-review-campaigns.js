@@ -13,6 +13,10 @@
  *            例: vendor --date 2026-07-18 --follow 512 --coupon 14
  *   report   shadow 突合レポート (--days 14 既定 / --from --to 指定可)
  *   cutover  shadow → LIVE の切替 (PR-C5、一度だけ)。既定は dry-run (影響件数の表示のみ)
+ *            段階1 (クーポン先行): cutover --coupon-only --coupon-at 2026-07-25T00:00:00+09:00 [--live]
+ *              フォローは vendor のまま、クーポンメールだけ自作が送り始める (vendor のクーポン経路が故障中のため)
+ *            段階2 (フォロー切替、解約後): cutover --follow-at 2026-09-02T23:59:59+09:00 [--live]
+ *              段階1済みなら --coupon-at は省略 (確定済みの値を引き継ぐ)
  *            例: cutover --follow-at 2026-09-02T23:59:59+09:00 --coupon-at 2026-07-25T00:00:00+09:00 [--live]
  *              --follow-at : この時刻より後に最終発送された注文のフォローメールを自作が送る
  *                            (らくらくーぽん最終稼働日の10日前 23:59:59 = 空白も二重送信も出ない境目)
@@ -32,7 +36,7 @@ import Database from 'better-sqlite3';
 import {
   ensureCampaignTables, planCampaigns, campaignStats,
   recordVendorDailyBatch, shadowComparisonReport, jstDateOf, REPORT_MAX_DAYS,
-  getCutover, parseCutoverArg, cutoverPreview, applyCutover,
+  getCutover, parseCutoverArg, cutoverPreview, applyCutover, applyCouponCutover,
 } from './rakuten-review-campaign-lib.js';
 import { ensureContactTables } from './rakuten-review-contacts-lib.js';
 import { ensureRakutenReviewTables } from './rakuten-review-lib.js';
@@ -60,7 +64,7 @@ ensureCampaignTables(db);
 try {
   if (mode === 'plan') {
     const c = planCampaigns(db);
-    const phase = getCutover(db).cutoverAt ? 'LIVE' : 'shadow';
+    const phase = { live: 'LIVE', coupon_only: 'クーポン先行LIVE/フォローshadow', shadow: 'shadow' }[getCutover(db).stage];
     console.log(`[campaign] plan完了 (${phase}): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
       `ready昇格 ${c.promotedReady} / 抑止 ${c.suppressed} / 期限切れ ${c.expired} / 取消 ${c.cancelled} / ` +
       `再スケジュール ${c.rescheduled} / ownership追加 ${c.ownershipInserted}`);
@@ -68,7 +72,8 @@ try {
     const s = campaignStats(db);
     const cut = getCutover(db);
     console.log(`coupon_epoch: ${s.epoch || '(未設定=plan未実行)'}`);
-    console.log(`cutover: ${cut.cutoverAt ? `LIVE (follow=${cut.cutoverAt} / coupon=${cut.couponCutoverAt})` : 'shadow (未実施)'}`);
+    console.log(`cutover: ${cut.stage === 'live' ? `LIVE (follow=${cut.cutoverAt} / coupon=${cut.couponCutoverAt})`
+      : cut.stage === 'coupon_only' ? `段階1=クーポン先行 (coupon=${cut.couponCutoverAt} / フォローは shadow)` : 'shadow (未実施)'}`);
     console.log(`予定超過で待機中 (planned): ${s.dueOverdue}件 / 今後24時間の送信予定 (planned): ${s.dueNext24h}件 / 本日(JST) ready昇格: ${s.readyTodayJst}件`);
     for (const row of s.byStatus) {
       console.log(`  ${row.action_type} ${row.status}${row.reason ? ` (${row.reason})` : ''}: ${row.n}件`);
@@ -125,30 +130,37 @@ try {
     }
     console.log('※ vendor件数は「vendor --date ... --follow N --coupon N」で転記 (らくらくーぽん メール配信履歴画面)');
   } else if (mode === 'cutover') {
-    const followRaw = getArg('--follow-at');
-    if (!followRaw) {
-      console.error('FATAL: cutover には --follow-at <ISO日時+オフセット> が必要 (例: 2026-09-02T23:59:59+09:00)');
-      process.exitCode = 2;
-      throw Object.assign(new Error('usage'), { silent: true });
-    }
-    const cutoverAt = parseCutoverArg(followRaw);
-    const couponCutoverAt = getArg('--coupon-at') ? parseCutoverArg(getArg('--coupon-at')) : cutoverAt;
+    const couponOnly = args.includes('--coupon-only');
     const live = args.includes('--live');
     const cur = getCutover(db);
     const fmt = (iso) => `${iso} (JST ${new Date(Date.parse(iso) + 9 * 3600000).toISOString().slice(0, 19).replace('T', ' ')})`;
-    console.log(`[cutover] ${live ? '🔴 LIVE' : 'dry-run'} — 現在: ${cur.cutoverAt ? `LIVE 済み (follow=${cur.cutoverAt})` : 'shadow'}`);
-    console.log(`[cutover] フォロー境目: ${fmt(cutoverAt)} より後の最終発送 → self`);
+    const usage = (msg) => { console.error(`FATAL: ${msg}`); process.exitCode = 2; throw Object.assign(new Error('usage'), { silent: true }); };
+    const stageLabel = cur.stage === 'live' ? `LIVE 済み (follow=${cur.cutoverAt})`
+      : cur.stage === 'coupon_only' ? `段階1 (クーポン先行、coupon=${cur.couponCutoverAt})` : 'shadow';
+    let cutoverAt, couponCutoverAt;
+    if (couponOnly) {
+      if (getArg('--follow-at')) usage('--coupon-only と --follow-at は同時に指定できない');
+      if (!getArg('--coupon-at')) usage('cutover --coupon-only には --coupon-at <ISO日時+オフセット> が必要 (例: 2026-07-25T00:00:00+09:00)');
+      couponCutoverAt = parseCutoverArg(getArg('--coupon-at'));
+      cutoverAt = null;
+    } else {
+      if (!getArg('--follow-at')) usage('cutover には --follow-at <ISO日時+オフセット> が必要 (例: 2026-09-02T23:59:59+09:00)。クーポンだけ先行するなら --coupon-only --coupon-at');
+      cutoverAt = parseCutoverArg(getArg('--follow-at'));
+      couponCutoverAt = getArg('--coupon-at') ? parseCutoverArg(getArg('--coupon-at')) : (cur.couponCutoverAt || cutoverAt);
+    }
+    console.log(`[cutover] ${live ? '🔴 LIVE' : 'dry-run'} ${couponOnly ? '(段階1: クーポンのみ)' : '(フォロー+クーポン)'} — 現在: ${stageLabel}`);
+    console.log(`[cutover] フォロー境目: ${cutoverAt ? `${fmt(cutoverAt)} より後の最終発送 → self` : '(変更なし = vendor のまま)'}`);
     console.log(`[cutover] クーポン境目: ${fmt(couponCutoverAt)} より後の最終発送 → self`);
-    const pv = cutoverPreview(db, { cutoverAt, couponCutoverAt });
-    console.log(`[cutover] 影響: shadow ownership 行 ${pv.shadowRows} 件を削除して再判定 / 発送済み contacts ${pv.shipped} 件のうち ` +
+    const pv = cutoverPreview(db, { cutoverAt: cutoverAt || '9999-12-31T00:00:00.000Z', couponCutoverAt });
+    console.log(`[cutover] 影響: 再判定対象の ownership 行 ${pv.shadowRows} 件 / 発送済み contacts ${pv.shipped} 件のうち ` +
       `フォロー self ${pv.followSelf} / クーポン self ${pv.couponSelf} / 両方 vendor ${pv.vendorBoth}`);
     console.log(`[cutover] 切替後に自作の送信対象になる action (期限内): フォロー ready ${pv.followReady} + planned ${pv.followPlanned} / ` +
       `クーポン ready ${pv.couponReady} + planned ${pv.couponPlanned}`);
     if (!live) {
       console.log('[cutover] dry-run のため何も変更していない。実行は --live を付ける (一度だけ・戻せない)');
     } else {
-      const r = applyCutover(db, { cutoverAt, couponCutoverAt });
-      console.log(`[cutover] ✅ 適用: shadow 行削除 ${r.shadowDeleted} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
+      const r = couponOnly ? applyCouponCutover(db, { couponCutoverAt }) : applyCutover(db, { cutoverAt, couponCutoverAt });
+      console.log(`[cutover] ✅ 適用: 旧 ownership 行削除 ${r.shadowDeleted} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
       console.log('[cutover] 次の 12:05 (RakutenReviewMailSend) から自作が送信する。当月の月次クーポンが未発行なら manage-rakuten-review-coupon.js ensure-monthly --live を先に');
     }
   } else {

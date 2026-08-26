@@ -13,7 +13,7 @@ import {
   ensureCampaignTables, planCampaigns, campaignStats, dedupeKeyFor,
   jstDateOf, jstNoonUtcIso, nextNoonJstAfter, followScheduleFor, postedAtToUtcIso,
   recordVendorDaily, recordVendorDailyBatch, shadowComparisonReport, isValidJstDate,
-  getCutover, parseCutoverArg, cutoverPreview, applyCutover,
+  getCutover, parseCutoverArg, cutoverPreview, applyCutover, applyCouponCutover,
 } from './rakuten-review-campaign-lib.js';
 import {
   ensureContactTables, loadContactKeys, encryptEmail, hmacEmail, hmacOrderKey,
@@ -558,6 +558,69 @@ console.log('=== 11. PR-C5: cutover (shadow → LIVE、フォロー/クーポン
   planCampaigns(db3, { nowIso: '2026-09-15T01:00:00.000Z' });
   check('contacts の無い注文は両方 vendor (cutover_no_contact)', own('ORPHAN-1').owner === 'vendor' && own('ORPHAN-1').coupon_owner === 'vendor');
   db3.close();
+}
+
+console.log('=== 12. PR-C5b: 段階1 (クーポン先行) → 段階2 (フォロー切替) ===');
+{
+  const db5 = new Database(path.join(tmp, 'w5.db'));
+  db5.pragma('foreign_keys = ON');
+  ensureRakutenReviewTables(db5); ensureContactTables(db5); ensureCampaignTables(db5);
+  let seq5 = 0;
+  const mk = (shippingIso) => {
+    const orderNumber = `373343-20260810-${String(++seq5).padStart(10, '0')}`;
+    upsertContacts(db5, [{
+      order_number: orderNumber, order_key_hmac: hmacOrderKey(orderNumber, keys),
+      masked_email_enc: encryptEmail('u@anshin.rakuten.co.jp', keys, orderNumber), masked_email_hash: hmacEmail('u@anshin.rakuten.co.jp', keys),
+      order_datetime: '2026-08-10T10:00:00+09:00', shipping_datetime: shippingIso, order_progress: 700,
+      contact_delete_at: '2099-01-01T00:00:00.000Z',
+    }]);
+    return orderNumber;
+  };
+  const own = (o) => db5.prepare(`SELECT owner, coupon_owner, reason FROM rakuten_order_campaign_ownership WHERE order_number = ?`).get(o);
+  const oOld = mk('2026-07-20T12:00:00+09:00');
+  const oAug = mk('2026-08-20T12:00:00+09:00');
+  planCampaigns(db5, { nowIso: '2026-08-26T00:00:00.000Z', couponEpochOverride: '2026-07-17T00:00:00.000Z' });
+  insertReview(db5, { orderNumber: oAug, firstSeenAt: '2026-08-26T00:30:00.000Z', postedAt: '2026-08-25 20:00:00' });
+  planCampaigns(db5, { nowIso: '2026-08-26T01:00:00.000Z' });
+  check('段階0: shadow', getCutover(db5).stage === 'shadow' && own(oAug).reason === 'shadow');
+
+  const NOW1 = '2026-08-26T08:00:00.000Z'; // 8/26 17:00 JST
+  const cpn = parseCutoverArg('2026-07-25T00:00:00+09:00');
+  let futureRej = false;
+  try { applyCouponCutover(db5, { couponCutoverAt: parseCutoverArg('2026-08-27T00:00:00+09:00'), nowIso: NOW1 }); } catch { futureRej = true; }
+  check('段階1: 未来の境目は拒否', futureRej && getCutover(db5).stage === 'shadow');
+  const r1 = applyCouponCutover(db5, { couponCutoverAt: cpn, nowIso: NOW1 });
+  const cut1 = getCutover(db5);
+  check('段階1: coupon_cutover_at だけ設定・stage=coupon_only', cut1.stage === 'coupon_only' && cut1.cutoverAt === null && cut1.couponCutoverAt === cpn
+    && r1.shadowDeleted === 2, JSON.stringify({ cut1, r1 }));
+  check('段階1: 8/20発送 = フォロー vendor / クーポン self (reason=coupon_cutover)',
+    own(oAug).owner === 'vendor' && own(oAug).coupon_owner === 'self' && own(oAug).reason === 'coupon_cutover');
+  check('段階1: 7/20発送 = 両方 vendor', own(oOld).owner === 'vendor' && own(oOld).coupon_owner === 'vendor');
+  let twice1 = false;
+  try { applyCouponCutover(db5, { couponCutoverAt: cpn, nowIso: NOW1 }); } catch { twice1 = true; }
+  check('段階1: 二度目は拒否', twice1);
+  // 段階1 の後に発送された注文も plan で同じルール
+  const oSep = mk('2026-09-05T12:00:00+09:00');
+  planCampaigns(db5, { nowIso: '2026-09-06T00:00:00.000Z' });
+  check('段階1中の新規発送: フォロー vendor / クーポン self', own(oSep).owner === 'vendor' && own(oSep).coupon_owner === 'self' && own(oSep).reason === 'coupon_cutover');
+  // クーポン action は段階1で送信対象になり得る (ownership 上)。フォローは vendor で止まる (sender 側テストで確認済み)
+
+  // 段階2: フォロー切替。coupon-at を違う値で指定すると拒否、省略で引き継ぎ
+  const NOW2 = '2026-09-13T03:00:00.000Z';
+  const fol = parseCutoverArg('2026-09-02T23:59:59+09:00');
+  let diffRej = false;
+  try { applyCutover(db5, { cutoverAt: fol, couponCutoverAt: parseCutoverArg('2026-08-01T00:00:00+09:00'), nowIso: NOW2 }); } catch { diffRej = true; }
+  check('段階2: 段階1と違う coupon 境目は拒否', diffRej && getCutover(db5).stage === 'coupon_only');
+  const r2 = applyCutover(db5, { cutoverAt: fol, couponCutoverAt: null, nowIso: NOW2 });
+  const cut2 = getCutover(db5);
+  check('段階2: LIVE・coupon 境目は段階1の値を引き継ぐ・段階1の行を全部再判定',
+    cut2.stage === 'live' && cut2.cutoverAt === fol && cut2.couponCutoverAt === cpn && r2.shadowDeleted === 3, JSON.stringify({ cut2, r2 }));
+  check('段階2: 9/5発送 = フォロー self / クーポン self (reason=cutover_shipping)',
+    own(oSep).owner === 'self' && own(oSep).coupon_owner === 'self' && own(oSep).reason === 'cutover_shipping');
+  check('段階2: 8/20発送 = フォロー vendor / クーポン self のまま', own(oAug).owner === 'vendor' && own(oAug).coupon_owner === 'self');
+  check('段階2後: 段階1/shadow の行は残らない',
+    db5.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason IN ('shadow','coupon_cutover','coupon_cutover_no_contact')`).get().n === 0);
+  db5.close();
 }
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
