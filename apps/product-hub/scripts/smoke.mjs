@@ -2224,7 +2224,8 @@ let wfDraftId = null;
 
   // 画像トラックを全部完了にすると理由が消える (他の理由は残ってよい)
   for (const s of wfp.progressOf(idGate, { db }).image) {
-    if (s.state !== 'done') wfp.setStepState(idGate, s.step_code, { state: 'done' }, 'admin', ADMIN);
+    // ⑧ 楽天登録は出品なしに done にできない → 対象外で決着させる
+    if (s.state !== 'done') wfp.setStepState(idGate, s.step_code, { state: s.step_code === 'imgd_rakuten' ? 'skip' : 'done' }, 'admin', ADMIN);
   }
   check('画像承認まで終われば画像の理由は消える',
     !(listing.buildItemPayload(db, idGate).reasons || []).some((x) => /画像トラック/.test(x)));
@@ -2968,6 +2969,16 @@ let wfSetParentId = null;
     check('v2: ⑥ 両方 done で出品ゲートが開く (⑦⑧⑨ は前提にしない)', wfpEarly.imageTrackBlockReason(db, idV2) === null, wfpEarly.imageTrackBlockReason(db, idV2));
     const pV2b = wfpEarly.progressOf(idV2, { db });
     check('v2: gateDone は true・done (全工程) は false (⑦⑧⑨ が残る)', pV2b.imageDetail.gateDone === true && pV2b.imageDetail.done === false);
+    // ⑧ 楽天登録は人が done にできない (admin でも)。出品の根拠があれば可・system は可
+    let rkErr = null;
+    try { wfpEarly.setStepState(idV2, 'imgd_rakuten', { state: 'done' }, 'smoke', ADMIN2); } catch (e) { rkErr = e; }
+    check('v2: ⑧ 楽天登録は出品なしに done にできない (admin でも)', rkErr?.status === 400 && /自動で完了/.test(rkErr.message), rkErr?.message);
+    let rkMove = null;
+    try { wfpEarly.moveBoardCard(idV2, { view: 'image', kind: 'detail', to: 'done', expectedCurrent: 'imgd_amazon' }, 'smoke', ADMIN2); } catch (e) { rkMove = e; }
+    check('v2: 完了列への D&D も ⑧で止まる (途中の ⑦ もロールバック)', !!rkMove && stV2('imgd_amazon') === 'todo', rkMove?.message);
+    check('v2: ⑧ は「対象外」にはできる', wfpEarly.setStepState(idV2, 'imgd_rakuten', { state: 'skip' }, 'smoke', ADMIN2).changed === true);
+    wfpEarly.setStepState(idV2, 'imgd_rakuten', { state: 'todo' }, 'smoke', ADMIN2);
+    check('v2: 出品処理 (systemActor) なら ⑧ done', wfpEarly.setStepState(idV2, 'imgd_rakuten', { state: 'done' }, 'system', { isAdmin: true, systemActor: true }).changed === true);
     // カード情報
     const cardV2 = [...wfpEarly.boardData(db, { view: 'image', imageKind: 'detail' }).columns.flatMap((c) => c.cards)].find((c) => c.id === idV2);
     check('v2: 詳細カードに 撮影・素材 / 商品情報あり が乗る',
@@ -3012,7 +3023,19 @@ let wfSetParentId = null;
     check('v2 移行: 旧 未着手は全部 todo', stM(idM5, 'imgd_request') === 'todo');
     check('v2 移行: イベントに元工程を記録',
       db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_track_v2_migrated' AND detail LIKE '%img_approve_detail=done%'").get(idM3).c === 1);
-    check('v2 移行: 二度目は走らない', dbmod.migrateDetailTrackV2(db).skipped === true);
+    check('v2 移行: 二度目は写す商品が無い (ドラフト単位で冪等)', dbmod.migrateDetailTrackV2(db).skipped === true);
+    // 途中デプロイ等で写し損ねた商品 (旧行あり・移行イベント無し) は次回起動で拾う。v2 行が todo で先にあっても done に揃える
+    const idM6 = mk('DRV-M-LATE', false); insV1.run(idM6, 'img_request_detail', 'done'); insV1.run(idM6, 'img_production_detail', 'done');
+    insV1.run(idM6, 'imgd_request', 'todo');
+    const mig2 = dbmod.migrateDetailTrackV2(db);
+    check('v2 移行: 写し損ねた商品を後から拾い、todo の v2 行も期待状態へ揃える',
+      mig2.migrated === 1 && stM(idM6, 'imgd_request') === 'done' && stM(idM6, 'imgd_ai') === 'done' && stM(idM6, 'imgd_design') === 'todo', JSON.stringify(mig2));
+    // 楽天登録済みの根拠は registered_at 以外 (status listed / モール別状況) でも拾う
+    const idM7 = mk('DRV-M-LISTED', false); insV1.run(idM7, 'img_request_detail', 'done');
+    db.prepare("UPDATE product_drafts SET status = 'listed' WHERE id = ?").run(idM7);
+    dbmod.migrateDetailTrackV2(db);
+    check('v2 移行: status=listed も楽天登録済みとみなして全部 done', stM(idM7, 'imgd_aplus') === 'done');
+    db.prepare('DELETE FROM product_drafts WHERE id IN (?, ?)').run(idM6, idM7);
     check('v2 移行: 旧詳細工程は active=0',
       db.prepare(`SELECT COUNT(*) c FROM ph_steps WHERE code IN ('img_shoot_detail','img_request_detail') AND active = 1`).get().c === 0);
     for (const id of [idV2, idV2Rk, idM1, idM2, idM3, idM4, idM5]) db.prepare('DELETE FROM product_drafts WHERE id = ?').run(id);

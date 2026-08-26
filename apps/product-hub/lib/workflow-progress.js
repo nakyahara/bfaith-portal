@@ -624,7 +624,7 @@ export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = fa
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -682,6 +682,15 @@ export function setStepState(
         throw badRequest(`完了にはまだ足りません: ${reasons.join(' / ')}`);
       }
     }
+    // ⑧ 楽天登録 = 出品成功で自動完了する工程。人が (admin でも) 出品なしに done にできない (Codex R2 high)。
+    // 例外 = 楽天登録の根拠 (アプリ経由の登録記録 / モール別状況の楽天 done) がある商品 (アプリ以前に手で出した商品)
+    if (state === 'done' && code === 'imgd_rakuten' && !systemActor) {
+      const evidence = db.prepare(`
+        SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
+           OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
+      `).get({ id });
+      if (!evidence) throw badRequest('「楽天登録」は楽天に出品すると自動で完了します (このアプリから出品するか、モール別の展開状況で楽天を完了にしてください。出さない商品は「対象外」)');
+    }
     // 画像工程 v2 の完了条件 (2026-08-26)
     // ①③ の材料チェックは自社商品だけ (撮影・素材/商品情報は自社商品の画像制作カードでしか入力できない。
     // 仕入商品で詳細を作る場合は工程だけ進める)。⑥の順序は全商品
@@ -694,8 +703,9 @@ export function setStepState(
         // ① = 撮影要否の判断 + 商品情報 (1.5)。商品情報は v2 切替後に作られた商品だけ必須 (移行データは例外 — 中原さん決定 7)
         if (!ip.material_status) throw badRequest('完了にはまだ足りません: 撮影・素材ステータス (撮影不要/未発送/…) を設定してください');
         const v2At = imageTrackV2At(db);
-        const created = db.prepare('SELECT created_at FROM product_drafts WHERE id = ?').get(id)?.created_at || '';
-        if (v2At && created > v2At && !String(ip.product_info_text || '').trim()) {
+        const d = db.prepare('SELECT created_at, source FROM product_drafts WHERE id = ?').get(id) || {};
+        // 取り込み由来 (Notion 画像DB・商品マスター) は「移行データ」なので必須にしない (中原さん決定 7)
+        if (v2At && (d.created_at || '') > v2At && d.source !== 'notion_import' && !String(ip.product_info_text || '').trim()) {
           throw badRequest('完了にはまだ足りません: 商品情報 (Amazon やパッケージを見て手入力) を入れてください');
         }
       }

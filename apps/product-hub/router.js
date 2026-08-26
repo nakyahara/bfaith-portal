@@ -714,9 +714,25 @@ router.post('/api/drafts/:id/yahoo', (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * 画像制作情報 (撮影・素材/商品情報/Canva 等) を触れる人 = admin か、画像系の役割 (画像登録者・画像作成承認者) を持つ担当者。
+ * ①③ の完了ゲートを左右する値なので、工程と同じく誰でもは書けない (Codex R2 medium)
+ */
+function canEditImageProduction(req) {
+  if (req.session?.role === 'admin') return true;
+  const me = staffByPortalEmail(req.session?.email);
+  if (!me) return false;
+  return !!getDB().prepare(`
+    SELECT 1 FROM ph_staff_roles WHERE staff_id = ? AND role_code IN ('image', 'image_approver')
+  `).get(me.id);
+}
+
 router.post('/api/drafts/:id/image-production', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '画像制作情報を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)' });
+  }
   if (!draft.own_brand) {
     return res.status(400).json({ ok: false, error: '画像制作情報は自社商品のみ登録できます (基本情報で「自社商品」をONにしてください)' });
   }
@@ -778,6 +794,9 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   // 画像制作情報 (image-production) と同じく自社商品だけ (Codex R2 medium)
   if (!draft.own_brand) {
     return res.status(400).json({ ok: false, error: '画像制作の保留は自社商品のみ使えます (基本情報で「自社商品」をONにしてください)' });
+  }
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '画像制作の保留は 画像登録者・画像作成承認者 の担当者か管理者だけです' });
   }
   // boolean の true/false だけ受ける。欠落・文字列・typo を「解除」に倒さない (Codex R2 medium)
   if (typeof req.body?.on_hold !== 'boolean') {
@@ -1276,7 +1295,7 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
     try {
       const st = getDB().prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(draft.id);
       if (st && st.state !== 'done' && st.state !== 'skip') {
-        setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actorOf(req), { isAdmin: true });
+        setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actorOf(req), { isAdmin: true, systemActor: true });
       }
     } catch (e) {
       console.warn('[product-hub] imgd_rakuten auto-done failed:', e?.message || e);

@@ -1159,27 +1159,40 @@ export function migrateImageKindSplit(db) {
  * @returns {{ migrated: number, skipped: boolean }}
  */
 export function migrateDetailTrackV2(db) {
-  const done = db.prepare('SELECT value FROM ph_intake_state WHERE key = ?').get(IMAGE_TRACK_V2_KEY);
-  if (done) return { migrated: 0, skipped: true };
   const ph = LEGACY_DETAIL_V1_CODES.map(() => '?').join(',');
   const run = db.transaction(() => {
     // 1. 旧詳細工程を無効化 (新規 DB では行が無いので no-op)
     db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${ph})`).run(...LEGACY_DETAIL_V1_CODES);
-    // 2. 旧詳細の進捗を持つドラフトを写す
+    // 2. 旧詳細の進捗を持ち、**まだ v2 へ写していない**ドラフトを写す (ドラフト単位で冪等 — Codex R2 high:
+    //    DB 全体のマーカー 1 個だと、抽出漏れ・途中デプロイで写し損ねた商品が永久に確定する)。
+    //    「写した」根拠は draft_events の image_track_v2_migrated
     const drafts = db.prepare(`
-      SELECT DISTINCT p.draft_id AS id FROM draft_step_progress p WHERE p.step_code IN (${ph})
+      SELECT DISTINCT p.draft_id AS id FROM draft_step_progress p
+      WHERE p.step_code IN (${ph})
+        AND NOT EXISTS (SELECT 1 FROM draft_events e WHERE e.draft_id = p.draft_id AND e.event = 'image_track_v2_migrated')
     `).all(...LEGACY_DETAIL_V1_CODES).map((r) => r.id);
     const oldRows = db.prepare(`SELECT step_code, state FROM draft_step_progress WHERE draft_id = ? AND step_code IN (${ph})`);
-    const listedQ = db.prepare('SELECT 1 FROM draft_rakuten WHERE draft_id = ? AND registered_at IS NOT NULL');
+    // 楽天登録済みの根拠は 1 表に限らない (Codex R2 high): アプリ経由の登録記録 / 導出 status / モール別状況の楽天 done
+    const listedQ = db.prepare(`
+      SELECT 1 WHERE EXISTS (SELECT 1 FROM draft_rakuten WHERE draft_id = @id AND registered_at IS NOT NULL)
+         OR EXISTS (SELECT 1 FROM product_drafts WHERE id = @id AND status IN ('listed', 'expanded'))
+         OR EXISTS (SELECT 1 FROM draft_mall_status WHERE draft_id = @id AND mall = 'rakuten' AND state = 'done')
+    `);
+    // 既に v2 行が (途中デプロイ等で) todo のまま存在していても期待状態へ揃える
     const ins = db.prepare(`
-      INSERT OR IGNORE INTO draft_step_progress (draft_id, step_code, state, done_at, done_by)
+      INSERT INTO draft_step_progress (draft_id, step_code, state, done_at, done_by)
       VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(draft_id, step_code) DO UPDATE SET
+        state = CASE WHEN draft_step_progress.state = 'todo' AND excluded.state = 'done' THEN 'done' ELSE draft_step_progress.state END,
+        done_at = CASE WHEN draft_step_progress.state = 'todo' AND excluded.state = 'done' THEN excluded.done_at ELSE draft_step_progress.done_at END,
+        done_by = CASE WHEN draft_step_progress.state = 'todo' AND excluded.state = 'done' THEN excluded.done_by ELSE draft_step_progress.done_by END,
+        version = draft_step_progress.version + 1
     `);
     const settled = (st) => st === 'done' || st === 'skip';
     let migrated = 0;
     for (const id of drafts) {
       const old = Object.fromEntries(oldRows.all(id, ...LEGACY_DETAIL_V1_CODES).map((r) => [r.step_code, r.state]));
-      const listed = !!listedQ.get(id);
+      const listed = !!listedQ.get({ id });
       let doneUpTo = -1;   // DETAIL_V2_CODES の index。-1 = 何も済んでいない
       let rule;
       if (listed) {
@@ -1211,16 +1224,17 @@ export function migrateDetailTrackV2(db) {
     for (const [code, from, to] of [['img_production_top', 20, 51], ['img_register_top', 30, 52], ['img_approve_top', 40, 62]]) {
       db.prepare('UPDATE ph_steps SET sort = ? WHERE code = ? AND sort = ?').run(to, code, from);
     }
-    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ)
+    // 3. 旧 Notion 5 値 → 撮影・素材ステータス (空のときだけ。毎起動で冪等)
     for (const [from, to] of Object.entries(SHIPPING_TO_MATERIAL)) {
       db.prepare('UPDATE draft_image_production SET material_status = ? WHERE material_status IS NULL AND shipping_status = ?').run(to, from);
     }
-    db.prepare('INSERT INTO ph_intake_state (key, value) VALUES (?, ?)').run(IMAGE_TRACK_V2_KEY, new Date().toISOString());
+    // v2 に切り替えた日時 (初回だけ記録。①の「商品情報必須」の境目に使う)
+    db.prepare('INSERT OR IGNORE INTO ph_intake_state (key, value) VALUES (?, ?)').run(IMAGE_TRACK_V2_KEY, new Date().toISOString());
     return migrated;
   });
   const migrated = run();
   if (migrated > 0) console.log(`[product-hub] 商品詳細画像の工程を v2 (①〜⑨) へ移行しました (${migrated} 件)`);
-  return { migrated, skipped: false };
+  return { migrated, skipped: migrated === 0 };
 }
 
 /** 画像工程 v2 に切り替えた日時 (この日時より後に作られた商品は ①の完了に商品情報が必須) */
