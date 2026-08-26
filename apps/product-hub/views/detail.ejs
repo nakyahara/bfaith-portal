@@ -1042,9 +1042,45 @@
             <button class="btn" id="image-hold-btn" data-on-hold="1">画像制作を保留</button>
           <% } %>
         </div>
+        <%# 画像工程 v2 (2026-08-26): 1.5 商品情報 (手入力) と ChatGPT 用の定型文ボタン %>
+        <div class="field" style="padding:8px 10px; border-radius:8px; background:#f0f9ff; border:1px solid #bae6fd;">
+          <label>商品情報 <span class="muted" style="font-weight:400">(1.5 = Amazon やパッケージを確認して手入力。①の完了条件・下の定型文の材料)</span></label>
+          <textarea id="ip-product-info" rows="5" placeholder="商品の特徴・用途・サイズ・内容量・素材など、画像に載せる情報を書く"><%= ip.product_info_text || '' %></textarea>
+          <% if (ip.product_info_updated_at) { %>
+            <div class="muted" style="font-size:11px;">最終更新: <%= String(ip.product_info_updated_at).slice(0, 16).replace('T', ' ') %> <%= ip.product_info_updated_by || '' %></div>
+          <% } %>
+          <div style="display:flex; gap:8px; margin-top:6px; flex-wrap:wrap; align-items:center;">
+            <button type="button" class="btn prompt-btn" data-kind="initialJudge" <%= promptTemplates.available ? '' : 'disabled' %>>🧪 初動判定を準備</button>
+            <button type="button" class="btn prompt-btn" data-kind="productAnalysis" <%= promptTemplates.available ? '' : 'disabled' %>>📝 商品分析を準備</button>
+            <span class="muted" style="font-size:12px;"><%= promptTemplates.available ? 'ChatGPT に貼る定型文を作ります (コピーして商品画像を添付)' : promptTemplates.reason %></span>
+          </div>
+          <div id="prompt-modal" hidden style="margin-top:8px; background:#fff; border:1px solid #cbd5e1; border-radius:8px; padding:8px;">
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:6px;">
+              <strong id="prompt-title"></strong>
+              <button type="button" class="btn btn-primary" id="prompt-copy-btn">コピー</button>
+              <button type="button" class="btn" id="prompt-close-btn">閉じる</button>
+              <span class="muted" id="prompt-copy-result" style="font-size:12px;"></span>
+            </div>
+            <div id="prompt-supplement-wrap" hidden style="margin-bottom:6px;">
+              <label>補足情報 (編集可・上の本文に反映)</label>
+              <textarea id="prompt-supplement" rows="2"></textarea>
+            </div>
+            <textarea id="prompt-text" rows="12" style="width:100%; font-family:ui-monospace, monospace; font-size:12px;"></textarea>
+          </div>
+        </div>
+        <script type="application/json" id="prompt-templates-json"><%- JSON.stringify(promptTemplates).replace(/</g, '\\u003c') %></script>
         <div class="field" style="display:flex; gap:12px;">
           <div style="flex:1">
-            <label>ステータス</label>
+            <label>撮影・素材ステータス <span class="muted" style="font-weight:400">(①で撮影要否を判断 / ③は 素材完了 か 撮影不要 で完了)</span></label>
+            <select id="ip-material" style="width:100%;">
+              <option value="">未設定</option>
+              <% for (const m of materialStatuses) { %>
+                <option value="<%= m.code %>" <%= ip.material_status === m.code ? 'selected' : '' %>><%= m.label %></option>
+              <% } %>
+            </select>
+          </div>
+          <div style="flex:1">
+            <label>ステータス <span class="muted" style="font-weight:400">(メモ用。工程は上の工程パネルが正)</span></label>
             <input type="text" id="ip-status" list="dl-ip-status" value="<%= ip.status || '' %>">
             <datalist id="dl-ip-status">
               <option value="参考画像収集"><option value="A+コンテンツ作成"><option value="楽天登録">
@@ -1075,11 +1111,8 @@
         </div>
         <div class="field" style="display:flex; gap:12px;">
           <div style="flex:1">
-            <label>撮影商品発送</label>
-            <input type="text" id="ip-shipping" list="dl-ip-shipping" value="<%= ip.shipping_status || '' %>">
-            <datalist id="dl-ip-shipping">
-              <option value="撮影依頼不要"><option value="撮影商品発送手配済み"><option value="撮影商品未発送"><option value="社内準備">
-            </datalist>
+            <label>撮影商品発送 <span class="muted" style="font-weight:400">(旧 Notion 項目。上の「撮影・素材ステータス」に置き換え)</span></label>
+            <input type="text" id="ip-shipping" value="<%= ip.shipping_status || '' %>" readonly style="background:#f1f5f9;">
           </div>
           <div style="flex:1">
             <label>参考画像・レビュー収集</label>
@@ -2758,9 +2791,46 @@
         page_composer: document.getElementById('ip-composer').value,
         request_text: document.getElementById('ip-request').value,
         canva_url: document.getElementById('ip-canva-url').value,
+        material_status: document.getElementById('ip-material').value,
+        product_info_text: document.getElementById('ip-product-info').value,
       }), '画像制作情報を保存しました');
     });
   }
+  // 定型文ボタン (画像工程 v2)。文面はサーバー (lib/prompt-templates.js) が組み立て、画面は表示とコピーだけ
+  (function initPromptButtons() {
+    const holder = document.getElementById('prompt-templates-json');
+    if (!holder) return;
+    let tpl = {};
+    try { tpl = JSON.parse(holder.textContent) || {}; } catch (e) { return; }
+    const modal = document.getElementById('prompt-modal');
+    const textEl = document.getElementById('prompt-text');
+    const supWrap = document.getElementById('prompt-supplement-wrap');
+    const supEl = document.getElementById('prompt-supplement');
+    const titleEl = document.getElementById('prompt-title');
+    const resultEl = document.getElementById('prompt-copy-result');
+    let base = '';
+    function render() {
+      textEl.value = base.replace('{{SUPPLEMENT}}', supEl.value || '');
+    }
+    document.querySelectorAll('.prompt-btn').forEach((b) => {
+      b.addEventListener('click', () => {
+        const kind = b.dataset.kind;
+        base = tpl[kind] || '';
+        titleEl.textContent = kind === 'initialJudge' ? '新商品初動判定 Ver1.0 (ChatGPT に貼る)' : 'LP制作システム V2.1 ① 商品分析 (ChatGPT に貼る)';
+        supWrap.hidden = kind !== 'productAnalysis';
+        resultEl.textContent = '';
+        render();
+        modal.hidden = false;
+        textEl.focus();
+      });
+    });
+    supEl.addEventListener('input', render);
+    document.getElementById('prompt-close-btn').addEventListener('click', () => { modal.hidden = true; });
+    document.getElementById('prompt-copy-btn').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(textEl.value); resultEl.textContent = 'コピーしました。ChatGPT に貼って商品画像を添付してください'; }
+      catch (e) { textEl.select(); resultEl.textContent = 'コピーできませんでした (選択したので Ctrl+C で)'; }
+    });
+  })();
   const imageHoldBtn = document.getElementById('image-hold-btn');
   if (imageHoldBtn) {
     imageHoldBtn.addEventListener('click', async () => {

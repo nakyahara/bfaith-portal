@@ -23,7 +23,7 @@ import crypto from 'node:crypto';
 import { getConfig, requireEnv, queryDatabaseAll, notionRequest, findPageByManageNumber } from '../../rakuten-yahoo-sync/lib/notion-client.js';
 import {
   getDB, logEvent, upsertImageProduction, setImageWorkflowState,
-  OWN_BRAND_IMAGE_PRIORITY, SOURCE_NOTION_IMPORT,
+  OWN_BRAND_IMAGE_PRIORITY, SOURCE_NOTION_IMPORT, DETAIL_V2_CODES, SHIPPING_TO_MATERIAL,
 } from '../db.js';
 import { resolveVariationGroup, isDetached } from '../lib/variation.js';
 import { ensureProgress, setStepState } from '../lib/workflow-progress.js';
@@ -121,35 +121,25 @@ export function findStaffByName(db, name) {
  * 撮影依頼中 (詳細のみ) は 撮影商品発送 から: 撮影依頼不要 → skip / 発送手配済み → done / 社内準備 → 段階で doing|done
  * @returns {{ steps: Array<{code:string, state:string}>, hold: boolean, assigneeName: string|null, assigneeStepStage: string|null }}
  */
-export function planStepsFor(status, { shippingStatus = null, hasImages = false } = {}) {
-  const out = { steps: [], hold: false, assigneeName: null, assigneeStepStage: null };
+export function planStepsFor(status, _opts = {}) {
+  // 画像工程 v2 (2026-08-26): 詳細系列 ①〜⑨ (TOP 側は ⑤/⑥-2 の完了で自動追随するので書かない)
+  //   構成作成中       → ① done / ② 構成 doing
+  //   画像作成中（高島） → ①〜④ done / ⑤ デザイン修正 doing (担当 高島)
+  //   画像確認（田中）   → ①〜⑤ done / ⑥-1 社内確認 (田中) doing (担当 田中)
+  //   保留             → 工程は書かない。画像制作だけ保留
+  const out = { steps: [], hold: false, assigneeName: null, assigneeStepCode: null };
   const st = String(status || '');
   if (st === '保留') { out.hold = true; return out; }
-  let stage = null; // 'request' | 'production' | 'register'
-  if (st === '構成作成中') stage = 'request';
-  else if (st.startsWith('画像作成中')) { stage = 'production'; out.assigneeName = '高島'; out.assigneeStepStage = 'production'; }
-  else if (st.startsWith('画像確認')) { stage = 'register'; out.assigneeName = '田中'; out.assigneeStepStage = 'approve'; }
+  let doingCode = null;
+  if (st === '構成作成中') doingCode = 'imgd_compose';
+  else if (st.startsWith('画像作成中')) { doingCode = 'imgd_design'; out.assigneeName = '高島'; out.assigneeStepCode = 'imgd_design'; }
+  else if (st.startsWith('画像確認')) { doingCode = 'imgd_review_1'; out.assigneeName = '田中'; out.assigneeStepCode = 'imgd_review_1'; }
   else return out; // 対象外のステータスは何も書かない
-  const order = ['request', 'production', 'register', 'approve'];
-  const idx = order.indexOf(stage);
-  for (const kind of ['top', 'detail']) {
-    order.forEach((s, i) => {
-      let state = i < idx ? 'done' : (i === idx ? 'doing' : 'todo');
-      // 画像確認で、アプリに画像が既に登録済みなら「登録」は済み → 承認が作業中
-      if (stage === 'register' && hasImages) {
-        if (s === 'register') state = 'done';
-        if (s === 'approve') state = 'doing';
-      }
-      if (state !== 'todo') out.steps.push({ code: `img_${s}_${kind}`, state });
-    });
-  }
-  // 撮影依頼中 (詳細のみ)
-  const ship = String(shippingStatus || '');
-  let shoot = null;
-  if (ship === '撮影依頼不要') shoot = 'skip';
-  else if (ship === '撮影商品発送手配済み') shoot = 'done';
-  else if (ship === '社内準備') shoot = stage === 'request' ? 'doing' : 'done';
-  if (shoot) out.steps.unshift({ code: 'img_shoot_detail', state: shoot });
+  const idx = DETAIL_V2_CODES.indexOf(doingCode);
+  DETAIL_V2_CODES.forEach((code, i) => {
+    if (i < idx) out.steps.push({ code, state: 'done' });
+    else if (i === idx) out.steps.push({ code, state: 'doing' });
+  });
   return out;
 }
 
@@ -336,10 +326,12 @@ export async function importImageDbByStatus({
       if (rec[f] && blank(ipCur[f])) plan.ip[f] = rec[f];
     }
     if (rec.status && blank(ipCur.status)) plan.ip.status = rec.status;
+    // 撮影商品発送 → 撮影・素材ステータス (v2 の安定コード)。空のときだけ
+    const mat = rec.shipping_status ? SHIPPING_TO_MATERIAL[rec.shipping_status] : null;
+    if (mat && blank(ipCur.material_status)) plan.ip.material_status = mat;
 
     // 工程
-    const hasImages = existing ? !!db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(existing.id) : false;
-    const sp = planStepsFor(rec.status, { shippingStatus: rec.shipping_status, hasImages });
+    const sp = planStepsFor(rec.status);
     plan.hold = sp.hold;
     if (sp.hold) {
       // 現在の保留状態を plan (= snapshot) に載せる: プレビュー後に人が解除していたら snapshot 不一致で止まる
@@ -354,7 +346,7 @@ export async function importImageDbByStatus({
         plan.steps = sp.steps;
         if (sp.assigneeName) {
           const f = findStaffByName(db, sp.assigneeName);
-          if (f.staff) plan.assignee = { staffId: f.staff.id, name: f.staff.name, stage: sp.assigneeStepStage };
+          if (f.staff) plan.assignee = { staffId: f.staff.id, name: f.staff.name, code: sp.assigneeStepCode };
           else result.warnings.push(`担当者「${sp.assigneeName}」を担当者マスタで特定できず未割当 (${f.reason === 'ambiguous' ? '複数該当' : '見つからない'})`);
         }
       }
@@ -498,16 +490,11 @@ function applyPlan(db, rec, plan, { actor, runId }) {
       if (untouched) {
         throw new Error(`プレビュー後に画像工程が動きました (${untouched})。再プレビューしてください`);
       } else {
-        const assigneeCodes = plan.assignee
-          ? new Set(['top', 'detail'].map((k) => `img_${plan.assignee.stage}_${k}`)) : new Set();
         for (const s of plan.steps) {
           const patch = { state: s.state };
-          if (assigneeCodes.has(s.code)) { patch.assignee_id = plan.assignee.staffId; assigneeCodes.delete(s.code); }
-          setStepState(draftId, s.code, patch, actor, { isAdmin: true });
-        }
-        // 状態は todo のまま担当だけ入れる工程 (画像確認 → 承認担当 = 田中)
-        for (const code of assigneeCodes) {
-          setStepState(draftId, code, { assignee_id: plan.assignee.staffId }, actor, { isAdmin: true });
+          if (plan.assignee && plan.assignee.code === s.code) patch.assignee_id = plan.assignee.staffId;
+          // Notion で既に済んでいる段階を写すだけなので ①③ の材料チェックは通さない (bypassGates)。⑥順序も plan の順で満たす
+          setStepState(draftId, s.code, patch, actor, { isAdmin: true, bypassGates: true });
         }
       }
     }

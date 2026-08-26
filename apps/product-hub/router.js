@@ -16,7 +16,7 @@ import {
   getDB, logEvent, gateReasons, applyFolderImport,
   claimGenerationDrafts, generationClaimError, releaseGenerationClaim, acquireGenerationWriteLock,
   extractAsin, saveSpKeywordSnapshot, loadSpKeywordSnapshot,
-  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
+  upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
@@ -39,6 +39,7 @@ import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
+import { buildPromptTemplates } from './lib/prompt-templates.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
@@ -306,6 +307,8 @@ router.get('/detail/:id', (req, res) => {
     setDrafts: setDraftsOf(db, draft.id),
     setInfo: setInfoOf(db, draft.id),
     imagePriorities: IMAGE_PRIORITIES,
+    materialStatuses: MATERIAL_STATUSES,
+    promptTemplates: buildPromptTemplates(draft, imageProduction),
   });
 });
 
@@ -711,9 +714,25 @@ router.post('/api/drafts/:id/yahoo', (req, res) => {
   res.json({ ok: true });
 });
 
+/**
+ * 画像制作情報 (撮影・素材/商品情報/Canva 等) を触れる人 = admin か、画像系の役割 (画像登録者・画像作成承認者) を持つ担当者。
+ * ①③ の完了ゲートを左右する値なので、工程と同じく誰でもは書けない (Codex R2 medium)
+ */
+function canEditImageProduction(req) {
+  if (req.session?.role === 'admin') return true;
+  const me = staffByPortalEmail(req.session?.email);
+  if (!me) return false;
+  return !!getDB().prepare(`
+    SELECT 1 FROM ph_staff_roles WHERE staff_id = ? AND role_code IN ('image', 'image_approver')
+  `).get(me.id);
+}
+
 router.post('/api/drafts/:id/image-production', (req, res) => {
   const draft = loadDraftOr404(req, res);
   if (!draft) return;
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '画像制作情報を変えられるのは 画像登録者・画像作成承認者 の担当者か管理者だけです (担当者・工程で役割を確認してください)' });
+  }
   if (!draft.own_brand) {
     return res.status(400).json({ ok: false, error: '画像制作情報は自社商品のみ登録できます (基本情報で「自社商品」をONにしてください)' });
   }
@@ -726,6 +745,23 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   const canvaVal = b.canva_url !== undefined ? cleanText(b.canva_url, 1000) : undefined;
   if (canvaVal && !isHttpUrl(canvaVal)) {
     return res.status(400).json({ ok: false, error: 'CanvaリンクのURL形式が不正です (http/https)' });
+  }
+  // 画像工程 v2 (2026-08-26): 撮影・素材ステータスは安定コードだけ受ける / 商品情報は変更時に更新者・日時を残す
+  let materialVal;
+  if (b.material_status !== undefined) {
+    materialVal = cleanText(b.material_status, 40) || null;
+    if (materialVal && !MATERIAL_STATUS_CODES.has(materialVal)) {
+      return res.status(400).json({ ok: false, error: '撮影・素材ステータスの値が不正です' });
+    }
+  }
+  let infoVal; let infoAt; let infoBy;
+  if (b.product_info_text !== undefined) {
+    infoVal = cleanText(b.product_info_text, 20000) || null;
+    const cur = db.prepare('SELECT product_info_text FROM draft_image_production WHERE draft_id = ?').get(draft.id);
+    if ((cur?.product_info_text || null) !== infoVal) {
+      infoAt = new Date().toISOString();
+      infoBy = actorOf(req);
+    }
   }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
   upsertImageProduction(db, draft.id, {
@@ -741,8 +777,12 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     page_composer: clean(b.page_composer, 100),
     request_text: clean(b.request_text, 10000),
     canva_url: canvaVal,
+    material_status: materialVal,
+    product_info_text: infoVal,
+    product_info_updated_at: infoAt,
+    product_info_updated_by: infoBy,
   });
-  logEvent(db, draft.id, 'image_production_updated', null, actorOf(req));
+  logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
   res.json({ ok: true });
 });
 
@@ -754,6 +794,9 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   // 画像制作情報 (image-production) と同じく自社商品だけ (Codex R2 medium)
   if (!draft.own_brand) {
     return res.status(400).json({ ok: false, error: '画像制作の保留は自社商品のみ使えます (基本情報で「自社商品」をONにしてください)' });
+  }
+  if (!canEditImageProduction(req)) {
+    return res.status(403).json({ ok: false, error: '画像制作の保留は 画像登録者・画像作成承認者 の担当者か管理者だけです' });
   }
   // boolean の true/false だけ受ける。欠落・文字列・typo を「解除」に倒さない (Codex R2 medium)
   if (typeof req.body?.on_hold !== 'boolean') {
@@ -1248,6 +1291,15 @@ router.post('/api/drafts/:id/rakuten/register', async (req, res) => {
       itemUrl: rakutenItemPageUrl(draft.ne_code),
       actor: actorOf(req),
     });
+    // 画像工程 v2 ⑧「楽天登録」も自動で完了 (fail-soft: 出品は成功している)
+    try {
+      const st = getDB().prepare("SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = 'imgd_rakuten'").get(draft.id);
+      if (st && st.state !== 'done' && st.state !== 'skip') {
+        setStepState(draft.id, 'imgd_rakuten', { state: 'done' }, actorOf(req), { isAdmin: true, systemActor: true });
+      }
+    } catch (e) {
+      console.warn('[product-hub] imgd_rakuten auto-done failed:', e?.message || e);
+    }
     res.json(r);
   } catch (e) {
     console.error('[product-hub] rakuten register failed:', e);
