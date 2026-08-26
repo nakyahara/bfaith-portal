@@ -3874,6 +3874,307 @@ for (const [name, file, data] of renders) {
 // ─── EJS 内クライアントJSの構文チェック ───
 // レンダリングは通っても <script> 内の構文エラー (例: 文字列リテラル内の生改行) は検出できず、
 // ボタン全滅の形で本番に出る (#700 の confirm 事故)。EJS タグを無害値に置換して構文だけ検証する。
+// ─── Notion 画像DB (商品ページ商品画像登録) の移植 (2026-08-26) ───
+{
+  const iimp = await import('../services/notion-image-import.js');
+  const wfp2 = await import('../lib/workflow-progress.js');
+  const takashima = wf.createStaff({ name: '高島さん', kind: 'internal' });
+
+  const sel = (name) => ({ type: 'select', select: name ? { name } : null });
+  const url = (u) => ({ type: 'url', url: u });
+  const rtx = (t) => ({ type: 'rich_text', rich_text: t ? [{ plain_text: t }] : [] });
+  const imgPage = (code, status, extra = {}) => ({
+    id: `img-page-${code}-${status}`,
+    properties: {
+      Name: { type: 'title', title: [{ plain_text: `画像商品 ${code}` }] },
+      '商品コード': rtx(code),
+      Status: sel(status),
+      'グーグルドライブURL': url('https://drive.google.com/drive/folders/1ABC'),
+      AmazonURL: url('https://www.amazon.co.jp/dp/B0IMG1'),
+      ASIN: rtx('B0IMG1'),
+      '重要商品区分': sel('そこそこ力を入れる（6〜8枚）'),
+      '撮影商品発送': sel('社内準備'),
+      'カメラ撮影指示URL': url('https://docs.google.com/spreadsheets/d/xyz'),
+      Canva: url('https://canva.link/abc'),
+      '依頼文': { type: 'formula', formula: { type: 'string', string: 'お世話になっています。画像作成お願いします' } },
+      '画像作成担当者': sel(null),
+      ...extra,
+    },
+  });
+
+  // buildImageRecord
+  const r0 = iimp.buildImageRecord(imgPage('IMG-REC', '構成作成中', { Canva: url('javascript:alert(1)') }));
+  check('画像DB: レコード変換 (コード・名前・URL・区分・依頼文)',
+    r0.ne_code === 'IMG-REC' && r0.name === '画像商品 IMG-REC' && r0.status === '構成作成中'
+    && r0.drive_folder_url === 'https://drive.google.com/drive/folders/1ABC' && r0.asin === 'B0IMG1'
+    && r0.importance_tier === 'そこそこ力を入れる（6〜8枚）' && r0.shipping_status === '社内準備'
+    && r0.request_text.startsWith('お世話になっています') && typeof r0.source_hash === 'string' && r0.source_hash.length === 32,
+    JSON.stringify(r0));
+  check('画像DB: http(s) 以外の URL は捨てる', r0.canva_url === null);
+  check('画像DB: 商品コード無しは null', iimp.buildImageRecord({ id: 'x', properties: { Name: { type: 'title', title: [] } } }) === null);
+
+  // planStepsFor
+  const p1 = iimp.planStepsFor('構成作成中', { shippingStatus: '社内準備' });
+  check('画像DB: 構成作成中 → 依頼 doing (TOP/詳細) + 撮影 doing',
+    p1.steps.some((s) => s.code === 'img_request_top' && s.state === 'doing')
+    && p1.steps.some((s) => s.code === 'img_request_detail' && s.state === 'doing')
+    && p1.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'doing')
+    && !p1.steps.some((s) => s.code.startsWith('img_production')) && !p1.hold, JSON.stringify(p1));
+  const p2 = iimp.planStepsFor('画像作成中（高島）', { shippingStatus: '撮影依頼不要' });
+  check('画像DB: 画像作成中 → 依頼 done・制作 doing・担当=高島・撮影 skip',
+    p2.steps.some((s) => s.code === 'img_request_top' && s.state === 'done')
+    && p2.steps.some((s) => s.code === 'img_production_detail' && s.state === 'doing')
+    && p2.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'skip')
+    && p2.assigneeName === '高島' && p2.assigneeStepStage === 'production', JSON.stringify(p2));
+  const p3 = iimp.planStepsFor('画像確認（田中）', { shippingStatus: '撮影商品発送手配済み', hasImages: true });
+  check('画像DB: 画像確認 + 画像登録済み → 登録 done・承認 doing・担当=田中',
+    p3.steps.some((s) => s.code === 'img_register_top' && s.state === 'done')
+    && p3.steps.some((s) => s.code === 'img_approve_top' && s.state === 'doing')
+    && p3.steps.some((s) => s.code === 'img_shoot_detail' && s.state === 'done')
+    && p3.assigneeName === '田中' && p3.assigneeStepStage === 'approve', JSON.stringify(p3));
+  const p3b = iimp.planStepsFor('画像確認（田中）', { shippingStatus: null, hasImages: false });
+  check('画像DB: 画像確認 + 未登録 → 登録 doing・承認 todo (担当だけ)',
+    p3b.steps.some((s) => s.code === 'img_register_top' && s.state === 'doing')
+    && !p3b.steps.some((s) => s.code === 'img_approve_top') && !p3b.steps.some((s) => s.code === 'img_shoot_detail'));
+  const p4 = iimp.planStepsFor('保留', {});
+  check('画像DB: 保留 → 工程なし・画像制作だけ保留', p4.hold && p4.steps.length === 0);
+  check('画像DB: 対象外ステータスは何も書かない', iimp.planStepsFor('完了', {}).steps.length === 0);
+
+  // 担当者の名寄せ
+  check('画像DB: 担当者名寄せ 高島 → 高島さん (完全一致)', iimp.findStaffByName(db, '高島')?.staff?.id === takashima);
+  const tanakaId = db.prepare("SELECT id FROM ph_staff WHERE name = '田中美祐'").get()?.id;
+  check('画像DB: 担当者名寄せ 田中 → 田中美祐 (部分一致)', iimp.findStaffByName(db, '田中')?.staff?.id === tanakaId);
+  check('画像DB: 見つからない名前は未割当', iimp.findStaffByName(db, '存在しない').staff === null);
+
+  // 既存ドラフト (portal 起点・重要度未設定) と、重要度が自社以外のドラフト
+  const insDraft = db.prepare(`INSERT INTO product_drafts (ne_code, name, status, source, image_priority, own_brand)
+    VALUES (?, ?, 'draft', 'portal', ?, ?)`);
+  const existId = Number(insDraft.run('IMG-EXIST-1', '既存商品', null, 0).lastInsertRowid);
+  const confId = Number(insDraft.run('IMG-CONF-1', '重要度衝突', '仕入商品（重要度：低）', 0).lastInsertRowid);
+  const conf2Id = Number(insDraft.run('IMG-CONF-2', '逆方向の不整合', '自社商品（重要度：高）', 0).lastInsertRowid);
+  insProd.run(9101, 'IMG-VCONF', '表記ゆれ A', null);
+  insProd.run(9102, 'img-vconf', '表記ゆれ B', null);
+  check('画像DB: 前提 = mirror 表記ゆれは conflict', vari.resolveVariationGroup(db, 'IMG-VCONF').kind === 'conflict');
+  db.prepare("UPDATE product_drafts SET amazon_url = 'https://www.amazon.co.jp/dp/B0EXIST' WHERE id = ?").run(existId);
+
+  const schemaImg = { properties: { Status: { type: 'select', select: { options: [
+    { name: '構成作成中' }, { name: '画像作成中（高島）' }, { name: '画像確認（田中）' }, { name: '保留' }, { name: '完了' }, { name: 'A+コンテンツ作成' },
+  ] } } } };
+  const pagesImg = [
+    imgPage('IMG-NEW-1', '構成作成中'),
+    imgPage('IMG-EXIST-1', '画像作成中（高島）', { '撮影商品発送': sel('撮影依頼不要') }),
+    imgPage('IMG-MASTER-1', '画像確認（田中）'),
+    imgPage('rooms-l-wh', '保留'),
+    imgPage('IMG-CONF-1', '構成作成中'),
+    imgPage('IMG-DUP-1', '構成作成中'),
+    imgPage('IMG-DUP-1', '保留'),
+    imgPage('IMG-VCONF', '構成作成中'),   // NE 側に同じコードが複数 (mirror の表記ゆれ) → 止める
+    imgPage('IMG-CONF-2', '構成作成中'),
+    { id: 'img-page-nocode', properties: { Name: { type: 'title', title: [{ plain_text: 'コード無し' }] } } },
+  ];
+  let capImg = null;
+  const diImg = {
+    config: () => ({ databaseId: 'img-db-test' }),
+    request: async () => schemaImg,
+    query: async (opts) => { capImg = opts; return { pages: pagesImg }; },
+    masterFinder: async (code) => (code === 'IMG-MASTER-1'
+      ? { id: 'master-1', properties: { Status: { type: 'select', select: { name: '②商品タイトル_大輔' } } } } : null),
+    runId: 'img-smoke-1',
+  };
+  const beforeDrafts = db.prepare('SELECT COUNT(*) c FROM product_drafts').get().c;
+  const prevImg = await iimp.importImageDbByStatus({ actor: 'smoke', ...diImg });
+  check('画像DB: フィルタは対象4ステータスだけ (完了・A+ を含まない)',
+    capImg.filter.or.length === 4 && capImg.filter.or.every((f) => iimp.IMAGE_MIGRATE_STATUSES.includes(f.select.equals)),
+    JSON.stringify(capImg.filter));
+  const byCode = (res, code, status) => res.results.find((r) => r.ne_code === code && (!status || r.notion_status === status));
+  check('画像DB: dryRun は書き込まず分類だけ返す',
+    prevImg.summary.would_create === 2 && prevImg.summary.would_update === 1
+    && prevImg.summary.needs_master_import === 1 && prevImg.summary.brand_priority_conflict === 2
+    && prevImg.summary.duplicate === 2 && prevImg.summary.variation_conflict === 1
+    && prevImg.summary.failed === 1 && prevImg.total === 10
+    && db.prepare('SELECT COUNT(*) c FROM product_drafts').get().c === beforeDrafts
+    && db.prepare('SELECT COUNT(*) c FROM draft_image_notion_imports').get().c === 0,
+    JSON.stringify(prevImg.summary));
+  check('画像DB: 重複コードは全カード止める・NE 表記ゆれは variation_conflict・own_brand=0×重要度自社も止める',
+    prevImg.results.filter((r) => r.ne_code === 'IMG-DUP-1').every((r) => r.outcome === 'duplicate')
+    && byCode(prevImg, 'IMG-VCONF').outcome === 'variation_conflict'
+    && byCode(prevImg, 'IMG-CONF-2').outcome === 'brand_priority_conflict');
+  check('画像DB: 商品マスターに居る商品は本体取り込みを先に (ブロック)',
+    byCode(prevImg, 'IMG-MASTER-1').outcome === 'needs_master_import' && byCode(prevImg, 'IMG-MASTER-1').master_status === '②商品タイトル_大輔');
+  check('画像DB: 子SKU は detach の予告が出る',
+    byCode(prevImg, 'rooms-l-wh').outcome === 'would_create'
+    && byCode(prevImg, 'rooms-l-wh').warnings.some((w) => w.includes('独立ページ')));
+  check('画像DB: 既存の Amazon URL は上書きせず、空欄 (Drive/ASIN) だけ補完予定',
+    byCode(prevImg, 'IMG-EXIST-1').plan_summary.includes('drive_folder_url')
+    && byCode(prevImg, 'IMG-EXIST-1').plan_summary.includes('asin')
+    && !byCode(prevImg, 'IMG-EXIST-1').plan_summary.includes('amazon_url'));
+
+  // 実行: snapshot 無し・不一致は止める
+  let mis = null;
+  try { await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, ...diImg }); } catch (e) { mis = e; }
+  check('画像DB: snapshot 無しの実行は拒否 (書き込みなし)',
+    mis?.code === 'snapshot_mismatch' && db.prepare('SELECT COUNT(*) c FROM draft_image_notion_imports').get().c === 0);
+
+  const runImg = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: prevImg.snapshot, ...diImg });
+  check('画像DB: 実行 → 新規2・補完1 (衝突・重複は書かない)',
+    runImg.summary.created === 2 && runImg.summary.updated === 1 && runImg.summary.failed === 1
+    && !db.prepare('SELECT 1 FROM product_drafts WHERE ne_code IN (?, ?)').get('IMG-DUP-1', 'IMG-VCONF')
+    && db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(conf2Id).own_brand === 0,
+    JSON.stringify(runImg.results.map((r) => [r.ne_code, r.outcome, r.error, r.warnings])));
+  const newRow = db.prepare('SELECT * FROM product_drafts WHERE ne_code = ?').get('IMG-NEW-1');
+  check('画像DB: 新規は最小情報 + 自社商品 + 画像フォルダ',
+    newRow && newRow.own_brand === 1 && newRow.image_priority === '自社商品（重要度：高）' && newRow.source === 'notion_import'
+    && newRow.drive_folder_url === 'https://drive.google.com/drive/folders/1ABC' && newRow.asin === 'B0IMG1' && newRow.price == null,
+    JSON.stringify(newRow));
+  const newIp = db.prepare('SELECT * FROM draft_image_production WHERE draft_id = ?').get(newRow.id);
+  check('画像DB: 画像制作情報 (区分・撮影指示・Canva・依頼文・原文ステータス)',
+    newIp && newIp.importance_tier === 'そこそこ力を入れる（6〜8枚）' && newIp.canva_url === 'https://canva.link/abc'
+    && newIp.camera_instruction_url === 'https://docs.google.com/spreadsheets/d/xyz' && newIp.status === '構成作成中'
+    && newIp.workflow_state === 'active', JSON.stringify(newIp));
+  const stepOf = (id, code) => db.prepare('SELECT state, assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code);
+  check('画像DB: 構成作成中 → 依頼 doing・撮影 doing (新規)',
+    stepOf(newRow.id, 'img_request_top')?.state === 'doing' && stepOf(newRow.id, 'img_request_detail')?.state === 'doing'
+    && stepOf(newRow.id, 'img_shoot_detail')?.state === 'doing' && stepOf(newRow.id, 'img_production_top')?.state === 'todo');
+  const exRow = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(existId);
+  check('画像DB: 既存は空欄だけ補完 (Amazon URL は据え置き・自社商品に)',
+    exRow.amazon_url === 'https://www.amazon.co.jp/dp/B0EXIST' && exRow.drive_folder_url === 'https://drive.google.com/drive/folders/1ABC'
+    && exRow.own_brand === 1 && exRow.image_priority === '自社商品（重要度：高）' && exRow.name === '既存商品' && exRow.source === 'portal');
+  check('画像DB: 画像作成中 → 依頼 done・制作 doing・担当=高島・撮影 skip (既存)',
+    stepOf(existId, 'img_request_top')?.state === 'done' && stepOf(existId, 'img_production_top')?.state === 'doing'
+    && stepOf(existId, 'img_production_top')?.assignee_id === takashima && stepOf(existId, 'img_production_detail')?.assignee_id === takashima
+    && stepOf(existId, 'img_shoot_detail')?.state === 'skip', JSON.stringify([stepOf(existId, 'img_request_top'), stepOf(existId, 'img_production_top')]));
+  check('画像DB: 重要度が自社以外の商品は触らない',
+    db.prepare('SELECT image_priority, own_brand FROM product_drafts WHERE id = ?').get(confId).image_priority === '仕入商品（重要度：低）'
+    && !db.prepare('SELECT 1 FROM draft_image_notion_imports WHERE draft_id = ?').get(confId));
+  const roomsRow = db.prepare('SELECT * FROM product_drafts WHERE ne_code = ?').get('rooms-l-wh');
+  check('画像DB: 子SKU は独立ページ (detach 記録) + 画像制作だけ保留 (商品 status は draft のまま)',
+    roomsRow && roomsRow.status === 'draft'
+    && vari.resolveVariationGroup(db, 'rooms-l-wh').kind === 'detached'
+    && db.prepare('SELECT workflow_state, hold_note FROM draft_image_production WHERE draft_id = ?').get(roomsRow.id)?.workflow_state === 'on_hold'
+    && db.prepare("SELECT COUNT(*) c FROM draft_step_progress WHERE draft_id = ? AND state != 'todo'").get(roomsRow.id).c === 0,
+    JSON.stringify(roomsRow));
+  check('画像DB: 台帳に 1 カード 1 行 (成功分だけ)',
+    db.prepare("SELECT COUNT(*) c FROM draft_image_notion_imports WHERE import_run_id = 'img-smoke-1'").get().c === 3
+    && db.prepare('SELECT source_status FROM draft_image_notion_imports WHERE notion_page_id = ?').get('img-page-rooms-l-wh-保留')?.source_status === '保留');
+  check('画像DB: イベントが残る', db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_db_imported'").get(newRow.id).c === 1
+    && db.prepare("SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'image_hold'").get(roomsRow.id).c === 1);
+
+  // 画像制作の保留 = 楽天出品ゲートが閉じる。解除で開く (工程の理由に戻る)
+  const gateHold = wfp2.imageTrackBlockReason(db, roomsRow.id);
+  check('画像DB: 保留中は出品ゲートが「保留」で止まる', typeof gateHold === 'string' && gateHold.includes('保留'), gateHold);
+  const rel = dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' });
+  const gateAfter = wfp2.imageTrackBlockReason(db, roomsRow.id);
+  check('画像DB: 保留解除 → ゲートは工程の理由に戻る (冪等)',
+    rel.changed === true && typeof gateAfter === 'string' && !gateAfter.includes('保留中')
+    && dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' }).changed === false, gateAfter);
+  let badState = null;
+  try { dbmod.setImageWorkflowState(db, roomsRow.id, 'bogus', {}); } catch (e) { badState = e; }
+  check('画像DB: 不正な状態は拒否', !!badState);
+
+  // 再実行: 移植済みはスキップ、内容が変わったカードは報告のみ (追従しない)
+  const prev2 = await iimp.importImageDbByStatus({ actor: 'smoke', ...diImg });
+  check('画像DB: 再プレビューは移植済み 3 (書き込み予定 0)',
+    prev2.summary.already_migrated === 3 && prev2.summary.would_create === 0 && prev2.summary.would_update === 0, JSON.stringify(prev2.summary));
+  const changedPages = pagesImg.map((p) => (p.id === 'img-page-IMG-NEW-1-構成作成中'
+    ? { ...p, properties: { ...p.properties, Status: sel('画像作成中（高島）') } } : p));
+  const prev3 = await iimp.importImageDbByStatus({ actor: 'smoke', ...diImg, query: async () => ({ pages: changedPages }) });
+  check('画像DB: 移植後に Notion 側が変わっても追従せず報告だけ',
+    byCode(prev3, 'IMG-NEW-1', '画像作成中（高島）')?.outcome === 'source_changed_after_migration'
+    && stepOf(newRow.id, 'img_production_top')?.state === 'todo');
+
+  // 人が動かした工程は上書きしない
+  const untouchedId = Number(insDraft.run('IMG-TOUCHED-1', '触った商品', null, 0).lastInsertRowid);
+  wfp2.setStepState(untouchedId, 'img_request_top', { note: '手で準備中' }, 'smoke', ADMIN);
+  const prev4 = await iimp.importImageDbByStatus({
+    actor: 'smoke', ...diImg, query: async () => ({ pages: [imgPage('IMG-TOUCHED-1', '画像確認（田中）')] }),
+  });
+  check('画像DB: 担当・メモが入っている画像工程は書かない (警告)',
+    byCode(prev4, 'IMG-TOUCHED-1').outcome === 'would_update'
+    && byCode(prev4, 'IMG-TOUCHED-1').warnings.some((w) => w.includes('工程は書きません')));
+
+  // 保留: プレビュー後に人が保留状態を変えたら実行は止まる (snapshot 不一致)
+  {
+    const holdId = Number(insDraft.run('IMG-HOLD-1', '保留テスト', null, 0).lastInsertRowid);
+    const diHold = { ...diImg, query: async () => ({ pages: [imgPage('IMG-HOLD-1', '保留')] }) };
+    const ph = await iimp.importImageDbByStatus({ actor: 'smoke', ...diHold });
+    dbmod.setImageWorkflowState(db, holdId, 'on_hold', { note: '人が保留', actor: 'smoke' });
+    let holdMis = null;
+    try { await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: ph.snapshot, ...diHold }); } catch (e) { holdMis = e; }
+    check('画像DB: プレビュー後に保留状態が変わったら実行を止める', holdMis?.code === 'snapshot_mismatch');
+    const ph2 = await iimp.importImageDbByStatus({ actor: 'smoke', ...diHold });
+    check('画像DB: 既に保留中なら「台帳に記録だけ」',
+      byCode(ph2, 'IMG-HOLD-1').outcome === 'would_ledger_only' || byCode(ph2, 'IMG-HOLD-1').outcome === 'would_update',
+      byCode(ph2, 'IMG-HOLD-1').outcome);
+    const ph3 = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: ph2.snapshot, ...diHold });
+    check('画像DB: 保留中のまま実行 → 保留を維持 (人の理由を上書きしない)',
+      (ph3.summary.ledger_only + ph3.summary.updated) === 1
+      && db.prepare('SELECT hold_note FROM draft_image_production WHERE draft_id = ?').get(holdId).hold_note === '人が保留');
+  }
+
+  // 対象ステータスの一部が Notion に無い → プレビューは通るが実行は止める
+  {
+    const partial = { properties: { Status: { type: 'select', select: { options: [{ name: '構成作成中' }, { name: '完了' }] } } } };
+    const diPart = { ...diImg, request: async () => partial, query: async () => ({ pages: [imgPage('IMG-PART-1', '構成作成中')] }) };
+    const pp = await iimp.importImageDbByStatus({ actor: 'smoke', ...diPart });
+    let partErr = null;
+    try { await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: pp.snapshot, ...diPart }); } catch (e) { partErr = e; }
+    check('画像DB: 選択肢が一部欠けていたらプレビューで報告し実行は止める',
+      pp.missingStatuses.length === 3 && partErr?.code === 'missing_statuses'
+      && !db.prepare('SELECT 1 FROM product_drafts WHERE ne_code = ?').get('IMG-PART-1'));
+  }
+
+  // Status の選択肢が全部消えていたら fail-closed
+  let noOpt = null;
+  try {
+    await iimp.importImageDbByStatus({ actor: 'smoke', ...diImg, request: async () => ({ properties: { Status: { type: 'select', select: { options: [{ name: '完了' }] } } } }) });
+  } catch (e) { noOpt = e; }
+  check('画像DB: 対象ステータスが Notion に無ければ止める (0件成功にしない)', !!noOpt && /見つかりません/.test(noOpt.message));
+
+  // 画像制作 upsert に canva_url が乗る (部分更新で他列を消さない)
+  dbmod.upsertImageProduction(db, newRow.id, { canva_url: 'https://canva.link/new' });
+  const ip2 = db.prepare('SELECT canva_url, importance_tier, workflow_state FROM draft_image_production WHERE draft_id = ?').get(newRow.id);
+  check('画像DB: canva_url の部分更新で他列・保留状態を消さない',
+    ip2.canva_url === 'https://canva.link/new' && ip2.importance_tier === 'そこそこ力を入れる（6〜8枚）' && ip2.workflow_state === 'active');
+
+  // 保留中は画像工程を動かせない (本流は動く)。解除で動く
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'on_hold', { note: 'テスト保留', actor: 'smoke' });
+  let holdStep = null;
+  try { wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'doing' }, 'smoke', ADMIN); } catch (e) { holdStep = e; }
+  check('画像DB: 保留中は画像工程を動かせない (400)', holdStep?.status === 400 && /保留中/.test(holdStep.message)
+    && stepOf(roomsRow.id, 'img_request_top')?.state === 'todo', holdStep?.message);
+  let holdMove = null;
+  try { wfp2.moveBoardCard(roomsRow.id, { view: 'image', kind: 'top', to: 'production', expectedCurrent: 'img_request_top' }, 'smoke', ADMIN); } catch (e) { holdMove = e; }
+  check('画像DB: 保留中はボード D&D も止まる', !!holdMove && /保留中/.test(holdMove.message), holdMove?.message);
+  check('画像DB: 保留中でも本流工程は動く', wfp2.setStepState(roomsRow.id, 'basic_info', { note: '本流メモ' }, 'smoke', ADMIN).changed === true);
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' });
+  check('画像DB: 解除後は画像工程が動く', wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'doing' }, 'smoke', ADMIN).changed === true);
+  wfp2.setStepState(roomsRow.id, 'img_request_top', { state: 'todo' }, 'smoke', ADMIN);
+
+  // プレビュー後に人が空欄を埋めた → 実行はそのカードだけ失敗し台帳に載らない
+  {
+    const raceId = Number(insDraft.run('IMG-RACE-1', '競合テスト', null, 0).lastInsertRowid);
+    const diRace = { ...diImg, query: async () => ({ pages: [imgPage('IMG-RACE-1', '構成作成中')] }) };
+    const pr = await iimp.importImageDbByStatus({ actor: 'smoke', ...diRace });
+    db.prepare("UPDATE product_drafts SET drive_folder_url = 'https://drive.google.com/drive/folders/HUMAN' WHERE id = ?").run(raceId);
+    let raceRun = null;
+    try { raceRun = await iimp.importImageDbByStatus({ actor: 'smoke', dryRun: false, expectedSnapshot: pr.snapshot, ...diRace }); } catch (e) { raceRun = { err: e }; }
+    check('画像DB: プレビュー後に人が入力した項目があれば snapshot 不一致か、そのカードだけ失敗 (台帳に載らない)',
+      (raceRun.err?.code === 'snapshot_mismatch' || byCode(raceRun, 'IMG-RACE-1')?.outcome === 'failed')
+      && !db.prepare('SELECT 1 FROM draft_image_notion_imports WHERE draft_id = ?').get(raceId)
+      && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(raceId).drive_folder_url.endsWith('HUMAN'),
+      JSON.stringify(raceRun.err ? raceRun.err.code : raceRun.results));
+  }
+
+  // ボード: 保留カードにフラグ (画像ビュー)
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'on_hold', { note: 'テスト保留', actor: 'smoke' });
+  const bImg = wfp2.boardData(db, { view: 'image' });
+  const holdCard = [...bImg.columns.flatMap((c) => c.cards), ...bImg.doneCards].find((c) => c.id === roomsRow.id);
+  check('画像DB: 画像ビューのカードに保留フラグと理由が乗る (滞留日数は付けない)',
+    holdCard && holdCard.imageOnHold === true && holdCard.imageHoldNote === 'テスト保留' && holdCard.kindStalledDays == null,
+    JSON.stringify(holdCard && { imageOnHold: holdCard.imageOnHold, note: holdCard.imageHoldNote, stalled: holdCard.kindStalledDays }));
+  dbmod.setImageWorkflowState(db, roomsRow.id, 'active', { actor: 'smoke' });
+}
+
 {
   const fs = await import('node:fs');
   const vm = await import('node:vm');

@@ -929,6 +929,42 @@ export function initProductHubDB() {
     }
   }
 
+  // 2026-08-26 Notion 画像DB (商品ページ商品画像登録) 移植 (要件定義 = AI_reference『Notion画像DB移植_要件定義_20260826.md』)。
+  //   canva_url       … Notion「Canva」プロパティ (制作中デザインのリンク)
+  //   workflow_state  … **画像制作だけの保留** (中原さん決定 8/26)。商品本流の on_hold と違い、
+  //                     本流・AI・ボード本流は止めず、画像トラックと楽天出品ゲートだけを閉じる
+  //   hold_note       … 保留の理由 (任意)
+  const ipCols = new Set(db.prepare('PRAGMA table_info(draft_image_production)').all().map((c) => c.name));
+  const ipAlters = [
+    ['canva_url', 'ALTER TABLE draft_image_production ADD COLUMN canva_url TEXT'],
+    ['workflow_state', "ALTER TABLE draft_image_production ADD COLUMN workflow_state TEXT NOT NULL DEFAULT 'active' CHECK (workflow_state IN ('active', 'on_hold'))"],
+    ['hold_note', 'ALTER TABLE draft_image_production ADD COLUMN hold_note TEXT'],
+  ];
+  for (const [col, sql] of ipAlters) {
+    if (ipCols.has(col)) continue;
+    try {
+      db.exec(sql);
+    } catch (e) {
+      if (!/duplicate column/i.test(String(e?.message || ''))) throw e;
+    }
+  }
+  // 画像DB移植の**移植元カード台帳** (Codex R1: 画像DBは 1 ドラフト : 1 カードでない。
+  // draft_image_production に page id を 1 つ置くと、同じ商品の他カードの冪等・監査情報を失う)。
+  // notion_page_id が PK = 同じカードを二度取り込まない。source_hash は再実行時の「同じ内容 / 変わった」判定
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS draft_image_notion_imports (
+      notion_page_id   TEXT PRIMARY KEY,
+      draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      source_ne_code   TEXT NOT NULL,
+      source_status    TEXT,
+      drive_folder_url TEXT,
+      source_hash      TEXT NOT NULL,
+      import_run_id    TEXT NOT NULL,
+      imported_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_dini_draft ON draft_image_notion_imports(draft_id);
+  `);
+
   // 役割・工程の初期値。INSERT OR IGNORE なので、管理画面で改名・並べ替え・無効化しても
   // 毎起動で巻き戻らない (code が PK)。ph_steps.role_code は ph_roles を参照するので順序が要る
   const roleSeed = db.prepare('INSERT OR IGNORE INTO ph_roles (code, label, sort, builtin) VALUES (?, ?, ?, 1)');
@@ -1085,10 +1121,39 @@ export function upsertDraftYahoo(db, draftId, fields) {
   `).run({ draft_id: draftId, ...merged });
 }
 
+export const IMAGE_WORKFLOW_STATES = ['active', 'on_hold'];
+
+/**
+ * 画像制作だけの保留 / 解除 (2026-08-26 中原さん決定: Notion 画像DB の「保留」= 画像制作の保留であって
+ * 商品そのものの保留ではない)。product_drafts.status は触らない。
+ * 行が無ければ作る (INSERT OR IGNORE → UPDATE)。冪等: 同じ状態なら changed=false でイベントも残さない
+ */
+export function setImageWorkflowState(db, draftId, state, { note = null, actor = null } = {}) {
+  const st = String(state || '');
+  if (!IMAGE_WORKFLOW_STATES.includes(st)) throw new Error('画像制作の状態の指定が不正です');
+  const id = Number(draftId);
+  const run = db.transaction(() => {
+    db.prepare('INSERT OR IGNORE INTO draft_image_production (draft_id) VALUES (?)').run(id);
+    const cur = db.prepare('SELECT workflow_state, hold_note FROM draft_image_production WHERE draft_id = ?').get(id);
+    const noteClean = note == null ? null : (String(note).trim().slice(0, 300) || null);
+    if (cur.workflow_state === st && (st === 'active' || (cur.hold_note ?? null) === noteClean)) return { changed: false };
+    db.prepare(`
+      UPDATE draft_image_production
+      SET workflow_state = ?, hold_note = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE draft_id = ?
+    `).run(st, st === 'on_hold' ? noteClean : null, id);
+    logEvent(db, id, st === 'on_hold' ? 'image_hold' : 'image_resume',
+      st === 'on_hold' ? (noteClean || '画像制作を保留') : '画像制作の保留を解除', actor);
+    return { changed: true };
+  });
+  return run();
+}
+
 const IMAGE_PRODUCTION_FIELDS = [
   'status', 'importance_tier', 'production_type', 'aplus_content', 'aplus_related',
   'camera_instruction_url', 'shipping_status', 'reference_collection',
   'designer', 'page_composer', 'request_text',
+  'canva_url',   // 2026-08-26 Notion 画像DB の「Canva」(制作中デザインのリンク) 移植で追加
 ];
 
 /** draft_image_production の upsert (部分更新)。自社商品のみ呼ぶ想定 (router 側でガード) */

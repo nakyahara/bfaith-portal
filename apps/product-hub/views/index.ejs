@@ -101,6 +101,24 @@
           </div>
           <div id="mig-detail" style="margin-top:10px; max-height:320px; overflow-y:auto;"></div>
         </div>
+
+        <!-- Notion 画像DB (商品ページ商品画像登録) の移植 (2026-08-26 中原さん指示)。
+             対象 = 構成作成中 / 画像作成中（高島） / 画像確認（田中） / 保留。画像制作の情報と画像工程を入れる -->
+        <div style="margin-top:14px; padding:10px 12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;">
+          <div style="font-size:13px; margin-bottom:8px;">
+            <strong>画像DB (商品ページ商品画像登録) の移植</strong> — Notion 画像DBの Status が
+            <strong>構成作成中 / 画像作成中（高島） / 画像確認（田中） / 保留</strong> の商品を取り込みます。
+            画像フォルダ・Amazon URL・重要商品区分・撮影指示・Canva・依頼文を<strong>アプリ側が空のときだけ</strong>埋め、
+            画像トラックの工程を Notion の段階に合わせます (「保留」は画像制作だけ保留)。商品本体の情報・Notion 側には触りません。
+            商品マスターにある商品は、先に上の「①〜⑥の一括移植」で本体を入れてください。
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+            <button class="btn" id="imig-preview-btn">対象を確認 (プレビュー)</button>
+            <button class="btn btn-primary" id="imig-run-btn" disabled>移植を実行</button>
+            <span class="muted" id="imig-result"></span>
+          </div>
+          <div id="imig-detail" style="margin-top:10px; max-height:360px; overflow-y:auto;"></div>
+        </div>
       <% } %>
     </details>
   </div>
@@ -599,6 +617,89 @@
         return;
       }
       runMigrate(false);
+    });
+  }
+
+  // ─── 画像DB (商品ページ商品画像登録) の移植 (admin のみ表示。プレビュー → 実行の2段階) ───
+  const imigPreviewBtn = document.getElementById('imig-preview-btn');
+  const imigRunBtn = document.getElementById('imig-run-btn');
+  if (imigPreviewBtn && imigRunBtn) {
+    const IMIG_LABELS = {
+      would_create: '新規作成 (予定)',
+      would_update: '既存に補完 (予定)',
+      would_ledger_only: '補完なし・台帳に記録だけ (予定)',
+      created: '新規作成',
+      updated: '既存に補完',
+      ledger_only: '補完なし・台帳に記録だけ',
+      variation_conflict: 'NE に同じコードが複数 (要確認)',
+      already_migrated: '移植済み (スキップ)',
+      source_changed_after_migration: '移植済み・Notion側が変更あり (追従しません)',
+      needs_master_import: '先に商品マスターから本体を取り込んでください',
+      brand_priority_conflict: '重要度が自社商品以外 (要確認)',
+      duplicate: 'Notion側で重複 (要確認)',
+      deferred: '今回は見送り (再度プレビュー→実行で続きから)',
+      failed: '失敗',
+    };
+    let imigSnapshot = null;
+    async function runImageMigrate(dryRun) {
+      const out = document.getElementById('imig-result');
+      imigPreviewBtn.disabled = true;
+      imigRunBtn.disabled = true;
+      out.textContent = dryRun ? '対象を確認中… (Notion照会に少し時間がかかります)' : '移植中…';
+      document.getElementById('imig-detail').innerHTML = '';
+      try {
+        const res = await fetch('/apps/product-hub/api/notion-image-import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dry_run: dryRun, expected_snapshot: imigSnapshot }),
+        });
+        const json = await res.json();
+        if (!json.ok) {
+          imigSnapshot = null;
+          out.textContent = 'エラー: ' + (json.error || '不明');
+          return;
+        }
+        imigSnapshot = json.snapshot || null;
+        const s = json.summary;
+        const planned = dryRun ? (s.would_create + s.would_update + s.would_ledger_only) : (s.created + s.updated + s.ledger_only);
+        out.textContent = '対象 ' + json.total + ' 件 → ' + (dryRun ? '移植予定 ' : '移植 ') + planned
+          + ' (新規 ' + (dryRun ? s.would_create : s.created) + ' / 補完 ' + (dryRun ? s.would_update : s.updated) + ')'
+          + ' / 移植済み ' + s.already_migrated + ' / 本体未取込 ' + s.needs_master_import
+          + ' / 要確認 ' + (s.brand_priority_conflict + s.variation_conflict + s.duplicate + s.source_changed_after_migration)
+          + ' / 失敗 ' + s.failed + (s.deferred ? ' / 上限見送り ' + s.deferred : '')
+          + ((json.missingStatuses || []).length ? ' ⚠ Notionに無い選択肢: ' + json.missingStatuses.join(', ') : '');
+        const rows = json.results.map(function (r) {
+          var link = Number.isSafeInteger(r.draftId)
+            ? '<a href="/apps/product-hub/detail/' + r.draftId + '">開く</a>' : '';
+          var warn = (r.warnings || []).map(function (w) { return '<div>⚠ ' + escapeHtml(w) + '</div>'; }).join('');
+          return '<tr><td><code>' + escapeHtml(r.ne_code) + '</code><div class="muted" style="font-size:11px;">' + escapeHtml(r.name || '') + '</div></td>'
+            + '<td class="muted">' + escapeHtml(r.notion_status || '') + '</td>'
+            + '<td>' + escapeHtml(IMIG_LABELS[r.outcome] || r.outcome) + '</td>'
+            + '<td class="muted" style="font-size:12px;">' + escapeHtml(r.plan_summary || '') + (r.error ? '<div>' + escapeHtml(r.error) + '</div>' : '') + warn + '</td>'
+            + '<td>' + link + '</td></tr>';
+        }).join('');
+        document.getElementById('imig-detail').innerHTML =
+          '<table class="list"><tbody>' + rows + '</tbody></table>'
+          + (json.truncated ? '<p class="muted">…一覧は300件まで表示 (件数は上の集計が正)</p>' : '');
+        if (dryRun) {
+          imigRunBtn.disabled = planned === 0;
+          if (planned === 0) out.textContent += ' — 移植するものはありません';
+        } else if (s.deferred > 0) {
+          out.textContent += ' — 1回の上限に達しました。もう一度「対象を確認」→「実行」で続きが入ります';
+        }
+      } catch (e) {
+        out.textContent = '通信エラー: ' + e.message;
+      } finally {
+        imigPreviewBtn.disabled = false;
+      }
+    }
+    imigPreviewBtn.addEventListener('click', function () { runImageMigrate(true); });
+    imigRunBtn.addEventListener('click', function () {
+      if (!confirm('プレビューの「移植予定」の商品に、Notion 画像DBの画像情報と画像工程を入れます。\nNotion側のカードには書き戻しません。\n\nよろしいですか?')) {
+        imigRunBtn.disabled = false;
+        return;
+      }
+      runImageMigrate(false);
     });
   }
 
