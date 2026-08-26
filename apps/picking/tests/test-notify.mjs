@@ -15,6 +15,7 @@ delete process.env.WAREHOUSE_URL;
 delete process.env.WAREHOUSE_SERVICE_TOKEN;
 
 const { buildShortageText, notifyShortage } = await import('../notify.js');
+const { listStockCandidates } = await import('../stock-locations.js');
 
 let passed = 0;
 function t(name, fn) { fn(); passed++; console.log(`  ok: ${name}`); }
@@ -25,6 +26,39 @@ const INFO = {
   worker: '星',
   shortageQty: 2,
 };
+
+t('listStockCandidates: 画面用はロケ単位にまとめ (free合計・期限は近い方)・現ロケ除外・上限', () => {
+  const data = { importedAt: new Date().toISOString(), locations: [
+    { block: 'P3FB', location: '001-003-03', free: 5, quality: '良品' },                       // 現ロケ (除外)
+    { block: 'P4FA', location: '001-003-02', free: 2, quality: '良品', expiry: '20280101' },
+    { block: 'P4FA', location: '001-003-02', free: 3, quality: '良品', expiry: '20270601' },  // 同ロケ別ロット
+    { block: 'P4FA', location: '001-003-09', free: 1, quality: '不良品' },                      // 良品以外 (除外)
+    { block: 'ZZZ', location: 'ZZZ-ZZZ-ZZ', free: 40, quality: '良品' },
+  ] };
+  const g = listStockCandidates(data, { excludeBlock: 'P3FB', excludeLocation: '00100303', groupByLocation: true, maxRows: 1 });
+  assert.equal(g.fetched, true);
+  assert.deepEqual(g.rows.map((r) => [r.label, r.free, r.expiry]), [['P4FA-001-003-02', 5, '2027/06/01']]);
+  assert.equal(g.truncated, 1, 'ZZZ が上限で落ちた件数');
+  const raw = listStockCandidates(data, { excludeBlock: 'P3FB', excludeLocation: '00100303' });
+  assert.equal(raw.rows.length, 3, '通知用はロットごと');
+  assert.equal(listStockCandidates(null).fetched, false, '取得失敗は fetched=false (候補ゼロと区別)');
+});
+
+t('buildShortageText v2: 判断結果で見出しが変わる (他ロケ全量確保/後で取りに行く/どこにもない)', () => {
+  const alt = buildShortageText({ ...INFO, shortageQty: 2, altFree: 1,
+    line: { ...INFO.line, alt_block: 'P4FA', alt_location: '001-003-02', alt_qty: 2, remaining_qty: 0, remaining: null } });
+  assert.ok(alt.startsWith('📦 他ロケからピッキングしました — ロジザードで数量を減らしてください'), alt);
+  assert.ok(alt.includes('→ P4FA-001-003-02 から 2個 確保しました (表示在庫1より多い・現物優先)'), alt);
+  assert.ok(alt.includes('ロジザード: P4FA-001-003-02 の在庫を 2個 減らしてください'), alt);
+  assert.ok(!alt.includes('他ロケ在庫'), '全量確保のときは他ロケ一覧を付けない');
+  const later = buildShortageText({ ...INFO, shortageQty: 3, stockText: '📍 他ロケ在庫: なし',
+    line: { ...INFO.line, alt_block: 'P4FA', alt_location: '001-003-02', alt_qty: 1, remaining_qty: 2, remaining: 'later' } });
+  assert.ok(later.startsWith('🕒 ピッキング欠品 — 後で取りに行きます'), later);
+  assert.ok(later.includes('残り 2個 → 後で取りに行きます') && later.includes('📍 他ロケ在庫: なし'), later);
+  const none = buildShortageText({ ...INFO, shortageQty: 1, line: { ...INFO.line, remaining_qty: 1, remaining: 'none' } });
+  assert.ok(none.startsWith('❌ ピッキング欠品 — どのロケにも在庫がありません'), none);
+  assert.ok(none.includes('指定ロケで不足 1個 / 指示 3個 (2個は確保済み)'), none);
+});
 
 t('buildShortageText: バッチ/ロケ/商品/商品コード/数量/作業者が入る (一部欠品は確保数も)', () => {
   const text = buildShortageText(INFO);

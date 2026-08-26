@@ -36,21 +36,58 @@ export function resolveLineTo(now = new Date()) {
   return { to: parseTo(process.env.PICKING_LINE_TO), holiday };
 }
 
-/** 読み手ファースト (現場の管理者が次の行動を決められる形) の欠品メッセージ。 */
-export function buildShortageText({ batch, line, worker, shortageQty, stockText }) {
+/**
+ * 読み手ファースト (現場の管理者が次の行動を決められる形) の欠品メッセージ。
+ * v2 (2026-08-26): ピッカーの判断結果で見出しを変える。
+ *   - 他ロケで全量確保 → 「ロジザードで数量を減らしてください」(事務の次の行動が主題)
+ *   - 残りを後で取りに行く / どこにもない → 欠品として、他ロケ在庫を添える
+ * @param altFree 画面に出ていた確保ロケの表示在庫 (記録しない。表示より多く確保したときの一言用)
+ */
+export function buildShortageText({ batch, line, worker, shortageQty, stockText, altFree = null }) {
+  const alt = Number(line.alt_qty) || 0;
+  const remQty = line.remaining_qty ?? (shortageQty - alt);
+  const rem = line.remaining || null;
   const picked = line.qty - shortageQty;
+  const fromLoc = line.locationLabel || line.location;
+  const altLabel = line.alt_block && line.alt_location && !String(line.alt_location).startsWith(`${line.alt_block}-`) && line.alt_location !== line.alt_block
+    ? `${line.alt_block}-${line.alt_location}` : (line.alt_location || line.alt_block || '');
+  const v2 = alt > 0 || rem != null;
+  let head = '🚨 ピッキング欠品';
+  if (alt > 0 && remQty === 0) head = '📦 他ロケからピッキングしました — ロジザードで数量を減らしてください';
+  else if (rem === 'later') head = '🕒 ピッキング欠品 — 後で取りに行きます';
+  else if (rem === 'none') head = '❌ ピッキング欠品 — どのロケにも在庫がありません';
   return [
-    '🚨 ピッキング欠品',
+    head,
     `${batch.folder_name || ''}｜${batch.hikiate_class}`,
-    `ロケ: ${line.locationLabel || line.location}`,
+    `ロケ: ${fromLoc}`,
     `商品: ${line.product_name || ''}`,
     // NE在庫修正でそのまま検索・コピーできるよう独立行 (2026-08-16 中原さん要望)
     `商品コード: ${line.sku}`,
-    `欠品 ${shortageQty}個 / 指示 ${line.qty}個${picked > 0 ? ` (${picked}個は確保済み)` : ''}`,
+    v2
+      ? `指定ロケで不足 ${shortageQty}個 / 指示 ${line.qty}個${picked > 0 ? ` (${picked}個は確保済み)` : ''}`
+      : `欠品 ${shortageQty}個 / 指示 ${line.qty}個${picked > 0 ? ` (${picked}個は確保済み)` : ''}`,
+    alt > 0 ? `→ ${altLabel} から ${alt}個 確保しました${Number.isFinite(Number(altFree)) && alt > Number(altFree) ? ` (表示在庫${altFree}より多い・現物優先)` : ''}` : null,
+    alt > 0 && remQty === 0 ? `ロジザード: ${altLabel} の在庫を ${alt}個 減らしてください` : null,
+    remQty > 0 && v2 ? `残り ${remQty}個 → ${rem === 'later' ? '後で取りに行きます' : '欠品確定 (どこにもない)'}` : null,
     `作業者: ${worker}`,
-    // 他ロケ在庫 (ロジザード在庫スナップショット。取得失敗時も「取得できず」を必ず出す)
-    stockText || null,
+    // 他ロケ在庫 (ロジザード在庫スナップショット。取得失敗時も「取得できず」を必ず出す)。
+    // 全量確保できたときは不要 (読み手の次の行動は在庫減算だけ)
+    (alt > 0 && remQty === 0) ? null : (stockText || null),
   ].filter((s) => s !== null).join('\n');
+}
+
+/** back で欠品記録が取り消されたときの訂正 (GChatのみ・fail-soft)。 */
+export async function notifyShortageUndo({ batch, line, worker }) {
+  if (!process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
+  const text = [
+    '↩ 訂正: さきほどの欠品記録は取り消されました (ピッカーが「前へ」で戻しました)',
+    `${batch.folder_name || ''}｜${batch.hikiate_class}`,
+    `ロケ: ${line.locationLabel || line.location} / 商品コード: ${line.sku}`,
+    Number(line.alt_qty) > 0 ? `※ 他ロケ (${line.alt_location}) から ${line.alt_qty}個 確保の記録も取消 — ロジザード減算をしていれば戻してください` : null,
+    `作業者: ${worker}`,
+  ].filter((s) => s !== null).join('\n');
+  await sendGChat(text);
+  return 'sent';
 }
 
 async function postJson(url, headers, body) {

@@ -293,6 +293,59 @@ t('shortage: 数量の範囲検証・表示中以外は out_of_order', () => {
   expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 1 }, W1), 'out_of_order');
 });
 
+t('shortage v2: open→resolve の区間が paused_total_sec に入り、他ロケ確保と残りが記録される', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  applyEvent(id, { opId: op(), event: 'next', lineSeq: 1 }, W1);
+  const t0 = Date.now() - 90 * 1000;
+  applyEvent(id, { opId: op(), event: 'shortage_open', lineSeq: 2, clientAt: new Date(t0).toISOString() }, W1);
+  let b = getDB().prepare('SELECT * FROM pk_batches WHERE id=?').get(id);
+  assert.equal(b.shortage_open_seq, 2);
+  // 開き直し (再送) は開始時刻を動かさない
+  applyEvent(id, { opId: op(), event: 'shortage_open', lineSeq: 2, clientAt: new Date().toISOString() }, W1);
+  assert.equal(getDB().prepare('SELECT shortage_open_at FROM pk_batches WHERE id=?').get(id).shortage_open_at, b.shortage_open_at);
+  // 指示2: 他ロケで1個確保・残り1は後で取りに行く
+  const r = applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 2, shortageQty: 2,
+    altBlock: 'P4FA', altLocation: '00100302', altQty: 1, remaining: 'later', clientAt: new Date().toISOString() }, W1);
+  assert.equal(r.currentSeq, 3);
+  const l = getDB().prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=2').get(id);
+  assert.deepEqual([l.status, l.shortage_qty, l.alt_block, l.alt_location, l.alt_qty, l.remaining_qty, l.remaining],
+    ['shortage', 2, 'P4FA', '00100302', 1, 1, 'later']);
+  b = getDB().prepare('SELECT * FROM pk_batches WHERE id=?').get(id);
+  assert.equal(b.shortage_open_seq, null);
+  assert.ok(b.paused_total_sec >= 85 && b.paused_total_sec <= 95, `欠品対応の約90秒が中断扱い (${b.paused_total_sec})`);
+  // 明細の所要時間 (done_at - shown_at) からも除外される = shown_at が後ろへずれる (Codex R2)
+  const lineSec = Math.round((Date.parse(l.done_at) - Date.parse(l.shown_at)) / 1000);
+  assert.ok(lineSec <= 5, `明細時間に欠品対応が乗らない (${lineSec}s)`);
+  // 全量を他ロケで確保 → remaining_qty=0・remaining=null (欠品には数えない)
+  applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 3, shortageQty: 3, altBlock: 'P4FA', altLocation: '00100303', altQty: 3 }, W1);
+  const l3 = getDB().prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=3').get(id);
+  assert.deepEqual([l3.remaining_qty, l3.remaining, l3.alt_qty], [0, null, 3]);
+  const sum = getDailySummary(getDB().prepare('SELECT work_date FROM pk_batches WHERE id=?').get(id).work_date);
+  const mine = sum.shortages.filter((x) => x.batch_id === id);
+  assert.deepEqual(mine.map((x) => x.seq), [2], '他ロケで全量確保した seq3 は欠品一覧に出ない');
+});
+
+t('shortage v2: cancel で計測再開・検証 (alt_qty範囲/ロケ必須/remaining値)', () => {
+  const id = makeBatch();
+  applyEvent(id, { opId: op(), event: 'start' }, W1);
+  const t0 = Date.now() - 30 * 1000;
+  applyEvent(id, { opId: op(), event: 'shortage_open', lineSeq: 1, clientAt: new Date(t0).toISOString() }, W1);
+  applyEvent(id, { opId: op(), event: 'shortage_cancel', lineSeq: 1, clientAt: new Date().toISOString() }, W1);
+  const b = getDB().prepare('SELECT * FROM pk_batches WHERE id=?').get(id);
+  assert.equal(b.shortage_open_seq, null);
+  assert.ok(b.paused_total_sec >= 25 && b.paused_total_sec <= 35, `やめた分も中断扱い (${b.paused_total_sec})`);
+  assert.equal(getWorkState(id).lines[0].status, 'pending', '記録は残らない');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage_open', lineSeq: 2 }, W1), 'out_of_order');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 1, altQty: 2, altLocation: 'x' }, W1), 'bad_alt_qty');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 1, altQty: 1 }, W1), 'bad_alt_location');
+  expectPkError(() => applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 1, remaining: 'maybe' }, W1), 'bad_remaining');
+  // 旧クライアント (alt/remaining 無し) = 残り全量・none
+  applyEvent(id, { opId: op(), event: 'shortage', lineSeq: 1, shortageQty: 1 }, W1);
+  const l = getDB().prepare('SELECT * FROM pk_lines WHERE batch_id=? AND seq=1').get(id);
+  assert.deepEqual([l.remaining_qty, l.remaining, l.alt_qty], [1, 'none', null]);
+});
+
 t('back: 欠品明細も取り消せる (shortage_qtyがクリアされる)', () => {
   const id = makeBatch();
   applyEvent(id, { opId: op(), event: 'start' }, W1);

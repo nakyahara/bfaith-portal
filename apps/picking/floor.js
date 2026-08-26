@@ -333,6 +333,7 @@ function buildQuality(db, workDate) {
     JOIN pk_batches b ON b.id = l.batch_id
     WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
       AND l.status = 'shortage'
+      AND COALESCE(l.remaining_qty, l.shortage_qty, 1) > 0   -- 他ロケで全量確保した分は欠品に数えない
   `).get(workDate).c;
   try {
     const rows = db.prepare(`

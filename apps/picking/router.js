@@ -26,8 +26,9 @@ import {
   getPickingStats, getTodayProgress, getMissStats, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
 import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert } from './service.js';
-import { notifyShortage } from './notify.js';
+import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
+import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
 import { enqueueBatchSync, fetchNotionWorkerNames, STATUS_PICKING, STATUS_PICKED } from './notion.js';
 import { getFloorData } from './floor.js';
 // ロケーション動線マスタ (NEXTサイン)。起動時にマスタが空なら同梱CSVで初期化する
@@ -352,6 +353,12 @@ const NOTION_STATUS_BY_BATCH = {
 router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) => {
   const batchId = Number(req.params.id);
   const worker = resolveWorker(req);
+  // back で取り消される明細が欠品記録なら、適用後に訂正通知を出すため先に控える
+  let undoneShortage = null;
+  if (req.body.event === 'back') {
+    const l = listLines(batchId).find((x) => x.seq === Number(req.body.line_seq));
+    if (l && l.status === 'shortage') undoneShortage = { ...l, locationLabel: formatLocation(l.block, l.location) };
+  }
   const result = applyEvent(batchId, {
     opId: req.body.op_id,
     event: req.body.event,
@@ -360,6 +367,11 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     undoOpId: req.body.undo_op_id || null,
     shortageQty: req.body.shortage_qty == null ? null : Number(req.body.shortage_qty),
     pauseReason: req.body.pause_reason || null,
+    // 欠品フローv2: 他ロケで確保した分と残りの扱い
+    altBlock: req.body.alt_block || null,
+    altLocation: req.body.alt_location || null,
+    altQty: req.body.alt_qty == null || req.body.alt_qty === '' ? null : Number(req.body.alt_qty),
+    remaining: req.body.remaining || null,
   }, worker.id);
   // 欠品は管理者チャットへ即時通知 (fail-soft・要件§5.6)。replayed の再送では通知しない。
   // outbox は持たない設計判断: 重複は「backして再度欠品にした」正当な操作のみ・
@@ -373,8 +385,14 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         line: { ...line, locationLabel: formatLocation(line.block, line.location) },
         worker: worker.name,
         shortageQty: line.shortage_qty ?? line.qty,
+        altFree: req.body.alt_free == null ? null : Number(req.body.alt_free),
       }).catch((e) => console.warn(`[picking-notify] 欠品通知失敗 (${line.sku}): ${e.message}`));
     }
+  }
+  // 欠品記録の取消 (back) は通知先へ訂正を流す (通知は消せないので追送 — Codex R1)
+  if (req.body.event === 'back' && !result.replayed && undoneShortage) {
+    notifyShortageUndo({ batch: getBatch(batchId), line: undoneShortage, worker: worker.name })
+      .catch((e) => console.warn(`[picking-notify] 欠品訂正通知失敗 (${undoneShortage.sku}): ${e.message}`));
   }
   // Notion連携 (fail-soft)。replayed では動かさない。ラベルは送信直前にバッチの
   // 最新状態から決める (イベント時点のラベルだと並行PATCHの順序逆転で巻き戻る)
@@ -485,6 +503,21 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
 }));
 
 /** 作業状態の再取得 (リロード・オンライン復帰時の同期用)。 */
+/**
+ * 欠品フローv2: 表示中明細の同一SKUの他ロケ在庫 (ロジザード毎時スナップショット) を画面に出す。
+ * 取得失敗 (fetched=false) と候補ゼロ (rows=[]) は区別して返す — 失敗時に「どこにもない」を既定にしない
+ */
+router.get('/api/batches/:id(\\d+)/stock-locations', api(async (req, res) => {
+  const batchId = Number(req.params.id);
+  const seq = Number(req.query.seq);
+  const line = listLines(batchId).find((l) => l.seq === seq);
+  if (!line) throw new PkError(404, 'line_not_found', '明細がありません');
+  if (!stockLookupConfigured()) return res.json({ ok: true, configured: false, fetched: false, rows: [] });
+  const data = await fetchStockLocations(line.sku);
+  const out = listStockCandidates(data, { excludeBlock: line.block, excludeLocation: line.location, groupByLocation: true, maxRows: 40 });
+  res.json({ ok: true, configured: true, sku: line.sku, ...out });
+}));
+
 router.get('/api/batches/:id(\\d+)/state', api(async (req, res) => {
   const s = getWorkState(Number(req.params.id));
   res.json({

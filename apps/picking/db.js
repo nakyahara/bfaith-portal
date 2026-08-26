@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -220,6 +220,18 @@ const MIGRATIONS = {
     }
     db.exec(`UPDATE pk_product_images SET fetched_at = '2000-01-01T00:00:00Z'
       WHERE status = 'ok' AND manage_number IS NOT NULL AND lower(ne_code) <> lower(manage_number)`);
+  },
+  // v10: 欠品フローv2 (要件『ピッキング欠品フローv2_要件定義_20260826.md』・中原さん承認 2026-08-26)。
+  //   欠品ボタン押下〜判断確定を「欠品対応セッション」として計測から除外し (paused_total_sec に加算)、
+  //   判断結果 (他ロケで確保した数・残りをどうするか) を明細に持つ。履歴は pk_events が正
+  10: () => {
+    db.exec('ALTER TABLE pk_batches ADD COLUMN shortage_open_at TEXT');     // 対応中の欠品セッション開始時刻
+    db.exec('ALTER TABLE pk_batches ADD COLUMN shortage_open_seq INTEGER'); // その明細 seq
+    db.exec('ALTER TABLE pk_lines ADD COLUMN alt_block TEXT');       // 他ロケで確保: ブロック
+    db.exec('ALTER TABLE pk_lines ADD COLUMN alt_location TEXT');    // 他ロケで確保: ロケ
+    db.exec('ALTER TABLE pk_lines ADD COLUMN alt_qty INTEGER');      // 他ロケで確保した数
+    db.exec('ALTER TABLE pk_lines ADD COLUMN remaining_qty INTEGER'); // 確保できなかった残り (0=全量他ロケで確保)
+    db.exec("ALTER TABLE pk_lines ADD COLUMN remaining TEXT");        // 残りの扱い: 'later'(後で取りに行く) | 'none'(どこにもない)
   },
 };
 
