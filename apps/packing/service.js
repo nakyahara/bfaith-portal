@@ -508,10 +508,10 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
 const LINE_EVENTS = ['line_sort_start', 'line_sort_done', 'line_start', 'line_stop', 'line_done'];
 // 伝票単位のイベント (梱包機バッチでは不可 — 伝票状態とライン工程の矛盾を作らない。Codex high)。
 // undo はライン専用の段階的取消として別実装、takeover/pause/resume/cancel は両方で使える
-const SLIP_ONLY_EVENTS = ['start', 'next', 'jump', 'ship_change', 'reprint',
+const SLIP_ONLY_EVENTS = ['start', 'next', 'jump', 'ship_change', 'reprint', 'label_missing',
   'shortage', 'excess', 'wrong_item', 'found', 'receive'];
 const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump', 'ship_change',
-  'reprint', 'shortage', 'excess', 'wrong_item', 'found', 'receive', ...LINE_EVENTS];
+  'reprint', 'label_missing', 'shortage', 'excess', 'wrong_item', 'found', 'receive', ...LINE_EVENTS];
 
 /**
  * 梱包機ライン種別 (要件v7 — 中原さん指示 2026-08-18)。
@@ -923,9 +923,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, batch.folder_name, slip.delivery_method,
         proposed, reason, worker, now, now);
-    } else if (event === 'reprint') {
+    } else if (event === 'reprint' || event === 'label_missing') {
       // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示): 記録+即時通知のみ。伝票状態は変えず、
       // 梱包画面にも痕跡を出さない (理由入力なし)。完了済み伝票でも押せる (配送変更と同様)
+      // 📭 label_missing (2026-08-26): 「送り状が束に無かった」の事務通知。経路は再印刷と同一 (kind で区別)
       if (batch.status !== 'packing' && batch.status !== 'done') {
         throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
       }
@@ -934,10 +935,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
       const info = db.prepare(`
         INSERT INTO pk_pack_reprints (batch_id, slip_seq, ne_slip_no, site_order_no, folder_name,
-          recipient_name, requested_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          recipient_name, requested_by, created_at, kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(batchId, slipSeq, slip.ne_slip_no, slip.site_order_no || null, batch.folder_name,
-        slip.recipient_name || null, worker, now);
+        slip.recipient_name || null, worker, now, event);
       var reprintId = Number(info.lastInsertRowid);   // eventResult後にresultへ載せる (var=分岐外参照)
     } else if (['shortage', 'excess', 'wrong_item', 'found', 'receive'].includes(event)) {
       // ①不足→再ピック / ②余り→棚戻し / 品違い / 見つかった / 受領 (要件§5.4〜5.6)。
@@ -1132,7 +1133,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // eventResult はこのイベント行の INSERT より前に走るため、lastDoneSeq (イベント履歴由来) に
     // いま完了させた伝票が反映されない。next のときはここで上書きする
     if (event === 'next') result.lastDoneSeq = slipSeq;
-    if (event === 'reprint' && typeof reprintId !== 'undefined') result.reprintId = reprintId;
+    if ((event === 'reprint' || event === 'label_missing') && typeof reprintId !== 'undefined') result.reprintId = reprintId;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
         || finalCount != null || manualCount != null || excludedCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,

@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -387,6 +387,11 @@ const MIGRATIONS = {
   //   工程の所要時間 (started→finished) から差し引けるようにする
   11: () => {
     db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN paused_total_sec INTEGER NOT NULL DEFAULT 0');
+  },
+  // v12: 📭「送り状がなかった」通知 (2026-08-26 中原さん指示)。再印刷と同じ伝達経路
+  //   (事務スペースへ即時通知+送り状PDF追送+未通知は再送) なので同じ表に kind で区別する
+  12: () => {
+    db.exec("ALTER TABLE pk_pack_reprints ADD COLUMN kind TEXT NOT NULL DEFAULT 'reprint'");
   },
 };
 

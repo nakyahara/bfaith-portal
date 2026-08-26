@@ -399,7 +399,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
   // テキスト通知を先に送り、送り状PDFの抜き出しは非同期で追送 (Codex high: Drive処理を
   // await すると「即時」にならず応答も塞ぐ)。webhook成功→DB更新間のクラッシュでは
   // 再送により同内容が重複し得る (NE伝票番号併記で判別可能・webhookにexactly-onceは無い)
-  if (req.body.event === 'reprint' && !result.replayed && result.reprintId) {
+  if (['reprint', 'label_missing'].includes(req.body.event) && !result.replayed && result.reprintId) {
     const row = getDB().prepare('SELECT * FROM pk_pack_reprints WHERE id=?').get(result.reprintId);
     if (row) {
       const lines = getDB().prepare(`
@@ -409,7 +409,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
       `).all(row.batch_id, row.slip_seq);
       try {
         const sent = await notifyReprint({
-          folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
+          kind: row.kind, folderName: row.folder_name, slipSeq: row.slip_seq, neSlipNo: row.ne_slip_no,
           siteOrderNo: row.site_order_no, recipientName: row.recipient_name, worker, lines,
         });
         getDB().prepare('UPDATE pk_pack_reprints SET notified_at=?, notify_error=? WHERE id=?')
