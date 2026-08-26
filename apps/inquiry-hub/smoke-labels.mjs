@@ -185,8 +185,11 @@ console.log('4. HTTP');
 
   // 一覧: チップが色付きで出る + ラベル絞込select
   const list = await (await fetch(base + '/?view=all')).text();
-  check('一覧: 状態の隣に「ラベル」列+色チップ (2026-08-25 メールディーラー同配置)',
-    list.includes('<th>状態</th><th>ラベル</th>') && list.includes('class="lbl"') && list.includes('#123456'));
+  // 列順は 状態 → 受信日時 → ラベル (2026-08-26 に受信日時を割り込ませた。
+  // メールディーラーも 状態 → 担当者 → 日付 → ラベル の並び)
+  check('一覧: 受信日時の隣に「ラベル」列+色チップ',
+    /<th[^>]*>受信日時<\/th><th>ラベル<\/th>/.test(list) && list.includes('class="lbl"') && list.includes('#123456'), 
+    list.slice(list.indexOf('<thead>'), list.indexOf('</thead>')));
   check('一覧の絞込にラベルselect', list.includes('name="label"') && list.includes('ラベル: 全て'));
 
   // 詳細: select + h2チップ + メールルールのラベルselect
