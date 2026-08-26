@@ -585,6 +585,36 @@ console.log('HTTP: 全件一括');
   check('詳細: 未完了は右上に「✅ 対応完了」1クリックボタン', dOpen.includes('id="quickDoneBtn"') && dOpen.includes('✅ 対応完了'));
   const dDone = await (await fetch(`${base}/inquiries/${h5}?view=inbox`)).text();
   check('詳細: 完了済みは押せない表示', !dDone.includes('id="quickDoneBtn"') && dDone.includes('✅ 完了済み'));
+
+  // 返信欄 (2026-08-26 スタッフ要望×2): ①「送信」「送信して回答完了」の2ボタン ②テンプレートはカテゴリ見出し付き1本セレクト
+  {
+    process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED = 'true';
+    const vm = await import('vm');
+    const scriptOf = html => {
+      // 最後の <script>…</script> = 詳細画面のクライアントJS。構文エラーがあると画面全体が死ぬので必ず検証
+      const m = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+      return m.length ? m[m.length - 1][1] : '';
+    };
+    const dMail = await (await fetch(`${base}/inquiries/${h4}?view=inbox`)).text();
+    check('メール: 「✉️ 送信」+「✅ 送信して完了」の2ボタン (チェックボックス廃止)',
+      dMail.includes('id="replyBtn"') && dMail.includes('id="replyCompleteBtn"') && dMail.includes('✅ 送信して完了') && !dMail.includes('id="replyComplete"'));
+    check('メール: モール側完了の案内は出ない', !dMail.includes('✅ 送信して回答完了') && !dMail.includes('ストアクリエイターPro') && dMail.includes('var MALL_COMPLETE = false'));
+    check('テンプレートは1本のセレクト (カテゴリselect廃止・optgroupで見出し)',
+      dMail.includes('id="tplSel"') && !dMail.includes('id="tplCat"') && dMail.includes("createElement('optgroup')"));
+    let jsErr = null;
+    try { new vm.Script(scriptOf(dMail)); } catch (e) { jsErr = e; }
+    check('詳細画面のクライアントJSが構文OK (メール)', jsErr === null, String(jsErr));
+
+    const shopYh = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('yahoo','Yahoo店','yh-ui')").run().lastInsertRowid;
+    const iYh = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, received_at, is_unread)
+      VALUES ('yahoo', ?, 'yh-ui-1', 'Yahoo問い合わせ', ?, 1)`).run(shopYh, T('2026-08-26T10:00:00+09:00')).lastInsertRowid;
+    const dYh = await (await fetch(`${base}/inquiries/${iYh}?view=inbox`)).text();
+    check('Yahoo!: 「✅ 送信して回答完了」+ ストクリも完了になる案内', dYh.includes('✅ 送信して回答完了') && dYh.includes('ストアクリエイターPro') && dYh.includes('var MALL_COMPLETE = true'));
+    let jsErr2 = null;
+    try { new vm.Script(scriptOf(dYh)); } catch (e) { jsErr2 = e; }
+    check('詳細画面のクライアントJSが構文OK (Yahoo!)', jsErr2 === null, String(jsErr2));
+    delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
+  }
   const qd = await jp(`/api/inquiries/${h4}/status`, { status: 'done' });
   check('1クリック完了のAPI: done遷移+completed_at刻印', qd.status === 200
     && db.prepare('SELECT internal_status, completed_at FROM inquiries WHERE id = ?').get(h4).internal_status === 'done'

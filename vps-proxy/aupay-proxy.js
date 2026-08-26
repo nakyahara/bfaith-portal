@@ -340,7 +340,7 @@ async function yahooCircusGetBinary(apiPath, params = {}, maxBytes = YAHOO_ATTAC
 }
 
 // POST (メッセージ投稿等)。⚠️リトライしない (送信系の再試行は二重投稿になる。結果不明の扱いは呼び出し元=outboxに委ねる)
-async function yahooCircusPost(apiPath, queryParams = {}, jsonBody = {}) {
+async function yahooCircusPost(apiPath, queryParams = {}, jsonBody = {}, method = 'POST') {
   const accessToken = await getAccessToken();
   const u = new URL(`${YAHOO_API_BASE}${apiPath}`);
   for (const [k, v] of Object.entries(queryParams)) {
@@ -348,7 +348,7 @@ async function yahooCircusPost(apiPath, queryParams = {}, jsonBody = {}) {
   }
   const headers = { ...yahooCircusHeaders(accessToken), 'Content-Type': 'application/json' };
   const res = await fetch(u, {
-    method: 'POST', headers, body: JSON.stringify(jsonBody), signal: AbortSignal.timeout(30000),
+    method, headers, body: JSON.stringify(jsonBody), signal: AbortSignal.timeout(30000),
   });
   const body = await res.text();
   return { status: res.status, contentType: res.headers.get('content-type') || 'application/json', body };
@@ -894,6 +894,38 @@ const server = http.createServer(async (req, res) => {
       }
       const r = await yahooCircusPost('/externalTalkAdd', { topicId }, { sellerId: YAHOO_SELLER_ID, body: message });
       console.log(`[${ts()}] Yahoo externalTalkAdd ${topicId.slice(0, 12)}… -> ${r.status} (${r.body.length} bytes)`);
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+      return;
+    }
+
+    // 質問完了 passthrough (inquiry-hub「送信して回答完了」2026-08-26 スタッフ要望。変更系2本目)
+    // 公式仕様: PUT /externalTalkComplete?topicId=... body={sellerId, completeConditionId?} → {status:'ok'}
+    //   completeConditionId: 未指定/1=通常完了 (出店者の返信が1回以上ある場合のみ可) 2=電話 3=メール 4=同一質問 5=回答不要
+    // inquiry-hub は返信投稿の直後にだけ呼ぶ (未指定=通常完了)。リトライしない (冪等だが上流の負荷を増やさない)
+    if (pathname === '/yahoo/externalTalkComplete' && req.method === 'PUT') {
+      const reqBody = await readBody(req);
+      let parsed;
+      try { parsed = JSON.parse(reqBody); } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'JSONボディが必要です' }));
+        return;
+      }
+      const topicId = typeof parsed.topicId === 'string' ? parsed.topicId.trim() : '';
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(topicId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'topicId が不正です' }));
+        return;
+      }
+      const cond = parsed.completeConditionId;
+      if (cond !== undefined && cond !== null && !/^[1-5]$/.test(String(cond))) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'completeConditionId は 1〜5 か未指定 (Yahoo!公式)' }));
+        return;
+      }
+      const body = { sellerId: YAHOO_SELLER_ID, ...(cond != null ? { completeConditionId: String(cond) } : {}) };
+      const r = await yahooCircusPost('/externalTalkComplete', { topicId }, body, 'PUT');
+      console.log(`[${ts()}] Yahoo externalTalkComplete ${topicId.slice(0, 12)}… -> ${r.status} (${r.body.length} bytes)`);
       res.writeHead(r.status, { 'Content-Type': r.contentType });
       res.end(r.body);
       return;
