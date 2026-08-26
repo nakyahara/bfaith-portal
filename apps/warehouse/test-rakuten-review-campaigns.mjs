@@ -504,6 +504,15 @@ console.log('=== 11. PR-C5: cutover (shadow → LIVE、フォロー/クーポン
   try { parseCutoverArg('2026-13-40T00:00:00+09:00'); } catch { bad = true; }
   check('parseCutoverArg: オフセット無し・不正日時は拒否 / +09:00 は UTC ISO に正規化',
     naive && bad && parseCutoverArg('2026-09-02T23:59:59+09:00') === '2026-09-02T14:59:59.000Z');
+  // 存在しない暦日・時刻は正規化せず拒否 (Codex C5-R2 High)
+  const rejects = ['2026-02-30T00:00:00+09:00', '2026-02-29T00:00:00+09:00', '2026-09-02T24:00:00+09:00',
+    '2026-09-02T23:60:00+09:00', '2026-09-02T23:59:60+09:00', '2026-09-02T23:59:59+25:00', '2026-04-31T12:00:00Z'];
+  const allRejected = rejects.every((v) => { try { parseCutoverArg(v); return false; } catch { return true; } });
+  check('parseCutoverArg: 02-30 / 平年02-29 / 24:00 / 23:60 / 秒60 / 不正オフセットを拒否', allRejected);
+  check('parseCutoverArg: 閏年 02-29・Z・負オフセット・秒省略は受理',
+    parseCutoverArg('2028-02-29T00:00:00+09:00') === '2028-02-28T15:00:00.000Z'
+    && parseCutoverArg('2026-09-02T14:59:59Z') === '2026-09-02T14:59:59.000Z'
+    && parseCutoverArg('2026-09-02T10:00-05:00') === '2026-09-02T15:00:00.000Z');
 
   const NOW = '2026-09-13T03:00:00.000Z'; // 9/13 12:00 JST (らくらくーぽん解約翌日の正午)
   const cutoverAt = parseCutoverArg('2026-09-02T23:59:59+09:00');

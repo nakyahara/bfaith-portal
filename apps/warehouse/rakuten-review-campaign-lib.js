@@ -518,12 +518,25 @@ export function getCutover(db) {
 /** オフセット付き ISO 日時 → UTC ISO。オフセット無し (naive) は JST か UTC か曖昧なので拒否 */
 export function parseCutoverArg(s) {
   const str = String(s || '').trim();
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?(Z|[+-]\d{2}:\d{2})$/.test(str)) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(Z|[+-]\d{2}:\d{2})$/.exec(str);
+  if (!m) {
     throw new Error(`CUTOVER: 日時は 'YYYY-MM-DDTHH:MM:SS+09:00' 形式 (オフセット必須) で指定 (${str || '(空)'})`);
   }
-  const t = Date.parse(str);
-  if (!Number.isFinite(t)) throw new Error(`CUTOVER: 日時を解釈できない (${str})`);
-  return new Date(t).toISOString();
+  // 存在しない暦日・時刻 (02-30 / 24:00 / 23:60) は Date.parse が翌日等へ正規化し得る
+  // (Codex C5-R2 High: cutover は覆せないので境目が数日ずれると二重送信/取りこぼし)。
+  // Date.UTC で組み立てて各要素が round-trip するかで実在を確認する
+  const [Y, Mo, D, h, mi, sec] = [m[1], m[2], m[3], m[4], m[5], m[6] || '00'].map(Number);
+  const wall = new Date(Date.UTC(Y, Mo - 1, D, h, mi, sec));
+  const roundTrip = wall.getUTCFullYear() === Y && wall.getUTCMonth() === Mo - 1 && wall.getUTCDate() === D
+    && wall.getUTCHours() === h && wall.getUTCMinutes() === mi && wall.getUTCSeconds() === sec;
+  if (!roundTrip) throw new Error(`CUTOVER: 実在しない日時 (${str})`);
+  let offsetMin = 0;
+  if (m[7] !== 'Z') {
+    const [, sign, oh, om] = /^([+-])(\d{2}):(\d{2})$/.exec(m[7]);
+    if (Number(oh) > 23 || Number(om) > 59) throw new Error(`CUTOVER: オフセットが不正 (${str})`);
+    offsetMin = (sign === '-' ? -1 : 1) * (Number(oh) * 60 + Number(om));
+  }
+  return new Date(wall.getTime() - offsetMin * 60000).toISOString();
 }
 
 /**
