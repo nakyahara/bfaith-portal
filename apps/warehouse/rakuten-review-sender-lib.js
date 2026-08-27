@@ -194,13 +194,15 @@ function recoverStaleClaimsT(T, db, nowIso = new Date().toISOString(), leaseMs =
 /** 送信結果の確定 (claimed → sent / failed_safe)。claimToken を照合し、リース回収などで
  *  claim を失っていたら何も書かない (Codex C4-R2 High: 横取り後の上書きで矛盾状態を作らない)。
  *  @returns true=確定できた / false=claim を失っていた (attempt も触らない) */
-function finalizeAttemptT(T, db, { actionId, outcome, claimToken = null, smtpCode = null, note = null, nowIso = new Date().toISOString() }) {
+function finalizeAttemptT(T, db, { actionId, outcome, claimToken, smtpCode = null, note = null, nowIso = new Date().toISOString() }) {
+  // claimToken 必須 (Codex Y0-R2 High: NULL で照合を迂回できると別 worker の claim を確定できてしまう)
+  if (!claimToken) throw new Error('finalizeAttempt: claimToken は必須');
   const status = outcome === 'accepted' ? 'sent' : 'failed_safe';
   const tx = db.transaction(() => {
     const r = db.prepare(`
       UPDATE ${T.actions} SET status = ?, status_reason = NULL, updated_at = ?
-       WHERE id = ? AND status = 'claimed' AND (? IS NULL OR claim_token = ?)
-    `).run(status, nowIso, actionId, claimToken, claimToken);
+       WHERE id = ? AND status = 'claimed' AND claim_token = ?
+    `).run(status, nowIso, actionId, claimToken);
     if (r.changes !== 1) return false;
     db.prepare(`
       UPDATE ${T.attempts} SET outcome = ?, smtp_code = ?, note = ?
@@ -212,12 +214,13 @@ function finalizeAttemptT(T, db, { actionId, outcome, claimToken = null, smtpCod
 }
 
 /** 結果不明の確定 (claimed → ambiguous、attempt は ambiguous のまま note のみ)。claimToken 照合つき */
-function markAmbiguousT(T, db, { actionId, claimToken = null, note = null, nowIso = new Date().toISOString() }) {
+function markAmbiguousT(T, db, { actionId, claimToken, note = null, nowIso = new Date().toISOString() }) {
+  if (!claimToken) throw new Error('markAmbiguous: claimToken は必須');
   const tx = db.transaction(() => {
     const r = db.prepare(`
       UPDATE ${T.actions} SET status = 'ambiguous', status_reason = 'smtp_unknown', updated_at = ?
-       WHERE id = ? AND status = 'claimed' AND (? IS NULL OR claim_token = ?)
-    `).run(nowIso, actionId, claimToken, claimToken);
+       WHERE id = ? AND status = 'claimed' AND claim_token = ?
+    `).run(nowIso, actionId, claimToken);
     if (r.changes !== 1) return false;
     db.prepare(`
       UPDATE ${T.attempts} SET note = ? WHERE action_id = ?
@@ -246,7 +249,7 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
   // リース切れ claimed の回収が先 (あれば送信を始めない — 人の確認が先)。
   // リース内の claimed (別プロセスが送信中の可能性) がある場合も開始しない (単一運転を前提とした保険)
   const { recovered: staleRecovered, inFlight } = recoverStaleClaimsT(T, db, nowIso);
-  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: 0, claimLost: 0, gateFailed: 0, finalizeConflict: 0, recipientRetry: 0, staleRecovered, inFlight, details: [] };
+  const out = { sent: 0, failedSafe: 0, ambiguous: 0, skipped: 0, claimLost: 0, gateFailed: 0, finalizeConflict: 0, recipientRetry: 0, releaseConflict: 0, staleRecovered, inFlight, details: [] };
   if (staleRecovered > 0 || inFlight > 0) {
     out.details.push({ result: staleRecovered > 0 ? 'stale_claims_recovered' : 'in_flight_claims_present', count: staleRecovered || inFlight });
     return out;
@@ -274,14 +277,15 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
           out.recipientRetry++;
           out.details.push({ id: action.id, result: 'recipient_retry', reason: String(e.code || 'retryable') });
         } else {
-          out.finalizeConflict++;
+          // 送信結果の確定競合 (finalizeConflict) とは別事象なので専用カウンタ (Codex Y0-R2 High)
+          out.releaseConflict++;
           out.details.push({ id: action.id, result: 'release_conflict', reason: String(e.code || 'retryable') });
         }
         continue;
       }
-      finalizeAttemptT(T, db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, note: (e && e.code) || 'contact_undecryptable', nowIso });
-      out.failedSafe++;
-      out.details.push({ id: action.id, result: 'failed_safe', reason: (e && e.code) || 'contact_undecryptable' });
+      const okF = finalizeAttemptT(T, db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, note: (e && e.code) || 'contact_undecryptable', nowIso });
+      if (okF) { out.failedSafe++; out.details.push({ id: action.id, result: 'failed_safe', reason: (e && e.code) || 'contact_undecryptable' }); }
+      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict', reason: (e && e.code) || 'contact_undecryptable' }); }
       continue;
     }
     const mail = A.buildMail(claim.fresh, nowIso);

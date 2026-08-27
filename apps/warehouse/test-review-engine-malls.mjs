@@ -126,6 +126,9 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
   check('releaseClaim: 正しい token + 未使用 attempt → 解放', Y.releaseClaim(db, { actionId: id3, claimToken: cl.claimToken, nowIso: NOW }) === true
     && db.prepare(`SELECT status FROM ${T.actions} WHERE id = ?`).get(id3).status === 'ready'
     && db.prepare(`SELECT COUNT(*) n FROM ${T.attempts} WHERE action_id = ?`).get(id3).n === 0);
+  check('finalizeAttempt / markAmbiguous: claimToken 無しは throw',
+    (() => { try { Y.finalizeAttempt(db, { actionId: id3, outcome: 'accepted' }); return false; } catch (e) { return /claimToken/.test(e.message); } })()
+    && (() => { try { Y.markAmbiguous(db, { actionId: id3 }); return false; } catch (e) { return /claimToken/.test(e.message); } })());
   check('楽天側の rakuten_campaign_delivery_attempts は空のまま', db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_delivery_attempts`).get().n === 0);
   check('楽天互換 selectEligibleActions は rakuten_ を見る (0件)', selectEligibleActions(db, { nowIso: NOW, limit: 10 }).eligible.length === 0);
 }
