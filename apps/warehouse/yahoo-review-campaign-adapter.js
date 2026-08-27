@@ -16,6 +16,7 @@
  *
  * ⚠️ 制約: raw_yahoo_orders は受注日ベースの窓 (daily-sync は直近 7 日) で再取得されるため、
  * 受注から 8 日以上あとに発送された注文は ship_date が入らず、フォロー対象にならない (取りこぼし側に倒れる)。
+ * stats の unshipped_over_7d でその規模を見張り、多ければ PR-Y-C2 で「未発送の古い注文だけ orderInfo で再取得」を足す。
  */
 export const YAHOO_ORDER_STATUS_CANCELLED = '4';
 export const YAHOO_SHIP_STATUS_SHIPPED = '3';
@@ -40,7 +41,9 @@ export function ensureYahooCampaignSources(db) {
     SELECT
       o.order_id                                   AS order_number,
       MIN(o.order_time)                            AS order_datetime,
-      CASE WHEN MAX(o.ship_status) = '${YAHOO_SHIP_STATUS_SHIPPED}' AND MAX(o.ship_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
+      -- 全明細が出荷完了 (1 行でも未発送なら NULL = 部分発送では送らない — Codex Y-C1 R1 High)
+      CASE WHEN SUM(CASE WHEN COALESCE(o.ship_status, '') != '${YAHOO_SHIP_STATUS_SHIPPED}' THEN 1 ELSE 0 END) = 0
+            AND MAX(o.ship_date) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'
            THEN MAX(o.ship_date) || 'T00:00:00+09:00' ELSE NULL END AS shipping_datetime,
       '(api)'                                      AS masked_email_enc,
       NULL                                         AS masked_email_hash,
@@ -49,8 +52,9 @@ export function ensureYahooCampaignSources(db) {
       MAX(o.synced_at)                             AS fetched_at
     FROM raw_yahoo_orders o
     GROUP BY o.order_id
-    HAVING MAX(COALESCE(o.order_status, '')) != '${YAHOO_ORDER_STATUS_CANCELLED}'
-       AND COALESCE(MAX(o.social_gift_type), '0') IN ('0', '')`);
+    -- 1 行でもキャンセル/ソーシャルギフトなら注文ごと除外 (Codex Y-C1 R1 High: MAX だと '4' と '5' の併存で素通りする)
+    HAVING SUM(CASE WHEN o.order_status = '${YAHOO_ORDER_STATUS_CANCELLED}' THEN 1 ELSE 0 END) = 0
+       AND SUM(CASE WHEN COALESCE(o.social_gift_type, '0') NOT IN ('0', '') THEN 1 ELSE 0 END) = 0`);
   db.exec(`CREATE TABLE IF NOT EXISTS yahoo_contact_suppressions (
     email_hash  TEXT PRIMARY KEY,
     reason      TEXT NOT NULL,
@@ -69,8 +73,17 @@ export function yahooContactStats(db) {
            MIN(order_datetime) AS oldest, MAX(order_datetime) AS newest
       FROM yahoo_order_contacts`).get();
   const excluded = db.prepare(`
-    SELECT SUM(CASE WHEN order_status = '${YAHOO_ORDER_STATUS_CANCELLED}' THEN 1 ELSE 0 END) AS cancelled,
-           SUM(CASE WHEN COALESCE(social_gift_type, '0') NOT IN ('0', '') THEN 1 ELSE 0 END) AS social_gift
-      FROM (SELECT order_id, MAX(order_status) order_status, MAX(social_gift_type) social_gift_type FROM raw_yahoo_orders GROUP BY order_id)`).get();
+    SELECT SUM(CASE WHEN cancelled > 0 THEN 1 ELSE 0 END) AS cancelled,
+           SUM(CASE WHEN gift > 0 THEN 1 ELSE 0 END) AS social_gift,
+           SUM(CASE WHEN cancelled = 0 AND gift = 0 AND unshipped > 0 AND order_time < ? THEN 1 ELSE 0 END) AS unshipped_over_7d,
+           SUM(CASE WHEN cancelled = 0 AND gift = 0 AND unshipped = 0 AND has_date = 0 THEN 1 ELSE 0 END) AS shipped_no_date
+      FROM (SELECT order_id, MIN(order_time) order_time,
+                   SUM(CASE WHEN order_status = '${YAHOO_ORDER_STATUS_CANCELLED}' THEN 1 ELSE 0 END) cancelled,
+                   SUM(CASE WHEN COALESCE(social_gift_type, '0') NOT IN ('0', '') THEN 1 ELSE 0 END) gift,
+                   SUM(CASE WHEN COALESCE(ship_status, '') != '${YAHOO_SHIP_STATUS_SHIPPED}' THEN 1 ELSE 0 END) unshipped,
+                   MAX(CASE WHEN ship_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' THEN 1 ELSE 0 END) has_date
+              FROM raw_yahoo_orders GROUP BY order_id)`).get(new Date(Date.now() - 7 * 86400000).toISOString());
+  // unshipped_over_7d = 受注 7 日超で未発送 (raw の再取得窓 7 日を過ぎると ship_date が入らない = 取りこぼし候補、Codex Y-C1 R1 Medium)
+  // shipped_no_date  = 出荷完了なのに ship_date 無し (PR-Y-B 以前の取込。再取得窓内なら翌日埋まる)
   return { ...r, ...excluded };
 }

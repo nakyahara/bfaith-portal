@@ -89,7 +89,8 @@ try {
     if (MALL === 'yahoo') {
       const { yahooContactStats } = await import('./yahoo-review-campaign-adapter.js');
       const cs = yahooContactStats(db);
-      console.log(`[Yahoo] 母集合 (raw_yahoo_orders VIEW): 注文 ${cs.orders} / 発送日あり ${cs.shipped} / 除外 キャンセル ${cs.cancelled}・ソーシャルギフト ${cs.social_gift} / ${cs.oldest?.slice(0, 10)}〜${cs.newest?.slice(0, 10)}`);
+      console.log(`[Yahoo] 母集合 (raw_yahoo_orders VIEW): 注文 ${cs.orders} / 発送日あり ${cs.shipped ?? 0} / 除外 キャンセル ${cs.cancelled ?? 0}・ソーシャルギフト ${cs.social_gift ?? 0} / ${cs.oldest?.slice(0, 10) ?? '-'}〜${cs.newest?.slice(0, 10) ?? '-'}`);
+      console.log(`[Yahoo] ⚠️取りこぼし候補: 受注7日超で未発送 ${cs.unshipped_over_7d ?? 0} / 出荷完了だが ship_date 無し ${cs.shipped_no_date ?? 0} (再取得窓 7 日の外は ship_date が入らない)`);
     }
     console.log(`cutover: ${cut.stage === 'live' ? `LIVE (follow=${cut.cutoverAt} / coupon=${cut.couponCutoverAt})`
       : cut.stage === 'coupon_only' ? `段階1=クーポン先行 (coupon=${cut.couponCutoverAt} / フォローは shadow)` : 'shadow (未実施)'}`);
