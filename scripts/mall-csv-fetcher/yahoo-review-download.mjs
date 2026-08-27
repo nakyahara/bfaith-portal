@@ -101,7 +101,13 @@ async function applyFilter(page, win) {
   if (state.from !== slashDate(win.from) || state.to !== slashDate(win.to)) throw new Error(`FILTER: 期間が反映されていない (${state.from}〜${state.to})`);
   if (state.total == null) {
     // 0 件は「N件」表示が出ない可能性がある → 0 件文言を肯定証拠として要求 (無ければ画面仕様変更として止める)
-    const zero = await page.evaluate(() => /該当するレビューはありません|レビューはありません|0\s*件|見つかりません/.test(document.body.innerText.replace(/\s+/g, ' ')));
+    // ページ全体でなく「絞り込み」フォーム以降の本文だけを見る (ヘッダ/お知らせ欄の「0件」誤検知を避ける)
+    const zero = await page.evaluate(() => {
+      const t = document.body.innerText.replace(/\s+/g, ' ');
+      const i = t.indexOf('絞り込み');
+      const tail = i >= 0 ? t.slice(i) : t;
+      return /該当するレビューはありません|レビューはありません|表示件数[：:]\s*0\s*件|見つかりません/.test(tail);
+    });
     if (!zero) throw new Error('FILTER: 「N件」表示も 0 件文言も読めない (画面仕様変更の疑い)');
     return 0;
   }

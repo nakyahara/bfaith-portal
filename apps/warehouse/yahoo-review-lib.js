@@ -10,7 +10,7 @@
  *     revision_hash = sha256(identity + 評価日 + ★ + 正規化タイトル + 正規化本文 + 動画数 + 画像数) を版とする
  *     (Codex 設計R1/R2: 版キーを個体キーにしない・revision PK は (identity, hash))
  *   - 同一 identity が 1 ファイルに 2 行以上 = 同一注文×商品の複数レビュー (可否は未実測) → **fail-closed**:
- *     その identity は conflict=1 で取込・配信対象から外し、件数を通知 (Codex 設計R3 High)
+ *     その identity は fact に入れず fact_yahoo_review_conflicts へ隔離 (planner の has_review にも使わない)、件数を通知 (Codex 設計R3 High)
  *   - 削除検知は「検証済みの 90 日全量スナップショット」だけを材料にする (ファイル名の窓マーカー
  *     `_d<from>_<to>_` が必須。無いファイル=手動DLでは削除検知しない)。2 回連続不在で is_deleted=1 (監査用途)
  *   - planner (campaign-lib、MALL_TABLES.yahoo.reviews) が楽天と同じ列名で読めるよう
@@ -51,7 +51,6 @@ export function ensureYahooReviewTables(db) {
     is_deleted       INTEGER NOT NULL DEFAULT 0,
     miss_count       INTEGER NOT NULL DEFAULT 0,
     last_missed_on   TEXT,
-    conflict         INTEGER NOT NULL DEFAULT 0,
     source_file      TEXT,
     import_id        INTEGER,
     imported_at      TEXT NOT NULL,
@@ -68,6 +67,18 @@ export function ensureYahooReviewTables(db) {
     date_jst        TEXT NOT NULL,
     is_deleted      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (review_identity, revision_hash)
+  )`);
+  // identity 衝突 (同一注文×商品に内容の違う行が複数) は fact に入れず隔離する (fail-closed、Codex Y-A R2 High 4:
+  // fact に置くと planner の has_review 判定に使われてしまう)。解消 (次の全量で 1 行に戻る) したら fact へ戻す
+  db.exec(`CREATE TABLE IF NOT EXISTS fact_yahoo_review_conflicts (
+    review_identity TEXT PRIMARY KEY,
+    order_number    TEXT NOT NULL,
+    product_code    TEXT NOT NULL,
+    item_name       TEXT,
+    rows_seen       INTEGER NOT NULL,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    source_file     TEXT
   )`);
   db.exec(`CREATE TABLE IF NOT EXISTS raw_yahoo_review_import_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,13 +107,14 @@ export function ensureYahooReviewTables(db) {
   )`);
   // 低評価通知キュー (取込 tx 内で enqueue、送信 2xx で削除)。kind = first (初回観測) / transition (★3以上→★2以下)
   db.exec(`CREATE TABLE IF NOT EXISTS yahoo_review_low_notify_queue (
-    review_identity TEXT PRIMARY KEY,
+    review_identity TEXT NOT NULL,
     kind            TEXT NOT NULL CHECK (kind IN ('first','transition','conflict')),
     item_name       TEXT,
     product_code    TEXT,
     rating          INTEGER,
     date_jst        TEXT,
-    queued_at       TEXT NOT NULL
+    queued_at       TEXT NOT NULL,
+    PRIMARY KEY (review_identity, kind)
   )`);
 }
 
@@ -222,7 +234,7 @@ export function prepareYahooReviewFile(name, buffer) {
     }
     byId.set(rec.review_identity, rec);
   }
-  const conflicts = [...conflictIds].map((id) => byId.get(id)).filter(Boolean);
+  const conflicts = [...conflictIds].map((id) => ({ ...byId.get(id), rows_seen: rows.slice(1).filter((c) => c.length === header.length && reviewIdentityFor(trimS(c[idx['注文ID']]), trimS(c[idx['商品コード']])) === id).length }));
   for (const id of conflictIds) byId.delete(id);
   const records = [...byId.values()];
   const dates = records.map((r) => r.date_jst).sort();
@@ -264,22 +276,28 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
   const detectDeletion = !!window && (fullSnapshot === false ? false : true);
   const snapshotNote = detectDeletion ? '' : (marker ? ' (削除検知なし: 検証済みスナップショット未登録)' : ' (削除検知なし)');
 
-  const selectStmt = db.prepare(`SELECT review_identity, revision_hash, rating, is_deleted, conflict FROM fact_yahoo_reviews WHERE review_identity = ?`);
+  const selectStmt = db.prepare(`SELECT review_identity, revision_hash, rating, is_deleted FROM fact_yahoo_reviews WHERE review_identity = ?`);
+  const selectConflictStmt = db.prepare(`SELECT review_identity FROM fact_yahoo_review_conflicts WHERE review_identity = ?`);
+  const upsertConflictStmt = db.prepare(`INSERT INTO fact_yahoo_review_conflicts (review_identity, order_number, product_code, item_name, rows_seen, first_seen_at, last_seen_at, source_file)
+    VALUES (@review_identity, @order_number, @product_code, @item_name, @rows_seen, @now, @now, @source_file)
+    ON CONFLICT(review_identity) DO UPDATE SET rows_seen = excluded.rows_seen, last_seen_at = excluded.last_seen_at, source_file = excluded.source_file, item_name = excluded.item_name`);
+  const deleteFactStmt = db.prepare(`DELETE FROM fact_yahoo_reviews WHERE review_identity = ?`);
+  const deleteConflictStmt = db.prepare(`DELETE FROM fact_yahoo_review_conflicts WHERE review_identity = ?`);
   const insertStmt = db.prepare(`
     INSERT INTO fact_yahoo_reviews (
       review_identity, review_url, order_number, product_code, item_name, rating, posted_at, date_jst, title, body,
-      video_count, image_count, like_count, revision_hash, first_seen_at, last_seen_at, is_deleted, miss_count, conflict,
+      video_count, image_count, like_count, revision_hash, first_seen_at, last_seen_at, is_deleted, miss_count,
       source_file, import_id, imported_at, updated_at
     ) VALUES (
       @review_identity, @review_url, @order_number, @product_code, @item_name, @rating, @posted_at, @date_jst, @title, @body,
-      @video_count, @image_count, @like_count, @revision_hash, @now, @now, 0, 0, @conflict,
+      @video_count, @image_count, @like_count, @revision_hash, @now, @now, 0, 0,
       @source_file, @import_id, @now, @now
     )`);
   const updateStmt = db.prepare(`
     UPDATE fact_yahoo_reviews SET
       item_name = @item_name, rating = @rating, posted_at = @posted_at, date_jst = @date_jst, title = @title, body = @body,
       video_count = @video_count, image_count = @image_count, like_count = @like_count, revision_hash = @revision_hash,
-      last_seen_at = @now, is_deleted = 0, miss_count = 0, conflict = @conflict, source_file = @source_file, import_id = @import_id, updated_at = @now
+      last_seen_at = @now, is_deleted = 0, miss_count = 0, source_file = @source_file, import_id = @import_id, updated_at = @now
     WHERE review_identity = @review_identity`);
   const touchStmt = db.prepare(`UPDATE fact_yahoo_reviews SET last_seen_at = ?, is_deleted = 0, miss_count = 0, like_count = ?, updated_at = ? WHERE review_identity = ?`);
   const revisionStmt = db.prepare(`INSERT OR IGNORE INTO fact_yahoo_review_revisions (review_identity, revision_hash, observed_at, rating, date_jst, is_deleted) VALUES (?, ?, ?, ?, ?, ?)`);
@@ -291,7 +309,7 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
   const markDeletedStmt = db.prepare(`UPDATE fact_yahoo_reviews SET is_deleted = 1, miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_identity = ?`);
   const activeInWindowStmt = db.prepare(`
     SELECT review_identity, revision_hash, rating, date_jst, miss_count, last_missed_on FROM fact_yahoo_reviews
-     WHERE is_deleted = 0 AND conflict = 0 AND date_jst >= ? AND date_jst <= ?`); // conflict 行は取込対象外なので不在に数えない
+     WHERE is_deleted = 0 AND date_jst >= ? AND date_jst <= ?`);
 
   if (verified && verified.screen_count !== prepared.records.length + prepared.conflicts.length) {
     const msg = `検証済みスナップショットの件数 ${verified.screen_count} と行数 ${prepared.records.length + prepared.conflicts.length} が一致しない`;
@@ -301,19 +319,20 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
   const tx = db.transaction(() => {
     const log = logStmt.run(now, source, name, sha256, prepared.dateFrom, prepared.dateTo, prepared.records.length, 0, 0, '');
     const importId = Number(log.lastInsertRowid);
-    let inserted = 0, updated = 0, unchanged = 0, missed = 0, deleted = 0;
+    let inserted = 0, updated = 0, unchanged = 0, missed = 0, deleted = 0, resolvedConflicts = 0;
     const newLow = [];
     const seen = new Set();
     for (const rec of prepared.records) {
       seen.add(rec.review_identity);
       const prev = selectStmt.get(rec.review_identity);
-      const params = { ...rec, now, source_file: name, import_id: importId, conflict: 0 };
+      const params = { ...rec, now, source_file: name, import_id: importId };
+      if (selectConflictStmt.get(rec.review_identity)) { deleteConflictStmt.run(rec.review_identity); resolvedConflicts++; } // 衝突解消 → fact へ戻る
       if (!prev) {
         insertStmt.run(params);
         revisionStmt.run(rec.review_identity, rec.revision_hash, now, rec.rating, rec.date_jst, 0);
         inserted++;
         if (rec.rating <= 2) { enqueueLowStmt.run(rec.review_identity, 'first', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); newLow.push({ identity: rec.review_identity, rating: rec.rating }); }
-      } else if (prev.revision_hash !== rec.revision_hash || prev.conflict) {
+      } else if (prev.revision_hash !== rec.revision_hash) {
         updateStmt.run(params);
         revisionStmt.run(rec.review_identity, rec.revision_hash, now, rec.rating, rec.date_jst, 0);
         updated++;
@@ -323,17 +342,20 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
         unchanged++;
       }
     }
-    // 衝突 identity: 行を残すが conflict=1 (planner は has_review 判定に使うだけなので害はない。付与は注文単位で
-    // dedupe されるため二重付与にもならない)。初回観測時だけ通知
+    // 衝突 identity: fact から外して隔離表へ (既存の通常行があれば削除 = planner の has_review にも使わない)。
+    // 「新規の衝突」と「通常→衝突への遷移」の両方を通知 (Codex Y-A R2 High 3)
+    let conflictsNew = 0;
     for (const rec of prepared.conflicts) {
       seen.add(rec.review_identity);
-      const prev = selectStmt.get(rec.review_identity);
-      const params = { ...rec, now, source_file: name, import_id: importId, conflict: 1 };
-      if (!prev) { insertStmt.run(params); inserted++; enqueueLowStmt.run(rec.review_identity, 'conflict', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); }
-      else { updateStmt.run(params); updated++; }
+      const wasNormal = !!selectStmt.get(rec.review_identity);
+      const wasConflict = !!selectConflictStmt.get(rec.review_identity);
+      if (wasNormal) { deleteFactStmt.run(rec.review_identity); revisionStmt.run(rec.review_identity, `conflict:${rec.revision_hash}`, now, rec.rating, rec.date_jst, 0); }
+      upsertConflictStmt.run({ review_identity: rec.review_identity, order_number: rec.order_number, product_code: rec.product_code, item_name: rec.item_name, rows_seen: rec.rows_seen, now, source_file: name });
+      if (!wasConflict) { enqueueLowStmt.run(rec.review_identity, 'conflict', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); conflictsNew++; }
     }
     if (detectDeletion) {
-      const today = now.slice(0, 10);
+      // 同日ガードは JST 暦日で (Codex Y-A R2 High 2: UTC 日付だと JST 同日の 2 回目を別日に数えて誤削除する)
+      const today = new Date(Date.parse(now) + 9 * 3600 * 1000).toISOString().slice(0, 10);
       for (const row of activeInWindowStmt.all(window.from, window.to)) {
         if (seen.has(row.review_identity)) continue;
         if (row.last_missed_on === today) continue; // 同日 2 回の取込で 2 回数えない
@@ -348,14 +370,14 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
       }
     }
     db.prepare(`UPDATE raw_yahoo_review_import_log SET inserted = ?, updated = ?, message = ? WHERE id = ?`)
-      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} missed=${missed} deleted=${deleted}${snapshotNote}`, importId);
-    return { inserted, updated, unchanged, missed, deleted, newLow };
+      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} (new ${conflictsNew}, resolved ${resolvedConflicts}) missed=${missed} deleted=${deleted}${snapshotNote}`, importId);
+    return { inserted, updated, unchanged, missed, deleted, newLow, conflictsNew, resolvedConflicts };
   });
   const r = tx();
   return {
     status: 'ok',
     results: [{ file: name, ok: true, label: prepared.label, inserted: r.inserted, updated: r.updated, unchanged: r.unchanged, missed: r.missed, deleted: r.deleted,
-      conflicts: prepared.conflicts.length, date_from: prepared.dateFrom, date_to: prepared.dateTo, warnings: prepared.warnings }],
+      conflicts: prepared.conflicts.length, conflictsNew: r.conflictsNew, resolvedConflicts: r.resolvedConflicts, date_from: prepared.dateFrom, date_to: prepared.dateTo, warnings: prepared.warnings }],
     newLowRatings: r.newLow,
   };
 }

@@ -58,13 +58,13 @@ async function notifyLowRatings(db) {
     lines.push('ストクリ > 評価 > 商品レビューチェックツール で確認・返信');
   }
   if (conflicts.length) {
-    lines.push(`⚠️ *Yahoo レビュー identity 衝突 ${conflicts.length}件* (同一注文×商品に内容の違うレビューが複数。取込・配信対象から外しました=fail-closed。設計書 §Y1 のスキーマ拡張が必要か確認)`);
+    lines.push(`⚠️ *Yahoo レビュー identity 衝突 ${conflicts.length}件* (同一注文×商品に内容の違うレビューが複数。fact から外して fact_yahoo_review_conflicts に隔離=fail-closed。設計書 §Y1 のスキーマ拡張が必要か確認)`);
   }
   try {
     const res = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json; charset=UTF-8' }, body: JSON.stringify({ text: lines.join('\n') }), signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const del = db.prepare(`DELETE FROM yahoo_review_low_notify_queue WHERE review_identity = ?`);
-    const tx = db.transaction(() => { for (const r of queued) del.run(r.review_identity); });
+    const del = db.prepare(`DELETE FROM yahoo_review_low_notify_queue WHERE review_identity = ? AND kind = ?`);
+    const tx = db.transaction(() => { for (const r of queued) del.run(r.review_identity, r.kind); });
     tx();
     console.log(`  📣 Yahoo 低評価/衝突 ${queued.length}件 → GChat通知 (${res.status})、キュー消化`);
   } catch (e) {
@@ -110,6 +110,15 @@ if (entries.length === 0) {
   try {
     for (const name of entries) {
       const srcPath = path.join(incomingDir, name);
+      // サイズ上限を読む前に確認 (Codex Y-A R2 High 1: 巨大ファイルを丸ごとメモリに載せない)。超過は読まずに failed/ へ
+      const MAX = /\.zip$/i.test(name) ? 20 * 1024 * 1024 : 50 * 1024 * 1024;
+      let size = 0;
+      try { size = fs.statSync(srcPath).size; } catch (e) { console.error(`✗ ${name}: stat 失敗 (${e.message})`); failCount++; continue; }
+      if (size > MAX) {
+        console.error(`✗ ${name}: サイズ上限超過 (${size} bytes > ${MAX})。読まずに failed/ へ`);
+        try { moveTo(srcPath, failedDir); } catch { /* noop */ }
+        failCount++; continue;
+      }
       let buffer;
       try { buffer = fs.readFileSync(srcPath); } catch (e) { console.error(`✗ ${name}: 読込失敗 (${e.message})`); failCount++; continue; }
       const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');

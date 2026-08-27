@@ -114,9 +114,25 @@ console.log('=== 3. identity 衝突は fail-closed ===');
   check('prepare: 同一注文×商品で内容が違う行 → records から外し conflicts に', p.ok && p.records.length === 0 && p.conflicts.length === 1);
   const buf = zipOf(rows);
   const r = importYahooReviewFile(db, { name: 'manual.zip', buffer: buf, sha256: sha(buf), nowIso: '2026-08-29T01:00:00.000Z' });
-  const rowc = db.prepare(`SELECT conflict FROM fact_yahoo_reviews WHERE order_number = 'o9'`).get();
-  check('取込: conflict=1 で保持し conflict 通知をキューへ', r.status === 'ok' && rowc.conflict === 1
+  check('取込: fact には入れず conflicts 表へ隔離、conflict 通知をキューへ', r.status === 'ok' && r.results[0].conflictsNew === 1
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews WHERE order_number = 'o9'`).get().n === 0
+    && db.prepare(`SELECT rows_seen FROM fact_yahoo_review_conflicts WHERE order_number = 'o9'`).get().rows_seen === 2
     && db.prepare(`SELECT kind FROM yahoo_review_low_notify_queue WHERE review_identity = ?`).get(reviewIdentityFor('o9', 'p9')).kind === 'conflict');
+  // 通常 → 衝突への遷移も通知し、fact から外す (Codex Y-A R2 High 3/4)
+  const rowsT = [row('20260827', 5, 'p1', 'o1', 't', 'good!!'), row('20260827', 4, 'p1', 'o1', 'u', 'another')];
+  const bufT = zipOf(rowsT);
+  const rT = importYahooReviewFile(db, { name: 'manual-t.zip', buffer: bufT, sha256: sha(bufT), nowIso: '2026-08-29T02:00:00.000Z' });
+  check('通常レビュー o1 が衝突に変化 → fact から削除・conflicts へ・通知', rT.results[0].conflictsNew === 1
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews WHERE order_number = 'o1'`).get().n === 0
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = 'o1'`).get().n === 1
+    && db.prepare(`SELECT COUNT(*) n FROM yahoo_review_low_notify_queue WHERE review_identity = ? AND kind = 'conflict'`).get(reviewIdentityFor('o1', 'p1')).n === 1);
+  const rT2 = importYahooReviewFile(db, { name: 'manual-t2.zip', buffer: zipOf(rowsT, 'q.csv'), sha256: 'conf-again', nowIso: '2026-08-29T03:00:00.000Z' });
+  check('衝突が続いても再通知しない', rT2.results[0].conflictsNew === 0);
+  // 解消 (1 行に戻る) → fact へ復帰・conflicts から消える
+  const rR = importYahooReviewFile(db, { name: 'manual-r.zip', buffer: zipOf([row('20260827', 5, 'p1', 'o1', 't', 'good!!')], 'r.csv'), sha256: 'resolved', nowIso: '2026-08-29T04:00:00.000Z' });
+  check('衝突解消 → fact へ戻り conflicts から削除', rR.results[0].resolvedConflicts === 1
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews WHERE order_number = 'o1'`).get().n === 1
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = 'o1'`).get().n === 0);
 }
 
 console.log('=== 4. 削除検知 (検証済み全量スナップショットのみ) ===');
@@ -134,12 +150,14 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   check('台帳の画面件数 ≠ 行数 → error', rMis.status === 'error' && /一致しない/.test(rMis.results[0].error));
   recordVerifiedSnapshot(db, { sha256: sha(bufA), from: '2026-08-25', to: '2026-08-29', screenCount: 1 });
   check('台帳登録の読み出し', getVerifiedSnapshot(db, sha(bufA)).screen_count === 1);
-  const rA = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_c.zip', buffer: bufA, sha256: sha(bufA), nowIso: '2026-08-30T00:00:00.000Z' });
+  // JST 8/30 08:30 (= UTC 8/29 23:30) に 1 回目
+  const rA = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_c.zip', buffer: bufA, sha256: sha(bufA), nowIso: '2026-08-29T23:30:00.000Z' });
   check('1 回目不在 → miss+1 (o2 のみ。窓外の o3/衝突 o9 は数えない)', rA.results[0].missed === 1 && rA.results[0].deleted === 0
     && db.prepare(`SELECT miss_count, is_deleted FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().miss_count === 1, JSON.stringify(rA.results[0]));
   recordVerifiedSnapshot(db, { sha256: 'different', from: '2026-08-25', to: '2026-08-29', screenCount: 1 });
   const rA2 = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_d.zip', buffer: zipOf(rowsA, 'x.csv'), sha256: 'different', nowIso: '2026-08-30T02:00:00.000Z' });
-  check('同日 2 回目は数えない', rA2.results[0].missed === 0 && rA2.results[0].deleted === 0);
+  check('JST 同日 (UTC では翌日) の 2 回目は数えない', rA2.results[0].missed === 0 && rA2.results[0].deleted === 0
+    && db.prepare(`SELECT miss_count, last_missed_on FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().last_missed_on === '2026-08-30');
   recordVerifiedSnapshot(db, { sha256: 'different2', from: '2026-08-25', to: '2026-08-31', screenCount: 1 });
   const rB = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-31_e.zip', buffer: zipOf(rowsA, 'y.csv'), sha256: 'different2', nowIso: '2026-08-31T00:00:00.000Z' });
   check('別日 2 回連続不在 → is_deleted=1 + deleted revision', rB.results[0].deleted === 1
