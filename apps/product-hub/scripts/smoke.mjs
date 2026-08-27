@@ -3380,9 +3380,35 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
     },
   };
   const r3 = await dif.attemptImageFolderCreation(difId3, { driveClient: racingDrive });
-  check('作成中の手入力 URL を上書きしない', r3.outcome === 'kept_manual_url'
+  check('作成中の手入力 URL を上書きしない (url は残った方を返す)', r3.outcome === 'kept_manual_url'
+    && r3.url.endsWith('HUMAN2') && r3.unusedFolderUrl.endsWith('AUTO-ID')
     && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId3).drive_folder_url.endsWith('HUMAN2'),
     JSON.stringify(r3));
+
+  // 同一 draft への同時呼び出しは1本にまとまる (list→create の隙間の二重作成防止)
+  const difId5 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-5', '同時実行', 'smoke')`).run().lastInsertRowid);
+  let createCalls = 0;
+  const slowDrive = {
+    files: {
+      list: async () => { await new Promise((r) => setTimeout(r, 20)); return { data: { files: [] } }; },
+      create: async () => { createCalls += 1; return { data: { id: 'ONCE-ID' } }; },
+    },
+  };
+  const [c1, c2] = await Promise.all([
+    dif.attemptImageFolderCreation(difId5, { driveClient: slowDrive }),
+    dif.attemptImageFolderCreation(difId5, { driveClient: slowDrive }),
+  ]);
+  check('同時2回の呼び出しで create は1回', createCalls === 1 && c1.outcome === 'created' && c2.outcome === 'created',
+    JSON.stringify({ createCalls, c1, c2 }));
+
+  // 壊れた SA 鍵でも throw せず failed (登録 API を 500 にしない)
+  const difIdBadKey = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-BADKEY', '鍵破損', 'smoke')`).run().lastInsertRowid);
+  process.env.GOOGLE_SERVICE_ACCOUNT_KEY = 'not-base64-json!!';
+  const rBad = await dif.attemptImageFolderCreation(difIdBadKey, {});
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  check('壊れた SA 鍵は failed (throw しない)', rBad.outcome === 'failed' && !!rBad.error
+    && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_failed'`).get(difIdBadKey).c === 1,
+    JSON.stringify(rBad));
 
   // Drive 失敗は fail-soft + イベント記録
   const difId4 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-4', '失敗', 'smoke')`).run().lastInsertRowid);
@@ -3391,10 +3417,28 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
     && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_failed'`).get(difId4).c === 1,
     JSON.stringify(r4));
 
-  // バッチ: created / skipped (URL済み・不存在) を集計。例外は投げない
-  const s = await dif.attemptImageFolderCreationBatch([difId2, difId4, 999999], { driveClient: fakeDrive([], 'BATCH-ID') });
-  check('バッチ集計 (URL済み=skip / 前回失敗分=created / 不存在=skip)',
-    s.created === 1 && s.skipped === 2 && s.failed === 0, JSON.stringify(s));
+  // バッチは途中の失敗で止まらない (1件目 throw → 2件目は作成される)
+  const difId6 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-6', 'バッチ続行', 'smoke')`).run().lastInsertRowid);
+  let batchCall = 0;
+  const flakyDrive = {
+    files: {
+      list: async () => { batchCall += 1; if (batchCall === 1) throw new Error('flaky'); return { data: { files: [] } }; },
+      create: async () => ({ data: { id: 'BATCH-ID' } }),
+    },
+  };
+  const difId7 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-7', 'バッチ2件目', 'smoke')`).run().lastInsertRowid);
+  const s = await dif.attemptImageFolderCreationBatch([difId6, difId7, difId2, 999999], { driveClient: flakyDrive });
+  check('バッチは失敗で止まらない (失敗1/作成1/skip2)',
+    s.failed === 1 && s.created === 1 && s.skipped === 2, JSON.stringify(s));
+
+  // 失敗の回収: drive_folder_failed のまま URL 空の単品だけ再試行する (バックフィルはしない)
+  const rt1 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'RETRY-ID') });
+  check('再試行: 失敗した draft を回収して URL が入る', rt1.retried >= 2 && rt1.created >= 2 && rt1.failed === 0
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId4).drive_folder_url.endsWith('RETRY-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId6).drive_folder_url.endsWith('RETRY-ID'),
+    JSON.stringify(rt1));
+  const rt2 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'X') });
+  check('再試行: 回収済みなら対象なし', rt2.retried === 0, JSON.stringify(rt2));
 }
 
 // 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)

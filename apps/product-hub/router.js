@@ -44,7 +44,7 @@ import { buildPromptTemplates } from './lib/prompt-templates.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
-import { attemptImageFolderCreation, attemptImageFolderCreationBatch } from './services/drive-image-folder.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
@@ -392,8 +392,14 @@ router.post('/api/drafts', async (req, res) => {
   const { id: draftId, effectiveCode, groupedFrom } = created;
 
   // 画像フォルダの自動作成 (2026-08-27 中原さん指示): 単品のみ「商品コード_商品名」を
-  // Drive の画像置き場に作って drive_folder_url へ。失敗しても登録は成功 (fail-soft)
-  const imageFolder = await attemptImageFolderCreation(draftId, { actor: actorOf(req) });
+  // Drive の画像置き場に作って drive_folder_url へ。失敗しても登録は成功 (fail-soft)。
+  // Drive が遅いときは 12 秒で登録レスポンスを先に返し、作成は裏で続行する (Codex R1 medium-5)
+  const folderPromise = attemptImageFolderCreation(draftId, { actor: actorOf(req) });
+  let folderTimer;
+  const imageFolder = await Promise.race([
+    folderPromise.finally(() => clearTimeout(folderTimer)),
+    new Promise((resolve) => { folderTimer = setTimeout(() => resolve({ outcome: 'pending' }), 12_000); }),
+  ]);
 
   // §5: 登録と同時に Notion カード作成 (失敗しても登録は成功。バナー+リトライで回収)
   const notion = await attemptCardCreation(draftId, { actor: actorOf(req) });
@@ -1708,14 +1714,17 @@ router.post('/api/intake/run', (req, res) => {
     }[r.error] || r.error;
     return res.status(400).json({ ok: false, error: msg });
   }
-  // 取込で作られた新カードにも画像フォルダを裏で作る (単品のみ・fail-soft)
+  // 取込で作られた新カードにも画像フォルダを裏で作る (単品のみ・fail-soft)。
+  // あわせて過去に失敗したまま URL 空の分も回収する (Codex R1 high-3)
   if (r.mode === 'intake' && !r.dryRun) {
     const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
-    if (ids.length > 0) {
-      void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
-        .then((s) => console.log(`[product-hub] 画像フォルダ一括作成(取込): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`))
-        .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(取込)に失敗:', e.message));
-    }
+    void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
+      .then((s) => {
+        if (ids.length > 0) console.log(`[product-hub] 画像フォルダ一括作成(取込): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`);
+        return retryFailedImageFolders({ actor: actorOf(req) });
+      })
+      .then((s) => { if (s.retried > 0) console.log(`[product-hub] 画像フォルダ再試行(取込): retried=${s.retried} created=${s.created} failed=${s.failed}`); })
+      .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(取込)に失敗:', e.message));
   }
   res.json(r);
 });
