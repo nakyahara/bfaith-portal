@@ -26,6 +26,8 @@
   .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
   .chip { border: 1px solid #d1d5db; background: #fff; border-radius: 999px; padding: 4px 12px; cursor: pointer; font-size: 12px; color: #374151; }
   .chip.on { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .summary { font-size: 12px; color: #4b5563; margin-bottom: 12px; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 12px; }
+  .summary b { color: #1d4ed8; }
   table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   th { text-align: left; font-size: 12px; color: #6b7280; font-weight: 600; padding: 8px 10px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
   td { padding: 8px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; }
@@ -70,10 +72,12 @@
     <input id="search" type="text" placeholder="検索：支払い先名・URL・保存先・用途…" autocomplete="off">
   </div>
   <div class="chips" id="chips"></div>
+  <div class="chips" id="methodChips"></div>
+  <div class="summary" id="summary"></div>
 
   <table>
     <thead>
-      <tr><th>支払い先</th><th>マイページ</th><th>証憑の保存先</th><th>用途</th><th>引落日</th><th>領収書取得</th><th></th></tr>
+      <tr><th>支払い先</th><th>マイページ</th><th>証憑の保存先</th><th>用途</th><th>取得方式</th><th>引落日</th><th>領収書取得</th><th></th></tr>
     </thead>
     <tbody id="rows"></tbody>
   </table>
@@ -92,6 +96,18 @@
       <div class="field"><label>支払いタイミング</label><input id="f_payment_timing" placeholder="毎月 / 年1回"></div>
       <div class="field"><label>毎月引き落とし日</label><input id="f_debit_day" placeholder="例: 15"></div>
       <div class="field"><label>領収書取得先</label><input id="f_receipt_source" placeholder="サイトからダウンロード / メールに添付"></div>
+      <div class="field"><label>取得方式（自動化の分類）</label>
+        <select id="f_fetch_method" style="width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:14px">
+          <option value="">未分類</option>
+          <option value="A">A: メール添付（自動転送できる）</option>
+          <option value="B">B: メール内リンク（メールは来るがDLが要る）</option>
+          <option value="C">C: サイトDL（通常ログイン）</option>
+          <option value="D">D: サイトDL（2FA・ワンタイムあり）</option>
+          <option value="E">E: 自動化不可（CAPTCHA・bot禁止）</option>
+          <option value="F">F: 証憑なし・別経路</option>
+        </select>
+      </div>
+      <div class="field"><label>取得方式の補足（確認事項など）</label><input id="f_fetch_note"></div>
       <div class="field"><label>メモ</label><input id="f_note"></div>
     </div>
     <div class="dlg-foot">
@@ -107,14 +123,23 @@
 
 <script>
 const API = 'api/links';
-const FIELDS = ['name', 'url', 'storage_path', 'card_type', 'payment_timing', 'debit_day', 'receipt_source', 'note'];
+const FIELDS = ['name', 'url', 'storage_path', 'card_type', 'payment_timing', 'debit_day', 'receipt_source', 'fetch_method', 'fetch_note', 'note'];
+const METHODS = {
+  A: { label: 'A メール添付',    bg: '#f0fdf4', fg: '#15803d' },
+  B: { label: 'B メールリンク',  bg: '#ecfeff', fg: '#0e7490' },
+  C: { label: 'C サイトDL',      bg: '#eff6ff', fg: '#1d4ed8' },
+  D: { label: 'D 2FAあり',       bg: '#fef3c7', fg: '#b45309' },
+  E: { label: 'E 自動化不可',    bg: '#fee2e2', fg: '#b91c1c' },
+  F: { label: 'F 証憑なし',      bg: '#f3f4f6', fg: '#6b7280' },
+};
 const TAG_COLORS = [
   ['#eff6ff', '#1d4ed8'], ['#f0fdf4', '#15803d'], ['#fef3c7', '#b45309'], ['#fce7f3', '#be185d'],
   ['#f3e8ff', '#7e22ce'], ['#ecfeff', '#0e7490'], ['#fff7ed', '#c2410c'], ['#f1f5f9', '#475569'],
 ];
 let links = [];
-let filterType = null; // null = すべて
-let editingId = null;  // null = 新規
+let filterType = null;   // null = すべて (用途)
+let filterMethod = null; // null = すべて / '' = 未分類 / 'A'〜'F' (取得方式)
+let editingId = null;    // null = 新規
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -148,8 +173,9 @@ function visible() {
   const q = $('search').value.trim().toLowerCase();
   return links.filter(l => {
     if (filterType !== null && l.card_type !== filterType) return false;
+    if (filterMethod !== null && (l.fetch_method || '') !== filterMethod) return false;
     if (!q) return true;
-    return [l.name, l.url, l.storage_path, l.card_type, l.receipt_source, l.note]
+    return [l.name, l.url, l.storage_path, l.card_type, l.receipt_source, l.fetch_note, l.note]
       .some(v => (v || '').toLowerCase().includes(q));
   });
 }
@@ -165,12 +191,43 @@ function render() {
       <td class="open">${l.url ? `<a href="${esc(l.url)}" target="_blank" rel="noopener">開く ↗</a>` : ''}</td>
       <td class="path">${l.storage_path ? `<span class="p">${esc(l.storage_path)}</span> <button class="copy" data-copy="${esc(l.storage_path)}" title="パスをコピー">📋</button>` : ''}</td>
       <td>${l.card_type ? `<span class="tag" style="background:${bg};color:${fg}">${esc(l.card_type)}</span>` : ''}</td>
+      <td>${methodBadge(l)}</td>
       <td class="day">${l.debit_day ? esc(l.debit_day) + '日' : ''}${l.payment_timing && l.payment_timing !== '毎月' ? ` <span style="color:#9ca3af">(${esc(l.payment_timing)})</span>` : ''}</td>
       <td class="src">${esc(l.receipt_source)}</td>
       <td><button class="edit-btn" data-edit="${l.id}" title="編集">✏️</button></td>
     </tr>`;
   }).join('');
   renderChips();
+  renderMethodChips();
+  renderSummary();
+}
+
+function methodBadge(l) {
+  const m = METHODS[l.fetch_method];
+  if (!m) return `<span class="tag" style="background:#fff;color:#9ca3af;border:1px dashed #d1d5db" title="${esc(l.fetch_note)}">未分類</span>`;
+  return `<span class="tag" style="background:${m.bg};color:${m.fg}" title="${esc(l.fetch_note)}">${esc(m.label)}</span>`;
+}
+
+function renderSummary() {
+  const counts = { A: 0, B: 0, C: 0, D: 0, E: 0, F: 0, '': 0 };
+  for (const l of links) counts[METHODS[l.fetch_method] ? l.fetch_method : '']++;
+  const auto = counts.A + counts.B + counts.C;
+  const classified = links.length - counts[''];
+  $('summary').innerHTML =
+    `自動化見込み (A+B+C): <b>${auto}社</b> / 分類済み ${classified}社・全${links.length}社` +
+    ` &nbsp;｜&nbsp; 半自動 (D): ${counts.D}社 ・ 対象外 (E+F): ${counts.E + counts.F}社 ・ 未分類: ${counts['']}社` +
+    `<br><span style="color:#9ca3af">分類は元データとURLからの機械推定を含む。バッジにカーソルを乗せると確認事項が出ます</span>`;
+}
+
+function renderMethodChips() {
+  const counts = {};
+  for (const l of links) { const k = METHODS[l.fetch_method] ? l.fetch_method : ''; counts[k] = (counts[k] || 0) + 1; }
+  const chip = (val, text) =>
+    `<button class="chip ${filterMethod === val ? 'on' : ''}" data-method="${val === null ? '__all__' : val}">${text}</button>`;
+  $('methodChips').innerHTML = [chip(null, '取得方式: すべて')]
+    .concat(Object.entries(METHODS).map(([k, m]) => chip(k, `${m.label} ${counts[k] || 0}`)))
+    .concat([chip('', `未分類 ${counts[''] || 0}`)])
+    .join('');
 }
 
 function renderChips() {
@@ -231,6 +288,12 @@ document.addEventListener('click', async (ev) => {
   }
   const edit = ev.target.closest('[data-edit]');
   if (edit) return openDialog(Number(edit.dataset.edit));
+  const mchip = ev.target.closest('[data-method]');
+  if (mchip) {
+    filterMethod = mchip.dataset.method === '__all__' ? null : mchip.dataset.method;
+    render();
+    return;
+  }
   const chip = ev.target.closest('.chip');
   if (chip) {
     filterType = chip.dataset.type === '' ? null : chip.dataset.type;

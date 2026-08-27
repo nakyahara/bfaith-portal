@@ -12,7 +12,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let db = null;
 
-const FIELDS = ['name', 'url', 'storage_path', 'card_type', 'payment_timing', 'debit_day', 'receipt_source', 'note'];
+const FIELDS = ['name', 'url', 'storage_path', 'card_type', 'payment_timing', 'debit_day', 'receipt_source', 'note', 'fetch_method', 'fetch_note'];
+
+/** 取得方式 (Phase 0分類)。'' = 未分類 */
+export const FETCH_METHODS = ['A', 'B', 'C', 'D', 'E', 'F'];
 
 export function getShohyoDB() {
   if (db) return db;
@@ -36,8 +39,44 @@ export function getShohyoDB() {
     updated_at     TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_vendor_links_name ON vendor_links(name)');
+  // Phase 0 (証憑取得自動化の棚卸し) で追加した列。既存DBにも冪等に足す
+  addColumnIfMissing('vendor_links', 'fetch_method', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('vendor_links', 'fetch_note', "TEXT NOT NULL DEFAULT ''");
   seedIfEmpty();
+  applyClassificationPatch();
   return db;
+}
+
+/** 列が無ければ ALTER で追加。追加したときだけ true (warehouse/db.js の同名ヘルパ準拠) */
+function addColumnIfMissing(table, column, typeClause) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (cols.some(c => c.name === column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${typeClause}`);
+  return true;
+}
+
+/**
+ * seed/classification.json (Phase 0の機械分類) を「fetch_method が空の行だけ」に適用する。
+ * 冪等: 手動で分類・修正済みの行は上書きしない。名前+URL一致で対象行を特定。
+ */
+export function applyClassificationPatch() {
+  const file = path.join(__dirname, 'seed', 'classification.json');
+  if (!fs.existsSync(file)) return 0;
+  const entries = JSON.parse(fs.readFileSync(file, 'utf8'));
+  // 未分類 (method='') でもnoteは投入したいので、両フィールドが未入力の行だけを対象にする
+  const upd = db.prepare(`UPDATE vendor_links
+    SET fetch_method = @fetch_method, fetch_note = @fetch_note, updated_at = @updated_at
+    WHERE name = @name AND url = @url AND fetch_method = '' AND fetch_note = ''
+      AND (@fetch_method != '' OR @fetch_note != '')`);
+  let applied = 0;
+  const tx = db.transaction((items) => {
+    for (const e of items) {
+      applied += upd.run({ ...e, updated_at: new Date().toISOString() }).changes;
+    }
+  });
+  tx(entries);
+  if (applied > 0) console.log(`[shohyo-links] classification patch applied to ${applied} rows`);
+  return applied;
 }
 
 function seedIfEmpty() {
