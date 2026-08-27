@@ -2764,7 +2764,9 @@ let wfSetParentId = null;
   const routerMod = await import('../router.js');
   const app = express();
   // セッションを偽装して直接マウント (本番は server.js の requireAppAccess を通る)
-  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  // 一部のテストは一般ユーザーとして叩く (smokeSession を差し替える)
+  let smokeSession = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' };
+  app.use((req, res, next) => { req.session = smokeSession; next(); });
   app.use('/ph', routerMod.default);
   const server = app.listen(0);
   const base = `http://127.0.0.1:${server.address().port}/ph`;
@@ -2854,6 +2856,80 @@ let wfSetParentId = null;
   let dndPerm = null;
   try { wfpEarly.moveBoardCard(idM, { view: 'main', to: 'title_approve', expectedCurrent: 'set_review' }, 'x@b-faith.biz', { isAdmin: false, actorStaffId: null }); } catch (e) { dndPerm = e; }
   check('D&D 権限: 後方移動でも他所の工程は権限チェックが効く', dndPerm?.status === 403 || dndPerm?.status === 400, dndPerm?.message || '例外が出ていない');
+
+  // 未割り当て工程の自動引き受け (2026-08-27 田中さん改善案): 一般ユーザーが D&D で跨ぐ工程が
+  // 未割り当てなら、本人に担当を付けてから done にする (詳細画面で全工程に「自分が担当する」を押さなくてよい)
+  const idM5 = Number(db.prepare(`
+    INSERT INTO product_drafts (ne_code, name, official_url, created_by)
+    VALUES ('DRV-MOVE5', '自動引き受け', 'https://example.com/item5', 'smoke')
+  `).run().lastInsertRowid);
+  db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, 'drv-move5-img')`).run(idM5);
+  wfpEarly.ensureProgress(db, idM5);
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ?`).run(idM5);
+  const TANAKA = { isAdmin: false, actorStaffId: wfTanakaId };
+  const assigneeOf = (id, code) => db.prepare(
+    'SELECT assignee_id FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.assignee_id;
+  const versionOf = (id, code) => db.prepare(
+    'SELECT version FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, code)?.version;
+  const eventsOf = (id) => db.prepare(`SELECT detail FROM draft_events WHERE draft_id = ? AND event = 'step_changed' ORDER BY id`).all(id).map((r) => r.detail);
+
+  // 一般ユーザーは基本情報 → 商品説明確認 へ直接は動かせない (間の AI待ち = システム工程は admin のみ。特例は作らない)
+  let dndSys = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'desc_review', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndSys = e; }
+  check('D&D 自動引き受け: システム工程 (AI待ち) は一般ユーザーでは跨げない (403) + 先行の basic_info もロールバック',
+    dndSys?.status === 403 && stepOf(idM5, 'basic_info') === 'todo' && assigneeOf(idM5, 'basic_info') == null, dndSys?.message || '例外が出ていない');
+  // 基本情報 → AI待ちの列 (隣) へは動かせる = 未割り当ての basic_info を引き受けて完了 (version は 1 だけ増える・イベント 1 件)
+  const v0 = versionOf(idM5, 'basic_info');
+  const ev0 = eventsOf(idM5).length;
+  let dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'ai_generate', expectedCurrent: 'basic_info' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D 自動引き受け: 未割り当て工程を一般ユーザーが跨げる (基本情報 → AI待ち)', dndClaim === null, dndClaim?.message || '');
+  check('D&D 自動引き受け: 跨いだ工程は本人担当 + done + version は 1 増',
+    stepOf(idM5, 'basic_info') === 'done' && assigneeOf(idM5, 'basic_info') === wfTanakaId && versionOf(idM5, 'basic_info') === v0 + 1);
+  const evs = eventsOf(idM5);
+  check('D&D 自動引き受け: イベントは 1 件で「自動引き受け」と明記', evs.length === ev0 + 1 && /自動引き受け/.test(evs[evs.length - 1]), JSON.stringify(evs.slice(ev0)));
+  check('D&D 自動引き受け: 移動先がシステム工程なら担当は付けない', assigneeOf(idM5, 'ai_generate') == null);
+
+  // AI待ちが済んだ体にして、商品説明確認 → セット検討 へ (title_approve を跨ぐ)
+  wfpEarly.setStepState(idM5, 'ai_generate', { state: 'done' }, 'smoke', ADMIN2);
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'set_review', expectedCurrent: 'desc_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D 自動引き受け: 通過工程 2 つを一度に引き受けて done', dndClaim === null
+    && stepOf(idM5, 'desc_review') === 'done' && assigneeOf(idM5, 'desc_review') === wfTanakaId
+    && stepOf(idM5, 'title_approve') === 'done' && assigneeOf(idM5, 'title_approve') === wfTanakaId, dndClaim?.message || '');
+  check('D&D 自動引き受け: 移動先 (いまやる番) も未割り当てなら移動者の担当になる (todo のまま)',
+    stepOf(idM5, 'set_review') === 'todo' && assigneeOf(idM5, 'set_review') === wfTanakaId);
+
+  // 後方移動 (開け直し): 本当に未割り当ての工程で検証する
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ? AND step_code = 'title_approve'`).run(idM5);
+  dndClaim = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'title_approve', expectedCurrent: 'set_review' }, 'tanaka', TANAKA); } catch (e) { dndClaim = e; }
+  check('D&D 自動引き受け: 後方移動も本人の担当で開け直す', dndClaim === null
+    && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') === wfTanakaId, dndClaim?.message || '');
+
+  // 途中に他人の担当工程があれば 403 (先行して引き受けた工程もロールバック = 担当を奪わない・中途半端に進めない)
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = NULL WHERE draft_id = ? AND step_code = 'title_approve'`).run(idM5);
+  db.prepare(`UPDATE draft_step_progress SET assignee_id = ? WHERE draft_id = ? AND step_code = 'set_review'`).run(wfOkawaId, idM5);
+  let dndOther = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'listing', expectedCurrent: 'title_approve' }, 'tanaka', TANAKA); } catch (e) { dndOther = e; }
+  check('D&D 自動引き受け: 途中に他人の担当工程があれば 403 で全体ロールバック',
+    dndOther?.status === 403 && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null
+    && assigneeOf(idM5, 'set_review') === wfOkawaId,
+    dndOther?.message || '例外が出ていない');
+  // 担当者に紐づいていないログインユーザーは従来どおり引き受けできない
+  let dndNoStaff = null;
+  try { wfpEarly.moveBoardCard(idM5, { view: 'main', to: 'set_review', expectedCurrent: 'title_approve' }, 'x@b-faith.biz', { isAdmin: false, actorStaffId: null }); } catch (e) { dndNoStaff = e; }
+  check('D&D 自動引き受け: 担当者未紐付けのユーザーは 403', dndNoStaff?.status === 403 && stepOf(idM5, 'title_approve') === 'todo', dndNoStaff?.message || '例外が出ていない');
+  // boardClaim は D&D 経路の内部オプション。通常の工程 API に body で送っても効かない (Codex R2)
+  const adminSession = smokeSession;
+  smokeSession = { email: 'tanaka@b-faith.biz', displayName: '田中', role: 'user' };
+  try {
+    r = await call('POST', `/api/drafts/${idM5}/steps/title_approve`, {
+      assignee_id: wfTanakaId, state: 'done', boardClaim: true, expected_version: versionOf(idM5, 'title_approve'),
+    });
+    check('工程API: body の boardClaim は無視され、未割り当て工程の引き受け+完了は 403', r.status === 403
+      && stepOf(idM5, 'title_approve') === 'todo' && assigneeOf(idM5, 'title_approve') == null, JSON.stringify(r.json));
+  } finally { smokeSession = adminSession; }
 
   // 画像ビュー: TOP を 依頼 → 登録 へ (依頼・制作が done)、完了列で承認まで閉じる。
   // idM は画像ありのため初回 seed で TOP側が done 済み (仕様) → 画像なしの別ドラフトで検証する
