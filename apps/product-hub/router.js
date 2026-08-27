@@ -35,6 +35,7 @@ import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
 } from './lib/mall-status.js';
 import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
+import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
@@ -458,6 +459,8 @@ router.post('/api/drafts/:id', async (req, res) => {
     if ((imagePriority || null) !== (cur.image_priority || null)) {
       logEvent(db, draft.id, 'image_priority_changed', `${cur.image_priority || '未設定'} -> ${imagePriority || '未設定'} (自社商品チェック連動)`, actorOf(req));
     }
+    // 商品リンク台帳へ同一トランザクションで写す (画像フォルダURL)。台帳側の失敗は握って夜間照合で自己修復
+    syncDraftLinks(db, draft.id, { actor: actorOf(req) });
     return { ownBrandValue: ownBrand, imagePriorityValue: imagePriority };
   })();
   // 税率は基本情報の項目として保存する (2026-08-06 中原さん指示で Yahoo!欄から移動。
@@ -764,6 +767,9 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     }
   }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
+  // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
+  try {
+  db.transaction(() => {
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
     importance_tier: clean(b.importance_tier, 100),
@@ -782,7 +788,14 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     product_info_updated_at: infoAt,
     product_info_updated_by: infoBy,
   });
+  // 商品リンク台帳へ写す (Canva リンク)。strict = 台帳側が失敗したらこの保存ごと巻き戻す (Codex PR1 R2 High)
+  syncDraftLinks(db, draft.id, { actor: actorOf(req), strict: true });
   logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
+  })();
+  } catch (e) {
+    console.error('[product-hub] image-production save failed (rolled back):', e);
+    return res.status(500).json({ ok: false, error: '保存できませんでした (商品リンク台帳への同期で失敗。Render ログを確認してください)' });
+  }
   res.json({ ok: true });
 });
 

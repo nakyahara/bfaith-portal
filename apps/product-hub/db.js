@@ -14,6 +14,7 @@
  *   手で遷移させるのは 保留/除外/再開 のみ (それ以外の手動遷移 API は廃止)。
  */
 import { getMirrorDB } from '../warehouse-mirror/db.js';
+import { syncDraftLinks } from '../product-links/sync.js';
 import { fileViewUrl } from './lib/drive-link.js';
 
 export const DRAFT_STATUSES = [
@@ -1561,6 +1562,8 @@ export function applyFolderImport(db, draftId, assigned, { folderUrl = null, cur
     if (folderUrl && folderUrl !== currentFolderUrl) {
       db.prepare(`UPDATE product_drafts SET drive_folder_url = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`)
         .run(folderUrl, draftId);
+      // 商品リンク台帳へ同一トランザクションで写す (2026-08-27)
+      syncDraftLinks(db, draftId, { actor: 'auto:folder_import' });
     }
   })();
 }
