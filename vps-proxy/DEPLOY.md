@@ -46,6 +46,11 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
    STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1 node apps/warehouse/smoke-yahoo-proxy.js 14
    ```
    → `✅ Yahoo orderInfo proxy 動作確認 OK` を確認。
+   PR-Y-B 以降は `/yahoo/orderContact` のスモークも:
+   ```bash
+   node apps/warehouse/smoke-yahoo-order-contact.js
+   ```
+   → `✅ orderContact OK` と `✅ orderInfo に ShipDate=true SocialGiftType=true` を確認 (メールの値は表示しない)。
    `STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1` は `/yahoo/access-token` の verify (Cache-Control: no-store / 401 fail-closed) を必須化する。本番 deploy では必ず STRICT を付けること (`YAHOO_TOKEN_MINT_SECRET` 同期漏れで `503` のまま残るのを防ぐ)。
 5. **smoke 失敗時の rollback** (手動判断):
    ```bash
