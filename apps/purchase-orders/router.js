@@ -37,6 +37,7 @@ import { fetchShipmentMails, listShipmentMails, setShipmentMailStatus, reparseSh
 import { getSetting, setSetting, audit, markCycleFbaJobDone } from './ledger.js';
 import { computeShortageRisk, shortageSettings, validateShortageSetting, shortageSettingKey, SHORTAGE_DEFAULTS } from './shortage-risk.js';
 import { getDriveCsvInfo, downloadDriveCsv } from '../../lib/drive-csv.js';
+import { startFbaAutoRefresh, nextBusinessDay9Jst } from './scheduler.js';
 
 startEmailDispatcher(); // 予約送信 (毎分、時刻が来たqueuedジョブを送信。unrefでプロセス終了は妨げない)
 
@@ -63,6 +64,8 @@ async function callWarehouse(fullPath, { method = 'GET', timeout = 30000 } = {})
   if (!ct.includes('application/json')) throw new Error(`レスポンス形式異常 (ct=${ct || 'none'})`);
   return res.json();
 }
+
+startFbaAutoRefresh(callWarehouse); // 平日16時 (JST) のFBA在庫自動更新 (土日祝スキップ・Render限定。中原さん要望 2026-08-27)
 
 const router = Router();
 
@@ -1364,6 +1367,12 @@ router.post('/api/email/reconcile', async (req, res) => {
 
 router.get('/api/email/settings', (req, res) => {
   try { res.json({ ok: true, ...emailSettings() }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// 翌営業日 (土日祝を除く) 9:00 JST — /backorders「⏰ 翌営業日9時に送信」の予約日時 (クリック時点で算出)
+router.get('/api/email/next-business-day', (req, res) => {
+  try { res.json({ ok: true, value: nextBusinessDay9Jst() }); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -6398,6 +6407,7 @@ router.get('/backorders', (req, res) => {
     <div class="toolbar" id="boBulkBar" style="display:none;background:#eef4ff;border-radius:8px;padding:8px 12px;margin:6px 0;gap:12px;align-items:center;flex-wrap:wrap">
       <b id="boSelCount"></b>
       <label class="muted">予約日時 <input type="datetime-local" id="boBulkAt"> <span style="font-size:11px">(空欄=今すぐ送信)</span></label>
+      <button class="pri" id="boBulkNbd" title="予約日時を翌営業日 (土日祝を除く) の朝9:00にセットして、そのまま送信の確認へ進みます">⏰ 翌営業日9時に送信</button>
       <button class="pri" id="boBulkSend">📧 選択した発注書をまとめて送信</button>
       <button class="ghost" id="boSelClear">選択解除</button>
     </div>
@@ -6652,6 +6662,18 @@ document.getElementById('boSelClear').addEventListener('click', function() {
   SEL = {};
   document.querySelectorAll('.boSel').forEach(function(cb){ cb.checked = false; });
   updateBulkBar();
+});
+// ⏰ 翌営業日9時に送信: 予約日時を翌営業日 (土日祝を除く) 9:00 JST にセットして既存の一括送信フローへ
+// (確認ダイアログに予約日時が表示される。日時はクリック時点でサーバ算出 — 日を跨いで開きっぱなしでもズレない。中原さん要望 2026-08-27)
+document.getElementById('boBulkNbd').addEventListener('click', function() {
+  var btn = this;
+  btn.disabled = true;
+  getJson(API + '/email/next-business-day').then(function(j) {
+    btn.disabled = false;
+    if (!j.ok) { toast('エラー: ' + j.error); return; }
+    document.getElementById('boBulkAt').value = j.value;
+    document.getElementById('boBulkSend').click();
+  }).catch(function(e){ btn.disabled = false; toast('通信エラー: ' + e.message); });
 });
 // 送信可能なPO (オープン+メール対象) か — 選択時だけでなく送信直前にも再検証する (Codex 一括R1 High)
 function bulkEligibleIds() {

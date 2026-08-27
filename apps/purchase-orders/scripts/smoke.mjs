@@ -4329,6 +4329,45 @@ console.log('── FBAサイクルリセット サーバ側検知 ──');
   delete process.env.PO_FBA_CYCLE_CHECK_INTERVAL_MS;
 }
 
+// ═══ scheduler: FBA毎日16時自動更新の判定 + 翌営業日9時 (中原さん要望 2026-08-27) ═══
+console.log('── scheduler: FBA自動更新判定 + 翌営業日9時 ──');
+{
+  const { nextBusinessDay9Jst, fbaAutoDue } = await imp('apps/purchase-orders/scheduler.js');
+  const at = s => new Date(Date.parse(s + '+09:00')); // JSTの 'YYYY-MM-DDTHH:mm' → Date
+
+  // 翌営業日9:00 (JST): 平日→翌平日 / 金曜・土曜→月曜 / 祝日連休は跨ぐ
+  ok(nextBusinessDay9Jst(at('2026-08-26T10:00')) === '2026-08-27T09:00', '翌営業日: 水→木');
+  ok(nextBusinessDay9Jst(at('2026-08-28T10:00')) === '2026-08-31T09:00', '翌営業日: 金→月 (土日スキップ)');
+  ok(nextBusinessDay9Jst(at('2026-08-29T08:00')) === '2026-08-31T09:00', '翌営業日: 土曜起点→月曜');
+  ok(nextBusinessDay9Jst(at('2026-09-18T16:00')) === '2026-09-24T09:00',
+    '翌営業日: シルバーウィーク (9/19土 9/20日 9/21敬老 9/22国民の休日 9/23秋分) を跨ぐ', nextBusinessDay9Jst(at('2026-09-18T16:00')));
+  ok(nextBusinessDay9Jst(at('2026-08-27T23:30')) === '2026-08-28T09:00', '翌営業日: 深夜でもJST基準で翌日');
+
+  // 16時窓の判定: 平日 16:00〜16:59 かつ当日未実行のときだけ due。土日祝は skip (実行せず処理済みマークのみ)
+  ok(fbaAutoDue(at('2026-08-27T15:59'), null).due === false, 'FBA自動更新: 16時前は起動しない');
+  ok(fbaAutoDue(at('2026-08-27T16:00'), null).due === true, 'FBA自動更新: 平日16:00に起動');
+  ok(fbaAutoDue(at('2026-08-27T16:30'), '2026-08-27').due === false, 'FBA自動更新: 当日起動済みは再起動しない');
+  ok(fbaAutoDue(at('2026-08-27T16:30'), '2026-08-26').due === true, 'FBA自動更新: 16時台の再起動後は追い上げ起動');
+  ok(fbaAutoDue(at('2026-08-27T17:00'), '2026-08-26').due === false, 'FBA自動更新: 17時以降は当日を諦める (夜中の無人更新なし)');
+  ok(fbaAutoDue(at('2026-08-27T16:59'), null).ymd === '2026-08-27', 'FBA自動更新: ymdはJST日付');
+  const sat = fbaAutoDue(at('2026-08-29T16:00'), null);
+  ok(sat.due === false && sat.skip === true, 'FBA自動更新: 土曜は起動せずskip (第2・第4土曜も一律)', sat);
+  const sun = fbaAutoDue(at('2026-08-30T16:30'), null);
+  ok(sun.due === false && sun.skip === true, 'FBA自動更新: 日曜はskip', sun);
+  const hol = fbaAutoDue(at('2026-09-21T16:00'), null);
+  ok(hol.due === false && hol.skip === true, 'FBA自動更新: 祝日 (敬老の日) はskip', hol);
+  const satDone = fbaAutoDue(at('2026-08-29T16:30'), '2026-08-29');
+  ok(satDone.skip === false && satDone.due === false, 'FBA自動更新: skip記録済みの休日は再skipしない (ping連打なし)', satDone);
+  const satOut = fbaAutoDue(at('2026-08-29T15:00'), null);
+  ok(satOut.skip === false && satOut.due === false, 'FBA自動更新: 休日でも16時窓の外ではskip処理しない', satOut);
+
+  // API + /backorders UI
+  r = await j('/api/email/next-business-day');
+  ok(r.status === 200 && r.body.ok && /^\d{4}-\d{2}-\d{2}T09:00$/.test(r.body.value), 'GET /api/email/next-business-day → YYYY-MM-DDT09:00', r.body);
+  const boHtmlNbd = await (await fetch(base + '/backorders')).text();
+  ok(boHtmlNbd.includes('boBulkNbd') && boHtmlNbd.includes('翌営業日9時に送信'), '/backorders ⏰翌営業日9時に送信ボタン配信');
+}
+
 // ═══ 全ページのインラインJS構文チェック (サーバtemplate literal内クライアントJSの括弧崩れ等を機械検出) ═══
 console.log('── ページ内スクリプトの構文チェック ──');
 {

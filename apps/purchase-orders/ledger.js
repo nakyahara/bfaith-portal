@@ -57,6 +57,7 @@ const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_t
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
   'email_issuer_name',   // 発注書CSVの「発行担当者」列
   'po_lz_mirror_suppress_capture', // 「CSV取込を解除」時のmirror世代 (この世代までは自動反映を復活させない)
+  'po_fba_auto_refresh_last_ymd',  // FBA自動更新 (16時) の最終起動日 (JST)。同日の二重起動防止 (scheduler.js)
   // P17 欠品リスクのしきい値 (数値範囲は下の SHORTAGE_SETTING_RULES で setSetting 自体が検証する)
   'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
 
