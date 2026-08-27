@@ -126,6 +126,25 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
   check('releaseClaim: 正しい token + 未使用 attempt → 解放', Y.releaseClaim(db, { actionId: id3, claimToken: cl.claimToken, nowIso: NOW }) === true
     && db.prepare(`SELECT status FROM ${T.actions} WHERE id = ?`).get(id3).status === 'ready'
     && db.prepare(`SELECT COUNT(*) n FROM ${T.attempts} WHERE action_id = ?`).get(id3).n === 0);
+  // release_conflict はバッチ中断 (後続 action を処理しない)
+  {
+    db.prepare(`INSERT INTO yahoo_order_contacts (order_number, shipping_datetime, masked_email_enc, fetched_at) VALUES ('b-faith01-4', '2026-09-01T12:00:00+09:00', '(api)', ?)`).run(NOW);
+    db.prepare(`INSERT INTO ${T.ownership} (order_number, owner, reason, decided_at) VALUES ('b-faith01-4', 'self', 'test', ?)`).run(NOW);
+    createCampaignEngine('yahoo').planCampaigns(db, { nowIso: NOW });
+    db.prepare(`UPDATE ${T.actions} SET status = 'ready', scheduled_at = '2026-09-11T03:00:00.000Z', ready_at = ? WHERE order_number IN ('b-faith01-3','b-faith01-4')`).run(NOW);
+    const before = sent.length;
+    const tamper = createSenderEngine({ mall: 'yahoo', monthlyCouponFor: () => null, buildMail: (a) => ({ subject: 's', text: 't' }), fromHeader: 'x <x@b-faith.biz>',
+      resolveRecipient: async (_db, a) => {
+        // 解放が失敗する状況を作る: 別 worker が attempt に note を付けた体
+        db.prepare(`UPDATE ${T.attempts} SET note = 'other-worker' WHERE action_id = ?`).run(a.id);
+        const e = new Error('429'); e.retryable = true; e.code = 'api_429'; throw e;
+      } });
+    const r5 = await tamper.processReadyActions(db, { keys, sendFn, nowIso: NOW, limit: 10 });
+    check('release_conflict は専用カウンタ + バッチ即時中断 (2件目は手つかず)', r5.releaseConflict === 1 && r5.recipientRetry === 0 && r5.finalizeConflict === 0
+      && sent.length === before && db.prepare(`SELECT COUNT(*) n FROM ${T.actions} WHERE status = 'ready' AND order_number IN ('b-faith01-3','b-faith01-4')`).get().n === 1
+      && db.prepare(`SELECT COUNT(*) n FROM ${T.actions} WHERE status = 'claimed'`).get().n === 1, JSON.stringify(r5));
+    // 後片付け: claimed を ambiguous 扱いで残す (人の確認対象)。id3 の attempt note を戻すのは本テストでは不要
+  }
   check('finalizeAttempt / markAmbiguous: claimToken 無しは throw',
     (() => { try { Y.finalizeAttempt(db, { actionId: id3, outcome: 'accepted' }); return false; } catch (e) { return /claimToken/.test(e.message); } })()
     && (() => { try { Y.markAmbiguous(db, { actionId: id3 }); return false; } catch (e) { return /claimToken/.test(e.message); } })());

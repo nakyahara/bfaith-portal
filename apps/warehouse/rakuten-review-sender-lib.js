@@ -277,9 +277,12 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
           out.recipientRetry++;
           out.details.push({ id: action.id, result: 'recipient_retry', reason: String(e.code || 'retryable') });
         } else {
-          // 送信結果の確定競合 (finalizeConflict) とは別事象なので専用カウンタ (Codex Y0-R2 High)
+          // 送信結果の確定競合 (finalizeConflict) とは別事象なので専用カウンタ (Codex Y0-R2 High)。
+          // claim 喪失 / attempt 改変 = 別 worker や状態不明を排除できないので、ambiguous と同じく
+          // バッチを即時中断して人の確認へ (Codex Y0-R3 High)
           out.releaseConflict++;
           out.details.push({ id: action.id, result: 'release_conflict', reason: String(e.code || 'retryable') });
+          break;
         }
         continue;
       }
