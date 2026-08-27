@@ -162,6 +162,14 @@ export function analyzeUrl(raw) {
   return { provider: null, external_id: null, normalized_url: norm, link_type_hint: hint };
 }
 
+/** http/https だけ・資格情報つきは拒否 (URL パーサで判定)。台帳へ入る URL の共通ゲート (手入力・自動同期・取込すべて) */
+export function isSafeHttpUrl(u) {
+  try {
+    const p = new URL(String(u || ''));
+    return (p.protocol === 'http:' || p.protocol === 'https:') && !p.username && !p.password && !!p.hostname;
+  } catch { return false; }
+}
+
 /** 検索語の正規化: NFKC (全角英数→半角) ・小文字・空白畳み込み */
 export function normalizeText(s) {
   return String(s ?? '').normalize('NFKC').toLowerCase().replace(/[\s　]+/g, ' ').trim();
@@ -183,6 +191,7 @@ export function upsertLink(db, {
   if (!LINK_TYPES.includes(linkType)) throw validationError(`リンク種類が不正です: ${linkType}`);
   if (purpose !== null && !PURPOSES.includes(purpose)) throw validationError(`用途が不正です: ${purpose}`);
   if (!SOURCE_SYSTEMS.includes(source)) throw new Error(`source_system が不正です: ${source}`);
+  if (!isSafeHttpUrl(url)) throw validationError('URL の形式が不正です (http/https のみ)');
   const a = analyzeUrl(url);
   if (!a) throw validationError('URL が空です');
   const effPurpose = linkType === 'drive_folder' ? null : purpose;
@@ -298,15 +307,18 @@ export function updateLinkMeta(db, id, { label, purpose, hidden }) {
   return true;
 }
 
-/** PATCH 1 回分を原子的に (primary だけ変わって 400 が返る、を防ぐ — Codex PR1 R1 M6) */
+/**
+ * PATCH 1 回分を原子的に (primary だけ変わって 400 が返る、を防ぐ — Codex PR1 R1 M6)。
+ * 用途・ラベル → primary の順 (用途変更は primary を外すので、同時指定なら新しい用途で primary を付け直す — Codex R2 M)
+ */
 export function patchLink(db, id, { is_primary, label, purpose, hidden }) {
   return db.transaction(() => {
-    if (is_primary !== undefined && !setPrimary(db, id, !!is_primary)) return false;
     const meta = {};
     if (label !== undefined) meta.label = label;
     if (purpose !== undefined) meta.purpose = purpose;
     if (hidden !== undefined) meta.hidden = hidden;
     if (Object.keys(meta).length > 0 && !updateLinkMeta(db, id, meta)) return false;
+    if (is_primary !== undefined && !setPrimary(db, id, !!is_primary)) return false;
     return true;
   })();
 }
@@ -457,13 +469,16 @@ export function membersOf(db, setCodes) {
     for (const r of rows) { if (!map.has(r.set_code)) map.set(r.set_code, []); map.get(r.set_code).push({ code: r.code, name: r.name, qty: r.qty }); }
   }
   if (hasTable(db, 'draft_set_members')) {
+    // mirror が正。mirror に構成が無いセットだけ product-hub の派生構成で補完 (判定は mirror 由来の集合で行う —
+    // map.has で判定すると補完 1 件目を入れた瞬間に 2 件目以降を読み飛ばす: Codex PR1 R2 M)
+    const inMirror = new Set(map.keys());
     const rows = db.prepare(`
       SELECT LOWER(TRIM(p.ne_code)) AS set_code, LOWER(TRIM(m.member_ne_code)) AS code, m.qty
       FROM draft_set_members m JOIN product_drafts p ON p.id = m.set_draft_id
       WHERE LOWER(TRIM(p.ne_code)) IN (${list.map(() => '?').join(',')}) ORDER BY m.sort, m.member_ne_code
     `).all(...list);
     for (const r of rows) {
-      if (map.has(r.set_code)) continue; // mirror が正。無いときだけ補完
+      if (inMirror.has(r.set_code)) continue;
       if (!map.has(r.set_code)) map.set(r.set_code, []);
       map.get(r.set_code).push({ code: r.code, name: null, qty: r.qty });
     }

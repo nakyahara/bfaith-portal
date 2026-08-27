@@ -768,6 +768,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
   // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
+  try {
   db.transaction(() => {
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
@@ -787,10 +788,14 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     product_info_updated_at: infoAt,
     product_info_updated_by: infoBy,
   });
-  // 商品リンク台帳へ写す (Canva リンク)。保存済みの値から冪等に同期するので upsert の直後に呼ぶだけでよい
-  syncDraftLinks(db, draft.id, { actor: actorOf(req) });
+  // 商品リンク台帳へ写す (Canva リンク)。strict = 台帳側が失敗したらこの保存ごと巻き戻す (Codex PR1 R2 High)
+  syncDraftLinks(db, draft.id, { actor: actorOf(req), strict: true });
   logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
   })();
+  } catch (e) {
+    console.error('[product-hub] image-production save failed (rolled back):', e);
+    return res.status(500).json({ ok: false, error: '保存できませんでした (商品リンク台帳への同期で失敗。Render ログを確認してください)' });
+  }
   res.json({ ok: true });
 });
 

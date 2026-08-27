@@ -10,16 +10,24 @@
  * 呼び出し側 (product-hub の保存 API) は自分のトランザクションの中から呼ぶ。ここで例外を投げると保存ごと
  * 巻き戻るので、台帳側の失敗は握って記録するだけにする (夜間照合で自己修復する)。
  */
-import { upsertLink, detachStaleSources, normalizeCode } from './db.js';
+import { upsertLink, detachStaleSources, normalizeCode, isSafeHttpUrl } from './db.js';
 
 function tableExists(db, name) {
   return !!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
 }
 
 /** 返す: { ok, upserted: number, detached: number } */
-export function syncDraftLinks(db, draftId, { actor = 'auto:product_hub' } = {}) {
+/**
+ * @param {{actor?: string, strict?: boolean}} opts
+ *   strict=true … 失敗を例外にする (呼び出し側のトランザクションごと巻き戻したいとき = 画像制作保存)。
+ *   既定 false … 失敗を握って {ok:false} (基本情報保存 = 台帳の都合で商品登録を止めない)
+ */
+export function syncDraftLinks(db, draftId, { actor = 'auto:product_hub', strict = false } = {}) {
   try {
-    if (!tableExists(db, 'ph_product_links')) return { ok: false, error: 'table_missing' };
+    if (!tableExists(db, 'ph_product_links')) {
+      if (strict) throw new Error('ph_product_links が未作成です');
+      return { ok: false, error: 'table_missing' };
+    }
     // 1 ドラフト分は原子的に (外側のトランザクションの中では SAVEPOINT になる)。
     // 失敗はここで握る = product-hub の保存を台帳の都合で落とさない (夜間照合が自己修復)
     return db.transaction(() => {
@@ -30,10 +38,11 @@ export function syncDraftLinks(db, draftId, { actor = 'auto:product_hub' } = {})
           ? db.prepare('SELECT canva_url, updated_at FROM draft_image_production WHERE draft_id = ?').get(draftId)
           : null;
         const base = { neCode: draft.ne_code, productName: draft.name, source: 'product_hub', sourceEntityId: String(draft.id), createdBy: actor };
-        if (draft.drive_folder_url && /^https?:\/\//i.test(draft.drive_folder_url)) {
+        // 不正な URL (http/https 以外) は台帳へ入れない (product-hub 側の検証が緩くても台帳の href を汚さない)
+        if (isSafeHttpUrl(draft.drive_folder_url)) {
           keep.push(upsertLink(db, { ...base, linkType: 'drive_folder', url: draft.drive_folder_url, sourceUpdatedAt: draft.updated_at }).id);
         }
-        if (ip?.canva_url && /^https?:\/\//i.test(ip.canva_url)) {
+        if (isSafeHttpUrl(ip?.canva_url)) {
           keep.push(upsertLink(db, { ...base, linkType: 'canva', url: ip.canva_url, sourceUpdatedAt: ip.updated_at }).id);
         }
       }
@@ -42,6 +51,7 @@ export function syncDraftLinks(db, draftId, { actor = 'auto:product_hub' } = {})
     })();
   } catch (e) {
     console.error(`[product-links] sync draft ${draftId} failed:`, e.message);
+    if (strict) throw e;
     return { ok: false, error: e.message };
   }
 }

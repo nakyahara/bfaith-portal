@@ -3,7 +3,9 @@
   <% if (canEdit && l.purpose) { %><button class="star <%= l.is_primary ? 'on' : '' %>" type="button" data-id="<%= l.id %>" title="主リンクにする (同じ用途の中で「これを使う」印)">★</button>
   <% } else if (l.is_primary) { %><span style="color:#f59e0b">★</span><% } %>
   <span class="icon"><%= icon %></span>
-  <a href="<%= l.url %>" target="_blank" rel="noopener"><%= linkTypeLabels[l.link_type] %><%= l.purpose ? ' / ' + purposeLabels[l.purpose] : '' %><%= l.label ? ' (' + l.label + ')' : '' %></a>
+<%# href は http/https だけ (DB 層でも弾いているが、描画側でも二重に守る: javascript: 等を絶対に出さない) %>
+<% const safeHref = /^https?:\/\//i.test(String(l.url || '')) ? l.url : null; %>
+<% if (safeHref) { %><a href="<%= safeHref %>" target="_blank" rel="noopener noreferrer"><% } else { %><span class="muted" title="不正なURLのため開けません"><% } %><%= linkTypeLabels[l.link_type] %><%= l.purpose ? ' / ' + purposeLabels[l.purpose] : '' %><%= l.label ? ' (' + l.label + ')' : '' %><% if (safeHref) { %></a><% } else { %></span><% } %>
   <span class="meta"><%= (l.sources || []).map(s => sourceLabels[s] || s).join('・') %><%= l.hidden ? '・非表示' : '' %></span>
   <% if (canEdit) { %>
     <span class="tools">

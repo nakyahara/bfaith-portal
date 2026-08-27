@@ -189,7 +189,7 @@
       } else if (a === 'hide') {
         api('PATCH', '/apps/product-links/api/links/' + lid, { hidden: act.getAttribute('data-cur') !== '1' }).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
       } else if (a === 'del') {
-        if (!confirm('このリンクを台帳から削除しますか? (商品登録ハブ側の値は変わりません。次の照合で由来がまだあれば復活します)')) return;
+        if (!confirm('このリンクを台帳から削除しますか? (商品登録ハブ側の値は変わりません。自動同期では復活しません。戻したいときは同じURLを手で追加してください)')) return;
         api('DELETE', '/apps/product-links/api/links/' + lid).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
       }
     }

@@ -125,6 +125,34 @@ const { patchLink } = pl;
 threw = false;
 try { patchLink(db, p2.id, { is_primary: true, purpose: 'bogus' }); } catch (e) { threw = e.code === 'VALIDATION'; }
 check('patchLink 原子性 (400 なら primary も戻る)', threw && db.prepare('SELECT is_primary FROM ph_product_links WHERE id = ?').get(p2.id).is_primary === 0);
+patchLink(db, np.id, { purpose: 'a_plus', is_primary: true });
+check('patchLink 用途+primary 同時指定 → 新しい用途で primary', db.prepare('SELECT purpose, is_primary FROM ph_product_links WHERE id = ?').get(np.id).is_primary === 1);
+patchLink(db, np.id, { purpose: 'variation', is_primary: true });
+const npRow = db.prepare('SELECT purpose, is_primary FROM ph_product_links WHERE id = ?').get(np.id);
+check('patchLink 用途変更+primary → 変更後の用途で primary のまま', npRow.purpose === 'variation' && npRow.is_primary === 1);
+// 不正 URL は台帳に入らない (DB 層ゲート)
+for (const bad of ['javascript:alert(1)', 'http://%', 'https://user:pw@example.com/x', 'ftp://example.com/a']) {
+  let rejected = false;
+  try { upsertLink(db, { neCode: 'spearmint30', linkType: 'other', url: bad, source: 'manual', sourceEntityId: 't' }); } catch (e) { rejected = e.code === 'VALIDATION'; }
+  check(`不正 URL 拒否: ${bad}`, rejected);
+}
+// 自動同期も不正 URL を写さない
+const ins3 = db.prepare(`INSERT INTO product_drafts (ne_code, name, drive_folder_url) VALUES (?, ?, ?)`).run('nolink01', 'x', 'javascript:alert(1)');
+const s3 = syncDraftLinks(db, Number(ins3.lastInsertRowid));
+check('自動同期: 不正 URL は写さない', s3.ok && s3.upserted === 0);
+db.prepare('DELETE FROM product_drafts WHERE id = ?').run(Number(ins3.lastInsertRowid));
+// strict は例外を投げる (存在しない draft でも tableExists は通るので、不正な source で試す代わりに db を壊さず検証: 用途なし primary を strict 経路で)
+threw = false;
+try { syncDraftLinks({ prepare: () => { throw new Error('boom'); } }, 1, { strict: true }); } catch { threw = true; }
+check('strict=true は例外を投げる', threw);
+check('strict 既定は握る', syncDraftLinks({ prepare: () => { throw new Error('boom'); } }, 1).ok === false);
+// セット構成の product-hub 補完は複数構成品を全部拾う
+db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 原価状態, updated_at) VALUES (?, ?, ?, ?, 'n/a', '')`).run('phset01', 'ハブ派生セット', 'セット', '取扱中');
+const insSet = db.prepare(`INSERT INTO product_drafts (ne_code, name) VALUES (?, ?)`).run('phset01', 'ハブ派生セット');
+db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)').run(Number(insSet.lastInsertRowid), 'spearmint30', 2, 0);
+db.prepare('INSERT INTO draft_set_members (set_draft_id, member_ne_code, qty, sort) VALUES (?, ?, ?, ?)').run(Number(insSet.lastInsertRowid), 'nolink01', 1, 1);
+check('draft_set_members 補完は全構成品', (pl.membersOf(db, ['phset01']).get('phset01') || []).length === 2);
+check('mirror にある構成は mirror が正 (補完しない)', (pl.membersOf(db, ['mint3set']).get('mint3set') || []).length === 1);
 
 console.log('--- 検索');
 invalidateCatalogCache();
