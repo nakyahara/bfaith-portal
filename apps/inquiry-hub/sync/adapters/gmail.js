@@ -26,6 +26,7 @@ import nodemailer from 'nodemailer';
 import { evaluateMailRules } from '../../mail-rules.js';
 import { classifyReplyDestination, isBounceSignature, RAKUTEN_MASKED_RE } from '../../no-reply.js';
 import { isComposeThread } from '../../compose-id.js';
+import { checkRecipientDomain } from '../../mx-check.js';
 import { SendRejectedError } from '../../outbox.js';
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
@@ -474,6 +475,12 @@ export function createGmailAdapter(cfg = {}) {
         throw new SendRejectedError(`宛先メールアドレスを特定できません (customer_identifier='${inquiry?.customer_identifier || ''}'。`
           + 'スレッド内にも顧客の差出人が見つかりません — 顧客への送信手段がないメール (自社発の通知等) の可能性があります)');
       }
+      // 宛先ドメインの事前確認 (2026-08-27)。画面のジョブ作成時にも見ているが、
+      // スレッドから宛先を復元した場合はここが初めての確認になる。
+      // 「確実に受け取れない」ときだけ未送信で止める (DNS不通なら止めない。mx-check.js)
+      const domainCheck = await checkRecipientDomain(to);
+      if (!domainCheck.ok) throw new SendRejectedError(`${domainCheck.reason} (未送信)`);
+
       // ─── 返信不可アドレス宛は未送信で止める (2026-08-26 本番事故。no-reply.js 参照) ───
       // no-reply@mercari-shops.com 宛の返信が Gmail のリトライ後にバウンスし、画面上は
       // 「送信済み」なのに顧客には何も届いていなかった。送る前に止めて返信先を案内する

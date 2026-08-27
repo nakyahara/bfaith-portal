@@ -7,6 +7,14 @@ import { initInquiryHubDB, getDB, logActivity, toUtcIso } from './db.js';
 import { listInquiries, listFilterOptions, getInquiryDetail, likeEsc, PAGE_SIZE, STATUSES, INBOX_STATUSES } from './queries.js';
 import { parseCsv, importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templates.js';
 import { purgeDemo } from './scripts/purge-demo.mjs';
+import { setResolverForTest } from './mx-check.js';
+
+// 返信APIの宛先ドメイン事前確認 (mx-check.js) で実DNSを引かせない (常に「受け取れる」扱い)
+setResolverForTest({
+  resolveMx: async (d) => [{ exchange: `mail.${d}`, priority: 10 }],
+  resolve4: async () => [],
+  resolve6: async () => [],
+});
 
 const T = s => toUtcIso(s); // fixture はJSTで書き、保存は正準形式 (UTC 'YYYY-MM-DDTHH:MM:SSZ')
 

@@ -13,6 +13,23 @@ import { normalizeRecipient, normalizeSubject, normalizeCustomerName, validateBo
 import { createReplyJob, runOutboxPass } from './outbox.js';
 import { createGmailAdapter } from './sync/adapters/gmail.js';
 import { listInquiries } from './queries.js';
+import { setResolverForTest, clearMxCache } from './mx-check.js';
+
+// 宛先ドメインの事前確認 (mx-check.js) は実DNSを引かせない。
+// 'gmial.test' だけ「ドメインが存在しない」= 打ち間違いの再現、それ以外は受け取れる扱い
+const nxError = () => Object.assign(new Error('stub ENOTFOUND'), { code: 'ENOTFOUND' });
+function restoreStubResolver() {
+  setResolverForTest({
+    resolveMx: async (d) => {
+      if (d.endsWith('gmial.test')) throw nxError();
+      return [{ exchange: `mail.${d}`, priority: 10 }];
+    },
+    resolve4: async () => { throw nxError(); },
+    resolve6: async () => { throw nxError(); },
+  });
+}
+restoreStubResolver();
+clearMxCache();
 
 if (!process.env.DATA_DIR) {
   console.error('FATAL: DATA_DIR が未指定です。専用の空ディレクトリを指定してください (例: DATA_DIR=c:/tmp/ih-compose-smoke)');
@@ -343,6 +360,12 @@ console.log('7. Gmail送信の組み立て');
     /^To: Taro\.Yamada@example\.jp$/m.test(mimeCase), (mimeCase.match(/^To: .*$/m) || [])[0]);
   check('実スレッドIDを返す (outboxが仮IDと差し替える)', out.externalThreadId === 'gmail-thread-9' && out.externalReplyId === 'sent-1');
 
+  // 送信ワーカー側の確認 (画面を通らない経路・スレッドから宛先を復元した場合の保険)
+  await rejects('送信直前にも宛先ドメインを確認し、存在しなければ未送信で止める',
+    () => gmail.sendReply({ inquiry: { external_inquiry_id: `${COMPOSE_PREFIX}typo`,
+      customer_identifier: 'taro@gmial.test', subject: '打ち間違い' }, bodyText: '本文' }),
+    '打ち間違い');
+
   await rejects('宛先が空の新規メールは未送信で止める (スレッドから復元しない)',
     () => gmail.sendReply({ inquiry: { external_inquiry_id: `${COMPOSE_PREFIX}x`, customer_identifier: '', subject: 'x' }, bodyText: 'b' }),
     '新規メールの宛先が不正');
@@ -491,6 +514,39 @@ console.log('8. 画面');
     check('同時POST (下書きなし): 問い合わせは1件しか増えない',
       db.prepare('SELECT COUNT(*) c FROM inquiries').get().c === before2 + 1
       && b1.status === 200 && b2.status === 200 && b1.j.outboxId === b2.j.outboxId);
+  }
+
+  // 宛先ドメインの事前確認 (2026-08-27): 打ち間違いは送る前に止める
+  {
+    const before = db.prepare('SELECT COUNT(*) c FROM inquiries').get().c;
+    const typo = await jp('/api/compose/send', { to: 'kokyaku@gmial.test', subject: '打ち間違い',
+      body: '本文', clientOperationId: 'op-typo-1' });
+    check('存在しないドメイン宛は送信前に400で止まる',
+      typo.status === 400 && String(typo.j.error).includes('打ち間違い'));
+    check('止めたときは問い合わせも送信ジョブも作らない',
+      db.prepare('SELECT COUNT(*) c FROM inquiries').get().c === before
+      && db.prepare("SELECT COUNT(*) c FROM outbox_replies WHERE client_operation_id = 'op-typo-1'").get().c === 0);
+  }
+
+  // 再POSTは宛先ドメインの判定より先に既存ジョブを返す (Codexレビュー: 送信済みなのに失敗表示にしない)
+  {
+    const dr = await jp('/api/compose/draft', { shopId: shopEmail });
+    const first = await jp('/api/compose/send', { draftId: dr.j.id, to: 'saki@ok-domain.test',
+      subject: 'DNS後戻り確認', body: '本文', clientOperationId: 'op-dns-retry' });
+    check('1回目は普通に送信ジョブができる', first.status === 200 && first.j.duplicate === false);
+    // 送信後にそのドメインが引けなくなった状況を作る (キャッシュを消してNXDOMAINに)
+    clearMxCache();
+    setResolverForTest({
+      resolveMx: async () => { throw Object.assign(new Error('stub ENOTFOUND'), { code: 'ENOTFOUND' }); },
+      resolve4: async () => { throw Object.assign(new Error('stub ENOTFOUND'), { code: 'ENOTFOUND' }); },
+      resolve6: async () => { throw Object.assign(new Error('stub ENOTFOUND'), { code: 'ENOTFOUND' }); },
+    });
+    const again = await jp('/api/compose/send', { draftId: dr.j.id, to: 'saki@ok-domain.test',
+      subject: 'DNS後戻り確認', body: '本文', clientOperationId: 'op-dns-retry' });
+    check('同じ操作IDの再POSTはDNSが否定でも既存ジョブを返す (失敗表示にしない)',
+      again.status === 200 && again.j.duplicate === true && again.j.outboxId === first.j.outboxId);
+    restoreStubResolver();
+    clearMxCache();
   }
 
   // 送信ジョブ作成に失敗したら問い合わせごと巻き戻る (Codexレビュー 1巡目 High-1)
