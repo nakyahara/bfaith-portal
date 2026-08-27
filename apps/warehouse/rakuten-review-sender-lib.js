@@ -288,7 +288,7 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
       }
       const okF = finalizeAttemptT(T, db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, note: (e && e.code) || 'contact_undecryptable', nowIso });
       if (okF) { out.failedSafe++; out.details.push({ id: action.id, result: 'failed_safe', reason: (e && e.code) || 'contact_undecryptable' }); }
-      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict', reason: (e && e.code) || 'contact_undecryptable' }); }
+      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict', reason: (e && e.code) || 'contact_undecryptable' }); break; }
       continue;
     }
     const mail = A.buildMail(claim.fresh, nowIso);
@@ -297,13 +297,13 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
       // note には固定分類のみ (SMTPエラー原文は宛先が混入し得るため保存しない — Codex C4-R1 Medium)
       const ok = finalizeAttemptT(T, db, { actionId: action.id, outcome: 'accepted', claimToken: claim.claimToken, smtpCode: null, nowIso });
       if (ok) { out.sent++; out.details.push({ id: action.id, result: 'sent', type: action.action_type }); }
-      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); }
+      else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); break; } // 別プロセスの介入痕跡 → 即中断 (Codex Y0-R4 High)
     } catch (e) {
       const cls = classifySendError(e);
       if (cls.kind === 'rejected') {
         const ok = finalizeAttemptT(T, db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, smtpCode: cls.code, note: 'smtp_rejected', nowIso });
         if (ok) { out.failedSafe++; out.details.push({ id: action.id, result: 'failed_safe', code: cls.code }); }
-        else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); }
+        else { out.finalizeConflict++; out.details.push({ id: action.id, result: 'finalize_conflict' }); break; } // 別プロセスの介入痕跡 → 即中断 (Codex Y0-R4 High)
       } else {
         const ok = markAmbiguousT(T, db, { actionId: action.id, claimToken: claim.claimToken, note: 'smtp_unknown', nowIso });
         if (!ok) out.finalizeConflict++;
