@@ -64,6 +64,8 @@ import siteContactRouter from './apps/site-contact/router.js';
 import supplierSalesRouter from './apps/supplier-sales/router.js';
 import productHubRouter, { serviceApiRouter as productHubServiceApiRouter } from './apps/product-hub/router.js';
 import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
+import productLinksRouter from './apps/product-links/router.js';
+import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
@@ -458,6 +460,15 @@ const apps = [
     description: '新商品ドラフト一元管理 (Notionカード自動作成 + AI生成 + 楽天出品へ)',
     icon: '📦',
     path: '/apps/product-hub',
+    status: 'active',
+    category: 'product-sync',
+  },
+  {
+    id: 'product-links',
+    name: '商品リンク台帳',
+    description: '全商品の Canva・画像フォルダ (Drive) リンクを商品名・コードで検索 (単品もセットも)',
+    icon: '🔗',
+    path: '/apps/product-links',
     status: 'active',
     category: 'product-sync',
   },
@@ -1306,6 +1317,8 @@ app.use('/apps/site-contact/api', express.json({ limit: '64kb' }), siteContactRo
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
+// 商品リンク台帳: warehouse-mirror.db 同居 (product-hub の保存と同一トランザクションで写す)。編集は product-hub 権限
+app.use('/apps/product-links', requireAppAccess('product-links'), productLinksRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
@@ -1534,6 +1547,8 @@ app.listen(PORT, () => {
   // 既定で有効 (JST 09:00 = ミラー同期完了後)。止める場合のみ INBOUND_INFO_SYNC_ENABLED=false
   startInboundInfoCron();
   startProductHubIntakeCron();
+  // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
+  startProductLinksCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();

@@ -1,0 +1,203 @@
+<%- include('../../product-hub/views/_header') %>
+<style>
+  .topbar .app-title { display: none; }
+  .pl-title { font-weight: 700; font-size: 15px; }
+  .searchbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .searchbar input[type=text] { flex: 1; min-width: 240px; font-size: 15px; padding: 9px 12px; }
+  .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: #e2e8f0; color: #334155; font-weight: 600; }
+  .chip-set { background: #fef3c7; color: #92400e; }
+  .chip-single { background: #e0f2fe; color: #0369a1; }
+  .chip-off { background: #f1f5f9; color: #94a3b8; }
+  .links { display: flex; flex-direction: column; gap: 4px; }
+  .lnk { display: flex; align-items: center; gap: 6px; font-size: 13px; flex-wrap: wrap; }
+  .lnk a { color: #1d4ed8; text-decoration: none; }
+  .lnk a:hover { text-decoration: underline; }
+  .lnk .star { cursor: pointer; color: #cbd5e1; border: 0; background: none; font-size: 14px; padding: 0 2px; }
+  .lnk .star.on { color: #f59e0b; }
+  .lnk .meta { font-size: 11px; color: #94a3b8; }
+  .lnk.hidden-row { opacity: .45; }
+  .lnk .tools { display: none; gap: 4px; }
+  .lnk:hover .tools { display: inline-flex; }
+  .tools button { border: 1px solid #e2e8f0; background: #fff; border-radius: 5px; font-size: 11px; padding: 1px 6px; cursor: pointer; }
+  .member { margin-left: 14px; padding-left: 8px; border-left: 2px solid #fde68a; font-size: 12px; color: #64748b; }
+  .member .lnk { font-size: 12px; }
+  .row-missing td { color: #94a3b8; }
+  .code-cell { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: nowrap; }
+  .addbox { display: none; margin-top: 6px; padding: 8px; background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 7px; }
+  .addbox.open { display: block; }
+  .addbox .r { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
+  .addbox input, .addbox select { width: auto; }
+  .addbox input.url { flex: 1; min-width: 260px; }
+  .stats { font-size: 12px; color: #64748b; }
+  .icon { width: 16px; text-align: center; display: inline-block; }
+</style>
+<div class="topbar" style="margin-top:-1px">
+  <span class="pl-title">🔗 商品リンク台帳</span>
+  <a href="/apps/product-hub/board">商品登録ハブへ</a>
+  <span class="spacer"></span>
+  <span class="user"><%= displayName %></span>
+</div>
+<div class="wrap">
+  <form class="searchbar" method="get" action="/apps/product-links">
+    <input type="text" name="q" value="<%= q %>" placeholder="商品名・商品コード・JAN で検索 (空白区切りで絞り込み)" autofocus>
+    <select name="kind" onchange="this.form.submit()">
+      <option value="" <%= kind === '' ? 'selected' : '' %>>単品+セット</option>
+      <option value="single" <%= kind === 'single' ? 'selected' : '' %>>単品だけ</option>
+      <option value="set" <%= kind === 'set' ? 'selected' : '' %>>セットだけ</option>
+    </select>
+    <label style="display:inline-flex; align-items:center; gap:4px; margin:0; font-size:13px; color:#334155;">
+      <input type="checkbox" name="missing" value="1" <%= onlyMissing ? 'checked' : '' %> onchange="this.form.submit()" style="width:auto"> リンク未登録だけ
+    </label>
+    <button class="btn btn-primary" type="submit">検索</button>
+  </form>
+
+  <div class="stats" style="margin-bottom:10px; display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
+    <span>登録リンク <strong><%= stats.links %></strong> 本 / リンクのある商品 <strong><%= stats.products_with_links %></strong> / 商品マスタ <%= stats.catalog %> 件 (取扱中 <%= stats.catalog_active %>)</span>
+    <span>該当 <strong><%= result.total %></strong> 件<%= result.total > result.rows.length ? ` (先頭 ${result.rows.length} 件を表示。語を足して絞ってください)` : '' %></span>
+    <% if (isAdmin) { %>
+      <button class="btn btn-sm" id="reconcile-btn" type="button">🔄 商品登録ハブから照合</button><span class="muted" id="reconcile-result"></span>
+    <% } %>
+  </div>
+
+  <div class="card" style="padding:0; overflow:auto;">
+    <table class="list">
+      <thead><tr>
+        <th style="width:150px">商品コード</th>
+        <th>商品名</th>
+        <th style="width:52%">リンク</th>
+      </tr></thead>
+      <tbody>
+      <% if (result.rows.length === 0) { %>
+        <tr><td colspan="3" class="muted" style="padding:24px; text-align:center;">該当する商品がありません</td></tr>
+      <% } %>
+      <% for (const p of result.rows) { const visible = p.links.filter(l => !l.hidden); %>
+        <tr class="<%= visible.length === 0 ? 'row-missing' : '' %>" data-code="<%= p.code %>">
+          <td class="code-cell">
+            <button class="copy-code" data-code="<%= p.display_code %>" type="button" style="padding:3px 7px; font-size:12px;"><%= p.display_code %><span class="copy-hint">📋</span></button>
+            <div style="margin-top:4px; display:flex; gap:4px; flex-wrap:wrap;">
+              <% if (p.is_set) { %><span class="chip chip-set">セット</span><% } else { %><span class="chip chip-single">単品</span><% } %>
+              <% if (p.handling && p.handling !== '取扱中') { %><span class="chip chip-off"><%= p.handling %></span><% } %>
+            </div>
+          </td>
+          <td>
+            <div><%= p.name || '(商品名なし)' %></div>
+            <div class="muted" style="margin-top:3px; display:flex; gap:8px; flex-wrap:wrap;">
+              <% if (p.draft_id) { %><a href="/apps/product-hub/drafts/<%= p.draft_id %>" style="color:#1d4ed8; text-decoration:none;">📦 商品登録ハブのカード</a><% } %>
+              <% if (p.jan) { %><span>JAN <%= p.jan %></span><% } %>
+            </div>
+          </td>
+          <td>
+            <div class="links" data-links-for="<%= p.code %>">
+              <% for (const l of p.links) { %>
+                <%- include('_link', { l, canEdit, linkTypeLabels, purposeLabels, sourceLabels }) %>
+              <% } %>
+              <% if (p.links.length === 0) { %><span class="muted">リンク未登録</span><% } %>
+            </div>
+            <% if (p.members.length > 0) { %>
+              <div class="member" style="margin-top:6px;">
+                <div style="font-weight:600; margin-bottom:2px;">構成商品から参照 (セット固有ではありません)</div>
+                <% for (const m of p.members) { %>
+                  <div style="margin-bottom:3px;">
+                    <span class="code-cell"><%= m.code %></span> ×<%= m.qty %> <%= m.name %>
+                    <% if (m.links.filter(x => !x.hidden).length === 0) { %><span class="muted">— リンクなし</span><% } %>
+                    <% for (const l of m.links.filter(x => !x.hidden)) { %>
+                      <%- include('_link', { l, canEdit: false, linkTypeLabels, purposeLabels, sourceLabels }) %>
+                    <% } %>
+                  </div>
+                <% } %>
+              </div>
+            <% } %>
+            <% if (canEdit) { %>
+              <div style="margin-top:4px;"><button class="btn btn-sm add-toggle" type="button" data-code="<%= p.code %>">＋ リンクを追加</button></div>
+              <div class="addbox" id="add-<%= p.code %>">
+                <div class="r">
+                  <input type="text" class="url" placeholder="Canva / Google Drive のURLを貼る">
+                </div>
+                <div class="r">
+                  <select class="ltype">
+                    <option value="">種類 (URLから自動)</option>
+                    <% for (const t of linkTypes) { %><option value="<%= t %>"><%= linkTypeLabels[t] %></option><% } %>
+                  </select>
+                  <select class="purpose">
+                    <option value="">用途 (あとで可)</option>
+                    <% for (const pu of purposes) { %><option value="<%= pu %>"><%= purposeLabels[pu] %></option><% } %>
+                  </select>
+                  <input type="text" class="label" placeholder="ラベル (例: 赤 / 2枚目)" style="width:160px">
+                  <button class="btn btn-sm btn-primary add-submit" type="button" data-code="<%= p.code %>">保存</button>
+                  <span class="muted add-msg"></span>
+                </div>
+              </div>
+            <% } %>
+          </td>
+        </tr>
+      <% } %>
+      </tbody>
+    </table>
+  </div>
+  <p class="muted">⭐ = 主リンク (同じ用途に複数あるとき「これを使う」印)。商品登録ハブの画像フォルダ・Canva は保存した瞬間にここへ写ります。用途・ラベルはここで付けてください。</p>
+</div>
+<script>
+(function () {
+  var purposeLabels = <%- JSON.stringify(purposeLabels) %>;
+  function api(method, url, body) {
+    return fetch(url, { method: method, headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined })
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    var tog = t.closest && t.closest('.add-toggle');
+    if (tog) { var box = document.getElementById('add-' + tog.getAttribute('data-code')); if (box) box.classList.toggle('open'); return; }
+    var sub = t.closest && t.closest('.add-submit');
+    if (sub) {
+      var code = sub.getAttribute('data-code');
+      var box2 = document.getElementById('add-' + code);
+      var msg = box2.querySelector('.add-msg');
+      var payload = {
+        ne_code: code, url: box2.querySelector('.url').value.trim(),
+        link_type: box2.querySelector('.ltype').value || undefined,
+        purpose: box2.querySelector('.purpose').value || null,
+        label: box2.querySelector('.label').value.trim() || null
+      };
+      msg.textContent = '保存中…';
+      api('POST', '/apps/product-links/api/links', payload).then(function () { location.reload(); })
+        .catch(function (e) { msg.textContent = '⚠️ ' + e.message; });
+      return;
+    }
+    var star = t.closest && t.closest('.star');
+    if (star) {
+      var id = star.getAttribute('data-id'); var on = !star.classList.contains('on');
+      api('PATCH', '/apps/product-links/api/links/' + id, { is_primary: on }).then(function () { location.reload(); })
+        .catch(function (e) { alert(e.message); });
+      return;
+    }
+    var act = t.closest && t.closest('[data-act]');
+    if (act) {
+      var lid = act.getAttribute('data-id'); var a = act.getAttribute('data-act');
+      if (a === 'purpose') {
+        var keys = Object.keys(purposeLabels);
+        var cur = act.getAttribute('data-cur') || '';
+        var pick = prompt('用途を番号で選んでください:\n' + keys.map(function (k, i) { return (i + 1) + '. ' + purposeLabels[k]; }).join('\n') + '\n0. (なし)', cur ? String(keys.indexOf(cur) + 1) : '');
+        if (pick === null) return;
+        var n = parseInt(pick, 10);
+        var val = n > 0 && n <= keys.length ? keys[n - 1] : null;
+        api('PATCH', '/apps/product-links/api/links/' + lid, { purpose: val }).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
+      } else if (a === 'label') {
+        var v = prompt('ラベル (空で消去)', act.getAttribute('data-cur') || '');
+        if (v === null) return;
+        api('PATCH', '/apps/product-links/api/links/' + lid, { label: v }).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
+      } else if (a === 'hide') {
+        api('PATCH', '/apps/product-links/api/links/' + lid, { hidden: act.getAttribute('data-cur') !== '1' }).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
+      } else if (a === 'del') {
+        if (!confirm('このリンクを台帳から削除しますか? (商品登録ハブ側の値は変わりません。次の照合で由来がまだあれば復活します)')) return;
+        api('DELETE', '/apps/product-links/api/links/' + lid).then(function () { location.reload(); }).catch(function (e) { alert(e.message); });
+      }
+    }
+  });
+  var rb = document.getElementById('reconcile-btn');
+  if (rb) rb.addEventListener('click', function () {
+    var out = document.getElementById('reconcile-result'); out.textContent = '照合中…';
+    api('POST', '/apps/product-links/api/reconcile').then(function (j) { out.textContent = '✅ ドラフト ' + j.drafts + ' 件 / 追加・更新 ' + j.upserted + ' / 外れ ' + j.detached; setTimeout(function () { location.reload(); }, 800); })
+      .catch(function (e) { out.textContent = '⚠️ ' + e.message; });
+  });
+})();
+</script>

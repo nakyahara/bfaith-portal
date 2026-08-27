@@ -354,6 +354,22 @@ export const JOBS_REGISTRY = [
     runbook: 'Render Logs で「intake」を検索。mirror_too_small/mirror_empty = daily-sync 未完か同期途中 (miniPC側を確認)。'
       + '手動実行 = product-hub 一覧 (admin) の「NE取込を今すぐ実行」。2026-08-05 点火 (初回はシードのみ・翌日から自動作成)',
   },
+  {
+    id: 'product-links-reconcile',
+    type: 'scheduled_job',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '商品リンク台帳 (/apps/product-links) の夜間照合。product-hub の画像フォルダURL・Canva は保存時に同一トランザクションで台帳へ写る (これが正)。'
+      + 'この cron はフックが落ちた分の自己修復 + ドラフト削除分の由来外し。止まっても即障害ではないが、台帳と product-hub のズレが直らなくなる',
+    where: 'Render bfaith-portal 内 node-cron (apps/product-links/cron.js。既定 ON、PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)',
+    schedule: '毎日 09:45 JST (ph-ne-intake 09:30 の後)。起動時に台帳が空なら初回バックフィルも同じ処理',
+    anchor_hour_jst: 9,
+    anchor_minute_jst: 45,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「product-links」を検索。手動実行 = /apps/product-links (admin) の「商品登録ハブから照合」。'
+      + '正本 = AI_reference『システム設計/商品リンク台帳_要件定義_20260827.md』',
+  },
   // ⭐2026-08-05 追加分 — 2026-08-01 の棚卸しは miniPC Task Scheduler だけが対象で、
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている

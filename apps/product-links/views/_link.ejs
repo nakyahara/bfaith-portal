@@ -1,0 +1,16 @@
+<% const icon = { canva: '🎨', drive_folder: '📁', drive_file: '🖼️', gdoc: '📄', other: '🔗' }[l.link_type] || '🔗'; %>
+<div class="lnk <%= l.hidden ? 'hidden-row' : '' %>">
+  <% if (canEdit) { %><button class="star <%= l.is_primary ? 'on' : '' %>" type="button" data-id="<%= l.id %>" title="主リンクにする">★</button>
+  <% } else if (l.is_primary) { %><span style="color:#f59e0b">★</span><% } %>
+  <span class="icon"><%= icon %></span>
+  <a href="<%= l.url %>" target="_blank" rel="noopener"><%= linkTypeLabels[l.link_type] %><%= l.purpose ? ' / ' + purposeLabels[l.purpose] : '' %><%= l.label ? ' (' + l.label + ')' : '' %></a>
+  <span class="meta"><%= (l.sources || []).map(s => sourceLabels[s] || s).join('・') %><%= l.hidden ? '・非表示' : '' %></span>
+  <% if (canEdit) { %>
+    <span class="tools">
+      <% if (l.link_type !== 'drive_folder') { %><button type="button" data-act="purpose" data-id="<%= l.id %>" data-cur="<%= l.purpose || '' %>">用途</button><% } %>
+      <button type="button" data-act="label" data-id="<%= l.id %>" data-cur="<%= l.label || '' %>">ラベル</button>
+      <button type="button" data-act="hide" data-id="<%= l.id %>" data-cur="<%= l.hidden ? 1 : 0 %>"><%= l.hidden ? '表示' : '非表示' %></button>
+      <button type="button" data-act="del" data-id="<%= l.id %>" style="color:#b91c1c">削除</button>
+    </span>
+  <% } %>
+</div>
