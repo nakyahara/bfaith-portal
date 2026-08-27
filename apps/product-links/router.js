@@ -13,13 +13,14 @@ import {
   LINK_TYPES, LINK_TYPE_LABELS, PURPOSES, PURPOSE_LABELS, SOURCE_LABELS, normalizeCode, loadCatalog,
 } from './db.js';
 import { runReconcile } from './cron.js';
+import adminRouter from './admin-router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
 const view = (name) => path.join(__dirname, 'views', name);
 
-// ─── CSRF 二段ガード (更新系だけ) ───
-router.use('/api/', (req, res, next) => {
+// ─── CSRF 二段ガード (更新系だけ。/api/ と /admin/api/ の両方) ───
+router.use(['/api/', '/admin/api/'], (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   const origin = req.headers.origin;
   if (origin) {
@@ -32,7 +33,9 @@ router.use('/api/', (req, res, next) => {
   }
   next();
 });
-router.use(express.json({ limit: '128kb' }));
+router.use(express.json({ limit: '1mb' })); // CSV 貼り付け取込 (admin) があるので 1MB
+// 取込 (admin 専用): 候補表・Drive 走査・Notion・CSV
+router.use('/admin', adminRouter);
 
 function canEdit(req) {
   const s = req.session || {};

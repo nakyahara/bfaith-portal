@@ -35,6 +35,7 @@
   <span class="pl-title">🔗 商品リンク台帳</span>
   <a href="/apps/product-hub/board">商品登録ハブへ</a>
   <span class="spacer"></span>
+  <% if (isAdmin) { %><a href="/apps/product-links/admin">📥 取込 (過去分)</a><% } %>
   <span class="user"><%= displayName %></span>
 </div>
 <div class="wrap">
