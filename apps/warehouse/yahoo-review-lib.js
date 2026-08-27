@@ -331,6 +331,8 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
     db.prepare(`INSERT INTO raw_yahoo_review_import_log (imported_at, source, file_name, file_sha256, status, message) VALUES (?, ?, ?, ?, 'error', ?)`).run(now, source, name, sha256, msg);
     return { status: 'error', results: [{ file: name, ok: false, error: msg }], newLowRatings: [] };
   }
+  // 初回バックフィル (fact が空で 100 行以上) では過去分の ★1-2 を一斉通知しない (楽天版と同じ扱い)
+  const isBackfill = db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews`).get().n === 0 && prepared.records.length >= 100;
   const tx = db.transaction(() => {
     const log = logStmt.run(now, source, name, sha256, prepared.dateFrom, prepared.dateTo, obsWindow?.from || null, obsWindow?.to || null, countedRows(prepared), 0, 0, '');
     const importId = Number(log.lastInsertRowid);
@@ -351,7 +353,7 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
         insertStmt.run(params);
         revisionStmt.run(rec.review_identity, rec.revision_hash, now, rec.rating, rec.date_jst, 0);
         inserted++;
-        if (rec.rating <= 2) { enqueueLowStmt.run(rec.review_identity, 'first', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); newLow.push({ identity: rec.review_identity, rating: rec.rating }); }
+        if (rec.rating <= 2 && !isBackfill) { enqueueLowStmt.run(rec.review_identity, 'first', rec.item_name, rec.product_code, rec.rating, rec.date_jst, now); newLow.push({ identity: rec.review_identity, rating: rec.rating }); }
       } else if (prev.revision_hash !== rec.revision_hash) {
         updateStmt.run(params);
         revisionStmt.run(rec.review_identity, rec.revision_hash, now, rec.rating, rec.date_jst, 0);
@@ -390,7 +392,7 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
       }
     }
     db.prepare(`UPDATE raw_yahoo_review_import_log SET inserted = ?, updated = ?, message = ? WHERE id = ?`)
-      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} (new ${conflictsNew}, resolved ${resolvedConflicts}, held ${conflictHeld}) missed=${missed} deleted=${deleted}${snapshotNote}`, importId);
+      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} (new ${conflictsNew}, resolved ${resolvedConflicts}, held ${conflictHeld}) missed=${missed} deleted=${deleted}${snapshotNote}${isBackfill ? ' (初回バックフィル: 低評価通知なし)' : ''}`, importId);
     return { inserted, updated, unchanged, missed, deleted, newLow, conflictsNew, resolvedConflicts, conflictHeld };
   });
   const r = tx();

@@ -192,6 +192,19 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   check('台帳: 同一 sha256 で 2 窓が別行として残る', db.prepare(`SELECT COUNT(*) n FROM yahoo_review_snapshots WHERE file_sha256 = ?`).get(shaE).n === 2);
 }
 
+console.log('=== 4b. 初回バックフィルは低評価を一斉通知しない ===');
+{
+  const dbB = new Database(':memory:'); ensureYahooReviewTables(dbB);
+  const big = Array.from({ length: 120 }, (_, i) => row('20260801', i % 10 === 0 ? 1 : 5, `pb${i}`, `ob${i}`, 't', 'x'));
+  const bufB = zipOf(big, 'big.csv');
+  const rBig = importYahooReviewFile(dbB, { name: 'yreview_d2026-06-01_2026-08-27_big.zip', buffer: bufB, sha256: sha(bufB), nowIso: T1 });
+  check('fact が空で 100 行以上 → 取込は全件・通知キューは空', rBig.results[0].inserted === 120 && rBig.newLowRatings.length === 0
+    && dbB.prepare(`SELECT COUNT(*) n FROM yahoo_review_low_notify_queue`).get().n === 0 && /バックフィル/.test(dbB.prepare(`SELECT message FROM raw_yahoo_review_import_log`).get().message));
+  const rNext = importYahooReviewFile(dbB, { name: 'yreview_d2026-06-02_2026-08-28_n.zip', buffer: zipOf([...big, row('20260828', 2, 'pnew', 'onew', 't', 'y')], 'n.csv'), sha256: 'next', nowIso: '2026-08-29T00:00:00.000Z' });
+  check('2 回目以降の新規 ★2 は通知', rNext.newLowRatings.length === 1);
+  dbB.close();
+}
+
 console.log('=== 5. planner (MALL_TABLES.yahoo) が fact_yahoo_reviews を読める ===');
 {
   db.exec(`CREATE TABLE yahoo_order_contacts (order_number TEXT PRIMARY KEY, order_key_hmac TEXT, masked_email_enc TEXT, masked_email_hash TEXT,
