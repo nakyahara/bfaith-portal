@@ -7,7 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getDB, PURPOSES, PURPOSE_LABELS, LINK_TYPE_LABELS, SOURCE_LABELS } from './db.js';
 import {
-  listCandidates, candidateCounts, acceptCandidate, rejectCandidate, acceptAllExact, addCandidates, parseCsvItems, newBatchId,
+  listCandidates, candidateCounts, acceptCandidate, rejectCandidate, acceptExactByIds, addCandidates, parseCsvItems, newBatchId,
 } from './candidates.js';
 import { scanDriveProductFolders, importNotionImageDb, driveFolderId } from './import-sources.js';
 
@@ -25,10 +25,18 @@ function actorOf(req) { return req.session?.email || req.session?.displayName ||
 function apiError(res, e, where) {
   if (e?.code === 'VALIDATION') return res.status(400).json({ ok: false, error: e.message });
   console.error(`[product-links] ${where}:`, e);
-  return res.status(500).json({ ok: false, error: String(e?.message || 'サーバーエラー').slice(0, 300) });
+  return res.status(500).json({ ok: false, error: 'サーバーエラーが発生しました (Render ログを確認してください)' });
+}
+/** Drive / Notion の照会失敗は運用者が対処する情報 (共有設定・env) なので文言を返す。それ以外は丸める */
+function externalError(res, e, where) {
+  console.error(`[product-links] ${where}:`, e);
+  const msg = String(e?.message || '');
+  const known = /アクセスできません|共有|GOOGLE_SERVICE_ACCOUNT_KEY|NOTION_|Notion|実行中です/i.test(msg);
+  return res.status(e?.code === 'VALIDATION' ? 400 : 502).json({ ok: false, error: known ? msg.slice(0, 300) : '外部サービスの照会に失敗しました (Render ログを確認してください)' });
 }
 
-// 同時実行ガード (Drive / Notion の照会が重なると API 上限とバッチ重複の元)
+// 同時実行ガード (Drive / Notion の照会が重なると API 上限とバッチ重複の元)。
+// Render の bfaith-portal は単一インスタンスなのでプロセス内ロックで足りる (複数インスタンス化するときはジョブ表へ)
 let running = null;
 async function runExclusive(name, fn) {
   if (running) { const e = new Error(`${running} を実行中です。終わってからもう一度押してください`); e.code = 'VALIDATION'; throw e; }
@@ -54,14 +62,15 @@ router.post('/api/scan-drive', async (req, res) => {
   try {
     const r = await runExclusive('Drive走査', () => scanDriveProductFolders(getDB(), { actor: actorOf(req) }));
     res.json({ ok: true, ...r });
-  } catch (e) { apiError(res, e, 'scan-drive'); }
+  } catch (e) { externalError(res, e, 'scan-drive'); }
 });
 
 router.post('/api/import-notion', async (req, res) => {
   try {
+    // queryDatabaseAll は maxPages 超過で例外 (サイレント打ち切りにならない)
     const r = await runExclusive('Notion取込', () => importNotionImageDb(getDB(), { actor: actorOf(req) }));
     res.json({ ok: true, ...r });
-  } catch (e) { apiError(res, e, 'import-notion'); }
+  } catch (e) { externalError(res, e, 'import-notion'); }
 });
 
 router.post('/api/import-csv', (req, res) => {
@@ -94,9 +103,12 @@ router.post('/api/candidates/:id/reject', (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/api/accept-all-exact', (req, res) => {
-  const source = ['drive_scan', 'notion_image', 'csv'].includes(req.body?.source) ? req.body.source : null;
-  res.json({ ok: true, ...acceptAllExact(getDB(), { actor: actorOf(req), source }) });
+// 画面に出ている完全一致候補 (id 列挙) をまとめて採用。id 以外の集合は採らない
+router.post('/api/accept-exact', (req, res) => {
+  const ids = req.body?.ids;
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ ok: false, error: '対象の候補がありません' });
+  if (ids.length > 1000) return res.status(400).json({ ok: false, error: '一度に採用できるのは 1,000 件までです' });
+  res.json({ ok: true, ...acceptExactByIds(getDB(), { ids, actor: actorOf(req) }) });
 });
 
 export default router;

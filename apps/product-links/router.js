@@ -33,7 +33,9 @@ router.use(['/api/', '/admin/api/'], (req, res, next) => {
   }
   next();
 });
-router.use(express.json({ limit: '1mb' })); // CSV 貼り付け取込 (admin) があるので 1MB
+// CSV 貼り付け取込 (admin) だけ 1MB。他の API は 128KB のまま (Codex PR2 R1 M: 共通上限を広げない)
+router.use('/admin/api/import-csv', express.json({ limit: '1mb' }));
+router.use(express.json({ limit: '128kb' }));
 // 取込 (admin 専用): 候補表・Drive 走査・Notion・CSV
 router.use('/admin', adminRouter);
 

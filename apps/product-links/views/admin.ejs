@@ -71,7 +71,7 @@
       <tbody>
       <% if (candidates.length === 0) { %><tr><td colspan="4" class="muted" style="padding:20px; text-align:center;">候補はありません</td></tr><% } %>
       <% for (const c of candidates) { %>
-        <tr class="cand" data-id="<%= c.id %>">
+        <tr class="cand" data-id="<%= c.id %>" data-exact="<%= c.resolution === 'pending' && c.confidence === 'exact' ? 1 : 0 %>">
           <td>
             <span class="conf conf-<%= c.confidence %>"><%= { exact: '完全一致', prefix: '前方一致', none: '不明' }[c.confidence] %></span>
             <div class="muted" style="margin-top:3px;"><%= sourceLabels[c.source_system] || c.source_system %></div>
@@ -139,7 +139,8 @@
   if (ae) ae.addEventListener('click', function () {
     if (!confirm('完全一致の候補をすべて台帳に載せます。よろしいですか?')) return;
     var m = document.getElementById('accept-exact-msg'); m.textContent = '処理中…';
-    api('POST', '/apps/product-links/admin/api/accept-all-exact', { source: <%- JSON.stringify(source || null) %> })
+    var ids = Array.prototype.map.call(document.querySelectorAll('tr.cand[data-exact="1"]'), function (tr) { return Number(tr.getAttribute('data-id')); });
+    api('POST', '/apps/product-links/admin/api/accept-exact', { ids: ids })
       .then(function (j) { m.textContent = '✅ 採用 ' + j.accepted + ' / 失敗 ' + j.failed; setTimeout(function () { location.reload(); }, 900); })
       .catch(function (e) { m.textContent = '⚠️ ' + e.message; });
   });

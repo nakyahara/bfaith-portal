@@ -77,8 +77,15 @@ try { cand.acceptCandidate(db, old.id, { neCode: 'bikerepairs', actor: 'tester' 
 check('二重採用は拒否', threw);
 const pre = cand.listCandidates(db).find((c) => c.raw_code === 'uni');
 check('reject', cand.rejectCandidate(db, pre.id, { actor: 'tester' }) && !cand.rejectCandidate(db, pre.id, { actor: 'tester' }));
-const all = cand.acceptAllExact(db, { actor: 'tester' });
-check('完全一致まとめて採用', all.accepted === 1 && all.failed === 0 && pl.linksByCodes(db, ['okuwa07set']).get('okuwa07set')?.length === 1);
+const exactIds = cand.listCandidates(db).filter((c) => c.confidence === 'exact').map((c) => c.id);
+const all = cand.acceptExactByIds(db, { ids: [...exactIds, old.id, 999999], actor: 'tester' });
+check('完全一致まとめて採用 (id 列挙・処理済み/不明 id はスキップ)', all.accepted === 1 && all.failed === 0 && all.skipped === 2 && pl.linksByCodes(db, ['okuwa07set']).get('okuwa07set')?.length === 1, JSON.stringify(all));
+// 却下済み候補と同じリンクが後から本表に入っても、再走査で由来が足されない (Codex PR2 R1 High)
+const rejectedC = cand.listCandidates(db, { resolution: 'rejected' })[0];
+pl.upsertLink(db, { neCode: 'uniq', linkType: 'drive_folder', url: rejectedC.raw_url, source: 'manual', sourceEntityId: 't' });
+r = await src.scanDriveProductFolders(db, { actor: 'tester', list: async () => folders });
+const uniqLink = pl.linksByCodes(db, ['uniq']).get('uniq')[0];
+check('再走査: 却下済みは触らない (drive_scan 由来が付かない)', r.inserted === 0 && r.duplicate === 0 && !uniqLink.sources.includes('drive_scan'));
 const counts = cand.candidateCounts(db);
 check('counts', counts.pending === 0 && counts.accepted === 2 && counts.rejected === 1 && counts.duplicate === 1, JSON.stringify(counts));
 
@@ -115,6 +122,10 @@ threw = false;
 try { cand.parseCsvItems('foo,bar\n1,2'); } catch (e) { threw = e.code === 'VALIDATION'; }
 check('ヘッダ不正は VALIDATION', threw);
 check('不正 URL はスキップ', cand.addCandidates(db, { batchId: 'b', source: 'csv', items: [{ raw_code: 'spearmint30', url: 'javascript:alert(1)' }] }).skipped === 1);
+// external_id が取れない URL も (provider='url', 正規化URL) で二重化しない
+const o1 = cand.addCandidates(db, { batchId: 'b', source: 'csv', items: [{ raw_code: 'uniq', url: 'https://example.com/page/' }] });
+const o2 = cand.addCandidates(db, { batchId: 'b', source: 'csv', items: [{ raw_code: 'uniq', url: 'HTTPS://EXAMPLE.com/page#x' }] });
+check('種別不明 URL の重複判定 (正規化)', o1.inserted === 1 && o2.inserted === 0 && o2.skipped === 1, JSON.stringify([o1, o2]));
 
 console.log('--- EJS');
 const locals = {

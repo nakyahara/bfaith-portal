@@ -11,16 +11,16 @@ import { analyzeUrl, normalizeCode, isSafeHttpUrl, upsertLink, loadCatalog, vali
 
 const NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 
-/** PR2 で足した列 (label = CSV のラベルを採用時に引き継ぐ)。冪等 ALTER */
-let ensured = false;
+/** PR2 で足した列 (label = CSV のラベルを採用時に引き継ぐ)。冪等 ALTER。DB 接続ごとに確認 (Codex PR2 R1 M) */
+const ensuredDbs = new WeakSet();
 function ensureColumns(db) {
-  if (ensured) return;
+  if (ensuredDbs.has(db)) return;
   const cols = new Set(db.prepare('PRAGMA table_info(ph_link_import_candidates)').all().map((c) => c.name));
   if (!cols.has('label')) {
     try { db.exec('ALTER TABLE ph_link_import_candidates ADD COLUMN label TEXT'); }
     catch (e) { if (!/duplicate column/i.test(String(e?.message || ''))) throw e; }
   }
-  ensured = true;
+  ensuredDbs.add(db);
 }
 
 /** バッチ ID (時刻 + 乱数。同一 ms の衝突を避ける — [[feedback-unique-id-generation]]) */
@@ -53,13 +53,10 @@ export function inferCode(catalog, rawCode) {
 export function addCandidates(db, { batchId, source, items, actor = null }) {
   ensureColumns(db);
   const catalog = loadCatalog(db);
+  // 候補の同一性 = (source, provider, external_id)。Drive fileId / Canva DESIGN_ID が取れない URL は
+  // provider='url', external_id=正規化URL にして同じ UNIQUE 制約に乗せる (NULL は UNIQUE で重複を止められない — Codex PR2 R1 M)
   const ins = db.prepare(`
     INSERT OR IGNORE INTO ph_link_import_candidates
-      (import_batch_id, source_system, raw_code, raw_name, raw_url, provider, external_id, link_type, purpose, inferred_ne_code, confidence, label)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const insNoExt = db.prepare(`
-    INSERT INTO ph_link_import_candidates
       (import_batch_id, source_system, raw_code, raw_name, raw_url, provider, external_id, link_type, purpose, inferred_ne_code, confidence, label)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
@@ -69,41 +66,32 @@ export function addCandidates(db, { batchId, source, items, actor = null }) {
       const url = String(it.url || '').trim();
       if (!isSafeHttpUrl(url)) { skipped++; continue; }
       const a = analyzeUrl(url);
+      const provider = a.provider || 'url';
+      const externalId = a.external_id || a.normalized_url;
       const linkType = LINK_TYPES.includes(it.link_type) ? it.link_type : (a.link_type_hint || 'other');
       const purpose = it.purpose && PURPOSES.includes(it.purpose) ? it.purpose : null;
       const { inferred, confidence } = inferCode(catalog, it.raw_code);
       const label = it.label ? String(it.label).trim().slice(0, 100) || null : null;
-      const args = [batchId, source, it.raw_code || null, it.raw_name || null, url, a.provider, a.external_id, linkType, purpose, inferred, confidence, label];
-      // 既に本表に同じリンク (商品 × 正規化URL) がある exact 候補は、由来を足して duplicate で閉じる
+      // 候補行を先に確保。既に候補がある (pending / rejected / accepted どれでも) ものは何もしない
+      // (Codex PR2 R1 High: 却下済みの候補を再走査で本表に由来追加してしまわない)
+      const r = ins.run(batchId, source, it.raw_code || null, it.raw_name || null, url, provider, externalId, linkType, purpose, inferred, confidence, label);
+      if (r.changes === 0) { skipped++; continue; }
+      const candId = Number(r.lastInsertRowid);
+      // 今回新規に入った候補だけ: exact で本表に同じリンク (商品 × 正規化URL) があれば由来を足して duplicate で閉じる
       if (confidence === 'exact') {
         const existing = db.prepare('SELECT id FROM ph_product_links WHERE ne_code = ? AND normalized_url = ? AND deleted_at IS NULL').get(inferred, a.normalized_url);
         if (existing) {
           upsertLink(db, { neCode: inferred, linkType, purpose, url, label, source, sourceEntityId: it.source_entity_id || batchId, createdBy: actor });
-          const r = insNoExtOrIgnore(db, ins, insNoExt, a, args);
-          if (r) {
-            db.prepare(`UPDATE ph_link_import_candidates SET resolution = 'duplicate', accepted_link_id = ?, resolved_ne_code = ?, resolved_by = ?, resolved_at = ${NOW} WHERE id = ?`)
-              .run(existing.id, inferred, actor ? `auto:${actor}` : 'auto', r);
-            duplicate++;
-          } else skipped++;
+          db.prepare(`UPDATE ph_link_import_candidates SET resolution = 'duplicate', accepted_link_id = ?, resolved_ne_code = ?, resolved_by = ?, resolved_at = ${NOW} WHERE id = ?`)
+            .run(existing.id, inferred, actor ? `auto:${actor}` : 'auto', candId);
+          duplicate++;
           continue;
         }
       }
-      const r = insNoExtOrIgnore(db, ins, insNoExt, a, args);
-      if (r) inserted++; else skipped++;
+      inserted++;
     }
   })();
   return { inserted, skipped, duplicate };
-}
-
-function insNoExtOrIgnore(db, ins, insNoExt, a, args) {
-  if (a.external_id) {
-    const r = ins.run(...args);
-    return r.changes > 0 ? Number(r.lastInsertRowid) : null;
-  }
-  // external_id 無し (URL 種別不明) は URL 文字列で重複判定
-  const dup = db.prepare('SELECT id FROM ph_link_import_candidates WHERE source_system = ? AND raw_url = ?').get(args[1], args[4]);
-  if (dup) return null;
-  return Number(insNoExt.run(...args).lastInsertRowid);
 }
 
 export function listCandidates(db, { resolution = 'pending', source = null, limit = 500 } = {}) {
@@ -132,21 +120,24 @@ export function candidateCounts(db) {
 /** 候補を採用 → 本表へ upsert (由来 = 候補の source_system)。ne_code は人が上書きできる */
 export function acceptCandidate(db, id, { neCode, purpose, label, actor }) {
   ensureColumns(db);
-  const c = db.prepare('SELECT * FROM ph_link_import_candidates WHERE id = ?').get(id);
-  if (!c) return null;
-  if (c.resolution !== 'pending') throw validationError('この候補は処理済みです');
-  const code = normalizeCode(neCode || c.inferred_ne_code);
-  if (!code) throw validationError('商品コードを指定してください');
-  const product = loadCatalog(db).find((r) => r.code === code);
-  if (!product) throw validationError(`商品コード ${code} は商品マスタにありません`);
-  const pu = purpose !== undefined ? (purpose || null) : c.purpose;
   return db.transaction(() => {
+    const c = db.prepare('SELECT * FROM ph_link_import_candidates WHERE id = ?').get(id);
+    if (!c) return null;
+    if (c.resolution !== 'pending') throw validationError('この候補は処理済みです');
+    const code = normalizeCode(neCode || c.inferred_ne_code);
+    if (!code) throw validationError('商品コードを指定してください');
+    const product = loadCatalog(db).find((r) => r.code === code);
+    if (!product) throw validationError(`商品コード ${code} は商品マスタにありません`);
+    const pu = purpose !== undefined ? (purpose || null) : c.purpose;
+    // 状態遷移を先に取る (pending のときだけ)。同時採用は片方が changes=0 で止まる (Codex PR2 R1 M)
+    const claimed = db.prepare(`UPDATE ph_link_import_candidates SET resolution = 'accepted', resolved_ne_code = ?, resolved_by = ?, resolved_at = ${NOW} WHERE id = ? AND resolution = 'pending'`)
+      .run(code, actor || null, id);
+    if (claimed.changes !== 1) throw validationError('この候補は処理済みです');
     const r = upsertLink(db, {
       neCode: code, linkType: c.link_type, purpose: pu, url: c.raw_url, label: label || c.label || null, productName: product.name,
       source: c.source_system, sourceEntityId: `${c.import_batch_id}:${c.id}`, createdBy: actor,
     });
-    db.prepare(`UPDATE ph_link_import_candidates SET resolution = 'accepted', accepted_link_id = ?, resolved_ne_code = ?, resolved_by = ?, resolved_at = ${NOW} WHERE id = ?`)
-      .run(r.id, code, actor || null, id);
+    db.prepare('UPDATE ph_link_import_candidates SET accepted_link_id = ? WHERE id = ?').run(r.id, id);
     return { link_id: r.id, created: r.created, ne_code: code };
   })();
 }
@@ -156,16 +147,20 @@ export function rejectCandidate(db, id, { actor }) {
   return r.changes > 0;
 }
 
-/** exact 候補をまとめて採用 (人が一覧を見て「完全一致は全部入れる」を押す用) */
-export function acceptAllExact(db, { actor, source = null }) {
-  const where = ["resolution = 'pending'", "confidence = 'exact'"]; const args = [];
-  if (source) { where.push('source_system = ?'); args.push(source); }
-  const ids = db.prepare(`SELECT id FROM ph_link_import_candidates WHERE ${where.join(' AND ')}`).all(...args).map((r) => r.id);
-  let accepted = 0; let failed = 0;
-  for (const id of ids) {
+/**
+ * exact 候補をまとめて採用。対象は **画面が見せている id 集合** (人が確認した集合と同じものだけ採用する —
+ * Codex PR2 R1 M: 一覧の 500 件制限の外や、古い画面から全件採用してしまわない)。
+ * 渡された id のうち pending かつ exact のものだけ処理する
+ */
+export function acceptExactByIds(db, { ids, actor }) {
+  const list = [...new Set((ids || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))].slice(0, 1000);
+  let accepted = 0; let failed = 0; let skipped = 0;
+  for (const id of list) {
+    const c = db.prepare("SELECT resolution, confidence FROM ph_link_import_candidates WHERE id = ?").get(id);
+    if (!c || c.resolution !== 'pending' || c.confidence !== 'exact') { skipped++; continue; }
     try { acceptCandidate(db, id, { actor }); accepted++; } catch (e) { failed++; console.error(`[product-links] accept ${id} failed:`, e.message); }
   }
-  return { accepted, failed, total: ids.length };
+  return { accepted, failed, skipped, total: list.length };
 }
 
 /**
