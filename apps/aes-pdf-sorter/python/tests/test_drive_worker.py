@@ -3,6 +3,8 @@
 
 実行: apps/aes-pdf-sorter/python で `python -m unittest discover -s tests -v`
 """
+import hashlib
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -15,11 +17,22 @@ from drive_worker import (
     has_stale_dup_ack,
     is_aes_pattern, parse_pattern_name,
     parse_poll_hours, within_hours, natural_key, build_invalid_pdf,
-    OUTPUT_PDF_NAME, ERROR_TXT_NAME, CSV_NAME, FOLDER_MIME,
+    OUTPUT_PDF_NAME, MANIFEST_NAME, ERROR_TXT_NAME, CSV_NAME, FOLDER_MIME,
     CONFLICT_MARKER_PROP, DUP_ACK_PROP,
 )
 
 UTC = timezone.utc
+
+
+def uploads_named(client, name):
+    """指定名のアップロードだけを取り出す (成功時はPDFとmanifestの2件が上がる)"""
+    return [u for u in client.uploads if u[1] == name]
+
+
+def one_upload(client, name):
+    ups = uploads_named(client, name)
+    assert len(ups) == 1, f'{name} のアップロードが {len(ups)} 件'
+    return ups[0]
 
 OLD = '2026-07-01T00:00:00.000Z'      # 十分昔 (整定済み)
 OLDER = '2026-06-01T00:00:00.000Z'
@@ -461,11 +474,26 @@ class WorkerE2ETest(unittest.TestCase):
             {'page': 1, 'data': 'DA200', 'format': 'CODE128', 'box': '青枠'},
         ])
 
-        self.assertEqual(len(client.uploads), 1)
-        folder_id, name, content, mimetype = client.uploads[0]
+        # 成功時は 並び替え済PDF と manifest の2件
+        self.assertEqual(sorted(u[1] for u in client.uploads),
+                         sorted([OUTPUT_PDF_NAME, MANIFEST_NAME]))
+        folder_id, name, content, mimetype = one_upload(client, OUTPUT_PDF_NAME)
         self.assertEqual((folder_id, name, mimetype), ('id-出荷_20', OUTPUT_PDF_NAME, 'application/pdf'))
         # 納品書の注文順 (DA200 → DA100) に並んでいること
         self.assertEqual(page_texts(content), ['LABEL-DA200', 'LABEL-DA100'])
+        # manifest も同じ順で「出力ページ→注文番号」を持つ (再印刷はこれで完全一致検索する)
+        m_folder, _, m_content, m_mime = one_upload(client, MANIFEST_NAME)
+        self.assertEqual((m_folder, m_mime), ('id-出荷_20', 'application/json'))
+        manifest = json.loads(m_content.decode('utf-8'))
+        self.assertEqual([p['page'] for p in manifest['pages']], [1, 2])
+        self.assertEqual([p['order_number'] for p in manifest['pages']],
+                         ['249-2222222-2222222', '249-1111111-1111111'])
+        self.assertEqual([p['shipping_number'] for p in manifest['pages']], ['DA200', 'DA100'])
+        self.assertEqual(manifest['page_count'], 2)
+        self.assertEqual(manifest['output_pdf'], OUTPUT_PDF_NAME)
+        self.assertEqual(manifest['output_pdf_sha256'], hashlib.sha256(content).hexdigest())
+        # テキストだけのページでも非白ピクセルはあるので白紙とは判定されない
+        self.assertTrue(all(p['ink_ratio'] > 0 for p in manifest['pages']))
         self.assertEqual(client.overwrites, [])
 
     def test_non_aes_folder_skipped(self):
@@ -558,9 +586,9 @@ class WorkerE2ETest(unittest.TestCase):
             {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
         ])
 
-        # PDFは新規作成、エラーtxtは削除せず「解消済み」に上書き
-        self.assertEqual(len(client.uploads), 1)
-        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
+        # PDF+manifestは新規作成、エラーtxtは削除せず「解消済み」に上書き
+        self.assertEqual(sorted(u[1] for u in client.uploads),
+                         sorted([OUTPUT_PDF_NAME, MANIFEST_NAME]))
         self.assertEqual(len(client.overwrites), 1)
         file_id, content, mimetype = client.overwrites[0]
         self.assertEqual(file_id, f'id-{ERROR_TXT_NAME}')
@@ -620,9 +648,8 @@ class WorkerE2ETest(unittest.TestCase):
             {'page': 1, 'data': 'DA200', 'format': 'CODE128', 'box': '青枠'},
         ])
 
-        self.assertEqual(len(client.uploads), 1)
-        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
-        self.assertEqual(page_texts(client.uploads[0][2]), ['LABEL-DA100', 'LABEL-DA200'])
+        self.assertEqual(page_texts(one_upload(client, OUTPUT_PDF_NAME)[2]),
+                         ['LABEL-DA100', 'LABEL-DA200'])
 
     def test_multiple_pattern_txts_conflict(self):
         # AESと非AESのtxtが共存 → どちらのフォルダか確定できないためエラー停止
@@ -674,8 +701,160 @@ class WorkerE2ETest(unittest.TestCase):
                         ]]))
         worker.run_cycle()
 
-        self.assertEqual(len(client.uploads), 1)
-        self.assertEqual(client.uploads[0][1], OUTPUT_PDF_NAME)
+        self.assertEqual(sorted(u[1] for u in client.uploads),
+                         sorted([OUTPUT_PDF_NAME, MANIFEST_NAME]))
+
+    def test_failure_invalidates_stale_manifest(self):
+        # 失敗時は旧PDFだけでなく旧manifestも失効させる。古い対応表が残ると
+        # 新しいバッチの伝票を古いページ番号で引いて別人の送り状を印刷しかねない
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-9999999-9999999'])   # CSVに無い注文 → 失敗
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf', '2026-07-02T00:00:00.000Z'),
+            meta(OUTPUT_PDF_NAME, '2026-07-01T12:00:00.000Z'),
+            meta(MANIFEST_NAME, '2026-07-01T12:00:00.000Z', mime='application/json'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        by_id = {file_id: (content, m) for file_id, content, m in client.overwrites}
+        manifest = json.loads(by_id[f'id-{MANIFEST_NAME}'][0].decode('utf-8'))
+        self.assertIs(manifest['invalid'], True)
+        self.assertEqual(manifest['pages'], [])
+        self.assertTrue(manifest['reasons'])
+        self.assertEqual(by_id[f'id-{MANIFEST_NAME}'][1], 'application/json')
+        self.assertEqual(client.app_properties[f'id-{MANIFEST_NAME}'],
+                         {CONFLICT_MARKER_PROP: '1', DUP_ACK_PROP: None})
+
+    def test_duplicate_manifest_blocks_output(self):
+        # manifestの同名重複も出力停止の対象 (どれを更新すべきか確定できない)
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+            dict(meta(MANIFEST_NAME, mime='application/json'), id='id-manifest-1'),
+            dict(meta(MANIFEST_NAME, mime='application/json'), id='id-manifest-2'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual([u[1] for u in client.uploads], [ERROR_TXT_NAME])
+        text = client.uploads[0][2].decode('utf-8')
+        self.assertIn('同名の出力ファイルが複数あります', text)
+        self.assertIn(MANIFEST_NAME, text)
+
+    def test_manifest_records_blank_page(self):
+        # 送り状ページが白紙なら ink_ratio が 0 になる (自動印刷側はこれで白紙を弾く)
+        blank_doc = fitz.open()
+        blank_doc.new_page()
+        label_pdf = blank_doc.tobytes()
+        blank_doc.close()
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        manifest = json.loads(one_upload(client, MANIFEST_NAME)[2].decode('utf-8'))
+        self.assertEqual(manifest['pages'][0]['ink_ratio'], 0.0)
+        self.assertEqual(manifest['pages'][0]['source_file'], 'AES_labels.pdf')
+        self.assertEqual(manifest['pages'][0]['source_page'], 1)
+
+    def test_pre_existing_success_folder_not_reprocessed_for_manifest(self):
+        # 導入前に成功済みのフォルダ (manifest無し) は再処理しない。今日の素材で
+        # 突合し直すと過去バッチの注文が全件不一致になり、正常な出力PDFを
+        # 「使用禁止」で潰してしまうため (Codexレビュー指摘1への意図的な回答)。
+        # 過去フォルダは自動印刷の対象外 = 読み手が manifest 無しで印刷しない
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        label_pdf = make_pdf(['LABEL-DA100'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', OLDER, mime='text/plain'),
+            meta('納品書_20.pdf', OLDER),
+            meta(OUTPUT_PDF_NAME, OLD),      # 導入前の成功PDF (manifestは無い)
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = self._run(children, all_contents, [
+            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+        ])
+
+        self.assertEqual(client.uploads, [])
+        self.assertEqual(client.overwrites, [])
+
+    def test_manifest_write_failure_keeps_good_pdf(self):
+        # manifestの書き込みだけ失敗 → 並び替え済PDFは正常なまま残し、エラーtxtも出さない。
+        # PDFは現場が毎朝そのまま印刷する業務の要で、manifestは自動印刷を許可する券にすぎない。
+        # 券が発行できなかっただけで現場の送り状を「使用禁止」にしてはいけない
+        class BrokenManifestClient(FakeDriveClient):
+            def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
+                if name == MANIFEST_NAME:
+                    raise RuntimeError('manifest upload failed')
+                return super().upload_new(folder_id, name, content, mimetype, app_properties)
+
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = BrokenManifestClient(children, all_contents)
+        worker = Worker(FakeConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        # 並び替え済PDFは正常に出ている
+        self.assertEqual(page_texts(one_upload(client, OUTPUT_PDF_NAME)[2]), ['LABEL-DA100'])
+        # エラーtxtは出さない (現場の運用は今までどおり成立している)
+        self.assertEqual(uploads_named(client, ERROR_TXT_NAME), [])
+        # PDFを「使用禁止」で潰していない
+        self.assertEqual(client.overwrites, [])
 
     def test_non_ship_folder_ignored(self):
         # ルート直下でも 出荷_XX 以外の名前のフォルダは走査しない
@@ -1038,7 +1217,8 @@ class WorkerE2ETest(unittest.TestCase):
             {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
         ])
 
-        self.assertEqual(client.uploads, [])
+        # 既存の重複2種はoverwrite。manifestはこのフォルダに無いので新規作成される
+        self.assertEqual([u[1] for u in client.uploads], [MANIFEST_NAME])
         by_id = {file_id: (content, m) for file_id, content, m in client.overwrites}
         # 無効PDFは正常な並び替え済みPDFで上書きされ、マーカーは両方消える
         self.assertEqual(page_texts(by_id[out['id']][0]), ['LABEL-DA100'])
@@ -1106,7 +1286,8 @@ class WorkerE2ETest(unittest.TestCase):
                 {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
             ])
 
-        self.assertEqual(len(client.uploads), 1)
+        # PDFを作れなかったので manifest も出さない (片方だけ残さない)
+        self.assertEqual([u[1] for u in client.uploads], [ERROR_TXT_NAME])
         _, name, content, _ = client.uploads[0]
         self.assertEqual(name, ERROR_TXT_NAME)
         text = content.decode('utf-8')

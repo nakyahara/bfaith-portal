@@ -13,8 +13,11 @@ logi_dispatch.csv と素材フォルダの AES*.pdf (送り状) を使って
 設計書: G:\\共有ドライブ\\AI_reference\\システム設計\\AES送り状並び替え_Drive自動化_設計_20260722.md
 
 安全設計:
-- Driveへの書き込みは AES送り状_並び替え済.pdf / AES送り状_エラー.txt の
-  新規作成・自ファイル上書きのみ。削除・移動・リネームは一切行わない。
+- Driveへの書き込みは AES送り状_並び替え済.pdf / AES送り状_並び替え済_manifest.json /
+  AES送り状_エラー.txt の新規作成・自ファイル上書きのみ。削除・移動・リネームは一切行わない。
+- manifest.json は「出力ページ→注文番号」の対応表。再印刷の自動印刷がこれを正本として
+  完全一致でページを引くため、PDFと**必ず同時に**更新し、失敗時は**同時に失効**させる
+  (古い対応表が残ると別人の送り状を印刷しかねない)。
 - 失敗時に前回の成功PDFが残っていると誤って印刷・使用される恐れがあるため、
   削除の代わりに「使用禁止」表示のPDFで上書きして失効させる (Codexレビュー指摘1)。
 - 突合の競合 (同一配送番号が複数ページ / 複数注文が同一ページ) は黙って進めず
@@ -40,7 +43,10 @@ import sorter_core
 
 JST = timezone(timedelta(hours=9))
 
-OUTPUT_PDF_NAME = 'AES送り状_並び替え済.pdf'
+OUTPUT_PDF_NAME = sorter_core.OUTPUT_PDF_NAME
+# 出力ページ→注文番号の対応表 (再印刷の自動印刷が完全一致でページを引くための正本)。
+# 並び替え済PDFと**必ず同時に**更新・失効させる。古い対応表が残ると別人の送り状を印刷し得る
+MANIFEST_NAME = sorter_core.MANIFEST_NAME
 ERROR_TXT_NAME = 'AES送り状_エラー.txt'
 CSV_NAME = 'logi_dispatch.csv'
 
@@ -109,12 +115,13 @@ def is_aes_pattern(txt_filename, txt_text):
     return txt_filename.startswith('引当パターン_AES')
 
 
-def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_files):
+def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_files,
+                  manifest_files=()):
     """処理要否判定 (設計書§6)。
 
     local_inputs:  対象フォルダ内の入力メタ一覧 (納品書・引当パターンtxt)
     shared_inputs: フォルダ横断の素材メタ一覧 (素材AES*.pdf + logi_dispatch.csv)
-    output_files / error_files: 前回試行の出力メタ一覧 (通常0〜1件。同名重複時は全件)
+    output_files / error_files / manifest_files: 前回試行の出力メタ一覧 (通常0〜1件。同名重複時は全件)
     戻り値: 'process' / 'skip_done' (試行済みで入力に変化なし) / 'skip_settling' (整定待ち)
 
     素材はバッチごとに日中何度も入れ替わる (2026-07-23 実運用で確認。設計時の
@@ -123,11 +130,17 @@ def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_file
     成功状態 (失敗マーカー無し) のフォルダはフォルダ内の入力が変わらない限りskipする。
     失敗状態のフォルダは素材の入れ替えでも再試行する (CSV置き直しでの自動復旧)。
 
+    ⭐ manifest が無いだけでは再処理しない (意図的)。導入前に処理済みのフォルダは
+    manifest を持たないが、そこを再処理すると**今日の素材**で突合することになり、
+    過去バッチの注文は全件不一致 → 正常な出力PDFを「使用禁止」で潰してしまう
+    (上の段落と同じ理由)。manifest の無い過去フォルダは再印刷の自動印刷の対象外とし、
+    読み手側が「manifest が無ければ印刷しない」でfail-closedに倒す (Codexレビュー指摘1への回答)。
+
     出力PDF・エラーtxtが複数存在する場合、試行の完了時刻には「最も古いもの」を使う。
     完全な試行は全アーティファクトを更新するため、一部だけ新しい = 前回の書き込みが
     途中で失敗した状態であり、skipせず次サイクルで再試行する (Codexレビュー2巡目 指摘1)。
     """
-    attempts = list(output_files) + list(error_files)
+    attempts = list(output_files) + list(error_files) + list(manifest_files)
     failure_state = any(CONFLICT_MARKER_PROP in (f.get('appProperties') or {}) for f in attempts)
     if not attempts or failure_state:
         trigger_inputs = list(local_inputs) + list(shared_inputs)
@@ -151,7 +164,7 @@ def decide_action(now_utc, local_inputs, shared_inputs, output_files, error_file
     return 'process'
 
 
-def has_unacknowledged_duplicates(output_files, error_files):
+def has_unacknowledged_duplicates(*groups):
     """同名出力ファイルの重複のうち、競合通知が済んでいない (DUP_ACK_PROP無し) ものがあるか。
 
     二重実行で作られた同名ファイルは通常どちらも入力より新しいため、mtime基準の
@@ -162,14 +175,14 @@ def has_unacknowledged_duplicates(output_files, error_files):
     二重実行で同時新規作成されたエラーtxtは最初から両方に付いているため
     (Codexレビュー4巡目 指摘2)。
     """
-    for group in (output_files, error_files):
+    for group in groups:
         if len(group) > 1 and any(
                 DUP_ACK_PROP not in (f.get('appProperties') or {}) for f in group):
             return True
     return False
 
 
-def has_stale_dup_ack(output_files, error_files):
+def has_stale_dup_ack(*groups):
     """重複の手動整理後に、競合通知の出力 (通知済みマーカー付きの1件) が残っている状態か。
 
     競合通知後にユーザーが重複を1件に整理すると、残ったファイルは DUP_ACK_PROP
@@ -179,13 +192,13 @@ def has_stale_dup_ack(output_files, error_files):
     再処理の書き込みは成功時 (_CLEAR_FAILURE)・失敗時 (_MARK_FAILURE) とも
     DUP_ACK_PROP を消すため、復旧処理が毎サイクル繰り返されることはない。
     """
-    for group in (output_files, error_files):
+    for group in groups:
         if len(group) == 1 and DUP_ACK_PROP in (group[0].get('appProperties') or {}):
             return True
     return False
 
 
-def has_incomplete_failure_write(output_files, error_files):
+def has_incomplete_failure_write(*groups):
     """失敗マーカーの付与状態が混在 = 前回の失敗通知/成功更新が途中で失敗している。
 
     完全な失敗通知は全アーティファクトに CONFLICT_MARKER_PROP を付け、完全な
@@ -195,7 +208,7 @@ def has_incomplete_failure_write(output_files, error_files):
     mtimeに関係なく再処理する (Codexレビュー4巡目 指摘1)。
     """
     flags = [CONFLICT_MARKER_PROP in (f.get('appProperties') or {})
-             for f in list(output_files) + list(error_files)]
+             for group in groups for f in group]
     return any(flags) and not all(flags)
 
 
@@ -414,6 +427,7 @@ class SharedInputs:
         self.order_shipping_map = {}
         self.barcode_map = {}
         self.duplicate_barcodes = []  # 同一配送番号が複数ページにあった場合の配送番号一覧
+        self.doc_names = {}           # id(fitz doc) -> 素材ファイル名 (manifestの出所記録用)
         self.load_errors = []         # 人向けのエラー文言 (素材が読めない類)
         self._docs = []
 
@@ -438,7 +452,8 @@ class SharedInputs:
 
             extractor = self._extractor_factory()
             self.barcode_map, label_errors, self._docs = sorter_core.build_shipping_barcode_map(
-                label_files, extractor, duplicates=self.duplicate_barcodes)
+                label_files, extractor, duplicates=self.duplicate_barcodes,
+                doc_names=self.doc_names)
             for err in label_errors:
                 self.load_errors.append(f'{err["file"]}: {err["error"]}')
         except Exception as e:
@@ -517,6 +532,7 @@ class Worker:
             return
 
         output_files = [f for f in non_folder if f['name'] == OUTPUT_PDF_NAME]
+        manifest_files = [f for f in non_folder if f['name'] == MANIFEST_NAME]
         error_files = [f for f in non_folder if f['name'] == ERROR_TXT_NAME]
 
         # 処理要否判定 (素材のメタも入力に含める。CSV不在時はフォルダ側の変化だけで判定し、
@@ -527,11 +543,11 @@ class Worker:
         # 処理へ進ませる
         local_inputs = invoices + pattern_txts
         shared_inputs = labels_meta + ([csv_meta] if csv_meta else [])
-        if not (has_unacknowledged_duplicates(output_files, error_files)
-                or has_incomplete_failure_write(output_files, error_files)
-                or has_stale_dup_ack(output_files, error_files)):
+        if not (has_unacknowledged_duplicates(output_files, error_files, manifest_files)
+                or has_incomplete_failure_write(output_files, error_files, manifest_files)
+                or has_stale_dup_ack(output_files, error_files, manifest_files)):
             action = decide_action(self._now_utc(), local_inputs, shared_inputs,
-                                   output_files, error_files)
+                                   output_files, error_files, manifest_files)
             if action != 'process':
                 return
 
@@ -564,7 +580,8 @@ class Worker:
         # どれを更新すべきか確定できない。以後は片方だけ更新される事故になるため停止する
         # (削除はしない方針なので自動では直せない。Codexレビュー2巡目 指摘3)
         duplicated_outputs = [name for name, group in
-                              ((OUTPUT_PDF_NAME, output_files), (ERROR_TXT_NAME, error_files))
+                              ((OUTPUT_PDF_NAME, output_files), (MANIFEST_NAME, manifest_files),
+                               (ERROR_TXT_NAME, error_files))
                               if len(group) > 1]
         if duplicated_outputs:
             reasons.append(f'同名の出力ファイルが複数あります ({", ".join(duplicated_outputs)})。'
@@ -577,6 +594,7 @@ class Worker:
             reasons.append('素材フォルダに AES*.pdf (送り状) が見つかりません')
 
         matched_pages = []
+        matches = []
         if not reasons:
             shared.ensure_loaded()
             if not shared.order_shipping_map:
@@ -622,8 +640,9 @@ class Worker:
                                    + ' (古い納品書PDFが残っていないか確認してください)')
 
                 if not reasons:
-                    matched_pages, unmatched = sorter_core.match_orders(
+                    matches, unmatched = sorter_core.match_orders_detailed(
                         all_orders, shared.order_shipping_map, shared.barcode_map)
+                    matched_pages = [(m['doc'], m['source_page']) for m in matches]
                     for order_number in unmatched:
                         reasons.append(f'注文番号 {order_number} に対応する送り状が見つかりません')
                     if not matched_pages and not unmatched:
@@ -636,14 +655,22 @@ class Worker:
                                        f'{CSV_NAME} と送り状PDFの組み合わせを確認してください')
 
         if reasons:
-            self._notify_failure(folder, reasons, output_files, error_files)
+            self._notify_failure(folder, reasons, output_files, error_files, manifest_files)
             return
 
-        # ここに来た時点で output_files / error_files は0〜1件 (複数なら上で停止済み)
+        # ここに来た時点で output_files / manifest_files / error_files は0〜1件 (複数なら上で停止済み)
         output_file = output_files[0] if output_files else None
+        manifest_file = manifest_files[0] if manifest_files else None
         try:
-            # PDF組み立ての失敗 (壊れたPDF等) もログだけにせず人に見える形で通知する
+            # PDF組み立ての失敗 (壊れたPDF等) もログだけにせず人に見える形で通知する。
+            # PDFとmanifestは**先に両方メモリ上で作ってから**書き込む (片方だけ作れた状態を作らない)。
+            # 書き込みの途中で落ちても、manifest の output_pdf_sha256 が実物と一致しなければ
+            # 読み手 (再印刷の自動印刷) は使わない = fail-closed
             label_bytes = sorter_core.build_label_pdf(matched_pages)
+            manifest_bytes = sorter_core.build_manifest(
+                matches, shared.doc_names, label_bytes, unmatched_orders=[],
+                generated_at=datetime.now(JST), folder_name=folder['name'],
+                invoice_files=invoices)
             if output_file:
                 # 成功したので失敗ハンドラのマーカーは外す
                 client.overwrite(output_file['id'], label_bytes, 'application/pdf',
@@ -654,8 +681,36 @@ class Worker:
             self._notify_failure(
                 folder,
                 [f'{OUTPUT_PDF_NAME} の生成/アップロードに失敗しました: {e}'],
-                output_files, error_files)
+                output_files, error_files, manifest_files)
             return
+
+        # manifest の書き込み失敗では**並び替え済PDFを失効させない** (重要)。
+        # PDFは現場が毎朝そのまま印刷する業務の要。manifest は「自動印刷を許可する券」に
+        # すぎないので、券が発行できなかっただけで現場の送り状を「使用禁止」にしてはいけない
+        # (この機能を入れる前の挙動をそのまま維持する)。
+        # 券が無い/古いままなら読み手は sha256 不一致で自動印刷しない = fail-closed。
+        try:
+            if manifest_file:
+                client.overwrite(manifest_file['id'], manifest_bytes, 'application/json',
+                                 app_properties=_CLEAR_FAILURE)
+            else:
+                client.upload_new(folder['id'], MANIFEST_NAME, manifest_bytes, 'application/json')
+        except Exception as e:
+            _log(f"フォルダ '{folder['name']}' の {MANIFEST_NAME} 書き込みに失敗 "
+                 f"(並び替え済PDFは正常。自動印刷のみ無効化する): {e}")
+            for stale in manifest_files:
+                try:
+                    client.overwrite(stale['id'],
+                                     sorter_core.build_invalid_manifest(
+                                         datetime.now(JST),
+                                         [f'{MANIFEST_NAME} の更新に失敗しました: {e}'],
+                                         folder_name=folder['name']),
+                                     # ⭐失敗マーカーは付けない。付けるとマーカー混在で次サイクルに
+                                     # 再処理が走り、その時点の (入れ替わった) 素材で突合して
+                                     # 全件不一致 → 正常な送り状PDFを潰す事故になり得るため
+                                     'application/json', app_properties=_CLEAR_FAILURE)
+                except Exception as e2:
+                    _log(f"  旧 {MANIFEST_NAME} の失効も失敗 (sha256不一致で読み手が弾く): {e2}")
 
         # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
         for error_file in error_files:
@@ -667,8 +722,8 @@ class Worker:
 
         _log(f"出力完了: {folder['name']} / {OUTPUT_PDF_NAME} ({len(matched_pages)}ページ)")
 
-    def _notify_failure(self, folder, reasons, output_files, error_files):
-        """エラーtxtを作成/上書きしてから、残っている旧出力PDF全件を「使用禁止」PDFで失効させる。
+    def _notify_failure(self, folder, reasons, output_files, error_files, manifest_files=()):
+        """エラーtxtを作成/上書きしてから、残っている旧出力PDF・manifest全件を失効させる。
 
         順序が重要: 先にPDFを無効化した後でエラーtxtの書き込みに失敗すると、
         「入力より新しいPDFだけがある」状態になり decide_action が完了済みと誤判定して
@@ -685,6 +740,7 @@ class Worker:
         # 同名重複グループへの書き込みは「競合通知済み」マーカーも付ける
         txt_props = _MARK_FAILURE_DUP if len(error_files) > 1 else _MARK_FAILURE
         pdf_props = _MARK_FAILURE_DUP if len(output_files) > 1 else _MARK_FAILURE
+        manifest_props = _MARK_FAILURE_DUP if len(manifest_files) > 1 else _MARK_FAILURE
 
         try:
             content = build_error_txt(now_jst, reasons)
@@ -707,6 +763,17 @@ class Worker:
                                  app_properties=pdf_props)
             except Exception as e:
                 _log(f"フォルダ '{folder['name']}' の旧出力PDFの無効化に失敗: {e}")
+
+        # manifest も必ず同時に失効させる。古い対応表が残ると、新しいバッチの伝票を
+        # 古いページ番号で引いて**別人の送り状を印刷**しかねない (自動印刷の最大リスク)
+        for manifest_file in manifest_files:
+            try:
+                client.overwrite(manifest_file['id'],
+                                 sorter_core.build_invalid_manifest(now_jst, reasons,
+                                                                    folder_name=folder['name']),
+                                 'application/json', app_properties=manifest_props)
+            except Exception as e:
+                _log(f"フォルダ '{folder['name']}' の旧manifestの無効化に失敗: {e}")
 
         _log(f"エラー通知: {folder['name']} ({len(reasons)}件)")
 
