@@ -120,7 +120,7 @@ async function fetchWindow(page, win) {
   await gotoStorePage(page, `${STORE_TOP_URL}/${TOOL_PATH}`, '商品レビューチェックツール');
   const total = await applyFilter(page, win);
   console.log(`  [filter] 画面の総件数 = ${total}`);
-  const { prepareYahooReviewFile, HEADER_COLS } = await import('../../apps/warehouse/yahoo-review-lib.js');
+  const { prepareYahooReviewFile, HEADER_COLS, countedRows } = await import('../../apps/warehouse/yahoo-review-lib.js');
   if (total === 0) {
     // 0 件も「完全スナップショット」として投入する (窓内の全レビュー削除を検知するため — Codex Y-A R1 High)
     const ts0 = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
@@ -146,7 +146,7 @@ async function fetchWindow(page, win) {
 
   const p = prepareYahooReviewFile(basename(dest), buf);
   if (!p.ok) throw new Error(`DL_VERIFY: 取込レシピを通らない ZIP/CSV (${p.error})。画面仕様変更の疑い`);
-  const rows = p.records.length + p.conflicts.length;
+  const rows = countedRows(p); // 衝突は identity 数でなく行数で数える (画面件数と同じ単位)
   if (rows !== total) throw new Error(`DL_VERIFY: 行数 ${rows} が画面の件数 ${total} と一致しない (部分ダウンロード/フィルタ不一致の疑い)。incoming には置かない`);
   if (p.dateFrom && (p.dateFrom < win.from || p.dateTo > win.to)) throw new Error(`DL_VERIFY: 窓 ${label} の外の評価日 (${p.dateFrom}〜${p.dateTo}) が混入`);
   console.log(`  [verify] ${p.label} (${p.dateFrom}〜${p.dateTo}) = 画面件数と一致`);

@@ -88,6 +88,8 @@ export function ensureYahooReviewTables(db) {
     file_sha256 TEXT NOT NULL,
     date_from   TEXT,
     date_to     TEXT,
+    window_from TEXT,
+    window_to   TEXT,
     row_count   INTEGER,
     inserted    INTEGER,
     updated     INTEGER,
@@ -128,6 +130,11 @@ export function normalizeText(s) {
 export function revisionHashFor(rec) {
   const s = JSON.stringify([rec.review_identity, rec.date_jst, rec.rating, normalizeText(rec.title), normalizeText(rec.body), rec.video_count, rec.image_count]);
   return crypto.createHash('sha256').update(s, 'utf8').digest('hex').slice(0, 24);
+}
+
+/** 画面の件数と突合する行数 = 通常レコード + 衝突 identity の実行数 (衝突は identity 数ではなく行数で数える — Codex Y-A R3 High) */
+export function countedRows(prepared) {
+  return prepared.records.length + prepared.conflicts.reduce((n, c) => n + (c.rows_seen || 1), 0);
 }
 
 /** downloader が検証済みの全量スナップショットを登録する (importer の削除検知の信頼境界) */
@@ -255,7 +262,14 @@ export function prepareYahooReviewFile(name, buffer) {
  */
 export function importYahooReviewFile(db, { name, buffer, sha256, source = 'incoming', nowIso = null, fullSnapshot = null }) {
   const now = nowIso || new Date().toISOString();
-  const dup = db.prepare(`SELECT id FROM raw_yahoo_review_import_log WHERE file_sha256 = ? AND status = 'ok'`).get(sha256);
+  // 観測窓 = 台帳 (検証済み) > ファイル名マーカー > なし。冪等判定は (sha256, 窓) で行う
+  // (Codex Y-A R3 High: 0件スナップショットは本文が毎回同一で sha256 が同じになる → 窓が違えば別の観測として取り込む)
+  const verified = getVerifiedSnapshot(db, sha256);
+  const marker = parseWindowMarker(name);
+  const window = verified ? { from: verified.window_from, to: verified.window_to } : (fullSnapshot === true ? marker : null);
+  const obsWindow = window || marker || null;
+  const dup = db.prepare(`SELECT id FROM raw_yahoo_review_import_log WHERE file_sha256 = ? AND status = 'ok' AND COALESCE(window_from, '') = ? AND COALESCE(window_to, '') = ?`)
+    .get(sha256, obsWindow?.from || '', obsWindow?.to || '');
   if (dup) {
     db.prepare(`INSERT INTO raw_yahoo_review_import_log (imported_at, source, file_name, file_sha256, status, message)
                 VALUES (?, ?, ?, ?, 'duplicate', 'same sha256 already imported')`).run(now, source, name, sha256);
@@ -267,12 +281,9 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
                 VALUES (?, ?, ?, ?, 'error', ?)`).run(now, source, name, sha256, prepared.error.slice(0, 500));
     return { status: 'error', results: [{ file: name, ok: false, error: prepared.error }], newLowRatings: [] };
   }
-  const marker = parseWindowMarker(name);
   // 削除検知の材料 = 台帳 (yahoo_review_snapshots) に sha256 が登録され、その窓と一致するファイルだけ。
   // ファイル名のマーカーだけでは検知しない (手動DL・部分CSVで正規レビューを削除扱いにしない)。
   // fullSnapshot=true はテスト用の明示オーバーライド (窓はマーカーから取る)
-  const verified = getVerifiedSnapshot(db, sha256);
-  const window = verified ? { from: verified.window_from, to: verified.window_to } : (fullSnapshot === true ? marker : null);
   const detectDeletion = !!window && (fullSnapshot === false ? false : true);
   const snapshotNote = detectDeletion ? '' : (marker ? ' (削除検知なし: 検証済みスナップショット未登録)' : ' (削除検知なし)');
 
@@ -303,30 +314,35 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
   const revisionStmt = db.prepare(`INSERT OR IGNORE INTO fact_yahoo_review_revisions (review_identity, revision_hash, observed_at, rating, date_jst, is_deleted) VALUES (?, ?, ?, ?, ?, ?)`);
   const enqueueLowStmt = db.prepare(`INSERT OR IGNORE INTO yahoo_review_low_notify_queue (review_identity, kind, item_name, product_code, rating, date_jst, queued_at) VALUES (?, ?, ?, ?, ?, ?, ?)`);
   const logStmt = db.prepare(`
-    INSERT INTO raw_yahoo_review_import_log (imported_at, source, file_name, file_sha256, date_from, date_to, row_count, inserted, updated, status, message)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?)`);
+    INSERT INTO raw_yahoo_review_import_log (imported_at, source, file_name, file_sha256, date_from, date_to, window_from, window_to, row_count, inserted, updated, status, message)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ok', ?)`);
   const missStmt = db.prepare(`UPDATE fact_yahoo_reviews SET miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_identity = ?`);
   const markDeletedStmt = db.prepare(`UPDATE fact_yahoo_reviews SET is_deleted = 1, miss_count = miss_count + 1, last_missed_on = ?, updated_at = ? WHERE review_identity = ?`);
   const activeInWindowStmt = db.prepare(`
     SELECT review_identity, revision_hash, rating, date_jst, miss_count, last_missed_on FROM fact_yahoo_reviews
      WHERE is_deleted = 0 AND date_jst >= ? AND date_jst <= ?`);
 
-  if (verified && verified.screen_count !== prepared.records.length + prepared.conflicts.length) {
-    const msg = `検証済みスナップショットの件数 ${verified.screen_count} と行数 ${prepared.records.length + prepared.conflicts.length} が一致しない`;
+  if (verified && verified.screen_count !== countedRows(prepared)) {
+    const msg = `検証済みスナップショットの件数 ${verified.screen_count} と行数 ${countedRows(prepared)} が一致しない`;
     db.prepare(`INSERT INTO raw_yahoo_review_import_log (imported_at, source, file_name, file_sha256, status, message) VALUES (?, ?, ?, ?, 'error', ?)`).run(now, source, name, sha256, msg);
     return { status: 'error', results: [{ file: name, ok: false, error: msg }], newLowRatings: [] };
   }
   const tx = db.transaction(() => {
-    const log = logStmt.run(now, source, name, sha256, prepared.dateFrom, prepared.dateTo, prepared.records.length, 0, 0, '');
+    const log = logStmt.run(now, source, name, sha256, prepared.dateFrom, prepared.dateTo, obsWindow?.from || null, obsWindow?.to || null, countedRows(prepared), 0, 0, '');
     const importId = Number(log.lastInsertRowid);
-    let inserted = 0, updated = 0, unchanged = 0, missed = 0, deleted = 0, resolvedConflicts = 0;
+    let inserted = 0, updated = 0, unchanged = 0, missed = 0, deleted = 0, resolvedConflicts = 0, conflictHeld = 0;
     const newLow = [];
     const seen = new Set();
     for (const rec of prepared.records) {
       seen.add(rec.review_identity);
       const prev = selectStmt.get(rec.review_identity);
       const params = { ...rec, now, source_file: name, import_id: importId };
-      if (selectConflictStmt.get(rec.review_identity)) { deleteConflictStmt.run(rec.review_identity); resolvedConflicts++; } // 衝突解消 → fact へ戻る
+      // 衝突解消 (1 行に戻った) は検証済み全量スナップショットのときだけ認める (Codex Y-A R3 High: 部分CSVで片方だけ
+      // 来ただけで fact に復帰させない)。未検証ファイルでは衝突 identity を取り込まない (隔離のまま)
+      if (selectConflictStmt.get(rec.review_identity)) {
+        if (!detectDeletion) { conflictHeld++; continue; }
+        deleteConflictStmt.run(rec.review_identity); resolvedConflicts++;
+      }
       if (!prev) {
         insertStmt.run(params);
         revisionStmt.run(rec.review_identity, rec.revision_hash, now, rec.rating, rec.date_jst, 0);
@@ -370,14 +386,14 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
       }
     }
     db.prepare(`UPDATE raw_yahoo_review_import_log SET inserted = ?, updated = ?, message = ? WHERE id = ?`)
-      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} (new ${conflictsNew}, resolved ${resolvedConflicts}) missed=${missed} deleted=${deleted}${snapshotNote}`, importId);
-    return { inserted, updated, unchanged, missed, deleted, newLow, conflictsNew, resolvedConflicts };
+      .run(inserted, updated, `unchanged=${unchanged} conflicts=${prepared.conflicts.length} (new ${conflictsNew}, resolved ${resolvedConflicts}, held ${conflictHeld}) missed=${missed} deleted=${deleted}${snapshotNote}`, importId);
+    return { inserted, updated, unchanged, missed, deleted, newLow, conflictsNew, resolvedConflicts, conflictHeld };
   });
   const r = tx();
   return {
     status: 'ok',
     results: [{ file: name, ok: true, label: prepared.label, inserted: r.inserted, updated: r.updated, unchanged: r.unchanged, missed: r.missed, deleted: r.deleted,
-      conflicts: prepared.conflicts.length, conflictsNew: r.conflictsNew, resolvedConflicts: r.resolvedConflicts, date_from: prepared.dateFrom, date_to: prepared.dateTo, warnings: prepared.warnings }],
+      conflicts: prepared.conflicts.length, conflictsNew: r.conflictsNew, resolvedConflicts: r.resolvedConflicts, conflictHeld: r.conflictHeld, date_from: prepared.dateFrom, date_to: prepared.dateTo, warnings: prepared.warnings }],
     newLowRatings: r.newLow,
   };
 }

@@ -13,7 +13,7 @@ import zlib from 'node:zlib';
 import iconv from 'iconv-lite';
 import {
   ensureYahooReviewTables, prepareYahooReviewFile, importYahooReviewFile, reviewIdentityFor, revisionHashFor, parseWindowMarker, HEADER_COLS,
-  recordVerifiedSnapshot, getVerifiedSnapshot,
+  recordVerifiedSnapshot, getVerifiedSnapshot, countedRows,
 } from './yahoo-review-lib.js';
 import { createCampaignEngine } from './rakuten-review-campaign-lib.js';
 
@@ -112,6 +112,7 @@ console.log('=== 3. identity 衝突は fail-closed ===');
   const rows = [row('20260827', 5, 'p9', 'o9', 'a', 'first review'), row('20260827', 3, 'p9', 'o9', 'b', 'second review')];
   const p = prepareYahooReviewFile('c.zip', zipOf(rows));
   check('prepare: 同一注文×商品で内容が違う行 → records から外し conflicts に', p.ok && p.records.length === 0 && p.conflicts.length === 1);
+  check('countedRows: 衝突は行数で数える (画面件数と同じ単位)', countedRows(p) === 2 && p.conflicts[0].rows_seen === 2);
   const buf = zipOf(rows);
   const r = importYahooReviewFile(db, { name: 'manual.zip', buffer: buf, sha256: sha(buf), nowIso: '2026-08-29T01:00:00.000Z' });
   check('取込: fact には入れず conflicts 表へ隔離、conflict 通知をキューへ', r.status === 'ok' && r.results[0].conflictsNew === 1
@@ -129,10 +130,16 @@ console.log('=== 3. identity 衝突は fail-closed ===');
   const rT2 = importYahooReviewFile(db, { name: 'manual-t2.zip', buffer: zipOf(rowsT, 'q.csv'), sha256: 'conf-again', nowIso: '2026-08-29T03:00:00.000Z' });
   check('衝突が続いても再通知しない', rT2.results[0].conflictsNew === 0);
   // 解消 (1 行に戻る) → fact へ復帰・conflicts から消える
-  const rR = importYahooReviewFile(db, { name: 'manual-r.zip', buffer: zipOf([row('20260827', 5, 'p1', 'o1', 't', 'good!!')], 'r.csv'), sha256: 'resolved', nowIso: '2026-08-29T04:00:00.000Z' });
-  check('衝突解消 → fact へ戻り conflicts から削除', rR.results[0].resolvedConflicts === 1
+  const rHeld = importYahooReviewFile(db, { name: 'manual-r.zip', buffer: zipOf([row('20260827', 5, 'p1', 'o1', 't', 'good!!')], 'r.csv'), sha256: 'resolved-unverified', nowIso: '2026-08-29T04:00:00.000Z' });
+  check('未検証ファイルで 1 行に戻っても復帰しない (held)', rHeld.results[0].conflictHeld === 1 && rHeld.results[0].resolvedConflicts === 0
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews WHERE order_number = 'o1'`).get().n === 0
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = 'o1'`).get().n === 1);
+  const bufR = zipOf([row('20260827', 5, 'p1', 'o1', 't', 'good!!'), row('20260826', 2, 'p2', 'o2', 't', 'bad', 0, 1), row('20260820', 1, 'p3', 'o3', 't', 'terrible')], 'r2.csv');
+  recordVerifiedSnapshot(db, { sha256: sha(bufR), from: '2026-06-01', to: '2026-08-29', screenCount: 3 });
+  const rR = importYahooReviewFile(db, { name: 'yreview_d2026-06-01_2026-08-29_r.zip', buffer: bufR, sha256: sha(bufR), nowIso: '2026-08-29T05:00:00.000Z' });
+  check('検証済み全量で 1 行に戻ったら fact へ復帰・conflicts から削除', rR.results[0].resolvedConflicts === 1
     && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_reviews WHERE order_number = 'o1'`).get().n === 1
-    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = 'o1'`).get().n === 0);
+    && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_conflicts WHERE order_number = 'o1'`).get().n === 0, JSON.stringify(rR.results[0]));
 }
 
 console.log('=== 4. 削除検知 (検証済み全量スナップショットのみ) ===');
@@ -170,6 +177,16 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   // 0 件スナップショット (ヘッダのみ CSV) も検証済みなら削除検知に使える
   const empty = iconv.encode(csvOf([]), 'Shift_JIS');
   check('ヘッダのみ CSV は 0 レコードとして受理', prepareYahooReviewFile('yreview_d2026-09-01_2026-09-03_empty.csv', empty).ok && prepareYahooReviewFile('e.csv', empty).records.length === 0);
+  // 0件スナップショット: 本文同一 (sha256 同一) でも窓が違えば別の観測として取り込み、削除検知が進む
+  const shaE = sha(empty);
+  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-25', to: '2026-09-03', screenCount: 0 });
+  const rE1 = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-09-03_e1.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-04T00:00:00.000Z' });
+  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-26', to: '2026-09-04', screenCount: 0 });
+  const rE2 = importYahooReviewFile(db, { name: 'yreview_d2026-08-26_2026-09-04_e2.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T00:00:00.000Z' });
+  check('0件スナップショット: 窓が違えば duplicate にならず、不在が 2 回進んで削除確定', rE1.status === 'ok' && rE2.status === 'ok'
+    && rE1.results[0].missed >= 1 && rE2.results[0].deleted >= 1, JSON.stringify([rE1.results[0], rE2.results[0]]));
+  const rE3 = importYahooReviewFile(db, { name: 'yreview_d2026-08-26_2026-09-04_e3.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T01:00:00.000Z' });
+  check('同じ窓・同じ sha256 は duplicate', rE3.status === 'duplicate');
   check('再出現で自己修復 (is_deleted=0, miss_count=0)', db.prepare(`SELECT is_deleted, miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().is_deleted === 0 && rBack.status === 'ok');
 }
 
