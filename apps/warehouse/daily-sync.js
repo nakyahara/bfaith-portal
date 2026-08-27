@@ -833,6 +833,15 @@ async function main() {
       console.log('[DailySync] 楽天レビュー sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === Yahoo レビュー ZIP 取込 (P2-Y PR-Y-A、らくらくーぽん Yahoo版置換) ===
+    // 自動DL (yahoo-review-download.mjs、fetch-all) が incoming/yahoo-review/ に置いた 90日全量 ZIP を取り込む。
+    // 低評価・identity衝突はキュー方式で GChat。mirror は PR-Y-D。楽天版と同じ理由で retryLibuvCrash
+    const yahooReviewImportResult = runScript(
+      `apps/warehouse/import-yahoo-review.js --data-dir ${DATA_DIR_ARG}`,
+      'Yahooレビュー 取込', 600000, { retryLibuvCrash: true }
+    );
+    results.push({ name: 'Yahooレビュー 取込', ...yahooReviewImportResult });
+
     // === 楽天レビュー contacts 取得 (mall-csv-fetcher P2 PR-B、らくらくーぽん置換) ===
     // 発送日直近25日の注文の「マスクメールアドレス+最終発送日」を暗号化保存 (フォローメールPR-Cの材料)。
     // miniPC内で完結し mirror へは送らない。終了時に期限超過分の purge も実行

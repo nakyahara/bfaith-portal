@@ -103,7 +103,7 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job',
     importance: 'P1',
     owner: '中原さん',
-    purpose: 'モール統計CSVの自動取得 (楽天RPP/データ/レビュー・Yahoo・auPAY・Qoo10)。分析データの入口',
+    purpose: 'モール統計CSVの自動取得 (楽天RPP/データ/レビュー・Yahoo統計・Yahooレビュー(P2-Y)・auPAY・Qoo10)。分析データの入口',
     where: 'miniPC TaskScheduler [MallCsvFetchAll]',
     schedule: '毎日 05:30 (失敗モールは25分後に1回リトライ)',
     anchor_hour_jst: 5,
