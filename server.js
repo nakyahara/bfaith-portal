@@ -1317,8 +1317,13 @@ app.use('/apps/site-contact/api', express.json({ limit: '64kb' }), siteContactRo
 app.use('/apps/supplier-sales', requireAppAccess('supplier-sales'), express.json({ limit: '256kb' }), supplierSalesRouter);
 app.use('/apps/product-hub/service-api', productHubServiceApiRouter); // トークン認証 (PH_SERVICE_TOKEN, fail-closed)
 app.use('/apps/product-hub', requireAppAccess('product-hub'), productHubRouter);
-// 商品リンク台帳: warehouse-mirror.db 同居 (product-hub の保存と同一トランザクションで写す)。編集は product-hub 権限
-app.use('/apps/product-links', requireAppAccess('product-links'), productLinksRouter);
+// 商品リンク台帳: warehouse-mirror.db 同居 (product-hub の保存と同一トランザクションで写す)。編集は product-hub 権限。
+// product-hub を使える人は権限付与なしでも閲覧できる (付け忘れで編集者が 403 にならないように — Codex PR1 R1 L12)
+app.use('/apps/product-links', (req, res, next) => {
+  const a = req.session?.authenticated ? req.session.allowedApps : null;
+  if (Array.isArray(a) && a.includes('product-hub')) return next();
+  return requireAppAccess('product-links')(req, res, next);
+}, productLinksRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。

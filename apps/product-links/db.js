@@ -59,8 +59,10 @@ export function initProductLinksDB() {
       deleted_at            TEXT,
       deleted_by            TEXT
     );
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_ppl_link ON ph_product_links(ne_code, link_type, normalized_url) WHERE deleted_at IS NULL;
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_ppl_primary ON ph_product_links(ne_code, purpose) WHERE is_primary = 1 AND deleted_at IS NULL;
+    -- 同一判定は (商品 × 正規化URL)。link_type を含めない = 同じ Canva DESIGN_ID / Drive fileId を種類違いで二重登録できない (Codex PR1 R1 M4)
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_ppl_link2 ON ph_product_links(ne_code, normalized_url) WHERE deleted_at IS NULL;
+    -- primary は「用途つき」でだけ意味を持つ (purpose NULL は UNIQUE で重複を止められない — Codex PR1 R1 H3)
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_ppl_primary ON ph_product_links(ne_code, purpose) WHERE is_primary = 1 AND deleted_at IS NULL AND purpose IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_ppl_code ON ph_product_links(ne_code);
     CREATE INDEX IF NOT EXISTS idx_ppl_ext ON ph_product_links(provider, external_id);
 
@@ -107,6 +109,14 @@ export function initProductLinksDB() {
 
 export function getDB() {
   return initProductLinksDB();
+}
+
+/** 利用者に見せてよい入力エラー (それ以外の例外は内部エラーとしてログだけに残す) */
+export function validationError(message) {
+  const e = new Error(message);
+  e.code = 'VALIDATION';
+  e.status = 400;
+  return e;
 }
 
 // ─── 正規化 ───
@@ -169,28 +179,51 @@ export function upsertLink(db, {
   source, sourceEntityId = '', sourceUpdatedAt = null, createdBy = null,
 }) {
   const ne_code = normalizeCode(neCode);
-  if (!ne_code) throw new Error('ne_code が空です');
-  if (!LINK_TYPES.includes(linkType)) throw new Error(`link_type が不正です: ${linkType}`);
-  if (purpose !== null && !PURPOSES.includes(purpose)) throw new Error(`purpose が不正です: ${purpose}`);
+  if (!ne_code) throw validationError('商品コードが空です');
+  if (!LINK_TYPES.includes(linkType)) throw validationError(`リンク種類が不正です: ${linkType}`);
+  if (purpose !== null && !PURPOSES.includes(purpose)) throw validationError(`用途が不正です: ${purpose}`);
   if (!SOURCE_SYSTEMS.includes(source)) throw new Error(`source_system が不正です: ${source}`);
   const a = analyzeUrl(url);
-  if (!a) throw new Error('url が空です');
+  if (!a) throw validationError('URL が空です');
   const effPurpose = linkType === 'drive_folder' ? null : purpose;
+  // 同一判定は (商品 × 正規化URL)。link_type は既存行のものを尊重する
   const existing = db.prepare(`
-    SELECT id FROM ph_product_links WHERE ne_code = ? AND link_type = ? AND normalized_url = ? AND deleted_at IS NULL
-  `).get(ne_code, linkType, a.normalized_url);
+    SELECT id FROM ph_product_links WHERE ne_code = ? AND normalized_url = ? AND deleted_at IS NULL
+  `).get(ne_code, a.normalized_url);
   let id; let created = false;
   if (existing) {
     id = existing.id;
-    // 由来が product_hub なら label/purpose を埋めるだけ (空のときだけ)。人が付けた値は残す
-    db.prepare(`
-      UPDATE ph_product_links SET
-        purpose = COALESCE(purpose, ?), label = COALESCE(label, ?),
-        product_name_snapshot = COALESCE(product_name_snapshot, ?),
-        updated_at = ${NOW}
-      WHERE id = ?
-    `).run(effPurpose, label, productName, id);
+    // 既存行のメタ (用途・ラベル) は人の判断なので自動同期では触らない。人の手入力 (manual) のときだけ空欄を埋める
+    if (source === 'manual') {
+      db.prepare(`
+        UPDATE ph_product_links SET purpose = COALESCE(purpose, ?), label = COALESCE(label, ?), updated_at = ${NOW} WHERE id = ?
+      `).run(effPurpose, label, id);
+    }
+    db.prepare(`UPDATE ph_product_links SET product_name_snapshot = COALESCE(product_name_snapshot, ?) WHERE id = ?`).run(productName, id);
   } else {
+    // 人が削除した行は自動同期で復活させない (Codex PR1 R1 H2)。由来だけ記録して deleted のまま返す。
+    // 人が手入力 (manual) で同じ URL を入れ直したときだけ復活させる
+    const deleted = db.prepare(`
+      SELECT id FROM ph_product_links WHERE ne_code = ? AND normalized_url = ? AND deleted_at IS NOT NULL ORDER BY id DESC LIMIT 1
+    `).get(ne_code, a.normalized_url);
+    if (deleted && source !== 'manual') {
+      db.prepare(`
+        INSERT INTO ph_product_link_sources (link_id, source_system, source_entity_id, source_updated_at, last_synced_at, detached_at)
+        VALUES (?, ?, ?, ?, ${NOW}, NULL)
+        ON CONFLICT(link_id, source_system, source_entity_id) DO UPDATE SET
+          source_updated_at = excluded.source_updated_at, last_synced_at = excluded.last_synced_at, detached_at = NULL
+      `).run(deleted.id, source, String(sourceEntityId ?? ''), sourceUpdatedAt);
+      return { id: deleted.id, created: false, suppressed: true };
+    }
+    if (deleted) {
+      db.prepare(`
+        UPDATE ph_product_links SET deleted_at = NULL, deleted_by = NULL, hidden = 0, is_primary = 0,
+          url = ?, purpose = ?, label = ?, updated_at = ${NOW} WHERE id = ?
+      `).run(String(url).trim(), effPurpose, label, deleted.id);
+      id = deleted.id;
+    }
+  }
+  if (id === undefined) {
     const r = db.prepare(`
       INSERT INTO ph_product_links
         (ne_code, link_type, purpose, url, normalized_url, provider, external_id, label, product_name_snapshot, created_by)
@@ -234,20 +267,18 @@ export function detachStaleSources(db, { source, sourceEntityId, keepLinkIds }) 
   return n;
 }
 
+/** 主リンク切替。用途 (purpose) の無いリンクには付けられない (「何の主か」が定まらない) */
 export function setPrimary(db, id, on) {
   const row = db.prepare('SELECT * FROM ph_product_links WHERE id = ? AND deleted_at IS NULL').get(id);
   if (!row) return false;
-  db.transaction(() => {
-    if (on) {
-      if (row.purpose) {
-        db.prepare(`UPDATE ph_product_links SET is_primary = 0, updated_at = ${NOW} WHERE ne_code = ? AND purpose = ? AND is_primary = 1 AND deleted_at IS NULL`)
-          .run(row.ne_code, row.purpose);
-      }
-      db.prepare(`UPDATE ph_product_links SET is_primary = 1, updated_at = ${NOW} WHERE id = ?`).run(id);
-    } else {
-      db.prepare(`UPDATE ph_product_links SET is_primary = 0, updated_at = ${NOW} WHERE id = ?`).run(id);
-    }
-  })();
+  if (on && !row.purpose) throw validationError('主リンクにするには先に用途を付けてください');
+  if (on) {
+    db.prepare(`UPDATE ph_product_links SET is_primary = 0, updated_at = ${NOW} WHERE ne_code = ? AND purpose = ? AND is_primary = 1 AND deleted_at IS NULL`)
+      .run(row.ne_code, row.purpose);
+    db.prepare(`UPDATE ph_product_links SET is_primary = 1, updated_at = ${NOW} WHERE id = ?`).run(id);
+  } else {
+    db.prepare(`UPDATE ph_product_links SET is_primary = 0, updated_at = ${NOW} WHERE id = ?`).run(id);
+  }
   return true;
 }
 
@@ -257,7 +288,7 @@ export function updateLinkMeta(db, id, { label, purpose, hidden }) {
   const sets = []; const args = [];
   if (label !== undefined) { sets.push('label = ?'); args.push(label || null); }
   if (purpose !== undefined && row.link_type !== 'drive_folder') {
-    if (purpose !== null && !PURPOSES.includes(purpose)) throw new Error('purpose が不正です');
+    if (purpose !== null && !PURPOSES.includes(purpose)) throw validationError('用途の値が不正です');
     // 用途を変えると primary の一意 (ne_code × purpose) と衝突しうる → 変更時は primary を外す
     sets.push('purpose = ?', 'is_primary = 0'); args.push(purpose);
   }
@@ -265,6 +296,19 @@ export function updateLinkMeta(db, id, { label, purpose, hidden }) {
   if (sets.length === 0) return true;
   db.prepare(`UPDATE ph_product_links SET ${sets.join(', ')}, updated_at = ${NOW} WHERE id = ?`).run(...args, id);
   return true;
+}
+
+/** PATCH 1 回分を原子的に (primary だけ変わって 400 が返る、を防ぐ — Codex PR1 R1 M6) */
+export function patchLink(db, id, { is_primary, label, purpose, hidden }) {
+  return db.transaction(() => {
+    if (is_primary !== undefined && !setPrimary(db, id, !!is_primary)) return false;
+    const meta = {};
+    if (label !== undefined) meta.label = label;
+    if (purpose !== undefined) meta.purpose = purpose;
+    if (hidden !== undefined) meta.hidden = hidden;
+    if (Object.keys(meta).length > 0 && !updateLinkMeta(db, id, meta)) return false;
+    return true;
+  })();
 }
 
 export function softDeleteLink(db, id, by) {

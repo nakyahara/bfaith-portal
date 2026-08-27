@@ -98,8 +98,33 @@ updateLinkMeta(db, p2.id, { purpose: 'detail_image' });
 check('用途変更で primary が外れる', db.prepare('SELECT is_primary, purpose FROM ph_product_links WHERE id = ?').get(p2.id).is_primary === 0);
 check('drive_folder は purpose を持たない', db.prepare("SELECT purpose FROM ph_product_links WHERE link_type = 'drive_folder' AND purpose IS NOT NULL").all().length === 0);
 let threw = false;
-try { upsertLink(db, { neCode: 'x', linkType: 'canva', purpose: 'bogus', url: 'https://a.b/c', source: 'manual' }); } catch { threw = true; }
-check('不正 purpose は拒否', threw);
+try { upsertLink(db, { neCode: 'x', linkType: 'canva', purpose: 'bogus', url: 'https://a.b/c', source: 'manual' }); } catch (e) { threw = e.code === 'VALIDATION'; }
+check('不正 purpose は拒否 (VALIDATION)', threw);
+threw = false;
+const np = upsertLink(db, { neCode: 'spearmint30', linkType: 'canva', url: 'https://www.canva.com/design/DAFnopurpose/x/edit', source: 'manual', sourceEntityId: 't' });
+try { setPrimary(db, np.id, true); } catch (e) { threw = e.code === 'VALIDATION'; }
+check('用途なしは primary にできない', threw && db.prepare('SELECT is_primary FROM ph_product_links WHERE id = ?').get(np.id).is_primary === 0);
+// 同じ DESIGN_ID を種類違いで入れても 1 行 (同一判定は 商品×正規化URL)
+const dup = upsertLink(db, { neCode: 'spearmint30', linkType: 'other', url: 'https://www.canva.com/design/DAFnopurpose/zz/view', source: 'manual', sourceEntityId: 't' });
+check('種類違いでも同じ URL は同じ行', !dup.created && dup.id === np.id && db.prepare('SELECT link_type FROM ph_product_links WHERE id = ?').get(np.id).link_type === 'canva');
+// 人が削除した行を自動同期が復活させない
+const ins2 = db.prepare(`INSERT INTO product_drafts (ne_code, name, drive_folder_url) VALUES (?, ?, ?)`).run('nolink01', 'リンク無し商品', folderA);
+const draft2 = Number(ins2.lastInsertRowid);
+syncDraftLinks(db, draft2);
+const autoRow = linksByCodes(db, ['nolink01']).get('nolink01')[0];
+softDeleteLink(db, autoRow.id, 'tester');
+const s2 = syncDraftLinks(db, draft2);
+check('削除済みは自動同期で復活しない (由来だけ記録)', s2.ok && !linksByCodes(db, ['nolink01']) .get('nolink01') && db.prepare("SELECT deleted_at FROM ph_product_links WHERE id = ?").get(autoRow.id).deleted_at != null);
+check('削除済み行に product_hub 由来が再付与されている', db.prepare("SELECT detached_at FROM ph_product_link_sources WHERE link_id = ? AND source_system = 'product_hub'").get(autoRow.id)?.detached_at === null);
+const re = upsertLink(db, { neCode: 'nolink01', linkType: 'drive_folder', url: folderA, source: 'manual', sourceEntityId: 't' });
+check('人が入れ直すと復活 (同じ id)', re.id === autoRow.id && db.prepare('SELECT deleted_at FROM ph_product_links WHERE id = ?').get(re.id).deleted_at === null);
+softDeleteLink(db, autoRow.id, 'tester');
+db.prepare('DELETE FROM product_drafts WHERE id = ?').run(draft2);
+// PATCH は原子的: 不正 purpose なら primary も変わらない
+const { patchLink } = pl;
+threw = false;
+try { patchLink(db, p2.id, { is_primary: true, purpose: 'bogus' }); } catch (e) { threw = e.code === 'VALIDATION'; }
+check('patchLink 原子性 (400 なら primary も戻る)', threw && db.prepare('SELECT is_primary FROM ph_product_links WHERE id = ?').get(p2.id).is_primary === 0);
 
 console.log('--- 検索');
 invalidateCatalogCache();

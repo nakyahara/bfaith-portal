@@ -1,6 +1,6 @@
 <% const icon = { canva: '🎨', drive_folder: '📁', drive_file: '🖼️', gdoc: '📄', other: '🔗' }[l.link_type] || '🔗'; %>
 <div class="lnk <%= l.hidden ? 'hidden-row' : '' %>">
-  <% if (canEdit) { %><button class="star <%= l.is_primary ? 'on' : '' %>" type="button" data-id="<%= l.id %>" title="主リンクにする">★</button>
+  <% if (canEdit && l.purpose) { %><button class="star <%= l.is_primary ? 'on' : '' %>" type="button" data-id="<%= l.id %>" title="主リンクにする (同じ用途の中で「これを使う」印)">★</button>
   <% } else if (l.is_primary) { %><span style="color:#f59e0b">★</span><% } %>
   <span class="icon"><%= icon %></span>
   <a href="<%= l.url %>" target="_blank" rel="noopener"><%= linkTypeLabels[l.link_type] %><%= l.purpose ? ' / ' + purposeLabels[l.purpose] : '' %><%= l.label ? ' (' + l.label + ')' : '' %></a>

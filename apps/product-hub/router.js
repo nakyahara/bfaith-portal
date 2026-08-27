@@ -767,6 +767,8 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
     }
   }
   const clean = (v, len) => (v !== undefined ? cleanText(v, len) : undefined);
+  // 保存・台帳同期・イベントを 1 トランザクションに (途中終了で product-hub だけ更新される状態を作らない — Codex PR1 R1 H1)
+  db.transaction(() => {
   upsertImageProduction(db, draft.id, {
     status: clean(b.status, 100),
     importance_tier: clean(b.importance_tier, 100),
@@ -788,6 +790,7 @@ router.post('/api/drafts/:id/image-production', (req, res) => {
   // 商品リンク台帳へ写す (Canva リンク)。保存済みの値から冪等に同期するので upsert の直後に呼ぶだけでよい
   syncDraftLinks(db, draft.id, { actor: actorOf(req) });
   logEvent(db, draft.id, 'image_production_updated', infoAt ? '商品情報を更新' : null, actorOf(req));
+  })();
   res.json({ ok: true });
 });
 
