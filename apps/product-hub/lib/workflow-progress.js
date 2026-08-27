@@ -238,10 +238,13 @@ function isRealDate(s) {
  *   - 担当者本人        … 状態 (未着手/作業中/完了)・期限・メモ。対象外と他人への付け替えは不可
  *   - 未割り当ての工程  … 誰でも「自分が担当する」形で引き受けられる (放置を防ぐ)
  *   - 他人の担当工程    … 触れない
- * 誰の担当でもないシステム工程 (AI待ち) は、生成が終わったのに進まないときに
- * 人が手で進められるよう、未割り当てと同じ扱いにする。
+ *   - システム工程 (role_code なし = AI待ち・出品展開) … 手で進めるのは admin だけ
+ *     (生成が終わったのに進まない、などの例外操作は管理者に寄せる)
+ *   - boardClaim (かんばん D&D 専用・2026-08-27) … 未割り当ての人手工程に限り
+ *     「自分が担当する + 状態変更」を 1 回の更新で許す (version 1 増・イベント 1 件)。
+ *     admin 以外がボードで列を跨ぐたびに詳細画面で引き受けを押す手間をなくす
  */
-function assertStepPermission(db, row, patch, { isAdmin, actorStaffId }) {
+function assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim = false }) {
   if (isAdmin) return;
 
   // 自分の担当工程
@@ -267,9 +270,12 @@ function assertStepPermission(db, row, patch, { isAdmin, actorStaffId }) {
       throw forbidden('あなたのポータルアカウントに担当者が紐づいていません (担当者・工程の画面で設定してください)');
     }
     const keys = Object.keys(patch || {}).filter((k) => patch[k] !== undefined && k !== 'expected_version');
-    const onlyClaim = keys.length === 1 && keys[0] === 'assignee_id'
-      && Number(patch.assignee_id) === actorStaffId;
-    if (!onlyClaim) throw forbidden('先に「自分が担当する」を押してから操作してください');
+    const claimsSelf = Number(patch?.assignee_id) === actorStaffId;
+    const onlyClaim = keys.length === 1 && keys[0] === 'assignee_id' && claimsSelf;
+    // D&D の自動引き受け: 自分を担当に付けるのと同時に状態だけ変える (skip は本人でも不可なので同じく弾く)
+    const boardClaimOk = boardClaim && claimsSelf && patch?.state !== 'skip'
+      && keys.every((k) => k === 'assignee_id' || k === 'state');
+    if (!onlyClaim && !boardClaimOk) throw forbidden('先に「自分が担当する」を押してから操作してください');
     return;
   }
 
@@ -628,7 +634,7 @@ export function setDetailImagesExcluded(draftId, excluded, actor, { isAdmin = fa
  */
 export function setStepState(
   draftId, stepCode, patch, actor,
-  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false } = {},
+  { isAdmin = false, actorStaffId = null, requireVersion = false, bypassGates = false, systemActor = false, boardClaim = false } = {},
 ) {
   const db = getDB();
   const id = Number(draftId);
@@ -647,7 +653,7 @@ export function setStepState(
   if (row.track === 'image' && patch && Object.keys(patch).some((k) => k !== 'expected_version') && imageHoldOf(db, id).onHold) {
     throw badRequest('画像制作が保留中です。詳細画面の「画像制作」カードで保留を解除してから操作してください');
   }
-  assertStepPermission(db, row, patch, { isAdmin, actorStaffId });
+  assertStepPermission(db, row, patch, { isAdmin, actorStaffId, boardClaim });
   // TOP画像 (サムネイル) は楽天出品に必須なので、admin でも工程単位の「対象外」にはできない。
   // 詳細画像を作らない商品は setDetailImagesExcluded (商品単位のフラグ) を使う
   if (patch?.state === 'skip' && row.track === 'image' && row.image_kind !== 'detail') {
@@ -834,7 +840,8 @@ export function setStepState(
       ${where}
     `).run(params);
     if (info.changes !== 1) return null;
-    if (event) logEvent(db, id, 'step_changed', event, actor);
+    // D&D の自動引き受けは、詳細画面で本人が正式に引き受けた操作と区別できるよう明記する (Codex R1)
+    if (event) logEvent(db, id, 'step_changed', boardClaim ? `${event} (ボードD&D: 自動引き受け)` : event, actor);
     // 本流工程の状態が動いたら status を導出し直す (同一トランザクション = 食い違いを残さない)
     let draftStatus = null;
     if (stateChanged && row.track === 'main') {
@@ -926,12 +933,34 @@ export function moveBoardCard(
       if (tIdx === -1) throw badRequest('移動先の工程が見つかりません');
     }
     if (tIdx === curIdx) return { changed: false };
+    // 未割り当ての人手工程は「動かした本人が引き受けた」ことにして進める (2026-08-27 田中さん改善案:
+    // 列を跨ぐたびに詳細画面で通過工程ぜんぶに「自分が担当する」を押さないと動かせなかった)。
+    // 権限の方針 (本人 + admin のみ・未割り当ては誰でも引き受け可) は変えず、クリックを肩代わりするだけ。
+    // 引き受けと状態変更は 1 回の setStepState (boardClaim) = version 1 増・イベント 1 件 (Codex R1)。
+    // ここで付く担当者は「完了を確定した人」であって実作業者とは限らない — イベントに自動引き受けと明記して区別する。
+    // 他人の担当工程・システム工程 (role_code なし) は従来どおり assertStepPermission が弾く (途中で弾かれたら全体ロールバック)
+    const unassignedHuman = (code) => {
+      if (isAdmin || actorStaffId == null) return false;
+      const r = db.prepare(`
+        SELECT p.assignee_id, s.role_code FROM draft_step_progress p
+        JOIN ph_steps s ON s.code = p.step_code WHERE p.draft_id = ? AND p.step_code = ?
+      `).get(id, code);
+      return !!(r && r.assignee_id == null && r.role_code);
+    };
+    const setWithClaim = (code, state) => {
+      const claim = unassignedHuman(code);
+      setStepState(id, code, claim ? { assignee_id: actorStaffId, state } : { state }, actor,
+        { isAdmin, actorStaffId, boardClaim: claim });
+    };
     if (tIdx > curIdx) {
-      for (let i = curIdx; i < tIdx; i++) {
-        setStepState(id, rows[i].step_code, { state: 'done' }, actor, { isAdmin, actorStaffId });
+      for (let i = curIdx; i < tIdx; i++) setWithClaim(rows[i].step_code, 'done');
+      // 移動先 (= いまやる番) も未割り当てなら移動者に付ける (Codex R1: ドラッグ = 「自分が次工程を持っていく」の意思表示。
+      // 付けないと次の操作でまた「自分が担当する」が要る)。完了列 (tIdx = rows.length) には移動先が無い
+      if (tIdx < rows.length && unassignedHuman(rows[tIdx].step_code)) {
+        setStepState(id, rows[tIdx].step_code, { assignee_id: actorStaffId }, actor, { isAdmin, actorStaffId, boardClaim: true });
       }
     } else {
-      setStepState(id, rows[tIdx].step_code, { state: 'todo' }, actor, { isAdmin, actorStaffId });
+      setWithClaim(rows[tIdx].step_code, 'todo');
     }
     return { changed: true };
   });
