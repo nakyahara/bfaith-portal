@@ -818,6 +818,44 @@ class WorkerE2ETest(unittest.TestCase):
         self.assertEqual(client.uploads, [])
         self.assertEqual(client.overwrites, [])
 
+    def test_manifest_write_failure_keeps_good_pdf(self):
+        # manifestの書き込みだけ失敗 → 並び替え済PDFは正常なまま残し、エラーtxtも出さない。
+        # PDFは現場が毎朝そのまま印刷する業務の要で、manifestは自動印刷を許可する券にすぎない。
+        # 券が発行できなかっただけで現場の送り状を「使用禁止」にしてはいけない
+        class BrokenManifestClient(FakeDriveClient):
+            def upload_new(self, folder_id, name, content, mimetype, app_properties=None):
+                if name == MANIFEST_NAME:
+                    raise RuntimeError('manifest upload failed')
+                return super().upload_new(folder_id, name, content, mimetype, app_properties)
+
+        label_pdf = make_pdf(['LABEL-DA100'])
+        invoice_pdf = make_pdf(['249-1111111-1111111'])
+        folder_files = [
+            meta('引当パターン_AES《単品》.txt', mime='text/plain'),
+            meta('納品書_20.pdf'),
+        ]
+        contents = {
+            'id-引当パターン_AES《単品》.txt': PATTERN_AES.encode('utf-8'),
+            'id-納品書_20.pdf': invoice_pdf,
+            'id-AES_labels.pdf': label_pdf,
+        }
+        children, all_contents = build_world(
+            csv_text=CSV_TEXT, folder_files=folder_files, contents=contents)
+
+        client = BrokenManifestClient(children, all_contents)
+        worker = Worker(FakeConfig(), client,
+                        extractor_factory=lambda: FakeExtractor([[
+                            {'page': 0, 'data': 'DA100', 'format': 'CODE128', 'box': '青枠'},
+                        ]]))
+        worker.run_cycle()
+
+        # 並び替え済PDFは正常に出ている
+        self.assertEqual(page_texts(one_upload(client, OUTPUT_PDF_NAME)[2]), ['LABEL-DA100'])
+        # エラーtxtは出さない (現場の運用は今までどおり成立している)
+        self.assertEqual(uploads_named(client, ERROR_TXT_NAME), [])
+        # PDFを「使用禁止」で潰していない
+        self.assertEqual(client.overwrites, [])
+
     def test_non_ship_folder_ignored(self):
         # ルート直下でも 出荷_XX 以外の名前のフォルダは走査しない
         invoice_pdf = make_pdf(['249-1111111-1111111'])

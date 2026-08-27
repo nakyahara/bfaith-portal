@@ -677,17 +677,40 @@ class Worker:
                                  app_properties=_CLEAR_FAILURE)
             else:
                 client.upload_new(folder['id'], OUTPUT_PDF_NAME, label_bytes, 'application/pdf')
+        except Exception as e:
+            self._notify_failure(
+                folder,
+                [f'{OUTPUT_PDF_NAME} の生成/アップロードに失敗しました: {e}'],
+                output_files, error_files, manifest_files)
+            return
+
+        # manifest の書き込み失敗では**並び替え済PDFを失効させない** (重要)。
+        # PDFは現場が毎朝そのまま印刷する業務の要。manifest は「自動印刷を許可する券」に
+        # すぎないので、券が発行できなかっただけで現場の送り状を「使用禁止」にしてはいけない
+        # (この機能を入れる前の挙動をそのまま維持する)。
+        # 券が無い/古いままなら読み手は sha256 不一致で自動印刷しない = fail-closed。
+        try:
             if manifest_file:
                 client.overwrite(manifest_file['id'], manifest_bytes, 'application/json',
                                  app_properties=_CLEAR_FAILURE)
             else:
                 client.upload_new(folder['id'], MANIFEST_NAME, manifest_bytes, 'application/json')
         except Exception as e:
-            self._notify_failure(
-                folder,
-                [f'{OUTPUT_PDF_NAME} / {MANIFEST_NAME} の生成/アップロードに失敗しました: {e}'],
-                output_files, error_files, manifest_files)
-            return
+            _log(f"フォルダ '{folder['name']}' の {MANIFEST_NAME} 書き込みに失敗 "
+                 f"(並び替え済PDFは正常。自動印刷のみ無効化する): {e}")
+            for stale in manifest_files:
+                try:
+                    client.overwrite(stale['id'],
+                                     sorter_core.build_invalid_manifest(
+                                         datetime.now(JST),
+                                         [f'{MANIFEST_NAME} の更新に失敗しました: {e}'],
+                                         folder_name=folder['name']),
+                                     # ⭐失敗マーカーは付けない。付けるとマーカー混在で次サイクルに
+                                     # 再処理が走り、その時点の (入れ替わった) 素材で突合して
+                                     # 全件不一致 → 正常な送り状PDFを潰す事故になり得るため
+                                     'application/json', app_properties=_CLEAR_FAILURE)
+                except Exception as e2:
+                    _log(f"  旧 {MANIFEST_NAME} の失効も失敗 (sha256不一致で読み手が弾く): {e2}")
 
         # 過去のエラーtxtは削除せず「解消済み」に上書きする (Drive削除禁止ルール)
         for error_file in error_files:
