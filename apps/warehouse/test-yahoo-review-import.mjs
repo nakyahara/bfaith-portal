@@ -177,17 +177,17 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   // 0 件スナップショット (ヘッダのみ CSV) も検証済みなら削除検知に使える
   const empty = iconv.encode(csvOf([]), 'Shift_JIS');
   check('ヘッダのみ CSV は 0 レコードとして受理', prepareYahooReviewFile('yreview_d2026-09-01_2026-09-03_empty.csv', empty).ok && prepareYahooReviewFile('e.csv', empty).records.length === 0);
-  // 0件スナップショット: 本文同一 (sha256 同一) でも窓が違えば別の観測として取り込み、削除検知が進む
+  check('再出現で自己修復 (is_deleted=0, miss_count=0)', db.prepare(`SELECT is_deleted, miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().is_deleted === 0 && rBack.status === 'ok', JSON.stringify(rBack) + JSON.stringify(db.prepare(`SELECT is_deleted, miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get()));
+  // 0件スナップショット (窓は o3=8/20 だけを含む): 本文同一 (sha256 同一) でも窓が違えば別の観測として取り込み、削除検知が進む
   const shaE = sha(empty);
-  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-25', to: '2026-09-03', screenCount: 0 });
-  const rE1 = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-09-03_e1.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-04T00:00:00.000Z' });
-  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-26', to: '2026-09-04', screenCount: 0 });
-  const rE2 = importYahooReviewFile(db, { name: 'yreview_d2026-08-26_2026-09-04_e2.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T00:00:00.000Z' });
+  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-19', to: '2026-08-21', screenCount: 0 });
+  const rE1 = importYahooReviewFile(db, { name: 'yreview_d2026-08-19_2026-08-21_e1.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-04T00:00:00.000Z' });
+  recordVerifiedSnapshot(db, { sha256: shaE, from: '2026-08-20', to: '2026-08-22', screenCount: 0 });
+  const rE2 = importYahooReviewFile(db, { name: 'yreview_d2026-08-20_2026-08-22_e2.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T00:00:00.000Z' });
   check('0件スナップショット: 窓が違えば duplicate にならず、不在が 2 回進んで削除確定', rE1.status === 'ok' && rE2.status === 'ok'
     && rE1.results[0].missed >= 1 && rE2.results[0].deleted >= 1, JSON.stringify([rE1.results[0], rE2.results[0]]));
-  const rE3 = importYahooReviewFile(db, { name: 'yreview_d2026-08-26_2026-09-04_e3.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T01:00:00.000Z' });
+  const rE3 = importYahooReviewFile(db, { name: 'yreview_d2026-08-20_2026-08-22_e3.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T01:00:00.000Z' });
   check('同じ窓・同じ sha256 は duplicate', rE3.status === 'duplicate');
-  check('再出現で自己修復 (is_deleted=0, miss_count=0)', db.prepare(`SELECT is_deleted, miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().is_deleted === 0 && rBack.status === 'ok');
 }
 
 console.log('=== 5. planner (MALL_TABLES.yahoo) が fact_yahoo_reviews を読める ===');
