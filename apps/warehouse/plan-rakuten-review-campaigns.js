@@ -26,6 +26,9 @@
  *            live 後は毎日 12:05 の RakutenReviewMailSend (scripts/mall-csv-fetcher/run-rakuten-review-send.ps1)
  *            が実送信する。cutover を戻す手段は CLI に無い (rakuten_campaign_meta を手で直す)
  *
+ *   --mall yahoo   (PR-Y-C1) Yahoo 版のテーブル (MALL_TABLES.yahoo) で同じ処理を行う。既定は rakuten (挙動不変)。
+ *                  Yahoo の注文母集合は raw_yahoo_orders 上の VIEW yahoo_order_contacts (yahoo-review-campaign-adapter.js)
+ *
  * env: DATA_DIR (必須)
  * exit code: 0=成功 / 1=失敗 / 2=env・引数エラー
  */
@@ -33,11 +36,7 @@ import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
 import Database from 'better-sqlite3';
-import {
-  ensureCampaignTables, planCampaigns, campaignStats,
-  recordVendorDailyBatch, shadowComparisonReport, jstDateOf, REPORT_MAX_DAYS,
-  getCutover, parseCutoverArg, cutoverPreview, applyCutover, applyCouponCutover,
-} from './rakuten-review-campaign-lib.js';
+import { jstDateOf, REPORT_MAX_DAYS, parseCutoverArg, createCampaignEngine } from './rakuten-review-campaign-lib.js';
 import { ensureContactTables } from './rakuten-review-contacts-lib.js';
 import { ensureRakutenReviewTables } from './rakuten-review-lib.js';
 
@@ -45,6 +44,14 @@ const args = process.argv.slice(2);
 function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.length - 1 ? args[i + 1] : null; }
 const DATA_DIR = (process.env.DATA_DIR || getArg('--data-dir') || '').trim();
 const mode = (args[0] && !args[0].startsWith('--')) ? args[0] : 'plan';
+const MALL = (getArg('--mall') || 'rakuten').trim();
+if (!['rakuten', 'yahoo'].includes(MALL)) { console.error(`FATAL: --mall は rakuten / yahoo (got: ${MALL})`); process.exit(2); }
+const E = createCampaignEngine(MALL); // モール束縛エンジン (楽天既定 = 従来と同一の関数)
+const {
+  ensureCampaignTables, planCampaigns, campaignStats, recordVendorDailyBatch, shadowComparisonReport,
+  getCutover, cutoverPreview, applyCutover, applyCouponCutover,
+} = E;
+const LABEL = MALL === 'yahoo' ? 'Yahoo' : '楽天';
 
 if (!DATA_DIR) { console.error('FATAL: DATA_DIR is required'); process.exit(2); }
 const dbPath = path.join(DATA_DIR, 'warehouse.db');
@@ -57,21 +64,34 @@ db.pragma('busy_timeout = 5000');
 // PR-C4 の sender 接続でも必ず有効化すること
 db.pragma('foreign_keys = ON');
 // planner は contacts / reviews を読むため、初回実行順に依らず全テーブルを冪等に確保する
-ensureRakutenReviewTables(db);
-ensureContactTables(db);
+if (MALL === 'yahoo') {
+  const { ensureYahooReviewTables } = await import('./yahoo-review-lib.js');
+  const { ensureYahooCampaignSources } = await import('./yahoo-review-campaign-adapter.js');
+  ensureYahooReviewTables(db);
+  ensureYahooCampaignSources(db); // raw_yahoo_orders 上の VIEW + suppressions
+} else {
+  ensureRakutenReviewTables(db);
+  ensureContactTables(db);
+}
 ensureCampaignTables(db);
 
 try {
   if (mode === 'plan') {
     const c = planCampaigns(db);
     const phase = { live: 'LIVE', coupon_only: 'クーポン先行LIVE/フォローshadow', shadow: 'shadow' }[getCutover(db).stage];
-    console.log(`[campaign] plan完了 (${phase}): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
+    console.log(`[campaign:${MALL}] plan完了 (${phase}): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
       `ready昇格 ${c.promotedReady} / 抑止 ${c.suppressed} / 期限切れ ${c.expired} / 取消 ${c.cancelled} / ` +
       `再スケジュール ${c.rescheduled} / ownership追加 ${c.ownershipInserted}`);
   } else if (mode === 'stats') {
     const s = campaignStats(db);
     const cut = getCutover(db);
-    console.log(`coupon_epoch: ${s.epoch || '(未設定=plan未実行)'}`);
+    console.log(`[${LABEL}] coupon_epoch: ${s.epoch || '(未設定=plan未実行)'}`);
+    if (MALL === 'yahoo') {
+      const { yahooContactStats } = await import('./yahoo-review-campaign-adapter.js');
+      const cs = yahooContactStats(db);
+      console.log(`[Yahoo] 母集合 (raw_yahoo_orders VIEW): 注文 ${cs.orders} / 発送日あり ${cs.shipped ?? 0} / 除外 キャンセル ${cs.cancelled ?? 0}・ソーシャルギフト ${cs.social_gift ?? 0} / ${cs.oldest?.slice(0, 10) ?? '-'}〜${cs.newest?.slice(0, 10) ?? '-'}`);
+      console.log(`[Yahoo] ⚠️取りこぼし候補: 受注7日超で未発送 ${cs.unshipped_over_7d ?? 0} / 出荷完了だが ship_date 無し ${cs.shipped_no_date ?? 0} (再取得窓 7 日の外は ship_date が入らない)`);
+    }
     console.log(`cutover: ${cut.stage === 'live' ? `LIVE (follow=${cut.cutoverAt} / coupon=${cut.couponCutoverAt})`
       : cut.stage === 'coupon_only' ? `段階1=クーポン先行 (coupon=${cut.couponCutoverAt} / フォローは shadow)` : 'shadow (未実施)'}`);
     console.log(`予定超過で待機中 (planned): ${s.dueOverdue}件 / 今後24時間の送信予定 (planned): ${s.dueNext24h}件 / 本日(JST) ready昇格: ${s.readyTodayJst}件`);
@@ -161,7 +181,7 @@ try {
     } else {
       const r = couponOnly ? applyCouponCutover(db, { couponCutoverAt }) : applyCutover(db, { cutoverAt, couponCutoverAt });
       console.log(`[cutover] ✅ 適用: shadow 行削除 ${r.shadowDeleted} / 段階1行の引き継ぎ ${r.stage1Migrated ?? 0} / ownership 再判定 ${r.ownershipInserted} / ready昇格 ${r.promotedReady}`);
-      console.log('[cutover] 次の 12:05 (RakutenReviewMailSend) から自作が送信する。当月の月次クーポンが未発行なら manage-rakuten-review-coupon.js ensure-monthly --live を先に');
+      console.log(`[cutover] 次の正午ジョブ (${MALL === 'yahoo' ? 'YahooReviewMailSend (PR-Y-C5)' : 'RakutenReviewMailSend'}) から自作が送信する。当月の月次クーポンが未発行なら ensure-monthly --live を先に`);
     }
   } else {
     console.error(`FATAL: unknown mode '${mode}' (plan / stats / vendor / report / cutover)`);

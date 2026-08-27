@@ -842,6 +842,15 @@ async function main() {
     );
     results.push({ name: 'Yahooレビュー 取込', ...yahooReviewImportResult });
 
+    // === Yahoo レビュー campaign planner shadow (P2-Y PR-Y-C1) ===
+    // 母集合 = raw_yahoo_orders (上の Yahoo 受注取込で ship_date 入り) の VIEW。送信ゼロ (ownership は vendor)。
+    // レビュー取込が失敗しても plan は安全 (材料が減るだけ) なので実行する
+    const yahooPlanResult = runScript(
+      `apps/warehouse/plan-rakuten-review-campaigns.js plan --mall yahoo --data-dir ${DATA_DIR_ARG}`,
+      'Yahooレビュー campaign plan (shadow)', 600000
+    );
+    results.push({ name: 'Yahooレビュー campaign plan (shadow)', ...yahooPlanResult });
+
     // === 楽天レビュー contacts 取得 (mall-csv-fetcher P2 PR-B、らくらくーぽん置換) ===
     // 発送日直近25日の注文の「マスクメールアドレス+最終発送日」を暗号化保存 (フォローメールPR-Cの材料)。
     // miniPC内で完結し mirror へは送らない。終了時に期限超過分の purge も実行
