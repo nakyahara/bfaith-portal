@@ -12,8 +12,10 @@
  *   pending ──rev競合──▶ needs_review (workerは二度と拾わない。人間が新しいジョブとして再作成)
  *
  * 送信アダプター契約 (設計書§5.2 最小IF):
- *   await adapter.sendReply({ inquiry, shop, bodyText, attachmentsJson }) → { externalReplyId?, warning? }
+ *   await adapter.sendReply({ inquiry, shop, bodyText, attachmentsJson }) → { externalReplyId?, externalThreadId?, warning? }
  *   - warning = 送信は成功したが人が確認すべき事象 (例: Gmailの送信元From置き換え)。sentのままerror_messageに表示
+ *   - externalThreadId = 送信で新しく外部スレッドが生まれたときのID (このアプリ発の新規メール。compose.js)。
+ *     受け取ったら仮の external_inquiry_id と差し替える = 以後の受信が同じチケットに合流する
  *   - 外部APIが「受け付けなかった」と明確に分かる失敗は SendRejectedError を throw (→ failed。再送は安全)
  *   - それ以外の失敗 (タイムアウト・5xx・切断等、送信された可能性が残るもの) は通常の throw (→ unknown)
  *   await adapter.completeInquiry?.({ inquiry }) → { ok } (任意。2026-08-26「送信して回答完了」)
@@ -24,6 +26,8 @@ import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from './db.js';
 import { claimAttachmentsForJob, loadJobAttachments } from './reply-attachments.js';
 import { blockedReplyDestination } from './no-reply.js';
+import { attachExternalThread, markComposeThreadUnresolved } from './compose.js';
+import { isComposeThread } from './compose-id.js';
 
 export const DEFAULT_SEND_LEASE_MINUTES = 5;
 
@@ -255,6 +259,41 @@ export async function runOutboxPass(adapters, opts = {}) {
              is_incoming, sent_by_user_id, outbox_id, sent_at, received_at)
           VALUES (?,?,'shop',?,?,0,?,?,?,?)`)
           .run(job.inquiry_id, extReplyId, job.created_by, job.body_text, job.created_by, job.id, sentIso, sentIso);
+        // 新規メール (compose.js) の仮ID 'compose:…' を実際のスレッドIDに差し替える。
+        // これで次回の同期で同じスレッドとして合流し、顧客の返信も同じチケットに載る。
+        // 同期が先に同じスレッドを取り込んでいた場合 (衝突) は差し替えられないので、
+        // ジョブ履歴に警告を足して人が気付けるようにする (問い合わせ側は⚠️要確認になる)
+        if (isComposeThread(inq.external_inquiry_id)) {
+          let att = { attached: false };
+          let attachError = null;
+          if (!sent?.externalThreadId) {
+            // スレッドIDが取れないと以後の受信が別チケットになる。黙って成功に見せない
+            attachError = '送信先のメールスレッドIDを取得できませんでした';
+            try { markComposeThreadUnresolved(db, job.inquiry_id, { error: attachError }); }
+            catch (e2) { console.error(`[outbox] #${job.id} 要確認フラグも立てられませんでした: ${e2?.message || e2}`); }
+          } else {
+            try {
+              att = attachExternalThread(db, job.inquiry_id, sent.externalThreadId) || att;
+            } catch (e) {
+              // 差し替えに失敗しても送信は完了している。黙って成功に見せず、印と警告を残す
+              attachError = String(e?.message || e).slice(0, 200);
+              try { markComposeThreadUnresolved(db, job.inquiry_id, { error: attachError }); }
+              catch (e2) { console.error(`[outbox] #${job.id} 要確認フラグも立てられませんでした: ${e2?.message || e2}`); }
+            }
+          }
+          const warn = att.conflictInquiryId
+            ? `送信は完了しましたが、同じメールスレッドの問い合わせ #${att.conflictInquiryId} が既にあります`
+              + ' (会話が2つに分かれています。内容を確認してください)'
+            : attachError
+              ? `送信は完了しましたが、メールスレッドの紐付けに失敗しました (${attachError})。`
+                + 'この宛先からの返信は別の問い合わせとして届く可能性があります'
+              : null;
+          if (warn) {
+            db.prepare("UPDATE outbox_replies SET error_message = COALESCE(error_message || ' / ', '') || ? WHERE id = ?")
+              .run(warn, job.id);
+            console.warn(`[outbox] #${job.id} ${warn}`);
+          }
+        }
         // 自送信も conversation_rev++ (以後の送信操作は送信後の会話を基準にする)
         // 送信後のステータス (メールディーラー準拠): 通常は「返信処理中」、
         // 「送信して完了にする」を選んでいれば「完了」まで進める

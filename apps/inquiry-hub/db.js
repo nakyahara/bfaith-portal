@@ -306,6 +306,25 @@ function createTables() {
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
 
+  // 署名 (2026-08-27 中原さん要望。メールディーラーの新規メール作成1段目「署名」相当)。
+  // 本文の末尾に付ける定型の差出人表記。新規メール作成で選ぶと本文に展開される
+  // (展開後は普通のテキストなので、送る前に画面で編集できる = メールディーラーと同じ挙動)。
+  // 削除は論理削除のみ (is_active=0)。既定署名は1件だけ (signatures.js が保証)
+  db.exec(`CREATE TABLE IF NOT EXISTS inquiry_signatures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    name_key TEXT,                  -- 重複判定用の正規化キー (NFKC + 小文字。signatures.js が入れる)
+    body TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_signatures_namekey_active
+    ON inquiry_signatures(name_key) WHERE is_active = 1 AND name_key IS NOT NULL`);
+
   // 返信テンプレート (メールディーラーのテンプレートエクスポートCSVを取込)
   db.exec(`CREATE TABLE IF NOT EXISTS reply_templates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

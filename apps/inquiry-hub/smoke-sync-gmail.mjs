@@ -301,7 +301,9 @@ console.log('5. 送信');
   check('live送信: externalReplyId=Gmail messageId', sent.externalReplyId === 'sent-001');
   check('send payload に threadId (スレッド維持)', sendBody?.threadId === 'g1');
   const mime = Buffer.from(sendBody.raw.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-  check('To=顧客 (小文字化)', mime.includes('To: customer@gmail.com'));
+  // 2026-08-27: 宛先はドメインだけ小文字化する (ローカル部は RFC 上大小を区別し得るので原文のまま)。
+  // 受信同期が入れる customer_identifier は元から小文字なので、実運用の返信の見え方は変わらない
+  check('To=顧客 (ドメインだけ小文字化・ローカル部は原文のまま)', mime.includes('To: Customer@gmail.com'));
   check('Subject=Re:付き (RFC2047)', /Subject: =\?UTF-8\?B\?/.test(mime));
   check('In-Reply-To/References=元Message-ID', mime.includes('In-Reply-To: <orig-123@mail.gmail.com>') && mime.includes('References: <orig-123@mail.gmail.com>'));
   check('From=info@b-faith.biz', mime.includes('<info@b-faith.biz>'));
