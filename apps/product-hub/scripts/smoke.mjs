@@ -3449,6 +3449,21 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
   const rt2 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'X') });
   check('再試行: 回収済みなら対象なし', rt2.retried === 0, JSON.stringify(rt2));
 
+  // limit 到達時は「古い失敗」から優先 (先頭 id 固定の飢餓にならない)
+  const oldFailAt = (id, hoursAgo) => db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at)
+    VALUES (?, 'drive_folder_failed', 'old-fail', 'smoke', strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' hours'))`).run(id, hoursAgo);
+  const difIdOldA = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-A', '5時間前', 'smoke')`).run().lastInsertRowid);
+  const difIdOldB = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-B', '4時間前', 'smoke')`).run().lastInsertRowid);
+  const difIdOldC = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-C', '3時間前', 'smoke')`).run().lastInsertRowid);
+  oldFailAt(difIdOldC, 3); oldFailAt(difIdOldA, 5); oldFailAt(difIdOldB, 4);
+  const rt3 = await dif.retryFailedImageFolders({ limit: 2, driveClient: fakeDrive([], 'OLDEST-ID') });
+  check('再試行: limit 超過時は古い失敗から優先 (新しい方は次回へ)',
+    rt3.retried === 2 && rt3.created === 2
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldA).drive_folder_url.endsWith('OLDEST-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldB).drive_folder_url.endsWith('OLDEST-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldC).drive_folder_url == null,
+    JSON.stringify(rt3));
+
   // 不正な PH_IMAGE_FOLDER_PARENT_ID は既定値へフォールバック (Drive クエリを壊さない)
   process.env.PH_IMAGE_FOLDER_PARENT_ID = "bad'id --";
   const pid = dif.imageFolderParentId();
