@@ -1,0 +1,165 @@
+<%- include('../../product-hub/views/_header') %>
+<style>
+  .topbar .app-title { display: none; }
+  .pl-title { font-weight: 700; font-size: 15px; }
+  .src-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .src-row .btn { white-space: nowrap; }
+  .msg { font-size: 12px; color: #64748b; }
+  .conf { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; }
+  .conf-exact { background: #dcfce7; color: #166534; }
+  .conf-prefix { background: #fef3c7; color: #92400e; }
+  .conf-none { background: #fee2e2; color: #b91c1c; }
+  .code-in { width: 150px; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  .cand td { vertical-align: top; }
+  .cand .raw { font-size: 12px; color: #64748b; word-break: break-all; }
+  textarea.csv { font-family: ui-monospace, Consolas, monospace; font-size: 12px; min-height: 90px; }
+  .tabs a { margin-right: 10px; }
+</style>
+<div class="topbar" style="margin-top:-1px">
+  <span class="pl-title">🔗 商品リンク台帳 — 取込 (admin)</span>
+  <a href="/apps/product-links">台帳へ戻る</a>
+  <span class="spacer"></span>
+  <span class="user"><%= displayName %></span>
+</div>
+<div class="wrap">
+  <div class="card">
+    <h2>過去分の取り込み (すべて「候補」に入り、下で確認してから台帳に載ります)</h2>
+    <div class="src-row" style="margin-bottom:10px;">
+      <button class="btn btn-primary" id="scan-drive" type="button">📁 Drive「商品別」を走査 (読み取りのみ)</button>
+      <span class="msg">フォルダ <code><%= driveFolderId %></code> 直下のサブフォルダ名「商品コード_商品名」からコードを推定します。移動・改名・削除は一切しません</span>
+      <span class="msg" id="scan-drive-msg"></span>
+    </div>
+    <div class="src-row" style="margin-bottom:10px;">
+      <button class="btn btn-primary" id="import-notion" type="button">🗂 Notion 画像DB の Canva / Drive を取り込む</button>
+      <span class="msg">「Canva」「グーグルドライブURL」列を商品コードで候補化。商品登録ハブに移植済みの分は自動で「重複」として閉じます</span>
+      <span class="msg" id="import-notion-msg"></span>
+    </div>
+    <details>
+      <summary style="cursor:pointer; font-size:13px;">📄 CSV / タブ区切りを貼り付けて取り込む (ヘッダ: ne_code, url, link_type, purpose, label)</summary>
+      <textarea class="csv" id="csv-text" placeholder="ne_code,url,link_type,purpose,label&#10;spearmint30,https://www.canva.com/design/XXXX/YYYY/edit,canva,top_image,"></textarea>
+      <div style="margin-top:6px;"><button class="btn btn-sm" id="import-csv" type="button">取り込む</button> <span class="msg" id="import-csv-msg"></span></div>
+    </details>
+  </div>
+
+  <div class="card">
+    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:8px;">
+      <span class="tabs">
+        <% for (const [k, label] of [['pending', '未処理'], ['accepted', '採用'], ['duplicate', '重複 (自動)'], ['rejected', '却下'], ['all', 'すべて']]) { %>
+          <a class="btn btn-sm <%= resolution === k ? 'btn-primary' : '' %>" href="?r=<%= k %><%= source ? '&s=' + source : '' %>"><%= label %> (<%= k === 'all' ? Object.values(counts).reduce((a, b) => a + b, 0) : counts[k] %>)</a>
+        <% } %>
+      </span>
+      <select onchange="location.href='?r=<%= resolution %>' + (this.value ? '&s=' + this.value : '')" style="width:auto;">
+        <option value="" <%= !source ? 'selected' : '' %>>取込元: すべて</option>
+        <option value="drive_scan" <%= source === 'drive_scan' ? 'selected' : '' %>>Drive走査</option>
+        <option value="notion_image" <%= source === 'notion_image' ? 'selected' : '' %>>Notion画像DB</option>
+        <option value="csv" <%= source === 'csv' ? 'selected' : '' %>>CSV</option>
+      </select>
+      <span style="flex:1"></span>
+      <% if (resolution === 'pending') { %>
+        <button class="btn btn-sm" id="accept-exact" type="button">✅ 完全一致 (<%= candidates.filter(c => c.confidence === 'exact').length %> 件) をまとめて採用</button>
+        <span class="msg" id="accept-exact-msg"></span>
+      <% } %>
+    </div>
+    <div style="overflow:auto;">
+    <table class="list">
+      <thead><tr>
+        <th style="width:110px">推定</th>
+        <th>取込元 / フォルダ名・URL</th>
+        <th style="width:330px">商品コード (直せます) / 用途</th>
+        <th style="width:150px">操作</th>
+      </tr></thead>
+      <tbody>
+      <% if (candidates.length === 0) { %><tr><td colspan="4" class="muted" style="padding:20px; text-align:center;">候補はありません</td></tr><% } %>
+      <% for (const c of candidates) { %>
+        <tr class="cand" data-id="<%= c.id %>" data-exact="<%= c.resolution === 'pending' && c.confidence === 'exact' ? 1 : 0 %>">
+          <td>
+            <span class="conf conf-<%= c.confidence %>"><%= { exact: '完全一致', prefix: '前方一致', none: '不明' }[c.confidence] %></span>
+            <div class="muted" style="margin-top:3px;"><%= sourceLabels[c.source_system] || c.source_system %></div>
+          </td>
+          <td>
+            <div><%= linkTypeLabels[c.link_type] || c.link_type %> — <%= c.raw_name || '' %></div>
+            <div class="raw"><a href="<%= /^https?:\/\//i.test(c.raw_url) ? c.raw_url : '#' %>" target="_blank" rel="noopener noreferrer"><%= c.raw_url %></a></div>
+            <% if (c.resolution !== 'pending') { %><div class="muted"><%= c.resolution %> / <%= c.resolved_ne_code || '' %> / <%= c.resolved_by || '' %> <%= (c.resolved_at || '').slice(0, 16) %></div><% } %>
+          </td>
+          <td>
+            <% if (c.resolution === 'pending') { %>
+              <input type="text" class="code-in" value="<%= c.inferred_ne_code || c.raw_code || '' %>" placeholder="商品コード">
+              <span class="muted"><%= c.inferred_name %></span>
+              <% if (c.link_type !== 'drive_folder') { %>
+                <div style="margin-top:4px;">
+                  <select class="purpose-in" style="width:auto;">
+                    <option value="">用途 (あとで可)</option>
+                    <% for (const p of purposes) { %><option value="<%= p %>" <%= c.purpose === p ? 'selected' : '' %>><%= purposeLabels[p] %></option><% } %>
+                  </select>
+                </div>
+              <% } %>
+            <% } else { %>
+              <span class="code-cell"><%= c.resolved_ne_code || c.inferred_ne_code || '' %></span>
+            <% } %>
+          </td>
+          <td>
+            <% if (c.resolution === 'pending') { %>
+              <button class="btn btn-sm btn-primary act-accept" type="button">採用</button>
+              <button class="btn btn-sm act-reject" type="button">却下</button>
+              <div class="msg act-msg"></div>
+            <% } %>
+          </td>
+        </tr>
+      <% } %>
+      </tbody>
+    </table>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  function api(method, url, body) {
+    return fetch(url, { method: method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) })
+      .then(function (r) { return r.json().then(function (j) { if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  function bindRun(btnId, url, fmt) {
+    var b = document.getElementById(btnId); if (!b) return;
+    var m = document.getElementById(btnId + '-msg');
+    b.addEventListener('click', function () {
+      b.disabled = true; m.textContent = '実行中… (数十秒かかることがあります)';
+      api('POST', url, {}).then(function (j) { m.textContent = fmt(j); setTimeout(function () { location.href = '?r=pending'; }, 1200); })
+        .catch(function (e) { m.textContent = '⚠️ ' + e.message; b.disabled = false; });
+    });
+  }
+  bindRun('scan-drive', '/apps/product-links/admin/api/scan-drive', function (j) { return '✅ フォルダ ' + j.folders + ' 件 → 新規候補 ' + j.inserted + ' / 重複で自動処理 ' + j.duplicate + ' / スキップ ' + j.skipped; });
+  bindRun('import-notion', '/apps/product-links/admin/api/import-notion', function (j) { return '✅ カード ' + j.pages + ' 件 → 新規候補 ' + j.inserted + ' / 重複で自動処理 ' + j.duplicate + ' / スキップ ' + j.skipped; });
+  var csvBtn = document.getElementById('import-csv');
+  if (csvBtn) csvBtn.addEventListener('click', function () {
+    var m = document.getElementById('import-csv-msg'); m.textContent = '取込中…';
+    api('POST', '/apps/product-links/admin/api/import-csv', { text: document.getElementById('csv-text').value })
+      .then(function (j) { m.textContent = '✅ ' + j.rows + ' 行 → 新規候補 ' + j.inserted + ' / 重複 ' + j.duplicate + ' / スキップ ' + j.skipped; setTimeout(function () { location.href = '?r=pending&s=csv'; }, 1200); })
+      .catch(function (e) { m.textContent = '⚠️ ' + e.message; });
+  });
+  var ae = document.getElementById('accept-exact');
+  if (ae) ae.addEventListener('click', function () {
+    if (!confirm('完全一致の候補をすべて台帳に載せます。よろしいですか?')) return;
+    var m = document.getElementById('accept-exact-msg'); m.textContent = '処理中…';
+    var ids = Array.prototype.map.call(document.querySelectorAll('tr.cand[data-exact="1"]'), function (tr) { return Number(tr.getAttribute('data-id')); });
+    api('POST', '/apps/product-links/admin/api/accept-exact', { ids: ids })
+      .then(function (j) { m.textContent = '✅ 採用 ' + j.accepted + ' / 失敗 ' + j.failed; setTimeout(function () { location.reload(); }, 900); })
+      .catch(function (e) { m.textContent = '⚠️ ' + e.message; });
+  });
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    var tr = t.closest && t.closest('tr.cand'); if (!tr) return;
+    var id = tr.getAttribute('data-id'); var msg = tr.querySelector('.act-msg');
+    if (t.closest('.act-accept')) {
+      var code = (tr.querySelector('.code-in') || {}).value || '';
+      var pu = tr.querySelector('.purpose-in'); var purpose = pu ? (pu.value || null) : undefined;
+      msg.textContent = '保存中…';
+      api('POST', '/apps/product-links/admin/api/candidates/' + id + '/accept', { ne_code: code.trim(), purpose: purpose })
+        .then(function () { tr.style.opacity = '.4'; msg.textContent = '✅ 採用'; tr.querySelectorAll('button').forEach(function (b) { b.disabled = true; }); })
+        .catch(function (e) { msg.textContent = '⚠️ ' + e.message; });
+    } else if (t.closest('.act-reject')) {
+      api('POST', '/apps/product-links/admin/api/candidates/' + id + '/reject', {})
+        .then(function () { tr.style.opacity = '.4'; msg.textContent = '却下'; tr.querySelectorAll('button').forEach(function (b) { b.disabled = true; }); })
+        .catch(function (e) { msg.textContent = '⚠️ ' + e.message; });
+    }
+  });
+})();
+</script>
