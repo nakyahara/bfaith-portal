@@ -36,6 +36,11 @@ export const KNOWN_NOTIFY_ONLY_DOMAINS = {
   },
 };
 
+/** 楽天あんしんメルアドサービスのマスクアドレス (…@pc.fw.rakuten.ne.jp / @mb.fw.rakuten.ne.jp 等)。
+ * 返信 (既存スレッド) は楽天公式SMTP経由で送れるが (adapters/gmail.js)、Gmailスレッドが残らないため
+ * 新規メールの宛先には使えない (compose.js)。両方から参照するのでここに置く */
+export const RAKUTEN_MASKED_RE = /@(?:[a-z0-9-]+\.)?fw\.rakuten\.ne\.jp$/i;
+
 /** ローカル部を比較用に正規化 ('No.Reply+tag' → 'noreply')。区切り記号と +タグを落とす */
 function normalizeLocalPart(local) {
   return String(local || '').toLowerCase().split('+')[0].replace(/[._-]/g, '');

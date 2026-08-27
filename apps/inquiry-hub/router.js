@@ -25,6 +25,7 @@ import { importTemplatesCsv, importQaCsv, listTemplates, listQa } from './templa
 import { aiRewriteEnabled, rewriteReply, draftReply, REWRITE_STYLES } from './ai-rewrite.js';
 import { findRelevantKnowledge, formatKnowledgeForPrompt } from './knowledge.js';
 import { runSync, listSyncStatus } from './sync/engine.js';
+import { DEFAULT_FROM_ADDRESS, DEFAULT_FROM_NAME } from './sync/adapters/gmail.js';
 import { buildAdapterForShop, refreshShopAuthStatus } from './sync/cron.js';
 import { listOutboxIssues, resolveUnknown, cancelJob, createReplyJob } from './outbox.js';
 import { listFolders, countUnfiled, createFolder, updateFolder, deleteFolder, setInquiryFolder,
@@ -42,6 +43,10 @@ import { blockedReplyDestination } from './no-reply.js';
 import { linkifyText, urlSafeCut } from './linkify.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
+import { listMailShops, resolveMailShop, createComposeDraft, finalizeComposeDraft,
+  pruneStaleComposeDrafts, validateBody, SUBJECT_MAX, BODY_MAX } from './compose.js';
+import { listSignatures, getSignature, getDefaultSignature, createSignature, updateSignature,
+  deleteSignature, composeBodyWithSignature, SIGNATURE_NAME_MAX, SIGNATURE_BODY_MAX } from './signatures.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
 // ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
@@ -1298,6 +1303,7 @@ router.get('/api/templates', (req, res) => {
       id: t.id,
       name: t.template_name,
       category: t.category || '',
+      subject: t.subject || '',
       body: t.template_body || '',
       bodyBottom: t.body_bottom || '',
     })),
@@ -1686,6 +1692,571 @@ const EXPAND_SCRIPT = `
   });`;
 
 // ─── テンプレート管理 (メールディーラーCSV取込 + CRUD) ───
+// ═══════════════════════════════════════════════════════════════
+// ✉️ 新規メール作成 (2026-08-27 中原さん要望「メール作成ボタンからメールが送れるように」
+//    「押したらテンプレート・To/From設定・署名を選ぶ画面へ飛ぶように」= メールディーラーと同じ2段階)
+//      1段目 /compose      … テンプレート / To-From設定 / 署名を選ぶ
+//      2段目 /compose/new  … 宛先・件名・本文を書いて送る (テンプレ本文+署名が入った状態で開く)
+//    送信の仕組みは返信とまったく同じ (compose.js が問い合わせスレッドを1件作り、あとは outbox)。
+//    → 送信済み一覧・スレッド表示・顧客からの返信の紐付けが自動的に効く
+// ═══════════════════════════════════════════════════════════════
+
+/** メール送信ワーカーの状態バナー (返信パネルと同じ判定をメールチャネル固定で) */
+function mailWorkerBanner() {
+  const box = 'border-radius:8px;padding:8px 10px;margin-bottom:10px';
+  if (!['true', '1'].includes(process.env.INQUIRY_HUB_OUTBOX_CRON_ENABLED || '')) {
+    return `<div class="sub" style="background:#fef3c7;${box}">⚠️ 送信ワーカーは停止中です。作成したメールはまだ実際には送信されません (⚙️運用管理で確認・取消できます)</div>`;
+  }
+  if (process.env.INQUIRY_HUB_MAIL_SEND_MODE !== 'live') {
+    return `<div class="sub" style="background:#e0e7ff;${box}">🧪 DRYRUNモード: 送信ジョブは検証のみで、実際には送信されません (動作確認用)</div>`;
+  }
+  return '';
+}
+
+/** 送信機能そのものが無効なときの案内 (返信エディタと同じ env フラグで制御) */
+function composeDisabledBody() {
+  return `<div class="panel reply-note">✉️ メール送信機能はまだ有効になっていません (いまはメールディーラーから送ってください)。
+    <span class="sub">管理者が env <code>INQUIRY_HUB_REPLY_EDITOR_ENABLED=true</code> を設定すると、この画面からメールを送れます</span></div>`;
+}
+
+/** 送信元 (To/From設定) の選択肢。いまは店舗1件だけの想定だが、増えたらそのまま並ぶ */
+function mailShopOptions(shops, cur) {
+  return shops.map(s => `<option value="${s.id}"${String(cur || '') === String(s.id) ? ' selected' : ''}>`
+    + `To/From設定なし (${he(DEFAULT_FROM_ADDRESS)}) — ${he(s.shop_name)}</option>`).join('');
+}
+
+// ─── 1段目: テンプレート / To-From設定 / 署名を選ぶ ───
+router.get('/compose', (req, res) => {
+  if (!replyEditorEnabled()) {
+    return res.send(pageShell('問い合わせ管理 — メール作成', 'compose', composeDisabledBody(), ''));
+  }
+  // 送られないまま残った下書き (添付用の器) の掃除はここで行う (cronを増やさない)
+  try { pruneStaleComposeDrafts(); } catch (e) { console.warn(`[inquiry-hub] 下書き掃除に失敗: ${e?.message || e}`); }
+
+  let shops = [];
+  try { shops = listMailShops(); } catch { /* 初期化前は空 */ }
+  if (!shops.length) {
+    return res.send(pageShell('問い合わせ管理 — メール作成', 'compose',
+      `<div class="card empty">メール送信に使える店舗が登録されていません。<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で確認してください</div>`, ''));
+  }
+  const signatures = listSignatures();
+  const defSig = signatures.find(s => s.is_default) || null;
+
+  const body = `
+  <div class="view-hint">✉️ <b>新規メール作成</b> — テンプレート、To/From設定、署名を選択してください。
+    <span class="sub">(次の画面で宛先・件名・本文を書いて送ります)</span></div>
+  ${mailWorkerBanner()}
+  <div class="card" style="padding:16px">
+    <div class="cform">
+      <label class="k" for="tplSel">テンプレート</label>
+      <div>
+        <select id="tplSel"><option value="">-------- (使わない)</option></select>
+        <div class="sub" style="margin-top:4px">選ぶと件名と本文が入った状態で次の画面が開きます (そのあと自由に編集できます)</div>
+        <div class="cpreview" id="tplPrev" hidden></div>
+      </div>
+
+      <label class="k" for="shopSel">To/From設定</label>
+      <div>
+        <select id="shopSel">${mailShopOptions(shops, shops[0].id)}</select>
+        <div class="sub" style="margin-top:4px">差出人: ${he(DEFAULT_FROM_NAME)} &lt;${he(DEFAULT_FROM_ADDRESS)}&gt;</div>
+      </div>
+
+      <label class="k" for="sigSel">署名</label>
+      <div>
+        <select id="sigSel">
+          <option value="">署名なし</option>
+          ${signatures.map(s => `<option value="${s.id}"${defSig && defSig.id === s.id ? ' selected' : ''}>${he(s.name)}${s.is_default ? ' (既定)' : ''}</option>`).join('')}
+        </select>
+        <div class="cpreview" id="sigPrev" hidden></div>
+        <div class="sub" style="margin-top:4px">
+          ${signatures.length ? '' : 'まだ署名が登録されていません。'}<a href="/apps/inquiry-hub/signatures">✍️ 署名を作る・編集する</a></div>
+      </div>
+    </div>
+    <div class="cactions">
+      <button class="pri" id="nextBtn" type="button">次へ →</button>
+      <a class="btn-link" href="/apps/inquiry-hub">キャンセル</a>
+    </div>
+  </div>`;
+
+  const script = `
+  var SIGS = ${JSON.stringify(signatures.map(s => ({ id: s.id, body: s.body }))).replace(/</g, '\\u003c')};
+  var TPLS = null;
+  var tplSel = document.getElementById('tplSel');
+  var sigSel = document.getElementById('sigSel');
+  // テンプレートは件数が多いので本文ごと埋め込まず、返信画面と同じ /api/templates から取る
+  fetch('/apps/inquiry-hub/api/templates')
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function(j) {
+      TPLS = j.templates || [];
+      var cur = tplSel.value;
+      tplSel.textContent = '';
+      var head = document.createElement('option');
+      head.value = ''; head.textContent = '-------- (テンプレートを使わない)';
+      tplSel.appendChild(head);
+      // カテゴリ = optgroup (太字の見出し)。未分類は最後に「その他」(返信画面と同じ並べ方)
+      var order = (j.categories || []).slice();
+      TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+      order.push('');
+      order.forEach(function(cat) {
+        var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
+        if (!items.length) return;
+        var g = document.createElement('optgroup');
+        g.label = cat || 'その他';
+        items.forEach(function(t) {
+          var o = document.createElement('option');
+          o.value = String(t.id); o.textContent = t.name;
+          g.appendChild(o);
+        });
+        tplSel.appendChild(g);
+      });
+      tplSel.value = cur;
+      if (tplSel.selectedIndex < 0) tplSel.value = '';
+    })
+    .catch(function(e) { toast('テンプレート取得失敗: ' + e.message); });
+
+  function showPreview(el, text) {
+    el.textContent = text || '';
+    el.hidden = !text;
+  }
+  tplSel.addEventListener('change', function() {
+    var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
+    showPreview(document.getElementById('tplPrev'),
+      t ? ((t.subject ? '件名: ' + t.subject + '\\n\\n' : '') + t.body + (t.bodyBottom ? '\\n\\n' + t.bodyBottom : '')) : '');
+  });
+  function syncSigPrev() {
+    var s = SIGS.find(function(x) { return String(x.id) === sigSel.value; });
+    showPreview(document.getElementById('sigPrev'), s ? s.body : '');
+  }
+  sigSel.addEventListener('change', syncSigPrev);
+  syncSigPrev();
+
+  document.getElementById('nextBtn').addEventListener('click', function() {
+    var qs = [];
+    if (tplSel.value) qs.push('tpl=' + encodeURIComponent(tplSel.value));
+    if (sigSel.value) qs.push('sig=' + encodeURIComponent(sigSel.value));
+    if (document.getElementById('shopSel').value) qs.push('shop=' + encodeURIComponent(document.getElementById('shopSel').value));
+    location.href = '/apps/inquiry-hub/compose/new' + (qs.length ? '?' + qs.join('&') : '');
+  });`;
+
+  res.send(pageShell('問い合わせ管理 — メール作成', 'compose', body, script));
+});
+
+// ─── 2段目: 宛先・件名・本文を書いて送る ───
+router.get('/compose/new', (req, res) => {
+  if (!replyEditorEnabled()) {
+    return res.send(pageShell('問い合わせ管理 — メール作成', 'compose', composeDisabledBody(), ''));
+  }
+  const q = req.query || {};
+  let shop;
+  try {
+    shop = resolveMailShop(/^\d+$/.test(String(q.shop || '')) ? Number(q.shop) : null);
+  } catch (e) {
+    return res.send(pageShell('問い合わせ管理 — メール作成', 'compose',
+      `<div class="card empty">${he(String(e?.message || e))}</div>`, ''));
+  }
+  // 1段目で選んだテンプレート・署名を本文に展開しておく (以後はただのテキストとして編集できる)
+  const tpl = /^\d+$/.test(String(q.tpl || ''))
+    ? getDB().prepare('SELECT * FROM reply_templates WHERE id = ? AND is_active = 1').get(Number(q.tpl)) : null;
+  const sig = /^\d+$/.test(String(q.sig || '')) ? getSignature(Number(q.sig)) : null;
+  const tplBody = tpl ? String(tpl.template_body || '') + (tpl.body_bottom ? `\n\n${tpl.body_bottom}` : '') : '';
+  const initialBody = composeBodyWithSignature(tplBody, sig && sig.is_active ? sig.body : '');
+  const initialSubject = tpl ? String(tpl.subject || '') : '';
+  // 操作IDはページ描画時にサーバーが採番 (返信と同じ。二重送信を防ぐ冪等キー)
+  const opId = crypto.randomUUID();
+
+  const body = `
+  <div class="view-hint"><a href="/apps/inquiry-hub/compose">← テンプレート・署名を選び直す</a></div>
+  ${mailWorkerBanner()}
+  <div class="card" style="padding:16px">
+    <div class="cform">
+      <label class="k">送信元</label>
+      <div class="sub" style="padding-top:9px">${he(DEFAULT_FROM_NAME)} &lt;${he(DEFAULT_FROM_ADDRESS)}&gt;
+        <span style="margin-left:8px">(${he(shop.shop_name)})</span></div>
+
+      <label class="k" for="cTo">宛先 <span style="color:#b91c1c">*</span></label>
+      <div>
+        <input type="email" id="cTo" placeholder="example@example.com" autocomplete="off" spellcheck="false">
+        <div class="sub" style="margin-top:4px">1件だけ指定できます (Cc・複数宛先は未対応)</div>
+      </div>
+
+      <label class="k" for="cName">宛先の名前</label>
+      <div>
+        <input type="text" id="cName" placeholder="(任意) 山田 太郎 様 / 株式会社○○" maxlength="100">
+        <div class="sub" style="margin-top:4px">一覧で誰宛か分かるようにするための表示名です (メールのヘッダーには入りません)</div>
+      </div>
+
+      <label class="k" for="cSubject">件名 <span style="color:#b91c1c">*</span></label>
+      <div><input type="text" id="cSubject" maxlength="${SUBJECT_MAX}" value="${he(initialSubject)}" placeholder="件名"></div>
+
+      <label class="k" for="cBody">本文 <span style="color:#b91c1c">*</span></label>
+      <div>
+        <div class="row tpl-row" id="tplRow" style="margin-bottom:6px">
+          <select id="tplSel" title="テンプレートを選ぶ (カテゴリごとにまとまっています)"><option value="">📄 テンプレートを本文に入れる…</option></select>
+        </div>
+        <textarea id="cBody" maxlength="${BODY_MAX}" placeholder="本文">${he(initialBody)}</textarea>
+        <div class="row rw-row" id="attRow" style="margin-top:8px">
+          <button class="ghost" type="button" id="attBtn">📎 ファイルを添付</button>
+          <input type="file" id="attFile" multiple accept=".pdf,.png,.jpg,.jpeg,.gif,.webp,.bmp,application/pdf,image/*" style="display:none">
+          <span class="sub">${he(ALLOWED_LABEL)}・1ファイル${Math.round(MAX_FILE_BYTES / 1048576)}MB・最大${MAX_FILES_PER_REPLY}つ</span>
+        </div>
+        <div id="attList"></div>
+      </div>
+    </div>
+    <div class="cactions" style="justify-content:flex-end">
+      <span class="sub" style="margin-right:auto">「送信して完了」= 送ったあとの状態を「完了」にします (返信を待つなら「送信」)</span>
+      <a class="btn-link" href="/apps/inquiry-hub">キャンセル</a>
+      <button class="ghost" id="sendBtn" type="button" title="送信後は「返信処理中」になります">✉️ 送信</button>
+      <button class="pri" id="sendDoneBtn" type="button" title="送信後に「完了」にします">✅ 送信して完了</button>
+    </div>
+  </div>`;
+
+  const script = `
+  var SHOP_ID = ${Number(shop.id)};
+  var OP_ID = ${JSON.stringify(opId)};
+  var DRAFT_ID = null;
+  var ATT = [];
+  var MAXF = ${MAX_FILES_PER_REPLY}, MAXB = ${MAX_FILE_BYTES};
+
+  function jpost(url, data) {
+    return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {}) })
+      .then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j) {
+        if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  // 添付は問い合わせIDに紐付けて保存するので、添付する時点で下書き (器) を1件だけ作る。
+  // 送られなければ24時間後に掃除される (compose.js)
+  function ensureDraft() {
+    if (DRAFT_ID) return Promise.resolve(DRAFT_ID);
+    return jpost('/apps/inquiry-hub/api/compose/draft', { shopId: SHOP_ID })
+      .then(function(j) { DRAFT_ID = j.id; return DRAFT_ID; });
+  }
+
+  // ─── テンプレートを後から本文に入れる (1段目で選ばなかった場合の入口) ───
+  (function() {
+    var tplSel = document.getElementById('tplSel');
+    var TPLS = null, loading = null;
+    function load() {
+      if (loading) return loading;
+      loading = fetch('/apps/inquiry-hub/api/templates')
+        .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function(j) {
+          TPLS = j.templates || [];
+          var cur = tplSel.value;
+          tplSel.textContent = '';
+          var head = document.createElement('option');
+          head.value = ''; head.textContent = '📄 テンプレートを本文に入れる… (' + TPLS.length + '件)';
+          tplSel.appendChild(head);
+          var order = (j.categories || []).slice();
+          TPLS.forEach(function(t) { if (t.category && order.indexOf(t.category) < 0) order.push(t.category); });
+          order.push('');
+          order.forEach(function(cat) {
+            var items = TPLS.filter(function(t) { return (t.category || '') === cat; });
+            if (!items.length) return;
+            var g = document.createElement('optgroup');
+            g.label = cat || 'その他';
+            items.forEach(function(t) {
+              var o = document.createElement('option');
+              o.value = String(t.id); o.textContent = t.name;
+              g.appendChild(o);
+            });
+            tplSel.appendChild(g);
+          });
+          tplSel.value = cur;
+          if (tplSel.selectedIndex < 0) tplSel.value = '';
+        })
+        .catch(function(e) { loading = null; toast('テンプレート取得失敗: ' + e.message); });
+      return loading;
+    }
+    document.getElementById('tplRow').addEventListener('pointerover', load, { once: true });
+    tplSel.addEventListener('focus', load);
+    tplSel.addEventListener('change', function() {
+      var t = (TPLS || []).find(function(x) { return String(x.id) === tplSel.value; });
+      if (!t) return;
+      var ta = document.getElementById('cBody');
+      var text = t.body + (t.bodyBottom ? '\\n\\n' + t.bodyBottom : '');
+      if (ta.value.trim() && !confirm('本文をテンプレート「' + t.name + '」で置き換えますか? (署名も置き換わります)')) return;
+      ta.value = text;
+      var sub = document.getElementById('cSubject');
+      if (t.subject && !sub.value.trim()) sub.value = t.subject;
+      ta.focus();
+      toast('テンプレート「' + t.name + '」を入れました。内容を確認・編集してください');
+    });
+  })();
+
+  // ─── 📎 添付 (返信画面と同じ仕組み・同じ上限) ───
+  (function() {
+    var attBtn = document.getElementById('attBtn');
+    var input = document.getElementById('attFile');
+    var list = document.getElementById('attList');
+    function fmtB(n) { return n < 1048576 ? Math.round(n / 1024) + 'KB' : (n / 1048576).toFixed(1) + 'MB'; }
+    function render() {
+      list.textContent = '';
+      ATT.forEach(function(a) {
+        var row = document.createElement('div');
+        row.className = 'att-chip';
+        var name = document.createElement('span');
+        name.textContent = '📎 ' + a.name + ' (' + fmtB(a.size) + ')';
+        var del = document.createElement('button');
+        del.type = 'button'; del.className = 'ghost'; del.textContent = '✕'; del.title = 'この添付を取り消す';
+        del.addEventListener('click', function() {
+          del.disabled = true;
+          jpost('/apps/inquiry-hub/api/inquiries/' + DRAFT_ID + '/reply-attachments/' + a.id + '/delete', {})
+            .then(function() { ATT = ATT.filter(function(x) { return x.id !== a.id; }); render(); })
+            .catch(function(e) { del.disabled = false; toast('削除失敗: ' + e.message); });
+        });
+        row.appendChild(name); row.appendChild(del);
+        list.appendChild(row);
+      });
+    }
+    attBtn.addEventListener('click', function() { input.click(); });
+    input.addEventListener('change', function() {
+      var files = Array.prototype.slice.call(input.files || []);
+      input.value = '';
+      ensureDraft().then(function(id) {
+        (function next() {
+          var f = files.shift();
+          if (!f) return;
+          if (ATT.length >= MAXF) { toast('添付は' + MAXF + 'つまでです'); return; }
+          if (f.size > MAXB) { toast(f.name + ' は大きすぎます (上限' + Math.round(MAXB / 1048576) + 'MB)'); next(); return; }
+          attBtn.disabled = true;
+          fetch('/apps/inquiry-hub/api/inquiries/' + id + '/reply-attachments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream', 'X-File-Name': encodeURIComponent(f.name) },
+            body: f,
+          }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j) { if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); })
+            .then(function(j) { ATT.push({ id: j.id, name: j.fileName, size: j.fileSize }); render(); attBtn.disabled = false; next(); })
+            .catch(function(e) { toast('添付失敗: ' + f.name + ' — ' + e.message); attBtn.disabled = false; next(); });
+        })();
+      }).catch(function(e) { toast('添付の準備に失敗: ' + e.message); });
+    });
+  })();
+
+  // ─── 送信 ───
+  var sendBtn = document.getElementById('sendBtn');
+  var sendDoneBtn = document.getElementById('sendDoneBtn');
+  function send(complete) {
+    var to = document.getElementById('cTo').value.trim();
+    var subject = document.getElementById('cSubject').value.trim();
+    var body = document.getElementById('cBody').value;
+    if (!to) { toast('宛先を入力してください'); return; }
+    if (!subject) { toast('件名を入力してください'); return; }
+    if (!body.trim()) { toast('本文が空です'); return; }
+    var preview = body.length > 300 ? body.slice(0, 300) + '…' : body;
+    if (!confirm('このメールを送信しますか?\\n\\n宛先: ' + to + '\\n件名: ' + subject
+      + (ATT.length ? '\\n添付: ' + ATT.map(function(a) { return a.name; }).join(' / ') : '')
+      + (complete ? '\\n送信後に「完了」にします' : '\\n送信後は「返信処理中」になります')
+      + '\\n\\n' + preview)) return;
+    sendBtn.disabled = true; sendDoneBtn.disabled = true;
+    jpost('/apps/inquiry-hub/api/compose/send', {
+      draftId: DRAFT_ID, shopId: SHOP_ID, to: to, subject: subject,
+      customerName: document.getElementById('cName').value.trim(), body: body,
+      attachmentIds: ATT.map(function(a) { return a.id; }),
+      completeOnSend: complete, clientOperationId: OP_ID,
+    }).then(function(j) {
+      toast(j.duplicate ? '既に同じ操作で作成済みです' : '送信ジョブを作成しました');
+      setTimeout(function() { location.href = '/apps/inquiry-hub/inquiries/' + j.inquiryId; }, 900);
+    }).catch(function(e) {
+      toast('送信失敗: ' + e.message);
+      sendBtn.disabled = false; sendDoneBtn.disabled = false;
+    });
+  }
+  sendBtn.addEventListener('click', function() { send(false); });
+  sendDoneBtn.addEventListener('click', function() { send(true); });`;
+
+  res.send(pageShell('問い合わせ管理 — メール作成', 'compose', body, script));
+});
+
+// ─── 新規メールのAPI (CSRF・JSON必須ガードは上の router.use('/api/') が効く) ───
+
+/** 添付を保存するための下書き (器) を1件作る。送られなければ24時間後に掃除される */
+router.post('/api/compose/draft', (req, res) => {
+  if (!replyEditorEnabled()) return res.status(403).json({ error: 'メール送信機能が有効になっていません' });
+  try {
+    const d = createComposeDraft({ shopId: (req.body || {}).shopId ?? null, createdBy: actorOf(req) });
+    res.json({ ok: true, id: d.id });
+  } catch (e) {
+    res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+/**
+ * 新規メールの送信ジョブ作成 (実送信は送信ワーカー = 返信とまったく同じ経路)。
+ * 下書きを表に出す → 送信ジョブを作る の順で行い、ジョブが作れなければ下書きに戻す
+ * (宛先も件名も入っているのに送信ジョブが無いスレッドを一覧に残さない)。
+ */
+router.post('/api/compose/send', (req, res) => {
+  if (!replyEditorEnabled()) return res.status(403).json({ error: 'メール送信機能が有効になっていません' });
+  const b = req.body || {};
+  const bodyText = String(b.body || '');
+  if (!b.clientOperationId || typeof b.clientOperationId !== 'string') {
+    return res.status(400).json({ error: '不正なリクエストです (clientOperationId)' });
+  }
+  const attachmentIds = b.attachmentIds;
+  if (attachmentIds !== undefined && (!Array.isArray(attachmentIds) || !attachmentIds.every(n => Number.isInteger(n) && n > 0))) {
+    return res.status(400).json({ error: '不正なリクエストです (attachmentIds は数値の配列)' });
+  }
+  try {
+    validateBody(bodyText);
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+  const db = getDB();
+  const opId = String(b.clientOperationId);
+  /** 同じ操作IDの再POST (レスポンスが届かなかった・二度押し) は既存ジョブをそのまま返す */
+  const duplicateOf = (row) => {
+    const e = new Error('duplicate');
+    e.duplicate = { inquiryId: row.inquiry_id, outboxId: row.id };
+    return e;
+  };
+  try {
+    // 下書きの確定と送信ジョブの作成、そして操作IDの重複判定までを1つのトランザクションで行う。
+    //  - 途中で落ちたら丸ごと巻き戻す = 「宛先も件名も入っているのに送信ジョブが無い問い合わせ」を
+    //    一覧に残さない (Codexレビュー 1巡目 High-1)
+    //  - 重複判定をトランザクションの外でやると、同じ操作IDの同時POSTが両方すり抜けて
+    //    片方が空の問い合わせを作ってしまう (Codexレビュー 2巡目 High)。BEGIN IMMEDIATE の
+    //    書き込みロックで直列化し、中で判定する
+    const out = db.transaction(() => {
+      const already = db.prepare('SELECT id, inquiry_id FROM outbox_replies WHERE client_operation_id = ?').get(opId);
+      if (already) throw duplicateOf(already);
+      const r = finalizeComposeDraft({ draftId: b.draftId ?? null, shopId: b.shopId ?? null,
+        to: b.to, subject: b.subject, customerName: b.customerName, actor: actorOf(req) });
+      const job = createReplyJob({
+        inquiryId: r.inquiry.id, channelType: 'email', bodyText,
+        attachmentIds: attachmentIds || [], createdBy: actorOf(req),
+        clientOperationId: opId, baseConversationRev: r.inquiry.conversation_rev,
+        completeOnSend: b.completeOnSend === true,
+      });
+      if (job.conflict) {
+        const e = new Error(job.conflict);
+        e.httpStatus = 409;
+        throw e;   // 巻き戻して下書きのままにする
+      }
+      if (!job.created) {
+        // 上の判定を抜けてここに来ることは無いはずだが、来たら今作った器ごと巻き戻す
+        // (「新しい問い合わせIDに古い送信ジョブ」という食い違った応答を返さない)
+        const existing = db.prepare('SELECT id, inquiry_id FROM outbox_replies WHERE id = ?').get(job.id);
+        throw duplicateOf(existing || { id: job.id, inquiry_id: r.inquiry.id });
+      }
+      return { inquiryId: r.inquiry.id, outboxId: job.id, to: r.inquiry.customer_identifier };
+    }).immediate();
+    console.log(`[inquiry-hub] 新規メール送信ジョブ #${out.outboxId} (問い合わせ #${out.inquiryId} → ${out.to}) by ${actorOf(req)}`);
+    res.json({ ok: true, inquiryId: out.inquiryId, outboxId: out.outboxId, duplicate: false });
+  } catch (e) {
+    if (e?.duplicate) return res.json({ ok: true, ...e.duplicate, duplicate: true });
+    res.status(e?.httpStatus || 400).json({ error: String(e?.message || e).slice(0, 300) });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ✍️ 署名の設定 (2026-08-27 中原さん要望。新規メール作成1段目で選ぶ「署名」の登録先)
+//    本文の末尾に付ける定型の差出人表記。選ぶと作成画面の本文に展開される (以後は普通のテキスト)
+// ═══════════════════════════════════════════════════════════════
+router.get('/signatures', (req, res) => {
+  const rows = listSignatures();
+  const trs = rows.map(s => `
+    <tr>
+      <td data-full data-label="名前">
+        <input type="text" class="s-name" data-id="${s.id}" value="${he(s.name)}" maxlength="${SIGNATURE_NAME_MAX}" style="width:100%">
+        <label class="chk" style="margin-top:6px"><input type="radio" name="sigdef" class="s-def" data-id="${s.id}"${s.is_default ? ' checked' : ''}>この署名を既定にする</label>
+      </td>
+      <td data-full data-label="本文">
+        <textarea class="s-body" data-id="${s.id}" rows="6" maxlength="${SIGNATURE_BODY_MAX}"
+          style="width:100%;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;font-family:inherit;font-size:13px">${he(s.body)}</textarea>
+      </td>
+      <td data-label="表示順"><input type="number" class="s-order" data-id="${s.id}" value="${s.sort_order}" style="width:80px"></td>
+      <td class="ops">
+        <button class="pri s-save" data-id="${s.id}">保存</button>
+        <button class="s-del" data-id="${s.id}" data-name="${he(s.name)}">削除</button>
+      </td>
+    </tr>`).join('');
+
+  const body = `
+  <div class="view-hint">✍️ <b>署名</b> — <a href="/apps/inquiry-hub/compose">✉️メール作成</a>の1段目で選ぶと、本文の末尾に入った状態で作成画面が開きます。
+    入ったあとは普通の文章として編集できます (送信前にその場で直せます)。
+    <b>既定</b>にした署名は、メール作成画面を開いたときに最初から選ばれています。</div>
+  <div class="card" style="padding:12px 14px;margin-bottom:14px">
+    <div class="cform">
+      <label class="k" for="newName">署名の名前</label>
+      <div><input type="text" id="newName" placeholder="例: 雑貨イズム署名" maxlength="${SIGNATURE_NAME_MAX}"></div>
+      <label class="k" for="newBody">本文</label>
+      <div><textarea id="newBody" rows="6" maxlength="${SIGNATURE_BODY_MAX}"
+        placeholder="例:&#10;━━━━━━━━━━━━━━━&#10;雑貨イズム（B-Faith株式会社）&#10;〒000-0000 ○○県○○市…&#10;TEL 00-0000-0000 / info@b-faith.biz&#10;━━━━━━━━━━━━━━━"></textarea></div>
+    </div>
+    <div class="cactions"><button class="pri" id="createBtn" type="button">➕ 署名を作成</button></div>
+  </div>
+  <div class="card">
+    <table class="cardable">
+      <thead><tr><th style="width:26%">名前 / 既定</th><th>本文</th><th>表示順</th><th>操作</th></tr></thead>
+      <tbody>${trs || '<tr><td colspan="4" class="empty">署名はまだありません。上の欄から作成してください</td></tr>'}</tbody>
+    </table>
+  </div>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/signatures' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.getElementById('createBtn').addEventListener('click', function() {
+    var btn = this;
+    var name = document.getElementById('newName').value.trim();
+    var body = document.getElementById('newBody').value;
+    if (!name) { toast('署名の名前を入力してください'); return; }
+    if (!body.trim()) { toast('署名の本文を入力してください'); return; }
+    btn.disabled = true;
+    api('', { name: name, body: body }).then(function() { location.reload(); })
+      .catch(function(e) { toast('作成失敗: ' + e.message); btn.disabled = false; });
+  });
+  document.querySelectorAll('.s-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var id = b.dataset.id;
+      b.disabled = true;
+      api('/' + id, {
+        name: document.querySelector('.s-name[data-id="' + id + '"]').value.trim(),
+        body: document.querySelector('.s-body[data-id="' + id + '"]').value,
+        sortOrder: Number(document.querySelector('.s-order[data-id="' + id + '"]').value),
+        isDefault: document.querySelector('.s-def[data-id="' + id + '"]').checked,
+      }).then(function() { location.reload(); })
+        .catch(function(e) { toast('保存失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.s-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm('署名「' + b.dataset.name + '」を削除しますか?\\n\\n選択肢から消えるだけで、これまでに送ったメールの本文は変わりません。')) return;
+      b.disabled = true;
+      api('/' + b.dataset.id + '/delete', {}).then(function() {
+        toast('削除しました');
+        setTimeout(function(){ location.reload(); }, 700);
+      }).catch(function(e) { toast('削除失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — 署名', 'signatures', body, script));
+});
+
+router.post('/api/signatures', (req, res) => {
+  try {
+    const b = req.body || {};
+    const s = createSignature({ name: b.name, body: b.body, isDefault: b.isDefault === true, createdBy: actorOf(req) });
+    console.log(`[inquiry-hub] 署名作成「${s.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true, ...s });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/signatures/:id(\\d+)', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = updateSignature(Number(req.params.id), { name: b.name, body: b.body, sortOrder: b.sortOrder, isDefault: b.isDefault });
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/signatures/:id(\\d+)/delete', (req, res) => {
+  try {
+    const r = deleteSignature(Number(req.params.id));
+    console.log(`[inquiry-hub] 署名削除「${r.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
 router.get('/templates', (req, res) => {
   const q = req.query || {};
   const { rows, categories } = listTemplates(q);
@@ -3138,6 +3709,26 @@ td.ops button { margin: 2px 4px 2px 0; }
   max-height: 100vh; overflow-y: auto; }
 .nav-group { display: flex; flex-direction: column; gap: 2px; }
 .nav-sep { height: 1px; background: #dbe3ee; margin: 10px 12px; }
+/* ✉️ メール作成 (2026-08-27): メールディーラーと同じくサイドバー最上部。押すと選択画面 → 作成画面 */
+.nav-compose { display: flex; align-items: center; justify-content: center; gap: 8px;
+  margin: 2px 6px 12px; padding: 11px 14px; border-radius: 10px; background: #1d4ed8; color: #fff;
+  font-weight: 700; font-size: 14px; text-decoration: none; box-shadow: 0 1px 3px rgba(0,0,0,.15); }
+.nav-compose:hover { background: #1e40af; color: #fff; }
+.nav-compose.on { background: #1e3a8a; }
+/* 新規メール作成の入力欄 (1段目=選択・2段目=作成で共通) */
+.cform { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px 14px; align-items: start; }
+.cform > label.k { color: #475569; font-size: 13px; font-weight: 700; padding-top: 8px; }
+.cform input[type=text], .cform input[type=email], .cform select, .cform textarea {
+  width: 100%; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px;
+  font-family: inherit; background: #fff; }
+.cform textarea { min-height: 260px; line-height: 1.6; resize: vertical; }
+.cpreview { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px;
+  white-space: pre-wrap; word-break: break-word; font-size: 13px; color: #334155; max-height: 220px; overflow-y: auto; }
+.cactions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+@media (max-width: 700px) {
+  .cform { grid-template-columns: 1fr; gap: 4px 0; }
+  .cform > label.k { padding-top: 10px; }
+}
 .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-radius: 999px;
   color: #334155; text-decoration: none; font-size: 14px; line-height: 1.3; }
 .nav-item:hover { background: #e2e8f0; }
@@ -3276,6 +3867,8 @@ function pageShell(title, active, body, script, opts = {}) {
 
   const sidebar = `
   <aside class="side-nav" id="sideNav">
+    <a href="/apps/inquiry-hub/compose" class="nav-compose${active === 'compose' ? ' on' : ''}"
+      title="宛先を指定して新しくメールを送ります (テンプレート・署名を選んでから作成画面に進みます)">✉️ メール作成</a>
     <div class="nav-group">
       ${navItem(`/apps/inquiry-hub?view=inbox${groupQs}`, '📥', '受信トレイ', 'inbox', counts.inbox)}
       ${navItem(`/apps/inquiry-hub?view=sent${groupQs}`, '📤', '送信済み', 'sent', counts.sent)}
@@ -3292,6 +3885,7 @@ function pageShell(title, active, body, script, opts = {}) {
     <div class="nav-sep"></div>
     <div class="nav-group">
       ${navItem('/apps/inquiry-hub/templates', '📄', '返信テンプレート', 'templates', 0)}
+      ${navItem('/apps/inquiry-hub/signatures', '✍️', '署名', 'signatures', 0)}
       ${navItem('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa', 0)}
       ${navItem('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules', 0)}
       ${navItem('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin', 0)}

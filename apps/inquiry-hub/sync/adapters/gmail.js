@@ -24,10 +24,14 @@
  */
 import nodemailer from 'nodemailer';
 import { evaluateMailRules } from '../../mail-rules.js';
-import { classifyReplyDestination, isBounceSignature } from '../../no-reply.js';
+import { classifyReplyDestination, isBounceSignature, RAKUTEN_MASKED_RE } from '../../no-reply.js';
+import { isComposeThread } from '../../compose-id.js';
 import { SendRejectedError } from '../../outbox.js';
 
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
+/** 送信時の差出人 (cfg 未指定時の既定)。画面の「送信元」表示でも使う */
+export const DEFAULT_FROM_ADDRESS = 'info@b-faith.biz';
+export const DEFAULT_FROM_NAME = '雑貨イズム（B-Faith株式会社）';
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const OWN_DOMAIN = 'b-faith.biz';
 const PAGE_SIZE = 100;
@@ -61,13 +65,13 @@ const headerOf = (payload, name) => {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** 楽天あんしんメルアドサービスのマスクアドレス (…@pc.fw.rakuten.ne.jp / @mb.fw.rakuten.ne.jp 等)。
+/** 楽天あんしんメルアドのマスクアドレス (判定は no-reply.js。ここは従来の import 元との互換で再export)。
  * 2026-08-24 実測: Gmail API経由の送信は send-as エイリアス (From=info@) があっても
  * SMTPエンベロープに認証アカウント (d.nakahara@) が出るため、楽天中継が
  * `552 5.2.0 <d.nakahara@…> sender rejected` で拒否する (RMS登録アドレス以外は不可)。
  * → この宛先だけは楽天提供の公式SMTP (sub.fw.rakuten.ne.jp:587) 経由で送る (sendReply 参照)。
  *   メールディーラー・メールワイズ・Re:lation 等の他ツールと同じ方式 */
-export const RAKUTEN_MASKED_RE = /@(?:[a-z0-9-]+\.)?fw\.rakuten\.ne\.jp$/i;
+export { RAKUTEN_MASKED_RE };
 
 /** 楽天あんしんメルアド公式SMTPの接続設定を env から解決。
  * SMTP AUTH ID/パスワードは R-Login「あんしんメルアドサービスメニュー」→「メールサーバ設定情報」で確認。
@@ -275,8 +279,8 @@ export function createGmailAdapter(cfg = {}) {
   const concurrency = cfg.concurrency ?? 5;
   const ruleEvaluator = cfg.ruleEvaluator ?? evaluateMailRules;
   const sendMode = cfg.sendMode ?? 'dryrun';
-  const fromAddress = cfg.fromAddress ?? 'info@b-faith.biz';
-  const fromName = cfg.fromName ?? '雑貨イズム（B-Faith株式会社）';
+  const fromAddress = cfg.fromAddress ?? DEFAULT_FROM_ADDRESS;
+  const fromName = cfg.fromName ?? DEFAULT_FROM_NAME;
   // 楽天あんしんメルアド公式SMTP (resolveRakutenMaskSmtpFromEnv)。マスクアドレス宛の送信に必須
   const rakutenSmtp = cfg.rakutenSmtp ?? null;
   // テスト差し替え用。既定は nodemailer (STARTTLS必須・タイムアウトはGmailと同じ設定に揃える)
@@ -407,20 +411,35 @@ export function createGmailAdapter(cfg = {}) {
      * 返信送信 (outbox.js §8.3 契約)。未送信確定の失敗のみ SendRejectedError を throw。
      * 送信要求後の失敗は汎用エラー (→ unknown、自動再送しない)。
      * スレッド返信: Gmailスレッドの最後のメッセージから Message-ID を取り、In-Reply-To/References を付ける。
+     * 新規メール (compose.js。external_inquiry_id が 'compose:…') はスレッドが存在しないので
+     * スレッドメタの取得・Re: の付与・In-Reply-To を行わず、宛先も画面で入力したものだけを使う。
+     * 送信できたら実際のGmailスレッドIDを externalThreadId として返す (outbox.js が仮IDと差し替える)。
      * 引数 dryRun: true はアダプターのモード設定に関係なく実送信を禁止する
      * (プレビュー経路がliveアダプターを受け取っても安全なように、呼び出し単位で強制。Codexレビュー反映)
      */
     async sendReply({ inquiry, bodyText, attachments = [], dryRun = false }) {
       requests = 0;
-      let to = String(inquiry?.customer_identifier || '').trim().toLowerCase();
+      // 宛先はドメインだけ小文字化する (RFC上ローカル部は大小を区別し得るため原文のまま送る。
+      // 受信同期由来の customer_identifier は元から小文字なので従来の返信の挙動は変わらない)
+      const toRaw = String(inquiry?.customer_identifier || '').trim();
+      const toAt = toRaw.lastIndexOf('@');
+      let to = toAt > 0 ? `${toRaw.slice(0, toAt)}@${toRaw.slice(toAt + 1).toLowerCase()}` : toRaw.toLowerCase();
       const threadId = String(inquiry?.external_inquiry_id || '');
       if (!threadId) throw new SendRejectedError('Gmailスレッド外部IDがありません');
-      const subjectBase = headerSafe('件名', String(inquiry?.subject || 'お問い合わせについて').trim() || 'お問い合わせについて');
-      const subject = /^re:/i.test(subjectBase) ? subjectBase : `Re: ${subjectBase}`;
+      // このアプリから出す新規メール (返信ではない)。Gmailスレッドはまだ存在しない
+      const isNewMail = isComposeThread(threadId);
+      const subjectBase = headerSafe('件名', String(inquiry?.subject || (isNewMail ? '' : 'お問い合わせについて')).trim()
+        || (isNewMail ? '' : 'お問い合わせについて'));
+      if (isNewMail && !subjectBase) throw new SendRejectedError('件名がありません (未送信)');
+      const subject = isNewMail || /^re:/i.test(subjectBase) ? subjectBase : `Re: ${subjectBase}`;
 
       // スレッド返信ヘッダの材料 + 宛先フォールバック (この時点の失敗 = 未送信確定)
       let inReplyTo = '', references = '';
-      try {
+      // 新規メールの宛先は画面で入力されたものが全て (遡れるスレッドが無いのでフォールバックしない)
+      if (isNewMail && !EMAIL_RE.test(to)) {
+        throw new SendRejectedError(`新規メールの宛先が不正です (customer_identifier='${inquiry?.customer_identifier || ''}'。未送信)`);
+      }
+      if (!isNewMail) try {
         const t = await apiGet(`threads/${encodeURIComponent(threadId)}?format=metadata`
           + '&metadataHeaders=Message-ID&metadataHeaders=References'
           + '&metadataHeaders=From&metadataHeaders=Reply-To&metadataHeaders=X-Original-Sender', 'send-thread-meta');
@@ -509,6 +528,8 @@ export function createGmailAdapter(cfg = {}) {
         }
         const extId = String(info?.messageId || '').trim();
         console.log(`[gmail-send] 楽天SMTP送信完了 To=${to} messageId=${extId || '(不明)'}`);
+        // この経路は Gmail を通らないので新規メールでもスレッドIDは分からない
+        // (仮ID 'compose:…' のまま残る。画面表示・以後の返信送信はそれで成立する)
         return extId ? { externalReplyId: extId } : {};
       }
 
@@ -555,9 +576,10 @@ export function createGmailAdapter(cfg = {}) {
         console.log(`[gmail-send DRYRUN] To=${to} Subject=${subject.slice(0, 40)} thread=${threadId.slice(0, 12)}… bytes=${mime.length} atts=${attachments.length} (実送信していません)`);
         return { dryRun: true, externalReplyId: `dryrun:${threadId}` };
       }
-      const sent = await apiPost('messages/send', { raw, threadId }, 'send');
+      // 新規メールは threadId を渡さない (Gmail が新しいスレッドを起こす)。返信は既存スレッドに載せる
+      const sent = await apiPost('messages/send', isNewMail ? { raw } : { raw, threadId }, 'send');
       if (!sent?.id) throw new Error('Gmail送信レスポンスに id がありません — 結果不明');
-      console.log(`[gmail-send] 送信完了 To=${to} messageId=${sent.id}`);
+      console.log(`[gmail-send] ${isNewMail ? '新規メール' : '返信'}送信完了 To=${to} messageId=${sent.id}${isNewMail ? ` thread=${sent.threadId || '(不明)'}` : ''}`);
 
       // From実測検証 (2026-08-24 バウンス実測の再発防止): 送ったメッセージを読み戻し、
       // Gmail が From を置き換えていないか確認する。置き換わっていたら warning を返して
@@ -577,7 +599,10 @@ export function createGmailAdapter(cfg = {}) {
       } catch (e) {
         console.warn(`[gmail-send] From実測検証をスキップ (送信は完了): ${String(e?.message || e).slice(0, 120)}`);
       }
-      return warning ? { externalReplyId: sent.id, warning } : { externalReplyId: sent.id };
+      // 新規メールは実スレッドIDを返す (outbox.js が仮ID 'compose:…' と差し替え、
+      // 以後この会話に届く返信が同じチケットに載るようにする)
+      const threadOut = isNewMail && sent.threadId ? { externalThreadId: String(sent.threadId) } : {};
+      return { externalReplyId: sent.id, ...threadOut, ...(warning ? { warning } : {}) };
     },
 
     /**

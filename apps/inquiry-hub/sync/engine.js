@@ -39,6 +39,7 @@
  */
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from '../db.js';
+import { adoptComposeInquiryByMessageIds, flagComposeThreadSplit } from '../compose.js';
 
 export const OVERLAP_MS = 60 * 60 * 1000;          // 取得ウィンドウのオーバーラップ (60分。§8.1)
 export const DEFAULT_BACKFILL_DAYS = 30;           // 初回同期の遡り日数
@@ -98,6 +99,24 @@ function ingestInquiry(db, shop, item, nowIso) {
 
   let inq = db.prepare('SELECT * FROM inquiries WHERE channel_type = ? AND shop_id = ? AND external_inquiry_id = ?')
     .get(shop.channel_type, shop.id, item.externalInquiryId);
+
+  // このアプリから出した新規メール (compose.js) は、送信直後は仮IDのままのことがある
+  // (送信 → 実スレッドIDへの差し替え、の間に同期が走った場合)。そのまま新規チケットを作ると
+  // 同じ1通の会話が2つに割れるので、送信済みメッセージIDで探して合流させる
+  const sentMessageIds = (item.messages || []).map(m => m.externalMessageId);
+  if (!inq) {
+    inq = adoptComposeInquiryByMessageIds(db, {
+      channelType: shop.channel_type, shopId: shop.id,
+      externalInquiryId: item.externalInquiryId,
+      messageIds: sentMessageIds,
+    });
+  } else {
+    // 既に実スレッドのチケットがある場合でも、同じメールを持つ compose チケットが
+    // 残っていれば会話が2つに割れている。自動マージはせず、両方に⚠️要確認を立てて人に渡す
+    flagComposeThreadSplit(db, {
+      channelType: shop.channel_type, shopId: shop.id, inquiryId: inq.id, messageIds: sentMessageIds,
+    });
+  }
 
   const extStatus = item.externalStatus == null ? null : String(item.externalStatus);
   const extRead = item.externalIsRead == null ? null : (item.externalIsRead ? 1 : 0);
