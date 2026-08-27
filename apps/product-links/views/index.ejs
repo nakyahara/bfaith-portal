@@ -83,7 +83,7 @@
           <td>
             <div><%= p.name || '(商品名なし)' %></div>
             <div class="muted" style="margin-top:3px; display:flex; gap:8px; flex-wrap:wrap;">
-              <% if (p.draft_id) { %><a href="/apps/product-hub/drafts/<%= p.draft_id %>" style="color:#1d4ed8; text-decoration:none;">📦 商品登録ハブのカード</a><% } %>
+              <% if (p.draft_id) { %><a href="/apps/product-hub/detail/<%= p.draft_id %>" style="color:#1d4ed8; text-decoration:none;">📦 商品登録ハブのカード</a><% } %>
               <% if (p.jan) { %><span>JAN <%= p.jan %></span><% } %>
             </div>
           </td>
