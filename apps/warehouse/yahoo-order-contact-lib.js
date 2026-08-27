@@ -60,7 +60,9 @@ export async function fetchYahooOrderContact(orderId, opts = {}) {
   }
   if (!res.ok || !body?.ok || !body.contact) throw mkErr('proxy_error', `unexpected response ${res.status}`, true);
   const c = body.contact;
-  if (c.socialGiftType && c.socialGiftType !== '0') throw mkErr('social_gift', `SocialGiftType=${c.socialGiftType}`, false);
+  // 返ってきた注文IDが要求と一致しない = 取り違え (誤送信・PII 漏えいに直結) → 送らない (Codex Y-B R2 High)
+  if (c.orderId !== orderId) throw mkErr('order_id_mismatch', 'proxy returned a different order', false);
+  if (c.socialGiftType && c.socialGiftType !== '0') throw mkErr('social_gift', 'social gift order (not a mail target)', false);
   if (!c.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c.email)) throw mkErr('no_email', 'BillMailAddress が空/不正', false);
   return { email: c.email, orderStatus: c.orderStatus || '', shipStatus: c.shipStatus || '', shipDate: c.shipDate || '', socialGiftType: c.socialGiftType || '' };
 }

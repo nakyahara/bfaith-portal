@@ -19,8 +19,9 @@ check('502 public_key_auth_failed → retryable (設定不備、送信前)', awa
 check('503 → retryable', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(503, { error: 'x' }) }), 'x', true));
 check('403 → retryable (secret 不一致)', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(403, { error: 'Forbidden' }) }), 'http_403', true));
 check('Yahoo が注文なしを返す → order_not_found (非 retryable)', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(404, { ok: false, error: 'yahoo_error', code: 'od10001' }) }), 'order_not_found', false));
-check('ソーシャルギフト → 非 retryable (送らない)', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(200, { ok: true, contact: { email: 'u@example.jp', socialGiftType: '2' } }) }), 'social_gift', false));
-check('メール空 → 非 retryable', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(200, { ok: true, contact: { email: '', socialGiftType: '0' } }) }), 'no_email', false));
+check('ソーシャルギフト → 非 retryable (送らない)・値は文言に出さない', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(200, { ok: true, contact: { orderId: 'b-faith01-1', email: 'u@example.jp', socialGiftType: '2' } }) }), 'social_gift', false));
+check('メール空 → 非 retryable', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(200, { ok: true, contact: { orderId: 'b-faith01-1', email: '', socialGiftType: '0' } }) }), 'no_email', false));
+check('返却 orderId が要求と違う → order_id_mismatch (非 retryable、送らない)', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(200, { ok: true, contact: { orderId: 'b-faith01-2', email: 'u@example.jp', socialGiftType: '0' } }) }), 'order_id_mismatch', false));
 check('ネットワーク断 → retryable', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: async () => { throw new Error('ECONNRESET'); } }), 'network', true));
 let thrown;
 try { await fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(500, { error: 'boom', message: 'contact u@example.jp leaked?' }) }); } catch (e) { thrown = e; }

@@ -1082,6 +1082,13 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: parsed.error, code: parsed.code || null }));
         return;
       }
+      if (parsed.contact.orderId !== orderId) {
+        // 取り違え防止 (Codex Y-B R2 High): 要求した注文IDと違う注文の宛先は返さない
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: order_id_mismatch`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'order_id_mismatch' }));
+        return;
+      }
       console.log(`[${ts()}] Yahoo orderContact ${orderId}: ok ship=${parsed.contact.shipStatus} gift=${parsed.contact.socialGiftType} email=${parsed.contact.email ? 'present' : 'empty'}`);
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ ok: true, contact: parsed.contact }));
