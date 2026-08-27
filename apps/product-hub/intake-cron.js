@@ -15,6 +15,7 @@
  */
 import cron from 'node-cron';
 import { syncNewProducts } from './services/new-product-intake.js';
+import { attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import { recordPing } from '../jobs-monitor/store.js';
 
 // dead-man 監視 (jobs-registry: ph-ne-intake)。同一プロセスなので内部関数を直接呼ぶ。
@@ -51,6 +52,17 @@ export function startProductHubIntakeCron() {
       } else {
         console.log(`[product-hub] intake done: created=${r.created} merged=${r.merged}${r.capped ? ' (上限到達)' : ''}`);
         ping('ok', `created=${r.created} merged=${r.merged}`);
+        // 新カードの画像フォルダ「商品コード_商品名」を裏で作る (単品のみ・fail-soft。
+        // 失敗しても取込は成功のまま = draft_events の drive_folder_failed で追える)。
+        // あわせて過去に失敗したまま URL 空の分も回収する (一時障害・権限付与前の失敗の自然回復)
+        const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
+        void attemptImageFolderCreationBatch(ids, { actor: 'cron:ne-intake' })
+          .then((s) => {
+            if (ids.length > 0) console.log(`[product-hub] 画像フォルダ一括作成(cron): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`);
+            return retryFailedImageFolders({ actor: 'cron:ne-intake' });
+          })
+          .then((s) => { if (s.retried > 0) console.log(`[product-hub] 画像フォルダ再試行(cron): retried=${s.retried} created=${s.created} failed=${s.failed}`); })
+          .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(cron)に失敗:', e.message));
       }
     } catch (e) {
       console.error('[product-hub] intake failed:', e.message);
