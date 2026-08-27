@@ -89,6 +89,7 @@ import { isWarehouseDbReady } from './apps/warehouse/router.js';
 import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
+import shohyoLinksRouter from './apps/shohyo-links/router.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -797,6 +798,15 @@ const apps = [
     category: 'accounting',
   },
   {
+    id: 'shohyo-links',
+    name: '証憑リンク集',
+    description: 'MF仕訳用の支払い先マスタ。マイページURL・証憑保存先・引き落とし日を検索して即開く',
+    icon: '🧾',
+    path: '/apps/shohyo-links',
+    status: 'active',
+    category: 'accounting',
+  },
+  {
     id: 'inventory-monthly',
     name: '月末棚卸しツール',
     description: 'FBA在庫(発注推奨レポート)・自社倉庫CSV・発注後未着商品を集計し、税抜原価ベースの月末棚卸資産を算出・履歴保存',
@@ -1297,6 +1307,8 @@ app.use('/apps/ai-insights', requireAppAccess('ai-insights'), express.json({ lim
 app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossSellFinderRouter);
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
+// MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
+app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '256kb' }), shohyoLinksRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
