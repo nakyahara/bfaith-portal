@@ -143,9 +143,15 @@
         return;
       }
       const notionOk = json.notion && (json.notion.outcome === 'created' || json.notion.outcome === 'adopted_existing');
-      out.textContent = notionOk
-        ? '登録しました。Notionカードも作成済み。詳細画面へ移動します…'
-        : '登録しました (Notionカードは未作成 — 一覧のバナーから再作成できます)。詳細画面へ…';
+      // 画像フォルダの自動作成結果 (単品のみ)。失敗してもカードはできているので注意書きだけ
+      const fol = json.image_folder || {};
+      const folderMsg = fol.outcome === 'created' ? ' 画像フォルダも作成しました。'
+        : fol.outcome === 'reused' ? ' 画像フォルダは既存のものを紐付けました。'
+        : fol.outcome === 'failed' ? ' ⚠画像フォルダの自動作成に失敗しました (詳細画面で手動設定できます)。'
+        : '';
+      out.textContent = (notionOk
+        ? '登録しました。Notionカードも作成済み。'
+        : '登録しました。') + folderMsg + '詳細画面へ移動します…';
       setTimeout(() => { location.href = '/apps/product-hub/detail/' + json.id; }, 900);
     } catch (e) {
       out.textContent = '通信エラー: ' + e.message;

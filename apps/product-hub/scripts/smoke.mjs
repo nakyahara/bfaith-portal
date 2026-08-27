@@ -3324,6 +3324,79 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
   fimgs2.length === 2 && frk2.white_bg_drive_file_id === 'wb2' && frk2.genre_id === '123456',
   JSON.stringify({ fimgs2, frk2 }));
 
+// ─── drive-image-folder (画像フォルダ「商品コード_商品名」の自動作成、2026-08-27) ───
+{
+  const dif = await import('../services/drive-image-folder.js');
+  // フォルダ名: G: 同期される親フォルダなので Windows 禁止文字は全角へ寄せる
+  check('フォルダ名: 商品コード_商品名', dif.buildImageFolderName('sgs-or', 'メガネストラップ') === 'sgs-or_メガネストラップ');
+  check('フォルダ名: Windows禁止文字を全角へ', dif.buildImageFolderName('a/b', 'x:y*z?"<>|') === 'a／b_x：y＊z？”＜＞｜');
+  check('フォルダ名: 空白圧縮+末尾ドット除去', dif.buildImageFolderName(' c1 ', ' 商品  名 .. ') === 'c1_商品 名');
+  check('フォルダ名: 商品名が空ならコードのみ', dif.buildImageFolderName('code-1', '  ') === 'code-1');
+  check('フォルダ名: 100字で切る', dif.buildImageFolderName('X', 'あ'.repeat(200)).length <= 100);
+
+  check('単品判定: 通常ドラフトは対象', dif.isSingleProductDraft({ parent_draft_id: null, provisional_code: 0 }) === true);
+  check('単品判定: セット派生 (仮コード) は対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 1 }) === false);
+  check('単品判定: コード確定後のセットも対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 0 }) === false);
+
+  const setDifId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, parent_draft_id, provisional_code, created_by)
+    VALUES ('SET-DIF-01', 'セット派生', 999, 1, 'smoke')`).run().lastInsertRowid);
+  check('セット派生はフォルダを作らない', (await dif.attemptImageFolderCreation(setDifId, {})).outcome === 'skipped_set');
+  check('URL入力済みのカードは触らない', (await dif.attemptImageFolderCreation(fdraft.id, {})).outcome === 'skipped_has_url');
+
+  // SA 鍵なし → disabled (fail-soft。カード作成は成功のまま)
+  const difId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-1', 'フォルダ自動作成', 'smoke')`).run().lastInsertRowid);
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  check('SA鍵なしは disabled', (await dif.attemptImageFolderCreation(difId, {})).outcome === 'disabled');
+
+  // 成功パス (fake client 注入・API 非接続)
+  const fakeDrive = (listFiles, createdId) => ({
+    files: {
+      list: async () => ({ data: { files: listFiles } }),
+      create: async () => ({ data: { id: createdId } }),
+    },
+  });
+  const r1 = await dif.attemptImageFolderCreation(difId, { actor: 'smoke', driveClient: fakeDrive([], 'NEW-FOLDER-ID') });
+  check('新規作成で drive_folder_url が入る', r1.outcome === 'created' && r1.url.endsWith('NEW-FOLDER-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId).drive_folder_url.endsWith('NEW-FOLDER-ID'),
+    JSON.stringify(r1));
+  check('drive_folder_created イベント記録',
+    db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_created'`).get(difId).c === 1);
+  check('2回目は URL 済みで skip', (await dif.attemptImageFolderCreation(difId, { driveClient: fakeDrive([], 'X') })).outcome === 'skipped_has_url');
+
+  // 冪等: 親フォルダ直下に同名フォルダがあれば再利用 (二重作成しない)
+  const difId2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-2', '再利用', 'smoke')`).run().lastInsertRowid);
+  const r2 = await dif.attemptImageFolderCreation(difId2, { driveClient: fakeDrive([{ id: 'EXIST-ID', name: 'x' }], 'unused') });
+  check('同名フォルダは再利用', r2.outcome === 'reused' && r2.url.endsWith('EXIST-ID'), JSON.stringify(r2));
+
+  // レース: Drive 作成中に人が URL を貼ったら人の入力を正とする (上書きしない)
+  const difId3 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-3', 'レース', 'smoke')`).run().lastInsertRowid);
+  const racingDrive = {
+    files: {
+      list: async () => {
+        db.prepare(`UPDATE product_drafts SET drive_folder_url = 'https://drive.google.com/drive/folders/HUMAN2' WHERE id = ?`).run(difId3);
+        return { data: { files: [] } };
+      },
+      create: async () => ({ data: { id: 'AUTO-ID' } }),
+    },
+  };
+  const r3 = await dif.attemptImageFolderCreation(difId3, { driveClient: racingDrive });
+  check('作成中の手入力 URL を上書きしない', r3.outcome === 'kept_manual_url'
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId3).drive_folder_url.endsWith('HUMAN2'),
+    JSON.stringify(r3));
+
+  // Drive 失敗は fail-soft + イベント記録
+  const difId4 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-4', '失敗', 'smoke')`).run().lastInsertRowid);
+  const r4 = await dif.attemptImageFolderCreation(difId4, { driveClient: { files: { list: async () => { throw new Error('boom'); } } } });
+  check('Drive失敗は fail-soft + drive_folder_failed', r4.outcome === 'failed' && r4.error.includes('boom')
+    && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_failed'`).get(difId4).c === 1,
+    JSON.stringify(r4));
+
+  // バッチ: created / skipped (URL済み・不存在) を集計。例外は投げない
+  const s = await dif.attemptImageFolderCreationBatch([difId2, difId4, 999999], { driveClient: fakeDrive([], 'BATCH-ID') });
+  check('バッチ集計 (URL済み=skip / 前回失敗分=created / 不存在=skip)',
+    s.created === 1 && s.skipped === 2 && s.failed === 0, JSON.stringify(s));
+}
+
 // 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)
 const everSavedQuery = (id) => db.prepare(
   `SELECT COUNT(*) AS c FROM draft_events WHERE draft_id = ? AND event = 'shop_categories_saved'`

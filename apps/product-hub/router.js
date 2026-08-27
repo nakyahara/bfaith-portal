@@ -44,6 +44,7 @@ import { buildPromptTemplates } from './lib/prompt-templates.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch } from './services/drive-image-folder.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
@@ -390,12 +391,17 @@ router.post('/api/drafts', async (req, res) => {
   }
   const { id: draftId, effectiveCode, groupedFrom } = created;
 
+  // 画像フォルダの自動作成 (2026-08-27 中原さん指示): 単品のみ「商品コード_商品名」を
+  // Drive の画像置き場に作って drive_folder_url へ。失敗しても登録は成功 (fail-soft)
+  const imageFolder = await attemptImageFolderCreation(draftId, { actor: actorOf(req) });
+
   // §5: 登録と同時に Notion カード作成 (失敗しても登録は成功。バナー+リトライで回収)
   const notion = await attemptCardCreation(draftId, { actor: actorOf(req) });
   res.json({
     ok: true, id: draftId, notion,
     ne_code: effectiveCode,
     grouped: groupedFrom ? { from: groupedFrom, to: effectiveCode, memberCount: created.memberCount } : null,
+    image_folder: imageFolder,
   });
 });
 
@@ -1674,6 +1680,15 @@ router.post('/api/register-codes', (req, res) => {
     }[r.error] || r.error;
     return res.status(400).json({ ok: false, error: msg });
   }
+  // 画像フォルダの自動作成 (単品のみ・fail-soft)。件数が多いのでレスポンスは待たせず裏で直列実行
+  if (!r.dryRun) {
+    const ids = r.results.filter((x) => x.outcome === 'created' && x.draftId).map((x) => x.draftId);
+    if (ids.length > 0) {
+      void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
+        .then((s) => console.log(`[product-hub] 画像フォルダ一括作成: created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`))
+        .catch((e) => console.error('[product-hub] 画像フォルダ一括作成に失敗:', e.message));
+    }
+  }
   res.json(r);
 });
 
@@ -1692,6 +1707,15 @@ router.post('/api/intake/run', (req, res) => {
       ne_unique_not_enforced: '商品コードの重複 (大文字小文字違い) があるため停止しています',
     }[r.error] || r.error;
     return res.status(400).json({ ok: false, error: msg });
+  }
+  // 取込で作られた新カードにも画像フォルダを裏で作る (単品のみ・fail-soft)
+  if (r.mode === 'intake' && !r.dryRun) {
+    const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
+    if (ids.length > 0) {
+      void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
+        .then((s) => console.log(`[product-hub] 画像フォルダ一括作成(取込): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`))
+        .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(取込)に失敗:', e.message));
+    }
   }
   res.json(r);
 });
