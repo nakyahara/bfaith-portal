@@ -50,6 +50,8 @@ export async function fetchYahooOrderContact(orderId, opts = {}) {
   const safeCode = (v) => (typeof v === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(v) ? v : null);
   if (res.status === 429) throw mkErr('http_429', `rate limited (Retry-After=${/^\d{1,5}$/.test(res.headers.get('retry-after') || '') ? res.headers.get('retry-after') : '-'})`, true);
   if (res.status === 403) throw mkErr('http_403', 'proxy secret rejected', true);
+  // proxy が取り違えを検知した 502 は再試行しても直らない (Codex Y-B R3 High) → 非 retryable で終端
+  if (body?.error === 'order_id_mismatch') throw mkErr('order_id_mismatch', `http ${res.status}`, false);
   if (res.status >= 500) {
     const known = safeCode(body?.error);
     const code = known === 'public_key_auth_failed' ? 'public_key_auth_failed' : (known || 'http_5xx');
