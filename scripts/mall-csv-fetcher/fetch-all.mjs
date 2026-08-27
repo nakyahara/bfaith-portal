@@ -105,6 +105,11 @@ const DEFAULT_FETCHERS = [
     timeoutMs: 20 * 60 * 1000,
   },
   {
+    mall: 'yahoo-review', // 商品レビューチェックツール ZIP 90日全量 (P2-Y PR-Y-A、らくらくーぽん Yahoo版置換)。同期DL1本
+    script: join(__dirname, 'yahoo-review-download.mjs'),
+    timeoutMs: 15 * 60 * 1000,
+  },
+  {
     mall: 'aupay', // WOW!マネージャー分析CSV (mall-csv-fetcher P1-A)。非同期ジョブのポーリング最大15分に余裕
     script: join(__dirname, 'aupay-data-download.mjs'),
     timeoutMs: 30 * 60 * 1000,
