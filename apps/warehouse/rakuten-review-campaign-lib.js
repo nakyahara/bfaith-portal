@@ -44,6 +44,30 @@ export const COUPON_TEMPLATE_VERSION = 'coupon:v1:either'; // 付与条件=ど�
 
 const DAY_MS = 86400000;
 
+// ─── PR-Y-0: モール別テーブル (固定マップ。文字列連結で作らない — Codex 設計R1) ───
+// 楽天は既存名のまま。Yahoo は同形スキーマを別テーブルで持つ (1 DB 内)。
+export const MALL_TABLES = Object.freeze({
+  rakuten: Object.freeze({
+    actions: 'rakuten_campaign_actions', attempts: 'rakuten_campaign_delivery_attempts', grants: 'rakuten_coupon_grants',
+    ownership: 'rakuten_order_campaign_ownership', meta: 'rakuten_campaign_meta', vendor: 'rakuten_vendor_send_daily',
+    contacts: 'rakuten_order_contacts', suppressions: 'rakuten_contact_suppressions', reviews: 'fact_rakuten_reviews',
+    coupons: 'rakuten_campaign_coupons', idx: 'idx_rca',
+  }),
+  yahoo: Object.freeze({
+    actions: 'yahoo_campaign_actions', attempts: 'yahoo_campaign_delivery_attempts', grants: 'yahoo_coupon_grants',
+    ownership: 'yahoo_order_campaign_ownership', meta: 'yahoo_campaign_meta', vendor: 'yahoo_vendor_send_daily',
+    contacts: 'yahoo_order_contacts', suppressions: 'yahoo_contact_suppressions', reviews: 'fact_yahoo_reviews',
+    coupons: 'yahoo_campaign_coupons', idx: 'idx_yca',
+  }),
+});
+export function tablesFor(mall = 'rakuten') {
+  const t = MALL_TABLES[mall];
+  if (!t) throw new Error(`MALL_TABLES: unknown mall '${mall}' (rakuten / yahoo)`);
+  return t;
+}
+const RT = MALL_TABLES.rakuten;
+
+
 // ─── 時刻ヘルパ (JST壁時計→UTC ISO。feedback_jst_to_iso_string_trap: 文字列組立で月境界事故を防ぐ) ───
 /** ISO日時 (オフセット付き) → JST の暦日 'YYYY-MM-DD' */
 export function jstDateOf(iso) {
@@ -88,8 +112,8 @@ export function dedupeKeyFor(actionType, orderNumber) {
 }
 
 // ─── DDL ───
-export function ensureCampaignTables(db) {
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_actions (
+function ensureCampaignTablesT(T, db) {
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.actions} (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     action_type        TEXT NOT NULL CHECK (action_type IN ('follow','coupon')),
     dedupe_key         TEXT NOT NULL UNIQUE,
@@ -114,11 +138,11 @@ export function ensureCampaignTables(db) {
   // ⑥ownership owner='self' を再評価すること。
   // ready_at は「観測時刻」であり送信予定時刻ではない (planner は朝実行のため正午予定の action は
   // 翌朝 ready になる)。PR-C2 の日次突合は scheduled_at の JST 暦日で集計すること
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_status_sched ON rakuten_campaign_actions(status, scheduled_at)`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_order ON rakuten_campaign_actions(order_number)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ${T.idx}_status_sched ON ${T.actions}(status, scheduled_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ${T.idx}_order ON ${T.actions}(order_number)`);
   // 突合レポートの scheduled_at 単独範囲検索用 (Codex C2-R2 Medium: (status,scheduled_at) では
   // status 無指定の集計が全件走査になる)
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_rca_sched ON rakuten_campaign_actions(scheduled_at)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS ${T.idx}_sched ON ${T.actions}(scheduled_at)`);
 
   // 送信試行ログ (PR-C4 で書く)。UNIQUE(action_id) = action単位の at-most-once を
   // DB制約で強制する (Codex C1-R1 High: message_id UNIQUE だけでは同一actionに別message_idで
@@ -127,9 +151,9 @@ export function ensureCampaignTables(db) {
   // 予約契約 (Codex C1-R2 Medium): attempt 行は SMTP 呼び出しの「前」に claim と同一
   // トランザクションで outcome='ambiguous' として予約 commit し、送信後に accepted/rejected へ
   // 更新する。送信後 INSERT だと「SMTP受付成功→DB記録前にクラッシュ」の窓で再送できてしまう
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_delivery_attempts (
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.attempts} (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    action_id    INTEGER NOT NULL UNIQUE REFERENCES rakuten_campaign_actions(id),
+    action_id    INTEGER NOT NULL UNIQUE REFERENCES ${T.actions}(id),
     message_id   TEXT NOT NULL UNIQUE,
     attempted_at TEXT NOT NULL,
     outcome      TEXT NOT NULL CHECK (outcome IN ('accepted','rejected','ambiguous')),
@@ -138,9 +162,9 @@ export function ensureCampaignTables(db) {
   )`);
 
   // クーポン発行とメール送信の分離 (PR-C3/C4 で書く。メール失敗でもクーポンを再発行しない)
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_coupon_grants (
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.grants} (
     order_number TEXT PRIMARY KEY,
-    action_id    INTEGER REFERENCES rakuten_campaign_actions(id),
+    action_id    INTEGER REFERENCES ${T.actions}(id),
     coupon_code  TEXT,
     issue_status TEXT NOT NULL CHECK (issue_status IN ('pending','issued','failed')),
     issued_at    TEXT,
@@ -148,7 +172,7 @@ export function ensureCampaignTables(db) {
   )`);
 
   // 注文の担当者 (shadow中=vendor。cutover後の新規注文=self。PR-C4の送信ゲートが owner='self' を要求)
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_order_campaign_ownership (
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.ownership} (
     order_number TEXT PRIMARY KEY,
     owner        TEXT NOT NULL CHECK (owner IN ('vendor','self','none')),
     reason       TEXT,
@@ -157,20 +181,20 @@ export function ensureCampaignTables(db) {
   // PR-C5: クーポンの担当者はフォローと別に持つ (らくらくーぽんのクーポンメールは 2026年7月末から
   // 故障しており、フォローより早い境目で自作が引き取る)。NULL = owner (フォロー) と同じ扱い。
   // 既存DBへは ALTER で後付け (CREATE IF NOT EXISTS は既存テーブルに列を足さない)
-  const ownCols = db.prepare(`PRAGMA table_info(rakuten_order_campaign_ownership)`).all().map((c) => c.name);
+  const ownCols = db.prepare(`PRAGMA table_info(${T.ownership})`).all().map((c) => c.name);
   if (!ownCols.includes('coupon_owner')) {
-    db.exec(`ALTER TABLE rakuten_order_campaign_ownership
+    db.exec(`ALTER TABLE ${T.ownership}
                ADD COLUMN coupon_owner TEXT CHECK (coupon_owner IN ('vendor','self','none'))`);
   }
 
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_campaign_meta (
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.meta} (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`);
 
   // vendor (らくらくーぽん) の日次送信実績 (PR-C2)。管理画面「メール配信履歴」の日次件数を
   // 中原さんが手で転記する (宛先単位のエクスポートは vendor 画面に存在しない)。件数のみ=PIIなし
-  db.exec(`CREATE TABLE IF NOT EXISTS rakuten_vendor_send_daily (
+  db.exec(`CREATE TABLE IF NOT EXISTS ${T.vendor} (
     date_jst    TEXT NOT NULL CHECK (date_jst GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
     action_type TEXT NOT NULL CHECK (action_type IN ('follow','coupon')),
     sent_count  INTEGER NOT NULL CHECK (sent_count >= 0),
@@ -185,7 +209,7 @@ export function ensureCampaignTables(db) {
  * @param {object} opts { nowIso: テスト用時刻注入, couponEpochOverride: テスト用epoch }
  * @returns 件数サマリ (PII なし)
  */
-export function planCampaigns(db, opts = {}) {
+function planCampaignsT(T, db, opts = {}) {
   const now = opts.nowIso || new Date().toISOString();
   const counts = {
     followInserted: 0, couponInserted: 0,
@@ -194,7 +218,7 @@ export function planCampaigns(db, opts = {}) {
   };
 
   const insertStmt = db.prepare(`
-    INSERT OR IGNORE INTO rakuten_campaign_actions (
+    INSERT OR IGNORE INTO ${T.actions} (
       action_type, dedupe_key, order_number, trigger_review_url,
       status, status_reason, template_version, scheduled_at, expires_at,
       ready_at, created_at, updated_at
@@ -205,27 +229,27 @@ export function planCampaigns(db, opts = {}) {
     )
   `);
   const setStatusStmt = db.prepare(`
-    UPDATE rakuten_campaign_actions
+    UPDATE ${T.actions}
        SET status = @status, status_reason = @reason, ready_at = @ready_at, updated_at = @now
      WHERE id = @id AND status = 'planned'
   `);
 
   const tx = db.transaction(() => {
     // ── 0. クーポン epoch (初回実行時刻。これ以前の first_seen レビューには action を作らない) ──
-    let epoch = db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'coupon_epoch'`).get()?.value;
+    let epoch = db.prepare(`SELECT value FROM ${T.meta} WHERE key = 'coupon_epoch'`).get()?.value;
     if (!epoch) {
       epoch = opts.couponEpochOverride || now;
-      db.prepare(`INSERT INTO rakuten_campaign_meta (key, value) VALUES ('coupon_epoch', ?)`).run(epoch);
+      db.prepare(`INSERT INTO ${T.meta} (key, value) VALUES ('coupon_epoch', ?)`).run(epoch);
     }
 
     // ── 1. 新規フォロー action (発送済み contacts で action 未作成のもの) ──
     // 発送前 (shipping_datetime NULL) はスキップ = 後日の実行で発送済みになってから作る
     const newFollows = db.prepare(`
       SELECT c.order_number, c.shipping_datetime, c.masked_email_enc, c.masked_email_hash,
-             EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = c.order_number) AS has_review,
-             EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
-        FROM rakuten_order_contacts c
-        LEFT JOIN rakuten_campaign_actions a
+             EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = c.order_number) AS has_review,
+             EXISTS(SELECT 1 FROM ${T.suppressions} s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
+        FROM ${T.contacts} c
+        LEFT JOIN ${T.actions} a
                ON a.order_number = c.order_number AND a.action_type = 'follow'
        WHERE a.id IS NULL AND c.shipping_datetime IS NOT NULL
     `).all();
@@ -255,23 +279,23 @@ export function planCampaigns(db, opts = {}) {
     // のため ready_at も消す)
     const followRows = db.prepare(`
       SELECT a.id, a.status, a.scheduled_at, a.expires_at, c.shipping_datetime
-        FROM rakuten_campaign_actions a
-        JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+        FROM ${T.actions} a
+        JOIN ${T.contacts} c ON c.order_number = a.order_number
        WHERE a.action_type = 'follow' AND a.status IN ('planned','ready')
          AND c.shipping_datetime IS NOT NULL
     `).all();
     const reschedStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions SET scheduled_at = ?, expires_at = ?, updated_at = ?
+      UPDATE ${T.actions} SET scheduled_at = ?, expires_at = ?, updated_at = ?
        WHERE id = ? AND status = ?
     `);
     const demoteStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions
+      UPDATE ${T.actions}
          SET scheduled_at = ?, expires_at = ?, status = 'planned', status_reason = 'rescheduled',
              ready_at = NULL, updated_at = ?
        WHERE id = ? AND status = 'ready'
     `);
     const readyExpireOnlyStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions SET expires_at = ?, updated_at = ?
+      UPDATE ${T.actions} SET expires_at = ?, updated_at = ?
        WHERE id = ? AND status = 'ready'
     `);
     for (const a of followRows) {
@@ -300,12 +324,12 @@ export function planCampaigns(db, opts = {}) {
     // 「日次12時台」意味論とずれる。vendor なら次のバッチ=翌12時台に送る)
     const plannedCoupons = db.prepare(`
       SELECT a.id, a.scheduled_at, a.expires_at, c.shipping_datetime
-        FROM rakuten_campaign_actions a
-        JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+        FROM ${T.actions} a
+        JOIN ${T.contacts} c ON c.order_number = a.order_number
        WHERE a.action_type = 'coupon' AND a.status = 'planned' AND c.shipping_datetime IS NOT NULL
     `).all();
     const reExpireStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions SET expires_at = ?, scheduled_at = ?, updated_at = ?
+      UPDATE ${T.actions} SET expires_at = ?, scheduled_at = ?, updated_at = ?
        WHERE id = ? AND status = 'planned'
     `);
     for (const a of plannedCoupons) {
@@ -321,20 +345,20 @@ export function planCampaigns(db, opts = {}) {
     const newCoupons = db.prepare(`
       SELECT r.order_number,
              MIN(r.posted_at) AS first_posted,
-             (SELECT r2.review_url FROM fact_rakuten_reviews r2
+             (SELECT r2.review_url FROM ${T.reviews} r2
                WHERE r2.order_number = r.order_number AND r2.is_deleted = 0
                ORDER BY r2.posted_at, r2.review_url LIMIT 1) AS trigger_url,
              c.order_number IS NOT NULL AS has_contact,
              c.shipping_datetime, c.masked_email_enc, c.masked_email_hash,
-             EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
-        FROM fact_rakuten_reviews r
-        LEFT JOIN rakuten_order_contacts c ON c.order_number = r.order_number
-        LEFT JOIN rakuten_campaign_actions a
+             EXISTS(SELECT 1 FROM ${T.suppressions} s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
+        FROM ${T.reviews} r
+        LEFT JOIN ${T.contacts} c ON c.order_number = r.order_number
+        LEFT JOIN ${T.actions} a
                ON a.order_number = r.order_number AND a.action_type = 'coupon'
        WHERE r.order_number IS NOT NULL AND r.order_number != ''
          AND r.is_deleted = 0 AND r.first_seen_at >= ? AND a.id IS NULL
          AND NOT EXISTS (
-           SELECT 1 FROM fact_rakuten_reviews old
+           SELECT 1 FROM ${T.reviews} old
             WHERE old.order_number = r.order_number AND old.first_seen_at < ?
          )
        GROUP BY r.order_number
@@ -373,13 +397,13 @@ export function planCampaigns(db, opts = {}) {
     // 未claimの ready も対象 (Codex C1-R3 High: 取込遅延でレビューなしとして ready になった後に
     // レビューが到着するケース)。ready_at は突合記録として保持する
     const preSendStmt = db.prepare(`
-      UPDATE rakuten_campaign_actions SET status = @status, status_reason = @reason, updated_at = @now
+      UPDATE ${T.actions} SET status = @status, status_reason = @reason, updated_at = @now
        WHERE id = @id AND status IN ('planned','ready')
     `);
     const followSuppress = db.prepare(`
-      SELECT a.id FROM rakuten_campaign_actions a
+      SELECT a.id FROM ${T.actions} a
        WHERE a.action_type = 'follow' AND a.status IN ('planned','ready')
-         AND EXISTS(SELECT 1 FROM fact_rakuten_reviews r WHERE r.order_number = a.order_number)
+         AND EXISTS(SELECT 1 FROM ${T.reviews} r WHERE r.order_number = a.order_number)
     `).all();
     for (const a of followSuppress) {
       preSendStmt.run({ id: a.id, status: 'suppressed', reason: 'review_exists', now });
@@ -388,9 +412,9 @@ export function planCampaigns(db, opts = {}) {
 
     // ── 4b. クーポン: 引き金レビューが全削除されたら取消 (送信前=planned/ready のみ。sent後は関知しない) ──
     const couponCancel = db.prepare(`
-      SELECT a.id FROM rakuten_campaign_actions a
+      SELECT a.id FROM ${T.actions} a
        WHERE a.action_type = 'coupon' AND a.status IN ('planned','ready')
-         AND NOT EXISTS(SELECT 1 FROM fact_rakuten_reviews r
+         AND NOT EXISTS(SELECT 1 FROM ${T.reviews} r
                          WHERE r.order_number = a.order_number AND r.is_deleted = 0)
     `).all();
     for (const a of couponCancel) {
@@ -400,7 +424,7 @@ export function planCampaigns(db, opts = {}) {
 
     // ── 4c. planned で期限超過 → expired ──
     const expiredRows = db.prepare(`
-      SELECT id FROM rakuten_campaign_actions WHERE status = 'planned' AND expires_at <= ?
+      SELECT id FROM ${T.actions} WHERE status = 'planned' AND expires_at <= ?
     `).all(now);
     for (const a of expiredRows) {
       setStatusStmt.run({ id: a.id, status: 'expired', reason: 'expired', ready_at: null, now });
@@ -410,7 +434,7 @@ export function planCampaigns(db, opts = {}) {
     // ── 4c'. ready のまま期限超過 → expired (ready_at は突合の記録として保持) ──
     // Codex C1-R1 Medium: ready を終端にしない。PR-C4 の送信キューに期限切れが残らないようにする
     const readyExpired = db.prepare(`
-      UPDATE rakuten_campaign_actions
+      UPDATE ${T.actions}
          SET status = 'expired', status_reason = 'expired_after_ready', updated_at = ?
        WHERE status = 'ready' AND expires_at <= ?
     `).run(now, now);
@@ -423,9 +447,9 @@ export function planCampaigns(db, opts = {}) {
       SELECT a.id, a.action_type, a.status_reason,
              c.order_number IS NOT NULL AS has_contact,
              c.shipping_datetime, c.masked_email_enc, c.masked_email_hash, c.purged_at,
-             EXISTS(SELECT 1 FROM rakuten_contact_suppressions s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
-        FROM rakuten_campaign_actions a
-        LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+             EXISTS(SELECT 1 FROM ${T.suppressions} s WHERE s.email_hash = c.masked_email_hash) AS is_suppressed
+        FROM ${T.actions} a
+        LEFT JOIN ${T.contacts} c ON c.order_number = a.order_number
        WHERE a.status = 'planned' AND a.scheduled_at <= ?
     `).all(now);
     for (const a of dueRows) {
@@ -461,15 +485,15 @@ export function planCampaigns(db, opts = {}) {
     // INSERT OR IGNORE のため一度決めた owner は覆らない (境界注文は vendor のまま =
     // 重複より取りこぼしを選ぶ)。PR-C4 の送信ゲートは「ownership 行が無い or owner != 'self'
     // = 送らない (fail-closed)」とすること。cutover_at は PR-C5 の cutover 手順だけが設定する
-    const { cutoverAt, couponCutoverAt } = getCutover(db);
+    const { cutoverAt, couponCutoverAt } = getCutoverT(T, db);
     if (!cutoverAt && !couponCutoverAt) {
       const r1 = db.prepare(`
-        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-        SELECT c.order_number, 'vendor', 'shadow', ? FROM rakuten_order_contacts c
+        INSERT OR IGNORE INTO ${T.ownership} (order_number, owner, reason, decided_at)
+        SELECT c.order_number, 'vendor', 'shadow', ? FROM ${T.contacts} c
       `).run(now);
       const r2 = db.prepare(`
-        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, reason, decided_at)
-        SELECT DISTINCT a.order_number, 'vendor', 'shadow', ? FROM rakuten_campaign_actions a
+        INSERT OR IGNORE INTO ${T.ownership} (order_number, owner, reason, decided_at)
+        SELECT DISTINCT a.order_number, 'vendor', 'shadow', ? FROM ${T.actions} a
       `).run(now);
       counts.ownershipInserted = r1.changes + r2.changes;
     } else {
@@ -484,11 +508,11 @@ export function planCampaigns(db, opts = {}) {
       const reasonShip = couponOnly ? 'coupon_cutover' : 'cutover_shipping';
       const reasonOrphan = couponOnly ? 'coupon_cutover_no_contact' : 'cutover_no_contact';
       const ownStmt = db.prepare(`
-        INSERT OR IGNORE INTO rakuten_order_campaign_ownership (order_number, owner, coupon_owner, reason, decided_at)
+        INSERT OR IGNORE INTO ${T.ownership} (order_number, owner, coupon_owner, reason, decided_at)
         VALUES (?, ?, ?, ?, ?)
       `);
       const shipped = db.prepare(`
-        SELECT order_number, shipping_datetime FROM rakuten_order_contacts WHERE shipping_datetime IS NOT NULL
+        SELECT order_number, shipping_datetime FROM ${T.contacts} WHERE shipping_datetime IS NOT NULL
       `).all();
       for (const c of shipped) {
         const t = Date.parse(c.shipping_datetime);
@@ -498,8 +522,8 @@ export function planCampaigns(db, opts = {}) {
       }
       // action があるのに contacts が無い注文 (no_contact 経路の古い注文) は安全側で vendor
       const orphans = db.prepare(`
-        SELECT DISTINCT a.order_number FROM rakuten_campaign_actions a
-          LEFT JOIN rakuten_order_contacts c ON c.order_number = a.order_number
+        SELECT DISTINCT a.order_number FROM ${T.actions} a
+          LEFT JOIN ${T.contacts} c ON c.order_number = a.order_number
          WHERE c.order_number IS NULL
       `).all();
       for (const o of orphans) {
@@ -513,8 +537,8 @@ export function planCampaigns(db, opts = {}) {
 
 // ─── PR-C5: cutover (shadow → LIVE を一度だけ) ───
 /** meta の cutover 時刻。coupon_cutover_at 未設定時はフォローと同じ境目 */
-export function getCutover(db) {
-  const get = (k) => db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = ?`).get(k)?.value || null;
+function getCutoverT(T, db) {
+  const get = (k) => db.prepare(`SELECT value FROM ${T.meta} WHERE key = ?`).get(k)?.value || null;
   const cutoverAt = get('cutover_at');
   const couponCutoverAt = get('coupon_cutover_at') || cutoverAt; // 段階1では coupon だけ、段階2以降は両方
   return { cutoverAt, couponCutoverAt, stage: cutoverAt ? 'live' : (couponCutoverAt ? 'coupon_only' : 'shadow') };
@@ -548,10 +572,10 @@ export function parseCutoverArg(s) {
  * cutover の影響を数える (読み取りのみ)。dry-run 表示と live 前の確認に共用。
  * 「self になる注文」= contacts で最終発送が境目より後。件数のみ (PII なし)
  */
-export function cutoverPreview(db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
+function cutoverPreviewT(T, db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
   const cutT = Date.parse(cutoverAt), cpnT = Date.parse(couponCutoverAt);
-  const shadowRows = db.prepare(`SELECT COUNT(*) n FROM rakuten_order_campaign_ownership WHERE reason IN ${PRE_LIVE_REASONS}`).get().n;
-  const shipped = db.prepare(`SELECT order_number, shipping_datetime FROM rakuten_order_contacts WHERE shipping_datetime IS NOT NULL`).all();
+  const shadowRows = db.prepare(`SELECT COUNT(*) n FROM ${T.ownership} WHERE reason IN ${PRE_LIVE_REASONS}`).get().n;
+  const shipped = db.prepare(`SELECT order_number, shipping_datetime FROM ${T.contacts} WHERE shipping_datetime IS NOT NULL`).all();
   let followSelf = 0, couponSelf = 0, vendorBoth = 0;
   const followSelfSet = new Set(), couponSelfSet = new Set();
   for (const c of shipped) {
@@ -564,7 +588,7 @@ export function cutoverPreview(db, { cutoverAt, couponCutoverAt, nowIso = new Da
   }
   // 今すぐ (cutover 直後の次の送信) 対象になり得る action: ready/planned・期限内・self 側
   const live = db.prepare(`
-    SELECT action_type, order_number, status FROM rakuten_campaign_actions
+    SELECT action_type, order_number, status FROM ${T.actions}
      WHERE status IN ('ready','planned') AND expires_at > ?
   `).all(nowIso);
   let followReady = 0, followPlanned = 0, couponReady = 0, couponPlanned = 0;
@@ -597,26 +621,26 @@ function assertCutoverRange(label, iso, nowIso) {
  * フォローの境目 (解約日) を待たずに引き取る)。フォローは全件 vendor のまま。
  * 単一 tx: coupon_cutover_at 記録 → shadow 行削除 → planCampaigns が段階1ルールで再判定
  */
-export function applyCouponCutover(db, { couponCutoverAt, nowIso = new Date().toISOString() }) {
+function applyCouponCutoverT(T, db, { couponCutoverAt, nowIso = new Date().toISOString() }) {
   const tx = db.transaction(() => {
-    const cur = getCutover(db);
+    const cur = getCutoverT(T, db);
     if (cur.cutoverAt) throw new Error(`CUTOVER: 既に LIVE (cutover_at=${cur.cutoverAt})。クーポン先行の段階は終わっている`);
-    if (cur.couponCutoverAt) throw new Error(`CUTOVER: 既に coupon_cutover_at=${cur.couponCutoverAt} が設定済み。やり直しは rakuten_campaign_meta を手で直してから`);
+    if (cur.couponCutoverAt) throw new Error(`CUTOVER: 既に coupon_cutover_at=${cur.couponCutoverAt} が設定済み。やり直しは ${T.meta} を手で直してから`);
     assertCutoverRange('coupon_cutover_at', couponCutoverAt, nowIso);
-    const ins = db.prepare(`INSERT INTO rakuten_campaign_meta (key, value) VALUES (?, ?)`);
+    const ins = db.prepare(`INSERT INTO ${T.meta} (key, value) VALUES (?, ?)`);
     ins.run('coupon_cutover_at', couponCutoverAt);
     ins.run('coupon_cutover_applied_at', nowIso);
-    const del = db.prepare(`DELETE FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).run();
-    const counts = planCampaigns(db, { nowIso });
+    const del = db.prepare(`DELETE FROM ${T.ownership} WHERE reason = 'shadow'`).run();
+    const counts = planCampaignsT(T, db, { nowIso });
     return { shadowDeleted: del.changes, ...counts };
   });
   return tx.immediate();
 }
 
-export function applyCutover(db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
+function applyCutoverT(T, db, { cutoverAt, couponCutoverAt, nowIso = new Date().toISOString() }) {
   const tx = db.transaction(() => {
-    const cur = getCutover(db);
-    if (cur.cutoverAt) throw new Error(`CUTOVER: 既に cutover_at=${cur.cutoverAt} が設定済み。やり直しは rakuten_campaign_meta を手で直してから`);
+    const cur = getCutoverT(T, db);
+    if (cur.cutoverAt) throw new Error(`CUTOVER: 既に cutover_at=${cur.cutoverAt} が設定済み。やり直しは ${T.meta} を手で直してから`);
     // 段階1 (クーポン先行) 済みなら coupon の境目はそのまま引き継ぐ (違う値の指定は拒否)
     if (cur.couponCutoverAt) {
       if (couponCutoverAt && couponCutoverAt !== cur.couponCutoverAt) {
@@ -631,29 +655,29 @@ export function applyCutover(db, { cutoverAt, couponCutoverAt, nowIso = new Date
     assertCutoverRange('cutover_at', cutoverAt, nowIso);
     if (!cur.couponCutoverAt) assertCutoverRange('coupon_cutover_at', couponCutoverAt, nowIso);
     if (Date.parse(couponCutoverAt) > Date.parse(cutoverAt)) throw new Error('CUTOVER: coupon_cutover_at はフォローの境目以前であること (クーポンは早く引き取る側)');
-    const ins = db.prepare(`INSERT OR REPLACE INTO rakuten_campaign_meta (key, value) VALUES (?, ?)`);
+    const ins = db.prepare(`INSERT OR REPLACE INTO ${T.meta} (key, value) VALUES (?, ?)`);
     ins.run('cutover_at', cutoverAt);
     ins.run('coupon_cutover_at', couponCutoverAt);
     ins.run('cutover_applied_at', nowIso);
     // shadow 行は消して LIVE ルールで再判定。段階1の行は消さず coupon_owner を保持したまま
     // owner (フォロー担当) と reason だけ更新する (Codex C5b-R1 Medium: 削除→再作成だと段階1以降に
     // 最終発送日が動いた注文の coupon_owner が覆り「一度決めた担当は覆らない」に反する)
-    const del = db.prepare(`DELETE FROM rakuten_order_campaign_ownership WHERE reason = 'shadow'`).run();
+    const del = db.prepare(`DELETE FROM ${T.ownership} WHERE reason = 'shadow'`).run();
     const cutT = Date.parse(cutoverAt);
     const stage1 = db.prepare(`
-      SELECT o.order_number, c.shipping_datetime FROM rakuten_order_campaign_ownership o
-        LEFT JOIN rakuten_order_contacts c ON c.order_number = o.order_number
+      SELECT o.order_number, c.shipping_datetime FROM ${T.ownership} o
+        LEFT JOIN ${T.contacts} c ON c.order_number = o.order_number
        WHERE o.reason = 'coupon_cutover'
     `).all();
-    const upd = db.prepare(`UPDATE rakuten_order_campaign_ownership SET owner = ?, reason = 'cutover_shipping', decided_at = ? WHERE order_number = ? AND reason = 'coupon_cutover'`);
+    const upd = db.prepare(`UPDATE ${T.ownership} SET owner = ?, reason = 'cutover_shipping', decided_at = ? WHERE order_number = ? AND reason = 'coupon_cutover'`);
     let stage1Migrated = 0;
     for (const o of stage1) {
       const t = Date.parse(o.shipping_datetime);
       // 発送日時が消えている/壊れている行は判定不能 → vendor (fail-closed)
       stage1Migrated += upd.run(Number.isFinite(t) && t > cutT ? 'self' : 'vendor', nowIso, o.order_number).changes;
     }
-    stage1Migrated += db.prepare(`UPDATE rakuten_order_campaign_ownership SET reason = 'cutover_no_contact', decided_at = ? WHERE reason = 'coupon_cutover_no_contact'`).run(nowIso).changes;
-    const counts = planCampaigns(db, { nowIso });
+    stage1Migrated += db.prepare(`UPDATE ${T.ownership} SET reason = 'cutover_no_contact', decided_at = ? WHERE reason = 'coupon_cutover_no_contact'`).run(nowIso).changes;
+    const counts = planCampaignsT(T, db, { nowIso });
     return { shadowDeleted: del.changes, stage1Migrated, ...counts };
   });
   return tx.immediate();
@@ -667,13 +691,13 @@ export function isValidJstDate(s) {
 }
 
 /** vendor 日次送信件数の記録 (UPSERT。訂正転記を許す。recorded_at=最終転記時刻の仕様) */
-export function recordVendorDaily(db, { dateJst, actionType, count, source = 'manual', nowIso = new Date().toISOString() }) {
+function recordVendorDailyT(T, db, { dateJst, actionType, count, source = 'manual', nowIso = new Date().toISOString() }) {
   if (!isValidJstDate(dateJst)) throw new Error(`VENDOR_RECORD: 日付が不正 (${dateJst})`);
   if (!['follow', 'coupon'].includes(actionType)) throw new Error(`VENDOR_RECORD: action_type が不正 (${actionType})`);
   const n = Number(count);
   if (!Number.isInteger(n) || n < 0) throw new Error(`VENDOR_RECORD: 件数が不正 (${count})`);
   db.prepare(`
-    INSERT INTO rakuten_vendor_send_daily (date_jst, action_type, sent_count, source, recorded_at)
+    INSERT INTO ${T.vendor} (date_jst, action_type, sent_count, source, recorded_at)
     VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(date_jst, action_type) DO UPDATE SET
       sent_count = excluded.sent_count, source = excluded.source, recorded_at = excluded.recorded_at
@@ -682,9 +706,9 @@ export function recordVendorDaily(db, { dateJst, actionType, count, source = 'ma
 
 /** 複数エントリの原子的転記 (CLI 用 — Codex C2-R1 High: follow だけ保存されて coupon が
  *  失敗する部分更新を防ぐ。1件でも不正なら全体をロールバック) */
-export function recordVendorDailyBatch(db, entries, nowIso = new Date().toISOString()) {
+function recordVendorDailyBatchT(T, db, entries, nowIso = new Date().toISOString()) {
   const tx = db.transaction(() => {
-    for (const e of entries) recordVendorDaily(db, { ...e, nowIso });
+    for (const e of entries) recordVendorDailyT(T, db, { ...e, nowIso });
   });
   tx();
 }
@@ -701,7 +725,7 @@ export function recordVendorDailyBatch(db, entries, nowIso = new Date().toISOStr
  */
 export const REPORT_MAX_DAYS = 92;
 
-export function shadowComparisonReport(db, { fromJst, toJst }) {
+function shadowComparisonReportT(T, db, { fromJst, toJst }) {
   if (!isValidJstDate(fromJst) || !isValidJstDate(toJst) || fromJst > toJst) {
     throw new Error(`REPORT: 期間が不正 (${fromJst}..${toJst})`);
   }
@@ -724,7 +748,7 @@ export function shadowComparisonReport(db, { fromJst, toJst }) {
   const fromUtc = new Date(fromMs).toISOString();
   const toUtcEx = new Date(toMsEx).toISOString();
   const shadowRows = db.prepare(`
-    SELECT action_type, scheduled_at FROM rakuten_campaign_actions
+    SELECT action_type, scheduled_at FROM ${T.actions}
      WHERE ready_at IS NOT NULL AND scheduled_at >= ? AND scheduled_at < ?
   `).all(fromUtc, toUtcEx);
   for (const r of shadowRows) {
@@ -732,7 +756,7 @@ export function shadowComparisonReport(db, { fromJst, toJst }) {
     if (days.has(d)) days.get(d)[r.action_type].shadow++;
   }
   const vendorRows = db.prepare(`
-    SELECT date_jst, action_type, sent_count FROM rakuten_vendor_send_daily
+    SELECT date_jst, action_type, sent_count FROM ${T.vendor}
      WHERE date_jst >= ? AND date_jst <= ?
   `).all(fromJst, toJst);
   for (const r of vendorRows) {
@@ -742,7 +766,7 @@ export function shadowComparisonReport(db, { fromJst, toJst }) {
   // 差分の説明材料: 期間内に予定があったのに would-send にならなかった action の状態×理由の内訳
   const nonReady = db.prepare(`
     SELECT action_type, status, COALESCE(status_reason, '') AS reason, COUNT(*) AS n
-      FROM rakuten_campaign_actions
+      FROM ${T.actions}
      WHERE ready_at IS NULL AND scheduled_at >= ? AND scheduled_at < ?
      GROUP BY action_type, status, reason
   `).all(fromUtc, toUtcEx);
@@ -763,25 +787,55 @@ export function shadowComparisonReport(db, { fromJst, toJst }) {
 }
 
 /** 状態サマリ (CLI stats 用。PII なし) */
-export function campaignStats(db, nowIso = new Date().toISOString()) {
+function campaignStatsT(T, db, nowIso = new Date().toISOString()) {
   const byStatus = db.prepare(`
     SELECT action_type, status, COALESCE(status_reason, '') AS reason, COUNT(*) AS n
-      FROM rakuten_campaign_actions
+      FROM ${T.actions}
      GROUP BY action_type, status, reason
      ORDER BY action_type, status, reason
   `).all();
   // overdue (予定超過で待機=awaiting_* が大半) と今後24時間を分けて数える (Codex C1-R3 Low)
   const dueOverdue = db.prepare(`
-    SELECT COUNT(*) AS n FROM rakuten_campaign_actions
+    SELECT COUNT(*) AS n FROM ${T.actions}
      WHERE status = 'planned' AND scheduled_at <= ?
   `).get(nowIso).n;
   const dueNext24h = db.prepare(`
-    SELECT COUNT(*) AS n FROM rakuten_campaign_actions
+    SELECT COUNT(*) AS n FROM ${T.actions}
      WHERE status = 'planned' AND scheduled_at > ? AND scheduled_at <= ?
   `).get(nowIso, new Date(Date.parse(nowIso) + DAY_MS).toISOString()).n;
   const readyTodayJst = db.prepare(`
-    SELECT COUNT(*) AS n FROM rakuten_campaign_actions WHERE status = 'ready' AND ready_at >= ?
+    SELECT COUNT(*) AS n FROM ${T.actions} WHERE status = 'ready' AND ready_at >= ?
   `).get(new Date(Date.parse(`${jstDateOf(nowIso)}T00:00:00+09:00`)).toISOString()).n;
-  const epoch = db.prepare(`SELECT value FROM rakuten_campaign_meta WHERE key = 'coupon_epoch'`).get()?.value || null;
+  const epoch = db.prepare(`SELECT value FROM ${T.meta} WHERE key = 'coupon_epoch'`).get()?.value || null;
   return { byStatus, dueOverdue, dueNext24h, readyTodayJst, epoch };
+}
+
+// ─── 互換エクスポート (楽天束縛。既存の呼び出し側・テストは無変更) ───
+export const ensureCampaignTables = (db) => ensureCampaignTablesT(RT, db);
+export const planCampaigns = (db, opts = {}) => planCampaignsT(RT, db, opts);
+export const getCutover = (db) => getCutoverT(RT, db);
+export const cutoverPreview = (db, a) => cutoverPreviewT(RT, db, a);
+export const applyCouponCutover = (db, a) => applyCouponCutoverT(RT, db, a);
+export const applyCutover = (db, a) => applyCutoverT(RT, db, a);
+export const recordVendorDaily = (db, a) => recordVendorDailyT(RT, db, a);
+export const recordVendorDailyBatch = (db, entries, nowIso = new Date().toISOString()) => recordVendorDailyBatchT(RT, db, entries, nowIso);
+export const shadowComparisonReport = (db, a) => shadowComparisonReportT(RT, db, a);
+export const campaignStats = (db, nowIso = new Date().toISOString()) => campaignStatsT(RT, db, nowIso);
+
+/** モール別エンジン (PR-Y-0)。`createCampaignEngine('yahoo')` で Yahoo テーブル束縛の同一ロジックを得る */
+export function createCampaignEngine(mall = 'rakuten') {
+  const T = tablesFor(mall);
+  return {
+    mall, tables: T,
+    ensureCampaignTables: (db) => ensureCampaignTablesT(T, db),
+    planCampaigns: (db, opts = {}) => planCampaignsT(T, db, opts),
+    getCutover: (db) => getCutoverT(T, db),
+    cutoverPreview: (db, a) => cutoverPreviewT(T, db, a),
+    applyCouponCutover: (db, a) => applyCouponCutoverT(T, db, a),
+    applyCutover: (db, a) => applyCutoverT(T, db, a),
+    recordVendorDaily: (db, a) => recordVendorDailyT(T, db, a),
+    recordVendorDailyBatch: (db, entries, nowIso = new Date().toISOString()) => recordVendorDailyBatchT(T, db, entries, nowIso),
+    shadowComparisonReport: (db, a) => shadowComparisonReportT(T, db, a),
+    campaignStats: (db, nowIso = new Date().toISOString()) => campaignStatsT(T, db, nowIso),
+  };
 }

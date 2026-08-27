@@ -154,6 +154,11 @@ try {
             + (result.failedSafe > 0 ? ` / 明確な失敗 ${result.failedSafe}件 (delivery_attempts を確認)` : '')
             + (result.limitHit ? ` / ⚠️上限 ${limit} 件に到達 (残りは翌日の正午)` : ''));
         }
+        if (result.releaseConflict > 0) {
+          await notifyOperator(`⚠️ 楽天レビューメール: 宛先解決の再試行で claim を解放できない action が ${result.releaseConflict}件 (別プロセスの介入か状態不明)。送信を中断しました。delivery_attempts を確認してください`);
+          console.error(`[send] ⚠️release_conflict ${result.releaseConflict}件で中断。delivery_attempts を確認してください`);
+          process.exitCode = 1;
+        }
         if (result.finalizeConflict > 0) {
           console.error(`[send] ⚠️確定競合 ${result.finalizeConflict}件 (送信後に claim を失った=別プロセスの介入痕跡)。delivery_attempts を確認してください`);
           process.exitCode = 1;
