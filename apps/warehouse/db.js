@@ -361,6 +361,12 @@ function createTables() {
     coupon_discount     REAL,
     synced_at           TEXT
   )`);
+  // PR-Y-B (らくらくーぽん Yahoo版置換): 発送日とソーシャルギフト種別 (非PII) を後付け。planner の母集合に使う
+  for (const t of ['raw_yahoo_orders', 'raw_yahoo_orders_log']) {
+    const cols = db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+    if (!cols.includes('ship_date')) db.exec(`ALTER TABLE ${t} ADD COLUMN ship_date TEXT`);
+    if (!cols.includes('social_gift_type')) db.exec(`ALTER TABLE ${t} ADD COLUMN social_gift_type TEXT`);
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_order ON raw_yahoo_orders(order_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_date ON raw_yahoo_orders(order_time)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_yh_orders_item ON raw_yahoo_orders(item_id)');

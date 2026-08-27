@@ -62,6 +62,8 @@ const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-t
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
 function ts() { return new Date().toISOString().slice(0, 19); }
+// PR-Y-B: /yahoo/orderContact の純粋ロジック (テスト可能な別モジュール)
+const yahooOrderContact = require('./yahoo-order-contact.js');
 
 // ─── Yahoo トークン管理 ───
 
@@ -261,7 +263,48 @@ async function callYahooAPI(endpoint, xmlBody) {
   } catch (e) { console.log(`[${ts()}] 署名スキップ: ${e.message}`); }
 
   const res = await fetch(url, { method: 'POST', headers, body: xmlBody });
+  const auth = res.headers.get('x-sws-authorize-status');
+  if (auth && auth !== 'authorized') console.warn(`[${ts()}] ⚠️ X-SWS-Authorize-Status=${auth} (${endpoint}) 公開鍵認証に失敗。期限切れなら暗号鍵管理で再発行`);
   return await res.text();
+}
+
+/** callYahooAPI と同じ認証で、HTTP status と公開鍵認証ヘッダも返す (PR-Y-B: orderContact 用) */
+async function callYahooAPIWithMeta(endpoint, xmlBody) {
+  const accessToken = await getAccessToken();
+  const url = `${YAHOO_API_BASE}/${endpoint}`;
+  const headers = { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/xml; charset=utf-8' };
+  if (fs.existsSync(YAHOO_PUBLIC_KEY_PATH)) {
+    const publicKey = crypto.createPublicKey(fs.readFileSync(YAHOO_PUBLIC_KEY_PATH, 'utf-8'));
+    const encrypted = crypto.publicEncrypt({ key: publicKey, padding: crypto.constants.RSA_PKCS1_PADDING },
+      Buffer.from(`${YAHOO_SELLER_ID}:${Math.floor(Date.now() / 1000)}`, 'utf-8'));
+    headers['X-sws-signature'] = encrypted.toString('base64');
+    headers['X-sws-signature-version'] = YAHOO_SIGNATURE_VERSION;
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: xmlBody });
+  return { status: res.status, authorizeStatus: res.headers.get('x-sws-authorize-status'), retryAfter: res.headers.get('retry-after'), text: await res.text() };
+}
+
+// ─── PR-Y-B: /yahoo/orderContact — 注文 1 件の宛先を「保存せず」返す ───
+// 約款第10条 (購入者PIIを保持しない) を守るため、プロキシは値をログ・ファイルに一切書かない。
+// 直列化 (同時 1 件・1.1 秒間隔 = Yahoo の 1 req/秒目安) して他の orderInfo 呼び出しと競合させない
+// Yahoo orderInfo 系 (orderInfo バッチ / GET / orderContact) は 1 本のキューで直列化し 1.1 秒間隔にする
+// (Codex Y-B R1 Medium: orderContact だけ直列化しても orderInfo バッチと並走すれば Yahoo には近接リクエストが飛ぶ)
+let yahooChain = Promise.resolve();
+let lastYahooCallAt = 0;
+function yahooSerialized(fn) {
+  const run = async () => {
+    const wait = 1100 - (Date.now() - lastYahooCallAt);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastYahooCallAt = Date.now();
+    return await fn();
+  };
+  const p = yahooChain.then(run, run);
+  yahooChain = p.catch(() => {});
+  return p;
+}
+function yahooOrderContactSerialized(orderId) {
+  const xml = `<Req><Target><OrderId>${orderId}</OrderId><Field>${yahooOrderContact.CONTACT_FIELDS}</Field></Target><SellerId>${YAHOO_SELLER_ID}</SellerId></Req>`;
+  return yahooSerialized(() => callYahooAPIWithMeta('orderInfo', xml));
 }
 
 // ─── Yahoo 問い合わせ管理API (circus REST。inquiry-hub 受信同期+返信送信用) ───
@@ -415,7 +458,7 @@ async function yahooOrderInfo(orderId) {
   const xml = `<Req>
   <Target>
     <OrderId>${orderId}</OrderId>
-    <Field>OrderId,OrderTime,LastUpdateTime,OrderStatus,PayStatus,ShipStatus,TotalPrice,PayCharge,ShipCharge,Discount,UsePoint,LineId,ItemId,Title,SubCode,UnitPrice,OriginalPrice,Quantity,ItemTaxRatio,CouponDiscount</Field>
+    <Field>OrderId,OrderTime,LastUpdateTime,OrderStatus,PayStatus,ShipStatus,ShipDate,SocialGiftType,TotalPrice,PayCharge,ShipCharge,Discount,UsePoint,LineId,ItemId,Title,SubCode,UnitPrice,OriginalPrice,Quantity,ItemTaxRatio,CouponDiscount</Field>
   </Target>
   <SellerId>${YAHOO_SELLER_ID}</SellerId>
 </Req>`;
@@ -973,23 +1016,94 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const { orderIds } = JSON.parse(body);
       if (!orderIds || !orderIds.length) throw new Error('orderIds が必要です');
+      // PR-Y-B (Codex R1 High): orderId は XML に埋め込むため形式検証 (注入で Field を差し替えられると PII が混入する)
+      const badId = orderIds.find((id) => !yahooOrderContact.isValidOrderId(id));
+      if (badId !== undefined) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_order_id' }));
+        return;
+      }
       const results = [];
       for (let i = 0; i < orderIds.length; i++) {
         console.log(`[${ts()}] Yahoo orderInfo: ${orderIds[i]} (${i + 1}/${orderIds.length})`);
-        const xml = await yahooOrderInfo(orderIds[i]);
+        const xml = await yahooSerialized(() => yahooOrderInfo(orderIds[i])); // 共通レートリミッタ (1.1秒間隔) — orderContact と共有
         results.push({ orderId: orderIds[i], xml });
-        if (i < orderIds.length - 1) await new Promise(r => setTimeout(r, 1100));
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, results }));
       return;
     }
 
+    // PR-Y-B: POST /yahoo/orderContact { orderId } → { ok, contact: { orderId, orderStatus, shipStatus, shipDate, socialGiftType, email } }
+    // ログには orderId と結果コードだけ (メールアドレス・レスポンス本文は出さない)
+    if (pathname === '/yahoo/orderContact' && req.method === 'POST') {
+      let orderId;
+      try { ({ orderId } = JSON.parse(await readBody(req))); } catch { orderId = null; }
+      if (!yahooOrderContact.isValidOrderId(orderId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_order_id' }));
+        return;
+      }
+      let meta;
+      try {
+        meta = await yahooOrderContactSerialized(orderId);
+      } catch (e) {
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: upstream failure (${String(e.message).slice(0, 60)})`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'upstream_failure' }));
+        return;
+      }
+      if (meta.status === 429) {
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: 429`);
+        res.writeHead(429, { 'Content-Type': 'application/json', ...(meta.retryAfter ? { 'Retry-After': meta.retryAfter } : {}) });
+        res.end(JSON.stringify({ ok: false, error: 'rate_limited' }));
+        return;
+      }
+      if (!yahooOrderContact.authorizeStatusOk(meta.authorizeStatus)) {
+        // HTTP 200 でも公開鍵認証失敗はここで止める (Yahoo 公式: 認証結果はヘッダにのみ出る)
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: public key auth ${meta.authorizeStatus || 'none'}`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'public_key_auth_failed', authorizeStatus: meta.authorizeStatus || 'none' }));
+        return;
+      }
+      let parsed;
+      try {
+        parsed = yahooOrderContact.parseOrderContactXml(meta.text);
+      } catch (e) {
+        // PII を含む本文を共通例外ログに近づけない (Codex Y-B R1 Medium)
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: parse_failed`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'parse_failed' }));
+        return;
+      }
+      if (!parsed.ok) {
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: ${parsed.error} ${parsed.code || ''} (http ${meta.status})`);
+        res.writeHead(meta.status >= 500 ? 502 : 404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: parsed.error, code: parsed.code || null }));
+        return;
+      }
+      if (parsed.contact.orderId !== orderId) {
+        // 取り違え防止 (Codex Y-B R2 High): 要求した注文IDと違う注文の宛先は返さない
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: order_id_mismatch`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'order_id_mismatch' }));
+        return;
+      }
+      console.log(`[${ts()}] Yahoo orderContact ${orderId}: ok ship=${parsed.contact.shipStatus} gift=${parsed.contact.socialGiftType} email=${parsed.contact.email ? 'present' : 'empty'}`);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, contact: parsed.contact }));
+      return;
+    }
+
     if (pathname === '/yahoo/orderInfo' && req.method === 'GET') {
       const orderId = url.searchParams.get('orderId');
-      if (!orderId) throw new Error('orderId が必要です');
+      if (!yahooOrderContact.isValidOrderId(orderId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_order_id' }));
+        return;
+      }
       console.log(`[${ts()}] Yahoo orderInfo: ${orderId}`);
-      const xml = await yahooOrderInfo(orderId);
+      const xml = await yahooSerialized(() => yahooOrderInfo(orderId));
       res.writeHead(200, { 'Content-Type': 'application/xml' });
       res.end(xml);
       return;

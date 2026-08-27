@@ -141,8 +141,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      ingested_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      ingested_at, ship_date, social_gift_type
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   const deleteCurrentOrder = db.prepare('DELETE FROM raw_yahoo_orders WHERE order_id = ?');
@@ -152,8 +152,8 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       total_price, pay_charge, ship_charge, discount, use_point,
       line_id, item_id, title, sub_code,
       unit_price, original_price, quantity, item_tax_ratio, coupon_discount,
-      synced_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      synced_at, ship_date, social_gift_type
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
 
   let logCount = 0, currentCount = 0;
@@ -194,6 +194,9 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
       const orderStatus = orderInfo.OrderStatus || '';
       const payStatus = orderInfo.Pay?.PayStatus || orderInfo.PayStatus || '';
       const shipStatus = orderInfo.Ship?.ShipStatus || orderInfo.ShipStatus || '';
+      // PR-Y-B: 発送日 (YYYY-MM-DD、未発送は空→NULL) とソーシャルギフト種別 (0=通常)。どちらも非PII
+      const shipDate = String(orderInfo.Ship?.ShipDate || orderInfo.ShipDate || '').trim() || null;
+      const socialGiftType = String(orderInfo.SocialGiftType ?? '').trim() || null;
 
       // 注文ヘッダ必須 field validation (Codex fail-closed 案、SubCode は任意)
       if (!orderTime || !orderStatus) {
@@ -257,7 +260,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts
+          ts, shipDate, socialGiftType
         );
         logCount++;
 
@@ -267,7 +270,7 @@ function insertOrders(db, orders, batchId, windowStart, windowEnd) {
           totalPrice, payCharge, shipCharge, discount, usePoint,
           lineId, itemId, title, subCode,
           unitPrice, originalPrice, quantity, itemTaxRatio, couponDiscount,
-          ts
+          ts, shipDate, socialGiftType
         );
         currentCount++;
       }
