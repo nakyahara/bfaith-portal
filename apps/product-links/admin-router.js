@@ -31,7 +31,8 @@ function apiError(res, e, where) {
 function externalError(res, e, where) {
   console.error(`[product-links] ${where}:`, e);
   const msg = String(e?.message || '');
-  const known = /アクセスできません|共有|GOOGLE_SERVICE_ACCOUNT_KEY|NOTION_|Notion|実行中です/i.test(msg);
+  // 既知 = drive-csv.js の共有/認証エラー・notion-client の env 未設定 (requireEnv)・排他ガード。それ以外は丸める
+  const known = /アクセスできません|閲覧者以上で共有|GOOGLE_SERVICE_ACCOUNT_KEY|NOTION_IMAGE_DB_ID|RYS_NOTION_TOKEN|が未設定|実行中です/i.test(msg);
   return res.status(e?.code === 'VALIDATION' ? 400 : 502).json({ ok: false, error: known ? msg.slice(0, 300) : '外部サービスの照会に失敗しました (Render ログを確認してください)' });
 }
 
@@ -99,8 +100,10 @@ router.post('/api/candidates/:id/accept', (req, res) => {
 router.post('/api/candidates/:id/reject', (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'id が不正です' });
-  if (!rejectCandidate(getDB(), id, { actor: actorOf(req) })) return res.status(404).json({ ok: false, error: '未処理の候補が見つかりません' });
-  res.json({ ok: true });
+  try {
+    if (!rejectCandidate(getDB(), id, { actor: actorOf(req) })) return res.status(404).json({ ok: false, error: '未処理の候補が見つかりません' });
+    res.json({ ok: true });
+  } catch (e) { apiError(res, e, 'reject'); }
 });
 
 // 画面に出ている完全一致候補 (id 列挙) をまとめて採用。id 以外の集合は採らない
@@ -108,7 +111,9 @@ router.post('/api/accept-exact', (req, res) => {
   const ids = req.body?.ids;
   if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ ok: false, error: '対象の候補がありません' });
   if (ids.length > 1000) return res.status(400).json({ ok: false, error: '一度に採用できるのは 1,000 件までです' });
-  res.json({ ok: true, ...acceptExactByIds(getDB(), { ids, actor: actorOf(req) }) });
+  try {
+    res.json({ ok: true, ...acceptExactByIds(getDB(), { ids, actor: actorOf(req) }) });
+  } catch (e) { apiError(res, e, 'accept-exact'); }
 });
 
 export default router;
