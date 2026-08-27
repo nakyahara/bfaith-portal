@@ -74,8 +74,10 @@ async function logFetch(entry) {
 /** フィルタを「評価 5 段階 ON・動画/画像 OFF・期間 = 窓」にして絞り込み、画面の総件数を返す */
 async function applyFilter(page, win) {
   const ok = await page.evaluate(({ from, to }) => {
-    const ratings = [...document.querySelectorAll('input[name=filterRating]')];
-    if (ratings.length !== 5) return { ok: false, reason: `filterRating が ${ratings.length} 個` };
+    // 実機では name=filterRating の input が 6 個ある (value 1..5 のほかに隠しの「全て」相当が 1 個) → value 1..5 だけを対象にする
+    const all = [...document.querySelectorAll('input[name=filterRating]')];
+    const ratings = all.filter((cb) => /^[1-5]$/.test(cb.value));
+    if (ratings.length !== 5) return { ok: false, reason: `filterRating(value 1..5) が ${ratings.length} 個 (全 ${all.length})` };
     for (const cb of ratings) if (!cb.checked) cb.click();
     for (const id of ['video', 'image']) { const el = document.getElementById(id); if (el && el.checked) el.click(); }
     const f = document.getElementById('filterTermFrom'), t = document.getElementById('filterTermTo');
@@ -92,7 +94,7 @@ async function applyFilter(page, win) {
   const state = await page.evaluate(() => {
     const text = document.body.innerText.replace(/\s+/g, ' ');
     const m = text.match(/件目\/\s*([\d,]+)\s*件/);
-    const ratings = [...document.querySelectorAll('input[name=filterRating]')].map((cb) => cb.checked);
+    const ratings = [...document.querySelectorAll('input[name=filterRating]')].filter((cb) => /^[1-5]$/.test(cb.value)).map((cb) => cb.checked);
     const media = ['video', 'image'].map((id) => document.getElementById(id)?.checked || false);
     const from = document.getElementById('filterTermFrom')?.value, to = document.getElementById('filterTermTo')?.value;
     return { total: m ? Number(m[1].replace(/,/g, '')) : null, ratings, media, from, to, hasDownload: /ダウンロード/.test(text) };

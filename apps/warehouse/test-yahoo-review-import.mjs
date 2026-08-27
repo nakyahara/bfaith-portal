@@ -156,7 +156,8 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   const rMis = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_m.zip', buffer: bufA, sha256: 'mismatch', nowIso: '2026-08-30T00:00:00.000Z' });
   check('台帳の画面件数 ≠ 行数 → error', rMis.status === 'error' && /一致しない/.test(rMis.results[0].error));
   recordVerifiedSnapshot(db, { sha256: sha(bufA), from: '2026-08-25', to: '2026-08-29', screenCount: 1 });
-  check('台帳登録の読み出し', getVerifiedSnapshot(db, sha(bufA)).screen_count === 1);
+  check('台帳登録の読み出しは (sha256, 窓) で引く (窓なし=null)', getVerifiedSnapshot(db, sha(bufA), { from: '2026-08-25', to: '2026-08-29' }).screen_count === 1
+    && getVerifiedSnapshot(db, sha(bufA)) === null && getVerifiedSnapshot(db, sha(bufA), { from: '2026-01-01', to: '2026-01-02' }) === null);
   // JST 8/30 08:30 (= UTC 8/29 23:30) に 1 回目
   const rA = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_c.zip', buffer: bufA, sha256: sha(bufA), nowIso: '2026-08-29T23:30:00.000Z' });
   check('1 回目不在 → miss+1 (o2 のみ。窓外の o3/衝突 o9 は数えない)', rA.results[0].missed === 1 && rA.results[0].deleted === 0
@@ -188,6 +189,7 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
     && rE1.results[0].missed >= 1 && rE2.results[0].deleted >= 1, JSON.stringify([rE1.results[0], rE2.results[0]]));
   const rE3 = importYahooReviewFile(db, { name: 'yreview_d2026-08-20_2026-08-22_e3.csv', buffer: empty, sha256: shaE, nowIso: '2026-09-05T01:00:00.000Z' });
   check('同じ窓・同じ sha256 は duplicate', rE3.status === 'duplicate');
+  check('台帳: 同一 sha256 で 2 窓が別行として残る', db.prepare(`SELECT COUNT(*) n FROM yahoo_review_snapshots WHERE file_sha256 = ?`).get(shaE).n === 2);
 }
 
 console.log('=== 5. planner (MALL_TABLES.yahoo) が fact_yahoo_reviews を読める ===');

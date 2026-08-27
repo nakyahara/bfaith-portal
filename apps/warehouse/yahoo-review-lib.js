@@ -100,12 +100,14 @@ export function ensureYahooReviewTables(db) {
   // 検証済み全量スナップショット台帳 (Codex Y-A R1 High: ファイル名マーカーは誰でも付けられるので信頼境界にしない。
   // downloader が「画面の件数 = 行数・窓内・ヘッダ一致」を確認した ZIP の sha256 をここに記録し、
   // importer は sha256 が一致し窓も一致するファイルだけを削除検知の材料にする)
+  // PK は (sha256, 窓): 0件スナップショットは本文が毎回同一で sha256 が同じになるため、窓ごとに別行 (Codex Y-A R4 High)
   db.exec(`CREATE TABLE IF NOT EXISTS yahoo_review_snapshots (
-    file_sha256  TEXT PRIMARY KEY,
+    file_sha256  TEXT NOT NULL,
     window_from  TEXT NOT NULL,
     window_to    TEXT NOT NULL,
     screen_count INTEGER NOT NULL,
-    verified_at  TEXT NOT NULL
+    verified_at  TEXT NOT NULL,
+    PRIMARY KEY (file_sha256, window_from, window_to)
   )`);
   // 低評価通知キュー (取込 tx 内で enqueue、送信 2xx で削除)。kind = first (初回観測) / transition (★3以上→★2以下)
   db.exec(`CREATE TABLE IF NOT EXISTS yahoo_review_low_notify_queue (
@@ -142,8 +144,10 @@ export function recordVerifiedSnapshot(db, { sha256, from, to, screenCount, nowI
   db.prepare(`INSERT OR REPLACE INTO yahoo_review_snapshots (file_sha256, window_from, window_to, screen_count, verified_at) VALUES (?, ?, ?, ?, ?)`)
     .run(sha256, from, to, screenCount, nowIso);
 }
-export function getVerifiedSnapshot(db, sha256) {
-  return db.prepare(`SELECT * FROM yahoo_review_snapshots WHERE file_sha256 = ?`).get(sha256) || null;
+/** 検証済みスナップショットの参照。窓 (ファイル名マーカー) が無いファイルは台帳と突合できないので null */
+export function getVerifiedSnapshot(db, sha256, window = null) {
+  if (!window) return null;
+  return db.prepare(`SELECT * FROM yahoo_review_snapshots WHERE file_sha256 = ? AND window_from = ? AND window_to = ?`).get(sha256, window.from, window.to) || null;
 }
 
 /** ファイル名の要求窓マーカー `_d<from>_<to>_` (downloader の命名契約) */
@@ -264,8 +268,8 @@ export function importYahooReviewFile(db, { name, buffer, sha256, source = 'inco
   const now = nowIso || new Date().toISOString();
   // 観測窓 = 台帳 (検証済み) > ファイル名マーカー > なし。冪等判定は (sha256, 窓) で行う
   // (Codex Y-A R3 High: 0件スナップショットは本文が毎回同一で sha256 が同じになる → 窓が違えば別の観測として取り込む)
-  const verified = getVerifiedSnapshot(db, sha256);
   const marker = parseWindowMarker(name);
+  const verified = getVerifiedSnapshot(db, sha256, marker);
   const window = verified ? { from: verified.window_from, to: verified.window_to } : (fullSnapshot === true ? marker : null);
   const obsWindow = window || marker || null;
   const dup = db.prepare(`SELECT id FROM raw_yahoo_review_import_log WHERE file_sha256 = ? AND status = 'ok' AND COALESCE(window_from, '') = ? AND COALESCE(window_to, '') = ?`)
