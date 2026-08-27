@@ -41,18 +41,22 @@ export async function fetchYahooOrderContact(orderId, opts = {}) {
       signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
-    throw mkErr(e?.name === 'TimeoutError' ? 'timeout' : 'network', String(e?.message || e).slice(0, 80), true);
+    // 例外メッセージに上流の文字列を持ち回らない (Codex Y-B R1 High: 呼び出し側ログ/未捕捉例外に PII が出る経路を断つ)
+    throw mkErr(e?.name === 'TimeoutError' ? 'timeout' : 'network', e?.name === 'TimeoutError' ? `timeout ${timeoutMs}ms` : 'fetch failed', true);
   }
   let body = null;
   try { body = await res.json(); } catch { body = null; }
-  if (res.status === 429) throw mkErr('http_429', `rate limited (Retry-After=${res.headers.get('retry-after') || '-'})`, true);
+  // 以下、Error.message は固定文言 + HTTP status / 既知コードだけ (上流の message 文字列は使わない)
+  const safeCode = (v) => (typeof v === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(v) ? v : null);
+  if (res.status === 429) throw mkErr('http_429', `rate limited (Retry-After=${/^\d{1,5}$/.test(res.headers.get('retry-after') || '') ? res.headers.get('retry-after') : '-'})`, true);
   if (res.status === 403) throw mkErr('http_403', 'proxy secret rejected', true);
   if (res.status >= 500) {
-    const code = body?.error === 'public_key_auth_failed' ? 'public_key_auth_failed' : (body?.error || 'http_5xx');
-    throw mkErr(code, String(body?.message || body?.authorizeStatus || res.status).slice(0, 80), true);
+    const known = safeCode(body?.error);
+    const code = known === 'public_key_auth_failed' ? 'public_key_auth_failed' : (known || 'http_5xx');
+    throw mkErr(code, `http ${res.status}${known === 'public_key_auth_failed' ? ` authorizeStatus=${safeCode(body?.authorizeStatus) || '?'}` : ''}`, true);
   }
-  if (res.status === 404 || body?.error === 'order_not_found' || body?.error === 'yahoo_error' || body?.error === 'yahoo_status') {
-    throw mkErr('order_not_found', String(body?.code || body?.message || 'not found').slice(0, 80), false);
+  if (res.status === 404 || ['order_not_found', 'yahoo_error', 'yahoo_status'].includes(body?.error)) {
+    throw mkErr('order_not_found', `http ${res.status} code=${safeCode(body?.code) || '-'}`, false);
   }
   if (!res.ok || !body?.ok || !body.contact) throw mkErr('proxy_error', `unexpected response ${res.status}`, true);
   const c = body.contact;

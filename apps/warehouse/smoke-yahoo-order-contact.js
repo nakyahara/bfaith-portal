@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * smoke-yahoo-order-contact.js — VPS proxy /yahoo/orderContact の疎通確認 (PR-Y-B デプロイ時に実行)
- *   raw_yahoo_orders の直近注文 1 件で呼び、メールアドレスは **ドメインと長さだけ** 表示する (値は出さない)。
+ *   raw_yahoo_orders の直近注文 1 件で呼び、メールアドレスは **有無と長さだけ** 表示する (値・ドメインは出さない)。
  *   ついでに /yahoo/orderInfo に ShipDate / SocialGiftType が出ているかも確認。
  * 実行: node apps/warehouse/smoke-yahoo-order-contact.js  (env: DATA_DIR, YAHOO_PROXY_URL, YAHOO_PROXY_SECRET)
  * exit: 0=OK / 1=NG
@@ -21,8 +21,7 @@ if (!row) { console.error('FATAL: raw_yahoo_orders に注文が無い'); process
 
 try {
   const c = await fetchYahooOrderContact(row.order_id);
-  const dom = c.email.split('@')[1];
-  console.log(`✅ orderContact OK: order=${row.order_id} status=${c.orderStatus} ship=${c.shipStatus} shipDate=${c.shipDate || '(未発送)'} gift=${c.socialGiftType} email=[len ${c.email.length}, @${dom}]`);
+  console.log(`✅ orderContact OK: order=${row.order_id} status=${c.orderStatus} ship=${c.shipStatus} shipDate=${c.shipDate || '(未発送)'} gift=${c.socialGiftType} email=present (len ${c.email.length})`);
 } catch (e) {
   console.error(`❌ orderContact NG: ${e.code} retryable=${e.retryable} ${e.message}`);
   process.exit(1);

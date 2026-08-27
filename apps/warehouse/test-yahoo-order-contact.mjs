@@ -24,7 +24,13 @@ check('メール空 → 非 retryable', await expectErr(() => fetchYahooOrderCon
 check('ネットワーク断 → retryable', await expectErr(() => fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: async () => { throw new Error('ECONNRESET'); } }), 'network', true));
 let thrown;
 try { await fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(500, { error: 'boom', message: 'contact u@example.jp leaked?' }) }); } catch (e) { thrown = e; }
-check('エラーメッセージは 80 文字で切る (本文を丸ごと持ち回らない)', thrown && thrown.message.length < 120);
+check('エラーメッセージに上流 message を含めない (固定文言 + status のみ)', thrown && !/example\.jp|leaked/.test(thrown.message) && /http 500/.test(thrown.message));
+let thrown2;
+try { await fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: async () => { throw new Error('ECONNRESET to u@example.jp'); } }); } catch (e) { thrown2 = e; }
+check('ネットワーク例外の文言も持ち回らない', thrown2 && !/example\.jp/.test(thrown2.message) && thrown2.code === 'network');
+let thrown3;
+try { await fetchYahooOrderContact('b-faith01-1', { ...OPTS, fetchImpl: mk(404, { ok: false, error: 'yahoo_error', code: 'od10001 <u@example.jp>' }) }); } catch (e) { thrown3 = e; }
+check('上流 code は英数のみ通す', thrown3 && !/example/.test(thrown3.message) && /code=-/.test(thrown3.message));
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed > 0 ? 1 : 0);

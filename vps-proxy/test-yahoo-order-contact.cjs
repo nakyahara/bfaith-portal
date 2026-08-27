@@ -6,7 +6,8 @@ let passed = 0, failed = 0;
 const check = (name, cond, detail = '') => { if (cond) { console.log(`  ✅ ${name}`); passed++; } else { console.log(`  ❌ ${name} ${detail}`); failed++; } };
 
 check('orderId 形式: 正常', isValidOrderId('b-faith01-10288658'));
-check('orderId 形式: 不正 (空/空白/長すぎ/記号)', !isValidOrderId('') && !isValidOrderId('a b') && !isValidOrderId('x'.repeat(70)) && !isValidOrderId('a;b') && !isValidOrderId(123));
+check('orderId 形式: 不正 (空/空白/長すぎ/記号/XML注入)', !isValidOrderId('') && !isValidOrderId('a b') && !isValidOrderId('x'.repeat(70)) && !isValidOrderId('a;b') && !isValidOrderId(123)
+  && !isValidOrderId('b-faith01-1</OrderId><Field>BillMailAddress</Field><OrderId>x'));
 check('CONTACT_FIELDS に PII は BillMailAddress だけ (氏名・電話は取らない)', CONTACT_FIELDS === 'OrderId,OrderStatus,ShipStatus,ShipDate,SocialGiftType,BillMailAddress');
 
 const ok = `<?xml version='1.0' encoding='UTF-8'?><ResultSet totalResultsAvailable="1"><Result><Status>OK</Status><OrderInfo><OrderId>b-faith01-1</OrderId><OrderStatus>2</OrderStatus><Pay><BillMailAddress><![CDATA[user+tag@Example.co.jp]]></BillMailAddress></Pay><Ship><ShipDate>2026-08-27</ShipDate><ShipStatus>3</ShipStatus></Ship><SocialGiftType>0</SocialGiftType></OrderInfo></Result></ResultSet>`;

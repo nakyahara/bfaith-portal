@@ -287,19 +287,24 @@ async function callYahooAPIWithMeta(endpoint, xmlBody) {
 // ─── PR-Y-B: /yahoo/orderContact — 注文 1 件の宛先を「保存せず」返す ───
 // 約款第10条 (購入者PIIを保持しない) を守るため、プロキシは値をログ・ファイルに一切書かない。
 // 直列化 (同時 1 件・1.1 秒間隔 = Yahoo の 1 req/秒目安) して他の orderInfo 呼び出しと競合させない
-let contactChain = Promise.resolve();
-let lastContactAt = 0;
-function yahooOrderContactSerialized(orderId) {
+// Yahoo orderInfo 系 (orderInfo バッチ / GET / orderContact) は 1 本のキューで直列化し 1.1 秒間隔にする
+// (Codex Y-B R1 Medium: orderContact だけ直列化しても orderInfo バッチと並走すれば Yahoo には近接リクエストが飛ぶ)
+let yahooChain = Promise.resolve();
+let lastYahooCallAt = 0;
+function yahooSerialized(fn) {
   const run = async () => {
-    const wait = 1100 - (Date.now() - lastContactAt);
+    const wait = 1100 - (Date.now() - lastYahooCallAt);
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    lastContactAt = Date.now();
-    const xml = `<Req><Target><OrderId>${orderId}</OrderId><Field>${yahooOrderContact.CONTACT_FIELDS}</Field></Target><SellerId>${YAHOO_SELLER_ID}</SellerId></Req>`;
-    return await callYahooAPIWithMeta('orderInfo', xml);
+    lastYahooCallAt = Date.now();
+    return await fn();
   };
-  const p = contactChain.then(run, run);
-  contactChain = p.catch(() => {});
+  const p = yahooChain.then(run, run);
+  yahooChain = p.catch(() => {});
   return p;
+}
+function yahooOrderContactSerialized(orderId) {
+  const xml = `<Req><Target><OrderId>${orderId}</OrderId><Field>${yahooOrderContact.CONTACT_FIELDS}</Field></Target><SellerId>${YAHOO_SELLER_ID}</SellerId></Req>`;
+  return yahooSerialized(() => callYahooAPIWithMeta('orderInfo', xml));
 }
 
 // ─── Yahoo 問い合わせ管理API (circus REST。inquiry-hub 受信同期+返信送信用) ───
@@ -1011,12 +1016,18 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const { orderIds } = JSON.parse(body);
       if (!orderIds || !orderIds.length) throw new Error('orderIds が必要です');
+      // PR-Y-B (Codex R1 High): orderId は XML に埋め込むため形式検証 (注入で Field を差し替えられると PII が混入する)
+      const badId = orderIds.find((id) => !yahooOrderContact.isValidOrderId(id));
+      if (badId !== undefined) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_order_id' }));
+        return;
+      }
       const results = [];
       for (let i = 0; i < orderIds.length; i++) {
         console.log(`[${ts()}] Yahoo orderInfo: ${orderIds[i]} (${i + 1}/${orderIds.length})`);
-        const xml = await yahooOrderInfo(orderIds[i]);
+        const xml = await yahooSerialized(() => yahooOrderInfo(orderIds[i])); // 共通レートリミッタ (1.1秒間隔) — orderContact と共有
         results.push({ orderId: orderIds[i], xml });
-        if (i < orderIds.length - 1) await new Promise(r => setTimeout(r, 1100));
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, results }));
@@ -1055,7 +1066,16 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ ok: false, error: 'public_key_auth_failed', authorizeStatus: meta.authorizeStatus || 'none' }));
         return;
       }
-      const parsed = yahooOrderContact.parseOrderContactXml(meta.text);
+      let parsed;
+      try {
+        parsed = yahooOrderContact.parseOrderContactXml(meta.text);
+      } catch (e) {
+        // PII を含む本文を共通例外ログに近づけない (Codex Y-B R1 Medium)
+        console.log(`[${ts()}] Yahoo orderContact ${orderId}: parse_failed`);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'parse_failed' }));
+        return;
+      }
       if (!parsed.ok) {
         console.log(`[${ts()}] Yahoo orderContact ${orderId}: ${parsed.error} ${parsed.code || ''} (http ${meta.status})`);
         res.writeHead(meta.status >= 500 ? 502 : 404, { 'Content-Type': 'application/json' });
@@ -1070,9 +1090,13 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/yahoo/orderInfo' && req.method === 'GET') {
       const orderId = url.searchParams.get('orderId');
-      if (!orderId) throw new Error('orderId が必要です');
+      if (!yahooOrderContact.isValidOrderId(orderId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_order_id' }));
+        return;
+      }
       console.log(`[${ts()}] Yahoo orderInfo: ${orderId}`);
-      const xml = await yahooOrderInfo(orderId);
+      const xml = await yahooSerialized(() => yahooOrderInfo(orderId));
       res.writeHead(200, { 'Content-Type': 'application/xml' });
       res.end(xml);
       return;
