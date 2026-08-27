@@ -39,6 +39,11 @@ const ERROR_MAX_LEN = 500;
 const DRIVE_TIMEOUT_MS = 10_000;
 // 再試行1回あたりの上限 (異常時に Drive を叩きすぎない)
 export const MAX_RETRY_PER_RUN = 50;
+// 1 draft あたりの総試行上限 (Codex R2 high: 恒久失敗の無制限 retry とイベント無限増加を防ぐ)。
+// drive_folder_failed イベント数 = 試行回数として数える (append-only なので信頼できるカウンタ)
+export const MAX_RETRY_ATTEMPTS = 10;
+// 前回失敗からの最短間隔 (時間)。同一 intake 実行内での即時再試行も自然に防ぐ
+export const RETRY_BACKOFF_HOURS = 2;
 
 // Drive の ID として妥当な文字だけ許す。env の誤設定でクエリ文字列を壊さない (Codex R1 medium-4)
 const DRIVE_ID_RE = /^[A-Za-z0-9_-]{5,}$/;
@@ -218,6 +223,12 @@ export async function attemptImageFolderCreationBatch(draftIds, { actor = null, 
  * 再試行する。intake cron から毎回呼ばれる = Drive の一時障害・権限付与前の失敗が
  * 権限付与後に自然回復する。対象は「一度作ろうとして失敗した draft」だけ
  * (既存カードへの一括バックフィルはしない)。reject しない。
+ *
+ * retry の制御 (Codex R2 high 対応):
+ *   - 総試行 MAX_RETRY_ATTEMPTS 回まで (failed イベント数で数える = イベント増加も同数で頭打ち)。
+ *     上限に達した draft は対象外 → 人が詳細画面で URL を貼る (`drive_folder_failed` イベントで追える)
+ *   - 前回失敗から RETRY_BACKOFF_HOURS 時間以内は再試行しない (同一実行内の即時 retry も防ぐ)
+ *   - 古い失敗から順に処理 (LIMIT で先頭固定にならない = 飢餓防止)
  * @returns {Promise<{retried: number, created: number, reused: number, skipped: number, failed: number}>}
  */
 export async function retryFailedImageFolders({ limit = MAX_RETRY_PER_RUN, actor = null, driveClient = null } = {}) {
@@ -225,13 +236,16 @@ export async function retryFailedImageFolders({ limit = MAX_RETRY_PER_RUN, actor
     const db = getDB();
     if (isDisabled()) return { retried: 0, created: 0, reused: 0, skipped: 0, failed: 0 };
     const rows = db.prepare(`
-      SELECT DISTINCT d.id FROM product_drafts d
+      SELECT d.id FROM product_drafts d
         JOIN draft_events e ON e.draft_id = d.id AND e.event = 'drive_folder_failed'
        WHERE (d.drive_folder_url IS NULL OR TRIM(d.drive_folder_url) = '')
          AND d.parent_draft_id IS NULL AND COALESCE(d.provisional_code, 0) = 0
-       ORDER BY d.id
+       GROUP BY d.id
+      HAVING COUNT(e.id) < ?
+         AND MAX(e.created_at) <= strftime('%Y-%m-%dT%H:%M:%fZ','now','-${Number(RETRY_BACKOFF_HOURS)} hours')
+       ORDER BY MAX(e.created_at) ASC
        LIMIT ?
-    `).all(limit);
+    `).all(MAX_RETRY_ATTEMPTS, limit);
     const summary = await attemptImageFolderCreationBatch(rows.map((r) => r.id), { actor, driveClient });
     return { retried: rows.length, ...summary };
   } catch (e) {

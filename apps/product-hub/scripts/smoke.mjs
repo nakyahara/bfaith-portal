@@ -3431,14 +3431,29 @@ check('白抜きのみの取込は商品画像を触らず、draft_rakuten の�
   check('バッチは失敗で止まらない (失敗1/作成1/skip2)',
     s.failed === 1 && s.created === 1 && s.skipped === 2, JSON.stringify(s));
 
-  // 失敗の回収: drive_folder_failed のまま URL 空の単品だけ再試行する (バックフィルはしない)
+  // 失敗の回収: drive_folder_failed のまま URL 空の単品だけ再試行する (バックフィルはしない)。
+  // 直近失敗 (backoff 中) と総試行上限超えは対象外 = 恒久失敗を毎回叩かない (Codex R2 high)
+  const difId8 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-8', '再試行対象', 'smoke')`).run().lastInsertRowid);
+  const insOldFail = db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at)
+    VALUES (?, 'drive_folder_failed', 'old-fail', 'smoke', strftime('%Y-%m-%dT%H:%M:%fZ','now','-3 hours'))`);
+  insOldFail.run(difId8);
+  const difId9 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-9', '上限超え', 'smoke')`).run().lastInsertRowid);
+  for (let i = 0; i < dif.MAX_RETRY_ATTEMPTS; i++) insOldFail.run(difId9);
   const rt1 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'RETRY-ID') });
-  check('再試行: 失敗した draft を回収して URL が入る', rt1.retried >= 2 && rt1.created >= 2 && rt1.failed === 0
-    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId4).drive_folder_url.endsWith('RETRY-ID')
-    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId6).drive_folder_url.endsWith('RETRY-ID'),
+  check('再試行: 古い失敗だけ回収 (直近失敗=backoff中・上限超えは対象外)',
+    rt1.retried === 1 && rt1.created === 1 && rt1.failed === 0
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId8).drive_folder_url.endsWith('RETRY-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId9).drive_folder_url == null
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId4).drive_folder_url == null,
     JSON.stringify(rt1));
   const rt2 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'X') });
   check('再試行: 回収済みなら対象なし', rt2.retried === 0, JSON.stringify(rt2));
+
+  // 不正な PH_IMAGE_FOLDER_PARENT_ID は既定値へフォールバック (Drive クエリを壊さない)
+  process.env.PH_IMAGE_FOLDER_PARENT_ID = "bad'id --";
+  const pid = dif.imageFolderParentId();
+  delete process.env.PH_IMAGE_FOLDER_PARENT_ID;
+  check('不正な親フォルダIDは既定値へ', /^[A-Za-z0-9_-]+$/.test(pid) && pid !== "bad'id --", pid);
 }
 
 // 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)
