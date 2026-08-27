@@ -4,9 +4,14 @@
  * 認証は server.js の requireAppAccess('shohyo-links') に委譲。
  */
 import { Router } from 'express';
+import crypto from 'node:crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { listLinks, createLink, updateLink, deleteLink } from './db.js';
+import {
+  mfConfigured, authorizeUrl, exchangeCode, loadTokens, clearTokens,
+  currentOffice, getJournals, postVoucher, matchVendors,
+} from './mf-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -63,5 +68,119 @@ router.delete('/api/links/:id', (req, res) => {
     res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
+
+// ---- MF会計API連携 (Phase 2) ----
+
+router.get('/mf', (req, res) => {
+  res.sendFile(path.join(__dirname, 'views', 'mf.html'));
+});
+
+// OAuth開始: MFの認可画面へリダイレクト
+router.get('/mf/connect', (req, res) => {
+  if (!mfConfigured()) return res.status(500).send('MF_CLIENT_ID / MF_CLIENT_SECRET が未設定です (Render環境変数)');
+  const state = crypto.randomBytes(16).toString('hex');
+  req.session.mfOauthState = state;
+  res.redirect(authorizeUrl(state));
+});
+
+// OAuthコールバック
+router.get('/mf/callback', async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+    if (error) return res.redirect('mf?error=' + encodeURIComponent(String(error)));
+    if (!code || !state || state !== req.session.mfOauthState) {
+      return res.redirect('mf?error=state_mismatch');
+    }
+    delete req.session.mfOauthState;
+    await exchangeCode(String(code));
+    res.redirect('mf?connected=1');
+  } catch (e) {
+    console.error('[shohyo-links] mf callback', e.message, e.detail || '');
+    res.redirect('mf?error=' + encodeURIComponent(e.message));
+  }
+});
+
+router.get('/api/mf/status', async (req, res) => {
+  try {
+    if (!mfConfigured()) return res.json({ ok: true, result: { configured: false, connected: false } });
+    if (!loadTokens()) return res.json({ ok: true, result: { configured: true, connected: false } });
+    let office = null;
+    try { office = await currentOffice(); } catch (e) {
+      if (e.message === 'mf_not_connected' || String(e.message).includes('invalid_grant')) {
+        return res.json({ ok: true, result: { configured: true, connected: false, reason: 'token_expired' } });
+      }
+      throw e;
+    }
+    res.json({ ok: true, result: { configured: true, connected: true, office } });
+  } catch (e) {
+    console.error('[shohyo-links] mf status', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/mf/disconnect', (req, res) => {
+  clearTokens();
+  res.json({ ok: true, result: { disconnected: true } });
+});
+
+// 期間内の仕訳を取得し、証憑未添付を支払い先マスタと突合して返す
+router.get('/api/mf/unattached', async (req, res) => {
+  try {
+    const { start, end, all } = req.query;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(start)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(end))) {
+      return res.status(400).json({ ok: false, error: 'bad_period' });
+    }
+    const vendors = listLinks();
+    const journals = await getJournals(String(start), String(end));
+    const rows = journals
+      .filter(j => all === '1' || !(j.voucher_file_ids || []).length)
+      .map(j => ({
+        id: j.id,
+        number: j.number,
+        date: j.transaction_date,
+        memo: j.memo || '',
+        vouchers: (j.voucher_file_ids || []).length,
+        raw_summary: summarize_(j),
+        vendors: matchVendors(j, vendors).map(v => ({
+          id: v.id, name: v.name, url: v.url, storage_path: v.storage_path, fetch_method: v.fetch_method,
+        })),
+      }));
+    res.json({ ok: true, result: { total: journals.length, rows } });
+  } catch (e) {
+    console.error('[shohyo-links] mf unattached', e.message, e.detail || '');
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// 証憑ファイルを仕訳に添付 (journal_id 無しならBoxへ未添付保存)
+router.post('/api/mf/attach', async (req, res) => {
+  try {
+    const { journal_id, file_name, file_data } = req.body || {};
+    if (!file_name || !file_data) return res.status(400).json({ ok: false, error: 'file_required' });
+    if (String(file_data).length > 15 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large' });
+    const result = await postVoucher(journal_id || null, String(file_name), String(file_data));
+    res.json({ ok: true, result });
+  } catch (e) {
+    console.error('[shohyo-links] mf attach', e.message, e.detail || '');
+    res.status(e.status === 413 ? 413 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+/** 仕訳の金額と勘定科目/取引先を表示用に要約する (スキーマ差異に耐えるベストエフォート) */
+function summarize_(j) {
+  const names = [];
+  let value = null;
+  const walk = (v) => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== 'object') return;
+    if (typeof v.value === 'number' && value === null) value = v.value;
+    for (const k of ['trade_partner_name', 'account_name', 'sub_account_name']) {
+      if (typeof v[k] === 'string' && v[k] && !names.includes(v[k])) names.push(v[k]);
+    }
+    Object.values(v).forEach(w => { if (typeof w === 'object') walk(w); });
+  };
+  walk(j);
+  return { value, names: names.slice(0, 4) };
+}
 
 export default router;

@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MF照合 — 証憑リンク集</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; background: #f5f6f8; color: #1f2933; font-size: 14px; }
+  .wrap { max-width: 1200px; margin: 0 auto; padding: 16px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  header h1 { font-size: 20px; }
+  header a { color: #4b5563; text-decoration: none; font-size: 13px; }
+  header a:hover { text-decoration: underline; }
+  .spacer { flex: 1; }
+  .btn { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #f3f4f6; }
+  .btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.primary:hover { background: #1d4ed8; }
+  .bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: #16a34a; } .dot.ng { background: #dc2626; }
+  select, input[type=month] { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  th { text-align: left; font-size: 12px; color: #6b7280; font-weight: 600; padding: 8px 10px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; font-size: 13px; }
+  tr:hover td { background: #f8fafc; }
+  .amount { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .names { color: #4b5563; max-width: 320px; }
+  .vendor a { display: inline-block; background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 6px; padding: 2px 8px; text-decoration: none; font-size: 12px; margin: 1px 2px 1px 0; }
+  .vendor a:hover { background: #dbeafe; }
+  .none { color: #9ca3af; }
+  .tag { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 11px; white-space: nowrap; }
+  .tag.un { background: #fee2e2; color: #b91c1c; }
+  .tag.at { background: #f0fdf4; color: #15803d; }
+  .empty { padding: 30px; text-align: center; color: #9ca3af; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #111827; color: #fff; padding: 8px 18px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: .92; }
+  .attach-label { color: #1d4ed8; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .attach-label:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a href="./">← 証憑リンク集</a>
+    <h1>📎 MF照合（証憑未添付の仕訳）</h1>
+    <span class="spacer"></span>
+  </header>
+
+  <div class="bar" id="statusBar">読み込み中…</div>
+
+  <div class="bar">
+    対象月: <input type="month" id="month">
+    <label><input type="checkbox" id="showAll"> 添付済みも表示</label>
+    <button class="btn primary" id="loadBtn">仕訳を取得</button>
+    <span id="loadInfo" style="color:#6b7280"></span>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>取引日</th><th>No.</th><th class="amount">金額</th><th>摘要・取引先</th><th>マッチした支払い先（開いて証憑を取る）</th><th>証憑</th><th>添付</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty">上の「仕訳を取得」を押してください</div>
+</div>
+
+<input type="file" id="filePicker" accept=".pdf,.jpg,.jpeg,.png" style="display:none">
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let attachTarget = null; // ファイル選択中の仕訳ID
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  return body.result;
+}
+
+async function refreshStatus() {
+  const bar = $('statusBar');
+  try {
+    const s = await api('api/mf/status');
+    if (!s.configured) {
+      bar.innerHTML = '<span class="dot ng"></span> MF_CLIENT_ID / MF_CLIENT_SECRET が未設定です（Renderの環境変数に設定してください）';
+    } else if (!s.connected) {
+      bar.innerHTML = '<span class="dot ng"></span> MF未接続 <button class="btn primary" onclick="location.href=\'mf/connect\'">MFと接続する</button>'
+        + (s.reason === 'token_expired' ? ' <span style="color:#b45309">（トークン失効。再接続してください）</span>' : '');
+    } else {
+      const name = s.office?.office?.name || s.office?.name || '接続済み';
+      bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(name)}</b> <span class="spacer"></span>`
+        + '<button class="btn" id="disconnectBtn">接続解除</button>';
+      $('disconnectBtn').onclick = async () => {
+        if (!confirm('MFとの接続を解除しますか？')) return;
+        await api('api/mf/disconnect', { method: 'POST' });
+        refreshStatus();
+      };
+    }
+  } catch (e) {
+    bar.innerHTML = '<span class="dot ng"></span> 状態取得エラー: ' + esc(e.message);
+  }
+}
+
+function monthRange(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(y, m, 0).getDate();
+  return [`${ym}-01`, `${ym}-${String(last).padStart(2, '0')}`];
+}
+
+async function load() {
+  const ym = $('month').value;
+  if (!ym) return toast('対象月を選んでください');
+  const [start, end] = monthRange(ym);
+  $('loadInfo').textContent = '取得中…';
+  try {
+    const r = await api(`api/mf/unattached?start=${start}&end=${end}&all=${$('showAll').checked ? 1 : 0}`);
+    render(r);
+    $('loadInfo').textContent = `仕訳 ${r.total}件中 ${r.rows.length}件を表示`;
+  } catch (e) {
+    $('loadInfo').textContent = '';
+    if (e.message === 'mf_not_connected') toast('先にMFと接続してください');
+    else toast('取得エラー: ' + e.message);
+  }
+}
+
+function render(r) {
+  $('empty').style.display = r.rows.length ? 'none' : 'block';
+  $('empty').textContent = '証憑未添付の仕訳はありません 🎉';
+  $('rows').innerHTML = r.rows.map(row => `<tr>
+    <td>${esc(row.date)}</td>
+    <td>${esc(row.number)}</td>
+    <td class="amount">${row.raw_summary?.value != null ? Number(row.raw_summary.value).toLocaleString() : ''}</td>
+    <td class="names">${esc([...(row.raw_summary?.names || []), row.memo].filter(Boolean).join(' / '))}</td>
+    <td class="vendor">${row.vendors.length
+      ? row.vendors.map(v => `${v.url ? `<a href="${esc(v.url)}" target="_blank" rel="noopener" title="${esc(v.name)}">${esc(shorten(v.name))} ↗</a>` : esc(shorten(v.name))}`).join('')
+      : '<span class="none">マスタに一致なし</span>'}</td>
+    <td>${row.vouchers ? `<span class="tag at">添付${row.vouchers}件</span>` : '<span class="tag un">未添付</span>'}</td>
+    <td><span class="attach-label" data-attach="${esc(row.id)}">📎 ファイルを添付</span></td>
+  </tr>`).join('');
+}
+
+function shorten(name) {
+  return name.length > 18 ? name.slice(0, 18) + '…' : name;
+}
+
+document.addEventListener('click', (ev) => {
+  const t = ev.target.closest('[data-attach]');
+  if (t) {
+    attachTarget = t.dataset.attach;
+    $('filePicker').value = '';
+    $('filePicker').click();
+  }
+});
+
+$('filePicker').addEventListener('change', async () => {
+  const file = $('filePicker').files[0];
+  if (!file || !attachTarget) return;
+  if (file.size > 10 * 1024 * 1024) return toast('10MB以下のファイルにしてください（大きいものはMFのBox画面から）');
+  toast('アップロード中…');
+  const b64 = await new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1]);
+    fr.onerror = reject;
+    fr.readAsDataURL(file);
+  });
+  try {
+    await api('api/mf/attach', {
+      method: 'POST',
+      body: JSON.stringify({ journal_id: attachTarget, file_name: file.name, file_data: b64 }),
+    });
+    toast('添付しました');
+    load();
+  } catch (e) {
+    toast('添付エラー: ' + e.message);
+  }
+});
+
+$('loadBtn').addEventListener('click', load);
+
+(function init() {
+  const now = new Date();
+  $('month').value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const q = new URLSearchParams(location.search);
+  if (q.get('connected')) toast('MFと接続しました');
+  if (q.get('error')) toast('接続エラー: ' + q.get('error'));
+  refreshStatus();
+})();
+</script>
+</body>
+</html>
