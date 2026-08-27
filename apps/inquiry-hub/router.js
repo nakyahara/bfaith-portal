@@ -40,6 +40,7 @@ import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
 import { isImage, isInlineSafe, fmtBytes, resolveContentType } from './mime.js';
 import { blockedReplyDestination } from './no-reply.js';
+import { checkRecipientDomain } from './mx-check.js';
 import { linkifyText, urlSafeCut } from './linkify.js';
 import { listMailRules, addMailRule, setMailRuleActive, deleteMailRule, evaluateMailRules, importMailDealerRulesCsv,
   applyRuleToExistingMails, canApplyToExisting, validateConditions } from './mail-rules.js';
@@ -59,6 +60,17 @@ const router = Router();
 
 // ─── 共通ヘルパ ───
 const he = s => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/** 宛先ドメインが「確実に受け取れない」ときだけ理由を返す (それ以外は null = 送信を止めない)。
+ * 確認自体が失敗しても null を返す — DNSの不調で正常な送信を止めないため (mx-check.js) */
+async function recipientDomainProblem(address) {
+  try {
+    const v = await checkRecipientDomain(address);
+    return v.ok ? null : v.reason;
+  } catch (e) {
+    console.warn(`[inquiry-hub] 宛先ドメインの事前確認をスキップ: ${e?.message || e}`);
+    return null;
+  }
+}
 const actorOf = req => (req.session && (req.session.email || req.session.displayName)) || 'portal';
 
 function fmtJst(iso) {
@@ -1496,7 +1508,7 @@ router.post('/api/inquiries/:id/ai-flag', (req, res) => {
 });
 
 // 返信ジョブ作成 (Dark Launch。設計書§7.1#3 / §8.3)。実際の送信は送信ワーカー (Step 3〜) が担う
-router.post('/api/inquiries/:id/reply', (req, res) => {
+router.post('/api/inquiries/:id/reply', async (req, res) => {
   if (!replyEditorEnabled()) return res.status(403).json({ error: '返信機能は現在無効です (INQUIRY_HUB_REPLY_EDITOR_ENABLED)' });
   const inq = loadInquiry(req, res); if (!inq) return;
   const body = String((req.body || {}).body || '').trim();
@@ -1522,6 +1534,17 @@ router.post('/api/inquiries/:id/reply', (req, res) => {
   const attachmentIds = (req.body || {}).attachmentIds;
   if (attachmentIds !== undefined && (!Array.isArray(attachmentIds) || !attachmentIds.every(n => Number.isInteger(n) && n > 0))) {
     return res.status(400).json({ error: '不正なリクエストです (attachmentIds は数値の配列)' });
+  }
+  // 宛先ドメインがメールを受け取れるかの事前確認 (2026-08-27)。
+  // 打ち間違いを送信前に止める。DNSが引けないときは止めない (fail-open。mx-check.js)。
+  //  - 同じ操作IDの再POST (レスポンス消失後のリトライ) は既に作ったジョブを返すのが先。
+  //    ここでDNS判定に引っかけると「送信済みなのに失敗表示」になる (Codexレビュー High)
+  //  - customer_identifier が空の問い合わせは送信時にスレッドから宛先を復元するので見ない
+  //    (その経路は送信ワーカー側で同じ確認をする。adapters/gmail.js)
+  const alreadyJob = getDB().prepare('SELECT id FROM outbox_replies WHERE client_operation_id = ?').get(opId);
+  if (!alreadyJob && inq.channel_type === 'email' && String(inq.customer_identifier || '').includes('@')) {
+    const problem = await recipientDomainProblem(inq.customer_identifier);
+    if (problem) return res.status(400).json({ error: `${problem} (未送信)` });
   }
   try {
     const r = createReplyJob({
@@ -2083,7 +2106,7 @@ router.post('/api/compose/draft', (req, res) => {
  * 下書きを表に出す → 送信ジョブを作る の順で行い、ジョブが作れなければ下書きに戻す
  * (宛先も件名も入っているのに送信ジョブが無いスレッドを一覧に残さない)。
  */
-router.post('/api/compose/send', (req, res) => {
+router.post('/api/compose/send', async (req, res) => {
   if (!replyEditorEnabled()) return res.status(403).json({ error: 'メール送信機能が有効になっていません' });
   const b = req.body || {};
   const bodyText = String(b.body || '');
@@ -2101,6 +2124,13 @@ router.post('/api/compose/send', (req, res) => {
   }
   const db = getDB();
   const opId = String(b.clientOperationId);
+  // 宛先ドメインの事前確認 (2026-08-27)。形式の検証は finalizeComposeDraft が行うので、
+  // ここでは「ドメインが実在してメールを受け取れるか」だけを見る (DNS不通なら止めない)。
+  // 同じ操作IDの再POSTは既存ジョブを返すのが先 = DNSの結果で失敗表示にしない (Codexレビュー High)
+  if (!db.prepare('SELECT id FROM outbox_replies WHERE client_operation_id = ?').get(opId)) {
+    const problem = await recipientDomainProblem(b.to);
+    if (problem) return res.status(400).json({ error: problem });
+  }
   /** 同じ操作IDの再POST (レスポンスが届かなかった・二度押し) は既存ジョブをそのまま返す */
   const duplicateOf = (row) => {
     const e = new Error('duplicate');

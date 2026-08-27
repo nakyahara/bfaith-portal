@@ -2,6 +2,14 @@
 // 使い方: DATA_DIR=<作業ディレクトリ> node apps/inquiry-hub/smoke-sync-gmail.mjs
 import fs from 'fs';
 import path from 'path';
+import { setResolverForTest } from './mx-check.js';
+
+// 送信時の宛先ドメイン確認 (mx-check.js) で実DNSを引かせない (常に「受け取れる」扱い)
+setResolverForTest({
+  resolveMx: async (d) => [{ exchange: `mail.${d}`, priority: 10 }],
+  resolve4: async () => [],
+  resolve6: async () => [],
+});
 
 if (!process.env.DATA_DIR) {
   console.error('FATAL: DATA_DIR が未指定です (例: DATA_DIR=c:/tmp/ih-gmail-smoke)');
