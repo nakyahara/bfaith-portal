@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -392,6 +392,17 @@ const MIGRATIONS = {
   //   (事務スペースへ即時通知+送り状PDF追送+未通知は再送) なので同じ表に kind で区別する
   12: () => {
     db.exec("ALTER TABLE pk_pack_reprints ADD COLUMN kind TEXT NOT NULL DEFAULT 'reprint'");
+  },
+  // v13: 送り状自動印刷 P0/P1 (要件定義 送り状自動印刷_20260827)。
+  //   - pdf_by: ページの特定方法 ('manifest' = 注文番号の完全一致 / 'slip_no' / 'name' / 'position')
+  //   - pdf_printable: 1 = 自動印刷してよい (manifest経路+白紙検査を通過した場合のみ)。
+  //     位置推定は照合漏れで1ページずれて別人の送り状を掴み得るので、人が見る前提の
+  //     リンク添付には使うが自動印刷の根拠にはしない
+  //   - pdf_ink_ratio: 白紙判定に使った非白ピクセル率 (しきい値の実データ較正用に残す)
+  13: () => {
+    db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_by TEXT');
+    db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_printable INTEGER NOT NULL DEFAULT 0');
+    db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_ink_ratio REAL');
   },
 };
 
