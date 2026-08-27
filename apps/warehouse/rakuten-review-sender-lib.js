@@ -269,9 +269,14 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
       to = await A.resolveRecipient(db, claim.fresh, keys);
     } catch (e) {
       if (e && e.retryable) {
-        releaseClaimT(T, db, { actionId: action.id, claimToken: claim.claimToken, nowIso });
-        out.recipientRetry++;
-        out.details.push({ id: action.id, result: 'recipient_retry', reason: String(e.code || 'retryable') });
+        // 解放できなければ (claim を失っている/attempt が触られている) ambiguous と同じく人の確認へ
+        if (releaseClaimT(T, db, { actionId: action.id, claimToken: claim.claimToken, nowIso })) {
+          out.recipientRetry++;
+          out.details.push({ id: action.id, result: 'recipient_retry', reason: String(e.code || 'retryable') });
+        } else {
+          out.finalizeConflict++;
+          out.details.push({ id: action.id, result: 'release_conflict', reason: String(e.code || 'retryable') });
+        }
         continue;
       }
       finalizeAttemptT(T, db, { actionId: action.id, outcome: 'rejected', claimToken: claim.claimToken, note: (e && e.code) || 'contact_undecryptable', nowIso });
@@ -306,17 +311,31 @@ async function processReadyActionsT(T, A, db, { keys, sendFn, nowIso = new Date(
 
 /** claim の解放 (PR-Y-0)。SMTP を一切呼んでいないことが確実な段階 (宛先解決の一時失敗) でだけ使う:
  *  claimed→ready に戻し、予約した attempt 行を消す (UNIQUE(action_id) を再び使えるようにする)。claimToken 照合つき */
-function releaseClaimT(T, db, { actionId, claimToken = null, nowIso = new Date().toISOString() }) {
+function releaseClaimT(T, db, { actionId, claimToken, nowIso = new Date().toISOString() }) {
+  // claimToken は必須 (Codex Y0-R1 High: token 無しで解放できると、別 worker が送信中の claim を
+  // 横取り解放→再 claim→二重送信になる)。attempt 行が「予約のまま未使用」であることを先に検証し、
+  // 1 行ちょうど消せなければ全体をロールバック (Codex Y0-R1 Medium)
+  if (!claimToken) throw new Error('releaseClaim: claimToken は必須');
   const tx = db.transaction(() => {
+    const att = db.prepare(`SELECT outcome, smtp_code, note FROM ${T.attempts} WHERE action_id = ?`).get(actionId);
+    if (!att || att.outcome !== 'ambiguous' || att.smtp_code !== null || att.note !== null) {
+      throw Object.assign(new Error('attempt_not_pristine'), { releaseFailed: true });
+    }
     const r = db.prepare(`
       UPDATE ${T.actions} SET status = 'ready', claim_token = NULL, claimed_at = NULL, updated_at = ?
-       WHERE id = ? AND status = 'claimed' AND (? IS NULL OR claim_token = ?)
-    `).run(nowIso, actionId, claimToken, claimToken);
-    if (r.changes !== 1) return false;
-    db.prepare(`DELETE FROM ${T.attempts} WHERE action_id = ? AND outcome = 'ambiguous' AND smtp_code IS NULL AND note IS NULL`).run(actionId);
+       WHERE id = ? AND status = 'claimed' AND claim_token = ?
+    `).run(nowIso, actionId, claimToken);
+    if (r.changes !== 1) throw Object.assign(new Error('claim_not_owned'), { releaseFailed: true });
+    const d = db.prepare(`DELETE FROM ${T.attempts} WHERE action_id = ? AND outcome = 'ambiguous' AND smtp_code IS NULL AND note IS NULL`).run(actionId);
+    if (d.changes !== 1) throw Object.assign(new Error('attempt_delete_failed'), { releaseFailed: true });
     return true;
   });
-  return tx.immediate();
+  try {
+    return tx.immediate();
+  } catch (e) {
+    if (e.releaseFailed) return false;
+    throw e;
+  }
 }
 
 /** 楽天アダプタ (既定)。PR-Y-0 以前の挙動と同一 */
@@ -343,7 +362,17 @@ export const processReadyActions = (db, o) => processReadyActionsT(RT, RAKUTEN_S
  * 一時失敗は err.retryable=true で throw)、buildMail(action, nowIso) → {subject, text}、fromHeader }
  */
 export function createSenderEngine(adapter = RAKUTEN_SENDER_ADAPTER) {
-  const A = { ...RAKUTEN_SENDER_ADAPTER, ...adapter };
+  // 楽天以外は 4 つのモール固有項目を必須にする (Codex Y0-R1 Medium: 指定漏れを楽天の
+  // クーポン台帳・文面・From で静かに補完すると、Yahoo が楽天の URL/署名で送ってしまう)
+  const A = { ...adapter };
+  if (!A.mall) throw new Error('createSenderEngine: adapter.mall は必須');
+  if (A.mall === 'rakuten') {
+    Object.assign(A, { ...RAKUTEN_SENDER_ADAPTER, ...adapter });
+  } else {
+    for (const k of ['monthlyCouponFor', 'resolveRecipient', 'buildMail', 'fromHeader']) {
+      if (A[k] == null) throw new Error(`createSenderEngine(${A.mall}): adapter.${k} は必須 (楽天既定は継承しない)`);
+    }
+  }
   const T = tablesFor(A.mall);
   return {
     mall: A.mall, tables: T, adapter: A,

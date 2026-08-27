@@ -73,8 +73,12 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
     buildMail: (a) => ({ subject: `S ${a.order_number}`, text: `T ${a.order_number}` }),
     fromHeader: '"雑貨イズム" <info@b-faith.biz>',
   });
-  check('createSenderEngine: 未指定項目は楽天既定を継承', Y.adapter.fromHeader.includes('info@') && Y.tables.actions === 'yahoo_campaign_actions'
+  check('createSenderEngine: Yahoo 束縛', Y.adapter.fromHeader.includes('info@') && Y.tables.actions === 'yahoo_campaign_actions'
     && RAKUTEN_SENDER_ADAPTER.mall === 'rakuten');
+  check('createSenderEngine: 楽天以外でモール固有項目が欠けると throw (楽天既定を継承しない)',
+    (() => { try { createSenderEngine({ mall: 'yahoo', resolveRecipient: async () => 'x' }); return false; } catch (e) { return /buildMail|monthlyCouponFor|fromHeader/.test(e.message); } })()
+    && (() => { try { createSenderEngine({}); return false; } catch { return true; } })()
+    && createSenderEngine({ mall: 'rakuten', fromHeader: 'X <x@b-faith.biz>' }).adapter.fromHeader.startsWith('X'));
   // ready なフォロー action + ownership self
   const T = tablesFor('yahoo');
   db.prepare(`INSERT OR REPLACE INTO ${T.ownership} (order_number, owner, reason, decided_at) VALUES ('b-faith01-1', 'self', 'test', ?)`).run(NOW);
@@ -104,6 +108,24 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
   check('非 retryable → failed_safe 終端 (note=エラーコード)', r3.failedSafe === 1 && sent.length === 1
     && db.prepare(`SELECT status FROM ${T.actions} WHERE order_number = 'b-faith01-2'`).get().status === 'failed_safe'
     && db.prepare(`SELECT note FROM ${T.attempts} WHERE action_id = (SELECT id FROM ${T.actions} WHERE order_number = 'b-faith01-2')`).get().note === 'order_not_found');
+  // releaseClaim の安全弁: token 必須 / 他人の token では解放できない / attempt が触られていたら解放しない
+  db.prepare(`INSERT INTO yahoo_order_contacts (order_number, shipping_datetime, masked_email_enc, fetched_at) VALUES ('b-faith01-3', '2026-09-01T12:00:00+09:00', '(api)', ?)`).run(NOW);
+  db.prepare(`INSERT INTO ${T.ownership} (order_number, owner, reason, decided_at) VALUES ('b-faith01-3', 'self', 'test', ?)`).run(NOW);
+  createCampaignEngine('yahoo').planCampaigns(db, { nowIso: NOW });
+  db.prepare(`UPDATE ${T.actions} SET status = 'ready', scheduled_at = '2026-09-11T03:00:00.000Z', ready_at = ? WHERE order_number = 'b-faith01-3'`).run(NOW);
+  const id3 = db.prepare(`SELECT id FROM ${T.actions} WHERE order_number = 'b-faith01-3'`).get().id;
+  const cl = Y.claimActionGuarded(db, id3, NOW);
+  check('releaseClaim: token 無しは throw', (() => { try { Y.releaseClaim(db, { actionId: id3 }); return false; } catch (e) { return /claimToken/.test(e.message); } })());
+  check('releaseClaim: 他人の token では解放しない (claimed のまま)', Y.releaseClaim(db, { actionId: id3, claimToken: 'not-mine', nowIso: NOW }) === false
+    && db.prepare(`SELECT status FROM ${T.actions} WHERE id = ?`).get(id3).status === 'claimed');
+  db.prepare(`UPDATE ${T.attempts} SET note = 'touched' WHERE action_id = ?`).run(id3);
+  check('releaseClaim: attempt が触られていたら解放せずロールバック', Y.releaseClaim(db, { actionId: id3, claimToken: cl.claimToken, nowIso: NOW }) === false
+    && db.prepare(`SELECT status FROM ${T.actions} WHERE id = ?`).get(id3).status === 'claimed'
+    && db.prepare(`SELECT COUNT(*) n FROM ${T.attempts} WHERE action_id = ?`).get(id3).n === 1);
+  db.prepare(`UPDATE ${T.attempts} SET note = NULL WHERE action_id = ?`).run(id3);
+  check('releaseClaim: 正しい token + 未使用 attempt → 解放', Y.releaseClaim(db, { actionId: id3, claimToken: cl.claimToken, nowIso: NOW }) === true
+    && db.prepare(`SELECT status FROM ${T.actions} WHERE id = ?`).get(id3).status === 'ready'
+    && db.prepare(`SELECT COUNT(*) n FROM ${T.attempts} WHERE action_id = ?`).get(id3).n === 0);
   check('楽天側の rakuten_campaign_delivery_attempts は空のまま', db.prepare(`SELECT COUNT(*) n FROM rakuten_campaign_delivery_attempts`).get().n === 0);
   check('楽天互換 selectEligibleActions は rakuten_ を見る (0件)', selectEligibleActions(db, { nowIso: NOW, limit: 10 }).eligible.length === 0);
 }
