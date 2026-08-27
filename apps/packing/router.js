@@ -31,7 +31,7 @@ import {
   resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
-import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR } from './reprint-pdf.js';
+import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR, LabelUnusableError } from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
@@ -424,18 +424,26 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
       // 送り状PDFの抜き出し→追送 (fire-and-forget・fail-soft)
       (async () => {
         try {
+          const batch = getPackBatch(row.batch_id);
           const r = await extractReprintPdf({
             folderName: row.folder_name, neSlipNo: row.ne_slip_no, recipientName: row.recipient_name,
-            slipSeq: row.slip_seq, slipCount: getPackBatch(row.batch_id)?.slip_count ?? null,
+            siteOrderNo: row.site_order_no,
+            slipSeq: row.slip_seq, slipCount: batch?.slip_count ?? null,
+            batchCreatedAt: batch?.created_at ?? null,
           });
           const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
-          getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=? WHERE id=?').run(r.token, row.id);
+          getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=?, pdf_by=?, pdf_printable=?, pdf_ink_ratio=? WHERE id=?')
+            .run(r.token, r.by, r.printable ? 1 : 0, r.inkRatio ?? null, row.id);
           await postReprintText(`📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
         } catch (e) {
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_error=? WHERE id=?')
             .run(String(e.message).slice(0, 120), row.id);
-          postReprintText(`⚠ ${row.ne_slip_no} の送り状PDFは自動で抜き出せませんでした (${String(e.message).slice(0, 80)}) — フォルダから該当分を印刷してください`)
-            .catch(() => {});
+          // 白紙・中身なしは「探せなかった」ではなく**そのページが使えない**。
+          // 印刷しても白紙が出るだけなので、リンクを渡さずはっきりエラーとして知らせる
+          const msg = e instanceof LabelUnusableError
+            ? `📄 ${row.ne_slip_no} の送り状PDFがエラーです (${String(e.message).slice(0, 90)}) — 印刷していません。元の送り状PDFを確認してください`
+            : `⚠ ${row.ne_slip_no} の送り状PDFは自動で抜き出せませんでした (${String(e.message).slice(0, 80)}) — フォルダから該当分を印刷してください`;
+          postReprintText(msg).catch(() => {});
         }
       })().catch((e) => console.warn(`[packing-reprint] PDF追送失敗 (${row.ne_slip_no}): ${e.message}`));
     }
