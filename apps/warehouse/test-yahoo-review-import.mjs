@@ -9,9 +9,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 import AdmZip from 'adm-zip';
+import zlib from 'node:zlib';
 import iconv from 'iconv-lite';
 import {
   ensureYahooReviewTables, prepareYahooReviewFile, importYahooReviewFile, reviewIdentityFor, revisionHashFor, parseWindowMarker, HEADER_COLS,
+  recordVerifiedSnapshot, getVerifiedSnapshot,
 } from './yahoo-review-lib.js';
 import { createCampaignEngine } from './rakuten-review-campaign-lib.js';
 
@@ -53,8 +55,25 @@ console.log('=== 1. ZIP/CSV 解釈 ===');
   check('ヘッダ不一致は拒否', !prepareYahooReviewFile('a.zip', badHdr.toBuffer()).ok);
   const two = new AdmZip(); two.addFile('a.csv', Buffer.from('x')); two.addFile('b.csv', Buffer.from('y'));
   check('ZIP エントリ 2 本は拒否', !prepareYahooReviewFile('two.zip', two.toBuffer()).ok);
-  const trav = new AdmZip(); trav.addFile('../evil.csv', iconv.encode(csvOf([]), 'Shift_JIS'));
-  check('path traversal エントリは拒否', !prepareYahooReviewFile('t.zip', trav.toBuffer()).ok);
+  // adm-zip は addFile 時に名前を正規化するので、ローカルヘッダに '../' を残した ZIP を手組みする (stored)
+  const rawZip = (name, data) => {
+    const crc = zlib.crc32(data) >>> 0;
+    const nameB = Buffer.from(name, 'utf8');
+    const lh = Buffer.alloc(30); lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0, 6); lh.writeUInt16LE(0, 8);
+    lh.writeUInt16LE(0, 10); lh.writeUInt16LE(0, 12); lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(data.length, 18); lh.writeUInt32LE(data.length, 22);
+    lh.writeUInt16LE(nameB.length, 26); lh.writeUInt16LE(0, 28);
+    const cd = Buffer.alloc(46); cd.writeUInt32LE(0x02014b50, 0); cd.writeUInt16LE(20, 4); cd.writeUInt16LE(20, 6); cd.writeUInt16LE(0, 8); cd.writeUInt16LE(0, 10);
+    cd.writeUInt16LE(0, 12); cd.writeUInt16LE(0, 14); cd.writeUInt32LE(crc, 16); cd.writeUInt32LE(data.length, 20); cd.writeUInt32LE(data.length, 24);
+    cd.writeUInt16LE(nameB.length, 28); cd.writeUInt16LE(0, 30); cd.writeUInt16LE(0, 32); cd.writeUInt16LE(0, 34); cd.writeUInt16LE(0, 36); cd.writeUInt32LE(0, 38); cd.writeUInt32LE(0, 42);
+    const cdOffset = 30 + nameB.length + data.length;
+    const eocd = Buffer.alloc(22); eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(0, 4); eocd.writeUInt16LE(0, 6); eocd.writeUInt16LE(1, 8); eocd.writeUInt16LE(1, 10);
+    eocd.writeUInt32LE(46 + nameB.length, 12); eocd.writeUInt32LE(cdOffset, 16); eocd.writeUInt16LE(0, 20);
+    return Buffer.concat([lh, nameB, data, cd, nameB, eocd]);
+  };
+  const csvBytes = iconv.encode(csvOf([]), 'Shift_JIS');
+  check('手組み ZIP (正常名) は受理', prepareYahooReviewFile('ok.zip', rawZip('20260101_20260301_ItemReview.csv', csvBytes)).ok);
+  const travRes = prepareYahooReviewFile('t.zip', rawZip('../evil.csv', csvBytes));
+  check('path traversal エントリは拒否', !travRes.ok && /不正/.test(travRes.error), travRes.error || 'accepted');
   check('素の CSV も受理', prepareYahooReviewFile('manual.csv', iconv.encode(csvOf(rows.slice(0, 1)), 'Shift_JIS')).ok);
   check('窓マーカー', JSON.stringify(parseWindowMarker('yreview_d2026-05-30_2026-08-27_x.zip')) === '{"from":"2026-05-30","to":"2026-08-27"}' && parseWindowMarker('20260530_20260827_ItemReview.zip') === null);
 }
@@ -105,18 +124,34 @@ console.log('=== 4. 削除検知 (検証済み全量スナップショットの�
   // o2 が消えた全量 (窓内)。1 回目 miss、2 回目 (別日) で deleted。窓外 (o3 は 8/20、窓 8/25〜) は対象外
   const rowsA = [row('20260827', 5, 'p1', 'o1', 't', 'good!!')];
   const bufA = zipOf(rowsA);
+  // 台帳未登録 (ファイル名マーカーだけ) → 削除検知しない
+  const rUnverified = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_u.zip', buffer: bufA, sha256: 'unverified', nowIso: '2026-08-30T00:00:00.000Z' });
+  check('台帳未登録のファイルはマーカーがあっても削除検知しない (信頼境界)', rUnverified.results[0].missed === 0 && rUnverified.results[0].deleted === 0
+    && db.prepare(`SELECT miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().miss_count === 0);
+  // 台帳の件数と行数が違えば取込自体を拒否
+  recordVerifiedSnapshot(db, { sha256: 'mismatch', from: '2026-08-25', to: '2026-08-29', screenCount: 5 });
+  const rMis = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_m.zip', buffer: bufA, sha256: 'mismatch', nowIso: '2026-08-30T00:00:00.000Z' });
+  check('台帳の画面件数 ≠ 行数 → error', rMis.status === 'error' && /一致しない/.test(rMis.results[0].error));
+  recordVerifiedSnapshot(db, { sha256: sha(bufA), from: '2026-08-25', to: '2026-08-29', screenCount: 1 });
+  check('台帳登録の読み出し', getVerifiedSnapshot(db, sha(bufA)).screen_count === 1);
   const rA = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_c.zip', buffer: bufA, sha256: sha(bufA), nowIso: '2026-08-30T00:00:00.000Z' });
   check('1 回目不在 → miss+1 (o2 のみ。窓外の o3/衝突 o9 は数えない)', rA.results[0].missed === 1 && rA.results[0].deleted === 0
     && db.prepare(`SELECT miss_count, is_deleted FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().miss_count === 1, JSON.stringify(rA.results[0]));
+  recordVerifiedSnapshot(db, { sha256: 'different', from: '2026-08-25', to: '2026-08-29', screenCount: 1 });
   const rA2 = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-29_d.zip', buffer: zipOf(rowsA, 'x.csv'), sha256: 'different', nowIso: '2026-08-30T02:00:00.000Z' });
   check('同日 2 回目は数えない', rA2.results[0].missed === 0 && rA2.results[0].deleted === 0);
+  recordVerifiedSnapshot(db, { sha256: 'different2', from: '2026-08-25', to: '2026-08-31', screenCount: 1 });
   const rB = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-08-31_e.zip', buffer: zipOf(rowsA, 'y.csv'), sha256: 'different2', nowIso: '2026-08-31T00:00:00.000Z' });
   check('別日 2 回連続不在 → is_deleted=1 + deleted revision', rB.results[0].deleted === 1
     && db.prepare(`SELECT is_deleted FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().is_deleted === 1
     && db.prepare(`SELECT COUNT(*) n FROM fact_yahoo_review_revisions WHERE is_deleted = 1`).get().n === 1);
   const rNoMarker = importYahooReviewFile(db, { name: 'manual2.zip', buffer: zipOf([], 'z.csv'), sha256: 'different3', nowIso: '2026-09-01T00:00:00.000Z' });
   check('窓マーカー無し (手動DL) は削除検知しない', rNoMarker.status === 'ok' && rNoMarker.results[0].missed === 0 && rNoMarker.results[0].deleted === 0);
+  recordVerifiedSnapshot(db, { sha256: 'different4', from: '2026-08-25', to: '2026-09-01', screenCount: 2 });
   const rBack = importYahooReviewFile(db, { name: 'yreview_d2026-08-25_2026-09-01_f.zip', buffer: zipOf([...rowsA, row('20260826', 2, 'p2', 'o2', 't', 'bad', 0, 1)], 'w.csv'), sha256: 'different4', nowIso: '2026-09-02T00:00:00.000Z' });
+  // 0 件スナップショット (ヘッダのみ CSV) も検証済みなら削除検知に使える
+  const empty = iconv.encode(csvOf([]), 'Shift_JIS');
+  check('ヘッダのみ CSV は 0 レコードとして受理', prepareYahooReviewFile('yreview_d2026-09-01_2026-09-03_empty.csv', empty).ok && prepareYahooReviewFile('e.csv', empty).records.length === 0);
   check('再出現で自己修復 (is_deleted=0, miss_count=0)', db.prepare(`SELECT is_deleted, miss_count FROM fact_yahoo_reviews WHERE order_number = 'o2'`).get().is_deleted === 0 && rBack.status === 'ok');
 }
 

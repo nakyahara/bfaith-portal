@@ -20,7 +20,8 @@
  *   env: REVIEW_DAYS=90 (1..90) / WAREHOUSE_DATA_DIR or DATA_DIR
  * exit: 0=成功 / 1=失敗 (通知済み) / 2=env / 3=2FA_REQUIRED (fetch-all はリトライしない)
  */
-import { mkdir, copyFile, readFile } from 'node:fs/promises';
+import { mkdir, copyFile, readFile, stat, readdir, unlink, writeFile } from 'node:fs/promises';
+import iconv from 'iconv-lite';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, basename } from 'node:path';
@@ -33,6 +34,8 @@ const OUT_DIR = join(__dirname, 'spike-output');
 const WAREHOUSE_DATA_DIR = (process.env.WAREHOUSE_DATA_DIR || process.env.DATA_DIR || '').trim();
 const INCOMING_DIR = WAREHOUSE_DATA_DIR ? join(WAREHOUSE_DATA_DIR, 'incoming', 'yahoo-review') : null;
 const TOOL_PATH = 'review/low_rate/item';
+const ZIP_MAX_BYTES = 20 * 1024 * 1024;
+const DOWNLOADS_KEEP_DAYS = 14; // 注文IDを含む生ZIPを downloads/ に無期限で残さない (Codex Y-A R1 Medium)
 
 function jstNow() { return new Date(Date.now() + 9 * 3600 * 1000); }
 const isoDate = (dt) => dt.toISOString().slice(0, 10);
@@ -96,7 +99,12 @@ async function applyFilter(page, win) {
   });
   if (!state.ratings.every(Boolean) || state.media.some(Boolean)) throw new Error(`FILTER: 絞り込み後の条件が想定外 (ratings=${state.ratings} media=${state.media})`);
   if (state.from !== slashDate(win.from) || state.to !== slashDate(win.to)) throw new Error(`FILTER: 期間が反映されていない (${state.from}〜${state.to})`);
-  if (state.total == null) throw new Error('FILTER: 「N件」の表示が読めない (0 件 or 画面仕様変更)');
+  if (state.total == null) {
+    // 0 件は「N件」表示が出ない可能性がある → 0 件文言を肯定証拠として要求 (無ければ画面仕様変更として止める)
+    const zero = await page.evaluate(() => /該当するレビューはありません|レビューはありません|0\s*件|見つかりません/.test(document.body.innerText.replace(/\s+/g, ' ')));
+    if (!zero) throw new Error('FILTER: 「N件」表示も 0 件文言も読めない (画面仕様変更の疑い)');
+    return 0;
+  }
   return state.total;
 }
 
@@ -106,9 +114,17 @@ async function fetchWindow(page, win) {
   await gotoStorePage(page, `${STORE_TOP_URL}/${TOOL_PATH}`, '商品レビューチェックツール');
   const total = await applyFilter(page, win);
   console.log(`  [filter] 画面の総件数 = ${total}`);
+  const { prepareYahooReviewFile, HEADER_COLS } = await import('../../apps/warehouse/yahoo-review-lib.js');
   if (total === 0) {
-    await logFetch({ report_type: 'yreview_zip', period_from: win.from, period_to: win.to, status: 'empty', message: 'レビュー0件' });
-    return { files: 0, rows: 0, empty: true };
+    // 0 件も「完全スナップショット」として投入する (窓内の全レビュー削除を検知するため — Codex Y-A R1 High)
+    const ts0 = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
+    const dest0 = join(DL_DIR, `yreview_d${win.from}_${win.to}_${ts0}_empty.csv`);
+    const csv0 = iconv.encode(HEADER_COLS.map((c) => `"${c}"`).join(',') + '\r\n', 'Shift_JIS');
+    await writeFile(dest0, csv0);
+    const p0 = prepareYahooReviewFile(basename(dest0), csv0);
+    if (!p0.ok || p0.records.length !== 0) throw new Error(`DL_VERIFY: 0件スナップショットの生成に失敗 (${p0.error || p0.records.length})`);
+    await persist(dest0, csv0, win, 0);
+    return { files: 1, rows: 0, empty: true };
   }
   const dlBtn = page.locator('button, input[type=submit], input[type=button], a').filter({ hasText: /ダウンロード/ }).first();
   const dlPromise = page.waitForEvent('download', { timeout: 120000 });
@@ -117,33 +133,62 @@ async function fetchWindow(page, win) {
   const ts = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
   const dest = join(DL_DIR, `yreview_d${win.from}_${win.to}_${ts}.zip`);
   await download.saveAs(dest);
+  const size = (await stat(dest)).size;
+  if (size > ZIP_MAX_BYTES) throw new Error(`DL_VERIFY: ZIP が大きすぎる (${size} bytes > ${ZIP_MAX_BYTES})。メモリに読まない`);
   const buf = await readFile(dest);
-  const sha256 = createHash('sha256').update(buf).digest('hex');
   console.log(`  ✅ ダウンロード成功: ${download.suggestedFilename()} → ${basename(dest)} (${buf.length.toLocaleString()} bytes)`);
 
-  const { prepareYahooReviewFile } = await import('../../apps/warehouse/yahoo-review-lib.js');
   const p = prepareYahooReviewFile(basename(dest), buf);
   if (!p.ok) throw new Error(`DL_VERIFY: 取込レシピを通らない ZIP/CSV (${p.error})。画面仕様変更の疑い`);
   const rows = p.records.length + p.conflicts.length;
   if (rows !== total) throw new Error(`DL_VERIFY: 行数 ${rows} が画面の件数 ${total} と一致しない (部分ダウンロード/フィルタ不一致の疑い)。incoming には置かない`);
   if (p.dateFrom && (p.dateFrom < win.from || p.dateTo > win.to)) throw new Error(`DL_VERIFY: 窓 ${label} の外の評価日 (${p.dateFrom}〜${p.dateTo}) が混入`);
   console.log(`  [verify] ${p.label} (${p.dateFrom}〜${p.dateTo}) = 画面件数と一致`);
-
-  if (INCOMING_DIR) {
-    await mkdir(INCOMING_DIR, { recursive: true });
-    await copyFile(dest, join(INCOMING_DIR, basename(dest)));
-    console.log(`  → incoming投入: ${join(INCOMING_DIR, basename(dest))}`);
-  } else {
-    console.log('  ⚠ WAREHOUSE_DATA_DIR 未設定のため incoming/ 投入スキップ');
-  }
-  await logFetch({ report_type: 'yreview_zip', period_from: win.from, period_to: win.to, file_name: basename(dest), file_sha256: sha256, file_bytes: buf.length, status: 'ok', message: `${rows}件` });
+  await persist(dest, buf, win, rows);
   return { files: 1, rows, empty: false };
+}
+
+/** 検証済みスナップショットを台帳 (yahoo_review_snapshots) に登録してから incoming へ。台帳登録に失敗したら投入しない
+ *  (importer は台帳に無いファイルを削除検知に使わないため、投入だけすると「取込はされるが削除検知なし」になる=安全側だが意図と違う) */
+async function persist(dest, buf, win, rows) {
+  const sha256 = createHash('sha256').update(buf).digest('hex');
+  const { default: Database } = await import('better-sqlite3');
+  const { ensureYahooReviewTables, recordVerifiedSnapshot } = await import('../../apps/warehouse/yahoo-review-lib.js');
+  const db = new Database(join(WAREHOUSE_DATA_DIR, 'warehouse.db'));
+  try {
+    db.pragma('busy_timeout = 5000');
+    ensureYahooReviewTables(db);
+    recordVerifiedSnapshot(db, { sha256, from: win.from, to: win.to, screenCount: rows });
+  } finally { db.close(); }
+  await mkdir(INCOMING_DIR, { recursive: true });
+  await copyFile(dest, join(INCOMING_DIR, basename(dest)));
+  console.log(`  → 検証済みスナップショット登録 (${sha256.slice(0, 12)}…) → incoming投入: ${join(INCOMING_DIR, basename(dest))}`);
+  await logFetch({ report_type: 'yreview_zip', period_from: win.from, period_to: win.to, file_name: basename(dest), file_sha256: sha256, file_bytes: buf.length, status: rows === 0 ? 'empty' : 'ok', message: `${rows}件` });
+}
+
+/** downloads/ の古い生ZIP/CSV を消す (注文IDを含むため保持期限を設ける) */
+async function purgeOldDownloads() {
+  const cutoff = Date.now() - DOWNLOADS_KEEP_DAYS * 86400000;
+  let n = 0;
+  for (const f of await readdir(DL_DIR).catch(() => [])) {
+    if (!/^yreview_/.test(f)) continue;
+    const st = await stat(join(DL_DIR, f)).catch(() => null);
+    if (st && st.mtimeMs < cutoff) { await unlink(join(DL_DIR, f)).catch(() => {}); n++; }
+  }
+  if (n) console.log(`  [purge] downloads/ の ${DOWNLOADS_KEEP_DAYS} 日超の yreview_* を ${n} 件削除`);
 }
 
 async function main() {
   const runLog = initRunLog('yahoo-review');
+  if (!WAREHOUSE_DATA_DIR || !INCOMING_DIR) {
+    // 取込先が無いのに exit 0 で終わると監視上は成功に見える (Codex Y-A R1 Medium) → env 不備は exit 2
+    console.error('FATAL: WAREHOUSE_DATA_DIR (or DATA_DIR) が未設定。incoming/yahoo-review/ へ投入できないため中止');
+    process.exitCode = 2;
+    return;
+  }
   await mkdir(DL_DIR, { recursive: true });
   await mkdir(OUT_DIR, { recursive: true });
+  await purgeOldDownloads();
   const win = computeWindow();
   let context;
   try {
@@ -173,7 +218,7 @@ async function main() {
     await sendGChat(buildErrorReport({
       mall: 'yahoo-review', outcomes, logPath: runLog.logPath,
       failures: [{ reportType: is2fa ? '2FA_REQUIRED (Yahoo セッション切れ)' : 'yreview_zip', error: err.message, url: page.url(), screenshot: join(OUT_DIR, 'yreview_error.png') }],
-      repro: is2fa ? 'miniPC のデスクトップ「Yahoo-Relogin.bat」で再ログイン (確認コードはメール)' : 'node scripts/mall-csv-fetcher/yahoo-review-download.mjs (手動DL → incoming/yahoo-review/ でも可。ファイル名に _dYYYY-MM-DD_YYYY-MM-DD_ を付けると削除検知に使う)',
+      repro: is2fa ? 'miniPC のデスクトップ「Yahoo-Relogin.bat」で再ログイン (確認コードはメール)' : 'node scripts/mall-csv-fetcher/yahoo-review-download.mjs (手動DL → incoming/yahoo-review/ でも可 (手動分は取込のみ。削除検知は自動DLの検証済みスナップショットだけ))',
     }), 'yahoo-review');
     process.exitCode = is2fa ? 3 : 1;
   } finally {

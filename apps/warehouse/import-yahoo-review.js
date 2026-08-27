@@ -5,7 +5,7 @@
  * <DATA_DIR>/incoming/yahoo-review/ 直下の *.zip / *.csv を走査して warehouse.db へ UPSERT
  * (fact_yahoo_reviews、identity/revision 方式)。成功 → processed/YYYY-MM/、失敗 → failed/。sha256 冪等。
  * 低評価 (★1-2 の初回観測・★3以上→★2以下の遷移) と identity 衝突は GChat 通知 (キュー方式、fail-soft)。
- * 削除検知はファイル名に窓マーカー `_d<from>_<to>_` があるもの (= downloader が全量検証済み) だけ。
+ * 削除検知は yahoo_review_snapshots (downloader が「画面件数=行数」を検証して登録した sha256) に一致するファイルだけ。手動DL分は取込のみ。
  *
  * 実行: node apps/warehouse/import-yahoo-review.js [--data-dir <dir>] [--dry-run]
  * env: DATA_DIR / GCHAT_WEBHOOK_MALL_FETCH (or GCHAT_WEBHOOK) / NOTIFY_LOW_REVIEW=0 で通知抑止
@@ -71,6 +71,23 @@ async function notifyLowRatings(db) {
     console.log(`  ⚠ GChat通知失敗 (キューに残置、次回リトライ): ${e.message}`);
   }
 }
+
+// processed/ の生ZIP (注文IDを含む) は 90 日で削除 (保持期限 — Codex Y-A R1 Medium)
+const PROCESSED_KEEP_DAYS = 90;
+try {
+  const cutoff = Date.now() - PROCESSED_KEEP_DAYS * 86400000;
+  let purged = 0;
+  for (const ym of fs.readdirSync(processedRoot)) {
+    const dir = path.join(processedRoot, ym);
+    if (!fs.statSync(dir).isDirectory()) continue;
+    for (const f of fs.readdirSync(dir)) {
+      const fp = path.join(dir, f);
+      if (fs.statSync(fp).mtimeMs < cutoff) { fs.unlinkSync(fp); purged++; }
+    }
+    if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir);
+  }
+  if (purged) console.log(`[purge] processed/ の ${PROCESSED_KEEP_DAYS} 日超を ${purged} 件削除`);
+} catch (e) { console.warn(`[purge] processed/ 掃除失敗 (続行): ${e.message}`); }
 
 const entries = fs.readdirSync(incomingDir, { withFileTypes: true })
   .filter((e) => e.isFile() && /\.(zip|csv)$/i.test(e.name)).map((e) => e.name).sort();
