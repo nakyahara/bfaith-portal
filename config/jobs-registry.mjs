@@ -99,6 +99,26 @@ export const JOBS_REGISTRY = [
   },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
   {
+    id: 'ph-generate-nightly',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'product-hub「AI情報入力待ち」の夜間自動生成 (Claude Code headless・サブスク枠、2026-08-28)。'
+      + '裏取り→生成→copy_lint→Codex検品→書き戻し。生成できない draft は generation-block で人待ち (ボードに ⚠)。'
+      + '成否は Claude の自己申告でなくサーバの queue で判定: 未処理 (claimable+leased) が 0 → ok / 減れば partial / 減らない・timeout → fail。'
+      + 'Claude がシェルで実行できるのは固定機能 CLI ./phq と検品ラッパー ./phreview だけ (トークンは phq の中・Claude は見ない。bin/ と設定は ACL で書き換え不可)',
+    where: 'miniPC TaskScheduler [PhGenerateNightly] (scripts/ph-nightly/run-ph-generate.ps1、bfaith Interactive = ログオン中のみ・RunLevel Limited)',
+    schedule: '毎日 02:30 (claimable が 0 の夜も claude auth status を検査して ok を打つ = 認証切れを静かな週に見逃さない)',
+    anchor_hour_jst: 2,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md。C:\\tools\\ph-nightly\\logs\\runner.log の末尾を見る: '
+      + '"not logged in" → bfaith で cd C:\\tools\\ph-nightly\\work; claude → /login / "no progress" → 同 logs の *.err.log '
+      + '(permission denied は allow を安易に増やさず ./phq で代替できないか先に確認 / codex 未ログイン / Amazon の HTML 構造変更) / '
+      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly',
+  },
+  {
     id: 'mall-csv-fetch-all',
     type: 'scheduled_job',
     importance: 'P1',

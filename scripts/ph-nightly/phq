@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# phq shim (lives in work/, write-protected by ACL). Runs the fixed-function CLI from bin/.
+# One of only two shell commands the nightly Claude Code session may run (see settings.json).
+here="$(cd "$(dirname "$0")" && pwd)"
+exec node "$here/../bin/phq.mjs" "$@"
