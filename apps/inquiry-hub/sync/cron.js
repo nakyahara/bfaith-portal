@@ -21,6 +21,7 @@ import { createYahooAdapter, resolveYahooTransportFromEnv, DEEP_LIST_LOOKBACK_DA
 import { createGmailAdapter, resolveGmailTransportFromEnv, resolveRakutenMaskSmtpFromEnv } from './adapters/gmail.js';
 import { sendGChatMessage } from '../../profit-analysis/gchat-client.js';
 import { pingJobThrottled } from '../../jobs-monitor/ping-local.js';
+import { buildCutoffNotice, cutoffNoticeCrons } from '../cutoff.js';
 
 export const DEFAULT_SYNC_CRON = '*/15 * * * *';
 // UTC 20:37 = JST 05:37。miniPC daily-sync (JST 07:00) 前の静かな時間帯で、かつ通常同期の
@@ -306,6 +307,81 @@ export function startInquiryHubOutboxCron() {
   timer.unref?.(); // プロセス終了を妨げない
   console.log(`[inquiry-hub-outbox] 送信ワーカー起動: ${intervalMs}ms間隔, モード= メール:${mailMode} / 楽天:${rkMode} / Yahoo:${yhMode} (dryrunは実送信しません)`);
   return timer;
+}
+
+/**
+ * ⏰締め前通知 (2026-08-28)。ロジザードの締め (09:00 / 12:30 / 14:30 JST) の少し前に、
+ * キャンセル・住所変更・日時指定の未対応をGChatへ流す。
+ *
+ * ⭐0件でも必ず送る — 通知が来なければ「仕組みが止まった」と気づけるようにするため
+ *   (この通知そのものが dead-man を兼ねる)。
+ * 既定は締めの15分前 (JST 08:45 / 12:15 / 14:15 = UTC 23:45 / 03:15 / 05:15)。
+ */
+// ⭐締め時刻の正本は cutoff.js の CUTOFF_TIMES。cron 式はそこから導出する
+// (時刻とcronを別々に書くと、締めが変わったときに必ずずれる。Codexレビュー指摘)
+export const DEFAULT_CUTOFF_CRONS = cutoffNoticeCrons();
+
+/**
+ * 締め前通知を1回送る (手動実行・テストからも呼べる)。
+ * 失敗しても throw しない代わりに、**何で失敗したかを reason で返す**。
+ * 呼び元は sent===true のときだけ生存 ping を打つ (Codexレビュー指摘)
+ * @returns {{ sent: boolean, reason?: 'build_failed'|'no_webhook'|'send_failed', error?, text? }}
+ */
+export async function runCutoffNoticeTick({ webhook = process.env.GCHAT_WEBHOOK, nowMs = Date.now() } = {}) {
+  const baseUrl = process.env.PUBLIC_BASE_URL || 'https://bfaith-portal.onrender.com';
+  let text;
+  try {
+    text = buildCutoffNotice({ nowMs, baseUrl });
+  } catch (e) {
+    console.error(`[inquiry-hub-cutoff] ❌通知文の組み立てに失敗 (通知は出ていません): ${e?.message || e}`);
+    return { sent: false, reason: 'build_failed', error: String(e?.message || e) };
+  }
+  if (!webhook) {
+    console.warn(`[inquiry-hub-cutoff] ⚠️GCHAT_WEBHOOK 未設定のため誰にも届きません (stdout のみ):\n${text}`);
+    return { sent: false, reason: 'no_webhook', text };
+  }
+  try {
+    await sendGChatMessage(webhook, text);
+    console.log('[inquiry-hub-cutoff] 締め前通知を送信しました');
+    return { sent: true, text };
+  } catch (e) {
+    // 通知の失敗でプロセスを落とさない (次の締めでまた送る)。ping は打たないので監視には出る
+    console.error(`[inquiry-hub-cutoff] ❌GChat送信失敗 (通知は届いていません): ${e?.message || e}`);
+    return { sent: false, reason: 'send_failed', error: String(e?.message || e), text };
+  }
+}
+
+/** INQUIRY_HUB_CUTOFF_CRON_ENABLED='true'|'1' のときだけ schedule する (Dark Launch) */
+export function startInquiryHubCutoffCron() {
+  const enabled = process.env.INQUIRY_HUB_CUTOFF_CRON_ENABLED;
+  if (enabled !== 'true' && enabled !== '1') {
+    console.log('[inquiry-hub-cutoff] INQUIRY_HUB_CUTOFF_CRON_ENABLED が未設定/false のためスケジュールしない (Dark Launch)');
+    return null;
+  }
+  // カンマ区切りで上書き可 (締め時刻を変えたときはここと cutoff.js の CUTOFF_TIMES を揃える)
+  const exprs = (process.env.INQUIRY_HUB_CUTOFF_CRONS || DEFAULT_CUTOFF_CRONS.join(','))
+    .split(',').map(s => s.trim()).filter(Boolean);
+  for (const expr of exprs) {
+    if (!cron.validate(expr)) {
+      console.error(`[inquiry-hub-cutoff] INQUIRY_HUB_CUTOFF_CRONS が不正: ${expr}`);
+      return null;
+    }
+  }
+  const tasks = exprs.map(expr => cron.schedule(expr, () => {
+    runCutoffNoticeTick()
+      // ⭐dead-man ping は「実際に送れたとき」だけ打つ (台帳 config/jobs-registry.mjs)。
+      //   webhook 未設定や GChat 側の障害で誰にも届いていないのに ping を出すと、
+      //   「動いているのに誰も見ていない」状態が緑のまま埋もれる (Codexレビュー指摘)。
+      //   通知は1日3回なので間引かない
+      .then(r => {
+        if (r?.sent) return pingJobThrottled('inquiry-hub-cutoff', '締め前通知を送信', 0);
+        console.warn(`[inquiry-hub-cutoff] 生存pingを送りません (理由: ${r?.reason || '不明'}) — 監視側で締切超過になります`);
+        return null;
+      })
+      .catch((e) => console.error('[inquiry-hub-cutoff] 生存ping失敗:', e));
+  }, { timezone: 'UTC' }));
+  console.log(`[inquiry-hub-cutoff] 締め前通知をスケジュール: ${exprs.join(' / ')} (UTC)`);
+  return tasks;
 }
 
 /** INQUIRY_HUB_SYNC_CRON_ENABLED='true'|'1' のときだけ schedule する (Dark Launch) */
