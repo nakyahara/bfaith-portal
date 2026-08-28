@@ -44,6 +44,9 @@ export let logizardStockInitError = null;
 // 新商品企画スカウト表も同様 (apps/product-scout、2026-08-28)
 export let productScoutInitError = null;
 
+// SKUマップ 2種 (yahoo/aupay) も同様 (価格一括改定ツール PR1、2026-08-28)
+export let skuMapInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -57,6 +60,7 @@ export function initMirrorDB() {
   shipmentsDailyInitError = null;
   logizardStockInitError = null;
   productScoutInitError = null;
+  skuMapInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -1088,6 +1092,45 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] 楽天レビュー集計表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── SKUマップ 2種 (価格一括改定ツール PR1、2026-08-28) ───
+  // miniPC の f_yahoo_sku_map / f_aupay_sku_map (= モール出品コード → NEコード の手動 map) を mirror へ。
+  // 用途: 価格一括改定ツール (apps/price-update) の出品引き当て。Render 側は read-only。
+  // ★clear_strategy='full_snapshot' で毎回全置換する。no_clear upsert だと miniPC で
+  //   「誤りとして削除した map」が mirror に残り続け、別人の商品に値付けする事故になる。
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_sku_map (
+      yahoo_key   TEXT NOT NULL PRIMARY KEY CHECK(trim(yahoo_key) <> ''),
+      store_id    TEXT NOT NULL DEFAULT 'b-faith01',
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> ''),
+      resolution_source TEXT NOT NULL,
+      notes       TEXT,
+      created_at  TEXT,
+      updated_at  TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mysm_ne ON mirror_yahoo_sku_map(ne_code)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_sku_map (
+      store_id    TEXT NOT NULL DEFAULT 'b-faith01',
+      aupay_key   TEXT NOT NULL CHECK(trim(aupay_key) <> ''),
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> ''),
+      resolution_source TEXT NOT NULL,
+      notes       TEXT,
+      created_at  TEXT,
+      updated_at  TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (store_id, aupay_key)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_masm_ne ON mirror_aupay_sku_map(ne_code)');
+  } catch (e) {
+    skuMapInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] SKUマップ表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // ─── 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数、2026-08-05) ───

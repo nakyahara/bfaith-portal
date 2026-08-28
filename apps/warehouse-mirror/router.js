@@ -13,7 +13,7 @@
  */
 import { Router } from 'express';
 import crypto from 'crypto';
-import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError } from './db.js';
+import { initMirrorDB, getMirrorDB, yahooInitError, aupayDataInitError, qoo10DataInitError, rakutenReviewInitError, logizardStockInitError, skuMapInitError } from './db.js';
 import { bootStart, bootEnd, bootFail } from '../observability/boot-log.js';
 import {
   STORE_BENCH_COLS, STORE_DEVICE_BASE_COLS, STORE_DEVICE_OPT_COLS, CATEGORY_DEMO_COLS,
@@ -1179,8 +1179,26 @@ const RAKUTEN_REVIEW_TABLE_SPECS = {
 };
 const RAKUTEN_REVIEW_ENTITY_NAMES = new Set(Object.keys(RAKUTEN_REVIEW_TABLE_SPECS));
 
+// SKUマップ 2種 (価格一括改定ツール PR1、2026-08-28)。モール出品コード → NEコード の手動 map。
+// full_snapshot = 毎 run 全置換 (miniPC で削除された map を mirror に残さない)
+const SKU_MAP_TABLE_SPECS = {
+  yahoo_sku_map: {
+    table: 'mirror_yahoo_sku_map',
+    required: ['yahoo_key', 'ne_code', 'resolution_source'],
+    cols: ['yahoo_key', 'store_id', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
+    defaults: { store_id: 'b-faith01' },
+  },
+  aupay_sku_map: {
+    table: 'mirror_aupay_sku_map',
+    required: ['store_id', 'aupay_key', 'ne_code', 'resolution_source'],
+    cols: ['store_id', 'aupay_key', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
+    defaults: { store_id: 'b-faith01' },
+  },
+};
+const SKU_MAP_ENTITY_NAMES = new Set(Object.keys(SKU_MAP_TABLE_SPECS));
+
 // 楽天dd + Yahoo + au PAY分析 + Qoo10 + 楽天レビュー を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
-const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS };
+const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS, ...SKU_MAP_TABLE_SPECS };
 
 function getRakutenDdInsert(db, entityKey) {
   const b = getStmtBundle(db);
@@ -1855,6 +1873,14 @@ const ENTITY_REGISTRY = {
     getInsertStmt: (db) => getRakutenDdInsert(db, key),
     normalizeRow: (r) => normalizeRakutenDdRow(key, r),
   }])),
+  // SKUマップ 2 entity (価格一括改定ツール PR1、2026-08-28)。全置換 = full_snapshot
+  ...Object.fromEntries(Object.keys(SKU_MAP_TABLE_SPECS).map((key) => [key, {
+    contract_version: 1,
+    mirror_table: SKU_MAP_TABLE_SPECS[key].table,
+    clear_strategy: 'full_snapshot',
+    getInsertStmt: (db) => getRakutenDdInsert(db, key),
+    normalizeRow: (r) => normalizeRakutenDdRow(key, r),
+  }])),
   // 楽天レビュー 日次集計 1 entity (mall-csv-fetcher P2 PR-A、2026-07-16)
   rakuten_review_daily: {
     contract_version: 1,
@@ -2099,6 +2125,9 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   if (RAKUTEN_REVIEW_ENTITY_NAMES.has(entity) && rakutenReviewInitError) {
     return res.status(503).json({ error: 'rakuten review tables init failed', init_error: rakutenReviewInitError });
   }
+  if (SKU_MAP_ENTITY_NAMES.has(entity) && skuMapInitError) {
+    return res.status(503).json({ error: 'sku map tables init failed', init_error: skuMapInitError });
+  }
   if (contract_version !== entityCfg.contract_version) {
     return res.status(400).json({
       error: 'contract_version_mismatch',
@@ -2119,6 +2148,23 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
   }
   let clearDates = null;
   const clearStrategy = entityCfg.clear_strategy || 'date_range';  // backward compat
+  // full_snapshot (SKUマップ 2種): 毎 run で mirror 表を全置換する。分割 run は
+  // 「clear 済みだが後続 chunk が届かない」窓で表が欠けるため、単一 chunk のみ受ける
+  // (対象は数百行のマスタ。増えて分割されたら 400 で気づける = 黙って壊れない)
+  if (clearStrategy === 'full_snapshot' && chunk_count !== 1) {
+    return res.status(400).json({
+      error: 'full_snapshot_requires_single_chunk',
+      message: `entity=${entity} は full_snapshot のため chunk_count=1 のみ受信可 (got ${chunk_count})`,
+    });
+  }
+  // 空 snapshot は fail-closed。送信側の事故 (source 表の消失・SELECT ミス) で mirror を
+  // 黙って空にしない。本当に 0 件にしたい時だけ meta.allow_empty_snapshot=true を明示する
+  if (clearStrategy === 'full_snapshot' && rows.length === 0 && meta.allow_empty_snapshot !== true) {
+    return res.status(400).json({
+      error: 'empty_snapshot_rejected',
+      message: `entity=${entity} の full_snapshot が 0 件。意図的なら meta.allow_empty_snapshot=true を付けてください`,
+    });
+  }
   if (is_first && clearStrategy === 'date_range') {
     clearDates = meta[entityCfg.clear_meta_key];
     if (!Array.isArray(clearDates) || clearDates.length === 0) {
@@ -2282,6 +2328,17 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
             `).run(...clearDates).changes;
             didClear = true;
           }
+        }
+      }
+      // 4c-2. full_snapshot (SKUマップ 2種): 全行 DELETE → 同一 tx 内でこの chunk を INSERT。
+      // 単一 chunk 限定なので clear と投入が原子的に入れ替わり、途中で空になる窓が無い
+      if (is_first && clearStrategy === 'full_snapshot') {
+        const priorCount = db.prepare(`
+          SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
+        `).get(sync_run_id, entity).c;
+        if (priorCount === 0) {
+          clearedRows = db.prepare(`DELETE FROM ${entityCfg.mirror_table}`).run().changes;
+          didClear = true;
         }
       }
       // H-4: clear_dates の持ち越し保存は priorCount に依存させない (chunk 0 が後着する run —
@@ -3210,6 +3267,12 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
         // MF entity (clear_strategy='no_clear') は source_run_id 列を持たないので skip
         // backout は MF 専用 endpoint (Phase 2 で追加予定) で対応
         if (cfg.clear_strategy === 'no_clear') {
+          deleted[entity] = 0;
+          continue;
+        }
+        // full_snapshot (SKUマップ) も skip: この run の行を消すと直前の snapshot が
+        // 戻らず表が空になる (= backout がデータ全消しになる)。再送で正しい状態に戻す
+        if (cfg.clear_strategy === 'full_snapshot') {
           deleted[entity] = 0;
           continue;
         }
