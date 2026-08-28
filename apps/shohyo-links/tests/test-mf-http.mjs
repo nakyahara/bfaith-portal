@@ -67,6 +67,56 @@ check('明細API 不正な期間は400', r.status === 400 && (await r.json()).er
 r = await fetch(base + '/apps/shohyo-links/api/mf/transactions?start=2026-08-01&end=2026-08-31');
 check('明細API 未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
 
+// 受け箱
+r = await fetch(base + '/apps/shohyo-links/mf/inbox', { redirect: 'manual' });
+check('/mf/inbox は200', r.status === 200, String(r.status));
+const b64 = Buffer.from('%PDF-1.4 smoke').toString('base64');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: '2026-08-08_21092_ロジマート.pdf', file_data: b64, mime: 'application/pdf' }) });
+let j = await r.json();
+check('受け箱に入り、ファイル名規約から日付・金額・支払先が入る', r.status === 200 && j.result.row.doc_date === '2026-08-08' && j.result.row.amount === 21092 && j.result.row.vendor_name === 'ロジマート');
+const inboxId = j.result.row.id;
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'dup.pdf', file_data: b64, mime: 'application/pdf' }) });
+check('同じ内容は duplicate', (await r.json()).result.duplicate === true);
+r = await fetch(base + '/apps/shohyo-links/api/inbox');
+j = await r.json();
+check('一覧に1件・提案モード既定', j.result.rows.length === 1 && j.result.auto_attach === false);
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/file`);
+check('ファイルを返す', r.status === 200 && (await r.text()).startsWith('%PDF'));
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: 21000 }) });
+check('メタ修正', (await r.json()).result.amount === 21000);
+r = await fetch(base + '/apps/shohyo-links/api/inbox/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('照合は未接続で401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('相手未指定の添付は400', r.status === 400 && (await r.json()).error === 'target_required');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/exclude`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('除外', (await r.json()).result.status === 'excluded');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/reopen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('戻す', (await r.json()).result.status === 'new');
+r = await fetch(base + '/apps/shohyo-links/api/inbox/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_attach: true }) });
+check('自動添付の切替は admin 以外 403', r.status === 403 && (await r.json()).error === 'admin_only');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: Buffer.from('<html>').toString('base64') }) });
+check('PDF/JPEG/PNG 以外は415', r.status === 415 && (await r.json()).error === 'unsupported_file');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: '!!!notbase64' }) });
+check('壊れたbase64は400', r.status === 400 && (await r.json()).error === 'bad_base64');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'y.pdf', file_data: Buffer.from('%PDF-1.4 y').toString('base64'), doc_date: '2026-02-30' }) });
+check('存在しない日付は400', r.status === 400 && (await r.json()).error === 'bad_date');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'not-a-candidate' }) });
+check('候補にない明細への添付は400', r.status === 400 && (await r.json()).error === 'not_a_candidate');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'z.pdf', file_data: Buffer.from('%PDF-1.4 z').toString('base64'), vendor_id: 999999 }) });
+check('存在しない vendor_id は400', r.status === 400 && (await r.json()).error === 'bad_vendor_id');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'x'.repeat(300) }) });
+check('長すぎる tx_id は400', r.status === 400 && (await r.json()).error === 'bad_tx_id');
+r = await fetch(base + '/apps/shohyo-links/api/inbox/abc/file');
+check('不正IDは404', r.status === 404);
+r = await fetch(base + '/apps/shohyo-links/api/inbox?status=bogus');
+check('未知の status は400', r.status === 400);
+
 server.close();
 console.log(ng ? `\n${ng}件NG` : '\n全件パス');
 process.exitCode = ng ? 1 : 0;
