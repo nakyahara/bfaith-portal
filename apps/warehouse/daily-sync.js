@@ -1317,10 +1317,16 @@ async function main() {
     if (health.refreshTokenExpiresAt) {
       const expiry = new Date(health.refreshTokenExpiresAt);
       const daysLeft = Math.floor((expiry - new Date()) / 86400000);
-      if (daysLeft <= 3) {
-        tokenWarnings.push(`🔴 Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）→ 再認可が必要！`);
-      } else if (daysLeft <= 7) {
-        tokenWarnings.push(`🟡 Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）`);
+      if (daysLeft <= 7) {
+        // 再認可は在庫検索ボットへ「yahoo再認可」と送れば URL と手順が出る (apps/stock-bot/yahoo-reauth.js)。
+        // ここでも認可 URL を直接添えて 1 タップで始められるようにする
+        let authLine = '';
+        try {
+          const r = await fetch(`${yahooProxyUrl}/yahoo/auth-url`, { headers: { 'X-Proxy-Secret': yahooProxySecret }, signal: AbortSignal.timeout(10000) });
+          const j = r.ok ? await r.json() : null;
+          if (j?.url) authLine = `\n　→ 再認可: 在庫検索ボットに「yahoo再認可」と送る / または ${j.url} を開いて戻り先 URL をボットに貼る`;
+        } catch { /* URL 取得失敗は警告本体だけ出す */ }
+        tokenWarnings.push(`${daysLeft <= 3 ? '🔴' : '🟡'} Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）${daysLeft <= 3 ? '→ 再認可が必要！' : ''}${authLine}`);
       }
     } else if (health.tokenExpiry) {
       tokenWarnings.push('🟡 Yahoo refresh token 期限不明（次回認可時に記録されます）');
