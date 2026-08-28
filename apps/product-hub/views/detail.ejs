@@ -578,6 +578,13 @@
         <div style="flex:1">
           <label>JANコード<span class="ftag ftag-m">手入力</span></label>
           <input type="text" id="f-jan" inputmode="numeric" value="<%= draft.jan_code || '' %>">
+          <% if (variation.kind === 'variation' && variation.members.length > 1) { %>
+            <%# 2026-08-28 中原さん要望: バリエーションありのときは SKU ごとに JAN を控える %>
+            <div class="muted" style="font-size:11px;">
+              バリエーションありです — SKUごとのJANは右の「このページに載るSKU」表で入力してください
+              (この欄はページ代表の1つ = 楽天のカタログID用)
+            </div>
+          <% } %>
         </div>
         <div style="flex:1">
           <!-- 税率は基本情報 (2026-08-06 中原さん指示: Yahoo!欄から移動)。楽天・Yahoo!両方の登録で使う -->
@@ -719,10 +726,17 @@
               💰 原価がSKUごとに異なります。<strong>売価もSKUごとに設定</strong>してください (空欄 = ページ代表の売価 <%= draft.price != null ? draft.price.toLocaleString() + '円' : '未設定' %> を使う。入力すると即保存)。
             </p>
           <% } %>
+          <%# SKU別JAN (2026-08-28 中原さん要望) %>
+          <p class="muted" style="margin:8px 0 0; font-size:12px;">
+            🏷 <strong>JANコードはSKUごと</strong>に入力してください (入力すると即保存。空欄にすると解除)。
+            基本情報タブのJAN欄はこのページ代表の1つ (楽天のカタログID用) です。
+          </p>
           <table class="list" style="margin-top:8px;">
             <thead><tr>
               <th style="width:170px">商品コード</th><th>商品名</th><th style="width:80px">取扱区分</th><th style="width:50px">在庫</th>
               <th style="width:80px">原価<span class="muted" style="font-weight:400">(税抜)</span></th>
+              <%# SKU別JAN (2026-08-28 中原さん要望)。バリエーションありのときはページ代表のJAN1つでは足りない %>
+              <th style="width:140px">JANコード</th>
               <% if (showSkuPrices) { %><th style="width:100px">売価<span class="muted" style="font-weight:400">(税込)</span></th><th style="width:110px">利益</th><% } %>
               <th style="width:70px"></th>
             </tr></thead>
@@ -738,6 +752,12 @@
                   <td class="muted"><%= m.在庫数 != null ? m.在庫数 : '' %></td>
                   <td style="text-align:right;<%= mCost?.costExTax == null ? '' : 'font-variant-numeric:tabular-nums;' %>">
                     <% if (mCost?.costExTax != null) { %><%= mCost.costExTax.toLocaleString() %>円<% } else { %><span class="muted" title="NEに原価がありません">—</span><% } %>
+                  </td>
+                  <td>
+                    <input type="text" class="sku-jan-input" inputmode="numeric" maxlength="13"
+                           style="width:130px; font-size:12px; padding:4px 6px;"
+                           data-code="<%= m.商品コード %>"
+                           value="<%= skuJans[mKey] || '' %>" placeholder="8/12/13桁">
                   </td>
                   <% if (showSkuPrices) { %>
                     <td>
@@ -824,9 +844,14 @@
           </li>
         <% } %>
       </ul>
+      <%# 2026-08-28 中原さん要望: 追加ボタンを押さなくても、入力したら反映する
+          (URL を貼って他の欄へ移る / Enter で確定。ボタンは残す = 迷ったときの逃げ道) %>
       <div style="display:flex; gap:8px;">
-        <input type="url" id="new-ref-url" placeholder="https://...">
+        <input type="url" id="new-ref-url" placeholder="https://... (貼って Enter、または他の欄へ移ると追加)">
         <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
+      </div>
+      <div class="muted" id="add-ref-msg" style="font-size:11px; margin-top:4px;">
+        URL を貼って Enter を押すか、他の欄へ移ると自動で追加されます。
       </div>
     </div>
     </div><!-- /右カラム -->
@@ -1335,9 +1360,15 @@
         <label id="pi-l-importer">輸入者名 <span class="muted">(輸入品はメーカー名と両記載が楽天必須)</span><span class="ftag ftag-m">手入力</span></label>
         <input type="text" id="pi-importer" value="<%= pageInfo?.importer_name || '' %>">
       </div>
+      <%# ブランド名 (2026-08-28 中原さん要望)。掲載HTMLの表に「ブランド名」行として載る %>
+      <div class="field" id="pi-f-brand">
+        <label id="pi-l-brand">ブランド名<span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-brand" value="<%= pageInfo?.brand_name || '' %>" placeholder="例: B-Faith">
+      </div>
+      <%# 内容量 = 容量 (ml / g)。2026-08-28 中原さん要望で雑貨でも常時表示にした %>
       <div class="field" id="pi-f-volume">
-        <label id="pi-l-volume">内容量<span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="pi-volume" value="<%= pageInfo?.content_volume || '' %>" placeholder="例: 50ml">
+        <label id="pi-l-volume">内容量・容量 <span class="muted">(ml / g など)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="pi-volume" value="<%= pageInfo?.content_volume || '' %>" placeholder="例: 50ml / 200g">
       </div>
       <div class="field" id="pi-f-size">
         <label id="pi-l-size">サイズ<span class="ftag ftag-m">手入力</span></label>
@@ -2480,7 +2511,8 @@
       'pi-f-origin':      { valueId: 'pi-origin-type', general: true,  cosmetics: true,  health_food: true,  food: true },
       'pi-f-seller':      { valueId: 'pi-seller',      general: true,  cosmetics: true,  health_food: true,  food: true },
       'pi-f-importer':    { valueId: 'pi-importer',    general: false, cosmetics: 'overseas', health_food: 'overseas', food: 'overseas' },
-      'pi-f-volume':      { valueId: 'pi-volume',      general: false, cosmetics: true,  health_food: true,  food: true },
+      // 内容量・容量 (ml/g) は雑貨でも使う (2026-08-28 中原さん要望。以前は雑貨だと隠していた)
+      'pi-f-volume':      { valueId: 'pi-volume',      general: true,  cosmetics: true,  health_food: true,  food: true },
       'pi-f-ingredients': { valueId: 'pi-ingredients', general: true,  cosmetics: true,  health_food: false, food: false },
     };
     // 楽天必須の *必須 マーク (validatePageInfo と対応)
@@ -2492,7 +2524,7 @@
     const ALL_REQ_LABELS = ['pi-l-category', 'pi-l-origin', 'pi-l-seller', 'pi-l-importer', 'pi-l-volume',
       'pi-l-food-name', 'pi-l-food-ingredients', 'pi-l-food-expiry', 'pi-l-food-storage'];
     // 雑貨は楽天必須の記載がない → 入力ハードルを下げるため「(任意)」を明示 (中原さん指示 2026-08-01)
-    const OPT_LABELS_GENERAL = ['pi-l-seller', 'pi-l-size', 'pi-l-ingredients', 'pi-l-usage'];
+    const OPT_LABELS_GENERAL = ['pi-l-seller', 'pi-l-size', 'pi-l-ingredients', 'pi-l-usage', 'pi-l-brand', 'pi-l-volume'];
 
     const applyTypeVisibility = () => {
       const t = typeSel.value || 'general';
@@ -2539,6 +2571,7 @@
       origin_country: document.getElementById('pi-origin-country').value,
       seller_name: document.getElementById('pi-seller').value,
       importer_name: document.getElementById('pi-importer').value,
+      brand_name: document.getElementById('pi-brand').value,
       content_volume: document.getElementById('pi-volume').value,
       size_text: document.getElementById('pi-size').value,
       ingredients: document.getElementById('pi-ingredients').value,
@@ -2555,7 +2588,7 @@
     // 生の入力値で比べると「 x 」vs「x」が永遠に差分扱いになり自動保存が止まらなくなるため
     const PI_LIMITS = {
       category_label: 50, origin_country: 100, seller_name: 200, importer_name: 200,
-      content_volume: 200, size_text: 300, ingredients: 3000, usage_notes: 2000,
+      brand_name: 200, content_volume: 200, size_text: 300, ingredients: 3000, usage_notes: 2000,
       food_name: 200, food_ingredients: 3000, food_expiry: 200, food_storage: 300,
     };
     function piSnapshot(body) {
@@ -2566,6 +2599,10 @@
       }
       return JSON.stringify(out);
     }
+    // 掲載HTMLの「商品名」行は**基本情報タブにいま入っている商品名**を使う (2026-08-28 中原さん要望)。
+    // 基本情報は明示保存なので、DB の値だけで組むと打ち替えた直後の確認で古い名前が出る。
+    // 保存対象ではないので collect() には入れない (入れると名前を打つたび差分扱いになり自動保存が走る)
+    const previewProductName = () => (document.getElementById('f-name') || {}).value || '';
     let piSavedSnapshot = piSnapshot(collect());
     let piSaveChain = Promise.resolve(); // 全保存経路を直列化 (並行POSTの後勝ち上書き防止)
     // リビジョン: ページロードごとのトークン + 単調増加 seq。サーバーは同一トークン内で
@@ -2578,7 +2615,7 @@
       const fields = collect();
       let json;
       try {
-        json = await post(BASE + '/page-info', { ...fields, save_token: piToken, save_seq: ++piSeq });
+        json = await post(BASE + '/page-info', { ...fields, product_name: previewProductName(), save_token: piToken, save_seq: ++piSeq });
       } catch (_) {
         json = { ok: false, error: '通信エラーで保存できませんでした' };
       }
@@ -2753,6 +2790,38 @@
     });
   })();
 
+  // ─── SKU別JAN (2026-08-28 中原さん要望)。入力欄を離れたら即保存 ───
+  (function initSkuJans() {
+    const inputs = [...document.querySelectorAll('.sku-jan-input')];
+    if (inputs.length === 0) return;
+    const result = document.getElementById('rk-result');
+    let saveChain = Promise.resolve(); // POST は1本ずつ (並行保存の後勝ち上書き防止)
+    inputs.forEach((input) => {
+      let last = input.value.trim();
+      async function save(value) {
+        if (value === last) return;
+        let json;
+        try {
+          json = await post(BASE + '/sku-jans', { ne_code: input.dataset.code, jan_code: value });
+        } catch (e) {
+          json = { ok: false, error: '通信エラーでJANコードを保存できませんでした' };
+        }
+        if (!json.ok) {
+          alert(json.error || 'JANコードの保存に失敗しました');
+          // 後続の変更値を潰さない: 表示が失敗した値のままのときだけ巻き戻す
+          if (input.value.trim() === value) input.value = last;
+          return;
+        }
+        last = value;
+        if (result) result.textContent = 'JANコードを保存しました (' + input.dataset.code + (value ? ' = ' + value : ' 解除') + ')';
+      }
+      input.addEventListener('change', () => {
+        const value = input.value.trim();
+        saveChain = saveChain.then(() => save(value));
+      });
+    });
+  })();
+
   // 取り込みテストデータの掃除 (取り込み由来のみ。Notion 側のカードには触らない)
   const deleteDraftBtn = document.getElementById('delete-draft-btn');
   if (deleteDraftBtn) {
@@ -2869,9 +2938,48 @@
     });
   }
 
-  document.getElementById('add-ref-btn').addEventListener('click', async () => {
-    showAndReload(await post(BASE + '/refs', { url: document.getElementById('new-ref-url').value }), '追加しました');
-  });
+  // 参考URL: 追加ボタンを押さなくても、入力したら反映する (2026-08-28 中原さん要望)。
+  // change (他の欄へ移った) と Enter とボタンの 3 経路が同じ関数を呼ぶ。
+  // ボタンを押すと change → click の順で 2 回走りうるので、送信中フラグで 1 回に閉じる
+  (function initRefAdd() {
+    const input = document.getElementById('new-ref-url');
+    const btn = document.getElementById('add-ref-btn');
+    const msg = document.getElementById('add-ref-msg');
+    if (!input || !btn) return;
+    let busy = false;
+    async function addRef() {
+      if (busy) return;
+      const url = input.value.trim();
+      if (!url) return;                       // 空欄で離れただけ = 何もしない
+      if (!/^https?:\/\//i.test(url)) {
+        // 打ちかけで離れただけの可能性があるので、消さずに理由だけ出す
+        msg.style.color = '#dc2626';
+        msg.textContent = 'http:// または https:// で始まる URL を入力してください';
+        return;
+      }
+      busy = true;
+      msg.style.color = '';
+      msg.textContent = '追加しています…';
+      try {
+        // showAndReload は成功時に読み直す (一覧・タブのバッジ・AI参照元の判定まで揃える)
+        showAndReload(await post(BASE + '/refs', { url }), '追加しました');
+      } catch (e) {
+        msg.style.color = '#dc2626';
+        msg.textContent = '通信エラーで追加できませんでした — もう一度お試しください';
+      } finally {
+        // 例外時に busy を握ったままにしない (以後 Enter もボタンも無反応になる — Codex R1 低)
+        busy = false;
+      }
+    }
+    input.addEventListener('change', addRef);
+    input.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      if (e.isComposing) return;              // 日本語入力の変換確定 Enter では送らない
+      e.preventDefault();                     // フォーム既定の送信を止める
+      addRef();
+    });
+    btn.addEventListener('click', addRef);
+  })();
 
   // ─── 楽天の説明文3欄プレビュー (2026-08-03。デフォルト表示 = ページを開いたら自動で組み立てる) ───
   (function initDesc3Preview() {
