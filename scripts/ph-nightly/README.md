@@ -11,21 +11,32 @@
 
 | もの | 場所 (miniPC) | 出所 |
 |---|---|---|
-| 作業ディレクトリ | `C:\tools\ph-nightly\` | install.ps1 が作る |
-| 権限設定 | `C:\tools\ph-nightly\.claude\settings.json` | [`settings.json`](settings.json) |
-| **phq** (固定機能 CLI) | `C:\tools\ph-nightly\phq.mjs` + `./phq` | [`phq.mjs`](phq.mjs) / [`phq`](phq) |
-| lint | `C:\tools\ph-nightly\copy_lint.py` | [`copy_lint.py`](copy_lint.py) (正本 = AI_reference。miniPC に G: が無いので同梱) |
-| スキル | `C:\tools\ph-nightly\.claude\skills` → clone の `.claude\skills` へのジャンクション | `git pull` で更新 |
+| コード (書き換え不可) | `C:\tools\ph-nightly\bin\` (phq.mjs, copy_lint.py) | install.ps1 が置き、ACL で bfaith に書き込み拒否 |
+| 作業ディレクトリ (Claude の cwd) | `C:\tools\ph-nightly\work\` — `./phq` `./phreview` は書き込み拒否、生成物だけ書ける | install.ps1 が作る |
+| 権限設定 | `C:\tools\ph-nightly\work\.claude\settings.json` (書き込み拒否) | [`settings.json`](settings.json) |
+| **phq** / **phreview** | `bin\phq.mjs` + `work\phq` / `work\phreview` | [`phq.mjs`](phq.mjs) / [`phq`](phq) / [`phreview`](phreview) |
+| lint | `bin\copy_lint.py` | [`copy_lint.py`](copy_lint.py) (正本 = AI_reference。miniPC に G: が無いので同梱) |
+| スキル | `work\.claude\skills` → clone の `.claude\skills` へのジャンクション | `git pull` で更新 |
 | ランナー | [`run-ph-generate.ps1`](run-ph-generate.ps1) (clone 内をそのまま実行) | Task Scheduler `PhGenerateNightly` |
 | ログ | `C:\tools\ph-nightly\logs\` (`runner.log` + 実行ごとの `*.out.log` / `*.err.log`) | |
 | 監視 | jobs-monitor ping `ph-generate-nightly` (台帳 `config/jobs-registry.mjs`) | dead-man 方式 |
 
 ## 安全設計 (なぜこの形か)
 
-**Claude はトークンを見ない。** 無人セッションがシェルで実行できるのは `./phq` と `codex exec` だけ
-(`settings.json`: `curl` / `node` / `python` / `cat` / シェル類は deny)。HTTP の相手・メソッド・パスは
-`phq.mjs` の中で固定され、`fetch` は GET のみ・本文なし・内部ネットワーク拒否・出力先は作業ディレクトリ内。
-外部ページ由来の prompt injection があっても「秘密情報を読んで外へ送る」経路が無い (Codex R1 critical の対応)。
+**Claude はトークンを見ない。** 無人セッションがシェルで実行できるのは `./phq` と `./phreview` だけ
+(`settings.json`: `curl` / `node` / `python` / `cat` / `codex` / シェル類は deny)。
+- HTTP の相手・メソッド・パスは `phq.mjs` の中で固定。`fetch` は GET のみ・本文なし・**DNS 解決後の**アドレスが
+  private/loopback/link-local なら拒否・8MB 上限・出力先は作業ディレクトリ直下
+- **phq のファイル引数は `page-<ID>.html` / `copy-<ID>.json` / `reason-<ID>.txt` という名前だけ** (パス付き・symlink は拒否)
+  → phq 経由でトークンや .env を読ませられない (Codex R2 critical 1)
+- `bin/` (phq.mjs, copy_lint.py)・`work/phq`・`work/phreview`・`work/.claude/settings.json` は **ACL で bfaith に書き込み拒否**
+  → Claude が Write ツールで CLI や設定を書き換えて許可済みコマンドとして実行できない (R2 critical 2)。
+  install.ps1 が deny を外して更新し、また掛ける
+- `./phreview ID` は Codex 検品の固定ラッパー (プロンプト固定・`_ph_review_<ID>.md` 固定・timeout 600 秒)。
+  `codex exec *` を直接許可すると任意プロンプト・任意オプションを渡せる (R2 critical 3)
+外部ページ由来の prompt injection があっても「秘密情報を読んで外へ送る」「コードを書き換えて実行する」経路が無い。
+残るリスク (承知の上): fetch の DNS rebinding (解決時は public、接続時に private へ変わる) は防いでいない。miniPC 内部で
+夜間に応答するサービスはポータル API (認証必須) だけで、GET 本文なしでは実害が薄い。
 
 **`dontAsk`**: 非対話には Yes を押す相手がいない。止まる要因は「allowlist 外のツール」と「auto mode 分類器」の
 2 層で、`dontAsk` は後者を通す。`bypassPermissions` は deny も無効になるので使わない。
@@ -39,7 +50,9 @@ claim しただけで死んだ実行を「進んだ」と誤認しない (Codex 
 保存パスワード方式は 2026-05-23 の `WarehouseDailySync` 無音停止と同じ構成になる。
 既存の `MallCsvFetchAll` 等と同じ「ログオン中のみ実行」に載せる (bfaith は console にログオンしたまま)。
 
-**1 件ずつ claim**: lease は 30 分。5 件まとめると後半が期限切れになる (Codex R1 high)。夜間上限 15 件。
+**1 件ずつ claim** (phq は `--limit` を受け付けない): lease は 30 分。5 件まとめると後半が期限切れになる (Codex R1 high)。夜間上限 15 件。
+
+**成否判定の限界**: 実行前から別の実行が lease していた draft がその実行で完了すると、このランナーの `done` に数えられる (R2 medium 11)。02:30 に手動実行が重なることは想定しない。
 
 ## 導入 (miniPC、bfaith で)
 
@@ -53,7 +66,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 人がやる一回きりの作業 (Claude Code のセッションはやらない・できない):
 
 1. `C:\Users\bfaith\.claude\secrets\ph-service-token.txt` に Render の `PH_SERVICE_TOKEN` と同じ値を置く
-2. `cd C:\tools\ph-nightly` → `claude` → `/login` (サブスクのアカウント)
+2. `cd C:\tools\ph-nightly\work` → `claude` → `/login` (サブスクのアカウント)
 3. `codex login` (ChatGPT サブスク)
 4. 初回は手で `powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\bfaith\bfaith-portal\scripts\ph-nightly\run-ph-generate.ps1`
    を回し、`C:\tools\ph-nightly\logs\*.err.log` を見る。
@@ -66,7 +79,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\ph-nightly\install.p
 
 - **人待ち (⚠ AIが止めました)**: ボードのカードに理由。基本情報を直して詳細画面の「解除する」→ 次の夜に再挑戦
 - **朝のチェック**: jobs-monitor の要対応に `ph-generate-nightly` が出たら `C:\tools\ph-nightly\logs\runner.log` の末尾
-  - `not logged in` → bfaith で `cd C:\tools\ph-nightly ; claude` → `/login`
+  - `not logged in` → bfaith で `cd C:\tools\ph-nightly\work ; claude` → `/login`
   - `no progress` → 同じ logs の `*.err.log` (permission denied / codex 未ログイン / Amazon の HTML 構造変更)
   - `timeout` → 件数が多かっただけとは限らない (ハング・認証・Codex 停止も)。`*.out.log` で最後に何をしていたか見る
   - `partial` → 翌晩に続く。連日続くなら件数か時間の見直し

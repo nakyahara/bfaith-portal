@@ -16,7 +16,8 @@
 # and must not contain quotes or cmd metacharacters (it is passed through claude.cmd = cmd.exe).
 $ErrorActionPreference = 'Continue'
 
-$WorkDir    = 'C:\tools\ph-nightly'
+$Root       = 'C:\tools\ph-nightly'
+$WorkDir    = Join-Path $Root 'work'      # Claude's cwd (generated files); code lives in bin\ (write-denied)
 # Repo = the checkout this script lives in (production clone, or a worktree when testing an unmerged branch)
 $Repo       = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Claude     = Join-Path $env:APPDATA 'npm\claude.cmd'
@@ -27,7 +28,7 @@ $TimeoutMin = 100     # 1 draft per claim, ~6-8 min each incl. Codex review; up 
 $MaxDrafts  = 15
 $PingId     = 'ph-generate-nightly'
 $Stamp      = Get-Date -Format 'yyyyMMdd-HHmmss'
-$LogDir     = Join-Path $WorkDir 'logs'
+$LogDir     = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $OutLog = Join-Path $LogDir "$Stamp.out.log"
 $ErrLog = Join-Path $LogDir "$Stamp.err.log"
@@ -40,13 +41,15 @@ function Log([string]$msg) {
   Add-Content -Path $RunLog -Value $line
 }
 function Send-Ping([string]$status, [string]$note) {
-  Log ("ping " + $status + " : " + $note)
+  # note goes through cmd-style argument parsing: strip quotes / control chars, cap length (Codex R2 medium 9)
+  $safe = ($note -replace '["\r\n\t]', ' ') -replace '\s+', ' '
+  if ($safe.Length -gt 180) { $safe = $safe.Substring(0, 180) }
+  Log ("ping " + $status + " : " + $safe)
   if (-not (Test-Path $PingPs1)) { Log 'ping.ps1 not found - skipped'; $script:pingFailed = $true; return }
+  # ping.ps1 has its own 15s HTTP timeout and always exits 0 by design; call it synchronously.
   try {
-    $pp = Start-Process -FilePath 'powershell.exe' -PassThru -NoNewWindow -Wait:$false `
-            -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PingPs1, '-Id', $PingId, '-Status', $status, '-Note', ('"' + $note + '"'))
-    if (-not $pp.WaitForExit(60000)) { try { $pp.Kill() } catch { }; Log 'ping timed out (60s)'; $script:pingFailed = $true; return }
-    if ($pp.ExitCode -ne 0) { Log ('ping exit ' + $pp.ExitCode); $script:pingFailed = $true }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $PingPs1 -Id $PingId -Status $status -Note $safe
+    if ($LASTEXITCODE -ne 0) { Log ('ping exit ' + $LASTEXITCODE); $script:pingFailed = $true }
   } catch { Log ('ping error: ' + $_.Exception.Message); $script:pingFailed = $true }
 }
 function Finish([int]$code) { if ($script:pingFailed -and $code -eq 0) { exit 3 }; exit $code }
@@ -59,7 +62,7 @@ function Get-Queue {
 # --- preflight ------------------------------------------------------------------
 if (-not (Test-Path $Claude)) { Send-Ping 'fail' 'claude.cmd not found (npm install -g @anthropic-ai/claude-code)'; Finish 1 }
 if (-not (Test-Path $TokenFile)) { Send-Ping 'fail' 'ph-service-token.txt missing'; Finish 1 }
-if (-not (Test-Path (Join-Path $WorkDir 'phq.mjs'))) { Send-Ping 'fail' 'phq.mjs missing in workdir (run install.ps1)'; Finish 1 }
+if (-not (Test-Path (Join-Path $Root 'bin\phq.mjs')) -or -not (Test-Path (Join-Path $WorkDir 'phq'))) { Send-Ping 'fail' 'phq not installed (run install.ps1)'; Finish 1 }
 
 # Auth check every night, even when there is nothing to generate: subscription OAuth can expire silently
 # and a quiet week would otherwise hide it until a busy night.
@@ -79,9 +82,9 @@ if ([int]$before.claimable -eq 0 -and [int]$before.leased -eq 0) {
 }
 
 # --- run Claude Code headless ----------------------------------------------------
-# Permissions come from C:\tools\ph-nightly\.claude\settings.json (defaultMode dontAsk; only ./phq and codex exec).
+# Permissions come from work\.claude\settings.json (defaultMode dontAsk; only ./phq and ./phreview).
 # ASCII, no quotes, no cmd metacharacters (& | < > ^ %). One draft at a time: lease is 30 min.
-$prompt = 'Process the product-hub generation queue. Follow the ph-generate skill in this workspace exactly: claim ONE draft at a time with ./phq, verify identity, generate, lint, Codex review, then submit or block. Every claimed draft must end as done, blocked, or released. Stop when ./phq claim returns no drafts or after ' + $MaxDrafts + ' drafts. Never read the service token and never touch files outside this workspace. Finish with one line: done=N blocked=N released=N'
+$prompt = 'Process the product-hub generation queue. Follow the ph-generate skill in this workspace exactly: claim ONE draft at a time with ./phq, verify identity, generate, lint, review with ./phreview, then submit or block. Every claimed draft must end as done, blocked, or released. Stop when ./phq claim returns no drafts or after ' + $MaxDrafts + ' drafts. Never read the service token and never touch files outside this workspace. Finish with one line: done=N blocked=N released=N'
 $timedOut = $false
 $claudeExit = -1
 try {
