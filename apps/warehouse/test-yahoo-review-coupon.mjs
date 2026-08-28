@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, usableCouponFor, getCouponRow, isValidMonth, findByOperationId,
-  couponUrlMatchesId, isUsableCopySource,
+  couponUrlMatchesId, isUsableCopySource, EXPECTED_FORM, COUPON_TITLE,
 } from './yahoo-review-coupon-lib.js';
 
 let passed = 0, failed = 0;
@@ -45,6 +45,15 @@ console.log('=== 2. op-id / URL 検証 ===');
     && !isValidCouponUrl('https://evil.example.com/coupon/interior/ZTM3NjEyYzBkOWVhZTgwNzZmMDhmY2ZiOWNm')
     && !isValidCouponUrl('https://shopping.yahoo.co.jp/coupon/interior/abc')
     && !isValidCouponUrl('https://shopping.yahoo.co.jp/my/coupon/'));
+}
+
+console.log('=== 2b. 実測した期待値 (2026-08-28 vendor クーポン) ===');
+{
+  check('定率5% / 非表示 / ストア全品 / 併用不可 / 期間指定',
+    EXPECTED_FORM.DiscountType === '2' && EXPECTED_FORM.DiscountRatio === '5' && EXPECTED_FORM.DispFlg === '0'
+    && EXPECTED_FORM.ItemDesignation === '3' && EXPECTED_FORM.Combine === '0' && EXPECTED_FORM.nDayFlg === '0');
+  check('タイトルは vendor と完全一致 (％は全角)', COUPON_TITLE === '雑貨イズムYahoo!ショッピング店で次回購入に使える5％割引クーポン');
+  check('EXPECTED_FORM は凍結', Object.isFrozen(EXPECTED_FORM));
 }
 
 console.log('=== 3. 状態機械 (二重発行より未発行を選ぶ) ===');

@@ -30,7 +30,7 @@ import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
-  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO,
+  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM,
 } from '../../apps/warehouse/yahoo-review-coupon-lib.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -64,7 +64,7 @@ async function snap(page, label) {
   await page.screenshot({ path: join(OUT_DIR, `yrcoupon_${label}.png`), fullPage: true }).catch(() => {});
 }
 
-/** クーポン一覧 (ID・タイトル・説明・期間・状態)。説明は詳細を開かないと出ないため hidden input から拾う */
+/** クーポン一覧 (ID・タイトル・割引・期間・状態)。実測: 一覧の hidden に説明文は無い (照合は詳細ページで行う) */
 async function fetchCouponRows(page) {
   await gotoStorePage(page, `${STORE_TOP_URL}/coupon/index`, 'クーポン一覧');
   assertCouponUrl(page.url(), 'クーポン一覧');
@@ -82,7 +82,7 @@ async function fetchCouponRows(page) {
         if (m) hidden[m[1]] = inp.value;
       }
       out.push({
-        couponId: cells[0], title: cells[1], description: hidden.Description || '',
+        couponId: cells[0], title: cells[1],
         discountType: hidden.DiscountType || '', discountRatio: hidden.DiscountRatio || '',
         publicStatus: hidden.PublicStatus || '', state: cells[11],
         useStart: cells[9], useEnd: cells[10],
@@ -91,12 +91,44 @@ async function fetchCouponRows(page) {
     return out;
   });
   console.log(`[list] クーポン ${rows.length} 件`);
-  // op-id 照合は説明文 (hidden input) に依存する。出ていないなら照合できない = 作成してはいけない
-  // (Codex Y-C3 R1 Medium: 発行済みでも毎回 0 件扱いになり自動復旧できなくなる)
-  if (rows.length > 0 && !rows.some((r) => r.description)) {
-    throw new Error('LIST_SHAPE: 一覧に説明文 (hidden Description) が出ていない。op-id で照合できないため作成しない (画面仕様変更の疑い)');
+  if (rows.length > 0 && !rows.some((r) => r.couponId && r.title)) {
+    throw new Error('LIST_SHAPE: 一覧から ID/タイトルを読めない (画面仕様変更の疑い)');
   }
   return rows;
+}
+
+/**
+ * op-id でクーポンを特定する (実測 2026-08-28: 一覧に説明文は出ないので詳細ページ GET で読む)。
+ * 候補はタイトル一致の行だけに絞る (自作・vendor とも同じタイトル)。
+ * 説明文がどの候補からも読めない場合は throw = 照合不能なので作成させない (fail-closed)。
+ */
+const MATCH_CANDIDATE_LIMIT = 20;
+async function findIssuedByOpId(page, rows, operationId) {
+  const candidates = rows.filter((r) => r.title === COUPON_TITLE && r.state !== '削除済み').slice(0, MATCH_CANDIDATE_LIMIT);
+  console.log(`[match] タイトル一致の候補 ${candidates.length} 件を詳細で照合`);
+  const hits = [];
+  let readable = 0;
+  for (const c of candidates) {
+    const detail = await page.context().newPage();
+    try {
+      await detail.goto(`${STORE_TOP_URL}/coupon/edit/detail/${c.couponId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      if (!detail.url().includes(c.couponId)) throw new Error('詳細ページが別のクーポン');
+      const desc = await detail.evaluate(() => {
+        const el = document.querySelector('[name="Description"]');
+        return el ? String(el.value || '') : null;
+      });
+      if (desc !== null) readable++;
+      if (desc && desc.includes(operationId)) hits.push(c);
+    } catch (e) {
+      console.warn(`  ⚠ 詳細を読めず (${c.couponId.slice(0, 8)}…): ${String(e.message).split('\n')[0]}`);
+    } finally {
+      await detail.close().catch(() => {});
+    }
+  }
+  if (candidates.length > 0 && readable === 0) {
+    throw new Error('MATCH_SHAPE: どの候補からも説明文を読めない。op-id で照合できないため作成しない (画面仕様変更の疑い)');
+  }
+  return hits;
 }
 
 /** 一覧の「URL」ポップアップから獲得URLを読む (実測: /coupon/edit/detail-url/{id} の textarea) */
@@ -206,6 +238,11 @@ async function verifyForm(page, { period, operationId, invariants }) {
   for (const k of ['DiscountType', 'DiscountRatio', 'DiscountPrice', 'ItemDesignation', 'DispFlg', 'OrderType', 'Combine', 'nDayFlg']) {
     if (got[k] !== invariants[k]) diffs.push(`${k} がコピー元から変化: "${invariants[k]}" → "${got[k]}"`);
   }
+  // 実測した期待値そのものとも突き合わせる (2026-08-28 実測: 定率5% / 公開範囲=非表示 / ストア全品 / 併用不可 / 期間指定)。
+  // コピー元が将来変わっても「レビュー用クーポンの条件」から外れたら止まる
+  for (const [k, w] of Object.entries(EXPECTED_FORM)) {
+    if (got[k] !== w) diffs.push(`${k}: 期待"${w}" 実際"${got[k]}" (レビュー用クーポンの条件から外れている)`);
+  }
   // その上で、レビュー用として必須の条件 (定率 5% であること・定額が入っていないこと) を直接確認する
   if (String(got.DiscountRatio || '') !== String(COUPON_DISCOUNT_RATIO)) diffs.push(`DiscountRatio: 期待"${COUPON_DISCOUNT_RATIO}" 実際"${got.DiscountRatio}"`);
   if (got.DiscountPrice && !['0', ''].includes(String(got.DiscountPrice))) diffs.push(`DiscountPrice が入っている (定額に化けている恐れ): "${got.DiscountPrice}"`);
@@ -312,7 +349,7 @@ async function main() {
     let rows = await fetchCouponRows(page);
 
     // ── 既に作られていないかを op-id で照合 (submitting / reconcile_required からの復帰もここ) ──
-    const found = rows.filter((r) => r.description.includes(operationId));
+    const found = await findIssuedByOpId(page, rows, operationId);
     if (found.length === 1) {
       const url = await readCouponUrl(page, found[0].couponId);
       if (isValidCouponUrl(url)) {
@@ -373,7 +410,7 @@ async function main() {
     }
     // ── 発行後の照合 (成否に関わらず一覧を取り直す) ──
     rows = await fetchCouponRows(page);
-    const after = rows.filter((r) => r.description.includes(operationId));
+    const after = await findIssuedByOpId(page, rows, operationId);
     if (after.length === 1) {
       const url = await readCouponUrl(page, after[0].couponId);
       if (isValidCouponUrl(url)) {

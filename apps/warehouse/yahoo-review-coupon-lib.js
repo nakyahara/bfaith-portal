@@ -17,12 +17,21 @@
  */
 
 export const COUPON_DISCOUNT_RATIO = 5;          // 定率 5% (vendor 現行と同じ)
-export const COUPON_TITLE = '雑貨イズムYahoo!ショッピング店で次回購入に使える5%割引クーポン';
+export const COUPON_TITLE = '雑貨イズムYahoo!ショッピング店で次回購入に使える5％割引クーポン'; // vendor の実タイトルと完全一致 (％は全角)
 export const COUPON_START_HOUR = '00';
 export const COUPON_END_HOUR = '23';
 export const OP_ID_PREFIX = 'RVW';
 // コピー元クーポンに要求する条件 (一覧の hidden input。実測 2026-08-27: vendor の月次クーポン)
 export const SOURCE_DISCOUNT_TYPE = '2';   // 2 = 定率割引
+// 発行フォームに要求する値 (2026-08-28 に vendor のクーポンを実測)
+export const EXPECTED_FORM = Object.freeze({
+  DiscountType: '2',      // 定率
+  DiscountRatio: '5',     // 5%
+  DispFlg: '0',           // 公開範囲 = 非表示 (URL を知っている人だけが獲得できる)
+  ItemDesignation: '3',   // ストア内全商品
+  Combine: '0',           // 他クーポンとの併用不可
+  nDayFlg: '0',           // 期間指定 (獲得日起点ではない)
+});
 /** コピー元として使える行か (定率5%であること)。違えば作成しない = 定額や別条件のクーポンを増殖させない */
 export function isUsableCopySource(row) {
   return !!row && String(row.discountType) === SOURCE_DISCOUNT_TYPE && String(row.discountRatio) === String(COUPON_DISCOUNT_RATIO);
