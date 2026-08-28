@@ -45,7 +45,36 @@ export function safeHost(url) {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
+/**
+ * 実行アカウントが LocalSystem かを判定する (Windows)。
+ * SYSTEM は %USERPROFILE% が C:\Windows\system32\config\systemprofile、
+ * %USERNAME% が <COMPUTERNAME>$ になる。どちらかが当てはまれば SYSTEM とみなす。
+ * @param env テスト用の注入点
+ */
+export function isSystemAccount(env = process.env) {
+  const profile = String(env.USERPROFILE || '').replace(/\//g, '\\').toLowerCase();
+  if (profile.includes('\\config\\systemprofile')) return true;
+  const user = String(env.USERNAME || '').toLowerCase();
+  const host = String(env.COMPUTERNAME || '').toLowerCase();
+  if (user === 'system') return true;
+  return !!host && user === `${host}$`;
+}
+
+/**
+ * 永続プロファイルを開く。
+ *
+ * 🚨**SYSTEM では絶対に開かせない** (2026-08-28 の事故)。Chromium の Cookie は DPAPI で
+ * Windows ユーザーに紐づけて暗号化されるため、SYSTEM から開くと復号できず「ログアウト状態」と
+ * 判断されて Cookie が破棄される = **Yahoo ストアのセッションが壊れ、現地での 2FA 再ログインが要る**。
+ * 読み取りのつもりでも開いた時点で壊れるので、起動前に止める。
+ * ガードをここ (ライブラリ) に置いてあるのは、タスクからでも手動実行でも必ず通る唯一の場所だから。
+ */
 export async function openYahooContext() {
+  if (isSystemAccount()) {
+    throw new Error('SYSTEM_ACCOUNT: SYSTEM 権限では Yahoo の永続プロファイルを開けません '
+      + '(開くとログインセッションが壊れ、miniPC の画面で 2FA 再ログインが必要になります)。'
+      + 'このジョブは bfaith (Interactive) で実行してください');
+  }
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: process.env.HEADLESS === '1',
     slowMo: process.env.HEADLESS === '1' ? 0 : 150,
