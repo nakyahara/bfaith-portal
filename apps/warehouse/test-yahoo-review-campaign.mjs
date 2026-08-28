@@ -49,7 +49,7 @@ console.log('=== 1b. ship_date バックフィルの対象選択 (PR-Y-C2) ===')
   const NOW_SQL = '2026-08-28 00:00:00';
   const t = selectShipDateBackfillTargets(db, { days: 30, limit: 100, nowIso: NOW_SQL });
   check('出荷完了で ship_date 無し (Y-noshipdate) が最優先で入る', t[0] === 'Y-noshipdate', JSON.stringify(t));
-  check('ship_date 済み・キャンセル・ギフトは対象外', !t.includes('Y-shipped') && !t.includes('Y-cancel') && !t.includes('Y-mixcancel'));
+  check('ship_date 済み・キャンセル・既知のソーシャルギフトは対象外', !t.includes('Y-shipped') && !t.includes('Y-cancel') && !t.includes('Y-mixcancel') && !t.includes('Y-gift'));
   check('未発送でも受注 7 日以内 (Y-unshipped 8/26) は引かない', !t.includes('Y-unshipped'), JSON.stringify(t));
   check('部分発送 (片方に発送日あり) も 7 日超なら対象 = ship_status を取り直して完了を拾う', t.includes('Y-partial'));
   check('出荷完了で発送日ありの注文は対象外', !t.includes('Y-shipped'));

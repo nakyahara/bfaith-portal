@@ -83,6 +83,11 @@ if (targets.length > 0 && !isDryRun) {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       data = await res.json();
+      // 形式を検証してから使う (Codex Y-C2 R1 High: HTTP 200 でも results 欠落・件数不足がありうる)
+      if (!Array.isArray(data?.results)) throw new Error('results が配列でない');
+      const got = new Set(data.results.map((r) => r?.orderId));
+      const missing = batch.filter((id) => !got.has(id));
+      if (missing.length) throw new Error(`results に ${missing.length} 件不足 (要求 ${batch.length})`);
     } catch (e) {
       console.error(`  ⚠ batch ${i + 1}-${i + batch.length} 失敗: ${e.message}`);
       apiError += batch.length;
@@ -107,8 +112,10 @@ if (targets.length > 0 && !isDryRun) {
 db.close();
 
 console.log(`=== summary: 更新 ${updated} / 未発送のまま ${unshipped} / API失敗 ${apiError} / 対象外 ${noChange} ===`);
-if (!isDryRun && targets.length > 0 && apiError > targets.length * 0.5) {
-  console.error('FATAL: API 失敗が半数を超えた (プロキシ/トークンを確認)');
+// 1 件でも取れなければ失敗扱い (Codex Y-C2 R1 Medium: 突合の母数が欠けたまま「成功」にしない)。
+// 更新済みの分は残るので、直してから再実行すれば続きから埋まる
+if (!isDryRun && apiError > 0) {
+  console.error(`FATAL: ${apiError} 件が取得できなかった (プロキシ/トークン/レート制限を確認して再実行)`);
   process.exitCode = 1;
 } else {
   process.exitCode = 0;

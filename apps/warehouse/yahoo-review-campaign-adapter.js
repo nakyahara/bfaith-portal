@@ -80,11 +80,13 @@ export function selectShipDateBackfillTargets(db, { days = 30, limit = 60, nowIs
       SELECT order_id, MIN(order_time) AS ot,
              MAX(CASE WHEN ship_date IS NOT NULL AND ship_date != '' THEN 1 ELSE 0 END) AS has_date,
              SUM(CASE WHEN order_status = '${YAHOO_ORDER_STATUS_CANCELLED}' THEN 1 ELSE 0 END) AS cancelled,
-             SUM(CASE WHEN COALESCE(ship_status, '') != '${YAHOO_SHIP_STATUS_SHIPPED}' THEN 1 ELSE 0 END) AS unshipped_lines
+             SUM(CASE WHEN COALESCE(ship_status, '') != '${YAHOO_SHIP_STATUS_SHIPPED}' THEN 1 ELSE 0 END) AS unshipped_lines,
+             SUM(CASE WHEN COALESCE(social_gift_type, '0') NOT IN ('0', '') THEN 1 ELSE 0 END) AS gift_lines
         FROM raw_yahoo_orders
        WHERE order_time >= datetime(${now}, ?)
        GROUP BY order_id)
      WHERE cancelled = 0
+       AND gift_lines = 0  -- 既知のソーシャルギフトは送信対象外なので引く価値がない (未取得=NULL は対象のまま)
        AND (has_date = 0 OR unshipped_lines > 0)
        AND (unshipped_lines = 0 OR ot < datetime(${now}, '-7 days'))
      ORDER BY (CASE WHEN unshipped_lines = 0 AND has_date = 0 THEN 0 ELSE 1 END), ot DESC
