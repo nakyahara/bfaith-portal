@@ -67,6 +67,10 @@ function db() {
       updated_at           TEXT NOT NULL
     )`);
     d.exec('CREATE INDEX IF NOT EXISTS idx_voucher_inbox_status ON voucher_inbox(status)');
+    // 読み取りの経緯 (なぜ読めた/読めなかったか)。既存DBにも冪等に足す
+    if (!d.prepare('PRAGMA table_info(voucher_inbox)').all().some(c => c.name === 'extract_note')) {
+      d.exec("ALTER TABLE voucher_inbox ADD COLUMN extract_note TEXT NOT NULL DEFAULT ''");
+    }
     // 明細ごとに 確保中/添付済み は1件だけ (二重POSTをDBで止める。確保の時点で効く)
     d.exec('DROP INDEX IF EXISTS uq_voucher_inbox_attached_tx');
     d.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_inbox_owned_tx ON voucher_inbox(match_tx_id)
@@ -331,6 +335,10 @@ export function recoverStaleClaims() {
 }
 
 /** 人の操作で状態を変える。attaching/attached からは変えない。needs_check からは new (戻す) と excluded だけ */
+export function setExtractNote(id, note) {
+  db().prepare('UPDATE voucher_inbox SET extract_note=?, updated_at=? WHERE id=?').run(String(note || '').slice(0, 500), new Date().toISOString(), id);
+}
+
 export function setStatus(id, status) {
   if (!INBOX_STATUSES.includes(status)) throw new Error('bad_status');
   db().prepare(`UPDATE voucher_inbox SET status=?, match_tx_id = CASE WHEN ? = 'new' THEN '' ELSE match_tx_id END, error='', updated_at=?
