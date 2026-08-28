@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# phq shim: the only shell command the nightly Claude Code session is allowed to run (see settings.json).
+# Resolves to phq.mjs next to this file so `./phq ...` works from C:\tools\ph-nightly (Git Bash).
+exec node "$(dirname "$0")/phq.mjs" "$@"

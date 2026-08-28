@@ -1,0 +1,71 @@
+{
+  "_comment": "product-hub 夜間生成 (miniPC) 専用の Claude Code 設定。install.ps1 が C:\\tools\\ph-nightly\\.claude\\settings.json へコピーする。作業ディレクトリ限定なので他の用途には効かない。",
+  "_why_dontAsk": "非対話 (claude -p) には Yes を押す相手がいない。止まる要因は 2 層: ①allowlist 外のツール ②auto mode 分類器。dontAsk は②を通す。bypassPermissions は deny も無効になるので使わない。",
+  "_why_only_phq": "Codex R1 critical (2026-08-28): curl/node/python/cat を許すと deny は迂回でき、トークンも読める。そこでシェルで許すのは固定機能 CLI の ./phq と codex exec だけ。HTTP・トークン・URL 制限は phq.mjs の中で決まる (Claude はトークンを見ない)。",
+
+  "permissions": {
+    "defaultMode": "dontAsk",
+
+    "allow": [
+      "Bash(./phq *)",
+      "Bash(codex exec *)",
+      "Bash(timeout * codex exec *)",
+      "Bash(ls *)",
+      "Bash(rm _ph_review_*)",
+      "Bash(rm facts-*)",
+      "Bash(rm copy-*)",
+      "Bash(rm page-*)",
+      "Bash(rm reason-*)",
+      "Read",
+      "Write",
+      "Edit"
+    ],
+
+    "deny": [
+      "Bash(node *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(py *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(cat *)",
+      "Bash(bash *)",
+      "Bash(sh *)",
+      "Bash(cmd *)",
+      "Bash(powershell *)",
+      "Bash(pwsh *)",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(schtasks *)",
+      "Bash(shutdown *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(rclone *)",
+      "Bash(rm -r*)",
+      "Edit(//C:/Users/bfaith/bfaith-portal/**)",
+      "Write(//C:/Users/bfaith/bfaith-portal/**)",
+      "Edit(//C:/tools/**)",
+      "Read(//C:/Users/bfaith/bfaith-portal/.env*)",
+      "Read(//C:/Users/bfaith/bfaith-portal/data/**)",
+      "Read(//C:/Users/bfaith/.ssh/**)",
+      "Read(//C:/Users/bfaith/.claude/secrets/**)",
+      "Read(//C:/Users/bfaith/.codex/**)",
+      "Read(//C:/tools/keys/**)",
+      "Read(**/.env*)"
+    ]
+  },
+
+  "_notes": {
+    "allow ./phq": "queue/claim/block/release/submit/fetch/extract/find/lint/search-amazon。任意 URL への送信・本文付きリクエストはできない",
+    "allow codex exec": "検品用。Codex 自身の sandbox (read-only workspace) が効く。プロンプトは固定文言 + ファイル名のみ (スキル)",
+    "deny インタプリタ/シェル": "deny は allow より強い。./phq 以外の実行経路を残さない",
+    "deny Read": "組み込み Read にだけ効く (シェル経由は上で塞いだ)。秘密情報と本番 DB をコンテキストに載せない",
+    "Edit(//C:/tools/**)": "作業ディレクトリ C:\\tools\\ph-nightly は Write/Edit できる必要がある → Edit の deny は Write を含まない。Write(//C:/tools/ph-nightly/..) は allow の Write で通り、Edit は既存ファイルの上書きなので影響は小さい"
+  },
+
+  "env": {
+    "PYTHONUTF8": "1"
+  }
+}
