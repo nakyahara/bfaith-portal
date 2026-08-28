@@ -90,6 +90,37 @@ export function createProductScoutTables(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_scout_concepts_gate ON scout_concepts(hard_gate, rank_in_snapshot)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_scout_concepts_snapshot ON scout_concepts(snapshot_id)');
 
+  // ⭐自社/AMC商品 = 「すでに採用した企画」の実例。撤退したものは負例になる。
+  //   これから採否を貯めても年に数十件しか溜まらないので、過去から学べるようにここを埋める。
+  //   意思決定前のデータ (scout_concepts) とは別テーブルにする — 結果を混ぜると
+  //   「何を見て決めたか」と「どうなったか」の区別が付かなくなる。
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scout_own_families (
+      family_key         TEXT PRIMARY KEY,   -- 商品名の「【」より前 (色/容量違いを1つに束ねる)
+      snapshot_id        TEXT,
+      concept_id         TEXT,               -- テーマに載せられたときだけ入る (NULL = カテゴリ不明)
+      category_path      TEXT,
+      form               TEXT,
+      amc_capable        TEXT,
+      sku_count          INTEGER,
+      asin_count         INTEGER,
+      launched_on        TEXT,
+      last_sold_on       TEXT,
+      -- 発売から180日ぶんの数量。180日経っていないものは NULL
+      -- (「売れなかった」と「まだ分からない」を混ぜない)
+      qty180             INTEGER,
+      qty_all            INTEGER,
+      active_skus        INTEGER,
+      discontinued_skus  INTEGER,
+      median_price       INTEGER,
+      -- active = いま売っている / withdrawn = 全SKU終売 / shrinking = 一部終売
+      outcome            TEXT NOT NULL CHECK (outcome IN ('active','withdrawn','shrinking')),
+      updated_at         TEXT NOT NULL
+    )
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_scout_own_concept ON scout_own_families(concept_id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_scout_own_outcome ON scout_own_families(outcome)');
+
   // 採否イベント (追記専用)。UPDATE / DELETE はトリガーで拒否する
   db.exec(`
     CREATE TABLE IF NOT EXISTS scout_decisions (

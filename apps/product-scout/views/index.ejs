@@ -138,6 +138,22 @@
             <p class="ps-reason">⛔ <%= c.gate_fail_reason %></p>
           <% } %>
 
+          <%# ⭐自社が既にやっているテーマかどうか。重複提案を止め、
+              「前に出して撤退した」を判断材料として最初に見せる %>
+          <% if (c.own_count) { %>
+            <p class="ps-own <%= c.own_withdrawn ? 'ps-own-withdrawn' : '' %>">
+              <% if (c.own_withdrawn && !c.own_active) { %>
+                🪦 <b>過去に出して撤退した</b>（<%= c.own_withdrawn %>ファミリー）
+              <% } else if (c.own_withdrawn) { %>
+                ⚠️ <b>自社で販売中</b>（<%= c.own_active %>）＋ <b>撤退済み</b>（<%= c.own_withdrawn %>）
+              <% } else { %>
+                ✅ <b>自社で販売中</b>（<%= c.own_active %>ファミリー）
+              <% } %>
+              <% if (c.own_qty180) { %>／ 初回180日 計<%= c.own_qty180.toLocaleString() %>個<% } %>
+              <span class="ps-muted">： <%= c.own_names %></span>
+            </p>
+          <% } %>
+
           <div class="ps-metrics">
             <div><b><%= (c.total_monthly_sold || 0).toLocaleString() %></b><span>総月販(下限)</span></div>
             <div><b><%= c.product_count %></b><span>商品数</span></div>
