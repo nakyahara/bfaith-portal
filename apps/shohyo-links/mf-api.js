@@ -267,7 +267,8 @@ export async function postVoucher(journalId, fileName, fileDataBase64) {
 
 /** 全角→半角・カナ正規化・大文字化・空白類除去 (NFKCで大部分をカバー) */
 export function normalizeText(s) {
-  return String(s || '').normalize('NFKC').toUpperCase().replace(/[\s　・･]/g, '');
+  // 長音「ー」とダッシュ類 (－ ‐ ‑ – — ― -) は表記ゆれが多いので比較からは落とす (ロジマート = ロジマ－ト = ロジマト)
+  return String(s || '').normalize('NFKC').toUpperCase().replace(/[\s　・･]/g, '').replace(/[ー\-‐‑–—―]/g, '');
 }
 
 // 単語トークンとして一般的すぎて突合キーにしない語

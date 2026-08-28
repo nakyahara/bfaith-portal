@@ -15,8 +15,13 @@
 import { normalizeText, vendorKeys } from './mf-api.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-// 自動添付に使える支払先キーの最短長。「APPLE」が「APPLE JAPAN」に内包される類の衝突を減らす
-const STRONG_KEY_MIN = 6;
+// 自動添付に使える支払先キーの最短長。「APPLE」が「APPLE JAPAN」に内包される類の衝突を減らす。
+// 英数字は6文字以上、カナ・漢字は1文字の情報量が多いので4文字以上 (ロジマート・ラクスル 等)
+const STRONG_KEY_MIN_ASCII = 6;
+const STRONG_KEY_MIN_JA = 4;
+export function isStrongKey(k) {
+  return /^[\x21-\x7E]+$/.test(k) ? k.length >= STRONG_KEY_MIN_ASCII : k.length >= STRONG_KEY_MIN_JA;
+}
 
 function dayDiff(a, b) {
   const ta = Date.parse(a), tb = Date.parse(b);
@@ -29,6 +34,21 @@ export function isValidDate(s) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(s || ''))) return false;
   const d = new Date(s + 'T00:00:00Z');
   return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+/**
+ * 読み取った支払先名を支払い先マスタに結びつける。
+ * マスタ名はカード明細の表記 (ﾛｼﾞﾏｰﾄ（LOGIMART）) で書かれているので、結びつけばキーが増えて strong になりやすい。
+ * 双方のキー (4文字以上) がどちらかを含むマスタが **1件だけ** のとき、その id を返す (複数なら null)
+ */
+export function resolveVendorId(vendorName, vendors) {
+  const nameKeys = vendorKeys(vendorName).filter(k => k.length >= STRONG_KEY_MIN_JA);
+  if (!nameKeys.length) return null;
+  const hits = vendors.filter(v => {
+    const vk = vendorKeys(v.name).filter(k => k.length >= STRONG_KEY_MIN_JA);
+    return vk.some(k => nameKeys.some(n => k.includes(n) || n.includes(k)));
+  });
+  return hits.length === 1 ? hits[0].id : null;
 }
 
 /** 証憑側の支払先キー。マスタ (vendor) があればそのキー、無ければ抽出した名前から */
@@ -57,7 +77,7 @@ function contentTokens(raw) {
 function vendorHit(vkeys, t) {
   const content = normalizeText(t.content || '');
   const memo = normalizeText(t.memo || '');
-  const strongKeys = vkeys.filter(k => k.length >= STRONG_KEY_MIN);
+  const strongKeys = vkeys.filter(isStrongKey);
   if (strongKeys.some(k => content.includes(k))) {
     const toks = contentTokens(t.content);
     // 雑音語しか無い加盟店名 (決済事業者名だけ等) は strong にしない
