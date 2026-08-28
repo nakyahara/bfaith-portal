@@ -31,6 +31,12 @@
   .card .badge { min-width: 52px; text-align: center; border-radius: 4px; padding: 6px 4px; color: #fff; font-size: 11px; line-height: 1.2; }
   .card .badge b { display: block; font-size: 16px; }
   .badge.need { background: #d9534f; }
+  .ib { display: inline-block; border-radius: 3px; padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+  .ib.ready { background: #dcfce7; color: #166534; }
+  .ib.missing { background: #fee2e2; color: #b91c1c; }
+  .ib.done { background: #e0e7ff; color: #3730a3; }
+  .ib.check { background: #fef3c7; color: #92400e; }
+  .ib a { color: inherit; }
   .badge.zero { background: #9aa3b2; }
   .autotag { display: inline-block; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; border-radius: 3px; padding: 0 6px; font-size: 10px; margin-left: 6px; vertical-align: middle; }
   .card .name { font-weight: 600; font-size: 14px; color: #2f3b5a; }
@@ -100,6 +106,8 @@
       <input type="search" id="q" placeholder="摘要・支払い先で検索">
       <select id="filter">
         <option value="todo">未仕訳 + 証憑待ち</option>
+        <option value="missing">証憑なし（取りに行く）だけ</option>
+        <option value="ready">証憑あり（登録するだけ）だけ</option>
         <option value="none">未仕訳だけ</option>
         <option value="need">証憑待ち（登録済・証憑なし）だけ</option>
         <option value="all">全て</option>
@@ -107,7 +115,7 @@
     </div>
     <table>
       <thead>
-        <tr><th>取引日</th><th class="amount">金額</th><th>摘要</th><th>勘定科目</th><th>仕訳登録</th><th>マッチした支払い先（開いて証憑を取る）</th><th>証憑</th><th></th></tr>
+        <tr><th>取引日</th><th class="amount">金額</th><th>摘要</th><th>勘定科目</th><th>仕訳登録</th><th>証憑の状態</th><th>マッチした支払い先（開いて証憑を取る）</th><th>MF</th><th></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -207,7 +215,7 @@ function renderCards() {
       ${badge}
       <div>
         <div class="name">${esc(a.name)}${a.auto_voucher ? '<span class="autotag" title="MFが明細と一緒に証憑を取得できるサービス (先方に領収書が上がっている場合)">証憑自動取得対応</span>' : ''}</div>
-        <div class="sub">明細 ${c.total}件 ／ <span class="un">証憑待ち ${c.need_voucher}件</span> ／ 添付済 ${c.attached}件</div>
+        <div class="sub">明細 ${c.total}件 ／ <span style="color:#166534">証憑あり・登録するだけ ${c.ready}件</span> ／ <span class="un">証憑なし ${c.missing}件</span> ／ 添付済 ${c.attached}件</div>
       </div>
     </div>`;
   }).join('') || '<div class="empty">この期間に明細のある連携サービスがありません</div>';
@@ -228,6 +236,8 @@ function renderRows() {
   const q = $('q').value.trim().toLowerCase();
   const f = $('filter').value;
   const rows = a.rows.filter(r => {
+    if (f === 'missing' && !(r.side === 'EXPENSE' && !r.vouchers && !r.inbox && r.status !== 'excluded')) return false;
+    if (f === 'ready' && !(r.inbox && !r.vouchers)) return false;
     if (f === 'none' && r.status !== 'none') return false;
     if (f === 'need' && !needsVoucher(r)) return false;
     if (f === 'todo' && !(r.status === 'none' || needsVoucher(r))) return false;
@@ -242,10 +252,25 @@ function renderRows() {
     <td class="content">${esc(r.content)}${r.memo ? `<span class="memo">${esc(r.memo)}</span>` : ''}</td>
     <td class="acct">${esc((r.accounts || []).slice(0, 2).join(' / '))}</td>
     <td><span class="st ${esc(r.status)}">${STATUS_LABEL[r.status] || esc(r.status)}</span>${r.journal_number ? ` <span class="acct">No.${esc(r.journal_number)}</span>` : ''}</td>
+    <td>${inboxCell(r)}</td>
     <td class="vendor">${vendorCell(r)}</td>
     <td><span class="clip ${r.vouchers ? 'on' : 'off'}" title="${r.vouchers ? `証憑 ${r.vouchers}件` : '証憑なし'}">📎</span>${r.vouchers ? ` <span class="acct">${r.vouchers}</span>` : ''}</td>
     <td>${attachCell(r)}</td>
   </tr>`).join('');
+}
+
+/** 受け箱の状態 = この明細について人が何をすればいいか */
+function inboxCell(r) {
+  if (r.vouchers) return '<span class="ib done">✅ 添付済み</span>';
+  if (r.side !== 'EXPENSE' || r.status === 'excluded') return '';
+  const ib = r.inbox;
+  if (!ib) return '<span class="ib missing">❌ 証憑なし → 取りに行く</span>';
+  const file = `<a href="../api/inbox/${ib.id}/file" target="_blank" rel="noopener" title="${esc(ib.file_name)}">📄</a>`;
+  if (ib.candidate) return `<span class="ib check">候補あり（受け箱で選ぶ）</span> ${file}`;
+  if (ib.status === 'needs_check') return `<span class="ib check">MF側を確認</span> ${file}`;
+  if (r.status === 'none') return `<span class="ib ready">📥 証憑あり → MFで「登録」するだけ</span> ${file}`;
+  if (ib.status === 'proposed') return `<span class="ib ready">📥 証憑あり → 受け箱で「承認」</span> ${file}`;
+  return `<span class="ib ready">📥 証憑あり（次の周期で貼付）</span> ${file}`;
 }
 
 function vendorCell(r) {
