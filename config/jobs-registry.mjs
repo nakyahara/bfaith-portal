@@ -375,6 +375,21 @@ export const JOBS_REGISTRY = [
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている
   //   (ping も Render 側からしか飛ばない)。
   {
+    id: 'shohyo-voucher-attach',
+    type: 'heartbeat',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '証憑受け箱 (/apps/shohyo-links/mf/inbox) の突合 + 添付。受け箱の証憑を MF明細と「支払先+金額+日付±3日」で突合し、'
+      + '自動添付ON かつ 一意一致 かつ 仕訳登録済み のときだけ POST /vouchers で仕訳に貼る (既定=提案モード・人が承認)。'
+      + '止まると受け箱に証憑が溜まり、経理がMF側で手で貼る状態に戻る (即障害ではない)',
+    where: 'Render bfaith-portal 内 node-cron (apps/shohyo-links/attach-job.js。SHOHYO_ATTACH_ENABLED=false で停止)',
+    schedule: '毎時 07分 JST (env SHOHYO_ATTACH_CRON)。MF未接続のときは partial',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「shohyo-attach」を検索。手動実行 = /apps/shohyo-links/mf/inbox の「今すぐ照合」。'
+      + 'MF未接続 (partial が続く) なら /apps/shohyo-links/mf で再接続。正本 = AI_reference『システム設計/証憑自動添付_全体像とロードマップ_20260828.md』',
+  },
+  {
     id: 'fba-daily-sync',
     type: 'scheduled_job',
     importance: 'P2',

@@ -13,6 +13,12 @@ import {
   currentOffice, getJournals, postVoucher, matchVendors, revokeTokens, journalDigest,
   getConnectedAccounts, getTransactions, getJournalsByTransactionIds, missingScopes,
 } from './mf-api.js';
+import {
+  addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, markAttached, setStatus,
+  listAttachLog, autoAttachEnabled, setSetting,
+} from './inbox.js';
+import { runInboxMatch } from './attach-job.js';
+import { parseVoucherFileName } from './matcher.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -249,6 +255,137 @@ router.get('/api/mf/transactions', async (req, res) => {
     res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
   }
 });
+
+// ---- 証憑の受け箱 (Phase 3 ③④: 突合 + 提案/自動添付) ----
+
+router.get('/mf/inbox', (req, res) => {
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  if (pathname.endsWith('/')) return res.redirect(308, `${req.baseUrl}/mf/inbox` + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
+  res.sendFile(path.join(__dirname, 'views', 'mf-inbox.html'));
+});
+
+router.get('/api/inbox', (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : null;
+    res.json({ ok: true, result: { rows: listInbox({ status }), counts: countByStatus(), auto_attach: autoAttachEnabled() } });
+  } catch (e) {
+    console.error('[shohyo-links] inbox list', e.message);
+    res.status(500).json({ ok: false, error: 'db_error' });
+  }
+});
+
+// 受け箱に入れる (画面のアップロード / ロボット / メール転送)。JSON+base64。ファイル名規約から日付・金額・支払先を補完
+router.post('/api/inbox', (req, res) => {
+  try {
+    const { file_name, file_data, mime, source, vendor_id, vendor_name, doc_date, amount, note } = req.body || {};
+    if (!file_name || !file_data) return res.status(400).json({ ok: false, error: 'file_required' });
+    if (String(file_name).length > 255) return res.status(400).json({ ok: false, error: 'file_name_too_long' });
+    if (decodedSize_(String(file_data)) > 5 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large_5mb' });
+    const parsed = parseVoucherFileName(file_name) || {};
+    const { row, duplicate } = addToInbox(Buffer.from(String(file_data), 'base64'), {
+      file_name, mime, source: source || 'upload', vendor_id,
+      vendor_name: vendor_name ?? parsed.vendor_name, doc_date: doc_date ?? parsed.doc_date, amount: amount ?? parsed.amount, note,
+    });
+    res.json({ ok: true, result: { row, duplicate } });
+  } catch (e) {
+    console.error('[shohyo-links] inbox add', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/inbox/:id/file', (req, res) => {
+  const row = getInbox(Number(req.params.id));
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  try {
+    res.setHeader('Content-Type', row.mime || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(row.file_name)}`);
+    res.send(readFile(row));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'file_missing' });
+  }
+});
+
+router.patch('/api/inbox/:id', (req, res) => {
+  try {
+    const row = updateInboxMeta(Number(req.params.id), req.body || {});
+    if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.json({ ok: true, result: row });
+  } catch (e) {
+    res.status(e.message === 'already_attached' ? 409 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// 人の操作: 提案を承認して貼る / 候補 (tx_id) を指定して貼る / 任意の仕訳IDに貼る
+router.post('/api/inbox/:id/attach', async (req, res) => {
+  const id = Number(req.params.id);
+  const row = getInbox(id);
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
+  try {
+    let journalId = String(req.body?.journal_id || row.match_journal_id || '');
+    let journalNumber = req.body?.journal_number ?? row.match_journal_number ?? null;
+    let txId = String(req.body?.tx_id || row.match_tx_id || '');
+    if (!journalId) {
+      // 候補の明細から仕訳を引く (登録済みでないと貼れない)
+      if (!txId) return res.status(400).json({ ok: false, error: 'target_required' });
+      const [j] = await getJournalsByTransactionIds([txId], row.doc_date ? shiftDate_(row.doc_date, -10) : shiftDate_(new Date().toISOString().slice(0, 10), -60), shiftDate_(new Date().toISOString().slice(0, 10), 1));
+      if (!j) return res.status(409).json({ ok: false, error: 'journal_not_registered' });
+      journalId = j.id; journalNumber = j.number;
+    }
+    const r = await postVoucher(journalId, row.file_name, readFile(row).toString('base64'));
+    const fileId = r?.voucher_file_ids?.[0]?.file_id || '';
+    const actor = req.session?.user?.email || req.session?.user?.name || 'user';
+    const out = markAttached(id, { journal_id: journalId, journal_number: journalNumber, tx_id: txId, mf_file_id: fileId, mode: 'manual', actor, reason: req.body?.reason || 'approved' });
+    res.json({ ok: true, result: out });
+  } catch (e) {
+    console.error('[shohyo-links] inbox attach', e.message, e.detail || '');
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/inbox/:id/exclude', (req, res) => {
+  const row = getInbox(Number(req.params.id));
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
+  res.json({ ok: true, result: setStatus(row.id, 'excluded') });
+});
+
+router.post('/api/inbox/:id/reopen', (req, res) => {
+  const row = getInbox(Number(req.params.id));
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
+  setMatch(row.id, { status: 'new', candidates: [] });
+  res.json({ ok: true, result: getInbox(row.id) });
+});
+
+// 今すぐ照合 (cron を待たない)。attach は設定 (自動添付ON) に従う
+router.post('/api/inbox/run', async (req, res) => {
+  try {
+    const r = await runInboxMatch({ attach: true, actor: 'manual' });
+    res.status(r.error === 'mf_not_connected' ? 401 : 200).json({ ok: r.ok || Boolean(r.error), result: r, ...(r.error ? { error: r.error } : {}) });
+  } catch (e) {
+    console.error('[shohyo-links] inbox run', e.message, e.detail || '');
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.get('/api/inbox/log', (req, res) => {
+  res.json({ ok: true, result: listAttachLog(200) });
+});
+
+router.post('/api/inbox/settings', (req, res) => {
+  const on = req.body?.auto_attach === true || req.body?.auto_attach === '1' || req.body?.auto_attach === 1;
+  setSetting('auto_attach', on ? '1' : '0');
+  console.log(`[shohyo-links] auto_attach -> ${on ? 'ON' : 'OFF'} by ${req.session?.user?.email || 'user'}`);
+  res.json({ ok: true, result: { auto_attach: on } });
+});
+
+function shiftDate_(ymd, days) {
+  const d = new Date(ymd + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
 
 // 証憑ファイルを仕訳に添付 (journal_id 無しならBoxへ未添付保存)
 router.post('/api/mf/attach', async (req, res) => {

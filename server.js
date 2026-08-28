@@ -90,6 +90,7 @@ import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
+import { startShohyoAttachCron } from './apps/shohyo-links/attach-job.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -1567,6 +1568,8 @@ app.listen(PORT, () => {
   startProductHubIntakeCron();
   // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
   startProductLinksCron();
+  // 証憑受け箱の突合+添付 (毎時・台帳 shohyo-voucher-attach)。jobs-monitor と同じ Render 専用ガード内
+  startShohyoAttachCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
