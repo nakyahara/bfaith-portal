@@ -16,7 +16,8 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured } from './notify.js';
+import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText } from './notify.js';
+import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor } from './print-queue.js';
 import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
 import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
@@ -252,6 +253,30 @@ async function retryReprintNotify() {
   }
 }
 
+/**
+ * 🖨 印刷キューの滞留・結果不明を GChat に知らせる (要件§6.3 dead-man)。
+ * **出てこないときに誰も気づかない状態を作らない**のがこの機能の存在理由なので、
+ * ここが落ちてもポーラー全体は止めない (fail-soft) が、失敗はログに残す。
+ */
+async function sweepPrintJobsStep() {
+  try {
+    sweepPrintJobs();   // 進まなくなったジョブを安全な状態へ (manual / unknown)
+  } catch (e) {
+    console.warn(`[packing-drive-poller] 印刷キューの整理に失敗: ${e.message}`);
+  }
+  // 通知は**送れたときだけ**「通知済み」にする。送信前に印を付けると、webhook が落ちていた
+  // 分が永久に鳴らなくなる。1件の失敗で後続を止めないよう、ジョブごとに握る
+  for (const job of pendingAlerts()) {
+    try {
+      const text = alertTextFor(job);
+      if (!text) continue;
+      if (await postReprintText(text)) markAlerted(job.id, job.state);
+    } catch (e) {
+      console.warn(`[packing-drive-poller] 印刷結果の通知に失敗 (${job.ne_slip_no}): ${e.message}`);
+    }
+  }
+}
+
 export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
@@ -273,6 +298,7 @@ export function startPackingDrivePoller() {
       await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);
       purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
       cleanupReprintPdfs();
+      await sweepPrintJobsStep();
       await pingJobsMonitor();
     } catch (e) {
       _status.lastError = String(e.message).slice(0, 300);

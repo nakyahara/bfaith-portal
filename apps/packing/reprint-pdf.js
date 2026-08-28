@@ -388,7 +388,8 @@ async function cutPage(srcBuffer, pageIndex, filename) {
   const token = crypto.randomBytes(16).toString('base64url');
   fs.mkdirSync(REPRINTS_DIR, { recursive: true });
   fs.writeFileSync(path.join(REPRINTS_DIR, `${token}.pdf`), bytes);
-  return { token, file: filename };
+  // sha256 は印刷キューが配信時に実物と突合するために返す (差し替わったPDFを刷らない)
+  return { token, file: filename, sha256: sha256(Buffer.from(bytes)) };
 }
 
 /** 古い抜き出しPDFの掃除 (7日超)。ポーラーから呼ばれる (fail-soft)。 */

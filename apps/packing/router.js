@@ -16,6 +16,7 @@
 import { Router } from 'express';
 import path from 'path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
@@ -33,6 +34,11 @@ import {
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
 import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR, LabelUnusableError } from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
+import {
+  enqueuePrintJob, leaseNextJob, findLeasedJob, claimPdfForPrint, failBeforeDispatch,
+  markSubmitted, markFinished, recordHeartbeat, listPrintJobs, markAlerted, alertTextFor,
+  getJobStatusFor, LEASE_SEC, PRINT_STATE_LABELS,
+} from './print-queue.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -87,6 +93,12 @@ function packingAccess(req, res, next) {
   // 🖨 抜き出した送り状PDFの配信 (事務がチャットのリンクから開く)。認証はセッションでなく
   // 128bit推測不能トークン (capability URL)。ファイルは7日で自動削除
   if (/^\/reprints\/[A-Za-z0-9_-]{16,}\.pdf$/.test(req.path)) return next();
+  // 🖨 印刷エージェント (出荷PC) は Cookie ではなく Authorization ヘッダーで名乗る。
+  // /print/ 配下はここでは素通しし、router.use('/print', requirePrintAgent) が
+  // kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)。
+  // ⭐ルートを列挙しないのは、後から /print/... を足したときに
+  //   「正規のエージェントが packingAccess に弾かれる」ズレを作らないため
+  if (req.path === '/print' || req.path.startsWith('/print/')) return next();
   if (req.session?.email) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('packing'))) return next();
@@ -153,6 +165,117 @@ router.get('/reprints/:token([A-Za-z0-9_-]{16,}).pdf', (req, res) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   fs.createReadStream(file).pipe(res);
 });
+
+// ─── 🖨 印刷キュー (出荷PCの印刷エージェントが pull で取りに来る・要件§6) ───
+/**
+ * エージェント認証。**Authorization ヘッダーのみ**で、iPad の端末Cookieは受け付けない
+ * (共用iPadのCookieで送り状を勝手に刷れる状態を作らない)。
+ */
+function requirePrintAgent(req, res, next) {
+  const m = /^Bearer\s+(\S+)$/.exec(req.headers.authorization || '');
+  const device = m ? verifyDevice(m[1]) : null;
+  if (!device || device.kind !== 'agent') {
+    return res.status(401).json({ error: '印刷エージェントとして認証されていません' });
+  }
+  req.printAgent = device;
+  next();
+}
+
+// /print/ 配下は**この1行で**エージェント認証を必須にする。個々のルートに付け忘れても
+// ここで止まる (認証の付け忘れが一番怖いので、境界をprefixで一元化する)
+router.use('/print', requirePrintAgent);
+
+/** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る)。 */
+router.get('/print/next', requirePrintAgent, api(async (req, res) => {
+  // 出力先が決まっていない端末には**lease する前に**断る。どこに出るか分からないまま
+  // 刷らせないのが目的だが、掴んでから断ると試行回数だけ減って正常なジョブが failed に落ちる
+  if (!req.printAgent.printer_name) {
+    return res.status(409).json({ error: 'この端末に出力先プリンターが登録されていません' });
+  }
+  const job = leaseNextJob(req.printAgent);
+  if (!job) return res.status(204).end();
+  res.json({ ok: true, job });
+}));
+
+/**
+ * 印刷対象のPDF本体。
+ * 🚨 **渡した時点で紙が出た可能性がある**ので、ここで dispatched に進めて自動再配布を止める
+ *    (エージェントが投入報告の前に落ちても、別の端末には二度と配らない)。
+ */
+router.get('/print/:id(\\d+)/pdf', requirePrintAgent, (req, res) => {
+  const jobId = Number(req.params.id);
+  const lease = { deviceId: req.printAgent.id, leaseToken: req.query.lease ? String(req.query.lease) : null };
+  // ① まずは読むだけ。PDFの実体を確かめる前に dispatched にすると、1バイトも渡していないのに
+  //    「印刷したかもしれない」扱いになり、確実な欠落が「結果不明」に化ける
+  const job = findLeasedJob(jobId, lease);
+  if (!job) return res.status(404).json({ error: 'このジョブを保持していません (lease を確認してください)' });
+
+  // ② PDFの実体を検証。渡せないと分かったらはっきり失敗にして人に知らせる
+  const file = path.join(REPRINTS_DIR, `${job.pdf_token}.pdf`);
+  const fail = (status, msg) => {
+    failBeforeDispatch(jobId, { ...lease, error: msg });
+    return res.status(status).json({ error: msg });
+  };
+  if (!file.startsWith(REPRINTS_DIR) || !fs.existsSync(file)) {
+    return fail(410, '印刷対象のPDFがありません (7日で削除されます)');
+  }
+  let bytes;
+  try { bytes = fs.readFileSync(file); } catch (e) { return fail(500, `PDFを読めません: ${e.message}`); }
+  if (crypto.createHash('sha256').update(bytes).digest('hex') !== job.pdf_sha256) {
+    return fail(409, '印刷対象のPDFが登録時と異なります');
+  }
+
+  // ③ 渡せると確定してから dispatched (= ここから自動再配布しない)
+  if (!claimPdfForPrint(jobId, lease)) {
+    return res.status(409).json({ error: 'ジョブの状態が変わりました (取り直してください)' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(bytes);
+});
+
+/** エージェントが再起動したときに、掴んでいたジョブがどうなったか確かめるための照会。 */
+router.get('/print/:id(\\d+)/status', requirePrintAgent, api(async (req, res) => {
+  const row = getJobStatusFor(Number(req.params.id), req.printAgent.id);
+  if (!row) throw new PackError(404, 'not_found', 'このジョブを保持していません');
+  res.json({ ok: true, job: row });
+}));
+
+router.post('/print/:id(\\d+)/submitted', requirePrintAgent, api(async (req, res) => {
+  const r = markSubmitted(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    spoolJobId: req.body.spool_job_id ?? null,
+  });
+  if (!r.ok) throw new PackError(409, 'not_leased', `報告を受け付けられません (${r.reason})`);
+  // replayed = 応答が届かなかった前回と同じ報告。エージェントが「もう投入済み」と分かる
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/:id(\\d+)/completed', requirePrintAgent, api(async (req, res) => {
+  // 「刷れた/刷れなかった」は真偽値でしか受け取らない。未指定・文字列 "false"・null を
+  // 成功扱いすると、エージェントの不具合が「印刷成功」として記録されてしまう
+  if (typeof req.body.ok !== 'boolean') {
+    throw new PackError(400, 'bad_ok', 'ok は true / false で送ってください');
+  }
+  const r = markFinished(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    ok: req.body.ok, error: req.body.error ?? null,
+  });
+  if (!r.ok) throw new PackError(409, 'not_leased', `報告を受け付けられません (${r.reason})`);
+  // 印刷の成否は現場に見える形で伝える (出なかったことに誰も気づかない状態を作らない)。
+  // 送信できたときだけ「通知済み」にする — 失敗した分はポーラーが次の周回で送り直す
+  const job = getDB().prepare('SELECT * FROM pk_print_jobs WHERE id=?').get(Number(req.params.id));
+  postReprintText(alertTextFor(job))
+    .then((sent) => { if (sent) markAlerted(job.id, job.state); })
+    .catch(() => { /* ポーラーが再送する */ });
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/heartbeat', requirePrintAgent, api(async (req, res) => {
+  recordHeartbeat(req.printAgent.id, req.body.note ?? null);
+  res.json({ ok: true, lease_sec: LEASE_SEC });
+}));
 
 // ─── 現場間アラート (「ピッキング済みの商品を下して」→ ピッキングヘッダーへ) ───
 // テーブルは picking 所有 — picking service の関数経由で読み書き (要件§7.1)
@@ -434,7 +557,14 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
           const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=?, pdf_by=?, pdf_printable=?, pdf_ink_ratio=? WHERE id=?')
             .run(r.token, r.by, r.printable ? 1 : 0, r.inkRatio ?? null, row.id);
-          await postReprintText(`📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
+          // 🖨 自動印刷に載せてよいのは manifest 経路+白紙検査を通ったものだけ。
+          // その条件は enqueuePrintJob の SQL が上の UPDATE 済みの行を直接見て判定する
+          // (呼び出し側の if に任せると、入口が増えたとき位置推定のPDFが積まれる)。
+          // 位置推定で見つけた分は今までどおり**リンクだけ**渡して人が見て印刷する
+          const queued = enqueuePrintJob(row.id, { pdfSha256: r.sha256 });
+          await postReprintText(queued
+            ? `🖨 ${row.ne_slip_no} の送り状を出荷PCで印刷します (${r.file})。念のためのリンク: ${url}`
+            : `📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
         } catch (e) {
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_error=? WHERE id=?')
             .run(String(e.message).slice(0, 120), row.id);
@@ -1139,6 +1269,8 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
     displayName: req.session.displayName,
     isAdmin: true,
     devices: listDevices(),
+    printJobs: listPrintJobs(30),
+    PRINT_STATE_LABELS,
   });
 });
 
@@ -1150,6 +1282,20 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
 router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
   if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
+
+  // 🖨 印刷エージェント (出荷PC) は iPad と発行導線は同じだが扱いが逆:
+  //   - Cookie ではなく**平文トークンをこの1回だけ画面に表示**する (エージェントの設定に貼る)
+  //   - 管理者セッションは破棄しない (登録している端末 = 中原さんのPCで、共用端末ではない)
+  //   - 出力先プリンター名をサーバ側で紐づける (エージェントの設定ミスで別プリンターに出さない)
+  if (String(req.body.kind || '') === 'agent') {
+    const printerName = String(req.body.printer_name || '').trim();
+    if (!printerName || printerName.length > 120) {
+      throw new PackError(400, 'bad_printer', 'プリンター名を入力してください (出荷PCの「プリンターとスキャナー」の表記どおり)');
+    }
+    const { token, id } = createDevice(label, req.session.email, { kind: 'agent', printerName });
+    return res.json({ ok: true, kind: 'agent', id, token, printer_name: printerName });
+  }
+
   const { token, id: deviceId } = createDevice(label, req.session.email);
   res.cookie(DEVICE_COOKIE, token, {
     httpOnly: true,

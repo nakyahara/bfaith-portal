@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -404,6 +404,52 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_printable INTEGER NOT NULL DEFAULT 0');
     db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_ink_ratio REAL');
   },
+  // v14: 送り状自動印刷 P2 — 印刷キュー (要件定義 送り状自動印刷_20260827 §6)。
+  //   出荷PCの印刷エージェントが pull で取りに来る。miniPC からは出荷PCへ一切繋がない
+  //   (出荷PCの固定IP・受信ポート開放が不要になる)。
+  //   ⭐端末は既存の pk_pack_devices を kind で区別して使う (iPad と同じ発行・失効導線に乗せる)。
+  //     プリンター名は**サーバ側が端末に紐づけて持つ** — エージェント側の設定ミスで
+  //     別のプリンターに送り状を出さないため (要件§6.2)
+  14: () => {
+    db.exec(`ALTER TABLE pk_pack_devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'ipad'
+             CHECK (kind IN ('ipad','agent'))`);
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN printer_name TEXT');
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN heartbeat_at TEXT');
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN heartbeat_note TEXT');
+    // 1つの再印刷につき印刷ジョブは1つ (UNIQUE)。「もう一度押した」で二重に紙が出ないようにする。
+    //   queued → leased → dispatched → submitted → completed / failed
+    //          ↘ manual (誰も取りに来ない)        ↘ unknown (報告が来ない)
+    // 🚨 **dispatched (PDFを渡した) 時点で紙が出た可能性がある**ため、そこから先は期限切れでも
+    //    自動で配り直さない。二重印刷より欠落を選び、人に知らせて実物を見てもらう (要件§6.1)。
+    // 🚨 状態は安全の要なので CHECK でDB側にも書いておく (保守SQL・アプリのバグで未知の状態が
+    //    入ると、監視の対象からも外れて「気づかないまま出ない」になる)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_print_jobs (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      reprint_id       INTEGER NOT NULL UNIQUE REFERENCES pk_pack_reprints(id),
+      pdf_token        TEXT NOT NULL,
+      pdf_sha256       TEXT NOT NULL,       -- 配信時に実物と突合 (差し替わったPDFを刷らない)
+      ne_slip_no       TEXT NOT NULL,
+      folder_name      TEXT,
+      printer_name     TEXT,                -- lease したデバイスに紐づく実際の出力先
+      state            TEXT NOT NULL CHECK (state IN
+                         ('queued','leased','dispatched','submitted','completed','failed','manual','unknown')),
+      lease_device_id  INTEGER REFERENCES pk_pack_devices(id),
+      lease_token      TEXT,                -- 報告時の照合 (期限切れ後の遅れた報告を弾く)
+      lease_expires_at TEXT,
+      attempt_count    INTEGER NOT NULL DEFAULT 0,
+      spool_job_id     TEXT,
+      error            TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      submitted_at     TEXT,
+      finished_at      TEXT,
+      alerted_state    TEXT,                -- GChatに鳴らし終えた状態 (送信成功後にだけ入れる)
+      -- lease を持っている状態では、誰がいつまで持っているかが必ず埋まっている
+      CHECK (state NOT IN ('leased','dispatched')
+             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL))
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_print_jobs_state ON pk_print_jobs(state, id)');
+  },
 };
 
 function createCoreTables() {
@@ -569,13 +615,18 @@ import crypto from 'node:crypto';
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
 
-/** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
-export function createDevice(label, actor) {
+/**
+ * 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。
+ * kind='agent' は出荷PCの印刷エージェント — 出力先プリンターを**サーバ側で**この端末に紐づける
+ * (エージェント側の設定ミスで別のプリンターに送り状を出さないため)。
+ */
+export function createDevice(label, actor, { kind = 'ipad', printerName = null } = {}) {
   const token = crypto.randomBytes(32).toString('base64url');
   const info = getDB().prepare(`
-    INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(hashToken(token), String(label).trim(), actor, utcNow());
+    INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at, kind, printer_name)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(hashToken(token), String(label).trim(), actor, utcNow(), kind,
+    printerName ? String(printerName).trim() : null);
   return { token, id: Number(info.lastInsertRowid) };
 }
 
@@ -602,7 +653,6 @@ export function revokeDevice(id) {
 }
 
 export function listDevices() {
-  return getDB().prepare(
-    'SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM pk_pack_devices ORDER BY id'
-  ).all();
+  return getDB().prepare(`SELECT id, label, created_by, created_at, last_seen_at, revoked_at,
+    kind, printer_name, heartbeat_at, heartbeat_note FROM pk_pack_devices ORDER BY id`).all();
 }
