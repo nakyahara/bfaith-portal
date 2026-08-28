@@ -536,6 +536,21 @@ export function initProductHubDB() {
     );
 
     -- ドラフトが載る店舗内カテゴリ (複数選択)。公開時に RMS 画面で設定する指示として使う
+    -- SKU別の JANコード (2026-08-28 中原さん要望: バリエーションありのとき、
+    -- ページ代表の JAN 1つだけでは SKU ごとの JAN を控えられない)。
+    -- ページ代表の JAN は product_drafts.jan_code (楽天のカタログIDに使う) のまま。
+    -- sku_code は LOWER(TRIM()) した SKU 商品コード (draft_sku_prices と同じ規則)
+    CREATE TABLE IF NOT EXISTS draft_sku_jans (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,
+      jan_code   TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code),
+      -- 同じ JAN を同じページの2つの SKU に付けない (別商品なのに同一 JAN はモール側で弾かれる)。
+      -- API 側でも事前に 409 を返すが、一括取込など別経路からも作らせないための制約
+      UNIQUE (draft_id, jan_code)
+    );
+
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
@@ -565,7 +580,8 @@ export function initProductHubDB() {
       draft_id        INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
       product_type    TEXT NOT NULL DEFAULT 'general'
                       CHECK (product_type IN ('general','cosmetics','health_food','food')),
-      content_volume  TEXT,               -- 内容量 (例: 50ml)
+      brand_name      TEXT,               -- ブランド名 (2026-08-28 中原さん要望。掲載HTMLの先頭行)
+      content_volume  TEXT,               -- 内容量・容量 (例: 50ml / 200g)
       size_text       TEXT,               -- サイズ (例: 縦5cm×横10cm×高さ15cm)
       ingredients     TEXT,               -- 成分/素材/材質 (化粧品=全成分、雑貨=素材)
       usage_notes     TEXT,               -- 使用上の注意
@@ -803,6 +819,29 @@ export function initProductHubDB() {
   }
 
   // 店舗内カテゴリの枠番 (2026-08-02、RMS「表示先カテゴリ 1〜5」対応)
+  // draft_sku_jans の JAN 重複防止 (2026-08-28)。テーブル定義側にも UNIQUE を書いているが、
+  // CREATE TABLE IF NOT EXISTS は既存テーブルには効かない。UNIQUE の無い版が残っていても
+  // 後から張れるようにする。重複が既にあると張れないので fail-soft (起動は止めない)
+  try {
+    const sjIndexes = db.prepare('PRAGMA index_list(draft_sku_jans)').all();
+    const hasJanUnique = sjIndexes.some((ix) => {
+      if (!ix.unique) return false;
+      const cols = db.prepare(`PRAGMA index_info(${JSON.stringify(ix.name)})`).all().map((c) => c.name);
+      return cols.length === 2 && cols.includes('draft_id') && cols.includes('jan_code');
+    });
+    if (!hasJanUnique) {
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_dsj_draft_jan ON draft_sku_jans(draft_id, jan_code)');
+    }
+  } catch (e) {
+    console.warn('[product-hub] draft_sku_jans の JAN 一意制約を張れませんでした (重複データの可能性):', e.message);
+  }
+
+  // ブランド名 (2026-08-28)。既存 DB への冪等追加
+  const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
+  if (!piCols.has('brand_name')) {
+    db.exec('ALTER TABLE draft_page_info ADD COLUMN brand_name TEXT');
+  }
+
   migrateShopCategorySlots(db);
 
   // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER

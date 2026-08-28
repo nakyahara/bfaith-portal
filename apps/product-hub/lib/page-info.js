@@ -146,7 +146,10 @@ export function buildPageInfoHtml({ productName, info, shippingLabel, descriptio
     rows.push(mkRow(label, valueHtml));
   };
   const i = info || {};
+  // ブランド名 (2026-08-28 中原さん要望)。買い手が最初に見る identity なので表の先頭に置く
+  add('ブランド名', s(i.brand_name) ? esc(i.brand_name) : null);
   add('サイズ', s(i.size_text) ? nl2br(i.size_text) : null);
+  // 「内容量」= 容量 (ml / g) もここ。雑貨でも入力できる (2026-08-28 中原さん要望)
   add('内容量', s(i.content_volume) ? nl2br(i.content_volume) : null);
   add(i.product_type === 'food' || i.product_type === 'health_food' ? '原材料名' : '成分・素材',
     s(i.product_type === 'food' || i.product_type === 'health_food' ? i.food_ingredients : i.ingredients)

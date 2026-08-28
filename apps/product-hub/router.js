@@ -52,6 +52,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
+  isValidGtin,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -241,6 +242,11 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?').all(draft.id)) {
     skuPrices[r.sku_code] = r.price;
   }
+  // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき SKU ごとに控える)
+  const skuJans = {};
+  for (const r of db.prepare('SELECT sku_code, jan_code FROM draft_sku_jans WHERE draft_id = ?').all(draft.id)) {
+    skuJans[r.sku_code] = r.jan_code;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -290,7 +296,7 @@ router.get('/detail/:id', (req, res) => {
     rakuten, cabinetImages, genreDict,
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
-    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices,
+    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -1423,6 +1429,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   const originType = ['日本製', '海外製'].includes(b.origin_type) ? b.origin_type : null;
   const vals = {
     product_type: productType,
+    brand_name: cleanText(b.brand_name, 200),
     content_volume: cleanText(b.content_volume, 200),
     size_text: cleanText(b.size_text, 300),
     ingredients: cleanText(b.ingredients, 3000),
@@ -1460,12 +1467,12 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   } else {
     db.prepare(`
       INSERT INTO draft_page_info (
-        draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
+        draft_id, product_type, brand_name, content_volume, size_text, ingredients, usage_notes,
         origin_type, origin_country, category_label, seller_name, importer_name,
         food_name, food_ingredients, food_expiry, food_storage, save_token, save_seq
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
-        product_type = excluded.product_type,
+        product_type = excluded.product_type, brand_name = excluded.brand_name,
         content_volume = excluded.content_volume, size_text = excluded.size_text,
         ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
         origin_type = excluded.origin_type, origin_country = excluded.origin_country,
@@ -1476,7 +1483,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
         save_token = excluded.save_token, save_seq = excluded.save_seq,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(
-      draft.id, vals.product_type,
+      draft.id, vals.product_type, vals.brand_name,
       vals.content_volume, vals.size_text, vals.ingredients, vals.usage_notes,
       vals.origin_type, vals.origin_country,
       vals.category_label, vals.seller_name, vals.importer_name,
@@ -1492,7 +1499,14 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     ...(isStale ? { stale: true } : {}),
     warnings: validatePageInfo(info),
     html: buildPageInfoHtml({
-      productName: draft.name, info,
+      // 掲載HTMLの「商品名」行は**基本情報タブにいま入っている商品名**を使う
+      // (2026-08-28 中原さん要望)。基本情報は明示保存なので、DB の値だけを見ると
+      // 打ち替えた直後の確認で古い名前が出る。ここでは表示に使うだけで保存はしない。
+      // 「送られてこなかった (未対応クライアント)」と「空で送られた (画面で消した)」は
+      // 区別する — 空を DB 値に戻すと、消したのに古い名前が復活する (Codex R1 中)
+      // 上限は基本情報の商品名と同じ 300 (255 で切ると長い商品名で保存値と表示がズレる — Codex R2 低)
+      productName: b.product_name !== undefined ? (cleanText(b.product_name, 300) || '') : draft.name,
+      info,
       shippingLabel: rakutenShippingLabelOf(db, draft.id) ?? neShip.label,
     }),
   });
@@ -1561,6 +1575,9 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
     // INSERT より前に置く: 既に除外済み (UNIQUE) の冪等リクエストでも掃除は必ず走らせる (Codex R2)。
     // 非UNIQUEの例外時はトランザクションごと巻き戻るので、この DELETE だけが残ることはない
     db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
+    // SKU別JAN も同じ理由で掃除する (2026-08-28)。残すと入力欄が消えて解除できない
+    db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?')
       .run(draft.id, code.trim().toLowerCase());
     try {
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
@@ -1649,6 +1666,61 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
         price = excluded.price, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(draft.id, key, price);
     logEvent(db, draft.id, 'sku_price_saved', `${code} = ${price}円`, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
+// SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
+// SKU ごとの JAN を控えられない)。空欄で送れば解除。sku-prices と同じく所属確認まで 1 トランザクション。
+// 出品 payload には使わない (バリエーションページの自動出品は P3.5 で未対応) — いまは台帳としての控え
+router.post('/api/drafts/:id/sku-jans', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const raw = req.body?.jan_code;
+  const jan = raw == null ? '' : String(raw).trim();
+  if (jan !== '' && !isValidGtin(jan)) {
+    return res.status(400).json({ ok: false, error: 'JANコードの形式が不正です (8/12/13桁 + チェックデジット)' });
+  }
+  const db = getDB();
+  const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (jan === '') {
+      // 解除はいつでも許可 (SKU を外した後でも残った行を消せるように — sku-prices と同じ方針)
+      const info = db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_jan_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+    if (v.kind !== 'variation') {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    const inGroup = v.members.some((m) => String(m.商品コード).trim().toLowerCase() === key);
+    if (!inGroup) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    // 同じ JAN を 2 つの SKU に付けない (別商品なのに同一 JAN = モール側で弾かれる元)
+    const dup = db.prepare(
+      'SELECT sku_code FROM draft_sku_jans WHERE draft_id = ? AND jan_code = ? AND sku_code != ?'
+    ).get(draft.id, jan, key);
+    if (dup) return { code: 409, error: `JAN ${jan} は ${dup.sku_code} で既に使われています` };
+    try {
+      db.prepare(`
+        INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+          jan_code = excluded.jan_code, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run(draft.id, key, jan);
+    } catch (e) {
+      // UNIQUE(draft_id, jan_code) の backstop (別プロセス・将来の一括取込との競合 — Codex R1 中)
+      if (/UNIQUE/i.test(String(e && e.message))) {
+        return { code: 409, error: `JAN ${jan} はこのページの別のSKUで既に使われています` };
+      }
+      throw e;
+    }
+    logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
     return { code: 200 };
   })();
   if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });

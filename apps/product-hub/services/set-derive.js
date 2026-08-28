@@ -148,15 +148,16 @@ export function createSetDraft(parentDraftId, opts, actor, ctx = { isAdmin: fals
     }
     // 商品ページ表記は**許可リスト**でコピーする (Codex R1 high 2026-08-23)。
     // 全列コピーすると「50ml」の 2 個セットが内容量 50ml のまま出て、法定表示が誤る。
-    // 数量で変わるもの (内容量・サイズ) と食品表示は空にして、人に入れ直させる
+    // 数量で変わるもの (内容量・サイズ) と食品表示は空にして、人に入れ直させる。
+    // ブランド名は数量で変わらないのでコピーする (2026-08-28)
     const pinfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(parentId);
     if (pinfo) {
       db.prepare(`
         INSERT INTO draft_page_info (
-          draft_id, product_type, ingredients, usage_notes, origin_type, origin_country,
+          draft_id, product_type, brand_name, ingredients, usage_notes, origin_type, origin_country,
           category_label, seller_name, importer_name
         )
-        SELECT ?, product_type, ingredients, usage_notes, origin_type, origin_country,
+        SELECT ?, product_type, brand_name, ingredients, usage_notes, origin_type, origin_country,
                category_label, seller_name, importer_name
         FROM draft_page_info WHERE draft_id = ?
       `).run(setId, parentId);

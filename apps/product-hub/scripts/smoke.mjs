@@ -1034,6 +1034,16 @@ db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_i
 // ページ表記の自動保存リビジョン列 (#691 冪等ALTER)
 const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
 check('draft_page_info に save_token/save_seq (冪等ALTER)', piCols.has('save_token') && piCols.has('save_seq'));
+check('draft_page_info に brand_name (冪等ALTER)', piCols.has('brand_name'));
+// SKU別JAN の一意制約 (テーブル定義 + 後付けインデックスの両方で担保)
+{
+  const ix = db.prepare('PRAGMA index_list(draft_sku_jans)').all().some((i) => {
+    if (!i.unique) return false;
+    const cols = db.prepare(`PRAGMA index_info(${JSON.stringify(i.name)})`).all().map((c) => c.name);
+    return cols.length === 2 && cols.includes('draft_id') && cols.includes('jan_code');
+  });
+  check('draft_sku_jans に UNIQUE(draft_id, jan_code)', ix);
+}
 
 // ─── サムネイルプロキシの取得対象ガード (Codex R1 high: confused-deputy 防止) ───
 const { isKnownImageFileId } = await import('../db.js');
@@ -1753,6 +1763,21 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
     pinfo.buildPageInfoHtml({ productName: 'X', info: null, shippingLabel: null }).includes('広告文責'));
   check('page-info html: 商品名すら無ければ固定行のみ (空文字にはならない)',
     pinfo.buildPageInfoHtml({ productName: '', info: null, shippingLabel: null }).includes('注意事項'));
+  // ブランド名・容量 (ml/g) — 2026-08-28 中原さん要望
+  {
+    const bh = pinfo.buildPageInfoHtml({
+      productName: 'X', shippingLabel: null,
+      info: { product_type: 'general', brand_name: 'B-Faith<x>', content_volume: '200g' },
+    });
+    check('page-info html: ブランド名の行が載る (エスケープあり)',
+      bh.includes('<b>ブランド名</b>') && bh.includes('B-Faith&lt;x&gt;'), bh.slice(0, 300));
+    check('page-info html: ブランド名は商品名の次・サイズより前',
+      bh.indexOf('商品名') < bh.indexOf('ブランド名') && bh.indexOf('ブランド名') < bh.indexOf('内容量'));
+    check('page-info html: 雑貨でも容量 (ml/g) が内容量として載る', bh.includes('<b>内容量</b>') && bh.includes('200g'));
+    check('page-info html: ブランド名が空なら行を出さない',
+      !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' }, shippingLabel: null })
+        .includes('ブランド名'));
+  }
 }
 
 // mapNeShippingToRakuten: 保存済み > 完全一致 > 部分一致 > null
@@ -3183,7 +3208,87 @@ let wfSetParentId = null;
   check('SKU売価: 残った行の解除はいつでもできる (原価が同一に変わった後でも)', r.status === 200
     && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
   db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
+
+  // ─── SKU別JAN (2026-08-28 中原さん要望: バリエーションありはSKUごとにJANを控える) ───
+  // 有効な JAN (チェックデジット込み): 4901234567894 / 4912345678904
+  const janOf = (code) => db.prepare(
+    'SELECT jan_code FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').get(idP, code)?.jan_code;
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: 保存できる', r.status === 200 && janOf('vc-b') === '4901234567894', JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4912345678904' });
+  check('SKU JAN: 上書きできる (UPSERT)', r.status === 200 && janOf('vc-b') === '4912345678904');
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567890' });
+  check('SKU JAN: チェックデジットが合わない値は 400', r.status === 400, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '12345' });
+  check('SKU JAN: 桁数が合わない値は 400', r.status === 400);
+  check('SKU JAN: 弾かれた要求で既存値は書き換わらない', janOf('vc-b') === '4912345678904');
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-a', jan_code: '4912345678904' });
+  check('SKU JAN: 同じJANを別SKUに付けようとしたら 409 (別商品の同一JANはモールで弾かれる)',
+    r.status === 409, JSON.stringify(r.json));
+  {
+    // API の事前チェックだけでなく DB 制約でも防ぐ (一括取込など別経路の backstop)
+    let dupErr = null;
+    try {
+      db.prepare(`INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, 'vc-a', '4912345678904')`).run(idP);
+    } catch (e) { dupErr = e; }
+    check('SKU JAN: 同一ページ内のJAN重複は DB 制約でも弾く', /UNIQUE/i.test(String(dupErr && dupErr.message)),
+      String(dupErr && dupErr.message));
+  }
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'not-in-group', jan_code: '4901234567894' });
+  check('SKU JAN: グループ外のSKUは 409', r.status === 409);
+  r = await call('POST', `/api/drafts/${idE}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: バリエーションでないドラフトは 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '' });
+  check('SKU JAN: 空で解除 = 行が消える', r.status === 200 && janOf('vc-b') === undefined);
+  // SKU を外したら JAN 行も掃除される (残すと入力欄が消えて解除できない)
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: 除外前は保存できる', r.status === 200, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/variation/exclude`, { ne_code: 'vc-b' });
+  check('SKU JAN: SKUを外すとJAN行も消える (孤児行を残さない)', r.status === 200 && janOf('vc-b') === undefined);
+  db.prepare(`DELETE FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) = 'vc-b'`).run();
+
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
+
+  // ─── 参考URL / 商品情報 (ブランド名・容量) / 掲載HTMLの商品名 (2026-08-28 中原さん要望) ───
+  {
+    const idB = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-BASIC28', '旧の商品名', 'smoke')
+    `).run().lastInsertRowid);
+    // ブランド名・容量が保存され、掲載HTMLに載る
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g',
+    });
+    check('商品情報: ブランド名・容量が保存される', r.status === 200
+      && db.prepare('SELECT brand_name, content_volume FROM draft_page_info WHERE draft_id = ?').get(idB)?.brand_name === 'B-Faith',
+      JSON.stringify(r.json).slice(0, 200));
+    check('商品情報: 掲載HTMLにブランド名と容量が載る (雑貨でも容量が出る)',
+      r.json.html.includes('ブランド名') && r.json.html.includes('B-Faith')
+      && r.json.html.includes('内容量') && r.json.html.includes('200g'));
+    // 掲載HTMLの商品名は「基本情報にいま入っている商品名」を使う (保存はしない)
+    check('掲載HTML: product_name 未指定なら DB の商品名', r.json.html.includes('旧の商品名'));
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', product_name: '打ち替えた新しい商品名',
+    });
+    check('掲載HTML: 基本情報にいま入っている商品名が使われる',
+      r.json.html.includes('打ち替えた新しい商品名') && !r.json.html.includes('旧の商品名'),
+      r.json.html.slice(0, 200));
+    check('掲載HTML: 商品名のプレビュー指定では product_drafts.name を書き換えない',
+      db.prepare('SELECT name FROM product_drafts WHERE id = ?').get(idB).name === '旧の商品名');
+    // 画面で商品名を空にしたら「商品名」行も消える (DB の古い値を復活させない — Codex R1 中)
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', product_name: '',
+    });
+    check('掲載HTML: 画面で商品名が空なら「商品名」行を出さない (古い名前を復活させない)',
+      !r.json.html.includes('旧の商品名') && !r.json.html.includes('<b>商品名</b>'), r.json.html.slice(0, 200));
+    // 参考URL: 追加ボタンでも自動反映でも通る経路は同じ (URL 検証はサーバー側が最終判定)
+    r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'https://example.com/ref-1' });
+    check('参考URL: 追加できる', r.status === 200
+      && db.prepare('SELECT COUNT(*) c FROM draft_reference_urls WHERE draft_id = ?').get(idB).c === 1,
+      JSON.stringify(r.json));
+    r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'javascript:alert(1)' });
+    check('参考URL: http(s) 以外は 400 (自動反映でも素通しにしない)', r.status === 400, JSON.stringify(r.json));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idB);
+  }
 
   // ─── 工程ボードをデフォルトに (2026-08-24 中原さん要望) ───
   const rawGet = async (p) => {
@@ -4236,6 +4341,20 @@ renders.push(
       },
       profitSim: null,
       skuPrices: { 'rooms-l-bk': 1480 },
+      // SKU別JAN (2026-08-28): 保存済み / 未入力 の両方を描かせる
+      skuJans: { 'rooms-l-bk': '4901234567894' },
+    }]);
+    // バリエーションあり (原価は全SKU共通) — SKU別JANの列だけが出る分岐
+    renders.push(['detail.ejs (バリエーション: SKU別JANのみ)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980, jan_code: '4901234567894' },
+      variation: variationFixtures.rep,
+      skuJans: { 'rooms-l-wh': '4912345678904' },
+    }]);
+    // 商品情報: ブランド名・容量が入っている分岐
+    renders.push(['detail.ejs (商品情報: ブランド名・容量あり)', 'detail.ejs', {
+      ...d0[2],
+      pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
     }]);
   }
 }
@@ -4273,6 +4392,7 @@ for (const [name, file, data] of renders) {
         backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
+        skuJans: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
