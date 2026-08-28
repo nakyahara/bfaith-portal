@@ -88,17 +88,12 @@
         <button class="btn btn-sm btn-danger" id="delete-draft-btn" style="margin-left:8px">この取り込みを削除</button>
       </div>
     <% } %>
+    <%# Notion カードはもう作らない運用 (2026-08-28 中原さん)。「⏳ 未作成」も「再作成」も出さない。
+        既に作られているカードだけ、開くためのリンクとして残す (過去データへの導線)。
+        #action-result は画面全体の保存メッセージ置き場なので、この div ごとは消さない %>
     <div style="margin-top:10px; font-size:13px;">
-      Notionカード:
       <% if (draft.notion_card_status === 'created' && draft.notion_page_id) { %>
-        ✅ 作成済み <a href="https://www.notion.so/<%= draft.notion_page_id.replace(/-/g, '') %>" target="_blank" rel="noopener">Notionで開く ↗</a>
-      <% } else { %>
-        <% if (draft.notion_card_status === 'failed') { %>
-          ❌ 作成失敗 <span class="muted"><%= draft.notion_card_error || '' %></span>
-        <% } else { %>
-          ⏳ 未作成
-        <% } %>
-        <button class="btn btn-sm" id="notion-retry-btn">再作成</button>
+        Notionカード: ✅ 作成済み <a href="https://www.notion.so/<%= draft.notion_page_id.replace(/-/g, '') %>" target="_blank" rel="noopener">Notionで開く ↗</a>
       <% } %>
       <span class="muted" id="action-result" style="margin-left:8px"></span>
     </div>
@@ -844,12 +839,9 @@
           </li>
         <% } %>
       </ul>
-      <%# 2026-08-28 中原さん要望: 追加ボタンを押さなくても、入力したら反映する
-          (URL を貼って他の欄へ移る / Enter で確定。ボタンは残す = 迷ったときの逃げ道) %>
-      <div style="display:flex; gap:8px;">
-        <input type="url" id="new-ref-url" placeholder="https://... (貼って Enter、または他の欄へ移ると追加)">
-        <button class="btn" id="add-ref-btn" style="white-space:nowrap">追加</button>
-      </div>
+      <%# 2026-08-28 中原さん要望: 入力したら反映する (URL を貼って他の欄へ移る / Enter で確定)。
+          「追加」ボタンは押す必要が無くなったので置かない %>
+      <input type="url" id="new-ref-url" placeholder="https://... (貼って Enter、または他の欄へ移ると追加)">
       <div class="muted" id="add-ref-msg" style="font-size:11px; margin-top:4px;">
         URL を貼って Enter を押すか、他の欄へ移ると自動で追加されます。
       </div>
@@ -1688,15 +1680,6 @@
     });
   }
 
-  const notionRetryBtn = document.getElementById('notion-retry-btn');
-  if (notionRetryBtn) {
-    notionRetryBtn.addEventListener('click', async () => {
-      notionRetryBtn.disabled = true;
-      const json = await post(BASE + '/notion-retry');
-      showAndReload(json, 'Notionカードを作成しました');
-      if (!json.ok) notionRetryBtn.disabled = false;
-    });
-  }
 
   // 画像の重要度: 選択で即保存 (基本情報の保存ボタンとは独立。ボードのセレクトと同じ API)
   const imgPrioritySel = document.getElementById('f-image-priority');
@@ -2938,14 +2921,13 @@
     });
   }
 
-  // 参考URL: 追加ボタンを押さなくても、入力したら反映する (2026-08-28 中原さん要望)。
-  // change (他の欄へ移った) と Enter とボタンの 3 経路が同じ関数を呼ぶ。
-  // ボタンを押すと change → click の順で 2 回走りうるので、送信中フラグで 1 回に閉じる
+  // 参考URL: 入力したら反映する (2026-08-28 中原さん要望)。
+  // change (他の欄へ移った) と Enter の 2 経路が同じ関数を呼ぶ。
+  // Enter → blur の順で 2 回走りうるので、送信中フラグで 1 回に閉じる
   (function initRefAdd() {
     const input = document.getElementById('new-ref-url');
-    const btn = document.getElementById('add-ref-btn');
     const msg = document.getElementById('add-ref-msg');
-    if (!input || !btn) return;
+    if (!input || !msg) return;
     let busy = false;
     async function addRef() {
       if (busy) return;
@@ -2978,7 +2960,6 @@
       e.preventDefault();                     // フォーム既定の送信を止める
       addRef();
     });
-    btn.addEventListener('click', addRef);
   })();
 
   // ─── 楽天の説明文3欄プレビュー (2026-08-03。デフォルト表示 = ページを開いたら自動で組み立てる) ───
