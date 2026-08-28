@@ -35,11 +35,13 @@ function sweepPreviews(now = Date.now()) {
 // ─── CSRF 二段ガード (inquiry-hub / product-links と同型) ───
 router.use('/api/', (req, res, next) => {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+  // ★Origin は必須にする (Codex R1 Medium)。他アプリは「あれば照合」だが、このアプリは
+  // この先モールへ書き込むので、Origin を落とした要求を通さない (fail-closed)
   const origin = req.headers.origin;
-  if (origin) {
-    let host = null;
-    try { host = new URL(origin).host; } catch { /* 壊れた Origin は不一致扱い */ }
-    if (!host || host !== req.headers.host) return res.status(403).json({ ok: false, error: 'origin_mismatch' });
+  let host = null;
+  try { host = origin ? new URL(origin).host : null; } catch { /* 壊れた Origin は不一致扱い */ }
+  if (!host || host !== req.headers.host) {
+    return res.status(403).json({ ok: false, error: 'origin_mismatch', message: 'ブラウザから操作してください (Origin ヘッダが必要です)' });
   }
   if (!/^application\/json\b/i.test(String(req.headers['content-type'] || ''))) {
     return res.status(415).json({ ok: false, error: 'Content-Type は application/json にしてください' });
@@ -73,10 +75,22 @@ export function parseCodes(input) {
     .filter(Boolean))];
 }
 
-function toIntOrNull(v) {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? Math.trunc(n) : null;
+/**
+ * 新売価の厳格パース。★勝手に切り捨てない (Codex R1 High)。
+ * 1200.9 を黙って 1200 にすると「入力した値」と「監査に残る値」がずれる。
+ * @returns {{ok:true, value:number|null} | {ok:false, raw:any}}
+ */
+export function parseStrictPrice(v) {
+  if (v === null || v === undefined || v === '') return { ok: true, value: null };
+  if (typeof v === 'number') return Number.isInteger(v) ? { ok: true, value: v } : { ok: false, raw: v };
+  if (typeof v === 'string') {
+    const s = v.trim();
+    if (s === '') return { ok: true, value: null };
+    // 10進の整数表記だけ受ける ("1e3" や "1,000"、小数は拒否)
+    if (!/^\d{1,12}$/.test(s)) return { ok: false, raw: v };
+    return { ok: true, value: Number(s) };
+  }
+  return { ok: false, raw: v };
 }
 
 /** 行の一意キー (プレビュー内で行を指すため。運用IDではない) */
@@ -148,7 +162,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         if (p?.found) {
           price = p.price; priceSource = 'Yahoo itemInfo (ライブ)'; priceIsLive = true;
           confidence = 'confirmed';
-          if (p.subCodes?.length) note = `sub_code別価格あり: ${p.subCodes.map((s) => `${s.subCode}=${s.price ?? '?'}`).join(', ')}`;
+          if (p.skuCode) { skuCode = p.skuCode; note = `sub_code ${p.skuCode} の価格`; }
         } else {
           note = p?.reason || '設定価格を取得できませんでした';
         }
@@ -300,11 +314,18 @@ router.post('/api/preview', (req, res) => {
     for (const row of Array.isArray(req.body?.rows) ? req.body.rows : []) {
       inputs.set(String(row?.key || ''), row);
     }
-    p.rows = p.rows.map((r) => {
+    const bad = [];
+    const next = p.rows.map((r) => {
       const inp = inputs.get(r.key);
       if (!inp) return r;
-      return { ...r, newPrice: toIntOrNull(inp.newPrice), selected: !!inp.selected };
+      const parsed = parseStrictPrice(inp.newPrice);
+      if (!parsed.ok) { bad.push(`${r.mall} ${r.listingCode}: ${JSON.stringify(inp.newPrice)}`); return r; }
+      return { ...r, newPrice: parsed.value, selected: !!inp.selected };
     });
+    if (bad.length > 0) {
+      throw validationError(`新売価は整数円で入力してください (小数・指数表記・カンマは不可): ${bad.join(' / ')}`);
+    }
+    p.rows = next;
     res.json({ ok: true, rows: evaluateRows(p.rows) });
   } catch (e) {
     apiError(res, e, 'preview');
@@ -345,7 +366,10 @@ router.post('/api/runs', (req, res) => {
       feeRate: r.feeRate,
       guard: r.evaluation ? { blocks: r.evaluation.blocks, warns: r.evaluation.warns, canUpdate: r.evaluation.canUpdate } : null,
       productUrl: r.url,
-      initialState: r.manual ? 'manual_required' : 'previewed',
+      // ★ガードに引っかかった行は previewed にしない (Codex R1 High)。
+      // M2 の実行候補は previewed だけを見る。ブロック理由つきの行が同じ状態で混ざると、
+      // 「引き当て未確定」「原価割れ」の行をそのままモールに送りかねない
+      initialState: r.manual ? 'manual_required' : (r.evaluation?.canUpdate ? 'previewed' : 'blocked_preview'),
     }));
 
     const runId = insertRun(db, {

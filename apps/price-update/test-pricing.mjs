@@ -78,6 +78,11 @@ console.log('\n── 引き当て・現在価格が確定していない行 ─
   has(evaluateRow({ ...base, confidence: 'rule' }).blocks, '引き当てが確定していない', '規則推定は更新不可');
   has(evaluateRow({ ...base, confidence: 'sales' }).blocks, '引き当てが確定していない', '実績のみは更新不可');
   has(evaluateRow({ ...base, currentPrice: null }).blocks, '現在の設定価格を取得できていない', 'ライブ価格なしは更新不可');
+  // 現在価格が 0 だと変更率が計算できず、−30%〜+100% の判定が丸ごと飛んでしまう
+  const zeroNow = evaluateRow({ ...base, currentPrice: 0, newPrice: 99999 });
+  has(zeroNow.blocks, '現在の設定価格が異常です', '現在価格 0円 は更新不可 (変更率ガードの迂回を塞ぐ)');
+  ok(!zeroNow.canUpdate, '0円スタートで高額を入れても通らない');
+  has(evaluateRow({ ...base, currentPrice: -100 }).blocks, '現在の設定価格が異常です', '負の現在価格も更新不可');
 }
 
 console.log('\n── 粗利警告 (ブロックはしない) ──');

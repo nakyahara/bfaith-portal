@@ -21,8 +21,14 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 
 let initialized = false;
 
-/** M1 で使う状態 (M2 以降で増える) */
-export const STATES = ['previewed', 'manual_required', 'manual_done'];
+/**
+ * M1 で使う状態 (M2 以降で増える)
+ *   previewed       … 更新候補として記録した (ガードを全部通っている)
+ *   blocked_preview … ガードに引っかかったまま記録した (★M2 の実行候補にしてはいけない)
+ *   manual_required … Amazon / auPAY / Qoo10 の手動更新対象
+ *   manual_done     … 手動更新を済ませたと本人が記録した
+ */
+export const STATES = ['previewed', 'blocked_preview', 'manual_required', 'manual_done'];
 
 export function initPriceUpdate() {
   const db = getMirrorDB();
@@ -86,6 +92,24 @@ export function createTables(db) {
     PRIMARY KEY (run_id, seq)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_pu_events_op ON pu_events(run_id, operation_id, seq)');
+
+  // ★append-only を DB 側で強制する (Codex R1 Critical)。
+  // 「UPDATE/DELETE を書かない」という規約だけでは、保守スクリプトや SQL コンソールから
+  // 監査根拠を書き換えられてしまい、「構造で保証する」と言えない。
+  // 訂正は必ず新しいイベントの追記で表す (取り消しも追記)。
+  for (const t of ['pu_runs', 'pu_operations', 'pu_events']) {
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_update BEFORE UPDATE ON ${t}
+      BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (UPDATE 禁止)。訂正はイベントを足してください'); END`);
+    db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_no_delete BEFORE DELETE ON ${t}
+      BEGIN SELECT RAISE(ABORT, '${t} は追記のみ (DELETE 禁止)。訂正はイベントを足してください'); END`);
+  }
+  // イベントは同じ run の operation にしか付けられない (run 跨ぎの取り違え防止)。
+  // operation_id が NULL の行 = run 全体のイベントは対象外 (SQLite の FK は NULL を許す)
+  db.exec(`CREATE TRIGGER IF NOT EXISTS pu_events_op_belongs_to_run BEFORE INSERT ON pu_events
+    WHEN NEW.operation_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM pu_operations o WHERE o.run_id = NEW.run_id AND o.operation_id = NEW.operation_id
+    )
+    BEGIN SELECT RAISE(ABORT, 'pu_events: その operation は同じ run に属していません'); END`);
   return db;
 }
 

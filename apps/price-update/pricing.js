@@ -110,7 +110,13 @@ export function evaluateRow(row) {
   if (mall === 'aupay' || mall === 'qoo10') blocks.push('このモールは手動更新です (API更新は Phase 2)');
 
   if (row.confidence !== 'confirmed') blocks.push('引き当てが確定していない行は更新できません');
-  if (current == null) blocks.push('現在の設定価格を取得できていない行は更新できません');
+  if (current == null) {
+    blocks.push('現在の設定価格を取得できていない行は更新できません');
+  } else if (!isValidPrice(current)) {
+    // ★現在価格が 0 や負数だと変更率ガードが素通りする (0 で割れないので比較が飛ばされる)。
+    // モール側が 0 円で登録されている異常状態のまま値付けさせない (Codex R1 High)
+    blocks.push(`現在の設定価格が異常です (${current})。モール側を確認してください`);
+  }
 
   if (next == null) {
     // 新売価未入力は「まだ対象でない」だけ。ブロック理由には積むが警告は出さない
@@ -121,7 +127,7 @@ export function evaluateRow(row) {
 
   let changeRatio = null;
   let changeAmount = null;
-  if (current != null && next != null && isValidPrice(next)) {
+  if (isValidPrice(current) && next != null && isValidPrice(next)) {
     changeAmount = next - current;
     changeRatio = current > 0 ? changeAmount / current : null;
     if (changeRatio != null && !row.isRecovery) {

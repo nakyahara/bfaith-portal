@@ -145,23 +145,46 @@ export async function fetchYahooPrices(itemCodes, deps = {}) {
   const fetchOne = deps.fetchYahooItemDetail || fetchYahooItemDetail;
   for (const c of codes) {
     const key = normCode(c);
+    const miss = (reason, extra = {}) => out.set(key, { price: null, subCodes: [], skuCode: null, found: false, reason, itemName: null, ...extra });
     try {
       const d = await fetchOne(c);
-      const price = toIntPrice(d?.Price);
+      // ★問い合わせた商品と返ってきた商品が同じことを確かめる (Codex R1 Critical)。
+      // 「価格が返ってきた」だけでは実在確認にならない — 取り違えた応答をそのまま
+      // 「この出品の現在価格」として confirmed にすると、別商品の価格を根拠に値付けしてしまう
+      if (d?.ok === false) { miss('Yahoo が ok を返しませんでした'); continue; }
+      if (normCode(d?.ItemCode) !== key) {
+        miss(`問い合わせた商品コードと応答が一致しません (要求 ${c} / 応答 ${d?.ItemCode ?? 'なし'})`);
+        continue;
+      }
+      const itemPrice = toIntPrice(d?.Price);
       const subCodes = Array.isArray(d?.SubCodes)
-        ? d.SubCodes.map((s) => ({ subCode: s?.SubCode || null, price: toIntPrice(s?.Price) })).filter((s) => s.subCode)
+        ? d.SubCodes.map((s) => ({ subCode: s?.SubCode == null ? null : String(s.SubCode), price: toIntPrice(s?.Price) })).filter((s) => s.subCode)
         : [];
-      out.set(key, {
-        price,
-        subCodes,
-        found: price != null,
-        reason: price == null
-          ? (d?.Price === undefined ? '価格が返ってきません (VPS プロキシの Price 抽出が未デプロイの可能性)' : '設定価格を整数円として読めません')
-          : null,
-        itemName: d?.Name || null,
-      });
+      // sub_code 別価格の扱い:
+      //   ・要求コードがサブコードと一致 → そのサブコードの価格 (null なら商品価格を継承)
+      //   ・一致しないのに「価格を持つサブコード」がある → どの SKU の価格か決められないので未確定 (fail-closed)
+      //   ・サブコードが無い / 全部が商品価格を継承 → 商品価格でよい
+      const matchedSub = subCodes.find((s) => normCode(s.subCode) === key) || null;
+      const pricedSubs = subCodes.filter((s) => s.price != null);
+      let price = null;
+      let skuCode = null;
+      let reason = null;
+      if (matchedSub) {
+        price = matchedSub.price != null ? matchedSub.price : itemPrice;
+        skuCode = matchedSub.subCode;
+        if (price == null) reason = '設定価格を整数円として読めません';
+      } else if (pricedSubs.length > 0) {
+        reason = `SKU別価格のある商品です (${pricedSubs.map((s) => s.subCode).join(', ')})。どのSKUかを特定できないため更新対象にできません`;
+      } else if (itemPrice == null) {
+        reason = d?.Price === undefined
+          ? '価格が返ってきません (VPS プロキシの Price 抽出が未デプロイの可能性)'
+          : '設定価格を整数円として読めません';
+      } else {
+        price = itemPrice;
+      }
+      out.set(key, { price, subCodes, skuCode, found: price != null, reason, itemName: d?.Name || null });
     } catch (e) {
-      out.set(key, { price: null, subCodes: [], found: false, reason: e?.message || 'Yahooから取得できません', itemName: null });
+      miss(e?.message || 'Yahooから取得できません');
     }
   }
   return out;

@@ -19,7 +19,7 @@ import Database from 'better-sqlite3';
 import { buildTargets, findSetsContaining, setCostOf, listingUrl } from './resolve.js';
 import { toIntPrice, fetchRakutenPrices, fetchYahooPrices, _resetCodeMapCache } from './live-price.js';
 import { createTables, insertRun, appendEvent, currentStates, getRun, listRuns } from './db.js';
-import { buildPreviewRows, evaluateRows, parseCodes } from './router.js';
+import { buildPreviewRows, evaluateRows, parseCodes, parseStrictPrice } from './router.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -62,6 +62,20 @@ console.log('\n── 入力のパース ──');
 {
   eq(parseCodes('abc-001\nabc-002, abc-001  abc-003'), ['abc-001', 'abc-002', 'abc-003'], '改行・カンマ・空白区切り + 重複除去');
   eq(parseCodes(''), [], '空入力は空配列');
+}
+
+console.log('\n── 新売価の厳格パース (勝手に切り捨てない) ──');
+{
+  eq(parseStrictPrice('1200'), { ok: true, value: 1200 }, '整数文字列');
+  eq(parseStrictPrice(1200), { ok: true, value: 1200 }, '数値');
+  eq(parseStrictPrice(''), { ok: true, value: null }, '空は未入力');
+  eq(parseStrictPrice(null), { ok: true, value: null }, 'null は未入力');
+  ok(!parseStrictPrice('1200.9').ok, '★小数は 1200 に切り捨てず拒否 (入力と監査の値がずれる)');
+  ok(!parseStrictPrice(1200.9).ok, '数値の小数も拒否');
+  ok(!parseStrictPrice('1e3').ok, '指数表記は拒否');
+  ok(!parseStrictPrice('1,200').ok, 'カンマ入りは拒否');
+  ok(!parseStrictPrice('-100').ok, '負数は拒否');
+  ok(!parseStrictPrice({}).ok, 'オブジェクトは拒否');
 }
 
 console.log('\n── セットの逆引きと原価再計算 ──');
@@ -140,6 +154,49 @@ console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ─
   ok(yahoo.get('old-vps').reason.includes('未デプロイ'), '理由に未デプロイの可能性を書く');
 }
 
+console.log('\n── Yahoo: 応答の取り違えと SKU別価格 (fail-closed) ──');
+{
+  // ★別商品の応答が返ってきたら確定させない (「価格が返った」= 実在確認 ではない)
+  const mismatched = await fetchYahooPrices(['abc-001'], {
+    fetchYahooItemDetail: async () => ({ ok: true, ItemCode: 'other-999', Name: '別商品', Price: 500 }),
+  });
+  eq(mismatched.get('abc-001').found, false, '応答の ItemCode が違えば取得不可');
+  ok(mismatched.get('abc-001').reason.includes('一致しません'), '理由に不一致と書く');
+
+  const notOk = await fetchYahooPrices(['abc-001'], {
+    fetchYahooItemDetail: async (c) => ({ ok: false, ItemCode: c, Price: 500 }),
+  });
+  eq(notOk.get('abc-001').found, false, 'ok=false は取得不可');
+
+  // SKU別価格があるのに、要求コードがどのサブコードでもない → どのSKUの価格か決められない
+  const parentOfVariants = await fetchYahooPrices(['item-v'], {
+    fetchYahooItemDetail: async (c) => ({
+      ok: true, ItemCode: c, Name: 'バリ商品', Price: 2000,
+      SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }, { SubCode: 'item-v-b', Price: 2200 }],
+    }),
+  });
+  eq(parentOfVariants.get('item-v').found, false, '★SKU別価格がある商品の親コードは未確定 (親価格で値付けさせない)');
+  ok(parentOfVariants.get('item-v').reason.includes('SKU別価格'), '理由に SKU別価格と書く');
+
+  // 要求コードがサブコードと一致 → そのサブコードの価格を使う
+  const sub = await fetchYahooPrices(['item-v-b'], {
+    fetchYahooItemDetail: async (c) => ({
+      ok: true, ItemCode: c, Name: 'バリ商品', Price: 2000,
+      SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }, { SubCode: 'item-v-b', Price: 2200 }],
+    }),
+  });
+  eq([sub.get('item-v-b').price, sub.get('item-v-b').skuCode], [2200, 'item-v-b'], 'サブコード一致ならその価格');
+
+  // サブコードはあるが価格を持たない (商品価格を継承する運用) → 商品価格でよい
+  const inherit = await fetchYahooPrices(['item-w'], {
+    fetchYahooItemDetail: async (c) => ({
+      ok: true, ItemCode: c, Name: '継承', Price: 1500,
+      SubCodes: [{ SubCode: 'item-w-a', Price: null }],
+    }),
+  });
+  eq(inherit.get('item-w').price, 1500, 'サブコードが価格を持たなければ商品価格を使う');
+}
+
 console.log('\n── プレビュー行の組み立て (confirmed への昇格) ──');
 let previewRows = null;
 {
@@ -206,6 +263,17 @@ console.log('\n── 監査記録 (append-only・状態はイベントから導
   // 状態イベント以外の event 名では状態が動かない (未知のイベントで状態を壊さない)
   appendEvent(db, runId, { operationId: manualOp.operation_id, actor: 't', event: 'note_added' });
   eq(currentStates(db, runId).get(manualOp.operation_id), 'manual_required', '未知のイベントは状態を変えない');
+
+  // ★append-only は DB 側で強制されている (規約だけにしない)
+  const throws = (fn, label) => {
+    try { fn(); ok(false, label + ' — 通ってしまった'); } catch (e) { ok(/追記のみ|属していません/.test(e.message), `${label} — ${e.message.slice(0, 60)}`); }
+  };
+  throws(() => db.prepare('UPDATE pu_operations SET new_price = 1 WHERE run_id = ?').run(runId), 'pu_operations の UPDATE は拒否される');
+  throws(() => db.prepare('DELETE FROM pu_operations WHERE run_id = ?').run(runId), 'pu_operations の DELETE は拒否される');
+  throws(() => db.prepare('UPDATE pu_runs SET note = ? WHERE run_id = ?').run('改ざん', runId), 'pu_runs の UPDATE は拒否される');
+  throws(() => db.prepare('DELETE FROM pu_events WHERE run_id = ?').run(runId), 'pu_events の DELETE は拒否される');
+  throws(() => appendEvent(db, runId, { operationId: 'puo-not-in-this-run', actor: 't', event: 'manual_done' }),
+    '他 run の operation にイベントは付けられない');
 }
 
 db.close();
