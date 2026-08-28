@@ -14,11 +14,11 @@ import {
   getConnectedAccounts, getTransactions, getJournalsByTransactionIds, missingScopes,
 } from './mf-api.js';
 import {
-  addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, markAttached, setStatus,
-  listAttachLog, autoAttachEnabled, setSetting,
+  addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, setStatus,
+  listAttachLog, autoAttachEnabled, setSetting, decodeBase64Strict, INBOX_STATUSES,
 } from './inbox.js';
-import { runInboxMatch } from './attach-job.js';
-import { parseVoucherFileName } from './matcher.js';
+import { runInboxMatch, attachWithClaim } from './attach-job.js';
+import { parseVoucherFileName, isValidDate } from './matcher.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -265,107 +265,45 @@ router.get('/mf/inbox', (req, res) => {
   res.sendFile(path.join(__dirname, 'views', 'mf-inbox.html'));
 });
 
+const inboxId_ = (v) => { const n = Number(v); return Number.isSafeInteger(n) && n > 0 ? n : null; };
+const actorOf_ = (req) => req.session?.user?.email || req.session?.email || req.session?.user?.name || 'user';
+// 自動添付のON/OFF (お金に関わる設定) は admin だけ
+function requireAdmin_(req, res, next) {
+  if (req.session?.role !== 'admin') return res.status(403).json({ ok: false, error: 'admin_only' });
+  next();
+}
+
 router.get('/api/inbox', (req, res) => {
   try {
     const status = req.query.status ? String(req.query.status) : null;
-    res.json({ ok: true, result: { rows: listInbox({ status }), counts: countByStatus(), auto_attach: autoAttachEnabled() } });
+    if (status && !INBOX_STATUSES.includes(status)) return res.status(400).json({ ok: false, error: 'bad_status' });
+    res.json({ ok: true, result: { rows: listInbox({ status }), counts: countByStatus(), auto_attach: autoAttachEnabled(), is_admin: req.session?.role === 'admin' } });
   } catch (e) {
     console.error('[shohyo-links] inbox list', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
   }
 });
 
-// 受け箱に入れる (画面のアップロード / ロボット / メール転送)。JSON+base64。ファイル名規約から日付・金額・支払先を補完
+// 受け箱に入れる (画面のアップロード / ロボット / メール転送)。JSON+base64。
+// 種別は中身 (magic bytes) で決め、申告された mime/拡張子は使わない。ファイル名規約から日付・金額・支払先を補完
 router.post('/api/inbox', (req, res) => {
   try {
-    const { file_name, file_data, mime, source, vendor_id, vendor_name, doc_date, amount, note } = req.body || {};
-    if (!file_name || !file_data) return res.status(400).json({ ok: false, error: 'file_required' });
-    if (String(file_name).length > 255) return res.status(400).json({ ok: false, error: 'file_name_too_long' });
-    if (decodedSize_(String(file_data)) > 5 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large_5mb' });
+    const { file_name, file_data, source, vendor_id, vendor_name, doc_date, amount, note } = req.body || {};
+    if (typeof file_name !== 'string' || !file_name.trim() || !file_data) return res.status(400).json({ ok: false, error: 'file_required' });
+    if (file_name.length > 255) return res.status(400).json({ ok: false, error: 'file_name_too_long' });
+    if (typeof file_data !== 'string' || decodedSize_(file_data) > 5 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large_5mb' });
+    const buffer = decodeBase64Strict(file_data);
+    if (!buffer) return res.status(400).json({ ok: false, error: 'bad_base64' });
+    if (doc_date !== undefined && doc_date !== '' && !isValidDate(doc_date)) return res.status(400).json({ ok: false, error: 'bad_date' });
     const parsed = parseVoucherFileName(file_name) || {};
-    const { row, duplicate } = addToInbox(Buffer.from(String(file_data), 'base64'), {
-      file_name, mime, source: source || 'upload', vendor_id,
+    const { row, duplicate } = addToInbox(buffer, {
+      file_name, source, vendor_id,
       vendor_name: vendor_name ?? parsed.vendor_name, doc_date: doc_date ?? parsed.doc_date, amount: amount ?? parsed.amount, note,
     });
     res.json({ ok: true, result: { row, duplicate } });
   } catch (e) {
+    if (e.message === 'unsupported_file') return res.status(415).json({ ok: false, error: 'unsupported_file' });
     console.error('[shohyo-links] inbox add', e.message);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-router.get('/api/inbox/:id/file', (req, res) => {
-  const row = getInbox(Number(req.params.id));
-  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-  try {
-    res.setHeader('Content-Type', row.mime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(row.file_name)}`);
-    res.send(readFile(row));
-  } catch (e) {
-    res.status(500).json({ ok: false, error: 'file_missing' });
-  }
-});
-
-router.patch('/api/inbox/:id', (req, res) => {
-  try {
-    const row = updateInboxMeta(Number(req.params.id), req.body || {});
-    if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-    res.json({ ok: true, result: row });
-  } catch (e) {
-    res.status(e.message === 'already_attached' ? 409 : 500).json({ ok: false, error: e.message });
-  }
-});
-
-// 人の操作: 提案を承認して貼る / 候補 (tx_id) を指定して貼る / 任意の仕訳IDに貼る
-router.post('/api/inbox/:id/attach', async (req, res) => {
-  const id = Number(req.params.id);
-  const row = getInbox(id);
-  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
-  try {
-    let journalId = String(req.body?.journal_id || row.match_journal_id || '');
-    let journalNumber = req.body?.journal_number ?? row.match_journal_number ?? null;
-    let txId = String(req.body?.tx_id || row.match_tx_id || '');
-    if (!journalId) {
-      // 候補の明細から仕訳を引く (登録済みでないと貼れない)
-      if (!txId) return res.status(400).json({ ok: false, error: 'target_required' });
-      const [j] = await getJournalsByTransactionIds([txId], row.doc_date ? shiftDate_(row.doc_date, -10) : shiftDate_(new Date().toISOString().slice(0, 10), -60), shiftDate_(new Date().toISOString().slice(0, 10), 1));
-      if (!j) return res.status(409).json({ ok: false, error: 'journal_not_registered' });
-      journalId = j.id; journalNumber = j.number;
-    }
-    const r = await postVoucher(journalId, row.file_name, readFile(row).toString('base64'));
-    const fileId = r?.voucher_file_ids?.[0]?.file_id || '';
-    const actor = req.session?.user?.email || req.session?.user?.name || 'user';
-    const out = markAttached(id, { journal_id: journalId, journal_number: journalNumber, tx_id: txId, mf_file_id: fileId, mode: 'manual', actor, reason: req.body?.reason || 'approved' });
-    res.json({ ok: true, result: out });
-  } catch (e) {
-    console.error('[shohyo-links] inbox attach', e.message, e.detail || '');
-    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
-  }
-});
-
-router.post('/api/inbox/:id/exclude', (req, res) => {
-  const row = getInbox(Number(req.params.id));
-  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
-  res.json({ ok: true, result: setStatus(row.id, 'excluded') });
-});
-
-router.post('/api/inbox/:id/reopen', (req, res) => {
-  const row = getInbox(Number(req.params.id));
-  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-  if (row.status === 'attached') return res.status(409).json({ ok: false, error: 'already_attached' });
-  setMatch(row.id, { status: 'new', candidates: [] });
-  res.json({ ok: true, result: getInbox(row.id) });
-});
-
-// 今すぐ照合 (cron を待たない)。attach は設定 (自動添付ON) に従う
-router.post('/api/inbox/run', async (req, res) => {
-  try {
-    const r = await runInboxMatch({ attach: true, actor: 'manual' });
-    res.status(r.error === 'mf_not_connected' ? 401 : 200).json({ ok: r.ok || Boolean(r.error), result: r, ...(r.error ? { error: r.error } : {}) });
-  } catch (e) {
-    console.error('[shohyo-links] inbox run', e.message, e.detail || '');
     res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -374,11 +312,100 @@ router.get('/api/inbox/log', (req, res) => {
   res.json({ ok: true, result: listAttachLog(200) });
 });
 
-router.post('/api/inbox/settings', (req, res) => {
-  const on = req.body?.auto_attach === true || req.body?.auto_attach === '1' || req.body?.auto_attach === 1;
-  setSetting('auto_attach', on ? '1' : '0');
-  console.log(`[shohyo-links] auto_attach -> ${on ? 'ON' : 'OFF'} by ${req.session?.user?.email || 'user'}`);
-  res.json({ ok: true, result: { auto_attach: on } });
+router.get('/api/inbox/:id/file', (req, res) => {
+  const id = inboxId_(req.params.id);
+  const row = id ? getInbox(id) : null;
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  try {
+    const buf = readFile(row);
+    res.setHeader('Content-Type', row.mime || 'application/octet-stream');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Disposition', "inline; filename*=UTF-8''" + encodeURIComponent(row.file_name));
+    res.send(buf);
+  } catch (e) {
+    console.error('[shohyo-links] inbox file', id, e.message);
+    res.status(500).json({ ok: false, error: e.message === 'file_corrupted' ? 'file_corrupted' : 'file_missing' });
+  }
+});
+
+router.patch('/api/inbox/:id', (req, res) => {
+  const id = inboxId_(req.params.id);
+  if (!id) return res.status(400).json({ ok: false, error: 'bad_id' });
+  try {
+    const row = updateInboxMeta(id, req.body || {});
+    if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+    res.json({ ok: true, result: row });
+  } catch (e) {
+    const code = { already_attached: 409, bad_date: 400, bad_amount: 400 }[e.message] || 500;
+    res.status(code).json({ ok: false, error: e.message });
+  }
+});
+
+// 人の操作: 提案を承認して貼る / 候補 (tx_id) を指定して貼る。
+// 貼れる相手は「サーバーが突合で出した候補」だけ。任意の仕訳IDは受け付けない (Codexレビュー High-5)
+router.post('/api/inbox/:id/attach', async (req, res) => {
+  const id = inboxId_(req.params.id);
+  const row = id ? getInbox(id) : null;
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached' || row.status === 'attaching') return res.status(409).json({ ok: false, error: 'already_attached' });
+  try {
+    const txId = typeof req.body?.tx_id === 'string' && req.body.tx_id ? req.body.tx_id : row.match_tx_id;
+    if (!txId) return res.status(400).json({ ok: false, error: 'target_required' });
+    const allowed = new Set([row.match_tx_id, ...(row.candidates || []).map(c => c.tx_id)].filter(Boolean));
+    if (!allowed.has(txId)) return res.status(400).json({ ok: false, error: 'not_a_candidate' });
+    // 仕訳はMFから引き直し、明細IDが一致することを確認する (クライアントの仕訳No.は信用しない)
+    const today = new Date().toISOString().slice(0, 10);
+    const from = shiftDate_(isValidDate(row.doc_date) ? row.doc_date : today, isValidDate(row.doc_date) ? -10 : -60);
+    const journals = await getJournalsByTransactionIds([txId], from, shiftDate_(today, 1));
+    const j = journals.find(x => x.transaction_id === txId);
+    if (!j) return res.status(409).json({ ok: false, error: 'journal_not_registered' });
+    const r = await attachWithClaim(row, j, { tx_id: txId, mode: 'manual', actor: actorOf_(req), reason: req.body?.tx_id ? 'picked' : 'approved' });
+    if (!r.ok) {
+      if (r.error === 'claim_failed') return res.status(409).json({ ok: false, error: 'already_attached' });
+      return res.status(r.error === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: r.error });
+    }
+    res.json({ ok: true, result: getInbox(id) });
+  } catch (e) {
+    console.error('[shohyo-links] inbox attach', e.message, e.detail || '');
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/inbox/:id/exclude', (req, res) => {
+  const id = inboxId_(req.params.id);
+  const row = id ? getInbox(id) : null;
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached' || row.status === 'attaching') return res.status(409).json({ ok: false, error: 'already_attached' });
+  res.json({ ok: true, result: setStatus(row.id, 'excluded') });
+});
+
+router.post('/api/inbox/:id/reopen', (req, res) => {
+  const id = inboxId_(req.params.id);
+  const row = id ? getInbox(id) : null;
+  if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (row.status === 'attached' || row.status === 'attaching') return res.status(409).json({ ok: false, error: 'already_attached' });
+  setMatch(row.id, { status: 'new', candidates: [] });
+  res.json({ ok: true, result: getInbox(row.id) });
+});
+
+// 今すぐ照合 (cron を待たない)。attach は設定 (自動添付ON) に従う。進行中なら相乗り (二重実行しない)
+router.post('/api/inbox/run', async (req, res) => {
+  try {
+    const r = await runInboxMatch({ attach: true, actor: actorOf_(req) });
+    if (r.error) return res.status(r.error === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: r.error, result: r });
+    res.json({ ok: true, result: r });
+  } catch (e) {
+    console.error('[shohyo-links] inbox run', e.message, e.detail || '');
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/inbox/settings', requireAdmin_, (req, res) => {
+  const v = req.body?.auto_attach;
+  if (v !== true && v !== false) return res.status(400).json({ ok: false, error: 'bad_value' });
+  setSetting('auto_attach', v ? '1' : '0');
+  console.log(`[shohyo-links] auto_attach -> ${v ? 'ON' : 'OFF'} by ${actorOf_(req)}`);
+  res.json({ ok: true, result: { auto_attach: v } });
 });
 
 function shiftDate_(ymd, days) {

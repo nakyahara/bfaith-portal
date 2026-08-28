@@ -45,6 +45,7 @@
   .st.waiting_registration { background: #fef3c7; color: #92400e; }
   .st.ambiguous, .st.no_match { background: #fee2e2; color: #b91c1c; }
   .st.attached { background: #dcfce7; color: #166534; }
+  .st.attaching { background: #e0e7ff; color: #3730a3; }
   .st.excluded { background: #f3f4f6; color: #9ca3af; }
   .st.error { background: #fee2e2; color: #b91c1c; }
   .cand { display: block; padding: 4px 8px; border: 1px solid #e3e6eb; border-radius: 4px; margin: 2px 0; background: #fafbfc; }
@@ -116,7 +117,7 @@ const TABS = [
   ['todo', '要対応'], ['proposed', '提案'], ['waiting_registration', '登録待ち'], ['ambiguous', '候補複数'], ['no_match', '一致なし'],
   ['new', '未照合'], ['attached', '添付済み'], ['excluded', '除外'], ['error', 'エラー'], ['all', '全て'],
 ];
-const LABEL = { new: '未照合', proposed: '提案', waiting_registration: '登録待ち', ambiguous: '候補複数', no_match: '一致なし', attached: '添付済み', excluded: '除外', error: 'エラー' };
+const LABEL = { new: '未照合', proposed: '提案', waiting_registration: '登録待ち', ambiguous: '候補複数', no_match: '一致なし', attaching: '添付中', attached: '添付済み', excluded: '除外', error: 'エラー' };
 const TODO = new Set(['proposed', 'ambiguous', 'no_match', 'error']);
 
 function toast(msg) {
@@ -145,6 +146,8 @@ async function refreshStatus() {
 async function load() {
   data = await api('../api/inbox');
   $('autoAttach').checked = data.auto_attach;
+  $('autoAttach').disabled = !data.is_admin;
+  $('autoAttach').title = data.is_admin ? '' : '自動添付の切替は管理者だけができます';
   $('modeInfo').textContent = data.auto_attach ? '自動モード: 支払先+金額+日付が一意に一致した証憑は毎時自動で貼られます' : '提案モード: ロボットは提案するだけ。「承認して貼る」で貼ります';
   renderTabs(); render();
 }
@@ -230,7 +233,9 @@ document.addEventListener('click', async (ev) => {
     if (t.dataset.exclude) { await api(`../api/inbox/${t.dataset.exclude}/exclude`, { method: 'POST', body: '{}' }); return load(); }
     if (t.dataset.reopen) { await api(`../api/inbox/${t.dataset.reopen}/reopen`, { method: 'POST', body: '{}' }); return load(); }
   } catch (e) {
-    toast('エラー: ' + ({ journal_not_registered: 'その明細はまだMFで登録されていません（登録後に貼れます）', mf_not_connected: 'MF未接続です' }[e.message] || e.message));
+    toast('エラー: ' + ({ journal_not_registered: 'その明細はまだMFで登録されていません（登録後に貼れます）', mf_not_connected: 'MF未接続です',
+      not_a_candidate: '候補にない明細には貼れません', already_attached: '既に添付済み（または処理中）です', admin_only: '管理者だけが変更できます',
+      file_corrupted: 'ファイルが壊れています（受け箱に入れ直してください）' }[e.message] || e.message));
     load();
   }
 });
@@ -240,7 +245,9 @@ $('autoAttach').addEventListener('change', async () => {
   if (on && !confirm('自動添付をONにします。支払先・金額・日付が一意に一致した証憑は、人の承認なしでMFの仕訳に貼られます。よろしいですか？')) {
     $('autoAttach').checked = false; return;
   }
-  await api('../api/inbox/settings', { method: 'POST', body: JSON.stringify({ auto_attach: on }) });
+  try {
+    await api('../api/inbox/settings', { method: 'POST', body: JSON.stringify({ auto_attach: on }) });
+  } catch (e) { toast(e.message === 'admin_only' ? '管理者だけが変更できます' : 'エラー: ' + e.message); }
   load();
 });
 
@@ -270,7 +277,7 @@ async function upload(files) {
     try {
       const r = await api('../api/inbox', { method: 'POST', body: JSON.stringify({ file_name: f.name, file_data: b64, mime: f.type, source: 'upload' }) });
       r.duplicate ? dup++ : ok++;
-    } catch (e) { ng++; }
+    } catch (e) { ng++; if (e.message === 'unsupported_file') toast(`${f.name}: PDF・JPEG・PNG 以外は受け付けません`); }
   }
   toast(`受け箱に ${ok}件追加${dup ? `・重複 ${dup}件` : ''}${ng ? `・失敗 ${ng}件` : ''}。照合します…`);
   try { await api('../api/inbox/run', { method: 'POST', body: '{}' }); } catch (e) { /* 未接続などはタブで分かる */ }

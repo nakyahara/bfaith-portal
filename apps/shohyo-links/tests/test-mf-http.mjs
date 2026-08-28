@@ -95,7 +95,22 @@ check('除外', (await r.json()).result.status === 'excluded');
 r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/reopen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
 check('戻す', (await r.json()).result.status === 'new');
 r = await fetch(base + '/apps/shohyo-links/api/inbox/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_attach: true }) });
-check('自動添付ON', (await r.json()).result.auto_attach === true);
+check('自動添付の切替は admin 以外 403', r.status === 403 && (await r.json()).error === 'admin_only');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: Buffer.from('<html>').toString('base64') }) });
+check('PDF/JPEG/PNG 以外は415', r.status === 415 && (await r.json()).error === 'unsupported_file');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: '!!!notbase64' }) });
+check('壊れたbase64は400', r.status === 400 && (await r.json()).error === 'bad_base64');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'y.pdf', file_data: Buffer.from('%PDF-1.4 y').toString('base64'), doc_date: '2026-02-30' }) });
+check('存在しない日付は400', r.status === 400 && (await r.json()).error === 'bad_date');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'not-a-candidate' }) });
+check('候補にない明細への添付は400', r.status === 400 && (await r.json()).error === 'not_a_candidate');
+r = await fetch(base + '/apps/shohyo-links/api/inbox/abc/file');
+check('不正IDは404', r.status === 404);
+r = await fetch(base + '/apps/shohyo-links/api/inbox?status=bogus');
+check('未知の status は400', r.status === 400);
 
 server.close();
 console.log(ng ? `\n${ng}件NG` : '\n全件パス');

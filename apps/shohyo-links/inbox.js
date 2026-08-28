@@ -3,22 +3,29 @@
  *
  * 「証憑はここに入れれば、あとはロボットがMFの仕訳に貼る」の台帳。
  * ファイル実体は DATA_DIR/shohyo-vouchers/<sha256>.<ext> (正本はMF側のBox。ここは貼るまでの待機所)。
+ * DBには絶対パスを持たず sha256 と拡張子から毎回組み立てる (DB内のパスを信用しない・Codexレビュー #8)。
  *
  * status の遷移:
  *   new → (突合) → proposed            … 一意に決まった (提案モードでは人が承認、自動モードでは即添付)
  *                → waiting_registration … 相手の明細がまだ未仕訳 (登録されたら次の周期で貼る)
  *                → ambiguous / no_match … 人が候補から選ぶ
+ *                → attaching            … 添付の確保中 (二重添付防止のリース。POST前に必ずここを通る)
  *                → attached             … MFに貼れた (mf_file_id を持つ)
- *   人の操作: excluded (貼らない) / manual で任意の仕訳へ
+ *   人の操作: excluded (貼らない) / 候補から選んで attach
  */
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { getShohyoDB } from './db.js';
+import { isValidDate } from './matcher.js';
 
-export const INBOX_STATUSES = ['new', 'proposed', 'waiting_registration', 'ambiguous', 'no_match', 'attached', 'excluded', 'error'];
+export const INBOX_STATUSES = ['new', 'proposed', 'waiting_registration', 'ambiguous', 'no_match', 'attaching', 'attached', 'excluded', 'error'];
 const OPEN_STATUSES = ['new', 'proposed', 'waiting_registration', 'ambiguous', 'no_match', 'error'];
+// 添付を確保できる状態 (attaching/attached/excluded からは確保しない)
+const CLAIMABLE = ['new', 'proposed', 'waiting_registration', 'ambiguous', 'no_match', 'error'];
 const EXT_BY_MIME = { 'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png' };
+const MIME_BY_EXT = { pdf: 'application/pdf', jpg: 'image/jpeg', png: 'image/png' };
+const AMOUNT_MAX = 1_000_000_000;
 
 let ready = false;
 function db() {
@@ -30,7 +37,7 @@ function db() {
       file_name            TEXT NOT NULL,
       mime                 TEXT NOT NULL DEFAULT '',
       size                 INTEGER NOT NULL DEFAULT 0,
-      stored_path          TEXT NOT NULL DEFAULT '',
+      ext                  TEXT NOT NULL DEFAULT 'pdf',
       source               TEXT NOT NULL DEFAULT 'upload',
       vendor_id            INTEGER,
       vendor_name          TEXT NOT NULL DEFAULT '',
@@ -44,6 +51,8 @@ function db() {
       match_strength       TEXT NOT NULL DEFAULT '',
       match_reason         TEXT NOT NULL DEFAULT '',
       candidates_json      TEXT NOT NULL DEFAULT '[]',
+      lease_token          TEXT NOT NULL DEFAULT '',
+      lease_prev_status    TEXT NOT NULL DEFAULT '',
       mf_file_id           TEXT NOT NULL DEFAULT '',
       attached_at          TEXT NOT NULL DEFAULT '',
       last_checked_at      TEXT NOT NULL DEFAULT '',
@@ -52,6 +61,9 @@ function db() {
       updated_at           TEXT NOT NULL
     )`);
     d.exec('CREATE INDEX IF NOT EXISTS idx_voucher_inbox_status ON voucher_inbox(status)');
+    // 添付済みの明細は1証憑1明細 (二重割当をDBで禁止)
+    d.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_inbox_attached_tx ON voucher_inbox(match_tx_id)
+      WHERE status = 'attached' AND match_tx_id != ''`);
     d.exec(`CREATE TABLE IF NOT EXISTS voucher_attach_log (
       id             INTEGER PRIMARY KEY AUTOINCREMENT,
       inbox_id       INTEGER NOT NULL,
@@ -80,6 +92,22 @@ export function storageDir() {
   return dir;
 }
 
+/** 実体の中身で種別を決める (申告された mime/拡張子は信用しない)。対応外は null */
+export function sniffKind(buffer) {
+  if (buffer.length >= 5 && buffer.subarray(0, 5).toString('latin1') === '%PDF-') return { ext: 'pdf', mime: 'application/pdf' };
+  if (buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return { ext: 'jpg', mime: 'image/jpeg' };
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))) return { ext: 'png', mime: 'image/png' };
+  return null;
+}
+
+/** base64 を厳密に復号する (壊れた/空の文字列は null) */
+export function decodeBase64Strict(s) {
+  const str = String(s || '').replace(/\s+/g, '');
+  if (!str || str.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(str)) return null;
+  const buf = Buffer.from(str, 'base64');
+  return buf.length ? buf : null;
+}
+
 // ---- 設定 (自動添付ON/OFF = 提案モード) ----
 
 export function getSetting(key, fallback = '') {
@@ -97,32 +125,65 @@ export function autoAttachEnabled() {
   return getSetting('auto_attach', '0') === '1';
 }
 
+// ---- 入力の正規化 ----
+
+function normAmount(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  const r = Math.round(n);
+  return Number.isSafeInteger(r) && r > 0 && r <= AMOUNT_MAX ? r : null;
+}
+function normVendorId(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+const str = (v, max) => (typeof v === 'string' || typeof v === 'number') ? String(v).trim().slice(0, max) : '';
+
 // ---- 受け入れ ----
 
 /**
  * ファイルを受け箱に入れる。同じ内容 (sha256) は二重登録しない (既存行を返す・duplicate=true)
  * @param {Buffer} buffer
- * @param {{ file_name, mime?, source?, vendor_id?, vendor_name?, doc_date?, amount?, note? }} meta
+ * @param {{ file_name, source?, vendor_id?, vendor_name?, doc_date?, amount?, note? }} meta
+ * @throws unsupported_file … PDF/JPEG/PNG 以外
  */
 export function addToInbox(buffer, meta) {
+  const kind = sniffKind(buffer);
+  if (!kind) throw new Error('unsupported_file');
   const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
-  const existing = db().prepare('SELECT * FROM voucher_inbox WHERE sha256 = ?').get(sha256);
-  if (existing) return { row: existing, duplicate: true };
-  const ext = EXT_BY_MIME[meta.mime] || (path.extname(meta.file_name || '').slice(1).toLowerCase() || 'bin');
-  const stored = path.join(storageDir(), `${sha256}.${ext}`);
-  fs.writeFileSync(stored, buffer);
+  const d = db();
+  const existing = d.prepare('SELECT * FROM voucher_inbox WHERE sha256 = ?').get(sha256);
+  if (existing) return { row: hydrate(existing), duplicate: true };
+
+  // 一時ファイル → rename で原子的に置く。INSERT が競合 (同時アップロード) したら自分のファイルは消す
+  const dir = storageDir();
+  const finalPath = path.join(dir, `${sha256}.${kind.ext}`);
+  const tmpPath = path.join(dir, `.${sha256}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tmpPath, buffer);
+  try {
+    fs.renameSync(tmpPath, finalPath);
+  } catch (e) {
+    try { fs.unlinkSync(tmpPath); } catch { /* 既に無い */ }
+    throw e;
+  }
   const now = new Date().toISOString();
-  const res = db().prepare(`INSERT INTO voucher_inbox
-    (sha256, file_name, mime, size, stored_path, source, vendor_id, vendor_name, doc_date, amount, note, status, created_at, updated_at)
-    VALUES (@sha256, @file_name, @mime, @size, @stored_path, @source, @vendor_id, @vendor_name, @doc_date, @amount, @note, 'new', @now, @now)`)
+  const res = d.prepare(`INSERT INTO voucher_inbox
+    (sha256, file_name, mime, size, ext, source, vendor_id, vendor_name, doc_date, amount, note, status, created_at, updated_at)
+    VALUES (@sha256, @file_name, @mime, @size, @ext, @source, @vendor_id, @vendor_name, @doc_date, @amount, @note, 'new', @now, @now)
+    ON CONFLICT(sha256) DO NOTHING`)
     .run({
-      sha256, file_name: String(meta.file_name || 'voucher').slice(0, 255), mime: meta.mime || '', size: buffer.length,
-      stored_path: stored, source: meta.source || 'upload',
-      vendor_id: meta.vendor_id ? Number(meta.vendor_id) : null, vendor_name: String(meta.vendor_name || '').slice(0, 200),
-      doc_date: /^\d{4}-\d{2}-\d{2}$/.test(String(meta.doc_date || '')) ? meta.doc_date : '',
-      amount: Number.isFinite(Number(meta.amount)) && Number(meta.amount) > 0 ? Math.round(Number(meta.amount)) : null,
-      note: String(meta.note || '').slice(0, 500), now,
+      sha256, file_name: str(meta.file_name, 255) || `voucher.${kind.ext}`, mime: kind.mime, size: buffer.length, ext: kind.ext,
+      source: ['upload', 'robot', 'mail', 'gdrive'].includes(meta.source) ? meta.source : 'upload',
+      vendor_id: normVendorId(meta.vendor_id), vendor_name: str(meta.vendor_name, 200),
+      doc_date: isValidDate(meta.doc_date) ? meta.doc_date : '',
+      amount: normAmount(meta.amount), note: str(meta.note, 500), now,
     });
+  if (res.changes === 0) {
+    // 同時に同じ内容が入った。相手の行が正
+    return { row: hydrate(d.prepare('SELECT * FROM voucher_inbox WHERE sha256 = ?').get(sha256)), duplicate: true };
+  }
   return { row: getInbox(res.lastInsertRowid), duplicate: false };
 }
 
@@ -134,7 +195,8 @@ export function getInbox(id) {
 function hydrate(row) {
   let candidates = [];
   try { candidates = JSON.parse(row.candidates_json || '[]'); } catch { /* 壊れていても一覧は出す */ }
-  return { ...row, candidates };
+  const { lease_token, lease_prev_status, ...rest } = row;
+  return { ...rest, candidates };
 }
 
 export function listInbox({ status = null, limit = 500 } = {}) {
@@ -155,21 +217,30 @@ export function countByStatus() {
   return out;
 }
 
+/** 保存ディレクトリ配下の sha256.ext だけを読む。読んだ内容の sha256 も検証する (差し替え・破損を貼らない) */
 export function readFile(row) {
-  return fs.readFileSync(row.stored_path);
+  if (!/^[0-9a-f]{64}$/.test(row.sha256) || !MIME_BY_EXT[row.ext]) throw new Error('bad_row');
+  const dir = storageDir();
+  const p = path.resolve(dir, `${row.sha256}.${row.ext}`);
+  if (path.dirname(p) !== path.resolve(dir)) throw new Error('bad_path');
+  const buf = fs.readFileSync(p);
+  if (crypto.createHash('sha256').update(buf).digest('hex') !== row.sha256) throw new Error('file_corrupted');
+  return buf;
 }
 
 /** 人が直せる項目 (日付・金額・支払先・メモ)。直したら突合をやり直すため status は new に戻す */
 export function updateInboxMeta(id, body) {
   const cur = getInbox(id);
   if (!cur) return null;
-  if (cur.status === 'attached') throw new Error('already_attached');
+  if (cur.status === 'attached' || cur.status === 'attaching') throw new Error('already_attached');
+  if (body.doc_date !== undefined && body.doc_date !== '' && !isValidDate(body.doc_date)) throw new Error('bad_date');
+  if (body.amount !== undefined && body.amount !== '' && body.amount !== null && normAmount(body.amount) === null) throw new Error('bad_amount');
   const data = {
-    vendor_id: body.vendor_id === undefined ? cur.vendor_id : (body.vendor_id ? Number(body.vendor_id) : null),
-    vendor_name: body.vendor_name === undefined ? cur.vendor_name : String(body.vendor_name || '').slice(0, 200),
-    doc_date: body.doc_date === undefined ? cur.doc_date : (/^\d{4}-\d{2}-\d{2}$/.test(String(body.doc_date || '')) ? body.doc_date : ''),
-    amount: body.amount === undefined ? cur.amount : (Number(body.amount) > 0 ? Math.round(Number(body.amount)) : null),
-    note: body.note === undefined ? cur.note : String(body.note || '').slice(0, 500),
+    vendor_id: body.vendor_id === undefined ? cur.vendor_id : normVendorId(body.vendor_id),
+    vendor_name: body.vendor_name === undefined ? cur.vendor_name : str(body.vendor_name, 200),
+    doc_date: body.doc_date === undefined ? cur.doc_date : (isValidDate(body.doc_date) ? body.doc_date : ''),
+    amount: body.amount === undefined ? cur.amount : normAmount(body.amount),
+    note: body.note === undefined ? cur.note : str(body.note, 500),
   };
   db().prepare(`UPDATE voucher_inbox SET vendor_id=@vendor_id, vendor_name=@vendor_name, doc_date=@doc_date, amount=@amount, note=@note,
     status='new', match_tx_id='', match_journal_id='', match_journal_number=NULL, match_strength='', match_reason='', candidates_json='[]',
@@ -178,33 +249,63 @@ export function updateInboxMeta(id, body) {
 }
 
 export function setMatch(id, { status, tx_id = '', journal_id = '', journal_number = null, strength = '', reason = '', candidates = [] }) {
+  if (!INBOX_STATUSES.includes(status)) throw new Error('bad_status');
+  // 添付の確保中・添付済みは突合結果で上書きしない
   db().prepare(`UPDATE voucher_inbox SET status=@status, match_tx_id=@tx_id, match_journal_id=@journal_id, match_journal_number=@journal_number,
-    match_strength=@strength, match_reason=@reason, candidates_json=@candidates, last_checked_at=@now, error='', updated_at=@now WHERE id=@id`)
+    match_strength=@strength, match_reason=@reason, candidates_json=@candidates, last_checked_at=@now, error='', updated_at=@now
+    WHERE id=@id AND status NOT IN ('attaching','attached')`)
     .run({ status, tx_id, journal_id, journal_number, strength, reason, candidates: JSON.stringify(candidates).slice(0, 20000), now: new Date().toISOString(), id });
 }
 
-export function markAttached(id, { journal_id, journal_number = null, tx_id = '', mf_file_id, mode, actor = '', reason = '' }) {
-  const now = new Date().toISOString();
-  const d = db();
-  const tx = d.transaction(() => {
-    d.prepare(`UPDATE voucher_inbox SET status='attached', match_journal_id=@journal_id, match_journal_number=@journal_number, match_tx_id=@tx_id,
-      mf_file_id=@mf_file_id, attached_at=@now, error='', updated_at=@now WHERE id=@id`)
-      .run({ journal_id, journal_number, tx_id, mf_file_id, now, id });
-    d.prepare(`INSERT INTO voucher_attach_log (inbox_id, journal_id, journal_number, tx_id, mf_file_id, mode, actor, reason, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, journal_id, journal_number, tx_id, mf_file_id, mode, actor, reason, now);
-  });
-  tx();
-  return getInbox(id);
+// ---- 添付の確保 (リース) ----
+// POST /vouchers の前に必ず claim する。確保できた実行者だけが貼る → cron と手動、ダブルクリックが重なっても1回
+
+export function claimForAttach(id) {
+  const token = crypto.randomBytes(12).toString('hex');
+  const q = CLAIMABLE.map(() => '?').join(',');
+  const res = db().prepare(`UPDATE voucher_inbox SET lease_prev_status = status, status='attaching', lease_token=?, updated_at=?
+    WHERE id=? AND status IN (${q})`).run(token, new Date().toISOString(), id, ...CLAIMABLE);
+  return res.changes === 1 ? token : null;
 }
 
-export function markError(id, message) {
-  db().prepare(`UPDATE voucher_inbox SET status='error', error=?, last_checked_at=?, updated_at=? WHERE id=?`)
-    .run(String(message).slice(0, 500), new Date().toISOString(), new Date().toISOString(), id);
+/** 確保したが貼れなかった: 元の状態に戻し、エラーを記録する */
+export function releaseClaim(id, token, errorMessage = '') {
+  const now = new Date().toISOString();
+  db().prepare(`UPDATE voucher_inbox SET status = CASE WHEN ? != '' THEN 'error' ELSE lease_prev_status END,
+    error=?, lease_token='', lease_prev_status='', last_checked_at=?, updated_at=? WHERE id=? AND status='attaching' AND lease_token=?`)
+    .run(errorMessage, String(errorMessage).slice(0, 500), now, now, id, token);
+}
+
+/** 確保トークン付きで添付済みにする (CAS)。他者に確保を奪われていたら false */
+export function markAttached(id, token, { journal_id, journal_number = null, tx_id = '', mf_file_id, mode, actor = '', reason = '' }) {
+  const now = new Date().toISOString();
+  const d = db();
+  let ok = false;
+  const tx = d.transaction(() => {
+    const res = d.prepare(`UPDATE voucher_inbox SET status='attached', match_journal_id=@journal_id, match_journal_number=@journal_number, match_tx_id=@tx_id,
+      mf_file_id=@mf_file_id, attached_at=@now, error='', lease_token='', lease_prev_status='', updated_at=@now
+      WHERE id=@id AND status='attaching' AND lease_token=@token`)
+      .run({ journal_id, journal_number, tx_id, mf_file_id, now, id, token });
+    if (res.changes !== 1) return;
+    d.prepare(`INSERT INTO voucher_attach_log (inbox_id, journal_id, journal_number, tx_id, mf_file_id, mode, actor, reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(id, journal_id, journal_number, tx_id, mf_file_id, mode, actor, reason, now);
+    ok = true;
+  });
+  tx();
+  return ok;
+}
+
+/** 起動時: 前回のプロセスが attaching のまま落ちた行を error に戻す (人が確認する。MF側に貼れている可能性があるため再送しない) */
+export function recoverStaleClaims() {
+  const now = new Date().toISOString();
+  const res = db().prepare(`UPDATE voucher_inbox SET status='error', error='前回の添付処理が途中で止まりました。MF側に貼れているか確認してから「戻す」か「除外」してください',
+    lease_token='', lease_prev_status='', updated_at=? WHERE status='attaching'`).run(now);
+  return res.changes;
 }
 
 export function setStatus(id, status) {
   if (!INBOX_STATUSES.includes(status)) throw new Error('bad_status');
-  db().prepare('UPDATE voucher_inbox SET status=?, updated_at=? WHERE id=?').run(status, new Date().toISOString(), id);
+  db().prepare(`UPDATE voucher_inbox SET status=?, updated_at=? WHERE id=? AND status NOT IN ('attaching','attached')`).run(status, new Date().toISOString(), id);
   return getInbox(id);
 }
 
@@ -213,8 +314,13 @@ export function listAttachLog(limit = 200) {
     JOIN voucher_inbox i ON i.id = l.inbox_id ORDER BY l.id DESC LIMIT ?`).all(limit);
 }
 
-/** 添付済み証憑のうち他の証憑が既に確定している明細ID (証憑側の一意性チェック用) */
-export function takenTransactionIds() {
-  return new Set(db().prepare(`SELECT match_tx_id FROM voucher_inbox WHERE match_tx_id != '' AND status IN ('attached','proposed','waiting_registration')`)
-    .all().map(r => r.match_tx_id));
+/** 確定済み (添付済み/提案/登録待ち/確保中) の明細と、その所有者 inbox_id の集合 */
+export function transactionOwners() {
+  const owners = new Map();
+  for (const r of db().prepare(`SELECT id, match_tx_id FROM voucher_inbox
+    WHERE match_tx_id != '' AND status IN ('attached','proposed','waiting_registration','attaching')`).all()) {
+    if (!owners.has(r.match_tx_id)) owners.set(r.match_tx_id, new Set());
+    owners.get(r.match_tx_id).add(r.id);
+  }
+  return owners;
 }
