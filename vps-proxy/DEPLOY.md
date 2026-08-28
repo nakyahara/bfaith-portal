@@ -41,7 +41,17 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
      systemctl is-active aupay-proxy.service
    '
    ```
-4. **smoke test 必須** (miniPC から):
+4. **パーサ self-test** (VPS 上、サービス再起動の前後どちらでも可):
+   ```bash
+   cd /home/rocky/bfaith-portal/vps-proxy && node aupay-proxy.js --self-test
+   ```
+   → `✅ self-test 全件 pass` を確認。外部通信も secret も要らない純粋なパーサ検証で、
+   `getItemDetail` の `Price` / `SubCodes` 抽出を見る (価格一括改定ツールが「更新前価格の照合」に使う値)。
+   目的は **読めない形を「それらしい数値」に化けさせないこと** の確認なので
+   (`1080abc` → 1080、`1,2,3` → 123 のような取り違えは照合を無意味にする)、
+   価格まわりを触った変更では必ず通すこと。
+
+5. **smoke test 必須** (miniPC から):
    ```bash
    STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1 node apps/warehouse/smoke-yahoo-proxy.js 14
    ```
@@ -52,14 +62,14 @@ systemd は `/home/rocky/bfaith-portal/vps-proxy/aupay-proxy.js` を実行。
    ```
    → `✅ orderContact OK` と `✅ orderInfo に ShipDate=true SocialGiftType=true` を確認 (メールの値は表示しない)。
    `STRICT_YAHOO_ACCESS_TOKEN_SMOKE=1` は `/yahoo/access-token` の verify (Cache-Control: no-store / 401 fail-closed) を必須化する。本番 deploy では必ず STRICT を付けること (`YAHOO_TOKEN_MINT_SECRET` 同期漏れで `503` のまま残るのを防ぐ)。
-5. **smoke 失敗時の rollback** (手動判断):
+6. **smoke 失敗時の rollback** (手動判断):
    ```bash
    ssh -i ~/.ssh/id_ed25519_vps rocky@133.167.122.198 '
      cd /home/rocky/bfaith-portal && git checkout $OLD && sudo systemctl restart aupay-proxy.service
    '
    # → 再度 smoke で疎通確認
    ```
-6. au PAY 側に影響ないか翌朝の daily-sync 結果で確認
+7. au PAY 側に影響ないか翌朝の daily-sync 結果で確認
 
 ## 初回セットアップ (移行時の手順、1 回のみ)
 

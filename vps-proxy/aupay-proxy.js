@@ -59,6 +59,10 @@ const YAHOO_REDIRECT_URI = process.env.YAHOO_REDIRECT_URI || 'https://b-faith.bi
 // (.env に YAHOO_TOKEN_FILE=/home/rocky/yahoo-tokens.json を設定推奨)
 const TOKEN_FILE = process.env.YAHOO_TOKEN_FILE || path.join(__dirname, 'yahoo-tokens.json');
 
+// --self-test は起動前に処理する。secret も外部通信も要らない純粋なパーサ検証なので、
+// PROXY_SECRET の必須チェックより前に置く (手元でも VPS 上でも同じコードを確かめられるように)
+if (process.argv.includes('--self-test')) { runSelfTest(); }
+
 if (!PROXY_SECRET) { console.error('PROXY_SECRET is required'); process.exit(1); }
 
 function ts() { return new Date().toISOString().slice(0, 19); }
@@ -513,7 +517,13 @@ function decodeXmlEntities(s) {
  *   <Path>直書き  ではなく <PathList> 内の <Path> なので、 古い実装の単純 tag マッチでは取れない。
  */
 function parseGetItemDetailXml(xml) {
-  const out = { ItemCode: null, ProductCategory: null, Path: null, Name: null };
+  const out = {
+    ItemCode: null, ProductCategory: null, Path: null, Name: null,
+    // 価格一括改定ツール (M0 2026-08-24) で追加。更新前の設定価格を API で読むために必要。
+    // Price は「商品単位の設定価格」。バリエーション商品は SubCodes[] に sub_code 別価格が入る
+    // (現行の出品運用ではサブコード別価格は使わず item 価格を継承する方針 — variation-resolver.js 参照)
+    Price: null, SubCodes: [],
+  };
   if (typeof xml !== 'string' || xml.length === 0) return out;
   // PR #322 で getItem 対応した時 path/name が null だった件:
   //   Yahoo getItem の <Path>/<Name> は CDATA wrap (`<![CDATA[...]]>`) で返ってくる。
@@ -551,6 +561,50 @@ function parseGetItemDetailXml(xml) {
     return null;
   })();
   out.Name = tag('Name');
+
+  // --- 価格 ---
+  // <Price> はバリエーション情報 (SubCodeInfo / Options) の中にも現れうるので、
+  // 商品単位の価格を取るときはバリエーションブロックを除いた範囲から探す
+  // (Path が <PathList> 内に限定して探しているのと同じ考え方)。
+  const withoutVariationBlocks = xml
+    .replace(/<SubCodeInfo\b[\s\S]*?<\/SubCodeInfo>/gi, '')
+    .replace(/<Options\b[\s\S]*?<\/Options>/gi, '');
+  // この値は「更新前価格の照合 (楽観ロック)」に使うので、読めない形は黙って数値化せず null にする。
+  // parseInt だと "1080abc" が 1080 に、"1,2,3" が 123 に化けて安全確認が無効になるため、
+  // カンマ・空白を除いたうえで全文が整数 (または .00 のような無害な小数) であることを検証する。
+  const toIntPrice = (raw) => {
+    if (typeof raw !== 'string') return null;
+    const s = raw.replace(/\s/g, '');
+    if (s === '') return null;
+    // 末尾の .00 のような無害な小数部だけ許して切り離す (.99 のような端数は読めない扱い)
+    const m = s.match(/^([\d,]+)(?:\.0+)?$/);
+    if (!m) return null;
+    const digits = m[1];
+    // カンマは3桁区切りとしてのみ許容する。"1,2,3" を 123 と読むと照合が無意味になる
+    const valid = digits.includes(',')
+      ? /^([1-9]\d{0,2})(,\d{3})+$/.test(digits)
+      : /^(0|[1-9]\d*)$/.test(digits);
+    if (!valid) return null;
+    const n = Number(digits.replace(/,/g, ''));
+    return Number.isSafeInteger(n) ? n : null;
+  };
+  const priceIn = (scope, name = 'Price') => {
+    // 同じスコープに Price が複数あるのは想定外の構造。取り違えるくらいなら読めない扱いにする (fail closed)
+    const all = scope.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'gi')) || [];
+    if (all.length !== 1) return null;
+    const m = all[0].match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+    return toIntPrice(decodeXmlEntities(unwrapCdata(m[1])).trim());
+  };
+  out.Price = priceIn(withoutVariationBlocks);
+
+  // サブコード別の価格 (存在する場合のみ)。バリエーション単位で価格を持つ商品の把握に使う
+  const subBlocks = xml.match(/<SubCodeInfo\b[\s\S]*?<\/SubCodeInfo>/gi) || [];
+  for (const block of subBlocks) {
+    const codeM = block.match(/<SubCode\b[^>]*>([\s\S]*?)<\/SubCode>/i);
+    const code = codeM ? decodeXmlEntities(unwrapCdata(codeM[1])).trim() : null;
+    if (!code) continue;
+    out.SubCodes.push({ SubCode: code, Price: priceIn(block) });
+  }
   return out;
 }
 
@@ -1208,7 +1262,7 @@ const server = http.createServer(async (req, res) => {
     //   request body: { itemCode: string }
     //   Yahoo itemInfo (getItemDetail) API へ token + 署名付きで forward。
     //   レスポンス XML を JSON に変換して返す:
-    //     { ok: true, ItemCode, ProductCategory, Path, Name }
+    //     { ok: true, ItemCode, ProductCategory, Path, Name, Price, SubCodes:[{SubCode,Price}] }
     if (pathname === '/yahoo/get-item-detail' && req.method === 'POST') {
       const raw = await readBody(req);
       let body;
@@ -1242,6 +1296,9 @@ const server = http.createServer(async (req, res) => {
         ProductCategory: parsed.ProductCategory,
         Path: parsed.Path,
         Name: parsed.Name,
+        // 価格一括改定ツール向け (2026-08-24 追加)
+        Price: parsed.Price,
+        SubCodes: parsed.SubCodes,
       }));
       return;
     }
@@ -1447,6 +1504,78 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: e.message }));
   }
 });
+
+// ─── self-test ───
+// `node aupay-proxy.js --self-test` でパーサだけを検証する (サーバは起動しない)。
+// 外部通信も secret も要らないので、デプロイ前の手元でも VPS 上でも同じコードを確かめられる。
+// 呼び出しはファイル冒頭 (PROXY_SECRET チェックの前)。function 宣言なのでホイスティングで届く。
+function runSelfTest() {
+  let failed = 0;
+  const check = (label, actual, expected) => {
+    const a = JSON.stringify(actual), e = JSON.stringify(expected);
+    if (a === e) { console.log(`  ok   ${label}`); return; }
+    failed++;
+    console.log(`  FAIL ${label}\n       expected: ${e}\n       actual  : ${a}`);
+  };
+
+  console.log('parseGetItemDetailXml:');
+  // 1) バリエーション無し。Price は商品直下
+  const plain = `<?xml version="1.0"?><ResultSet><Result><ItemCode><![CDATA[abc-001]]></ItemCode>
+    <Name><![CDATA[テスト商品]]></Name><Price>1080</Price>
+    <ProductCategory>1815</ProductCategory>
+    <PathList><Path origFlag="1"><![CDATA[店:カテゴリ]]></Path></PathList></Result></ResultSet>`;
+  const r1 = parseGetItemDetailXml(plain);
+  check('plain: Price', r1.Price, 1080);
+  check('plain: Name', r1.Name, 'テスト商品');
+  check('plain: ItemCode', r1.ItemCode, 'abc-001');
+  check('plain: SubCodes', r1.SubCodes, []);
+
+  // 2) バリエーションあり。商品価格が SubCodeInfo の価格に引っ張られないこと
+  const withSub = `<ResultSet><Result><ItemCode>v-001</ItemCode><Name>バリ商品</Name>
+    <Price>2000</Price>
+    <SubCodeInfo><SubCode>v-001-a</SubCode><Price>2100</Price></SubCodeInfo>
+    <SubCodeInfo><SubCode>v-001-b</SubCode><Price>2200</Price></SubCodeInfo>
+    </Result></ResultSet>`;
+  const r2 = parseGetItemDetailXml(withSub);
+  check('variation: 商品Price', r2.Price, 2000);
+  check('variation: SubCodes', r2.SubCodes, [
+    { SubCode: 'v-001-a', Price: 2100 },
+    { SubCode: 'v-001-b', Price: 2200 },
+  ]);
+
+  // 3) SubCodeInfo が Price より前にあっても商品価格を取り違えない
+  const subFirst = `<ResultSet><Result><ItemCode>v-002</ItemCode>
+    <SubCodeInfo><SubCode>v-002-a</SubCode><Price>500</Price></SubCodeInfo>
+    <Price>900</Price><Name>順序違い</Name></Result></ResultSet>`;
+  check('variation(順序違い): 商品Price', parseGetItemDetailXml(subFirst).Price, 900);
+
+  // 4) 表記ゆれ (カンマ・小数・空白) と欠落
+  check('カンマ表記', parseGetItemDetailXml('<Result><Price>1,080</Price></Result>').Price, 1080);
+  check('小数表記(.00)', parseGetItemDetailXml('<Result><Price>1080.00</Price></Result>').Price, 1080);
+  check('0円', parseGetItemDetailXml('<Result><Price>0</Price></Result>').Price, 0);
+  check('Price欠落', parseGetItemDetailXml('<Result><Name>x</Name></Result>').Price, null);
+  check('空Price', parseGetItemDetailXml('<Result><Price></Price></Result>').Price, null);
+  check('空XML', parseGetItemDetailXml('').Price, null);
+
+  // 5) 読めない形は「それらしい数値」に化けさせず null にする (照合に使う値なので fail closed)
+  check('末尾ゴミ', parseGetItemDetailXml('<Result><Price>1080abc</Price></Result>').Price, null);
+  check('区切り誤り', parseGetItemDetailXml('<Result><Price>1,2,3</Price></Result>').Price, null);
+  check('区切り誤り2', parseGetItemDetailXml('<Result><Price>12,34</Price></Result>').Price, null);
+  check('大きい桁の区切り', parseGetItemDetailXml('<Result><Price>1,234,567</Price></Result>').Price, 1234567);
+  check('端数あり小数', parseGetItemDetailXml('<Result><Price>1080.99</Price></Result>').Price, null);
+  check('負数', parseGetItemDetailXml('<Result><Price>-100</Price></Result>').Price, null);
+  check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
+  check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
+  // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  check('Price重複', parseGetItemDetailXml('<Result><Price>100</Price><Price>200</Price></Result>').Price, null);
+
+  // 6) 既存の挙動が壊れていないこと (Path は PathList 内の origFlag=1 優先)
+  const paths = `<Result><PathList><Path>その他</Path><Path origFlag="1">本命</Path></PathList></Result>`;
+  check('Path: origFlag優先', parseGetItemDetailXml(paths).Path, '本命');
+
+  console.log(failed === 0 ? '\n✅ self-test 全件 pass' : `\n❌ ${failed} 件 FAIL`);
+  process.exit(failed === 0 ? 0 : 1);
+}
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`API Proxy running on port ${PORT} (au PAY + Yahoo Shopping)`);
