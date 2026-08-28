@@ -27,7 +27,9 @@ let _codeMapAt = 0;
 
 /** 文字列でも数値でも受けて、整数円として読めた時だけ数値を返す (読めなければ null) */
 export function toIntPrice(v) {
-  if (typeof v === 'number') return Number.isInteger(v) ? v : (Number.isFinite(v) && Number.isInteger(Math.round(v)) && Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : null);
+  // 数値も「整数そのもの」だけ受ける。1000.0000000001 を 1000 に丸めると、
+  // 監査に残る値と楽観ロックの基準値が実際の設定価格とずれる (Codex R2)
+  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
   if (typeof v !== 'string') return null;
   const s = v.trim();
   if (!/^\d+$/.test(s)) return null;
@@ -152,14 +154,18 @@ export async function fetchYahooPrices(itemCodes, deps = {}) {
       // 「価格が返ってきた」だけでは実在確認にならない — 取り違えた応答をそのまま
       // 「この出品の現在価格」として confirmed にすると、別商品の価格を根拠に値付けしてしまう
       if (d?.ok === false) { miss('Yahoo が ok を返しませんでした'); continue; }
-      if (normCode(d?.ItemCode) !== key) {
-        miss(`問い合わせた商品コードと応答が一致しません (要求 ${c} / 応答 ${d?.ItemCode ?? 'なし'})`);
-        continue;
-      }
       const itemPrice = toIntPrice(d?.Price);
       const subCodes = Array.isArray(d?.SubCodes)
         ? d.SubCodes.map((s) => ({ subCode: s?.SubCode == null ? null : String(s.SubCode), price: toIntPrice(s?.Price) })).filter((s) => s.subCode)
         : [];
+      // 識別子の一致は「商品コードが一致」か「サブコードのどれかが一致」で認める。
+      // サブコードで問い合わせたとき応答の ItemCode が親商品になる仕様でも引き当てられるように
+      // (ItemCode だけを見ると、サブコード行が全件 fail-closed になる — Codex R2)
+      const subMatches = subCodes.some((s) => normCode(s.subCode) === key);
+      if (normCode(d?.ItemCode) !== key && !subMatches) {
+        miss(`問い合わせた商品コードと応答が一致しません (要求 ${c} / 応答 ${d?.ItemCode ?? 'なし'})`);
+        continue;
+      }
       // sub_code 別価格の扱い:
       //   ・要求コードがサブコードと一致 → そのサブコードの価格 (null なら商品価格を継承)
       //   ・一致しないのに「価格を持つサブコード」がある → どの SKU の価格か決められないので未確定 (fail-closed)

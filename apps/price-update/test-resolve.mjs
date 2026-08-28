@@ -124,6 +124,8 @@ console.log('\n── 楽天の文字列価格 (M0実測) ──');
   eq(toIntPrice('1000abc'), null, '末尾ゴミは読めない扱い');
   eq(toIntPrice(''), null, '空は null');
   eq(toIntPrice(null), null, 'null は null');
+  eq(toIntPrice(1000.0000000001), null, '★整数でない数値は丸めずに null (監査値と実価格をずらさない)');
+  eq(toIntPrice(1000.5), null, '小数は null');
 }
 
 console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ──');
@@ -186,6 +188,25 @@ console.log('\n── Yahoo: 応答の取り違えと SKU別価格 (fail-closed)
     }),
   });
   eq([sub.get('item-v-b').price, sub.get('item-v-b').skuCode], [2200, 'item-v-b'], 'サブコード一致ならその価格');
+
+  // サブコードで問い合わせて応答の ItemCode が親商品になる仕様でも引き当てられる
+  const subViaParent = await fetchYahooPrices(['item-v-a'], {
+    fetchYahooItemDetail: async () => ({
+      ok: true, ItemCode: 'item-v', Name: 'バリ商品', Price: 2000,
+      SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }, { SubCode: 'item-v-b', Price: 2200 }],
+    }),
+  });
+  eq([subViaParent.get('item-v-a').price, subViaParent.get('item-v-a').skuCode], [2100, 'item-v-a'],
+    '★応答が親 ItemCode でも、サブコード一致なら引き当てる');
+
+  // 応答に要求コードがどこにも無い (ItemCode も SubCodes も違う) → 取り違えとして拒否
+  const wrongItem = await fetchYahooPrices(['item-x'], {
+    fetchYahooItemDetail: async () => ({
+      ok: true, ItemCode: 'item-v', Name: '別商品', Price: 2000,
+      SubCodes: [{ SubCode: 'item-v-a', Price: 2100 }],
+    }),
+  });
+  eq(wrongItem.get('item-x').found, false, '要求コードが応答のどこにも無ければ拒否');
 
   // サブコードはあるが価格を持たない (商品価格を継承する運用) → 商品価格でよい
   const inherit = await fetchYahooPrices(['item-w'], {

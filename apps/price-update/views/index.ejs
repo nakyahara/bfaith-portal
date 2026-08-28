@@ -236,10 +236,17 @@
     document.querySelectorAll('.sel').forEach((el) => { el.onchange = onInputChange; });
   }
 
+  // 入力のたびにサーバへ送らないよう少しまとめる。★保存前には必ず flush する
+  // (待たずに記録すると、画面の入力とサーバ側スナップショット = 監査記録 がずれる)
   let timer = null;
+  let pending = null;
   function onInputChange() {
     clearTimeout(timer);
-    timer = setTimeout(sendPreview, 250);
+    timer = setTimeout(function () { pending = sendPreview(); }, 250);
+  }
+  async function flushPreview() {
+    if (timer) { clearTimeout(timer); timer = null; pending = sendPreview(); }
+    if (pending) { await pending; pending = null; }
   }
 
   async function sendPreview() {
@@ -263,6 +270,7 @@
     $('save-btn').disabled = true;
     $('save-msg').textContent = '記録中…';
     try {
+      await flushPreview();   // 直前の入力を確実にサーバへ反映してから記録する
       const r = await api('/apps/price-update/api/runs', { previewId, note: $('run-note').value });
       location.href = '/apps/price-update/runs/' + r.runId;
     } catch (e) {
