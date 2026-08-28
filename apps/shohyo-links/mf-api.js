@@ -14,7 +14,15 @@ export const MF_SCOPES = [
   'mfc/accounting/voucher.write',
   'mfc/accounting/transaction.read',
   'mfc/accounting/trade_partners.read',
+  'mfc/accounting/connected_account.read', // 明細ビューの連携サービス名 (2026-08-28 追加。旧接続は再認可が要る)
 ].join(' ');
+
+/** 接続時に許可されたスコープのうち、今のアプリが必要としていて足りないもの */
+export function missingScopes() {
+  const granted = new Set(String(loadTokens()?.scope || '').split(/\s+/).filter(Boolean));
+  if (!granted.size) return []; // scope が返らない実装なら判定しない
+  return MF_SCOPES.split(' ').filter(sc => !granted.has(sc));
+}
 
 function clientConfig() {
   const id = process.env.MF_CLIENT_ID || '';

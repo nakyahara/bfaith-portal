@@ -153,6 +153,13 @@ async function api(path, opts) {
   return body.result;
 }
 
+// 接続後にアプリ側の必要スコープが増えた場合 (403 の原因)。MFの認可画面をもう一度通すと解消する
+function scopeWarn(s, connectHref) {
+  if (!s.missing_scopes?.length) return '';
+  return ` <span style="color:#b45309">権限が足りません（${s.missing_scopes.map(x => x.replace('mfc/accounting/', '')).join(', ')}）</span> `
+    + `<button class="btn primary" onclick="location.href='${connectHref}'">再接続して許可する</button>`;
+}
+
 async function refreshStatus() {
   const bar = $('statusBar');
   try {
@@ -165,7 +172,7 @@ async function refreshStatus() {
     } else {
       const name = s.office?.office?.name || s.office?.name || '接続済み';
       bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(name)}</b> <span class="spacer"></span>`
-        + '<button class="btn" id="disconnectBtn">接続解除</button>';
+        + scopeWarn(s, 'mf/connect') + '<button class="btn" id="disconnectBtn">接続解除</button>';
       $('disconnectBtn').onclick = async () => {
         if (!confirm('MFとの接続を解除しますか？')) return;
         await api('api/mf/disconnect', { method: 'POST' });

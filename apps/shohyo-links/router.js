@@ -11,7 +11,7 @@ import { listLinks, createLink, updateLink, deleteLink } from './db.js';
 import {
   mfConfigured, authorizeUrl, exchangeCode, loadTokens, clearTokens,
   currentOffice, getJournals, postVoucher, matchVendors, revokeTokens, journalDigest,
-  getConnectedAccounts, getTransactions, getJournalsByTransactionIds,
+  getConnectedAccounts, getTransactions, getJournalsByTransactionIds, missingScopes,
 } from './mf-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -120,7 +120,7 @@ router.get('/api/mf/status', async (req, res) => {
       }
       throw e;
     }
-    res.json({ ok: true, result: { configured: true, connected: true, office } });
+    res.json({ ok: true, result: { configured: true, connected: true, office, missing_scopes: missingScopes() } });
   } catch (e) {
     console.error('[shohyo-links] mf status', e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -187,7 +187,16 @@ router.get('/api/mf/transactions', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'bad_period' });
     }
     const vendors = listLinks();
-    const [accounts, txs] = await Promise.all([getConnectedAccounts(), getTransactions(String(start), String(end))]);
+    // 連携サービス名は connected_account.read が要る。旧スコープで接続したままだと403 → 名前なしで続行し再接続を促す
+    let accountsWarning = null;
+    const [accounts, txs] = await Promise.all([
+      getConnectedAccounts().catch((e) => {
+        if (e.status !== 403) throw e;
+        accountsWarning = 'reconnect_for_scope';
+        return [];
+      }),
+      getTransactions(String(start), String(end)),
+    ]);
 
     // 仕訳済み明細 → 仕訳 (証憑は仕訳に付くので、添付有無は仕訳側が正)
     const registered = txs.filter(t => t.journalizing_status !== 'none' && t.journalizing_status !== 'excluded');
@@ -201,7 +210,7 @@ router.get('/api/mf/transactions', async (req, res) => {
     }
     for (const t of txs) {
       if (!byAccount.has(t.connected_account_id)) {
-        byAccount.set(t.connected_account_id, { id: t.connected_account_id, name: '(不明な連携サービス)', auto_voucher: false, rows: [] });
+        byAccount.set(t.connected_account_id, { id: t.connected_account_id, name: `連携サービス ${byAccount.size + 1}`, auto_voucher: false, rows: [] });
       }
       const j = journalByTx.get(t.id) || null;
       const voucherCount = j ? (j.voucher_file_ids || []).length : (t.voucher_file_ids || []).length;
@@ -234,7 +243,7 @@ router.get('/api/mf/transactions', async (req, res) => {
         },
       };
     }).sort((x, y) => y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
-    res.json({ ok: true, result: { accounts: result, total: txs.length } });
+    res.json({ ok: true, result: { accounts: result, total: txs.length, warning: accountsWarning } });
   } catch (e) {
     console.error('[shohyo-links] mf transactions', e.message, e.detail || '');
     res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
