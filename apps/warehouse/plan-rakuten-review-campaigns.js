@@ -76,7 +76,11 @@ if (MALL === 'yahoo') {
 ensureCampaignTables(db);
 
 try {
-  if (mode === 'plan') {
+  if (mode === 'cutover-stage') {
+    // 機械可読に stage だけ出す (shadow / coupon_only / live)。定時ジョブが
+    // 「まだ vendor 担当なのに月次クーポンを作りに行く」のを避けるための判定に使う
+    console.log(getCutover(db).stage);
+  } else if (mode === 'plan') {
     const c = planCampaigns(db);
     const phase = { live: 'LIVE', coupon_only: 'クーポン先行LIVE/フォローshadow', shadow: 'shadow' }[getCutover(db).stage];
     console.log(`[campaign:${MALL}] plan完了 (${phase}): フォロー新規 ${c.followInserted} / クーポン新規 ${c.couponInserted} / ` +
@@ -184,7 +188,7 @@ try {
       console.log(`[cutover] 次の正午ジョブ (${MALL === 'yahoo' ? 'YahooReviewMailSend (PR-Y-C5)' : 'RakutenReviewMailSend'}) から自作が送信する。当月の月次クーポンが未発行なら ensure-monthly --live を先に`);
     }
   } else {
-    console.error(`FATAL: unknown mode '${mode}' (plan / stats / vendor / report / cutover)`);
+    console.error(`FATAL: unknown mode '${mode}' (plan / stats / vendor / report / cutover / cutover-stage)`);
     process.exitCode = 2;
   }
 } catch (e) {

@@ -178,7 +178,7 @@ export const JOBS_REGISTRY = [
     importance: 'P2',
     owner: '中原さん',
     purpose: 'Yahoo!ショッピング レビュー フォロー/クーポンメールの正午送信 (らくらくフォロー置換 PR-Y-C5)。'
-      + '月次5%クーポンの発行 (台帳が issued ならブラウザを起動せず終了) → 当日12:00予定の action を ready 昇格 (plan) → '
+      + '月次5%クーポンの発行 (cutover 前 = shadow のうちは丸ごとスキップ。台帳が issued ならブラウザを起動せず終了) → '+ '当日12:00予定の action を ready 昇格 (plan) → '
       + 'at-most-once の Gmail 送信 (send)。cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)。'
       + '楽天版 (12:05) と 15 分ずらしてある = warehouse.db を同時に書かせないため',
     where: 'miniPC TaskScheduler [YahooReviewMailSend] (scripts/mall-csv-fetcher/run-yahoo-review-send.ps1)',
