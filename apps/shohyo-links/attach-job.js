@@ -23,6 +23,7 @@ import {
   listOpenInbox, setMatch, readFile, autoAttachEnabled, transactionOwners,
   claimForAttach, releaseClaim, markAttached, markNeedsCheck, recoverStaleClaims,
 } from './inbox.js';
+import { runGdriveInbox, gdriveInboxEnabled } from './gdrive-inbox.js';
 
 const JOB_ID = 'shohyo-voucher-attach';
 const OFF = new Set(['0', 'false', 'off', 'no']);
@@ -151,8 +152,20 @@ async function runOnce({ attach = true, actor = 'cron' } = {}) {
 
 async function tick() {
   try {
+    // 先にGドライブの受け箱フォルダを拾う (失敗しても突合は続ける)
+    let g = '';
+    if (gdriveInboxEnabled()) {
+      try {
+        const gr = await runGdriveInbox();
+        g = `gdrive(in=${gr.ingested} dup=${gr.duplicate} ng=${gr.unsupported} fail=${gr.failed}) `;
+        if (gr.errors?.length) console.error('[shohyo-gdrive] errors:', gr.errors.join(' / '));
+      } catch (e) {
+        g = `gdrive(error=${String(e.message).slice(0, 60)}) `;
+        console.error('[shohyo-gdrive] failed:', e.message);
+      }
+    }
     const r = await runInboxMatch({ attach: true, actor: 'cron' });
-    const note = r.error ? r.error : `checked=${r.checked} attached=${r.attached} proposed=${r.proposed} waiting=${r.waiting} ambiguous=${r.ambiguous} none=${r.none} needs_check=${r.needs_check} err=${r.errors}`;
+    const note = r.error ? g + r.error : `${g}checked=${r.checked} attached=${r.attached} proposed=${r.proposed} waiting=${r.waiting} ambiguous=${r.ambiguous} none=${r.none} needs_check=${r.needs_check} err=${r.errors}`;
     console.log(`[shohyo-attach] ${note}`);
     // 未接続は「動いているが仕事ができない」なので ok にしない
     pingJob(JOB_ID, r.error === 'mf_not_connected' ? 'partial' : (r.ok ? 'ok' : 'partial'), note);

@@ -431,7 +431,8 @@ export const JOBS_REGISTRY = [
     type: 'heartbeat',
     importance: 'P3',
     owner: '中原さん',
-    purpose: '証憑受け箱 (/apps/shohyo-links/mf/inbox) の突合 + 添付。受け箱の証憑を MF明細と「支払先+金額+日付±3日」で突合し、'
+    purpose: '証憑受け箱 (/apps/shohyo-links/mf/inbox) の取込 + 突合 + 添付。先頭で Gドライブ「証憑受け箱」フォルダ (env SHOHYO_GDRIVE_INBOX_FOLDER_ID) を拾って'
+      + '受け箱へ入れ (取込済み/対応外 へ移動)、受け箱の証憑を MF明細と「支払先+金額+日付±3日」で突合し、'
       + '自動添付ON かつ 一意一致 かつ 仕訳登録済み のときだけ POST /vouchers で仕訳に貼る (既定=提案モード・人が承認)。'
       + '止まると受け箱に証憑が溜まり、経理がMF側で手で貼る状態に戻る (即障害ではない)',
     where: 'Render bfaith-portal 内 node-cron (apps/shohyo-links/attach-job.js。SHOHYO_ATTACH_ENABLED=false で停止)',
