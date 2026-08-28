@@ -4,7 +4,7 @@
  * 設計原則:
  *   - vps-proxy `/yahoo/get-item-detail` endpoint へ JSON POST
  *   - secret は env (YAHOO_PROXY_SECRET) で送る、 yahoo-publish-proxy と同パターン
- *   - response: { ok, ItemCode, ProductCategory, Path, Name }
+ *   - response: { ok, ItemCode, ProductCategory, Path, Name, Price, SubCodes }
  *
  * 提供:
  *   - fetchYahooItemDetail(itemCode): Promise<{ ok, ItemCode, ProductCategory, Path, Name }>
@@ -70,6 +70,10 @@ export async function fetchYahooItemDetail(itemCode, { timeoutMs = DEFAULT_TIMEO
     ProductCategory: Number.isFinite(parsed.ProductCategory) ? parsed.ProductCategory : null,
     Path: typeof parsed.Path === 'string' && parsed.Path.length > 0 ? parsed.Path : null,
     Name: typeof parsed.Name === 'string' && parsed.Name.length > 0 ? parsed.Name : null,
+    // 設定価格 (価格一括改定ツール F2)。VPS 側の Price 抽出が未デプロイの間は undefined のまま来る。
+    // 0 や null に丸めず素通しする — 呼び出し側が「未デプロイ/取得不能」と「0円」を区別できるように
+    Price: parsed.Price,
+    SubCodes: Array.isArray(parsed.SubCodes) ? parsed.SubCodes : undefined,
   };
 }
 

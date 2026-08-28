@@ -68,6 +68,7 @@ import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import productLinksRouter from './apps/product-links/router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
+import priceUpdateRouter from './apps/price-update/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
 import pickingRouter from './apps/picking/router.js';
@@ -854,6 +855,15 @@ const apps = [
     category: 'purchasing',
   },
   {
+    id: 'price-update',
+    name: '価格一括改定',
+    description: '値上げ時に各モールの売価を1画面で改定。出品の引き当て・現在価格・利益プレビュー (M1 は読み取り専用・モールへは書き込まない)',
+    icon: '💴',
+    path: '/apps/price-update',
+    status: 'active',
+    category: 'purchasing',
+  },
+  {
     id: 'inquiry-hub',
     name: '問い合わせ管理',
     description: 'メール+楽天R-Messe+Yahoo!問い合わせの一元管理 (メールディーラー置き換え)。Step 1: 一覧/詳細/担当/メモ/検索 (read-only運用)',
@@ -1356,6 +1366,10 @@ app.use('/apps/product-links', (req, res, next) => {
 }, productLinksRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
+// 価格一括改定 (price-update): mirror(read-only) + pu_* 監査 (warehouse-mirror.db 同居)。
+// M1 は読み取り専用 — モールへの書き込みは無い。express.json は router 側で CSRF ガードの後に付ける
+// (Content-Type 検査より先に body を読ませない)
+app.use('/apps/price-update', requireAppAccess('price-update'), priceUpdateRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
 // AI連携API (ローカルClaude Codeランナー用) は X-AI-Key 認証・セッション外 (設計書§9.2 権限分離。
 // 先に mount してポータルセッション認証を通さない。product-hub/service-api と同パターン)
