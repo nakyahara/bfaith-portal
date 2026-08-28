@@ -19,7 +19,9 @@ import {
 } from './inbox.js';
 import { runInboxMatch, attachWithClaim } from './attach-job.js';
 import { parseVoucherFileName, isValidDate, matchVoucher } from './matcher.js';
-import { extractVoucher, extractEnabled } from './extract.js';
+import { extractEnabled } from './extract.js';
+import { ingestVoucher, applyExtraction } from './ingest.js';
+import { runGdriveInbox, gdriveInboxEnabled, gdriveInboxUrl } from './gdrive-inbox.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -294,7 +296,10 @@ router.get('/api/inbox', (req, res) => {
   try {
     const status = req.query.status ? String(req.query.status) : null;
     if (status && !INBOX_STATUSES.includes(status)) return res.status(400).json({ ok: false, error: 'bad_status' });
-    res.json({ ok: true, result: { rows: listInbox({ status }), counts: countByStatus(), auto_attach: autoAttachEnabled(), is_admin: req.session?.role === 'admin', ai_enabled: extractEnabled() } });
+    res.json({ ok: true, result: {
+      rows: listInbox({ status }), counts: countByStatus(), auto_attach: autoAttachEnabled(), is_admin: req.session?.role === 'admin',
+      ai_enabled: extractEnabled(), gdrive: { enabled: gdriveInboxEnabled(), url: gdriveInboxUrl() },
+    } });
   } catch (e) {
     console.error('[shohyo-links] inbox list', e.message);
     res.status(500).json({ ok: false, error: 'db_error' });
@@ -312,17 +317,8 @@ router.post('/api/inbox', async (req, res) => {
     const buffer = decodeBase64Strict(file_data);
     if (!buffer) return res.status(400).json({ ok: false, error: 'bad_base64' });
     if (doc_date !== undefined && doc_date !== '' && !isValidDate(doc_date)) return res.status(400).json({ ok: false, error: 'bad_date' });
-    const parsed = parseVoucherFileName(file_name) || {};
-    let { row, duplicate } = addToInbox(buffer, {
-      file_name, source, vendor_id,
-      vendor_name: vendor_name ?? parsed.vendor_name, doc_date: doc_date ?? parsed.doc_date, amount: amount ?? parsed.amount, note,
-    });
-    // 日付・金額・支払先が揃っていなければ中身を読む (PDFはルール→AI、画像はAI)。読めなくてもアップロードは成功
-    let extracted = null;
-    if (!duplicate && (!row.doc_date || !row.amount || !(row.vendor_id || row.vendor_name))) {
-      extracted = await applyExtraction_(row, buffer);
-      row = getInbox(row.id);
-    }
+    // 保存 → 日付・金額・支払先が揃っていなければ中身を読む (PDFはルール→AI、画像はAI)。読めなくてもアップロードは成功
+    const { row, duplicate, extracted } = await ingestVoucher(buffer, { file_name, source, vendor_id, vendor_name, doc_date, amount, note });
     res.json({ ok: true, result: { row, duplicate, extracted } });
   } catch (e) {
     if (e.message === 'unsupported_file') return res.status(415).json({ ok: false, error: 'unsupported_file' });
@@ -332,22 +328,6 @@ router.post('/api/inbox', async (req, res) => {
   }
 });
 
-/** 中身を読んで、空の項目だけ埋める (人が入れた値は上書きしない)。読み取り結果を返す */
-async function applyExtraction_(row, buffer) {
-  try {
-    const ex = await extractVoucher(buffer, row.ext);
-    const patch = {};
-    if (!row.doc_date && ex.doc_date) patch.doc_date = ex.doc_date;
-    if (!row.amount && ex.amount) patch.amount = ex.amount;
-    if (!row.vendor_id && !row.vendor_name && ex.vendor_name) patch.vendor_name = ex.vendor_name;
-    if (Object.keys(patch).length) updateInboxMeta(row.id, patch);
-    return { ...ex, applied: Object.keys(patch) };
-  } catch (e) {
-    console.warn('[shohyo-links] extract failed', row.id, e.message);
-    return { source: 'none', error: String(e.message).slice(0, 200), applied: [] };
-  }
-}
-
 // 読み取りをやり直す (直し忘れ・AI鍵を後から入れた等)。空の項目だけ埋める
 router.post('/api/inbox/:id/extract', async (req, res) => {
   const id = inboxId_(req.params.id);
@@ -355,7 +335,7 @@ router.post('/api/inbox/:id/extract', async (req, res) => {
   if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
   if (['attached', 'attaching', 'needs_check'].includes(row.status)) return res.status(409).json({ ok: false, error: 'already_attached' });
   try {
-    const extracted = await applyExtraction_(row, readFile(row));
+    const extracted = await applyExtraction(row, readFile(row));
     res.json({ ok: true, result: { row: getInbox(id), extracted, ai_enabled: extractEnabled() } });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -458,10 +438,15 @@ router.post('/api/inbox/:id/reopen', (req, res) => {
   res.json({ ok: true, result: setStatus(row.id, 'new') });
 });
 
-// 今すぐ照合 (cron を待たない)。attach は設定 (自動添付ON) に従う。進行中なら相乗り (二重実行しない)
+// 今すぐ照合 (cron を待たない)。先にGドライブの受け箱を拾ってから突合。attach は設定 (自動添付ON) に従う
 router.post('/api/inbox/run', async (req, res) => {
   try {
+    let gdrive = null;
+    if (gdriveInboxEnabled()) {
+      try { gdrive = await runGdriveInbox(); } catch (e) { gdrive = { ok: false, errors: [String(e.message).slice(0, 120)] }; }
+    }
     const r = await runInboxMatch({ attach: true, actor: actorOf_(req) });
+    r.gdrive = gdrive;
     if (r.error) return res.status(r.error === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: r.error, result: r });
     res.json({ ok: true, result: r });
   } catch (e) {

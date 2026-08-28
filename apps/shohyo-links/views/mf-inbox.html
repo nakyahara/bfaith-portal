@@ -93,6 +93,7 @@
   </div>
 
   <div class="drop" id="drop">📎 <b>ここにファイルをドロップ</b> するかクリックして選ぶ（PDF / JPG / PNG・1件5MBまで・複数可）</div>
+  <div class="bar" id="gdriveBar" style="display:none"></div>
   <input type="file" id="picker" accept=".pdf,.jpg,.jpeg,.png" multiple style="display:none">
 
   <div class="tabs" id="tabs"></div>
@@ -154,6 +155,11 @@ async function load(followId = null) {
       toast(`「${LABEL[row.status] || row.status}」に移りました`);
     }
   }
+  const g = data.gdrive || {};
+  $('gdriveBar').style.display = 'flex';
+  $('gdriveBar').innerHTML = g.enabled
+    ? `📁 Gドライブの <a href="${esc(g.url)}" target="_blank" rel="noopener"><b>証憑受け箱</b> フォルダ ↗</a> に入れたファイルも毎時自動で取り込みます（取り込んだ物は「取込済み」へ移動。5MB超や PDF/JPEG/PNG 以外は「対応外」へ）`
+    : '📁 Gドライブの受け箱フォルダは未設定です（Render env SHOHYO_GDRIVE_INBOX_FOLDER_ID）';
   $('autoAttach').checked = data.auto_attach;
   $('autoAttach').disabled = !data.is_admin;
   $('autoAttach').title = data.is_admin ? '' : '自動添付の切替は管理者だけができます';
@@ -294,7 +300,8 @@ $('runBtn').addEventListener('click', async () => {
   $('runBtn').disabled = true; $('runInfo').textContent = '照合中…';
   try {
     const r = await api('../api/inbox/run', { method: 'POST', body: '{}' });
-    $('runInfo').textContent = `照合 ${r.checked}件: 貼った ${r.attached} ／ 提案 ${r.proposed} ／ 登録待ち ${r.waiting} ／ 候補複数 ${r.ambiguous} ／ 一致なし ${r.none}`;
+    const gd = r.gdrive ? `Gドライブ取込 ${r.gdrive.ingested ?? 0}件${r.gdrive.failed ? `（失敗 ${r.gdrive.failed}）` : ''} ／ ` : '';
+    $('runInfo').textContent = `${gd}照合 ${r.checked}件: 貼った ${r.attached} ／ 提案 ${r.proposed} ／ 登録待ち ${r.waiting} ／ 候補複数 ${r.ambiguous} ／ 一致なし ${r.none}`;
     load();
   } catch (e) { $('runInfo').textContent = ''; toast(e.message === 'mf_not_connected' ? 'MF未接続です' : '照合エラー: ' + e.message); }
   $('runBtn').disabled = false;
