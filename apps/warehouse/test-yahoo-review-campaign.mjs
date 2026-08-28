@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** test-yahoo-review-campaign.mjs — PR-Y-C1 スモーク: raw_yahoo_orders → VIEW yahoo_order_contacts → planner (MALL_TABLES.yahoo)。実行: node apps/warehouse/test-yahoo-review-campaign.mjs */
 import Database from 'better-sqlite3';
-import { ensureYahooCampaignSources, yahooContactStats } from './yahoo-review-campaign-adapter.js';
+import { ensureYahooCampaignSources, yahooContactStats, selectShipDateBackfillTargets } from './yahoo-review-campaign-adapter.js';
 import { createCampaignEngine } from './rakuten-review-campaign-lib.js';
 import { ensureYahooReviewTables, importYahooReviewFile, HEADER_COLS } from './yahoo-review-lib.js';
 import iconv from 'iconv-lite';
@@ -41,6 +41,20 @@ console.log('=== 1. VIEW yahoo_order_contacts ===');
   check('宛先列はプレースホルダ (PII なし)', rows['Y-shipped'].masked_email_enc === '(api)' && rows['Y-shipped'].masked_email_hash === null && rows['Y-shipped'].purged_at === null);
   const st = yahooContactStats(db);
   check('stats: orders 5 / shipped 2 / cancelled 2 / social_gift 1 / shipped_no_date 1', st.orders === 5 && st.shipped === 2 && st.cancelled === 2 && st.social_gift === 1 && st.shipped_no_date === 1, JSON.stringify(st));
+}
+
+console.log('=== 1b. ship_date バックフィルの対象選択 (PR-Y-C2) ===');
+{
+  // 判定基準日を固定 (nowIso) して相対日付を安定させる
+  const NOW_SQL = '2026-08-28 00:00:00';
+  const t = selectShipDateBackfillTargets(db, { days: 30, limit: 100, nowIso: NOW_SQL });
+  check('出荷完了で ship_date 無し (Y-noshipdate) が最優先で入る', t[0] === 'Y-noshipdate', JSON.stringify(t));
+  check('ship_date 済み・キャンセル・ギフトは対象外', !t.includes('Y-shipped') && !t.includes('Y-cancel') && !t.includes('Y-mixcancel'));
+  check('未発送でも受注 7 日以内 (Y-unshipped 8/26) は引かない', !t.includes('Y-unshipped'), JSON.stringify(t));
+  check('部分発送 (片方に発送日あり) も 7 日超なら対象 = ship_status を取り直して完了を拾う', t.includes('Y-partial'));
+  check('出荷完了で発送日ありの注文は対象外', !t.includes('Y-shipped'));
+  check('limit が効く', selectShipDateBackfillTargets(db, { days: 30, limit: 1, nowIso: NOW_SQL }).length === 1);
+  check('days の窓外 (Y-old 7/1) は対象外', !selectShipDateBackfillTargets(db, { days: 20, limit: 100, nowIso: NOW_SQL }).includes('Y-old'));
 }
 
 console.log('=== 2. planner (shadow) ===');

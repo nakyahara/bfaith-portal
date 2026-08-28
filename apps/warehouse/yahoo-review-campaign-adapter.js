@@ -65,6 +65,32 @@ export function ensureYahooCampaignSources(db) {
   )`);
 }
 
+/**
+ * ship_date バックフィルの対象注文を選ぶ (PR-Y-C2、backfill-yahoo-ship-date.js が使う)。
+ *   ①出荷完了 (全明細 ship_status=3) なのに ship_date が無い注文 … 確実に埋まる = vendor 突合に効く
+ *   ②未発送・部分発送のまま受注 7 日を超えた注文 … 受注取込の窓 (7日) の外で発送された可能性 (実測 0.3%)
+ *      → バックフィルは ship_status も更新するので、部分発送が完了済みに変わったことも拾える
+ * 未発送で 7 日以内は翌朝の通常取込で埋まるので引かない (無駄な API 呼び出しを避ける)。
+ * キャンセルは除外 (送信対象にならない)。①→②の順、各群は新しい注文から (突合に効くのは直近)。
+ */
+export function selectShipDateBackfillTargets(db, { days = 30, limit = 60, nowIso = null } = {}) {
+  const now = nowIso ? `'${nowIso.replace(/'/g, '')}'` : `'now'`;
+  return db.prepare(`
+    SELECT order_id FROM (
+      SELECT order_id, MIN(order_time) AS ot,
+             MAX(CASE WHEN ship_date IS NOT NULL AND ship_date != '' THEN 1 ELSE 0 END) AS has_date,
+             SUM(CASE WHEN order_status = '${YAHOO_ORDER_STATUS_CANCELLED}' THEN 1 ELSE 0 END) AS cancelled,
+             SUM(CASE WHEN COALESCE(ship_status, '') != '${YAHOO_SHIP_STATUS_SHIPPED}' THEN 1 ELSE 0 END) AS unshipped_lines
+        FROM raw_yahoo_orders
+       WHERE order_time >= datetime(${now}, ?)
+       GROUP BY order_id)
+     WHERE cancelled = 0
+       AND (has_date = 0 OR unshipped_lines > 0)
+       AND (unshipped_lines = 0 OR ot < datetime(${now}, '-7 days'))
+     ORDER BY (CASE WHEN unshipped_lines = 0 AND has_date = 0 THEN 0 ELSE 1 END), ot DESC
+     LIMIT ?`).all(`-${Number(days)} days`, Number(limit)).map((r) => r.order_id);
+}
+
 /** 母集合の概況 (PII なし、stats 用) */
 export function yahooContactStats(db) {
   const r = db.prepare(`

@@ -553,6 +553,11 @@ async function main() {
 
   // Yahoo!ショッピング（VPSプロキシ経由で遅延しやすいため60分）
   const yahooResult = runScript('apps/warehouse/yahoo-orders.js 7', 'Yahoo!ショッピング', 3600000);
+  // 受注取込の窓 (7日) から漏れた ship_date を毎日少しずつ埋める (P2-Y PR-Y-C2)。
+  // 出荷完了なのに発送日が無い注文 → レビューメールのフォロー予定が立たないため。上限 60 件/日 (VPS 側 1.1 秒間隔)
+  const yahooShipDateFill = runScript(
+    'apps/warehouse/backfill-yahoo-ship-date.js --days 60 --limit 60', 'Yahoo発送日 穴埋め', 300000);
+  results.push({ name: 'Yahoo発送日 穴埋め', ...yahooShipDateFill });
   results.push({ name: 'Yahoo', ...yahooResult });
 
   // au PAY マーケット (Wow!manager API、VPS proxy 経由で遅延しやすいため 60 分)
