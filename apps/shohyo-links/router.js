@@ -211,6 +211,17 @@ router.get('/api/mf/transactions', async (req, res) => {
     const journalByTx = new Map();
     for (const j of journals) if (j.transaction_id) journalByTx.set(j.transaction_id, j);
 
+    // 受け箱の状態を明細に重ねる (この画面だけで「証憑が揃っているか」が分かるように)
+    const inboxByTx = new Map();
+    for (const v of listInbox({ limit: 2000 })) {
+      const tag = { id: v.id, status: v.status, file_name: v.file_name };
+      if (v.match_tx_id && ['waiting_registration', 'proposed', 'attaching', 'attached', 'needs_check'].includes(v.status)) {
+        inboxByTx.set(v.match_tx_id, tag);
+      } else if (v.status === 'ambiguous') {
+        for (const c of v.candidates || []) if (!inboxByTx.has(c.tx_id)) inboxByTx.set(c.tx_id, { ...tag, candidate: true });
+      }
+    }
+
     const byAccount = new Map();
     for (const a of accounts) {
       byAccount.set(a.id, { id: a.id, name: a.name, auto_voucher: isAutoVoucher(a.name), rows: [] });
@@ -233,6 +244,7 @@ router.get('/api/mf/transactions', async (req, res) => {
         journal_number: j ? j.number : null,
         accounts: j ? journalDigest(j).accounts : [],
         vouchers: voucherCount,
+        inbox: inboxByTx.get(t.id) || null,
         vendors: matchVendors({ content: t.content, memo: t.memo }, vendors).map(v => ({
           id: v.id, name: v.name, url: v.url, storage_path: v.storage_path, fetch_method: v.fetch_method,
         })),
@@ -247,6 +259,10 @@ router.get('/api/mf/transactions', async (req, res) => {
           unregistered: a.rows.filter(r => r.status === 'none').length,
           need_voucher: expense.filter(r => r.status !== 'none' && !r.vouchers).length,
           attached: expense.filter(r => r.vouchers > 0).length,
+          // 受け箱に証憑が来ていて、MFで「登録」すれば貼れる明細
+          ready: a.rows.filter(r => r.status === 'none' && r.inbox && !r.inbox.candidate && r.inbox.status !== 'attached').length,
+          // 支出でまだ証憑が無い (受け箱にも無い) 明細 = 取りに行く対象
+          missing: expense.filter(r => !r.vouchers && !r.inbox).length,
         },
       };
     }).sort((x, y) => y.counts.unregistered - x.counts.unregistered || y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
