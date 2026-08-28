@@ -14,12 +14,13 @@ import path from 'node:path';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-printq-test-'));
 process.env.DATA_DIR = tmpDir;
 
-const { initPackingDB, getDB, utcNow, createDevice } = await import('../db.js');
+const { initPackingDB, getDB, utcNow, createDevice, setAgentPrinters, revokeDevice } = await import('../db.js');
 const {
   enqueuePrintJob, leaseNextJob, findLeasedJob, claimPdfForPrint, failBeforeDispatch,
   markSubmitted, markFinished, recordHeartbeat, isPrintable, sweepPrintJobs,
   reclaimExpiredLeases, pendingAlerts, markAlerted, alertTextFor, getJobStatusFor,
-  listPrintJobs, MAX_ATTEMPTS, STALE_QUEUED_SEC, DISPATCHED_TIMEOUT_SEC, LEASE_SEC,
+  listPrintJobs, setPrintRoute, printerForSlug, listPrintRoutes, normalizeSlug,
+  MAX_ATTEMPTS, STALE_QUEUED_SEC, DISPATCHED_TIMEOUT_SEC, LEASE_SEC,
 } = await import('../print-queue.js');
 
 let failed = 0;
@@ -54,27 +55,147 @@ const agentRow = db.prepare('SELECT * FROM pk_pack_devices WHERE id=?').get(agen
 const agent2 = createDevice('出荷PC2', 'test', { kind: 'agent', printerName: 'Munbyn 2' });
 const agent2Row = db.prepare('SELECT * FROM pk_pack_devices WHERE id=?').get(agent2.id);
 const ipad = createDevice('梱包iPad', 'test');
+// 出荷PC = AES の Munbyn。倉庫PC = 定形外の QL-720 (別のPCに別のプリンターがぶら下がる)
+setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)']);
+setAgentPrinters(agent2.id, ['Brother QL-720']);
+setPrintRoute('aes', 'Munbyn ITPP941(300DPI)', 'test');
+setPrintRoute('teikeigai', 'Brother QL-720', 'test');
 
 console.log('── 🚨 印刷してよいものだけが積まれる (安全条件は enqueue の SQL 側) ──');
 {
-  ok(enqueuePrintJob(newReprint({ by: 'position' }), { pdfSha256: SHA('a') }) === null,
+  ok(enqueuePrintJob(newReprint({ by: 'position' }), { pdfSha256: SHA('a'), slug: 'aes' }) === null,
     '位置推定で特定したページは積めない (別人の送り状を掴み得る)');
-  ok(enqueuePrintJob(newReprint({ printable: 0 }), { pdfSha256: SHA('a') }) === null,
+  ok(enqueuePrintJob(newReprint({ printable: 0 }), { pdfSha256: SHA('a'), slug: 'aes' }) === null,
     '白紙検査を通っていないものは積めない');
-  ok(enqueuePrintJob(newReprint({ by: 'slip_no' }), { pdfSha256: SHA('a') }) === null,
+  ok(enqueuePrintJob(newReprint({ by: 'slip_no' }), { pdfSha256: SHA('a'), slug: 'aes' }) === null,
     'テキスト照合で見つけたものも積めない (manifest だけ)');
-  ok(enqueuePrintJob(999999, { pdfSha256: SHA('a') }) === null, '存在しない再印刷は積めない');
-  ok(enqueuePrintJob(newReprint(), { pdfSha256: 'ぐちゃぐちゃ' }) === null, 'sha256 が不正なら積まない');
+  ok(enqueuePrintJob(999999, { pdfSha256: SHA('a'), slug: 'aes' }) === null, '存在しない再印刷は積めない');
+  ok(enqueuePrintJob(newReprint(), { pdfSha256: 'ぐちゃぐちゃ', slug: 'aes' }) === null, 'sha256 が不正なら積まない');
   // isPrintable は画面表示用 — 実際の境界は SQL 側にあることを明示しておく
   ok(isPrintable({ pdf_printable: 1, pdf_by: 'manifest', pdf_token: 'x' }) === true, 'isPrintable: 通る条件');
   ok(isPrintable({ pdf_printable: 1, pdf_by: 'position', pdf_token: 'x' }) === false, 'isPrintable: 位置推定は false');
 }
 
+console.log('\n── 🚨 出力先が決まっていない引当分類は自動印刷しない ──');
+{
+  // 引当分類によって送り状を出すソフトが違う (DENZOU / ヤマトB2 / ゆうプリR / 汎用送り状)。
+  // 対応表に無いものを「とりあえずどこかに刷る」と、別のプリンターから他人の送り状が出る
+  const r1 = enqueuePrintJob(newReprint(), { pdfSha256: SHA('7'), slug: 'nekoposu' });
+  eq({ id: r1.id, reason: r1.reason }, { id: null, reason: 'no_route' },
+    '対応表に無い分類 (ネコポス) は積まない');
+  const r2 = enqueuePrintJob(newReprint(), { pdfSha256: SHA('7'), slug: null });
+  eq({ id: r2.id, reason: r2.reason }, { id: null, reason: 'no_slug' },
+    '引当分類が読めなかったら積まない (どのソフトの送り状か分からない)');
+
+  // 対応表を入れれば載る。出力先はジョブに焼き付く
+  setPrintRoute('nekoposu', 'ヤマトB2プリンター', 'test');
+  const r3 = enqueuePrintJob(newReprint(), { pdfSha256: SHA('7'), slug: 'nekoposu' });
+  eq(r3.printer, 'ヤマトB2プリンター', '対応表の出力先がジョブに入る');
+  // 空にすると自動印刷が止まる (どこに出るか決まっていない状態に戻す)
+  setPrintRoute('nekoposu', '', 'test');
+  ok(printerForSlug('nekoposu') === null, '空欄にすると自動印刷しない状態に戻る');
+  eq(enqueuePrintJob(newReprint(), { pdfSha256: SHA('7'), slug: 'nekoposu' }).reason, 'no_route',
+    '外した分類は積まれない');
+  // 入力の妥当性
+  eq(setPrintRoute('../etc', 'x', 'test').ok, false, '変な slug は受け付けない');
+  eq(setPrintRoute('unknown_soft', 'x', 'test').ok, false, '知らない引当分類は受け付けない');
+  // 🚨 読み取り側 (CSVファイル名) は小文字化するので、登録側で大文字を許すと永久に一致せず
+  //    「理由の見えない印刷されない」になる
+  setPrintRoute('AES', 'Munbyn ITPP941(300DPI)', 'test');
+  eq(printerForSlug('aes'), 'Munbyn ITPP941(300DPI)', '大文字で登録しても小文字の slug と一致する');
+  eq(normalizeSlug(' NekoPosu '), 'nekoposu', '前後の空白と大文字を吸収する');
+  ok(normalizeSlug('yamato') === null, '知らない分類は null');
+  // その名前の端末が無い設定は「積んでも誰も取りに来ない」ので保存時に知らせる
+  ok(setPrintRoute('60size', '誰も持っていないプリンター', 'test').orphan === true,
+    '登録端末が無いプリンターを指定したら警告を返す');
+  ok(setPrintRoute('60size', 'Munbyn ITPP941(300DPI)', 'test').orphan === false,
+    '端末が持っているプリンターなら警告なし');
+  setPrintRoute('60size', '', 'test');
+  ok(listPrintRoutes().some((x) => x.slug === 'aes'), '一覧に出る');
+}
+
+console.log('\n── 🚨 プリンター名の持ち主が変わっても、積んだジョブは別の実機から出ない ──');
+{
+  // プリンター名はPCごとのローカル名。UNIQUE は「同時点で2台に無い」ことしか保証しないので、
+  // PC-A から名前を外して PC-B に付け直すと、PC-A 向けに積んであったジョブを
+  // PC-B が取れてしまう = 別の物理プリンターから他人の送り状が出る
+  setPrintRoute('60size', 'Munbyn 予備', 'test');
+  setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)', 'Munbyn 予備']);
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('9'), slug: '60size' });
+  db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
+  eq(db.prepare('SELECT target_device_id FROM pk_print_jobs WHERE id=?').get(id).target_device_id,
+    agent.id, '積んだ時点の端末がジョブに焼き付く');
+
+  // 未処理のジョブが残っている名前は手放せない (ここが最初の防波堤)
+  const busy = setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)']);
+  eq({ ok: busy.ok, reason: busy.reason }, { ok: false, reason: 'printer_busy' },
+    '印刷待ちが残っている名前は外せない');
+
+  // 仮に外せてしまっても (ジョブが片づいた後に付け替える等)、別端末は取れない
+  db.prepare('DELETE FROM pk_print_agent_printers WHERE device_id=? AND printer_name=?')
+    .run(agent.id, 'Munbyn 予備');
+  setAgentPrinters(agent2.id, ['Brother QL-720', 'Munbyn 予備']);
+  ok(leaseNextJob(agent2Row)?.id !== id, '名前を引き継いだ別のPCでも、積んだ先が違うジョブは取れない');
+  eq(stateOf(id), 'queued', 'ジョブは queued のまま (誤った実機から出るくらいなら出さない)');
+  // 誰も取れないまま滞留するが、それは manual として人に回る (黙って消えない)
+  sweepPrintJobs({ now: at(STALE_QUEUED_SEC + 1) });
+  eq(stateOf(id), 'manual', '取り手がいなければ手動印刷へ回る');
+  setAgentPrinters(agent2.id, ['Brother QL-720']);
+  setPrintRoute('60size', '', 'test');
+}
+
+console.log('\n── 失効した端末はプリンター名を手放す ──');
+{
+  // 握ったままだと、代わりのPCを同じ名前で登録できない
+  const old = createDevice('壊れたPC', 'test', { kind: 'agent' });
+  eq(setAgentPrinters(old.id, ['予備プリンター']).ok, true, '登録できる');
+  const other = createDevice('代わりのPC', 'test', { kind: 'agent' });
+  eq(setAgentPrinters(other.id, ['予備プリンター']).reason, 'duplicate_printer', '使用中は登録できない');
+  revokeDevice(old.id);
+  eq(setAgentPrinters(other.id, ['予備プリンター']).ok, true, '失効させれば同じ名前で登録できる');
+}
+
+console.log('\n── 🚨 同じプリンター名を2台のPCに登録させない ──');
+{
+  // Windowsのプリンター名はPCごとのローカル名。出荷PCと倉庫PCの両方に同じ名前があると、
+  // どちらも同じジョブを取れてしまい「別の物理プリンターから黙って送り状が出る」
+  const other = createDevice('別のPC', 'test', { kind: 'agent' });
+  const r = setAgentPrinters(other.id, ['Munbyn ITPP941(300DPI)']);
+  eq({ ok: r.ok, reason: r.reason }, { ok: false, reason: 'duplicate_printer' },
+    '他の端末が使っている名前は登録できない');
+  ok(String(r.message).includes('別の端末'), '理由が人に分かる文言で返る');
+  // 不正な項目を黙って捨てない (登録したつもりが入っていない = 印刷されないのに気づけない)
+  eq(setAgentPrinters(other.id, ['ok-printer', '']).ok, false, '空文字が混ざったら全体を拒否');
+  eq(setAgentPrinters(other.id, ['x'.repeat(121)]).ok, false, '長すぎる名前は拒否');
+  eq(setAgentPrinters(ipad.id, ['どこか']).reason, 'not_agent', 'iPad にはプリンターを付けられない');
+  eq(setAgentPrinters(999999, ['どこか']).reason, 'not_agent', '存在しない端末には付けられない');
+  // 自分自身の付け替えはできる (増減のたびに登録し直さなくてよい)
+  eq(setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)', 'Munbyn 予備']).ok, true, '自分の分は付け替えられる');
+  eq(setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)']).printers, ['Munbyn ITPP941(300DPI)'], '減らせる');
+}
+
+console.log('\n── 🚨 そのPCに無いプリンター宛のジョブは渡さない ──');
+{
+  // 出荷PC (Munbyn) と 倉庫PC (QL-720) は別のPC。定形外のジョブを出荷PCに渡すと
+  // 存在しないプリンター名で印刷することになる
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('8'), slug: 'teikeigai' });
+  db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
+  ok(leaseNextJob(agentRow)?.id !== id, '出荷PC (Munbynだけ) は QL-720 宛のジョブを取れない');
+  eq(leaseNextJob(agent2Row)?.id, id, '倉庫PC (QL-720) なら取れる');
+  eq(db.prepare('SELECT printer_name, slug FROM pk_print_jobs WHERE id=?').get(id),
+    { printer_name: 'Brother QL-720', slug: 'teikeigai' }, '出力先と分類がジョブに残る');
+  // プリンターが1つも登録されていない端末には何も渡さない
+  const bare = createDevice('設定途中のPC', 'test', { kind: 'agent' });
+  const bareRow = db.prepare('SELECT * FROM pk_pack_devices WHERE id=?').get(bare.id);
+  ok(leaseNextJob(bareRow) === null, 'プリンター未登録の端末には配らない');
+}
+
+
 console.log('\n── enqueue: 1再印刷につき1ジョブ (連打・通知再送で二重に出さない) ──');
 {
   const rid = newReprint();
-  const a = enqueuePrintJob(rid, { pdfSha256: SHA('a') });
-  const b = enqueuePrintJob(rid, { pdfSha256: SHA('a') });
+  const a = enqueuePrintJob(rid, { pdfSha256: SHA('a'), slug: 'aes' });
+  const b = enqueuePrintJob(rid, { pdfSha256: SHA('a'), slug: 'aes' });
   ok(a.created === true, '1回目は積まれる');
   eq({ created: b.created, sameId: b.id === a.id }, { created: false, sameId: true }, '2回目は積まれず同じジョブを指す');
 }
@@ -112,12 +233,12 @@ console.log('\n── 正常系: lease → PDF受け取り → 投入報告 → 
 
 console.log('\n── 🚨 PDFを渡した後は、報告前に落ちても自動で配り直さない (二重印刷防止) ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('b') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('b'), slug: 'aes' });
   const job = leaseNextJob(agentRow);
   claimPdfForPrint(id, { deviceId: agentRow.id, leaseToken: job.leaseToken });
   // ここでエージェントPCが落ちた (スプーラーには入っているかもしれない) 想定
   ok(leaseNextJob(agentRow, { now: at(9999) })?.id !== id, 'lease期限を過ぎても dispatched は再配布されない');
-  ok(leaseNextJob(agent2Row, { now: at(9999) })?.id !== id, '別のエージェントにも配らない');
+  ok(leaseNextJob(agentRow, { now: at(9999) })?.id !== id, '同じエージェントにも配らない');
   eq(stateOf(id), 'dispatched', 'dispatched のまま');
   // 代わりに「結果不明」として人に知らせる
   sweepPrintJobs({ now: at(DISPATCHED_TIMEOUT_SEC + 1) });
@@ -128,10 +249,10 @@ console.log('\n── 🚨 PDFを渡した後は、報告前に落ちても自�
 
 console.log('\n── 🚨 遅れて届いた古い報告が、新しい lease を乗っ取らない ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('c') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('c'), slug: 'aes' });
   const old = leaseNextJob(agentRow);
   // 期限切れ → 別のエージェントが取り直す (PDFはまだ渡していないので配り直してよい)
-  const fresh = leaseNextJob(agent2Row, { now: at(9999) });
+  const fresh = leaseNextJob(agentRow, { now: at(9999) });
   eq(fresh.id, id, '期限切れの leased は配り直される');
   ok(old.leaseToken !== fresh.leaseToken, 'lease token は取り直しで変わる');
   eq(markSubmitted(id, { deviceId: agentRow.id, leaseToken: old.leaseToken, now: at(9999) }).ok, false,
@@ -143,7 +264,7 @@ console.log('\n── 🚨 遅れて届いた古い報告が、新しい lease �
 
 console.log('\n── lease 期限切れの繰り返し: 上限を超えたら人に投げる ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('d') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('d'), slug: 'aes' });
   // 先に積んである別ジョブを片付けてから (ORDER BY id で先頭を取るため)
   db.prepare("UPDATE pk_print_jobs SET state='completed', finished_at=?, alerted_state='completed' WHERE id<? AND state IN ('queued','leased')")
     .run(now, id);
@@ -160,7 +281,7 @@ console.log('\n── lease 期限切れの繰り返し: 上限を超えたら�
 
 console.log('\n── 🚨 滞留: 手で刷ってもらう前に自動配布を止める ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('e') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('e'), slug: 'aes' });
   const s0 = sweepPrintJobs({ now: at(1) });
   eq({ manual: s0.manual, unknown: s0.unknown }, { manual: 0, unknown: 0 }, '積んだ直後は何もしない');
   sweepPrintJobs({ now: at(STALE_QUEUED_SEC + 1) });
@@ -174,7 +295,7 @@ console.log('\n── 🚨 滞留: 手で刷ってもらう前に自動配布を
 
 console.log('\n── 🚨 通知は送れるまで諦めない (webhook が落ちていた分を捨てない) ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('f') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('f'), slug: 'aes' });
   sweepPrintJobs({ now: at(STALE_QUEUED_SEC + 1) });
   ok(pendingAlerts().some((j) => j.id === id), '通知前は未通知として残る');
   // 送信に失敗した (markAlerted を呼ばなかった) → 次の周回でも対象のまま
@@ -188,7 +309,7 @@ console.log('\n── 🚨 通知は送れるまで諦めない (webhook が落�
 
 console.log('\n── 再滞留も検知する ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('0') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('0'), slug: 'aes' });
   const j = leaseNextJob(agentRow);
   eq(j.id, id, '対象を lease');
   // lease 期限切れで queued に戻る → 通知済みマークが残っていると2度目が黙る
@@ -205,7 +326,7 @@ console.log('\n── 🚨 古い依頼でも、初回の lease 失敗で自動�
   // 「積まれてから時間が経っているが、いま初めて lease されたジョブ」。
   // 滞留の起算点を created_at にすると、lease 期限切れで queued に戻った瞬間に
   // 同じ周回で manual にされ、試行上限に達する前に自動印刷を諦めてしまう
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('6') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('6'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const T = STALE_QUEUED_SEC * 5;               // 積んでからだいぶ経っている
   eq(leaseNextJob(agentRow, { now: at(T) })?.id, id, '古いジョブでも lease できる');
@@ -219,7 +340,7 @@ console.log('\n── 🚨 古い依頼でも、初回の lease 失敗で自動�
 
 console.log('\n── 🚨 エージェントが全滅しても leased が残り続けない (dead-man) ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('2') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('2'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const j = leaseNextJob(agentRow);
   eq(j.id, id, '対象を lease');
@@ -234,7 +355,7 @@ console.log('\n── 🚨 エージェントが全滅しても leased が残り
 
 console.log('\n── 🚨 PDFを渡せなかったときは「結果不明」にしない ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('3') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('3'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const job = leaseNextJob(agentRow);
   ok(findLeasedJob(id, { deviceId: agentRow.id, leaseToken: job.leaseToken }) !== null,
@@ -249,7 +370,7 @@ console.log('\n── 🚨 PDFを渡せなかったときは「結果不明」�
 
 console.log('\n── 🚨 印刷に手間取っても完了報告が弾かれない (報告期限は lease と別) ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('4') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('4'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const job = leaseNextJob(agentRow);
   // lease 期限ぎりぎりでPDFを受け取り、そこから印刷に時間がかかった想定
@@ -264,7 +385,7 @@ console.log('\n── 🚨 印刷に手間取っても完了報告が弾かれ�
 
 console.log('\n── 応答が失われた再送を成功として受ける (冪等) ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('5') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('5'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const job = leaseNextJob(agentRow);
   claimPdfForPrint(id, { deviceId: agentRow.id, leaseToken: job.leaseToken });
@@ -284,7 +405,7 @@ console.log('\n── 応答が失われた再送を成功として受ける (�
 
 console.log('\n── 失敗報告 ──');
 {
-  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('1') });
+  const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('1'), slug: 'aes' });
   db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
   const job = leaseNextJob(agentRow);
   eq(job.id, id, '対象を lease');

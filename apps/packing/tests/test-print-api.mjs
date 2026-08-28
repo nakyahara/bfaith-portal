@@ -18,8 +18,8 @@ process.env.DATA_DIR = tmpDir;
 delete process.env.PACKING_REPRINT_WEBHOOK;   // 通知は飛ばさない
 
 const express = (await import('express')).default;
-const { initPackingDB, getDB, utcNow, createDevice } = await import('../db.js');
-const { enqueuePrintJob } = await import('../print-queue.js');
+const { initPackingDB, getDB, utcNow, createDevice, setAgentPrinters } = await import('../db.js');
+const { enqueuePrintJob, setPrintRoute } = await import('../print-queue.js');
 const { REPRINTS_DIR } = await import('../reprint-pdf.js');
 const router = (await import('../router.js')).default;
 
@@ -44,10 +44,13 @@ fs.mkdirSync(REPRINTS_DIR, { recursive: true });
 const pdfBytes = Buffer.from('%PDF-1.4 dummy label');
 fs.writeFileSync(path.join(REPRINTS_DIR, 'tokenAAAAAAAAAAAA.pdf'), pdfBytes);
 const sha = crypto.createHash('sha256').update(pdfBytes).digest('hex');
-const { id: jobId } = enqueuePrintJob(reprintId, { pdfSha256: sha });
-
-const agent = createDevice('出荷PC', 'test', { kind: 'agent', printerName: 'Munbyn ITPP941(300DPI)' });
+// 端末 → そのPCから出せるプリンター → 引当分類ごとの出力先、の順に用意してから積む
+// (どの端末に出させるかもジョブに焼き付くため、端末が先に居る必要がある)
+const agent = createDevice('出荷PC', 'test', { kind: 'agent' });
+setAgentPrinters(agent.id, ['Munbyn ITPP941(300DPI)']);
 const ipad = createDevice('梱包iPad1', 'test');
+setPrintRoute('aes', 'Munbyn ITPP941(300DPI)', 'test');
+const { id: jobId } = enqueuePrintJob(reprintId, { pdfSha256: sha, slug: 'aes' });
 
 const app = express();
 app.use(express.json());
@@ -150,17 +153,22 @@ console.log('\n── 報告 ──');
 
 console.log('\n── 出力先が登録されていない端末には配らない ──');
 {
-  const noPrinter = createDevice('設定途中のPC', 'test', { kind: 'agent', printerName: null });
+  const noPrinter = createDevice('設定途中のPC', 'test', { kind: 'agent' });
   const rid2 = Number(db.prepare(`INSERT INTO pk_pack_reprints (batch_id, slip_seq, ne_slip_no,
     site_order_no, folder_name, recipient_name, requested_by, created_at, kind, pdf_token, pdf_by, pdf_printable)
     VALUES (1, 23, '1538887', '503-0000000-0000001', '出荷_32', '川野', '大場', ?, 'reprint', 'tokenBBBBBBBBBBBB', 'manifest', 1)`)
     .run(now).lastInsertRowid);
-  enqueuePrintJob(rid2, { pdfSha256: sha });
+  enqueuePrintJob(rid2, { pdfSha256: sha, slug: 'aes' });
   eq((await call('GET', '/print/next', { token: noPrinter.token })).status, 409,
     'どこに出るか分からないまま刷らせない');
   // 掴んでから断ると、正常なジョブの試行回数だけが減って failed に落ちてしまう
   eq(db.prepare('SELECT state, attempt_count FROM pk_print_jobs WHERE ne_slip_no=?').get('1538887'),
     { state: 'queued', attempt_count: 0 }, '断られたジョブは queued のまま (試行回数を消費しない)');
+  // 別のPCのプリンター宛ジョブは渡さない (存在しないプリンター名で刷らせない)
+  const warehouse = createDevice('倉庫PC', 'test', { kind: 'agent' });
+  setAgentPrinters(warehouse.id, ['Brother QL-720']);
+  eq((await call('GET', '/print/next', { token: warehouse.token })).status, 204,
+    'QL-720 しか無いPCには Munbyn 宛のジョブを渡さない');
 }
 
 await new Promise((r) => server.close(r));

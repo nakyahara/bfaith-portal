@@ -45,6 +45,20 @@ const REDISTRIBUTABLE = 'leased';
 /** 人に知らせる必要がある状態。alerted_state と一致するまで繰り返し通知対象になる */
 const ALERT_STATES = ['completed', 'failed', 'manual', 'unknown'];
 
+/**
+ * 引当分類 (slug) の日本語名。正本 = AI_reference ロジザード作業自動化/hikiate-patterns.csv。
+ * 管理画面で「どの送り状のことか」が分かるように持つ (対応表の登録間違いを防ぐ)。
+ */
+export const SLUG_LABELS = Object.freeze({
+  aes: 'AES (DENZOU) — 並び替え済PDF',
+  nekoposu: 'ネコポス (ヤマトB2)',
+  '50size': '50サイズ宅急便 (ヤマトB2・50専用アカウント)',
+  '60size': '60サイズ以上宅急便 (ヤマトB2)',
+  yupakepafu: 'ゆうパケットパフ (ゆうプリR)',
+  teikeigai: '定形外 (汎用送り状・P-touch)',
+  retapa: 'レターパック (汎用送り状・P-touch)',
+});
+
 /** 画面表示用のラベル (状態そのものを英語で見せない)。 */
 export const PRINT_STATE_LABELS = {
   queued: '⏳ 印刷待ち',
@@ -80,28 +94,82 @@ export function isPrintable(reprintRow) {
  * 1再印刷につき1ジョブ (UNIQUE) — 通知の再送やリトライで同じ送り状が二重に出ない。
  * @returns {{id: number, created: boolean}|null} 印刷してよい行でなければ null
  */
-export function enqueuePrintJob(reprintId, { pdfSha256 }) {
+export function enqueuePrintJob(reprintId, { pdfSha256, slug = null }) {
   if (!Number.isInteger(reprintId) || typeof pdfSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(pdfSha256)) {
     return null;
   }
   const db = getDB();
   const now = utcNow();
+  // 🚨 出力先が決まっていないものは積まない。引当分類 (= 送り状発行ソフト) によって
+  //    ヤマトB2 / DENZOU / ゆうプリR / 汎用送り状 と出す先が違うので、
+  //    対応表に無い分類を「とりあえずどこかに刷る」と別のプリンターから他人の送り状が出る
+  const printer = printerForSlug(slug);
+  if (!printer) return { id: null, created: false, reason: slug ? 'no_route' : 'no_slug', slug };
+  // 🚨 出力先は「名前」だけでなく「そのとき名前を持っていた端末」も焼き付ける。
+  //    名前はPCごとのローカル名なので、後から別のPCが同じ名前を名乗ると、
+  //    積んであったジョブが別の実機から出てしまう
+  const owner = db.prepare(`SELECT p.device_id FROM pk_print_agent_printers p
+    JOIN pk_pack_devices d ON d.id = p.device_id AND d.revoked_at IS NULL
+    WHERE p.printer_name = ?`).get(printer);
+  if (!owner) return { id: null, created: false, reason: 'no_agent', printer, slug };
   return db.transaction(() => {
     const info = db.prepare(`
       INSERT INTO pk_print_jobs (reprint_id, pdf_token, pdf_sha256, ne_slip_no, folder_name,
-                                 state, created_at, updated_at)
-      SELECT r.id, r.pdf_token, ?, r.ne_slip_no, r.folder_name, 'queued', ?, ?
+                                 slug, printer_name, target_device_id, state, created_at, updated_at)
+      SELECT r.id, r.pdf_token, ?, r.ne_slip_no, r.folder_name, ?, ?, ?, 'queued', ?, ?
       FROM pk_pack_reprints r
       WHERE r.id = ?
         AND r.pdf_by = 'manifest'      -- 注文番号の完全一致で特定できたものだけ
         AND r.pdf_printable = 1        -- 白紙検査を通ったものだけ
         AND r.pdf_token IS NOT NULL
       ON CONFLICT(reprint_id) DO NOTHING
-    `).run(pdfSha256, now, now, reprintId);
-    if (info.changes > 0) return { id: Number(info.lastInsertRowid), created: true };
-    const row = db.prepare('SELECT id FROM pk_print_jobs WHERE reprint_id=?').get(reprintId);
-    return row ? { id: row.id, created: false } : null;
+    `).run(pdfSha256, slug, printer, owner.device_id, now, now, reprintId);
+    if (info.changes > 0) return { id: Number(info.lastInsertRowid), created: true, printer, slug };
+    const row = db.prepare('SELECT id, printer_name FROM pk_print_jobs WHERE reprint_id=?').get(reprintId);
+    return row ? { id: row.id, created: false, printer: row.printer_name, slug } : null;
   }).immediate();
+}
+
+/** 引当分類 (slug) → 出力先プリンター。対応表に無ければ null (= 自動印刷しない)。 */
+export function printerForSlug(slug) {
+  const s = normalizeSlug(slug);
+  if (!s) return null;
+  return getDB().prepare('SELECT printer_name FROM pk_print_routes WHERE slug=?')
+    .get(s)?.printer_name ?? null;
+}
+
+/**
+ * slug の表記ゆれを1か所で吸収する。
+ * 🚨 読み取り側 (CSVファイル名) は小文字化しているので、登録側で 'AES' を許すと永久に
+ *    一致せず、理由の見えない「印刷されない」になる。
+ */
+export function normalizeSlug(slug) {
+  const s = String(slug || '').trim().toLowerCase();
+  return s && Object.prototype.hasOwnProperty.call(SLUG_LABELS, s) ? s : null;
+}
+
+/** 対応表の全件 (管理画面)。 */
+export function listPrintRoutes() {
+  return getDB().prepare('SELECT * FROM pk_print_routes ORDER BY slug').all();
+}
+
+/** 対応表の登録・更新。printerName を空にすると削除 (= その分類は自動印刷しない)。 */
+export function setPrintRoute(slug, printerName, actor, note = null) {
+  const db = getDB();
+  const s = normalizeSlug(slug);
+  const p = String(printerName || '').trim();
+  if (!s) return { ok: false, reason: 'bad_slug', message: '知らない引当分類です' };
+  if (p.length > 120) return { ok: false, reason: 'bad_printer', message: 'プリンター名が長すぎます' };
+  if (!p) { db.prepare('DELETE FROM pk_print_routes WHERE slug=?').run(s); return { ok: true, deleted: true }; }
+  db.prepare(`INSERT INTO pk_print_routes (slug, printer_name, note, updated_by, updated_at)
+    VALUES (?,?,?,?,?)
+    ON CONFLICT(slug) DO UPDATE SET printer_name=excluded.printer_name, note=excluded.note,
+      updated_by=excluded.updated_by, updated_at=excluded.updated_at`)
+    .run(s, p, note ? String(note).slice(0, 200) : null, actor, utcNow());
+  // その名前を登録している端末が無いと、ジョブは積まれても誰も取りに来ず滞留する。
+  // 通知を待たずに設定ミスを気づけるよう、保存時に返して画面に出す
+  const owner = db.prepare('SELECT device_id FROM pk_print_agent_printers WHERE printer_name=?').get(p);
+  return { ok: true, orphan: !owner };
 }
 
 /**
@@ -141,14 +209,24 @@ export function leaseNextJob(device, { now = utcNow(), leaseSec = LEASE_SEC } = 
   const nowMs = ms(now);
   reclaimExpiredLeases({ now });
   return db.transaction(() => {
-    const job = db.prepare("SELECT * FROM pk_print_jobs WHERE state='queued' ORDER BY id LIMIT 1").get();
+    // 🚨 その端末から出せるプリンター宛のジョブだけ渡す。出力先はジョブが持っている
+    //    (引当分類ごとに決まる) ので、端末側の申告や既定プリンターでは決めない
+    const printers = db.prepare('SELECT printer_name FROM pk_print_agent_printers WHERE device_id=?')
+      .all(device.id).map((r) => r.printer_name);
+    if (printers.length === 0) return null;
+    // 積んだときの端末と、いまその名前を持っている端末の**両方**が一致したものだけ渡す。
+    // 名前だけで照合すると、名前の持ち主が付け替わったときに別の実機から出る
+    const job = db.prepare(`SELECT * FROM pk_print_jobs WHERE state='queued'
+      AND target_device_id = ?
+      AND printer_name IN (${printers.map(() => '?').join(',')}) ORDER BY id LIMIT 1`)
+      .get(device.id, ...printers);
     if (!job) return null;
     const leaseToken = crypto.randomBytes(16).toString('base64url');
     const expiresAt = iso(nowMs + leaseSec * 1000);
     const upd = db.prepare(`UPDATE pk_print_jobs SET state=?, lease_device_id=?, lease_token=?,
-      lease_expires_at=?, attempt_count=attempt_count+1, printer_name=?, updated_at=?
+      lease_expires_at=?, attempt_count=attempt_count+1, updated_at=?
       WHERE id=? AND state='queued'`)
-      .run(REDISTRIBUTABLE, device.id, leaseToken, expiresAt, device.printer_name || null, now, job.id);
+      .run(REDISTRIBUTABLE, device.id, leaseToken, expiresAt, now, job.id);
     if (upd.changes !== 1) return null;   // 同時実行で他に取られた
     return {
       id: job.id,
@@ -156,8 +234,9 @@ export function leaseNextJob(device, { now = utcNow(), leaseSec = LEASE_SEC } = 
       neSlipNo: job.ne_slip_no,
       folderName: job.folder_name,
       pdfSha256: job.pdf_sha256,
-      // プリンター名は**サーバが決める**。エージェントは指示された名前にだけ出す
-      printerName: device.printer_name || null,
+      slug: job.slug,
+      // プリンター名は**サーバが引当分類から決めた**もの。エージェントはこの名前にだけ出す
+      printerName: job.printer_name,
       attempt: job.attempt_count + 1,
       leaseExpiresAt: expiresAt,
     };

@@ -392,6 +392,42 @@ async function cutPage(srcBuffer, pageIndex, filename) {
   return { token, file: filename, sha256: sha256(Buffer.from(bytes)) };
 }
 
+/**
+ * 出荷フォルダの引当分類 (= 送り状発行ソフトの振り分けキー) を読む。
+ *
+ * どのフォルダにも `okurijo_<slug>_<日時>.csv` が1本だけ置かれる (引当ツールの出力)。
+ * この slug が「どのソフトで送り状を出したか」= どのプリンターに出すか の決め手になる。
+ * 正本 = AI_reference ロジザード作業自動化/hikiate-patterns.csv の「送り状発行ソフト」列。
+ *
+ * 🚨 複数 slug が同居していたら null を返す (どちらの送り状か決められないものを刷らない)。
+ * @returns {Promise<string|null>} 'aes' | 'nekoposu' | '50size' | ... / 判別できなければ null
+ */
+export async function detectOkurijoSlug(folderName) {
+  try {
+    const folders = (await getShippingFolders()).filter((f) => f.name === folderName);
+    if (folders.length !== 1) return null;
+    const listed = await driveCall(() => listDriveFilesAcross({ folders, nameContains: 'okurijo_' }));
+    const slugs = new Set();
+    const unparsed = [];
+    for (const f of listed) {
+      const name = f.filename || '';
+      if (!/^okurijo_/i.test(name)) continue;
+      const m = /^okurijo_([A-Za-z0-9]+)_\d+\.csv$/i.exec(name);
+      if (m) slugs.add(m[1].toLowerCase());
+      else unparsed.push(name);   // 命名ゆれを黙って無視すると別の分類の送り状を刷りかねない
+    }
+    if (slugs.size !== 1 || unparsed.length > 0) {
+      console.warn(`[packing-reprint] ${folderName}: 引当分類を特定できません `
+        + `(検出=${[...slugs].join(',') || 'なし'}${unparsed.length ? ` / 読めないファイル=${unparsed.join(',')}` : ''})`);
+      return null;
+    }
+    return [...slugs][0];
+  } catch (e) {
+    console.warn(`[packing-reprint] ${folderName}: 引当分類の読み取り失敗: ${e.message}`);
+    return null;
+  }
+}
+
 /** 古い抜き出しPDFの掃除 (7日超)。ポーラーから呼ばれる (fail-soft)。 */
 export function cleanupReprintPdfs(maxAgeDays = 7) {
   try {
