@@ -261,8 +261,8 @@ router.get('/api/mf/transactions', async (req, res) => {
           attached: expense.filter(r => r.vouchers > 0).length,
           // 受け箱に証憑が来ていて、MFで「登録」すれば貼れる明細
           ready: a.rows.filter(r => r.status === 'none' && r.inbox && !r.inbox.candidate && r.inbox.status !== 'attached').length,
-          // 支出でまだ証憑が無い (受け箱にも無い) 明細 = 取りに行く対象
-          missing: expense.filter(r => !r.vouchers && !r.inbox).length,
+          // 支出でまだ証憑が無い (受け箱にも無い) 明細 = 取りに行く対象。MFが証憑を自動取得するサービスは除く
+          missing: a.auto_voucher ? 0 : expense.filter(r => !r.vouchers && !r.inbox).length,
         },
       };
     }).sort((x, y) => y.counts.unregistered - x.counts.unregistered || y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
