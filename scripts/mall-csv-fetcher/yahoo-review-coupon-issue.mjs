@@ -182,6 +182,7 @@ async function verifyForm(page, { period, operationId, invariants }) {
       StartHour: v('StartHour'), EndHour: v('EndHour'),
       DiscountType: checked('DiscountType'), DiscountRatio: v('DiscountRatio'), DiscountPrice: v('DiscountPrice'),
       ItemDesignation: checked('ItemDesignation'), DispFlg: checked('DispFlg'), OrderType: checked('OrderType'),
+      Combine: checked('Combine'), nDayFlg: checked('nDayFlg'),   // 不変条件の比較対象 (Codex Y-C3 R2 High: 読み戻し漏れ)
     };
   });
   const diffs = [];
@@ -252,16 +253,18 @@ async function clickIssue(page) {
 async function main() {
   await mkdir(OUT_DIR, { recursive: true });
   const runLog = initRunLog('yahoo-review-coupon');
-  const db = new Database(join(DATA_DIR, 'warehouse.db'));
+  // dry-run は本番 DB を一切変更しない (readonly = DDL も走らない — Codex Y-C3 R2 High)
+  const db = new Database(join(DATA_DIR, 'warehouse.db'), LIVE ? {} : { readonly: true });
   db.pragma('busy_timeout = 10000');
-  ensureYahooCouponLedger(db);
+  if (LIVE) ensureYahooCouponLedger(db);
+  const hasLedger = !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='yahoo_campaign_coupons'`).get();
 
-  const escalated = escalateStale(db, { nowIso: nowIso() });
+  const escalated = LIVE && hasLedger ? escalateStale(db, { nowIso: nowIso() }) : [];
   if (escalated.length) {
     await sendGChat(`🔴 *Yahooレビュークーポン: 人手確認が必要* (${escalated.join(', ')})\n24時間 reconcile できていません。ストクリのクーポン一覧を確認し、台帳 yahoo_campaign_coupons を手で直してください。`, 'yahoo-review-coupon');
   }
 
-  let row = getCouponRow(db, MONTH);
+  let row = hasLedger ? getCouponRow(db, MONTH) : null;
   console.log(`=== Yahooレビュークーポン ${MONTH} (${LIVE ? '★LIVE' : 'dry-run'}${RECONCILE_ONLY ? ' / 照合のみ' : ''}) ===`);
   console.log(`台帳: ${row ? `${row.status} (op=${row.operation_id}${row.coupon_id ? `, id=${row.coupon_id}` : ''})` : '未作成'}`);
 
@@ -329,9 +332,11 @@ async function main() {
     }
 
     // ── ここから作成 (planned のときだけ) ──
-    const sourceId = (rows.find((r) => r.couponId === (getCouponRow(db, MONTH)?.coupon_id))?.couponId)
-      || (db.prepare(`SELECT coupon_id FROM yahoo_campaign_coupons WHERE status = 'issued' AND coupon_id IS NOT NULL ORDER BY month DESC LIMIT 1`).get()?.coupon_id)
-      || SOURCE_ID;
+    const lastIssued = hasLedger
+      ? db.prepare(`SELECT coupon_id FROM yahoo_campaign_coupons WHERE status = 'issued' AND coupon_id IS NOT NULL ORDER BY month DESC LIMIT 1`).get()?.coupon_id
+      : null;
+    // 直近の自作クーポン → 無ければ vendor のクーポン (env)。どちらも一覧に居ることを後で確認する
+    const sourceId = (lastIssued && rows.some((r) => r.couponId === lastIssued)) ? lastIssued : SOURCE_ID;
     if (!sourceId) throw new Error('コピー元のクーポンIDが分からない (env YAHOO_REVIEW_COUPON_SOURCE_ID に vendor の月次クーポンIDを設定)');
     if (!rows.some((r) => r.couponId === sourceId)) throw new Error(`コピー元 ${sourceId} が一覧に無い (削除された?)`);
     const sourceRow = rows.find((r) => r.couponId === sourceId);
