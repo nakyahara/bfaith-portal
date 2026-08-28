@@ -30,7 +30,7 @@ import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
-  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM,
+  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO, EXPECTED_FORM, FORM_HOUR_START, FORM_HOUR_END,
 } from '../../apps/warehouse/yahoo-review-coupon-lib.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -203,8 +203,9 @@ async function applyPlan(page, { period, operationId }) {
   await setField(page, 'publish_end_date', period.endYmd);
   await setField(page, 'start_date', period.startYmd);
   await setField(page, 'end_date', period.endYmd);
-  for (const [n, v] of [['PublishStartHour', period.startHour], ['PublishEndHour', period.endHour], ['StartHour', period.startHour], ['EndHour', period.endHour]]) {
-    await page.selectOption(`select[name="${n}"]`, v).catch(() => {});
+  // 時刻セレクトは HHMMSS 形式 (実測 '000000'/'230000')。台帳の '00'/'23' 表記とは別物
+  for (const [n, v] of [['PublishStartHour', FORM_HOUR_START], ['PublishEndHour', FORM_HOUR_END], ['StartHour', FORM_HOUR_START], ['EndHour', FORM_HOUR_END]]) {
+    await page.selectOption(`select[name="${n}"]`, v);
   }
 }
 
@@ -229,8 +230,8 @@ async function verifyForm(page, { period, operationId, invariants }) {
     Title: COUPON_TITLE, Description: couponDescription(operationId),
     publish_start_date: period.startYmd, publish_end_date: period.endYmd,
     start_date: period.startYmd, end_date: period.endYmd,
-    PublishStartHour: period.startHour, PublishEndHour: period.endHour,
-    StartHour: period.startHour, EndHour: period.endHour,
+    PublishStartHour: FORM_HOUR_START, PublishEndHour: FORM_HOUR_END,
+    StartHour: FORM_HOUR_START, EndHour: FORM_HOUR_END,
   };
   for (const [k, w] of Object.entries(want)) if (got[k] !== w) diffs.push(`${k}: 期待"${w}" 実際"${got[k]}"`);
   // コピー元から引き継いだ設定 (割引種別・率・公開範囲・対象商品・併用可否) が編集で変わっていないこと。

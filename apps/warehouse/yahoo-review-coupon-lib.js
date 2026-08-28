@@ -18,8 +18,11 @@
 
 export const COUPON_DISCOUNT_RATIO = 5;          // 定率 5% (vendor 現行と同じ)
 export const COUPON_TITLE = '雑貨イズムYahoo!ショッピング店で次回購入に使える5％割引クーポン'; // vendor の実タイトルと完全一致 (％は全角)
-export const COUPON_START_HOUR = '00';
+export const COUPON_START_HOUR = '00';   // 台帳表記 (YYYY/MM/DD HH:00)
 export const COUPON_END_HOUR = '23';
+// 発行フォームの時刻セレクトは HHMMSS 形式 (2026-08-28 実測: '000000' / '230000')
+export const FORM_HOUR_START = '000000';
+export const FORM_HOUR_END = '230000';
 export const OP_ID_PREFIX = 'RVW';
 // コピー元クーポンに要求する条件 (一覧の hidden input。実測 2026-08-27: vendor の月次クーポン)
 export const SOURCE_DISCOUNT_TYPE = '2';   // 2 = 定率割引
