@@ -174,15 +174,29 @@ console.log('\n── ne_code の表記ゆれは m_products の正本表記に�
     'ne0006', 'mirror には正本表記で入る');
 }
 
-console.log('\n── source が 0 件なら送らず失敗させる (map 全消しの事故を ok で流さない) ──');
+console.log('\n── 同期実績があるのに 0 件になったら失敗させる (map 消失の事故を ok で流さない) ──');
 {
   const db6 = senderConn();
   db6.prepare('DELETE FROM f_yahoo_sku_map').run();
   db6.close();
   const r = await runSender(['--entity', 'yahoo_sku_map']);
   eq(r.code, 1, 'exit 1');
-  ok(r.out.includes('0件のため送信しない'), '理由がログに出る');
+  ok(r.out.includes('0 件になりました'), '前回件数つきで理由がログに出る');
   eq(yahooKeys().length, 3, 'mirror は無傷');
+}
+
+console.log('\n── 一度も同期していない & 0 件は「未登録」として skip (毎日赤くしない) ──');
+{
+  // au PAY 側の map を空にして、同期実績も無い状態を作る (= 手動 map 未登録の実際の状態)
+  const db7 = senderConn();
+  db7.prepare('DELETE FROM f_aupay_sku_map').run();
+  db7.prepare("DELETE FROM sync_runs WHERE entity = 'aupay_sku_map'").run();
+  db7.close();
+  const r = await runSender(['--entity', 'aupay_sku_map']);
+  eq(r.code, 0, '★exit 0 (未登録は事故ではない)');
+  ok(r.out.includes('未登録'), 'ログに「未登録」と出る');
+  ok(r.out.includes('skip'), 'skip したと分かる');
+  eq(mirrorDb.prepare('SELECT COUNT(*) n FROM mirror_aupay_sku_map').get().n, 1, 'mirror は前回のまま (消さない)');
 }
 
 server.close();

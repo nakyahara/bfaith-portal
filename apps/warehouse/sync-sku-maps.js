@@ -189,7 +189,16 @@ async function syncEntity(entity) {
   // 0件は送らない。受け側も empty_snapshot_rejected で弾くが、こちら側でも失敗として見せる
   // (手動 map が全部消えている = 引き当てが静かに壊れている状態なので ok で流さない)
   if (rows.length === 0) {
-    console.error('  ✗ 0件のため送信しない (map が空 = 引き当てが壊れている可能性)。意図的に空にした場合は手動で対応してください');
+    // 「まだ一度も同期していない & 0件」= 手動 map が未登録なだけ (2026-08-28 時点の実際の状態)。
+    // これを毎日 fail にすると daily-sync が恒常的に赤くなり、本物の失敗が埋もれる。
+    // 一方「前回は同期できていたのに 0 件」は map 消失の事故なので必ず fail にする。
+    if (!lastApplied) {
+      console.warn('  ⏭ 0件 (手動 map が未登録)。まだ一度も同期していないので「未登録」として skip します');
+      console.warn('     ※登録したら次の daily-sync から自動で mirror に載ります');
+      return { entity: entity.name, ok: true, skipped: true, rows: 0 };
+    }
+    console.error(`  ✗ 前回は ${lastApplied.row_count_received} 件同期できていたのに 0 件になりました。`
+      + ' map 消失の可能性があるため送信しません (mirror は前回の内容のまま維持されます)');
     return { entity: entity.name, ok: false, error: 'empty_source' };
   }
   if (rows.length > MAX_ROWS) {
@@ -337,5 +346,7 @@ for (const entity of targetEntities) {
 }
 
 const failed = outcomes.filter(o => !o.ok);
-console.log(`\n=== summary: ${outcomes.length - failed.length}/${outcomes.length} entities OK ===`);
+const skipped = outcomes.filter((o) => o.skipped);
+console.log(`\n=== summary: ${outcomes.length - failed.length}/${outcomes.length} entities OK`
+  + `${skipped.length ? ` (うち ${skipped.length} 件は map 未登録で skip: ${skipped.map((o) => o.entity).join(', ')})` : ''} ===`);
 process.exitCode = failed.length > 0 ? 1 : 0;
