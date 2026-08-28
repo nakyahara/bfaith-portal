@@ -201,9 +201,12 @@ export const JOBS_REGISTRY = [
     importance: 'P2',
     owner: '中原さん',
     purpose: 'Yahoo!ショッピング レビュー フォロー/クーポンメールの正午送信 (らくらくフォロー置換 PR-Y-C5)。'
-      + '月次5%クーポンの発行 (cutover 前 = shadow のうちは丸ごとスキップ。台帳が issued ならブラウザを起動せず終了) → '+ '当日12:00予定の action を ready 昇格 (plan) → '
-      + 'at-most-once の Gmail 送信 (send)。cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)。'
-      + '楽天版 (12:05) と 15 分ずらしてある = warehouse.db を同時に書かせないため',
+      + '当日12:00予定の action を ready 昇格 (plan) → at-most-once の Gmail 送信 (send)。'
+      + 'cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)。'
+      + '楽天版 (12:05) と 15 分ずらしてある = warehouse.db を同時に書かせないため。'
+      + '⭐SYSTEM 実行なので Playwright を絶対に呼ばない (永続プロファイルを SYSTEM で開くと '
+      + 'Yahoo ストアのセッションが壊れる — 2026-08-28 の事故)。月次クーポンの発行は '
+      + '別ジョブ yahoo-review-coupon-issue (bfaith 実行) が担当',
     where: 'miniPC TaskScheduler [YahooReviewMailSend] (scripts/mall-csv-fetcher/run-yahoo-review-send.ps1)',
     schedule: '毎日 12:20',
     anchor_hour_jst: 12,
@@ -211,10 +214,42 @@ export const JOBS_REGISTRY = [
     grace_hours: 3, // 15:20 までに ok が無ければ締切超過 (フォローは発送+21日の期限があるため翌日には気づきたい)
     lifecycle: 'permanent',
     runbook: 'AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』§Y-C5。'
-      + '手動再実行 (送信だけやり直す場合): DATA_DIR を設定して '+ 'node apps/warehouse/plan-rakuten-review-campaigns.js plan --mall yahoo (当日12:00予定を ready 昇格) → '+ 'node apps/warehouse/send-yahoo-review-mails.js send --limit N。'+ '送らずに状況だけ見るなら send-yahoo-review-mails.js plan。'+ 'クーポン発行まで含めてジョブ全体をやり直すなら ps1 をそのまま実行する (coupon → plan → send)。'
+      + '手動再実行: DATA_DIR を設定して '
+      + 'node apps/warehouse/plan-rakuten-review-campaigns.js plan --mall yahoo (当日12:00予定を ready 昇格) → '
+      + 'node apps/warehouse/send-yahoo-review-mails.js send --limit N。'
+      + '送らずに状況だけ見るなら send-yahoo-review-mails.js plan。'
       + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決。'
-      + '「FROM_NOT_VERIFIED / FROM_VERIFY_STALE」で 0 件なら send-yahoo-review-mails.js verify-from --to <社内アドレス> を実行 (90日ごと)。'
-      + 'クーポンが reconcile_required で止まったら --reconcile-only で照合し、未作成を確認してから台帳の行を消して再実行',
+      + '「FROM_NOT_VERIFIED / FROM_VERIFY_STALE」で 0 件なら send-yahoo-review-mails.js verify-from --to <社内アドレス> を実行 (90日ごと)',
+  },
+  {
+    id: 'yahoo-review-coupon-issue',
+    type: 'scheduled_job',
+    // P2 = 締切超過を即時通知する。grace 2h (12:10) と対で「12:20 の送信より前に気づく」ため。
+    // P3 (毎朝のサマリのみ) だと猶予を縮めても送信前には届かない (Codex Y-C5 R4 Medium)
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Yahoo レビューお礼メールに載せる月次5%クーポンの発行 (らくらくフォロー置換 PR-Y-C5)。'
+      + '台帳 yahoo_campaign_coupons が当月分を issued で持っていればブラウザを起動せず終了 (毎日の実費は SQLite 1読み)。'
+      + 'cutover 前 = shadow のうちは丸ごとスキップ (誰にも配らないクーポンをストアに残さない)。'
+      + '⭐**bfaith (Interactive) 実行**: Playwright の永続プロファイルは Windows ユーザーに紐づいて暗号化されており、'
+      + 'SYSTEM で開くと Yahoo ストアのセッションが壊れて現地での 2FA 再ログインが必要になる (2026-08-28 の事故)。'
+      + '10:10 なのは同じプロファイルを使う MallCsvFetchAll (05:30) / YahooCouponRotate (09:30) と重ねないため',
+    where: 'miniPC TaskScheduler [YahooReviewCouponIssue] (scripts/mall-csv-fetcher/run-yahoo-review-coupon.ps1、bfaith Interactive = ログオン中のみ)',
+    schedule: '毎日 10:10',
+    anchor_hour_jst: 10,
+    anchor_minute_jst: 10,
+    // 12:20 の送信より前 (12:10) に気づけるよう猶予は 2 時間。
+    // 通常月は Yahoo のクーポンが月初〜翌月末で 2 か月ぶん重なり、送信側が「今使える発行済みクーポン」に
+    // フォールバックするので落ちても影響は無いが、**初回 cutover 月・前月分が無い月**は
+    // その日のクーポンメールが丸ごと skip されるため、送信前に気づきたい (Codex Y-C5 R3 Medium)
+    grace_hours: 2,
+    lifecycle: 'permanent',
+    runbook: 'AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』§Y-C3/C5。'
+      + '手動実行: DATA_DIR/WAREHOUSE_DATA_DIR と HEADLESS=1 を設定して '
+      + 'node scripts/mall-csv-fetcher/yahoo-review-coupon-issue.mjs --month YYYY-MM [--live] (--live 無しは完全非破壊の dry-run)。'
+      + '2FA_REQUIRED で失敗したら miniPC の画面で デスクトップの Yahoo-Relogin.bat (確認コードはメール)。'
+      + 'reconcile_required で止まったら --reconcile-only で照合し、未作成を確認してから台帳の行を消して再実行 '
+      + '(作成は絶対に自動再試行しない = 二重発行より未発行を選ぶ)',
   },
   {
     id: 'warehouse-daily-sync',
