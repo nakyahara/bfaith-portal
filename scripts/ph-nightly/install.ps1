@@ -36,19 +36,29 @@ function Invoke-Icacls([string[]]$argv) {
   & icacls.exe @argv | Out-Null
   if ($LASTEXITCODE -ne 0) { throw ("icacls failed (exit " + $LASTEXITCODE + "): icacls " + ($argv -join ' ')) }
 }
+# Rights to deny = the specific write/delete/ACL rights ONLY. Never use the generic 'W': it expands to
+# FILE_GENERIC_WRITE which includes SYNCHRONIZE, and denying SYNCHRONIZE blocks ordinary read opens too
+# (found on the miniPC: powershell -File bin\run-ph-generate.ps1 -> access denied, and Claude Code could not
+# have read settings.json). WD=write data/add file, AD=append/add subdir, WEA/WA=write attributes,
+# D=delete, DC=delete child, WDAC=write DACL, WO=write owner.
+$DenyRights = 'WD,AD,WEA,WA,D,DC,WDAC,WO'
 function Unprotect([string]$p) { if (Test-Path $p) { Invoke-Icacls @($p, '/remove:d', $Me) } }
 function Protect([string]$p, [bool]$isDir) {
-  if ($isDir) { Invoke-Icacls @($p, '/deny', ($Me + ':(OI)(CI)(W,D,DC,WDAC,WO)')) }
-  else        { Invoke-Icacls @($p, '/deny', ($Me + ':(W,D,DC,WDAC,WO)')) }
+  if ($isDir) { Invoke-Icacls @($p, '/deny', ($Me + ':(OI)(CI)(' + $DenyRights + ')')) }
+  else        { Invoke-Icacls @($p, '/deny', ($Me + ':(' + $DenyRights + ')')) }
 }
-# Verify one ACE: our user, DENY, the five rights, and (OI)(CI) on directories (Codex R4 medium 2)
+# Verify one ACE: our user, DENY, the write/delete/ACL rights, and (OI)(CI) on directories (Codex R4 medium 2).
+# Also verify the file is still READABLE (the whole point of using specific rights).
 function Assert-Denied([string]$p, [bool]$isDir) {
   $lines = & icacls.exe $p
   if ($LASTEXITCODE -ne 0) { throw "icacls query failed on $p" }
   $inh = ''
   if ($isDir) { $inh = '\(OI\)\(CI\)' }
-  $re = [regex]::Escape($Me) + ':' + $inh + '(\(I\))?\(DENY\)\((?=[^)]*\bW\b)(?=[^)]*\bD\b)(?=[^)]*\bDC\b)(?=[^)]*\bWDAC\b)(?=[^)]*\bWO\b)[^)]*\)'
+  $re = [regex]::Escape($Me) + ':' + $inh + '(\(I\))?\(DENY\)\((?=[^)]*\bWD\b)(?=[^)]*\bAD\b)(?=[^)]*\bD\b)(?=[^)]*\bDC\b)(?=[^)]*\bWDAC\b)(?=[^)]*\bWO\b)[^)]*\)'
   if (-not (($lines -join "`n") -match $re)) { throw "deny ACE missing or incomplete on $p" }
+  if (-not $isDir) {
+    try { [IO.File]::ReadAllBytes($p) | Out-Null } catch { throw "protected file is not readable (deny too broad?): $p" }
+  }
 }
 
 # All protected targets are registered BEFORE any deny is lifted, and the finally re-protects each one
