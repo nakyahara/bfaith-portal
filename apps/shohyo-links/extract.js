@@ -114,7 +114,7 @@ export function normalizeAiResult(j) {
   return out;
 }
 
-export async function extractByAi({ text = '', imageBuffer = null, mime = '', env = process.env, fetchImpl = fetch }) {
+export async function extractByAi({ text = '', imageBuffer = null, pdfBuffer = null, mime = '', fileName = 'voucher.pdf', env = process.env, fetchImpl = fetch }) {
   const apiKey = env.OPENAI_API_KEY;
   if (!apiKey) return null;
   const model = env.SHOHYO_EXTRACT_MODEL || DEFAULT_MODEL;
@@ -123,6 +123,12 @@ export async function extractByAi({ text = '', imageBuffer = null, mime = '', en
     userContent = [
       { type: 'text', text: 'この領収書の画像から3項目を読み取ってください。' },
       { type: 'image_url', image_url: { url: `data:${mime || 'image/jpeg'};base64,${imageBuffer.toString('base64')}` } },
+    ];
+  } else if (pdfBuffer) {
+    // 文字が埋め込まれていない (スキャン画像型) PDF は、PDFファイルそのものを渡して読ませる
+    userContent = [
+      { type: 'text', text: 'この領収書のPDFから3項目を読み取ってください。' },
+      { type: 'file', file: { filename: fileName, file_data: `data:application/pdf;base64,${pdfBuffer.toString('base64')}` } },
     ];
   } else {
     userContent = `【領収書のテキスト】\n${String(text).slice(0, MAX_TEXT_CHARS)}`;
@@ -151,8 +157,11 @@ async function pdfText(buffer) {
  * @param {'pdf'|'jpg'|'png'} ext
  * @returns {{ doc_date, amount, vendor_name, source: 'rules'|'ai'|'rules+ai'|'none', text_chars, ai?: {confidence, model} }}
  */
-export async function extractVoucher(buffer, ext, { env = process.env, fetchImpl = fetch } = {}) {
-  const out = { doc_date: null, amount: null, vendor_name: null, source: 'none', text_chars: 0 };
+// これ未満の文字数しか取れないPDFは「文字が埋め込まれていない (スキャン画像型)」とみなし、PDFごとAIに渡す
+const PDF_TEXT_MIN = 40;
+
+export async function extractVoucher(buffer, ext, { env = process.env, fetchImpl = fetch, fileName = 'voucher.pdf' } = {}) {
+  const out = { doc_date: null, amount: null, vendor_name: null, source: 'none', text_chars: 0, notes: [] };
   let text = '';
   if (ext === 'pdf') {
     text = await pdfText(buffer);
@@ -160,13 +169,18 @@ export async function extractVoucher(buffer, ext, { env = process.env, fetchImpl
     const r = extractByRules(text);
     out.doc_date = r.doc_date; out.amount = r.amount;
     if (r.doc_date || r.amount) out.source = 'rules';
+    if (text.trim().length < PDF_TEXT_MIN) out.notes.push(`PDFに文字が埋め込まれていません (${text.trim().length}字)`);
+    else out.notes.push(`ルール: 日付=${r.how.date || '×'} 金額=${r.how.amount || '×'}`);
   }
-  // 支払先はルールでは取れないので、鍵があればAIに読ませる (画像は必ずAI)
+  // 支払先はルールでは取れないので、鍵があればAIに読ませる (画像・文字のないPDFは必ずAI)
   const needAi = !out.vendor_name || !out.amount || !out.doc_date;
+  if (needAi && !extractEnabled(env)) out.notes.push('AI読み取り未設定 (OPENAI_API_KEY)');
   if (needAi && extractEnabled(env)) {
     try {
       const ai = ext === 'pdf'
-        ? (text.trim() ? await extractByAi({ text, env, fetchImpl }) : null)
+        ? (text.trim().length >= PDF_TEXT_MIN
+          ? await extractByAi({ text, env, fetchImpl })
+          : await extractByAi({ pdfBuffer: buffer, fileName, env, fetchImpl }))
         : await extractByAi({ imageBuffer: buffer, mime: ext === 'png' ? 'image/png' : 'image/jpeg', env, fetchImpl });
       if (ai) {
         // ルールで取れた日付・金額はAIより優先 (決定的なので)。支払先はAIから
@@ -175,10 +189,12 @@ export async function extractVoucher(buffer, ext, { env = process.env, fetchImpl
         out.vendor_name = ai.vendor_name;
         out.ai = { confidence: ai.confidence, model: ai.model };
         out.source = out.source === 'rules' ? 'rules+ai' : 'ai';
+        out.notes.push(`AI(${ai.model}): 日付=${ai.doc_date || '×'} 金額=${ai.amount ?? '×'} 支払先=${ai.vendor_name || '×'}`);
       }
     } catch (e) {
       console.warn('[shohyo-extract] ai failed:', e.message);
       out.ai_error = String(e.message).slice(0, 200);
+      out.notes.push(`AI失敗: ${out.ai_error}`);
     }
   }
   return out;

@@ -53,6 +53,8 @@ check('テキストをAIに渡して JSON を受ける', ai.vendor_name === '郵
 ai = await extractByAi({ imageBuffer: Buffer.from([0xFF, 0xD8, 0xFF]), mime: 'image/jpeg', env, fetchImpl: fakeFetch });
 check('画像は data URL で渡す', Array.isArray(captured.messages[1].content) && captured.messages[1].content[1].image_url.url.startsWith('data:image/jpeg;base64,'));
 check('鍵が無ければ null (AIを呼ばない)', (await extractByAi({ text: 'x', env: {}, fetchImpl: fakeFetch })) === null);
+ai = await extractByAi({ pdfBuffer: Buffer.from('%PDF-1.4 scan'), fileName: 'doc (3).pdf', env, fetchImpl: fakeFetch });
+check('文字のないPDFは file として渡す', Array.isArray(captured.messages[1].content) && captured.messages[1].content[1].type === 'file' && captured.messages[1].content[1].file.file_data.startsWith('data:application/pdf;base64,') && captured.messages[1].content[1].file.filename === 'doc (3).pdf');
 const badFetch = async () => ({ ok: false, status: 429, json: async () => ({ error: { message: 'rate' } }) });
 let threw = false;
 try { await extractByAi({ text: 'x', env, fetchImpl: badFetch }); } catch (e) { threw = e.message.startsWith('openai_429'); }
@@ -62,7 +64,11 @@ check('APIエラーは openai_<status> で throw', threw);
 const img = await extractVoucher(Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), 'jpg', { env, fetchImpl: fakeFetch });
 check('画像は AI で読み source=ai', img.source === 'ai' && img.amount === 60000 && img.vendor_name === '郵便局のネットショップ');
 const noKey = await extractVoucher(Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), 'jpg', { env: {}, fetchImpl: fakeFetch });
-check('鍵なし画像は何も取れない (source=none)', noKey.source === 'none' && noKey.amount === null);
+check('鍵なし画像は何も取れない (source=none・理由が notes に残る)', noKey.source === 'none' && noKey.amount === null && noKey.notes.some(n => n.includes('OPENAI_API_KEY')));
+// 文字のないPDF (pdf-parse が読めない中身) → PDFごと AI へ
+captured = null;
+const scanPdf = await extractVoucher(Buffer.from('%PDF-1.4 scanned image only'), 'pdf', { env, fetchImpl: fakeFetch, fileName: 'doc (3).pdf' });
+check('文字のないPDFは PDFごと AI に渡して読む', scanPdf.source === 'ai' && scanPdf.amount === 60000 && captured?.messages[1].content[1].type === 'file' && scanPdf.notes.some(n => n.includes('埋め込まれていません')));
 const aiFail = await extractVoucher(Buffer.from([0xFF, 0xD8, 0xFF, 0xE0]), 'jpg', { env, fetchImpl: badFetch });
 check('AI失敗でも落ちない (ai_error を持つ)', aiFail.source === 'none' && aiFail.ai_error?.startsWith('openai_429'));
 

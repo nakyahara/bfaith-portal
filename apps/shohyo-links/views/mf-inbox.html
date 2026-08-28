@@ -189,7 +189,7 @@ function render() {
   $('rows').innerHTML = rows.map(r => `<tr>
     <td class="file"><a href="../api/inbox/${r.id}/file" target="_blank" rel="noopener">${esc(r.file_name)}</a><span class="src">${esc(r.source)} ／ ${esc((r.created_at || '').slice(0, 10))}</span></td>
     ${editing.has(r.id) ? editCells(r) : `<td>${esc(r.doc_date || '—')}</td><td class="amount">${r.amount != null ? Number(r.amount).toLocaleString() : '—'}</td><td>${esc(r.vendor_name || '—')}</td>`}
-    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}<div class="reason">${esc(r.error || r.match_reason || '')}</div></td>
+    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}<div class="reason">${esc(r.error || r.match_reason || '')}</div>${r.extract_note ? `<div class="reason" title="読み取りの経緯">📖 ${esc(r.extract_note)}</div>` : ''}</td>
     <td>${candCell(r)}</td>
     <td>${actions(r)}</td>
   </tr>`).join('');
