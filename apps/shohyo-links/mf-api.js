@@ -244,6 +244,45 @@ export function vendorKeys(name) {
   return [...keys];
 }
 
+/**
+ * 仕訳を表示・絞り込み用に要約する (スキーマ差異に耐えるベストエフォート)
+ * amount=借方合計 / accounts=勘定科目 / partners=取引先 / remarks=摘要
+ * 勘定科目を分けて返すのは、画面側で「証憑が要らない仕訳 (売上計上・棚卸など)」を
+ * 勘定科目チップで畳めるようにするため。
+ */
+export function journalDigest(j) {
+  const accounts = [];
+  const partners = [];
+  const remarks = [];
+  let amount = 0;
+  const push = (arr, v) => { if (typeof v === 'string' && v.trim() && !arr.includes(v)) arr.push(v); };
+  const side = (s) => {
+    if (!s || typeof s !== 'object') return;
+    push(accounts, s.account_name);
+    push(accounts, s.sub_account_name);
+    push(partners, s.trade_partner_name);
+  };
+  for (const b of Array.isArray(j.branches) ? j.branches : []) {
+    side(b.debitor);
+    side(b.creditor);
+    push(remarks, b.remark);
+    const v = Number(b.debitor?.value);
+    if (Number.isFinite(v)) amount += v;
+  }
+  if (!accounts.length && !partners.length) {
+    // branches が想定と違う形で来た場合の保険 (再帰でそれらしいキーを拾う)
+    const walk = (v) => {
+      if (Array.isArray(v)) return v.forEach(walk);
+      if (!v || typeof v !== 'object') return;
+      side(v);
+      if (!amount && typeof v.value === 'number') amount = v.value;
+      Object.values(v).forEach(w => { if (w && typeof w === 'object') walk(w); });
+    };
+    walk(j);
+  }
+  return { amount, accounts, partners, remarks };
+}
+
 /** 仕訳オブジェクトから突合対象の文字列 (摘要・取引先名・content等) を再帰収集 */
 export function journalTexts(journal) {
   const out = [];

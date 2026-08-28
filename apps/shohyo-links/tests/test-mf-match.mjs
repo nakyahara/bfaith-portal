@@ -8,7 +8,7 @@ import os from 'node:os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'shohyo-mf-test-'));
 
-const { normalizeText, vendorKeys, journalTexts, matchVendors, loadTokens, saveTokens, clearTokens } =
+const { normalizeText, vendorKeys, journalTexts, matchVendors, journalDigest, loadTokens, saveTokens, clearTokens } =
   await import('../mf-api.js');
 
 let failed = 0;
@@ -51,6 +51,23 @@ check('英字社名の部分一致', m2.length === 1 && m2[0].id === 3);
 check('一致なしは空配列', matchVendors({ memo: '西濃運輸' }, vendors).length === 0);
 
 // トークン保存
+// journalDigest (MF公式サンプルの branches 形状)
+const j2 = {
+  branches: [
+    { remark: '8月分', debitor: { value: 11000, account_name: '消耗品費', trade_partner_name: 'ラクスル株式会社' },
+      creditor: { value: 11000, account_name: '未払金', sub_account_name: 'UPSIDER' } },
+    { remark: '', debitor: { value: 3300, account_name: '消耗品費' },
+      creditor: { value: 3300, account_name: '未払金' } },
+  ],
+};
+const d2 = journalDigest(j2);
+check('借方の合計を金額にする', d2.amount === 14300);
+check('勘定科目を重複なく集める', d2.accounts.join('/') === '消耗品費/未払金/UPSIDER');
+check('取引先を分けて返す', d2.partners.join('/') === 'ラクスル株式会社');
+check('空の摘要は入れない', d2.remarks.join('/') === '8月分');
+const d3 = journalDigest({ memo: 'x', value: 500, account_name: '通信費' });
+check('branchesが無い形でも拾う (保険)', d3.accounts.includes('通信費') && d3.amount === 500);
+
 check('初期状態は未接続', loadTokens() === null);
 saveTokens({ access_token: 'a', refresh_token: 'r', expires_at: 123 });
 check('保存→復元', loadTokens()?.refresh_token === 'r');
