@@ -1,13 +1,7 @@
 <%- include('_header') %>
 <div class="wrap">
-  <% if (notionPending > 0) { %>
-    <div class="banner-warn">
-      ⚠️ Notion カード未作成のドラフトが <strong><%= notionPending %> 件</strong> あります
-      <button class="btn btn-sm" id="retry-all-btn">まとめて再作成</button>
-      <span class="muted" id="retry-all-result"></span>
-    </div>
-  <% } %>
-
+  <%# Notion カードはもう作らない運用 (2026-08-28 中原さん)。
+      「未作成 n件」バナーと「まとめて再作成」ボタンは出さない %>
   <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
     <a class="btn <%= !statusFilter ? 'btn-primary' : '' %>" href="/apps/product-hub/list">
       すべて (<%= Object.values(counts).reduce((a, b) => a + b, 0) %>)
@@ -198,7 +192,6 @@
             <th style="width:110px">ステータス</th>
             <th style="width:170px">工程 / 担当</th>
             <th style="width:90px">出自</th>
-            <th style="width:90px">Notion</th>
             <th style="width:150px">更新日時</th>
           </tr>
         </thead>
@@ -254,15 +247,6 @@
                   <span class="muted">アプリ</span>
                 <% } %>
               </td>
-              <td>
-                <% if (d.notion_card_status === 'created') { %>
-                  <span title="Notionカード作成済み">✅</span>
-                <% } else if (d.notion_card_status === 'failed') { %>
-                  <span title="作成失敗: <%= d.notion_card_error || '' %>">❌ 失敗</span>
-                <% } else { %>
-                  <span class="muted">⏳ 未作成</span>
-                <% } %>
-              </td>
               <td class="muted"><%= (d.updated_at || '').replace('T', ' ').slice(0, 16) %></td>
             </tr>
           <% } %>
@@ -273,25 +257,6 @@
 </div>
 
 <script>
-  const retryAllBtn = document.getElementById('retry-all-btn');
-  if (retryAllBtn) {
-    retryAllBtn.addEventListener('click', async () => {
-      retryAllBtn.disabled = true;
-      retryAllBtn.textContent = '作成中…';
-      try {
-        const res = await fetch('/apps/product-hub/api/notion-retry-all', { method: 'POST' });
-        const json = await res.json();
-        document.getElementById('retry-all-result').textContent =
-          json.ok ? '全件作成できました。再読み込みします…' : (json.tried + '件中 ' + json.failed + '件失敗 (詳細は各ドラフト参照)');
-        setTimeout(() => location.reload(), 1200);
-      } catch (e) {
-        document.getElementById('retry-all-result').textContent = '通信エラー: ' + e.message;
-        retryAllBtn.disabled = false;
-        retryAllBtn.textContent = 'まとめて再作成';
-      }
-    });
-  }
-
   // ─── NE取込の手動実行 (admin。cron を待たずシード/取込を回す) ───
   const intakeBtn = document.getElementById('intake-run-btn');
   if (intakeBtn) {

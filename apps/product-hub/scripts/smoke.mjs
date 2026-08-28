@@ -4487,6 +4487,7 @@ renders.push(
     board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
   }],
 );
+const renderedHtml = new Map();
 for (const [name, file, data] of renders) {
   try {
     // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態・自動追加バナー)
@@ -4516,9 +4517,47 @@ for (const [name, file, data] of renders) {
         ...data,
       });
     check(`render ${name}`, html.length > 500);
+    renderedHtml.set(name, html);
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
+}
+
+// ─── 画面から消した UI が戻ってこないこと (2026-08-28 中原さん指摘) ───
+{
+  // 参考URL: 「追加」ボタンは無い (入力したら反映されるので押す必要が無い)
+  const anyDetail = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('参考URL: 「追加」ボタンを出さない (入力欄だけ)',
+    anyDetail.includes('id="new-ref-url"') && !anyDetail.includes('id="add-ref-btn"'));
+  // Notionカード: 「⏳ 未作成」「再作成」は出さない
+  const noCard = renderedHtml.get('detail.ejs (child SKU + regroup button)') || '';
+  check('Notionカード: 未作成のとき何も出さない (⏳未作成・再作成ボタンなし)',
+    noCard.length > 500 && !noCard.includes('未作成') && !noCard.includes('notion-retry-btn')
+    && !noCard.includes('Notionカード:'),
+    noCard.includes('Notionカード:') ? 'Notionカード: が残っている' : '未作成/再作成が残っている');
+  // カードが作成済みの商品でも、Notion への導線は出さない (2026-08-28 中原さん)
+  const hasCard = renderedHtml.get('detail.ejs (created notion / non-own-brand)') || '';
+  check('Notionカード: 作成済みでも「Notionで開く」リンクを出さない',
+    hasCard.length > 500 && !hasCard.includes('Notionで開く') && !hasCard.includes('notion.so')
+    && !hasCard.includes('Notionカード'),
+    hasCard.includes('Notionで開く') ? 'リンクが残っている' : 'Notionカード の文言が残っている');
+  // 一覧も同じ表示 (Notion列の ⏳ 未作成) をやめる。列を消したのでヘッダごと無い
+  const list = renderedHtml.get('index.ejs (banner+rows+import panel)') || '';
+  check('一覧: Notion列 (⏳ 未作成) を出さない',
+    list.length > 500 && !list.includes('>Notion</th>') && !list.includes('⏳ 未作成'),
+    list.includes('>Notion</th>') ? 'Notion列が残っている' : '⏳ 未作成 が残っている');
+  // 「未作成 n件」バナーと「まとめて再作成」も出さない (fixture は notionPending: 1 で描いている)
+  check('一覧: Notionカード未作成バナー・まとめて再作成を出さない',
+    !list.includes('retry-all-btn') && !list.includes('まとめて再作成')
+    && !list.includes('カード未作成') && !list.includes('notion-retry-all'));
+  check('一覧: ヘッダとデータ行の列数が合っている (列削除で崩れていない)', (() => {
+    const head = (list.match(/<thead>[\s\S]*?<\/thead>/) || [''])[0];
+    const body = (list.match(/<tbody>[\s\S]*?<\/tbody>/) || [''])[0];
+    const th = (head.match(/<th[\s>]/g) || []).length;
+    const firstRow = (body.match(/<tr[^>]*>[\s\S]*?<\/tr>/) || [''])[0];
+    const td = (firstRow.match(/<td[\s>]/g) || []).length;
+    return th > 0 && th === td;
+  })());
 }
 
 // ─── EJS 内クライアントJSの構文チェック ───
