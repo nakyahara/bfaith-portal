@@ -48,6 +48,13 @@ const MONTH = getArg('--month') || jstMonth();
 
 if (!DATA_DIR) { console.error('FATAL: WAREHOUSE_DATA_DIR (or DATA_DIR) が必要'); process.exit(2); }
 
+// dry-run は台帳を一切更新しない (readonly 接続で例外になるのを防ぎ、「書かずに確認」を守る — Codex Y-C3 R3 High)。
+// 更新内容はログに出すので、何が起きるはずだったかは分かる
+function ledgerWrite(label, fn) {
+  if (!LIVE) { console.log(`  [dry-run] 台帳更新はしない (${label})`); return false; }
+  return fn();
+}
+
 function assertCouponUrl(url, label) {
   if (!/^https:\/\/pro\.store\.yahoo\.co\.jp\/pro\.[a-z0-9-]+\/coupon\//.test(String(url))) {
     throw new Error(`NAV: ${label} が想定外の URL (${url})`);
@@ -309,24 +316,24 @@ async function main() {
     if (found.length === 1) {
       const url = await readCouponUrl(page, found[0].couponId);
       if (isValidCouponUrl(url)) {
-        markIssued(db, { month: MONTH, couponId: found[0].couponId, couponUrl: url, nowIso: nowIso() });
-        console.log(`✅ 照合できたので issued: id=${found[0].couponId}`);
-        await sendGChat(`✅ *Yahooレビュークーポン ${MONTH} 発行済み* (定率${COUPON_DISCOUNT_RATIO}% / ${period.startYmd}〜${period.endYmd})`, 'yahoo-review-coupon');
+        ledgerWrite(`issued id=${found[0].couponId}`, () => markIssued(db, { month: MONTH, couponId: found[0].couponId, couponUrl: url, nowIso: nowIso() }));
+        console.log(`✅ 照合できた${LIVE ? 'ので issued' : ' (dry-run)'}: id=${found[0].couponId}`);
+        if (LIVE) await sendGChat(`✅ *Yahooレビュークーポン ${MONTH} 発行済み* (定率${COUPON_DISCOUNT_RATIO}% / ${period.startYmd}〜${period.endYmd})`, 'yahoo-review-coupon');
       } else {
-        markReconcileRequired(db, { month: MONTH, note: `獲得URLが読めない (${String(url).slice(0, 60)})`, nowIso: nowIso() });
+        ledgerWrite('reconcile_required (URL不明)', () => markReconcileRequired(db, { month: MONTH, note: `獲得URLが読めない (${String(url).slice(0, 60)})`, nowIso: nowIso() }));
         console.error('⚠ クーポンは存在するが獲得URLが読めない → reconcile_required');
         process.exitCode = 1;
       }
       db.close(); await context.close().catch(() => {}); return;
     }
     if (found.length > 1) {
-      markReconcileRequired(db, { month: MONTH, note: `同じ op-id のクーポンが ${found.length} 件`, nowIso: nowIso() });
+      ledgerWrite('reconcile_required (重複)', () => markReconcileRequired(db, { month: MONTH, note: `同じ op-id のクーポンが ${found.length} 件`, nowIso: nowIso() }));
       console.error(`⚠ 同じ op-id が ${found.length} 件 → reconcile_required (人が1本消す)`);
       db.close(); await context.close().catch(() => {}); process.exitCode = 1; return;
     }
     if (RECONCILE_ONLY || row.status === 'reconcile_required' || row.status === 'submitting') {
       // 作成は自動で再試行しない (二重発行より未発行を選ぶ)
-      markReconcileRequired(db, { month: MONTH, note: `一覧に op-id が見つからない (${row.status})`, nowIso: nowIso() });
+      ledgerWrite('reconcile_required (未検出)', () => markReconcileRequired(db, { month: MONTH, note: `一覧に op-id が見つからない (${row.status})`, nowIso: nowIso() }));
       console.error(`⚠ ${row.status} だが一覧に見つからない → 作成の再試行はしない。人が確認して台帳を直すか、別 op-id で作り直してください`);
       db.close(); await context.close().catch(() => {}); process.exitCode = 1; return;
     }
@@ -361,7 +368,7 @@ async function main() {
     try {
       await clickIssue(page);
     } catch (e) {
-      markReconcileRequired(db, { month: MONTH, note: `発行操作が不明 (${String(e.message).slice(0, 120)})`, nowIso: nowIso() });
+      markReconcileRequired(db, { month: MONTH, note: `発行操作が不明 (${String(e.message).slice(0, 120)})`, nowIso: nowIso() }); // ここは LIVE のみ到達
       throw e;
     }
     // ── 発行後の照合 (成否に関わらず一覧を取り直す) ──
