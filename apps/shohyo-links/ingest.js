@@ -5,8 +5,9 @@
  * 人が入れた値は上書きしない。読めなくても受け入れは成功する (人が「直す」で入れる)。
  */
 import { addToInbox, getInbox, updateInboxMeta, setExtractNote } from './inbox.js';
-import { parseVoucherFileName } from './matcher.js';
+import { parseVoucherFileName, resolveVendorId } from './matcher.js';
 import { extractVoucher } from './extract.js';
+import { listLinks } from './db.js';
 
 /** 中身を読んで、空の項目だけ埋める。読み取り結果 (applied=埋めた項目) を返す */
 export async function applyExtraction(row, buffer) {
@@ -16,6 +17,12 @@ export async function applyExtraction(row, buffer) {
     if (!row.doc_date && ex.doc_date) patch.doc_date = ex.doc_date;
     if (!row.amount && ex.amount) patch.amount = ex.amount;
     if (!row.vendor_id && !row.vendor_name && ex.vendor_name) patch.vendor_name = ex.vendor_name;
+    // 支払先名 (AI/ファイル名) をマスタに結びつける。マスタ名はカード明細の表記なので突合が強くなる
+    const nameForResolve = patch.vendor_name || row.vendor_name;
+    if (!row.vendor_id && nameForResolve) {
+      const vid = resolveVendorId(nameForResolve, listLinks());
+      if (vid) { patch.vendor_id = vid; ex.notes = [...(ex.notes || []), `マスタ#${vid} に結びつけ`]; }
+    }
     if (Object.keys(patch).length) updateInboxMeta(row.id, patch);
     setExtractNote(row.id, (ex.notes || []).join(' / '));
     console.log(`[shohyo-extract] inbox#${row.id} ${row.file_name}: ${(ex.notes || []).join(' / ')} → ${Object.keys(patch).join(',') || 'なし'}`);

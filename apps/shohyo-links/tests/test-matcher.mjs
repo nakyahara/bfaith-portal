@@ -7,7 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'shohyo-matcher-'));
-const { matchVoucher, matchBatch, parseVoucherFileName, isValidDate } = await import('../matcher.js');
+const { matchVoucher, matchBatch, parseVoucherFileName, isValidDate, resolveVendorId, isStrongKey } = await import('../matcher.js');
 const {
   addToInbox, listInbox, updateInboxMeta, setMatch, countByStatus, transactionOwners, autoAttachEnabled, setSetting,
   claimForAttach, releaseClaim, markAttached, markNeedsCheck, recoverStaleClaims, readFile, sniffKind, decodeBase64Strict, getInbox, setStatus,
@@ -50,6 +50,13 @@ m = matchVoucher({ vendor_name: 'CANVA', amount: 3760, doc_date: '2026-08-06' },
 check('vendor_name (5文字) は短いキー → weak (自動添付しない)', m.kind === 'unique' && m.strength === 'weak');
 m = matchVoucher({ vendor_name: 'LOGIMART', amount: 21092, doc_date: '2026-08-08' }, txs, vendors);
 check('vendor_name が英字だけで加盟店名のカタカナ部分を説明できない → weak (人が確認)', m.kind === 'unique' && m.strength === 'weak');
+check('strong key: 英数は6文字以上・カナ漢字は4文字以上', !isStrongKey('CANVA') && isStrongKey('LOGIMART') && isStrongKey('ロジマート') && !isStrongKey('ラク'));
+m = matchVoucher({ vendor_name: 'ロジマ－ト', amount: 21092, doc_date: '2026-08-08' }, txs, vendors);
+check('長音の表記ゆれ (ー/－) を吸収して一致', m.kind === 'unique' && m.candidates[0].vendor_hit !== null);
+check('AIの支払先名をマスタに結びつける (1件だけ一致)', resolveVendorId('ロジマート（大豊物流システム）', vendors) === 1 && resolveVendorId('ロジマート', vendors) === 1);
+check('複数に当たる/当たらない名前は結びつけない', resolveVendorId('株式会社', vendors) === null && resolveVendorId('日本郵便株式会社', vendors) === null);
+m = matchVoucher({ vendor_id: resolveVendorId('ロジマート', vendors), amount: 21092, doc_date: '2026-08-08' }, txs, vendors);
+check('マスタに結びつくと LOGIMART も説明できて strong', m.kind === 'unique' && m.strength === 'strong');
 m = matchVoucher({ vendor_name: 'ﾛｼﾞﾏｰﾄ（LOGIMART）', amount: 21092, doc_date: '2026-08-08' }, txs, vendors);
 check('vendor_name が加盟店名を丸ごと説明できる → strong', m.kind === 'unique' && m.strength === 'strong');
 m = matchVoucher({ vendor_id: 1, amount: 5000, doc_date: '2026-08-12' }, txs, vendors);
