@@ -20,6 +20,11 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
+// 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
+import {
+  validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
+  blockGenerationDraft, unblockGenerationDraft, generationQueueSummary,
+} from './db.js';
 import {
   listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
   listRoles, createRole, updateRole,
@@ -285,6 +290,7 @@ router.get('/detail/:id', (req, res) => {
     gate: gateReasons(db, draft),
     nextStatuses,
     statusLabels: STATUS_LABELS,
+    blockLabels: GENERATION_BLOCK_CODES,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
@@ -690,6 +696,10 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   const kind = String(req.body?.kind || '');
   if (!AI_OUTPUT_KINDS.includes(kind)) return res.status(400).json({ ok: false, error: 'invalid kind' });
   const content = cleanText(req.body?.content, 50000);
+  // 人の手直しにも同じ上限を掛ける (127字超を保存できると楽天出品時に落ちる)。
+  // 触っていない他の kind は検証しない — 既存の超過値が別欄の修正を塞がないように (Codex設計相談 high)
+  const v = validateAiOutputLength(kind, content);
+  if (!v.ok) return res.status(400).json({ ok: false, ...v });
   const db = getDB();
   db.prepare(`
     INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human)
@@ -698,6 +708,23 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   `).run(draft.id, kind, content);
   logEvent(db, draft.id, 'ai_output_edited', kind, actorOf(req));
   res.json({ ok: true });
+});
+
+// 「人の確認待ち」の解除 (2026-08-28)。解除 = AI の claim 対象に戻すだけで、自動では何もしない。
+// body: { clear: true, blocked_at?: string }  blocked_at は画面が見ていた値 (楽観ロック)
+router.post('/api/drafts/:id/generation-block', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.clear !== true) {
+    return res.status(400).json({ ok: false, error: '人が止めるのはこの画面からはできません (clear: true で解除のみ)' });
+  }
+  // blocked_at は必須: 省略できると楽観ロックを迂回して「別の理由で止め直された block」を消せてしまう (Codex R1 medium)
+  const blockedAt = cleanText(req.body?.blocked_at, 40);
+  if (!blockedAt) return res.status(400).json({ ok: false, error: 'blocked_at が必要です (画面を読み直してください)' });
+  const r = unblockGenerationDraft(getDB(), draft.id, { actor: actorOf(req), expectedBlockedAt: blockedAt });
+  if (r.result === 'not_blocked') return res.status(400).json({ ok: false, error: 'AI は止めていません (すでに解除済みです)' });
+  if (r.result === 'stale') return res.status(409).json({ ok: false, error: '別の理由で止め直されています。画面を読み直してください' });
+  res.json({ ok: true, unblocked: true });
 });
 
 // ─── API: Yahoo 向け追記項目 / 画像制作 (P1.5) ─────────────
@@ -2190,7 +2217,8 @@ serviceApiRouter.get('/generation-queue', (req, res) => {
   // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
   // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
   maybeBackfillDerivedStatus(db);
-  res.json({ ok: true, drafts: listGenerationQueue(db) });
+  // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
+  res.json({ ok: true, drafts: listGenerationQueue(db), queue: generationQueueSummary(db) });
 });
 
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
@@ -2248,7 +2276,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
       for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
-  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed, queue: generationQueueSummary(db) });
 });
 
 // claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)
@@ -2262,6 +2290,34 @@ serviceApiRouter.post('/drafts/:id/release', (req, res) => {
   const released = releaseGenerationClaim(db, id, runId);
   if (released) logEvent(db, id, 'generation_released', `${runId}: ${cleanText(req.body?.reason, 300) || '理由未記載'}`, 'service-api');
   res.json({ ok: true, released });
+});
+
+// 「人の確認待ち」にする (2026-08-28 夜間自動化)。release と違い、人が解除するまで claim 対象から外れる。
+// 仕様不一致 (draft は 50本・ページは 100本入り 等) は何度 claim しても生成できないので、
+// release で回すと毎晩同じ draft を掴んで捨てる無限ループになる — それを止めるための終端状態。
+// body: { run_id, code, reason }  code は GENERATION_BLOCK_CODES のキーのみ
+serviceApiRouter.post('/drafts/:id/generation-block', (req, res) => {
+  // parseInt は "123abc" を 123 と読む → 文字列全体が数字のときだけ受ける (Codex R1 low)
+  const id = /^[1-9]\d*$/.test(String(req.params.id)) ? Number(req.params.id) : NaN;
+  const runId = cleanText(req.body?.run_id, 100);
+  const code = cleanText(req.body?.code, 40);
+  if (!Number.isInteger(id) || !runId) {
+    return res.status(400).json({ ok: false, error: 'draft id と run_id が必要です' });
+  }
+  if (!code || !Object.hasOwn(GENERATION_BLOCK_CODES, code)) {
+    return res.status(400).json({ ok: false, error: `code は ${Object.keys(GENERATION_BLOCK_CODES).join(' / ')} のいずれかです` });
+  }
+  // reason は監査ログにも残るので、上限超過は黙って切り詰めずに拒否する (Codex R1 low)
+  const rawReason = req.body?.reason == null ? '' : String(req.body.reason).trim();
+  if (!rawReason) return res.status(400).json({ ok: false, error: 'reason (人向けの説明) が必要です' });
+  if ([...rawReason].length > GENERATION_BLOCK_REASON_MAX) {
+    return res.status(400).json({ ok: false, error: `reason は ${GENERATION_BLOCK_REASON_MAX} 文字までです` });
+  }
+  const reason = rawReason;
+  const r = blockGenerationDraft(getDB(), id, runId, { code, reason });
+  if (r.result === 'not_found') return res.status(404).json({ ok: false, error: 'draft not found' });
+  if (r.result === 'conflict') return res.status(409).json({ ok: false, error: r.error });
+  res.json({ ok: true, blocked: true, already: r.result === 'already' });
 });
 
 // AI 生成結果の一括書き戻し + status ready_for_ai → review
@@ -2291,6 +2347,10 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
   for (const [kind, content] of Object.entries(outputs)) {
     const c = cleanText(content, 50000);
     if (!c) return res.status(400).json({ ok: false, error: `outputs.${kind} が空です` });
+    // モールの文字数上限 (楽天127/Yahoo!65/キャッチ30) はサーバで担保する (2026-08-28)。
+    // 夜間の無人実行で lint が飛ばされても、長すぎる文章がレビュー列に入らない
+    const v = validateAiOutputLength(kind, c);
+    if (!v.ok) return res.status(400).json({ ok: false, ...v });
     cleaned[kind] = c;
   }
   if (Object.keys(cleaned).length === 0) {
