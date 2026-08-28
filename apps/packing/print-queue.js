@@ -328,18 +328,26 @@ export function markSubmitted(jobId, { deviceId, leaseToken, spoolJobId = null, 
  * - 失敗は leased / dispatched / submitted から受け付ける
  * 失敗しても**自動では積み直さない** — 同じ理由で失敗し続けて紙を無駄にするより人に知らせる。
  */
-export function markFinished(jobId, { deviceId, leaseToken, ok, error = null, now = utcNow() }) {
+export function markFinished(jobId, {
+  deviceId, leaseToken, ok, error = null, uncertain = false, now = utcNow(),
+}) {
   if (typeof ok !== 'boolean') return { ok: false, reason: 'bad_ok' };
+  // 🚨「刷れなかった」と「紙が出たか分からない」を混ぜてはいけない。
+  //   failed の通知は「フォルダから手動で印刷してください」と言うので、実は紙が出ていた
+  //   ケースをここに流すと、現場がもう1枚刷って**二重印刷**になる。
+  //   エージェントがスプーラーに渡した後に落ちた等、確信が持てない場合は uncertain=true で
+  //   報告させ、unknown (=「実物を確認してください・自動では刷り直していません」) にする。
+  const target = ok ? 'completed' : (uncertain ? 'unknown' : 'failed');
   const from = ok ? ["'submitted'"] : [`'${REDISTRIBUTABLE}'`, "'dispatched'", "'submitted'"];
   // lease_token は消さない — 再送を冪等に受けるための照合に要る (状態条件で遷移は止まる)
   const upd = getDB().prepare(`UPDATE pk_print_jobs SET state=?, error=?, finished_at=?, updated_at=?,
     lease_expires_at=NULL
     WHERE id=? AND state IN (${from.join(',')})
       AND lease_device_id=? AND lease_token=? AND lease_expires_at > ?`)
-    .run(ok ? 'completed' : 'failed', ok ? null : String(error || '').slice(0, 200) || '理由不明',
+    .run(target, ok ? null : String(error || '').slice(0, 200) || '理由不明',
       now, now, jobId, deviceId, leaseToken || '', now);
-  if (upd.changes === 1) return { ok: true };
-  if (alreadyIn(jobId, ok ? 'completed' : 'failed', deviceId, leaseToken)) return { ok: true, replayed: true };
+  if (upd.changes === 1) return { ok: true, state: target };
+  if (alreadyIn(jobId, target, deviceId, leaseToken)) return { ok: true, replayed: true, state: target };
   return { ok: false, reason: 'not_leased_or_wrong_state' };
 }
 

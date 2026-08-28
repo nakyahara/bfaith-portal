@@ -264,6 +264,9 @@ router.post('/print/:id(\\d+)/completed', requirePrintAgent, api(async (req, res
   const r = markFinished(Number(req.params.id), {
     deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
     ok: req.body.ok, error: req.body.error ?? null,
+    // uncertain = 「刷れなかった」と言い切れない (スプーラーに渡した後に落ちた等)。
+    // failed にすると通知が「手動で印刷してください」になり、実は出ていた紙と合わせて二重になる
+    uncertain: req.body.uncertain === true,
   });
   if (!r.ok) throw new PackError(409, 'not_leased', `報告を受け付けられません (${r.reason})`);
   // 印刷の成否は現場に見える形で伝える (出なかったことに誰も気づかない状態を作らない)。
