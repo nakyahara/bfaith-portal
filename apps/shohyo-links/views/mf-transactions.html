@@ -32,7 +32,7 @@
   .card .badge b { display: block; font-size: 16px; }
   .badge.need { background: #d9534f; }
   .badge.zero { background: #9aa3b2; }
-  .badge.auto { background: #3b8f5c; }
+  .autotag { display: inline-block; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; border-radius: 3px; padding: 0 6px; font-size: 10px; margin-left: 6px; vertical-align: middle; }
   .card .name { font-weight: 600; font-size: 14px; color: #2f3b5a; }
   .card .sub { color: #6b7280; font-size: 12px; margin-top: 2px; }
   .card .sub .un { color: #b45309; }
@@ -87,8 +87,6 @@
     対象月: <input type="month" id="month">
     <button class="btn primary" id="loadBtn">明細を取得</button>
     <span id="loadInfo" style="color:#6b7280"></span>
-    <span class="spacer"></span>
-    <label><input type="checkbox" id="showAuto"> 証憑自動取得のサービスも表示</label>
   </div>
 
   <div class="cards" id="cards"></div>
@@ -99,7 +97,12 @@
       <span id="panelNote"></span>
       <span class="spacer"></span>
       <input type="search" id="q" placeholder="摘要・支払い先で検索">
-      <label><input type="checkbox" id="onlyNeed" checked> 証憑が要る行だけ</label>
+      <select id="filter">
+        <option value="todo">未仕訳 + 証憑待ち</option>
+        <option value="none">未仕訳だけ</option>
+        <option value="need">証憑待ち（登録済・証憑なし）だけ</option>
+        <option value="all">全て</option>
+      </select>
     </div>
     <table>
       <thead>
@@ -192,20 +195,18 @@ async function load() {
 }
 
 function visibleAccounts() {
-  return data.accounts.filter(a => $('showAuto').checked || !a.auto_voucher);
+  return data.accounts.filter(a => a.counts.total > 0);
 }
 
 function renderCards() {
   $('cards').innerHTML = visibleAccounts().map(a => {
     const c = a.counts;
-    const badge = a.auto_voucher
-      ? `<div class="badge auto">自動<b>取得</b></div>`
-      : c.need_voucher ? `<div class="badge need">証憑待ち<b>${c.need_voucher}</b></div>` : `<div class="badge zero">証憑待ち<b>0</b></div>`;
+    const badge = `<div class="badge ${c.unregistered ? 'need' : 'zero'}">未仕訳<b>${c.unregistered}</b></div>`;
     return `<div class="card${a.id === current ? ' active' : ''}" data-acc="${esc(a.id)}">
       ${badge}
       <div>
-        <div class="name">${esc(a.name)}</div>
-        <div class="sub">明細 ${c.total}件${c.unregistered ? ` ／ <span class="un">未仕訳 ${c.unregistered}件</span>` : ''} ／ 添付済 ${c.attached}件</div>
+        <div class="name">${esc(a.name)}${a.auto_voucher ? '<span class="autotag" title="MFが明細と一緒に証憑を取得できるサービス (先方に領収書が上がっている場合)">証憑自動取得対応</span>' : ''}</div>
+        <div class="sub">明細 ${c.total}件 ／ <span class="un">証憑待ち ${c.need_voucher}件</span> ／ 添付済 ${c.attached}件</div>
       </div>
     </div>`;
   }).join('') || '<div class="empty">この期間に明細のある連携サービスがありません</div>';
@@ -221,16 +222,19 @@ function renderRows() {
   if (!a) return;
   $('panelTitle').textContent = a.name;
   $('panelNote').innerHTML = a.auto_voucher
-    ? '<span class="note">このサービスはMFが証憑を自動取得します。クリップが灰色の行だけ確認してください</span>'
+    ? '<span class="note">MFの証憑自動取得に対応しているサービスです（先方サイトに領収書が上がっていれば、明細と一緒にMFへ入ります）</span>'
     : '';
   const q = $('q').value.trim().toLowerCase();
+  const f = $('filter').value;
   const rows = a.rows.filter(r => {
-    if ($('onlyNeed').checked && !needsVoucher(r)) return false;
+    if (f === 'none' && r.status !== 'none') return false;
+    if (f === 'need' && !needsVoucher(r)) return false;
+    if (f === 'todo' && !(r.status === 'none' || needsVoucher(r))) return false;
     if (q && ![r.content, r.memo, ...r.vendors.map(v => v.name)].join(' ').toLowerCase().includes(q)) return false;
     return true;
   });
   $('empty').style.display = rows.length ? 'none' : 'block';
-  $('empty').textContent = a.rows.length ? '証憑が要る明細はありません 🎉' : 'この期間の明細はありません';
+  $('empty').textContent = a.rows.length ? '条件に合う明細はありません 🎉' : 'この期間の明細はありません';
   $('rows').innerHTML = rows.map(r => `<tr class="${r.vouchers ? 'done' : ''}">
     <td>${esc(r.date.slice(5).replace('-', '/'))}</td>
     <td class="amount ${r.side === 'EXPENSE' ? 'exp' : ''}">${r.side === 'EXPENSE' ? '-' : ''}${Number(r.value).toLocaleString()}</td>
@@ -299,8 +303,7 @@ $('filePicker').addEventListener('change', async () => {
 
 $('loadBtn').addEventListener('click', load);
 $('q').addEventListener('input', renderRows);
-$('onlyNeed').addEventListener('change', renderRows);
-$('showAuto').addEventListener('change', () => { renderCards(); renderRows(); });
+$('filter').addEventListener('change', renderRows);
 
 (function init() {
   const now = new Date();

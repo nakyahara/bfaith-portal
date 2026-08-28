@@ -242,7 +242,7 @@ router.get('/api/mf/transactions', async (req, res) => {
           attached: expense.filter(r => r.vouchers > 0).length,
         },
       };
-    }).sort((x, y) => y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
+    }).sort((x, y) => y.counts.unregistered - x.counts.unregistered || y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
     res.json({ ok: true, result: { accounts: result, total: txs.length, warning: accountsWarning } });
   } catch (e) {
     console.error('[shohyo-links] mf transactions', e.message, e.detail || '');
