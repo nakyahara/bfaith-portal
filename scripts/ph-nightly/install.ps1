@@ -9,6 +9,9 @@
 # with -Repo <worktree> the checkout is not deny-listed and the session could edit a runner there (Codex R4 high 2).
 # Skills are copied, not junctioned, for the same reason (R3 critical 1). Re-run this script after `git pull`.
 # Does NOT log in to Claude Code / Codex (interactive, once, by a person) and does NOT place the service token.
+#
+# PS 5.1 trap (found on the miniPC 2026-08-28): a helper named `Icacls` calling `& icacls` recurses into itself
+# (function names are case-insensitive and shadow executables) -> CallDepthOverflow. Always call icacls.exe.
 param(
   # Repo checkout to install FROM. Default = production clone. Pass a git worktree path to test an unmerged branch.
   [string]$Repo = 'C:\Users\bfaith\bfaith-portal'
@@ -29,18 +32,18 @@ if (-not (Test-Path (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1'))) { throw 
 # ACL helpers. Explicit deny ACEs on the running user beat any group allow. The task runs with RunLevel Limited,
 # so even though bfaith is an Administrator the session only has the filtered token and cannot take ownership /
 # rewrite ACLs without UAC (Codex R3 high 1). Claude Code's Write/Edit -> EACCES.
-function Icacls([string[]]$argv) {
-  & icacls @argv | Out-Null
+function Invoke-Icacls([string[]]$argv) {
+  & icacls.exe @argv | Out-Null
   if ($LASTEXITCODE -ne 0) { throw ("icacls failed (exit " + $LASTEXITCODE + "): icacls " + ($argv -join ' ')) }
 }
-function Unprotect([string]$p) { if (Test-Path $p) { Icacls @($p, '/remove:d', $Me) } }
+function Unprotect([string]$p) { if (Test-Path $p) { Invoke-Icacls @($p, '/remove:d', $Me) } }
 function Protect([string]$p, [bool]$isDir) {
-  if ($isDir) { Icacls @($p, '/deny', ($Me + ':(OI)(CI)(W,D,DC,WDAC,WO)')) }
-  else        { Icacls @($p, '/deny', ($Me + ':(W,D,DC,WDAC,WO)')) }
+  if ($isDir) { Invoke-Icacls @($p, '/deny', ($Me + ':(OI)(CI)(W,D,DC,WDAC,WO)')) }
+  else        { Invoke-Icacls @($p, '/deny', ($Me + ':(W,D,DC,WDAC,WO)')) }
 }
 # Verify one ACE: our user, DENY, the five rights, and (OI)(CI) on directories (Codex R4 medium 2)
 function Assert-Denied([string]$p, [bool]$isDir) {
-  $lines = & icacls $p
+  $lines = & icacls.exe $p
   if ($LASTEXITCODE -ne 0) { throw "icacls query failed on $p" }
   $inh = ''
   if ($isDir) { $inh = '\(OI\)\(CI\)' }
@@ -49,48 +52,53 @@ function Assert-Denied([string]$p, [bool]$isDir) {
 }
 
 # All protected targets are registered BEFORE any deny is lifted, and the finally re-protects each one
-# independently (Codex R4 high 1: a failure half-way must not leave code writable for the next night's run).
+# independently (Codex R4 high 1). The original error and any re-protect errors are reported together (R5 medium).
 $targets = @(
   @{ p = $Bin;                          d = $true  },
   @{ p = $Cfg;                          d = $true  },
   @{ p = (Join-Path $Work 'phq');       d = $false },
   @{ p = (Join-Path $Work 'phreview');  d = $false }
 )
+$updateError = $null
 $reprotectErrors = @()
 try {
-  New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, (Join-Path $Root 'logs') | Out-Null
-  New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.claude\secrets') | Out-Null
+  try {
+    New-Item -ItemType Directory -Force -Path $Bin, $Work, $Cfg, (Join-Path $Root 'logs') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.claude\secrets') | Out-Null
 
-  # 1) lift denies
-  foreach ($t in $targets) { Unprotect $t.p }
+    # 1) lift denies
+    foreach ($t in $targets) { Unprotect $t.p }
 
-  # 2) executable code + shims + settings (all as protected copies)
-  Copy-Item -Force (Join-Path $Src 'phq.mjs')              (Join-Path $Bin 'phq.mjs')
-  Copy-Item -Force (Join-Path $Src 'copy_lint.py')         (Join-Path $Bin 'copy_lint.py')   # canonical = AI_reference (miniPC has no G:)
-  Copy-Item -Force (Join-Path $Src 'run-ph-generate.ps1')  (Join-Path $Bin 'run-ph-generate.ps1')
-  Copy-Item -Force (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1') (Join-Path $Bin 'ping.ps1')
-  Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
-  Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
-  Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
-  foreach ($f in @('phq', 'phreview')) {
-    $bytes = [IO.File]::ReadAllBytes((Join-Path $Work $f))
-    if (@($bytes | Where-Object { $_ -eq 13 }).Count -gt 0) { throw "$f has CRLF line endings (bash shim needs LF; check .gitattributes)" }
-  }
-
-  # 3) skills: copy into the protected config dir. An old junction at the path is unlinked (link only).
-  $skills = Join-Path $Cfg 'skills'
-  if (Test-Path $skills) {
-    $item = Get-Item $skills -Force
-    if ($item.LinkType) {
-      cmd /c rmdir "$skills"
-      if ($LASTEXITCODE -ne 0) { throw "could not remove old junction $skills (exit $LASTEXITCODE)" }
-    } else {
-      Remove-Item -Recurse -Force $skills   # install-owned directory, only ever populated by this script
+    # 2) executable code + shims + settings (all as protected copies)
+    Copy-Item -Force (Join-Path $Src 'phq.mjs')              (Join-Path $Bin 'phq.mjs')
+    Copy-Item -Force (Join-Path $Src 'copy_lint.py')         (Join-Path $Bin 'copy_lint.py')   # canonical = AI_reference (miniPC has no G:)
+    Copy-Item -Force (Join-Path $Src 'run-ph-generate.ps1')  (Join-Path $Bin 'run-ph-generate.ps1')
+    Copy-Item -Force (Join-Path $Repo 'scripts\jobs-monitor\ping.ps1') (Join-Path $Bin 'ping.ps1')
+    Copy-Item -Force (Join-Path $Src 'phq')                  (Join-Path $Work 'phq')
+    Copy-Item -Force (Join-Path $Src 'phreview')             (Join-Path $Work 'phreview')
+    Copy-Item -Force (Join-Path $Src 'settings.json')        (Join-Path $Cfg 'settings.json')
+    foreach ($f in @('phq', 'phreview')) {
+      $bytes = [IO.File]::ReadAllBytes((Join-Path $Work $f))
+      if (@($bytes | Where-Object { $_ -eq 13 }).Count -gt 0) { throw "$f has CRLF line endings (bash shim needs LF; check .gitattributes)" }
     }
+
+    # 3) skills: copy into the protected config dir. An old junction at the path is unlinked (link only).
+    $skills = Join-Path $Cfg 'skills'
+    if (Test-Path $skills) {
+      $item = Get-Item $skills -Force
+      if ($item.LinkType) {
+        cmd /c rmdir "$skills"
+        if ($LASTEXITCODE -ne 0) { throw "could not remove old junction $skills (exit $LASTEXITCODE)" }
+      } else {
+        Remove-Item -Recurse -Force $skills   # install-owned directory, only ever populated by this script
+      }
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-generate') | Out-Null
+    Copy-Item -Force -Recurse (Join-Path $SkillsSrc '*') (Join-Path $skills 'ph-generate')
+    if (-not (Test-Path (Join-Path $skills 'ph-generate\SKILL.md'))) { throw "skill copy failed: $skills" }
+  } catch {
+    $updateError = $_.Exception.Message
   }
-  New-Item -ItemType Directory -Force -Path (Join-Path $skills 'ph-generate') | Out-Null
-  Copy-Item -Force -Recurse (Join-Path $SkillsSrc '*') (Join-Path $skills 'ph-generate')
-  if (-not (Test-Path (Join-Path $skills 'ph-generate\SKILL.md'))) { throw "skill copy failed: $skills" }
 } finally {
   # 4) re-apply write denies no matter what happened above; never stop at the first failure
   foreach ($t in $targets) {
@@ -99,7 +107,12 @@ try {
     }
   }
 }
-if ($reprotectErrors.Count -gt 0) { throw ($reprotectErrors -join "`n") }
+if ($updateError -or $reprotectErrors.Count -gt 0) {
+  $msg = @()
+  if ($updateError) { $msg += ("update failed: " + $updateError) }
+  $msg += $reprotectErrors
+  throw ($msg -join "`n")
+}
 foreach ($t in $targets) { Assert-Denied $t.p $t.d }
 Assert-Denied (Join-Path $Bin 'phq.mjs') $false                       # inheritance reached files under bin
 Assert-Denied (Join-Path $Bin 'run-ph-generate.ps1') $false
