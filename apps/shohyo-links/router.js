@@ -15,7 +15,7 @@ import {
 } from './mf-api.js';
 import {
   addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, setStatus,
-  listAttachLog, autoAttachEnabled, setSetting, decodeBase64Strict, INBOX_STATUSES, TX_ID_MAX, transactionOwners,
+  listAttachLog, autoAttachEnabled, setSetting, getSetting, decodeBase64Strict, INBOX_STATUSES, TX_ID_MAX, transactionOwners,
 } from './inbox.js';
 import { runInboxMatch, attachWithClaim } from './attach-job.js';
 import { parseVoucherFileName, isValidDate, matchVoucher } from './matcher.js';
@@ -224,7 +224,7 @@ router.get('/api/mf/transactions', async (req, res) => {
 
     const byAccount = new Map();
     for (const a of accounts) {
-      byAccount.set(a.id, { id: a.id, name: a.name, auto_voucher: isAutoVoucher(a.name), rows: [] });
+      byAccount.set(a.id, { id: a.id, name: a.name, auto_voucher: isAutoVoucher(a.name), mf_url: getSetting(mfUrlKey_(a.id), ''), rows: [] });
     }
     for (const t of txs) {
       if (!byAccount.has(t.connected_account_id)) {
@@ -483,6 +483,24 @@ function shiftDate_(ymd, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
+
+// MF「連携サービスから入力 (通帳・カード他)」の、カードで絞ったURLを連携サービスごとに覚える。
+// URL中の search_form[asset_acts][account_id_hash] はMF画面専用のハッシュで、APIの連携サービスIDから作れない。
+// なので人が1回だけ「MFでカードを選んで検索したURL」を貼る (2026-08-28 中原さん)
+const MF_TJ_PREFIX = 'https://accounting.moneyforward.com/transaction_journals';
+const mfUrlKey_ = (accountId) => `mf_url:${String(accountId).slice(0, 200)}`;
+
+router.post('/api/mf/accounts/:id/url', (req, res) => {
+  const accountId = String(req.params.id || '');
+  if (!accountId || accountId.length > 200) return res.status(400).json({ ok: false, error: 'bad_id' });
+  const url = String(req.body?.url || '').trim();
+  if (url === '') { setSetting(mfUrlKey_(accountId), ''); return res.json({ ok: true, result: { url: '' } }); }
+  if (!url.startsWith(MF_TJ_PREFIX) || url.length > 1000 || /[\s<>"']/.test(url)) {
+    return res.status(400).json({ ok: false, error: 'bad_url' });
+  }
+  setSetting(mfUrlKey_(accountId), url);
+  res.json({ ok: true, result: { url } });
+});
 
 // 証憑ファイルを仕訳に添付 (journal_id 無しならBoxへ未添付保存)
 router.post('/api/mf/attach', async (req, res) => {

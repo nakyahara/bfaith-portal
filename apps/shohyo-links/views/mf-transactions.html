@@ -247,9 +247,12 @@ function renderRows() {
   $('panel').style.display = a ? 'block' : 'none';
   if (!a) return;
   $('panelTitle').textContent = a.name;
-  $('panelNote').innerHTML = a.auto_voucher
-    ? '<span class="note">MFの証憑自動取得に対応しているサービスです（先方サイトに領収書が上がっていれば、明細と一緒にMFへ入ります）</span>'
-    : '';
+  $('panelNote').innerHTML = (a.auto_voucher
+    ? '<span class="note">MFの証憑自動取得に対応しているサービスです（先方サイトに領収書が上がっていれば、明細と一緒にMFへ入ります）</span> '
+    : '')
+    + (a.mf_url
+      ? `<a class="btn go" href="${esc(a.mf_url)}" target="_blank" rel="noopener">MFでこのカードを開く ↗</a> <button class="btn" data-seturl="${esc(a.id)}" title="MFのURLを登録し直す">⚙</button>`
+      : `<button class="btn" data-seturl="${esc(a.id)}" style="border-color:#f59e0b;color:#92400e">⚙ MFのURLを登録（1回だけ）</button>`);
   const q = $('q').value.trim().toLowerCase();
   const f = $('filter').value;
   const rows = a.rows.filter(r => {
@@ -280,6 +283,8 @@ function renderRows() {
 }
 
 const MF_INPUT_URL = 'https://accounting.moneyforward.com/transaction_journals';
+/** このカードで絞ったMFのURL (登録済みならそれ、無ければ絞り込みなしの画面) */
+function mfUrlFor(a) { return a.mf_url || MF_INPUT_URL; }
 
 /** この明細について人が何をすればいいか (行の色・並び順にも使う) */
 function category(r, a) {
@@ -295,7 +300,7 @@ function category(r, a) {
 function inboxCell(r, a) {
   const cat = category(r, a);
   const copyBtn = `<button class="btn" data-copy="${r.value}" title="MFの金額欄に貼って絞り込む">金額をコピー</button>`;
-  const mfBtn = `<a class="btn go" href="${MF_INPUT_URL}" target="_blank" rel="noopener">MFで登録 ↗</a>`;
+  const mfBtn = `<a class="btn go" href="${esc(mfUrlFor(a))}" target="_blank" rel="noopener" title="${a.mf_url ? 'このカードで絞ったMFの画面を開く' : 'MFの通帳・カード他を開く (カードの絞り込みは未登録)'}">MFで登録 ↗</a>`;
   if (cat === 'done') return '<span class="ib done">✅ 添付済み</span>';
   if (cat === 'auto') return r.status === 'none'
     ? '<span class="ib auto">MFが自動取得（登録すると証憑が付く）</span>'
@@ -332,6 +337,16 @@ function attachCell(r) {
 function shorten(name) { return name.length > 16 ? name.slice(0, 16) + '…' : name; }
 
 document.addEventListener('click', (ev) => {
+  const setUrl = ev.target.closest('[data-seturl]');
+  if (setUrl) {
+    const a = data.accounts.find(x => x.id === setUrl.dataset.seturl);
+    const url = prompt(`MFの「連携サービスから入力 > 通帳・カード他」で 連携サービス=${a?.name || ''} を選んで「検索」した直後のURLを貼ってください（空にすると解除）`, a?.mf_url || '');
+    if (url === null) return;
+    api(`../api/mf/accounts/${encodeURIComponent(setUrl.dataset.seturl)}/url`, { method: 'POST', body: JSON.stringify({ url: url.trim() }) })
+      .then(() => { toast(url.trim() ? 'MFのURLを登録しました' : 'MFのURLを解除しました'); load(); })
+      .catch(e => toast(e.message === 'bad_url' ? 'URLが違います（https://accounting.moneyforward.com/transaction_journals で始まるもの）' : 'エラー: ' + e.message));
+    return;
+  }
   const copy = ev.target.closest('[data-copy]');
   if (copy) {
     navigator.clipboard?.writeText(String(copy.dataset.copy)).then(() => toast(`${Number(copy.dataset.copy).toLocaleString()} をコピーしました。MFの「金額」欄に貼って検索してください`));
