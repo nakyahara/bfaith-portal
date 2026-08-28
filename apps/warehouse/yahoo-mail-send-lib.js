@@ -101,10 +101,38 @@ function headerSafe(name, v) {
   return s;
 }
 
-/** 非ASCIIヘッダの RFC2047 (UTF-8/Base64) エンコード */
-function mimeWord(s) {
+/**
+ * 非ASCIIヘッダの RFC2047 (UTF-8/Base64) エンコード。
+ * encoded-word は 1 個 75 文字以内という決まりがあるので、**バイト数**で分割する
+ * (文字数で切ると日本語は 1 文字 3 バイトなので上限を超える)。文字の途中では切らない。
+ */
+export function mimeWord(s) {
   if (/^[\x20-\x7e]*$/.test(s)) return s;
-  return s.match(/.{1,20}/gs).map((w) => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n ');
+  const MAX_BYTES = 45; // base64 で 60 文字 + `=?UTF-8?B?` `?=` の 12 文字 = 72 < 75
+  const words = [];
+  let buf = '';
+  for (const ch of String(s)) { // コードポイント単位 (サロゲートペアを割らない)
+    if (Buffer.byteLength(buf + ch, 'utf8') > MAX_BYTES) { words.push(buf); buf = ''; }
+    buf += ch;
+  }
+  if (buf) words.push(buf);
+  return words.map((w) => `=?UTF-8?B?${Buffer.from(w, 'utf8').toString('base64')}?=`).join('\r\n ');
+}
+
+/**
+ * From/To などアドレスヘッダの表示名をエンコードする。
+ * 表示名に日本語をそのまま置くと受信側で文字化けする (2026-08-28 実機で「雑貨イズム」が化けた)。
+ * 非ASCII は encoded-word にする (encoded-word は引用符で囲んではいけない)。
+ */
+export function encodeAddressHeader(name, v) {
+  const s = headerSafe(name, v);
+  const m = s.match(/^\s*(.*?)\s*<([^<>]+)>\s*$/);
+  if (!m) return s; // 表示名なしの素のアドレス
+  const display = m[1].replace(/^"(.*)"$/, '$1').trim();
+  const addr = m[2].trim();
+  if (!display) return `<${addr}>`;
+  if (/^[\x20-\x7e]*$/.test(display)) return `"${display.replace(/(["\\])/g, '\\$1')}" <${addr}>`;
+  return `${mimeWord(display)} <${addr}>`;
 }
 
 /** RFC822 を組み立てて Gmail API の raw (base64url) にする */
@@ -112,7 +140,7 @@ export function buildRawMessage({ to, from, subject, text, messageId }) {
   const t = headerSafe('To', to);
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) throw Object.assign(new Error('MAIL_TO: 宛先の形式が不正'), { responseCode: 400 });
   const headers = [
-    `From: ${headerSafe('From', from)}`,
+    `From: ${encodeAddressHeader('From', from)}`,
     `To: ${t}`,
     `Subject: ${mimeWord(headerSafe('Subject', subject))}`,
     `Message-ID: ${headerSafe('Message-ID', messageId)}`,
