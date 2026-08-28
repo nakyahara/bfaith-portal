@@ -173,6 +173,27 @@ export const JOBS_REGISTRY = [
       + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決',
   },
   {
+    id: 'yahoo-review-mail-send',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Yahoo!ショッピング レビュー フォロー/クーポンメールの正午送信 (らくらくフォロー置換 PR-Y-C5)。'
+      + '月次5%クーポンの発行 (台帳が issued ならブラウザを起動せず終了) → 当日12:00予定の action を ready 昇格 (plan) → '
+      + 'at-most-once の Gmail 送信 (send)。cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)。'
+      + '楽天版 (12:05) と 15 分ずらしてある = warehouse.db を同時に書かせないため',
+    where: 'miniPC TaskScheduler [YahooReviewMailSend] (scripts/mall-csv-fetcher/run-yahoo-review-send.ps1)',
+    schedule: '毎日 12:20',
+    anchor_hour_jst: 12,
+    anchor_minute_jst: 20,
+    grace_hours: 3, // 15:20 までに ok が無ければ締切超過 (フォローは発送+21日の期限があるため翌日には気づきたい)
+    lifecycle: 'permanent',
+    runbook: 'AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』§Y-C5。'
+      + '手動再実行 (送信だけやり直す場合): DATA_DIR を設定して '+ 'node apps/warehouse/plan-rakuten-review-campaigns.js plan --mall yahoo (当日12:00予定を ready 昇格) → '+ 'node apps/warehouse/send-yahoo-review-mails.js send --limit N。'+ '送らずに状況だけ見るなら send-yahoo-review-mails.js plan。'+ 'クーポン発行まで含めてジョブ全体をやり直すなら ps1 をそのまま実行する (coupon → plan → send)。'
+      + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決。'
+      + '「FROM_NOT_VERIFIED / FROM_VERIFY_STALE」で 0 件なら send-yahoo-review-mails.js verify-from --to <社内アドレス> を実行 (90日ごと)。'
+      + 'クーポンが reconcile_required で止まったら --reconcile-only で照合し、未作成を確認してから台帳の行を消して再実行',
+  },
+  {
     id: 'warehouse-daily-sync',
     type: 'scheduled_job',
     importance: 'P1',

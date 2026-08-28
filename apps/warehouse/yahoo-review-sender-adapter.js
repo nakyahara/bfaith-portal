@@ -4,7 +4,8 @@
  * createSenderEngine(adapter) に渡す 6 項目を Yahoo 用に埋める。
  * 楽天との違いはここに閉じ込め、送信の状態機械 (claim → attempt 予約 → 送信 → 確定) は共通。
  *
- *   monthlyCouponFor : yahoo_campaign_coupons (issued のみ) を engine の形に正規化
+ *   monthlyCouponFor : yahoo_campaign_coupons を engine の形に正規化 (当月が未発行なら
+ *                      「今使える発行済みクーポン」へフォールバック。最終判定は couponUsableCheck)
  *   couponUrlOk      : Yahoo のクーポン獲得URLだけを通す (楽天ドメイン判定を継承しない)
  *   resolveRecipient : **PII 非保持** — DB には宛先を持たず、送信直前に VPS 経由で取得する。
  *                      配信停止の照合もここで行う (VIEW の masked_email_hash は NULL なので
@@ -14,7 +15,7 @@
  *   fromHeader       : info@b-faith.biz (Gmail の send-as エイリアス)
  */
 
-import { getCouponRow, isValidCouponUrl } from './yahoo-review-coupon-lib.js';
+import { getCouponRow, isValidCouponUrl, usableCouponFor } from './yahoo-review-coupon-lib.js';
 import { fetchYahooOrderContact } from './yahoo-order-contact-lib.js';
 import { hmacEmail, isSuppressedHash } from './yahoo-review-suppression-lib.js';
 import {
@@ -31,21 +32,28 @@ export function couponTimeToIso(v, secs) {
   return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${secs}+09:00`;
 }
 
+/** 台帳の行を engine の形 ({ status, pc_get_url, coupon_start, coupon_end }) に正規化。
+ *  終了は「23:00 の分まで」= 23:00:59 (画面の終了時刻が時単位なので切り上げず保守側に倒す) */
+const normalizeRow = (r) => (r ? {
+  ...r,
+  status: r.status,
+  pc_get_url: r.coupon_url,
+  coupon_start: couponTimeToIso(r.coupon_start, '00'),
+  coupon_end: couponTimeToIso(r.coupon_end, '59'),
+} : null);
+
 /**
- * 月のクーポンを engine の形 ({ status, pc_get_url, coupon_start, coupon_end }) に正規化。
- * 終了は「23:00 の分まで」= 23:00:59 とする (画面の終了時刻が時単位なので、
- * 切り上げずに保守側へ倒す。usableCouponFor と同じ扱い)
+ * 送信に使うクーポン。まず当月分、無ければ **今の時点で使える発行済みクーポン** を返す。
+ *
+ * Yahoo のクーポンは vendor と同じく「月初〜翌月末」= 2 か月ぶんが重なる。当月キーだけを見ると、
+ * 月初の発行が 1 日落ちただけでその月のクーポンメールが全部止まる (前月分がまだ有効なのに)。
+ * → フォールバックを入れる (Codex Y-C5 R1 Medium)。期間・状態・URL の検証は
+ *   呼び出し側の couponUsableCheck が最終的に行うので、ここが緩くても送信条件は緩まない。
  */
-export function monthlyCouponFor(db, month) {
-  const r = getCouponRow(db, month);
-  if (!r) return null;
-  return {
-    ...r,
-    status: r.status,
-    pc_get_url: r.coupon_url,
-    coupon_start: couponTimeToIso(r.coupon_start, '00'),
-    coupon_end: couponTimeToIso(r.coupon_end, '59'),
-  };
+export function monthlyCouponFor(db, month, nowIso = new Date().toISOString()) {
+  const cur = normalizeRow(getCouponRow(db, month));
+  if (cur && cur.status === 'issued') return cur;
+  return normalizeRow(usableCouponFor(db, nowIso)) || cur;
 }
 
 /**
