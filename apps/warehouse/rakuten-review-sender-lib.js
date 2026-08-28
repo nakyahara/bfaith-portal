@@ -115,7 +115,7 @@ export function gateReason(a, { nowIso, couponUsable }) {
  */
 function selectEligibleActionsT(T, A, db, { nowIso = new Date().toISOString(), limit = 5 } = {}) {
   const month = jstDateOf(nowIso).slice(0, 7);
-  const monthlyCoupon = A.monthlyCouponFor(db, month);
+  const monthlyCoupon = A.monthlyCouponFor(db, month, nowIso);
   const couponUsable = couponUsableCheck(monthlyCoupon, nowIso, A.couponUrlOk);
 
   const rows = db.prepare(`${gateSql(T)}
@@ -146,7 +146,7 @@ function claimActionGuardedT(T, A, db, actionId, nowIso = new Date().toISOString
     const a = db.prepare(`${gateSql(T)} WHERE a.id = ?`).get(actionId);
     if (!a) throw Object.assign(new Error('gone'), { gateFailed: 'not_found' });
     const month = jstDateOf(nowIso).slice(0, 7);
-    const monthlyCoupon = a.action_type === 'coupon' ? A.monthlyCouponFor(db, month) : null;
+    const monthlyCoupon = a.action_type === 'coupon' ? A.monthlyCouponFor(db, month, nowIso) : null;
     const couponUsable = a.action_type === 'coupon' ? couponUsableCheck(monthlyCoupon, nowIso, A.couponUrlOk) : true;
     const reason = gateReason(a, { nowIso, couponUsable });
     if (reason) throw Object.assign(new Error(reason), { gateFailed: reason });
@@ -372,7 +372,7 @@ export const releaseClaim = (db, a) => releaseClaimT(RT, db, a);
 export const processReadyActions = (db, o) => processReadyActionsT(RT, RAKUTEN_SENDER_ADAPTER, db, o);
 
 /**
- * モール別送信エンジン (PR-Y-0)。adapter = { mall, monthlyCouponFor(db, month), resolveRecipient(db, action, keys) (async、
+ * モール別送信エンジン (PR-Y-0)。adapter = { mall, monthlyCouponFor(db, month, nowIso), resolveRecipient(db, action, keys) (async、
  * 一時失敗は err.retryable=true で throw)、buildMail(action, nowIso) → {subject, text}、fromHeader、
  * messageIdFor(actionId, dedupeKey) (モール別 prefix)、couponUrlOk(url) (クーポンURLの妥当性) }
  */

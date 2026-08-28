@@ -211,7 +211,17 @@ console.log('=== 6. アダプタ (クーポン正規化・宛先解決・エン�
   check('終了後 (11/1 JST) は配らない', couponUsableCheck(monthlyCouponFor(db, '2026-09'), '2026-11-01T00:00:00.000Z', A.couponUrlOk) === false);
   check('楽天のURL判定を継承していない (楽天クーポンは Yahoo で使えない)',
     couponUsableCheck({ status: 'issued', pc_get_url: 'https://coupon.rakuten.co.jp/getCoupon?getkey=x&rt=', coupon_start: '2026-09-01T00:00:00+09:00', coupon_end: '2026-10-31T23:00:59+09:00' }, NOW, A.couponUrlOk) === false);
-  check('存在しない月は null', monthlyCouponFor(db, '2027-01') === null);
+  // 月初の発行が落ちても、今使える発行済みクーポンがあれば送れる (Codex Y-C5 R1 Medium)。
+  // Yahoo のクーポンは月初〜翌月末で 2 か月ぶんが重なるため、当月キーだけを見ると全部止まってしまう
+  const OCT = '2026-10-15T03:00:00.000Z'; // JST 10/15 12:00 — 9月分 (10/31まで) が有効
+  check('当月分が無くても、期間内の発行済みクーポンにフォールバックする',
+    couponUsableCheck(monthlyCouponFor(db, '2026-10', OCT), OCT, A.couponUrlOk) === true);
+  check('フォールバックで返るのは実際に有効な 9 月分', monthlyCouponFor(db, '2026-10', OCT)?.month === '2026-09');
+  const NOV = '2026-11-15T03:00:00.000Z'; // 9月分も切れている
+  check('どれも期間外ならフォールバックしない (期限切れを配らない)',
+    couponUsableCheck(monthlyCouponFor(db, '2026-11', NOV), NOV, A.couponUrlOk) === false);
+  check('当月分が issued ならそれを優先 (フォールバックしない)', monthlyCouponFor(db, '2026-09', NOW)?.month === '2026-09');
+  check('存在しない月は null', monthlyCouponFor(db, '2027-01', '2027-01-15T03:00:00.000Z') === null);
   db.close();
 
   const mail = buildMailForAction({
