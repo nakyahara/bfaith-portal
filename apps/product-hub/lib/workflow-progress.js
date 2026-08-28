@@ -14,7 +14,7 @@
  *     recomputeDraftStatus が再計算して書く。status 列を残すのは、AI キュー (ready_for_ai) の
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
-import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS } from '../db.js';
+import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES } from '../db.js';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -1154,6 +1154,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
+      d.generation_block_code, d.generation_block_reason,
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
@@ -1239,6 +1240,12 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       canvaUrl: d.canva_url || null,
       hasProductInfo: d.has_product_info === 1,
       ownBrand: d.own_brand === 1,
+      // 夜間自動化 (2026-08-28): AI が「人の確認待ち」にした理由。列は変えず (工程は AI情報入力待ちのまま)
+      // カードに ⚠ で出す — on_hold にするとボードから消えて誰も気づかない
+      genBlockCode: d.generation_block_code || null,
+      genBlockReason: d.generation_block_reason || null,
+      genBlockLabel: d.generation_block_code
+        ? (GENERATION_BLOCK_CODES[d.generation_block_code] || d.generation_block_code) : null,
     };
 
     if (view === 'image') {

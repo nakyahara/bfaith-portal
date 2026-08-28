@@ -83,6 +83,44 @@ export const AI_OUTPUT_KINDS = [
   'rakuten_title', 'yahoo_title', 'desc_catch', 'desc_features', 'desc_spec', 'desc_notes',
 ];
 
+/**
+ * AI 出力の文字数上限 (モールの物理制約。2026-08-28 夜間自動化に先立ちサーバ側で担保)。
+ *   楽天タイトル 127 / Yahoo!タイトル 65 / キャッチコピー 30 (Yahoo!ヘッドライン兼用)
+ * 説明文3欄は上限を置かない (モール別上限は出品時に別途検証)。
+ * NG ワード検査は入れない — 自社 copy_lint.py と二重管理になる。ここは「超えたら出品できない長さ」だけ。
+ */
+export const AI_OUTPUT_LIMITS = { rakuten_title: 127, yahoo_title: 65, desc_catch: 30 };
+
+/**
+ * 文字数の数え方は **コードポイント数** (`[...s].length`)。copy_lint.py の `len()` と一致させる。
+ * `String.length` (UTF-16 単位) だと絵文字・一部の漢字が 2 と数えられ、lint を通った文章が
+ * サーバで弾かれる食い違いが出る。検証は cleanText 後の「保存される値」に対して行う。
+ * @returns {{ok: true} | {ok: false, error: string, code: 'OUTPUT_TOO_LONG', kind: string, limit: number, actual: number}}
+ */
+export function validateAiOutputLength(kind, content) {
+  const limit = AI_OUTPUT_LIMITS[kind];
+  if (!limit || content == null) return { ok: true };
+  const actual = [...String(content)].length;
+  if (actual <= limit) return { ok: true };
+  return {
+    ok: false, code: 'OUTPUT_TOO_LONG', kind, limit, actual,
+    error: `${kind} が ${limit} 文字を超えています (${actual} 文字)`,
+  };
+}
+
+/**
+ * AI ランナーが draft を「人の確認待ち」にする理由コード (許容値は固定。画面表示用ラベル付き)。
+ * 未知のコードは受け付けない — UI が説明できない状態を作らない
+ */
+export const GENERATION_BLOCK_CODES = {
+  PACK_COUNT_MISMATCH: '入数・容量が参照ページと食い違う',
+  IDENTITY_UNVERIFIED: '商品の同一性を確認できない',
+  SOURCE_UNREACHABLE: '参照ページを取得できない',
+  FACTS_TOO_THIN: '裏取りできた事実が少なすぎる',
+  OTHER: 'その他',
+};
+export const GENERATION_BLOCK_REASON_MAX = 1000;
+
 /** 担当者の区分 (表示順)。外注さんはポータルにログインしないので kind で見分ける */
 export const STAFF_KINDS = [
   { value: 'internal', label: '社内' },
@@ -768,6 +806,26 @@ export function initProductHubDB() {
   if (!draftCols.has('generation_claim_until')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN generation_claim_until TEXT');
   }
+  // 夜間自動化 (2026-08-28): AI ランナーが「人が見ないと進められない」と判断した draft を
+  // 人が解除するまで claim 対象から外す。status は ready_for_ai のまま (工程導出を壊さない・
+  // ボードの「AI情報入力待ち」列に残して ⚠ を出す)。release と違い updated_at も進めるので、
+  // 解除後は列の末尾に回る。4列は「全部 NULL」か「code/at/by が非NULL」のどちらかで揃える
+  // (Codex設計相談 medium: 部分的な不整合を作らない — 書くのは blockGenerationDraft だけ)
+  if (!draftCols.has('generation_block_code')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_block_code TEXT');
+  }
+  if (!draftCols.has('generation_block_reason')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_block_reason TEXT');
+  }
+  if (!draftCols.has('generation_blocked_at')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_blocked_at TEXT');
+  }
+  if (!draftCols.has('generation_blocked_by')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_blocked_by TEXT');
+  }
+  // claim の候補 SELECT 用の部分インデックス (キューが大きくなっても updated_at 順の先頭だけ読む)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_product_drafts_generation_queue
+    ON product_drafts(updated_at) WHERE status = 'ready_for_ai' AND generation_block_code IS NULL`);
   // Notion 取り込み (テスト検証用)。source='notion_import' の行は Notion 側が正であり、
   // ポータルから Notion へ書き戻してはならない (既存カードの破壊防止 — notion-card.js のガード参照)。
   //   注意: ALTER で足す列に CHECK は付けられない。そのため書き戻し判定は canWriteToNotion の
@@ -1391,12 +1449,14 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
   const drafts = ids
     ? db.prepare(`
         SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
-        FROM product_drafts WHERE status = 'ready_for_ai' AND id IN (${ids.map(() => '?').join(',') || 'NULL'})
+        FROM product_drafts WHERE status = 'ready_for_ai' AND generation_block_code IS NULL
+          AND id IN (${ids.map(() => '?').join(',') || 'NULL'})
         ORDER BY updated_at ASC
       `).all(...ids)
     : db.prepare(`
         SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
-        FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
+        FROM product_drafts WHERE status = 'ready_for_ai' AND generation_block_code IS NULL
+        ORDER BY updated_at ASC LIMIT ?
       `).all(limit);
   const refStmt = db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id');
   const specStmt = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id');
@@ -1464,9 +1524,11 @@ export const GENERATION_LEASE_MINUTES = 30;
 export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
   const now = new Date().toISOString();
   const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  // 人の確認待ち (generation_block_code) は候補から外す。**CAS UPDATE 側にも同じ条件を入れる** —
+  // SELECT と UPDATE の隙間で block された draft を掴めてしまう (Codex設計相談 Critical)
   const candidates = db.prepare(`
     SELECT id FROM product_drafts
-    WHERE status = 'ready_for_ai'
+    WHERE status = 'ready_for_ai' AND generation_block_code IS NULL
       AND (generation_claim_until IS NULL OR generation_claim_until < ?)
     ORDER BY updated_at ASC LIMIT ?
   `).all(now, limit);
@@ -1474,7 +1536,7 @@ export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
   for (const c of candidates) {
     const info = db.prepare(`
       UPDATE product_drafts SET generation_claim_run_id = ?, generation_claim_until = ?
-      WHERE id = ? AND status = 'ready_for_ai'
+      WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL
         AND (generation_claim_until IS NULL OR generation_claim_until < ?)
     `).run(runId, until, c.id, now);
     if (info.changes === 1) claimed.push(c.id);
@@ -1492,9 +1554,11 @@ export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
 export function acquireGenerationWriteLock(db, draftId, runId) {
   const now = new Date().toISOString();
   const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  // block 済みなら書き込み権を渡さない: 同じ run が「出力保存」と「人待ち」を並行して送った場合に
+  // block 済みの draft へ文章が入る取り違えを防ぐ (Codex設計相談 Critical)
   return db.prepare(`
     UPDATE product_drafts SET generation_claim_until = ?
-    WHERE id = ? AND status = 'ready_for_ai'
+    WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL
       AND generation_claim_run_id = ? AND generation_claim_until >= ?
   `).run(until, draftId, runId, now).changes === 1;
 }
@@ -1521,6 +1585,98 @@ export function releaseGenerationClaim(db, draftId, runId) {
     UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL
     WHERE id = ? AND generation_claim_run_id = ?
   `).run(draftId, runId).changes === 1;
+}
+
+/**
+ * AI ランナーが draft を「人の確認待ち」にする (2026-08-28 夜間自動化)。
+ * release との違い: release は「一時的に手放す」(次の claim でまた先頭に戻る) のに対し、
+ * これは **人が解除するまで claim 対象から外す**。仕様不一致 (入数の食い違い等) は何度 claim しても
+ * 生成できないので、release で回すと毎晩同じ draft を掴んで捨てる無限ループになる。
+ *
+ * 書けるのは **有効な claim を持つ run だけ**。検証と書き込みは 1 本の条件付き UPDATE で行う
+ * (事前に読んでから無条件 UPDATE すると、その間の lease 切れ・解除・別 claim を取りこぼす — Codex Critical)。
+ * 同じ run が同じ code で再送してきたら「適用済み」として成功扱い (通信断で応答だけ失った再試行を 409 にしない)。
+ * @returns {{result: 'blocked'|'already'|'conflict'|'not_found', error?: string}}
+ */
+export function blockGenerationDraft(db, draftId, runId, { code, reason }) {
+  const id = Number(draftId);
+  const by = `ai:${runId}`;
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const info = db.prepare(`
+      UPDATE product_drafts
+      SET generation_block_code = ?, generation_block_reason = ?, generation_blocked_at = ?, generation_blocked_by = ?,
+          generation_claim_run_id = NULL, generation_claim_until = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL
+        AND generation_claim_run_id = ? AND generation_claim_until >= ?
+    `).run(code, reason, now, by, id, runId, now);
+    if (info.changes === 1) {
+      logEvent(db, id, 'generation_blocked', `${code}: ${reason}`, by);
+      return { result: 'blocked' };
+    }
+    const cur = db.prepare(`
+      SELECT status, generation_block_code, generation_blocked_by, generation_claim_run_id, generation_claim_until
+      FROM product_drafts WHERE id = ?
+    `).get(id);
+    if (!cur) return { result: 'not_found' };
+    if (cur.generation_block_code) {
+      if (cur.generation_blocked_by === by && cur.generation_block_code === code) return { result: 'already' };
+      return { result: 'conflict', error: `すでに人の確認待ちです (${cur.generation_block_code})。上書きしません` };
+    }
+    return { result: 'conflict', error: generationClaimError(cur, runId) || 'claim が無効です' };
+  })();
+}
+
+/**
+ * 人が「人の確認待ち」を解除する。解除 = claim 対象に戻すだけで、自動で再生成はしない
+ * (人が基本情報を直した上で解除する前提。直さずに解除すれば次の夜また同じ理由で止まる = 正しい挙動)。
+ * expectedBlockedAt を渡すと楽観ロック: 画面が見ていた block と違う block になっていたら解除しない
+ * (Codex設計相談 medium: 長時間開いた画面からの解除で、別の理由の block を消さない)。
+ * @returns {{result: 'unblocked'|'not_blocked'|'stale'|'not_found'}}
+ */
+export function unblockGenerationDraft(db, draftId, { actor = null, expectedBlockedAt = null } = {}) {
+  const id = Number(draftId);
+  return db.transaction(() => {
+    const cur = db.prepare(`
+      SELECT generation_block_code, generation_block_reason, generation_blocked_at FROM product_drafts WHERE id = ?
+    `).get(id);
+    if (!cur) return { result: 'not_found' };
+    if (!cur.generation_block_code) return { result: 'not_blocked' };
+    const info = db.prepare(`
+      UPDATE product_drafts
+      SET generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND generation_block_code IS NOT NULL
+        AND (? IS NULL OR generation_blocked_at = ?)
+    `).run(id, expectedBlockedAt, expectedBlockedAt);
+    if (info.changes !== 1) return { result: 'stale' };
+    logEvent(db, id, 'generation_unblocked', `${cur.generation_block_code}: ${cur.generation_block_reason || ''}`.trim(), actor);
+    return { result: 'unblocked' };
+  })();
+}
+
+/**
+ * 生成キューの内訳 (夜間バッチの成否判定用)。
+ * 「キューが減ったか」で成否を見ると、人待ちだけが残った夜を失敗扱いにしてしまう (Codex設計相談 High)。
+ * ランナー/監視は claimable === 0 を「今夜やることは終わった」と読む。blocked は別枠で人に見せる。
+ * claim 処理と同じスナップショットではない (観測値) — 厳密な制御には使わない
+ */
+export function generationQueueSummary(db) {
+  const now = new Date().toISOString();
+  const r = db.prepare(`
+    SELECT
+      SUM(CASE WHEN generation_block_code IS NULL AND (generation_claim_until IS NULL OR generation_claim_until < ?) THEN 1 ELSE 0 END) AS claimable,
+      SUM(CASE WHEN generation_block_code IS NULL AND generation_claim_until >= ? THEN 1 ELSE 0 END) AS leased,
+      SUM(CASE WHEN generation_block_code IS NOT NULL THEN 1 ELSE 0 END) AS blocked
+    FROM product_drafts WHERE status = 'ready_for_ai'
+  `).get(now, now);
+  const blockedByCode = {};
+  for (const row of db.prepare(`
+    SELECT generation_block_code AS code, COUNT(*) AS c FROM product_drafts
+    WHERE status = 'ready_for_ai' AND generation_block_code IS NOT NULL GROUP BY generation_block_code
+  `).all()) blockedByCode[row.code] = row.c;
+  return { claimable: r?.claimable || 0, leased: r?.leased || 0, blocked: r?.blocked || 0, blockedByCode };
 }
 
 // demoteIfGateBroken は lib/workflow-progress.js へ移設 (PR4):

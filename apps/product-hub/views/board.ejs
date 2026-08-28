@@ -28,6 +28,7 @@
   .kb-tag.canva { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
+  .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
   .kb-col.drop-ok { outline: 2px dashed #2563eb; outline-offset: -2px; background: #eff6ff; }
   /* TOP画像の重要度 (どれぐらい力を入れて作るか)。Notion のタグ風に色を付ける */
   .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
@@ -208,6 +209,8 @@
                 </div>
               <% } %>
               <% } %>
+              <%# AI が「人の確認待ち」にした商品 (2026-08-28)。列は動かさず理由をカードに出す %>
+              <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -316,6 +319,7 @@
               <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
             <% } %>
+            <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
             <div class="kb-card-top">
               <% if (c.first_image_id) { %>
                 <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">

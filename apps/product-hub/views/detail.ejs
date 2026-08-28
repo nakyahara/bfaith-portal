@@ -63,6 +63,20 @@
         </div>
       </div>
     <% } %>
+    <%# AI が「人の確認待ち」にした商品 (2026-08-28 夜間自動化)。解除だけでは生成されない — 人が直してから解除する %>
+    <% if (draft.generation_block_code) { %>
+      <div class="banner-warn" style="margin:12px 0 0; background:#fee2e2; border-color:#ef4444;">
+        <div>
+          <strong>⚠ AI が止めています: <%= blockLabels[draft.generation_block_code] || draft.generation_block_code %></strong>
+          <div style="margin-top:4px; white-space:pre-wrap;"><%= draft.generation_block_reason %></div>
+          <div class="muted" style="font-size:11px; margin-top:6px;">
+            <%= draft.generation_blocked_by %> / <%= draft.generation_blocked_at %>
+            — 基本情報 (商品名・URL 等) を直してから「解除」すると、次の夜間実行で AI が再挑戦します。直さずに解除すると同じ理由でまた止まります
+          </div>
+          <button class="btn btn-sm" id="gen-unblock-btn" data-blocked-at="<%= draft.generation_blocked_at %>" style="margin-top:8px;">解除する (AI に再挑戦させる)</button>
+        </div>
+      </div>
+    <% } %>
     <% if (draft.source === 'notion_import') { %>
       <div class="banner-warn" style="margin:12px 0 0;">
         📥 <strong>Notionから取り込んだ商品です (検証用)。</strong>
@@ -1630,6 +1644,18 @@
       showAndReload(await post(BASE + '/status', { to: btn.dataset.to }), 'ステータスを変更しました');
     });
   });
+
+  // AI の「人の確認待ち」解除 (2026-08-28)。blocked_at を送って、画面が見ていた block と違えば 409
+  const genUnblockBtn = document.getElementById('gen-unblock-btn');
+  if (genUnblockBtn) {
+    genUnblockBtn.addEventListener('click', async () => {
+      if (!confirm('AI が止めた理由は直しましたか？\n解除すると次の夜間実行で AI が再挑戦します (直していなければ同じ理由でまた止まります)')) return;
+      genUnblockBtn.disabled = true;
+      const json = await post(BASE + '/generation-block', { clear: true, blocked_at: genUnblockBtn.dataset.blockedAt });
+      showAndReload(json, 'AI の停止を解除しました');
+      if (!json.ok) genUnblockBtn.disabled = false;
+    });
+  }
 
   const notionRetryBtn = document.getElementById('notion-retry-btn');
   if (notionRetryBtn) {

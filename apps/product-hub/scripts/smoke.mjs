@@ -3912,8 +3912,103 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     r.json.drafts.some((d) => d.id === gdraft2.id) && !r.json.drafts.some((d) => d.id === gdraft.id),
     JSON.stringify(r.json).slice(0, 200));
 
+  // ─── 人の確認待ち (generation-block) + 文字数ガード (2026-08-28 夜間自動化) ───
+  // 人用ルート (解除・手直し) も同じ app に載せる。session は偽装
+  const routerModGB = await import('../router.js');
+  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  app.use('/ph', routerModGB.default);
+  const callPh = async (method, path, body) => {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/ph` + path, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, amazon_url, status)
+    VALUES ('GEN-3', 'アイスの棒 50本', 'smoke', 'https://www.amazon.co.jp/dp/B0GEN3', 'ready_for_ai')`).run();
+  const gdraft3 = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-3'`).get();
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runJ', limit: 10 });
+  check('block 準備: runJ が GEN-3 を claim', r.json.drafts.some((d) => d.id === gdraft3.id));
+  check('claim 応答に queue 内訳が付く', r.json.queue && typeof r.json.queue.claimable === 'number' && typeof r.json.queue.blocked === 'number', JSON.stringify(r.json.queue));
+
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { code: 'PACK_COUNT_MISMATCH', reason: 'x' });
+  check('block: run_id なしは 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runX', code: 'PACK_COUNT_MISMATCH', reason: 'x' });
+  check('block: claim を持たない run は 409 (他人の draft を止められない)', r.status === 409, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'NOT_A_CODE', reason: 'x' });
+  check('block: 未知の code は 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH' });
+  check('block: reason なしは 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: 'draft は 50本、Amazon ページは 100本入り' });
+  check('block: 有効な claim を持つ run は止められる', r.status === 200 && r.json.blocked === true && r.json.already === false, JSON.stringify(r.json));
+  let rowB = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('block: 4列が揃って書かれ claim は解放される (status は ready_for_ai のまま)',
+    rowB.generation_block_code === 'PACK_COUNT_MISMATCH' && rowB.generation_blocked_at && rowB.generation_blocked_by === 'ai:runJ'
+    && rowB.generation_claim_run_id == null && rowB.generation_claim_until == null && rowB.status === 'ready_for_ai');
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: '再送' });
+  check('block: 同じ run・同じ code の再送は 200 already (通信断リトライを 409 にしない)', r.status === 200 && r.json.already === true, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'OTHER', reason: '別の理由' });
+  check('block: 別 code での上書きは 409 (人が解除するまで理由を固定)', r.status === 409);
+
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runK', limit: 10 });
+  check('block 後: claim 候補から外れる', !r.json.drafts.some((d) => d.id === gdraft3.id));
+  check('block 後: queue.blocked に数えられる', r.json.queue.blocked >= 1 && r.json.queue.blockedByCode.PACK_COUNT_MISMATCH >= 1, JSON.stringify(r.json.queue));
+  r = await call('GET', '/generation-queue');
+  check('block 後: GET 一覧からも消える (人待ちは AI に見せない)', !r.json.drafts.some((d) => d.id === gdraft3.id) && r.json.queue.blocked >= 1);
+
+  // 書き込みロックのレース: block 済みなのに有効な claim が残っていても文章は入らない (Codex Critical)
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runJ', generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  check('block 済み: acquireGenerationWriteLock は書き込み権を渡さない', dbmod.acquireGenerationWriteLock(db, gdraft3.id, 'runJ') === false);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runJ', outputs: SIX, advance: true });
+  check('block 済み: ai-outputs は 409 で 1 バイトも書かれない', r.status === 409
+    && db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c === 0, JSON.stringify(r.json));
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+
+  // 人の解除 (通常ルート) — 楽観ロック付き
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: '1999-01-01T00:00:00.000Z' });
+  check('解除: 画面が見ていた blocked_at と違えば 409', r.status === 409, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: false });
+  check('解除: clear:true 以外は 400 (人がこの画面から止めることはできない)', r.status === 400);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: rowB.generation_blocked_at });
+  check('解除: blocked_at 一致で解除できる', r.status === 200 && r.json.unblocked === true, JSON.stringify(r.json));
+  rowB = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('解除後: 4列すべて NULL に戻る', rowB.generation_block_code == null && rowB.generation_block_reason == null
+    && rowB.generation_blocked_at == null && rowB.generation_blocked_by == null);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true });
+  check('解除: 二重解除は 400', r.status === 400);
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runL', limit: 10 });
+  check('解除後: 次の claim で拾える (解除 = キューに戻すだけ)', r.json.drafts.some((d) => d.id === gdraft3.id));
+  const evGB = db.prepare(`SELECT event FROM draft_events WHERE draft_id = ? AND event IN ('generation_blocked','generation_unblocked') ORDER BY id`).all(gdraft3.id).map((e) => e.event);
+  check('監査ログ: blocked → unblocked が残る', evGB.join(',') === 'generation_blocked,generation_unblocked', evGB.join(','));
+
+  // 文字数ガード (service-api)。数え方はコードポイント (copy_lint.py の len() と一致)
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { ...SIX, rakuten_title: 'あ'.repeat(128) }, advance: true });
+  check('文字数: 楽天タイトル 128 字は 400 (構造化エラー)', r.status === 400 && r.json.code === 'OUTPUT_TOO_LONG'
+    && r.json.kind === 'rakuten_title' && r.json.limit === 127 && r.json.actual === 128, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { yahoo_title: 'い'.repeat(66) } });
+  check('文字数: Yahoo!タイトル 66 字は 400', r.status === 400 && r.json.kind === 'yahoo_title' && r.json.limit === 65);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { desc_catch: 'う'.repeat(31) } });
+  check('文字数: キャッチコピー 31 字は 400', r.status === 400 && r.json.kind === 'desc_catch' && r.json.limit === 30);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { rakuten_title: '😀'.repeat(127) } });
+  check('文字数: 絵文字 127 個 (UTF-16 では 254) はコードポイント数で 127 → 通る', r.status === 200 && r.json.written === 1, JSON.stringify(r.json));
+  // 書き込み成功で claim は解放される仕様 → 次の書き込みは claim し直す
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runM', limit: 10 });
+  check('文字数: 部分保存の後は claim が解放され、次の run が拾える', r.json.drafts.some((d) => d.id === gdraft3.id));
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runM', outputs: { desc_features: 'え'.repeat(3000) } });
+  check('文字数: 説明文3欄には上限を置かない', r.status === 200, JSON.stringify(r.json));
+  // 人の手直し (通常ルート) にも同じ上限
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/ai-outputs`, { kind: 'yahoo_title', content: 'お'.repeat(66) });
+  check('文字数 (人の手直し): 66 字は 400', r.status === 400 && r.json.code === 'OUTPUT_TOO_LONG');
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/ai-outputs`, { kind: 'yahoo_title', content: 'お'.repeat(65) });
+  check('文字数 (人の手直し): 65 字は通る', r.status === 200);
+
   // 後始末
-  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id IN (?, ?)`).run(gdraft.id, gdraft2.id);
+  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL,
+    generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL
+    WHERE id IN (?, ?, ?)`).run(gdraft.id, gdraft2.id, gdraft3.id);
   server.close();
 }
 
