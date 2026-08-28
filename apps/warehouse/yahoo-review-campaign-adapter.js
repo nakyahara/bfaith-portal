@@ -63,6 +63,17 @@ export function ensureYahooCampaignSources(db) {
     created_at  TEXT NOT NULL,
     released_by TEXT
   )`);
+  // 既存 DB (PR-Y-C1 期の最小形や、テストが手で作った表) には後付け列が無い。
+  // 無いまま送信すると claim 済みの状態で SQLite エラーになり、送っていないのに終端へ落ちる
+  // (Codex Y-C4 R3 High) → 起動時に不足列を足す
+  {
+    const have = new Set(db.prepare(`PRAGMA table_info(yahoo_contact_suppressions)`).all().map((c) => c.name));
+    for (const [col, ddl] of [
+      ['source', `source TEXT NOT NULL DEFAULT 'manual'`],
+      ['evidence', 'evidence TEXT'],
+      ['released_by', 'released_by TEXT'],
+    ]) if (!have.has(col)) db.exec(`ALTER TABLE yahoo_contact_suppressions ADD COLUMN ${ddl}`);
+  }
 }
 
 /**

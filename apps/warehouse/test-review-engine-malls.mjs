@@ -72,6 +72,9 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
     },
     buildMail: (a) => ({ subject: `S ${a.order_number}`, text: `T ${a.order_number}` }),
     fromHeader: '"雑貨イズム" <info@b-faith.biz>',
+    // PR-Y-C4 で必須化 (Message-ID の prefix とクーポンURLの妥当性もモール別)
+    messageIdFor: (id, key) => `<yrc-${id}-${key}@b-faith.biz>`,
+    couponUrlOk: (u) => /^https:\/\/shopping\.yahoo\.co\.jp\//.test(String(u)),
   });
   check('createSenderEngine: Yahoo 束縛', Y.adapter.fromHeader.includes('info@') && Y.tables.actions === 'yahoo_campaign_actions'
     && RAKUTEN_SENDER_ADAPTER.mall === 'rakuten');
@@ -134,6 +137,7 @@ console.log('=== 2. sender アダプタ (Yahoo 束縛・宛先は API 即時取�
     db.prepare(`UPDATE ${T.actions} SET status = 'ready', scheduled_at = '2026-09-11T03:00:00.000Z', ready_at = ? WHERE order_number IN ('b-faith01-3','b-faith01-4')`).run(NOW);
     const before = sent.length;
     const tamper = createSenderEngine({ mall: 'yahoo', monthlyCouponFor: () => null, buildMail: (a) => ({ subject: 's', text: 't' }), fromHeader: 'x <x@b-faith.biz>',
+      messageIdFor: (id, key) => `<yrc-${id}-${key}@b-faith.biz>`, couponUrlOk: () => false,
       resolveRecipient: async (_db, a) => {
         // 解放が失敗する状況を作る: 別 worker が attempt に note を付けた体
         db.prepare(`UPDATE ${T.attempts} SET note = 'other-worker' WHERE action_id = ?`).run(a.id);
