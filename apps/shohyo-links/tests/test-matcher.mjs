@@ -10,8 +10,9 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'shohyo-matcher-'))
 const { matchVoucher, matchBatch, parseVoucherFileName, isValidDate } = await import('../matcher.js');
 const {
   addToInbox, listInbox, updateInboxMeta, setMatch, countByStatus, transactionOwners, autoAttachEnabled, setSetting,
-  claimForAttach, releaseClaim, markAttached, recoverStaleClaims, readFile, sniffKind, decodeBase64Strict, getInbox,
+  claimForAttach, releaseClaim, markAttached, markNeedsCheck, recoverStaleClaims, readFile, sniffKind, decodeBase64Strict, getInbox, setStatus,
 } = await import('../inbox.js');
+const { listLinks } = await import('../db.js');
 const { periodFor } = await import('../attach-job.js');
 
 let failed = 0;
@@ -110,13 +111,15 @@ check('同じ内容は二重登録しない', dupe.duplicate && dupe.row.id === 
 let threw = false;
 try { addToInbox(Buffer.from('<html>'), { file_name: 'x.pdf' }); } catch (e) { threw = e.message === 'unsupported_file'; }
 check('PDF/JPEG/PNG 以外は拒否', threw);
-check('金額の上限・非整数は弾く', addToInbox(Buffer.from('%PDF-1.4 b'), { file_name: 'b.pdf', amount: 1e12 }).row.amount === null
-  && addToInbox(Buffer.from('%PDF-1.4 c'), { file_name: 'c.pdf', amount: '1234.6' }).row.amount === 1235);
+check('金額の上限超えは bad_amount', (() => { try { addToInbox(Buffer.from('%PDF-1.4 b'), { file_name: 'b.pdf', amount: 1e12 }); return false; } catch (e) { return e.message === 'bad_amount'; } })());
+check('小数は丸める', addToInbox(Buffer.from('%PDF-1.4 c'), { file_name: 'c.pdf', amount: '1234.6' }).row.amount === 1235);
+check('存在しない vendor_id は bad_vendor_id', (() => { try { addToInbox(Buffer.from('%PDF-1.4 d'), { file_name: 'd.pdf', vendor_id: 999999 }); return false; } catch (e) { return e.message === 'bad_vendor_id'; } })());
+check('実在する vendor_id は通る', addToInbox(Buffer.from('%PDF-1.4 e'), { file_name: 'e.pdf', vendor_id: listLinks()[0].id }).row.vendor_id === listLinks()[0].id);
 check('既定は提案モード (auto_attach OFF)', autoAttachEnabled() === false);
 setSetting('auto_attach', '1');
 check('auto_attach を ON にできる', autoAttachEnabled() === true);
 setMatch(a.row.id, { status: 'proposed', tx_id: 't1', journal_id: 'j1', journal_number: 480, strength: 'strong', reason: 'vendor+amount+date', candidates: [{ tx_id: 't1' }] });
-check('owners に proposed の明細と所有者が入る', transactionOwners().get('t1')?.has(a.row.id));
+check('proposed は排他的所有ではない (毎周期まとめて再評価する)', !transactionOwners().has('t1'));
 threw = false;
 try { updateInboxMeta(a.row.id, { doc_date: '2026-13-01' }); } catch (e) { threw = e.message === 'bad_date'; }
 check('存在しない日付への修正は bad_date', threw);
@@ -124,36 +127,47 @@ const upd = updateInboxMeta(a.row.id, { amount: 21000 });
 check('メタ修正で new に戻り突合結果が消える', upd.status === 'new' && upd.amount === 21000 && upd.match_tx_id === '');
 
 // 添付の確保 (リース) — 二重添付防止
-const token = claimForAttach(a.row.id);
-check('確保できる (attaching)', token && getInbox(a.row.id).status === 'attaching');
-check('二重に確保できない', claimForAttach(a.row.id) === null);
+check('明細IDなしでは確保できない', claimForAttach(a.row.id, '') === null);
+const token = claimForAttach(a.row.id, 't1');
+check('確保できる (attaching・明細IDを持つ)', token && getInbox(a.row.id).status === 'attaching' && getInbox(a.row.id).match_tx_id === 't1');
+check('二重に確保できない', claimForAttach(a.row.id, 't1') === null);
+check('確保中は所有者になる', transactionOwners().get('t1')?.has(a.row.id));
 check('確保中は突合結果で上書きされない', (setMatch(a.row.id, { status: 'no_match' }), getInbox(a.row.id).status === 'attaching'));
 check('確保中はメタを直せない', (() => { try { updateInboxMeta(a.row.id, { amount: 1 }); return false; } catch (e) { return e.message === 'already_attached'; } })());
 check('偽トークンでは attached にできない', markAttached(a.row.id, 'bogus', { journal_id: 'j1', mf_file_id: 'f', mode: 'auto' }) === false);
-releaseClaim(a.row.id, token, 'mf_api_500');
-check('失敗時は error に戻る', getInbox(a.row.id).status === 'error' && getInbox(a.row.id).error === 'mf_api_500');
-const token2 = claimForAttach(a.row.id);
+// 同じ明細を別の証憑が同時に確保しようとしても DB が止める
+const other = addToInbox(Buffer.from('%PDF-1.4 other'), { file_name: 'other.pdf' });
+check('同じ明細は別の証憑が確保できない (uq index)', claimForAttach(other.row.id, 't1') === null && getInbox(other.row.id).status === 'new');
+check('別の明細なら確保できる', claimForAttach(other.row.id, 't5') !== null);
+releaseClaim(a.row.id, token, 'mf_api_400');
+check('確実な拒否は error に戻る', getInbox(a.row.id).status === 'error' && getInbox(a.row.id).error === 'mf_api_400');
+const token2 = claimForAttach(a.row.id, 't1');
 releaseClaim(a.row.id, token2, '');
 check('エラーなしの解放は元の状態 (error) に戻る', getInbox(a.row.id).status === 'error');
-const token3 = claimForAttach(a.row.id);
-check('正しいトークンで attached', markAttached(a.row.id, token3, { journal_id: 'j1', journal_number: 480, tx_id: 't1', mf_file_id: 'f1', mode: 'manual', actor: 'test' }) === true
+const token3 = claimForAttach(a.row.id, 't1');
+markNeedsCheck(a.row.id, token3, 'timeout');
+const nc = getInbox(a.row.id);
+check('結果不明は needs_check (自動再送しない・所有は保持)', nc.status === 'needs_check' && transactionOwners().get('t1')?.has(a.row.id));
+check('needs_check は突合で上書きされない', (setMatch(a.row.id, { status: 'proposed' }), getInbox(a.row.id).status === 'needs_check'));
+check('needs_check は「戻す」で new に戻り所有を手放す', setStatus(a.row.id, 'new').status === 'new' && !transactionOwners().has('t1'));
+const token4 = claimForAttach(a.row.id, 't1');
+check('正しいトークンで attached', markAttached(a.row.id, token4, { journal_id: 'j1', journal_number: 480, tx_id: 't1', mf_file_id: 'f1', mode: 'manual', actor: 'test' }) === true
   && listInbox({ status: 'attached' }).length === 1 && countByStatus().attached === 1);
 threw = false;
 try { updateInboxMeta(a.row.id, { amount: 1 }); } catch (e) { threw = e.message === 'already_attached'; }
 check('添付済みは直せない', threw);
-// 添付済み明細の一意制約 (同じ明細に2つ目を attached にできない)
-const c2 = addToInbox(Buffer.from('%PDF-1.4 second'), { file_name: 'second.pdf' });
-const tk = claimForAttach(c2.row.id);
-threw = false;
-try { markAttached(c2.row.id, tk, { journal_id: 'j1', tx_id: 't1', mf_file_id: 'f2', mode: 'manual' }); } catch (e) { threw = /UNIQUE/i.test(e.message); }
-check('同じ明細への2件目の attached は DB が拒否', threw);
-// 途中で落ちた確保の回収
-check('起動時に attaching を error に戻す', recoverStaleClaims() === 1 && getInbox(c2.row.id).status === 'error');
+check('添付済み明細への確保は DB が拒否', claimForAttach(addToInbox(Buffer.from('%PDF-1.4 second'), { file_name: 'second.pdf' }).row.id, 't1') === null);
+// 途中で落ちた確保の回収 (other は t5 で attaching のまま)
+check('起動時に attaching を needs_check に', recoverStaleClaims() === 1 && getInbox(other.row.id).status === 'needs_check');
 
 // 期間計算
 const [ps, pe] = periodFor([{ doc_date: '2026-99-99', created_at: '2026-08-20T00:00:00Z' }, { doc_date: '2026-08-01', created_at: '2026-08-21T00:00:00Z' }], Date.parse('2026-08-28T00:00:00Z'));
 check('periodFor: 無効日付は登録日にフォールバック・前後7日', ps === '2026-07-25' && pe === '2026-08-27');
 check('periodFor: 空でも落ちない', Array.isArray(periodFor([], Date.parse('2026-08-28T00:00:00Z'))));
+const [fs1, fe1] = periodFor([{ doc_date: '2027-03-01', created_at: '2026-08-20T00:00:00Z' }], Date.parse('2026-08-28T00:00:00Z'));
+check('periodFor: 未来日付でも start <= end', fs1 <= fe1);
+m = matchVoucher({ vendor_name: 'PAYPAY', amount: 100, doc_date: '2026-08-01' }, [{ id: 'tp', date: '2026-08-01', value: 100, side: 'EXPENSE', content: 'PAYPAY', journalizing_status: 'none' }], vendors);
+check('雑音語だけの加盟店名は strong にしない', m.kind === 'unique' && m.strength === 'weak');
 
 console.log(failed ? `\n${failed}件NG` : '\n全件パス');
 process.exit(failed ? 1 : 0);

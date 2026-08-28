@@ -107,6 +107,11 @@ r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers
 check('存在しない日付は400', r.status === 400 && (await r.json()).error === 'bad_date');
 r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'not-a-candidate' }) });
 check('候補にない明細への添付は400', r.status === 400 && (await r.json()).error === 'not_a_candidate');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'z.pdf', file_data: Buffer.from('%PDF-1.4 z').toString('base64'), vendor_id: 999999 }) });
+check('存在しない vendor_id は400', r.status === 400 && (await r.json()).error === 'bad_vendor_id');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'x'.repeat(300) }) });
+check('長すぎる tx_id は400', r.status === 400 && (await r.json()).error === 'bad_tx_id');
 r = await fetch(base + '/apps/shohyo-links/api/inbox/abc/file');
 check('不正IDは404', r.status === 404);
 r = await fetch(base + '/apps/shohyo-links/api/inbox?status=bogus');

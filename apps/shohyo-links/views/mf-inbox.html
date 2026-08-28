@@ -46,6 +46,7 @@
   .st.ambiguous, .st.no_match { background: #fee2e2; color: #b91c1c; }
   .st.attached { background: #dcfce7; color: #166534; }
   .st.attaching { background: #e0e7ff; color: #3730a3; }
+  .st.needs_check { background: #fef3c7; color: #92400e; font-weight: 600; }
   .st.excluded { background: #f3f4f6; color: #9ca3af; }
   .st.error { background: #fee2e2; color: #b91c1c; }
   .cand { display: block; padding: 4px 8px; border: 1px solid #e3e6eb; border-radius: 4px; margin: 2px 0; background: #fafbfc; }
@@ -115,10 +116,10 @@ const editing = new Set();
 
 const TABS = [
   ['todo', '要対応'], ['proposed', '提案'], ['waiting_registration', '登録待ち'], ['ambiguous', '候補複数'], ['no_match', '一致なし'],
-  ['new', '未照合'], ['attached', '添付済み'], ['excluded', '除外'], ['error', 'エラー'], ['all', '全て'],
+  ['needs_check', 'MF側を確認'], ['new', '未照合'], ['attached', '添付済み'], ['excluded', '除外'], ['error', 'エラー'], ['all', '全て'],
 ];
-const LABEL = { new: '未照合', proposed: '提案', waiting_registration: '登録待ち', ambiguous: '候補複数', no_match: '一致なし', attaching: '添付中', attached: '添付済み', excluded: '除外', error: 'エラー' };
-const TODO = new Set(['proposed', 'ambiguous', 'no_match', 'error']);
+const LABEL = { new: '未照合', proposed: '提案', waiting_registration: '登録待ち', ambiguous: '候補複数', no_match: '一致なし', attaching: '添付中', attached: '添付済み', needs_check: 'MF側を確認', excluded: '除外', error: 'エラー' };
+const TODO = new Set(['proposed', 'ambiguous', 'no_match', 'error', 'needs_check']);
 
 function toast(msg) {
   const el = $('toast');
@@ -154,7 +155,7 @@ async function load() {
 
 function renderTabs() {
   const c = data.counts || {};
-  const todo = ['proposed', 'ambiguous', 'no_match', 'error'].reduce((a, k) => a + (c[k] || 0), 0);
+  const todo = ['proposed', 'ambiguous', 'no_match', 'error', 'needs_check'].reduce((a, k) => a + (c[k] || 0), 0);
   $('tabs').innerHTML = TABS.map(([k, l]) => {
     const n = k === 'todo' ? todo : k === 'all' ? Object.values(c).reduce((a, b) => a + b, 0) : (c[k] || 0);
     return `<span class="tab${tab === k ? ' active' : ''}" data-tab="${k}">${l}<span class="n">${n}</span></span>`;
@@ -204,8 +205,13 @@ function actions(r) {
   if (editing.has(r.id)) return `<button class="btn mini ok" data-save="${r.id}">保存して再照合</button> <button class="btn mini" data-cancel="${r.id}">やめる</button>`;
   const b = [];
   if (r.status === 'proposed') b.push(`<button class="btn mini ok" data-attach="${r.id}">承認して貼る</button>`);
-  if (r.status !== 'attached') b.push(`<button class="btn mini" data-edit="${r.id}">直す</button>`);
-  if (r.status !== 'attached' && r.status !== 'excluded') b.push(`<button class="btn mini" data-exclude="${r.id}">除外</button>`);
+  if (r.status === 'needs_check') {
+    b.push(`<button class="btn mini" data-reopen="${r.id}" title="MFで見て、貼れていなかった">貼れていない→戻す</button>`);
+    b.push(`<button class="btn mini" data-exclude="${r.id}" title="MFで見て、貼れていた">貼れていた→除外</button>`);
+    return b.join(' ');
+  }
+  if (!['attached', 'attaching'].includes(r.status)) b.push(`<button class="btn mini" data-edit="${r.id}">直す</button>`);
+  if (!['attached', 'attaching', 'excluded'].includes(r.status)) b.push(`<button class="btn mini" data-exclude="${r.id}">除外</button>`);
   if (r.status === 'excluded') b.push(`<button class="btn mini" data-reopen="${r.id}">戻す</button>`);
   return b.join(' ');
 }
@@ -215,10 +221,10 @@ document.addEventListener('click', async (ev) => {
   if (!t) return;
   try {
     if (t.dataset.tab) { tab = t.dataset.tab; renderTabs(); render(); return; }
-    if (t.dataset.attach) { t.disabled = true; await api(`../api/inbox/${t.dataset.attach}/attach`, { method: 'POST', body: '{}' }); toast('MFの仕訳に貼りました'); return load(); }
+    if (t.dataset.attach) { t.disabled = true; await attachWithConfirm(t.dataset.attach, {}); toast('MFの仕訳に貼りました'); return load(); }
     if (t.dataset.pick) {
       if (!confirm('この明細に貼りますか？')) return;
-      await api(`../api/inbox/${t.dataset.pick}/attach`, { method: 'POST', body: JSON.stringify({ tx_id: t.dataset.tx, reason: 'picked' }) });
+      await attachWithConfirm(t.dataset.pick, { tx_id: t.dataset.tx });
       toast('貼りました'); return load();
     }
     if (t.dataset.edit) { editing.add(Number(t.dataset.edit)); return render(); }
@@ -235,10 +241,24 @@ document.addEventListener('click', async (ev) => {
   } catch (e) {
     toast('エラー: ' + ({ journal_not_registered: 'その明細はまだMFで登録されていません（登録後に貼れます）', mf_not_connected: 'MF未接続です',
       not_a_candidate: '候補にない明細には貼れません', already_attached: '既に添付済み（または処理中）です', admin_only: '管理者だけが変更できます',
+      taken_by_other: 'その明細には別の証憑が貼られています', transaction_gone: 'MF側でその明細が見つかりません（再照合してください）',
+      candidate_stale: '明細の内容が変わっています（金額・日付・支払先が合いません）。再照合してください',
+      needs_check: 'MFへの送信結果が確認できませんでした。MFの仕訳を見て「貼れていた／貼れていない」を選んでください', cancelled: 'キャンセルしました',
       file_corrupted: 'ファイルが壊れています（受け箱に入れ直してください）' }[e.message] || e.message));
     load();
   }
 });
+
+// 仕訳に既に証憑があるときは、人に確認してから force で貼る
+async function attachWithConfirm(id, body) {
+  try {
+    return await api(`../api/inbox/${id}/attach`, { method: 'POST', body: JSON.stringify(body) });
+  } catch (e) {
+    if (e.message !== 'journal_has_voucher') throw e;
+    if (!confirm('この仕訳には既に証憑が付いています。追加で貼りますか？（同じ領収書の二重添付にご注意ください）')) throw new Error('cancelled');
+    return api(`../api/inbox/${id}/attach`, { method: 'POST', body: JSON.stringify({ ...body, force: true }) });
+  }
+}
 
 $('autoAttach').addEventListener('change', async () => {
   const on = $('autoAttach').checked;

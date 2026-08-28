@@ -59,7 +59,9 @@ function vendorHit(vkeys, t) {
   const memo = normalizeText(t.memo || '');
   const strongKeys = vkeys.filter(k => k.length >= STRONG_KEY_MIN);
   if (strongKeys.some(k => content.includes(k))) {
-    const covered = contentTokens(t.content).every(tok => vkeys.some(k => k.length >= 3 && (tok.includes(k) || k.includes(tok))));
+    const toks = contentTokens(t.content);
+    // 雑音語しか無い加盟店名 (決済事業者名だけ等) は strong にしない
+    const covered = toks.length > 0 && toks.every(tok => vkeys.some(k => k.length >= 3 && (tok.includes(k) || k.includes(tok))));
     if (covered) return 'content';
     return 'weak';
   }

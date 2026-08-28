@@ -15,10 +15,10 @@ import {
 } from './mf-api.js';
 import {
   addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, setStatus,
-  listAttachLog, autoAttachEnabled, setSetting, decodeBase64Strict, INBOX_STATUSES,
+  listAttachLog, autoAttachEnabled, setSetting, decodeBase64Strict, INBOX_STATUSES, TX_ID_MAX, transactionOwners,
 } from './inbox.js';
 import { runInboxMatch, attachWithClaim } from './attach-job.js';
-import { parseVoucherFileName, isValidDate } from './matcher.js';
+import { parseVoucherFileName, isValidDate, matchVoucher } from './matcher.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = Router();
@@ -303,6 +303,7 @@ router.post('/api/inbox', (req, res) => {
     res.json({ ok: true, result: { row, duplicate } });
   } catch (e) {
     if (e.message === 'unsupported_file') return res.status(415).json({ ok: false, error: 'unsupported_file' });
+    if (['bad_amount', 'bad_vendor_id', 'bad_date'].includes(e.message)) return res.status(400).json({ ok: false, error: e.message });
     console.error('[shohyo-links] inbox add', e.message);
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -336,32 +337,48 @@ router.patch('/api/inbox/:id', (req, res) => {
     if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
     res.json({ ok: true, result: row });
   } catch (e) {
-    const code = { already_attached: 409, bad_date: 400, bad_amount: 400 }[e.message] || 500;
+    const code = { already_attached: 409, bad_date: 400, bad_amount: 400, bad_vendor_id: 400 }[e.message] || 500;
     res.status(code).json({ ok: false, error: e.message });
   }
 });
 
 // 人の操作: 提案を承認して貼る / 候補 (tx_id) を指定して貼る。
-// 貼れる相手は「サーバーが突合で出した候補」だけ。任意の仕訳IDは受け付けない (Codexレビュー High-5)
+// 貼れる相手は「サーバーが突合で出した候補」だけ。任意の仕訳IDは受け付けない (Codexレビュー High-5)。
+// 添付直前にMFから明細と仕訳を引き直し、金額・日付・支払先が今も合うこと・他の証憑に取られていないこと・
+// 仕訳に既に証憑が無いことを再検証する (古い候補に貼らない・Codex 2巡目 #4)。証憑ありは force=true (人の確認) で許可
 router.post('/api/inbox/:id/attach', async (req, res) => {
   const id = inboxId_(req.params.id);
   const row = id ? getInbox(id) : null;
   if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
-  if (row.status === 'attached' || row.status === 'attaching') return res.status(409).json({ ok: false, error: 'already_attached' });
+  if (['attached', 'attaching', 'needs_check'].includes(row.status)) return res.status(409).json({ ok: false, error: 'already_attached' });
   try {
-    const txId = typeof req.body?.tx_id === 'string' && req.body.tx_id ? req.body.tx_id : row.match_tx_id;
+    const bodyTx = req.body?.tx_id;
+    if (bodyTx !== undefined && (typeof bodyTx !== 'string' || bodyTx.length > TX_ID_MAX)) return res.status(400).json({ ok: false, error: 'bad_tx_id' });
+    const txId = bodyTx || row.match_tx_id;
     if (!txId) return res.status(400).json({ ok: false, error: 'target_required' });
-    const allowed = new Set([row.match_tx_id, ...(row.candidates || []).map(c => c.tx_id)].filter(Boolean));
-    if (!allowed.has(txId)) return res.status(400).json({ ok: false, error: 'not_a_candidate' });
-    // 仕訳はMFから引き直し、明細IDが一致することを確認する (クライアントの仕訳No.は信用しない)
-    const today = new Date().toISOString().slice(0, 10);
-    const from = shiftDate_(isValidDate(row.doc_date) ? row.doc_date : today, isValidDate(row.doc_date) ? -10 : -60);
-    const journals = await getJournalsByTransactionIds([txId], from, shiftDate_(today, 1));
+    const candidates = row.candidates || [];
+    const cand = candidates.find(c => c.tx_id === txId) || (row.match_tx_id === txId ? { tx_id: txId, date: row.doc_date } : null);
+    if (!cand) return res.status(400).json({ ok: false, error: 'not_a_candidate' });
+    const owners = transactionOwners();
+    if ([...(owners.get(txId) || [])].some(o => o !== row.id)) return res.status(409).json({ ok: false, error: 'taken_by_other' });
+
+    // MFから引き直す (候補の取引日 ±10日)
+    const anchor = isValidDate(cand.date) ? cand.date : (isValidDate(row.doc_date) ? row.doc_date : new Date().toISOString().slice(0, 10));
+    const from = shiftDate_(anchor, -10), to = shiftDate_(anchor, 10);
+    const tx = (await getTransactions(from, to)).find(t => t.id === txId);
+    if (!tx) return res.status(409).json({ ok: false, error: 'transaction_gone' });
+    const recheck = matchVoucher(row, [tx], listLinks());
+    if (recheck.kind !== 'unique') return res.status(409).json({ ok: false, error: 'candidate_stale', reason: recheck.reason });
+    const journals = await getJournalsByTransactionIds([txId], from, to);
     const j = journals.find(x => x.transaction_id === txId);
     if (!j) return res.status(409).json({ ok: false, error: 'journal_not_registered' });
-    const r = await attachWithClaim(row, j, { tx_id: txId, mode: 'manual', actor: actorOf_(req), reason: req.body?.tx_id ? 'picked' : 'approved' });
+    if ((j.voucher_file_ids || []).length > 0 && req.body?.force !== true) {
+      return res.status(409).json({ ok: false, error: 'journal_has_voucher', vouchers: j.voucher_file_ids.length });
+    }
+    const r = await attachWithClaim(row, j, { tx_id: txId, mode: 'manual', actor: actorOf_(req), reason: bodyTx ? 'picked' : 'approved' });
     if (!r.ok) {
       if (r.error === 'claim_failed') return res.status(409).json({ ok: false, error: 'already_attached' });
+      if (r.error === 'needs_check') return res.status(502).json({ ok: false, error: 'needs_check' });
       return res.status(r.error === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: r.error });
     }
     res.json({ ok: true, result: getInbox(id) });
@@ -379,13 +396,13 @@ router.post('/api/inbox/:id/exclude', (req, res) => {
   res.json({ ok: true, result: setStatus(row.id, 'excluded') });
 });
 
+// 戻す: 除外 / 要確認 (MFで未添付だったと人が確認した) を再照合の対象に戻す
 router.post('/api/inbox/:id/reopen', (req, res) => {
   const id = inboxId_(req.params.id);
   const row = id ? getInbox(id) : null;
   if (!row) return res.status(404).json({ ok: false, error: 'not_found' });
   if (row.status === 'attached' || row.status === 'attaching') return res.status(409).json({ ok: false, error: 'already_attached' });
-  setMatch(row.id, { status: 'new', candidates: [] });
-  res.json({ ok: true, result: getInbox(row.id) });
+  res.json({ ok: true, result: setStatus(row.id, 'new') });
 });
 
 // 今すぐ照合 (cron を待たない)。attach は設定 (自動添付ON) に従う。進行中なら相乗り (二重実行しない)
