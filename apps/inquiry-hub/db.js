@@ -605,6 +605,30 @@ function createTables() {
     PRIMARY KEY (message_id, kind)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_cutoff_acks_inquiry ON cutoff_acks(inquiry_id)');
+
+  // 締め前確認に出さない差出人 (2026-08-28 中原さん「的外れが多すぎる」)。
+  // ⭐メールチャネルには顧客のメールも業者の連絡もAmazonの販促も同じように届く。
+  //   チャネルごと除外すると本物の顧客メールまで消えるので、**差出人ごとに**外す。
+  //   画面の各行から1タップで足せるようにして、使いながら育てる
+  const excludesExisted = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cutoff_excludes'").get();
+  db.exec(`CREATE TABLE IF NOT EXISTS cutoff_excludes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern TEXT NOT NULL,          -- 'foo@example.com' (そのアドレス) / '@example.com' (そのドメイン全部)
+    pattern_key TEXT NOT NULL,      -- 比較用に小文字化したもの
+    note TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_cutoff_excludes_key ON cutoff_excludes(pattern_key)');
+  // 初回だけ、中原さんが実物を見て挙げた3件を入れておく (以後は画面での編集が正)
+  if (!excludesExisted) {
+    const ins = db.prepare('INSERT OR IGNORE INTO cutoff_excludes (pattern, pattern_key, note, created_by) VALUES (?,?,?,?)');
+    for (const [p, note] of [
+      ['gvipsenriyamada@gmail.com', '業者からの連絡 (中原さん指定 2026-08-28)'],
+      ['noreply@qemailserver.com', '自動配信 (中原さん指定 2026-08-28)'],
+      ['amazon-cons-deal@amazon.com', 'Amazonの販促通知 (中原さん指定 2026-08-28)'],
+    ]) ins.run(p, p.toLowerCase(), note, 'seed');
+  }
 }
 
 /**
