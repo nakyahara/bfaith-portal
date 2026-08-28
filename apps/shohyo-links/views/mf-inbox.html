@@ -144,8 +144,16 @@ async function refreshStatus() {
   } catch (e) { bar.innerHTML = '<span class="dot ng"></span> 状態取得エラー: ' + esc(e.message); }
 }
 
-async function load() {
+// 操作した行が今のタブから消えるときは、その行の行き先タブへ切り替える (「押したら消えた」を防ぐ)
+async function load(followId = null) {
   data = await api('../api/inbox');
+  if (followId) {
+    const row = data.rows.find(r => r.id === Number(followId));
+    if (row && !rowsFor().some(r => r.id === row.id)) {
+      tab = row.status;
+      toast(`「${LABEL[row.status] || row.status}」に移りました`);
+    }
+  }
   $('autoAttach').checked = data.auto_attach;
   $('autoAttach').disabled = !data.is_admin;
   $('autoAttach').title = data.is_admin ? '' : '自動添付の切替は管理者だけができます';
@@ -196,6 +204,7 @@ function candLine(c, pick, rId) {
 function candCell(r) {
   if (r.status === 'attached') return `<span class="cand">仕訳 No.${esc(r.journal_number_display || r.match_journal_number || '')} に添付済み <span class="meta">${esc((r.attached_at || '').slice(0, 16).replace('T', ' '))}</span></span>`;
   if (r.status === 'ambiguous') return r.candidates.map(c => candLine(c, true, r.id)).join('') + '<div class="reason">候補をクリックすると、その明細（の仕訳）に貼ります</div>';
+  if (r.status === 'waiting_registration') return r.candidates.map(c => candLine(c, false, r.id)).join('') + '<div class="reason">この明細はMFでまだ未仕訳です。MFで「登録」すると次の周期（毎時07分）に貼られます</div>';
   if (r.candidates?.length) return r.candidates.map(c => candLine(c, false, r.id)).join('');
   if (r.status === 'no_match') return '<span class="reason">同じ金額の明細が見つかりません。日付・金額・支払先を直すか、除外してください</span>';
   return '';
@@ -222,11 +231,11 @@ document.addEventListener('click', async (ev) => {
   if (!t) return;
   try {
     if (t.dataset.tab) { tab = t.dataset.tab; renderTabs(); render(); return; }
-    if (t.dataset.attach) { t.disabled = true; await attachWithConfirm(t.dataset.attach, {}); toast('MFの仕訳に貼りました'); return load(); }
+    if (t.dataset.attach) { t.disabled = true; await attachWithConfirm(t.dataset.attach, {}); toast('MFの仕訳に貼りました'); return load(t.dataset.attach); }
     if (t.dataset.pick) {
       if (!confirm('この明細に貼りますか？')) return;
       await attachWithConfirm(t.dataset.pick, { tx_id: t.dataset.tx });
-      toast('貼りました'); return load();
+      toast('貼りました'); return load(t.dataset.pick);
     }
     if (t.dataset.edit) { editing.add(Number(t.dataset.edit)); return render(); }
     if (t.dataset.cancel) { editing.delete(Number(t.dataset.cancel)); return render(); }
@@ -235,7 +244,7 @@ document.addEventListener('click', async (ev) => {
       await api(`../api/inbox/${id}`, { method: 'PATCH', body: JSON.stringify({ doc_date: $('d' + id).value, amount: $('a' + id).value, vendor_name: $('v' + id).value }) });
       editing.delete(id);
       await api('../api/inbox/run', { method: 'POST', body: '{}' });
-      toast('直して照合しました'); return load();
+      toast('直して照合しました'); return load(id);
     }
     if (t.dataset.extract) {
       t.disabled = true; t.textContent = '読み取り中…';
@@ -244,10 +253,10 @@ document.addEventListener('click', async (ev) => {
       toast(ex.applied?.length ? `読み取り: ${ex.applied.map(k => ({ doc_date: '日付', amount: '金額', vendor_name: '支払先' })[k]).join('・')} を入れました（${ex.source}）。照合します…`
         : (r.ai_enabled ? '読み取れませんでした。「直す」で入れてください' : 'AI読み取りが未設定です（OPENAI_API_KEY）。「直す」で入れてください'));
       if (ex.applied?.length) { try { await api('../api/inbox/run', { method: 'POST', body: '{}' }); } catch (e) { /* 未接続等 */ } }
-      return load();
+      return load(t.dataset.extract);
     }
-    if (t.dataset.exclude) { await api(`../api/inbox/${t.dataset.exclude}/exclude`, { method: 'POST', body: '{}' }); return load(); }
-    if (t.dataset.reopen) { await api(`../api/inbox/${t.dataset.reopen}/reopen`, { method: 'POST', body: '{}' }); return load(); }
+    if (t.dataset.exclude) { await api(`../api/inbox/${t.dataset.exclude}/exclude`, { method: 'POST', body: '{}' }); return load(t.dataset.exclude); }
+    if (t.dataset.reopen) { await api(`../api/inbox/${t.dataset.reopen}/reopen`, { method: 'POST', body: '{}' }); return load(t.dataset.reopen); }
   } catch (e) {
     toast('エラー: ' + ({ journal_not_registered: 'その明細はまだMFで登録されていません（登録後に貼れます）', mf_not_connected: 'MF未接続です',
       not_a_candidate: '候補にない明細には貼れません', already_attached: '既に添付済み（または処理中）です', admin_only: '管理者だけが変更できます',
