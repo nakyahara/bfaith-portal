@@ -207,6 +207,46 @@ export async function getJournals(startDate, endDate) {
   return journals;
 }
 
+// MFが返すIDは URLエンコード済み ('%2B' 等)。URLSearchParams が再エンコードするので一度戻す
+const rawId = (id) => { try { return decodeURIComponent(String(id)); } catch { return String(id); } };
+
+/** 連携サービス (カード・銀行口座) の一覧 */
+export async function getConnectedAccounts() {
+  const res = await apiFetch('/api/v3/connected_accounts');
+  return res?.connected_accounts || [];
+}
+
+/**
+ * 期間内の明細 (連携サービスから入力の1行) を全ページ取得。
+ * statuses = journalizing_status の配列 (none=未仕訳 / registered=仕訳済み ...)。省略で全件
+ */
+export async function getTransactions(startDate, endDate, { statuses = null, accountId = null } = {}) {
+  const out = [];
+  const perPage = 500;
+  for (let page = 1; page <= 40; page++) {
+    const q = new URLSearchParams({ start_date: startDate, end_date: endDate, page: String(page), per_page: String(perPage), order: 'asc' });
+    if (accountId) q.set('connected_account_id', rawId(accountId));
+    for (const st of statuses || []) q.append('journalizing_statuses', st);
+    const res = await apiFetch(`/api/v3/transactions?${q}`);
+    const items = res?.transactions || [];
+    out.push(...items);
+    if (items.length < perPage) break;
+  }
+  return out;
+}
+
+/** 明細IDに紐づく仕訳を引く (transaction_ids は最大50件/回) */
+export async function getJournalsByTransactionIds(ids, startDate, endDate) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 50) {
+    const q = new URLSearchParams({ start_date: startDate, end_date: endDate, per_page: '500' });
+    for (const id of ids.slice(i, i + 50)) q.append('transaction_ids', rawId(id));
+    const res = await apiFetch(`/api/v3/journals?${q}`);
+    out.push(...(res?.journals || []));
+  }
+  return out;
+}
+
 /** 証憑を保存する。journalId が null なら未添付のままBoxに保存される */
 export async function postVoucher(journalId, fileName, fileDataBase64) {
   return apiFetch('/api/v3/vouchers', {

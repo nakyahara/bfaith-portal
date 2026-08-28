@@ -57,6 +57,16 @@ check('不正な期間は400 bad_period', r.status === 400 && (await r.json()).e
 r = await fetch(base + '/apps/shohyo-links/api/mf/unattached?start=2026-08-01&end=2026-08-31');
 check('未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
 
+// 明細ビュー
+r = await fetch(base + '/apps/shohyo-links/mf/transactions', { redirect: 'manual' });
+check('/mf/transactions は200', r.status === 200, String(r.status));
+r = await fetch(base + '/apps/shohyo-links/mf/transactions/', { redirect: 'manual' });
+check('/mf/transactions/ は308で寄せる', r.status === 308 && r.headers.get('location') === '/apps/shohyo-links/mf/transactions', String(r.headers.get('location')));
+r = await fetch(base + '/apps/shohyo-links/api/mf/transactions?start=2026-8-1&end=2026-08-31');
+check('明細API 不正な期間は400', r.status === 400 && (await r.json()).error === 'bad_period');
+r = await fetch(base + '/apps/shohyo-links/api/mf/transactions?start=2026-08-01&end=2026-08-31');
+check('明細API 未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
+
 server.close();
 console.log(ng ? `\n${ng}件NG` : '\n全件パス');
 process.exitCode = ng ? 1 : 0;

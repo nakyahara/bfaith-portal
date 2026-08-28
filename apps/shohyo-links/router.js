@@ -11,6 +11,7 @@ import { listLinks, createLink, updateLink, deleteLink } from './db.js';
 import {
   mfConfigured, authorizeUrl, exchangeCode, loadTokens, clearTokens,
   currentOffice, getJournals, postVoucher, matchVendors, revokeTokens, journalDigest,
+  getConnectedAccounts, getTransactions, getJournalsByTransactionIds,
 } from './mf-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -158,6 +159,84 @@ router.get('/api/mf/unattached', async (req, res) => {
     res.json({ ok: true, result: { total: journals.length, rows } });
   } catch (e) {
     console.error('[shohyo-links] mf unattached', e.message, e.detail || '');
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+  }
+});
+
+// MFの「連携サービスから入力」と同じ単位 = 連携サービス (カード/口座) ごとの明細。
+// 経理の実作業はこの画面で起きているため、仕訳ではなく明細を主役にする。
+router.get('/mf/transactions', (req, res) => {
+  // 画面内の相対パスは '../' 基準 (末尾スラッシュが付くと階層がずれるので /mf/transactions に寄せる)
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  if (pathname.endsWith('/')) {
+    return res.redirect(308, `${req.baseUrl}/mf/transactions` + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
+  }
+  res.sendFile(path.join(__dirname, 'views', 'mf-transactions.html'));
+});
+
+// MFが明細取得と一緒に証憑も自動取得してくれる連携サービス (公式一覧 2025-12)。ここは人が取りに行かない
+const AUTO_VOUCHER_SERVICES = ['UPSIDER', 'PRESIDENT CARD', 'Amazon.co.jp', 'Amazonビジネス', 'MISUMI', 'Yahoo!ショッピング', '楽天市場', 'ビジネスカード'];
+const isAutoVoucher = (name) => AUTO_VOUCHER_SERVICES.some(k => String(name || '').includes(k));
+
+// 期間内の明細を連携サービスごとにまとめて返す。仕訳済みの明細には仕訳ID・証憑数を付ける
+router.get('/api/mf/transactions', async (req, res) => {
+  try {
+    const { start, end } = req.query;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(start)) || !/^\d{4}-\d{2}-\d{2}$/.test(String(end))) {
+      return res.status(400).json({ ok: false, error: 'bad_period' });
+    }
+    const vendors = listLinks();
+    const [accounts, txs] = await Promise.all([getConnectedAccounts(), getTransactions(String(start), String(end))]);
+
+    // 仕訳済み明細 → 仕訳 (証憑は仕訳に付くので、添付有無は仕訳側が正)
+    const registered = txs.filter(t => t.journalizing_status !== 'none' && t.journalizing_status !== 'excluded');
+    const journals = registered.length ? await getJournalsByTransactionIds(registered.map(t => t.id), String(start), String(end)) : [];
+    const journalByTx = new Map();
+    for (const j of journals) if (j.transaction_id) journalByTx.set(j.transaction_id, j);
+
+    const byAccount = new Map();
+    for (const a of accounts) {
+      byAccount.set(a.id, { id: a.id, name: a.name, auto_voucher: isAutoVoucher(a.name), rows: [] });
+    }
+    for (const t of txs) {
+      if (!byAccount.has(t.connected_account_id)) {
+        byAccount.set(t.connected_account_id, { id: t.connected_account_id, name: '(不明な連携サービス)', auto_voucher: false, rows: [] });
+      }
+      const j = journalByTx.get(t.id) || null;
+      const voucherCount = j ? (j.voucher_file_ids || []).length : (t.voucher_file_ids || []).length;
+      byAccount.get(t.connected_account_id).rows.push({
+        id: t.id,
+        date: t.date,
+        value: t.value,
+        side: t.side,
+        content: t.content || '',
+        memo: t.memo || '',
+        status: t.journalizing_status,
+        journal_id: j ? j.id : null,
+        journal_number: j ? j.number : null,
+        accounts: j ? journalDigest(j).accounts : [],
+        vouchers: voucherCount,
+        vendors: matchVendors({ content: t.content, memo: t.memo }, vendors).map(v => ({
+          id: v.id, name: v.name, url: v.url, storage_path: v.storage_path, fetch_method: v.fetch_method,
+        })),
+      });
+    }
+    const result = [...byAccount.values()].map(a => {
+      const expense = a.rows.filter(r => r.side === 'EXPENSE' && r.status !== 'excluded');
+      return {
+        ...a,
+        counts: {
+          total: a.rows.length,
+          unregistered: a.rows.filter(r => r.status === 'none').length,
+          need_voucher: expense.filter(r => r.status !== 'none' && !r.vouchers).length,
+          attached: expense.filter(r => r.vouchers > 0).length,
+        },
+      };
+    }).sort((x, y) => y.counts.need_voucher - x.counts.need_voucher || y.counts.total - x.counts.total);
+    res.json({ ok: true, result: { accounts: result, total: txs.length } });
+  } catch (e) {
+    console.error('[shohyo-links] mf transactions', e.message, e.detail || '');
     res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
   }
 });
