@@ -396,7 +396,8 @@ async function main() {
     console.error(`\n⚠️ ${err.message}`);
     if (page) await snap(page, 'error');
     try { db.close(); } catch { /* noop */ }
-    await sendGChat(buildErrorReport({
+    // dry-run は外部への副作用ゼロ (通知も出さない)。手動実行なのでコンソールで足りる (Codex Y-C3 R4 High)
+    if (LIVE) await sendGChat(buildErrorReport({
       mall: 'yahoo-review-coupon', logPath: runLog.logPath,
       failures: [{ reportType: is2fa ? '2FA_REQUIRED (Yahoo セッション切れ)' : 'coupon_issue', error: err.message, url: page ? page.url() : '', screenshot: join(OUT_DIR, 'yrcoupon_error.png') }],
       repro: is2fa ? 'miniPC の Yahoo-Relogin.bat で再ログイン' : 'node scripts/mall-csv-fetcher/yahoo-review-coupon-issue.mjs (dry-run) で再現。台帳 yahoo_campaign_coupons の status を確認',
