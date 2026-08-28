@@ -715,6 +715,25 @@ export function initProductHubDB() {
       value TEXT
     );
 
+    -- かんばんの手動並び順 (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
+    -- 既定は「停滞日数の多い順 → 登録順」だが、それだと現場で決めた「今日はこの順でやる」が
+    -- 保存されず、動かしても読み直すたびに元へ戻ってしまう。
+    -- 1 枚のカード = (view, draft_id, kind) につき 1 行。col は最後に手で置いた列で、
+    -- 工程が変わって別の列に出たときは手動順を捨てて既定順に戻す (別の列の並びを
+    -- そのまま持ち込むと、置いた覚えのない位置に割り込む)。
+    -- kind は画像ビューの種別 (top/detail)。本流ビューは '' (空文字) を使う。
+    -- 現場の目安情報なのでロックも版数も持たない (最後に置いた人の並びが正)。
+    CREATE TABLE IF NOT EXISTS ph_board_order (
+      view       TEXT NOT NULL,                   -- main / image
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      kind       TEXT NOT NULL DEFAULT '',        -- image ビューのみ top / detail
+      col        TEXT NOT NULL,                   -- 置いた列 (工程コード / 画像ステージ / done)
+      sort       INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (view, draft_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_board_order_col ON ph_board_order(view, col, sort);
+
     CREATE TABLE IF NOT EXISTS draft_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id   INTEGER NOT NULL,

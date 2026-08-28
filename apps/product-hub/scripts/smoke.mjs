@@ -1930,6 +1930,7 @@ const wf = await import('../lib/workflow.js');
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
 const wfp = await import('../lib/workflow-progress.js');
+const backLink = await import('../lib/back-link.js');
 // 工程操作の権限文脈。admin は全部できる (一般ユーザーの制限は下の権限ブロックで検証する)
 const ADMIN = { isAdmin: true, actorStaffId: null };
 const wfTanakaId = wf.listStaff().find((s) => s.name === '田中美祐').id;
@@ -3201,6 +3202,114 @@ let wfSetParentId = null;
   const listRes = await fetch(base + '/list');
   check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
 
+  // ─── かんばんの手動並び順 + 詳細の戻り先 (2026-08-28 中原さん要望) ───
+  {
+    // 既定の並びは「停滞が長い順 → 登録順」。手で並べ替えたらその順が残る (読み直しても戻らない)
+    const colOf = (b, code) => b.columns.find((c) => (c.code || c.key) === code);
+    const b0 = wfp.boardData(db, {});
+    const target = b0.columns.find((c) => c.cards.length >= 2);
+    check('並び順: 2枚以上あるボード列がある (以降の検証の前提)', !!target,
+      b0.columns.map((c) => `${c.code}:${c.cards.length}`).join(','));
+    if (target) {
+      const colCode = target.code || target.key;
+      const before = target.cards.map((c) => c.id);
+      // 先頭と末尾を入れ替えて保存 (画面が送るのと同じ「列まるごとの順番」)
+      const wanted = [before[before.length - 1], ...before.slice(1, -1), before[0]];
+      const rr = await call('POST', '/api/board/reorder', {
+        view: 'main', col: colCode, items: wanted.map((id) => ({ id })),
+      });
+      check('並び順: API が保存を受け付ける', rr.status === 200 && rr.json.ok && rr.json.saved === wanted.length,
+        JSON.stringify(rr.json));
+      const b1 = wfp.boardData(db, {});
+      check('並び順: 読み直しても手で並べた順のまま (作成順に戻らない)',
+        colOf(b1, colCode).cards.map((c) => c.id).join(',') === wanted.join(','),
+        `${colOf(b1, colCode).cards.map((c) => c.id).join(',')} != ${wanted.join(',')}`);
+
+      // 別ビューの並びは独立 (本流で並べても画像ボードの順は変わらない)
+      const ordRows = db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE view = 'image'`).get().n;
+      check('並び順: 本流の並べ替えは画像ビューに漏れない', ordRows === 0, `image rows=${ordRows}`);
+
+      // 工程が変わって別の列に出たカードは、前の列で付けた順番を持ち込まない
+      const movedId = wanted[0];
+      db.prepare(`UPDATE ph_board_order SET col = 'ZZZ-OTHER' WHERE view = 'main' AND draft_id = ?`).run(movedId);
+      const b2 = wfp.boardData(db, {});
+      const cards2 = colOf(b2, colCode).cards.map((c) => c.id);
+      check('並び順: 別の列に置いた記録はこの列に効かない (既定順に戻る)',
+        cards2[0] !== movedId || wanted.length === 1, cards2.join(','));
+      // 記録の列と実際の列が食い違う行は、ボードを開いたときに掃除される (Codex R2 中:
+      // 残ると、あとでその列を並べ替えたとき見えないカードとして差し込み位置を押し下げる)
+      check('並び順: 実際の列と食い違う記録はボード表示時に消える',
+        db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER'`).get().n === 0);
+      // 後片付け (以降の並び検証に影響させない)
+      db.prepare(`DELETE FROM ph_board_order`).run();
+    }
+    // 絞り込み中の並べ替えが、画面に出ていないカードの順番を巻き込まない (Codex R1 高)
+    {
+      const b = wfp.boardData(db, {});
+      const t = b.columns.find((c) => c.cards.length >= 3);
+      check('並び順(部分): 3枚以上あるボード列がある (以降の検証の前提)', !!t,
+        b.columns.map((c) => `${c.code}:${c.cards.length}`).join(','));
+      if (t) {
+        const code = t.code;
+        const all = t.cards.map((c) => c.id);
+        // まず列全体を固定 (A,B,C,...)
+        await call('POST', '/api/board/reorder', { view: 'main', col: code, items: all.map((id) => ({ id })) });
+        // 次に「B だけ絞り込みで隠れている画面」から A と C を入れ替えて保存
+        const visible = [all[2], all[0], ...all.slice(3)];
+        const rp = await call('POST', '/api/board/reorder', { view: 'main', col: code, items: visible.map((id) => ({ id })) });
+        check('並び順(部分): 一部だけ送っても受け付ける', rp.status === 200 && rp.json.ok, JSON.stringify(rp.json));
+        const after2 = wfp.boardData(db, {}).columns.find((c) => c.code === code).cards.map((c) => c.id);
+        check('並び順(部分): 送ったカードだけ入れ替わり、隠れていたカードは動かない',
+          after2.join(',') === [all[2], all[1], all[0], ...all.slice(3)].join(','),
+          `${after2.join(',')} != ${[all[2], all[1], all[0], ...all.slice(3)].join(',')}`);
+        db.prepare(`DELETE FROM ph_board_order`).run();
+      }
+    }
+
+    const rBad = await call('POST', '/api/board/reorder', { view: 'main', col: '', items: [{ id: 1 }] });
+    check('並び順: 列の指定が無ければ拒否', rBad.status >= 400, JSON.stringify(rBad.json));
+    const rNoItems = await call('POST', '/api/board/reorder', { view: 'main', col: 'basic_info' });
+    check('並び順: items 無しは 400', rNoItems.status === 400, JSON.stringify(rNoItems.json));
+    // 入力の検証 (黙って main / top に倒さない — Codex R1 高)
+    const rCol = await call('POST', '/api/board/reorder', { view: 'main', col: 'ZZZ-NOPE', items: [{ id: wfDraftId }] });
+    check('並び順: 存在しない列は 400', rCol.status === 400, JSON.stringify(rCol.json));
+    const rView = await call('POST', '/api/board/reorder', { view: 'bogus', col: 'basic_info', items: [{ id: wfDraftId }] });
+    check('並び順: 不正なビューは 400 (黙って本流にしない)', rView.status === 400, JSON.stringify(rView.json));
+    const rKind = await call('POST', '/api/board/reorder', { view: 'image', col: 'request', items: [{ id: wfDraftId, kind: 'bogus' }] });
+    check('並び順: 不正な画像種別は 400 (黙って TOP にしない)', rKind.status === 400, JSON.stringify(rKind.json));
+    const rDup = await call('POST', '/api/board/reorder', {
+      view: 'main', col: 'basic_info', items: [{ id: wfDraftId }, { id: wfDraftId }],
+    });
+    check('並び順: 同じカードの重複は 400', rDup.status === 400, JSON.stringify(rDup.json));
+    const rGhost = await call('POST', '/api/board/reorder', { view: 'main', col: 'basic_info', items: [{ id: 999999 }] });
+    check('並び順: 存在しない商品は 400', rGhost.status === 400, JSON.stringify(rGhost.json));
+    check('並び順: 検証で弾かれた要求は 1 行も書かない',
+      db.prepare('SELECT COUNT(*) AS n FROM ph_board_order').get().n === 0);
+
+    // 戻り先: ボードから開いたら見ていたボードへ。不正な値は一覧に倒す (外部URLへ飛ばさない)
+    check('戻り先: back なしは一覧', backLink.backLinkOf({}).url === '/apps/product-hub/list');
+    check('戻り先: 画像ビュー + 種別 + 未割り当てを復元',
+      backLink.backLinkOf({ back: 'v=board&view=image&kind=detail&filter=unassigned' }).url
+      === '/apps/product-hub/board?view=image&filter=unassigned&kind=detail',
+      backLink.backLinkOf({ back: 'v=board&view=image&kind=detail&filter=unassigned' }).url);
+    check('戻り先: 本流ビューは素のボード',
+      backLink.backLinkOf({ back: 'v=board' }).url === '/apps/product-hub/board');
+    check('戻り先: 担当者は me か数字だけ通す',
+      backLink.backLinkOf({ back: 'v=board&assignee=me' }).url === '/apps/product-hub/board?assignee=me'
+      && backLink.backLinkOf({ back: 'v=board&assignee=12' }).url === '/apps/product-hub/board?assignee=12'
+      && backLink.backLinkOf({ back: 'v=board&assignee=../../evil' }).url === '/apps/product-hub/board');
+    check('戻り先: 外部URLを入れても board 以外へは行かない',
+      backLink.backLinkOf({ back: 'https://evil.example.com/' }).url === '/apps/product-hub/list'
+      && backLink.backLinkOf({ back: 'v=board&view=//evil.example.com' }).url === '/apps/product-hub/board');
+    check('戻り先: 種別は画像ビューのときだけ効く',
+      backLink.backLinkOf({ back: 'v=board&kind=detail' }).url === '/apps/product-hub/board');
+    // ボードのカードリンクに戻り先の印が付いている (これが無いと詳細から一覧に戻ってしまう)
+    const boardHtml = await (await fetch(base + '/board?view=image&kind=top')).text();
+    check('戻り先: ボードのカードリンクに back= が付く',
+      boardHtml.includes('back=v%3Dboard%26view%3Dimage%26kind%3Dtop'),
+      boardHtml.slice(boardHtml.indexOf('kb-card-link'), boardHtml.indexOf('kb-card-link') + 200));
+  }
+
   // ─── 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望) ───
   // 不変条件: own_brand=1 ⟺ image_priority='自社商品（重要度：高）'
   const idOb = Number(db.prepare(`
@@ -4160,6 +4269,8 @@ for (const [name, file, data] of renders) {
     const html = await ejs.renderFile(path.join(views, file),
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
+        // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
+        backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
         imagePriorities: dbmod.IMAGE_PRIORITIES,

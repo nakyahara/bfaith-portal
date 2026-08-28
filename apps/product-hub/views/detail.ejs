@@ -31,7 +31,9 @@
 <div class="wrap wide">
 
   <div style="margin-bottom:12px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
-    <a class="btn" href="/apps/product-hub/list">← 一覧に戻る</a>
+    <%# 戻り先は開いた画面に合わせる (2026-08-28 中原さん要望: ボードのカードから開いたら、
+        直前に見ていた工程ボード (本流 / 画像・絞り込み) に戻す。一覧から開いたら一覧へ) %>
+    <a class="btn" href="<%= backLink.url %>"><%= backLink.label %></a>
     <span class="muted" style="font-size:12px;">
       項目の見方: <span class="ftag ftag-m" style="margin-left:0">手入力</span>=人が入れる /
       <span class="ftag ftag-ai" style="margin-left:0">AI</span>=AIが入れる (直してOK) /
