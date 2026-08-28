@@ -3,6 +3,8 @@
 #   warehouse.db must not take concurrent writers, and vendor "rakuraku follow" also sends around 12:45.
 #   1. coupon : issue this month's 5% coupon if the ledger has none (idempotent; exits before launching
 #               the browser when status is already 'issued', so the daily cost is one SQLite read).
+#               Skipped entirely while the cutover stage is 'shadow' - the vendor still owns every order,
+#               so a coupon issued now would sit unused in the store.
 #               Failure does NOT stop the job: follow mails need no coupon, and the sender gates coupon
 #               mails on the ledger anyway (no_monthly_coupon = fail-closed). Yahoo coupons run from the
 #               1st to the end of the NEXT month, so two months overlap and the sender falls back to any
@@ -21,11 +23,21 @@ $env:PLAYWRIGHT_BROWSERS_PATH = 'C:\Users\bfaith\AppData\Local\ms-playwright'
 $env:HEADLESS = '1'
 $worst = 0
 
-$month = Get-Date -Format 'yyyy-MM'
-node scripts\mall-csv-fetcher\yahoo-review-coupon-issue.mjs --month $month --live
+# Do not create coupons while every order still belongs to the vendor (stage = shadow):
+# there is nothing to send, so issuing one would just leave an unused coupon in the store every month.
+$stage = (node apps\warehouse\plan-rakuten-review-campaigns.js cutover-stage --mall yahoo | Select-Object -Last 1)
 if ($LASTEXITCODE -ne 0) {
-  Write-Output "[run] coupon step failed (exit $LASTEXITCODE) - continuing (follow mails do not need it)"
+  Write-Output "[run] cannot read cutover stage (exit $LASTEXITCODE) - coupon step skipped"
   if ($LASTEXITCODE -gt $worst) { $worst = $LASTEXITCODE }
+} elseif ($stage -eq 'shadow') {
+  Write-Output "[run] cutover stage is shadow - coupon step skipped (nothing to send yet)"
+} else {
+  $month = Get-Date -Format 'yyyy-MM'
+  node scripts\mall-csv-fetcher\yahoo-review-coupon-issue.mjs --month $month --live
+  if ($LASTEXITCODE -ne 0) {
+    Write-Output "[run] coupon step failed (exit $LASTEXITCODE) - continuing (follow mails do not need it)"
+    if ($LASTEXITCODE -gt $worst) { $worst = $LASTEXITCODE }
+  }
 }
 
 node apps\warehouse\plan-rakuten-review-campaigns.js plan --mall yahoo
