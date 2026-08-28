@@ -36,12 +36,14 @@ function Invoke-Icacls([string[]]$argv) {
   & icacls.exe @argv | Out-Null
   if ($LASTEXITCODE -ne 0) { throw ("icacls failed (exit " + $LASTEXITCODE + "): icacls " + ($argv -join ' ')) }
 }
-# Rights to deny = the specific write/delete/ACL rights ONLY. Never use the generic 'W': it expands to
-# FILE_GENERIC_WRITE which includes SYNCHRONIZE, and denying SYNCHRONIZE blocks ordinary read opens too
-# (found on the miniPC: powershell -File bin\run-ph-generate.ps1 -> access denied, and Claude Code could not
-# have read settings.json). WD=write data/add file, AD=append/add subdir, WEA/WA=write attributes,
-# D=delete, DC=delete child, WDAC=write DACL, WO=write owner.
-$DenyRights = 'WD,AD,WEA,WA,D,DC,WDAC,WO'
+# Rights to deny = the specific write/delete/ACL rights ONLY, measured on the miniPC (2026-08-28):
+#   - generic 'W' and the simple right 'D' (delete access) both make .NET / PowerShell READS fail
+#     (powershell -File bin\run-ph-generate.ps1 -> access denied; Claude Code could not read settings.json),
+#     while node still reads fine - so a naive "node works" test hides it.
+#   - WD,AD,WEA,WA,DE,DC,WDAC,WO: read OK for .NET/PowerShell/node, append/write denied.
+# WD=write data/add file, AD=append/add subdir, WEA/WA=write attributes, DE=delete, DC=delete child,
+# WDAC=write DACL, WO=write owner.
+$DenyRights = 'WD,AD,WEA,WA,DE,DC,WDAC,WO'
 function Unprotect([string]$p) { if (Test-Path $p) { Invoke-Icacls @($p, '/remove:d', $Me) } }
 function Protect([string]$p, [bool]$isDir) {
   if ($isDir) { Invoke-Icacls @($p, '/deny', ($Me + ':(OI)(CI)(' + $DenyRights + ')')) }
@@ -54,7 +56,7 @@ function Assert-Denied([string]$p, [bool]$isDir) {
   if ($LASTEXITCODE -ne 0) { throw "icacls query failed on $p" }
   $inh = ''
   if ($isDir) { $inh = '\(OI\)\(CI\)' }
-  $re = [regex]::Escape($Me) + ':' + $inh + '(\(I\))?\(DENY\)\((?=[^)]*\bWD\b)(?=[^)]*\bAD\b)(?=[^)]*\bD\b)(?=[^)]*\bDC\b)(?=[^)]*\bWDAC\b)(?=[^)]*\bWO\b)[^)]*\)'
+  $re = [regex]::Escape($Me) + ':' + $inh + '(\(I\))?\(DENY\)\((?=[^)]*\bWD\b)(?=[^)]*\bAD\b)(?=[^)]*\bDE\b)(?=[^)]*\bDC\b)(?=[^)]*\bWDAC\b)(?=[^)]*\bWO\b)[^)]*\)'
   if (-not (($lines -join "`n") -match $re)) { throw "deny ACE missing or incomplete on $p" }
   if (-not $isDir) {
     try { [IO.File]::ReadAllBytes($p) | Out-Null } catch { throw "protected file is not readable (deny too broad?): $p" }
