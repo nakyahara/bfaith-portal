@@ -12,7 +12,7 @@ import { PDFDocument, StandardFonts } from 'pdf-lib';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'packing-manifest-test-'));
 process.env.DATA_DIR = tmpDir;
 
-const { verifyManifest, pageHasContent, isSorterFailureText, MIN_INK_RATIO } = await import('../reprint-pdf.js');
+const { verifyManifest, pageHasContent, isSorterFailureText, MIN_INK_RATIO, INVOICE_PDF_RE } = await import('../reprint-pdf.js');
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -136,6 +136,37 @@ console.log('\n── verifyManifest: 止める場合 (fail-closed) ──');
   // ⭐梱包バッチの取込時刻との前後比較は使わない: 並び替えと取込のどちらが先かは運用で
   // 変わるため、常に「古い」判定になって新経路が一度も有効にならない事故になり得る
   // (Codexレビュー指摘5)。世代は「manifestが今の納品書から作られたか」で見る
+}
+
+console.log('\n── 納品書の数え方が並び替えツール (Python) と同期しているか ──');
+{
+  // 🚨 2026-08-28 本番: 読み手が `納品書` の部分一致で数えて `納品書_出荷_32.csv` まで拾い、
+  //    納品書PDFだけを記録する並び替え側と件数が合わず、manifest経路が一度も通らなかった
+  //    (全フォルダで位置推定に落ちていた)。片側だけ直しても同じ事故が再発するので、
+  //    Python の INVOICE_RE を実読して JS 側と同じであることを固定する
+  const py = fs.readFileSync(
+    path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+      '..', '..', 'aes-pdf-sorter', 'python', 'drive_worker.py'), 'utf8');
+  const m = /^INVOICE_RE\s*=\s*re\.compile\(r'([^']+)'/m.exec(py);
+  ok(!!m, 'drive_worker.py から INVOICE_RE を読み取れる');
+  if (m) {
+    eq(INVOICE_PDF_RE.source, m[1],
+      '納品書の判定条件が並び替えツールと一致 (ズレると manifest経路が永久に不成立)');
+  }
+
+  // 実データ (出荷_32) の並び: 納品書PDF 1件 + 納品書CSV 1件。CSVを数に入れてはいけない
+  const listed = [
+    { filename: '納品書_出荷_32.csv', modified_time: '2026-08-28T05:51:39.502Z' },
+    { filename: '納品書_32.pdf', modified_time: '2026-08-28T05:51:34.879Z' },
+  ];
+  const invoices = listed.filter((f) => INVOICE_PDF_RE.test(f.filename));
+  eq(invoices.map((f) => f.filename), ['納品書_32.pdf'], '納品書CSVは世代照合の対象外');
+  const v = verifyManifest(baseManifest({
+    invoice_files: [{ name: '納品書_32.pdf', modified_time: '2026-08-28T05:51:34.879Z' }],
+  }), ctx({
+    invoiceFiles: invoices.map((f) => ({ name: f.filename, modified_time: f.modified_time })),
+  }));
+  eq({ ok: v.ok, page: v.page }, { ok: true, page: 1 }, '同じフォルダにCSVがあっても manifest経路が通る');
 }
 
 console.log('\n── verifyManifest: 白紙 ──');

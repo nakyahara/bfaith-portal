@@ -26,6 +26,15 @@ export const MANIFEST_NAME = 'AES送り状_並び替え済_manifest.json';
 export const SORTED_PDF_NAME = 'AES送り状_並び替え済.pdf';
 export const SORTER_ERROR_TXT = 'AES送り状_エラー.txt';
 
+// 🚨 manifest が「いまの納品書から作られたか」を照合するための、納品書ファイルの判定条件。
+// **並び替えツール側 (apps/aes-pdf-sorter/python/drive_worker.py の INVOICE_RE) と同一でなければ
+// ならない**。ここがズレると manifest に記録された納品書の集合と、いま数えた集合が永久に
+// 一致せず、manifest経路が一度も有効にならないまま位置推定に落ち続ける (2026-08-28 本番)。
+// 実際に踏んだズレ: 読み手が `納品書` の部分一致で数えたため `納品書_出荷_32.csv` まで拾い、
+// PDFだけを記録している並び替え側と件数が合わなかった。
+// 同期は tests/test-reprint-manifest.mjs が drive_worker.py を実読して検証する。
+export const INVOICE_PDF_RE = /^納品書_.*\.pdf$/i;
+
 // 白紙判定のしきい値 (manifest の ink_ratio = 低解像度描画の非白ピクセル率)。
 // 実データを見て調整できるよう env で上書き可能にするが、envの打ち間違いで安全境界が
 // 壊れないよう (0,1] の有限数に限る。範囲外・非数は既定値に戻す (Codexレビュー指摘1)
@@ -302,7 +311,10 @@ export async function extractReprintPdf({
       const pdf = await download(sortedPdfFile, 60 * 1024 * 1024);
       const mf = await download(manifestFile, 8 * 1024 * 1024);
       const manifest = JSON.parse(mf.buffer.toString('utf8'));
-      const invoices = await driveCall(() => listDriveFilesAcross({ folders, nameContains: '納品書' }));
+      // Drive の nameContains は部分一致なので `納品書_出荷_32.csv` 等も返る。
+      // 並び替え側が記録するのは納品書**PDF**だけなので、同じ条件まで絞ってから突き合わせる
+      const invoices = (await driveCall(() => listDriveFilesAcross({ folders, nameContains: '納品書' })))
+        .filter((f) => INVOICE_PDF_RE.test(f.filename));
       // エラーtxtは成功時にも「解消済み」で上書きされるので、中身まで見て失敗か解消かを判別する
       let errorTxt = null;
       if (errorTxtDup.length === 1) {
