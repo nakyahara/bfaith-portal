@@ -22,7 +22,7 @@ import multer from 'multer';
 import {
   initPackingDB, getDB, jstToday, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, STATUS_LABELS, MATCH_LABELS,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinters, agentPrintersOf,
 } from './db.js';
 import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
@@ -32,12 +32,15 @@ import {
   resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
-import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR, LabelUnusableError } from './reprint-pdf.js';
+import {
+  extractReprintPdf, cleanupReprintPdfs, detectOkurijoSlug, REPRINTS_DIR, LabelUnusableError,
+} from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
 import {
   enqueuePrintJob, leaseNextJob, findLeasedJob, claimPdfForPrint, failBeforeDispatch,
   markSubmitted, markFinished, recordHeartbeat, listPrintJobs, markAlerted, alertTextFor,
-  getJobStatusFor, LEASE_SEC, PRINT_STATE_LABELS,
+  getJobStatusFor, listPrintRoutes, setPrintRoute, SLUG_LABELS,
+  LEASE_SEC, PRINT_STATE_LABELS,
 } from './print-queue.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
@@ -187,9 +190,9 @@ router.use('/print', requirePrintAgent);
 
 /** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る)。 */
 router.get('/print/next', requirePrintAgent, api(async (req, res) => {
-  // 出力先が決まっていない端末には**lease する前に**断る。どこに出るか分からないまま
-  // 刷らせないのが目的だが、掴んでから断ると試行回数だけ減って正常なジョブが failed に落ちる
-  if (!req.printAgent.printer_name) {
+  // このPCから出せるプリンターが1つも登録されていない端末には**lease する前に**断る。
+  // 掴んでから断ると試行回数だけ減って正常なジョブが failed に落ちる
+  if (agentPrintersOf(req.printAgent.id).length === 0) {
     return res.status(409).json({ error: 'この端末に出力先プリンターが登録されていません' });
   }
   const job = leaseNextJob(req.printAgent);
@@ -561,9 +564,15 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
           // その条件は enqueuePrintJob の SQL が上の UPDATE 済みの行を直接見て判定する
           // (呼び出し側の if に任せると、入口が増えたとき位置推定のPDFが積まれる)。
           // 位置推定で見つけた分は今までどおり**リンクだけ**渡して人が見て印刷する
-          const queued = enqueuePrintJob(row.id, { pdfSha256: r.sha256 });
-          await postReprintText(queued
-            ? `🖨 ${row.ne_slip_no} の送り状を出荷PCで印刷します (${r.file})。念のためのリンク: ${url}`
+          // 出力先は**引当分類 (送り状発行ソフト) ごと**に決まる (ヤマトB2 / DENZOU /
+          // ゆうプリR / 汎用送り状 で物理プリンターが違う)。フォルダの okurijo_<slug>_*.csv から読む
+          const slug = await detectOkurijoSlug(row.folder_name);
+          const queued = enqueuePrintJob(row.id, { pdfSha256: r.sha256, slug });
+          if (queued && !queued.id) {
+            console.warn(`[packing-reprint] ${row.ne_slip_no}: 自動印刷しません (${queued.reason} slug=${queued.slug ?? '-'})`);
+          }
+          await postReprintText(queued?.id
+            ? `🖨 ${row.ne_slip_no} の送り状を印刷します (${queued.printer})。念のためのリンク: ${url}`
             : `📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
         } catch (e) {
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_error=? WHERE id=?')
@@ -1270,9 +1279,27 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
     isAdmin: true,
     devices: listDevices(),
     printJobs: listPrintJobs(30),
+    routes: listPrintRoutes(),
+    SLUG_LABELS,
     PRINT_STATE_LABELS,
   });
 });
+
+/** 引当分類 → プリンター の対応表を編集する。 */
+router.post('/admin/print-routes', checkOrigin, requireAdmin, api(async (req, res) => {
+  const r = setPrintRoute(req.body.slug, req.body.printer_name, req.session.email, req.body.note);
+  if (!r.ok) throw new PackError(400, r.reason, r.message || '入力を確認してください');
+  // orphan = その名前を登録している端末が無い → 積まれても誰も取りに来ず滞留する
+  res.json({ ok: true, deleted: !!r.deleted, orphan: !!r.orphan });
+}));
+
+/** 端末から出せるプリンターを付け替える (登録し直さずに増減できるように)。 */
+router.post('/admin/devices/:id(\\d+)/printers', checkOrigin, requireAdmin, api(async (req, res) => {
+  const names = Array.isArray(req.body.printers) ? req.body.printers : [];
+  const r = setAgentPrinters(Number(req.params.id), names);
+  if (!r.ok) throw new PackError(400, r.reason, r.message);
+  res.json({ ok: true, printers: r.printers });
+}));
 
 /**
  * この端末 (iPad) を登録する。発行トークンは httpOnly Cookie としてこの端末にだけ渡す。
@@ -1288,12 +1315,25 @@ router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) =>
   //   - 管理者セッションは破棄しない (登録している端末 = 中原さんのPCで、共用端末ではない)
   //   - 出力先プリンター名をサーバ側で紐づける (エージェントの設定ミスで別プリンターに出さない)
   if (String(req.body.kind || '') === 'agent') {
-    const printerName = String(req.body.printer_name || '').trim();
-    if (!printerName || printerName.length > 120) {
-      throw new PackError(400, 'bad_printer', 'プリンター名を入力してください (出荷PCの「プリンターとスキャナー」の表記どおり)');
+    // 1台のPCに複数のプリンターがぶら下がる (出荷PC / 倉庫PC)。ここに登録した名前**だけ**が
+    // そのPCの出力先候補になる。どのジョブをどれに出すかは引当分類の対応表が決める
+    // 検証は setAgentPrinters に一本化する。ここで空項目を捨てると、
+    // 「新規登録は通るのに付け替えは400」と入口ごとに基準が変わり、
+    // 登録できたつもりで1つ入っていない状態を作る
+    const names = Array.isArray(req.body.printers) ? req.body.printers
+      : (req.body.printer_name == null ? [] : [req.body.printer_name]);
+    if (names.length === 0) {
+      throw new PackError(400, 'bad_printer',
+        'このPCから出せるプリンター名を1つ以上入力してください (「プリンターとスキャナー」の表記どおり)');
     }
-    const { token, id } = createDevice(label, req.session.email, { kind: 'agent', printerName });
-    return res.json({ ok: true, kind: 'agent', id, token, printer_name: printerName });
+    const { token, id } = createDevice(label, req.session.email, { kind: 'agent' });
+    const set = setAgentPrinters(id, names);
+    if (!set.ok) {
+      // 端末だけ作って中身が入らない状態を残さない (登録できたつもりで印刷されない事故を防ぐ)
+      revokeDevice(id);
+      throw new PackError(400, set.reason, set.message);
+    }
+    return res.json({ ok: true, kind: 'agent', id, token, printers: set.printers });
   }
 
   const { token, id: deviceId } = createDevice(label, req.session.email);
