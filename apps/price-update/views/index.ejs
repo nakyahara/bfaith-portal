@@ -234,6 +234,7 @@
 
     document.querySelectorAll('.price-in').forEach((el) => { el.onchange = onInputChange; });
     document.querySelectorAll('.sel').forEach((el) => { el.onchange = onInputChange; });
+    if (saving) setInputsDisabled(true);   // 記録中に応答が来て描き直しても入力は止めたまま
   }
 
   // 入力のたびにサーバへ送らないよう少しまとめる。
@@ -243,6 +244,7 @@
   let timer = null;
   let chain = Promise.resolve();
   let enqueueSeq = 0;
+  let saving = false;   // 記録中は再描画しても入力を止めたままにする
 
   /** 送信内容は「キューに入れた時点の画面」で固定する (実行時に読むと、その間の入力とずれる) */
   function snapshotPayload() {
@@ -268,16 +270,17 @@
   function setInputsDisabled(v) {
     document.querySelectorAll('.price-in, .sel, .cost-in').forEach((el) => { el.disabled = v; });
   }
-  /** 保存前: 入力を止めて、キューが完全に静止するまで待つ。失敗していれば例外を投げる */
+  /**
+   * 保存前: 入力を止めて、キューが完全に静止するまで待つ。失敗していれば例外を投げる。
+   * ★ここでは入力を戻さない。記録API の応答を待つ間に入力されると、
+   *   画面の最新値が記録されないまま保存が確定してしまう。戻すのは保存に失敗した時だけ (save 側)
+   */
   async function flushPreview() {
+    saving = true;
     setInputsDisabled(true);
-    try {
-      if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
-      let last;
-      do { last = chain; await chain; } while (last !== chain);
-    } finally {
-      setInputsDisabled(false);
-    }
+    if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
+    let last;
+    do { last = chain; await chain; } while (last !== chain);
   }
 
   async function sendPreview(payload, mySeq) {
@@ -307,6 +310,9 @@
       const r = await api('/apps/price-update/api/runs', { previewId, note: $('run-note').value });
       location.href = '/apps/price-update/runs/' + r.runId;
     } catch (e) {
+      // 失敗した時だけ入力を戻す (成功時は画面遷移するまで止めたまま)
+      saving = false;
+      setInputsDisabled(false);
       $('save-msg').textContent = 'エラー: ' + e.message;
       $('save-btn').disabled = false;
     }
