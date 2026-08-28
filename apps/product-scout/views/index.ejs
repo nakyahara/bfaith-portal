@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>新商品企画スカウト | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/apps/product-scout/public/product-scout.css">
+  <link rel="stylesheet" href="/mobile.css">
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🔎 新商品企画スカウト</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/" class="btn-logout">← ダッシュボード</a>
+      <a href="/logout" class="btn-logout">ログアウト</a>
+    </div>
+  </header>
+
+  <main class="ps-main">
+
+    <!-- ① 信号 — 5秒で「順調 / 詰まっている / 投入待ち」が分かること -->
+    <section class="ps-signal ps-signal-<%= signal.level %>">
+      <div class="ps-signal-mark"><%= signal.level === 'green' ? '🟢' : (signal.level === 'yellow' ? '🟡' : (signal.level === 'red' ? '🔴' : '⬜')) %></div>
+      <div class="ps-signal-body">
+        <div class="ps-signal-title"><%= signal.title %></div>
+        <div class="ps-signal-detail"><%= signal.detail %></div>
+        <% if (snapshot) { %>
+          <div class="ps-signal-meta">
+            最終取り込み <%= new Date(snapshot.ingested_at).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) %>
+            ／ 集計対象 <%= (snapshot.after_base_filter || 0).toLocaleString() %>商品 → <%= (snapshot.concept_count || 0).toLocaleString() %>テーマ
+          </div>
+        <% } %>
+      </div>
+    </section>
+
+    <!-- ② 工程表 — 7カテゴリ全部を常に出す。現在のカテゴリだけでは1周の停滞が見えない -->
+    <section class="ps-card">
+      <h2>収集の工程</h2>
+      <table class="ps-table">
+        <thead>
+          <tr><th>カテゴリ</th><th>状態</th><th>取得</th><th class="ps-num">対象ASIN</th><th>分母の質</th><th>最終取得</th></tr>
+        </thead>
+        <tbody>
+        <% if (!categories.length) { %>
+          <tr><td colspan="6" class="ps-empty">まだ取り込みがありません</td></tr>
+        <% } %>
+        <% categories.forEach(function (c) {
+             const pct = (c.asin_target && c.fetched != null) ? Math.floor(c.fetched / c.asin_target * 100) : null; %>
+          <tr>
+            <td><%= c.name %></td>
+            <td>
+              <% if (c.state === 'collecting') { %><span class="ps-badge ps-badge-run">収集中</span>
+              <% } else if (c.state === 'collected') { %><span class="ps-badge ps-badge-done">取得済み</span>
+              <% } else if (c.state === 'queued') { %><span class="ps-badge">投入済み</span>
+              <% } else { %><span class="ps-badge ps-badge-wait">未投入</span><% } %>
+            </td>
+            <td>
+              <% if (pct === null) { %>—
+              <% } else { %>
+                <div class="ps-bar"><div class="ps-bar-fill" style="width: <%= Math.min(100, pct) %>%"></div></div>
+                <%# ⭐分母が不完全なら「100%」と言ってはいけない。取りこぼしが確定しているので「下限」と書く %>
+                <span class="ps-pct"><%= c.complete === 0 ? '下限 ' : '' %><%= pct %>%</span>
+              <% } %>
+            </td>
+            <td class="ps-num"><%= c.asin_target ? c.asin_target.toLocaleString() : '—' %></td>
+            <td>
+              <% if (c.complete === 1) { %><span class="ps-ok">完全</span>
+              <% } else if (c.complete === 0) { %><span class="ps-warn">不完全（約<%= (c.estimated_missing || 0).toLocaleString() %>件 取りこぼし）</span>
+              <% } else { %><span class="ps-muted">不明（旧版で取得）</span><% } %>
+            </td>
+            <td class="ps-muted"><%= c.fetched_at ? c.fetched_at.slice(0, 10) : '—' %></td>
+          </tr>
+        <% }); %>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- ③ テーマ一覧 — 審査対象。ASINではなく「作る商品の企画」単位 -->
+    <section class="ps-card">
+      <h2>
+        商品テーマ
+        <span class="ps-counts">
+          ゲート通過 <%= counts.pass %> ／ 要確認 <%= counts.unknown %> ／ ゲート落ち <%= counts.fail %>
+          ／ 判断済み <%= counts.decided %>
+        </span>
+      </h2>
+
+      <div class="ps-filters">
+        <span>ゲート:</span>
+        <% ['pass','unknown','fail','all'].forEach(function (g) { %>
+          <a class="ps-chip <%= gate === g ? 'on' : '' %>" href="?gate=<%= g %>&status=<%= status %>&page=1"><%=
+            g === 'pass' ? '通過' : (g === 'unknown' ? '要確認' : (g === 'fail' ? '落ち' : 'すべて')) %></a>
+        <% }); %>
+        <span class="ps-sep"></span>
+        <span>判断:</span>
+        <% ['undecided','adopt','hold','reject','all'].forEach(function (s) { %>
+          <a class="ps-chip <%= status === s ? 'on' : '' %>" href="?gate=<%= gate %>&status=<%= s %>&page=1"><%=
+            s === 'undecided' ? '未判断' : (s === 'adopt' ? '採用' : (s === 'hold' ? '保留' : (s === 'reject' ? '不採用' : 'すべて'))) %></a>
+        <% }); %>
+      </div>
+
+      <% if (!concepts.length) { %>
+        <p class="ps-empty">該当するテーマがありません。</p>
+      <% } else { %>
+        <p class="ps-muted ps-range">
+          <%= total.toLocaleString() %>件中 <%= (((page - 1) * pageSize) + 1).toLocaleString() %>〜<%= Math.min(total, page * pageSize).toLocaleString() %>件目
+          （<%= page %> / <%= totalPages %> ページ）
+        </p>
+      <% } %>
+
+      <% concepts.forEach(function (c) { %>
+        <article class="ps-concept" data-id="<%= c.concept_id %>">
+          <header class="ps-concept-head">
+            <div>
+              <span class="ps-rank">#<%= c.rank_in_snapshot %></span>
+              <span class="ps-concept-name"><%= c.concept %></span>
+              <span class="ps-root"><%= c.root_category_name %></span>
+            </div>
+            <div class="ps-gates">
+              <% if (c.hard_gate === 'pass') { %><span class="ps-badge ps-badge-done">ゲート通過</span>
+              <% } else if (c.hard_gate === 'fail') { %><span class="ps-badge ps-badge-ng">落ち</span>
+              <% } else { %><span class="ps-badge ps-badge-wait">要確認</span><% } %>
+              <% if (c.commodity === 'suspect') { %><span class="ps-badge ps-badge-ng">中華コモディティ疑い</span><% } %>
+              <% if (c.big_brand === 'dominated') { %><span class="ps-badge ps-badge-wait">大手が押さえている</span><% } %>
+              <% if (c.decision) { %><span class="ps-badge ps-badge-<%= c.decision %>"><%=
+                c.decision === 'adopt' ? '採用' : (c.decision === 'reject' ? '不採用' : '保留') %></span><% } %>
+            </div>
+          </header>
+
+          <% if (c.gate_fail_reason) { %>
+            <p class="ps-reason">⛔ <%= c.gate_fail_reason %></p>
+          <% } %>
+
+          <div class="ps-metrics">
+            <div><b><%= (c.total_monthly_sold || 0).toLocaleString() %></b><span>総月販(下限)</span></div>
+            <div><b><%= c.product_count %></b><span>商品数</span></div>
+            <div><b><%= c.brand_count %></b><span>ブランド数</span></div>
+            <div><b><%= c.top1_share_pct %>%</b><span>Top1シェア</span></div>
+            <div><b>¥<%= (c.median_price || 0).toLocaleString() %></b><span>中央価格</span></div>
+            <div><b><%= c.median_fee_pct %>%</b><span>手数料</span></div>
+            <div><b><%= c.small_size_rate_pct == null ? '—' : c.small_size_rate_pct + '%' %></b><span>小型率</span></div>
+            <div><b><%= c.median_review_count %></b><span>レビュー中央</span></div>
+          </div>
+
+          <p class="ps-form">作り方: <b><%= c.form %></b>　Top1: <%= c.top1_brand %>
+            <%# ⭐データがいつ時点のものかを必ず出す。7カテゴリを1周する間に月販の集合は変わる %>
+            <span class="ps-muted">／ データ <%= c.source_fetched_at ? c.source_fetched_at.slice(0, 10) : '不明' %>時点<%=
+              c.source_complete === 0 ? '・分母が不完全' : '' %></span>
+          </p>
+
+          <details class="ps-examples">
+            <summary>代表商品 <%= (c.examples || []).length %>件</summary>
+            <ul>
+              <% (c.examples || []).forEach(function (e) { %>
+                <li>
+                  <a href="https://www.amazon.co.jp/dp/<%= e.asin %>" target="_blank" rel="noopener"><%= e.asin %></a>
+                  <b><%= e.brand %></b> <%= e.title %>
+                  <span class="ps-muted">月販<%= (e.monthlySold || 0).toLocaleString() %> / ¥<%= (e.price || 0).toLocaleString() %> / レビュー<%= e.reviewCount || 0 %></span>
+                </li>
+              <% }); %>
+            </ul>
+          </details>
+
+          <% if (c.decision) { %>
+            <p class="ps-decided">
+              <%= c.decision === 'adopt' ? '採用' : (c.decision === 'reject' ? '不採用' : '保留') %>
+              <% if (c.reason_code) { %>（<%= c.reason_code %>）<% } %>
+              <% if (c.comment) { %>: <%= c.comment %><% } %>
+              <span class="ps-muted">— <%= c.decided_by %> <%= c.decided_at ? c.decided_at.slice(0, 10) : '' %></span>
+            </p>
+            <% if (c.recheck_condition) { %><p class="ps-recheck">再審査条件: <%= c.recheck_condition %></p><% } %>
+          <% } %>
+
+          <form class="ps-decide">
+            <select name="decision">
+              <option value="">判断を選ぶ…</option>
+              <option value="adopt">採用（次の調査へ進める）</option>
+              <option value="hold">保留（情報不足・時期not now）</option>
+              <option value="reject">不採用</option>
+            </select>
+            <select name="reasonCode" class="ps-reason-select" hidden>
+              <option value="">不採用の理由を選ぶ…</option>
+              <% reasonCodes.forEach(function (r) { %>
+                <option value="<%= r.code %>"><%= r.label %></option>
+              <% }); %>
+            </select>
+            <input type="text" name="comment" placeholder="コメント（任意）" maxlength="500">
+            <input type="text" name="recheckCondition" placeholder="再審査条件（例: 原料が30%下がれば再検討）" maxlength="200">
+            <button type="submit">記録する</button>
+            <span class="ps-msg"></span>
+          </form>
+        </article>
+      <% }); %>
+
+      <% if (totalPages > 1) { %>
+        <nav class="ps-pager">
+          <% if (page > 1) { %>
+            <a class="ps-chip" href="?gate=<%= gate %>&status=<%= status %>&page=<%= page - 1 %>">← 前の<%= pageSize %>件</a>
+          <% } %>
+          <span class="ps-muted"><%= page %> / <%= totalPages %></span>
+          <% if (page < totalPages) { %>
+            <a class="ps-chip" href="?gate=<%= gate %>&status=<%= status %>&page=<%= page + 1 %>">次の<%= pageSize %>件 →</a>
+          <% } %>
+        </nav>
+      <% } %>
+    </section>
+  </main>
+
+  <script src="/apps/product-scout/public/product-scout.js"></script>
+</body>
+</html>
