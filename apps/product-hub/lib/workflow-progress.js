@@ -967,6 +967,118 @@ export function moveBoardCard(
   return run();
 }
 
+/** かんばんの列キー。本流ビューは工程コード、画像ビューは画像ステージのキー、終端は 'done' */
+const BOARD_DONE_COL = 'done';
+
+/**
+ * かんばんの手動並び順を読む (2026-08-28)。
+ * @returns {Map<string, {col: string, sort: number}>} キー = `${draft_id}|${kind}` (本流は kind='')
+ */
+export function loadBoardOrder(db, view, draftIds) {
+  const ids = (Array.isArray(draftIds) ? draftIds : []).map(Number).filter(Number.isInteger);
+  const out = new Map();
+  if (ids.length === 0) return out;
+  // SQLite の変数上限 (999) に当たらないよう分割して引く
+  for (let i = 0; i < ids.length; i += 400) {
+    const chunk = ids.slice(i, i + 400);
+    const rows = db.prepare(`
+      SELECT draft_id, kind, col, sort FROM ph_board_order
+      WHERE view = ? AND draft_id IN (${chunk.map(() => '?').join(',')})
+    `).all(view, ...chunk);
+    for (const r of rows) out.set(`${r.draft_id}|${r.kind || ''}`, { col: r.col, sort: r.sort });
+  }
+  return out;
+}
+
+/** そのビューで実在する列キー (本流=工程コード / 画像=画像ステージ / 終端=done) */
+export function boardColumnKeys(db, view) {
+  const keys = new Set([BOARD_DONE_COL]);
+  const rows = db.prepare(`SELECT code, track, image_stage FROM ph_steps WHERE active = 1`).all();
+  for (const r of rows) {
+    if (view === 'image') {
+      if (r.track === 'image') keys.add(r.image_stage || `code:${r.code}`);
+    } else if (r.track === 'main') {
+      keys.add(r.code);
+    }
+  }
+  return keys;
+}
+
+/**
+ * 1 列ぶんの並び順を保存する (2026-08-28 中原さん要望)。
+ *
+ * 画面から**その列に見えているカードの順番**を受け取る。1 枚ぶんの差分だけを受け取る方式だと、
+ * 既定順のカードと手動順のカードが混ざったとき「動かしたのに戻る」が再発するため。
+ *
+ * ただし画面に見えているのは列の一部でしかない (担当者・未割り当て・種別の絞り込み、
+ * 完了列の直近 30 件、検索)。受け取った順番でそのまま 0 から振り直すと、**画面に出ていない
+ * カードの順番を巻き込んで壊す** (Codex R1 高)。そこで既存の並びに**差し込む**:
+ *   - 送られてきたカードは、そのカードたちが今占めている位置の中だけで入れ替える
+ *   - 送られてこなかったカード (絞り込みで隠れている等) は今の位置のまま動かさない
+ *   - 手動順をまだ持たないカードは、送信順で前後のカードの間に入る
+ *
+ * 競合は最後勝ち。表示順というやり直しの効く情報なので、409 を出して操作を止めない。
+ *
+ * @param {Array<{id: number, kind?: string}>} items 上から順のカード (画面に見えている分)
+ */
+export function saveBoardOrder(db, { view, col, items }) {
+  if (view !== 'main' && view !== 'image') throw badRequest('ビューの指定が不正です');
+  const colKey = String(col || '').trim();
+  if (!colKey) throw badRequest('列が指定されていません');
+  if (!boardColumnKeys(db, view).has(colKey)) throw badRequest(`列 ${colKey} は存在しません`);
+
+  const seen = new Set();
+  const sent = [];
+  for (const raw of (Array.isArray(items) ? items : [])) {
+    const id = Number(raw?.id);
+    if (!Number.isInteger(id) || id <= 0) throw badRequest('カードの指定が不正です');
+    let kind = '';
+    if (view === 'image') {
+      kind = String(raw?.kind ?? '');
+      if (kind !== 'top' && kind !== 'detail') throw badRequest('画像の種別が不正です');
+    }
+    const key = `${id}|${kind}`;
+    // 同じカードが 2 回来たら並びが決まらない (壊れた画面か改ざん)
+    if (seen.has(key)) throw badRequest('同じカードが重複しています');
+    seen.add(key);
+    sent.push({ id, kind, key });
+  }
+  if (sent.length === 0) return { saved: 0 };
+  // 実在しないドラフトは弾く (FK でも落ちるが、理由の分かるエラーにする)
+  const exists = new Set(db.prepare(
+    `SELECT id FROM product_drafts WHERE id IN (${sent.map(() => '?').join(',')})`
+  ).all(...sent.map((x) => x.id)).map((r) => r.id));
+  for (const x of sent) if (!exists.has(x.id)) throw badRequest(`商品 #${x.id} は存在しません`);
+
+  return db.transaction(() => {
+    const existing = db.prepare(`
+      SELECT draft_id, kind FROM ph_board_order WHERE view = ? AND col = ? ORDER BY sort, draft_id, kind
+    `).all(view, colKey).map((r) => ({ id: r.draft_id, kind: r.kind || '', key: `${r.draft_id}|${r.kind || ''}` }));
+    const existingKeys = new Set(existing.map((x) => x.key));
+    const sentKeys = new Set(sent.map((x) => x.key));
+
+    // 既存の並びの「送られてきたカードが占めている位置」に、送信順で入れ直す。
+    // 送信順のうち手動順をまだ持たないカードは、次に来る既存カードの直前に差し込む
+    const merged = [];
+    let i = 0;
+    for (const cur of existing) {
+      if (!sentKeys.has(cur.key)) { merged.push(cur); continue; }
+      while (i < sent.length && !existingKeys.has(sent[i].key)) merged.push(sent[i++]);
+      if (i < sent.length) merged.push(sent[i++]);
+    }
+    while (i < sent.length) merged.push(sent[i++]);
+
+    const up = db.prepare(`
+      INSERT INTO ph_board_order (view, draft_id, kind, col, sort, updated_at)
+      VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      ON CONFLICT (view, draft_id, kind) DO UPDATE SET
+        col = excluded.col, sort = excluded.sort, updated_at = excluded.updated_at
+    `);
+    merged.forEach((x, n) => up.run(view, x.id, x.kind, colKey, n));
+    return { saved: sent.length, ordered: merged.length };
+  })();
+}
+
 /**
  * かんばん 1 枚分のデータ。列 (工程) ごとにカードを振り分けて返す。
  *
@@ -1185,15 +1297,60 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     for (const [id, card] of cardsById) card.malls = malls.get(id) || null;
   }
 
-  // 停滞しているものを上に出す (打ち手が要るカードを埋もれさせない)
-  const order = (a, b) => ((b.kindStalledDays ?? b.stalledDays) || 0) - ((a.kindStalledDays ?? a.stalledDays) || 0) || a.id - b.id;
-  for (const c of columns) c.cards.sort(order);
+  // 並び順。既定は「停滞しているものを上」(打ち手が要るカードを埋もれさせない) だが、
+  // 手で並べ替えたカードはその順を優先する (2026-08-28 中原さん要望)。
+  // 手動順は「その列に置いたもの」だけ効かせる — 工程が変わって別の列に出たカードは
+  // 既定順に戻す (別の列で付けた番号を持ち込むと、置いた覚えのない位置に割り込む)
+  const manual = loadBoardOrder(db, view, drafts.map((d) => d.id));
+  // 手動順の後片付け (Codex R2 中)。詳細画面から工程を進めた場合など、D&D を通らずに列が
+  // 変わったカードは「前の列に置いた記録」が残る。表示には効かないが行が溜まり、あとで
+  // その列を並べ替えたとき見えないカードとして差し込み位置を押し下げる。
+  // **いま描画したカード**だけを対象に、記録の列と実際の列が食い違う行を消す
+  // (絞り込みで描画していないカード・改ざんで入った他所の行も、次に出たときここで消える)
+  {
+    const actual = new Map();
+    for (const c of columns) for (const card of c.cards) actual.set(`${card.id}|${card.kind || ''}`, c.code || c.key);
+    for (const card of doneCards) actual.set(`${card.id}|${card.kind || ''}`, BOARD_DONE_COL);
+    const stale = [...manual.entries()].filter(([k, m]) => actual.has(k) && actual.get(k) !== m.col).map(([k]) => k);
+    if (stale.length > 0) {
+      const del = db.prepare('DELETE FROM ph_board_order WHERE view = ? AND draft_id = ? AND kind = ?');
+      db.transaction(() => {
+        for (const k of stale) {
+          const [id, kind] = k.split('|');
+          del.run(view, Number(id), kind || '');
+          manual.delete(k);
+        }
+      })();
+    }
+  }
+  const manualIn = (colKey) => (c) => {
+    const m = manual.get(`${c.id}|${c.kind || ''}`);
+    return m && m.col === colKey ? m.sort : null;
+  };
+  const defaultOrder = (a, b) => ((b.kindStalledDays ?? b.stalledDays) || 0) - ((a.kindStalledDays ?? a.stalledDays) || 0) || a.id - b.id;
+  const orderIn = (colKey, fallback) => {
+    const mo = manualIn(colKey);
+    return (a, b) => {
+      const ma = mo(a); const mb = mo(b);
+      if (ma != null && mb != null) return ma - mb;
+      if (ma != null) return -1;      // 手で置いたカードは既定順のカードより上
+      if (mb != null) return 1;
+      return fallback(a, b);
+    };
+  };
+  for (const c of columns) c.cards.sort(orderIn(c.code || c.key, defaultOrder));
+  // 完了列は「直近から 30 件」。**先に 30 件を切ってから**手動順を当てる (Codex R2 高:
+  // 先に並べ替えると、昔並べ替えた古い完了カードが新しい完了より上に居座り続けて
+  // 「直近 30 件」でなくなる)。既定の並びは drafts の updated_at DESC のまま触らない —
+  // Array#sort は安定 (ES2019) なので 0 を返せば元の順が保たれる
+  const doneRecent = doneCards.slice(0, 30);
+  doneRecent.sort(orderIn(BOARD_DONE_COL, () => 0));
 
   return {
     view,
     columns,
     // 完了は溜まる一方なので直近だけ (全部見たいときは一覧から)
-    doneCards: doneCards.slice(0, 30),
+    doneCards: doneRecent,
     doneTotal: doneCards.length,
     total: drafts.length,
     truncated,

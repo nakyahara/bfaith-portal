@@ -29,7 +29,7 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard,
+  moveBoardCard, saveBoardOrder,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -37,6 +37,7 @@ import {
 import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
+import { backLinkOf } from './lib/back-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
@@ -276,6 +277,8 @@ router.get('/detail/:id', (req, res) => {
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
+    // 「← 戻る」の戻り先。ボードのカードから開いたらそのボードへ戻す (2026-08-28)
+    backLink: backLinkOf(req.query),
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     skuImages: db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draft.id),
@@ -1992,6 +1995,22 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       actorStaffId: me?.id ?? null,
     });
     res.json({ ok: true, changed: r.changed });
+  } catch (e) { workflowError(res, e); }
+});
+
+// かんばん列の並び替え (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
+// 画面から**その列に見えているカードの順番**を受け取り、既存の並びに差し込む (saveBoardOrder)。
+// 現場の目安情報 (重要度セレクトと同じ扱い) なのでログイン済みなら誰でも並べ替えられる。
+// 工程は動かさないので履歴 (draft_events) には残さない — ドラッグのたびに履歴が埋まる
+router.post('/api/board/reorder', (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : null;
+  if (!items) return res.status(400).json({ ok: false, error: 'items がありません' });
+  if (items.length > 1000) return res.status(400).json({ ok: false, error: 'カードが多すぎます' });
+  try {
+    // view / kind / col は saveBoardOrder 側で厳密に検証する (黙って main / top に倒すと
+    // 画面のバグや壊れたリクエストに気付けない — Codex R1 高)
+    const r = saveBoardOrder(getDB(), { view: req.body?.view, col: req.body?.col, items });
+    res.json({ ok: true, saved: r.saved });
   } catch (e) { workflowError(res, e); }
 });
 
