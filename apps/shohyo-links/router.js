@@ -72,6 +72,12 @@ router.delete('/api/links/:id', (req, res) => {
 // ---- MF会計API連携 (Phase 2) ----
 
 router.get('/mf', (req, res) => {
+  // 末尾スラッシュ (/mf/) だと画面内の相対fetch (api/mf/...) が 1階層ずれるため /mf に寄せる
+  const qIdx = req.originalUrl.indexOf('?');
+  const pathname = qIdx === -1 ? req.originalUrl : req.originalUrl.slice(0, qIdx);
+  if (pathname.endsWith('/')) {
+    return res.redirect(308, `${req.baseUrl}/mf` + (qIdx === -1 ? '' : req.originalUrl.slice(qIdx)));
+  }
   res.sendFile(path.join(__dirname, 'views', 'mf.html'));
 });
 
@@ -85,18 +91,20 @@ router.get('/mf/connect', (req, res) => {
 
 // OAuthコールバック
 router.get('/mf/callback', async (req, res) => {
+  // 相対リダイレクト ('mf?...') は /apps/shohyo-links/mf/callback を基準に解決され /mf/mf になるため絶対パスで返す
+  const backToMf = (q) => res.redirect(`${req.baseUrl}/mf${q}`);
   try {
     const { code, state, error } = req.query;
-    if (error) return res.redirect('mf?error=' + encodeURIComponent(String(error)));
+    if (error) return backToMf('?error=' + encodeURIComponent(String(error)));
     if (!code || !state || state !== req.session.mfOauthState) {
-      return res.redirect('mf?error=state_mismatch');
+      return backToMf('?error=state_mismatch');
     }
     delete req.session.mfOauthState;
     await exchangeCode(String(code));
-    res.redirect('mf?connected=1');
+    backToMf('?connected=1');
   } catch (e) {
     console.error('[shohyo-links] mf callback', e.message, e.detail || '');
-    res.redirect('mf?error=' + encodeURIComponent(e.message));
+    backToMf('?error=' + encodeURIComponent(e.message));
   }
 });
 
@@ -157,14 +165,23 @@ router.post('/api/mf/attach', async (req, res) => {
   try {
     const { journal_id, file_name, file_data } = req.body || {};
     if (!file_name || !file_data) return res.status(400).json({ ok: false, error: 'file_required' });
-    if (String(file_data).length > 15 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large' });
+    // MF証憑API仕様 (developers /specs/vouchers): 1件5MB・名称255文字・1仕訳あたり5件まで
+    if (String(file_name).length > 255) return res.status(400).json({ ok: false, error: 'file_name_too_long' });
+    if (decodedSize_(String(file_data)) > 5 * 1024 * 1024) return res.status(413).json({ ok: false, error: 'file_too_large_5mb' });
     const result = await postVoucher(journal_id || null, String(file_name), String(file_data));
     res.json({ ok: true, result });
   } catch (e) {
     console.error('[shohyo-links] mf attach', e.message, e.detail || '');
-    res.status(e.status === 413 ? 413 : 500).json({ ok: false, error: e.message });
+    const status = e.message === 'mf_not_connected' ? 401 : (e.status === 413 ? 413 : 500);
+    res.status(status).json({ ok: false, error: e.message });
   }
 });
+
+/** base64文字列から元ファイルのバイト数を求める (パディング考慮) */
+function decodedSize_(b64) {
+  const s = b64.replace(/=+$/, '');
+  return Math.floor(s.length * 3 / 4);
+}
 
 /** 仕訳の金額と勘定科目/取引先を表示用に要約する (スキーマ差異に耐えるベストエフォート) */
 function summarize_(j) {

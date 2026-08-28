@@ -82,6 +82,15 @@ function toast(msg) {
   el._t = setTimeout(() => el.classList.remove('show'), 2500);
 }
 
+const ATTACH_ERRORS = {
+  file_too_large_5mb: 'MFの上限は1件5MBです',
+  file_name_too_long: 'ファイル名が長すぎます（255文字まで）',
+  mf_api_400: 'MFに拒否されました（1仕訳の証憑は5件まで・重複や形式をご確認ください）',
+  mf_api_401: 'MFのトークンが失効しています。再接続してください',
+  mf_api_413: 'ファイルサイズがMFの上限を超えています',
+  mf_api_429: 'MFのリクエスト制限に当たりました。少し待って再試行してください',
+};
+
 async function api(path, opts) {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const body = await res.json().catch(() => ({}));
@@ -167,7 +176,9 @@ document.addEventListener('click', (ev) => {
 $('filePicker').addEventListener('change', async () => {
   const file = $('filePicker').files[0];
   if (!file || !attachTarget) return;
-  if (file.size > 10 * 1024 * 1024) return toast('10MB以下のファイルにしてください（大きいものはMFのBox画面から）');
+  // MF証憑APIの制限: 1件5MB・名称255文字・1仕訳あたり5件まで
+  if (file.size > 5 * 1024 * 1024) return toast('MFの上限は1件5MBです（超える場合は分割するかBox画面から）');
+  if (file.name.length > 255) return toast('ファイル名が長すぎます（255文字まで）');
   toast('アップロード中…');
   const b64 = await new Promise((resolve, reject) => {
     const fr = new FileReader();
@@ -183,7 +194,7 @@ $('filePicker').addEventListener('change', async () => {
     toast('添付しました');
     load();
   } catch (e) {
-    toast('添付エラー: ' + e.message);
+    toast('添付エラー: ' + (ATTACH_ERRORS[e.message] || e.message));
   }
 });
 

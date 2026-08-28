@@ -113,25 +113,51 @@ async function ensureAccessToken() {
 
 // ---- APIラッパー ----
 
-async function apiFetch(path, { method = 'GET', body } = {}) {
-  const token = await ensureAccessToken();
-  const res = await fetch(`${API_BASE}${path}`, {
-    method,
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
+// MFのRate Limiter: 1アクセストークンあたり 3リクエスト/秒 (developers /rate_limiter)。
+// 呼び出しを直列化し最低350ms間隔を空ける + 429は Retry-After に従って最大2回リトライする。
+const MIN_INTERVAL_MS = 350;
+let lastCallAt = 0;
+let queue = Promise.resolve();
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function throttled(fn) {
+  const run = queue.then(async () => {
+    const wait = lastCallAt + MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastCallAt = Date.now();
+    return fn();
   });
-  if (res.status === 204) return null;
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(`mf_api_${res.status}`);
-    err.detail = json;
-    err.status = res.status;
-    throw err;
+  queue = run.catch(() => {}); // 失敗しても後続の待ち行列は止めない
+  return run;
+}
+
+async function apiFetch(path, { method = 'GET', body } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    const token = await ensureAccessToken();
+    const res = await throttled(() => fetch(`${API_BASE}${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    }));
+    if (res.status === 429 && attempt < 2) {
+      const retryAfter = Number(res.headers.get('retry-after'));
+      await sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1000 * (attempt + 1));
+      continue;
+    }
+    if (res.status === 204) return null;
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(`mf_api_${res.status}`);
+      err.detail = json;
+      err.status = res.status;
+      throw err;
+    }
+    return json;
   }
-  return json;
 }
 
 export async function currentOffice() {

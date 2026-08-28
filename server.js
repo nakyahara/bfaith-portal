@@ -1308,8 +1308,8 @@ app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossS
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
-// limit 16mb = MF照合画面の証憑添付 (base64 JSONで最大10MBファイルを想定) を受けるため
-app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '16mb' }), shohyoLinksRouter);
+// limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
+app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
