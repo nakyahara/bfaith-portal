@@ -403,6 +403,35 @@ console.log('\n── 応答が失われた再送を成功として受ける (�
 }
 
 
+console.log('\n── 🚨「刷れなかった」と「紙が出たか分からない」を混ぜない ──');
+{
+  // failed の通知は「フォルダから手動で印刷してください」と言う。実は紙が出ていたケースを
+  // ここに流すと、現場がもう1枚刷って**二重印刷**になる (=最重要要件に反する)。
+  // エージェントが確信を持てない場合は uncertain=true で報告させ、unknown にする
+  const mk = (sha) => {
+    const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA(sha), slug: 'aes' });
+    db.prepare("UPDATE pk_print_jobs SET state='manual' WHERE id<? AND state='queued'").run(id);
+    const job = leaseNextJob(agentRow);
+    claimPdfForPrint(id, { deviceId: agentRow.id, leaseToken: job.leaseToken });
+    return { id, lease: job.leaseToken };
+  };
+
+  const a = mk('a');
+  eq(markFinished(a.id, { deviceId: agentRow.id, leaseToken: a.lease, ok: false, error: 'プリンターがありません' }).state,
+    'failed', '確実に出ていない失敗は failed');
+  ok(alertTextFor(db.prepare('SELECT * FROM pk_print_jobs WHERE id=?').get(a.id)).includes('手動で印刷'),
+    'failed の通知は「手動で印刷してください」');
+
+  const b = mk('b');
+  eq(markFinished(b.id, { deviceId: agentRow.id, leaseToken: b.lease, ok: false,
+    error: 'スプーラーに渡した後で落ちました', uncertain: true }).state,
+    'unknown', '🚨 紙が出たか分からない失敗は unknown (failed にしない)');
+  const t = alertTextFor(db.prepare('SELECT * FROM pk_print_jobs WHERE id=?').get(b.id));
+  ok(t.includes('実物を確認'), 'unknown の通知は「実物を確認してください」');
+  ok(!t.includes('手動で印刷'), '🚨 二重印刷を誘発する「手動で印刷してください」を言わない');
+  ok(leaseNextJob(agentRow, { now: at(99999) })?.id !== b.id, 'unknown は自動で刷り直さない');
+}
+
 console.log('\n── 失敗報告 ──');
 {
   const { id } = enqueuePrintJob(newReprint(), { pdfSha256: SHA('1'), slug: 'aes' });

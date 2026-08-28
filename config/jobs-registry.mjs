@@ -71,6 +71,29 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [packing-drive-poller] を確認。失敗台帳は picking.db pk_pack_drive_imports'
       + ' (取込画面 /apps/packing/admin/import にも要確認一覧が出る)。復旧は Restart-Service PickingServer',
   },
+  {
+    id: 'slip-print-agent',
+    type: 'heartbeat',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: '梱包iPadの「🖨 伝票再印刷」を押したら出荷PCのサーマルプリンターから送り状を自動で出す常駐エージェント。'
+      + '出荷PC (DESKTOP-P9JLN7Q) のタスクスケジューラで SYSTEM 実行 (サインイン不要)。'
+      + 'miniPC の印刷キューへ数秒ごとに pull で聞きに行く一方向通信で、miniPC から出荷PCへは繋がない。'
+      + '止まると再印刷の紙が出ないまま滞留する (キュー側も3分で「手で刷ってください」を通知するが、'
+      + '毎回それが出る状態は運用が回らないので P1)',
+    where: '出荷PC C:\\tools\\slip-print-agent\\agent.ps1 (タスク名 BFaith-SlipPrintAgent)',
+    schedule: '常駐 (4秒間隔で /print/next・45秒ごとに heartbeat。生存 ping は1時間に1回へ間引き)',
+    // ⭐ping は**エージェント自身ではなく miniPC が中継する** (出荷PCへ JOBS_MONITOR_TOKEN を
+    //   もう1つ配らずに済ませるため)。miniPC が pk_pack_devices.heartbeat_at を見て、
+    //   10分以内なら ok を打つ = エージェントが死ねば ping も止まりここに出る
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: '出荷PCで Get-Content C:\\tools\\slip-print-agent\\work\\agent.log -Tail 30 / '
+      + 'Get-ScheduledTaskInfo -TaskName BFaith-SlipPrintAgent。'
+      + '401 = トークン失効 → /apps/packing/admin/devices で登録し直す。'
+      + '手順と切り分け表 = リポジトリ scripts/slip-print-agent/README.md。'
+      + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
+  },
   // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
   {
     id: 'inquiry-hub-sync',
