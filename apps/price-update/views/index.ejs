@@ -236,17 +236,23 @@
     document.querySelectorAll('.sel').forEach((el) => { el.onchange = onInputChange; });
   }
 
-  // 入力のたびにサーバへ送らないよう少しまとめる。★保存前には必ず flush する
-  // (待たずに記録すると、画面の入力とサーバ側スナップショット = 監査記録 がずれる)
+  // 入力のたびにサーバへ送らないよう少しまとめる。
+  // ★送信は直列化する (応答が前後して古い入力でサーバ側スナップショットを上書きしないため)。
+  // ★保存前には必ず flush し、失敗したら保存を中止する
+  //   (待たない/握り潰すと、画面の入力とサーバ側スナップショット = 監査記録 がずれる)
   let timer = null;
-  let pending = null;
+  let chain = Promise.resolve();
+  function enqueuePreview() {
+    chain = chain.then(sendPreview, sendPreview);   // 前回が失敗していても最新入力を送り直す
+    return chain;
+  }
   function onInputChange() {
     clearTimeout(timer);
-    timer = setTimeout(function () { pending = sendPreview(); }, 250);
+    timer = setTimeout(function () { timer = null; enqueuePreview(); }, 250);
   }
   async function flushPreview() {
-    if (timer) { clearTimeout(timer); timer = null; pending = sendPreview(); }
-    if (pending) { await pending; pending = null; }
+    if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
+    await chain;   // 直近の送信が失敗していればここで例外 → 呼び出し側 (save) が中止する
   }
 
   async function sendPreview() {
@@ -260,8 +266,11 @@
       const r = await api('/apps/price-update/api/preview', { previewId, rows: payload });
       rows = r.rows;
       render();
+      $('save-msg').textContent = '';
     } catch (e) {
+      // ★握り潰さない。失敗を飲み込むと「画面の入力が反映されていないのに記録できてしまう」
       $('save-msg').textContent = 'エラー: ' + e.message;
+      throw e;
     }
   }
 
