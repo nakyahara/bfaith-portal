@@ -4,6 +4,7 @@ import Database from 'better-sqlite3';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, usableCouponFor, getCouponRow, isValidMonth, findByOperationId,
+  couponUrlMatchesId, isUsableCopySource,
 } from './yahoo-review-coupon-lib.js';
 
 let passed = 0, failed = 0;
@@ -58,6 +59,13 @@ console.log('=== 3. 状態機械 (二重発行より未発行を選ぶ) ===');
   check('submitting からの再 submitting は不可 (作成を二度走らせない)', markSubmitting(db, '2026-09', NOW) === false);
   check('結果不明 → reconcile_required', markReconcileRequired(db, { month: '2026-09', note: '一覧に0件', nowIso: NOW }) === true
     && getCouponRow(db, '2026-09').status === 'reconcile_required');
+  check('URL とクーポンID の一致を要求', couponUrlMatchesId('https://shopping.yahoo.co.jp/coupon/interior/ABCDEF0123456789ABCD', 'ABCDEF0123456789ABCD')
+    && !couponUrlMatchesId('https://shopping.yahoo.co.jp/coupon/interior/ABCDEF0123456789ABCD', 'OTHERID0123456789ABC'));
+  let mismatch = false;
+  try { markIssued(db, { month: '2026-09', couponId: 'OTHERID0123456789ABC', couponUrl: 'https://shopping.yahoo.co.jp/coupon/interior/ABCDEF0123456789ABCD', nowIso: NOW }); } catch { mismatch = true; }
+  check('URL とIDが食い違えば issued にしない', mismatch && getCouponRow(db, '2026-09').status === 'reconcile_required');
+  check('コピー元は定率5%のものだけ', isUsableCopySource({ discountType: '2', discountRatio: '5' })
+    && !isUsableCopySource({ discountType: '1', discountRatio: '5' }) && !isUsableCopySource({ discountType: '2', discountRatio: '10' }) && !isUsableCopySource(null));
   check('reconcile_required からも issued にできる (後から見つかった)',
     markIssued(db, { month: '2026-09', couponId: 'ABCDEF0123456789ABCD', couponUrl: 'https://shopping.yahoo.co.jp/coupon/interior/ABCDEF0123456789ABCD', nowIso: NOW }) === true
     && getCouponRow(db, '2026-09').status === 'issued');
@@ -72,6 +80,9 @@ console.log('=== 3. 状態機械 (二重発行より未発行を選ぶ) ===');
   markSubmitting(db, '2026-10', '2026-10-01T00:00:00.000Z');
   markReconcileRequired(db, { month: '2026-10', note: '応答不明', nowIso: '2026-10-01T00:00:00.000Z' });
   check('24時間以内は据え置き', escalateStale(db, { nowIso: '2026-10-01T12:00:00.000Z' }).length === 0);
+  // 毎日の照合で再マークされても、最初に reconcile_required になった時刻を基準にする (Codex Y-C3 R1 High)
+  markReconcileRequired(db, { month: '2026-10', note: '2日目も見つからない', nowIso: '2026-10-02T00:00:00.000Z' });
+  check('再マークしても reconcile_since は動かない', getCouponRow(db, '2026-10').reconcile_since === '2026-10-01T00:00:00.000Z');
   check('24時間超で manual_intervention', escalateStale(db, { nowIso: '2026-10-03T00:00:00.000Z' }).join() === '2026-10'
     && getCouponRow(db, '2026-10').status === 'manual_intervention');
 }

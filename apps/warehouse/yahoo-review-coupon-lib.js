@@ -21,8 +21,20 @@ export const COUPON_TITLE = '雑貨イズムYahoo!ショッピング店で次回
 export const COUPON_START_HOUR = '00';
 export const COUPON_END_HOUR = '23';
 export const OP_ID_PREFIX = 'RVW';
+// コピー元クーポンに要求する条件 (一覧の hidden input。実測 2026-08-27: vendor の月次クーポン)
+export const SOURCE_DISCOUNT_TYPE = '2';   // 2 = 定率割引
+/** コピー元として使える行か (定率5%であること)。違えば作成しない = 定額や別条件のクーポンを増殖させない */
+export function isUsableCopySource(row) {
+  return !!row && String(row.discountType) === SOURCE_DISCOUNT_TYPE && String(row.discountRatio) === String(COUPON_DISCOUNT_RATIO);
+}
 
 export function ensureYahooCouponLedger(db) {
+  const migrate = (t, col, ddl) => {
+    const has = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
+    if (!has) return;
+    const cols = db.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name);
+    if (!cols.includes(col)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${ddl}`);
+  };
   db.exec(`CREATE TABLE IF NOT EXISTS yahoo_campaign_coupons (
     month        TEXT PRIMARY KEY CHECK (month GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]'),
     status       TEXT NOT NULL CHECK (status IN ('planned','submitting','reconcile_required','issued','manual_intervention','abandoned')),
@@ -33,10 +45,12 @@ export function ensureYahooCouponLedger(db) {
     coupon_end   TEXT NOT NULL,
     reserved_at  TEXT NOT NULL,
     submitted_at TEXT,
+    reconcile_since TEXT,
     issued_at    TEXT,
     note         TEXT,
     updated_at   TEXT NOT NULL
   )`);
+  migrate('yahoo_campaign_coupons', 'reconcile_since', 'reconcile_since TEXT');
 }
 
 /** 'YYYY-MM' の妥当性 */
@@ -136,24 +150,35 @@ export function markSubmitting(db, month, nowIso = new Date().toISOString()) {
 /** 照合できた → issued (URL は検証済みのものだけ) */
 export function markIssued(db, { month, couponId, couponUrl, nowIso = new Date().toISOString() }) {
   if (!isValidCouponUrl(couponUrl)) throw new Error(`獲得URLが不正 (${String(couponUrl).slice(0, 60)})`);
+  if (!couponUrlMatchesId(couponUrl, couponId)) throw new Error(`獲得URLがクーポンIDと一致しない (id=${String(couponId).slice(0, 24)})`);
   const r = db.prepare(`UPDATE yahoo_campaign_coupons SET status = 'issued', coupon_id = ?, coupon_url = ?, issued_at = ?, note = NULL, updated_at = ?
                          WHERE month = ? AND status IN ('submitting','reconcile_required')`)
     .run(couponId, couponUrl, nowIso, nowIso, month);
   return r.changes === 1;
 }
 
+/** 獲得URLの末尾がそのクーポンIDであること (別クーポンの URL を掴んでいないか — Codex Y-C3 R1 Medium) */
+export function couponUrlMatchesId(url, couponId) {
+  if (!isValidCouponUrl(url) || !/^[A-Za-z0-9]{16,}$/.test(String(couponId || ''))) return false;
+  return String(url).replace(/\/$/, '').endsWith(`/${couponId}`);
+}
+
 /** 結果不明・0件・複数 → reconcile_required (作成は再試行しない) */
 export function markReconcileRequired(db, { month, note, nowIso = new Date().toISOString() }) {
-  const r = db.prepare(`UPDATE yahoo_campaign_coupons SET status = 'reconcile_required', note = ?, updated_at = ?
-                         WHERE month = ? AND status IN ('submitting','reconcile_required')`)
-    .run(String(note || '').slice(0, 300), nowIso, month);
+  // reconcile_since は「最初に reconcile_required になった時刻」を保つ (Codex Y-C3 R1 High:
+  // updated_at を基準にすると、毎回の照合で更新され続けて 24 時間のエスカレーションが永久に発火しない)
+  const r = db.prepare(`UPDATE yahoo_campaign_coupons
+       SET status = 'reconcile_required', note = ?, updated_at = ?,
+           reconcile_since = COALESCE(reconcile_since, ?)
+     WHERE month = ? AND status IN ('submitting','reconcile_required')`)
+    .run(String(note || '').slice(0, 300), nowIso, nowIso, month);
   return r.changes === 1;
 }
 
 /** 24時間解決しない reconcile_required を人手対応へ上げる */
 export function escalateStale(db, { hours = 24, nowIso = new Date().toISOString() } = {}) {
   const cutoff = new Date(Date.parse(nowIso) - hours * 3600 * 1000).toISOString();
-  const rows = db.prepare(`SELECT month FROM yahoo_campaign_coupons WHERE status = 'reconcile_required' AND updated_at < ?`).all(cutoff);
+  const rows = db.prepare(`SELECT month FROM yahoo_campaign_coupons WHERE status = 'reconcile_required' AND COALESCE(reconcile_since, updated_at) < ?`).all(cutoff);
   for (const r of rows) {
     db.prepare(`UPDATE yahoo_campaign_coupons SET status = 'manual_intervention', updated_at = ? WHERE month = ? AND status = 'reconcile_required'`)
       .run(nowIso, r.month);

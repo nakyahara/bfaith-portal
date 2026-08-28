@@ -30,7 +30,7 @@ import { initRunLog, sendGChat, buildErrorReport } from './lib-notify.mjs';
 import {
   ensureYahooCouponLedger, monthlyCouponPeriod, makeOperationId, couponDescription, isValidCouponUrl,
   reserveMonth, markSubmitting, markIssued, markReconcileRequired, escalateStale, getCouponRow,
-  COUPON_TITLE, COUPON_DISCOUNT_RATIO,
+  couponUrlMatchesId, isUsableCopySource, COUPON_TITLE, COUPON_DISCOUNT_RATIO,
 } from '../../apps/warehouse/yahoo-review-coupon-lib.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -84,6 +84,11 @@ async function fetchCouponRows(page) {
     return out;
   });
   console.log(`[list] クーポン ${rows.length} 件`);
+  // op-id 照合は説明文 (hidden input) に依存する。出ていないなら照合できない = 作成してはいけない
+  // (Codex Y-C3 R1 Medium: 発行済みでも毎回 0 件扱いになり自動復旧できなくなる)
+  if (rows.length > 0 && !rows.some((r) => r.description)) {
+    throw new Error('LIST_SHAPE: 一覧に説明文 (hidden Description) が出ていない。op-id で照合できないため作成しない (画面仕様変更の疑い)');
+  }
   return rows;
 }
 
@@ -92,6 +97,7 @@ async function readCouponUrl(page, couponId) {
   const popup = await page.context().newPage();
   try {
     await popup.goto(`${STORE_TOP_URL}/coupon/edit/detail-url/${couponId}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    if (!popup.url().includes(couponId)) throw new Error(`URL_PAGE: 詳細URL画面が別のクーポン (${popup.url().slice(0, 80)})`);
     const url = await popup.evaluate(() => {
       for (const el of document.querySelectorAll('textarea, input[type=text]')) {
         const v = String(el.value || '').trim();
@@ -100,6 +106,7 @@ async function readCouponUrl(page, couponId) {
       const m = document.body.innerHTML.match(/https:\/\/shopping\.yahoo\.co\.jp\/coupon\/[^"'\s<>]+/);
       return m ? m[0] : null;
     });
+    if (url && !couponUrlMatchesId(url, couponId)) throw new Error(`URL_MISMATCH: 取得した獲得URLがクーポンIDと一致しない`);
     return url;
   } finally {
     await popup.close().catch(() => {});
@@ -136,6 +143,19 @@ async function setField(page, name, value) {
   if (got !== String(value)) throw new Error(`FORM_SET: ${name} に設定できず (実際="${String(got).slice(0, 40)}")`);
 }
 
+/** 編集前のフォーム値 (コピー元から引き継いだ設定) を控える。これが編集で変わっていないことを後で要求する */
+async function readInvariants(page) {
+  return page.evaluate(() => {
+    const v = (n) => { const el = document.querySelector(`[name="${n}"]`); return el ? String(el.value || '') : null; };
+    const checked = (n) => { const el = document.querySelector(`[name="${n}"]:checked`); return el ? el.value : null; };
+    return {
+      DiscountType: checked('DiscountType'), DiscountRatio: v('DiscountRatio'), DiscountPrice: v('DiscountPrice'),
+      ItemDesignation: checked('ItemDesignation'), DispFlg: checked('DispFlg'), OrderType: checked('OrderType'),
+      Combine: checked('Combine'), nDayFlg: checked('nDayFlg'),
+    };
+  });
+}
+
 /** コピー元から引き継ぐ設定は触らず、タイトル・説明・期間だけ書き換える */
 async function applyPlan(page, { period, operationId }) {
   await setField(page, 'Title', COUPON_TITLE);
@@ -150,7 +170,7 @@ async function applyPlan(page, { period, operationId }) {
 }
 
 /** 発行前の読み戻し。コピー元から引き継ぐはずの「定率5% / 非表示 / ストア内全商品」もここで確認する */
-async function verifyForm(page, { period, operationId }) {
+async function verifyForm(page, { period, operationId, invariants }) {
   const got = await page.evaluate(() => {
     const v = (n) => { const el = document.querySelector(`[name="${n}"]`); return el ? String(el.value || '') : null; };
     const checked = (n) => { const el = document.querySelector(`[name="${n}"]:checked`); return el ? el.value : null; };
@@ -173,11 +193,16 @@ async function verifyForm(page, { period, operationId }) {
     StartHour: period.startHour, EndHour: period.endHour,
   };
   for (const [k, w] of Object.entries(want)) if (got[k] !== w) diffs.push(`${k}: 期待"${w}" 実際"${got[k]}"`);
-  // コピー元から引き継ぐ値 (定率5%・非表示) が崩れていないか
+  // コピー元から引き継いだ設定 (割引種別・率・公開範囲・対象商品・併用可否) が編集で変わっていないこと。
+  // 画面の値の意味 (DispFlg の 非表示 が 1 か 2 か 等) を決め打ちせずに済む = 仕様変更に強い (Codex Y-C3 R1 High)
+  for (const k of ['DiscountType', 'DiscountRatio', 'DiscountPrice', 'ItemDesignation', 'DispFlg', 'OrderType', 'Combine', 'nDayFlg']) {
+    if (got[k] !== invariants[k]) diffs.push(`${k} がコピー元から変化: "${invariants[k]}" → "${got[k]}"`);
+  }
+  // その上で、レビュー用として必須の条件 (定率 5% であること・定額が入っていないこと) を直接確認する
   if (String(got.DiscountRatio || '') !== String(COUPON_DISCOUNT_RATIO)) diffs.push(`DiscountRatio: 期待"${COUPON_DISCOUNT_RATIO}" 実際"${got.DiscountRatio}"`);
-  if (got.DiscountPrice && got.DiscountPrice !== '0' && got.DiscountPrice !== '') diffs.push(`DiscountPrice が入っている (定額になっている恐れ): "${got.DiscountPrice}"`);
+  if (got.DiscountPrice && !['0', ''].includes(String(got.DiscountPrice))) diffs.push(`DiscountPrice が入っている (定額に化けている恐れ): "${got.DiscountPrice}"`);
   if (diffs.length) throw new Error(`FORM_VERIFY: ${diffs.join(' / ')}`);
-  console.log(`  [form] 検証OK (定率${got.DiscountRatio}% / 公開範囲=${got.DispFlg} / 対象=${got.ItemDesignation})`);
+  console.log(`  [form] 検証OK (種別=${got.DiscountType} 定率${got.DiscountRatio}% / 公開範囲=${got.DispFlg} / 対象=${got.ItemDesignation} / 併用=${got.Combine})`);
   return got;
 }
 
@@ -255,8 +280,14 @@ async function main() {
   if (!row) {
     if (RECONCILE_ONLY) { console.log('照合のみ指定だが台帳に行が無い (何もしない)'); db.close(); return; }
     operationId = makeOperationId(MONTH);
-    reserveMonth(db, { month: MONTH, period, operationId, nowIso: nowIso() });
-    row = getCouponRow(db, MONTH);
+    if (LIVE) {
+      reserveMonth(db, { month: MONTH, period, operationId, nowIso: nowIso() });
+      row = getCouponRow(db, MONTH);
+    } else {
+      // dry-run は台帳に一切書かない (完全非破壊 — Codex Y-C3 R1 補足)
+      row = { status: 'planned', operation_id: operationId };
+      console.log('(dry-run のため台帳には書き込まない)');
+    }
   } else {
     operationId = row.operation_id;
     period = { startYmd: row.coupon_start.slice(0, 10), endYmd: row.coupon_end.slice(0, 10), startHour: row.coupon_start.slice(11, 13), endHour: row.coupon_end.slice(11, 13), spanDays: 0 };
@@ -303,10 +334,15 @@ async function main() {
       || SOURCE_ID;
     if (!sourceId) throw new Error('コピー元のクーポンIDが分からない (env YAHOO_REVIEW_COUPON_SOURCE_ID に vendor の月次クーポンIDを設定)');
     if (!rows.some((r) => r.couponId === sourceId)) throw new Error(`コピー元 ${sourceId} が一覧に無い (削除された?)`);
-    console.log(`コピー元: ${sourceId}`);
+    const sourceRow = rows.find((r) => r.couponId === sourceId);
+    if (!isUsableCopySource(sourceRow)) {
+      throw new Error(`SOURCE: コピー元 ${sourceId} が定率${COUPON_DISCOUNT_RATIO}%でない (type=${sourceRow?.discountType} ratio=${sourceRow?.discountRatio})。別条件のクーポンを増やさないため中止`);
+    }
+    console.log(`コピー元: ${sourceId} (定率${sourceRow.discountRatio}%)`);
     await openCopyForm(page, sourceId);
+    const invariants = await readInvariants(page);
     await applyPlan(page, { period, operationId });
-    await verifyForm(page, { period, operationId });
+    await verifyForm(page, { period, operationId, invariants });
     await submitToConfirm(page);
     await snap(page, `confirm_${MONTH}`);
     if (!LIVE) {
