@@ -60,6 +60,10 @@ m = matchVoucher({ vendor_id: 4, amount: 5986, doc_date: '2026-08-01' }, txs.con
 check('AMAZON.CO.JP は CO/JP が雑音語 → strong', m.kind === 'unique' && m.strength === 'strong');
 m = matchVoucher({ vendor_name: 'ﾗｸｽﾙ（DP4*RAKSUL）', amount: 11422, doc_date: '2026-08-14' }, [{ id: 't11', date: '2026-08-14', value: 11422, side: 'EXPENSE', content: 'ﾗｸｽﾙｶﾌﾞｼｷｶﾞｲｼｬ（DP4*RAKSUL）', journalizing_status: 'none' }], vendors);
 check('ラクスル株式会社(DP4*RAKSUL) は語が全部説明できる → strong', m.kind === 'unique' && m.strength === 'strong');
+m = matchVoucher({ vendor_name: '郵便局のネットショップ', amount: 60000, doc_date: '2026-08-17' }, [{ id: 'tj', date: '2026-08-17', value: 60000, side: 'EXPENSE', content: 'ﾕｳﾋﾞﾝｷｮｸﾉﾈｯﾄｼｮｯﾌﾟ（JAPANPOST NETSHOP）', journalizing_status: 'none' }], vendors);
+check('支払先の表記が合わなくても金額+日付で weak 候補を出す (人が選べる)', m.kind === 'unique' && m.strength === 'weak' && m.reason === 'amount+date (vendor text mismatch)');
+m = matchVoucher({ vendor_name: '郵便局のネットショップ', amount: 60000, doc_date: '' }, [{ id: 'tj', date: '2026-08-17', value: 60000, side: 'EXPENSE', content: 'JAPANPOST', journalizing_status: 'none' }], vendors);
+check('表記不一致の救済は日付があるときだけ', m.kind === 'none');
 m = matchVoucher({ vendor_id: 1, amount: 21093, doc_date: '2026-08-08' }, txs, vendors);
 check('金額1円違いは none', m.kind === 'none');
 m = matchVoucher({ vendor_id: 1, amount: 21092, doc_date: '2026-08-20' }, txs, vendors);

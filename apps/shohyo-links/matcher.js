@@ -83,19 +83,25 @@ export function matchVoucher(voucher, transactions, vendors, { dateWindowDays = 
   const hasVendor = vkeys.length > 0;
   const hasDate = isValidDate(voucher.doc_date);
 
-  const candidates = [];
+  let candidates = [];
+  const fallback = [];
   for (const t of transactions) {
     if (t.side !== 'EXPENSE' || t.journalizing_status === 'excluded') continue;
     if (Number(t.value) !== amount) continue;
     const dd = hasDate ? dayDiff(t.date, voucher.doc_date) : null;
     if (hasDate && (dd === null || dd > dateWindowDays)) continue;
     const hit = hasVendor ? vendorHit(vkeys, t) : null;
-    if (hasVendor && !hit) continue; // 支払先が分かっているのに違う相手には合わせない
-    candidates.push({
+    const c = {
       tx_id: t.id, date: t.date, value: t.value, content: t.content || '', status: t.journalizing_status,
       day_diff: dd, vendor_hit: hit, taken: taken.has(t.id),
-    });
+    };
+    if (hasVendor && !hit) { fallback.push(c); continue; } // 支払先が分かっているのに違う相手には合わせない
+    candidates.push(c);
   }
+  // 支払先の表記が明細と合わない (AI/人が書いた名前がカタカナ加盟店名と一致しない等) ときは、
+  // 金額+日付の候補を weak として見せる。自動添付はしないが、人が候補から選べる
+  let vendorMismatch = false;
+  if (hasVendor && !candidates.length && fallback.length && hasDate) { candidates = fallback; vendorMismatch = true; }
 
   const free = candidates.filter(c => !c.taken);
   if (!candidates.length) return { kind: 'none', strength: null, candidates: [], reason: hasVendor ? 'no_amount_vendor_match' : 'no_amount_match' };
@@ -105,9 +111,10 @@ export function matchVoucher(voucher, transactions, vendors, { dateWindowDays = 
     return { kind: 'ambiguous', strength: null, candidates: free, reason: 'multiple_candidates' };
   }
   const only = free[0];
-  const strong = hasVendor && hasDate && only.vendor_hit === 'content';
+  const strong = hasVendor && hasDate && only.vendor_hit === 'content' && !vendorMismatch;
   let reason = 'vendor+amount+date';
   if (!hasVendor) reason = 'amount+date (vendor unknown)';
+  else if (vendorMismatch) reason = 'amount+date (vendor text mismatch)';
   else if (!hasDate) reason = 'vendor+amount (no date)';
   else if (only.vendor_hit === 'weak') reason = 'vendor(weak)+amount+date';
   return { kind: 'unique', strength: strong ? 'strong' : 'weak', candidates: [only], reason };

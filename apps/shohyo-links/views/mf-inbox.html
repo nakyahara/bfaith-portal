@@ -81,7 +81,7 @@
     ここに証憑（PDF・写真）を入れると、ロボットが MF の明細と <b>支払先・金額・日付±3日</b> で突き合わせ、
     一意に決まったものを仕訳に貼ります。迷ったものは「要確認」に出るので、候補から選ぶだけです。<br>
     相手の明細がまだ <b>未仕訳</b> のときは「登録待ち」になり、MFで登録された後の周期（毎時）に貼られます。
-    ファイル名を <code>2026-08-08_21092_ロジマート.pdf</code> の形にすると日付・金額・支払先が自動で入ります。
+    入れたファイルは中身を読んで日付・金額・支払先を自動で埋めます（PDFはルール→AI、写真はAI）。読めなかった行は「直す」で入れてください。
   </div>
 
   <div class="bar">
@@ -211,13 +211,14 @@ function actions(r) {
     return b.join(' ');
   }
   if (!['attached', 'attaching'].includes(r.status)) b.push(`<button class="btn mini" data-edit="${r.id}">直す</button>`);
+  if (!['attached', 'attaching'].includes(r.status) && (!r.doc_date || !r.amount || !(r.vendor_id || r.vendor_name))) b.push(`<button class="btn mini" data-extract="${r.id}" title="PDF/画像の中身から日付・金額・支払先を読み取る">読み取り</button>`);
   if (!['attached', 'attaching', 'excluded'].includes(r.status)) b.push(`<button class="btn mini" data-exclude="${r.id}">除外</button>`);
   if (r.status === 'excluded') b.push(`<button class="btn mini" data-reopen="${r.id}">戻す</button>`);
   return b.join(' ');
 }
 
 document.addEventListener('click', async (ev) => {
-  const t = ev.target.closest('[data-tab],[data-attach],[data-pick],[data-edit],[data-save],[data-cancel],[data-exclude],[data-reopen]');
+  const t = ev.target.closest('[data-tab],[data-attach],[data-pick],[data-edit],[data-save],[data-cancel],[data-exclude],[data-reopen],[data-extract]');
   if (!t) return;
   try {
     if (t.dataset.tab) { tab = t.dataset.tab; renderTabs(); render(); return; }
@@ -235,6 +236,15 @@ document.addEventListener('click', async (ev) => {
       editing.delete(id);
       await api('../api/inbox/run', { method: 'POST', body: '{}' });
       toast('直して照合しました'); return load();
+    }
+    if (t.dataset.extract) {
+      t.disabled = true; t.textContent = '読み取り中…';
+      const r = await api(`../api/inbox/${t.dataset.extract}/extract`, { method: 'POST', body: '{}' });
+      const ex = r.extracted || {};
+      toast(ex.applied?.length ? `読み取り: ${ex.applied.map(k => ({ doc_date: '日付', amount: '金額', vendor_name: '支払先' })[k]).join('・')} を入れました（${ex.source}）。照合します…`
+        : (r.ai_enabled ? '読み取れませんでした。「直す」で入れてください' : 'AI読み取りが未設定です（OPENAI_API_KEY）。「直す」で入れてください'));
+      if (ex.applied?.length) { try { await api('../api/inbox/run', { method: 'POST', body: '{}' }); } catch (e) { /* 未接続等 */ } }
+      return load();
     }
     if (t.dataset.exclude) { await api(`../api/inbox/${t.dataset.exclude}/exclude`, { method: 'POST', body: '{}' }); return load(); }
     if (t.dataset.reopen) { await api(`../api/inbox/${t.dataset.reopen}/reopen`, { method: 'POST', body: '{}' }); return load(); }
@@ -290,16 +300,17 @@ drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove
 $('picker').addEventListener('change', () => upload([...$('picker').files]));
 
 async function upload(files) {
-  let ok = 0, dup = 0, ng = 0;
+  let ok = 0, dup = 0, ng = 0, unread = 0;
   for (const f of files) {
     if (f.size > 5 * 1024 * 1024) { ng++; toast(`${f.name} は5MBを超えています`); continue; }
     const b64 = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(f); });
     try {
       const r = await api('../api/inbox', { method: 'POST', body: JSON.stringify({ file_name: f.name, file_data: b64, mime: f.type, source: 'upload' }) });
       r.duplicate ? dup++ : ok++;
+      if (!r.duplicate && r.extracted && !r.extracted.applied?.length) unread++;
     } catch (e) { ng++; if (e.message === 'unsupported_file') toast(`${f.name}: PDF・JPEG・PNG 以外は受け付けません`); }
   }
-  toast(`受け箱に ${ok}件追加${dup ? `・重複 ${dup}件` : ''}${ng ? `・失敗 ${ng}件` : ''}。照合します…`);
+  toast(`受け箱に ${ok}件追加${dup ? `・重複 ${dup}件` : ''}${ng ? `・失敗 ${ng}件` : ''}${unread ? `・読み取れず ${unread}件 (「直す」で入力)` : ''}。照合します…`);
   try { await api('../api/inbox/run', { method: 'POST', body: '{}' }); } catch (e) { /* 未接続などはタブで分かる */ }
   load();
 }
