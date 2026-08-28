@@ -31,7 +31,8 @@ check('しきい値は env で変えられる (warnDays=10 なら残り 6 日で
 check('既定しきい値は 5', DEFAULT_WARN_DAYS === 5);
 
 const hErr = buildTokenExpiryNotice({ health: null, healthError: 'timeout', authUrl: null, nowIso: NOW });
-check('プロキシ到達不可 → 🔴 health_unreachable (見張れていないことを通知)', hErr.kind === 'health_unreachable' && hErr.level === 'critical' && hErr.text.includes('timeout'));
+check('プロキシ到達不可 → 🔴 health_unreachable (見張れていないことを通知) + 再認可手順も入れる',
+  hErr.kind === 'health_unreachable' && hErr.level === 'critical' && hErr.text.includes('timeout') && hErr.text.includes('yahoo再認可'));
 const noTok = buildTokenExpiryNotice({ health: { hasTokens: false }, authUrl: AUTH, nowIso: NOW });
 check('トークン未初期化 → 🔴 no_tokens + 手順', noTok.kind === 'no_tokens' && noTok.text.includes('yahoo再認可'));
 const unk = buildTokenExpiryNotice({ health: { hasTokens: true }, authUrl: AUTH, nowIso: NOW });

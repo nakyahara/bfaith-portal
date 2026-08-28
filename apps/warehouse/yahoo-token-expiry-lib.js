@@ -53,7 +53,9 @@ export function buildTokenExpiryNotice({ health, healthError = null, authUrl = n
   if (healthError) {
     return { kind: 'health_unreachable', level: 'critical', daysLeft: null,
       text: [`🔴 *Yahoo API プロキシに接続できません* (${healthError})`, '',
-        'トークンの期限を見張れていない状態です。VPS (aupay-proxy) の稼働を確認してください。', stop].join('\n') };
+        'トークンの期限を見張れていない状態です。VPS (aupay-proxy) の稼働を確認してください。', stop,
+        // プロキシが復帰していれば、この手順だけで再認可まで進める (Codex R1 Medium)
+        ...how].join('\n') };
   }
   if (!health || health.hasTokens === false) {
     return { kind: 'no_tokens', level: 'critical', daysLeft: null,
