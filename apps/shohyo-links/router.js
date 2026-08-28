@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
 import { listLinks, createLink, updateLink, deleteLink } from './db.js';
 import {
   mfConfigured, authorizeUrl, exchangeCode, loadTokens, clearTokens,
-  currentOffice, getJournals, postVoucher, matchVendors,
+  currentOffice, getJournals, postVoucher, matchVendors, revokeTokens,
 } from './mf-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,9 +126,11 @@ router.get('/api/mf/status', async (req, res) => {
   }
 });
 
-router.post('/api/mf/disconnect', (req, res) => {
+router.post('/api/mf/disconnect', async (req, res) => {
+  // MF側でも失効させてから手元のトークンを消す (残しておくと第三者が使える状態が続く)
+  const revoke = await revokeTokens();
   clearTokens();
-  res.json({ ok: true, result: { disconnected: true } });
+  res.json({ ok: true, result: { disconnected: true, ...revoke } });
 });
 
 // 期間内の仕訳を取得し、証憑未添付を支払い先マスタと突合して返す

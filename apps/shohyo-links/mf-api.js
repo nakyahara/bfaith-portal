@@ -100,15 +100,45 @@ function normalizeTokens(body) {
   };
 }
 
+// MFは refresh のたびに refresh_token をローテーションするため、同時にrefreshすると
+// 片方のトークンが無効化される。プロセス内で1本に束ねる (Renderは単一プロセス)。
+let refreshInFlight = null;
+
 async function ensureAccessToken() {
   const tokens = loadTokens();
   if (!tokens) throw new Error('mf_not_connected');
   if (Date.now() < tokens.expires_at - 60_000) return tokens.access_token;
-  const body = await tokenRequest({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token });
-  const next = normalizeTokens(body);
-  if (!next.refresh_token) next.refresh_token = tokens.refresh_token; // refresh_tokenが返らない実装への保険
-  saveTokens(next);
-  return next.access_token;
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      const body = await tokenRequest({ grant_type: 'refresh_token', refresh_token: tokens.refresh_token });
+      const next = normalizeTokens(body);
+      if (!next.refresh_token) next.refresh_token = tokens.refresh_token; // refresh_tokenが返らない実装への保険
+      saveTokens(next);
+      return next.access_token;
+    })().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+/** 接続解除時にMF側でもトークンを失効させる (RFC 7009 /revoke)。失敗しても解除は続行する */
+export async function revokeTokens() {
+  const tokens = loadTokens();
+  if (!tokens?.refresh_token) return { revoked: false, reason: 'no_token' };
+  const { id, secret } = clientConfig();
+  try {
+    const res = await fetch(`${AUTH_BASE}/revoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Authorization: 'Basic ' + Buffer.from(`${id}:${secret}`).toString('base64'),
+      },
+      body: new URLSearchParams({ token: tokens.refresh_token, token_type_hint: 'refresh_token' }).toString(),
+    });
+    return { revoked: res.ok, status: res.status };
+  } catch (e) {
+    console.error('[shohyo-links] mf revoke', e.message);
+    return { revoked: false, reason: e.message };
+  }
 }
 
 // ---- APIラッパー ----
