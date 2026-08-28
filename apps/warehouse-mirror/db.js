@@ -1101,22 +1101,34 @@ function createTables() {
   //   「誤りとして削除した map」が mirror に残り続け、別人の商品に値付けする事故になる。
   // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
   try {
+    // full_snapshot entity の世代 (単調増加)。古い run の遅延到着で新しい map を巻き戻さないための番人。
+    // BEGIN IMMEDIATE は同時書き込みを直列化するだけで順序逆転は防がない (Codex R1 High #1)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_snapshot_generations (
+      entity      TEXT PRIMARY KEY,
+      generation  INTEGER NOT NULL,
+      run_id      TEXT NOT NULL,
+      row_count   INTEGER NOT NULL,
+      applied_at  TEXT NOT NULL
+    )`);
+    // ★store_id を PK に含める: Yahoo ストアが増えたとき、同じ yahoo_key の別ストア行を
+    //   INSERT OR REPLACE で黙って上書きしない (au PAY 側と粒度を揃える — Codex R1 Medium #4)
     db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_sku_map (
-      yahoo_key   TEXT NOT NULL PRIMARY KEY CHECK(trim(yahoo_key) <> ''),
-      store_id    TEXT NOT NULL DEFAULT 'b-faith01',
-      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> ''),
-      resolution_source TEXT NOT NULL,
+      store_id    TEXT NOT NULL,
+      yahoo_key   TEXT NOT NULL CHECK(trim(yahoo_key) <> '' AND yahoo_key = trim(yahoo_key)),
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> '' AND ne_code = trim(ne_code)),
+      resolution_source TEXT NOT NULL CHECK(resolution_source IN ('manual','auto_pattern','fallback_parent')),
       notes       TEXT,
       created_at  TEXT,
       updated_at  TEXT,
-      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (store_id, yahoo_key)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_mysm_ne ON mirror_yahoo_sku_map(ne_code)');
     db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_sku_map (
-      store_id    TEXT NOT NULL DEFAULT 'b-faith01',
-      aupay_key   TEXT NOT NULL CHECK(trim(aupay_key) <> ''),
-      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> ''),
-      resolution_source TEXT NOT NULL,
+      store_id    TEXT NOT NULL,
+      aupay_key   TEXT NOT NULL CHECK(trim(aupay_key) <> '' AND aupay_key = trim(aupay_key)),
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> '' AND ne_code = trim(ne_code)),
+      resolution_source TEXT NOT NULL CHECK(resolution_source IN ('manual','auto_pattern','fallback_parent')),
       notes       TEXT,
       created_at  TEXT,
       updated_at  TEXT,

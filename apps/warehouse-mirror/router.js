@@ -1181,21 +1181,51 @@ const RAKUTEN_REVIEW_ENTITY_NAMES = new Set(Object.keys(RAKUTEN_REVIEW_TABLE_SPE
 
 // SKUマップ 2種 (価格一括改定ツール PR1、2026-08-28)。モール出品コード → NEコード の手動 map。
 // full_snapshot = 毎 run 全置換 (miniPC で削除された map を mirror に残さない)
+// 許可ストア。増えたらここに足す (未知の store_id を黙って受けると引き当て粒度が崩れる)
+const SKU_MAP_ALLOWED_STORES = new Set(['b-faith01']);
+const SKU_MAP_RESOLUTION_SOURCES = new Set(['manual', 'auto_pattern', 'fallback_parent']);
+
+// 値の意味検証 (Codex R1 High #3)。前後空白・表記ゆれ・タイポをここで止める。
+// ★ne_code が実在の商品かは Render 側では判定できない (NE商品マスタは miniPC のみ)。
+//   参照整合性は送信元 sync-sku-maps.js が m_products と突合して担保し、
+//   価格改定の実行時 (PR4/PR5) にも再検証する — 「mirror に入った = 正しい」とはしない
+function makeSkuMapValidator(keyCol) {
+  return (r, HttpErrorCls) => {
+    for (const col of [keyCol, 'ne_code', 'store_id']) {
+      const v = r[col];
+      if (typeof v !== 'string' || v !== v.trim() || v === '') {
+        throw new HttpErrorCls(400, { error: 'bad_row', message: `${col} は前後空白なしの非空文字列が必要: ${JSON.stringify(v)}` });
+      }
+    }
+    if (!SKU_MAP_ALLOWED_STORES.has(r.store_id)) {
+      throw new HttpErrorCls(400, { error: 'bad_row', message: `未知の store_id: ${r.store_id}` });
+    }
+    if (!SKU_MAP_RESOLUTION_SOURCES.has(r.resolution_source)) {
+      throw new HttpErrorCls(400, { error: 'bad_row', message: `未知の resolution_source: ${r.resolution_source}` });
+    }
+  };
+}
+
 const SKU_MAP_TABLE_SPECS = {
   yahoo_sku_map: {
     table: 'mirror_yahoo_sku_map',
-    required: ['yahoo_key', 'ne_code', 'resolution_source'],
-    cols: ['yahoo_key', 'store_id', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
-    defaults: { store_id: 'b-faith01' },
+    // store_id も必須 (default で黙って埋めない。PK の一部なので取り違えると別ストアの行を上書きする)
+    required: ['store_id', 'yahoo_key', 'ne_code', 'resolution_source'],
+    cols: ['store_id', 'yahoo_key', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
+    validate: makeSkuMapValidator('yahoo_key'),
   },
   aupay_sku_map: {
     table: 'mirror_aupay_sku_map',
     required: ['store_id', 'aupay_key', 'ne_code', 'resolution_source'],
     cols: ['store_id', 'aupay_key', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
-    defaults: { store_id: 'b-faith01' },
+    validate: makeSkuMapValidator('aupay_key'),
   },
 };
 const SKU_MAP_ENTITY_NAMES = new Set(Object.keys(SKU_MAP_TABLE_SPECS));
+
+// full_snapshot で「何割まで減ってよいか」。これを超える減少は明示承認 (meta.allow_shrink) が要る。
+// 0件だけを弾いても「本来500件が3件」の欠損 snapshot は通ってしまう (Codex R1 High #2)
+const FULL_SNAPSHOT_MAX_SHRINK_RATIO = 0.2;
 
 // 楽天dd + Yahoo + au PAY分析 + Qoo10 + 楽天レビュー を1つのレジストリに統合 (getRakutenDdInsert/normalizeRakutenDdRow が参照)
 const DD_ALL_TABLE_SPECS = { ...RAKUTEN_DD_TABLE_SPECS, ...YAHOO_DATA_TABLE_SPECS, ...AUPAY_DATA_TABLE_SPECS, ...QOO10_DATA_TABLE_SPECS, ...RAKUTEN_REVIEW_TABLE_SPECS, ...SKU_MAP_TABLE_SPECS };
@@ -2157,13 +2187,37 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
       message: `entity=${entity} は full_snapshot のため chunk_count=1 のみ受信可 (got ${chunk_count})`,
     });
   }
-  // 空 snapshot は fail-closed。送信側の事故 (source 表の消失・SELECT ミス) で mirror を
-  // 黙って空にしない。本当に 0 件にしたい時だけ meta.allow_empty_snapshot=true を明示する
-  if (clearStrategy === 'full_snapshot' && rows.length === 0 && meta.allow_empty_snapshot !== true) {
-    return res.status(400).json({
-      error: 'empty_snapshot_rejected',
-      message: `entity=${entity} の full_snapshot が 0 件。意図的なら meta.allow_empty_snapshot=true を付けてください`,
-    });
+  let snapshotGeneration = null;
+  if (clearStrategy === 'full_snapshot') {
+    // 世代 (単調増加)。古い run の遅延到着で新しい map を巻き戻さない (Codex R1 High #1)。
+    // 値は送信元 (miniPC) が sync_snapshot_generations で採番する — 時刻ベースにしない
+    snapshotGeneration = meta.snapshot_generation;
+    if (!Number.isInteger(snapshotGeneration) || snapshotGeneration < 1) {
+      return res.status(400).json({
+        error: 'snapshot_generation_required',
+        message: `entity=${entity} は meta.snapshot_generation (1以上の整数) が必要`,
+      });
+    }
+    // 監査メタは受け側で付け直すが、送信元の申告と食い違う run は事故なので先に弾く (Codex R1 Medium #5)
+    for (const r of rows) {
+      if (!r || typeof r !== 'object') {
+        return res.status(400).json({ error: 'bad_row', message: 'row is not an object' });
+      }
+      if (r.source_run_id !== undefined && r.source_run_id !== sync_run_id) {
+        return res.status(400).json({
+          error: 'source_run_id_mismatch',
+          message: `row.source_run_id=${r.source_run_id} != sync_run_id=${sync_run_id}`,
+        });
+      }
+    }
+    // 空 snapshot は fail-closed。送信側の事故 (source 表の消失・SELECT ミス) で mirror を
+    // 黙って空にしない。全消しは「消える件数を言い当てられること」まで要求する (Codex R1 Medium #6)
+    if (rows.length === 0 && meta.allow_empty_snapshot !== true) {
+      return res.status(400).json({
+        error: 'empty_snapshot_rejected',
+        message: `entity=${entity} の full_snapshot が 0 件。意図的なら meta.allow_empty_snapshot=true と meta.expected_deleted_rows を付けてください`,
+      });
+    }
   }
   if (is_first && clearStrategy === 'date_range') {
     clearDates = meta[entityCfg.clear_meta_key];
@@ -2337,6 +2391,36 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
           SELECT COUNT(*) AS c FROM sync_run_chunks WHERE run_id = ? AND entity = ?
         `).get(sync_run_id, entity).c;
         if (priorCount === 0) {
+          // (a) 世代の単調性: 古い snapshot の遅延到着を 409 で拒否する
+          const genRow = db.prepare('SELECT generation, run_id FROM mirror_snapshot_generations WHERE entity = ?').get(entity);
+          if (genRow && snapshotGeneration <= genRow.generation) {
+            throw new HttpError(409, {
+              error: 'stale_snapshot',
+              message: `entity=${entity} は generation=${genRow.generation} (run=${genRow.run_id}) を適用済み。received=${snapshotGeneration} は古いので拒否`,
+              entity, applied_generation: genRow.generation, received_generation: snapshotGeneration,
+            });
+          }
+          // (b) 件数ゲート: 大幅に減る snapshot は明示承認が要る
+          const liveCount = db.prepare(`SELECT COUNT(*) AS c FROM ${entityCfg.mirror_table}`).get().c;
+          if (liveCount > 0) {
+            if (rows.length === 0) {
+              // 全消しは「消える件数を言い当てられること」を条件にする (誤爆した client では通らない)
+              if (meta.expected_deleted_rows !== liveCount) {
+                throw new HttpError(400, {
+                  error: 'empty_snapshot_confirmation_mismatch',
+                  message: `全消しには meta.expected_deleted_rows=${liveCount} (現在の行数) が必要 (received=${JSON.stringify(meta.expected_deleted_rows)})`,
+                  entity, live_rows: liveCount,
+                });
+              }
+            } else if (rows.length < liveCount * (1 - FULL_SNAPSHOT_MAX_SHRINK_RATIO) && meta.allow_shrink !== true) {
+              throw new HttpError(400, {
+                error: 'snapshot_shrink_rejected',
+                message: `entity=${entity} が ${liveCount} 件 → ${rows.length} 件へ大幅減少 (許容 ${Math.round(FULL_SNAPSHOT_MAX_SHRINK_RATIO * 100)}%)。`
+                  + ' 欠損 snapshot の可能性があるため拒否。意図した削除なら meta.allow_shrink=true',
+                entity, live_rows: liveCount, incoming_rows: rows.length,
+              });
+            }
+          }
           clearedRows = db.prepare(`DELETE FROM ${entityCfg.mirror_table}`).run().changes;
           didClear = true;
         }
@@ -2395,10 +2479,30 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         for (let i = 0; i < rows.length; i++) {
           stageInsert.run(sync_run_id, entity, chunk_index, i, JSON.stringify(rows[i]));
         }
+      } else if (clearStrategy === 'full_snapshot') {
+        // 監査メタ (source_run_id / source_row_hash / synced_at) は受け側で付け直す。
+        // 送信元の申告をそのまま保存すると、監査値が偽装・欠落しても気づけない (Codex R1 Medium #5)
+        const spec = DD_ALL_TABLE_SPECS[entity];
+        for (const r of rows) {
+          const norm = entityCfg.normalizeRow(r);
+          norm.source_run_id = sync_run_id;
+          norm.source_row_hash = crypto.createHash('sha256')
+            .update(JSON.stringify(spec.cols.map((c) => norm[c]))).digest('hex').slice(0, 16);
+          norm.synced_at = now;
+          insertStmt.run(norm);
+        }
       } else {
         for (const r of rows) {
           insertStmt.run(entityCfg.normalizeRow(r));
         }
+      }
+      // full_snapshot の世代を確定 (この tx が commit されて初めて「適用済み」になる)
+      if (is_first && clearStrategy === 'full_snapshot') {
+        db.prepare(`INSERT INTO mirror_snapshot_generations (entity, generation, run_id, row_count, applied_at)
+          VALUES (?,?,?,?,?)
+          ON CONFLICT(entity) DO UPDATE SET generation = excluded.generation, run_id = excluded.run_id,
+            row_count = excluded.row_count, applied_at = excluded.applied_at`)
+          .run(entity, snapshotGeneration, sync_run_id, rows.length, now);
       }
 
       // 4e. ledger insert (mf_source_run_id NULL=非MF entity)。
@@ -3259,6 +3363,18 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
   }
 
   const entities = [...new Set(targetChunks.map(t => t.entity))];
+  // full_snapshot entity は backout 非対応 (Codex R1 Medium #7)。
+  // この run の行を消しても直前の snapshot は戻らず、表が空になるだけで「取り消し」にならない。
+  // ledger だけ消えて実データが残る中途半端な状態を作らないよう、ここで断る。
+  // 戻したい時は正しい map を miniPC 側から再送する (世代が上がるので順序も守られる)
+  const fullSnapshotEntities = entities.filter((e) => ENTITY_REGISTRY[e]?.clear_strategy === 'full_snapshot');
+  if (fullSnapshotEntities.length > 0) {
+    return res.status(409).json({
+      error: 'backout_not_supported_for_full_snapshot',
+      message: `full_snapshot entity (${fullSnapshotEntities.join(', ')}) は backout できません。直前の snapshot は保存していないため、正しい内容を送信元から再送してください`,
+      run_id: runId, entities: fullSnapshotEntities,
+    });
+  }
   const deleted = {};
   const tx = db.transaction(() => {
     for (const entity of entities) {
@@ -3267,12 +3383,6 @@ router.post('/api/sync/runs/:run_id/backout', requireSyncKey, (req, res) => {
         // MF entity (clear_strategy='no_clear') は source_run_id 列を持たないので skip
         // backout は MF 専用 endpoint (Phase 2 で追加予定) で対応
         if (cfg.clear_strategy === 'no_clear') {
-          deleted[entity] = 0;
-          continue;
-        }
-        // full_snapshot (SKUマップ) も skip: この run の行を消すと直前の snapshot が
-        // 戻らず表が空になる (= backout がデータ全消しになる)。再送で正しい状態に戻す
-        if (cfg.clear_strategy === 'full_snapshot') {
           deleted[entity] = 0;
           continue;
         }

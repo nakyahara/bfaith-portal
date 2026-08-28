@@ -13,7 +13,13 @@
  * 使い方:
  *   DATA_DIR=... node apps/warehouse/sync-sku-maps.js --dry-run
  *   DATA_DIR=... node apps/warehouse/sync-sku-maps.js --entity yahoo_sku_map
+ *   DATA_DIR=... node apps/warehouse/sync-sku-maps.js --allow-shrink   # map を実際に整理した時だけ
  * env: DATA_DIR (必須) / RENDER_MIRROR_URL / MIRROR_SYNC_KEY
+ *
+ * 送る前に落とすもの (全置換なので「一部だけ送る」が一番危ない):
+ *   - ne_code が m_products に無い / store_id・resolution_source が想定外 / 前後空白 / PK重複
+ *   - 前回適用より 20% 超減っている (--allow-shrink で解除)
+ *   - 0件・単一 chunk に収まらない行数
  */
 import path from 'node:path';
 import fs from 'node:fs';
@@ -30,6 +36,8 @@ function getArg(flag) { const i = args.indexOf(flag); return i >= 0 && i < args.
 const DATA_DIR = (process.env.DATA_DIR || getArg('--data-dir') || '').trim();
 const entityFilter = getArg('--entity');
 const isDryRun = args.includes('--dry-run');
+// 大幅減少ゲートの明示解除。map を実際に整理した時だけ人が付ける
+const allowShrink = args.includes('--allow-shrink');
 const renderUrl = process.env.RENDER_MIRROR_URL;
 const syncKey = process.env.MIRROR_SYNC_KEY;
 
@@ -46,24 +54,77 @@ if (!isDryRun && (!renderUrl || !syncKey)) {
 const todayJst = new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 10);
 const dateRange = { from: todayJst, to: todayJst };
 
+// 許可ストア / resolution_source の enum。受け側でも同じものを検証する (二重の網)
+const ALLOWED_STORES = new Set(['b-faith01']);
+const RESOLUTION_SOURCES = new Set(['manual', 'auto_pattern', 'fallback_parent']);
+// 前回適用件数からこの割合を超えて減る snapshot は送らない (欠損 SELECT の事故を素通しさせない)
+const MAX_SHRINK_RATIO = 0.2;
+
 const ENTITIES = [
   {
     name: 'yahoo_sku_map',
     contractVersion: 1,
-    selectSql: 'SELECT yahoo_key, store_id, ne_code, resolution_source, notes, created_at, updated_at'
-      + ' FROM f_yahoo_sku_map ORDER BY yahoo_key',
-    hashRow: (r) => ({ k: r.yahoo_key, s: r.store_id, n: r.ne_code, r: r.resolution_source }),
+    keyCol: 'yahoo_key',
+    selectSql: 'SELECT store_id, yahoo_key, ne_code, resolution_source, notes, created_at, updated_at'
+      + ' FROM f_yahoo_sku_map ORDER BY store_id, yahoo_key',
     sampleLog: (r) => `yahoo_key=${r.yahoo_key} ne=${r.ne_code} src=${r.resolution_source}`,
   },
   {
     name: 'aupay_sku_map',
     contractVersion: 1,
+    keyCol: 'aupay_key',
     selectSql: 'SELECT store_id, aupay_key, ne_code, resolution_source, notes, created_at, updated_at'
       + ' FROM f_aupay_sku_map ORDER BY store_id, aupay_key',
-    hashRow: (r) => ({ s: r.store_id, k: r.aupay_key, n: r.ne_code, r: r.resolution_source }),
     sampleLog: (r) => `aupay_key=${r.aupay_key} ne=${r.ne_code} src=${r.resolution_source}`,
   },
 ];
+
+/**
+ * 送信前の意味検証。map が壊れたまま mirror に入ると、価格改定で別商品に値付けする事故になる。
+ * ここで落とす = 一部だけ送って「全置換」を成立させない (fail-closed、Codex R1 High #3)。
+ * ne_code の実在確認は NE商品マスタ (m_products) を持つ miniPC 側にしかできない。
+ */
+function validateRows(db, entity, rows) {
+  const problems = [];
+  const known = new Set(
+    db.prepare('SELECT LOWER(TRIM(商品コード)) AS c FROM m_products').all().map((r) => r.c)
+  );
+  const seen = new Set();
+  for (const r of rows) {
+    const where = `${entity.keyCol}=${JSON.stringify(r[entity.keyCol])}`;
+    for (const col of [entity.keyCol, 'ne_code', 'store_id']) {
+      const v = r[col];
+      if (typeof v !== 'string' || v === '' || v !== v.trim()) {
+        problems.push(`${where}: ${col} が空 or 前後空白あり (${JSON.stringify(v)})`);
+      }
+    }
+    if (!ALLOWED_STORES.has(r.store_id)) problems.push(`${where}: 未知の store_id=${r.store_id}`);
+    if (!RESOLUTION_SOURCES.has(r.resolution_source)) problems.push(`${where}: 未知の resolution_source=${r.resolution_source}`);
+    if (typeof r.ne_code === 'string' && !known.has(r.ne_code.trim().toLowerCase())) {
+      problems.push(`${where}: ne_code=${r.ne_code} が m_products に無い (廃番 or タイポ)`);
+    }
+    const pk = JSON.stringify([r.store_id, r[entity.keyCol]]);
+    if (seen.has(pk)) problems.push(`${where}: PK 重複`);
+    seen.add(pk);
+  }
+  return problems;
+}
+
+/** 送信のたびに単調増加する世代番号を採る (受け側が古い run を 409 で弾くための番号) */
+function nextGeneration(dbPathArg, entityName) {
+  const wdb = new Database(dbPathArg);
+  try {
+    const tx = wdb.transaction(() => {
+      wdb.prepare(`INSERT INTO sync_snapshot_generations (entity, generation, updated_at) VALUES (?, 1, ?)
+        ON CONFLICT(entity) DO UPDATE SET generation = generation + 1, updated_at = excluded.updated_at`)
+        .run(entityName, new Date().toISOString());
+      return wdb.prepare('SELECT generation FROM sync_snapshot_generations WHERE entity = ?').get(entityName).generation;
+    });
+    return tx();
+  } finally {
+    wdb.close();
+  }
+}
 
 const targetEntities = entityFilter ? ENTITIES.filter(e => e.name === entityFilter) : ENTITIES;
 if (targetEntities.length === 0) {
@@ -74,6 +135,8 @@ if (targetEntities.length === 0) {
 async function syncEntity(entity) {
   const db = new Database(dbPath, { readonly: true });
   let rows;
+  let problems;
+  let lastApplied;
   try {
     const contract = db.prepare('SELECT * FROM sync_contracts WHERE entity = ?').get(entity.name);
     if (!contract) {
@@ -96,6 +159,12 @@ async function syncEntity(entity) {
       return { entity: entity.name, ok: false, error: 'source_table_missing' };
     }
     rows = db.prepare(entity.selectSql).all();
+    problems = validateRows(db, entity, rows);
+    // 前回 applied の件数 (大幅減少ゲートの基準)
+    lastApplied = db.prepare(`
+      SELECT row_count_received FROM sync_runs
+       WHERE entity = ? AND status = 'applied' ORDER BY applied_at DESC LIMIT 1
+    `).get(entity.name);
   } finally {
     db.close();
   }
@@ -111,17 +180,28 @@ async function syncEntity(entity) {
     console.error(`  ✗ ${rows.length} 行 > MAX_ROWS=${MAX_ROWS}。受け側が単一 chunk しか受けないため送信しない (分割対応が必要)`);
     return { entity: entity.name, ok: false, error: 'too_many_rows' };
   }
+  if (problems.length > 0) {
+    console.error(`  ✗ 内容の検証で ${problems.length} 件の問題。全置換なので一部だけ送らずに中断する:`);
+    for (const p of problems.slice(0, 20)) console.error(`      - ${p}`);
+    if (problems.length > 20) console.error(`      ... 他 ${problems.length - 20} 件`);
+    return { entity: entity.name, ok: false, error: 'invalid_rows' };
+  }
+  // 大幅減少ゲート: 「本来500件が3件」の欠損 snapshot を全置換として通さない
+  const prevRows = lastApplied ? lastApplied.row_count_received : null;
+  if (prevRows && rows.length < prevRows * (1 - MAX_SHRINK_RATIO) && !allowShrink) {
+    console.error(`  ✗ 前回 ${prevRows} 件 → 今回 ${rows.length} 件 (許容 ${Math.round(MAX_SHRINK_RATIO * 100)}% 減)。`
+      + ' 欠損の可能性があるため送信しない。意図した削除なら --allow-shrink を付けて実行してください');
+    return { entity: entity.name, ok: false, error: 'shrink_rejected' };
+  }
 
   const tsCompact = new Date().toISOString().replace(/[:.]/g, '').replace('Z', '');
   const runIdSalt = crypto.randomBytes(3).toString('hex');
   const runId = `${entity.name}-v${entity.contractVersion}-${tsCompact}-${runIdSalt}`;
   console.log(`  run_id: ${runId}`);
 
-  const syncedAt = new Date().toISOString();
-  const enrichedRows = rows.map(r => {
-    const hash = crypto.createHash('sha256').update(JSON.stringify(entity.hashRow(r))).digest('hex').slice(0, 16);
-    return { ...r, source_run_id: runId, source_row_hash: hash, synced_at: syncedAt };
-  });
+  // 監査メタ (source_row_hash / synced_at) は受け側が付け直す。ここでは run の同一性だけ載せる
+  // (受け側は row.source_run_id != sync_run_id を 400 で弾く)
+  const enrichedRows = rows.map(r => ({ ...r, source_run_id: runId }));
 
   if (isDryRun) {
     console.log('  --- DRY RUN ---');
@@ -129,6 +209,10 @@ async function syncEntity(entity) {
     console.log(`  Sample row[0]: ${entity.sampleLog(enrichedRows[0])}`);
     return { entity: entity.name, ok: true, dryRun: true, rows: enrichedRows.length };
   }
+
+  // 世代採番は「実際に送る」と決めた後に行う (dry-run や検証落ちで番号を飛ばさない)
+  const generation = nextGeneration(dbPath, entity.name);
+  console.log(`  snapshot_generation: ${generation}`);
 
   const sourceHost = os.hostname();
   const startedAt = new Date().toISOString();
@@ -158,7 +242,7 @@ async function syncEntity(entity) {
     is_last: true,
     row_count: enrichedRows.length,
     payload_checksum: payloadChecksum,
-    meta: {},
+    meta: { snapshot_generation: generation, ...(allowShrink ? { allow_shrink: true } : {}) },
     payload,
   };
 
@@ -176,7 +260,20 @@ async function syncEntity(entity) {
       console.error(`  ✗ chunk failed: ${lastError}`);
     } else {
       const result = await res.json();
-      console.log(`  ✓ chunk applied (request_id=${result.request_id}, status=${result.status}, rows_received=${result.rows_received})`);
+      // 2xx というだけで applied にしない。プロキシ差し替えや将来の API 変更で
+      // 「送信元は applied、mirror は未反映」になるのを防ぐ (Codex R1 Low #8)
+      const mismatches = [];
+      if (result.ok !== true) mismatches.push(`ok=${JSON.stringify(result.ok)}`);
+      if (result.status !== 'completed') mismatches.push(`status=${JSON.stringify(result.status)}`);
+      if (result.sync_run_id !== runId) mismatches.push(`sync_run_id=${JSON.stringify(result.sync_run_id)}`);
+      if (result.entity !== entity.name) mismatches.push(`entity=${JSON.stringify(result.entity)}`);
+      if (result.rows_received !== enrichedRows.length) mismatches.push(`rows_received=${JSON.stringify(result.rows_received)} (expected ${enrichedRows.length})`);
+      if (mismatches.length > 0) {
+        lastError = `unexpected response: ${mismatches.join(', ')}`;
+        console.error(`  ✗ 応答が契約と違う: ${lastError}`);
+      } else {
+        console.log(`  ✓ chunk applied (request_id=${result.request_id}, rows_received=${result.rows_received})`);
+      }
     }
   } catch (e) {
     lastError = e.message;

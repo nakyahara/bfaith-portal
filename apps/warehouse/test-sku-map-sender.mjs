@@ -57,11 +57,19 @@ eq(contracts.map((c) => c.target_table), ['mirror_aupay_sku_map', 'mirror_yahoo_
 
 senderDb.exec(fs.readFileSync(path.join(REPO, 'sql', 'yahoo', 'f_yahoo_sku_map.sql'), 'utf8'));
 senderDb.exec(fs.readFileSync(path.join(REPO, 'sql', 'aupay', 'f_aupay_sku_map.sql'), 'utf8'));
+// ne_code は m_products に実在するものしか送れない (送信側の参照整合性チェック)
+const insProduct = senderDb.prepare(
+  "INSERT INTO m_products (商品コード, 商品名, 商品区分, 原価状態, updated_at) VALUES (?, ?, '単品', '確定', '2026-08-28T00:00:00Z')"
+);
+for (let i = 1; i <= 12; i++) insProduct.run(`ne${String(i).padStart(4, '0')}`, `商品${i}`);
 const insYahoo = senderDb.prepare(
   "INSERT INTO f_yahoo_sku_map (yahoo_key, store_id, ne_code, resolution_source, notes) VALUES (?, 'b-faith01', ?, 'manual', ?)"
 );
 insYahoo.run('abc-01', 'ne0001', 'テスト');
 insYahoo.run('abc-02', 'ne0002', null);
+insYahoo.run('abc-03', 'ne0003', null);
+insYahoo.run('abc-04', 'ne0004', null);
+insYahoo.run('abc-05', 'ne0005', null);
 senderDb.prepare(
   "INSERT INTO f_aupay_sku_map (store_id, aupay_key, ne_code, resolution_source, notes) VALUES ('b-faith01', ?, ?, 'manual', NULL)"
 ).run('item-a', 'ne0001');
@@ -80,48 +88,87 @@ const runSender = (extraArgs = []) => new Promise((resolve) => {
   child.on('close', (code) => resolve({ code, out }));
 });
 
+const senderConn = () => new Database(path.join(senderDir, 'warehouse.db'));
+const yahooKeys = () => mirrorDb.prepare('SELECT yahoo_key FROM mirror_yahoo_sku_map ORDER BY yahoo_key').all().map((x) => x.yahoo_key);
+
 console.log('\n── dry-run ──');
 {
   const r = await runSender(['--dry-run']);
   eq(r.code, 0, 'exit 0');
-  ok(r.out.includes('Would send 1 chunk (2 rows'), 'yahoo 2行を1chunkで送る予定と出る');
+  ok(r.out.includes('Would send 1 chunk (5 rows'), 'yahoo 5行を1chunkで送る予定と出る');
   eq(mirrorDb.prepare('SELECT COUNT(*) n FROM mirror_yahoo_sku_map').get().n, 0, 'dry-run では送っていない');
+  const gen = senderConn().prepare("SELECT COUNT(*) n FROM sync_snapshot_generations").get().n;
+  eq(gen, 0, 'dry-run では世代を消費しない');
 }
 
 console.log('\n── 本送信 ──');
 {
   const r = await runSender();
   eq(r.code, 0, 'exit 0');
-  eq(mirrorDb.prepare('SELECT yahoo_key FROM mirror_yahoo_sku_map ORDER BY yahoo_key').all().map((x) => x.yahoo_key),
-    ['abc-01', 'abc-02'], 'yahoo 2行が mirror に入った');
+  eq(yahooKeys(), ['abc-01', 'abc-02', 'abc-03', 'abc-04', 'abc-05'], 'yahoo 5行が mirror に入った');
   eq(mirrorDb.prepare('SELECT COUNT(*) n FROM mirror_aupay_sku_map').get().n, 1, 'aupay 1行が mirror に入った');
-  const saved = mirrorDb.prepare("SELECT ne_code, notes, store_id FROM mirror_yahoo_sku_map WHERE yahoo_key='abc-01'").get();
+  const saved = mirrorDb.prepare("SELECT ne_code, notes, store_id, source_row_hash FROM mirror_yahoo_sku_map WHERE yahoo_key='abc-01'").get();
   eq([saved.ne_code, saved.notes, saved.store_id], ['ne0001', 'テスト', 'b-faith01'], '値がそのまま入る');
-  const runs = new Database(path.join(senderDir, 'warehouse.db'), { readonly: true })
-    .prepare("SELECT status, row_count_received FROM sync_runs WHERE entity='yahoo_sku_map'").all();
-  eq(runs.map((x) => x.status), ['applied'], 'sync_runs が applied で残る');
+  ok(/^[0-9a-f]{16}$/.test(saved.source_row_hash), 'source_row_hash は受け側が付与');
+  const sdb = senderConn();
+  eq(sdb.prepare("SELECT status FROM sync_runs WHERE entity='yahoo_sku_map'").all().map((x) => x.status),
+    ['applied'], 'sync_runs が applied で残る');
+  eq(sdb.prepare("SELECT generation FROM sync_snapshot_generations WHERE entity='yahoo_sku_map'").get().generation,
+    1, '世代 1 を消費');
+  eq(mirrorDb.prepare("SELECT generation FROM mirror_snapshot_generations WHERE entity='yahoo_sku_map'").get().generation,
+    1, 'mirror 側も世代 1');
+  sdb.close();
 }
 
 console.log('\n── miniPC 側で 1 行削除 → 再送で mirror からも消える ──');
 {
-  const db2 = new Database(path.join(senderDir, 'warehouse.db'));
+  const db2 = senderConn();
   db2.prepare("DELETE FROM f_yahoo_sku_map WHERE yahoo_key='abc-01'").run();
   db2.close();
   const r = await runSender(['--entity', 'yahoo_sku_map']);
   eq(r.code, 0, 'exit 0');
-  eq(mirrorDb.prepare('SELECT yahoo_key FROM mirror_yahoo_sku_map ORDER BY yahoo_key').all().map((x) => x.yahoo_key),
-    ['abc-02'], '削除した map は mirror にも残らない');
+  eq(yahooKeys(), ['abc-02', 'abc-03', 'abc-04', 'abc-05'], '削除した map は mirror にも残らない');
+}
+
+console.log('\n── 大幅減少は送らない (--allow-shrink で解除) ──');
+{
+  const db3 = senderConn();
+  db3.prepare("DELETE FROM f_yahoo_sku_map WHERE yahoo_key IN ('abc-03','abc-04')").run();
+  db3.close();
+  const r = await runSender(['--entity', 'yahoo_sku_map']);
+  eq(r.code, 1, 'exit 1');
+  ok(r.out.includes('欠損の可能性があるため送信しない'), '理由がログに出る');
+  eq(yahooKeys().length, 4, 'mirror は無傷');
+  const forced = await runSender(['--entity', 'yahoo_sku_map', '--allow-shrink']);
+  eq(forced.code, 0, '--allow-shrink なら通る');
+  eq(yahooKeys(), ['abc-02', 'abc-05'], '意図した削除が反映される');
+}
+
+console.log('\n── 壊れた map は送らない (ne_code が m_products に無い等) ──');
+{
+  const db4 = senderConn();
+  db4.prepare("INSERT INTO f_yahoo_sku_map (yahoo_key, store_id, ne_code, resolution_source) VALUES ('bad-1','b-faith01','ne9999','manual')").run();
+  db4.prepare("INSERT INTO f_yahoo_sku_map (yahoo_key, store_id, ne_code, resolution_source) VALUES ('bad-2','b-faith01',' ne0002 ','manual')").run();
+  db4.close();
+  const r = await runSender(['--entity', 'yahoo_sku_map']);
+  eq(r.code, 1, 'exit 1');
+  ok(r.out.includes('m_products に無い'), '廃番/タイポの ne_code を指摘');
+  ok(r.out.includes('前後空白あり'), '前後空白を指摘');
+  eq(yahooKeys(), ['abc-02', 'abc-05'], 'mirror は無傷 (一部だけ送らない)');
+  const db5 = senderConn();
+  db5.prepare("DELETE FROM f_yahoo_sku_map WHERE yahoo_key IN ('bad-1','bad-2')").run();
+  db5.close();
 }
 
 console.log('\n── source が 0 件なら送らず失敗させる (map 全消しの事故を ok で流さない) ──');
 {
-  const db3 = new Database(path.join(senderDir, 'warehouse.db'));
-  db3.prepare('DELETE FROM f_yahoo_sku_map').run();
-  db3.close();
+  const db6 = senderConn();
+  db6.prepare('DELETE FROM f_yahoo_sku_map').run();
+  db6.close();
   const r = await runSender(['--entity', 'yahoo_sku_map']);
   eq(r.code, 1, 'exit 1');
   ok(r.out.includes('0件のため送信しない'), '理由がログに出る');
-  eq(mirrorDb.prepare('SELECT COUNT(*) n FROM mirror_yahoo_sku_map').get().n, 1, 'mirror は無傷');
+  eq(yahooKeys().length, 2, 'mirror は無傷');
 }
 
 server.close();

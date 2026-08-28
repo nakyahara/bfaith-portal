@@ -2023,6 +2023,16 @@ function createTables() {
     }
   }
 
+  // ---- full_snapshot entity の世代採番 (価格一括改定ツール PR1、2026-08-28)
+  // 全置換 snapshot は「あとから来た古い run が新しい内容を巻き戻す」事故が起きうる。
+  // 送信のたびにここで単調増加の番号を採り、受け側は古い世代を 409 で拒否する。
+  // 時刻ベースにしないのは、送信元の時計ずれ・巻き戻りに依存させないため
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_snapshot_generations (
+    entity      TEXT PRIMARY KEY,
+    generation  INTEGER NOT NULL,
+    updated_at  TEXT NOT NULL
+  )`);
+
   // ---- SKUマップ 2種: contract auto-seed (価格一括改定ツール PR1、2026-08-28)
   // f_yahoo_sku_map / f_aupay_sku_map = モール出品コード → NEコード の手動 map。
   // 価格一括改定ツール (Render) の出品引き当てが参照する。全置換 (full_snapshot) で送るのは
