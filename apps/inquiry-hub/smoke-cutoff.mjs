@@ -446,7 +446,13 @@ console.log('8. 画面とAPI');
   check('除外リストの管理セクションが出る', html.includes('この画面に出さない差出人'));
   check('差出人が表示される', html.includes('✉️'));
   check('「この差出人は今後出さない」ボタンが出る', html.includes('cut-excl'));
-  check('「問い合わせ自体は消えない」と書いてある', html.includes('問い合わせ自体が消えるわけではありません'));
+  check('「問い合わせ自体は消えない」と書いてある', html.includes('問い合わせ自体が消えるわけでもありません'));
+  // ⭐押し間違いを戻せることを画面が伝えているか (中原さん「間違えて押しちゃった時に戻せる?」)
+  check('「外せば元どおり」と画面に書いてある', html.includes('外す」を押せば元どおり'));
+  check('確認ダイアログにも「元に戻せます」と出す', html.includes('元に戻せます'));
+  check('「除外したぶんも見る」導線がある', html.includes('excluded=1'));
+  const exclView = await (await fetch(base + '/cutoff?excluded=1')).text();
+  check('除外したぶんも表示できる', exclView.includes('除外した差出人のぶんも表示しています'));
   const rEx = await jpost('/api/cutoff/exclude', { pattern: 'smoke-excl@example.com', note: 'smoke' });
   check('除外の追加API', rEx.status === 200);
   check('メールアドレスでないものは400', (await jpost('/api/cutoff/exclude', { pattern: 'あいうえお' })).status === 400);
