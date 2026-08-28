@@ -147,13 +147,20 @@ async function api(path, opts) {
   return body.result;
 }
 
+// 接続後にアプリ側の必要スコープが増えた場合 (403 の原因)。MFの認可画面をもう一度通すと解消する
+function scopeWarn(s, connectHref) {
+  if (!s.missing_scopes?.length) return '';
+  return ` <span style="color:#b45309">権限が足りません（${s.missing_scopes.map(x => x.replace('mfc/accounting/', '')).join(', ')}）</span> `
+    + `<button class="btn primary" onclick="location.href='${connectHref}'">再接続して許可する</button>`;
+}
+
 async function refreshStatus() {
   const bar = $('statusBar');
   try {
     const s = await api('../api/mf/status');
     if (!s.configured) bar.innerHTML = '<span class="dot ng"></span> MF_CLIENT_ID / MF_CLIENT_SECRET が未設定です';
     else if (!s.connected) bar.innerHTML = '<span class="dot ng"></span> MF未接続 <button class="btn primary" onclick="location.href=\'../mf/connect\'">MFと接続する</button>';
-    else bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(s.office?.office?.name || s.office?.name || '')}</b>`;
+    else bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(s.office?.office?.name || s.office?.name || '')}</b>` + scopeWarn(s, '../mf/connect');
   } catch (e) {
     bar.innerHTML = '<span class="dot ng"></span> 状態取得エラー: ' + esc(e.message);
   }
@@ -174,6 +181,7 @@ async function load() {
     data = await api(`../api/mf/transactions?start=${start}&end=${end}`);
     $('hint').style.display = 'none';
     $('loadInfo').textContent = `明細 ${data.total}件`;
+    if (data.warning === 'reconnect_for_scope') toast('連携サービス名を出すには「再接続して許可する」を押してください');
     if (!data.accounts.some(a => a.id === current)) current = (visibleAccounts()[0] || {}).id || null;
     renderCards();
     renderRows();
