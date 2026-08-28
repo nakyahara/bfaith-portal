@@ -53,11 +53,18 @@ function Assert-Denied([string]$p, [bool]$isDir) {
 
 # All protected targets are registered BEFORE any deny is lifted, and the finally re-protects each one
 # independently (Codex R4 high 1). The original error and any re-protect errors are reported together (R5 medium).
+# Files under bin/ and .claude/ inherit the directory deny, but older installs (or a partial run) may have left an
+# explicit deny on the file itself; lift and re-apply those too so Copy-Item never hits a stale ACE.
 $targets = @(
-  @{ p = $Bin;                          d = $true  },
-  @{ p = $Cfg;                          d = $true  },
-  @{ p = (Join-Path $Work 'phq');       d = $false },
-  @{ p = (Join-Path $Work 'phreview');  d = $false }
+  @{ p = $Bin;                                          d = $true  },
+  @{ p = $Cfg;                                          d = $true  },
+  @{ p = (Join-Path $Work 'phq');                       d = $false },
+  @{ p = (Join-Path $Work 'phreview');                  d = $false },
+  @{ p = (Join-Path $Cfg 'settings.json');              d = $false },
+  @{ p = (Join-Path $Bin 'phq.mjs');                    d = $false },
+  @{ p = (Join-Path $Bin 'copy_lint.py');               d = $false },
+  @{ p = (Join-Path $Bin 'run-ph-generate.ps1');        d = $false },
+  @{ p = (Join-Path $Bin 'ping.ps1');                   d = $false }
 )
 $updateError = $null
 $reprotectErrors = @()
