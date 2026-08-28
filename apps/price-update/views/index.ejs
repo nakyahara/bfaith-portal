@@ -242,31 +242,55 @@
   //   (待たない/握り潰すと、画面の入力とサーバ側スナップショット = 監査記録 がずれる)
   let timer = null;
   let chain = Promise.resolve();
+  let enqueueSeq = 0;
+
+  /** 送信内容は「キューに入れた時点の画面」で固定する (実行時に読むと、その間の入力とずれる) */
+  function snapshotPayload() {
+    const payload = [];
+    document.querySelectorAll('.price-in').forEach((el) => {
+      const sel = document.querySelector('.sel[data-key="' + el.dataset.key + '"]');
+      payload.push({ key: el.dataset.key, newPrice: el.value === '' ? null : el.value, selected: !!(sel && sel.checked) });
+    });
+    return payload;
+  }
+
   function enqueuePreview() {
-    chain = chain.then(sendPreview, sendPreview);   // 前回が失敗していても最新入力を送り直す
+    const mySeq = ++enqueueSeq;
+    const payload = snapshotPayload();
+    const run = () => sendPreview(payload, mySeq);
+    chain = chain.then(run, run);   // 前回が失敗していても最新入力を送り直す
     return chain;
   }
   function onInputChange() {
     clearTimeout(timer);
     timer = setTimeout(function () { timer = null; enqueuePreview(); }, 250);
   }
+  function setInputsDisabled(v) {
+    document.querySelectorAll('.price-in, .sel, .cost-in').forEach((el) => { el.disabled = v; });
+  }
+  /** 保存前: 入力を止めて、キューが完全に静止するまで待つ。失敗していれば例外を投げる */
   async function flushPreview() {
-    if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
-    await chain;   // 直近の送信が失敗していればここで例外 → 呼び出し側 (save) が中止する
+    setInputsDisabled(true);
+    try {
+      if (timer) { clearTimeout(timer); timer = null; enqueuePreview(); }
+      let last;
+      do { last = chain; await chain; } while (last !== chain);
+    } finally {
+      setInputsDisabled(false);
+    }
   }
 
-  async function sendPreview() {
+  async function sendPreview(payload, mySeq) {
     if (!previewId) return;
-    const payload = [];
-    document.querySelectorAll('.price-in').forEach((el) => {
-      const sel = document.querySelector('.sel[data-key="' + el.dataset.key + '"]');
-      payload.push({ key: el.dataset.key, newPrice: el.value === '' ? null : Number(el.value), selected: !!(sel && sel.checked) });
-    });
     try {
       const r = await api('/apps/price-update/api/preview', { previewId, rows: payload });
-      rows = r.rows;
-      render();
-      $('save-msg').textContent = '';
+      // 自分より新しい入力が既にキューに入っているなら描き直さない
+      // (古い応答で表を作り直すと、入力中の値が前の値へ巻き戻る)
+      if (mySeq === enqueueSeq) {
+        rows = r.rows;
+        render();
+        $('save-msg').textContent = '';
+      }
     } catch (e) {
       // ★握り潰さない。失敗を飲み込むと「画面の入力が反映されていないのに記録できてしまう」
       $('save-msg').textContent = 'エラー: ' + e.message;
