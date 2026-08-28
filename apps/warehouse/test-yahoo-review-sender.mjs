@@ -8,7 +8,7 @@ import {
 } from './yahoo-review-mail-lib.js';
 import { messageIdFor as rakutenMessageIdFor } from './rakuten-review-mail-lib.js';
 import {
-  buildRawMessage, createGmailSender, resolveGmailCredentials, assertFromVerified,
+  buildRawMessage, mimeWord, encodeAddressHeader, createGmailSender, resolveGmailCredentials, assertFromVerified,
   recordFromVerification, ensureFromVerificationLedger, invalidateFromVerification, FROM_VERIFY_TTL_DAYS,
 } from './yahoo-mail-send-lib.js';
 import { monthlyCouponFor, couponTimeToIso, resolveRecipient, buildMailForAction, createYahooSenderAdapter } from './yahoo-review-sender-adapter.js';
@@ -69,6 +69,30 @@ console.log('=== 3. RFC822 の組み立て (ヘッダインジェクション防
   check('base64url (+ / = を含まない)', !/[+/=]/.test(raw));
   check('必須ヘッダが揃う', ['From:', 'To: a@example.com', 'Subject: ', 'Message-ID: <yrc-1-abc@b-faith.biz>', 'MIME-Version: 1.0'].every((h) => decoded.includes(h)));
   check('非ASCII件名は RFC2047 エンコード', /Subject: =\?UTF-8\?B\?/.test(decoded));
+  // 2026-08-28 実機で差出人「雑貨イズム」が文字化けした:
+  // 件名だけエンコードして From の表示名は生の日本語を置いていた
+  const decodeWords = (x) => x.replace(/=\?UTF-8\?B\?([^?]*)\?=(\r\n )?/g, (_, b) => Buffer.from(b, 'base64').toString('utf8'));
+  const head = decoded.split('\r\n\r\n')[0];
+  check('From の表示名も RFC2047 エンコードされる (生の日本語を置かない)',
+    /^From: =\?UTF-8\?B\?[^?]+\?= <info@b-faith\.biz>$/m.test(head), head.match(/^From: .*$/m)?.[0]);
+  check('From を復号すると元の表示名とアドレスに戻る',
+    decodeWords(head.match(/^From: (.*)$/m)[1]) === '雑貨イズム <info@b-faith.biz>');
+  check('件名を復号すると元に戻る (分割しても壊れない)',
+    decodeWords(head.split('Subject: ')[1].split('\r\nMessage-ID')[0]) === '【テスト】日本語');
+  {
+    // encoded-word は 1 個 75 文字以内。文字数で切ると日本語 20 文字 = 60 バイトで超えるため
+    const longSubject = `【雑貨イズム】${'あ'.repeat(60)}`;
+    const h2 = Buffer.from(buildRawMessage({ to: 'a@example.com', from: '"雑貨イズム" <info@b-faith.biz>', subject: longSubject, text: 't', messageId: '<m@b>' })
+      .replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8').split('\r\n\r\n')[0];
+    const words = h2.match(/=\?UTF-8\?B\?[^?]*\?=/g) || [];
+    const longest = Math.max(...words.map((w) => w.length));
+    check('長い件名でも encoded-word は 75 文字以内', words.length > 1 && longest <= 75, `最長 ${longest}`);
+    check('長い件名も復号すれば元どおり', decodeWords(h2.split('Subject: ')[1].split('\r\nMessage-ID')[0]) === longSubject);
+  }
+  check('ASCII の表示名は引用符つきのまま (エンコードしない)',
+    encodeAddressHeader('From', '"Zakka Ism" <info@b-faith.biz>') === '"Zakka Ism" <info@b-faith.biz>');
+  check('表示名なしの素のアドレスはそのまま', encodeAddressHeader('From', 'info@b-faith.biz') === 'info@b-faith.biz');
+  check('ASCII はエンコードしない (mimeWord)', mimeWord('plain ascii') === 'plain ascii');
   check('本文は base64 で往復する', Buffer.from(decoded.split('\r\n\r\n').slice(1).join('\r\n\r\n').replace(/\r\n/g, ''), 'base64').toString('utf8') === '本文\n2行目');
   check('一括配信ヘッダ (Auto-Submitted / Precedence)', decoded.includes('Auto-Submitted: auto-generated') && decoded.includes('Precedence: bulk'));
   let inj = 0;
