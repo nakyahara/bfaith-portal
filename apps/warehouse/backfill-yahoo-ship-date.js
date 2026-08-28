@@ -85,9 +85,13 @@ if (targets.length > 0 && !isDryRun) {
       data = await res.json();
       // 形式を検証してから使う (Codex Y-C2 R1 High: HTTP 200 でも results 欠落・件数不足がありうる)
       if (!Array.isArray(data?.results)) throw new Error('results が配列でない');
+      if (data.results.length !== batch.length) throw new Error(`results 件数不一致 (要求 ${batch.length} / 応答 ${data.results.length})`);
       const got = new Set(data.results.map((r) => r?.orderId));
-      const missing = batch.filter((id) => !got.has(id));
-      if (missing.length) throw new Error(`results に ${missing.length} 件不足 (要求 ${batch.length})`);
+      const want = new Set(batch);
+      // 欠落・重複・要求外の混入をすべて弾く (要求した注文の集合と完全一致でなければ batch 全件を失敗扱い)
+      if (got.size !== want.size) throw new Error(`results に重複がある (unique ${got.size} / 要求 ${want.size})`);
+      for (const id of got) if (!want.has(id)) throw new Error('results に要求していない注文が含まれる');
+      for (const id of want) if (!got.has(id)) throw new Error('results に要求した注文が欠けている');
     } catch (e) {
       console.error(`  ⚠ batch ${i + 1}-${i + batch.length} 失敗: ${e.message}`);
       apiError += batch.length;
