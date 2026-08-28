@@ -2039,9 +2039,12 @@ function createTables() {
   // 「誤りとして miniPC で削除した map」が mirror に残ると別商品に値付けする事故になるため。
   {
     const skuMapContracts = [
+      // ★粒度は (store_id, yahoo_key)。現在の f_yahoo_sku_map は yahoo_key 単独 PK だが、
+      //   これは「ストアが b-faith01 だけ」という現状に依存した、より強い制約にすぎない。
+      //   2 店舗目を持つときは f_yahoo_sku_map の PK も複合へ移行する (mirror は既に複合)
       ['yahoo_sku_map', 'f_yahoo_sku_map',
-        'one row = one yahoo_key (item_id or sub_code) — Yahoo出品コード → NEコード の手動map',
-        '["yahoo_key"]'],
+        'one row = one (store_id, yahoo_key=item_id or sub_code) — Yahoo出品コード → NEコード の手動map',
+        '["store_id","yahoo_key"]'],
       ['aupay_sku_map', 'f_aupay_sku_map',
         'one row = one (store_id, aupay_key=item_code) — au PAY出品コード → NEコード の手動map',
         '["store_id","aupay_key"]'],
