@@ -261,38 +261,56 @@ async function submitToConfirm(page) {
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(800);
   assertCouponUrl(page.url(), '確認画面');
-  const body = (await page.locator('body').innerText().catch(() => '')).replace(/\s+/g, ' ');
-  if (/エラー|入力してください|正しく入力/.test(body) && !/確認/.test(body)) throw new Error(`CONFIRM: 確認画面でエラー → ${body.slice(0, 200)}`);
-  return body;
+  // 実測: 入力エラーは .ycMdErrMsg に文言が入る (要素自体は空でも常に存在する)。
+  // 「確認」という語での除外は「ご確認ください」に引っかかって素通りするので使わない
+  const state = await page.evaluate(() => {
+    const norm = (x) => (x || '').replace(/\s+/g, ' ').trim();
+    return {
+      title: document.title,
+      err: norm(document.querySelector('.ycMdErrMsg')?.innerText || ''),
+      body: norm(document.body.innerText),
+      hasGoUpdate: !!document.querySelector('a[onclick*="goUpdate"]'),
+    };
+  });
+  if (state.err) throw new Error(`CONFIRM: 入力エラー → ${state.err.slice(0, 200)}`);
+  if (!/クーポン新規発行確認/.test(state.title)) throw new Error(`CONFIRM: 確認画面ではない (title=${state.title})`);
+  if (!state.hasGoUpdate) throw new Error('CONFIRM: 発行ボタン (goUpdate) が見つからない (画面仕様変更の疑い)');
+  // 最終安全確認: 確認画面の表示が「非表示・併用不可・ストア内全商品」であること
+  for (const [label, re] of [['公開範囲=非表示', /公開範囲[^ ]* 非表示/], ['併用不可', /併用可否 併用不可/], ['ストア内全商品', /対象商品 ストア内全商品/]]) {
+    if (!re.test(state.body)) throw new Error(`CONFIRM: 確認画面に「${label}」が見当たらない (意図と違うクーポンを発行しかけている)`);
+  }
+  console.log('  [confirm] 非表示・併用不可・ストア内全商品 を確認');
+  return state.body;
 }
 
-/** 確認画面の「発行」→ モーダルの「発行」の 2 段階 (rotate.mjs の実測どおり) */
+/**
+ * 確認画面の「発行」→ モーダルの「発行」の 2 段階 (2026-08-28 実測)。
+ * 1 段階目 = 可視の <a>発行</a> (onclick 無し) がモーダルを開く。
+ * 2 段階目 = 最初は非可視の <a onclick="goUpdate()">発行</a> が、モーダル内で可視になる。
+ * (rotate.mjs はモーダル本文の「ご注意ください」で探していたが、この画面は文言が違う → onclick で特定する)
+ */
 async function clickIssue(page) {
   const tagged = await page.evaluate(() => {
     const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
     const els = [...document.querySelectorAll('a, button, input[type=submit], input[type=button]')]
-      .filter(vis).filter((el) => (el.innerText || el.value || '').replace(/\s+/g, '') === '発行');
+      .filter(vis)
+      .filter((el) => (el.innerText || el.value || '').replace(/\s+/g, '') === '発行')
+      .filter((el) => !/goUpdate/.test(el.getAttribute('onclick') || ''));
     els.forEach((el, i) => { if (i === 0) el.setAttribute('data-yrc-issue', '1'); });
     return { count: els.length };
   });
-  if (tagged.count !== 1) throw new Error(`ISSUE: 発行ボタンを一意に特定できず (可視 ${tagged.count} 件)`);
+  if (tagged.count !== 1) throw new Error(`ISSUE: モーダルを開く発行ボタンを一意に特定できず (可視 ${tagged.count} 件)`);
   await page.locator('[data-yrc-issue="1"]').click({ timeout: 15000 });
-  await page.waitForTimeout(1200);
-  const modal = await page.evaluate(() => {
-    const vis = (el) => !!(el.offsetParent || el.getClientRects().length);
-    const dialogs = [...document.querySelectorAll('div')].filter((d) => vis(d) && /ご注意ください/.test(d.innerText || ''));
-    if (!dialogs.length) return { ok: false, reason: 'モーダルが出ていない' };
-    const inner = dialogs.reduce((a, b) => (a.contains(b) ? b : a));
-    const btns = [...inner.querySelectorAll('a, button, input[type=submit], input[type=button]')]
-      .filter(vis).filter((el) => (el.innerText || el.value || '').replace(/\s+/g, '') === '発行');
-    if (btns.length !== 1) return { ok: false, reason: `モーダル内の発行ボタンが ${btns.length} 件` };
-    btns[0].setAttribute('data-yrc-issue2', '1');
-    return { ok: true };
-  });
-  if (!modal.ok) throw new Error(`ISSUE: ${modal.reason}`);
-  await page.locator('[data-yrc-issue2="1"]').click({ timeout: 15000 });
+  // モーダルが開くと goUpdate ボタンが可視になる
+  const confirmBtn = page.locator('a[onclick*="goUpdate"]').first();
+  try {
+    await confirmBtn.waitFor({ state: 'visible', timeout: 15000 });
+  } catch {
+    throw new Error('ISSUE: 発行モーダルが開かない (goUpdate ボタンが可視にならない)');
+  }
+  await confirmBtn.click({ timeout: 15000 });
   await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 }
 
 async function main() {
