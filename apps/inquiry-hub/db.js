@@ -520,6 +520,124 @@ function createTables() {
   // 初回作成時だけ、登録済み店舗に合わせた既定リンクを入れておく (すぐ使える状態にする)。
   // 以後は画面での編集が正 — 全部消しても復活しない (2回目以降は何もしない)
   if (!linksExisted) seedDefaultQuickLinks();
+
+  // ─── 担当者マスタと権限マップ (2026-08-28 中原さん要望「権限マップをアプリに入れて自分で登録したい」) ───
+  // 位置づけ: AIトリアージに人を選ばせない。AIが出すのは「必要な権限 (決裁D / エスカレーションE / 操作S)」
+  //   までで、そこから誰に渡すかはこの表を見る決定的なルールが決める。
+  //   人が増減してもAI側のプロンプトを触らずに済み、誤りが「人違い」でなく「権限違い」として検出できる。
+  // ⚠️ inquiries.assigned_user_id は従来どおり自由入力の TEXT のまま。このマスタは候補と権限の管理であって
+  //   担当の保存先ではない (マスタに無い担当者名も引き続き保存できる = 既存データを壊さない)
+  db.exec(`CREATE TABLE IF NOT EXISTS staff_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_key TEXT NOT NULL,              -- inquiries.assigned_user_id に入る値 (メールアドレス等)
+    display_name TEXT NOT NULL,
+    -- D2 (少額の補償) の上限額。⚠️NULL は「無制限」ではなく「金額の決裁はできない (未設定)」。
+    -- 設定を忘れただけの人が無制限の決裁者になる fail-open を作らないため (Codexレビュー指摘)
+    refund_limit_yen INTEGER,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),  -- 削除は論理削除のみ
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    note TEXT,
+    created_by TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  // 有効な担当者の user_key は重複させない (同じ人が2行あると権限が食い違う)
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_userkey_active
+    ON staff_members(user_key) WHERE is_active = 1`);
+
+  // 権限定義。既定の19件は is_builtin=1 で、コード側 (トリアージのルーティング) が code を参照する。
+  // 名称・説明・表示順は画面から編集でき、使わない権限は is_active=0 で隠せる。
+  // ⚠️ builtin は削除できない (消えるとルーティングが参照先を失う)。独自の権限は追加できる
+  db.exec(`CREATE TABLE IF NOT EXISTS permissions (
+    code TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK(kind IN ('decision','escalation','system')),
+    name TEXT NOT NULL,                  -- ⚠️既定権限は編集不可 (コードが意味を前提に使うため)
+    description TEXT,                    -- 同上
+    local_note TEXT,                     -- 社内向けの補足メモ。既定権限でも自由に書ける
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+    is_builtin INTEGER NOT NULL DEFAULT 0 CHECK(is_builtin IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+
+  // 誰にどの権限があるか (画面のチェックボックス1つ = この1行)
+  db.exec(`CREATE TABLE IF NOT EXISTS staff_permissions (
+    staff_id INTEGER NOT NULL REFERENCES staff_members(id),
+    permission_code TEXT NOT NULL REFERENCES permissions(code),
+    granted_by TEXT,
+    granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (staff_id, permission_code)
+  )`);
+
+  // 権限の付与・剥奪の履歴。権限は事故に直結するので「誰がいつ外したか」を残す
+  // (staff_permissions は現在の状態しか持たないため。追記のみ・更新削除はしない)
+  db.exec(`CREATE TABLE IF NOT EXISTS staff_permission_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    staff_id INTEGER NOT NULL,
+    permission_code TEXT NOT NULL,
+    permission_name TEXT,               -- 操作した時点の権限名 (権限定義が消えても履歴が読める)
+    action TEXT NOT NULL CHECK(action IN ('grant','revoke')),
+    actor TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_permlog_staff ON staff_permission_logs(staff_id, id)');
+
+  seedBuiltinPermissions();
+}
+
+/**
+ * 既定の権限定義 20件 (中原さんとCodexの議論で確定した D / E / S の3系統)。
+ * 内訳: 決裁 D0-D4 = 5件 / エスカレーション E1-E6 = 6件 / 操作 S1-S8 = 9件
+ *   (操作は S2 を「止める(S2a)」「解除する(S2b)」に分けるので番号8つで9権限)
+ *
+ * ⭐分け方の根拠:
+ *   D (決裁) = 顧客に何を約束していいか。「キャンセルを受け付ける判断 (D1)」と
+ *              「返金を実行する操作 (S4)」は別物 — キャンセルは売上取消・ポイント返還・
+ *              モール手数料に波及するので、受付判断と決済操作を1つの権限にまとめない
+ *   E (エスカレーション) = 金額の大小で決められない領域。少額でも即上位へ上げる
+ *   S (操作) = どのシステムを触れるか。読み取りと更新を分け、
+ *              「止める (S2a)」と「止めたものを解除する (S2b)」も分ける
+ *              (停止だけ与えた人が解除までできると誤操作の被害が大きい)
+ */
+export const BUILTIN_PERMISSIONS = [
+  // ── 決裁権限: 顧客に何を約束していいか ──
+  { code: 'D0', kind: 'decision', name: '定型回答のみ', description: '既存のQ&A・テンプレートの範囲で答える。新しい約束はしない' },
+  { code: 'D1', kind: 'decision', name: '注文の変更・停止を受け付ける', description: 'キャンセル受付・住所変更・お届け日変更を「受け付ける」判断。返金の実行 (S4) は含まない' },
+  { code: 'D2', kind: 'decision', name: '少額の補償を決める', description: '再送・返品送料・少額返金。上限額は担当者ごとに設定する' },
+  { code: 'D3', kind: 'decision', name: '高額・例外・規約外を決める', description: '全額返金・代替品手配・継続的な例外対応・同一顧客への累積補償' },
+  { code: 'D4', kind: 'decision', name: '外部と交渉する', description: '運送会社への調査依頼・モール運営とのやりとり・仕入先クレーム' },
+  // ── エスカレーション属性: 金額と無関係に上位へ上げる領域 ──
+  { code: 'E1', kind: 'escalation', name: '個人情報・本人確認', description: '住所などの開示、第三者からの変更依頼、削除請求' },
+  { code: 'E2', kind: 'escalation', name: '決済不正・チャージバック', description: 'カード名義違い、不正注文の疑い、支払方法の変更、後払い審査' },
+  { code: 'E3', kind: 'escalation', name: '法務・規制対応', description: '内容証明、消費生活センター、弁護士、警察、行政機関' },
+  { code: 'E4', kind: 'escalation', name: '商品安全', description: '発煙・発熱・けが・誤飲・健康被害・リコールの疑い' },
+  { code: 'E5', kind: 'escalation', name: 'セキュリティ', description: 'モールアカウントの乗っ取り、なりすまし、情報漏えいの疑い' },
+  { code: 'E6', kind: 'escalation', name: '公開対応', description: 'レビューへの返信、SNS投稿、モール上の公開回答' },
+  // ── 操作権限: どのシステムを触れるか ──
+  { code: 'S1', kind: 'system', name: '受注・在庫を照会する', description: 'ネクストエンジン / warehouse / ロジザードの読み取り' },
+  { code: 'S2a', kind: 'system', name: '出荷を止める', description: 'WMS流し込み前の除外、ピッキングの中断' },
+  { code: 'S2b', kind: 'system', name: '止めた出荷を解除・再送する', description: '「止める」とは別権限 (誤って解除されると出荷事故になる)' },
+  { code: 'S3', kind: 'system', name: '受注内容を編集する', description: '届け先住所・明細の修正' },
+  { code: 'S4', kind: 'system', name: '決済取消・返金を実行する', description: '部分返金・全額返金・決済の取り消し' },
+  { code: 'S5', kind: 'system', name: 'クーポン・ポイントを発行する', description: '返金とは別の商業判断' },
+  { code: 'S6', kind: 'system', name: 'モールで顧客へ返信する', description: 'モール管理画面からの返信・レビューへの公開返信' },
+  { code: 'S7', kind: 'system', name: '個人情報を閲覧する', description: '顧客の氏名・住所・連絡先の閲覧' },
+  { code: 'S8', kind: 'system', name: '誤出荷管理に記録する', description: '誤出荷・事故の証跡登録' },
+];
+
+/**
+ * 既定権限の存在を保証する (INSERT OR IGNORE)。
+ * 名称・説明は上書きしない — 画面で編集した内容が起動のたびに戻ってしまうため。
+ * 使わない権限は削除ではなく is_active=0 で隠す (コードが参照する code を消さない)
+ */
+function seedBuiltinPermissions() {
+  const db = getDB();
+  const ins = db.prepare(`INSERT OR IGNORE INTO permissions
+    (code, kind, name, description, sort_order, is_builtin) VALUES (?,?,?,?,?,1)`);
+  db.transaction(() => {
+    BUILTIN_PERMISSIONS.forEach((p, i) => ins.run(p.code, p.kind, p.name, p.description, (i + 1) * 10));
+  }).immediate();
 }
 
 /** 既定のクイックリンク投入 (テーブル新規作成時のみ)。店舗が登録されているチャネルの分だけ入れる */
