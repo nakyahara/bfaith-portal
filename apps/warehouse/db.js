@@ -2023,6 +2023,56 @@ function createTables() {
     }
   }
 
+  // ---- full_snapshot entity の世代採番 (価格一括改定ツール PR1、2026-08-28)
+  // 全置換 snapshot は「あとから来た古い run が新しい内容を巻き戻す」事故が起きうる。
+  // 送信のたびにここで単調増加の番号を採り、受け側は古い世代を 409 で拒否する。
+  // 時刻ベースにしないのは、送信元の時計ずれ・巻き戻りに依存させないため
+  db.exec(`CREATE TABLE IF NOT EXISTS sync_snapshot_generations (
+    entity      TEXT PRIMARY KEY,
+    generation  INTEGER NOT NULL,
+    updated_at  TEXT NOT NULL
+  )`);
+
+  // ---- SKUマップ 2種: contract auto-seed (価格一括改定ツール PR1、2026-08-28)
+  // f_yahoo_sku_map / f_aupay_sku_map = モール出品コード → NEコード の手動 map。
+  // 価格一括改定ツール (Render) の出品引き当てが参照する。全置換 (full_snapshot) で送るのは
+  // 「誤りとして miniPC で削除した map」が mirror に残ると別商品に値付けする事故になるため。
+  {
+    const skuMapContracts = [
+      // ★粒度は (store_id, yahoo_key)。現在の f_yahoo_sku_map は yahoo_key 単独 PK だが、
+      //   これは「ストアが b-faith01 だけ」という現状に依存した、より強い制約にすぎない。
+      //   2 店舗目を持つときは f_yahoo_sku_map の PK も複合へ移行する (mirror は既に複合)
+      ['yahoo_sku_map', 'f_yahoo_sku_map',
+        'one row = one (store_id, yahoo_key=item_id or sub_code) — Yahoo出品コード → NEコード の手動map',
+        '["store_id","yahoo_key"]'],
+      ['aupay_sku_map', 'f_aupay_sku_map',
+        'one row = one (store_id, aupay_key=item_code) — au PAY出品コード → NEコード の手動map',
+        '["store_id","aupay_key"]'],
+    ];
+    const seedStmt = db.prepare(`
+      INSERT INTO sync_contracts (
+        entity, contract_version, source_system, source_object, target_table,
+        grain_definition, key_columns_json, payload_schema_json,
+        clear_strategy, apply_mode, enabled, owner, created_at, updated_at
+      ) VALUES (
+        ?, 1, 'minipc-warehouse', ?, ?, ?, ?,
+        '{"required":["ne_code","resolution_source"]}',
+        'full_snapshot', 'insert_or_replace', 1, 'price-update',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      )
+      ON CONFLICT(entity) DO UPDATE SET
+        contract_version = excluded.contract_version, source_system = excluded.source_system,
+        source_object = excluded.source_object, target_table = excluded.target_table,
+        grain_definition = excluded.grain_definition, key_columns_json = excluded.key_columns_json,
+        payload_schema_json = excluded.payload_schema_json, clear_strategy = excluded.clear_strategy,
+        apply_mode = excluded.apply_mode, enabled = excluded.enabled, owner = excluded.owner,
+        updated_at = excluded.updated_at
+    `);
+    for (const [entity, srcTable, grain, keys] of skuMapContracts) {
+      seedStmt.run(entity, srcTable, `mirror_${entity}`, grain, keys);
+    }
+  }
+
   // ---- 楽天レビュー 日次集計: contract auto-seed (mall-csv-fetcher P2 PR-A、2026-07-16)
   // ★非PII projection のみ mirror へ (本文/注文番号/レビューURL は miniPC 内に留める — らくらくーぽん置換 設計書§4)
   db.exec(`
