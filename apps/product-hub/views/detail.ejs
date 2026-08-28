@@ -88,14 +88,10 @@
         <button class="btn btn-sm btn-danger" id="delete-draft-btn" style="margin-left:8px">この取り込みを削除</button>
       </div>
     <% } %>
-    <%# Notion カードはもう作らない運用 (2026-08-28 中原さん)。「⏳ 未作成」も「再作成」も出さない。
-        既に作られているカードだけ、開くためのリンクとして残す (過去データへの導線)。
+    <%# Notion はもう使わない運用 (2026-08-28 中原さん)。カードの状態も「Notionで開く」リンクも出さない。
         #action-result は画面全体の保存メッセージ置き場なので、この div ごとは消さない %>
     <div style="margin-top:10px; font-size:13px;">
-      <% if (draft.notion_card_status === 'created' && draft.notion_page_id) { %>
-        Notionカード: ✅ 作成済み <a href="https://www.notion.so/<%= draft.notion_page_id.replace(/-/g, '') %>" target="_blank" rel="noopener">Notionで開く ↗</a>
-      <% } %>
-      <span class="muted" id="action-result" style="margin-left:8px"></span>
+      <span class="muted" id="action-result"></span>
     </div>
   </div>
 
@@ -517,7 +513,7 @@
       <h2>✏️ 基本情報 <span class="muted" style="font-weight:400">(入力)</span></h2>
       <div class="field">
         <label>商品コード (NE / 楽天管理番号)<span class="ftag ftag-auto">自動</span></label>
-        <!-- 登録後の変更は影響範囲が広い (Notionカード・NE突合のキー) ので表示専用。クリックでコピー -->
+        <%# 登録後の変更は影響範囲が広い (NE突合・楽天管理番号のキー) ので表示専用。クリックでコピー %>
         <button type="button" class="copy-code" data-code="<%= draft.ne_code %>"
                 title="クリックでコピー"><%= draft.ne_code %><span class="copy-hint">📋 コピー</span></button>
       </div>

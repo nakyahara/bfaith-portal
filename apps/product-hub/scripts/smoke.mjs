@@ -4535,10 +4535,12 @@ for (const [name, file, data] of renders) {
     noCard.length > 500 && !noCard.includes('未作成') && !noCard.includes('notion-retry-btn')
     && !noCard.includes('Notionカード:'),
     noCard.includes('Notionカード:') ? 'Notionカード: が残っている' : '未作成/再作成が残っている');
-  // 作成済みのカードだけ、開くリンクを残す (過去データへの導線)
+  // カードが作成済みの商品でも、Notion への導線は出さない (2026-08-28 中原さん)
   const hasCard = renderedHtml.get('detail.ejs (created notion / non-own-brand)') || '';
-  check('Notionカード: 作成済みなら「Notionで開く」リンクは残す',
-    hasCard.includes('Notionで開く') && !hasCard.includes('notion-retry-btn'), hasCard.length + '');
+  check('Notionカード: 作成済みでも「Notionで開く」リンクを出さない',
+    hasCard.length > 500 && !hasCard.includes('Notionで開く') && !hasCard.includes('notion.so')
+    && !hasCard.includes('Notionカード'),
+    hasCard.includes('Notionで開く') ? 'リンクが残っている' : 'Notionカード の文言が残っている');
   // 一覧も同じ表示 (Notion列の ⏳ 未作成) をやめる。列を消したのでヘッダごと無い
   const list = renderedHtml.get('index.ejs (banner+rows+import panel)') || '';
   check('一覧: Notion列 (⏳ 未作成) を出さない',
