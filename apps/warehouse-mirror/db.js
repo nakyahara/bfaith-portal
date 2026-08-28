@@ -9,6 +9,7 @@
  *   mart_*    — ツール用に加工したデータ（将来）
  */
 import Database from 'better-sqlite3';
+import { createProductScoutTables } from '../product-scout/schema.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -40,6 +41,9 @@ export let shipmentsDailyInitError = null;
 // ロジザード在庫スナップショット表も同様 (毎時mirror、2026-08-16)
 export let logizardStockInitError = null;
 
+// 新商品企画スカウト表も同様 (apps/product-scout、2026-08-28)
+export let productScoutInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -52,6 +56,7 @@ export function initMirrorDB() {
   rakutenReviewInitError = null;
   shipmentsDailyInitError = null;
   logizardStockInitError = null;
+  productScoutInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -2575,7 +2580,22 @@ function createTables() {
   createGiftsetTables();
   createSupplierShareTables();
   createInboundInfoTables();
+
+  // ▼▼▼ 新商品企画スカウト (apps/product-scout) ▼▼▼
+  // 新規mirror表のDDLは fail-soft 必須 (2026-07-12 の本番障害の教訓)。
+  // ここで落ちても mirror 本体と他モールを道連れにしない。
+  try {
+    createProductScoutTables(db);
+  } catch (e) {
+    productScoutInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] 商品スカウト表の初期化失敗 (mirror本体は継続):', e.message);
+  }
 }
+
 
 // ▼▼▼ 入庫情報管理（apps/inbound-info）正本テーブル ▼▼▼
 // 旧: スプレッドシート「入庫情報管理表.xlsx」(入数マスタ + 原産国) の置き換え。

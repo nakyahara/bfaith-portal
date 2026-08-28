@@ -302,7 +302,7 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job',
     importance: 'P3',
     owner: '中原さん',
-    purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集。冪等・全件取得済みなら即終了)',
+    purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集 → 商品テーマに束ねてポータル /apps/product-scout へ供給。冪等)',
     where: 'miniPC TaskScheduler [ProductIdeaScout]',
     schedule: '毎日 14:00 (19時間で自主中断→翌日続きから。Task Scheduler の上限20hは保険)',
     anchor_hour_jst: 14,
@@ -312,7 +312,16 @@ export const JOBS_REGISTRY = [
     // 未完走7回までは許容し、8回目で「進んでいないのでは」と疑う
     partial_max_days: 7,
     lifecycle: 'permanent',
-    runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
+    runbook:
+      'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。' +
+      '① exit 0=完走(ok) / 3=時間切れ(partial) / 4=やる仕事が0件 / その他=異常。' +
+      '② ⭐exit 4 のとき run-products.bat は `node finder.js --next` で次の未投入カテゴリを自動投入する ' +
+      '(投入できたら partial ping)。投入先がもう無い (finder exit 5 = 7カテゴリ1周完了) ときだけ fail ping を打ち、' +
+      '翌日 late で赤くなる。「正常終了しているが仕事が無い」を ok にしたせいで 2026-08-07〜27 の20日間、' +
+      '監視が緑のまま何も進まなかった — ここを緑に戻してはいけない。' +
+      '③ 収集の完全性は `node finder.js --status` で見る (⚠️不完全 = 進捗率は「下限」)。' +
+      '④ 画面 = ポータル /apps/product-scout。供給は `node concepts.js` → `node push.js`。' +
+      '2度の停止事故の教訓で毎日実行化 (2026-08-01)、空回り検知と自動投入を追加 (2026-08-28)',
   },
   {
     id: 'fba-tracking-input',

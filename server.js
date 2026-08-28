@@ -58,6 +58,7 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
+import productScoutRouter, { ingestRouter as productScoutIngestRouter } from './apps/product-scout/router.js';
 import shippingLogViewRouter from './apps/shipping-log/view-router.js';
 import siteProductsRouter from './apps/site-products/router.js';
 import siteContactRouter from './apps/site-contact/router.js';
@@ -825,6 +826,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'product-scout',
+    name: '新商品企画スカウト',
+    description: 'Keepaで月販50点以上を収集し、AMCで作れる商品テーマに束ねて採否を判断する。収集の進捗と分母の完全性も同じ画面で見る',
+    icon: '🔎',
+    path: '/apps/product-scout',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'mis-shipment',
     name: '誤出荷管理',
     description: '誤出荷の記録・分析、モール別誤出荷率と工程別/原因別の可視化 (Phase 1)',
@@ -1319,6 +1329,12 @@ app.use('/apps/packing-dispatch/rule-change-api', express.json({ limit: '256kb' 
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
+
+// 新商品企画スカウト (apps/product-scout): warehouse-mirror.db 同居の scout_* が正本。
+// ⚠️/ingest だけは miniPC のバッチが叩くのでセッションを持てない。router 内で MIRROR_SYNC_KEY を
+//   検証するため、社内ログインを掛けない経路として先に mount する (fail-closed: 鍵未設定なら503)。
+app.use('/apps/product-scout/ingest', productScoutIngestRouter);
+app.use('/apps/product-scout', requireAppAccess('product-scout'), productScoutRouter);
 // 出荷件数ダッシュボード (apps/shipping-log)。
 // GAS からの伝票取込 API (/apps/shipping-log/api) は 2026-08-26 に廃止 (吸い上げ全廃)。
 app.use('/apps/shipping-log', requireAppAccess('shipping-log'), shippingLogViewRouter);
