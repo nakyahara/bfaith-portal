@@ -1616,12 +1616,17 @@ export function blockGenerationDraft(db, draftId, runId, { code, reason }) {
       return { result: 'blocked' };
     }
     const cur = db.prepare(`
-      SELECT status, generation_block_code, generation_blocked_by, generation_claim_run_id, generation_claim_until
+      SELECT status, generation_block_code, generation_block_reason, generation_blocked_by,
+             generation_claim_run_id, generation_claim_until
       FROM product_drafts WHERE id = ?
     `).get(id);
     if (!cur) return { result: 'not_found' };
     if (cur.generation_block_code) {
-      if (cur.generation_blocked_by === by && cur.generation_block_code === code) return { result: 'already' };
+      // 冪等は「同一操作の再送」に限る: run・code・reason が全部同じときだけ already。
+      // reason 違いまで成功扱いにすると、ランナー側のバグで理由が変わったのを隠す (Codex R1 medium)
+      if (cur.generation_blocked_by === by && cur.generation_block_code === code && cur.generation_block_reason === reason) {
+        return { result: 'already' };
+      }
       return { result: 'conflict', error: `すでに人の確認待ちです (${cur.generation_block_code})。上書きしません` };
     }
     return { result: 'conflict', error: generationClaimError(cur, runId) || 'claim が無効です' };

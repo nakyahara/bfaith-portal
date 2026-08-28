@@ -3947,11 +3947,18 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     rowB.generation_block_code === 'PACK_COUNT_MISMATCH' && rowB.generation_blocked_at && rowB.generation_blocked_by === 'ai:runJ'
     && rowB.generation_claim_run_id == null && rowB.generation_claim_until == null && rowB.status === 'ready_for_ai');
   r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
-    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: '再送' });
-  check('block: 同じ run・同じ code の再送は 200 already (通信断リトライを 409 にしない)', r.status === 200 && r.json.already === true, JSON.stringify(r.json));
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: 'draft は 50本、Amazon ページは 100本入り' });
+  check('block: 同じ run・code・reason の再送は 200 already (通信断リトライを 409 にしない)', r.status === 200 && r.json.already === true, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: '理由が変わった' });
+  check('block: 同じ run でも reason が違えば 409 (冪等は同一操作の再送だけ — Codex R1 medium)', r.status === 409);
   r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
     { run_id: 'runJ', code: 'OTHER', reason: '別の理由' });
   check('block: 別 code での上書きは 409 (人が解除するまで理由を固定)', r.status === 409);
+  r = await call('POST', `/drafts/${gdraft3.id}abc/generation-block`, { run_id: 'runJ', code: 'OTHER', reason: 'x' });
+  check('block: id に数字以外が混じると 400 (parseInt の緩さを許さない)', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'OTHER', reason: 'か'.repeat(1001) });
+  check('block: reason 1001 字は切り詰めずに 400', r.status === 400, JSON.stringify(r.json));
 
   r = await call('POST', '/generation-queue/claim', { run_id: 'runK', limit: 10 });
   check('block 後: claim 候補から外れる', !r.json.drafts.some((d) => d.id === gdraft3.id));
@@ -3972,12 +3979,15 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   check('解除: 画面が見ていた blocked_at と違えば 409', r.status === 409, JSON.stringify(r.json));
   r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: false });
   check('解除: clear:true 以外は 400 (人がこの画面から止めることはできない)', r.status === 400);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true });
+  check('解除: blocked_at 省略は 400 (楽観ロックを迂回させない — Codex R1 medium)', r.status === 400
+    && db.prepare('SELECT generation_block_code FROM product_drafts WHERE id = ?').get(gdraft3.id).generation_block_code === 'PACK_COUNT_MISMATCH');
   r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: rowB.generation_blocked_at });
   check('解除: blocked_at 一致で解除できる', r.status === 200 && r.json.unblocked === true, JSON.stringify(r.json));
   rowB = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
   check('解除後: 4列すべて NULL に戻る', rowB.generation_block_code == null && rowB.generation_block_reason == null
     && rowB.generation_blocked_at == null && rowB.generation_blocked_by == null);
-  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true });
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: rowB.generation_blocked_at || '2000-01-01T00:00:00.000Z' });
   check('解除: 二重解除は 400', r.status === 400);
   r = await call('POST', '/generation-queue/claim', { run_id: 'runL', limit: 10 });
   check('解除後: 次の claim で拾える (解除 = キューに戻すだけ)', r.json.drafts.some((d) => d.id === gdraft3.id));

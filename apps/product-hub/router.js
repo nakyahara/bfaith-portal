@@ -718,9 +718,10 @@ router.post('/api/drafts/:id/generation-block', (req, res) => {
   if (req.body?.clear !== true) {
     return res.status(400).json({ ok: false, error: '人が止めるのはこの画面からはできません (clear: true で解除のみ)' });
   }
-  const r = unblockGenerationDraft(getDB(), draft.id, {
-    actor: actorOf(req), expectedBlockedAt: cleanText(req.body?.blocked_at, 40),
-  });
+  // blocked_at は必須: 省略できると楽観ロックを迂回して「別の理由で止め直された block」を消せてしまう (Codex R1 medium)
+  const blockedAt = cleanText(req.body?.blocked_at, 40);
+  if (!blockedAt) return res.status(400).json({ ok: false, error: 'blocked_at が必要です (画面を読み直してください)' });
+  const r = unblockGenerationDraft(getDB(), draft.id, { actor: actorOf(req), expectedBlockedAt: blockedAt });
   if (r.result === 'not_blocked') return res.status(400).json({ ok: false, error: 'AI は止めていません (すでに解除済みです)' });
   if (r.result === 'stale') return res.status(409).json({ ok: false, error: '別の理由で止め直されています。画面を読み直してください' });
   res.json({ ok: true, unblocked: true });
@@ -2296,17 +2297,23 @@ serviceApiRouter.post('/drafts/:id/release', (req, res) => {
 // release で回すと毎晩同じ draft を掴んで捨てる無限ループになる — それを止めるための終端状態。
 // body: { run_id, code, reason }  code は GENERATION_BLOCK_CODES のキーのみ
 serviceApiRouter.post('/drafts/:id/generation-block', (req, res) => {
-  const id = Number.parseInt(req.params.id, 10);
+  // parseInt は "123abc" を 123 と読む → 文字列全体が数字のときだけ受ける (Codex R1 low)
+  const id = /^[1-9]\d*$/.test(String(req.params.id)) ? Number(req.params.id) : NaN;
   const runId = cleanText(req.body?.run_id, 100);
   const code = cleanText(req.body?.code, 40);
-  const reason = cleanText(req.body?.reason, GENERATION_BLOCK_REASON_MAX);
-  if (!Number.isInteger(id) || id <= 0 || !runId) {
+  if (!Number.isInteger(id) || !runId) {
     return res.status(400).json({ ok: false, error: 'draft id と run_id が必要です' });
   }
   if (!code || !Object.hasOwn(GENERATION_BLOCK_CODES, code)) {
     return res.status(400).json({ ok: false, error: `code は ${Object.keys(GENERATION_BLOCK_CODES).join(' / ')} のいずれかです` });
   }
-  if (!reason) return res.status(400).json({ ok: false, error: 'reason (人向けの説明) が必要です' });
+  // reason は監査ログにも残るので、上限超過は黙って切り詰めずに拒否する (Codex R1 low)
+  const rawReason = req.body?.reason == null ? '' : String(req.body.reason).trim();
+  if (!rawReason) return res.status(400).json({ ok: false, error: 'reason (人向けの説明) が必要です' });
+  if ([...rawReason].length > GENERATION_BLOCK_REASON_MAX) {
+    return res.status(400).json({ ok: false, error: `reason は ${GENERATION_BLOCK_REASON_MAX} 文字までです` });
+  }
+  const reason = rawReason;
   const r = blockGenerationDraft(getDB(), id, runId, { code, reason });
   if (r.result === 'not_found') return res.status(404).json({ ok: false, error: 'draft not found' });
   if (r.result === 'conflict') return res.status(409).json({ ok: false, error: r.error });
