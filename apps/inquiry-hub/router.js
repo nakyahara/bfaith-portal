@@ -3268,7 +3268,10 @@ const CUTOFF_PAGE_CSS = `<style>
 router.get('/cutoff', (req, res) => {
   const showAcked = req.query.acked === '1';
   const showDone = req.query.done === '1';
-  const { items, truncated, excluded } = listCutoffItems({ includeAcked: showAcked, includeDone: showDone });
+  // 除外したせいで何が見えなくなっているかを確認できる導線 (間違えて外していないかを見つけられるように)
+  const showExcluded = req.query.excluded === '1';
+  const { items, truncated, excluded } = listCutoffItems({
+    includeAcked: showAcked, includeDone: showDone, includeExcluded: showExcluded });
   const excludes = listCutoffExcludes();
   // いま出ている差出人を多い順に (お客さまでないものをまとめて外せるように)
   const senderCount = new Map();
@@ -3322,6 +3325,10 @@ router.get('/cutoff', (req, res) => {
   ${truncated ? `<div class="card" style="padding:10px;background:#fef2f2;border-color:#fca5a5">
     ⚠️ <b>件数が多く、全部は表示しきれていません</b>。ここに出ていないものが残っている可能性があります。</div>` : ''}
 
+  ${showExcluded ? `<div class="card" style="padding:10px;background:#f1f5f9">
+    🚫 <b>除外した差出人のぶんも表示しています</b> (ふだんは出ません)。
+    お客さまのメールが混じっていたら、下の「この画面に出さない差出人」から「外す」を押してください。</div>` : ''}
+
   <div class="cut-hero">
     <div>次の締めは <span class="big">${he(next.label)}</span>${next.isTomorrow ? ' <span class="sub">(翌朝)</span>' : ''}</div>
     <div class="sub">あと ${h > 0 ? h + '時間' : ''}${m}分</div>
@@ -3335,6 +3342,8 @@ router.get('/cutoff', (req, res) => {
     <a class="${showAcked ? 'ghost' : 'pri'} btn-link" href="/apps/inquiry-hub/cutoff">未対応だけ</a>
     <a class="${showAcked ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?acked=1">対応済みも表示</a>
     <a class="${showDone ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?done=${showDone ? '0' : '1'}">完了した問い合わせも見る</a>
+    <a class="${showExcluded ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?excluded=${showExcluded ? '0' : '1'}"
+      title="除外した差出人のぶんも表示します。間違えて外していないかの確認に使ってください">🚫 除外したぶんも見る</a>
     <span style="flex:1"></span>
     <span class="sub">締め: ${CUTOFF_TIMES.map(c => c.label).join(' / ')}</span>
   </div>
@@ -3364,7 +3373,8 @@ router.get('/cutoff', (req, res) => {
       ${excluded ? `<span class="sub"> — 直近で ${excluded}通 を除外しました</span>` : ''}</summary>
     <div class="sub" style="margin:8px 0">業者からの連絡・Amazonの通知・自動配信など、<b>お客さまではない差出人</b>をここに入れておくと出なくなります。
       一覧の「🚫この差出人は今後出さない」からも足せます。<br>
-      <b>問い合わせ自体が消えるわけではありません</b> (受信トレイには残ります)。
+      ⭐<b>間違えて入れても「外す」を押せば元どおり出るようになります</b> (取り消せます)。
+      <b>問い合わせ自体が消えるわけでもありません</b> — 受信トレイには残るので、この画面に出さないだけです。<br>
       no-reply系・バウンスは登録しなくても自動で外れます。</div>
     <div class="filters">
       <input type="text" id="exclInput" placeholder="foo@example.com または @example.com (ドメインごと)" style="min-width:300px">
@@ -3412,17 +3422,19 @@ router.get('/cutoff', (req, res) => {
       .then(function() { location.reload(); })
       .catch(function(e) { toast('失敗: ' + e.message); btn.disabled = false; });
   }
+  var UNDO_NOTE = String.fromCharCode(10, 10)
+    + '※ 間違えても、下の「🚫この画面に出さない差出人」から「外す」を押せば元に戻せます。'
+    + String.fromCharCode(10) + '※ 問い合わせ自体は消えません (受信トレイには残ります)。';
   document.querySelectorAll('.cut-excl').forEach(function(b) {
     b.addEventListener('click', function() {
-      if (!confirm(b.dataset.sender + ' からのメールを、今後この画面に出さないようにします。'
-        + String.fromCharCode(10, 10) + '問い合わせ自体は消えません (受信トレイには残ります)。')) return;
+      if (!confirm(b.dataset.sender + ' からのメールを、今後この画面に出さないようにします。' + UNDO_NOTE)) return;
       addExclude(b.dataset.sender, '画面から追加', b);
     });
   });
   document.querySelectorAll('.cut-excl-dom').forEach(function(b) {
     b.addEventListener('click', function() {
       if (!confirm(b.dataset.domain + ' のドメイン全体を、今後この画面に出さないようにします。'
-        + String.fromCharCode(10, 10) + 'そのドメインのお客さまがいる場合は個別のアドレスだけにしてください。')) return;
+        + String.fromCharCode(10) + 'そのドメインにお客さまがいる場合は、個別のアドレスだけにしてください。' + UNDO_NOTE)) return;
       addExclude(b.dataset.domain, '画面からドメインごと追加', b);
     });
   });
