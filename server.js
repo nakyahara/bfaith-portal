@@ -23,7 +23,7 @@ import { startNotificationJob as startInventoryNotificationJob } from './apps/pr
 import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
-import { startInquiryHubSyncCron, startInquiryHubOutboxCron } from './apps/inquiry-hub/sync/cron.js';
+import { startInquiryHubSyncCron, startInquiryHubOutboxCron, startInquiryHubCutoffCron } from './apps/inquiry-hub/sync/cron.js';
 import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
@@ -1593,6 +1593,10 @@ app.listen(PORT, () => {
   // inquiry-hub 送信ワーカー (outbox 30秒。INQUIRY_HUB_OUTBOX_CRON_ENABLED=true で起動、
   // メール実送信はさらに INQUIRY_HUB_MAIL_SEND_MODE=live が必要。既定=dryrun)
   startInquiryHubOutboxCron();
+
+  // inquiry-hub ⏰締め前通知 (ロジザードの締め 09:00/12:30/14:30 の15分前にGChat。0件でも送る=dead-man)。
+  // INQUIRY_HUB_CUTOFF_CRON_ENABLED=true で起動、Dark Launch
+  startInquiryHubCutoffCron();
 
   // Render 一次データ自己バックアップ (JST 03:30、Google Drive へ外向き送信のみ =
   // DB ダウンロード用の公開エンドポイントは作らない。RENDER_BACKUP_CRON_ENABLED=1 で起動、Dark Launch)

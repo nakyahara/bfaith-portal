@@ -19,7 +19,7 @@ import path from 'path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import {
-  ingestSnapshot, getLatestSnapshot, listCategories, listConcepts, countConcepts,
+  ingestSnapshot, ingestOwnFamilies, getLatestSnapshot, listCategories, listConcepts, countConcepts,
   getConcept, recordDecision, countMatching, REASON_CODES,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
@@ -91,6 +91,42 @@ ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) 
     // 未認証でも到達しうる経路なので、内部の詳細は返さず追跡IDだけ返す
     const traceId = crypto.randomBytes(4).toString('hex');
     console.error('[product-scout] 取り込み失敗 (' + traceId + '):', e.message);
+    res.status(500).json({ error: '取り込みに失敗しました', traceId });
+  }
+});
+
+/**
+ * 自社/AMC商品 (=すでに採用した企画) の取り込み。
+ * テーマの取り込みと同じ鍵で認証するが、送られてくる形が違うので入口を分ける。
+ */
+ingestRouter.post('/own', express.json({ limit: '8mb' }), guardTables, (req, res) => {
+  const key = process.env.MIRROR_SYNC_KEY;
+  if (!key) return res.status(503).json({ error: 'MIRROR_SYNC_KEY 未設定' });
+  const got = String(req.headers['x-sync-key'] || '');
+  const a = Buffer.from(got);
+  const b = Buffer.from(key);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  const payload = req.body;
+  if (!payload || !Array.isArray(payload.families)) {
+    return res.status(400).json({ error: 'families 配列が必要です' });
+  }
+  if (payload.families.length > 20000) {
+    return res.status(413).json({ error: 'ファミリーが多すぎます' });
+  }
+  const bad = payload.families.find((f) => !f || !f.familyKey
+    || !['active', 'withdrawn', 'shrinking'].includes(f.outcome));
+  if (bad) {
+    return res.status(400).json({ error: 'familyKey と outcome (active|withdrawn|shrinking) は必須です' });
+  }
+  try {
+    const r = ingestOwnFamilies(payload);
+    console.log(`[product-scout] 自社商品 ${r.families}ファミリー取り込み (テーマに載った ${r.placed})`);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    const traceId = crypto.randomBytes(4).toString('hex');
+    console.error('[product-scout] 自社商品の取り込み失敗 (' + traceId + '):', e.message);
     res.status(500).json({ error: '取り込みに失敗しました', traceId });
   }
 });

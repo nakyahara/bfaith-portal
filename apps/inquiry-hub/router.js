@@ -52,6 +52,9 @@ import { getPermissionMatrix, createStaff, saveStaffWithPermissions, deactivateS
   createPermission, updatePermission, setPermissionActive, deletePermission, listPermissionLogs,
   STAFF_NAME_MAX, STAFF_KEY_MAX, PERM_NAME_MAX, PERM_CODE_MAX } from './staff.js';
 import { collectInsights, estimateCost, WMS_CUTOFFS } from './insights.js';
+import { listCutoffItems, countCutoffItems, summarize, ackCutoffItem, unackCutoffItem,
+  nextCutoff, CUTOFF_KINDS, CUTOFF_TIMES, LOOKBACK_DAYS } from './cutoff.js';
+import { toPreviewLine } from './text-utils.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
 // ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
@@ -105,16 +108,7 @@ const stBadge = st => badge(STATUSES[st], null) || he(st);
  * 表示は1行 (CSSで省略) なので改行は空白に畳む
  */
 export function previewOf(text, max = 110) {
-  const cut = String(text || '')
-    // 引用ヘッダ以降は落とす (返信の下にぶら下がる過去のやり取り)
-    .split(/\n(?:[-–—_]{3,}|={3,}|\d{4}年\d{1,2}月\d{1,2}日.*?:|On .{0,60}wrote:|.{0,40}さんは書きました)/)[0];
-  const body = cut.split('\n')
-    .filter(l => !/^\s*[>|｜]/.test(l))          // 引用行
-    .join(' ')
-    .replace(/https?:\/\/\S+/g, '')             // URLは仕分けの役に立たない
-    .replace(/\s+/g, ' ')
-    .trim();
-  return body.length > max ? body.slice(0, max) + '…' : body;
+  return toPreviewLine(text, max);
 }
 
 /** 色付きラベルチップ (2026-08-24 メールディーラーのラベル相当)。color は labels.js が '#rrggbb' に検証済み */
@@ -3248,6 +3242,132 @@ router.get('/attachments/:id(\\d+)', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// ⏰ 締め前確認 (2026-08-28 中原さん要望)
+//    キャンセル・住所変更・日時指定の連絡を、ロジザードへ流す前 (09:00/12:30/14:30) に拾う。
+//    人がネクストエンジンで直してから流す運用なので、ここは「気づくための画面」に徹する
+//    (システムが出荷を止めたりはしない)
+// ═══════════════════════════════════════════════════════════════
+
+const CUTOFF_PAGE_CSS = `<style>
+.cut-hero { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding:14px;
+  border-radius:10px; background:#fffbeb; border:1px solid #fcd34d; margin-bottom:14px }
+.cut-hero .big { font-size:26px; font-weight:700 }
+.cut-item { border:1px solid #e2e8f0; border-left-width:5px; border-radius:10px; padding:12px;
+  margin-bottom:10px; background:#fff }
+.cut-item.acked { opacity:.55 }
+.cut-head { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin-bottom:4px }
+.cut-body { font-size:13px; color:#475569; margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere }
+.cut-meta { font-size:12px; color:#64748b; display:flex; gap:10px; flex-wrap:wrap }
+.cut-hit { font-size:11px; color:#94a3b8 }
+.cut-ops { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap }
+.cut-empty { padding:24px; text-align:center; color:#166534; background:#f0fdf4;
+  border:1px solid #86efac; border-radius:10px; font-size:15px }
+</style>`;
+
+router.get('/cutoff', (req, res) => {
+  const showAcked = req.query.acked === '1';
+  const showDone = req.query.done === '1';
+  const { items, truncated } = listCutoffItems({ includeAcked: showAcked, includeDone: showDone });
+  const counts = summarize(items.filter(i => !i.ack));
+  const next = nextCutoff();
+  const h = Math.floor(next.minutesLeft / 60), m = next.minutesLeft % 60;
+
+  const itemCards = items.map(it => `
+    <div class="cut-item${it.ack ? ' acked' : ''}" style="border-left-color:${it.kind === 'cancel' ? '#dc2626' : it.kind === 'address' ? '#f59e0b' : '#3b82f6'}">
+      <div class="cut-head">
+        <span class="badge" style="${it.style}">${it.icon} ${he(it.kindLabel)}</span>
+        ${chBadge(it.channel)}
+        <a href="/apps/inquiry-hub/inquiries/${it.inquiryId}"><b>${he(it.subject || '(件名なし)')}</b></a>
+        ${it.ack ? `<span class="badge" style="background:#f1f5f9;color:#475569">${it.ack.status === 'done' ? '✅対応済み' : '対象外'}</span>` : ''}
+      </div>
+      <div class="cut-meta">
+        <span>📅 ${fmtJst(it.receivedAt)}</span>
+        <span>👤 ${he(it.customerName || '(名前なし)')}</span>
+        <span>${it.orderNumber ? '🔗 注文 ' + he(it.orderNumber) : '⚠️ 注文番号なし (NEで名前・メールから探す)'}</span>
+        ${it.assignedTo ? `<span>担当 ${he(it.assignedTo)}</span>` : ''}
+      </div>
+      <div class="cut-body">${he(toPreviewLine(it.body, 300))}</div>
+      <div class="cut-hit">引っかかった言葉: ${he(it.matched.join('、'))}</div>
+      <div class="cut-ops">
+        ${it.ack
+          ? `<button class="cut-undo" data-msg="${it.messageId}" data-kind="${he(it.kind)}">↩️ 未対応に戻す</button>`
+          : `<button class="pri cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="done">✅ ネクストエンジンで直した</button>
+             <button class="cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="not_applicable">対象外だった</button>`}
+      </div>
+    </div>`).join('');
+
+  const body = `${CUTOFF_PAGE_CSS}
+  <div class="view-hint">⏰ <b>締め前確認</b> — お客さまからの
+    <b>キャンセル・住所変更・お届け日時の変更</b>を、ロジザードへ流す前に拾って並べます。
+    <b>ネクストエンジンで先に直してから</b>流してください。
+    <span class="sub">直近${LOOKBACK_DAYS}日ぶん・${showDone ? '完了した問い合わせも含む' : '完了にした問い合わせは対応済みとみなして出しません'}。
+    言葉で拾っているので的外れなものも混じります (「対象外だった」で消せます)</span></div>
+
+  ${truncated ? `<div class="card" style="padding:10px;background:#fef2f2;border-color:#fca5a5">
+    ⚠️ <b>件数が多く、全部は表示しきれていません</b>。ここに出ていないものが残っている可能性があります。</div>` : ''}
+
+  <div class="cut-hero">
+    <div>次の締めは <span class="big">${he(next.label)}</span>${next.isTomorrow ? ' <span class="sub">(翌朝)</span>' : ''}</div>
+    <div class="sub">あと ${h > 0 ? h + '時間' : ''}${m}分</div>
+    <span style="flex:1"></span>
+    <div>${counts.total === 0
+      ? '<b style="color:#166534">未対応 0件</b>'
+      : `<b style="color:#b91c1c">未対応 ${counts.inquiries}件</b> <span class="sub">(${CUTOFF_KINDS.filter(k => counts.byKind[k.kind]).map(k => `${k.icon}${counts.byKind[k.kind]}`).join(' ')})</span>`}</div>
+  </div>
+
+  <div class="filters">
+    <a class="${showAcked ? 'ghost' : 'pri'} btn-link" href="/apps/inquiry-hub/cutoff">未対応だけ</a>
+    <a class="${showAcked ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?acked=1">対応済みも表示</a>
+    <a class="${showDone ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?done=${showDone ? '0' : '1'}">完了した問い合わせも見る</a>
+    <span style="flex:1"></span>
+    <span class="sub">締め: ${CUTOFF_TIMES.map(c => c.label).join(' / ')}</span>
+  </div>
+
+  ${items.length ? itemCards : `<div class="cut-empty">✅ 検知された未対応は0件です<br>
+    <span class="sub">キャンセル・住所変更・日時指定の連絡は見つかりませんでした。
+    ただし言葉で拾っているので取りこぼしはありえます — いつもどおり確認して流してください。</span></div>`}`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/cutoff' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.querySelectorAll('.cut-ack').forEach(function(b) {
+    b.addEventListener('click', function() {
+      b.disabled = true;
+      api('/ack', { messageId: Number(b.dataset.msg), kind: b.dataset.kind, status: b.dataset.status })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.cut-undo').forEach(function(b) {
+    b.addEventListener('click', function() {
+      b.disabled = true;
+      api('/unack', { messageId: Number(b.dataset.msg), kind: b.dataset.kind })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — 締め前確認', 'cutoff', body, script));
+});
+
+router.post('/api/cutoff/ack', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = ackCutoffItem({ messageId: b.messageId, kind: b.kind, status: b.status, note: b.note }, actorOf(req));
+    console.log(`[inquiry-hub] 締め前確認 ${r.kind}=${r.status} msg=${r.messageId} by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/unack', (req, res) => {
+  try {
+    res.json({ ok: true, ...unackCutoffItem({ messageId: (req.body || {}).messageId, kind: (req.body || {}).kind }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // 👥 担当者と権限マップ (2026-08-28 中原さん要望「権限マップをアプリに入れて自分で登録したい」)
 //    ⭐AIに人を選ばせない設計の土台。AIが出すのは「必要な権限」までで、
 //      誰に渡すかはこの表を見る決定的なルールが決める (staff.js の冒頭に理由)
@@ -4404,6 +4524,9 @@ function pageShell(title, active, body, script, opts = {}) {
   // = 受信トレイと同じ「自分のタスク」基準。失敗しても画面は出す (fail-soft)
   let folderNav = [];
   try { folderNav = listFolders({ withCounts: true }); } catch { /* 初期化前などは出さない */ }
+  // ⏰締め前確認の未対応件数。重い集計なので失敗しても画面は出す (fail-soft)
+  let cutoffCount = 0;
+  try { cutoffCount = countCutoffItems().inquiries; } catch { /* 初期化前などは0 */ }
   const folderItems = folderNav.map(f =>
     navItem(`/apps/inquiry-hub?view=all&folder=${f.id}${groupQs}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
 
@@ -4416,6 +4539,10 @@ function pageShell(title, active, body, script, opts = {}) {
       ${navItem(`/apps/inquiry-hub?view=sent${groupQs}`, '📤', '送信済み', 'sent', counts.sent)}
       ${navItem(`/apps/inquiry-hub?view=done${groupQs}`, '✅', '対応済み', 'done', 0)}
       ${navItem(`/apps/inquiry-hub?view=all${groupQs}`, '🗂️', 'すべて', 'all', 0)}
+    </div>
+    <div class="nav-sep"></div>
+    <div class="nav-group">
+      ${navItem('/apps/inquiry-hub/cutoff', '⏰', '締め前確認', 'cutoff', cutoffCount)}
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">

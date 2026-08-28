@@ -84,3 +84,8 @@
 
 .ps-range { margin: -4px 0 10px; }
 .ps-pager { display: flex; gap: 12px; align-items: center; justify-content: center; padding: 12px 0 4px; }
+
+/* 自社が既にやっているテーマ。重複提案を止める最重要の1行なので目立たせる */
+.ps-own { background: #eef6ff; border-left: 3px solid #4a90d9; border-radius: 4px;
+  padding: 6px 10px; font-size: 13px; margin: 8px 0 0; }
+.ps-own-withdrawn { background: #fdf3ec; border-left-color: #c07a3a; }

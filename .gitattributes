@@ -4,3 +4,6 @@
 # 各PCの core.autocrlf 設定に依存させないため明示する。
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# bash shim for the nightly runner: CRLF would append \r to the last argument
+scripts/ph-nightly/phq text eol=lf
+scripts/ph-nightly/phreview text eol=lf
