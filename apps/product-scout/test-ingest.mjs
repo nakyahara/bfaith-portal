@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import { createProductScoutTables } from './schema.js';
 import {
   ingestSnapshot, getLatestSnapshot, listCategories, listConcepts, countConcepts,
-  getConcept, recordDecision,
+  getConcept, recordDecision, countMatching,
 } from './db.js';
 
 const db = new Database(':memory:');
@@ -50,9 +50,10 @@ assert.strictEqual(r.concepts, payload.concepts.length);
 ok('取り込みが通る');
 
 // ⭐同じスナップショットを2回入れても増えない (冪等)。バッチは何度でも再実行されうる
-const before = countConcepts(db);
+const snap0 = getLatestSnapshot(db);
+const before = countConcepts(snap0.snapshot_id, db);
 ingestSnapshot(payload, db);
-const after = countConcepts(db);
+const after = countConcepts(snap0.snapshot_id, db);
 assert.deepStrictEqual(after, before, '2回目の取り込みで件数が変わってはいけない');
 ok('取り込みが冪等 (2回流しても増えない)');
 
@@ -67,12 +68,12 @@ assert.strictEqual(cats.length, payload.collection.length);
 assert.ok(cats.some((c) => c.state === 'not_started'), '未投入カテゴリも行として残る');
 ok('工程表に全カテゴリが並ぶ (未投入も含めて)');
 
-const counts = countConcepts(db);
+const counts = countConcepts(snap.snapshot_id, db);
 console.log(`  ゲート: 通過${counts.pass} / 要確認${counts.unknown} / 落ち${counts.fail}`);
 assert.ok(counts.pass > 0, 'ゲート通過が1件以上');
 ok('ゲート別の件数が数えられる');
 
-const passList = listConcepts({ gate: 'pass', status: 'undecided', limit: 5 }, db);
+const passList = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'undecided', limit: 5 }, db);
 assert.ok(passList.length > 0);
 assert.ok(passList.every((c) => c.hard_gate === 'pass'), 'ゲート通過だけが返る');
 assert.ok(passList.every((c) => c.decision === null), '未判断だけが返る');
@@ -88,7 +89,7 @@ ok('順位どおりに並ぶ');
 const target = passList[0];
 recordDecision({ conceptId: target.concept_id, decision: 'reject', reasonCode: 'commodity_price',
   comment: '中華が強い', decidedBy: 'test@example.com' }, db);
-const afterDecide = listConcepts({ gate: 'pass', status: 'undecided', limit: 5 }, db);
+const afterDecide = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'undecided', limit: 5 }, db);
 assert.ok(!afterDecide.some((c) => c.concept_id === target.concept_id), '判断したものは審査待ちから外れる');
 ok('採否を記録すると審査待ちから外れる');
 
@@ -111,5 +112,54 @@ ingestSnapshot(payload, db);
 const stillDecided = getConcept(target.concept_id, db);
 assert.strictEqual(stillDecided.history.length, 1, '再取り込みで判断履歴が消えてはいけない');
 ok('再取り込みしても判断履歴は消えない');
+
+// ⭐同一ミリ秒に判断が2件入っても、一覧が重複しないこと。
+//   MAX(decided_at) で最新を選んでいた頃は、二重送信や別タブの同時操作で
+//   2行とも「最新」になり、テーマが重複表示され件数まで水増しされた。
+const dupTarget = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'undecided', limit: 1 }, db)[0];
+const sameMs = '2026-09-20T00:00:00.000Z';
+const rawInsert = db.prepare(
+  'INSERT INTO scout_decisions (decision_id, concept_id, decision, decided_by, decided_at, metrics_json)'
+  + " VALUES (?, ?, 'hold', 't', ?, '{}')"
+);
+rawInsert.run('dup1', dupTarget.concept_id, sameMs);
+rawInsert.run('dup2', dupTarget.concept_id, sameMs);
+const dupRows = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all', limit: 500 }, db)
+  .filter((c) => c.concept_id === dupTarget.concept_id);
+assert.strictEqual(dupRows.length, 1, '同一時刻の判断が2件あっても一覧は1行');
+ok('同一ミリ秒の判断が2件あっても最新が1件に決まる');
+
+// ページ送り (約2,000テーマあるので上位だけ見て終わりにはできない)
+const totalPass = countMatching({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all' }, db);
+assert.ok(totalPass > 0);
+const p1 = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all', limit: 2, offset: 0 }, db);
+const p2 = listConcepts({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all', limit: 2, offset: 2 }, db);
+assert.ok(p1.length > 0, '1ページ目が引ける');
+assert.ok(!p1.some((a) => p2.some((b) => b.concept_id === a.concept_id)), 'ページ間で重複しない');
+ok(`ページ送りできる (総件数 ${totalPass} / offset)`);
+
+// ⭐同じ payload を送り直しても同じスナップショットになること。
+//   ID に現在時刻を混ぜていた頃は、再送のたびに別スナップショットが積もった。
+const idA = ingestSnapshot(payload, db).snapshotId;
+const idB = ingestSnapshot(payload, db).snapshotId;
+assert.strictEqual(idA, idB, '同じ中身なら同じ snapshot_id');
+ok('再送しても同じスナップショットになる (冪等ID)');
+
+// 判断者が取れないものは記録しない (台帳の値打ちは監査できることにある)
+assert.throws(() => recordDecision({ conceptId: dupTarget.concept_id, decision: 'hold', decidedBy: null }, db),
+  /判断者/);
+ok('判断者が取れないときは記録しない');
+
+// 採用・保留に不採用理由が付くと、後で理由を集計したときに水増しされる
+assert.throws(() => recordDecision({ conceptId: dupTarget.concept_id, decision: 'adopt',
+  reasonCode: 'no_edge', decidedBy: 't' }, db), /採用・保留/);
+ok('採用・保留に不採用理由は付けられない');
+
+// ⭐アプリを迂回して直接INSERTしても、不採用理由なしは DB が弾くこと
+assert.throws(() => db.prepare(
+  'INSERT INTO scout_decisions (decision_id, concept_id, decision, decided_by, decided_at)'
+  + " VALUES ('raw1', ?, 'reject', 't', '2026-09-21T00:00:00Z')"
+).run(dupTarget.concept_id), /CHECK/);
+ok('DB制約でも不採用理由なしは弾かれる');
 
 console.log(`\n${passed} 件すべて通りました`);

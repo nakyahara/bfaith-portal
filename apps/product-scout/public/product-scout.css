@@ -81,3 +81,6 @@
   .ps-metrics { gap: 12px; }
   .ps-decide input[name=comment], .ps-decide input[name=recheckCondition] { flex-basis: 100%; }
 }
+
+.ps-range { margin: -4px 0 10px; }
+.ps-pager { display: flex; gap: 12px; align-items: center; justify-content: center; padding: 12px 0 4px; }

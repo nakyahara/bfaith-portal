@@ -95,19 +95,24 @@
       <div class="ps-filters">
         <span>ゲート:</span>
         <% ['pass','unknown','fail','all'].forEach(function (g) { %>
-          <a class="ps-chip <%= gate === g ? 'on' : '' %>" href="?gate=<%= g %>&status=<%= status %>"><%=
+          <a class="ps-chip <%= gate === g ? 'on' : '' %>" href="?gate=<%= g %>&status=<%= status %>&page=1"><%=
             g === 'pass' ? '通過' : (g === 'unknown' ? '要確認' : (g === 'fail' ? '落ち' : 'すべて')) %></a>
         <% }); %>
         <span class="ps-sep"></span>
         <span>判断:</span>
         <% ['undecided','adopt','hold','reject','all'].forEach(function (s) { %>
-          <a class="ps-chip <%= status === s ? 'on' : '' %>" href="?gate=<%= gate %>&status=<%= s %>"><%=
+          <a class="ps-chip <%= status === s ? 'on' : '' %>" href="?gate=<%= gate %>&status=<%= s %>&page=1"><%=
             s === 'undecided' ? '未判断' : (s === 'adopt' ? '採用' : (s === 'hold' ? '保留' : (s === 'reject' ? '不採用' : 'すべて'))) %></a>
         <% }); %>
       </div>
 
       <% if (!concepts.length) { %>
         <p class="ps-empty">該当するテーマがありません。</p>
+      <% } else { %>
+        <p class="ps-muted ps-range">
+          <%= total.toLocaleString() %>件中 <%= (((page - 1) * pageSize) + 1).toLocaleString() %>〜<%= Math.min(total, page * pageSize).toLocaleString() %>件目
+          （<%= page %> / <%= totalPages %> ページ）
+        </p>
       <% } %>
 
       <% concepts.forEach(function (c) { %>
@@ -193,6 +198,18 @@
           </form>
         </article>
       <% }); %>
+
+      <% if (totalPages > 1) { %>
+        <nav class="ps-pager">
+          <% if (page > 1) { %>
+            <a class="ps-chip" href="?gate=<%= gate %>&status=<%= status %>&page=<%= page - 1 %>">← 前の<%= pageSize %>件</a>
+          <% } %>
+          <span class="ps-muted"><%= page %> / <%= totalPages %></span>
+          <% if (page < totalPages) { %>
+            <a class="ps-chip" href="?gate=<%= gate %>&status=<%= status %>&page=<%= page + 1 %>">次の<%= pageSize %>件 →</a>
+          <% } %>
+        </nav>
+      <% } %>
     </section>
   </main>
 

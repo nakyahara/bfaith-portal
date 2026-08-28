@@ -48,8 +48,12 @@ export function jstDate(d = new Date()) {
 export function ingestSnapshot(payload, handle) {
   const db = resolveDb(handle);
   const now = utcIsoNow();
+  // ⭐IDは中身から決める。`now` を混ぜると同じファイルを送り直すたび別スナップショットになり、
+  //   「バッチは何度でも再実行してよい」が成り立たなくなる (画面に同じ内容が二重に積もる)。
   const snapshotId = payload.snapshotId
-    || crypto.createHash('sha1').update(`${payload.generatedAt}|${now}`).digest('hex').slice(0, 16);
+    || crypto.createHash('sha1')
+      .update(`${payload.generatedAt}|${payload.algorithmVersion ?? 1}|${(payload.concepts || []).length}`)
+      .digest('hex').slice(0, 16);
 
   const insSnap = db.prepare(`
     INSERT INTO scout_snapshots (snapshot_id, generated_at, ingested_at, algorithm_version,
@@ -178,13 +182,31 @@ export function listCategories(snapshotId, handle) {
 }
 
 /**
+ * 各テーマの「最新の判断」を1件だけ選ぶ副問い合わせ。
+ *
+ * ⚠️MAX(decided_at) だけで選んではいけない。decided_at はミリ秒精度なので、
+ *   二重送信や別タブの操作が同一ミリ秒に入ると2行とも最新になり、
+ *   テーマ一覧が重複して件数まで水増しされる。
+ *   挿入順で単調に増える rowid で選べば、必ず1件に決まる。
+ */
+const LATEST_DECISION_SQL = `
+  SELECT s.* FROM scout_decisions s
+  JOIN (SELECT concept_id, MAX(rowid) AS r FROM scout_decisions GROUP BY concept_id) l
+    ON l.concept_id = s.concept_id AND l.r = s.rowid
+`;
+
+/**
  * テーマ一覧 + 各テーマの最新判断。
  * 現在状態は scout_decisions の最新イベントから導出する (concepts 側に持たない)。
+ *
+ * ⭐snapshotId で必ず絞る。絞らないと、収集条件を変えて消えたテーマや
+ *   古いランキングのテーマが「未判断」として画面に残り続ける。
  */
-export function listConcepts({ gate = 'pass', status = 'undecided', limit = 50, offset = 0 } = {}, handle) {
+export function listConcepts({ snapshotId, gate = 'pass', status = 'undecided', limit = 50, offset = 0 } = {}, handle) {
   const db = resolveDb(handle);
   const where = [];
   const params = {};
+  if (snapshotId) { where.push('c.snapshot_id = @snapshotId'); params.snapshotId = snapshotId; }
   if (gate && gate !== 'all') { where.push('c.hard_gate = @gate'); params.gate = gate; }
   if (status === 'undecided') where.push('d.decision IS NULL');
   else if (status && status !== 'all') { where.push('d.decision = @status'); params.status = status; }
@@ -193,11 +215,7 @@ export function listConcepts({ gate = 'pass', status = 'undecided', limit = 50, 
     SELECT c.*, d.decision, d.reason_code, d.comment, d.recheck_condition,
            d.decided_by, d.decided_at
     FROM scout_concepts c
-    LEFT JOIN (
-      SELECT s.* FROM scout_decisions s
-      JOIN (SELECT concept_id, MAX(decided_at) AS m FROM scout_decisions GROUP BY concept_id) l
-        ON l.concept_id = s.concept_id AND l.m = s.decided_at
-    ) d ON d.concept_id = c.concept_id
+    LEFT JOIN (${LATEST_DECISION_SQL}) d ON d.concept_id = c.concept_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY c.rank_in_snapshot
     LIMIT @limit OFFSET @offset
@@ -206,18 +224,32 @@ export function listConcepts({ gate = 'pass', status = 'undecided', limit = 50, 
   return rows.map((r) => ({ ...r, examples: safeJson(r.examples_json) }));
 }
 
-export function countConcepts(handle) {
+/** listConcepts と同じ条件での総件数 (ページ送りに必要) */
+export function countMatching({ snapshotId, gate = 'pass', status = 'undecided' } = {}, handle) {
+  const db = resolveDb(handle);
+  const where = [];
+  const params = {};
+  if (snapshotId) { where.push('c.snapshot_id = @snapshotId'); params.snapshotId = snapshotId; }
+  if (gate && gate !== 'all') { where.push('c.hard_gate = @gate'); params.gate = gate; }
+  if (status === 'undecided') where.push('d.decision IS NULL');
+  else if (status && status !== 'all') { where.push('d.decision = @status'); params.status = status; }
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n FROM scout_concepts c
+    LEFT JOIN (${LATEST_DECISION_SQL}) d ON d.concept_id = c.concept_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+  `).get(params);
+  return row ? row.n : 0;
+}
+
+export function countConcepts(snapshotId, handle) {
   const db = resolveDb(handle);
   const rows = db.prepare(`
     SELECT c.hard_gate, (d.decision IS NULL) AS undecided, COUNT(*) AS n
     FROM scout_concepts c
-    LEFT JOIN (
-      SELECT s.* FROM scout_decisions s
-      JOIN (SELECT concept_id, MAX(decided_at) AS m FROM scout_decisions GROUP BY concept_id) l
-        ON l.concept_id = s.concept_id AND l.m = s.decided_at
-    ) d ON d.concept_id = c.concept_id
+    LEFT JOIN (${LATEST_DECISION_SQL}) d ON d.concept_id = c.concept_id
+    ${snapshotId ? 'WHERE c.snapshot_id = @snapshotId' : ''}
     GROUP BY c.hard_gate, undecided
-  `).all();
+  `).all(snapshotId ? { snapshotId } : {});
   const out = { pass: 0, unknown: 0, fail: 0, undecidedPass: 0, decided: 0 };
   for (const r of rows) {
     out[r.hard_gate] = (out[r.hard_gate] || 0) + r.n;
@@ -266,6 +298,10 @@ const REASON_SET = new Set(REASON_CODES.map((r) => r.code));
  */
 export function recordDecision({ conceptId, decision, reasonCode, comment, recheckCondition, decidedBy }, handle) {
   const db = resolveDb(handle);
+  if (!decidedBy) {
+    // 誰が決めたか分からない判断は記録しない。台帳の値打ちが監査できるところにあるため
+    throw Object.assign(new Error('判断者が特定できません'), { status: 401 });
+  }
   const concept = db.prepare('SELECT * FROM scout_concepts WHERE concept_id = ?').get(conceptId);
   if (!concept) throw Object.assign(new Error('テーマが見つかりません'), { status: 404 });
   if (!['adopt', 'reject', 'hold'].includes(decision)) {
@@ -278,13 +314,16 @@ export function recordDecision({ conceptId, decision, reasonCode, comment, reche
     if (reasonCode === 'other' && !String(comment || '').trim()) {
       throw Object.assign(new Error('理由が「その他」のときはコメントが必要です'), { status: 400 });
     }
+  } else if (reasonCode) {
+    // 採用・保留に不採用理由が付くと、後で「不採用の理由」を集計したときに水増しされる
+    throw Object.assign(new Error('採用・保留に不採用理由は付けられません'), { status: 400 });
   }
 
-  const prior = db.prepare(
-    'SELECT decision_id FROM scout_decisions WHERE concept_id = ? ORDER BY decided_at DESC LIMIT 1'
-  ).get(conceptId);
-
   const metrics = {
+    // ⭐数字だけでなく、判断したときに画面に出ていた文言と代表商品も固定する。
+    //   取り込みでテーマ名やカテゴリが更新されると、過去の判断が「何を見て決めたか」を失う
+    concept: concept.concept, categoryPath: concept.category_path, form: concept.form,
+    examples: safeJson(concept.examples_json),
     productCount: concept.product_count, totalMonthlySold: concept.total_monthly_sold,
     brandCount: concept.brand_count, top1Brand: concept.top1_brand,
     top1SharePct: concept.top1_share_pct, medianPrice: concept.median_price,
@@ -295,14 +334,22 @@ export function recordDecision({ conceptId, decision, reasonCode, comment, reche
   };
   // 一意IDは ms + 乱数 (同一msの二重採番を避ける)
   const decisionId = `${Date.now().toString(36)}-${crypto.randomBytes(6).toString('hex')}`;
-  db.prepare(`
+  const ins = db.prepare(`
     INSERT INTO scout_decisions (decision_id, concept_id, decision, failed_gate, reason_code,
       comment, recheck_condition, decided_by, decided_at, snapshot_id, metrics_json, prior_decision_id)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(decisionId, conceptId, decision, concept.gate_fail_reason || null,
-    reasonCode || null, comment || null, recheckCondition || null,
-    decidedBy, utcIsoNow(), concept.snapshot_id, JSON.stringify(metrics),
-    prior ? prior.decision_id : null);
+  `);
+  // ⭐直前の判断を読むのと書くのを1トランザクションに入れる。
+  //   別々にすると、二重送信や別タブの同時操作で両方が同じ prior を指し、履歴の鎖が枝分かれする。
+  db.transaction(() => {
+    const prior = db.prepare(
+      'SELECT decision_id FROM scout_decisions WHERE concept_id = ? ORDER BY rowid DESC LIMIT 1'
+    ).get(conceptId);
+    ins.run(decisionId, conceptId, decision, concept.gate_fail_reason || null,
+      reasonCode || null, comment || null, recheckCondition || null,
+      decidedBy, utcIsoNow(), concept.snapshot_id, JSON.stringify(metrics),
+      prior ? prior.decision_id : null);
+  }).immediate();
 
   return { decisionId };
 }

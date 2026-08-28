@@ -20,7 +20,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import {
   ingestSnapshot, getLatestSnapshot, listCategories, listConcepts, countConcepts,
-  getConcept, recordDecision, REASON_CODES,
+  getConcept, recordDecision, countMatching, REASON_CODES,
 } from './db.js';
 import { productScoutInitError } from '../warehouse-mirror/db.js';
 
@@ -35,7 +35,9 @@ router.use('/public', express.static(path.join(__dirname, 'public'), { maxAge: '
 /** テーブルの初期化に失敗していたら、壊れた画面を出さずに理由を見せる */
 function guardTables(req, res, next) {
   if (productScoutInitError) {
-    return res.status(503).json({ error: 'テーブル初期化に失敗しています', detail: productScoutInitError });
+    // ⚠️詳細 (SQLite の表名やスタック) は返さない。サーバログにだけ残す
+    console.error('[product-scout] テーブル初期化エラー:', productScoutInitError);
+    return res.status(503).json({ error: 'テーブル初期化に失敗しています (ログを確認してください)' });
   }
   return next();
 }
@@ -58,13 +60,38 @@ ingestRouter.post('/', express.json({ limit: '32mb' }), guardTables, (req, res) 
   if (!payload || !Array.isArray(payload.concepts)) {
     return res.status(400).json({ error: 'concepts 配列が必要です' });
   }
+  // ⚠️共有DB (他20アプリが使う) に1トランザクションで書き込むので、
+  //   異常な大きさのものを受けるとその間ほかのアプリの書き込みを塞ぐ。
+  //   バッチ不具合や鍵の誤設定で巻き添えにしないよう、入口で桁を確かめる。
+  const MAX_CONCEPTS = 20000;   // 実測 1,988件。1桁の余裕を持たせた上限
+  const MAX_CATEGORIES = 200;
+  if (payload.concepts.length > MAX_CONCEPTS) {
+    return res.status(413).json({ error: `テーマが多すぎます (${payload.concepts.length} > ${MAX_CONCEPTS})` });
+  }
+  if (Array.isArray(payload.collection) && payload.collection.length > MAX_CATEGORIES) {
+    return res.status(413).json({ error: `カテゴリが多すぎます (${payload.collection.length} > ${MAX_CATEGORIES})` });
+  }
+  if (!payload.generatedAt || Number.isNaN(Date.parse(payload.generatedAt))) {
+    return res.status(400).json({ error: 'generatedAt が日時として読めません' });
+  }
+  if (payload.lastProgressAt && Number.isNaN(Date.parse(payload.lastProgressAt))) {
+    // 画面の信号がこの値で判定するので、読めない値を黙って入れさせない
+    return res.status(400).json({ error: 'lastProgressAt が日時として読めません' });
+  }
+  const badConcept = payload.concepts.find((c) => !c || typeof c.categoryPath !== 'string'
+    || typeof c.form !== 'string' || !c.categoryPath || !c.form);
+  if (badConcept) {
+    return res.status(400).json({ error: 'categoryPath と form は必須です (テーマの安定キーに使うため)' });
+  }
   try {
     const r = ingestSnapshot(payload);
     console.log(`[product-scout] 取り込み ${r.concepts}テーマ / ${r.categories}カテゴリ (${r.snapshotId})`);
     res.json({ ok: true, ...r });
   } catch (e) {
-    console.error('[product-scout] 取り込み失敗:', e.message);
-    res.status(500).json({ error: e.message });
+    // 未認証でも到達しうる経路なので、内部の詳細は返さず追跡IDだけ返す
+    const traceId = crypto.randomBytes(4).toString('hex');
+    console.error('[product-scout] 取り込み失敗 (' + traceId + '):', e.message);
+    res.status(500).json({ error: '取り込みに失敗しました', traceId });
   }
 });
 
@@ -91,14 +118,21 @@ function buildSignal(snapshot, categories, counts) {
   //   Keepa が返さない数件はいつまでも残るので、それを「収集中」と呼ぶと
   //   止まっていても永久に緑になる (直したはずの空回りが別の形で戻る)。
   //   実際に products.jsonl が伸びた時刻で見る。
-  const progressH = snapshot.last_progress_at
-    ? (Date.now() - Date.parse(snapshot.last_progress_at)) / 3600000 : null;
+  const progressMs = snapshot.last_progress_at ? Date.parse(snapshot.last_progress_at) : NaN;
+  const progressH = Number.isFinite(progressMs) ? (Date.now() - progressMs) / 3600000 : null;
 
   if (ageH > 48) {
     return { level: 'red', title: 'データが更新されていません',
       detail: `最後の取り込みは ${Math.floor(ageH / 24)}日前。miniPC の毎日14:00タスクが動いているか確認してください` };
   }
-  if (remaining > 0 && progressH !== null && progressH > 48) {
+  // ⚠️前進時刻が無い・読めないときに緑へ抜けさせない。
+  //   「判定できない」を「問題なし」にするのは、まさに20日間の空回りを隠した思考なので、
+  //   分からないなら黄色にして人に見に行かせる。
+  if (remaining > 0 && progressH === null) {
+    return { level: 'yellow', title: '進んでいるか判定できません',
+      detail: `残り${remaining.toLocaleString()}件ありますが、最終前進時刻が取り込まれていません (バッチが古い可能性)` };
+  }
+  if (remaining > 0 && progressH > 48) {
     return { level: 'red', title: '収集が止まっています',
       detail: `残り${remaining.toLocaleString()}件あるのに ${Math.floor(progressH / 24)}日間なにも取得できていません。products.log を確認してください` };
   }
@@ -115,19 +149,27 @@ function buildSignal(snapshot, categories, counts) {
     detail: `審査待ち ${counts.undecidedPass}件` + (incomplete.length ? ` ／ ⚠️分母が不完全なカテゴリ ${incomplete.length}件` : '') };
 }
 
+const PAGE_SIZE = 40;
+
 router.get('/', guardTables, (req, res) => {
   const snapshot = getLatestSnapshot();
-  const categories = snapshot ? listCategories(snapshot.snapshot_id) : [];
-  const counts = countConcepts();
+  const snapshotId = snapshot ? snapshot.snapshot_id : null;
+  const categories = snapshot ? listCategories(snapshotId) : [];
+  const counts = countConcepts(snapshotId);
   const gate = ['pass', 'unknown', 'fail', 'all'].includes(req.query.gate) ? req.query.gate : 'pass';
   const status = ['undecided', 'adopt', 'reject', 'hold', 'all'].includes(req.query.status)
     ? req.query.status : 'undecided';
-  const concepts = listConcepts({ gate, status, limit: 60 });
+  // 約2,000テーマあるので、上位だけ見て終わりにできない。ページで送れるようにする
+  const page = Math.max(1, Math.min(500, Number(req.query.page) || 1));
+  const offset = (page - 1) * PAGE_SIZE;
+  const total = countMatching({ snapshotId, gate, status });
+  const concepts = listConcepts({ snapshotId, gate, status, limit: PAGE_SIZE, offset });
 
   res.render(path.join(__dirname, 'views/index'), {
     username: req.session?.email,
     displayName: req.session?.displayName,
     snapshot, categories, counts, concepts, gate, status,
+    page, pageSize: PAGE_SIZE, total, totalPages: Math.max(1, Math.ceil(total / PAGE_SIZE)),
     reasonCodes: REASON_CODES,
     signal: buildSignal(snapshot, categories, counts),
   });
@@ -147,7 +189,9 @@ router.post('/concepts/:id/decision', express.json({ limit: '64kb' }), guardTabl
       reasonCode: req.body?.reasonCode || null,
       comment: req.body?.comment || null,
       recheckCondition: req.body?.recheckCondition || null,
-      decidedBy: req.session?.email || 'unknown',
+      // 判断者が取れないなら記録しない (db.js が401にする)。
+      // 'unknown' で通すと、認証まわりが変わったときに監査性が静かに失われる
+      decidedBy: req.session?.email || null,
     });
     res.json({ ok: true, ...r });
   } catch (e) {

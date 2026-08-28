@@ -14,6 +14,10 @@
 //   採否は scout_decisions への追記だけで表現し、現在状態は最新イベントから導出する。
 //   不採用理由の蓄積こそがこのツールの資産 (中原さんの明示方針)。
 export function createProductScoutTables(db) {
+  // ⭐DDL 一式を1トランザクションにする。途中のインデックス作成で失敗したとき
+  //   テーブルだけ残った半端な状態にすると、次回起動の復旧結果が残骸に依存して読めなくなる。
+  //   全部作れるか、何も作らないかのどちらかにする。
+  db.transaction(() => {
   // 取り込み単位。同じ concept を何度取り込んでも履歴が追えるようにする
   db.exec(`
     CREATE TABLE IF NOT EXISTS scout_snapshots (
@@ -100,7 +104,16 @@ export function createProductScoutTables(db) {
       decided_at         TEXT NOT NULL,
       snapshot_id        TEXT,
       metrics_json       TEXT,                -- ⭐判断時点の指標を固定する (後知恵で上書きしない)
-      prior_decision_id  TEXT
+      prior_decision_id  TEXT,
+      -- ⭐不採用理由の記録がこのツールの資産なので、アプリ層だけでなくDBでも強制する。
+      --   共有DBで他アプリからも触れる以上、アプリの検証は「最後の砦」にならない (Codex R1 high)
+      CHECK (decision <> 'reject' OR (reason_code IS NOT NULL AND trim(reason_code) <> '')),
+      CHECK (reason_code <> 'other' OR (comment IS NOT NULL AND trim(comment) <> '')),
+      -- 採用・保留に不採用理由が付いていると、後から集計したときに「不採用の理由」が水増しされる
+      CHECK (decision = 'reject' OR reason_code IS NULL),
+      CHECK (reason_code IS NULL OR reason_code IN (
+        'amc_cannot_make','commodity_price','too_large','regulation','ip_risk','weak_intent',
+        'seasonal','no_margin','no_edge','duplicate','other'))
     )
   `);
   db.exec('CREATE INDEX IF NOT EXISTS idx_scout_decisions_concept ON scout_decisions(concept_id, decided_at)');
@@ -115,4 +128,5 @@ export function createProductScoutTables(db) {
     BEFORE DELETE ON scout_decisions
     BEGIN SELECT RAISE(ABORT, 'scout_decisions は追記専用です'); END
   `);
+  })();
 }
