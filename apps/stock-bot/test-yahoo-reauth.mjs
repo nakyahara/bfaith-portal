@@ -8,6 +8,9 @@ check('parse: yahoo再認可 / yahoo reauth', parseYahooReauthCommand('yahoo再�
 check('parse: リダイレクト URL の貼り付け', JSON.stringify(parseYahooReauthCommand('https://b-faith.biz/?code=AbC-123_xyz&state=1')) === '{"kind":"code","code":"AbC-123_xyz"}');
 check('parse: yahoo code XXXX', parseYahooReauthCommand('yahoo code abcdef12')?.code === 'abcdef12');
 check('parse: 商品検索は null (ハッカ油 / code / yahoo)', parseYahooReauthCommand('ハッカ油') === null && parseYahooReauthCommand('code') === null && parseYahooReauthCommand('yahoo') === null);
+check('parse: b-faith.biz 以外の ?code= や別パスは拾わない (Codex R1)', parseYahooReauthCommand('https://example.com/?code=ABCDEF123') === null
+  && parseYahooReauthCommand('https://b-faith.biz/shop/?code=ABCDEF123') === null && parseYahooReauthCommand('yahoo code ABC') === null
+  && parseYahooReauthCommand('https://www.b-faith.biz/?state=x&code=ABCDEF123')?.code === 'ABCDEF123');
 check('allowed: 未設定は誰も不可 / 大文字小文字無視', !reauthUserAllowed('a@b-faith.biz', {}) && reauthUserAllowed('A@b-faith.biz', { YAHOO_REAUTH_USERS: 'x@b-faith.biz, a@b-faith.biz' })
   && reauthUserAllowed('a@b-faith.biz', { PD_RULE_APPROVERS: 'a@b-faith.biz' }));
 
@@ -32,8 +35,9 @@ const r3 = await handleYahooReauth({ kind: 'code', code: 'OLD' }, { email: 'me@b
 check('交換失敗 → やり直し案内 (上流文言は返さない)', /❌/.test(r3.text) && /HTTP 400/.test(r3.text) && !/leaked/.test(r3.text));
 const r4 = await handleYahooReauth({ kind: 'auth-url' }, { email: 'me@b-faith.biz', env: ENV, fetchImpl: async () => { throw new Error('ECONNREFUSED'); } });
 check('VPS 到達不可 → network 案内', /network/.test(r4.text));
-const r5 = await handleYahooReauth({ kind: 'auth-url' }, { email: 'me@b-faith.biz', env: { YAHOO_REAUTH_USERS: 'me@b-faith.biz' }, fetchImpl: okFetch });
-check('proxy env 無し → 設定案内', /YAHOO_PROXY_URL/.test(r5.text));
+const r5 = await handleYahooReauth({ kind: 'auth-url' }, { email: 'me@b-faith.biz', env: { YAHOO_REAUTH_USERS: 'me@b-faith.biz', YAHOO_PROXY_URL: 'http://vps', AUPAY_PROXY_SECRET: 'x' }, fetchImpl: okFetch });
+check('proxy secret は YAHOO_PROXY_SECRET のみ (AUPAY の流用不可)', /YAHOO_PROXY_URL/.test(r5.text));
+check('手順文に DM 推奨・削除案内', /DM/.test(r1.text) && /削除/.test(r1.text));
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed > 0 ? 1 : 0);

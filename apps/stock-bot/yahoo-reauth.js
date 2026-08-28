@@ -11,13 +11,28 @@
  */
 
 const AUTH_RE = /^\s*yahoo\s*(再認可|再認証|reauth|auth|認可)\s*$/i;
-const CODE_RE = /(?:[?&]code=|^\s*yahoo\s*code\s+)([A-Za-z0-9_.-]{6,200})/i;
+const MANUAL_CODE_RE = /^\s*yahoo\s+code\s+([A-Za-z0-9_.-]{6,200})\s*$/i;
+const CODE_VALUE_RE = /^[A-Za-z0-9_.-]{6,200}$/;
+const REDIRECT_HOSTS = new Set(['b-faith.biz', 'www.b-faith.biz']);
+
+/** 貼り付けられた URL が Yahoo のコールバック先 (b-faith.biz) で code を持つときだけ code を返す (他サイトの ?code= は拾わない — Codex R1 Medium) */
+function codeFromRedirectUrl(text) {
+  const m = String(text).match(/https?:\/\/\S+/);
+  if (!m) return null;
+  let u;
+  try { u = new URL(m[0]); } catch { return null; }
+  if (!REDIRECT_HOSTS.has(u.hostname.toLowerCase()) || (u.pathname !== '/' && u.pathname !== '')) return null;
+  const code = u.searchParams.get('code');
+  return code && CODE_VALUE_RE.test(code) ? code : null;
+}
 
 export function parseYahooReauthCommand(text) {
   const t = String(text || '').trim();
   if (AUTH_RE.test(t)) return { kind: 'auth-url' };
-  const m = t.match(CODE_RE);
-  if (m && /yahoo|b-faith\.biz|code=/i.test(t)) return { kind: 'code', code: m[1] };
+  const manual = t.match(MANUAL_CODE_RE);
+  if (manual) return { kind: 'code', code: manual[1] };
+  const fromUrl = codeFromRedirectUrl(t);
+  if (fromUrl) return { kind: 'code', code: fromUrl };
   return null;
 }
 
@@ -29,7 +44,7 @@ export function reauthUserAllowed(email, env = process.env) {
 
 function proxyConfig(env) {
   const url = String(env.YAHOO_PROXY_URL || '').trim().replace(/\/$/, '');
-  const secret = String(env.YAHOO_PROXY_SECRET || env.AUPAY_PROXY_SECRET || '').trim();
+  const secret = String(env.YAHOO_PROXY_SECRET || '').trim(); // Yahoo 用 secret のみ (fail-closed、Codex R1 Low)
   return { url, secret };
 }
 
@@ -76,7 +91,8 @@ export async function handleYahooReauth(cmd, { email, env = process.env, fetchIm
         '2. 「https://b-faith.biz/?code=…」に戻ったら、その *URL をそのままこのチャットに貼る* だけで完了します',
         '   (URL が長くて貼りにくければ「yahoo code XXXX」でも可)',
         '',
-        '※ 認可コードは数分で失効するので、戻ったらすぐ貼ってください',
+        '※ 認可コードは数分で失効し 1 回しか使えません。戻ったらすぐ貼ってください',
+        '※ 貼った URL はチャット履歴に残るので、このボットとの DM で行い、完了したらそのメッセージは削除して構いません',
       ].join('\n'),
     };
   }

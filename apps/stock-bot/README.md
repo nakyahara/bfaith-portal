@@ -68,5 +68,6 @@
 ## Yahoo API 再認可 (2026-08-28、yahoo-reauth.js)
 - 「yahoo再認可」と送る → 認可 URL と手順を返す。ログイン後に戻る `https://b-faith.biz/?code=…` の URL をそのまま貼る (or「yahoo code XXXX」) → VPS `/yahoo/token/init` でトークン交換 → 新しい期限を返す
 - 実行できる人: Render env `YAHOO_REAUTH_USERS` (カンマ区切りメール)。未設定なら `PD_RULE_APPROVERS` を流用、それも無ければ誰も実行できない (fail-closed)
-- 必要 env: `YAHOO_PROXY_URL` / `YAHOO_PROXY_SECRET` (未発送アラート等と共用で Render に設定済み)
+- 必要 env: `YAHOO_PROXY_URL` / `YAHOO_PROXY_SECRET` (未発送アラート等と共用で Render に設定済み。AUPAY 側の secret は流用しない)
+- 貼り付けは `https://b-faith.biz/?code=…` (www 可) のみ受け付ける。他サイトの `?code=` は商品検索扱い。認可コードは数分・1 回限りなので Chat 履歴に残っても実害は小さいが、ボットとの DM で行い完了後にメッセージを消す運用を案内している
 - code はログに出さない。失敗時は上流の文言を返さない (「認可コードが古い可能性」案内のみ)
