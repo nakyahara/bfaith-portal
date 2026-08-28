@@ -71,3 +71,4 @@
 - 必要 env: `YAHOO_PROXY_URL` / `YAHOO_PROXY_SECRET` (未発送アラート等と共用で Render に設定済み。AUPAY 側の secret は流用しない)
 - 貼り付けは `https://b-faith.biz/?code=…` (www 可) のみ受け付ける。他サイトの `?code=` は商品検索扱い。認可コードは数分・1 回限りなので Chat 履歴に残っても実害は小さいが、ボットとの DM で行い完了後にメッセージを消す運用を案内している
 - code はログに出さない。失敗時は上流の文言を返さない (「認可コードが古い可能性」案内のみ)
+- **期限が近づくと向こうから通知が来る**: daily-sync の `apps/warehouse/notify-yahoo-token-expiry.js` が残り 5 日 (env `YAHOO_TOKEN_WARN_DAYS`) から毎日 1 通、GChat に再認可の手順と認可 URL を投げる

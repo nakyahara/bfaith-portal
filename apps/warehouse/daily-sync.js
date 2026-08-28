@@ -1222,6 +1222,14 @@ async function main() {
     }
   }
 
+  // ─── Yahoo refresh token 期限アラート (残り5日から毎日1通、#958 の GChat 再認可へ誘導) ───
+  // 失効すると Yahoo 系 (受注取込・未発送アラート・レビューメール) が全滅するため、切れる前に声をかける。
+  // 1日1通の抑止は script 側 (yahoo_token_notify_state)。retry で再実行されても二重送信しない
+  // 通知の失敗 (webhook 障害等) では exit 0 を返す実装 = daily-sync 全体を落とさない (Codex R1 High)。
+  // RETRYABLE_JOBS にも入れない (翌朝の実行で送れば足りる)
+  const yahooTokenAlert = runScript('apps/warehouse/notify-yahoo-token-expiry.js', 'Yahooトークン期限アラート', 120000);
+  results.push({ name: 'Yahooトークン期限アラート', ...yahooTokenAlert });
+
   // ─── 楽天 未発送アラート (出荷漏れの通知) ───
   // 前日12:00 (出荷の締め) までに入金確認できていたのに、まだ発送されていない注文を GChat へ。
   // ・warehouse.db を見ず RMS API を直接読むので、他ステップの成否に影響されない
