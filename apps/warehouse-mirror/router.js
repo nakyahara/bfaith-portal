@@ -2210,6 +2210,24 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
         });
       }
     }
+    // PK 重複は 400 (Codex R2 High)。保存は INSERT OR REPLACE なので、同じキーを 2 回含む
+    // snapshot は「行数は足りているのに実際は半分」になり、減少ゲートも世代表の row_count も
+    // すり抜ける (監査上も欠損が見えない)。送信側にも同じ検査があるが、受け側でも必ず見る
+    {
+      const spec = DD_ALL_TABLE_SPECS[entity];
+      const keyCols = spec.cols.filter((c) => c === 'store_id' || c.endsWith('_key'));
+      const seen = new Set();
+      for (const r of rows) {
+        const pk = JSON.stringify(keyCols.map((c) => r[c]));
+        if (seen.has(pk)) {
+          return res.status(400).json({
+            error: 'duplicate_primary_key',
+            message: `entity=${entity} の snapshot に PK 重複: ${pk} (全置換で行が黙って減る)`,
+          });
+        }
+        seen.add(pk);
+      }
+    }
     // 空 snapshot は fail-closed。送信側の事故 (source 表の消失・SELECT ミス) で mirror を
     // 黙って空にしない。全消しは「消える件数を言い当てられること」まで要求する (Codex R1 Medium #6)
     if (rows.length === 0 && meta.allow_empty_snapshot !== true) {

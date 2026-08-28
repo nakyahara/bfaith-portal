@@ -160,6 +160,20 @@ console.log('\n── 壊れた map は送らない (ne_code が m_products に�
   db5.close();
 }
 
+console.log('\n── ne_code の表記ゆれは m_products の正本表記に直して送る ──');
+{
+  const db7 = senderConn();
+  // マスタは 'ne0006'。map 側が 'NE0006' でも突合は通る (SKU は LOWER(TRIM) が家ルール) が、
+  // mirror に非正本表記が残ると価格改定側の完全一致 JOIN で「存在しないコード」になる
+  db7.prepare("INSERT INTO f_yahoo_sku_map (yahoo_key, store_id, ne_code, resolution_source) VALUES ('abc-06','b-faith01','NE0006','manual')").run();
+  db7.close();
+  const r = await runSender(['--entity', 'yahoo_sku_map']);
+  eq(r.code, 0, 'exit 0');
+  ok(r.out.includes('正本表記に直した行: 1'), '直した件数がログに出る');
+  eq(mirrorDb.prepare("SELECT ne_code FROM mirror_yahoo_sku_map WHERE yahoo_key='abc-06'").get().ne_code,
+    'ne0006', 'mirror には正本表記で入る');
+}
+
 console.log('\n── source が 0 件なら送らず失敗させる (map 全消しの事故を ok で流さない) ──');
 {
   const db6 = senderConn();
@@ -168,7 +182,7 @@ console.log('\n── source が 0 件なら送らず失敗させる (map 全消
   const r = await runSender(['--entity', 'yahoo_sku_map']);
   eq(r.code, 1, 'exit 1');
   ok(r.out.includes('0件のため送信しない'), '理由がログに出る');
-  eq(yahooKeys().length, 2, 'mirror は無傷');
+  eq(yahooKeys().length, 3, 'mirror は無傷');
 }
 
 server.close();

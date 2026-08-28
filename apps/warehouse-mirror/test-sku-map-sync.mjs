@@ -159,6 +159,9 @@ const cases = [
   ['0件 + 件数を言い当てられない', [], { meta: { allow_empty_snapshot: true, expected_deleted_rows: 999 } }, 'empty_snapshot_confirmation_mismatch'],
   ['chunk 分割 (途中欠落で表が欠ける)', [row()], { chunkCount: 2, isLast: false }, 'full_snapshot_requires_single_chunk'],
   ['row.source_run_id 不一致', [row()], { rowRunId: 'other-run' }, 'source_run_id_mismatch'],
+  // 同じ PK を 2 回含む snapshot: 行数は足りているのに INSERT OR REPLACE で実際は半分になる。
+  // 減少ゲートも世代表の row_count もすり抜けるので、ここで止めないと欠損が監査上も見えない
+  ['PK 重複 (行数だけ足りている)', [...manyRows(8), row({ yahoo_key: 'k-000' }), row({ yahoo_key: 'k-000', ne_code: 'ne0002' })], {}, 'duplicate_primary_key'],
   ['ne_code 欠落', withBad(row({ yahoo_key: 'bad-1', ne_code: '' })), {}, 'bad_row'],
   ['yahoo_key 欠落', withBad(row({ yahoo_key: null })), {}, 'bad_row'],
   ['store_id 欠落 (default で埋めない)', withBad(row({ yahoo_key: 'bad-3', store_id: undefined })), {}, 'bad_row'],

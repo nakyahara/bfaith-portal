@@ -80,14 +80,21 @@ const ENTITIES = [
 ];
 
 /**
- * 送信前の意味検証。map が壊れたまま mirror に入ると、価格改定で別商品に値付けする事故になる。
+ * 送信前の意味検証 + 正規化。map が壊れたまま mirror に入ると、価格改定で別商品に値付けする事故になる。
  * ここで落とす = 一部だけ送って「全置換」を成立させない (fail-closed、Codex R1 High #3)。
  * ne_code の実在確認は NE商品マスタ (m_products) を持つ miniPC 側にしかできない。
+ *
+ * ★突合は LOWER(TRIM()) (SKU の家ルール) だが、送るのは m_products の正本表記に直した値。
+ *   CI で通しておきながら mirror には 'NE0001' のような非正本表記が残ると、価格改定側が
+ *   完全一致で結合したときに「存在しないコード」になる (Codex R2 Medium)
  */
 function validateRows(db, entity, rows) {
   const problems = [];
-  const known = new Set(
-    db.prepare('SELECT LOWER(TRIM(商品コード)) AS c FROM m_products').all().map((r) => r.c)
+  let normalized = 0;
+  // lower(trim) → 正本表記
+  const known = new Map(
+    db.prepare('SELECT 商品コード AS code FROM m_products').all()
+      .map((r) => [String(r.code).trim().toLowerCase(), String(r.code)])
   );
   const seen = new Set();
   for (const r of rows) {
@@ -100,14 +107,21 @@ function validateRows(db, entity, rows) {
     }
     if (!ALLOWED_STORES.has(r.store_id)) problems.push(`${where}: 未知の store_id=${r.store_id}`);
     if (!RESOLUTION_SOURCES.has(r.resolution_source)) problems.push(`${where}: 未知の resolution_source=${r.resolution_source}`);
-    if (typeof r.ne_code === 'string' && !known.has(r.ne_code.trim().toLowerCase())) {
-      problems.push(`${where}: ne_code=${r.ne_code} が m_products に無い (廃番 or タイポ)`);
+    if (typeof r.ne_code === 'string') {
+      const hit = known.get(r.ne_code.trim().toLowerCase());
+      if (!hit) {
+        problems.push(`${where}: ne_code=${r.ne_code} が m_products に無い (廃番 or タイポ)`);
+      } else if (hit !== r.ne_code) {
+        // 表記ゆれは正本に寄せて送る (map 自体の修正は miniPC 側の運用で行う)
+        r.ne_code = hit;
+        normalized++;
+      }
     }
     const pk = JSON.stringify([r.store_id, r[entity.keyCol]]);
     if (seen.has(pk)) problems.push(`${where}: PK 重複`);
     seen.add(pk);
   }
-  return problems;
+  return { problems, normalized };
 }
 
 /** 送信のたびに単調増加する世代番号を採る (受け側が古い run を 409 で弾くための番号) */
@@ -136,6 +150,7 @@ async function syncEntity(entity) {
   const db = new Database(dbPath, { readonly: true });
   let rows;
   let problems;
+  let normalized;
   let lastApplied;
   try {
     const contract = db.prepare('SELECT * FROM sync_contracts WHERE entity = ?').get(entity.name);
@@ -159,7 +174,7 @@ async function syncEntity(entity) {
       return { entity: entity.name, ok: false, error: 'source_table_missing' };
     }
     rows = db.prepare(entity.selectSql).all();
-    problems = validateRows(db, entity, rows);
+    ({ problems, normalized } = validateRows(db, entity, rows));
     // 前回 applied の件数 (大幅減少ゲートの基準)
     lastApplied = db.prepare(`
       SELECT row_count_received FROM sync_runs
@@ -170,6 +185,7 @@ async function syncEntity(entity) {
   }
 
   console.log(`  Rows to sync: ${rows.length.toLocaleString()}`);
+  if (normalized > 0) console.log(`  ne_code の表記を m_products の正本表記に直した行: ${normalized}`);
   // 0件は送らない。受け側も empty_snapshot_rejected で弾くが、こちら側でも失敗として見せる
   // (手動 map が全部消えている = 引き当てが静かに壊れている状態なので ok で流さない)
   if (rows.length === 0) {
@@ -264,13 +280,19 @@ async function syncEntity(entity) {
       // 「送信元は applied、mirror は未反映」になるのを防ぐ (Codex R1 Low #8)
       const mismatches = [];
       if (result.ok !== true) mismatches.push(`ok=${JSON.stringify(result.ok)}`);
-      if (result.status !== 'completed') mismatches.push(`status=${JSON.stringify(result.status)}`);
       if (result.sync_run_id !== runId) mismatches.push(`sync_run_id=${JSON.stringify(result.sync_run_id)}`);
       if (result.entity !== entity.name) mismatches.push(`entity=${JSON.stringify(result.entity)}`);
-      if (result.rows_received !== enrichedRows.length) mismatches.push(`rows_received=${JSON.stringify(result.rows_received)} (expected ${enrichedRows.length})`);
+      // replayed = 同じ run が既に適用済み (プロキシの POST 再試行など)。適用済みなので成功扱いにする。
+      // この応答には status / rows_received が無いので、そこは求めない (Codex R2 Medium)
+      if (result.replayed !== true) {
+        if (result.status !== 'completed') mismatches.push(`status=${JSON.stringify(result.status)}`);
+        if (result.rows_received !== enrichedRows.length) mismatches.push(`rows_received=${JSON.stringify(result.rows_received)} (expected ${enrichedRows.length})`);
+      }
       if (mismatches.length > 0) {
         lastError = `unexpected response: ${mismatches.join(', ')}`;
         console.error(`  ✗ 応答が契約と違う: ${lastError}`);
+      } else if (result.replayed === true) {
+        console.log(`  ✓ chunk は適用済み (replayed / request_id=${result.request_id})`);
       } else {
         console.log(`  ✓ chunk applied (request_id=${result.request_id}, rows_received=${result.rows_received})`);
       }
