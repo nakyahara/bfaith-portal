@@ -117,6 +117,14 @@ check('不正IDは404', r.status === 404);
 r = await fetch(base + '/apps/shohyo-links/api/inbox?status=bogus');
 check('未知の status は400', r.status === 400);
 
+// カードごとのMF URL
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://evil.example/x' }) });
+check('MF以外のURLは400', r.status === 400 && (await r.json()).error === 'bad_url');
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://accounting.moneyforward.com/transaction_journals?cti=x&search_form%5Basset_acts%5D%5Baccount_id_hash%5D=y' }) });
+check('MFの通帳・カード他URLは登録できる', r.status === 200 && (await r.json()).result.url.includes('account_id_hash'));
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: '' }) });
+check('空で解除', r.status === 200 && (await r.json()).result.url === '');
+
 server.close();
 console.log(ng ? `\n${ng}件NG` : '\n全件パス');
 process.exitCode = ng ? 1 : 0;
