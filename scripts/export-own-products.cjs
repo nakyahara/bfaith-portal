@@ -24,10 +24,16 @@ const Database = require('better-sqlite3');
 const fs = require('fs');
 const path = require('path');
 
+// ⚠️%USERPROFILE% を当てにしてはいけない。
+//   このスクリプトは miniPC のタスクスケジューラから **SYSTEM** で走るので、
+//   USERPROFILE は C:\WINDOWS\system32\config\systemprofile になり、warehouse.db を見失う
+//   (2026-08-28 に実際に踏んだ)。リポジトリからの相対で解決すれば実行ユーザーに依らない。
+const REPO_ROOT = path.join(__dirname, '..');
 const DB_FILE = process.env.WAREHOUSE_DB
-  || path.join(process.env.USERPROFILE || 'C:/Users/bfaith', 'bfaith-portal', 'data', 'warehouse.db');
+  || path.join(process.env.DATA_DIR || path.join(REPO_ROOT, 'data'), 'warehouse.db');
+// 出力先は bat から明示的に渡す。既定は「ポータルと同じ階層の product-idea-scout」
 const OUT = process.argv[2]
-  || path.join(process.env.USERPROFILE || 'C:/Users/bfaith', 'product-idea-scout', 'data', 'own-products.json');
+  || path.join(REPO_ROOT, '..', 'product-idea-scout', 'data', 'own-products.json');
 
 /** 色/容量違いを束ねるキー。「【」より前が空なら商品名そのもの (【で始まる商品が222件ある) */
 function familyKey(name) {
