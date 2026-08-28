@@ -584,6 +584,27 @@ function createTables() {
   db.exec('CREATE INDEX IF NOT EXISTS idx_permlog_staff ON staff_permission_logs(staff_id, id)');
 
   seedBuiltinPermissions();
+
+  // ─── ⏰締め前確認 (2026-08-28 中原さん要望) ───
+  // お客さまからのキャンセル・住所変更・日時指定の連絡を、ロジザードへ流す前 (09:00/12:30/14:30) に拾う。
+  // ⭐**検知結果はここに保存しない** — 毎回キーワードで判定し直す (cutoff.js)。
+  //   キーワードを足したら過去分にも即反映されるし、古い判定が残る問題も起きない。
+  //   ここに入るのは「人が片付けた」という事実だけ。
+  db.exec(`CREATE TABLE IF NOT EXISTS cutoff_acks (
+    message_id INTEGER NOT NULL REFERENCES inquiry_messages(id),
+    inquiry_id INTEGER NOT NULL REFERENCES inquiries(id),
+    kind TEXT NOT NULL,                 -- cutoff.js の CUTOFF_KINDS (cancel / address / datetime)
+    status TEXT NOT NULL CHECK(status IN ('done','not_applicable')),
+      -- done = ネクストエンジンで直した / not_applicable = 検知が的外れだった
+    -- 判定ルールの版 (cutoff.js DETECTOR_VERSION)。⭐「対象外だった」はルールが変わったら
+    -- もう一度見せる — 古いルールでの「的外れ」判断を、新しい判定の結果にまで効かせないため
+    detector_version INTEGER NOT NULL DEFAULT 0,
+    note TEXT,
+    acked_by TEXT,
+    acked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    PRIMARY KEY (message_id, kind)
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cutoff_acks_inquiry ON cutoff_acks(inquiry_id)');
 }
 
 /**
