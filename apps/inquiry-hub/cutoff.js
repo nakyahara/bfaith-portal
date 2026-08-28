@@ -19,6 +19,7 @@
  */
 import { getDB } from './db.js';
 import { stripQuoted, normalizeForMatch } from './text-utils.js';
+import { blockedReplyDestination } from './no-reply.js';
 
 /** ロジザードの締め時刻 (JST)。⭐締め時刻の正本はここだけ。通知cronの時刻もここから導出する */
 export const CUTOFF_TIMES = [
@@ -222,6 +223,66 @@ export function cutoffNoticeCrons(leadMinutes = NOTICE_LEAD_MINUTES) {
   });
 }
 
+// ─── 差出人の除外 (2026-08-28 中原さん「的外れが多すぎる」) ───
+
+/**
+ * ⭐**メールチャネルには顧客のメールも業者の連絡もAmazonの販促も同じように届く。**
+ *   「お客さんから問い合わせ以外で普通にメールが届くこともある」(中原さん) ので、
+ *   チャネルごと外すと本物の顧客メールまで消える。だから差出人ごとに外す。
+ *
+ * 除外は2段構え:
+ *   1. 自動 … no-reply / 通知専用ドメイン / バウンス (顧客ではないと確実に言えるもの)
+ *   2. 手動 … cutoff_excludes。画面の各行から1タップで足せる (使いながら育てる)
+ */
+
+/** 除外リストを比較用のキー集合にして返す */
+export function loadExcludeKeys() {
+  return new Set(getDB().prepare('SELECT pattern_key FROM cutoff_excludes').all().map(r => r.pattern_key));
+}
+
+/** その差出人を締め前確認から外すか。@から始まるパターンはドメイン一致 */
+export function isExcludedSender(identifier, keys) {
+  const a = String(identifier || '').trim().toLowerCase();
+  if (!a) return false;                       // 差出人不明は外さない (取りこぼしを作らない)
+  if (keys.has(a)) return true;
+  const at = a.lastIndexOf('@');
+  return at >= 0 && keys.has(a.slice(at));    // '@example.com'
+}
+
+/**
+ * 顧客からの連絡でないと**確実に**言えるものだけ true。
+ * ⚠️狭く判定する — 迷うものは通す (取りこぼしは誰も気づけないため)。
+ * 楽天のマスクアドレス (…@pc.fw.rakuten.ne.jp) は顧客なので、ここでは外れない
+ */
+export function isNonCustomerSender(identifier) {
+  return !!blockedReplyDestination(identifier);
+}
+
+export function listCutoffExcludes() {
+  return getDB().prepare('SELECT * FROM cutoff_excludes ORDER BY pattern_key').all();
+}
+
+/** 除外を1件足す。'@example.com' でドメインごとも指定できる */
+export function addCutoffExclude(pattern, note = null, actorId = null) {
+  const p = String(pattern || '').trim().toLowerCase().replace(/^mailto:/, '');
+  if (!p) throw new Error('メールアドレス (または @ドメイン) を入れてください');
+  if (p.length > 200) throw new Error('長すぎます (200文字まで)');
+  const isDomain = p.startsWith('@');
+  const ok = isDomain ? /^@[\w.-]+\.[a-z]{2,}$/i.test(p) : /^[^\s@]+@[\w.-]+\.[a-z]{2,}$/i.test(p);
+  if (!ok) throw new Error(`メールアドレスの形式ではありません: ${p} (ドメイン全部なら @example.com のように書きます)`);
+  getDB().prepare(`INSERT OR IGNORE INTO cutoff_excludes (pattern, pattern_key, note, created_by)
+    VALUES (?,?,?,?)`).run(p, p, note ? String(note).slice(0, 200) : null, actorId);
+  clearCutoffCountCache();
+  return { pattern: p, isDomain };
+}
+
+/** 除外を外す (再び出るようになる)。既に無くても成功 (冪等) */
+export function removeCutoffExclude(id) {
+  const r = getDB().prepare('DELETE FROM cutoff_excludes WHERE id = ?').run(Number(id));
+  clearCutoffCountCache();
+  return { removed: r.changes };
+}
+
 // ─── 一覧 ───
 
 /**
@@ -238,14 +299,15 @@ export function cutoffNoticeCrons(leadMinutes = NOTICE_LEAD_MINUTES) {
  *   truncated = 上限に達して全部は見きれていない (画面と通知で「0件だから安全」と言わせないため)
  */
 export function listCutoffItems({ nowMs = Date.now(), days = LOOKBACK_DAYS,
-  includeAcked = false, includeDone = false } = {}) {
+  includeAcked = false, includeDone = false, includeExcluded = false } = {}) {
   const db = getDB();
   const d = Math.min(90, Math.max(1, Number(days) || LOOKBACK_DAYS));
   // 期間の下限は JS 側で決める (SQLite の 'now' と nowMs がずれないように。Codexレビュー指摘)
   const since = new Date(nowMs - d * 86400000).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
   const rows = db.prepare(`SELECT m.id AS message_id, m.message_body_text, m.received_at, m.sent_at,
-      i.id AS inquiry_id, i.subject, i.customer_name, i.order_number, i.product_name,
+      i.id AS inquiry_id, i.subject, i.customer_name, i.customer_identifier,
+      i.order_number, i.product_name,
       i.channel_type, i.internal_status, i.assigned_user_id, s.shop_name,
       (SELECT MIN(m2.id) FROM inquiry_messages m2
         WHERE m2.inquiry_id = i.id AND m2.is_incoming = 1) AS first_incoming_id
@@ -267,8 +329,14 @@ export function listCutoffItems({ nowMs = Date.now(), days = LOOKBACK_DAYS,
     acked.set(`${a.message_id}:${a.kind}`, a);
   }
 
+  const excludeKeys = loadExcludeKeys();
   const items = [];
+  let excluded = 0;
   for (const r of scan) {
+    // ⭐顧客以外の差出人 (業者の連絡・Amazonの販促・自動配信) は出さない。
+    //   ⚠️ただしメールチャネルには本物の顧客メールも届くので、チャネルでなく差出人で外す
+    if (!includeExcluded && (isExcludedSender(r.customer_identifier, excludeKeys)
+      || isNonCustomerSender(r.customer_identifier))) { excluded++; continue; }
     // ⚠️件名はスレッド最初の受信メッセージにだけ使う。
     //   全メッセージに件名を効かせると、「注文キャンセル」という件名のスレッドに
     //   お礼の返信が来るたびに新しい未対応が湧く (Codexレビュー指摘)
@@ -286,16 +354,17 @@ export function listCutoffItems({ nowMs = Date.now(), days = LOOKBACK_DAYS,
         kind: h.kind, kindLabel: h.label, icon: h.icon, style: h.style, matched: h.matched,
         subject: r.subject, customerName: r.customer_name, orderNumber: r.order_number,
         productName: r.product_name, channel: r.channel_type, shopName: r.shop_name,
+        sender: r.customer_identifier,
         status: r.internal_status, assignedTo: r.assigned_user_id,
         receivedAt: r.received_at || r.sent_at,
         body: r.message_body_text,
         ack: ackStale ? null : ack,
         ackStale,
       });
-      if (items.length >= MAX_ROWS) return { items, truncated: true, scanned: scan.length };
+      if (items.length >= MAX_ROWS) return { items, truncated: true, scanned: scan.length, excluded };
     }
   }
-  return { items, truncated, scanned: scan.length };
+  return { items, truncated, scanned: scan.length, excluded };
 }
 
 /** 一覧の結果から件数を数える (同じ検索を2回走らせないための純粋関数) */
@@ -317,7 +386,7 @@ const COUNT_CACHE_MS = 30000;
 let countCache = null;
 
 export function countCutoffItems(opts = {}) {
-  const useCache = !opts.nowMs && !opts.days && !opts.includeAcked && !opts.includeDone;
+  const useCache = !opts.nowMs && !opts.days && !opts.includeAcked && !opts.includeDone && !opts.includeExcluded;
   if (useCache && countCache && Date.now() - countCache.at < COUNT_CACHE_MS) return countCache.value;
   const r = listCutoffItems(opts);
   const value = { ...summarize(r.items), truncated: r.truncated };

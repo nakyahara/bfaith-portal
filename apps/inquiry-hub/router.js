@@ -53,6 +53,7 @@ import { getPermissionMatrix, createStaff, saveStaffWithPermissions, deactivateS
   STAFF_NAME_MAX, STAFF_KEY_MAX, PERM_NAME_MAX, PERM_CODE_MAX } from './staff.js';
 import { collectInsights, estimateCost, WMS_CUTOFFS } from './insights.js';
 import { listCutoffItems, countCutoffItems, summarize, ackCutoffItem, unackCutoffItem,
+  listCutoffExcludes, addCutoffExclude, removeCutoffExclude,
   nextCutoff, CUTOFF_KINDS, CUTOFF_TIMES, LOOKBACK_DAYS } from './cutoff.js';
 import { toPreviewLine } from './text-utils.js';
 
@@ -3267,7 +3268,18 @@ const CUTOFF_PAGE_CSS = `<style>
 router.get('/cutoff', (req, res) => {
   const showAcked = req.query.acked === '1';
   const showDone = req.query.done === '1';
-  const { items, truncated } = listCutoffItems({ includeAcked: showAcked, includeDone: showDone });
+  const { items, truncated, excluded } = listCutoffItems({ includeAcked: showAcked, includeDone: showDone });
+  const excludes = listCutoffExcludes();
+  // いま出ている差出人を多い順に (お客さまでないものをまとめて外せるように)
+  const senderCount = new Map();
+  for (const it of items) {
+    if (!it.sender) continue;
+    senderCount.set(it.sender, (senderCount.get(it.sender) || 0) + 1);
+  }
+  const senderRanking = [...senderCount.entries()]
+    .map(([sender, count]) => ({ sender, count }))
+    .sort((a, b) => b.count - a.count || a.sender.localeCompare(b.sender))
+    .slice(0, 15);
   const counts = summarize(items.filter(i => !i.ack));
   const next = nextCutoff();
   const h = Math.floor(next.minutesLeft / 60), m = next.minutesLeft % 60;
@@ -3283,6 +3295,7 @@ router.get('/cutoff', (req, res) => {
       <div class="cut-meta">
         <span>📅 ${fmtJst(it.receivedAt)}</span>
         <span>👤 ${he(it.customerName || '(名前なし)')}</span>
+        ${it.sender ? `<span>✉️ ${he(it.sender)}</span>` : ''}
         <span>${it.orderNumber ? '🔗 注文 ' + he(it.orderNumber) : '⚠️ 注文番号なし (NEで名前・メールから探す)'}</span>
         ${it.assignedTo ? `<span>担当 ${he(it.assignedTo)}</span>` : ''}
       </div>
@@ -3293,6 +3306,9 @@ router.get('/cutoff', (req, res) => {
           ? `<button class="cut-undo" data-msg="${it.messageId}" data-kind="${he(it.kind)}">↩️ 未対応に戻す</button>`
           : `<button class="pri cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="done">✅ ネクストエンジンで直した</button>
              <button class="cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="not_applicable">対象外だった</button>`}
+        ${it.sender ? `<span style="flex:1"></span>
+          <button class="cut-excl" data-sender="${he(it.sender)}" title="この差出人からのメールを今後この画面に出しません (問い合わせ自体は消えません)">🚫 この差出人は今後出さない</button>
+          <button class="cut-excl-dom" data-domain="${he('@' + String(it.sender).split('@').pop())}" title="このドメインからのメールを今後この画面に出しません">🚫 @${he(String(it.sender).split('@').pop())} ごと</button>` : ''}
       </div>
     </div>`).join('');
 
@@ -3325,7 +3341,47 @@ router.get('/cutoff', (req, res) => {
 
   ${items.length ? itemCards : `<div class="cut-empty">✅ 検知された未対応は0件です<br>
     <span class="sub">キャンセル・住所変更・日時指定の連絡は見つかりませんでした。
-    ただし言葉で拾っているので取りこぼしはありえます — いつもどおり確認して流してください。</span></div>`}`;
+    ただし言葉で拾っているので取りこぼしはありえます — いつもどおり確認して流してください。</span></div>`}
+
+  ${senderRanking.length > 1 ? `<details class="card" style="padding:12px">
+    <summary><b>📊 いま出ている差出人 (多い順)</b> <span class="sub">— お客さまでないものをまとめて外せます</span></summary>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>差出人</th><th>件数</th><th></th></tr></thead>
+      <tbody>${senderRanking.map(s => `
+        <tr>
+          <td><code>${he(s.sender)}</code></td>
+          <td class="nowrap">${s.count}件</td>
+          <td class="nowrap ops">
+            <button class="cut-excl" data-sender="${he(s.sender)}">🚫 出さない</button>
+            <button class="cut-excl-dom" data-domain="${he('@' + s.sender.split('@').pop())}">@${he(s.sender.split('@').pop())} ごと</button>
+          </td>
+        </tr>`).join('')}</tbody>
+    </table>
+  </details>` : ''}
+
+  <details class="card" style="padding:12px">
+    <summary><b>🚫 この画面に出さない差出人 (${excludes.length}件)</b>
+      ${excluded ? `<span class="sub"> — 直近で ${excluded}通 を除外しました</span>` : ''}</summary>
+    <div class="sub" style="margin:8px 0">業者からの連絡・Amazonの通知・自動配信など、<b>お客さまではない差出人</b>をここに入れておくと出なくなります。
+      一覧の「🚫この差出人は今後出さない」からも足せます。<br>
+      <b>問い合わせ自体が消えるわけではありません</b> (受信トレイには残ります)。
+      no-reply系・バウンスは登録しなくても自動で外れます。</div>
+    <div class="filters">
+      <input type="text" id="exclInput" placeholder="foo@example.com または @example.com (ドメインごと)" style="min-width:300px">
+      <input type="text" id="exclNote" placeholder="メモ (任意)" style="min-width:160px">
+      <button class="pri" id="exclAdd">➕ 追加</button>
+    </div>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>差出人 / ドメイン</th><th>メモ</th><th>登録</th><th></th></tr></thead>
+      <tbody>${excludes.length ? excludes.map(e => `
+        <tr>
+          <td class="nowrap"><code>${he(e.pattern)}</code>${e.pattern.startsWith('@') ? ' <span class="badge" style="background:#f1f5f9;color:#475569">ドメイン</span>' : ''}</td>
+          <td class="sub">${he(e.note || '')}</td>
+          <td class="sub nowrap">${fmtJst(e.created_at)}</td>
+          <td class="ops"><button class="excl-del" data-id="${e.id}" data-pattern="${he(e.pattern)}">外す</button></td>
+        </tr>`).join('') : '<tr><td colspan="4" class="empty">まだ登録がありません</td></tr>'}</tbody>
+    </table>
+  </details>`;
 
   const script = `
   function api(path, data) {
@@ -3348,6 +3404,42 @@ router.get('/cutoff', (req, res) => {
         .then(function() { location.reload(); })
         .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
     });
+  });
+  // 差出人ごと・ドメインごとの除外 (一覧から1タップで足せる)
+  function addExclude(pattern, note, btn) {
+    btn.disabled = true;
+    api('/exclude', { pattern: pattern, note: note })
+      .then(function() { location.reload(); })
+      .catch(function(e) { toast('失敗: ' + e.message); btn.disabled = false; });
+  }
+  document.querySelectorAll('.cut-excl').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.sender + ' からのメールを、今後この画面に出さないようにします。'
+        + String.fromCharCode(10, 10) + '問い合わせ自体は消えません (受信トレイには残ります)。')) return;
+      addExclude(b.dataset.sender, '画面から追加', b);
+    });
+  });
+  document.querySelectorAll('.cut-excl-dom').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.domain + ' のドメイン全体を、今後この画面に出さないようにします。'
+        + String.fromCharCode(10, 10) + 'そのドメインのお客さまがいる場合は個別のアドレスだけにしてください。')) return;
+      addExclude(b.dataset.domain, '画面からドメインごと追加', b);
+    });
+  });
+  var exclAdd = document.getElementById('exclAdd');
+  if (exclAdd) exclAdd.addEventListener('click', function() {
+    var v = document.getElementById('exclInput').value.trim();
+    if (!v) { toast('メールアドレス (または @ドメイン) を入れてください'); return; }
+    addExclude(v, document.getElementById('exclNote').value.trim() || null, this);
+  });
+  document.querySelectorAll('.excl-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.pattern + ' の除外を外します (また出るようになります)。')) return;
+      b.disabled = true;
+      api('/exclude/' + b.dataset.id + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
   });`;
   res.send(pageShell('問い合わせ管理 — 締め前確認', 'cutoff', body, script));
 });
@@ -3364,6 +3456,21 @@ router.post('/api/cutoff/ack', (req, res) => {
 router.post('/api/cutoff/unack', (req, res) => {
   try {
     res.json({ ok: true, ...unackCutoffItem({ messageId: (req.body || {}).messageId, kind: (req.body || {}).kind }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/exclude', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = addCutoffExclude(b.pattern, b.note, actorOf(req));
+    console.log(`[inquiry-hub] 締め前確認から除外「${r.pattern}」 by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/exclude/:id(\\d+)/delete', (req, res) => {
+  try {
+    res.json({ ok: true, ...removeCutoffExclude(Number(req.params.id)) });
   } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
 });
 

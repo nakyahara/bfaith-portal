@@ -175,6 +175,86 @@ let mCancel, mAddr, mOld, mDone;
   check('問い合わせ数も出る', counts.inquiries === 3);
 }
 
+// ─── 4b. 差出人の除外 (2026-08-28「的外れが多すぎる」) ───
+console.log('4b. 差出人の除外');
+{
+  const shopId = db.prepare('SELECT id FROM shops').get().id;
+  const mkFrom = (ext, from, body) => {
+    const at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const id = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject,
+        internal_status, customer_identifier, customer_name, received_at, last_message_at)
+      VALUES ('email', ?, ?, '件名', 'open', ?, '差出人', ?, ?)`).run(shopId, ext, from, at, at).lastInsertRowid;
+    return db.prepare(`INSERT INTO inquiry_messages (inquiry_id, external_message_id, sender_type,
+        is_incoming, message_body_text, received_at) VALUES (?, ?, 'customer', 1, ?, ?)`)
+      .run(id, `msg-${ext}`, body, at).lastInsertRowid;
+  };
+
+  // 既定シード = 中原さんが実物を見て挙げた3件
+  const seeded = cut.listCutoffExcludes().map(e => e.pattern);
+  check('既定で3件が入っている (中原さん指定)',
+    seeded.includes('gvipsenriyamada@gmail.com') && seeded.includes('noreply@qemailserver.com')
+    && seeded.includes('amazon-cons-deal@amazon.com'), seeded.join());
+
+  const mBiz = mkFrom('ex1', 'gvipsenriyamada@gmail.com', 'キャンセルの件です');
+  const mAmz = mkFrom('ex2', 'amazon-cons-deal@amazon.com', 'お届け日を変更しました');
+  const mCust = mkFrom('ex3', 'okyakusama@example.com', '注文をキャンセルしたいです');
+  const ids = () => cut.listCutoffItems().items.map(i => i.messageId);
+  check('指定された業者は出ない', !ids().includes(mBiz));
+  check('Amazonの通知も出ない', !ids().includes(mAmz));
+  check('⭐ふつうのお客さまのメールは出る (チャネルごと消さない)', ids().includes(mCust));
+
+  // no-reply系・バウンスは登録しなくても自動で外れる
+  const mNoreply = mkFrom('ex4', 'noreply@somewhere.example.com', 'キャンセルします');
+  const mBounce = mkFrom('ex5', 'mailer-daemon@example.com', 'キャンセルします');
+  check('no-reply は登録しなくても外れる', !ids().includes(mNoreply));
+  check('バウンス通知も外れる', !ids().includes(mBounce));
+
+  // 楽天のマスクアドレスは顧客なので外さない
+  const mRakuten = mkFrom('ex6', 'abc123@pc.fw.rakuten.ne.jp', '住所を変更してください');
+  check('⭐楽天のマスクアドレスは顧客なので外さない', ids().includes(mRakuten));
+
+  // 画面から1タップで足す / 外す
+  cut.addCutoffExclude('okyakusama@example.com', 'テスト', 'tester');
+  check('追加すると消える', !ids().includes(mCust));
+  const added = cut.listCutoffExcludes().find(e => e.pattern === 'okyakusama@example.com');
+  check('一覧に出る', !!added);
+  cut.removeCutoffExclude(added.id);
+  check('外すとまた出る', ids().includes(mCust));
+  check('外すのは冪等', cut.removeCutoffExclude(added.id).removed === 0);
+
+  // ドメインごと
+  const mDom1 = mkFrom('ex7', 'a@gyousha.example.jp', 'キャンセルします');
+  const mDom2 = mkFrom('ex8', 'b@gyousha.example.jp', '住所を変更してください');
+  check('ドメイン除外の前は出る', ids().includes(mDom1) && ids().includes(mDom2));
+  cut.addCutoffExclude('@gyousha.example.jp', 'ドメインごと', 'tester');
+  check('ドメインごと外せる', !ids().includes(mDom1) && !ids().includes(mDom2));
+  check('別ドメインのお客さまは残る', ids().includes(mCust));
+
+  // 入力の検証
+  check('空はthrow', throws(() => cut.addCutoffExclude('')));
+  check('メールアドレスでないものはthrow', throws(() => cut.addCutoffExclude('ただの文字列')));
+  check('@だけはthrow', throws(() => cut.addCutoffExclude('@')));
+  check('同じものを2回足しても壊れない (冪等)',
+    !throws(() => cut.addCutoffExclude('@gyousha.example.jp', 'again', 'tester')));
+  check('大文字で入れても効く (小文字化)',
+    !throws(() => cut.addCutoffExclude('BIG@Example.COM')) &&
+    cut.listCutoffExcludes().some(e => e.pattern === 'big@example.com'));
+
+  // 除外した件数が分かる (画面に出す)
+  const r = cut.listCutoffItems();
+  check('除外した通数が返る', r.excluded > 0, String(r.excluded));
+  check('includeExcluded なら除外分も見られる',
+    cut.listCutoffItems({ includeExcluded: true }).items.some(i => i.messageId === mDom1));
+
+  // 後片付け (以降のテストに影響させない)
+  for (const e of cut.listCutoffExcludes()) {
+    if (['@gyousha.example.jp', 'big@example.com'].includes(e.pattern)) cut.removeCutoffExclude(e.id);
+  }
+  for (const it of cut.listCutoffItems().items.filter(i => String(i.subject) === '件名')) {
+    cut.ackCutoffItem({ messageId: it.messageId, kind: it.kind, status: 'done' }, 'tester');
+  }
+}
+
 // ─── 5. 対応済みにする ───
 console.log('5. 対応済み');
 {
@@ -361,6 +441,19 @@ console.log('8. 画面とAPI');
 
   const acked = await (await fetch(base + '/cutoff?acked=1')).text();
   check('対応済みも表示できる', acked.includes('対応済みも表示'));
+
+  // 差出人の除外 (画面 + API)
+  check('除外リストの管理セクションが出る', html.includes('この画面に出さない差出人'));
+  check('差出人が表示される', html.includes('✉️'));
+  check('「この差出人は今後出さない」ボタンが出る', html.includes('cut-excl'));
+  check('「問い合わせ自体は消えない」と書いてある', html.includes('問い合わせ自体が消えるわけではありません'));
+  const rEx = await jpost('/api/cutoff/exclude', { pattern: 'smoke-excl@example.com', note: 'smoke' });
+  check('除外の追加API', rEx.status === 200);
+  check('メールアドレスでないものは400', (await jpost('/api/cutoff/exclude', { pattern: 'あいうえお' })).status === 400);
+  check('空は400', (await jpost('/api/cutoff/exclude', { pattern: '' })).status === 400);
+  const exId = cut.listCutoffExcludes().find(e => e.pattern === 'smoke-excl@example.com').id;
+  check('除外を外すAPI', (await jpost(`/api/cutoff/exclude/${exId}/delete`, {})).status === 200);
+  check('外すAPIの再送も200 (冪等)', (await jpost(`/api/cutoff/exclude/${exId}/delete`, {})).status === 200);
 
   // 0件のときの画面
   for (const it of cut.listCutoffItems().items) cut.ackCutoffItem({ messageId: it.messageId, kind: it.kind, status: 'done' }, 'tester');
