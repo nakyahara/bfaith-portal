@@ -162,6 +162,62 @@ export function ingestSnapshot(payload, handle) {
   return { snapshotId, concepts: (payload.concepts || []).length, categories: (payload.collection || []).length };
 }
 
+/**
+ * 自社/AMC商品 (=すでに採用した企画) を取り込む。
+ *
+ * ⭐これがこのツールが過去から学ぶための土台。
+ *   撤退したファミリーは「やってみたがダメだった企画」= 負例で、
+ *   同じテーマが候補に出てきたときに「前に出して撤退した」と言えるようになる。
+ */
+export function ingestOwnFamilies(payload, handle) {
+  const db = resolveDb(handle);
+  const now = utcIsoNow();
+  const ins = db.prepare(`
+    INSERT INTO scout_own_families (family_key, snapshot_id, concept_id, category_path, form,
+      amc_capable, sku_count, asin_count, launched_on, last_sold_on, qty180, qty_all,
+      active_skus, discontinued_skus, median_price, outcome, updated_at)
+    VALUES (@familyKey, @snapshotId, @conceptId, @categoryPath, @form,
+      @amcCapable, @skuCount, @asinCount, @launchedOn, @lastSoldOn, @qty180, @qtyAll,
+      @activeSkus, @discontinuedSkus, @medianPrice, @outcome, @now)
+    ON CONFLICT(family_key) DO UPDATE SET
+      snapshot_id = excluded.snapshot_id, concept_id = excluded.concept_id,
+      category_path = excluded.category_path, form = excluded.form,
+      amc_capable = excluded.amc_capable, sku_count = excluded.sku_count,
+      asin_count = excluded.asin_count, launched_on = excluded.launched_on,
+      last_sold_on = excluded.last_sold_on, qty180 = excluded.qty180, qty_all = excluded.qty_all,
+      active_skus = excluded.active_skus, discontinued_skus = excluded.discontinued_skus,
+      median_price = excluded.median_price, outcome = excluded.outcome, updated_at = excluded.updated_at
+  `);
+  const latest = getLatestSnapshot(handle);
+  const run = db.transaction(() => {
+    for (const f of payload.families || []) {
+      ins.run({
+        familyKey: f.familyKey,
+        snapshotId: latest ? latest.snapshot_id : null,
+        // カテゴリが取れなかったファミリーは concept_id を持たない (テーマに載せられない)
+        conceptId: f.categoryPath ? conceptIdOf(f.categoryPath, f.form) : null,
+        categoryPath: f.categoryPath ?? null,
+        form: f.form ?? null,
+        amcCapable: f.amcCapable === true ? 'pass' : (f.amcCapable === false ? 'fail' : 'unknown'),
+        skuCount: f.skuCount ?? null,
+        asinCount: f.asinCount ?? null,
+        launchedOn: f.launchedOn ?? null,
+        lastSoldOn: f.lastSoldOn ?? null,
+        qty180: f.qty180 ?? null,
+        qtyAll: f.qtyAll ?? null,
+        activeSkus: f.activeSkus ?? null,
+        discontinuedSkus: f.discontinuedSkus ?? null,
+        medianPrice: f.medianPrice ?? null,
+        outcome: f.outcome,
+        now,
+      });
+    }
+  });
+  run();
+  const placed = (payload.families || []).filter((f) => f.categoryPath).length;
+  return { families: (payload.families || []).length, placed };
+}
+
 // ─────────────────────────────────────────────────────────────
 // 参照
 // ─────────────────────────────────────────────────────────────
@@ -213,9 +269,21 @@ export function listConcepts({ snapshotId, gate = 'pass', status = 'undecided', 
 
   const sql = `
     SELECT c.*, d.decision, d.reason_code, d.comment, d.recheck_condition,
-           d.decided_by, d.decided_at
+           d.decided_by, d.decided_at,
+           -- ⭐このテーマを自社が既にやっているか。重複提案を止め、
+           --   「前に出して撤退した」を判断材料として出すため
+           o.own_count, o.own_active, o.own_withdrawn, o.own_qty180, o.own_names
     FROM scout_concepts c
     LEFT JOIN (${LATEST_DECISION_SQL}) d ON d.concept_id = c.concept_id
+    LEFT JOIN (
+      SELECT concept_id,
+             COUNT(*)                                        AS own_count,
+             SUM(CASE WHEN outcome = 'active' THEN 1 ELSE 0 END)    AS own_active,
+             SUM(CASE WHEN outcome = 'withdrawn' THEN 1 ELSE 0 END) AS own_withdrawn,
+             SUM(COALESCE(qty180, 0))                        AS own_qty180,
+             GROUP_CONCAT(family_key, ' / ')                 AS own_names
+      FROM scout_own_families WHERE concept_id IS NOT NULL GROUP BY concept_id
+    ) o ON o.concept_id = c.concept_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY c.rank_in_snapshot
     LIMIT @limit OFFSET @offset

@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import { createProductScoutTables } from './schema.js';
 import {
   ingestSnapshot, getLatestSnapshot, listCategories, listConcepts, countConcepts,
-  getConcept, recordDecision, countMatching,
+  getConcept, recordDecision, countMatching, ingestOwnFamilies,
 } from './db.js';
 
 const db = new Database(':memory:');
@@ -161,5 +161,53 @@ assert.throws(() => db.prepare(
   + " VALUES ('raw1', ?, 'reject', 't', '2026-09-21T00:00:00Z')"
 ).run(dupTarget.concept_id), /CHECK/);
 ok('DB制約でも不採用理由なしは弾かれる');
+
+// ── 自社/AMC商品 (=すでに採用した企画) ──
+// ⭐これが「過去から学ぶ」土台。同じテーマが候補に出てきたときに
+//   「自社で販売中」「前に出して撤退した」を判断材料として出せるようにする。
+const sample = listConcepts({ snapshotId: snap.snapshot_id, gate: 'all', status: 'all', limit: 2 }, db);
+const ownPayload = {
+  families: [
+    // 候補テーマと同じ (categoryPath, form) にすると concept_id が一致して紐づく
+    { familyKey: '既に売っている商品', categoryPath: sample[0].category_path, form: sample[0].form,
+      amcCapable: true, skuCount: 3, asinCount: 3, launchedOn: '2023-04-01', lastSoldOn: '2026-08-01',
+      qty180: 1200, qtyAll: 9000, activeSkus: 3, discontinuedSkus: 0, medianPrice: 880, outcome: 'active' },
+    { familyKey: '撤退した商品', categoryPath: sample[0].category_path, form: sample[0].form,
+      amcCapable: true, skuCount: 2, asinCount: 1, launchedOn: '2020-03-05', lastSoldOn: '2021-06-01',
+      qty180: 40, qtyAll: 120, activeSkus: 0, discontinuedSkus: 2, medianPrice: 700, outcome: 'withdrawn' },
+    // カテゴリが取れなかったファミリーも捨てずに持つ (後でカテゴリが付くかもしれない)
+    { familyKey: 'カテゴリ不明の商品', categoryPath: null, form: 'その他 (要判定)',
+      amcCapable: null, skuCount: 1, asinCount: 0, launchedOn: '2024-01-01', lastSoldOn: null,
+      qty180: null, qtyAll: 0, activeSkus: 1, discontinuedSkus: 0, medianPrice: 500, outcome: 'active' },
+  ],
+};
+const ownRes = ingestOwnFamilies(ownPayload, db);
+assert.strictEqual(ownRes.families, 3);
+assert.strictEqual(ownRes.placed, 2, 'カテゴリが取れた2件だけテーマに載る');
+ok('自社商品を取り込める (カテゴリ不明も捨てない)');
+
+ingestOwnFamilies(ownPayload, db);
+assert.strictEqual(db.prepare('SELECT COUNT(*) n FROM scout_own_families').get().n, 3,
+  '2回取り込んでも増えない');
+ok('自社商品の取り込みが冪等');
+
+const withOwn = listConcepts({ snapshotId: snap.snapshot_id, gate: 'all', status: 'all', limit: 500 }, db)
+  .find((c) => c.concept_id === sample[0].concept_id);
+assert.strictEqual(withOwn.own_count, 2, 'そのテーマに自社2ファミリーが紐づく');
+assert.strictEqual(withOwn.own_active, 1);
+assert.strictEqual(withOwn.own_withdrawn, 1, '撤退したものが負例として見える');
+assert.strictEqual(withOwn.own_qty180, 1240);
+ok('テーマに「自社で販売中 / 撤退済み」が出る');
+
+// 自社商品を紐づけても、テーマ側の件数は変わらない (JOINで行が増えていないこと)
+const afterOwn = countMatching({ snapshotId: snap.snapshot_id, gate: 'pass', status: 'all' }, db);
+assert.strictEqual(afterOwn, totalPass, '自社商品のJOINでテーマが重複していないこと');
+ok('自社商品を紐づけてもテーマ件数が増えない');
+
+// outcome の値域はDBで縛る (集計を壊さないため)
+assert.throws(() => db.prepare(
+  "INSERT INTO scout_own_families (family_key, outcome, updated_at) VALUES ('x','maybe','t')"
+).run(), /CHECK/);
+ok('outcome は active/withdrawn/shrinking のみ');
 
 console.log(`\n${passed} 件すべて通りました`);
