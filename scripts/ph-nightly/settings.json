@@ -41,6 +41,7 @@
       "Bash(npm *)",
       "Bash(npx *)",
       "Bash(icacls *)",
+      "Bash(takeown *)",
       "Bash(attrib *)",
       "Bash(schtasks *)",
       "Bash(shutdown *)",
@@ -70,9 +71,9 @@
 
   "_notes": {
     "allow ./phq": "queue/claim(常に1件)/block/release/submit/fetch/extract/find/lint/search-amazon。ファイル引数は work/ 直下の page-*.html / copy-*.json / reason-*.txt だけ",
-    "allow ./phreview": "Codex 検品。引数は draft ID だけ。プロンプト固定・_ph_review_<ID>.md 固定・timeout 600 秒",
+    "allow ./phreview": "Codex 検品。引数は draft ID だけ。プロンプト固定・_ph_review_<ID>.md 固定 (lstat で実体検査)・--sandbox read-only 固定・timeout 600 秒",
     "deny 一式": "deny は allow より強い。./phq と ./phreview 以外の実行経路を残さない。ACL が本命で、パス deny は二重化 (Windows パス記法の効き方は初回実行で確認)",
-    "Write/Edit": "生成物 (facts/copy/reason/_ph_review/page) を work/ 直下に書くために必要。bin/ と work/.claude は ACL + deny で書けない"
+    "Write/Edit": "生成物 (facts/copy/reason/_ph_review/page) を work/ 直下に書くために必要。bin/ と work/.claude (settings + スキルのコピー) は ACL + deny で書けない。タスクは RunLevel Limited なので昇格して ACL を外す経路も無い"
   },
 
   "env": {

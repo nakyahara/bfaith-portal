@@ -107,7 +107,7 @@ export const JOBS_REGISTRY = [
       + '裏取り→生成→copy_lint→Codex検品→書き戻し。生成できない draft は generation-block で人待ち (ボードに ⚠)。'
       + '成否は Claude の自己申告でなくサーバの queue で判定: 未処理 (claimable+leased) が 0 → ok / 減れば partial / 減らない・timeout → fail。'
       + 'Claude がシェルで実行できるのは固定機能 CLI ./phq と検品ラッパー ./phreview だけ (トークンは phq の中・Claude は見ない。bin/ と設定は ACL で書き換え不可)',
-    where: 'miniPC TaskScheduler [PhGenerateNightly] (scripts/ph-nightly/run-ph-generate.ps1、bfaith Interactive = ログオン中のみ)',
+    where: 'miniPC TaskScheduler [PhGenerateNightly] (scripts/ph-nightly/run-ph-generate.ps1、bfaith Interactive = ログオン中のみ・RunLevel Limited)',
     schedule: '毎日 02:30 (claimable が 0 の夜も claude auth status を検査して ok を打つ = 認証切れを静かな週に見逃さない)',
     anchor_hour_jst: 2,
     anchor_minute_jst: 30,

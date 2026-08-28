@@ -5,7 +5,8 @@
  * なぜあるか (Codex R1/R2 critical, 2026-08-28): Claude Code に curl/node/python を許可すると deny は迂回でき、
  * スキルがトークンを読ませていた。そこで **Claude にはこの CLI (と phreview) だけを許可し、トークンはこの中でしか扱わない**。
  *   - HTTP の相手は service-api 固定 (Base URL・メソッド・パスをここで決める)。任意 URL への POST はできない
- *   - fetch は GET のみ・本文なし・DNS 解決後のアドレスが private/loopback/link-local なら拒否・8MB 上限
+ *   - fetch は GET のみ・本文なし・DNS の A レコードが全部グローバル IPv4 でなければ拒否し、**その IP に接続を固定**
+ *     (検査と接続の間で解決結果が変わる DNS rebinding を潰す。IPv6 は使わない)・8MB 上限
  *   - **ファイル引数は作業ディレクトリ直下の決まった名前だけ** (page-*.html / copy-*.json / reason-*.txt)。
  *     パス区切りを含む名前・symlink は拒否 → トークンや .env をこの CLI 経由で読ませない (R2 critical 1)
  *   - claim は常に 1 件 (lease 30 分に収める)
@@ -28,6 +29,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import dns from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -114,61 +117,90 @@ async function api(method, p, body, { retries = 4 } = {}) {
   return last;
 }
 
-// ── fetch: GET のみ・DNS 解決後のアドレスで内部ネットワーク拒否・サイズ上限 ───────
-function isPrivateIp(ip) {
-  if (ip.includes(':')) { // IPv6: loopback / link-local / unique-local / v4-mapped
-    const v = ip.toLowerCase();
-    if (v === '::1' || v === '::' || v.startsWith('fe80:') || v.startsWith('fc') || v.startsWith('fd')) return true;
-    const m = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(v); return m ? isPrivateIp(m[1]) : false;
-  }
-  const [a, b] = ip.split('.').map(Number);
-  return a === 10 || a === 127 || a === 0 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31)
-    || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+// ── fetch: GET のみ・**検査済み IPv4 に接続を固定** (DNS rebinding 対策)・サイズ上限 ─────
+// IPv4 だけを許す判定 (Codex R3 high 3 / R4 medium): IANA Special-Purpose Address Registry の全レンジを CIDR で拒否
+const NON_GLOBAL_V4 = [
+  '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12',
+  '192.0.0.0/24', '192.0.2.0/24', '192.31.196.0/24', '192.52.193.0/24', '192.88.99.0/24', '192.168.0.0/16',
+  '192.175.48.0/24', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24', '224.0.0.0/4', '240.0.0.0/4',
+].map((c) => { const [ip, bits] = c.split('/'); return { base: ipv4ToInt(ip), mask: bits === '0' ? 0 : (~0 << (32 - Number(bits))) >>> 0 }; });
+function ipv4ToInt(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip); if (!m) return null;
+  const p = m.slice(1).map(Number); if (p.some((x) => x > 255)) return null;
+  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
 }
-async function assertPublicHttpUrl(u) {
+function isGlobalIpv4(ip) {
+  const n = ipv4ToInt(ip); if (n === null) return false;
+  return !NON_GLOBAL_V4.some((r) => ((n & r.mask) >>> 0) === r.base);
+}
+/** URL を検証し、接続に使う IPv4 を決める。ホスト名は DNS の A レコード全部がグローバルでなければ拒否 */
+async function resolvePublic(u) {
   let url;
   try { url = new URL(u); } catch { die(`invalid URL: ${u}`); }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') die(`only http(s) is allowed: ${u}`);
-  const h = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const h = url.hostname.toLowerCase();
+  if (h.startsWith('[') || h.includes(':')) die(`IPv6 targets are not allowed: ${h}`);
   if (h === 'localhost' || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.localhost')) die(`blocked host: ${h}`);
   let addrs;
-  if (/^[\d.]+$/.test(h) || h.includes(':')) addrs = [{ address: h }];
+  if (/^[\d.]+$/.test(h)) addrs = [h];
   else {
-    try { addrs = await dns.lookup(h, { all: true }); } catch { die(`DNS lookup failed: ${h}`); }
+    // OS リゾルバ (getaddrinfo)。dns.resolve4 (c-ares 直接) は社内ネットワークで失敗することがある
+    try { addrs = (await dns.lookup(h, { all: true, family: 4 })).map((a) => a.address); } catch { die(`DNS lookup (A) failed: ${h}`); }
   }
-  if (addrs.length === 0 || addrs.some((a) => isPrivateIp(a.address))) die(`blocked address for host ${h}`);
-  return url;
+  if (addrs.length === 0 || !addrs.every(isGlobalIpv4)) die(`blocked address for host ${h}`);
+  return { url, ip: addrs[0] };
 }
-async function readCapped(res, max) {
-  const cl = Number(res.headers.get('content-length') || 0);
-  if (cl > max) throw new Error(`response too large (${cl}B > ${max}B)`);
-  const chunks = []; let total = 0;
-  for await (const chunk of res.body) {
-    total += chunk.length;
-    if (total > max) throw new Error(`response too large (> ${max}B)`);
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
+/** 1 回の GET。接続先は resolvePublic が返した IP に固定 (lookup を差し替え)、Host/SNI は元のホスト名のまま */
+function getOnce(url, ip) {
+  return new Promise((resolve, reject) => {
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.request(url, {
+      method: 'GET',
+      headers: { 'User-Agent': UA, 'Accept-Language': 'ja-JP,ja;q=0.9', Accept: 'text/html,*/*;q=0.8', Connection: 'close' },
+      // 接続先を検査済み IP に固定。Node 22+ の net は all:true で配列 [{address,family}] を期待する
+      lookup: (_host, opts, cb) => (opts && opts.all ? cb(null, [{ address: ip, family: 4 }]) : cb(null, ip, 4)),
+      timeout: 45_000,
+    }, (res) => {
+      const cl = Number(res.headers['content-length'] || 0);
+      if (cl > FETCH_MAX_BYTES) { res.destroy(); return reject(new Error(`response too large (${cl}B > ${FETCH_MAX_BYTES}B)`)); }
+      const chunks = []; let total = 0;
+      res.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > FETCH_MAX_BYTES) { res.destroy(); return reject(new Error(`response too large (> ${FETCH_MAX_BYTES}B)`)); }
+        chunks.push(chunk);
+      });
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end();
+  });
 }
 async function fetchToFile(u, outName) {
   const outFile = workFile(outName, 'page', { mustExist: false });
-  let url = await assertPublicHttpUrl(u);
+  let { url, ip } = await resolvePublic(u);
   let res;
   for (let hop = 0; hop < 6; hop++) {
-    res = await fetch(url, {
-      method: 'GET', redirect: 'manual',
-      headers: { 'User-Agent': UA, 'Accept-Language': 'ja-JP,ja;q=0.9', Accept: 'text/html,*/*;q=0.8' },
-      signal: AbortSignal.timeout(45_000),
-    });
-    if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
-      url = await assertPublicHttpUrl(new URL(res.headers.get('location'), url).toString());
+    res = await getOnce(url, ip);
+    if (res.status >= 300 && res.status < 400 && res.headers.location) {
+      ({ url, ip } = await resolvePublic(new URL(res.headers.location, url).toString()));
       continue;
     }
     break;
   }
-  const buf = await readCapped(res, FETCH_MAX_BYTES);
-  fs.writeFileSync(outFile, buf);
-  return { ok: res.ok, status: res.status, final_url: url.toString(), bytes: buf.length, file: path.basename(outFile) };
+  fs.writeFileSync(outFile, res.body);
+  const ok = res.status >= 200 && res.status < 300;
+  return { ok, status: res.status, final_url: url.toString(), bytes: res.body.length, file: path.basename(outFile) };
+}
+/** phreview 用: レビューファイルが作業ディレクトリ直下の実体ファイルか (bash の -f は symlink をたどる) */
+function cmdCheckReview(pos) {
+  const id = pos[0]; if (!/^\d{1,9}$/.test(id || '')) die('usage: checkreview ID');
+  const name = `_ph_review_${id}.md`;
+  const cwd = fs.realpathSync(process.cwd());
+  let st = null; try { st = fs.lstatSync(path.join(cwd, name)); } catch { st = null; }
+  if (!st || !st.isFile()) die(`${name} is missing or not a regular file`);
+  out({ ok: true, file: name, bytes: st.size });
 }
 async function cmdFetch(pos, opt) {
   if (!pos[0] || !opt.out) die('usage: fetch URL --out page-ID.html');
@@ -287,6 +319,6 @@ function cmdLint(pos) {
 
 const { pos, opt } = parseArgs(process.argv.slice(2));
 const cmd = pos.shift();
-const table = { queue: cmdQueue, claim: cmdClaim, block: cmdBlock, release: cmdRelease, submit: cmdSubmit, fetch: cmdFetch, extract: cmdExtract, find: cmdFind, lint: cmdLint, 'search-amazon': cmdSearchAmazon };
+const table = { queue: cmdQueue, claim: cmdClaim, block: cmdBlock, release: cmdRelease, submit: cmdSubmit, fetch: cmdFetch, extract: cmdExtract, find: cmdFind, lint: cmdLint, 'search-amazon': cmdSearchAmazon, checkreview: cmdCheckReview };
 if (!cmd || !table[cmd]) die(`usage: phq <${Object.keys(table).join('|')}> ...`);
 Promise.resolve(table[cmd](pos, opt)).catch((e) => { process.stderr.write(`phq: ${String(e.message || e)}\n`); fail(1); });

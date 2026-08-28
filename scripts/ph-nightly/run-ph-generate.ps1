@@ -18,10 +18,10 @@ $ErrorActionPreference = 'Continue'
 
 $Root       = 'C:\tools\ph-nightly'
 $WorkDir    = Join-Path $Root 'work'      # Claude's cwd (generated files); code lives in bin\ (write-denied)
-# Repo = the checkout this script lives in (production clone, or a worktree when testing an unmerged branch)
-$Repo       = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+# This script runs from its protected copy in bin\ (install.ps1 puts ping.ps1 next to it). The repo checkout is
+# never executed by the task, so a writable worktree cannot become a persistence path (Codex R4 high 2).
 $Claude     = Join-Path $env:APPDATA 'npm\claude.cmd'
-$PingPs1    = Join-Path $Repo 'scripts\jobs-monitor\ping.ps1'
+$PingPs1    = Join-Path $PSScriptRoot 'ping.ps1'
 $TokenFile  = Join-Path $env:USERPROFILE '.claude\secrets\ph-service-token.txt'
 $Base       = 'https://bfaith-portal.onrender.com/apps/product-hub/service-api'
 $TimeoutMin = 100     # 1 draft per claim, ~6-8 min each incl. Codex review; up to 15 drafts per night
@@ -38,7 +38,7 @@ $script:pingFailed = $false
 function Log([string]$msg) {
   $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $msg
   Write-Output $line
-  Add-Content -Path $RunLog -Value $line
+  Add-Content -Path $RunLog -Value $line -Encoding UTF8   # PS 5.1 default would be ANSI (Codex R3)
 }
 function Send-Ping([string]$status, [string]$note) {
   # note goes through cmd-style argument parsing: strip quotes / control chars, cap length (Codex R2 medium 9)
