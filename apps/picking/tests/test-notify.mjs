@@ -10,6 +10,7 @@ process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'picking-test-'));
 delete process.env.PICKING_LINE_CHANNEL_TOKEN;
 delete process.env.PICKING_LINE_TO;
 delete process.env.PICKING_ALERT_WEBHOOK;
+delete process.env.PICKING_SHORTAGE_LINE;
 // 他ロケ在庫の warehouse 連携は未設定状態を既定にする (既存テストの通知本文・fetch回数を変えない)
 delete process.env.WAREHOUSE_URL;
 delete process.env.WAREHOUSE_SERVICE_TOKEN;
@@ -87,8 +88,24 @@ globalThis.fetch = async (url, opts) => {
 }
 
 {
-  // LINE broadcast (PICKING_LINE_TO 無し)
+  // 既定 (PICKING_SHORTAGE_LINE 未設定) はトークンがあってもLINEへ送らない (無料枠対策)
   process.env.PICKING_LINE_CHANNEL_TOKEN = 'test-token';
+  calls.length = 0;
+  const r = await notifyShortage(INFO);
+  assert.equal(r, 'disabled', 'GChat未設定+LINE既定OFFは disabled');
+  assert.equal(calls.length, 0);
+  process.env.PICKING_ALERT_WEBHOOK = 'https://chat.example/webhook';
+  calls.length = 0;
+  const r2 = await notifyShortage(INFO);
+  assert.equal(r2, 'sent');
+  assert.deepEqual(calls.map((c) => c.url), ['https://chat.example/webhook'], 'GChatのみに送る');
+  delete process.env.PICKING_ALERT_WEBHOOK;
+  console.log('  ok: 既定はLINEに送らない (トークンがあってもGChatのみ) (async)');
+}
+
+{
+  // LINE broadcast (PICKING_SHORTAGE_LINE=on・PICKING_LINE_TO 無し)
+  process.env.PICKING_SHORTAGE_LINE = 'on';
   calls.length = 0;
   const r = await notifyShortage(INFO);
   assert.equal(r, 'sent');
@@ -458,4 +475,4 @@ globalThis.fetch = async (url, opts) => {
   console.log('  ok: 欠品通知本文に他ロケ在庫が載る / warehouse停止でも通知は出る (async)');
 }
 
-console.log(`\ntest-notify: ${passed + 12} 件 pass`);
+console.log(`\ntest-notify: ${passed + 13} 件 pass`);

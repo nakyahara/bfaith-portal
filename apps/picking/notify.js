@@ -1,17 +1,20 @@
 /**
- * 欠品の即時通知 (要件§5.6 確定 2026-08-11 → 2026-08-13 中原さん要望で LINE を第一候補に)。
+ * 欠品の即時通知 (要件§5.6 確定 2026-08-11 → 2026-08-13 LINE第一候補 → 2026-08-24 GChatへ戻す)。
  *
- * 送信先 (設定されているものへ送る。両方あれば両方):
- *   - LINE: env PICKING_LINE_CHANNEL_TOKEN (LINE公式アカウントの Messaging API
- *     チャネルアクセストークン)。⚠ LINE Notify は2025-03終了のため Messaging API を使う。
+ * 送信先:
+ *   - Google Chat: env PICKING_ALERT_WEBHOOK。これが正 (2026-08-24 中原さん決定)。
+ *     LINEのpushはグループ人数×欠品件数で無料枠 (月200通) を消費するため欠品通知には使わない
+ *   - LINE: env PICKING_SHORTAGE_LINE=on を明示した場合のみ送る (既定OFF。
+ *     有料プラン移行や枠に余裕がある月に env だけで復帰できるよう経路は残す)。
+ *     PICKING_LINE_CHANNEL_TOKEN (Messaging APIチャネルアクセストークン) と、
  *     env PICKING_LINE_TO (カンマ区切りの userId/groupId) があれば push、
- *     無ければ broadcast (公式アカウントを友だち追加した全員に届く。社内専用アカウント前提)
- *   - 土日祝 (JST) は env PICKING_LINE_TO_HOLIDAY があればそちらへ送る
- *     (2026-08-15 中原さん要望: 休日は別の休日専用LINEグループに通知)。
- *     未設定の土日祝は平日と同じ PICKING_LINE_TO へ (通知が消えるより誤配のほうがまし)
- *   - Google Chat: env PICKING_ALERT_WEBHOOK (旧経路。互換のため残す)
+ *     無ければ broadcast (友だち全員に届き人数分課金されるので社内専用アカウント前提)。
+ *     土日祝 (JST) は env PICKING_LINE_TO_HOLIDAY があればそちらへ
+ *     (2026-08-15 中原さん要望。未設定の土日祝は平日と同じ宛先へフォールバック)
+ *   ※ PICKING_LINE_CHANNEL_TOKEN 自体は在庫検索ボット (line-search.js・reply=無料) が
+ *     使い続けるので、欠品通知を止めてもトークンは消さないこと
  *
- * - どちらも未設定なら何もしない (導入前でも動く)
+ * - どの経路も未設定なら何もしない (導入前でも動く)
  * - fail-soft: 通知失敗でピッキング作業は止めない (呼び出し側は fire-and-forget)
  * - 在庫修正・出荷保留の後続対応は通知を受けた管理者が行う (システムは記録と通知まで)
  */
@@ -109,10 +112,15 @@ async function postJson(url, headers, body) {
   }
 }
 
+/** 欠品通知のLINE送信を使うか。無料枠対策で既定OFF (PICKING_SHORTAGE_LINE=on で復帰)。 */
+export function lineShortageEnabled() {
+  return process.env.PICKING_SHORTAGE_LINE === 'on' && Boolean(process.env.PICKING_LINE_CHANNEL_TOKEN);
+}
+
 /** LINE Messaging API へ送信。宛先指定 (push) か全友だち (broadcast)。 */
 async function sendLine(text, now = new Date()) {
+  if (!lineShortageEnabled()) return false;
   const token = process.env.PICKING_LINE_CHANNEL_TOKEN;
-  if (!token) return false;
   const headers = { Authorization: `Bearer ${token}` };
   const messages = [{ type: 'text', text }];
   const { to } = resolveLineTo(now);
@@ -139,7 +147,7 @@ async function sendGChat(text) {
  * @returns {'disabled'|'sent'} 全経路失敗は throw (呼び出し側が warn ログ)
  */
 export async function notifyShortage(info, now = new Date()) {
-  if (!process.env.PICKING_LINE_CHANNEL_TOKEN && !process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
+  if (!lineShortageEnabled() && !process.env.PICKING_ALERT_WEBHOOK) return 'disabled';
   // 同一SKUの他ロケ在庫 (ロジザード毎時スナップショット) を warehouse から取る。
   // fail-soft: 取得・整形のどんな失敗でも通知本体は止めない (想定外レスポンス形状で
   // 整形が throw しても「取得できず」に落とす)。呼び出し側は fire-and-forget なので待ってよい。
