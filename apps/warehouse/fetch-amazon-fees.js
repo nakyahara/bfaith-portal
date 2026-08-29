@@ -28,6 +28,7 @@
 import 'dotenv/config';
 import SellingPartner from 'amazon-sp-api';
 import { initDB, getDB } from './db.js';
+import { refreshThresholdHours } from './fee-cache-policy.js';
 
 let spClient = null;
 
@@ -51,7 +52,9 @@ const MARKETPLACE_ID = process.env.SP_API_MARKETPLACE_ID || 'A1VC38T7YXB528';
 const BATCH_SIZE = 20;                   // SP-API getMyFeesEstimates の batch 上限
 const BATCH_SLEEP_MS = 2100;             // restore_rate=2 (0.5 RPS) + 100ms 余裕
 const MAX_RETRIES = 3;
-const TTL_HOURS = 7 * 24;                // キャッシュ有効期限 (Codex Round 1 #4: 整数切捨を避けるため hour 単位、7日 = 168時間)
+// 手数料キャッシュの鮮度ポリシー (REFRESH/STALE 閾値・ジッター) は fee-cache-policy.js に集約。
+// refresh 閾値は SKU 毎にジッター付き 96〜144h (基準120h)、監視 (monitor-fee-coverage.js) の
+// stale 閾値 168h より必ず手前 → 監視が赤くなる前に日次更新が先に走る (2026-05-22 境界レース事故の根治)。
 const PRICE_DIFF_THRESHOLD = 0.20;       // 価格乖離 20% 超で refresh
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -152,7 +155,7 @@ function getSpecificSku(db, sku) {
  * 対象 SKU から「実際に SP-API call が必要なもの」だけ抽出。
  * refresh 条件 (どれか 1 つでも該当):
  *   1. キャッシュ無し (新規 SKU)
- *   2. fetched_at > TTL_DAYS (デフォルト 7日)
+ *   2. fetched_at の経過時間 >= refreshThresholdHours(sku) (SKU毎ジッター 96〜144h、監視 168h の手前。fee-cache-policy.js)
  *   3. asin が変わった
  *   4. fulfillment_channel が変わった
  *   5. price_used と最新価格の乖離 > PRICE_DIFF_THRESHOLD (デフォルト 20%)
@@ -178,7 +181,7 @@ function filterByTTLAndDiff(db, items) {
       needRefresh.push(item);
       continue;
     }
-    if (cache.age_hours >= TTL_HOURS) {
+    if (cache.age_hours >= refreshThresholdHours(item.seller_sku)) {
       item.refresh_reason = `ttl_${cache.age_hours.toFixed(1)}h`;
       needRefresh.push(item);
       continue;
