@@ -3601,9 +3601,9 @@ router.get('/', (req, res) => {
     ? `<div class="warn">⚠️ 売れているのに推奨保有月数が未設定で要発注判定ができない商品が ${ruleStats.holdMonthsMissing}件あります (<a href="/apps/purchase-orders/products">全商品情報</a> の「⚠️ 推奨保有月数 未設定」で確認 → NEで設定)</div>`
     : '';
   const ruleNote = (ruleStats.rule === 'v1'
-    ? `<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫0・注残0 の売れ筋 ${ruleStats.addedCount}件 (推奨額 ¥${ruleStats.addedAmount.toLocaleString('ja-JP')}) は要発注に出ません (設定 target_rule)</div>`
+    ? `<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫+注残が0以下の売れ筋 ${ruleStats.addedCount}件 (推奨額 ¥${ruleStats.addedAmount.toLocaleString('ja-JP')}) は要発注に出ません (設定 target_rule)</div>`
     : (ruleStats.addedCount
-      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫0・注残0 で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b></span></div>`
+      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫+注残が0以下 (在庫切れ) で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b></span></div>`
       : '')) + hmmNote;
   // 発注サイクルの経過表示: ✅発注確定済み・×非表示はデータ更新ボタンまで保持される。長く放置したら注意を出す
   let cycleNote = '';
