@@ -615,8 +615,12 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(Number(req.params.id), Number(req.body.slip_seq));
       try {
+        // 出荷伝票NO (SP…) = ヤマトB2の お客様管理番号。元の送り状を消すのに要る
+        const slipNo = getDB().prepare(
+          'SELECT slip_no FROM pk_pack_slips WHERE batch_id=? AND seq=?'
+        ).get(row.batch_id, row.slip_seq)?.slip_no ?? null;
         const sent = await notifyShipChange({
-          folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+          folderName: row.folder_name, neSlipNo: row.ne_slip_no, slipNo,
           currentMethod: row.current_method, proposedMethod: row.proposed_method,
           reason: row.reason, worker, lines,
         });

@@ -652,7 +652,9 @@
     // 完了済みの閲覧 (前へ) は読まずに止め、対象へ戻ったら読み直す
     function maybeSpeak() {
       if (!('speechSynthesis' in window)) return;
-      const isTarget = !doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode) && !paused;
+      // ⭐ボタンの出し分けと同じ判定を使う (canCompleteSeq)。別々に書くと、
+      //   「ボタンは閲覧なのに読み上げは梱包対象」というズレが起きる (Codex 2026-08-30)
+      const isTarget = canCompleteSeq(viewSeq) && !paused;
       if (isTarget && viewSeq !== lastSpokenSeq) {
         lastSpokenSeq = viewSeq;
         speakSlip(bySeq.get(viewSeq));
@@ -1854,7 +1856,8 @@
         && $('doneOverlay').style.display !== 'flex' && $('workerOverlay').style.display !== 'flex';
       if (working) {
         // 表示中の梱包対象が変わったら伝票タイマーをリセット
-        const target = (!doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode)) ? viewSeq : null;
+        // 閲覧中の伝票でタイマーを進めない (作業時間が実態とズレる)。判定はボタンと共通
+        const target = canCompleteSeq(viewSeq) ? viewSeq : null;
         if (target !== timerSeq) { timerSeq = target; slipSec = 0; }
         if (target != null) slipSec++;
         batchSec++;
