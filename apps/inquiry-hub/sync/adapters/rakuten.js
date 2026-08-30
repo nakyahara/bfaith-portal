@@ -33,6 +33,56 @@ const PAGE_LIMIT = 50;
 const MAX_RANGE_DAYS = 30;                 // 1クエリの最大期間 (API上限31日の安全側)
 const DEFAULT_MAX_PAGES = 60;              // スライスあたり60ページ=3,000件。超過は契約想定外として全体失敗させる
 
+/** 401/403 に添える「次に何をすればいいか」。楽天の licenseKey は90日で失効する */
+const AUTH_HINT = ' ← 楽天のライセンスキー失効の可能性 (RMSで再発行 → miniPCの.env RAKUTEN_LICENSE_KEY → Restart-Service WarehouseServer)';
+
+/**
+ * 楽天/passthrough のエラー本文から「人が読める1行」を作る (エクスポートはテスト用)。
+ *
+ * 本文をそのまま出すと問い合わせ本文や個人情報が混ざるので **構造化フィールドだけ** を拾う。
+ * 形が4通りあり、特に **認証エラー (401) は errors[] 形式** で返る。これを拾えていなかったため
+ * 2026-08-30 のライセンスキー失効時に画面へ「HTTP 401: {}」としか出ず、原因が分からなかった:
+ *   RMS 共通エラー  : { errors: [{ code: 'GA0001', message: 'Un-Authorised' }] }
+ *   RMS (別系統)    : { error: { code, message, targets } }
+ *   RMS 受注API系   : { MessageModelList: [{ messageType: 'ERROR', messageCode, message }] }
+ *   passthrough失敗 : { ok: false, error: 'RMS_API_ERROR', message }
+ *
+ * @param {string|object|null} body レスポンス本文 (文字列 or パース済み)
+ * @param {number|null} status HTTPステータス (401/403 なら復旧手順を添える)
+ */
+export function describeRakutenError(body, status = null) {
+  const hint = (status === 401 || status === 403) ? AUTH_HINT : '';
+  let data = body;
+  if (typeof body === 'string' || body == null) {
+    const t = String(body ?? '').trim();
+    if (!t) return `(エラー詳細なし)${hint}`;
+    try { data = JSON.parse(t); } catch { return `${t.slice(0, 120)}${hint}`; }
+  }
+  if (data == null || typeof data !== 'object') return `(エラー詳細なし)${hint}`;
+
+  let code = null, message = null, targets;
+  const errs = Array.isArray(data.errors) ? data.errors.filter(e => e && typeof e === 'object') : null;
+  const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
+  if (errs && errs.length > 0) {
+    const e = errs[0];
+    code = typeof e.code === 'string' ? e.code : null;
+    message = typeof e.message === 'string' ? e.message : null;
+  } else if (list && list.length > 0) {
+    const e = list.find(m => m && m.messageType === 'ERROR') || list[0];
+    code = e && typeof e.messageCode === 'string' ? e.messageCode : null;
+    message = e && typeof e.message === 'string' ? e.message : null;
+  } else {
+    code = data?.error?.code ?? (typeof data.error === 'string' ? data.error : null);
+    message = data?.error?.message ?? (typeof data.message === 'string' ? data.message : null);
+    targets = data?.error?.targets;
+  }
+  const head = [
+    [code, message].filter(v => typeof v === 'string' && v).join(': '),
+    targets ? `targets=${JSON.stringify(targets).slice(0, 80)}` : '',
+  ].filter(Boolean).join(' ');
+  return `${(head || '(エラー詳細なし)').slice(0, 220)}${hint}`;
+}
+
 /** UTCのISO/エポックms → 楽天APIが解釈するJST naive文字列 'yyyy-MM-ddTHH:mm:ss' */
 export function toJstNaive(input) {
   const ms = typeof input === 'number' ? input : Date.parse(input);
@@ -176,18 +226,8 @@ export function createRakutenAdapter(cfg = {}) {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
   // エラー本文は構造化フィールドだけをログに残す (問い合わせ本文等の露出防止。Codex R1)。
-  // RMS直: {error:{code,message,targets}} / warehouse passthrough失敗: {ok,error,message} の両形に対応
-  const errorHead = async res => {
-    const text = await res.text().catch(() => '');
-    try {
-      const j = JSON.parse(text);
-      return JSON.stringify({
-        code: j?.error?.code ?? (typeof j?.error === 'string' ? j.error : undefined),
-        message: j?.error?.message ?? j?.message,
-        targets: j?.error?.targets,
-      }).slice(0, 300);
-    } catch { return text.slice(0, 120); }
-  };
+  // 形の違いと 401 の復旧ヒントは describeRakutenError に集約
+  const errorHead = async res => describeRakutenError(await res.text().catch(() => ''), res.status);
 
   async function getListPage(fromDate, toDate, page) {
     const url = `${listUrlBase}?fromDate=${encodeURIComponent(fromDate)}&toDate=${encodeURIComponent(toDate)}&limit=${PAGE_LIMIT}&page=${page}`;
@@ -327,11 +367,9 @@ export function createRakutenAdapter(cfg = {}) {
       let data = null;
       try { data = JSON.parse(text); } catch { /* 非JSONはdata=nullのまま */ }
       if (res.status >= 400 && res.status < 500) {
-        // 4xx = 受理されなかった (未送信確定)。エラー本文は構造化フィールドのみ (本文露出防止)
-        throw new SendRejectedError(`楽天返信が拒否されました (HTTP ${res.status}): ${JSON.stringify({
-          code: data?.error?.code ?? (typeof data?.error === 'string' ? data.error : undefined),
-          message: data?.error?.message ?? data?.message,
-        }).slice(0, 300)}`);
+        // 4xx = 受理されなかった (未送信確定)。エラー本文は構造化フィールドのみ (本文露出防止)。
+        // 401 は errors[] 形式で来るので describeRakutenError で拾う (旧実装は '{}' としか出せなかった)
+        throw new SendRejectedError(`楽天返信が拒否されました (HTTP ${res.status}): ${describeRakutenError(data ?? text, res.status)}`);
       }
       if (res.status >= 500) throw new Error(`楽天返信送信 HTTP ${res.status} — 結果不明`);
       // 成功。ReplyResult の返信IDの形は実返信テストで確定させる (無ければ outbox が op:<operation_id> を使う)

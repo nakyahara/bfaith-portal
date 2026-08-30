@@ -1244,6 +1244,15 @@ async function main() {
   const yahooTokenAlert = runScript('apps/warehouse/notify-yahoo-token-expiry.js', 'Yahooトークン期限アラート', 120000);
   results.push({ name: 'Yahooトークン期限アラート', ...yahooTokenAlert });
 
+  // ─── 楽天RMS ライセンスキー期限アラート (残り14日から毎日1通) ───
+  // licenseKey は90日で失効し、切れると楽天API が全部 401 になる (受注取込・未発送アラート・
+  // 問い合わせ返信・クーポン・価格改定・出品まで一斉停止)。2026-08-30 に実際に発生したため、
+  // 期限を API (license-management) で読んで切れる前に声をかける。
+  // Yahoo版と同じ規約: 1日1通の抑止は script 側 (rakuten_license_notify_state)、
+  // 通知失敗でも exit 0 (daily-sync 全体を落とさない)、RETRYABLE_JOBS には入れない
+  const rakutenLicenseAlert = runScript('apps/warehouse/notify-rakuten-license-expiry.js', '楽天ライセンス期限アラート', 120000);
+  results.push({ name: '楽天ライセンス期限アラート', ...rakutenLicenseAlert });
+
   // ─── 楽天 未発送アラート (出荷漏れの通知) ───
   // 前日12:00 (出荷の締め) までに入金確認できていたのに、まだ発送されていない注文を GChat へ。
   // ・warehouse.db を見ず RMS API を直接読むので、他ステップの成否に影響されない

@@ -192,3 +192,54 @@ async function doRakutenRequest({
 
   throw lastError || new Error('Rakuten request failed after retries');
 }
+
+/**
+ * RMS のエラーレスポンス本文から code / message を取り出す (ログ・画面表示用)。
+ *
+ * RMS は API 系統ごとに形が違う。**認証エラー (401) は errors[] 形式**で返るので、
+ * これを拾えないと「HTTP 401: {}」としか出ず原因が分からない (2026-08-30 の
+ * ライセンスキー失効で実際に起きた):
+ *   - 共通エラー   : { errors: [{ code: 'GA0001', message: 'Un-Authorised' }] }
+ *   - 受注API系    : { MessageModelList: [{ messageType: 'ERROR', messageCode, message }] }
+ *   - その他       : { code, message } / { error, message }
+ * 本文をそのまま出すと注文者情報や問い合わせ本文が混ざるので、**構造化フィールドだけ**を拾う。
+ */
+export function describeRmsError(data) {
+  if (data == null) return { code: null, message: null };
+  if (typeof data === 'string') {
+    const t = data.trim();
+    return { code: null, message: t ? t.slice(0, 200) : null };
+  }
+  if (typeof data !== 'object') return { code: null, message: null };
+
+  const errs = Array.isArray(data.errors) ? data.errors.filter(e => e && typeof e === 'object') : null;
+  if (errs && errs.length > 0) {
+    const e = errs[0];
+    return {
+      code: typeof e.code === 'string' ? e.code : null,
+      message: typeof e.message === 'string' ? e.message : null,
+    };
+  }
+  const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
+  if (list && list.length > 0) {
+    const e = list.find(m => m && m.messageType === 'ERROR') || list[0];
+    return {
+      code: e && typeof e.messageCode === 'string' ? e.messageCode : null,
+      message: e && typeof e.message === 'string' ? e.message : null,
+    };
+  }
+  return {
+    code: typeof data.code === 'string' ? data.code : (typeof data.error === 'string' ? data.error : null),
+    message: typeof data.message === 'string' ? data.message : null,
+  };
+}
+
+/** describeRmsError の結果を ' (GA0001: Un-Authorised)' の形の接尾辞にする。何も取れなければ '' */
+export function rmsErrorSuffix(data) {
+  const { code, message } = describeRmsError(data);
+  if (!code && !message) return '';
+  return ` (${[code, message].filter(Boolean).join(': ').slice(0, 200)})`;
+}
+
+/** 401/403 のときに人が次に何をすればいいかを1行で添える (ライセンスキーは90日で失効する) */
+export const RMS_AUTH_HINT = ' ← ライセンスキー失効の可能性 (RMS で再発行 → miniPC .env の RAKUTEN_LICENSE_KEY → Restart-Service WarehouseServer)';
