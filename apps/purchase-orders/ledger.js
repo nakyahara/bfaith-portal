@@ -57,6 +57,7 @@ const SETTABLE_KEYS = new Set(['backorder_source', 'email_mode', 'email_dryrun_t
   'dashboard_hidden_suppliers', // ダッシュボード×非表示 {"cycle":<保存時のpo_cycle_reset_at>,"codes":[...]} — サイクルIDが変わると自動失効
   'email_issuer_name',   // 発注書CSVの「発行担当者」列
   'po_lz_mirror_suppress_capture', // 「CSV取込を解除」時のmirror世代 (この世代までは自動反映を復活させない)
+  'target_rule',         // 要発注判定ルール 'v2' (既定、不等式形) | 'v1' (旧式 0<L<=M へのロールバック)。logic.js targetRule()
   // P17 欠品リスクのしきい値 (数値範囲は下の SHORTAGE_SETTING_RULES で setSetting 自体が検証する)
   'shortage_w7', 'shortage_margin_days', 'shortage_unanswered_days', 'shortage_horizon_days', 'shortage_soon_days']);
 
@@ -79,6 +80,7 @@ export function setSetting(key, value, { actor = null, actorType = 'user', reaso
   validateActor(actorType);
   if (!SETTABLE_KEYS.has(key)) throw new Error(`設定キーが不正です (変更可能: ${[...SETTABLE_KEYS].join(', ')}): ${key}`);
   if (key === 'backorder_source' && value !== 'ne' && value !== 'app') throw new Error(`backorder_source は ne/app のみ: ${value}`);
+  if (key === 'target_rule' && value !== 'v1' && value !== 'v2') throw new Error(`target_rule は v1/v2 のみ: ${value}`);
   if (key === 'email_mode' && value !== 'dry_run' && value !== 'live') throw new Error(`email_mode は dry_run/live のみ: ${value}`);
   if (key === 'email_dryrun_to') {
     value = String(value).trim(); // 保存値もtrim (送信ヘッダに余分な空白を残さない)

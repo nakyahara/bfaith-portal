@@ -20,7 +20,7 @@ import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture } from './logic.js';
+import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture, targetRule } from './logic.js';
 import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
@@ -342,7 +342,8 @@ function productDto(p) {
   return {
     code: p.code, name: p.name, stock: p.stock, backOrder: p.backOrder,
     sales30: p.sales30, sales7: p.sales7, lot: p.lot, holdMonths: p.holdMonths,
-    stockMonths: Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
+    stockMonths: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
+    salesDefined: p.salesDefined, targetReason: p.targetReason, holdMonthsMissing: p.holdMonthsMissing,
     cost: p.cost, price: p.price, lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
     conditionId: p.conditionId, materialGroupId: p.materialGroupId,
     capacityPerUnit: p.capacityPerUnit, caseGroup: p.caseGroup || '', caseLot: p.caseLot || null,
@@ -801,6 +802,19 @@ router.patch('/api/shortage-risk/settings', (req, res) => {
     res.json({ ok: true, settings: shortageSettings(), defaults: SHORTAGE_DEFAULTS });
   }
   catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 要発注判定ルールの切替 (v2=既定の不等式形 / v1=旧式 0<L<=M へのロールバック)。運用者のロールバック口 (DB直接操作なしで戻せる)
+router.get('/api/target-rule', (req, res) => {
+  res.json({ ok: true, rule: targetRule() });
+});
+router.post('/api/target-rule', (req, res) => {
+  try {
+    const rule = req.body && req.body.rule;
+    if (rule !== 'v1' && rule !== 'v2') return res.status(400).json({ ok: false, error: 'rule は v1/v2 のみ' });
+    setSetting('target_rule', rule, { actor: actorOf(req), reason: rule === 'v1' ? '⚠️要発注判定を旧ルール(v1)へロールバック' : '要発注判定を v2 (不等式形) へ' });
+    res.json({ ok: true, rule: targetRule() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // NE発注残CSVの初期取込 (移行PO作成)。commit='1' 以外はプレビューのみ (書込なし)。
@@ -3556,12 +3570,13 @@ function freshnessText(pub, overlay) {
 router.get('/', (req, res) => {
   let data;
   try {
-    const { pub, overlay, bySupplier, products } = computeAll();
+    const { pub, overlay, bySupplier, products, ruleStats } = computeAll();
     const db = getDB();
     const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
     const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
     const cards = [];
     const others = [];
+    data = { ruleStats };
     for (const g of bySupplier.values()) {
       const ci = cycleIssued.get(g.code);
       const c = {
@@ -3576,10 +3591,20 @@ router.get('/', (req, res) => {
     others.sort((a, b) => b.productCount - a.productCount);
     const searchIndex = products.filter(p => p.active).map(p => ({ c: p.code, n: p.name, s: p.supplierCode }));
     const boSummary = listBackorders().summary;
-    data = { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes: readHiddenSuppliers(), cycleMarker: getSetting('po_cycle_reset_at') || '' };
+    data = { ...data, pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes: readHiddenSuppliers(), cycleMarker: getSetting('po_cycle_reset_at') || '' };
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
-  const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker } = data;
+  const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker, ruleStats } = data;
+  // 判定ルール v2 (在庫0・注残0 の売れ筋を要発注に含める) で新たに載った件数。旧式との差分を運用者に見せる (Codex R2: 観測可能性)
+  // 差分通知と設定不備通知は別条件 (差分0件でも M 未設定は出す、Codex PR1-R1 Low)
+  const hmmNote = ruleStats.holdMonthsMissing
+    ? `<div class="warn">⚠️ 売れているのに推奨保有月数が未設定で要発注判定ができない商品が ${ruleStats.holdMonthsMissing}件あります (<a href="/apps/purchase-orders/products">全商品情報</a> の「⚠️ 推奨保有月数 未設定」で確認 → NEで設定)</div>`
+    : '';
+  const ruleNote = (ruleStats.rule === 'v1'
+    ? `<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫+注残が0以下の売れ筋 ${ruleStats.addedCount}件 (推奨額 ¥${ruleStats.addedAmount.toLocaleString('ja-JP')}) は要発注に出ません (設定 target_rule)</div>`
+    : (ruleStats.addedCount
+      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫+注残が0以下 (在庫切れ) で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b></span></div>`
+      : '')) + hmmNote;
   // 発注サイクルの経過表示: ✅発注確定済み・×非表示はデータ更新ボタンまで保持される。長く放置したら注意を出す
   let cycleNote = '';
   if (cycleMarker) {
@@ -3606,6 +3631,7 @@ router.get('/', (req, res) => {
     </a>`;
   const body = `
     ${stale ? '<div class="warn">⚠️ PMLデータが古い可能性があります (as_of=' + he(pub ? pub.as_of_date : 'なし') + ')。daily-sync の状態を確認してください。</div>' : ''}
+    ${ruleNote}
     <div class="toolbar">
       <input type="text" id="q" placeholder="商品コード / 商品名で検索 → 仕入先を探す" style="width:340px">
       <span class="muted">${freshNote}</span>
@@ -4982,9 +5008,9 @@ router.get('/products', (req, res) => {
     rows = r.products.map(p => ({
       c: p.code, n: p.name, s: p.supplierCode, a: p.active ? 1 : 0,
       st: p.stock, b: p.backOrder, s7: p.sales7, s30: p.sales30,
-      m: Math.round(p.stockMonths * 100) / 100, hm: p.holdMonths, lo: p.lot,
+      m: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, hm: p.holdMonths, lo: p.lot,
       co: p.cost, pr: p.price, lp: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
-      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0,
+      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0, hmm: p.holdMonthsMissing ? 1 : 0, sd: p.salesDefined ? 1 : 0,
     }));
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
@@ -5031,6 +5057,8 @@ var COLS = [
 function stateBadge(r) {
   if (!r.a) return '<span class="badge" style="background:#eceff3;color:#64748b">取扱中止</span>';
   if (r.t) return '<span class="badge b-warn">🔴 要発注</span>';
+  // 設定不備は掘り起こしより先に出す (v1 ロールバック中は両方 true になり得る、Codex PR1-R1 Medium)
+  if (r.hmm) return '<span class="badge b-warn" title="売れているのに推奨保有月数が未設定のため要発注判定ができない。NEで推奨保有月数を設定してください">⚠️ 推奨保有月数 未設定</span>';
   if (r.h) return '<span class="badge" style="background:#f4f4f5;color:#52525b">⚪ 掘り起こし</span>';
   return '<span class="badge b-issued">取扱中</span>';
 }
