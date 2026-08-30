@@ -128,6 +128,62 @@ console.log('\n── 楽天の文字列価格 (M0実測) ──');
   eq(toIntPrice(1000.5), null, '小数は null');
 }
 
+console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行にまとめる (2026-08-30 実機で判明) ──');
+{
+  // 実データと同じ形: ne_code=0726-001802-bk に対し al=360 / am=0726-001802-bk / w=0726-001802
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 100, 0.1, null);
+  for (const [rc, src] of [['360', 'al'], ['0726-001802-bk', 'am'], ['0726-001802', 'w']]) {
+    db.prepare('INSERT INTO mirror_rakuten_sku_map VALUES (?,?,?,?)').run(rc, '0726-001802-bk', src, 'now');
+  }
+  const { targets } = buildTargets(db, ['0726-001802-bk']);
+  const rak = targets[0].listings.filter((l) => l.mall === 'rakuten');
+  eq(rak.length, 1, '★別名3つでも楽天の行は1つ');
+  eq(rak[0].listingCode, '0726-001802', '表示は W (商品番号 = 管理番号)');
+  eq(rak[0].aliases.sort(), ['0726-001802', '0726-001802-bk', '360'], '別名は候補として保持');
+
+  // 実物と同じ 12 variant の商品。別名 360 / 0726-001802-BK のどちらでも同じ variant を指す
+  const variants = {};
+  const colors = ['BK', 'CL', 'WH', 'CM', 'DB', 'OW', 'BE', 'BG', 'GR'];
+  colors.forEach((c, i) => { variants[String(360 + i)] = { merchantDefinedSkuId: `0726-001802-${c}`, standardPrice: '577' }; });
+  for (const c of ['MG', 'BR', 'NV']) variants[`0726-001802-${c}`] = { merchantDefinedSkuId: `0726-001802-${c}`, standardPrice: '577' };
+
+  _resetCodeMapCache();
+  const deps = {
+    fetchAllItemCodes: async () => ({ '0726-001802': '0726-001802' }),
+    fetchItemDetailsBulkDetailed: async (mns) => ({
+      items: mns.includes('0726-001802')
+        ? [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: '合皮補修シート', variants }]
+        : [],
+      failed: [],
+    }),
+  };
+  const prices = await fetchRakutenPrices([{ key: rak[0].listingCode, aliases: rak[0].aliases }], deps);
+  const p = prices.get('0726-001802');
+  eq([p.found, p.price, p.skuCode, p.manageNumber], [true, 577, '360', '0726-001802'],
+    '★12SKU の中から別名で variant 360 を特定できる');
+
+  // 別名がどの variant にも当たらない場合は確定させない (取り違え防止)
+  _resetCodeMapCache();
+  const miss = await fetchRakutenPrices([{ key: 'zzz-999', aliases: ['zzz-999'] }], {
+    ...deps,
+    fetchAllItemCodes: async () => ({ 'zzz-999': '0726-001802' }),
+  });
+  eq(miss.get('zzz-999').found, false, '別名がどのSKUにも当たらなければ未確定');
+  ok(/[0-9]+ SKU/.test(miss.get('zzz-999').reason), '理由に SKU 数を書く: ' + miss.get('zzz-999').reason);
+}
+
+console.log('\n── 引き当てできないモールは行を消さず「未解決」で出す (要件 F1) ──');
+{
+  const { targets } = buildTargets(db, ['abc-002']);   // 楽天/Amazon の map を持たない商品
+  const malls = targets[0].listings.map((l) => l.mall).sort();
+  eq(malls, ['amazon', 'aupay', 'qoo10', 'rakuten', 'yahoo'], '5モールすべての行が出る');
+  const rak = targets[0].listings.find((l) => l.mall === 'rakuten');
+  eq(rak.confidence, 'unresolved', '楽天は未解決');
+  eq(rak.listingCode, null, '出品コードは空');
+  ok(rak.source.includes('出品が無いとは限りません'), '「未出品」と言い切らない');
+}
+
 console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ──');
 {
   _resetCodeMapCache();
@@ -141,7 +197,8 @@ console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ─
       failed: mns.filter((m) => m !== 'MN-ABC-001').map((m) => ({ manageNumber: m, reason: 'not found' })),
     }),
   };
-  const prices = await fetchRakutenPrices(['abc-001', 'ghost-001'], deps);
+  const prices = await fetchRakutenPrices(
+    [{ key: 'abc-001', aliases: ['abc-001'] }, { key: 'ghost-001', aliases: ['ghost-001'] }], deps);
   eq(prices.get('abc-001').price, 1000, '楽天のライブ価格が整数で取れる');
   eq(prices.get('abc-001').skuCode, 'sku-a', 'どの SKU かも分かる');
   eq(prices.get('ghost-001').found, false, '見つからない出品は found=false');

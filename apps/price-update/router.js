@@ -105,12 +105,14 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const { targets, unknownCodes } = buildTargets(db, codes, { costOverrides });
 
   // モールごとに問い合わせ対象をまとめる (1商品1回。行ごとに叩かない)
-  const rakutenCodes = [];
+  // 楽天は AM/AL/W の別名をまとめて渡す (同じ SKU の別名なので、どれか1つで manageNumber と
+  // variant を特定できる — 別名ごとに問い合わせると全部「見つかりません」になる)
+  const rakutenTargets = [];
   const yahooCodes = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
-      if (l.mall === 'rakuten') rakutenCodes.push(l.listingCode);
+      if (l.mall === 'rakuten') rakutenTargets.push({ key: l.listingCode, aliases: l.aliases || [l.listingCode] });
       else if (l.mall === 'yahoo') yahooCodes.push(l.listingCode);
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
@@ -119,9 +121,9 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const notices = [];
   let rakutenPrices = new Map();
   let yahooPrices = new Map();
-  if (rakutenCodes.length > 0) {
+  if (rakutenTargets.length > 0) {
     try {
-      rakutenPrices = await fetchRakutenPrices(rakutenCodes, deps);
+      rakutenPrices = await fetchRakutenPrices(rakutenTargets, deps);
     } catch (e) {
       notices.push(`楽天の設定価格を取得できませんでした: ${e.message}`);
     }
@@ -146,16 +148,22 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       let confidence = l.confidence;
       let note = null;
       let skuCode = l.skuCode;
+      let listingCode = l.listingCode;
       let url = listingUrl(l.mall, l.listingCode);
 
-      if (l.mall === 'rakuten') {
+      if (!l.listingCode) {
+        // 引き当てできなかったモール。「出品が無い」とは書かない (否定を証明できていないため)
+        note = 'このモールの出品コードを引き当てられませんでした';
+      } else if (l.mall === 'rakuten') {
         const p = rakutenPrices.get(key);
         if (p?.found) {
           price = p.price; priceSource = '楽天RMS (ライブ)'; priceIsLive = true;
           confidence = 'confirmed'; skuCode = p.skuCode;
-          if (p.manageNumber) url = listingUrl('rakuten', p.manageNumber);
+          // 表示は実際の商品管理番号に差し替える (別名のままだと楽天の画面で探せない)
+          if (p.manageNumber) { listingCode = p.manageNumber; url = listingUrl('rakuten', p.manageNumber); }
         } else {
           note = p?.reason || '設定価格を取得できませんでした';
+          if (p?.manageNumber) url = listingUrl('rakuten', p.manageNumber);
         }
       } else if (l.mall === 'yahoo') {
         const p = yahooPrices.get(key);
@@ -184,7 +192,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         rowKind: t.rowKind,
         viaCode: t.viaCode,
         mall: l.mall,
-        listingCode: l.listingCode,
+        listingCode,
         skuCode,
         confidence,
         resolveSource: l.source,
@@ -342,7 +350,9 @@ router.post('/api/runs', (req, res) => {
     if (p.createdBy !== actorOf(req)) throw validationError('他の人が作ったプレビューは操作できません');
 
     const evaluated = evaluateRows(p.rows);
-    const chosen = evaluated.filter((r) => r.selected || r.manual);
+    // 未解決行 (出品コードを引き当てられなかったモール) は自動では記録しない。
+    // 手動更新リストに「コード不明の行」が積み上がっても、チェックのしようがない
+    const chosen = evaluated.filter((r) => r.selected || (r.manual && r.confidence !== 'unresolved' && r.listingCode));
     if (chosen.length === 0) throw validationError('記録する行が選ばれていません');
 
     const note = String(req.body?.note || '').slice(0, 500) || null;

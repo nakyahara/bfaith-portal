@@ -67,71 +67,78 @@ export function _resetCodeMapCache() { _codeMap = null; _codeMapAt = 0; }
  *                                found:boolean, reason:string|null, itemTitle:string|null}>>}
  *   キーは listingCode の正規化キー
  */
-export async function fetchRakutenPrices(listingCodes, deps = {}) {
+export async function fetchRakutenPrices(targets, deps = {}) {
   const out = new Map();
-  const codes = [...new Set((listingCodes || []).map((c) => String(c || '').trim()).filter(Boolean))];
-  if (codes.length === 0) return out;
+  // targets = [{ key, aliases: [AM/AL/W の別名] }]。key は行を引くためのキー (= 表示中の出品コード)
+  const list = (targets || [])
+    .map((t) => ({
+      key: normCode(t.key),
+      aliases: [...new Set([t.key, ...(t.aliases || [])].map((a) => String(a || '').trim()).filter(Boolean))],
+    }))
+    .filter((t) => t.key);
+  if (list.length === 0) return out;
 
   const codeMap = await itemNumberToManageNumber(deps);
-  // listingCode → 問い合わせる manageNumber (対応表に無ければ「コード自体が管理番号」とみなす)
-  const wanted = new Map();
-  for (const c of codes) {
-    const mn = codeMap.get(normCode(c)) || c;
+  // 別名のどれかが itemNumber として対応表にあれば、それが manageNumber。
+  // 無ければ「別名自体が管理番号」の可能性を順に試す (単品はコード = 管理番号のことが多い)
+  const wanted = new Map();   // manageNumber → [target...]
+  for (const t of list) {
+    let mn = null;
+    for (const a of t.aliases) { const hit = codeMap.get(normCode(a)); if (hit) { mn = hit; break; } }
+    if (!mn) mn = t.aliases[0];
+    t.manageNumber = mn;
     if (!wanted.has(mn)) wanted.set(mn, []);
-    wanted.get(mn).push(c);
+    wanted.get(mn).push(t);
   }
 
   const fetchBulk = deps.fetchItemDetailsBulkDetailed || fetchItemDetailsBulkDetailed;
   const { items, failed } = await fetchBulk([...wanted.keys()]);
-  const failedByCode = new Map(failed.map((f) => [normCode(f.manageNumber), f.reason]));
+  const failedByCode = new Map((failed || []).map((f) => [normCode(f.manageNumber), f.reason]));
+  const itemByMn = new Map((items || []).map((it) => [normCode(it?.manageNumber), it]));
 
-  for (const item of items || []) {
-    const mn = item?.manageNumber || '';
-    const originals = wanted.get(mn) || wanted.get(String(mn)) || [];
-    const variants = item?.variants && typeof item.variants === 'object' ? item.variants : {};
-    for (const original of originals) {
-      const key = normCode(original);
-      // variant の特定: SKU管理番号 (variants のキー) か システム連携SKU番号 で一致する行
-      let matchedKey = null;
-      for (const [vk, v] of Object.entries(variants)) {
-        if (normCode(vk) === key || normCode(v?.merchantDefinedSkuId) === key) { matchedKey = vk; break; }
-      }
-      // 商品番号/管理番号で引いた場合は variant が1つだけなら確定できる。
-      // 複数 variant があるのに特定できない = SKU を取り違える危険があるので確定させない
-      if (!matchedKey) {
-        const vkeys = Object.keys(variants);
-        if (vkeys.length === 1) matchedKey = vkeys[0];
-      }
-      if (!matchedKey) {
-        out.set(key, {
-          price: null, manageNumber: mn, skuCode: null, found: false,
-          reason: Object.keys(variants).length === 0 ? 'SKU情報が取得できません' : 'どのSKUか特定できません (SKU管理番号で指定してください)',
-          itemTitle: item?.title || null,
-        });
-        continue;
-      }
-      const price = toIntPrice(variants[matchedKey]?.standardPrice);
-      out.set(key, {
-        price,
-        manageNumber: mn,
-        skuCode: matchedKey,
-        found: price != null,
-        reason: price == null ? '設定価格を整数円として読めません' : null,
-        itemTitle: item?.title || null,
-      });
-    }
-  }
-
-  for (const [mn, originals] of wanted) {
-    for (const original of originals) {
-      const key = normCode(original);
-      if (out.has(key)) continue;
-      out.set(key, {
-        price: null, manageNumber: mn, skuCode: null, found: false,
-        reason: failedByCode.get(normCode(mn)) || '楽天に見つかりません',
+  for (const t of list) {
+    const item = itemByMn.get(normCode(t.manageNumber));
+    if (!item) {
+      out.set(t.key, {
+        price: null, manageNumber: t.manageNumber, skuCode: null, found: false,
+        reason: failedByCode.get(normCode(t.manageNumber)) || '楽天に見つかりません',
         itemTitle: null,
       });
+      continue;
     }
+    const variants = item?.variants && typeof item.variants === 'object' ? item.variants : {};
+    const aliasKeys = new Set(t.aliases.map(normCode));
+    // variant の特定: SKU管理番号 (variants のキー) か システム連携SKU番号 が、別名のどれかと一致
+    const matched = [];
+    for (const [vk, v] of Object.entries(variants)) {
+      if (aliasKeys.has(normCode(vk)) || aliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
+    }
+    let matchedKey = matched.length === 1 ? matched[0] : null;
+    // 別名で特定できなくても、variant が 1 つだけの商品なら取り違えようがない
+    if (!matchedKey && matched.length === 0 && Object.keys(variants).length === 1) {
+      matchedKey = Object.keys(variants)[0];
+    }
+    if (!matchedKey) {
+      out.set(t.key, {
+        price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
+        reason: matched.length > 1
+          ? `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`
+          : (Object.keys(variants).length === 0
+            ? 'SKU情報が取得できません'
+            : `どのSKUか特定できません (この商品には ${Object.keys(variants).length} SKU あります)`),
+        itemTitle: item?.title || null,
+      });
+      continue;
+    }
+    const price = toIntPrice(variants[matchedKey]?.standardPrice);
+    out.set(t.key, {
+      price,
+      manageNumber: item.manageNumber || t.manageNumber,
+      skuCode: matchedKey,
+      found: price != null,
+      reason: price == null ? '設定価格を整数円として読めません' : null,
+      itemTitle: item?.title || null,
+    });
   }
   return out;
 }
@@ -190,7 +197,12 @@ export async function fetchYahooPrices(itemCodes, deps = {}) {
       }
       out.set(key, { price, subCodes, skuCode, found: price != null, reason, itemName: d?.Name || null });
     } catch (e) {
-      miss(e?.message || 'Yahooから取得できません');
+      // Yahoo は「その item_code の商品が無い」も 400 で返す。生の HTTP 400 を出しても読めないので、
+      // 「出品が見つからない」と分かる言葉にする (規則推定で当てた候補が外れた時にここへ来る)
+      const msg = String(e?.message || '');
+      miss(/HTTP 400\b/.test(msg)
+        ? `Yahoo にこの出品コードの商品が見つかりません (${c})`
+        : (msg || 'Yahooから取得できません'));
     }
   }
   return out;

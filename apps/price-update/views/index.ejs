@@ -13,8 +13,14 @@
   table.pu tr.blocked td { color: #64748b; }
   .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .price-in { width: 96px; text-align: right; }
-  .cost-in { width: 96px; text-align: right; }
+  /* ★セレクタは input.〜 にする: 共通ヘッダの `input[type=number] { width:100% }` は
+     属性セレクタぶん詳細度が高く、`.price-in` だけだと負けて全幅になり、
+     商品名の列が1文字幅まで潰れる (2026-08-30 の画面崩れ) */
+  input.price-in { width: 96px; text-align: right; }
+  input.cost-in { width: 110px; text-align: right; flex: 0 0 auto; }
+  .cost-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 110px 110px; gap: 10px;
+              align-items: center; margin-bottom: 6px; }
+  .cost-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
   .c-confirmed { background: #dcfce7; color: #166534; }
   .c-rule { background: #fef3c7; color: #92400e; }
@@ -176,10 +182,10 @@
     $('cost-card').classList.remove('hidden');
     $('cost-list').innerHTML = codes.map((c) => {
       const row = rows.find((r) => r.neCode === c);
-      return '<div style="display:flex; gap:10px; align-items:center; margin-bottom:6px;">'
-        + '<span class="code" style="min-width:140px;">' + esc(c) + '</span>'
-        + '<span class="pu-note" style="flex:1;">' + esc(row.productName || '') + '</span>'
-        + '<span class="pu-note">現 ' + yen(row.cost) + ' 円</span>'
+      return '<div class="cost-row">'
+        + '<span class="code">' + esc(c) + '</span>'
+        + '<span class="pu-note nm" title="' + esc(row.productName || '') + '">' + esc(row.productName || '') + '</span>'
+        + '<span class="pu-note" style="text-align:right;">現 ' + yen(row.cost) + ' 円</span>'
         + '<input type="number" class="cost-in" data-code="' + esc(c) + '" min="0" step="1" placeholder="新原価">'
         + '</div>';
     }).join('');
