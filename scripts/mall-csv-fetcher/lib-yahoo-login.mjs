@@ -15,6 +15,7 @@
  */
 
 import { chromium } from 'playwright';
+import { assertNotSystemAccount, isSystemAccount } from './lib-browser-profile-guard.mjs';
 import { config as loadEnv } from 'dotenv';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -37,27 +38,14 @@ loadEnv({ path: join(__dirname, '.env') });
   }
 }
 
+export { isSystemAccount }; // 後方互換 (テストが lib-yahoo-login から読む)
+
 export const PROFILE_DIR = join(__dirname, '.profile-yahoo');
 export const STORE_ACCOUNT = (process.env.YAHOO_STORE_ACCOUNT || 'b-faith01').trim();
 export const STORE_TOP_URL = `https://pro.store.yahoo.co.jp/pro.${STORE_ACCOUNT}`;
 
 export function safeHost(url) {
   try { return new URL(url).hostname; } catch { return ''; }
-}
-
-/**
- * 実行アカウントが LocalSystem かを判定する (Windows)。
- * SYSTEM は %USERPROFILE% が C:\Windows\system32\config\systemprofile、
- * %USERNAME% が <COMPUTERNAME>$ になる。どちらかが当てはまれば SYSTEM とみなす。
- * @param env テスト用の注入点
- */
-export function isSystemAccount(env = process.env) {
-  const profile = String(env.USERPROFILE || '').replace(/\//g, '\\').toLowerCase();
-  if (profile.includes('\\config\\systemprofile')) return true;
-  const user = String(env.USERNAME || '').toLowerCase();
-  const host = String(env.COMPUTERNAME || '').toLowerCase();
-  if (user === 'system') return true;
-  return !!host && user === `${host}$`;
 }
 
 /**
@@ -70,11 +58,7 @@ export function isSystemAccount(env = process.env) {
  * ガードをここ (ライブラリ) に置いてあるのは、タスクからでも手動実行でも必ず通る唯一の場所だから。
  */
 export async function openYahooContext() {
-  if (isSystemAccount()) {
-    throw new Error('SYSTEM_ACCOUNT: SYSTEM 権限では Yahoo の永続プロファイルを開けません '
-      + '(開くとログインセッションが壊れ、miniPC の画面で 2FA 再ログインが必要になります)。'
-      + 'このジョブは bfaith (Interactive) で実行してください');
-  }
+  assertNotSystemAccount('Yahoo');
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: process.env.HEADLESS === '1',
     slowMo: process.env.HEADLESS === '1' ? 0 : 150,
