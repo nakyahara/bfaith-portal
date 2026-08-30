@@ -12,6 +12,7 @@
  */
 
 import { chromium } from 'playwright';
+import { assertNotSystemAccount } from './lib-browser-profile-guard.mjs';
 import { config as loadEnv } from 'dotenv';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +62,7 @@ export function assertLoginEnv() {
 }
 
 export async function openContext() {
+  assertNotSystemAccount('楽天RMS'); // 2026-08-28 の事故: SYSTEM で開くとセッションが壊れる
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: HEADLESS === '1',
     slowMo: HEADLESS === '1' ? 0 : 150,
@@ -216,7 +218,7 @@ async function runLogin(page) {
 const MAINMENU_URL = 'https://mainmenu.rms.rakuten.co.jp/rms';
 
 /** 本当にRMSにログインできているか (システムエラー/再ログイン誘導/ログインフォームを弾く) */
-async function looksLoggedIn(page) {
+export async function looksLoggedIn(page) {
   const url = page.url();
   if (/system_error/i.test(url)) return false;
   const host = safeHost(url);

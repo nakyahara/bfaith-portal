@@ -13,6 +13,7 @@
  */
 
 import { chromium } from 'playwright';
+import { assertNotSystemAccount } from './lib-browser-profile-guard.mjs';
 import { config as loadEnv } from 'dotenv';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -54,6 +55,7 @@ export function assertLoginEnv() {
 }
 
 export async function openAupayContext() {
+  assertNotSystemAccount('auPAY'); // 2026-08-28 の事故: SYSTEM で開くとセッションが壊れる
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: process.env.HEADLESS === '1',
     slowMo: process.env.HEADLESS === '1' ? 0 : 150,
