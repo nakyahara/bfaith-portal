@@ -153,7 +153,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
 
       if (!l.listingCode) {
         // 引き当てできなかったモール。「出品が無い」とは書かない (否定を証明できていないため)
-        note = 'このモールの出品コードを引き当てられませんでした';
+        note = 'このモールの出品コードが見つかりませんでした';
       } else if (l.mall === 'rakuten') {
         const p = rakutenPrices.get(key);
         if (p?.found) {
@@ -316,7 +316,7 @@ router.post('/api/preview', (req, res) => {
   try {
     sweepPreviews();
     const p = previews.get(String(req.body?.previewId || ''));
-    if (!p) throw validationError('プレビューの有効期限が切れました。もう一度引き当てからやり直してください');
+    if (!p) throw validationError('プレビューの有効期限が切れました。もう一度検索からやり直してください');
     if (p.createdBy !== actorOf(req)) throw validationError('他の人が作ったプレビューは操作できません');
     const inputs = new Map();
     for (const row of Array.isArray(req.body?.rows) ? req.body.rows : []) {
@@ -346,7 +346,7 @@ router.post('/api/runs', (req, res) => {
     sweepPreviews();
     const db = getDB();
     const p = previews.get(String(req.body?.previewId || ''));
-    if (!p) throw validationError('プレビューの有効期限が切れました。もう一度引き当てからやり直してください');
+    if (!p) throw validationError('プレビューの有効期限が切れました。もう一度検索からやり直してください');
     if (p.createdBy !== actorOf(req)) throw validationError('他の人が作ったプレビューは操作できません');
 
     const evaluated = evaluateRows(p.rows);

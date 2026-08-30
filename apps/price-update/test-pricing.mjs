@@ -75,8 +75,8 @@ console.log('\n── 更新対象外のモール ──');
 
 console.log('\n── 引き当て・現在価格が確定していない行 ──');
 {
-  has(evaluateRow({ ...base, confidence: 'rule' }).blocks, '引き当てが確定していない', '規則推定は更新不可');
-  has(evaluateRow({ ...base, confidence: 'sales' }).blocks, '引き当てが確定していない', '実績のみは更新不可');
+  has(evaluateRow({ ...base, confidence: 'rule' }).blocks, '出品が確認できていない', '規則推定は更新不可');
+  has(evaluateRow({ ...base, confidence: 'sales' }).blocks, '出品が確認できていない', '実績のみは更新不可');
   has(evaluateRow({ ...base, currentPrice: null }).blocks, '現在の設定価格を取得できていない', 'ライブ価格なしは更新不可');
   // 現在価格が 0 だと変更率が計算できず、−30%〜+100% の判定が丸ごと飛んでしまう
   const zeroNow = evaluateRow({ ...base, currentPrice: 0, newPrice: 99999 });

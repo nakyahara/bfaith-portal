@@ -857,7 +857,7 @@ const apps = [
   {
     id: 'price-update',
     name: '価格一括改定',
-    description: '値上げ時に各モールの売価を1画面で改定。出品の引き当て・現在価格・利益プレビュー (M1 は読み取り専用・モールへは書き込まない)',
+    description: '値上げ時に各モールの売価を1画面で改定。出品の検索・現在価格・利益プレビュー (M1 は読み取り専用・モールへは書き込まない)',
     icon: '💴',
     path: '/apps/price-update',
     status: 'active',

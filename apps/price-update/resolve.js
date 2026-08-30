@@ -214,7 +214,7 @@ export function resolveListings(db, code) {
       listingCode: null,
       skuCode: null,
       confidence: 'unresolved',
-      source: '引き当てできませんでした (出品が無いとは限りません)',
+      source: '出品コードが見つかりませんでした (出品が無いとは限りません)',
     });
   }
   return out;
