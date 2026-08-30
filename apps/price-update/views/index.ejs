@@ -13,8 +13,14 @@
   table.pu tr.blocked td { color: #64748b; }
   .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
   .num { text-align: right; font-variant-numeric: tabular-nums; }
-  .price-in { width: 96px; text-align: right; }
-  .cost-in { width: 96px; text-align: right; }
+  /* ★セレクタは input.〜 にする: 共通ヘッダの `input[type=number] { width:100% }` は
+     属性セレクタぶん詳細度が高く、`.price-in` だけだと負けて全幅になり、
+     商品名の列が1文字幅まで潰れる (2026-08-30 の画面崩れ) */
+  input.price-in { width: 96px; text-align: right; }
+  input.cost-in { width: 110px; text-align: right; flex: 0 0 auto; }
+  .cost-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 110px 110px; gap: 10px;
+              align-items: center; margin-bottom: 6px; }
+  .cost-row .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
   .c-confirmed { background: #dcfce7; color: #166534; }
   .c-rule { background: #fef3c7; color: #92400e; }
@@ -37,7 +43,7 @@
 </div>
 <div class="wrap">
   <div class="banner-warn">
-    <span>📖 <strong>いまは読み取り専用版 (M1)</strong> です。モールへの書き込みは行いません。引き当て・現在価格・利益の確認と、手動更新チェックリストの記録までができます。楽天への自動更新は次の段階 (M2) で開放します。</span>
+    <span>📖 <strong>いまは読み取り専用版 (M1)</strong> です。モールへの書き込みは行いません。出品の検索・現在価格・利益の確認と、手動更新チェックリストの記録までができます。楽天への自動更新は次の段階 (M2) で開放します。</span>
   </div>
 
   <div class="card">
@@ -45,9 +51,9 @@
     <div class="pu-input">
       <div style="flex:1; min-width:320px;">
         <textarea id="codes" placeholder="abc-001&#10;abc-002&#10;(改行・カンマ・空白区切り。最大 <%= limits.maxNeCodes %> コード)"></textarea>
-        <div class="pu-note">入力した単品と、それを構成に含むセット商品の出品をまとめて引き当てます (セット行は初期状態では未選択)。</div>
+        <div class="pu-note">入力した単品と、それを構成に含むセット商品の出品をまとめて探します (セット行は初期状態では未選択)。</div>
       </div>
-      <button class="btn btn-primary" id="resolve-btn" type="button">引き当てる</button>
+      <button class="btn btn-primary" id="resolve-btn" type="button">出品を検索</button>
     </div>
     <div id="resolve-msg" class="pu-note" style="margin-top:8px;"></div>
   </div>
@@ -56,7 +62,7 @@
     <h2>2. 新しい原価 (税抜) — 値上げ連絡があった分だけ</h2>
     <div id="cost-list"></div>
     <div class="pu-note">入力すると、その商品を含むセットの原価も構成から再計算します。空欄なら現在の原価 (m_products.原価) を使います。</div>
-    <button class="btn btn-sm" id="recost-btn" type="button" style="margin-top:8px;">新原価で引き当て直す</button>
+    <button class="btn btn-sm" id="recost-btn" type="button" style="margin-top:8px;">新原価で計算し直す</button>
   </div>
 
   <div class="card hidden" id="rows-card">
@@ -66,7 +72,7 @@
         <thead>
           <tr>
             <th style="width:28px;"></th>
-            <th>モール</th><th>商品</th><th>出品コード / SKU</th><th>引き当て</th>
+            <th>モール</th><th>商品</th><th>出品コード / SKU</th><th>出品の確認</th>
             <th class="num">現在価格</th><th class="num">原価(税抜)</th>
             <th class="num">新売価</th><th class="num">変更</th><th class="num">概算粗利</th>
             <th>判定</th><th></th>
@@ -149,7 +155,7 @@
 
   async function doResolve() {
     const codes = $('codes').value;
-    $('resolve-msg').textContent = '引き当て中… (モールAPIに問い合わせるので数十秒かかることがあります)';
+    $('resolve-msg').textContent = '検索中… (モールAPIに問い合わせるので数十秒かかることがあります)';
     $('resolve-btn').disabled = true;
     try {
       const r = await api('/apps/price-update/api/resolve', { codes, costOverrides: costOverridesFromForm() });
@@ -176,10 +182,10 @@
     $('cost-card').classList.remove('hidden');
     $('cost-list').innerHTML = codes.map((c) => {
       const row = rows.find((r) => r.neCode === c);
-      return '<div style="display:flex; gap:10px; align-items:center; margin-bottom:6px;">'
-        + '<span class="code" style="min-width:140px;">' + esc(c) + '</span>'
-        + '<span class="pu-note" style="flex:1;">' + esc(row.productName || '') + '</span>'
-        + '<span class="pu-note">現 ' + yen(row.cost) + ' 円</span>'
+      return '<div class="cost-row">'
+        + '<span class="code">' + esc(c) + '</span>'
+        + '<span class="pu-note nm" title="' + esc(row.productName || '') + '">' + esc(row.productName || '') + '</span>'
+        + '<span class="pu-note" style="text-align:right;">現 ' + yen(row.cost) + ' 円</span>'
         + '<input type="number" class="cost-in" data-code="' + esc(c) + '" min="0" step="1" placeholder="新原価">'
         + '</div>';
     }).join('');

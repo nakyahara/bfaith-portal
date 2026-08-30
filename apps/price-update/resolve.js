@@ -92,19 +92,36 @@ export function setCostOf(db, setCode, costOverrides = new Map()) {
   return { cost: missing.length > 0 ? null : total, missing, components };
 }
 
-/** 楽天: mirror_rakuten_sku_map (AM/AL/W の逆引き)。rakuten_code は小文字で入っている */
+/**
+ * 楽天: mirror_rakuten_sku_map (AM/AL/W の逆引き)。
+ *
+ * ★AM/AL/W は「別々の出品」ではなく **同じ 1 SKU の別名** (2026-08-30 実機で確認):
+ *   AM = merchantDefinedSkuId (システム連携用SKU番号) / AL = variants のキー (SKU管理番号) /
+ *   W  = itemNumber (商品番号。これが manageNumber になる)
+ *   例) ne_code=0726-001802-bk → AL=360 / AM=0726-001802-bk / W=0726-001802 で、
+ *       実体は「manageNumber=0726-001802 の variant 360」1つだけ。
+ *
+ * ここで別名ごとに行を作ると、同じ SKU が 3 行に見えるうえ、AL/AM は manageNumber として
+ * 引けないので全部「見つかりません」になる。→ **1 SKU = 1 行**にまとめ、別名は候補として持つ。
+ * どの manageNumber / variant かの確定は live-price.js が API で行う。
+ */
 function resolveRakuten(db, code) {
   const rows = db.prepare(`
     SELECT rakuten_code AS listingCode, source
       FROM mirror_rakuten_sku_map WHERE LOWER(TRIM(ne_code)) = ? ORDER BY source, rakuten_code
   `).all(normCode(code));
-  return rows.map((r) => ({
+  if (rows.length === 0) return [];
+  const aliases = rows.map((r) => r.listingCode);
+  // 表示は W (商品番号 = manageNumber) を優先。無ければ最初の別名 (ライブ取得後に実際の管理番号へ差し替わる)
+  const w = rows.find((r) => r.source === 'w');
+  return [{
     mall: 'rakuten',
-    listingCode: r.listingCode,
+    listingCode: w ? w.listingCode : aliases[0],
+    aliases,
     skuCode: null,
     confidence: 'rule',
-    source: `mirror_rakuten_sku_map(${r.source})`,
-  }));
+    source: `mirror_rakuten_sku_map(${rows.map((r) => r.source).join('/')})`,
+  }];
 }
 
 /** Yahoo: mirror_yahoo_sku_map (手動map) + 「出品コード = NEコード」規則 */
@@ -173,15 +190,34 @@ export const MALLS = ['rakuten', 'yahoo', 'amazon', 'aupay', 'qoo10'];
 /** API で価格を更新できる (予定の) モール。M1 は読むだけ */
 export const UPDATABLE_MALLS = ['rakuten', 'yahoo'];
 
-/** 1 NEコードの全モール出品候補 */
+/**
+ * 1 NEコードの全モール出品候補。
+ *
+ * ★候補が1つも無いモールは行を消さず「未解決」として出す (要件 F1)。
+ *   行が消えると「そのモールには出品していない」と読めてしまうが、それを言い切れるのは
+ *   全出品カタログと照合して否定できた時だけ。引き当てられなかっただけなら、そう表示する。
+ */
 export function resolveListings(db, code) {
-  return [
-    ...resolveRakuten(db, code),
-    ...resolveYahoo(db, code),
-    ...resolveAmazon(db, code),
-    ...resolveAupay(db, code),
-    ...resolveQoo10(db, code),
-  ];
+  const byMall = {
+    rakuten: resolveRakuten(db, code),
+    yahoo: resolveYahoo(db, code),
+    amazon: resolveAmazon(db, code),
+    aupay: resolveAupay(db, code),
+    qoo10: resolveQoo10(db, code),
+  };
+  const out = [];
+  for (const mall of MALLS) {
+    const found = byMall[mall] || [];
+    if (found.length > 0) { out.push(...found); continue; }
+    out.push({
+      mall,
+      listingCode: null,
+      skuCode: null,
+      confidence: 'unresolved',
+      source: '出品コードが見つかりませんでした (出品が無いとは限りません)',
+    });
+  }
+  return out;
 }
 
 /** 商品ページ / 管理画面の URL (要件 F5) */

@@ -109,7 +109,7 @@ export function evaluateRow(row) {
   if (mall === 'amazon') blocks.push('Amazon は本ツールの更新対象外です (既存の価格管理の仕組みを使ってください)');
   if (mall === 'aupay' || mall === 'qoo10') blocks.push('このモールは手動更新です (API更新は Phase 2)');
 
-  if (row.confidence !== 'confirmed') blocks.push('引き当てが確定していない行は更新できません');
+  if (row.confidence !== 'confirmed') blocks.push('出品が確認できていない行は更新できません');
   if (current == null) {
     blocks.push('現在の設定価格を取得できていない行は更新できません');
   } else if (!isValidPrice(current)) {
