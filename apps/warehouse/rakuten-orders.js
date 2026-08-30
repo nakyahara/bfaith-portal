@@ -17,7 +17,7 @@
  */
 import 'dotenv/config';
 import { initDB, getDB, updateSyncMeta } from './db.js';
-import { rakutenRequest } from './rakuten-client.js';
+import { rakutenRequest, rmsErrorSuffix, RMS_AUTH_HINT } from './rakuten-client.js';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -38,7 +38,10 @@ async function callRMS(endpoint, body) {
   });
 
   if (result.status < 200 || result.status >= 300) {
-    throw new Error(`RMS API ${endpoint} HTTP ${result.status}`);
+    // エラー本文は構造化フィールドだけを付ける (個人情報を混ぜない)。
+    // 401/403 は原因がほぼライセンスキー失効なので次の一手も添える
+    const hint = (result.status === 401 || result.status === 403) ? RMS_AUTH_HINT : '';
+    throw new Error(`RMS API ${endpoint} HTTP ${result.status}${rmsErrorSuffix(result.data)}${hint}`);
   }
 
   const data = result.data;
@@ -255,7 +258,8 @@ async function main() {
   // 認証チェック (helper でも throw されるが、起動時の早期エラーとして残す)
   if (!process.env.RAKUTEN_SERVICE_SECRET || !process.env.RAKUTEN_LICENSE_KEY) {
     console.error('[楽天] 環境変数が不足: RAKUTEN_SERVICE_SECRET, RAKUTEN_LICENSE_KEY');
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   await initDB();
@@ -429,5 +433,8 @@ async function fetchChunkWithSplit(startDate, endDate, chunkNum, totalChunks) {
 
 main().catch(e => {
   console.error('[楽天] エラー:', e.message);
-  process.exit(1);
+  // process.exit() は使わない: fetch 直後の即 exit は Windows node で libuv abort
+  // (Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)) を踏み、終了コードが
+  // 3221226505 になって呼び出し側 (daily-sync) がエラー内容を読めなくなる (2026-08-30 の 401 で発生)
+  process.exitCode = 1;
 });

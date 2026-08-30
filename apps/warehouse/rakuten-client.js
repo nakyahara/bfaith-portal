@@ -192,3 +192,46 @@ async function doRakutenRequest({
 
   throw lastError || new Error('Rakuten request failed after retries');
 }
+
+/**
+ * RMS のエラーレスポンス本文から code / message を取り出す (ログ・画面表示用)。
+ *
+ * RMS は API 系統ごとに形が違う。**認証エラー (401) は errors[] 形式**で返るので、
+ * これを拾えないと「HTTP 401: {}」としか出ず原因が分からない (2026-08-30 の
+ * ライセンスキー失効で実際に起きた):
+ *   - 共通エラー   : { errors: [{ code: 'GA0001', message: 'Un-Authorised' }] }
+ *   - 受注API系    : { MessageModelList: [{ messageType: 'ERROR', messageCode, message }] }
+ *   - その他       : { code, message } / { error, message }
+ * 本文をそのまま出すと注文者情報や問い合わせ本文が混ざるので、**構造化フィールドだけ**を拾う。
+ */
+/** 表示に載せる文字列の掃除: 制御文字・改行を潰す (ログ1行を壊さない / 端末エスケープを渡さない) */
+const cleanRmsText = v => (typeof v === 'string' ? v.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim() || null : null);
+
+export function describeRmsError(data) {
+  if (data == null) return { code: null, message: null };
+  if (typeof data === 'string') return { code: null, message: cleanRmsText(data.slice(0, 200)) };
+  if (typeof data !== 'object') return { code: null, message: null };
+
+  // find (filter ではなく) — 巨大配列を全走査しない
+  const err0 = Array.isArray(data.errors) ? data.errors.find(e => e && typeof e === 'object') : null;
+  if (err0) return { code: cleanRmsText(err0.code), message: cleanRmsText(err0.message) };
+
+  const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
+  if (list && list.length > 0) {
+    const e = list.find(m => m && m.messageType === 'ERROR') || list[0];
+    return { code: cleanRmsText(e?.messageCode), message: cleanRmsText(e?.message) };
+  }
+  return {
+    code: cleanRmsText(data.code) ?? cleanRmsText(data.error),
+    message: cleanRmsText(data.message),
+  };
+}
+/** describeRmsError の結果を ' (GA0001: Un-Authorised)' の形の接尾辞にする。何も取れなければ '' */
+export function rmsErrorSuffix(data) {
+  const { code, message } = describeRmsError(data);
+  if (!code && !message) return '';
+  return ` (${[code, message].filter(Boolean).join(': ').slice(0, 200)})`;
+}
+
+/** 401/403 のときに人が次に何をすればいいかを1行で添える (ライセンスキーは90日で失効する) */
+export const RMS_AUTH_HINT = ' ← ライセンスキー失効の可能性 (RMS で再発行 → miniPC .env の RAKUTEN_LICENSE_KEY → Restart-Service WarehouseServer)';

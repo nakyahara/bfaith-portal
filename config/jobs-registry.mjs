@@ -261,7 +261,9 @@ export const JOBS_REGISTRY = [
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
       + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'
-      + '「Yahooトークン期限アラート」(refresh token 残り5日から毎日1通、GChatボットの「yahoo再認可」へ誘導) も走る',
+      + '「Yahooトークン期限アラート」(refresh token 残り5日から毎日1通、GChatボットの「yahoo再認可」へ誘導)、'
+      + '「楽天ライセンス期限アラート」(licenseKey は90日で失効。残り14日から毎日1通。'
+      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,
