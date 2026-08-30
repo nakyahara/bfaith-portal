@@ -595,11 +595,27 @@ router.get('/inquiries/:id', (req, res) => {
       return names.length ? ` <span class="sub" title="${he(names.join(' / '))}">📎${names.length}件</span>` : '';
     } catch { return ''; }
   };
+  // 送信ジョブの本文は**全文**を残す。2026-08-30 の楽天401 (ライセンスキー失効) で送信が失敗したとき、
+  // 履歴には先頭60文字しか出ておらず「何を送ろうとしたか」が画面から分からなかった (中原さん要望)。
+  // 返信欄が空いていれば (未決着ジョブが無ければ) そのまま書き戻して送り直せる
+  const canRestoreBody = replyEditorEnabled() && !activeJob;
+  const jobBody = (o) => {
+    const body = String(o.body_text || '');
+    if (!body) return '';
+    let attNames = [];
+    try { attNames = JSON.parse(o.attachments_json || '[]').map(a => a.name).filter(Boolean); } catch { /* 壊れていても本文は見せる */ }
+    return `<details class="job-body">
+      <summary class="sub">${he(body.slice(0, 60))}${body.length > 60 ? '…' : ''} <span class="job-body-more">▼全文</span></summary>
+      <div class="job-body-full">${he(body)}</div>
+      ${attNames.length ? `<div class="sub">📎 ${he(attNames.join(' / '))} — <b>添付は付け直してください</b> (送信済みの実体は保持していません)</div>` : ''}
+      ${canRestoreBody ? '<button class="ghost job-restore" type="button">↩ この内容を返信欄に戻す</button>' : ''}
+    </details>`;
+  };
   const outboxHtml = outboxJobs.length ? `
     <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
     ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>${jobAtts(o)}
-      <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span>
-      ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 200))}</div>` : ''}</div>`).join('')}` : '';
+      ${jobBody(o)}
+      ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 500))}</div>` : ''}</div>`).join('')}` : '';
   // 📎 送信用添付: 未紐付け分 (ページ再読み込みしてもアップロード済みが消えないよう復元する)
   const pendingAtts = (replyEditorEnabled() && ['email', 'rakuten'].includes(inq.channel_type) && !activeJob)
     ? listPendingAttachments(inq.id) : [];
@@ -920,6 +936,20 @@ router.get('/inquiries/:id', (req, res) => {
     ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
     ta.focus();
     toast('AI返信案をコピーしました。内容を確認・編集してから送信してください');
+  });
+  // 送信ジョブ履歴の本文 → 返信欄へ戻す (送信失敗した返信をそのまま作り直せるように)。
+  // 本文は DOM のテキストから取る (属性に埋め込まないので長文でも安全)
+  Array.prototype.forEach.call(document.querySelectorAll('.job-restore'), function(btn) {
+    btn.addEventListener('click', function() {
+      var full = btn.parentElement && btn.parentElement.querySelector('.job-body-full');
+      var ta = document.getElementById('replyBody');
+      if (!full || !ta) { toast('返信フォームが使えません (未決着の送信ジョブを解決してください)'); return; }
+      if (ta.value.trim() && !confirm('返信欄の内容を、この送信ジョブの本文で置き換えますか?')) return;
+      ta.value = full.textContent;
+      ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      ta.focus();
+      toast('本文を返信欄に戻しました。添付があった場合は付け直してください');
+    });
   });
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
   var mrBtn = document.getElementById('mrBtn');
@@ -4426,6 +4456,15 @@ figure.att-img.att-err .att-fail { display: block; }
 /* カテゴリ見出し (optgroup) は太字・テンプレートは1段下げて、一目で区別がつくように */
 .tpl-row #tplSel optgroup { font-weight: 700; font-style: normal; color: #0f172a; }
 .tpl-row #tplSel option { font-weight: 400; padding-left: 1.2em; }
+/* 送信ジョブ履歴: 送ろうとした本文の全文 (失敗したときに何を書いたか読めるように) */
+.job-body summary { cursor: pointer; list-style: none; }
+.job-body summary::-webkit-details-marker { display: none; }
+.job-body .job-body-more { color: #4f46e5; margin-left: 4px; white-space: nowrap; }
+.job-body[open] .job-body-more { visibility: hidden; }
+.job-body-full { white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc;
+  border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; margin: 6px 0;
+  font-size: 13px; max-height: 340px; overflow-y: auto; }
+.job-restore { margin-bottom: 4px; }
 /* AI書き換えボタン行 */
 .rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .rw-row .rw-btn { margin: 0; }
