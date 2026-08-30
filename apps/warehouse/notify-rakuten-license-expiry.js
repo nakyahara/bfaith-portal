@@ -93,6 +93,8 @@ if (process.exitCode !== 2) {
   /**
    * 「その kind をその JST 日に送る権利」を原子的に取る (SELECT→送信→UPDATE だと
    * daily-sync の retry・手動実行の同時起動で二重送信になる)。取れたら true。
+   * 抑止の単位は **kind ごとに1日1通**。状況が変わった (expiring → expired 等) ときは
+   * その日でも1通届く — 悪化を黙って飲み込まないための意図的な設計
    */
   const claimTodaySlot = (kind, today, expiry) => db.transaction(() => {
     const prev = db.prepare('SELECT last_sent_day FROM rakuten_license_notify_state WHERE kind = ?').get(kind);
@@ -104,10 +106,17 @@ if (process.exitCode !== 2) {
     return true;
   }).immediate();
 
-  const releaseTodaySlot = (kind, prevDay) => {
+  /**
+   * 送信に失敗したとき、自分が取った枠だけを戻す (次の retry / 翌朝に再送させる)。
+   * `last_sent_day = claimedDay` の compare-and-set — 日付境界で別プロセスが翌日の枠を
+   * 取っていた場合に、それを巻き戻して二重送信させないため (Codex R1 High)
+   */
+  const releaseTodaySlot = (kind, prevDay, claimedDay) => {
     try {
-      db.prepare('UPDATE rakuten_license_notify_state SET last_sent_day = ?, sent_count = MAX(sent_count - 1, 0), updated_at = ? WHERE kind = ?')
-        .run(prevDay || '', nowIso, kind);
+      db.prepare(`UPDATE rakuten_license_notify_state
+                  SET last_sent_day = ?, sent_count = MAX(sent_count - 1, 0), updated_at = ?
+                  WHERE kind = ? AND last_sent_day = ?`)
+        .run(prevDay || '', nowIso, kind, claimedDay);
     } catch { /* 戻せなくても翌日には送れる */ }
   };
 
@@ -124,13 +133,16 @@ if (process.exitCode !== 2) {
       if (isDryRun) {
         console.log('--- dry-run ---\n' + notice.text);
       } else if (!webhook) {
+        // 設定漏れは一時障害と違って自然回復しない = 期限監視が丸ごと効いていない。
+        // env エラー (exit 2) にして daily-sync のサマリで気づけるようにする (Codex R1 Medium)
         console.error('[rakuten-license] ⚠ GCHAT_WEBHOOK 未設定のため通知できない (設定を確認してください)');
+        process.exitCode = 2;
       } else if (isForce) {
         await send(notice, () => {});
       } else if (!claimTodaySlot(notice.kind, today, expiryDate)) {
         console.log('[rakuten-license] 本日は送信済みのためスキップ (--force で強制送信)');
       } else {
-        await send(notice, () => releaseTodaySlot(notice.kind, prevDay));
+        await send(notice, () => releaseTodaySlot(notice.kind, prevDay, today));
       }
     }
   } finally {

@@ -50,35 +50,50 @@ const AUTH_HINT = ' ← 楽天のライセンスキー失効の可能性 (RMSで
  * @param {string|object|null} body レスポンス本文 (文字列 or パース済み)
  * @param {number|null} status HTTPステータス (401/403 なら復旧手順を添える)
  */
+const MAX_PARSE_BYTES = 64 * 1024;   // これを超える本文は解析しない (異常なレスポンスで CPU を使わない)
+/** 表示に載せる文字列の掃除: 制御文字・改行を潰す (ログ1行を壊さない / 端末エスケープを渡さない) */
+const cleanText = v => (typeof v === 'string' ? v.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim() || null : null);
+
+/** targets は配列の先頭3件・primitive だけを出す (巨大構造/循環を stringify しない) */
+function formatTargets(targets) {
+  if (targets == null) return '';
+  try {
+    const arr = Array.isArray(targets) ? targets.slice(0, 3) : [targets];
+    const vals = arr.map(t => (t == null || typeof t === 'object' ? '…' : cleanText(String(t)))).filter(Boolean);
+    return vals.length ? `targets=${vals.join(',').slice(0, 80)}` : '';
+  } catch { return ''; }
+}
+
 export function describeRakutenError(body, status = null) {
   const hint = (status === 401 || status === 403) ? AUTH_HINT : '';
   let data = body;
   if (typeof body === 'string' || body == null) {
     const t = String(body ?? '').trim();
     if (!t) return `(エラー詳細なし)${hint}`;
-    try { data = JSON.parse(t); } catch { return `${t.slice(0, 120)}${hint}`; }
+    if (t.length > MAX_PARSE_BYTES) return `${cleanText(t.slice(0, 120)) || '(エラー詳細なし)'}${hint}`;
+    try { data = JSON.parse(t); } catch { return `${cleanText(t.slice(0, 120)) || '(エラー詳細なし)'}${hint}`; }
   }
   if (data == null || typeof data !== 'object') return `(エラー詳細なし)${hint}`;
 
   let code = null, message = null, targets;
-  const errs = Array.isArray(data.errors) ? data.errors.filter(e => e && typeof e === 'object') : null;
+  // find (filter ではなく) — 巨大配列を全走査しない
+  const err0 = Array.isArray(data.errors) ? data.errors.find(e => e && typeof e === 'object') : null;
   const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
-  if (errs && errs.length > 0) {
-    const e = errs[0];
-    code = typeof e.code === 'string' ? e.code : null;
-    message = typeof e.message === 'string' ? e.message : null;
+  if (err0) {
+    code = cleanText(err0.code);
+    message = cleanText(err0.message);
   } else if (list && list.length > 0) {
     const e = list.find(m => m && m.messageType === 'ERROR') || list[0];
-    code = e && typeof e.messageCode === 'string' ? e.messageCode : null;
-    message = e && typeof e.message === 'string' ? e.message : null;
+    code = cleanText(e?.messageCode);
+    message = cleanText(e?.message);
   } else {
-    code = data?.error?.code ?? (typeof data.error === 'string' ? data.error : null);
-    message = data?.error?.message ?? (typeof data.message === 'string' ? data.message : null);
+    code = cleanText(data?.error?.code) ?? cleanText(data.error);
+    message = cleanText(data?.error?.message) ?? cleanText(data.message);
     targets = data?.error?.targets;
   }
   const head = [
     [code, message].filter(v => typeof v === 'string' && v).join(': '),
-    targets ? `targets=${JSON.stringify(targets).slice(0, 80)}` : '',
+    formatTargets(targets),
   ].filter(Boolean).join(' ');
   return `${(head || '(エラー詳細なし)').slice(0, 220)}${hint}`;
 }

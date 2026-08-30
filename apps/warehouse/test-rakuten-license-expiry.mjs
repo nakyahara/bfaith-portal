@@ -18,6 +18,14 @@ check('TZ付き (+09:00) → そのまま', parseRmsExpiry('2026-11-28T23:59:59+
 check('TZ付き (Z) → そのまま', parseRmsExpiry('2026-11-28T14:59:59Z') === Date.parse('2026-11-28T14:59:59Z'));
 check('日付だけ → その日の JST 23:59:59', parseRmsExpiry('2026-11-28') === Date.parse('2026-11-28T23:59:59+09:00'));
 check('壊れた値 / 空 / null → null', parseRmsExpiry('not-a-date') === null && parseRmsExpiry('') === null && parseRmsExpiry(null) === null);
+check('存在しない暦日は拒否 (翌月へ正規化させない)', parseRmsExpiry('2026-02-30') === null && parseRmsExpiry('2026-13-01') === null && parseRmsExpiry('2027-02-29') === null);
+check('うるう年 2/29 は通る', parseRmsExpiry('2028-02-29') === Date.parse('2028-02-29T23:59:59+09:00'));
+check('時分秒の範囲外は拒否', parseRmsExpiry('2026-11-28T24:00:00') === null && parseRmsExpiry('2026-11-28T23:60:00') === null);
+check('小文字 z / +0900 形式も受ける',
+  parseRmsExpiry('2026-11-28t14:59:59z') === Date.parse('2026-11-28T14:59:59Z')
+  && parseRmsExpiry('2026-11-28T23:59:59+0900') === Date.parse('2026-11-28T23:59:59+09:00'));
+check('ミリ秒つきも受ける', parseRmsExpiry('2026-11-28T23:59:59.123') === Date.parse('2026-11-28T23:59:59+09:00'));
+check('前後の余計な文字列は拒否 (部分一致させない)', parseRmsExpiry('exp: 2026-11-28') === null && parseRmsExpiry('2026-11-28 ちょっとメモ') === null);
 check('jstDay: UTC→JST 暦日', jstDay(Date.parse('2026-11-28T20:00:00Z')) === '2026-11-29' && jstDay(Date.parse('2026-11-28T05:00:00Z')) === '2026-11-28');
 check('daysUntil: JST 暦日の差 (当日=0)',
   daysUntil(parseRmsExpiry('2026-11-28T23:59:59'), Date.parse(NOW)) === 14
@@ -83,6 +91,23 @@ check('inquiry-hub: 空ボディ・非JSONでも落ちない',
 check('inquiry-hub: パース済みオブジェクトも受け付ける', describeRakutenError(AUTH_BODY, 401).includes('GA0001'));
 check('inquiry-hub: 本文は 220 文字で切る (問い合わせ本文の露出防止)',
   describeRakutenError(JSON.stringify({ errors: [{ code: 'X', message: 'あ'.repeat(500) }] }), 400).length <= 240);
+
+console.log('\n── 異常な本文でも壊れない (Codex R1) ──');
+check('制御文字・改行は潰す (ログ1行を壊さない)',
+  describeRakutenError({ errors: [{ code: 'XY', message: 'a\nb\tc' }] }, 400) === 'XY: a b c'
+  , JSON.stringify(describeRakutenError({ errors: [{ code: 'XY', message: 'a\nb\tc' }] }, 400)));
+check('warehouse 側も制御文字を潰す', describeRmsError({ errors: [{ code: 'A\nB', message: 'xy' }] }).code === 'A B');
+check('64KB 超の本文は解析せず先頭だけ', describeRakutenError('x'.repeat(70000), 500).length < 200);
+check('errors[] に非オブジェクトが混ざっても最初の object を拾う',
+  describeRakutenError({ errors: [null, 'x', { code: 'GA0001', message: 'Un-Authorised' }] }, 401).includes('GA0001'));
+check('巨大 errors[] でも落ちない', describeRakutenError({ errors: Array.from({ length: 50000 }, () => null).concat([{ code: 'Z', message: 'z' }]) }, 400).includes('Z'));
+const circular = { error: { code: 'E', message: 'm', targets: {} } };
+circular.error.targets.self = circular;   // 循環参照 (JSON.stringify は throw する)
+check('targets が循環参照でも throw しない', describeRakutenError(circular, 400).includes('E: m'));
+check('targets は配列の先頭3件・primitive のみ',
+  describeRakutenError({ error: { code: 'E', message: 'm', targets: ['a', 'b', 'c', 'd'] } }, 400).includes('targets=a,b,c')
+  && !describeRakutenError({ error: { code: 'E', message: 'm', targets: ['a', 'b', 'c', 'd'] } }, 400).includes('d'));
+check('targets に BigInt が混ざっても落ちない', describeRakutenError({ error: { code: 'E', message: 'm', targets: [10n] } }, 400).includes('targets=10'));
 
 console.log(`\n結果: ${passed} PASS / ${failed} FAIL`);
 process.exitCode = failed > 0 ? 1 : 0;

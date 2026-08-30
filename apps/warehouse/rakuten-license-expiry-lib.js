@@ -26,15 +26,26 @@ export const URGENT_DAYS = 3;
  * タイムゾーン表記が無い形 ('2026-11-28T23:59:59') は **JST** として解釈する
  * (ホスト TZ に依存させない。miniPC 以外で動かしても同じ結果にする)。
  */
+const EXPIRY_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?)?(Z|[+-]\d{2}:?\d{2})?$/i;
+
 export function parseRmsExpiry(raw) {
   if (raw == null) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/.test(s);
-  const iso = hasTz ? s
-    : /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T23:59:59+09:00`
-      : `${s}+09:00`;
-  const ms = Date.parse(iso);
+  const m = EXPIRY_RE.exec(String(raw).trim());
+  if (!m) return null;                                   // 契約外の形は解釈しない (誤読より不明を選ぶ)
+  const [, y, mo, d, hh, mi, ss, tz] = m;
+  const [Y, MO, D] = [Number(y), Number(mo), Number(d)];
+  // 暦日として実在するか (Date.parse 任せだと 2026-02-30 が 3/2 に正規化されうる)
+  const probe = new Date(Date.UTC(Y, MO - 1, D));
+  if (probe.getUTCFullYear() !== Y || probe.getUTCMonth() !== MO - 1 || probe.getUTCDate() !== D) return null;
+  // 時刻が無い形 ('2026-11-28') はその日の終わりとみなす
+  const [H, MI, S] = [hh === undefined ? 23 : Number(hh), mi === undefined ? 59 : Number(mi), ss === undefined ? 59 : Number(ss)];
+  if (H > 23 || MI > 59 || S > 59) return null;
+  const p2 = n => String(n).padStart(2, '0');
+  // タイムゾーン表記が無ければ JST (実測レスポンスがこの形)。小文字 z / '+0900' 形式も受ける
+  const offset = !tz ? '+09:00'
+    : tz.toUpperCase() === 'Z' ? '+00:00'
+      : tz.includes(':') ? tz : `${tz.slice(0, 3)}:${tz.slice(3)}`;
+  const ms = Date.parse(`${y}-${mo}-${d}T${p2(H)}:${p2(MI)}:${p2(S)}${offset}`);
   return Number.isFinite(ms) ? ms : null;
 }
 

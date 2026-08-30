@@ -204,36 +204,28 @@ async function doRakutenRequest({
  *   - その他       : { code, message } / { error, message }
  * 本文をそのまま出すと注文者情報や問い合わせ本文が混ざるので、**構造化フィールドだけ**を拾う。
  */
+/** 表示に載せる文字列の掃除: 制御文字・改行を潰す (ログ1行を壊さない / 端末エスケープを渡さない) */
+const cleanRmsText = v => (typeof v === 'string' ? v.replace(/[\u0000-\u001F\u007F]+/g, ' ').trim() || null : null);
+
 export function describeRmsError(data) {
   if (data == null) return { code: null, message: null };
-  if (typeof data === 'string') {
-    const t = data.trim();
-    return { code: null, message: t ? t.slice(0, 200) : null };
-  }
+  if (typeof data === 'string') return { code: null, message: cleanRmsText(data.slice(0, 200)) };
   if (typeof data !== 'object') return { code: null, message: null };
 
-  const errs = Array.isArray(data.errors) ? data.errors.filter(e => e && typeof e === 'object') : null;
-  if (errs && errs.length > 0) {
-    const e = errs[0];
-    return {
-      code: typeof e.code === 'string' ? e.code : null,
-      message: typeof e.message === 'string' ? e.message : null,
-    };
-  }
+  // find (filter ではなく) — 巨大配列を全走査しない
+  const err0 = Array.isArray(data.errors) ? data.errors.find(e => e && typeof e === 'object') : null;
+  if (err0) return { code: cleanRmsText(err0.code), message: cleanRmsText(err0.message) };
+
   const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
   if (list && list.length > 0) {
     const e = list.find(m => m && m.messageType === 'ERROR') || list[0];
-    return {
-      code: e && typeof e.messageCode === 'string' ? e.messageCode : null,
-      message: e && typeof e.message === 'string' ? e.message : null,
-    };
+    return { code: cleanRmsText(e?.messageCode), message: cleanRmsText(e?.message) };
   }
   return {
-    code: typeof data.code === 'string' ? data.code : (typeof data.error === 'string' ? data.error : null),
-    message: typeof data.message === 'string' ? data.message : null,
+    code: cleanRmsText(data.code) ?? cleanRmsText(data.error),
+    message: cleanRmsText(data.message),
   };
 }
-
 /** describeRmsError の結果を ' (GA0001: Un-Authorised)' の形の接尾辞にする。何も取れなければ '' */
 export function rmsErrorSuffix(data) {
   const { code, message } = describeRmsError(data);
