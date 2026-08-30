@@ -66,6 +66,7 @@
         <input type="date" name="date" value="<%= workDate %>" onchange="this.form.submit()">
       </form>
       <span class="muted"><%= batches.length %> バッチ</span>
+      <button id="refreshBtn" type="button" style="margin-left:auto; padding:8px 18px; font-size:15px; border:1px solid #ced4da; border-radius:8px; background:#fff; cursor:pointer;">🔄 更新</button>
     </div>
 
     <% if (batches.length === 0) { %>
@@ -73,6 +74,28 @@
         バッチがありません。<% if (isAdmin) { %><a href="/apps/packing/admin/import">納品書CSV を取り込む</a><% } else { %>取込が済むとここに表示されます。<% } %>
       </div>
     <% } %>
+
+    <script>
+      // ── 一覧の更新 (納品書CSVの取込は随時来るため、開きっぱなしでも追従する) ──
+      // ピッキング一覧 (apps/picking/views/batches.ejs) と同方式。
+      // ⭐10秒ごとに署名だけ見て、バッチの増減・状態変化があった時だけ再読込する。
+      //   毎回フルリロードすると、iPadで見ながら作業している人の画面が白く飛ぶ
+      document.getElementById('refreshBtn').addEventListener('click', function () { location.reload(); });
+      var SIG = <%- JSON.stringify(batches.map(function (b) { return b.id + ':' + b.status; }).join(',')) %>;
+      var DATE = <%- JSON.stringify(workDate) %>;
+      setInterval(function () {
+        if (document.visibilityState !== 'visible') return;
+        fetch('/apps/packing/api/batches-signature?date=' + encodeURIComponent(DATE))
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (b) { if (b && b.sig !== SIG) location.reload(); })
+          .catch(function () { /* オフライン中は次の周期で */ });
+      }, 10000);
+      // PWA復帰・タブ復帰の瞬間にも最新化 (読込から15秒以上経っているときだけ)
+      var loadedAt = Date.now();
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'visible' && Date.now() - loadedAt > 15000) location.reload();
+      });
+    </script>
 
     <div style="margin:10px 0;">
       <button type="button" id="faUnload" style="padding:12px 14px; border:1px solid #1a73e8; color:#1a73e8; background:#fff; border-radius:10px; font-weight:700">📦 ピッキング済みの商品を下して</button>

@@ -169,6 +169,18 @@ router.get('/reprints/:token([A-Za-z0-9_-]{16,}).pdf', (req, res) => {
   fs.createReadStream(file).pipe(res);
 });
 
+/**
+ * バッチ一覧の署名 (画面の自動追従用)。
+ * 納品書CSVの取込は随時来るので、一覧を開きっぱなしでも増減・状態変化に追従させる。
+ * ⭐毎回フルリロードせず「署名が変わった時だけ」再読込する — 進捗の数字が動くたびに
+ *   画面が白く飛ぶと、iPadで作業しながら見ている人には使えない (picking と同方式)
+ */
+router.get('/api/batches-signature', api(async (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  const sig = listPackBatches(workDate).map((b) => `${b.id}:${b.status}`).join(',');
+  res.json({ ok: true, sig });
+}));
+
 // ─── 🖨 印刷キュー (出荷PCの印刷エージェントが pull で取りに来る・要件§6) ───
 /**
  * エージェント認証。**Authorization ヘッダーのみ**で、iPad の端末Cookieは受け付けない
