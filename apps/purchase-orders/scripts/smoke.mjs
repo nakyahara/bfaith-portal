@@ -58,6 +58,7 @@ insRow.run('boundary-eq', '在庫+注残 = M×V ちょうど', '', '取扱中', 
 insRow.run('boundary-plus', '在庫+注残 = M×V + 1', '', '取扱中', 2, 101, 50, 25, 100, 10, 1.5, 500, 200, '2026-07-01', '2020-01-01');
 db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数)
   VALUES ('run_test', 'm-missing', '推奨保有月数 未設定で売れている商品', '', '取扱中', 2, 0, 0, 10, 50, 100, NULL)`).run();
+insRow.run('neg-stock', '在庫が負 (引当超過) の商品', '', '取扱中', 2, -5, 0, 25, 100, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01');
 
 console.log('── computeProduct (シート数式一致) ──');
 const get = code => computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code));
@@ -99,6 +100,10 @@ ok(bplus.isTarget === false, 'v2 境界: S+B == M×V + 1 → 対象外', bplus.s
 const mm = get('m-missing');
 ok(mm.isTarget === false && mm.holdMonthsMissing === true && mm.isHorikoshi === false, 'v2: M未設定 (null) で売れている → 要発注にしない・holdMonthsMissing', { t: mm.isTarget, hmm: mm.holdMonthsMissing });
 ok(so.holdMonthsMissing === false && hori.holdMonthsMissing === false, 'holdMonthsMissing は「売れているのに M<=0」だけ');
+const neg = get('neg-stock');
+// 在庫+注残が負 → 在庫0 として扱う: 要発注、推奨 = (M+O)×V − 0 = 2.5×100 = 250 → ロット100 で lots=2.5 → ROUND=3 → 300 (負をそのまま使うと 255→300 だが 0 起点で計算)
+ok(neg.isTarget === true && neg.stockNegative === true && neg.stockMonths === 0 && neg.recQty === 300, 'v2: 在庫負は在庫0扱いで要発注・推奨は0起点', { t: neg.isTarget, m: neg.stockMonths, rec: neg.recQty });
+ok(so.recQtyV2 === 300 && soV1.recQtyV2 === 300 && soV1.recQty === null, 'recQtyV2 はルールに依存しない (v1 動作中でも影響額を出せる)');
 // 同値性: 旧式と同じ領域 (S+B>0) では判定・推奨量が変わらない
 for (const [code, p] of [['noflyersticker', nofly], ['cardstand-silver-r', card], ['0726-001060', niku], ['diyorangeoil100', oil], ['alloc-item', alloc]]) {
   const v1 = computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code), undefined, 'v1');
@@ -150,8 +155,9 @@ console.log('── 判定ルール v2: ダッシュボード表示とロール�
 {
   let html = await (await fetch(base + '/')).text();
   // stockout-selling (仕入先なし) が v2 で新たに要発注 → 差分バナー +1件 / 推奨額 300×200=¥60,000、m-missing が M未設定 1件
-  ok(html.includes('判定ルール v2') && html.includes('+1件') && html.includes('+¥60,000') && html.includes('未設定で判定できない商品 1件'),
-    'dashboard: v2 差分バナー (+1件 / +¥60,000 / M未設定 1件)');
+  // stockout-selling + neg-stock (仕入先なし) が v2 で新たに要発注 → 差分バナー +2件 / ¥60,000×2、m-missing が M未設定 1件
+  ok(html.includes('判定ルール v2') && html.includes('+2件') && html.includes('+¥120,000') && html.includes('未設定で要発注判定ができない商品が 1件'),
+    'dashboard: v2 差分バナー (+2件 / +¥120,000 / M未設定 1件)');
   r = await j('/api/target-rule');
   ok(r.body.ok && r.body.rule === 'v2', 'target-rule: 既定 v2');
   r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v0' }) });
@@ -159,9 +165,12 @@ console.log('── 判定ルール v2: ダッシュボード表示とロール�
   r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v1' }) });
   ok(r.body.ok && r.body.rule === 'v1', 'target-rule: v1 へロールバック');
   html = await (await fetch(base + '/')).text();
-  ok(html.includes('旧ルール (v1)'), 'dashboard: v1 のとき警告表示');
-  const prodV1 = computeAll().products.find(p => p.code === 'stockout-selling');
+  // v1 でも v2 の影響 (2件: stockout-selling + neg-stock、¥60,000+¥60,000) と M未設定の警告は出る
+  ok(html.includes('旧ルール (v1)') && html.includes('2件 (推奨額 ¥120,000)') && html.includes('未設定で要発注判定ができない商品が 1件'), 'dashboard: v1 のとき警告表示 (影響額と M未設定は別条件で表示)');
+  const allV1 = computeAll();
+  const prodV1 = allV1.products.find(p => p.code === 'stockout-selling');
   ok(prodV1 && prodV1.isTarget === false && prodV1.isHorikoshi === true, 'v1: computeAll も旧式で判定 (stockout-selling は掘り起こし)');
+  ok(allV1.ruleStats.rule === 'v1' && allV1.ruleStats.addedCount === 2 && allV1.ruleStats.addedAmount === 120000, 'v1: ruleStats の影響額はルールに依存しない', allV1.ruleStats);
   r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v2' }) });
   ok(r.body.ok && r.body.rule === 'v2', 'target-rule: v2 へ戻す');
   const prodV2 = computeAll().products.find(p => p.code === 'stockout-selling');

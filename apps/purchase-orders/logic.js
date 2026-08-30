@@ -68,18 +68,25 @@ export function computeProduct(r, backOrderOverride, rule = 'v2') {
   const N = num(r['発注ロット単位']);
   const active = String(r['取扱区分'] || '') === '取扱中';
   const salesDefined = V > 0;
-  const stockMonths = salesDefined ? (S + B) / V : null; // L (販売0は未定義)
+  // 在庫+注残が負 (NE の引当超過・取込異常) は「在庫0」として扱う。v1 は L<0 で黙って対象外にしていたが、
+  // 実態は欠品なので v2 では対象にし、推奨量は 0 起点で計算する (負をそのまま使うと推奨量が膨らむ、Codex PR1-R1 Low)
+  const stockNegative = S + B < 0;
+  const SB = stockNegative ? 0 : S + B;
+  const stockMonths = salesDefined ? SB / V : null; // L (販売0は未定義)
   const targetV1 = active && salesDefined && stockMonths > 0 && stockMonths <= M;
-  const targetV2 = active && salesDefined && M > 0 && (S + B) <= M * V;
+  const targetV2 = active && salesDefined && M > 0 && SB <= M * V;
   const isTarget = rule === 'v1' ? targetV1 : targetV2;
   // 売れているのに推奨保有月数が未設定 → どのルールでも要発注に出ない設定不備 (管理画面で埋める)
   const holdMonthsMissing = active && salesDefined && !(M > 0);
-  let recQty = null;
-  if (isTarget && N > 0) {
+  // 推奨量は v2 判定で常に計算する (v1 ⊂ v2 なので v1 の対象商品も同じ式)。
+  // recQtyV2 はルール切替の影響額 (ruleStats) 用で、現在のルールに依存させない (Codex PR1-R1 Medium)
+  let recQtyV2 = null;
+  if (targetV2 && N > 0) {
     const P = M + stockConstant(M);
-    const lots = (P * V - (S + B)) / N; // = (P − L) × V / N。target なら S+B <= M×V なので必ず正 (最低1ロット)
-    recQty = lots > 1 ? Math.round(lots) * N : Math.ceil(lots) * N;
+    const lots = (P * V - SB) / N; // = (P − L) × V / N。target なら SB <= M×V なので必ず正 (最低1ロット)
+    recQtyV2 = lots > 1 ? Math.round(lots) * N : Math.ceil(lots) * N;
   }
+  const recQty = isTarget ? recQtyV2 : null;
   return {
     code: r['商品コード'],
     key: normProductCode(r['商品コード']),
@@ -103,7 +110,9 @@ export function computeProduct(r, backOrderOverride, rule = 'v2') {
     targetV2,
     targetReason: isTarget ? ['total'] : [],
     holdMonthsMissing,
+    stockNegative,
     recQty,
+    recQtyV2,
     // 掘り起こし = 取扱中かつ在庫0・注残0・販売0 (仕入を控えた商品の再販調査。販売0でも在庫があれば対象外。
     // v2 では売れている欠品品は要発注へ行くので掘り起こしには落とさない)
     isHorikoshi: active && S === 0 && B === 0 && (rule === 'v1' || !salesDefined),
@@ -410,7 +419,7 @@ export function computeAll() {
     if (p.holdMonthsMissing) ruleStats.holdMonthsMissing++;
     if (p.targetV2 && !p.targetV1) {
       ruleStats.addedCount++;
-      ruleStats.addedAmount += (p.recQty || 0) * p.cost;
+      ruleStats.addedAmount += (p.recQtyV2 || 0) * p.cost; // v1 で動作中でも v2 の影響額が見える
     }
     const a = masters.attrs.get(p.key);
     p.conditionId = a ? (a.condition_id || '') : '';

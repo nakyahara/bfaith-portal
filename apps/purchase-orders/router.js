@@ -3596,11 +3596,15 @@ router.get('/', (req, res) => {
 
   const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker, ruleStats } = data;
   // 判定ルール v2 (在庫0・注残0 の売れ筋を要発注に含める) で新たに載った件数。旧式との差分を運用者に見せる (Codex R2: 観測可能性)
-  const ruleNote = ruleStats.rule === 'v1'
-    ? '<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫0・注残0 の売れ筋は要発注に出ません (設定 target_rule)</div>'
+  // 差分通知と設定不備通知は別条件 (差分0件でも M 未設定は出す、Codex PR1-R1 Low)
+  const hmmNote = ruleStats.holdMonthsMissing
+    ? `<div class="warn">⚠️ 売れているのに推奨保有月数が未設定で要発注判定ができない商品が ${ruleStats.holdMonthsMissing}件あります (<a href="/apps/purchase-orders/products">全商品情報</a> の「⚠️ 推奨保有月数 未設定」で確認 → NEで設定)</div>`
+    : '';
+  const ruleNote = (ruleStats.rule === 'v1'
+    ? `<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫0・注残0 の売れ筋 ${ruleStats.addedCount}件 (推奨額 ¥${ruleStats.addedAmount.toLocaleString('ja-JP')}) は要発注に出ません (設定 target_rule)</div>`
     : (ruleStats.addedCount
-      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫0・注残0 で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b>${ruleStats.holdMonthsMissing ? `　／　⚠️ 売れているのに推奨保有月数が未設定で判定できない商品 ${ruleStats.holdMonthsMissing}件 (全商品情報で確認)` : ''}</span></div>`
-      : '');
+      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫0・注残0 で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b></span></div>`
+      : '')) + hmmNote;
   // 発注サイクルの経過表示: ✅発注確定済み・×非表示はデータ更新ボタンまで保持される。長く放置したら注意を出す
   let cycleNote = '';
   if (cycleMarker) {
@@ -5006,7 +5010,7 @@ router.get('/products', (req, res) => {
       st: p.stock, b: p.backOrder, s7: p.sales7, s30: p.sales30,
       m: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, hm: p.holdMonths, lo: p.lot,
       co: p.cost, pr: p.price, lp: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
-      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0, hmm: p.holdMonthsMissing ? 1 : 0,
+      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0, hmm: p.holdMonthsMissing ? 1 : 0, sd: p.salesDefined ? 1 : 0,
     }));
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
@@ -5053,8 +5057,9 @@ var COLS = [
 function stateBadge(r) {
   if (!r.a) return '<span class="badge" style="background:#eceff3;color:#64748b">取扱中止</span>';
   if (r.t) return '<span class="badge b-warn">🔴 要発注</span>';
-  if (r.h) return '<span class="badge" style="background:#f4f4f5;color:#52525b">⚪ 掘り起こし</span>';
+  // 設定不備は掘り起こしより先に出す (v1 ロールバック中は両方 true になり得る、Codex PR1-R1 Medium)
   if (r.hmm) return '<span class="badge b-warn" title="売れているのに推奨保有月数が未設定のため要発注判定ができない。NEで推奨保有月数を設定してください">⚠️ 推奨保有月数 未設定</span>';
+  if (r.h) return '<span class="badge" style="background:#f4f4f5;color:#52525b">⚪ 掘り起こし</span>';
   return '<span class="badge b-issued">取扱中</span>';
 }
 function filtered() {
