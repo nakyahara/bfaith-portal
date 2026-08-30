@@ -62,6 +62,16 @@ db.prepare("UPDATE outbox_replies SET status = 'needs_review' WHERE id = ?").run
 const inq3 = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, received_at, conversation_rev)
   VALUES ('rakuten', ?, 'adm-3', '配送について', ?, 1)`).run(rkShop, toUtcIso(Date.now())).lastInsertRowid;
 const jobP = createReplyJob({ inquiryId: inq3, channelType: 'rakuten', bodyText: '明日発送します', createdBy: 'tester', clientOperationId: 'op-p', baseConversationRev: 1 });
+// 送信失敗 (未送信確定) の長文ジョブ。2026-08-30 の楽天401 で「何を送ろうとしたか」が
+// 先頭60文字しか見えず作り直す羽目になったため、全文表示と書き戻しを検証する
+const inq4 = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, received_at, conversation_rev)
+  VALUES ('rakuten', ?, 'adm-4', '再注文について', ?, 1)`).run(rkShop, toUtcIso(Date.now())).lastInsertRowid;
+const FAILED_BODY = 'ご連絡いただき、ありがとうございます。楽天市場からご購入いただくことも可能ですが、'
+  + '今回のような大量注文の場合は、直接お問い合わせいただくほうがスムーズです。\n\n'
+  + '9月5日午前中のお届けをご希望とのこと、承知いたしました。ご注文時に備考欄へご記入ください。';
+const FAILED_ERR = '楽天返信が拒否されました (HTTP 401): GA0001: Un-Authorised ← 楽天のライセンスキー失効の可能性';
+const jobF = createReplyJob({ inquiryId: inq4, channelType: 'rakuten', bodyText: FAILED_BODY, createdBy: 'tester', clientOperationId: 'op-f', baseConversationRev: 1 });
+db.prepare("UPDATE outbox_replies SET status = 'failed', error_message = ? WHERE id = ?").run(FAILED_ERR, jobF.id);
 
 // ─── ルーターをマウントして起動 ───
 const app = express();
@@ -209,6 +219,17 @@ console.log('5. 返信エディタ');
   check('フラグON: エディタ表示+ワーカー未稼働の警告', htmlOn.includes('id="replyBody"') && htmlOn.includes('送信ワーカーは停止中'));
   check('送信ジョブ履歴が表示される (failedになったジョブ)', htmlOn.includes('❌送信失敗'));
 
+  // 送信失敗した返信の「送ろうとした内容」が読めること (2026-08-30 楽天401 の教訓)
+  const html4 = await (await fetch(base + `/inquiries/${inq4}`)).text();
+  check('失敗ジョブの本文が全文表示される (末尾まで)',
+    html4.includes('備考欄へご記入ください') && html4.includes('job-body-full'));
+  check('失敗の理由も画面に出る (401 のコードと復旧ヒント)',
+    html4.includes('GA0001') && html4.includes('ライセンスキー失効の可能性'));
+  // CSS 側にも .job-restore が載っているので、ボタン要素そのもので判定する
+  check('未決着ジョブが無ければ「返信欄に戻す」が出る',
+    html4.includes('class="ghost job-restore"') && html4.includes('返信欄に戻す'));
+  check('本文の改行は pre-wrap で保持 (CSSが載っている)', html4.includes('.job-body-full') && html4.includes('white-space: pre-wrap'));
+
   const rEmpty = await jpost(`/api/inquiries/${inq}/reply`, { body: '  ', clientOperationId: randomUUID(), baseConversationRev: 1 });
   check('空本文は400', rEmpty.status === 400);
   const rBadOp = await jpost(`/api/inquiries/${inq}/reply`, { body: 'x', clientOperationId: 'not-a-uuid', baseConversationRev: 1 });
@@ -235,6 +256,9 @@ console.log('5. 返信エディタ');
   check('未決着ジョブがある間は新規作成409 (1問い合わせ1送信)', rSecond.status === 409);
   const htmlActive = await (await fetch(base + `/inquiries/${inq}`)).text();
   check('未決着ジョブ中はフォームの代わりに案内表示', htmlActive.includes('未決着の送信ジョブ') && !htmlActive.includes('id="replyBody"'));
+  // 履歴の本文は読めるが、書き戻し先の返信欄が無いのでボタンは出さない (CSS側の .job-restore は常に載る)
+  check('未決着ジョブ中は「返信欄に戻す」ボタンを出さない',
+    !htmlActive.includes('class="ghost job-restore"') && htmlActive.includes('job-body-full'));
   check('運用管理の要対応に⏳送信待ちで出る', (await (await fetch(base + '/admin')).text()).includes('⏳送信待ち'));
   delete process.env.INQUIRY_HUB_REPLY_EDITOR_ENABLED;
 }
