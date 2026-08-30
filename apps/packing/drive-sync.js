@@ -235,8 +235,11 @@ async function retryShipChangeNotify() {
         FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(row.batch_id, row.slip_seq);
+      // ⭐初回送信 (router) と同じ内容にする — 片方だけ直すと再送で番号が落ちる
+      const slipNo = db.prepare('SELECT slip_no FROM pk_pack_slips WHERE batch_id=? AND seq=?')
+        .get(row.batch_id, row.slip_seq)?.slip_no ?? null;
       const sent = await notifyShipChange({
-        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+        folderName: row.folder_name, neSlipNo: row.ne_slip_no, slipNo,
         currentMethod: row.current_method, proposedMethod: row.proposed_method,
         reason: `${row.reason} (再送)`, worker: row.requested_by, lines,
       });
