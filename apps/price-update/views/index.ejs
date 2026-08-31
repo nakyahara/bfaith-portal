@@ -203,9 +203,10 @@
       if (s.singleItemShipping === 1) bits.push('単品配送');
       if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
     } else if (r.mall === 'yahoo' && s) {
+      // 送料設定 (PostageSet) が商品ごとに変わる = 実質の配送方法。Delivery は今のところ全商品 "1"
       const bits = [];
-      if (s.delivery) bits.push('配送方法 ' + esc(s.delivery));
       if (s.postageSet) bits.push('送料設定 ' + esc(s.postageSet));
+      if (s.delivery) bits.push('配送 ' + esc(s.delivery));
       if (s.shipWeight) bits.push(esc(s.shipWeight) + 'g');
       if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
     }
