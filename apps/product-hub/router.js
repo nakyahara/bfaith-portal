@@ -25,6 +25,10 @@ import {
   validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
   blockGenerationDraft, unblockGenerationDraft, generationQueueSummary,
 } from './db.js';
+// 確認中 (2026-08-31): 情報待ちで工程を進められないカードの印
+import {
+  setDraftChecking, clearDraftChecking, CHECKING_REASONS, CHECKING_NOTE_MAX,
+} from './db.js';
 import {
   listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
   listRoles, createRole, updateRole,
@@ -325,6 +329,9 @@ router.get('/detail/:id', (req, res) => {
     setInfo: setInfoOf(db, draft.id),
     imagePriorities: IMAGE_PRIORITIES,
     materialStatuses: MATERIAL_STATUSES,
+    // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
+    checkingReasons: CHECKING_REASONS,
+    checkingNoteMax: CHECKING_NOTE_MAX,
     promptTemplates: buildPromptTemplates(draft, imageProduction),
   });
 });
@@ -870,6 +877,34 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
     res.json({ ok: true, changed: r.changed, workflow_state: onHold ? 'on_hold' : 'active' });
   } catch (e) {
     res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+// 「確認中」の設定 / 解除 (2026-08-31 スタッフ要望)。
+// 工程 (列) も status も動かさない — カードにラベルが出て列の先頭に並び、AI 生成キューから外れるだけ。
+// 権限は基本情報の編集と同じ扱い (誰が待たせているかは actor で残る): 情報待ちに気づいた人が
+// その場で立てられないと、結局「誰も立てないラベル」になる
+router.post('/api/drafts/:id/checking', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  // boolean の true/false だけ受ける (image-hold と同じ。欠落・文字列を「解除」に倒さない)
+  if (typeof req.body?.on !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'on は true / false で指定してください' });
+  }
+  const db = getDB();
+  try {
+    if (!req.body.on) {
+      const r = clearDraftChecking(db, draft.id, { actor: actorOf(req) });
+      return res.json({ ok: true, changed: r.changed, checking: false });
+    }
+    const note = req.body?.note !== undefined && req.body?.note !== null
+      ? cleanText(req.body.note, CHECKING_NOTE_MAX) : null;
+    const r = setDraftChecking(db, draft.id, {
+      reasonCode: req.body?.reason_code, note, actor: actorOf(req),
+    });
+    res.json({ ok: true, changed: r.changed, checking: true });
+  } catch (e) {
+    res.status(e.status === 400 ? 400 : 500).json({ ok: false, error: e.message });
   }
 });
 
@@ -1946,13 +1981,16 @@ router.get('/board', (req, res) => {
   // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
   const raw = String(req.query.assignee || '').trim();
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
-  const unassignedOnly = String(req.query.filter || '') === 'unassigned';
+  const filterParam = String(req.query.filter || '');
+  const unassignedOnly = filterParam === 'unassigned';
+  // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
+  const checkingOnly = filterParam === 'checking';
   const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
   // 画像ビューの種別絞り込み (TOP画像 / 商品詳細画像 — 2026-08-24 中原さん要望)
   const imageKind = boardView === 'image' && ['top', 'detail'].includes(String(req.query.kind || ''))
     ? String(req.query.kind) : null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, imageKind, mallSummary: mallSummaryFor });
+  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
@@ -1963,6 +2001,7 @@ router.get('/board', (req, res) => {
     assigneeId,
     assigneeParam: raw,
     unassignedOnly,
+    checkingOnly,
     imageKind,
     thumbnailUrl,
     stepStateLabels: STEP_STATE_LABELS,

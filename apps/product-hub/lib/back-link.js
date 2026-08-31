@@ -23,7 +23,10 @@ export function backLinkOf(query) {
   if (isImage) p.set('view', 'image');
   const assignee = String(src.get('assignee') ?? '');
   if (assignee === 'me' || /^\d{1,9}$/.test(assignee)) p.set('assignee', assignee);
-  if (src.get('filter') === 'unassigned') p.set('filter', 'unassigned');
+  const filter = src.get('filter');
+  // 確認中 (2026-08-31) も戻り先として通す。ここに足さないと、確認中で絞ったボードから
+  // カードを開いて解除 → 戻ると絞り込みが外れ、続きを処理する列を見失う
+  if (filter === 'unassigned' || filter === 'checking') p.set('filter', filter);
   const kind = src.get('kind');
   // 種別は画像ビューだけの条件 (本流に付けても board 側が無視する)
   if (isImage && (kind === 'top' || kind === 'detail')) p.set('kind', kind);

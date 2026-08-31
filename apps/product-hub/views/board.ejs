@@ -29,6 +29,10 @@
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
   .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
+  /* 確認中 (2026-08-31): 情報待ちのカード。列の先頭に並ぶ + 左の太いラインで一目で分かるようにする */
+  .kb-hold.kb-checking { color: #1e40af; background: #dbeafe; border-color: #3b82f6; }
+  .kb-hold.kb-checking.long { color: #9a3412; background: #ffedd5; border-color: #f97316; }
+  .kb-card.checking { border-color: #93c5fd; border-left: 4px solid #3b82f6; background: #f8fbff; }
   .kb-col.drop-ok { outline: 2px dashed #2563eb; outline-offset: -2px; background: #eff6ff; }
   /* TOP画像の重要度 (どれぐらい力を入れて作るか)。Notion のタグ風に色を付ける */
   .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
@@ -92,7 +96,8 @@
     if (v === 'image') p.set('view', 'image');
     const a = over.assignee !== undefined ? over.assignee : assigneeParam;
     if (a) p.set('assignee', a);
-    const f = over.filter !== undefined ? over.filter : (unassignedOnly ? 'unassigned' : '');
+    const f = over.filter !== undefined ? over.filter
+      : (unassignedOnly ? 'unassigned' : (checkingOnly ? 'checking' : ''));
     if (f) p.set('filter', f);
     // 種別 (TOP画像/商品詳細画像) は画像ビューだけの条件。本流へ切り替えたら落とす
     const k = over.kind !== undefined ? over.kind : (imageKind || '');
@@ -108,6 +113,7 @@
     if (boardView === 'image') p.set('view', 'image');
     if (assigneeParam) p.set('assignee', assigneeParam);
     if (unassignedOnly) p.set('filter', 'unassigned');
+    if (checkingOnly) p.set('filter', 'checking');
     if (imageKind && boardView === 'image') p.set('kind', imageKind);
     return p.toString();
   })();
@@ -126,13 +132,21 @@
       <a class="kb-tab <%= boardView !== 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'main' }) %>">本流で並べる</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
     </span>
-    <a class="chip <%= !assigneeParam && !unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
+    <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <% if (me) { %>
       <a class="chip <%= assigneeParam === 'me' ? 'on' : '' %>" href="<%= boardUrl({ assignee: 'me', filter: '' }) %>">
         自分のボール (<%= me.name %>)
       </a>
     <% } %>
     <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
+    <%# 確認中 (2026-08-31 スタッフ要望)。件数は**絞り込み・ビューと無関係の商品件数**を出す —
+        絞り込み中に 0 と出ると確認中が無いように見えて、拾うための入口がそこで消える。
+        画像ビューはカード = 商品×種別なので、この件数とカード枚数は一致しない (Codex R1) %>
+    <a class="chip <%= checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'checking' }) %>"
+       title="確認中の商品の件数 (いまの絞り込み・ビューに関わらない全体の数)"
+       style="<%= !checkingOnly && board.checkingTotal > 0 ? 'border-color:#3b82f6; color:#1e40af;' : '' %>">
+      🔍 確認中<%= board.checkingTotal > 0 ? ` ${board.checkingTotal}` : '' %>
+    </a>
     <% if (boardView === 'image') { %>
       <%# 種別の絞り込み (2026-08-24 中原さん要望)。担当者の絞り込みとは独立に効く %>
       <span style="border-left:1px solid #e2e8f0; align-self:stretch;"></span>
@@ -191,7 +205,7 @@
           <% for (const c of col.cards) { %>
             <% const stalled = boardView === 'image' ? c.kindStalledDays : c.stalledDays; %>
             <% const currentCode = boardView === 'image' ? (c.kindCurrent && c.kindCurrent.step_code) : (c.current && c.current.step_code); %>
-            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
+            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= c.checking ? ' checking' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
                  data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>"
                  data-current="<%= currentCode || '' %>"
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
@@ -208,6 +222,13 @@
                   <% if (!c.hasProductInfo && c.ownBrand) { %><span class="kb-tag info-missing">商品情報 未入力</span><% } %>
                 </div>
               <% } %>
+              <% } %>
+              <%# 確認中 (2026-08-31)。列は動かさず、何を待っているか + 何日待っているかをカードに出す。
+                  7日を超えたら色を変える (待ちっぱなしで忘れられたカードを目立たせる) %>
+              <% if (c.checking) { %>
+                <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
+                  🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
+                </div>
               <% } %>
               <%# AI が「人の確認待ち」にした商品 (2026-08-28)。列は動かさず理由をカードに出す %>
               <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
@@ -311,13 +332,18 @@
         <%# 完了カードもドラッグで差し戻せる (data-current 空 = 全工程決着の CAS 値)。
             画像ビューは 商品×種別 なので、どちらを戻すかはカード自体が持っている %>
         <% for (const c of board.doneCards) { %>
-          <div class="kb-card<%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
+          <div class="kb-card<%= c.checking ? ' checking' : '' %><%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
                data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <a class="kb-card-link" href="<%= cardHref(c.id, false) %>">
             <% if (boardView === 'image' && c.kind) { %>
               <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
+            <% } %>
+            <% if (c.checking) { %>
+              <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
+                🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
+              </div>
             <% } %>
             <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
             <div class="kb-card-top">
