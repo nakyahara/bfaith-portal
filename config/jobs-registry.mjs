@@ -646,6 +646,27 @@ export const JOBS_REGISTRY = [
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
   {
+    id: 'mall-fetch-skip-rakuten-blocked',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: '夜間のモールCSV取得から **rakuten (RPP広告) と rakuten-data (データ分析) を一時除外**している。'
+      + 'miniPC の .env に MALL_FETCH_ONLY=rakuten-review,yahoo,yahoo-review,aupay,qoo10 を設定。'
+      + '理由: この2つは 2026-07-17 から RMS のサブアプリ側で拒否され続けており、'
+      + '**拒否されるとRMSセッションごと失効する**ため、同じ実行の後ろに並ぶ rakuten-review (レビュー取得= '
+      + 'クーポンメールの入力データ) まで巻き込んで失敗させていた。加えて失敗のたびに再ログインを繰り返すため、'
+      + 'ログイン自体が弾かれる状態を招く (2026-08-30 に実際に発生)。'
+      + '除外しても失うデータは無い (6週間前から取れていない)',
+    where: 'miniPC C:\\Users\\bfaith\\bfaith-portal\\.env の MALL_FETCH_ONLY',
+    remove_by: '2026-09-30',
+    lifecycle: 'temporary',
+    runbook: 'R-Login の「利用者管理（権限管理）」→「サービス別権限設定」で RPP広告 と データ分析 の権限を確認・付与し、'
+      + 'node scripts/mall-csv-fetcher/rakuten-data-download.mjs が通ることを確認したら '
+      + '.env の MALL_FETCH_ONLY を削除してこのエントリも消す。'
+      + '🚨検証は1日1回まで (失敗するたびにセッションが切れ、連続ログインでアカウントが弾かれる)。'
+      + '経緯 = AI_reference のインシデント記録『楽天RMS サブアプリ認証拒否障害』2026-08-30 追記',
+  },
+  {
     id: 'retired-tasks-cleanup',
     type: 'temporary_asset',
     importance: 'TMP',
