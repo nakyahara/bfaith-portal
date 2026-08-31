@@ -2562,27 +2562,8 @@
     });
   })();
 
-  // 画像フォルダのリンクを開くボタン (2026-08-31 中原さん要望)。
-  // 入力が空 / http(s) 以外のときは隠す (javascript: を踏ませない)
-  (function initFolderOpen() {
-    const input = document.getElementById('import-folder-url');
-    const link = document.getElementById('import-folder-open');
-    if (!input || !link) return;
-    const sync = () => {
-      const v = String(input.value || '').trim();
-      let ok = false;
-      try {
-        const u = new URL(v);
-        ok = u.protocol === 'http:' || u.protocol === 'https:';
-      } catch (e) { ok = false; }
-      link.style.display = ok ? '' : 'none';
-      if (ok) link.href = v;
-      else link.removeAttribute('href');
-    };
-    input.addEventListener('input', sync);
-    input.addEventListener('change', sync);
-    sync();
-  })();
+  // 画像フォルダのリンク (Amazon URL と同じ共通関数で開く)
+  bindOpenLink('import-folder-url', 'import-folder-open');
 
   document.getElementById('rk-attr-add').addEventListener('click', () => {
     const tr = document.createElement('tr');

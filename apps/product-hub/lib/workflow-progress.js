@@ -945,7 +945,7 @@ export function moveBoardCard(
         const otherKind = kind === 'detail' ? 'top' : 'detail';
         const inOther = db.prepare(`
           SELECT label FROM ph_steps WHERE track = 'image' AND active = 1 AND image_stage = ?
-            AND ${otherKind === 'detail' ? "image_kind = 'detail'" : "image_kind <> 'detail'"}
+            AND ${otherKind === 'detail' ? "image_kind = 'detail'" : "(image_kind IS NULL OR image_kind <> 'detail')"}
           LIMIT 1
         `).get(String(to));
         if (inOther) {

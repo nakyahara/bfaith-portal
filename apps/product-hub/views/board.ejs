@@ -595,6 +595,8 @@
           o.value = s.value;
           o.style.background = p ? p.bg : '';
           o.style.color = p ? p.fg : '';
+          // 枠線も揃える (初期描画は border-color も重要度色。ここを抜くと枠だけ前の色が残る)
+          o.style.borderColor = p ? p.fg + '33' : '';
           o.style.fontWeight = p ? '600' : '';
         });
       } catch (err) {
