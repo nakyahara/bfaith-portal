@@ -71,6 +71,10 @@ function db() {
     if (!d.prepare('PRAGMA table_info(voucher_inbox)').all().some(c => c.name === 'extract_note')) {
       d.exec("ALTER TABLE voucher_inbox ADD COLUMN extract_note TEXT NOT NULL DEFAULT ''");
     }
+    // 相手の仕訳に既に付いている証憑の数。0より大きい行に貼ると二重添付になるので、画面で警告しボタンを変える
+    if (!d.prepare('PRAGMA table_info(voucher_inbox)').all().some(c => c.name === 'match_journal_vouchers')) {
+      d.exec('ALTER TABLE voucher_inbox ADD COLUMN match_journal_vouchers INTEGER NOT NULL DEFAULT 0');
+    }
     // 明細ごとに 確保中/添付済み は1件だけ (二重POSTをDBで止める。確保の時点で効く)
     d.exec('DROP INDEX IF EXISTS uq_voucher_inbox_attached_tx');
     d.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_inbox_owned_tx ON voucher_inbox(match_tx_id)
@@ -259,17 +263,20 @@ export function updateInboxMeta(id, body) {
   };
   db().prepare(`UPDATE voucher_inbox SET vendor_id=@vendor_id, vendor_name=@vendor_name, doc_date=@doc_date, amount=@amount, note=@note,
     status='new', match_tx_id='', match_journal_id='', match_journal_number=NULL, match_strength='', match_reason='', candidates_json='[]',
+    match_journal_vouchers=0,
     updated_at=@now WHERE id=@id`).run({ ...data, now: new Date().toISOString(), id });
   return getInbox(id);
 }
 
-export function setMatch(id, { status, tx_id = '', journal_id = '', journal_number = null, strength = '', reason = '', candidates = [] }) {
+export function setMatch(id, { status, tx_id = '', journal_id = '', journal_number = null, strength = '', reason = '', candidates = [], journal_vouchers = 0 }) {
   if (!INBOX_STATUSES.includes(status)) throw new Error('bad_status');
   // 添付の確保中・添付済み・要確認は突合結果で上書きしない
   db().prepare(`UPDATE voucher_inbox SET status=@status, match_tx_id=@tx_id, match_journal_id=@journal_id, match_journal_number=@journal_number,
-    match_strength=@strength, match_reason=@reason, candidates_json=@candidates, last_checked_at=@now, error='', updated_at=@now
+    match_strength=@strength, match_reason=@reason, match_journal_vouchers=@journal_vouchers, candidates_json=@candidates,
+    last_checked_at=@now, error='', updated_at=@now
     WHERE id=@id AND status NOT IN ('attaching','attached','needs_check')`)
-    .run({ status, tx_id, journal_id, journal_number, strength, reason, candidates: JSON.stringify(candidates).slice(0, 20000), now: new Date().toISOString(), id });
+    .run({ status, tx_id, journal_id, journal_number, strength, reason, journal_vouchers: Number(journal_vouchers) || 0,
+      candidates: JSON.stringify(candidates).slice(0, 20000), now: new Date().toISOString(), id });
 }
 
 // ---- 添付の確保 (リース) ----

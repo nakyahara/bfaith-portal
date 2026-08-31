@@ -57,6 +57,13 @@
   .strength.strong { background: #dcfce7; color: #166534; }
   .strength.weak { background: #fef3c7; color: #92400e; }
   .reason { color: #6b7280; font-size: 11px; }
+  .st.dup { background: #fee2e2; color: #b91c1c; margin-left: 4px; }
+  .btn.warn { background: #fffbeb; border-color: #f59e0b; color: #92400e; }
+  .btn.warn:hover { background: #fef3c7; }
+  .mflink { color: #2563eb; font-size: 11px; text-decoration: none; white-space: nowrap; }
+  .mflink:hover { text-decoration: underline; }
+  .dupnote { color: #b91c1c; font-size: 11px; margin-top: 3px; line-height: 1.5; }
+  .jlink { margin-top: 3px; }
   .edit input { width: 100%; padding: 3px 6px; border: 1px solid #c9ced6; border-radius: 4px; font-size: 12px; }
   .empty { padding: 30px; text-align: center; color: #9ca3af; }
   .note { background: #f0f9ff; border: 1px solid #bae6fd; color: #075985; border-radius: 4px; padding: 8px 12px; font-size: 12px; margin-bottom: 12px; line-height: 1.6; }
@@ -134,6 +141,7 @@ async function api(path, opts) {
   if (!res.ok || !body.ok) {
     const err = new Error(body.error || ('http_' + res.status));
     if (body.detail) err.detail = body.detail; // MFのエラー本文 (原因の切り分け用)
+    if (body.vouchers != null) err.vouchers = body.vouchers; // 既に付いている証憑の数 (二重添付の警告に使う)
     throw err;
   }
   return body.result;
@@ -193,7 +201,7 @@ function render() {
   $('rows').innerHTML = rows.map(r => `<tr>
     <td class="file"><a href="../api/inbox/${r.id}/file" target="_blank" rel="noopener">${esc(r.file_name)}</a><span class="src">${esc(r.source)} ／ ${esc((r.created_at || '').slice(0, 10))}</span></td>
     ${editing.has(r.id) ? editCells(r) : `<td>${esc(r.doc_date || '—')}</td><td class="amount">${r.amount != null ? Number(r.amount).toLocaleString() : '—'}</td><td>${esc(r.vendor_name || '—')}</td>`}
-    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}<div class="reason">${esc(r.error || r.match_reason || '')}</div>${r.extract_note ? `<div class="reason" title="読み取りの経緯">📖 ${esc(r.extract_note)}</div>` : ''}</td>
+    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}${hasDup(r) ? '<span class="st dup" title="相手の仕訳にはもう証憑が付いています。このまま貼ると二重添付になります">⚠ 仕訳に証憑あり</span>' : ''}<div class="reason">${esc(r.error || r.match_reason || '')}</div>${r.extract_note ? `<div class="reason" title="読み取りの経緯">📖 ${esc(r.extract_note)}</div>` : ''}</td>
     <td>${candCell(r)}</td>
     <td>${actions(r)}</td>
   </tr>`).join('');
@@ -211,11 +219,37 @@ function candLine(c, pick, rId) {
     <span class="meta">${c.status === 'none' ? '未仕訳' : '登録済'}${c.day_diff != null ? ` ／ 日付差${c.day_diff}日` : ''}</span></span>`;
 }
 
+// MFには「仕訳1件を直接開くURL」が無いため、仕訳帳を開いて 仕訳No. で探してもらう
+// (明細ビューの「金額をコピー → MFの金額欄に貼る」と同じ流儀)
+const MF_JOURNALS_URL = 'https://accounting.moneyforward.com/journals';
+
+/** 相手の仕訳に既に証憑が付いているか (貼ると二重添付になる行) */
+function hasDup(r) {
+  return Number(r.match_journal_vouchers || 0) > 0 && !['attached', 'attaching', 'excluded'].includes(r.status);
+}
+
+/** MFの仕訳帳へのリンク + 仕訳No.のコピー (No. が無ければ何も出さない) */
+function mfJournalCell(r, label) {
+  const no = r.match_journal_number;
+  if (!no) return '';
+  return `<div class="jlink"><a class="mflink" href="${MF_JOURNALS_URL}" target="_blank" rel="noopener"
+    title="MFの仕訳帳を新しいタブで開きます。仕訳No.で検索してください">${label}</a>
+    <button class="btn mini" data-copyno="${esc(String(no))}" title="仕訳No.をコピー（MFの仕訳帳の検索欄に貼る）">No.${esc(String(no))} をコピー</button></div>`;
+}
+
+/** 二重添付になる行の説明 (何が起きるか・どうすればよいか) */
+function dupNote(r) {
+  if (!hasDup(r)) return '';
+  const n = Number(r.match_journal_vouchers);
+  return `<div class="dupnote">⚠ この仕訳には既に証憑が ${n} 件付いています。貼ると ${n + 1} 件並びます。<br>
+    同じ書類なら「除外」、別の書類だとMFで確かめられたときだけ「それでも貼る」。</div>` + mfJournalCell(r, 'MFで中身を確認する ↗');
+}
+
 function candCell(r) {
-  if (r.status === 'attached') return `<span class="cand">仕訳 No.${esc(r.journal_number_display || r.match_journal_number || '')} に添付済み <span class="meta">${esc((r.attached_at || '').slice(0, 16).replace('T', ' '))}</span></span>`;
+  if (r.status === 'attached') return `<span class="cand">仕訳 No.${esc(r.journal_number_display || r.match_journal_number || '')} に添付済み <span class="meta">${esc((r.attached_at || '').slice(0, 16).replace('T', ' '))}</span></span>` + mfJournalCell(r, 'MFでこの仕訳を見る ↗');
   if (r.status === 'ambiguous') return r.candidates.map(c => candLine(c, true, r.id)).join('') + '<div class="reason">候補をクリックすると、その明細（の仕訳）に貼ります</div>';
   if (r.status === 'waiting_registration') return r.candidates.map(c => candLine(c, false, r.id)).join('') + '<div class="reason">この明細はMFでまだ未仕訳です。MFで「登録」すると次の周期（毎時07分）に貼られます</div>';
-  if (r.candidates?.length) return r.candidates.map(c => candLine(c, false, r.id)).join('');
+  if (r.candidates?.length) return r.candidates.map(c => candLine(c, false, r.id)).join('') + dupNote(r);
   if (r.status === 'no_match') return '<span class="reason">同じ金額の明細が見つかりません。日付・金額・支払先を直すか、除外してください</span>';
   return '';
 }
@@ -223,7 +257,10 @@ function candCell(r) {
 function actions(r) {
   if (editing.has(r.id)) return `<button class="btn mini ok" data-save="${r.id}">保存して再照合</button> <button class="btn mini" data-cancel="${r.id}">やめる</button>`;
   const b = [];
-  if (r.status === 'proposed') b.push(`<button class="btn mini ok" data-attach="${r.id}">承認して貼る</button>`);
+  // 二重添付になる行は、青い「承認して貼る」を出さない (押しやすい位置に置かない)
+  if (r.status === 'proposed') b.push(hasDup(r)
+    ? `<button class="btn mini warn" data-attach="${r.id}" title="この仕訳には既に証憑があります。MFで中身を確かめてから押してください">それでも貼る</button>`
+    : `<button class="btn mini ok" data-attach="${r.id}">承認して貼る</button>`);
   if (r.status === 'needs_check') {
     b.push(`<button class="btn mini" data-reopen="${r.id}" title="MFで見て、貼れていなかった">貼れていない→戻す</button>`);
     b.push(`<button class="btn mini" data-exclude="${r.id}" title="MFで見て、貼れていた">貼れていた→除外</button>`);
@@ -237,10 +274,15 @@ function actions(r) {
 }
 
 document.addEventListener('click', async (ev) => {
-  const t = ev.target.closest('[data-tab],[data-attach],[data-pick],[data-edit],[data-save],[data-cancel],[data-exclude],[data-reopen],[data-extract]');
+  const t = ev.target.closest('[data-tab],[data-attach],[data-pick],[data-edit],[data-save],[data-cancel],[data-exclude],[data-reopen],[data-extract],[data-copyno]');
   if (!t) return;
   try {
     if (t.dataset.tab) { tab = t.dataset.tab; renderTabs(); render(); return; }
+    if (t.dataset.copyno) {
+      navigator.clipboard?.writeText(String(t.dataset.copyno));
+      toast(`仕訳No.${t.dataset.copyno} をコピーしました。MFの仕訳帳の検索欄に貼ってください`);
+      return;
+    }
     if (t.dataset.attach) { t.disabled = true; await attachWithConfirm(t.dataset.attach, {}); toast('MFの仕訳に貼りました'); return load(t.dataset.attach); }
     if (t.dataset.pick) {
       if (!confirm('この明細に貼りますか？')) return;
@@ -284,7 +326,21 @@ async function attachWithConfirm(id, body) {
     return await api(`../api/inbox/${id}/attach`, { method: 'POST', body: JSON.stringify(body) });
   } catch (e) {
     if (e.message !== 'journal_has_voucher') throw e;
-    if (!confirm('この仕訳には既に証憑が付いています。追加で貼りますか？（同じ領収書の二重添付にご注意ください）')) throw new Error('cancelled');
+    const row = (data.rows || []).find(x => String(x.id) === String(id)) || {};
+    const n = Number(e.vouchers || row.match_journal_vouchers || 1);
+    const where = row.match_journal_number ? `仕訳 No.${row.match_journal_number}` : 'この仕訳';
+    const msg = [
+      '⚠ 二重添付になるかもしれません',
+      '',
+      `${where} には、すでに証憑が ${n} 件付いています。`,
+      `このまま貼ると、同じ仕訳に証憑が ${n + 1} 件並びます。`,
+      '',
+      `貼ろうとしているファイル: ${row.file_name || ''}`,
+      '',
+      '・すでに貼ってある物と同じ書類 → 「キャンセル」して、行の「除外」を押してください',
+      '・MFで中身を見て、別の書類だと確かめた → 「OK」',
+    ].join('\n');
+    if (!confirm(msg)) throw new Error('cancelled');
     return api(`../api/inbox/${id}/attach`, { method: 'POST', body: JSON.stringify({ ...body, force: true }) });
   }
 }

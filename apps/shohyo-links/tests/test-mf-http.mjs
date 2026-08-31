@@ -57,6 +57,15 @@ check('不正な期間は400 bad_period', r.status === 400 && (await r.json()).e
 r = await fetch(base + '/apps/shohyo-links/api/mf/unattached?start=2026-08-01&end=2026-08-31');
 check('未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
 
+// 受け箱の画面に「二重添付のガード」と「仕訳へのリンク」が入っていること (描画はブラウザ側なのでソースで確認)
+const inboxHtml = await (await fetch(base + '/apps/shohyo-links/mf/inbox')).text();
+check('受け箱: 証憑ありの行は「それでも貼る」に変わる', inboxHtml.includes('それでも貼る') && inboxHtml.includes('hasDup(r)'));
+check('受け箱: 「⚠ 仕訳に証憑あり」バッジがある', inboxHtml.includes('⚠ 仕訳に証憑あり'));
+check('受け箱: MFの仕訳帳へのリンクと No.コピーがある',
+  inboxHtml.includes('https://accounting.moneyforward.com/journals') && inboxHtml.includes('data-copyno'));
+check('受け箱: 二重添付の確認文に件数と選択肢が出る',
+  inboxHtml.includes('二重添付になるかもしれません') && inboxHtml.includes('別の書類だと確かめた'));
+
 // 明細ビュー
 r = await fetch(base + '/apps/shohyo-links/mf/transactions', { redirect: 'manual' });
 check('/mf/transactions は200', r.status === 200, String(r.status));

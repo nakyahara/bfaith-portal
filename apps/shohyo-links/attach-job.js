@@ -138,7 +138,8 @@ async function runOnce({ attach = true, actor = 'cron' } = {}) {
         summary.proposed++;
         setMatch(item.id, {
           status: 'proposed', tx_id: c.tx_id, journal_id: j.id, journal_number: j.number, strength: m.strength,
-          reason: alreadyHas ? `${m.reason} (仕訳に証憑あり)` : m.reason, candidates: m.candidates,
+          // 既に証憑がある相手は「数」で持つ (画面が警告表示とボタンの出し分けに使う。文字列に混ぜると壊れやすい)
+          reason: m.reason, journal_vouchers: alreadyHas ? (j.voucher_file_ids || []).length : 0, candidates: m.candidates,
         });
       }
     } catch (e) {

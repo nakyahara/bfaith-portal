@@ -180,5 +180,23 @@ check('periodFor: 未来日付でも start <= end', fs1 <= fe1);
 m = matchVoucher({ vendor_name: 'PAYPAY', amount: 100, doc_date: '2026-08-01' }, [{ id: 'tp', date: '2026-08-01', value: 100, side: 'EXPENSE', content: 'PAYPAY', journalizing_status: 'none' }], vendors);
 check('雑音語だけの加盟店名は strong にしない', m.kind === 'unique' && m.strength === 'weak');
 
+// ---- 二重添付のガード (相手の仕訳に既に証憑がある行) ----
+// 2026-08-31: 「(仕訳に証憑あり)」を reason 文字列に混ぜていたため画面で目立たず、
+// 青い「承認して貼る」がそのまま出ていた。件数を正式なフィールドで持つ。
+const dupIn = addToInbox(Buffer.from('%PDF-1.4 dup'), { file_name: 'dup.pdf', doc_date: '2026-07-20', amount: 11422 });
+const dupId = dupIn.row.id;
+const proposed = (journal_vouchers, reason = 'amount+date (vendor text mismatch)') =>
+  setMatch(dupId, { status: 'proposed', tx_id: 'tdup', journal_id: 'jdup', journal_number: 607, strength: 'weak', reason, journal_vouchers, candidates: [{ tx_id: 'tdup' }] });
+
+check('既定は0 (証憑なし)', getInbox(dupId).match_journal_vouchers === 0);
+proposed(2);
+check('仕訳に既に付いている証憑の数を保存する', getInbox(dupId).match_journal_vouchers === 2);
+check('reason 文字列には混ぜない', !String(getInbox(dupId).match_reason).includes('仕訳に証憑あり'));
+proposed(0);
+check('証憑が無くなれば0に戻る (前回値が残らない)', getInbox(dupId).match_journal_vouchers === 0);
+proposed(1);
+updateInboxMeta(dupId, { amount: 11423 });
+check('「直す」で件数もリセットされる', getInbox(dupId).match_journal_vouchers === 0 && getInbox(dupId).status === 'new');
+
 console.log(failed ? `\n${failed}件NG` : '\n全件パス');
 process.exit(failed ? 1 : 0);

@@ -408,7 +408,12 @@ router.post('/api/inbox/:id/attach', async (req, res) => {
     if ((j.voucher_file_ids || []).length > 0 && req.body?.force !== true) {
       return res.status(409).json({ ok: false, error: 'journal_has_voucher', vouchers: j.voucher_file_ids.length });
     }
-    const r = await attachWithClaim(row, j, { tx_id: txId, mode: 'manual', actor: actorOf_(req), reason: bodyTx ? 'picked' : 'approved' });
+    // 既に証憑がある仕訳へ人の確認で追加した場合は、後から分かるよう台帳に残す
+    const forced = req.body?.force === true && (j.voucher_file_ids || []).length > 0;
+    const r = await attachWithClaim(row, j, {
+      tx_id: txId, mode: 'manual', actor: actorOf_(req),
+      reason: `${bodyTx ? 'picked' : 'approved'}${forced ? '+force(証憑ありの仕訳へ追加)' : ''}`,
+    });
     if (!r.ok) {
       if (r.error === 'claim_failed') return res.status(409).json({ ok: false, error: 'already_attached' });
       if (r.error === 'needs_check') return res.status(502).json({ ok: false, error: 'needs_check' });
