@@ -616,10 +616,10 @@ function renderPage() {
       try {
         const r = await fetch(location.pathname + '/upload', { method: 'POST', body: formData });
         const data = await r.json();
-        if (data.error) { document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + data.error + '</span>'; return; }
+        if (data.error) { document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + esc(data.error) + '</span>'; return; }
         showResult(data);
       } catch(e) {
-        document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + e.message + '</span>';
+        document.getElementById('uploadStatus').innerHTML = '<span class="negative">エラー: ' + esc(e.message) + '</span>';
       }
       btn.disabled = false;
       btn.textContent = 'アップロード＆集計';
@@ -999,10 +999,10 @@ function renderPage() {
           document.getElementById('confirmStatus').innerHTML = '<span style="color:#27ae60">OK ' + lastData.yearMonth + ' 確定済（' + result.confirmed_at + '）</span>';
           loadHistory();
         } else {
-          document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + (result.error || '') + '</span>';
+          document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + esc(result.error || '') + '</span>';
         }
       } catch(e) {
-        document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + e.message + '</span>';
+        document.getElementById('confirmStatus').innerHTML = '<span class="negative">エラー: ' + esc(e.message) + '</span>';
       }
       btn.disabled = false;
       btn.textContent = 'この月の集計を確定';
@@ -1140,6 +1140,15 @@ function renderPage() {
         const segCols = ['商品売上','商品の売上税','配送料','配送料の税金','ギフト包装手数料','ギフト包装の税金','Amazonポイント費用','プロモーション割引額','プロモーション割引の税金','手数料','FBA手数料','トランザクション他','その他','合計'];
         const adTargets = ['1','2'];
 
+        // CSVセル (サーバ側 csvCell と同じ規則): 数値はそのまま、文字列は 引用符/カンマ/改行を引用し、先頭 = + - @ はアポストロフィ。
+        // 検証導入前に /import-history で保存された文字列値が数式セルになったり列を崩したりするのを防ぐ
+        const csvCellJs = v => {
+          if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '';
+          let s = String(v == null ? '' : v);
+          if (/^[\\s\\u0000-\\u001f]*[=+\\-@]/.test(s)) s = "'" + s;
+          return /[",\\r\\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+        };
+
         let csv = '\\uFEFF'; // BOM
         csv += '集計月,セグメント,' + segCols.join(',') + ',広告費,原価合計,' + FEE_COLUMNS.join(',') + '\\n';
 
@@ -1169,9 +1178,9 @@ function renderPage() {
 
           for (const [key, sr] of Object.entries(seg)) {
             const label = segNames[key] || key;
-            const vals = segCols.map(c => sr[c] || 0);
-            const feeVals = FEE_COLUMNS.map(c => sr[c] === undefined ? '' : sr[c]); // 未対応月は空欄
-            csv += ymStr + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + ',' + feeVals.join(',') + '\\n';
+            const vals = segCols.map(c => csvCellJs(sr[c] || 0));
+            const feeVals = FEE_COLUMNS.map(c => sr[c] === undefined ? '' : csvCellJs(sr[c])); // 未対応月は空欄
+            csv += [csvCellJs(ymStr), csvCellJs(key + ':' + label), ...vals, csvCellJs(adMap[key] || 0), csvCellJs(sr.原価合計 || 0), ...feeVals].join(',') + '\\n';
           }
         }
 
