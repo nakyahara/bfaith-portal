@@ -654,10 +654,11 @@ console.log('HTTP: 全件一括');
     const row1 = rowOf(ciMail);
     check('API: 注文番号を保存 (前後空白は除去) + manual_fields に手入力として記録',
       r1.status === 200 && row1.order_number === '373343-20260831-00001' && row1.manual_fields === '["order_number"]', JSON.stringify(r1.j));
-    check('API: 応答に保存後のNE受注リンク (メールでも手入力の番号でNEを開ける)',
-      !!r1.j.links && String(r1.j.links.ne_order_url).includes('kensaku_denpyo_no=373343-20260831-00001') && r1.j.links.mall_order_url === null);
+    check('API: 応答に保存後のNE受注リンク (メールでも手入力の番号でNEを開ける) + 楽天形式なのでモール自動判定',
+      !!r1.j.links && String(r1.j.links.ne_order_url).includes('kensaku_denpyo_no=373343-20260831-00001')
+      && r1.j.guessed_mall === 'rakuten' && String(r1.j.links.mall_order_url).includes('orderNumber=373343-20260831-00001'));
     check('API: 操作ログ customer_info_edit (before/after は変更項目のみ)',
-      !!db.prepare("SELECT 1 FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit' AND before_json = '{\"order_number\":null}' AND after_json = '{\"order_number\":\"373343-20260831-00001\"}'").get(ciMail));
+      !!db.prepare("SELECT 1 FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit' AND before_json LIKE '%\"order_number\":null%' AND after_json LIKE '%\"order_number\":\"373343-20260831-00001\"%' AND after_json NOT LIKE '%product%'").get(ciMail));
     check('一覧検索: 手入力した注文番号でも見つかる', listInquiries({ q: '373343-20260831-00001' }).rows.some(r => r.id === ciMail));
     const dCi2 = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
     check('保存後の詳細: 手入力の注文番号は引き続き入力欄 (ロックしない) + NE直リンク + 検索導線は消える',
@@ -721,6 +722,69 @@ console.log('HTTP: 全件一括');
       manualFieldsAfterSync('["order_number","product_code"]', { orderNumber: 'X', productCode: null }) === '["product_code"]'
       && manualFieldsAfterSync('["order_number"]', { orderNumber: 'X' }) === null
       && manualFieldsAfterSync(null, { orderNumber: 'X' }) === null);
+
+    // ─── モール選択 (2026-08-31 追加要望): 注文番号に「どのモールか」を付け、そのモールの注文詳細へ飛べるように ───
+    console.log('  -- 注文番号のモール選択 + 注文詳細リンク');
+    const { orderLinksOf, guessOrderMall } = await import('./customer-info.js');
+    await jp(`/api/inquiries/${ciMail}/customer-info`, { order_mall: '', order_number: '' });
+    const dM0 = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
+    check('メール: 注文番号の左にモール選択 (未選択・出店モール一覧)',
+      dM0.includes('id="ci_order_mall"') && dM0.includes('<option value="">モール…</option>') && dM0.includes('<option value="rakuten">楽天市場</option>')
+      && dM0.includes('<option value="amazon">Amazon</option>') && dM0.includes('>au PAY マーケット<') && dM0.includes('>LINEギフト<') && dM0.includes('class="row ci-order-row"'));
+    const m1 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: '373343-20260831-00001' });
+    check('楽天形式の注文番号: モールを楽天と自動判定 + RMSの注文詳細リンク',
+      m1.status === 200 && m1.j.guessed_mall === 'rakuten' && m1.j.order_mall === 'rakuten' && rowOf(ciMail).order_mall === 'rakuten'
+      && m1.j.links.mall === 'rakuten' && m1.j.links.mall_short === '楽天'
+      && m1.j.links.mall_order_url === 'https://order-rp.rms.rakuten.co.jp/order-rb/individual-order-detail/init?orderNumber=373343-20260831-00001', JSON.stringify(m1.j));
+    check('操作ログにモールも残る (自動判定分)',
+      !!db.prepare("SELECT 1 FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit' AND after_json LIKE '%\"order_mall\":\"rakuten\"%'").get(ciMail));
+    const dM1 = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
+    check('保存後の詳細: モール選択が楽天 + 「🛍️ 楽天で注文を開く」+ 履歴に「モール=楽天市場」',
+      dM1.includes('<option value="rakuten" selected>') && dM1.includes('🛍️ 楽天で注文を開く ↗') && dM1.includes('モール=楽天市場'));
+    const m2 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: '503-1234567-7654321' });
+    check('Amazon形式に変えたら Amazon に判定し直し + Seller Central の注文詳細リンク',
+      m2.status === 200 && m2.j.guessed_mall === 'amazon' && rowOf(ciMail).order_mall === 'amazon'
+      && m2.j.links.mall_order_url === 'https://sellercentral.amazon.co.jp/orders-v3/order/503-1234567-7654321', JSON.stringify(m2.j.links));
+    const m3 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_mall: 'qoo10' });
+    check('モールを手動で Qoo10 に: 直リンク形式が未確認なので管理画面トップ (番号コピー導線)',
+      m3.status === 200 && rowOf(ciMail).order_mall === 'qoo10' && m3.j.links.mall_order_url === null
+      && m3.j.links.mall_admin_url === 'https://qsm.qoo10.jp/' && m3.j.links.order_number === '503-1234567-7654321', JSON.stringify(m3.j.links));
+    const dM3 = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
+    check('Qoo10 の詳細: 「管理画面を開く (番号をコピー)」リンク + コピーして開くJS',
+      dM3.includes('class="ci-copy-open"') && dM3.includes('data-copy="503-1234567-7654321"') && dM3.includes('Qoo10の管理画面を開く (番号をコピー)')
+      && dM3.includes("closest('a.ci-copy-open')"));
+    let jsErrM = null; try { new vm.Script(scriptOf(dM3)); } catch (e) { jsErrM = e; }
+    check('詳細画面のクライアントJSが構文OK (モール選択込み)', jsErrM === null, String(jsErrM));
+    const m4 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: 'Q-99999' });
+    check('形式で判定できない番号: 選んであるモールは維持 (Qoo10)', m4.status === 200 && m4.j.guessed_mall === null && rowOf(ciMail).order_mall === 'qoo10');
+    const m5 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_mall: 'ebay' });
+    check('不明なモールは 400', m5.status === 400 && rowOf(ciMail).order_mall === 'qoo10');
+    const m6 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_mall: '' });
+    check('未選択に戻せる (NULL・リンク無し・NEだけ残る)',
+      m6.status === 200 && rowOf(ciMail).order_mall === null && m6.j.links.mall === null && m6.j.links.mall_order_url === null && m6.j.links.mall_admin_url === null && !!m6.j.links.ne_order_url);
+    const yAcct = db.prepare("SELECT account_identifier FROM shops WHERE channel_type = 'yahoo' AND is_active = 1 ORDER BY id LIMIT 1").get()?.account_identifier;
+    const m7 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_mall: 'yahoo' });
+    check('Yahoo!選択 (接頭辞なしの番号): ストクリURLは店舗接頭辞付き・NEは接頭辞なし',
+      !!yAcct && m7.status === 200 && m7.j.links.mall_order_url === `https://pro.store.yahoo.co.jp/pro.${yAcct}/order/manage/detail/${yAcct}-Q-99999`
+      && m7.j.links.ne_order_url.includes('kensaku_denpyo_no=Q-99999&'), JSON.stringify(m7.j.links));
+    const m8 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: `${yAcct}-10287187` });
+    check('Yahoo!接頭辞付きの番号: URLは二重に付けない・NEは接頭辞を剥がす',
+      m8.status === 200 && rowOf(ciMail).order_mall === 'yahoo' && m8.j.links.mall_order_url.endsWith(`/order/manage/detail/${yAcct}-10287187`)
+      && m8.j.links.ne_order_url.includes('kensaku_denpyo_no=10287187&'), JSON.stringify(m8.j.links));
+    const m9 = await jp(`/api/inquiries/${ciRk}/customer-info`, { order_mall: 'amazon' });
+    check('確定した注文番号のモールは変更できない (409) + 確定の詳細にはモール選択を出さない',
+      m9.status === 409 && rowOf(ciRk).order_mall == null && !dRk2.includes('id="ci_order_mall"'));
+    check('guessOrderMall: 楽天/Amazon/Yahoo!接頭辞/数字だけは不明',
+      guessOrderMall('373343-20260617-49607914') === 'rakuten' && guessOrderMall('249-1234567-1234567') === 'amazon'
+      && guessOrderMall('b-faith01-10287187', { yahooAccounts: ['b-faith01'] }) === 'yahoo'
+      && guessOrderMall('10287187', { yahooAccounts: ['b-faith01'] }) === null && guessOrderMall('') === null);
+    const olLine = orderLinksOf({ channel_type: 'email', order_number: '1', order_mall: 'linegift', manual_fields: '["order_number"]' }, { yahooAccounts: [] });
+    check('orderLinksOf: URL未知のモール (LINEギフト) はモール名だけ・リンク無し・NEは出る',
+      olLine.mall === 'linegift' && olLine.mallLabel === 'LINEギフト' && olLine.mallOrderUrl === null && olLine.mallAdminUrl === null && !!olLine.neOrderUrl);
+    const olLocked = orderLinksOf({ channel_type: 'rakuten', order_number: '1', order_mall: 'amazon', manual_fields: null }, { yahooAccounts: [] });
+    check('orderLinksOf: 確定 (同期由来) は order_mall を無視してチャネルのモール', olLocked.mall === 'rakuten' && olLocked.mallOrderUrl.includes('rms.rakuten'));
+    const olRkEmpty = orderLinksOf({ channel_type: 'rakuten', order_number: null, order_mall: null, manual_fields: null }, { yahooAccounts: [] });
+    check('orderLinksOf: 楽天チャネルで注文番号が空 = モールは楽天 (選択欄の初期値)・リンク無し', olRkEmpty.mall === 'rakuten' && olRkEmpty.mallOrderUrl === null && olRkEmpty.neOrderUrl === null);
   }
 
   await new Promise(r => srv.close(r));
