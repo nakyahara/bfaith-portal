@@ -37,7 +37,7 @@ import {
   listFaceImports, getFaceImportCsv, exportFacesCsv, ensureLocationFacesSeeded,
 } from './location-faces.js';
 import fs from 'fs';
-import { queueEnsureImages, getImageMap } from './images.js';
+import { queueEnsureImages, getImageMap, listMissingImages, missingImagesCsv, requestForceRefresh } from './images.js';
 import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
 // Drive共有ヘルパーと自動ポーリング (standaloneが起動。router は手動取込と状態表示に使う)
 import { getShippingFolders, driveCall, getPollerStatus } from './drive-sync.js';
@@ -708,6 +708,54 @@ router.get('/admin/stats', requireAdmin, (req, res) => {
     minDate: STATS_MIN_DATE,
   });
 });
+
+// ─── 画像が出ない商品の一覧 (2026-08-31 中原さん依頼) ───
+// 「ピッキング画面で写真が出ない商品」を楽天の商品管理番号つきで一覧化し、
+// 楽天側を直せば直るもの / そもそも楽天に商品が無いもの を見分けられるようにする
+function missingImagesParams(req) {
+  const until = isRealDate(String(req.query.until || '')) ? String(req.query.until) : jstToday();
+  return { until, days: parseDays(req.query.days) };
+}
+
+router.get('/admin/missing-images', requireAdmin, (req, res) => {
+  const p = missingImagesParams(req);
+  res.render(path.join(__dirname, 'views/admin_missing_images'), {
+    title: '画像が出ない商品',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    result: listMissingImages(p),
+    retried: req.query.retried === '1' ? Number(req.query.n || 0) : null,
+  });
+});
+
+router.get('/admin/missing-images.csv', requireAdmin, (req, res) => {
+  const p = missingImagesParams(req);
+  res.type('text/csv; charset=utf-8')
+    .set('Content-Disposition', `attachment; filename="picking-missing-images-${p.until}.csv"`)
+    .send(missingImagesCsv(listMissingImages(p)));
+});
+
+/**
+ * 一覧に出ているSKUを強制再取得する (not_found は当日中は自動再試行しないための手動の出口)。
+ * 対象は「再取得で直る可能性があり、かつ楽天の商品管理番号が引けるもの」だけ —
+ * 管理番号が引けない商品は何度呼んでも not_found で、RMS を無駄に叩くだけになる。
+ * 取込直後の自動解決と同じ直列キューに載せ、走っている間は 409 で断る (Codex R1)。
+ * all=1 で「画像なし全件 (管理番号があるもの)」に広げる。
+ */
+router.post('/admin/missing-images/retry', requireAdmin, checkOrigin, api(async (req, res) => {
+  const p = missingImagesParams(req);
+  const result = listMissingImages(p);
+  const all = String(req.query.all || '') === '1';
+  const skus = result.missing
+    .filter((x) => x.manageNumber && (all || x.retryable))
+    .map((x) => x.sku);
+  const stats = await requestForceRefresh(skus, `admin再取得(${skus.length}件)`);
+  if (stats === null) {
+    throw new PkError(409, 'image_queue_busy', '画像の取得が進行中です。少し待ってからもう一度お試しください');
+  }
+  res.json({ ok: true, requested: skus.length, stats: skus.length > 0 ? stats : null });
+}));
 
 // ─── 端末・作業者管理 (管理者・セッション必須) ───
 

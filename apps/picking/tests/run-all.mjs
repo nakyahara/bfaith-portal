@@ -8,7 +8,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
-const suites = ['test-import.mjs', 'test-work.mjs', 'test-images.mjs', 'test-device.mjs', 'test-notify.mjs', 'test-drive-sync.mjs', 'test-line-search.mjs', 'test-stats.mjs', 'test-board-acl.mjs', 'test-floor.mjs', 'test-floor-disabled.mjs', 'test-repick.mjs', 'test-floor-alerts.mjs', 'test-miss-stats.mjs', 'test-next-sign.mjs', 'test-shortage-link.mjs'];
+const suites = ['test-import.mjs', 'test-work.mjs', 'test-images.mjs', 'test-device.mjs', 'test-notify.mjs', 'test-drive-sync.mjs', 'test-line-search.mjs', 'test-stats.mjs', 'test-board-acl.mjs', 'test-floor.mjs', 'test-floor-disabled.mjs', 'test-repick.mjs', 'test-floor-alerts.mjs', 'test-miss-stats.mjs', 'test-next-sign.mjs', 'test-shortage-link.mjs', 'test-missing-images.mjs'];
 
 let failed = 0;
 for (const f of suites) {
