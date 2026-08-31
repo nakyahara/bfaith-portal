@@ -1845,6 +1845,10 @@
         || IMAGE_PRODUCTION_PRIORITIES.indexOf(String(json.image_priority || '').trim()) >= 0;
       if (canNow === CAN_IMAGE_PRODUCTION) return false;
       if (noteEl) noteEl.textContent = '保存しました (画像制作の欄を出し直します)';
+      // 読み直すまでこの 2 つは触らせない (Codex R4 medium): 600ms の間に操作されると、
+      // その保存がページ遷移で中断されて DB と画面が食い違う
+      if (imgPrioritySel) imgPrioritySel.disabled = true;
+      if (ownBrandChk) ownBrandChk.disabled = true;
       setTimeout(() => location.reload(), 600);
       return true;
     }
