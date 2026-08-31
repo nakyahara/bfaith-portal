@@ -1885,6 +1885,9 @@
     if (ownBrandChk) {
       let obChain = Promise.resolve();
       async function saveOwnBrand(value) {
+        // 保存が終わるまで触らせない (Codex R5 medium): 連打すると 2 回目がキューに入り、
+        // 1 回目の応答で予約した再読込に巻き込まれて中断される
+        ownBrandChk.disabled = true;
         let json;
         try {
           json = await post(BASE + '/own-brand', { value });
@@ -1892,6 +1895,7 @@
           json = { ok: false, error: '通信エラーで自社商品を保存できませんでした' };
         }
         if (!json.ok) {
+          ownBrandChk.disabled = false;
           alert(json.error || '自社商品の保存に失敗しました');
           if (ownBrandChk.checked === value) ownBrandChk.checked = !value;
           return;
@@ -1902,8 +1906,10 @@
           applyPriorityColors();
         }
         result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
-        // 画面の案内自体が「自社商品をONにする」と誘導しているので、ここでも出し分けを直す
-        reloadIfImageProductionChanged(json, result);
+        // 画面の案内自体が「自社商品をONにする」と誘導しているので、ここでも出し分けを直す。
+        // 読み直すなら disabled のままにする (戻すとその隙に触れてしまう)
+        if (reloadIfImageProductionChanged(json, result)) return;
+        ownBrandChk.disabled = false;
       }
       ownBrandChk.addEventListener('change', () => {
         const value = ownBrandChk.checked;
