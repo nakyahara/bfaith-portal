@@ -25,7 +25,7 @@ const fetchYahooPrices = (codes, deps) => (Array.isArray(codes) && typeof codes[
 import { createTables, insertRun, appendEvent, currentStates, getRun, listRuns } from './db.js';
 import { buildPreviewRows, evaluateRows, parseCodes, parseStrictPrice } from './router.js';
 import { rakutenShippingLabel, yahooPostageLabel } from './shipping-labels.js';
-import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
+import { loadShippingRates, resolveMallShippingCost, familyOf } from './shipping-cost.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -275,9 +275,20 @@ console.log('\n── モール別の配送関係費 (既存の送料マスタ�
     { cost: 182, source: 'product', label: '定形外規格内（50g以内）', exact: false },
     '楽天=定形外 は商品マスタの段を使う (重さの段が決まらないため)');
 
+  // ★モールが「定形外」で商品マスタが「定形内」= 同じ郵便定形の系統。
+  //   モールの名前は設定セットの名前で、実際の段は商品マスタが正 (中原さん 8/31) → 不明にしない
+  insRate.run('102', '日本郵便', '定形内（50g以内）', '50', 110, 146);
+  const rates2 = loadShippingRates(db);
+  eq(resolveMallShippingCost(rates2, { mallMethodName: '定形外', neShippingCode: '102', neShippingCost: 146 }),
+    { cost: 146, source: 'product', label: '定形内（50g以内）', exact: false },
+    '★楽天=定形外 × 商品マスタ=定形内 は同系統なので警告を出さない');
+
   // 系統も違う → 不明。商品マスタの値に戻すが「不明」と言う
   const unknown = resolveMallShippingCost(rates, { mallMethodName: '佐川急便', neShippingCode: '103', neShippingCost: 182 });
   eq([unknown.cost, unknown.source], [182, 'unknown'], '★決められない時は不明と言う (近い名前に寄せない)');
+  eq(familyOf('定形外規格内（50g以内）'), '郵便定形', '定形系はまとめて1つの系統');
+  eq(familyOf('クロネコ宅急便'), 'ヤマト宅急便', '宅急便系も1つの系統');
+  eq(familyOf('よく分からない配送'), null, '分類できない名前は同系統とみなさない');
 
   eq(resolveMallShippingCost(rates, { mallMethodName: null, neShippingCode: '1201', neShippingCost: 424 }).cost,
     424, 'モール側が分からない行は商品マスタの値');
