@@ -61,7 +61,7 @@ import {
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
-  isValidGtin,
+  isValidGtin, MODEL_ATTR_NAME,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -329,6 +329,8 @@ router.get('/detail/:id', (req, res) => {
     setInfo: setInfoOf(db, draft.id),
     imagePriorities: IMAGE_PRIORITIES,
     materialStatuses: MATERIAL_STATUSES,
+    // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
+    modelAttrName: MODEL_ATTR_NAME,
     // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
     checkingReasons: CHECKING_REASONS,
     checkingNoteMax: CHECKING_NOTE_MAX,
@@ -1023,10 +1025,28 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   if (genreId && !/^\d+$/.test(genreId)) {
     return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
   }
-  // attributes は [{name, value}] で受けて [{name, values:[..]}] に正規化して保存
-  let attributesJson = null;
+  // メーカー型番は attributes の検証でも使うので、ここで先に読む
+  let articleNumber = cleanText(req.body?.article_number, 100);
+  // 既存の属性は複数の判定で使うので先に読む
+  const prevRkRow = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // 既存 JSON が壊れていたら何を消したか分からなくなるので、上書きせず止める (Codex R2 medium)
+  let prevAttrs = [];
+  if (prevRkRow && String(prevRkRow.attributes_json || '').trim()) {
+    let parsedPrev = null;
+    try { parsedPrev = JSON.parse(prevRkRow.attributes_json); } catch (e) { parsedPrev = null; }
+    if (!Array.isArray(parsedPrev)) {
+      return res.status(400).json({ ok: false,
+        error: 'この商品の既存の商品属性データが壊れています。上書きすると復元できないため保存を止めました (管理者に連絡してください)' });
+    }
+    prevAttrs = parsedPrev;
+  }
+
+  // attributes は [{name, value}] で受けて [{name, values:[..]}] に正規化して保存。
+  // **送ってこない呼び出しでは既存を維持する** (Codex R3 medium): null のまま書くと
+  // 部分更新のつもりの POST や旧クライアントで、属性が全部消える
+  let rows = null;
   if (Array.isArray(req.body?.attributes)) {
-    const rows = req.body.attributes
+    rows = req.body.attributes
       .map((a) => ({ name: cleanText(a?.name, 100), value: cleanText(a?.value, 300) }))
       .filter((a) => a.name || a.value);
     for (const a of rows) {
@@ -1034,11 +1054,72 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         return res.status(400).json({ ok: false, error: '属性は「属性名」と「値」の両方を入力してください (不要な行は両方空に)' });
       }
     }
-    attributesJson = JSON.stringify(rows.map((a) => ({ name: a.name, values: [a.value] })));
+  }
+
+  // ─── メーカー型番: 入口は「メーカー型番」欄 (article_number) だけ (2026-08-31 中原さん) ───
+  // RMS でも入力項目は 1 つなのに、画面が欄と商品属性の 2 箇所に入れさせていた。
+  // 画面は属性行を出さないので、ここで属性から落として 1 箇所に寄せる。
+  //
+  // 🚨 **黙って消してはいけない** (Codex R1 high)。画面は属性側の値を隠すので、欄と違う値が
+  // 残っていると人が気づかないまま保存で消える。POST と DB の両方から集めて 400 で止める。
+  // ⭐ 止めるだけだと**画面から直せない** (Codex R2 high) ので、画面の選択ボタンから
+  // resolve_model_conflict=true で送られたときだけ旧値を捨てる (人の決定として扱う)。
+  // 🚨 判定は attributes の有無に関わらず走らせる (Codex R5 medium): 部分更新の POST で
+  // 欄だけ書き換えられると、競合状態を新しく作れてしまう
+  const modelOf = (list) => (Array.isArray(list) ? list : [])
+    .filter((a) => a && a.name === MODEL_ATTR_NAME)
+    // 旧形式 {name, value} も拾う (parseAttributes が受理する形。Codex R2 medium)
+    .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
+    .map((v) => String(v == null ? '' : v).trim())
+    .filter(Boolean);
+  const prevModels = modelOf(prevAttrs);
+  const postModels = rows ? rows.filter((a) => a.name === MODEL_ATTR_NAME).map((a) => String(a.value || '').trim()).filter(Boolean) : [];
+  const modelValues = [...new Set([...postModels, ...prevModels])];
+  const resolveModel = req.body?.resolve_model_conflict === true;
+  if (resolveModel) {
+    // 楽観ロック (Codex R5 medium): 画面が「見た」旧値と、いま DB にある旧値が違うなら、
+    // 別のタブ・別の人が触っている。見ていない値を捨てさせない。
+    // **省略は許さない** (Codex R6 medium): 無ければ照合なしで捨てられてしまい、楽観ロックの意味がなくなる
+    if (!Array.isArray(req.body?.model_conflict_seen)) {
+      return res.status(400).json({ ok: false,
+        error: `${MODEL_ATTR_NAME}の解消には model_conflict_seen (画面で見えていた値の配列) が必要です` });
+    }
+    // 重複を持つ旧データ (同じ値が 2 行) でも解消できるよう、**両方とも集合にして**比べる
+    // (Codex R6 medium: 片側だけ重複排除すると件数差で永久に 409 になる)
+    const seen = [...new Set(req.body.model_conflict_seen.map((v) => String(v == null ? '' : v).trim()).filter(Boolean))];
+    const prevSet = [...new Set(prevModels)];
+    if (seen.length !== prevSet.length || seen.some((v) => !prevSet.includes(v))) {
+      return res.status(409).json({ ok: false, conflict: MODEL_ATTR_NAME, values: prevSet,
+        error: `この商品の${MODEL_ATTR_NAME}が別の画面から変わりました (いまの値: ${prevSet.join(' / ') || 'なし'})。画面を再読み込みしてから選び直してください` });
+    }
+  }
+  if (!resolveModel) {
+    if (modelValues.length > 1) {
+      return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
+        error: `${MODEL_ATTR_NAME}が複数あります (${modelValues.join(' / ')})。画面の警告からどれを残すか選んでください` });
+    }
+    if (modelValues.length === 1 && articleNumber && modelValues[0] !== articleNumber) {
+      return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
+        error: `商品属性に別の${MODEL_ATTR_NAME}「${modelValues[0]}」が残っています。画面の警告からどちらを残すか選んでください` });
+    }
+    // 欄が空で属性側にだけ値がある = 旧データ。欄へ引き上げる (値を失わない)
+    if (modelValues.length === 1 && !articleNumber) articleNumber = modelValues[0];
+  }
+
+  // 保存する属性を確定する。attributes を送ってきたらそれを、送ってこなければ既存を使い、
+  // どちらの場合も メーカー型番 の行だけは落とす (入口を 1 つに保つ)
+  let attributesJson = prevRkRow?.attributes_json ?? null;
+  if (rows) {
+    attributesJson = JSON.stringify(
+      rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] })));
     if (parseAttributes(attributesJson) === null) {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
+  } else if (prevModels.length > 0) {
+    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)
+    attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === MODEL_ATTR_NAME)));
   }
+
   // 店舗内カテゴリ (複数選択)。フィールドが来たときだけ入れ替える
   let shopCategoryIds = null;
   if (req.body?.shop_category_ids !== undefined) {
@@ -1082,7 +1163,6 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     whiteBgFileId = parsed.id;
   }
 
-  const articleNumber = cleanText(req.body?.article_number, 100);
   db.transaction(() => {
     db.prepare(`
       INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,

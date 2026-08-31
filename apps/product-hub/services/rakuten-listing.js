@@ -696,6 +696,16 @@ export async function syncSkuImagesToRms(draftId, { actor = null } = {}) {
 
 // ─── 出品 payload ───
 
+/**
+ * メーカー型番のジャンル属性名 (2026-08-31 中原さん指摘)。
+ * RMS の入力項目は 1 つなのに、このアプリは「メーカー型番」欄と商品属性の 2 箇所に
+ * 入れさせていた。入口は **article_number (メーカー型番欄) だけ** に統一し、
+ * ジャンル属性に この名前があるジャンルでは送信時に自動で属性へも積む
+ * (カタログID を JAN 欄から自動付与しているのと同じ方式)。
+ * 画面はこの名前の属性行を出さない・保存時に落とす。
+ */
+export const MODEL_ATTR_NAME = 'メーカー型番';
+
 /** attributes_json をパースして RMS 形式に整える。壊れた JSON は null */
 export function parseAttributes(json) {
   if (!json || !String(json).trim()) return [];
@@ -1096,6 +1106,23 @@ export function buildItemPayload(db, draftId) {
       reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
     }
   }
+  // メーカー型番はカタログIDと同じ扱い (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに
+  // 画面で 2 箇所に入れさせていた)。**入口は「メーカー型番」欄 (article_number) だけ**にして、
+  // ジャンル属性に「メーカー型番」があるときは下でその値を自動付与する。
+  // 旧データで属性側にも残っている場合に備え、食い違いだけは止める
+  const articleNo = String(rk.article_number || '').trim();
+  const modelAttrs = Array.isArray(attributes) ? attributes.filter((a) => a.name === MODEL_ATTR_NAME) : [];
+  let manualModel = null;
+  if (modelAttrs.length > 1) {
+    reasons.push(`商品属性「${MODEL_ATTR_NAME}」が複数あります (1件にまとめてください)`);
+  } else if (modelAttrs.length === 1) {
+    manualModel = modelAttrs[0];
+    if (manualModel.values.length !== 1) {
+      reasons.push(`商品属性「${MODEL_ATTR_NAME}」の値は1個だけにしてください`);
+    } else if (articleNo && manualModel.values[0] !== articleNo) {
+      reasons.push(`商品属性の${MODEL_ATTR_NAME} (${manualModel.values[0]}) と メーカー型番欄 (${articleNo}) が一致しません — メーカー型番欄に揃えてください`);
+    }
+  }
   // ─── ジャンル属性辞書による事前検証 (2026-07-28 Genre API) ───
   // 辞書キャッシュがある場合だけ検証する (無ければ RMS が最終検証する)。
   // genre_id をキーに引くので、ジャンルを変えた直後は辞書未取得 = 検証スキップになる
@@ -1105,9 +1132,11 @@ export function buildItemPayload(db, draftId) {
     ? getCachedGenreAttributes(db, String(rk.genre_id).trim(), { maxAgeMs: GENRE_CACHE_TTL_MS })
     : null;
   let dictHasCatalogId = false;
+  let dictHasModel = false;
   if (genreDict && Array.isArray(attributes)) {
     const dictByName = new Map(genreDict.attributes.map((a) => [a.name, a]));
     dictHasCatalogId = dictByName.has('カタログID');
+    dictHasModel = dictByName.has(MODEL_ATTR_NAME);
     // ① 辞書に無い属性名は IE1002 で登録が失敗する → 送る前に止める
     for (const a of attributes) {
       if (!dictByName.has(a.name)) {
@@ -1119,6 +1148,8 @@ export function buildItemPayload(db, draftId) {
     for (const da of genreDict.attributes) {
       if (!da.mandatory || presentNames.has(da.name)) continue;
       if (da.name === 'カタログID' && jan) continue; // 下で自動付与する
+      // メーカー型番は「メーカー型番」欄から自動付与する (属性行では入力させない)
+      if (da.name === MODEL_ATTR_NAME && articleNo) continue;
       reasons.push(`必須属性「${da.name}」が未入力です (ジャンル ${genreDict.genreName || rk.genre_id} の必須)`);
     }
     // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
@@ -1171,6 +1202,12 @@ export function buildItemPayload(db, draftId) {
   const attrs = attributes.slice();
   if (dictHasCatalogId && jan && !manualCatalog) {
     attrs.push({ name: 'カタログID', values: [jan] });
+  }
+  // メーカー型番を属性としても送る (2026-08-31)。入口は「メーカー型番」欄だけなので、
+  // ジャンル属性に メーカー型番 があるジャンルではここで補う。
+  // 旧データで属性側に同じ値が残っている場合は二重に足さない (上で不一致は弾いてある)
+  if (dictHasModel && articleNo && !manualModel) {
+    attrs.push({ name: MODEL_ATTR_NAME, values: [articleNo] });
   }
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる
