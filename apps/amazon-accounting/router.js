@@ -27,6 +27,37 @@ const evidenceStore = new Map();
 // 除外セグメント（4=輸出はセグメント集計に含めない）
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
+// ─── 手数料内訳（説明別）───
+// SKUを持たない手数料行を CSV「説明」列で判別し、その行の「合計」列を合算してセグメント表の右端に列として見せる。
+// 実データ (2026-06/07) で判明: 説明の文言は月で変わる (Easy Ship は 6月 2種の別名 / 7月 統合名)、
+// 金額が入る列も月で変わる (手数料 / トランザクション他 / FBA手数料 / その他) → 部分一致 + 合計列の合算が唯一安定。
+// 判定は上から順に排他 (「FBA長期在庫保管手数料」は「在庫保管手数料」を含むので長期を先に)。
+// 既存の各列・合計には既に含まれている金額の抜き出しであり、集計値は一切変えない (表示の追加のみ)。
+// 要件定義: システム設計\Amazon売上集計_手数料内訳表示_要件定義_20260831.md
+const FEE_BREAKDOWN_RULES = [
+  { label: 'FBA長期在庫保管手数料', test: d => d.includes('長期在庫保管手数料') },
+  { label: 'FBA在庫保管手数料',     test: d => d.includes('在庫保管手数料') },
+  { label: 'Amazon Easy Ship料金',  test: d => d.includes('easy ship') },
+];
+// 表示順（セグメント表・CSV の右端に追加する列）
+const FEE_COLUMNS = ['Amazon Easy Ship料金', 'FBA在庫保管手数料', 'FBA長期在庫保管手数料'];
+
+// 説明の正規化: 前後空白と末尾のコロン (取り消し/訂正行は "FBA在庫保管手数料:" と付く) を除去して小文字化
+function normalizeFeeDesc(desc) {
+  return String(desc || '').trim().replace(/[:：\s]+$/, '').toLowerCase();
+}
+
+// 行がどの手数料内訳に該当するかをラベルで返す（該当なしは null）。
+// SKU空欄行のみ対象 (注文・返金行の説明は商品名なので誤判定を避ける)。振込みは既存集計と同様に対象外。
+function classifyFeeRow(row) {
+  if (!row || row.解決方法 === 'skip') return null;
+  if (row.sku) return null;
+  const d = normalizeFeeDesc(row.説明);
+  if (!d) return null;
+  const rule = FEE_BREAKDOWN_RULES.find(r => r.test(d));
+  return rule ? rule.label : null;
+}
+
 // ─── CSV解析 ───
 
 function parseCsvBuffer(buf) {
@@ -268,6 +299,7 @@ function aggregate(resolvedRows) {
   function emptyRow() {
     const r = {};
     columns.forEach(c => r[c] = 0);
+    FEE_COLUMNS.forEach(c => r[c] = 0); // 手数料内訳 (合計列の抜き出し。上の各列に含まれる金額の内訳であり加算しない)
     r.原価合計 = 0;
     r.行数 = 0;
     return r;
@@ -275,6 +307,8 @@ function aggregate(resolvedRows) {
 
   function addRow(target, row) {
     columns.forEach(c => target[c] += row[c] || 0);
+    const feeKey = classifyFeeRow(row);
+    if (feeKey) target[feeKey] += row.合計 || 0;
     target.原価合計 += (row.原価 || 0) * (row.数量 || 1);
     target.行数++;
   }
@@ -290,9 +324,25 @@ function aggregate(resolvedRows) {
 
   // 「その他/未分類」に入った行の明細を記録
   const otherDetails = new Map();
+  // SKUなし行の説明別一覧 (トランザクションの種類 × 説明 原文)。手数料内訳の根拠と、Amazonが文言を変えた月の検知用
+  const noSkuDetails = new Map();
 
   for (const row of resolvedRows) {
     if (row.解決方法 === 'skip') continue; // 振込み
+
+    if (!row.sku) {
+      const nk = (row.トランザクション種類 || '') + '||' + (row.説明 || '');
+      const ne = noSkuDetails.get(nk) || {
+        トランザクション種類: row.トランザクション種類 || '',
+        説明: row.説明 || '',
+        判定: classifyFeeRow(row) || '',
+        行数: 0,
+        合計: 0,
+      };
+      ne.行数++;
+      ne.合計 += row.合計 || 0;
+      noSkuDetails.set(nk, ne);
+    }
 
     // 税率別（税率未登録は集計しない）
     if (row.税率 === 10 || row.税率 === 8) {
@@ -366,7 +416,9 @@ function aggregate(resolvedRows) {
     bySegment,
     excluded,
     otherDetails: [...otherDetails.values()].sort((a, b) => Math.abs(b.商品売上) - Math.abs(a.商品売上)),
+    noSkuDetails: [...noSkuDetails.values()].sort((a, b) => Math.abs(b.合計) - Math.abs(a.合計)),
     columns,
+    feeColumns: FEE_COLUMNS,
     mfRow,
     mfColumns,
   };
@@ -474,7 +526,14 @@ router.post('/upload', upload.single('file'), (req, res) => {
   const { resolved, unresolved, zeroGenka, unresolvedTax, conflicts } = resolveSkus(parsedRows, db);
 
   // 集計
-  const { byTax, bySegment, excluded, otherDetails, columns, mfRow, mfColumns } = aggregate(resolved);
+  const { byTax, bySegment, excluded, otherDetails, noSkuDetails, columns, feeColumns, mfRow, mfColumns } = aggregate(resolved);
+
+  // 確定済みの月なら前回情報を返す (過去月の再集計時に広告費をプリフィルし、上書き注意を出す)
+  let existing = null;
+  try {
+    const prev = db.prepare('SELECT confirmed_at, ad_cost, csv_filename FROM mart_amazon_monthly_summary WHERE year_month = ?').get(yearMonth);
+    if (prev) existing = { confirmed_at: prev.confirmed_at || '', ad_cost: prev.ad_cost || 0, csv_filename: prev.csv_filename || '' };
+  } catch {}
 
   // 未登録税率の件数
   const unresolvedTaxCount = resolved.filter(r => r.解決方法 !== 'skip' && r.解決方法 !== 'no_sku' && r.解決方法 !== 'adjustment_no_master' && r.税率 === null).length;
@@ -511,10 +570,18 @@ router.post('/upload', upload.single('file'), (req, res) => {
   summaryCsv += mfColumns.map(c => mfRow[c] || 0).join(',') + '\n';
   // セグメント別
   summaryCsv += '\n【セグメント別集計（管理会計用）】\n';
-  summaryCsv += 'セグメント,' + columns.join(',') + ',原価合計\n';
+  summaryCsv += 'セグメント,' + columns.join(',') + ',原価合計,' + feeColumns.join(',') + '\n';
   for (const [key, row] of Object.entries(bySegment)) {
     const label = SEGMENT_NAMES[key] || (key === 'other' ? 'その他/未分類' : key);
-    summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0) + '\n';
+    summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0)
+      + ',' + feeColumns.map(c => row[c] || 0).join(',') + '\n';
+  }
+  // SKUなし行の説明別一覧 (手数料内訳の根拠)
+  const csvCell = v => { const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  summaryCsv += '\n【SKUなし行の説明別一覧（手数料内訳）】\n';
+  summaryCsv += 'トランザクションの種類,説明,判定,行数,合計\n';
+  for (const d of noSkuDetails) {
+    summaryCsv += [csvCell(d.トランザクション種類), csvCell(d.説明), csvCell(d.判定), d.行数, d.合計].join(',') + '\n';
   }
 
   // /confirm でサーバ側の真値として使うため集計結果も保管 (Codex 3R #1: 改竄防御)
@@ -546,12 +613,15 @@ router.post('/upload', upload.single('file'), (req, res) => {
     bySegment,
     excluded,
     otherDetails,
+    noSkuDetails,
     columns,
+    feeColumns,
     mfRow,
     mfColumns,
     segmentNames: SEGMENT_NAMES,
     excludedNames: EXCLUDED_SEGMENTS,
     zeroGenka,
+    existing,
   });
   } catch (e) {
     console.error('[AmazonAccounting] エラー:', e.message, e.stack);
@@ -593,6 +663,9 @@ function renderPage() {
     #result{display:none}
     .num{font-family:monospace}
     .negative{color:#e74c3c}
+    th.fee-col{background:#f3e8d6}
+    td.fee-col{background:#fdf8f0}
+    .fee-first{border-left:2px solid #e0c9a6}
     .detail-table td{font-size:12px;font-weight:normal}
     .detail-table th{font-size:11px}
     .modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000;justify-content:center;align-items:flex-start;padding:30px}
@@ -677,6 +750,12 @@ function renderPage() {
         <div id="excludedInfo"></div>
       </div>
 
+      <div id="noSkuCard" class="card" style="display:none">
+        <h2>SKUなし行の説明別一覧（手数料内訳の根拠）</h2>
+        <p class="meta">SKUを持たない行を「トランザクションの種類 × 説明」で集計。「判定」列が手数料内訳（Amazon Easy Ship料金 / FBA在庫保管手数料 / FBA長期在庫保管手数料）のどれに入ったかです。Amazonが説明の文言を変えた月はここで気づけます。</p>
+        <div id="noSkuList"></div>
+      </div>
+
       <div id="otherDetailCard" class="card" style="display:none">
         <h2>「その他/未分類」明細</h2>
         <p class="meta">売上分類が未登録の商品・SKUなし行の内訳</p>
@@ -699,7 +778,7 @@ function renderPage() {
           <button class="btn btn-p" onclick="downloadEvidence('detail')">明細エビデンスCSV</button>
           <button class="btn btn-p" onclick="downloadEvidence('summary')">集計サマリーCSV</button>
         </div>
-        <p class="meta" style="margin-top:6px">明細: アップロードCSVの全行+税率・分類・原価の判定結果 / 集計: 税率別+MF税込+セグメント別</p>
+        <p class="meta" style="margin-top:6px">明細: アップロードCSVの全行+税率・分類・原価の判定結果 / 集計: 税率別+MF税込+セグメント別（手数料内訳列付き）+SKUなし行の説明別一覧</p>
         <div id="confirmStatus" class="meta"></div>
       </div>
     </div>
@@ -712,6 +791,8 @@ function renderPage() {
   </div>
 
   <script>
+    const FEE_COLUMNS = ${JSON.stringify(FEE_COLUMNS)};
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const fmt = n => {
       if (n === 0) return '0';
       const s = Math.round(n).toLocaleString();
@@ -761,6 +842,13 @@ function renderPage() {
         summaryHtml += '<br><b style="color:#e74c3c">❌ ' + reasons.join('・') + 'あり — 確定不可</b>';
       }
       summaryHtml += '</div>';
+      // 確定済みの月を再アップロードした場合 (過去月の再集計): 上書き注意 + 広告費を前回値でプリフィル
+      if (data.existing) {
+        summaryHtml += '<div class="warn">📌 <b>' + data.yearMonth + ' は確定済みです</b>（' + esc(data.existing.confirmed_at || '') + '・広告費 ¥' + Math.round(data.existing.ad_cost || 0).toLocaleString() + '）。'
+          + 'このまま「確定」すると前回の集計を上書きします。広告費欄には前回の値を入れてあります。</div>';
+        const adInput = document.getElementById('adCost');
+        if (adInput) adInput.value = Math.round(data.existing.ad_cost || 0);
+      }
       document.getElementById('summary').innerHTML = summaryHtml;
       // 確定ボタンの disabled 制御 (hard fail)
       const confirmBtn = document.getElementById('confirmBtn');
@@ -857,6 +945,30 @@ function renderPage() {
 
       // セグメント別（1〜3 + other。4=輸出は除外）
       renderSegmentTable('segmentTable', data.bySegment, data.segmentNames, cols, null);
+
+      // SKUなし行の説明別一覧 (手数料内訳の根拠)
+      renderNoSkuList(data.noSkuDetails || []);
+    }
+
+    function renderNoSkuList(list) {
+      const card = document.getElementById('noSkuCard');
+      if (!list.length) { card.style.display = 'none'; return; }
+      card.style.display = 'block';
+      let html = '<table class="detail-table"><tr><th>トランザクションの種類</th><th>説明</th><th>判定</th><th>行数</th><th>合計</th></tr>';
+      let rows = 0, total = 0;
+      for (const d of list) {
+        html += '<tr>';
+        html += '<td style="text-align:left;font-weight:normal">' + esc(d.トランザクション種類 || '-') + '</td>';
+        html += '<td style="text-align:left">' + esc(d.説明 || '-') + '</td>';
+        html += '<td style="text-align:left">' + (d.判定 ? '<b>' + esc(d.判定) + '</b>' : '<span class="meta">—</span>') + '</td>';
+        html += '<td class="num">' + d.行数 + '</td>';
+        html += '<td class="num">' + fmt(d.合計) + '</td>';
+        html += '</tr>';
+        rows += d.行数; total += d.合計;
+      }
+      html += '<tr style="font-weight:bold;border-top:2px solid #333"><td colspan="3">合計</td><td class="num">' + rows + '</td><td class="num">' + fmt(total) + '</td></tr>';
+      html += '</table>';
+      document.getElementById('noSkuList').innerHTML = html;
     }
 
     // MF振替伝票用の仕訳行を組み立てる。
@@ -945,11 +1057,17 @@ function renderPage() {
         if (maxKey) adByKey[maxKey] += (ad - adSum);
       }
 
+      // 手数料内訳列 (右端。合計に含まれる金額の抜き出しなので合計行の横並びに加算はしない)
+      const feeCols = (lastData && lastData.feeColumns) || FEE_COLUMNS;
+      const feeCls = i => 'fee-col' + (i === 0 ? ' fee-first' : '');
       let segHtml = '<table><tr><th>セグメント</th>';
       cols.forEach(c => segHtml += '<th>' + c + '</th>');
-      segHtml += '<th>広告費</th><th>原価合計</th></tr>';
+      segHtml += '<th>広告費</th><th>原価合計</th>';
+      feeCols.forEach((c, i) => segHtml += '<th class="' + feeCls(i) + '" title="合計に含まれる金額の内訳（CSV「説明」で判別）">' + c + '</th>');
+      segHtml += '</tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
+      feeCols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
       let totalAd = 0;
       for (const [key, row] of Object.entries(bySegment)) {
@@ -960,12 +1078,16 @@ function renderPage() {
         totalAd += (adByKey[key] || 0);
         segHtml += '<td class="num">' + fmt(row.原価合計 || 0) + '</td>';
         totalRow.原価合計 += (row.原価合計 || 0);
+        feeCols.forEach((c, i) => { segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
         segHtml += '</tr>';
       }
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
       cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
       segHtml += '<td class="num">' + fmt(totalAd) + '</td>';
-      segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td></tr></table>';
+      segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td>';
+      feeCols.forEach((c, i) => segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(totalRow[c]) + '</td>');
+      segHtml += '</tr></table>';
+      segHtml += '<p class="meta">右端の3列（' + feeCols.join(' / ') + '）は、CSV「説明」で判別したSKUなし行の「合計」を合算した<b>内訳</b>です。同じ行の 手数料・FBA手数料・その他・合計 に既に含まれている金額の抜き出しで、加算対象ではありません。根拠は下の「SKUなし行の説明別一覧」を参照。</p>';
       document.getElementById(targetId).innerHTML = segHtml;
 
       // 除外セグメント（4=輸出）
@@ -1147,10 +1269,16 @@ function renderPage() {
             if (mk) hAd[mk] += (ad - hAdSum);
           }
 
+          // 手数料内訳列は本機能リリース後に確定した月だけ持つ (無い月は「—」)
+          const hasFee = Object.values(seg).some(sr => FEE_COLUMNS.some(c => sr[c] !== undefined));
+          const hFeeCls = i => 'fee-col' + (i === 0 ? ' fee-first' : '');
+          const hFeeCell = v => hasFee ? fmt(v || 0) : '<span class="meta">—</span>';
           html += '<table><tr><th>セグメント</th>';
           segCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '<th>広告費</th><th>原価合計</th></tr>';
-          let sTot = {}; segCols.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; let sAdTot = 0;
+          html += '<th>広告費</th><th>原価合計</th>';
+          FEE_COLUMNS.forEach((c, i) => html += '<th class="' + hFeeCls(i) + '">' + c + '</th>');
+          html += '</tr>';
+          let sTot = {}; segCols.forEach(c => sTot[c] = 0); FEE_COLUMNS.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; let sAdTot = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
             html += '<tr><td>' + key + ': ' + lb + '</td>';
@@ -1159,12 +1287,16 @@ function renderPage() {
             sAdTot += (hAd[key] || 0);
             html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
             sTot.原価合計 += (sr.原価合計 || 0);
+            FEE_COLUMNS.forEach((c, i) => { html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sr[c]) + '</td>'; sTot[c] += (sr[c] || 0); });
             html += '</tr>';
           }
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
           segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
           html += '<td class="num">' + fmt(sAdTot) + '</td>';
-          html += '<td class="num">' + fmt(sTot.原価合計) + '</td></tr></table>';
+          html += '<td class="num">' + fmt(sTot.原価合計) + '</td>';
+          FEE_COLUMNS.forEach((c, i) => html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sTot[c]) + '</td>');
+          html += '</tr></table>';
+          if (!hasFee) html += '<p class="meta">手数料内訳（右端3列）はこの月の確定時点では未対応でした。この月のペイメントCSVを再アップロードして再確定すると表示されます。</p>';
 
           // 除外セグメント
           const excl = row.excluded || {};
@@ -1200,7 +1332,7 @@ function renderPage() {
         const adTargets = ['1','2'];
 
         let csv = '\\uFEFF'; // BOM
-        csv += '集計月,セグメント,' + segCols.join(',') + ',広告費,原価合計\\n';
+        csv += '集計月,セグメント,' + segCols.join(',') + ',広告費,原価合計,' + FEE_COLUMNS.join(',') + '\\n';
 
         for (const row of rows) {
           const seg = row.by_segment || {};
@@ -1229,7 +1361,8 @@ function renderPage() {
           for (const [key, sr] of Object.entries(seg)) {
             const label = segNames[key] || key;
             const vals = segCols.map(c => sr[c] || 0);
-            csv += ymStr + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + '\\n';
+            const feeVals = FEE_COLUMNS.map(c => sr[c] === undefined ? '' : sr[c]); // 未対応月は空欄
+            csv += ymStr + ',' + key + ':' + label + ',' + vals.join(',') + ',' + (adMap[key] || 0) + ',' + (sr.原価合計 || 0) + ',' + feeVals.join(',') + '\\n';
           }
         }
 
@@ -1352,19 +1485,34 @@ function renderPage() {
       <h3>原価合計</h3>
       <p>各行の <code>原価 × 数量</code> をセグメントごとに合算（税抜）。</p>
 
+      <h3>手数料内訳（右端3列: Amazon Easy Ship料金 / FBA在庫保管手数料 / FBA長期在庫保管手数料）</h3>
+      <p>SKUを持たない手数料行をCSVの「説明」で判別し、その行の「合計」列を合算した金額です。<b>同じ行の 手数料・FBA手数料・その他・合計 に既に含まれている金額の抜き出し</b>であり、セグメント合計への加算対象ではありません（二重計上ではありません）。</p>
+      <table class="m-tbl">
+        <tr><th>列</th><th>判定（説明の部分一致・上から順に排他）</th><th>実データでの表記例</th></tr>
+        <tr><td><b>FBA長期在庫保管手数料</b></td><td>「長期在庫保管手数料」を含む</td><td>FBA長期在庫保管手数料</td></tr>
+        <tr><td><b>FBA在庫保管手数料</b></td><td>「在庫保管手数料」を含む（長期に該当しなかった行）</td><td>FBA在庫保管手数料 / FBA在庫保管手数料:（取り消し・訂正行）</td></tr>
+        <tr><td><b>Amazon Easy Ship料金</b></td><td>「Easy Ship」を含む（大文字小文字は無視）</td><td>Amazon Easy Ship料金 / Amazon Easy Shipの発送重量手数料 / Easy Ship発送重量手数料</td></tr>
+      </table>
+      <ul>
+        <li>説明の文言も金額が入る列も月によって変わる（例: Easy Ship は 2026年6月まで2種類の別名、7月から統合名）ため、完全一致ではなく部分一致＋「合計」列の合算で判定します</li>
+        <li>在庫保管手数料の<b>取り消し・訂正</b>行（説明の末尾に「:」が付く）も含めたネット額です。内訳は「SKUなし行の説明別一覧」カードで確認できます</li>
+        <li>SKUなし行は売上分類を持たないため、金額は原則「other: その他/未分類」行に入ります</li>
+        <li>本機能リリース前に確定した月・旧スプレッドシート移行分は「—」表示。その月のペイメントCSVを再アップロードして再確定すると表示されます（2026年3月分以降を再集計する運用）</li>
+      </ul>
+
       <h2>9. エビデンスCSV</h2>
       <p>アップロード後に2種類ダウンロード可能:</p>
       <table class="m-tbl">
         <tr><th>種類</th><th>内容</th></tr>
         <tr><td><b>明細エビデンス</b></td><td>元CSVの全行 + 商品コード・税率・売上分類・原価・解決方法</td></tr>
-        <tr><td><b>集計サマリー</b></td><td>税率別 + MF税込 + セグメント別の集計表</td></tr>
+        <tr><td><b>集計サマリー</b></td><td>税率別 + MF税込 + セグメント別（手数料内訳列付き）の集計表 + SKUなし行の説明別一覧</td></tr>
       </table>
       <div class="note">エビデンスはアップロード時にメモリに一時保存。ページを離れると再アップロードが必要です。</div>
 
       <h2>10. 確定保存・過去データ</h2>
       <ul>
         <li>広告費を入力して「確定」→ DBに保存</li>
-        <li>同じ年月で再確定すると上書き</li>
+        <li>同じ年月で再確定すると上書き（確定済みの月を再アップロードすると画面上部に注意が出て、広告費欄に前回の値が入ります）</li>
         <li>確定済みデータはアコーディオンで展開表示</li>
         <li>「セグメント別集計CSVダウンロード」で全月分を一括CSV出力（集計月は各月末日 yyyy/mm/dd）</li>
       </ul>
@@ -1526,3 +1674,5 @@ router.post('/import-history', requireImportKey('IMPORT_KEY_AMAZON'), importJson
 
 
 export default router;
+// テスト用 (fee-breakdown.test.mjs から純粋関数を検証する)
+export { aggregate, classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS, FEE_BREAKDOWN_RULES };
