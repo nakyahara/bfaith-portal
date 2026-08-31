@@ -3476,7 +3476,29 @@ let wfSetParentId = null;
             .run(s.state, s.draft_id, s.step_code);
         }
         for (const id of donors) wfp.recomputeDraftStatus(db, id, { actor: 'smoke' });
-        // 画像ビュー: カード = 商品×種別。同じ商品の TOP/詳細 が**それぞれの列で**先頭に来る
+        // 片方の種別にしか無い列へ落としたときのエラー文 (2026-08-31 中原さん報告:
+  // 「画像制作」列へ動かすと「移動先の工程が見つかりません」とだけ出て理由が分からなかった)
+  {
+    const bImg = wfp.boardData(db, { view: 'image' });
+    const detailCard = bImg.columns.flatMap((c) => c.cards).find((c) => c.kind === 'detail');
+    check('D&D: 片側にしか無い列への移動は「どちらの工程か」を言う (前提: 詳細カードがある)',
+      !!detailCard, detailCard ? '' : '(詳細カードが無い)');
+    if (detailCard) {
+      let err = null;
+      try {
+        // 'production' (画像制作) は TOP 側にしかない段階
+        wfp.moveBoardCard(detailCard.id, {
+          view: 'image', kind: 'detail', to: 'production',
+          expectedCurrent: detailCard.kindCurrent ? detailCard.kindCurrent.step_code : null,
+        }, 'smoke', { isAdmin: true });
+      } catch (e) { err = e; }
+      check('D&D: TOP専用の列へ詳細カードを落とすと理由が分かるエラーになる',
+        err && err.status === 400 && /TOP画像の工程です/.test(err.message || ''),
+        err ? err.message : '(エラーが出ていない)');
+    }
+  }
+
+  // 画像ビュー: カード = 商品×種別。同じ商品の TOP/詳細 が**それぞれの列で**先頭に来る
         const bI = wfp.boardData(db, { view: 'image' });
         const imgCol = bI.columns.find((c) => c.cards.length >= 2);
         // 前提も check にする (Codex R3): fixture が変わって「2枚以上ある画像列」が消えたとき、
@@ -4904,6 +4926,18 @@ renders.push(
       ...d0[2],
       pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
     }]);
+    // 取扱先限定商品 (own_brand=0) でも画像制作の管理項目が使えること (2026-08-31 中原さん:
+    // 栃木レザー等。自社商品だけに閉じていると撮影の設定や LP の重要度を決められなかった)
+    renders.push(['detail.ejs (取扱先限定商品・画像制作あり)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, own_brand: 0, image_priority: '取扱先限定商品（重要度：高）' },
+      canImageProduction: true,
+    }]);
+    renders.push(['detail.ejs (仕入商品・画像制作なし)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, own_brand: 0, image_priority: '仕入商品（重要度：低）' },
+      canImageProduction: false,
+    }]);
     // メーカー型番 (2026-08-31): 旧データで商品属性側に入っている状態。
     // 上の「メーカー型番」欄へ引き上げて表示し、属性テーブルには行を出さない
     renders.push(['detail.ejs (メーカー型番が属性側にある旧データ)', 'detail.ejs', {
@@ -4982,6 +5016,9 @@ for (const [name, file, data] of renders) {
         checkingDays: null,
         // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
         modelAttrName: listing.MODEL_ATTR_NAME,
+        // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
+        // fixture 側の draft で上書きされる (...data が後に来る)
+        canImageProduction: true,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
@@ -5076,6 +5113,28 @@ for (const [name, file, data] of renders) {
   })(), [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]).join(',') || '(1つも無い)');
   // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
   dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
+}
+
+// ─── 画像制作の対象商品 / 撮影依頼の定型文 / Amazon URL を開く (2026-08-31 中原さん) ───
+{
+  const dOk = renderedHtml.get('detail.ejs (取扱先限定商品・画像制作あり)') || '';
+  const dNg = renderedHtml.get('detail.ejs (仕入商品・画像制作なし)') || '';
+  check('画像制作: 取扱先限定商品 (自社商品でない) でも管理項目が出る',
+    dOk.includes('id="ip-request"') && dOk.includes('id="save-ip-btn"')
+    && !dOk.includes('ONにすると、画像制作の管理項目が使えます'),
+    dOk.includes('id="ip-request"') ? '案内文が残っている' : '管理項目が出ていない');
+  check('画像制作: 仕入商品では出さず、どうすれば使えるかを案内する',
+    !dNg.includes('id="ip-request"') && dNg.includes('取扱先限定商品（重要度：高）'),
+    dNg.includes('id="ip-request"') ? '管理項目が出てしまっている' : '案内文が無い');
+  check('撮影依頼: 定型文を作るボタンがある (デザイナー向けの文言は使わない)',
+    dOk.includes('id="ip-request-template"') && dOk.includes('カメラマンへの撮影依頼')
+    && !dOk.includes('外注への画像作成依頼'),
+    dOk.includes('ip-request-template') ? '旧ラベルが残っている' : 'ボタンが無い');
+  const dh0 = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('Amazon URL: 開くボタンがある (空のときは隠れる)',
+    dh0.includes('id="f-amazon-open"')
+    && /id="f-amazon-open"[\s\S]{0,140}display:none/.test(dh0),
+    dh0.includes('f-amazon-open') ? '初期状態が隠れていない' : 'ボタンが無い');
 }
 
 // ─── 画面の直し 3 点 (2026-08-31 中原さんの実務フィードバック) ───

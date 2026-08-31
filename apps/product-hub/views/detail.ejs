@@ -714,7 +714,13 @@
         </div>
         <div style="flex:2">
           <label>Amazon URL <span class="muted">(ASINを入れると自動で作られます)</span><span class="ftag ftag-m">手入力</span></label>
-          <input type="url" id="f-amazon-url" value="<%= draft.amazon_url || '' %>" placeholder="https://www.amazon.co.jp/dp/...">
+          <%# ASIN の取り違えを目で確かめるため、その場で商品ページを開けるようにする
+              (2026-08-31 中原さん: 画像登録を依頼する前に ASIN が合っているか見に行く) %>
+          <div style="display:flex; gap:6px;">
+            <input type="url" id="f-amazon-url" value="<%= draft.amazon_url || '' %>" placeholder="https://www.amazon.co.jp/dp/..." style="flex:1;">
+            <a class="btn" id="f-amazon-open" target="_blank" rel="noopener"
+               style="white-space:nowrap; display:none;">🔗 開く</a>
+          </div>
         </div>
       </div>
       <div class="field">
@@ -1125,11 +1131,16 @@
     </div>
   </div>
 
-    <!-- 画像制作 (自社商品のみ) -->
+    <!-- 画像制作 (自社商品 / 取扱先限定商品) -->
     <div class="card">
-      <h2>画像制作 <span class="muted" style="font-weight:400">(自社商品のみ)</span></h2>
-      <% if (!draft.own_brand) { %>
-        <p class="muted">基本情報で「自社商品」をONにすると、画像制作の管理項目が使えます。</p>
+      <h2>画像制作 <span class="muted" style="font-weight:400">(自社商品・取扱先限定商品)</span></h2>
+      <%# 2026-08-31 中原さん: 栃木レザーなどの取扱先限定商品でも撮影の設定や LP の重要度を決めるので、
+          自社商品だけに閉じていると設定できなかった。判定はサーバ (canUseImageProduction) と同じ %>
+      <% if (!canImageProduction) { %>
+        <p class="muted">
+          基本情報の「自社商品」をONにするか、「画像の重要度」を
+          <strong>取扱先限定商品（重要度：高）</strong> にすると、画像制作の管理項目が使えます。
+        </p>
       <% } else { %>
         <% const ip = imageProduction || {}; %>
         <%# 画像制作だけの保留 (2026-08-26 中原さん決定)。商品の本流は止めず、画像トラックと楽天出品ゲートだけ閉じる %>
@@ -1250,8 +1261,16 @@
           <input type="text" id="ip-aplus-related" value="<%= ip.aplus_related || '' %>">
         </div>
         <div class="field">
-          <label>依頼文 (外注への画像作成依頼)</label>
-          <textarea id="ip-request" rows="4"><%= ip.request_text || '' %></textarea>
+          <%# 2026-08-31 中原さん: デザインは社内で進めるようになったので、依頼文はカメラマンへの
+              撮影依頼に変わった。URL 2 本 (Drive フォルダ / カメラ撮影指示) を差し込んだ定型文を作る %>
+          <label>依頼文 (カメラマンへの撮影依頼)</label>
+          <div style="display:flex; gap:6px; align-items:center; margin-bottom:4px; flex-wrap:wrap;">
+            <button type="button" class="btn btn-sm" id="ip-request-template">📷 撮影依頼の定型文を作る</button>
+            <span class="muted" id="ip-request-template-note" style="font-size:11px;">
+              画像フォルダのURL と カメラ撮影指示URL を差し込みます
+            </span>
+          </div>
+          <textarea id="ip-request" rows="6"><%= ip.request_text || '' %></textarea>
         </div>
         <button class="btn btn-primary" id="save-ip-btn">画像制作情報を保存</button>
       <% } %>
@@ -2489,6 +2508,59 @@
       info.textContent = '通信エラー: ' + e.message;
     } finally { btn.disabled = false; }
   });
+
+  // 入力欄のリンクをその場で開くボタン (2026-08-31 中原さん要望)。
+  // 空 / http(s) 以外のときは隠す (javascript: を踏ませない)
+  function bindOpenLink(inputId, linkId) {
+    const input = document.getElementById(inputId);
+    const link = document.getElementById(linkId);
+    if (!input || !link) return;
+    const sync = () => {
+      const v = String(input.value || '').trim();
+      let ok = false;
+      try {
+        const u = new URL(v);
+        ok = u.protocol === 'http:' || u.protocol === 'https:';
+      } catch (e) { ok = false; }
+      link.style.display = ok ? '' : 'none';
+      if (ok) link.href = v;
+      else link.removeAttribute('href');
+    };
+    input.addEventListener('input', sync);
+    input.addEventListener('change', sync);
+    sync();
+  }
+  // Amazon URL: ASIN の取り違えを目で確かめるため (画像登録を依頼する前に商品ページを見に行く)
+  bindOpenLink('f-amazon-url', 'f-amazon-open');
+
+  // カメラマンへの撮影依頼の定型文 (2026-08-31 中原さん)。
+  // デザインは社内で進めるようになったので、旧デザイナー向け依頼文は使わない
+  (function initRequestTemplate() {
+    const btn = document.getElementById('ip-request-template');
+    const area = document.getElementById('ip-request');
+    if (!btn || !area) return;
+    btn.addEventListener('click', () => {
+      const folder = String((document.getElementById('import-folder-url') || {}).value || '').trim();
+      const camera = String((document.getElementById('ip-camera-url') || {}).value || '').trim();
+      const lines = [
+        'お世話になっています。',
+        '下記商品の商品撮影をお願いします。',
+        folder || '(画像フォルダのURLが未入力です)',
+        camera || '(カメラ撮影指示URLが未入力です)',
+      ];
+      const text = lines.join(String.fromCharCode(10));
+      // すでに書いてある文を黙って消さない (書き足した内容が失われるため)
+      if (area.value.trim() && !confirm('依頼文を定型文で置き換えます。いま書いてある内容は消えます。よろしいですか?')) return;
+      area.value = text;
+      area.focus();
+      const note = document.getElementById('ip-request-template-note');
+      if (note) {
+        note.textContent = (folder && camera)
+          ? '定型文を入れました。「画像制作情報を保存」で保存してください'
+          : '定型文を入れました (未入力のURLは括弧書きのままです)';
+      }
+    });
+  })();
 
   // 画像フォルダのリンクを開くボタン (2026-08-31 中原さん要望)。
   // 入力が空 / http(s) 以外のときは隠す (javascript: を踏ませない)
