@@ -30,7 +30,7 @@
   /* 確認中 (2026-08-31 中原さん: 折りたたみでは気づけない)。商品名のすぐ下に 1 本の帯で置き、
      理由ボタンを 1 タップで押せるようにする。立っているときは青く塗って見落とせなくする */
   .chk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-             margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+             margin-top: 8px; padding: 6px 10px; border-radius: 8px;
              background: #f8fafc; border: 1px solid #e2e8f0; }
   .chk-bar.chk-on { background: #eff6ff; border: 2px solid #3b82f6; }
   .chk-lead { font-size: 13px; font-weight: 700; color: #334155; }
@@ -46,10 +46,22 @@
   .chk-clear:hover { background: #15803d; }
   .chk-note { width: 240px; font-size: 12px; }
   .chk-select { width: auto; font-size: 12px; }
+  /* タブより上 (常時表示) のカードは詰める (2026-08-31 中原さん: 間延びして専有スペースが大きい)。
+     ここが縦に伸びるほど、実際に手を動かす基本情報タブが画面の外へ押し出される。
+     .card そのものを変えると他アプリの画面まで詰まるので、この画面のヘッダー帯だけに当てる */
+  .card.hdr { padding: 9px 14px; margin-bottom: 8px; }
+  .card.hdr h2 { font-size: 14px; margin: 0 0 6px; }
+  /* 読まなくても操作できる説明は畳む (操作そのものは畳まない — 折りたたむと気づけないため) */
+  .hdr-help > summary { cursor: pointer; font-size: 12px; color: #64748b; list-style: none; }
+  .hdr-help > summary::-webkit-details-marker { display: none; }
+  .hdr-help > summary::before { content: 'ⓘ '; }
+  .hdr-help[open] > summary::before { content: '▾ '; }   /* 開閉が見た目で分かるようにする */
+  .hdr-help > summary:hover { color: #1d4ed8; text-decoration: underline; }
+  .hdr-help p { margin: 6px 0 0; font-size: 12px; color: #64748b; }
 </style>
 <div class="wrap wide">
 
-  <div style="margin-bottom:12px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
+  <div style="margin-bottom:8px; display:flex; align-items:center; gap:14px; flex-wrap:wrap;">
     <%# 戻り先は開いた画面に合わせる (2026-08-28 中原さん要望: ボードのカードから開いたら、
         直前に見ていた工程ボード (本流 / 画像・絞り込み) に戻す。一覧から開いたら一覧へ) %>
     <a class="btn" href="<%= backLink.url %>"><%= backLink.label %></a>
@@ -61,7 +73,7 @@
   </div>
 
   <!-- ステータス + Notion -->
-  <div class="card">
+  <div class="card hdr">
     <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
       <span class="badge badge-<%= draft.status %>" style="font-size:13px"><%= statusLabels[draft.status] || draft.status %></span>
       <strong style="font-size:16px"><%= draft.name %></strong>
@@ -116,19 +128,20 @@
         <span style="flex:1"></span>
         <button class="btn chk-clear" id="checking-clear-btn">✅ 確認できた</button>
       </div>
-      <div class="muted" style="font-size:11px; margin-top:4px;">
-        <%= draft.checking_by || '' %> / <%= draft.checking_since %> から
-        — ボードのカードにラベルが出て列の先頭に並びます。この間 AI の情報入力は動きません
+      <div class="muted" style="font-size:11px; margin-top:3px;">
+        <%= draft.checking_by || '' %> / <%= draft.checking_since %> から — この間 AI の情報入力は動きません
       </div>
     <% } else { %>
       <%# ワンタップで立てられるようにする (2026-08-31 中原さん: 折りたたみは気づけない)。
           理由ごとにボタンを並べ、押した時点で確認中になる。補足は立てたあとで入れられる %>
-      <div class="chk-bar">
+      <div class="chk-bar" title="押すとボードのカードにラベルが出て、列の先頭に並びます">
         <span class="chk-lead">🔍 確認中にする</span>
         <% for (const r of checkingReasons) { %>
           <button class="btn chk-pick" data-reason="<%= r.code %>" title="<%= r.hint %>"><%= r.short || r.label %></button>
         <% } %>
-        <span class="muted" style="font-size:11px;">押すとボードのカードにラベルが出て、列の先頭に並びます</span>
+        <%# 説明を title だけにすると iPad では読めない (Codex R1 medium)。
+            省スペースは保ちたいので、同じ帯の末尾に短く常時表示する %>
+        <span class="muted" style="font-size:11px;">押すとボードで先頭に出ます</span>
       </div>
     <% } %>
     <% if (draft.source === 'notion_import') { %>
@@ -160,9 +173,9 @@
     ).length;
   %>
   <!-- 楽天出品 (P3) -->
-  <div class="card" style="border-color:#fecaca; background:#fffbfa;">
+  <div class="card hdr" style="border-color:#fecaca; background:#fffbfa;">
     <h2>🛒 楽天に出品 <span class="muted" style="font-weight:400">(公開で登録 — 在庫0なので売れません。在庫はNE連携)</span></h2>
-    <div style="font-size:13px; margin-bottom:10px;">
+    <div style="font-size:13px; margin-bottom:6px;">
       🖼 画像転送:
       <% if (images.length === 0) { %>
         <span style="color:#b45309;">画像未登録 (画像タブでフォルダを取り込んでください)</span>
@@ -226,15 +239,17 @@
 <%= rakuten.last_error %></div>
     <% } %>
 
-    <p class="muted" style="margin:0 0 10px; font-size:12px;">
-      💡 税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報タブの値を自動で送ります。
-      在庫は常に 0 で登録します。<br>
-      配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
-      「出品情報を保存」はタブをまたいで全ての出品項目を保存します。
-    </p>
+    <details class="hdr-help" style="margin:0 0 6px;">
+      <summary>送られる値・項目の場所</summary>
+      <p>
+        税率 (<%= yahoo?.tax_rate || '未設定 = 店舗デフォルト10%' %>) と JANコード (<%= draft.jan_code || '未入力' %>) は基本情報タブの値を自動で送ります。
+        在庫は常に 0 で登録します。<br>
+        配送方法・売価は「基本情報」タブ、ジャンル・店舗内カテゴリ・商品属性は「カテゴリ・属性」タブにあります。
+        </p>
+    </details>
 
-    <div style="display:flex; gap:8px; align-items:center; margin-top:6px; flex-wrap:wrap;">
-      <button class="btn" id="rk-save-btn">出品情報を保存</button>
+    <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button class="btn" id="rk-save-btn">出品情報を保存 (全タブ分)</button>
       <button class="btn" id="rk-preview-btn">送信内容を確認</button>
       <button class="btn btn-primary" id="rk-register-btn">公開で登録</button>
       <span class="muted" id="rk-result"></span>
@@ -243,7 +258,7 @@
   </div>
 
   <!-- ═══ 工程 (いま誰のボールか) ═══ 2026-08-23 -->
-  <div class="card" id="wf-card" style="border-color:#bfdbfe; background:#f8fbff;">
+  <div class="card hdr" id="wf-card" style="border-color:#bfdbfe; background:#f8fbff;">
     <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
       <span style="font-size:14px; font-weight:700;">🔁 工程</span>
       <% if (workflow.current) { %>
@@ -1097,7 +1112,7 @@
           <span class="muted" style="font-size:12px; white-space:nowrap;"><%= whiteBgTransferred ? '✅ 転送済み' : '⏳ 未転送 (「画像を転送」で送る)' %></span>
         <% } %>
       </div>
-      <div class="muted" style="font-size:11px;">保存は上部の「出品情報を保存」か「基本情報を保存」で行われます</div>
+      <div class="muted" style="font-size:11px;">保存は上部の「出品情報を保存 (全タブ分)」か「基本情報を保存」で行われます</div>
     </div>
     <div style="display:flex; gap:8px; align-items:center; margin-top:10px; flex-wrap:wrap;">
       <!-- 件数は drive_file_id 突合 (Codex R2: 履歴件数だと画像差し替え後や白抜き分でズレる) -->
