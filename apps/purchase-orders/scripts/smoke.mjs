@@ -4250,6 +4250,33 @@ console.log('── P15e: 発注方法 変更後の取り残しジョブ ──'
   ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15e)', r.body.error);
 }
 
+// ═══ 仕入先マスタ保存の寛容化 (2026-08-31: 行内の別欄の書式エラーで「発注方法を変えても保存されない」) ═══
+console.log('── 仕入先マスタ: 保存の寛容化 ──');
+{
+  const emailModAll = await imp('apps/purchase-orders/email.js');
+  const supPost = body => j('/api/masters/suppliers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const getSup = code => j('/api/masters/suppliers').then(x => (x.body.rows || []).find(s => s.supplier_code === code));
+  // 発注方法≠FAX なら FAX欄の書式不備は保存を止めない (warning)。メーラーからのコピペ「名前 <addr>」はアドレス部を採る
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'email_pdf', email_to: '築山 <ken@example.jp>', fax_number: 'abc', contact_name: '築山' });
+  ok(r.status === 200 && r.body.ok && String(r.body.warning).includes('FAX番号'), 'suppliers: FAX欄不備でも発注方法≠FAXなら保存 (warning)', r.body);
+  let s9 = await getSup('9');
+  ok(s9 && s9.send_method === 'email_pdf' && s9.email_to === 'ken@example.jp' && s9.fax_number === 'abc', 'suppliers: email_pdf 保存 + 「名前 <addr>」→ addr', s9);
+  // 発注方法=FAX は FAX番号の書式を厳密に (保存拒否)
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'fax', email_to: 'ken@example.jp', fax_number: 'abc' });
+  ok(r.status === 400 && String(r.body.error).includes('FAX番号'), 'suppliers: 発注方法=FAX は FAX番号不備で拒否', r.body);
+  // 全角のFAX番号・全角メールは半角化して受ける
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'fax', email_to: 'ｋｅｎ＠example.jp', fax_number: '０６－１２３４－５６７８' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 全角FAX番号・全角メールを半角化して保存', r.body);
+  s9 = await getSup('9');
+  ok(s9.email_to === 'ken@example.jp' && s9.fax_number === '０６－１２３４－５６７８', 'suppliers: メールは半角化・FAXは入力表記のまま', s9);
+  ok(emailModAll.normalizeFaxNumber('０６－１２３４－５６７８') === '0612345678' && emailModAll.normalizeFaxNumber('06.1234.5678') === '0612345678', 'normalizeFaxNumber: 全角・ドット区切り');
+  // 本当に不正なメールは従来どおり拒否
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'email', email_to: 'ken@' });
+  ok(r.status === 400 && String(r.body.error).includes('メールアドレス'), 'suppliers: 不正メールは拒否', r.body);
+  r = await j('/api/masters/suppliers/9', { method: 'DELETE' });
+  ok(r.body.ok, 'suppliers: テスト行削除');
+}
+
 // ═══ ロジザード在庫 mirror 自動反映 (画面アクセス時に captured_at 比較 → 在庫オーバーレイ自動更新) ═══
 console.log('── ロジザード在庫 mirror 自動反映 ──');
 {
