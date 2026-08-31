@@ -4175,6 +4175,81 @@ console.log('── P15d: PDFメール (email_pdf) ──');
   ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15d)', r.body.error);
 }
 
+// ═══ P15e: 発注方法の変更後に、変更前に作られたジョブ (予約/失敗) を作成時の添付のまま送らない ═══
+// (2026-08-31 フォーユー: email→email_pdf に変えた後、変更前の予約ジョブが CSV 添付で先方へ出た)
+console.log('── P15e: 発注方法 変更後の取り残しジョブ ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key, channel) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: channel || 'email', ...body }) });
+
+  // 仕入先 0002 = 📧メール (CSV) で予約送信ジョブを作る
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 0002を📧メールへ (送信前ジョブなし=warningなし)', r.body);
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 37 }], requestedDate: '2026-09-06' }) });
+  ok(r.body.ok, 'P15e: PO発行', r.body.error);
+  const cmOrderId = r.body.id;
+  const futureJst = new Date(Date.now() + 9 * 3600000 + 3 * 3600000).toISOString().slice(0, 16); // 3時間後 (JST表記)
+  r = await jsonPost('/api/orders/' + cmOrderId + '/email/send', { scheduledAt: futureJst }, 'cm-key-1');
+  ok(r.body.ok && r.body.channel === 'email' && r.body.status === 'scheduled', 'P15e: 📧メールで予約送信ジョブ作成', r.body);
+  const cmJob = db.prepare('SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC').get(cmOrderId);
+  ok(cmJob.status === 'queued' && cmJob.channel === 'email' && /\.csv$/.test(cmJob.attachment_name), 'P15e: ジョブ=queued/email/CSV添付', cmJob.attachment_name);
+
+  // 発注方法を 📄PDFメール へ変更 → 保存応答に送信前ジョブの警告
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && r.body.warning && r.body.warning.includes('1件') && r.body.warning.includes('予約'), 'suppliers: 発注方法変更 → 送信前ジョブ1件の警告', r.body);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 発注方法が同じ再保存は警告なし', r.body);
+
+  // 予約時刻到来 → ディスパッチャは送らずに failed (CSV添付のまま先方へ出さない)
+  db.prepare("UPDATE po_email_jobs SET scheduled_at=? WHERE id=?").run(new Date(Date.now() - 60000).toISOString(), cmJob.id);
+  const d = await emailMod.dispatchDueEmailJobs();
+  const cmJob2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJob.id);
+  ok(d.due >= 1 && cmJob2.status === 'failed' && !cmJob2.gmail_message_id, 'P15e: 予約到来 → 送信せず failed', { d, status: cmJob2.status, err: cmJob2.error });
+  ok(String(cmJob2.error).includes('発注方法がジョブ作成後に変わった') && cmJob2.error.includes('CSV添付') && cmJob2.error.includes('PDFメール'),
+    'P15e: エラー文に作成時/現在の発注方法', cmJob2.error);
+  ok(db.prepare("SELECT COUNT(*) AS n FROM po_audit_log WHERE action='email_channel_mismatch' AND detail_json LIKE ?").get('%"jobId":' + cmJob.id + '%').n === 1,
+    'P15e: 監査ログ email_channel_mismatch');
+
+  // 再試行しても同じ理由で止まる (添付はジョブ作成時に固定)
+  r = await j('/api/email-jobs/' + cmJob.id + '/retry', { method: 'POST' });
+  const cmJob3 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJob.id);
+  ok(r.body.ok && r.body.status === 'failed' && cmJob3.status === 'failed' && !cmJob3.gmail_message_id, 'P15e: 再試行 → 送信せず failed のまま', r.body);
+  ok(db.prepare("SELECT COUNT(*) AS n FROM po_email_jobs WHERE order_id=? AND status='sent'").get(cmOrderId).n === 0, 'P15e: このPOは1通も送信されていない');
+
+  // 取消 → 新規送信 (email_pdf) は通る
+  r = await j('/api/email-jobs/' + cmJob.id + '/cancel', { method: 'POST' });
+  ok(r.body.ok, 'P15e: 取り残しジョブの取消', r.body);
+  r = await j('/api/orders/' + cmOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'email_pdf' && /\.pdf$/.test(r.body.attachmentName), 'P15e: プレビューは現在の発注方法 (email_pdf/PDF)', r.body.channel);
+  r = await jsonPost('/api/orders/' + cmOrderId + '/email/send', {}, 'cm-key-2', 'email_pdf');
+  ok(r.body.ok && r.body.channel === 'email_pdf' && r.body.status === 'sent', 'P15e: 新規送信 (email_pdf) → sent', r.body);
+
+  // 発注方法=送信なし (none) へ変えた場合も、送信前ジョブは止まる
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 38 }], requestedDate: '2026-09-06' }) });
+  const cmOrderId2 = r.body.id;
+  r = await jsonPost('/api/orders/' + cmOrderId2 + '/email/send', { scheduledAt: futureJst }, 'cm-key-3', 'email_pdf');
+  ok(r.body.ok && r.body.status === 'scheduled', 'P15e: email_pdf の予約ジョブ作成', r.body);
+  const cmJobN = db.prepare('SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC').get(cmOrderId2);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'none', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.body.ok && r.body.warning && r.body.warning.includes('1件'), 'suppliers: none へ変更 → 警告', r.body);
+  db.prepare("UPDATE po_email_jobs SET scheduled_at=? WHERE id=?").run(new Date(Date.now() - 60000).toISOString(), cmJobN.id);
+  await emailMod.dispatchDueEmailJobs();
+  const cmJobN2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJobN.id);
+  ok(cmJobN2.status === 'failed' && cmJobN2.error.includes('送信なし'), 'P15e: 送信なしへ変更後の予約ジョブも failed', cmJobN2.error);
+  await j('/api/email-jobs/' + cmJobN.id + '/cancel', { method: 'POST' });
+
+  // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15e)', r.body.error);
+}
+
 // ═══ ロジザード在庫 mirror 自動反映 (画面アクセス時に captured_at 比較 → 在庫オーバーレイ自動更新) ═══
 console.log('── ロジザード在庫 mirror 自動反映 ──');
 {
