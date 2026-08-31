@@ -937,15 +937,18 @@ export function trailingBannerLocations(shippingGroup) {
  * 説明文3欄の組み立て (§10 店舗フォーマット)。buildItemPayload と 3欄プレビューの共通部。
  * 楽天の入力欄と1:1対応: pc=PC用商品説明文 / sales=PC用販売説明文 / sp=スマートフォン用商品説明文
  */
-export function composeDescriptions({ title, ai, specs, pageInfo, shippingLabel, cabinetLocations }) {
-  // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
-  const descTexts = [title];
+export function composeDescriptions({ productName, ai, specs, pageInfo, cabinetLocations }) {
+  // 「説明」行 = AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)。
+  // **楽天タイトルは入れない** (2026-08-31 中原さん): タイトルは検索用に語を並べたもので、
+  // 説明として読ませる文ではない。表の先頭に丸ごと出ると SEO 語の羅列がそのまま載る
+  const descTexts = [];
   if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
   if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
   const pc = buildPageInfoHtml({
-    productName: title,
+    // AI 文が 1 つも無いときだけ「商品名」行として使われる。ここは NE の商品名を渡す
+    // (楽天タイトルを渡すと、上で外したはずの SEO 語がフォールバックで出てしまう)
+    productName,
     info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
-    shippingLabel,
     descriptionText: descTexts.join('\n\n'),
     notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
     specs,
@@ -969,7 +972,6 @@ export function buildDescriptionPreview(db, draftId) {
   }
   const specs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draftId);
   const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draftId) || null;
-  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
   // 転送済みの商品画像 (白抜き除く・バナーは §15 どおり salesDescription に入れない) — buildItemPayload と同じ突合
   const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location, drive_modified_time FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
   const byFile = freshCabinetMap(cabinetAll);
@@ -977,10 +979,8 @@ export function buildDescriptionPreview(db, draftId) {
   const current = db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ? ORDER BY sort, id')
     .all(draftId).filter((i) => i.drive_file_id !== whiteBgId);
   const locations = current.filter((i) => byFile.has(cabinetKeyOf(i))).map((i) => byFile.get(cabinetKeyOf(i)));
-  const title = String(ai.rakuten_title || draft.name || '').trim();
   const d = composeDescriptions({
-    title, ai, specs, pageInfo,
-    shippingLabel: effectiveShip.label, cabinetLocations: locations,
+    productName: draft.name, ai, specs, pageInfo, cabinetLocations: locations,
   });
   return {
     ok: true, ...d,
@@ -1185,10 +1185,8 @@ export function buildItemPayload(db, draftId) {
   //   PC用商品説明文 (productDescription.pc) = 表1枚 (説明/注意事項/仕様表/商品ページ表記)
   //   PC用販売説明文 (salesDescription)      = 商品画像を width100% で並べた画像HTML
   //   スマホ用商品説明文 (productDescription.sp) = 販売説明文 + 商品説明文
-  // 発送方法の表示名は上で解決済みの effectiveShip (アプリ指定 > NEマッピング)
   const { pc: pcHtml, sales: salesHtml, sp: spHtml } = composeDescriptions({
-    title, ai, specs, pageInfo,
-    shippingLabel: effectiveShip.label,
+    productName: draft.name, ai, specs, pageInfo,
     cabinetLocations: cabinet.map((c) => c.cabinet_location),
   });
   if (pcHtml.length > DESC_LIMIT) reasons.push(`PC用商品説明文が長すぎます (${pcHtml.length}字 / 上限${DESC_LIMIT}字)`);

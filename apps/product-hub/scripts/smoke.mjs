@@ -995,10 +995,12 @@ check('payload: システム連携用SKU番号 = 商品コード',
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
 // 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
-check('payload: PC説明文は表形式 — 説明行に商品名+特徴',
+// 2026-08-31 中原さん: 楽天タイトルは検索用に語を並べたもので、説明として読ませる文ではない。
+// 表の先頭に丸ごと出ると SEO 語の羅列がそのまま載るので、説明行には入れない
+check('payload: PC説明文は表形式 — 説明行は AI 特徴から始まる (楽天タイトルを入れない)',
   pl.productDescription.pc.startsWith('<table')
   && pl.productDescription.pc.includes('<b>説明</b>')
-  && pl.productDescription.pc.includes('楽天用タイトル')
+  && !pl.productDescription.pc.includes('楽天用タイトル')
   && pl.productDescription.pc.includes('特徴文'),
   pl.productDescription.pc);
 check('payload: 仕様表は1項目1行',
@@ -1319,11 +1321,13 @@ check('payload: 化粧品の必須記載不足は登録をブロック',
 db.prepare(`UPDATE draft_page_info SET seller_name = 'メーカーA', origin_type = '日本製', category_label = '化粧品' WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: 充足すると説明文末尾に表を連結 (発送方法=アプリ指定グループ名)',
+// 発送方法の行は出さない (2026-08-31 中原さん: 表には不要。配送方法は画像末尾のバナーで見せている)
+check('payload: 充足すると説明文末尾に表を連結 (発送方法の行は出さない)',
   b27.ok === true
   && b27.payload.productDescription.pc.includes('<table')
   && b27.payload.productDescription.pc.includes('メーカーA')
-  && b27.payload.productDescription.pc.includes('ネコポス'),
+  && !b27.payload.productDescription.pc.includes('発送方法')
+  && !b27.payload.productDescription.pc.includes('ネコポス'),
   JSON.stringify(b27.reasons || null));
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
 // 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
@@ -1796,34 +1800,35 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
       origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品',
       seller_name: 'メーカーA', importer_name: '輸入者B',
     },
-    shippingLabel: 'ネコポス',
   });
   check('page-info html: table + エスケープ + 改行→<br>',
     html.startsWith('<table') && html.includes('テスト&lt;商品&gt; &amp; &quot;A&quot;') && html.includes('水<br>グリセリン'),
     html.slice(0, 200));
   check('page-info html: 製造国は「海外製（フランス）」形式', html.includes('海外製（フランス）'));
   check('page-info html: 発売元 + 輸入者の両記載 (楽天ルール: 輸入品)', html.includes('メーカーA<br>輸入者: 輸入者B'));
-  check('page-info html: 発送方法/広告文責/注意事項が載る',
-    html.includes('ネコポス') && html.includes(pinfo.adResponsibility()) && html.includes(pinfo.FIXED_NOTES));
+  check('page-info html: 広告文責/注意事項が載る',
+    html.includes(pinfo.adResponsibility()) && html.includes(pinfo.FIXED_NOTES));
+  check('page-info html: 発送方法の行は出さない (2026-08-31 中原さん: 表には不要)',
+    !html.includes('発送方法') && !html.includes('ネコポス'), html.slice(0, 300));
   check('page-info html: 空欄の行は出さない (サイズ/使用上の注意なし)',
     !html.includes('サイズ') && !html.includes('使用上の注意'));
   const foodHtml = pinfo.buildPageInfoHtml({
     productName: 'アマニ', info: {
       product_type: 'food', food_name: '有機亜麻仁シード', food_ingredients: '有機アマニ',
       food_expiry: 'ラベルに記載', food_storage: '常温',
-    }, shippingLabel: null,
+    },
   });
   check('page-info html: 食品は 名称/原材料名/賞味期限/保存方法',
     ['名称', '原材料名', '賞味期限', '保存方法'].every((k) => foodHtml.includes(k))
     && !foodHtml.includes('発送方法'));
   check('page-info html: 全空でも固定行 (商品名/広告文責/注意事項) だけの表になる',
-    pinfo.buildPageInfoHtml({ productName: 'X', info: null, shippingLabel: null }).includes('広告文責'));
+    pinfo.buildPageInfoHtml({ productName: 'X', info: null }).includes('広告文責'));
   check('page-info html: 商品名すら無ければ固定行のみ (空文字にはならない)',
-    pinfo.buildPageInfoHtml({ productName: '', info: null, shippingLabel: null }).includes('注意事項'));
+    pinfo.buildPageInfoHtml({ productName: '', info: null }).includes('注意事項'));
   // ブランド名・容量 (ml/g) — 2026-08-28 中原さん要望
   {
     const bh = pinfo.buildPageInfoHtml({
-      productName: 'X', shippingLabel: null,
+      productName: 'X',
       info: { product_type: 'general', brand_name: 'B-Faith<x>', content_volume: '200g' },
     });
     check('page-info html: ブランド名の行が載る (エスケープあり)',
@@ -1832,7 +1837,7 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
       bh.indexOf('商品名') < bh.indexOf('ブランド名') && bh.indexOf('ブランド名') < bh.indexOf('内容量'));
     check('page-info html: 雑貨でも容量 (ml/g) が内容量として載る', bh.includes('<b>内容量</b>') && bh.includes('200g'));
     check('page-info html: ブランド名が空なら行を出さない',
-      !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' }, shippingLabel: null })
+      !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' } })
         .includes('ブランド名'));
   }
 }
@@ -4619,9 +4624,21 @@ check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === nu
   check('3欄プレビュー: スマホ用 = 販売+PC の連結 (販売が空ならPCと同じ)', pv.sp === pv.pc);
   check('3欄プレビュー: 存在しないdraftはok:false', buildDescriptionPreview(db, 999999).ok === false);
   // composeDescriptions が buildItemPayload と同じ入力形で pc/sales/sp を返す (共通化の回帰)
+  // 説明行が空 (AI 文が 1 つも無い) のときだけ productName がフォールバックで使われる。
+  // ここに楽天タイトルを渡すと、外したはずの SEO 語がフォールバックで出てしまう
+  {
+    const fb = composeDescriptions({
+      productName: 'NE商品名<X>', ai: {}, specs: [], pageInfo: null, cabinetLocations: [],
+    });
+    check('composeDescriptions: AI 文が空なら「商品名」行に NE 商品名が出る (楽天タイトルではない)',
+      fb.pc.includes('<b>商品名</b>') && fb.pc.includes('NE商品名&lt;X&gt;')
+      && !fb.pc.includes('<b>説明</b>'), fb.pc.slice(0, 220));
+    check('composeDescriptions: フォールバックの商品名もエスケープされる',
+      !fb.pc.includes('NE商品名<X>'), fb.pc.slice(0, 220));
+  }
   const comp = composeDescriptions({
-    title: 'T', ai: { desc_features: 'F', desc_spec: 'S', desc_notes: 'N' },
-    specs: [], pageInfo: null, shippingLabel: null, cabinetLocations: ['/x/a.jpg'],
+    productName: 'NE名', ai: { desc_features: 'F', desc_spec: 'S', desc_notes: 'N' },
+    specs: [], pageInfo: null, cabinetLocations: ['/x/a.jpg'],
   });
   check('composeDescriptions: pc に特徴/仕様が入り sales に画像HTML・sp が連結',
     comp.pc.includes('F') && comp.pc.includes('S') && comp.sales.includes('/x/a.jpg')
@@ -4630,10 +4647,10 @@ check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === nu
   // XSS境界 (Codexレビュー提案): 3欄は画面で innerHTML レンダリングされるため、
   // 素材にHTML/属性注入が混ざっても生成関数がすべてエスケープすることを固定する
   const evil = composeDescriptions({
-    title: '<script>alert(1)</script>',
+    productName: '<script>alert(1)</script>',
     ai: { desc_features: '<img src=x onerror=alert(2)>', desc_notes: '</td><script>alert(3)</script>' },
     specs: [{ spec_key: '<b>鍵</b>', spec_value: '"onmouseover="alert(4)' }],
-    pageInfo: null, shippingLabel: null,
+    pageInfo: null,
     cabinetLocations: ['/dir/"onerror="alert(5)/a.jpg'],
   });
   check('XSS境界: PC欄で素材の生タグが実行形で出ない (全てエスケープ)',
@@ -5059,6 +5076,24 @@ for (const [name, file, data] of renders) {
   })(), [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]).join(',') || '(1つも無い)');
   // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
   dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
+}
+
+// ─── 画面の直し 3 点 (2026-08-31 中原さんの実務フィードバック) ───
+{
+  const dh = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  // ④ 店舗内カテゴリ: 必須項目なので畳まない。ツリーは 5 枠より上に置く (記載を見逃さないため)
+  const accIdx = dh.indexOf('id="rk-cats-acc"');
+  const slotIdx = dh.indexOf('id="rk-cat-slots"');
+  check('カテゴリ: ツリーは既定で開いている (必須項目を畳まない)',
+    accIdx >= 0 && /<details id="rk-cats-acc" open/.test(dh),
+    accIdx >= 0 ? dh.slice(accIdx - 40, accIdx + 40) : '(ツリーが無い)');
+  check('カテゴリ: ツリーは 1〜5 の枠より上にある',
+    accIdx >= 0 && slotIdx >= 0 && accIdx < slotIdx, `acc=${accIdx} slots=${slotIdx}`);
+  // ⑤ 画像フォルダのリンクを開くボタン (入力が空なら隠れる = 初期表示は display:none)
+  check('画像フォルダ: リンクを開くボタンがある (空のときは隠れる)',
+    dh.includes('id="import-folder-open"') && dh.includes('📂 開く')
+    && /id="import-folder-open"[\s\S]{0,120}display:none/.test(dh),
+    dh.includes('import-folder-open') ? '初期状態が隠れていない' : 'ボタンが無い');
 }
 
 // ─── メーカー型番の入口は 1 つ / ジャンル属性の候補ボタン (2026-08-31 中原さん要望) ───
