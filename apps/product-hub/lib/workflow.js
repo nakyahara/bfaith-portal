@@ -12,7 +12,7 @@
  *   - builtin の役割・工程はコードが参照するので無効化・削除させない (改名は可)
  *   - 検証エラーは e.status=400 を付けて投げ、router 側で JSON にする
  */
-import { getDB, STAFF_KINDS, STAFF_COLORS, RETIRED_TOP_STEP_CODES } from '../db.js';
+import { getDB, STAFF_KINDS, STAFF_COLORS } from '../db.js';
 
 const KIND_VALUES = new Set(STAFF_KINDS.map((k) => k.value));
 const MAX_NAME_LEN = 40;
@@ -416,8 +416,9 @@ export function updateStep(code, input) {
   }
   if (input?.active !== undefined) {
     const on = input.active ? 1 : 0;
-    // 廃止した TOP画像の工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)
-    if (on && RETIRED_TOP_STEP_CODES.includes(step.code)) {
+    // 廃止した TOP画像の工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)。
+    // **コードでなく属性で**見る (Codex R3 high): 管理画面から足したカスタム TOP 工程も同じ
+    if (on && step.track === 'image' && step.image_kind !== 'detail') {
       throw badRequest('TOP画像の工程は 2026-08-31 に廃止しました (画像の工程は商品詳細 (LP) の 1 本です)');
     }
     if (!on && step.builtin === 1) {

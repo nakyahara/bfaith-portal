@@ -1360,9 +1360,13 @@ export function migrateImageKindSplit(db) {
  * 進捗行 (draft_step_progress) は消さない — 誰がどこまでやったかの記録として残す。冪等。
  */
 export function retireTopImageSteps(db) {
-  const ph = RETIRED_TOP_STEP_CODES.map(() => '?').join(',');
-  const info = db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${ph}) AND active = 1`)
-    .run(...RETIRED_TOP_STEP_CODES);
+  // **コードでなく属性で**落とす (Codex R3 high): 管理画面から足したカスタム TOP 工程
+  // (step_xxx / image_kind='top' や NULL) が残ると、そこだけ TOP 列・TOP カードが復活する。
+  // 画像トラックは商品詳細 (LP) の 1 本に統一したので、detail 以外の画像工程はすべて無効化する
+  const info = db.prepare(`
+    UPDATE ph_steps SET active = 0
+    WHERE track = 'image' AND (image_kind IS NULL OR image_kind <> 'detail') AND active = 1
+  `).run();
   if (info.changes > 0) {
     console.log(`[product-hub] TOP画像の工程 ${info.changes} 件を無効化しました (画像工程は詳細に一本化)`);
   }

@@ -1992,10 +1992,27 @@ const wf = await import('../lib/workflow.js');
   const extra = wf.createStep({ label: '撮影', track: 'image', image_kind: 'detail', role_code: 'image' });
   check('工程を追加できる (種別つき)', wf.listSteps({ track: 'image' }).find((s) => s.code === extra)?.image_kind === 'detail');
   check('追加した工程は無効化できる', wf.updateStep(extra, { active: false }) === true);
-  // 廃止した TOP 工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)
-  let revive = null;
-  try { wf.updateStep('img_approve_top', { active: true }); } catch (e) { revive = e; }
-  check('廃止した TOP 工程は再有効化できない', revive?.status === 400, revive?.message || '例外が出ていない');
+  // 廃止した TOP 工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)。
+  // 旧版の管理画面から足せた**カスタム TOP 工程**も同じ扱いにする (Codex R3 high)。
+  // 新規 DB には TOP 工程が無いので、直 SQL で「旧 DB に残っている状態」を作って検証する
+  {
+    db.prepare(`INSERT INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, builtin, active)
+      VALUES ('step_legacy_top', '旧カスタムTOP', 'image', 'top', 'request', 'image', 999, 0, 1)`).run();
+    db.prepare(`INSERT INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, builtin, active)
+      VALUES ('step_legacy_nokind', '旧カスタム画像 (種別なし)', 'image', NULL, NULL, 'image', 998, 0, 1)`).run();
+    const activeOf = (code) => db.prepare('SELECT active FROM ph_steps WHERE code = ?').get(code)?.active;
+    check('起動時: 詳細以外の画像工程 (カスタム TOP・種別なし) は無効化される',
+      dbmod.retireTopImageSteps(db) >= 2 && activeOf('step_legacy_top') === 0 && activeOf('step_legacy_nokind') === 0,
+      `top=${activeOf('step_legacy_top')} nokind=${activeOf('step_legacy_nokind')}`);
+    for (const code of ['step_legacy_top', 'step_legacy_nokind']) {
+      let revive = null;
+      try { wf.updateStep(code, { active: true }); } catch (e) { revive = e; }
+      check(`廃止した画像工程は再有効化できない (${code})`,
+        revive?.status === 400 && /TOP画像の工程/.test(revive.message || '')
+        && activeOf(code) === 0, revive?.message || '例外が出ていない');
+    }
+    db.prepare(`DELETE FROM ph_steps WHERE code IN ('step_legacy_top', 'step_legacy_nokind')`).run();
+  }
   check('無効化した工程は既定の一覧に出ない', !wf.listSteps().some((s) => s.code === extra));
 
   // 画像トラックの組み込み工程 (2026-08-31 以降は商品詳細のみ) のラベル・並び順・滞留日数を変える
