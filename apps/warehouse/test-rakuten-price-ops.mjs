@@ -138,7 +138,14 @@ console.log('\n── 受領台帳 (冪等) ──');
     operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'MN-1',
     request: { prices: { 360: 620 }, expected: { 360: '577' } },
   });
-  eq(!!reordered.reused, false, 'キー順・大小文字・文字列価格の違いは同じ依頼とみなす');
+  eq(!!reordered.reused, false, 'キー順・大小文字・expected の文字列/数値の違いは同じ依頼とみなす');
+  // ★prices は型まで含めて別物。"620" は本来 INVALID_PRICE で弾かれる依頼なので、
+  //   620 の成功応答を replay させてはいけない
+  const strPrice = receiveOperation(db, {
+    operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-1',
+    request: { expected: { 360: 577 }, prices: { 360: '620' } },
+  });
+  eq(!!strPrice.reused, true, '★prices が文字列の依頼は別物 (弾かれるはずの依頼が成功を replay しない)');
 
   // conflict の replay は「成功」にしない (呼び出し側が適用済みと誤解しないため)
   receiveOperation(db, { operationId: 'op-0003-abcdef', manageNumber: 'mn-1', request: req });

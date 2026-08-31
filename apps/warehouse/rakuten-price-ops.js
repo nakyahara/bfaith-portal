@@ -185,13 +185,21 @@ function safeParse(json) {
 
 /** 依頼の同一性を見るためのハッシュ (キー順に依存しない正規形から作る) */
 export function requestHash({ manageNumber, request }) {
-  const norm = (o) => Object.fromEntries(
+  // expected は「更新前価格の照合値」で、planPriceUpdate が文字列でも整数として扱う。
+  // だから 577 と "577" は同じ依頼とみなしてよい
+  const normExpected = (o) => Object.fromEntries(
     Object.keys(o || {}).sort().map((k) => [k, toIntPrice(o[k]) ?? o[k]])
+  );
+  // ★prices は型を保ったままにする。"620" は planPriceUpdate では INVALID_PRICE として弾かれる値で、
+  //   620 と同じ依頼ではない。ここで同一視すると、弾かれるはずの依頼が
+  //   過去の成功応答を replay してしまう
+  const keepPrices = (o) => Object.fromEntries(
+    Object.keys(o || {}).sort().map((k) => [k, [typeof o[k], o[k]]])
   );
   const canonical = JSON.stringify({
     mn: String(manageNumber || '').trim().toLowerCase(),
-    expected: norm(request?.expected),
-    prices: norm(request?.prices),
+    expected: normExpected(request?.expected),
+    prices: keepPrices(request?.prices),
   });
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
