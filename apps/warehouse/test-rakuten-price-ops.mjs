@@ -104,21 +104,23 @@ console.log('\n── 受領台帳 (冪等) ──');
 
   const first = receiveOperation(db, { operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-1', request: req });
   eq(first.fresh, true, '初回は fresh');
-  completeOperation(db, 'op-0001-abcdef', 'applied', { applied: { 360: 620 } });
+  // 台帳には「返した HTTP status と本文」をそのまま残す (再送で初回と同じ応答を返すため)
+  completeOperation(db, 'op-0001-abcdef', 'applied', { httpStatus: 200, body: { ok: true, state: 'applied', applied: { 360: 620 } } });
 
   const again = receiveOperation(db, { operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-1', request: req });
   eq(again.fresh, false, '★同じ operation_id は再実行しない');
   const replay = replayOf(again.row);
-  eq([replay.replay, replay.state, replay.result], [true, 'applied', { applied: { 360: 620 } }], '前回結果をそのまま返す');
+  eq([replay.status, replay.state], [200, 'applied'], '前回と同じ HTTP status');
+  eq(replay.body, { ok: true, state: 'applied', applied: { 360: 620 }, replay: true }, '★本文も初回と同じ形 (replay フラグだけ増える)');
 
   // 受領はしたが結果が無い = 送信済みか不明。実行し直さない
   receiveOperation(db, { operationId: 'op-0002-abcdef', runId: 'run-1', manageNumber: 'mn-1', request: req });
   const unknown = replayOf(getOperation(db, 'op-0002-abcdef'));
-  eq(unknown.state, 'unknown', '★結果が残っていない受領済みIDは unknown');
-  ok(unknown.result.message.includes('実行しません'), '実行しないと明示する');
+  eq([unknown.state, unknown.status], ['unknown', 409], '★結果が残っていない受領済みIDは unknown/409');
+  ok(unknown.body.message.includes('実行しません'), '実行しないと明示する');
 
   // 結果は上書きしない (最初の結果が正)
-  completeOperation(db, 'op-0001-abcdef', 'failed', { error: 'X' });
+  completeOperation(db, 'op-0001-abcdef', 'failed', { httpStatus: 502, body: { ok: false } });
   eq(getOperation(db, 'op-0001-abcdef').result_state, 'applied', '★確定した結果は後から書き換わらない');
 
   // ★同じ operation_id で別の依頼が来たら、前回結果を返さず拒否する (ID の使い回し・衝突)
@@ -140,9 +142,9 @@ console.log('\n── 受領台帳 (冪等) ──');
 
   // conflict の replay は「成功」にしない (呼び出し側が適用済みと誤解しないため)
   receiveOperation(db, { operationId: 'op-0003-abcdef', manageNumber: 'mn-1', request: req });
-  completeOperation(db, 'op-0003-abcdef', 'conflict', { code: 'CONFLICT' });
+  completeOperation(db, 'op-0003-abcdef', 'conflict', { httpStatus: 409, body: { ok: false, state: 'conflict', error: 'CONFLICT' } });
   const conflictReplay = replayOf(getOperation(db, 'op-0003-abcdef'));
-  eq(conflictReplay.state, 'conflict', '★conflict の再送は conflict のまま (成功にしない)');
+  eq([conflictReplay.status, conflictReplay.body.ok], [409, false], '★conflict の再送は 409 / ok:false (成功にしない)');
 
   // ★request_hash 列を足す前の行 (hash が NULL) でも検査が効くこと
   receiveOperation(db, { operationId: 'op-0005-abcdef', manageNumber: 'mn-1', request: req });

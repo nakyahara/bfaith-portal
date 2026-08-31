@@ -210,16 +210,33 @@ export function getOperation(db, operationId) {
 
 /**
  * 同じ operation_id が来たときの扱い。
- *   結果あり  → 前回結果をそのまま返す (実行しない)
+ *   結果あり  → **初回とまったく同じ応答**を返す (実行しない)。
+ *               状態や本文の形が初回と変わると、呼び出し側が再送だけ別扱いする羽目になる。
+ *               そのため台帳には「返した HTTP status と本文」をそのまま保存してある
  *   結果なし  → 送信済みか分からない。★実行し直さない (二重更新を作らない)
+ * @returns {{state:string, status:number, body:object}}
  */
 export function replayOf(row) {
   if (row.result_state) {
-    return { replay: true, state: row.result_state, result: JSON.parse(row.result_json || 'null') };
+    const saved = safeParse(row.result_json);
+    if (saved && typeof saved === 'object' && saved.body && Number.isInteger(saved.httpStatus)) {
+      return { state: row.result_state, status: saved.httpStatus, body: { ...saved.body, replay: true } };
+    }
+    // 応答を保存する前の形式で残っている行 (移行期) — 状態から最小限を組み立てる
+    const fallbackStatus = { applied: 200, noop: 200, conflict: 409, failed: 502 }[row.result_state] ?? 409;
+    return {
+      state: row.result_state, status: fallbackStatus,
+      body: {
+        ok: row.result_state === 'applied' || row.result_state === 'noop',
+        state: row.result_state, result: saved, replay: true,
+      },
+    };
   }
   return {
-    replay: true, state: 'unknown',
-    result: {
+    state: 'unknown', status: 409,
+    body: {
+      ok: false, state: 'unknown', replay: true,
+      error: 'OPERATION_RESULT_UNKNOWN',
       message: '同じ operation_id を受領済みですが結果が残っていません。'
         + '楽天へ送信済みか不明なため実行しません。商品の現在価格を確認してから判断してください。',
       receivedAt: row.received_at,
