@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<!--
+  画像が出ない商品の一覧 (2026-08-31 中原さん依頼)。
+  ピッキング画面は「商品画像 + 商品名」で取り違えを防ぐ設計なので、写真が出ない商品は
+  そのぶん確認が弱くなる。楽天の商品管理番号・商品ページへのリンクを並べて、
+  「楽天側に画像を足せば直るもの」と「そもそも楽天に商品が無いもの」を見分けられるようにする。
+-->
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title %> | B-Faith Portal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/mobile.css">
+  <style>
+    .pk-wrap { max-width: 1200px; margin: 0 auto; padding: 12px 16px 40px; }
+    .pk-bar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+    .tile { background: #f8f9fa; border-radius: 10px; padding: 12px 14px; }
+    .tile .v { font-size: 1.6em; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tile .k { font-size: 0.78em; color: #495057; }
+    .tile.bad .v { color: #c92a2a; }
+    .tile.warn .v { color: #e67700; }
+    h2 { font-size: 1.0em; margin: 24px 0 6px; }
+    .note { background: #fff9db; border-radius: 8px; padding: 10px 12px; font-size: 0.85em; margin-bottom: 16px; line-height: 1.7; }
+    table.pk-list { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    table.pk-list th, table.pk-list td { border-bottom: 1px solid #dee2e6; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.pk-list th { background: #f1f3f5; position: sticky; top: 0; }
+    table.pk-list td.num, table.pk-list th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .muted { color: #868e96; }
+    .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.82em; white-space: nowrap; }
+    .badge.nf { background: #ffe3e3; color: #c92a2a; }
+    .badge.err { background: #fff3bf; color: #e67700; }
+    .badge.un { background: #e7f5ff; color: #1971c2; }
+    .badge.var { background: #f3f0ff; color: #6741d9; }
+    .scroll-x { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .scroll-x table.pk-list th, .scroll-x table.pk-list td { white-space: nowrap; }
+    .scroll-x table.pk-list td.nm { white-space: normal; min-width: 22em; }
+    .thumb { width: 40px; height: 40px; object-fit: contain; background: #f1f3f5; border-radius: 4px; }
+    .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    button.retry { padding: 8px 14px; border-radius: 8px; border: 1px solid #1971c2; background: #fff; color: #1971c2; font-weight: 700; }
+    button.retry:disabled { opacity: .5; }
+    .flash { background: #d3f9d8; color: #2b8a3e; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: .9em; }
+  </style>
+</head>
+<body>
+  <header class="portal-header">
+    <div class="header-left">
+      <h1>B-Faith Portal</h1>
+      <span class="page-title">🖼 画像が出ない商品</span>
+    </div>
+    <div class="header-right">
+      <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/picking/admin/stats" class="btn-logout">📈 実績(30日)</a>
+      <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
+      <a href="/" class="btn-logout">ダッシュボード</a>
+    </div>
+  </header>
+
+  <div class="pk-wrap">
+    <div class="pk-bar">
+      <form method="get" action="/apps/picking/admin/missing-images">
+        <label>集計終了日 <input type="date" name="until" value="<%= result.until %>"></label>
+        <label>期間
+          <select name="days">
+            <% for (const d of [7, 14, 30, 60, 90]) { %>
+              <option value="<%= d %>" <%= result.days === d ? 'selected' : '' %>><%= d %>日</option>
+            <% } %>
+          </select>
+        </label>
+        <button type="submit">表示</button>
+      </form>
+      <span class="muted"><%= result.since %> 〜 <%= result.until %> にピッキングした商品</span>
+      <span class="actions" style="margin-left:auto">
+        <a class="btn-logout" href="/apps/picking/admin/missing-images.csv?until=<%= result.until %>&days=<%= result.days %>">⬇ CSV</a>
+        <button type="button" class="retry" id="retryBtn" <%= result.summary.retryable ? '' : 'disabled' %>>🔄 画像を再取得 (<%= result.summary.retryable %>件)</button>
+      </span>
+    </div>
+
+    <div id="flash" class="flash" style="display:none"></div>
+
+    <div class="tiles">
+      <div class="tile"><div class="v"><%= result.summary.skus %></div><div class="k">期間内の商品数</div></div>
+      <div class="tile bad"><div class="v"><%= result.summary.missing %></div><div class="k">写真が出ない</div></div>
+      <div class="tile warn"><div class="v"><%= result.summary.variantMissing %></div><div class="k">別バリエーションの写真が出る</div></div>
+      <div class="tile"><div class="v"><%= result.summary.byStatus.not_found || 0 %></div><div class="k">楽天に画像が無い</div></div>
+      <div class="tile"><div class="v"><%= (result.summary.byStatus.error || 0) + (result.summary.byStatus.uncached || 0) %></div><div class="k">取得できていない</div></div>
+    </div>
+
+    <div class="note">
+      ピッキング画面は<b>商品の写真と名前の二重確認</b>で取り違えを防いでいます。ここに出ている商品は写真が出ないので、その分だけ確認が弱くなります。<br>
+      <b>楽天の商品ページに白抜き画像 (またはバリエーションごとの画像) を登録すると、翌日の取込で自動的に出るようになります。</b>
+      画像を登録した直後に反映したいときは「🔄 画像を再取得」を押してください
+      (楽天の商品ページが分かっていて、取り直せば直る可能性がある <b><%= result.summary.retryable %></b> 件が対象です)。<br>
+      <b>商品管理番号が「-」の商品は、楽天に商品ページがありません</b> (楽天で売っていない商品・モール限定商品など)。この場合は楽天側では直せません。
+      <% if (!result.summary.mirrorAvailable) { %><br><b style="color:#c92a2a">⚠ 楽天のデータ (mirror) を読めなかったため、商品管理番号は表示できていません。</b><% } %>
+    </div>
+
+    <h2>① 写真が1枚も出ない商品 (<%= result.missing.length %>件)</h2>
+    <div class="scroll-x">
+      <table class="pk-list">
+        <thead>
+          <tr>
+            <th>商品コード</th><th>商品名</th><th>状態</th>
+            <th>楽天 商品管理番号</th><th>楽天SKUコード</th>
+            <th class="num">明細数</th><th class="num">数量</th><th>最終ピッキング</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% for (const r of result.missing) { %>
+            <tr>
+              <td class="code"><%= r.sku %></td>
+              <td class="nm"><%= r.name || '' %></td>
+              <td>
+                <span class="badge <%= r.status === 'not_found' ? 'nf' : (r.status === 'error' ? 'err' : 'un') %>"><%= r.statusLabel %></span>
+                <% if (r.retryable) { %><span class="muted" style="font-size:.85em"> 再取得で直る可能性</span><% } %>
+              </td>
+              <td class="code">
+                <% if (r.itemUrl) { %><a href="<%= r.itemUrl %>" target="_blank" rel="noopener"><%= r.manageNumber %></a><% } else { %><span class="muted">-</span><% } %>
+              </td>
+              <td class="code"><%= r.rakutenCode || '' %></td>
+              <td class="num"><%= r.lines %></td>
+              <td class="num"><%= r.qty %></td>
+              <td><%= r.lastDate %></td>
+            </tr>
+          <% } %>
+          <% if (result.missing.length === 0) { %>
+            <tr><td colspan="8" class="muted">この期間に写真が出ない商品はありません 🎉</td></tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>② 別のバリエーションの写真が出ている商品 (<%= result.variantMissing.length %>件)</h2>
+    <p class="muted" style="font-size:.85em; margin:0 0 8px">
+      同じ楽天の商品ページを複数の商品コードで共有していて、<b>その商品コード自身の写真が登録されていない</b>ものです。
+      画面には商品ページの代表写真が出るため、<b>香り違い・色違いで「別の色の写真」が表示されます</b> (取り違えの原因)。
+      楽天の商品ページで<b>バリエーションごとの画像</b>を登録すると解消します。
+    </p>
+    <div class="scroll-x">
+      <table class="pk-list">
+        <thead>
+          <tr>
+            <th>いま出ている写真</th><th>商品コード</th><th>商品名</th>
+            <th>楽天 商品管理番号</th><th class="num">共有している商品数</th>
+            <th class="num">明細数</th><th class="num">数量</th><th>最終ピッキング</th>
+          </tr>
+        </thead>
+        <tbody>
+          <% for (const r of result.variantMissing) { %>
+            <tr>
+              <td><% if (r.imageUrl) { %><img class="thumb" src="<%= r.imageUrl %>" alt="" loading="lazy"><% } %></td>
+              <td class="code"><%= r.sku %></td>
+              <td class="nm"><%= r.name || '' %></td>
+              <td class="code">
+                <% if (r.itemUrl) { %><a href="<%= r.itemUrl %>" target="_blank" rel="noopener"><%= r.manageNumber %></a><% } else { %><span class="muted">-</span><% } %>
+              </td>
+              <td class="num"><%= r.sharedBy %></td>
+              <td class="num"><%= r.lines %></td>
+              <td class="num"><%= r.qty %></td>
+              <td><%= r.lastDate %></td>
+            </tr>
+          <% } %>
+          <% if (result.variantMissing.length === 0) { %>
+            <tr><td colspan="8" class="muted">該当なし 🎉</td></tr>
+          <% } %>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('retryBtn').addEventListener('click', async function () {
+      var btn = this;
+      var flash = document.getElementById('flash');
+      if (!confirm('楽天に画像を追加した商品の写真を取り直します (<%= result.summary.retryable %>件)。\n数十秒かかることがあります。よろしいですか?')) return;
+      btn.disabled = true;
+      var old = btn.textContent;
+      btn.textContent = '取得中…';
+      try {
+        var url = '/apps/picking/admin/missing-images/retry?until=<%= result.until %>&days=<%= result.days %>';
+        var res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        var body = await res.json().catch(function () { return {}; });
+        if (res.status === 409) {   // 取込直後の自動解決と重なった = 失敗ではないので案内だけ出す
+          flash.textContent = body.error || '画像の取得が進行中です。少し待ってからもう一度お試しください。';
+          flash.style.background = '#fff3bf'; flash.style.color = '#e67700';
+          flash.style.display = 'block';
+          return;
+        }
+        if (!res.ok) { alert(body.error || ('エラー (' + res.status + ')')); return; }
+        if (!body.requested) {
+          flash.textContent = '取り直せる商品がありませんでした (商品管理番号が分かるものが無い)。';
+        } else {
+          var s = body.stats || {};
+          flash.textContent = body.requested + '件を取り直しました: 画像あり ' + (s.ok || 0) + ' / 画像なし ' + (s.notFound || 0) + ' / 失敗 ' + (s.errors || 0) + '。画面を更新します…';
+        }
+        flash.style.display = 'block';
+        setTimeout(function () { location.reload(); }, 1800);
+      } catch (e) {
+        alert('通信エラー: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = old;
+      }
+    });
+  </script>
+</body>
+</html>
