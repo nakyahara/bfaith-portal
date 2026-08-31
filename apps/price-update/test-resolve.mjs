@@ -25,6 +25,7 @@ const fetchYahooPrices = (codes, deps) => (Array.isArray(codes) && typeof codes[
 import { createTables, insertRun, appendEvent, currentStates, getRun, listRuns } from './db.js';
 import { buildPreviewRows, evaluateRows, parseCodes, parseStrictPrice } from './router.js';
 import { rakutenShippingLabel, yahooPostageLabel } from './shipping-labels.js';
+import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -36,7 +37,7 @@ const db = new Database(path.join(tmpDir, 'mirror.db'));
 // ── mirror 相当の表を用意 (本番と同じ列名) ──
 db.exec(`CREATE TABLE mirror_products (
   商品コード TEXT PRIMARY KEY, 商品名 TEXT, 商品区分 TEXT NOT NULL, 取扱区分 TEXT,
-  標準売価 REAL, 原価 REAL, 原価状態 TEXT NOT NULL, 送料 REAL, 配送方法 TEXT, 消費税率 REAL, セット構成品数 INTEGER)`);
+  標準売価 REAL, 原価 REAL, 原価状態 TEXT NOT NULL, 送料 REAL, 送料コード TEXT, 配送方法 TEXT, 消費税率 REAL, セット構成品数 INTEGER)`);
 db.exec(`CREATE TABLE mirror_set_components (
   セット商品コード TEXT NOT NULL, 構成商品コード TEXT NOT NULL, 数量 INTEGER NOT NULL DEFAULT 1,
   構成商品名 TEXT, 構成商品原価 REAL, updated_at TEXT NOT NULL,
@@ -47,11 +48,11 @@ db.exec(`CREATE TABLE mirror_amazon_price_snapshot_daily (date_jst TEXT NOT NULL
 db.exec(`CREATE TABLE dim_mall (mall_key TEXT PRIMARY KEY, label TEXT, display_order INTEGER, is_channel INTEGER, in_daily_summary INTEGER, tax_included INTEGER, fee_rate_approx REAL)`);
 createTables(db);
 
-const insProduct = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
-insProduct.run('abc-001', 'テスト商品A', '単品', '取扱中', 1200, 500, '確定', 100, 'ネコポス', 0.1, null);
-insProduct.run('abc-002', 'テスト商品B', '単品', '取扱中', 900, 300, '確定', 100, 'ネコポス', 0.1, null);
-insProduct.run('abc-set', 'A+Bセット', 'セット', '取扱中', 2000, null, '確定', 150, 'ネコポス', 0.1, 2);
-insProduct.run('abc-set2', '原価欠けセット', 'セット', '取扱中', 2500, null, '未確定', 150, 'ネコポス', 0.1, 2);
+const insProduct = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+insProduct.run('abc-001', 'テスト商品A', '単品', '取扱中', 1200, 500, '確定', 100, '501', 'ネコポス', 0.1, null);
+insProduct.run('abc-002', 'テスト商品B', '単品', '取扱中', 900, 300, '確定', 100, '501', 'ネコポス', 0.1, null);
+insProduct.run('abc-set', 'A+Bセット', 'セット', '取扱中', 2000, null, '確定', 150, '501', 'ネコポス', 0.1, 2);
+insProduct.run('abc-set2', '原価欠けセット', 'セット', '取扱中', 2500, null, '未確定', 150, '501', 'ネコポス', 0.1, 2);
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set', 'abc-001', 2, 'テスト商品A', 500, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set', 'abc-002', 1, 'テスト商品B', 300, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set2', 'abc-001', 1, 'テスト商品A', 500, 'now');
@@ -136,8 +137,8 @@ console.log('\n── 楽天の文字列価格 (M0実測) ──');
 console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行にまとめる (2026-08-30 実機で判明) ──');
 {
   // 実データと同じ形: ne_code=0726-001802-bk に対し al=360 / am=0726-001802-bk / w=0726-001802
-  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
-    .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 100, '定形外規格内（50g以内）', 0.1, null);
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
   for (const [rc, src] of [['360', 'al'], ['0726-001802-bk', 'am'], ['0726-001802', 'w']]) {
     db.prepare('INSERT INTO mirror_rakuten_sku_map VALUES (?,?,?,?)').run(rc, '0726-001802-bk', src, 'now');
   }
@@ -247,6 +248,44 @@ console.log('\n── 発送方法: モール側の設定を抜き出す (売価
     fetchYahooItemDetail: async (c) => ({ ok: true, ItemCode: c, Name: 'Y', Price: 100, SubCodes: [] }),
   });
   eq(none.get('ship-z').shipping, null, '発送情報が無ければ null (空の項目を作らない)');
+}
+
+console.log('\n── モール別の配送関係費 (既存の送料マスタを参照) ──');
+{
+  db.exec(`CREATE TABLE mirror_shipping_rates (
+    shipping_code TEXT PRIMARY KEY, 大分類区分 TEXT, 運送会社 TEXT, 小分類区分名称 TEXT NOT NULL,
+    梱包サイズ TEXT, 最大重量 TEXT, 追跡有無 TEXT, 送料 REAL, 出荷作業料 REAL,
+    想定梱包資材費 REAL, 想定人件費 REAL, 配送関係費合計 REAL, 備考 TEXT,
+    source_run_id TEXT, source_row_hash TEXT, synced_at TEXT)`);
+  const insRate = db.prepare('INSERT INTO mirror_shipping_rates (shipping_code, 運送会社, 小分類区分名称, 最大重量, 送料, 配送関係費合計) VALUES (?,?,?,?,?,?)');
+  insRate.run('103', '日本郵便', '定形外規格内（50g以内）', '50', 140, 182);
+  insRate.run('501', 'ヤマト運輸', 'ネコポス', '1000', 198, 237);
+  insRate.run('1201', '日本郵便', 'ゆうパケットパフ', '1000', 374, 424);
+
+  const rates = loadShippingRates(db);
+  ok(rates.available, '送料マスタを読める');
+
+  // ネコポス = 名前が完全一致 → マスタの配送関係費合計
+  eq(resolveMallShippingCost(rates, { mallMethodName: 'ネコポス', neShippingCode: '103', neShippingCost: 182 }),
+    { cost: 237, source: 'mall', label: 'ネコポス', exact: true },
+    '★Yahoo=ネコポスなら 237円 (商品マスタの182円ではなく)');
+
+  // 楽天「定形外」はまとめた呼び方 → 商品マスタの段 (定形外規格内50g=182円) を使う
+  eq(resolveMallShippingCost(rates, { mallMethodName: '定形外', neShippingCode: '103', neShippingCost: 182 }),
+    { cost: 182, source: 'product', label: '定形外規格内（50g以内）', exact: false },
+    '楽天=定形外 は商品マスタの段を使う (重さの段が決まらないため)');
+
+  // 系統も違う → 不明。商品マスタの値に戻すが「不明」と言う
+  const unknown = resolveMallShippingCost(rates, { mallMethodName: '佐川急便', neShippingCode: '103', neShippingCost: 182 });
+  eq([unknown.cost, unknown.source], [182, 'unknown'], '★決められない時は不明と言う (近い名前に寄せない)');
+
+  eq(resolveMallShippingCost(rates, { mallMethodName: null, neShippingCode: '1201', neShippingCost: 424 }).cost,
+    424, 'モール側が分からない行は商品マスタの値');
+
+  // 送料マスタがまだ無い環境でも落ちない
+  const empty = { rows: [], byCode: new Map(), byName: new Map(), available: false };
+  eq(resolveMallShippingCost(empty, { mallMethodName: 'ネコポス', neShippingCode: '103', neShippingCost: 182 }).cost,
+    182, 'マスタが無ければ商品マスタの値 (fail-soft)');
 }
 
 console.log('\n── 配送方法の番号 → 名前 ──');

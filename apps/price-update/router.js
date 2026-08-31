@@ -19,7 +19,8 @@ import { getDB, insertRun, appendEvent, getRun, listRuns, newId } from './db.js'
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
-import { rakutenShippingLabel, yahooPostageLabel } from './shipping-labels.js';
+import { rakutenShippingLabel, yahooPostageLabel, rakutenShippingName, yahooPostageName } from './shipping-labels.js';
+import { loadShippingRates, resolveMallShippingCost } from './shipping-cost.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -103,6 +104,7 @@ function rowKeyOf(i) { return `r${i}`; }
  */
 async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   const dim = loadDimMall(db);
+  const rates = loadShippingRates(db);   // 送料マスタ (配送方法ごとの配送関係費合計)
   const { targets, unknownCodes } = buildTargets(db, codes, { costOverrides });
 
   // モールごとに問い合わせ対象をまとめる (1商品1回。行ごとに叩かない)
@@ -161,7 +163,8 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         if (p?.found) {
           price = p.price; priceSource = '楽天RMS (ライブ)'; priceIsLive = true;
           confidence = 'confirmed'; skuCode = p.skuCode;
-          mallShipping = p.shipping ? { ...p.shipping, methodLabel: rakutenShippingLabel(p.shipping.methodGroup) } : null;
+          mallShipping = p.shipping ? { ...p.shipping, methodLabel: rakutenShippingLabel(p.shipping.methodGroup),
+            methodName: rakutenShippingName(p.shipping.methodGroup) } : null;
           // 表示は実際の商品管理番号に差し替える (別名のままだと楽天の画面で探せない)
           if (p.manageNumber) { listingCode = p.manageNumber; url = listingUrl('rakuten', p.manageNumber); }
         } else {
@@ -173,7 +176,8 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         if (p?.found) {
           price = p.price; priceSource = 'Yahoo itemInfo (ライブ)'; priceIsLive = true;
           confidence = 'confirmed';
-          mallShipping = p.shipping ? { ...p.shipping, postageLabel: yahooPostageLabel(p.shipping.postageSet) } : null;
+          mallShipping = p.shipping ? { ...p.shipping, postageLabel: yahooPostageLabel(p.shipping.postageSet),
+            methodName: yahooPostageName(p.shipping.postageSet) } : null;
           // カラバリは「親の商品コード + 個別商品コード」で登録されている。
           // 当たった実際の商品コードに差し替える (Yahoo の画面で探せるように)
           if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('yahoo', p.itemCode); }
@@ -191,6 +195,14 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       } else {
         note = '手動更新 (管理画面で直す)';
       }
+
+      // このモールの配送方法に対応する配送関係費 (粗利の計算に使う)。
+      // 決められない時は商品マスタの値に戻し、その旨を画面に出す (黙って別の送料を使わない)
+      const shipCost = resolveMallShippingCost(rates, {
+        mallMethodName: mallShipping?.methodName || null,
+        neShippingCode: t.shippingCode,
+        neShippingCost: t.shipping,
+      });
 
       rows.push({
         key: rowKeyOf(rows.length),

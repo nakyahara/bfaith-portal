@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
- * sync-sku-maps.js — SKUマップ 2種の mirror sync (価格一括改定ツール PR1)
+ * sync-sku-maps.js — 小さなマスタの mirror sync (価格一括改定ツール)
+ *   ・SKUマップ 2種 (f_yahoo_sku_map / f_aupay_sku_map)
+ *   ・送料マスタ (shipping_rates) — モール別の粗利計算に使う
  *
  * f_yahoo_sku_map / f_aupay_sku_map (= モール出品コード → NEコード の手動 map) を
  * Render mirror へ全置換で送る。価格一括改定ツール (apps/price-update) の出品引き当てが参照する。
@@ -77,6 +79,18 @@ const ENTITIES = [
       + ' FROM f_aupay_sku_map ORDER BY store_id, aupay_key',
     sampleLog: (r) => `aupay_key=${r.aupay_key} ne=${r.ne_code} src=${r.resolution_source}`,
   },
+  {
+    // 送料マスタ (25行程度)。価格一括改定がモール別の粗利を出すのに使う。
+    // 手動 map とは違い「未登録なら skip」ではなく、消えていたら事故なので 0 件は失敗にする
+    name: 'shipping_rates',
+    contractVersion: 1,
+    keyCol: 'shipping_code',
+    isMaster: true,               // NEコード検証・store 検証の対象外 (商品ではなく配送方法の表)
+    selectSql: 'SELECT shipping_code, 大分類区分, 運送会社, 小分類区分名称, 梱包サイズ, 最大重量,'
+      + ' 追跡有無, 送料, 出荷作業料, 想定梱包資材費, 想定人件費, 配送関係費合計, 備考'
+      + ' FROM shipping_rates ORDER BY shipping_code',
+    sampleLog: (r) => `${r.shipping_code} ${r.小分類区分名称} 配送関係費合計=${r.配送関係費合計}`,
+  },
 ];
 
 /**
@@ -91,6 +105,17 @@ const ENTITIES = [
 function validateRows(db, entity, rows) {
   const problems = [];
   let normalized = 0;
+  if (entity.isMaster) {
+    // 商品コードを持たない表 (送料マスタ等)。キーの重複と空だけ見る
+    const seenKeys = new Set();
+    for (const r of rows) {
+      const k = r[entity.keyCol];
+      if (typeof k !== 'string' || k.trim() === '') { problems.push(`${entity.keyCol} が空の行があります`); continue; }
+      if (seenKeys.has(k)) problems.push(`${entity.keyCol}=${k}: 重複`);
+      seenKeys.add(k);
+    }
+    return { problems, normalized: 0 };
+  }
   // lower(trim) → 正本表記
   const known = new Map(
     db.prepare('SELECT 商品コード AS code FROM m_products').all()
@@ -192,7 +217,7 @@ async function syncEntity(entity) {
     // 「まだ一度も同期していない & 0件」= 手動 map が未登録なだけ (2026-08-28 時点の実際の状態)。
     // これを毎日 fail にすると daily-sync が恒常的に赤くなり、本物の失敗が埋もれる。
     // 一方「前回は同期できていたのに 0 件」は map 消失の事故なので必ず fail にする。
-    if (!lastApplied) {
+    if (!lastApplied && !entity.isMaster) {
       console.warn('  ⏭ 0件 (手動 map が未登録)。まだ一度も同期していないので「未登録」として skip します');
       console.warn('     ※登録したら次の daily-sync から自動で mirror に載ります');
       return { entity: entity.name, ok: true, skipped: true, rows: 0 };

@@ -73,6 +73,14 @@ insYahoo.run('abc-05', 'ne0005', null);
 senderDb.prepare(
   "INSERT INTO f_aupay_sku_map (store_id, aupay_key, ne_code, resolution_source, notes) VALUES ('b-faith01', ?, ?, 'manual', NULL)"
 ).run('item-a', 'ne0001');
+// 送料マスタ (initDB が作る shipping_rates に数行入れる)
+const insRate = senderDb.prepare(
+  'INSERT INTO shipping_rates (shipping_code, 大分類区分, 運送会社, 小分類区分名称, 梱包サイズ, 最大重量,'
+  + ' 追跡有無, 送料, 出荷作業料, 想定梱包資材費, 想定人件費, 配送関係費合計, 備考, synced_at)'
+  + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, '2026-08-31T00:00:00Z')"
+);
+insRate.run('103', '郵便', '日本郵便', '定形外規格内（50g以内）', '', '50', '無', 140, 20, 12, 10, 182, '');
+insRate.run('501', '宅配', 'ヤマト運輸', 'ネコポス', '', '1000', '有', 198, 20, 9, 10, 237, '');
 senderDb.close();
 
 // ── 3. 送信 ──
@@ -118,6 +126,14 @@ console.log('\n── 本送信 ──');
   eq(mirrorDb.prepare("SELECT generation FROM mirror_snapshot_generations WHERE entity='yahoo_sku_map'").get().generation,
     1, 'mirror 側も世代 1');
   sdb.close();
+}
+
+console.log('\n── 送料マスタも一緒に同期される ──');
+{
+  const rates = mirrorDb.prepare('SELECT shipping_code, 小分類区分名称 AS name, 配送関係費合計 AS total FROM mirror_shipping_rates ORDER BY shipping_code').all();
+  eq(rates.map((r) => [r.shipping_code, r.name, r.total]),
+    [['103', '定形外規格内（50g以内）', 182], ['501', 'ネコポス', 237]],
+    '★配送関係費合計まで mirror に載る (モール別粗利の根拠)');
 }
 
 console.log('\n── miniPC 側で 1 行削除 → 再送で mirror からも消える ──');

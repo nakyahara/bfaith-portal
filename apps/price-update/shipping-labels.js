@@ -57,3 +57,11 @@ export function labelOf(map, id) {
 
 export function rakutenShippingLabel(id) { return labelOf(RAKUTEN_SHIPPING_METHODS, id); }
 export function yahooPostageLabel(id) { return labelOf(YAHOO_POSTAGE_SETS, id); }
+
+/** 名前だけ (送料マスタとの突合に使う)。表に無ければ null */
+export function nameOf(map, id) {
+  if (id == null || id === '') return null;
+  return map[String(id)] ?? map[Number(id)] ?? null;
+}
+export function rakutenShippingName(id) { return nameOf(RAKUTEN_SHIPPING_METHODS, id); }
+export function yahooPostageName(id) { return nameOf(YAHOO_POSTAGE_SETS, id); }
