@@ -972,6 +972,10 @@
       <div style="display:flex; gap:8px;">
         <input type="url" id="import-folder-url" style="flex:1;" value="<%= draft.drive_folder_url || '' %>"
                placeholder="https://drive.google.com/drive/folders/... (画像フォルダのリンク)">
+        <%# 入っているリンクをそのまま開けるように (2026-08-31 中原さん要望)。
+            空のときは押しても行き先が無いのでボタンごと隠す %>
+        <a class="btn" id="import-folder-open" target="_blank" rel="noopener"
+           style="white-space:nowrap; display:none;">📂 開く</a>
         <button class="btn btn-primary" id="import-folder-btn" style="white-space:nowrap">フォルダから自動セット</button>
       </div>
       <div class="muted" style="font-size:11px;">
@@ -1564,16 +1568,18 @@
       <% } else { %>
         <!-- AI 初期候補 (2026-08-02): 未選択ならAIが1位を自動セット、人は候補ボタン/ツリーで修正 -->
         <div id="rk-cats-suggest" style="font-size:12px; margin-bottom:4px;"></div>
-        <!-- RMS「表示先カテゴリ 1〜5」と同じ5枠 (2026-08-02 中原さん要望)。チェックした順に枠へ入る -->
-        <div id="rk-cat-slots" style="display:grid; gap:4px; margin-bottom:6px;"></div>
-        <!-- ツリーはアコーディオンで開閉 (常時表示だと縦に長い) -->
-        <details id="rk-cats-acc" style="border:1px solid #e2e8f0; border-radius:8px; background:#fff;">
-          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリーを開く)</summary>
+        <%# ツリーは 5 枠の**上**に置き、既定で開いておく (2026-08-31 中原さん: 必須項目なので
+            畳んでいると記載を見逃す)。開いた状態でも枠 1〜5 がすぐ下にあるので、
+            選んだ結果がその場で見える %>
+        <details id="rk-cats-acc" open style="border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:6px;">
+          <summary style="cursor:pointer; padding:7px 10px; font-size:13px; color:#475569;">🗂 カテゴリ選択 (ツリー)</summary>
           <div style="padding:0 10px 8px;">
             <input type="text" id="rk-cat-filter" placeholder="絞り込み (カテゴリ名の一部)" style="margin:6px 0;">
             <div id="rk-cats" style="max-height:280px; overflow:auto;"></div>
           </div>
         </details>
+        <!-- RMS「表示先カテゴリ 1〜5」と同じ5枠 (2026-08-02 中原さん要望)。チェックした順に枠へ入る -->
+        <div id="rk-cat-slots" style="display:grid; gap:4px; margin-bottom:6px;"></div>
         <script type="application/json" id="rk-cats-data"><%- JSON.stringify(shopCategories.map((c) => ({ id: c.id, path: c.path, selected: !!c.selected, slot: c.slot ?? null, inactive: !c.is_active }))).replace(/</g, '\\u003c') %></script>
       <% } %>
     </div>
@@ -2483,6 +2489,28 @@
       info.textContent = '通信エラー: ' + e.message;
     } finally { btn.disabled = false; }
   });
+
+  // 画像フォルダのリンクを開くボタン (2026-08-31 中原さん要望)。
+  // 入力が空 / http(s) 以外のときは隠す (javascript: を踏ませない)
+  (function initFolderOpen() {
+    const input = document.getElementById('import-folder-url');
+    const link = document.getElementById('import-folder-open');
+    if (!input || !link) return;
+    const sync = () => {
+      const v = String(input.value || '').trim();
+      let ok = false;
+      try {
+        const u = new URL(v);
+        ok = u.protocol === 'http:' || u.protocol === 'https:';
+      } catch (e) { ok = false; }
+      link.style.display = ok ? '' : 'none';
+      if (ok) link.href = v;
+      else link.removeAttribute('href');
+    };
+    input.addEventListener('input', sync);
+    input.addEventListener('change', sync);
+    sync();
+  })();
 
   document.getElementById('rk-attr-add').addEventListener('click', () => {
     const tr = document.createElement('tr');

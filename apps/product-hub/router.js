@@ -128,16 +128,6 @@ function loadDraftOr404(req, res) {
   return draft;
 }
 
-// 出品カードで選択済みの楽天配送方法グループ名 (未選択なら null)
-function rakutenShippingLabelOf(db, draftId) {
-  const rk = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(draftId);
-  const g = rk?.shipping_method_group != null ? String(rk.shipping_method_group).trim() : '';
-  // 複合選択肢 (楽天=定形外/Yahoo!別配送) は楽天側ラベルに解決する
-  const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
-  if (ov) return SHIPPING_METHOD_GROUPS[ov.rakutenGroup];
-  return g && SHIPPING_METHOD_GROUPS[g] ? SHIPPING_METHOD_GROUPS[g] : null;
-}
-
 // ─── 画面 ───────────────────────────────────────────────
 
 // 工程ボードが主画面 (2026-08-24 中原さん要望)。ドラフト一覧は /list へ。
@@ -269,11 +259,9 @@ router.get('/detail/:id', (req, res) => {
   const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id) || null;
   // 発送方法: NE 配送方法 → 楽天グループ (マップ表 + 名前一致の推測)
   const neShipping = mapNeShippingToRakuten(db, neCost?.shippingMethod);
-  const pageInfoHtml = buildPageInfoHtml({
-    productName: draft.name, info: pageInfo,
-    shippingLabel: pageInfo?.shipping_label_override
-      || (rakutenShippingLabelOf(db, draft.id) ?? neShipping.label),
-  });
+  // 「発送方法」の行は表に出さない (2026-08-31 中原さん) ので shippingLabel は渡さない。
+  // 配送方法は商品画像末尾の店舗共通バナーで見せている
+  const pageInfoHtml = buildPageInfoHtml({ productName: draft.name, info: pageInfo });
 
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // 出品時に商品画像の末尾へ自動追加される店舗共通バナー (画像タブのプレビュー用)。
@@ -1640,7 +1628,6 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
     info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   }
-  const neShip = mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
   res.json({
     ok: true,
     ...(isStale ? { stale: true } : {}),
@@ -1654,7 +1641,6 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
       // 上限は基本情報の商品名と同じ 300 (255 で切ると長い商品名で保存値と表示がズレる — Codex R2 低)
       productName: b.product_name !== undefined ? (cleanText(b.product_name, 300) || '') : draft.name,
       info,
-      shippingLabel: rakutenShippingLabelOf(db, draft.id) ?? neShip.label,
     }),
   });
 });
