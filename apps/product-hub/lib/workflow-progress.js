@@ -543,7 +543,9 @@ export function progressOf(draftId, { db = null } = {}) {
     mainDone: main.length > 0 && !current,
     // 画像トラック全体の決着 = TOP が済み、詳細も済みか対象外 (出品ゲートと同じ見方)。
     // 詳細工程 0 件は「済み」に数えない (対象外にしていないなら設定壊れ — Codex R2 high)
-    imageDone: imageTop.done && (detailExcluded || imageDetail.done),
+    // 2026-08-31: TOP の工程は廃止したので、画像が終わったかは商品詳細 (LP) だけで決まる
+    // (TOP画像そのものの有無は出品ゲート imageTrackBlockReason が画像の登録で見る)
+    imageDone: detailExcluded || imageDetail.done,
     doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
     totalCount: main.length,
   };
@@ -576,30 +578,24 @@ export function imageTrackBlockReason(db, draftId) {
   if (hold.onHold) {
     return `画像制作が保留中です${hold.note ? ` (${hold.note})` : ''}。詳細画面の「画像制作」カードで保留を解除してください`;
   }
-  // fail-closed: TOP 側の工程が 1 つも無い状態 (工程の無効化・移行漏れ) で出品を通さない (Codex R1 high)。
-  // progressOf → ensureProgress が行を自己修復するので、ここに来るのは設定が壊れているときだけ
-  if (p.imageTop.rows.length === 0) {
-    return '画像トラック (TOP画像) の工程が見つかりません。担当者・工程の設定を確認してください';
+  // TOP画像は**工程ではなく画像が登録されているか**で見る (2026-08-31 中原さん決定 A)。
+  // 工程は商品詳細 (LP) に一本化し、TOP の 4 工程は廃止した (RETIRED_TOP_STEP_CODES)。
+  // サムネイル無しの楽天出品はありえないので、ここは引き続き fail-closed で止める
+  const hasImage = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(Number(draftId));
+  if (!hasImage) {
+    return 'TOP画像 (サムネイル) が登録されていません。画像タブの「画像フォルダから自動セット」で取り込んでください';
   }
-  // TOP 全部が「対象外」はゲートを開けない (サムネイル無しの楽天出品はありえない — Codex設計相談 High)。
-  // setStepState 側でも TOP の skip は拒否しているが、ゲートは独立に防御する
-  if (p.imageTop.rows.every((r) => r.state === 'skip')) {
-    return 'TOP画像の工程がすべて「対象外」になっています。TOP画像 (サムネイル) は楽天出品に必須です';
-  }
-  // 詳細側も同じ fail-closed (Codex R2 high): 対象外にしていないのに工程が 0 件なら
+  // 詳細側は fail-closed (Codex R2 high): 対象外にしていないのに工程が 0 件なら
   // 「揃っている」ではなく「設定が壊れている」— ここで通すと詳細画像の確認が丸ごと飛ぶ
   if (!p.detailExcluded && p.imageDetail.rows.length === 0) {
     return '画像トラック (詳細画像) の工程が見つかりません。詳細画像を作らない商品なら「詳細画像は対象外」にするか、担当者・工程の設定を確認してください';
   }
   const blocked = [];
-  if (!p.imageTop.done) {
-    blocked.push(`${IMAGE_KIND_LABELS.top}: ${kindBlockDetail(p.imageTop)}`);
-  }
   if (!p.detailExcluded && !p.imageDetail.gateDone) {
     blocked.push(`${IMAGE_KIND_LABELS.detail}: ${kindBlockDetail({ ...p.imageDetail, current: p.imageDetail.gateCurrent })}`);
   }
   if (blocked.length === 0) return null;
-  return `画像トラックが終わっていません (${blocked.join(' ／ ')})。画像承認まで済ませるか、`
+  return `画像の工程が終わっていません (${blocked.join(' ／ ')})。最後まで進めるか、`
     + '詳細画像を作らない商品なら詳細画面で「詳細画像は対象外」にしてください';
 }
 
@@ -854,22 +850,9 @@ export function setStepState(
     if (stateChanged && row.track === 'main') {
       draftStatus = recomputeDraftStatus(db, id, { actor }).status;
     }
-    // 自社商品の TOP は ⑤デザイン修正で作る (2026-08-26 中原さん): ⑤ done → TOP の 依頼/制作/登録、
-    // ⑥-2 中原確認 done → TOP の承認 を自動で done にして二重操作をなくす。差し戻しは追随しない (人が判断)
-    if (stateChanged && params.state === 'done' && (code === 'imgd_design' || code === 'imgd_review_2')) {
-      const own = db.prepare('SELECT own_brand FROM product_drafts WHERE id = ?').get(id)?.own_brand === 1;
-      if (own) {
-        const follow = code === 'imgd_design'
-          ? ['img_request_top', 'img_production_top', 'img_register_top'] : ['img_approve_top'];
-        for (const fc of follow) {
-          const fr = db.prepare('SELECT state FROM draft_step_progress WHERE draft_id = ? AND step_code = ?').get(id, fc);
-          if (fr && fr.state !== 'done' && fr.state !== 'skip') {
-            setStepState(id, fc, { state: 'done' }, actor, { isAdmin: true });
-            logEvent(db, id, 'step_changed', `TOP画像: 「${row.label}」の完了に追随して完了`, actor);
-          }
-        }
-      }
-    }
+    // 2026-08-31: TOP画像の 4 工程を廃止したので、⑤⑥-2 からの自動追随も無くした。
+    // (LP と TOP は同時進行で作るため工程を分けない — 中原さん。TOP の状態は
+    //  「画像が登録されているか」で見る = imageTrackBlockReason)
     const freshRow = db.prepare(
       'SELECT version, updated_at FROM draft_step_progress WHERE draft_id = ? AND step_code = ?'
     ).get(id, code);
@@ -1464,7 +1447,9 @@ export function progressSummaryFor(db, draftIds) {
       imageTop,
       imageDetail,
       detailExcluded,
-      imageDone: imageTop.done && (detailExcluded || imageDetail.done),
+      // 2026-08-31: TOP の工程は廃止したので、画像が終わったかは商品詳細 (LP) だけで決まる
+    // (TOP画像そのものの有無は出品ゲート imageTrackBlockReason が画像の登録で見る)
+    imageDone: detailExcluded || imageDetail.done,
       stalledDays: current ? stalledDaysOf(main, main.indexOf(current), createdAt) : null,
       doneCount: main.filter((r) => r.state === 'done' || r.state === 'skip').length,
       totalCount: main.length,
