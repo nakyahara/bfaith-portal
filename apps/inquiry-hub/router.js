@@ -9,7 +9,7 @@
  *   GET  /inquiries/:id           問い合わせ詳細 (スレッド・顧客情報・メモ・履歴)
  *   POST /api/inquiries/:id/status     社内ステータス変更
  *   POST /api/inquiries/:id/assign     担当者設定
- *   POST /api/inquiries/:id/customer-info  顧客情報の手入力 (注文番号・商品。自動保存。確定情報はロック)
+ *   POST /api/inquiries/:id/customer-info  顧客情報の手入力 (注文番号+モール・商品。自動保存。確定情報はロック)
  *   POST /api/inquiries/:id/read       社内既読/未読切替
  *   POST /api/inquiries/:id/attention  要確認フラグ切替
  *   POST /api/inquiries/:id/ai-flag    AIフラグ設定 (0:不要 1:AI返信 2:社長確認 3:責任者確認)
@@ -36,7 +36,7 @@ import { listLabels, createLabel, updateLabel, deleteLabel, setInquiryLabel,
 import { listQuickLinks, createQuickLink, updateQuickLink, deleteQuickLink,
   LINK_NAME_MAX, LINK_URL_MAX, MAX_ACTIVE_LINKS } from './links.js';
 import { listBulkBatches, revertBulkBatch, BATCH_SOURCE_LABELS } from './batches.js';
-import { CUSTOMER_INFO_FIELDS, CUSTOMER_INFO_KEYS, customerInfoState, setCustomerInfo } from './customer-info.js';
+import { CUSTOMER_INFO_FIELDS, CUSTOMER_INFO_KEYS, ORDER_MALLS, ORDER_MALL_KEYS, customerInfoState, setCustomerInfo, orderLinksOf } from './customer-info.js';
 import { getAttachmentContext, fetchAttachmentBody, contentDispositionValue } from './attachments.js';
 import { saveReplyAttachment, listPendingAttachments, deletePendingAttachment,
   MAX_FILE_BYTES, MAX_FILES_PER_REPLY, ALLOWED_LABEL } from './reply-attachments.js';
@@ -131,6 +131,7 @@ function fmtLogValue(key, v) {
     case 'status': return (STATUSES[v] || {}).label || String(v);
     case 'order_number': case 'product_code': case 'product_name':
       return `${CUSTOMER_INFO_FIELDS[key].label}=${v == null || v === '' ? '(空)' : String(v)}`;
+    case 'order_mall': return `モール=${v ? ((ORDER_MALLS[v] || {}).label || String(v)) : '(未選択)'}`;
     case 'is_unread': return v ? '未読' : '既読';
     case 'needs_attention': return v ? '⚠️要確認ON' : '要確認OFF';
     case 'ai_needed': return Number(v) === 0 ? 'AI不要' : ((AI_FLAGS[v] || {}).label || String(v));
@@ -151,31 +152,8 @@ function fmtLogJson(json) {
   } catch { return json; } // 表示用なので壊れたJSONはそのまま出す
 }
 
-// ─── 注文リンク (2026-08-16 中原さん要望): NE個別受注明細 + モール側の注文詳細を直接開く ───
-// NE: kensaku_denpyo_no で個別受注明細を検索表示できる (中原さん実証URL)。
-// Yahoo!はNE側の受注番号に店舗プレフィックスが無い (例: b-faith01-10287187 → 10287187) ため
-// account_identifier + '-' を剥がす。楽天は注文番号そのまま。
-// メール等に手入力した注文番号 (2026-08-31) もそのまま NE に渡す (NEで調べて写した番号を想定)。
-// 詳細画面と /customer-info API (自動保存後のリンク差し替え) の両方で使う
-export function orderLinksOf(inq) {
-  const raw = String(inq.order_number || '').trim();
-  const account = String(inq.account_identifier || '').trim();
-  const prefix = `${account}-`;
-  const neOrderNo = !raw ? null
-    : inq.channel_type === 'yahoo' && prefix.length > 1 && raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
-  const neOrderUrl = neOrderNo
-    ? `https://main.next-engine.com/Userjyuchu/jyuchuInp?kensaku_denpyo_no=${encodeURIComponent(neOrderNo)}&jyuchu_meisai_order=jyuchu_meisai_gyo`
-    : null;
-  // モール側の注文詳細。楽天=RMS個別受注画面、Yahoo!=ストアクリエイターProの注文詳細
-  // (Yahoo!のURL形式は中原さん実証 2026-08-16: pro.store.yahoo.co.jp/pro.{アカウント}/order/manage/detail/{注文番号})
-  const mallOrderUrl = !raw ? null
-    : inq.channel_type === 'rakuten'
-      ? `https://order-rp.rms.rakuten.co.jp/order-rb/individual-order-detail/init?orderNumber=${encodeURIComponent(raw)}`
-      : inq.channel_type === 'yahoo' && account
-        ? `https://pro.store.yahoo.co.jp/pro.${encodeURIComponent(account)}/order/manage/detail/${encodeURIComponent(raw)}`
-        : null;
-  return { neOrderNo, neOrderUrl, mallOrderUrl };
-}
+// 注文リンク (NE個別受注明細 + モール側の注文詳細) の計算は customer-info.js の orderLinksOf() に集約
+// (2026-08-16 中原さん要望 → 2026-08-31 手入力のモール選択に対応してモジュール側へ移動)
 
 // ─── 一覧画面 ───
 router.get('/', (req, res) => {
@@ -778,10 +756,16 @@ router.get('/inquiries/:id', (req, res) => {
       </div>` : '';
 
   // ─── 注文リンク (2026-08-16 中原さん要望): NE個別受注明細 + モール側の注文詳細を直接開く ───
-  // 計算は orderLinksOf() に共通化 (顧客情報の自動保存APIも同じリンクを返す。2026-08-31)
-  const { neOrderNo, neOrderUrl, mallOrderUrl } = orderLinksOf(inq);
+  // 計算は customer-info.js の orderLinksOf() に共通化 (顧客情報の自動保存APIも同じリンクを返す。2026-08-31)
+  const ol = orderLinksOf(inq);
+  const { neOrderNo, neOrderUrl, mallOrderUrl } = ol;
   const neLinkHtml = neOrderUrl ? `<a href="${he(neOrderUrl)}" target="_blank" rel="noopener" title="ネクストエンジンの個別受注明細を開く">🧾 NEで受注を開く ↗</a>` : '';
-  const mallLinkHtml = mallOrderUrl ? `<a href="${he(mallOrderUrl)}" target="_blank" rel="noopener" title="モールの注文詳細画面を開く">🛍️ モールで注文を開く ↗</a>` : '';
+  // モールの注文詳細への直リンク。直リンク形式が未確認のモールは管理画面トップを「番号をコピーして開く」
+  const mallLinkHtml = mallOrderUrl
+    ? `<a href="${he(mallOrderUrl)}" target="_blank" rel="noopener" title="${he(ol.mallLabel || 'モール')}の注文詳細画面を開く">🛍️ ${he(ol.mallShort || 'モール')}で注文を開く ↗</a>`
+    : ol.mallAdminUrl
+      ? `<a href="${he(ol.mallAdminUrl)}" class="ci-copy-open" data-copy="${he(ol.orderNumber || '')}" target="_blank" rel="noopener" title="注文番号をコピーして${he(ol.mallLabel || 'モール')}の管理画面を開きます (注文検索に貼り付けてください)">🛍️ ${he(ol.mallShort || 'モール')}の管理画面を開く (番号をコピー) ↗</a>`
+      : '';
   // ─── 顧客情報の手入力 (2026-08-31 中原さん要望): 注文番号等が付いて来ないメール問い合わせに、
   // NE等で調べた注文番号・商品を残す (次に開いた人が調べ直さなくて済む)。保存ボタンは無く、
   // 入力欄から出た時点で自動保存 (/customer-info)。モール同期が入れた確定情報 (楽天/Yahoo!の
@@ -789,6 +773,9 @@ router.get('/inquiries/:id', (req, res) => {
   const ci = customerInfoState(inq);
   const ciLock = '<span class="ci-lock" title="モールから取得した確定情報のため変更できません">🔒</span>';
   const ciInput = (key, placeholder) => `<input type="text" class="ci-input" id="ci_${key}" data-key="${key}" value="${he(ci[key].value || '')}" placeholder="${he(placeholder)}" maxlength="${CUSTOMER_INFO_FIELDS[key].max}" autocomplete="off" title="調べた内容を入力すると自動で保存されます (入力欄から出た時点で保存)">`;
+  // モール選択 (2026-08-31 追加要望): 手入力の注文番号に「どのモールか」を付け、そのモールの注文詳細へ飛べるようにする。
+  // 楽天/Amazon/Yahoo! は注文番号の形式から自動で入る (違えば選び直せる)。表示は有効なモール (ol.mall)
+  const ciMallSelect = `<select class="ci-select" id="ci_order_mall" data-key="order_mall" title="この注文番号のモール (注文番号の形式から自動で入ります。違えば選び直してください)"><option value="">モール…</option>${ORDER_MALL_KEYS.map(k => `<option value="${k}"${(ol.mall || '') === k ? ' selected' : ''}>${he(ORDER_MALLS[k].label)}</option>`).join('')}</select>`;
   const ciEditable = CUSTOMER_INFO_KEYS.some(k => !ci[k].locked);
   const ciLocked = CUSTOMER_INFO_KEYS.some(k => ci[k].locked);
   const ciHint = ciEditable
@@ -839,7 +826,7 @@ router.get('/inquiries/:id', (req, res) => {
           <dt>顧客</dt><dd>${he(inq.customer_name || '—')}${inq.customer_identifier ? `<div class="sub">${he(inq.customer_identifier)}</div>` : ''}${neSearchMail ? `<div class="sub"><a href="#" id="neMailSearch" data-mail="${he(neSearchMail)}" title="メールアドレスをコピーして、ネクストエンジンの受注検索画面を新しいタブで開きます (検索欄に貼り付けて検索してください)">🔎 NEで受注検索 (アドレスをコピー) ↗</a></div>` : ''}</dd>
           <dt>注文番号</dt><dd>${ci.order_number.locked
             ? `${he(ci.order_number.value)}${ciLock}${mallLinkHtml ? `<div class="sub">${mallLinkHtml}</div>` : ''}`
-            : `${ciInput('order_number', '注文番号を調べて入力')}<div class="sub ci-links" id="ciOrderLinks">${neLinkHtml}${mallLinkHtml}</div>`}</dd>
+            : `<div class="row ci-order-row">${ciMallSelect}${ciInput('order_number', '注文番号を調べて入力')}</div><div class="sub ci-links" id="ciOrderLinks">${mallLinkHtml}${neLinkHtml}</div>`}</dd>
           ${ci.order_number.locked && neOrderNo ? `<dt>NE受注</dt><dd><a href="${he(neOrderUrl)}" target="_blank" rel="noopener" title="ネクストエンジンの個別受注明細を開く">${he(neOrderNo)} ↗</a></dd>` : ''}
           <dt>商品</dt><dd>${ci.product_name.locked ? `${he(ci.product_name.value)}${ciLock}` : ciInput('product_name', '商品名を調べて入力')}${ci.product_code.locked ? `<div class="sub">${he(ci.product_code.value)}${ciLock}</div>` : ciInput('product_code', '商品コード')}</dd>
           <dt>モール側状態</dt><dd class="sub" title="外部モール側のステータス (参考表示。同期が上書き)">${he(inq.external_status || '—')}${inq.external_is_read != null ? ` / ${inq.external_is_read ? '既読' : '未読'}` : ''}</dd>
@@ -894,35 +881,63 @@ router.get('/inquiries/:id', (req, res) => {
   // 顧客情報の自動保存 (2026-08-31 中原さん要望): 注文番号・商品コード・商品名は保存ボタン無しで、
   // 入力欄から出た時点 (change) に項目単位で保存する。Enter でも確定。失敗したら元の値に戻す。
   // 「次の問い合わせ →」を押した直後 (画面遷移中) でも保存が届くよう keepalive で送る
-  var CI = ${JSON.stringify(Object.fromEntries(CUSTOMER_INFO_KEYS.map(k => [k, ci[k].value || '']))).replace(/</g, '\\u003c')};
-  var CI_LABEL = ${JSON.stringify(Object.fromEntries(CUSTOMER_INFO_KEYS.map(k => [k, CUSTOMER_INFO_FIELDS[k].label]))).replace(/</g, '\\u003c')};
+  var CI = ${JSON.stringify({ ...Object.fromEntries(CUSTOMER_INFO_KEYS.map(k => [k, ci[k].value || ''])), order_mall: ol.mall || '' }).replace(/</g, '\\u003c')};
+  var CI_LABEL = ${JSON.stringify({ ...Object.fromEntries(CUSTOMER_INFO_KEYS.map(k => [k, CUSTOMER_INFO_FIELDS[k].label])), order_mall: 'モール' }).replace(/</g, '\\u003c')};
+  var MALL_SHORT = ${JSON.stringify(Object.fromEntries(ORDER_MALL_KEYS.map(k => [k, ORDER_MALLS[k].short]))).replace(/</g, '\\u003c')};
+  // 注文リンクの描画 (保存後にリロード無しで差し替え)。モールの直リンク → 無ければ管理画面 (番号コピー) → NE
   function renderOrderLinks(links) {
     var box = document.getElementById('ciOrderLinks'); if (!box) return;
     box.textContent = '';
-    var add = function(href, text, title) {
+    if (!links) return;
+    var add = function(href, text, title, copy) {
       if (!href) return;
       var a = document.createElement('a'); a.href = href; a.target = '_blank'; a.rel = 'noopener'; a.title = title; a.textContent = text;
+      if (copy) { a.className = 'ci-copy-open'; a.dataset.copy = copy; }
       box.appendChild(a);
     };
-    add(links && links.ne_order_url, '🧾 NEで受注を開く ↗', 'ネクストエンジンの個別受注明細を開く');
-    add(links && links.mall_order_url, '🛍️ モールで注文を開く ↗', 'モールの注文詳細画面を開く');
+    var mallName = links.mall_label || 'モール', mallShort = links.mall_short || 'モール';
+    add(links.mall_order_url, '🛍️ ' + mallShort + 'で注文を開く ↗', mallName + 'の注文詳細画面を開く');
+    if (!links.mall_order_url) add(links.mall_admin_url, '🛍️ ' + mallShort + 'の管理画面を開く (番号をコピー) ↗',
+      '注文番号をコピーして' + mallName + 'の管理画面を開きます (注文検索に貼り付けてください)', links.order_number || '');
+    add(links.ne_order_url, '🧾 NEで受注を開く ↗', 'ネクストエンジンの個別受注明細を開く');
   }
-  Array.prototype.forEach.call(document.querySelectorAll('.ci-input'), function(inp) {
+  // 管理画面トップしか分からないモール: 番号をコピーしてから開く (逆順だとフォーカスが新タブへ移りコピーが失敗する)
+  document.addEventListener('click', function(ev) {
+    var a = ev.target && ev.target.closest ? ev.target.closest('a.ci-copy-open') : null;
+    if (!a) return;
+    ev.preventDefault();
+    var open = function() { window.open(a.href, '_blank', 'noopener'); };
+    var no = a.dataset.copy || '';
+    if (no && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(no).then(function() {
+        toast('注文番号 ' + no + ' をコピーしました。管理画面の注文検索に貼り付けてください'); open();
+      }, function() { toast('コピーできませんでした。注文番号を手でコピーしてください'); open(); });
+    } else open();
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.ci-input, .ci-select'), function(inp) {
     var key = inp.dataset.key;
-    inp.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); } });
+    if (inp.tagName === 'INPUT') inp.addEventListener('keydown', function(ev) { if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); } });
     inp.addEventListener('change', function() {
       var v = inp.value.trim();
       if (v === CI[key]) { inp.value = v; return; }
       var data = {}; data[key] = v;
       inp.classList.add('ci-saving');
       post('/customer-info', data, { keepalive: true }).then(function(j) {
-        // サーバー側の正規化後の値 (空白畳み込み等) を正とする
-        var saved = (j.info && j.info[key] && j.info[key].value) || '';
+        // サーバー側の正規化後の値 (空白畳み込み等) を正とする。モールは有効なモール (チャネル由来も含む)
+        var saved = key === 'order_mall' ? ((j.links && j.links.mall) || '') : ((j.info && j.info[key] && j.info[key].value) || '');
         CI[key] = saved; inp.value = saved;
         inp.classList.remove('ci-saving'); inp.classList.add('ci-saved');
         setTimeout(function() { inp.classList.remove('ci-saved'); }, 1500);
-        toast(CI_LABEL[key] + (v ? 'を保存しました' : 'を空にしました'));
-        if (key === 'order_number') renderOrderLinks(j.links);
+        var msg = CI_LABEL[key] + (v ? 'を保存しました' : 'を空にしました');
+        // 注文番号の形式からモールが自動で決まったら選択欄にも反映して知らせる
+        var sel = document.getElementById('ci_order_mall');
+        if (key === 'order_number' && sel && j.links) {
+          var eff = j.links.mall || '';
+          if (eff !== CI.order_mall) { CI.order_mall = eff; sel.value = eff; }
+          if (j.guessed_mall) msg += ' (モール: ' + (MALL_SHORT[j.guessed_mall] || j.guessed_mall) + ' と判定)';
+        }
+        toast(msg);
+        if (key === 'order_number' || key === 'order_mall') renderOrderLinks(j.links);
       }).catch(function(e) {
         inp.classList.remove('ci-saving'); inp.value = CI[key];
         toast('保存できませんでした: ' + e.message);
@@ -1519,22 +1534,26 @@ function applyChange(inq, req, actionType, before, after, updateFn) {
   })();
 }
 
-// 顧客情報の手入力 (2026-08-31 中原さん要望): 注文番号・商品コード・商品名を画面から保存 (自動保存)。
-// body は { order_number?, product_code?, product_name? } の部分更新。'' = 空にする。
+// 顧客情報の手入力 (2026-08-31 中原さん要望): 注文番号 (+そのモール)・商品コード・商品名を画面から保存 (自動保存)。
+// body は { order_number?, order_mall?, product_code?, product_name? } の部分更新。'' = 空にする。
 // モール同期で確定した項目 (customer-info.js のロック) への変更は 409 で拒否する。
-// 応答の links は保存後の注文リンク (画面がリロード無しで NE/モールのリンクを差し替えるため)
+// 応答の links は保存後の注文リンク (画面がリロード無しで モール/NE のリンクを差し替えるため)、
+// guessed_mall は注文番号の形式から自動判定したモール (楽天/Amazon/Yahoo!)
 router.post('/api/inquiries/:id/customer-info', (req, res) => {
   const inq = loadInquiry(req, res); if (!inq) return;
   const body = req.body || {};
   const patch = {};
-  for (const k of CUSTOMER_INFO_KEYS) if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
-  if (!Object.keys(patch).length) return res.status(400).json({ error: '保存する項目がありません (注文番号・商品コード・商品名)' });
+  for (const k of [...CUSTOMER_INFO_KEYS, 'order_mall']) if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
+  if (!Object.keys(patch).length) return res.status(400).json({ error: '保存する項目がありません (注文番号・モール・商品コード・商品名)' });
   try {
     const r = setCustomerInfo(inq.id, patch, actorOf(req));
-    const now = getDB().prepare('SELECT i.order_number, i.channel_type, s.account_identifier FROM inquiries i JOIN shops s ON s.id = i.shop_id WHERE i.id = ?').get(inq.id);
+    // orderLinksOf はロック判定に manual_fields、モールに order_mall が要るので行ごと読む
+    const now = getDB().prepare('SELECT i.*, s.account_identifier FROM inquiries i JOIN shops s ON s.id = i.shop_id WHERE i.id = ?').get(inq.id);
     const links = orderLinksOf(now || inq);
     res.json({ ok: true, unchanged: !!r.unchanged, changed: r.changed, info: r.state,
-      links: { ne_order_url: links.neOrderUrl, mall_order_url: links.mallOrderUrl } });
+      order_mall: r.order_mall, guessed_mall: r.guessedMall,
+      links: { mall: links.mall, mall_label: links.mallLabel, mall_short: links.mallShort, order_number: links.orderNumber,
+        mall_order_url: links.mallOrderUrl, mall_admin_url: links.mallAdminUrl, ne_order_url: links.neOrderUrl } });
   } catch (e) {
     res.status(e && e.code === 'LOCKED' ? 409 : 400).json({ error: String(e?.message || e).slice(0, 200) });
   }
@@ -4538,8 +4557,12 @@ figure.att-img.att-err .att-fail { display: block; }
 .panel .row { display: flex; gap: 6px; }
 /* 顧客情報の手入力 (2026-08-31): 自動保存の入力欄。保存直後は緑枠で「保存された」を示す */
 .ci-input + .ci-input { margin-top: 4px; }
-.ci-input.ci-saving { opacity: .6; }
-.ci-input.ci-saved { border-color: #22c55e; box-shadow: 0 0 0 2px #bbf7d0; }
+.ci-input.ci-saving, .ci-select.ci-saving { opacity: .6; }
+.ci-input.ci-saved, .ci-select.ci-saved { border-color: #22c55e; box-shadow: 0 0 0 2px #bbf7d0; }
+/* 注文番号の行: [モール▾][注文番号] を横並び (モール選択は4割) */
+.ci-order-row { margin-top: 2px; }
+.ci-order-row .ci-select { flex: 0 0 42%; min-width: 0; margin-top: 0; }
+.ci-order-row .ci-input { flex: 1; min-width: 0; margin-top: 0; }
 .ci-lock { font-size: 11px; margin-left: 4px; cursor: help; }
 .ci-links:empty { display: none; }
 .ci-links a + a { margin-left: 8px; }

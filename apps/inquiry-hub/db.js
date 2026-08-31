@@ -177,6 +177,10 @@ function createTables() {
   // JSON配列 (例 '["order_number"]')。NULL=手入力なし。値があるのにここに無い項目はモール同期が
   // 入れた確定情報で、画面から変更できない (customer-info.js)。同期が値を返した項目はここから外れる
   addColumnIfMissing('inquiries', 'manual_fields', 'TEXT');
+  // 手入力の注文番号のモール (2026-08-31): customer-info.js ORDER_MALLS のキー
+  // (rakuten/yahoo/amazon/aupay/qoo10/mercari/linegift)。NULL=未選択。
+  // 同期が注文番号を入れた (ロック) 問い合わせでは使わない (モール=チャネルそのもの)
+  addColumnIfMissing('inquiries', 'order_mall', 'TEXT');
 
   // メッセージ (受信・送信の両方)
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (
