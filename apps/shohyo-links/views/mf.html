@@ -149,7 +149,11 @@ const ATTACH_ERRORS = {
 async function api(path, opts) {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  if (!res.ok || !body.ok) {
+    const err = new Error(body.error || ('http_' + res.status));
+    if (body.detail) err.detail = body.detail; // MFのエラー本文 (原因の切り分け用)
+    throw err;
+  }
   return body.result;
 }
 
