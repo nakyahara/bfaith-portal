@@ -201,7 +201,7 @@ function render() {
   $('rows').innerHTML = rows.map(r => `<tr>
     <td class="file"><a href="../api/inbox/${r.id}/file" target="_blank" rel="noopener">${esc(r.file_name)}</a><span class="src">${esc(r.source)} ／ ${esc((r.created_at || '').slice(0, 10))}</span></td>
     ${editing.has(r.id) ? editCells(r) : `<td>${esc(r.doc_date || '—')}</td><td class="amount">${r.amount != null ? Number(r.amount).toLocaleString() : '—'}</td><td>${esc(r.vendor_name || '—')}</td>`}
-    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}${hasDup(r) ? '<span class="st dup" title="相手の仕訳にはもう証憑が付いています。このまま貼ると二重添付になります">⚠ 仕訳に証憑あり</span>' : ''}<div class="reason">${esc(r.error || r.match_reason || '')}</div>${r.extract_note ? `<div class="reason" title="読み取りの経緯">📖 ${esc(r.extract_note)}</div>` : ''}</td>
+    <td><span class="st ${esc(r.status)}">${LABEL[r.status] || esc(r.status)}</span>${r.match_strength ? `<span class="strength ${esc(r.match_strength)}">${r.match_strength === 'strong' ? '3キー一致' : '要確認'}</span>` : ''}${hasDup(r) ? '<span class="st dup" title="相手の仕訳にはもう証憑が付いています。このまま貼ると二重添付になります">⚠ 仕訳に証憑あり</span>' : ''}<div class="reason" title="${esc(r.error || r.match_reason || '')}">${esc(reasonText(r))}</div>${r.extract_note ? `<div class="reason" title="${esc(r.extract_note)}">📖 ${esc(prettyNote(r.extract_note))}</div>` : ''}</td>
     <td>${candCell(r)}</td>
     <td>${actions(r)}</td>
   </tr>`).join('');
@@ -217,6 +217,34 @@ function candLine(c, pick, rId) {
   return `<span class="cand${pick ? ' pick' : ''}" ${pick ? `data-pick="${rId}" data-tx="${esc(c.tx_id)}" title="この明細に貼る"` : ''}>
     ${esc((c.date || '').slice(5).replace('-', '/'))} −${Number(c.value).toLocaleString()} ${esc(c.content)}
     <span class="meta">${c.status === 'none' ? '未仕訳' : '登録済'}${c.day_diff != null ? ` ／ 日付差${c.day_diff}日` : ''}</span></span>`;
+}
+
+// 突合の内部コードは経理には読めない。画面には日本語を出し、元のコードは title に残す (調査用)
+const REASON_JA = {
+  'vendor+amount+date': '支払先・金額・日付の3つが一致しました',
+  'vendor(weak)+amount+date': '金額と日付が一致（支払先の一致は弱め）',
+  'amount+date (vendor text mismatch)': '金額と日付が一致（支払先の表記が明細と違う）',
+  'amount+date (vendor unknown)': '金額と日付が一致（支払先が未設定）',
+  'vendor+amount (no date)': '支払先と金額が一致（日付が無い）',
+  amount_missing: '金額が読めていません（「直す」で入れてください）',
+  no_amount_match: '同じ金額の明細がMFにありません',
+  no_amount_vendor_match: '同じ金額の明細がMFにありません',
+  multiple_candidates: '同じ日・同じ金額の明細が複数あります',
+  all_candidates_taken: '候補の明細は別の証憑がすでに押さえています',
+  multiple_vouchers_for_transaction: '同じ明細を複数の証憑が指しています',
+};
+
+/** 状態欄に出す日本語。未知のコードはそのまま出す (隠さない) */
+function reasonText(r) {
+  if (r.error) return r.error;
+  // 旧形式の「(仕訳に証憑あり)」が残っている行でも日本語になるように落としてから引く
+  const raw = String(r.match_reason || '').replace(' (仕訳に証憑あり)', '');
+  return REASON_JA[raw] || raw;
+}
+
+/** 読み取りの経緯からモデル名・内部IDを畳む (全文は title で見られる) */
+function prettyNote(s) {
+  return String(s).replace(/AI\([^)]*\)/g, 'AI').replace(/マスタ#\d+ に結びつけ/g, '支払先マスタに結びつけ');
 }
 
 // MFには「仕訳1件を直接開くURL」が無いため、仕訳帳を開いて 仕訳No. で探してもらう

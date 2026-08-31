@@ -9,7 +9,7 @@ import os from 'node:os';
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'shohyo-matcher-'));
 const { matchVoucher, matchBatch, parseVoucherFileName, isValidDate, resolveVendorId, isStrongKey } = await import('../matcher.js');
 const {
-  addToInbox, listInbox, updateInboxMeta, setMatch, countByStatus, transactionOwners, autoAttachEnabled, setSetting,
+  addToInbox, listInbox, updateInboxMeta, setMatch, countByStatus, transactionOwners, autoAttachEnabled, setSetting, backfillJournalVouchers,
   claimForAttach, releaseClaim, markAttached, markNeedsCheck, recoverStaleClaims, readFile, sniffKind, decodeBase64Strict, getInbox, setStatus,
 } = await import('../inbox.js');
 const { listLinks } = await import('../db.js');
@@ -197,6 +197,20 @@ check('証憑が無くなれば0に戻る (前回値が残らない)', getInbox(
 proposed(1);
 updateInboxMeta(dupId, { amount: 11423 });
 check('「直す」で件数もリセットされる', getInbox(dupId).match_journal_vouchers === 0 && getInbox(dupId).status === 'new');
+
+// 旧形式 (reason に「(仕訳に証憑あり)」を連結) の行を新カラムへ移す
+// 2026-08-31 本番: #1044 をデプロイしても既存の行は警告が出ず、「照合し直すまで直らない」状態だった
+const oldRow = addToInbox(Buffer.from('%PDF-1.4 old'), { file_name: 'old.pdf', doc_date: '2026-07-20', amount: 11422 });
+setMatch(oldRow.row.id, {
+  status: 'proposed', tx_id: 'told', journal_id: 'jold', journal_number: 607, strength: 'weak',
+  reason: 'amount+date (vendor text mismatch) (仕訳に証憑あり)', candidates: [{ tx_id: 'told' }],
+});
+check('旧形式の行は件数0のまま (バックフィル前)', getInbox(oldRow.row.id).match_journal_vouchers === 0);
+check('バックフィルは該当行を移す', backfillJournalVouchers() === 1);
+check('バックフィル後は件数1', getInbox(oldRow.row.id).match_journal_vouchers === 1);
+check('バックフィルで理由の文字列も掃除する',
+  getInbox(oldRow.row.id).match_reason === 'amount+date (vendor text mismatch)');
+check('2回目は何もしない (冪等)', backfillJournalVouchers() === 0);
 
 console.log(failed ? `\n${failed}件NG` : '\n全件パス');
 process.exit(failed ? 1 : 0);

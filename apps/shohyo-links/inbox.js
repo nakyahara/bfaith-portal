@@ -75,6 +75,9 @@ function db() {
     if (!d.prepare('PRAGMA table_info(voucher_inbox)').all().some(c => c.name === 'match_journal_vouchers')) {
       d.exec('ALTER TABLE voucher_inbox ADD COLUMN match_journal_vouchers INTEGER NOT NULL DEFAULT 0');
     }
+    // #1044 以前の行は reason 文字列に「(仕訳に証憑あり)」を連結していた。新カラムへ移して
+    // 「照合し直すまで警告が出ない」状態を無くす (該当行が無くなれば何もしないので冪等)
+    backfillJournalVouchers(d);
     // 明細ごとに 確保中/添付済み は1件だけ (二重POSTをDBで止める。確保の時点で効く)
     d.exec('DROP INDEX IF EXISTS uq_voucher_inbox_attached_tx');
     d.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_voucher_inbox_owned_tx ON voucher_inbox(match_tx_id)
@@ -266,6 +269,17 @@ export function updateInboxMeta(id, body) {
     match_journal_vouchers=0,
     updated_at=@now WHERE id=@id`).run({ ...data, now: new Date().toISOString(), id });
   return getInbox(id);
+}
+
+/**
+ * 旧形式 (match_reason に「(仕訳に証憑あり)」を連結していた頃) の行を match_journal_vouchers へ移す。
+ * 件数までは分からないので 1 件として扱う (画面の警告を出すのが目的)。冪等。
+ * @returns 移した行数
+ */
+export function backfillJournalVouchers(d = db()) {
+  return d.prepare(`UPDATE voucher_inbox SET match_journal_vouchers = 1,
+    match_reason = replace(match_reason, ' (仕訳に証憑あり)', '')
+    WHERE match_reason LIKE '%(仕訳に証憑あり)%'`).run().changes;
 }
 
 export function setMatch(id, { status, tx_id = '', journal_id = '', journal_number = null, strength = '', reason = '', candidates = [], journal_vouchers = 0 }) {
