@@ -1536,6 +1536,63 @@ gb = listing.buildItemPayload(db, gdId);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
   gb.ok === false && gb.reasons.some((r) => r.includes('カタログID')), JSON.stringify(gb.reasons));
 
+// ─── メーカー型番は「メーカー型番」欄が唯一の入口 (2026-08-31 中原さん指摘) ───
+// RMS でも入力項目は 1 つなのに、画面が「メーカー型番」欄と商品属性の 2 箇所に入れさせていた。
+// 入口を article_number だけにして、辞書に メーカー型番 があるジャンルでは送信時に自動で積む
+{
+  const MODEL = listing.MODEL_ATTR_NAME;
+  // 辞書に メーカー型番 を足す (必須にして「欄に入っていれば必須欠落にならない」ことも見る)
+  const withModel = JSON.parse(JSON.stringify(gnorm.attributes));
+  withModel.push({ name: MODEL, mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 1, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' });
+  db.prepare(`INSERT OR REPLACE INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at)
+    VALUES ('900002', ?, ?, ?, ?)`).run(gnorm.genreName, gnorm.genrePath, JSON.stringify(withModel), gnorm.fixedAt);
+  db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
+  const OK_ATTRS = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]';
+
+  // ① 欄に入れれば、属性に メーカー型番 が無くても必須欠落にならず、payload には積まれる
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+  let bm = listing.buildItemPayload(db, gdId);
+  const attrsOf = (r) => (r.ok ? r.payload.variants['gd-smoke-1'].attributes || [] : []);
+  check('メーカー型番: 欄に入れれば属性行が無くても通り、属性として自動で積まれる',
+    bm.ok === true && attrsOf(bm).some((a2) => a2.name === MODEL && a2.values[0] === 'toys3pen'),
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+  check('メーカー型番: articleNumber にも入る (楽天の型番フィールド)',
+    bm.ok === true && bm.payload.variants['gd-smoke-1'].articleNumber
+    && bm.payload.variants['gd-smoke-1'].articleNumber.value === 'toys3pen',
+    JSON.stringify(bm.ok ? bm.payload.variants['gd-smoke-1'].articleNumber : bm.reasons));
+
+  // ② 欄が空なら、辞書必須の メーカー型番 は今までどおり欠落エラー (黙って通さない)
+  db.prepare(`UPDATE draft_rakuten SET article_number = NULL WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 欄が空なら辞書必須の欠落として止まる',
+    bm.ok === false && bm.reasons.some((r) => r.includes(MODEL)), JSON.stringify(bm.reasons));
+
+  // ③ 旧データで属性側にも残っていて、欄と食い違うときは止める (どちらが正か分からない)
+  db.prepare(`UPDATE draft_rakuten SET article_number = 'toys3pen',
+    attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["別の型番"]}]'
+    WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 属性側の旧値と欄が食い違ったら止める',
+    bm.ok === false && bm.reasons.some((r) => r.includes('一致しません')), JSON.stringify(bm.reasons));
+
+  // ④ 同じ値なら通り、**二重に積まない** (属性が 2 つになると RMS 側で弾かれる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json =
+    '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["toys3pen"]}]'
+    WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 属性側と同じ値なら通り、属性は 1 つだけ (二重に積まない)',
+    bm.ok === true && attrsOf(bm).filter((a2) => a2.name === MODEL).length === 1,
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+
+  // ⑤ 辞書に メーカー型番 が無いジャンルでは属性に積まない (IE1002 になる)
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 辞書に無いジャンルでは属性に積まない (IE1002 対策)',
+    bm.ok === true && !attrsOf(bm).some((a2) => a2.name === MODEL),
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+}
+
 // 鮮度切れ辞書は検証に使わない (Codex R1 High-1: 古い辞書で正しい属性を弾かない)
 db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"存在しない属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
@@ -2396,7 +2453,7 @@ let wfSetParentId = null;
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', 'ステンレス', 1)`).run(parentId);
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '50ml', 2)`).run(parentId);
   db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number) VALUES (?, '565004', '[]', 'parent-model-1')`).run(parentId);
   db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
   // 商品ページ表記: セットで変わるもの (内容量・サイズ・食品表示) が引き継がれないことを見る
   db.prepare(`
@@ -2440,6 +2497,11 @@ let wfSetParentId = null;
     db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(r.draftId).c === 1);
   check('楽天ジャンルはコピーする',
     db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.genre_id === '565004');
+  // メーカー型番の入口を article_number に統一したので、ここを抜かすと派生したセットから型番が消える
+  // (2026-08-31 / Codex R1 high)
+  check('メーカー型番 (article_number) もコピーする',
+    db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.article_number === 'parent-model-1',
+    String(db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.article_number));
   check('画像はコピーしない',
     db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(r.draftId).c === 0);
   check('AIモードでは説明文をコピーしない',
@@ -4338,6 +4400,151 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   check('確認中: 監査ログが on → updated (理由変更 2 回) → off で残る (誰が何を待たせたかを追える)',
     evCK.join(',') === 'checking_on,checking_updated,checking_updated,checking_off', evCK.join(','));
 
+  // ─── メーカー型番は保存時にも属性から落とす (2026-08-31) ───
+  // 画面は行を出さないが、旧い画面を開いたままのタブや直叩きからも入らないようにする
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [
+      { name: 'ブランド名', value: 'テストブランド' },
+      { name: 'メーカー型番', value: 'toys3pen' },
+    ],
+    article_number: 'toys3pen',
+  });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    const attrs = JSON.parse(saved?.attributes_json || '[]');
+    check('メーカー型番: 保存時に属性から落とす (古い画面からの POST でも二重にならない)',
+      r.status === 200 && !attrs.some((a2) => a2.name === 'メーカー型番')
+      && attrs.some((a2) => a2.name === 'ブランド名') && saved.article_number === 'toys3pen',
+      JSON.stringify(saved));
+  }
+
+  // 🚨 値を黙って消さないこと (Codex R1 high)。画面は属性側の メーカー型番 を隠すので、
+  // 欄と違う値が残っていると人が気づかないまま保存で消える → サーバ側で 400 にする
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["テストブランド"]},{"name":"メーカー型番","values":["別の型番XYZ"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [{ name: 'ブランド名', value: 'テストブランド' }],   // 画面は メーカー型番 を送らない
+    article_number: 'toys3pen',
+  });
+  {
+    const saved = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: DB に残った別の値は黙って消さず 400 で止める',
+      r.status === 400 && String(r.json.error || '').includes('別の型番XYZ')
+      && String(saved.attributes_json).includes('別の型番XYZ'),   // 保存されず DB もそのまま
+      `${r.status} ${JSON.stringify(r.json)}`);
+  }
+  // 複数残っている場合も「どれが正か」を人に決めさせる
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ? WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["AAA"]},{"name":"メーカー型番","values":["BBB"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [{ name: 'ブランド名', value: 'テストブランド' }], article_number: 'AAA',
+  });
+  check('メーカー型番: 属性側に複数あるときは 400 (どれかが黙って消えない)',
+    r.status === 400 && String(r.json.error || '').includes('複数'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 🚨 競合を検出したあと、画面から**直せる**こと (Codex R2 high)。
+  // 止めるだけだと「OLD が DB に残っているので何を送っても 400」のデッドロックになる
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 競合中はフラグ無しの保存を止める (誤って消さない)', r.status === 400, `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true });
+  check('メーカー型番: 解消に model_conflict_seen が無ければ 400 (楽観ロックを迂回させない)',
+    r.status === 400 && String(r.json.error || '').includes('model_conflict_seen'), `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 人が「欄の値を残す」と決めたら解消できる (デッドロックにしない)',
+      r.status === 200 && saved.article_number === 'NEW'
+      && !String(saved.attributes_json).includes('OLD'), `${r.status} ${JSON.stringify(saved)}`);
+  }
+  // 「型番なしにする」も選べる (空にできないと直せない商品が出る)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: '', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 「型番なしにする」も選べる (空にできる)',
+      r.status === 200 && !saved.article_number && !String(saved.attributes_json).includes('OLD'),
+      `${r.status} ${JSON.stringify(saved)}`);
+  }
+  // 旧形式 {name, value} で残っている値も拾う (Codex R2 medium: values 配列だけ見ると消える)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","value":"OLDFORM"}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 旧形式 {name,value} の値も競合として拾う',
+    r.status === 400 && String(r.json.error || '').includes('OLDFORM'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 壊れた JSON は上書きせず止める (中身が分からなくなる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ? WHERE draft_id = ?`).run('{壊れ', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 既存の属性JSONが壊れていたら上書きせず止める',
+    r.status === 400 && String(r.json.error || '').includes('壊れています'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 同じ値が 2 行に重複した旧データでも解消できる (Codex R6 medium: 片側だけ集合化すると永久 409)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["DUP"]},{"name":"メーカー型番","values":["DUP"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['DUP'] });
+  check('メーカー型番: 同じ値が重複した旧データでも解消できる (件数差で 409 にしない)',
+    r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).article_number === 'NEW',
+    `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 部分更新 (attributes 省略) でも競合を新しく作らせない (Codex R5 medium)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { article_number: 'NEW' });
+  check('メーカー型番: attributes を省いた部分更新でも競合を止める',
+    r.status === 400 && String(r.json.error || '').includes('OLD'), `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 楽観ロック: 画面が見ていた旧値と DB が食い違うなら 409 (別タブで変わった値を捨てない)
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['見ていない値'] });
+  check('メーカー型番: 画面が見た旧値と DB が違えば 409 (見ていない値を捨てない)',
+    r.status === 409 && String(r.json.error || '').includes('別の画面'), `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  check('メーカー型番: 見た旧値が一致すれば解消できる',
+    r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).article_number === 'NEW',
+    `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 部分更新でも メーカー型番 の行は残さない (次の保存でまた競合になる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["B"]},{"name":"メーカー型番","values":["ONLY"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { genre_id: '565004' });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 部分更新でも属性側から落として欄へ寄せる',
+      r.status === 200 && saved.article_number === 'ONLY'
+      && !String(saved.attributes_json).includes('メーカー型番')
+      && String(saved.attributes_json).includes('ブランド名'), `${r.status} ${JSON.stringify(saved)}`);
+  }
+
+  // attributes を送ってこない POST で既存属性が全部消えないこと (Codex R3 medium)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["残るはず"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { article_number: 'only-model' });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('属性: attributes を送らない POST で既存の属性が消えない',
+      r.status === 200 && String(saved.attributes_json).includes('残るはず') && saved.article_number === 'only-model',
+      `${r.status} ${JSON.stringify(saved)}`);
+  }
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[]', article_number = NULL WHERE draft_id = ?`).run(gdraft3.id);
+
+  // 欄が空で属性側にだけある旧データは、欄へ引き上げて保存できる (値を失わない)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["legacy-123"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 欄が空の旧データは欄へ引き上げて保存される (値を失わない)',
+      r.status === 200 && saved.article_number === 'legacy-123'
+      && !String(saved.attributes_json).includes('メーカー型番'), JSON.stringify(saved));
+  }
+
   // 後始末
   db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL,
     generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL,
@@ -4680,6 +4887,21 @@ renders.push(
       ...d0[2],
       pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
     }]);
+    // メーカー型番 (2026-08-31): 旧データで商品属性側に入っている状態。
+    // 上の「メーカー型番」欄へ引き上げて表示し、属性テーブルには行を出さない
+    renders.push(['detail.ejs (メーカー型番が属性側にある旧データ)', 'detail.ejs', {
+      ...d0[2],
+      rakuten: { ...d0[2].rakuten, article_number: null,
+        attributes_json: '[{"name":"ブランド名","values":["テストブランド"]},{"name":"メーカー型番","values":["toys3pen"]}]' },
+    }]);
+    // メーカー型番が 2 つあって競合している状態 (人がどれを残すか選ぶ画面)。
+    // 型番に script 終了タグを混ぜ、画面へ埋め込むときのエスケープが効いていることも同時に見る
+    renders.push(['detail.ejs (メーカー型番が競合)', 'detail.ejs', {
+      ...d0[2],
+      rakuten: { ...d0[2].rakuten, article_number: 'toys3pen',
+        attributes_json: JSON.stringify([{ name: 'ブランド名', values: ['テストブランド'] },
+          { name: 'メーカー型番', values: ['x' + '</scr' + 'ipt><img src=x onerror=alert(1)>'] }]) },
+    }]);
     // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
     // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
     renders.push(['detail.ejs (確認中)', 'detail.ejs', {
@@ -4741,6 +4963,8 @@ for (const [name, file, data] of renders) {
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
         checkingDays: null,
+        // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
+        modelAttrName: listing.MODEL_ATTR_NAME,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
@@ -4835,6 +5059,58 @@ for (const [name, file, data] of renders) {
   })(), [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]).join(',') || '(1つも無い)');
   // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
   dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
+}
+
+// ─── メーカー型番の入口は 1 つ / ジャンル属性の候補ボタン (2026-08-31 中原さん要望) ───
+{
+  const dl = renderedHtml.get('detail.ejs (メーカー型番が属性側にある旧データ)') || '';
+  const attrTable = (dl.match(/<table class="list" id="rk-attrs"[\s\S]*?<\/table>/) || [''])[0];
+  check('メーカー型番: 商品属性のテーブルに行を出さない (入口は上の欄だけ)',
+    attrTable.length > 0 && !attrTable.includes('メーカー型番') && attrTable.includes('テストブランド'),
+    attrTable.includes('メーカー型番') ? '属性テーブルに残っている' : '属性テーブルが取れない');
+  check('メーカー型番: 旧データの値は「メーカー型番」欄へ引き上げて表示する',
+    /id="rk-article" value="toys3pen"/.test(dl) && dl.includes('商品属性に入っていた値をここへ移しました'),
+    (dl.match(/id="rk-article" value="[^"]*"/) || ['(見つからない)'])[0]);
+  // 旧値を欄へ引き上げて表示している状態は、そのまま/書き換えて保存できる必要がある
+  // (Codex R4 high: フラグが false だと保存が 400 になるのに解消ボタンが出ていない)
+  // 埋め込む JSON のエスケープ (Codex R7 high: バックスラッシュ 1 つだと JS 上では '<' そのもので
+  // 置換が無意味になり、型番に script 終了タグを入れられると script ブロックを脱出できる)
+  {
+    // 競合の fixture は型番に script 終了タグを混ぜてある。埋め込み行がそれを生で持たないこと
+    const dc = renderedHtml.get('detail.ejs (メーカー型番が競合)') || '';
+    const seenLine = dc.split('\n').find((l) => l.includes('const modelSeenValues')) || '';
+    check('メーカー型番: 画面へ埋め込む値は < をエスケープする (script ブロックを脱出させない)',
+      seenLine.length > 0 && seenLine.includes('u003c')
+      && !seenLine.toLowerCase().includes('<' + '/script'),
+      seenLine.slice(0, 160) || '(埋め込み行が無い)');
+    check('メーカー型番: 競合しているときは「どれを残すか」のボタンを出す',
+      dc.includes('id="rk-model-conflict"') && dc.includes('rk-model-pick')
+      && dc.includes('型番なしにする'),
+      dc.includes('rk-model-conflict') ? '選択ボタンが無い' : '警告が出ていない');
+    check('メーカー型番: 競合中は解消フラグを立てない (人が選ぶまで捨てない)',
+      dc.includes('let modelConflictResolved = false;'),
+      (dc.split('\n').find((l) => l.includes('let modelConflictResolved')) || '(見つからない)').trim());
+  }
+  check('メーカー型番: 引き上げ表示のときは解消フラグが最初から立つ (書き換えて保存できる)',
+    /let modelConflictResolved = true;/.test(dl),
+    (dl.match(/let modelConflictResolved = \w+;/) || ['(見つからない)'])[0]);
+  const d0f = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('メーカー型番: 旧値が無い通常の商品では解消フラグは立てない (黙って捨てない)',
+    /let modelConflictResolved = false;/.test(d0f),
+    (d0f.match(/let modelConflictResolved = \w+;/) || ['(見つからない)'])[0]);
+  // 候補ボタン (②): 入れ物とジャンル辞書の受け渡しがあること
+  const d0h = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('属性候補: 候補ボタンの置き場所とジャンル辞書の受け渡しがある',
+    d0h.includes('id="rk-attr-suggest"') && d0h.includes('id="rk-attrdict-json"')
+    && d0h.includes('id="rk-model-attr-json"'));
+  check('属性候補: 辞書の全属性 (必須+任意) を渡している (必須だけに絞らない)', (() => {
+    const m = d0h.match(/id="rk-attrdict-json">(\[[\s\S]*?\])<\/script>/);
+    if (!m) return false;
+    let arr = [];
+    try { arr = JSON.parse(m[1]); } catch (e) { return false; }
+    // fixture のジャンル辞書は必須 1 件のみだが、mandatory フラグ付きで渡っていることを見る
+    return arr.length >= 1 && arr.every((x) => typeof x.name === 'string' && 'mandatory' in x);
+  })(), (d0h.match(/id="rk-attrdict-json">([\s\S]{0,120})/) || ['', '(無い)'])[1]);
 }
 
 // ─── EJS 内クライアントJSの構文チェック ───

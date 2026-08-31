@@ -1500,8 +1500,58 @@
         </div>
       </div>
       <div style="flex:1">
-        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信)</span><span class="ftag ftag-m">手入力</span></label>
-        <input type="text" id="rk-article" value="<%= rakuten?.article_number || '' %>">
+        <%# メーカー型番の入口は**この欄だけ** (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに、
+            商品属性にも同じ欄があって二重入力になっていた)。ジャンル属性に「メーカー型番」がある
+            ジャンルでは、送信時にこの値が属性へ自動で積まれる (カタログID と同じ方式)。
+            旧データで属性側に入っている分はここへ引き上げて表示する — 保存すれば統合される %>
+        <%
+          let rkAttrsRaw = [];
+          try { rkAttrsRaw = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrsRaw = []; }
+          // 旧データに残っている メーカー型番 の値をすべて集める (1 行 1 値とは限らない)
+          // 旧形式 {name, value} も拾う (Codex R3 high): これを取りこぼすと、
+          // サーバは 400 にするのに画面には値が出ず、直せないまま止まる
+          const legacyModels = [...new Set(rkAttrsRaw
+            .filter((a) => a && a.name === modelAttrName)
+            .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
+            .map((v) => String(v == null ? '' : v).trim())
+            .filter(Boolean))];
+          const legacyModel = legacyModels.length === 1 ? legacyModels[0] : '';
+          // 「欄と違う値が属性に残っている」「属性に複数ある」= 人が決めないと消えてしまう。
+          // 隠さずに見せて、サーバ側 (保存 API) も 400 で止める (Codex R1 high/medium)
+          const modelConflict = legacyModels.length > 1
+            || (legacyModels.length === 1 && rakuten?.article_number && rakuten.article_number !== legacyModels[0]);
+          // 旧値を欄へ引き上げて表示しているケース (欄が空で属性側に 1 つだけ) は、
+          // **人がその値を画面で見ている**状態。そのまま保存しても書き換えて保存しても
+          // 「見えている値が正」なので、解消フラグを最初から立てておく (Codex R4 high:
+          // 立てないと、書き換えて保存 → DB の旧値と食い違って 400、なのに解消ボタンが
+          // 出ていない、という直せない状態になる)
+          const modelAutoResolve = !modelConflict && legacyModels.length === 1 && !rakuten?.article_number;
+        %>
+        <label>メーカー型番 <span class="muted">(空なら「型番なし」で送信。商品属性にも自動で入ります)</span><span class="ftag ftag-m">手入力</span></label>
+        <input type="text" id="rk-article" value="<%= rakuten?.article_number || legacyModel || '' %>">
+        <% if (modelConflict) { %>
+          <%# 止めるだけだと画面から直せない (Codex R2 high)。どれを残すかを押して決められるようにする。
+              押した値だけが残り、他は捨てられる — 捨てる操作を人に選ばせるのが要点 %>
+          <div class="banner-warn" style="margin:6px 0 0; font-size:12px;" id="rk-model-conflict">
+            ⚠️ <%= modelAttrName %>が 2 つ以上あります。<strong>どれを残すか選んでください</strong>
+            (選んだ値だけが残ります)。このままでは保存できません。
+            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;">
+              <% for (const m of legacyModels) { %>
+                <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= m %>">
+                  商品属性の「<%= m %>」を残す
+                </button>
+              <% } %>
+              <% if (rakuten?.article_number && !legacyModels.includes(rakuten.article_number)) { %>
+                <button type="button" class="btn btn-sm rk-model-pick" data-value="<%= rakuten.article_number %>">
+                  この欄の「<%= rakuten.article_number %>」を残す
+                </button>
+              <% } %>
+              <button type="button" class="btn btn-sm rk-model-pick" data-value="">型番なしにする</button>
+            </div>
+          </div>
+        <% } else if (!rakuten?.article_number && legacyModel) { %>
+          <div class="muted" style="font-size:11px;">ℹ️ 商品属性に入っていた値をここへ移しました。保存すると 1 箇所にまとまります</div>
+        <% } %>
       </div>
     </div>
 
@@ -1535,6 +1585,8 @@
         <%
           let rkAttrs = [];
           try { rkAttrs = JSON.parse(rakuten?.attributes_json || '[]'); } catch (e) { rkAttrs = []; }
+          // メーカー型番は上の欄が入口なので行として出さない (カタログID と同じ考え方)
+          rkAttrs = rkAttrs.filter((a) => a.name !== modelAttrName);
           if (rkAttrs.length === 0) rkAttrs = [{ name: '', values: [''] }];
         %>
         <% for (const a of rkAttrs) { %>
@@ -1548,6 +1600,12 @@
     </table>
     <button type="button" class="btn btn-sm" id="rk-attr-add">＋ 属性行を追加</button>
     <script type="application/json" id="rk-mandatory-json"><%- JSON.stringify(genreDict ? genreDict.attributes.filter((a) => a.mandatory).map((a) => a.name) : []).replace(/</g, '\\u003c') %></script>
+    <%# このジャンルで使える属性の候補 (2026-08-31 中原さん要望: 何を入れられるかが分からず、
+        既存の類似商品を見て手打ちしている。押すと行が増える形にして、入力欄は必要な分だけにする) %>
+    <div id="rk-attr-suggest" style="margin-top:10px;"></div>
+    <%# 候補ボタン用にジャンルの全属性 (必須+任意)。名前・必須・入力方式・単位・上限だけあれば足りる %>
+    <script type="application/json" id="rk-attrdict-json"><%- JSON.stringify(genreDict ? genreDict.attributes.map((a) => ({ name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null, unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null })) : []).replace(/</g, '\\u003c') %></script>
+    <script type="application/json" id="rk-model-attr-json"><%- JSON.stringify(modelAttrName) %></script>
 
     <div style="display:flex; gap:8px; align-items:center; margin-top:14px; flex-wrap:wrap;">
       <button class="btn btn-primary" id="rk-save-btn-cat">カテゴリ・属性を保存</button>
@@ -2255,6 +2313,73 @@
     if (document.getElementById('rk-cats-suggest')) suggestShopCats(true);
   })();
 
+  // ─── このジャンルで使える属性の候補ボタン (2026-08-31 中原さん要望) ───
+  // 何を入れられるかが分からず、既存の類似商品を開いて確認しながら手打ちしていた。
+  // 辞書にある属性をボタンで並べ、押した分だけ行が増える形にする
+  // (全部を最初から行にすると、ジャンルによっては入力欄が数十行になって邪魔になる)。
+  let attrDict = [];
+  let modelAttrName = 'メーカー型番';
+  try { attrDict = JSON.parse(document.getElementById('rk-attrdict-json').textContent) || []; } catch (e) {}
+  try { modelAttrName = JSON.parse(document.getElementById('rk-model-attr-json').textContent) || modelAttrName; } catch (e) {}
+
+  function attrNamesInForm() {
+    const names = new Set();
+    document.querySelectorAll('#rk-attrs tbody tr .rk-attr-name').forEach((el) => {
+      const v = String(el.value || '').trim();
+      if (v) names.add(v);
+    });
+    return names;
+  }
+
+  function renderAttrSuggest() {
+    const box = document.getElementById('rk-attr-suggest');
+    if (!box) return;
+    box.textContent = '';
+    if (attrDict.length === 0) return;
+    const used = attrNamesInForm();
+    // 画面に入口を持たない属性は候補に出さない:
+    //   メーカー型番 = 上の「メーカー型番」欄が入口 / カタログID = JAN欄から自動送信
+    const rest = attrDict.filter((a) => a.name !== modelAttrName && a.name !== 'カタログID' && !used.has(a.name));
+    if (rest.length === 0) return;
+    const head = document.createElement('div');
+    head.className = 'muted';
+    head.style.fontSize = '11px';
+    head.style.marginBottom = '4px';
+    head.textContent = 'このジャンルで使える属性 (押すと行が増えます) — 残り ' + rest.length + ' 件';
+    box.appendChild(head);
+    const wrap = document.createElement('div');
+    wrap.style.display = 'flex';
+    wrap.style.flexWrap = 'wrap';
+    wrap.style.gap = '4px';
+    // 必須を先に、その中は辞書の並び順のまま (RMS の並びと揃える)
+    const sorted = rest.slice().sort((a, b) => (b.mandatory ? 1 : 0) - (a.mandatory ? 1 : 0));
+    for (const a of sorted) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn btn-sm';
+      b.style.fontSize = '12px';
+      b.style.padding = '3px 9px';
+      if (a.mandatory) { b.style.borderColor = '#fca5a5'; b.style.color = '#b91c1c'; b.style.fontWeight = '600'; }
+      b.textContent = (a.mandatory ? '*' : '') + a.name;
+      b.title = [a.mandatory ? '必須' : '任意', a.inputMethod === 'SELECTIVE' ? '選択式' : null,
+                 a.unit ? '単位:' + a.unit : null, a.maxLength ? '〜' + a.maxLength + '文字' : null]
+                 .filter(Boolean).join(' / ');
+      b.addEventListener('click', () => {
+        // 名前も値も空の行が余っていれば、そこを使う (押すたびに空行が増えない)
+        const blank = [...document.querySelectorAll('#rk-attrs tbody tr')].find((tr) =>
+          !tr.querySelector('.rk-attr-name').value.trim() && !tr.querySelector('.rk-attr-value').value.trim());
+        if (blank) blank.remove();
+        const tr = addAttrRow(a.name, '', a);
+        renderAttrSuggest();
+        const v = tr.querySelector('.rk-attr-value');
+        if (v) v.focus();
+        updateTabBadges();
+      });
+      wrap.appendChild(b);
+    }
+    box.appendChild(wrap);
+  }
+
   // ─── ジャンル情報を取得 (Genre API) → 必須属性の行を自動生成 ───
   function addAttrRow(name, value, meta) {
     const tr = document.createElement('tr');
@@ -2273,6 +2398,21 @@
     if (meta && meta.mandatory) tr.querySelector('.rk-attr-name').style.borderColor = '#fca5a5';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
     return tr;
+  }
+
+  // ジャンルIDを書き換えたら旧ジャンルの候補は消す (Codex R1 medium)。
+  // 残っていると、新しいジャンルでは使えない属性行を押して追加できてしまう
+  {
+    const genreInput = document.getElementById('rk-genre');
+    if (genreInput) {
+      let lastGenre = genreInput.value.trim();
+      genreInput.addEventListener('input', () => {
+        if (genreInput.value.trim() === lastGenre) return;
+        lastGenre = genreInput.value.trim();
+        attrDict = [];
+        renderAttrSuggest();
+      });
+    }
   }
 
   document.getElementById('rk-genre-fetch').addEventListener('click', async () => {
@@ -2309,19 +2449,33 @@
         // 空行 (name も value も空) は整理して詰める
         if (!n && !tr.querySelector('.rk-attr-value').value.trim()) tr.remove();
       });
+      // 候補ボタン用の辞書も新しいジャンルのものに差し替える (2026-08-31)
+      attrDict = (g.attributes || []).map((a) => ({
+        name: a.name, mandatory: !!a.mandatory, inputMethod: a.inputMethod || null,
+        unit: a.unit || null, maxLength: a.maxLength || null, multiValueLimit: a.multiValueLimit || null,
+      }));
       let added = 0;
       for (const a of mandatory) {
         if (present.has(a.name)) continue;
         if (a.name === 'カタログID') continue; // JAN欄から自動送信される (footnote 参照)
+        if (a.name === modelAttrName) continue; // 「メーカー型番」欄から自動送信される (2026-08-31)
         addAttrRow(a.name, '', a);
         added += 1;
       }
+      renderAttrSuggest();
       if ((g.attributes || []).some((a) => a.name === 'カタログID')) {
         const note = document.createElement('div');
         note.className = 'muted';
         note.style.fontSize = '11px';
         note.textContent = 'ℹ️ このジャンルはカタログIDが属性にあります。JAN欄の値が自動で送られます。';
         info.appendChild(note);
+      }
+      if ((g.attributes || []).some((a) => a.name === modelAttrName)) {
+        const note2 = document.createElement('div');
+        note2.className = 'muted';
+        note2.style.fontSize = '11px';
+        note2.textContent = 'ℹ️ このジャンルは' + modelAttrName + 'が属性にあります。上の「メーカー型番」欄の値が自動で送られます。';
+        info.appendChild(note2);
       }
       if (added > 0) rkResultCat.textContent = '必須属性 ' + added + ' 行を追加しました。値を埋めて保存してください';
       updateTabBadges();
@@ -2337,10 +2491,21 @@
       + '<td><button type="button" class="btn btn-sm rk-attr-del">×</button></td>';
     document.querySelector('#rk-attrs tbody').appendChild(tr);
   });
+  // 手で属性名を打ち替えたときも候補を合わせる (打った属性は候補から消え、消した属性は戻る)
+  document.getElementById('rk-attrs').addEventListener('input', (ev) => {
+    if (ev.target.classList && ev.target.classList.contains('rk-attr-name')) renderAttrSuggest();
+  });
   document.getElementById('rk-attrs').addEventListener('click', (ev) => {
     const del = ev.target.closest && ev.target.closest('.rk-attr-del');
-    if (del) del.closest('tr').remove();
+    if (del) { del.closest('tr').remove(); renderAttrSuggest(); }
   });
+
+  // メーカー型番の競合 (欄と商品属性に別の値がある) を人が解消したかどうか。
+  // ボタンで選んだときだけ true になり、サーバはそのとき旧値を捨てる (黙って捨てない)。
+  // 例外: 旧値を欄へ引き上げて表示している状態は、その値が画面に見えているので最初から true
+  let modelConflictResolved = <%= modelAutoResolve ? 'true' : 'false' %>;
+  // この画面を描いた時点で商品属性側にあった メーカー型番 (楽観ロックの照合用)
+  const modelSeenValues = <%- JSON.stringify(legacyModels).replace(/</g, '\\u003c') %>;
 
   function collectRakutenFields() {
     const attrs = [];
@@ -2354,6 +2519,11 @@
       genre_id: document.getElementById('rk-genre').value,
       article_number: document.getElementById('rk-article').value,
       attributes: attrs,
+      // メーカー型番の競合を人が解消したときだけ true (サーバはこのとき旧値を捨てる)
+      resolve_model_conflict: modelConflictResolved,
+      // 画面を開いたとき属性側に見えていた型番。サーバはこれと DB が一致するときだけ
+      // 捨てることを許す (別タブで変わっていたら 409。見ていない値を消さない)
+      model_conflict_seen: modelSeenValues,
       shop_category_ids: getShopCatOrderedIds(),   // 枠順 (配列順=slot。先頭=メインページ)
       shipping_method_group: document.getElementById('rk-shipping-group').value,
       postage_included: document.getElementById('rk-postage').value,
@@ -2435,11 +2605,45 @@
     return true;
   }
 
+  // メーカー型番を属性側から欄へ寄せた保存のあとは、画面が持っている「見た値」が古くなる。
+  // そのまま 2 回目を保存すると楽観ロックで 409 になるので読み直す (Codex R7 medium)
+  function afterRakutenSave(resultEl) {
+    if (modelConflictResolved) {
+      resultEl.textContent = '保存しました (メーカー型番を 1 箇所にまとめました)';
+      setTimeout(() => location.reload(), 700);
+      return;
+    }
+    resultEl.textContent = '保存しました';
+  }
   document.getElementById('rk-save-btn').addEventListener('click', async () => {
-    if (await saveRakutenFields()) { rkResult.textContent = '保存しました'; }
+    if (await saveRakutenFields()) afterRakutenSave(rkResult);
   });
   document.getElementById('rk-save-btn-cat').addEventListener('click', async () => {
-    if (await saveRakutenFields()) { rkResultCat.textContent = '保存しました'; }
+    if (await saveRakutenFields()) afterRakutenSave(rkResultCat);
+  });
+  // メーカー型番の競合解消: 押した値を欄に入れ、解消フラグ付きでそのまま保存する
+  document.querySelectorAll('.rk-model-pick').forEach((b) => {
+    b.addEventListener('click', async () => {
+      const picked = b.dataset.value || '';
+      if (!confirm(picked
+        ? '「' + picked + '」を残して、ほかのメーカー型番を消します。よろしいですか?'
+        : 'メーカー型番を空 (型番なし) にします。よろしいですか?')) return;
+      document.querySelectorAll('.rk-model-pick').forEach((x) => { x.disabled = true; });
+      document.getElementById('rk-article').value = picked;
+      modelConflictResolved = true;
+      try {
+        if (await saveRakutenFields()) {
+          rkResultCat.textContent = 'メーカー型番を 1 つにまとめました';
+          setTimeout(() => location.reload(), 700);
+          return;
+        }
+      } catch (e) {
+        alert('保存できませんでした: ' + e.message);
+      }
+      // 失敗したらフラグを戻す (次の保存で意図せず旧値を捨てない)
+      modelConflictResolved = false;
+      document.querySelectorAll('.rk-model-pick').forEach((x) => { x.disabled = false; });
+    });
   });
 
   document.getElementById('rk-images-btn').addEventListener('click', async () => {
@@ -3318,6 +3522,8 @@
   // 初期表示のバッジ計算 (initPageInfo 内の applyTypeVisibility でも一度呼ばれるが、
   // pi-type が無い画面状態でも必ず一度は計算しておく)
   updateTabBadges();
+  // 属性の候補ボタン (2026-08-31)。ジャンル辞書が取得済みなら開いた時点で並ぶ
+  renderAttrSuggest();
 
   // ─── 工程パネル (誰のボールか) ───
   // 変更したその場で保存する。保存ボタン方式だと「状態だけ変えて押し忘れ」が起き、
