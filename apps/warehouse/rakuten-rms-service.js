@@ -14,6 +14,9 @@
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
+import {
+  planPriceUpdate, getPriceOpsDb, receiveOperation, completeOperation, getOperation, replayOf,
+} from './rakuten-price-ops.js';
 import express, { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
@@ -675,6 +678,141 @@ router.post('/items/manage-numbers/:manageNumber/visibility', requireWrite, rate
     res.status(result.status).json(result.data ?? { ok: false });
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// ==========================================
+// 価格更新 (価格一括改定ツール M2)
+//   PATCH /items/manage-numbers/:mn/prices
+//   body: { operation_id, run_id?, expected: {sku:円}, prices: {sku:円} }
+//
+// 🚨ここが唯一「楽天の売価を書き換える」経路。守っていること:
+//   ・RAKUTEN_RMS_WRITE_ENABLED が無ければ 503 (fail-closed)
+//   ・operation_id で冪等。同じ ID の再送は実行せず前回結果を返す。
+//     結果が残っていない受領済み ID は unknown を返して**実行しない** (二重更新を作らない)
+//   ・商品ロックの中で GET → SKU実在確認 → expected と整数円で完全一致 → PATCH
+//     (M0実測: 存在しない SKU を送ると新規SKU作成になる / GET の価格は文字列)
+//   ・自動リトライしない (maxAttempts:1)。成功は 204 のみ
+//   ・受領台帳 (rakuten-price-ops.db) に受領と結果を残す (要件 F6 の miniPC 側ログ)
+// ==========================================
+// 応答を1か所で作り、台帳にも同じものを残す (再送で初回と同じ応答を返すため)
+function respondPriceOp(res, opsDb, operationId, state, httpStatus, body) {
+  completeOperation(opsDb, operationId, state, { httpStatus, body });
+  return res.status(httpStatus).json(body);
+}
+
+router.patch('/items/manage-numbers/:manageNumber/prices', requireWrite, rateLimitMiddleware('rakuten'), async (req, res) => {
+  const mn = String(req.params.manageNumber || '').trim().toLowerCase();
+  const operationId = String(req.body?.operation_id || '').trim();
+  const runId = req.body?.run_id ? String(req.body.run_id).trim() : null;
+  const expected = req.body?.expected;
+  const prices = req.body?.prices;
+
+  if (!MANAGE_NUMBER_RE.test(mn)) {
+    return errorResponse(res, { status: 400, error: 'INVALID_MANAGE_NUMBER', message: '商品管理番号の形式が不正です', requestId: req.requestId });
+  }
+  if (!/^[A-Za-z0-9._-]{8,80}$/.test(operationId)) {
+    return errorResponse(res, { status: 400, error: 'INVALID_OPERATION_ID', message: 'operation_id (8〜80文字の英数.-_) が必要です', requestId: req.requestId });
+  }
+  if (!prices || typeof prices !== 'object' || Array.isArray(prices)
+      || !expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    return errorResponse(res, { status: 400, error: 'INVALID_PAYLOAD', message: 'expected と prices (どちらもオブジェクト) が必要です', requestId: req.requestId });
+  }
+
+  let opsDb;
+  try {
+    opsDb = getPriceOpsDb();
+  } catch (e) {
+    // 台帳に書けない = 冪等を保証できない。書き込みはしない (fail-closed)
+    return errorResponse(res, { status: 503, error: 'OPS_LEDGER_UNAVAILABLE', message: `受領台帳を開けません: ${e.message}`, requestId: req.requestId });
+  }
+
+  const received = receiveOperation(opsDb, { operationId, runId, manageNumber: mn, request: { expected, prices } });
+  if (received.reused) {
+    // 同じ operation_id で別の依頼が来た。前回結果を返すと「更新していないのに成功」になる
+    console.error(`[rakuten-rms] price operation_id 使い回し op=${operationId} mn=${mn}`);
+    return errorResponse(res, {
+      status: 409, error: 'OPERATION_ID_REUSED',
+      message: 'この operation_id は別の依頼で使われています。新しい ID で送り直してください',
+      requestId: req.requestId,
+    });
+  }
+  if (!received.fresh) {
+    // ★初回とまったく同じ HTTP status・本文を返す (replay フラグだけ足す)。
+    //   状態や形が初回と変わると、呼び出し側が再送だけ別扱いする羽目になる
+    const r = replayOf(received.row);
+    console.log(`[rakuten-rms] price replay op=${operationId} state=${r.state} status=${r.status}`);
+    return res.status(r.status).json(r.body);
+  }
+
+  try {
+    const outcome = await withManageNumberLock(mn, async () => {
+      const existing = await rakutenRequest({ path: `/es/2.0/items/manage-numbers/${mn}` });
+      if (existing.status === 404) return { block: 404 };
+      if (existing.status !== 200) return { block: 502, detail: existing.status };
+      const item = existing.data?.item || existing.data;
+      const plan = planPriceUpdate(item, { expected, prices });
+      if (!plan.ok) return { plan };
+      if (plan.noop) return { plan };
+      // 変更系は自動リトライしない (途中で通っていた場合に二重更新になるため)
+      const result = await rakutenRequest({
+        path: `/es/2.0/items/manage-numbers/${mn}`, method: 'PATCH',
+        body: plan.patch, timeoutMs: 90_000, maxAttempts: 1,
+      });
+      return { plan, result };
+    });
+
+    if (outcome.block === 404) {
+      return respondPriceOp(res, opsDb, operationId, 'failed', 404,
+        { ok: false, state: 'failed', error: 'ITEM_NOT_FOUND', message: `${mn} は楽天に存在しません` });
+    }
+    if (outcome.block) {
+      return respondPriceOp(res, opsDb, operationId, 'failed', 502,
+        { ok: false, state: 'failed', error: 'RMS_PRECHECK_FAILED', message: `商品の取得に失敗 (${outcome.detail})` });
+    }
+    const { plan, result } = outcome;
+    if (!plan.ok) {
+      const state = plan.code === 'CONFLICT' ? 'conflict' : 'failed';
+      const httpStatus = plan.code === 'CONFLICT' ? 409 : 400;
+      console.log(`[rakuten-rms] price ${state} mn=${mn} op=${operationId} code=${plan.code}`);
+      return respondPriceOp(res, opsDb, operationId, state, httpStatus,
+        { ok: false, state, error: plan.code, message: plan.message, detail: plan.detail ?? null });
+    }
+    if (plan.noop) {
+      console.log(`[rakuten-rms] price noop mn=${mn} op=${operationId}`);
+      return respondPriceOp(res, opsDb, operationId, 'noop', 200,
+        { ok: true, state: 'noop', reason: plan.reason });
+    }
+    // 🚨M0実測: 成功は 204。200/201 を成功にしない
+    if (result.status === 204) {
+      console.log(`[rakuten-rms] price applied mn=${mn} op=${operationId} skus=${Object.keys(plan.applied).join(',')}`);
+      return respondPriceOp(res, opsDb, operationId, 'applied', 200,
+        { ok: true, state: 'applied', applied: plan.applied });
+    }
+    console.error(`[rakuten-rms] price FAILED mn=${mn} op=${operationId} status=${result.status}`);
+    return respondPriceOp(res, opsDb, operationId, 'failed', 502,
+      { ok: false, state: 'failed', error: 'RMS_PRICE_UPDATE_FAILED',
+        message: `楽天が 204 以外を返しました (${result.status})`, rmsStatus: result.status });
+  } catch (e) {
+    // 送信の途中で落ちた可能性がある → 結果は書かない (unknown のまま残し、再送は実行させない)
+    console.error(`[rakuten-rms] price ERROR mn=${mn} op=${operationId}: ${e.message}`);
+    return errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
+  }
+});
+
+// 受領照会 (Render 側が unknown を解決するために使う)。read-only
+router.get('/price-ops/:operationId', (req, res) => {
+  try {
+    const row = getOperation(getPriceOpsDb(), String(req.params.operationId || '').trim());
+    if (!row) return res.status(404).json({ ok: false, error: 'NOT_FOUND' });
+    res.json({
+      ok: true,
+      operation_id: row.operation_id, run_id: row.run_id, manage_number: row.manage_number,
+      received_at: row.received_at, state: row.result_state, completed_at: row.completed_at,
+      request: JSON.parse(row.request_json || 'null'), result: JSON.parse(row.result_json || 'null'),
+    });
+  } catch (e) {
+    errorResponse(res, { status: 500, error: 'OPS_LOOKUP_FAILED', message: e.message, requestId: req.requestId });
   }
 });
 
