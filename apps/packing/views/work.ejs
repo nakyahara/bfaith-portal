@@ -1448,7 +1448,12 @@
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');
       currentSeq = minPending();
-      showToast('依頼を取り下げました');
+      // 見つかった商品は手元にある → その伝票を今すぐ梱包して「完了」できるように、その伝票に留まる
+      // (以前は先頭の未処理へ戻していたため、あとで納品書を探して開き直す作業が生じた — 2026-08-31 現場意見)。
+      // 作業位置より後ろの伝票なら順序外の完了 (jumped) として送る
+      viewSeq = seq;
+      if (seq !== currentSeq) { jumpMode = true; jumpTargetSeq = seq; } else { jumpMode = false; jumpTargetSeq = null; }
+      showToast('依頼を取り下げました。見つかった商品を梱包して「完了」を押してください');
       render();
     });
 
