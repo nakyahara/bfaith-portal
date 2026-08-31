@@ -147,13 +147,6 @@
        style="<%= !checkingOnly && board.checkingTotal > 0 ? 'border-color:#3b82f6; color:#1e40af;' : '' %>">
       🔍 確認中<%= board.checkingTotal > 0 ? ` ${board.checkingTotal}` : '' %>
     </a>
-    <% if (boardView === 'image') { %>
-      <%# 種別の絞り込み (2026-08-24 中原さん要望)。担当者の絞り込みとは独立に効く %>
-      <span style="border-left:1px solid #e2e8f0; align-self:stretch;"></span>
-      <a class="chip <%= !imageKind ? 'on' : '' %>" href="<%= boardUrl({ kind: '' }) %>">両方</a>
-      <a class="chip <%= imageKind === 'top' ? 'on' : '' %>" href="<%= boardUrl({ kind: 'top' }) %>">🖼 TOP画像</a>
-      <a class="chip <%= imageKind === 'detail' ? 'on' : '' %>" href="<%= boardUrl({ kind: 'detail' }) %>">📸 商品詳細画像</a>
-    <% } %>
     <select id="assignee-select" style="width:auto; font-size:12px;">
       <option value="">担当者で絞る…</option>
       <% for (const s of staff) { %>
@@ -177,14 +170,11 @@
 
   <%
     // 画像トラック (TOP/詳細) のミニステッパー。どちらのビューでも同じものをカードに出す
+    // 2026-08-31: TOP の工程は廃止したので、カードに出すのは商品詳細 (LP) の 1 行だけ。
+    // 'top' を残すと工程が無いカードに「TOP —」が出続ける (Codex R4 low)
     const imgTrackRows = (c) => {
-      const rows = [];
-      for (const kind of ['top', 'detail']) {
-        const t = c.image && c.image[kind];
-        if (!t) continue;
-        rows.push({ kind, t });
-      }
-      return rows;
+      const t = c.image && c.image.detail;
+      return t ? [{ kind: 'detail', t }] : [];
     };
   %>
 
@@ -211,7 +201,6 @@
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
             <a class="kb-card-link" href="<%= cardHref(c.id, boardView === 'image') %>">
               <% if (boardView === 'image') { %>
-                <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
               <%# 画像工程 v2 (2026-08-26): 詳細カードに 撮影・素材 / 確認者 (列に工程が複数あるとき) / Canva / 商品情報 %>
               <% if (c.kind === 'detail') { %>
@@ -270,7 +259,7 @@
               <div class="kb-imgtracks">
                 <% for (const { kind, t } of imgTrackRows(c)) { %>
                   <div class="kb-krow">
-                    <span class="kb-kname"><%= kind === 'top' ? 'TOP' : '詳細' %></span>
+                    <span class="kb-kname">画像</span>
                     <% if (t.excluded) { %>
                       <span class="kb-klabel excluded">対象外</span>
                     <% } else { %>
@@ -340,7 +329,6 @@
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
           <a class="kb-card-link" href="<%= cardHref(c.id, false) %>">
             <% if (boardView === 'image' && c.kind) { %>
-              <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
             <% } %>
             <% if (c.checking) { %>
@@ -380,7 +368,7 @@
     カードは<strong>ドラッグで動かせます</strong> — 別の列に落とすと工程が進み、同じ列の中で上下に動かすと<strong>並び順</strong>が保存されます (次に開いてもその順のまま)。
     並べ替えた列にあとから入ってきたカードは、いちばん下に付きます (上から順にやれば先に来たものから片付く)。
     <% if (boardView === 'image') { %>
-      カードは 商品 × 画像種別 (🖼 TOP画像 / 📸 商品詳細画像) の2枚です。商品詳細画像を作らない商品は「対象外」にするとここに出ません。
+カードは 1 商品 1 枚です (2026-08-31: TOP画像の工程は廃止し、LP の工程に一本化)。商品詳細画像を作らない商品は「対象外」にするとここに出ません。
     <% } %>
     保留・除外にした商品はこのボードには出ません（<a href="/apps/product-hub/list">一覧</a>で確認できます）。
   </p>

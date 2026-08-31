@@ -416,6 +416,11 @@ export function updateStep(code, input) {
   }
   if (input?.active !== undefined) {
     const on = input.active ? 1 : 0;
+    // 廃止した TOP画像の工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)。
+    // **コードでなく属性で**見る (Codex R3 high): 管理画面から足したカスタム TOP 工程も同じ
+    if (on && step.track === 'image' && step.image_kind !== 'detail') {
+      throw badRequest('TOP画像の工程は 2026-08-31 に廃止しました (画像の工程は商品詳細 (LP) の 1 本です)');
+    }
     if (!on && step.builtin === 1) {
       throw badRequest('この工程は本流の定義に含まれるため無効化できません (名前と担当ロールは変更できます)');
     }
@@ -457,8 +462,13 @@ export function createStep(input) {
   let imageKind = null;
   if (track === 'image') {
     imageKind = trimOrNull(input?.image_kind);
-    if (imageKind !== 'top' && imageKind !== 'detail') {
-      throw badRequest('画像トラックの工程は種別 (TOP画像 / 商品詳細画像) を指定してください');
+    // TOP画像の工程は 2026-08-31 に廃止 (LP に一本化)。作れるようにしておくと
+    // ボードに TOP 列・TOP カードが復活して「1 商品 1 枚」が崩れる
+    if (imageKind === 'top') {
+      throw badRequest('TOP画像の工程は作れません (2026-08-31 に廃止。画像の工程は商品詳細 (LP) の 1 本です)');
+    }
+    if (imageKind !== 'detail') {
+      throw badRequest('画像トラックの工程は種別 (商品詳細画像) を指定してください');
     }
   }
   const rc = trimOrNull(input?.role_code);

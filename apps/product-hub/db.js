@@ -234,30 +234,8 @@ export const STEP_SEEDS = [
   // 撮影依頼中 (2026-08-25 中原さん要望)。**商品詳細画像だけ**の段階 — 外部カメラマンへの
   // 撮影依頼は商品詳細画像のみの運用のため、TOP側には作らない (ボードの列には詳細カードだけが載る)。
   // 撮影しない商品 (メーカー素材を使う等) は工程パネルで「対象外」にするか、ボードで先の列へ D&D
-  ...['top'].flatMap((kind) => [
-    {
-      code: `img_request_${kind}`, label: '画像制作の依頼', track: 'image', image_kind: kind, image_stage: 'request',
-      role_code: 'image', sort: 10,
-      description: '参考画像・レビュー収集、撮影商品の発送手配、外注への依頼',
-    },
-    {
-      code: `img_production_${kind}`, label: '画像制作', track: 'image', image_kind: kind, image_stage: 'production',
-      // sort は詳細 v2 (①10 … ⑤50 / ⑥60,61 / ⑦70…) と同じ物差し。自社商品の TOP は ⑤で作るので、その直後に並べる (2026-08-26)
-      role_code: 'image', sort: 51, stall_days: 7,
-      description: '外注/社内での画像制作。納品待ちがここで滞留する',
-    },
-    {
-      code: `img_register_${kind}`, label: '画像登録', track: 'image', image_kind: kind, image_stage: 'register',
-      role_code: 'image', sort: 52,
-      description: 'Drive へ格納してアプリに取り込む',
-    },
-    {
-      // 2026-08-23 中原さん追加。登録の後に置くのは、アプリの画像タブでサムネを見て承認できるため
-      code: `img_approve_${kind}`, label: '画像承認', track: 'image', image_kind: kind, image_stage: 'approve',
-      role_code: 'image_approver', sort: 62, stall_days: 3,
-      description: '登録された画像を確認して承認する。楽天出品は対象の画像種別すべての承認が前提 (出品ゲート)',
-    },
-  ]),
+  // TOP画像の 4 工程 (img_*_top) は 2026-08-31 に廃止 (RETIRED_TOP_STEP_CODES)。
+  // 画像の工程は商品詳細 (LP) の 10 段階に一本化し、TOP は「画像が登録されているか」で見る
   // ── 商品詳細画像 v2 (2026-08-26 現場要望・中原さん決定。要件定義 = AI_reference『画像工程v2_要件定義_20260826.md』) ──
   // 自社商品の詳細画像の流れ ①〜⑨ (⑩完了 = ボードの終端列)。TOP 画像は全商品で作るので TOP 系列は上のまま。
   // 自社商品の TOP は ⑤デザイン修正で作る → ⑤ done で TOP 系列の依頼/制作/登録、⑥中原確認 done で TOP 承認が自動 done
@@ -287,7 +265,7 @@ export const STEP_SEEDS = [
   {
     code: 'imgd_design', label: 'デザイン修正', track: 'image', image_kind: 'detail', image_stage: 'design',
     role_code: 'image', sort: 50, stall_days: 7, skippable: 0, listing_gate: 1,
-    description: '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)',
+    description: '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)',
   },
   {
     code: 'imgd_review_1', label: '社内確認 (田中)', track: 'image', image_kind: 'detail', image_stage: 'review',
@@ -297,7 +275,7 @@ export const STEP_SEEDS = [
   {
     code: 'imgd_review_2', label: '社内確認 (中原)', track: 'image', image_kind: 'detail', image_stage: 'review',
     role_code: 'image_approver', sort: 61, stall_days: 3, skippable: 0, listing_gate: 1,
-    description: '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で TOP 側の承認も自動で済みになる = 楽天出品ゲートが開く',
+    description: '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く',
   },
   {
     code: 'imgd_amazon', label: 'Amazon登録依頼', track: 'image', image_kind: 'detail', image_stage: 'amazon',
@@ -340,6 +318,19 @@ export const IMAGE_TRACK_V2_KEY = 'image_track_v2_migrated_at';
 
 /** kind 分割前の画像工程コード (2026-08-24 移行で active=0 にする。進捗行は残置) */
 export const LEGACY_IMAGE_STEP_CODES = ['img_request', 'img_production', 'img_register', 'img_approve'];
+
+/**
+ * TOP画像の工程 (2026-08-31 中原さん決定で廃止)。
+ *
+ * 「LP と TOP画像は基本的に同時進行で制作するため、工程を分けて管理する必要性が低い」
+ * 「商品詳細画像と TOP画像が別工程になっているため、実際の制作件数がぱっと見で分かりにくい」
+ * → 画像の工程は **商品詳細 (LP) の 10 段階に一本化**し、カードは 1 商品 1 枚にする。
+ *
+ * TOP画像そのものは楽天出品に必須なので、ゲートは工程ではなく
+ * **画像が登録されているか**で見る (中原さんの選択 A。imageTrackBlockReason 参照)。
+ * 進捗行は消さずに残す (履歴)。active=0 なので画面・ボードには出ない。
+ */
+export const RETIRED_TOP_STEP_CODES = ['img_request_top', 'img_production_top', 'img_register_top', 'img_approve_top'];
 
 /** 画像トラックの種別。TOP は楽天出品に必須なので「対象外」にできない (workflow-progress 側で拒否) */
 export const IMAGE_KINDS = [
@@ -1269,6 +1260,7 @@ export function initProductHubDB() {
     }
     migrateImageKindSplit(db);
     migrateDetailTrackV2(db);
+    retireTopImageSteps(db);
     syncOwnBrandImagePriority(db);
   })();
 
@@ -1339,8 +1331,10 @@ export function migrateImageKindSplit(db) {
   let copied = 0;
   const stepExists = db.prepare('SELECT 1 FROM ph_steps WHERE code = ?');
   for (const legacy of LEGACY_IMAGE_STEP_CODES) {
-    copied += copyTop.run(`${legacy}_top`, legacy).changes;
-    // 詳細 v1 工程は 2026-08-26 の v2 以降シードされない (新規 DB には無い) → 行が無ければコピーしない (FK)
+    // コピー先の工程が無ければ写さない (FK 制約違反になる)。
+    // TOP の 4 工程は 2026-08-31 に廃止し、詳細 v1 も v2 以降シードされないので、
+    // 新規 DB では両方とも「写す先が無い」= 旧工程を無効化するだけになる
+    if (stepExists.get(`${legacy}_top`)) copied += copyTop.run(`${legacy}_top`, legacy).changes;
     if (stepExists.get(`${legacy}_detail`)) copied += copyDetail.run(`${legacy}_detail`, legacy).changes;
   }
   db.prepare(`UPDATE ph_steps SET active = 0 WHERE code IN (${placeholders})`).run(...LEGACY_IMAGE_STEP_CODES);
@@ -1356,6 +1350,42 @@ export function migrateImageKindSplit(db) {
  * 旧 shipping_status → material_status も、空のときだけ写す。
  * @returns {{ migrated: number, skipped: boolean }}
  */
+/**
+ * TOP画像の 4 工程を無効化する (2026-08-31 中原さん決定)。
+ *
+ * 「LP と TOP画像は基本的に同時進行で制作するため、工程を分けて管理する必要性が低い」。
+ * 画像の工程は商品詳細 (LP) の 10 段階に一本化し、カードは 1 商品 1 枚にする。
+ * TOP画像そのものは楽天出品に必須なので、ゲートは工程ではなく
+ * **画像が登録されているか** で見る (imageTrackBlockReason)。
+ * 進捗行 (draft_step_progress) は消さない — 誰がどこまでやったかの記録として残す。冪等。
+ */
+export function retireTopImageSteps(db) {
+  // **コードでなく属性で**落とす (Codex R3 high): 管理画面から足したカスタム TOP 工程
+  // (step_xxx / image_kind='top' や NULL) が残ると、そこだけ TOP 列・TOP カードが復活する。
+  // 画像トラックは商品詳細 (LP) の 1 本に統一したので、detail 以外の画像工程はすべて無効化する
+  const info = db.prepare(`
+    UPDATE ph_steps SET active = 0
+    WHERE track = 'image' AND (image_kind IS NULL OR image_kind <> 'detail') AND active = 1
+  `).run();
+  // 説明文も直す (Codex R5 low)。シードは INSERT OR IGNORE なので、既存 DB には
+  // 「TOP側工程も自動完了」という**もう起きない動作**の説明が残ってしまう
+  // **旧文言に完全一致するときだけ**置き換える (Codex R6 low): 「新文言と違えば上書き」だと、
+  // 管理画面で書き換えた独自の説明が毎起動で消える
+  const fixDesc = db.prepare('UPDATE ph_steps SET description = ? WHERE code = ? AND description = ?');
+  for (const [code, oldDesc, newDesc] of [
+    ['imgd_design',
+      '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)',
+      '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)'],
+    ['imgd_review_2',
+      '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で TOP 側の承認も自動で済みになる = 楽天出品ゲートが開く',
+      '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く'],
+  ]) fixDesc.run(newDesc, code, oldDesc);
+  if (info.changes > 0) {
+    console.log(`[product-hub] TOP画像の工程 ${info.changes} 件を無効化しました (画像工程は詳細に一本化)`);
+  }
+  return info.changes;
+}
+
 export function migrateDetailTrackV2(db) {
   const ph = LEGACY_DETAIL_V1_CODES.map(() => '?').join(',');
   const run = db.transaction(() => {

@@ -2063,9 +2063,10 @@ router.get('/board', (req, res) => {
   // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
   const checkingOnly = filterParam === 'checking';
   const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
-  // 画像ビューの種別絞り込み (TOP画像 / 商品詳細画像 — 2026-08-24 中原さん要望)
-  const imageKind = boardView === 'image' && ['top', 'detail'].includes(String(req.query.kind || ''))
-    ? String(req.query.kind) : null;
+  // 種別の絞り込み (TOP画像 / 商品詳細画像) は 2026-08-31 に廃止 (カードが 1 商品 1 枚になった)。
+  // 古いブックマークの ?kind=top をそのまま効かせると、カードも列も空の画面になり、
+  // 画面から外す手段も無い (チップを消したため) — 受け取らずに無視する
+  const imageKind = null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
   const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {

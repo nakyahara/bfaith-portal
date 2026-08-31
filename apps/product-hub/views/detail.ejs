@@ -282,7 +282,8 @@
         <span class="badge" style="background:#fee2e2; color:#b91c1c;">⚠️ <%= workflow.stalledDays %>日 動いていません</span>
       <% } %>
       <span style="flex:1"></span>
-      <%# 画像トラックは TOP/詳細 で別々に進む (2026-08-24)。両方の現在地をここに常時出す %>
+      <%# 画像の工程は商品詳細 (LP) の 1 本 (2026-08-31: TOP の 4 工程は廃止し、
+          TOP画像そのものは「画像が登録されているか」で見る)。現在地をここに常時出す %>
       <% const kindChip = (label, t) => { %>
         <span style="font-size:12px;">
           🖼 <%= label %>:
@@ -303,8 +304,7 @@
           <% } %>
         </span>
       <% }; %>
-      <% kindChip('TOP', workflow.imageTop); %>
-      <% kindChip('詳細', workflow.imageDetail); %>
+      <% kindChip('画像', workflow.imageDetail); %>
     </div>
 
     <details style="margin-top:10px;">
@@ -388,7 +388,7 @@
       %>
       <p style="margin:10px 0 0; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
         <% if (workflow.detailExcluded) { %>
-          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像の承認だけで出品ゲートが開きます)</span>
+          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像が登録されていれば出品ゲートが開きます)</span>
           <% if (canToggleDetailExcluded) { %>
             <button type="button" class="btn btn-sm" id="wf-detail-excluded" data-next="false">対象外を解除する</button>
           <% } %>
