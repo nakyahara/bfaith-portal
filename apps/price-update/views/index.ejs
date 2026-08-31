@@ -197,7 +197,7 @@
     const s = r.mallShipping;
     if (r.mall === 'rakuten' && s) {
       const bits = [];
-      if (s.methodGroup != null) bits.push('配送方法セット ' + esc(s.methodGroup));
+      if (s.methodGroup != null) bits.push(esc(s.methodLabel || s.methodGroup));
       if (s.postageIncluded === true) bits.push('送料込み');
       if (s.postageIncluded === false) bits.push('送料別');
       if (s.singleItemShipping === 1) bits.push('単品配送');
@@ -205,7 +205,7 @@
     } else if (r.mall === 'yahoo' && s) {
       // 送料設定 (PostageSet) が商品ごとに変わる = 実質の配送方法。Delivery は今のところ全商品 "1"
       const bits = [];
-      if (s.postageSet) bits.push('送料設定 ' + esc(s.postageSet));
+      if (s.postageSet) bits.push('送料設定 ' + esc(s.postageLabel || s.postageSet));
       if (s.delivery) bits.push('配送 ' + esc(s.delivery));
       if (s.shipWeight) bits.push(esc(s.shipWeight) + 'g');
       if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
