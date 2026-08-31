@@ -136,17 +136,39 @@ async function gotoSafe(page, url) {
   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
 }
 
-/** 「お気をつけください」等のお知らせ確認ページ(glogin上, 次へボタン)を通過する */
+/**
+ * 「お気をつけください」等のお知らせ確認ページ(glogin上, 次へボタン)を通過する。
+ *
+ * 2026-08-31 実測: R-Login ID に**管理者権限**が付いていると、「次へ」の先が RMS 本体ではなく
+ * **R-Login メニュー** (glogin ドメインのまま、タイトル「R-Loginメニュー」) になる。そこから RMS に
+ * 入るにはメニューの「ＲＭＳ」リンク (mainmenu.rms.rakuten.co.jp/?act=login&sp_id=1) を踏む必要があり、
+ * mainmenu を直接 goto すると glogin/?sp_id=1 のログインフォームに戻される。
+ * 権限が「通常」だった頃は「次へ」→ mainmenu 直行だったため、このメニューを知らない実装のままだと
+ * 「ログイン手順は完走したが RMS に入れない」と誤判定して止まる (8/30 18:10 の権限変更直後から発生。
+ * 規制と決めつけて数時間を無駄にした — 人がやる経路をそのまま辿る)。
+ */
 async function passNotice(page) {
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     const host = safeHost(page.url());
     if (host !== 'glogin.rms.rakuten.co.jp') break;
     const next = page.locator('text=次へ').first();
-    if (!(await next.isVisible().catch(() => false))) break;
-    console.log('  [notice] お知らせページ「次へ」を通過');
-    await next.click().catch(() => {});
-    await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await page.waitForTimeout(1000);
+    if (await next.isVisible().catch(() => false)) {
+      console.log('  [notice] お知らせページ「次へ」を通過');
+      await next.click().catch(() => {});
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(1000);
+      continue;
+    }
+    // R-Login メニュー: 「ＲＭＳ」リンクで RMS 本体へ (人と同じ経路)
+    const rms = page.locator('a', { hasText: /^\s*(ＲＭＳ|RMS)\s*$/ }).first();
+    if (await rms.isVisible().catch(() => false)) {
+      console.log('  [notice] R-Loginメニュー → 「ＲＭＳ」リンクで RMS 本体へ');
+      await rms.click().catch(() => {});
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(1500);
+      continue;
+    }
+    break;
   }
 }
 
