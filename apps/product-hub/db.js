@@ -265,7 +265,7 @@ export const STEP_SEEDS = [
   {
     code: 'imgd_design', label: 'デザイン修正', track: 'image', image_kind: 'detail', image_stage: 'design',
     role_code: 'image', sort: 50, stall_days: 7, skippable: 0, listing_gate: 1,
-    description: '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)',
+    description: '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)',
   },
   {
     code: 'imgd_review_1', label: '社内確認 (田中)', track: 'image', image_kind: 'detail', image_stage: 'review',
@@ -275,7 +275,7 @@ export const STEP_SEEDS = [
   {
     code: 'imgd_review_2', label: '社内確認 (中原)', track: 'image', image_kind: 'detail', image_stage: 'review',
     role_code: 'image_approver', sort: 61, stall_days: 3, skippable: 0, listing_gate: 1,
-    description: '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で TOP 側の承認も自動で済みになる = 楽天出品ゲートが開く',
+    description: '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く',
   },
   {
     code: 'imgd_amazon', label: 'Amazon登録依頼', track: 'image', image_kind: 'detail', image_stage: 'amazon',
@@ -1367,6 +1367,13 @@ export function retireTopImageSteps(db) {
     UPDATE ph_steps SET active = 0
     WHERE track = 'image' AND (image_kind IS NULL OR image_kind <> 'detail') AND active = 1
   `).run();
+  // 説明文も直す (Codex R5 low)。シードは INSERT OR IGNORE なので、既存 DB には
+  // 「TOP側工程も自動完了」という**もう起きない動作**の説明が残ってしまう
+  const fixDesc = db.prepare('UPDATE ph_steps SET description = ? WHERE code = ? AND description <> ?');
+  for (const [code, desc] of [
+    ['imgd_design', '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)'],
+    ['imgd_review_2', '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く'],
+  ]) fixDesc.run(desc, code, desc);
   if (info.changes > 0) {
     console.log(`[product-hub] TOP画像の工程 ${info.changes} 件を無効化しました (画像工程は詳細に一本化)`);
   }

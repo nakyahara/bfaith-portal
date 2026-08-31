@@ -2001,9 +2001,15 @@ const wf = await import('../lib/workflow.js');
     db.prepare(`INSERT INTO ph_steps (code, label, track, image_kind, image_stage, role_code, sort, builtin, active)
       VALUES ('step_legacy_nokind', '旧カスタム画像 (種別なし)', 'image', NULL, NULL, 'image', 998, 0, 1)`).run();
     const activeOf = (code) => db.prepare('SELECT active FROM ph_steps WHERE code = ?').get(code)?.active;
+    // 既存 DB に残った「TOP側工程も自動完了」の説明も、この起動処理で直す (シードは
+    // INSERT OR IGNORE なので説明だけ古いまま残り、もう起きない動作を案内してしまう — Codex R5 low)
+    db.prepare(`UPDATE ph_steps SET description = '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)' WHERE code = 'imgd_design'`).run();
     check('起動時: 詳細以外の画像工程 (カスタム TOP・種別なし) は無効化される',
       dbmod.retireTopImageSteps(db) >= 2 && activeOf('step_legacy_top') === 0 && activeOf('step_legacy_nokind') === 0,
       `top=${activeOf('step_legacy_top')} nokind=${activeOf('step_legacy_nokind')}`);
+    check('起動時: 古い工程説明 (TOP側も自動完了) を直す',
+      !/TOP 側の/.test(db.prepare(`SELECT description FROM ph_steps WHERE code = 'imgd_design'`).get()?.description || ''),
+      db.prepare(`SELECT description FROM ph_steps WHERE code = 'imgd_design'`).get()?.description);
     for (const code of ['step_legacy_top', 'step_legacy_nokind']) {
       let revive = null;
       try { wf.updateStep(code, { active: true }); } catch (e) { revive = e; }

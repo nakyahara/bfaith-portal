@@ -388,7 +388,7 @@
       %>
       <p style="margin:10px 0 0; font-size:12px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
         <% if (workflow.detailExcluded) { %>
-          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像の承認だけで出品ゲートが開きます)</span>
+          <span style="color:#6d28d9;">🖼 この商品は<strong>詳細画像を作りません</strong> (TOP画像が登録されていれば出品ゲートが開きます)</span>
           <% if (canToggleDetailExcluded) { %>
             <button type="button" class="btn btn-sm" id="wf-detail-excluded" data-next="false">対象外を解除する</button>
           <% } %>
