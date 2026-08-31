@@ -2602,8 +2602,22 @@ router.post('/api/masters/:kind', (req, res) => {
       && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
       return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
     }
+    // 仕入先の発注方法を変えたとき、変更前に作られた未送信ジョブ (予約/失敗) は作成時の添付 (CSV/PDF) のまま
+    // なので送信直前の突合で止まる (email.js channelMismatchOf)。保存時にも件数を返して「取消して新規送信」を促す
+    let warning = null;
+    if (req.params.kind === 'suppliers') {
+      const prev = getDB().prepare('SELECT send_method FROM po_suppliers WHERE supplier_code=?').get(row.supplier_code);
+      if (prev && (prev.send_method || null) !== (row.send_method || null)) {
+        const pending = getDB().prepare(`SELECT o.po_number, j.id, j.status, j.scheduled_at FROM po_email_jobs j
+          JOIN po_orders o ON o.id = j.order_id WHERE o.supplier_code=? AND j.status IN ('queued','failed') ORDER BY j.id`).all(row.supplier_code);
+        if (pending.length) {
+          warning = `発注方法を変更しました。この仕入先には送信前のジョブが ${pending.length}件あります (${pending.map(p => `${p.po_number || '#' + p.id}${p.scheduled_at ? ' 予約' : ''}`).join(', ')})。` +
+            'これらは作成時の添付のままなので送信時に自動で止まります。発注書メールパネルで「取消」し、新規に送信し直してください';
+        }
+      }
+    }
     upsertMasterRow(def, row);
-    res.json({ ok: true });
+    res.json({ ok: true, ...(warning ? { warning } : {}) });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -8769,6 +8783,7 @@ function post(b) {
   }).then(function(r){ return r.json(); }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
+      if (j.warning) alert('⚠️ ' + j.warning); // 発注方法の変更で送信前ジョブが取り残される等 (見逃さないよう alert)
       if (reqTab === 'conditions' || reqTab === 'materials') GROUPS = null; // グループ名キャッシュを更新
       if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
       SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
