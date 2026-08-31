@@ -19,6 +19,7 @@ import { getDB, insertRun, appendEvent, getRun, listRuns, newId } from './db.js'
 import { buildTargets, listingUrl, normCode, UPDATABLE_MALLS } from './resolve.js';
 import { fetchRakutenPrices, fetchYahooPrices, loadAmazonSnapshot } from './live-price.js';
 import { evaluateRow, runLimits } from './pricing.js';
+import { rakutenShippingLabel, yahooPostageLabel } from './shipping-labels.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const router = express.Router();
@@ -159,7 +160,8 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         const p = rakutenPrices.get(key);
         if (p?.found) {
           price = p.price; priceSource = '楽天RMS (ライブ)'; priceIsLive = true;
-          confidence = 'confirmed'; skuCode = p.skuCode; mallShipping = p.shipping || null;
+          confidence = 'confirmed'; skuCode = p.skuCode;
+          mallShipping = p.shipping ? { ...p.shipping, methodLabel: rakutenShippingLabel(p.shipping.methodGroup) } : null;
           // 表示は実際の商品管理番号に差し替える (別名のままだと楽天の画面で探せない)
           if (p.manageNumber) { listingCode = p.manageNumber; url = listingUrl('rakuten', p.manageNumber); }
         } else {
@@ -170,7 +172,8 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         const p = yahooPrices.get(key);
         if (p?.found) {
           price = p.price; priceSource = 'Yahoo itemInfo (ライブ)'; priceIsLive = true;
-          confidence = 'confirmed'; mallShipping = p.shipping || null;
+          confidence = 'confirmed';
+          mallShipping = p.shipping ? { ...p.shipping, postageLabel: yahooPostageLabel(p.shipping.postageSet) } : null;
           // カラバリは「親の商品コード + 個別商品コード」で登録されている。
           // 当たった実際の商品コードに差し替える (Yahoo の画面で探せるように)
           if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('yahoo', p.itemCode); }

@@ -24,6 +24,7 @@ const fetchYahooPrices = (codes, deps) => (Array.isArray(codes) && typeof codes[
   : fetchYahooPricesRaw(codes, deps));
 import { createTables, insertRun, appendEvent, currentStates, getRun, listRuns } from './db.js';
 import { buildPreviewRows, evaluateRows, parseCodes, parseStrictPrice } from './router.js';
+import { rakutenShippingLabel, yahooPostageLabel } from './shipping-labels.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -246,6 +247,15 @@ console.log('\n── 発送方法: モール側の設定を抜き出す (売価
     fetchYahooItemDetail: async (c) => ({ ok: true, ItemCode: c, Name: 'Y', Price: 100, SubCodes: [] }),
   });
   eq(none.get('ship-z').shipping, null, '発送情報が無ければ null (空の項目を作らない)');
+}
+
+console.log('\n── 配送方法の番号 → 名前 ──');
+{
+  eq(rakutenShippingLabel(1), '1 (定形外)', '楽天 1 = 定形外');
+  eq(rakutenShippingLabel('9'), '9 (ゆうパケットパフ)', '文字列の番号も引ける');
+  eq(rakutenShippingLabel(99), '99', '★表に無い番号は番号だけ (勝手に名前を当てない)');
+  eq(rakutenShippingLabel(null), null, '未設定は null');
+  eq(yahooPostageLabel(6), '6', 'Yahoo は対応表が未入手なので番号のまま');
 }
 
 console.log('\n── 引き当てできないモールは行を消さず「未解決」で出す (要件 F1) ──');
