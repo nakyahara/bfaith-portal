@@ -15,7 +15,7 @@
  *   交代 (takeover) しても交代前の伝票は前任者に付く。
  */
 import { getDB, jstToday } from './db.js';
-import { lineKindOf } from './service.js';
+import { lineKindOf, lineDailyTotal } from './service.js';
 import { displayWorkerName, shiftDate } from '../picking/service.js';
 
 // 集計の床止め (梱包の本稼働開始より前のテスト運用期間を混ぜない)
@@ -211,5 +211,89 @@ export function getPackingStats({ until = jstToday(), days = PACK_STATS_WINDOW_D
     baseline,
     workers,
     byDate,
+  };
+}
+
+/**
+ * 本日の梱包進捗 (実績ボードの左上)。picking の getTodayProgress と同型。
+ *   - 手梱包: 伝票単位 (done 伝票数 / 全伝票数・秒/伝票は表示〜完了の平均。外れ値は除く)
+ *   - 梱包機ライン: 伝票単位の完了が無いので、バッチ完了 (line_done) の final_count を完了数に数える。
+ *     ライン累計 (出荷/機械通過) は lines.pas / lines.melt に別出し
+ *   - いま作業中 = packing / paused のバッチ (作業者・出荷_XX・引当分類)
+ */
+export function getTodayPackingProgress(workDate = jstToday(), db = getDB()) {
+  let batches = [];
+  try {
+    batches = db.prepare(`
+      SELECT b.id, b.status, b.worker, b.folder_name, b.slip_count, b.pause_started_at,
+        pb.hikiate_class,
+        (SELECT COUNT(*) FROM pk_pack_slips s WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips,
+        (SELECT r.final_count FROM pk_pack_line_runs r WHERE r.batch_id = b.id AND r.phase = 'run') AS line_final
+      FROM pk_pack_batches b
+      LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
+      WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      ORDER BY b.id
+    `).all(workDate);
+  } catch {
+    // pk_batches 未初期化 (picking 無し環境) — 分類なしで数える
+    batches = db.prepare(`
+      SELECT b.id, b.status, b.worker, b.folder_name, b.slip_count, b.pause_started_at, NULL AS hikiate_class,
+        (SELECT COUNT(*) FROM pk_pack_slips s WHERE s.batch_id = b.id AND s.status = 'done') AS done_slips,
+        (SELECT r.final_count FROM pk_pack_line_runs r WHERE r.batch_id = b.id AND r.phase = 'run') AS line_final
+      FROM pk_pack_batches b
+      WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      ORDER BY b.id
+    `).all(workDate);
+  }
+  // 手梱包とラインは分けて数える (画面は「本日の進捗 (手梱包)」— ライン込みだと実際より大きく見える。Codex)
+  let totalSlips = 0;
+  let doneSlips = 0;
+  const hand = { batchCount: 0, doneCount: 0 };
+  const lineSum = { batchCount: 0, doneCount: 0, totalSlips: 0, doneSlips: 0 };
+  const active = [];
+  for (const b of batches) {
+    const line = lineKindOf(b.hikiate_class) !== null;
+    if (line) {
+      lineSum.batchCount++;
+      if (b.status === 'done') { lineSum.doneCount++; lineSum.doneSlips += b.line_final ?? b.slip_count; }
+      lineSum.totalSlips += b.slip_count;
+    } else {
+      hand.batchCount++;
+      if (b.status === 'done') hand.doneCount++;
+      totalSlips += b.slip_count;
+      doneSlips += b.done_slips;
+    }
+    if (b.status === 'packing' || b.status === 'paused') {
+      active.push({
+        name: displayWorkerName(b.worker || '(不明)'), folder: b.folder_name, hikiateClass: b.hikiate_class,
+        paused: b.status === 'paused', line,
+      });
+    }
+  }
+  // 秒/伝票 (手梱包・本日・外れ値除く)。ライン伝票は伝票単位の時刻を持たないが、
+  // 万一入っていても混ぜない (loadStatsSlips と同じく引当分類で除外 — Codex R2)
+  const lineBatchIds = new Set(batches.filter((b) => lineKindOf(b.hikiate_class) !== null).map((b) => b.id));
+  const secs = db.prepare(`
+    SELECT s.batch_id, (unixepoch(s.done_at) - unixepoch(s.shown_at)) AS sec
+    FROM pk_pack_slips s JOIN pk_pack_batches b ON b.id = s.batch_id
+    WHERE b.work_date = ? AND b.validity = 'valid' AND b.status != 'cancelled'
+      AND s.status = 'done' AND s.done_at IS NOT NULL AND s.shown_at IS NOT NULL
+  `).all(workDate)
+    .filter((r) => !lineBatchIds.has(r.batch_id) && r.sec >= 0 && r.sec <= PACK_STATS_OUTLIER_SEC)
+    .map((r) => r.sec);
+  const sp = secs.length > 0 ? { n: secs.length, avg: secs.reduce((a, x) => a + x, 0) / secs.length } : null;
+  return {
+    workDate,
+    // 手梱包のみ (伝票単位の計測がある側)
+    batchCount: hand.batchCount,
+    doneCount: hand.doneCount,
+    totalSlips,
+    doneSlips,
+    remainingSlips: Math.max(0, totalSlips - doneSlips),
+    secPerSlip: sp && sp.n > 0 ? sp.avg : null,
+    active,
+    // 梱包機ライン (別枠)
+    line: lineSum,
+    lines: { pas: lineDailyTotal(workDate, 'pas'), melt: lineDailyTotal(workDate, 'melt') },
   };
 }

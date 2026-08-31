@@ -853,7 +853,7 @@ export function displayWorkerName(worker) {
  * shown_at/done_at は PR2 で「直近表示時刻」を刻んでいるので、back で往復しても
  * 他の明細の時間が混入しない (= この差がその明細の実所要時間)。
  */
-function loadStatsLines(since, until) {
+export function loadStatsLines(since, until) {
   return getDB().prepare(`
     SELECT b.work_date, b.hikiate_class, b.id AS batch_id, l.seq, l.status, l.shortage_qty, l.remaining_qty,
       CAST(ROUND((julianday(l.done_at) - julianday(l.shown_at)) * 86400) AS INTEGER) AS sec,
@@ -887,9 +887,10 @@ function loadStatsLines(since, until) {
  *   byDate: [{date, lines, sec, secPerLine, workers}]
  * }}
  */
-export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
+export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS, lineRows = null } = {}) {
   const range = statsRange(until, days);
-  const rows = loadStatsLines(range.since, range.until);
+  // lineRows = 呼び出し側で読んだ明細 (ボードは getMissStats と同じ窓を使うので1回の読みを共有 — Codex)
+  const rows = lineRows ?? loadStatsLines(range.since, range.until);
 
   // ── 外れ値の仕分け ──
   // 捨てた件数は全体と作業者別の両方で出す。除外は「放置の多い人ほど悪い記録が消える」
@@ -1541,39 +1542,131 @@ export function ackFloorAlert(id, worker, direction) {
  * 期間内のミス集計 (作業者×種別)。
  * @returns {{ byWorker: [{worker,total,shortage,excess,wrong_item,qty}], total: {...} }}
  */
+/**
+ * 期間内のミス集計 (作業者×種別) — **件数より比率** (中原さん指示 2026-08-31)。
+ *
+ * - 分母 = その作業者が期間内にピッキングした明細数 (完了バッチの明細。欠品で止めた明細も含む。
+ *   外れ値除外はしない = 速さ統計と違い「やった量」なので全部数える)
+ * - 比率 = 1,000 明細あたりのミス件数 (per1000)。分母が minLines 未満は参考値 (provisional)
+ * - **時間軸と帰属は分母と同じ規則** (Codex R1 High×2):
+ *     日付 = そのミスが出たピッキングバッチの work_date (梱包で見つかった日ではない)。
+ *     作業者 = その SKU の明細を実際にピッキングした人 (pk_events の最後の next/shortage の担当。交代しても
+ *     交代前の明細は前任者に付く — loadStatsLines と同じ)。ピッキングバッチを引けないときだけ
+ *     確定時の attributed_worker / created_at の JST 日付にフォールバック
+ * - 🚨 **欠品とミスは別物**: 梱包で「不足」として確定したものでも、
+ *     (a) ピッキング側でその受注×SKU が欠品 (他ロケにも無く「後で取りに行く」/「どこにもない」 = pk_shortage_allocations)、
+ *     (b) 配賦記録を持たない古いバッチ (2026-08-31 以前) で、同じバッチの同 SKU が欠品 (残りあり) だった
+ *   なら、棚に無かったのであってピッカーの取り忘れではない → `stockout` として数え、ミスから除く
+ *
+ * @returns {{ since, until, minLines,
+ *   byWorker: [{worker, name, lines, total, shortage, excess, wrong_item, qty, stockout, per1000, provisional}],
+ *   total: {lines, total, shortage, excess, wrong_item, qty, stockout, per1000} }}
+ */
+/** ミス率の分母: 期間内の完了バッチ (有効・再ピック以外) の**全明細** — 速さ統計と違い、表示/完了時刻が
+ *  無い明細も数える (Codex R5: loadStatsLines は時刻のある明細だけなので分母が小さくなりミス率が過大になる)。
+ *  作業者の帰属は loadStatsLines と同じ (その明細の最後の next/shortage の担当 → 無ければバッチ担当)。 */
+function loadMissDenominator(since, until) {
+  return getDB().prepare(`
+    SELECT COALESCE(
+        (SELECT e.worker FROM pk_events e
+          WHERE e.batch_id = l.batch_id AND e.line_seq = l.seq AND e.event IN ('next','shortage')
+          ORDER BY e.id DESC LIMIT 1),
+        b.worker
+      ) AS worker, COUNT(*) AS n
+    FROM pk_lines l
+    JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.work_date >= ? AND b.work_date <= ?
+      AND b.validity = 'valid' AND b.status = 'done' AND b.origin != 'repick'
+    GROUP BY worker
+  `).all(since, until);
+}
+
 export function getMissStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
   const db = getDB();
-  const since = new Date(Date.parse(`${until}T00:00:00Z`) - (days - 1) * 864e5).toISOString().slice(0, 10);
-  // created_at は UTC → JST日付境界に変換して窓を切る (統計画面と同じ期間感覚)
-  const startUtc = new Date(`${since}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
-  const endUtc = new Date(new Date(`${until}T00:00:00+09:00`).getTime() + 864e5).toISOString().slice(0, 19) + 'Z';
-  const empty = { total: 0, shortage: 0, excess: 0, wrong_item: 0, qty: 0 };
+  const { since, until: to } = statsRange(until, days);
+  const empty = () => ({ lines: 0, total: 0, shortage: 0, excess: 0, wrong_item: 0, qty: 0, stockout: 0, per1000: null });
+  const map = new Map();
+  const ensure = (worker) => {
+    if (!map.has(worker)) map.set(worker, { worker, name: displayWorkerName(worker), ...empty() });
+    return map.get(worker);
+  };
+  // 分母: 期間内にピッキングした明細数 (作業者は明細単位の帰属 = 速さ統計と同じ。時刻の無い明細も含む)
+  for (const r of loadMissDenominator(since, to)) ensure(r.worker || '(不明)').lines += r.n;
+
+  // 確定ミスを、対応するピッキングバッチ (取込時の突合 pk_batch_id を優先。無ければ tb_no = tb_key の有効な最新・
+  // 再ピックバッチは除く — 同じ tb_no の再取込で別バッチへ誤帰属しないため Codex R4) と受注番号つきで読む。
+  // packing のテーブルが無い環境 (picking 単独) では incident だけ読む
+  let rows = [];
   try {
-    const rows = db.prepare(`
-      SELECT COALESCE(attributed_worker, '(担当不明)') AS worker, kind, COUNT(*) AS cnt, SUM(qty) AS qty
-      FROM pk_pack_incidents
-      WHERE status = 'confirmed' AND created_at >= ? AND created_at < ?
-      GROUP BY worker, kind
-    `).all(startUtc, endUtc);
-    const map = new Map();
-    const total = { ...empty };
-    for (const r of rows) {
-      if (!map.has(r.worker)) map.set(r.worker, { worker: r.worker, ...empty });
-      const w = map.get(r.worker);
-      w[r.kind] = (w[r.kind] || 0) + r.cnt;
-      w.total += r.cnt;
-      w.qty += r.qty || 0;
-      total[r.kind] = (total[r.kind] || 0) + r.cnt;
-      total.total += r.cnt;
-      total.qty += r.qty || 0;
-    }
-    return { since, until, byWorker: [...map.values()].sort((a, b) => b.total - a.total), total };
+    rows = db.prepare(`
+      SELECT i.id, i.kind, i.qty, i.sku, i.attributed_worker, i.created_at,
+        COALESCE(pb.pk_batch_id,
+          (SELECT b.id FROM pk_batches b WHERE b.tb_no = pb.tb_key AND b.origin != 'repick' AND b.validity = 'valid'
+             ORDER BY b.id DESC LIMIT 1)) AS pk_batch_id,
+        s.ne_slip_no
+      FROM pk_pack_incidents i
+      LEFT JOIN pk_pack_batches pb ON pb.id = i.batch_id
+      LEFT JOIN pk_pack_slips s ON s.batch_id = i.batch_id AND s.seq = i.slip_seq
+      WHERE i.status = 'confirmed'
+      ORDER BY i.id
+    `).all();
   } catch (e) {
-    // テーブル未作成 (packing未初期化環境) のみ空扱い。それ以外のDB障害は隠さず投げる
-    // (Codex: 包括catchだと障害時に「ミス0件」という誤った正常値を表示してしまう)
     if (/no such table: pk_pack_incidents/.test(String(e.message))) {
-      return { since, until, byWorker: [], total: empty };
+      rows = [];
+    } else if (/no such table/.test(String(e.message))) {
+      rows = db.prepare(`SELECT id, kind, qty, sku, attributed_worker, created_at, NULL AS pk_batch_id, NULL AS ne_slip_no
+        FROM pk_pack_incidents WHERE status = 'confirmed' ORDER BY id`).all();
+    } else {
+      throw e;   // それ以外のDB障害は隠さず投げる (Codex: 「ミス0件」という誤った正常値を出さない)
     }
-    throw e;
   }
+  const qBatch = db.prepare('SELECT work_date, worker FROM pk_batches WHERE id = ?');
+  const qLineWorker = db.prepare(`
+    SELECT e.worker FROM pk_events e
+    JOIN pk_lines l ON l.batch_id = e.batch_id AND l.seq = e.line_seq
+    WHERE l.batch_id = ? AND LOWER(TRIM(l.sku)) = ? AND e.event IN ('next','shortage')
+    ORDER BY e.id DESC LIMIT 1`);
+  const qAlloc = db.prepare(`SELECT 1 FROM pk_shortage_allocations
+    WHERE batch_id = ? AND ne_slip_no = ? AND LOWER(TRIM(sku)) = ? LIMIT 1`);
+  const qAnyAlloc = db.prepare('SELECT 1 FROM pk_shortage_allocations WHERE batch_id = ? LIMIT 1');
+  const qShortLine = db.prepare(`SELECT 1 FROM pk_lines
+    WHERE batch_id = ? AND LOWER(TRIM(sku)) = ? AND status = 'shortage' AND COALESCE(remaining_qty, shortage_qty, 0) > 0 LIMIT 1`);
+  const jstDateOf = (iso) => new Date(Date.parse(iso) + 9 * 3600 * 1000).toISOString().slice(0, 10);
+
+  const total = empty();
+  for (const r of rows) {
+    const skuN = String(r.sku ?? '').trim().toLowerCase();
+    const pb = r.pk_batch_id != null ? qBatch.get(r.pk_batch_id) : null;
+    const day = pb?.work_date ?? jstDateOf(r.created_at);
+    if (day < since || day > to) continue;
+    let worker = null;
+    let stockout = false;
+    if (pb) {
+      worker = qLineWorker.get(r.pk_batch_id, skuN)?.worker ?? pb.worker ?? null;
+      if (r.kind === 'shortage') {
+        stockout = (r.ne_slip_no != null && qAlloc.get(r.pk_batch_id, r.ne_slip_no, skuN) != null)
+          || (qAnyAlloc.get(r.pk_batch_id) == null && qShortLine.get(r.pk_batch_id, skuN) != null);
+      }
+    }
+    const w = ensure(worker ?? r.attributed_worker ?? '(担当不明)');
+    if (stockout) { w.stockout++; total.stockout++; continue; }   // 欠品 = ミスではない
+    w[r.kind] = (w[r.kind] || 0) + 1;
+    w.total++;
+    w.qty += r.qty || 0;
+    total[r.kind] = (total[r.kind] || 0) + 1;
+    total.total++;
+    total.qty += r.qty || 0;
+  }
+  for (const w of map.values()) {
+    total.lines += w.lines;
+    w.per1000 = w.lines > 0 ? Math.round((w.total / w.lines) * 10000) / 10 : null;
+    w.provisional = w.lines < STATS_MIN_LINES;
+  }
+  total.per1000 = total.lines > 0 ? Math.round((total.total / total.lines) * 10000) / 10 : null;
+  // 並び = 比率の高い順 (分母ゼロは後ろ・件数順)。同率は件数順
+  const byWorker = [...map.values()].sort((a, b) => {
+    if ((b.per1000 ?? -1) !== (a.per1000 ?? -1)) return (b.per1000 ?? -1) - (a.per1000 ?? -1);
+    return b.total - a.total;
+  });
+  return { since, until: to, minLines: STATS_MIN_LINES, byWorker, total };
 }
