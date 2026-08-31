@@ -288,6 +288,30 @@ console.log('\n── モール別の配送関係費 (既存の送料マスタ�
     182, 'マスタが無ければ商品マスタの値 (fail-soft)');
 }
 
+console.log('\n── ★行データまで配送関係費が届いているか (配線の抜けを検知する) ──');
+{
+  // 単体では正しく引けていても、行に載せ忘れると画面は商品マスタの値のまま。
+  // 2026-08-31 に実際その抜けがあった (mirror には 25 行あるのに Yahoo が 182円 のままだった)
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('ship-nk', 'ネコポス確認用', '単品', '取扱中', 700, 210, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
+  const { rows } = await buildPreviewRows(db, ['ship-nk'], new Map(), {
+    fetchAllItemCodes: async () => ({}),
+    fetchItemDetailsBulkDetailed: async () => ({ items: [], failed: [] }),
+    fetchYahooItemDetail: async (c) => ({
+      ok: true, ItemCode: c, Name: 'Y', Price: 698, SubCodes: [],
+      Delivery: '1', PostageSet: '6', ShipWeight: null,   // 6 = ネコポス
+    }),
+  });
+  const y = rows.find((r) => r.mall === 'yahoo');
+  eq([y.shipping, y.shippingSource, y.shippingLabel], [237, 'mall', 'ネコポス'],
+    '★Yahoo行の shipping が ネコポス 237円 になっている (商品マスタの182円ではない)');
+  eq(y.productShipping, 182, '商品マスタの送料も参考として持つ');
+  // 粗利もその送料で計算されていること
+  const ev = evaluateRows([{ ...y, newPrice: 800, selected: true }])[0].evaluation;
+  // 800 - 231(原価税込) - 80(手数料10%) - 237(ネコポス) = 252
+  eq(ev.estimate.gross, 800 - 231 - 80 - 237, '★粗利もネコポスの送料で計算される');
+}
+
 console.log('\n── 配送方法の番号 → 名前 ──');
 {
   eq(rakutenShippingLabel(1), '1 (定形外)', '楽天 1 = 定形外');
