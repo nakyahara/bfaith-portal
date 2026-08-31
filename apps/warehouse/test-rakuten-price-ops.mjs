@@ -144,6 +144,17 @@ console.log('\n── 受領台帳 (冪等) ──');
   const conflictReplay = replayOf(getOperation(db, 'op-0003-abcdef'));
   eq(conflictReplay.state, 'conflict', '★conflict の再送は conflict のまま (成功にしない)');
 
+  // ★request_hash 列を足す前の行 (hash が NULL) でも検査が効くこと
+  receiveOperation(db, { operationId: 'op-0005-abcdef', manageNumber: 'mn-1', request: req });
+  db.prepare('UPDATE rakuten_price_ops SET request_hash = NULL WHERE operation_id = ?').run('op-0005-abcdef');
+  const legacyOther = receiveOperation(db, {
+    operationId: 'op-0005-abcdef', manageNumber: 'mn-1',
+    request: { expected: { 360: 577 }, prices: { 360: 888 } },
+  });
+  eq(!!legacyOther.reused, true, '★hash が無い古い行でも、別の依頼なら拒否する');
+  const legacySame = receiveOperation(db, { operationId: 'op-0005-abcdef', manageNumber: 'mn-1', request: req });
+  eq(!!legacySame.reused, false, 'hash が無い古い行でも、同じ依頼なら replay');
+
   // 同時受領: 片方だけが fresh になる (主キー違反で落ちない)
   const a = receiveOperation(db, { operationId: 'op-0004-abcdef', manageNumber: 'mn-1', request: req });
   const b = receiveOperation(db, { operationId: 'op-0004-abcdef', manageNumber: 'mn-1', request: req });

@@ -722,10 +722,25 @@ router.patch('/items/manage-numbers/:manageNumber/prices', requireWrite, rateLim
   }
 
   const received = receiveOperation(opsDb, { operationId, runId, manageNumber: mn, request: { expected, prices } });
+  if (received.reused) {
+    // 同じ operation_id で別の依頼が来た。前回結果を返すと「更新していないのに成功」になる
+    console.error(`[rakuten-rms] price operation_id 使い回し op=${operationId} mn=${mn}`);
+    return errorResponse(res, {
+      status: 409, error: 'OPERATION_ID_REUSED',
+      message: 'この operation_id は別の依頼で使われています。新しい ID で送り直してください',
+      requestId: req.requestId,
+    });
+  }
   if (!received.fresh) {
     const r = replayOf(received.row);
-    console.log(`[rakuten-rms] price replay op=${operationId} state=${r.state}`);
-    return res.status(r.state === 'unknown' ? 409 : 200).json({ ok: r.state !== 'unknown' && r.state !== 'failed', replay: true, state: r.state, result: r.result });
+    // ★状態ごとに初回と同じ扱いにする。conflict を 200/ok:true で返すと、
+    //   呼び出し側が「適用済み」と誤って確定する
+    const status = { applied: 200, noop: 200, conflict: 409, failed: 502, unknown: 409 }[r.state] ?? 409;
+    console.log(`[rakuten-rms] price replay op=${operationId} state=${r.state} status=${status}`);
+    return res.status(status).json({
+      ok: r.state === 'applied' || r.state === 'noop',
+      replay: true, state: r.state, result: r.result,
+    });
   }
 
   try {

@@ -166,12 +166,21 @@ export function receiveOperation(db, { operationId, runId, manageNumber, request
   if (info.changes === 1) return { fresh: true };
 
   const row = getOperation(db, operationId);
+  if (!row) return { fresh: false, reused: true, row: null };
   // ★同じ operation_id で**別の依頼**が来た = ID の使い回し/衝突。前回結果を返すと
-  //   「更新していないのに成功」と記録される。実行も replay もせず拒否する
-  if (!row || (row.request_hash && row.request_hash !== hash)) {
-    return { fresh: false, reused: true, row: row || null };
-  }
+  //   「更新していないのに成功」と記録される。実行も replay もせず拒否する。
+  //   request_hash 列を足す前の行は hash が NULL なので、保存してある依頼から計算し直して比べる
+  //   (NULL を「一致」とみなすと、古い行に対しては検査が丸ごと効かない)
+  const storedHash = row.request_hash || requestHash({
+    manageNumber: row.manage_number,
+    request: safeParse(row.request_json),
+  });
+  if (storedHash !== hash) return { fresh: false, reused: true, row };
   return { fresh: false, row };
+}
+
+function safeParse(json) {
+  try { return JSON.parse(json || 'null'); } catch { return null; }
 }
 
 /** 依頼の同一性を見るためのハッシュ (キー順に依存しない正規形から作る) */
