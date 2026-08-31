@@ -19,6 +19,7 @@
  */
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
 /** 楽天APIの許容上限。0円は 204 で通ってしまうので下限は 1 円 */
@@ -137,11 +138,14 @@ export function createPriceOpsTables(db) {
     run_id         TEXT,
     manage_number  TEXT NOT NULL,
     request_json   TEXT NOT NULL,
+    request_hash   TEXT,                  -- 同じ operation_id で別の依頼が来ていないかの照合用
     received_at    TEXT NOT NULL,
     result_state   TEXT,                  -- 'applied' | 'noop' | 'conflict' | 'failed'
     result_json    TEXT,
     completed_at   TEXT
   )`);
+  // 既存DBへの列追加 (再起動で自動的に整う)
+  try { db.exec('ALTER TABLE rakuten_price_ops ADD COLUMN request_hash TEXT'); } catch { /* 既にある */ }
   db.exec('CREATE INDEX IF NOT EXISTS idx_rpo_run ON rakuten_price_ops(run_id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_rpo_mn ON rakuten_price_ops(manage_number, received_at)');
   return db;
@@ -152,13 +156,35 @@ export function createPriceOpsTables(db) {
  * @returns {{fresh:true} | {fresh:false, row:object}} fresh=false なら同じ operation_id が既にある
  */
 export function receiveOperation(db, { operationId, runId, manageNumber, request }) {
-  const existing = db.prepare('SELECT * FROM rakuten_price_ops WHERE operation_id = ?').get(operationId);
-  if (existing) return { fresh: false, row: existing };
-  db.prepare(`INSERT INTO rakuten_price_ops
-      (operation_id, run_id, manage_number, request_json, received_at)
-      VALUES (?,?,?,?,?)`)
-    .run(operationId, runId ?? null, manageNumber, JSON.stringify(request), new Date().toISOString());
-  return { fresh: true };
+  const hash = requestHash({ manageNumber, request });
+  // ★SELECT→INSERT だと同時受領で主キー違反になる。INSERT の結果で受領できたかを判断する
+  const info = db.prepare(`INSERT INTO rakuten_price_ops
+      (operation_id, run_id, manage_number, request_json, request_hash, received_at)
+      VALUES (?,?,?,?,?,?)
+      ON CONFLICT(operation_id) DO NOTHING`)
+    .run(operationId, runId ?? null, manageNumber, JSON.stringify(request), hash, new Date().toISOString());
+  if (info.changes === 1) return { fresh: true };
+
+  const row = getOperation(db, operationId);
+  // ★同じ operation_id で**別の依頼**が来た = ID の使い回し/衝突。前回結果を返すと
+  //   「更新していないのに成功」と記録される。実行も replay もせず拒否する
+  if (!row || (row.request_hash && row.request_hash !== hash)) {
+    return { fresh: false, reused: true, row: row || null };
+  }
+  return { fresh: false, row };
+}
+
+/** 依頼の同一性を見るためのハッシュ (キー順に依存しない正規形から作る) */
+export function requestHash({ manageNumber, request }) {
+  const norm = (o) => Object.fromEntries(
+    Object.keys(o || {}).sort().map((k) => [k, toIntPrice(o[k]) ?? o[k]])
+  );
+  const canonical = JSON.stringify({
+    mn: String(manageNumber || '').trim().toLowerCase(),
+    expected: norm(request?.expected),
+    prices: norm(request?.prices),
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 32);
 }
 
 /** 結果を記録する (受領済みの行に追記する。上書きはしない) */

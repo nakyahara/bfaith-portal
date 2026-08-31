@@ -121,6 +121,34 @@ console.log('\n── 受領台帳 (冪等) ──');
   completeOperation(db, 'op-0001-abcdef', 'failed', { error: 'X' });
   eq(getOperation(db, 'op-0001-abcdef').result_state, 'applied', '★確定した結果は後から書き換わらない');
 
+  // ★同じ operation_id で別の依頼が来たら、前回結果を返さず拒否する (ID の使い回し・衝突)
+  const otherItem = receiveOperation(db, { operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-2', request: req });
+  eq([otherItem.fresh, otherItem.reused], [false, true], '同一ID + 別商品 は拒否');
+  const otherPrice = receiveOperation(db, {
+    operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-1',
+    request: { expected: { 360: 577 }, prices: { 360: 999 } },
+  });
+  eq([otherPrice.fresh, otherPrice.reused], [false, true], '同一ID + 別価格 は拒否');
+  const sameAgain = receiveOperation(db, { operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'mn-1', request: req });
+  eq([sameAgain.fresh, !!sameAgain.reused], [false, false], '同じ依頼なら replay として扱う');
+  // キーの順番が違うだけの同じ依頼は同一とみなす
+  const reordered = receiveOperation(db, {
+    operationId: 'op-0001-abcdef', runId: 'run-1', manageNumber: 'MN-1',
+    request: { prices: { 360: 620 }, expected: { 360: '577' } },
+  });
+  eq(!!reordered.reused, false, 'キー順・大小文字・文字列価格の違いは同じ依頼とみなす');
+
+  // conflict の replay は「成功」にしない (呼び出し側が適用済みと誤解しないため)
+  receiveOperation(db, { operationId: 'op-0003-abcdef', manageNumber: 'mn-1', request: req });
+  completeOperation(db, 'op-0003-abcdef', 'conflict', { code: 'CONFLICT' });
+  const conflictReplay = replayOf(getOperation(db, 'op-0003-abcdef'));
+  eq(conflictReplay.state, 'conflict', '★conflict の再送は conflict のまま (成功にしない)');
+
+  // 同時受領: 片方だけが fresh になる (主キー違反で落ちない)
+  const a = receiveOperation(db, { operationId: 'op-0004-abcdef', manageNumber: 'mn-1', request: req });
+  const b = receiveOperation(db, { operationId: 'op-0004-abcdef', manageNumber: 'mn-1', request: req });
+  eq([a.fresh, b.fresh], [true, false], '★同じIDの二重受領でも例外にならず、実行するのは1回だけ');
+
   db.close();
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* Windows のロック残りは無視 */ }
 }
