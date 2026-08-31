@@ -169,6 +169,21 @@ t('登録済みでスキップした納品のCSV行は「見つかりません�
   assert.ok(problems.some((p) => /FBA15MISSING.*見つかりません/.test(p)), problems.join(' / '));
 });
 
+t('🚨投入できない納品 (skipReason付き) のCSV行も「見つかりません」と騒がない', () => {
+  // 🚨これが無いと、記入欄が無い納品1件のせいで**その日の全件が中断**する。
+  //   納品側 (targets から外す) とCSV側 (orphan にしない) の両方をやらないと意味が無い
+  const ships = [{ ...SHIPMENTS[0], skipReason: 'Amazon側に追跡番号の記入欄がありません' }];
+  const { rows } = parseTrackingCsv(csv([
+    row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+  ]));
+  const { problems, skipped, assignments } = buildAssignments(rows, ships);
+  assert.equal(assignments.length, 0, '投入対象にはしない');
+  assert.equal(skipped[0].shipmentConfirmationId, 'FBA15GGL5J2X');
+  assert.match(skipped[0].reason, /記入欄/);
+  assert.equal(skipped[0].needsManual, true);
+  assert.deepEqual(problems, [], problems.join(' / '));
+});
+
 t('🚨同じ送り状番号が別の宛先に現れたら取り違えを疑う', () => {
   const { rows } = parseTrackingCsv(csv([
     row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
