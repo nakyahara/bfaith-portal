@@ -137,9 +137,9 @@ export const GENERATION_BLOCK_REASON_MAX = 1000;
  * (自由記述だけだと集計できない)。補足は checking_note に書く。
  */
 export const CHECKING_REASONS = [
-  { code: 'package_label', label: 'パッケージ裏面の確認待ち', hint: '成分表示・原材料など、実物を見ないと埋まらない項目がある' },
+  { code: 'package_label', label: 'パッケージ裏面の確認待ち', hint: '自社商品の成分表示・原材料など、実物を見ないと埋まらない項目がある' },
   { code: 'no_web_info', label: 'ウェブに情報が無い', hint: 'メーカー・仕入先へ問い合わせ中' },
-  { code: 'share_info', label: '担当者と共有・相談中', hint: 'どういう商品かを担当者とすり合わせている' },
+  { code: 'share_info', label: '仕入れ担当と共有・相談中', hint: 'どういう商品なのかを仕入れ担当とすり合わせている' },
   { code: 'other', label: 'その他', hint: '' },
 ];
 export const CHECKING_REASON_CODES = new Set(CHECKING_REASONS.map((r) => r.code));
