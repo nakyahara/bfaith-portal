@@ -3345,6 +3345,110 @@ let wfSetParentId = null;
       // 残ると、あとでその列を並べ替えたとき見えないカードとして差し込み位置を押し下げる)
       check('並び順: 実際の列と食い違う記録はボード表示時に消える',
         db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER'`).get().n === 0);
+
+      // 確認中は手動順より上 (2026-08-31 / Codex R1)。「情報待ちが埋もれる」が要望の本体なので、
+      // 以前その列で手で決めた位置より優先する。手で最後尾に置いたカードを確認中にして確かめる
+      {
+        const again = await call('POST', '/api/board/reorder', {
+          view: 'main', col: colCode, items: wanted.map((id) => ({ id })),
+        });
+        check('確認中: 手動順の再保存 (前提)', again.status === 200);
+        const lastId = wanted[wanted.length - 1];
+        dbmod.setDraftChecking(db, lastId, { reasonCode: 'no_web_info', actor: 'smoke' });
+        const bChk = wfp.boardData(db, {});
+        const colChk = colOf(bChk, colCode);
+        check('確認中: 手で最後尾に置いたカードでも、確認中にしたら列の先頭に来る',
+          colChk && colChk.cards[0].id === lastId,
+          colChk ? colChk.cards.map((c) => `${c.id}${c.checking ? '(確認中)' : ''}`).join(',') : '(列が無い)');
+        dbmod.clearDraftChecking(db, lastId, { actor: 'smoke' });
+        const bBack = wfp.boardData(db, {});
+        check('確認中: 解除すると手で並べた順に戻る (手動順を壊さない)',
+          colOf(bBack, colCode).cards.map((c) => c.id).join(',') === wanted.join(','),
+          colOf(bBack, colCode).cards.map((c) => c.id).join(','));
+      }
+
+      // 完了列と画像ビューも同じ orderIn を通る (Codex R2 low: 本流の通常列でしか見ていなかった)
+      {
+        // 完了列の検証には完了カードが 2 枚要る。この時点では足りないので、既存 draft 2 件の
+        // 本流工程をその場で done にして作り、検証後に元の state へ戻す
+        // (「前提が無いので黙って skip」にすると、テストがあるのに何も検証していない状態になる)
+        const mainCodes = db.prepare(`SELECT code FROM ph_steps WHERE track = 'main' AND active = 1`).all().map((x) => x.code);
+        const donors = db.prepare(`SELECT id FROM product_drafts WHERE status NOT IN ('on_hold','excluded')
+          ORDER BY id LIMIT 2`).all().map((x) => x.id);
+        const savedStates = donors.length === 2
+          ? db.prepare(`SELECT draft_id, step_code, state FROM draft_step_progress
+              WHERE draft_id IN (${donors.join(',')})`).all()
+          : [];
+        if (donors.length === 2) {
+          db.prepare(`UPDATE draft_step_progress SET state = 'done'
+            WHERE draft_id IN (${donors.join(',')})
+              AND step_code IN (${mainCodes.map(() => '?').join(',')})`).run(...mainCodes);
+        }
+        const bD = wfp.boardData(db, {});
+        check('確認中: 完了列の検証の前提 (完了カードを 2 枚用意できた)', bD.doneCards.length >= 2,
+          `done=${bD.doneCards.length}`);
+        if (bD.doneCards.length >= 2) {
+          const doneIds = bD.doneCards.map((c) => c.id);
+          const wantedDone = [...doneIds.slice(1), doneIds[0]];
+          await call('POST', '/api/board/reorder', {
+            view: 'main', col: 'done', items: wantedDone.map((id) => ({ id })),
+          });
+          const lastDone = wantedDone[wantedDone.length - 1];
+          dbmod.setDraftChecking(db, lastDone, { reasonCode: 'other', actor: 'smoke' });
+          check('確認中: 完了列でも手動順より上に来る',
+            wfp.boardData(db, {}).doneCards[0].id === lastDone,
+            wfp.boardData(db, {}).doneCards.map((c) => `${c.id}${c.checking ? '(確認中)' : ''}`).join(','));
+          dbmod.clearDraftChecking(db, lastDone, { actor: 'smoke' });
+          check('確認中: 完了列も解除で手動順に戻る',
+            wfp.boardData(db, {}).doneCards.slice(0, wantedDone.length).map((c) => c.id).join(',') === wantedDone.join(','),
+            wfp.boardData(db, {}).doneCards.map((c) => c.id).join(','));
+        }
+        // 工程を元に戻す (以降のテストに「勝手に完了した商品」を持ち込まない)
+        for (const s of savedStates) {
+          db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?')
+            .run(s.state, s.draft_id, s.step_code);
+        }
+        for (const id of donors) wfp.recomputeDraftStatus(db, id, { actor: 'smoke' });
+        // 画像ビュー: カード = 商品×種別。同じ商品の TOP/詳細 が**それぞれの列で**先頭に来る
+        const bI = wfp.boardData(db, { view: 'image' });
+        const imgCol = bI.columns.find((c) => c.cards.length >= 2);
+        // 前提も check にする (Codex R3): fixture が変わって「2枚以上ある画像列」が消えたとき、
+        // 黙って未実行のまま ALL PASS になると、検証しているつもりで何も見ていない状態になる
+        check('確認中: 画像ビューの検証の前提 (2枚以上あるカード列がある)', !!imgCol,
+          bI.columns.map((c) => `${c.code || c.key}:${c.cards.length}`).join(','));
+        if (imgCol) {
+          const imgIds = imgCol.cards.map((c) => `${c.id}|${c.kind}`);
+          const wantedImg = [...imgIds.slice(1), imgIds[0]];
+          await call('POST', '/api/board/reorder', {
+            view: 'image', col: imgCol.code || imgCol.key,
+            items: wantedImg.map((k) => ({ id: Number(k.split('|')[0]), kind: k.split('|')[1] })),
+          });
+          const lastImg = wantedImg[wantedImg.length - 1];
+          const lastImgId = Number(lastImg.split('|')[0]);
+          dbmod.setDraftChecking(db, lastImgId, { reasonCode: 'other', actor: 'smoke' });
+          const afterImg = wfp.boardData(db, { view: 'image' });
+          const colAfter = afterImg.columns.find((c) => (c.code || c.key) === (imgCol.code || imgCol.key));
+          // 確認中は**商品**に付くフラグなので、画像ビューでは同じ商品の TOP と詳細が
+          // 両方とも確認中カードになる。「その 1 枚が先頭」ではなく
+          // 「確認中のカードが全部、通常のカードより前にいて、そこに対象が居る」で見る
+          check('確認中: 画像ビューでも手動順より上に来る (同じ商品の TOP/詳細 が揃って先頭グループ)', (() => {
+            if (!colAfter) return false;
+            const flags = colAfter.cards.map((c) => !!c.checking);
+            const lastChk = flags.lastIndexOf(true);
+            const firstNormal = flags.indexOf(false);
+            if (lastChk < 0) return false;                                  // 確認中が 1 枚も無い
+            if (firstNormal >= 0 && lastChk > firstNormal) return false;    // 通常カードに割り込まれている
+            return colAfter.cards.map((c) => `${c.id}|${c.kind}`).indexOf(lastImg) <= lastChk;
+          })(),
+            colAfter ? colAfter.cards.map((c) => `${c.id}|${c.kind}${c.checking ? '(確認中)' : ''}`).join(',') : '(列が無い)');
+          dbmod.clearDraftChecking(db, lastImgId, { actor: 'smoke' });
+          const backImg = wfp.boardData(db, { view: 'image' })
+            .columns.find((c) => (c.code || c.key) === (imgCol.code || imgCol.key));
+          check('確認中: 画像ビューも解除で id|kind ごとの手動順に戻る',
+            backImg.cards.map((c) => `${c.id}|${c.kind}`).join(',') === wantedImg.join(','),
+            backImg.cards.map((c) => `${c.id}|${c.kind}`).join(','));
+        }
+      }
       // 後片付け (以降の並び検証に影響させない)
       db.prepare(`DELETE FROM ph_board_order`).run();
     }
@@ -3408,6 +3512,11 @@ let wfSetParentId = null;
       && backLink.backLinkOf({ back: 'v=board&view=//evil.example.com' }).url === '/apps/product-hub/board');
     check('戻り先: 種別は画像ビューのときだけ効く',
       backLink.backLinkOf({ back: 'v=board&kind=detail' }).url === '/apps/product-hub/board');
+    check('戻り先: filter=checking も復元される (確認中で絞った画面に戻す — 2026-08-31)',
+      backLink.backLinkOf({ back: 'v=board&filter=checking' }).url === '/apps/product-hub/board?filter=checking',
+      backLink.backLinkOf({ back: 'v=board&filter=checking' }).url);
+    check('戻り先: 未知の filter は落とす',
+      backLink.backLinkOf({ back: 'v=board&filter=whatever' }).url === '/apps/product-hub/board');
     // ボードのカードリンクに戻り先の印が付いている (これが無いと詳細から一覧に戻ってしまう)
     const boardHtml = await (await fetch(base + '/board?view=image&kind=top')).text();
     check('戻り先: ボードのカードリンクに back= が付く',
@@ -4120,9 +4229,119 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
   r = await callPh('POST', `/api/drafts/${gdraft3.id}/ai-outputs`, { kind: 'yahoo_title', content: 'お'.repeat(65) });
   check('文字数 (人の手直し): 65 字は通る', r.status === 200);
 
+  // ─── 確認中 (2026-08-31 スタッフ要望): 情報待ちの印。工程も status も動かさず、
+  //     カードにラベルが出て AI 生成キューからだけ外れる ───
+  db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = NULL,
+    generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { reason_code: 'package_label' });
+  check('確認中: on の指定なしは 400 (欠落を「解除」に倒さない)', r.status === 400, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: 'true', reason_code: 'package_label' });
+  check('確認中: on が文字列なら 400', r.status === 400);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'NOT_A_REASON' });
+  check('確認中: 未知の理由コードは 400 (画面が説明できない状態を作らない)', r.status === 400, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'package_label', note: '成分表示を実物で確認' });
+  check('確認中: 有効な理由なら立てられる', r.status === 200 && r.json.changed === true, JSON.stringify(r.json));
+  let rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  const checkingSince0 = rowC.checking_since;
+  check('確認中: 4列が揃って書かれ status は ready_for_ai のまま (工程導出を壊さない)',
+    rowC.checking_reason_code === 'package_label' && rowC.checking_note === '成分表示を実物で確認'
+    && rowC.checking_since && rowC.checking_by && rowC.status === 'ready_for_ai', JSON.stringify(rowC).slice(0, 200));
+
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runN', limit: 10 });
+  check('確認中: claim 候補から外れる (確認中に AI が原稿を書かない)', !r.json.drafts.some((d) => d.id === gdraft3.id));
+  // 「数え漏れ」でなく「claimable から checking へ 1 件移った」ことを見る (Codex R2 low:
+  // checking >= 1 だけだと claimable にも二重計上されている状態を見逃す)
+  {
+    const claimCols = `generation_claim_run_id = NULL, generation_claim_until = NULL`;
+    db.prepare(`UPDATE product_drafts SET checking_since = NULL, checking_reason_code = NULL,
+      checking_by = NULL, ${claimCols} WHERE id = ?`).run(gdraft3.id);
+    const qOff = dbmod.generationQueueSummary(db);
+    db.prepare(`UPDATE product_drafts SET checking_since = ?, checking_reason_code = 'package_label',
+      checking_by = 'smoke', ${claimCols} WHERE id = ?`).run(checkingSince0, gdraft3.id);
+    const qOn = dbmod.generationQueueSummary(db);
+    check('確認中: queue の内訳が claimable → checking へ 1 件移る (二重計上しない)',
+      qOn.checking === qOff.checking + 1 && qOn.claimable === qOff.claimable - 1 && qOn.blocked === qOff.blocked,
+      `off=${JSON.stringify(qOff)} on=${JSON.stringify(qOn)}`);
+  }
+  r = await call('GET', '/generation-queue');
+  check('確認中: GET 一覧からも消える', !r.json.drafts.some((d) => d.id === gdraft3.id));
+
+  // 生成中の run が居るまま確認中にしたら claim も解放する (Codex R1 medium)。
+  // 残すと、lease (30分) の内に人が解除した場合だけ古い run が結果を書き戻せる。
+  // (理由を変える = changed:true の更新でも claim が落ちること。checking_since は維持されること)
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runRace',
+    generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'share_info', note: '成分表示を実物で確認' });
+  const rowRace = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 立てると走っていた実行の claim も解放される (解除直後に古い結果が書かれない)',
+    rowRace.generation_claim_run_id == null && rowRace.generation_claim_until == null
+    && rowRace.checking_since === checkingSince0,
+    `${rowRace.generation_claim_run_id} / ${rowRace.generation_claim_until} / ${rowRace.checking_since}`);
+
+  // 書き込みロックのレース: claim 済みの生成が走っている最中に人が確認中にしたら結果は書かせない
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runN', generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  check('確認中: acquireGenerationWriteLock は書き込み権を渡さない',
+    dbmod.acquireGenerationWriteLock(db, gdraft3.id, 'runN') === false);
+  const aiCountBefore = db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c;
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runN', outputs: SIX, advance: true });
+  check('確認中: ai-outputs は 409 で 1 バイトも書かれない', r.status === 409
+    && db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c === aiCountBefore,
+    JSON.stringify(r.json));
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'share_info', note: '成分表示を実物で確認' });
+  check('確認中: 同じ理由・同じ補足の再送は changed:false (ログを無駄に増やさない)',
+    r.status === 200 && r.json.changed === false, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'no_web_info', note: 'メーカーに問い合わせ中' });
+  rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 理由を変えても checking_since は進まない (何日待っているかを見失わない)',
+    r.status === 200 && rowC.checking_reason_code === 'no_web_info' && rowC.checking_since === checkingSince0,
+    `${rowC.checking_since} vs ${checkingSince0}`);
+
+  // ボード表示: ラベル・並び順・絞り込み
+  {
+    const bC = wfp.boardData(db, {});
+    const cardC = bC.columns.flatMap((c) => c.cards).concat(bC.doneCards).find((c) => c.id === gdraft3.id);
+    check('確認中: ボードのカードに理由ラベルと経過日数が乗る',
+      !!cardC?.checking && cardC.checking.label === 'ウェブに情報が無い' && typeof cardC.checking.days === 'number',
+      JSON.stringify(cardC?.checking));
+    check('確認中: checkingTotal に数えられる', bC.checkingTotal >= 1, String(bC.checkingTotal));
+    const colOfC = bC.columns.find((c) => c.cards.some((x) => x.id === gdraft3.id));
+    check('確認中: カードは列の先頭に並ぶ (他のカードに埋もれない)',
+      !colOfC || colOfC.cards[0].id === gdraft3.id,
+      colOfC ? colOfC.cards.map((x) => x.id).join(',') : '(完了列)');
+    const bOnly = wfp.boardData(db, { checkingOnly: true });
+    const idsOnly = bOnly.columns.flatMap((c) => c.cards).concat(bOnly.doneCards).map((c) => c.id);
+    check('確認中: filter=checking で確認中だけに絞れる',
+      idsOnly.includes(gdraft3.id) && idsOnly.length >= 1
+      && db.prepare(`SELECT COUNT(*) AS c FROM product_drafts WHERE id IN (${idsOnly.join(',') || 'NULL'}) AND checking_since IS NULL`).get().c === 0,
+      idsOnly.join(','));
+    // 絞り込み中でも総数を出す (0 と出ると確認中が無いように見えて入口が消える)
+    const bUn = wfp.boardData(db, { unassignedOnly: true });
+    check('確認中: 別の絞り込み中でも checkingTotal は総数のまま', bUn.checkingTotal >= 1, String(bUn.checkingTotal));
+  }
+
+  // 解除
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: false });
+  check('確認中: 解除できる', r.status === 200 && r.json.changed === true, JSON.stringify(r.json));
+  rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 解除で 4列すべて NULL に戻る',
+    rowC.checking_reason_code == null && rowC.checking_note == null
+    && rowC.checking_since == null && rowC.checking_by == null);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: false });
+  check('確認中: 二重解除は changed:false (エラーにしない — 押し直しで詰まらせない)',
+    r.status === 200 && r.json.changed === false, JSON.stringify(r.json));
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runO', limit: 10 });
+  check('確認中: 解除後は次の claim で拾える (解除 = キューに戻すだけ)', r.json.drafts.some((d) => d.id === gdraft3.id));
+  const evCK = db.prepare(`SELECT event FROM draft_events WHERE draft_id = ?
+    AND event IN ('checking_on','checking_updated','checking_off') ORDER BY id`).all(gdraft3.id).map((e) => e.event);
+  check('確認中: 監査ログが on → updated (理由変更 2 回) → off で残る (誰が何を待たせたかを追える)',
+    evCK.join(',') === 'checking_on,checking_updated,checking_updated,checking_off', evCK.join(','));
+
   // 後始末
   db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL,
-    generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL
+    generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL,
+    checking_reason_code = NULL, checking_note = NULL, checking_since = NULL, checking_by = NULL
     WHERE id IN (?, ?, ?)`).run(gdraft.id, gdraft2.id, gdraft3.id);
   server.close();
 }
@@ -4461,18 +4680,34 @@ renders.push(
       ...d0[2],
       pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
     }]);
+    // 確認中 (2026-08-31): 立っているとき = 青いバナー + 解除ボタン、
+    // 立っていないとき = 折りたたみの「確認中にする」(既定の detail fixture 側で描かれる)
+    renders.push(['detail.ejs (確認中)', 'detail.ejs', {
+      ...d0[2],
+      draft: {
+        ...d0[2].draft,
+        checking_reason_code: 'package_label', checking_note: '裏面の成分表示を確認',
+        checking_since: '2026-08-25T00:00:00.000Z', checking_by: 'smoke@b-faith.biz',
+      },
+    }]);
   }
 }
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
+// 確認中 (2026-08-31) のラベルを実際に描かせるため、ボード用の fixture を作る間だけ 1 件立てる
+dbmod.setDraftChecking(db, wfDraftId, { reasonCode: 'package_label', note: '裏面の成分表示を確認', actor: 'smoke' });
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
-  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, imageKind: null,
+  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, checkingOnly: false, imageKind: null,
   stepStateLabels: wfp.STEP_STATE_LABELS,
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
+  ['board.ejs (確認中で絞り込み)', 'board.ejs', {
+    ...boardBase, checkingOnly: true,
+    board: wfp.boardData(db, { checkingOnly: true, mallSummary: ms.mallSummaryFor }),
+  }],
   ['board.ejs (画像ビュー)', 'board.ejs', {
     ...boardBase, boardView: 'image',
     board: wfp.boardData(db, { view: 'image' }),
@@ -4484,7 +4719,7 @@ renders.push(
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
-    board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
+    board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
   }],
 );
 const renderedHtml = new Map();
@@ -4501,6 +4736,10 @@ for (const [name, file, data] of renders) {
         skuJans: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
+        checkingReasons: dbmod.CHECKING_REASONS,
+        checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
+        checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
@@ -4558,6 +4797,33 @@ for (const [name, file, data] of renders) {
     const td = (firstRow.match(/<td[\s>]/g) || []).length;
     return th > 0 && th === td;
   })());
+}
+
+// ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
+{
+  const bh = renderedHtml.get('board.ejs') || '';
+  check('ボード: 確認中のカードに理由ラベルが出る',
+    bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
+    bh.includes('kb-checking') ? 'ラベル文言が出ていない' : 'バッジ自体が無い');
+  check('ボード: 補足は title 属性に入る (カードを狭くしない)',
+    bh.includes('title="裏面の成分表示を確認"'));
+  check('ボード: 「🔍 確認中」チップが件数付きで出る',
+    /🔍 確認中 \d+/.test(bh), bh.includes('🔍 確認中') ? '件数が付いていない' : 'チップが無い');
+  const bhOnly = renderedHtml.get('board.ejs (確認中で絞り込み)') || '';
+  check('ボード: 確認中で絞ると そのチップだけが on になる',
+    /<a class="chip on"\s+href="[^"]*filter=checking/.test(bhOnly)
+    && !/<a class="chip on" href="\/apps\/product-hub\/board">/.test(bhOnly),
+    bhOnly.match(/<a class="chip on"[\s\S]{0,80}/g)?.join(' | ') || 'on のチップが無い');
+  const dh = renderedHtml.get('detail.ejs (確認中)') || '';
+  check('詳細: 確認中のバナーと解除ボタンが出る',
+    dh.includes('🔍 確認中: パッケージ裏面の確認待ち') && dh.includes('id="checking-clear-btn"')
+    && dh.includes('裏面の成分表示を確認'), dh.includes('checking-clear-btn') ? '文言が出ていない' : 'ボタンが無い');
+  const dh0 = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('詳細: 確認中でないときは「確認中にする」の入口だけ出る (解除ボタンは無い)',
+    dh0.includes('🔍 確認中にする') && dh0.includes('id="checking-set-btn"')
+    && !dh0.includes('id="checking-clear-btn"'));
+  // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
+  dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
 }
 
 // ─── EJS 内クライアントJSの構文チェック ───

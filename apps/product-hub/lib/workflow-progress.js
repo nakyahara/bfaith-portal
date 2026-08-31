@@ -14,7 +14,7 @@
  *     recomputeDraftStatus が再計算して書く。status 列を残すのは、AI キュー (ready_for_ai) の
  *     claim/lease と一覧タブが status を引き続き参照するため (実体化された導出値)
  */
-import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES } from '../db.js';
+import { getDB, logEvent, gateReasons, imageTrackV2At, MATERIAL_STATUS_LABELS, GENERATION_BLOCK_CODES, CHECKING_REASON_LABELS } from '../db.js';
 // モール定義は定義専用ファイルから取る (mall-status.js を import すると循環する)
 import { MALLS, LISTING_STEP_CODE as LISTING_STEP } from './malls-def.js';
 
@@ -460,6 +460,13 @@ function stalledDaysOf(rows, idx, createdAt) {
   if (!Number.isFinite(t)) return null;
   const days = Math.floor((Date.now() - t) / 86400000);
   return days >= row.stall_days ? days : null;
+}
+
+/** ISO 文字列から今日までの経過日数 (0 以上の整数)。パースできなければ null */
+function daysSinceIso(iso) {
+  const t = Date.parse(iso || '');
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.floor((Date.now() - t) / 86400000));
 }
 
 /** 画像種別の表示名。ph_steps.image_kind ('top'/'detail') に対応する */
@@ -1092,9 +1099,10 @@ export function saveBoardOrder(db, { view, col, items }) {
  * @param {'main'|'image'} opts.view 列の軸。main = 本流の工程、image = 画像の工程 (カードは 商品×種別)
  * @param {object} opts.assigneeId  この担当者のボールだけに絞る (null = 全部)
  * @param {boolean} opts.unassignedOnly 担当者が決まっていないカードだけ
- * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean}}
+ * @param {boolean} opts.checkingOnly 「確認中」のカードだけ (2026-08-31: 情報待ちの商品を拾う)
+ * @returns {{view: string, columns: Array, doneCards: Array, doneTotal: number, total: number, truncated: boolean, checkingTotal: number}}
  */
-export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
+export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly = false, checkingOnly = false, imageKind = null, limit = 800, mallSummary = null } = {}) {
   const steps = db.prepare(`
     SELECT code, label, track, image_kind, image_stage, sort, role_code, stall_days FROM ph_steps
     WHERE active = 1 ORDER BY track = 'image', sort, code
@@ -1155,6 +1163,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
       d.generation_block_code, d.generation_block_reason,
+      d.checking_reason_code, d.checking_note, d.checking_since,
       (SELECT workflow_state FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_workflow_state,
       (SELECT hold_note FROM draft_image_production ip WHERE ip.draft_id = d.id) AS image_hold_note,
       (SELECT material_status FROM draft_image_production ip WHERE ip.draft_id = d.id) AS material_status,
@@ -1165,6 +1174,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     FROM product_drafts d
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
+    ${checkingOnly ? 'AND d.checking_since IS NOT NULL' : ''}
     ${kindSafe === 'detail' ? 'AND d.detail_images_excluded = 0' : ''}
     ORDER BY d.updated_at DESC
     LIMIT ?
@@ -1246,6 +1256,15 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
       genBlockReason: d.generation_block_reason || null,
       genBlockLabel: d.generation_block_code
         ? (GENERATION_BLOCK_CODES[d.generation_block_code] || d.generation_block_code) : null,
+      // 確認中 (2026-08-31): 人が「情報待ち」で止めた印。genBlock と同じく列は変えずカードに出す。
+      // days = 確認中にしてから何日経ったか (何日も動いていないカードを見つけるため)
+      checking: d.checking_since ? {
+        code: d.checking_reason_code,
+        label: CHECKING_REASON_LABELS[d.checking_reason_code] || d.checking_reason_code || '確認中',
+        note: d.checking_note || null,
+        since: d.checking_since,
+        days: daysSinceIso(d.checking_since),
+      } : null,
     };
 
     if (view === 'image') {
@@ -1334,10 +1353,23 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     const m = manual.get(`${c.id}|${c.kind || ''}`);
     return m && m.col === colKey ? m.sort : null;
   };
-  const defaultOrder = (a, b) => ((b.kindStalledDays ?? b.stalledDays) || 0) - ((a.kindStalledDays ?? a.stalledDays) || 0) || a.id - b.id;
+  // 既定順は 停滞日数 → id。確認中どうしは「長く待っている順」(忘れられているものほど上)
+  const defaultOrder = (a, b) => {
+    if (a.checking && b.checking) {
+      const d = (b.checking.days || 0) - (a.checking.days || 0);
+      if (d !== 0) return d;
+    }
+    return ((b.kindStalledDays ?? b.stalledDays) || 0) - ((a.kindStalledDays ?? a.stalledDays) || 0) || a.id - b.id;
+  };
   const orderIn = (colKey, fallback) => {
     const mo = manualIn(colKey);
     return (a, b) => {
+      // 確認中は**手動順より上**に置く (2026-08-31 スタッフ要望 / Codex R1)。
+      // 「情報待ちのカードが埋もれる」が要望の本体なので、以前その列で手作業で決めた位置より
+      // 優先する。手動順は確認中どうし・通常どうしの中では今まで通り効く
+      const ca = a.checking ? 1 : 0;
+      const cb = b.checking ? 1 : 0;
+      if (ca !== cb) return cb - ca;
       const ma = mo(a); const mb = mo(b);
       if (ma != null && mb != null) return ma - mb;
       if (ma != null) return -1;      // 手で置いたカードは既定順のカードより上
@@ -1353,6 +1385,15 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
   const doneRecent = doneCards.slice(0, 30);
   doneRecent.sort(orderIn(BOARD_DONE_COL, () => 0));
 
+  // 「確認中」チップの件数。**絞り込み・ビューと無関係の "商品" 件数**を出す (絞り込み中に
+  // 0 と出ると確認中が無いように見え、拾うための入口がそこで消える)。
+  // 画像ビューはカード = 商品×種別、かつ詳細画像を作らない商品はカードにならないので、
+  // この数と画面上のカード枚数は一致しない (Codex R1 medium。チップの title に明記してある)
+  const checkingTotal = db.prepare(`
+    SELECT COUNT(*) AS c FROM product_drafts
+    WHERE status NOT IN ('on_hold', 'excluded') AND checking_since IS NOT NULL
+  `).get()?.c || 0;
+
   return {
     view,
     columns,
@@ -1361,6 +1402,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     doneTotal: doneCards.length,
     total: drafts.length,
     truncated,
+    checkingTotal,
   };
 }
 

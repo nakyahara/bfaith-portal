@@ -77,6 +77,52 @@
         </div>
       </div>
     <% } %>
+    <%# 確認中 (2026-08-31 スタッフ要望): パッケージ裏面を見ないと埋まらない・ウェブに情報が無い等、
+        「情報待ちで進められない」を表す印。工程 (列) も status も動かさず、ボードのカードに
+        ラベルが出て列の先頭に並ぶ。AI の情報入力だけは止まる (確認中に原稿が書かれないように) %>
+    <% if (draft.checking_since) { %>
+      <% const cr = checkingReasons.find((r) => r.code === draft.checking_reason_code); %>
+      <div class="banner-warn" style="margin:12px 0 0; background:#eff6ff; border-color:#3b82f6;">
+        <div>
+          <strong>🔍 確認中: <%= cr ? cr.label : (draft.checking_reason_code || '') %></strong>
+          <% if (draft.checking_note) { %>
+            <div style="margin-top:4px; white-space:pre-wrap;"><%= draft.checking_note %></div>
+          <% } %>
+          <div class="muted" style="font-size:11px; margin-top:6px;">
+            <%= draft.checking_by || '' %> / <%= draft.checking_since %> から
+            — ボードのカードにラベルが出て列の先頭に並びます。この間 AI の情報入力は動きません
+          </div>
+          <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+            <select id="checking-reason" style="width:auto; font-size:12px;">
+              <% for (const r of checkingReasons) { %>
+                <option value="<%= r.code %>" <%= r.code === draft.checking_reason_code ? 'selected' : '' %>><%= r.label %></option>
+              <% } %>
+            </select>
+            <input type="text" id="checking-note" value="<%= draft.checking_note || '' %>"
+                   maxlength="<%= checkingNoteMax %>" placeholder="補足 (任意)" style="width:260px; font-size:12px;">
+            <button class="btn btn-sm" id="checking-set-btn">理由・補足を更新</button>
+            <button class="btn btn-sm" id="checking-clear-btn">✅ 確認できた (解除)</button>
+          </div>
+        </div>
+      </div>
+    <% } else { %>
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer; font-size:12px; color:#475569;">🔍 確認中にする (実物やメーカーへの確認待ち)</summary>
+        <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <select id="checking-reason" style="width:auto; font-size:12px;">
+            <% for (const r of checkingReasons) { %>
+              <option value="<%= r.code %>"><%= r.label %><%= r.hint ? ` — ${r.hint}` : '' %></option>
+            <% } %>
+          </select>
+          <input type="text" id="checking-note" maxlength="<%= checkingNoteMax %>"
+                 placeholder="補足 (任意)" style="width:260px; font-size:12px;">
+          <button class="btn btn-sm" id="checking-set-btn">確認中にする</button>
+        </div>
+        <div class="muted" style="font-size:11px; margin-top:4px;">
+          工程は動きません。ボードのカードにラベルが出て列の先頭に並び、AI の情報入力だけ止まります
+        </div>
+      </details>
+    <% } %>
     <% if (draft.source === 'notion_import') { %>
       <div class="banner-warn" style="margin:12px 0 0;">
         📥 <strong>Notionから取り込んだ商品です (検証用)。</strong>
@@ -2914,6 +2960,26 @@
       const noteEl = document.getElementById('image-hold-note');
       showAndReload(await post(BASE + '/image-hold', { on_hold: onHold, note: noteEl ? noteEl.value : null }),
         onHold ? '画像制作を保留にしました' : '画像制作の保留を解除しました');
+    });
+  }
+
+  // 確認中 (2026-08-31)。立てる / 理由・補足の更新 / 解除。工程も status も動かさない
+  const checkingSetBtn = document.getElementById('checking-set-btn');
+  if (checkingSetBtn) {
+    checkingSetBtn.addEventListener('click', async () => {
+      const reasonEl = document.getElementById('checking-reason');
+      const noteEl = document.getElementById('checking-note');
+      showAndReload(await post(BASE + '/checking', {
+        on: true,
+        reason_code: reasonEl ? reasonEl.value : '',
+        note: noteEl ? noteEl.value : null,
+      }), '確認中にしました');
+    });
+  }
+  const checkingClearBtn = document.getElementById('checking-clear-btn');
+  if (checkingClearBtn) {
+    checkingClearBtn.addEventListener('click', async () => {
+      showAndReload(await post(BASE + '/checking', { on: false }), '確認中を解除しました');
     });
   }
 
