@@ -23,7 +23,7 @@ import {
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
-  getPickingStats, getTodayProgress, getMissStats, STATS_WINDOW_DAYS, STATS_MIN_DATE,
+  getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
 import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
@@ -634,12 +634,26 @@ router.post('/board/exit', checkOrigin, requireAdmin, api(async (req, res) => {
 
 // ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
 router.get('/api/board', api(async (req, res) => {
-  const stats = getPickingStats({ days: parseDays(req.query.days) });
+  // 明細の読み込みは1回にして速さ統計とミス率で共有 (20秒ごと×端末数のポーリング — Codex)
+  const days = parseDays(req.query.days);
+  const range = statsRange(jstToday(), days);
+  const lineRows = loadStatsLines(range.since, range.until);
+  const stats = getPickingStats({ days, lineRows });
+  // ピッキングミス率 (中原さん指示 2026-08-31: 件数より比率・欠品はミスに含めない)
+  const miss = getMissStats({ days });
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
     now: new Date().toISOString(),
     today: getTodayProgress(),
+    miss: {
+      since: miss.since, until: miss.until, minLines: miss.minLines,
+      total: miss.total,
+      workers: miss.byWorker.map((w) => ({
+        worker: w.worker, name: w.name, lines: w.lines, total: w.total, stockout: w.stockout,
+        shortage: w.shortage, excess: w.excess, wrong_item: w.wrong_item, per1000: w.per1000, provisional: w.provisional,
+      })),
+    },
     stats: {
       since: stats.since, until: stats.until, days: stats.days,
       minDate: STATS_MIN_DATE,

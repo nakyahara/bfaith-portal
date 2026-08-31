@@ -51,6 +51,7 @@
     </div>
     <div class="header-right">
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
+      <a href="/apps/packing/board" class="btn-logout">🏆 実績</a>
       <% if (isAdmin) { %>
         <a href="/apps/packing/admin/import" class="btn-logout">📥 納品書CSV取込</a>
         <a href="/apps/packing/admin/summary" class="btn-logout">📊 サマリ</a>

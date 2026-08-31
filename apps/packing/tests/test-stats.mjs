@@ -21,7 +21,7 @@ process.env.PACKING_STATS_MIN_CLASS_SLIPS = '5';
 const { initPickingDB } = await import('../../picking/db.js');
 const { initPackingDB, getDB } = await import('../db.js');
 const {
-  getPackingStats, packStatsRange,
+  getPackingStats, packStatsRange, getTodayPackingProgress,
   PACK_STATS_MIN_DATE, PACK_STATS_OUTLIER_SEC, PACK_STATS_MIN_SLIPS, PACK_STATS_MIN_CLASS_SLIPS,
 } = await import('../stats.js');
 
@@ -202,6 +202,37 @@ t('日別推移が出る', () => {
 
 t('外れ値しきい値は設定値', () => {
   assert.equal(stats.outlierSec, PACK_STATS_OUTLIER_SEC);
+});
+
+// ─── 本日の進捗 (実績ボード 2026-08-31) ───
+t('本日の進捗: 手梱包の done 伝票 + ラインは final_count・作業中一覧・ライン累計', () => {
+  const day = '2026-08-30';
+  // 手梱包: 完了 3伝票 (10,20,30秒) と 作業中 (2伝票中1完了)
+  makePackBatch({ workDate: day, cls: CLS_A, worker: 'taro@test', secs: [10, 20, 30] });
+  const wip = makePackBatch({ workDate: day, cls: CLS_A, worker: 'hanako@test', secs: [15, 25], status: 'packing' });
+  // 作業中バッチの伝票は helper が pending で作る → 1枚目だけ完了 (15秒) にする
+  db.prepare("UPDATE pk_pack_slips SET status='done', shown_at=?, done_at=? WHERE batch_id=? AND seq=1").run(at(day, 1000), at(day, 1015), wip);
+  // 梱包機ライン (PAS): 完了 final_count=40 (伝票 42)
+  const pasPk = makePickBatch(day, 'ネコポス【梱包機PAS-LINE《3つ折り》】単品');
+  db.prepare(`INSERT INTO pk_pack_batches (id, tb_key, folder_name, work_date, slip_count, line_count, total_qty, pk_batch_id,
+      match_status, status, worker, validity, csv_sha256, imported_by, created_at, updated_at)
+    VALUES (900, 'KEY900', '出荷_90', ?, 42, 42, 42, ?, 'ok', 'done', 'pas@test', 'valid', 'sha', 'test', ?, ?)`).run(day, pasPk, at(day, 0), at(day, 0));
+  db.prepare(`INSERT INTO pk_pack_line_runs (batch_id, phase, started_at, finished_at, planned_count, final_count, manual_count, worker, updated_at)
+    VALUES (900, 'run', ?, ?, 42, 40, 2, 'pas@test', ?)`).run(at(day, 0), at(day, 600), at(day, 600));
+  // ラインバッチに時刻つきの done 伝票が (何かの経路で) あっても、手梱包の秒/伝票には混ぜない (Codex)
+  db.prepare(`INSERT INTO pk_pack_slips (batch_id, seq, ne_slip_no, slip_no, mall, status, shown_at, done_at)
+    VALUES (900, 1, 'NE900-1', 'SP900-1', 'テスト店', 'done', ?, ?)`).run(at(day, 2000), at(day, 2900));
+  const p = getTodayPackingProgress(day);
+  assert.equal(p.batchCount, 2, '手梱包のバッチ数 (ラインは別枠)');
+  assert.equal(p.doneCount, 1);
+  assert.equal(p.totalSlips, 3 + 2, '手梱包の伝票数のみ');
+  assert.equal(p.doneSlips, 3 + 1, '手梱包の done 伝票のみ');
+  assert.equal(p.remainingSlips, 1);
+  assert.deepEqual(p.line, { batchCount: 1, doneCount: 1, totalSlips: 42, doneSlips: 40 }, 'ラインは別枠 (final_count)');
+  assert.equal(Math.round(p.secPerSlip), Math.round((10 + 20 + 30 + 15) / 4), '秒/伝票は手梱包の done 伝票の平均');
+  assert.deepEqual(p.active.map((a) => [a.folder, a.paused, a.line]), [[`出荷_${wip}`, false, false]]);
+  assert.deepEqual([p.lines.pas.total, p.lines.pas.machine], [40, 38], 'PAS 累計 (出荷/機械通過)');
+  assert.equal(p.lines.melt.total, 0);
 });
 
 console.log(`\npacking test-stats: ${passed} 件 pass`);

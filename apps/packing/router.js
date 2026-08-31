@@ -36,6 +36,7 @@ import {
   extractReprintPdf, cleanupReprintPdfs, detectOkurijoSlug, REPRINTS_DIR, LabelUnusableError,
 } from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
+import { getPackingStats, getTodayPackingProgress, PACK_STATS_WINDOW_DAYS, PACK_STATS_MIN_DATE } from './stats.js';
 import {
   enqueuePrintJob, leaseNextJob, findLeasedJob, claimPdfForPrint, failBeforeDispatch,
   markSubmitted, markFinished, recordHeartbeat, listPrintJobs, markAlerted, alertTextFor,
@@ -916,6 +917,50 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
 }));
 
 // ─── 日次サマリ (管理者) ───
+// ─── 実績ボード (2026-08-31 中原さん指示: 梱包にも「実績」— 梱包スピードをダッシュボードで) ───
+// picking の /board と同じ設計。端末Cookie (iPad) でもセッションでも見られる (packingAccess)。
+function parseDays(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return PACK_STATS_WINDOW_DAYS;
+  return Math.min(365, Math.max(1, Math.round(n)));
+}
+router.get('/board', (req, res) => {
+  res.render(path.join(__dirname, 'views/board'), {
+    title: '梱包実績ボード',
+    windowDays: PACK_STATS_WINDOW_DAYS,
+  });
+});
+router.get('/api/board', api(async (req, res) => {
+  const stats = getPackingStats({ days: parseDays(req.query.days) });
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    today: getTodayPackingProgress(),
+    stats: {
+      since: stats.since, until: stats.until, days: stats.days,
+      minDate: PACK_STATS_MIN_DATE,
+      minSlips: stats.minSlips,
+      minClassSlips: stats.minClassSlips,
+      outlierSec: stats.outlierSec,
+      total: stats.total,
+      // 掲示は伝票数上位の分類のみ (ヒートマップの行数 = 画面に収まる範囲)
+      baseline: stats.baseline.slice(0, 12).map((c) => ({
+        key: c.key, slips: c.slips, avgSec: c.avgSec, workerCount: c.workerCount,
+        workers: c.workers.map((w) => ({
+          worker: w.worker, name: w.name, slips: w.slips, secPerSlip: w.secPerSlip,
+          index: w.index, provisional: w.provisional,
+        })),
+      })),
+      workers: stats.workers.map((w) => ({
+        worker: w.worker, name: w.name, slips: w.slips, secPerSlip: w.secPerSlip,
+        index: w.index, provisional: w.provisional, batches: w.batches, days: w.days, excluded: w.excluded,
+      })),
+      byDate: stats.byDate,
+    },
+  });
+}));
+
 router.get('/admin/summary', requireAdmin, (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   res.render(path.join(__dirname, 'views/admin_summary'), {
