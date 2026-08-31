@@ -332,6 +332,11 @@ router.get('/detail/:id', (req, res) => {
     // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
     checkingReasons: CHECKING_REASONS,
     checkingNoteMax: CHECKING_NOTE_MAX,
+    // 何日待っているか (ボードのカードと同じ数え方)。未設定なら null
+    checkingDays: (() => {
+      const t = Date.parse(draft.checking_since || '');
+      return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 86400000)) : null;
+    })(),
     promptTemplates: buildPromptTemplates(draft, imageProduction),
   });
 });
