@@ -16,8 +16,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { buildTargets, findSetsContaining, setCostOf, listingUrl } from './resolve.js';
-import { toIntPrice, fetchRakutenPrices, fetchYahooPrices, _resetCodeMapCache } from './live-price.js';
+import { buildTargets, findSetsContaining, setCostOf, listingUrl, parentCodeOf } from './resolve.js';
+import { toIntPrice, fetchRakutenPrices, fetchYahooPrices as fetchYahooPricesRaw, _resetCodeMapCache } from './live-price.js';
+// 既存ケースは「候補=そのコードだけ」で呼ぶ
+const fetchYahooPrices = (codes, deps) => (Array.isArray(codes) && typeof codes[0] === 'string'
+  ? fetchYahooPricesRaw(codes.map((c) => ({ key: c, candidates: [c] })), deps)
+  : fetchYahooPricesRaw(codes, deps));
 import { createTables, insertRun, appendEvent, currentStates, getRun, listRuns } from './db.js';
 import { buildPreviewRows, evaluateRows, parseCodes, parseStrictPrice } from './router.js';
 
@@ -173,6 +177,41 @@ console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行
   ok(/[0-9]+ SKU/.test(miss.get('zzz-999').reason), '理由に SKU 数を書く: ' + miss.get('zzz-999').reason);
 }
 
+console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品コード (2026-08-30 中原さん確認) ──');
+{
+  // 実際の登録: item_code=0726-001802 のページに sub_code=0726-001802-BK がある。
+  // NEコード (0726-001802-bk) そのままでは 400 になるので、親コードも候補に入れて拾う
+  eq(parentCodeOf('0726-001802-bk'), '0726-001802', 'カラー枝番を落として親コードを作る');
+  eq(parentCodeOf('0726-001163'), null, '★枝番でない数字までは剥がさない (別商品を掴まないため)');
+  eq(parentCodeOf('0726-001163-2'), null, '★2個セットの -2 も剥がさない');
+
+  const calls = [];
+  const yahooDeps = {
+    fetchYahooItemDetail: async (c) => {
+      calls.push(c);
+      if (c === '0726-001802') {
+        return {
+          ok: true, ItemCode: '0726-001802', Name: '合皮補修シート', Price: 577,
+          SubCodes: [{ SubCode: '0726-001802-BK', Price: null }, { SubCode: '0726-001802-CL', Price: null }],
+        };
+      }
+      const e = new Error('[yahoo-proxy:get-item-detail] HTTP 400');
+      throw e;
+    },
+  };
+  const r = await fetchYahooPricesRaw(
+    [{ key: '0726-001802-bk', candidates: ['0726-001802-bk', '0726-001802'] }], yahooDeps);
+  const got = r.get('0726-001802-bk');
+  eq([got.found, got.price, got.skuCode, got.itemCode], [true, 577, '0726-001802-BK', '0726-001802'],
+    '★親コードで当てて、個別商品コードの価格 (継承なら商品価格) を採る');
+  eq(calls, ['0726-001802-bk', '0726-001802'], 'NEコード → 親コードの順に試す');
+
+  // 親ページに自分の個別商品コードが無ければ確定させない (別商品を掴まない)
+  const wrong = await fetchYahooPricesRaw(
+    [{ key: '0726-001802-zz', candidates: ['0726-001802-zz', '0726-001802'] }], yahooDeps);
+  eq(wrong.get('0726-001802-zz').found, false, '親ページに自分のコードが無ければ未確定');
+}
+
 console.log('\n── 引き当てできないモールは行を消さず「未解決」で出す (要件 F1) ──');
 {
   const { targets } = buildTargets(db, ['abc-002']);   // 楽天/Amazon の map を持たない商品
@@ -220,7 +259,7 @@ console.log('\n── Yahoo: 応答の取り違えと SKU別価格 (fail-closed)
     fetchYahooItemDetail: async () => ({ ok: true, ItemCode: 'other-999', Name: '別商品', Price: 500 }),
   });
   eq(mismatched.get('abc-001').found, false, '応答の ItemCode が違えば取得不可');
-  ok(mismatched.get('abc-001').reason.includes('一致しません'), '理由に不一致と書く');
+  ok(mismatched.get('abc-001').reason.includes('含まれていません'), '理由に「その商品に無い」と書く');
 
   const notOk = await fetchYahooPrices(['abc-001'], {
     fetchYahooItemDetail: async (c) => ({ ok: false, ItemCode: c, Price: 500 }),

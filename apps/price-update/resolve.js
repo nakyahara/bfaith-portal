@@ -124,21 +124,45 @@ function resolveRakuten(db, code) {
   }];
 }
 
-/** Yahoo: mirror_yahoo_sku_map (手動map) + 「出品コード = NEコード」規則 */
+/**
+ * カラーなどの枝番を落とした「親商品コード」候補を1つ返す (無ければ null)。
+ *   0726-001802-bk → 0726-001802
+ * ★枝番は「英字を含む 1〜4 文字」に限る。`-2` (2個セット) や `-001163` まで剥がすと、
+ *   まったく別の商品ページを掴みかねない。実際に剥がしてよいのはカラー等の枝番だけ。
+ */
+export function parentCodeOf(code) {
+  const m = String(code || '').trim().match(/^(.+)-([0-9]*[A-Za-z][A-Za-z0-9]{0,3})$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Yahoo: mirror_yahoo_sku_map (手動map) + 規則。
+ *
+ * ★カラバリは「親の商品コード + 個別商品コード (sub_code)」で登録されている (2026-08-30 中原さん):
+ *   NEコード 0726-001802-bk → Yahoo は item_code=0726-001802 / sub_code=0726-001802-BK
+ * そのため「出品コード = NEコード」だけで問い合わせると 400 (そんな商品は無い) になる。
+ * 親コードも候補に含めて、応答の SubCodes に NEコードがあれば**その sub_code の価格**を採る。
+ * どの候補で当たったかは live-price.js が API で確かめる (親を掴んだだけでは確定にしない)。
+ */
 function resolveYahoo(db, code) {
-  const out = [];
-  if (tableExists(db, 'mirror_yahoo_sku_map')) {
-    for (const r of db.prepare(`
-      SELECT yahoo_key AS listingCode FROM mirror_yahoo_sku_map
-       WHERE LOWER(TRIM(ne_code)) = ? ORDER BY yahoo_key
-    `).all(normCode(code))) {
-      out.push({ mall: 'yahoo', listingCode: r.listingCode, skuCode: null, confidence: 'rule', source: 'mirror_yahoo_sku_map' });
-    }
-  }
-  if (!out.some((x) => normCode(x.listingCode) === normCode(code))) {
-    out.push({ mall: 'yahoo', listingCode: code, skuCode: null, confidence: 'rule', source: '規則 (出品コード=NEコード)' });
-  }
-  return out;
+  const mapped = tableExists(db, 'mirror_yahoo_sku_map')
+    ? db.prepare(`
+        SELECT yahoo_key AS listingCode FROM mirror_yahoo_sku_map
+         WHERE LOWER(TRIM(ne_code)) = ? ORDER BY yahoo_key
+      `).all(normCode(code)).map((r) => r.listingCode)
+    : [];
+  // 問い合わせ順: 手動map → NEコードそのもの → 枝番を落とした親コード
+  const candidates = [...mapped, code];
+  const parent = parentCodeOf(code);
+  if (parent && !candidates.some((c) => normCode(c) === normCode(parent))) candidates.push(parent);
+  return [{
+    mall: 'yahoo',
+    listingCode: mapped[0] || code,
+    candidates: [...new Set(candidates)],
+    skuCode: null,
+    confidence: 'rule',
+    source: mapped.length > 0 ? 'mirror_yahoo_sku_map' : '規則 (出品コード=NEコード / 親コード+個別商品コード)',
+  }];
 }
 
 /** au PAY: mirror_aupay_sku_map + 「item_code = NEコード」規則。価格は出さない (要件 F2) */

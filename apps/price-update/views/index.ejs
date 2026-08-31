@@ -207,8 +207,15 @@
     $('rows-table').querySelector('tbody').innerHTML = updatable.map((r) => {
       const ev = r.evaluation;
       const ratio = ev && ev.changeRatio != null ? (ev.changeRatio * 100).toFixed(1) + '%' : '—';
-      const gross = ev && ev.estimate.gross != null
-        ? yen(Math.round(ev.estimate.gross)) + ' 円 (' + (ev.estimate.rate * 100).toFixed(1) + '%)' : '—';
+      // 新売価が未入力の間の概算は「今の価格での粗利」。新売価の隣にあると
+      // 「入れた後の粗利」と読めてしまうので、どちらの値かを必ず添える
+      const grossText = ev && ev.estimate.gross != null
+        ? yen(Math.round(ev.estimate.gross)) + ' 円 (' + (ev.estimate.rate * 100).toFixed(1) + '%)' : null;
+      const gross = grossText
+        ? (r.newPrice == null
+          ? '<span class="pu-note">現在価格で ' + grossText + '</span>'
+          : grossText)
+        : '—';
       return '<tr class="' + (r.rowKind === 'set' ? 'set-row ' : '') + (ev && !ev.canUpdate ? 'blocked' : '') + '">'
         + '<td><input type="checkbox" class="sel" data-key="' + r.key + '" ' + (r.selected ? 'checked' : '') + '></td>'
         + '<td><span class="mall m-' + r.mall + '">' + esc(MALL_LABEL[r.mall] || r.mall) + '</span></td>'

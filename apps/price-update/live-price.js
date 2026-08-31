@@ -148,45 +148,70 @@ export async function fetchRakutenPrices(targets, deps = {}) {
  * ★VPS 側の Price 抽出 (PR2) が未デプロイだと Price は undefined で返る。
  *   その場合は「取得できない」として扱い、confirmed に昇格させない (古い値で値付けしない)。
  */
-export async function fetchYahooPrices(itemCodes, deps = {}) {
+export async function fetchYahooPrices(targets, deps = {}) {
   const out = new Map();
-  const codes = [...new Set((itemCodes || []).map((c) => String(c || '').trim()).filter(Boolean))];
+  // targets = [{ key, candidates: [問い合わせる item_code 候補] }]
+  const list = (targets || [])
+    .map((t) => ({
+      key: normCode(t.key),
+      candidates: [...new Set([t.key, ...(t.candidates || [])].map((c) => String(c || '').trim()).filter(Boolean))],
+    }))
+    .filter((t) => t.key);
+  if (list.length === 0) return out;
+
   const fetchOne = deps.fetchYahooItemDetail || fetchYahooItemDetail;
-  for (const c of codes) {
-    const key = normCode(c);
-    const miss = (reason, extra = {}) => out.set(key, { price: null, subCodes: [], skuCode: null, found: false, reason, itemName: null, ...extra });
-    try {
-      const d = await fetchOne(c);
-      // ★問い合わせた商品と返ってきた商品が同じことを確かめる (Codex R1 Critical)。
-      // 「価格が返ってきた」だけでは実在確認にならない — 取り違えた応答をそのまま
-      // 「この出品の現在価格」として confirmed にすると、別商品の価格を根拠に値付けしてしまう
-      if (d?.ok === false) { miss('Yahoo が ok を返しませんでした'); continue; }
+  const cache = new Map();   // 同じ item_code を何度も叩かない (親コードは複数のカラーで共有される)
+
+  async function detailOf(code) {
+    const k = normCode(code);
+    if (!cache.has(k)) {
+      try { cache.set(k, { ok: true, d: await fetchOne(code) }); }
+      catch (e) { cache.set(k, { ok: false, e }); }
+    }
+    return cache.get(k);
+  }
+
+  for (const t of list) {
+    const reasons = [];
+    let resolved = null;
+    for (const cand of t.candidates) {
+      const got = await detailOf(cand);
+      if (!got.ok) {
+        // Yahoo は「その item_code の商品が無い」も 400 で返す。生の HTTP 400 では読めない
+        const msg = String(got.e?.message || '');
+        reasons.push(/HTTP 400\b/.test(msg)
+          ? `${cand}: この出品コードの商品が見つかりません`
+          : `${cand}: ${msg || '取得できません'}`);
+        continue;
+      }
+      const d = got.d;
+      if (d?.ok === false) { reasons.push(`${cand}: Yahoo が ok を返しませんでした`); continue; }
+
       const itemPrice = toIntPrice(d?.Price);
       const subCodes = Array.isArray(d?.SubCodes)
         ? d.SubCodes.map((s) => ({ subCode: s?.SubCode == null ? null : String(s.SubCode), price: toIntPrice(s?.Price) })).filter((s) => s.subCode)
         : [];
-      // 識別子の一致は「商品コードが一致」か「サブコードのどれかが一致」で認める。
-      // サブコードで問い合わせたとき応答の ItemCode が親商品になる仕様でも引き当てられるように
-      // (ItemCode だけを見ると、サブコード行が全件 fail-closed になる — Codex R2)
-      const subMatches = subCodes.some((s) => normCode(s.subCode) === key);
-      if (normCode(d?.ItemCode) !== key && !subMatches) {
-        miss(`問い合わせた商品コードと応答が一致しません (要求 ${c} / 応答 ${d?.ItemCode ?? 'なし'})`);
+      // ★実在確認は「探しているコード (= NEコード) が、応答の ItemCode か SubCodes にある」ことで行う。
+      // 親コードで問い合わせた場合は SubCodes 側で当たる (カラバリはこの形で登録されている)。
+      // どちらにも無ければ、その候補は別商品なので使わない (取り違え防止)
+      const matchedSub = subCodes.find((s) => normCode(s.subCode) === t.key) || null;
+      const itemMatches = normCode(d?.ItemCode) === t.key;
+      if (!matchedSub && !itemMatches) {
+        reasons.push(`${cand}: この商品には ${t.key} が含まれていません`);
         continue;
       }
-      // sub_code 別価格の扱い:
-      //   ・要求コードがサブコードと一致 → そのサブコードの価格 (null なら商品価格を継承)
-      //   ・一致しないのに「価格を持つサブコード」がある → どの SKU の価格か決められないので未確定 (fail-closed)
-      //   ・サブコードが無い / 全部が商品価格を継承 → 商品価格でよい
-      const matchedSub = subCodes.find((s) => normCode(s.subCode) === key) || null;
+
       const pricedSubs = subCodes.filter((s) => s.price != null);
       let price = null;
       let skuCode = null;
       let reason = null;
       if (matchedSub) {
+        // 個別商品コードの価格。null なら商品価格を継承する運用
         price = matchedSub.price != null ? matchedSub.price : itemPrice;
         skuCode = matchedSub.subCode;
         if (price == null) reason = '設定価格を整数円として読めません';
       } else if (pricedSubs.length > 0) {
+        // 商品コードでは一致したが、SKU別価格を持つ商品 → どのSKUの価格か決められない (fail-closed)
         reason = `SKU別価格のある商品です (${pricedSubs.map((s) => s.subCode).join(', ')})。どのSKUかを特定できないため更新対象にできません`;
       } else if (itemPrice == null) {
         reason = d?.Price === undefined
@@ -195,15 +220,20 @@ export async function fetchYahooPrices(itemCodes, deps = {}) {
       } else {
         price = itemPrice;
       }
-      out.set(key, { price, subCodes, skuCode, found: price != null, reason, itemName: d?.Name || null });
-    } catch (e) {
-      // Yahoo は「その item_code の商品が無い」も 400 で返す。生の HTTP 400 を出しても読めないので、
-      // 「出品が見つからない」と分かる言葉にする (規則推定で当てた候補が外れた時にここへ来る)
-      const msg = String(e?.message || '');
-      miss(/HTTP 400\b/.test(msg)
-        ? `Yahoo にこの出品コードの商品が見つかりません (${c})`
-        : (msg || 'Yahooから取得できません'));
+      resolved = {
+        price, subCodes, skuCode,
+        itemCode: d?.ItemCode || cand,
+        found: price != null,
+        reason,
+        itemName: d?.Name || null,
+      };
+      break;   // 当たった候補で確定 (以降の候補は試さない)
     }
+    out.set(t.key, resolved || {
+      price: null, subCodes: [], skuCode: null, itemCode: null, found: false,
+      reason: reasons.length ? reasons.join(' / ') : 'Yahooから取得できません',
+      itemName: null,
+    });
   }
   return out;
 }

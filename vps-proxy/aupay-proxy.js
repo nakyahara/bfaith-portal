@@ -1289,6 +1289,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const parsed = parseGetItemDetailXml(r.body);
+      // 調査用: body.debugRaw=true で、応答XMLの「タグの出方」と先頭部分を返す。
+      // 商品カタログの構造を知らないとパーサを直せないため (PII は無い / secret 必須 / read-only)。
+      // 価格や在庫を書き換える経路ではない
+      const debug = body.debugRaw === true ? (() => {
+        const counts = {};
+        for (const m of String(r.body).matchAll(/<([A-Za-z][\w.]*)\b/g)) {
+          counts[m[1]] = (counts[m[1]] || 0) + 1;
+        }
+        return { tagCounts: counts, head: String(r.body).slice(0, 4000), length: String(r.body).length };
+      })() : undefined;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
@@ -1299,6 +1309,7 @@ const server = http.createServer(async (req, res) => {
         // 価格一括改定ツール向け (2026-08-24 追加)
         Price: parsed.Price,
         SubCodes: parsed.SubCodes,
+        debug,
       }));
       return;
     }
