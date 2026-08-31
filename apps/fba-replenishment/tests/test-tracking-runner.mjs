@@ -207,6 +207,24 @@ t('🚨記入欄が無い納品は投入対象から外す (何度投げても B
   assert.match(outOfReach[0].skipReason, /記入欄/);
 });
 
+t('🚨記入欄と輸送箱が食い違う納品は送らない (一部の箱が宙に浮く)', () => {
+  const ng = mkShip('FBA-PARTIAL', { slots: 1, boxes: 3 });
+  assert.equal(ng.putReady, false);
+  assert.match(ng.notReadyReason, /記入欄 1個 と輸送箱 3個 が一致しません/);
+  const { todo, outOfReach } = partitionShipments([], [ng]);
+  assert.equal(todo.length, 0);
+  assert.match(outOfReach[0].skipReason, /一致しません/);
+});
+
+t('🚨到着済みなのに追跡番号が無い納品を黙って消さない (240箱を3週間見落とした原因)', () => {
+  const late = mkShip('FBA-LATE', { slots: 0, boxes: 19, status: 'RECEIVING' });
+  const { todo, outOfReach } = partitionShipments([], [], new Date(), [late]);
+  assert.equal(todo.length, 0);
+  assert.equal(outOfReach.length, 1);
+  assert.equal(outOfReach[0].tooLate, true);
+  assert.match(outOfReach[0].skipReason, /RECEIVING.*未登録のまま到着/);
+});
+
 t('🚨期限切れは照合より前に外す (残すとCSV行が宙に浮いてその日の全件が中断する)', () => {
   const now = new Date('2026-08-28T13:00:00Z');
   const dead = mkShip('FBA-OLD', { slots: 1, rtsEnd: '2026-08-27T14:59Z' });

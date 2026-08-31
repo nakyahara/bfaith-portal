@@ -18,9 +18,13 @@
  * ⭐22:00 に走らせる理由:
  *   - 追跡番号を入れると納品の修正が極端に面倒になるため、日中に箱数のズレが
  *     表面化する時間を作る (子会社いろはの数え間違いがまれに発生する)
- *   - APIの投入は **当日中でないと期限切れで拒否される** (2026-08-07 実測)。
- *     翌朝に回すと通らない。逆に Seller Central 画面は期限後でも入るので、
- *     取りこぼした日は人が画面で入れればリカバリできる
+ *   - APIの投入は当日中でないと期限で弾かれる。翌朝に回すと通らない。
+ *     逆に Seller Central 画面は期限後でも入るので、取りこぼした日は人が画面で入れられる
+ *
+ * 🚨**投入できるかどうかは、Amazon側に「記入欄」があるかで決まる** (2026-08-31 確定)。
+ *   欄は人が Seller Central で出荷確定の操作をすると作られる。つまりこのジョブは
+ *   **人の操作より後**でないと仕事ができない。22:00 までに出荷確定が済んでいない納品は
+ *   翌日に持ち越さず、その晩のうちに「画面から入力してください」と名指しで知らせる。
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -48,22 +52,36 @@ const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex').sl
  *   「送り状がCSVにありません」→ blocked → **その日の全件が中断**していた
  *   (2026-08-28〜31 に4日間ゼロ件で止まり、その間の135箱が未登録のまま到着した)。
  *
- * 投入できない理由は2つ。どちらも**人がやることは同じ (画面から入力)** なので同じ箱に入れる:
+ * 投入できない理由は3つ。**人がやることは同じ (画面を見に行く)** なので同じ箱に入れる:
  *   - Amazon側に追跡番号の記入欄が無い (画面で出荷確定の操作をしていない)
  *   - 編集期限を過ぎている
+ *   - もう RECEIVING / CLOSED まで進んでいる (手遅れ。それでも黙って消さない)
  *
  * @param {Array} shipments 記入欄がある納品 (登録済みも含む)
- * @param {Array} notReady  記入欄が無い納品
+ * @param {Array} notReady  記入欄が無い/箱と食い違う納品
+ * @param {Date}  now
+ * @param {Array} arrived   書き込める段階を過ぎた納品で追跡番号が無いもの
  * @returns {{actionable: Array, outOfReach: Array, todo: Array}}
  *   actionable … 照合に回す納品 (登録済みを含む。CSV行を宙に浮かせないため)
  *   outOfReach … 人が画面で入力するもの
  *   todo       … 実際に今から投入する納品
  */
-export function partitionShipments(shipments, notReady = [], now = new Date()) {
+export function partitionShipments(shipments, notReady = [], now = new Date(), arrived = []) {
   const outOfReach = notReady.map((s) => ({
     ...s,
-    skipReason: 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が必要)',
+    // 理由は summarizeShipment が判定済み (記入欄が無い / 欄と箱が食い違う)
+    skipReason: s.notReadyReason ?? 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が必要)',
   }));
+  // 🚨もう書き込める段階を過ぎた納品 (RECEIVING / CLOSED) で追跡番号が入っていないもの。
+  //   APIでも画面でも手遅れだが、**黙って消してはいけない**。これを見えなくしていたせいで
+  //   8/19〜8/28 の約240箱が未登録のまま到着していたことに3週間気づけなかった
+  for (const s of arrived) {
+    outOfReach.push({
+      ...s,
+      skipReason: `すでに ${s.status} まで進んでいて追跡番号が入っていません (Amazonに未登録のまま到着しています)`,
+      tooLate: true,
+    });
+  }
   const actionable = [];
   for (const s of shipments) {
     if (s.hasTracking) { actionable.push(s); continue; } // 登録済みは buildAssignments 側で skipped
@@ -163,10 +181,12 @@ async function runInner(summary, ctx) {
   // ここを先にやることで「納品が無い日の置きっぱなしCSV」を異常扱いしないで済む。
   let shipments;
   let notReady;
+  let arrived;
   try {
     const r = await findOpenShipments({ now });
     shipments = r.shipments;
     notReady = r.notReady ?? [];
+    arrived = r.arrived ?? [];
     summary.scanned = r.scanned;
     // 🚨取得に失敗したプランがあると「今日は納品が無い」に化ける。書き込みジョブなので
     //   一部でも見えていない状態では進めない (全体を止めて人に知らせる)
@@ -183,7 +203,7 @@ async function runInner(summary, ctx) {
     summary.blocked.push(`納品の取得に失敗: ${e.message}`);
     return summary;
   }
-  const { actionable, outOfReach, todo } = partitionShipments(shipments, notReady, now);
+  const { actionable, outOfReach, todo } = partitionShipments(shipments, notReady, now, arrived);
   summary.openShipments = todo.length;
   summary.outOfReach = outOfReach.map((s) => ({
     shipmentConfirmationId: s.shipmentConfirmationId, fcCode: s.fcCode,
@@ -344,7 +364,7 @@ async function runInner(summary, ctx) {
       status: ship?.status ?? null,
     };
     store.append(rec);
-    if (res.ok) summary.registered.push(a);
+    if (res.ok) summary.registered.push({ ...a, status: ship.status });
     else summary.failed.push({
       shipmentConfirmationId: a.shipmentConfirmationId, error: res.error,
       retryable: res.retryable, needsManual: res.indeterminate === true,
@@ -371,6 +391,13 @@ export function formatSummary(s) {
   if (s.registered.length) {
     L.push('', `*登録${s.commit ? '' : '予定'} ${s.registered.length}件*`);
     s.registered.forEach((a) => L.push(`・${a.shipmentConfirmationId} (${a.fcCode}) ${a.countBoxes}箱  照合=${a.matchedBy}`));
+    // 🚨APIでは「まだ未入力」と「画面で入れた直後 (反映が数時間遅れる)」を区別できない。
+    //   発送済み状態の納品へ書いたときは、上書きの可能性があることを必ず人に見せる
+    const shipped = s.registered.filter((a) => a.status === 'SHIPPED');
+    if (shipped.length) {
+      L.push('', `※ うち ${shipped.length}件 は発送済み状態の納品です。` +
+        'この間に画面から手入力していた場合は上書きしています (画面の番号をご確認ください)');
+    }
   }
   if (s.failed.length) {
     L.push('', `*失敗 ${s.failed.length}件*`);
