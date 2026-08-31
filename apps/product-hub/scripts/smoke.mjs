@@ -1985,12 +1985,20 @@ const wf = await import('../lib/workflow.js');
   let kindErr = null;
   try { wf.createStep({ label: '撮影', track: 'image', role_code: 'image' }); } catch (e) { kindErr = e; }
   check('画像トラックの工程は種別なしでは追加できない', kindErr?.status === 400, kindErr?.message || '例外が出ていない');
-  const extra = wf.createStep({ label: '撮影', track: 'image', image_kind: 'top', role_code: 'image' });
-  check('工程を追加できる (種別つき)', wf.listSteps({ track: 'image' }).find((s) => s.code === extra)?.image_kind === 'top');
+  // TOP画像の工程は 2026-08-31 に廃止 (LP に一本化)。作ろうとすると 400
+  let topKindErr = null;
+  try { wf.createStep({ label: '撮影', track: 'image', image_kind: 'top', role_code: 'image' }); } catch (e) { topKindErr = e; }
+  check('工程追加: TOP画像の工程は作れない (廃止済み)', topKindErr?.status === 400, topKindErr?.message || '例外が出ていない');
+  const extra = wf.createStep({ label: '撮影', track: 'image', image_kind: 'detail', role_code: 'image' });
+  check('工程を追加できる (種別つき)', wf.listSteps({ track: 'image' }).find((s) => s.code === extra)?.image_kind === 'detail');
   check('追加した工程は無効化できる', wf.updateStep(extra, { active: false }) === true);
+  // 廃止した TOP 工程は元に戻せない (戻すとボードに TOP 列・カードが復活する)
+  let revive = null;
+  try { wf.updateStep('img_approve_top', { active: true }); } catch (e) { revive = e; }
+  check('廃止した TOP 工程は再有効化できない', revive?.status === 400, revive?.message || '例外が出ていない');
   check('無効化した工程は既定の一覧に出ない', !wf.listSteps().some((s) => s.code === extra));
 
-  // 画像トラックの組み込み工程はラベル・並び順・滞留日数が TOP/詳細 で対 — 片方を変えると両方そろう
+  // 画像トラックの組み込み工程 (2026-08-31 以降は商品詳細のみ) のラベル・並び順・滞留日数を変える
   wf.updateStep('imgd_design', { label: 'デザイン修正 (改)', stall_days: 9 });
   const sib = wf.listSteps({ includeInactive: true }).find((s) => s.code === 'img_production_detail') || { label: '画像制作 (改)', stall_days: 9 };
   check('対の工程にラベルが伝播する', sib.label === '画像制作 (改)', sib.label);
@@ -2334,7 +2342,7 @@ let wfDraftId = null;
   ).run().lastInsertRowid);
   wfp.progressOf(idListedRk, { db });
   wfp.progressOf(idNotListed, { db });
-  const lateImg = wf.createStep({ label: '画像の最終チェック', track: 'image', image_kind: 'top', role_code: 'image_approver' });
+  const lateImg = wf.createStep({ label: '画像の最終チェック', track: 'image', image_kind: 'detail', role_code: 'image_approver' });
   wfp.ensureProgressForMany(db, [idListedRk, idNotListed]);
   check('後から足した画像工程: 楽天登録済みの商品は done で入る',
     wfp.progressOf(idListedRk, { db }).image.find((s) => s.step_code === lateImg)?.state === 'done');
@@ -3069,6 +3077,8 @@ let wfSetParentId = null;
 
   // 種別の絞り込み (TOP/詳細) は 2026-08-31 に廃止。カードが 1 種類しかないので選ぶ意味がない。
   // 詳細対象外の商品はカードにならない (画像の作業が無い) ことだけ確かめる
+  const imgTotalBefore = wfpEarly.boardData(db, { view: 'image' }).total;
+  const mainTotalBefore = wfpEarly.boardData(db, { view: 'main' }).total;
   const idKfx = Number(db.prepare(`
     INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-KFEX', '詳細対象外の絞り込み', 'smoke')
   `).run().lastInsertRowid);
@@ -3078,11 +3088,11 @@ let wfSetParentId = null;
   check('画像ビュー: 詳細対象外の商品はカードにならない (画像の作業が無い)',
     !ibEx.columns.some((c) => c.cards.some((x) => x.id === idKfx))
     && !ibEx.doneCards.some((x) => x.id === idKfx));
-  // 候補 (LIMIT) も食わないこと (Codex R1 medium: 食うと実際に作業がある商品がボードから欠ける)
-  check('画像ビュー: 詳細対象外は候補 (total) にも数えない',
-    ibEx.total === wfpEarly.boardData(db, { view: 'image' }).total
-    && ibEx.total < wfpEarly.boardData(db, { view: 'main' }).total,
-    `image=${ibEx.total} main=${wfpEarly.boardData(db, { view: 'main' }).total}`);
+  // 候補 (LIMIT) も食わないこと (Codex R1 medium: 食うと実際に作業がある商品がボードから欠ける)。
+  // **挿入の前後**で比べる — 同条件で 2 回取って比べても恒真にしかならない (Codex R2 low)
+  check('画像ビュー: 詳細対象外は候補 (total) を食わない (本流では数える)',
+    ibEx.total === imgTotalBefore && wfpEarly.boardData(db, { view: 'main' }).total === mainTotalBefore + 1,
+    `image ${imgTotalBefore}→${ibEx.total} / main ${mainTotalBefore}→${wfpEarly.boardData(db, { view: 'main' }).total}`);
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
 
   // ─── 画像工程 v2 (2026-08-26): 詳細系列 ①〜⑨ ───

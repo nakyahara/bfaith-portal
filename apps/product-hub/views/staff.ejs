@@ -79,7 +79,8 @@
     </div>
 
     <%# 画像トラックは TOP/詳細 で別々に進む (2026-08-24)。流れは同じなので種別ごとに 1 行ずつ出す %>
-    <% for (const [kindCode, kindLabel] of [['top', 'TOP画像 (サムネイル)'], ['detail', '商品詳細画像']]) { %>
+    <%# TOP画像の工程は 2026-08-31 に廃止 (LP に一本化)。表示も選択肢も出さない %>
+    <% for (const [kindCode, kindLabel] of [['detail', '商品詳細画像']]) { %>
       <% const kindSteps = overview.image.filter((st) => (st.image_kind === 'detail') === (kindCode === 'detail')); %>
       <div class="track-title">画像トラック【<%= kindLabel %>】<span style="font-weight:400">— 基本情報が入った時点から本流と並行で走ります</span></div>
       <div class="flow">
@@ -104,7 +105,7 @@
       </div>
     <% } %>
     <p class="mini" style="margin:8px 0 0;">
-      TOP画像と商品詳細画像の両方が承認されるまで楽天出品には進めません (出品時のゲート)。
+商品詳細画像の工程が終わるまで楽天出品には進めません (出品時のゲート)。TOP画像は「画像が登録されているか」で見ます。
       商品詳細画像を作らない商品は、商品の詳細画面で「詳細画像は対象外」にすると TOP だけでゲートが開きます。
     </p>
   </div>
@@ -341,7 +342,6 @@
           <input type="text" id="new-step-label" placeholder="新しい工程名" style="max-width:220px;" maxlength="40">
           <select id="new-step-track" style="width:auto;">
             <option value="main">本流</option>
-            <option value="image:top">画像トラック (TOP画像)</option>
             <option value="image:detail">画像トラック (商品詳細画像)</option>
           </select>
           <select id="new-step-role" style="width:auto;">
