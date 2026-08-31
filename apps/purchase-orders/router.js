@@ -8421,7 +8421,8 @@ function loadLotMissing() {
   ]).then(function(res) {
     if (TAB !== 'lotmissing') return;
     if (!res[0].ok) { document.getElementById('tabBody').textContent = res[0].error; return; }
-    LM_DATA = res[0]; LM_DATA.autofill = res[1].ok ? res[1].autofill : true;
+    // スイッチの取得失敗は「状態不明」(null) にして操作不能にする。true へ倒すと停止中なのに ON 表示になる (Codex PR2-R1 Low)
+    LM_DATA = res[0]; LM_DATA.autofill = res[1].ok ? res[1].autofill : null;
     renderLotMissing();
   }).catch(function(e){ if (TAB === 'lotmissing') document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
 }
@@ -8434,8 +8435,8 @@ function renderLotMissing() {
     '<button class="ghost sm" id="lmCsv" style="margin-left:auto">⬇ CSV (NE更新用)</button></div>' +
     '<div class="hint">NEの「発注ロット単位」が未設定 (0) の取扱中商品。<b>推奨数量は1個単位で計算して要発注に載せています</b> (中原さん決定 2026-08-30)。' +
     'ケース単位でしか受けない商品はNEでロットを設定してください (翌朝の同期で反映され、この一覧から消えます)。並び順: 要発注 → 在庫0で販売あり → 月間粗利の大きい順。</div>' +
-    '<div class="hint" style="margin-top:4px"><label><input type="checkbox" id="lmAutofill"' + (j.autofill ? ' checked' : '') + '> ロット未設定商品の推奨量を初期カートへ自動投入する</label>' +
-    ' <span class="muted">(OFF = 参考表示のみ。誤発注が続くときの一括停止スイッチ)</span></div>';
+    '<div class="hint" style="margin-top:4px"><label><input type="checkbox" id="lmAutofill"' + (j.autofill ? ' checked' : '') + (j.autofill == null ? ' disabled' : '') + '> ロット未設定商品の推奨量を初期カートへ自動投入する</label>' +
+    (j.autofill == null ? ' <span class="badge b-warn">設定の取得に失敗 (再読込してください)</span>' : ' <span class="muted">(OFF = 参考表示のみ。誤発注が続くときの一括停止スイッチ)</span>') + '</div>';
   h += '<table class="t"><thead><tr><th>商品コード</th><th>商品名</th><th>仕入先</th><th>状態</th><th class="r">在庫+注残</th><th class="r">30日販売</th><th class="r">在庫月数</th><th class="r">推奨保有</th><th class="r">推奨(1個単位)</th><th class="r">月間粗利</th><th>最終仕入</th></tr></thead><tbody>';
   if (!rows.length) h += '<tr><td colspan="11" class="muted">該当なし 🎉</td></tr>';
   rows.slice(0, 500).forEach(function(r) {
@@ -8455,12 +8456,14 @@ function renderLotMissing() {
     dlCsv('ロット未設定_' + new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) + '.csv', out);
   });
   document.getElementById('lmAutofill').addEventListener('change', function(ev) {
-    var on = !!ev.target.checked;
-    if (!on && !confirm('ロット未設定商品の推奨量を初期カートに入れなくなります (参考表示のみ)。よろしいですか?')) { ev.target.checked = true; return; }
+    var box = ev.target, on = !!box.checked;
+    if (!on && !confirm('ロット未設定商品の推奨量を初期カートに入れなくなります (参考表示のみ)。よろしいですか?')) { box.checked = true; return; }
+    box.disabled = true; // 保存中は連打不可 (応答順で表示と保存値が食い違うのを防ぐ、Codex PR2-R1 Low)
     fetch('/apps/purchase-orders/api/lot-missing-autofill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autofill: on }) })
       .then(function(r){ return r.json(); })
-      .then(function(res){ if (!res.ok) { alert(res.error || '保存に失敗しました'); ev.target.checked = !on; } else LM_DATA.autofill = res.autofill; })
-      .catch(function(e){ alert('通信エラー: ' + e.message); ev.target.checked = !on; });
+      .then(function(res){ if (!res.ok) { alert(res.error || '保存に失敗しました'); box.checked = !on; } else { LM_DATA.autofill = res.autofill; box.checked = res.autofill; } })
+      .catch(function(e){ alert('通信エラー: ' + e.message + ' — 保存されたか不明です。再読込して確認してください'); box.checked = !on; })
+      .then(function(){ box.disabled = false; });
   });
 }
 // ── 🏷️ バーコードラベルタブ (自社商品=AMC×売上分類1 の全対象商品を未登録含めて一覧管理。
