@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS } from './fee-breakdown.js';
+import { classifyFeeRow, normalizeFeeDesc, netTotal, FEE_COLUMNS } from './fee-breakdown.js';
 import { parsePaymentCsvText, aggregate } from './payment-csv.js';
 
 const EASY = 'Amazon Easy Ship料金';
@@ -54,6 +54,14 @@ test('classifyFeeRow: 対象外の行は null', () => {
   // 振込みは対象外
   assert.equal(classifyFeeRow({ sku: '', 説明: 'Easy Ship', 解決方法: 'skip' }), null);
   assert.equal(classifyFeeRow(null), null);
+});
+
+test('netTotal: 表示用の合計 = CSVの合計 − 手数料内訳3列 (内訳キーが無い旧月はそのまま)', () => {
+  assert.equal(netTotal({ 合計: -2758943, [EASY]: -2303252, [STORAGE]: -303905, [LONG]: -101496 }), -50290);
+  assert.equal(netTotal({ 合計: -1234 }), -1234);                       // 旧月 (内訳キーなし)
+  assert.equal(netTotal({ 合計: 100, [EASY]: 0, [STORAGE]: 0, [LONG]: 0 }), 100);
+  assert.equal(netTotal({ 合計: '5', [EASY]: '-2' }), 7);               // 文字列でも数値化
+  assert.equal(netTotal(null), 0);
 });
 
 test('parsePaymentCsvText: メタ行の後のヘッダーを動的検出し、引用符内カンマ・桁区切り・時刻付き日付を処理', () => {
@@ -127,6 +135,7 @@ test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・�
   assert.equal(other['FBA手数料'], -1300);
   assert.equal(other['その他'], 50);     // 1000 - 900 - 50
   assert.equal(other['合計'], -1825);
+  assert.equal(netTotal(other), -1825 - (-575 - 900 - 300)); // 表示用の合計 = -50 (内訳3列 + 表示合計 = CSVの合計)
   assert.equal(other.行数, 8);
   // 商品セグメントは内訳 0・既存値そのまま
   const seg1 = r.bySegment['1'];
@@ -209,5 +218,7 @@ for (const c of REAL_CASES) {
     assert.equal(Math.round(feeSum), Math.round(judged));
     // 商品セグメントには内訳が入らない
     for (const col of FEE_COLUMNS) assert.equal(r.bySegment['1'][col], 0);
+    // 表示用の合計 = CSVの合計 − 内訳3列
+    assert.equal(Math.round(netTotal(other)), c.other.合計 - (c.easy + c.storage + c.long));
   });
 }
