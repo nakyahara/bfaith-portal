@@ -66,11 +66,39 @@ export function resolveMallShippingCost(rates, { mallMethodName, neShippingCode,
   }
 
   // 2) モール側が「定形外」「宅急便」のような**まとめた呼び方**の場合、重さ・サイズの段が決まらない。
-  //    商品マスタの配送方法が同じ系統ならその段を使う (定形外 → 定形外規格内(50g以内) など)
-  if (productRow && nameKey(productRow.name).startsWith(nameKey(mallMethodName))) {
+  //    同じ系統なら、実際にどの段で送っているかを知っている商品マスタの値を使う。
+  //    ★モールの配送方法名は「設定セットの名前」であって送り方そのものではない
+  //      (楽天の「定形外」セットで実際は定形内で送っている、が実運用 — 中原さん 2026-08-31)。
+  //      系統さえ合っていれば商品マスタが正なので、警告は出さない
+  if (productRow && sameFamily(mallMethodName, productRow.name)) {
     return { cost: productCost, source: 'product', label: productRow.name, exact: false };
   }
 
-  // 3) 決められない。商品マスタの値に戻すが「不明」と言う (黙って近い名前に寄せない)
+  // 3) 系統も違う (例: モール=佐川急便 / 商品マスタ=定形内)。決められないので
+  //    商品マスタの値に戻すが「不明」と言う (黙って近い名前に寄せない)。
+  //    ここが出たら、モール側か商品マスタのどちらかの登録がずれている合図
   return { cost: productCost, source: 'unknown', label: productRow?.name || null, exact: false };
+}
+
+/**
+ * 配送方法の系統 (運送会社・サービスの大枠) が同じか。
+ * 重さ・サイズの段の違い (定形内 / 定形外規格内(50g以内) など) は同じ系統として扱う。
+ */
+export function familyOf(name) {
+  const n = nameKey(name);
+  if (!n) return null;
+  if (/^定形/.test(n)) return '郵便定形';                       // 定形内 / 定形外規格内 / 定形外規格外
+  if (n.includes('ネコポス')) return 'ネコポス';
+  if (n.includes('ゆうパケット')) return 'ゆうパケット';
+  if (n.includes('クリックポスト')) return 'クリックポスト';
+  if (n.includes('レターパック')) return 'レターパック';
+  if (n.includes('ゆうパック')) return 'ゆうパック';
+  if (/宅急便|クロネコ|ヤマト/.test(n)) return 'ヤマト宅急便';
+  if (/佐川|飛脚/.test(n)) return '佐川';
+  return null;                                                   // 分類できない = 同系統とみなさない
+}
+
+function sameFamily(a, b) {
+  const fa = familyOf(a);
+  return fa != null && fa === familyOf(b);
 }
