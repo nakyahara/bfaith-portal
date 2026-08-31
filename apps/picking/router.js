@@ -25,7 +25,7 @@ import {
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
   getPickingStats, getTodayProgress, getMissStats, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -386,8 +386,11 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         worker: worker.name,
         shortageQty: line.shortage_qty ?? line.qty,
         altFree: req.body.alt_free == null ? null : Number(req.body.alt_free),
+        allocations: listShortageAllocations(batchId, Number(req.body.line_seq)),
       }).catch((e) => console.warn(`[picking-notify] 欠品通知失敗 (${line.sku}): ${e.message}`));
     }
+    // 「後で取りに行く」を梱包タスクへ展開 (梱包が取込済みなら即・未取込なら reconcile が追いつく)
+    try { bindPendingLaterRequests(); } catch { /* fail-soft */ }
   }
   // 欠品記録の取消 (back) は通知先へ訂正を流す (通知は消せないので追送 — Codex R1)
   if (req.body.event === 'back' && !result.replayed && undoneShortage) {

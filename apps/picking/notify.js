@@ -43,7 +43,7 @@ export function resolveLineTo(now = new Date()) {
  *   - 残りを後で取りに行く / どこにもない → 欠品として、他ロケ在庫を添える
  * @param altFree 画面に出ていた確保ロケの表示在庫 (記録しない。表示より多く確保したときの一言用)
  */
-export function buildShortageText({ batch, line, worker, shortageQty, stockText, altFree = null }) {
+export function buildShortageText({ batch, line, worker, shortageQty, stockText, altFree = null, allocations = null }) {
   const alt = Number(line.alt_qty) || 0;
   const remQty = line.remaining_qty ?? (shortageQty - alt);
   const rem = line.remaining || null;
@@ -69,6 +69,9 @@ export function buildShortageText({ batch, line, worker, shortageQty, stockText,
     alt > 0 ? `→ ${altLabel} から ${alt}個 確保しました${Number.isFinite(Number(altFree)) && alt > Number(altFree) ? ` (表示在庫${altFree}より多い・現物優先)` : ''}` : null,
     alt > 0 && remQty === 0 ? `ロジザード: ${altLabel} の在庫を ${alt}個 減らしてください` : null,
     remQty > 0 && v2 ? `残り ${remQty}個 → ${rem === 'later' ? '後で取りに行きます' : '欠品確定 (どこにもない)'}` : null,
+    // どの受注が欠品扱いになったか (配賦先)。事務がNE・出荷可否を判断する起点 (要件§5)
+    (allocations && allocations.length > 0)
+      ? `対象受注: ${allocations.map((x) => `${x.ne_slip_no} × ${x.qty}`).join(' / ')}` : null,
     `作業者: ${worker}`,
     // 他ロケ在庫 (ロジザード在庫スナップショット。取得失敗時も「取得できず」を必ず出す)。
     // 全量確保できたときは不要 (読み手の次の行動は在庫減算だけ)

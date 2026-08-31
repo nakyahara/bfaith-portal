@@ -336,6 +336,10 @@ export function startPackingDrivePoller() {
       purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
       cleanupReprintPdfs();
       await sweepPrintJobsStep();
+      // ピッキング「後で取りに行く」依頼を取込済みバッチへ展開 (欠品フローv2 PR2・fail-soft)。
+      // 欠品はピッキング中 = 梱包CSVの取込前が普通なので、取込後のここで追いつくのが主経路
+      try { (await import('../picking/service.js')).bindPendingLaterRequests(); }
+      catch { /* picking無効環境では何もしない */ }
       await pingJobsMonitor();
       await pingPrintAgentAlive();
     } catch (e) {

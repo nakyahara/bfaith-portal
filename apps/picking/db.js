@@ -48,7 +48,7 @@ export const STATUS_LABELS = {
 };
 
 // スキーマ版数 (PRAGMA user_version)。変更時は MIGRATIONS に追記して番号を上げる。
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 export function initPickingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -232,6 +232,43 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_lines ADD COLUMN alt_qty INTEGER');      // 他ロケで確保した数
     db.exec('ALTER TABLE pk_lines ADD COLUMN remaining_qty INTEGER'); // 確保できなかった残り (0=全量他ロケで確保)
     db.exec("ALTER TABLE pk_lines ADD COLUMN remaining TEXT");        // 残りの扱い: 'later'(後で取りに行く) | 'none'(どこにもない)
+  },
+  // v11: 欠品フローv2 PR2 — picking↔packing 連携 (要件 ピッキング欠品フローv2_20260826 §4.3/4.4)。
+  //   - pk_shortage_allocations: 不足数を**受注に配賦**した結果。梱包画面の 🕒/❌ バッジの元。
+  //     ⭐「同一SKUの全伝票に表示」は不採用 (欠品1個で10伝票が保留に見える) — 配賦した伝票だけに出す
+  //   - pk_later_requests: 「後で取りに行く」の依頼。梱包バッチが取込済みなら pk_pack_tasks
+  //     (kind='repick') へ展開され、既存の再ピック機構 (1行バッチ→受領) にそのまま乗る。
+  //     未取込なら pending_binding で待ち、取込後の reconcile/ポーラーで展開する
+  11: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_shortage_allocations (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id   INTEGER NOT NULL REFERENCES pk_batches(id),
+      line_seq   INTEGER NOT NULL,
+      sku        TEXT NOT NULL,
+      ne_slip_no TEXT NOT NULL,             -- 配賦先の受注 (NE伝票番号)
+      qty        INTEGER NOT NULL,
+      kind       TEXT NOT NULL CHECK(kind IN ('later','none')),
+      created_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_shortage_alloc_line ON pk_shortage_allocations(batch_id, line_seq)');
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_later_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id      INTEGER NOT NULL REFERENCES pk_batches(id),
+      line_seq      INTEGER NOT NULL,
+      sku           TEXT NOT NULL,
+      product_name  TEXT,
+      qty           INTEGER NOT NULL,       -- 後で取りに行く数 (= その明細の remaining_qty)
+      from_block    TEXT,
+      from_location TEXT,                   -- 元ロケ (取りに行く場所の参考)
+      requested_by  TEXT NOT NULL,          -- ピッカー
+      status        TEXT NOT NULL DEFAULT 'pending_binding'
+        CHECK(status IN ('pending_binding','requested','cancelled')),
+      merged_task_ids TEXT,                 -- 梱包側の再ピックに合流した先 (カンマ区切り task id)。
+                                            -- 合流先が着手済みなら back を拒否するために持つ
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL
+    )`);
+    db.exec("CREATE INDEX IF NOT EXISTS idx_pk_later_requests_status ON pk_later_requests(status)");
   },
 };
 

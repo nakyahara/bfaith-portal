@@ -14,6 +14,8 @@
  */
 import crypto from 'node:crypto';
 import { parseCsv, decodeCp932 } from '../packing-dispatch/csv.js';
+// 欠品フローv2 PR2: 再取込 (overwrite) 前に、ピッカーの「後で取りに行く」の展開を依頼へ戻す
+import { resetLaterBindingsForPackBatch } from '../picking/service.js';
 import {
   getDB, getPackBatchByTbKey, utcNow, jstToday,
 } from './db.js';
@@ -409,6 +411,17 @@ export function importPackBatch(preview, { folderName, overwrite, matchAck, date
         throw new PackError(409, 'duplicate',
           `バッチ ${preview.tbKey} は取込済みです (${existing.slip_count}伝票)`);
       }
+      // 欠品フローv2 PR2: ピッカーの「後で取りに行く」から展開済みのタスクは slip_seq で
+      // 伝票を指しており、再取込で別のお客さまを指してしまう → 依頼へ戻して展開し直させる。
+      // ピッカーが既に取りに動いている分があれば再取込を止める (Codex High)。
+      // ⭐overwrite は status='ready' のバッチにしか許されないので、梱包者自身の
+      //   再ピックタスク (作業開始後にしか生まれない) はここに存在し得ない
+      try {
+        resetLaterBindingsForPackBatch(db, existing.id);
+      } catch (e) {
+        if (e && e.code === 'later_in_progress') throw new PackError(409, 'later_in_progress', e.message);
+        throw e;
+      }
       // 旧版の伝票・明細を監査ログ用に丸ごとスナップショットしてから消す (Codex R1 medium:
       // 集計値だけでは、Drive側のCSVも差し替わった後に「上書き前は何が対象だったか」を復元できない)
       existing._snapshotSlips = db.prepare(
@@ -619,6 +632,24 @@ export function getWorkState(batchId) {
     warns: s.warn_json ? JSON.parse(s.warn_json) : [],
     lines: linesBySlip.get(s.id) || [],
   }));
+  // ピッキング欠品の配賦 (欠品フローv2 PR2・picking所有テーブルの参照のみ)。
+  // 配賦された伝票だけに 🕒(後で取りに行く)/❌(どこにもない) を出す —
+  // 同一SKUの全伝票に出すと、欠品1個で10伝票が保留に見えて出荷が遅れる (要件§4.4)
+  try {
+    const bySlip = new Map();
+    for (const a of db.prepare(`
+      SELECT s.seq, a.sku, a.qty, a.kind
+      FROM pk_shortage_allocations a
+      JOIN pk_batches pb ON pb.id = a.batch_id
+      JOIN pk_pack_slips s ON s.batch_id = ? AND s.ne_slip_no = a.ne_slip_no
+      WHERE pb.tb_no = ?
+      ORDER BY a.id
+    `).all(batchId, batch.tb_key)) {
+      if (!bySlip.has(a.seq)) bySlip.set(a.seq, []);
+      bySlip.get(a.seq).push({ sku: a.sku, qty: a.qty, kind: a.kind });
+    }
+    for (const s of full) s.pickingShortages = bySlip.get(s.seq) || [];
+  } catch { for (const s of full) s.pickingShortages = []; }   // picking無効環境
   const pending = full.filter((s) => s.status === 'pending');
   // ③ミス候補 (梱包完了サマリで確定/取下げする) と、保留伝票の未解決再ピックタスク状態
   let incidents = [];
