@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -507,6 +507,13 @@ const MIGRATIONS = {
     db.exec(`UPDATE pk_print_jobs SET state='manual', finished_at=datetime('now'),
       updated_at=datetime('now'), error='出力先の決め方が変わったため手動印刷へ回しました'
       WHERE state IN ('queued','leased') AND (printer_name IS NULL OR printer_name = '')`);
+  },
+  // v16: 欠品フローv2 PR2 — ピッカーの「後で取りに行く」から展開された repick タスクに
+  //   出自 (pk_later_requests.id) を持たせる。ピッカーが back で取り下げるとき、
+  //   この依頼から生まれたタスクだけを正確に取消するため (SKU/伝票の一致では、梱包側が
+  //   自分で出した再ピック依頼まで巻き込みかねない)
+  16: () => {
+    db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN later_request_id INTEGER');
   },
 };
 

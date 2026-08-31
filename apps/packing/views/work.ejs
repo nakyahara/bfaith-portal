@@ -380,7 +380,7 @@
       slips: state.slips.map((s) => ({
         seq: s.seq, status: s.status, neSlipNo: s.ne_slip_no, mall: s.mall,
         deliveryMethod: s.delivery_method, material: s.material, printHeader1: s.print_header1,
-        boxCount: s.box_count, warns: s.warns,
+        boxCount: s.box_count, warns: s.warns, pickingShortages: s.pickingShortages || [],
         recipientName: s.recipient_name, recipientZip: s.recipient_zip,
         recipientPref: s.recipient_pref, recipientAddr: s.recipient_addr,
         siteOrderNo: s.site_order_no, orderDate: s.order_date,
@@ -491,6 +491,10 @@
       if (heldSet.has(s.seq)) $('doneTag').style.display = 'inline-block';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
+      // ピッキング欠品の配賦バッジ (欠品フローv2 PR2)。この伝票に入るはずの商品が足りない
+      const pshort = (s.pickingShortages || []).map((p) => p.kind === 'none'
+        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません (${esc(p.sku)} × ${p.qty})</span>`
+        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 後で取りに行きます (${esc(p.sku)} × ${p.qty})</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
       $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
       const lines = s.lines.map((l) => `
@@ -521,7 +525,7 @@
           ${s.deliveryDate ? `<span>配達指定 ${esc(s.deliveryDate)} ${esc(s.deliveryTime || '')}</span>` : ''}
         </div>
         ${matCardHtml(s.seq)}
-        ${warns ? `<div class="warns">${warns}</div>` : ''}
+        ${(warns || pshort) ? `<div class="warns">${pshort}${warns}</div>` : ''}
         <div class="recipient">
           <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
           <div class="addr">〒${esc(s.recipientZip || '')} ${esc(s.recipientPref || '')}${esc(s.recipientAddr || '')}</div>
