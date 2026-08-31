@@ -49,6 +49,19 @@ console.log('=== 1. ZIP/CSV 解釈 ===');
     && p.records[0].posted_at === '2026-08-27 00:00:00' && p.records[0].review_url === `yahoo:${reviewIdentityFor('b-faith01-10287955', 'golden-jojoba-1000')}`);
   check('identity は注文ID+商品コードで決定的、revision は内容で変わる',
     reviewIdentityFor('a', 'b') === reviewIdentityFor(' a ', 'b') && revisionHashFor(p.records[0]) !== revisionHashFor({ ...p.records[0], body: 'x' }));
+  // 2026-08-31 実データ: レビュー本文に二重引用符が **1 個だけ** 入っていた。
+  // RFC4180 パーサだとそこを「囲みの開始」と誤読して次の行と結合し、
+  // 「列数不一致 (7 != 10)」で 1,144 件の取込が丸ごと止まった (自動取得が実際に停止)
+  {
+    const q = prepareYahooReviewFile('20260530_20260827_ItemReview.zip', zipOf([
+      row('20260826', 5, 'wsage-1', 'b-faith01-1', 'よい', 'よい商品'),
+      row('20260827', 4, 'mitsurou-1', 'b-faith01-2', '定番', 'いわゆる "定番" です'),
+      row('20260827', 3, 'bukka-1', 'b-faith01-3', 'ふつう', 'ふつうでした'),
+    ]));
+    check('本文に引用符が1個だけでも全行読める (行が結合されない)', q.ok && q.records.length === 3, q.error);
+    check('引用符は本文の文字として残る', q.ok && /"定番"/.test(q.records.find((r) => r.order_number === 'b-faith01-2')?.body || ''));
+  }
+
   const bad = prepareYahooReviewFile('x.zip', zipOf([row('20260231', 5, 'c', 'o', '', '')]));
   check('実在しない評価日は拒否', !bad.ok && /評価日/.test(bad.error));
   const badHdr = new AdmZip(); badHdr.addFile('a.csv', iconv.encode('"評価日","評価点数"\r\n"20260101","5"\r\n', 'Shift_JIS'));
