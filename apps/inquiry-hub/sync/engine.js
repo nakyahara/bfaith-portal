@@ -40,6 +40,7 @@
 import crypto from 'crypto';
 import { getDB, logActivity, toUtcIso } from '../db.js';
 import { adoptComposeInquiryByMessageIds, flagComposeThreadSplit } from '../compose.js';
+import { manualFieldsAfterSync } from '../customer-info.js';
 
 export const OVERLAP_MS = 60 * 60 * 1000;          // 取得ウィンドウのオーバーラップ (60分。§8.1)
 export const DEFAULT_BACKFILL_DAYS = 30;           // 初回同期の遡り日数
@@ -145,7 +146,11 @@ function ingestInquiry(db, shop, item, nowIso) {
     stats.newInquiry = true;
   } else {
     // 外部状態は表示専用カラムへそのまま保存 (internal_statusには反映しない。§8.1)。
-    // 顧客名・注文番号等はアダプターが値を返した場合のみ上書き (nullで消さない)
+    // 顧客名・注文番号等はアダプターが値を返した場合のみ上書き (nullで消さない)。
+    // 顧客情報の手入力 (2026-08-31): 同期が値を返した項目はモール確定情報になるので手入力集合
+    // (manual_fields) から外し、以後は画面から変更できなくする。返さない項目の手入力値は残る
+    // (inq は compose 合流経由で部分行のこともあるため manual_fields はここで読む)
+    const manualRaw = db.prepare('SELECT manual_fields FROM inquiries WHERE id = ?').get(inq.id)?.manual_fields ?? null;
     db.prepare(`UPDATE inquiries SET
         external_status = COALESCE(?, external_status),
         external_is_read = COALESCE(?, external_is_read),
@@ -156,11 +161,13 @@ function ingestInquiry(db, shop, item, nowIso) {
         order_number = COALESCE(?, order_number),
         product_code = COALESCE(?, product_code),
         product_name = COALESCE(?, product_name),
+        manual_fields = ?,
         updated_at = ?
       WHERE id = ?`)
       .run(extStatus, extRead, nowIso,
         item.customerName ?? null, item.customerIdentifier ?? null, item.subject ?? null,
         item.orderNumber ?? null, item.productCode ?? null, item.productName ?? null,
+        manualFieldsAfterSync(manualRaw, item),
         nowIso, inq.id);
   }
 
