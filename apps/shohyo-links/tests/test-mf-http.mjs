@@ -66,6 +66,12 @@ check('受け箱: MFの仕訳帳へのリンクと No.コピーがある',
 check('受け箱: 二重添付の確認文に件数と選択肢が出る',
   inboxHtml.includes('二重添付になるかもしれません') && inboxHtml.includes('別の書類だと確かめた'));
 
+// 突合コードを日本語で出す (経理が読む画面に内部コードを出さない)
+check('受け箱: 突合コードの日本語訳がある',
+  inboxHtml.includes('支払先・金額・日付の3つが一致しました') && inboxHtml.includes('同じ金額の明細がMFにありません'));
+check('受け箱: 旧形式の「(仕訳に証憑あり)」が残っていても日本語になる', inboxHtml.includes("replace(' (仕訳に証憑あり)', '')"));
+check('受け箱: 元のコードは title に残す (調査用)', inboxHtml.includes('title="${esc(r.error || r.match_reason'));
+
 // 明細ビュー
 r = await fetch(base + '/apps/shohyo-links/mf/transactions', { redirect: 'manual' });
 check('/mf/transactions は200', r.status === 200, String(r.status));
