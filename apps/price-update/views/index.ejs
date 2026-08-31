@@ -210,9 +210,18 @@
       if (s.shipWeight) bits.push(esc(s.shipWeight) + 'g');
       if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
     }
-    if (r.neDeliveryMethod || r.shipping != null) {
-      parts.push('<div class="pu-note">NE: ' + esc(r.neDeliveryMethod || '未登録')
-        + (r.shipping != null ? ' ' + yen(r.shipping) + '円' : '') + '</div>');
+    // 粗利に使っている配送関係費。どこから引いた値かを必ず添える
+    if (r.shipping != null) {
+      const src = r.shippingSource === 'mall'
+        ? '<span class="ok">' + esc(r.shippingLabel || '') + ' ' + yen(r.shipping) + '円</span>'
+        : (r.shippingSource === 'unknown'
+          ? '<span class="warn">送料は不明 — 商品マスタの ' + yen(r.shipping) + '円で計算</span>'
+          : '<span class="pu-note">' + esc(r.shippingLabel || r.neDeliveryMethod || '') + ' ' + yen(r.shipping) + '円</span>');
+      parts.push('<div>' + src + '</div>');
+    }
+    if (r.neDeliveryMethod) {
+      parts.push('<div class="pu-note">NE: ' + esc(r.neDeliveryMethod)
+        + (r.productShipping != null ? ' ' + yen(r.productShipping) + '円' : '') + '</div>');
     }
     return parts.length ? parts.join('') : '<span class="pu-note">—</span>';
   }

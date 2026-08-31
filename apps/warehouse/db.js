@@ -2048,6 +2048,11 @@ function createTables() {
       ['aupay_sku_map', 'f_aupay_sku_map',
         'one row = one (store_id, aupay_key=item_code) — au PAY出品コード → NEコード の手動map',
         '["store_id","aupay_key"]'],
+      // 送料マスタ (25行程度)。価格一括改定がモール別の粗利を出すのに使う (2026-08-31)。
+      // 同じ商品でも楽天=定形外 / Yahoo=ネコポス と配送方法が違い、送料が変わるため
+      ['shipping_rates', 'shipping_rates',
+        'one row = one shipping_code — 配送方法マスタ (送料 + 出荷作業料 + 梱包資材費 + 人件費 = 配送関係費合計)',
+        '["shipping_code"]'],
     ];
     const seedStmt = db.prepare(`
       INSERT INTO sync_contracts (

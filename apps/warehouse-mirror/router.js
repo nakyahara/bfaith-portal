@@ -1212,13 +1212,34 @@ const SKU_MAP_TABLE_SPECS = {
     // store_id も必須 (default で黙って埋めない。PK の一部なので取り違えると別ストアの行を上書きする)
     required: ['store_id', 'yahoo_key', 'ne_code', 'resolution_source'],
     cols: ['store_id', 'yahoo_key', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
+    pkCols: ['store_id', 'yahoo_key'],
     validate: makeSkuMapValidator('yahoo_key'),
   },
   aupay_sku_map: {
     table: 'mirror_aupay_sku_map',
     required: ['store_id', 'aupay_key', 'ne_code', 'resolution_source'],
     cols: ['store_id', 'aupay_key', 'ne_code', 'resolution_source', 'notes', 'created_at', 'updated_at'],
+    pkCols: ['store_id', 'aupay_key'],
     validate: makeSkuMapValidator('aupay_key'),
+  },
+  // 送料マスタ (25行程度)。配送方法ごとの配送関係費合計を持つ。
+  // 価格一括改定がモール別の粗利を出すのに使う (2026-08-31)
+  shipping_rates: {
+    table: 'mirror_shipping_rates',
+    required: ['shipping_code', '小分類区分名称'],
+    cols: ['shipping_code', '大分類区分', '運送会社', '小分類区分名称', '梱包サイズ', '最大重量',
+      '追跡有無', '送料', '出荷作業料', '想定梱包資材費', '想定人件費', '配送関係費合計', '備考'],
+    pkCols: ['shipping_code'],
+    validate: (r, HttpErrorCls) => {
+      // 金額は数値でなければ受けない (文字列が入ると粗利計算が黙って壊れる)
+      for (const col of ['送料', '出荷作業料', '想定梱包資材費', '想定人件費', '配送関係費合計']) {
+        const v = r[col];
+        if (v === null || v === undefined || v === '') continue;
+        if (!Number.isFinite(Number(v)) || Number(v) < 0) {
+          throw new HttpErrorCls(400, { error: 'bad_row', message: `${col} は 0 以上の数値が必要: ${JSON.stringify(v)}` });
+        }
+      }
+    },
   },
 };
 const SKU_MAP_ENTITY_NAMES = new Set(Object.keys(SKU_MAP_TABLE_SPECS));
@@ -2215,7 +2236,7 @@ router.post('/api/sync/:entity/chunk', requireSyncKey, async (req, res) => {
     // すり抜ける (監査上も欠損が見えない)。送信側にも同じ検査があるが、受け側でも必ず見る
     {
       const spec = DD_ALL_TABLE_SPECS[entity];
-      const keyCols = spec.cols.filter((c) => c === 'store_id' || c.endsWith('_key'));
+      const keyCols = spec.pkCols || spec.cols.filter((c) => c === 'store_id' || c.endsWith('_key'));
       const seen = new Set();
       for (const r of rows) {
         const pk = JSON.stringify(keyCols.map((c) => r[c]));

@@ -928,14 +928,15 @@ async function main() {
       console.log('[DailySync] Qoo10分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
-    // === SKUマップ 2種 mirror sync (価格一括改定ツール PR1、2026-08-28) ===
+    // === 小さなマスタの mirror sync (価格一括改定ツール) ===
+    // SKUマップ 2種 + 送料マスタ (配送方法ごとの配送関係費合計。モール別の粗利計算に使う)
     // f_yahoo_sku_map / f_aupay_sku_map を Render へ全置換で送る。価格一括改定ツールの
     // 出品引き当てが参照する。手動 map なので普段は差分ゼロ、行数も数百 (単一 chunk)
     const skuMapSyncResult = runScript(
       `apps/warehouse/sync-sku-maps.js --data-dir ${DATA_DIR_ARG}`,
-      'SKUマップ sync', 300000
+      'SKUマップ/送料マスタ sync', 300000
     );
-    results.push({ name: 'SKUマップ sync', ...skuMapSyncResult });
+    results.push({ name: 'SKUマップ/送料マスタ sync', ...skuMapSyncResult });
 
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)

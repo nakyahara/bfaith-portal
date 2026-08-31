@@ -1136,6 +1136,27 @@ function createTables() {
       PRIMARY KEY (store_id, aupay_key)
     )`);
     db.exec('CREATE INDEX IF NOT EXISTS idx_masm_ne ON mirror_aupay_sku_map(ne_code)');
+    // 送料マスタ (25行程度)。m_products.送料コード の参照先で、配送方法ごとの「配送関係費合計」
+    // (送料 + 出荷作業料 + 梱包資材費 + 人件費) を持つ。
+    // 価格一括改定でモール別の粗利を出すのに使う — 同じ商品でも楽天=定形外 / Yahoo=ネコポス と
+    // 配送方法が違い、送料が変わるため (2026-08-31)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_shipping_rates (
+      shipping_code   TEXT NOT NULL PRIMARY KEY CHECK(trim(shipping_code) <> ''),
+      大分類区分       TEXT,
+      運送会社         TEXT,
+      小分類区分名称   TEXT NOT NULL CHECK(trim(小分類区分名称) <> ''),
+      梱包サイズ       TEXT,
+      最大重量         TEXT,
+      追跡有無         TEXT,
+      送料             REAL,
+      出荷作業料       REAL,
+      想定梱包資材費   REAL,
+      想定人件費       REAL,
+      配送関係費合計   REAL,
+      備考             TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_msr_name ON mirror_shipping_rates(小分類区分名称)');
   } catch (e) {
     skuMapInitError = {
       message: String(e.message || e),
