@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { classifyFeeRow, normalizeFeeDesc, netTotal, FEE_COLUMNS } from './fee-breakdown.js';
-import { parsePaymentCsvText, aggregate } from './payment-csv.js';
+import { parsePaymentCsvText, aggregate, segmentCsvSection } from './payment-csv.js';
 
 const EASY = 'Amazon Easy Ship料金';
 const STORAGE = 'FBA在庫保管手数料';
@@ -168,6 +168,22 @@ test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・�
   const feeSum = FEE_COLUMNS.reduce((s, c) => s + other[c], 0);
   const judged = d.filter(x => x.判定).reduce((s, x) => s + x.合計, 0);
   assert.equal(feeSum, judged);
+});
+
+test('segmentCsvSection: 列順 = 金額列 → 内訳3列 → 合計(差引) → 原価合計、旧月 (内訳キーなし) は従来の合計', () => {
+  const columns = ['商品売上', 'その他', '合計'];
+  const bySegment = {
+    '1': { 商品売上: 1000, その他: 0, 合計: 1000, [EASY]: 0, [STORAGE]: 0, [LONG]: 0, 原価合計: 400 },
+    other: { 商品売上: 0, その他: -900, 合計: -900, [EASY]: -500, [STORAGE]: -300, [LONG]: -100, 原価合計: 0 },
+    old: { 商品売上: 10, その他: -5, 合計: 5, 原価合計: 1 }, // 内訳キーなし (旧月相当)
+  };
+  const csv = segmentCsvSection(bySegment, columns, FEE_COLUMNS, { 1: '自社商品' });
+  const lines = csv.split('\n');
+  assert.equal(lines[0], 'セグメント,商品売上,その他,' + FEE_COLUMNS.join(',') + ',合計,原価合計');
+  assert.equal(lines[1], '1:自社商品,1000,0,0,0,0,1000,400');
+  assert.equal(lines[2], 'other:その他/未分類,0,-900,-500,-300,-100,0,0'); // 合計 = -900 - (-900) = 0
+  assert.equal(lines[3], 'old:old,10,-5,0,0,0,5,1');                     // 旧月は従来の合計 5 のまま
+  assert.equal(lines[4], '');
 });
 
 // ─── 実CSVでの受け入れ確認 (要件定義 §7 の期待値) ───

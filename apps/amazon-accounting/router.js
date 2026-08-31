@@ -13,8 +13,8 @@ import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 import { normalizeYearMonth } from '../../lib/jst-date.js';
-import { FEE_COLUMNS, netTotal } from './fee-breakdown.js';
-import { parsePaymentCsvText, aggregate } from './payment-csv.js';
+import { FEE_COLUMNS } from './fee-breakdown.js';
+import { parsePaymentCsvText, aggregate, segmentCsvSection } from './payment-csv.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -374,14 +374,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
   summaryCsv += mfColumns.map(c => mfRow[c] || 0).join(',') + '\n';
   // セグメント別
   summaryCsv += '\n【セグメント別集計（管理会計用）】\n';
-  // 列順は画面と同じ: 金額列 → 手数料内訳3列 → 合計 (内訳3列を差し引いた額) → 原価合計
-  const amountColumns = columns.filter(c => c !== '合計');
-  summaryCsv += 'セグメント,' + amountColumns.join(',') + ',' + feeColumns.join(',') + ',合計,原価合計\n';
-  for (const [key, row] of Object.entries(bySegment)) {
-    const label = SEGMENT_NAMES[key] || (key === 'other' ? 'その他/未分類' : key);
-    summaryCsv += key + ':' + label + ',' + amountColumns.map(c => row[c] || 0).join(',')
-      + ',' + feeColumns.map(c => row[c] || 0).join(',') + ',' + netTotal(row, feeColumns) + ',' + (row.原価合計 || 0) + '\n';
-  }
+  // 列順は画面と同じ (金額列 → 手数料内訳3列 → 合計(差引) → 原価合計)。生成は payment-csv.js に分離 (テスト対象)
+  summaryCsv += segmentCsvSection(bySegment, columns, feeColumns, SEGMENT_NAMES);
   // SKUなし行の説明別一覧 (手数料内訳の根拠)
   summaryCsv += '\n【SKUなし行の説明別一覧（手数料内訳）】\n';
   summaryCsv += 'トランザクションの種類,説明,判定,行数,合計\n';
@@ -1038,7 +1032,8 @@ function renderPage() {
           // ヘッダーの合計: セグメント全体の商品売上と合計を集計
           const segAll = row.by_segment || {};
           let hdrSales = 0, hdrTotal = 0;
-          for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += (sr['合計'] || 0); }
+          // 見出しの合計は展開後の表と同じ差引後 (内訳3列を引いた額。内訳キーが無い旧月は従来の合計)
+          for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += netTotal(sr, FEE_COLUMNS); }
 
           html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
           html += '<span><b>' + esc(row.year_month) + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()

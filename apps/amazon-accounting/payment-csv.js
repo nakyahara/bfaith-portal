@@ -6,7 +6,7 @@
  *
  * 集計ロジックの正本は システム設計\Amazon売上集計ツール_引き継ぎ.md、手数料内訳は fee-breakdown.js を参照。
  */
-import { FEE_COLUMNS, classifyFeeRow } from './fee-breakdown.js';
+import { FEE_COLUMNS, classifyFeeRow, netTotal } from './fee-breakdown.js';
 
 // ─── ペイメントレポートCSVの解析 ───
 // 先頭のメタ行数は Amazon 側で増減するため、"日付/時間" と "SKU" を含む行をヘッダーとして動的に検出する。
@@ -212,4 +212,18 @@ export function aggregate(resolvedRows) {
     mfRow,
     mfColumns,
   };
+}
+
+// ─── 集計サマリーCSV「セグメント別集計」セクション ───
+// 列順は画面のセグメント表と同じ: 金額列 (合計を除く) → 手数料内訳3列 → 合計 (内訳3列を差し引いた額) → 原価合計
+// (router.js から分離 = テストで列順と差引合計を固定値検証する)
+export function segmentCsvSection(bySegment, columns, feeColumns, segmentNames) {
+  const amountColumns = columns.filter(c => c !== '合計');
+  let out = 'セグメント,' + amountColumns.join(',') + ',' + feeColumns.join(',') + ',合計,原価合計\n';
+  for (const [key, row] of Object.entries(bySegment || {})) {
+    const label = (segmentNames && segmentNames[key]) || (key === 'other' ? 'その他/未分類' : key);
+    out += key + ':' + label + ',' + amountColumns.map(c => row[c] || 0).join(',')
+      + ',' + feeColumns.map(c => row[c] || 0).join(',') + ',' + netTotal(row, feeColumns) + ',' + (row.原価合計 || 0) + '\n';
+  }
+  return out;
 }
