@@ -341,7 +341,7 @@ function supplementOrder(parentId, rawItems, extraNote, sendEmail, actor) {
 function productDto(p) {
   return {
     code: p.code, name: p.name, stock: p.stock, backOrder: p.backOrder,
-    sales30: p.sales30, sales7: p.sales7, lot: p.lot, holdMonths: p.holdMonths,
+    sales30: p.sales30, sales7: p.sales7, lot: p.lot, lotMissing: p.lotMissing, effectiveLot: p.effectiveLot, holdMonths: p.holdMonths,
     stockMonths: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
     salesDefined: p.salesDefined, targetReason: p.targetReason, holdMonthsMissing: p.holdMonthsMissing,
     cost: p.cost, price: p.price, lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
@@ -461,6 +461,8 @@ function supplierWorkspaceData(code) {
     horikoshi: g ? g.horikoshi.map(p => ({ ...productDto(p), barcode: bcOf(p) })) : [],
     conditions, materialGroups, draft, draftExtras, issuedMonth, issuedByCond, issuedTotal, allGroups,
     monthLabel: jstNow.toISOString().slice(0, 7),
+    // ロット未設定商品 (1個単位で計算) の推奨量を初期カートへ自動投入するか (既定 on。off で参考表示だけにできる一括停止スイッチ)
+    lotMissingAutofill: getSetting('lot_missing_autofill') !== 'off',
   };
 }
 
@@ -814,6 +816,19 @@ router.post('/api/target-rule', (req, res) => {
     if (rule !== 'v1' && rule !== 'v2') return res.status(400).json({ ok: false, error: 'rule は v1/v2 のみ' });
     setSetting('target_rule', rule, { actor: actorOf(req), reason: rule === 'v1' ? '⚠️要発注判定を旧ルール(v1)へロールバック' : '要発注判定を v2 (不等式形) へ' });
     res.json({ ok: true, rule: targetRule() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// ロット未設定商品の自動カート投入 on/off (既定 on)。off = 推奨量は参考表示のみ (Codex PR2 設計: 一括停止スイッチ)
+router.get('/api/lot-missing-autofill', (req, res) => {
+  res.json({ ok: true, autofill: getSetting('lot_missing_autofill') !== 'off' });
+});
+router.post('/api/lot-missing-autofill', (req, res) => {
+  try {
+    const v = req.body && req.body.autofill;
+    if (typeof v !== 'boolean') return res.status(400).json({ ok: false, error: 'autofill は true/false' });
+    setSetting('lot_missing_autofill', v ? 'on' : 'off', { actor: actorOf(req), reason: v ? 'ロット未設定商品の自動投入を再開' : '⚠️ロット未設定商品の自動投入を停止 (参考表示のみ)' });
+    res.json({ ok: true, autofill: getSetting('lot_missing_autofill') !== 'off' });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -3214,6 +3229,33 @@ router.get('/api/attrs/unlinked', (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// 取扱中 × 発注ロット単位 未設定 の商品一覧 (NE で埋めてもらう作業キュー。アプリ側にロット補正値は保存しない = SSoT は NE)。
+// 優先順: 要発注に該当 → 在庫0で売れている → 月間粗利 (30日販売×(売価−原価)) の大きい順 (Codex 設計相談 R1)
+router.get('/api/lot-missing', (req, res) => {
+  try {
+    const { products } = computeAll();
+    const rows = [];
+    let sellingCount = 0, targetCount = 0;
+    for (const p of products) {
+      if (!p.active || !p.lotMissing) continue;
+      const selling = p.sales30 > 0;
+      if (selling) sellingCount++;
+      if (p.isTarget) targetCount++;
+      const gp = Math.round(p.sales30 * Math.max(0, p.price - p.cost));
+      rows.push({
+        code: p.code, name: p.name, supplier: p.supplierCode || '', stock: p.stock, backOrder: p.backOrder,
+        sales30: p.sales30, stockMonths: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100,
+        holdMonths: p.holdMonths, cost: p.cost, price: p.price, monthlyGp: gp, recQty: p.recQty,
+        isTarget: p.isTarget, stockoutSelling: selling && (p.stock + p.backOrder) <= 0,
+        lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
+        rank: p.isTarget ? 0 : (selling && (p.stock + p.backOrder) <= 0) ? 1 : selling ? 2 : 3,
+      });
+    }
+    rows.sort((a, b) => a.rank - b.rank || b.monthlyGp - a.monthlyGp || a.code.localeCompare(b.code));
+    res.json({ ok: true, count: rows.length, sellingCount, targetCount, rows });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ─── 商品別モール販売内訳 (売れ筋の在庫切れ防止の定点観測用) ───
 // 速報 = mirror_f_sales_velocity_by_product_mall (NE受注ベース、毎朝、7/30日固定、全チャネル)
 // 確定 = mirror_*_finance_sku_daily 6モール (精算/受注fact)。セット構成を展開して実出荷ピース数で数える
@@ -4017,7 +4059,8 @@ if (D.draft && D.draft.items.length) {
   });
   if (disChanged) saveDis();
 } else {
-  D.targets.forEach(function(p){ if (p.recQty && !p.recentIssued && !DIS.has(p.code)) CART[p.code] = p.recQty; });
+  // ロット未設定 (1個単位で計算) の行は設定 lot_missing_autofill=off のとき投入しない (参考表示のみ)
+  D.targets.forEach(function(p){ if (p.recQty && !p.recentIssued && !DIS.has(p.code) && (!p.lotMissing || D.lotMissingAutofill)) CART[p.code] = p.recQty; });
 }
 
 function months(p){ return p.stockMonths == null ? '—' : (Math.round(p.stockMonths * 100) / 100).toFixed(2); }
@@ -4032,6 +4075,10 @@ function qtyCell(p) {
 }
 function dateCell(p) {
   return '<input type="date" data-date="' + esc(p.code) + '" value="' + esc(DATES[p.code] || '') + '" style="width:135px" title="この商品の希望納期 (空=指定なし)。仕入先への発注メールに載ります">';
+}
+function lotBadge(p) {
+  if (!p.lotMissing) return '';
+  return ' <span class="badge b-warn" title="NEの発注ロット単位が未設定 (0)。推奨数量は1個単位で計算しています (発注条件のロット倍率・ケース換算には数えません)。NEでロットを設定すると翌朝から反映">⚠️ロット未設定→1個単位</span>';
 }
 function selBadge(p) {
   if (!p.selectableLow) return '';
@@ -4058,12 +4105,12 @@ function addedBadge(p) {
 function rowHtml(p, kind) {
   var rec = p.recQty ? p.recQty.toLocaleString('ja-JP') : '—';
   return '<tr>' +
-    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + addedBadge(p) + bcBadge(p.code, p.barcode) + '</td>' +
+    '<td><a class="copyv" data-copy="' + esc(p.code) + '" title="クリックで商品コードをコピー">' + esc(p.code) + '</a>' + issuedBadge(p) + selBadge(p) + lotBadge(p) + addedBadge(p) + bcBadge(p.code, p.barcode) + '</td>' +
     '<td><a class="pname" data-acc="' + esc(p.code) + '" title="クリックで詳細・発注条件・同グループ商品">' + esc(p.name) + '</a></td>' +
     '<td class="r">' + months(p) + '</td>' +
     '<td class="r">' + p.sales30.toLocaleString('ja-JP') + '</td>' +
     '<td class="r">' + (p.stock + p.backOrder).toLocaleString('ja-JP') + (p.backOrder ? ' <span class="muted">(注残' + p.backOrder.toLocaleString('ja-JP') + ')</span>' + boDateNote(p) : '') + '</td>' +
-    '<td class="r">' + (p.lot || '—') + '</td>' +
+    '<td class="r">' + (p.lotMissing ? '<span class="muted" title="未設定 (1個単位で計算)">未設定</span>' : p.lot) + '</td>' +
     '<td class="r">' + (kind === 'hori' ? esc(p.lastPurchase || '—') : rec) + '</td>' +
     '<td class="r">' + (p.cost ? yen(p.cost) : '—') + '</td>' +
     '<td style="white-space:nowrap">' + qtyCell(p) + '<a class="copyq" data-copyq="' + esc(p.code) + '" title="クリックで発注数をコピー">📋</a></td>' +
@@ -8125,6 +8172,7 @@ router.get('/admin', (req, res) => {
       <button data-tab="attrs">商品紐付け</button>
       <button data-tab="selectable">🧩 選べるセット構成</button>
       <button data-tab="unlinked">🆕 未紐付けの新商品<span id="unlinkedBadge"></span></button>
+      <button data-tab="lotmissing">⚠️ ロット未設定<span id="lotMissingBadge"></span></button>
     </div>
     <div class="sec" id="tabSec"><div class="bd" id="tabBody">読み込み中…</div></div>`;
   const script = `
@@ -8362,6 +8410,59 @@ function loadUnlinked(days) {
     .then(function(r){ return r.json(); })
     .then(function(j){ if (j.ok) renderUnlinked(j); else document.getElementById('tabBody').textContent = j.error; });
 }
+// ── ⚠️ ロット未設定タブ (取扱中 × NE発注ロット単位=0)。推奨量は1個単位で計算・投入しているので、
+//     NEでロットを埋めてもらう作業キュー。アプリ側にロット補正値は持たない (SSoT=NE、翌朝同期で自然に消える) ──
+var LM_DATA = null, LM_FILTER = 'all';
+function loadLotMissing() {
+  document.getElementById('tabBody').textContent = '読み込み中…';
+  Promise.all([
+    fetch('/apps/purchase-orders/api/lot-missing').then(function(r){ return r.json(); }),
+    fetch('/apps/purchase-orders/api/lot-missing-autofill').then(function(r){ return r.json(); }),
+  ]).then(function(res) {
+    if (TAB !== 'lotmissing') return;
+    if (!res[0].ok) { document.getElementById('tabBody').textContent = res[0].error; return; }
+    LM_DATA = res[0]; LM_DATA.autofill = res[1].ok ? res[1].autofill : true;
+    renderLotMissing();
+  }).catch(function(e){ if (TAB === 'lotmissing') document.getElementById('tabBody').textContent = '通信エラー: ' + e.message; });
+}
+function renderLotMissing() {
+  var j = LM_DATA;
+  var rows = j.rows.filter(function(r){ return LM_FILTER === 'all' || (LM_FILTER === 'target' && r.isTarget) || (LM_FILTER === 'selling' && r.sales30 > 0); });
+  var h = '<div class="toolbar" style="flex-wrap:wrap;gap:6px">' +
+    [['all', '全て ' + j.count], ['target', '要発注に該当 ' + j.targetCount], ['selling', '直近30日に販売あり ' + j.sellingCount]].map(function(c){
+      return '<button class="' + (LM_FILTER === c[0] ? 'pri' : 'ghost') + ' sm" data-lmfilter="' + c[0] + '">' + c[1] + '</button>'; }).join('') +
+    '<button class="ghost sm" id="lmCsv" style="margin-left:auto">⬇ CSV (NE更新用)</button></div>' +
+    '<div class="hint">NEの「発注ロット単位」が未設定 (0) の取扱中商品。<b>推奨数量は1個単位で計算して要発注に載せています</b> (中原さん決定 2026-08-30)。' +
+    'ケース単位でしか受けない商品はNEでロットを設定してください (翌朝の同期で反映され、この一覧から消えます)。並び順: 要発注 → 在庫0で販売あり → 月間粗利の大きい順。</div>' +
+    '<div class="hint" style="margin-top:4px"><label><input type="checkbox" id="lmAutofill"' + (j.autofill ? ' checked' : '') + '> ロット未設定商品の推奨量を初期カートへ自動投入する</label>' +
+    ' <span class="muted">(OFF = 参考表示のみ。誤発注が続くときの一括停止スイッチ)</span></div>';
+  h += '<table class="t"><thead><tr><th>商品コード</th><th>商品名</th><th>仕入先</th><th>状態</th><th class="r">在庫+注残</th><th class="r">30日販売</th><th class="r">在庫月数</th><th class="r">推奨保有</th><th class="r">推奨(1個単位)</th><th class="r">月間粗利</th><th>最終仕入</th></tr></thead><tbody>';
+  if (!rows.length) h += '<tr><td colspan="11" class="muted">該当なし 🎉</td></tr>';
+  rows.slice(0, 500).forEach(function(r) {
+    var st = r.isTarget ? '<span class="badge b-warn">🔴 要発注</span>' : r.stockoutSelling ? '<span class="badge b-issued">在庫0・販売あり</span>' : r.sales30 > 0 ? '<span class="badge b-draft">販売あり</span>' : '<span class="muted">—</span>';
+    h += '<tr><td><b>' + esc(r.code) + '</b></td><td>' + esc(r.name) + '</td><td>' + esc(r.supplier || '—') + '</td><td>' + st + '</td>' +
+      '<td class="r">' + (r.stock + r.backOrder).toLocaleString('ja-JP') + '</td><td class="r">' + r.sales30.toLocaleString('ja-JP') + '</td>' +
+      '<td class="r">' + (r.stockMonths == null ? '—' : r.stockMonths.toFixed(2)) + '</td><td class="r">' + (r.holdMonths || '—') + '</td>' +
+      '<td class="r">' + (r.recQty == null ? '—' : r.recQty.toLocaleString('ja-JP')) + '</td><td class="r">' + (r.monthlyGp ? '¥' + r.monthlyGp.toLocaleString('ja-JP') : '—') + '</td>' +
+      '<td>' + esc(r.lastPurchase || '—') + '</td></tr>';
+  });
+  h += '</tbody></table>' + (rows.length > 500 ? '<div class="muted">先頭500件を表示 (CSVは全件)</div>' : '');
+  document.getElementById('tabBody').innerHTML = h;
+  document.querySelectorAll('[data-lmfilter]').forEach(function(b){ b.addEventListener('click', function(){ LM_FILTER = b.getAttribute('data-lmfilter'); renderLotMissing(); }); });
+  document.getElementById('lmCsv').addEventListener('click', function() {
+    var out = [['商品コード','商品名','仕入先','要発注','在庫','注残','30日販売','推奨保有月数','推奨(1個単位)','月間粗利','最終仕入日']];
+    rows.forEach(function(r){ out.push([r.code, r.name, r.supplier, r.isTarget ? '1' : '', r.stock, r.backOrder, r.sales30, r.holdMonths, r.recQty == null ? '' : r.recQty, r.monthlyGp, r.lastPurchase]); });
+    dlCsv('ロット未設定_' + new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10) + '.csv', out);
+  });
+  document.getElementById('lmAutofill').addEventListener('change', function(ev) {
+    var on = !!ev.target.checked;
+    if (!on && !confirm('ロット未設定商品の推奨量を初期カートに入れなくなります (参考表示のみ)。よろしいですか?')) { ev.target.checked = true; return; }
+    fetch('/apps/purchase-orders/api/lot-missing-autofill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autofill: on }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){ if (!res.ok) { alert(res.error || '保存に失敗しました'); ev.target.checked = !on; } else LM_DATA.autofill = res.autofill; })
+      .catch(function(e){ alert('通信エラー: ' + e.message); ev.target.checked = !on; });
+  });
+}
 // ── 🏷️ バーコードラベルタブ (自社商品=AMC×売上分類1 の全対象商品を未登録含めて一覧管理。
 //     旧Excel「BFバーコード管理_既存商品.xlsx」の移行先。バッジクリックで状態変更) ──
 var BC_FILTER = 'all';
@@ -8493,6 +8594,7 @@ document.getElementById('bcImpForm').addEventListener('submit', function(ev) {
 var MLOAD_SEQ = 0;
 function load() {
   if (TAB === 'unlinked') { loadUnlinked(60); return; }
+  if (TAB === 'lotmissing') { loadLotMissing(); return; }
   if (TAB === 'vendormap') { loadVmap(); return; }
   if (TAB === 'barcode') { loadBarcode(); return; }
   // 世代ガード: 素早いタブ切替で古いGET応答が現在タブのrenderに渡らないように (Codex attrs-R1 Medium)
@@ -8898,6 +9000,10 @@ setGroup(grp0 && GRP_HINTS[grp0] ? grp0 : 'suppliers');
 // 未紐付けの新商品バッジ (作業キューなので件数を見せる、Codex IA提言)
 fetch('/apps/purchase-orders/api/attrs/unlinked?days=60').then(function(r){ return r.json(); }).then(function(j) {
   if (j.ok && j.count > 0) document.getElementById('unlinkedBadge').innerHTML = ' <span class="badge b-draft">' + j.count + '</span>';
+}).catch(function(){});
+// ロット未設定バッジ = 要発注に該当している件数 (今すぐ埋めてほしい分だけ見せる)
+fetch('/apps/purchase-orders/api/lot-missing').then(function(r){ return r.json(); }).then(function(j) {
+  if (j.ok && j.targetCount > 0) document.getElementById('lotMissingBadge').innerHTML = ' <span class="badge b-warn">' + j.targetCount + '</span>';
 }).catch(function(){});`;
   res.send(pageShell('発注補助 — マスタ管理', 'admin', body, script));
 });
