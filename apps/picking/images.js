@@ -134,8 +134,15 @@ async function fetchWithQueueRetry(fetchDetails, manageNumbers, sleep) {
   throw lastErr;
 }
 
-/** mirror から解決用の索引を読む (デフォルト実装。テストでは差し替える)。 */
+// mirror 索引の短時間キャッシュ。一覧GET・CSV・再取得POST が続けて呼ぶうえ、
+// mirror_rakuten_item_daily は日次で伸び続けるため毎回の全件 DISTINCT は避ける (Codex R1)
+const MIRROR_MAPS_TTL_MS = 60_000;
+let _mapsCache = null;
+export function clearMirrorMapsCache() { _mapsCache = null; }
+
+/** mirror から解決用の索引を読む (デフォルト実装。テストでは差し替える)。60秒キャッシュ。 */
 function loadMirrorMaps() {
+  if (_mapsCache && Date.now() - _mapsCache.at < MIRROR_MAPS_TTL_MS) return _mapsCache.value;
   const mdb = getMirrorDB();
   const rakutenByNe = new Map();
   for (const r of mdb.prepare(
@@ -149,7 +156,9 @@ function loadMirrorMaps() {
   ).all()) {
     itemNumbers.set(norm(r.item_manage_number), r.item_manage_number);
   }
-  return { rakutenByNe, itemNumbers };
+  const value = { rakutenByNe, itemNumbers };
+  _mapsCache = { at: Date.now(), value };
+  return value;
 }
 
 /** キャッシュ済みSKUの画像URLマップ: norm(ne_code) → {url, status}。表示用。 */
@@ -180,6 +189,13 @@ const ERROR_RETRY_MS = 30 * 60 * 1000;
 export async function ensureImagesFor(skus, deps = {}) {
   const db = getDB();
   const all = [...new Set(skus.map(norm).filter(Boolean))];
+  // force = TTL を無視して取り直す (管理画面の「再取得」— not_found は当日中は再試行しないため、
+  // 楽天側に画像を追加した直後に反映させる手段が無いと現場が待たされる)
+  if (deps.force) {
+    const stats = { requested: all.length, fetched: all.length, ok: 0, notFound: 0, errors: 0 };
+    if (all.length === 0) return stats;
+    return resolveAndCache(db, all, deps, stats);
+  }
   // ok は7日間キャッシュ (楽天側の画像差し替えに追従できるようTTLを置く)。
   // error は30分後に再試行 / not_found はJST当日中は再試行しない (翌日に取り直す)
   const need = all.filter((sku) => {
@@ -193,7 +209,11 @@ export async function ensureImagesFor(skus, deps = {}) {
   });
   const stats = { requested: all.length, fetched: need.length, ok: 0, notFound: 0, errors: 0 };
   if (need.length === 0) return stats;
+  return resolveAndCache(db, need, deps, stats);
+}
 
+/** 指定SKUを実際に解決してキャッシュへ書く (ensureImagesFor の本体・force でも共用)。 */
+async function resolveAndCache(db, need, deps, stats) {
   const { rakutenByNe, itemNumbers } = (deps.loadMaps || loadMirrorMaps)();
   const mnBySku = new Map();
   const codesBySku = new Map();   // バリエーション照合用: このSKUを指し得るコード群
@@ -294,19 +314,240 @@ export async function ensureImagesFor(skus, deps = {}) {
 // リトライ待機で先頭ジョブが数分残ることがあり、無制限に積むとTTL越えの再取得が連鎖する (Codex medium)
 let _chain = Promise.resolve();
 const _pendingKeys = new Set();
+let _queueDepth = 0;
+
+/** いまキューで画像解決が走っているか (管理画面の再取得を多重に走らせないため — Codex R1)。 */
+export function isImageQueueBusy() { return _queueDepth > 0; }
+
 export function queueEnsureImages(skus, label = '', deps = undefined) {
   const set = [...new Set(skus.map(norm).filter(Boolean))].sort();
-  const key = JSON.stringify(set);   // join(',')だと集合が違ってもキー衝突し得る (Codex low)
+  // force は「同じ集合でも取り直す」操作なのでキーを分ける (通常キューと重複排除を共有しない)
+  const key = JSON.stringify([deps?.force ? 'force' : 'ttl', set]);
   if (set.length === 0 || _pendingKeys.has(key)) return _chain;
   _pendingKeys.add(key);
+  _queueDepth++;
   _chain = _chain
     .then(() => ensureImagesFor(skus, deps))
     .then((stats) => {
+      if (deps?.onStats) { try { deps.onStats(stats); } catch { /* 呼び出し側の都合は無視 */ } }
       if (stats.fetched > 0) {
         console.log(`[picking-images] ${label} 解決 ${stats.fetched}件: ok=${stats.ok} (うちバリエーション画像=${stats.variant || 0}) なし=${stats.notFound} 失敗=${stats.errors}`);
       }
     })
-    .catch((e) => console.warn(`[picking-images] ${label} 画像解決失敗 (作業は継続可能): ${e.message}`))
-    .finally(() => _pendingKeys.delete(key));
+    .catch((e) => {
+      if (deps?.onError) { try { deps.onError(e); } catch { /* 呼び出し側の都合は無視 */ } }
+      console.warn(`[picking-images] ${label} 画像解決失敗 (作業は継続可能): ${e.message}`);
+    })
+    .finally(() => { _pendingKeys.delete(key); _queueDepth--; });
   return _chain;
+}
+
+/**
+ * 管理画面の「画像を再取得」— 直列キューに載せて取り直し、結果を返す (Codex R1: router から
+ * ensureImagesFor を直接呼ぶと既存キューを迂回し、連打・取込直後の解決と並列に RMS を叩く)。
+ * @returns {Promise<{stats}|null>} 既に解決処理が走っていれば null (呼び出し側が 409 にする)
+ */
+export function requestForceRefresh(skus, label = 'admin再取得') {
+  if (isImageQueueBusy()) return Promise.resolve(null);
+  const set = [...new Set(skus.map(norm).filter(Boolean))];
+  if (set.length === 0) return Promise.resolve({ requested: 0, ok: 0, notFound: 0, errors: 0, fetched: 0 });
+  // 🚨 通常キューは失敗を warn ログに落として握り潰す (取込を止めないため) が、手動の再取得では
+  //    失敗を黙ってキュー混雑 (409) に見せてはいけない — 例外をそのまま呼び出し元へ返す (Codex R2)
+  let out = null;
+  let err = null;
+  const p = queueEnsureImages(set, label, {
+    force: true,
+    onStats: (st) => { out = st; },
+    onError: (e) => { err = e; },
+  });
+  return p.then(() => {
+    if (err) throw err;
+    return out;
+  });
+}
+
+// ═══ 画像が出ない商品の一覧 (管理画面・2026-08-31 中原さん依頼) ═══════════════
+// 現場の用途 = 「ピッキング画面で写真が出ない商品」を潰す。楽天の商品ページを直せば直るものと、
+// そもそも楽天に商品が無い (＝画像を出しようがない) ものを、商品管理番号つきで見分けられるようにする。
+
+/** JST 日付を n 日ずらす (service.js の shiftDate と同じ。循環 import を避けてローカルに置く)。 */
+function shiftDateLocal(dateStr, days) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+/** 楽天の商品ページURL (店舗スラッグは env。商品管理番号が無ければ null)。 */
+export function rakutenItemUrl(manageNumber) {
+  if (!manageNumber) return null;
+  const slug = (process.env.RAKUTEN_SHOP_SLUG || 'b-faith').trim();
+  return `https://item.rakuten.co.jp/${slug}/${encodeURIComponent(manageNumber)}/`;
+}
+
+const STATUS_LABEL = {
+  not_found: '楽天に画像が無い',
+  error: '取得に失敗 (再取得で直ることがある)',
+  uncached: 'まだ取得していない',
+};
+
+/**
+ * 期間内のピッキング明細に出たSKUのうち、画像まわりに問題があるものを返す。
+ *
+ *  - missing        = 画像URLが1つも無い (画面がプレースホルダになる)
+ *  - variantMissing = 同じ楽天商品 (manage_number) を2SKU以上で共有しているのに、そのSKU自身の
+ *                     バリエーション画像が無く商品共通の写真で代用している商品。
+ *                     「No.4 の行に No.8 の写真」が出て取り違えの原因になる (2026-08-25 現場指摘) ため、
+ *                     画像はあっても直す対象として並べる
+ *
+ * 楽天の商品管理番号は キャッシュ済み manage_number を優先し、無ければ mirror から今その場で解決する
+ * (キャッシュ時点では mirror に商品が無くても、後から出品されていることがある — 中原さん依頼 2026-08-31)。
+ * mirror が使えない環境では管理番号なしで一覧だけ返す (fail-soft)。
+ */
+export function listMissingImages({ until = jstToday(), days = 30 } = {}) {
+  const db = getDB();
+  const to = until;
+  const since = shiftDateLocal(to, -(Math.max(1, days) - 1));
+  // 明細を1回読んで JS で集約する (SKUごとの相関サブクエリは索引が効かず、
+  // 商品名だけ期間外・無効バッチ由来になる穴もあった — Codex R1)
+  const agg = new Map();
+  for (const l of db.prepare(`
+    SELECT LOWER(TRIM(l.sku)) AS sku, l.product_name, l.qty, l.rowid AS rid, b.work_date
+    FROM pk_lines l
+    JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.validity = 'valid' AND b.origin != 'repick'
+      AND b.work_date >= ? AND b.work_date <= ?
+  `).iterate(since, to)) {
+    if (!l.sku) continue;
+    let a = agg.get(l.sku);
+    if (!a) { a = { sku: l.sku, name: null, nameRid: -1, nameDate: null, lines: 0, qty: 0, lastDate: null }; agg.set(l.sku, a); }
+    a.lines++;
+    a.qty += l.qty || 0;
+    if (a.lastDate == null || l.work_date > a.lastDate) a.lastDate = l.work_date;
+    // 商品名は期間内で最後に使われたもの (無効バッチ・再ピック由来の名前は入らない)
+    // 商品名は「作業日が新しい方」を採り、同日なら後に取り込んだ行 (rowid が大きい方)。
+    // rowid だけで比べると、過去日分を後から取り込んだときに古い日の名前で上書きされる (Codex R2)
+    if (l.product_name && (a.nameDate == null || l.work_date > a.nameDate
+        || (l.work_date === a.nameDate && l.rid > a.nameRid))) {
+      a.name = l.product_name; a.nameRid = l.rid; a.nameDate = l.work_date;
+    }
+  }
+  const skus = [...agg.keys()];
+  const cache = new Map();
+  const CH = 400;
+  for (let i = 0; i < skus.length; i += CH) {
+    const chunk = skus.slice(i, i + CH);
+    for (const r of db.prepare(
+      `SELECT ne_code, manage_number, status, variant_image_url, white_bg_url, top_image_url, fetched_at
+       FROM pk_product_images WHERE ne_code IN (${chunk.map(() => '?').join(',')})`
+    ).all(...chunk)) cache.set(r.ne_code, r);
+  }
+
+  // mirror から楽天コード・商品管理番号を引く (fail-soft)
+  let maps = null;
+  try {
+    maps = loadMirrorMaps();
+  } catch (e) {
+    console.warn(`[picking-images] mirror参照失敗 (管理番号なしで続行): ${e.message}`);
+  }
+
+  // ① まず全SKUの「最終的な商品管理番号」を確定する。
+  //    キャッシュ済みを優先し、無ければ mirror から解決 (後から出品された商品を拾う)
+  const rows = [];
+  for (const sku of skus) {
+    const a = agg.get(sku);
+    const c = cache.get(sku) || null;
+    const rakutenCode = maps ? (maps.rakutenByNe.get(sku) || null) : null;
+    const resolved = maps ? resolveManageNumber(maps.itemNumbers, rakutenCode || sku) : null;
+    rows.push({ ...a, cache: c, rakutenCode, manageNumber: c?.manage_number || resolved || null, resolved });
+  }
+
+  // ② 共有数 (= バリエーション商品かどうか) は、確定した管理番号で数える (Codex R1 High)。
+  //    母集団は画像キャッシュ全体 — 兄弟SKUがこの期間に流れていなくても商品構造は変わらないため
+  const shareCount = new Map();
+  const bump = (mn) => { if (mn) shareCount.set(norm(mn), (shareCount.get(norm(mn)) || 0) + 1); };
+  const counted = new Set();
+  try {
+    for (const r of db.prepare(
+      "SELECT ne_code, manage_number FROM pk_product_images WHERE manage_number IS NOT NULL AND trim(manage_number) <> ''"
+    ).iterate()) { bump(r.manage_number); counted.add(r.ne_code); }
+  } catch { /* 表が無い環境 */ }
+  for (const r of rows) {
+    if (!counted.has(r.sku) && r.manageNumber) bump(r.manageNumber);   // キャッシュに無い分だけ足す
+  }
+
+  const missing = [];
+  const variantMissing = [];
+  const byStatus = { not_found: 0, error: 0, uncached: 0 };
+  for (const r of rows) {
+    const c = r.cache;
+    const hasImage = !!(c && (c.variant_image_url || c.white_bg_url || c.top_image_url));
+    const base = {
+      sku: r.sku,
+      name: r.name || null,
+      lines: r.lines,
+      qty: r.qty,
+      lastDate: r.lastDate,
+      manageNumber: r.manageNumber,
+      rakutenCode: r.rakutenCode,
+      itemUrl: rakutenItemUrl(r.manageNumber),
+      fetchedAt: c?.fetched_at || null,
+    };
+    if (!hasImage) {
+      const status = c?.status || 'uncached';
+      byStatus[status] = (byStatus[status] || 0) + 1;
+      missing.push({
+        ...base,
+        status,
+        statusLabel: STATUS_LABEL[status] || status,
+        // キャッシュ時は管理番号が引けなかったが今は引ける = 再取得すれば直る可能性がある
+        retryable: status === 'error' || status === 'uncached' || (!c?.manage_number && !!r.resolved),
+      });
+      continue;
+    }
+    const sharedBy = r.manageNumber ? (shareCount.get(norm(r.manageNumber)) || 1) : 1;
+    if (!c.variant_image_url && sharedBy >= 2) {
+      variantMissing.push({ ...base, sharedBy, imageUrl: c.white_bg_url || c.top_image_url });
+    }
+  }
+  const byLines = (a, b) => b.lines - a.lines || String(a.sku).localeCompare(String(b.sku));
+  missing.sort(byLines);
+  variantMissing.sort(byLines);
+  return {
+    since, until: to, days,
+    summary: {
+      skus: rows.length,
+      missing: missing.length,
+      variantMissing: variantMissing.length,
+      byStatus,
+      mirrorAvailable: !!maps,
+      retryable: missing.filter((x) => x.retryable && x.manageNumber).length,
+    },
+    missing,
+    variantMissing,
+  };
+}
+
+/** 一覧の CSV (Excel で開く前提の BOM つき)。 */
+export function missingImagesCsv(result) {
+  // Excel は = + - @ (と先頭のタブ・CR) で始まるセルを数式として評価するため、'  を前置して無害化する。
+  // 商品名は外部CSV (ロジザード/NE) 由来なので管理者向け出力でも素通ししない (Codex R1)
+  const esc = (v) => {
+    let s = v == null ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = ['\uFEFF区分,商品コード,商品名,状態,楽天商品管理番号,楽天SKUコード,商品ページURL,明細数,数量,最終ピッキング日,共有SKU数'];
+  for (const r of result.missing) {
+    lines.push([
+      '画像なし', r.sku, r.name, r.statusLabel, r.manageNumber, r.rakutenCode, r.itemUrl,
+      r.lines, r.qty, r.lastDate, '',
+    ].map(esc).join(','));
+  }
+  for (const r of result.variantMissing) {
+    lines.push([
+      'バリエーション画像なし', r.sku, r.name, 'この商品の写真が無く別バリエーションの写真を表示',
+      r.manageNumber, r.rakutenCode, r.itemUrl, r.lines, r.qty, r.lastDate, r.sharedBy,
+    ].map(esc).join(','));
+  }
+  return lines.join('\r\n') + '\r\n';
 }
