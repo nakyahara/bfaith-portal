@@ -299,5 +299,47 @@ console.log('9. 双方向を一括取込');
     after2.internal_status === 'open' && after2.is_unread === 1 && r2.stats.reopened === 1);
 }
 
+// ─── 10. 顧客情報の手入力と同期の関係 (2026-08-31 customer-info.js) ───
+// 同期が値を返した項目は確定情報として手入力を上書き+ロック、返さない (null) 項目は手入力値が残る
+console.log('10. 手入力の注文番号・商品コード vs 同期');
+{
+  const { setCustomerInfo, customerInfoState } = await import('./customer-info.js');
+  const shopCi = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','手入力店','rk-ci')").run().lastInsertRowid;
+  const ciItem = (over = {}) => ({
+    externalInquiryId: 'ci-1', customerName: '顧客C', subject: '商品ページからの質問',
+    orderNumber: null, productCode: null, productName: '商品C',
+    receivedAt: iso(0), updatedAt: iso(0),
+    messages: [{ externalMessageId: 'ci-m1', senderType: 'customer', bodyText: '質問', isIncoming: 1, receivedAt: iso(0) }],
+    ...over,
+  });
+  await runSync(shopCi, createMockAdapter([ciItem()]), { now: T0 + 5 * 60000 });
+  const ciId = db.prepare("SELECT id FROM inquiries WHERE external_inquiry_id = 'ci-1'").get().id;
+  const rowOf = () => db.prepare('SELECT * FROM inquiries WHERE id = ?').get(ciId);
+  const st0 = customerInfoState(rowOf());
+  check('新規取込: 同期由来の商品名はロック、注文番号・商品コードは空で編集可',
+    st0.product_name.locked && !st0.order_number.locked && !st0.product_code.locked && rowOf().manual_fields === null);
+
+  setCustomerInfo(ciId, { order_number: 'MANUAL-1', product_code: 'MAN-SKU' }, 'tester');
+  check('手入力後: manual_fields に2項目', rowOf().manual_fields === '["order_number","product_code"]');
+
+  // 同期が注文番号を返さない (null) → 手入力値は残る (COALESCE で消えない)
+  await runSync(shopCi, createMockAdapter([ciItem({ updatedAt: iso(10) })]), { now: T0 + 15 * 60000 });
+  const row1 = rowOf();
+  const st1 = customerInfoState(row1);
+  check('同期が null の項目は手入力値が残り、編集可のまま',
+    row1.order_number === 'MANUAL-1' && row1.product_code === 'MAN-SKU' && st1.order_number.manual && !st1.order_number.locked);
+
+  // 同期が注文番号を返した → 確定値で上書き+ロック。商品コードは同期が返さないので手入力のまま
+  await runSync(shopCi, createMockAdapter([ciItem({ orderNumber: 'RK-CONFIRMED', updatedAt: iso(20) })]), { now: T0 + 25 * 60000 });
+  const row2 = rowOf();
+  const st2 = customerInfoState(row2);
+  check('同期が注文番号を返したら確定値で上書き+ロック (manual_fields から外れる)',
+    row2.order_number === 'RK-CONFIRMED' && st2.order_number.locked && row2.manual_fields === '["product_code"]');
+  check('手入力の商品コードは同期後も残り編集可', row2.product_code === 'MAN-SKU' && st2.product_code.manual && !st2.product_code.locked);
+  let lockErr = null;
+  try { setCustomerInfo(ciId, { order_number: 'X' }, 'tester'); } catch (e) { lockErr = e; }
+  check('ロック後は手入力で変更できない (LOCKED)', !!lockErr && lockErr.code === 'LOCKED' && rowOf().order_number === 'RK-CONFIRMED');
+}
+
 console.log(`\n${failed === 0 ? 'OK' : 'NG'}: ${passed} PASS / ${failed} FAIL`);
 process.exit(failed === 0 ? 0 : 1);

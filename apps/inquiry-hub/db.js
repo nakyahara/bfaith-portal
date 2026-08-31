@@ -173,6 +173,10 @@ function createTables() {
   // 「返信したのに顧客へ届いていない」を画面で気付けるようにするための印。
   // 同期がバウンス通知を検知したときに立ち、その後の返信が実際に送信できた時点で消える
   addColumnIfMissing('inquiries', 'delivery_failed_at', 'TEXT');
+  // 顧客情報の手入力 (2026-08-31): 注文番号・商品コード・商品名のうち「画面から手で入れた」項目名の
+  // JSON配列 (例 '["order_number"]')。NULL=手入力なし。値があるのにここに無い項目はモール同期が
+  // 入れた確定情報で、画面から変更できない (customer-info.js)。同期が値を返した項目はここから外れる
+  addColumnIfMissing('inquiries', 'manual_fields', 'TEXT');
 
   // メッセージ (受信・送信の両方)
   db.exec(`CREATE TABLE IF NOT EXISTS inquiry_messages (

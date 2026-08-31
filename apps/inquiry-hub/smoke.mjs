@@ -628,6 +628,101 @@ console.log('HTTP: 全件一括');
     && db.prepare('SELECT internal_status, completed_at FROM inquiries WHERE id = ?').get(h4).internal_status === 'done'
     && !!db.prepare('SELECT completed_at FROM inquiries WHERE id = ?').get(h4).completed_at);
 
+  // ─── 顧客情報の手入力 (2026-08-31 中原さん要望) ───
+  // 注文番号等が付いて来ないメール問い合わせに、NE等で調べた結果を保存ボタン無しで残す。
+  // モール同期で確定した項目 (楽天/Yahoo!の購入者問い合わせ) は変更できない (ロック)
+  console.log('  -- 顧客情報の手入力 (自動保存 + 確定情報ロック)');
+  {
+    const { customerInfoState, manualFieldsAfterSync } = await import('./customer-info.js');
+    const vm = await import('vm');
+    const scriptOf = html => { const m = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]; return m.length ? m[m.length - 1][1] : ''; };
+    const rowOf = id => db.prepare('SELECT * FROM inquiries WHERE id = ?').get(id);
+
+    const ciMail = mkH('ci-mail', 'open');
+    db.prepare('UPDATE inquiries SET customer_identifier = ? WHERE id = ?').run('ci-customer@example.com', ciMail);
+    const dCi = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
+    check('詳細: パネル名は「顧客情報」(「チケット情報」は廃止)', dCi.includes('<h3>顧客情報</h3>') && !dCi.includes('チケット情報'));
+    check('メール (注文番号なし): 注文番号・商品名・商品コードが自動保存の入力欄になる',
+      dCi.includes('id="ci_order_number"') && dCi.includes('id="ci_product_name"') && dCi.includes('id="ci_product_code"') && dCi.includes('class="sub ci-hint">✏️'));
+    check('注文番号が無いうちは「NEで受注検索」導線もそのまま出る', dCi.includes('id="neMailSearch"'));
+    check('自動保存のクライアントJS (change で /customer-info へ keepalive 送信)',
+      dCi.includes("post('/customer-info', data, { keepalive: true })") && dCi.includes("addEventListener('change'"));
+    let jsErrCi = null; try { new vm.Script(scriptOf(dCi)); } catch (e) { jsErrCi = e; }
+    check('詳細画面のクライアントJSが構文OK (顧客情報の自動保存込み)', jsErrCi === null, String(jsErrCi));
+
+    const r1 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: ' 373343-20260831-00001 ' });
+    const row1 = rowOf(ciMail);
+    check('API: 注文番号を保存 (前後空白は除去) + manual_fields に手入力として記録',
+      r1.status === 200 && row1.order_number === '373343-20260831-00001' && row1.manual_fields === '["order_number"]', JSON.stringify(r1.j));
+    check('API: 応答に保存後のNE受注リンク (メールでも手入力の番号でNEを開ける)',
+      !!r1.j.links && String(r1.j.links.ne_order_url).includes('kensaku_denpyo_no=373343-20260831-00001') && r1.j.links.mall_order_url === null);
+    check('API: 操作ログ customer_info_edit (before/after は変更項目のみ)',
+      !!db.prepare("SELECT 1 FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit' AND before_json = '{\"order_number\":null}' AND after_json = '{\"order_number\":\"373343-20260831-00001\"}'").get(ciMail));
+    check('一覧検索: 手入力した注文番号でも見つかる', listInquiries({ q: '373343-20260831-00001' }).rows.some(r => r.id === ciMail));
+    const dCi2 = await (await fetch(`${base}/inquiries/${ciMail}?view=inbox`)).text();
+    check('保存後の詳細: 手入力の注文番号は引き続き入力欄 (ロックしない) + NE直リンク + 検索導線は消える',
+      dCi2.includes('id="ci_order_number"') && dCi2.includes('value="373343-20260831-00001"')
+      && dCi2.includes('kensaku_denpyo_no=373343-20260831-00001') && !dCi2.includes('id="neMailSearch"') && !dCi2.includes('<span class="ci-lock"'));
+    check('保存後の詳細: 対応履歴に「顧客情報の編集」として日本語で出る', dCi2.includes('顧客情報の編集') && dCi2.includes('注文番号=373343-20260831-00001'));
+
+    const r2 = await jp(`/api/inquiries/${ciMail}/customer-info`, { product_name: 'アロマストーン', product_code: 'AS-01' });
+    const row2 = rowOf(ciMail);
+    check('API: 商品名+商品コードを同時に保存', r2.status === 200 && row2.product_name === 'アロマストーン' && row2.product_code === 'AS-01'
+      && JSON.parse(row2.manual_fields).length === 3 && r2.j.changed.length === 2);
+    const r3 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: '' });
+    const row3 = rowOf(ciMail);
+    check('API: 空文字で NULL に戻り manual_fields からも外れる (商品は残る)',
+      r3.status === 200 && row3.order_number === null && !JSON.parse(row3.manual_fields).includes('order_number') && row3.product_name === 'アロマストーン');
+    const r4 = await jp(`/api/inquiries/${ciMail}/customer-info`, { order_number: 'x'.repeat(101) });
+    check('API: 長すぎる値は 400', r4.status === 400 && rowOf(ciMail).order_number === null);
+    const r5 = await jp(`/api/inquiries/${ciMail}/customer-info`, { foo: 'bar' });
+    check('API: 既知の項目が無ければ 400', r5.status === 400);
+    const r6 = await jp(`/api/inquiries/${ciMail}/customer-info`, { product_name: 'アロマストーン' });
+    const logCount = db.prepare("SELECT COUNT(*) AS n FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit'").get(ciMail).n;
+    check('API: 同じ値は unchanged (ログを増やさない)', r6.status === 200 && r6.j.unchanged === true && logCount === 3, `logs=${logCount}`);
+    const r7 = await jp(`/api/inquiries/${ciMail}/customer-info`, { product_code: 'AS-01\nrm -rf' });
+    check('API: 改行は空白に畳まれて1行の値として保存', r7.status === 200 && rowOf(ciMail).product_code === 'AS-01 rm -rf');
+
+    // 確定情報ロック: 楽天の購入者問い合わせ (同期が注文番号を入れた = manual_fields 無し) は変更不可
+    const shopCiRk = db.prepare("INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('rakuten','楽天CI店','rk-ci')").run().lastInsertRowid;
+    const ciRk = db.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject, order_number, product_name, received_at, is_unread)
+      VALUES ('rakuten', ?, 'rk-ci-1', '注文の件', '123456-20260831-00009', '楽天商品', ?, 1)`).run(shopCiRk, T('2026-08-31T10:00:00+09:00')).lastInsertRowid;
+    const dRk = await (await fetch(`${base}/inquiries/${ciRk}?view=inbox`)).text();
+    check('楽天 (注文番号確定): 注文番号・商品名は🔒表示で入力欄なし。空の商品コードだけ入力欄',
+      !dRk.includes('id="ci_order_number"') && !dRk.includes('id="ci_product_name"') && dRk.includes('id="ci_product_code"')
+      && dRk.includes('123456-20260831-00009<span class="ci-lock"') && dRk.includes('楽天商品<span class="ci-lock"'));
+    check('楽天 (注文番号確定): NE受注行とモールの注文リンクは従来どおり',
+      dRk.includes('<dt>NE受注</dt>') && dRk.includes('kensaku_denpyo_no=123456-20260831-00009') && dRk.includes('orderNumber=123456-20260831-00009'));
+    let jsErrRk = null; try { new vm.Script(scriptOf(dRk)); } catch (e) { jsErrRk = e; }
+    check('詳細画面のクライアントJSが構文OK (ロック混在)', jsErrRk === null, String(jsErrRk));
+    const l1 = await jp(`/api/inquiries/${ciRk}/customer-info`, { order_number: '999' });
+    check('API: 確定した注文番号の変更は 409 で拒否 (値は不変)', l1.status === 409 && /確定情報/.test(l1.j.error) && rowOf(ciRk).order_number === '123456-20260831-00009');
+    const l2 = await jp(`/api/inquiries/${ciRk}/customer-info`, { order_number: '' });
+    check('API: 確定した注文番号は空にもできない', l2.status === 409 && rowOf(ciRk).order_number === '123456-20260831-00009');
+    const l3 = await jp(`/api/inquiries/${ciRk}/customer-info`, { order_number: '123456-20260831-00009', product_code: 'RK-SKU-1' });
+    const rowL3 = rowOf(ciRk);
+    check('API: 確定項目に同じ値 + 空だった商品コードの手入力 = 商品コードだけ保存',
+      l3.status === 200 && rowL3.product_code === 'RK-SKU-1' && rowL3.manual_fields === '["product_code"]' && rowL3.order_number === '123456-20260831-00009');
+    check('API: 確定した注文番号の 409 ではログを残さない',
+      db.prepare("SELECT COUNT(*) AS n FROM inquiry_activity_logs WHERE inquiry_id = ? AND action_type = 'customer_info_edit'").get(ciRk).n === 1);
+    const l4 = await jp(`/api/inquiries/${ciRk}/customer-info`, { order_number: '999', product_code: 'RK-SKU-2' });
+    check('API: ロック項目を含む一括更新は丸ごと拒否 (部分適用しない)', l4.status === 409 && rowOf(ciRk).product_code === 'RK-SKU-1');
+    db.prepare('UPDATE inquiries SET product_code = ?, manual_fields = NULL WHERE id = ?').run('RK-FIXED', ciRk);
+    const dRk2 = await (await fetch(`${base}/inquiries/${ciRk}?view=inbox`)).text();
+    check('全項目が確定: 入力欄は出さず「変更できません」の案内だけ', !dRk2.includes('class="ci-input"') && dRk2.includes('🔒 注文番号・商品はモールから取得した確定情報です'));
+
+    // 判定ヘルパー (customer-info.js)
+    const st = customerInfoState({ order_number: 'A', product_code: null, product_name: 'B', manual_fields: '["product_name"]' });
+    check('customerInfoState: 値あり+手入力でない=ロック / 手入力=編集可 / 空=編集可',
+      st.order_number.locked && !st.product_name.locked && st.product_name.manual && !st.product_code.locked && !st.product_code.manual);
+    check('customerInfoState: 壊れた manual_fields は「手入力なし」扱い (値ありはロック側に倒す)',
+      customerInfoState({ order_number: 'A', manual_fields: '{bad' }).order_number.locked);
+    check('manualFieldsAfterSync: 同期が値を返した項目は手入力から外れ、返さない項目は残る',
+      manualFieldsAfterSync('["order_number","product_code"]', { orderNumber: 'X', productCode: null }) === '["product_code"]'
+      && manualFieldsAfterSync('["order_number"]', { orderNumber: 'X' }) === null
+      && manualFieldsAfterSync(null, { orderNumber: 'X' }) === null);
+  }
+
   await new Promise(r => srv.close(r));
 }
 
