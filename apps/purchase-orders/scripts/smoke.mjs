@@ -64,6 +64,8 @@ insRow.run('lot-zero', 'ロット0で要発注の商品', '', '取扱中', 2, 10
 db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数, 売価, 原価)
   VALUES ('run_test', 'lot-null', 'ロットNULLで在庫0・売れている商品', '', '取扱中', 2, 0, 0, 10, 40, NULL, 1.5, 300, 100)`).run();
 insRow.run('lot-zero-ok', 'ロット0だが在庫十分', '', '取扱中', 2, 500, 0, 25, 100, 0, 1.5, 500, 200, '2026-07-01', '2020-01-01');
+// 仕入先付き (0002) のロット未設定・要発注: 仕入先ワークスペースの初期カート投入 ON/OFF を実コードで検証する用
+insRow.run('lot-zero-sup', 'ロット未設定で要発注 (仕入先あり)', '0002', '取扱中', 3, 10, 0, 12, 50, 0, 1.5, 500, 200, '2026-07-01', '2020-01-01');
 
 console.log('── computeProduct (シート数式一致) ──');
 const get = code => computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code));
@@ -199,10 +201,10 @@ console.log('── ロット未設定 (PR2): API・自動投入スイッチ・�
   r = await j('/api/lot-missing-autofill');
   ok(r.body.ok && r.body.autofill === true, 'lot-missing-autofill: 既定 on');
   r = await j('/api/lot-missing', {});
-  ok(r.body.ok && r.body.count === 3 && r.body.targetCount === 2 && r.body.sellingCount === 3, 'lot-missing: 取扱中×ロット未設定=3 (要発注2・販売あり3)', { c: r.body.count, t: r.body.targetCount, s: r.body.sellingCount });
+  ok(r.body.ok && r.body.count === 4 && r.body.targetCount === 3 && r.body.sellingCount === 4, 'lot-missing: 取扱中×ロット未設定=4 (要発注3・販売あり4)', { c: r.body.count, t: r.body.targetCount, s: r.body.sellingCount });
   const codes = r.body.rows.map(x => x.code);
-  // 並び: 要発注 (月間粗利 大→小: lot-zero 100×300=30,000 > lot-null 40×200=8,000) → その他
-  ok(codes[0] === 'lot-zero' && codes[1] === 'lot-null' && codes[2] === 'lot-zero-ok', 'lot-missing: 要発注→月間粗利順', codes);
+  // 並び: 要発注 (月間粗利 大→小: lot-zero 100×300=30,000 > lot-zero-sup 50×300=15,000 > lot-null 40×200=8,000) → その他
+  ok(codes[0] === 'lot-zero' && codes[1] === 'lot-zero-sup' && codes[2] === 'lot-null' && codes[3] === 'lot-zero-ok', 'lot-missing: 要発注→月間粗利順', codes);
   const lzRow = r.body.rows[0];
   ok(lzRow.recQty === 240 && lzRow.monthlyGp === 30000 && lzRow.isTarget === true && lzRow.stockMonths === 0.1, 'lot-missing: 行に推奨量・月間粗利・在庫月数', lzRow);
   // 仕入先ワークスペース DTO に lotMissing/effectiveLot と lotMissingAutofill が載る (仕入先なし商品は載らないので 0001 の通常商品で確認)
@@ -215,8 +217,22 @@ console.log('── ロット未設定 (PR2): API・自動投入スイッチ・�
   ok(r.body.ok && r.body.autofill === false, 'lot-missing-autofill: off へ');
   r = await j('/api/supplier/0001');
   ok(r.body.lotMissingAutofill === false, 'supplier: off が DTO に反映 (初期カート投入の判定に使う)');
+  // 初期カート投入の実コードで ON/OFF を検証: 仕入先ページの inline JS から投入行を抜き出し、API 応答を D として実行する (Codex PR2-R2 Low)
+  const supHtml = await (await fetch(base + '/supplier/2')).text();
+  const fillLine = (supHtml.match(/D\.targets\.forEach\(function\(p\)\{ if \(p\.recQty[^\n]*\n/) || [])[0];
+  ok(!!fillLine && fillLine.includes('D.lotMissingAutofill'), 'supplier page: 初期カート投入行がスイッチを参照');
+  const runFill = (D) => { const CART = {}; const DIS = new Set(); new Function('D', 'CART', 'DIS', fillLine)(D, CART, DIS); return CART; };
+  r = await j('/api/supplier/2');
+  const sup2 = r.body;
+  const lzs = sup2.targets.find(p => p.code === 'lot-zero-sup');
+  ok(lzs && lzs.lotMissing === true && lzs.recQty === 115 && sup2.lotMissingAutofill === false, 'supplier/2: ロット未設定の要発注 (推奨 2.5×50−10=115)、スイッチ off');
+  let cart = runFill(sup2);
+  ok(cart['lot-zero-sup'] == null && cart['gyoumuhandcream60-BI'] > 0, '初期カート: スイッチ off → ロット未設定は投入されず、通常商品は投入', cart);
   r = await j('/api/lot-missing-autofill', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autofill: true }) });
   ok(r.body.ok && r.body.autofill === true, 'lot-missing-autofill: on へ戻す');
+  r = await j('/api/supplier/2');
+  cart = runFill(r.body);
+  ok(r.body.lotMissingAutofill === true && cart['lot-zero-sup'] === 115, '初期カート: スイッチ on → ロット未設定も推奨量で投入', cart);
   const adminHtml = await (await fetch(base + '/admin')).text();
   ok(adminHtml.includes('data-tab="lotmissing"') && adminHtml.includes('function loadLotMissing'), 'admin: ロット未設定タブと読込関数');
 }

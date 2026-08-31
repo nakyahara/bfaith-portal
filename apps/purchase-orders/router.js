@@ -3241,7 +3241,7 @@ router.get('/api/lot-missing', (req, res) => {
       const selling = p.sales30 > 0;
       if (selling) sellingCount++;
       if (p.isTarget) targetCount++;
-      const gp = Math.round(p.sales30 * Math.max(0, p.price - p.cost));
+      const gp = Math.round(p.sales30 * (p.price - p.cost)); // 赤字は負のまま (0 に丸めると同順位に潰れる、Codex PR2-R2 Low)
       rows.push({
         code: p.code, name: p.name, supplier: p.supplierCode || '', stock: p.stock, backOrder: p.backOrder,
         sales30: p.sales30, stockMonths: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100,
