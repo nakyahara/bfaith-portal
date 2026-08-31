@@ -78,13 +78,19 @@ export function computeProduct(r, backOrderOverride, rule = 'v2') {
   const isTarget = rule === 'v1' ? targetV1 : targetV2;
   // 売れているのに推奨保有月数が未設定 → どのルールでも要発注に出ない設定不備 (管理画面で埋める)
   const holdMonthsMissing = active && salesDefined && !(M > 0);
+  // 発注ロット単位が未設定 (0/null) の商品は 1個単位として推奨量を計算する (中原さん決定 2026-08-30「0のものは1として考えていい」)。
+  // 旧挙動は recQty=null → 画面「—」・一括カート投入の対象外・並び順 (推奨額) で最下位に沈み、
+  // 要発注に載っているのに実質スキップされていた (2026-08-30 調査: 43件・月118万円)。
+  // lot (元値) は据え置き: 発注条件ゲージ (ロット倍率・ケース換算) と数量ステッパーは元値で判定する (1 を実値扱いしない)
+  const lotMissing = !(N > 0);
+  const effectiveLot = lotMissing ? 1 : N;
   // 推奨量は v2 判定で常に計算する (v1 ⊂ v2 なので v1 の対象商品も同じ式)。
   // recQtyV2 はルール切替の影響額 (ruleStats) 用で、現在のルールに依存させない (Codex PR1-R1 Medium)
   let recQtyV2 = null;
-  if (targetV2 && N > 0) {
+  if (targetV2) {
     const P = M + stockConstant(M);
-    const lots = (P * V - SB) / N; // = (P − L) × V / N。target なら SB <= M×V なので必ず正 (最低1ロット)
-    recQtyV2 = lots > 1 ? Math.round(lots) * N : Math.ceil(lots) * N;
+    const lots = (P * V - SB) / effectiveLot; // = (P − L) × V / N。target なら SB <= M×V なので必ず正 (最低1ロット)
+    recQtyV2 = lots > 1 ? Math.round(lots) * effectiveLot : Math.ceil(lots) * effectiveLot;
   }
   const recQty = isTarget ? recQtyV2 : null;
   return {
@@ -99,6 +105,8 @@ export function computeProduct(r, backOrderOverride, rule = 'v2') {
     sales30: V,
     sales7: num(r['販売数7日_合計']),
     lot: N,
+    lotMissing,
+    effectiveLot,
     holdMonths: M,
     price: num(r['売価']),
     cost: num(r['原価']),
