@@ -11,7 +11,7 @@ import { listLinks, createLink, updateLink, deleteLink } from './db.js';
 import {
   mfConfigured, authorizeUrl, exchangeCode, loadTokens, clearTokens,
   currentOffice, getJournals, postVoucher, matchVendors, revokeTokens, journalDigest,
-  getConnectedAccounts, getTransactions, getJournalsByTransactionIds, missingScopes,
+  getConnectedAccounts, getTransactions, getJournalsByTransactionIds, missingScopes, mfErrorText,
 } from './mf-api.js';
 import {
   addToInbox, getInbox, listInbox, countByStatus, readFile, updateInboxMeta, setMatch, setStatus,
@@ -168,7 +168,7 @@ router.get('/api/mf/unattached', async (req, res) => {
     res.json({ ok: true, result: { total: journals.length, rows } });
   } catch (e) {
     console.error('[shohyo-links] mf unattached', e.message, e.detail || '');
-    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message, detail: mfErrorText(e) });
   }
 });
 
@@ -271,7 +271,7 @@ router.get('/api/mf/transactions', async (req, res) => {
     res.json({ ok: true, result: { accounts: result, total: txs.length, warning: accountsWarning } });
   } catch (e) {
     console.error('[shohyo-links] mf transactions', e.message, e.detail || '');
-    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message, detail: mfErrorText(e) });
   }
 });
 
@@ -417,7 +417,7 @@ router.post('/api/inbox/:id/attach', async (req, res) => {
     res.json({ ok: true, result: getInbox(id) });
   } catch (e) {
     console.error('[shohyo-links] inbox attach', e.message, e.detail || '');
-    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message });
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message, detail: mfErrorText(e) });
   }
 });
 
@@ -451,7 +451,8 @@ router.post('/api/inbox/run', async (req, res) => {
     res.json({ ok: true, result: r });
   } catch (e) {
     console.error('[shohyo-links] inbox run', e.message, e.detail || '');
-    res.status(500).json({ ok: false, error: e.message });
+    // MFのエラー本文も返す (画面のトーストに出す。mf_api_400 だけでは原因が分からない)
+    res.status(e.message === 'mf_not_connected' ? 401 : 500).json({ ok: false, error: e.message, detail: mfErrorText(e) });
   }
 });
 

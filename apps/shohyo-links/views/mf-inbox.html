@@ -131,7 +131,11 @@ function toast(msg) {
 async function api(path, opts) {
   const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  if (!res.ok || !body.ok) {
+    const err = new Error(body.error || ('http_' + res.status));
+    if (body.detail) err.detail = body.detail; // MFのエラー本文 (原因の切り分け用)
+    throw err;
+  }
   return body.result;
 }
 
@@ -303,7 +307,7 @@ $('runBtn').addEventListener('click', async () => {
     const gd = r.gdrive ? `Gドライブ取込 ${r.gdrive.ingested ?? 0}件${r.gdrive.failed ? `（失敗 ${r.gdrive.failed}）` : ''} ／ ` : '';
     $('runInfo').textContent = `${gd}照合 ${r.checked}件: 貼った ${r.attached} ／ 提案 ${r.proposed} ／ 登録待ち ${r.waiting} ／ 候補複数 ${r.ambiguous} ／ 一致なし ${r.none}`;
     load();
-  } catch (e) { $('runInfo').textContent = ''; toast(e.message === 'mf_not_connected' ? 'MF未接続です' : '照合エラー: ' + e.message); }
+  } catch (e) { $('runInfo').textContent = ''; toast(e.message === 'mf_not_connected' ? 'MF未接続です' : '照合エラー: ' + e.message + (e.detail ? ' — ' + e.detail : '')); }
   $('runBtn').disabled = false;
 });
 

@@ -4,7 +4,7 @@
  * 台帳 = jobs-registry 'shohyo-voucher-attach'。
  * 1周期の仕事:
  *   1. 受け箱の未処理 (new/proposed/waiting_registration/ambiguous/no_match/error) を集める
- *   2. それらの日付を覆う期間のMF明細 + 仕訳を取る (1回のAPI往復で全件分)
+ *   2. それらの日付を覆う期間のMF明細 + 仕訳を取る (仕訳は会計期間をまたぐと 400 なので mf-api 側で期ごとに取って結合)
  *   3. matchBatch でルール突合 (証憑→明細・明細→証憑の両方向で一意のときだけ strong) → status を更新
  *   4. strong かつ 明細が仕訳登録済み かつ 仕訳に証憑なし かつ 自動添付ON のときだけ、
  *      claim (リース) を取ってから POST /vouchers で貼る。提案モード (OFF) では proposed に置く
@@ -17,7 +17,7 @@
 import cron from 'node-cron';
 import { pingJob } from '../jobs-monitor/ping-local.js';
 import { listLinks } from './db.js';
-import { loadTokens, getTransactions, getJournalsByTransactionIds, postVoucher } from './mf-api.js';
+import { loadTokens, getTransactions, getJournalsByTransactionIds, postVoucher, mfErrorText } from './mf-api.js';
 import { matchBatch, isValidDate } from './matcher.js';
 import {
   listOpenInbox, setMatch, readFile, autoAttachEnabled, transactionOwners,
@@ -170,8 +170,9 @@ async function tick() {
     // 未接続は「動いているが仕事ができない」なので ok にしない
     pingJob(JOB_ID, r.error === 'mf_not_connected' ? 'partial' : (r.ok ? 'ok' : 'partial'), note);
   } catch (e) {
-    console.error('[shohyo-attach] tick failed:', e.message);
-    pingJob(JOB_ID, 'fail', String(e.message).slice(0, 180));
+    console.error('[shohyo-attach] tick failed:', e.message, e.detail || '');
+    const mfText = mfErrorText(e);
+    pingJob(JOB_ID, 'fail', `${e.message}${mfText ? ' ' + mfText : ''}`.slice(0, 180));
   }
 }
 

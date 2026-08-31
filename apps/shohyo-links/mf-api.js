@@ -60,6 +60,7 @@ export function saveTokens(tokens) {
 
 export function clearTokens() {
   ensureTokenTable().prepare('DELETE FROM mf_tokens WHERE id = 1').run();
+  resetAccountingPeriodsCache(); // 別の事業者に繋ぎ直すことがある
 }
 
 // ---- OAuth ----
@@ -96,6 +97,7 @@ export async function exchangeCode(code) {
   const body = await tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: redirect });
   const tokens = normalizeTokens(body);
   saveTokens(tokens);
+  resetAccountingPeriodsCache();
   return tokens;
 }
 
@@ -202,15 +204,80 @@ export async function currentOffice() {
   return apiFetch('/api/v3/offices');
 }
 
-/** 期間内の仕訳を全ページ取得 */
+/** MFのエラー本文 (e.detail = { errors: [{ code, message }] }) から人が読める1行を取り出す (トースト・ジョブのノート用)。無ければ '' */
+export function mfErrorText(e) {
+  const d = e?.detail;
+  if (!d || typeof d !== 'object') return '';
+  const first = Array.isArray(d.errors) ? d.errors[0] : null;
+  const msg = first?.message || d.message || d.error_description || (typeof d.error === 'string' ? d.error : '') || '';
+  const code = first?.code || d.code || '';
+  return String(code && msg ? `${code}: ${msg}` : (msg || code)).slice(0, 200);
+}
+
+// ---- 会計期間 (期をまたぐ仕訳取得は 400) ----
+// GET /journals は「指定日が含まれる会計期間の仕訳のみ」を返す仕様で、start_date と end_date が別の期に
+// またがると 400 invalid_query_parameter_value "Accounting period doesn't exist for the fiscal year." になる
+// (2026-08-30 実機。決算期 7/1〜6/30 の環境で、受け箱に前期 (5月) の証憑が1枚あるだけで照合全体が止まった)。
+// → offices の accounting_periods (offices.read・再認可不要) で期間を期ごとに切って取り、結合する。
+// transactions API にこの制約は無い (366日以内のみ) ので明細側はそのまま。
+
+let periodsCache = { at: 0, periods: null };
+const PERIODS_TTL_MS = 6 * 60 * 60 * 1000;
+const isYmd = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s));
+
+export function resetAccountingPeriodsCache() { periodsCache = { at: 0, periods: null }; }
+
+/** 会計期間 [{ start_date, end_date, fiscal_year }] を開始日昇順で (MFは降順で返す)。6時間キャッシュ */
+export async function getAccountingPeriods({ force = false } = {}) {
+  if (!force && periodsCache.periods && Date.now() - periodsCache.at < PERIODS_TTL_MS) return periodsCache.periods;
+  const office = await currentOffice();
+  const periods = (office?.accounting_periods || [])
+    .filter(p => isYmd(p?.start_date) && isYmd(p?.end_date))
+    .map(p => ({ start_date: p.start_date, end_date: p.end_date, fiscal_year: p.fiscal_year }))
+    .sort((a, b) => a.start_date.localeCompare(b.start_date));
+  periodsCache = { at: Date.now(), periods };
+  return periods;
+}
+
+/**
+ * 純関数: 期間 [startDate, endDate] を会計期間ごとの小区間に切る (YYYY-MM-DD の文字列比較)。
+ * どの期にも含まれない日は落とす (そこに仕訳は存在し得ず、含めると MF が 400 を返す)。
+ * periods が空 (取れなかった) なら分割しない = 従来どおり1本で叩く。
+ * @returns {[string, string][]} 開始日昇順
+ */
+export function splitByAccountingPeriods(startDate, endDate, periods) {
+  if (!Array.isArray(periods) || !periods.length) return [[startDate, endDate]];
+  const out = [];
+  for (const p of [...periods].sort((a, b) => String(a.start_date).localeCompare(String(b.start_date)))) {
+    const s = startDate > p.start_date ? startDate : p.start_date;
+    const e = endDate < p.end_date ? endDate : p.end_date;
+    if (s <= e) out.push([s, e]);
+  }
+  return out;
+}
+
+/** 仕訳取得用に期間を期ごとに切る。会計期間が取れないときは従来どおり1本 (この修正で悪化させない) */
+async function journalRanges_(startDate, endDate) {
+  let periods = [];
+  try { periods = await getAccountingPeriods(); } catch (e) {
+    console.warn('[shohyo-links] accounting_periods を取れないので期の分割なしで仕訳を取ります:', e.message);
+  }
+  const ranges = splitByAccountingPeriods(startDate, endDate, periods);
+  if (!ranges.length) console.warn(`[shohyo-links] ${startDate}〜${endDate} はどの会計期間にも含まれません (仕訳0件として扱う)`);
+  return ranges;
+}
+
+/** 期間内の仕訳を全ページ取得 (期をまたぐときは期ごとに取って結合) */
 export async function getJournals(startDate, endDate) {
   const journals = [];
   const perPage = 500;
-  for (let page = 1; page <= 40; page++) {
-    const res = await apiFetch(`/api/v3/journals?start_date=${startDate}&end_date=${endDate}&page=${page}&per_page=${perPage}`);
-    const items = res?.journals || [];
-    journals.push(...items);
-    if (items.length < perPage) break;
+  for (const [s, e] of await journalRanges_(startDate, endDate)) {
+    for (let page = 1; page <= 40; page++) {
+      const res = await apiFetch(`/api/v3/journals?start_date=${s}&end_date=${e}&page=${page}&per_page=${perPage}`);
+      const items = res?.journals || [];
+      journals.push(...items);
+      if (items.length < perPage) break;
+    }
   }
   return journals;
 }
@@ -243,14 +310,20 @@ export async function getTransactions(startDate, endDate, { statuses = null, acc
   return out;
 }
 
-/** 明細IDに紐づく仕訳を引く (transaction_ids は最大50件/回) */
+/** 明細IDに紐づく仕訳を引く (transaction_ids は最大50件/回。期をまたぐときは期ごとに引いて結合) */
 export async function getJournalsByTransactionIds(ids, startDate, endDate) {
   const out = [];
-  for (let i = 0; i < ids.length; i += 50) {
-    const q = new URLSearchParams({ start_date: startDate, end_date: endDate, per_page: '500' });
-    for (const id of ids.slice(i, i + 50)) q.append('transaction_ids', rawId(id));
-    const res = await apiFetch(`/api/v3/journals?${q}`);
-    out.push(...(res?.journals || []));
+  const seen = new Set();
+  for (const [s, e] of await journalRanges_(startDate, endDate)) {
+    for (let i = 0; i < ids.length; i += 50) {
+      const q = new URLSearchParams({ start_date: s, end_date: e, per_page: '500' });
+      for (const id of ids.slice(i, i + 50)) q.append('transaction_ids', rawId(id));
+      const res = await apiFetch(`/api/v3/journals?${q}`);
+      for (const j of res?.journals || []) {
+        if (j?.id) { if (seen.has(j.id)) continue; seen.add(j.id); }
+        out.push(j);
+      }
+    }
   }
   return out;
 }
