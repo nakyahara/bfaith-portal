@@ -18,9 +18,13 @@
  * ⭐22:00 に走らせる理由:
  *   - 追跡番号を入れると納品の修正が極端に面倒になるため、日中に箱数のズレが
  *     表面化する時間を作る (子会社いろはの数え間違いがまれに発生する)
- *   - APIの投入は **当日中でないと期限切れで拒否される** (2026-08-07 実測)。
- *     翌朝に回すと通らない。逆に Seller Central 画面は期限後でも入るので、
- *     取りこぼした日は人が画面で入れればリカバリできる
+ *   - APIの投入は当日中でないと期限で弾かれる。翌朝に回すと通らない。
+ *     逆に Seller Central 画面は期限後でも入るので、取りこぼした日は人が画面で入れられる
+ *
+ * 🚨**投入できるかどうかは、Amazon側に「記入欄」があるかで決まる** (2026-08-31 確定)。
+ *   欄は人が Seller Central で出荷確定の操作をすると作られる。つまりこのジョブは
+ *   **人の操作より後**でないと仕事ができない。22:00 までに出荷確定が済んでいない納品は
+ *   翌日に持ち越さず、その晩のうちに「画面から入力してください」と名指しで知らせる。
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -39,6 +43,54 @@ export function jstYmd(date = new Date()) {
 }
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex').slice(0, 16);
+
+/**
+ * 納品を「APIで投入できるもの」と「人が画面で入れるしかないもの」に分ける。
+ *
+ * 🚨**照合より前に**分けるのが肝。旧実装は期限を buildAssignments の後でしか見ておらず、
+ *   投入できない納品が1件でも open に残ると、その納品ぶんのCSV行が宙に浮いて
+ *   「送り状がCSVにありません」→ blocked → **その日の全件が中断**していた
+ *   (2026-08-28〜31 に4日間ゼロ件で止まり、その間の135箱が未登録のまま到着した)。
+ *
+ * 投入できない理由は3つ。**人がやることは同じ (画面を見に行く)** なので同じ箱に入れる:
+ *   - Amazon側に追跡番号の記入欄が無い (画面で出荷確定の操作をしていない)
+ *   - 編集期限を過ぎている
+ *   - もう RECEIVING / CLOSED まで進んでいる (手遅れ。それでも黙って消さない)
+ *
+ * @param {Array} shipments 記入欄がある納品 (登録済みも含む)
+ * @param {Array} notReady  記入欄が無い/箱と食い違う納品
+ * @param {Date}  now
+ * @param {Array} arrived   書き込める段階を過ぎた納品で追跡番号が無いもの
+ * @returns {{actionable: Array, outOfReach: Array, todo: Array}}
+ *   actionable … 照合に回す納品 (登録済みを含む。CSV行を宙に浮かせないため)
+ *   outOfReach … 人が画面で入力するもの
+ *   todo       … 実際に今から投入する納品
+ */
+export function partitionShipments(shipments, notReady = [], now = new Date(), arrived = []) {
+  const outOfReach = notReady.map((s) => ({
+    ...s,
+    // 理由は summarizeShipment が判定済み (記入欄が無い / 欄と箱が食い違う)
+    skipReason: s.notReadyReason ?? 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が必要)',
+  }));
+  // 🚨もう書き込める段階を過ぎた納品 (RECEIVING / CLOSED) で追跡番号が入っていないもの。
+  //   APIでも画面でも手遅れだが、**黙って消してはいけない**。これを見えなくしていたせいで
+  //   8/19〜8/28 の約240箱が未登録のまま到着していたことに3週間気づけなかった
+  for (const s of arrived) {
+    outOfReach.push({
+      ...s,
+      skipReason: `すでに ${s.status} まで進んでいて追跡番号が入っていません (Amazonに未登録のまま到着しています)`,
+      tooLate: true,
+    });
+  }
+  const actionable = [];
+  for (const s of shipments) {
+    if (s.hasTracking) { actionable.push(s); continue; } // 登録済みは buildAssignments 側で skipped
+    const dl = checkDeadline(s, now);
+    if (dl.ok) actionable.push(s);
+    else outOfReach.push({ ...s, skipReason: dl.note ?? '編集期限を過ぎています (Seller Central画面から入力してください)' });
+  }
+  return { actionable, outOfReach, todo: actionable.filter((s) => !s.hasTracking) };
+}
 
 /**
  * CSVを取得する。ローカル指定が最優先 (手元での通しテスト用)。
@@ -85,6 +137,8 @@ export async function runTrackingJob(opts = {}) {
     openShipments: 0,
     scanned: null,
     blocked: [], excluded: [], skipped: [], registered: [], failed: [], note: [],
+    // APIでは投入できず、人が画面から入力するしかない納品 (記入欄が無い/期限切れ)
+    outOfReach: [],
   };
 
   const miss = missingEnv();
@@ -126,9 +180,13 @@ async function runInner(summary, ctx) {
   // ── 1. まず Amazon 側を見る ────────────────────────────────
   // ここを先にやることで「納品が無い日の置きっぱなしCSV」を異常扱いしないで済む。
   let shipments;
+  let notReady;
+  let arrived;
   try {
     const r = await findOpenShipments({ now });
     shipments = r.shipments;
+    notReady = r.notReady ?? [];
+    arrived = r.arrived ?? [];
     summary.scanned = r.scanned;
     // 🚨取得に失敗したプランがあると「今日は納品が無い」に化ける。書き込みジョブなので
     //   一部でも見えていない状態では進めない (全体を止めて人に知らせる)
@@ -145,9 +203,24 @@ async function runInner(summary, ctx) {
     summary.blocked.push(`納品の取得に失敗: ${e.message}`);
     return summary;
   }
-  summary.openShipments = shipments.length;
+  const { actionable, outOfReach, todo } = partitionShipments(shipments, notReady, now, arrived);
+  summary.openShipments = todo.length;
+  summary.outOfReach = outOfReach.map((s) => ({
+    shipmentConfirmationId: s.shipmentConfirmationId, fcCode: s.fcCode,
+    boxes: (s.boxIds ?? []).length, status: s.status, reason: s.skipReason,
+  }));
 
-  if (!shipments.length) {
+  if (!todo.length) {
+    // 🚨投入できない納品が残っているのに「することが無い」で緑にすると、その箱は
+    //   誰にも気づかれないまま期限を過ぎる。件数があるときは必ず人を呼ぶ
+    if (outOfReach.length) {
+      summary.severity = 'warn';
+      summary.note.push(
+        `APIで投入できる納品はありませんが、画面から入力すべき納品が ${outOfReach.length}件 ` +
+          `(${outOfReach.reduce((a, s) => a + (s.boxIds ?? []).length, 0)}箱) あります`,
+      );
+      return summary;
+    }
     // 追跡番号の投入を待っている納品が1つも無い = 今日はすることが無い。
     // (納品が無い日 / すでに人が画面で入れた日 / まだラベル未発行)
     summary.severity = 'info';
@@ -156,7 +229,7 @@ async function runInner(summary, ctx) {
   }
 
   // ── 2. ここから先は「投入すべき納品がある」= CSVが必要 ──────
-  const waiting = shipments.map((s) => `${s.shipmentConfirmationId}(${s.fcCode}) ${s.boxIds.length}箱`).join(' / ');
+  const waiting = todo.map((s) => `${s.shipmentConfirmationId}(${s.fcCode}) ${s.boxIds.length}箱`).join(' / ');
 
   let csv;
   try {
@@ -202,7 +275,9 @@ async function runInner(summary, ctx) {
   if (summary.blocked.length) { summary.severity = 'blocked'; return summary; }
 
   // ── 4. 割り当て ────────────────────────────────────────
-  const { assignments, excluded, problems, skipped } = buildAssignments(rows, shipments, {
+  // ⭐投入できない納品 (outOfReach) も一緒に渡す。渡さないと、その納品ぶんのCSV行が
+  //   「対応する納品が見つかりません」になって結局その日の全件が止まる (両方やらないと意味が無い)
+  const { assignments, excluded, problems, skipped } = buildAssignments(rows, [...actionable, ...outOfReach], {
     allowFcFallback: opts.allowFcFallback === true, // 既定OFF。移行期に手動実行するときだけ明示的に許す
   });
   summary.excluded = excluded;
@@ -215,7 +290,7 @@ async function runInner(summary, ctx) {
 
   // ── 5. 納品ごとに投入 ──────────────────────────────────
   for (const a of assignments) {
-    const ship = shipments.find((s) => s.shipmentConfirmationId === a.shipmentConfirmationId);
+    const ship = actionable.find((s) => s.shipmentConfirmationId === a.shipmentConfirmationId);
     const items = a.items.map((i) => ({ boxId: i.boxId, trackingId: i.trackingId }));
 
     // 自前記録が第一 (APIの trackingDetails は反映が数時間遅れるため信用しない)
@@ -259,7 +334,7 @@ async function runInner(summary, ctx) {
 
     // 🚨CSVを解析している間に、人が画面から入力していることがある (即SHIPPEDになる)。
     //   入力直後は追跡番号がAPIに現れないので「未登録」に見える。送る直前にもう一度確かめる
-    const re = await recheckBeforePut({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId });
+    const re = await recheckBeforePut({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId, boxIds: ship.boxIds });
     if (!re.ok) {
       summary.failed.push({ shipmentConfirmationId: a.shipmentConfirmationId, error: re.reason, needsManual: true });
       continue;
@@ -283,23 +358,28 @@ async function runInner(summary, ctx) {
       items: a.items, sourceFile: summary.source, sourceHash: summary.sourceHash,
       result: res.ok ? 'success' : 'failed', operationId: res.operationId ?? null, error: res.error ?? null,
       indeterminate: res.indeterminate === true,
+      // 🚨同じ文言でも原因は複数ありうる。code・HTTPステータス・request ID を残して後から追えるようにする
+      errorDetail: res.errorDetail ?? null,
+      slots: ship?.slots ?? null,
+      status: ship?.status ?? null,
     };
     store.append(rec);
-    if (res.ok) summary.registered.push(a);
+    if (res.ok) summary.registered.push({ ...a, status: ship.status });
     else summary.failed.push({
       shipmentConfirmationId: a.shipmentConfirmationId, error: res.error,
       retryable: res.retryable, needsManual: res.indeterminate === true,
     });
   }
 
-  if (summary.failed.length) summary.severity = 'warn';
+  // 🚨投入できなかった納品が1件でもあれば緑にしない。放っておくと期限を過ぎて箱が迷子になる
+  if (summary.failed.length || summary.outOfReach.length) summary.severity = 'warn';
   return summary;
 }
 
 /** GChat 用の本文。読み手が「何をすればいいか」だけ分かるように書く。 */
 export function formatSummary(s) {
   const L = [];
-  const sev = s.severity ?? (s.blocked.length ? 'blocked' : s.failed.length ? 'warn' : 'ok');
+  const sev = s.severity ?? (s.blocked.length ? 'blocked' : (s.failed.length || s.outOfReach?.length) ? 'warn' : 'ok');
   const head = { blocked: '🚨', warn: '⚠️', info: 'ℹ️', ok: s.registered.length ? '✅' : 'ℹ️' }[sev] ?? 'ℹ️';
   L.push(`${head} *FBA納品 追跡番号${s.commit ? '' : '(プレビュー)'}*  ${s.expectYmd}`);
 
@@ -311,10 +391,24 @@ export function formatSummary(s) {
   if (s.registered.length) {
     L.push('', `*登録${s.commit ? '' : '予定'} ${s.registered.length}件*`);
     s.registered.forEach((a) => L.push(`・${a.shipmentConfirmationId} (${a.fcCode}) ${a.countBoxes}箱  照合=${a.matchedBy}`));
+    // 🚨APIでは「まだ未入力」と「画面で入れた直後 (反映が数時間遅れる)」を区別できない。
+    //   発送済み状態の納品へ書いたときは、上書きの可能性があることを必ず人に見せる
+    const shipped = s.registered.filter((a) => a.status === 'SHIPPED');
+    if (shipped.length) {
+      L.push('', `※ うち ${shipped.length}件 は発送済み状態の納品です。` +
+        'この間に画面から手入力していた場合は上書きしています (画面の番号をご確認ください)');
+    }
   }
   if (s.failed.length) {
     L.push('', `*失敗 ${s.failed.length}件*`);
     s.failed.forEach((f) => L.push(`・${f.shipmentConfirmationId}: ${f.error}${f.needsManual ? ' → 画面から手入力してください' : ''}`));
+  }
+  if (s.outOfReach?.length) {
+    // ⭐APIでは絶対に入らないものを「失敗」と同じ顔で出すと、直せるものと直せないものが混ざる。
+    //   人がやることが決まっている (画面で入力する) ので、その1点だけを伝える
+    const n = s.outOfReach.reduce((a, x) => a + (x.boxes ?? 0), 0);
+    L.push('', `*画面から入力してください ${s.outOfReach.length}件 (${n}箱)*`);
+    s.outOfReach.forEach((x) => L.push(`・${x.shipmentConfirmationId} (${x.fcCode}) ${x.boxes}箱: ${x.reason}`));
   }
   if (s.skipped.length) L.push('', `スキップ ${s.skipped.length}件 (${s.skipped.map((x) => x.reason).join('/')})`);
   if (s.excluded.length) {

@@ -13,9 +13,9 @@ for (const k of ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOK
   process.env[k] = process.env[k] || 'dummy-for-test';
 }
 
-const { jstYmd, formatSummary, runTrackingJob } = await import('../tracking-runner.js');
+const { jstYmd, formatSummary, runTrackingJob, partitionShipments } = await import('../tracking-runner.js');
 const store = await import('../tracking-store.js');
-const { _internal, summarizeShipment, checkDeadline } = await import('../tracking-service.js');
+const { _internal, summarizeShipment, checkDeadline, trackingSlotCount, describePutError, ARRIVAL_STATUSES } = await import('../tracking-service.js');
 
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log(`  ok  ${name}`); };
@@ -170,6 +170,109 @@ t('期限の情報が無い納品は緩い側に倒す (ok=true。最終判断�
     { shipmentConfirmationId: 'FBA-X', status: 'READY_TO_SHIP', destination: { warehouseId: 'HND2' } }, []);
   assert.equal(ship.dates, null);
   assert.equal(checkDeadline(ship).ok, true);
+});
+
+// ── 記入欄 (spdTrackingItems の枠) の有無で投入可否が決まる — 2026-08-31 実測 ──
+const mkShip = (id, { slots = 1, boxes = 1, status = 'READY_TO_SHIP', rtsEnd = null, tracked = false } = {}) => {
+  const items = Array.from({ length: slots }, (_, i) => ({ boxId: `${id}U${i}`, ...(tracked ? { trackingId: '66393873615' } : {}) }));
+  const raw = {
+    shipmentConfirmationId: id, status, destination: { warehouseId: 'HND2' },
+    trackingDetails: slots ? { spdTrackingDetail: { spdTrackingItems: items } } : {},
+    ...(rtsEnd ? { dates: { readyToShipWindow: { start: rtsEnd, end: rtsEnd } } } : {}),
+  };
+  return summarizeShipment({ inboundPlanId: 'p1', name: '' }, { shipmentId: 's-' + id }, raw,
+    Array.from({ length: boxes }, (_, i) => ({ boxId: `${id}U${i}` })));
+};
+
+t('🚨記入欄の数を数える (これがPUTの可否そのもの)', () => {
+  assert.equal(trackingSlotCount({ trackingDetails: { spdTrackingDetail: { spdTrackingItems: [{ boxId: 'B1' }, { boxId: 'B2' }] } } }), 2);
+  assert.equal(trackingSlotCount({ trackingDetails: {} }), 0);
+  assert.equal(trackingSlotCount({}), 0);
+});
+
+t('🚨記入欄が空でも「欄がある」なら投入できる (欄あり=putReady)', () => {
+  const s = mkShip('FBA-SLOT', { slots: 3, boxes: 3 });
+  assert.equal(s.slots, 3);
+  assert.equal(s.putReady, true);
+  assert.equal(s.hasTracking, false, '空欄は「登録済み」ではない');
+});
+
+t('🚨記入欄が無い納品は投入対象から外す (何度投げても BadRequest になるだけ)', () => {
+  const ng = mkShip('FBA-NOSLOT', { slots: 0, boxes: 4 });
+  assert.equal(ng.putReady, false);
+  const { actionable, outOfReach, todo } = partitionShipments([], [ng]);
+  assert.equal(todo.length, 0);
+  assert.equal(actionable.length, 0);
+  assert.equal(outOfReach.length, 1);
+  assert.match(outOfReach[0].skipReason, /記入欄/);
+});
+
+t('🚨記入欄と輸送箱が食い違う納品は送らない (一部の箱が宙に浮く)', () => {
+  const ng = mkShip('FBA-PARTIAL', { slots: 1, boxes: 3 });
+  assert.equal(ng.putReady, false);
+  assert.match(ng.notReadyReason, /記入欄 1個 と輸送箱 3個 が一致しません/);
+  const { todo, outOfReach } = partitionShipments([], [ng]);
+  assert.equal(todo.length, 0);
+  assert.match(outOfReach[0].skipReason, /一致しません/);
+});
+
+t('🚨到着済みなのに追跡番号が無い納品を黙って消さない (240箱を3週間見落とした原因)', () => {
+  const late = mkShip('FBA-LATE', { slots: 0, boxes: 19, status: 'RECEIVING' });
+  const { todo, outOfReach } = partitionShipments([], [], new Date(), [late]);
+  assert.equal(todo.length, 0);
+  assert.equal(outOfReach.length, 1);
+  assert.equal(outOfReach[0].tooLate, true);
+  assert.match(outOfReach[0].skipReason, /RECEIVING.*未登録のまま到着/);
+});
+
+t('🚨期限切れは照合より前に外す (残すとCSV行が宙に浮いてその日の全件が中断する)', () => {
+  const now = new Date('2026-08-28T13:00:00Z');
+  const dead = mkShip('FBA-OLD', { slots: 1, rtsEnd: '2026-08-27T14:59Z' });
+  const live = mkShip('FBA-NEW', { slots: 1, rtsEnd: '2026-08-28T14:59Z' });
+  const { actionable, outOfReach, todo } = partitionShipments([dead, live], [], now);
+  assert.deepEqual(todo.map((s) => s.shipmentConfirmationId), ['FBA-NEW']);
+  assert.deepEqual(outOfReach.map((s) => s.shipmentConfirmationId), ['FBA-OLD']);
+  assert.ok(actionable.every((s) => s.shipmentConfirmationId !== 'FBA-OLD'));
+});
+
+t('登録済みの納品は照合には回すが、投入対象には数えない (CSV行を宙に浮かせないため)', () => {
+  const done = mkShip('FBA-DONE', { slots: 1, tracked: true });
+  const { actionable, todo, outOfReach } = partitionShipments([done], []);
+  assert.equal(actionable.length, 1, '照合には渡す');
+  assert.equal(todo.length, 0, '投入はしない');
+  assert.equal(outOfReach.length, 0);
+});
+
+t('🚨投入できない納品が残る日は緑にしない (放置すると期限を過ぎて箱が迷子になる)', () => {
+  const s = formatSummary({
+    ...base, severity: 'warn', registered: [],
+    outOfReach: [{ shipmentConfirmationId: 'FBA-A', fcCode: 'XJE1', boxes: 45, reason: 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が必要)' }],
+  });
+  assert.match(s, /⚠️/);
+  assert.match(s, /画面から入力してください 1件 \(45箱\)/);
+  assert.match(s, /FBA-A \(XJE1\) 45箱/);
+  assert.match(s, /記入欄/);
+});
+
+t('🚨PUT失敗は code・details を残す (同じ文言の別原因を切り分けるため)', () => {
+  // amazon-sp-api 1.2.0 の CustomError = 応答本文 errors[0] のキーをそのままコピーした形
+  const sdkShaped = Object.assign(new Error('ERROR: Shipment sh1 is not in a state where tracking details can be provided.'),
+    { code: 'BadRequest', details: '' });
+  const d = describePutError(sdkShaped);
+  assert.equal(d.code, 'BadRequest');
+  assert.match(d.message, /not in a state/);
+  assert.equal(d.httpStatus, undefined, 'SDK経由ではHTTPステータスは取れない (無いものを捏造しない)');
+  // あれば拾う (raw_result で自前解析する将来のため)
+  const rich = describePutError({ code: 'BadRequest', statusCode: 400, message: 'x', headers: { 'x-amzn-requestid': 'abc-123' } });
+  assert.equal(rich.httpStatus, 400);
+  assert.equal(rich.requestId, 'abc-123');
+  // 手がかりが何も無い例外でも message だけは必ず残る
+  assert.equal(describePutError(new Error('socket hang up')).message, 'socket hang up');
+});
+
+t('🚨到着系だけを arrived に入れる (CANCELLED/DELETED/WORKING は追跡番号の対象外)', () => {
+  for (const st of ['IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING', 'CLOSED']) assert.ok(ARRIVAL_STATUSES.has(st), st);
+  for (const st of ['CANCELLED', 'DELETED', 'WORKING', 'ERROR', 'READY_TO_SHIP', 'SHIPPED']) assert.ok(!ARRIVAL_STATUSES.has(st), st);
 });
 
 await (async () => {

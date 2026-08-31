@@ -220,9 +220,23 @@ export function buildAssignments(rows, shipments, opts = {}) {
     if (tags.size > 1) problems.push(`送り状番号 ${t} が複数の宛先に現れます (${[...tags].join(' / ')})`);
   }
 
-  const targets = shipments.filter((s) => !s.hasTracking);
+  // 🚨skipReason が付いた納品 = 呼び出し側が「APIでは投入できない」と判断済みのもの
+  //   (Amazon側に記入欄が無い / 編集期限を過ぎている)。
+  //   これを targets に残すと「送り状がCSVにありません」、CSV行の側では「対応する納品が
+  //   見つかりません」となり、**その納品1件のせいでその日の全件が中断**する
+  //   (2026-08-28〜31 に実際に4日間ゼロ件で止まった)。skipped に落として通知だけ出す。
+  const targets = shipments.filter((s) => !s.hasTracking && !s.skipReason);
   for (const s of shipments) {
     if (s.hasTracking) skipped.push({ shipmentConfirmationId: s.shipmentConfirmationId, reason: '登録済み' });
+    else if (s.skipReason) {
+      skipped.push({
+        shipmentConfirmationId: s.shipmentConfirmationId,
+        fcCode: s.fcCode,
+        boxes: (s.boxIds ?? []).length,
+        reason: s.skipReason,
+        needsManual: true,
+      });
+    }
   }
 
   const assignments = [];
@@ -274,6 +288,20 @@ export function buildAssignments(rows, shipments, opts = {}) {
   //   「FBA以外の便」と同じ扱い (黙って除外) にすると、取り違えたまま他の納品だけ登録してしまう。
   //   ただし「登録済みでスキップした納品」の行は正常 (画面から入力済みなだけ) なので騒がない。
   const skippedIds = new Set(skipped.map((s) => s.shipmentConfirmationId));
+  // 🚨投入できない納品 (skipReason付き) の行は「無条件で正常」にしない (Codexレビュー 2026-08-31)。
+  //   行が無いのは正常 (出荷確定していない納品の伝票は今日のCSVに無くて当然) だが、
+  //   行が**ある**なら個口数は輸送箱と合っていなければおかしい。合っていないのに通すと
+  //   「CSV全体が正しい」という前提が崩れたまま他の納品へ投入することになる
+  for (const s of shipments) {
+    if (!s.skipReason) continue;
+    const n = units.filter((u) => u.納品番号 === s.shipmentConfirmationId).length;
+    if (n && n !== (s.boxIds ?? []).length) {
+      problems.push(
+        `${s.shipmentConfirmationId} (${s.fcCode}): ` +
+          `伝票の個口合計 ${n} と輸送箱 ${(s.boxIds ?? []).length} が一致しません (投入対象外の納品ですが、CSVの内容が疑わしいため中断します)`,
+      );
+    }
+  }
   const orphans = new Map();
   units.forEach((u, i) => {
     if (usedUnits.has(i) || !u.納品番号) return; // 管理番号が空の行は ② で excluded 済み

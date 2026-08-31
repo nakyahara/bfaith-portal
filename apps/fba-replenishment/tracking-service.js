@@ -8,12 +8,18 @@
  *   - boxId は `<納品番号>U<6桁連番>` だが **推測生成せず必ず listShipmentBoxes の返り値を使う**
  *   - trackingId は **ハイフン無しの数字**で送る
  *   - 送信ボディに `ltlTrackingDetail` は入れない (SPDのみ)
- *   - 🚨 **PUT は「期限内」でないと拒否される**。status ではなく期限が効く:
- *       READY_TO_SHIP + 期限外 ❌ / SHIPPED + 期限外 ❌ / SHIPPED + 期限内 ✅
- *     期限は `dates.readyToShipWindow.end` (出荷日23:59 JST) と
- *     `selectedDeliveryWindow.editableUntil` (翌日09:00 JST)。
- *     22:00 JST の定期実行は期限内に入るが、**失敗時のリトライ余裕は当日中しかない**
  *   - PUT は非同期。operationId を `getInboundOperationStatus` で SUCCESS まで追う
+ *
+ * 🏆**PUT の可否を決めるのは「記入欄 (spdTrackingItems の枠) の有無」** (2026-08-31 確定)。
+ *   本番24件の突合で、成功9件はすべて欄あり・失敗15件はすべて欄なし。例外なし。
+ *   欄は Seller Central で出荷確定の操作をするとAmazon側に作られる → trackingSlotCount 参照。
+ *
+ *   ⚠️ 2026-08-07〜08-21 のあいだ「status が効く」「期限が効く」「未発送だから」と
+ *   立て続けに誤診した。いずれも**欄の有無と相関する別の何か**を見ていただけだった:
+ *     - 期限切れの納品は欄も無いことが多い (出荷確定していないから期限も過ぎる)
+ *     - 実際に出していない納品は当然出荷確定もしていない = 欄が無い
+ *   期限 (checkDeadline) は無駄なPUTを減らす事前判定として残してあるが、
+ *   **拒否の理由ではない**。
  */
 import SellingPartner from 'amazon-sp-api';
 
@@ -98,6 +104,32 @@ const DEFINITE_REJECT_CODES = new Set([
   'BadRequest', 'InvalidInput', 'Unauthorized', 'Forbidden', 'NotFound', 'AccessDenied', 'QuotaExceeded',
 ]);
 
+/**
+ * エラーの手がかりを、後から原因を追えるだけ残す。
+ * 🚨message だけを記録していたため「同じ文言の別原因」を区別できず、真因の特定に3週間かかった
+ *   (2026-08-31)。
+ * ⚠️ amazon-sp-api 1.2.0 の CustomError は応答本文の `errors[0]` (code / message / details) を
+ *   コピーするだけで、**HTTPステータスと応答ヘッダ (x-amzn-RequestId) は捨てる**。
+ *   ここで httpStatus / requestId を拾うのは「あれば」の保険で、SDK経由では通常 code と
+ *   details までしか残らない。request ID まで要るなら PUT だけ `options.raw_result` で
+ *   自前解析する (未対応・必要になったら)。
+ */
+export function describePutError(e) {
+  const pick = (...vals) => vals.find((v) => v !== undefined && v !== null && v !== '') ?? null;
+  const headers = e?.headers ?? e?.response?.headers ?? {};
+  const h = (name) => headers?.[name] ?? headers?.[name.toLowerCase()] ?? null;
+  const detail = {
+    code: pick(e?.code, e?.error?.code, e?.body?.errors?.[0]?.code),
+    httpStatus: pick(e?.statusCode, e?.status, e?.response?.status, e?.response?.statusCode),
+    requestId: pick(h('x-amzn-RequestId'), h('x-amzn-requestid'), e?.requestId),
+    details: pick(e?.details, e?.error?.details, e?.body?.errors?.[0]?.details),
+    errors: Array.isArray(e?.body?.errors) ? e.body.errors : (Array.isArray(e?.errors) ? e.errors : null),
+    message: String(e?.message ?? e ?? ''),
+  };
+  for (const k of Object.keys(detail)) if (detail[k] === null) delete detail[k];
+  return detail;
+}
+
 function classifyPutError(e) {
   const code = e?.code ?? '';
   const msg = String(e?.message ?? e ?? '');
@@ -156,6 +188,47 @@ export function realTrackingItems(detail) {
 }
 
 /**
+ * 追跡番号の**記入欄** (spdTrackingItems のエントリ) が何個あるか。
+ *
+ * 🏆(2026-08-31 実測で確定) `PUT trackingDetails` が通るかどうかは status でも期限でもなく、
+ *   **この記入欄が存在するか**だけで決まる。欄はAmazon側が用意するもので、
+ *   Seller Central で出荷確定の操作をした納品にだけ箱数ぶん作られる。
+ *
+ *   欄あり → 投入できる / 欄なし (0個) → 何度投げても
+ *   `not in a state where tracking details can be provided` で拒否される。
+ *
+ *   本番24件の突合で例外なし (成功9件はすべて欄あり・失敗15件はすべて欄なし)。
+ *   欄の有無は人がいつ画面を操作したかで決まるため**納品プラン単位で揃う**。
+ *   これが「日によって全滅したり全成功したりする」ように見えていた正体。
+ */
+export function trackingSlotCount(detail) {
+  return (detail?.trackingDetails?.spdTrackingDetail?.spdTrackingItems ?? []).length;
+}
+
+/**
+ * 記入欄が「その納品の箱と1対1で揃っているか」。
+ * 🚨欄が1つでもあれば投入してよい、にはしない (Codexレビュー 2026-08-31)。
+ *   PUTには /boxes 由来の boxId を全件送るので、欄の側と食い違っていれば
+ *   一部の箱が宙に浮くか、知らない箱へ書きにいくことになる。書き込みジョブなので
+ *   「揃っていることを確認できたときだけ送る」に倒す。
+ * @returns {{ok: boolean, reason: string|null}}
+ */
+export function checkSlotsMatchBoxes(detail, boxIds) {
+  const slotIds = (detail?.trackingDetails?.spdTrackingDetail?.spdTrackingItems ?? []).map((i) => String(i?.boxId ?? ''));
+  if (!slotIds.length) {
+    return { ok: false, reason: 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が必要)' };
+  }
+  const a = [...slotIds].sort().join(' ');
+  const b = [...boxIds].map(String).sort().join(' ');
+  if (a === b) return { ok: true, reason: null };
+  return {
+    ok: false,
+    reason: `Amazon側の記入欄 ${slotIds.length}個 と輸送箱 ${boxIds.length}個 が一致しません。` +
+      '取り違えを避けるため自動では投入しません (画面から入力してください)',
+  };
+}
+
+/**
  * getShipment の生レスポンスから runner に渡す要約を組み立てる。
  * 🚨期限の生データ (dates / selectedDeliveryWindow) を必ず残すこと。
  *   runner は投入直前に checkDeadline(ship) を呼び直すが、ここで落とすと
@@ -164,6 +237,9 @@ export function realTrackingItems(detail) {
  *   ガードを抜けて "not in a state..." で拒否された)
  */
 export function summarizeShipment(plan, shipmentRef, detail, boxes, now = new Date()) {
+  const boxIds = boxes.map((x) => x.boxId);
+  // ⭐APIが追跡番号を受け付ける状態か (記入欄の有無と、箱との対応)。詳細は trackingSlotCount のコメント
+  const slot = checkSlotsMatchBoxes(detail, boxIds);
   return {
     inboundPlanId: plan.inboundPlanId,
     planName: plan.name || '',
@@ -172,8 +248,11 @@ export function summarizeShipment(plan, shipmentRef, detail, boxes, now = new Da
     fcCode: detail.destination?.warehouseId ?? '',
     status: detail.status,
     // ⭐boxIdは規則から生成せずAPIの返り値を正とする
-    boxIds: boxes.map((x) => x.boxId),
+    boxIds,
     hasTracking: realTrackingItems(detail).length > 0,
+    slots: trackingSlotCount(detail),
+    putReady: slot.ok,
+    notReadyReason: slot.reason,
     deadline: checkDeadline(detail, now),
     dates: detail.dates ?? null,
     selectedDeliveryWindow: detail.selectedDeliveryWindow ?? null,
@@ -183,19 +262,36 @@ export function summarizeShipment(plan, shipmentRef, detail, boxes, now = new Da
 /**
  * 追跡番号がまだ入っていない納品を探す。
  * ⭐無駄なAPI呼び出しを避けるため、プラン本体の shipments[].status を見てから詳細を取る。
+ *
+ * 🏆**SHIPPED も必ず対象に入れる** (2026-08-31 に設計を反転):
+ *   記入欄 (trackingSlotCount) が立つのは Seller Central で出荷確定の操作をした時で、
+ *   その操作で status は SHIPPED になる。READY_TO_SHIP だけを見ていた旧実装は
+ *   **「投入できる納品」を除外し、「何度投げても入らない納品」だけを拾っていた**。
+ *   実際 8/21・8/28・8/31 の135箱は欄が立っていたのに一度も試されず、
+ *   逆に 8/24・8/27 の56箱は欄が無いのに投入を試みて全部 BadRequest になっていた。
+ *
+ *   旧コメントの「SHIPPED を足すと、人が画面で入力した直後を未登録と誤認して二重投入する」
+ *   という懸念自体は残る (値の反映は数時間遅れる)。ただしそれは自前記録 (tracking-store) と
+ *   投入直前の再確認で守る側であって、**status で入口を閉じる理由にはならない**。
+ *
  * @param {{statuses?: string[]}} [opts]
- *   statuses の既定は READY_TO_SHIP のみ。
- *   ⚠️ SHIPPED を足してはいけない: 人が画面で追跡番号を入れると即 SHIPPED になるが、
- *   `trackingDetails` の反映は数時間遅れる。よって「SHIPPED かつ hasTracking=false」は
- *   「未登録」ではなく「登録直後で見えていないだけ」のことがあり、拾うと二重投入になる。
- * @returns {Promise<Array>} [{inboundPlanId, planName, shipmentId, shipmentConfirmationId, fcCode,
- *                             status, boxIds, hasTracking, deadline, raw}]
+ * @returns {Promise<{shipments: Array, notReady: Array, errors: string[], scanned: object}>}
+ *   shipments … 記入欄があり投入できる納品 (hasTracking 済みのものも含む。呼び出し側で skip)
+ *   notReady  … 記入欄が無く、APIでは投入できない納品 (人が画面で出荷確定していない)
  */
+/**
+ * 「もう書き込める段階を過ぎた」納品の status。追跡番号が無ければ arrived として人に見せる。
+ * これ以外 (CANCELLED / DELETED / WORKING / ERROR / 未知) は見ない = 追跡番号の対象外。
+ */
+export const ARRIVAL_STATUSES = new Set(['IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING', 'CLOSED']);
+
 export async function findOpenShipments(opts = {}) {
-  const wantStatuses = opts.statuses ?? ['READY_TO_SHIP'];
+  const wantStatuses = opts.statuses ?? ['READY_TO_SHIP', 'SHIPPED'];
   const windowDays = opts.windowDays ?? PLAN_WINDOW_DAYS();
   const now = opts.now ?? new Date();
   const out = [];
+  const notReady = [];
+  const arrived = [];
   const errors = [];
 
   let plans;
@@ -227,17 +323,30 @@ export async function findOpenShipments(opts = {}) {
       continue;
     }
     for (const s of full.shipments ?? []) {
-      if (!wantStatuses.includes(s.status)) continue;
+      // 🚨書き込み対象 (wantStatuses) 以外を全部見ない、はダメ (Codexレビュー 2026-08-31)。
+      //   「到着済みなのに追跡番号が入っていない納品」が誰にも見えないまま消える。
+      //   直近の被害 (8/19〜8/28 の約240箱) がまさにこれで、気づいたのは3週間後だった。
+      //   ただし CANCELLED / DELETED / WORKING / ERROR 等まで見に行くと、無関係な納品の
+      //   取得失敗で当日の全件が止まるので、「到着系」だけを追加で見る (arrivalStatuses)
+      if (!wantStatuses.includes(s.status) && !ARRIVAL_STATUSES.has(s.status)) continue;
       const base = `${V}/inboundPlans/${p.inboundPlanId}/shipments/${s.shipmentId}`;
       try {
         const d = await call(base);
-        // 🚨プラン一覧を見てから詳細を取るまでの間に、人が画面で追跡番号を入れて
-        //   SHIPPED になっていることがある。そのとき trackingDetails はまだ空なので
-        //   「未登録」に見えてしまう (反映が数時間遅れるため)。詳細でもう一度確認する
-        if (!wantStatuses.includes(d.status)) continue;
+        // 一覧を見てから詳細を取るまでに状態が進むことがあるので詳細でも同じ集合で判定する
+        if (!wantStatuses.includes(d.status) && !ARRIVAL_STATUSES.has(d.status)) continue;
         const b = await callAllPages(`${base}/boxes`, 'boxes', { pageSize: 100 });
         if (b.truncated) errors.push(`${d.shipmentConfirmationId}: 輸送箱が多すぎて全部見られませんでした`);
-        out.push(summarizeShipment(p, s, d, b.items));
+        const sum = summarizeShipment(p, s, d, b.items, now);
+
+        // 登録済みは status を問わず返す。ここで落とすとCSV行が宙に浮いて全件中断する
+        if (sum.hasTracking) { out.push(sum); continue; }
+        // もう書き込める段階ではない (到着系)。手遅れだが黙って消さない
+        if (!wantStatuses.includes(d.status)) { arrived.push(sum); continue; }
+        // 🚨記入欄が無い納品を投入対象に混ぜてはいけない。投げれば必ず BadRequest になり、
+        //   さらに「対応する納品が見つからない/送り状がCSVに無い」で**その日の全件が中断**する。
+        //   人が画面で出荷確定するまでAPIでは手が出ないので、対象から外して名指しで知らせる
+        if (sum.putReady) out.push(sum);
+        else notReady.push(sum);
       } catch (e) {
         errors.push(`納品 ${s.shipmentId} の取得に失敗: ${e?.message ?? e}`);
       }
@@ -245,6 +354,8 @@ export async function findOpenShipments(opts = {}) {
   }
   return {
     shipments: out,
+    notReady,
+    arrived,
     errors,
     scanned: { total: plans.items.length, checked: recent.length, skippedOld: skipped, windowDays },
   };
@@ -253,9 +364,19 @@ export async function findOpenShipments(opts = {}) {
 /**
  * PUTの直前に、まだ投入してよい状態かをもう一度確かめる。
  * CSVの解析中に人が画面から入力していることがある (即 SHIPPED になる)。
+ *
+ * ⭐人が画面で追跡番号を入れた直後の納品は **`trackingDetails` が null** (記入欄そのものが無い)
+ *   で数時間見える (2026-08-07 実測・HND2 5箱・35分後も null)。今日の「出荷確定だけ済んで
+ *   欄は空」とは別の状態なので、**「欄が無い→送らない」の判定がそのまま手入力直後の除外になる**。
+ *   ただし「null → 値あり」の途中で「欄あり・空」を経由しないことは未確認。
+ *   その残りのリスクは、SHIPPED へ書いたときに通知で「上書きしています」と明示して人に見せる。
+ *
+ * @param {{inboundPlanId: string, shipmentId: string, boxIds?: string[]}} target
+ *   boxIds を渡すと、最初の取得時と同じ「記入欄 = 輸送箱」の完全一致をここでも要求する
+ *   (最初の取得からPUTまでに欄が部分的に変わった場合に、1枠でも残っていれば送ってしまうのを防ぐ)
  * @returns {Promise<{ok: boolean, reason?: string, status?: string}>}
  */
-export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHIP'] } = {}) {
+export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHIP', 'SHIPPED'] } = {}) {
   const base = `${V}/inboundPlans/${target.inboundPlanId}/shipments/${target.shipmentId}`;
   let d;
   try {
@@ -266,6 +387,15 @@ export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHI
   if (realTrackingItems(d).length) {
     return { ok: false, status: d.status, reason: 'すでに追跡番号が入っています (この間に誰かが入力した可能性)' };
   }
+  // 記入欄が消えた/箱と食い違った = もうAPIでは受け付けられない。投げれば BadRequest になるだけなので送らない
+  const slot = Array.isArray(target.boxIds)
+    ? checkSlotsMatchBoxes(d, target.boxIds)
+    : (trackingSlotCount(d) === 0
+      ? { ok: false, reason: 'Amazon側に追跡番号の記入欄がありません (Seller Central で出荷確定の操作が済んでいない状態)' }
+      : { ok: true, reason: null });
+  if (!slot.ok) {
+    return { ok: false, status: d.status, slots: trackingSlotCount(d), reason: `${slot.reason}。APIでは登録できないため、画面から入力してください` };
+  }
   if (!expectStatuses.includes(d.status)) {
     return {
       ok: false, status: d.status,
@@ -273,7 +403,7 @@ export async function recheckBeforePut(target, { expectStatuses = ['READY_TO_SHI
         ' (入力直後は追跡番号がAPIに現れないため、自動では投入しません)',
     };
   }
-  return { ok: true, status: d.status };
+  return { ok: true, status: d.status, slots: trackingSlotCount(d) };
 }
 
 /**
@@ -306,6 +436,7 @@ export async function putTrackingDetails(target, items) {
       //   確定失敗にすると次回の実行で再送され二重投入になるため indeterminate にする
       indeterminate: c.indeterminate,
       retryable: c.retryable,
+      errorDetail: describePutError(e),
     };
   }
 
