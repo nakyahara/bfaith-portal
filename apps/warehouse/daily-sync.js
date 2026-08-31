@@ -553,6 +553,11 @@ async function main() {
 
   // Yahoo!ショッピング（VPSプロキシ経由で遅延しやすいため60分）
   const yahooResult = runScript('apps/warehouse/yahoo-orders.js 7', 'Yahoo!ショッピング', 3600000);
+  // 受注取込の窓 (7日) から漏れた ship_date を毎日少しずつ埋める (P2-Y PR-Y-C2)。
+  // 出荷完了なのに発送日が無い注文 → レビューメールのフォロー予定が立たないため。上限 60 件/日 (VPS 側 1.1 秒間隔)
+  const yahooShipDateFill = runScript(
+    'apps/warehouse/backfill-yahoo-ship-date.js --days 60 --limit 60', 'Yahoo発送日 穴埋め', 300000);
+  results.push({ name: 'Yahoo発送日 穴埋め', ...yahooShipDateFill });
   results.push({ name: 'Yahoo', ...yahooResult });
 
   // au PAY マーケット (Wow!manager API、VPS proxy 経由で遅延しやすいため 60 分)
@@ -923,6 +928,16 @@ async function main() {
       console.log('[DailySync] Qoo10分析 sync は取込失敗のためスキップ (failed/ を確認、修正後に再投入)');
     }
 
+    // === 小さなマスタの mirror sync (価格一括改定ツール) ===
+    // SKUマップ 2種 + 送料マスタ (配送方法ごとの配送関係費合計。モール別の粗利計算に使う)
+    // f_yahoo_sku_map / f_aupay_sku_map を Render へ全置換で送る。価格一括改定ツールの
+    // 出品引き当てが参照する。手動 map なので普段は差分ゼロ、行数も数百 (単一 chunk)
+    const skuMapSyncResult = runScript(
+      `apps/warehouse/sync-sku-maps.js --data-dir ${DATA_DIR_ARG}`,
+      'SKUマップ/送料マスタ sync', 300000
+    );
+    results.push({ name: 'SKUマップ/送料マスタ sync', ...skuMapSyncResult });
+
     // === Yahoo finance daily fact (Yahoo Phase 1 Y-3c、Y-1 + Y-2 + Y-3a 統合) ===
     // 1. f_yahoo_finance_sku_daily_v1 build (whitelist order=5/pay=1/ship=3、partial margin)
     // 2. DQ gate (6 check、severity error で exit 1)
@@ -1222,6 +1237,23 @@ async function main() {
     }
   }
 
+  // ─── Yahoo refresh token 期限アラート (残り5日から毎日1通、#958 の GChat 再認可へ誘導) ───
+  // 失効すると Yahoo 系 (受注取込・未発送アラート・レビューメール) が全滅するため、切れる前に声をかける。
+  // 1日1通の抑止は script 側 (yahoo_token_notify_state)。retry で再実行されても二重送信しない
+  // 通知の失敗 (webhook 障害等) では exit 0 を返す実装 = daily-sync 全体を落とさない (Codex R1 High)。
+  // RETRYABLE_JOBS にも入れない (翌朝の実行で送れば足りる)
+  const yahooTokenAlert = runScript('apps/warehouse/notify-yahoo-token-expiry.js', 'Yahooトークン期限アラート', 120000);
+  results.push({ name: 'Yahooトークン期限アラート', ...yahooTokenAlert });
+
+  // ─── 楽天RMS ライセンスキー期限アラート (残り14日から毎日1通) ───
+  // licenseKey は90日で失効し、切れると楽天API が全部 401 になる (受注取込・未発送アラート・
+  // 問い合わせ返信・クーポン・価格改定・出品まで一斉停止)。2026-08-30 に実際に発生したため、
+  // 期限を API (license-management) で読んで切れる前に声をかける。
+  // Yahoo版と同じ規約: 1日1通の抑止は script 側 (rakuten_license_notify_state)、
+  // 通知失敗でも exit 0 (daily-sync 全体を落とさない)、RETRYABLE_JOBS には入れない
+  const rakutenLicenseAlert = runScript('apps/warehouse/notify-rakuten-license-expiry.js', '楽天ライセンス期限アラート', 120000);
+  results.push({ name: '楽天ライセンス期限アラート', ...rakutenLicenseAlert });
+
   // ─── 楽天 未発送アラート (出荷漏れの通知) ───
   // 前日12:00 (出荷の締め) までに入金確認できていたのに、まだ発送されていない注文を GChat へ。
   // ・warehouse.db を見ず RMS API を直接読むので、他ステップの成否に影響されない
@@ -1317,10 +1349,16 @@ async function main() {
     if (health.refreshTokenExpiresAt) {
       const expiry = new Date(health.refreshTokenExpiresAt);
       const daysLeft = Math.floor((expiry - new Date()) / 86400000);
-      if (daysLeft <= 3) {
-        tokenWarnings.push(`🔴 Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）→ 再認可が必要！`);
-      } else if (daysLeft <= 7) {
-        tokenWarnings.push(`🟡 Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）`);
+      if (daysLeft <= 7) {
+        // 再認可は在庫検索ボットへ「yahoo再認可」と送れば URL と手順が出る (apps/stock-bot/yahoo-reauth.js)。
+        // ここでも認可 URL を直接添えて 1 タップで始められるようにする
+        let authLine = '';
+        try {
+          const r = await fetch(`${yahooProxyUrl}/yahoo/auth-url`, { headers: { 'X-Proxy-Secret': yahooProxySecret }, signal: AbortSignal.timeout(10000) });
+          const j = r.ok ? await r.json() : null;
+          if (j?.url) authLine = `\n　→ 再認可: 在庫検索ボットに「yahoo再認可」と送る / または ${j.url} を開いて戻り先 URL をボットに貼る`;
+        } catch { /* URL 取得失敗は警告本体だけ出す */ }
+        tokenWarnings.push(`${daysLeft <= 3 ? '🔴' : '🟡'} Yahoo refresh token 残り${daysLeft}日（${expiry.toISOString().slice(0, 10)}）${daysLeft <= 3 ? '→ 再認可が必要！' : ''}${authLine}`);
       }
     } else if (health.tokenExpiry) {
       tokenWarnings.push('🟡 Yahoo refresh token 期限不明（次回認可時に記録されます）');

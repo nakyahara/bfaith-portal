@@ -83,6 +83,70 @@ export const AI_OUTPUT_KINDS = [
   'rakuten_title', 'yahoo_title', 'desc_catch', 'desc_features', 'desc_spec', 'desc_notes',
 ];
 
+/**
+ * AI 出力の文字数上限 (モールの物理制約。2026-08-28 夜間自動化に先立ちサーバ側で担保)。
+ *   楽天タイトル 127 / Yahoo!タイトル 65 / キャッチコピー 30 (Yahoo!ヘッドライン兼用)
+ * 説明文3欄は上限を置かない (モール別上限は出品時に別途検証)。
+ * NG ワード検査は入れない — 自社 copy_lint.py と二重管理になる。ここは「超えたら出品できない長さ」だけ。
+ */
+export const AI_OUTPUT_LIMITS = { rakuten_title: 127, yahoo_title: 65, desc_catch: 30 };
+
+/**
+ * 文字数の数え方は **コードポイント数** (`[...s].length`)。copy_lint.py の `len()` と一致させる。
+ * `String.length` (UTF-16 単位) だと絵文字・一部の漢字が 2 と数えられ、lint を通った文章が
+ * サーバで弾かれる食い違いが出る。検証は cleanText 後の「保存される値」に対して行う。
+ * @returns {{ok: true} | {ok: false, error: string, code: 'OUTPUT_TOO_LONG', kind: string, limit: number, actual: number}}
+ */
+export function validateAiOutputLength(kind, content) {
+  const limit = AI_OUTPUT_LIMITS[kind];
+  if (!limit || content == null) return { ok: true };
+  const actual = [...String(content)].length;
+  if (actual <= limit) return { ok: true };
+  return {
+    ok: false, code: 'OUTPUT_TOO_LONG', kind, limit, actual,
+    error: `${kind} が ${limit} 文字を超えています (${actual} 文字)`,
+  };
+}
+
+/**
+ * AI ランナーが draft を「人の確認待ち」にする理由コード (許容値は固定。画面表示用ラベル付き)。
+ * 未知のコードは受け付けない — UI が説明できない状態を作らない
+ */
+export const GENERATION_BLOCK_CODES = {
+  PACK_COUNT_MISMATCH: '入数・容量が参照ページと食い違う',
+  IDENTITY_UNVERIFIED: '商品の同一性を確認できない',
+  SOURCE_UNREACHABLE: '参照ページを取得できない',
+  FACTS_TOO_THIN: '裏取りできた事実が少なすぎる',
+  OTHER: 'その他',
+};
+export const GENERATION_BLOCK_REASON_MAX = 1000;
+
+/**
+ * 「確認中」の理由 (2026-08-31 中原さん・スタッフ要望)。
+ *
+ * 工程を進められない原因が **情報待ち** のときに人が立てる印。工程 (列) は動かさず、
+ * カードにラベルを出す。列を挟む案を採らなかったのは:
+ *   - 本流は直列なので、間に工程を足すと保留でない商品も全部そこを通る
+ *   - status の導出は組み込み 5 工程しか見ない (deriveDraftStatus) ので、
+ *     新しい列にカードが居ても status は ready_for_ai のままで **夜間 AI が生成してしまう**
+ *   - 情報待ちは基本情報入力の直後だけでなく、どの工程でも起きる (列は 1 箇所にしか置けない)
+ * 既存の「画像制作の保留」(draft_image_production.workflow_state) と
+ * 「AI が止めました」(generation_block_code) と同じ **列を変えずカードに出す** 方式に揃えた。
+ *
+ * 理由コードを固定にするのは、あとで「何を待って止まっているか」を数えるため
+ * (自由記述だけだと集計できない)。補足は checking_note に書く。
+ */
+// short = 詳細画面のワンタップ用ボタンの文字 (長いと押しにくい)。label = カード・バナーの表示
+export const CHECKING_REASONS = [
+  { code: 'package_label', short: '裏面を確認', label: 'パッケージ裏面の確認待ち', hint: '自社商品の成分表示・原材料など、実物を見ないと埋まらない項目がある' },
+  { code: 'no_web_info', short: 'ウェブに情報なし', label: 'ウェブに情報が無い', hint: 'メーカー・仕入先へ問い合わせ中' },
+  { code: 'share_info', short: '仕入れ担当と相談', label: '仕入れ担当と共有・相談中', hint: 'どういう商品なのかを仕入れ担当とすり合わせている' },
+  { code: 'other', short: 'その他', label: 'その他', hint: '' },
+];
+export const CHECKING_REASON_CODES = new Set(CHECKING_REASONS.map((r) => r.code));
+export const CHECKING_REASON_LABELS = Object.fromEntries(CHECKING_REASONS.map((r) => [r.code, r.label]));
+export const CHECKING_NOTE_MAX = 300;
+
 /** 担当者の区分 (表示順)。外注さんはポータルにログインしないので kind で見分ける */
 export const STAFF_KINDS = [
   { value: 'internal', label: '社内' },
@@ -536,6 +600,21 @@ export function initProductHubDB() {
     );
 
     -- ドラフトが載る店舗内カテゴリ (複数選択)。公開時に RMS 画面で設定する指示として使う
+    -- SKU別の JANコード (2026-08-28 中原さん要望: バリエーションありのとき、
+    -- ページ代表の JAN 1つだけでは SKU ごとの JAN を控えられない)。
+    -- ページ代表の JAN は product_drafts.jan_code (楽天のカタログIDに使う) のまま。
+    -- sku_code は LOWER(TRIM()) した SKU 商品コード (draft_sku_prices と同じ規則)
+    CREATE TABLE IF NOT EXISTS draft_sku_jans (
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      sku_code   TEXT NOT NULL,
+      jan_code   TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (draft_id, sku_code),
+      -- 同じ JAN を同じページの2つの SKU に付けない (別商品なのに同一 JAN はモール側で弾かれる)。
+      -- API 側でも事前に 409 を返すが、一括取込など別経路からも作らせないための制約
+      UNIQUE (draft_id, jan_code)
+    );
+
     CREATE TABLE IF NOT EXISTS draft_shop_categories (
       draft_id         INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
       shop_category_id INTEGER NOT NULL REFERENCES ph_shop_categories(id),
@@ -565,7 +644,8 @@ export function initProductHubDB() {
       draft_id        INTEGER PRIMARY KEY REFERENCES product_drafts(id) ON DELETE CASCADE,
       product_type    TEXT NOT NULL DEFAULT 'general'
                       CHECK (product_type IN ('general','cosmetics','health_food','food')),
-      content_volume  TEXT,               -- 内容量 (例: 50ml)
+      brand_name      TEXT,               -- ブランド名 (2026-08-28 中原さん要望。掲載HTMLの先頭行)
+      content_volume  TEXT,               -- 内容量・容量 (例: 50ml / 200g)
       size_text       TEXT,               -- サイズ (例: 縦5cm×横10cm×高さ15cm)
       ingredients     TEXT,               -- 成分/素材/材質 (化粧品=全成分、雑貨=素材)
       usage_notes     TEXT,               -- 使用上の注意
@@ -715,6 +795,25 @@ export function initProductHubDB() {
       value TEXT
     );
 
+    -- かんばんの手動並び順 (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
+    -- 既定は「停滞日数の多い順 → 登録順」だが、それだと現場で決めた「今日はこの順でやる」が
+    -- 保存されず、動かしても読み直すたびに元へ戻ってしまう。
+    -- 1 枚のカード = (view, draft_id, kind) につき 1 行。col は最後に手で置いた列で、
+    -- 工程が変わって別の列に出たときは手動順を捨てて既定順に戻す (別の列の並びを
+    -- そのまま持ち込むと、置いた覚えのない位置に割り込む)。
+    -- kind は画像ビューの種別 (top/detail)。本流ビューは '' (空文字) を使う。
+    -- 現場の目安情報なのでロックも版数も持たない (最後に置いた人の並びが正)。
+    CREATE TABLE IF NOT EXISTS ph_board_order (
+      view       TEXT NOT NULL,                   -- main / image
+      draft_id   INTEGER NOT NULL REFERENCES product_drafts(id) ON DELETE CASCADE,
+      kind       TEXT NOT NULL DEFAULT '',        -- image ビューのみ top / detail
+      col        TEXT NOT NULL,                   -- 置いた列 (工程コード / 画像ステージ / done)
+      sort       INTEGER NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (view, draft_id, kind)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ph_board_order_col ON ph_board_order(view, col, sort);
+
     CREATE TABLE IF NOT EXISTS draft_events (
       id         INTEGER PRIMARY KEY AUTOINCREMENT,
       draft_id   INTEGER NOT NULL,
@@ -749,6 +848,64 @@ export function initProductHubDB() {
   if (!draftCols.has('generation_claim_until')) {
     db.exec('ALTER TABLE product_drafts ADD COLUMN generation_claim_until TEXT');
   }
+  // 夜間自動化 (2026-08-28): AI ランナーが「人が見ないと進められない」と判断した draft を
+  // 人が解除するまで claim 対象から外す。status は ready_for_ai のまま (工程導出を壊さない・
+  // ボードの「AI情報入力待ち」列に残して ⚠ を出す)。release と違い updated_at も進めるので、
+  // 解除後は列の末尾に回る。4列は「全部 NULL」か「code/at/by が非NULL」のどちらかで揃える
+  // (Codex設計相談 medium: 部分的な不整合を作らない — 書くのは blockGenerationDraft だけ)
+  if (!draftCols.has('generation_block_code')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_block_code TEXT');
+  }
+  if (!draftCols.has('generation_block_reason')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_block_reason TEXT');
+  }
+  if (!draftCols.has('generation_blocked_at')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_blocked_at TEXT');
+  }
+  if (!draftCols.has('generation_blocked_by')) {
+    db.exec('ALTER TABLE product_drafts ADD COLUMN generation_blocked_by TEXT');
+  }
+  // 確認中 (2026-08-31): 人が「情報待ちで進められない」と立てる印。generation_block と同じく
+  // 工程・status は動かさず、ボードのカードにラベルを出して AI 生成キューからだけ外す。
+  // **確認中の判定は checking_since**。reason_code は since と必ず対で入る (書くのは
+  // set/clearDraftChecking だけ)。note は任意、by はログイン情報が取れないとき NULL になりうる。
+  // 解除は 4 列まとめて NULL に戻す — 「reason だけ残る」中途半端な状態を作らない (Codex R1)。
+  //
+  // 列追加と、AI キューの部分インデックスの作り直しを **1 つの immediate transaction** で行う
+  // (Codex R2/R3 medium)。理由は 2 つ:
+  //   - CREATE INDEX IF NOT EXISTS は**定義変更を反映しない**ので、旧定義 (checking_since 抜き) が
+  //     残っている環境では DROP して作り直す必要がある
+  //   - 上の draftCols のようにトランザクション外で「読んでから ALTER」すると、同じ DB を
+  //     2 プロセスが同時に起動したとき両方が旧スキーマを見て duplicate column name で落ちる。
+  //     BEGIN IMMEDIATE で最初から書きロックを取り、**中で存在確認をやり直す**ことで塞ぐ
+  // 注: このファイルの他の ALTER 群は従来どおりトランザクション外。同じ性質を持つが、
+  //     まとめて直すのは影響範囲が広いので別途 (ここで足す 4 列だけ先に安全側に倒す)
+  const migrateChecking = db.transaction(() => {
+    const cols = new Set(db.prepare('PRAGMA table_info(product_drafts)').all().map((c) => c.name));
+    if (!cols.has('checking_reason_code')) {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN checking_reason_code TEXT');
+    }
+    if (!cols.has('checking_note')) {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN checking_note TEXT');
+    }
+    if (!cols.has('checking_since')) {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN checking_since TEXT');
+    }
+    if (!cols.has('checking_by')) {
+      db.exec('ALTER TABLE product_drafts ADD COLUMN checking_by TEXT');
+    }
+    // claim の候補 SELECT 用の部分インデックス (キューが大きくなっても updated_at 順の先頭だけ読む)
+    const genQueueIdx = db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_product_drafts_generation_queue'
+    `).get();
+    if (genQueueIdx && !String(genQueueIdx.sql || '').includes('checking_since')) {
+      db.exec('DROP INDEX IF EXISTS idx_product_drafts_generation_queue');
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_product_drafts_generation_queue
+      ON product_drafts(updated_at)
+      WHERE status = 'ready_for_ai' AND generation_block_code IS NULL AND checking_since IS NULL`);
+  });
+  migrateChecking.immediate();
   // Notion 取り込み (テスト検証用)。source='notion_import' の行は Notion 側が正であり、
   // ポータルから Notion へ書き戻してはならない (既存カードの破壊防止 — notion-card.js のガード参照)。
   //   注意: ALTER で足す列に CHECK は付けられない。そのため書き戻し判定は canWriteToNotion の
@@ -784,6 +941,29 @@ export function initProductHubDB() {
   }
 
   // 店舗内カテゴリの枠番 (2026-08-02、RMS「表示先カテゴリ 1〜5」対応)
+  // draft_sku_jans の JAN 重複防止 (2026-08-28)。テーブル定義側にも UNIQUE を書いているが、
+  // CREATE TABLE IF NOT EXISTS は既存テーブルには効かない。UNIQUE の無い版が残っていても
+  // 後から張れるようにする。重複が既にあると張れないので fail-soft (起動は止めない)
+  try {
+    const sjIndexes = db.prepare('PRAGMA index_list(draft_sku_jans)').all();
+    const hasJanUnique = sjIndexes.some((ix) => {
+      if (!ix.unique) return false;
+      const cols = db.prepare(`PRAGMA index_info(${JSON.stringify(ix.name)})`).all().map((c) => c.name);
+      return cols.length === 2 && cols.includes('draft_id') && cols.includes('jan_code');
+    });
+    if (!hasJanUnique) {
+      db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_dsj_draft_jan ON draft_sku_jans(draft_id, jan_code)');
+    }
+  } catch (e) {
+    console.warn('[product-hub] draft_sku_jans の JAN 一意制約を張れませんでした (重複データの可能性):', e.message);
+  }
+
+  // ブランド名 (2026-08-28)。既存 DB への冪等追加
+  const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
+  if (!piCols.has('brand_name')) {
+    db.exec('ALTER TABLE draft_page_info ADD COLUMN brand_name TEXT');
+  }
+
   migrateShopCategorySlots(db);
 
   // 楽天出品仕様 2026-07-27 (配送/納期/白抜き/公開状態)。#629 デプロイ済み DB への冪等 ALTER
@@ -1336,6 +1516,80 @@ export function setImageWorkflowState(db, draftId, state, { note = null, actor =
   return run();
 }
 
+/**
+ * 「確認中」を立てる / 理由・メモを差し替える (2026-08-31)。
+ *
+ * status も工程も動かさない。効くのは 2 つだけ:
+ *   - ボードのカードにラベルが出て、列の先頭に並ぶ (埋もれない)
+ *   - AI 生成キューの候補から外れる (確認中なのに夜間 AI が原稿を書く、を防ぐ)
+ * checking_since は **立て直しても進めない** (「何日待っているか」が 0 に戻ると
+ * 長引いているカードを見失う)。理由やメモの修正で待ち時間がリセットされない。
+ *
+ * claim も同時に解放する (Codex R1 medium)。生成中の run が居るまま確認中にすると、
+ * lease の 30 分以内に解除された場合だけ古い run が結果を書き戻せてしまう。
+ * generation_block も claim を消しているので、そちらとも揃う。
+ */
+export function setDraftChecking(db, draftId, { reasonCode, note = null, actor = null } = {}) {
+  const code = String(reasonCode || '');
+  if (!CHECKING_REASON_CODES.has(code)) {
+    const e = new Error('確認中の理由の指定が不正です');
+    e.status = 400;
+    throw e;
+  }
+  const id = Number(draftId);
+  const noteClean = note == null ? null : (String(note).trim().slice(0, CHECKING_NOTE_MAX) || null);
+  const run = db.transaction(() => {
+    const cur = db.prepare(`
+      SELECT checking_reason_code, checking_note, checking_since FROM product_drafts WHERE id = ?
+    `).get(id);
+    if (!cur) return { changed: false };
+    // 冪等: 同じ理由・同じメモなら書かない (イベントログを無意味に増やさない)。
+    // ただし claim だけは落とす — 「setDraftChecking を呼べば claim は必ず落ちている」を
+    // 関数の契約にするため (Codex R2 low: 何らかの経路で確認中のまま claim が残った状態を
+    // 自己修復できるようにする)。updated_at は進めない (中身は変わっていない)
+    if (cur.checking_reason_code === code && (cur.checking_note ?? null) === noteClean) {
+      db.prepare(`
+        UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL
+        WHERE id = ? AND (generation_claim_run_id IS NOT NULL OR generation_claim_until IS NOT NULL)
+      `).run(id);
+      return { changed: false };
+    }
+    const wasOn = cur.checking_since != null;
+    db.prepare(`
+      UPDATE product_drafts
+      SET checking_reason_code = ?, checking_note = ?,
+          checking_since = COALESCE(checking_since, strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          checking_by = ?,
+          generation_claim_run_id = NULL, generation_claim_until = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?
+    `).run(code, noteClean, actor, id);
+    const label = CHECKING_REASON_LABELS[code] || code;
+    logEvent(db, id, wasOn ? 'checking_updated' : 'checking_on',
+      `${wasOn ? '確認中の理由を変更' : '確認中にした'}: ${label}${noteClean ? ` (${noteClean})` : ''}`, actor);
+    return { changed: true };
+  });
+  return run();
+}
+
+/** 「確認中」を外す。4 列まとめて NULL に戻す (中途半端な残り方をさせない) */
+export function clearDraftChecking(db, draftId, { actor = null } = {}) {
+  const id = Number(draftId);
+  const run = db.transaction(() => {
+    const cur = db.prepare('SELECT checking_since FROM product_drafts WHERE id = ?').get(id);
+    if (!cur || cur.checking_since == null) return { changed: false };
+    db.prepare(`
+      UPDATE product_drafts
+      SET checking_reason_code = NULL, checking_note = NULL, checking_since = NULL, checking_by = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ?
+    `).run(id);
+    logEvent(db, id, 'checking_off', '確認中を解除', actor);
+    return { changed: true };
+  });
+  return run();
+}
+
 const IMAGE_PRODUCTION_FIELDS = [
   'status', 'importance_tier', 'production_type', 'aplus_content', 'aplus_related',
   'camera_instruction_url', 'shipping_status', 'reference_collection',
@@ -1372,12 +1626,16 @@ export function listGenerationQueue(db, { limit = 50, ids = null } = {}) {
   const drafts = ids
     ? db.prepare(`
         SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
-        FROM product_drafts WHERE status = 'ready_for_ai' AND id IN (${ids.map(() => '?').join(',') || 'NULL'})
+        FROM product_drafts WHERE status = 'ready_for_ai' AND generation_block_code IS NULL
+          AND checking_since IS NULL
+          AND id IN (${ids.map(() => '?').join(',') || 'NULL'})
         ORDER BY updated_at ASC
       `).all(...ids)
     : db.prepare(`
         SELECT id, ne_code, name, official_url, amazon_url, asin, price, jan_code, drive_folder_url, own_brand
-        FROM product_drafts WHERE status = 'ready_for_ai' ORDER BY updated_at ASC LIMIT ?
+        FROM product_drafts WHERE status = 'ready_for_ai' AND generation_block_code IS NULL
+          AND checking_since IS NULL
+        ORDER BY updated_at ASC LIMIT ?
       `).all(limit);
   const refStmt = db.prepare('SELECT url FROM draft_reference_urls WHERE draft_id = ? ORDER BY sort, id');
   const specStmt = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id');
@@ -1445,9 +1703,12 @@ export const GENERATION_LEASE_MINUTES = 30;
 export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
   const now = new Date().toISOString();
   const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  // 人の確認待ち (generation_block_code) と 確認中 (checking_since) は候補から外す。
+  // **CAS UPDATE 側にも同じ条件を入れる** — SELECT と UPDATE の隙間で block / 確認中に
+  // された draft を掴めてしまう (Codex設計相談 Critical)
   const candidates = db.prepare(`
     SELECT id FROM product_drafts
-    WHERE status = 'ready_for_ai'
+    WHERE status = 'ready_for_ai' AND generation_block_code IS NULL AND checking_since IS NULL
       AND (generation_claim_until IS NULL OR generation_claim_until < ?)
     ORDER BY updated_at ASC LIMIT ?
   `).all(now, limit);
@@ -1455,7 +1716,7 @@ export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
   for (const c of candidates) {
     const info = db.prepare(`
       UPDATE product_drafts SET generation_claim_run_id = ?, generation_claim_until = ?
-      WHERE id = ? AND status = 'ready_for_ai'
+      WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL AND checking_since IS NULL
         AND (generation_claim_until IS NULL OR generation_claim_until < ?)
     `).run(runId, until, c.id, now);
     if (info.changes === 1) claimed.push(c.id);
@@ -1473,9 +1734,12 @@ export function claimGenerationDrafts(db, runId, { limit = 2 } = {}) {
 export function acquireGenerationWriteLock(db, draftId, runId) {
   const now = new Date().toISOString();
   const until = new Date(Date.now() + GENERATION_LEASE_MINUTES * 60_000).toISOString();
+  // block 済みなら書き込み権を渡さない: 同じ run が「出力保存」と「人待ち」を並行して送った場合に
+  // block 済みの draft へ文章が入る取り違えを防ぐ (Codex設計相談 Critical)。
+  // 確認中も同じ — claim 済みの生成が走っている最中に人が確認中にしたら、その結果は書かせない
   return db.prepare(`
     UPDATE product_drafts SET generation_claim_until = ?
-    WHERE id = ? AND status = 'ready_for_ai'
+    WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL AND checking_since IS NULL
       AND generation_claim_run_id = ? AND generation_claim_until >= ?
   `).run(until, draftId, runId, now).changes === 1;
 }
@@ -1488,6 +1752,11 @@ export function generationClaimError(draft, runId) {
   if (!runId) return 'run_id が必要です (先に claim してください)';
   if (draft.status !== 'ready_for_ai') {
     return `status が ready_for_ai ではありません (${draft.status})。人がレビュー中の可能性があるため書き込みません`;
+  }
+  // claim 後に人が「確認中」にした場合。書けない理由を具体的に返す
+  // (acquireGenerationWriteLock でも弾かれるが、そこだと「claim 切れ」に見えて原因が追えない)
+  if (draft.checking_since) {
+    return '人が「確認中」にした draft です (情報待ちのため書き込みません)';
   }
   if (draft.generation_claim_run_id !== runId) return 'この draft は別の実行が claim しています';
   if (!draft.generation_claim_until || draft.generation_claim_until < new Date().toISOString()) {
@@ -1502,6 +1771,111 @@ export function releaseGenerationClaim(db, draftId, runId) {
     UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL
     WHERE id = ? AND generation_claim_run_id = ?
   `).run(draftId, runId).changes === 1;
+}
+
+/**
+ * AI ランナーが draft を「人の確認待ち」にする (2026-08-28 夜間自動化)。
+ * release との違い: release は「一時的に手放す」(次の claim でまた先頭に戻る) のに対し、
+ * これは **人が解除するまで claim 対象から外す**。仕様不一致 (入数の食い違い等) は何度 claim しても
+ * 生成できないので、release で回すと毎晩同じ draft を掴んで捨てる無限ループになる。
+ *
+ * 書けるのは **有効な claim を持つ run だけ**。検証と書き込みは 1 本の条件付き UPDATE で行う
+ * (事前に読んでから無条件 UPDATE すると、その間の lease 切れ・解除・別 claim を取りこぼす — Codex Critical)。
+ * 同じ run が同じ code で再送してきたら「適用済み」として成功扱い (通信断で応答だけ失った再試行を 409 にしない)。
+ * @returns {{result: 'blocked'|'already'|'conflict'|'not_found', error?: string}}
+ */
+export function blockGenerationDraft(db, draftId, runId, { code, reason }) {
+  const id = Number(draftId);
+  const by = `ai:${runId}`;
+  return db.transaction(() => {
+    const now = new Date().toISOString();
+    const info = db.prepare(`
+      UPDATE product_drafts
+      SET generation_block_code = ?, generation_block_reason = ?, generation_blocked_at = ?, generation_blocked_by = ?,
+          generation_claim_run_id = NULL, generation_claim_until = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND status = 'ready_for_ai' AND generation_block_code IS NULL AND checking_since IS NULL
+        AND generation_claim_run_id = ? AND generation_claim_until >= ?
+    `).run(code, reason, now, by, id, runId, now);
+    if (info.changes === 1) {
+      logEvent(db, id, 'generation_blocked', `${code}: ${reason}`, by);
+      return { result: 'blocked' };
+    }
+    // checking_since も引く: 確認中の draft を block しようとしたとき、下の generationClaimError が
+    // 「人が確認中にした draft です」と具体的な理由を返せる (Codex R2 low)
+    const cur = db.prepare(`
+      SELECT status, generation_block_code, generation_block_reason, generation_blocked_by,
+             generation_claim_run_id, generation_claim_until, checking_since
+      FROM product_drafts WHERE id = ?
+    `).get(id);
+    if (!cur) return { result: 'not_found' };
+    if (cur.generation_block_code) {
+      // 冪等は「同一操作の再送」に限る: run・code・reason が全部同じときだけ already。
+      // reason 違いまで成功扱いにすると、ランナー側のバグで理由が変わったのを隠す (Codex R1 medium)
+      if (cur.generation_blocked_by === by && cur.generation_block_code === code && cur.generation_block_reason === reason) {
+        return { result: 'already' };
+      }
+      return { result: 'conflict', error: `すでに人の確認待ちです (${cur.generation_block_code})。上書きしません` };
+    }
+    return { result: 'conflict', error: generationClaimError(cur, runId) || 'claim が無効です' };
+  })();
+}
+
+/**
+ * 人が「人の確認待ち」を解除する。解除 = claim 対象に戻すだけで、自動で再生成はしない
+ * (人が基本情報を直した上で解除する前提。直さずに解除すれば次の夜また同じ理由で止まる = 正しい挙動)。
+ * expectedBlockedAt を渡すと楽観ロック: 画面が見ていた block と違う block になっていたら解除しない
+ * (Codex設計相談 medium: 長時間開いた画面からの解除で、別の理由の block を消さない)。
+ * @returns {{result: 'unblocked'|'not_blocked'|'stale'|'not_found'}}
+ */
+export function unblockGenerationDraft(db, draftId, { actor = null, expectedBlockedAt = null } = {}) {
+  const id = Number(draftId);
+  return db.transaction(() => {
+    const cur = db.prepare(`
+      SELECT generation_block_code, generation_block_reason, generation_blocked_at FROM product_drafts WHERE id = ?
+    `).get(id);
+    if (!cur) return { result: 'not_found' };
+    if (!cur.generation_block_code) return { result: 'not_blocked' };
+    const info = db.prepare(`
+      UPDATE product_drafts
+      SET generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL,
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE id = ? AND generation_block_code IS NOT NULL
+        AND (? IS NULL OR generation_blocked_at = ?)
+    `).run(id, expectedBlockedAt, expectedBlockedAt);
+    if (info.changes !== 1) return { result: 'stale' };
+    logEvent(db, id, 'generation_unblocked', `${cur.generation_block_code}: ${cur.generation_block_reason || ''}`.trim(), actor);
+    return { result: 'unblocked' };
+  })();
+}
+
+/**
+ * 生成キューの内訳 (夜間バッチの成否判定用)。
+ * 「キューが減ったか」で成否を見ると、人待ちだけが残った夜を失敗扱いにしてしまう (Codex設計相談 High)。
+ * ランナー/監視は claimable === 0 を「今夜やることは終わった」と読む。blocked は別枠で人に見せる。
+ * claim 処理と同じスナップショットではない (観測値) — 厳密な制御には使わない
+ */
+export function generationQueueSummary(db) {
+  const now = new Date().toISOString();
+  // 確認中 (checking) は claimable から外す — 実際に claim できない分を「生成待ち」に数えると、
+  // キューが減らない理由が読めなくなる。checking は独立した内訳として返す
+  const r = db.prepare(`
+    SELECT
+      SUM(CASE WHEN generation_block_code IS NULL AND checking_since IS NULL AND (generation_claim_until IS NULL OR generation_claim_until < ?) THEN 1 ELSE 0 END) AS claimable,
+      SUM(CASE WHEN generation_block_code IS NULL AND checking_since IS NULL AND generation_claim_until >= ? THEN 1 ELSE 0 END) AS leased,
+      SUM(CASE WHEN generation_block_code IS NOT NULL THEN 1 ELSE 0 END) AS blocked,
+      SUM(CASE WHEN generation_block_code IS NULL AND checking_since IS NOT NULL THEN 1 ELSE 0 END) AS checking
+    FROM product_drafts WHERE status = 'ready_for_ai'
+  `).get(now, now);
+  const blockedByCode = {};
+  for (const row of db.prepare(`
+    SELECT generation_block_code AS code, COUNT(*) AS c FROM product_drafts
+    WHERE status = 'ready_for_ai' AND generation_block_code IS NOT NULL GROUP BY generation_block_code
+  `).all()) blockedByCode[row.code] = row.c;
+  return {
+    claimable: r?.claimable || 0, leased: r?.leased || 0, blocked: r?.blocked || 0,
+    checking: r?.checking || 0, blockedByCode,
+  };
 }
 
 // demoteIfGateBroken は lib/workflow-progress.js へ移設 (PR4):

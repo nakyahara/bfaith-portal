@@ -472,6 +472,7 @@ function applyPlan(db, rec, plan, { actor, runId }) {
     if (plan.detach && !isDetached(db, rec.ne_code)) {
       const fromId = plan.detach.repDraftId || draftId;
       db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?').run(fromId, norm(rec.ne_code));
+      db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').run(fromId, norm(rec.ne_code));
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
         .run(fromId, rec.ne_code, actor || null);
       logEvent(db, fromId, 'variation_sku_excluded', `${rec.ne_code} (Notion 画像DB移植: 色ごとに別ページ)`, actor);

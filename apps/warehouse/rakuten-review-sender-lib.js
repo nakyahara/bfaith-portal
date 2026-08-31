@@ -60,18 +60,23 @@ export function classifySendError(e) {
 
 /** 月次クーポンの利用可否 (獲得URLは楽天ドメインの https のみ許可 — Codex C4-R1 Medium:
  *  台帳の誤登録で楽天外リンクがメールに載る事故を claim 前ゲートで遮断) */
-export function couponUsableCheck(monthlyCoupon, nowIso) {
+export const RAKUTEN_COUPON_URL_OK = (url) => {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' && u.hostname === 'coupon.rakuten.co.jp';
+  } catch {
+    return false;
+  }
+};
+
+/** @param couponUrlOk モール別の URL 妥当性判定 (既定=楽天。Yahoo は adapter が渡す) */
+export function couponUsableCheck(monthlyCoupon, nowIso, couponUrlOk = RAKUTEN_COUPON_URL_OK) {
   if (!monthlyCoupon || monthlyCoupon.status !== 'issued' || !monthlyCoupon.pc_get_url) return false;
   if (!(Date.parse(monthlyCoupon.coupon_end) > Date.parse(nowIso))) return false;
   // PR-C5: 開始前のクーポンURLは配らない (当月途中に発行すると開始=発行+90分。その日の正午バッチが
   // 開始前のURLを送ると顧客が獲得できない → 翌日の正午まで待つ)
   if (!(Date.parse(monthlyCoupon.coupon_start) <= Date.parse(nowIso))) return false;
-  try {
-    const u = new URL(monthlyCoupon.pc_get_url);
-    return u.protocol === 'https:' && u.hostname === 'coupon.rakuten.co.jp';
-  } catch {
-    return false;
-  }
+  return couponUrlOk(monthlyCoupon.pc_get_url) === true;
 }
 
 const gateSql = (T) => `
@@ -110,8 +115,8 @@ export function gateReason(a, { nowIso, couponUsable }) {
  */
 function selectEligibleActionsT(T, A, db, { nowIso = new Date().toISOString(), limit = 5 } = {}) {
   const month = jstDateOf(nowIso).slice(0, 7);
-  const monthlyCoupon = A.monthlyCouponFor(db, month);
-  const couponUsable = couponUsableCheck(monthlyCoupon, nowIso);
+  const monthlyCoupon = A.monthlyCouponFor(db, month, nowIso);
+  const couponUsable = couponUsableCheck(monthlyCoupon, nowIso, A.couponUrlOk);
 
   const rows = db.prepare(`${gateSql(T)}
      WHERE a.status = 'ready' AND a.scheduled_at <= ? AND a.expires_at > ?
@@ -141,11 +146,11 @@ function claimActionGuardedT(T, A, db, actionId, nowIso = new Date().toISOString
     const a = db.prepare(`${gateSql(T)} WHERE a.id = ?`).get(actionId);
     if (!a) throw Object.assign(new Error('gone'), { gateFailed: 'not_found' });
     const month = jstDateOf(nowIso).slice(0, 7);
-    const monthlyCoupon = a.action_type === 'coupon' ? A.monthlyCouponFor(db, month) : null;
-    const couponUsable = a.action_type === 'coupon' ? couponUsableCheck(monthlyCoupon, nowIso) : true;
+    const monthlyCoupon = a.action_type === 'coupon' ? A.monthlyCouponFor(db, month, nowIso) : null;
+    const couponUsable = a.action_type === 'coupon' ? couponUsableCheck(monthlyCoupon, nowIso, A.couponUrlOk) : true;
     const reason = gateReason(a, { nowIso, couponUsable });
     if (reason) throw Object.assign(new Error(reason), { gateFailed: reason });
-    const messageId = messageIdFor(a.id, a.dedupe_key);
+    const messageId = A.messageIdFor(a.id, a.dedupe_key);
     const r = db.prepare(`
       UPDATE ${T.actions}
          SET status = 'claimed', claim_token = ?, claimed_at = ?, updated_at = ?
@@ -352,6 +357,8 @@ export const RAKUTEN_SENDER_ADAPTER = Object.freeze({
   resolveRecipient: async (db, action, keys) => decryptEmail(action.masked_email_enc, keys, action.order_number),
   buildMail: (action, nowIso) => buildMailForAction(action, nowIso),
   fromHeader: `"${SHOP_NAME}" <${FROM_ADDRESS}>`,
+  messageIdFor,
+  couponUrlOk: RAKUTEN_COUPON_URL_OK,
 });
 const RT = tablesFor('rakuten');
 
@@ -365,18 +372,21 @@ export const releaseClaim = (db, a) => releaseClaimT(RT, db, a);
 export const processReadyActions = (db, o) => processReadyActionsT(RT, RAKUTEN_SENDER_ADAPTER, db, o);
 
 /**
- * モール別送信エンジン (PR-Y-0)。adapter = { mall, monthlyCouponFor(db, month), resolveRecipient(db, action, keys) (async、
- * 一時失敗は err.retryable=true で throw)、buildMail(action, nowIso) → {subject, text}、fromHeader }
+ * モール別送信エンジン (PR-Y-0)。adapter = { mall, monthlyCouponFor(db, month, nowIso), resolveRecipient(db, action, keys) (async、
+ * 一時失敗は err.retryable=true で throw)、buildMail(action, nowIso) → {subject, text}、fromHeader、
+ * messageIdFor(actionId, dedupeKey) (モール別 prefix)、couponUrlOk(url) (クーポンURLの妥当性) }
  */
 export function createSenderEngine(adapter = RAKUTEN_SENDER_ADAPTER) {
-  // 楽天以外は 4 つのモール固有項目を必須にする (Codex Y0-R1 Medium: 指定漏れを楽天の
+  // 楽天以外はモール固有項目を必須にする (Codex Y0-R1 Medium: 指定漏れを楽天の
   // クーポン台帳・文面・From で静かに補完すると、Yahoo が楽天の URL/署名で送ってしまう)
+  // messageIdFor/couponUrlOk も同様 — 継承すると Message-ID が衝突し、楽天ドメイン判定で
+  // Yahoo のクーポンが常に「使えない」と黙って落ちる
   const A = { ...adapter };
   if (!A.mall) throw new Error('createSenderEngine: adapter.mall は必須');
   if (A.mall === 'rakuten') {
     Object.assign(A, { ...RAKUTEN_SENDER_ADAPTER, ...adapter });
   } else {
-    for (const k of ['monthlyCouponFor', 'resolveRecipient', 'buildMail', 'fromHeader']) {
+    for (const k of ['monthlyCouponFor', 'resolveRecipient', 'buildMail', 'fromHeader', 'messageIdFor', 'couponUrlOk']) {
       if (A[k] == null) throw new Error(`createSenderEngine(${A.mall}): adapter.${k} は必須 (楽天既定は継承しない)`);
     }
   }

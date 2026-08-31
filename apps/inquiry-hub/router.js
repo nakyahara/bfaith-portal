@@ -48,6 +48,14 @@ import { listMailShops, resolveMailShop, createComposeDraft, finalizeComposeDraf
   pruneStaleComposeDrafts, validateBody, SUBJECT_MAX, BODY_MAX } from './compose.js';
 import { listSignatures, getSignature, getDefaultSignature, createSignature, updateSignature,
   deleteSignature, composeBodyWithSignature, SIGNATURE_NAME_MAX, SIGNATURE_BODY_MAX } from './signatures.js';
+import { getPermissionMatrix, createStaff, saveStaffWithPermissions, deactivateStaff, refundLimitOf,
+  createPermission, updatePermission, setPermissionActive, deletePermission, listPermissionLogs,
+  STAFF_NAME_MAX, STAFF_KEY_MAX, PERM_NAME_MAX, PERM_CODE_MAX } from './staff.js';
+import { collectInsights, estimateCost, WMS_CUTOFFS } from './insights.js';
+import { listCutoffItems, countCutoffItems, summarize, ackCutoffItem, unackCutoffItem,
+  listCutoffExcludes, addCutoffExclude, removeCutoffExclude,
+  nextCutoff, CUTOFF_KINDS, CUTOFF_TIMES, LOOKBACK_DAYS } from './cutoff.js';
+import { toPreviewLine } from './text-utils.js';
 
 // 返信エディタの Dark Launch フラグ (送信ワーカー稼働前にスタッフが誤って「送信したつもり」に
 // ならないよう、既定は非表示。動作確認・Step 3 送信開始時に env で有効化する)
@@ -101,16 +109,7 @@ const stBadge = st => badge(STATUSES[st], null) || he(st);
  * 表示は1行 (CSSで省略) なので改行は空白に畳む
  */
 export function previewOf(text, max = 110) {
-  const cut = String(text || '')
-    // 引用ヘッダ以降は落とす (返信の下にぶら下がる過去のやり取り)
-    .split(/\n(?:[-–—_]{3,}|={3,}|\d{4}年\d{1,2}月\d{1,2}日.*?:|On .{0,60}wrote:|.{0,40}さんは書きました)/)[0];
-  const body = cut.split('\n')
-    .filter(l => !/^\s*[>|｜]/.test(l))          // 引用行
-    .join(' ')
-    .replace(/https?:\/\/\S+/g, '')             // URLは仕分けの役に立たない
-    .replace(/\s+/g, ' ')
-    .trim();
-  return body.length > max ? body.slice(0, max) + '…' : body;
+  return toPreviewLine(text, max);
 }
 
 /** 色付きラベルチップ (2026-08-24 メールディーラーのラベル相当)。color は labels.js が '#rrggbb' に検証済み */
@@ -596,11 +595,27 @@ router.get('/inquiries/:id', (req, res) => {
       return names.length ? ` <span class="sub" title="${he(names.join(' / '))}">📎${names.length}件</span>` : '';
     } catch { return ''; }
   };
+  // 送信ジョブの本文は**全文**を残す。2026-08-30 の楽天401 (ライセンスキー失効) で送信が失敗したとき、
+  // 履歴には先頭60文字しか出ておらず「何を送ろうとしたか」が画面から分からなかった (中原さん要望)。
+  // 返信欄が空いていれば (未決着ジョブが無ければ) そのまま書き戻して送り直せる
+  const canRestoreBody = replyEditorEnabled() && !activeJob;
+  const jobBody = (o) => {
+    const body = String(o.body_text || '');
+    if (!body) return '';
+    let attNames = [];
+    try { attNames = JSON.parse(o.attachments_json || '[]').map(a => a.name).filter(Boolean); } catch { /* 壊れていても本文は見せる */ }
+    return `<details class="job-body">
+      <summary class="sub">${he(body.slice(0, 60))}${body.length > 60 ? '…' : ''} <span class="job-body-more">▼全文</span></summary>
+      <div class="job-body-full">${he(body)}</div>
+      ${attNames.length ? `<div class="sub">📎 ${he(attNames.join(' / '))} — <b>添付は付け直してください</b> (送信済みの実体は保持していません)</div>` : ''}
+      ${canRestoreBody ? '<button class="ghost job-restore" type="button">↩ この内容を返信欄に戻す</button>' : ''}
+    </details>`;
+  };
   const outboxHtml = outboxJobs.length ? `
     <div class="sub" style="margin-bottom:6px">送信ジョブ履歴 (<a href="/apps/inquiry-hub/admin">⚙️運用管理</a>で解決・取消):</div>
     ${outboxJobs.map(o => `<div class="log-row">${jobBadge(o)} <span class="msg-date">${fmtJst(o.created_at)}</span>${jobAtts(o)}
-      <span class="sub">${he(String(o.body_text || '').slice(0, 60))}${String(o.body_text || '').length > 60 ? '…' : ''}</span>
-      ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 200))}</div>` : ''}</div>`).join('')}` : '';
+      ${jobBody(o)}
+      ${o.error_message ? `<div class="sub" style="color:#b91c1c">└ ${he(String(o.error_message).slice(0, 500))}</div>` : ''}</div>`).join('')}` : '';
   // 📎 送信用添付: 未紐付け分 (ページ再読み込みしてもアップロード済みが消えないよう復元する)
   const pendingAtts = (replyEditorEnabled() && ['email', 'rakuten'].includes(inq.channel_type) && !activeJob)
     ? listPendingAttachments(inq.id) : [];
@@ -921,6 +936,20 @@ router.get('/inquiries/:id', (req, res) => {
     ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
     ta.focus();
     toast('AI返信案をコピーしました。内容を確認・編集してから送信してください');
+  });
+  // 送信ジョブ履歴の本文 → 返信欄へ戻す (送信失敗した返信をそのまま作り直せるように)。
+  // 本文は DOM のテキストから取る (属性に埋め込まないので長文でも安全)
+  Array.prototype.forEach.call(document.querySelectorAll('.job-restore'), function(btn) {
+    btn.addEventListener('click', function() {
+      var full = btn.parentElement && btn.parentElement.querySelector('.job-body-full');
+      var ta = document.getElementById('replyBody');
+      if (!full || !ta) { toast('返信フォームが使えません (未決着の送信ジョブを解決してください)'); return; }
+      if (ta.value.trim() && !confirm('返信欄の内容を、この送信ジョブの本文で置き換えますか?')) return;
+      ta.value = full.textContent;
+      ta.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      ta.focus();
+      toast('本文を返信欄に戻しました。添付があった場合は付け直してください');
+    });
   });
   // 📧 今後の自動処理 (メールルール作成。複数条件を組み合わせられる)
   var mrBtn = document.getElementById('mrBtn');
@@ -3244,6 +3273,602 @@ router.get('/attachments/:id(\\d+)', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// ⏰ 締め前確認 (2026-08-28 中原さん要望)
+//    キャンセル・住所変更・日時指定の連絡を、ロジザードへ流す前 (09:00/12:30/14:30) に拾う。
+//    人がネクストエンジンで直してから流す運用なので、ここは「気づくための画面」に徹する
+//    (システムが出荷を止めたりはしない)
+// ═══════════════════════════════════════════════════════════════
+
+const CUTOFF_PAGE_CSS = `<style>
+.cut-hero { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; padding:14px;
+  border-radius:10px; background:#fffbeb; border:1px solid #fcd34d; margin-bottom:14px }
+.cut-hero .big { font-size:26px; font-weight:700 }
+.cut-item { border:1px solid #e2e8f0; border-left-width:5px; border-radius:10px; padding:12px;
+  margin-bottom:10px; background:#fff }
+.cut-item.acked { opacity:.55 }
+.cut-head { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; margin-bottom:4px }
+.cut-body { font-size:13px; color:#475569; margin:6px 0; white-space:pre-wrap; overflow-wrap:anywhere }
+.cut-meta { font-size:12px; color:#64748b; display:flex; gap:10px; flex-wrap:wrap }
+.cut-hit { font-size:11px; color:#94a3b8 }
+.cut-ops { margin-top:8px; display:flex; gap:6px; flex-wrap:wrap }
+.cut-empty { padding:24px; text-align:center; color:#166534; background:#f0fdf4;
+  border:1px solid #86efac; border-radius:10px; font-size:15px }
+</style>`;
+
+router.get('/cutoff', (req, res) => {
+  const showAcked = req.query.acked === '1';
+  const showDone = req.query.done === '1';
+  // 除外したせいで何が見えなくなっているかを確認できる導線 (間違えて外していないかを見つけられるように)
+  const showExcluded = req.query.excluded === '1';
+  const { items, truncated, excluded } = listCutoffItems({
+    includeAcked: showAcked, includeDone: showDone, includeExcluded: showExcluded });
+  const excludes = listCutoffExcludes();
+  // いま出ている差出人を多い順に (お客さまでないものをまとめて外せるように)
+  const senderCount = new Map();
+  for (const it of items) {
+    if (!it.sender) continue;
+    senderCount.set(it.sender, (senderCount.get(it.sender) || 0) + 1);
+  }
+  const senderRanking = [...senderCount.entries()]
+    .map(([sender, count]) => ({ sender, count }))
+    .sort((a, b) => b.count - a.count || a.sender.localeCompare(b.sender))
+    .slice(0, 15);
+  const counts = summarize(items.filter(i => !i.ack));
+  const next = nextCutoff();
+  const h = Math.floor(next.minutesLeft / 60), m = next.minutesLeft % 60;
+
+  const itemCards = items.map(it => `
+    <div class="cut-item${it.ack ? ' acked' : ''}" style="border-left-color:${it.kind === 'cancel' ? '#dc2626' : it.kind === 'address' ? '#f59e0b' : '#3b82f6'}">
+      <div class="cut-head">
+        <span class="badge" style="${it.style}">${it.icon} ${he(it.kindLabel)}</span>
+        ${chBadge(it.channel)}
+        <a href="/apps/inquiry-hub/inquiries/${it.inquiryId}"><b>${he(it.subject || '(件名なし)')}</b></a>
+        ${it.ack ? `<span class="badge" style="background:#f1f5f9;color:#475569">${it.ack.status === 'done' ? '✅対応済み' : '対象外'}</span>` : ''}
+      </div>
+      <div class="cut-meta">
+        <span>📅 ${fmtJst(it.receivedAt)}</span>
+        <span>👤 ${he(it.customerName || '(名前なし)')}</span>
+        ${it.sender ? `<span>✉️ ${he(it.sender)}</span>` : ''}
+        <span>${it.orderNumber ? '🔗 注文 ' + he(it.orderNumber) : '⚠️ 注文番号なし (NEで名前・メールから探す)'}</span>
+        ${it.assignedTo ? `<span>担当 ${he(it.assignedTo)}</span>` : ''}
+      </div>
+      <div class="cut-body">${he(toPreviewLine(it.body, 300))}</div>
+      <div class="cut-hit">引っかかった言葉: ${he(it.matched.join('、'))}</div>
+      <div class="cut-ops">
+        ${it.ack
+          ? `<button class="cut-undo" data-msg="${it.messageId}" data-kind="${he(it.kind)}">↩️ 未対応に戻す</button>`
+          : `<button class="pri cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="done">✅ ネクストエンジンで直した</button>
+             <button class="cut-ack" data-msg="${it.messageId}" data-kind="${he(it.kind)}" data-status="not_applicable">対象外だった</button>`}
+        ${it.sender ? `<span style="flex:1"></span>
+          <button class="cut-excl" data-sender="${he(it.sender)}" title="この差出人からのメールを今後この画面に出しません (問い合わせ自体は消えません)">🚫 この差出人は今後出さない</button>
+          <button class="cut-excl-dom" data-domain="${he('@' + String(it.sender).split('@').pop())}" title="このドメインからのメールを今後この画面に出しません">🚫 @${he(String(it.sender).split('@').pop())} ごと</button>` : ''}
+      </div>
+    </div>`).join('');
+
+  const body = `${CUTOFF_PAGE_CSS}
+  <div class="view-hint">⏰ <b>締め前確認</b> — お客さまからの
+    <b>キャンセル・住所変更・お届け日時の変更</b>を、ロジザードへ流す前に拾って並べます。
+    <b>ネクストエンジンで先に直してから</b>流してください。
+    <span class="sub">直近${LOOKBACK_DAYS}日ぶん・${showDone ? '完了した問い合わせも含む' : '完了にした問い合わせは対応済みとみなして出しません'}。
+    言葉で拾っているので的外れなものも混じります (「対象外だった」で消せます)</span></div>
+
+  ${truncated ? `<div class="card" style="padding:10px;background:#fef2f2;border-color:#fca5a5">
+    ⚠️ <b>件数が多く、全部は表示しきれていません</b>。ここに出ていないものが残っている可能性があります。</div>` : ''}
+
+  ${showExcluded ? `<div class="card" style="padding:10px;background:#f1f5f9">
+    🚫 <b>除外した差出人のぶんも表示しています</b> (ふだんは出ません)。
+    お客さまのメールが混じっていたら、下の「この画面に出さない差出人」から「外す」を押してください。</div>` : ''}
+
+  <div class="cut-hero">
+    <div>次の締めは <span class="big">${he(next.label)}</span>${next.isTomorrow ? ' <span class="sub">(翌朝)</span>' : ''}</div>
+    <div class="sub">あと ${h > 0 ? h + '時間' : ''}${m}分</div>
+    <span style="flex:1"></span>
+    <div>${counts.total === 0
+      ? '<b style="color:#166534">未対応 0件</b>'
+      : `<b style="color:#b91c1c">未対応 ${counts.inquiries}件</b> <span class="sub">(${CUTOFF_KINDS.filter(k => counts.byKind[k.kind]).map(k => `${k.icon}${counts.byKind[k.kind]}`).join(' ')})</span>`}</div>
+  </div>
+
+  <div class="filters">
+    <a class="${showAcked ? 'ghost' : 'pri'} btn-link" href="/apps/inquiry-hub/cutoff">未対応だけ</a>
+    <a class="${showAcked ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?acked=1">対応済みも表示</a>
+    <a class="${showDone ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?done=${showDone ? '0' : '1'}">完了した問い合わせも見る</a>
+    <a class="${showExcluded ? 'pri' : 'ghost'} btn-link" href="/apps/inquiry-hub/cutoff?excluded=${showExcluded ? '0' : '1'}"
+      title="除外した差出人のぶんも表示します。間違えて外していないかの確認に使ってください">🚫 除外したぶんも見る</a>
+    <span style="flex:1"></span>
+    <span class="sub">締め: ${CUTOFF_TIMES.map(c => c.label).join(' / ')}</span>
+  </div>
+
+  ${items.length ? itemCards : `<div class="cut-empty">✅ 検知された未対応は0件です<br>
+    <span class="sub">キャンセル・住所変更・日時指定の連絡は見つかりませんでした。
+    ただし言葉で拾っているので取りこぼしはありえます — いつもどおり確認して流してください。</span></div>`}
+
+  ${senderRanking.length > 1 ? `<details class="card" style="padding:12px">
+    <summary><b>📊 いま出ている差出人 (多い順)</b> <span class="sub">— お客さまでないものをまとめて外せます</span></summary>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>差出人</th><th>件数</th><th></th></tr></thead>
+      <tbody>${senderRanking.map(s => `
+        <tr>
+          <td><code>${he(s.sender)}</code></td>
+          <td class="nowrap">${s.count}件</td>
+          <td class="nowrap ops">
+            <button class="cut-excl" data-sender="${he(s.sender)}">🚫 出さない</button>
+            <button class="cut-excl-dom" data-domain="${he('@' + s.sender.split('@').pop())}">@${he(s.sender.split('@').pop())} ごと</button>
+          </td>
+        </tr>`).join('')}</tbody>
+    </table>
+  </details>` : ''}
+
+  <details class="card" style="padding:12px">
+    <summary><b>🚫 この画面に出さない差出人 (${excludes.length}件)</b>
+      ${excluded ? `<span class="sub"> — 直近で ${excluded}通 を除外しました</span>` : ''}</summary>
+    <div class="sub" style="margin:8px 0">業者からの連絡・Amazonの通知・自動配信など、<b>お客さまではない差出人</b>をここに入れておくと出なくなります。
+      一覧の「🚫この差出人は今後出さない」からも足せます。<br>
+      ⭐<b>間違えて入れても「外す」を押せば元どおり出るようになります</b> (取り消せます)。
+      <b>問い合わせ自体が消えるわけでもありません</b> — 受信トレイには残るので、この画面に出さないだけです。<br>
+      no-reply系・バウンスは登録しなくても自動で外れます。</div>
+    <div class="filters">
+      <input type="text" id="exclInput" placeholder="foo@example.com または @example.com (ドメインごと)" style="min-width:300px">
+      <input type="text" id="exclNote" placeholder="メモ (任意)" style="min-width:160px">
+      <button class="pri" id="exclAdd">➕ 追加</button>
+    </div>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>差出人 / ドメイン</th><th>メモ</th><th>登録</th><th></th></tr></thead>
+      <tbody>${excludes.length ? excludes.map(e => `
+        <tr>
+          <td class="nowrap"><code>${he(e.pattern)}</code>${e.pattern.startsWith('@') ? ' <span class="badge" style="background:#f1f5f9;color:#475569">ドメイン</span>' : ''}</td>
+          <td class="sub">${he(e.note || '')}</td>
+          <td class="sub nowrap">${fmtJst(e.created_at)}</td>
+          <td class="ops"><button class="excl-del" data-id="${e.id}" data-pattern="${he(e.pattern)}">外す</button></td>
+        </tr>`).join('') : '<tr><td colspan="4" class="empty">まだ登録がありません</td></tr>'}</tbody>
+    </table>
+  </details>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api/cutoff' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  document.querySelectorAll('.cut-ack').forEach(function(b) {
+    b.addEventListener('click', function() {
+      b.disabled = true;
+      api('/ack', { messageId: Number(b.dataset.msg), kind: b.dataset.kind, status: b.dataset.status })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.cut-undo').forEach(function(b) {
+    b.addEventListener('click', function() {
+      b.disabled = true;
+      api('/unack', { messageId: Number(b.dataset.msg), kind: b.dataset.kind })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  // 差出人ごと・ドメインごとの除外 (一覧から1タップで足せる)
+  function addExclude(pattern, note, btn) {
+    btn.disabled = true;
+    api('/exclude', { pattern: pattern, note: note })
+      .then(function() { location.reload(); })
+      .catch(function(e) { toast('失敗: ' + e.message); btn.disabled = false; });
+  }
+  var UNDO_NOTE = String.fromCharCode(10, 10)
+    + '※ 間違えても、下の「🚫この画面に出さない差出人」から「外す」を押せば元に戻せます。'
+    + String.fromCharCode(10) + '※ 問い合わせ自体は消えません (受信トレイには残ります)。';
+  document.querySelectorAll('.cut-excl').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.sender + ' からのメールを、今後この画面に出さないようにします。' + UNDO_NOTE)) return;
+      addExclude(b.dataset.sender, '画面から追加', b);
+    });
+  });
+  document.querySelectorAll('.cut-excl-dom').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.domain + ' のドメイン全体を、今後この画面に出さないようにします。'
+        + String.fromCharCode(10) + 'そのドメインにお客さまがいる場合は、個別のアドレスだけにしてください。' + UNDO_NOTE)) return;
+      addExclude(b.dataset.domain, '画面からドメインごと追加', b);
+    });
+  });
+  var exclAdd = document.getElementById('exclAdd');
+  if (exclAdd) exclAdd.addEventListener('click', function() {
+    var v = document.getElementById('exclInput').value.trim();
+    if (!v) { toast('メールアドレス (または @ドメイン) を入れてください'); return; }
+    addExclude(v, document.getElementById('exclNote').value.trim() || null, this);
+  });
+  document.querySelectorAll('.excl-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.pattern + ' の除外を外します (また出るようになります)。')) return;
+      b.disabled = true;
+      api('/exclude/' + b.dataset.id + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — 締め前確認', 'cutoff', body, script));
+});
+
+router.post('/api/cutoff/ack', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = ackCutoffItem({ messageId: b.messageId, kind: b.kind, status: b.status, note: b.note }, actorOf(req));
+    console.log(`[inquiry-hub] 締め前確認 ${r.kind}=${r.status} msg=${r.messageId} by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/unack', (req, res) => {
+  try {
+    res.json({ ok: true, ...unackCutoffItem({ messageId: (req.body || {}).messageId, kind: (req.body || {}).kind }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/exclude', (req, res) => {
+  try {
+    const b = req.body || {};
+    const r = addCutoffExclude(b.pattern, b.note, actorOf(req));
+    console.log(`[inquiry-hub] 締め前確認から除外「${r.pattern}」 by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/cutoff/exclude/:id(\\d+)/delete', (req, res) => {
+  try {
+    res.json({ ok: true, ...removeCutoffExclude(Number(req.params.id)) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 👥 担当者と権限マップ (2026-08-28 中原さん要望「権限マップをアプリに入れて自分で登録したい」)
+//    ⭐AIに人を選ばせない設計の土台。AIが出すのは「必要な権限」までで、
+//      誰に渡すかはこの表を見る決定的なルールが決める (staff.js の冒頭に理由)
+// ═══════════════════════════════════════════════════════════════
+
+const PERM_KIND_META = {
+  decision: { label: '決裁権限', hint: '顧客に何を約束していいか', style: 'background:#dbeafe;color:#1d4ed8' },
+  escalation: { label: 'エスカレーション', hint: '金額の大小で決められない領域。少額でも上位へ上げる', style: 'background:#fee2e2;color:#b91c1c' },
+  system: { label: '操作権限', hint: 'どのシステムを触れるか', style: 'background:#dcfce7;color:#166534' },
+};
+const PERM_KINDS = ['decision', 'escalation', 'system'];
+
+/**
+ * 権限マップを編集できる人 (env INQUIRY_HUB_PERMISSION_ADMINS にカンマ区切りで指定)。
+ * ⚠️ 未設定なら全員が編集できる — 他の設定画面 (フォルダ・メールルール) と同じ扱いにして、
+ *   env を入れ忘れた状態で誰も編集できなくなる事故を避けるため。ただしこの表は
+ *   「誰が返金を決めていいか」を決めるものなので、未設定のときは画面に注意を出す。
+ */
+function canEditPermissions(req) {
+  const raw = process.env.INQUIRY_HUB_PERMISSION_ADMINS;
+  if (!raw || !raw.trim()) return true;
+  const allowed = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  if (!allowed.length) return true;
+  return allowed.includes(String(actorOf(req) || '').toLowerCase());
+}
+
+/** 編集APIの共通ガード。編集できないときは 403 を返す */
+function requirePermissionAdmin(req, res) {
+  if (canEditPermissions(req)) return true;
+  res.status(403).json({ error: '権限マップを変更できるのは管理者だけです (INQUIRY_HUB_PERMISSION_ADMINS)' });
+  return false;
+}
+
+const STAFF_PAGE_CSS = `<style>
+.perm-group { margin:10px 0 }
+.perm-group-h { display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap }
+.perm-chk { display:flex; align-items:baseline; gap:6px; padding:4px 6px; border-radius:6px; cursor:pointer }
+.perm-chk:hover { background:#f8fafc }
+.perm-code { font-family:ui-monospace,monospace; font-size:12px; color:#64748b; min-width:34px }
+.staff-card { border:1px solid #e2e8f0; border-radius:10px; padding:14px; margin-bottom:14px; background:#fff }
+.staff-card h3 { margin:0 0 4px; font-size:16px }
+.staff-fields { display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end }
+.staff-fields label { display:flex; flex-direction:column; gap:3px; font-size:12px; color:#475569 }
+.staff-fields input { padding:6px 8px; border:1px solid #cbd5e1; border-radius:6px }
+.perm-holders { font-size:13px }
+.perm-holders td { padding:4px 8px; border-bottom:1px solid #f1f5f9 }
+</style>`;
+
+router.get('/staff', (req, res) => {
+  const { permissions, staff } = getPermissionMatrix();
+  const activePerms = permissions.filter(p => p.is_active);
+  const canEdit = canEditPermissions(req);
+  const adminsConfigured = !!String(process.env.INQUIRY_HUB_PERMISSION_ADMINS || '').trim();
+  const dis = canEdit ? '' : ' disabled';
+
+  const permChecks = s => PERM_KINDS.map(kind => {
+    const list = activePerms.filter(p => p.kind === kind);
+    if (!list.length) return '';
+    const m = PERM_KIND_META[kind];
+    return `
+      <div class="perm-group">
+        <div class="perm-group-h"><span class="badge" style="${m.style}">${m.label}</span>
+          <span class="sub">${m.hint}</span></div>
+        ${list.map(p => `
+          <label class="perm-chk" title="${he(p.description || '')}">
+            <input type="checkbox" class="p-chk" data-staff="${s.id}" value="${he(p.code)}"${s.permissions.includes(p.code) ? ' checked' : ''}${dis}>
+            <span class="perm-code">${he(p.code)}</span><span>${he(p.name)}</span>
+          </label>`).join('')}
+      </div>`;
+  }).join('');
+
+  const staffCards = staff.map(s => {
+    // ⭐上限額を空にしたまま D2 を付けても「無制限」にはならない (0円 = 金額の判断はできない)。
+    //   設定漏れが無制限の決裁者を作る fail-open を避けるため。画面では設定を促す
+    const rl = refundLimitOf(s);
+    return `
+    <div class="staff-card" data-staff="${s.id}">
+      <h3>${he(s.display_name)}</h3>
+      ${rl.needsLimit ? `<div class="sub" style="color:#b91c1c">⚠️ 「少額の補償を決める (D2)」が付いていますが、
+        <b>返金の上限額が未設定なので金額の判断はできません</b> (0円扱い)。下の欄に上限額を入れてください。</div>` : ''}
+      ${rl.hasD2 && !rl.needsLimit ? `<div class="sub">返金は <b>${rl.limit.toLocaleString('ja-JP')}円</b> まで判断できます</div>` : ''}
+      <div class="staff-fields">
+        <label>表示名<input type="text" class="s-name" data-id="${s.id}" value="${he(s.display_name)}" maxlength="${STAFF_NAME_MAX}"${dis}></label>
+        <label>担当者キー (担当欄に入る値)<input type="text" class="s-key" data-id="${s.id}" value="${he(s.user_key)}" maxlength="${STAFF_KEY_MAX}" style="min-width:220px"${dis}></label>
+        <label title="空欄のままだと金額の判断はできません (無制限にはなりません)">返金の上限額 (D2用・空欄=判断できない)<input type="number" class="s-limit" data-id="${s.id}" value="${s.refund_limit_yen == null ? '' : s.refund_limit_yen}" min="0" style="width:150px"${dis}></label>
+      </div>
+      ${permChecks(s)}
+      ${canEdit ? `<div class="ops" style="margin-top:10px">
+        <button class="pri s-save" data-id="${s.id}">保存</button>
+        <button class="s-off" data-id="${s.id}" data-name="${he(s.display_name)}">この担当者を使わなくする</button>
+      </div>` : ''}
+    </div>`;
+  }).join('');
+
+  // 権限別に「誰が持っているか」の俯瞰 (割り当ての抜けを見つけるため)
+  const holderRows = activePerms.map(p => {
+    const holders = staff.filter(s => s.permissions.includes(p.code));
+    return `<tr>
+      <td class="nowrap"><span class="perm-code">${he(p.code)}</span> ${he(p.name)}</td>
+      <td${holders.length ? '' : ' style="color:#b91c1c"'}>${holders.length ? holders.map(h => he(h.display_name)).join('、') : '⚠️ 誰も持っていません'}</td>
+    </tr>`;
+  }).join('');
+
+  const permAdminRows = permissions.map(p => `
+    <tr${p.is_active ? '' : ' style="opacity:.55"'}>
+      <td class="nowrap"><span class="perm-code">${he(p.code)}</span>${p.is_builtin ? '' : ' <span class="badge" style="background:#f1f5f9;color:#475569">独自</span>'}</td>
+      <td>${he(PERM_KIND_META[p.kind]?.label || p.kind)}</td>
+      ${p.is_builtin
+        // ⚠️既定権限の名前と説明は変えられない — コード側 (ルーティング・AIプロンプト・監査画面) が
+        //   D1 や S4 の意味を前提に動くため。補足は「社内メモ」に書く
+        ? `<td><b>${he(p.name)}</b><div class="sub">変更できません</div></td>
+           <td class="sub">${he(p.description || '')}</td>`
+        : `<td><input type="text" class="pm-name" data-code="${he(p.code)}" value="${he(p.name)}" maxlength="${PERM_NAME_MAX}" style="min-width:180px"></td>
+           <td><input type="text" class="pm-desc" data-code="${he(p.code)}" value="${he(p.description || '')}" style="min-width:240px"></td>`}
+      <td><input type="text" class="pm-note" data-code="${he(p.code)}" value="${he(p.local_note || '')}" placeholder="社内メモ (自由)" style="min-width:200px"></td>
+      <td class="nowrap ops">
+        <button class="pm-save" data-code="${he(p.code)}">保存</button>
+        <button class="pm-act" data-code="${he(p.code)}" data-active="${p.is_active}">${p.is_active ? '無効にする' : '有効に戻す'}</button>
+        ${p.is_builtin ? '' : `<button class="pm-del" data-code="${he(p.code)}" data-name="${he(p.name)}">削除</button>`}
+      </td>
+    </tr>`).join('');
+
+  const logRows = listPermissionLogs(30).map(l => `
+    <tr>
+      <td class="nowrap">${fmtJst(l.created_at)}</td>
+      <td>${he(l.display_name || `(担当者#${l.staff_id})`)}</td>
+      <td><span class="perm-code">${he(l.permission_code)}</span> ${he(l.permission_name || '')}</td>
+      <td>${l.action === 'grant' ? '<span class="badge" style="background:#dcfce7;color:#166534">付与</span>' : '<span class="badge" style="background:#fee2e2;color:#b91c1c">剥奪</span>'}</td>
+      <td>${he(l.actor || '—')}</td>
+    </tr>`).join('');
+
+  const body = `${STAFF_PAGE_CSS}
+  <div class="view-hint">👥 <b>担当者と権限</b> — 問い合わせを「誰に振るか」ではなく
+    「<b>どの権限が要るか</b>」で管理します。AIは必要な権限を見立てるところまでで、人を選ぶのはこの表です。
+    担当者が変わってもこの表を直すだけで済み、<b>誰が何を約束していいかが記録として残ります</b>。</div>
+
+  ${canEdit && !adminsConfigured ? `<div class="card" style="padding:10px;background:#fffbeb;border-color:#fcd34d">
+    ⚠️ いまは<b>ログインできる人なら誰でもこの表を変更できます</b>。
+    変更できる人を限る場合は Render の環境変数 <code>INQUIRY_HUB_PERMISSION_ADMINS</code> に
+    メールアドレスをカンマ区切りで設定してください (例: <code>d.nakahara@b-faith.biz</code>)。</div>` : ''}
+  ${canEdit ? '' : `<div class="card" style="padding:10px;background:#f1f5f9">
+    🔒 閲覧のみです。この表を変更できるのは管理者だけです。</div>`}
+
+  ${canEdit ? `<div class="filters">
+    <input type="text" id="newName" placeholder="表示名 (例: 田中)" maxlength="${STAFF_NAME_MAX}" style="min-width:160px">
+    <input type="text" id="newKey" placeholder="担当者キー (例: tanaka@b-faith.biz)" maxlength="${STAFF_KEY_MAX}" style="min-width:260px">
+    <button class="pri" id="createBtn">➕ 担当者を追加</button>
+  </div>` : ''}
+
+  ${staffCards || '<div class="card"><div class="empty">担当者はまだ登録されていません。上の欄から追加してください</div></div>'}
+
+  <details class="card" style="padding:12px">
+    <summary><b>権限を誰が持っているか (俯瞰)</b></summary>
+    <table class="perm-holders" style="width:100%;margin-top:10px">
+      <tbody>${holderRows}</tbody>
+    </table>
+  </details>
+
+  ${canEdit ? `<details class="card" style="padding:12px">
+    <summary><b>権限の名前・説明を編集する / 独自の権限を足す</b></summary>
+    <div class="sub" style="margin:8px 0">既定の19件は削除できません (トリアージのルーティングがこのコードを参照するため)。
+      使わない権限は「無効にする」で画面から隠せます。</div>
+    <div class="filters">
+      <input type="text" id="npCode" placeholder="コード (英数字。例 S9)" maxlength="${PERM_CODE_MAX}" style="width:150px">
+      <select id="npKind">
+        <option value="decision">決裁権限</option>
+        <option value="escalation">エスカレーション</option>
+        <option value="system">操作権限</option>
+      </select>
+      <input type="text" id="npName" placeholder="権限名" maxlength="${PERM_NAME_MAX}" style="min-width:200px">
+      <button class="pri" id="npAdd">➕ 権限を足す</button>
+    </div>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>コード</th><th>種別</th><th>名前</th><th>説明</th><th>社内メモ</th><th>操作</th></tr></thead>
+      <tbody>${permAdminRows}</tbody>
+    </table>
+  </details>` : ''}
+
+  <details class="card" style="padding:12px">
+    <summary><b>権限の変更履歴 (直近30件)</b></summary>
+    <table class="cardable" style="margin-top:10px">
+      <thead><tr><th>日時</th><th>担当者</th><th>権限</th><th>操作</th><th>実行者</th></tr></thead>
+      <tbody>${logRows || '<tr><td colspan="5" class="empty">まだ変更はありません</td></tr>'}</tbody>
+    </table>
+  </details>`;
+
+  const script = `
+  function api(path, data) {
+    return fetch('/apps/inquiry-hub/api' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data || {})
+    }).then(function(r) { return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+  }
+  // 閲覧のみのときは追加フォーム自体が無い (要素が無くてもエラーにしない)
+  var createBtn = document.getElementById('createBtn');
+  if (createBtn) createBtn.addEventListener('click', function() {
+    var name = document.getElementById('newName').value.trim();
+    var key = document.getElementById('newKey').value.trim();
+    if (!name || !key) { toast('表示名と担当者キーの両方を入れてください'); return; }
+    var btn = this; btn.disabled = true;
+    api('/staff', { displayName: name, userKey: key }).then(function() { location.reload(); })
+      .catch(function(e) { toast('追加に失敗: ' + e.message); btn.disabled = false; });
+  });
+  document.querySelectorAll('.s-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var id = b.dataset.id;
+      var codes = [];
+      document.querySelectorAll('.p-chk[data-staff="' + id + '"]').forEach(function(c) { if (c.checked) codes.push(c.value); });
+      var limit = document.querySelector('.s-limit[data-id="' + id + '"]').value.trim();
+      b.disabled = true;
+      api('/staff/' + id, {
+        displayName: document.querySelector('.s-name[data-id="' + id + '"]').value.trim(),
+        userKey: document.querySelector('.s-key[data-id="' + id + '"]').value.trim(),
+        refundLimitYen: limit === '' ? null : limit,
+        permissions: codes
+      }).then(function(r) {
+        var msg = '保存しました';
+        if (r.permissions) {
+          var g = (r.permissions.granted || []).length, v = (r.permissions.revoked || []).length;
+          if (g || v) msg += ' (権限 +' + g + ' / -' + v + ')';
+        }
+        toast(msg);
+        setTimeout(function(){ location.reload(); }, 700);
+      }).catch(function(e) { toast('保存に失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.s-off').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm(b.dataset.name + ' さんを使わなくしますか?' + String.fromCharCode(10, 10)
+        + '権限はすべて外れます。過去の問い合わせに残っている担当の記録は消えません。')) return;
+      b.disabled = true;
+      api('/staff/' + b.dataset.id + '/deactivate', {}).then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  var npAdd = document.getElementById('npAdd');
+  if (npAdd) npAdd.addEventListener('click', function() {
+    var code = document.getElementById('npCode').value.trim();
+    var name = document.getElementById('npName').value.trim();
+    if (!code || !name) { toast('コードと権限名を入れてください'); return; }
+    var btn = this; btn.disabled = true;
+    api('/permissions', { code: code, kind: document.getElementById('npKind').value, name: name })
+      .then(function() { location.reload(); })
+      .catch(function(e) { toast('追加に失敗: ' + e.message); btn.disabled = false; });
+  });
+  document.querySelectorAll('.pm-save').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var c = b.dataset.code; b.disabled = true;
+      // 既定権限は名前・説明の入力欄が無い (社内メモだけ送る)
+      var nameEl = document.querySelector('.pm-name[data-code="' + c + '"]');
+      var descEl = document.querySelector('.pm-desc[data-code="' + c + '"]');
+      var payload = { localNote: document.querySelector('.pm-note[data-code="' + c + '"]').value.trim() };
+      if (nameEl) { payload.name = nameEl.value.trim(); payload.description = descEl.value.trim(); }
+      api('/permissions/' + encodeURIComponent(c), payload)
+        .then(function() { toast('保存しました'); b.disabled = false; })
+        .catch(function(e) { toast('保存に失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.pm-act').forEach(function(b) {
+    b.addEventListener('click', function() {
+      var on = b.dataset.active === '1'; b.disabled = true;
+      api('/permissions/' + encodeURIComponent(b.dataset.code) + '/active', { active: !on })
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('失敗: ' + e.message); b.disabled = false; });
+    });
+  });
+  document.querySelectorAll('.pm-del').forEach(function(b) {
+    b.addEventListener('click', function() {
+      if (!confirm('権限「' + b.dataset.name + '」を削除しますか?' + String.fromCharCode(10)
+        + '付与済みの担当者からも外れます。')) return;
+      b.disabled = true;
+      api('/permissions/' + encodeURIComponent(b.dataset.code) + '/delete', {})
+        .then(function() { location.reload(); })
+        .catch(function(e) { toast('削除に失敗: ' + e.message); b.disabled = false; });
+    });
+  });`;
+  res.send(pageShell('問い合わせ管理 — 担当者と権限', 'staff', body, script));
+});
+
+router.post('/api/staff', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const b = req.body || {};
+    const s = createStaff({ userKey: b.userKey, displayName: b.displayName,
+      refundLimitYen: b.refundLimitYen, note: b.note }, actorOf(req));
+    console.log(`[inquiry-hub] 担当者追加「${s.displayName}」(${s.userKey}) by ${actorOf(req)}`);
+    res.json({ ok: true, ...s });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/staff/:id(\\d+)', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const b = req.body || {};
+    const r = saveStaffWithPermissions(Number(req.params.id), {
+      userKey: b.userKey, displayName: b.displayName, refundLimitYen: b.refundLimitYen,
+      note: b.note, sortOrder: b.sortOrder,
+      permissions: Array.isArray(b.permissions) ? b.permissions : undefined,
+    }, actorOf(req));
+    if (r.permissions && (r.permissions.granted.length || r.permissions.revoked.length)) {
+      console.log(`[inquiry-hub] 権限変更 ${r.displayName}: +[${r.permissions.granted.join(',')}] -[${r.permissions.revoked.join(',')}] by ${actorOf(req)}`);
+    }
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/staff/:id(\\d+)/deactivate', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const r = deactivateStaff(Number(req.params.id), actorOf(req));
+    console.log(`[inquiry-hub] 担当者を無効化「${r.displayName}」 権限${r.revoked}件を解除 by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/permissions', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const b = req.body || {};
+    const r = createPermission({ code: b.code, kind: b.kind, name: b.name, description: b.description });
+    console.log(`[inquiry-hub] 権限を追加「${r.code} ${r.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/permissions/:code([A-Za-z0-9_]+)', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const b = req.body || {};
+    res.json({ ok: true, ...updatePermission(req.params.code,
+      { name: b.name, description: b.description, localNote: b.localNote, sortOrder: b.sortOrder }) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/permissions/:code([A-Za-z0-9_]+)/active', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const active = (req.body || {}).active;
+    if (typeof active !== 'boolean') return res.status(400).json({ error: 'active は true/false で指定してください' });
+    res.json({ ok: true, ...setPermissionActive(req.params.code, active) });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+router.post('/api/permissions/:code([A-Za-z0-9_]+)/delete', (req, res) => {
+  if (!requirePermissionAdmin(req, res)) return;
+  try {
+    const r = deletePermission(req.params.code, actorOf(req));
+    console.log(`[inquiry-hub] 権限を削除「${r.code} ${r.name}」 by ${actorOf(req)}`);
+    res.json({ ok: true, ...r });
+  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // ⚙️ 運用管理画面 (設計書§7.1 #6 同期・エラー管理 + #4 送信結果不明の解決)
 // ═══════════════════════════════════════════════════════════════
 
@@ -3385,6 +4010,10 @@ router.get('/admin', (req, res) => {
   </div>`;
 
   const body = `
+  <div class="filters">
+    <a class="ghost btn-link" href="/apps/inquiry-hub/admin/insights">📊 実データ調査 (件数・締めまでの処理量・AI費用の試算)</a>
+    <a class="ghost btn-link" href="/apps/inquiry-hub/staff">👥 担当者と権限</a>
+  </div>
   ${aiCard}
   ${batchCard}
   <div class="card" style="margin-bottom:16px">
@@ -3532,6 +4161,158 @@ router.post('/api/admin/sync-errors/:id(\\d+)/resolve', (req, res) => {
   res.json({ ok: true });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// 📊 実データ調査 (2026-08-28) — AIトリアージの設計・費用試算を推測でなく実測で決めるための画面
+//    ロジザードの締めは 09:00 / 12:30 / 14:30 の3回。キャンセル・住所変更は
+//    「1日に何件か」より「1回の締めまでに何件さばく必要があるか」で見る
+// ═══════════════════════════════════════════════════════════════
+
+router.get('/admin/insights', (req, res) => {
+  const days = Math.min(365, Math.max(7, Number(req.query.days) || 30));
+  const d = collectInsights({ days });
+  // collectInsights は各項目を { data, error } で返す (失敗値を成功として扱わないため)
+  const rowsOf = v => (v && Array.isArray(v.data) ? v.data : []);
+  const dataOf = v => (v && v.error ? null : (v && v.data) || null);
+  const errOf = v => (v && v.error) ? `<div class="sub" style="color:#b91c1c">取得できませんでした: ${he(v.error)}</div>` : '';
+
+  const tbl = (head, rows, cells) => `
+    <table class="cardable"><thead><tr>${head.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.length ? rows.map(cells).join('') : `<tr><td colspan="${head.length}" class="empty">データがありません</td></tr>`}</tbody></table>`;
+
+  // 顧客受信の1日あたり件数 (費用試算の母数)
+  const chRows = rowsOf(d.byChannel);
+  const perDayTotal = chRows.reduce((a, r) => a + Number(r.per_day || 0), 0);
+  const bodyLen = dataOf(d.bodyLength);
+  const totals = dataOf(d.totals);
+  const assign = dataOf(d.assignment);
+  const cats = dataOf(d.categories);
+  const ai = dataOf(d.aiStatus);
+  const avgChars = (bodyLen && bodyLen.avg_chars) || 0;
+  const cost = estimateCost({ avgChars, perDay: perDayTotal });
+
+  // 締め窓ごとの件数 — この画面の主役
+  const cutRows = rowsOf(d.cutoffWindows);
+  const cutMax = Math.max(1, ...cutRows.map(r => Number(r.count) || 0));
+  const cutoffCards = cutRows.map(r => `
+    <div style="display:flex;align-items:center;gap:10px;margin:6px 0;flex-wrap:wrap">
+      <div style="min-width:290px">${he(r.label)}</div>
+      <div style="flex:1;min-width:120px;background:#f1f5f9;border-radius:4px;height:20px">
+        <div style="width:${Math.round(100 * r.count / cutMax)}%;background:#f59e0b;height:100%;border-radius:4px"></div>
+      </div>
+      <div class="nowrap"><b>問い合わせ ${r.inquiries}件</b>
+        <span class="sub">(メッセージ ${r.count}件 ・ 1日 ${r.perDay}件)</span></div>
+    </div>`).join('');
+
+  const body = `
+  <div class="view-hint">📊 <b>実データ調査</b> — AIトリアージ (出荷前のキャンセル・住所変更の検知、担当の振り分け) を
+    設計するための実測値です。直近 <b>${d.days}日</b> 分。
+    <span class="sub">個人情報は出しません (件数・時刻・文字数だけ)</span></div>
+
+  <div class="filters">
+    <span>集計期間:</span>
+    ${[14, 30, 60, 90].map(n => `<a class="${n === d.days ? 'pri btn-link' : 'ghost btn-link'}" href="?days=${n}">${n}日</a>`).join('')}
+  </div>
+
+  <div class="card" style="padding:14px">
+    <h3 style="margin:0 0 4px">⏰ 締めまでに何件さばく必要があるか</h3>
+    <div class="sub" style="margin-bottom:10px">ロジザードの締め = ${WMS_CUTOFFS.map(c => c.label).join(' / ')} の3回。
+      キャンセル・住所変更・宛先変更に当たるキーワードを含む顧客メッセージを、受信時刻から「どの締めに間に合わせる必要があったか」で振り分けています。
+      <b>これが出荷前トリアージの1回あたりの処理量</b>です。</div>
+    ${cutoffCards || '<div class="empty">データがありません</div>'}
+    ${errOf(d.cutoffWindows)}
+  </div>
+
+  <div class="card" style="padding:14px">
+    <h3 style="margin:0 0 4px">💰 AIトリアージの費用 (実測した本文長からの試算)</h3>
+    <div class="sub">顧客受信メッセージの平均 <b>${avgChars || '—'}文字</b> ・ 1日あたり <b>${perDayTotal.toFixed(1)}件</b> で計算。
+      モデル = gpt-5.6-luna ($0.20 / $1.20 per 1M) ・ 1ドル150円換算</div>
+    <table class="cardable" style="margin-top:8px"><tbody>
+      <tr><td>1件あたりの入力/出力トークン</td><td>${cost.inTokens} / ${cost.outTokens}</td></tr>
+      <tr><td>1件あたり</td><td><b>${cost.perCallJpy}円</b></td></tr>
+      <tr><td>1日あたり (全件に投げた場合)</td><td>${cost.perDayJpy}円</td></tr>
+      <tr><td><b>1ヶ月あたり</b></td><td><b>約${cost.perMonthJpy.toLocaleString('ja-JP')}円</b></td></tr>
+    </tbody></table>
+    <div class="sub" style="margin-top:6px">⚠️ これは「届いた顧客メッセージ全部に投げた場合」の上限です。
+      自動配信メールを除外すれば下がります。実運用の値はトリアージ稼働後に実測に置き換えます。</div>
+  </div>
+
+  <div class="card" style="padding:14px">
+    <h3 style="margin:0 0 8px">📥 どれだけ届いているか</h3>
+    ${tbl(['チャネル', '件数', '1日あたり'], chRows, r => `<tr><td>${chBadge(r.channel)}</td><td>${r.c}</td><td>${r.per_day}</td></tr>`)}
+    ${errOf(d.byChannel)}
+    <div class="sub" style="margin-top:8px">問い合わせ総数 ${totals ? totals.inquiries_all : '—'}件 /
+      未アーカイブ ${totals ? totals.inquiries_active : '—'}件 /
+      未対応 (新着・対応中・保留) ${totals ? totals.open_like : '—'}件</div>
+  </div>
+
+  <div class="card" style="padding:14px">
+    <h3 style="margin:0 0 8px">🔎 出荷前ブロック候補のキーワード</h3>
+    <div class="sub" style="margin-bottom:8px">AIを使わない決定的な検知 (層1) の当たり具合。
+      <b>取りこぼしを減らすため、わざと広めに引っかけています</b> — 実際に対応が要るのはこの一部です。</div>
+    ${tbl(['キーワード', 'メッセージ数', '問い合わせ数', '1日あたり'], rowsOf(d.keywordHits),
+      r => `<tr><td>${he(r.name)}</td><td>${r.count}</td><td>${r.inquiries}</td><td>${r.perDay}</td></tr>`)}
+    ${errOf(d.keywordHits)}
+  </div>
+
+  <div class="card" style="padding:14px">
+    <h3 style="margin:0 0 8px">🔗 注文番号がどれだけ埋まっているか</h3>
+    <div class="sub" style="margin-bottom:8px">「どの注文の話か」を特定できる割合。
+      <b>メール (Gmail) は取込時に注文番号を入れていないので0%に近いはず</b>です。
+      ここが埋まらない分は「注文が特定できないキャンセル依頼」として、人が確認する列に残す必要があります。</div>
+    ${tbl(['チャネル', '件数', '注文番号あり', '割合'], rowsOf(d.orderNumberFill), r => `<tr><td>${chBadge(r.channel)}</td><td>${r.c}</td><td>${r.with_order}</td><td>${r.pct}%</td></tr>`)}
+    ${errOf(d.orderNumberFill)}
+  </div>
+
+  <details class="card" style="padding:12px">
+    <summary><b>日別の受信件数 (直近14日)</b></summary>
+    ${tbl(['日付 (JST)', '件数'], rowsOf(d.byDay), r => `<tr><td>${he(r.day)}</td><td>${r.c}</td></tr>`)}
+  </details>
+
+  <details class="card" style="padding:12px">
+    <summary><b>時刻別 (キャンセル・住所変更まわり・JST)</b></summary>
+    ${tbl(['JST時', '件数'], rowsOf(d.byHour), r => `<tr><td>${he(r.hour)}時台</td><td>${r.c}</td></tr>`)}
+  </details>
+
+  <details class="card" style="padding:12px">
+    <summary><b>フォルダ別 (自動配信がどれだけ振り分けられているか)</b></summary>
+    ${tbl(['フォルダ', '件数'], rowsOf(d.byFolder), r => `<tr><td>${he(r.folder)}</td><td>${r.c}</td></tr>`)}
+  </details>
+
+  <details class="card" style="padding:12px">
+    <summary><b>いまの担当・エスカレーションの使われ方</b></summary>
+    ${assign ? `
+      ${tbl(['担当', '件数 (直近90日)'], assign.byAssignee || [], r => `<tr><td>${he(r.assignee)}</td><td>${r.c}</td></tr>`)}
+      <div class="sub" style="margin-top:10px">AIフラグ (0:不要 1:AI返信必要 2:社長確認 3:責任者確認):
+        ${(assign.aiNeeded || []).map(r => `${r.ai_needed}=${r.c}件`).join(' / ')}</div>
+      <div class="sub">要確認フラグ: ${(assign.attention || []).map(r => `${r.needs_attention ? 'あり' : 'なし'}=${r.c}件`).join(' / ')}</div>
+    ` : `<div class="empty">取得できませんでした</div>${errOf(d.assignment)}`}
+  </details>
+
+  <details class="card" style="padding:12px">
+    <summary><b>テンプレート・Q&amp;Aのカテゴリ (実務の問い合わせ類型)</b></summary>
+    <div class="sub" style="margin:8px 0">権限マップの分類が実態と合っているかの裏取りに使います。</div>
+    ${cats ? `
+      <div><b>返信テンプレート</b></div>
+      ${tbl(['カテゴリ', '件数'], cats.templates || [], r => `<tr><td>${he(r.category)}</td><td>${r.c}</td></tr>`)}
+      <div style="margin-top:10px"><b>Q&amp;Aナレッジ</b></div>
+      ${tbl(['カテゴリ', '件数'], cats.qa || [], r => `<tr><td>${he(r.category)}</td><td>${r.c}</td></tr>`)}
+    ` : `<div class="empty">取得できませんでした</div>${errOf(d.categories)}`}
+  </details>
+
+  <details class="card" style="padding:12px">
+    <summary><b>AI基盤の稼働状況</b></summary>
+    ${ai ? `<div class="sub" style="margin-top:8px">
+      バッチ実行 ${ai.runs.c}回 (最終 ${fmtJst(ai.runs.last)}) /
+      生成済み下書き ${ai.drafts.c}件 (最終 ${fmtJst(ai.drafts.last)}) /
+      待機中ジョブ ${ai.queued.c}件</div>` : `<div class="empty">取得できませんでした</div>${errOf(d.aiStatus)}`}
+  </details>
+
+  <div class="sub" style="margin-top:10px">集計時刻: ${fmtJst(d.generatedAt)} ・
+    <a href="/apps/inquiry-hub/admin">⚙️ 運用管理へ戻る</a></div>`;
+
+  res.send(pageShell('問い合わせ管理 — 実データ調査', 'admin', body, ''));
+});
+
 // 一括操作の取り消し (2026-08-25 安全装置。取り消しは1バッチ1回だけ・再送は成功扱い)
 router.post('/api/bulk-batches/:id(\\d+)/revert', (req, res) => {
   try {
@@ -3675,6 +4456,15 @@ figure.att-img.att-err .att-fail { display: block; }
 /* カテゴリ見出し (optgroup) は太字・テンプレートは1段下げて、一目で区別がつくように */
 .tpl-row #tplSel optgroup { font-weight: 700; font-style: normal; color: #0f172a; }
 .tpl-row #tplSel option { font-weight: 400; padding-left: 1.2em; }
+/* 送信ジョブ履歴: 送ろうとした本文の全文 (失敗したときに何を書いたか読めるように) */
+.job-body summary { cursor: pointer; list-style: none; }
+.job-body summary::-webkit-details-marker { display: none; }
+.job-body .job-body-more { color: #4f46e5; margin-left: 4px; white-space: nowrap; }
+.job-body[open] .job-body-more { visibility: hidden; }
+.job-body-full { white-space: pre-wrap; overflow-wrap: anywhere; background: #f8fafc;
+  border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 10px; margin: 6px 0;
+  font-size: 13px; max-height: 340px; overflow-y: auto; }
+.job-restore { margin-bottom: 4px; }
 /* AI書き換えボタン行 */
 .rw-row { margin-top: 6px; flex-wrap: wrap; align-items: center; }
 .rw-row .rw-btn { margin: 0; }
@@ -3892,6 +4682,9 @@ function pageShell(title, active, body, script, opts = {}) {
   // = 受信トレイと同じ「自分のタスク」基準。失敗しても画面は出す (fail-soft)
   let folderNav = [];
   try { folderNav = listFolders({ withCounts: true }); } catch { /* 初期化前などは出さない */ }
+  // ⏰締め前確認の未対応件数。重い集計なので失敗しても画面は出す (fail-soft)
+  let cutoffCount = 0;
+  try { cutoffCount = countCutoffItems().inquiries; } catch { /* 初期化前などは0 */ }
   const folderItems = folderNav.map(f =>
     navItem(`/apps/inquiry-hub?view=all&folder=${f.id}${groupQs}`, '📁', he(f.name), `folder:${f.id}`, f.open_count)).join('');
 
@@ -3907,6 +4700,10 @@ function pageShell(title, active, body, script, opts = {}) {
     </div>
     <div class="nav-sep"></div>
     <div class="nav-group">
+      ${navItem('/apps/inquiry-hub/cutoff', '⏰', '締め前確認', 'cutoff', cutoffCount)}
+    </div>
+    <div class="nav-sep"></div>
+    <div class="nav-group">
       ${folderItems}
       ${navItem('/apps/inquiry-hub/folders', '⚙️', 'フォルダを作る・編集', 'folders', 0)}
       ${navItem('/apps/inquiry-hub/labels', '🏷️', 'ラベルを作る・編集', 'labels', 0)}
@@ -3918,6 +4715,7 @@ function pageShell(title, active, body, script, opts = {}) {
       ${navItem('/apps/inquiry-hub/signatures', '✍️', '署名', 'signatures', 0)}
       ${navItem('/apps/inquiry-hub/qa', '❓', 'Q&amp;A', 'qa', 0)}
       ${navItem('/apps/inquiry-hub/mail-rules', '📧', 'メールルール', 'mailrules', 0)}
+      ${navItem('/apps/inquiry-hub/staff', '👥', '担当者と権限', 'staff', 0)}
       ${navItem('/apps/inquiry-hub/admin', '⚙️', '運用管理', 'admin', 0)}
     </div>
   </aside>`;

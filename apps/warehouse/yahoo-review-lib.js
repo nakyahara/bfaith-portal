@@ -20,7 +20,7 @@
  */
 import crypto from 'node:crypto';
 import AdmZip from 'adm-zip';
-import { parseCsvBuffer } from './rakuten-ads-rpp-lib.js';
+import { decodeCsvBuffer } from './rakuten-ads-rpp-lib.js';
 
 export const YAHOO_REVIEW_SOURCE = 'yahoo-review';
 export const HEADER_COLS = ['評価日', '評価点数', '商品名', '商品コード', '注文ID', 'コメントタイトル', 'コメント内容', '動画本数', '画像枚数', 'いいね数'];
@@ -191,6 +191,25 @@ export function extractReviewCsvFromZip(buffer) {
  * ZIP (or CSV) を解釈して取込レコードにする。DL 直後の検証にも使う。
  * @returns {ok, records, conflicts, dateFrom, dateTo, warnings, csvName} | {ok:false, error}
  */
+/**
+ * Yahoo レビュー CSV の行分割。
+ *
+ * 🚨このCSVは **フィールドを引用符で囲わない方言** (2026-08-31 実測: 1,144 行のうち
+ * 引用符を含む行は、本文に二重引用符が 1 個だけ入った 1 行のみ。囲みには一切使われていない)。
+ * RFC4180 のパーサに通すと、その 1 個を「囲みの開始」と誤読して次の行と結合してしまい、
+ * 「列数不一致 (7 != 10)」で**全 1,144 件の取込が丸ごと止まる** (8/31 の自動取得が実際に停止した)。
+ *
+ * Yahoo 側は本文からカンマも改行も除去して出力している (物理行数 = ヘッダ + 件数 + 末尾空行が
+ * 画面件数とぴったり一致する) ので、**1 物理行 = 1 レビュー / カンマ区切り**で読むのが正しい。
+ * セル全体が引用符で囲まれていれば外すが、途中の 1 個は本文の文字として残す。
+ * 列数が合わなければ従来どおり呼び出し側が弾く (fail-closed は維持)。
+ */
+export function parseYahooReviewCsv(buf) {
+  const text = decodeCsvBuffer(buf);
+  const unquote = (cell) => (/^".*"$/s.test(cell) ? cell.slice(1, -1).replace(/""/g, '"') : cell);
+  return text.split(/\r?\n/).map((line) => line.split(',').map(unquote));
+}
+
 export function prepareYahooReviewFile(name, buffer) {
   let csvName = name, csv = buffer;
   if (/\.zip$/i.test(name) || (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b)) {
@@ -198,7 +217,7 @@ export function prepareYahooReviewFile(name, buffer) {
     catch (e) { return { ok: false, error: e.message }; }
   }
   let rows;
-  try { rows = parseCsvBuffer(csv); } catch (e) { return { ok: false, error: `CSVパース失敗: ${e.message}` }; }
+  try { rows = parseYahooReviewCsv(csv); } catch (e) { return { ok: false, error: `CSVパース失敗: ${e.message}` }; }
   if (rows.length === 0) return { ok: false, error: '空ファイル' };
   const header = rows[0].map((h) => trimS(h).replace(/^\uFEFF/, ''));
   const missing = HEADER_COLS.filter((c) => !header.includes(c));

@@ -23,7 +23,7 @@ import { startNotificationJob as startInventoryNotificationJob } from './apps/pr
 import { startMarginAlertJob } from './apps/profit-analysis/margin-alert-job.js';
 import { startSalesNotificationJob } from './apps/biz-ops-overview/notify-job.js';
 import { startRysCron } from './apps/rakuten-yahoo-sync/services/rys-cron.js';
-import { startInquiryHubSyncCron, startInquiryHubOutboxCron } from './apps/inquiry-hub/sync/cron.js';
+import { startInquiryHubSyncCron, startInquiryHubOutboxCron, startInquiryHubCutoffCron } from './apps/inquiry-hub/sync/cron.js';
 import { startRenderBackupCron } from './apps/render-backup/backup-render.js';
 import fbaRouter from './apps/fba-replenishment/router.js';
 import fbaPublicPrintRouter from './apps/fba-replenishment/public-router.js';
@@ -58,6 +58,7 @@ import packingDispatchRouter, { neSyncWorkerRouter as packingDispatchNeSyncWorke
 import packingDispatchRuleChangeApiRouter from './apps/packing-dispatch/rule-change-api.js';
 import inventoryMonthlyRouter, { apiRouter as inventoryMonthlyApiRouter } from './apps/inventory-monthly/router.js';
 import misShipmentRouter from './apps/mis-shipment/router.js';
+import productScoutRouter, { ingestRouter as productScoutIngestRouter } from './apps/product-scout/router.js';
 import shippingLogViewRouter from './apps/shipping-log/view-router.js';
 import siteProductsRouter from './apps/site-products/router.js';
 import siteContactRouter from './apps/site-contact/router.js';
@@ -67,6 +68,7 @@ import { startProductHubIntakeCron } from './apps/product-hub/intake-cron.js';
 import productLinksRouter from './apps/product-links/router.js';
 import { startProductLinksCron } from './apps/product-links/cron.js';
 import purchaseOrdersRouter from './apps/purchase-orders/router.js';
+import priceUpdateRouter from './apps/price-update/router.js';
 import inquiryHubRouter from './apps/inquiry-hub/router.js';
 import shippingWorkRouter from './apps/shipping-work/router.js';
 import pickingRouter from './apps/picking/router.js';
@@ -90,6 +92,7 @@ import jobsMonitorRouter from './apps/jobs-monitor/router.js';
 import { startJobsMonitor } from './apps/jobs-monitor/notify-job.js';
 import stockBotRouter, { stockBotAuth } from './apps/stock-bot/router.js';
 import shohyoLinksRouter from './apps/shohyo-links/router.js';
+import { startShohyoAttachCron } from './apps/shohyo-links/attach-job.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -825,6 +828,15 @@ const apps = [
     category: 'analysis',
   },
   {
+    id: 'product-scout',
+    name: '新商品企画スカウト',
+    description: 'Keepaで月販50点以上を収集し、AMCで作れる商品テーマに束ねて採否を判断する。収集の進捗と分母の完全性も同じ画面で見る',
+    icon: '🔎',
+    path: '/apps/product-scout',
+    status: 'active',
+    category: 'analysis',
+  },
+  {
     id: 'mis-shipment',
     name: '誤出荷管理',
     description: '誤出荷の記録・分析、モール別誤出荷率と工程別/原因別の可視化 (Phase 1)',
@@ -839,6 +851,15 @@ const apps = [
     description: '仕入先への発注を1画面で完結。要発注判定・推奨発注量・最低発注条件ゲージ・ついで買い候補・発注履歴 (旧: 発注対象商品シート+発注条件マスタ)',
     icon: '🛒',
     path: '/apps/purchase-orders',
+    status: 'active',
+    category: 'purchasing',
+  },
+  {
+    id: 'price-update',
+    name: '価格一括改定',
+    description: '値上げ時に各モールの売価を1画面で改定。出品の検索・現在価格・利益プレビュー (M1 は読み取り専用・モールへは書き込まない)',
+    icon: '💴',
+    path: '/apps/price-update',
     status: 'active',
     category: 'purchasing',
   },
@@ -1308,7 +1329,8 @@ app.use('/apps/cross-sell-finder', requireAppAccess('cross-sell-finder'), crossS
 app.use('/apps/giftset-assembly', requireAppAccess('giftset-assembly'), express.json({ limit: '256kb' }), giftsetAssemblyRouter);
 app.use('/apps/inbound-info', requireAppAccess('inbound-info'), express.json({ limit: '256kb' }), inboundInfoRouter);
 // MF仕訳用 証憑リンク集 (apps/shohyo-links): 専用DB shohyo-links.db (DATA_DIR)。Notion「支払い関係リンク先」の移行先
-app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '256kb' }), shohyoLinksRouter);
+// limit 8mb = MF照合画面の証憑添付 (MFの上限5MBファイル → base64で約6.7MB) を受けるため
+app.use('/apps/shohyo-links', requireAppAccess('shohyo-links'), express.json({ limit: '8mb' }), shohyoLinksRouter);
 app.use('/apps/sales-analytics-linegift', requireAppAccess('sales-analytics-linegift'), express.json({ limit: '256kb' }), salesAnalyticsLinegiftRouter);
 // 構成 B (2026-06-05 中原さん確定): NE 反映 worker (miniPC) は session 認証なし、Bearer fail-closed のみ。
 // packing-dispatch 本体 (requireAppAccess) より「前」に mount しないと、miniPC が 401/403 で弾かれる。
@@ -1318,6 +1340,12 @@ app.use('/apps/packing-dispatch/rule-change-api', express.json({ limit: '256kb' 
 app.use('/apps/packing-dispatch', requireAppAccess('packing-dispatch'), express.json({ limit: '2mb' }), packingDispatchRouter);
 // 誤出荷管理 (apps/mis-shipment): warehouse-mirror.db 同居の f_mis_shipments を CRUD、注文 lookup は miniPC GET 経由
 app.use('/apps/mis-shipment', requireAppAccess('mis-shipment'), express.json({ limit: '256kb' }), misShipmentRouter);
+
+// 新商品企画スカウト (apps/product-scout): warehouse-mirror.db 同居の scout_* が正本。
+// ⚠️/ingest だけは miniPC のバッチが叩くのでセッションを持てない。router 内で MIRROR_SYNC_KEY を
+//   検証するため、社内ログインを掛けない経路として先に mount する (fail-closed: 鍵未設定なら503)。
+app.use('/apps/product-scout/ingest', productScoutIngestRouter);
+app.use('/apps/product-scout', requireAppAccess('product-scout'), productScoutRouter);
 // 出荷件数ダッシュボード (apps/shipping-log)。
 // GAS からの伝票取込 API (/apps/shipping-log/api) は 2026-08-26 に廃止 (吸い上げ全廃)。
 app.use('/apps/shipping-log', requireAppAccess('shipping-log'), shippingLogViewRouter);
@@ -1338,6 +1366,10 @@ app.use('/apps/product-links', (req, res, next) => {
 }, productLinksRouter);
 // 仕入先発注補助: mirror PML(read-only) + po_* マスタ/発注履歴 (warehouse-mirror.db 同居)
 app.use('/apps/purchase-orders', requireAppAccess('purchase-orders'), express.json({ limit: '1mb' }), purchaseOrdersRouter);
+// 価格一括改定 (price-update): mirror(read-only) + pu_* 監査 (warehouse-mirror.db 同居)。
+// M1 は読み取り専用 — モールへの書き込みは無い。express.json は router 側で CSRF ガードの後に付ける
+// (Content-Type 検査より先に body を読ませない)
+app.use('/apps/price-update', requireAppAccess('price-update'), priceUpdateRouter);
 // 問い合わせ管理 (inquiry-hub): 専用DB inquiry-hub.db (DATA_DIR)。
 // AI連携API (ローカルClaude Codeランナー用) は X-AI-Key 認証・セッション外 (設計書§9.2 権限分離。
 // 先に mount してポータルセッション認証を通さない。product-hub/service-api と同パターン)
@@ -1566,6 +1598,8 @@ app.listen(PORT, () => {
   startProductHubIntakeCron();
   // 商品リンク台帳: 夜間照合 (09:45 JST) + 台帳が空なら起動時バックフィル。既定 ON (PRODUCT_LINKS_RECONCILE_ENABLED=false で停止)
   startProductLinksCron();
+  // 証憑受け箱の突合+添付 (毎時・台帳 shohyo-voucher-attach)。jobs-monitor と同じ Render 専用ガード内
+  startShohyoAttachCron();
 
   // inquiry-hub 受信同期 (楽天15分+deep日次。INQUIRY_HUB_SYNC_CRON_ENABLED=true で起動、Dark Launch)
   startInquiryHubSyncCron();
@@ -1573,6 +1607,10 @@ app.listen(PORT, () => {
   // inquiry-hub 送信ワーカー (outbox 30秒。INQUIRY_HUB_OUTBOX_CRON_ENABLED=true で起動、
   // メール実送信はさらに INQUIRY_HUB_MAIL_SEND_MODE=live が必要。既定=dryrun)
   startInquiryHubOutboxCron();
+
+  // inquiry-hub ⏰締め前通知 (ロジザードの締め 09:00/12:30/14:30 の15分前にGChat。0件でも送る=dead-man)。
+  // INQUIRY_HUB_CUTOFF_CRON_ENABLED=true で起動、Dark Launch
+  startInquiryHubCutoffCron();
 
   // Render 一次データ自己バックアップ (JST 03:30、Google Drive へ外向き送信のみ =
   // DB ダウンロード用の公開エンドポイントは作らない。RENDER_BACKUP_CRON_ENABLED=1 で起動、Dark Launch)

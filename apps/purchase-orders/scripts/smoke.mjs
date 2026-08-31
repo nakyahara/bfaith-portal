@@ -20,7 +20,7 @@ process.env.PML_READ_TOKEN = 'smoke-pml-token';
 const mirrorRouter = (await imp('apps/warehouse-mirror/router.js')).default;
 const pmlListRouter = (await imp('apps/product-management-list/router.js')).default;
 const { getDB } = await imp('apps/purchase-orders/db.js');
-const { computeProduct, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
+const { computeProduct, computeAll, stockConstant, evaluateCondition } = await imp('apps/purchase-orders/logic.js');
 const routerMod = await imp('apps/purchase-orders/router.js');
 const express = (await import('express')).default;
 
@@ -52,6 +52,13 @@ insRow.run('diyorangeoil100', '木工用オレンジオイル 100ml', '0001', '�
 // 引当済み込み回帰: 総在庫数≠総在庫数_引当なし の行 (誤って旧列を参照すると L=0.5→対象になり検出できる)
 db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 総在庫数_引当なし, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数)
   VALUES ('run_test', 'alloc-item', 'FBA準備で引当済みの商品', '0001', '取扱中', 2, 200, 50, 0, 25, 100, 100, 1.5)`).run();
+// 判定ルール v2 (2026-08-30): 仕入先なし ('') で登録し、仕入先別の件数テストに影響させない
+insRow.run('stockout-selling', '在庫0・注残0で売れている商品', '', '取扱中', 2, 0, 0, 30, 120, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01');
+insRow.run('boundary-eq', '在庫+注残 = M×V ちょうど', '', '取扱中', 2, 100, 50, 25, 100, 10, 1.5, 500, 200, '2026-07-01', '2020-01-01');
+insRow.run('boundary-plus', '在庫+注残 = M×V + 1', '', '取扱中', 2, 101, 50, 25, 100, 10, 1.5, 500, 200, '2026-07-01', '2020-01-01');
+db.prepare(`INSERT INTO mirror_pml_snapshot_rows (run_id, 商品コード, 商品名, 仕入先, 取扱区分, 売上分類, 総在庫数, 注残数, 販売数7日_合計, 販売数30日_合計, 発注ロット単位, 推奨保有月数)
+  VALUES ('run_test', 'm-missing', '推奨保有月数 未設定で売れている商品', '', '取扱中', 2, 0, 0, 10, 50, 100, NULL)`).run();
+insRow.run('neg-stock', '在庫が負 (引当超過) の商品', '', '取扱中', 2, -5, 0, 25, 100, 100, 1.5, 500, 200, '2026-07-01', '2020-01-01');
 
 console.log('── computeProduct (シート数式一致) ──');
 const get = code => computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code));
@@ -76,6 +83,32 @@ ok(stockConstant(1) === 0.5 && stockConstant(1.5) === 1 && stockConstant(2.5) ==
 const alloc = get('alloc-item');
 // 引当済み込みの総在庫数を使う: L=200/100=2.0>1.5→対象外 (旧列の引当なし50なら L=0.5→対象になってしまう)
 ok(alloc.stock === 200 && alloc.isTarget === false, 'alloc-item 在庫=総在庫数(引当込み200)で対象外 (引当なし50は使わない)', { stock: alloc.stock, m: alloc.stockMonths });
+
+console.log('── 判定ルール v2 (不等式形: V>0 && M>0 && S+B <= M×V) ──');
+const so = get('stockout-selling');
+// v1 では L=0 で下限を割り掘り起こしに落ちていた。v2 では要発注 + 推奨 = (M+O)×V = 2.5×120 = 300 (ロット100)
+ok(so.isTarget === true && so.targetReason.includes('total') && so.recQty === 300, 'v2: 在庫0・注残0・販売あり → 要発注 (推奨300)', { t: so.isTarget, rec: so.recQty });
+ok(so.isHorikoshi === false && so.stockMonths === 0 && so.salesDefined === true, 'v2: 売れている欠品品は掘り起こしではない・在庫月数は本当の0', { h: so.isHorikoshi, m: so.stockMonths });
+ok(so.targetV1 === false && so.targetV2 === true, 'v2: v1/v2 の両判定を返す (ルール切替の観測用)');
+const soV1 = computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード='stockout-selling'`).get(), undefined, 'v1');
+ok(soV1.isTarget === false && soV1.isHorikoshi === true && soV1.recQty === null, 'v1 ロールバック: 旧式では掘り起こし扱い (要発注に出ない)');
+ok(hori.stockMonths === null && hori.salesDefined === false, 'v2: 販売0 の在庫月数は null (未定義)', hori.stockMonths);
+ok(dead.stockMonths === null && dead.isHorikoshi === false, 'v2: 在庫あり販売0 は在庫月数 null・掘り起こしでもない');
+const beq = get('boundary-eq'), bplus = get('boundary-plus');
+ok(beq.isTarget === true && Math.abs(beq.stockMonths - 1.5) < 1e-9, 'v2 境界: S+B == M×V → 要発注 (L=M)', beq.stockMonths);
+ok(bplus.isTarget === false, 'v2 境界: S+B == M×V + 1 → 対象外', bplus.stockMonths);
+const mm = get('m-missing');
+ok(mm.isTarget === false && mm.holdMonthsMissing === true && mm.isHorikoshi === false, 'v2: M未設定 (null) で売れている → 要発注にしない・holdMonthsMissing', { t: mm.isTarget, hmm: mm.holdMonthsMissing });
+ok(so.holdMonthsMissing === false && hori.holdMonthsMissing === false, 'holdMonthsMissing は「売れているのに M<=0」だけ');
+const neg = get('neg-stock');
+// 在庫+注残が負 → 在庫0 として扱う: 要発注、推奨 = (M+O)×V − 0 = 2.5×100 = 250 → ロット100 で lots=2.5 → ROUND=3 → 300 (負をそのまま使うと 255→300 だが 0 起点で計算)
+ok(neg.isTarget === true && neg.stockNegative === true && neg.stockMonths === 0 && neg.recQty === 300, 'v2: 在庫負は在庫0扱いで要発注・推奨は0起点', { t: neg.isTarget, m: neg.stockMonths, rec: neg.recQty });
+ok(so.recQtyV2 === 300 && soV1.recQtyV2 === 300 && soV1.recQty === null, 'recQtyV2 はルールに依存しない (v1 動作中でも影響額を出せる)');
+// 同値性: 旧式と同じ領域 (S+B>0) では判定・推奨量が変わらない
+for (const [code, p] of [['noflyersticker', nofly], ['cardstand-silver-r', card], ['0726-001060', niku], ['diyorangeoil100', oil], ['alloc-item', alloc]]) {
+  const v1 = computeProduct(db.prepare(`SELECT * FROM mirror_pml_snapshot_rows WHERE 商品コード=?`).get(code), undefined, 'v1');
+  ok(v1.isTarget === p.isTarget && v1.recQty === p.recQty, `v1/v2 同値 (S+B>0): ${code}`, { v1: [v1.isTarget, v1.recQty], v2: [p.isTarget, p.recQty] });
+}
 
 // ── 2. express 起動 (認証なしで直 mount) ──
 const app = express();
@@ -117,6 +150,32 @@ const fd2 = new FormData();
 fd2.append('file', new Blob([badCsv]), 'bad.csv');
 r = await j('/api/masters/suppliers/csv', { method: 'POST', body: fd2 });
 ok(r.status === 400, '見出し不一致CSVは 400');
+
+console.log('── 判定ルール v2: ダッシュボード表示とロールバック口 ──');
+{
+  let html = await (await fetch(base + '/')).text();
+  // stockout-selling (仕入先なし) が v2 で新たに要発注 → 差分バナー +1件 / 推奨額 300×200=¥60,000、m-missing が M未設定 1件
+  // stockout-selling + neg-stock (仕入先なし) が v2 で新たに要発注 → 差分バナー +2件 / ¥60,000×2、m-missing が M未設定 1件
+  ok(html.includes('判定ルール v2') && html.includes('+2件') && html.includes('+¥120,000') && html.includes('未設定で要発注判定ができない商品が 1件'),
+    'dashboard: v2 差分バナー (+2件 / +¥120,000 / M未設定 1件)');
+  r = await j('/api/target-rule');
+  ok(r.body.ok && r.body.rule === 'v2', 'target-rule: 既定 v2');
+  r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v0' }) });
+  ok(r.status === 400, 'target-rule: v1/v2 以外は 400');
+  r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v1' }) });
+  ok(r.body.ok && r.body.rule === 'v1', 'target-rule: v1 へロールバック');
+  html = await (await fetch(base + '/')).text();
+  // v1 でも v2 の影響 (2件: stockout-selling + neg-stock、¥60,000+¥60,000) と M未設定の警告は出る
+  ok(html.includes('旧ルール (v1)') && html.includes('2件 (推奨額 ¥120,000)') && html.includes('未設定で要発注判定ができない商品が 1件'), 'dashboard: v1 のとき警告表示 (影響額と M未設定は別条件で表示)');
+  const allV1 = computeAll();
+  const prodV1 = allV1.products.find(p => p.code === 'stockout-selling');
+  ok(prodV1 && prodV1.isTarget === false && prodV1.isHorikoshi === true, 'v1: computeAll も旧式で判定 (stockout-selling は掘り起こし)');
+  ok(allV1.ruleStats.rule === 'v1' && allV1.ruleStats.addedCount === 2 && allV1.ruleStats.addedAmount === 120000, 'v1: ruleStats の影響額はルールに依存しない', allV1.ruleStats);
+  r = await j('/api/target-rule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rule: 'v2' }) });
+  ok(r.body.ok && r.body.rule === 'v2', 'target-rule: v2 へ戻す');
+  const prodV2 = computeAll().products.find(p => p.code === 'stockout-selling');
+  ok(prodV2 && prodV2.isTarget === true, 'v2: computeAll で要発注に戻る');
+}
 
 console.log('── overview / supplier ──');
 r = await j('/api/overview');
@@ -4114,6 +4173,108 @@ console.log('── P15d: PDFメール (email_pdf) ──');
   // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
   r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
   ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15d)', r.body.error);
+}
+
+// ═══ P15e: 発注方法の変更後に、変更前に作られたジョブ (予約/失敗) を作成時の添付のまま送らない ═══
+// (2026-08-31 フォーユー: email→email_pdf に変えた後、変更前の予約ジョブが CSV 添付で先方へ出た)
+console.log('── P15e: 発注方法 変更後の取り残しジョブ ──');
+{
+  process.env.PO_EMAIL_FAKE = '1';
+  process.env.PO_PDF_FAKE = '1';
+  const emailMod = await imp('apps/purchase-orders/email.js');
+  const jsonPost = (p, body, key, channel) => j(p, { method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'Idempotency-Key': key } : {}) },
+    body: JSON.stringify({ expectedMode: 'dry_run', expectedChannel: channel || 'email', ...body }) });
+
+  // 仕入先 0002 = 📧メール (CSV) で予約送信ジョブを作る
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 0002を📧メールへ (送信前ジョブなし=warningなし)', r.body);
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 37 }], requestedDate: '2026-09-06' }) });
+  ok(r.body.ok, 'P15e: PO発行', r.body.error);
+  const cmOrderId = r.body.id;
+  const futureJst = new Date(Date.now() + 9 * 3600000 + 3 * 3600000).toISOString().slice(0, 16); // 3時間後 (JST表記)
+  r = await jsonPost('/api/orders/' + cmOrderId + '/email/send', { scheduledAt: futureJst }, 'cm-key-1');
+  ok(r.body.ok && r.body.channel === 'email' && r.body.status === 'scheduled', 'P15e: 📧メールで予約送信ジョブ作成', r.body);
+  const cmJob = db.prepare('SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC').get(cmOrderId);
+  ok(cmJob.status === 'queued' && cmJob.channel === 'email' && /\.csv$/.test(cmJob.attachment_name), 'P15e: ジョブ=queued/email/CSV添付', cmJob.attachment_name);
+
+  // 発注方法を 📄PDFメール へ変更 → 保存応答に送信前ジョブの警告
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && r.body.warning && r.body.warning.includes('1件') && r.body.warning.includes('予約'), 'suppliers: 発注方法変更 → 送信前ジョブ1件の警告', r.body);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 発注方法が同じ再保存は警告なし', r.body);
+
+  // 予約時刻到来 → ディスパッチャは送らずに failed (CSV添付のまま先方へ出さない)
+  db.prepare("UPDATE po_email_jobs SET scheduled_at=? WHERE id=?").run(new Date(Date.now() - 60000).toISOString(), cmJob.id);
+  const d = await emailMod.dispatchDueEmailJobs();
+  const cmJob2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJob.id);
+  ok(d.due >= 1 && cmJob2.status === 'failed' && !cmJob2.gmail_message_id, 'P15e: 予約到来 → 送信せず failed', { d, status: cmJob2.status, err: cmJob2.error });
+  ok(String(cmJob2.error).includes('発注方法がジョブ作成後に変わった') && cmJob2.error.includes('CSV添付') && cmJob2.error.includes('PDFメール'),
+    'P15e: エラー文に作成時/現在の発注方法', cmJob2.error);
+  ok(db.prepare("SELECT COUNT(*) AS n FROM po_audit_log WHERE action='email_channel_mismatch' AND detail_json LIKE ?").get('%"jobId":' + cmJob.id + '%').n === 1,
+    'P15e: 監査ログ email_channel_mismatch');
+
+  // 再試行しても同じ理由で止まる (添付はジョブ作成時に固定)
+  r = await j('/api/email-jobs/' + cmJob.id + '/retry', { method: 'POST' });
+  const cmJob3 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJob.id);
+  ok(r.body.ok && r.body.status === 'failed' && cmJob3.status === 'failed' && !cmJob3.gmail_message_id, 'P15e: 再試行 → 送信せず failed のまま', r.body);
+  ok(db.prepare("SELECT COUNT(*) AS n FROM po_email_jobs WHERE order_id=? AND status='sent'").get(cmOrderId).n === 0, 'P15e: このPOは1通も送信されていない');
+
+  // 取消 → 新規送信 (email_pdf) は通る
+  r = await j('/api/email-jobs/' + cmJob.id + '/cancel', { method: 'POST' });
+  ok(r.body.ok, 'P15e: 取り残しジョブの取消', r.body);
+  r = await j('/api/orders/' + cmOrderId + '/email/preview');
+  ok(r.body.ok && r.body.channel === 'email_pdf' && /\.pdf$/.test(r.body.attachmentName), 'P15e: プレビューは現在の発注方法 (email_pdf/PDF)', r.body.channel);
+  r = await jsonPost('/api/orders/' + cmOrderId + '/email/send', {}, 'cm-key-2', 'email_pdf');
+  ok(r.body.ok && r.body.channel === 'email_pdf' && r.body.status === 'sent', 'P15e: 新規送信 (email_pdf) → sent', r.body);
+
+  // 発注方法=送信なし (none) へ変えた場合も、送信前ジョブは止まる
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'email_pdf', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  r = await j('/api/supplier/2/issue', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: [{ code: 'gyoumuhandcream60-BI', qty: 38 }], requestedDate: '2026-09-06' }) });
+  const cmOrderId2 = r.body.id;
+  r = await jsonPost('/api/orders/' + cmOrderId2 + '/email/send', { scheduledAt: futureJst }, 'cm-key-3', 'email_pdf');
+  ok(r.body.ok && r.body.status === 'scheduled', 'P15e: email_pdf の予約ジョブ作成', r.body);
+  const cmJobN = db.prepare('SELECT * FROM po_email_jobs WHERE order_id=? ORDER BY id DESC').get(cmOrderId2);
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'none', email_to: 'ken-foryou@example.jp', contact_name: '佐藤' });
+  ok(r.body.ok && r.body.warning && r.body.warning.includes('1件'), 'suppliers: none へ変更 → 警告', r.body);
+  db.prepare("UPDATE po_email_jobs SET scheduled_at=? WHERE id=?").run(new Date(Date.now() - 60000).toISOString(), cmJobN.id);
+  await emailMod.dispatchDueEmailJobs();
+  const cmJobN2 = db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(cmJobN.id);
+  ok(cmJobN2.status === 'failed' && cmJobN2.error.includes('送信なし'), 'P15e: 送信なしへ変更後の予約ジョブも failed', cmJobN2.error);
+  await j('/api/email-jobs/' + cmJobN.id + '/cancel', { method: 'POST' });
+
+  // 後続テストへの影響を消す (仕入先0002をFAX設定に戻す)
+  r = await jsonPost('/api/masters/suppliers', { supplier_code: '0002', name: 'ビーフリー様', send_method: 'fax', fax_number: '06-7632-4190', contact_name: '佐藤' });
+  ok(r.status === 200 && r.body.ok, 'suppliers: 0002をFAX設定へ復元 (P15e)', r.body.error);
+}
+
+// ═══ 仕入先マスタ保存の寛容化 (2026-08-31: 行内の別欄の書式エラーで「発注方法を変えても保存されない」) ═══
+console.log('── 仕入先マスタ: 保存の寛容化 ──');
+{
+  const emailModAll = await imp('apps/purchase-orders/email.js');
+  const supPost = body => j('/api/masters/suppliers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const getSup = code => j('/api/masters/suppliers').then(x => (x.body.rows || []).find(s => s.supplier_code === code));
+  // 発注方法≠FAX なら FAX欄の書式不備は保存を止めない (warning)。メーラーからのコピペ「名前 <addr>」はアドレス部を採る
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'email_pdf', email_to: '築山 <ken@example.jp>', fax_number: 'abc', contact_name: '築山' });
+  ok(r.status === 200 && r.body.ok && String(r.body.warning).includes('FAX番号'), 'suppliers: FAX欄不備でも発注方法≠FAXなら保存 (warning)', r.body);
+  let s9 = await getSup('9');
+  ok(s9 && s9.send_method === 'email_pdf' && s9.email_to === 'ken@example.jp' && s9.fax_number === 'abc', 'suppliers: email_pdf 保存 + 「名前 <addr>」→ addr', s9);
+  // 発注方法=FAX は FAX番号の書式を厳密に (保存拒否)
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'fax', email_to: 'ken@example.jp', fax_number: 'abc' });
+  ok(r.status === 400 && String(r.body.error).includes('FAX番号'), 'suppliers: 発注方法=FAX は FAX番号不備で拒否', r.body);
+  // 全角のFAX番号・全角メールは半角化して受ける
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'fax', email_to: 'ｋｅｎ＠example.jp', fax_number: '０６－１２３４－５６７８' });
+  ok(r.status === 200 && r.body.ok && !r.body.warning, 'suppliers: 全角FAX番号・全角メールを半角化して保存', r.body);
+  s9 = await getSup('9');
+  ok(s9.email_to === 'ken@example.jp' && s9.fax_number === '０６－１２３４－５６７８', 'suppliers: メールは半角化・FAXは入力表記のまま', s9);
+  ok(emailModAll.normalizeFaxNumber('０６－１２３４－５６７８') === '0612345678' && emailModAll.normalizeFaxNumber('06.1234.5678') === '0612345678', 'normalizeFaxNumber: 全角・ドット区切り');
+  // 本当に不正なメールは従来どおり拒否
+  r = await supPost({ supplier_code: '0009', name: 'テスト書式様', send_method: 'email', email_to: 'ken@' });
+  ok(r.status === 400 && String(r.body.error).includes('メールアドレス'), 'suppliers: 不正メールは拒否', r.body);
+  r = await j('/api/masters/suppliers/9', { method: 'DELETE' });
+  ok(r.body.ok, 'suppliers: テスト行削除');
 }
 
 // ═══ ロジザード在庫 mirror 自動反映 (画面アクセス時に captured_at 比較 → 在庫オーバーレイ自動更新) ═══

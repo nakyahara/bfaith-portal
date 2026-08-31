@@ -9,6 +9,7 @@
  *   mart_*    — ツール用に加工したデータ（将来）
  */
 import Database from 'better-sqlite3';
+import { createProductScoutTables } from '../product-scout/schema.js';
 import path from 'path';
 import fs from 'fs';
 import {
@@ -40,6 +41,12 @@ export let shipmentsDailyInitError = null;
 // ロジザード在庫スナップショット表も同様 (毎時mirror、2026-08-16)
 export let logizardStockInitError = null;
 
+// 新商品企画スカウト表も同様 (apps/product-scout、2026-08-28)
+export let productScoutInitError = null;
+
+// SKUマップ 2種 (yahoo/aupay) も同様 (価格一括改定ツール PR1、2026-08-28)
+export let skuMapInitError = null;
+
 export function initMirrorDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   // リトライ再入時 (2026-07-12 障害対応: 一過性失敗の自己回復) に前のハンドルを
@@ -52,6 +59,8 @@ export function initMirrorDB() {
   rakutenReviewInitError = null;
   shipmentsDailyInitError = null;
   logizardStockInitError = null;
+  productScoutInitError = null;
+  skuMapInitError = null;
   db = new Database(DB_FILE);
   // PRAGMA は接続単位の設定。SQLite のデフォルトは foreign_keys=OFF / recursive_triggers=OFF なので、
   // f_mis_shipments の FK 制約 と append-only trigger を機能させるために毎接続で明示する必要がある。
@@ -1083,6 +1092,78 @@ function createTables() {
       at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
     };
     console.error('[Mirror] 楽天レビュー集計表の初期化失敗 (mirror本体は継続):', e.message);
+  }
+
+  // ─── SKUマップ 2種 (価格一括改定ツール PR1、2026-08-28) ───
+  // miniPC の f_yahoo_sku_map / f_aupay_sku_map (= モール出品コード → NEコード の手動 map) を mirror へ。
+  // 用途: 価格一括改定ツール (apps/price-update) の出品引き当て。Render 側は read-only。
+  // ★clear_strategy='full_snapshot' で毎回全置換する。no_clear upsert だと miniPC で
+  //   「誤りとして削除した map」が mirror に残り続け、別人の商品に値付けする事故になる。
+  // fail-soft: 新mirror表のDDLは fail-soft 必須 (2026-07-12 障害の教訓)
+  try {
+    // full_snapshot entity の世代 (単調増加)。古い run の遅延到着で新しい map を巻き戻さないための番人。
+    // BEGIN IMMEDIATE は同時書き込みを直列化するだけで順序逆転は防がない (Codex R1 High #1)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_snapshot_generations (
+      entity      TEXT PRIMARY KEY,
+      generation  INTEGER NOT NULL,
+      run_id      TEXT NOT NULL,
+      row_count   INTEGER NOT NULL,
+      applied_at  TEXT NOT NULL
+    )`);
+    // ★store_id を PK に含める: Yahoo ストアが増えたとき、同じ yahoo_key の別ストア行を
+    //   INSERT OR REPLACE で黙って上書きしない (au PAY 側と粒度を揃える — Codex R1 Medium #4)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_yahoo_sku_map (
+      store_id    TEXT NOT NULL,
+      yahoo_key   TEXT NOT NULL CHECK(trim(yahoo_key) <> '' AND yahoo_key = trim(yahoo_key)),
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> '' AND ne_code = trim(ne_code)),
+      resolution_source TEXT NOT NULL CHECK(resolution_source IN ('manual','auto_pattern','fallback_parent')),
+      notes       TEXT,
+      created_at  TEXT,
+      updated_at  TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (store_id, yahoo_key)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_mysm_ne ON mirror_yahoo_sku_map(ne_code)');
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_aupay_sku_map (
+      store_id    TEXT NOT NULL,
+      aupay_key   TEXT NOT NULL CHECK(trim(aupay_key) <> '' AND aupay_key = trim(aupay_key)),
+      ne_code     TEXT NOT NULL CHECK(trim(ne_code) <> '' AND ne_code = trim(ne_code)),
+      resolution_source TEXT NOT NULL CHECK(resolution_source IN ('manual','auto_pattern','fallback_parent')),
+      notes       TEXT,
+      created_at  TEXT,
+      updated_at  TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL,
+      PRIMARY KEY (store_id, aupay_key)
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_masm_ne ON mirror_aupay_sku_map(ne_code)');
+    // 送料マスタ (25行程度)。m_products.送料コード の参照先で、配送方法ごとの「配送関係費合計」
+    // (送料 + 出荷作業料 + 梱包資材費 + 人件費) を持つ。
+    // 価格一括改定でモール別の粗利を出すのに使う — 同じ商品でも楽天=定形外 / Yahoo=ネコポス と
+    // 配送方法が違い、送料が変わるため (2026-08-31)
+    db.exec(`CREATE TABLE IF NOT EXISTS mirror_shipping_rates (
+      shipping_code   TEXT NOT NULL PRIMARY KEY CHECK(trim(shipping_code) <> ''),
+      大分類区分       TEXT,
+      運送会社         TEXT,
+      小分類区分名称   TEXT NOT NULL CHECK(trim(小分類区分名称) <> ''),
+      梱包サイズ       TEXT,
+      最大重量         TEXT,
+      追跡有無         TEXT,
+      送料             REAL,
+      出荷作業料       REAL,
+      想定梱包資材費   REAL,
+      想定人件費       REAL,
+      配送関係費合計   REAL,
+      備考             TEXT,
+      source_run_id TEXT NOT NULL, source_row_hash TEXT NOT NULL, synced_at TEXT NOT NULL
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_msr_name ON mirror_shipping_rates(小分類区分名称)');
+  } catch (e) {
+    skuMapInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] SKUマップ表の初期化失敗 (mirror本体は継続):', e.message);
   }
 
   // ─── 日次出荷サマリ (出荷日 × モール × 配送方法 の伝票件数、2026-08-05) ───
@@ -2575,7 +2656,22 @@ function createTables() {
   createGiftsetTables();
   createSupplierShareTables();
   createInboundInfoTables();
+
+  // ▼▼▼ 新商品企画スカウト (apps/product-scout) ▼▼▼
+  // 新規mirror表のDDLは fail-soft 必須 (2026-07-12 の本番障害の教訓)。
+  // ここで落ちても mirror 本体と他モールを道連れにしない。
+  try {
+    createProductScoutTables(db);
+  } catch (e) {
+    productScoutInitError = {
+      message: String(e.message || e),
+      code: e.code || null,
+      at: String(e.stack || '').split(String.fromCharCode(10)).slice(0, 3).join(' | '),
+    };
+    console.error('[Mirror] 商品スカウト表の初期化失敗 (mirror本体は継続):', e.message);
+  }
 }
+
 
 // ▼▼▼ 入庫情報管理（apps/inbound-info）正本テーブル ▼▼▼
 // 旧: スプレッドシート「入庫情報管理表.xlsx」(入数マスタ + 原産国) の置き換え。

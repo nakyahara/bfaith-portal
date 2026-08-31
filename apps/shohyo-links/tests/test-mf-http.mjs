@@ -1,0 +1,130 @@
+/**
+ * shohyo-links MF照合画面のHTTPスモーク (ルーティング・リダイレクト先・入力検証)
+ * MF本体には接続しない (未接続エラーまでを確認する)。実行: node apps/shohyo-links/tests/test-mf-http.mjs
+ */
+import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+
+process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'shohyo-links-http-'));
+const { default: router } = await import('../router.js');
+
+const app = express();
+app.use((req, _res, next) => { req.session = {}; next(); });
+app.use('/apps/shohyo-links', express.json({ limit: '8mb' }), router);
+const server = app.listen(0);
+await new Promise(r => server.once('listening', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+let ng = 0;
+const check = (name, cond, extra = '') => {
+  console.log((cond ? 'OK  ' : 'NG  ') + name + (cond ? '' : ' ' + extra));
+  if (!cond) ng++;
+};
+
+// /mf は200・/mf/ は308で /mf へ寄せる
+let r = await fetch(base + '/apps/shohyo-links/mf', { redirect: 'manual' });
+check('/mf は200', r.status === 200, String(r.status));
+r = await fetch(base + '/apps/shohyo-links/mf/?x=1', { redirect: 'manual' });
+check('/mf/ は308で /mf?x=1 へ', r.status === 308 && r.headers.get('location') === '/apps/shohyo-links/mf?x=1',
+  `${r.status} ${r.headers.get('location')}`);
+
+// コールバックの戻り先が絶対パス (相対だと /mf/mf になる)
+r = await fetch(base + '/apps/shohyo-links/mf/callback?error=access_denied', { redirect: 'manual' });
+check('callback(error) は /apps/shohyo-links/mf?error=... へ',
+  r.headers.get('location') === '/apps/shohyo-links/mf?error=access_denied', String(r.headers.get('location')));
+r = await fetch(base + '/apps/shohyo-links/mf/callback?code=x&state=y', { redirect: 'manual' });
+check('callback(state不一致) も絶対パスで戻る',
+  r.headers.get('location') === '/apps/shohyo-links/mf?error=state_mismatch', String(r.headers.get('location')));
+
+// 添付のバリデーション
+const post = (body) => fetch(base + '/apps/shohyo-links/api/mf/attach', {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+});
+r = await post({});
+check('ファイル無しは400 file_required', r.status === 400 && (await r.json()).error === 'file_required');
+r = await post({ journal_id: 'j', file_name: 'a'.repeat(256) + '.pdf', file_data: 'AAAA' });
+check('名称256文字超は400', r.status === 400 && (await r.json()).error === 'file_name_too_long');
+r = await post({ journal_id: 'j', file_name: 'a.pdf', file_data: 'A'.repeat(Math.ceil(5 * 1024 * 1024 * 4 / 3) + 100) });
+check('5MB超は413', r.status === 413 && (await r.json()).error === 'file_too_large_5mb');
+r = await post({ journal_id: 'j', file_name: 'a.pdf', file_data: 'QUJD' });
+check('制限内は未接続エラーまで進む (mf_not_connected)', (await r.json()).error === 'mf_not_connected');
+
+// 期間バリデーションと未接続
+r = await fetch(base + '/apps/shohyo-links/api/mf/unattached?start=2026-8-1&end=2026-08-31');
+check('不正な期間は400 bad_period', r.status === 400 && (await r.json()).error === 'bad_period');
+r = await fetch(base + '/apps/shohyo-links/api/mf/unattached?start=2026-08-01&end=2026-08-31');
+check('未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
+
+// 明細ビュー
+r = await fetch(base + '/apps/shohyo-links/mf/transactions', { redirect: 'manual' });
+check('/mf/transactions は200', r.status === 200, String(r.status));
+r = await fetch(base + '/apps/shohyo-links/mf/transactions/', { redirect: 'manual' });
+check('/mf/transactions/ は308で寄せる', r.status === 308 && r.headers.get('location') === '/apps/shohyo-links/mf/transactions', String(r.headers.get('location')));
+r = await fetch(base + '/apps/shohyo-links/api/mf/transactions?start=2026-8-1&end=2026-08-31');
+check('明細API 不正な期間は400', r.status === 400 && (await r.json()).error === 'bad_period');
+r = await fetch(base + '/apps/shohyo-links/api/mf/transactions?start=2026-08-01&end=2026-08-31');
+check('明細API 未接続は401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
+
+// 受け箱
+r = await fetch(base + '/apps/shohyo-links/mf/inbox', { redirect: 'manual' });
+check('/mf/inbox は200', r.status === 200, String(r.status));
+const b64 = Buffer.from('%PDF-1.4 smoke').toString('base64');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: '2026-08-08_21092_ロジマート.pdf', file_data: b64, mime: 'application/pdf' }) });
+let j = await r.json();
+check('受け箱に入り、ファイル名規約から日付・金額・支払先が入る', r.status === 200 && j.result.row.doc_date === '2026-08-08' && j.result.row.amount === 21092 && j.result.row.vendor_name === 'ロジマート');
+const inboxId = j.result.row.id;
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'dup.pdf', file_data: b64, mime: 'application/pdf' }) });
+check('同じ内容は duplicate', (await r.json()).result.duplicate === true);
+r = await fetch(base + '/apps/shohyo-links/api/inbox');
+j = await r.json();
+check('一覧に1件・提案モード既定', j.result.rows.length === 1 && j.result.auto_attach === false);
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/file`);
+check('ファイルを返す', r.status === 200 && (await r.text()).startsWith('%PDF'));
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ amount: 21000 }) });
+check('メタ修正', (await r.json()).result.amount === 21000);
+r = await fetch(base + '/apps/shohyo-links/api/inbox/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('照合は未接続で401', r.status === 401 && (await r.json()).error === 'mf_not_connected');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('相手未指定の添付は400', r.status === 400 && (await r.json()).error === 'target_required');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/exclude`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('除外', (await r.json()).result.status === 'excluded');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/reopen`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+check('戻す', (await r.json()).result.status === 'new');
+r = await fetch(base + '/apps/shohyo-links/api/inbox/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ auto_attach: true }) });
+check('自動添付の切替は admin 以外 403', r.status === 403 && (await r.json()).error === 'admin_only');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: Buffer.from('<html>').toString('base64') }) });
+check('PDF/JPEG/PNG 以外は415', r.status === 415 && (await r.json()).error === 'unsupported_file');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'x.pdf', file_data: '!!!notbase64' }) });
+check('壊れたbase64は400', r.status === 400 && (await r.json()).error === 'bad_base64');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'y.pdf', file_data: Buffer.from('%PDF-1.4 y').toString('base64'), doc_date: '2026-02-30' }) });
+check('存在しない日付は400', r.status === 400 && (await r.json()).error === 'bad_date');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'not-a-candidate' }) });
+check('候補にない明細への添付は400', r.status === 400 && (await r.json()).error === 'not_a_candidate');
+r = await fetch(base + '/apps/shohyo-links/api/inbox', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ file_name: 'z.pdf', file_data: Buffer.from('%PDF-1.4 z').toString('base64'), vendor_id: 999999 }) });
+check('存在しない vendor_id は400', r.status === 400 && (await r.json()).error === 'bad_vendor_id');
+r = await fetch(base + `/apps/shohyo-links/api/inbox/${inboxId}/attach`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tx_id: 'x'.repeat(300) }) });
+check('長すぎる tx_id は400', r.status === 400 && (await r.json()).error === 'bad_tx_id');
+r = await fetch(base + '/apps/shohyo-links/api/inbox/abc/file');
+check('不正IDは404', r.status === 404);
+r = await fetch(base + '/apps/shohyo-links/api/inbox?status=bogus');
+check('未知の status は400', r.status === 400);
+
+// カードごとのMF URL
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://evil.example/x' }) });
+check('MF以外のURLは400', r.status === 400 && (await r.json()).error === 'bad_url');
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: 'https://accounting.moneyforward.com/transaction_journals?cti=x&search_form%5Basset_acts%5D%5Baccount_id_hash%5D=y' }) });
+check('MFの通帳・カード他URLは登録できる', r.status === 200 && (await r.json()).result.url.includes('account_id_hash'));
+r = await fetch(base + '/apps/shohyo-links/api/mf/accounts/abc/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: '' }) });
+check('空で解除', r.status === 200 && (await r.json()).result.url === '');
+
+server.close();
+console.log(ng ? `\n${ng}件NG` : '\n全件パス');
+process.exitCode = ng ? 1 : 0;

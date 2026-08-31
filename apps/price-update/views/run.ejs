@@ -1,0 +1,123 @@
+<%- include('../../product-hub/views/_header') %>
+<style>
+  .topbar .app-title { display: none; }
+  .pu-title { font-weight: 700; font-size: 15px; }
+  .wrap { max-width: 1400px; }
+  .pu-note { font-size: 12px; color: #64748b; }
+  table.pu { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.pu th { text-align: left; color: #64748b; font-size: 11px; font-weight: 600; border-bottom: 2px solid #e2e8f0; padding: 6px 8px; white-space: nowrap; }
+  table.pu td { border-bottom: 1px solid #f1f5f9; padding: 6px 8px; vertical-align: middle; }
+  .code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chip { font-size: 11px; padding: 1px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  .s-previewed { background: #e0f2fe; color: #0369a1; }
+  .s-manual_required { background: #fef3c7; color: #92400e; }
+  .s-manual_done { background: #dcfce7; color: #166534; }
+  .mall { font-weight: 600; font-size: 12px; }
+  .m-rakuten { color: #bf0000; } .m-yahoo { color: #ff0033; } .m-amazon { color: #ff9900; }
+  .m-aupay { color: #eb5505; } .m-qoo10 { color: #e4002b; }
+</style>
+<div class="topbar" style="margin-top:-1px">
+  <span class="pu-title">💴 価格一括改定 — 履歴</span>
+  <a href="/apps/price-update">戻る</a>
+  <span class="spacer"></span>
+  <span class="user"><%= displayName %></span>
+</div>
+<div class="wrap">
+  <div class="card">
+    <h2><%= run.run_id %></h2>
+    <div class="pu-note">
+      <%= run.created_at.replace('T', ' ').slice(0, 19) %> / 実行者 <%= run.created_by %> /
+      <%= run.kind === 'recovery' ? '復旧 run' : '通常 run' %> /
+      対象コード <%= run.neCodes.join(', ') %>
+    </div>
+    <% if (run.note) { %><div style="margin-top:6px;"><%= run.note %></div><% } %>
+  </div>
+
+  <div class="card">
+    <h2>行 (<%= run.operations.length %>)</h2>
+    <div style="overflow-x:auto;">
+      <table class="pu">
+        <thead>
+          <tr>
+            <th>状態</th><th>モール</th><th>商品</th><th>出品コード / SKU</th><th>引き当て</th>
+            <th class="num">記録時の価格</th><th class="num">新売価</th><th>判定</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          <% run.operations.forEach(function (o) { %>
+            <% var guard = o.guard_json ? JSON.parse(o.guard_json) : null; %>
+            <tr data-op="<%= o.operation_id %>">
+              <td>
+                <span class="chip s-<%= o.state %>" data-state-cell><%= o.state === 'manual_done' ? '手動更新済み' : (o.state === 'manual_required' ? '手動更新まち' : '記録のみ') %></span>
+              </td>
+              <td><span class="mall m-<%= o.mall %>"><%= o.mall %></span></td>
+              <td>
+                <div class="code"><%= o.ne_code %><%= o.row_kind === 'set' ? ' (セット)' : '' %></div>
+                <div class="pu-note"><%= o.product_name || '' %></div>
+              </td>
+              <td class="code"><%= o.listing_code || '' %><% if (o.sku_code) { %><div class="pu-note">SKU <%= o.sku_code %></div><% } %></td>
+              <td><%= o.confidence %><div class="pu-note"><%= o.price_source || '' %></div></td>
+              <td class="num"><%= o.expected_current_price == null ? '—' : o.expected_current_price.toLocaleString() %></td>
+              <td class="num"><%= o.new_price == null ? '—' : o.new_price.toLocaleString() %></td>
+              <td class="pu-note">
+                <% if (guard && guard.blocks && guard.blocks.length) { %><%= guard.blocks.join(' / ') %>
+                <% } else if (guard && guard.warns && guard.warns.length) { %><%= guard.warns.join(' / ') %>
+                <% } else { %>—<% } %>
+              </td>
+              <td>
+                <% if (o.initial_state === 'manual_required') { %>
+                  <button class="btn btn-sm manual-btn" data-op="<%= o.operation_id %>" data-done="<%= o.state === 'manual_done' ? '0' : '1' %>">
+                    <%= o.state === 'manual_done' ? '取り消す' : '手動更新した' %>
+                  </button>
+                <% } %>
+                <% if (o.product_url) { %><a href="<%= o.product_url %>" target="_blank" rel="noopener">開く</a><% } %>
+              </td>
+            </tr>
+          <% }); %>
+        </tbody>
+      </table>
+    </div>
+    <div class="pu-note" id="manual-msg" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>イベント (追記のみ)</h2>
+    <table class="pu">
+      <thead><tr><th>日時</th><th>操作者</th><th>イベント</th><th>対象</th><th>詳細</th></tr></thead>
+      <tbody>
+        <% run.events.forEach(function (e) { %>
+          <tr>
+            <td class="code"><%= e.at.replace('T', ' ').slice(0, 19) %></td>
+            <td><%= e.actor %></td>
+            <td><%= e.event %></td>
+            <td class="code"><%= e.operation_id || '(run)' %></td>
+            <td class="pu-note"><%= e.detail_json || '' %></td>
+          </tr>
+        <% }); %>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  document.querySelectorAll('.manual-btn').forEach(function (btn) {
+    btn.addEventListener('click', async function () {
+      const done = btn.dataset.done === '1';
+      btn.disabled = true;
+      try {
+        const res = await fetch(location.pathname.replace(/\/runs\/.*$/, '/api/runs/') + encodeURIComponent('<%= run.run_id %>') + '/manual', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ operationId: btn.dataset.op, done: done }),
+        });
+        const json = await res.json();
+        if (!res.ok || json.ok === false) throw new Error(json.error || ('HTTP ' + res.status));
+        location.reload();
+      } catch (e) {
+        document.getElementById('manual-msg').textContent = 'エラー: ' + e.message;
+        btn.disabled = false;
+      }
+    });
+  });
+</script>

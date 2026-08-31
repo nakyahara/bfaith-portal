@@ -555,6 +555,11 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
         throw new PkError(409, 'not_picking', `作業中ではないため取消できません (${batch.status})`);
       }
       if (batch.worker !== worker) throw new PkError(409, 'taken', `このバッチは ${batch.worker} が作業中です`);
+      // v2 PR2: 欠品明細の後始末 (配賦・依頼・展開済みタスク・梱包側の保留) を明細ごとに。
+      // 着手済みの「後で取りに行く」が1つでもあれば取消できない (throw でトランザクションごと巻き戻る)
+      for (const l of db.prepare("SELECT seq FROM pk_lines WHERE batch_id=? AND status='shortage'").all(batchId)) {
+        undoShortageSideEffects(db, batchId, l.seq, now);
+      }
       db.prepare(`
         UPDATE pk_batches SET status='ready', worker=NULL, started_at=NULL, finished_at=NULL,
           paused_total_sec=0, pause_started_at=NULL, pause_reason=NULL, updated_at=? WHERE id=?
@@ -654,6 +659,9 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
             WHERE batch_id=? AND seq=?`)
             .run(now, q, altBlk, altLoc, a > 0 ? a : null, remQty, rem, batchId, lineSeq);
           closeShortageSession(db, batch, lineSeq, clampedEventTime(clientAt, now), now);
+          // v2 PR2: 残りを受注に配賦し (梱包の 🕒/❌ バッジの元)、「後で」は依頼として積む。
+          // 梱包タスクへの展開はトランザクション外 (bindPendingLaterRequests — router/reconcile/ポーラー)
+          recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, worker }, now);
         } else {
           db.prepare("UPDATE pk_lines SET status='done', done_at=? WHERE batch_id=? AND seq=?")
             .run(now, batchId, lineSeq);
@@ -697,6 +705,8 @@ export function applyEvent(batchId, { opId, event, lineSeq, clientAt, undoOpId, 
           throw new PkError(409, 'stale_back',
             '取り消し対象の完了が見つからないか、別の操作で上書きされています');
         }
+        // v2 PR2: 欠品の後始末 (配賦・依頼・展開済みタスク・保留)。着手済みなら back 自体を拒否
+        if (line.status === 'shortage') undoShortageSideEffects(db, batchId, lineSeq, now);
         // shown_at は now に更新 (この瞬間から再表示。再作業時間に前の明細の時間を混ぜない)
         db.prepare(`UPDATE pk_lines SET status='pending', done_at=NULL, shortage_qty=NULL, shown_at=?,
             alt_block=NULL, alt_location=NULL, alt_qty=NULL, remaining_qty=NULL, remaining=NULL
@@ -843,7 +853,7 @@ export function displayWorkerName(worker) {
  * shown_at/done_at は PR2 で「直近表示時刻」を刻んでいるので、back で往復しても
  * 他の明細の時間が混入しない (= この差がその明細の実所要時間)。
  */
-function loadStatsLines(since, until) {
+export function loadStatsLines(since, until) {
   return getDB().prepare(`
     SELECT b.work_date, b.hikiate_class, b.id AS batch_id, l.seq, l.status, l.shortage_qty, l.remaining_qty,
       CAST(ROUND((julianday(l.done_at) - julianday(l.shown_at)) * 86400) AS INTEGER) AS sec,
@@ -877,9 +887,10 @@ function loadStatsLines(since, until) {
  *   byDate: [{date, lines, sec, secPerLine, workers}]
  * }}
  */
-export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
+export function getPickingStats({ until = jstToday(), days = STATS_WINDOW_DAYS, lineRows = null } = {}) {
   const range = statsRange(until, days);
-  const rows = loadStatsLines(range.since, range.until);
+  // lineRows = 呼び出し側で読んだ明細 (ボードは getMissStats と同じ窓を使うので1回の読みを共有 — Codex)
+  const rows = lineRows ?? loadStatsLines(range.since, range.until);
 
   // ── 外れ値の仕分け ──
   // 捨てた件数は全体と作業者別の両方で出す。除外は「放置の多い人ほど悪い記録が消える」
@@ -1112,6 +1123,295 @@ export function getTodayProgress(workDate = jstToday()) {
  * pk_batches / pk_lines は picking 所有のため、packing からはこの関数を呼ぶ (要件§7.1)。
  * @param task pk_pack_tasks の行 (id/sku/product_name/req_qty/location/block/folder_name/slip_seq/requested_by)
  */
+/**
+ * 欠品記録の後始末 (back と バッチ取消 cancel で共用・欠品フローv2 PR2)。
+ * 配賦を消し、「後で取りに行く」依頼を取り下げ、そのために作った未着手タスクを取消し、
+ * そのために保留にした梱包伝票を (他に生きた repick が無ければ) 戻す。
+ * 🚨 ピッカーが既に対応を始めている (自前タスクまたは合流先が requested/cancelled 以外) なら
+ *    PkError 409 later_in_progress で**操作そのものを拒否**する — 黙って戻すと、取りに行った商品と
+ *    取り消された記録がズレて二重ピックになる。呼び出し側のトランザクション内で使う (throw で巻き戻る)。
+ */
+function undoShortageSideEffects(db, batchId, lineSeq, now) {
+  const lr = db.prepare(`SELECT * FROM pk_later_requests
+    WHERE batch_id=? AND line_seq=? AND status IN ('pending_binding','requested')
+    ORDER BY id DESC LIMIT 1`).get(batchId, lineSeq);
+  if (lr) {
+    let tasks = [];
+    let mergedBusy = false;
+    try {
+      // cancelled 以外は全部見る — received (梱包者が受け取った後) や unavailable も
+      // 「対応が始まった」に含める (Codex High: 受領後に欠品記録だけ消せていた)
+      tasks = db.prepare(`SELECT * FROM pk_pack_tasks
+        WHERE later_request_id=? AND status != 'cancelled'`).all(lr.id);
+      // 梱包側の再ピックへ合流していた分も、その合流先が着手済みなら同じ扱い
+      // (全量合流だと自前のタスクが無く、ここを見ないと着手後に back できてしまう — Codex R7)
+      const mergedIds = String(lr.merged_task_ids || '').split(',').map((x) => Number(x)).filter((x) => x > 0);
+      if (mergedIds.length > 0) {
+        mergedBusy = db.prepare(`SELECT 1 FROM pk_pack_tasks
+          WHERE id IN (${mergedIds.map(() => '?').join(',')}) AND status NOT IN ('requested','cancelled')`)
+          .get(...mergedIds) != null;
+      }
+    } catch { /* packing無効環境 */ }
+    if (mergedBusy || tasks.some((t) => t.status !== 'requested')) {
+      throw new PkError(409, 'later_in_progress',
+        '「後で取りに行く」分は既に対応が始まっているため取り消せません');
+    }
+    for (const t of tasks) {
+      // 未着手のみ取消 (CAS)。pk_pack_tasks は packing 所有だが、
+      // 未着手の依頼の取り下げは依頼者 (ピッカー) の操作として許す
+      db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=? AND status='requested'")
+        .run(now, t.id);
+      if (t.slip_seq != null) {
+        // この依頼のために保留にした梱包伝票は、他に生きた repick が無ければ戻す
+        const other = db.prepare(`SELECT 1 FROM pk_pack_tasks
+          WHERE batch_id=? AND slip_seq=? AND kind='repick'
+            AND status IN ('requested','claimed','fulfilled')`).get(t.batch_id, t.slip_seq);
+        if (!other) {
+          db.prepare(`UPDATE pk_pack_slips SET status='pending', hold_reason=NULL
+            WHERE batch_id=? AND seq=? AND status='held' AND hold_reason='repick'`)
+            .run(t.batch_id, t.slip_seq);
+        }
+      }
+    }
+    db.prepare("UPDATE pk_later_requests SET status='cancelled', updated_at=? WHERE id=?")
+      .run(now, lr.id);
+    // タスクは依頼と1対1なので、兄弟依頼 (別ロケ明細由来) のタスクには触らない
+  }
+  db.prepare('DELETE FROM pk_shortage_allocations WHERE batch_id=? AND line_seq=?')
+    .run(batchId, lineSeq);
+}
+
+/**
+ * 欠品の残り (remQty) を受注に配賦する (欠品フローv2 PR2・要件§4.4)。
+ * ルール (Q2既定) = **ピッキング順の後ろの受注から不足扱い** (先に取れた分は前の受注へ)。
+ * 受注の順序 = pk_slip_lines の登録順 (CSV = 納品書順) → 後ろ = id の降順。
+ * 同一明細の再欠品 (back後のやり直し) で二重にならないよう、必ず作り直す。
+ */
+function recordShortageAllocations(db, batch, line, lineSeq, { remQty, rem, worker }, now) {
+  db.prepare('DELETE FROM pk_shortage_allocations WHERE batch_id=? AND line_seq=?').run(batch.id, lineSeq);
+  if (rem == null || remQty <= 0) return;
+  // 受注単位に集約する (同一受注に同じSKUの行が複数あると、行ごとに控除が重複して
+  //   本来使える数量まで「使用済み」に見える — Codex Medium)。順序は最後に出た行で決める
+  const slipRows = db.prepare(`SELECT ne_slip_no, SUM(qty) AS qty, MAX(id) AS last_id FROM pk_slip_lines
+    WHERE batch_id=? AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND ne_slip_no IS NOT NULL
+    GROUP BY ne_slip_no ORDER BY last_id DESC`).all(batch.id, line.sku);
+  // 🚨 同一SKUが複数ロケ (複数の pk_lines) にある場合、別の明細の欠品が既に同じ受注へ
+  //    配賦していることがある。控除しないと「注文1個に欠品2個」を作る (Codex High)
+  const taken = new Map();
+  for (const r of db.prepare(`SELECT ne_slip_no, SUM(qty) AS q FROM pk_shortage_allocations
+      WHERE batch_id=? AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND line_seq != ?
+      GROUP BY ne_slip_no`).all(batch.id, line.sku, lineSeq)) {
+    taken.set(r.ne_slip_no, r.q);
+  }
+  const ins = db.prepare(`INSERT INTO pk_shortage_allocations
+    (batch_id, line_seq, sku, ne_slip_no, qty, kind, created_at) VALUES (?,?,?,?,?,?,?)`);
+  let left = remQty;
+  for (const r of slipRows) {
+    if (left <= 0) break;
+    const avail = r.qty - (taken.get(r.ne_slip_no) || 0);
+    if (avail <= 0) continue;
+    const take = Math.min(left, avail);
+    ins.run(batch.id, lineSeq, line.sku, r.ne_slip_no, take, rem, now);
+    left -= take;
+  }
+  if (left > 0) {
+    // 受注に結べない残り (伝票明細の欠けた旧データ等)。欠品自体の記録はサマリが持つ
+    console.warn(`[picking] 欠品の配賦が ${left}個ぶん受注に結べません (batch=${batch.id} seq=${lineSeq} ${line.sku})`);
+  }
+  if (rem === 'later') {
+    db.prepare(`INSERT INTO pk_later_requests
+      (batch_id, line_seq, sku, product_name, qty, from_block, from_location, requested_by, status, created_at, updated_at)
+      VALUES (?,?,?,?,?,?,?,?, 'pending_binding', ?, ?)`)
+      .run(batch.id, lineSeq, line.sku, line.product_name || null, remQty,
+        line.block || null, line.location || null, worker, now, now);
+  }
+}
+
+/** 通知・画面用: その明細の配賦先 (受注×数量)。テーブル未作成環境では空。 */
+export function listShortageAllocations(batchId, lineSeq) {
+  try {
+    return getDB().prepare(`SELECT ne_slip_no, qty, kind FROM pk_shortage_allocations
+      WHERE batch_id=? AND line_seq=? ORDER BY id`).all(batchId, lineSeq);
+  } catch { return []; }
+}
+
+/**
+ * 「後で取りに行く」依頼を、取込済みの梱包バッチへ展開する (欠品フローv2 PR2・要件§4.3)。
+ * 展開 = 配賦先の伝票ごとに pk_pack_tasks(kind='repick') を作り、伝票を保留にする。
+ * その先は**既存の再ピック機構がそのまま動く**:
+ *   reconcileRepickBatches ② がタスクから「🕒後で取りに行く」1行バッチをピッキング一覧に出し、
+ *   完了→梱包ヘッダー緑バナー→「受け取った」で伝票の保留が解ける。
+ * 呼び出し: 欠品直後 (router)・picking一覧表示 (reconcile)・packingポーラー。冪等。
+ */
+export function bindPendingLaterRequests() {
+  const db = getDB();
+  let pend = [];
+  try {
+    pend = db.prepare(`SELECT lr.*, b.tb_no FROM pk_later_requests lr
+      JOIN pk_batches b ON b.id = lr.batch_id
+      WHERE lr.status = 'pending_binding'`).all();
+  } catch { return 0; }   // v11未適用環境
+  let bound = 0;
+  const now = utcNow();
+  for (const lr of pend) {
+    try { if (bindLaterRequest(db, lr, now)) bound++; }
+    catch (e) { console.warn(`[picking] later依頼の展開失敗 (id=${lr.id}): ${e.message}`); }
+  }
+  return bound;
+}
+
+function bindLaterRequest(db, lr, now) {
+  return db.transaction(() => {
+    // 並行呼び出し (一覧表示とポーラー) の二重展開ガード
+    const cur = db.prepare('SELECT status FROM pk_later_requests WHERE id=?').get(lr.id);
+    if (!cur || cur.status !== 'pending_binding') return false;
+    const pb = db.prepare(`SELECT * FROM pk_pack_batches
+      WHERE tb_key=? AND status != 'cancelled' ORDER BY id DESC LIMIT 1`).get(lr.tb_no);
+    if (!pb) return false;   // 梱包が未取込 — 次回の呼び出しで追いつく
+    const allocs = db.prepare(`SELECT ne_slip_no, SUM(qty) AS qty FROM pk_shortage_allocations
+      WHERE batch_id=? AND line_seq=? AND kind='later' GROUP BY ne_slip_no`).all(lr.batch_id, lr.line_seq);
+    const insTask = db.prepare(`INSERT INTO pk_pack_tasks
+      (batch_id, slip_seq, kind, sku, product_name, req_qty, location, block, folder_name,
+       status, requested_by, later_request_id, created_at, updated_at)
+      VALUES (?, ?, 'repick', ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?, ?)`);
+    let covered = 0;
+    const mergedTaskIds = new Set();
+    for (const a of allocs) {
+      const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND ne_slip_no=?')
+        .get(pb.id, a.ne_slip_no);
+      // 伝票が見つからない → 伝票なしタスク側へ回す (下)。
+      // 🚨 完了済み (done) は**保留へ戻す**対象 — bind より先に梱包が完了していた場合、
+      //    そのまま出荷すると商品が足りない箱が出る (Codex High)。
+      //    梱包側の「不足かも？」も done 伝票を held に戻す仕様で、これと同じ扱い
+      // 🚨 別の理由で保留中 (配送方法変更 shipping_change 等) の伝票は触らない。
+      //    hold_reason を repick に書き換えると、受領時に pending へ戻って元の保留を迂回する
+      //    (Codex High)。その分は伝票なしタスクへ回す (取りには行く)
+      const bindable = ['pending', 'done'].includes(slip?.status)
+        || (slip?.status === 'held' && slip.hold_reason === 'repick');
+      if (!slip || !bindable) continue;
+      // 同じ伝票×SKUの生きた repick が既にあれば (梱包側が先に「不足かも？」を出した等)、
+      // それは同一の物理不足なので合流する — ただし**数量で**判断する (Codex High)。
+      // 既存が1個・今回3個なら差分2個のタスクを作る。1個で伝票を解除できてしまうのを防ぐ。
+      // 二重に同数を作ると1行バッチが2本出て同じ商品を二度取りに行くので、差分だけ
+      // ⭐タスクは依頼ごとに1対1 (later_request_id で出自を持つ)。
+      //   配賦の段階で「受注の注文数を超えない」ことは保証済み (recordShortageAllocations の
+      //   taken 控除) なので、別ロケ由来の依頼どうしが同じ伝票へ配賦していても数量は重ならない。
+      //   → 各依頼は自分の配賦ぶんだけ作ればよく、兄弟依頼のタスクを「既にある」と見なさない
+      //     (見なすと後続の数量が落ちる・back の着手判定が出自とズレる・received 後に二重に
+      //      取りに行く — Codex R4/R5)
+      const own = db.prepare(`SELECT COALESCE(SUM(req_qty), 0) AS q FROM pk_pack_tasks
+        WHERE later_request_id=? AND slip_seq=? AND status != 'cancelled'`).get(lr.id, slip.seq).q;
+      // 梱包側が自分で出した再ピック (later_request_id IS NULL) と同じ伝票×SKU = 同一の物理不足。
+      // 二重に取りに行かないよう、**最初に展開する依頼だけ**がその数量ぶんを合流 (差し引く)。
+      // 2件目以降の依頼は差し引かない (余分に取りに行く側に倒す。余りは棚へ戻せる)
+      // 「先に展開済みの兄弟依頼」は**タスクの有無ではなく依頼の記録**で見る。
+      // 1件目が梱包側タスクに全量吸収されるとタスクが残らず、2件目も同じ数量を差し引いて
+      // 合計が足りなくなる (Codex R6)。展開済み = pk_later_requests.status='requested' で、
+      // 同じ受注へ配賦しているもの
+      const siblingBound = db.prepare(`SELECT 1 FROM pk_later_requests r
+        JOIN pk_shortage_allocations al
+          ON al.batch_id = r.batch_id AND al.line_seq = r.line_seq AND al.kind = 'later'
+        WHERE r.batch_id=? AND r.id != ? AND r.status = 'requested'
+          AND LOWER(TRIM(r.sku))=LOWER(TRIM(?)) AND al.ne_slip_no=?`)
+        .get(lr.batch_id, lr.id, lr.sku, a.ne_slip_no);
+      const packerTasks = siblingBound ? [] : db.prepare(`SELECT id, req_qty, status FROM pk_pack_tasks
+        WHERE batch_id=? AND kind='repick' AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND slip_seq=?
+          AND later_request_id IS NULL AND status IN ('requested','claimed','fulfilled') ORDER BY id`)
+        .all(pb.id, lr.sku, slip.seq);
+      const packerQty = packerTasks.reduce((s, t) => s + t.req_qty, 0);
+      const merged = Math.min(a.qty, packerQty);
+      // 合流した先を依頼に記録する — 合流先が着手済みなら back を拒否するため (Codex R7)。
+      // 全量合流だと自前のタスクが残らず、back の判定材料がこれしか無い。
+      // ⭐記録するのは合流数量ぶんに達するまでのタスクだけ。未着手 (requested) を優先して
+      //   割り当てる — 賄えるのに着手済みのタスクまで記録すると back/再取込が恒久的に 409 になる (Codex R9)
+      let remain = merged;
+      const ordered = [...packerTasks].sort((x, y) =>
+        ((x.status === 'requested' ? 0 : 1) - (y.status === 'requested' ? 0 : 1)) || (x.id - y.id));
+      for (const t of ordered) {
+        if (remain <= 0) break;
+        mergedTaskIds.add(t.id);
+        remain -= t.req_qty;
+      }
+      const need = a.qty - own - merged;
+      if (need > 0) {
+        insTask.run(pb.id, slip.seq, lr.sku, lr.product_name, need,
+          lr.from_location || null, lr.from_block || null, pb.folder_name, lr.requested_by, lr.id, now, now);
+      }
+      // 商品が無いまま梱包を完了できないよう保留に (done は done_at=NULL で戻す・held は不変)
+      db.prepare(`UPDATE pk_pack_slips SET status='held', hold_reason='repick', done_at=NULL WHERE id=?`)
+        .run(slip.id);
+      // 合流した既存タスクは back で取り消さない (依頼主が別のため) — 意図的
+      covered += a.qty;
+    }
+    if (covered < lr.qty) {
+      // 受注に結べない残り。取りに行くこと自体は必要なので、伝票なしのタスクで一覧に出す。
+      // 重複判定は**この依頼由来**の伝票なしタスクに限る (別の明細の依頼は別の物理不足)
+      const existingLoose = db.prepare(`SELECT COALESCE(SUM(req_qty), 0) AS q FROM pk_pack_tasks
+        WHERE batch_id=? AND kind='repick' AND slip_seq IS NULL AND later_request_id=?
+          AND status != 'cancelled'`).get(pb.id, lr.id).q;
+      const need = (lr.qty - covered) - existingLoose;
+      if (need > 0) {
+        insTask.run(pb.id, null, lr.sku, lr.product_name, need,
+          lr.from_location || null, lr.from_block || null, pb.folder_name, lr.requested_by, lr.id, now, now);
+      }
+    }
+    db.prepare("UPDATE pk_later_requests SET status='requested', merged_task_ids=?, updated_at=? WHERE id=?")
+      .run(mergedTaskIds.size ? [...mergedTaskIds].join(',') : null, now, lr.id);
+    return true;
+  })();
+}
+
+/**
+ * 梱包バッチの再取込 (overwrite) 前処理: このバッチへ展開済みの「後で取りに行く」を
+ * 依頼 (pending_binding) へ戻す (欠品フローv2 PR2・Codex High)。
+ *
+ * タスクの slip_seq は再取込で**別のお客さまの伝票**を指し得る不安定な参照。
+ * 展開済みタスクを残したまま伝票を作り直すと、無関係の伝票が保留/解除される。
+ * → 未着手タスクを取消して依頼へ戻し、再取込後に bindPendingLaterRequests が
+ *   新しい伝票に対して展開し直す (伝票の保留は overwrite が全削除→再作成するので触らない)。
+ * 🚨 ピッカーが既に動いている (claimed/fulfilled) 分があれば e.code='later_in_progress' を
+ *   投げて**再取込側を止める** (取りに行った商品の行き先が消えるため)。
+ * packing importPackBatch のトランザクション内から呼ばれる (同一 SQLite)。
+ */
+export function resetLaterBindingsForPackBatch(db, packBatchId) {
+  // 起点は**依頼** (タスクではなく)。全量合流した依頼は自前のタスクを持たないので、
+  // タスク起点だと見落として合流先が着手中でも再取込が通る (Codex R8)
+  let lrs = [];
+  try {
+    lrs = db.prepare(`SELECT r.* FROM pk_later_requests r
+      JOIN pk_batches b ON b.id = r.batch_id
+      JOIN pk_pack_batches pb ON pb.tb_key = b.tb_no
+      WHERE pb.id = ? AND r.status = 'requested'`).all(packBatchId);
+  } catch { return 0; }   // v11/v16未適用環境
+  if (lrs.length === 0) return 0;
+  const ids = lrs.map((r) => r.id);
+  const ph = ids.map(() => '?').join(',');
+  // 自前タスク: cancelled 以外は全部 — unavailable (梱包開始前でもピッカーが「在庫なし」にできる) や
+  // received も、古い slip_seq を抱えたまま残るので再取込の妨げになる
+  const own = db.prepare(`SELECT * FROM pk_pack_tasks
+    WHERE later_request_id IN (${ph}) AND status != 'cancelled'`).all(...ids);
+  // 合流先 (梱包側の再ピック) の着手も同じ扱い
+  const mergedIds = [...new Set(lrs.flatMap((r) => String(r.merged_task_ids || '').split(',')
+    .map((x) => Number(x)).filter((x) => x > 0)))];
+  const mergedBusy = mergedIds.length === 0 ? [] : db.prepare(`SELECT * FROM pk_pack_tasks
+    WHERE id IN (${mergedIds.map(() => '?').join(',')}) AND status NOT IN ('requested','cancelled')`).all(...mergedIds);
+  const busy = [...own.filter((t) => t.status !== 'requested'), ...mergedBusy];
+  if (busy.length > 0) {
+    const e = new Error(`「後で取りに行く」の対応が始まっています (${[...new Set(busy.map((t) => t.sku))].join(', ')})。完了 (受け取った) まで進めてから再取込してください`);
+    e.code = 'later_in_progress';
+    throw e;
+  }
+  const now = utcNow();
+  for (const t of own) {
+    db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=? AND status='requested'")
+      .run(now, t.id);
+  }
+  // 依頼を展開前に戻す。合流の記録も消す (再取込後の伝票に対して判断し直すため)
+  db.prepare(`UPDATE pk_later_requests SET status='pending_binding', merged_task_ids=NULL, updated_at=?
+    WHERE id IN (${ph}) AND status='requested'`).run(now, ...ids);
+  return lrs.length;
+}
+
 export function createRepickBatch(task) {
   const db = getDB();
   const now = utcNow();
@@ -1145,6 +1445,9 @@ export function createRepickBatch(task) {
  */
 export function reconcileRepickBatches() {
   const db = getDB();
+  // 「後で取りに行く」依頼の展開 (欠品時に梱包が未取込だった分の追いつき)。
+  // 展開されたタスクは直後の②で「🕒後で取りに行く」1行バッチになる
+  try { bindPendingLaterRequests(); } catch { /* fail-soft */ }
   try {
     // ①梱包側で取消されたタスクのバッチを畳む
     const rows = db.prepare(`
@@ -1239,39 +1542,131 @@ export function ackFloorAlert(id, worker, direction) {
  * 期間内のミス集計 (作業者×種別)。
  * @returns {{ byWorker: [{worker,total,shortage,excess,wrong_item,qty}], total: {...} }}
  */
+/**
+ * 期間内のミス集計 (作業者×種別) — **件数より比率** (中原さん指示 2026-08-31)。
+ *
+ * - 分母 = その作業者が期間内にピッキングした明細数 (完了バッチの明細。欠品で止めた明細も含む。
+ *   外れ値除外はしない = 速さ統計と違い「やった量」なので全部数える)
+ * - 比率 = 1,000 明細あたりのミス件数 (per1000)。分母が minLines 未満は参考値 (provisional)
+ * - **時間軸と帰属は分母と同じ規則** (Codex R1 High×2):
+ *     日付 = そのミスが出たピッキングバッチの work_date (梱包で見つかった日ではない)。
+ *     作業者 = その SKU の明細を実際にピッキングした人 (pk_events の最後の next/shortage の担当。交代しても
+ *     交代前の明細は前任者に付く — loadStatsLines と同じ)。ピッキングバッチを引けないときだけ
+ *     確定時の attributed_worker / created_at の JST 日付にフォールバック
+ * - 🚨 **欠品とミスは別物**: 梱包で「不足」として確定したものでも、
+ *     (a) ピッキング側でその受注×SKU が欠品 (他ロケにも無く「後で取りに行く」/「どこにもない」 = pk_shortage_allocations)、
+ *     (b) 配賦記録を持たない古いバッチ (2026-08-31 以前) で、同じバッチの同 SKU が欠品 (残りあり) だった
+ *   なら、棚に無かったのであってピッカーの取り忘れではない → `stockout` として数え、ミスから除く
+ *
+ * @returns {{ since, until, minLines,
+ *   byWorker: [{worker, name, lines, total, shortage, excess, wrong_item, qty, stockout, per1000, provisional}],
+ *   total: {lines, total, shortage, excess, wrong_item, qty, stockout, per1000} }}
+ */
+/** ミス率の分母: 期間内の完了バッチ (有効・再ピック以外) の**全明細** — 速さ統計と違い、表示/完了時刻が
+ *  無い明細も数える (Codex R5: loadStatsLines は時刻のある明細だけなので分母が小さくなりミス率が過大になる)。
+ *  作業者の帰属は loadStatsLines と同じ (その明細の最後の next/shortage の担当 → 無ければバッチ担当)。 */
+function loadMissDenominator(since, until) {
+  return getDB().prepare(`
+    SELECT COALESCE(
+        (SELECT e.worker FROM pk_events e
+          WHERE e.batch_id = l.batch_id AND e.line_seq = l.seq AND e.event IN ('next','shortage')
+          ORDER BY e.id DESC LIMIT 1),
+        b.worker
+      ) AS worker, COUNT(*) AS n
+    FROM pk_lines l
+    JOIN pk_batches b ON b.id = l.batch_id
+    WHERE b.work_date >= ? AND b.work_date <= ?
+      AND b.validity = 'valid' AND b.status = 'done' AND b.origin != 'repick'
+    GROUP BY worker
+  `).all(since, until);
+}
+
 export function getMissStats({ until = jstToday(), days = STATS_WINDOW_DAYS } = {}) {
   const db = getDB();
-  const since = new Date(Date.parse(`${until}T00:00:00Z`) - (days - 1) * 864e5).toISOString().slice(0, 10);
-  // created_at は UTC → JST日付境界に変換して窓を切る (統計画面と同じ期間感覚)
-  const startUtc = new Date(`${since}T00:00:00+09:00`).toISOString().slice(0, 19) + 'Z';
-  const endUtc = new Date(new Date(`${until}T00:00:00+09:00`).getTime() + 864e5).toISOString().slice(0, 19) + 'Z';
-  const empty = { total: 0, shortage: 0, excess: 0, wrong_item: 0, qty: 0 };
+  const { since, until: to } = statsRange(until, days);
+  const empty = () => ({ lines: 0, total: 0, shortage: 0, excess: 0, wrong_item: 0, qty: 0, stockout: 0, per1000: null });
+  const map = new Map();
+  const ensure = (worker) => {
+    if (!map.has(worker)) map.set(worker, { worker, name: displayWorkerName(worker), ...empty() });
+    return map.get(worker);
+  };
+  // 分母: 期間内にピッキングした明細数 (作業者は明細単位の帰属 = 速さ統計と同じ。時刻の無い明細も含む)
+  for (const r of loadMissDenominator(since, to)) ensure(r.worker || '(不明)').lines += r.n;
+
+  // 確定ミスを、対応するピッキングバッチ (取込時の突合 pk_batch_id を優先。無ければ tb_no = tb_key の有効な最新・
+  // 再ピックバッチは除く — 同じ tb_no の再取込で別バッチへ誤帰属しないため Codex R4) と受注番号つきで読む。
+  // packing のテーブルが無い環境 (picking 単独) では incident だけ読む
+  let rows = [];
   try {
-    const rows = db.prepare(`
-      SELECT COALESCE(attributed_worker, '(担当不明)') AS worker, kind, COUNT(*) AS cnt, SUM(qty) AS qty
-      FROM pk_pack_incidents
-      WHERE status = 'confirmed' AND created_at >= ? AND created_at < ?
-      GROUP BY worker, kind
-    `).all(startUtc, endUtc);
-    const map = new Map();
-    const total = { ...empty };
-    for (const r of rows) {
-      if (!map.has(r.worker)) map.set(r.worker, { worker: r.worker, ...empty });
-      const w = map.get(r.worker);
-      w[r.kind] = (w[r.kind] || 0) + r.cnt;
-      w.total += r.cnt;
-      w.qty += r.qty || 0;
-      total[r.kind] = (total[r.kind] || 0) + r.cnt;
-      total.total += r.cnt;
-      total.qty += r.qty || 0;
-    }
-    return { since, until, byWorker: [...map.values()].sort((a, b) => b.total - a.total), total };
+    rows = db.prepare(`
+      SELECT i.id, i.kind, i.qty, i.sku, i.attributed_worker, i.created_at,
+        COALESCE(pb.pk_batch_id,
+          (SELECT b.id FROM pk_batches b WHERE b.tb_no = pb.tb_key AND b.origin != 'repick' AND b.validity = 'valid'
+             ORDER BY b.id DESC LIMIT 1)) AS pk_batch_id,
+        s.ne_slip_no
+      FROM pk_pack_incidents i
+      LEFT JOIN pk_pack_batches pb ON pb.id = i.batch_id
+      LEFT JOIN pk_pack_slips s ON s.batch_id = i.batch_id AND s.seq = i.slip_seq
+      WHERE i.status = 'confirmed'
+      ORDER BY i.id
+    `).all();
   } catch (e) {
-    // テーブル未作成 (packing未初期化環境) のみ空扱い。それ以外のDB障害は隠さず投げる
-    // (Codex: 包括catchだと障害時に「ミス0件」という誤った正常値を表示してしまう)
     if (/no such table: pk_pack_incidents/.test(String(e.message))) {
-      return { since, until, byWorker: [], total: empty };
+      rows = [];
+    } else if (/no such table/.test(String(e.message))) {
+      rows = db.prepare(`SELECT id, kind, qty, sku, attributed_worker, created_at, NULL AS pk_batch_id, NULL AS ne_slip_no
+        FROM pk_pack_incidents WHERE status = 'confirmed' ORDER BY id`).all();
+    } else {
+      throw e;   // それ以外のDB障害は隠さず投げる (Codex: 「ミス0件」という誤った正常値を出さない)
     }
-    throw e;
   }
+  const qBatch = db.prepare('SELECT work_date, worker FROM pk_batches WHERE id = ?');
+  const qLineWorker = db.prepare(`
+    SELECT e.worker FROM pk_events e
+    JOIN pk_lines l ON l.batch_id = e.batch_id AND l.seq = e.line_seq
+    WHERE l.batch_id = ? AND LOWER(TRIM(l.sku)) = ? AND e.event IN ('next','shortage')
+    ORDER BY e.id DESC LIMIT 1`);
+  const qAlloc = db.prepare(`SELECT 1 FROM pk_shortage_allocations
+    WHERE batch_id = ? AND ne_slip_no = ? AND LOWER(TRIM(sku)) = ? LIMIT 1`);
+  const qAnyAlloc = db.prepare('SELECT 1 FROM pk_shortage_allocations WHERE batch_id = ? LIMIT 1');
+  const qShortLine = db.prepare(`SELECT 1 FROM pk_lines
+    WHERE batch_id = ? AND LOWER(TRIM(sku)) = ? AND status = 'shortage' AND COALESCE(remaining_qty, shortage_qty, 0) > 0 LIMIT 1`);
+  const jstDateOf = (iso) => new Date(Date.parse(iso) + 9 * 3600 * 1000).toISOString().slice(0, 10);
+
+  const total = empty();
+  for (const r of rows) {
+    const skuN = String(r.sku ?? '').trim().toLowerCase();
+    const pb = r.pk_batch_id != null ? qBatch.get(r.pk_batch_id) : null;
+    const day = pb?.work_date ?? jstDateOf(r.created_at);
+    if (day < since || day > to) continue;
+    let worker = null;
+    let stockout = false;
+    if (pb) {
+      worker = qLineWorker.get(r.pk_batch_id, skuN)?.worker ?? pb.worker ?? null;
+      if (r.kind === 'shortage') {
+        stockout = (r.ne_slip_no != null && qAlloc.get(r.pk_batch_id, r.ne_slip_no, skuN) != null)
+          || (qAnyAlloc.get(r.pk_batch_id) == null && qShortLine.get(r.pk_batch_id, skuN) != null);
+      }
+    }
+    const w = ensure(worker ?? r.attributed_worker ?? '(担当不明)');
+    if (stockout) { w.stockout++; total.stockout++; continue; }   // 欠品 = ミスではない
+    w[r.kind] = (w[r.kind] || 0) + 1;
+    w.total++;
+    w.qty += r.qty || 0;
+    total[r.kind] = (total[r.kind] || 0) + 1;
+    total.total++;
+    total.qty += r.qty || 0;
+  }
+  for (const w of map.values()) {
+    total.lines += w.lines;
+    w.per1000 = w.lines > 0 ? Math.round((w.total / w.lines) * 10000) / 10 : null;
+    w.provisional = w.lines < STATS_MIN_LINES;
+  }
+  total.per1000 = total.lines > 0 ? Math.round((total.total / total.lines) * 10000) / 10 : null;
+  // 並び = 比率の高い順 (分母ゼロは後ろ・件数順)。同率は件数順
+  const byWorker = [...map.values()].sort((a, b) => {
+    if ((b.per1000 ?? -1) !== (a.per1000 ?? -1)) return (b.per1000 ?? -1) - (a.per1000 ?? -1);
+    return b.total - a.total;
+  });
+  return { since, until: to, minLines: STATS_MIN_LINES, byWorker, total };
 }

@@ -16,7 +16,8 @@
  * 定期実行の台帳: config/jobs-registry.mjs の packing-drive-poller を参照。
  */
 import { getDB, utcNow } from './db.js';
-import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured } from './notify.js';
+import { notifyShipChange, notifyReprint, postMaterialText, materialWebhookConfigured, postReprintText } from './notify.js';
+import { sweepPrintJobs, pendingAlerts, markAlerted, alertTextFor } from './print-queue.js';
 import { materialNotifyStep, purgeOldViews } from './materials.js';
 import { cleanupReprintPdfs } from './reprint-pdf.js';
 import { parseCs03003, importPackBatch, checkPickingMatch, isStaleSagyoDate, PackError } from './service.js';
@@ -180,6 +181,40 @@ async function pingJobsMonitor(fetchFn = fetch) {
 }
 
 /**
+ * 🖨 出荷PCの印刷エージェントの生存を jobs-monitor へ中継する (台帳 id=slip-print-agent)。
+ *
+ * ⭐ping を**エージェント自身に打たせない**のは、出荷PCへ JOBS_MONITOR_TOKEN をもう1つ
+ *   配らずに済ませるため。エージェントの生存は heartbeat_at として既に miniPC が持っている。
+ * ⭐エージェントが一度も登録されていない間は ping しない (まだ導入していないものを
+ *   「止まっている」と鳴らさない)。登録後に途切れたら台帳の max_age_hours で検知される。
+ */
+const AGENT_ALIVE_MS = 10 * 60 * 1000;   // heartbeat 45秒間隔の十数倍
+let _lastAgentPingAt = 0;
+async function pingPrintAgentAlive(fetchFn = fetch) {
+  const token = process.env.JOBS_MONITOR_TOKEN;
+  if (!token) return;
+  if (Date.now() - _lastAgentPingAt < PING_THROTTLE_MS) return;
+  let alive = null;
+  try {
+    alive = getDB().prepare(`SELECT label, heartbeat_at FROM pk_pack_devices
+      WHERE kind='agent' AND revoked_at IS NULL AND heartbeat_at IS NOT NULL
+      ORDER BY heartbeat_at DESC LIMIT 1`).get();
+  } catch { return; }
+  if (!alive) return;                                        // 未導入 → 監視対象にしない
+  if (Date.now() - Date.parse(alive.heartbeat_at) > AGENT_ALIVE_MS) return;   // 途切れている
+  try {
+    const base = (process.env.JOBS_MONITOR_URL || 'https://bfaith-portal.onrender.com').replace(/\/+$/, '');
+    const res = await fetchFn(`${base}/apps/jobs-monitor/ping/slip-print-agent?status=ok`, {
+      method: 'POST', headers: { authorization: `Bearer ${token}` },
+    });
+    if (res.ok) _lastAgentPingAt = Date.now();
+    else console.warn(`[packing-drive-poller] 印刷エージェントの生存ping失敗: HTTP ${res.status}`);
+  } catch (e) {
+    console.warn(`[packing-drive-poller] 印刷エージェントの生存ping失敗: ${e.message}`);
+  }
+}
+
+/**
  * ④通知の再送 (直近2日・未通知のみ・1周期3件まで)。
  * 事務キュー廃止後の配送保証 (Codexレビュー high) — DBの行が正本で、通知はここで追いつく
  */
@@ -200,8 +235,11 @@ async function retryShipChangeNotify() {
         FROM pk_pack_lines l JOIN pk_pack_slips s ON s.id = l.slip_id
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(row.batch_id, row.slip_seq);
+      // ⭐初回送信 (router) と同じ内容にする — 片方だけ直すと再送で番号が落ちる
+      const slipNo = db.prepare('SELECT slip_no FROM pk_pack_slips WHERE batch_id=? AND seq=?')
+        .get(row.batch_id, row.slip_seq)?.slip_no ?? null;
       const sent = await notifyShipChange({
-        folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+        folderName: row.folder_name, neSlipNo: row.ne_slip_no, slipNo,
         currentMethod: row.current_method, proposedMethod: row.proposed_method,
         reason: `${row.reason} (再送)`, worker: row.requested_by, lines,
       });
@@ -252,6 +290,30 @@ async function retryReprintNotify() {
   }
 }
 
+/**
+ * 🖨 印刷キューの滞留・結果不明を GChat に知らせる (要件§6.3 dead-man)。
+ * **出てこないときに誰も気づかない状態を作らない**のがこの機能の存在理由なので、
+ * ここが落ちてもポーラー全体は止めない (fail-soft) が、失敗はログに残す。
+ */
+async function sweepPrintJobsStep() {
+  try {
+    sweepPrintJobs();   // 進まなくなったジョブを安全な状態へ (manual / unknown)
+  } catch (e) {
+    console.warn(`[packing-drive-poller] 印刷キューの整理に失敗: ${e.message}`);
+  }
+  // 通知は**送れたときだけ**「通知済み」にする。送信前に印を付けると、webhook が落ちていた
+  // 分が永久に鳴らなくなる。1件の失敗で後続を止めないよう、ジョブごとに握る
+  for (const job of pendingAlerts()) {
+    try {
+      const text = alertTextFor(job);
+      if (!text) continue;
+      if (await postReprintText(text)) markAlerted(job.id, job.state);
+    } catch (e) {
+      console.warn(`[packing-drive-poller] 印刷結果の通知に失敗 (${job.ne_slip_no}): ${e.message}`);
+    }
+  }
+}
+
 export function getPollerStatus() {
   return { ..._status, intervalSec: POLL_INTERVAL_MS / 1000 };
 }
@@ -273,7 +335,13 @@ export function startPackingDrivePoller() {
       await materialNotifyStep(materialWebhookConfigured() ? postMaterialText : null);
       purgeOldViews();   // 表示観測ログの180日 purge (要件§7)
       cleanupReprintPdfs();
+      await sweepPrintJobsStep();
+      // ピッキング「後で取りに行く」依頼を取込済みバッチへ展開 (欠品フローv2 PR2・fail-soft)。
+      // 欠品はピッキング中 = 梱包CSVの取込前が普通なので、取込後のここで追いつくのが主経路
+      try { (await import('../picking/service.js')).bindPendingLaterRequests(); }
+      catch { /* picking無効環境では何もしない */ }
       await pingJobsMonitor();
+      await pingPrintAgentAlive();
     } catch (e) {
       _status.lastError = String(e.message).slice(0, 300);
       console.warn(`[packing-drive-poller] ポーリング失敗: ${e.message}`);

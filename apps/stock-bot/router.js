@@ -14,6 +14,7 @@
  * セットアップ手順 = 同ディレクトリ README.md
  */
 import { Router } from 'express';
+import { parseYahooReauthCommand, handleYahooReauth } from './yahoo-reauth.js';
 import { OAuth2Client } from 'google-auth-library';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { buildStockLocationsText } from '../picking/stock-locations.js';
@@ -258,6 +259,10 @@ export function handleChatEvent(event, db, now = new Date()) {
   if (type === 'MESSAGE') {
     const q = messageQuery(event.message);
     if (!q) return { text: USAGE };
+    // Yahoo OAuth 再認可 (yahoo-reauth.js)。「yahoo再認可」/ リダイレクト URL (code=…) の貼り付けを商品検索より先に拾う。
+    // 権限は env (YAHOO_REAUTH_USERS) で fail-closed。非同期 = Promise を返す (router 側は Promise.resolve で await 済み)
+    const reauthCmd = parseYahooReauthCommand(q);
+    if (reauthCmd) return handleYahooReauth(reauthCmd, { email: event.user?.email });
     // 1文字検索は候補が広すぎ+全表LIKE走査の無駄撃ちなので案内を返す
     if (q.length < 2) return { text: `キーワードは2文字以上で送ってください。${USAGE}` };
     const found = searchProducts(db, q);

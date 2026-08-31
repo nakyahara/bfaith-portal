@@ -1,0 +1,91 @@
+/* 新商品企画スカウト — ポータル共通 style.css の上に載せる差分だけ */
+
+.ps-main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+
+/* ① 信号 — 5秒で状態が分かること。色と一行の文で言い切る */
+.ps-signal { display: flex; gap: 14px; align-items: flex-start;
+  border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; border: 1px solid #ddd; background: #fff; }
+.ps-signal-green  { background: #eef9f0; border-color: #b7e0c0; }
+.ps-signal-yellow { background: #fff8e6; border-color: #f0dca0; }
+.ps-signal-red    { background: #fdecec; border-color: #f0b4b4; }
+.ps-signal-mark { font-size: 30px; line-height: 1; }
+.ps-signal-title { font-size: 18px; font-weight: 700; }
+.ps-signal-detail { margin-top: 4px; color: #444; }
+.ps-signal-meta { margin-top: 6px; font-size: 12px; color: #777; }
+
+.ps-card { background: #fff; border: 1px solid #e2e2e2; border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; }
+.ps-card h2 { margin: 0 0 12px; font-size: 16px; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.ps-counts { font-size: 12px; font-weight: 400; color: #666; }
+
+/* 表は狭い画面で横に溢れるので、表だけ横スクロールさせる */
+.ps-table { width: 100%; border-collapse: collapse; font-size: 13px; display: block; overflow-x: auto; }
+.ps-table th, .ps-table td { border-bottom: 1px solid #eee; padding: 7px 8px; text-align: left; white-space: nowrap; }
+.ps-table th { color: #666; font-weight: 600; }
+.ps-num { text-align: right; }
+.ps-empty { color: #888; padding: 12px 0; }
+
+.ps-bar { display: inline-block; width: 110px; height: 8px; background: #eee; border-radius: 4px; overflow: hidden; vertical-align: middle; }
+.ps-bar-fill { height: 100%; background: #4a90d9; }
+.ps-pct { margin-left: 6px; font-variant-numeric: tabular-nums; }
+
+.ps-badge { display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 10px; background: #eef1f4; color: #445; }
+.ps-badge-run { background: #dff0ff; color: #14608f; }
+.ps-badge-done { background: #e2f6e6; color: #1c6b30; }
+.ps-badge-wait { background: #fdf0d5; color: #7a5a10; }
+.ps-badge-ng { background: #fbe3e3; color: #8f2020; }
+.ps-badge-adopt { background: #1c6b30; color: #fff; }
+.ps-badge-reject { background: #8f2020; color: #fff; }
+.ps-badge-hold { background: #7a5a10; color: #fff; }
+
+.ps-ok { color: #1c6b30; }
+.ps-warn { color: #8f2020; }
+.ps-muted { color: #888; font-size: 12px; }
+
+.ps-filters { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; font-size: 12px; color: #666; }
+.ps-chip { padding: 3px 10px; border-radius: 12px; border: 1px solid #ddd; text-decoration: none; color: #333; background: #fafafa; }
+.ps-chip.on { background: #333; color: #fff; border-color: #333; }
+.ps-sep { width: 12px; }
+
+/* ③ テーマ1件 = 判断の単位。30〜60秒で読み切れる密度に抑える */
+.ps-concept { border: 1px solid #e6e6e6; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px; }
+.ps-concept.ps-just-decided { background: #f4faf5; }
+.ps-concept-head { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: center; }
+.ps-rank { color: #999; font-size: 12px; margin-right: 6px; }
+.ps-concept-name { font-weight: 700; font-size: 15px; }
+.ps-root { color: #888; font-size: 12px; margin-left: 8px; }
+.ps-gates { display: flex; gap: 5px; flex-wrap: wrap; }
+.ps-reason { color: #8f2020; font-size: 13px; margin: 8px 0 0; }
+
+.ps-metrics { display: flex; gap: 16px; flex-wrap: wrap; margin: 10px 0 6px; }
+.ps-metrics div { display: flex; flex-direction: column; }
+.ps-metrics b { font-size: 15px; font-variant-numeric: tabular-nums; }
+.ps-metrics span { font-size: 11px; color: #888; }
+
+.ps-form { font-size: 13px; margin: 4px 0 8px; }
+.ps-examples summary { cursor: pointer; font-size: 13px; color: #14608f; }
+.ps-examples ul { margin: 8px 0 0; padding-left: 18px; }
+.ps-examples li { font-size: 12px; margin-bottom: 5px; line-height: 1.5; }
+
+.ps-decided { background: #f6f6f6; border-radius: 6px; padding: 7px 10px; font-size: 13px; margin: 8px 0 0; }
+.ps-recheck { font-size: 12px; color: #555; margin: 4px 0 0; }
+
+.ps-decide { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.ps-decide select, .ps-decide input { padding: 5px 7px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px; }
+.ps-decide input[name=comment] { flex: 1 1 200px; }
+.ps-decide input[name=recheckCondition] { flex: 1 1 240px; }
+.ps-decide button { padding: 5px 14px; border: 0; border-radius: 5px; background: #333; color: #fff; cursor: pointer; font-size: 13px; }
+.ps-decide button:disabled { background: #999; cursor: default; }
+.ps-msg { font-size: 12px; color: #555; }
+
+@media (max-width: 640px) {
+  .ps-metrics { gap: 12px; }
+  .ps-decide input[name=comment], .ps-decide input[name=recheckCondition] { flex-basis: 100%; }
+}
+
+.ps-range { margin: -4px 0 10px; }
+.ps-pager { display: flex; gap: 12px; align-items: center; justify-content: center; padding: 12px 0 4px; }
+
+/* 自社が既にやっているテーマ。重複提案を止める最重要の1行なので目立たせる */
+.ps-own { background: #eef6ff; border-left: 3px solid #4a90d9; border-radius: 4px;
+  padding: 6px 10px; font-size: 13px; margin: 8px 0 0; }
+.ps-own-withdrawn { background: #fdf3ec; border-left-color: #c07a3a; }

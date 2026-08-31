@@ -184,6 +184,10 @@ const html2 = await ejs.renderFile(path.join(__dirname, '..', 'views', 'index.ej
   linkTypes: pl.LINK_TYPES, linkTypeLabels: pl.LINK_TYPE_LABELS, purposes: pl.PURPOSES, purposeLabels: pl.PURPOSE_LABELS, sourceLabels: pl.SOURCE_LABELS,
 });
 check('閲覧のみ描画 (追加ボタン無し)', !html2.includes('class="btn btn-sm add-toggle"') && !html2.includes('class="addbox"'));
+// 「商品登録ハブのカード」の遷移先は product-hub の実ルート /detail/:id (旧 /drafts/:id は Cannot GET になる)
+check('ハブのカードは /apps/product-hub/detail/:id へ',
+  html2.includes(`/apps/product-hub/detail/${Number(insSet.lastInsertRowid)}`) && !html2.includes('/apps/product-hub/drafts/'),
+  html2.includes('商品登録ハブのカード') ? 'リンク先が不正' : 'カードリンクが描画されていない');
 
 console.log(failed === 0 ? '\nALL PASS' : `\n${failed} FAILED`);
 process.exitCode = failed === 0 ? 0 : 1;

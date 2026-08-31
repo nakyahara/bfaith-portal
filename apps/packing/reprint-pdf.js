@@ -26,6 +26,15 @@ export const MANIFEST_NAME = 'AES送り状_並び替え済_manifest.json';
 export const SORTED_PDF_NAME = 'AES送り状_並び替え済.pdf';
 export const SORTER_ERROR_TXT = 'AES送り状_エラー.txt';
 
+// 🚨 manifest が「いまの納品書から作られたか」を照合するための、納品書ファイルの判定条件。
+// **並び替えツール側 (apps/aes-pdf-sorter/python/drive_worker.py の INVOICE_RE) と同一でなければ
+// ならない**。ここがズレると manifest に記録された納品書の集合と、いま数えた集合が永久に
+// 一致せず、manifest経路が一度も有効にならないまま位置推定に落ち続ける (2026-08-28 本番)。
+// 実際に踏んだズレ: 読み手が `納品書` の部分一致で数えたため `納品書_出荷_32.csv` まで拾い、
+// PDFだけを記録している並び替え側と件数が合わなかった。
+// 同期は tests/test-reprint-manifest.mjs が drive_worker.py を実読して検証する。
+export const INVOICE_PDF_RE = /^納品書_.*\.pdf$/i;
+
 // 白紙判定のしきい値 (manifest の ink_ratio = 低解像度描画の非白ピクセル率)。
 // 実データを見て調整できるよう env で上書き可能にするが、envの打ち間違いで安全境界が
 // 壊れないよう (0,1] の有限数に限る。範囲外・非数は既定値に戻す (Codexレビュー指摘1)
@@ -302,7 +311,10 @@ export async function extractReprintPdf({
       const pdf = await download(sortedPdfFile, 60 * 1024 * 1024);
       const mf = await download(manifestFile, 8 * 1024 * 1024);
       const manifest = JSON.parse(mf.buffer.toString('utf8'));
-      const invoices = await driveCall(() => listDriveFilesAcross({ folders, nameContains: '納品書' }));
+      // Drive の nameContains は部分一致なので `納品書_出荷_32.csv` 等も返る。
+      // 並び替え側が記録するのは納品書**PDF**だけなので、同じ条件まで絞ってから突き合わせる
+      const invoices = (await driveCall(() => listDriveFilesAcross({ folders, nameContains: '納品書' })))
+        .filter((f) => INVOICE_PDF_RE.test(f.filename));
       // エラーtxtは成功時にも「解消済み」で上書きされるので、中身まで見て失敗か解消かを判別する
       let errorTxt = null;
       if (errorTxtDup.length === 1) {
@@ -376,7 +388,44 @@ async function cutPage(srcBuffer, pageIndex, filename) {
   const token = crypto.randomBytes(16).toString('base64url');
   fs.mkdirSync(REPRINTS_DIR, { recursive: true });
   fs.writeFileSync(path.join(REPRINTS_DIR, `${token}.pdf`), bytes);
-  return { token, file: filename };
+  // sha256 は印刷キューが配信時に実物と突合するために返す (差し替わったPDFを刷らない)
+  return { token, file: filename, sha256: sha256(Buffer.from(bytes)) };
+}
+
+/**
+ * 出荷フォルダの引当分類 (= 送り状発行ソフトの振り分けキー) を読む。
+ *
+ * どのフォルダにも `okurijo_<slug>_<日時>.csv` が1本だけ置かれる (引当ツールの出力)。
+ * この slug が「どのソフトで送り状を出したか」= どのプリンターに出すか の決め手になる。
+ * 正本 = AI_reference ロジザード作業自動化/hikiate-patterns.csv の「送り状発行ソフト」列。
+ *
+ * 🚨 複数 slug が同居していたら null を返す (どちらの送り状か決められないものを刷らない)。
+ * @returns {Promise<string|null>} 'aes' | 'nekoposu' | '50size' | ... / 判別できなければ null
+ */
+export async function detectOkurijoSlug(folderName) {
+  try {
+    const folders = (await getShippingFolders()).filter((f) => f.name === folderName);
+    if (folders.length !== 1) return null;
+    const listed = await driveCall(() => listDriveFilesAcross({ folders, nameContains: 'okurijo_' }));
+    const slugs = new Set();
+    const unparsed = [];
+    for (const f of listed) {
+      const name = f.filename || '';
+      if (!/^okurijo_/i.test(name)) continue;
+      const m = /^okurijo_([A-Za-z0-9]+)_\d+\.csv$/i.exec(name);
+      if (m) slugs.add(m[1].toLowerCase());
+      else unparsed.push(name);   // 命名ゆれを黙って無視すると別の分類の送り状を刷りかねない
+    }
+    if (slugs.size !== 1 || unparsed.length > 0) {
+      console.warn(`[packing-reprint] ${folderName}: 引当分類を特定できません `
+        + `(検出=${[...slugs].join(',') || 'なし'}${unparsed.length ? ` / 読めないファイル=${unparsed.join(',')}` : ''})`);
+      return null;
+    }
+    return [...slugs][0];
+  } catch (e) {
+    console.warn(`[packing-reprint] ${folderName}: 引当分類の読み取り失敗: ${e.message}`);
+    return null;
+  }
 }
 
 /** 古い抜き出しPDFの掃除 (7日超)。ポーラーから呼ばれる (fail-soft)。 */

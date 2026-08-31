@@ -175,6 +175,12 @@
         <h2>いま作業中</h2>
         <div class="chips" id="active"><span class="chip">-</span></div>
       </div>
+      <div class="panel">
+        <h2>ピッキングミス率 <span class="sub" id="missRange">(1,000明細あたりの件数)</span></h2>
+        <div class="today-big" id="missRate">-</div>
+        <div class="today-sub"><span id="missCount">-</span>件 / <span id="missLines">-</span>明細 ・ 欠品 (棚に無かった) は含めない</div>
+        <div id="missWorkers"></div>
+      </div>
       <div class="panel" style="flex:1 1 auto; overflow:hidden">
         <h2>日別 <span class="sub">(全体の秒/明細)</span></h2>
         <div id="byDate"></div>
@@ -302,8 +308,32 @@
       }).join('') || '<span style="color:var(--muted)">データがありません</span>';
     }
 
+    /**
+     * ピッキングミス率 (件数より比率 — 中原さん指示 2026-08-31)。
+     * 行 = 作業者 (比率の高い順)。バーは全体で最も高い人を 100% とした相対長。
+     * 欠品 (棚に無かった) はミスに含めない — 除外した件数は注記に出す。
+     */
+    function renderMiss(m) {
+      if (!m) return;
+      document.getElementById('missRate').textContent = m.total.per1000 == null ? '-' : fmt1(m.total.per1000);
+      document.getElementById('missCount').textContent = m.total.total;
+      document.getElementById('missLines').textContent = m.total.lines;
+      document.getElementById('missRange').textContent =
+        '(' + mmdd(m.since) + '〜' + mmdd(m.until) + ' ・ 1,000明細あたりの件数' + (m.total.stockout ? ' ・ 欠品由来 ' + m.total.stockout + '件は除外' : '') + ')';
+      var rows = m.workers.filter(function (w) { return w.lines > 0 || w.total > 0; });
+      var worst = rows.reduce(function (x, w) { return Math.max(x, w.per1000 || 0); }, 0) || 1;
+      document.getElementById('missWorkers').innerHTML = rows.map(function (w) {
+        var rate = w.per1000 == null ? '-' : fmt1(w.per1000);
+        return '<div class="day"' + (w.provisional ? ' style="opacity:.55"' : '') + '><span class="d" title="' + esc(w.name) + '">' + esc(w.name) + '</span>' +
+          '<span class="db"><i style="width:' + Math.round(((w.per1000 || 0) / worst) * 100) + '%; background:' + (w.total === 0 ? 'var(--ok)' : 'var(--warn)') + '"></i></span>' +
+          '<span class="v">' + rate + '</span>' +
+          '<span class="n">' + w.total + '件/' + w.lines + '</span></div>';
+      }).join('') || '<span style="color:var(--muted)">データがありません</span>';
+    }
+
     function render(data) {
       var s = data.stats;
+      renderMiss(data.miss);
       document.getElementById('range').textContent =
         mmdd(s.since) + '〜' + mmdd(s.until) + ' の' + s.days + '日間 ・ ' + s.total.lines + '明細';
       document.getElementById('heatTitle').innerHTML =

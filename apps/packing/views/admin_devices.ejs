@@ -48,17 +48,60 @@
       </div>
     </div>
 
+    <div class="pk-form">
+      <h2>🖨 出荷PCの印刷エージェントを登録する</h2>
+      <div class="pk-note">
+        伝票再印刷を押したときに<b>出荷PCのサーマルプリンターから自動で送り状を出す</b>ための登録です。
+        この画面は<b>中原さんのPCで操作してかまいません</b> (iPadの登録と違ってログアウトされません)。<br>
+        プリンター名は<b>そのPCの「プリンターとスキャナー」に出ている表記どおり</b>に、
+        1行に1つ入れてください (例: <code>Munbyn ITPP941(300DPI)</code>)。
+        ここに<b>書いた名前だけ</b>がそのPCの出力先候補になり、PC側の設定では変えられません
+        (別のプリンターに送り状が出る事故を防ぐため)。<br>
+        <b>どの送り状をどれに出すかは、下の「引当分類ごとの出力先」で決めます。</b><br>
+        発行されるトークンは<b>この1回しか表示されません</b>。出荷PCの設定に貼り付けてください。
+      </div>
+      <div class="pk-actions" style="align-items:flex-start">
+        <input type="text" id="agentLabel" placeholder="端末名 (例: 出荷PC)" maxlength="40">
+        <textarea id="agentPrinter" rows="3" style="width:320px;font-size:14px"
+          placeholder="このPCから出せるプリンター名 (1行に1つ)&#10;例: Munbyn ITPP941(300DPI)&#10;    Brother QL-720"></textarea>
+        <button id="agentBtn" type="button">登録してトークンを発行</button>
+        <span id="agentMsg" class="pk-msg"></span>
+      </div>
+      <div id="agentToken" style="display:none;margin-top:10px">
+        <div class="pk-note" style="margin-bottom:4px"><b>この端末のトークン (この画面を離れると二度と見られません)</b></div>
+        <textarea id="agentTokenBox" readonly rows="2" style="width:100%;font-family:monospace;font-size:13px"></textarea>
+      </div>
+    </div>
+
     <h2 style="font-size:1.05em">登録済み端末</h2>
+    <div class="pk-note">
+      印刷エージェントの「出力先」は<b>ここで増減できます</b> (登録し直しは不要)。
+      ただし<b>印刷待ちの送り状が残っているプリンターは外せません</b> —
+      外した名前を別のPCが引き取ると、積んであったぶんが別の実機から出てしまうためです。
+    </div>
     <table>
-      <thead><tr><th>ID</th><th>端末名</th><th>登録者</th><th>登録日</th><th>最終アクセス</th><th></th></tr></thead>
+      <thead><tr><th>ID</th><th>種別</th><th>端末名</th><th>出力先</th><th>登録者</th><th>登録日</th><th>最終アクセス</th><th></th></tr></thead>
       <tbody>
         <% for (const d of devices) { %>
           <tr class="<%= d.revoked_at ? 'revoked' : '' %>">
             <td><%= d.id %></td>
+            <td><%= d.kind === 'agent' ? '🖨 印刷' : '📱 iPad' %></td>
             <td><%= d.label %></td>
+            <td>
+              <% if (d.kind === 'agent' && !d.revoked_at) { %>
+                <textarea class="dev-printers" data-id="<%= d.id %>" rows="2"
+                  style="width:230px;font-size:13px" placeholder="(1行に1つ)"><%= (d.printers || []).join('\n') %></textarea>
+                <button type="button" class="btn-printers" data-id="<%= d.id %>">保存</button>
+              <% } else { %>
+                <%= (d.printers && d.printers.length) ? d.printers.join(' / ') : (d.printer_name || '-') %>
+              <% } %>
+            </td>
             <td><%= d.created_by %></td>
             <td><%= (d.created_at || '').slice(0, 10) %></td>
-            <td><%= (d.last_seen_at || '-').slice(0, 16).replace('T', ' ') %></td>
+            <td>
+              <%= ((d.kind === 'agent' ? d.heartbeat_at : d.last_seen_at) || '-').slice(0, 16).replace('T', ' ') %>
+              <% if (d.kind === 'agent' && d.heartbeat_note) { %><br><span style="color:#868e96"><%= d.heartbeat_note %></span><% } %>
+            </td>
             <td>
               <% if (!d.revoked_at) { %>
                 <button type="button" class="btn-revoke" data-id="<%= d.id %>">失効</button>
@@ -66,7 +109,61 @@
             </td>
           </tr>
         <% } %>
-        <% if (devices.length === 0) { %><tr><td colspan="6">登録された端末はありません</td></tr><% } %>
+        <% if (devices.length === 0) { %><tr><td colspan="8">登録された端末はありません</td></tr><% } %>
+      </tbody>
+    </table>
+
+    <h2 style="font-size:1.05em;margin-top:20px">🖨 引当分類ごとの出力先</h2>
+    <div class="pk-note">
+      引当分類によって送り状を出すソフトが違うため (DENZOU / ヤマトB2 / ゆうプリR / 汎用送り状)、
+      出す<b>プリンターも違います</b>。ここで決めた名前にだけ送り状が出ます。<br>
+      <b>空欄にすると、その分類は自動印刷しません</b> (今までどおりチャットにPDFリンクだけ出ます)。
+      どこに出るか決まっていないものを勝手に刷らないための仕組みです。<br>
+      ⚠ <b>ここの変更は「これから依頼された分」にだけ効きます。</b>
+      すでに印刷待ちに入っているぶんは、依頼された時点の出力先に出ます
+      (途中で出力先が変わると、どこに出たのか追えなくなるため)。
+      いま出さないようにしたいときは、下の一覧で状態を確認してください。
+    </div>
+    <table>
+      <thead><tr><th>引当分類</th><th>出力先プリンター</th><th>更新</th><th></th></tr></thead>
+      <tbody>
+        <% for (const [slug, label] of Object.entries(SLUG_LABELS)) {
+             const r = routes.find((x) => x.slug === slug); %>
+          <tr>
+            <td><%= label %><br><span style="color:#868e96;font-size:0.85em"><%= slug %></span></td>
+            <td><input type="text" class="route-printer" data-slug="<%= slug %>" maxlength="120"
+                  style="width:100%;padding:6px;font-size:14px" value="<%= r ? r.printer_name : '' %>"
+                  placeholder="(空欄 = 自動印刷しない)"></td>
+            <td style="white-space:nowrap;color:#868e96;font-size:0.85em">
+              <%= r ? (r.updated_at || '').slice(0, 10) + ' ' + r.updated_by : '-' %></td>
+            <td><button type="button" class="btn-route" data-slug="<%= slug %>">保存</button></td>
+          </tr>
+        <% } %>
+      </tbody>
+    </table>
+
+    <h2 style="font-size:1.05em;margin-top:20px">🖨 直近の印刷ジョブ</h2>
+    <div class="pk-note">
+      印刷まで進むのは<b>注文番号の完全一致でページを特定できたもの</b>だけです。
+      特定が位置推定に落ちたものは今までどおりリンクだけを送り、自動では印刷しません。
+    </div>
+    <table>
+      <thead><tr><th>ID</th><th>NE伝票</th><th>出荷</th><th>分類</th><th>状態</th><th>出力先</th><th>試行</th><th>依頼</th><th>備考</th></tr></thead>
+      <tbody>
+        <% for (const j of printJobs) { %>
+          <tr>
+            <td><%= j.id %></td>
+            <td><%= j.ne_slip_no %></td>
+            <td><%= j.folder_name || '-' %></td>
+            <td><%= j.slug || '-' %></td>
+            <td><%= PRINT_STATE_LABELS[j.state] || j.state %></td>
+            <td><%= j.printer_name || '-' %></td>
+            <td><%= j.attempt_count %></td>
+            <td><%= (j.created_at || '').slice(5, 16).replace('T', ' ') %></td>
+            <td><%= j.error || '' %></td>
+          </tr>
+        <% } %>
+        <% if (printJobs.length === 0) { %><tr><td colspan="9">印刷ジョブはまだありません</td></tr><% } %>
       </tbody>
     </table>
   </div>
@@ -87,6 +184,70 @@
         if (!res.ok) { $('msg').textContent = body.error || `エラー (${res.status})`; $('msg').className = 'pk-msg err'; return; }
         location.href = '/apps/packing/';
       } finally { $('registerBtn').disabled = false; }
+    });
+    $('agentBtn').addEventListener('click', async () => {
+      const label = $('agentLabel').value.trim();
+      const printer = $('agentPrinter').value.trim();
+      const say = (t, cls) => { $('agentMsg').textContent = t; $('agentMsg').className = 'pk-msg ' + cls; };
+      if (!label || !printer) { say('端末名とプリンター名を入力してください', 'err'); return; }
+      const list = printer.split('\n').map((x) => x.trim()).filter(Boolean);
+      if (!confirm(`印刷エージェントとして「${label}」を登録します。このPCから出せるプリンター:\n${list.join('\n')}\nよろしいですか?`)) return;
+      $('agentBtn').disabled = true;
+      try {
+        const res = await fetch('/apps/packing/admin/devices', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label, kind: 'agent', printers: printer.split('\n').map((x) => x.trim()).filter(Boolean) }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) { say(body.error || ('エラー (' + res.status + ')'), 'err'); return; }
+        $('agentToken').style.display = 'block';
+        $('agentTokenBox').value = body.token;
+        say('登録しました。トークンを控えてから画面を閉じてください', 'ok');
+      } finally { $('agentBtn').disabled = false; }
+    });
+    document.querySelectorAll('.btn-printers').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const box = document.querySelector('.dev-printers[data-id="' + btn.dataset.id + '"]');
+        const printers = box.value.split('\n').map((x) => x.trim()).filter(Boolean);
+        if (printers.length === 0) {
+          alert('プリンター名を1つ以上入れてください (全部消したいときは端末を失効させてください)');
+          return;
+        }
+        btn.disabled = true;
+        try {
+          const res = await fetch('/apps/packing/admin/devices/' + btn.dataset.id + '/printers', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ printers }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) { alert(body.error || ('エラー (' + res.status + ')')); return; }
+          btn.textContent = '保存しました';
+          setTimeout(() => { btn.textContent = '保存'; }, 2000);
+        } finally { btn.disabled = false; }
+      });
+    });
+    document.querySelectorAll('.btn-route').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const slug = btn.dataset.slug;
+        const input = document.querySelector('.route-printer[data-slug="' + slug + '"]');
+        const name = input.value.trim();
+        if (!name && !confirm(slug + ' の出力先を空にします。この分類は自動印刷されなくなります (チャットにリンクだけ出ます)。よろしいですか?')) return;
+        btn.disabled = true;
+        try {
+          const res = await fetch('/apps/packing/admin/print-routes', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slug, printer_name: name }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (res.ok && body.orphan) {
+            alert('保存しましたが、「' + name + '」を登録している印刷エージェントがありません。'
+              + 'このままだと印刷待ちのまま進まず、しばらくしてから「手で刷ってください」の通知になります。'
+              + '上の端末一覧でプリンター名を確認してください。');
+          }
+          btn.textContent = res.ok ? '保存しました' : (body.error || 'エラー');
+          setTimeout(() => { btn.textContent = '保存'; }, 3000);
+        } finally { btn.disabled = false; }
+      });
     });
     document.querySelectorAll('.btn-revoke').forEach((btn) => {
       btn.addEventListener('click', async () => {

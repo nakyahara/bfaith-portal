@@ -76,9 +76,20 @@ export function emailSettings() {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** カンマ/セミコロン/読点区切りの宛先文字列 → 検証済み配列 */
+/** 全角英数字・記号 (＠．－＜＞ 等) → 半角。マスタ画面への日本語IME入力の取りこぼし対策 */
+export function toHalfWidth(s) {
+  return String(s == null ? '' : s)
+    .replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/　/g, ' ');
+}
+
+/** カンマ/セミコロン/読点区切りの宛先文字列 → 検証済み配列。「名前 <addr>」形式はアドレス部だけ採る */
 export function parseAddresses(s) {
-  const list = trimS(s).split(/[,;、]/).map(x => x.trim()).filter(Boolean);
+  const list = toHalfWidth(s).split(/[,;、]/).map(x => {
+    const t = x.trim();
+    const m = t.match(/<([^<>]+)>\s*$/); // 築山 <ken@example.jp> → ken@example.jp (メーラーからのコピペ)
+    return (m ? m[1] : t).trim();
+  }).filter(Boolean);
   for (const a of list) if (!EMAIL_RE.test(a)) throw new Error(`メールアドレスが不正です: ${a}`);
   return list;
 }
@@ -92,7 +103,8 @@ export function parseAddresses(s) {
 export function normalizeFaxNumber(s) {
   const t = trimS(s);
   if (!t) return null;
-  const digits = t.replace(/[-−ー()（）\s]/g, '');
+  // 全角数字・記号も受ける (０６－…)。区切りは ハイフン類/括弧/空白/ドット
+  const digits = toHalfWidth(t).replace(/[-−ー‐–—()（）.\s]/g, '');
   if (!/^0\d{9,10}$/.test(digits)) {
     throw new Error(`FAX番号が不正です: ${t} (0始まりの10〜11桁で入力してください。例: 06-1234-5678)`);
   }
@@ -441,6 +453,32 @@ export function createEmailJob(orderId, { resend = false, resendOfJobId = null, 
  *  - Gmail送信要求「前」の失敗 (トークン取得等) → failed (再試行可)
  *  - Gmail送信要求「後」の失敗 → unknown (実際は届いている可能性。自動・通常再試行は不可、照合で回復)
  */
+/** 仕入先の発注方法 (send_method) → 送信チャネル。送れない設定 (web/none/未設定) は null */
+export function channelForSendMethod(sendMethod) {
+  const m = trimS(sendMethod);
+  return ['email', 'fax', 'relay', 'email_pdf'].includes(m) ? m : null;
+}
+const CHANNEL_LABEL = { email: '📧 メール (CSV添付)', email_pdf: '📄 PDFメール (本文ベタ打ち+PDF)', fax: '📠 FAX', relay: '📨 社内転送', web: '🌐 WEBサイト', none: '送信なし' };
+export function channelLabelOf(v) { return CHANNEL_LABEL[trimS(v)] || (trimS(v) ? trimS(v) : '未設定'); }
+
+/**
+ * ジョブの channel と「仕入先の現在の発注方法」の不一致メッセージ (一致なら null)。
+ * ジョブは作成時点の channel・添付を固定で持つため、作成後に発注方法を変えても中身は変わらない。
+ * 送信直前 (processEmailJob) で突合し、違っていれば送らずに failed にする
+ */
+export function channelMismatchOf(db, job) {
+  const sup = db.prepare(`SELECT s.name, s.send_method FROM po_orders o
+    LEFT JOIN po_suppliers s ON s.supplier_code = o.supplier_code WHERE o.id=?`).get(job.order_id);
+  const jobChannel = job.channel || 'email';
+  if (!sup || sup.send_method == null && !sup.name) {
+    return `仕入先マスタが見つからないため送信を中止しました (ジョブ作成時の発注方法: ${channelLabelOf(jobChannel)})。仕入先を登録し直してから新規に送信してください`;
+  }
+  const cur = channelForSendMethod(sup.send_method);
+  if (cur === jobChannel) return null;
+  return `仕入先「${sup.name}」の発注方法がジョブ作成後に変わったため送信を中止しました (ジョブ作成時: ${channelLabelOf(jobChannel)} / 現在: ${channelLabelOf(sup.send_method)})。` +
+    'このジョブを「取消」し、発注書メールパネルを開き直して新規に送信してください (添付の種類はジョブ作成時に固定されるため、再試行では直りません)';
+}
+
 export async function processEmailJob(jobId) {
   const db = getDB();
   const leased = db.transaction(() => {
@@ -466,10 +504,22 @@ export async function processEmailJob(jobId) {
     // generation = 送信試行の世代。照合はスナップショット時の世代と一致する場合のみ結果を適用する (競合検知)
     db.prepare("UPDATE po_email_jobs SET status='sending', sending_started_at=?, attempt_count=attempt_count+1, generation=generation+1, error=NULL WHERE id=?")
       .run(nowIso(), jobId);
+    // 仕入先の発注方法がジョブ作成後に変わっていたら送らない (2026-08-31 フォーユー: email→email_pdf に
+    // 変えた後、変更前に作られた予約/失敗ジョブが CSV 添付のまま先方へ出た)。
+    // ジョブは作成時点の channel・添付 (CSV/PDF) を固定で持つため、送信直前に現在の設定と突合する。
+    // queued→failed は状態機械が禁止しているので sending 経由で failed にする (再試行しても同じ理由で止まる)
+    const mismatch = channelMismatchOf(db, job);
+    if (mismatch) {
+      db.prepare("UPDATE po_email_jobs SET status='failed', error=? WHERE id=?").run(mismatch, jobId);
+      audit(db, { actorType: 'system', actor: null, action: 'email_channel_mismatch', resource: `order:${job.order_id}`,
+        detail: { jobId, channel: job.channel, deliveryKey: job.delivery_key, error: mismatch } });
+      return { done: 'channel_mismatch', job, error: mismatch };
+    }
     return { done: false, job: db.prepare('SELECT * FROM po_email_jobs WHERE id=?').get(jobId) };
   }).immediate();
   if (leased.done === 'sent') return { status: 'sent', gmailMessageId: leased.job.gmail_message_id };
   if (leased.done === 'scheduled') return { status: 'scheduled', scheduledAt: leased.job.scheduled_at };
+  if (leased.done === 'channel_mismatch') return { status: 'failed', error: leased.error };
 
   const job = leased.job;
   // 完了の書き戻しも lease時の generation を条件にする (Codex P15-R7 High-2:

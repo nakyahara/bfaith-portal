@@ -8,13 +8,22 @@
  *       日中のロジザード在庫CSV「在庫数(引当数を含む)」とも整合する)
  *   在庫定数 O      = M<=1→0.5, 1<M<=2→1, 2<M<=3→2, M>3→3   (M=推奨保有月数)
  *   目標月数 P      = M + O
- *   発注対象        = 取扱区分='取扱中' かつ 0 < L <= M
- *   推奨発注量      = lots = (P-L)*V/N を N(発注ロット単位)で丸め
+ *   発注対象 (v2)   = 取扱区分='取扱中' かつ V > 0 かつ M > 0 かつ S + B <= M × V
+ *     ※旧式 (v1) は 0 < L <= M。在庫0・注残0 で L=0 になると「下限」を割って要発注から消え、
+ *       売れていて先に切れた商品ほど掘り起こしに落ちていた (2026-08-30 全数調査: 203件・月204万円)。
+ *       v2 は V>0 かつ S+B>0 の領域で v1 と同値。差分は S+B=0 のみ = 要件定義原文
+ *       「掘り起こし = 在庫も注残もゼロ / 販売実績消失」に合わせた修正 (中原さん決定 2026-08-30)。
+ *       M>0 ガードが無いと S+B=0 <= 0×V が真になり M未設定の在庫0商品まで要発注化するため必須 (Codex R1)。
+ *       設定 target_rule='v1' で旧式へ即時ロールバックできる。
+ *   推奨発注量      = lots = (P×V − (S+B))/N を N(発注ロット単位)で丸め  (= (P-L)×V/N と同値)
  *                     lots > 1 → ROUND(lots)*N / lots <= 1 → ROUNDUP(lots)*N (最低1ロット)
- *   掘り起こし対象  = 取扱中 かつ 在庫0 かつ 注残0 (中原さん定義 2026-07-14:
+ *   掘り起こし対象 (v2) = 取扱中 かつ 在庫0 かつ 注残0 かつ 販売0 (販売実績消失。中原さん定義 2026-07-14:
  *     他社の値下げで価格が合わず仕入を控えた商品を、一定期間後に再販できるか調べるためのステータス)
  *     ※旧シートは取扱中止も掘り起こしに含めていたが、本アプリは「取扱中」のみに絞る (ノイズ除去)
  *     ※在庫があって販売0の商品は掘り起こしではない → ついで買い候補の末尾に回す
+ *     ※v1 は販売を見ずに 在庫0・注残0 を掘り起こしにしていた (売れている欠品品もここに落ちていた)
+ *   在庫月数 L      = 販売0 のとき null (「在庫月数を定義できない」。在庫0で販売ありの本当の0ヶ月と区別する、Codex R2)
+ *   推奨保有月数 M 未設定 (<=0) で売れている商品 = holdMonthsMissing (設定不備。要発注にしない)
  *   セット商品 (商品区分='セット') は対象外 = 一覧にも出さない (在庫・発注は構成品側で管理)
  *
  * データソース: mirror_pml_snapshot_rows (published run) + po_* マスタ。
@@ -42,22 +51,42 @@ export function stockConstant(m) {
   return 3;
 }
 
-/** 1商品の発注判定。旧シートの1行分。backOrderOverride を渡すとNE CSVの注残数の代わりに使う (アプリ台帳の残数) */
-export function computeProduct(r, backOrderOverride) {
+/** 要発注判定ルール (po_settings target_rule)。既定 'v2'。'v1' = 旧式 (0 < L <= M) へのロールバック用 */
+export function targetRule() {
+  return getSetting('target_rule') === 'v1' ? 'v1' : 'v2';
+}
+
+/**
+ * 1商品の発注判定。旧シートの1行分。backOrderOverride を渡すとNE CSVの注残数の代わりに使う (アプリ台帳の残数)。
+ * rule: 'v2' (既定) | 'v1'。両ルールの判定 (targetV1/targetV2) を常に返し、ルール切替の影響件数を観測できるようにする。
+ */
+export function computeProduct(r, backOrderOverride, rule = 'v2') {
   const S = num(r['総在庫数']); // 引当済み含む (FBA送付前の準備在庫も自社在庫として数える)
   const B = backOrderOverride != null ? backOrderOverride : num(r['注残数']);
   const V = num(r['販売数30日_合計']);
   const M = num(r['推奨保有月数']);
   const N = num(r['発注ロット単位']);
   const active = String(r['取扱区分'] || '') === '取扱中';
-  const stockMonths = V > 0 ? (S + B) / V : 0; // L
-  const isTarget = active && stockMonths > 0 && stockMonths <= M;
-  let recQty = null;
-  if (isTarget && N > 0) {
+  const salesDefined = V > 0;
+  // 在庫+注残が負 (NE の引当超過・取込異常) は「在庫0」として扱う。v1 は L<0 で黙って対象外にしていたが、
+  // 実態は欠品なので v2 では対象にし、推奨量は 0 起点で計算する (負をそのまま使うと推奨量が膨らむ、Codex PR1-R1 Low)
+  const stockNegative = S + B < 0;
+  const SB = stockNegative ? 0 : S + B;
+  const stockMonths = salesDefined ? SB / V : null; // L (販売0は未定義)
+  const targetV1 = active && salesDefined && stockMonths > 0 && stockMonths <= M;
+  const targetV2 = active && salesDefined && M > 0 && SB <= M * V;
+  const isTarget = rule === 'v1' ? targetV1 : targetV2;
+  // 売れているのに推奨保有月数が未設定 → どのルールでも要発注に出ない設定不備 (管理画面で埋める)
+  const holdMonthsMissing = active && salesDefined && !(M > 0);
+  // 推奨量は v2 判定で常に計算する (v1 ⊂ v2 なので v1 の対象商品も同じ式)。
+  // recQtyV2 はルール切替の影響額 (ruleStats) 用で、現在のルールに依存させない (Codex PR1-R1 Medium)
+  let recQtyV2 = null;
+  if (targetV2 && N > 0) {
     const P = M + stockConstant(M);
-    const lots = ((P - stockMonths) * V) / N;
-    recQty = lots > 1 ? Math.round(lots) * N : Math.ceil(lots) * N;
+    const lots = (P * V - SB) / N; // = (P − L) × V / N。target なら SB <= M×V なので必ず正 (最低1ロット)
+    recQtyV2 = lots > 1 ? Math.round(lots) * N : Math.ceil(lots) * N;
   }
+  const recQty = isTarget ? recQtyV2 : null;
   return {
     code: r['商品コード'],
     key: normProductCode(r['商品コード']),
@@ -75,10 +104,18 @@ export function computeProduct(r, backOrderOverride) {
     cost: num(r['原価']),
     lastPurchase: r['最終仕入日'] || '',
     stockMonths,
+    salesDefined,
     isTarget,
+    targetV1,
+    targetV2,
+    targetReason: isTarget ? ['total'] : [],
+    holdMonthsMissing,
+    stockNegative,
     recQty,
-    // 掘り起こし = 取扱中かつ在庫0・注残0 (仕入を控えた商品の再販調査。販売0でも在庫があれば対象外)
-    isHorikoshi: active && S === 0 && B === 0,
+    recQtyV2,
+    // 掘り起こし = 取扱中かつ在庫0・注残0・販売0 (仕入を控えた商品の再販調査。販売0でも在庫があれば対象外。
+    // v2 では売れている欠品品は要発注へ行くので掘り起こしには落とさない)
+    isHorikoshi: active && S === 0 && B === 0 && (rule === 'v1' || !salesDefined),
   };
 }
 
@@ -364,18 +401,26 @@ export function computeAll() {
   maybeRefreshFromLogizardMirror();
   // PML(+NEオーバーレイ)・マスタ・直近発注を1つの read transaction で読む (途中の書き込みと混在させない、Codex R2 Low)
   const db = getDB();
-  const { pub, rows, overlay, masters, recentIssued, ledgerZan, boDates, useLedgerZan } = db.transaction(() => ({
+  const { pub, rows, overlay, masters, recentIssued, ledgerZan, boDates, useLedgerZan, rule } = db.transaction(() => ({
     ...loadPmlMerged(), masters: loadMasters(), recentIssued: loadRecentIssued(), ledgerZan: loadLedgerBackorders(),
     boDates: loadBackorderRequestedDates(),
     // 既定 'app' = アプリ台帳。設定 backorder_source='ne' で旧挙動 (NE CSVの発注残数) へ戻せる
     useLedgerZan: getSetting('backorder_source') !== 'ne',
+    rule: targetRule(),
   }))();
   const products = [];
   const bySupplier = new Map();
+  // ルール切替の観測: v2 で新たに要発注になった (v1 では出なかった) 商品の件数と推奨額。v1 ⊂ v2 なので減る側は無い
+  const ruleStats = { rule, addedCount: 0, addedAmount: 0, holdMonthsMissing: 0 };
   for (const r of rows) {
     // セット商品は発注・在庫管理の対象外 (在庫は構成品側)。全商品情報にも出さない (中原さん 2026-07-14)
     if (String(r['商品区分'] || '').trim() === 'セット') continue;
-    const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined);
+    const p = computeProduct(r, useLedgerZan ? (ledgerZan.get(normProductCode(r['商品コード'])) || 0) : undefined, rule);
+    if (p.holdMonthsMissing) ruleStats.holdMonthsMissing++;
+    if (p.targetV2 && !p.targetV1) {
+      ruleStats.addedCount++;
+      ruleStats.addedAmount += (p.recQtyV2 || 0) * p.cost; // v1 で動作中でも v2 の影響額が見える
+    }
     const a = masters.attrs.get(p.key);
     p.conditionId = a ? (a.condition_id || '') : '';
     p.materialGroupId = a ? (a.material_group_id || '') : '';
@@ -417,14 +462,16 @@ export function computeAll() {
     // どのリストにも載らないとワークスペース検索・カート追加から消えてしまう)
     else if (p.active) g.candidates.push(p);
   }
+  // 在庫月数の昇順。販売0 (stockMonths=null) は末尾へ
+  const byMonths = (a, b) => ((a.stockMonths == null) - (b.stockMonths == null)) || (a.stockMonths - b.stockMonths);
   for (const g of bySupplier.values()) {
-    g.targets.sort((a, b) => a.stockMonths - b.stockMonths);
-    // 販売0 (stockMonths=0) は末尾へ。それ以外は在庫月数の少ない順
-    g.candidates.sort((a, b) => ((a.stockMonths === 0) - (b.stockMonths === 0)) || a.stockMonths - b.stockMonths);
+    g.targets.sort(byMonths);
+    g.candidates.sort(byMonths);
     g.horikoshi.sort((a, b) => (b.lastPurchase || '').localeCompare(a.lastPurchase || ''));
     g.estAmount = Math.round(g.targets.reduce((s, p) => s + (p.recQty || 0) * p.cost, 0));
   }
-  return { pub, overlay, products, bySupplier, masters };
+  ruleStats.addedAmount = Math.round(ruleStats.addedAmount);
+  return { pub, overlay, products, bySupplier, masters, ruleStats };
 }
 
 /**

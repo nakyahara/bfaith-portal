@@ -17,7 +17,7 @@ delete process.env.PACKING_NOTION_TOKEN;
 delete process.env.PICKING_NOTION_TOKEN;
 
 const { initPackingDB, getDB, utcNow } = await import('../db.js');
-const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, PackError } = await import('../service.js');
+const { applyEvent, lineKindOf, listLineRuns, lineDailyTotal, resolveIncident, getWorkState, PackError } = await import('../service.js');
 const { packBatchNotionState, STATUS_PACKING, STATUS_PACK_DONE, STATUS_SORTED } = await import('../notion.js');
 
 let failed = 0;
@@ -116,17 +116,21 @@ console.log('\n── MELT: 仕分け (除外件数方式) →流し ──');
 
 console.log('\n── 本日累計 (lineDailyTotal — 日付でリセット) ──');
 {
-  eq(lineDailyTotal('2026-08-18', 'pas'), { total: 99, machine: 97 },
+  eq(lineDailyTotal('2026-08-18', 'pas'), { total: 99, machine: 97, transferredIn: 0 },
     'PAS累計: 出荷99 (うち手動2) → 機械通過97');
-  eq(lineDailyTotal('2026-08-18', 'melt'), { total: 47, machine: 47 }, 'MELT累計は別集計');
-  eq(lineDailyTotal('2026-08-19', 'pas'), { total: 0, machine: 0 }, '翌日は0にリセット');
+  eq(lineDailyTotal('2026-08-18', 'melt'), { total: 47, machine: 47, transferredIn: 0 }, 'MELT累計は別集計');
+  eq(lineDailyTotal('2026-08-19', 'pas'), { total: 0, machine: 0, transferredIn: 0 }, '翌日は0にリセット');
 }
 
 console.log('\n── 伝票イベントの相互排他 / 段階的取消 ──');
 {
   mkBatch(5, 2, 40);   // MELT
   throws(() => ev(5, 'start'), 'line_batch', '梱包機バッチに伝票 start は不可');
-  throws(() => ev(5, 'shortage', { slipSeq: 1, sku: 'x', qty: 1 }), 'line_batch', '不足イベントも不可');
+  throws(() => ev(5, 'next', { slipSeq: 1 }), 'line_batch', '伝票の完了 (next) も不可');
+  throws(() => ev(5, 'jump', { slipSeq: 1 }), 'line_batch', 'ジャンプも不可');
+  throws(() => ev(5, 'excess', { sku: 'x', qty: 1 }), 'line_batch', '余り (棚戻し) は対象外');
+  // 依頼系 (不足/配送変更/再印刷) はラインからも出せる (2026-08-31)。伝票が無いバッチなので伝票検証まで進む
+  throws(() => ev(5, 'shortage', { slipSeq: 1, sku: 'x', qty: 1 }), 'sku_not_in_slip', '不足はライン制限では弾かれない (伝票検証へ進む)');
   ev(5, 'line_sort_start');
   ev(5, 'line_sort_done', { excludedCount: 2 });
   ev(5, 'line_start');
@@ -162,7 +166,7 @@ console.log('\n── 伝票イベントの相互排他 / 段階的取消 ──
   ev(6, 'line_stop');
   ev(6, 'line_done', { finalCount: 10 });
   eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=6').get().status, 'done', '再開後は完了できる');
-  eq(lineDailyTotal('2026-08-18', 'pas'), { total: 109, machine: 107 }, '累計にバッチ6の10件が加算');
+  eq(lineDailyTotal('2026-08-18', 'pas'), { total: 109, machine: 107, transferredIn: 0 }, '累計にバッチ6の10件が加算');
 }
 
 console.log('\n── 仕分けと流しの担当者分離 (中原さん指示 2026-08-20) ──');
@@ -260,6 +264,159 @@ console.log('\n── 一時中断 (2026-08-25 現場意見: 資材交換で止�
   ok(run2.finished_at == null && run2.paused_total_sec === run.paused_total_sec, '停止取消後も工程行の中断秒は保持');
 }
 
+console.log('\n── MELT 仕分け: PAS-LINE へ移した件数を PAS の本日累計へ (2026-08-31 現場意見) ──');
+{
+  mkBatch(20, 2, 30);   // MELT (2026-08-18)
+  const before = lineDailyTotal('2026-08-18', 'pas');
+  ev(20, 'line_sort_start');
+  throws(() => ev(20, 'line_sort_done', { excludedCount: 2, toPasCount: 3 }), 'bad_count', 'PAS へ移す件数 > 除外件数は拒否 (内数)');
+  throws(() => ev(20, 'line_sort_done', { excludedCount: 2, toPasCount: -1 }), 'bad_count', '負数は拒否');
+  ev(20, 'line_sort_done', { excludedCount: 3, toPasCount: 1 });
+  const sort = listLineRuns(20).find((r) => r.phase === 'sort');
+  eq([sort.excluded_count, sort.to_pas_count, sort.final_count], [3, 1, 27], '除外3 (うちPAS 1) → 機械に流す 27');
+  const after = lineDailyTotal('2026-08-18', 'pas');
+  eq([after.transferredIn - before.transferredIn, after.machine - before.machine, after.total - before.total], [1, 1, 1],
+    'PAS の累計 (出荷・機械通過) に MELT から移した 1 件が乗る');
+  eq(lineDailyTotal('2026-08-18', 'melt').transferredIn, 0, 'MELT 側の累計には乗らない');
+  // 未指定 (旧画面) は 0 扱い
+  mkBatch(21, 2, 10);
+  ev(21, 'line_sort_start');
+  ev(21, 'line_sort_done', { excludedCount: 1 });
+  eq(listLineRuns(21).find((r) => r.phase === 'sort').to_pas_count, 0, 'to_pas_count 未指定は 0');
+  // 取消で内訳も消える
+  ev(20, 'undo', { reason: '誤タップ' });
+  const undone = listLineRuns(20).find((r) => r.phase === 'sort');
+  eq([undone.finished_at, undone.excluded_count, undone.to_pas_count], [null, null, null], '仕分け完了の取消で to_pas_count も戻る');
+  eq(lineDailyTotal('2026-08-18', 'pas').transferredIn, before.transferredIn, '取消後は PAS 累計から消える');
+  // 同一 op_id の replay は同じ内容なら通る・内訳違いは op_conflict
+  const opId = `t${++op}`;
+  applyEvent(20, { opId, event: 'line_sort_done', excludedCount: 2, toPasCount: 2 }, '倉田');
+  ok(applyEvent(20, { opId, event: 'line_sort_done', excludedCount: 2, toPasCount: 2 }, '倉田').replayed, '同一内容の再送は replay');
+  throws(() => applyEvent(20, { opId, event: 'line_sort_done', excludedCount: 2, toPasCount: 1 }, '倉田'), 'op_conflict', '内訳が違う再送は op_conflict');
+}
+
+console.log('\n── ライン (紙作業) からの伝票ごとの依頼: 再ピック・配送変更・再印刷 (2026-08-31) ──');
+{
+  // PAS バッチに伝票を持たせる (実運用では CS03003 取込で入る)
+  mkBatch(30, 1, 3);
+  const insSlip = db.prepare(`INSERT INTO pk_pack_slips
+    (batch_id, seq, ne_slip_no, slip_no, recipient_name, site_order_no, status, delivery_method)
+    VALUES (30, ?, ?, ?, ?, ?, 'pending', 'ネコポス')`);
+  const insLine = db.prepare('INSERT INTO pk_pack_lines (slip_id, sku, product_name, qty) VALUES (?, ?, ?, ?)');
+  for (let i = 1; i <= 3; i++) {
+    const sid = Number(insSlip.run(i, `NE-30-${i}`, `SP30-${i}`, `客${i}`, `SO-${i}`).lastInsertRowid);
+    insLine.run(sid, 'sku-a', '商品A', 2);
+    if (i === 2) insLine.run(sid, 'sku-b', '商品B', 1);
+  }
+  // 未開始 (ready) のラインバッチでも依頼は出せる・工程担当と別人でも出せる
+  ev(30, 'line_start', {}, '流し担当');
+  const st0 = getWorkState(30);
+  eq(st0.slips.length, 3, '伝票3件');
+  ev(30, 'shortage', { slipSeq: 2, sku: 'sku-b', qty: 1 }, '仕分け担当');
+  const st1 = getWorkState(30);
+  eq([st1.slips[1].status, st1.slips[1].hold_reason], ['held', 'repick'], '不足 → 伝票2は保留 (repick)');
+  eq(st1.incidents.length, 1, '不足の候補が1件');
+  eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=30').get().status, 'packing', 'ラインの工程状態は変わらない');
+  // ラインは終了画面が無い → 伝票が pending のままでも即送信できる。担当者一致も課さない
+  const inc = resolveIncident(st1.incidents[0].id, 'confirm', '仕分け担当', 30);
+  eq(inc.dispatchedTasks.map((x) => x.kind), ['repick'], '確定で再ピックタスクが出る (伝票未完了でも可)');
+  const task = db.prepare("SELECT * FROM pk_pack_tasks WHERE batch_id=30 AND slip_seq=2").get();
+  eq([task.kind, task.sku, task.req_qty, task.status], ['repick', 'sku-b', 1, 'requested'], 'タスク内容');
+  eq(getWorkState(30).repickBySlip[2], 'requested', 'ライン画面の「進行中の依頼」= 依頼中');
+  // 受領はピッカーが fulfilled にしてから
+  throws(() => ev(30, 'receive', { slipSeq: 2 }, '流し担当'), 'repick_not_ready', '未完了の再ピックは受領できない');
+  db.prepare("UPDATE pk_pack_tasks SET status='fulfilled' WHERE id=?").run(task.id);
+  eq(getWorkState(30).repickBySlip[2], 'fulfilled', '完了 → 受取可');
+  ev(30, 'receive', { slipSeq: 2 }, '流し担当');
+  eq(getWorkState(30).slips[1].status, 'pending', '受領で保留解除');
+  eq(db.prepare('SELECT status FROM pk_pack_tasks WHERE id=?').get(task.id).status, 'received', 'タスクは received');
+  // 見つかった (取下げ): 候補ごと取り下げ・保留解除
+  ev(30, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 2 }, '流し担当');
+  ev(30, 'found', { slipSeq: 1 }, '流し担当');
+  eq(getWorkState(30).slips[0].status, 'pending', '見つかった → 保留解除');
+  eq(db.prepare("SELECT status FROM pk_pack_incidents WHERE batch_id=30 AND slip_seq=1").get().status, 'withdrawn', '候補は取下げ');
+  // 配送変更・再印刷 (伝票状態は変えない・記録だけ)
+  ev(30, 'ship_change', { slipSeq: 3, proposedMethod: '宅急便60サイズ', reason: '入らない' }, '仕分け担当');
+  const sc = db.prepare('SELECT * FROM pk_pack_ship_changes WHERE batch_id=30').get();
+  eq([sc.slip_seq, sc.current_method, sc.proposed_method, sc.reason, sc.status], [3, 'ネコポス', '宅急便60サイズ', '入らない', 'requested'], '配送変更の依頼が記録される');
+  const rp = ev(30, 'reprint', { slipSeq: 3 }, '仕分け担当');
+  ok(rp.reprintId > 0, '再印刷依頼が記録される');
+  eq(getWorkState(30).slips[2].status, 'pending', '配送変更・再印刷で伝票状態は変わらない');
+  // 完了済みラインバッチへの不足は「再オープン」しない (バッチ完了は件数記録で決まる)
+  ev(30, 'line_stop', {}, '流し担当');
+  ev(30, 'line_done', { finalCount: 3 }, '流し担当');
+  eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=30').get().status, 'done', '件数記録で完了');
+  ev(30, 'shortage', { slipSeq: 3, sku: 'sku-a', qty: 1 }, '流し担当');
+  eq(db.prepare('SELECT status FROM pk_pack_batches WHERE id=30').get().status, 'done', '完了後の不足依頼でもラインバッチは done のまま');
+  eq(getWorkState(30).slips[2].status, 'held', '伝票は保留になる (再ピック依頼は出せる)');
+  // 伝票の完了 (next) は引き続き不可
+  throws(() => ev(30, 'next', { slipSeq: 1 }, '流し担当'), 'line_batch', 'ラインでは next は不可のまま');
+}
+
+console.log('\n── ライン: 同じ伝票で複数SKUが不足 (Codex R1 High) / 緩和範囲の限定 ──');
+{
+  mkBatch(31, 1, 1);
+  const sid = Number(db.prepare(`INSERT INTO pk_pack_slips
+    (batch_id, seq, ne_slip_no, slip_no, recipient_name, site_order_no, status, delivery_method)
+    VALUES (31, 1, 'NE-31-1', 'SP31-1', '客', 'SO', 'pending', 'ネコポス')`).run().lastInsertRowid);
+  const insLine = db.prepare('INSERT INTO pk_pack_lines (slip_id, sku, product_name, qty) VALUES (?, ?, ?, ?)');
+  insLine.run(sid, 'sku-a', '商品A', 1);
+  insLine.run(sid, 'sku-b', '商品B', 2);
+  ev(31, 'line_start');
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 1 });
+  const incA = getWorkState(31).incidents[0];
+  resolveIncident(incA.id, 'confirm', '倉田', 31);
+  eq(getWorkState(31).slips[0].status, 'held', '1品目の依頼で保留');
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 2 });   // 保留中でも 2品目を出せる
+  const incB = getWorkState(31).incidents.find((i) => i.sku === 'sku-b');
+  ok(incB, '保留中の伝票にも 2品目の不足を記録できる');
+  resolveIncident(incB.id, 'confirm', '倉田', 31);
+  eq(db.prepare("SELECT COUNT(*) c FROM pk_pack_tasks WHERE batch_id=31 AND slip_seq=1 AND status='requested'").get().c, 2, '再ピックタスクが 2 件');
+  throws(() => ev(31, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 }), 'dup_task', '同じ伝票×SKU の二重依頼は拒否');
+  eq(getWorkState(31).repickBySlip[1], 'requested', '受取可は全タスク完了まで出ない');
+  db.prepare("UPDATE pk_pack_tasks SET status='fulfilled' WHERE batch_id=31").run();
+  ev(31, 'receive', { slipSeq: 1 });
+  eq(getWorkState(31).slips[0].status, 'pending', '2件とも完了 → 受領で保留解除');
+  // Codex R2: SKU 単位の「見つかった」と、未送信候補が残る間の受領禁止
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 1 });
+  const ia = getWorkState(31).incidents.find((i) => i.sku === 'sku-a');
+  resolveIncident(ia.id, 'confirm', '倉田', 31);                       // sku-a は依頼済み (タスク)
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 });           // sku-b は候補のまま (送信失敗を想定)
+  db.prepare("UPDATE pk_pack_tasks SET status='fulfilled' WHERE batch_id=31 AND status='requested'").run();
+  throws(() => ev(31, 'receive', { slipSeq: 1 }), 'repick_not_ready', '未送信の候補 (sku-b) が残る間は受領できない');
+  ev(31, 'found', { slipSeq: 1, sku: 'sku-a' });                        // 届いた sku-a ではなく…でも取下げ可 (見つかった)
+  eq(getWorkState(31).slips[0].status, 'held', 'SKU 単位の見つかった: 他の商品 (sku-b 候補) が残るので保留のまま');
+  eq(db.prepare("SELECT status FROM pk_pack_tasks WHERE batch_id=31 AND sku='sku-a' ORDER BY id DESC LIMIT 1").get().status, 'cancelled', 'sku-a のタスクだけ取消');
+  eq(getWorkState(31).incidents.map((i) => i.sku), ['sku-b'], 'sku-b の候補は残る');
+  ev(31, 'found', { slipSeq: 1, sku: 'sku-b' });
+  eq(getWorkState(31).slips[0].status, 'pending', '最後の商品も見つかった → 保留解除');
+  eq(getWorkState(31).incidents.length, 0, '候補は全部取下げ');
+  // sku 指定なしの found は従来どおり伝票の全依頼を取り下げる
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 1 });
+  ev(31, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 });
+  ev(31, 'found', { slipSeq: 1 });
+  eq([getWorkState(31).slips[0].status, getWorkState(31).incidents.length], ['pending', 0], 'sku なしの found = 全部見つかった');
+  // 手梱包バッチでは従来どおり保留中に不足は記録できない (挙動不変)
+  mkBatch(32, 3, 1);
+  const sid2 = Number(db.prepare(`INSERT INTO pk_pack_slips
+    (batch_id, seq, ne_slip_no, slip_no, recipient_name, site_order_no, status, delivery_method)
+    VALUES (32, 1, 'NE-32-1', 'SP32-1', '客', 'SO', 'pending', '箱')`).run().lastInsertRowid);
+  insLine.run(sid2, 'sku-a', '商品A', 1);
+  insLine.run(sid2, 'sku-b', '商品B', 1);
+  ev(32, 'start');
+  ev(32, 'shortage', { slipSeq: 1, sku: 'sku-a', qty: 1 });
+  throws(() => ev(32, 'shortage', { slipSeq: 1, sku: 'sku-b', qty: 1 }), 'not_pending', '手梱包は保留中の伝票に追加の不足を記録しない (従来どおり)');
+  // 緩和は不足候補だけ: 余り (excess) の候補はラインでも従来ルール (担当者一致・一通り終えてから)
+  db.prepare(`INSERT INTO pk_pack_incidents (batch_id, slip_seq, kind, sku, qty, status, detected_by, created_at, updated_at)
+    VALUES (31, NULL, 'excess', 'sku-z', 1, 'candidate', '倉田', ?, ?)`).run(now, now);
+  const exc = db.prepare("SELECT id FROM pk_pack_incidents WHERE batch_id=31 AND kind='excess'").get();
+  throws(() => resolveIncident(exc.id, 'confirm', '別人', 31), 'taken', '余りの候補は担当者一致が要る (緩和対象外)');
+  throws(() => resolveIncident(exc.id, 'confirm', '倉田', 31), 'batch_not_done', '余りの候補は一通り終えてから (緩和対象外)');
+  // already_resolved は現在の status を同梱 (再送の成功/競合の判別用 — Codex R5)
+  try { resolveIncident(incA.id, 'confirm', '倉田', 31); ok(false, 'already_resolved にならなかった'); }
+  catch (e) { eq([e.code, e.body?.status], ['already_resolved', 'confirmed'], 'already_resolved に status=confirmed が付く'); }
+}
+
 console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-25 事故: confirm文字列に改行が混入し全ボタン無反応) ──');
 {
   const ejs = (await import('ejs')).default;
@@ -272,6 +429,16 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
     ['PAS running', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, paused_total_sec: 0 }] }],
     ['PAS paused', { kind: 'pas', batch: { id: 1, status: 'paused', slip_count: 3, pause_reason: '資材の交換', pause_started_at: now }, runs: [{ phase: 'run', started_at: now, paused_total_sec: 30 }] }],
     ['PAS stopped', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, finished_at: now, paused_total_sec: 0, planned_count: 3 }] }],
+    ['MELT sorting (2026-08-31: PAS振替入力+依頼カード)', { kind: 'melt', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'sort', started_at: now, paused_total_sec: 0, planned_count: 3 }],
+      slips: [
+        { seq: 1, neSlipNo: '1', slipNo: 'SP1', siteOrderNo: 'SO1', recipientName: '山田 <太郎>', deliveryMethod: 'ネコポス', status: 'held', holdReason: 'repick', lines: [{ sku: 'a', name: '商品"A"', qty: 2 }] },
+        { seq: 2, neSlipNo: '2', slipNo: 'SP2', siteOrderNo: null, recipientName: "O'Brien", deliveryMethod: null, status: 'pending', holdReason: null, lines: [] },
+      ],
+      incidents: [{ id: 9, slipSeq: 1, kind: 'shortage', sku: 'a', qty: 1 }], repickBySlip: { 1: 'fulfilled' },
+      tasks: [{ id: 5, slipSeq: 1, sku: 'a', qty: 1, status: 'fulfilled' }, { id: 6, slipSeq: 1, sku: "b'x", qty: 1, status: 'requested' }],
+      methodOptions: ['定形外', 'ネコポス'], shipChangeReasons: ['入らない', 'その他'] }],
+    ['PAS with transferredIn', { kind: 'pas', batch: { id: 1, status: 'packing', slip_count: 3 }, runs: [{ phase: 'run', started_at: now, finished_at: now, paused_total_sec: 0, planned_count: 3 }],
+      dailyTotal: { total: 165, machine: 165, transferredIn: 1 }, slips: [] }],
   ];
   for (const [label, locals] of cases) {
     let html = null;
@@ -281,6 +448,23 @@ console.log('\n── line.ejs の描画 + インラインJSの構文 (2026-08-2
     try { new vm.Script(js); } catch (e) { syntaxOk = false; console.log('   ', e.message); }
     ok(syntaxOk, `${label}: インラインJSが構文エラーでない`);
     ok(!/onclick="[^"]*"[^ >]/.test(html), `${label}: onclick 属性の引用符が壊れていない`);
+    ok((html.match(/<script>/g) || []).length === (html.match(/<\/script>/g) || []).length, `${label}: script の開始/終了タグ数が一致`);
+    if (label.startsWith('MELT sorting')) {
+      ok(html.includes('id="sortToPas"') && html.includes('id="sortOther"'), `${label}: PAS へ移す件数の入力がある`);
+      ok(html.includes('id="reqCard"') && html.includes('ピッキングへ送信') && html.includes('見つかった'), `${label}: 依頼カード (未送信候補・SKU単位の見つかった)`);
+      ok(!html.includes('全部受け取った'), `${label}: 未送信候補が残る間は「全部受け取った」を出さない`);
+      ok(!html.includes('foundSku(1,'), `${label}: SKU を onclick に文字列埋め込みしない`);
+      ok(html.includes('data-sku="b&#39;x"'), `${label}: SKU は data 属性でエスケープして渡す (記号入りも加工しない)`);
+      ok(!html.includes('<太郎>') && html.includes('\\u003c太郎>'), `${label}: 埋め込み JSON の < がエスケープされる`);
+    }
+    if (label.startsWith('PAS with transferredIn')) {
+      ok(html.includes('MELT-LINE から移した分'), `${label}: 累計に MELT からの振替が表示される`);
+      ok(html.includes('計測中') === false || html.includes('live'), `${label}: 描画OK`);
+    }
+    if (label === 'PAS running') ok(html.includes('計測中'), `${label}: 計測中の表示がある`);
+    if (label === 'PAS paused') ok(html.includes('計測停止中'), `${label}: 中断中は計測停止中の表示`);
+    if (label === 'PAS stopped') ok(!html.includes('⏱ 計測中'), `${label}: 停止後は計測中バーが出ない`);
+    ok(html.includes('一覧へ戻る'), `${label}: 一覧へ戻るボタンがある`);
   }
 }
 

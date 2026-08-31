@@ -15,7 +15,7 @@
     .line-head h1 { font-size: 1.3rem; margin: 8px 0; }
     .line-kind { font-size: .85rem; color: #555; }
     .phase-card { background: #fff; border-radius: 12px; padding: 16px; margin: 12px 0; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-    .phase-card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; justify-content: space-between; }
+    .phase-card h2 { font-size: 1.05rem; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .phase-card.disabled { opacity: .55; }
     .phase-meta { font-size: .95rem; color: #333; line-height: 1.9; }
     .phase-meta b { font-size: 1.2rem; }
@@ -27,11 +27,28 @@
     .handover { background: #fef7e0; border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 1rem; }
     .form-row { margin: 10px 0; }
     .form-row label { display: block; font-size: .9rem; color: #555; margin-bottom: 4px; }
-    .form-row input[type=number], .form-row input[type=text] { width: 100%; padding: 12px; font-size: 1.2rem;
-      border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; }
+    .form-row input[type=number], .form-row input[type=text], .form-row select { width: 100%; padding: 12px; font-size: 1.2rem;
+      border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; background: #fff; }
     .worker-row { display: flex; gap: 8px; align-items: center; margin: 10px 0; }
     .worker-row select { flex: 1; padding: 10px; font-size: 1.05rem; border-radius: 8px; }
     .timer { font-variant-numeric: tabular-nums; color: #1a73e8; font-weight: 700; }
+    /* ← 一覧へ: リンクでは小さくて押しにくい (2026-08-31 現場意見) → ボタン */
+    .list-btn { display: inline-flex; align-items: center; gap: 6px; padding: 12px 18px; font-size: 1.05rem; font-weight: 700;
+      border: 2px solid #1a73e8; border-radius: 10px; background: #fff; color: #1a73e8; text-decoration: none; }
+    .list-btn.bottom { display: flex; justify-content: center; width: 100%; box-sizing: border-box; padding: 16px; margin: 16px 0 8px; }
+    /* 計測中の表示 (2026-08-31 現場意見: 動いているのか止まっているのか分からない) */
+    .live { display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 999px; font-weight: 700;
+      font-size: .95rem; background: #e6f4ea; color: #137333; white-space: nowrap; }
+    .live::before { content: ''; width: 10px; height: 10px; border-radius: 50%; background: #1e8e3e; animation: blink 1.2s ease-in-out infinite; }
+    .live.stopped { background: #fff3cd; color: #7a5b00; }
+    .live.stopped::before { background: #f9ab00; animation: none; }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+    @media (prefers-reduced-motion: reduce) { .live::before { animation: none; } }
+    .live-bar { position: sticky; top: 0; z-index: 40; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 10px 14px; border-radius: 0 0 12px 12px; font-weight: 700; font-size: 1.05rem; }
+    .live-bar.running { background: #137333; color: #fff; }
+    .live-bar.paused { background: #f9ab00; color: #202124; }
+    .live-bar .timer { color: inherit; font-size: 1.15rem; }
     .top-link { font-size: .9rem; }
     .big-btn.pause { background: #f9ab00; color: #202124; }
     .big-btn.resume { background: #1a73e8; padding: 22px; font-size: 1.4rem; }
@@ -39,7 +56,22 @@
     .reason-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
     .reason-grid button { padding: 16px 8px; font-size: 1.1rem; border: 1px solid #ccc; border-radius: 10px; background: #fff; }
     .reason-grid .cancel { grid-column: 1 / -1; background: none; border: none; color: #868e96; }
+    .reason-grid .wide { grid-column: 1 / -1; }
     .stop-hint { font-size: .9rem; color: #555; margin-top: 8px; }
+    .split-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    /* 伝票ごとの依頼 (紙で作業する分) */
+    .req-grid { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 10px; }
+    .req-grid button { padding: 14px 10px; font-size: 1.05rem; font-weight: 700; border: 1px solid #ccc; border-radius: 10px; background: #fff; text-align: left; }
+    .req-grid button:disabled { opacity: .5; }
+    .slip-info { background: #f1f3f5; border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: .95rem; line-height: 1.7; }
+    .slip-info .nm { font-weight: 700; }
+    .open-req { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 8px; margin-top: 8px; background: #fff3cd; font-size: .95rem; }
+    .open-req.ready { background: #e6f4ea; }
+    .open-req .grow { flex: 1 1 200px; }
+    .open-req button { padding: 10px 14px; font-size: 1rem; font-weight: 700; border-radius: 8px; border: 1px solid #ccc; background: #fff; }
+    .open-req button.primary { background: #188038; color: #fff; border-color: #188038; }
+    .open-req button.danger { background: #e03131; color: #fff; border-color: #e03131; }
+    .sub { font-size: .85rem; color: #868e96; font-weight: 400; }
   </style>
 </head>
 <body>
@@ -56,24 +88,43 @@
     const sort = runs.find((r) => r.phase === 'sort') || null;
     const run = runs.find((r) => r.phase === 'run') || null;
     const runPlanned = run ? run.planned_count : (kind === 'melt' ? (sort?.final_count ?? null) : batch.slip_count);
+    // 計測中 = 開始済み・未停止の工程 (仕分け or 流し)。中断中は「計測停止中」
+    const liveRun = (sort && !sort.finished_at) ? sort : ((run && !run.finished_at) ? run : null);
+    const liveLabel = liveRun ? (liveRun.phase === 'sort' ? '仕分け' : '機械流し') : null;
+    const lineName = kind === 'melt' ? 'MELT-LINE' : 'PAS-LINE';
+    const transferredIn = dailyTotal.transferredIn || 0;
+    // 伝票ごとの依頼: 保留 (再ピック) 中の伝票と、その状態 (候補=未送信 / requested,claimed=依頼中 / fulfilled=受取可)
+    const slipList = (typeof slips !== 'undefined' && Array.isArray(slips)) ? slips : [];
+    const incList = (typeof incidents !== 'undefined' && Array.isArray(incidents)) ? incidents : [];
+    const repickMap = (typeof repickBySlip !== 'undefined' && repickBySlip) ? repickBySlip : {};
+    const taskList = (typeof tasks !== 'undefined' && Array.isArray(tasks)) ? tasks : [];
+    const heldSlips = slipList.filter((x) => x.status === 'held' && x.holdReason === 'repick');
+    const TASK_LABEL = { requested: '⏳ ピッカー対応待ち', claimed: '🏃 ピッカーが取りに行っています', fulfilled: '✅ 届きました' };
   %>
+  <% if (liveRun) { %>
+    <div class="live-bar <%= isPaused ? 'paused' : 'running' %>">
+      <span><%= isPaused ? '⏸ 計測停止中 (一時中断)' : `⏱ 計測中 — ${liveLabel}` %></span>
+      <span class="timer" <%- timerAttrs(liveRun) %>></span>
+    </div>
+  <% } %>
   <div class="line-wrap">
     <div class="line-head">
       <div>
-        <h1>🏭 <%= batch.folder_name || batch.tb_key %> — <%= kind === 'melt' ? 'MELT-LINE' : 'PAS-LINE' %></h1>
+        <h1>🏭 <%= batch.folder_name || batch.tb_key %> — <%= lineName %></h1>
         <div class="line-kind"><%= hikiateClass %></div>
       </div>
-      <a class="top-link" href="/apps/packing/">← 一覧へ</a>
+      <a class="list-btn" href="/apps/packing/">← 一覧へ戻る</a>
     </div>
 
     <div class="phase-meta">
       予定 <b><%= batch.slip_count %></b> 件
       <span class="st <%= batch.status %>"><%= statusLabels[batch.status] || batch.status %></span>
       <% if (batch.worker) { %> / 👤 <%= batch.worker %><% } %>
+      <% if (liveRun) { %> / <span class="live <%= isPaused ? 'stopped' : '' %>"><%= isPaused ? '計測停止中' : '計測中' %></span><% } %>
     </div>
     <div class="done-note" style="background:#e8f0fe;">
       📟 本日このラインの累計: 出荷 <b><%= dailyTotal.total %></b> 件
-      (機械通過 <b><%= dailyTotal.machine %></b> 件) — 日付が変わるとリセット
+      (機械通過 <b><%= dailyTotal.machine %></b> 件<% if (transferredIn > 0) { %>・うち MELT-LINE から移した分 <b><%= transferredIn %></b> 件<% } %>) — 日付が変わるとリセット
     </div>
 
     <% if (isPaused) { %>
@@ -94,7 +145,7 @@
 
     <% if (kind === 'melt') { %>
       <div class="phase-card">
-        <h2>① 仕分け <% if (sort?.finished_at) { %><span>✅</span><% } %></h2>
+        <h2>① 仕分け <% if (sort?.finished_at) { %><span>✅</span><% } else if (sort && !isPaused) { %><span class="live">計測中</span><% } %></h2>
         <% if (!sort) { %>
           <p>機械に流す前の仕分けを開始します (<%= batch.slip_count %>件)。</p>
           <button class="big-btn" onclick="send('line_sort_start')">仕分け開始</button>
@@ -104,13 +155,19 @@
           <% if (!isPaused) { %>
             <button class="big-btn pause" type="button" onclick="openPause()">⏸ 一時中断 (資材交換・休憩など → あとで再開)</button>
           <% } %>
-          <div class="form-row">
-            <label>他の方法で出荷する件数 (配送方法変更などで機械に流さない分。無ければ 0)</label>
-            <input type="number" id="sortExcluded" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="0"
-              oninput="sortCalc()">
+          <div class="split-row">
+            <div class="form-row">
+              <label>PAS-LINE (3つ折り) へ移す件数</label>
+              <input type="number" id="sortToPas" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="0" oninput="sortCalc()">
+            </div>
+            <div class="form-row">
+              <label>その他の方法で出荷する件数 (配送方法変更など)</label>
+              <input type="number" id="sortOther" inputmode="numeric" min="0" max="<%= sort.planned_count %>" value="0" oninput="sortCalc()">
+            </div>
           </div>
           <div class="handover">🏭 機械に流す件数: <b id="sortFlowCount"><%= sort.planned_count %></b> 件
-            (伝票 <%= sort.planned_count %> − 除外 <span id="sortExShow">0</span>)</div>
+            (伝票 <%= sort.planned_count %> − 除外 <span id="sortExShow">0</span>)
+            <div class="sub" style="margin-top:4px">PAS-LINE へ移した件数は PAS の「本日の累計」に自動で足されます (機械カウンタと合わせるため)</div></div>
           <div class="form-row">
             <label>備考 (任意)</label>
             <input type="text" id="sortNote" maxlength="200" placeholder="例: 2件をネコポス手動へ変更">
@@ -118,7 +175,7 @@
           <button class="big-btn finish" onclick="sortDone(<%= sort.planned_count %>)" <%= isPaused ? 'disabled' : '' %>>仕分け完了</button>
         <% } else { %>
           <div class="done-note">
-            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> (所要 <%= durMin(sort.started_at, sort.finished_at, sort.paused_total_sec) %> 分) / 他の方法へ <b><%= sort.excluded_count ?? 0 %></b> 件
+            <%= jst(sort.started_at) %>〜<%= jst(sort.finished_at) %> (所要 <%= durMin(sort.started_at, sort.finished_at, sort.paused_total_sec) %> 分) / 他の方法へ <b><%= sort.excluded_count ?? 0 %></b> 件<% if (sort.to_pas_count) { %> (うち PAS-LINE へ <b><%= sort.to_pas_count %></b> 件)<% } %>
             → 機械に流す件数 <b><%= sort.final_count %></b> 件 (伝票 <%= sort.planned_count %> 件)
             <% if (sort.worker) { %> / 👤 仕分け: <%= sort.worker %><% } %>
             <% if (sort.note) { %> / 備考: <%= sort.note %><% } %>
@@ -128,7 +185,7 @@
     <% } %>
 
     <div class="phase-card <%= (kind === 'melt' && !sort?.finished_at) ? 'disabled' : '' %>">
-      <h2><%= kind === 'melt' ? '② 機械流し' : '機械流し' %> <% if (run?.finished_at) { %><span>✅</span><% } %></h2>
+      <h2><%= kind === 'melt' ? '② 機械流し' : '機械流し' %> <% if (run?.finished_at) { %><span>✅</span><% } else if (run && !isPaused) { %><span class="live">計測中</span><% } %></h2>
       <% if (kind === 'melt' && sort?.finished_at && !run) { %>
         <div class="handover">📋 申し送り: 仕分け後の機械に流す件数は <b><%= sort.final_count %></b> 件です
           <% if (sort.worker) { %>(仕分け担当: <%= sort.worker %>)<% } %></div>
@@ -167,7 +224,11 @@
           <% if (run.worker) { %>👤 流し: <%= run.worker %> — <% } %><b>件数を入力すると完了になります。</b>
         </div>
         <div class="handover">📟 前回までの累計: 機械通過 <b><%= dailyTotal.machine %></b> 件
-          — 梱包機のカウンタ表示から <b><%= dailyTotal.machine %></b> を引いた数が今回の機械通過分です</div>
+          — 梱包機のカウンタ表示から <b><%= dailyTotal.machine %></b> を引いた数が今回の機械通過分です
+          <% if (transferredIn > 0) { %>
+            <div class="sub" style="margin-top:6px; color:#7a5b00">⚠ うち <b><%= transferredIn %></b> 件は MELT-LINE から移した分 (仕分け完了の時点で足しています)。
+              その分をまだ PAS の機械に通していなければ <b><%= dailyTotal.machine - transferredIn %></b> で計算してください</div>
+          <% } %></div>
         <div class="form-row">
           <label>出荷完了件数 (手動で流した分も含む)</label>
           <input type="number" id="runFinal" inputmode="numeric" min="0" max="<%= run.planned_count %>" value="<%= run.planned_count %>">
@@ -184,12 +245,63 @@
       <% } %>
     </div>
 
+    <% if (slipList.length > 0) { %>
+      <div class="phase-card" id="reqCard">
+        <h2>📮 伝票ごとの依頼 <span class="sub">再ピック・サイズ変更・再印刷</span></h2>
+        <div class="phase-meta" style="font-size:.9rem; color:#555">紙で作業していても、伝票を選べばここから依頼できます (梱包画面と同じ経路で届きます)。</div>
+        <% if (heldSlips.length > 0 || incList.length > 0) { %>
+          <div style="margin-top:10px; font-weight:700">進行中の依頼</div>
+          <% for (const hs of heldSlips) {
+               // SKU 単位に状態を出す (同一伝票に複数の依頼があり得る — Codex R2)。
+               // 受け取れるのは「候補が残っておらず、タスクが全部 届いた (fulfilled)」ときだけ
+               const cands = incList.filter((i) => i.slipSeq === hs.seq);
+               const tks = taskList.filter((t) => t.slipSeq === hs.seq);
+               const ready = cands.length === 0 && tks.length > 0 && tks.every((t) => t.status === 'fulfilled');
+               const nameOf = (sku) => (hs.lines.find((l) => l.sku === sku) || {}).name || sku; %>
+            <div class="open-req <%= ready ? 'ready' : '' %>" data-seq="<%= hs.seq %>">
+              <div class="grow">#<%= hs.seq %> <%= hs.slipNo %> / <%= hs.recipientName || '' %> (NE <%= hs.neSlipNo %>)
+                <% for (const c of cands) { %>
+                  <div>📝 <%= nameOf(c.sku) %> × <%= c.qty %> — <b>未送信</b>
+                    <button type="button" class="danger" onclick="resolveInc(<%= c.id %>, 'confirm')">ピッキングへ送信</button>
+                    <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= c.sku %>" data-name="<%= nameOf(c.sku) %>">見つかった</button></div>
+                <% } %>
+                <% for (const t of tks) { %>
+                  <div>🔄 <%= nameOf(t.sku) %> × <%= t.qty %> — <%= TASK_LABEL[t.status] || t.status %>
+                    <button type="button" class="found-sku" data-seq="<%= hs.seq %>" data-sku="<%= t.sku %>" data-name="<%= nameOf(t.sku) %>">見つかった</button></div>
+                <% } %>
+                <% if (cands.length === 0 && tks.length === 0) { %><div>⏳ 保留中</div><% } %>
+              </div>
+              <% if (ready) { %>
+                <button type="button" class="primary" onclick="send('receive', { slip_seq: <%= hs.seq %> })">📦 全部受け取った</button>
+              <% } %>
+              <button type="button" onclick="foundSlip(<%= hs.seq %>)">全部見つかった (取下げ)</button>
+            </div>
+          <% } %>
+        <% } %>
+        <div class="form-row" style="margin-top:14px">
+          <label>伝票を選ぶ (伝票番号・SP番号・お届け先名で絞り込み)</label>
+          <input type="text" id="slipFilter" placeholder="例: 1540783 / SP / 山田" oninput="filterSlips()">
+          <select id="slipPick" style="margin-top:8px" onchange="showSlip()">
+            <option value="">— 伝票を選択 —</option>
+          </select>
+        </div>
+        <div class="slip-info" id="slipInfo" style="display:none"></div>
+        <div class="req-grid">
+          <button type="button" id="reqRepickBtn" onclick="reqRepick()" disabled>🔄 商品が足りない → 再ピック依頼 (ピッキングへ送信)</button>
+          <button type="button" id="reqShipBtn" onclick="reqShip()" disabled>📦 サイズ・配送方法の変更依頼 (事務へ通知)</button>
+          <button type="button" id="reqReprintBtn" onclick="reqReprint()" disabled>🖨 伝票の再印刷依頼 (事務へ通知)</button>
+        </div>
+      </div>
+    <% } %>
+
     <% if (runs.length > 0) { %>
       <div style="text-align:center; margin: 16px 0;">
         <button style="background:none; border:none; color:#c5221f; font-size:.95rem; text-decoration:underline;"
           onclick="lineUndo()">↩ 直前の記録を取り消す</button>
       </div>
     <% } %>
+
+    <a class="list-btn bottom" href="/apps/packing/">← 一覧へ戻る</a>
   </div>
 
   <div id="pauseBox" class="phase-card" style="display:none; position:fixed; left:12px; right:12px; bottom:12px; max-width:616px; margin:0 auto; box-shadow:0 4px 16px rgba(0,0,0,.25); z-index:50">
@@ -202,8 +314,16 @@
     </div>
   </div>
 
+  <div id="reqBox" class="phase-card" style="display:none; position:fixed; left:12px; right:12px; bottom:12px; max-width:616px; margin:0 auto; box-shadow:0 4px 16px rgba(0,0,0,.25); z-index:50; max-height:80vh; overflow:auto">
+    <h2 id="reqBoxTitle"></h2>
+    <div id="reqBoxBody"></div>
+  </div>
+
   <script>
     const BATCH_ID = <%= batch.id %>;
+    const SLIPS = <%- JSON.stringify(slipList).replace(/</g, '\\u003c') %>;
+    const METHOD_OPTIONS = <%- JSON.stringify((typeof methodOptions !== 'undefined' && methodOptions) || []).replace(/</g, '\\u003c') %>;
+    const SHIP_REASONS = <%- JSON.stringify((typeof shipChangeReasons !== 'undefined' && shipChangeReasons) || []).replace(/</g, '\\u003c') %>;
     const workerSel = document.getElementById('worker');
     const savedWorker = localStorage.getItem('packLineWorker');
     if (savedWorker) workerSel.value = savedWorker;
@@ -219,40 +339,46 @@
     }, 1000);
 
     let sending = false;
+    // 1操作 = 1 op_id で最大3回まで同一内容を再送 (通信失敗時)。戻り値 { ok, status, body } / 通信断は null
+    async function post(url, payloadObj) {
+      const payload = JSON.stringify(payloadObj);
+      for (let attempt = 1; ; attempt++) {
+        let res;
+        try {
+          res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload });
+        } catch (e) {
+          if (attempt >= 3) { alert(`通信エラー: ${e.message}\n電波の良い場所でもう一度お試しください。`); return null; }
+          await new Promise((r) => setTimeout(r, 1500));
+          continue;   // 同一 op_id で再送 (サーバー側は replay として同じ結果を返す)
+        }
+        const body = await res.json().catch(() => ({}));
+        return { ok: res.ok, status: res.status, body };
+      }
+    }
+    function eventPayload(event, extra = {}) {
+      // op_id は1操作につき1回だけ生成し、通信失敗時は同じ内容で再送する
+      // (Codex high: タップごとの新op_idだと「保存成功+応答喪失→再タップ」が already_done になる。
+      //  特に line_stop はタップ時刻が正なので、同一op_idのreplayで時刻が守られる)
+      return {
+        op_id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        event, worker_name: workerSel.value, client_at: new Date().toISOString(), ...extra,
+      };
+    }
     async function send(event, extra = {}) {
       if (sending) return;
       const worker = workerSel.value;
       if (!worker) { alert('作業者を選択してください'); return; }
       sending = true;
-      // op_id は1操作につき1回だけ生成し、通信失敗時は同じ内容で再送する
-      // (Codex high: タップごとの新op_idだと「保存成功+応答喪失→再タップ」が already_done になる。
-      //  特に line_stop はタップ時刻が正なので、同一op_idのreplayで時刻が守られる)
-      const payload = JSON.stringify({
-        op_id: `line-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        event, worker_name: worker, client_at: new Date().toISOString(), ...extra,
-      });
       try {
-        for (let attempt = 1; ; attempt++) {
-          let res;
-          try {
-            res = await fetch(`/apps/packing/api/batches/${BATCH_ID}/events`, {
-              method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload,
-            });
-          } catch (e) {
-            if (attempt >= 3) { alert(`通信エラー: ${e.message}\n電波の良い場所でもう一度お試しください。`); return; }
-            await new Promise((r) => setTimeout(r, 1500));
-            continue;   // 同一 op_id で再送 (サーバー側は replay として同じ結果を返す)
-          }
-          const body = await res.json().catch(() => ({}));
-          if (!res.ok) {
-            alert(body.error || `エラー (${res.status})`);
-            // 409 = 状態が進んでいる (別端末・応答喪失後の再タップ等) → 画面を実状態に同期
-            if (res.status === 409) location.reload();
-            return;
-          }
-          location.reload();
+        const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload(event, extra));
+        if (!r) return;
+        if (!r.ok) {
+          alert(r.body.error || `エラー (${r.status})`);
+          // 409 = 状態が進んでいる (別端末・応答喪失後の再タップ等) → 画面を実状態に同期
+          if (r.status === 409) location.reload();
           return;
         }
+        location.reload();
       } finally {
         sending = false;
       }
@@ -264,20 +390,30 @@
       if (!Number.isInteger(v) || v < 0) { alert(`${label}が不正です`); return null; }
       return v;
     }
+    // 仕分けの除外 = PAS-LINE へ移す + その他 (空欄は 0)
+    function sortParts() {
+      const p = document.getElementById('sortToPas');
+      const o = document.getElementById('sortOther');
+      const planned = Number(p.max);
+      const toPas = p.value.trim() === '' ? 0 : Number(p.value);
+      const other = o.value.trim() === '' ? 0 : Number(o.value);
+      const valid = Number.isInteger(toPas) && Number.isInteger(other) && toPas >= 0 && other >= 0 && toPas + other <= planned;
+      return { planned, toPas, other, ex: toPas + other, valid };
+    }
     function sortCalc() {
-      const el = document.getElementById('sortExcluded');
-      const planned = Number(el.max);
-      const ex = el.value.trim() === '' ? 0 : Number(el.value);
-      const valid = Number.isInteger(ex) && ex >= 0 && ex <= planned;
-      document.getElementById('sortFlowCount').textContent = valid ? planned - ex : '—';
-      document.getElementById('sortExShow').textContent = valid ? ex : '?';
+      const s = sortParts();
+      document.getElementById('sortFlowCount').textContent = s.valid ? s.planned - s.ex : '—';
+      document.getElementById('sortExShow').textContent = s.valid ? s.ex : '?';
     }
     function sortDone(planned) {
-      const raw = document.getElementById('sortExcluded').value.trim();
-      const ex = raw === '' ? 0 : Number(raw);   // 空欄=除外なし (0) 扱い
-      if (!Number.isInteger(ex) || ex < 0 || ex > planned) { alert('他の方法で出荷する件数が不正です'); return; }
-      if (!confirm(`他の方法へ ${ex} 件 → 機械に流す ${planned - ex} 件で仕分け完了にしますか?`)) return;
-      send('line_sort_done', { excluded_count: ex, note: document.getElementById('sortNote').value || null });
+      const s = sortParts();
+      if (!s.valid) { alert('他の方法で出荷する件数が不正です (合計は伝票数まで)'); return; }
+      const parts = [];
+      if (s.toPas > 0) parts.push(`PAS-LINE へ ${s.toPas} 件`);
+      if (s.other > 0) parts.push(`その他の方法へ ${s.other} 件`);
+      const head = parts.length > 0 ? parts.join('・') + ' → ' : '除外なし → ';
+      if (!confirm(`${head}機械に流す ${planned - s.ex} 件で仕分け完了にしますか?`)) return;
+      send('line_sort_done', { excluded_count: s.ex, to_pas_count: s.toPas, note: document.getElementById('sortNote').value || null });
     }
     function runDone() {
       const v = intOf('runFinal', '出荷完了件数');
@@ -301,6 +437,146 @@
     function lineUndo() {
       if (!confirm('直前の記録 (件数→停止→流し開始→仕分け完了→仕分け開始の順) を1段取り消します。よろしいですか?')) return;
       send('undo', { reason: '誤タップ' });
+    }
+
+    // ── 伝票ごとの依頼 (紙で作業する MELT/PAS でも再ピック・配送変更・再印刷を出せる — 2026-08-31) ──
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const slipPick = document.getElementById('slipPick');
+    const bySeq = new Map(SLIPS.map((x) => [x.seq, x]));
+    function slipLabel(x) {
+      return `#${x.seq} ${x.slipNo || ''} / ${x.recipientName || ''} (NE ${x.neSlipNo})`;
+    }
+    function filterSlips() {
+      if (!slipPick) return;
+      const q = document.getElementById('slipFilter').value.trim().toLowerCase();
+      const keep = slipPick.value;
+      const opts = ['<option value="">— 伝票を選択 —</option>'];
+      for (const x of SLIPS) {
+        const hay = `${x.seq} ${x.slipNo || ''} ${x.neSlipNo || ''} ${x.siteOrderNo || ''} ${x.recipientName || ''}`.toLowerCase();
+        if (q && !hay.includes(q)) continue;
+        opts.push(`<option value="${x.seq}">${esc(slipLabel(x))}</option>`);
+      }
+      slipPick.innerHTML = opts.join('');
+      if (keep && bySeq.has(Number(keep)) && [...slipPick.options].some((o) => o.value === keep)) slipPick.value = keep;
+      showSlip();
+    }
+    function selectedSlip() {
+      const v = slipPick ? Number(slipPick.value) : 0;
+      return v > 0 ? bySeq.get(v) || null : null;
+    }
+    function showSlip() {
+      const x = selectedSlip();
+      const info = document.getElementById('slipInfo');
+      for (const id of ['reqRepickBtn', 'reqShipBtn', 'reqReprintBtn']) document.getElementById(id).disabled = !x;
+      if (!x) { info.style.display = 'none'; return; }
+      const held = x.status === 'held' && x.holdReason === 'repick';
+      info.innerHTML = `<div class="nm">${esc(slipLabel(x))}</div>`
+        + `<div>配送方法: ${esc(x.deliveryMethod || '—')}${x.siteOrderNo ? ` / 受注番号: ${esc(x.siteOrderNo)}` : ''}${held ? ' / <b>⏳ 再ピック保留中</b>' : ''}</div>`
+        + x.lines.map((l) => `<div>・${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × <b>${l.qty}</b></div>`).join('');
+      info.style.display = 'block';
+      // 保留中でも別の商品の不足は追加で出せる (同じ伝票で2品目不足 — Codex R1)。同じ商品の二重依頼はサーバーが 409
+    }
+    if (slipPick) filterSlips();
+    function openReqBox(title, html) {
+      document.getElementById('reqBoxTitle').textContent = title;
+      document.getElementById('reqBoxBody').innerHTML = html;
+      document.getElementById('reqBox').style.display = 'block';
+    }
+    function closeReqBox() { document.getElementById('reqBox').style.display = 'none'; }
+    const cancelBtn = '<button type="button" class="cancel" onclick="closeReqBox()">やめる</button>';
+
+    // 🔄 不足 → 再ピック依頼: 候補の記録 (shortage) と送信 (confirm) を続けて行う。
+    //    ラインは終了画面が無いので、その場で送る (送信に失敗したら候補として残り「進行中の依頼」から送れる)
+    function reqRepick() {
+      const x = selectedSlip();
+      if (!x) return;
+      if (!workerSel.value) { alert('作業者を選択してください'); return; }
+      const rows = x.lines.map((l, i) =>
+        `<button type="button" class="wide" onclick="reqRepickQty(${x.seq}, ${i})">${esc(l.name)} <span class="sub">(${esc(l.sku)})</span> × ${l.qty}</button>`).join('');
+      const hint = x.lines.length > 1 ? '<div class="sub" style="grid-column:1/-1">2品目以上足りないときは、送ったあとにもう一度この伝票を選んで次の商品を送ってください</div>' : '';
+      openReqBox(`#${x.seq} 足りない商品は?`, `<div class="reason-grid">${rows}${hint}${cancelBtn}</div>`);
+    }
+    function reqRepickQty(seq, idx) {
+      const x = bySeq.get(seq);
+      const l = x.lines[idx];
+      let qty = l.qty;
+      if (l.qty > 1) {
+        const raw = prompt(`足りない数量 (1〜${l.qty})`, String(l.qty));
+        if (raw == null) return;
+        qty = Number(raw);
+        if (!Number.isInteger(qty) || qty < 1 || qty > l.qty) { alert('数量が不正です'); return; }
+      }
+      closeReqBox();
+      if (!confirm(`#${seq} ${l.name} × ${qty} が足りないとしてピッキングへ再ピックを依頼します。よろしいですか?`)) return;
+      sendRepick(seq, l.sku, qty);
+    }
+    async function sendRepick(seq, sku, qty) {
+      if (sending) return;
+      sending = true;
+      try {
+        const r = await post(`/apps/packing/api/batches/${BATCH_ID}/events`, eventPayload('shortage', { slip_seq: seq, sku, qty }));
+        if (!r) return;
+        if (!r.ok) { alert(r.body.error || `エラー (${r.status})`); location.reload(); return; }
+        // 直前に記録した候補 (この伝票・このSKU) を送信
+        const inc = (r.body.incidents || []).filter((i) => i.slip_seq === seq && i.sku === sku && i.status === 'candidate').pop();
+        if (!inc) { alert('候補は記録しましたが送信対象が見つかりません。画面を更新して「ピッキングへ送信」を押してください'); location.reload(); return; }
+        const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${inc.id}/resolve`, { decision: 'confirm', worker_name: workerSel.value });
+        // already_resolved かつ status が confirmed = 先の送信が届いていて応答だけ落ちた (post は同内容を再送する)
+        // → 成功扱い。取下げ済み (withdrawn) なら別操作との競合なので失敗として知らせる (Codex R4/R5)
+        const sent = c && (c.ok || (c.body.code === 'already_resolved' && c.body.status === 'confirmed'));
+        if (!sent) alert(`候補は記録しましたが送信に失敗しました${c ? ` (${c.body.error || c.status})` : ''}。「進行中の依頼」から「ピッキングへ送信」を押してください`);
+        location.reload();
+      } finally { sending = false; }
+    }
+    async function resolveInc(id, decision) {
+      if (sending) return;
+      if (!workerSel.value) { alert('作業者を選択してください'); return; }
+      if (decision === 'confirm' && !confirm('ピッキングへ再ピックを依頼します。よろしいですか?')) return;
+      sending = true;
+      try {
+        const c = await post(`/apps/packing/api/batches/${BATCH_ID}/incidents/${id}/resolve`, { decision, worker_name: workerSel.value });
+        const want = decision === 'confirm' ? 'confirmed' : 'withdrawn';
+        if (c && !c.ok && !(c.body.code === 'already_resolved' && c.body.status === want)) alert(c.body.error || `エラー (${c.status})`);
+        location.reload();
+      } finally { sending = false; }
+    }
+    function foundSlip(seq) {
+      if (!confirm(`#${seq} の足りなかった商品が【全部】見つかったため、この伝票の再ピック依頼と不足の候補をすべて取り下げます。\n(1品目だけ見つかったときは、その商品の横の「見つかった」を押してください)\nよろしいですか?`)) return;
+      send('found', { slip_seq: seq });
+    }
+    // SKU 単位の「見つかった」: その商品の依頼/候補だけ取り下げる (他の商品の依頼が残れば保留のまま)。
+    // SKU は data-* 属性から加工せずに渡す (onclick へ文字列埋め込みすると記号入り SKU が壊れる — Codex R3)
+    function foundSku(seq, sku, name) {
+      if (!confirm(`#${seq} の「${name}」が見つかったため、この商品の依頼だけ取り下げます。よろしいですか?`)) return;
+      send('found', { slip_seq: seq, sku });
+    }
+    document.querySelectorAll('.found-sku').forEach((b) => b.addEventListener('click',
+      () => foundSku(Number(b.dataset.seq), b.dataset.sku, b.dataset.name)));
+    // 📦 サイズ・配送方法の変更依頼 (梱包画面④と同じ: 提案する配送方法 → 理由 → 事務へ GChat 通知)
+    function reqShip() {
+      const x = selectedSlip();
+      if (!x) return;
+      if (!workerSel.value) { alert('作業者を選択してください'); return; }
+      const ms = METHOD_OPTIONS.filter((m) => m !== x.deliveryMethod)
+        .map((m) => `<button type="button" onclick="reqShipReason(${x.seq}, this.dataset.m)" data-m="${esc(m)}">${esc(m)}</button>`).join('')
+        || '<div style="grid-column:1/-1; color:#868e96">候補がありません</div>';
+      openReqBox(`#${x.seq} どの配送方法にしますか? (現在: ${x.deliveryMethod || '—'})`, `<div class="reason-grid">${ms}${cancelBtn}</div>`);
+    }
+    function reqShipReason(seq, method) {
+      const rs = SHIP_REASONS.map((r) => `<button type="button" onclick="reqShipSend(${seq}, this.dataset.m, this.dataset.r)" data-m="${esc(method)}" data-r="${esc(r)}">${esc(r)}</button>`).join('');
+      openReqBox(`#${seq} → ${method}: 理由は?`, `<div class="reason-grid">${rs}${cancelBtn}</div>`);
+    }
+    function reqShipSend(seq, method, reason) {
+      closeReqBox();
+      if (!confirm(`#${seq} を「${method}」へ変更するよう事務へ依頼します (理由: ${reason})。商品と納品書は変更待ちの棚へ置いてください。よろしいですか?`)) return;
+      send('ship_change', { slip_seq: seq, proposed_method: method, reason });
+    }
+    // 🖨 再印刷依頼 (押した瞬間に事務へ通知)
+    function reqReprint() {
+      const x = selectedSlip();
+      if (!x) return;
+      if (!confirm(`伝票 ${x.neSlipNo} (${x.recipientName || ''}) の再印刷を事務に依頼しますか?`)) return;
+      send('reprint', { slip_seq: x.seq });
     }
   </script>
 </body>

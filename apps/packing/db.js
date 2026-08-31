@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 17;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -404,6 +404,123 @@ const MIGRATIONS = {
     db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_printable INTEGER NOT NULL DEFAULT 0');
     db.exec('ALTER TABLE pk_pack_reprints ADD COLUMN pdf_ink_ratio REAL');
   },
+  // v14: 送り状自動印刷 P2 — 印刷キュー (要件定義 送り状自動印刷_20260827 §6)。
+  //   出荷PCの印刷エージェントが pull で取りに来る。miniPC からは出荷PCへ一切繋がない
+  //   (出荷PCの固定IP・受信ポート開放が不要になる)。
+  //   ⭐端末は既存の pk_pack_devices を kind で区別して使う (iPad と同じ発行・失効導線に乗せる)。
+  //     プリンター名は**サーバ側が端末に紐づけて持つ** — エージェント側の設定ミスで
+  //     別のプリンターに送り状を出さないため (要件§6.2)
+  14: () => {
+    db.exec(`ALTER TABLE pk_pack_devices ADD COLUMN kind TEXT NOT NULL DEFAULT 'ipad'
+             CHECK (kind IN ('ipad','agent'))`);
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN printer_name TEXT');
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN heartbeat_at TEXT');
+    db.exec('ALTER TABLE pk_pack_devices ADD COLUMN heartbeat_note TEXT');
+    // 1つの再印刷につき印刷ジョブは1つ (UNIQUE)。「もう一度押した」で二重に紙が出ないようにする。
+    //   queued → leased → dispatched → submitted → completed / failed
+    //          ↘ manual (誰も取りに来ない)        ↘ unknown (報告が来ない)
+    // 🚨 **dispatched (PDFを渡した) 時点で紙が出た可能性がある**ため、そこから先は期限切れでも
+    //    自動で配り直さない。二重印刷より欠落を選び、人に知らせて実物を見てもらう (要件§6.1)。
+    // 🚨 状態は安全の要なので CHECK でDB側にも書いておく (保守SQL・アプリのバグで未知の状態が
+    //    入ると、監視の対象からも外れて「気づかないまま出ない」になる)
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_print_jobs (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      reprint_id       INTEGER NOT NULL UNIQUE REFERENCES pk_pack_reprints(id),
+      pdf_token        TEXT NOT NULL,
+      pdf_sha256       TEXT NOT NULL,       -- 配信時に実物と突合 (差し替わったPDFを刷らない)
+      ne_slip_no       TEXT NOT NULL,
+      folder_name      TEXT,
+      printer_name     TEXT,                -- lease したデバイスに紐づく実際の出力先
+      state            TEXT NOT NULL CHECK (state IN
+                         ('queued','leased','dispatched','submitted','completed','failed','manual','unknown')),
+      lease_device_id  INTEGER REFERENCES pk_pack_devices(id),
+      lease_token      TEXT,                -- 報告時の照合 (期限切れ後の遅れた報告を弾く)
+      lease_expires_at TEXT,
+      attempt_count    INTEGER NOT NULL DEFAULT 0,
+      spool_job_id     TEXT,
+      error            TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      submitted_at     TEXT,
+      finished_at      TEXT,
+      alerted_state    TEXT,                -- GChatに鳴らし終えた状態 (送信成功後にだけ入れる)
+      -- lease を持っている状態では、誰がいつまで持っているかが必ず埋まっている
+      CHECK (state NOT IN ('leased','dispatched')
+             OR (lease_device_id IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL))
+    )`);
+    db.exec('CREATE INDEX IF NOT EXISTS idx_pk_print_jobs_state ON pk_print_jobs(state, id)');
+  },
+  // v15: 出力先を**引当分類 (= 送り状発行ソフト) ごとに決める** (中原さん指示 2026-08-28)。
+  //   引当分類によって送り状を出すソフトが違い (DENZOU / ヤマトB2 / ゆうプリR / 汎用送り状)、
+  //   したがって物理プリンターも違う。v14 の「1エージェント=1プリンター固定」では足りない。
+  //
+  //   出荷フォルダには必ず `okurijo_<slug>_*.csv` があり、この slug が発行ソフトの振り分けキー
+  //   (正本 = ロジザード作業自動化/hikiate-patterns.csv の「送り状発行ソフト」列)。
+  //   slug → プリンター名 を人が管理画面で登録し、サーバがジョブごとに出力先を決める。
+  //   🚨 対応表に無い slug は**自動印刷しない** (どこに出るか決まっていないものを刷らない)。
+  15: () => {
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_print_routes (
+      slug         TEXT PRIMARY KEY,     -- okurijo_<slug>_*.csv の slug (aes / nekoposu / 50size ...)
+      printer_name TEXT NOT NULL,        -- 出力先。エージェントはこの名前にだけ出す
+      note         TEXT,
+      updated_by   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL
+    )`);
+    // 1台のPCに複数のプリンターがぶら下がる (出荷PC / 倉庫PC など)。
+    // エージェントは**自分に登録されたプリンター宛のジョブしか受け取れない**
+    // 🚨 printer_name は UNIQUE。Windowsのプリンター名は**PCごとのローカル名**なので、
+    //    出荷PCと倉庫PCの両方に同じ「Brother QL-720」があると、どちらも同じジョブを取れて
+    //    しまい「別の物理プリンターから黙って送り状が出る」= 一番避けたい事故になる。
+    //    同名がある場合は登録時に弾き、どちらかを改名してもらう
+    db.exec(`CREATE TABLE IF NOT EXISTS pk_print_agent_printers (
+      device_id    INTEGER NOT NULL REFERENCES pk_pack_devices(id),
+      printer_name TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (device_id, printer_name)
+    )`);
+    // v14 で 1台1プリンターとして登録済みの端末を引き継ぐ (登録し直しをさせない)。
+    // 🚨 同名が複数端末にあったら OR IGNORE で片方を黙って捨てない —
+    //    どちらの実機が正しいかは業務判断で、勝手に選ぶと誤ったPCから送り状が出る
+    const dup = db.prepare(`SELECT printer_name, COUNT(*) c FROM pk_pack_devices
+      WHERE kind='agent' AND revoked_at IS NULL AND printer_name IS NOT NULL AND printer_name <> ''
+      GROUP BY printer_name HAVING c > 1`).all();
+    if (dup.length > 0) {
+      throw new Error(`同じプリンター名が複数の印刷エージェントに登録されています `
+        + `(${dup.map((d) => d.printer_name).join(', ')})。`
+        + 'どちらの実機か決められないため移行を中止しました。'
+        + '⚠ この状態では packing の管理画面も開けません (packing だけが無効になり picking は動きます)。'
+        + `data/picking.db に対して直接 `
+        + `UPDATE pk_pack_devices SET revoked_at=datetime('now') WHERE id=<残さない方のID>; `
+        + 'を実行してから再起動してください '
+        + '(端末の一覧: SELECT id,label,printer_name FROM pk_pack_devices WHERE kind=\'agent\';)');
+    }
+    db.exec(`INSERT INTO pk_print_agent_printers (device_id, printer_name)
+      SELECT id, printer_name FROM pk_pack_devices
+      WHERE kind='agent' AND revoked_at IS NULL AND printer_name IS NOT NULL AND printer_name <> ''`);
+    // ジョブは「どの分類の送り状か」を持つ (画面と監査のため。出力先の決定は enqueue 時に済む)
+    db.exec('ALTER TABLE pk_print_jobs ADD COLUMN slug TEXT');
+    // 🚨 出力先は「プリンター名」だけでなく「どの端末に出させるか」も焼き付ける。
+    //    名前はPCごとのローカル名なので、名前の持ち主が付け替わると、積んであったジョブが
+    //    別の物理プリンターから出てしまう (UNIQUE は同時点の重複しか防げない)
+    db.exec('ALTER TABLE pk_print_jobs ADD COLUMN target_device_id INTEGER REFERENCES pk_pack_devices(id)');
+    // v14 までに積まれた未処理ジョブは出力先が決まっていない (printer_name も slug も無い)。
+    // 名前一致でしか lease されなくなるので、放置すると黙って滞留する → 人に回す
+    db.exec(`UPDATE pk_print_jobs SET state='manual', finished_at=datetime('now'),
+      updated_at=datetime('now'), error='出力先の決め方が変わったため手動印刷へ回しました'
+      WHERE state IN ('queued','leased') AND (printer_name IS NULL OR printer_name = '')`);
+  },
+  // v16: 欠品フローv2 PR2 — ピッカーの「後で取りに行く」から展開された repick タスクに
+  //   出自 (pk_later_requests.id) を持たせる。ピッカーが back で取り下げるとき、
+  //   この依頼から生まれたタスクだけを正確に取消するため (SKU/伝票の一致では、梱包側が
+  //   自分で出した再ピック依頼まで巻き込みかねない)
+  16: () => {
+    db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN later_request_id INTEGER');
+  },
+  // v17: MELT 仕分けの「他の方法で出荷」の内訳に PAS-LINE へ移した件数を持つ (2026-08-31 現場意見:
+  //   3つ折りで PAS へ移した分が PAS の機械カウンタに乗り、PAS 側の累計 (164+37=201) と
+  //   カウンタ (202) が合わなかった)。to_pas_count ⊆ excluded_count。PAS の本日累計に加算する
+  17: () => {
+    db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN to_pas_count INTEGER');
+  },
 };
 
 function createCoreTables() {
@@ -428,6 +545,7 @@ function createCoreTables() {
     started_at       TEXT,
     finished_at      TEXT,
     paused_total_sec INTEGER NOT NULL DEFAULT 0,
+    to_pas_count     INTEGER,               -- v17: 除外のうち PAS-LINE へ移した件数 (MELT 仕分けのみ)
     validity         TEXT NOT NULL DEFAULT 'valid' CHECK(validity IN ('valid','invalid')),
     csv_sha256       TEXT NOT NULL,
     imported_by      TEXT NOT NULL,
@@ -569,13 +687,18 @@ import crypto from 'node:crypto';
 const hashToken = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
 const DEVICE_TTL_MS = 400 * 24 * 3600 * 1000;
 
-/** 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。 */
-export function createDevice(label, actor) {
+/**
+ * 端末を登録し、平文トークンを返す (保存はハッシュのみ。トークンはこの1回しか得られない)。
+ * kind='agent' は出荷PCの印刷エージェント — 出力先プリンターを**サーバ側で**この端末に紐づける
+ * (エージェント側の設定ミスで別のプリンターに送り状を出さないため)。
+ */
+export function createDevice(label, actor, { kind = 'ipad', printerName = null } = {}) {
   const token = crypto.randomBytes(32).toString('base64url');
   const info = getDB().prepare(`
-    INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at)
-    VALUES (?, ?, ?, ?)
-  `).run(hashToken(token), String(label).trim(), actor, utcNow());
+    INSERT INTO pk_pack_devices (token_hash, label, created_by, created_at, kind, printer_name)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(hashToken(token), String(label).trim(), actor, utcNow(), kind,
+    printerName ? String(printerName).trim() : null);
   return { token, id: Number(info.lastInsertRowid) };
 }
 
@@ -596,13 +719,93 @@ export function verifyDevice(token) {
 }
 
 export function revokeDevice(id) {
-  return getDB().prepare(
-    'UPDATE pk_pack_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'
-  ).run(utcNow(), id).changes > 0;
+  const db = getDB();
+  return db.transaction(() => {
+    const changed = db.prepare(
+      'UPDATE pk_pack_devices SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL'
+    ).run(utcNow(), id).changes > 0;
+    // 失効した端末がプリンター名を握ったままだと、代わりのPCを同じ名前で登録できない。
+    // 名前は「いま印刷できる端末」だけが持つ
+    if (changed) db.prepare('DELETE FROM pk_print_agent_printers WHERE device_id = ?').run(id);
+    return changed;
+  }).immediate();
 }
 
 export function listDevices() {
+  const rows = getDB().prepare(`SELECT id, label, created_by, created_at, last_seen_at, revoked_at,
+    kind, printer_name, heartbeat_at, heartbeat_note FROM pk_pack_devices ORDER BY id`).all();
+  const printers = getDB().prepare(
+    'SELECT device_id, printer_name FROM pk_print_agent_printers ORDER BY printer_name').all();
+  for (const r of rows) {
+    r.printers = printers.filter((p) => p.device_id === r.id).map((p) => p.printer_name);
+  }
+  return rows;
+}
+
+/** エージェント端末に「このPCから出せるプリンター」を登録する (全置換)。 */
+export function setAgentPrinters(deviceId, printerNames) {
+  const db = getDB();
+  const raw = (printerNames || []).map((n) => String(n || '').trim());
+  // 不正な項目を黙って捨てると「登録したつもりが入っていない」= 印刷されないのに気づけない
+  if (raw.some((n) => !n || n.length > 120)) {
+    return { ok: false, reason: 'bad_printer', message: 'プリンター名は1〜120文字で入力してください' };
+  }
+  const names = [...new Set(raw)];
+  // 🚨 検査と書き込みを1つのトランザクションにまとめる。分けると、同じ名前を同時に
+  //    登録した2人が両方とも事前検査を通り、片方が UNIQUE 例外で落ちる。
+  //    そのとき新規登録側は「端末だけできてプリンターが空」の状態を残してしまう
+  try {
+    return db.transaction(() => {
+      const dev = db.prepare(
+        "SELECT id FROM pk_pack_devices WHERE id=? AND kind='agent' AND revoked_at IS NULL").get(deviceId);
+      if (!dev) return { ok: false, reason: 'not_agent', message: '有効な印刷エージェント端末ではありません' };
+      // 同名プリンターが別の**有効な**端末に登録済み = どちらの物理プリンターか決められない
+      const taken = names.filter((n) => db.prepare(`SELECT p.device_id FROM pk_print_agent_printers p
+        JOIN pk_pack_devices d ON d.id = p.device_id AND d.revoked_at IS NULL
+        WHERE p.printer_name=? AND p.device_id<>?`).get(n, deviceId));
+      if (taken.length > 0) {
+        return {
+          ok: false,
+          reason: 'duplicate_printer',
+          message: `「${taken.join('」「')}」は別の端末に登録済みです。`
+            + 'プリンター名はPCごとのローカル名なので、同じ名前だとどちらの実機か決められません '
+            + '(どちらかのPCで名前を変えてください)',
+        };
+      }
+      // 手放そうとしている名前に未処理のジョブが残っていたら拒否する。
+      // その名前を別のPCが引き取ると、積んであったジョブが別の実機から出てしまう
+      const dropping = db.prepare('SELECT printer_name FROM pk_print_agent_printers WHERE device_id=?')
+        .all(deviceId).map((r) => r.printer_name).filter((n) => !names.includes(n));
+      const busy = dropping.filter((n) => db.prepare(
+        "SELECT 1 FROM pk_print_jobs WHERE printer_name=? AND state IN ('queued','leased','dispatched','submitted')")
+        .get(n));
+      if (busy.length > 0) {
+        return {
+          ok: false,
+          reason: 'printer_busy',
+          message: `「${busy.join('」「')}」にはまだ印刷待ちの送り状があります。`
+            + '先にそれが片づく (または手動印刷へ回る) のを待ってから外してください',
+        };
+      }
+      db.prepare('DELETE FROM pk_print_agent_printers WHERE device_id=?').run(deviceId);
+      const ins = db.prepare('INSERT INTO pk_print_agent_printers (device_id, printer_name) VALUES (?,?)');
+      for (const n of names) ins.run(deviceId, n);
+      // 画面の互換表示用に代表1つを残す (出力先の決定には使わない)
+      db.prepare('UPDATE pk_pack_devices SET printer_name=? WHERE id=?').run(names[0] ?? null, deviceId);
+      return { ok: true, printers: names };
+    }).immediate();
+  } catch (e) {
+    // 同時実行で UNIQUE に当たった場合も、例外ではなく同じ「重複」として返す
+    if (String(e.code || '').includes('SQLITE_CONSTRAINT')) {
+      return { ok: false, reason: 'duplicate_printer', message: 'そのプリンター名は別の端末に登録されています' };
+    }
+    throw e;
+  }
+}
+
+/** その端末から出せるプリンター名の一覧。 */
+export function agentPrintersOf(deviceId) {
   return getDB().prepare(
-    'SELECT id, label, created_by, created_at, last_seen_at, revoked_at FROM pk_pack_devices ORDER BY id'
-  ).all();
+    'SELECT printer_name FROM pk_print_agent_printers WHERE device_id=? ORDER BY printer_name')
+    .all(deviceId).map((r) => r.printer_name);
 }

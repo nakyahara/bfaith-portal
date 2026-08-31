@@ -23,9 +23,9 @@ import {
 import {
   parseCs03002, importBatch, formatLocation, PkError, getWorkState, applyEvent,
   deriveFolderName, isStaleInstructDate, getDailySummary, PAUSE_REASONS,
-  getPickingStats, getTodayProgress, getMissStats, STATS_WINDOW_DAYS, STATS_MIN_DATE,
+  getPickingStats, getTodayProgress, getMissStats, statsRange, loadStatsLines, STATS_WINDOW_DAYS, STATS_MIN_DATE,
 } from './service.js';
-import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert } from './service.js';
+import { reconcileRepickBatches, createFloorAlert, listFloorAlerts, ackFloorAlert, listShortageAllocations, bindPendingLaterRequests } from './service.js';
 import { notifyShortage, notifyShortageUndo } from './notify.js';
 import { allPatternNames } from './patterns.js';
 import { fetchStockLocations, listStockCandidates, stockLookupConfigured } from './stock-locations.js';
@@ -37,7 +37,7 @@ import {
   listFaceImports, getFaceImportCsv, exportFacesCsv, ensureLocationFacesSeeded,
 } from './location-faces.js';
 import fs from 'fs';
-import { queueEnsureImages, getImageMap } from './images.js';
+import { queueEnsureImages, getImageMap, listMissingImages, missingImagesCsv, requestForceRefresh } from './images.js';
 import { listDriveFilesAcross, downloadDriveFileById } from '../../lib/drive-csv.js';
 // Drive共有ヘルパーと自動ポーリング (standaloneが起動。router は手動取込と状態表示に使う)
 import { getShippingFolders, driveCall, getPollerStatus } from './drive-sync.js';
@@ -386,8 +386,11 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         worker: worker.name,
         shortageQty: line.shortage_qty ?? line.qty,
         altFree: req.body.alt_free == null ? null : Number(req.body.alt_free),
+        allocations: listShortageAllocations(batchId, Number(req.body.line_seq)),
       }).catch((e) => console.warn(`[picking-notify] 欠品通知失敗 (${line.sku}): ${e.message}`));
     }
+    // 「後で取りに行く」を梱包タスクへ展開 (梱包が取込済みなら即・未取込なら reconcile が追いつく)
+    try { bindPendingLaterRequests(); } catch { /* fail-soft */ }
   }
   // 欠品記録の取消 (back) は通知先へ訂正を流す (通知は消せないので追送 — Codex R1)
   if (req.body.event === 'back' && !result.replayed && undoneShortage) {
@@ -631,12 +634,26 @@ router.post('/board/exit', checkOrigin, requireAdmin, api(async (req, res) => {
 
 // ボードのデータ (画面が定期取得する。全画面リロードだとチラつくため)
 router.get('/api/board', api(async (req, res) => {
-  const stats = getPickingStats({ days: parseDays(req.query.days) });
+  // 明細の読み込みは1回にして速さ統計とミス率で共有 (20秒ごと×端末数のポーリング — Codex)
+  const days = parseDays(req.query.days);
+  const range = statsRange(jstToday(), days);
+  const lineRows = loadStatsLines(range.since, range.until);
+  const stats = getPickingStats({ days, lineRows });
+  // ピッキングミス率 (中原さん指示 2026-08-31: 件数より比率・欠品はミスに含めない)
+  const miss = getMissStats({ days });
   res.set('Cache-Control', 'no-store');
   res.json({
     ok: true,
     now: new Date().toISOString(),
     today: getTodayProgress(),
+    miss: {
+      since: miss.since, until: miss.until, minLines: miss.minLines,
+      total: miss.total,
+      workers: miss.byWorker.map((w) => ({
+        worker: w.worker, name: w.name, lines: w.lines, total: w.total, stockout: w.stockout,
+        shortage: w.shortage, excess: w.excess, wrong_item: w.wrong_item, per1000: w.per1000, provisional: w.provisional,
+      })),
+    },
     stats: {
       since: stats.since, until: stats.until, days: stats.days,
       minDate: STATS_MIN_DATE,
@@ -691,6 +708,54 @@ router.get('/admin/stats', requireAdmin, (req, res) => {
     minDate: STATS_MIN_DATE,
   });
 });
+
+// ─── 画像が出ない商品の一覧 (2026-08-31 中原さん依頼) ───
+// 「ピッキング画面で写真が出ない商品」を楽天の商品管理番号つきで一覧化し、
+// 楽天側を直せば直るもの / そもそも楽天に商品が無いもの を見分けられるようにする
+function missingImagesParams(req) {
+  const until = isRealDate(String(req.query.until || '')) ? String(req.query.until) : jstToday();
+  return { until, days: parseDays(req.query.days) };
+}
+
+router.get('/admin/missing-images', requireAdmin, (req, res) => {
+  const p = missingImagesParams(req);
+  res.render(path.join(__dirname, 'views/admin_missing_images'), {
+    title: '画像が出ない商品',
+    username: req.session.email,
+    displayName: req.session.displayName,
+    isAdmin: true,
+    result: listMissingImages(p),
+    retried: req.query.retried === '1' ? Number(req.query.n || 0) : null,
+  });
+});
+
+router.get('/admin/missing-images.csv', requireAdmin, (req, res) => {
+  const p = missingImagesParams(req);
+  res.type('text/csv; charset=utf-8')
+    .set('Content-Disposition', `attachment; filename="picking-missing-images-${p.until}.csv"`)
+    .send(missingImagesCsv(listMissingImages(p)));
+});
+
+/**
+ * 一覧に出ているSKUを強制再取得する (not_found は当日中は自動再試行しないための手動の出口)。
+ * 対象は「再取得で直る可能性があり、かつ楽天の商品管理番号が引けるもの」だけ —
+ * 管理番号が引けない商品は何度呼んでも not_found で、RMS を無駄に叩くだけになる。
+ * 取込直後の自動解決と同じ直列キューに載せ、走っている間は 409 で断る (Codex R1)。
+ * all=1 で「画像なし全件 (管理番号があるもの)」に広げる。
+ */
+router.post('/admin/missing-images/retry', requireAdmin, checkOrigin, api(async (req, res) => {
+  const p = missingImagesParams(req);
+  const result = listMissingImages(p);
+  const all = String(req.query.all || '') === '1';
+  const skus = result.missing
+    .filter((x) => x.manageNumber && (all || x.retryable))
+    .map((x) => x.sku);
+  const stats = await requestForceRefresh(skus, `admin再取得(${skus.length}件)`);
+  if (stats === null) {
+    throw new PkError(409, 'image_queue_busy', '画像の取得が進行中です。少し待ってからもう一度お試しください');
+  }
+  res.json({ ok: true, requested: skus.length, stats: skus.length > 0 ? stats : null });
+}));
 
 // ─── 端末・作業者管理 (管理者・セッション必須) ───
 

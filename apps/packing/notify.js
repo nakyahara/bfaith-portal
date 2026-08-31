@@ -7,7 +7,9 @@
 
 let _warnedNoWebhook = false;
 
-export async function notifyShipChange({ folderName, neSlipNo, currentMethod, proposedMethod, reason, worker, lines = [] }) {
+export async function notifyShipChange({
+  folderName, neSlipNo, slipNo = null, currentMethod, proposedMethod, reason, worker, lines = [],
+}) {
   const url = process.env.PACKING_SHIP_CHANGE_WEBHOOK;
   if (!url) {
     if (!_warnedNoWebhook) {
@@ -18,9 +20,17 @@ export async function notifyShipChange({ folderName, neSlipNo, currentMethod, pr
   }
   // 読み手 (事務) ファースト: 何をすればいいかが1行目で分かる形 (feedback_gchat_report_reader_first)。
   // 現物は「変更待ちの棚」にある — 画面での状態管理はしない (中原さん指示 2026-08-17)
+  // ⭐元の送り状を消すのに使う番号を必ず載せる (三宅さん 2026-08-29)。
+  //   お客様管理番号 = 出荷伝票NO (SP…) から SP を除いた数字。
+  //   実データで一致を確認済み (送り状CSVの お客様管理番号 33/33 が SP番号の数字部分と一致)。
+  //   これが無いと事務は名前で探すことになり、同姓や表記ゆれで手間取る
+  //   ⚠ 接頭辞を機械的に剥がすと、採番が変わったときに「別の番号」を検索キーとして
+  //     出してしまう。いま実データで確認できている SP+数字 の形だけを通す
+  const kanri = /^SP(\d+)$/i.exec(String(slipNo ?? '').trim())?.[1] ?? null;
   const text = [
     `🚚 *配送方法の変更依頼* — NE・ロジザードの変更と送り状の再発行をお願いします (現物は変更待ち棚)`,
     `伝票: *${neSlipNo}* (${folderName || '-'})`,
+    ...(kanri ? [`🔎 元の送り状を消すとき: お客様管理番号 *${kanri}* (出荷伝票NO ${slipNo})`] : []),
     ...lines.map((l) => `・${l.name || l.sku} × ${l.qty}個`),
     `現行: ${currentMethod || '-'} → 提案: *${proposedMethod}*`,
     `理由: ${reason} / 依頼: ${worker}`,

@@ -20,6 +20,15 @@ import {
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY,
 } from './db.js';
+// 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
+import {
+  validateAiOutputLength, GENERATION_BLOCK_CODES, GENERATION_BLOCK_REASON_MAX,
+  blockGenerationDraft, unblockGenerationDraft, generationQueueSummary,
+} from './db.js';
+// 確認中 (2026-08-31): 情報待ちで工程を進められないカードの印
+import {
+  setDraftChecking, clearDraftChecking, CHECKING_REASONS, CHECKING_NOTE_MAX,
+} from './db.js';
 import {
   listStaff, createStaffWithRoles, updateStaffWithRoles, setStaffActive, staffByPortalEmail,
   listRoles, createRole, updateRole,
@@ -29,7 +38,7 @@ import {
   progressOf, setStepState, progressSummaryFor, ensureProgress, ensureProgressForMany, boardData, STEP_STATE_LABELS,
   setDetailImagesExcluded, IMAGE_KIND_LABELS,
   ESCAPE_STATUSES, deriveWithGateCheck, recomputeDraftStatus, demoteIfGateBroken, maybeBackfillDerivedStatus,
-  moveBoardCard,
+  moveBoardCard, saveBoardOrder,
 } from './lib/workflow-progress.js';
 import {
   MALLS, mallStatusOf, setMallState, mallSummaryFor, markRakutenListed,
@@ -37,6 +46,7 @@ import {
 import { createSetDraft, setDraftsOf, setInfoOf, reconcileProvisionalCode } from './services/set-derive.js';
 import { syncDraftLinks } from '../product-links/sync.js';
 import { parseDriveLink, thumbnailUrl, fileViewUrl, THUMB_WIDTHS, DRIVE_FILE_ID_PATTERN } from './lib/drive-link.js';
+import { backLinkOf } from './lib/back-link.js';
 import { attemptCardCreation, retryPendingCards, pendingCardCount, syncCardLinks, isNotionCardEnabled } from './services/notion-card.js';
 import { importFromNotion, importByNotionStatus, parseNeCodes, MAX_IMPORT_CODES } from './services/notion-import.js';
 import { importImageDbByStatus } from './services/notion-image-import.js';
@@ -44,12 +54,14 @@ import { buildPromptTemplates } from './lib/prompt-templates.js';
 import { resolveVariationGroup, resolveVariationGroupsBatch, effectiveHasVariation, mirrorReady, resolveNeDefaults, getNeCost } from './lib/variation.js';
 import { regroupToRepCode, regroupBlockReason } from './services/regroup.js';
 import { registerByCodes, syncNewProducts, intakeStatus, MAX_REGISTER_CODES } from './services/new-product-intake.js';
+import { attemptImageFolderCreation, attemptImageFolderCreationBatch, retryFailedImageFolders } from './services/drive-image-folder.js';
 import {
   transferImagesToCabinet, buildItemPayload, registerItem, parseAttributes,
   setItemVisibility, SHIPPING_METHOD_GROUPS, YAHOO_OVERRIDE_SHIPPING_GROUPS,
   fetchGenreAttributes, getCachedGenreAttributes, listDriveFolderImages, fetchShopCategoryTree, syncShopCategoriesToRms, shopCategorySyncState, buildDescriptionPreview, rakutenItemPageUrl,
   importSkuImagesFromFolder, transferSkuImagesToCabinet, syncSkuImagesToRms,
   getDriveThumbnail, SHIPPING_BANNER_LOCATIONS, COMMON_TRAILING_BANNERS, cabinetImageUrl, effectiveShippingForDraft,
+  isValidGtin, MODEL_ATTR_NAME,
 } from './services/rakuten-listing.js';
 import { assignImageSlots, MAX_IMAGE_SLOTS, MAX_NUMBERED_IMAGE } from './lib/folder-import.js';
 import { fetchGenreChildren, suggestGenreByName, genrePathOf } from './lib/ichiba-genre.js';
@@ -114,16 +126,6 @@ function loadDraftOr404(req, res) {
     return null;
   }
   return draft;
-}
-
-// 出品カードで選択済みの楽天配送方法グループ名 (未選択なら null)
-function rakutenShippingLabelOf(db, draftId) {
-  const rk = db.prepare('SELECT shipping_method_group FROM draft_rakuten WHERE draft_id = ?').get(draftId);
-  const g = rk?.shipping_method_group != null ? String(rk.shipping_method_group).trim() : '';
-  // 複合選択肢 (楽天=定形外/Yahoo!別配送) は楽天側ラベルに解決する
-  const ov = YAHOO_OVERRIDE_SHIPPING_GROUPS[g];
-  if (ov) return SHIPPING_METHOD_GROUPS[ov.rakutenGroup];
-  return g && SHIPPING_METHOD_GROUPS[g] ? SHIPPING_METHOD_GROUPS[g] : null;
 }
 
 // ─── 画面 ───────────────────────────────────────────────
@@ -239,6 +241,11 @@ router.get('/detail/:id', (req, res) => {
   for (const r of db.prepare('SELECT sku_code, price FROM draft_sku_prices WHERE draft_id = ?').all(draft.id)) {
     skuPrices[r.sku_code] = r.price;
   }
+  // SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき SKU ごとに控える)
+  const skuJans = {};
+  for (const r of db.prepare('SELECT sku_code, jan_code FROM draft_sku_jans WHERE draft_id = ?').all(draft.id)) {
+    skuJans[r.sku_code] = r.jan_code;
+  }
   const simTaxPercent = (() => {
     const t = String(yahoo?.tax_rate ?? '').trim().match(/^(\d+)/);
     if (t) return Number(t[1]);
@@ -252,11 +259,9 @@ router.get('/detail/:id', (req, res) => {
   const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id) || null;
   // 発送方法: NE 配送方法 → 楽天グループ (マップ表 + 名前一致の推測)
   const neShipping = mapNeShippingToRakuten(db, neCost?.shippingMethod);
-  const pageInfoHtml = buildPageInfoHtml({
-    productName: draft.name, info: pageInfo,
-    shippingLabel: pageInfo?.shipping_label_override
-      || (rakutenShippingLabelOf(db, draft.id) ?? neShipping.label),
-  });
+  // 「発送方法」の行は表に出さない (2026-08-31 中原さん) ので shippingLabel は渡さない。
+  // 配送方法は商品画像末尾の店舗共通バナーで見せている
+  const pageInfoHtml = buildPageInfoHtml({ productName: draft.name, info: pageInfo });
 
   const rakuten = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(draft.id) || null;
   // 出品時に商品画像の末尾へ自動追加される店舗共通バナー (画像タブのプレビュー用)。
@@ -275,18 +280,21 @@ router.get('/detail/:id', (req, res) => {
   res.render(view('detail.ejs'), {
     title: `商品ドラフト #${draft.id}`,
     displayName: req.session?.displayName || req.session?.email || '',
+    // 「← 戻る」の戻り先。ボードのカードから開いたらそのボードへ戻す (2026-08-28)
+    backLink: backLinkOf(req.query),
     draft, refs, images, specs, aiOutputs, events, yahoo, imageProduction,
     rakutenItemUrl: rakutenItemPageUrl(draft.ne_code),
     skuImages: db.prepare('SELECT * FROM draft_sku_images WHERE draft_id = ? ORDER BY sku_code').all(draft.id),
     gate: gateReasons(db, draft),
     nextStatuses,
     statusLabels: STATUS_LABELS,
+    blockLabels: GENERATION_BLOCK_CODES,
     aiKinds: AI_OUTPUT_KINDS,
     variation, hasVariation, regroup,
     rakuten, cabinetImages, genreDict,
     shopCatSyncState: shopCategorySyncState(db, draft.id, rakuten),
     thumbnailUrl, fileViewUrl,
-    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices,
+    neCost, profitSim, simTaxPercent, profitTakeRate: TAKE_RATE, skuPrices, skuJans,
     pageInfo, pageInfoHtml, neShipping,
     productTypes: PRODUCT_TYPES, categoryLabels: CATEGORY_LABELS,
     categoryLabelsByType: CATEGORY_LABELS_BY_TYPE,
@@ -309,6 +317,16 @@ router.get('/detail/:id', (req, res) => {
     setInfo: setInfoOf(db, draft.id),
     imagePriorities: IMAGE_PRIORITIES,
     materialStatuses: MATERIAL_STATUSES,
+    // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
+    modelAttrName: MODEL_ATTR_NAME,
+    // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
+    checkingReasons: CHECKING_REASONS,
+    checkingNoteMax: CHECKING_NOTE_MAX,
+    // 何日待っているか (ボードのカードと同じ数え方)。未設定なら null
+    checkingDays: (() => {
+      const t = Date.parse(draft.checking_since || '');
+      return Number.isFinite(t) ? Math.max(0, Math.floor((Date.now() - t) / 86400000)) : null;
+    })(),
     promptTemplates: buildPromptTemplates(draft, imageProduction),
   });
 });
@@ -390,12 +408,23 @@ router.post('/api/drafts', async (req, res) => {
   }
   const { id: draftId, effectiveCode, groupedFrom } = created;
 
+  // 画像フォルダの自動作成 (2026-08-27 中原さん指示): 単品のみ「商品コード_商品名」を
+  // Drive の画像置き場に作って drive_folder_url へ。失敗しても登録は成功 (fail-soft)。
+  // Drive が遅いときは 12 秒で登録レスポンスを先に返し、作成は裏で続行する (Codex R1 medium-5)
+  const folderPromise = attemptImageFolderCreation(draftId, { actor: actorOf(req) });
+  let folderTimer;
+  const imageFolder = await Promise.race([
+    folderPromise.finally(() => clearTimeout(folderTimer)),
+    new Promise((resolve) => { folderTimer = setTimeout(() => resolve({ outcome: 'pending' }), 12_000); }),
+  ]);
+
   // §5: 登録と同時に Notion カード作成 (失敗しても登録は成功。バナー+リトライで回収)
   const notion = await attemptCardCreation(draftId, { actor: actorOf(req) });
   res.json({
     ok: true, id: draftId, notion,
     ne_code: effectiveCode,
     grouped: groupedFrom ? { from: groupedFrom, to: effectiveCode, memberCount: created.memberCount } : null,
+    image_folder: imageFolder,
   });
 });
 
@@ -675,6 +704,10 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   const kind = String(req.body?.kind || '');
   if (!AI_OUTPUT_KINDS.includes(kind)) return res.status(400).json({ ok: false, error: 'invalid kind' });
   const content = cleanText(req.body?.content, 50000);
+  // 人の手直しにも同じ上限を掛ける (127字超を保存できると楽天出品時に落ちる)。
+  // 触っていない他の kind は検証しない — 既存の超過値が別欄の修正を塞がないように (Codex設計相談 high)
+  const v = validateAiOutputLength(kind, content);
+  if (!v.ok) return res.status(400).json({ ok: false, ...v });
   const db = getDB();
   db.prepare(`
     INSERT INTO draft_ai_outputs (draft_id, kind, content, edited_by_human)
@@ -683,6 +716,23 @@ router.post('/api/drafts/:id/ai-outputs', (req, res) => {
   `).run(draft.id, kind, content);
   logEvent(db, draft.id, 'ai_output_edited', kind, actorOf(req));
   res.json({ ok: true });
+});
+
+// 「人の確認待ち」の解除 (2026-08-28)。解除 = AI の claim 対象に戻すだけで、自動では何もしない。
+// body: { clear: true, blocked_at?: string }  blocked_at は画面が見ていた値 (楽観ロック)
+router.post('/api/drafts/:id/generation-block', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  if (req.body?.clear !== true) {
+    return res.status(400).json({ ok: false, error: '人が止めるのはこの画面からはできません (clear: true で解除のみ)' });
+  }
+  // blocked_at は必須: 省略できると楽観ロックを迂回して「別の理由で止め直された block」を消せてしまう (Codex R1 medium)
+  const blockedAt = cleanText(req.body?.blocked_at, 40);
+  if (!blockedAt) return res.status(400).json({ ok: false, error: 'blocked_at が必要です (画面を読み直してください)' });
+  const r = unblockGenerationDraft(getDB(), draft.id, { actor: actorOf(req), expectedBlockedAt: blockedAt });
+  if (r.result === 'not_blocked') return res.status(400).json({ ok: false, error: 'AI は止めていません (すでに解除済みです)' });
+  if (r.result === 'stale') return res.status(409).json({ ok: false, error: '別の理由で止め直されています。画面を読み直してください' });
+  res.json({ ok: true, unblocked: true });
 });
 
 // ─── API: Yahoo 向け追記項目 / 画像制作 (P1.5) ─────────────
@@ -825,6 +875,34 @@ router.post('/api/drafts/:id/image-hold', (req, res) => {
   }
 });
 
+// 「確認中」の設定 / 解除 (2026-08-31 スタッフ要望)。
+// 工程 (列) も status も動かさない — カードにラベルが出て列の先頭に並び、AI 生成キューから外れるだけ。
+// 権限は基本情報の編集と同じ扱い (誰が待たせているかは actor で残る): 情報待ちに気づいた人が
+// その場で立てられないと、結局「誰も立てないラベル」になる
+router.post('/api/drafts/:id/checking', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  // boolean の true/false だけ受ける (image-hold と同じ。欠落・文字列を「解除」に倒さない)
+  if (typeof req.body?.on !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'on は true / false で指定してください' });
+  }
+  const db = getDB();
+  try {
+    if (!req.body.on) {
+      const r = clearDraftChecking(db, draft.id, { actor: actorOf(req) });
+      return res.json({ ok: true, changed: r.changed, checking: false });
+    }
+    const note = req.body?.note !== undefined && req.body?.note !== null
+      ? cleanText(req.body.note, CHECKING_NOTE_MAX) : null;
+    const r = setDraftChecking(db, draft.id, {
+      reasonCode: req.body?.reason_code, note, actor: actorOf(req),
+    });
+    res.json({ ok: true, changed: r.changed, checking: true });
+  } catch (e) {
+    res.status(e.status === 400 ? 400 : 500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── API: 保留・除外・再開 (PR4: それ以外の手動遷移は廃止 = 工程からの導出) ──────
 
 router.post('/api/drafts/:id/status', (req, res) => {
@@ -935,10 +1013,28 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
   if (genreId && !/^\d+$/.test(genreId)) {
     return res.status(400).json({ ok: false, error: 'ジャンルIDは数字で入力してください' });
   }
-  // attributes は [{name, value}] で受けて [{name, values:[..]}] に正規化して保存
-  let attributesJson = null;
+  // メーカー型番は attributes の検証でも使うので、ここで先に読む
+  let articleNumber = cleanText(req.body?.article_number, 100);
+  // 既存の属性は複数の判定で使うので先に読む
+  const prevRkRow = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(draft.id);
+  // 既存 JSON が壊れていたら何を消したか分からなくなるので、上書きせず止める (Codex R2 medium)
+  let prevAttrs = [];
+  if (prevRkRow && String(prevRkRow.attributes_json || '').trim()) {
+    let parsedPrev = null;
+    try { parsedPrev = JSON.parse(prevRkRow.attributes_json); } catch (e) { parsedPrev = null; }
+    if (!Array.isArray(parsedPrev)) {
+      return res.status(400).json({ ok: false,
+        error: 'この商品の既存の商品属性データが壊れています。上書きすると復元できないため保存を止めました (管理者に連絡してください)' });
+    }
+    prevAttrs = parsedPrev;
+  }
+
+  // attributes は [{name, value}] で受けて [{name, values:[..]}] に正規化して保存。
+  // **送ってこない呼び出しでは既存を維持する** (Codex R3 medium): null のまま書くと
+  // 部分更新のつもりの POST や旧クライアントで、属性が全部消える
+  let rows = null;
   if (Array.isArray(req.body?.attributes)) {
-    const rows = req.body.attributes
+    rows = req.body.attributes
       .map((a) => ({ name: cleanText(a?.name, 100), value: cleanText(a?.value, 300) }))
       .filter((a) => a.name || a.value);
     for (const a of rows) {
@@ -946,11 +1042,72 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
         return res.status(400).json({ ok: false, error: '属性は「属性名」と「値」の両方を入力してください (不要な行は両方空に)' });
       }
     }
-    attributesJson = JSON.stringify(rows.map((a) => ({ name: a.name, values: [a.value] })));
+  }
+
+  // ─── メーカー型番: 入口は「メーカー型番」欄 (article_number) だけ (2026-08-31 中原さん) ───
+  // RMS でも入力項目は 1 つなのに、画面が欄と商品属性の 2 箇所に入れさせていた。
+  // 画面は属性行を出さないので、ここで属性から落として 1 箇所に寄せる。
+  //
+  // 🚨 **黙って消してはいけない** (Codex R1 high)。画面は属性側の値を隠すので、欄と違う値が
+  // 残っていると人が気づかないまま保存で消える。POST と DB の両方から集めて 400 で止める。
+  // ⭐ 止めるだけだと**画面から直せない** (Codex R2 high) ので、画面の選択ボタンから
+  // resolve_model_conflict=true で送られたときだけ旧値を捨てる (人の決定として扱う)。
+  // 🚨 判定は attributes の有無に関わらず走らせる (Codex R5 medium): 部分更新の POST で
+  // 欄だけ書き換えられると、競合状態を新しく作れてしまう
+  const modelOf = (list) => (Array.isArray(list) ? list : [])
+    .filter((a) => a && a.name === MODEL_ATTR_NAME)
+    // 旧形式 {name, value} も拾う (parseAttributes が受理する形。Codex R2 medium)
+    .flatMap((a) => (Array.isArray(a.values) ? a.values : (a.value !== undefined ? [a.value] : [])))
+    .map((v) => String(v == null ? '' : v).trim())
+    .filter(Boolean);
+  const prevModels = modelOf(prevAttrs);
+  const postModels = rows ? rows.filter((a) => a.name === MODEL_ATTR_NAME).map((a) => String(a.value || '').trim()).filter(Boolean) : [];
+  const modelValues = [...new Set([...postModels, ...prevModels])];
+  const resolveModel = req.body?.resolve_model_conflict === true;
+  if (resolveModel) {
+    // 楽観ロック (Codex R5 medium): 画面が「見た」旧値と、いま DB にある旧値が違うなら、
+    // 別のタブ・別の人が触っている。見ていない値を捨てさせない。
+    // **省略は許さない** (Codex R6 medium): 無ければ照合なしで捨てられてしまい、楽観ロックの意味がなくなる
+    if (!Array.isArray(req.body?.model_conflict_seen)) {
+      return res.status(400).json({ ok: false,
+        error: `${MODEL_ATTR_NAME}の解消には model_conflict_seen (画面で見えていた値の配列) が必要です` });
+    }
+    // 重複を持つ旧データ (同じ値が 2 行) でも解消できるよう、**両方とも集合にして**比べる
+    // (Codex R6 medium: 片側だけ重複排除すると件数差で永久に 409 になる)
+    const seen = [...new Set(req.body.model_conflict_seen.map((v) => String(v == null ? '' : v).trim()).filter(Boolean))];
+    const prevSet = [...new Set(prevModels)];
+    if (seen.length !== prevSet.length || seen.some((v) => !prevSet.includes(v))) {
+      return res.status(409).json({ ok: false, conflict: MODEL_ATTR_NAME, values: prevSet,
+        error: `この商品の${MODEL_ATTR_NAME}が別の画面から変わりました (いまの値: ${prevSet.join(' / ') || 'なし'})。画面を再読み込みしてから選び直してください` });
+    }
+  }
+  if (!resolveModel) {
+    if (modelValues.length > 1) {
+      return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
+        error: `${MODEL_ATTR_NAME}が複数あります (${modelValues.join(' / ')})。画面の警告からどれを残すか選んでください` });
+    }
+    if (modelValues.length === 1 && articleNumber && modelValues[0] !== articleNumber) {
+      return res.status(400).json({ ok: false, conflict: MODEL_ATTR_NAME, values: modelValues,
+        error: `商品属性に別の${MODEL_ATTR_NAME}「${modelValues[0]}」が残っています。画面の警告からどちらを残すか選んでください` });
+    }
+    // 欄が空で属性側にだけ値がある = 旧データ。欄へ引き上げる (値を失わない)
+    if (modelValues.length === 1 && !articleNumber) articleNumber = modelValues[0];
+  }
+
+  // 保存する属性を確定する。attributes を送ってきたらそれを、送ってこなければ既存を使い、
+  // どちらの場合も メーカー型番 の行だけは落とす (入口を 1 つに保つ)
+  let attributesJson = prevRkRow?.attributes_json ?? null;
+  if (rows) {
+    attributesJson = JSON.stringify(
+      rows.filter((a) => a.name !== MODEL_ATTR_NAME).map((a) => ({ name: a.name, values: [a.value] })));
     if (parseAttributes(attributesJson) === null) {
       return res.status(400).json({ ok: false, error: '属性の形式が不正です' });
     }
+  } else if (prevModels.length > 0) {
+    // 部分更新でも、メーカー型番の行は残さない (次の保存でまた競合として出てくる)
+    attributesJson = JSON.stringify(prevAttrs.filter((a) => !(a && a.name === MODEL_ATTR_NAME)));
   }
+
   // 店舗内カテゴリ (複数選択)。フィールドが来たときだけ入れ替える
   let shopCategoryIds = null;
   if (req.body?.shop_category_ids !== undefined) {
@@ -994,7 +1151,6 @@ router.post('/api/drafts/:id/rakuten', (req, res) => {
     whiteBgFileId = parsed.id;
   }
 
-  const articleNumber = cleanText(req.body?.article_number, 100);
   db.transaction(() => {
     db.prepare(`
       INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number,
@@ -1408,6 +1564,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   const originType = ['日本製', '海外製'].includes(b.origin_type) ? b.origin_type : null;
   const vals = {
     product_type: productType,
+    brand_name: cleanText(b.brand_name, 200),
     content_volume: cleanText(b.content_volume, 200),
     size_text: cleanText(b.size_text, 300),
     ingredients: cleanText(b.ingredients, 3000),
@@ -1445,12 +1602,12 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
   } else {
     db.prepare(`
       INSERT INTO draft_page_info (
-        draft_id, product_type, content_volume, size_text, ingredients, usage_notes,
+        draft_id, product_type, brand_name, content_volume, size_text, ingredients, usage_notes,
         origin_type, origin_country, category_label, seller_name, importer_name,
         food_name, food_ingredients, food_expiry, food_storage, save_token, save_seq
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(draft_id) DO UPDATE SET
-        product_type = excluded.product_type,
+        product_type = excluded.product_type, brand_name = excluded.brand_name,
         content_volume = excluded.content_volume, size_text = excluded.size_text,
         ingredients = excluded.ingredients, usage_notes = excluded.usage_notes,
         origin_type = excluded.origin_type, origin_country = excluded.origin_country,
@@ -1461,7 +1618,7 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
         save_token = excluded.save_token, save_seq = excluded.save_seq,
         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
     `).run(
-      draft.id, vals.product_type,
+      draft.id, vals.product_type, vals.brand_name,
       vals.content_volume, vals.size_text, vals.ingredients, vals.usage_notes,
       vals.origin_type, vals.origin_country,
       vals.category_label, vals.seller_name, vals.importer_name,
@@ -1471,14 +1628,19 @@ router.post('/api/drafts/:id/page-info', (req, res) => {
     logEvent(db, draft.id, 'page_info_saved', productType, actorOf(req));
     info = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draft.id);
   }
-  const neShip = mapNeShippingToRakuten(db, getNeCost(db, draft.ne_code)?.shippingMethod);
   res.json({
     ok: true,
     ...(isStale ? { stale: true } : {}),
     warnings: validatePageInfo(info),
     html: buildPageInfoHtml({
-      productName: draft.name, info,
-      shippingLabel: rakutenShippingLabelOf(db, draft.id) ?? neShip.label,
+      // 掲載HTMLの「商品名」行は**基本情報タブにいま入っている商品名**を使う
+      // (2026-08-28 中原さん要望)。基本情報は明示保存なので、DB の値だけを見ると
+      // 打ち替えた直後の確認で古い名前が出る。ここでは表示に使うだけで保存はしない。
+      // 「送られてこなかった (未対応クライアント)」と「空で送られた (画面で消した)」は
+      // 区別する — 空を DB 値に戻すと、消したのに古い名前が復活する (Codex R1 中)
+      // 上限は基本情報の商品名と同じ 300 (255 で切ると長い商品名で保存値と表示がズレる — Codex R2 低)
+      productName: b.product_name !== undefined ? (cleanText(b.product_name, 300) || '') : draft.name,
+      info,
     }),
   });
 });
@@ -1546,6 +1708,9 @@ router.post('/api/drafts/:id/variation/exclude', (req, res) => {
     // INSERT より前に置く: 既に除外済み (UNIQUE) の冪等リクエストでも掃除は必ず走らせる (Codex R2)。
     // 非UNIQUEの例外時はトランザクションごと巻き戻るので、この DELETE だけが残ることはない
     db.prepare('DELETE FROM draft_sku_prices WHERE draft_id = ? AND sku_code = ?')
+      .run(draft.id, code.trim().toLowerCase());
+    // SKU別JAN も同じ理由で掃除する (2026-08-28)。残すと入力欄が消えて解除できない
+    db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?')
       .run(draft.id, code.trim().toLowerCase());
     try {
       db.prepare('INSERT INTO draft_variation_exclusions (draft_id, ne_code, actor) VALUES (?, ?, ?)')
@@ -1640,6 +1805,61 @@ router.post('/api/drafts/:id/sku-prices', (req, res) => {
   res.json({ ok: true });
 });
 
+// SKU別 JANコード (2026-08-28 中原さん要望: バリエーションありのとき、ページ代表の JAN 1つだけでは
+// SKU ごとの JAN を控えられない)。空欄で送れば解除。sku-prices と同じく所属確認まで 1 トランザクション。
+// 出品 payload には使わない (バリエーションページの自動出品は P3.5 で未対応) — いまは台帳としての控え
+router.post('/api/drafts/:id/sku-jans', (req, res) => {
+  const draft = loadDraftOr404(req, res);
+  if (!draft) return;
+  const code = cleanText(req.body?.ne_code, 100);
+  if (!code) return res.status(400).json({ ok: false, error: 'ne_code が必要です' });
+  const raw = req.body?.jan_code;
+  const jan = raw == null ? '' : String(raw).trim();
+  if (jan !== '' && !isValidGtin(jan)) {
+    return res.status(400).json({ ok: false, error: 'JANコードの形式が不正です (8/12/13桁 + チェックデジット)' });
+  }
+  const db = getDB();
+  const r = db.transaction(() => {
+    const key = code.trim().toLowerCase();
+    if (jan === '') {
+      // 解除はいつでも許可 (SKU を外した後でも残った行を消せるように — sku-prices と同じ方針)
+      const info = db.prepare('DELETE FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').run(draft.id, key);
+      if (info.changes > 0) logEvent(db, draft.id, 'sku_jan_saved', `${code} = (解除)`, actorOf(req));
+      return { code: 200 };
+    }
+    const v = resolveVariationGroup(db, draft.ne_code, { draftId: draft.id });
+    if (v.kind !== 'variation') {
+      return { code: 400, error: 'このドラフトはバリエーションではありません' };
+    }
+    const inGroup = v.members.some((m) => String(m.商品コード).trim().toLowerCase() === key);
+    if (!inGroup) {
+      return { code: 409, error: `${code} はこのページのバリエーションに含まれていません。画面を再読み込みしてください` };
+    }
+    // 同じ JAN を 2 つの SKU に付けない (別商品なのに同一 JAN = モール側で弾かれる元)
+    const dup = db.prepare(
+      'SELECT sku_code FROM draft_sku_jans WHERE draft_id = ? AND jan_code = ? AND sku_code != ?'
+    ).get(draft.id, jan, key);
+    if (dup) return { code: 409, error: `JAN ${jan} は ${dup.sku_code} で既に使われています` };
+    try {
+      db.prepare(`
+        INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, ?, ?)
+        ON CONFLICT(draft_id, sku_code) DO UPDATE SET
+          jan_code = excluded.jan_code, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `).run(draft.id, key, jan);
+    } catch (e) {
+      // UNIQUE(draft_id, jan_code) の backstop (別プロセス・将来の一括取込との競合 — Codex R1 中)
+      if (/UNIQUE/i.test(String(e && e.message))) {
+        return { code: 409, error: `JAN ${jan} はこのページの別のSKUで既に使われています` };
+      }
+      throw e;
+    }
+    logEvent(db, draft.id, 'sku_jan_saved', `${code} = ${jan}`, actorOf(req));
+    return { code: 200 };
+  })();
+  if (r.code !== 200) return res.status(r.code).json({ ok: false, error: r.error });
+  res.json({ ok: true });
+});
+
 // 子SKUで作られたドラフトを代表商品コードにまとめる (人が確認してから実行する)。
 // 判定・照合・更新・監査ログは services/regroup.js が 1 トランザクションで行う
 router.post('/api/drafts/:id/regroup', (req, res) => {
@@ -1674,6 +1894,15 @@ router.post('/api/register-codes', (req, res) => {
     }[r.error] || r.error;
     return res.status(400).json({ ok: false, error: msg });
   }
+  // 画像フォルダの自動作成 (単品のみ・fail-soft)。件数が多いのでレスポンスは待たせず裏で直列実行
+  if (!r.dryRun) {
+    const ids = r.results.filter((x) => x.outcome === 'created' && x.draftId).map((x) => x.draftId);
+    if (ids.length > 0) {
+      void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
+        .then((s) => console.log(`[product-hub] 画像フォルダ一括作成: created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`))
+        .catch((e) => console.error('[product-hub] 画像フォルダ一括作成に失敗:', e.message));
+    }
+  }
   res.json(r);
 });
 
@@ -1692,6 +1921,18 @@ router.post('/api/intake/run', (req, res) => {
       ne_unique_not_enforced: '商品コードの重複 (大文字小文字違い) があるため停止しています',
     }[r.error] || r.error;
     return res.status(400).json({ ok: false, error: msg });
+  }
+  // 取込で作られた新カードにも画像フォルダを裏で作る (単品のみ・fail-soft)。
+  // あわせて過去に失敗したまま URL 空の分も回収する (Codex R1 high-3)
+  if (r.mode === 'intake' && !r.dryRun) {
+    const ids = (r.drafts || []).map((d) => d.id).filter(Boolean);
+    void attemptImageFolderCreationBatch(ids, { actor: actorOf(req) })
+      .then((s) => {
+        if (ids.length > 0) console.log(`[product-hub] 画像フォルダ一括作成(取込): created=${s.created} reused=${s.reused} skipped=${s.skipped} failed=${s.failed}`);
+        return retryFailedImageFolders({ actor: actorOf(req) });
+      })
+      .then((s) => { if (s.retried > 0) console.log(`[product-hub] 画像フォルダ再試行(取込): retried=${s.retried} created=${s.created} failed=${s.failed}`); })
+      .catch((e) => console.error('[product-hub] 画像フォルダ一括作成(取込)に失敗:', e.message));
   }
   res.json(r);
 });
@@ -1811,13 +2052,16 @@ router.get('/board', (req, res) => {
   // ?assignee=me は「ログイン中の人に紐づく担当者」。紐づけが無ければ全件表示に倒す
   const raw = String(req.query.assignee || '').trim();
   const assigneeId = raw === 'me' ? (me?.id ?? null) : (/^\d+$/.test(raw) ? Number(raw) : null);
-  const unassignedOnly = String(req.query.filter || '') === 'unassigned';
+  const filterParam = String(req.query.filter || '');
+  const unassignedOnly = filterParam === 'unassigned';
+  // 確認中だけを見る (2026-08-31 スタッフ要望: 情報待ちのカードを一括で拾う)
+  const checkingOnly = filterParam === 'checking';
   const boardView = String(req.query.view || '') === 'image' ? 'image' : 'main';
   // 画像ビューの種別絞り込み (TOP画像 / 商品詳細画像 — 2026-08-24 中原さん要望)
   const imageKind = boardView === 'image' && ['top', 'detail'].includes(String(req.query.kind || ''))
     ? String(req.query.kind) : null;
   // モール状況の解決関数を渡す (lib どうしの循環 import を避けるため呼び出し側から注入)
-  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, imageKind, mallSummary: mallSummaryFor });
+  const board = boardData(db, { view: boardView, assigneeId, unassignedOnly, checkingOnly, imageKind, mallSummary: mallSummaryFor });
   res.render(view('board.ejs'), {
     title: '工程ボード',
     displayName: req.session?.displayName || req.session?.email || '',
@@ -1828,6 +2072,7 @@ router.get('/board', (req, res) => {
     assigneeId,
     assigneeParam: raw,
     unassignedOnly,
+    checkingOnly,
     imageKind,
     thumbnailUrl,
     stepStateLabels: STEP_STATE_LABELS,
@@ -1959,6 +2204,22 @@ router.post('/api/drafts/:id/board-move', (req, res) => {
       actorStaffId: me?.id ?? null,
     });
     res.json({ ok: true, changed: r.changed });
+  } catch (e) { workflowError(res, e); }
+});
+
+// かんばん列の並び替え (2026-08-28 中原さん要望: 「動かしたカードは自由に順番を変えたい」)。
+// 画面から**その列に見えているカードの順番**を受け取り、既存の並びに差し込む (saveBoardOrder)。
+// 現場の目安情報 (重要度セレクトと同じ扱い) なのでログイン済みなら誰でも並べ替えられる。
+// 工程は動かさないので履歴 (draft_events) には残さない — ドラッグのたびに履歴が埋まる
+router.post('/api/board/reorder', (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : null;
+  if (!items) return res.status(400).json({ ok: false, error: 'items がありません' });
+  if (items.length > 1000) return res.status(400).json({ ok: false, error: 'カードが多すぎます' });
+  try {
+    // view / kind / col は saveBoardOrder 側で厳密に検証する (黙って main / top に倒すと
+    // 画面のバグや壊れたリクエストに気付けない — Codex R1 高)
+    const r = saveBoardOrder(getDB(), { view: req.body?.view, col: req.body?.col, items });
+    res.json({ ok: true, saved: r.saved });
   } catch (e) { workflowError(res, e); }
 });
 
@@ -2138,7 +2399,8 @@ serviceApiRouter.get('/generation-queue', (req, res) => {
   // キューは status='ready_for_ai' を見るので、切替バックフィル前の古い status のまま
   // 拾い漏れ・拾い過ぎが起きないよう、AI キューの入口でも自己修復する
   maybeBackfillDerivedStatus(db);
-  res.json({ ok: true, drafts: listGenerationQueue(db) });
+  // drafts = 今 claim できるもの (人の確認待ちは含まない)。queue.blocked で人待ちの件数を別枠で返す
+  res.json({ ok: true, drafts: listGenerationQueue(db), queue: generationQueueSummary(db) });
 });
 
 // 生成対象の claim (2026-08-03、Codex設計相談 Critical 対応)。
@@ -2196,7 +2458,7 @@ serviceApiRouter.post('/generation-queue/claim', async (req, res) => {
       for (const d of claimedList) d.sp_keywords_error = kwError;
     }
   }
-  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed });
+  res.json({ ok: true, run_id: runId, lease_until: r.leaseUntil, drafts: r.claimed, queue: generationQueueSummary(db) });
 });
 
 // claim の解放 (生成を断念した draft を他の実行がすぐ拾えるように)
@@ -2210,6 +2472,34 @@ serviceApiRouter.post('/drafts/:id/release', (req, res) => {
   const released = releaseGenerationClaim(db, id, runId);
   if (released) logEvent(db, id, 'generation_released', `${runId}: ${cleanText(req.body?.reason, 300) || '理由未記載'}`, 'service-api');
   res.json({ ok: true, released });
+});
+
+// 「人の確認待ち」にする (2026-08-28 夜間自動化)。release と違い、人が解除するまで claim 対象から外れる。
+// 仕様不一致 (draft は 50本・ページは 100本入り 等) は何度 claim しても生成できないので、
+// release で回すと毎晩同じ draft を掴んで捨てる無限ループになる — それを止めるための終端状態。
+// body: { run_id, code, reason }  code は GENERATION_BLOCK_CODES のキーのみ
+serviceApiRouter.post('/drafts/:id/generation-block', (req, res) => {
+  // parseInt は "123abc" を 123 と読む → 文字列全体が数字のときだけ受ける (Codex R1 low)
+  const id = /^[1-9]\d*$/.test(String(req.params.id)) ? Number(req.params.id) : NaN;
+  const runId = cleanText(req.body?.run_id, 100);
+  const code = cleanText(req.body?.code, 40);
+  if (!Number.isInteger(id) || !runId) {
+    return res.status(400).json({ ok: false, error: 'draft id と run_id が必要です' });
+  }
+  if (!code || !Object.hasOwn(GENERATION_BLOCK_CODES, code)) {
+    return res.status(400).json({ ok: false, error: `code は ${Object.keys(GENERATION_BLOCK_CODES).join(' / ')} のいずれかです` });
+  }
+  // reason は監査ログにも残るので、上限超過は黙って切り詰めずに拒否する (Codex R1 low)
+  const rawReason = req.body?.reason == null ? '' : String(req.body.reason).trim();
+  if (!rawReason) return res.status(400).json({ ok: false, error: 'reason (人向けの説明) が必要です' });
+  if ([...rawReason].length > GENERATION_BLOCK_REASON_MAX) {
+    return res.status(400).json({ ok: false, error: `reason は ${GENERATION_BLOCK_REASON_MAX} 文字までです` });
+  }
+  const reason = rawReason;
+  const r = blockGenerationDraft(getDB(), id, runId, { code, reason });
+  if (r.result === 'not_found') return res.status(404).json({ ok: false, error: 'draft not found' });
+  if (r.result === 'conflict') return res.status(409).json({ ok: false, error: r.error });
+  res.json({ ok: true, blocked: true, already: r.result === 'already' });
 });
 
 // AI 生成結果の一括書き戻し + status ready_for_ai → review
@@ -2239,6 +2529,10 @@ serviceApiRouter.post('/drafts/:id/ai-outputs', (req, res) => {
   for (const [kind, content] of Object.entries(outputs)) {
     const c = cleanText(content, 50000);
     if (!c) return res.status(400).json({ ok: false, error: `outputs.${kind} が空です` });
+    // モールの文字数上限 (楽天127/Yahoo!65/キャッチ30) はサーバで担保する (2026-08-28)。
+    // 夜間の無人実行で lint が飛ばされても、長すぎる文章がレビュー列に入らない
+    const v = validateAiOutputLength(kind, c);
+    if (!v.ok) return res.status(400).json({ ok: false, ...v });
     cleaned[kind] = c;
   }
   if (Object.keys(cleaned).length === 0) {

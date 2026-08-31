@@ -71,6 +71,29 @@ export const JOBS_REGISTRY = [
     runbook: 'C:\\tools\\picking-service\\PickingServer.out.log の [packing-drive-poller] を確認。失敗台帳は picking.db pk_pack_drive_imports'
       + ' (取込画面 /apps/packing/admin/import にも要確認一覧が出る)。復旧は Restart-Service PickingServer',
   },
+  {
+    id: 'slip-print-agent',
+    type: 'heartbeat',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: '梱包iPadの「🖨 伝票再印刷」を押したら出荷PCのサーマルプリンターから送り状を自動で出す常駐エージェント。'
+      + '出荷PC (DESKTOP-P9JLN7Q) のタスクスケジューラで SYSTEM 実行 (サインイン不要)。'
+      + 'miniPC の印刷キューへ数秒ごとに pull で聞きに行く一方向通信で、miniPC から出荷PCへは繋がない。'
+      + '止まると再印刷の紙が出ないまま滞留する (キュー側も3分で「手で刷ってください」を通知するが、'
+      + '毎回それが出る状態は運用が回らないので P1)',
+    where: '出荷PC C:\\tools\\slip-print-agent\\agent.ps1 (タスク名 BFaith-SlipPrintAgent)',
+    schedule: '常駐 (4秒間隔で /print/next・45秒ごとに heartbeat。生存 ping は1時間に1回へ間引き)',
+    // ⭐ping は**エージェント自身ではなく miniPC が中継する** (出荷PCへ JOBS_MONITOR_TOKEN を
+    //   もう1つ配らずに済ませるため)。miniPC が pk_pack_devices.heartbeat_at を見て、
+    //   10分以内なら ok を打つ = エージェントが死ねば ping も止まりここに出る
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: '出荷PCで Get-Content C:\\tools\\slip-print-agent\\work\\agent.log -Tail 30 / '
+      + 'Get-ScheduledTaskInfo -TaskName BFaith-SlipPrintAgent。'
+      + '401 = トークン失効 → /apps/packing/admin/devices で登録し直す。'
+      + '手順と切り分け表 = リポジトリ scripts/slip-print-agent/README.md。'
+      + '⚠ 未導入のうちは ping しない設計なので、この項目が出たら「導入済みなのに止まった」',
+  },
   // ─────────────── heartbeat (Render 常駐: inquiry-hub) ───────────────
   {
     id: 'inquiry-hub-sync',
@@ -97,7 +120,49 @@ export const JOBS_REGISTRY = [
     runbook: 'Render ログの [inquiry-hub-outbox] を確認。要対応ジョブ (unknown/needs_review) は ⚙️運用管理 (/apps/inquiry-hub/admin)。復旧は Render 再デプロイ。'
       + '⚠️env INQUIRY_HUB_OUTBOX_CRON_ENABLED=true を入れるまでは ping が来ない (=有効化とこの台帳エントリはセット)',
   },
+  // ─────────────── scheduled_job ───────────────
+  {
+    id: 'inquiry-hub-cutoff',
+    type: 'scheduled_job',
+    importance: 'P1',
+    owner: '中原さん',
+    purpose: 'ロジザードへ流す前の締め前確認をGChatへ通知 (キャンセル・住所変更・お届け日時の変更)。'
+      + '締め = 09:00 / 12:30 / 14:30 の3回で、その15分前に送る。'
+      + '⭐0件でも必ず送るので、通知が来ないこと自体が「止まった」のサイン (この通知が dead-man を兼ねる)。'
+      + '止まると、キャンセル依頼に気づかないまま受注をロジザードへ流してしまう',
+    where: 'Render bfaith-portal 常駐 (apps/inquiry-hub/sync/cron.js startInquiryHubCutoffCron。env INQUIRY_HUB_CUTOFF_CRON_ENABLED)',
+    schedule: '毎日 08:45 / 12:15 / 14:15 (JST)',
+    anchor_hour_jst: 8,
+    anchor_minute_jst: 45,
+    grace_hours: 8,   // 3回のどれかが通れば ok (08:45〜16:45)。全部止まったときだけ締切超過にする
+    lifecycle: 'permanent',
+    runbook: 'Render ログの [inquiry-hub-cutoff] を確認。画面は /apps/inquiry-hub/cutoff。'
+      + '通知先は env GCHAT_WEBHOOK。⭐**実際にGChatへ送れたときだけ ping する** '
+      + '(webhook未設定・送信失敗では ping しない = 「動いているが誰にも届かない」を緑にしない)。'
+      + '⚠️env INQUIRY_HUB_CUTOFF_CRON_ENABLED=true を入れるまでは ping が来ない (=有効化とこの台帳エントリはセット)。'
+      + '締め時刻を変えるときは cutoff.js の CUTOFF_TIMES だけ直す (cron式はそこから導出される)',
+  },
   // ─────────────── scheduled_job (miniPC Task Scheduler) ───────────────
+  {
+    id: 'ph-generate-nightly',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'product-hub「AI情報入力待ち」の夜間自動生成 (Claude Code headless・サブスク枠、2026-08-28)。'
+      + '裏取り→生成→copy_lint→Codex検品→書き戻し。生成できない draft は generation-block で人待ち (ボードに ⚠)。'
+      + '成否は Claude の自己申告でなくサーバの queue で判定: 未処理 (claimable+leased) が 0 → ok / 減れば partial / 減らない・timeout → fail。'
+      + 'Claude がシェルで実行できるのは固定機能 CLI ./phq と検品ラッパー ./phreview だけ (トークンは phq の中・Claude は見ない。bin/ と設定は ACL で書き換え不可)',
+    where: 'miniPC TaskScheduler [PhGenerateNightly] (scripts/ph-nightly/run-ph-generate.ps1、bfaith Interactive = ログオン中のみ・RunLevel Limited)',
+    schedule: '毎日 02:30 (claimable が 0 の夜も claude auth status を検査して ok を打つ = 認証切れを静かな週に見逃さない)',
+    anchor_hour_jst: 2,
+    anchor_minute_jst: 30,
+    grace_hours: 6,
+    lifecycle: 'permanent',
+    runbook: 'scripts/ph-nightly/README.md。C:\\tools\\ph-nightly\\logs\\runner.log の末尾を見る: '
+      + '"not logged in" → bfaith で cd C:\\tools\\ph-nightly\\work; claude → /login / "no progress" → 同 logs の *.err.log '
+      + '(permission denied は allow を安易に増やさず ./phq で代替できないか先に確認 / codex 未ログイン / Amazon の HTML 構造変更) / '
+      + 'timeout は件数超過とは限らない (ハング・認証・Codex 停止も。*.out.log を見る) / partial は翌晩に続く。止めるなら Disable-ScheduledTask PhGenerateNightly',
+  },
   {
     id: 'mall-csv-fetch-all',
     type: 'scheduled_job',
@@ -131,6 +196,62 @@ export const JOBS_REGISTRY = [
       + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決',
   },
   {
+    id: 'yahoo-review-mail-send',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Yahoo!ショッピング レビュー フォロー/クーポンメールの正午送信 (らくらくフォロー置換 PR-Y-C5)。'
+      + '当日12:00予定の action を ready 昇格 (plan) → at-most-once の Gmail 送信 (send)。'
+      + 'cutover 前は ownership=vendor のため送信0件で正常 (ping は ok)。'
+      + '楽天版 (12:05) と 15 分ずらしてある = warehouse.db を同時に書かせないため。'
+      + '⭐SYSTEM 実行なので Playwright を絶対に呼ばない (永続プロファイルを SYSTEM で開くと '
+      + 'Yahoo ストアのセッションが壊れる — 2026-08-28 の事故)。月次クーポンの発行は '
+      + '別ジョブ yahoo-review-coupon-issue (bfaith 実行) が担当',
+    where: 'miniPC TaskScheduler [YahooReviewMailSend] (scripts/mall-csv-fetcher/run-yahoo-review-send.ps1)',
+    schedule: '毎日 12:20',
+    anchor_hour_jst: 12,
+    anchor_minute_jst: 20,
+    grace_hours: 3, // 15:20 までに ok が無ければ締切超過 (フォローは発送+21日の期限があるため翌日には気づきたい)
+    lifecycle: 'permanent',
+    runbook: 'AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』§Y-C5。'
+      + '手動再実行: DATA_DIR を設定して '
+      + 'node apps/warehouse/plan-rakuten-review-campaigns.js plan --mall yahoo (当日12:00予定を ready 昇格) → '
+      + 'node apps/warehouse/send-yahoo-review-mails.js send --limit N。'
+      + '送らずに状況だけ見るなら send-yahoo-review-mails.js plan。'
+      + 'ambiguous (結果不明) が出たら自動再送しない: delivery_attempts と実到達を確認して人が action を解決。'
+      + '「FROM_NOT_VERIFIED / FROM_VERIFY_STALE」で 0 件なら send-yahoo-review-mails.js verify-from --to <社内アドレス> を実行 (90日ごと)',
+  },
+  {
+    id: 'yahoo-review-coupon-issue',
+    type: 'scheduled_job',
+    // P2 = 締切超過を即時通知する。grace 2h (12:10) と対で「12:20 の送信より前に気づく」ため。
+    // P3 (毎朝のサマリのみ) だと猶予を縮めても送信前には届かない (Codex Y-C5 R4 Medium)
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'Yahoo レビューお礼メールに載せる月次5%クーポンの発行 (らくらくフォロー置換 PR-Y-C5)。'
+      + '台帳 yahoo_campaign_coupons が当月分を issued で持っていればブラウザを起動せず終了 (毎日の実費は SQLite 1読み)。'
+      + 'cutover 前 = shadow のうちは丸ごとスキップ (誰にも配らないクーポンをストアに残さない)。'
+      + '⭐**bfaith (Interactive) 実行**: Playwright の永続プロファイルは Windows ユーザーに紐づいて暗号化されており、'
+      + 'SYSTEM で開くと Yahoo ストアのセッションが壊れて現地での 2FA 再ログインが必要になる (2026-08-28 の事故)。'
+      + '10:10 なのは同じプロファイルを使う MallCsvFetchAll (05:30) / YahooCouponRotate (09:30) と重ねないため',
+    where: 'miniPC TaskScheduler [YahooReviewCouponIssue] (scripts/mall-csv-fetcher/run-yahoo-review-coupon.ps1、bfaith Interactive = ログオン中のみ)',
+    schedule: '毎日 10:10',
+    anchor_hour_jst: 10,
+    anchor_minute_jst: 10,
+    // 12:20 の送信より前 (12:10) に気づけるよう猶予は 2 時間。
+    // 通常月は Yahoo のクーポンが月初〜翌月末で 2 か月ぶん重なり、送信側が「今使える発行済みクーポン」に
+    // フォールバックするので落ちても影響は無いが、**初回 cutover 月・前月分が無い月**は
+    // その日のクーポンメールが丸ごと skip されるため、送信前に気づきたい (Codex Y-C5 R3 Medium)
+    grace_hours: 2,
+    lifecycle: 'permanent',
+    runbook: 'AI_reference『らくらくーぽんYahoo版_置換_要件設計_20260827.md』§Y-C3/C5。'
+      + '手動実行: DATA_DIR/WAREHOUSE_DATA_DIR と HEADLESS=1 を設定して '
+      + 'node scripts/mall-csv-fetcher/yahoo-review-coupon-issue.mjs --month YYYY-MM [--live] (--live 無しは完全非破壊の dry-run)。'
+      + '2FA_REQUIRED で失敗したら miniPC の画面で デスクトップの Yahoo-Relogin.bat (確認コードはメール)。'
+      + 'reconcile_required で止まったら --reconcile-only で照合し、未作成を確認してから台帳の行を消して再実行 '
+      + '(作成は絶対に自動再試行しない = 二重発行より未発行を選ぶ)',
+  },
+  {
     id: 'warehouse-daily-sync',
     type: 'scheduled_job',
     importance: 'P1',
@@ -139,7 +260,10 @@ export const JOBS_REGISTRY = [
       + '日次出荷サマリ (出荷日×モール×配送方法) の再構築もここ。'
       + '最後に「楽天未発送アラート」「Yahoo未発送アラート」「auPAY未発送アラート」「Qoo10未発送アラート」'
       + '(前日12時の締めより前の注文で、まだ発送されていないものを GChat 通知) と'
-      + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知) も走る',
+      + '「Yahoo問い合わせ対応漏れ」(未返信+完了処理忘れの問い合わせを検知、該当時のみ通知)、'
+      + '「Yahooトークン期限アラート」(refresh token 残り5日から毎日1通、GChatボットの「yahoo再認可」へ誘導)、'
+      + '「楽天ライセンス期限アラート」(licenseKey は90日で失効。残り14日から毎日1通。'
+      + '切れると楽天API が全部 401 になり受注取込・問い合わせ返信・クーポン・価格改定が止まる) も走る',
     where: 'miniPC TaskScheduler [WarehouseDailySync + Retry1〜3 (同じidにping)]',
     schedule: '毎日 07:00 (retry 08:30 / 10:00 / 11:30)',
     anchor_hour_jst: 7,
@@ -302,7 +426,7 @@ export const JOBS_REGISTRY = [
     type: 'scheduled_job',
     importance: 'P3',
     owner: '中原さん',
-    purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集。冪等・全件取得済みなら即終了)',
+    purpose: '新商品企画スカウト (Keepaで月販50+のASIN詳細を収集 → 商品テーマに束ねてポータル /apps/product-scout へ供給。冪等)',
     where: 'miniPC TaskScheduler [ProductIdeaScout]',
     schedule: '毎日 14:00 (19時間で自主中断→翌日続きから。Task Scheduler の上限20hは保険)',
     anchor_hour_jst: 14,
@@ -312,7 +436,16 @@ export const JOBS_REGISTRY = [
     // 未完走7回までは許容し、8回目で「進んでいないのでは」と疑う
     partial_max_days: 7,
     lifecycle: 'permanent',
-    runbook: 'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。2度の停止事故の教訓で毎日実行化 (2026-08-01)',
+    runbook:
+      'C:\\Users\\bfaith\\product-idea-scout\\data\\products.log を確認 (残件は ping の note にも出る)。' +
+      '① exit 0=完走(ok) / 3=時間切れ(partial) / 4=やる仕事が0件 / その他=異常。' +
+      '② ⭐exit 4 のとき run-products.bat は `node finder.js --next` で次の未投入カテゴリを自動投入する ' +
+      '(投入できたら partial ping)。投入先がもう無い (finder exit 5 = 7カテゴリ1周完了) ときだけ fail ping を打ち、' +
+      '翌日 late で赤くなる。「正常終了しているが仕事が無い」を ok にしたせいで 2026-08-07〜27 の20日間、' +
+      '監視が緑のまま何も進まなかった — ここを緑に戻してはいけない。' +
+      '③ 収集の完全性は `node finder.js --status` で見る (⚠️不完全 = 進捗率は「下限」)。' +
+      '④ 画面 = ポータル /apps/product-scout。供給は `node concepts.js` → `node push.js`。' +
+      '2度の停止事故の教訓で毎日実行化 (2026-08-01)、空回り検知と自動投入を追加 (2026-08-28)',
   },
   {
     id: 'fba-tracking-input',
@@ -374,6 +507,22 @@ export const JOBS_REGISTRY = [
   //   Render 内の node-cron / 常駐ワーカーはカテゴリごと台帳から漏れていた。
   //   同時に、これらが miniPC でも二重起動していたため Render 専用ガードを入れている
   //   (ping も Render 側からしか飛ばない)。
+  {
+    id: 'shohyo-voucher-attach',
+    type: 'heartbeat',
+    importance: 'P3',
+    owner: '中原さん',
+    purpose: '証憑受け箱 (/apps/shohyo-links/mf/inbox) の取込 + 突合 + 添付。先頭で Gドライブ「証憑受け箱」フォルダ (env SHOHYO_GDRIVE_INBOX_FOLDER_ID) を拾って'
+      + '受け箱へ入れ (取込済み/対応外 へ移動)、受け箱の証憑を MF明細と「支払先+金額+日付±3日」で突合し、'
+      + '自動添付ON かつ 一意一致 かつ 仕訳登録済み のときだけ POST /vouchers で仕訳に貼る (既定=提案モード・人が承認)。'
+      + '止まると受け箱に証憑が溜まり、経理がMF側で手で貼る状態に戻る (即障害ではない)',
+    where: 'Render bfaith-portal 内 node-cron (apps/shohyo-links/attach-job.js。SHOHYO_ATTACH_ENABLED=false で停止)',
+    schedule: '毎時 07分 JST (env SHOHYO_ATTACH_CRON)。MF未接続のときは partial',
+    max_age_hours: 3,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「shohyo-attach」を検索。手動実行 = /apps/shohyo-links/mf/inbox の「今すぐ照合」。'
+      + 'MF未接続 (partial が続く) なら /apps/shohyo-links/mf で再接続。正本 = AI_reference『システム設計/証憑自動添付_全体像とロードマップ_20260828.md』',
+  },
   {
     id: 'fba-daily-sync',
     type: 'scheduled_job',
@@ -514,6 +663,27 @@ export const JOBS_REGISTRY = [
   },
 
   // ─────────────── temporary_asset (期限つきの一時物) ───────────────
+  {
+    id: 'mall-fetch-skip-rakuten-blocked',
+    type: 'temporary_asset',
+    importance: 'TMP',
+    owner: '中原さん',
+    purpose: '夜間のモールCSV取得から **rakuten (RPP広告) と rakuten-data (データ分析) を一時除外**している。'
+      + 'miniPC の .env に MALL_FETCH_ONLY=rakuten-review,yahoo,yahoo-review,aupay,qoo10 を設定。'
+      + '理由: この2つは 2026-07-17 から RMS のサブアプリ側で拒否され続けており、'
+      + '**拒否されるとRMSセッションごと失効する**ため、同じ実行の後ろに並ぶ rakuten-review (レビュー取得= '
+      + 'クーポンメールの入力データ) まで巻き込んで失敗させていた。加えて失敗のたびに再ログインを繰り返すため、'
+      + 'ログイン自体が弾かれる状態を招く (2026-08-30 に実際に発生)。'
+      + '除外しても失うデータは無い (6週間前から取れていない)',
+    where: 'miniPC C:\\Users\\bfaith\\bfaith-portal\\.env の MALL_FETCH_ONLY',
+    remove_by: '2026-09-30',
+    lifecycle: 'temporary',
+    runbook: 'R-Login の「利用者管理（権限管理）」→「サービス別権限設定」で RPP広告 と データ分析 の権限を確認・付与し、'
+      + 'node scripts/mall-csv-fetcher/rakuten-data-download.mjs が通ることを確認したら '
+      + '.env の MALL_FETCH_ONLY を削除してこのエントリも消す。'
+      + '🚨検証は1日1回まで (失敗するたびにセッションが切れ、連続ログインでアカウントが弾かれる)。'
+      + '経緯 = AI_reference のインシデント記録『楽天RMS サブアプリ認証拒否障害』2026-08-30 追記',
+  },
   {
     id: 'retired-tasks-cleanup',
     type: 'temporary_asset',

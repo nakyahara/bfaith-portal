@@ -28,6 +28,11 @@
   .kb-tag.canva { background: #ecfeff; color: #155e75; border-color: #a5f3fc; }
   .kb-tag.info-missing { background: #fff7ed; color: #9a3412; border-color: #fdba74; }
   .kb-hold { font-size: 11px; font-weight: 600; color: #92400e; background: #fef3c7; border: 1px solid #f59e0b; border-radius: 4px; padding: 1px 6px; margin: 2px 0; display: inline-block; }
+  .kb-hold.kb-aiblock { color: #991b1b; background: #fee2e2; border-color: #ef4444; }
+  /* 確認中 (2026-08-31): 情報待ちのカード。列の先頭に並ぶ + 左の太いラインで一目で分かるようにする */
+  .kb-hold.kb-checking { color: #1e40af; background: #dbeafe; border-color: #3b82f6; }
+  .kb-hold.kb-checking.long { color: #9a3412; background: #ffedd5; border-color: #f97316; }
+  .kb-card.checking { border-color: #93c5fd; border-left: 4px solid #3b82f6; background: #f8fbff; }
   .kb-col.drop-ok { outline: 2px dashed #2563eb; outline-offset: -2px; background: #eff6ff; }
   /* TOP画像の重要度 (どれぐらい力を入れて作るか)。Notion のタグ風に色を付ける */
   .kb-priority { width: 100%; margin-top: 6px; font-size: 11px; border-radius: 6px;
@@ -91,13 +96,32 @@
     if (v === 'image') p.set('view', 'image');
     const a = over.assignee !== undefined ? over.assignee : assigneeParam;
     if (a) p.set('assignee', a);
-    const f = over.filter !== undefined ? over.filter : (unassignedOnly ? 'unassigned' : '');
+    const f = over.filter !== undefined ? over.filter
+      : (unassignedOnly ? 'unassigned' : (checkingOnly ? 'checking' : ''));
     if (f) p.set('filter', f);
     // 種別 (TOP画像/商品詳細画像) は画像ビューだけの条件。本流へ切り替えたら落とす
     const k = over.kind !== undefined ? over.kind : (imageKind || '');
     if (k && v === 'image') p.set('kind', k);
     const s = p.toString();
     return '/apps/product-hub/board' + (s ? '?' + s : '');
+  };
+  // カードから開いた詳細画面の「← 戻る」で、いま見ているボードへ戻すための印
+  // (2026-08-28 中原さん要望)。サーバ側 backLinkOf が既知のキーだけ拾って組み直す
+  const backParam = (() => {
+    const p = new URLSearchParams();
+    p.set('v', 'board');
+    if (boardView === 'image') p.set('view', 'image');
+    if (assigneeParam) p.set('assignee', assigneeParam);
+    if (unassignedOnly) p.set('filter', 'unassigned');
+    if (checkingOnly) p.set('filter', 'checking');
+    if (imageKind && boardView === 'image') p.set('kind', imageKind);
+    return p.toString();
+  })();
+  const cardHref = (id, imagesTab) => {
+    const p = new URLSearchParams();
+    if (imagesTab) p.set('tab', 'tab-images');
+    p.set('back', backParam);
+    return `/apps/product-hub/detail/${id}?${p.toString()}`;
   };
 %>
 
@@ -108,13 +132,21 @@
       <a class="kb-tab <%= boardView !== 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'main' }) %>">本流で並べる</a>
       <a class="kb-tab <%= boardView === 'image' ? 'on' : '' %>" href="<%= boardUrl({ view: 'image' }) %>">🖼 画像で並べる</a>
     </span>
-    <a class="chip <%= !assigneeParam && !unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
+    <a class="chip <%= !assigneeParam && !unassignedOnly && !checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: '' }) %>">すべて</a>
     <% if (me) { %>
       <a class="chip <%= assigneeParam === 'me' ? 'on' : '' %>" href="<%= boardUrl({ assignee: 'me', filter: '' }) %>">
         自分のボール (<%= me.name %>)
       </a>
     <% } %>
     <a class="chip <%= unassignedOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'unassigned' }) %>">未割り当て</a>
+    <%# 確認中 (2026-08-31 スタッフ要望)。件数は**絞り込み・ビューと無関係の商品件数**を出す —
+        絞り込み中に 0 と出ると確認中が無いように見えて、拾うための入口がそこで消える。
+        画像ビューはカード = 商品×種別なので、この件数とカード枚数は一致しない (Codex R1) %>
+    <a class="chip <%= checkingOnly ? 'on' : '' %>" href="<%= boardUrl({ assignee: '', filter: 'checking' }) %>"
+       title="確認中の商品の件数 (いまの絞り込み・ビューに関わらない全体の数)"
+       style="<%= !checkingOnly && board.checkingTotal > 0 ? 'border-color:#3b82f6; color:#1e40af;' : '' %>">
+      🔍 確認中<%= board.checkingTotal > 0 ? ` ${board.checkingTotal}` : '' %>
+    </a>
     <% if (boardView === 'image') { %>
       <%# 種別の絞り込み (2026-08-24 中原さん要望)。担当者の絞り込みとは独立に効く %>
       <span style="border-left:1px solid #e2e8f0; align-self:stretch;"></span>
@@ -173,11 +205,11 @@
           <% for (const c of col.cards) { %>
             <% const stalled = boardView === 'image' ? c.kindStalledDays : c.stalledDays; %>
             <% const currentCode = boardView === 'image' ? (c.kindCurrent && c.kindCurrent.step_code) : (c.current && c.current.step_code); %>
-            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
+            <div class="kb-card <%= stalled ? 'stalled' : '' %><%= c.checking ? ' checking' : '' %><%= boardView === 'image' ? ` kind-${c.kind}` : '' %>" draggable="true"
                  data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>"
                  data-current="<%= currentCode || '' %>"
                  data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
-            <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %><%= boardView === 'image' ? '?tab=tab-images' : '' %>">
+            <a class="kb-card-link" href="<%= cardHref(c.id, boardView === 'image') %>">
               <% if (boardView === 'image') { %>
                 <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
@@ -191,6 +223,15 @@
                 </div>
               <% } %>
               <% } %>
+              <%# 確認中 (2026-08-31)。列は動かさず、何を待っているか + 何日待っているかをカードに出す。
+                  7日を超えたら色を変える (待ちっぱなしで忘れられたカードを目立たせる) %>
+              <% if (c.checking) { %>
+                <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
+                  🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
+                </div>
+              <% } %>
+              <%# AI が「人の確認待ち」にした商品 (2026-08-28)。列は動かさず理由をカードに出す %>
+              <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
               <div class="kb-card-top">
                 <% if (c.first_image_id) { %>
                   <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -291,14 +332,20 @@
         <%# 完了カードもドラッグで差し戻せる (data-current 空 = 全工程決着の CAS 値)。
             画像ビューは 商品×種別 なので、どちらを戻すかはカード自体が持っている %>
         <% for (const c of board.doneCards) { %>
-          <div class="kb-card<%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
+          <div class="kb-card<%= c.checking ? ' checking' : '' %><%= boardView === 'image' && c.kind ? ` kind-${c.kind}` : '' %>" draggable="true"
                data-draft="<%= c.id %>" data-kind="<%= boardView === 'image' ? c.kind : '' %>" data-current=""
                data-search="<%= `${c.name || ''} ${c.ne_code || ''}`.toLowerCase() %>">
-          <a class="kb-card-link" href="/apps/product-hub/detail/<%= c.id %>">
+          <a class="kb-card-link" href="<%= cardHref(c.id, false) %>">
             <% if (boardView === 'image' && c.kind) { %>
               <div class="kb-kindband <%= c.kind %>"><%= c.kind === 'top' ? '🖼 ' : '📸 ' %><%= imageKindLabels[c.kind] %></div>
               <% if (c.imageOnHold) { %><div class="kb-hold" title="<%= c.imageHoldNote || '' %>">⏸ 画像制作 保留中</div><% } %>
             <% } %>
+            <% if (c.checking) { %>
+              <div class="kb-hold kb-checking <%= (c.checking.days || 0) >= 7 ? 'long' : '' %>" title="<%= c.checking.note || '' %>">
+                🔍 確認中: <%= c.checking.label %><%= c.checking.days ? ` (${c.checking.days}日)` : '' %>
+              </div>
+            <% } %>
+            <% if (c.genBlockCode) { %><div class="kb-hold kb-aiblock" title="<%= c.genBlockReason || '' %>">⚠ AIが止めました: <%= c.genBlockLabel %></div><% } %>
             <div class="kb-card-top">
               <% if (c.first_image_id) { %>
                 <img class="kb-thumb" src="<%= thumbnailUrl(c.first_image_id, 160, c.first_image_mtime) %>" alt="" loading="lazy" referrerpolicy="no-referrer">
@@ -327,6 +374,8 @@
 
   <p class="muted" style="margin-top:14px;">
     カードをクリックすると商品の詳細が開き、そこで工程を進められます。
+    カードは<strong>ドラッグで動かせます</strong> — 別の列に落とすと工程が進み、同じ列の中で上下に動かすと<strong>並び順</strong>が保存されます (次に開いてもその順のまま)。
+    並べ替えた列にあとから入ってきたカードは、いちばん下に付きます (上から順にやれば先に来たものから片付く)。
     <% if (boardView === 'image') { %>
       カードは 商品 × 画像種別 (🖼 TOP画像 / 📸 商品詳細画像) の2枚です。商品詳細画像を作らない商品は「対象外」にするとここに出ません。
     <% } %>
@@ -375,16 +424,66 @@
     } catch (e) { /* 保持なしで動く */ }
   })();
 
-  // ─── カードの D&D 移動: 落とした列がその商品の「いまやる工程」になる ───
+  // ─── カードの D&D: 列をまたぐと工程が動き、同じ列の中なら並び順が変わる ───
+  // (2026-08-28 中原さん要望: 動かしたカードの順番を自由に決めたい。
+  //  既定は「停滞が長い順」だが、それだと現場で決めた「今日はこの順」が読み直しで消える)
   const BOARD_VIEW = <%- JSON.stringify(boardView) %>;
   let dragCard = null;
+  let dragFromCol = null;   // 掴んだときの列。ドラッグ中に DOM を動かすので closest では判定できない
+  let dragHome = null;      // 元の位置 (どこにも落とさず離したときに戻す)
+  let dropped = false;
   // ドラッグ直後の click でリンクへ飛ばない (Codex R1 medium: dragend の後に click を
   // 発火するブラウザがある。drop の fetch を中断させないためにも一拍だけ抑止する)
   let suppressClick = false;
 
+  // 空列の「—」の出し入れ。ドラッグでカードが出入りしても見た目が食い違わないようにする
+  function refreshEmpty(col) {
+    if (!col) return;
+    const body = col.querySelector('.kb-body');
+    const empty = body?.querySelector('.kb-empty');
+    if (!body || !empty) return;
+    empty.style.display = body.querySelector('.kb-card') ? 'none' : '';
+  }
+  function refreshEmptyAll() { document.querySelectorAll('.kb-col[data-col]').forEach(refreshEmpty); }
+
+  // 掴んでいるカードを、どのカードの前に差し込むか (中心より上に来たら、そのカードの前)。
+  // 検索で隠しているカードは位置を持たないので飛ばす
+  function insertTargetIn(body, y) {
+    const els = [...body.querySelectorAll('.kb-card:not(.dragging)')].filter((e) => e.style.display !== 'none');
+    for (const el of els) {
+      const box = el.getBoundingClientRect();
+      if (y < box.top + box.height / 2) return el;
+    }
+    return null;
+  }
+
+  // その列に**いま並んでいるカードの順番をまるごと**送る。
+  // 動かした 1 枚だけを送る方式だと、既定順のカードと混ざったときに順番が定まらない。
+  // 検索で隠しているカードも DOM 上の位置のまま含める (絞り込み中の並べ替えで他が飛ばない)
+  async function saveOrder(col) {
+    const items = [...col.querySelectorAll('.kb-card[data-draft]')]
+      .map((c) => ({ id: Number(c.dataset.draft), kind: c.dataset.kind || '' }));
+    if (items.length === 0) return true;
+    try {
+      const res = await fetch('/apps/product-hub/api/board/reorder', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ view: BOARD_VIEW, col: col.dataset.col, items }),
+      });
+      const j = await res.json();
+      if (!j.ok) { alert(j.error || '並び順を保存できませんでした'); return false; }
+      return true;
+    } catch (err) {
+      alert('通信エラー: ' + err.message);
+      return false;
+    }
+  }
+
   document.querySelectorAll('.kb-card[draggable="true"]').forEach(function (card) {
     card.addEventListener('dragstart', function (e) {
       dragCard = card;
+      dragFromCol = card.closest('.kb-col');
+      dragHome = { parent: card.parentNode, next: card.nextSibling };
+      dropped = false;
       suppressClick = true;
       card.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
@@ -393,7 +492,10 @@
     card.addEventListener('dragend', function () {
       card.classList.remove('dragging');
       document.querySelectorAll('.kb-col.drop-ok').forEach((c) => c.classList.remove('drop-ok'));
-      dragCard = null;
+      // 列の外で離した = 取りやめ。プレビューで動かした DOM を元の位置に戻す
+      if (!dropped && dragHome) dragHome.parent.insertBefore(card, dragHome.next);
+      refreshEmptyAll();
+      dragCard = null; dragFromCol = null; dragHome = null;
       setTimeout(function () { suppressClick = false; }, 300);
     });
     card.querySelector('.kb-card-link')?.addEventListener('click', function (e) {
@@ -407,6 +509,16 @@
       e.preventDefault();
       e.dataTransfer.dropEffect = 'move';
       col.classList.add('drop-ok');
+      // 落ちる位置をその場で見せる (掴んだカード自体を差し込み位置へ動かす)。
+      // 位置が変わらないときは触らない — 毎回 DOM を動かすとドラッグがガタつく
+      const body = col.querySelector('.kb-body');
+      if (!body) return;
+      const target = insertTargetIn(body, e.clientY);
+      // すでにその位置にいるなら触らない (nextSibling は EJS の改行がテキストノードで
+      // 挟まるので nextElementSibling で見る)
+      if (target ? dragCard.nextElementSibling === target : body.lastElementChild === dragCard) return;
+      if (target) body.insertBefore(dragCard, target); else body.appendChild(dragCard);
+      refreshEmptyAll();
     });
     col.addEventListener('dragleave', function (e) {
       // 子要素間の移動でチラつかないよう、列の外に出たときだけ消す
@@ -417,9 +529,16 @@
       col.classList.remove('drop-ok');
       if (!dragCard) return;
       const card = dragCard;
+      const from = dragFromCol;
       const to = col.dataset.col;
-      // 同じ列へのドロップは何もしない
-      if (card.closest('.kb-col') === col) return;
+      dropped = true;
+      // 同じ列の中の並べ替え = 工程は動かさない。保存できた画面はもう正しい形なので読み直さない。
+      // 失敗したときだけ読み直す (並んだ見た目だけ残ると「保存された」と誤読する — Codex R1 中)
+      if (from === col) {
+        if (!await saveOrder(col)) location.reload();
+        return;
+      }
+      let moved = false;
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + card.dataset.draft + '/board-move', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -431,12 +550,13 @@
           }),
         });
         const j = await res.json();
-        if (!j.ok) {
-          alert(j.error || '移動できませんでした');
-        }
+        if (j.ok) moved = true; else alert(j.error || '移動できませんでした');
       } catch (err) {
         alert('通信エラー: ' + err.message);
       }
+      // 工程が動いたときだけ、落とした位置を並び順として残す (失敗時に位置だけ残ると
+      // 読み直しで元の列に戻ったカードが変な順で並ぶ)
+      if (moved) await saveOrder(col);
       // 成否どちらでも読み直す (成功 = 列とステータスの再描画 / 失敗 = カードを元の位置へ)
       location.reload();
     });

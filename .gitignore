@@ -26,3 +26,9 @@ vps-proxy/*.log
 vps-proxy/*.bak*
 .codex-diff.txt
 .codex-round2.log
+
+# 出荷PCの印刷エージェント: config.json にはデバイストークンが入るので絶対に入れない
+# (SumatraPDF.exe も 16MB あるので配布は Drive の印刷テストキット経由)
+scripts/slip-print-agent/config.json
+scripts/slip-print-agent/SumatraPDF.exe
+scripts/slip-print-agent/work/

@@ -696,6 +696,16 @@ export async function syncSkuImagesToRms(draftId, { actor = null } = {}) {
 
 // ─── 出品 payload ───
 
+/**
+ * メーカー型番のジャンル属性名 (2026-08-31 中原さん指摘)。
+ * RMS の入力項目は 1 つなのに、このアプリは「メーカー型番」欄と商品属性の 2 箇所に
+ * 入れさせていた。入口は **article_number (メーカー型番欄) だけ** に統一し、
+ * ジャンル属性に この名前があるジャンルでは送信時に自動で属性へも積む
+ * (カタログID を JAN 欄から自動付与しているのと同じ方式)。
+ * 画面はこの名前の属性行を出さない・保存時に落とす。
+ */
+export const MODEL_ATTR_NAME = 'メーカー型番';
+
 /** attributes_json をパースして RMS 形式に整える。壊れた JSON は null */
 export function parseAttributes(json) {
   if (!json || !String(json).trim()) return [];
@@ -927,15 +937,18 @@ export function trailingBannerLocations(shippingGroup) {
  * 説明文3欄の組み立て (§10 店舗フォーマット)。buildItemPayload と 3欄プレビューの共通部。
  * 楽天の入力欄と1:1対応: pc=PC用商品説明文 / sales=PC用販売説明文 / sp=スマートフォン用商品説明文
  */
-export function composeDescriptions({ title, ai, specs, pageInfo, shippingLabel, cabinetLocations }) {
-  // 「説明」行 = 商品名 + AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)
-  const descTexts = [title];
+export function composeDescriptions({ productName, ai, specs, pageInfo, cabinetLocations }) {
+  // 「説明」行 = AI特徴 + AI仕様 (仕様表・注意書きは表の別行に載る)。
+  // **楽天タイトルは入れない** (2026-08-31 中原さん): タイトルは検索用に語を並べたもので、
+  // 説明として読ませる文ではない。表の先頭に丸ごと出ると SEO 語の羅列がそのまま載る
+  const descTexts = [];
   if (ai.desc_features) descTexts.push(String(ai.desc_features).trim());
   if (ai.desc_spec) descTexts.push(String(ai.desc_spec).trim());
   const pc = buildPageInfoHtml({
-    productName: title,
+    // AI 文が 1 つも無いときだけ「商品名」行として使われる。ここは NE の商品名を渡す
+    // (楽天タイトルを渡すと、上で外したはずの SEO 語がフォールバックで出てしまう)
+    productName,
     info: pageInfo, // 未保存 (null) でも説明/注意事項/仕様表/広告文責の行は載る
-    shippingLabel,
     descriptionText: descTexts.join('\n\n'),
     notesText: ai.desc_notes ? String(ai.desc_notes).trim() : null,
     specs,
@@ -959,7 +972,6 @@ export function buildDescriptionPreview(db, draftId) {
   }
   const specs = db.prepare('SELECT spec_key, spec_value FROM draft_specs WHERE draft_id = ? ORDER BY sort, id').all(draftId);
   const pageInfo = db.prepare('SELECT * FROM draft_page_info WHERE draft_id = ?').get(draftId) || null;
-  const effectiveShip = effectiveShippingForDraft(db, draft.ne_code, rk.shipping_method_group);
   // 転送済みの商品画像 (白抜き除く・バナーは §15 どおり salesDescription に入れない) — buildItemPayload と同じ突合
   const cabinetAll = db.prepare('SELECT drive_file_id, cabinet_location, drive_modified_time FROM draft_cabinet_images WHERE draft_id = ? ORDER BY id').all(draftId);
   const byFile = freshCabinetMap(cabinetAll);
@@ -967,10 +979,8 @@ export function buildDescriptionPreview(db, draftId) {
   const current = db.prepare('SELECT drive_file_id, drive_modified_time FROM draft_images WHERE draft_id = ? ORDER BY sort, id')
     .all(draftId).filter((i) => i.drive_file_id !== whiteBgId);
   const locations = current.filter((i) => byFile.has(cabinetKeyOf(i))).map((i) => byFile.get(cabinetKeyOf(i)));
-  const title = String(ai.rakuten_title || draft.name || '').trim();
   const d = composeDescriptions({
-    title, ai, specs, pageInfo,
-    shippingLabel: effectiveShip.label, cabinetLocations: locations,
+    productName: draft.name, ai, specs, pageInfo, cabinetLocations: locations,
   });
   return {
     ok: true, ...d,
@@ -1096,6 +1106,23 @@ export function buildItemPayload(db, draftId) {
       reasons.push(`商品属性のカタログID (${manualCatalog.values[0]}) と JAN欄 (${jan}) が一致しません — どちらかに揃えてください`);
     }
   }
+  // メーカー型番はカタログIDと同じ扱い (2026-08-31 中原さん: RMS でも入力項目は 1 つなのに
+  // 画面で 2 箇所に入れさせていた)。**入口は「メーカー型番」欄 (article_number) だけ**にして、
+  // ジャンル属性に「メーカー型番」があるときは下でその値を自動付与する。
+  // 旧データで属性側にも残っている場合に備え、食い違いだけは止める
+  const articleNo = String(rk.article_number || '').trim();
+  const modelAttrs = Array.isArray(attributes) ? attributes.filter((a) => a.name === MODEL_ATTR_NAME) : [];
+  let manualModel = null;
+  if (modelAttrs.length > 1) {
+    reasons.push(`商品属性「${MODEL_ATTR_NAME}」が複数あります (1件にまとめてください)`);
+  } else if (modelAttrs.length === 1) {
+    manualModel = modelAttrs[0];
+    if (manualModel.values.length !== 1) {
+      reasons.push(`商品属性「${MODEL_ATTR_NAME}」の値は1個だけにしてください`);
+    } else if (articleNo && manualModel.values[0] !== articleNo) {
+      reasons.push(`商品属性の${MODEL_ATTR_NAME} (${manualModel.values[0]}) と メーカー型番欄 (${articleNo}) が一致しません — メーカー型番欄に揃えてください`);
+    }
+  }
   // ─── ジャンル属性辞書による事前検証 (2026-07-28 Genre API) ───
   // 辞書キャッシュがある場合だけ検証する (無ければ RMS が最終検証する)。
   // genre_id をキーに引くので、ジャンルを変えた直後は辞書未取得 = 検証スキップになる
@@ -1105,9 +1132,11 @@ export function buildItemPayload(db, draftId) {
     ? getCachedGenreAttributes(db, String(rk.genre_id).trim(), { maxAgeMs: GENRE_CACHE_TTL_MS })
     : null;
   let dictHasCatalogId = false;
+  let dictHasModel = false;
   if (genreDict && Array.isArray(attributes)) {
     const dictByName = new Map(genreDict.attributes.map((a) => [a.name, a]));
     dictHasCatalogId = dictByName.has('カタログID');
+    dictHasModel = dictByName.has(MODEL_ATTR_NAME);
     // ① 辞書に無い属性名は IE1002 で登録が失敗する → 送る前に止める
     for (const a of attributes) {
       if (!dictByName.has(a.name)) {
@@ -1119,6 +1148,8 @@ export function buildItemPayload(db, draftId) {
     for (const da of genreDict.attributes) {
       if (!da.mandatory || presentNames.has(da.name)) continue;
       if (da.name === 'カタログID' && jan) continue; // 下で自動付与する
+      // メーカー型番は「メーカー型番」欄から自動付与する (属性行では入力させない)
+      if (da.name === MODEL_ATTR_NAME && articleNo) continue;
       reasons.push(`必須属性「${da.name}」が未入力です (ジャンル ${genreDict.genreName || rk.genre_id} の必須)`);
     }
     // ③ 値の数・長さの軽い検証 (RMS と同じ基準で早めに教える)
@@ -1154,10 +1185,8 @@ export function buildItemPayload(db, draftId) {
   //   PC用商品説明文 (productDescription.pc) = 表1枚 (説明/注意事項/仕様表/商品ページ表記)
   //   PC用販売説明文 (salesDescription)      = 商品画像を width100% で並べた画像HTML
   //   スマホ用商品説明文 (productDescription.sp) = 販売説明文 + 商品説明文
-  // 発送方法の表示名は上で解決済みの effectiveShip (アプリ指定 > NEマッピング)
   const { pc: pcHtml, sales: salesHtml, sp: spHtml } = composeDescriptions({
-    title, ai, specs, pageInfo,
-    shippingLabel: effectiveShip.label,
+    productName: draft.name, ai, specs, pageInfo,
     cabinetLocations: cabinet.map((c) => c.cabinet_location),
   });
   if (pcHtml.length > DESC_LIMIT) reasons.push(`PC用商品説明文が長すぎます (${pcHtml.length}字 / 上限${DESC_LIMIT}字)`);
@@ -1171,6 +1200,12 @@ export function buildItemPayload(db, draftId) {
   const attrs = attributes.slice();
   if (dictHasCatalogId && jan && !manualCatalog) {
     attrs.push({ name: 'カタログID', values: [jan] });
+  }
+  // メーカー型番を属性としても送る (2026-08-31)。入口は「メーカー型番」欄だけなので、
+  // ジャンル属性に メーカー型番 があるジャンルではここで補う。
+  // 旧データで属性側に同じ値が残っている場合は二重に足さない (上で不一致は弾いてある)
+  if (dictHasModel && articleNo && !manualModel) {
+    attrs.push({ name: MODEL_ATTR_NAME, values: [articleNo] });
   }
 
   // 送料・配送方法 (variants[].shipping)。未設定の項目は送らず店舗デフォルトに任せる

@@ -110,19 +110,20 @@ function nl2br(v) {
  * xlsm と同じ表形式の掲載用 HTML を作る。空欄の行は出さない。
  *
  * 店舗の従来フォーマット (2026-08-01 中原さん提示の実例) では PC用商品説明文が
- * この表1枚で、先頭が「説明」行 (商品名+説明文)・2行目が「注意事項」行。
- * descriptionText を渡すとそのフォーマットになる (渡さなければ従来どおり
- * 「商品名」行から始まる = 商品情報タブの掲載プレビュー互換)。
+ * この表1枚で、先頭が「説明」行・2行目が「注意事項」行。
+ * descriptionText を渡すとそのフォーマットになる (渡さなければ「商品名」行から始まる
+ * = 商品情報タブの掲載プレビュー互換)。
+ * 「説明」行に**楽天タイトルは入れない** (2026-08-31 中原さん: 検索用に語を並べたもので
+ * 説明として読ませる文ではない)。productName は説明行が空のときのフォールバックにだけ使う。
  *
  * @param {object} p
- * @param {string} p.productName  商品名
+ * @param {string} p.productName  商品名 (descriptionText が空のときだけ「商品名」行として出る)
  * @param {object|null} p.info    draft_page_info 行
- * @param {string|null} p.shippingLabel 発送方法の表示名 (楽天配送方法グループ名)
- * @param {string|null} [p.descriptionText] 「説明」行に入れる平文 (商品名は呼び出し側が文頭に含める)
+ * @param {string|null} [p.descriptionText] 「説明」行に入れる平文 (商品名・楽天タイトルは含めない)
  * @param {string|null} [p.notesText] AI注意書き (平文)。「注意事項」行の固定文の前に載せる
  * @param {Array<{spec_key:string, spec_value:string|null}>|null} [p.specs] 仕様表 → 1項目1行
  */
-export function buildPageInfoHtml({ productName, info, shippingLabel, descriptionText = null, notesText = null, specs = null }) {
+export function buildPageInfoHtml({ productName, info, descriptionText = null, notesText = null, specs = null }) {
   // 行は3ブロックに分けて組む: 先頭 (説明/注意事項) → 仕様表 → 商品ページ表記。
   // 同じラベルが仕様表と商品ページ表記の両方にあるときは**商品ページ表記が正**
   // (楽天必須記載の正本。Codex R1 Medium: サイズ等が2行になる重複を防ぐ)
@@ -146,7 +147,10 @@ export function buildPageInfoHtml({ productName, info, shippingLabel, descriptio
     rows.push(mkRow(label, valueHtml));
   };
   const i = info || {};
+  // ブランド名 (2026-08-28 中原さん要望)。買い手が最初に見る identity なので表の先頭に置く
+  add('ブランド名', s(i.brand_name) ? esc(i.brand_name) : null);
   add('サイズ', s(i.size_text) ? nl2br(i.size_text) : null);
+  // 「内容量」= 容量 (ml / g) もここ。雑貨でも入力できる (2026-08-28 中原さん要望)
   add('内容量', s(i.content_volume) ? nl2br(i.content_volume) : null);
   add(i.product_type === 'food' || i.product_type === 'health_food' ? '原材料名' : '成分・素材',
     s(i.product_type === 'food' || i.product_type === 'health_food' ? i.food_ingredients : i.ingredients)
@@ -168,7 +172,9 @@ export function buildPageInfoHtml({ productName, info, shippingLabel, descriptio
     ? esc(i.seller_name) + (s(i.importer_name) ? `<br>輸入者: ${esc(i.importer_name)}` : '')
     : null;
   add('発売元', seller);
-  add('発送方法', s(shippingLabel) ? esc(shippingLabel) : null);
+  // 「発送方法」の行は出さない (2026-08-31 中原さん: 表には不要)。
+  // 配送方法は商品画像の末尾に付ける店舗共通バナー (SHIPPING_BANNER_LOCATIONS) で見せているので、
+  // 表にも書くと同じことを 2 箇所で言うことになる
   add('広告文責', adResponsibility()); // 固定値 (env 由来。<br> を含む信頼済み文字列)
   if (!s(descriptionText)) add('注意事項', FIXED_NOTES); // 説明行ありのときは先頭側で追加済み
 

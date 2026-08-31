@@ -995,10 +995,12 @@ check('payload: システム連携用SKU番号 = 商品コード',
 check('payload: タイトルはAI楽天タイトル優先', pl.title === '楽天用タイトル');
 check('payload: tagline=キャッチ', pl.tagline === 'キャッチ');
 // 2026-08-01 店舗フォーマット: PC商品説明文 = 表1枚 (説明/注意事項/仕様表/…)
-check('payload: PC説明文は表形式 — 説明行に商品名+特徴',
+// 2026-08-31 中原さん: 楽天タイトルは検索用に語を並べたもので、説明として読ませる文ではない。
+// 表の先頭に丸ごと出ると SEO 語の羅列がそのまま載るので、説明行には入れない
+check('payload: PC説明文は表形式 — 説明行は AI 特徴から始まる (楽天タイトルを入れない)',
   pl.productDescription.pc.startsWith('<table')
   && pl.productDescription.pc.includes('<b>説明</b>')
-  && pl.productDescription.pc.includes('楽天用タイトル')
+  && !pl.productDescription.pc.includes('楽天用タイトル')
   && pl.productDescription.pc.includes('特徴文'),
   pl.productDescription.pc);
 check('payload: 仕様表は1項目1行',
@@ -1034,6 +1036,16 @@ db.prepare(`DELETE FROM draft_cabinet_images WHERE draft_id = ? AND drive_file_i
 // ページ表記の自動保存リビジョン列 (#691 冪等ALTER)
 const piCols = new Set(db.prepare('PRAGMA table_info(draft_page_info)').all().map((c) => c.name));
 check('draft_page_info に save_token/save_seq (冪等ALTER)', piCols.has('save_token') && piCols.has('save_seq'));
+check('draft_page_info に brand_name (冪等ALTER)', piCols.has('brand_name'));
+// SKU別JAN の一意制約 (テーブル定義 + 後付けインデックスの両方で担保)
+{
+  const ix = db.prepare('PRAGMA index_list(draft_sku_jans)').all().some((i) => {
+    if (!i.unique) return false;
+    const cols = db.prepare(`PRAGMA index_info(${JSON.stringify(i.name)})`).all().map((c) => c.name);
+    return cols.length === 2 && cols.includes('draft_id') && cols.includes('jan_code');
+  });
+  check('draft_sku_jans に UNIQUE(draft_id, jan_code)', ix);
+}
 
 // ─── サムネイルプロキシの取得対象ガード (Codex R1 high: confused-deputy 防止) ───
 const { isKnownImageFileId } = await import('../db.js');
@@ -1309,11 +1321,13 @@ check('payload: 化粧品の必須記載不足は登録をブロック',
 db.prepare(`UPDATE draft_page_info SET seller_name = 'メーカーA', origin_type = '日本製', category_label = '化粧品' WHERE draft_id = ?`).run(rkId);
 db.prepare(`UPDATE draft_rakuten SET shipping_method_group = '5' WHERE draft_id = ?`).run(rkId);
 b27 = listing.buildItemPayload(db, rkId);
-check('payload: 充足すると説明文末尾に表を連結 (発送方法=アプリ指定グループ名)',
+// 発送方法の行は出さない (2026-08-31 中原さん: 表には不要。配送方法は画像末尾のバナーで見せている)
+check('payload: 充足すると説明文末尾に表を連結 (発送方法の行は出さない)',
   b27.ok === true
   && b27.payload.productDescription.pc.includes('<table')
   && b27.payload.productDescription.pc.includes('メーカーA')
-  && b27.payload.productDescription.pc.includes('ネコポス'),
+  && !b27.payload.productDescription.pc.includes('発送方法')
+  && !b27.payload.productDescription.pc.includes('ネコポス'),
   JSON.stringify(b27.reasons || null));
 check('payload: 表は説明文の末尾に付く', b27.payload.productDescription.pc.trim().endsWith('</table>'));
 // 仕様表とページ表記の同名ラベルはページ表記が正 (Codex R1 Medium: 重複行を作らない)
@@ -1526,6 +1540,63 @@ gb = listing.buildItemPayload(db, gdId);
 check('genre: JAN欄が空だと辞書必須のカタログIDは欠落エラーになる',
   gb.ok === false && gb.reasons.some((r) => r.includes('カタログID')), JSON.stringify(gb.reasons));
 
+// ─── メーカー型番は「メーカー型番」欄が唯一の入口 (2026-08-31 中原さん指摘) ───
+// RMS でも入力項目は 1 つなのに、画面が「メーカー型番」欄と商品属性の 2 箇所に入れさせていた。
+// 入口を article_number だけにして、辞書に メーカー型番 があるジャンルでは送信時に自動で積む
+{
+  const MODEL = listing.MODEL_ATTR_NAME;
+  // 辞書に メーカー型番 を足す (必須にして「欄に入っていれば必須欠落にならない」ことも見る)
+  const withModel = JSON.parse(JSON.stringify(gnorm.attributes));
+  withModel.push({ name: MODEL, mandatory: true, inputMethod: 'DESCRIPTIVE', multiValueLimit: 1, maxLength: 100, unit: null, dataType: 'STRING', mandatoryType: 'MANDATORY' });
+  db.prepare(`INSERT OR REPLACE INTO ph_genre_attributes (genre_id, genre_name, genre_path, payload_json, fixed_at)
+    VALUES ('900002', ?, ?, ?, ?)`).run(gnorm.genreName, gnorm.genrePath, JSON.stringify(withModel), gnorm.fixedAt);
+  db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
+  const OK_ATTRS = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]}]';
+
+  // ① 欄に入れれば、属性に メーカー型番 が無くても必須欠落にならず、payload には積まれる
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '900002', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+  let bm = listing.buildItemPayload(db, gdId);
+  const attrsOf = (r) => (r.ok ? r.payload.variants['gd-smoke-1'].attributes || [] : []);
+  check('メーカー型番: 欄に入れれば属性行が無くても通り、属性として自動で積まれる',
+    bm.ok === true && attrsOf(bm).some((a2) => a2.name === MODEL && a2.values[0] === 'toys3pen'),
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+  check('メーカー型番: articleNumber にも入る (楽天の型番フィールド)',
+    bm.ok === true && bm.payload.variants['gd-smoke-1'].articleNumber
+    && bm.payload.variants['gd-smoke-1'].articleNumber.value === 'toys3pen',
+    JSON.stringify(bm.ok ? bm.payload.variants['gd-smoke-1'].articleNumber : bm.reasons));
+
+  // ② 欄が空なら、辞書必須の メーカー型番 は今までどおり欠落エラー (黙って通さない)
+  db.prepare(`UPDATE draft_rakuten SET article_number = NULL WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 欄が空なら辞書必須の欠落として止まる',
+    bm.ok === false && bm.reasons.some((r) => r.includes(MODEL)), JSON.stringify(bm.reasons));
+
+  // ③ 旧データで属性側にも残っていて、欄と食い違うときは止める (どちらが正か分からない)
+  db.prepare(`UPDATE draft_rakuten SET article_number = 'toys3pen',
+    attributes_json = '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["別の型番"]}]'
+    WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 属性側の旧値と欄が食い違ったら止める',
+    bm.ok === false && bm.reasons.some((r) => r.includes('一致しません')), JSON.stringify(bm.reasons));
+
+  // ④ 同じ値なら通り、**二重に積まない** (属性が 2 つになると RMS 側で弾かれる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json =
+    '[{"name":"ブランド名","values":["x"]},{"name":"代表カラー","values":["黒"]},{"name":"メーカー型番","values":["toys3pen"]}]'
+    WHERE draft_id = ?`).run(gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 属性側と同じ値なら通り、属性は 1 つだけ (二重に積まない)',
+    bm.ok === true && attrsOf(bm).filter((a2) => a2.name === MODEL).length === 1,
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+
+  // ⑤ 辞書に メーカー型番 が無いジャンルでは属性に積まない (IE1002 になる)
+  db.prepare(`UPDATE draft_rakuten SET genre_id = '900001', attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+  bm = listing.buildItemPayload(db, gdId);
+  check('メーカー型番: 辞書に無いジャンルでは属性に積まない (IE1002 対策)',
+    bm.ok === true && !attrsOf(bm).some((a2) => a2.name === MODEL),
+    JSON.stringify(bm.ok ? attrsOf(bm) : bm.reasons));
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`).run(OK_ATTRS, gdId);
+}
+
 // 鮮度切れ辞書は検証に使わない (Codex R1 High-1: 古い辞書で正しい属性を弾かない)
 db.prepare(`UPDATE product_drafts SET jan_code = '4999999999999' WHERE id = ?`).run(gdId);
 db.prepare(`UPDATE draft_rakuten SET attributes_json = '[{"name":"存在しない属性","values":["z"]}]' WHERE draft_id = ?`).run(gdId);
@@ -1729,30 +1800,46 @@ check('page-info: 商品タイプと商品区分の不整合を弾く (化粧品
       origin_type: '海外製', origin_country: 'フランス', category_label: '化粧品',
       seller_name: 'メーカーA', importer_name: '輸入者B',
     },
-    shippingLabel: 'ネコポス',
   });
   check('page-info html: table + エスケープ + 改行→<br>',
     html.startsWith('<table') && html.includes('テスト&lt;商品&gt; &amp; &quot;A&quot;') && html.includes('水<br>グリセリン'),
     html.slice(0, 200));
   check('page-info html: 製造国は「海外製（フランス）」形式', html.includes('海外製（フランス）'));
   check('page-info html: 発売元 + 輸入者の両記載 (楽天ルール: 輸入品)', html.includes('メーカーA<br>輸入者: 輸入者B'));
-  check('page-info html: 発送方法/広告文責/注意事項が載る',
-    html.includes('ネコポス') && html.includes(pinfo.adResponsibility()) && html.includes(pinfo.FIXED_NOTES));
+  check('page-info html: 広告文責/注意事項が載る',
+    html.includes(pinfo.adResponsibility()) && html.includes(pinfo.FIXED_NOTES));
+  check('page-info html: 発送方法の行は出さない (2026-08-31 中原さん: 表には不要)',
+    !html.includes('発送方法') && !html.includes('ネコポス'), html.slice(0, 300));
   check('page-info html: 空欄の行は出さない (サイズ/使用上の注意なし)',
     !html.includes('サイズ') && !html.includes('使用上の注意'));
   const foodHtml = pinfo.buildPageInfoHtml({
     productName: 'アマニ', info: {
       product_type: 'food', food_name: '有機亜麻仁シード', food_ingredients: '有機アマニ',
       food_expiry: 'ラベルに記載', food_storage: '常温',
-    }, shippingLabel: null,
+    },
   });
   check('page-info html: 食品は 名称/原材料名/賞味期限/保存方法',
     ['名称', '原材料名', '賞味期限', '保存方法'].every((k) => foodHtml.includes(k))
     && !foodHtml.includes('発送方法'));
   check('page-info html: 全空でも固定行 (商品名/広告文責/注意事項) だけの表になる',
-    pinfo.buildPageInfoHtml({ productName: 'X', info: null, shippingLabel: null }).includes('広告文責'));
+    pinfo.buildPageInfoHtml({ productName: 'X', info: null }).includes('広告文責'));
   check('page-info html: 商品名すら無ければ固定行のみ (空文字にはならない)',
-    pinfo.buildPageInfoHtml({ productName: '', info: null, shippingLabel: null }).includes('注意事項'));
+    pinfo.buildPageInfoHtml({ productName: '', info: null }).includes('注意事項'));
+  // ブランド名・容量 (ml/g) — 2026-08-28 中原さん要望
+  {
+    const bh = pinfo.buildPageInfoHtml({
+      productName: 'X',
+      info: { product_type: 'general', brand_name: 'B-Faith<x>', content_volume: '200g' },
+    });
+    check('page-info html: ブランド名の行が載る (エスケープあり)',
+      bh.includes('<b>ブランド名</b>') && bh.includes('B-Faith&lt;x&gt;'), bh.slice(0, 300));
+    check('page-info html: ブランド名は商品名の次・サイズより前',
+      bh.indexOf('商品名') < bh.indexOf('ブランド名') && bh.indexOf('ブランド名') < bh.indexOf('内容量'));
+    check('page-info html: 雑貨でも容量 (ml/g) が内容量として載る', bh.includes('<b>内容量</b>') && bh.includes('200g'));
+    check('page-info html: ブランド名が空なら行を出さない',
+      !pinfo.buildPageInfoHtml({ productName: 'X', info: { product_type: 'general' } })
+        .includes('ブランド名'));
+  }
 }
 
 // mapNeShippingToRakuten: 保存済み > 完全一致 > 部分一致 > null
@@ -1930,6 +2017,7 @@ const wf = await import('../lib/workflow.js');
 
 // ─── ワークフロー: 商品 × 工程の進捗 (2026-08-23) ───
 const wfp = await import('../lib/workflow-progress.js');
+const backLink = await import('../lib/back-link.js');
 // 工程操作の権限文脈。admin は全部できる (一般ユーザーの制限は下の権限ブロックで検証する)
 const ADMIN = { isAdmin: true, actorStaffId: null };
 const wfTanakaId = wf.listStaff().find((s) => s.name === '田中美祐').id;
@@ -2370,7 +2458,7 @@ let wfSetParentId = null;
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '素材', 'ステンレス', 1)`).run(parentId);
   db.prepare(`INSERT INTO draft_specs (draft_id, spec_key, spec_value, sort) VALUES (?, '内容量', '50ml', 2)`).run(parentId);
   db.prepare(`INSERT INTO draft_reference_urls (draft_id, url, sort) VALUES (?, 'https://example.com/ref', 0)`).run(parentId);
-  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json) VALUES (?, '565004', '[]')`).run(parentId);
+  db.prepare(`INSERT INTO draft_rakuten (draft_id, genre_id, attributes_json, article_number) VALUES (?, '565004', '[]', 'parent-model-1')`).run(parentId);
   db.prepare(`INSERT INTO draft_ai_outputs (draft_id, kind, content) VALUES (?, 'rakuten_title', '単品のタイトル')`).run(parentId);
   // 商品ページ表記: セットで変わるもの (内容量・サイズ・食品表示) が引き継がれないことを見る
   db.prepare(`
@@ -2414,6 +2502,11 @@ let wfSetParentId = null;
     db.prepare('SELECT COUNT(*) AS c FROM draft_reference_urls WHERE draft_id = ?').get(r.draftId).c === 1);
   check('楽天ジャンルはコピーする',
     db.prepare('SELECT genre_id FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.genre_id === '565004');
+  // メーカー型番の入口を article_number に統一したので、ここを抜かすと派生したセットから型番が消える
+  // (2026-08-31 / Codex R1 high)
+  check('メーカー型番 (article_number) もコピーする',
+    db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.article_number === 'parent-model-1',
+    String(db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(r.draftId)?.article_number));
   check('画像はコピーしない',
     db.prepare('SELECT COUNT(*) AS c FROM draft_images WHERE draft_id = ?').get(r.draftId).c === 0);
   check('AIモードでは説明文をコピーしない',
@@ -3182,7 +3275,87 @@ let wfSetParentId = null;
   check('SKU売価: 残った行の解除はいつでもできる (原価が同一に変わった後でも)', r.status === 200
     && !db.prepare(`SELECT 1 FROM draft_sku_prices WHERE draft_id = ? AND sku_code = 'vc-b'`).get(idP));
   db.prepare(`UPDATE mirror_products SET 原価 = 500 WHERE product_id = 9411`).run();
+
+  // ─── SKU別JAN (2026-08-28 中原さん要望: バリエーションありはSKUごとにJANを控える) ───
+  // 有効な JAN (チェックデジット込み): 4901234567894 / 4912345678904
+  const janOf = (code) => db.prepare(
+    'SELECT jan_code FROM draft_sku_jans WHERE draft_id = ? AND sku_code = ?').get(idP, code)?.jan_code;
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: 保存できる', r.status === 200 && janOf('vc-b') === '4901234567894', JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4912345678904' });
+  check('SKU JAN: 上書きできる (UPSERT)', r.status === 200 && janOf('vc-b') === '4912345678904');
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567890' });
+  check('SKU JAN: チェックデジットが合わない値は 400', r.status === 400, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '12345' });
+  check('SKU JAN: 桁数が合わない値は 400', r.status === 400);
+  check('SKU JAN: 弾かれた要求で既存値は書き換わらない', janOf('vc-b') === '4912345678904');
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-a', jan_code: '4912345678904' });
+  check('SKU JAN: 同じJANを別SKUに付けようとしたら 409 (別商品の同一JANはモールで弾かれる)',
+    r.status === 409, JSON.stringify(r.json));
+  {
+    // API の事前チェックだけでなく DB 制約でも防ぐ (一括取込など別経路の backstop)
+    let dupErr = null;
+    try {
+      db.prepare(`INSERT INTO draft_sku_jans (draft_id, sku_code, jan_code) VALUES (?, 'vc-a', '4912345678904')`).run(idP);
+    } catch (e) { dupErr = e; }
+    check('SKU JAN: 同一ページ内のJAN重複は DB 制約でも弾く', /UNIQUE/i.test(String(dupErr && dupErr.message)),
+      String(dupErr && dupErr.message));
+  }
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'not-in-group', jan_code: '4901234567894' });
+  check('SKU JAN: グループ外のSKUは 409', r.status === 409);
+  r = await call('POST', `/api/drafts/${idE}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: バリエーションでないドラフトは 400', r.status === 400);
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '' });
+  check('SKU JAN: 空で解除 = 行が消える', r.status === 200 && janOf('vc-b') === undefined);
+  // SKU を外したら JAN 行も掃除される (残すと入力欄が消えて解除できない)
+  r = await call('POST', `/api/drafts/${idP}/sku-jans`, { ne_code: 'vc-b', jan_code: '4901234567894' });
+  check('SKU JAN: 除外前は保存できる', r.status === 200, JSON.stringify(r.json));
+  r = await call('POST', `/api/drafts/${idP}/variation/exclude`, { ne_code: 'vc-b' });
+  check('SKU JAN: SKUを外すとJAN行も消える (孤児行を残さない)', r.status === 200 && janOf('vc-b') === undefined);
+  db.prepare(`DELETE FROM draft_variation_exclusions WHERE LOWER(TRIM(ne_code)) = 'vc-b'`).run();
+
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idP);
+
+  // ─── 参考URL / 商品情報 (ブランド名・容量) / 掲載HTMLの商品名 (2026-08-28 中原さん要望) ───
+  {
+    const idB = Number(db.prepare(`
+      INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DRV-BASIC28', '旧の商品名', 'smoke')
+    `).run().lastInsertRowid);
+    // ブランド名・容量が保存され、掲載HTMLに載る
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g',
+    });
+    check('商品情報: ブランド名・容量が保存される', r.status === 200
+      && db.prepare('SELECT brand_name, content_volume FROM draft_page_info WHERE draft_id = ?').get(idB)?.brand_name === 'B-Faith',
+      JSON.stringify(r.json).slice(0, 200));
+    check('商品情報: 掲載HTMLにブランド名と容量が載る (雑貨でも容量が出る)',
+      r.json.html.includes('ブランド名') && r.json.html.includes('B-Faith')
+      && r.json.html.includes('内容量') && r.json.html.includes('200g'));
+    // 掲載HTMLの商品名は「基本情報にいま入っている商品名」を使う (保存はしない)
+    check('掲載HTML: product_name 未指定なら DB の商品名', r.json.html.includes('旧の商品名'));
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', product_name: '打ち替えた新しい商品名',
+    });
+    check('掲載HTML: 基本情報にいま入っている商品名が使われる',
+      r.json.html.includes('打ち替えた新しい商品名') && !r.json.html.includes('旧の商品名'),
+      r.json.html.slice(0, 200));
+    check('掲載HTML: 商品名のプレビュー指定では product_drafts.name を書き換えない',
+      db.prepare('SELECT name FROM product_drafts WHERE id = ?').get(idB).name === '旧の商品名');
+    // 画面で商品名を空にしたら「商品名」行も消える (DB の古い値を復活させない — Codex R1 中)
+    r = await call('POST', `/api/drafts/${idB}/page-info`, {
+      product_type: 'general', brand_name: 'B-Faith', content_volume: '200g', product_name: '',
+    });
+    check('掲載HTML: 画面で商品名が空なら「商品名」行を出さない (古い名前を復活させない)',
+      !r.json.html.includes('旧の商品名') && !r.json.html.includes('<b>商品名</b>'), r.json.html.slice(0, 200));
+    // 参考URL: 追加ボタンでも自動反映でも通る経路は同じ (URL 検証はサーバー側が最終判定)
+    r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'https://example.com/ref-1' });
+    check('参考URL: 追加できる', r.status === 200
+      && db.prepare('SELECT COUNT(*) c FROM draft_reference_urls WHERE draft_id = ?').get(idB).c === 1,
+      JSON.stringify(r.json));
+    r = await call('POST', `/api/drafts/${idB}/refs`, { url: 'javascript:alert(1)' });
+    check('参考URL: http(s) 以外は 400 (自動反映でも素通しにしない)', r.status === 400, JSON.stringify(r.json));
+    db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idB);
+  }
 
   // ─── 工程ボードをデフォルトに (2026-08-24 中原さん要望) ───
   const rawGet = async (p) => {
@@ -3200,6 +3373,223 @@ let wfSetParentId = null;
     rg.status === 302 && rg.location.endsWith('/apps/product-hub/list'), JSON.stringify(rg));
   const listRes = await fetch(base + '/list');
   check('ルート: /list が一覧を返す', listRes.status === 200 && (await listRes.text()).includes('新規登録'));
+
+  // ─── かんばんの手動並び順 + 詳細の戻り先 (2026-08-28 中原さん要望) ───
+  {
+    // 既定の並びは「停滞が長い順 → 登録順」。手で並べ替えたらその順が残る (読み直しても戻らない)
+    const colOf = (b, code) => b.columns.find((c) => (c.code || c.key) === code);
+    const b0 = wfp.boardData(db, {});
+    const target = b0.columns.find((c) => c.cards.length >= 2);
+    check('並び順: 2枚以上あるボード列がある (以降の検証の前提)', !!target,
+      b0.columns.map((c) => `${c.code}:${c.cards.length}`).join(','));
+    if (target) {
+      const colCode = target.code || target.key;
+      const before = target.cards.map((c) => c.id);
+      // 先頭と末尾を入れ替えて保存 (画面が送るのと同じ「列まるごとの順番」)
+      const wanted = [before[before.length - 1], ...before.slice(1, -1), before[0]];
+      const rr = await call('POST', '/api/board/reorder', {
+        view: 'main', col: colCode, items: wanted.map((id) => ({ id })),
+      });
+      check('並び順: API が保存を受け付ける', rr.status === 200 && rr.json.ok && rr.json.saved === wanted.length,
+        JSON.stringify(rr.json));
+      const b1 = wfp.boardData(db, {});
+      check('並び順: 読み直しても手で並べた順のまま (作成順に戻らない)',
+        colOf(b1, colCode).cards.map((c) => c.id).join(',') === wanted.join(','),
+        `${colOf(b1, colCode).cards.map((c) => c.id).join(',')} != ${wanted.join(',')}`);
+
+      // 別ビューの並びは独立 (本流で並べても画像ボードの順は変わらない)
+      const ordRows = db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE view = 'image'`).get().n;
+      check('並び順: 本流の並べ替えは画像ビューに漏れない', ordRows === 0, `image rows=${ordRows}`);
+
+      // 工程が変わって別の列に出たカードは、前の列で付けた順番を持ち込まない
+      const movedId = wanted[0];
+      db.prepare(`UPDATE ph_board_order SET col = 'ZZZ-OTHER' WHERE view = 'main' AND draft_id = ?`).run(movedId);
+      const b2 = wfp.boardData(db, {});
+      const cards2 = colOf(b2, colCode).cards.map((c) => c.id);
+      check('並び順: 別の列に置いた記録はこの列に効かない (既定順に戻る)',
+        cards2[0] !== movedId || wanted.length === 1, cards2.join(','));
+      // 記録の列と実際の列が食い違う行は、ボードを開いたときに掃除される (Codex R2 中:
+      // 残ると、あとでその列を並べ替えたとき見えないカードとして差し込み位置を押し下げる)
+      check('並び順: 実際の列と食い違う記録はボード表示時に消える',
+        db.prepare(`SELECT COUNT(*) AS n FROM ph_board_order WHERE col = 'ZZZ-OTHER'`).get().n === 0);
+
+      // 確認中は手動順より上 (2026-08-31 / Codex R1)。「情報待ちが埋もれる」が要望の本体なので、
+      // 以前その列で手で決めた位置より優先する。手で最後尾に置いたカードを確認中にして確かめる
+      {
+        const again = await call('POST', '/api/board/reorder', {
+          view: 'main', col: colCode, items: wanted.map((id) => ({ id })),
+        });
+        check('確認中: 手動順の再保存 (前提)', again.status === 200);
+        const lastId = wanted[wanted.length - 1];
+        dbmod.setDraftChecking(db, lastId, { reasonCode: 'no_web_info', actor: 'smoke' });
+        const bChk = wfp.boardData(db, {});
+        const colChk = colOf(bChk, colCode);
+        check('確認中: 手で最後尾に置いたカードでも、確認中にしたら列の先頭に来る',
+          colChk && colChk.cards[0].id === lastId,
+          colChk ? colChk.cards.map((c) => `${c.id}${c.checking ? '(確認中)' : ''}`).join(',') : '(列が無い)');
+        dbmod.clearDraftChecking(db, lastId, { actor: 'smoke' });
+        const bBack = wfp.boardData(db, {});
+        check('確認中: 解除すると手で並べた順に戻る (手動順を壊さない)',
+          colOf(bBack, colCode).cards.map((c) => c.id).join(',') === wanted.join(','),
+          colOf(bBack, colCode).cards.map((c) => c.id).join(','));
+      }
+
+      // 完了列と画像ビューも同じ orderIn を通る (Codex R2 low: 本流の通常列でしか見ていなかった)
+      {
+        // 完了列の検証には完了カードが 2 枚要る。この時点では足りないので、既存 draft 2 件の
+        // 本流工程をその場で done にして作り、検証後に元の state へ戻す
+        // (「前提が無いので黙って skip」にすると、テストがあるのに何も検証していない状態になる)
+        const mainCodes = db.prepare(`SELECT code FROM ph_steps WHERE track = 'main' AND active = 1`).all().map((x) => x.code);
+        const donors = db.prepare(`SELECT id FROM product_drafts WHERE status NOT IN ('on_hold','excluded')
+          ORDER BY id LIMIT 2`).all().map((x) => x.id);
+        const savedStates = donors.length === 2
+          ? db.prepare(`SELECT draft_id, step_code, state FROM draft_step_progress
+              WHERE draft_id IN (${donors.join(',')})`).all()
+          : [];
+        if (donors.length === 2) {
+          db.prepare(`UPDATE draft_step_progress SET state = 'done'
+            WHERE draft_id IN (${donors.join(',')})
+              AND step_code IN (${mainCodes.map(() => '?').join(',')})`).run(...mainCodes);
+        }
+        const bD = wfp.boardData(db, {});
+        check('確認中: 完了列の検証の前提 (完了カードを 2 枚用意できた)', bD.doneCards.length >= 2,
+          `done=${bD.doneCards.length}`);
+        if (bD.doneCards.length >= 2) {
+          const doneIds = bD.doneCards.map((c) => c.id);
+          const wantedDone = [...doneIds.slice(1), doneIds[0]];
+          await call('POST', '/api/board/reorder', {
+            view: 'main', col: 'done', items: wantedDone.map((id) => ({ id })),
+          });
+          const lastDone = wantedDone[wantedDone.length - 1];
+          dbmod.setDraftChecking(db, lastDone, { reasonCode: 'other', actor: 'smoke' });
+          check('確認中: 完了列でも手動順より上に来る',
+            wfp.boardData(db, {}).doneCards[0].id === lastDone,
+            wfp.boardData(db, {}).doneCards.map((c) => `${c.id}${c.checking ? '(確認中)' : ''}`).join(','));
+          dbmod.clearDraftChecking(db, lastDone, { actor: 'smoke' });
+          check('確認中: 完了列も解除で手動順に戻る',
+            wfp.boardData(db, {}).doneCards.slice(0, wantedDone.length).map((c) => c.id).join(',') === wantedDone.join(','),
+            wfp.boardData(db, {}).doneCards.map((c) => c.id).join(','));
+        }
+        // 工程を元に戻す (以降のテストに「勝手に完了した商品」を持ち込まない)
+        for (const s of savedStates) {
+          db.prepare('UPDATE draft_step_progress SET state = ? WHERE draft_id = ? AND step_code = ?')
+            .run(s.state, s.draft_id, s.step_code);
+        }
+        for (const id of donors) wfp.recomputeDraftStatus(db, id, { actor: 'smoke' });
+        // 画像ビュー: カード = 商品×種別。同じ商品の TOP/詳細 が**それぞれの列で**先頭に来る
+        const bI = wfp.boardData(db, { view: 'image' });
+        const imgCol = bI.columns.find((c) => c.cards.length >= 2);
+        // 前提も check にする (Codex R3): fixture が変わって「2枚以上ある画像列」が消えたとき、
+        // 黙って未実行のまま ALL PASS になると、検証しているつもりで何も見ていない状態になる
+        check('確認中: 画像ビューの検証の前提 (2枚以上あるカード列がある)', !!imgCol,
+          bI.columns.map((c) => `${c.code || c.key}:${c.cards.length}`).join(','));
+        if (imgCol) {
+          const imgIds = imgCol.cards.map((c) => `${c.id}|${c.kind}`);
+          const wantedImg = [...imgIds.slice(1), imgIds[0]];
+          await call('POST', '/api/board/reorder', {
+            view: 'image', col: imgCol.code || imgCol.key,
+            items: wantedImg.map((k) => ({ id: Number(k.split('|')[0]), kind: k.split('|')[1] })),
+          });
+          const lastImg = wantedImg[wantedImg.length - 1];
+          const lastImgId = Number(lastImg.split('|')[0]);
+          dbmod.setDraftChecking(db, lastImgId, { reasonCode: 'other', actor: 'smoke' });
+          const afterImg = wfp.boardData(db, { view: 'image' });
+          const colAfter = afterImg.columns.find((c) => (c.code || c.key) === (imgCol.code || imgCol.key));
+          // 確認中は**商品**に付くフラグなので、画像ビューでは同じ商品の TOP と詳細が
+          // 両方とも確認中カードになる。「その 1 枚が先頭」ではなく
+          // 「確認中のカードが全部、通常のカードより前にいて、そこに対象が居る」で見る
+          check('確認中: 画像ビューでも手動順より上に来る (同じ商品の TOP/詳細 が揃って先頭グループ)', (() => {
+            if (!colAfter) return false;
+            const flags = colAfter.cards.map((c) => !!c.checking);
+            const lastChk = flags.lastIndexOf(true);
+            const firstNormal = flags.indexOf(false);
+            if (lastChk < 0) return false;                                  // 確認中が 1 枚も無い
+            if (firstNormal >= 0 && lastChk > firstNormal) return false;    // 通常カードに割り込まれている
+            return colAfter.cards.map((c) => `${c.id}|${c.kind}`).indexOf(lastImg) <= lastChk;
+          })(),
+            colAfter ? colAfter.cards.map((c) => `${c.id}|${c.kind}${c.checking ? '(確認中)' : ''}`).join(',') : '(列が無い)');
+          dbmod.clearDraftChecking(db, lastImgId, { actor: 'smoke' });
+          const backImg = wfp.boardData(db, { view: 'image' })
+            .columns.find((c) => (c.code || c.key) === (imgCol.code || imgCol.key));
+          check('確認中: 画像ビューも解除で id|kind ごとの手動順に戻る',
+            backImg.cards.map((c) => `${c.id}|${c.kind}`).join(',') === wantedImg.join(','),
+            backImg.cards.map((c) => `${c.id}|${c.kind}`).join(','));
+        }
+      }
+      // 後片付け (以降の並び検証に影響させない)
+      db.prepare(`DELETE FROM ph_board_order`).run();
+    }
+    // 絞り込み中の並べ替えが、画面に出ていないカードの順番を巻き込まない (Codex R1 高)
+    {
+      const b = wfp.boardData(db, {});
+      const t = b.columns.find((c) => c.cards.length >= 3);
+      check('並び順(部分): 3枚以上あるボード列がある (以降の検証の前提)', !!t,
+        b.columns.map((c) => `${c.code}:${c.cards.length}`).join(','));
+      if (t) {
+        const code = t.code;
+        const all = t.cards.map((c) => c.id);
+        // まず列全体を固定 (A,B,C,...)
+        await call('POST', '/api/board/reorder', { view: 'main', col: code, items: all.map((id) => ({ id })) });
+        // 次に「B だけ絞り込みで隠れている画面」から A と C を入れ替えて保存
+        const visible = [all[2], all[0], ...all.slice(3)];
+        const rp = await call('POST', '/api/board/reorder', { view: 'main', col: code, items: visible.map((id) => ({ id })) });
+        check('並び順(部分): 一部だけ送っても受け付ける', rp.status === 200 && rp.json.ok, JSON.stringify(rp.json));
+        const after2 = wfp.boardData(db, {}).columns.find((c) => c.code === code).cards.map((c) => c.id);
+        check('並び順(部分): 送ったカードだけ入れ替わり、隠れていたカードは動かない',
+          after2.join(',') === [all[2], all[1], all[0], ...all.slice(3)].join(','),
+          `${after2.join(',')} != ${[all[2], all[1], all[0], ...all.slice(3)].join(',')}`);
+        db.prepare(`DELETE FROM ph_board_order`).run();
+      }
+    }
+
+    const rBad = await call('POST', '/api/board/reorder', { view: 'main', col: '', items: [{ id: 1 }] });
+    check('並び順: 列の指定が無ければ拒否', rBad.status >= 400, JSON.stringify(rBad.json));
+    const rNoItems = await call('POST', '/api/board/reorder', { view: 'main', col: 'basic_info' });
+    check('並び順: items 無しは 400', rNoItems.status === 400, JSON.stringify(rNoItems.json));
+    // 入力の検証 (黙って main / top に倒さない — Codex R1 高)
+    const rCol = await call('POST', '/api/board/reorder', { view: 'main', col: 'ZZZ-NOPE', items: [{ id: wfDraftId }] });
+    check('並び順: 存在しない列は 400', rCol.status === 400, JSON.stringify(rCol.json));
+    const rView = await call('POST', '/api/board/reorder', { view: 'bogus', col: 'basic_info', items: [{ id: wfDraftId }] });
+    check('並び順: 不正なビューは 400 (黙って本流にしない)', rView.status === 400, JSON.stringify(rView.json));
+    const rKind = await call('POST', '/api/board/reorder', { view: 'image', col: 'request', items: [{ id: wfDraftId, kind: 'bogus' }] });
+    check('並び順: 不正な画像種別は 400 (黙って TOP にしない)', rKind.status === 400, JSON.stringify(rKind.json));
+    const rDup = await call('POST', '/api/board/reorder', {
+      view: 'main', col: 'basic_info', items: [{ id: wfDraftId }, { id: wfDraftId }],
+    });
+    check('並び順: 同じカードの重複は 400', rDup.status === 400, JSON.stringify(rDup.json));
+    const rGhost = await call('POST', '/api/board/reorder', { view: 'main', col: 'basic_info', items: [{ id: 999999 }] });
+    check('並び順: 存在しない商品は 400', rGhost.status === 400, JSON.stringify(rGhost.json));
+    check('並び順: 検証で弾かれた要求は 1 行も書かない',
+      db.prepare('SELECT COUNT(*) AS n FROM ph_board_order').get().n === 0);
+
+    // 戻り先: ボードから開いたら見ていたボードへ。不正な値は一覧に倒す (外部URLへ飛ばさない)
+    check('戻り先: back なしは一覧', backLink.backLinkOf({}).url === '/apps/product-hub/list');
+    check('戻り先: 画像ビュー + 種別 + 未割り当てを復元',
+      backLink.backLinkOf({ back: 'v=board&view=image&kind=detail&filter=unassigned' }).url
+      === '/apps/product-hub/board?view=image&filter=unassigned&kind=detail',
+      backLink.backLinkOf({ back: 'v=board&view=image&kind=detail&filter=unassigned' }).url);
+    check('戻り先: 本流ビューは素のボード',
+      backLink.backLinkOf({ back: 'v=board' }).url === '/apps/product-hub/board');
+    check('戻り先: 担当者は me か数字だけ通す',
+      backLink.backLinkOf({ back: 'v=board&assignee=me' }).url === '/apps/product-hub/board?assignee=me'
+      && backLink.backLinkOf({ back: 'v=board&assignee=12' }).url === '/apps/product-hub/board?assignee=12'
+      && backLink.backLinkOf({ back: 'v=board&assignee=../../evil' }).url === '/apps/product-hub/board');
+    check('戻り先: 外部URLを入れても board 以外へは行かない',
+      backLink.backLinkOf({ back: 'https://evil.example.com/' }).url === '/apps/product-hub/list'
+      && backLink.backLinkOf({ back: 'v=board&view=//evil.example.com' }).url === '/apps/product-hub/board');
+    check('戻り先: 種別は画像ビューのときだけ効く',
+      backLink.backLinkOf({ back: 'v=board&kind=detail' }).url === '/apps/product-hub/board');
+    check('戻り先: filter=checking も復元される (確認中で絞った画面に戻す — 2026-08-31)',
+      backLink.backLinkOf({ back: 'v=board&filter=checking' }).url === '/apps/product-hub/board?filter=checking',
+      backLink.backLinkOf({ back: 'v=board&filter=checking' }).url);
+    check('戻り先: 未知の filter は落とす',
+      backLink.backLinkOf({ back: 'v=board&filter=whatever' }).url === '/apps/product-hub/board');
+    // ボードのカードリンクに戻り先の印が付いている (これが無いと詳細から一覧に戻ってしまう)
+    const boardHtml = await (await fetch(base + '/board?view=image&kind=top')).text();
+    check('戻り先: ボードのカードリンクに back= が付く',
+      boardHtml.includes('back=v%3Dboard%26view%3Dimage%26kind%3Dtop'),
+      boardHtml.slice(boardHtml.indexOf('kb-card-link'), boardHtml.indexOf('kb-card-link') + 200));
+  }
 
   // ─── 自社商品チェック ⇄ 画像の重要度「自社商品（重要度：高）」の連動 (2026-08-24 中原さん要望) ───
   // 不変条件: own_brand=1 ⟺ image_priority='自社商品（重要度：高）'
@@ -3323,6 +3713,153 @@ const frk2 = db.prepare('SELECT * FROM draft_rakuten WHERE draft_id = ?').get(fd
 check('白抜きのみの取込は商品画像を触らず、draft_rakuten の他カラムも保持',
   fimgs2.length === 2 && frk2.white_bg_drive_file_id === 'wb2' && frk2.genre_id === '123456',
   JSON.stringify({ fimgs2, frk2 }));
+
+// ─── drive-image-folder (画像フォルダ「商品コード_商品名」の自動作成、2026-08-27) ───
+{
+  const dif = await import('../services/drive-image-folder.js');
+  // フォルダ名: G: 同期される親フォルダなので Windows 禁止文字は全角へ寄せる
+  check('フォルダ名: 商品コード_商品名', dif.buildImageFolderName('sgs-or', 'メガネストラップ') === 'sgs-or_メガネストラップ');
+  check('フォルダ名: Windows禁止文字を全角へ', dif.buildImageFolderName('a/b', 'x:y*z?"<>|') === 'a／b_x：y＊z？”＜＞｜');
+  check('フォルダ名: 空白圧縮+末尾ドット除去', dif.buildImageFolderName(' c1 ', ' 商品  名 .. ') === 'c1_商品 名');
+  check('フォルダ名: 商品名が空ならコードのみ', dif.buildImageFolderName('code-1', '  ') === 'code-1');
+  check('フォルダ名: 100字で切る', dif.buildImageFolderName('X', 'あ'.repeat(200)).length <= 100);
+
+  check('単品判定: 通常ドラフトは対象', dif.isSingleProductDraft({ parent_draft_id: null, provisional_code: 0 }) === true);
+  check('単品判定: セット派生 (仮コード) は対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 1 }) === false);
+  check('単品判定: コード確定後のセットも対象外', dif.isSingleProductDraft({ parent_draft_id: 1, provisional_code: 0 }) === false);
+
+  const setDifId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, parent_draft_id, provisional_code, created_by)
+    VALUES ('SET-DIF-01', 'セット派生', 999, 1, 'smoke')`).run().lastInsertRowid);
+  check('セット派生はフォルダを作らない', (await dif.attemptImageFolderCreation(setDifId, {})).outcome === 'skipped_set');
+  check('URL入力済みのカードは触らない', (await dif.attemptImageFolderCreation(fdraft.id, {})).outcome === 'skipped_has_url');
+
+  // SA 鍵なし → disabled (fail-soft。カード作成は成功のまま)
+  const difId = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-1', 'フォルダ自動作成', 'smoke')`).run().lastInsertRowid);
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  check('SA鍵なしは disabled', (await dif.attemptImageFolderCreation(difId, {})).outcome === 'disabled');
+
+  // 成功パス (fake client 注入・API 非接続)
+  const fakeDrive = (listFiles, createdId) => ({
+    files: {
+      list: async () => ({ data: { files: listFiles } }),
+      create: async () => ({ data: { id: createdId } }),
+    },
+  });
+  const r1 = await dif.attemptImageFolderCreation(difId, { actor: 'smoke', driveClient: fakeDrive([], 'NEW-FOLDER-ID') });
+  check('新規作成で drive_folder_url が入る', r1.outcome === 'created' && r1.url.endsWith('NEW-FOLDER-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId).drive_folder_url.endsWith('NEW-FOLDER-ID'),
+    JSON.stringify(r1));
+  check('drive_folder_created イベント記録',
+    db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_created'`).get(difId).c === 1);
+  check('2回目は URL 済みで skip', (await dif.attemptImageFolderCreation(difId, { driveClient: fakeDrive([], 'X') })).outcome === 'skipped_has_url');
+
+  // 冪等: 親フォルダ直下に同名フォルダがあれば再利用 (二重作成しない)
+  const difId2 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-2', '再利用', 'smoke')`).run().lastInsertRowid);
+  const r2 = await dif.attemptImageFolderCreation(difId2, { driveClient: fakeDrive([{ id: 'EXIST-ID', name: 'x' }], 'unused') });
+  check('同名フォルダは再利用', r2.outcome === 'reused' && r2.url.endsWith('EXIST-ID'), JSON.stringify(r2));
+
+  // レース: Drive 作成中に人が URL を貼ったら人の入力を正とする (上書きしない)
+  const difId3 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-3', 'レース', 'smoke')`).run().lastInsertRowid);
+  const racingDrive = {
+    files: {
+      list: async () => {
+        db.prepare(`UPDATE product_drafts SET drive_folder_url = 'https://drive.google.com/drive/folders/HUMAN2' WHERE id = ?`).run(difId3);
+        return { data: { files: [] } };
+      },
+      create: async () => ({ data: { id: 'AUTO-ID' } }),
+    },
+  };
+  const r3 = await dif.attemptImageFolderCreation(difId3, { driveClient: racingDrive });
+  check('作成中の手入力 URL を上書きしない (url は残った方を返す)', r3.outcome === 'kept_manual_url'
+    && r3.url.endsWith('HUMAN2') && r3.unusedFolderUrl.endsWith('AUTO-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId3).drive_folder_url.endsWith('HUMAN2'),
+    JSON.stringify(r3));
+
+  // 同一 draft への同時呼び出しは1本にまとまる (list→create の隙間の二重作成防止)
+  const difId5 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-5', '同時実行', 'smoke')`).run().lastInsertRowid);
+  let createCalls = 0;
+  const slowDrive = {
+    files: {
+      list: async () => { await new Promise((r) => setTimeout(r, 20)); return { data: { files: [] } }; },
+      create: async () => { createCalls += 1; return { data: { id: 'ONCE-ID' } }; },
+    },
+  };
+  const [c1, c2] = await Promise.all([
+    dif.attemptImageFolderCreation(difId5, { driveClient: slowDrive }),
+    dif.attemptImageFolderCreation(difId5, { driveClient: slowDrive }),
+  ]);
+  check('同時2回の呼び出しで create は1回', createCalls === 1 && c1.outcome === 'created' && c2.outcome === 'created',
+    JSON.stringify({ createCalls, c1, c2 }));
+
+  // 壊れた SA 鍵でも throw せず failed (登録 API を 500 にしない)
+  const difIdBadKey = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-BADKEY', '鍵破損', 'smoke')`).run().lastInsertRowid);
+  process.env.GOOGLE_SERVICE_ACCOUNT_KEY = 'not-base64-json!!';
+  const rBad = await dif.attemptImageFolderCreation(difIdBadKey, {});
+  delete process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  check('壊れた SA 鍵は failed (throw しない)', rBad.outcome === 'failed' && !!rBad.error
+    && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_failed'`).get(difIdBadKey).c === 1,
+    JSON.stringify(rBad));
+
+  // Drive 失敗は fail-soft + イベント記録
+  const difId4 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-4', '失敗', 'smoke')`).run().lastInsertRowid);
+  const r4 = await dif.attemptImageFolderCreation(difId4, { driveClient: { files: { list: async () => { throw new Error('boom'); } } } });
+  check('Drive失敗は fail-soft + drive_folder_failed', r4.outcome === 'failed' && r4.error.includes('boom')
+    && db.prepare(`SELECT COUNT(*) c FROM draft_events WHERE draft_id = ? AND event = 'drive_folder_failed'`).get(difId4).c === 1,
+    JSON.stringify(r4));
+
+  // バッチは途中の失敗で止まらない (1件目 throw → 2件目は作成される)
+  const difId6 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-6', 'バッチ続行', 'smoke')`).run().lastInsertRowid);
+  let batchCall = 0;
+  const flakyDrive = {
+    files: {
+      list: async () => { batchCall += 1; if (batchCall === 1) throw new Error('flaky'); return { data: { files: [] } }; },
+      create: async () => ({ data: { id: 'BATCH-ID' } }),
+    },
+  };
+  const difId7 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-7', 'バッチ2件目', 'smoke')`).run().lastInsertRowid);
+  const s = await dif.attemptImageFolderCreationBatch([difId6, difId7, difId2, 999999], { driveClient: flakyDrive });
+  check('バッチは失敗で止まらない (失敗1/作成1/skip2)',
+    s.failed === 1 && s.created === 1 && s.skipped === 2, JSON.stringify(s));
+
+  // 失敗の回収: drive_folder_failed のまま URL 空の単品だけ再試行する (バックフィルはしない)。
+  // 直近失敗 (backoff 中) と総試行上限超えは対象外 = 恒久失敗を毎回叩かない (Codex R2 high)
+  const difId8 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-8', '再試行対象', 'smoke')`).run().lastInsertRowid);
+  const insOldFail = db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at)
+    VALUES (?, 'drive_folder_failed', 'old-fail', 'smoke', strftime('%Y-%m-%dT%H:%M:%fZ','now','-3 hours'))`);
+  insOldFail.run(difId8);
+  const difId9 = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-9', '上限超え', 'smoke')`).run().lastInsertRowid);
+  for (let i = 0; i < dif.MAX_RETRY_ATTEMPTS; i++) insOldFail.run(difId9);
+  const rt1 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'RETRY-ID') });
+  check('再試行: 古い失敗だけ回収 (直近失敗=backoff中・上限超えは対象外)',
+    rt1.retried === 1 && rt1.created === 1 && rt1.failed === 0
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId8).drive_folder_url.endsWith('RETRY-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId9).drive_folder_url == null
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difId4).drive_folder_url == null,
+    JSON.stringify(rt1));
+  const rt2 = await dif.retryFailedImageFolders({ driveClient: fakeDrive([], 'X') });
+  check('再試行: 回収済みなら対象なし', rt2.retried === 0, JSON.stringify(rt2));
+
+  // limit 到達時は「古い失敗」から優先 (先頭 id 固定の飢餓にならない)
+  const oldFailAt = (id, hoursAgo) => db.prepare(`INSERT INTO draft_events (draft_id, event, detail, actor, created_at)
+    VALUES (?, 'drive_folder_failed', 'old-fail', 'smoke', strftime('%Y-%m-%dT%H:%M:%fZ','now','-' || ? || ' hours'))`).run(id, hoursAgo);
+  const difIdOldA = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-A', '5時間前', 'smoke')`).run().lastInsertRowid);
+  const difIdOldB = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-B', '4時間前', 'smoke')`).run().lastInsertRowid);
+  const difIdOldC = Number(db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by) VALUES ('DIF-OLD-C', '3時間前', 'smoke')`).run().lastInsertRowid);
+  oldFailAt(difIdOldC, 3); oldFailAt(difIdOldA, 5); oldFailAt(difIdOldB, 4);
+  const rt3 = await dif.retryFailedImageFolders({ limit: 2, driveClient: fakeDrive([], 'OLDEST-ID') });
+  check('再試行: limit 超過時は古い失敗から優先 (新しい方は次回へ)',
+    rt3.retried === 2 && rt3.created === 2
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldA).drive_folder_url.endsWith('OLDEST-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldB).drive_folder_url.endsWith('OLDEST-ID')
+    && db.prepare('SELECT drive_folder_url FROM product_drafts WHERE id = ?').get(difIdOldC).drive_folder_url == null,
+    JSON.stringify(rt3));
+
+  // 不正な PH_IMAGE_FOLDER_PARENT_ID は既定値へフォールバック (Drive クエリを壊さない)
+  process.env.PH_IMAGE_FOLDER_PARENT_ID = "bad'id --";
+  const pid = dif.imageFolderParentId();
+  delete process.env.PH_IMAGE_FOLDER_PARENT_ID;
+  check('不正な親フォルダIDは既定値へ', /^[A-Za-z0-9_-]+$/.test(pid) && pid !== "bad'id --", pid);
+}
 
 // 店舗内カテゴリ AI 自動適用の「一度だけ」判定 (router の everSaved と同じイベント名・同じクエリ)
 const everSavedQuery = (id) => db.prepare(
@@ -3656,8 +4193,368 @@ check('店舗内カテゴリ: 保存後は shopCategoriesNeverSaved=false (AI自
     r.json.drafts.some((d) => d.id === gdraft2.id) && !r.json.drafts.some((d) => d.id === gdraft.id),
     JSON.stringify(r.json).slice(0, 200));
 
+  // ─── 人の確認待ち (generation-block) + 文字数ガード (2026-08-28 夜間自動化) ───
+  // 人用ルート (解除・手直し) も同じ app に載せる。session は偽装
+  const routerModGB = await import('../router.js');
+  app.use((req, res, next) => { req.session = { email: 'smoke@b-faith.biz', displayName: 'smoke', role: 'admin' }; next(); });
+  app.use('/ph', routerModGB.default);
+  const callPh = async (method, path, body) => {
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/ph` + path, {
+      method, headers: { 'Content-Type': 'application/json' },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  db.prepare(`INSERT INTO product_drafts (ne_code, name, created_by, amazon_url, status)
+    VALUES ('GEN-3', 'アイスの棒 50本', 'smoke', 'https://www.amazon.co.jp/dp/B0GEN3', 'ready_for_ai')`).run();
+  const gdraft3 = db.prepare(`SELECT * FROM product_drafts WHERE ne_code = 'GEN-3'`).get();
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runJ', limit: 10 });
+  check('block 準備: runJ が GEN-3 を claim', r.json.drafts.some((d) => d.id === gdraft3.id));
+  check('claim 応答に queue 内訳が付く', r.json.queue && typeof r.json.queue.claimable === 'number' && typeof r.json.queue.blocked === 'number', JSON.stringify(r.json.queue));
+
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { code: 'PACK_COUNT_MISMATCH', reason: 'x' });
+  check('block: run_id なしは 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runX', code: 'PACK_COUNT_MISMATCH', reason: 'x' });
+  check('block: claim を持たない run は 409 (他人の draft を止められない)', r.status === 409, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'NOT_A_CODE', reason: 'x' });
+  check('block: 未知の code は 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH' });
+  check('block: reason なしは 400', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: 'draft は 50本、Amazon ページは 100本入り' });
+  check('block: 有効な claim を持つ run は止められる', r.status === 200 && r.json.blocked === true && r.json.already === false, JSON.stringify(r.json));
+  let rowB = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('block: 4列が揃って書かれ claim は解放される (status は ready_for_ai のまま)',
+    rowB.generation_block_code === 'PACK_COUNT_MISMATCH' && rowB.generation_blocked_at && rowB.generation_blocked_by === 'ai:runJ'
+    && rowB.generation_claim_run_id == null && rowB.generation_claim_until == null && rowB.status === 'ready_for_ai');
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: 'draft は 50本、Amazon ページは 100本入り' });
+  check('block: 同じ run・code・reason の再送は 200 already (通信断リトライを 409 にしない)', r.status === 200 && r.json.already === true, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'PACK_COUNT_MISMATCH', reason: '理由が変わった' });
+  check('block: 同じ run でも reason が違えば 409 (冪等は同一操作の再送だけ — Codex R1 medium)', r.status === 409);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`,
+    { run_id: 'runJ', code: 'OTHER', reason: '別の理由' });
+  check('block: 別 code での上書きは 409 (人が解除するまで理由を固定)', r.status === 409);
+  r = await call('POST', `/drafts/${gdraft3.id}abc/generation-block`, { run_id: 'runJ', code: 'OTHER', reason: 'x' });
+  check('block: id に数字以外が混じると 400 (parseInt の緩さを許さない)', r.status === 400);
+  r = await call('POST', `/drafts/${gdraft3.id}/generation-block`, { run_id: 'runJ', code: 'OTHER', reason: 'か'.repeat(1001) });
+  check('block: reason 1001 字は切り詰めずに 400', r.status === 400, JSON.stringify(r.json));
+
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runK', limit: 10 });
+  check('block 後: claim 候補から外れる', !r.json.drafts.some((d) => d.id === gdraft3.id));
+  check('block 後: queue.blocked に数えられる', r.json.queue.blocked >= 1 && r.json.queue.blockedByCode.PACK_COUNT_MISMATCH >= 1, JSON.stringify(r.json.queue));
+  r = await call('GET', '/generation-queue');
+  check('block 後: GET 一覧からも消える (人待ちは AI に見せない)', !r.json.drafts.some((d) => d.id === gdraft3.id) && r.json.queue.blocked >= 1);
+
+  // 書き込みロックのレース: block 済みなのに有効な claim が残っていても文章は入らない (Codex Critical)
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runJ', generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  check('block 済み: acquireGenerationWriteLock は書き込み権を渡さない', dbmod.acquireGenerationWriteLock(db, gdraft3.id, 'runJ') === false);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runJ', outputs: SIX, advance: true });
+  check('block 済み: ai-outputs は 409 で 1 バイトも書かれない', r.status === 409
+    && db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c === 0, JSON.stringify(r.json));
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+
+  // 人の解除 (通常ルート) — 楽観ロック付き
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: '1999-01-01T00:00:00.000Z' });
+  check('解除: 画面が見ていた blocked_at と違えば 409', r.status === 409, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: false });
+  check('解除: clear:true 以外は 400 (人がこの画面から止めることはできない)', r.status === 400);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true });
+  check('解除: blocked_at 省略は 400 (楽観ロックを迂回させない — Codex R1 medium)', r.status === 400
+    && db.prepare('SELECT generation_block_code FROM product_drafts WHERE id = ?').get(gdraft3.id).generation_block_code === 'PACK_COUNT_MISMATCH');
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: rowB.generation_blocked_at });
+  check('解除: blocked_at 一致で解除できる', r.status === 200 && r.json.unblocked === true, JSON.stringify(r.json));
+  rowB = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('解除後: 4列すべて NULL に戻る', rowB.generation_block_code == null && rowB.generation_block_reason == null
+    && rowB.generation_blocked_at == null && rowB.generation_blocked_by == null);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/generation-block`, { clear: true, blocked_at: rowB.generation_blocked_at || '2000-01-01T00:00:00.000Z' });
+  check('解除: 二重解除は 400', r.status === 400);
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runL', limit: 10 });
+  check('解除後: 次の claim で拾える (解除 = キューに戻すだけ)', r.json.drafts.some((d) => d.id === gdraft3.id));
+  const evGB = db.prepare(`SELECT event FROM draft_events WHERE draft_id = ? AND event IN ('generation_blocked','generation_unblocked') ORDER BY id`).all(gdraft3.id).map((e) => e.event);
+  check('監査ログ: blocked → unblocked が残る', evGB.join(',') === 'generation_blocked,generation_unblocked', evGB.join(','));
+
+  // 文字数ガード (service-api)。数え方はコードポイント (copy_lint.py の len() と一致)
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { ...SIX, rakuten_title: 'あ'.repeat(128) }, advance: true });
+  check('文字数: 楽天タイトル 128 字は 400 (構造化エラー)', r.status === 400 && r.json.code === 'OUTPUT_TOO_LONG'
+    && r.json.kind === 'rakuten_title' && r.json.limit === 127 && r.json.actual === 128, JSON.stringify(r.json));
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { yahoo_title: 'い'.repeat(66) } });
+  check('文字数: Yahoo!タイトル 66 字は 400', r.status === 400 && r.json.kind === 'yahoo_title' && r.json.limit === 65);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { desc_catch: 'う'.repeat(31) } });
+  check('文字数: キャッチコピー 31 字は 400', r.status === 400 && r.json.kind === 'desc_catch' && r.json.limit === 30);
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runL', outputs: { rakuten_title: '😀'.repeat(127) } });
+  check('文字数: 絵文字 127 個 (UTF-16 では 254) はコードポイント数で 127 → 通る', r.status === 200 && r.json.written === 1, JSON.stringify(r.json));
+  // 書き込み成功で claim は解放される仕様 → 次の書き込みは claim し直す
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runM', limit: 10 });
+  check('文字数: 部分保存の後は claim が解放され、次の run が拾える', r.json.drafts.some((d) => d.id === gdraft3.id));
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runM', outputs: { desc_features: 'え'.repeat(3000) } });
+  check('文字数: 説明文3欄には上限を置かない', r.status === 200, JSON.stringify(r.json));
+  // 人の手直し (通常ルート) にも同じ上限
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/ai-outputs`, { kind: 'yahoo_title', content: 'お'.repeat(66) });
+  check('文字数 (人の手直し): 66 字は 400', r.status === 400 && r.json.code === 'OUTPUT_TOO_LONG');
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/ai-outputs`, { kind: 'yahoo_title', content: 'お'.repeat(65) });
+  check('文字数 (人の手直し): 65 字は通る', r.status === 200);
+
+  // ─── 確認中 (2026-08-31 スタッフ要望): 情報待ちの印。工程も status も動かさず、
+  //     カードにラベルが出て AI 生成キューからだけ外れる ───
+  db.prepare(`UPDATE product_drafts SET status = 'ready_for_ai', generation_claim_run_id = NULL,
+    generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { reason_code: 'package_label' });
+  check('確認中: on の指定なしは 400 (欠落を「解除」に倒さない)', r.status === 400, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: 'true', reason_code: 'package_label' });
+  check('確認中: on が文字列なら 400', r.status === 400);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'NOT_A_REASON' });
+  check('確認中: 未知の理由コードは 400 (画面が説明できない状態を作らない)', r.status === 400, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'package_label', note: '成分表示を実物で確認' });
+  check('確認中: 有効な理由なら立てられる', r.status === 200 && r.json.changed === true, JSON.stringify(r.json));
+  let rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  const checkingSince0 = rowC.checking_since;
+  check('確認中: 4列が揃って書かれ status は ready_for_ai のまま (工程導出を壊さない)',
+    rowC.checking_reason_code === 'package_label' && rowC.checking_note === '成分表示を実物で確認'
+    && rowC.checking_since && rowC.checking_by && rowC.status === 'ready_for_ai', JSON.stringify(rowC).slice(0, 200));
+
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runN', limit: 10 });
+  check('確認中: claim 候補から外れる (確認中に AI が原稿を書かない)', !r.json.drafts.some((d) => d.id === gdraft3.id));
+  // 「数え漏れ」でなく「claimable から checking へ 1 件移った」ことを見る (Codex R2 low:
+  // checking >= 1 だけだと claimable にも二重計上されている状態を見逃す)
+  {
+    const claimCols = `generation_claim_run_id = NULL, generation_claim_until = NULL`;
+    db.prepare(`UPDATE product_drafts SET checking_since = NULL, checking_reason_code = NULL,
+      checking_by = NULL, ${claimCols} WHERE id = ?`).run(gdraft3.id);
+    const qOff = dbmod.generationQueueSummary(db);
+    db.prepare(`UPDATE product_drafts SET checking_since = ?, checking_reason_code = 'package_label',
+      checking_by = 'smoke', ${claimCols} WHERE id = ?`).run(checkingSince0, gdraft3.id);
+    const qOn = dbmod.generationQueueSummary(db);
+    check('確認中: queue の内訳が claimable → checking へ 1 件移る (二重計上しない)',
+      qOn.checking === qOff.checking + 1 && qOn.claimable === qOff.claimable - 1 && qOn.blocked === qOff.blocked,
+      `off=${JSON.stringify(qOff)} on=${JSON.stringify(qOn)}`);
+  }
+  r = await call('GET', '/generation-queue');
+  check('確認中: GET 一覧からも消える', !r.json.drafts.some((d) => d.id === gdraft3.id));
+
+  // 生成中の run が居るまま確認中にしたら claim も解放する (Codex R1 medium)。
+  // 残すと、lease (30分) の内に人が解除した場合だけ古い run が結果を書き戻せる。
+  // (理由を変える = changed:true の更新でも claim が落ちること。checking_since は維持されること)
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runRace',
+    generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'share_info', note: '成分表示を実物で確認' });
+  const rowRace = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 立てると走っていた実行の claim も解放される (解除直後に古い結果が書かれない)',
+    rowRace.generation_claim_run_id == null && rowRace.generation_claim_until == null
+    && rowRace.checking_since === checkingSince0,
+    `${rowRace.generation_claim_run_id} / ${rowRace.generation_claim_until} / ${rowRace.checking_since}`);
+
+  // 書き込みロックのレース: claim 済みの生成が走っている最中に人が確認中にしたら結果は書かせない
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = 'runN', generation_claim_until = '2999-01-01T00:00:00Z' WHERE id = ?`).run(gdraft3.id);
+  check('確認中: acquireGenerationWriteLock は書き込み権を渡さない',
+    dbmod.acquireGenerationWriteLock(db, gdraft3.id, 'runN') === false);
+  const aiCountBefore = db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c;
+  r = await call('POST', `/drafts/${gdraft3.id}/ai-outputs`, { run_id: 'runN', outputs: SIX, advance: true });
+  check('確認中: ai-outputs は 409 で 1 バイトも書かれない', r.status === 409
+    && db.prepare('SELECT COUNT(*) AS c FROM draft_ai_outputs WHERE draft_id = ?').get(gdraft3.id).c === aiCountBefore,
+    JSON.stringify(r.json));
+  db.prepare(`UPDATE product_drafts SET generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id = ?`).run(gdraft3.id);
+
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'share_info', note: '成分表示を実物で確認' });
+  check('確認中: 同じ理由・同じ補足の再送は changed:false (ログを無駄に増やさない)',
+    r.status === 200 && r.json.changed === false, JSON.stringify(r.json));
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: true, reason_code: 'no_web_info', note: 'メーカーに問い合わせ中' });
+  rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 理由を変えても checking_since は進まない (何日待っているかを見失わない)',
+    r.status === 200 && rowC.checking_reason_code === 'no_web_info' && rowC.checking_since === checkingSince0,
+    `${rowC.checking_since} vs ${checkingSince0}`);
+
+  // ボード表示: ラベル・並び順・絞り込み
+  {
+    const bC = wfp.boardData(db, {});
+    const cardC = bC.columns.flatMap((c) => c.cards).concat(bC.doneCards).find((c) => c.id === gdraft3.id);
+    check('確認中: ボードのカードに理由ラベルと経過日数が乗る',
+      !!cardC?.checking && cardC.checking.label === 'ウェブに情報が無い' && typeof cardC.checking.days === 'number',
+      JSON.stringify(cardC?.checking));
+    check('確認中: checkingTotal に数えられる', bC.checkingTotal >= 1, String(bC.checkingTotal));
+    const colOfC = bC.columns.find((c) => c.cards.some((x) => x.id === gdraft3.id));
+    check('確認中: カードは列の先頭に並ぶ (他のカードに埋もれない)',
+      !colOfC || colOfC.cards[0].id === gdraft3.id,
+      colOfC ? colOfC.cards.map((x) => x.id).join(',') : '(完了列)');
+    const bOnly = wfp.boardData(db, { checkingOnly: true });
+    const idsOnly = bOnly.columns.flatMap((c) => c.cards).concat(bOnly.doneCards).map((c) => c.id);
+    check('確認中: filter=checking で確認中だけに絞れる',
+      idsOnly.includes(gdraft3.id) && idsOnly.length >= 1
+      && db.prepare(`SELECT COUNT(*) AS c FROM product_drafts WHERE id IN (${idsOnly.join(',') || 'NULL'}) AND checking_since IS NULL`).get().c === 0,
+      idsOnly.join(','));
+    // 絞り込み中でも総数を出す (0 と出ると確認中が無いように見えて入口が消える)
+    const bUn = wfp.boardData(db, { unassignedOnly: true });
+    check('確認中: 別の絞り込み中でも checkingTotal は総数のまま', bUn.checkingTotal >= 1, String(bUn.checkingTotal));
+  }
+
+  // 解除
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: false });
+  check('確認中: 解除できる', r.status === 200 && r.json.changed === true, JSON.stringify(r.json));
+  rowC = db.prepare('SELECT * FROM product_drafts WHERE id = ?').get(gdraft3.id);
+  check('確認中: 解除で 4列すべて NULL に戻る',
+    rowC.checking_reason_code == null && rowC.checking_note == null
+    && rowC.checking_since == null && rowC.checking_by == null);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/checking`, { on: false });
+  check('確認中: 二重解除は changed:false (エラーにしない — 押し直しで詰まらせない)',
+    r.status === 200 && r.json.changed === false, JSON.stringify(r.json));
+  r = await call('POST', '/generation-queue/claim', { run_id: 'runO', limit: 10 });
+  check('確認中: 解除後は次の claim で拾える (解除 = キューに戻すだけ)', r.json.drafts.some((d) => d.id === gdraft3.id));
+  const evCK = db.prepare(`SELECT event FROM draft_events WHERE draft_id = ?
+    AND event IN ('checking_on','checking_updated','checking_off') ORDER BY id`).all(gdraft3.id).map((e) => e.event);
+  check('確認中: 監査ログが on → updated (理由変更 2 回) → off で残る (誰が何を待たせたかを追える)',
+    evCK.join(',') === 'checking_on,checking_updated,checking_updated,checking_off', evCK.join(','));
+
+  // ─── メーカー型番は保存時にも属性から落とす (2026-08-31) ───
+  // 画面は行を出さないが、旧い画面を開いたままのタブや直叩きからも入らないようにする
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [
+      { name: 'ブランド名', value: 'テストブランド' },
+      { name: 'メーカー型番', value: 'toys3pen' },
+    ],
+    article_number: 'toys3pen',
+  });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    const attrs = JSON.parse(saved?.attributes_json || '[]');
+    check('メーカー型番: 保存時に属性から落とす (古い画面からの POST でも二重にならない)',
+      r.status === 200 && !attrs.some((a2) => a2.name === 'メーカー型番')
+      && attrs.some((a2) => a2.name === 'ブランド名') && saved.article_number === 'toys3pen',
+      JSON.stringify(saved));
+  }
+
+  // 🚨 値を黙って消さないこと (Codex R1 high)。画面は属性側の メーカー型番 を隠すので、
+  // 欄と違う値が残っていると人が気づかないまま保存で消える → サーバ側で 400 にする
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'toys3pen' WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["テストブランド"]},{"name":"メーカー型番","values":["別の型番XYZ"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [{ name: 'ブランド名', value: 'テストブランド' }],   // 画面は メーカー型番 を送らない
+    article_number: 'toys3pen',
+  });
+  {
+    const saved = db.prepare('SELECT attributes_json FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: DB に残った別の値は黙って消さず 400 で止める',
+      r.status === 400 && String(r.json.error || '').includes('別の型番XYZ')
+      && String(saved.attributes_json).includes('別の型番XYZ'),   // 保存されず DB もそのまま
+      `${r.status} ${JSON.stringify(r.json)}`);
+  }
+  // 複数残っている場合も「どれが正か」を人に決めさせる
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ? WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["AAA"]},{"name":"メーカー型番","values":["BBB"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, {
+    attributes: [{ name: 'ブランド名', value: 'テストブランド' }], article_number: 'AAA',
+  });
+  check('メーカー型番: 属性側に複数あるときは 400 (どれかが黙って消えない)',
+    r.status === 400 && String(r.json.error || '').includes('複数'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 🚨 競合を検出したあと、画面から**直せる**こと (Codex R2 high)。
+  // 止めるだけだと「OLD が DB に残っているので何を送っても 400」のデッドロックになる
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 競合中はフラグ無しの保存を止める (誤って消さない)', r.status === 400, `${r.status}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true });
+  check('メーカー型番: 解消に model_conflict_seen が無ければ 400 (楽観ロックを迂回させない)',
+    r.status === 400 && String(r.json.error || '').includes('model_conflict_seen'), `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 人が「欄の値を残す」と決めたら解消できる (デッドロックにしない)',
+      r.status === 200 && saved.article_number === 'NEW'
+      && !String(saved.attributes_json).includes('OLD'), `${r.status} ${JSON.stringify(saved)}`);
+  }
+  // 「型番なしにする」も選べる (空にできないと直せない商品が出る)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: '', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 「型番なしにする」も選べる (空にできる)',
+      r.status === 200 && !saved.article_number && !String(saved.attributes_json).includes('OLD'),
+      `${r.status} ${JSON.stringify(saved)}`);
+  }
+  // 旧形式 {name, value} で残っている値も拾う (Codex R2 medium: values 配列だけ見ると消える)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","value":"OLDFORM"}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 旧形式 {name,value} の値も競合として拾う',
+    r.status === 400 && String(r.json.error || '').includes('OLDFORM'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 壊れた JSON は上書きせず止める (中身が分からなくなる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ? WHERE draft_id = ?`).run('{壊れ', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [], article_number: 'NEW' });
+  check('メーカー型番: 既存の属性JSONが壊れていたら上書きせず止める',
+    r.status === 400 && String(r.json.error || '').includes('壊れています'), `${r.status} ${JSON.stringify(r.json)}`);
+  // 同じ値が 2 行に重複した旧データでも解消できる (Codex R6 medium: 片側だけ集合化すると永久 409)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = 'NEW' WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["DUP"]},{"name":"メーカー型番","values":["DUP"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['DUP'] });
+  check('メーカー型番: 同じ値が重複した旧データでも解消できる (件数差で 409 にしない)',
+    r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).article_number === 'NEW',
+    `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 部分更新 (attributes 省略) でも競合を新しく作らせない (Codex R5 medium)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["OLD"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { article_number: 'NEW' });
+  check('メーカー型番: attributes を省いた部分更新でも競合を止める',
+    r.status === 400 && String(r.json.error || '').includes('OLD'), `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 楽観ロック: 画面が見ていた旧値と DB が食い違うなら 409 (別タブで変わった値を捨てない)
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['見ていない値'] });
+  check('メーカー型番: 画面が見た旧値と DB が違えば 409 (見ていない値を捨てない)',
+    r.status === 409 && String(r.json.error || '').includes('別の画面'), `${r.status} ${JSON.stringify(r.json)}`);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`,
+    { attributes: [], article_number: 'NEW', resolve_model_conflict: true, model_conflict_seen: ['OLD'] });
+  check('メーカー型番: 見た旧値が一致すれば解消できる',
+    r.status === 200
+    && db.prepare('SELECT article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id).article_number === 'NEW',
+    `${r.status} ${JSON.stringify(r.json)}`);
+
+  // 部分更新でも メーカー型番 の行は残さない (次の保存でまた競合になる)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["B"]},{"name":"メーカー型番","values":["ONLY"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { genre_id: '565004' });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 部分更新でも属性側から落として欄へ寄せる',
+      r.status === 200 && saved.article_number === 'ONLY'
+      && !String(saved.attributes_json).includes('メーカー型番')
+      && String(saved.attributes_json).includes('ブランド名'), `${r.status} ${JSON.stringify(saved)}`);
+  }
+
+  // attributes を送ってこない POST で既存属性が全部消えないこと (Codex R3 medium)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"ブランド名","values":["残るはず"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { article_number: 'only-model' });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('属性: attributes を送らない POST で既存の属性が消えない',
+      r.status === 200 && String(saved.attributes_json).includes('残るはず') && saved.article_number === 'only-model',
+      `${r.status} ${JSON.stringify(saved)}`);
+  }
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = '[]', article_number = NULL WHERE draft_id = ?`).run(gdraft3.id);
+
+  // 欄が空で属性側にだけある旧データは、欄へ引き上げて保存できる (値を失わない)
+  db.prepare(`UPDATE draft_rakuten SET attributes_json = ?, article_number = NULL WHERE draft_id = ?`)
+    .run('[{"name":"メーカー型番","values":["legacy-123"]}]', gdraft3.id);
+  r = await callPh('POST', `/api/drafts/${gdraft3.id}/rakuten`, { attributes: [] });
+  {
+    const saved = db.prepare('SELECT attributes_json, article_number FROM draft_rakuten WHERE draft_id = ?').get(gdraft3.id);
+    check('メーカー型番: 欄が空の旧データは欄へ引き上げて保存される (値を失わない)',
+      r.status === 200 && saved.article_number === 'legacy-123'
+      && !String(saved.attributes_json).includes('メーカー型番'), JSON.stringify(saved));
+  }
+
   // 後始末
-  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL WHERE id IN (?, ?)`).run(gdraft.id, gdraft2.id);
+  db.prepare(`UPDATE product_drafts SET status = 'draft', generation_claim_run_id = NULL, generation_claim_until = NULL,
+    generation_block_code = NULL, generation_block_reason = NULL, generation_blocked_at = NULL, generation_blocked_by = NULL,
+    checking_reason_code = NULL, checking_note = NULL, checking_since = NULL, checking_by = NULL
+    WHERE id IN (?, ?, ?)`).run(gdraft.id, gdraft2.id, gdraft3.id);
   server.close();
 }
 
@@ -3727,9 +4624,21 @@ check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === nu
   check('3欄プレビュー: スマホ用 = 販売+PC の連結 (販売が空ならPCと同じ)', pv.sp === pv.pc);
   check('3欄プレビュー: 存在しないdraftはok:false', buildDescriptionPreview(db, 999999).ok === false);
   // composeDescriptions が buildItemPayload と同じ入力形で pc/sales/sp を返す (共通化の回帰)
+  // 説明行が空 (AI 文が 1 つも無い) のときだけ productName がフォールバックで使われる。
+  // ここに楽天タイトルを渡すと、外したはずの SEO 語がフォールバックで出てしまう
+  {
+    const fb = composeDescriptions({
+      productName: 'NE商品名<X>', ai: {}, specs: [], pageInfo: null, cabinetLocations: [],
+    });
+    check('composeDescriptions: AI 文が空なら「商品名」行に NE 商品名が出る (楽天タイトルではない)',
+      fb.pc.includes('<b>商品名</b>') && fb.pc.includes('NE商品名&lt;X&gt;')
+      && !fb.pc.includes('<b>説明</b>'), fb.pc.slice(0, 220));
+    check('composeDescriptions: フォールバックの商品名もエスケープされる',
+      !fb.pc.includes('NE商品名<X>'), fb.pc.slice(0, 220));
+  }
   const comp = composeDescriptions({
-    title: 'T', ai: { desc_features: 'F', desc_spec: 'S', desc_notes: 'N' },
-    specs: [], pageInfo: null, shippingLabel: null, cabinetLocations: ['/x/a.jpg'],
+    productName: 'NE名', ai: { desc_features: 'F', desc_spec: 'S', desc_notes: 'N' },
+    specs: [], pageInfo: null, cabinetLocations: ['/x/a.jpg'],
   });
   check('composeDescriptions: pc に特徴/仕様が入り sales に画像HTML・sp が連結',
     comp.pc.includes('F') && comp.pc.includes('S') && comp.sales.includes('/x/a.jpg')
@@ -3738,10 +4647,10 @@ check('extractAsin: どちらも無ければ null', dbmod.extractAsin({}) === nu
   // XSS境界 (Codexレビュー提案): 3欄は画面で innerHTML レンダリングされるため、
   // 素材にHTML/属性注入が混ざっても生成関数がすべてエスケープすることを固定する
   const evil = composeDescriptions({
-    title: '<script>alert(1)</script>',
+    productName: '<script>alert(1)</script>',
     ai: { desc_features: '<img src=x onerror=alert(2)>', desc_notes: '</td><script>alert(3)</script>' },
     specs: [{ spec_key: '<b>鍵</b>', spec_value: '"onmouseover="alert(4)' }],
-    pageInfo: null, shippingLabel: null,
+    pageInfo: null,
     cabinetLocations: ['/dir/"onerror="alert(5)/a.jpg'],
   });
   check('XSS境界: PC欄で素材の生タグが実行形で出ない (全てエスケープ)',
@@ -3980,19 +4889,65 @@ renders.push(
       },
       profitSim: null,
       skuPrices: { 'rooms-l-bk': 1480 },
+      // SKU別JAN (2026-08-28): 保存済み / 未入力 の両方を描かせる
+      skuJans: { 'rooms-l-bk': '4901234567894' },
+    }]);
+    // バリエーションあり (原価は全SKU共通) — SKU別JANの列だけが出る分岐
+    renders.push(['detail.ejs (バリエーション: SKU別JANのみ)', 'detail.ejs', {
+      ...d0[2],
+      draft: { ...d0[2].draft, ne_code: 'rooms', price: 1980, jan_code: '4901234567894' },
+      variation: variationFixtures.rep,
+      skuJans: { 'rooms-l-wh': '4912345678904' },
+    }]);
+    // 商品情報: ブランド名・容量が入っている分岐
+    renders.push(['detail.ejs (商品情報: ブランド名・容量あり)', 'detail.ejs', {
+      ...d0[2],
+      pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
+    }]);
+    // メーカー型番 (2026-08-31): 旧データで商品属性側に入っている状態。
+    // 上の「メーカー型番」欄へ引き上げて表示し、属性テーブルには行を出さない
+    renders.push(['detail.ejs (メーカー型番が属性側にある旧データ)', 'detail.ejs', {
+      ...d0[2],
+      rakuten: { ...d0[2].rakuten, article_number: null,
+        attributes_json: '[{"name":"ブランド名","values":["テストブランド"]},{"name":"メーカー型番","values":["toys3pen"]}]' },
+    }]);
+    // メーカー型番が 2 つあって競合している状態 (人がどれを残すか選ぶ画面)。
+    // 型番に script 終了タグを混ぜ、画面へ埋め込むときのエスケープが効いていることも同時に見る
+    renders.push(['detail.ejs (メーカー型番が競合)', 'detail.ejs', {
+      ...d0[2],
+      rakuten: { ...d0[2].rakuten, article_number: 'toys3pen',
+        attributes_json: JSON.stringify([{ name: 'ブランド名', values: ['テストブランド'] },
+          { name: 'メーカー型番', values: ['x' + '</scr' + 'ipt><img src=x onerror=alert(1)>'] }]) },
+    }]);
+    // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
+    // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
+    renders.push(['detail.ejs (確認中)', 'detail.ejs', {
+      ...d0[2],
+      draft: {
+        ...d0[2].draft,
+        checking_reason_code: 'package_label', checking_note: '裏面の成分表示を確認',
+        checking_since: '2026-08-25T00:00:00.000Z', checking_by: 'smoke@b-faith.biz',
+      },
+      checkingDays: 6,
     }]);
   }
 }
 // かんばん。カードあり / 自分の担当者が未紐付け / 空ボード の 3 分岐
+// 確認中 (2026-08-31) のラベルを実際に描かせるため、ボード用の fixture を作る間だけ 1 件立てる
+dbmod.setDraftChecking(db, wfDraftId, { reasonCode: 'package_label', note: '裏面の成分表示を確認', actor: 'smoke' });
 const boardBase = {
   title: '工程ボード', displayName: '中原 大輔',
   board: wfp.boardData(db, { mallSummary: ms.mallSummaryFor }), staff: wf.listStaff(),
-  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, imageKind: null,
+  me: null, assigneeId: null, assigneeParam: '', unassignedOnly: false, checkingOnly: false, imageKind: null,
   stepStateLabels: wfp.STEP_STATE_LABELS,
   boardView: 'main', imageKindLabels: wfp.IMAGE_KIND_LABELS,
 };
 renders.push(
   ['board.ejs', 'board.ejs', boardBase],
+  ['board.ejs (確認中で絞り込み)', 'board.ejs', {
+    ...boardBase, checkingOnly: true,
+    board: wfp.boardData(db, { checkingOnly: true, mallSummary: ms.mallSummaryFor }),
+  }],
   ['board.ejs (画像ビュー)', 'board.ejs', {
     ...boardBase, boardView: 'image',
     board: wfp.boardData(db, { view: 'image' }),
@@ -4004,19 +4959,30 @@ renders.push(
   ['board.ejs (自分のボール・担当者未紐付け)', 'board.ejs', { ...boardBase, assigneeParam: 'me' }],
   ['board.ejs (空)', 'board.ejs', {
     ...boardBase,
-    board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false },
+    board: { view: 'main', columns: [], doneCards: [], doneTotal: 0, total: 0, truncated: false, checkingTotal: 0 },
   }],
 );
+const renderedHtml = new Map();
 for (const [name, file, data] of renders) {
   try {
     // router が常に渡す共通 locals (画像スロットグリッド・棚の反映状態・自動追加バナー)
     const html = await ejs.renderFile(path.join(views, file),
       {
         thumbnailUrl, fileViewUrl, shopCatSyncState: null,
+        // 詳細画面の「← 戻る」の戻り先 (router の backLinkOf 相当。既定 = 一覧)
+        backLink: { url: '/apps/product-hub/list', label: '← 一覧に戻る' },
         rakutenItemUrl: 'https://item.rakuten.co.jp/b-faith/rk-smoke-1/',
         skuImages: [],
+        skuJans: {},
         imagePriorities: dbmod.IMAGE_PRIORITIES,
         materialStatuses: dbmod.MATERIAL_STATUSES,
+        // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
+        checkingReasons: dbmod.CHECKING_REASONS,
+        checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
+        checkingDays: null,
+        // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
+        modelAttrName: listing.MODEL_ATTR_NAME,
+        checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
         workflow: wfp.progressOf(wfDraftId, { db }),
@@ -4033,9 +4999,153 @@ for (const [name, file, data] of renders) {
         ...data,
       });
     check(`render ${name}`, html.length > 500);
+    renderedHtml.set(name, html);
   } catch (e) {
     check(`render ${name}`, false, e.message);
   }
+}
+
+// ─── 画面から消した UI が戻ってこないこと (2026-08-28 中原さん指摘) ───
+{
+  // 参考URL: 「追加」ボタンは無い (入力したら反映されるので押す必要が無い)
+  const anyDetail = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('参考URL: 「追加」ボタンを出さない (入力欄だけ)',
+    anyDetail.includes('id="new-ref-url"') && !anyDetail.includes('id="add-ref-btn"'));
+  // Notionカード: 「⏳ 未作成」「再作成」は出さない
+  const noCard = renderedHtml.get('detail.ejs (child SKU + regroup button)') || '';
+  check('Notionカード: 未作成のとき何も出さない (⏳未作成・再作成ボタンなし)',
+    noCard.length > 500 && !noCard.includes('未作成') && !noCard.includes('notion-retry-btn')
+    && !noCard.includes('Notionカード:'),
+    noCard.includes('Notionカード:') ? 'Notionカード: が残っている' : '未作成/再作成が残っている');
+  // カードが作成済みの商品でも、Notion への導線は出さない (2026-08-28 中原さん)
+  const hasCard = renderedHtml.get('detail.ejs (created notion / non-own-brand)') || '';
+  check('Notionカード: 作成済みでも「Notionで開く」リンクを出さない',
+    hasCard.length > 500 && !hasCard.includes('Notionで開く') && !hasCard.includes('notion.so')
+    && !hasCard.includes('Notionカード'),
+    hasCard.includes('Notionで開く') ? 'リンクが残っている' : 'Notionカード の文言が残っている');
+  // 一覧も同じ表示 (Notion列の ⏳ 未作成) をやめる。列を消したのでヘッダごと無い
+  const list = renderedHtml.get('index.ejs (banner+rows+import panel)') || '';
+  check('一覧: Notion列 (⏳ 未作成) を出さない',
+    list.length > 500 && !list.includes('>Notion</th>') && !list.includes('⏳ 未作成'),
+    list.includes('>Notion</th>') ? 'Notion列が残っている' : '⏳ 未作成 が残っている');
+  // 「未作成 n件」バナーと「まとめて再作成」も出さない (fixture は notionPending: 1 で描いている)
+  check('一覧: Notionカード未作成バナー・まとめて再作成を出さない',
+    !list.includes('retry-all-btn') && !list.includes('まとめて再作成')
+    && !list.includes('カード未作成') && !list.includes('notion-retry-all'));
+  check('一覧: ヘッダとデータ行の列数が合っている (列削除で崩れていない)', (() => {
+    const head = (list.match(/<thead>[\s\S]*?<\/thead>/) || [''])[0];
+    const body = (list.match(/<tbody>[\s\S]*?<\/tbody>/) || [''])[0];
+    const th = (head.match(/<th[\s>]/g) || []).length;
+    const firstRow = (body.match(/<tr[^>]*>[\s\S]*?<\/tr>/) || [''])[0];
+    const td = (firstRow.match(/<td[\s>]/g) || []).length;
+    return th > 0 && th === td;
+  })());
+}
+
+// ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
+{
+  const bh = renderedHtml.get('board.ejs') || '';
+  check('ボード: 確認中のカードに理由ラベルが出る',
+    bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
+    bh.includes('kb-checking') ? 'ラベル文言が出ていない' : 'バッジ自体が無い');
+  check('ボード: 補足は title 属性に入る (カードを狭くしない)',
+    bh.includes('title="裏面の成分表示を確認"'));
+  check('ボード: 「🔍 確認中」チップが件数付きで出る',
+    /🔍 確認中 \d+/.test(bh), bh.includes('🔍 確認中') ? '件数が付いていない' : 'チップが無い');
+  const bhOnly = renderedHtml.get('board.ejs (確認中で絞り込み)') || '';
+  check('ボード: 確認中で絞ると そのチップだけが on になる',
+    /<a class="chip on"\s+href="[^"]*filter=checking/.test(bhOnly)
+    && !/<a class="chip on" href="\/apps\/product-hub\/board">/.test(bhOnly),
+    bhOnly.match(/<a class="chip on"[\s\S]{0,80}/g)?.join(' | ') || 'on のチップが無い');
+  const dh = renderedHtml.get('detail.ejs (確認中)') || '';
+  check('詳細: 確認中の帯と解除ボタンが出る',
+    dh.includes('🔍 確認中') && dh.includes('パッケージ裏面の確認待ち') && dh.includes('id="checking-clear-btn"')
+    && dh.includes('裏面の成分表示を確認'), dh.includes('checking-clear-btn') ? '文言が出ていない' : 'ボタンが無い');
+  check('詳細: 確認中は何日目かを出す (待ちっぱなしを見つけるため)', dh.includes('6日目'));
+  const dh0 = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  // 2026-08-31 中原さん: 折りたたみ (details/summary) では気づけない → 理由ボタンを
+  // 最初から並べて 1 タップで立つ形にした。折りたたみに戻さないための検査
+  check('詳細: 確認中でないときは理由ボタンが**開いた状態で**並ぶ (折りたたみを使わない)',
+    dh0.includes('🔍 確認中にする') && dh0.includes('class="btn chk-pick"')
+    && !/<summary[^>]*>[^<]*確認中/.test(dh0) && !dh0.includes('id="checking-clear-btn"'),
+    /<summary[^>]*>[^<]*確認中/.test(dh0) ? '折りたたみに戻っている' : 'ボタンが無い');
+  check('詳細: 理由ボタンは全理由ぶん出て、押す理由がボタン自身に入っている (1タップで確定)', (() => {
+    const picks = [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]);
+    return picks.length === dbmod.CHECKING_REASONS.length
+      && dbmod.CHECKING_REASONS.every((r) => picks.includes(r.code));
+  })(), [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]).join(',') || '(1つも無い)');
+  // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
+  dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
+}
+
+// ─── 画面の直し 3 点 (2026-08-31 中原さんの実務フィードバック) ───
+{
+  const dh = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  // ④ 店舗内カテゴリ: 必須項目なので畳まない。ツリーは 5 枠より上に置く (記載を見逃さないため)
+  const accIdx = dh.indexOf('id="rk-cats-acc"');
+  const slotIdx = dh.indexOf('id="rk-cat-slots"');
+  check('カテゴリ: ツリーは既定で開いている (必須項目を畳まない)',
+    accIdx >= 0 && /<details id="rk-cats-acc" open/.test(dh),
+    accIdx >= 0 ? dh.slice(accIdx - 40, accIdx + 40) : '(ツリーが無い)');
+  check('カテゴリ: ツリーは 1〜5 の枠より上にある',
+    accIdx >= 0 && slotIdx >= 0 && accIdx < slotIdx, `acc=${accIdx} slots=${slotIdx}`);
+  // ⑤ 画像フォルダのリンクを開くボタン (入力が空なら隠れる = 初期表示は display:none)
+  check('画像フォルダ: リンクを開くボタンがある (空のときは隠れる)',
+    dh.includes('id="import-folder-open"') && dh.includes('📂 開く')
+    && /id="import-folder-open"[\s\S]{0,120}display:none/.test(dh),
+    dh.includes('import-folder-open') ? '初期状態が隠れていない' : 'ボタンが無い');
+}
+
+// ─── メーカー型番の入口は 1 つ / ジャンル属性の候補ボタン (2026-08-31 中原さん要望) ───
+{
+  const dl = renderedHtml.get('detail.ejs (メーカー型番が属性側にある旧データ)') || '';
+  const attrTable = (dl.match(/<table class="list" id="rk-attrs"[\s\S]*?<\/table>/) || [''])[0];
+  check('メーカー型番: 商品属性のテーブルに行を出さない (入口は上の欄だけ)',
+    attrTable.length > 0 && !attrTable.includes('メーカー型番') && attrTable.includes('テストブランド'),
+    attrTable.includes('メーカー型番') ? '属性テーブルに残っている' : '属性テーブルが取れない');
+  check('メーカー型番: 旧データの値は「メーカー型番」欄へ引き上げて表示する',
+    /id="rk-article" value="toys3pen"/.test(dl) && dl.includes('商品属性に入っていた値をここへ移しました'),
+    (dl.match(/id="rk-article" value="[^"]*"/) || ['(見つからない)'])[0]);
+  // 旧値を欄へ引き上げて表示している状態は、そのまま/書き換えて保存できる必要がある
+  // (Codex R4 high: フラグが false だと保存が 400 になるのに解消ボタンが出ていない)
+  // 埋め込む JSON のエスケープ (Codex R7 high: バックスラッシュ 1 つだと JS 上では '<' そのもので
+  // 置換が無意味になり、型番に script 終了タグを入れられると script ブロックを脱出できる)
+  {
+    // 競合の fixture は型番に script 終了タグを混ぜてある。埋め込み行がそれを生で持たないこと
+    const dc = renderedHtml.get('detail.ejs (メーカー型番が競合)') || '';
+    const seenLine = dc.split('\n').find((l) => l.includes('const modelSeenValues')) || '';
+    check('メーカー型番: 画面へ埋め込む値は < をエスケープする (script ブロックを脱出させない)',
+      seenLine.length > 0 && seenLine.includes('u003c')
+      && !seenLine.toLowerCase().includes('<' + '/script'),
+      seenLine.slice(0, 160) || '(埋め込み行が無い)');
+    check('メーカー型番: 競合しているときは「どれを残すか」のボタンを出す',
+      dc.includes('id="rk-model-conflict"') && dc.includes('rk-model-pick')
+      && dc.includes('型番なしにする'),
+      dc.includes('rk-model-conflict') ? '選択ボタンが無い' : '警告が出ていない');
+    check('メーカー型番: 競合中は解消フラグを立てない (人が選ぶまで捨てない)',
+      dc.includes('let modelConflictResolved = false;'),
+      (dc.split('\n').find((l) => l.includes('let modelConflictResolved')) || '(見つからない)').trim());
+  }
+  check('メーカー型番: 引き上げ表示のときは解消フラグが最初から立つ (書き換えて保存できる)',
+    /let modelConflictResolved = true;/.test(dl),
+    (dl.match(/let modelConflictResolved = \w+;/) || ['(見つからない)'])[0]);
+  const d0f = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('メーカー型番: 旧値が無い通常の商品では解消フラグは立てない (黙って捨てない)',
+    /let modelConflictResolved = false;/.test(d0f),
+    (d0f.match(/let modelConflictResolved = \w+;/) || ['(見つからない)'])[0]);
+  // 候補ボタン (②): 入れ物とジャンル辞書の受け渡しがあること
+  const d0h = renderedHtml.get('detail.ejs (full/own_brand)') || '';
+  check('属性候補: 候補ボタンの置き場所とジャンル辞書の受け渡しがある',
+    d0h.includes('id="rk-attr-suggest"') && d0h.includes('id="rk-attrdict-json"')
+    && d0h.includes('id="rk-model-attr-json"'));
+  check('属性候補: 辞書の全属性 (必須+任意) を渡している (必須だけに絞らない)', (() => {
+    const m = d0h.match(/id="rk-attrdict-json">(\[[\s\S]*?\])<\/script>/);
+    if (!m) return false;
+    let arr = [];
+    try { arr = JSON.parse(m[1]); } catch (e) { return false; }
+    // fixture のジャンル辞書は必須 1 件のみだが、mandatory フラグ付きで渡っていることを見る
+    return arr.length >= 1 && arr.every((x) => typeof x.name === 'string' && 'mandatory' in x);
+  })(), (d0h.match(/id="rk-attrdict-json">([\s\S]{0,120})/) || ['', '(無い)'])[1]);
 }
 
 // ─── EJS 内クライアントJSの構文チェック ───

@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MF照合 — 証憑リンク集</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; background: #f5f6f8; color: #1f2933; font-size: 14px; }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 16px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  header h1 { font-size: 20px; }
+  header a { color: #4b5563; text-decoration: none; font-size: 13px; }
+  header a:hover { text-decoration: underline; }
+  .spacer { flex: 1; }
+  .btn { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #f3f4f6; }
+  .btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.primary:hover { background: #1d4ed8; }
+  .btn.mini { padding: 3px 8px; font-size: 12px; }
+  .bar { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 10px 14px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: #16a34a; } .dot.ng { background: #dc2626; }
+  select, input[type=month], input[type=search] { padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+  input[type=search] { min-width: 200px; }
+  .filters { display: block; }
+  .filters .line { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .filters .line + .line { margin-top: 8px; padding-top: 8px; border-top: 1px solid #f0f1f3; }
+  .hint { color: #6b7280; font-size: 12px; }
+  .chip { display: inline-flex; align-items: center; gap: 4px; border: 1px solid #d1d5db; background: #fff; border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer; margin: 2px 2px 0 0; }
+  .chip:hover { background: #f3f4f6; }
+  .chip .n { color: #9ca3af; font-variant-numeric: tabular-nums; }
+  .chip.off { background: #f3f4f6; color: #9ca3af; border-style: dashed; text-decoration: line-through; }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  th { text-align: left; font-size: 12px; color: #6b7280; font-weight: 600; padding: 8px 10px; background: #f9fafb; border-bottom: 1px solid #e5e7eb; white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid #f0f1f3; vertical-align: top; font-size: 13px; }
+  tr:hover td { background: #f8fafc; }
+  .amount { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .names { color: #1f2933; max-width: 340px; }
+  .names .sub { display: block; color: #6b7280; font-size: 12px; margin-top: 2px; }
+  .vendor { max-width: 420px; }
+  .vendor a { display: inline-block; background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 6px; padding: 2px 8px; text-decoration: none; font-size: 12px; margin: 1px 2px 1px 0; }
+  .vendor a:hover { background: #dbeafe; }
+  .vendor .more { color: #6b7280; font-size: 12px; cursor: pointer; text-decoration: underline; }
+  .none { color: #9ca3af; }
+  .tag { display: inline-block; border-radius: 999px; padding: 2px 10px; font-size: 11px; white-space: nowrap; }
+  .tag.un { background: #fee2e2; color: #b91c1c; }
+  .tag.at { background: #f0fdf4; color: #15803d; }
+  .empty { padding: 30px; text-align: center; color: #9ca3af; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #111827; color: #fff; padding: 8px 18px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: .92; }
+  .attach-label { color: #1d4ed8; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .attach-label:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a href="./">← 証憑リンク集</a>
+    <h1>📎 MF照合（証憑未添付の仕訳）</h1>
+    <span class="spacer"></span>
+    <a href="mf/transactions">明細ビュー（MFと同じ並び）へ</a>
+  </header>
+
+  <div class="bar" id="statusBar">読み込み中…</div>
+
+  <div class="bar">
+    対象月: <input type="month" id="month">
+    <label><input type="checkbox" id="showAll"> 添付済みも表示</label>
+    <button class="btn primary" id="loadBtn">仕訳を取得</button>
+    <span id="loadInfo" style="color:#6b7280"></span>
+  </div>
+
+  <div class="bar filters" id="filterBar" style="display:none">
+    <div class="line">
+      <input type="search" id="q" placeholder="勘定科目・取引先・摘要で検索">
+      <label><input type="checkbox" id="onlyMatched"> 支払い先の候補がある仕訳だけ</label>
+      並び:
+      <select id="sort">
+        <option value="date">取引日順</option>
+        <option value="amount">金額が大きい順</option>
+      </select>
+      <span class="spacer"></span>
+      <span class="hint" id="filterInfo"></span>
+    </div>
+    <div class="line">
+      <span class="hint">勘定科目（クリックで除外／戻す）:</span>
+      <button class="btn mini" id="resetExcl">除外をリセット</button>
+    </div>
+    <div class="line" id="accountChips" style="gap:0"></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>取引日</th><th>No.</th><th class="amount">金額</th><th>勘定科目・取引先</th><th>マッチした支払い先（開いて証憑を取る）</th><th>証憑</th><th>添付</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty">上の「仕訳を取得」を押してください</div>
+</div>
+
+<input type="file" id="filePicker" accept=".pdf,.jpg,.jpeg,.png" style="display:none">
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let attachTarget = null; // ファイル選択中の仕訳ID
+let allRows = [];        // 取得した仕訳 (絞り込み前)
+const expanded = new Set(); // 支払い先候補を全部開いた行
+
+// 証憑を取りに行く必要がない仕訳 (売上計上・棚卸・繰越) の既定除外。
+// 中原さんが画面でチップを押して育てられるよう localStorage に持つ。
+const DEFAULT_EXCLUDED = ['売上高', '売掛金', '商品', '期首商品棚卸高', '期末商品棚卸高'];
+const PREF_KEY = 'shohyo-mf-filters';
+
+const prefs = loadPrefs();
+
+function loadPrefs() {
+  const base = { excluded: DEFAULT_EXCLUDED.slice(), onlyMatched: false, sort: 'date' };
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREF_KEY) || 'null');
+    if (saved && Array.isArray(saved.excluded)) return { ...base, ...saved };
+  } catch (e) { /* 壊れていたら既定で始める */ }
+  return base;
+}
+
+function savePrefs() {
+  try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch (e) { /* プライベートモード等 */ }
+}
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+const ATTACH_ERRORS = {
+  file_too_large_5mb: 'MFの上限は1件5MBです',
+  file_name_too_long: 'ファイル名が長すぎます（255文字まで）',
+  mf_api_400: 'MFに拒否されました（1仕訳の証憑は5件まで・重複や形式をご確認ください）',
+  mf_api_401: 'MFのトークンが失効しています。再接続してください',
+  mf_api_413: 'ファイルサイズがMFの上限を超えています',
+  mf_api_429: 'MFのリクエスト制限に当たりました。少し待って再試行してください',
+};
+
+async function api(path, opts) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  return body.result;
+}
+
+// 接続後にアプリ側の必要スコープが増えた場合 (403 の原因)。MFの認可画面をもう一度通すと解消する
+function scopeWarn(s, connectHref) {
+  if (!s.missing_scopes?.length) return '';
+  return ` <span style="color:#b45309">権限が足りません（${s.missing_scopes.map(x => x.replace('mfc/accounting/', '')).join(', ')}）</span> `
+    + `<button class="btn primary" onclick="location.href='${connectHref}'">再接続して許可する</button>`;
+}
+
+async function refreshStatus() {
+  const bar = $('statusBar');
+  try {
+    const s = await api('api/mf/status');
+    if (!s.configured) {
+      bar.innerHTML = '<span class="dot ng"></span> MF_CLIENT_ID / MF_CLIENT_SECRET が未設定です（Renderの環境変数に設定してください）';
+    } else if (!s.connected) {
+      bar.innerHTML = '<span class="dot ng"></span> MF未接続 <button class="btn primary" onclick="location.href=\'mf/connect\'">MFと接続する</button>'
+        + (s.reason === 'token_expired' ? ' <span style="color:#b45309">（トークン失効。再接続してください）</span>' : '');
+    } else {
+      const name = s.office?.office?.name || s.office?.name || '接続済み';
+      bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(name)}</b> <span class="spacer"></span>`
+        + scopeWarn(s, 'mf/connect') + '<button class="btn" id="disconnectBtn">接続解除</button>';
+      $('disconnectBtn').onclick = async () => {
+        if (!confirm('MFとの接続を解除しますか？')) return;
+        await api('api/mf/disconnect', { method: 'POST' });
+        refreshStatus();
+      };
+    }
+  } catch (e) {
+    bar.innerHTML = '<span class="dot ng"></span> 状態取得エラー: ' + esc(e.message);
+  }
+}
+
+function monthRange(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(y, m, 0).getDate();
+  return [`${ym}-01`, `${ym}-${String(last).padStart(2, '0')}`];
+}
+
+async function load() {
+  const ym = $('month').value;
+  if (!ym) return toast('対象月を選んでください');
+  const [start, end] = monthRange(ym);
+  $('loadInfo').textContent = '取得中…';
+  try {
+    const r = await api(`api/mf/unattached?start=${start}&end=${end}&all=${$('showAll').checked ? 1 : 0}`);
+    allRows = r.rows;
+    expanded.clear();
+    $('loadInfo').textContent = `仕訳 ${r.total}件中 対象 ${r.rows.length}件`;
+    $('filterBar').style.display = 'block';
+    renderChips();
+    render();
+  } catch (e) {
+    $('loadInfo').textContent = '';
+    if (e.message === 'mf_not_connected') toast('先にMFと接続してください');
+    else toast('取得エラー: ' + e.message);
+  }
+}
+
+/** 勘定科目ごとの件数 (多い順)。除外中のものも必ず出す */
+function accountCounts() {
+  const counts = new Map();
+  for (const row of allRows) {
+    for (const a of row.accounts || []) counts.set(a, (counts.get(a) || 0) + 1);
+  }
+  for (const a of prefs.excluded) if (!counts.has(a)) counts.set(a, 0);
+  return [...counts.entries()].sort((x, y) => y[1] - x[1]);
+}
+
+function renderChips() {
+  $('accountChips').innerHTML = accountCounts().map(([name, n]) => {
+    const off = prefs.excluded.includes(name);
+    return `<span class="chip${off ? ' off' : ''}" data-acc="${esc(name)}" title="${off ? 'クリックで表示に戻す' : 'クリックでこの勘定科目の仕訳を隠す'}">${esc(name)} <span class="n">${n}</span></span>`;
+  }).join('');
+}
+
+function visibleRows() {
+  const q = $('q').value.trim().toLowerCase();
+  const rows = allRows.filter(row => {
+    if ((row.accounts || []).some(a => prefs.excluded.includes(a))) return false;
+    if (prefs.onlyMatched && !row.vendors.length) return false;
+    if (q) {
+      const hay = [...(row.accounts || []), ...(row.partners || []), ...(row.remarks || []), row.memo,
+        ...row.vendors.map(v => v.name)].join(' ').toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+  if (prefs.sort === 'amount') rows.sort((a, b) => (b.amount || 0) - (a.amount || 0));
+  return rows;
+}
+
+function render() {
+  const rows = visibleRows();
+  const hidden = allRows.length - rows.length;
+  $('filterInfo').textContent = `${rows.length}件を表示` + (hidden > 0 ? `（${hidden}件を絞り込みで非表示）` : '');
+  $('empty').style.display = rows.length ? 'none' : 'block';
+  $('empty').textContent = allRows.length
+    ? '条件に合う仕訳がありません（除外をリセットすると戻ります）'
+    : '証憑未添付の仕訳はありません 🎉';
+
+  $('rows').innerHTML = rows.map(row => {
+    const partners = (row.partners || []).join(' / ');
+    const sub = [partners, ...(row.remarks || []), row.memo].filter(Boolean).join(' / ');
+    return `<tr>
+    <td>${esc(row.date)}</td>
+    <td>${esc(row.number)}</td>
+    <td class="amount">${row.amount ? Number(row.amount).toLocaleString() : ''}</td>
+    <td class="names">${esc((row.accounts || []).join(' / '))}${sub ? `<span class="sub">${esc(sub)}</span>` : ''}</td>
+    <td class="vendor">${vendorCell(row)}</td>
+    <td>${row.vouchers ? `<span class="tag at">添付${row.vouchers}件</span>` : '<span class="tag un">未添付</span>'}</td>
+    <td><span class="attach-label" data-attach="${esc(row.id)}">📎 ファイルを添付</span></td>
+  </tr>`;
+  }).join('');
+}
+
+/** 支払い先候補。多いときは3件まで見せて残りは「他n件」で開く */
+function vendorCell(row) {
+  if (!row.vendors.length) return '<span class="none">マスタに一致なし</span>';
+  const open = expanded.has(row.id);
+  const shown = open ? row.vendors : row.vendors.slice(0, 3);
+  const chips = shown.map(v => v.url
+    ? `<a href="${esc(v.url)}" target="_blank" rel="noopener" title="${esc(v.name)}${v.storage_path ? '\n保存先: ' + esc(v.storage_path) : ''}">${esc(shorten(v.name))} ↗</a>`
+    : `<span class="none">${esc(shorten(v.name))}</span>`).join('');
+  const rest = row.vendors.length - shown.length;
+  return chips + (rest > 0 ? ` <span class="more" data-more="${esc(row.id)}">他${rest}件</span>` : '');
+}
+
+function shorten(name) {
+  return name.length > 18 ? name.slice(0, 18) + '…' : name;
+}
+
+document.addEventListener('click', (ev) => {
+  const attach = ev.target.closest('[data-attach]');
+  if (attach) {
+    attachTarget = attach.dataset.attach;
+    $('filePicker').value = '';
+    $('filePicker').click();
+    return;
+  }
+  const more = ev.target.closest('[data-more]');
+  if (more) { expanded.add(more.dataset.more); return render(); }
+  const chip = ev.target.closest('[data-acc]');
+  if (chip) {
+    const name = chip.dataset.acc;
+    prefs.excluded = prefs.excluded.includes(name)
+      ? prefs.excluded.filter(a => a !== name)
+      : [...prefs.excluded, name];
+    savePrefs();
+    renderChips();
+    render();
+  }
+});
+
+$('filePicker').addEventListener('change', async () => {
+  const file = $('filePicker').files[0];
+  if (!file || !attachTarget) return;
+  // MF証憑APIの制限: 1件5MB・名称255文字・1仕訳あたり5件まで
+  if (file.size > 5 * 1024 * 1024) return toast('MFの上限は1件5MBです（超える場合は分割するかBox画面から）');
+  if (file.name.length > 255) return toast('ファイル名が長すぎます（255文字まで）');
+  toast('アップロード中…');
+  const b64 = await new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1]);
+    fr.onerror = reject;
+    fr.readAsDataURL(file);
+  });
+  try {
+    await api('api/mf/attach', {
+      method: 'POST',
+      body: JSON.stringify({ journal_id: attachTarget, file_name: file.name, file_data: b64 }),
+    });
+    toast('添付しました');
+    load();
+  } catch (e) {
+    toast('添付エラー: ' + (ATTACH_ERRORS[e.message] || e.message));
+  }
+});
+
+$('loadBtn').addEventListener('click', load);
+$('q').addEventListener('input', render);
+$('onlyMatched').addEventListener('change', () => { prefs.onlyMatched = $('onlyMatched').checked; savePrefs(); render(); });
+$('sort').addEventListener('change', () => { prefs.sort = $('sort').value; savePrefs(); render(); });
+$('resetExcl').addEventListener('click', () => {
+  prefs.excluded = [];
+  savePrefs();
+  renderChips();
+  render();
+});
+
+(function init() {
+  const now = new Date();
+  $('month').value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  $('onlyMatched').checked = prefs.onlyMatched;
+  $('sort').value = prefs.sort;
+  const q = new URLSearchParams(location.search);
+  if (q.get('connected')) toast('MFと接続しました');
+  if (q.get('error')) toast('接続エラー: ' + q.get('error'));
+  refreshStatus();
+})();
+</script>
+</body>
+</html>

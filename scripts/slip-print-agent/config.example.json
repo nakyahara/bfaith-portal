@@ -1,0 +1,9 @@
+{
+  "_comment": "config.json にコピーして token を埋めてください。config.json は git に入れません",
+  "baseUrl": "https://picking.bfaith-wh.uk/apps/packing",
+  "token": "PASTE_DEVICE_TOKEN_HERE",
+  "pollSec": 4,
+  "heartbeatSec": 45,
+  "sumatraPath": "C:\\tools\\slip-print-agent\\SumatraPDF.exe",
+  "workDir": "C:\\tools\\slip-print-agent\\work"
+}

@@ -15,6 +15,7 @@
  */
 
 import { chromium } from 'playwright';
+import { assertNotSystemAccount, isSystemAccount } from './lib-browser-profile-guard.mjs';
 import { config as loadEnv } from 'dotenv';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +38,8 @@ loadEnv({ path: join(__dirname, '.env') });
   }
 }
 
+export { isSystemAccount }; // 後方互換 (テストが lib-yahoo-login から読む)
+
 export const PROFILE_DIR = join(__dirname, '.profile-yahoo');
 export const STORE_ACCOUNT = (process.env.YAHOO_STORE_ACCOUNT || 'b-faith01').trim();
 export const STORE_TOP_URL = `https://pro.store.yahoo.co.jp/pro.${STORE_ACCOUNT}`;
@@ -45,7 +48,17 @@ export function safeHost(url) {
   try { return new URL(url).hostname; } catch { return ''; }
 }
 
+/**
+ * 永続プロファイルを開く。
+ *
+ * 🚨**SYSTEM では絶対に開かせない** (2026-08-28 の事故)。Chromium の Cookie は DPAPI で
+ * Windows ユーザーに紐づけて暗号化されるため、SYSTEM から開くと復号できず「ログアウト状態」と
+ * 判断されて Cookie が破棄される = **Yahoo ストアのセッションが壊れ、現地での 2FA 再ログインが要る**。
+ * 読み取りのつもりでも開いた時点で壊れるので、起動前に止める。
+ * ガードをここ (ライブラリ) に置いてあるのは、タスクからでも手動実行でも必ず通る唯一の場所だから。
+ */
 export async function openYahooContext() {
+  assertNotSystemAccount('Yahoo');
   return chromium.launchPersistentContext(PROFILE_DIR, {
     headless: process.env.HEADLESS === '1',
     slowMo: process.env.HEADLESS === '1' ? 0 : 150,

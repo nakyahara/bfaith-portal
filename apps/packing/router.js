@@ -16,12 +16,13 @@
 import { Router } from 'express';
 import path from 'path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
 import {
   initPackingDB, getDB, jstToday, listPackBatches, getPackBatch, listPackSlips,
   listPackLinesBySlip, STATUS_LABELS, MATCH_LABELS,
-  createDevice, verifyDevice, revokeDevice, listDevices,
+  createDevice, verifyDevice, revokeDevice, listDevices, setAgentPrinters, agentPrintersOf,
 } from './db.js';
 import { getPollerStatus, markLedgerImported } from './drive-sync.js';
 import {
@@ -31,8 +32,17 @@ import {
   resolveIncident, lineKindOf, batchHikiateClass, listLineRuns, lineDailyTotal, listRepickReady,
 } from './service.js';
 import { notifyShipChange, notifyTask, notifyReprint, postReprintText } from './notify.js';
-import { extractReprintPdf, cleanupReprintPdfs, REPRINTS_DIR, LabelUnusableError } from './reprint-pdf.js';
+import {
+  extractReprintPdf, cleanupReprintPdfs, detectOkurijoSlug, REPRINTS_DIR, LabelUnusableError,
+} from './reprint-pdf.js';
 import { enqueuePackBatchNotionSync } from './notion.js';
+import { getPackingStats, getTodayPackingProgress, PACK_STATS_WINDOW_DAYS, PACK_STATS_MIN_DATE } from './stats.js';
+import {
+  enqueuePrintJob, leaseNextJob, findLeasedJob, claimPdfForPrint, failBeforeDispatch,
+  markSubmitted, markFinished, recordHeartbeat, listPrintJobs, markAlerted, alertTextFor,
+  getJobStatusFor, listPrintRoutes, setPrintRoute, SLUG_LABELS,
+  LEASE_SEC, PRINT_STATE_LABELS,
+} from './print-queue.js';
 import { listNouhinCsvFiles, downloadNouhinCsv, driveCall } from './drive.js';
 // 商品画像は picking の楽天白抜きキャッシュ (pk_product_images) を共通部品として流用 (要件§7.1)
 import { getImageMap, queueEnsureImages } from '../picking/images.js';
@@ -87,6 +97,12 @@ function packingAccess(req, res, next) {
   // 🖨 抜き出した送り状PDFの配信 (事務がチャットのリンクから開く)。認証はセッションでなく
   // 128bit推測不能トークン (capability URL)。ファイルは7日で自動削除
   if (/^\/reprints\/[A-Za-z0-9_-]{16,}\.pdf$/.test(req.path)) return next();
+  // 🖨 印刷エージェント (出荷PC) は Cookie ではなく Authorization ヘッダーで名乗る。
+  // /print/ 配下はここでは素通しし、router.use('/print', requirePrintAgent) が
+  // kind='agent' の端末だけを通す (iPad の端末Cookieでは絶対に印刷ジョブを取れない)。
+  // ⭐ルートを列挙しないのは、後から /print/... を足したときに
+  //   「正規のエージェントが packingAccess に弾かれる」ズレを作らないため
+  if (req.path === '/print' || req.path.startsWith('/print/')) return next();
   if (req.session?.email) {
     const allowed = req.session.allowedApps;
     if (allowed === '*' || (Array.isArray(allowed) && allowed.includes('packing'))) return next();
@@ -153,6 +169,132 @@ router.get('/reprints/:token([A-Za-z0-9_-]{16,}).pdf', (req, res) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   fs.createReadStream(file).pipe(res);
 });
+
+/**
+ * バッチ一覧の署名 (画面の自動追従用)。
+ * 納品書CSVの取込は随時来るので、一覧を開きっぱなしでも増減・状態変化に追従させる。
+ * ⭐毎回フルリロードせず「署名が変わった時だけ」再読込する — 進捗の数字が動くたびに
+ *   画面が白く飛ぶと、iPadで作業しながら見ている人には使えない (picking と同方式)
+ */
+router.get('/api/batches-signature', api(async (req, res) => {
+  const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
+  const sig = listPackBatches(workDate).map((b) => `${b.id}:${b.status}`).join(',');
+  res.json({ ok: true, sig });
+}));
+
+// ─── 🖨 印刷キュー (出荷PCの印刷エージェントが pull で取りに来る・要件§6) ───
+/**
+ * エージェント認証。**Authorization ヘッダーのみ**で、iPad の端末Cookieは受け付けない
+ * (共用iPadのCookieで送り状を勝手に刷れる状態を作らない)。
+ */
+function requirePrintAgent(req, res, next) {
+  const m = /^Bearer\s+(\S+)$/.exec(req.headers.authorization || '');
+  const device = m ? verifyDevice(m[1]) : null;
+  if (!device || device.kind !== 'agent') {
+    return res.status(401).json({ error: '印刷エージェントとして認証されていません' });
+  }
+  req.printAgent = device;
+  next();
+}
+
+// /print/ 配下は**この1行で**エージェント認証を必須にする。個々のルートに付け忘れても
+// ここで止まる (認証の付け忘れが一番怖いので、境界をprefixで一元化する)
+router.use('/print', requirePrintAgent);
+
+/** 次に刷るものを1件 lease して返す。無ければ 204 (エージェントは数秒後にまた聞きに来る)。 */
+router.get('/print/next', requirePrintAgent, api(async (req, res) => {
+  // このPCから出せるプリンターが1つも登録されていない端末には**lease する前に**断る。
+  // 掴んでから断ると試行回数だけ減って正常なジョブが failed に落ちる
+  if (agentPrintersOf(req.printAgent.id).length === 0) {
+    return res.status(409).json({ error: 'この端末に出力先プリンターが登録されていません' });
+  }
+  const job = leaseNextJob(req.printAgent);
+  if (!job) return res.status(204).end();
+  res.json({ ok: true, job });
+}));
+
+/**
+ * 印刷対象のPDF本体。
+ * 🚨 **渡した時点で紙が出た可能性がある**ので、ここで dispatched に進めて自動再配布を止める
+ *    (エージェントが投入報告の前に落ちても、別の端末には二度と配らない)。
+ */
+router.get('/print/:id(\\d+)/pdf', requirePrintAgent, (req, res) => {
+  const jobId = Number(req.params.id);
+  const lease = { deviceId: req.printAgent.id, leaseToken: req.query.lease ? String(req.query.lease) : null };
+  // ① まずは読むだけ。PDFの実体を確かめる前に dispatched にすると、1バイトも渡していないのに
+  //    「印刷したかもしれない」扱いになり、確実な欠落が「結果不明」に化ける
+  const job = findLeasedJob(jobId, lease);
+  if (!job) return res.status(404).json({ error: 'このジョブを保持していません (lease を確認してください)' });
+
+  // ② PDFの実体を検証。渡せないと分かったらはっきり失敗にして人に知らせる
+  const file = path.join(REPRINTS_DIR, `${job.pdf_token}.pdf`);
+  const fail = (status, msg) => {
+    failBeforeDispatch(jobId, { ...lease, error: msg });
+    return res.status(status).json({ error: msg });
+  };
+  if (!file.startsWith(REPRINTS_DIR) || !fs.existsSync(file)) {
+    return fail(410, '印刷対象のPDFがありません (7日で削除されます)');
+  }
+  let bytes;
+  try { bytes = fs.readFileSync(file); } catch (e) { return fail(500, `PDFを読めません: ${e.message}`); }
+  if (crypto.createHash('sha256').update(bytes).digest('hex') !== job.pdf_sha256) {
+    return fail(409, '印刷対象のPDFが登録時と異なります');
+  }
+
+  // ③ 渡せると確定してから dispatched (= ここから自動再配布しない)
+  if (!claimPdfForPrint(jobId, lease)) {
+    return res.status(409).json({ error: 'ジョブの状態が変わりました (取り直してください)' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(bytes);
+});
+
+/** エージェントが再起動したときに、掴んでいたジョブがどうなったか確かめるための照会。 */
+router.get('/print/:id(\\d+)/status', requirePrintAgent, api(async (req, res) => {
+  const row = getJobStatusFor(Number(req.params.id), req.printAgent.id);
+  if (!row) throw new PackError(404, 'not_found', 'このジョブを保持していません');
+  res.json({ ok: true, job: row });
+}));
+
+router.post('/print/:id(\\d+)/submitted', requirePrintAgent, api(async (req, res) => {
+  const r = markSubmitted(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    spoolJobId: req.body.spool_job_id ?? null,
+  });
+  if (!r.ok) throw new PackError(409, 'not_leased', `報告を受け付けられません (${r.reason})`);
+  // replayed = 応答が届かなかった前回と同じ報告。エージェントが「もう投入済み」と分かる
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/:id(\\d+)/completed', requirePrintAgent, api(async (req, res) => {
+  // 「刷れた/刷れなかった」は真偽値でしか受け取らない。未指定・文字列 "false"・null を
+  // 成功扱いすると、エージェントの不具合が「印刷成功」として記録されてしまう
+  if (typeof req.body.ok !== 'boolean') {
+    throw new PackError(400, 'bad_ok', 'ok は true / false で送ってください');
+  }
+  const r = markFinished(Number(req.params.id), {
+    deviceId: req.printAgent.id, leaseToken: String(req.body.lease || ''),
+    ok: req.body.ok, error: req.body.error ?? null,
+    // uncertain = 「刷れなかった」と言い切れない (スプーラーに渡した後に落ちた等)。
+    // failed にすると通知が「手動で印刷してください」になり、実は出ていた紙と合わせて二重になる
+    uncertain: req.body.uncertain === true,
+  });
+  if (!r.ok) throw new PackError(409, 'not_leased', `報告を受け付けられません (${r.reason})`);
+  // 印刷の成否は現場に見える形で伝える (出なかったことに誰も気づかない状態を作らない)。
+  // 送信できたときだけ「通知済み」にする — 失敗した分はポーラーが次の周回で送り直す
+  const job = getDB().prepare('SELECT * FROM pk_print_jobs WHERE id=?').get(Number(req.params.id));
+  postReprintText(alertTextFor(job))
+    .then((sent) => { if (sent) markAlerted(job.id, job.state); })
+    .catch(() => { /* ポーラーが再送する */ });
+  res.json({ ok: true, replayed: !!r.replayed });
+}));
+
+router.post('/print/heartbeat', requirePrintAgent, api(async (req, res) => {
+  recordHeartbeat(req.printAgent.id, req.body.note ?? null);
+  res.json({ ok: true, lease_sec: LEASE_SEC });
+}));
 
 // ─── 現場間アラート (「ピッキング済みの商品を下して」→ ピッキングヘッダーへ) ───
 // テーブルは picking 所有 — picking service の関数経由で読み書き (要件§7.1)
@@ -326,7 +468,33 @@ router.get('/line/:id(\\d+)', (req, res) => {
   const hikiateClass = batchHikiateClass(getDB(), batch);
   const kind = lineKindOf(hikiateClass);
   if (!kind) return res.redirect(`/apps/packing/work/${batch.id}`);   // 手梱包は従来画面へ
+  // 伝票ごとの依頼 (再ピック/配送変更/再印刷) 用に伝票と候補・再ピック状態を渡す (2026-08-31)。
+  // 表示に要る列だけに絞る (宛名は事務の突合用に名前まで — 作業画面と同じ範囲)
+  let slips = [];
+  let incidents = [];
+  let repickBySlip = {};
+  let tasks = [];
+  try {
+    const st = getWorkState(batch.id);
+    slips = st.slips.map((x) => ({
+      seq: x.seq, neSlipNo: x.ne_slip_no, slipNo: x.slip_no, siteOrderNo: x.site_order_no || null,
+      recipientName: x.recipient_name || null, deliveryMethod: x.delivery_method || null,
+      status: x.status, holdReason: x.hold_reason || null,
+      lines: x.lines.map((l) => ({ sku: l.sku, name: l.print_name || l.product_name || l.sku, qty: l.qty })),
+    }));
+    incidents = st.incidents.map((i) => ({ id: i.id, slipSeq: i.slip_seq, kind: i.kind, sku: i.sku, qty: i.qty }));
+    repickBySlip = st.repickBySlip || {};
+    // 未完了の再ピックタスク (SKU 単位の状態表示・SKU 単位の「見つかった」用)
+    tasks = getDB().prepare(`SELECT id, slip_seq AS slipSeq, sku, req_qty AS qty, status FROM pk_pack_tasks
+      WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id`).all(batch.id);
+  } catch (e) { console.warn(`[packing] ライン画面の伝票取得失敗 (batch=${batch.id}): ${e.message}`); }
   res.render(path.join(__dirname, 'views/line'), {
+    slips,
+    incidents,
+    repickBySlip,
+    tasks,
+    methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+    shipChangeReasons: SHIP_CHANGE_REASONS,
     pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 一時中断の理由 (自動中断専用は出さない)
     title: `ライン | ${batch.folder_name || batch.tb_key}`,
     displayName: req.session?.displayName,
@@ -380,6 +548,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
     manualCount: req.body.manual_count == null || req.body.manual_count === '' ? null : Number(req.body.manual_count),
     excludedCount: req.body.excluded_count == null || req.body.excluded_count === '' ? null : Number(req.body.excluded_count),
+    toPasCount: req.body.to_pas_count == null || req.body.to_pas_count === '' ? null : Number(req.body.to_pas_count),
     note: req.body.note == null ? null : String(req.body.note).slice(0, 200),
   }, worker);
   // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため
@@ -434,7 +603,20 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
           const url = `https://picking.bfaith-wh.uk/apps/packing/reprints/${r.token}.pdf`;
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_token=?, pdf_by=?, pdf_printable=?, pdf_ink_ratio=? WHERE id=?')
             .run(r.token, r.by, r.printable ? 1 : 0, r.inkRatio ?? null, row.id);
-          await postReprintText(`📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
+          // 🖨 自動印刷に載せてよいのは manifest 経路+白紙検査を通ったものだけ。
+          // その条件は enqueuePrintJob の SQL が上の UPDATE 済みの行を直接見て判定する
+          // (呼び出し側の if に任せると、入口が増えたとき位置推定のPDFが積まれる)。
+          // 位置推定で見つけた分は今までどおり**リンクだけ**渡して人が見て印刷する
+          // 出力先は**引当分類 (送り状発行ソフト) ごと**に決まる (ヤマトB2 / DENZOU /
+          // ゆうプリR / 汎用送り状 で物理プリンターが違う)。フォルダの okurijo_<slug>_*.csv から読む
+          const slug = await detectOkurijoSlug(row.folder_name);
+          const queued = enqueuePrintJob(row.id, { pdfSha256: r.sha256, slug });
+          if (queued && !queued.id) {
+            console.warn(`[packing-reprint] ${row.ne_slip_no}: 自動印刷しません (${queued.reason} slug=${queued.slug ?? '-'})`);
+          }
+          await postReprintText(queued?.id
+            ? `🖨 ${row.ne_slip_no} の送り状を印刷します (${queued.printer})。念のためのリンク: ${url}`
+            : `📄 ${row.ne_slip_no} の送り状PDF (該当ページのみ・${r.file}): ${url}`);
         } catch (e) {
           getDB().prepare('UPDATE pk_pack_reprints SET pdf_error=? WHERE id=?')
             .run(String(e.message).slice(0, 120), row.id);
@@ -461,8 +643,12 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
         WHERE s.batch_id=? AND s.seq=? ORDER BY l.id
       `).all(Number(req.params.id), Number(req.body.slip_seq));
       try {
+        // 出荷伝票NO (SP…) = ヤマトB2の お客様管理番号。元の送り状を消すのに要る
+        const slipNo = getDB().prepare(
+          'SELECT slip_no FROM pk_pack_slips WHERE batch_id=? AND seq=?'
+        ).get(row.batch_id, row.slip_seq)?.slip_no ?? null;
         const sent = await notifyShipChange({
-          folderName: row.folder_name, neSlipNo: row.ne_slip_no,
+          folderName: row.folder_name, neSlipNo: row.ne_slip_no, slipNo,
           currentMethod: row.current_method, proposedMethod: row.proposed_method,
           reason: row.reason, worker, lines,
         });
@@ -731,6 +917,50 @@ router.get('/api/batches/:id(\\d+)/images', api(async (req, res) => {
 }));
 
 // ─── 日次サマリ (管理者) ───
+// ─── 実績ボード (2026-08-31 中原さん指示: 梱包にも「実績」— 梱包スピードをダッシュボードで) ───
+// picking の /board と同じ設計。端末Cookie (iPad) でもセッションでも見られる (packingAccess)。
+function parseDays(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return PACK_STATS_WINDOW_DAYS;
+  return Math.min(365, Math.max(1, Math.round(n)));
+}
+router.get('/board', (req, res) => {
+  res.render(path.join(__dirname, 'views/board'), {
+    title: '梱包実績ボード',
+    windowDays: PACK_STATS_WINDOW_DAYS,
+  });
+});
+router.get('/api/board', api(async (req, res) => {
+  const stats = getPackingStats({ days: parseDays(req.query.days) });
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    ok: true,
+    now: new Date().toISOString(),
+    today: getTodayPackingProgress(),
+    stats: {
+      since: stats.since, until: stats.until, days: stats.days,
+      minDate: PACK_STATS_MIN_DATE,
+      minSlips: stats.minSlips,
+      minClassSlips: stats.minClassSlips,
+      outlierSec: stats.outlierSec,
+      total: stats.total,
+      // 掲示は伝票数上位の分類のみ (ヒートマップの行数 = 画面に収まる範囲)
+      baseline: stats.baseline.slice(0, 12).map((c) => ({
+        key: c.key, slips: c.slips, avgSec: c.avgSec, workerCount: c.workerCount,
+        workers: c.workers.map((w) => ({
+          worker: w.worker, name: w.name, slips: w.slips, secPerSlip: w.secPerSlip,
+          index: w.index, provisional: w.provisional,
+        })),
+      })),
+      workers: stats.workers.map((w) => ({
+        worker: w.worker, name: w.name, slips: w.slips, secPerSlip: w.secPerSlip,
+        index: w.index, provisional: w.provisional, batches: w.batches, days: w.days, excluded: w.excluded,
+      })),
+      byDate: stats.byDate,
+    },
+  });
+}));
+
 router.get('/admin/summary', requireAdmin, (req, res) => {
   const workDate = isRealDate(String(req.query.date || '')) ? String(req.query.date) : jstToday();
   res.render(path.join(__dirname, 'views/admin_summary'), {
@@ -1139,8 +1369,28 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
     displayName: req.session.displayName,
     isAdmin: true,
     devices: listDevices(),
+    printJobs: listPrintJobs(30),
+    routes: listPrintRoutes(),
+    SLUG_LABELS,
+    PRINT_STATE_LABELS,
   });
 });
+
+/** 引当分類 → プリンター の対応表を編集する。 */
+router.post('/admin/print-routes', checkOrigin, requireAdmin, api(async (req, res) => {
+  const r = setPrintRoute(req.body.slug, req.body.printer_name, req.session.email, req.body.note);
+  if (!r.ok) throw new PackError(400, r.reason, r.message || '入力を確認してください');
+  // orphan = その名前を登録している端末が無い → 積まれても誰も取りに来ず滞留する
+  res.json({ ok: true, deleted: !!r.deleted, orphan: !!r.orphan });
+}));
+
+/** 端末から出せるプリンターを付け替える (登録し直さずに増減できるように)。 */
+router.post('/admin/devices/:id(\\d+)/printers', checkOrigin, requireAdmin, api(async (req, res) => {
+  const names = Array.isArray(req.body.printers) ? req.body.printers : [];
+  const r = setAgentPrinters(Number(req.params.id), names);
+  if (!r.ok) throw new PackError(400, r.reason, r.message);
+  res.json({ ok: true, printers: r.printers });
+}));
 
 /**
  * この端末 (iPad) を登録する。発行トークンは httpOnly Cookie としてこの端末にだけ渡す。
@@ -1150,6 +1400,33 @@ router.get('/admin/devices', requireAdmin, (req, res) => {
 router.post('/admin/devices', checkOrigin, requireAdmin, api(async (req, res) => {
   const label = String(req.body.label || '').trim();
   if (!label || label.length > 40) throw new PackError(400, 'bad_label', '端末名を1〜40文字で入力してください');
+
+  // 🖨 印刷エージェント (出荷PC) は iPad と発行導線は同じだが扱いが逆:
+  //   - Cookie ではなく**平文トークンをこの1回だけ画面に表示**する (エージェントの設定に貼る)
+  //   - 管理者セッションは破棄しない (登録している端末 = 中原さんのPCで、共用端末ではない)
+  //   - 出力先プリンター名をサーバ側で紐づける (エージェントの設定ミスで別プリンターに出さない)
+  if (String(req.body.kind || '') === 'agent') {
+    // 1台のPCに複数のプリンターがぶら下がる (出荷PC / 倉庫PC)。ここに登録した名前**だけ**が
+    // そのPCの出力先候補になる。どのジョブをどれに出すかは引当分類の対応表が決める
+    // 検証は setAgentPrinters に一本化する。ここで空項目を捨てると、
+    // 「新規登録は通るのに付け替えは400」と入口ごとに基準が変わり、
+    // 登録できたつもりで1つ入っていない状態を作る
+    const names = Array.isArray(req.body.printers) ? req.body.printers
+      : (req.body.printer_name == null ? [] : [req.body.printer_name]);
+    if (names.length === 0) {
+      throw new PackError(400, 'bad_printer',
+        'このPCから出せるプリンター名を1つ以上入力してください (「プリンターとスキャナー」の表記どおり)');
+    }
+    const { token, id } = createDevice(label, req.session.email, { kind: 'agent' });
+    const set = setAgentPrinters(id, names);
+    if (!set.ok) {
+      // 端末だけ作って中身が入らない状態を残さない (登録できたつもりで印刷されない事故を防ぐ)
+      revokeDevice(id);
+      throw new PackError(400, set.reason, set.message);
+    }
+    return res.json({ ok: true, kind: 'agent', id, token, printers: set.printers });
+  }
+
   const { token, id: deviceId } = createDevice(label, req.session.email);
   res.cookie(DEVICE_COOKIE, token, {
     httpOnly: true,

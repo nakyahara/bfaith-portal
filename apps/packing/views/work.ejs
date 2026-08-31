@@ -140,6 +140,11 @@
     .sheet-cancel { margin-top: 14px; width: 100%; padding: 10px; border: none; background: none; color: #868e96; font-size: 16px; cursor: pointer; }
     .jump-banner { display: none; background: #fff3bf; border: 1px solid #ffd43b; border-radius: 8px;
       padding: 6px 12px; margin: 0 auto 8px; max-width: 980px; font-size: 15px; font-weight: 600; }
+    /* 閲覧中 (完了済み・保留・作業位置より手前) だけ出す「作業へ戻る」帯。
+       下部の大きいボタンに載せない = 納品書を持つ手が触れても作業位置が動かない */
+    .back-to-work { display: none; margin: 0 auto 8px; max-width: 980px; }
+    .back-to-work button { width: 100%; border: 2px solid #e8590c; background: #fff4e6; color: #d9480f;
+      border-radius: 10px; padding: 10px 0; font-size: 17px; font-weight: 800; cursor: pointer; }
     .search-back { display: none; margin: 0 auto 8px; max-width: 980px; }
     .search-back button { background: #edf2ff; border: 1px solid #748ffc; border-radius: 8px;
       color: #364fc7; padding: 8px 16px; font-size: 15px; font-weight: 700; cursor: pointer; }
@@ -185,6 +190,7 @@
 
   <div class="sheet-area" id="sheetArea">
     <div class="search-back" id="searchBack"><button type="button" id="searchBackBtn">↩ 検索結果に戻る</button></div>
+    <div class="back-to-work" id="backToWork"><button type="button" id="backToWorkBtn">↩ 作業中の伝票へ戻る</button></div>
     <div class="jump-banner" id="jumpBanner">⚠ ズレ回復モード: 順序から外れた伝票を表示中。「次へ」で完了すると、間の伝票は未処理のまま残ります (最後に必ず戻ります)</div>
     <div class="paper" id="paper"></div>
     <div class="undo-link" id="undoLink"><button type="button" id="undoBtn">この伝票の完了を取り消す…</button></div>
@@ -374,7 +380,7 @@
       slips: state.slips.map((s) => ({
         seq: s.seq, status: s.status, neSlipNo: s.ne_slip_no, mall: s.mall,
         deliveryMethod: s.delivery_method, material: s.material, printHeader1: s.print_header1,
-        boxCount: s.box_count, warns: s.warns,
+        boxCount: s.box_count, warns: s.warns, pickingShortages: s.pickingShortages || [],
         recipientName: s.recipient_name, recipientZip: s.recipient_zip,
         recipientPref: s.recipient_pref, recipientAddr: s.recipient_addr,
         siteOrderNo: s.site_order_no, orderDate: s.order_date,
@@ -433,6 +439,10 @@
     let incidents = STATE.incidents || [];   // 未確定のミス候補 (完了サマリで確定/取下げ)
     let currentSeq = STATE.currentSeq;  // 次に梱包する伝票 = 最小の未処理 (null=全完了)
     let jumpMode = false;               // 検索ジャンプで順序から外れた伝票を表示中
+    // 🚨 ズレ回復で完了してよいのは「検索で飛んだその伝票」だけ。
+    //    jumpMode だけを見ると、そこから 前へ/次へ で別の未処理伝票へ移っても完了できてしまう
+    //    (= 間の伝票を飛ばして順序外完了。Codexレビュー 2026-08-30)
+    let jumpTargetSeq = null;
     let paused = STATE.batchStatus === 'paused';
     let lastDoneSeq = STATE.lastDoneSeq ?? null;   // 完了取消の対象 (最後に完了した伝票)
 
@@ -440,6 +450,17 @@
     function unfinishedCount() {
       return heldSet.size + incidents.filter((i) => i.slipSeq == null || !heldSet.has(i.slipSeq)).length;
     }
+    /**
+     * その伝票を「いま完了できるか」。render のボタン表示と goNext の実処理で**同じ関数**を使う。
+     * 別々に書くと片方だけ直して抜ける (実際 jumpMode の扱いがズレていた)。
+     */
+    function canCompleteSeq(seq) {
+      if (seq == null) return false;
+      if (doneSet.has(seq) || heldSet.has(seq)) return false;         // 完了済み・保留は不可
+      if (seq === currentSeq) return true;                            // 作業中の伝票
+      return jumpMode && seq === jumpTargetSeq;                       // 検索で飛んだその伝票だけ
+    }
+
     // 最小の未処理 seq (クライアント側の楽観計算。ズレ回復で順序外完了があっても正しい)
     function minPending() {
       for (const s of STATE.slips) if (!doneSet.has(s.seq) && !heldSet.has(s.seq)) return s.seq;
@@ -470,6 +491,10 @@
       if (heldSet.has(s.seq)) $('doneTag').style.display = 'inline-block';
 
       const warns = (s.warns || []).map((w) => `<span class="warn-badge">${esc(WARN_LABELS[w] || w)}</span>`).join('');
+      // ピッキング欠品の配賦バッジ (欠品フローv2 PR2)。この伝票に入るはずの商品が足りない
+      const pshort = (s.pickingShortages || []).map((p) => p.kind === 'none'
+        ? `<span class="warn-badge" style="background:#ffe3e3; border-color:#e03131; color:#c92a2a;">❌ ピッキング欠品: どのロケにもありません (${esc(p.sku)} × ${p.qty})</span>`
+        : `<span class="warn-badge" style="background:#fff3bf; border-color:#f08c00; color:#e8590c;">🕒 ピッキング欠品: 後で取りに行きます (${esc(p.sku)} × ${p.qty})</span>`).join('');
       // 明細数に応じた表示密度 (スクロールなしで全明細が見えるように)
       $('paper').dataset.density = s.lines.length <= 1 ? '1' : s.lines.length <= 3 ? '2' : '3';
       const lines = s.lines.map((l) => `
@@ -500,7 +525,7 @@
           ${s.deliveryDate ? `<span>配達指定 ${esc(s.deliveryDate)} ${esc(s.deliveryTime || '')}</span>` : ''}
         </div>
         ${matCardHtml(s.seq)}
-        ${warns ? `<div class="warns">${warns}</div>` : ''}
+        ${(warns || pshort) ? `<div class="warns">${pshort}${warns}</div>` : ''}
         <div class="recipient">
           <div class="name">${esc(s.recipientName || '(送り先なし)')} 様</div>
           <div class="addr">〒${esc(s.recipientZip || '')} ${esc(s.recipientPref || '')}${esc(s.recipientAddr || '')}</div>
@@ -527,21 +552,28 @@
       } else if (currentSeq == null) {
         $('nextBtn').textContent = '全伝票 完了';
         $('nextBtn').disabled = true;
-      } else if (viewingPending && (viewSeq === currentSeq || jumpMode)) {
+      } else if (canCompleteSeq(viewSeq)) {
         $('nextBtn').textContent = '次へ ▸';
         $('nextBtn').classList.remove('jump');
         $('nextBtn').disabled = false;
-      } else if (viewingPending) {
-        // 未処理だが順序外 (前へで戻りすぎた等)。現在の伝票へ誘導
-        $('nextBtn').textContent = `現在の伝票へ ▸`;
-        $('nextBtn').classList.add('jump');
-        $('nextBtn').disabled = false;
       } else {
-        $('nextBtn').textContent = `現在の伝票へ ▸`;
+        // 閲覧中 (完了済み / 保留 / 作業位置より手前)。
+        // ⭐ここは「移動」だけ。完了は作業中の伝票を表示しているときにしかできない
+        //   (canComplete の条件は変えていない)。
+        //   以前は「現在の伝票へ ▸」= 一気に作業位置へ吹き飛ぶ挙動で、1枚ずつ進む手段が
+        //   どこにも無かった (三宅さん 2026-08-29)。戻る導線は上部の帯へ移した
+        // 🚨 作業中の「次へ ▸」(= 完了) と同じ文字にしない。
+        //    1枚ずつ進んで作業位置に着いた瞬間から、同じ場所が「完了」に変わるので、
+        //    文字が同じだと勢いでもう1回押して未梱包の伝票を完了させかねない
+        $('nextBtn').textContent = '次の伝票を見る ▸';
         $('nextBtn').classList.add('jump');
-        $('nextBtn').disabled = false;
+        $('nextBtn').disabled = viewSeq >= STATE.slips.length;
       }
-      $('jumpBanner').style.display = (jumpMode && viewingPending && viewSeq !== currentSeq) ? 'block' : 'none';
+      // 作業位置から離れているときだけ「作業へ戻る」を出す
+      $('backToWork').style.display = (currentSeq != null && viewSeq !== currentSeq) ? 'block' : 'none';
+      // ズレ回復の注意書きは「検索で飛んだその伝票を表示中」のときだけ
+      $('jumpBanner').style.display =
+        (jumpMode && viewSeq === jumpTargetSeq && viewingPending && viewSeq !== currentSeq) ? 'block' : 'none';
       // 完了取消リンク: 最後に完了した伝票を閲覧中のときだけ
       $('undoLink').style.display = (!viewingPending && !viewingHeld && viewSeq === lastDoneSeq) ? 'block' : 'none';
       // 再ピック保留の伝票: 受領/取下げボタン (受領はピッカーが「持って行った」後のみ活性)
@@ -624,7 +656,9 @@
     // 完了済みの閲覧 (前へ) は読まずに止め、対象へ戻ったら読み直す
     function maybeSpeak() {
       if (!('speechSynthesis' in window)) return;
-      const isTarget = !doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode) && !paused;
+      // ⭐ボタンの出し分けと同じ判定を使う (canCompleteSeq)。別々に書くと、
+      //   「ボタンは閲覧なのに読み上げは梱包対象」というズレが起きる (Codex 2026-08-30)
+      const isTarget = canCompleteSeq(viewSeq) && !paused;
       if (isTarget && viewSeq !== lastSpokenSeq) {
         lastSpokenSeq = viewSeq;
         speakSlip(bySeq.get(viewSeq));
@@ -965,21 +999,20 @@
       if (paused || matBusy) return;
       if (currentSeq == null) {
         // 未処理ゼロ: 保留/候補が残っていれば終了処理へ戻る (閉じた・リロードした後の再入口)
-        if (STATE.batchStatus !== 'done' && unfinishedCount() > 0) { jumpMode = false; showEndOverlay(false); }
+        if (STATE.batchStatus !== 'done' && unfinishedCount() > 0) { jumpMode = false; jumpTargetSeq = null; showEndOverlay(false); }
         return;
       }
-      const viewingHeld = heldSet.has(viewSeq);
-      const viewingPending = !doneSet.has(viewSeq) && !viewingHeld;
-      const canComplete = viewingPending && (viewSeq === currentSeq || jumpMode);
-      if (!canComplete) {
-        viewSeq = currentSeq;   // 閲覧から現在の伝票へジャンプ
-        jumpMode = false;
-        render();
+      if (!canCompleteSeq(viewSeq)) {
+        // 🚨 完了はしない (canComplete が false = 表示中の伝票は完了できない)。
+        //    以前はここで viewSeq = currentSeq とし、作業位置へ一気に戻していた。
+        //    そのため「1枚ずつ戻れるのに、1枚ずつ進めない」状態だった (三宅さん 2026-08-29)。
+        //    移動だけを行う。戻る導線は上部の「↩ 作業中の伝票へ戻る」。
+        if (viewSeq < STATE.slips.length) { viewSeq += 1; render(); }
         return;
       }
       // 表示中伝票の完了宣言 + 次伝票へ (楽観的にUI更新・イベントはキュー送信)。
       // ズレ回復モード中は jumped フラグつきで順序外の完了を明示する
-      const wasJump = jumpMode && viewSeq !== currentSeq;
+      const wasJump = jumpMode && viewSeq === jumpTargetSeq && viewSeq !== currentSeq;
       $('searchBack').style.display = 'none';
       enqueue('next', viewSeq, wasJump ? { jumped: true } : {});
       doneSet.add(viewSeq);
@@ -989,17 +1022,17 @@
       if (next != null) {
         if (wasJump && next === minPending() && next < viewSeq) {
           showToast('未処理の伝票が残っています。先頭に戻ります');
-          jumpMode = false;
+          jumpMode = false; jumpTargetSeq = null;
         }
         viewSeq = next;
         render();
       } else if (heldSet.size > 0 || incidents.length > 0) {
         // 一通り終えた (未処理ゼロ) — ここで候補をまとめてピッキングへ送信する (⭐候補方式)
-        jumpMode = false;
+        jumpMode = false; jumpTargetSeq = null;
         render();
         showEndOverlay(false);
       } else {
-        jumpMode = false;
+        jumpMode = false; jumpTargetSeq = null;
         showEndOverlay(true);
         render();
         // render 内の maybeSpeak (閲覧扱いの cancel) より後に完了を読み上げる
@@ -1011,6 +1044,15 @@
       if (matBusy) return;
       if (viewSeq > 1) { viewSeq -= 1; render(); }
     }
+
+    // 閲覧から作業位置へ一発で戻る (100枚戻ったあとに1枚ずつ進むのは現実的でないため残す)
+    $('backToWorkBtn').addEventListener('click', () => {
+      if (currentSeq == null) return;
+      viewSeq = currentSeq;
+      jumpMode = false; jumpTargetSeq = null;
+      $('searchBack').style.display = 'none';
+      render();
+    });
 
     $('endClose').addEventListener('click', () => { overlayMode = null; $('doneOverlay').style.display = 'none'; });
     $('nextBtn').addEventListener('click', goNext);
@@ -1381,7 +1423,7 @@
         const r = await enqueueAndWait('receive', seq, {});
         if (!r.ok) { showToast(r.body?.error || `エラー (${r.status})`); return; }
         if ($('doneOverlay').style.display === 'flex') { $('doneOverlay').style.display = 'none'; overlayMode = null; }
-        viewSeq = seq; jumpMode = false;   // 受領した伝票へ自動ジャンプ (探し回らない)
+        viewSeq = seq; jumpMode = false; jumpTargetSeq = null;   // 受領した伝票へ自動ジャンプ (探し回らない)
         render();
         showToast(`伝票 #${seq} の保留を解除しました。梱包を続けてください`);
         if (window.__floorAlertsPoll) window.__floorAlertsPoll();
@@ -1406,7 +1448,12 @@
       heldSet.delete(seq); repickSet.delete(seq);
       incidents = incidents.filter((i) => i.slipSeq !== seq || i.kind === 'excess');
       currentSeq = minPending();
-      showToast('依頼を取り下げました');
+      // 見つかった商品は手元にある → その伝票を今すぐ梱包して「完了」できるように、その伝票に留まる
+      // (以前は先頭の未処理へ戻していたため、あとで納品書を探して開き直す作業が生じた — 2026-08-31 現場意見)。
+      // 作業位置より後ろの伝票なら順序外の完了 (jumped) として送る
+      viewSeq = seq;
+      if (seq !== currentSeq) { jumpMode = true; jumpTargetSeq = seq; } else { jumpMode = false; jumpTargetSeq = null; }
+      showToast('依頼を取り下げました。見つかった商品を梱包して「完了」を押してください');
       render();
     });
 
@@ -1685,10 +1732,10 @@
           viewSeq = seq;
           if (!doneSet.has(seq) && seq !== currentSeq) {
             // 順序から外れた未処理伝票へのジャンプ = ズレ回復モード (記録を残し頻度を計測する)
-            jumpMode = true;
+            jumpMode = true; jumpTargetSeq = seq;
             enqueue('jump', seq);
           } else {
-            jumpMode = false;
+            jumpMode = false; jumpTargetSeq = null;
           }
           render();
         });
@@ -1818,7 +1865,8 @@
         && $('doneOverlay').style.display !== 'flex' && $('workerOverlay').style.display !== 'flex';
       if (working) {
         // 表示中の梱包対象が変わったら伝票タイマーをリセット
-        const target = (!doneSet.has(viewSeq) && (viewSeq === currentSeq || jumpMode)) ? viewSeq : null;
+        // 閲覧中の伝票でタイマーを進めない (作業時間が実態とズレる)。判定はボタンと共通
+        const target = canCompleteSeq(viewSeq) ? viewSeq : null;
         if (target !== timerSeq) { timerSeq = target; slipSec = 0; }
         if (target != null) slipSec++;
         batchSec++;

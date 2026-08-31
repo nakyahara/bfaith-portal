@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>証憑を貼る — 証憑リンク集</title>
+<style>
+  /* MFの「自動で仕訳 > 連携サービスから入力」に見た目を寄せる (カード一覧 → 明細テーブル) */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif; background: #f4f5f7; color: #333; font-size: 13px; }
+  .wrap { max-width: 1400px; margin: 0 auto; padding: 14px 16px 60px; }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  header h1 { font-size: 18px; color: #2f3b5a; }
+  header a { color: #4b5563; text-decoration: none; font-size: 13px; }
+  header a:hover { text-decoration: underline; }
+  .spacer { flex: 1; }
+  .btn { border: 1px solid #c9ced6; background: #fff; border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .btn:hover { background: #f3f4f6; }
+  .btn.primary { background: #5b6b8f; border-color: #5b6b8f; color: #fff; }
+  .btn.primary:hover { background: #4a5878; }
+  .bar { background: #fff; border: 1px solid #e3e6eb; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .dot.ok { background: #16a34a; } .dot.ng { background: #dc2626; }
+  input[type=month], input[type=search], select { padding: 6px 10px; border: 1px solid #c9ced6; border-radius: 4px; font-size: 13px; }
+
+  /* 口座カード (MFホームの「未仕訳 n件」ブロック風) */
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: #fff; border: 1px solid #e3e6eb; border-radius: 6px; padding: 10px 12px; cursor: pointer; display: flex; gap: 10px; align-items: center; }
+  .card:hover { border-color: #8b97b5; }
+  .card.active { border-color: #5b6b8f; box-shadow: 0 0 0 2px #dfe4f0; }
+  .card .badge { min-width: 52px; text-align: center; border-radius: 4px; padding: 6px 4px; color: #fff; font-size: 11px; line-height: 1.2; }
+  .card .badge b { display: block; font-size: 16px; }
+  .badge.need { background: #d9534f; }
+  .ib { display: inline-block; border-radius: 4px; padding: 4px 10px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .act { display: inline-block; margin-top: 4px; }
+  .act .btn { padding: 3px 8px; font-size: 12px; margin-right: 4px; }
+  .act .btn.go { background: #2563eb; border-color: #2563eb; color: #fff; text-decoration: none; }
+  tr.row-ready td { background: #f0fdf4; }
+  tr.row-missing td { background: #fff5f5; }
+  tr.row-auto td { background: #fafafa; color: #6b7280; }
+  tr.row-done td { color: #9ca3af; }
+  .mfhead { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .legend { color: #6b7280; font-size: 12px; }
+  .ib.ready { background: #dcfce7; color: #166534; }
+  .ib.missing { background: #fee2e2; color: #b91c1c; }
+  .ib.done { background: #e0e7ff; color: #3730a3; }
+  .ib.auto { background: #f3f4f6; color: #6b7280; font-weight: 400; }
+  .ib.check { background: #fef3c7; color: #92400e; }
+  .ib a { color: inherit; }
+  .badge.zero { background: #9aa3b2; }
+  .autotag { display: inline-block; background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; border-radius: 3px; padding: 0 6px; font-size: 10px; margin-left: 6px; vertical-align: middle; }
+  .card .name { font-weight: 600; font-size: 14px; color: #2f3b5a; }
+  .card .sub { color: #6b7280; font-size: 12px; margin-top: 2px; }
+  .card .sub .un { color: #b45309; }
+
+  /* 明細テーブル (MFの連携サービスから入力の列構成に寄せる) */
+  .panel { background: #fff; border: 1px solid #e3e6eb; border-radius: 6px; }
+  .panel-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #e3e6eb; flex-wrap: wrap; }
+  .panel-head h2 { font-size: 15px; color: #2f3b5a; }
+  .note { background: #f0fdf4; border: 1px solid #bbf7d0; color: #166534; border-radius: 4px; padding: 6px 10px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; color: #4b5563; font-weight: 600; padding: 8px 10px; background: #eef0f4; border-bottom: 1px solid #dfe3ea; white-space: nowrap; }
+  td { padding: 8px 10px; border-bottom: 1px solid #edf0f4; vertical-align: top; font-size: 13px; }
+  tr:hover td { background: #f8fafc; }
+  tr.done td { color: #9ca3af; }
+  .amount { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .amount.exp { color: #b91c1c; }
+  .content { max-width: 360px; }
+  .content .memo { display: block; color: #6b7280; font-size: 12px; }
+  .acct { color: #4b5563; font-size: 12px; white-space: nowrap; }
+  .st { display: inline-block; border-radius: 3px; padding: 2px 8px; font-size: 11px; white-space: nowrap; }
+  .st.none { background: #fee2e2; color: #b91c1c; }
+  .st.registered { background: #e0e7ff; color: #3730a3; }
+  .st.modified, .st.new_voucher_attached { background: #fef3c7; color: #92400e; }
+  .st.excluded { background: #f3f4f6; color: #6b7280; }
+  .vendor a { display: inline-block; background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; border-radius: 4px; padding: 2px 8px; text-decoration: none; font-size: 12px; margin: 1px 2px 1px 0; }
+  .vendor a:hover { background: #dbeafe; }
+  .vendor .more { color: #6b7280; font-size: 12px; cursor: pointer; text-decoration: underline; }
+  .none-txt { color: #9ca3af; }
+  .clip { font-size: 16px; }
+  .clip.on { color: #2563eb; }
+  .clip.off { color: #c9ced6; }
+  .attach { color: #1d4ed8; cursor: pointer; font-size: 12px; white-space: nowrap; }
+  .attach:hover { text-decoration: underline; }
+  .attach.disabled { color: #9ca3af; cursor: default; text-decoration: none; }
+  .empty { padding: 30px; text-align: center; color: #9ca3af; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: #111827; color: #fff; padding: 8px 18px; border-radius: 999px; font-size: 13px; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  .toast.show { opacity: .92; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <a href="../">← 証憑リンク集</a>
+    <h1>🧾 証憑を貼る（連携サービスの明細ごと）</h1>
+    <span class="spacer"></span>
+    <a href="https://accounting.moneyforward.com/transaction_journals" target="_blank" rel="noopener" class="btn go" style="background:#2563eb;border-color:#2563eb;color:#fff;text-decoration:none">MFの「連携サービスから入力」を開く ↗</a>
+    <a href="../mf/inbox">📥 証憑の受け箱</a>
+    <a href="../mf">仕訳帳ビューへ</a>
+  </header>
+
+  <div class="bar" id="statusBar">読み込み中…</div>
+
+  <div class="bar">
+    対象月: <input type="month" id="month">
+    <button class="btn primary" id="loadBtn">明細を取得</button>
+    <span id="loadInfo" style="color:#6b7280"></span>
+  </div>
+
+  <div class="legend" style="margin:-4px 0 10px">
+    行の色: <span class="ib ready">緑 = 証憑あり → MFで「登録」するだけ</span>
+    <span class="ib missing">赤 = 証憑なし → 取りに行く</span>
+    <span class="ib auto">灰 = MFが証憑を自動取得するサービス</span>
+    <span class="ib done">✅ = 添付済み</span>
+  </div>
+  <div class="cards" id="cards"></div>
+
+  <div class="panel" id="panel" style="display:none">
+    <div class="panel-head">
+      <h2 id="panelTitle"></h2>
+      <span id="panelNote"></span>
+      <span class="spacer"></span>
+      <input type="search" id="q" placeholder="摘要・支払い先で検索">
+      <select id="filter">
+        <option value="todo">未仕訳 + 証憑待ち</option>
+        <option value="missing">証憑なし（取りに行く）だけ</option>
+        <option value="ready">証憑あり（登録するだけ）だけ</option>
+        <option value="none">未仕訳だけ</option>
+        <option value="need">証憑待ち（登録済・証憑なし）だけ</option>
+        <option value="all">全て</option>
+      </select>
+    </div>
+    <table>
+      <thead>
+        <tr><th>取引日</th><th class="amount">金額</th><th>摘要</th><th>勘定科目</th><th>仕訳登録</th><th>証憑の状態</th><th>マッチした支払い先（開いて証憑を取る）</th><th>MF</th><th></th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" style="display:none"></div>
+  </div>
+  <div class="empty" id="hint">上の「明細を取得」を押すと、MFの「連携サービスから入力」と同じ単位でカード・口座ごとに並びます</div>
+</div>
+
+<input type="file" id="filePicker" accept=".pdf,.jpg,.jpeg,.png" style="display:none">
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+let data = { accounts: [] };
+let current = null;      // 選択中の連携サービスID
+let attachTarget = null; // ファイル選択中の仕訳ID
+const expanded = new Set();
+
+const STATUS_LABEL = { none: '未仕訳', registered: '登録済', modified: '要確認', new_voucher_attached: '証憑追加', excluded: '対象外' };
+const ATTACH_ERRORS = {
+  file_too_large_5mb: 'MFの上限は1件5MBです',
+  file_name_too_long: 'ファイル名が長すぎます（255文字まで）',
+  mf_api_400: 'MFに拒否されました（1仕訳の証憑は5件まで・重複や形式をご確認ください）',
+  mf_api_401: 'MFのトークンが失効しています。再接続してください',
+  mf_api_429: 'MFのリクエスト制限に当たりました。少し待って再試行してください',
+};
+
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+async function api(path, opts) {
+  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body.ok) throw new Error(body.error || ('http_' + res.status));
+  return body.result;
+}
+
+// 接続後にアプリ側の必要スコープが増えた場合 (403 の原因)。MFの認可画面をもう一度通すと解消する
+function scopeWarn(s, connectHref) {
+  if (!s.missing_scopes?.length) return '';
+  return ` <span style="color:#b45309">権限が足りません（${s.missing_scopes.map(x => x.replace('mfc/accounting/', '')).join(', ')}）</span> `
+    + `<button class="btn primary" onclick="location.href='${connectHref}'">再接続して許可する</button>`;
+}
+
+async function refreshStatus() {
+  const bar = $('statusBar');
+  try {
+    const s = await api('../api/mf/status');
+    if (!s.configured) bar.innerHTML = '<span class="dot ng"></span> MF_CLIENT_ID / MF_CLIENT_SECRET が未設定です';
+    else if (!s.connected) bar.innerHTML = '<span class="dot ng"></span> MF未接続 <button class="btn primary" onclick="location.href=\'../mf/connect\'">MFと接続する</button>';
+    else bar.innerHTML = `<span class="dot ok"></span> MF接続中: <b>${esc(s.office?.office?.name || s.office?.name || '')}</b>` + scopeWarn(s, '../mf/connect');
+  } catch (e) {
+    bar.innerHTML = '<span class="dot ng"></span> 状態取得エラー: ' + esc(e.message);
+  }
+}
+
+function monthRange(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const last = new Date(y, m, 0).getDate();
+  return [`${ym}-01`, `${ym}-${String(last).padStart(2, '0')}`];
+}
+
+async function load() {
+  const ym = $('month').value;
+  if (!ym) return toast('対象月を選んでください');
+  const [start, end] = monthRange(ym);
+  $('loadInfo').textContent = '取得中…（明細と仕訳を突き合わせています）';
+  try {
+    data = await api(`../api/mf/transactions?start=${start}&end=${end}`);
+    $('hint').style.display = 'none';
+    $('loadInfo').textContent = `明細 ${data.total}件`;
+    if (data.warning === 'reconnect_for_scope') toast('連携サービス名を出すには「再接続して許可する」を押してください');
+    if (!data.accounts.some(a => a.id === current)) current = (visibleAccounts()[0] || {}).id || null;
+    renderCards();
+    renderRows();
+  } catch (e) {
+    $('loadInfo').textContent = '';
+    toast(e.message === 'mf_not_connected' ? '先にMFと接続してください' : '取得エラー: ' + e.message);
+  }
+}
+
+function visibleAccounts() {
+  return data.accounts.filter(a => a.counts.total > 0);
+}
+
+function renderCards() {
+  $('cards').innerHTML = visibleAccounts().map(a => {
+    const c = a.counts;
+    const badge = `<div class="badge ${c.unregistered ? 'need' : 'zero'}">未仕訳<b>${c.unregistered}</b></div>`;
+    return `<div class="card${a.id === current ? ' active' : ''}" data-acc="${esc(a.id)}">
+      ${badge}
+      <div>
+        <div class="name">${esc(a.name)}${a.auto_voucher ? '<span class="autotag" title="MFが明細と一緒に証憑を取得できるサービス (先方に領収書が上がっている場合)">証憑自動取得対応</span>' : ''}</div>
+        <div class="sub">明細 ${c.total}件 ／ <span style="color:#166534">証憑あり・登録するだけ ${c.ready}件</span> ／ <span class="un">証憑なし ${c.missing}件</span> ／ 添付済 ${c.attached}件</div>
+      </div>
+    </div>`;
+  }).join('') || '<div class="empty">この期間に明細のある連携サービスがありません</div>';
+}
+
+function needsVoucher(r) {
+  return r.side === 'EXPENSE' && r.status !== 'excluded' && !r.vouchers;
+}
+
+function renderRows() {
+  const a = data.accounts.find(x => x.id === current);
+  $('panel').style.display = a ? 'block' : 'none';
+  if (!a) return;
+  $('panelTitle').textContent = a.name;
+  $('panelNote').innerHTML = (a.auto_voucher
+    ? '<span class="note">MFの証憑自動取得に対応しているサービスです（先方サイトに領収書が上がっていれば、明細と一緒にMFへ入ります）</span> '
+    : '')
+    + (a.mf_url
+      ? `<a class="btn go" href="${esc(a.mf_url)}" target="_blank" rel="noopener">MFでこのカードを開く ↗</a> <button class="btn" data-seturl="${esc(a.id)}" title="MFのURLを登録し直す">⚙</button>`
+      : `<button class="btn" data-seturl="${esc(a.id)}" style="border-color:#f59e0b;color:#92400e">⚙ MFのURLを登録（1回だけ）</button>`);
+  const q = $('q').value.trim().toLowerCase();
+  const f = $('filter').value;
+  const rows = a.rows.filter(r => {
+    if (f === 'missing' && category(r, a) !== 'missing') return false;
+    if (f === 'ready' && category(r, a) !== 'ready') return false;
+    if (f === 'none' && r.status !== 'none') return false;
+    if (f === 'need' && !needsVoucher(r)) return false;
+    if (f === 'todo' && !(r.status === 'none' || needsVoucher(r))) return false;
+    if (q && ![r.content, r.memo, ...r.vendors.map(v => v.name)].join(' ').toLowerCase().includes(q)) return false;
+    return true;
+  });
+  $('empty').style.display = rows.length ? 'none' : 'block';
+  $('empty').textContent = a.rows.length ? '条件に合う明細はありません 🎉' : 'この期間の明細はありません';
+  // やることが同じ行をまとめる: 登録するだけ → 取りに行く → その他 → 添付済み (各グループ内は日付順)
+  const order = { ready: 0, missing: 1, other: 2, auto: 3, done: 4 };
+  rows.sort((x, y) => order[category(x, a)] - order[category(y, a)] || x.date.localeCompare(y.date));
+  $('rows').innerHTML = rows.map(r => `<tr class="row-${category(r, a)}">
+    <td>${esc(r.date.slice(5).replace('-', '/'))}</td>
+    <td class="amount ${r.side === 'EXPENSE' ? 'exp' : ''}">${r.side === 'EXPENSE' ? '-' : ''}${Number(r.value).toLocaleString()}</td>
+    <td class="content">${esc(r.content)}${r.memo ? `<span class="memo">${esc(r.memo)}</span>` : ''}</td>
+    <td class="acct">${esc((r.accounts || []).slice(0, 2).join(' / '))}</td>
+    <td><span class="st ${esc(r.status)}">${STATUS_LABEL[r.status] || esc(r.status)}</span>${r.journal_number ? ` <span class="acct">No.${esc(r.journal_number)}</span>` : ''}</td>
+    <td>${inboxCell(r, a)}</td>
+    <td class="vendor">${vendorCell(r)}</td>
+    <td><span class="clip ${r.vouchers ? 'on' : 'off'}" title="${r.vouchers ? `証憑 ${r.vouchers}件` : '証憑なし'}">📎</span>${r.vouchers ? ` <span class="acct">${r.vouchers}</span>` : ''}</td>
+    <td>${attachCell(r)}</td>
+  </tr>`).join('');
+}
+
+const MF_INPUT_URL = 'https://accounting.moneyforward.com/transaction_journals';
+/** このカードで絞ったMFのURL (登録済みならそれ、無ければ絞り込みなしの画面) */
+function mfUrlFor(a) { return a.mf_url || MF_INPUT_URL; }
+
+/** この明細について人が何をすればいいか (行の色・並び順にも使う) */
+function category(r, a) {
+  if (r.vouchers) return 'done';
+  if (r.side !== 'EXPENSE' || r.status === 'excluded') return 'other';
+  if (r.inbox && !r.inbox.candidate && r.inbox.status !== 'needs_check') return 'ready';
+  if (r.inbox) return 'other';
+  if (a.auto_voucher) return 'auto';
+  return 'missing';
+}
+
+/** 「証憑の状態」セル = 状態 + 次にやる操作のボタン */
+function inboxCell(r, a) {
+  const cat = category(r, a);
+  const copyBtn = `<button class="btn" data-copy="${r.value}" title="MFの金額欄に貼って絞り込む">金額をコピー</button>`;
+  const mfBtn = `<a class="btn go" href="${esc(mfUrlFor(a))}" target="_blank" rel="noopener" title="${a.mf_url ? 'このカードで絞ったMFの画面を開く' : 'MFの通帳・カード他を開く (カードの絞り込みは未登録)'}">MFで登録 ↗</a>`;
+  if (cat === 'done') return '<span class="ib done">✅ 添付済み</span>';
+  if (cat === 'auto') return r.status === 'none'
+    ? '<span class="ib auto">MFが自動取得（登録すると証憑が付く）</span>'
+    : '<span class="ib auto">MF自動取得なし（必要ならMFで手で貼る）</span>';
+  const ib = r.inbox;
+  const file = ib ? `<a href="../api/inbox/${ib.id}/file" target="_blank" rel="noopener" title="${esc(ib.file_name)}">📄 領収書を見る</a>` : '';
+  if (cat === 'missing') return `<span class="ib missing">❌ 証憑なし → 取りに行く</span><div class="act">${copyBtn}</div>`;
+  if (!ib) return '';
+  if (ib.candidate) return `<span class="ib check">候補あり → 受け箱で選ぶ</span><div class="act"><a class="btn" href="../mf/inbox">受け箱へ</a> ${file}</div>`;
+  if (ib.status === 'needs_check') return `<span class="ib check">MF側を確認</span><div class="act"><a class="btn" href="../mf/inbox">受け箱へ</a> ${file}</div>`;
+  if (r.status === 'none') return `<span class="ib ready">📥 証憑あり → MFで「登録」するだけ</span><div class="act">${mfBtn} ${copyBtn} ${file}</div>`;
+  if (ib.status === 'proposed') return `<span class="ib ready">📥 証憑あり → 受け箱で「承認」</span><div class="act"><a class="btn go" href="../mf/inbox">受け箱で承認</a> ${file}</div>`;
+  return `<span class="ib ready">📥 証憑あり（次の周期で自動で貼付）</span><div class="act">${file}</div>`;
+}
+
+function vendorCell(r) {
+  if (!r.vendors.length) return '<span class="none-txt">マスタに一致なし</span>';
+  const open = expanded.has(r.id);
+  const shown = open ? r.vendors : r.vendors.slice(0, 2);
+  const chips = shown.map(v => v.url
+    ? `<a href="${esc(v.url)}" target="_blank" rel="noopener" title="${esc(v.name)}${v.storage_path ? '\n保存先: ' + esc(v.storage_path) : ''}">${esc(shorten(v.name))} ↗</a>`
+    : `<span class="none-txt">${esc(shorten(v.name))}</span>`).join('');
+  const rest = r.vendors.length - shown.length;
+  return chips + (rest > 0 ? ` <span class="more" data-more="${esc(r.id)}">他${rest}件</span>` : '');
+}
+
+function attachCell(r) {
+  if (r.status === 'none') return '<span class="attach disabled" title="MFで仕訳登録すると、ここから貼れます">先にMFで登録</span>';
+  if (r.status === 'excluded') return '';
+  if (!r.journal_id) return '<span class="attach disabled">仕訳が見つからない</span>';
+  return `<span class="attach" data-attach="${esc(r.journal_id)}">📎 ファイルを添付</span>`;
+}
+
+function shorten(name) { return name.length > 16 ? name.slice(0, 16) + '…' : name; }
+
+document.addEventListener('click', (ev) => {
+  const setUrl = ev.target.closest('[data-seturl]');
+  if (setUrl) {
+    const a = data.accounts.find(x => x.id === setUrl.dataset.seturl);
+    const url = prompt(`MFの「連携サービスから入力 > 通帳・カード他」で 連携サービス=${a?.name || ''} を選んで「検索」した直後のURLを貼ってください（空にすると解除）`, a?.mf_url || '');
+    if (url === null) return;
+    api(`../api/mf/accounts/${encodeURIComponent(setUrl.dataset.seturl)}/url`, { method: 'POST', body: JSON.stringify({ url: url.trim() }) })
+      .then(() => { toast(url.trim() ? 'MFのURLを登録しました' : 'MFのURLを解除しました'); load(); })
+      .catch(e => toast(e.message === 'bad_url' ? 'URLが違います（https://accounting.moneyforward.com/transaction_journals で始まるもの）' : 'エラー: ' + e.message));
+    return;
+  }
+  const copy = ev.target.closest('[data-copy]');
+  if (copy) {
+    navigator.clipboard?.writeText(String(copy.dataset.copy)).then(() => toast(`${Number(copy.dataset.copy).toLocaleString()} をコピーしました。MFの「金額」欄に貼って検索してください`));
+    return;
+  }
+  const card = ev.target.closest('[data-acc]');
+  if (card) { current = card.dataset.acc; renderCards(); renderRows(); return; }
+  const more = ev.target.closest('[data-more]');
+  if (more) { expanded.add(more.dataset.more); return renderRows(); }
+  const attach = ev.target.closest('[data-attach]');
+  if (attach) {
+    attachTarget = attach.dataset.attach;
+    $('filePicker').value = '';
+    $('filePicker').click();
+  }
+});
+
+$('filePicker').addEventListener('change', async () => {
+  const file = $('filePicker').files[0];
+  if (!file || !attachTarget) return;
+  if (file.size > 5 * 1024 * 1024) return toast('MFの上限は1件5MBです');
+  if (file.name.length > 255) return toast('ファイル名が長すぎます（255文字まで）');
+  toast('アップロード中…');
+  const b64 = await new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(',')[1]);
+    fr.onerror = reject;
+    fr.readAsDataURL(file);
+  });
+  try {
+    await api('../api/mf/attach', { method: 'POST', body: JSON.stringify({ journal_id: attachTarget, file_name: file.name, file_data: b64 }) });
+    toast('添付しました');
+    load();
+  } catch (e) {
+    toast('添付エラー: ' + (ATTACH_ERRORS[e.message] || e.message));
+  }
+});
+
+$('loadBtn').addEventListener('click', load);
+$('q').addEventListener('input', renderRows);
+$('filter').addEventListener('change', renderRows);
+
+(function init() {
+  const now = new Date();
+  $('month').value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+  refreshStatus();
+})();
+</script>
+</body>
+</html>

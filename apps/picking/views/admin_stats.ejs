@@ -50,6 +50,7 @@
       <span class="user-name"><%= typeof displayName !== 'undefined' && displayName ? displayName : username %></span>
       <a href="/apps/picking/board" class="btn-logout" target="_blank">🖥 掲示ボード</a>
       <a href="/apps/picking/admin/summary" class="btn-logout">📊 本日サマリ</a>
+      <a href="/apps/picking/admin/missing-images" class="btn-logout">🖼 画像なし商品</a>
       <a href="/apps/picking/" class="btn-logout">← バッチ一覧</a>
       <a href="/" class="btn-logout">ダッシュボード</a>
     </div>
@@ -151,9 +152,11 @@
 
     <h2>ピッキングミス (梱包検知・確定分)</h2>
     <p class="muted" style="font-size:0.85em; margin:0 0 8px">
-      梱包で見つかり「ピッキングへ送信」で確定した 不足 (取り忘れ)・余り・品違い の件数
-      (取下げ=誤検知は除外)。帰責はそのバッチのピッキング担当。
-      <b>⚠欠品 (棚に在庫が無かった) はミスに含めません</b> (上の表の欠品列のまま)。
+      梱包で見つかり「ピッキングへ送信」で確定した 不足 (取り忘れ)・余り・品違い。
+      <b>件数より比率</b> (1,000明細あたり・分母=期間内にピッキングした明細数。<%= miss.minLines %>明細未満は参考値)。
+      帰責はそのバッチのピッキング担当。取下げ=誤検知は除外。
+      <b>⚠欠品 (棚に在庫が無かった) はミスに含めません</b> — 梱包で「不足」と確定していても、ピッキング側で
+      その受注×SKU が欠品 (後で取りに行く/どこにもない) だったものは「欠品由来」として除外しています。
       期間: <%= miss.since %> 〜 <%= miss.until %>
     </p>
     <div class="scroll-x">
@@ -161,31 +164,39 @@
       <thead>
         <tr>
           <th>作業者</th>
+          <th class="num">ミス率 (/1,000明細)</th><th class="num">明細数</th>
           <th class="num">合計</th><th class="num">不足 (取り忘れ)</th>
           <th class="num">余り (取りすぎ)</th><th class="num">品違い</th><th class="num">数量計</th>
+          <th class="num">欠品由来 (除外)</th>
         </tr>
       </thead>
       <tbody>
         <% miss.byWorker.forEach((m) => { %>
-          <tr>
-            <td><%= m.worker %></td>
+          <tr<%= m.provisional ? ' style="opacity:.6"' : '' %>>
+            <td><%= m.name || m.worker %></td>
+            <td class="num"><b><%= m.per1000 == null ? '-' : m.per1000.toFixed(1) %></b><%= m.provisional ? ' <span class="muted">(参考)</span>' : '' %></td>
+            <td class="num"><%= m.lines %></td>
             <td class="num"><b><%= m.total %></b></td>
             <td class="num"><%= m.shortage || 0 %></td>
             <td class="num"><%= m.excess || 0 %></td>
             <td class="num"><%= m.wrong_item || 0 %></td>
             <td class="num"><%= m.qty %></td>
+            <td class="num"><%= m.stockout || '' %></td>
           </tr>
         <% }) %>
         <% if (miss.byWorker.length === 0) { %>
-          <tr><td colspan="6" class="muted">この期間の確定ミスはありません 🎉</td></tr>
+          <tr><td colspan="9" class="muted">この期間の確定ミスはありません 🎉</td></tr>
         <% } else { %>
           <tr style="border-top:2px solid #adb5bd">
             <td><b>合計</b></td>
+            <td class="num"><b><%= miss.total.per1000 == null ? '-' : miss.total.per1000.toFixed(1) %></b></td>
+            <td class="num"><%= miss.total.lines %></td>
             <td class="num"><b><%= miss.total.total %></b></td>
             <td class="num"><%= miss.total.shortage %></td>
             <td class="num"><%= miss.total.excess %></td>
             <td class="num"><%= miss.total.wrong_item %></td>
             <td class="num"><%= miss.total.qty %></td>
+            <td class="num"><%= miss.total.stockout || '' %></td>
           </tr>
         <% } %>
       </tbody>

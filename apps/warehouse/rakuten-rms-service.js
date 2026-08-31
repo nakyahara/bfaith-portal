@@ -17,7 +17,7 @@ import Database from 'better-sqlite3';
 import express, { Router } from 'express';
 import { rateLimitMiddleware } from './rate-limiter.js';
 import { okResponse, errorResponse } from './error-handler.js';
-import { rakutenRequest } from './rakuten-client.js';
+import { rakutenRequest, describeRmsError, rmsErrorSuffix, RMS_AUTH_HINT } from './rakuten-client.js';
 
 const router = Router();
 
@@ -75,8 +75,8 @@ async function fetchAllRakutenItemCodes() {
     const result = await rakutenRequest({ path: apiPath });
 
     if (result.status !== 200) {
-      const err = extractRmsError(result.data);
-      throw Object.assign(new Error(`HTTP ${result.status}${err.message ? `: ${err.message}` : ''}`), { rmsStatus: result.status });
+      const hint = (result.status === 401 || result.status === 403) ? RMS_AUTH_HINT : '';
+      throw Object.assign(new Error(`HTTP ${result.status}${rmsErrorSuffix(result.data)}${hint}`), { rmsStatus: result.status });
     }
 
     const items = result.data.results || result.data.items || [];
@@ -94,26 +94,12 @@ async function fetchAllRakutenItemCodes() {
   return mapping;
 }
 
-// 楽天 RMS のレスポンス本文からエラーコード / メッセージを安全に抽出 (型固定)
+// 楽天 RMS のレスポンス本文からエラーコード / メッセージを安全に抽出 (型固定)。
+// 形の網羅 (errors[] / MessageModelList[] / {code,message}) は rakuten-client.js に集約した。
+// **errors[] を拾えないと 401 GA0001 'Un-Authorised' が空欄になる** (2026-08-30 のライセンス失効で実害)
 function extractRmsError(data) {
-  if (data == null) return { errorCode: null, message: null };
-  if (typeof data === 'string') return { errorCode: null, message: data.slice(0, 500) };
-  if (typeof data === 'object') {
-    // MessageModelList[].messageCode / message を最優先で拾う
-    const list = Array.isArray(data.MessageModelList) ? data.MessageModelList : null;
-    if (list && list.length > 0) {
-      const err = list.find(m => m && m.messageType === 'ERROR') || list[0];
-      return {
-        errorCode: err && typeof err.messageCode === 'string' ? err.messageCode : null,
-        message: err && typeof err.message === 'string' ? err.message : null,
-      };
-    }
-    return {
-      errorCode: typeof data.code === 'string' ? data.code : null,
-      message: typeof data.message === 'string' ? data.message : null,
-    };
-  }
-  return { errorCode: null, message: null };
+  const { code, message } = describeRmsError(data);
+  return { errorCode: code, message };
 }
 
 // ==========================================
@@ -189,7 +175,12 @@ router.get('/items/all-skus', rateLimitMiddleware('rakuten'), async (req, res) =
       const result = await rakutenRequest({ path: apiPath });
 
       if (result.status !== 200) {
-        return errorResponse(res, { status: result.status, error: 'RMS_API_ERROR', message: `HTTP ${result.status}`, requestId: req.requestId });
+        // 401 は errors[] 形式で理由が来る (GA0001 Un-Authorised = ライセンスキー失効)
+        const hint = (result.status === 401 || result.status === 403) ? RMS_AUTH_HINT : '';
+        return errorResponse(res, {
+          status: result.status, error: 'RMS_API_ERROR',
+          message: `HTTP ${result.status}${rmsErrorSuffix(result.data)}${hint}`, requestId: req.requestId,
+        });
       }
 
       const items = result.data.results || result.data.items || [];
@@ -395,7 +386,8 @@ router.post('/inquiry-attachment-upload', rateLimitMiddleware('rakuten'),
       fd.append('file', new Blob([buf], { type: contentType }), fileName);
       // アップロードは顧客可視の副作用が無いため rakutenRequest の既定リトライのままでよい
       const result = await rakutenRequest({ path: '/es/1.0/inquirymng-api/attachment', method: 'POST', formData: fd });
-      console.log(`[rakuten-rms] inquiry-attachment-upload ${fileName} ${buf.length}bytes -> HTTP ${result.status}`);
+      // 非2xx は理由も残す (401 GA0001 = ライセンスキー失効。status だけだと原因が追えない)
+      console.log(`[rakuten-rms] inquiry-attachment-upload ${fileName} ${buf.length}bytes -> HTTP ${result.status}${result.status >= 300 ? rmsErrorSuffix(result.data) : ''}`);
       res.status(result.status).json(result.data);
     } catch (e) {
       errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });
@@ -450,7 +442,8 @@ router.post('/inquiry-reply', rateLimitMiddleware('rakuten'), async (req, res) =
       body: { inquiryNumber, shopId, message, ...(attachments?.length ? { attachments } : {}) },
       maxAttempts: 1,
     });
-    console.log(`[rakuten-rms] inquiry-reply ${inquiryNumber} -> HTTP ${result.status}`);
+    // 非2xx は理由も残す (401 GA0001 = ライセンスキー失効。status だけだと原因が追えない)
+    console.log(`[rakuten-rms] inquiry-reply ${inquiryNumber} -> HTTP ${result.status}${result.status >= 300 ? rmsErrorSuffix(result.data) : ''}`);
     res.status(result.status).json(result.data);
   } catch (e) {
     errorResponse(res, { status: 502, error: 'RMS_API_ERROR', message: e.message, requestId: req.requestId });

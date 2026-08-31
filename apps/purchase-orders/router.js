@@ -20,7 +20,7 @@ import fs from 'fs';
 import multer from 'multer';
 import iconv from 'iconv-lite';
 import { getDB, normSupplierCode, normProductCode } from './db.js';
-import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture } from './logic.js';
+import { computeAll, loadPml, loadPmlMerged, loadMasters, evaluateCondition, logizardMirrorLatestCapture, targetRule } from './logic.js';
 import {
   ensureTrackingStarted, nextPoNumber, isYmd, checkLedgerIntegrity, withCommand,
   appendPoItemEvent, reverseEvent, manualCloseOrder, setItemPlan, listBackorders, listItemEvents, balanceOf,
@@ -345,7 +345,8 @@ function productDto(p) {
   return {
     code: p.code, name: p.name, stock: p.stock, backOrder: p.backOrder,
     sales30: p.sales30, sales7: p.sales7, lot: p.lot, holdMonths: p.holdMonths,
-    stockMonths: Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
+    stockMonths: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, recQty: p.recQty,
+    salesDefined: p.salesDefined, targetReason: p.targetReason, holdMonthsMissing: p.holdMonthsMissing,
     cost: p.cost, price: p.price, lastPurchase: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
     conditionId: p.conditionId, materialGroupId: p.materialGroupId,
     capacityPerUnit: p.capacityPerUnit, caseGroup: p.caseGroup || '', caseLot: p.caseLot || null,
@@ -804,6 +805,19 @@ router.patch('/api/shortage-risk/settings', (req, res) => {
     res.json({ ok: true, settings: shortageSettings(), defaults: SHORTAGE_DEFAULTS });
   }
   catch (e) { res.status(400).json({ ok: false, error: e.message }); }
+});
+
+// 要発注判定ルールの切替 (v2=既定の不等式形 / v1=旧式 0<L<=M へのロールバック)。運用者のロールバック口 (DB直接操作なしで戻せる)
+router.get('/api/target-rule', (req, res) => {
+  res.json({ ok: true, rule: targetRule() });
+});
+router.post('/api/target-rule', (req, res) => {
+  try {
+    const rule = req.body && req.body.rule;
+    if (rule !== 'v1' && rule !== 'v2') return res.status(400).json({ ok: false, error: 'rule は v1/v2 のみ' });
+    setSetting('target_rule', rule, { actor: actorOf(req), reason: rule === 'v1' ? '⚠️要発注判定を旧ルール(v1)へロールバック' : '要発注判定を v2 (不等式形) へ' });
+    res.json({ ok: true, rule: targetRule() });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
 // NE発注残CSVの初期取込 (移行PO作成)。commit='1' 以外はプレビューのみ (書込なし)。
@@ -2384,8 +2398,13 @@ const MASTER_DEFS = {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
       if (r.send_method && !['email', 'fax', 'web', 'relay', 'email_pdf', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/relay/email_pdf/none';
-      if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
-      if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
+      // FAX番号の書式は「発注方法=FAX」のときだけ保存を止める。それ以外の発注方法では、FAX欄の書式不備で
+      // 行全体 (発注方法の変更など) が保存できなくなる方が害が大きい (2026-08-31 フォーユー: 発注方法を
+      // 変えても保存されない → 実際は行内の別欄の検証エラー)。不備は warning で返す (POST 側)
+      if (r.send_method === 'fax') {
+        if (!r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
+        try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; }
+      }
       if (r.send_method === 'relay' && !r.relay_to) return '発注方法が社内転送の場合は社内転送先メールアドレスを入力してください';
       if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
       return null;
@@ -2597,8 +2616,27 @@ router.post('/api/masters/:kind', (req, res) => {
       && !getDB().prepare('SELECT 1 FROM po_product_attrs WHERE product_key=?').get(row.product_key)) {
       return res.status(400).json({ ok: false, error: 'グループ・容量・ケースが全て空です (空のままでは紐付けになりません)' });
     }
+    // 仕入先の発注方法を変えたとき、変更前に作られた未送信ジョブ (予約/失敗) は作成時の添付 (CSV/PDF) のまま
+    // なので送信直前の突合で止まる (email.js channelMismatchOf)。保存時にも件数を返して「取消して新規送信」を促す
+    let warning = null;
+    if (req.params.kind === 'suppliers') {
+      const prev = getDB().prepare('SELECT send_method FROM po_suppliers WHERE supplier_code=?').get(row.supplier_code);
+      if (prev && (prev.send_method || null) !== (row.send_method || null)) {
+        const pending = getDB().prepare(`SELECT o.po_number, j.id, j.status, j.scheduled_at FROM po_email_jobs j
+          JOIN po_orders o ON o.id = j.order_id WHERE o.supplier_code=? AND j.status IN ('queued','failed') ORDER BY j.id`).all(row.supplier_code);
+        if (pending.length) {
+          warning = `発注方法を変更しました。この仕入先には送信前のジョブが ${pending.length}件あります (${pending.map(p => `${p.po_number || '#' + p.id}${p.scheduled_at ? ' 予約' : ''}`).join(', ')})。` +
+            'これらは作成時の添付のままなので送信時に自動で止まります。発注書メールパネルで「取消」し、新規に送信し直してください';
+        }
+      }
+    }
+    // FAX番号の書式不備は 発注方法≠FAX なら保存を止めず warning (validate 参照)
+    if (req.params.kind === 'suppliers' && row.fax_number && row.send_method !== 'fax') {
+      try { normalizeFaxNumber(row.fax_number); }
+      catch (e) { warning = (warning ? warning + '\n\n' : '') + `保存しましたが、${e.message} — 発注方法をFAXに切り替える前に直してください`; }
+    }
     upsertMasterRow(def, row);
-    res.json({ ok: true });
+    res.json({ ok: true, ...(warning ? { warning } : {}) });
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
@@ -3565,12 +3603,13 @@ function freshnessText(pub, overlay) {
 router.get('/', (req, res) => {
   let data;
   try {
-    const { pub, overlay, bySupplier, products } = computeAll();
+    const { pub, overlay, bySupplier, products, ruleStats } = computeAll();
     const db = getDB();
     const draftCodes = new Set(db.prepare("SELECT supplier_code FROM po_orders WHERE status='draft'").all().map(r => r.supplier_code));
     const cycleIssued = new Map(cycleIssuedSuppliers(cycleStartIso(pub)).map(r => [r.code, r]));
     const cards = [];
     const others = [];
+    data = { ruleStats };
     for (const g of bySupplier.values()) {
       const ci = cycleIssued.get(g.code);
       const c = {
@@ -3585,10 +3624,20 @@ router.get('/', (req, res) => {
     others.sort((a, b) => b.productCount - a.productCount);
     const searchIndex = products.filter(p => p.active).map(p => ({ c: p.code, n: p.name, s: p.supplierCode }));
     const boSummary = listBackorders().summary;
-    data = { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes: readHiddenSuppliers(), cycleMarker: getSetting('po_cycle_reset_at') || '' };
+    data = { ...data, pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes: readHiddenSuppliers(), cycleMarker: getSetting('po_cycle_reset_at') || '' };
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
-  const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker } = data;
+  const { pub, overlay, cards, others, searchIndex, boSummary, hiddenCodes, cycleMarker, ruleStats } = data;
+  // 判定ルール v2 (在庫0・注残0 の売れ筋を要発注に含める) で新たに載った件数。旧式との差分を運用者に見せる (Codex R2: 観測可能性)
+  // 差分通知と設定不備通知は別条件 (差分0件でも M 未設定は出す、Codex PR1-R1 Low)
+  const hmmNote = ruleStats.holdMonthsMissing
+    ? `<div class="warn">⚠️ 売れているのに推奨保有月数が未設定で要発注判定ができない商品が ${ruleStats.holdMonthsMissing}件あります (<a href="/apps/purchase-orders/products">全商品情報</a> の「⚠️ 推奨保有月数 未設定」で確認 → NEで設定)</div>`
+    : '';
+  const ruleNote = (ruleStats.rule === 'v1'
+    ? `<div class="warn">⚠️ 要発注判定は旧ルール (v1) で動いています。在庫+注残が0以下の売れ筋 ${ruleStats.addedCount}件 (推奨額 ¥${ruleStats.addedAmount.toLocaleString('ja-JP')}) は要発注に出ません (設定 target_rule)</div>`
+    : (ruleStats.addedCount
+      ? `<div class="sec" style="padding:8px 14px;margin-bottom:4px"><span class="muted">🆕 判定ルール v2 (2026-08-30〜): 在庫+注残が0以下 (在庫切れ) で売れている商品を要発注に含めるようになりました。旧ルールより <b>+${ruleStats.addedCount}件 / 推奨額 +¥${ruleStats.addedAmount.toLocaleString('ja-JP')}</b></span></div>`
+      : '')) + hmmNote;
   // 発注サイクルの経過表示: ✅発注確定済み・×非表示はデータ更新ボタンまで保持される。長く放置したら注意を出す
   let cycleNote = '';
   if (cycleMarker) {
@@ -3615,6 +3664,7 @@ router.get('/', (req, res) => {
     </a>`;
   const body = `
     ${stale ? '<div class="warn">⚠️ PMLデータが古い可能性があります (as_of=' + he(pub ? pub.as_of_date : 'なし') + ')。daily-sync の状態を確認してください。</div>' : ''}
+    ${ruleNote}
     <div class="toolbar">
       <input type="text" id="q" placeholder="商品コード / 商品名で検索 → 仕入先を探す" style="width:340px">
       <span class="muted">${freshNote}</span>
@@ -4991,9 +5041,9 @@ router.get('/products', (req, res) => {
     rows = r.products.map(p => ({
       c: p.code, n: p.name, s: p.supplierCode, a: p.active ? 1 : 0,
       st: p.stock, b: p.backOrder, s7: p.sales7, s30: p.sales30,
-      m: Math.round(p.stockMonths * 100) / 100, hm: p.holdMonths, lo: p.lot,
+      m: p.stockMonths == null ? null : Math.round(p.stockMonths * 100) / 100, hm: p.holdMonths, lo: p.lot,
       co: p.cost, pr: p.price, lp: p.lastPurchase ? String(p.lastPurchase).slice(0, 10) : '',
-      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0,
+      t: p.isTarget ? 1 : 0, h: p.isHorikoshi ? 1 : 0, hmm: p.holdMonthsMissing ? 1 : 0, sd: p.salesDefined ? 1 : 0,
     }));
   } catch (e) { return res.status(500).send('error: ' + he(e.message)); }
 
@@ -5040,6 +5090,8 @@ var COLS = [
 function stateBadge(r) {
   if (!r.a) return '<span class="badge" style="background:#eceff3;color:#64748b">取扱中止</span>';
   if (r.t) return '<span class="badge b-warn">🔴 要発注</span>';
+  // 設定不備は掘り起こしより先に出す (v1 ロールバック中は両方 true になり得る、Codex PR1-R1 Medium)
+  if (r.hmm) return '<span class="badge b-warn" title="売れているのに推奨保有月数が未設定のため要発注判定ができない。NEで推奨保有月数を設定してください">⚠️ 推奨保有月数 未設定</span>';
   if (r.h) return '<span class="badge" style="background:#f4f4f5;color:#52525b">⚪ 掘り起こし</span>';
   return '<span class="badge b-issued">取扱中</span>';
 }
@@ -8760,14 +8812,25 @@ function post(b) {
   var reqTab = TAB;
   fetch('/apps/purchase-orders/api/masters/' + reqTab, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
-  }).then(function(r){ return r.json(); }).then(function(j) {
+  }).then(function(r) {
+    if (r.status === 401) throw new Error('ログインの有効期限が切れています。ページを再読み込みしてログインし直してから、もう一度保存してください');
+    if (r.status === 403) throw new Error('このアプリの編集権限がありません (/admin/permissions で確認)');
+    return r.json().catch(function(){ throw new Error('サーバ応答が不正です (HTTP ' + r.status + ')。ページを再読み込みしてから再度お試しください'); });
+  }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
+      if (j.warning) alert('⚠️ ' + j.warning); // 発注方法の変更で送信前ジョブが取り残される等 (見逃さないよう alert)
       if (reqTab === 'conditions' || reqTab === 'materials') GROUPS = null; // グループ名キャッシュを更新
       if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
       SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
       load();
-    } else toast('エラー: ' + j.error);
+    } else {
+      // 保存失敗は alert で止める (2.8秒のトーストだけだと見逃し、「変えたのに保存されない」に見える。2026-08-31)。
+      // 行の内容はそのまま残るので、直してもう一度「保存」できる
+      alert('❌ 保存できませんでした\\n\\n' + (j.error || '不明なエラー') + '\\n\\n(この行の入力内容はそのまま残っています。指摘された欄を直して、もう一度「保存」を押してください)');
+    }
+  }).catch(function(e) {
+    alert('❌ 保存できませんでした (通信エラー)\\n\\n' + e.message);
   });
 }
 // 初期表示は末尾の setGroup('suppliers') が行う (グループ状態と load を一体で初期化)

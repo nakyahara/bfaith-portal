@@ -38,6 +38,9 @@ const KNOWN = {
   'apps/warehouse/healthcheck.js': { count: 1, job: 'warehouse-healthcheck' },
   'apps/product-hub/intake-cron.js': { count: 1, job: 'ph-ne-intake' },
   'apps/ranking-checker/scheduler.js': { count: 2, job: 'rankcheck-csv-export' }, // 自動チェック(既定OFF) + CSV出力
+  'apps/shohyo-links/attach-job.js': { count: 1, job: 'shohyo-voucher-attach' },
+  'apps/product-links/cron.js': { count: 1, job: 'product-links-reconcile' },
+  'apps/packing/drive-sync.js': { count: 1, job: 'packing-drive-poller' },
 
   // ── 監視の本体 ──
   'apps/jobs-monitor/notify-job.js': { count: 1, exempt: '監視ループ自身 (これが止まれば GAS の見張りが鳴る)' },
