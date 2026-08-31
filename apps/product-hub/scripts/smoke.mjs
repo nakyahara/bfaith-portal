@@ -3078,6 +3078,11 @@ let wfSetParentId = null;
   check('画像ビュー: 詳細対象外の商品はカードにならない (画像の作業が無い)',
     !ibEx.columns.some((c) => c.cards.some((x) => x.id === idKfx))
     && !ibEx.doneCards.some((x) => x.id === idKfx));
+  // 候補 (LIMIT) も食わないこと (Codex R1 medium: 食うと実際に作業がある商品がボードから欠ける)
+  check('画像ビュー: 詳細対象外は候補 (total) にも数えない',
+    ibEx.total === wfpEarly.boardData(db, { view: 'image' }).total
+    && ibEx.total < wfpEarly.boardData(db, { view: 'main' }).total,
+    `image=${ibEx.total} main=${wfpEarly.boardData(db, { view: 'main' }).total}`);
   db.prepare('DELETE FROM product_drafts WHERE id = ?').run(idKfx);
 
   // ─── 画像工程 v2 (2026-08-26): 詳細系列 ①〜⑨ ───

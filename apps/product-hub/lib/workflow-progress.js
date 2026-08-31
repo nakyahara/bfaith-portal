@@ -1158,7 +1158,9 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     )`;
   }
 
-  // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)
+  // 保留・除外は工程の外に退避している状態なので、ボードには載せない (列が汚れる)。
+  // 画像ビューでは「詳細画像は対象外」の商品も候補から外す (Codex R1 medium): 画像の工程は
+  // 詳細 (LP) の 1 本なのでカードにならず、候補に残すと LIMIT を食って実際に作業がある商品が欠ける
   const drafts = db.prepare(`
     SELECT d.id, d.ne_code, d.name, d.status, d.created_at, d.updated_at, d.detail_images_excluded, d.image_priority, d.own_brand,
       d.generation_block_code, d.generation_block_reason,
@@ -1174,7 +1176,7 @@ export function boardData(db, { view = 'main', assigneeId = null, unassignedOnly
     WHERE d.status NOT IN ('on_hold', 'excluded')
     ${candidateSql}
     ${checkingOnly ? 'AND d.checking_since IS NOT NULL' : ''}
-    ${kindSafe === 'detail' ? 'AND d.detail_images_excluded = 0' : ''}
+    ${view === 'image' ? 'AND d.detail_images_excluded = 0' : ''}
     ORDER BY d.updated_at DESC
     LIMIT ?
   `).all(...candidateParams, limit + 1);
