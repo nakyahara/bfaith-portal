@@ -170,14 +170,11 @@
 
   <%
     // 画像トラック (TOP/詳細) のミニステッパー。どちらのビューでも同じものをカードに出す
+    // 2026-08-31: TOP の工程は廃止したので、カードに出すのは商品詳細 (LP) の 1 行だけ。
+    // 'top' を残すと工程が無いカードに「TOP —」が出続ける (Codex R4 low)
     const imgTrackRows = (c) => {
-      const rows = [];
-      for (const kind of ['top', 'detail']) {
-        const t = c.image && c.image[kind];
-        if (!t) continue;
-        rows.push({ kind, t });
-      }
-      return rows;
+      const t = c.image && c.image.detail;
+      return t ? [{ kind: 'detail', t }] : [];
     };
   %>
 
@@ -262,7 +259,7 @@
               <div class="kb-imgtracks">
                 <% for (const { kind, t } of imgTrackRows(c)) { %>
                   <div class="kb-krow">
-                    <span class="kb-kname"><%= kind === 'top' ? 'TOP' : '詳細' %></span>
+                    <span class="kb-kname">画像</span>
                     <% if (t.excluded) { %>
                       <span class="kb-klabel excluded">対象外</span>
                     <% } else { %>

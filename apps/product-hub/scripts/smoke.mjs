@@ -2657,6 +2657,7 @@ let wfSetParentId = null;
     check('ボード: カードに詳細のステッパーが付く (v2 の 10 点・TOP は工程を持たない)',
       card.image?.top?.steps?.length === 0 && card.image?.detail?.steps?.length === 10,
       JSON.stringify(card.image || null).slice(0, 120));
+
   }
 
   // 画像ビュー: 列は商品詳細 (LP) の 10 段階。カードは 1 商品 1 枚 (2026-08-31 TOP工程の廃止)
@@ -5091,6 +5092,10 @@ for (const [name, file, data] of renders) {
 // ─── 確認中が画面に出ていること (2026-08-31 スタッフ要望の本体は「カードに表示」) ───
 {
   const bh = renderedHtml.get('board.ejs') || '';
+  // 廃止した TOP の行をカードに出さない (Codex R4 low)
+  check('ボード: カードに廃止した TOP の行を出さない',
+    !bh.includes('>TOP<'),
+    (bh.match(/<span class="kb-kname">[^<]*<\/span>/g) || []).slice(0, 4).join(' ') || '(行が無い)');
   check('ボード: 確認中のカードに理由ラベルが出る',
     bh.includes('kb-checking') && bh.includes('🔍 確認中: パッケージ裏面の確認待ち'),
     bh.includes('kb-checking') ? 'ラベル文言が出ていない' : 'バッジ自体が無い');
