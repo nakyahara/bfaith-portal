@@ -213,4 +213,3 @@ export function aggregate(resolvedRows) {
     mfColumns,
   };
 }
-

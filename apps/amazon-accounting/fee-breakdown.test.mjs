@@ -162,15 +162,21 @@ test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・�
 });
 
 // ─── 実CSVでの受け入れ確認 (要件定義 §7 の期待値) ───
-// 本番と同じ parsePaymentCsvText() を使う。SKU解決は DB 不要のダミー (SKUあり=direct/分類1, SKUなし=no_sku, 振込み=skip)
+// 本番と同じ parsePaymentCsvText() を使う。SKU解決 (router.js resolveSkus) は DB が必要なので、ここでは
+//   ・マスタ非依存の経路 (振込み → skip / 注文外料金 → no_sku (SKUがあってもマスタ照合しない) / SKU空欄 → no_sku) を本番どおり再現し、
+//   ・マスタ依存の経路 (Stage 1/2・調整・未解決) は「全て解決済み・売上分類1」に固定する。
+// この前提では other 行 = SKUなし行 (+注文外料金) だけになり、その既存列 (手数料 / FBA手数料 / トランザクション他 / その他 / 合計) が
+// 本番画面 (2026-07 スクリーンショット) の other 行と一致することを確認済み。商品行の分類は本テストの検証対象外。
 function loadResolved(file) {
   const { headerIdx, rows } = parsePaymentCsvText(fs.readFileSync(file, 'utf-8'));
   assert.ok(headerIdx >= 0, 'header not found: ' + file);
+  const noMaster = { 商品コード: null, 売上分類: null, 税率: null, 原価: 0 };
   return rows.map(r => {
     const tx = r.トランザクション種類;
-    if (tx === '振込み') return { ...r, 解決方法: 'skip', 売上分類: null, 税率: null, 原価: 0 };
-    if (!r.sku) return { ...r, 解決方法: 'no_sku', 売上分類: null, 税率: null, 原価: 0 };
-    return { ...r, 解決方法: 'direct', 売上分類: 1, 税率: 10, 原価: 0 };
+    if (tx === '振込み') return { ...r, ...noMaster, 解決方法: 'skip' };
+    if (tx === '注文外料金') return { ...r, ...noMaster, 解決方法: 'no_sku' };
+    if (!r.sku) return { ...r, ...noMaster, 解決方法: 'no_sku' };
+    return { ...r, 商品コード: r.sku, 解決方法: 'direct', 売上分類: 1, 税率: 10, 原価: 0 };
   });
 }
 
@@ -179,12 +185,15 @@ const REAL_CASES = [
   // other 行の既存列 (手数料 / FBA手数料 / その他 / 合計) は本番画面 (2026-07 スクリーンショット) の other 行と一致する値
   { file: '2026JulMonthlyTransaction.csv', easy: -2303252, easyRows: 12890, storage: -303905, long: -101496,
     other: { 手数料: -2303252, FBA手数料: -480710, トランザクション他: 0, その他: 25019, 合計: -2758943 } },
+  // 6月は本番画面と未照合の回帰アンカー (同じパーサ+ダミー解決で採取)。FBA手数料 −319 には SKU付き注文外料金 (納品不備手数料 −51) を含む = 本番と同じ経路
   { file: '2026JunMonthlyTransaction.csv', easy: -1276326, easyRows: 7317, storage: -283754, long: -102696,
-    other: { 手数料: -203194, FBA手数料: -268, トランザクション他: -1073132, その他: -418237, 合計: -1694831 } },
+    other: { 手数料: -203194, FBA手数料: -319, トランザクション他: -1073132, その他: -418237, 合計: -1694882 } },
 ];
 for (const c of REAL_CASES) {
-  const file = CSV_DIR ? path.join(CSV_DIR, c.file) : null;
-  test('実CSV ' + c.file + ' の手数料内訳が要件定義 §7 の期待値と一致', { skip: !(file && fs.existsSync(file)) && 'AMAZON_PAYMENT_CSV_DIR 未指定またはCSVなし' }, () => {
+  // env 未指定のときだけ skip。指定したのにファイルが無い場合は fail (回帰検査が走らないまま green になるのを防ぐ)
+  test('実CSV ' + c.file + ' の手数料内訳が要件定義 §7 の期待値と一致', { skip: !CSV_DIR && 'AMAZON_PAYMENT_CSV_DIR 未指定' }, () => {
+    const file = path.join(CSV_DIR, c.file);
+    assert.ok(fs.existsSync(file), 'AMAZON_PAYMENT_CSV_DIR は指定されたがCSVが無い: ' + file);
     const r = aggregate(loadResolved(file));
     const other = r.bySegment.other;
     assert.equal(Math.round(other[EASY]), c.easy);

@@ -38,6 +38,24 @@ function csvCell(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
+// ─── ヒストリカル投入 (import-history) の検証 ───
+// 履歴画面は year_month とセグメントキーを innerHTML に出すため、投入経路でも形を固定する (Codex 2巡目 high)。
+// セグメントキーは 1/2/3/other のみ、行の値は有限数のみ (文字列は捨てる)
+const ALLOWED_SEGMENT_KEYS = new Set(['1', '2', '3', 'other']);
+function sanitizeSegmentJson(input) {
+  const out = {};
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
+  for (const [k, v] of Object.entries(input)) {
+    if (!ALLOWED_SEGMENT_KEYS.has(k) || !v || typeof v !== 'object' || Array.isArray(v)) continue;
+    const row = {};
+    for (const [c, n] of Object.entries(v)) {
+      if (typeof n === 'number' && Number.isFinite(n)) row[c] = n;
+    }
+    out[k] = row;
+  }
+  return out;
+}
+
 // ─── CSV解析 ───
 
 function parseCsvBuffer(buf) {
@@ -614,7 +632,7 @@ function renderPage() {
 
       // 概要
       let summaryHtml = '<div class="' + (data.canConfirm ? 'ok' : 'warn') + '">';
-      summaryHtml += '<b>対象年月: ' + data.yearMonth + '</b><br>';
+      summaryHtml += '<b>対象年月: ' + esc(data.yearMonth) + '</b><br>';
       summaryHtml += '総行数: ' + data.totalRows + ' / SKU解決済: ' + data.resolvedCount + ' / 未登録SKU: ' + data.unresolvedSkus.length + '件';
       if (data.unresolvedTax && data.unresolvedTax.length > 0) summaryHtml += ' / <span class="negative">税率未登録: ' + data.unresolvedTax.length + '商品</span>';
       if (data.conflicts && data.conflicts.length > 0) summaryHtml += ' / <span class="negative">セット解決エラー: ' + data.conflicts.length + '件</span>';
@@ -629,7 +647,7 @@ function renderPage() {
       summaryHtml += '</div>';
       // 確定済みの月を再アップロードした場合 (過去月の再集計): 上書き注意 + 広告費を前回値でプリフィル
       if (data.existing) {
-        summaryHtml += '<div class="warn">📌 <b>' + data.yearMonth + ' は確定済みです</b>（' + esc(data.existing.confirmed_at || '') + '・広告費 ¥' + Math.round(data.existing.ad_cost || 0).toLocaleString() + '）。'
+        summaryHtml += '<div class="warn">📌 <b>' + esc(data.yearMonth) + ' は確定済みです</b>（' + esc(data.existing.confirmed_at || '') + '・広告費 ¥' + Math.round(data.existing.ad_cost || 0).toLocaleString() + '）。'
           + 'このまま「確定」すると前回の集計を上書きします。広告費欄には前回の値を入れてあります。</div>';
       }
       // 広告費欄: 月が変わったら existing ? 前回値 : 0 に明示リセット (前の月のプリフィル値が別の月の按分・確定に流れるのを防ぐ)。
@@ -862,7 +880,7 @@ function renderPage() {
       let totalAd = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
-        segHtml += '<tr><td>' + key + ': ' + label + '</td>';
+        segHtml += '<tr><td>' + esc(key) + ': ' + esc(label) + '</td>';
         cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
         segHtml += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         totalAd += (adByKey[key] || 0);
@@ -887,7 +905,7 @@ function renderPage() {
           if (row.行数 > 0) {
             const label = lastData.excludedNames[key] || key;
             exclHtml += '<div class="excluded">';
-            exclHtml += '<b>除外: ' + key + ': ' + label + '</b>（' + row.行数 + '行）';
+            exclHtml += '<b>除外: ' + esc(key) + ': ' + esc(label) + '</b>（' + row.行数 + '行）';
             exclHtml += ' — 商品売上: ' + fmt(row['商品売上']) + ' / 合計: ' + fmt(row['合計']) + ' / 原価合計: ' + fmt(row.原価合計);
             exclHtml += '</div>';
           }
@@ -1013,10 +1031,10 @@ function renderPage() {
           for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += (sr['合計'] || 0); }
 
           html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
-          html += '<span><b>' + row.year_month + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
+          html += '<span><b>' + esc(row.year_month) + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
             + ' / 合計: \\u00a5' + Math.round(hdrTotal).toLocaleString()
             + (ad ? ' / 広告費: \\u00a5' + ad.toLocaleString() : '')
-            + ' <span class="meta">（' + (row.confirmed_at || '') + '）</span></span>';
+            + ' <span class="meta">（' + esc(row.confirmed_at || '') + '）</span></span>';
           html += '<span class="arrow">&#9654;</span></div>';
           html += '<div class="acc-body" id="acc-' + i + '">';
 
@@ -1072,7 +1090,7 @@ function renderPage() {
           let sTot = {}; segCols.forEach(c => sTot[c] = 0); FEE_COLUMNS.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; let sAdTot = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
-            html += '<tr><td>' + key + ': ' + lb + '</td>';
+            html += '<tr><td>' + esc(key) + ': ' + esc(lb) + '</td>';
             segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
             html += '<td class="num">' + fmt(hAd[key] || 0) + '</td>';
             sAdTot += (hAd[key] || 0);
@@ -1093,7 +1111,7 @@ function renderPage() {
           const excl = row.excluded || {};
           for (const [ek, er] of Object.entries(excl)) {
             if ((er.行数 || 0) > 0) {
-              html += '<div class="excluded"><b>除外: ' + ek + ': 輸出</b>（' + er.行数 + '行） — 商品売上: ' + fmt(er['商品売上'] || 0) + ' / 合計: ' + fmt(er['合計'] || 0) + '</div>';
+              html += '<div class="excluded"><b>除外: ' + esc(ek) + ': 輸出</b>（' + er.行数 + '行） — 商品売上: ' + fmt(er['商品売上'] || 0) + ' / 合計: ' + fmt(er['合計'] || 0) + '</div>';
             }
           }
 
@@ -1446,18 +1464,23 @@ router.post('/import-history', requireImportKey('IMPORT_KEY_AMAZON'), importJson
       VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
 
     let inserted = 0;
+    const skipped = [];
     const tx = db.transaction(() => {
       for (const m of months) {
+        // year_month は 'YYYY-MM' に正規化できるものだけ受け付ける (履歴画面の innerHTML に入るため)
+        const ym = normalizeYearMonth(m && m.yearMonth);
+        if (!ym) { skipped.push({ yearMonth: m && m.yearMonth, reason: 'invalid_year_month' }); continue; }
+        const adCost = Number.isFinite(Number(m.adCost)) ? Number(m.adCost) : 0;
         const r = stmt.run(
-          m.yearMonth, 0, 0, 0,
-          '{}', JSON.stringify(m.bySegment || {}), '{}', '{}',
-          m.adCost || 0, now, 'historical-import'
+          ym, 0, 0, 0,
+          '{}', JSON.stringify(sanitizeSegmentJson(m.bySegment)), '{}', '{}',
+          adCost, now, 'historical-import'
         );
         if (r.changes > 0) inserted++;
       }
     });
     tx();
-    res.json({ ok: true, inserted, total: months.length });
+    res.json({ ok: true, inserted, total: months.length, skipped });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
