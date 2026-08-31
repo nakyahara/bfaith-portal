@@ -76,9 +76,20 @@ export function emailSettings() {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** カンマ/セミコロン/読点区切りの宛先文字列 → 検証済み配列 */
+/** 全角英数字・記号 (＠．－＜＞ 等) → 半角。マスタ画面への日本語IME入力の取りこぼし対策 */
+export function toHalfWidth(s) {
+  return String(s == null ? '' : s)
+    .replace(/[！-～]/g, ch => String.fromCharCode(ch.charCodeAt(0) - 0xFEE0))
+    .replace(/　/g, ' ');
+}
+
+/** カンマ/セミコロン/読点区切りの宛先文字列 → 検証済み配列。「名前 <addr>」形式はアドレス部だけ採る */
 export function parseAddresses(s) {
-  const list = trimS(s).split(/[,;、]/).map(x => x.trim()).filter(Boolean);
+  const list = toHalfWidth(s).split(/[,;、]/).map(x => {
+    const t = x.trim();
+    const m = t.match(/<([^<>]+)>\s*$/); // 築山 <ken@example.jp> → ken@example.jp (メーラーからのコピペ)
+    return (m ? m[1] : t).trim();
+  }).filter(Boolean);
   for (const a of list) if (!EMAIL_RE.test(a)) throw new Error(`メールアドレスが不正です: ${a}`);
   return list;
 }
@@ -92,7 +103,8 @@ export function parseAddresses(s) {
 export function normalizeFaxNumber(s) {
   const t = trimS(s);
   if (!t) return null;
-  const digits = t.replace(/[-−ー()（）\s]/g, '');
+  // 全角数字・記号も受ける (０６－…)。区切りは ハイフン類/括弧/空白/ドット
+  const digits = toHalfWidth(t).replace(/[-−ー‐–—()（）.\s]/g, '');
   if (!/^0\d{9,10}$/.test(digits)) {
     throw new Error(`FAX番号が不正です: ${t} (0始まりの10〜11桁で入力してください。例: 06-1234-5678)`);
   }

@@ -2389,8 +2389,13 @@ const MASTER_DEFS = {
       if (!r.supplier_code) return '仕入先コード必須';
       if (!r.name) return '仕入先名必須';
       if (r.send_method && !['email', 'fax', 'web', 'relay', 'email_pdf', 'none'].includes(r.send_method)) return '送信方法は email/fax/web/relay/email_pdf/none';
-      if (r.fax_number) { try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; } }
-      if (r.send_method === 'fax' && !r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
+      // FAX番号の書式は「発注方法=FAX」のときだけ保存を止める。それ以外の発注方法では、FAX欄の書式不備で
+      // 行全体 (発注方法の変更など) が保存できなくなる方が害が大きい (2026-08-31 フォーユー: 発注方法を
+      // 変えても保存されない → 実際は行内の別欄の検証エラー)。不備は warning で返す (POST 側)
+      if (r.send_method === 'fax') {
+        if (!r.fax_number) return '発注方法がFAXの場合はFAX番号を入力してください';
+        try { normalizeFaxNumber(r.fax_number); } catch (e) { return e.message; }
+      }
       if (r.send_method === 'relay' && !r.relay_to) return '発注方法が社内転送の場合は社内転送先メールアドレスを入力してください';
       if (r.lead_days != null && (!Number.isInteger(r.lead_days) || r.lead_days < 0)) return 'リードタイムは0以上の整数';
       return null;
@@ -2615,6 +2620,11 @@ router.post('/api/masters/:kind', (req, res) => {
             'これらは作成時の添付のままなので送信時に自動で止まります。発注書メールパネルで「取消」し、新規に送信し直してください';
         }
       }
+    }
+    // FAX番号の書式不備は 発注方法≠FAX なら保存を止めず warning (validate 参照)
+    if (req.params.kind === 'suppliers' && row.fax_number && row.send_method !== 'fax') {
+      try { normalizeFaxNumber(row.fax_number); }
+      catch (e) { warning = (warning ? warning + '\n\n' : '') + `保存しましたが、${e.message} — 発注方法をFAXに切り替える前に直してください`; }
     }
     upsertMasterRow(def, row);
     res.json({ ok: true, ...(warning ? { warning } : {}) });
@@ -8780,7 +8790,11 @@ function post(b) {
   var reqTab = TAB;
   fetch('/apps/purchase-orders/api/masters/' + reqTab, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b),
-  }).then(function(r){ return r.json(); }).then(function(j) {
+  }).then(function(r) {
+    if (r.status === 401) throw new Error('ログインの有効期限が切れています。ページを再読み込みしてログインし直してから、もう一度保存してください');
+    if (r.status === 403) throw new Error('このアプリの編集権限がありません (/admin/permissions で確認)');
+    return r.json().catch(function(){ throw new Error('サーバ応答が不正です (HTTP ' + r.status + ')。ページを再読み込みしてから再度お試しください'); });
+  }).then(function(j) {
     if (j.ok) {
       toast('保存しました');
       if (j.warning) alert('⚠️ ' + j.warning); // 発注方法の変更で送信前ジョブが取り残される等 (見逃さないよう alert)
@@ -8788,7 +8802,13 @@ function post(b) {
       if (TAB !== reqTab) return; // 別タブへ移動済みなら再描画しない (戻ったときのloadで最新化される)
       SCROLL_RESTORE = { tab: reqTab, y: window.scrollY }; // 再描画後も同じ位置・同じフィルタで作業を続けられるように (中原さん要望)
       load();
-    } else toast('エラー: ' + j.error);
+    } else {
+      // 保存失敗は alert で止める (2.8秒のトーストだけだと見逃し、「変えたのに保存されない」に見える。2026-08-31)。
+      // 行の内容はそのまま残るので、直してもう一度「保存」できる
+      alert('❌ 保存できませんでした\\n\\n' + (j.error || '不明なエラー') + '\\n\\n(この行の入力内容はそのまま残っています。指摘された欄を直して、もう一度「保存」を押してください)');
+    }
+  }).catch(function(e) {
+    alert('❌ 保存できませんでした (通信エラー)\\n\\n' + e.message);
   });
 }
 // 初期表示は末尾の setGroup('suppliers') が行う (グループ状態と load を一体で初期化)
