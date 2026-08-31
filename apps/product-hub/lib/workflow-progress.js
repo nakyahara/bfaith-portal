@@ -581,9 +581,12 @@ export function imageTrackBlockReason(db, draftId) {
   // TOP画像は**工程ではなく画像が登録されているか**で見る (2026-08-31 中原さん決定 A)。
   // 工程は商品詳細 (LP) に一本化し、TOP の 4 工程は廃止した (RETIRED_TOP_STEP_CODES)。
   // サムネイル無しの楽天出品はありえないので、ここは引き続き fail-closed で止める
-  const hasImage = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? LIMIT 1').get(Number(draftId));
-  if (!hasImage) {
-    return 'TOP画像 (サムネイル) が登録されていません。画像タブの「画像フォルダから自動セット」で取り込んでください';
+  // **枠1 (sort=0) がある**ことを見る (Codex R6 high): 画像が 1 行あるだけだと、
+  // _top が無くて _01 だけ取り込まれた商品 (sort=1〜) が素通りする。
+  // 枠1 = <商品コード>_top で、これが楽天のサムネイルになる (rakuten-listing の判定と同じ)
+  const hasTopImage = db.prepare('SELECT 1 FROM draft_images WHERE draft_id = ? AND sort = 0 LIMIT 1').get(Number(draftId));
+  if (!hasTopImage) {
+    return 'TOP画像 (サムネイル) が登録されていません。画像フォルダに「_top」を置いて「フォルダから自動セット」で取り込んでください';
   }
   // 詳細側は fail-closed (Codex R2 high): 対象外にしていないのに工程が 0 件なら
   // 「揃っている」ではなく「設定が壊れている」— ここで通すと詳細画像の確認が丸ごと飛ぶ

@@ -1369,11 +1369,17 @@ export function retireTopImageSteps(db) {
   `).run();
   // 説明文も直す (Codex R5 low)。シードは INSERT OR IGNORE なので、既存 DB には
   // 「TOP側工程も自動完了」という**もう起きない動作**の説明が残ってしまう
-  const fixDesc = db.prepare('UPDATE ph_steps SET description = ? WHERE code = ? AND description <> ?');
-  for (const [code, desc] of [
-    ['imgd_design', '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)'],
-    ['imgd_review_2', '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く'],
-  ]) fixDesc.run(desc, code, desc);
+  // **旧文言に完全一致するときだけ**置き換える (Codex R6 low): 「新文言と違えば上書き」だと、
+  // 管理画面で書き換えた独自の説明が毎起動で消える
+  const fixDesc = db.prepare('UPDATE ph_steps SET description = ? WHERE code = ? AND description = ?');
+  for (const [code, oldDesc, newDesc] of [
+    ['imgd_design',
+      '⑤ AI 画像を修正 + TOP画像制作 (完了で TOP 側の 依頼/制作/登録 も自動で済みになる)',
+      '⑤ AI 画像を修正 + TOP画像制作 (TOP と LP は同時進行で作る)'],
+    ['imgd_review_2',
+      '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で TOP 側の承認も自動で済みになる = 楽天出品ゲートが開く',
+      '⑥-2 最終確認 (田中確認の後にしか完了できない)。完了で楽天出品ゲートが開く'],
+  ]) fixDesc.run(newDesc, code, oldDesc);
   if (info.changes > 0) {
     console.log(`[product-hub] TOP画像の工程 ${info.changes} 件を無効化しました (画像工程は詳細に一本化)`);
   }

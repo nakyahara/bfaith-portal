@@ -2010,6 +2010,11 @@ const wf = await import('../lib/workflow.js');
     check('起動時: 古い工程説明 (TOP側も自動完了) を直す',
       !/TOP 側の/.test(db.prepare(`SELECT description FROM ph_steps WHERE code = 'imgd_design'`).get()?.description || ''),
       db.prepare(`SELECT description FROM ph_steps WHERE code = 'imgd_design'`).get()?.description);
+    // 管理画面で書き換えた独自の説明は消さない (Codex R6 low: 旧文言に一致するときだけ置換)
+    db.prepare(`UPDATE ph_steps SET description = '現場で書き換えた説明' WHERE code = 'imgd_design'`).run();
+    dbmod.retireTopImageSteps(db);
+    check('起動時: 管理画面で書き換えた説明は上書きしない',
+      db.prepare(`SELECT description FROM ph_steps WHERE code = 'imgd_design'`).get()?.description === '現場で書き換えた説明');
     for (const code of ['step_legacy_top', 'step_legacy_nokind']) {
       let revive = null;
       try { wf.updateStep(code, { active: true }); } catch (e) { revive = e; }
@@ -2310,6 +2315,13 @@ let wfDraftId = null;
     check('画像が 1 枚も無ければゲートは開かない (TOP画像は楽天出品に必須)',
       /TOP画像 \(サムネイル\) が登録されていません/.test(wfp.imageTrackBlockReason(db, idGate) || ''),
       wfp.imageTrackBlockReason(db, idGate));
+    // 枠1 (sort=0 = <商品コード>_top) が無ければ通さない (Codex R6 high):
+    // _top を入れ忘れて _01 だけ取り込んだ商品が素通りすると、別の画像がサムネイルになる
+    db.prepare(`INSERT INTO draft_images (draft_id, drive_file_id, sort) VALUES (?, 'gate-img-nz', 1)`).run(idGate);
+    check('枠1 (_top) が無ければゲートは開かない (_01 だけでは通さない)',
+      /TOP画像 \(サムネイル\) が登録されていません/.test(wfp.imageTrackBlockReason(db, idGate) || ''),
+      wfp.imageTrackBlockReason(db, idGate));
+    db.prepare(`DELETE FROM draft_images WHERE draft_id = ? AND drive_file_id = 'gate-img-nz'`).run(idGate);
     const ins = db.prepare('INSERT INTO draft_images (draft_id, drive_file_id) VALUES (?, ?)');
     for (const i of imgs) ins.run(idGate, i.drive_file_id);
   }
