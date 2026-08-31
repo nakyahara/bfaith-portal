@@ -1,4 +1,4 @@
-// 手数料内訳（説明別）の判定・集計テスト
+// 手数料内訳（説明別）の判定・CSV解析・集計テスト（router.js は import しない = express/multer/sqlite の副作用なし）
 //   node --test apps/amazon-accounting/fee-breakdown.test.mjs
 // 実CSVでの受け入れ確認 (任意): 環境変数 AMAZON_PAYMENT_CSV_DIR にペイメントレポートCSVのあるフォルダを渡す
 //   例: AMAZON_PAYMENT_CSV_DIR=C:/Users/info/Downloads node --test apps/amazon-accounting/fee-breakdown.test.mjs
@@ -6,7 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { aggregate, classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS } from './router.js';
+import { classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS } from './fee-breakdown.js';
+import { parsePaymentCsvText, aggregate } from './payment-csv.js';
 
 const EASY = 'Amazon Easy Ship料金';
 const STORAGE = 'FBA在庫保管手数料';
@@ -14,10 +15,13 @@ const LONG = 'FBA長期在庫保管手数料';
 
 const noSku = (desc, extra = {}) => ({ sku: '', 説明: desc, 解決方法: 'no_sku', 合計: 0, ...extra });
 
-test('normalizeFeeDesc: 末尾コロン(半角/全角)と空白を除去し小文字化', () => {
+test('normalizeFeeDesc: 末尾コロン(半角/全角)・空白・全角英数・NBSP を正規化し小文字化', () => {
   assert.equal(normalizeFeeDesc('FBA在庫保管手数料:'), 'fba在庫保管手数料');
   assert.equal(normalizeFeeDesc('FBA在庫保管手数料：'), 'fba在庫保管手数料');
   assert.equal(normalizeFeeDesc('  Amazon Easy Ship料金 '), 'amazon easy ship料金');
+  assert.equal(normalizeFeeDesc('Ａｍａｚｏｎ　Ｅａｓｙ　Ｓｈｉｐ料金'), 'amazon easy ship料金'); // 全角英数・全角空白
+  assert.equal(normalizeFeeDesc('Amazon Easy\u00a0Ship料金'), 'amazon easy ship料金');            // NBSP
+  assert.equal(normalizeFeeDesc('Amazon  Easy   Ship料金'), 'amazon easy ship料金');               // 連続空白
   assert.equal(normalizeFeeDesc(null), '');
 });
 
@@ -27,9 +31,13 @@ test('classifyFeeRow: 月ごとの表記ゆれを全て拾う', () => {
   // 6月: 2種の別名
   assert.equal(classifyFeeRow(noSku('Amazon Easy Shipの発送重量手数料')), EASY);
   assert.equal(classifyFeeRow(noSku('Easy Ship発送重量手数料')), EASY);
+  // 全角・NBSP 表記
+  assert.equal(classifyFeeRow(noSku('Ａｍａｚｏｎ Ｅａｓｙ Ｓｈｉｐ料金')), EASY);
+  assert.equal(classifyFeeRow(noSku('Amazon Easy\u00a0Ship料金')), EASY);
   // 在庫保管 (通常 / 取り消し・訂正のコロン付き)
   assert.equal(classifyFeeRow(noSku('FBA在庫保管手数料')), STORAGE);
   assert.equal(classifyFeeRow(noSku('FBA在庫保管手数料:')), STORAGE);
+  assert.equal(classifyFeeRow(noSku('FBA在庫保管手数料：')), STORAGE);
   // 長期は在庫保管より先に排他判定
   assert.equal(classifyFeeRow(noSku('FBA長期在庫保管手数料')), LONG);
 });
@@ -37,18 +45,59 @@ test('classifyFeeRow: 月ごとの表記ゆれを全て拾う', () => {
 test('classifyFeeRow: 対象外の行は null', () => {
   assert.equal(classifyFeeRow(noSku('FBA在庫の返送手数料：')), null);
   assert.equal(classifyFeeRow(noSku('月額登録料')), null);
+  assert.equal(classifyFeeRow(noSku('購入者の再課金：')), null);
   assert.equal(classifyFeeRow(noSku('')), null);
-  // SKUあり行は商品名なので判定しない (商品名に Easy Ship が入っても拾わない)
+  assert.equal(classifyFeeRow(noSku('   ')), null);
+  // SKUあり行は商品名なので判定しない (商品名に Easy Ship / 在庫保管 が入っても拾わない)
   assert.equal(classifyFeeRow({ sku: 'abc-easy-ship', 説明: 'Easy Ship 対応 ○○', 解決方法: 'direct' }), null);
+  assert.equal(classifyFeeRow({ sku: 'x1', 説明: 'FBA在庫保管手数料', 解決方法: 'direct' }), null);
   // 振込みは対象外
   assert.equal(classifyFeeRow({ sku: '', 説明: 'Easy Ship', 解決方法: 'skip' }), null);
   assert.equal(classifyFeeRow(null), null);
 });
 
-test('aggregate: 内訳列は other 行に入り、既存列・合計は変わらない', () => {
+test('parsePaymentCsvText: メタ行の後のヘッダーを動的検出し、引用符内カンマ・桁区切り・時刻付き日付を処理', () => {
+  const hdr = ['日付/時間','決済番号','トランザクションの種類','注文番号','SKU','説明','数量','Amazon 出品サービス','フルフィルメント','市町村','都道府県','郵便番号','税金徴収型',
+    '商品売上','商品の売上税','配送料','配送料の税金','ギフト包装手数料','ギフト包装クレジットの税金','Amazonポイントの費用','プロモーション割引額','プロモーション割引の税金',
+    '源泉徴収税を伴うマーケットプレイス','手数料','FBA 手数料','トランザクションに関するその他の手数料','その他','合計','トランザクションのステータス','トランザクション開始日'];
+  const q = a => a.map(v => '"' + v + '"').join(',');
+  const lines = [
+    '"Amazon 出品サービス、フルフィルメント by Amazon (FBA)"', '"指定のない場合、単位は円"', '"定義："', '"日付/時刻：..."', '', // 空行も混ぜる
+    q(hdr),
+    q(['2026/07/03 12:34:56 JST','123','注文','249-1','SKU-A','商品, カンマ入り','2','','','','','','','1,200','120','0','0','0','0','0','-100','-10','','-150','-300','0','0','760','支払い実行済み','2026/07/01']),
+    q(['2026/07/31 23:59:59 JST','123','Amazon手数料','','','Amazon Easy Ship料金','','','','','','','','0','0','0','0','0','0','0','0','0','','-180','0','0','0','-180','支払い実行済み','2026/07/31']),
+    '',
+  ];
+  const { headerIdx, rows } = parsePaymentCsvText(lines.join('\r\n'));
+  assert.equal(headerIdx, 5);
+  assert.equal(rows.length, 2);
+  const r0 = rows[0];
+  assert.equal(r0.日付, '2026/07/03');
+  assert.equal(r0.トランザクション種類, '注文');
+  assert.equal(r0.sku, 'sku-a'); // 小文字化
+  assert.equal(r0.説明, '商品, カンマ入り');
+  assert.equal(r0.数量, 2);
+  assert.equal(r0.商品売上, 1200); // 桁区切り除去
+  assert.equal(r0.プロモーション割引額, -100);
+  assert.equal(r0.手数料, -150);
+  assert.equal(r0.FBA手数料, -300);
+  assert.equal(r0.合計, 760);
+  const r1 = rows[1];
+  assert.equal(r1.sku, '');
+  assert.equal(r1.説明, 'Amazon Easy Ship料金');
+  assert.equal(r1.数量, 0);
+  assert.equal(r1.手数料, -180);
+  assert.equal(r1.合計, -180);
+  // ヘッダー未検出
+  assert.deepEqual(parsePaymentCsvText('a,b,c\n1,2,3\n'), { headerIdx: -1, rows: [] });
+});
+
+test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・税率別・除外は変わらない', () => {
   const rows = [
     // 商品行 (自社商品)
     { sku: 'a1', 説明: '商品A', 解決方法: 'direct', 売上分類: 1, 税率: 10, 原価: 100, 数量: 2, 商品売上: 1000, 手数料: -100, 合計: 900 },
+    // 輸出 (除外セグメント)
+    { sku: 'e1', 説明: '商品E', 解決方法: 'direct', 売上分類: 4, 税率: 10, 原価: 50, 数量: 1, 商品売上: 500, 合計: 500 },
     // Easy Ship (7月形式: 手数料列に入る)
     noSku('Amazon Easy Ship料金', { トランザクション種類: 'Amazon手数料', 手数料: -150, 合計: -150 }),
     noSku('Amazon Easy Ship料金', { トランザクション種類: 'Amazon手数料', 手数料: -250, 合計: -250 }),
@@ -78,15 +127,25 @@ test('aggregate: 内訳列は other 行に入り、既存列・合計は変わ�
   assert.equal(other['FBA手数料'], -1300);
   assert.equal(other['その他'], 50);     // 1000 - 900 - 50
   assert.equal(other['合計'], -1825);
-  // 商品セグメントは 0
+  assert.equal(other.行数, 8);
+  // 商品セグメントは内訳 0・既存値そのまま
   const seg1 = r.bySegment['1'];
   assert.equal(seg1[EASY], 0); assert.equal(seg1[STORAGE], 0); assert.equal(seg1[LONG], 0);
-  assert.equal(seg1['合計'], 900);
-  // 税率別・除外の行にも列が生えている (0)
-  assert.equal(r.byTax['10'][EASY], -575); // no_sku 行は 10% 扱いで税率別にも入る (既存仕様)
-  assert.equal(r.excluded['4'][EASY], 0);
+  assert.equal(seg1['合計'], 900); assert.equal(seg1.原価合計, 200);
+  // 税率別・除外の行には内訳キーを生やさない (DB の by_tax / excluded JSON を汚さない)
+  for (const row of [r.byTax['10'], r.byTax['8'], r.excluded['4']]) {
+    for (const c of FEE_COLUMNS) assert.equal(Object.prototype.hasOwnProperty.call(row, c), false, c + ' must not exist');
+  }
+  assert.equal(r.byTax['10']['合計'], 900 + 500 - 1825); // no_sku 行は 10% 扱い (既存仕様)
+  assert.equal(r.excluded['4']['合計'], 500);
+  assert.equal(r.excluded['4'].行数, 1);
+  // MF 税込行は従来キーのみ・値も従来どおり
+  assert.deepEqual(Object.keys(r.mfRow), r.mfColumns);
+  assert.equal(r.mfRow['手数料'], -500);
+  assert.equal(r.mfRow['FBA手数料'], -1300);
+  assert.equal(r.mfRow['合計'], 900 + 500 - 1825);
 
-  // SKUなし行の説明別一覧: 種類×説明 で集約・判定付き・|合計| 降順
+  // SKUなし行の説明別一覧: 種類×説明 で集約・判定付き・|合計| 降順・振込みは含まない
   const d = r.noSkuDetails;
   assert.equal(d.length, 7);
   assert.equal(d[0].説明, 'FBA在庫保管手数料'); assert.equal(d[0].判定, STORAGE); assert.equal(d[0].合計, -1000);
@@ -94,60 +153,52 @@ test('aggregate: 内訳列は other 行に入り、既存列・合計は変わ�
   assert.equal(easy.行数, 2); assert.equal(easy.合計, -400); assert.equal(easy.判定, EASY);
   const cancel = d.find(x => x.トランザクション種類 === 'FBA 在庫関連の手数料 - 取り消し');
   assert.equal(cancel.説明, 'FBA在庫保管手数料:'); assert.equal(cancel.合計, 1000); assert.equal(cancel.判定, STORAGE);
-  const monthly = d.find(x => x.説明 === '月額登録料');
-  assert.equal(monthly.判定, '');
+  assert.equal(d.find(x => x.説明 === '月額登録料').判定, '');
   assert.ok(!d.some(x => x.トランザクション種類 === '振込み'));
+  // 内訳3列の和 = 説明別一覧で判定が付いた行の合計 (2つの経路の整合)
+  const feeSum = FEE_COLUMNS.reduce((s, c) => s + other[c], 0);
+  const judged = d.filter(x => x.判定).reduce((s, x) => s + x.合計, 0);
+  assert.equal(feeSum, judged);
 });
 
 // ─── 実CSVでの受け入れ確認 (要件定義 §7 の期待値) ───
-// /upload と同じ行パースを再現し、SKU解決は DB 不要のダミー (SKUあり=direct/分類1, SKUなし=no_sku, 振込み=skip)
-function parsePaymentCsv(file) {
-  const lines = fs.readFileSync(file, 'utf-8').split(/\r?\n/);
-  let headerIdx = -1;
-  for (let i = 0; i < Math.min(lines.length, 30); i++) {
-    if (lines[i].includes('日付/時間') && lines[i].includes('SKU')) { headerIdx = i; break; }
-  }
+// 本番と同じ parsePaymentCsvText() を使う。SKU解決は DB 不要のダミー (SKUあり=direct/分類1, SKUなし=no_sku, 振込み=skip)
+function loadResolved(file) {
+  const { headerIdx, rows } = parsePaymentCsvText(fs.readFileSync(file, 'utf-8'));
   assert.ok(headerIdx >= 0, 'header not found: ' + file);
-  const num = v => { const n = parseFloat((v || '').replace(/"/g, '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
-  const clean = v => (v || '').replace(/^"|"$/g, '').trim();
-  const rows = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    const cols = []; let cur = '', inQ = false;
-    for (const ch of line) { if (ch === '"') inQ = !inQ; else if (ch === ',' && !inQ) { cols.push(cur); cur = ''; } else cur += ch; }
-    cols.push(cur);
-    if (!clean(cols[0])) continue;
-    const tx = clean(cols[2]);
-    const sku = clean(cols[4]).toLowerCase();
-    rows.push({
-      トランザクション種類: tx, sku, 説明: clean(cols[5]), 数量: parseInt(clean(cols[6])) || 0,
-      商品売上: num(cols[13]), 手数料: num(cols[23]), FBA手数料: num(cols[24]), トランザクション他: num(cols[25]), その他: num(cols[26]), 合計: num(cols[27]),
-      解決方法: tx === '振込み' ? 'skip' : (sku ? 'direct' : 'no_sku'),
-      売上分類: (tx !== '振込み' && sku) ? 1 : null, 税率: (tx !== '振込み' && sku) ? 10 : null, 原価: 0,
-    });
-  }
-  return rows;
+  return rows.map(r => {
+    const tx = r.トランザクション種類;
+    if (tx === '振込み') return { ...r, 解決方法: 'skip', 売上分類: null, 税率: null, 原価: 0 };
+    if (!r.sku) return { ...r, 解決方法: 'no_sku', 売上分類: null, 税率: null, 原価: 0 };
+    return { ...r, 解決方法: 'direct', 売上分類: 1, 税率: 10, 原価: 0 };
+  });
 }
 
 const CSV_DIR = process.env.AMAZON_PAYMENT_CSV_DIR;
 const REAL_CASES = [
-  { file: '2026JulMonthlyTransaction.csv', easy: -2303252, easyRows: 12890, storage: -303905, long: -101496 },
-  { file: '2026JunMonthlyTransaction.csv', easy: -1276326, easyRows: 7317, storage: -283754, long: -102696 },
+  // other 行の既存列 (手数料 / FBA手数料 / その他 / 合計) は本番画面 (2026-07 スクリーンショット) の other 行と一致する値
+  { file: '2026JulMonthlyTransaction.csv', easy: -2303252, easyRows: 12890, storage: -303905, long: -101496,
+    other: { 手数料: -2303252, FBA手数料: -480710, トランザクション他: 0, その他: 25019, 合計: -2758943 } },
+  { file: '2026JunMonthlyTransaction.csv', easy: -1276326, easyRows: 7317, storage: -283754, long: -102696,
+    other: { 手数料: -203194, FBA手数料: -268, トランザクション他: -1073132, その他: -418237, 合計: -1694831 } },
 ];
 for (const c of REAL_CASES) {
   const file = CSV_DIR ? path.join(CSV_DIR, c.file) : null;
   test('実CSV ' + c.file + ' の手数料内訳が要件定義 §7 の期待値と一致', { skip: !(file && fs.existsSync(file)) && 'AMAZON_PAYMENT_CSV_DIR 未指定またはCSVなし' }, () => {
-    const r = aggregate(parsePaymentCsv(file));
+    const r = aggregate(loadResolved(file));
     const other = r.bySegment.other;
     assert.equal(Math.round(other[EASY]), c.easy);
     assert.equal(Math.round(other[STORAGE]), c.storage);
     assert.equal(Math.round(other[LONG]), c.long);
     const easyRows = r.noSkuDetails.filter(d => d.判定 === EASY).reduce((s, d) => s + d.行数, 0);
     assert.equal(easyRows, c.easyRows);
-    // 内訳は既存列に既に含まれている (抜き出し) こと: 3列の和が other 行の 手数料+FBA手数料+トランザクション他+その他 を超えない
-    const feeSum = other[EASY] + other[STORAGE] + other[LONG];
-    const colSum = other['手数料'] + other['FBA手数料'] + other['トランザクション他'] + other['その他'];
-    assert.ok(Math.abs(feeSum) <= Math.abs(colSum) + 1, 'fee breakdown must be a subset of existing columns');
+    // 既存列の回帰 (内訳を足しても変わらない)
+    for (const [k, v] of Object.entries(c.other)) assert.equal(Math.round(other[k]), v, 'other.' + k);
+    // 内訳3列の和 = 説明別一覧で判定が付いた行の合計
+    const feeSum = FEE_COLUMNS.reduce((s, col) => s + other[col], 0);
+    const judged = r.noSkuDetails.filter(d => d.判定).reduce((s, d) => s + d.合計, 0);
+    assert.equal(Math.round(feeSum), Math.round(judged));
+    // 商品セグメントには内訳が入らない
+    for (const col of FEE_COLUMNS) assert.equal(r.bySegment['1'][col], 0);
   });
 }

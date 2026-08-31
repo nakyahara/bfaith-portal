@@ -13,6 +13,8 @@ import fs from 'fs';
 import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 import { normalizeYearMonth } from '../../lib/jst-date.js';
+import { FEE_COLUMNS } from './fee-breakdown.js';
+import { parsePaymentCsvText, aggregate } from './payment-csv.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -27,35 +29,13 @@ const evidenceStore = new Map();
 // 除外セグメント（4=輸出はセグメント集計に含めない）
 const EXCLUDED_SEGMENTS = { 4: '輸出' };
 
-// ─── 手数料内訳（説明別）───
-// SKUを持たない手数料行を CSV「説明」列で判別し、その行の「合計」列を合算してセグメント表の右端に列として見せる。
-// 実データ (2026-06/07) で判明: 説明の文言は月で変わる (Easy Ship は 6月 2種の別名 / 7月 統合名)、
-// 金額が入る列も月で変わる (手数料 / トランザクション他 / FBA手数料 / その他) → 部分一致 + 合計列の合算が唯一安定。
-// 判定は上から順に排他 (「FBA長期在庫保管手数料」は「在庫保管手数料」を含むので長期を先に)。
-// 既存の各列・合計には既に含まれている金額の抜き出しであり、集計値は一切変えない (表示の追加のみ)。
-// 要件定義: システム設計\Amazon売上集計_手数料内訳表示_要件定義_20260831.md
-const FEE_BREAKDOWN_RULES = [
-  { label: 'FBA長期在庫保管手数料', test: d => d.includes('長期在庫保管手数料') },
-  { label: 'FBA在庫保管手数料',     test: d => d.includes('在庫保管手数料') },
-  { label: 'Amazon Easy Ship料金',  test: d => d.includes('easy ship') },
-];
-// 表示順（セグメント表・CSV の右端に追加する列）
-const FEE_COLUMNS = ['Amazon Easy Ship料金', 'FBA在庫保管手数料', 'FBA長期在庫保管手数料'];
-
-// 説明の正規化: 前後空白と末尾のコロン (取り消し/訂正行は "FBA在庫保管手数料:" と付く) を除去して小文字化
-function normalizeFeeDesc(desc) {
-  return String(desc || '').trim().replace(/[:：\s]+$/, '').toLowerCase();
-}
-
-// 行がどの手数料内訳に該当するかをラベルで返す（該当なしは null）。
-// SKU空欄行のみ対象 (注文・返金行の説明は商品名なので誤判定を避ける)。振込みは既存集計と同様に対象外。
-function classifyFeeRow(row) {
-  if (!row || row.解決方法 === 'skip') return null;
-  if (row.sku) return null;
-  const d = normalizeFeeDesc(row.説明);
-  if (!d) return null;
-  const rule = FEE_BREAKDOWN_RULES.find(r => r.test(d));
-  return rule ? rule.label : null;
+// ─── CSV出力のセル整形 ───
+// 外部入力 (CSVの説明・SKU・DB文字列) を安全に出力する。カンマ/引用符/改行 (CR含む) は引用し、
+// 先頭が = + - @ の値はスプレッドシートで数式として評価されないようアポストロフィを付ける (先頭の空白・制御文字は読み飛ばして判定)
+function csvCell(v) {
+  let s = String(v == null ? '' : v);
+  if (/^[\s\u0000-\u001f]*[=+\-@]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
 // ─── CSV解析 ───
@@ -288,142 +268,6 @@ function resolveSkus(rows, db) {
   };
 }
 
-// ─── 集計 ───
-
-function aggregate(resolvedRows) {
-  const columns = ['商品売上', '商品の売上税', '配送料', '配送料の税金',
-    'ギフト包装手数料', 'ギフト包装の税金', 'Amazonポイント費用',
-    'プロモーション割引額', 'プロモーション割引の税金', '手数料', 'FBA手数料',
-    'トランザクション他', 'その他', '合計'];
-
-  function emptyRow() {
-    const r = {};
-    columns.forEach(c => r[c] = 0);
-    FEE_COLUMNS.forEach(c => r[c] = 0); // 手数料内訳 (合計列の抜き出し。上の各列に含まれる金額の内訳であり加算しない)
-    r.原価合計 = 0;
-    r.行数 = 0;
-    return r;
-  }
-
-  function addRow(target, row) {
-    columns.forEach(c => target[c] += row[c] || 0);
-    const feeKey = classifyFeeRow(row);
-    if (feeKey) target[feeKey] += row.合計 || 0;
-    target.原価合計 += (row.原価 || 0) * (row.数量 || 1);
-    target.行数++;
-  }
-
-  // 税率別
-  const byTax = { '10': emptyRow(), '8': emptyRow() };
-
-  // セグメント別（1〜3 + other。4=輸出は除外）
-  const bySegment = { '1': emptyRow(), '2': emptyRow(), '3': emptyRow(), 'other': emptyRow() };
-
-  // 除外セグメント（4=輸出）
-  const excluded = { '4': emptyRow() };
-
-  // 「その他/未分類」に入った行の明細を記録
-  const otherDetails = new Map();
-  // SKUなし行の説明別一覧 (トランザクションの種類 × 説明 原文)。手数料内訳の根拠と、Amazonが文言を変えた月の検知用
-  const noSkuDetails = new Map();
-
-  for (const row of resolvedRows) {
-    if (row.解決方法 === 'skip') continue; // 振込み
-
-    if (!row.sku) {
-      const nk = (row.トランザクション種類 || '') + '||' + (row.説明 || '');
-      const ne = noSkuDetails.get(nk) || {
-        トランザクション種類: row.トランザクション種類 || '',
-        説明: row.説明 || '',
-        判定: classifyFeeRow(row) || '',
-        行数: 0,
-        合計: 0,
-      };
-      ne.行数++;
-      ne.合計 += row.合計 || 0;
-      noSkuDetails.set(nk, ne);
-    }
-
-    // 税率別（税率未登録は集計しない）
-    if (row.税率 === 10 || row.税率 === 8) {
-      addRow(byTax[String(row.税率)], row);
-    } else if (row.解決方法 === 'no_sku' || row.解決方法 === 'unresolved' || row.解決方法 === 'adjustment_no_master') {
-      // SKUなし・未解決・調整(照合対象外)は10%扱い（手数料/弁償金等は税率情報がない）
-      addRow(byTax['10'], row);
-    }
-    // 税率未登録（商品は解決済みだが税率がない）→ 税率別集計に含めない
-
-    // セグメント別
-    const segKey = row.売上分類 ? String(row.売上分類) : 'other';
-
-    if (excluded[segKey]) {
-      // 4=輸出 → 除外集計
-      addRow(excluded[segKey], row);
-    } else if (bySegment[segKey]) {
-      addRow(bySegment[segKey], row);
-    } else {
-      addRow(bySegment['other'], row);
-    }
-
-    // 「その他」に入った行の明細を記録
-    if (!row.売上分類 && !excluded[segKey]) {
-      const detailKey = row.商品コード || row.sku || '_no_sku_' + (row.トランザクション種類 || '');
-      const existing = otherDetails.get(detailKey) || {
-        sku: row.sku || '',
-        商品コード: row.商品コード || '',
-        商品名: row.説明 || '',
-        トランザクション種類: row.トランザクション種類 || '',
-        解決方法: row.解決方法,
-        商品売上: 0,
-        合計: 0,
-        数量: 0,
-        count: 0,
-      };
-      existing.商品売上 += row.商品売上 || 0;
-      existing.合計 += row.合計 || 0;
-      existing.数量 += row.数量 || 0;
-      existing.count++;
-      otherDetails.set(detailKey, existing);
-    }
-  }
-
-  // MF連携用 税込み集計行
-  const t10 = byTax['10'];
-  const t8 = byTax['8'];
-  const mfColumns = ['商品売上(10%)', '商品売上(8%)', '配送料', 'ギフト包装手数料',
-    'Amazonポイントの費用', 'プロモーション割引額', '手数料', 'FBA手数料',
-    'トランザクションに関するその他の手数料+その他', '合計', '端数調整'];
-  const mfRow = {
-    '商品売上(10%)': t10['商品売上'] + t10['商品の売上税'],
-    '商品売上(8%)': t8['商品売上'] + t8['商品の売上税'],
-    '配送料': t10['配送料'] + t10['配送料の税金'] + t8['配送料'] + t8['配送料の税金'],
-    'ギフト包装手数料': t10['ギフト包装手数料'] + t10['ギフト包装の税金'] + t8['ギフト包装手数料'] + t8['ギフト包装の税金'],
-    'Amazonポイントの費用': t10['Amazonポイント費用'] + t8['Amazonポイント費用'],
-    'プロモーション割引額': t10['プロモーション割引額'] + t10['プロモーション割引の税金'] + t8['プロモーション割引額'] + t8['プロモーション割引の税金'],
-    '手数料': t10['手数料'] + t8['手数料'],
-    'FBA手数料': t10['FBA手数料'] + t8['FBA手数料'],
-    'トランザクションに関するその他の手数料+その他': t10['トランザクション他'] + t10['その他'] + t8['トランザクション他'] + t8['その他'],
-    '合計': t10['合計'] + t8['合計'],
-  };
-  // 端数調整 = 合計 - 他全列の合計
-  const mfSubtotal = mfRow['商品売上(10%)'] + mfRow['商品売上(8%)'] + mfRow['配送料']
-    + mfRow['ギフト包装手数料'] + mfRow['Amazonポイントの費用'] + mfRow['プロモーション割引額']
-    + mfRow['手数料'] + mfRow['FBA手数料'] + mfRow['トランザクションに関するその他の手数料+その他'];
-  mfRow['端数調整'] = mfRow['合計'] - mfSubtotal;
-
-  return {
-    byTax,
-    bySegment,
-    excluded,
-    otherDetails: [...otherDetails.values()].sort((a, b) => Math.abs(b.商品売上) - Math.abs(a.商品売上)),
-    noSkuDetails: [...noSkuDetails.values()].sort((a, b) => Math.abs(b.合計) - Math.abs(a.合計)),
-    columns,
-    feeColumns: FEE_COLUMNS,
-    mfRow,
-    mfColumns,
-  };
-}
-
 // ─── GET / — メイン画面 ───
 
 router.get('/', (req, res) => {
@@ -449,69 +293,11 @@ router.post('/upload', upload.single('file'), (req, res) => {
   }
 
   try {
-  // CSV解析（テキストベースで軽量処理）
-  const text = buf[0] === 0xEF ? buf.toString('utf-8') : buf.toString('utf-8');
-  const lines = text.split(/\r?\n/);
-
-  // 列ヘッダー行（"日付/時間" と "SKU" を含む行）を検出して、その次行から読み始める
-  // ※Amazonがメタ行を増減してもヘッダー検出で吸収できるよう動的に判定
-  let headerIdx = -1;
-  for (let i = 0; i < Math.min(lines.length, 30); i++) {
-    if (lines[i].includes('日付/時間') && lines[i].includes('SKU')) {
-      headerIdx = i;
-      break;
-    }
-  }
+  // CSV解析（テキストベースで軽量処理。パーサは payment-csv.js に分離 = テストと本番で同一）
+  const text = buf.toString('utf-8');
+  const { headerIdx, rows: parsedRows } = parsePaymentCsvText(text);
   if (headerIdx < 0) {
     return res.status(400).json({ error: 'CSVヘッダー行（"日付/時間"と"SKU"を含む行）が見つかりません' });
-  }
-
-  const num = v => { const n = parseFloat((v || '').replace(/"/g, '').replace(/,/g, '')); return isNaN(n) ? 0 : n; };
-  const clean = v => (v || '').replace(/^"|"$/g, '').trim();
-
-  const parsedRows = [];
-  for (let i = headerIdx + 1; i < lines.length; i++) {
-    const line = lines[i];
-    if (!line.trim()) continue;
-    // CSV行をパース（ダブルクォート対応）
-    const cols = [];
-    let current = '', inQ = false;
-    for (let j = 0; j < line.length; j++) {
-      const ch = line[j];
-      if (ch === '"') inQ = !inQ;
-      else if (ch === ',' && !inQ) { cols.push(current); current = ''; }
-      else current += ch;
-    }
-    cols.push(current);
-
-    const date = clean(cols[0]);
-    if (!date) continue;
-    // 日付から時刻部分を除去
-    const dateOnly = date.replace(/ .+$/, '');
-
-    parsedRows.push({
-      日付: dateOnly,
-      決済番号: clean(cols[1]),
-      トランザクション種類: clean(cols[2]),
-      注文番号: clean(cols[3]),
-      sku: clean(cols[4]).toLowerCase(),
-      説明: clean(cols[5]),
-      数量: parseInt(clean(cols[6])) || 0,
-      商品売上: num(cols[13]),
-      商品の売上税: num(cols[14]),
-      配送料: num(cols[15]),
-      配送料の税金: num(cols[16]),
-      ギフト包装手数料: num(cols[17]),
-      ギフト包装の税金: num(cols[18]),
-      Amazonポイント費用: num(cols[19]),
-      プロモーション割引額: num(cols[20]),
-      プロモーション割引の税金: num(cols[21]),
-      手数料: num(cols[23]),
-      FBA手数料: num(cols[24]),
-      トランザクション他: num(cols[25]),
-      その他: num(cols[26]),
-      合計: num(cols[27]),
-    });
   }
 
   // 対象年月を推定（最初の日付から）。監査M-1: slice(0,7)は '2026/3/15'→'2026-3/' の
@@ -549,7 +335,7 @@ router.post('/upload', upload.single('file'), (req, res) => {
     const vals = detailCols.map(c => {
       const v = r[c];
       if (v === null || v === undefined) return '';
-      if (typeof v === 'string' && (v.includes(',') || v.includes('"'))) return '"' + v.replace(/"/g, '""') + '"';
+      if (typeof v === 'string') return csvCell(v);
       return v;
     });
     detailCsv += vals.join(',') + '\n';
@@ -577,7 +363,6 @@ router.post('/upload', upload.single('file'), (req, res) => {
       + ',' + feeColumns.map(c => row[c] || 0).join(',') + '\n';
   }
   // SKUなし行の説明別一覧 (手数料内訳の根拠)
-  const csvCell = v => { const s = String(v == null ? '' : v); return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
   summaryCsv += '\n【SKUなし行の説明別一覧（手数料内訳）】\n';
   summaryCsv += 'トランザクションの種類,説明,判定,行数,合計\n';
   for (const d of noSkuDetails) {
@@ -846,9 +631,14 @@ function renderPage() {
       if (data.existing) {
         summaryHtml += '<div class="warn">📌 <b>' + data.yearMonth + ' は確定済みです</b>（' + esc(data.existing.confirmed_at || '') + '・広告費 ¥' + Math.round(data.existing.ad_cost || 0).toLocaleString() + '）。'
           + 'このまま「確定」すると前回の集計を上書きします。広告費欄には前回の値を入れてあります。</div>';
-        const adInput = document.getElementById('adCost');
-        if (adInput) adInput.value = Math.round(data.existing.ad_cost || 0);
       }
+      // 広告費欄: 月が変わったら existing ? 前回値 : 0 に明示リセット (前の月のプリフィル値が別の月の按分・確定に流れるのを防ぐ)。
+      // 同じ月の再アップロード (SKU登録後のやり直し等) では入力中の値を維持する
+      const adInput = document.getElementById('adCost');
+      if (adInput && data.yearMonth !== lastYearMonth) {
+        adInput.value = data.existing ? Math.round(data.existing.ad_cost || 0) : 0;
+      }
+      lastYearMonth = data.yearMonth;
       document.getElementById('summary').innerHTML = summaryHtml;
       // 確定ボタンの disabled 制御 (hard fail)
       const confirmBtn = document.getElementById('confirmBtn');
@@ -860,7 +650,7 @@ function renderPage() {
         card.style.display = 'block';
         let html = '<table><tr><th>SKU</th><th>商品名</th><th>出現数</th><th>金額合計</th></tr>';
         for (const u of data.unresolvedSkus) {
-          html += '<tr><td>' + u.sku + '</td><td>' + (u.name || '').slice(0, 60) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td></tr>';
+          html += '<tr><td>' + esc(u.sku) + '</td><td>' + esc((u.name || '').slice(0, 60)) + '</td><td class="num">' + u.count + '</td><td class="num">' + fmt(u.amount) + '</td></tr>';
         }
         html += '</table>';
         document.getElementById('unresolvedList').innerHTML = html;
@@ -882,7 +672,7 @@ function renderPage() {
           else if (c.type === 'partial_component') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
           else if (c.type === 'invalid_quantity') detail = '不正数量: ' + (c.invalidQty || []).map(q => q.ne_code + '=' + q.rawQty).join(', ');
           else if (c.type === 'mapped_target_missing') detail = '欠損ne_code: ' + (c.missing || []).join(', ');
-          html += '<tr><td style="text-align:left">' + c.sku + '</td><td>' + label + '</td><td style="text-align:left">' + detail + '</td></tr>';
+          html += '<tr><td style="text-align:left">' + esc(c.sku) + '</td><td>' + label + '</td><td style="text-align:left">' + esc(detail) + '</td></tr>';
         }
         html += '</table>';
         document.getElementById('conflictsList').innerHTML = html;
@@ -898,9 +688,9 @@ function renderPage() {
         html += '<table class="detail-table"><tr><th>商品コード</th><th>SKU</th><th>商品名</th><th>出現行数</th><th>数量合計</th><th>商品売上合計</th></tr>';
         for (const t of data.unresolvedTax) {
           html += '<tr>';
-          html += '<td style="text-align:left">' + t.商品コード + '</td>';
-          html += '<td style="text-align:left">' + (t.sku || '-') + '</td>';
-          html += '<td style="text-align:left">' + (t.商品名 || '').slice(0, 50) + '</td>';
+          html += '<td style="text-align:left">' + esc(t.商品コード) + '</td>';
+          html += '<td style="text-align:left">' + esc(t.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + esc((t.商品名 || '').slice(0, 50)) + '</td>';
           html += '<td class="num">' + t.count + '</td>';
           html += '<td class="num">' + t.数量合計 + '</td>';
           html += '<td class="num">' + fmt(t.売上合計) + '</td>';
@@ -1111,12 +901,12 @@ function renderPage() {
         card.style.display = 'block';
         let html = '<table class="detail-table"><tr><th>SKU</th><th>商品コード</th><th>商品名</th><th>種類</th><th>解決方法</th><th>行数</th><th>数量</th><th>商品売上</th><th>合計</th></tr>';
         for (const d of lastData.otherDetails) {
-          const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし', adjustment_no_master: '調整(照合対象外)' }[d.解決方法] || d.解決方法;
+          const method = { direct: '商品コード一致', sku_map: 'SKUマップ経由', unresolved: '未解決', no_sku: 'SKUなし', adjustment_no_master: '調整(照合対象外)' }[d.解決方法] || esc(d.解決方法);
           html += '<tr>';
-          html += '<td style="text-align:left">' + (d.sku || '-') + '</td>';
-          html += '<td style="text-align:left">' + (d.商品コード || '-') + '</td>';
-          html += '<td style="text-align:left">' + (d.商品名 || '').slice(0, 50) + '</td>';
-          html += '<td style="text-align:left">' + (d.トランザクション種類 || '-') + '</td>';
+          html += '<td style="text-align:left">' + esc(d.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + esc(d.商品コード || '-') + '</td>';
+          html += '<td style="text-align:left">' + esc((d.商品名 || '').slice(0, 50)) + '</td>';
+          html += '<td style="text-align:left">' + esc(d.トランザクション種類 || '-') + '</td>';
           html += '<td style="text-align:left">' + method + '</td>';
           html += '<td class="num">' + d.count + '</td>';
           html += '<td class="num">' + d.数量 + '</td>';
@@ -1138,9 +928,9 @@ function renderPage() {
         html += '<table class="detail-table"><tr><th>商品コード</th><th>SKU</th><th>商品名</th><th>出現行数</th><th>数量合計</th><th>商品売上合計</th></tr>';
         for (const z of lastData.zeroGenka) {
           html += '<tr>';
-          html += '<td style="text-align:left">' + z.商品コード + '</td>';
-          html += '<td style="text-align:left">' + (z.sku || '-') + '</td>';
-          html += '<td style="text-align:left">' + (z.商品名 || '').slice(0, 50) + '</td>';
+          html += '<td style="text-align:left">' + esc(z.商品コード) + '</td>';
+          html += '<td style="text-align:left">' + esc(z.sku || '-') + '</td>';
+          html += '<td style="text-align:left">' + esc((z.商品名 || '').slice(0, 50)) + '</td>';
           html += '<td class="num">' + z.count + '</td>';
           html += '<td class="num">' + z.数量合計 + '</td>';
           html += '<td class="num">' + fmt(z.売上合計) + '</td>';
@@ -1153,6 +943,7 @@ function renderPage() {
       }
     }
     let lastData = null;
+    let lastYearMonth = null; // 直前に表示した年月 (広告費欄のリセット判定用)
 
     function updateAdCost() {
       if (!lastData) return;
@@ -1674,5 +1465,3 @@ router.post('/import-history', requireImportKey('IMPORT_KEY_AMAZON'), importJson
 
 
 export default router;
-// テスト用 (fee-breakdown.test.mjs から純粋関数を検証する)
-export { aggregate, classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS, FEE_BREAKDOWN_RULES };
