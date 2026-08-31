@@ -15,7 +15,7 @@ for (const k of ['SP_API_CLIENT_ID', 'SP_API_CLIENT_SECRET', 'SP_API_REFRESH_TOK
 
 const { jstYmd, formatSummary, runTrackingJob, partitionShipments } = await import('../tracking-runner.js');
 const store = await import('../tracking-store.js');
-const { _internal, summarizeShipment, checkDeadline, trackingSlotCount, describePutError } = await import('../tracking-service.js');
+const { _internal, summarizeShipment, checkDeadline, trackingSlotCount, describePutError, ARRIVAL_STATUSES } = await import('../tracking-service.js');
 
 let pass = 0;
 const t = (name, fn) => { fn(); pass++; console.log(`  ok  ${name}`); };
@@ -254,17 +254,25 @@ t('🚨投入できない納品が残る日は緑にしない (放置すると�
   assert.match(s, /記入欄/);
 });
 
-t('🚨PUT失敗はcode・HTTPステータス・request IDまで残す (同じ文言の別原因を切り分けるため)', () => {
-  const d = describePutError({
-    code: 'BadRequest', statusCode: 400, message: 'ERROR: Shipment sh1 is not in a state where tracking details can be provided.',
-    headers: { 'x-amzn-RequestId': 'abc-123' }, details: 'detail text',
-  });
+t('🚨PUT失敗は code・details を残す (同じ文言の別原因を切り分けるため)', () => {
+  // amazon-sp-api 1.2.0 の CustomError = 応答本文 errors[0] のキーをそのままコピーした形
+  const sdkShaped = Object.assign(new Error('ERROR: Shipment sh1 is not in a state where tracking details can be provided.'),
+    { code: 'BadRequest', details: '' });
+  const d = describePutError(sdkShaped);
   assert.equal(d.code, 'BadRequest');
-  assert.equal(d.httpStatus, 400);
-  assert.equal(d.requestId, 'abc-123');
   assert.match(d.message, /not in a state/);
+  assert.equal(d.httpStatus, undefined, 'SDK経由ではHTTPステータスは取れない (無いものを捏造しない)');
+  // あれば拾う (raw_result で自前解析する将来のため)
+  const rich = describePutError({ code: 'BadRequest', statusCode: 400, message: 'x', headers: { 'x-amzn-requestid': 'abc-123' } });
+  assert.equal(rich.httpStatus, 400);
+  assert.equal(rich.requestId, 'abc-123');
   // 手がかりが何も無い例外でも message だけは必ず残る
   assert.equal(describePutError(new Error('socket hang up')).message, 'socket hang up');
+});
+
+t('🚨到着系だけを arrived に入れる (CANCELLED/DELETED/WORKING は追跡番号の対象外)', () => {
+  for (const st of ['IN_TRANSIT', 'DELIVERED', 'CHECKED_IN', 'RECEIVING', 'CLOSED']) assert.ok(ARRIVAL_STATUSES.has(st), st);
+  for (const st of ['CANCELLED', 'DELETED', 'WORKING', 'ERROR', 'READY_TO_SHIP', 'SHIPPED']) assert.ok(!ARRIVAL_STATUSES.has(st), st);
 });
 
 await (async () => {

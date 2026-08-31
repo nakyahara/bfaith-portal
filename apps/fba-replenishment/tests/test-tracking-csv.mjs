@@ -175,6 +175,7 @@ t('🚨投入できない納品 (skipReason付き) のCSV行も「見つかり�
   const ships = [{ ...SHIPMENTS[0], skipReason: 'Amazon側に追跡番号の記入欄がありません' }];
   const { rows } = parseTrackingCsv(csv([
     row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
+    row({ tracking: '663-9387-3173', fc: 'HND2', kanri: 'FBA15GGL5J2X' }),
   ]));
   const { problems, skipped, assignments } = buildAssignments(rows, ships);
   assert.equal(assignments.length, 0, '投入対象にはしない');
@@ -182,6 +183,23 @@ t('🚨投入できない納品 (skipReason付き) のCSV行も「見つかり�
   assert.match(skipped[0].reason, /記入欄/);
   assert.equal(skipped[0].needsManual, true);
   assert.deepEqual(problems, [], problems.join(' / '));
+  // 行が無いのも正常 (出荷確定していない納品の伝票が今日のCSVに無いのは当然)
+  const none = buildAssignments([], ships);
+  assert.deepEqual(none.problems, []);
+});
+
+t('🚨投入できない納品でも、CSVに行があるなら個口数は箱と合っていなければ中断する', () => {
+  // 「投入対象外だから何でも通す」にすると、CSV全体が疑わしいまま他の納品へ投入してしまう
+  const ships = [{ ...SHIPMENTS[0], skipReason: 'Amazon側に追跡番号の記入欄がありません' }, SHIPMENTS[1]];
+  const { rows } = parseTrackingCsv(csv([
+    row({ tracking: '663-9387-3162', fc: 'HND2', kanri: 'FBA15GGL5J2X' }), // 2箱の納品に1行しかない
+    row({ tracking: '663-9387-3184', fc: 'XHD4', kanri: 'FBA15GGLDVMG' }),
+    row({ tracking: '663-9387-3195', fc: 'XHD4', kanri: 'FBA15GGLDVMG' }),
+    row({ tracking: '663-9387-3206', fc: 'XHD4', kanri: 'FBA15GGLDVMG' }),
+  ]));
+  const { problems, assignments } = buildAssignments(rows, ships);
+  assert.equal(assignments.length, 1, 'もう片方の割り当て自体は組み立てる (中断の判断は呼び出し側)');
+  assert.ok(problems.some((p) => /FBA15GGL5J2X.*個口合計 1 と輸送箱 2/.test(p)), problems.join(' / '));
 });
 
 t('🚨同じ送り状番号が別の宛先に現れたら取り違えを疑う', () => {

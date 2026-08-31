@@ -334,7 +334,7 @@ async function runInner(summary, ctx) {
 
     // 🚨CSVを解析している間に、人が画面から入力していることがある (即SHIPPEDになる)。
     //   入力直後は追跡番号がAPIに現れないので「未登録」に見える。送る直前にもう一度確かめる
-    const re = await recheckBeforePut({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId });
+    const re = await recheckBeforePut({ inboundPlanId: ship.inboundPlanId, shipmentId: ship.shipmentId, boxIds: ship.boxIds });
     if (!re.ok) {
       summary.failed.push({ shipmentConfirmationId: a.shipmentConfirmationId, error: re.reason, needsManual: true });
       continue;
