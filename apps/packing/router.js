@@ -467,7 +467,33 @@ router.get('/line/:id(\\d+)', (req, res) => {
   const hikiateClass = batchHikiateClass(getDB(), batch);
   const kind = lineKindOf(hikiateClass);
   if (!kind) return res.redirect(`/apps/packing/work/${batch.id}`);   // 手梱包は従来画面へ
+  // 伝票ごとの依頼 (再ピック/配送変更/再印刷) 用に伝票と候補・再ピック状態を渡す (2026-08-31)。
+  // 表示に要る列だけに絞る (宛名は事務の突合用に名前まで — 作業画面と同じ範囲)
+  let slips = [];
+  let incidents = [];
+  let repickBySlip = {};
+  let tasks = [];
+  try {
+    const st = getWorkState(batch.id);
+    slips = st.slips.map((x) => ({
+      seq: x.seq, neSlipNo: x.ne_slip_no, slipNo: x.slip_no, siteOrderNo: x.site_order_no || null,
+      recipientName: x.recipient_name || null, deliveryMethod: x.delivery_method || null,
+      status: x.status, holdReason: x.hold_reason || null,
+      lines: x.lines.map((l) => ({ sku: l.sku, name: l.print_name || l.product_name || l.sku, qty: l.qty })),
+    }));
+    incidents = st.incidents.map((i) => ({ id: i.id, slipSeq: i.slip_seq, kind: i.kind, sku: i.sku, qty: i.qty }));
+    repickBySlip = st.repickBySlip || {};
+    // 未完了の再ピックタスク (SKU 単位の状態表示・SKU 単位の「見つかった」用)
+    tasks = getDB().prepare(`SELECT id, slip_seq AS slipSeq, sku, req_qty AS qty, status FROM pk_pack_tasks
+      WHERE batch_id=? AND kind='repick' AND status IN ('requested','claimed','fulfilled') ORDER BY id`).all(batch.id);
+  } catch (e) { console.warn(`[packing] ライン画面の伝票取得失敗 (batch=${batch.id}): ${e.message}`); }
   res.render(path.join(__dirname, 'views/line'), {
+    slips,
+    incidents,
+    repickBySlip,
+    tasks,
+    methodOptions: SHIP_CHANGE_METHOD_OPTIONS,
+    shipChangeReasons: SHIP_CHANGE_REASONS,
     pauseReasons: PAUSE_REASONS.filter((r) => r !== '配送変更の入力'),   // 一時中断の理由 (自動中断専用は出さない)
     title: `ライン | ${batch.folder_name || batch.tb_key}`,
     displayName: req.session?.displayName,
@@ -521,6 +547,7 @@ router.post('/api/batches/:id(\\d+)/events', checkOrigin, api(async (req, res) =
     finalCount: req.body.final_count == null || req.body.final_count === '' ? null : Number(req.body.final_count),
     manualCount: req.body.manual_count == null || req.body.manual_count === '' ? null : Number(req.body.manual_count),
     excludedCount: req.body.excluded_count == null || req.body.excluded_count === '' ? null : Number(req.body.excluded_count),
+    toPasCount: req.body.to_pas_count == null || req.body.to_pas_count === '' ? null : Number(req.body.to_pas_count),
     note: req.body.note == null ? null : String(req.body.note).slice(0, 200),
   }, worker);
   // ⑤ Notionカード自動移動 (fail-soft・非同期直列化。送信直前に最新状態を読むため

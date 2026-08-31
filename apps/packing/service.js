@@ -523,6 +523,10 @@ const LINE_EVENTS = ['line_sort_start', 'line_sort_done', 'line_start', 'line_st
 // undo はライン専用の段階的取消として別実装、takeover/pause/resume/cancel は両方で使える
 const SLIP_ONLY_EVENTS = ['start', 'next', 'jump', 'ship_change', 'reprint', 'label_missing',
   'shortage', 'excess', 'wrong_item', 'found', 'receive'];
+// 紙で作業する梱包機ラインでも、伝票を選んでの「依頼」は出せる (2026-08-31 現場意見: MELT/PAS は
+// 再ピック依頼・サイズ変更依頼がかけられない)。伝票の完了 (next/jump) と余り/品違いは対象外 —
+// 伝票の完了状態はライン工程で管理しないため。保留 (repick) は伝票行に付くがライン工程とは独立
+export const LINE_SLIP_REQUEST_EVENTS = ['ship_change', 'reprint', 'label_missing', 'shortage', 'found', 'receive'];
 const WORK_EVENTS = ['start', 'next', 'takeover', 'pause', 'resume', 'cancel', 'undo', 'jump', 'ship_change',
   'reprint', 'label_missing', 'shortage', 'excess', 'wrong_item', 'found', 'receive', ...LINE_EVENTS];
 
@@ -556,10 +560,26 @@ export function listLineRuns(batchId) {
 /**
  * 本日 (作業日) ×同ライン種別の流し済み累計 — 梱包機のトータルカウンタとの突合用。
  * 日付が変わるとリセット (中原さん指示 2026-08-18)。
- * @returns { total: 出荷累計 (手動含む), machine: 機械通過累計 (=出荷-手動。カウンタと比較する数) }
+ * @returns { total: 出荷累計 (手動含む), machine: 機械通過累計 (=出荷-手動。カウンタと比較する数),
+ *            transferredIn: MELT の仕分けで PAS-LINE へ移した件数 (PAS のみ。total/machine に加算済み) }
  */
 export function lineDailyTotal(workDate, kind) {
   try {
+    // MELT → PAS の振替 (3つ折り等)。PAS の機械カウンタには乗るが PAS バッチの伝票数には無いので、
+    // ここで足さないと「前回までの累計」がカウンタと 1 件ずつズレていく (2026-08-31 現場意見)
+    let transferredIn = 0;
+    if (kind === 'pas') {
+      for (const r of getDB().prepare(`
+        SELECT r.to_pas_count, pb.hikiate_class
+        FROM pk_pack_line_runs r
+        JOIN pk_pack_batches b ON b.id = r.batch_id
+        LEFT JOIN pk_batches pb ON pb.id = b.pk_batch_id
+        WHERE b.work_date = ? AND r.phase = 'sort' AND r.finished_at IS NOT NULL
+          AND r.to_pas_count > 0 AND b.validity = 'valid'
+      `).all(workDate)) {
+        if (lineKindOf(r.hikiate_class) === 'melt') transferredIn += r.to_pas_count;
+      }
+    }
     const rows = getDB().prepare(`
       SELECT r.final_count, COALESCE(r.manual_count, 0) AS manual_count, pb.hikiate_class
       FROM pk_pack_line_runs r
@@ -574,9 +594,9 @@ export function lineDailyTotal(workDate, kind) {
       total += r.final_count;
       machine += r.final_count - r.manual_count;
     }
-    return { total, machine };
+    return { total: total + transferredIn, machine: machine + transferredIn, transferredIn };
   } catch {
-    return { total: 0, machine: 0 };   // pk_batches 未初期化環境
+    return { total: 0, machine: 0, transferredIn: 0 };   // pk_batches 未初期化環境
   }
 }
 
@@ -716,7 +736,7 @@ function eventResult(batchId) {
  * 作業イベントの適用。1イベント = 1トランザクション。
  * @returns {{replayed?: boolean, ...eventResult}}
  */
-export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, actualName, qty, finalCount, manualCount, excludedCount, note }, worker) {
+export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, jumped, proposedMethod, sku, actualSku, actualName, qty, finalCount, manualCount, excludedCount, toPasCount, note }, worker) {
   if (!opId || typeof opId !== 'string' || opId.length > 64) {
     throw new PackError(400, 'bad_op_id', 'op_id が不正です');
   }
@@ -739,6 +759,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
           && (pp.finalCount ?? null) === (finalCount ?? null)
           && (pp.manualCount ?? null) === (manualCount ?? null)
           && (pp.excludedCount ?? null) === (excludedCount ?? null)
+          && (pp.toPasCount ?? null) === (toPasCount ?? null)
           && (pp.note ?? null) === (note ?? null)) {
         return { replayed: true, ...JSON.parse(prev.result_json) };
       }
@@ -756,9 +777,20 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     // 梱包機ライン種別 (null=手梱包)。イベント族をサーバー側で相互排他にする (Codex high:
     // 伝票イベントとライン工程の混在は「伝票一部done+line_doneで完了」等の矛盾状態を作る)
     const lineKind = lineKindOf(batchHikiateClass(db, batch));
-    if (lineKind && SLIP_ONLY_EVENTS.includes(event)) {
+    // ラインバッチからの伝票単位の依頼 (再ピック/配送変更/再印刷/見つかった/受領)。
+    // 工程は担当交代 (仕分け→流し) があるので所有者チェックはせず (作業者名は router で有効名を検証済み)、
+    // 状態も取消以外なら受け付ける — 紙の作業は画面の開始/終了と必ずしも同期しないため
+    const lineSlipRequest = !!lineKind && LINE_SLIP_REQUEST_EVENTS.includes(event);
+    if (lineKind && SLIP_ONLY_EVENTS.includes(event) && !lineSlipRequest) {
       throw new PackError(409, 'line_batch', '梱包機バッチはライン管理画面から操作してください');
     }
+    const requireSlipOp = (statuses) => {
+      if (lineSlipRequest) return;
+      if (!statuses.includes(batch.status)) {
+        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
+      }
+      requireOwner();
+    };
     if (!lineKind && LINE_EVENTS.includes(event)) {
       throw new PackError(409, 'not_line_batch', '梱包機バッチではありません');
     }
@@ -886,7 +918,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         } else if (run) {
           db.prepare('DELETE FROM pk_pack_line_runs WHERE id=?').run(run.id);
         } else if (sort?.finished_at) {
-          db.prepare(`UPDATE pk_pack_line_runs SET finished_at=NULL, final_count=NULL, excluded_count=NULL, updated_at=?
+          db.prepare(`UPDATE pk_pack_line_runs SET finished_at=NULL, final_count=NULL, excluded_count=NULL, to_pas_count=NULL, updated_at=?
             WHERE id=?`).run(now, sort.id);
         } else if (sort) {
           db.prepare('DELETE FROM pk_pack_line_runs WHERE id=?').run(sort.id);
@@ -934,10 +966,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       // 伝票の保留や事務側の状態管理はしない — 現物を「変更待ちの棚」へ置く運用のため
       // 放置されず、事務の画面操作 (1工程) も不要。梱包者はそのまま「次へ」で完了してよい。
       // paused も許可 (④⑥フォーム表示中は自動中断で計測を止めるため — 2026-08-21)
-      if (!['packing', 'paused', 'done'].includes(batch.status)) {
-        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
-      }
-      requireOwner();
+      requireSlipOp(['packing', 'paused', 'done']);
       const proposed = String(proposedMethod || '').trim();
       if (!SHIP_CHANGE_METHOD_OPTIONS.includes(proposed)) {
         throw new PackError(400, 'bad_method', '提案する配送方法を選択してください');
@@ -958,10 +987,7 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
       // 🖨 伝票再印刷依頼 (2026-08-21 中原さん指示): 記録+即時通知のみ。伝票状態は変えず、
       // 梱包画面にも痕跡を出さない (理由入力なし)。完了済み伝票でも押せる (配送変更と同様)
       // 📭 label_missing (2026-08-26): 「送り状が束に無かった」の事務通知。経路は再印刷と同一 (kind で区別)
-      if (batch.status !== 'packing' && batch.status !== 'done') {
-        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
-      }
-      requireOwner();
+      requireSlipOp(['packing', 'done']);
       const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
       if (!slip) throw new PackError(404, 'slip_not_found', `伝票 ${slipSeq} がありません`);
       const info = db.prepare(`
@@ -974,12 +1000,10 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     } else if (['shortage', 'excess', 'wrong_item', 'found', 'receive'].includes(event)) {
       // ①不足→再ピック / ②余り→棚戻し / 品違い / 見つかった / 受領 (要件§5.4〜5.6)。
       // 完了済み伝票への不足/品違いも許可 (誤タップ後の気づき) — バッチ完了済みなら再オープン
-      if (batch.status !== 'packing' && batch.status !== 'done') {
-        throw new PackError(409, 'not_packing', `作業中ではありません (${batch.status})`);
-      }
-      requireOwner();
+      // (ラインバッチは再オープンしない: バッチの完了は件数記録 line_done で決まり、伝票の保留とは独立)
+      requireSlipOp(['packing', 'done']);
       taskNotify = applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actualName, qty }, worker, now).notify || null;
-      if (batch.status === 'done' && ['shortage', 'wrong_item'].includes(event)) {
+      if (!lineKind && batch.status === 'done' && ['shortage', 'wrong_item'].includes(event)) {
         db.prepare("UPDATE pk_pack_batches SET status='packing', finished_at=NULL, updated_at=? WHERE id=?")
           .run(now, batchId);
       }
@@ -1040,8 +1064,14 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
         if (!Number.isInteger(ex) || ex < 0 || ex > run.planned_count) {
           throw new PackError(400, 'bad_count', `他の方法で出荷する件数は 0〜${run.planned_count} で入力してください`);
         }
-        db.prepare(`UPDATE pk_pack_line_runs SET finished_at=?, excluded_count=?, final_count=?, note=?, worker=?, updated_at=?
-          WHERE id=?`).run(now, ex, run.planned_count - ex, note || run.note || null, worker, now, run.id);
+        // 除外の内訳: PAS-LINE へ移した件数 (3つ折り等)。PAS の本日累計 (機械カウンタ突合) に加算する
+        // (2026-08-31 現場意見)。未指定は 0 (旧画面・API 互換)
+        const tp = toPasCount == null ? 0 : Number(toPasCount);
+        if (!Number.isInteger(tp) || tp < 0 || tp > ex) {
+          throw new PackError(400, 'bad_count', 'PAS-LINE へ移す件数は「他の方法で出荷する件数」の内数 (0〜' + ex + ') で入力してください');
+        }
+        db.prepare(`UPDATE pk_pack_line_runs SET finished_at=?, excluded_count=?, to_pas_count=?, final_count=?, note=?, worker=?, updated_at=?
+          WHERE id=?`).run(now, ex, tp, run.planned_count - ex, note || run.note || null, worker, now, run.id);
       } else if (event === 'line_start') {
         if (getRun('run')) throw new PackError(409, 'already_started', '機械流しは開始済みです');
         let planned = batch.slip_count;
@@ -1166,11 +1196,11 @@ export function applyEvent(batchId, { opId, event, slipSeq, clientAt, reason, ju
     if (event === 'next') result.lastDoneSeq = slipSeq;
     if ((event === 'reprint' || event === 'label_missing') && typeof reprintId !== 'undefined') result.reprintId = reprintId;
     const payload = (clientAt || reason || jumped || proposedMethod || sku || actualSku || qty != null
-        || finalCount != null || manualCount != null || excludedCount != null || note || switchedFrom)
+        || finalCount != null || manualCount != null || excludedCount != null || toPasCount != null || note || switchedFrom)
       ? JSON.stringify({ clientAt, reason, jumped: jumped || undefined, proposedMethod: proposedMethod || undefined,
           sku: sku || undefined, actualSku: actualSku || undefined, actualName: actualName || undefined, qty: qty ?? undefined,
           finalCount: finalCount ?? undefined, manualCount: manualCount ?? undefined,
-          excludedCount: excludedCount ?? undefined, note: note || undefined,
+          excludedCount: excludedCount ?? undefined, toPasCount: toPasCount ?? undefined, note: note || undefined,
           switchedFrom: switchedFrom || undefined }) : null;
     db.prepare(`
       INSERT INTO pk_pack_events (op_id, batch_id, worker, event, slip_seq, payload_json, result_json, at)
@@ -1388,8 +1418,23 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
       throw new PackError(400, 'bad_qty', `数量は1〜${line.qty}で指定してください`);
     }
     const slip = db.prepare('SELECT * FROM pk_pack_slips WHERE batch_id=? AND seq=?').get(batchId, slipSeq);
-    if (!slip || (slip.status !== 'pending' && slip.status !== 'done')) {
+    // 梱包機ライン (紙作業) は終了画面が無く不足を1件ずつ即送信するため、既に保留 (repick) の伝票にも
+    // 追加の不足 (別SKU) を記録できる (Codex R1 High: 同一伝票で2品目が不足すると2件目を出せなかった)。
+    // 手梱包は従来どおり (保留中は画面側でまとめて扱う)
+    const lineKind = lineKindOf(batchHikiateClass(db, batch));
+    const heldRepick = slip && slip.status === 'held' && slip.hold_reason === 'repick';
+    if (!slip || !(slip.status === 'pending' || slip.status === 'done' || (lineKind && heldRepick))) {
       throw new PackError(409, 'not_pending', `伝票 ${slipSeq} は保留/取消済みです`);
+    }
+    if (lineKind) {
+      // 同じ伝票×SKU の未解決の候補・未完了タスクがあれば二重依頼 (タップの重複) として拒否
+      const dupInc = db.prepare(`SELECT id FROM pk_pack_incidents
+        WHERE batch_id=? AND slip_seq=? AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND kind IN ('shortage','wrong_item') AND status='candidate'`)
+        .get(batchId, slipSeq, line.sku);
+      const dupTask = db.prepare(`SELECT id FROM pk_pack_tasks
+        WHERE batch_id=? AND slip_seq=? AND kind='repick' AND LOWER(TRIM(sku))=LOWER(TRIM(?)) AND status IN ('requested','claimed','fulfilled')`)
+        .get(batchId, slipSeq, line.sku);
+      if (dupInc || dupTask) throw new PackError(409, 'dup_task', `伝票 ${slipSeq} の ${line.sku} は既に依頼済みです`);
     }
     // ⭐候補方式 (中原さん指示 2026-08-17): 記録時はタスクを発行しない。
     // 「途中で足りないと思っても最後までやると山の下から出てくる」ため、
@@ -1432,15 +1477,33 @@ export function applyTaskEvent(db, batch, event, { slipSeq, sku, actualSku, actu
     `).all(batchId, slipSeq);
     if (event === 'found') {
       // 商品が出てきた: この伝票の候補 (不足/品違い) を取り下げる。
-      // 送信済みなら repick タスクも取消 (棚戻しタスクは残す=間違い品が実在する場合)
-      for (const t of open) {
+      // 送信済みなら repick タスクも取消 (棚戻しタスクは残す=間違い品が実在する場合)。
+      // sku 指定あり = その商品だけ (ラインは同一伝票に複数SKUの依頼を許すため — Codex R2)。
+      // 他に候補/未完了タスクが残っていれば保留は解除しない
+      const skuN = sku ? normSku(sku) : null;
+      const targets = skuN ? open.filter((t) => normSku(t.sku) === skuN) : open;
+      for (const t of targets) {
         db.prepare("UPDATE pk_pack_tasks SET status='cancelled', updated_at=? WHERE id=?").run(now, t.id);
       }
       db.prepare(`
         UPDATE pk_pack_incidents SET status='withdrawn', updated_at=?
         WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')
-      `).run(now, batchId, slipSeq);
+          AND (? IS NULL OR LOWER(TRIM(sku)) = ?)
+      `).run(now, batchId, slipSeq, skuN, skuN);
+      if (skuN) {
+        const remainCands = db.prepare(`SELECT COUNT(*) c FROM pk_pack_incidents
+          WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')`).get(batchId, slipSeq).c;
+        if (open.length - targets.length > 0 || remainCands > 0) return {};   // 他の商品の依頼が残る → 保留のまま
+      }
     } else {
+      // 未送信の候補 (不足/品違い) が残っていれば受領できない — その商品はまだ依頼すら出ていない
+      // (Codex R2 High: 2品目の候補が未送信のまま1品目の受領で保留が解けていた)
+      const cands = db.prepare(`SELECT COUNT(*) c FROM pk_pack_incidents
+        WHERE batch_id=? AND slip_seq=? AND status='candidate' AND kind IN ('shortage','wrong_item')`).get(batchId, slipSeq).c;
+      if (cands > 0) {
+        throw new PackError(409, 'repick_not_ready',
+          '未送信の不足候補があります。先に「ピッキングへ送信」するか、見つかったなら取り下げてください');
+      }
       // receive は状態機械どおり fulfilled のみ (Codex Phase2 high: ピッカー未対応のまま
       // 保留解除できると、商品が無いのに梱包を再開してしまう)。
       // 依頼未送信 (候補のみ) の段階では受領は成立しない — 「見つかった」を使う
@@ -1590,11 +1653,18 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
       throw new PackError(404, 'not_found', '候補が見つかりません (バッチ不一致)');
     }
     if (inc.status !== 'candidate') {
-      throw new PackError(409, 'already_resolved', `既に${inc.status === 'confirmed' ? '送信' : '取下げ'}済みです`);
+      // 現在の status を同梱 — 再送側は「要求した decision と同じ結果か」で成功/競合を見分ける (Codex R5)
+      const e = new PackError(409, 'already_resolved', `既に${inc.status === 'confirmed' ? '送信' : '取下げ'}済みです`);
+      e.body = { status: inc.status };
+      throw e;
     }
     const batch = db.prepare('SELECT * FROM pk_pack_batches WHERE id = ?').get(inc.batch_id);
+    // 梱包機ライン (紙作業) は伝票の完了を追わない → 「一通り終えてから」の条件と担当者一致は課さない
+    // (工程ごとに担当が替わる。作業者名は router で有効名を検証済み — 2026-08-31)
+    // 緩和はライン画面が作る不足候補 (shortage) に限る (Codex R1: 余り/品違いまで誰でも確定できる範囲にしない)
+    const lineShortage = !!lineKindOf(batchHikiateClass(db, batch)) && inc.kind === 'shortage';
     // 担当者チェック (Codex high: 任意の作業者名で他人のバッチの候補を送信・帰責できてしまう)
-    if (batch.worker && batch.worker !== actor) {
+    if (!lineShortage && batch.worker && batch.worker !== actor) {
       throw new PackError(409, 'taken', `このバッチは ${batch.worker} が担当です`);
     }
     let attributed = null;
@@ -1604,7 +1674,7 @@ export function resolveIncident(incidentId, decision, actor, expectBatchId = nul
         "SELECT COUNT(*) c FROM pk_pack_slips WHERE batch_id=? AND status='pending'"
       ).get(inc.batch_id).c;
       // 許可状態を明示: 完了済み or 「作業中かつ未処理ゼロ」(=終了画面)。paused等からは不可 (Codex medium)
-      const allowed = batch.status === 'done' || (batch.status === 'packing' && pendingCount === 0);
+      const allowed = lineShortage || batch.status === 'done' || (batch.status === 'packing' && pendingCount === 0);
       if (!allowed) {
         throw new PackError(409, 'batch_not_done',
           '送信は梱包を一通り終えてからできます (途中で出てくることがあるため)。先に残りの伝票を進めてください');

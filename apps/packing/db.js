@@ -51,7 +51,7 @@ export const MATCH_LABELS = {
   no_picking: '⚠ ピッキング未取込 (承認済み)',
 };
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 export function initPackingDB() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -515,6 +515,12 @@ const MIGRATIONS = {
   16: () => {
     db.exec('ALTER TABLE pk_pack_tasks ADD COLUMN later_request_id INTEGER');
   },
+  // v17: MELT 仕分けの「他の方法で出荷」の内訳に PAS-LINE へ移した件数を持つ (2026-08-31 現場意見:
+  //   3つ折りで PAS へ移した分が PAS の機械カウンタに乗り、PAS 側の累計 (164+37=201) と
+  //   カウンタ (202) が合わなかった)。to_pas_count ⊆ excluded_count。PAS の本日累計に加算する
+  17: () => {
+    db.exec('ALTER TABLE pk_pack_line_runs ADD COLUMN to_pas_count INTEGER');
+  },
 };
 
 function createCoreTables() {
@@ -539,6 +545,7 @@ function createCoreTables() {
     started_at       TEXT,
     finished_at      TEXT,
     paused_total_sec INTEGER NOT NULL DEFAULT 0,
+    to_pas_count     INTEGER,               -- v17: 除外のうち PAS-LINE へ移した件数 (MELT 仕分けのみ)
     validity         TEXT NOT NULL DEFAULT 'valid' CHECK(validity IN ('valid','invalid')),
     csv_sha256       TEXT NOT NULL,
     imported_by      TEXT NOT NULL,
