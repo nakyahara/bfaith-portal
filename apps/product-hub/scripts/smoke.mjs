@@ -2026,16 +2026,23 @@ const wf = await import('../lib/workflow.js');
   }
   check('無効化した工程は既定の一覧に出ない', !wf.listSteps().some((s) => s.code === extra));
 
-  // 画像トラックの組み込み工程 (2026-08-31 以降は商品詳細のみ) のラベル・並び順・滞留日数を変える
+  // 画像トラックの組み込み工程のラベル・滞留日数は管理画面から変えられる。
+  // 2026-08-31 に TOP/詳細 の対を廃止したので「対へ伝播する」検査は無くなり、
+  // 更新した工程そのものが変わることを見る (Codex R7 low: 対が無い状態では恒真だった)
   wf.updateStep('imgd_design', { label: 'デザイン修正 (改)', stall_days: 9 });
-  const sib = wf.listSteps({ includeInactive: true }).find((s) => s.code === 'img_production_detail') || { label: '画像制作 (改)', stall_days: 9 };
-  check('対の工程にラベルが伝播する', sib.label === '画像制作 (改)', sib.label);
-  check('対の工程に滞留日数が伝播する', sib.stall_days === 9, `= ${sib.stall_days}`);
+  {
+    const edited = wf.listSteps({ includeInactive: true }).find((s) => s.code === 'imgd_design');
+    check('工程のラベル・滞留日数を変えられる',
+      edited?.label === 'デザイン修正 (改)' && edited?.stall_days === 9,
+      `${edited?.label} / ${edited?.stall_days}`);
+  }
   wf.updateStep('imgd_design', { label: 'デザイン修正', stall_days: 7 });
-  // 担当ロールは伝播しない (TOP と詳細で承認者を分けたい場合があるため)
+  check('工程のラベルを戻せる',
+    wf.listSteps({ includeInactive: true }).find((s) => s.code === 'imgd_design')?.label === 'デザイン修正');
+  // 担当ロールも工程ごとに変えられる
   wf.updateStep('imgd_review_2', { role_code: 'approver' });
-  check('担当ロールは対に伝播しない',
-    (wf.listSteps({ includeInactive: true }).find((s) => s.code === 'img_approve_detail')?.role_code ?? 'image_approver') === 'image_approver');
+  check('工程の担当ロールを変えられる',
+    wf.listSteps({ includeInactive: true }).find((s) => s.code === 'imgd_review_2')?.role_code === 'approver');
   wf.updateStep('imgd_review_2', { role_code: 'image_approver' });
 
   // 滞留日数
