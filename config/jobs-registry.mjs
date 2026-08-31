@@ -586,6 +586,24 @@ export const JOBS_REGISTRY = [
     lifecycle: 'permanent',
     runbook: 'Render Logs で「mgmt-auto-sync」を検索。確定済み月はスキップされる (それ自体は正常)。手動実行 = 管理会計画面の再計算',
   },
+  {
+    id: 'po-fba-auto-refresh',
+    type: 'scheduled_job',
+    importance: 'P2',
+    owner: '中原さん',
+    purpose: 'FBA在庫の平日16時 (JST) 自動更新。miniPC の fba-refresh ジョブを起動する'
+      + ' (発注補助画面の「🔄 FBA在庫を今すぐ更新」と同一。完了で✅発注確定済みサイクルもリセットされる)。'
+      + '止まると発注判断が朝同期のFBA在庫のまま古くなる',
+    where: 'Render bfaith-portal 内 常駐ワーカー (apps/purchase-orders/scheduler.js、16:00〜16:59に毎分判定)',
+    schedule: '平日 (土日祝を除く) 16:00 JST。土日祝は実行せず「休業日スキップ」の ok ping を打つ (週末の締切超過誤検知なし)。'
+      + '起動できない場合は16時台の間 毎分再試行、窓を過ぎたら当日は起動しない',
+    anchor_hour_jst: 16,
+    anchor_minute_jst: 0,
+    grace_hours: 4,
+    lifecycle: 'permanent',
+    runbook: 'Render Logs で「po-fba-auto」を検索。実行そのものは miniPC (warehouse fba-service) が担当 = '
+      + 'miniPC 側が止まっていないかも確認。手動代替 = 発注補助画面の「🔄 FBA在庫を今すぐ更新」ボタン',
+  },
   // ─────────────── heartbeat (常駐ワーカーの生存監視) ───────────────
   // 毎日決まった時刻に走るものではないので、アンカーではなく「最終生存報告からの経過」で見る。
   {

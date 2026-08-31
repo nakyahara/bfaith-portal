@@ -34,6 +34,7 @@ const KNOWN = {
   'apps/inbound-info/sync-job.js': { count: 1, job: 'inbound-info-daily' },
   'apps/mgmt-accounting/router.js': { count: 1, job: 'mgmt-auto-sync' },
   'apps/purchase-orders/email.js': { count: 0, job: 'po-email-dispatcher' }, // setTimeout 再帰なので呼び出しは数えない
+  'apps/purchase-orders/scheduler.js': { count: 0, job: 'po-fba-auto-refresh' }, // setTimeout 再帰なので呼び出しは数えない
   'apps/warehouse/healthcheck.js': { count: 1, job: 'warehouse-healthcheck' },
   'apps/product-hub/intake-cron.js': { count: 1, job: 'ph-ne-intake' },
   'apps/ranking-checker/scheduler.js': { count: 2, job: 'rankcheck-csv-export' }, // 自動チェック(既定OFF) + CSV出力
