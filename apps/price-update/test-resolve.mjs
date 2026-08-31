@@ -255,7 +255,9 @@ console.log('\n── 配送方法の番号 → 名前 ──');
   eq(rakutenShippingLabel('9'), '9 (ゆうパケットパフ)', '文字列の番号も引ける');
   eq(rakutenShippingLabel(99), '99', '★表に無い番号は番号だけ (勝手に名前を当てない)');
   eq(rakutenShippingLabel(null), null, '未設定は null');
-  eq(yahooPostageLabel(6), '6', 'Yahoo は対応表が未入手なので番号のまま');
+  eq(yahooPostageLabel(6), '6 (ネコポス)', 'Yahoo 6 = ネコポス');
+  eq(yahooPostageLabel(12), '12 (ゆうパケットパフ)', 'Yahoo 12 = ゆうパケットパフ');
+  eq(yahooPostageLabel(99), '99', '★Yahoo も表に無い番号は番号だけ');
 }
 
 console.log('\n── 引き当てできないモールは行を消さず「未解決」で出す (要件 F1) ──');
