@@ -566,7 +566,13 @@ function parseGetItemDetailXml(xml) {
   // <Price> はバリエーション情報 (SubCodeInfo / Options) の中にも現れうるので、
   // 商品単位の価格を取るときはバリエーションブロックを除いた範囲から探す
   // (Path が <PathList> 内に限定して探しているのと同じ考え方)。
+  // 🚨実測 (2026-08-31、合皮補修シート 0726-001802):
+  //   <Result> 直下に <Price>698</Price> があり、その後ろに
+  //   <Options>…</Options> と <SubCodes><SubCode code="0726-001802-BK" …><Price></Price>…
+  //   が並ぶ。**SubCodes を除外しないと Price が13個** (商品1 + サブ12) になり、
+  //   「1つでなければ読めない扱い」の安全弁に引っかかって商品価格まで null になっていた。
   const withoutVariationBlocks = xml
+    .replace(/<SubCodes\b[\s\S]*?<\/SubCodes>/gi, '')
     .replace(/<SubCodeInfo\b[\s\S]*?<\/SubCodeInfo>/gi, '')
     .replace(/<Options\b[\s\S]*?<\/Options>/gi, '');
   // この値は「更新前価格の照合 (楽観ロック)」に使うので、読めない形は黙って数値化せず null にする。
@@ -597,11 +603,28 @@ function parseGetItemDetailXml(xml) {
   };
   out.Price = priceIn(withoutVariationBlocks);
 
-  // サブコード別の価格 (存在する場合のみ)。バリエーション単位で価格を持つ商品の把握に使う
-  const subBlocks = xml.match(/<SubCodeInfo\b[\s\S]*?<\/SubCodeInfo>/gi) || [];
+  // サブコード別の価格。★実測の形 (2026-08-31):
+  //   <SubCodes>
+  //     <SubCode code="0726-001802-BK" quantity="22" stockClose="0">
+  //       <Option name="カラー" value="ブラック(黒)"/> … <Price></Price>
+  //     </SubCode> × 色数
+  //   </SubCodes>
+  // 個別商品コードは **要素の中身ではなく code 属性**。<Price> が空なら商品価格を継承する運用。
+  // (旧実装は <SubCodeInfo> という存在しないタグを探していたため、カラバリが常に 0 件だった)
+  const subBlocks = [
+    ...(xml.match(/<SubCode\b[^>]*>[\s\S]*?<\/SubCode>/gi) || []),
+    ...(xml.match(/<SubCode\b[^>]*\/>/gi) || []),          // 子要素なしの自己終了タグ
+  ];
   for (const block of subBlocks) {
-    const codeM = block.match(/<SubCode\b[^>]*>([\s\S]*?)<\/SubCode>/i);
-    const code = codeM ? decodeXmlEntities(unwrapCdata(codeM[1])).trim() : null;
+    const attr = block.match(/<SubCode\b[^>]*\bcode\s*=\s*"([^"]*)"/i)
+      || block.match(/<SubCode\b[^>]*\bcode\s*=\s*'([^']*)'/i);
+    let code = attr ? decodeXmlEntities(attr[1]).trim() : null;
+    if (!code) {
+      // 後方互換: 属性が無く要素の中身がコードの形 (旧実装の想定)
+      const inner = block.match(/<SubCode\b[^>]*>([\s\S]*?)<\/SubCode>/i);
+      const text = inner ? decodeXmlEntities(unwrapCdata(inner[1])).trim() : '';
+      if (text && !text.includes('<')) code = text;
+    }
     if (!code) continue;
     out.SubCodes.push({ SubCode: code, Price: priceIn(block) });
   }
@@ -1289,6 +1312,23 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const parsed = parseGetItemDetailXml(r.body);
+      // 調査用: body.debugRaw=true で、応答XMLの「タグの出方」と先頭部分を返す。
+      // 商品カタログの構造を知らないとパーサを直せないため (PII は無い / secret 必須 / read-only)。
+      // 価格や在庫を書き換える経路ではない
+      const debug = body.debugRaw === true ? (() => {
+        const counts = {};
+        for (const m of String(r.body).matchAll(/<([A-Za-z][\w.]*)\b/g)) {
+          counts[m[1]] = (counts[m[1]] || 0) + 1;
+        }
+        const body = String(r.body);
+        const sub = body.match(/<SubCodes>[\s\S]{0,1800}/i);
+        const opt = body.match(/<Options>[\s\S]{0,600}/i);
+        return {
+          tagCounts: counts, head: body.slice(0, 1200), length: body.length,
+          subCodesBlock: sub ? sub[0] : null,
+          optionsBlock: opt ? opt[0] : null,
+        };
+      })() : undefined;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
@@ -1299,6 +1339,7 @@ const server = http.createServer(async (req, res) => {
         // 価格一括改定ツール向け (2026-08-24 追加)
         Price: parsed.Price,
         SubCodes: parsed.SubCodes,
+        debug,
       }));
       return;
     }
@@ -1530,11 +1571,14 @@ function runSelfTest() {
   check('plain: ItemCode', r1.ItemCode, 'abc-001');
   check('plain: SubCodes', r1.SubCodes, []);
 
-  // 2) バリエーションあり。商品価格が SubCodeInfo の価格に引っ張られないこと
+  // 2) バリエーションあり (SKU別に価格を持つ形)。商品価格がサブの価格に引っ張られないこと。
+  //    ※旧テストは M0 時点で想像した <SubCodeInfo> 構造だった。実測の形 (code 属性 + <SubCodes> 内) に直した
   const withSub = `<ResultSet><Result><ItemCode>v-001</ItemCode><Name>バリ商品</Name>
     <Price>2000</Price>
-    <SubCodeInfo><SubCode>v-001-a</SubCode><Price>2100</Price></SubCodeInfo>
-    <SubCodeInfo><SubCode>v-001-b</SubCode><Price>2200</Price></SubCodeInfo>
+    <SubCodes>
+      <SubCode code="v-001-a" quantity="1"><Price>2100</Price></SubCode>
+      <SubCode code="v-001-b" quantity="2"><Price>2200</Price></SubCode>
+    </SubCodes>
     </Result></ResultSet>`;
   const r2 = parseGetItemDetailXml(withSub);
   check('variation: 商品Price', r2.Price, 2000);
@@ -1543,9 +1587,34 @@ function runSelfTest() {
     { SubCode: 'v-001-b', Price: 2200 },
   ]);
 
-  // 3) SubCodeInfo が Price より前にあっても商品価格を取り違えない
+  // 2b) ★実測の形 (2026-08-31 合皮補修シート): SubCodes/SubCode の code 属性 + 空 Price (商品価格を継承)
+  const real = `<?xml version="1.0" encoding="UTF-8"?><ResultSet totalResultsReturned="1"><Result>
+    <ItemCode>0726-001802</ItemCode>
+    <Name><![CDATA[合皮 補修 シート]]></Name>
+    <OriginalPrice></OriginalPrice><Price>698</Price><SalePrice></SalePrice>
+    <Options><Option type="1" name="カラー" specId="">
+      <Value specValue="" name="ブラック(黒)"/><Value specValue="" name="オフホワイト"/>
+    </Option></Options>
+    <SubCodes>
+      <SubCode code="0726-001802-BK" quantity="22" stockClose="0">
+        <Option name="カラー" value="ブラック(黒)"/><Price></Price><PostageSet></PostageSet>
+      </SubCode>
+      <SubCode code="0726-001802-OW" quantity="78" stockClose="0">
+        <Option name="カラー" value="オフホワイト"/><Price></Price><PostageSet></PostageSet>
+      </SubCode>
+    </SubCodes>
+    </Result></ResultSet>`;
+  const rr = parseGetItemDetailXml(real);
+  check('実測形: 商品Price (SubCodes を除外しないと13個になって null になる)', rr.Price, 698);
+  check('実測形: 個別商品コードは code 属性から取る', rr.SubCodes, [
+    { SubCode: '0726-001802-BK', Price: null },
+    { SubCode: '0726-001802-OW', Price: null },
+  ]);
+  check('実測形: ItemCode', rr.ItemCode, '0726-001802');
+
+  // 3) サブの塊が商品Price より前にあっても取り違えない
   const subFirst = `<ResultSet><Result><ItemCode>v-002</ItemCode>
-    <SubCodeInfo><SubCode>v-002-a</SubCode><Price>500</Price></SubCodeInfo>
+    <SubCodes><SubCode code="v-002-a"><Price>500</Price></SubCode></SubCodes>
     <Price>900</Price><Name>順序違い</Name></Result></ResultSet>`;
   check('variation(順序違い): 商品Price', parseGetItemDetailXml(subFirst).Price, 900);
 

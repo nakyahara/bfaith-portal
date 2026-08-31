@@ -108,12 +108,12 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
   // 楽天は AM/AL/W の別名をまとめて渡す (同じ SKU の別名なので、どれか1つで manageNumber と
   // variant を特定できる — 別名ごとに問い合わせると全部「見つかりません」になる)
   const rakutenTargets = [];
-  const yahooCodes = [];
+  const yahooTargets = [];
   const amazonSkus = [];
   for (const t of targets) {
     for (const l of t.listings) {
       if (l.mall === 'rakuten') rakutenTargets.push({ key: l.listingCode, aliases: l.aliases || [l.listingCode] });
-      else if (l.mall === 'yahoo') yahooCodes.push(l.listingCode);
+      else if (l.mall === 'yahoo') yahooTargets.push({ key: l.listingCode, candidates: l.candidates || [l.listingCode] });
       else if (l.mall === 'amazon') amazonSkus.push(l.listingCode);
     }
   }
@@ -128,9 +128,9 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       notices.push(`楽天の設定価格を取得できませんでした: ${e.message}`);
     }
   }
-  if (yahooCodes.length > 0) {
+  if (yahooTargets.length > 0) {
     try {
-      yahooPrices = await fetchYahooPrices(yahooCodes, deps);
+      yahooPrices = await fetchYahooPrices(yahooTargets, deps);
     } catch (e) {
       notices.push(`Yahoo の設定価格を取得できませんでした: ${e.message}`);
     }
@@ -170,7 +170,10 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         if (p?.found) {
           price = p.price; priceSource = 'Yahoo itemInfo (ライブ)'; priceIsLive = true;
           confidence = 'confirmed';
-          if (p.skuCode) { skuCode = p.skuCode; note = `sub_code ${p.skuCode} の価格`; }
+          // カラバリは「親の商品コード + 個別商品コード」で登録されている。
+          // 当たった実際の商品コードに差し替える (Yahoo の画面で探せるように)
+          if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('yahoo', p.itemCode); }
+          if (p.skuCode) skuCode = p.skuCode;
         } else {
           note = p?.reason || '設定価格を取得できませんでした';
         }
