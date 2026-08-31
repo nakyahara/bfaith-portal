@@ -45,3 +45,13 @@ export function classifyFeeRow(row) {
   const rule = FEE_BREAKDOWN_RULES.find(r => r.test(d));
   return rule ? rule.label : null;
 }
+
+/**
+ * 表示用の合計: CSVの「合計」から手数料内訳3列を差し引いた額（2026-09-01 代表指示: 3列を「その他」と「合計」の間に置き、合計からその分を引く）。
+ * 保存データ (by_segment) の 合計 は CSV の合計のまま（税率別集計・MF・管理会計と整合）。内訳3列 + netTotal = 合計。
+ * 内訳キーが無い行（本機能より前に確定した月）はそのまま 合計 を返す。
+ */
+export function netTotal(row, feeCols = FEE_COLUMNS) {
+  if (!row) return 0;
+  return (Number(row['合計']) || 0) - feeCols.reduce((s, c) => s + (Number(row[c]) || 0), 0);
+}

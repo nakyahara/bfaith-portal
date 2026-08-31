@@ -6,8 +6,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { classifyFeeRow, normalizeFeeDesc, FEE_COLUMNS } from './fee-breakdown.js';
-import { parsePaymentCsvText, aggregate } from './payment-csv.js';
+import { classifyFeeRow, normalizeFeeDesc, netTotal, FEE_COLUMNS } from './fee-breakdown.js';
+import { parsePaymentCsvText, aggregate, segmentCsvSection } from './payment-csv.js';
 
 const EASY = 'Amazon Easy Ship料金';
 const STORAGE = 'FBA在庫保管手数料';
@@ -54,6 +54,14 @@ test('classifyFeeRow: 対象外の行は null', () => {
   // 振込みは対象外
   assert.equal(classifyFeeRow({ sku: '', 説明: 'Easy Ship', 解決方法: 'skip' }), null);
   assert.equal(classifyFeeRow(null), null);
+});
+
+test('netTotal: 表示用の合計 = CSVの合計 − 手数料内訳3列 (内訳キーが無い旧月はそのまま)', () => {
+  assert.equal(netTotal({ 合計: -2758943, [EASY]: -2303252, [STORAGE]: -303905, [LONG]: -101496 }), -50290);
+  assert.equal(netTotal({ 合計: -1234 }), -1234);                       // 旧月 (内訳キーなし)
+  assert.equal(netTotal({ 合計: 100, [EASY]: 0, [STORAGE]: 0, [LONG]: 0 }), 100);
+  assert.equal(netTotal({ 合計: '5', [EASY]: '-2' }), 7);               // 文字列でも数値化
+  assert.equal(netTotal(null), 0);
 });
 
 test('parsePaymentCsvText: メタ行の後のヘッダーを動的検出し、引用符内カンマ・桁区切り・時刻付き日付を処理', () => {
@@ -127,6 +135,7 @@ test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・�
   assert.equal(other['FBA手数料'], -1300);
   assert.equal(other['その他'], 50);     // 1000 - 900 - 50
   assert.equal(other['合計'], -1825);
+  assert.equal(netTotal(other), -1825 - (-575 - 900 - 300)); // 表示用の合計 = -50 (内訳3列 + 表示合計 = CSVの合計)
   assert.equal(other.行数, 8);
   // 商品セグメントは内訳 0・既存値そのまま
   const seg1 = r.bySegment['1'];
@@ -159,6 +168,22 @@ test('aggregate: 内訳列は bySegment だけに入り、既存列・合計・�
   const feeSum = FEE_COLUMNS.reduce((s, c) => s + other[c], 0);
   const judged = d.filter(x => x.判定).reduce((s, x) => s + x.合計, 0);
   assert.equal(feeSum, judged);
+});
+
+test('segmentCsvSection: 列順 = 金額列 → 内訳3列 → 合計(差引) → 原価合計、旧月 (内訳キーなし) は従来の合計', () => {
+  const columns = ['商品売上', 'その他', '合計'];
+  const bySegment = {
+    '1': { 商品売上: 1000, その他: 0, 合計: 1000, [EASY]: 0, [STORAGE]: 0, [LONG]: 0, 原価合計: 400 },
+    other: { 商品売上: 0, その他: -900, 合計: -900, [EASY]: -500, [STORAGE]: -300, [LONG]: -100, 原価合計: 0 },
+    old: { 商品売上: 10, その他: -5, 合計: 5, 原価合計: 1 }, // 内訳キーなし (旧月相当)
+  };
+  const csv = segmentCsvSection(bySegment, columns, FEE_COLUMNS, { 1: '自社商品' });
+  const lines = csv.split('\n');
+  assert.equal(lines[0], 'セグメント,商品売上,その他,' + FEE_COLUMNS.join(',') + ',合計,原価合計');
+  assert.equal(lines[1], '1:自社商品,1000,0,0,0,0,1000,400');
+  assert.equal(lines[2], 'other:その他/未分類,0,-900,-500,-300,-100,0,0'); // 合計 = -900 - (-900) = 0
+  assert.equal(lines[3], 'old:old,10,-5,0,0,0,5,1');                     // 旧月は従来の合計 5 のまま
+  assert.equal(lines[4], '');
 });
 
 // ─── 実CSVでの受け入れ確認 (要件定義 §7 の期待値) ───
@@ -209,5 +234,7 @@ for (const c of REAL_CASES) {
     assert.equal(Math.round(feeSum), Math.round(judged));
     // 商品セグメントには内訳が入らない
     for (const col of FEE_COLUMNS) assert.equal(r.bySegment['1'][col], 0);
+    // 表示用の合計 = CSVの合計 − 内訳3列
+    assert.equal(Math.round(netTotal(other)), c.other.合計 - (c.easy + c.storage + c.long));
   });
 }

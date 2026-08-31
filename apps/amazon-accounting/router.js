@@ -14,7 +14,7 @@ import { getMirrorDB } from '../warehouse-mirror/db.js';
 import { requireImportKey, importJsonParser } from '../../lib/import-key-auth.js';
 import { normalizeYearMonth } from '../../lib/jst-date.js';
 import { FEE_COLUMNS } from './fee-breakdown.js';
-import { parsePaymentCsvText, aggregate } from './payment-csv.js';
+import { parsePaymentCsvText, aggregate, segmentCsvSection } from './payment-csv.js';
 
 const router = Router();
 const UPLOAD_DIR = process.env.DATA_DIR ? process.env.DATA_DIR + '/import' : 'data/import';
@@ -374,12 +374,8 @@ router.post('/upload', upload.single('file'), (req, res) => {
   summaryCsv += mfColumns.map(c => mfRow[c] || 0).join(',') + '\n';
   // セグメント別
   summaryCsv += '\n【セグメント別集計（管理会計用）】\n';
-  summaryCsv += 'セグメント,' + columns.join(',') + ',原価合計,' + feeColumns.join(',') + '\n';
-  for (const [key, row] of Object.entries(bySegment)) {
-    const label = SEGMENT_NAMES[key] || (key === 'other' ? 'その他/未分類' : key);
-    summaryCsv += key + ':' + label + ',' + columns.map(c => row[c] || 0).join(',') + ',' + (row.原価合計 || 0)
-      + ',' + feeColumns.map(c => row[c] || 0).join(',') + '\n';
-  }
+  // 列順は画面と同じ (金額列 → 手数料内訳3列 → 合計(差引) → 原価合計)。生成は payment-csv.js に分離 (テスト対象)
+  summaryCsv += segmentCsvSection(bySegment, columns, feeColumns, SEGMENT_NAMES);
   // SKUなし行の説明別一覧 (手数料内訳の根拠)
   summaryCsv += '\n【SKUなし行の説明別一覧（手数料内訳）】\n';
   summaryCsv += 'トランザクションの種類,説明,判定,行数,合計\n';
@@ -595,6 +591,8 @@ function renderPage() {
 
   <script>
     const FEE_COLUMNS = ${JSON.stringify(FEE_COLUMNS)};
+    // 表示用の合計 = CSVの合計 − 手数料内訳3列 (fee-breakdown.js の netTotal と同じ規則。内訳キーが無い旧月はそのまま)
+    const netTotal = (row, feeCols) => (Number(row['合計']) || 0) - feeCols.reduce((s, c) => s + (Number(row[c]) || 0), 0);
     const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     const fmt = n => {
       if (n === 0) return '0';
@@ -865,37 +863,43 @@ function renderPage() {
         if (maxKey) adByKey[maxKey] += (ad - adSum);
       }
 
-      // 手数料内訳列 (右端。合計に含まれる金額の抜き出しなので合計行の横並びに加算はしない)
+      // 手数料内訳3列は「その他」と「合計」の間に置き、合計は内訳3列を差し引いた額で表示する (2026-09-01 代表指示)。
+      // 保存データ (by_segment) の 合計 はCSVの合計のまま (税率別集計・MF・管理会計と整合)。内訳3列 + 表示の合計 = CSVの合計
       const feeCols = (lastData && lastData.feeColumns) || FEE_COLUMNS;
       const feeCls = i => 'fee-col' + (i === 0 ? ' fee-first' : '');
+      const amountCols = cols.filter(c => c !== '合計');
       let segHtml = '<table><tr><th>セグメント</th>';
-      cols.forEach(c => segHtml += '<th>' + c + '</th>');
-      segHtml += '<th>広告費</th><th>原価合計</th>';
-      feeCols.forEach((c, i) => segHtml += '<th class="' + feeCls(i) + '" title="合計に含まれる金額の内訳（CSV「説明」で判別）">' + c + '</th>');
-      segHtml += '</tr>';
+      amountCols.forEach(c => segHtml += '<th>' + c + '</th>');
+      feeCols.forEach((c, i) => segHtml += '<th class="' + feeCls(i) + '" title="CSV「説明」で判別したSKUなし行の「合計」の合算">' + c + '</th>');
+      segHtml += '<th title="CSVの合計から内訳3列を差し引いた額">合計</th><th>広告費</th><th>原価合計</th></tr>';
       let totalRow = {};
       cols.forEach(c => totalRow[c] = 0);
       feeCols.forEach(c => totalRow[c] = 0);
       totalRow.原価合計 = 0;
+      totalRow.netTotal = 0;
       let totalAd = 0;
       for (const [key, row] of Object.entries(bySegment)) {
         const label = segmentNames[key] || (key === 'other' ? 'その他/未分類' : key);
         segHtml += '<tr><td>' + esc(key) + ': ' + esc(label) + '</td>';
-        cols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
+        amountCols.forEach(c => { segHtml += '<td class="num">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
+        feeCols.forEach((c, i) => { segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
+        const net = netTotal(row, feeCols);
+        segHtml += '<td class="num">' + fmt(net) + '</td>';
+        totalRow.netTotal += net;
         segHtml += '<td class="num">' + fmt(adByKey[key] || 0) + '</td>';
         totalAd += (adByKey[key] || 0);
         segHtml += '<td class="num">' + fmt(row.原価合計 || 0) + '</td>';
         totalRow.原価合計 += (row.原価合計 || 0);
-        feeCols.forEach((c, i) => { segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(row[c] || 0) + '</td>'; totalRow[c] += (row[c] || 0); });
         segHtml += '</tr>';
       }
       segHtml += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-      cols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
+      amountCols.forEach(c => segHtml += '<td class="num">' + fmt(totalRow[c]) + '</td>');
+      feeCols.forEach((c, i) => segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(totalRow[c]) + '</td>');
+      segHtml += '<td class="num">' + fmt(totalRow.netTotal) + '</td>';
       segHtml += '<td class="num">' + fmt(totalAd) + '</td>';
       segHtml += '<td class="num">' + fmt(totalRow.原価合計) + '</td>';
-      feeCols.forEach((c, i) => segHtml += '<td class="num ' + feeCls(i) + '">' + fmt(totalRow[c]) + '</td>');
       segHtml += '</tr></table>';
-      segHtml += '<p class="meta">右端の3列（' + feeCols.join(' / ') + '）は、CSV「説明」で判別したSKUなし行の「合計」を合算した<b>内訳</b>です。同じ行の 手数料・FBA手数料・その他・合計 に既に含まれている金額の抜き出しで、加算対象ではありません。根拠は下の「SKUなし行の説明別一覧」を参照。</p>';
+      segHtml += '<p class="meta">' + feeCols.join(' / ') + ' の3列は、CSV「説明」で判別したSKUなし行の「合計」を合算した金額です。<b>「合計」列はCSVの合計からこの3列を差し引いた額</b>（3列 + 合計 = CSVの合計 = 税率別集計・MF税込集計の合計）。手数料・FBA手数料・その他 の列には3列分の金額が含まれたままです。根拠は下の「SKUなし行の説明別一覧」を参照。</p>';
       document.getElementById(targetId).innerHTML = segHtml;
 
       // 除外セグメント（4=輸出）
@@ -1028,7 +1032,8 @@ function renderPage() {
           // ヘッダーの合計: セグメント全体の商品売上と合計を集計
           const segAll = row.by_segment || {};
           let hdrSales = 0, hdrTotal = 0;
-          for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += (sr['合計'] || 0); }
+          // 見出しの合計は展開後の表と同じ差引後 (内訳3列を引いた額。内訳キーが無い旧月は従来の合計)
+          for (const sr of Object.values(segAll)) { hdrSales += (sr['商品売上'] || 0) + (sr['商品の売上税'] || 0); hdrTotal += netTotal(sr, FEE_COLUMNS); }
 
           html += '<div class="acc-header" onclick="toggleAcc(this)" data-idx="' + i + '">';
           html += '<span><b>' + esc(row.year_month) + '</b> — 商品売上(税込): \\u00a5' + Math.round(hdrSales).toLocaleString()
@@ -1078,34 +1083,38 @@ function renderPage() {
             if (mk) hAd[mk] += (ad - hAdSum);
           }
 
-          // 手数料内訳列は本機能リリース後に確定した月だけ持つ (無い月は「—」)
+          // 手数料内訳列は本機能リリース後に確定した月だけ持つ (無い月は「—」)。列順・合計の扱いはアップロード結果の表と同じ
           const hasFee = Object.values(seg).some(sr => FEE_COLUMNS.some(c => sr[c] !== undefined));
           const hFeeCls = i => 'fee-col' + (i === 0 ? ' fee-first' : '');
           const hFeeCell = v => hasFee ? fmt(v || 0) : '<span class="meta">—</span>';
+          const hAmountCols = segCols.filter(c => c !== '合計');
           html += '<table><tr><th>セグメント</th>';
-          segCols.forEach(c => html += '<th>' + c + '</th>');
-          html += '<th>広告費</th><th>原価合計</th>';
+          hAmountCols.forEach(c => html += '<th>' + c + '</th>');
           FEE_COLUMNS.forEach((c, i) => html += '<th class="' + hFeeCls(i) + '">' + c + '</th>');
-          html += '</tr>';
-          let sTot = {}; segCols.forEach(c => sTot[c] = 0); FEE_COLUMNS.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; let sAdTot = 0;
+          html += '<th title="CSVの合計から内訳3列を差し引いた額">合計</th><th>広告費</th><th>原価合計</th></tr>';
+          let sTot = {}; segCols.forEach(c => sTot[c] = 0); FEE_COLUMNS.forEach(c => sTot[c] = 0); sTot.原価合計 = 0; sTot.netTotal = 0; let sAdTot = 0;
           for (const [key, sr] of Object.entries(seg)) {
             const lb = segNames[key] || (key === 'other' ? 'その他/未分類' : key);
             html += '<tr><td>' + esc(key) + ': ' + esc(lb) + '</td>';
-            segCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
+            hAmountCols.forEach(c => { html += '<td class="num">' + fmt(sr[c] || 0) + '</td>'; sTot[c] += (sr[c] || 0); });
+            FEE_COLUMNS.forEach((c, i) => { html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sr[c]) + '</td>'; sTot[c] += (sr[c] || 0); });
+            const net = netTotal(sr, FEE_COLUMNS);
+            html += '<td class="num">' + fmt(net) + '</td>';
+            sTot.netTotal += net;
             html += '<td class="num">' + fmt(hAd[key] || 0) + '</td>';
             sAdTot += (hAd[key] || 0);
             html += '<td class="num">' + fmt(sr.原価合計 || 0) + '</td>';
             sTot.原価合計 += (sr.原価合計 || 0);
-            FEE_COLUMNS.forEach((c, i) => { html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sr[c]) + '</td>'; sTot[c] += (sr[c] || 0); });
             html += '</tr>';
           }
           html += '<tr style="font-weight:bold;border-top:2px solid #333"><td>合計</td>';
-          segCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
+          hAmountCols.forEach(c => html += '<td class="num">' + fmt(sTot[c]) + '</td>');
+          FEE_COLUMNS.forEach((c, i) => html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sTot[c]) + '</td>');
+          html += '<td class="num">' + fmt(sTot.netTotal) + '</td>';
           html += '<td class="num">' + fmt(sAdTot) + '</td>';
           html += '<td class="num">' + fmt(sTot.原価合計) + '</td>';
-          FEE_COLUMNS.forEach((c, i) => html += '<td class="num ' + hFeeCls(i) + '">' + hFeeCell(sTot[c]) + '</td>');
           html += '</tr></table>';
-          if (!hasFee) html += '<p class="meta">手数料内訳（右端3列）はこの月の確定時点では未対応でした。この月のペイメントCSVを再アップロードして再確定すると表示されます。</p>';
+          if (!hasFee) html += '<p class="meta">手数料内訳（3列）はこの月の確定時点では未対応でした。この月のペイメントCSVを再アップロードして再確定すると表示され、合計もその分を差し引いた額になります。</p>';
 
           // 除外セグメント
           const excl = row.excluded || {};
@@ -1150,7 +1159,9 @@ function renderPage() {
         };
 
         let csv = '\\uFEFF'; // BOM
-        csv += '集計月,セグメント,' + segCols.join(',') + ',広告費,原価合計,' + FEE_COLUMNS.join(',') + '\\n';
+        // 列順は画面と同じ: 金額列 → 手数料内訳3列 → 合計 (内訳3列を差し引いた額。未対応月はCSVの合計のまま) → 広告費 → 原価合計
+        const csvAmountCols = segCols.filter(c => c !== '合計');
+        csv += '集計月,セグメント,' + csvAmountCols.join(',') + ',' + FEE_COLUMNS.join(',') + ',合計,広告費,原価合計\\n';
 
         for (const row of rows) {
           const seg = row.by_segment || {};
@@ -1178,9 +1189,9 @@ function renderPage() {
 
           for (const [key, sr] of Object.entries(seg)) {
             const label = segNames[key] || key;
-            const vals = segCols.map(c => csvCellJs(sr[c] || 0));
+            const vals = csvAmountCols.map(c => csvCellJs(sr[c] || 0));
             const feeVals = FEE_COLUMNS.map(c => sr[c] === undefined ? '' : csvCellJs(sr[c])); // 未対応月は空欄
-            csv += [csvCellJs(ymStr), csvCellJs(key + ':' + label), ...vals, csvCellJs(adMap[key] || 0), csvCellJs(sr.原価合計 || 0), ...feeVals].join(',') + '\\n';
+            csv += [csvCellJs(ymStr), csvCellJs(key + ':' + label), ...vals, ...feeVals, csvCellJs(netTotal(sr, FEE_COLUMNS)), csvCellJs(adMap[key] || 0), csvCellJs(sr.原価合計 || 0)].join(',') + '\\n';
           }
         }
 
@@ -1303,8 +1314,8 @@ function renderPage() {
       <h3>原価合計</h3>
       <p>各行の <code>原価 × 数量</code> をセグメントごとに合算（税抜）。</p>
 
-      <h3>手数料内訳（右端3列: Amazon Easy Ship料金 / FBA在庫保管手数料 / FBA長期在庫保管手数料）</h3>
-      <p>SKUを持たない手数料行をCSVの「説明」で判別し、その行の「合計」列を合算した金額です。<b>同じ行の 手数料・FBA手数料・その他・合計 に既に含まれている金額の抜き出し</b>であり、セグメント合計への加算対象ではありません（二重計上ではありません）。</p>
+      <h3>手数料内訳（「その他」と「合計」の間の3列: Amazon Easy Ship料金 / FBA在庫保管手数料 / FBA長期在庫保管手数料）</h3>
+      <p>SKUを持たない手数料行をCSVの「説明」で判別し、その行の「合計」列を合算した金額です。<b>「合計」列はCSVの合計からこの3列を差し引いた額</b>で表示します（3列 + 合計 = CSVの合計 = 税率別集計・MF税込集計の合計）。手数料・FBA手数料・その他 の列には3列分の金額が含まれたままなので、行を横に足しても合計にはなりません。集計サマリーCSV・セグメント別集計CSVも同じ列順・同じ合計です。</p>
       <table class="m-tbl">
         <tr><th>列</th><th>判定（説明の部分一致・上から順に排他）</th><th>実データでの表記例</th></tr>
         <tr><td><b>FBA長期在庫保管手数料</b></td><td>「長期在庫保管手数料」を含む</td><td>FBA長期在庫保管手数料</td></tr>
