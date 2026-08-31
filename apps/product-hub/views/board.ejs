@@ -302,8 +302,11 @@
                 <div class="kb-progress"><i style="width:<%= c.totalCount ? Math.round(c.doneCount / c.totalCount * 100) : 0 %>%"></i></div>
               <% } %>
             </a>
-            <% if (boardView === 'image' && c.kind === 'top') { %>
-              <%# TOP画像をどれぐらい力を入れて作るかの目安 (リンクの外 = クリックで詳細に飛ばない) %>
+            <% if (boardView === 'image') { %>
+              <%# 画像をどれぐらい力を入れて作るかの目安 (リンクの外 = クリックで詳細に飛ばない)。
+                  2026-08-31 中原さん: 商品詳細画像のカードにも出す。設定後にどの重要度にしたかが
+                  カード一覧で分からず、いちいち開いて確かめていた。値は**商品単位**なので
+                  同じ商品の TOP カードと詳細カードには同じものが出る (片方を変えると両方に効く) %>
               <% const pr = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
               <select class="kb-priority" data-draft="<%= c.id %>"
                       style="<%= pr ? `background:${pr.bg}; color:${pr.fg}; border-color:${pr.fg}33; font-weight:600;` : '' %>">
@@ -356,7 +359,7 @@
               </div>
             </div>
           </a>
-          <% if (boardView === 'image' && c.kind === 'top') { %>
+          <% if (boardView === 'image') { %>
             <% const prd = imagePriorities.find((p) => p.value === c.image_priority) || null; %>
             <select class="kb-priority" data-draft="<%= c.id %>"
                     style="<%= prd ? `background:${prd.bg}; color:${prd.fg}; border-color:${prd.fg}33; font-weight:600;` : '' %>">
@@ -562,7 +565,7 @@
     });
   });
 
-  // ─── TOP画像の重要度セレクト (その場で保存) ───
+  // ─── 画像の重要度セレクト (その場で保存)。TOP・商品詳細の両カードに出る ───
   document.querySelectorAll('.kb-priority').forEach(function (s) {
     // select の操作でカードのドラッグが始まらないようにする
     s.addEventListener('mousedown', function () {
@@ -576,6 +579,10 @@
       });
     });
     s.addEventListener('change', async function () {
+      // 同じ商品のセレクトは TOP/詳細 の 2 枚ある。続けて変えると応答の順序で
+      // 画面と DB が食い違うので、保存が終わるまで同じ商品のものは全部止める (Codex R2 medium)
+      const sameDraft = [...document.querySelectorAll('.kb-priority[data-draft="' + s.dataset.draft + '"]')];
+      sameDraft.forEach(function (o) { o.disabled = true; });
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + s.dataset.draft + '/image-priority', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -583,15 +590,24 @@
         });
         const j = await res.json();
         if (!j.ok) { alert(j.error || '保存に失敗しました'); location.reload(); return; }
-        // 色を選択肢に追従させる (再読込なしで見た目だけ更新)
+        // 色を選択肢に追従させる (再読込なしで見た目だけ更新)。
+        // 重要度は**商品単位**なので、同じ商品の別カード (TOP ↔ 商品詳細) も一緒に揃える —
+        // 揃えないと画面の中で違う重要度が並んで見え、どちらが本当か分からなくなる
         const PR = <%- JSON.stringify(imagePriorities) %>;
         const p = PR.find((x) => x.value === s.value);
-        s.style.background = p ? p.bg : '';
-        s.style.color = p ? p.fg : '';
-        s.style.fontWeight = p ? '600' : '';
+        document.querySelectorAll('.kb-priority[data-draft="' + s.dataset.draft + '"]').forEach(function (o) {
+          o.value = s.value;
+          o.style.background = p ? p.bg : '';
+          o.style.color = p ? p.fg : '';
+          // 枠線も揃える (初期描画は border-color も重要度色。ここを抜くと枠だけ前の色が残る)
+          o.style.borderColor = p ? p.fg + '33' : '';
+          o.style.fontWeight = p ? '600' : '';
+        });
       } catch (err) {
         alert('通信エラー: ' + err.message);
         location.reload();
+      } finally {
+        sameDraft.forEach(function (o) { o.disabled = false; });
       }
     });
   });

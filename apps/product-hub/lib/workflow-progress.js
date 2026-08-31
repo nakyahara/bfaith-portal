@@ -937,7 +937,23 @@ export function moveBoardCard(
       tIdx = rows.findIndex((r) => (view === 'image'
         ? (r.image_stage ? r.image_stage === to : `code:${r.step_code}` === to)
         : r.step_code === to));
-      if (tIdx === -1) throw badRequest('移動先の工程が見つかりません');
+      if (tIdx === -1) {
+        // 画像ビューの列は TOP と 商品詳細 の工程を段階 (image_stage) でまとめたもの。
+        // 片方にしか無い段階 (例: 「画像制作」= TOP のみ) へもう片方のカードを落とすと、
+        // その種別には対応する工程が無いのでここに来る。「見つかりません」だけだと
+        // 何が悪いのか分からないので、どちらの工程かを言う (2026-08-31 中原さん報告)
+        const otherKind = kind === 'detail' ? 'top' : 'detail';
+        const inOther = db.prepare(`
+          SELECT label FROM ph_steps WHERE track = 'image' AND active = 1 AND image_stage = ?
+            AND ${otherKind === 'detail' ? "image_kind = 'detail'" : "(image_kind IS NULL OR image_kind <> 'detail')"}
+          LIMIT 1
+        `).get(String(to));
+        if (inOther) {
+          throw badRequest(`この列 (${inOther.label}) は${otherKind === 'detail' ? '商品詳細画像' : 'TOP画像'}の工程です。`
+            + `${kind === 'detail' ? '商品詳細画像' : 'TOP画像'}のカードは移動できません`);
+        }
+        throw badRequest('移動先の工程が見つかりません');
+      }
     }
     if (tIdx === curIdx) return { changed: false };
     // 未割り当ての人手工程は「動かした本人が引き受けた」ことにして進める (2026-08-27 田中さん改善案:

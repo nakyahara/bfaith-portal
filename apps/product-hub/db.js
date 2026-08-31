@@ -42,6 +42,23 @@ export const IMAGE_PRIORITY_VALUES = new Set(IMAGE_PRIORITIES.map((p) => p.value
 // 「自社商品」の重要度は own_brand チェックと連動する (2026-08-24 中原さん要望)
 export const OWN_BRAND_IMAGE_PRIORITY = '自社商品（重要度：高）';
 
+/**
+ * 画像制作の管理項目 (撮影・素材 / Canva / 依頼文 / 保留 …) を使える商品か (2026-08-31 中原さん)。
+ *
+ * もとは own_brand (自社商品) だけだったが、**取扱先限定商品 (栃木レザー等) でも
+ * 撮影の設定や LP の重要度を決める**ので画面が使えないと困る、という指摘で広げた。
+ * 判定は画面とサーバ (image-production / image-hold API) の両方で同じものを使う。
+ */
+export const IMAGE_PRODUCTION_PRIORITIES = [
+  OWN_BRAND_IMAGE_PRIORITY,
+  '取扱先限定商品（重要度：高）',
+];
+export function canUseImageProduction(draft) {
+  if (!draft) return false;
+  if (draft.own_brand === 1 || draft.own_brand === true) return true;
+  return IMAGE_PRODUCTION_PRIORITIES.includes(String(draft.image_priority || '').trim());
+}
+
 export const DRAFT_SOURCES = ['portal', 'notion_import'];
 export const SOURCE_PORTAL = 'portal';
 export const SOURCE_NOTION_IMPORT = 'notion_import';
