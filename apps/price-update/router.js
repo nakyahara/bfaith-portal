@@ -222,8 +222,12 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         cost: t.cost,
         costSource: t.costSource,
         taxRate: t.taxRate,
-        shipping: t.shipping,
-        neDeliveryMethod: t.deliveryMethod,   // NE側の配送方法 (概算粗利の送料はこれが根拠)
+        // ★このモールの配送方法で引いた配送関係費 (粗利・原価割れ判定はこれで計算する)
+        shipping: shipCost.cost,
+        shippingSource: shipCost.source,      // 'mall' = モールの配送方法で引けた / 'product' / 'unknown'
+        shippingLabel: shipCost.label,        // 引けた配送方法の名前
+        productShipping: t.shipping,          // 商品マスタの送料 (参考表示)
+        neDeliveryMethod: t.deliveryMethod,   // NE側の配送方法
         mallShipping,                          // モール側の発送設定 (楽天=配送方法セット / Yahoo=Delivery等)
         feeRate: dim.feeRateOf(l.mall),
         url,
