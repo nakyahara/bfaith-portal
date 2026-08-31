@@ -523,6 +523,9 @@ function parseGetItemDetailXml(xml) {
     // Price は「商品単位の設定価格」。バリエーション商品は SubCodes[] に sub_code 別価格が入る
     // (現行の出品運用ではサブコード別価格は使わず item 価格を継承する方針 — variation-resolver.js 参照)
     Price: null, SubCodes: [],
+    // 発送まわり (価格一括改定ツール 2026-08-31 追加)。同じ商品でもモールで配送方法が違い、
+    // それが売価差の理由になるため、画面で並べて見えるようにする
+    Delivery: null, PostageSet: null, ShipWeight: null,
   };
   if (typeof xml !== 'string' || xml.length === 0) return out;
   // PR #322 で getItem 対応した時 path/name が null だった件:
@@ -602,6 +605,17 @@ function parseGetItemDetailXml(xml) {
     return toIntPrice(decodeXmlEntities(unwrapCdata(m[1])).trim());
   };
   out.Price = priceIn(withoutVariationBlocks);
+
+  // 発送まわり (商品単位)。SubCodes 内にも同名タグがあるので、除外済みの範囲から取る
+  const textIn = (scope, name) => {
+    const m = scope.match(new RegExp(`<${name}\\b[^>]*>([\\s\\S]*?)</${name}>`, 'i'));
+    if (!m) return null;
+    const v = decodeXmlEntities(unwrapCdata(m[1])).trim();
+    return v === '' ? null : v;
+  };
+  out.Delivery = textIn(withoutVariationBlocks, 'Delivery');
+  out.PostageSet = textIn(withoutVariationBlocks, 'PostageSet');
+  out.ShipWeight = textIn(withoutVariationBlocks, 'ShipWeight');
 
   // サブコード別の価格。★実測の形 (2026-08-31):
   //   <SubCodes>
@@ -1339,6 +1353,10 @@ const server = http.createServer(async (req, res) => {
         // 価格一括改定ツール向け (2026-08-24 追加)
         Price: parsed.Price,
         SubCodes: parsed.SubCodes,
+        // 発送まわり (2026-08-31 追加)。モールごとの配送方法を画面で見比べるため
+        Delivery: parsed.Delivery,
+        PostageSet: parsed.PostageSet,
+        ShipWeight: parsed.ShipWeight,
         debug,
       }));
       return;

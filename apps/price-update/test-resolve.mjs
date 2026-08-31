@@ -35,7 +35,7 @@ const db = new Database(path.join(tmpDir, 'mirror.db'));
 // ── mirror 相当の表を用意 (本番と同じ列名) ──
 db.exec(`CREATE TABLE mirror_products (
   商品コード TEXT PRIMARY KEY, 商品名 TEXT, 商品区分 TEXT NOT NULL, 取扱区分 TEXT,
-  標準売価 REAL, 原価 REAL, 原価状態 TEXT NOT NULL, 送料 REAL, 消費税率 REAL, セット構成品数 INTEGER)`);
+  標準売価 REAL, 原価 REAL, 原価状態 TEXT NOT NULL, 送料 REAL, 配送方法 TEXT, 消費税率 REAL, セット構成品数 INTEGER)`);
 db.exec(`CREATE TABLE mirror_set_components (
   セット商品コード TEXT NOT NULL, 構成商品コード TEXT NOT NULL, 数量 INTEGER NOT NULL DEFAULT 1,
   構成商品名 TEXT, 構成商品原価 REAL, updated_at TEXT NOT NULL,
@@ -46,11 +46,11 @@ db.exec(`CREATE TABLE mirror_amazon_price_snapshot_daily (date_jst TEXT NOT NULL
 db.exec(`CREATE TABLE dim_mall (mall_key TEXT PRIMARY KEY, label TEXT, display_order INTEGER, is_channel INTEGER, in_daily_summary INTEGER, tax_included INTEGER, fee_rate_approx REAL)`);
 createTables(db);
 
-const insProduct = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?)`);
-insProduct.run('abc-001', 'テスト商品A', '単品', '取扱中', 1200, 500, '確定', 100, 0.1, null);
-insProduct.run('abc-002', 'テスト商品B', '単品', '取扱中', 900, 300, '確定', 100, 0.1, null);
-insProduct.run('abc-set', 'A+Bセット', 'セット', '取扱中', 2000, null, '確定', 150, 0.1, 2);
-insProduct.run('abc-set2', '原価欠けセット', 'セット', '取扱中', 2500, null, '未確定', 150, 0.1, 2);
+const insProduct = db.prepare(`INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
+insProduct.run('abc-001', 'テスト商品A', '単品', '取扱中', 1200, 500, '確定', 100, 'ネコポス', 0.1, null);
+insProduct.run('abc-002', 'テスト商品B', '単品', '取扱中', 900, 300, '確定', 100, 'ネコポス', 0.1, null);
+insProduct.run('abc-set', 'A+Bセット', 'セット', '取扱中', 2000, null, '確定', 150, 'ネコポス', 0.1, 2);
+insProduct.run('abc-set2', '原価欠けセット', 'セット', '取扱中', 2500, null, '未確定', 150, 'ネコポス', 0.1, 2);
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set', 'abc-001', 2, 'テスト商品A', 500, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set', 'abc-002', 1, 'テスト商品B', 300, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set2', 'abc-001', 1, 'テスト商品A', 500, 'now');
@@ -135,8 +135,8 @@ console.log('\n── 楽天の文字列価格 (M0実測) ──');
 console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行にまとめる (2026-08-30 実機で判明) ──');
 {
   // 実データと同じ形: ne_code=0726-001802-bk に対し al=360 / am=0726-001802-bk / w=0726-001802
-  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?)')
-    .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 100, 0.1, null);
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 100, '定形外規格内（50g以内）', 0.1, null);
   for (const [rc, src] of [['360', 'al'], ['0726-001802-bk', 'am'], ['0726-001802', 'w']]) {
     db.prepare('INSERT INTO mirror_rakuten_sku_map VALUES (?,?,?,?)').run(rc, '0726-001802-bk', src, 'now');
   }
@@ -210,6 +210,42 @@ console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品�
   const wrong = await fetchYahooPricesRaw(
     [{ key: '0726-001802-zz', candidates: ['0726-001802-zz', '0726-001802'] }], yahooDeps);
   eq(wrong.get('0726-001802-zz').found, false, '親ページに自分のコードが無ければ未確定');
+}
+
+console.log('\n── 発送方法: モール側の設定を抜き出す (売価差の理由になるため) ──');
+{
+  _resetCodeMapCache();
+  const rk = await fetchRakutenPrices([{ key: 'ship-001', aliases: ['ship-001'] }], {
+    fetchAllItemCodes: async () => ({ 'ship-001': 'ship-001' }),
+    fetchItemDetailsBulkDetailed: async () => ({
+      items: [{
+        manageNumber: 'ship-001', title: 'T',
+        variants: {
+          'ship-001': {
+            standardPrice: '577', normalDeliveryDateId: 4,
+            shipping: { shippingMethodGroup: '1', postageIncluded: true, singleItemShipping: 0, okihaiSetting: true },
+          },
+        },
+      }],
+      failed: [],
+    }),
+  });
+  eq(rk.get('ship-001').shipping, { methodGroup: '1', postageIncluded: true, singleItemShipping: 0, deliveryDateId: 4 },
+    '楽天: variant の shipping (配送方法セット番号・送料込みか) を返す');
+
+  const yh = await fetchYahooPricesRaw([{ key: 'ship-y', candidates: ['ship-y'] }], {
+    fetchYahooItemDetail: async (c) => ({
+      ok: true, ItemCode: c, Name: 'Y', Price: 698, SubCodes: [],
+      Delivery: '2', PostageSet: '1', ShipWeight: '50',
+    }),
+  });
+  eq(yh.get('ship-y').shipping, { delivery: '2', postageSet: '1', shipWeight: '50' },
+    'Yahoo: Delivery / PostageSet / ShipWeight を返す');
+
+  const none = await fetchYahooPricesRaw([{ key: 'ship-z', candidates: ['ship-z'] }], {
+    fetchYahooItemDetail: async (c) => ({ ok: true, ItemCode: c, Name: 'Y', Price: 100, SubCodes: [] }),
+  });
+  eq(none.get('ship-z').shipping, null, '発送情報が無ければ null (空の項目を作らない)');
 }
 
 console.log('\n── 引き当てできないモールは行を消さず「未解決」で出す (要件 F1) ──');

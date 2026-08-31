@@ -42,7 +42,7 @@ export function loadProducts(db, codes) {
   const rows = db.prepare(`
     SELECT 商品コード AS code, 商品名 AS name, 商品区分 AS kind, 取扱区分 AS handling,
            標準売価 AS listPrice, 原価 AS cost, 原価状態 AS costStatus, 送料 AS shipping,
-           消費税率 AS taxRate, セット構成品数 AS setCount
+           配送方法 AS deliveryMethod, 消費税率 AS taxRate, セット構成品数 AS setCount
       FROM mirror_products
      WHERE LOWER(TRIM(商品コード)) IN (${placeholders(keys.length)})
   `).all(...keys);
@@ -309,6 +309,7 @@ export function buildTargets(db, inputCodes, opts = {}) {
       costSource,
       taxRate: p.taxRate == null ? null : Number(p.taxRate),
       shipping: p.shipping == null ? null : Number(p.shipping),
+      deliveryMethod: p.deliveryMethod || null,
       listPrice: p.listPrice == null ? null : Number(p.listPrice),
       setComponents: setInfo ? setInfo.components : null,
       listings: resolveListings(db, p.code),

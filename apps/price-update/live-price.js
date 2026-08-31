@@ -60,6 +60,22 @@ async function itemNumberToManageNumber(deps) {
 export function _resetCodeMapCache() { _codeMap = null; _codeMapAt = 0; }
 
 /**
+ * 楽天 variant の発送設定を読む (要件外だが、モール間の売価差の理由が発送方法にあるため — 中原さん 8/31)。
+ * 楽天が持っているのは「配送方法セットの番号」で、名前 (定形外郵便 等) は RMS のマスタ側にある。
+ * ここでは持っている値をそのまま渡し、画面には番号と送料込みかどうかを出す。
+ */
+export function shippingOfRakutenVariant(v) {
+  const s = v?.shipping;
+  if (!s || typeof s !== 'object') return null;
+  return {
+    methodGroup: s.shippingMethodGroup == null ? null : String(s.shippingMethodGroup),
+    postageIncluded: typeof s.postageIncluded === 'boolean' ? s.postageIncluded : null,
+    singleItemShipping: s.singleItemShipping ?? null,
+    deliveryDateId: v?.normalDeliveryDateId ?? null,
+  };
+}
+
+/**
  * 楽天のライブ価格。listingCode は AM/AL/W いずれか (mirror_rakuten_sku_map 由来)。
  *
  * @param {string[]} listingCodes
@@ -138,6 +154,8 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       found: price != null,
       reason: price == null ? '設定価格を整数円として読めません' : null,
       itemTitle: item?.title || null,
+      // 発送設定 (SKU単位)。同じ商品でもモールで配送方法が違い、それが売価差の理由になる
+      shipping: shippingOfRakutenVariant(variants[matchedKey]),
     });
   }
   return out;
@@ -226,6 +244,10 @@ export async function fetchYahooPrices(targets, deps = {}) {
         found: price != null,
         reason,
         itemName: d?.Name || null,
+        // 発送設定 (商品単位)。Delivery = 配送方法、PostageSet = 送料設定、ShipWeight = 配送重量
+        shipping: (d?.Delivery != null || d?.PostageSet != null || d?.ShipWeight != null)
+          ? { delivery: d.Delivery ?? null, postageSet: d.PostageSet ?? null, shipWeight: d.ShipWeight ?? null }
+          : null,
       };
       break;   // 当たった候補で確定 (以降の候補は試さない)
     }

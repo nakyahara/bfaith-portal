@@ -149,6 +149,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
       let note = null;
       let skuCode = l.skuCode;
       let listingCode = l.listingCode;
+      let mallShipping = null;   // モール側の発送設定 (モールで配送方法が違うと売価差の理由になる)
       let url = listingUrl(l.mall, l.listingCode);
 
       if (!l.listingCode) {
@@ -158,7 +159,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         const p = rakutenPrices.get(key);
         if (p?.found) {
           price = p.price; priceSource = '楽天RMS (ライブ)'; priceIsLive = true;
-          confidence = 'confirmed'; skuCode = p.skuCode;
+          confidence = 'confirmed'; skuCode = p.skuCode; mallShipping = p.shipping || null;
           // 表示は実際の商品管理番号に差し替える (別名のままだと楽天の画面で探せない)
           if (p.manageNumber) { listingCode = p.manageNumber; url = listingUrl('rakuten', p.manageNumber); }
         } else {
@@ -169,7 +170,7 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         const p = yahooPrices.get(key);
         if (p?.found) {
           price = p.price; priceSource = 'Yahoo itemInfo (ライブ)'; priceIsLive = true;
-          confidence = 'confirmed';
+          confidence = 'confirmed'; mallShipping = p.shipping || null;
           // カラバリは「親の商品コード + 個別商品コード」で登録されている。
           // 当たった実際の商品コードに差し替える (Yahoo の画面で探せるように)
           if (p.itemCode) { listingCode = p.itemCode; url = listingUrl('yahoo', p.itemCode); }
@@ -207,6 +208,8 @@ async function buildPreviewRows(db, codes, costOverrides, deps = {}) {
         costSource: t.costSource,
         taxRate: t.taxRate,
         shipping: t.shipping,
+        neDeliveryMethod: t.deliveryMethod,   // NE側の配送方法 (概算粗利の送料はこれが根拠)
+        mallShipping,                          // モール側の発送設定 (楽天=配送方法セット / Yahoo=Delivery等)
         feeRate: dim.feeRateOf(l.mall),
         url,
         note,

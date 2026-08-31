@@ -73,7 +73,7 @@
           <tr>
             <th style="width:28px;"></th>
             <th>モール</th><th>商品</th><th>出品コード / SKU</th><th>出品の確認</th>
-            <th class="num">現在価格</th><th class="num">原価(税抜)</th>
+            <th class="num">現在価格</th><th>発送</th><th class="num">原価(税抜)</th>
             <th class="num">新売価</th><th class="num">変更</th><th class="num">概算粗利</th>
             <th>判定</th><th></th>
           </tr>
@@ -191,6 +191,31 @@
     }).join('');
   }
 
+  // 発送まわり: モール側の設定 (これが売価差の理由になる) と、NE側の配送方法 (概算粗利の送料の根拠)
+  function shippingCell(r) {
+    const parts = [];
+    const s = r.mallShipping;
+    if (r.mall === 'rakuten' && s) {
+      const bits = [];
+      if (s.methodGroup != null) bits.push('配送方法セット ' + esc(s.methodGroup));
+      if (s.postageIncluded === true) bits.push('送料込み');
+      if (s.postageIncluded === false) bits.push('送料別');
+      if (s.singleItemShipping === 1) bits.push('単品配送');
+      if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
+    } else if (r.mall === 'yahoo' && s) {
+      const bits = [];
+      if (s.delivery) bits.push('配送方法 ' + esc(s.delivery));
+      if (s.postageSet) bits.push('送料設定 ' + esc(s.postageSet));
+      if (s.shipWeight) bits.push(esc(s.shipWeight) + 'g');
+      if (bits.length) parts.push('<div>' + bits.join(' / ') + '</div>');
+    }
+    if (r.neDeliveryMethod || r.shipping != null) {
+      parts.push('<div class="pu-note">NE: ' + esc(r.neDeliveryMethod || '未登録')
+        + (r.shipping != null ? ' ' + yen(r.shipping) + '円' : '') + '</div>');
+    }
+    return parts.length ? parts.join('') : '<span class="pu-note">—</span>';
+  }
+
   function evalCell(ev) {
     if (!ev) return '<span class="pu-note">—</span>';
     if (ev.blocks.length) return '<span class="bad">' + ev.blocks.map(esc).join('<br>') + '</span>';
@@ -225,6 +250,7 @@
         + '<td><span class="chip c-' + r.confidence + '">' + esc(CONF_LABEL[r.confidence]) + '</span>'
         + '<div class="pu-note">' + esc(r.resolveSource || '') + '</div></td>'
         + '<td class="num">' + yen(r.price) + '<div class="pu-note">' + esc(r.priceSource || r.note || '取得できず') + '</div></td>'
+        + '<td>' + shippingCell(r) + '</td>'
         + '<td class="num">' + yen(r.cost) + '<div class="pu-note">' + esc(r.costSource || '') + '</div></td>'
         + '<td class="num"><input type="number" class="price-in" data-key="' + r.key + '" min="1" step="1" value="' + (r.newPrice == null ? '' : r.newPrice) + '"></td>'
         + '<td class="num">' + ratio + '</td>'
