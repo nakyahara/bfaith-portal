@@ -19,6 +19,7 @@ import {
   upsertDraftYahoo, upsertImageProduction, setImageWorkflowState, MATERIAL_STATUSES, MATERIAL_STATUS_CODES, listGenerationQueue, isNotionImported, isNeCodeUniqueEnforced, imageRefOfFileId,
   DRAFT_STATUSES, STATUS_LABELS, AI_OUTPUT_KINDS, STAFF_KINDS, STAFF_COLORS,
   IMAGE_PRIORITIES, IMAGE_PRIORITY_VALUES, OWN_BRAND_IMAGE_PRIORITY, canUseImageProduction,
+  IMAGE_PRODUCTION_PRIORITIES,
 } from './db.js';
 // 夜間自動化 (2026-08-28): 人の確認待ち + 文字数ガード
 import {
@@ -319,8 +320,10 @@ router.get('/detail/:id', (req, res) => {
     materialStatuses: MATERIAL_STATUSES,
     // メーカー型番の属性名 (画面はこの属性行を出さない — 入口はメーカー型番欄だけ)
     modelAttrName: MODEL_ATTR_NAME,
-    // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)
+    // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
+    // 重要度をその場で変えたとき、画面側が出し分けを判定し直すために集合も渡す
     canImageProduction: canUseImageProduction(draft),
+    imageProductionPriorities: IMAGE_PRODUCTION_PRIORITIES,
     // 確認中 (2026-08-31): 情報待ちの理由 (固定リスト) と文字数上限
     checkingReasons: CHECKING_REASONS,
     checkingNoteMax: CHECKING_NOTE_MAX,

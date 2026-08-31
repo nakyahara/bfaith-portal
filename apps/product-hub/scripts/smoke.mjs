@@ -5019,6 +5019,7 @@ for (const [name, file, data] of renders) {
         // 画像制作の管理項目を使える商品か (自社商品 / 取扱先限定商品)。
         // fixture 側の draft で上書きされる (...data が後に来る)
         canImageProduction: true,
+        imageProductionPriorities: dbmod.IMAGE_PRODUCTION_PRIORITIES,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く

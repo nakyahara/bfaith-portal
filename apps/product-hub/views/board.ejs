@@ -579,6 +579,10 @@
       });
     });
     s.addEventListener('change', async function () {
+      // 同じ商品のセレクトは TOP/詳細 の 2 枚ある。続けて変えると応答の順序で
+      // 画面と DB が食い違うので、保存が終わるまで同じ商品のものは全部止める (Codex R2 medium)
+      const sameDraft = [...document.querySelectorAll('.kb-priority[data-draft="' + s.dataset.draft + '"]')];
+      sameDraft.forEach(function (o) { o.disabled = true; });
       try {
         const res = await fetch('/apps/product-hub/api/drafts/' + s.dataset.draft + '/image-priority', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -602,6 +606,8 @@
       } catch (err) {
         alert('通信エラー: ' + err.message);
         location.reload();
+      } finally {
+        sameDraft.forEach(function (o) { o.disabled = false; });
       }
     });
   });
