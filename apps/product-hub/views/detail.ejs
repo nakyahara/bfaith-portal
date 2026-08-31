@@ -27,6 +27,25 @@
   .mall-dot.mall-doing { background: #f59e0b; }
   .mall-dot.mall-skip { background: #cbd5e1; opacity: .5; }
   #wf-card select, #wf-card input { font-size: 12px; padding: 4px 7px; }
+  /* 確認中 (2026-08-31 中原さん: 折りたたみでは気づけない)。商品名のすぐ下に 1 本の帯で置き、
+     理由ボタンを 1 タップで押せるようにする。立っているときは青く塗って見落とせなくする */
+  .chk-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+             margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+             background: #f8fafc; border: 1px solid #e2e8f0; }
+  .chk-bar.chk-on { background: #eff6ff; border: 2px solid #3b82f6; }
+  .chk-lead { font-size: 13px; font-weight: 700; color: #334155; }
+  .chk-bar.chk-on .chk-lead { color: #1e40af; }
+  .chk-reason { font-size: 15px; color: #1e3a8a; }
+  .chk-days { font-size: 12px; font-weight: 700; color: #fff; background: #3b82f6;
+              border-radius: 999px; padding: 2px 10px; }
+  .chk-pick { font-size: 13px; padding: 7px 14px; border: 1px solid #93c5fd;
+              background: #fff; color: #1e40af; border-radius: 8px; cursor: pointer; }
+  .chk-pick:hover { background: #dbeafe; border-color: #3b82f6; }
+  .chk-clear { font-size: 13px; padding: 7px 16px; background: #16a34a; color: #fff;
+               border: 1px solid #16a34a; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  .chk-clear:hover { background: #15803d; }
+  .chk-note { width: 240px; font-size: 12px; }
+  .chk-select { width: auto; font-size: 12px; }
 </style>
 <div class="wrap wide">
 
@@ -82,46 +101,35 @@
         ラベルが出て列の先頭に並ぶ。AI の情報入力だけは止まる (確認中に原稿が書かれないように) %>
     <% if (draft.checking_since) { %>
       <% const cr = checkingReasons.find((r) => r.code === draft.checking_reason_code); %>
-      <div class="banner-warn" style="margin:12px 0 0; background:#eff6ff; border-color:#3b82f6;">
-        <div>
-          <strong>🔍 確認中: <%= cr ? cr.label : (draft.checking_reason_code || '') %></strong>
-          <% if (draft.checking_note) { %>
-            <div style="margin-top:4px; white-space:pre-wrap;"><%= draft.checking_note %></div>
+      <div class="chk-bar chk-on">
+        <span class="chk-lead">🔍 確認中</span>
+        <strong class="chk-reason"><%= cr ? cr.label : (draft.checking_reason_code || '') %></strong>
+        <% if (checkingDays != null) { %><span class="chk-days"><%= checkingDays %>日目</span><% } %>
+        <input type="text" id="checking-note" value="<%= draft.checking_note || '' %>"
+               maxlength="<%= checkingNoteMax %>" placeholder="補足 (任意・入力したら更新を押す)" class="chk-note">
+        <select id="checking-reason" class="chk-select" title="理由を変える">
+          <% for (const r of checkingReasons) { %>
+            <option value="<%= r.code %>" <%= r.code === draft.checking_reason_code ? 'selected' : '' %>><%= r.label %></option>
           <% } %>
-          <div class="muted" style="font-size:11px; margin-top:6px;">
-            <%= draft.checking_by || '' %> / <%= draft.checking_since %> から
-            — ボードのカードにラベルが出て列の先頭に並びます。この間 AI の情報入力は動きません
-          </div>
-          <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-            <select id="checking-reason" style="width:auto; font-size:12px;">
-              <% for (const r of checkingReasons) { %>
-                <option value="<%= r.code %>" <%= r.code === draft.checking_reason_code ? 'selected' : '' %>><%= r.label %></option>
-              <% } %>
-            </select>
-            <input type="text" id="checking-note" value="<%= draft.checking_note || '' %>"
-                   maxlength="<%= checkingNoteMax %>" placeholder="補足 (任意)" style="width:260px; font-size:12px;">
-            <button class="btn btn-sm" id="checking-set-btn">理由・補足を更新</button>
-            <button class="btn btn-sm" id="checking-clear-btn">✅ 確認できた (解除)</button>
-          </div>
-        </div>
+        </select>
+        <button class="btn btn-sm" id="checking-set-btn">更新</button>
+        <span style="flex:1"></span>
+        <button class="btn chk-clear" id="checking-clear-btn">✅ 確認できた</button>
+      </div>
+      <div class="muted" style="font-size:11px; margin-top:4px;">
+        <%= draft.checking_by || '' %> / <%= draft.checking_since %> から
+        — ボードのカードにラベルが出て列の先頭に並びます。この間 AI の情報入力は動きません
       </div>
     <% } else { %>
-      <details style="margin-top:12px;">
-        <summary style="cursor:pointer; font-size:12px; color:#475569;">🔍 確認中にする (実物やメーカーへの確認待ち)</summary>
-        <div style="margin-top:8px; display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-          <select id="checking-reason" style="width:auto; font-size:12px;">
-            <% for (const r of checkingReasons) { %>
-              <option value="<%= r.code %>"><%= r.label %><%= r.hint ? ` — ${r.hint}` : '' %></option>
-            <% } %>
-          </select>
-          <input type="text" id="checking-note" maxlength="<%= checkingNoteMax %>"
-                 placeholder="補足 (任意)" style="width:260px; font-size:12px;">
-          <button class="btn btn-sm" id="checking-set-btn">確認中にする</button>
-        </div>
-        <div class="muted" style="font-size:11px; margin-top:4px;">
-          工程は動きません。ボードのカードにラベルが出て列の先頭に並び、AI の情報入力だけ止まります
-        </div>
-      </details>
+      <%# ワンタップで立てられるようにする (2026-08-31 中原さん: 折りたたみは気づけない)。
+          理由ごとにボタンを並べ、押した時点で確認中になる。補足は立てたあとで入れられる %>
+      <div class="chk-bar">
+        <span class="chk-lead">🔍 確認中にする</span>
+        <% for (const r of checkingReasons) { %>
+          <button class="btn chk-pick" data-reason="<%= r.code %>" title="<%= r.hint %>"><%= r.short || r.label %></button>
+        <% } %>
+        <span class="muted" style="font-size:11px;">押すとボードのカードにラベルが出て、列の先頭に並びます</span>
+      </div>
     <% } %>
     <% if (draft.source === 'notion_import') { %>
       <div class="banner-warn" style="margin:12px 0 0;">
@@ -2963,23 +2971,54 @@
     });
   }
 
-  // 確認中 (2026-08-31)。立てる / 理由・補足の更新 / 解除。工程も status も動かさない
+  // 確認中 (2026-08-31)。立てる / 理由・補足の更新 / 解除。工程も status も動かさない。
+  //
+  // 3 つとも同じ形で守る (Codex R1 medium): 押した瞬間に無効化 → **失敗したら必ず戻す** →
+  // 応答が読めなくても固まらせない。通信エラーで disabled のまま残ると「押しても何も起きない
+  // ボタン」になり、原因が分からないまま放置される。
+  // post() 自体を「常に {ok:false} を返す」契約に変えれば画面全部が直るが、他のボタンの
+  // 挙動まで変わるので今回は確認中まわりに閉じる (別途まとめて直す)
+  async function checkingCall(body, okMsg, buttons) {
+    const btns = buttons.filter(Boolean);
+    const enable = (on) => btns.forEach((b) => { b.disabled = !on; });
+    enable(false);
+    try {
+      const r = await post(BASE + '/checking', body);
+      if (!r || !r.ok) enable(true);
+      showAndReload(r || { ok: false, error: '応答を読めませんでした' }, okMsg);
+    } catch (e) {
+      enable(true);
+      alert('操作できませんでした (通信エラー)。もう一度押してください');
+    }
+  }
+
+  // 理由ボタンのワンタップで立てる (2026-08-31 中原さん要望: 折りたたみでは気づけない)。
+  // 押した理由がそのまま入るので、選んでから確定、の 2 手にならない
+  {
+    const picks = [...document.querySelectorAll('.chk-pick')];
+    for (const btn of picks) {
+      btn.addEventListener('click', () =>
+        checkingCall({ on: true, reason_code: btn.dataset.reason }, '確認中にしました', picks));
+    }
+  }
   const checkingSetBtn = document.getElementById('checking-set-btn');
   if (checkingSetBtn) {
-    checkingSetBtn.addEventListener('click', async () => {
+    checkingSetBtn.addEventListener('click', () => {
       const reasonEl = document.getElementById('checking-reason');
       const noteEl = document.getElementById('checking-note');
-      showAndReload(await post(BASE + '/checking', {
+      return checkingCall({
         on: true,
         reason_code: reasonEl ? reasonEl.value : '',
         note: noteEl ? noteEl.value : null,
-      }), '確認中にしました');
+        // 解除ボタンも一緒に止める (Codex R2 medium): 更新中に解除を押せると 2 リクエストが
+        // 並走し、到着順によっては「解除したのに確認中へ戻る」。更新と解除は相互排他にする
+      }, '確認中の内容を更新しました', [checkingSetBtn, document.getElementById('checking-clear-btn')]);
     });
   }
   const checkingClearBtn = document.getElementById('checking-clear-btn');
   if (checkingClearBtn) {
     checkingClearBtn.addEventListener('click', async () => {
-      showAndReload(await post(BASE + '/checking', { on: false }), '確認中を解除しました');
+      await checkingCall({ on: false }, '確認中を解除しました', [checkingClearBtn, checkingSetBtn]);
     });
   }
 

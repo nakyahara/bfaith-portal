@@ -4680,8 +4680,8 @@ renders.push(
       ...d0[2],
       pageInfo: { ...(d0[2].pageInfo || {}), product_type: 'general', brand_name: 'B-Faith', content_volume: '200g' },
     }]);
-    // 確認中 (2026-08-31): 立っているとき = 青いバナー + 解除ボタン、
-    // 立っていないとき = 折りたたみの「確認中にする」(既定の detail fixture 側で描かれる)
+    // 確認中 (2026-08-31): 立っているとき = 青い帯 + 経過日数 + 解除ボタン、
+    // 立っていないとき = 理由ボタンが並ぶ帯 (既定の detail fixture 側で描かれる)
     renders.push(['detail.ejs (確認中)', 'detail.ejs', {
       ...d0[2],
       draft: {
@@ -4689,6 +4689,7 @@ renders.push(
         checking_reason_code: 'package_label', checking_note: '裏面の成分表示を確認',
         checking_since: '2026-08-25T00:00:00.000Z', checking_by: 'smoke@b-faith.biz',
       },
+      checkingDays: 6,
     }]);
   }
 }
@@ -4739,6 +4740,7 @@ for (const [name, file, data] of renders) {
         // 確認中 (2026-08-31)。detail は理由リスト、board は絞り込みの状態を使う
         checkingReasons: dbmod.CHECKING_REASONS,
         checkingNoteMax: dbmod.CHECKING_NOTE_MAX,
+        checkingDays: null,
         checkingOnly: false,
         promptTemplates: { available: true, reason: null, initialJudge: '【入力】<x>', productAnalysis: 'LP {{SUPPLEMENT}}' },
         // 工程パネル (detail.ejs)。fixture 側で上書きできるよう ...data より前に置く
@@ -4815,13 +4817,22 @@ for (const [name, file, data] of renders) {
     && !/<a class="chip on" href="\/apps\/product-hub\/board">/.test(bhOnly),
     bhOnly.match(/<a class="chip on"[\s\S]{0,80}/g)?.join(' | ') || 'on のチップが無い');
   const dh = renderedHtml.get('detail.ejs (確認中)') || '';
-  check('詳細: 確認中のバナーと解除ボタンが出る',
-    dh.includes('🔍 確認中: パッケージ裏面の確認待ち') && dh.includes('id="checking-clear-btn"')
+  check('詳細: 確認中の帯と解除ボタンが出る',
+    dh.includes('🔍 確認中') && dh.includes('パッケージ裏面の確認待ち') && dh.includes('id="checking-clear-btn"')
     && dh.includes('裏面の成分表示を確認'), dh.includes('checking-clear-btn') ? '文言が出ていない' : 'ボタンが無い');
+  check('詳細: 確認中は何日目かを出す (待ちっぱなしを見つけるため)', dh.includes('6日目'));
   const dh0 = renderedHtml.get('detail.ejs (full/own_brand)') || '';
-  check('詳細: 確認中でないときは「確認中にする」の入口だけ出る (解除ボタンは無い)',
-    dh0.includes('🔍 確認中にする') && dh0.includes('id="checking-set-btn"')
-    && !dh0.includes('id="checking-clear-btn"'));
+  // 2026-08-31 中原さん: 折りたたみ (details/summary) では気づけない → 理由ボタンを
+  // 最初から並べて 1 タップで立つ形にした。折りたたみに戻さないための検査
+  check('詳細: 確認中でないときは理由ボタンが**開いた状態で**並ぶ (折りたたみを使わない)',
+    dh0.includes('🔍 確認中にする') && dh0.includes('class="btn chk-pick"')
+    && !/<summary[^>]*>[^<]*確認中/.test(dh0) && !dh0.includes('id="checking-clear-btn"'),
+    /<summary[^>]*>[^<]*確認中/.test(dh0) ? '折りたたみに戻っている' : 'ボタンが無い');
+  check('詳細: 理由ボタンは全理由ぶん出て、押す理由がボタン自身に入っている (1タップで確定)', (() => {
+    const picks = [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]);
+    return picks.length === dbmod.CHECKING_REASONS.length
+      && dbmod.CHECKING_REASONS.every((r) => picks.includes(r.code));
+  })(), [...dh0.matchAll(/data-reason="([a-z_]+)"/g)].map((m) => m[1]).join(',') || '(1つも無い)');
   // 後始末: ボード fixture 用に立てた確認中を戻す (後続のテストに持ち越さない)
   dbmod.clearDraftChecking(db, wfDraftId, { actor: 'smoke' });
 }

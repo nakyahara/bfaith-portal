@@ -136,11 +136,12 @@ export const GENERATION_BLOCK_REASON_MAX = 1000;
  * 理由コードを固定にするのは、あとで「何を待って止まっているか」を数えるため
  * (自由記述だけだと集計できない)。補足は checking_note に書く。
  */
+// short = 詳細画面のワンタップ用ボタンの文字 (長いと押しにくい)。label = カード・バナーの表示
 export const CHECKING_REASONS = [
-  { code: 'package_label', label: 'パッケージ裏面の確認待ち', hint: '自社商品の成分表示・原材料など、実物を見ないと埋まらない項目がある' },
-  { code: 'no_web_info', label: 'ウェブに情報が無い', hint: 'メーカー・仕入先へ問い合わせ中' },
-  { code: 'share_info', label: '仕入れ担当と共有・相談中', hint: 'どういう商品なのかを仕入れ担当とすり合わせている' },
-  { code: 'other', label: 'その他', hint: '' },
+  { code: 'package_label', short: '裏面を確認', label: 'パッケージ裏面の確認待ち', hint: '自社商品の成分表示・原材料など、実物を見ないと埋まらない項目がある' },
+  { code: 'no_web_info', short: 'ウェブに情報なし', label: 'ウェブに情報が無い', hint: 'メーカー・仕入先へ問い合わせ中' },
+  { code: 'share_info', short: '仕入れ担当と相談', label: '仕入れ担当と共有・相談中', hint: 'どういう商品なのかを仕入れ担当とすり合わせている' },
+  { code: 'other', short: 'その他', label: 'その他', hint: '' },
 ];
 export const CHECKING_REASON_CODES = new Set(CHECKING_REASONS.map((r) => r.code));
 export const CHECKING_REASON_LABELS = Object.fromEntries(CHECKING_REASONS.map((r) => [r.code, r.label]));
