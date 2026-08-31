@@ -1297,7 +1297,14 @@ const server = http.createServer(async (req, res) => {
         for (const m of String(r.body).matchAll(/<([A-Za-z][\w.]*)\b/g)) {
           counts[m[1]] = (counts[m[1]] || 0) + 1;
         }
-        return { tagCounts: counts, head: String(r.body).slice(0, 4000), length: String(r.body).length };
+        const body = String(r.body);
+        const sub = body.match(/<SubCodes>[\s\S]{0,1800}/i);
+        const opt = body.match(/<Options>[\s\S]{0,600}/i);
+        return {
+          tagCounts: counts, head: body.slice(0, 1200), length: body.length,
+          subCodesBlock: sub ? sub[0] : null,
+          optionsBlock: opt ? opt[0] : null,
+        };
       })() : undefined;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
