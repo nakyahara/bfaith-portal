@@ -2259,7 +2259,9 @@ router.post('/api/drafts/:id/image-priority', (req, res) => {
       logEvent(db, draft.id, 'updated', `own_brand ${cur.own_brand} -> ${ownBrand} (画像の重要度と連動)`, actorOf(req));
     }
   })();
-  res.json({ ok: true, own_brand: ownBrand });
+  // image_priority も返す: 画面はこの値で「画像制作の管理項目が使えるか」を判定し直す
+  // (返さないと、取扱先限定商品に変えても欄が出ないまま — Codex R3 medium)
+  res.json({ ok: true, own_brand: ownBrand, image_priority: value });
 });
 
 // 自社商品チェックの即保存 (2026-08-24)。基本情報の汎用APIとは分ける:

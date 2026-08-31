@@ -1837,6 +1837,17 @@
     // 画像制作の管理項目を使える重要度 (サーバの canUseImageProduction と同じ集合)
     const IMAGE_PRODUCTION_PRIORITIES = <%- JSON.stringify(imageProductionPriorities) %>;
     const CAN_IMAGE_PRODUCTION = <%= canImageProduction ? 'true' : 'false' %>;
+    // 画像制作の管理項目が使えるかどうかが変わったら読み直す (Codex R2/R3 medium)。
+    // 出し分けを更新しないと、使えるようになったのに欄が出ない /
+    // 使えなくなったのに欄が残って保存で 400 になる。重要度・自社商品チェックの両方から呼ぶ
+    function reloadIfImageProductionChanged(json, noteEl) {
+      const canNow = json.own_brand === 1 || json.own_brand === true
+        || IMAGE_PRODUCTION_PRIORITIES.indexOf(String(json.image_priority || '').trim()) >= 0;
+      if (canNow === CAN_IMAGE_PRODUCTION) return false;
+      if (noteEl) noteEl.textContent = '保存しました (画像制作の欄を出し直します)';
+      setTimeout(() => location.reload(), 600);
+      return true;
+    }
     const applyPriorityColors = () => {
       const p = IMG_PRIORITIES.find((x) => x.value === imgPrioritySel.value);
       imgPrioritySel.style.background = p ? p.bg : '';
@@ -1846,22 +1857,22 @@
     imgPrioritySel.addEventListener('change', async () => {
       const note = document.getElementById('image-priority-note');
       note.textContent = '保存中…';
-      const json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
+      // 保存中は操作させない (Codex R3 medium): 続けて変えると応答の順序で表示と DB が食い違う
+      imgPrioritySel.disabled = true;
+      let json;
+      try {
+        json = await post(BASE + '/image-priority', { value: imgPrioritySel.value });
+      } catch (e) {
+        json = { ok: false, error: '通信エラーで重要度を保存できませんでした' };
+      } finally {
+        imgPrioritySel.disabled = false;
+      }
       if (!json.ok) { note.textContent = ''; alert(json.error || '保存に失敗しました'); return; }
       note.textContent = '保存しました';
       applyPriorityColors();
       // 自社商品チェックと連動 (サーバーが own_brand も保存済み。表示を合わせる)
       if (ownBrandChk && json.own_brand !== undefined) ownBrandChk.checked = !!json.own_brand;
-      // 画像制作の管理項目が使えるかどうかが変わったら読み直す (Codex R2 medium)。
-      // 出し分けを更新しないと、使えるようになったのに欄が出ない / 使えなくなったのに欄が残って
-      // 保存で 400 になる
-      const canNow = json.own_brand === 1 || json.own_brand === true
-        || IMAGE_PRODUCTION_PRIORITIES.indexOf(String(json.image_priority || '').trim()) >= 0;
-      if (canNow !== CAN_IMAGE_PRODUCTION) {
-        note.textContent = '保存しました (画像制作の欄を出し直します)';
-        setTimeout(() => location.reload(), 600);
-        return;
-      }
+      if (reloadIfImageProductionChanged(json, note)) return;
       setTimeout(() => { note.textContent = ''; }, 2000);
     });
     // 自社商品チェック: 変更で即保存し、重要度「自社商品（重要度：高）」と連動する
@@ -1887,6 +1898,8 @@
           applyPriorityColors();
         }
         result.textContent = value ? '自社商品に設定しました (画像の重要度も連動)' : '自社商品を解除しました';
+        // 画面の案内自体が「自社商品をONにする」と誘導しているので、ここでも出し分けを直す
+        reloadIfImageProductionChanged(json, result);
       }
       ownBrandChk.addEventListener('change', () => {
         const value = ownBrandChk.checked;
