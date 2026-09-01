@@ -33,6 +33,11 @@ console.log('\n── 応答から「どの項目が足りないか」を読む 
   eq(e.message, 'パスは必須です。', 'CDATA のメッセージも読む');
 
   eq(editItemError({ status: 200, body: '<ResultSet><Result><Status>OK</Status></Result></ResultSet>' }), null, '成功なら null');
+  // ★2xx でも Status OK が無ければ成功にしない (Codex R3)
+  ok(editItemError({ status: 200, body: '' }), '★本文が空の 200 は成功にしない');
+  ok(editItemError({ status: 200, body: '<html>maintenance</html>' }), '★見たことのない 200 は成功にしない');
+  ok(editItemError({ status: 200, body: '' }).unrecognized, '「形が違う」と分かる印が付く');
+  ok(!isDefiniteRejection(editItemError({ status: 200, body: '' })), '★形が違う 200 は弾かれたとも言い切らない (戻しに行く)');
   ok(editItemError({ status: 200, body: '<ResultSet><Result><Status>NG</Status></Result></ResultSet>' }),
     '★HTTP 200 でも Status NG は失敗');
   ok(editItemError({ status: 500, body: 'boom' }), 'HTTP エラーは失敗');
@@ -73,6 +78,9 @@ console.log('\n── 「前」の応答から値を取る ──');
   eq(fieldValueFrom(flat, base, 'product_category'), '13587', 'カテゴリ番号');
   eq(fieldValueFrom(flat, base, 'caption'), '説明', '説明文');
   eq(fieldValueFrom(flat, base, 'abstract'), null, '中身が空の項目は取れない (空文字を送らない)');
+  // ★空文字が値として入っていても送らない
+  const emptyName = await flattenXml('<ResultSet><Result><ItemCode>zz-1</ItemCode><Name> </Name></Result></ResultSet>');
+  eq(fieldValueFrom(emptyName, itemBaseOf(emptyName, 'zz-1'), 'name'), null, '★空白だけの値は送らない');
   eq(fieldValueFrom(flat, base, 'headline'), null, '無い項目は null');
   eq(fieldValueFrom(flat, base, 'shipping_bogus'), null, '知らない項目は null');
   eq(fieldValueFrom(flat, null, 'name'), null, '商品の場所が分からなければ null');

@@ -51,13 +51,19 @@ export function editItemError(res) {
   };
   const status2xx = status >= 200 && status < 300;
   const ng = /<Status>\s*NG\s*<\/Status>/i.test(text);
-  if (status2xx && !ng && !/<Error[\s>]/i.test(text)) return null;
+  const okMarker = /<Status>\s*OK\s*<\/Status>/i.test(text);
+  // ★成功は「2xx かつ Status OK かつ Error 無し」だけ。
+  //   2xx で本文が空・壊れている・見たことのない形は成功にしない (Codex R3)。
+  //   成功にすると、あとで効いてくるかもしれない送信を「終わった」ことにしてしまう
+  if (status2xx && okMarker && !ng && !/<Error[\s>]/i.test(text)) return null;
+  const unrecognized = status2xx && !ng && !/<Error[\s>]/i.test(text);
   return {
     status,
     ng,
+    unrecognized,
     target: pick('Target'),
     code: pick('Code'),
-    message: pick('Message'),
+    message: unrecognized ? `応答の形が想定と違います: ${text.slice(0, 200)}` : pick('Message'),
   };
 }
 
@@ -94,11 +100,12 @@ export function fieldValueFrom(flat, itemBase, field) {
     if (!rest.endsWith(']') || !/^\d+$/.test(rest.slice(0, -1))) continue;
     hits.push({ path: k, value: v });
   }
-  if (hits.length === 0) return null;
-  if (hits.length === 1) return hits[0].value;
+  const nonEmpty = hits.filter((h) => String(h.value).trim() !== '');
+  if (nonEmpty.length === 0) return null;     // 中身が空の項目は送らない
+  if (nonEmpty.length === 1) return nonEmpty[0].value;
   // 複数あるときは、印のついたもの (origFlag="1") を本命とする
   if (spec.preferAttr) {
-    const marked = hits.filter((h) => flat.get(`${h.path}@${spec.preferAttr}`) === '1');
+    const marked = nonEmpty.filter((h) => flat.get(`${h.path}@${spec.preferAttr}`) === '1');
     if (marked.length === 1) return marked[0].value;
   }
   // ★どれか決められないなら null。当てずっぽうで送らない
