@@ -67,6 +67,27 @@ const YAHOO_API_GAP_MS = 1200;
  * ★self-test より前に置く (const は巻き上がらないので、後ろに書くと self-test から見えない)。
  */
 const PRICE_ONLY_KEYS = new Set(['item_code', 'price', 'sale_price', 'subcode_price']);
+/**
+ * expected (「今いくらのはず」) が全商品ぶん揃っているか。欠けていれば投げる。
+ * ★1件でも欠けると、その商品は照合もセール価格の確認も飛ばして送られてしまう。
+ *   「照合しないで送る」経路を作らないために、入口で止める。
+ */
+function assertExpectedForAll(items, expected) {
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) {
+    throw new Error('update-items: expected (今いくらのはず) が必要です。照合せずに送ることはできません');
+  }
+  for (const [i, it] of (items || []).entries()) {
+    const code = String(it?.item_code ?? '').trim();
+    const want = expected[code];
+    if (want === undefined || want === null || String(want).trim() === '') {
+      throw new Error(`update-items: ${i + 1}件目 (${code}) の expected がありません。照合せずに送ることはできません`);
+    }
+    if (!/^\d+$/.test(String(want).trim())) {
+      throw new Error(`update-items: ${i + 1}件目 (${code}) の expected が整数ではありません (${want})`);
+    }
+  }
+}
+
 /** 商品ごとのロック。★self-test より前に置く (const は巻き上がらない) */
 const yahooItemLocks = new Map();
 /** Yahoo に送ってよい価格の上限 (楽天側のガードと同じ) */
@@ -1307,6 +1328,9 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = JSON.parse(raw); } catch (_) { throw new Error('update-items: invalid JSON body'); }
       assertPriceOnlyItems(body.items, { clearSalePrice: body.clearSalePrice === true });
+      // ★expected は全商品ぶん必須 (Codex R3)。1件でも欠けていると、その商品だけ照合も
+      //   セール価格の確認も飛ばして送ってしまう。「照合しないで送る」経路を作らない
+      assertExpectedForAll(body.items, body.expected);
       const built = buildUpdateItemsBody(body.items, YAHOO_SELLER_ID, { includeItemNum: body.itemNum === true });
       const wantSubmit = body.submit !== false;
 
@@ -1315,10 +1339,9 @@ const server = http.createServer(async (req, res) => {
       //   割り込まれて、その変更を踏み潰す / 追加されたセール価格を空文字で消す。
       //   ⚠️Yahoo の管理画面から直に変えられた場合は API では閉じようがない (残る危険として明示)
       const outcome = await withYahooItemLock(built.codes, async () => {
-        if (body.expected && typeof body.expected === 'object') {
+        {
           for (const it of body.items) {
             const want = body.expected[it.item_code];
-            if (want === undefined) continue;
             const cur = await readItemForCheck(it.item_code);
             if (cur.error) return { conflict: { item_code: it.item_code, reason: cur.error } };
             if (cur.price !== Number(want)) {
@@ -2079,6 +2102,20 @@ function runSelfTest() {
   check('先頭ゼロ', parseGetItemDetailXml('<Result><Price>0080</Price></Result>').Price, null);
   check('全角', parseGetItemDetailXml('<Result><Price>１０８０</Price></Result>').Price, null);
   // 同一スコープに Price が複数 = 想定外の構造。取り違えるより読めない扱いにする
+  // 9b) expected は全商品ぶん必須
+  const tryExpected = (items, exp) => {
+    try { assertExpectedForAll(items, exp); return 'ok'; } catch (e) { return e.message; }
+  };
+  check('expected: 全商品ぶんあれば通る',
+    tryExpected([{ item_code: 'a' }, { item_code: 'b' }], { a: 100, b: 200 }), 'ok');
+  check('expected: ★1件でも欠けたら止める',
+    tryExpected([{ item_code: 'a' }, { item_code: 'b' }], { a: 100 }).includes('2件目 (b) の expected がありません'), true);
+  check('expected: ★丸ごと無ければ止める',
+    tryExpected([{ item_code: 'a' }], undefined).includes('照合せずに送ることはできません'), true);
+  check('expected: 整数でなければ止める',
+    tryExpected([{ item_code: 'a' }], { a: 'お問い合わせ' }).includes('整数ではありません'), true);
+  check('expected: 空文字も止める', tryExpected([{ item_code: 'a' }], { a: '' }).includes('expected がありません'), true);
+
   // 9) 商品ごとのロック (「読む → 照合 → 送る」が同じ商品で重ならないこと)
   {
     const order = [];
