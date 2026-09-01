@@ -74,6 +74,11 @@ export async function fetchYahooItemDetail(itemCode, { timeoutMs = DEFAULT_TIMEO
     // 0 や null に丸めず素通しする — 呼び出し側が「未デプロイ/取得不能」と「0円」を区別できるように
     Price: parsed.Price,
     SubCodes: Array.isArray(parsed.SubCodes) ? parsed.SubCodes : undefined,
+    // ★セール価格 (M3)。価格を送る時は sale_price も必ず送る決まりで、空文字を送ると消える。
+    //   「入っていない」と「読めなかった」を分けて素通しする — 呼び出し側が「無い」と決めつけないため。
+    //   ★ここで落とすと、価格更新側が毎回「確かめられない」と判断して1件も送れなくなる (実機で踏んだ)
+    SalePrice: parsed.SalePrice,
+    SalePriceReadable: parsed.SalePriceReadable === true,
     // 発送まわり (モールごとの配送方法を画面に出すため)
     Delivery: parsed.Delivery ?? null,
     PostageSet: parsed.PostageSet ?? null,
