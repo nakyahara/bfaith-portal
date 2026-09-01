@@ -117,15 +117,31 @@ async function unpublishedKeys({ maxPages = 50, perPage = 100 } = {}) {
     if (![...flat.keys()].some((k) => k.startsWith('ResultSet['))) {
       throw new Error(`publish-history の応答を一覧として読めません: ${oneLine(text)}`);
     }
+    // ★ページの件数は Result の数で数える (Codex R9)。
+    //   TargetKey の数で数えると、TargetKey が無い行があった時にページ位置がずれる
+    const resultIdx = new Set();
+    for (const k of flat.keys()) {
+      const m = k.match(/^ResultSet\[\d+\]\/Result\[(\d+)\]/);
+      if (m) resultIdx.add(m[1]);
+    }
+    const rows = resultIdx.size;
     let found = 0;
     for (const [k, v] of flat) {
-      if (/(^|\/)TargetKey\[\d+\]$/.test(k)) { keys.add(String(v).trim().toLowerCase()); found++; }
+      if (/(^|\/)TargetKey\[\d+\]$/.test(k) && String(v).trim()) {
+        keys.add(String(v).trim().toLowerCase());
+        found++;
+      }
+    }
+    // ★TargetKey が無い行があると、その行が対象商品かどうか分からない = 反映済みと言い切れない
+    if (found < rows) {
+      throw new Error(`publish-history に対象キーの無い行が ${rows - found} 件あります。反映できたか判定できません`);
     }
     // 総件数が分かるならそれで終わりを判断する。分からなければ「1ページに満たなければ終わり」
-    const total = Number(flat.get('ResultSet[0]@totalResultsAvailable'));
-    if (Number.isFinite(total) && total >= 0) {
-      if (start + found - 1 >= total) { complete = true; break; }
-    } else if (found < perPage) { complete = true; break; }
+    const totalRaw = String(flat.get('ResultSet[0]@totalResultsAvailable') ?? '').trim();
+    const total = /^\d+$/.test(totalRaw) ? Number(totalRaw) : null;   // 空文字を 0 と読まない
+    if (total !== null) {
+      if (start + rows - 1 >= total) { complete = true; break; }
+    } else if (rows < perPage) { complete = true; break; }
     await sleep(API_GAP_MS);
   }
   // ★上限で打ち切ったら「載っていない」と言い切れない (Codex R3)。
