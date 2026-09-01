@@ -348,7 +348,8 @@
     if (unexecuted.length > 0) {
       $('rec-status').innerHTML = '戻すための履歴は<b>もう作ってあります</b>: '
         + unexecuted.map((r) => '<a href="/apps/price-update/runs/' + encodeURIComponent(r.run_id) + '">' + esc(r.run_id) + '</a>').join(' / ')
-        + '。そちらを開いて実行してください。';
+        + '。そちらを開いて実行してください。'
+        + notRestorableHtml;   // ★どの分岐でも「戻せない行」は消さない (Codex R5)
       return;
     }
     if (!n(info.rows)) {
@@ -357,7 +358,8 @@
       return;
     }
     if (!info.canCreate) {
-      $('rec-status').textContent = info.canCreateReason || '権限がありません。';
+      // 権限が無くても「戻せない行」は見せる (知らせるべき事実であって、操作ではない)
+      $('rec-status').innerHTML = esc(info.canCreateReason || '権限がありません。') + notRestorableHtml;
       return;
     }
     const done = (info.existing || []).filter((r) => r.executed);
