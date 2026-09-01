@@ -28,7 +28,7 @@
  */
 import 'dotenv/config';
 import {
-  flattenXml, diff, isPricePath, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  flattenXml, diff, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
   TEST_NAME_MARKER,
 } from './yahoo-edit-item-probe.js';
 
@@ -116,13 +116,18 @@ async function main() {
 
   const probePrice = currentPrice + 1;
   console.log(`\n★ item_code と price だけを送ります (${currentPrice} → ${probePrice})。他の項目は一切送りません。`);
-  const r1 = await editPrice(itemCode, probePrice);
-  console.log(`editItem: HTTP ${r1.status} / ${r1.body.slice(0, 200).replace(/\s+/g, ' ')}`);
-  const sendFailure = editItemFailure(r1);
-  if (sendFailure) throw new Error(`送信できていません (${sendFailure})。書き換わっていないので、この回では何も判定しません`);
 
-  // ★ここから先は「価格を上げた状態」。何があっても戻しに行く
+  // ★送信を「試した」時点から戻しの責任が発生する。
+  //   応答が返る前に切れた場合でも Yahoo 側では変わっているかもしれないので、
+  //   editPrice の呼び出しごと try の中に入れる (Codex R2)
+  let attempted = false;
   try {
+    attempted = true;
+    const r1 = await editPrice(itemCode, probePrice);
+    console.log(`editItem: HTTP ${r1.status} / ${r1.body.slice(0, 200).replace(/\s+/g, ' ')}`);
+    const sendFailure = editItemFailure(r1);
+    if (sendFailure) throw new Error(`送信できていません (${sendFailure})。書き換わっていないので、この回では何も判定しません`);
+
     const after = await flattenXml(await getRawXml(itemCode));
     console.log(`「後」の項目数: ${after.size}`);
     const d1 = diff(before, after);
@@ -135,32 +140,35 @@ async function main() {
         + '送信が効いていないので、部分更新かどうかは判定できません');
       return;
     }
-    const collateral = [...d1.changed.filter((x) => !isPricePath(x.path)), ...d1.removed];
+    const collateral = collateralOf(d1);
     console.log(`\n${collateral.length === 0
       ? '✅ 価格は変わり、価格以外は変わっていません → editItem は「送った項目だけ変える」= 部分更新'
       : `🚨 価格以外が ${collateral.length} 項目 変わった/消えた → editItem は全項目上書き。価格だけ送ってはいけない`}`);
   } finally {
-    console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
-    try {
-      const r2 = await editPrice(itemCode, currentPrice);
-      console.log(`editItem: HTTP ${r2.status} / ${r2.body.slice(0, 200).replace(/\s+/g, ' ')}`);
-      const restoreFailure = editItemFailure(r2);
-      if (restoreFailure) {
-        console.error(`🚨 戻せていません (${restoreFailure})。Yahoo の管理画面で価格を ${currentPrice} に直してください`);
+    // ★finally の中で return しない (待っている例外を握りつぶしてしまう)
+    if (attempted) {
+      console.log(`\n価格を元に戻します (${probePrice} → ${currentPrice})`);
+      try {
+        const r2 = await editPrice(itemCode, currentPrice);
+        console.log(`editItem: HTTP ${r2.status} / ${r2.body.slice(0, 200).replace(/\s+/g, ' ')}`);
+        const restoreFailure = editItemFailure(r2);
+        if (restoreFailure) {
+          console.error(`🚨 戻せていません (${restoreFailure})。Yahoo の管理画面で価格を ${currentPrice} に直してください`);
+          process.exitCode = 1;
+        } else {
+          const restored = await flattenXml(await getRawXml(itemCode));
+          const restoredPrice = itemPriceOf(restored);
+          report('元に戻したあと、最初との差分', diff(before, restored));
+          if (restoredPrice !== currentPrice) {
+            console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
+            process.exitCode = 1;
+          }
+        }
+      } catch (e) {
+        console.error(`🚨 戻す処理でエラー: ${e.message}`);
+        console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直してください`);
         process.exitCode = 1;
-        return;
       }
-      const restored = await flattenXml(await getRawXml(itemCode));
-      const restoredPrice = itemPriceOf(restored);
-      report('元に戻したあと、最初との差分', diff(before, restored));
-      if (restoredPrice !== currentPrice) {
-        console.error(`🚨 価格が ${currentPrice} に戻っていません (実際: ${restoredPrice})。Yahoo の管理画面で直してください`);
-        process.exitCode = 1;
-      }
-    } catch (e) {
-      console.error(`🚨 戻す処理でエラー: ${e.message}`);
-      console.error(`   Yahoo の管理画面で ${itemCode} の価格を ${currentPrice} に直してください`);
-      process.exitCode = 1;
     }
   }
 }

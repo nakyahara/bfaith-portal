@@ -7,7 +7,7 @@
  * 実行: node apps/warehouse/test-yahoo-edit-item-probe.mjs
  */
 import {
-  flattenXml, diff, isPricePath, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
+  flattenXml, diff, isPricePath, collateralOf, guardTestCode, guardTestItem, itemPriceOf, editItemFailure,
 } from './yahoo-edit-item-probe.js';
 
 let failed = 0;
@@ -101,6 +101,21 @@ console.log('\n── 送信が成功したかの判定 (HTTP 200 でも失敗�
   eq(editItemFailure({ status: 200, body: '<Result><Code>0</Code></Result>' }), null, 'Code 0 は成功');
 }
 
+console.log('\n── 「価格以外の変化」の数え方 ──');
+{
+  const before = await flattenXml('<R><Name>名前</Name><Price>100</Price><Caption>説明</Caption></R>');
+  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption></R>'))).length,
+    0, '価格だけ変わったなら 0 (= 部分更新)');
+  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price></R>'))).map((x) => x.path),
+    ['R[0]/Caption[0]'], '★消えた項目を数える');
+  eq(collateralOf(diff(before, await flattenXml('<R><Name>別の名前</Name><Price>101</Price><Caption>説明</Caption></R>'))).map((x) => x.path),
+    ['R[0]/Name[0]'], '価格以外が変わったら数える');
+  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><New>x</New></R>'))).map((x) => x.path),
+    ['R[0]/New[0]'], '★増えた項目も数える (無視すると誤って部分更新と結論する)');
+  eq(collateralOf(diff(before, await flattenXml('<R><Name>名前</Name><Price>101</Price><Caption>説明</Caption><SubCodes><SubCode code="a"><Price>50</Price></SubCode></SubCodes></R>'))).length,
+    2, 'SKU が増えたら SubCodes と SubCode の属性が増分として出る');
+}
+
 console.log('\n── 本番商品では動かさない ──');
 {
   eq(guardTestCode('zz-yahoo-m0-0901'), null, '検証用コードは通る');
@@ -116,6 +131,10 @@ console.log('\n── 本番商品では動かさない ──');
   ok(guardTestItem(real), '★目印が無い商品は拒否する (コードを取り違えても本番を触らない)');
   ok(/zz検証用/.test(guardTestItem(real)) && /合皮補修シート/.test(guardTestItem(real)), '理由に目印と実際の商品名を書く');
   ok(guardTestItem(await flattenXml('<R><Price>100</Price></R>')), '商品名を読めなければ拒否');
+  // ★入れ子のどこかに目印があっても通さない (商品本体の名前だけを見る)
+  const nested = await flattenXml('<R><Name>合皮補修シート ベージュ</Name><Options><Option><Name>zz検証用</Name></Option></Options></R>');
+  ok(guardTestItem(nested), '★入れ子の Name に目印があっても拒否する');
+  ok(/合皮補修シート/.test(guardTestItem(nested)), '理由には商品本体の名前を出す');
 }
 
 console.log(`\n${failed === 0 ? '✅ 全テスト通過' : `❌ ${failed} 件失敗`}`);

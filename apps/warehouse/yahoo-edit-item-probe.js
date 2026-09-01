@@ -33,8 +33,9 @@ export function guardTestCode(itemCode) {
  * @param {Map<string,string>} flat flattenXml の戻り
  */
 export function guardTestItem(flat) {
+  // ★商品本体の名前だけを見る (ルート直下の Name)。入れ子のどこかに目印があれば通る、では門番にならない
   const names = [...flat.entries()]
-    .filter(([k]) => /(^|\/)Name\[\d+\]$/.test(k))
+    .filter(([k]) => /^[^/]+\/Name\[\d+\]$/.test(k))
     .map(([, v]) => v);
   if (names.length === 0) return '商品名を読めませんでした。検証用商品か確かめられないので動かしません';
   if (!names.some((n) => n.includes(TEST_NAME_MARKER))) {
@@ -115,6 +116,20 @@ export function diff(beforeMap, afterMap) {
 /** 価格の道すじか (価格だけが変わるのが期待値。それ以外が動いたら全項目上書き) */
 export function isPricePath(path) {
   return /(^|\/)Price\[\d+\]$/.test(String(path || ''));
+}
+
+/**
+ * 「価格以外の変化」を数える。
+ * ★変わった (価格以外) / 消えた / **増えた** の3つとも数える。
+ *   増えたものを無視すると、項目が生えた時に部分更新だと誤って結論する (Codex R2)。
+ * @param {{changed:Array,removed:Array,added:Array}} d diff() の戻り
+ */
+export function collateralOf(d) {
+  return [
+    ...(d.changed || []).filter((x) => !isPricePath(x.path)),
+    ...(d.removed || []),
+    ...(d.added || []),
+  ];
 }
 
 /** 商品本体の価格 (SubCode 配下ではないもの) を1つ返す。読めなければ null */
