@@ -29,12 +29,17 @@ export const EXCEPTION_PERMISSION = 'D3';
 
 /**
  * 例外操作をしてよいか。
- * ⭐担当者マスタが1人も登録されていないとき (null) は通す + 呼び元が画面に注意を出す。
- *   導入直後に誰も操作できず業務が止まるのを避けるため。1人でも登録されていれば D3 保有者のみ
+ *
+ * ⭐担当者が**一度も登録されていない**とき (null) だけ通す + 呼び元が画面に注意を出す。
+ *   導入直後に誰も操作できず業務が止まるのを避けるため。
+ * ⚠️「全員を無効化した」は未導入と区別する (無効の行が残っていれば通さない)。
+ *   未導入のまま通した例外操作は履歴に印を残す (bootstrap: true)
  */
 export function canDoException(actor) {
   const r = hasPermission(actor, EXCEPTION_PERMISSION);
-  return r === null ? { allowed: true, unmanaged: true } : { allowed: r === true, unmanaged: false };
+  return r === null
+    ? { allowed: true, unmanaged: true }
+    : { allowed: r === true, unmanaged: false };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -198,12 +203,18 @@ const PARTY_TO_WAITING = {
 
 const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
 
-/** UTC ISO → JST の 'YYYY-MM-DD' (⭐toISOString をそのまま使うと日付が1日ずれる) */
+/**
+ * UTC ISO → JST の 'YYYY-MM-DD' (⭐toISOString をそのまま使うと日付が1日ずれる)。
+ * ⭐**壊れた値でも例外を投げない** — 手で書き換えられたデータが1行あるだけで
+ *   ボードや詳細画面が真っ白になる、という壊れ方をさせない (fail-soft)
+ */
 export function jstDate(iso) {
   if (!iso) return '';
   const t = Date.parse(iso);
   if (Number.isNaN(t)) return '';
-  return new Date(t + JST_OFFSET_MS).toISOString().slice(0, 10);
+  try {
+    return new Date(t + JST_OFFSET_MS).toISOString().slice(0, 10);
+  } catch { return ''; }   // 範囲外の日時 (RangeError)
 }
 
 /**
@@ -645,20 +656,27 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
         // ⭐要否がまだ決まっていない工程だけ「対応不要」にできる。
         //   最初から必要な工程 (返金処理など) をここで消せると、完了ゲートが無意味になる
         if (step.necessity_status !== 'undecided') {
-          throw new Error('必要と決まっている工程は「対応不要」にできません (どうしても外すときは「必要な工程を外す」を使ってください)');
+          throw new Error('必要と決まっている工程は「対応不要」にできません (どうしても外すときは「この工程を外す」を使ってください)');
         }
         patch.necessity_status = 'not_required';
+        patch.necessity_before_skip = step.necessity_status;   // 戻すときはここへ戻す
         patch.progress_status = 'not_started';
         patch.completed_at = nowIso();
         patch.completed_by = actor || null;
         break;
       case 'skip_required': {
         // ⭐必要と決まっている工程を外す = 例外操作。理由と権限が要る (履歴にも別イベントで残す)
-        if (step.necessity_status === 'not_required') throw new Error('すでに対応不要です');
+        if (step.necessity_status !== 'required') {
+          throw new Error(step.necessity_status === 'not_required'
+            ? 'すでに対応不要です'
+            : '要否がまだ決まっていない工程は「対応不要にする」を使ってください');
+        }
         if (!String(reason || '').trim()) throw new Error('必要な工程を外すには理由を書いてください');
         const perm = canDoException(actor);
         if (!perm.allowed) throw new Error('必要な工程を外す権限がありません (担当者と権限の画面で D3 が要ります)');
+        if (perm.unmanaged) console.warn('[inquiry-hub] 担当者未登録のまま必要な工程を外しました case=' + caseId + ' step=' + stepId + ' by ' + (actor || '不明'));
         patch.necessity_status = 'not_required';
+        patch.necessity_before_skip = 'required';
         patch.progress_status = 'not_started';
         patch.completed_at = nowIso();
         patch.completed_by = actor || null;
@@ -678,8 +696,13 @@ export function updateStep(caseId, stepId, action, { note, externalRef, reason, 
         break;
       case 'undo':
         // ⭐「対応不要」を戻すときは必要性も戻す。進捗だけ戻すと、戻したつもりで
-        //   not_required のまま残り、完了ゲートをすり抜ける
-        if (step.necessity_status === 'not_required') patch.necessity_status = step.template_necessity || 'required';
+        //   not_required のまま残り、完了ゲートをすり抜ける。
+        //   戻し先は**外す直前の値** (人が「必要」と決めていたなら必要へ戻す。
+        //   テンプレート値へ戻すと、その判断が消えてしまう)
+        if (step.necessity_status === 'not_required') {
+          patch.necessity_status = step.necessity_before_skip || step.template_necessity || 'required';
+          patch.necessity_before_skip = null;
+        }
         patch.progress_status = 'not_started';
         patch.completed_at = null;
         patch.completed_by = null;
@@ -749,12 +772,16 @@ export function closeCase(caseId, { force = false, reasonCode = null, note = nul
     if (blockers.total > 0 && !force) {
       return { ok: false, blockers, case: c };
     }
+    let bootstrap = false;
     if (force) {
       if (!CLOSE_REASONS[reasonCode]) throw new Error('例外として完了するには理由を選んでください');
       if (!String(note || '').trim()) throw new Error('例外として完了するには詳細メモを入れてください');
       // ⭐例外完了は権限が要る (画面でボタンを隠すだけにしない — APIを直に叩けるため)
       const perm = canDoException(actor);
       if (!perm.allowed) throw new Error('例外として完了する権限がありません (担当者と権限の画面で D3 が要ります)');
+      // 担当者が未登録のまま通した操作には印を残す (あとで「権限の外で閉じた案件」を洗い出せるように)
+      bootstrap = perm.unmanaged;
+      if (bootstrap) console.warn('[inquiry-hub] 担当者未登録のまま例外完了しました case=' + caseId + ' by ' + (actor || '不明'));
     }
     // status='active' と closed_at IS NULL の両方を条件にして二重完了を防ぐ
     const r = db.prepare(`UPDATE return_cases SET status = 'completed', stage = 'COMPLETED', waiting_on = 'NONE',
@@ -764,7 +791,8 @@ export function closeCase(caseId, { force = false, reasonCode = null, note = nul
       .run(nowIso(), actor || null, force ? reasonCode : null, force ? note : (note || null), caseId);
     if (r.changes === 0) return { ok: true, already: true, case: getCase(caseId) };
     logCaseEvent(caseId, { eventType: force ? 'case_closed_exception' : 'case_closed',
-      to: { reasonCode: force ? reasonCode : null }, actorId: actor, note: note || null });
+      to: { reasonCode: force ? reasonCode : null, bootstrap: bootstrap || undefined },
+      actorId: actor, note: note || null });
     return { ok: true, case: getCase(caseId), blockers: force ? blockers : null };
   }).immediate();
 }

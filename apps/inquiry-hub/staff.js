@@ -107,20 +107,24 @@ const matchKey = v => String(v ?? '').normalize('NFKC').replace(/\s+/g, '').toLo
 /**
  * この人がこの権限を持っているか。
  *
- * 戻り値: true / false / **null = 担当者マスタが未整備で判定できない**
- * ⭐null を返す理由: 導入直後は担当者が1人も登録されていない。そこで false を返すと
- *   誰も操作できなくなって業務が止まる。「未整備なら通す + 画面に注意を出す」を
- *   呼び元が選べるようにする (env 未設定なら全員可とした canEditPermissions と同じ思想)。
- *   ⚠️ 1人でも登録されていれば、権限を持たない人は false = 通さない
+ * 戻り値: true / false / **null = 担当者が一度も登録されていない (未導入)**
+ *
+ * ⭐null を返す理由: 導入直後は担当者が1人もいない。そこで false を返すと誰も操作できず
+ *   業務が止まる。「未導入なら通す + 画面に注意を出す」を呼び元が選べるようにする。
+ * ⚠️**「全員を無効化した」は未導入ではない**。無効の行が残っていれば導入済みとみなし、
+ *   誰も通さない (設定事故で全員に例外権限が開くのを防ぐ。Codex R2 指摘)
+ * ⚠️照合は user_key (一意) を優先する。表示名は**一致が1人のときだけ**認める —
+ *   同姓の担当者がいると、権限を持つ別人に化けてしまうため
  */
 export function hasPermission(actor, code) {
-  const staff = listStaff({ withPermissions: true });
-  if (!staff.length) return null;
+  if (!listStaff({ includeInactive: true }).length) return null;   // 一度も登録がない = 未導入
   const key = matchKey(actor);
   if (!key) return false;
-  const me = staff.find(s => matchKey(s.user_key) === key || matchKey(s.display_name) === key);
-  if (!me) return false;
-  return me.permissions.includes(code);
+  const active = listStaff({ withPermissions: true });              // 有効な担当者だけ
+  const byKey = active.filter(s => matchKey(s.user_key) === key);
+  if (byKey.length) return byKey.length === 1 && byKey[0].permissions.includes(code);
+  const byName = active.filter(s => matchKey(s.display_name) === key);
+  return byName.length === 1 && byName[0].permissions.includes(code);
 }
 
 /** 作成。有効な担当者の user_key は重複させない */

@@ -3902,7 +3902,10 @@ router.get('/cases/:id(\\d+)', (req, res) => {
   const over = overdueDays(c.next_action_at);
   // 例外操作 (必要な工程を外す / 未処理を残して完了) の権限。
   // ⭐担当者マスタが未整備のうちは通すが、その旨を画面に出す
-  const excPerm = (() => { try { return canDoException(actorOf(req)); } catch { return { allowed: true, unmanaged: true }; } })();
+  // ⚠️判定できなかったときは「できない」と出す。ここで allowed:true にすると、
+  //   画面は押せそうに見えるのに API は 403 を返す、という食い違いになる
+  const excPerm = (() => { try { return canDoException(actorOf(req)); }
+    catch { return { allowed: false, unmanaged: false, error: true }; } })();
   const settled = s => ['completed', 'exception'].includes(s.progress_status) || s.necessity_status === 'not_required';
 
   const stepRow = s => {
@@ -4032,6 +4035,7 @@ router.get('/cases/:id(\\d+)', (req, res) => {
         ? `未処理の工程が ${blockers.total}件 残っています`
         : '必要な工程はすべて片付いています'}${excPerm.unmanaged
         ? ' ／ ⚠️担当者と権限が未登録のため、いまは誰でも例外操作ができます (<a href="/apps/inquiry-hub/staff">担当者と権限</a>で登録してください)'
+        : excPerm.error ? ' ／ ⚠️権限を確認できませんでした (例外操作はできません)'
         : excPerm.allowed ? '' : ' ／ 例外として完了する権限はありません'}</span>
       <span style="flex:1"></span>
       ${c.status === 'active'

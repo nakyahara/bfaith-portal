@@ -18,8 +18,10 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 
-const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'inquiry-hub.db');
+// ⚠️モジュール読み込み時に固定しない — 固定すると、初期化のたびに DATA_DIR を差し替える
+//   テスト (既存DBへの列追加の検証など) が、実際には元のDBを開いてしまい素通りする
+const dataDir = () => process.env.DATA_DIR || path.join(process.cwd(), 'data');
+const dbFile = () => path.join(dataDir(), 'inquiry-hub.db');
 
 let db = null;
 
@@ -38,9 +40,10 @@ export function toUtcIso(input) {
 }
 
 export function initInquiryHubDB() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  const dir = dataDir();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   if (db) { try { db.close(); } catch { /* close済み等は無視 */ } db = null; }
-  db = new Database(DB_FILE);
+  db = new Database(dbFile());
   // PRAGMAは接続単位。foreign_keys は SQLite デフォルトOFFなので毎接続で明示 (設計書§6)
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');
@@ -710,10 +713,13 @@ function createReturnCaseTables() {
     --   「返送は必要、でもまだ未着手」と「返送が必要かまだ分からない」を1列では書けない
     necessity_status TEXT NOT NULL DEFAULT 'required'
       CHECK(necessity_status IN ('undecided','required','not_required')),
-    -- テンプレート作成時の必要性。⭐「対応不要にしたのを戻す」ときに、ここへ戻す
-    --   (現在値だけだと、戻しても not_required のままになる = 戻したつもりで戻っていない)
+    -- テンプレート作成時の必要性 (最後の拠り所)
     template_necessity TEXT NOT NULL DEFAULT 'required'
       CHECK(template_necessity IN ('undecided','required')),
+    -- ⭐「対応不要」にする直前の必要性。戻すときはここへ戻す。
+    --   テンプレート値へ戻すと「要否未確定 → 必要にした → 外した → 戻す」で
+    --   要否未確定まで巻き戻ってしまう (人が下した「必要」という判断が消える)
+    necessity_before_skip TEXT,
     progress_status TEXT NOT NULL DEFAULT 'not_started'
       CHECK(progress_status IN ('not_started','in_progress','waiting','completed','exception')),
     assignee_id TEXT,                          -- 確認担当 (社内)
@@ -728,6 +734,14 @@ function createReturnCaseTables() {
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_case_steps_case ON case_steps(case_id, sort_order)');
+  // ⭐既に case_steps があるDB (先の版で作られたもの) にも列を足す。
+  //   CREATE TABLE IF NOT EXISTS の定義を変えるだけでは既存DBに列は増えず、
+  //   案件作成が "no column named ..." で落ちる (Codex R2 High)
+  addColumnIfMissing('case_steps', 'template_necessity',
+    "TEXT NOT NULL DEFAULT 'required' CHECK(template_necessity IN ('undecided','required'))");
+  addColumnIfMissing('case_steps', 'necessity_before_skip', 'TEXT');
+  // 既存行の backfill: いま要否未確定のものは、テンプレートでも要否未確定だったとみなす
+  db.exec("UPDATE case_steps SET template_necessity = 'undecided' WHERE necessity_status = 'undecided'");
 
   // 案件 ⇔ 問い合わせ (多対多)。⭐1問い合わせに複数案件 / 1案件に複数問い合わせ の両方が起きる
   db.exec(`CREATE TABLE IF NOT EXISTS case_inquiries (

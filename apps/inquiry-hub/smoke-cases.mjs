@@ -59,6 +59,9 @@ console.log('1. 日付ユーティリティ');
   check('土曜の0営業日後は月曜に寄る', rc.businessDaysFromNow(0, sat) === '2026-09-07', rc.businessDaysFromNow(0, sat));
   check('期限前は超過0', rc.overdueDays('2026-09-10T00:00:00Z', new Date('2026-09-09T00:00:00Z')) === 0);
   check('期限なしは超過0', rc.overdueDays(null) === 0);
+  // ⭐壊れた値が1行あるだけでボードが真っ白にならないこと (fail-soft)
+  check('壊れた日時でも落ちない',
+    rc.jstDate('こわれた') === '' && rc.overdueDays('こわれた') === 0 && rc.jstDate('+999999-01-01T00:00:00Z') === '');
   // ⭐当日は超過にしない (9:00 を過ぎただけで赤くしない。その日のうちにやればいい)
   check('期限当日の夕方はまだ超過0',
     rc.overdueDays('2026-09-09T00:00:00Z', new Date('2026-09-09T09:00:00Z')) === 0,
@@ -276,6 +279,23 @@ console.log('6b. 完了ゲートをすり抜ける経路を塞げているか');
     rc.listSteps(c.id).find(s => s.id === undecided.id).necessity_status === 'undecided');
 }
 
+console.log('6b-2. 外した工程を戻すと「外す直前」に戻る (Codex R2)');
+{
+  const inq = mkInquiry('inq-undo2');
+  const c = rc.createCase({ inquiryId: inq, caseType: 'RETURN_REFUND', nextActionDate: '2026-09-04', actor: '中村' });
+  // テンプレートでは要否未確定 → 人が「必要」と決めた → 外した → 戻す
+  const s = rc.listSteps(c.id).find(x => x.necessity_status === 'undecided');
+  rc.updateStep(c.id, s.id, 'need', { actor: '中村' });
+  rc.updateStep(c.id, s.id, 'skip_required', { reason: '顧客が返送を希望しないため', actor: '中村' });
+  rc.updateStep(c.id, s.id, 'undo', { actor: '中村' });
+  check('⭐人が「必要」と決めた判断は戻しても消えない (要否未確定まで巻き戻らない)',
+    rc.listSteps(c.id).find(x => x.id === s.id).necessity_status === 'required',
+    rc.listSteps(c.id).find(x => x.id === s.id).necessity_status);
+  check('要否未確定の工程は skip_required では外せない (通常の「対応不要」を使う)',
+    errOf(() => rc.updateStep(c.id, rc.listSteps(c.id).find(x => x.necessity_status === 'undecided').id,
+      'skip_required', { reason: 'テスト', actor: '中村' })).includes('要否がまだ決まっていない'));
+}
+
 console.log('6c. 権限 (例外操作)');
 {
   check('担当者マスタが空のうちは通す + 未整備と分かる',
@@ -310,9 +330,24 @@ console.log('6c. 権限 (例外操作)');
     errOf(() => rc.updateStep(c2.id, step.id, 'skip_required', { reason: 'テスト', actor: '田中' }))
       .includes('権限がありません'));
 
-  // 後続テストのために担当者を消す (未整備の状態へ戻す)
+  // ⭐同姓の別人に権限が化けないか (Codex R2)
+  const s3 = staff.createStaff({ userKey: 'nakamura2@example.com', displayName: '中村' }, 'smoke');
+  check('同じ表示名が2人いたら、表示名だけでは通さない', rc.canDoException('中村').allowed === false);
+  check('メールアドレス (一意) なら引ける', rc.canDoException('nakamura@example.com').allowed === true);
+  staff.deactivateStaff(s3.id, 'smoke');
+  check('同名の片方を無効にすれば表示名でも引ける', rc.canDoException('中村').allowed === true);
+
+  // ⭐「全員を無効化した」を未導入と取り違えない (取り違えると全員に例外権限が開く)
   staff.deactivateStaff(s1.id, 'smoke');
   staff.deactivateStaff(s2.id, 'smoke');
+  check('⭐全員無効にしても未整備扱いにはならない', rc.canDoException('中村').unmanaged === false);
+  check('⭐全員無効なら誰も例外操作できない (設定事故で権限が開かない)',
+    rc.canDoException('中村').allowed === false && rc.canDoException('誰か').allowed === false);
+
+  // 後続テストのために、一度も登録がない状態へ戻す (未導入の再現)
+  db.prepare('DELETE FROM staff_permissions').run();
+  db.prepare('DELETE FROM staff_members').run();
+  check('登録を消せば未導入に戻る', rc.canDoException('誰か').unmanaged === true);
 }
 
 console.log('6d. 完了後の書き換え・重複作成・日付の検証');
@@ -471,6 +506,50 @@ console.log('9. 画面とAPI');
   check('サイドバーに返品・交換案件が出る', board.includes('返品・交換案件</span>') || board.includes('nav-label">返品・交換案件'));
 
   await new Promise(r => server.close(r));
+}
+
+// ─── 10. 既存DBへの列追加 (Codex R2 High: リリースブロッカーだった) ───
+// ⚠️ここで DATA_DIR を差し替えて別のDBを開くので、このセクションは必ず最後に置く
+console.log('10. 既存DBに列が足りないときの移行');
+{
+  const Database = (await import('better-sqlite3')).default;
+  const dir2 = fs.mkdtempSync(path.join(baseDir, 'smoke-cases-mig-'));
+  // 先の版で作られた case_steps を再現する (template_necessity / necessity_before_skip だけが無い形)
+  const oldDb = new Database(path.join(dir2, 'inquiry-hub.db'));
+  oldDb.exec(`CREATE TABLE case_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    step_type TEXT NOT NULL,
+    necessity_status TEXT NOT NULL DEFAULT 'required',
+    progress_status TEXT NOT NULL DEFAULT 'not_started',
+    assignee_id TEXT, waiting_party TEXT, due_at TEXT, completed_at TEXT, completed_by TEXT,
+    external_ref TEXT, note TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')))`);
+  oldDb.prepare("INSERT INTO case_steps (case_id, step_type, necessity_status) VALUES (1,'wait_return_arrival','undecided')").run();
+  oldDb.prepare("INSERT INTO case_steps (case_id, step_type, necessity_status) VALUES (1,'execute_refund','required')").run();
+  oldDb.close();
+
+  process.env.DATA_DIR = dir2;
+  initInquiryHubDB();
+  const db2 = getDB();
+  const cols = db2.prepare('PRAGMA table_info(case_steps)').all().map(c => c.name);
+  check('⭐既存DBにも template_necessity が足される (無いと案件作成が落ちる)', cols.includes('template_necessity'));
+  check('⭐既存DBにも necessity_before_skip が足される', cols.includes('necessity_before_skip'));
+  const rows = db2.prepare('SELECT step_type, template_necessity FROM case_steps ORDER BY id').all();
+  check('既存の要否未確定はテンプレ値も要否未確定にする', rows[0].template_necessity === 'undecided');
+  check('既存の必要な工程は required のまま', rows[1].template_necessity === 'required');
+  // 移行後に案件を作れること (INSERT が落ちないこと) まで見る
+  db2.prepare(`INSERT INTO shops (channel_type, shop_name, account_identifier) VALUES ('email','移行テスト','mig@example.com')`).run();
+  const sid = db2.prepare('SELECT id FROM shops').get().id;
+  const at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const iid = db2.prepare(`INSERT INTO inquiries (channel_type, shop_id, external_inquiry_id, subject,
+      internal_status, assigned_user_id, received_at) VALUES ('email',?,?,?,'open','田中',?)`)
+    .run(sid, 'mig-1', '移行後の案件', at).lastInsertRowid;
+  check('⭐移行後も案件を作れる',
+    !!rc.createCase({ inquiryId: iid, caseType: 'RETURN_REFUND', nextActionDate: '2026-09-10', actor: '田中' }).case_no);
+  try { fs.rmSync(dir2, { recursive: true, force: true }); } catch { /* 掃除できなくても結果は返す */ }
 }
 
 console.log(`\n${failed === 0 ? '✅' : '❌'} PASS ${passed} / FAIL ${failed}`);
