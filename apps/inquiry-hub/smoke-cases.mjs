@@ -59,6 +59,13 @@ console.log('1. 日付ユーティリティ');
   check('土曜の0営業日後は月曜に寄る', rc.businessDaysFromNow(0, sat) === '2026-09-07', rc.businessDaysFromNow(0, sat));
   check('期限前は超過0', rc.overdueDays('2026-09-10T00:00:00Z', new Date('2026-09-09T00:00:00Z')) === 0);
   check('期限なしは超過0', rc.overdueDays(null) === 0);
+  // ⭐当日は超過にしない (9:00 を過ぎただけで赤くしない。その日のうちにやればいい)
+  check('期限当日の夕方はまだ超過0',
+    rc.overdueDays('2026-09-09T00:00:00Z', new Date('2026-09-09T09:00:00Z')) === 0,
+    String(rc.overdueDays('2026-09-09T00:00:00Z', new Date('2026-09-09T09:00:00Z'))));
+  check('翌日になったら1日超過',
+    rc.overdueDays('2026-09-09T00:00:00Z', new Date('2026-09-10T01:00:00Z')) === 1,
+    String(rc.overdueDays('2026-09-09T00:00:00Z', new Date('2026-09-10T01:00:00Z'))));
   check('2日過ぎたら2日超過',
     rc.overdueDays('2026-09-01T00:00:00Z', new Date('2026-09-03T00:00:00Z')) === 2,
     String(rc.overdueDays('2026-09-01T00:00:00Z', new Date('2026-09-03T00:00:00Z'))));
@@ -230,6 +237,120 @@ console.log('6. 完了ゲート (条件付き fail-closed)');
   check('開け直すと自社対応に戻る',
     rc.getCase(c2.id).status === 'active' && rc.getCase(c2.id).waiting_on === 'SELF');
   rc.closeCase(c2.id, { force: true, reasonCode: 'other', note: '再クローズ', actor: '小林' });
+}
+
+// ─── 6b. Codexレビューで塞いだ穴 (2026-09-01) ───
+console.log('6b. 完了ゲートをすり抜ける経路を塞げているか');
+{
+  const inq = mkInquiry('inq-gate');
+  const c = rc.createCase({ inquiryId: inq, caseType: 'RETURN_REFUND', nextActionDate: '2026-09-04', actor: '中村' });
+  const refundStep = rc.listSteps(c.id).find(s => s.step_type === 'execute_refund');
+  check('返金工程は最初から「必要」', refundStep.necessity_status === 'required');
+
+  // ⭐High: 必要と決まっている工程を無理由で「対応不要」にできると、ゲートが無意味になる
+  check('必要な工程は skip で外せない',
+    errOf(() => rc.updateStep(c.id, refundStep.id, 'skip', { actor: '中村' })).includes('対応不要」にできません'));
+  check('外すには理由が要る',
+    errOf(() => rc.updateStep(c.id, refundStep.id, 'skip_required', { actor: '中村' })).includes('理由'));
+  rc.updateStep(c.id, refundStep.id, 'skip_required', { reason: '顧客が返金を辞退したため', actor: '中村' });
+  check('理由があれば外せる',
+    rc.listSteps(c.id).find(s => s.id === refundStep.id).necessity_status === 'not_required');
+  check('⭐外した記録は履歴に別イベントで残る',
+    rc.listEvents(c.id).some(e => e.event_type === 'step_skipped_exception'));
+  check('理由が工程のメモに残る',
+    rc.listSteps(c.id).find(s => s.id === refundStep.id).note === '顧客が返金を辞退したため');
+
+  // ⭐Medium: 「戻す」が実際には戻っていない (not_required のまま) 問題
+  rc.updateStep(c.id, refundStep.id, 'undo', { actor: '中村' });
+  const back = rc.listSteps(c.id).find(s => s.id === refundStep.id);
+  check('⭐戻すと必要性も元に戻る (not_required のまま残らない)', back.necessity_status === 'required');
+  check('戻すと未着手になる', back.progress_status === 'not_started');
+  check('戻した工程はまた完了を止める',
+    rc.blockersOf(c.id).steps.some(s => s.id === refundStep.id));
+
+  // 要否未確定から「対応不要」にしたものを戻すと、要否未確定に戻る
+  const undecided = rc.listSteps(c.id).find(s => s.necessity_status === 'undecided');
+  rc.updateStep(c.id, undecided.id, 'skip', { actor: '中村' });
+  rc.updateStep(c.id, undecided.id, 'undo', { actor: '中村' });
+  check('要否未確定から外したものは要否未確定に戻る',
+    rc.listSteps(c.id).find(s => s.id === undecided.id).necessity_status === 'undecided');
+}
+
+console.log('6c. 権限 (例外操作)');
+{
+  check('担当者マスタが空のうちは通す + 未整備と分かる',
+    rc.canDoException('誰か').allowed === true && rc.canDoException('誰か').unmanaged === true);
+
+  // 担当者を1人登録すると、権限を持つ人だけが例外操作できる
+  const staff = await import('./staff.js');
+  const s1 = staff.createStaff({ userKey: 'tanaka@example.com', displayName: '田中' }, 'smoke');
+  staff.setStaffPermissions(s1.id, ['D0'], 'smoke');
+  const s2 = staff.createStaff({ userKey: 'nakamura@example.com', displayName: '中村' }, 'smoke');
+  staff.setStaffPermissions(s2.id, ['D3'], 'smoke');
+
+  check('マスタ整備後は未整備フラグが下りる', rc.canDoException('田中').unmanaged === false);
+  check('D3 を持たない人は例外操作できない', rc.canDoException('田中').allowed === false);
+  check('D3 を持つ人は例外操作できる', rc.canDoException('中村').allowed === true);
+  check('登録されていない人は例外操作できない', rc.canDoException('知らない人').allowed === false);
+  check('⭐空白の有無で別人にしない', rc.canDoException('中 村').allowed === true);
+  check('メールアドレスでも引ける', rc.canDoException('nakamura@example.com').allowed === true);
+
+  const inq = mkInquiry('inq-perm');
+  const c = rc.createCase({ inquiryId: inq, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '田中' });
+  check('⭐権限のない人は例外完了できない',
+    errOf(() => rc.closeCase(c.id, { force: true, reasonCode: 'other', note: 'テスト', actor: '田中' }))
+      .includes('権限がありません'));
+  check('権限のある人なら例外完了できる',
+    rc.closeCase(c.id, { force: true, reasonCode: 'other', note: 'テスト', actor: '中村' }).ok === true);
+
+  const inq2 = mkInquiry('inq-perm2');
+  const c2 = rc.createCase({ inquiryId: inq2, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '田中' });
+  const step = rc.listSteps(c2.id)[0];
+  check('権限のない人は必要な工程を外せない',
+    errOf(() => rc.updateStep(c2.id, step.id, 'skip_required', { reason: 'テスト', actor: '田中' }))
+      .includes('権限がありません'));
+
+  // 後続テストのために担当者を消す (未整備の状態へ戻す)
+  staff.deactivateStaff(s1.id, 'smoke');
+  staff.deactivateStaff(s2.id, 'smoke');
+}
+
+console.log('6d. 完了後の書き換え・重複作成・日付の検証');
+{
+  const inq = mkInquiry('inq-frozen');
+  const c = rc.createCase({ inquiryId: inq, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '小林' });
+  rc.closeCase(c.id, { force: true, reasonCode: 'other', note: '確認用', actor: '小林' });
+  check('⭐完了した案件の担当は変えられない', throws(() => rc.setAssignee(c.id, '別人', '小林')));
+  check('⭐完了した案件の返金額は書き換えられない', throws(() => rc.setRefund(c.id, { expected: 999, actor: '小林' })));
+  rc.reopenCase(c.id, '小林');
+  check('開け直せば直せる', rc.setRefund(c.id, { expected: 999, actor: '小林' }).refund_expected_amount === 999);
+
+  // ⭐二重作成 (ボタンの二度押し・再送) を止める
+  const inq2 = mkInquiry('inq-dup');
+  rc.createCase({ inquiryId: inq2, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '小林' });
+  let dupErr = null;
+  try { rc.createCase({ inquiryId: inq2, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '小林' }); }
+  catch (e) { dupErr = e; }
+  check('同じ問い合わせに未完了案件があると止まる', dupErr?.code === 'DUPLICATE_CASE');
+  check('止めるときは既存の案件番号を伝える', /^RC-/.test(dupErr?.caseNo || ''));
+  check('明示すれば別案件として作れる (商品Aは返金・商品Bは代品)',
+    !!rc.createCase({ inquiryId: inq2, caseType: 'EXCHANGE', nextActionDate: '2026-09-04',
+      allowDuplicate: true, actor: '小林' }).case_no);
+
+  // ⭐実在しない日付を弾く (APIを直に叩かれたときの入口)
+  check('2026-02-31 は弾く', rc.jstDateToIso('2026-02-31') === null);
+  check('2026-13-01 は弾く', rc.jstDateToIso('2026-13-01') === null);
+  check('うるう年の2/29は通す', rc.jstDateToIso('2028-02-29') === '2028-02-29T00:00:00Z');
+  check('平年の2/29は弾く', rc.jstDateToIso('2026-02-29') === null);
+
+  // ⭐待ち先を変えたら期限も取り直す (前の待ち先の期限を引きずらない)
+  const inq3 = mkInquiry('inq-due');
+  const c3 = rc.createCase({ inquiryId: inq3, caseType: 'OTHER', nextActionDate: '2026-09-04', actor: '小林' });
+  db.prepare("UPDATE return_cases SET waiting_on='CUSTOMER', next_action_at='2026-08-01T00:00:00Z' WHERE id=?").run(c3.id);
+  const moved = rc.setWaiting(c3.id, { waitingOn: 'SUPPLIER', actor: '小林' });
+  check('⭐待ち先が変わったら古い期限を引き継がない', moved.next_action_at > '2026-08-01T00:00:00Z');
+  const keep = rc.setWaiting(c3.id, { waitingOn: 'SUPPLIER', nextActionDate: '2026-10-01', actor: '小林' });
+  check('明示した日付はそのまま使う', rc.jstDate(keep.next_action_at) === '2026-10-01');
 }
 
 // ─── 7. ボード ───

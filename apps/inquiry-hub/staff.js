@@ -101,6 +101,28 @@ export function getStaff(id) {
   return getDB().prepare('SELECT * FROM staff_members WHERE id = ?').get(id) || null;
 }
 
+/** 照合用の正規化。⭐「中原大輔」と「中原 大輔」を別人にしない (2026-09-01 スタッフ同期の事故) */
+const matchKey = v => String(v ?? '').normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+
+/**
+ * この人がこの権限を持っているか。
+ *
+ * 戻り値: true / false / **null = 担当者マスタが未整備で判定できない**
+ * ⭐null を返す理由: 導入直後は担当者が1人も登録されていない。そこで false を返すと
+ *   誰も操作できなくなって業務が止まる。「未整備なら通す + 画面に注意を出す」を
+ *   呼び元が選べるようにする (env 未設定なら全員可とした canEditPermissions と同じ思想)。
+ *   ⚠️ 1人でも登録されていれば、権限を持たない人は false = 通さない
+ */
+export function hasPermission(actor, code) {
+  const staff = listStaff({ withPermissions: true });
+  if (!staff.length) return null;
+  const key = matchKey(actor);
+  if (!key) return false;
+  const me = staff.find(s => matchKey(s.user_key) === key || matchKey(s.display_name) === key);
+  if (!me) return false;
+  return me.permissions.includes(code);
+}
+
 /** 作成。有効な担当者の user_key は重複させない */
 export function createStaff({ userKey, displayName, refundLimitYen, note } = {}, createdBy = null) {
   const db = getDB();

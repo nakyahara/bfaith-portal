@@ -61,7 +61,7 @@ import { CASE_TYPES, STAGES, WAITING_ON, NECESSITY, PROGRESS, CLOSE_REASONS,
   createCase, getCase, listSteps, listCaseInquiries, listCasesForInquiry, listEvents,
   listBoardCases, boardColumns, nextStepOf, blockersOf, stepLabel, updateStep, setWaiting,
   setAssignee, setRefund, closeCase, reopenCase, linkInquiry, countOpenCases,
-  detectCaseKeywords, getTriage, setTriage, clearTriage, overdueDays, businessDaysFromNow,
+  detectCaseKeywords, getTriage, setTriage, clearTriage, overdueDays, businessDaysFromNow, canDoException,
   STEP_TEMPLATES, jstDate as rcJstDate } from './return-cases.js';
 import { toPreviewLine } from './text-utils.js';
 
@@ -1432,17 +1432,30 @@ router.get('/inquiries/:id', (req, res) => {
     if (!type) { toast('案件種別を選んでください'); return; }
     if (!date) { toast('次回確認日を入れてください'); return; }
     makeCaseBtn.disabled = true;
+    createCaseReq(type, date, false);
+  });
+  function createCaseReq(type, date, allowDuplicate) {
     fetch('/apps/inquiry-hub/api/cases', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inquiryId: ${id}, caseType: type, nextActionDate: date }) })
-      .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, j: j }; }); })
+      body: JSON.stringify({ inquiryId: ${id}, caseType: type, nextActionDate: date,
+        allowDuplicate: !!allowDuplicate }) })
+      .then(function(r) { return r.json().then(function(j) { return { status: r.status, ok: r.ok, j: j }; }); })
       .then(function(x) {
+        // 同じ問い合わせに進行中の案件がある = 二度押しの可能性。作るなら人が確認してから
+        if (x.status === 409 && x.j.duplicate) {
+          if (confirm('この問い合わせには進行中の案件 ' + x.j.caseNo + ' があります。\\n'
+            + '別の案件として新しく作りますか?\\n'
+            + '(同じ件なら「キャンセル」を押して、既存の案件を開いてください)')) {
+            createCaseReq(type, date, true);
+          } else { makeCaseBtn.disabled = false; }
+          return;
+        }
         if (!x.ok) { toast(x.j.error || '作成できませんでした'); makeCaseBtn.disabled = false; return; }
         toast(x.j.case_no + ' を作成しました');
         setTimeout(function() { location.href = '/apps/inquiry-hub/cases/' + x.j.id; }, 700);
       })
       .catch(function(e) { toast('作成失敗: ' + e.message); makeCaseBtn.disabled = false; });
-  });
+  }
   var noCaseBtn = document.getElementById('noCase');
   if (noCaseBtn) noCaseBtn.addEventListener('click', function() {
     fetch('/apps/inquiry-hub/api/inquiries/${id}/no-case', { method: 'POST',
@@ -3887,6 +3900,9 @@ router.get('/cases/:id(\\d+)', (req, res) => {
   const events = listEvents(c.id, 20);
   const blockers = blockersOf(c.id);
   const over = overdueDays(c.next_action_at);
+  // 例外操作 (必要な工程を外す / 未処理を残して完了) の権限。
+  // ⭐担当者マスタが未整備のうちは通すが、その旨を画面に出す
+  const excPerm = (() => { try { return canDoException(actorOf(req)); } catch { return { allowed: true, unmanaged: true }; } })();
   const settled = s => ['completed', 'exception'].includes(s.progress_status) || s.necessity_status === 'not_required';
 
   const stepRow = s => {
@@ -3895,6 +3911,8 @@ router.get('/cases/:id(\\d+)', (req, res) => {
       : s.necessity_status === 'not_required' ? NECESSITY.not_required
       : PROGRESS[s.progress_status];
     const sOver = !isSettled && s.due_at ? overdueDays(s.due_at) : 0;
+    // ⭐「対応不要」は要否がまだ決まっていない工程だけ。
+    //   必要と決まっている工程を外すのは例外操作 (理由 + 権限)。ボタンの見た目も分ける
     const ops = s.necessity_status === 'undecided'
       ? `<button class="stp" data-id="${s.id}" data-act="need">必要にする</button>
          <button class="stp ghost" data-id="${s.id}" data-act="skip">対応不要にする</button>`
@@ -3902,7 +3920,8 @@ router.get('/cases/:id(\\d+)', (req, res) => {
         ? `<button class="stp ghost" data-id="${s.id}" data-act="undo">戻す</button>`
         : `<button class="stp pri" data-id="${s.id}" data-act="complete">完了にする</button>
            <button class="stp" data-id="${s.id}" data-act="wait">回答・到着待ちにする</button>
-           <button class="stp ghost" data-id="${s.id}" data-act="skip">対応不要</button>`;
+           <button class="stp ghost stp-exc" data-id="${s.id}" data-act="skip_required"
+             title="必要と決まっている工程を外します。理由が要ります">この工程を外す</button>`;
     return `<div class="step-row${isSettled ? ' settled' : ''}${next && next.id === s.id ? ' now' : ''}">
       <div>${badge({ badge: stateMeta?.badge }, stateMeta?.label || s.progress_status)}</div>
       <div><div class="nm">${he(stepLabel(c.case_type, s.step_type))}</div>
@@ -4011,7 +4030,9 @@ router.get('/cases/:id(\\d+)', (req, res) => {
     <div style="margin-top:18px;padding-top:14px;border-top:1px solid #e2e8f0;display:flex;flex-wrap:wrap;gap:10px;align-items:center">
       <span class="sub">${blockers.total > 0
         ? `未処理の工程が ${blockers.total}件 残っています`
-        : '必要な工程はすべて片付いています'}</span>
+        : '必要な工程はすべて片付いています'}${excPerm.unmanaged
+        ? ' ／ ⚠️担当者と権限が未登録のため、いまは誰でも例外操作ができます (<a href="/apps/inquiry-hub/staff">担当者と権限</a>で登録してください)'
+        : excPerm.allowed ? '' : ' ／ 例外として完了する権限はありません'}</span>
       <span style="flex:1"></span>
       ${c.status === 'active'
         ? '<button class="pri" id="closeCase">案件を完了</button>'
@@ -4036,8 +4057,16 @@ router.get('/cases/:id(\\d+)', (req, res) => {
   });
   document.querySelectorAll('.stp').forEach(function(b) {
     b.addEventListener('click', async function() {
+      var payload = { action: b.dataset.act };
+      // 必要と決まっている工程を外すときは理由を必ず書かせる (履歴に残る)
+      if (b.dataset.act === 'skip_required') {
+        var why = prompt('この工程は「必要」と決まっています。外す理由を書いてください (履歴に残ります)\\n'
+          + '例: 顧客が返送を希望しないため / 別案件で処理済みのため');
+        if (!why || !why.trim()) return;
+        payload.reason = why;
+      }
       b.disabled = true;
-      var r = await api('/steps/' + b.dataset.id, { action: b.dataset.act });
+      var r = await api('/steps/' + b.dataset.id, payload);
       if (r) location.reload(); else b.disabled = false;
     });
   });
@@ -4107,19 +4136,29 @@ router.post('/api/cases', (req, res) => {
   try {
     const b = req.body || {};
     const r = createCase({ inquiryId: b.inquiryId ? Number(b.inquiryId) : null, caseType: b.caseType,
-      nextActionDate: b.nextActionDate, summary: b.summary, actor: actorOf(req) });
+      nextActionDate: b.nextActionDate, summary: b.summary, allowDuplicate: !!b.allowDuplicate,
+      actor: actorOf(req) });
     console.log(`[inquiry-hub] 返品案件 ${r.case_no} を作成 (${b.caseType}) by ${actorOf(req)}`);
     res.json({ ok: true, ...r });
-  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+  } catch (e) {
+    // ⭐二度押し・再送と「本当に別案件を作りたい」を区別する (409 を返して画面が確認する)
+    if (e?.code === 'DUPLICATE_CASE') {
+      return res.status(409).json({ error: String(e.message), duplicate: true, caseNo: e.caseNo });
+    }
+    res.status(400).json({ error: String(e?.message || e).slice(0, 200) });
+  }
 });
 
 router.post('/api/cases/:id(\\d+)/steps/:stepId(\\d+)', (req, res) => {
   try {
     const b = req.body || {};
     updateStep(Number(req.params.id), Number(req.params.stepId), b.action,
-      { note: b.note, externalRef: b.externalRef, actor: actorOf(req) });
+      { note: b.note, externalRef: b.externalRef, reason: b.reason, actor: actorOf(req) });
     res.json({ ok: true });
-  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 200);
+    res.status(msg.includes('権限がありません') ? 403 : 400).json({ error: msg });
+  }
 });
 
 router.post('/api/cases/:id(\\d+)/waiting', (req, res) => {
@@ -4161,7 +4200,10 @@ router.post('/api/cases/:id(\\d+)/close', (req, res) => {
     }
     if (!r.already) console.log(`[inquiry-hub] 返品案件 ${r.case.case_no} を完了${b.force ? ' (例外)' : ''} by ${actorOf(req)}`);
     res.json({ ok: true, case: r.case });
-  } catch (e) { res.status(400).json({ error: String(e?.message || e).slice(0, 200) }); }
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 200);
+    res.status(msg.includes('権限がありません') ? 403 : 400).json({ error: msg });
+  }
 });
 
 router.post('/api/cases/:id(\\d+)/reopen', (req, res) => {

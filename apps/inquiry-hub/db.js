@@ -710,6 +710,10 @@ function createReturnCaseTables() {
     --   「返送は必要、でもまだ未着手」と「返送が必要かまだ分からない」を1列では書けない
     necessity_status TEXT NOT NULL DEFAULT 'required'
       CHECK(necessity_status IN ('undecided','required','not_required')),
+    -- テンプレート作成時の必要性。⭐「対応不要にしたのを戻す」ときに、ここへ戻す
+    --   (現在値だけだと、戻しても not_required のままになる = 戻したつもりで戻っていない)
+    template_necessity TEXT NOT NULL DEFAULT 'required'
+      CHECK(template_necessity IN ('undecided','required')),
     progress_status TEXT NOT NULL DEFAULT 'not_started'
       CHECK(progress_status IN ('not_started','in_progress','waiting','completed','exception')),
     assignee_id TEXT,                          -- 確認担当 (社内)

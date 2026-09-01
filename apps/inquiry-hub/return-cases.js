@@ -18,6 +18,24 @@
  */
 import { getDB } from './db.js';
 import { stripQuoted, normalizeForMatch } from './text-utils.js';
+import { hasPermission } from './staff.js';
+
+/**
+ * 「必要と決まっていた工程を対応不要にする」「未処理を残したまま完了する」に要る権限。
+ * ⭐既存の権限マップ (staff.js BUILTIN_PERMISSIONS) の D3「高額・例外・規約外を決める」を使う。
+ *   新しい権限を増やさない — 権限が増えるほど、誰も付与されていない権限が生まれるため
+ */
+export const EXCEPTION_PERMISSION = 'D3';
+
+/**
+ * 例外操作をしてよいか。
+ * ⭐担当者マスタが1人も登録されていないとき (null) は通す + 呼び元が画面に注意を出す。
+ *   導入直後に誰も操作できず業務が止まるのを避けるため。1人でも登録されていれば D3 保有者のみ
+ */
+export function canDoException(actor) {
+  const r = hasPermission(actor, EXCEPTION_PERMISSION);
+  return r === null ? { allowed: true, unmanaged: true } : { allowed: r === true, unmanaged: false };
+}
 
 // ─────────────────────────────────────────────────────────
 // 定数 (画面表示は全部ここから引く。内部コードは画面に出さない)
@@ -188,11 +206,18 @@ export function jstDate(iso) {
   return new Date(t + JST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
-/** JST の 'YYYY-MM-DD' → その日の 09:00 JST を表す UTC ISO ('YYYY-MM-DDT00:00:00Z') */
+/**
+ * JST の 'YYYY-MM-DD' → その日の 09:00 JST を表す UTC ISO ('YYYY-MM-DDT00:00:00Z')。
+ * ⭐形式だけでなく**実在する日付か**も見る — '2026-02-31' は 3/3 に繰り上がって
+ *   別の日として保存されてしまう (APIを直に叩かれたときの入口を塞ぐ)
+ */
 export function jstDateToIso(ymd) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd || ''))) return null;
-  const t = Date.parse(`${ymd}T09:00:00+09:00`);
-  return Number.isNaN(t) ? null : new Date(t).toISOString().slice(0, 19) + 'Z';
+  const s = String(ymd || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const t = Date.parse(`${s}T09:00:00+09:00`);
+  if (Number.isNaN(t)) return null;
+  const iso = new Date(t).toISOString().slice(0, 19) + 'Z';
+  return jstDate(iso) === s ? iso : null;   // 繰り上がったら不正な日付
 }
 
 /** 今から n 営業日後 (土日を飛ばす。祝日は見ない — §11「高度なカレンダーは作らない」) の JST 日付 */
@@ -209,13 +234,17 @@ export function businessDaysFromNow(days, now = new Date()) {
   return d.toISOString().slice(0, 10);
 }
 
-/** 期限からの超過日数 (JST の日付差)。未超過なら 0 */
+/**
+ * 期限からの超過日数。未超過なら 0。
+ * ⭐**JST の日付どうしで比べる** — 時刻差で計算すると、次回確認日の当日 9:00 を過ぎただけで
+ *   「1日超過」と赤くなる。当日はまだ超過ではない (その日のうちにやればいい)
+ */
 export function overdueDays(nextActionAt, now = new Date()) {
   if (!nextActionAt) return 0;
-  const due = Date.parse(nextActionAt);
-  if (Number.isNaN(due)) return 0;
-  const diff = now.getTime() - due;
-  return diff <= 0 ? 0 : Math.floor(diff / 86400000) + (diff % 86400000 > 0 ? 1 : 0);
+  const due = jstDate(nextActionAt);
+  const today = jstDate(now.toISOString());
+  if (!due || !today || due >= today) return 0;
+  return Math.round((Date.parse(today + 'T00:00:00Z') - Date.parse(due + 'T00:00:00Z')) / 86400000);
 }
 
 /** 滞留日数 (waiting_since から今まで) */
@@ -290,13 +319,17 @@ export function logCaseEvent(caseId, { eventType, from = null, to = null, actorT
 // 案件の作成
 // ─────────────────────────────────────────────────────────
 
-/** 'RC-2026-0001' を採番する (年ごとの連番。同一トランザクション内で呼ぶこと) */
+/**
+ * 'RC-2026-0001' を採番する (年ごとの連番。同一トランザクション内で呼ぶこと)。
+ * ⭐**整数で最大値を取る** — 文字列順だと 'RC-2026-9999' > 'RC-2026-10000' になり、
+ *   年1万件を超えた瞬間に同じ番号を作り続けて UNIQUE 違反で止まる
+ */
 function nextCaseNo(db, now = new Date()) {
   const year = new Date(now.getTime() + JST_OFFSET_MS).getUTCFullYear();
   const prefix = `RC-${year}-`;
-  const last = db.prepare(`SELECT case_no FROM return_cases WHERE case_no LIKE ? ORDER BY case_no DESC LIMIT 1`)
-    .get(`${prefix}%`);
-  const n = last ? Number(String(last.case_no).slice(prefix.length)) + 1 : 1;
+  const row = db.prepare(`SELECT MAX(CAST(SUBSTR(case_no, ?) AS INTEGER)) AS mx
+    FROM return_cases WHERE case_no LIKE ?`).get(prefix.length + 1, `${prefix}%`);
+  const n = (row?.mx || 0) + 1;
   return prefix + String(n).padStart(4, '0');
 }
 
@@ -305,7 +338,8 @@ function nextCaseNo(db, now = new Date()) {
  * ⭐必須入力は **種別と次回確認日の2つだけ**。担当・注文番号・工程は自動で入れる
  *   (入力が3つを超えると押されなくなる)
  */
-export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId, summary = null, actor = null }) {
+export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId, summary = null,
+  allowDuplicate = false, actor = null }) {
   const db = getDB();
   if (!CASE_TYPES[caseType]) throw new Error('案件種別が正しくありません');
   const nextActionAt = jstDateToIso(nextActionDate);
@@ -318,6 +352,20 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
   if (!assignee) throw new Error('担当者が決まっていません (問い合わせに担当者を設定してから案件にしてください)');
 
   return db.transaction(() => {
+    // ⭐二重作成を止める。1問い合わせに複数案件は正しい設計だが (商品Aは返金・商品Bは代品)、
+    //   ボタンの二度押し・再送との区別がつかないので、既に未完了案件があるときは
+    //   allowDuplicate を明示しない限り作らない (画面が「本当に別案件を作るか」を確認する)
+    if (inquiryId && !allowDuplicate) {
+      const dup = db.prepare(`SELECT c.case_no FROM case_inquiries ci
+        JOIN return_cases c ON c.id = ci.case_id
+        WHERE ci.inquiry_id = ? AND c.status = 'active' LIMIT 1`).get(inquiryId);
+      if (dup) {
+        const e = new Error(`この問い合わせには進行中の案件 ${dup.case_no} があります`);
+        e.code = 'DUPLICATE_CASE';
+        e.caseNo = dup.case_no;
+        throw e;
+      }
+    }
     const caseNo = nextCaseNo(db);
     const info = db.prepare(`INSERT INTO return_cases
       (case_no, case_type, stage, waiting_on, status, assigned_user_id, next_action_at, waiting_since,
@@ -330,10 +378,10 @@ export function createCase({ inquiryId, caseType, nextActionDate, assignedUserId
 
     // 工程をテンプレートから作る
     const insStep = db.prepare(`INSERT INTO case_steps
-      (case_id, step_type, necessity_status, progress_status, assignee_id, waiting_party, due_at, sort_order)
-      VALUES (?,?,?,'not_started',?,?,?,?)`);
+      (case_id, step_type, necessity_status, template_necessity, progress_status, assignee_id, waiting_party, due_at, sort_order)
+      VALUES (?,?,?,?,'not_started',?,?,?,?)`);
     STEP_TEMPLATES[caseType].forEach((s, i) => {
-      insStep.run(caseId, s.code, s.necessity, assignee, s.party,
+      insStep.run(caseId, s.code, s.necessity, s.necessity, assignee, s.party,
         jstDateToIso(businessDaysFromNow(s.days)), (i + 1) * 10);
     });
 
@@ -499,19 +547,24 @@ function touchCase(db, caseId, patch = {}) {
  */
 export function setWaiting(caseId, { waitingOn, nextActionDate, nextActionNote, actor }) {
   const db = getDB();
-  const cur = getCase(caseId);
-  if (!cur) throw new Error('案件が見つかりません');
-  if (cur.status !== 'active') throw new Error('完了した案件は変更できません');
   if (!WAITING_ON[waitingOn]) throw new Error('待ち先が正しくありません');
-  let nextAt = nextActionDate ? jstDateToIso(nextActionDate) : cur.next_action_at;
-  if (nextActionDate && !nextAt) throw new Error('次回確認日の形式が正しくありません');
-  if (EXTERNAL_WAITING.includes(waitingOn) && !nextAt) {
-    nextAt = jstDateToIso(businessDaysFromNow(DEFAULT_DUE_BUSINESS_DAYS[waitingOn] ?? 3));
-  }
   return db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM return_cases WHERE id = ?').get(caseId);
+    if (!cur) throw new Error('案件が見つかりません');
+    if (cur.status !== 'active') throw new Error('完了した案件は変更できません');
+    const changed = cur.waiting_on !== waitingOn;
+    let nextAt = nextActionDate ? jstDateToIso(nextActionDate) : (changed ? null : cur.next_action_at);
+    if (nextActionDate && !nextAt) throw new Error('次回確認日の形式が正しくありません');
+    // ⭐待ち先が変わったのに日付を指定しなかったら、**新しい待ち先の既定で取り直す**。
+    //   前の待ち先の期限をそのまま持ち越すと、変えた瞬間に期限超過になったり、
+    //   逆に遠い将来の期限を引きずったりする
+    if (!nextAt && EXTERNAL_WAITING.includes(waitingOn)) {
+      nextAt = jstDateToIso(businessDaysFromNow(DEFAULT_DUE_BUSINESS_DAYS[waitingOn] ?? 3));
+    }
+    if (!nextAt && !EXTERNAL_WAITING.includes(waitingOn)) nextAt = changed ? cur.next_action_at : cur.next_action_at;
     const patch = { waiting_on: waitingOn, next_action_at: nextAt };
     if (nextActionNote !== undefined) patch.next_action_note = nextActionNote || null;
-    if (cur.waiting_on !== waitingOn) patch.waiting_since = nowIso();
+    if (changed) patch.waiting_since = nowIso();
     touchCase(db, caseId, patch);
     logCaseEvent(caseId, { eventType: 'waiting_changed',
       from: { waiting_on: cur.waiting_on, next_action_at: cur.next_action_at },
@@ -523,11 +576,14 @@ export function setWaiting(caseId, { waitingOn, nextActionDate, nextActionNote, 
 /** 案件の担当を変える (⭐外部待ちでも社内担当は必ず居る) */
 export function setAssignee(caseId, assignee, actor) {
   const db = getDB();
-  const cur = getCase(caseId);
-  if (!cur) throw new Error('案件が見つかりません');
   const name = String(assignee || '').trim();
   if (!name) throw new Error('担当者を空にはできません');
   db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM return_cases WHERE id = ?').get(caseId);
+    if (!cur) throw new Error('案件が見つかりません');
+    // ⭐完了した案件は変えない (閉じた時点の記録が後から書き換わると台帳として使えない)。
+    //   直すときは「開け直す」を通す
+    if (cur.status !== 'active') throw new Error('完了した案件は変更できません (開け直してから直してください)');
     touchCase(db, caseId, { assigned_user_id: name });
     logCaseEvent(caseId, { eventType: 'assignee_changed',
       from: { assignee: cur.assigned_user_id }, to: { assignee: name }, actorId: actor });
@@ -538,13 +594,15 @@ export function setAssignee(caseId, assignee, actor) {
 /** 返金の記録 (⭐実行はモール管理画面。ここは「いくら返す約束で、いくら返したか」) */
 export function setRefund(caseId, { expected, completed, ref, actor }) {
   const db = getDB();
-  const cur = getCase(caseId);
-  if (!cur) throw new Error('案件が見つかりません');
   const num = v => (v === '' || v == null) ? null : Number(String(v).replace(/[,\s]/g, ''));
   const exp = num(expected), done = num(completed);
   if (exp != null && (!Number.isFinite(exp) || exp < 0)) throw new Error('返金予定額が正しくありません');
   if (done != null && (!Number.isFinite(done) || done < 0)) throw new Error('返金実績額が正しくありません');
   db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM return_cases WHERE id = ?').get(caseId);
+    if (!cur) throw new Error('案件が見つかりません');
+    // ⭐完了後に返金額が書き換わると、閉じた時点の記録が信用できなくなる
+    if (cur.status !== 'active') throw new Error('完了した案件は変更できません (開け直してから直してください)');
     touchCase(db, caseId, {
       refund_expected_amount: exp, refund_completed_amount: done, refund_external_ref: ref || null,
     });
@@ -563,52 +621,75 @@ export function setRefund(caseId, { expected, completed, ref, actor }) {
  * ⭐工程を「回答・到着待ち」にしたら、案件の waiting_on もその待ち先に寄せる
  *   (カンバンの列を人が別途動かさなくて済む = 二重入力を作らない)
  */
-export function updateStep(caseId, stepId, action, { note, externalRef, actor } = {}) {
+export function updateStep(caseId, stepId, action, { note, externalRef, reason, actor } = {}) {
   const db = getDB();
-  const c = getCase(caseId);
-  if (!c) throw new Error('案件が見つかりません');
-  if (c.status !== 'active') throw new Error('完了した案件の工程は変更できません');
-  const step = db.prepare('SELECT * FROM case_steps WHERE id = ? AND case_id = ?').get(stepId, caseId);
-  if (!step) throw new Error('工程が見つかりません');
-
-  const before = { necessity: step.necessity_status, progress: step.progress_status };
-  const patch = {};
-  switch (action) {
-    case 'complete':
-      patch.necessity_status = 'required';
-      patch.progress_status = 'completed';
-      patch.completed_at = nowIso();
-      patch.completed_by = actor || null;
-      break;
-    case 'skip':
-      patch.necessity_status = 'not_required';
-      patch.progress_status = 'not_started';
-      patch.completed_at = nowIso();
-      patch.completed_by = actor || null;
-      break;
-    case 'need':
-      patch.necessity_status = 'required';
-      break;
-    case 'start':
-      patch.necessity_status = 'required';
-      patch.progress_status = 'in_progress';
-      break;
-    case 'wait':
-      patch.necessity_status = 'required';
-      patch.progress_status = 'waiting';
-      break;
-    case 'undo':
-      patch.progress_status = 'not_started';
-      patch.completed_at = null;
-      patch.completed_by = null;
-      break;
-    default:
-      throw new Error('操作が正しくありません');
-  }
-  if (note !== undefined) patch.note = note || null;
-  if (externalRef !== undefined) patch.external_ref = externalRef || null;
-
   return db.transaction(() => {
+    // ⭐判定に使う値はトランザクションの中で読む
+    //   (外で読むと、履歴の「変更前」が実際と食い違う / 判定と更新の間に状態が変わる)
+    const c = db.prepare('SELECT * FROM return_cases WHERE id = ?').get(caseId);
+    if (!c) throw new Error('案件が見つかりません');
+    if (c.status !== 'active') throw new Error('完了した案件の工程は変更できません');
+    const step = db.prepare('SELECT * FROM case_steps WHERE id = ? AND case_id = ?').get(stepId, caseId);
+    if (!step) throw new Error('工程が見つかりません');
+
+    const before = { necessity: step.necessity_status, progress: step.progress_status };
+    const patch = {};
+    switch (action) {
+      case 'complete':
+        patch.necessity_status = 'required';
+        patch.progress_status = 'completed';
+        patch.completed_at = nowIso();
+        patch.completed_by = actor || null;
+        break;
+      case 'skip':
+        // ⭐要否がまだ決まっていない工程だけ「対応不要」にできる。
+        //   最初から必要な工程 (返金処理など) をここで消せると、完了ゲートが無意味になる
+        if (step.necessity_status !== 'undecided') {
+          throw new Error('必要と決まっている工程は「対応不要」にできません (どうしても外すときは「必要な工程を外す」を使ってください)');
+        }
+        patch.necessity_status = 'not_required';
+        patch.progress_status = 'not_started';
+        patch.completed_at = nowIso();
+        patch.completed_by = actor || null;
+        break;
+      case 'skip_required': {
+        // ⭐必要と決まっている工程を外す = 例外操作。理由と権限が要る (履歴にも別イベントで残す)
+        if (step.necessity_status === 'not_required') throw new Error('すでに対応不要です');
+        if (!String(reason || '').trim()) throw new Error('必要な工程を外すには理由を書いてください');
+        const perm = canDoException(actor);
+        if (!perm.allowed) throw new Error('必要な工程を外す権限がありません (担当者と権限の画面で D3 が要ります)');
+        patch.necessity_status = 'not_required';
+        patch.progress_status = 'not_started';
+        patch.completed_at = nowIso();
+        patch.completed_by = actor || null;
+        patch.note = String(reason).slice(0, 500);
+        break;
+      }
+      case 'need':
+        patch.necessity_status = 'required';
+        break;
+      case 'start':
+        patch.necessity_status = 'required';
+        patch.progress_status = 'in_progress';
+        break;
+      case 'wait':
+        patch.necessity_status = 'required';
+        patch.progress_status = 'waiting';
+        break;
+      case 'undo':
+        // ⭐「対応不要」を戻すときは必要性も戻す。進捗だけ戻すと、戻したつもりで
+        //   not_required のまま残り、完了ゲートをすり抜ける
+        if (step.necessity_status === 'not_required') patch.necessity_status = step.template_necessity || 'required';
+        patch.progress_status = 'not_started';
+        patch.completed_at = null;
+        patch.completed_by = null;
+        break;
+      default:
+        throw new Error('操作が正しくありません');
+    }
+    if (note !== undefined) patch.note = note || null;
+    if (externalRef !== undefined) patch.external_ref = externalRef || null;
+
     const cols = Object.keys(patch);
     db.prepare(`UPDATE case_steps SET ${cols.map(k => `${k} = ?`).join(', ')},
       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?`)
@@ -643,8 +724,8 @@ export function updateStep(caseId, stepId, action, { note, externalRef, actor } 
     if (Object.keys(stagePatch).length) touchCase(db, caseId, stagePatch);
     else touchCase(db, caseId, {});
 
-    logCaseEvent(caseId, { eventType: 'step_changed', from: before,
-      to: { step_type: step.step_type, action, ...patch }, actorId: actor,
+    logCaseEvent(caseId, { eventType: action === 'skip_required' ? 'step_skipped_exception' : 'step_changed',
+      from: before, to: { step_type: step.step_type, action, ...patch }, actorId: actor,
       note: stepLabel(c.case_type, step.step_type) });
     return { case: getCase(caseId), steps: listSteps(caseId) };
   }).immediate();
@@ -658,22 +739,28 @@ export function updateStep(caseId, stepId, action, { note, externalRef, actor } 
  */
 export function closeCase(caseId, { force = false, reasonCode = null, note = null, actor = null } = {}) {
   const db = getDB();
-  const c = getCase(caseId);
-  if (!c) throw new Error('案件が見つかりません');
-  if (c.status !== 'active') return { ok: true, already: true, case: c };
-  const blockers = blockersOf(caseId);
-  if (blockers.total > 0 && !force) {
-    return { ok: false, blockers, case: c };
-  }
-  if (force && !CLOSE_REASONS[reasonCode]) throw new Error('例外として完了するには理由を選んでください');
-  if (force && !String(note || '').trim()) throw new Error('例外として完了するには詳細メモを入れてください');
-
+  // ⭐ゲートの判定と完了の更新を**同じトランザクションの中でやる**。
+  //   外で判定してから閉じると、その間に工程が増えても気づけない
   return db.transaction(() => {
-    // closed_at IS NULL を条件にして二重完了を防ぐ
+    const c = db.prepare('SELECT * FROM return_cases WHERE id = ?').get(caseId);
+    if (!c) throw new Error('案件が見つかりません');
+    if (c.status !== 'active') return { ok: true, already: true, case: c };
+    const blockers = blockersOf(caseId);
+    if (blockers.total > 0 && !force) {
+      return { ok: false, blockers, case: c };
+    }
+    if (force) {
+      if (!CLOSE_REASONS[reasonCode]) throw new Error('例外として完了するには理由を選んでください');
+      if (!String(note || '').trim()) throw new Error('例外として完了するには詳細メモを入れてください');
+      // ⭐例外完了は権限が要る (画面でボタンを隠すだけにしない — APIを直に叩けるため)
+      const perm = canDoException(actor);
+      if (!perm.allowed) throw new Error('例外として完了する権限がありません (担当者と権限の画面で D3 が要ります)');
+    }
+    // status='active' と closed_at IS NULL の両方を条件にして二重完了を防ぐ
     const r = db.prepare(`UPDATE return_cases SET status = 'completed', stage = 'COMPLETED', waiting_on = 'NONE',
       closed_at = ?, closed_by = ?, close_reason_code = ?, close_note = ?,
       updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-      WHERE id = ? AND closed_at IS NULL`)
+      WHERE id = ? AND status = 'active' AND closed_at IS NULL`)
       .run(nowIso(), actor || null, force ? reasonCode : null, force ? note : (note || null), caseId);
     if (r.changes === 0) return { ok: true, already: true, case: getCase(caseId) };
     logCaseEvent(caseId, { eventType: force ? 'case_closed_exception' : 'case_closed',
