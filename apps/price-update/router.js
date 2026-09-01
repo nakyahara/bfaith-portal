@@ -63,15 +63,24 @@ function isAdmin(req) {
 /**
  * 実行できる人か (要件⑨: 実行は中原さん + 奥様の2名)。
  * ★画面でボタンを隠すだけでは防御にならない。API を直接叩かれてもここで止める。
- * env PRICE_UPDATE_EXECUTORS にメールを並べて指定する (カンマ区切り)。
- * 未設定なら admin だけ (fail-closed。「誰でも実行できる」状態を作らない)。
+ * env PRICE_UPDATE_EXECUTORS にメールを並べて指定する (カンマ区切り)。名簿がすべて。
+ * ★admin でも名簿に無ければ実行できない。未設定なら誰も実行できない (Codex R2 High)。
+ *   「admin なら実行できる」にすると、権限を持つ人が増えた時に黙って実行者も増える。
  */
-function canExecute(req) {
+function executorGate(req) {
   const list = String(process.env.PRICE_UPDATE_EXECUTORS || '')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
-  const email = String(req.session?.email || '').toLowerCase();
-  if (list.length === 0) return req.session?.role === 'admin';
-  return list.includes(email) || req.session?.role === 'admin';
+  if (list.length === 0) {
+    return { ok: false, message: '実行できる人がまだ設定されていません (環境変数 PRICE_UPDATE_EXECUTORS にメールを設定してください)。設定されるまで誰も実行できません' };
+  }
+  const email = String(req.session?.email || '').trim().toLowerCase();
+  if (!list.includes(email)) {
+    return { ok: false, message: '価格を実際に更新できるのは、実行権限のある人だけです (管理者でも名簿に無ければ実行できません)' };
+  }
+  return { ok: true, message: null };
+}
+function canExecute(req) {
+  return executorGate(req).ok;
 }
 
 function apiError(res, e, where) {
@@ -447,11 +456,9 @@ router.post('/api/runs', (req, res) => {
 router.post('/api/runs/:runId/execute', async (req, res) => {
   try {
     const db = getDB();
-    if (!canExecute(req)) {
-      return res.status(403).json({
-        ok: false, error: 'forbidden',
-        message: '価格を実際に更新できるのは、実行権限のある人だけです (PRICE_UPDATE_EXECUTORS)',
-      });
+    const gate = executorGate(req);
+    if (!gate.ok) {
+      return res.status(403).json({ ok: false, error: 'forbidden', message: gate.message });
     }
     const run = getRun(db, req.params.runId);
     if (!run) throw validationError('履歴が見つかりません');
@@ -492,6 +499,7 @@ router.get('/api/runs/:runId/executable', (req, res) => {
       ok: true,
       targets: targets.length,
       canExecute: canExecute(req),
+      canExecuteReason: executorGate(req).message,   // 実行できない理由を画面に出すため
       claim: runClaim(getDB(), run.run_id),   // 既に実行済みならここに誰がいつ実行したかが入る
       gates: Object.fromEntries(malls.map((m) => [m, mallWriteEnabled(m)])),
     });
@@ -542,4 +550,4 @@ router.get('/api/runs/:runId', (req, res) => {
 });
 
 export default router;
-export { buildPreviewRows, evaluateRows };
+export { buildPreviewRows, evaluateRows, executorGate };

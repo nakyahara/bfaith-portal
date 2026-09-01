@@ -12,6 +12,7 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import { createTables, insertRun, getRun } from './db.js';
 import { executeRun, mallWriteEnabled, classify, groupOperations, BREAKER_CONSECUTIVE_FAILURES } from './execute.js';
+import { executorGate } from './router.js';
 
 let failed = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✅' : '❌'} ${label}`); if (!cond) failed++; };
@@ -77,6 +78,24 @@ console.log('\n── モール別 kill switch (明示的に有効でなけれ�
   eq(client.calls.length, 0, '楽天を1度も叩いていない');
 }
 
+console.log('\n── 実行できる人 (名簿がすべて) ──');
+{
+  const withEnv = (v, session) => {
+    const before = process.env.PRICE_UPDATE_EXECUTORS;
+    if (v === null) delete process.env.PRICE_UPDATE_EXECUTORS; else process.env.PRICE_UPDATE_EXECUTORS = v;
+    try { return executorGate({ session }); } finally {
+      if (before === undefined) delete process.env.PRICE_UPDATE_EXECUTORS; else process.env.PRICE_UPDATE_EXECUTORS = before;
+    }
+  };
+  const admin = { role: 'admin', email: 'admin@example.com' };
+  eq(withEnv(null, admin).ok, false, '★名簿が未設定なら admin でも実行できない (誰も実行できない)');
+  ok(withEnv(null, admin).message.includes('PRICE_UPDATE_EXECUTORS'), '未設定だと分かる理由を返す');
+  eq(withEnv('a@example.com', admin).ok, false, '★名簿に無ければ admin でも実行できない');
+  eq(withEnv('a@example.com', { role: 'user', email: 'A@Example.com ' }).ok, true, '名簿にあれば実行できる (大小文字・空白は無視)');
+  eq(withEnv('a@example.com , b@example.com', { role: 'user', email: 'b@example.com' }).ok, true, 'カンマ区切りで複数人');
+  eq(withEnv('a@example.com', { role: 'user' }).ok, false, 'メールが分からない相手は実行できない');
+}
+
 console.log('\n── 応答の解釈 ──');
 {
   eq(classify({ status: 200, body: { state: 'applied' } }), 'applied', '200 applied');
@@ -111,6 +130,19 @@ console.log('\n── 試運転が通れば続ける ──');
   const { summary } = await executeRun(db, run, { actor: 't', client, env: ENV_ON });
   eq([client.calls.length, summary.applied], [3, 3], '3件とも送って確認できた');
   eq(summary.stopped, null, '止まっていない');
+}
+
+console.log('\n── noop は試運転の合格にしない (書き込んでいないため) ──');
+{
+  const run = makeRun(3);
+  const client = makeClient([
+    { status: 200, body: { state: 'noop' } },                            // 送ったが書き換えは起きていない
+    { status: 400, body: { error: 'INVALID_PRICE', message: '不正な価格' } },
+  ]);
+  const { summary } = await executeRun(db, run, { actor: 't', client, env: ENV_ON });
+  eq(client.calls.length, 2, '★noop の次で失敗したら、そこで止まる (ブレーカーの2件目まで待たない)');
+  eq([summary.noop, summary.failed, summary.skipped], [1, 1, 1], 'noop 1 / 失敗 1 / 未送信 1');
+  ok(summary.stopped.includes('試運転'), '★止めた理由は「試運転が済んでいない」');
 }
 
 console.log('\n── サーキットブレーカー: 連続2件失敗で残りを止める ──');

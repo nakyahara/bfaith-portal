@@ -223,7 +223,9 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
           if (state === 'noop') { summary.noop++; record(op, 'noop', null, { live: verified.live?.[op.sku_code] ?? null }); }
           else { summary.applied++; record(op, 'confirmed', null, { sent: prices[op.sku_code], verified: verified.live?.[op.sku_code] ?? null }); }
         }
-        trialDone.add(mall);
+        // ★試運転が済んだ = 「実際に書き換えて、その通りになったことを確かめられた」1件があること。
+        //   noop は楽天へ書き込んでいないので、書き込みが通る証拠にならない (Codex R2 Medium)
+        if (state === 'applied') trialDone.add(mall);
         continue;
       }
       // 確認できなかった: 一致しない = failed / 取り直せない = unknown
@@ -254,7 +256,7 @@ export async function executeRun(db, run, { actor, client, env = process.env, sk
       const streak = (failStreak.get(mall) || 0) + 1;
       failStreak.set(mall, streak);
       if (!trialDone.has(mall)) {
-        stoppedMalls.set(mall, '試運転の1件目が失敗したため、残りを送っていません');
+        stoppedMalls.set(mall, '試運転 (実際に価格が変わったことの確認) が済む前に失敗したため、残りを送っていません');
       } else if (streak >= BREAKER_CONSECUTIVE_FAILURES) {
         stoppedMalls.set(mall, `${BREAKER_CONSECUTIVE_FAILURES} 件続けて失敗したため、残りを止めました`);
       }
