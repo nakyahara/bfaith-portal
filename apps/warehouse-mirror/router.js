@@ -482,10 +482,12 @@ router.post('/api/sync', requireSyncKey, (req, res) => {
       const tx = db.transaction(() => {
         db.exec('DELETE FROM mirror_rakuten_sku_map');
         const stmt = db.prepare(`INSERT INTO mirror_rakuten_sku_map (
-          rakuten_code, ne_code, source, updated_at
-        ) VALUES (?,?,?,?)`);
+          rakuten_code, ne_code, source, manage_number, updated_at
+        ) VALUES (?,?,?,?,?)`);
         for (const m of rskmData) {
-          stmt.run(m.rakuten_code, m.ne_code, m.source, now);
+          // manage_number は miniPC 側の再構築が新形式になるまで届かない (その間は NULL)
+          const mn = m.manage_number == null ? null : (String(m.manage_number).trim() || null);
+          stmt.run(m.rakuten_code, m.ne_code, m.source, mn, now);
         }
       });
       tx();

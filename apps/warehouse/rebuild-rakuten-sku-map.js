@@ -14,6 +14,7 @@ import 'dotenv/config';
 import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { buildMappings } from './rakuten-sku-map-build.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = path.resolve(__dirname, '..', '..');
@@ -21,11 +22,6 @@ const DB_PATH = path.join(PROJECT_DIR, 'data', 'warehouse.db');
 
 const SERVICE_TOKEN = process.env.SERVICE_TOKEN;
 const SERVICE_URL = process.env.WAREHOUSE_INTERNAL_URL || 'http://localhost:3000';
-
-const INVALID_AL = new Set(['normal-inventory', 'normal-size', 'normal', '']);
-
-// AM(1) > AL(2) > W(3): 小さいほど優先
-const PRIORITY = { am: 1, al: 2, w: 3 };
 
 async function fetchAllSkus() {
   const url = `${SERVICE_URL}/service-api/rakuten-rms/items/all-skus`;
@@ -46,26 +42,14 @@ function ensureTable(db) {
     updated_at   TEXT NOT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_frskm_ne ON f_rakuten_sku_map(ne_code)');
-}
-
-function resolveSku(sku, productMap) {
-  const am = (sku.systemSkuNumber || '').toLowerCase();
-  const al = (sku.skuManageNumber || '').toLowerCase();
-  const w  = (sku.itemNumber || '').toLowerCase();
-
-  // Stage 1: AM
-  if (am && productMap.has(am)) {
-    return { ne_code: productMap.get(am), resolution: 'am' };
+  // ★manage_number (商品管理番号) を全行に持つ (2026-09-01)。
+  //   W (商品番号) の行は 1 商品に 1 行しか作れないので、カラバリ 12 色のうち 11 色は W 行を持てず
+  //   商品ページにたどり着けなかった (価格一括改定で発覚・楽天出品の 3 割)。AM/AL の行にも入れる
+  const cols = db.prepare('PRAGMA table_info(f_rakuten_sku_map)').all().map((c) => c.name);
+  if (!cols.includes('manage_number')) {
+    db.exec('ALTER TABLE f_rakuten_sku_map ADD COLUMN manage_number TEXT');
+    console.log('[RakutenSkuMap] 列を追加: manage_number');
   }
-  // Stage 2: AL（無意味値はスキップ）
-  if (al && !INVALID_AL.has(al) && productMap.has(al)) {
-    return { ne_code: productMap.get(al), resolution: 'al' };
-  }
-  // Stage 3: W
-  if (w && productMap.has(w)) {
-    return { ne_code: productMap.get(w), resolution: 'w' };
-  }
-  return null;
 }
 
 async function main() {
@@ -92,51 +76,25 @@ async function main() {
   const skus = await fetchAllSkus();
   console.log(`[RakutenSkuMap] RMS取得: ${skus.length} SKU`);
 
-  // 3. 各SKUを解決して (rakuten_code → ne_code + source) を収集
-  //    複数SKUが同じrakuten_codeを持つ場合は source priority が高い方を優先
-  const mappings = new Map(); // rakuten_code → { ne_code, source, priority }
-  let resolvedCount = 0;
-  let unresolvedCount = 0;
-
-  for (const sku of skus) {
-    const result = resolveSku(sku, productMap);
-    if (!result) {
-      unresolvedCount++;
-      continue;
-    }
-    resolvedCount++;
-
-    const am = (sku.systemSkuNumber || '').toLowerCase();
-    const al = (sku.skuManageNumber || '').toLowerCase();
-    const w  = (sku.itemNumber || '').toLowerCase();
-
-    // 解決で使われたcodeは確実に登録（権威あり）
-    // それ以外のcodeも同じne_codeに対応付ける（profit-analysisで任意コードから引けるように）
-    const candidates = [];
-    if (am) candidates.push({ code: am, src: 'am' });
-    if (al && !INVALID_AL.has(al)) candidates.push({ code: al, src: 'al' });
-    if (w) candidates.push({ code: w, src: 'w' });
-
-    for (const c of candidates) {
-      const existing = mappings.get(c.code);
-      const newPriority = PRIORITY[c.src];
-      if (!existing || newPriority < existing.priority) {
-        mappings.set(c.code, { ne_code: result.ne_code, source: c.src, priority: newPriority });
-      }
-    }
-  }
+  // 3. 各SKUを解決して (rakuten_code → ne_code + source + manage_number) を収集
+  //    複数SKUが同じrakuten_codeを持つ場合は source priority が高い方を優先 (組み立ては rakuten-sku-map-build.js)
+  const { mappings, resolvedCount, unresolvedCount, withoutManageNumber } = buildMappings(skus, productMap);
 
   console.log(`[RakutenSkuMap] 解決: ${resolvedCount} / 未解決: ${unresolvedCount}`);
   console.log(`[RakutenSkuMap] マッピング総数（dedupe後）: ${mappings.size}`);
+  if (withoutManageNumber > 0) {
+    // 全SKU応答に manageNumber が無い = 経路のどこかが古い。ここで止めはしないが、気づけるように残す
+    console.warn(`[RakutenSkuMap] ⚠️ manageNumber が無い SKU が ${withoutManageNumber} 件 (商品ページに届かない行になる)`);
+  }
 
   // 4. DELETE + INSERT で全件置換
   ensureTable(db);
   const now = new Date().toISOString().replace('T', ' ').slice(0, 19);
   const tx = db.transaction(() => {
     db.exec('DELETE FROM f_rakuten_sku_map');
-    const stmt = db.prepare('INSERT INTO f_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?, ?, ?, ?)');
+    const stmt = db.prepare('INSERT INTO f_rakuten_sku_map (rakuten_code, ne_code, source, manage_number, updated_at) VALUES (?, ?, ?, ?, ?)');
     for (const [code, info] of mappings) {
-      stmt.run(code, info.ne_code, info.source, now);
+      stmt.run(code, info.ne_code, info.source, info.manage_number, now);
     }
   });
   tx();
@@ -144,6 +102,8 @@ async function main() {
   // 5. 結果サマリ
   const bySource = db.prepare('SELECT source, COUNT(*) as n FROM f_rakuten_sku_map GROUP BY source').all();
   console.log(`[RakutenSkuMap] 保存内訳:`, bySource);
+  const mnMissing = db.prepare('SELECT COUNT(*) as n FROM f_rakuten_sku_map WHERE manage_number IS NULL').get().n;
+  console.log(`[RakutenSkuMap] manage_number 無し: ${mnMissing} 行`);
 
   const elapsed = Math.round((Date.now() - startedAt) / 1000);
   console.log(`[RakutenSkuMap] 完了 (${elapsed}秒): ${mappings.size}件保存`);

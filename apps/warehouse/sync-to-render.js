@@ -324,7 +324,15 @@ export async function syncToRender() {
   // 2d. rakuten_sku_map（楽天AM/AL/W→NE商品コード マッピング）
   let rakuten_sku_map = [];
   try {
-    rakuten_sku_map = db.prepare('SELECT rakuten_code, ne_code, source, updated_at FROM f_rakuten_sku_map').all();
+    // manage_number (商品管理番号) は 2026-09-01 に追加。再構築が一度も走っていない DB では列が無いので、
+    // その時だけ旧4列で送る (Render 側は manage_number 無しを NULL として受ける)
+    try {
+      rakuten_sku_map = db.prepare('SELECT rakuten_code, ne_code, source, manage_number, updated_at FROM f_rakuten_sku_map').all();
+    } catch (e) {
+      if (!/no such column: manage_number/i.test(String(e.message))) throw e;
+      rakuten_sku_map = db.prepare('SELECT rakuten_code, ne_code, source, updated_at FROM f_rakuten_sku_map').all();
+      console.log('[Sync→Render]   rakuten_sku_map: manage_number 列がまだ無い (旧形式で送信。再構築後に入る)');
+    }
     console.log(`[Sync→Render]   rakuten_sku_map: ${rakuten_sku_map.length}件`);
   } catch {
     console.log(`[Sync→Render]   rakuten_sku_map: テーブル未作成（スキップ）`);

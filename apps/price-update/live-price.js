@@ -76,36 +76,61 @@ export function shippingOfRakutenVariant(v) {
 }
 
 /**
- * 楽天のライブ価格。listingCode は AM/AL/W いずれか (mirror_rakuten_sku_map 由来)。
+ * 楽天のライブ価格。
  *
- * @param {string[]} listingCodes
+ * @param {Array<{key:string, aliases?:string[], manageNumber?:string|null, manageNumbers?:string[], rowKey?:string}>} targets
+ *   key      = 表示中の出品コード (別名の1つとしても使う)
+ *   aliases  = AM/AL/W の別名 (mirror_rakuten_sku_map 由来)。variant の特定に使う
+ *   skuAliases = そのうち SKU 単位のもの (AM/AL。対応表の source で分けたもの)。variant の照合に使う
+ *   amAliases  = そのうち AM (システム連携用SKU番号) 由来のもの。当たった variant の AM はこれとだけ照合する
+ *   manageNumber  = 対応表が持っている商品管理番号 (あればこれを最優先で使う)
+ *   manageNumbers = 対応表に複数の商品管理番号があった時の一覧 (2つ以上なら取り違え防止で確定しない)
+ *   rowKey   = 結果を引くためのキー。★色違いは同じ商品管理番号を共有するので、
+ *              出品コードだけをキーにすると同じプレビュー内の別の行と衝突する。省略時は key の正規化
  * @returns {Promise<Map<string, {price:number|null, manageNumber:string|null, skuCode:string|null,
  *                                found:boolean, reason:string|null, itemTitle:string|null}>>}
- *   キーは listingCode の正規化キー
  */
 export async function fetchRakutenPrices(targets, deps = {}) {
   const out = new Map();
-  // targets = [{ key, aliases: [AM/AL/W の別名] }]。key は行を引くためのキー (= 表示中の出品コード)
   const list = (targets || [])
     .map((t) => ({
       key: normCode(t.key),
+      rowKey: t.rowKey ? String(t.rowKey) : normCode(t.key),
       aliases: [...new Set([t.key, ...(t.aliases || [])].map((a) => String(a || '').trim()).filter(Boolean))],
+      skuAliases: [...new Set((t.skuAliases || []).map((a) => String(a || '').trim()).filter(Boolean))],
+      amAliases: [...new Set((t.amAliases || []).map((a) => String(a || '').trim()).filter(Boolean))],
+      manageNumber: String(t.manageNumber || '').trim() || null,
+      manageNumbers: [...new Set((t.manageNumbers || []).map((m) => String(m || '').trim()).filter(Boolean))],
     }))
     .filter((t) => t.key);
   if (list.length === 0) return out;
 
-  const codeMap = await itemNumberToManageNumber(deps);
-  // 別名のどれかが itemNumber として対応表にあれば、それが manageNumber。
-  // 無ければ「別名自体が管理番号」の可能性を順に試す (単品はコード = 管理番号のことが多い)
+  // ★商品管理番号の決め方 (優先順):
+  //   1. 対応表の manage_number (RMS の全SKU一覧から取った値。AM/AL の行にも入っている — 2026-09-01)
+  //   2. 別名のどれかが itemNumber として all-codes にあれば、その manageNumber
+  //   3. 別名そのもの (単品はコード = 管理番号のことが多い)
+  //   1 で全部決まるなら all-codes は取りに行かない
+  const needCodeMap = list.some((t) => !t.manageNumber && t.manageNumbers.length <= 1);
+  const codeMap = needCodeMap ? await itemNumberToManageNumber(deps) : new Map();
   const wanted = new Map();   // manageNumber → [target...]
   for (const t of list) {
-    let mn = null;
-    for (const a of t.aliases) { const hit = codeMap.get(normCode(a)); if (hit) { mn = hit; break; } }
+    if (t.manageNumbers.length > 1) {
+      // 同じ NE コードが複数の楽天商品に紐づいている。どちらか決めずに未確定 (取り違え防止)
+      out.set(t.rowKey, {
+        price: null, manageNumber: null, skuCode: null, found: false,
+        reason: `このNEコードは複数の楽天商品に紐づいています (${t.manageNumbers.join(', ')})。どちらか特定できないため確定しません`,
+        itemTitle: null,
+      });
+      continue;
+    }
+    let mn = t.manageNumber;
+    if (!mn) for (const a of t.aliases) { const hit = codeMap.get(normCode(a)); if (hit) { mn = hit; break; } }
     if (!mn) mn = t.aliases[0];
     t.manageNumber = mn;
     if (!wanted.has(mn)) wanted.set(mn, []);
     wanted.get(mn).push(t);
   }
+  if (wanted.size === 0) return out;
 
   const fetchBulk = deps.fetchItemDetailsBulkDetailed || fetchItemDetailsBulkDetailed;
   const { items, failed } = await fetchBulk([...wanted.keys()]);
@@ -113,9 +138,10 @@ export async function fetchRakutenPrices(targets, deps = {}) {
   const itemByMn = new Map((items || []).map((it) => [normCode(it?.manageNumber), it]));
 
   for (const t of list) {
+    if (out.has(t.rowKey)) continue;   // 上で確定しないと決めた行
     const item = itemByMn.get(normCode(t.manageNumber));
     if (!item) {
-      out.set(t.key, {
+      out.set(t.rowKey, {
         price: null, manageNumber: t.manageNumber, skuCode: null, found: false,
         reason: failedByCode.get(normCode(t.manageNumber)) || '楽天に見つかりません',
         itemTitle: null,
@@ -123,31 +149,86 @@ export async function fetchRakutenPrices(targets, deps = {}) {
       continue;
     }
     const variants = item?.variants && typeof item.variants === 'object' ? item.variants : {};
-    const aliasKeys = new Set(t.aliases.map(normCode));
-    // variant の特定: SKU管理番号 (variants のキー) か システム連携SKU番号 が、別名のどれかと一致
-    const matched = [];
-    for (const [vk, v] of Object.entries(variants)) {
-      if (aliasKeys.has(normCode(vk)) || aliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
-    }
-    let matchedKey = matched.length === 1 ? matched[0] : null;
-    // 別名で特定できなくても、variant が 1 つだけの商品なら取り違えようがない
-    if (!matchedKey && matched.length === 0 && Object.keys(variants).length === 1) {
-      matchedKey = Object.keys(variants)[0];
-    }
-    if (!matchedKey) {
-      out.set(t.key, {
+    // variant の特定: SKU管理番号 (variants のキー) か システム連携用SKU番号 (AM) が、
+    // ★SKU 単位の別名 (AM/AL。対応表の source で分けたもの) のどれかと一致すること。
+    //   ページ単位の値 (商品番号 = 管理番号) は照合に使わない — 偶然それを SKU管理番号や AM に持つ
+    //   別の variant に当たりうる (Codex R6)。SKU 単位かどうかは値で推定しない (Codex R5)
+    const skuAliasKeys = new Set(t.skuAliases.map(normCode));
+    const variantCount = Object.keys(variants).length;
+    // ★対応表でこの NE コードに AM (= SKU) が 2 つ以上紐づいている = 同じ商品を 2 つの SKU で出している。
+    //   片方が消えた後に残った方へ当ててしまうと「対応表を作った時と違う状態」を確定させることになる (Codex R8)。
+    //   両方残っていても「別名が複数の SKU に一致」で確定しない。どちらにせよ人が見るべき状態
+    if (t.amAliases.length > 1) {
+      out.set(t.rowKey, {
         price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
-        reason: matched.length > 1
-          ? `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`
-          : (Object.keys(variants).length === 0
-            ? 'SKU情報が取得できません'
-            : `どのSKUか特定できません (この商品には ${Object.keys(variants).length} SKU あります)`),
+        reason: `対応表でこの NE コードに複数のシステム連携用SKU番号 (${t.amAliases.join(', ')}) が紐づいています。`
+          + 'どの SKU が正しいか決められないため確定しません (楽天側の重複出品を整理してください)',
         itemTitle: item?.title || null,
       });
       continue;
     }
+    const matched = [];
+    for (const [vk, v] of Object.entries(variants)) {
+      if (skuAliasKeys.has(normCode(vk)) || skuAliasKeys.has(normCode(v?.merchantDefinedSkuId))) matched.push(vk);
+    }
+    let matchedKey = matched.length === 1 ? matched[0] : null;
+    // SKU 単位の別名が 1 つも当たらない:
+    //   - 対応表が SKU 単位の別名を持っている → 記録していた SKU がこの商品から消えている (差し替わった疑い)。確定しない (Codex R4)
+    //   - 持っていない (W 行だけ。例: SKU管理番号 normal-inventory の単品) → variant が 1 つだけなら取り違える相手がいないので採用
+    let missingSkuAliases = [];
+    if (matched.length === 0) {
+      missingSkuAliases = t.skuAliases;
+      if (missingSkuAliases.length === 0 && variantCount === 1) matchedKey = Object.keys(variants)[0];
+    }
+    if (!matchedKey) {
+      let reason;
+      if (matched.length > 1) reason = `別名が複数のSKUに一致しました (${matched.join(', ')})。取り違えを避けるため確定しません`;
+      else if (variantCount === 0) reason = 'SKU情報が取得できません';
+      else if (missingSkuAliases.length > 0) {
+        reason = `対応表に記録された SKU (${missingSkuAliases.join(', ')}) がこの商品に見当たりません。`
+          + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+      } else reason = `どのSKUか特定できません (この商品には ${variantCount} SKU あります)`;
+      out.set(t.rowKey, {
+        price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
+        reason, itemTitle: item?.title || null,
+      });
+      continue;
+    }
+    // ★取り違えの最終防衛 (Codex R2〜R7): 当たった variant のシステム連携用SKU番号 (AM) を、
+    //   対応表の **AM 由来の別名とだけ** 照合する (AL と混ぜない — AL と同じ値の AM が後から付いた場合を区別するため)。
+    //   対応表を作った後に SKU が別商品へ移り、空いた SKU管理番号に別の SKU が入った、という隙を塞ぐ。
+    //   AM は店舗内で一意なので、これが違えば別の SKU。対応表を作った時と AM の有無・値が違えば、
+    //   同じ SKU と言い切れないので確定しない (翌朝の再構築で対応表が追いつけば通る)。
+    //   - AM があるのに対応表に AM が無い → 作った時には無かった AM。確定しない
+    //   - AM が対応表の AM と違う → 差し替わった疑い。確定しない
+    //   - AM が無いのに対応表には AM があった → 消えた or 別の SKU。確定しない
+    //   - どちらも無い → 複数SKUの商品では同一性を確かめる手段が無いので確定しない。
+    //     単一SKUの商品だけ通す (取り違える相手がいない。実データ: 複数SKU商品で AM 空は 0 件・単一SKUでは 1,652 件)
+    const liveAm = String(variants[matchedKey]?.merchantDefinedSkuId || '').trim();
+    const amAliasKeys = new Set(t.amAliases.map(normCode));
+    let identityProblem = null;
+    if (liveAm && amAliasKeys.size === 0) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号 (${liveAm}) がありますが、対応表を作った時には無かったものです。`
+        + '対応表を作った後に変わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (liveAm && !amAliasKeys.has(normCode(liveAm))) {
+      identityProblem = `SKU ${matchedKey} のシステム連携用SKU番号 (${liveAm}) が対応表のもの (${t.amAliases.join(', ')}) と違います。`
+        + '対応表を作った後に SKU が差し替わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (!liveAm && amAliasKeys.size > 0) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません (対応表を作った時は ${t.amAliases.join(', ')} でした)。`
+        + '対応表を作った後に変わった疑いがあるため確定しません (翌朝の再構築後に再確認してください)';
+    } else if (!liveAm && variantCount > 1) {
+      identityProblem = `SKU ${matchedKey} にシステム連携用SKU番号がありません。複数SKU (${variantCount}) の商品では同じ SKU か確かめられないため確定しません`
+        + ' (RMS でこの SKU にシステム連携用SKU番号を設定してください)';
+    }
+    if (identityProblem) {
+      out.set(t.rowKey, {
+        price: null, manageNumber: item.manageNumber || t.manageNumber, skuCode: null, found: false,
+        reason: identityProblem, itemTitle: item?.title || null,
+      });
+      continue;
+    }
     const price = toIntPrice(variants[matchedKey]?.standardPrice);
-    out.set(t.key, {
+    out.set(t.rowKey, {
       price,
       manageNumber: item.manageNumber || t.manageNumber,
       skuCode: matchedKey,

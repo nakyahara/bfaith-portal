@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { buildTargets, findSetsContaining, setCostOf, listingUrl, parentCodeOf } from './resolve.js';
+import { buildTargets, findSetsContaining, setCostOf, listingUrl, parentCodeOf, normCode } from './resolve.js';
 import { toIntPrice, fetchRakutenPrices, fetchYahooPrices as fetchYahooPricesRaw, _resetCodeMapCache } from './live-price.js';
 // 既存ケースは「候補=そのコードだけ」で呼ぶ
 const fetchYahooPrices = (codes, deps) => (Array.isArray(codes) && typeof codes[0] === 'string'
@@ -42,7 +42,7 @@ db.exec(`CREATE TABLE mirror_set_components (
   セット商品コード TEXT NOT NULL, 構成商品コード TEXT NOT NULL, 数量 INTEGER NOT NULL DEFAULT 1,
   構成商品名 TEXT, 構成商品原価 REAL, updated_at TEXT NOT NULL,
   PRIMARY KEY (セット商品コード, 構成商品コード))`);
-db.exec(`CREATE TABLE mirror_rakuten_sku_map (rakuten_code TEXT PRIMARY KEY, ne_code TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL)`);
+db.exec(`CREATE TABLE mirror_rakuten_sku_map (rakuten_code TEXT PRIMARY KEY, ne_code TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL, manage_number TEXT)`);
 db.exec(`CREATE TABLE mirror_sku_resolved (seller_sku TEXT NOT NULL, ne_code TEXT NOT NULL, quantity INTEGER NOT NULL, source TEXT NOT NULL, PRIMARY KEY (seller_sku, ne_code))`);
 db.exec(`CREATE TABLE mirror_amazon_price_snapshot_daily (date_jst TEXT NOT NULL, seller_sku TEXT NOT NULL, asin TEXT, my_price REAL, buybox_price REAL, fetched_at TEXT, PRIMARY KEY (date_jst, seller_sku))`);
 db.exec(`CREATE TABLE dim_mall (mall_key TEXT PRIMARY KEY, label TEXT, display_order INTEGER, is_channel INTEGER, in_daily_summary INTEGER, tax_included INTEGER, fee_rate_approx REAL)`);
@@ -57,7 +57,7 @@ db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-se
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set', 'abc-002', 1, 'テスト商品B', 300, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set2', 'abc-001', 1, 'テスト商品A', 500, 'now');
 db.prepare('INSERT INTO mirror_set_components VALUES (?,?,?,?,?,?)').run('abc-set2', 'zzz-999', 1, '原価未登録品', null, 'now');
-db.prepare('INSERT INTO mirror_rakuten_sku_map VALUES (?,?,?,?)').run('abc-001', 'abc-001', 'am', 'now');
+db.prepare('INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?,?,?,?)').run('abc-001', 'abc-001', 'am', 'now');
 db.prepare('INSERT INTO mirror_sku_resolved VALUES (?,?,?,?)').run('AMZ-ABC-001', 'abc-001', 1, 'master');
 db.prepare('INSERT INTO mirror_amazon_price_snapshot_daily VALUES (?,?,?,?,?,?)').run('2026-08-27', 'amz-abc-001', 'B00TEST', 1480, 1450, '2026-08-27T03:00:00Z');
 for (const [k, fee] of [['rakuten', 0.12], ['yahoo', 0.10], ['amazon', 0.15], ['aupay', 0.10], ['qoo10', 0.10]]) {
@@ -140,7 +140,8 @@ console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行
   db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
     .run('0726-001802-bk', '合皮補修シート ブラック', '単品', '取扱中', 577, 210, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
   for (const [rc, src] of [['360', 'al'], ['0726-001802-bk', 'am'], ['0726-001802', 'w']]) {
-    db.prepare('INSERT INTO mirror_rakuten_sku_map VALUES (?,?,?,?)').run(rc, '0726-001802-bk', src, 'now');
+    // manage_number 無し = 列が足される前に同期された行。W 行から管理番号にたどる旧経路が生きていること
+    db.prepare('INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at) VALUES (?,?,?,?)').run(rc, '0726-001802-bk', src, 'now');
   }
   const { targets } = buildTargets(db, ['0726-001802-bk']);
   const rak = targets[0].listings.filter((l) => l.mall === 'rakuten');
@@ -164,7 +165,9 @@ console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行
       failed: [],
     }),
   };
-  const prices = await fetchRakutenPrices([{ key: rak[0].listingCode, aliases: rak[0].aliases }], deps);
+  eq(rak[0].skuAliases.sort(), ['0726-001802-bk', '360'], 'SKU 単位の別名 = AM / AL (W は含めない)');
+  eq(rak[0].amAliases, ['0726-001802-bk'], 'AM 由来の別名は AM だけ');
+  const prices = await fetchRakutenPrices([{ key: rak[0].listingCode, aliases: rak[0].aliases, skuAliases: rak[0].skuAliases, amAliases: rak[0].amAliases }], deps);
   const p = prices.get('0726-001802');
   eq([p.found, p.price, p.skuCode, p.manageNumber], [true, 577, '360', '0726-001802'],
     '★12SKU の中から別名で variant 360 を特定できる');
@@ -177,6 +180,148 @@ console.log('\n── 楽天カラバリ: AM/AL/W は同じSKUの別名 → 1行
   });
   eq(miss.get('zzz-999').found, false, '別名がどのSKUにも当たらなければ未確定');
   ok(/[0-9]+ SKU/.test(miss.get('zzz-999').reason), '理由に SKU 数を書く: ' + miss.get('zzz-999').reason);
+}
+
+console.log('\n── ★カラバリ: W 行を持たない色 (BE) でも manage_number から商品ページへ届く (2026-09-01) ──');
+{
+  // 実データと同じ形: 0726-001802-be は am / al の 2 行だけ (W 行は BK が持っている)。
+  // 列が足される前はここで manageNumber=366 として楽天に問い合わせて「見つかりません」になっていた
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('0726-001802-be', '合皮補修シート ベージュ', '単品', '取扱中止', 577, 210, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
+  const ins = db.prepare('INSERT INTO mirror_rakuten_sku_map (rakuten_code, ne_code, source, updated_at, manage_number) VALUES (?,?,?,?,?)');
+  ins.run('0726-001802-be', '0726-001802-be', 'am', 'now', '0726-001802');
+  ins.run('366', '0726-001802-be', 'al', 'now', '0726-001802');
+
+  const { targets } = buildTargets(db, ['0726-001802-be']);
+  const rak = targets[0].listings.filter((l) => l.mall === 'rakuten');
+  eq(rak.length, 1, '楽天の行は 1 つ');
+  eq(rak[0].manageNumber, '0726-001802', '★W 行が無くても商品管理番号が分かる');
+  eq(rak[0].listingCode, '0726-001802', '表示も商品管理番号');
+  eq(rak[0].aliases.sort(), ['0726-001802-be', '366'], '別名は AM / AL');
+  eq(rak[0].skuAliases.sort(), ['0726-001802-be', '366'], 'SKU 単位の別名 (source が w 以外)');
+
+  const variants = {};
+  ['BK', 'CL', 'WH', 'CM', 'DB', 'OW', 'BE', 'BG', 'GR'].forEach((c, i) => {
+    variants[String(360 + i)] = { merchantDefinedSkuId: `0726-001802-${c}`, standardPrice: '577' };
+  });
+  let allCodesCalled = 0;
+  let asked = [];
+  _resetCodeMapCache();
+  const deps = {
+    fetchAllItemCodes: async () => { allCodesCalled++; return {}; },
+    fetchItemDetailsBulkDetailed: async (mns) => {
+      asked = mns;
+      return {
+        items: mns.includes('0726-001802') ? [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: '合皮補修シート', variants }] : [],
+        failed: mns.filter((m) => m !== '0726-001802').map((m) => ({ manageNumber: m, reason: 'Not found' })),
+      };
+    },
+  };
+  eq(rak[0].amAliases, ['0726-001802-be'], 'AM 由来の別名');
+  const target = { key: rak[0].listingCode, aliases: rak[0].aliases, skuAliases: rak[0].skuAliases, amAliases: rak[0].amAliases, manageNumber: rak[0].manageNumber, manageNumbers: rak[0].manageNumbers };
+  const prices = await fetchRakutenPrices([target], deps);
+  const p = prices.get('0726-001802');
+  eq(asked, ['0726-001802'], '★問い合わせるのは商品管理番号 (366 を管理番号として投げない)');
+  eq([p.found, p.price, p.skuCode, p.manageNumber], [true, 577, '366', '0726-001802'], '★BE の variant 366 = 577円 が取れる');
+  eq(allCodesCalled, 0, '対応表で管理番号が決まる時は all-codes を取りに行かない');
+
+  // ★対応表を作った後に SKU が差し替わった疑い: AL 366 は当たるが、その variant の AM が対応表に無い (Codex R2)
+  const swapped = { ...variants, 366: { merchantDefinedSkuId: 'other-product-xx', standardPrice: '980' } };
+  const depsSwapped = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: 'T', variants: swapped }], failed: [] }) };
+  const sw = (await fetchRakutenPrices([target], depsSwapped)).get('0726-001802');
+  eq(sw.found, false, '★AL は当たるが AM が別物 → 別商品の SKU の疑いで確定しない');
+  ok(/other-product-xx/.test(sw.reason) && /差し替わった/.test(sw.reason), '理由に実際の AM と疑いを書く: ' + sw.reason);
+  // AM が空の variant (単品。0726-001588 の実物と同じ形) は検査の対象外
+  const depsNoAm = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001588', variants: { '0726-001588': { standardPrice: '1280' } } }], failed: [] }) };
+  const single = (await fetchRakutenPrices([{ key: '0726-001588', aliases: ['0726-001588'], manageNumber: '0726-001588' }], depsNoAm)).get('0726-001588');
+  eq([single.found, single.price], [true, 1280], 'AM が無い単品は通る');
+  // ★複数SKUの商品で、当たった variant に AM が無い = 同じ SKU か確かめる手段が無い → 確定しない (Codex R3)
+  const noAmMulti = { ...variants, 366: { standardPrice: '577' } };   // 366 の AM が空 (差し替え後の可能性)
+  const depsNoAmMulti = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: '0726-001802', itemNumber: '0726-001802', title: 'T', variants: noAmMulti }], failed: [] }) };
+  const nam = (await fetchRakutenPrices([target], depsNoAmMulti)).get('0726-001802');
+  eq(nam.found, false, '★複数SKU商品で AM が空の variant は確定しない');
+
+  // ★単一SKUの救済は「対応表が商品ページ単位の別名しか持たない」時だけ (Codex R4)。
+  //   記録していた SKU (AM old-ne / AL 001) が消え、別の SKU (AL 999・AM 空) だけになった商品ページ
+  const depsReplaced = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-a', itemNumber: 'page-a', title: 'T', variants: { 999: { standardPrice: '9800' } } }], failed: [] }) };
+  const rp = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001'], skuAliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
+  eq(rp.found, false, '★記録した SKU が消えた単一SKU商品は、残った SKU を採用しない');
+  ok(/old-ne/.test(rp.reason) && /001/.test(rp.reason) && /差し替わった/.test(rp.reason), '理由に消えた SKU の別名を書く: ' + rp.reason);
+  // 商品番号しか別名が無い単品 (SKU管理番号 normal-inventory・AM 空) は今まで通り救済する
+  const depsWOnly = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'w-only-001', itemNumber: 'w-only-001', variants: { 'normal-inventory': { standardPrice: '500' } } }], failed: [] }) };
+  const wo = (await fetchRakutenPrices([{ key: 'w-only-001', aliases: ['w-only-001'], manageNumber: 'w-only-001' }], depsWOnly)).get('w-only-001');
+  eq([wo.found, wo.price, wo.skuCode], [true, 500, 'normal-inventory'], '商品番号だけの単品 (normal-inventory) は通る');
+  // ★AM に商品番号と同じ値を付けた単品 (source=am, 値は page-a)。値で見ればページ単位に見えるが SKU 単位 (Codex R5)
+  const rp2 = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['page-a'], skuAliases: ['page-a'], manageNumber: 'page-a' }], depsReplaced)).get('page-a');
+  eq(rp2.found, false, '★AM が商品番号と同じ値でも、SKU 単位の別名が当たらなければ救済しない');
+  // ★ページ単位の値 (page-a) を SKU管理番号や AM に持つ別の variant があっても、それに当てない (Codex R6)
+  const depsCoincide = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-a', itemNumber: 'page-a', variants: {
+      'page-a': { merchantDefinedSkuId: 'page-a', standardPrice: '9800' },
+      999: { merchantDefinedSkuId: 'other', standardPrice: '500' },
+    } }], failed: [] }) };
+  const co = (await fetchRakutenPrices([{ key: 'page-a', aliases: ['old-ne', '001', 'page-a'], skuAliases: ['old-ne', '001'], manageNumber: 'page-a' }], depsCoincide)).get('page-a');
+  eq(co.found, false, '★商品番号と同じ値を持つ variant に当てない (記録した SKU が消えている)');
+  ok(/old-ne/.test(co.reason) && /見当たりません/.test(co.reason), '理由は「記録した SKU が見当たらない」: ' + co.reason);
+  // W 行だけの単品に、対応表を作った後で AM が付いた → 作った時には無かったもの。確定しない
+  const depsLateAm = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'w-only-001', itemNumber: 'w-only-001', variants: { 'normal-inventory': { merchantDefinedSkuId: 'w-only-001', standardPrice: '500' } } }], failed: [] }) };
+  const la = (await fetchRakutenPrices([{ key: 'w-only-001', aliases: ['w-only-001'], skuAliases: [], manageNumber: 'w-only-001' }], depsLateAm)).get('w-only-001');
+  eq(la.found, false, '★W 行だけの商品に AM が付いていたら (作った時には無かった) 確定しない');
+  // ★AL と同じ値の AM が後から付いた (対応表は AL=123 だけ・AM 無し)。AL で当たっても AM は「作った時には無かった」(Codex R7)
+  const depsSameValueAm = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-b', itemNumber: 'page-b', variants: { 123: { merchantDefinedSkuId: '123', standardPrice: '9800' } } }], failed: [] }) };
+  const sv = (await fetchRakutenPrices([{ key: 'page-b', aliases: ['123'], skuAliases: ['123'], amAliases: [], manageNumber: 'page-b' }], depsSameValueAm)).get('page-b');
+  eq(sv.found, false, '★AL と同じ値の AM が後から付いた SKU は確定しない (AM は AM 由来の別名とだけ照合)');
+  ok(/作った時には無かった/.test(sv.reason), '理由: ' + sv.reason);
+  // 対応表に AM があったのに実物から消えた単一SKU → 変わった疑い
+  const depsAmGone = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-c', itemNumber: 'page-c', variants: { 'page-c': { standardPrice: '700' } } }], failed: [] }) };
+  const ag = (await fetchRakutenPrices([{ key: 'page-c', aliases: ['page-c-am', 'page-c'], skuAliases: ['page-c-am', 'page-c'], amAliases: ['page-c-am'], manageNumber: 'page-c' }], depsAmGone)).get('page-c');
+  eq(ag.found, false, '★対応表には AM があったのに実物に無い → 確定しない');
+  ok(/page-c-am/.test(ag.reason) && /作った時は/.test(ag.reason), '理由に対応表の AM を書く: ' + ag.reason);
+  // ★同じ NE コードに AM が 2 つ (同じ商品を 2 SKU で出している)。片方が消えて 1 つだけ残っても確定しない (Codex R8)
+  const depsOneLeft = { ...deps, fetchItemDetailsBulkDetailed: async () => ({
+    items: [{ manageNumber: 'page-d', itemNumber: 'page-d', variants: { '002': { merchantDefinedSkuId: 'am-current', standardPrice: '800' } } }], failed: [] }) };
+  const ol = (await fetchRakutenPrices([{ key: 'page-d', aliases: ['001', 'am-old', '002', 'am-current'], skuAliases: ['001', 'am-old', '002', 'am-current'], amAliases: ['am-old', 'am-current'], manageNumber: 'page-d' }], depsOneLeft)).get('page-d');
+  eq(ol.found, false, '★対応表に AM が 2 つある NE コードは、残った 1 つに当てない');
+  ok(/am-old/.test(ol.reason) && /am-current/.test(ol.reason) && /重複出品/.test(ol.reason), '理由に両方の AM と対処を書く: ' + ol.reason);
+  // 対応表の source で分けていることの確認: W 行だけの商品は skuAliases が空
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('w-only-001', 'W だけの単品', '単品', '取扱中', 500, 200, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
+  ins.run('w-only-001', 'w-only-001', 'w', 'now', 'w-only-001');
+  const wl = buildTargets(db, ['w-only-001']).targets[0].listings.find((l) => l.mall === 'rakuten');
+  eq([wl.aliases, wl.skuAliases], [['w-only-001'], []], 'W 行だけなら skuAliases は空 (救済してよい)');
+  ok(/システム連携用SKU番号がありません/.test(nam.reason) && /0726-001802-be/.test(nam.reason), '理由に「対応表を作った時の AM」を書く: ' + nam.reason);
+  // 対応表にも AM が無い複数SKU商品 (AM 無しの色違い): 同一性を確かめる手段が無いので確定しない
+  const namNoMap = (await fetchRakutenPrices([{ key: '0726-001802', aliases: ['366'], skuAliases: ['366'], amAliases: [], manageNumber: '0726-001802' }], depsNoAmMulti)).get('0726-001802');
+  eq(namNoMap.found, false, '★対応表にも実物にも AM が無い複数SKU商品は確定しない');
+  ok(/複数SKU [(]9[)] の商品/.test(namNoMap.reason), '理由に SKU 数と対処を書く: ' + namNoMap.reason);
+
+  // ★同じプレビューに BK と BE を並べても、片方がもう片方を上書きしない (行キーは NE コード単位)
+  const both = await fetchRakutenPrices([
+    { key: '0726-001802', rowKey: 'bk|rakuten', aliases: ['0726-001802-bk', '360', '0726-001802'], skuAliases: ['0726-001802-bk', '360'], amAliases: ['0726-001802-bk'], manageNumber: '0726-001802' },
+    { key: '0726-001802', rowKey: 'be|rakuten', aliases: ['0726-001802-be', '366'], skuAliases: ['0726-001802-be', '366'], amAliases: ['0726-001802-be'], manageNumber: '0726-001802' },
+  ], deps);
+  eq([both.get('bk|rakuten')?.skuCode, both.get('be|rakuten')?.skuCode], ['360', '366'], '★BK=360 / BE=366 をそれぞれ返す (衝突しない)');
+  eq(asked, ['0726-001802'], '同じ商品は 1 回だけ問い合わせる');
+
+  // ★同じ NE コードが 2 つの楽天商品に紐づいていたら、どちらか決めずに未確定
+  ins.run('dup-x', 'dup-001', 'am', 'now', 'page-a');
+  ins.run('dup-y', 'dup-001', 'al', 'now', 'page-b');
+  db.prepare('INSERT INTO mirror_products (商品コード, 商品名, 商品区分, 取扱区分, 標準売価, 原価, 原価状態, 送料, 送料コード, 配送方法, 消費税率, セット構成品数) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('dup-001', '二重出品', '単品', '取扱中', 1000, 400, '確定', 182, '103', '定形外規格内（50g以内）', 0.1, null);
+  const dup = buildTargets(db, ['dup-001']).targets[0].listings.find((l) => l.mall === 'rakuten');
+  eq([dup.manageNumber, dup.manageNumbers.sort()], [null, ['page-a', 'page-b']], '複数の商品管理番号 → 1 つに決めない');
+  const dupPrice = await fetchRakutenPrices([{ key: dup.listingCode, aliases: dup.aliases, manageNumber: dup.manageNumber, manageNumbers: dup.manageNumbers }], deps);
+  const dp = dupPrice.get(normCode(dup.listingCode));
+  eq(dp.found, false, '★複数の楽天商品に紐づく NE コードは確定しない');
+  ok(/page-a.*page-b|page-b.*page-a/.test(dp.reason), '理由に両方の商品管理番号を書く: ' + dp.reason);
 }
 
 console.log('\n── Yahoo カラバリ: 親の商品コード + 個別商品コード (2026-08-30 中原さん確認) ──');
@@ -359,7 +504,7 @@ console.log('\n── ライブ価格の取得 (モールAPIは差し替え) ─
     }),
   };
   const prices = await fetchRakutenPrices(
-    [{ key: 'abc-001', aliases: ['abc-001'] }, { key: 'ghost-001', aliases: ['ghost-001'] }], deps);
+    [{ key: 'abc-001', aliases: ['abc-001'], skuAliases: ['abc-001'], amAliases: ['abc-001'] }, { key: 'ghost-001', aliases: ['ghost-001'] }], deps);
   eq(prices.get('abc-001').price, 1000, '楽天のライブ価格が整数で取れる');
   eq(prices.get('abc-001').skuCode, 'sku-a', 'どの SKU かも分かる');
   eq(prices.get('ghost-001').found, false, '見つからない出品は found=false');
