@@ -1,22 +1,24 @@
 // 売上同期の自動運賃 (FBA運賃 / Easy Ship運賃) の統合テスト
 //   一時ディレクトリに warehouse-mirror.db を実初期化 (DATA_DIR) し、mart_amazon_monthly_summary に by_segment を入れて
-//   syncSegmentSalesForMonth() / syncAndRefreshMonth() を実行 → mgmt_freight_costs の自動行・PL再計算を検証する。
+//   syncSegmentSalesForMonth() / syncAndRefreshMonth() / runMgmtAutoSync() / POST /api/freight を実行して検証する。
 //   node --test apps/mgmt-accounting/easy-ship-freight.test.mjs
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import express from 'express';
 
 // DATA_DIR は db.js の import 時に評価されるため、動的 import の前に設定する。import に失敗しても一時ディレクトリは片付ける
 const prevDataDir = process.env.DATA_DIR;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mgmt-easyship-'));
 process.env.DATA_DIR = tmp;
-let db, syncSegmentSalesForMonth, syncAndRefreshMonth, AUTO_FREIGHT, CARRIERS;
+let db, router, syncSegmentSalesForMonth, syncAndRefreshMonth, runMgmtAutoSync, AUTO_FREIGHT, CARRIERS;
 try {
   const dbMod = await import('../warehouse-mirror/db.js');
   const routerMod = await import('./router.js');
-  ({ syncSegmentSalesForMonth, syncAndRefreshMonth, AUTO_FREIGHT, CARRIERS } = routerMod);
+  ({ syncSegmentSalesForMonth, syncAndRefreshMonth, runMgmtAutoSync, AUTO_FREIGHT, CARRIERS } = routerMod);
+  router = routerMod.default;
   db = dbMod.initMirrorDB();
 } catch (e) {
   fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -41,9 +43,23 @@ function putAmazonSummary(ym, bySegment) {
     VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(ym, 0, 0, 0, '{}', JSON.stringify(bySegment), '{}', '{}', 0, NOW, 'test');
 }
 const freightRows = ym => db.prepare('SELECT carrier, amount, cost_scope, note, entered_by FROM mgmt_freight_costs WHERE year_month = ? ORDER BY carrier').all(ym);
-const insertManualFreight = (ym, carrier, amount, user) => db.prepare(`INSERT INTO mgmt_freight_costs
+const insertFreight = (ym, carrier, amount, user, note = '請求書') => db.prepare(`INSERT INTO mgmt_freight_costs
   (year_month, carrier, amount, cost_scope, target_segment, target_mall_id, note, entered_by, entered_at, updated_at)
-  VALUES (?, ?, ?, 'shared', NULL, NULL, '請求書', ?, ?, ?)`).run(ym, carrier, amount, user, NOW, NOW);
+  VALUES (?, ?, ?, 'shared', NULL, NULL, ?, ?, ?, ?)`).run(ym, carrier, amount, note, user, NOW, NOW);
+
+// POST /api/freight を express 経由で叩く (セッションは email を持つスタブ)
+async function postFreight(body, email = 'tester@example.com') {
+  const app = express();
+  app.use(express.json());
+  app.use('/m', (req, _res, next) => { req.session = { authenticated: true, email }; next(); }, router);
+  const server = app.listen(0);
+  try {
+    const res = await fetch('http://127.0.0.1:' + server.address().port + '/m/api/freight', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    return { status: res.status, json: await res.json() };
+  } finally {
+    server.close();
+  }
+}
 
 test('AUTO_FREIGHT / CARRIERS: Easy Ship運賃 が FBA運賃 の次に定義されている', () => {
   assert.deepEqual(AUTO_FREIGHT.map(a => a.carrier), ['FBA運賃', 'Easy Ship運賃']);
@@ -96,9 +112,26 @@ test('売上同期の再実行: 列が無い月 (PR #1043 より前の確定・�
   assert.deepEqual(freightRows('2026-07').map(x => [x.carrier, x.amount]), [['FBA運賃', 3000]]);
 });
 
+test('売上同期: historical-import 由来 (note なし) の自動 carrier 行は、ネットゼロ/列なしの月で stale として消える (DELETE と UPSERT の所有権条件が同じ)', () => {
+  insertFreight('2026-05', 'FBA運賃', 9999, 'historical-import', null);
+  insertFreight('2026-05', 'Easy Ship運賃', 8888, 'historical-import', null);
+  // FBA手数料 はネットゼロ・Easy Ship 列は無い月
+  putAmazonSummary('2026-05', { '1': seg({ 商品売上: 10000, FBA手数料: -500 }), other: seg({ FBA手数料: 500 }) });
+  const r = syncSegmentSalesForMonth(db, '2026-05', NOW);
+  assert.deepEqual(r.auto_freight_tax_excluded, {});
+  assert.deepEqual(r.auto_freight_skipped, {});
+  assert.deepEqual(freightRows('2026-05'), []); // 古い運賃が残らない
+  // 金額があれば historical-import 行は自動値で更新される (従来どおり)
+  insertFreight('2026-05', 'FBA運賃', 9999, 'historical-import', null);
+  putAmazonSummary('2026-05', { '1': seg({ 商品売上: 10000, FBA手数料: -1100 }) });
+  const r2 = syncSegmentSalesForMonth(db, '2026-05', NOW);
+  assert.deepEqual(r2.auto_freight_tax_excluded, { 'FBA運賃': 1000 });
+  assert.deepEqual(freightRows('2026-05').map(x => [x.carrier, x.amount, x.entered_by]), [['FBA運賃', 1000, 'system-sync']]);
+});
+
 test('売上同期: 別 carrier の手入力行は消えず、同名 carrier の手入力行は上書きせずスキップして警告を返す', () => {
-  insertManualFreight('2026-06', 'ヤマト', 12345, 'tester');
-  insertManualFreight('2026-06', 'Easy Ship運賃', 777, 'tester'); // 画面からは入れられないが API/旧データで存在し得る
+  insertFreight('2026-06', 'ヤマト', 12345, 'tester');
+  insertFreight('2026-06', 'Easy Ship運賃', 777, 'tester'); // 旧データ等で存在し得る手入力行
   putAmazonSummary('2026-06', { other: seg({ [EASY]: -1100, FBA手数料: -2200, 合計: -3300 }) });
   const r = syncSegmentSalesForMonth(db, '2026-06', NOW);
   assert.deepEqual(r.auto_freight_tax_excluded, { 'FBA運賃': 2000 });
@@ -108,14 +141,22 @@ test('売上同期: 別 carrier の手入力行は消えず、同名 carrier の
     { carrier: 'FBA運賃', amount: 2000, cost_scope: 'shared', note: 'auto from mart_amazon_monthly_summary.by_segment.FBA手数料', entered_by: 'system-sync' },
     { carrier: 'ヤマト', amount: 12345, cost_scope: 'shared', note: '請求書', entered_by: 'tester' },
   ]);
-  // historical-import 由来 (Excel 取込・値は自動計算と同じ) は従来どおり自動値で更新される
-  db.prepare("UPDATE mgmt_freight_costs SET entered_by = 'historical-import', note = NULL WHERE year_month = '2026-06' AND carrier = 'Easy Ship運賃'").run();
-  const r2 = syncSegmentSalesForMonth(db, '2026-06', NOW);
-  assert.deepEqual(r2.auto_freight_tax_excluded, { 'FBA運賃': 2000, 'Easy Ship運賃': 1000 });
-  assert.deepEqual(r2.auto_freight_skipped, {});
-  const es = freightRows('2026-06').find(x => x.carrier === 'Easy Ship運賃');
-  assert.equal(es.amount, 1000);
-  assert.equal(es.entered_by, 'system-sync');
+});
+
+test('POST /api/freight: 自動 carrier は 400 で拒否、手入力の競合更新では entered_by が更新される', async () => {
+  // 自動 carrier を含む保存は拒否 (画面は送らないが API 直叩き・旧運用を防ぐ)
+  const rejected = await postFreight({ year_month: '2026-06', items: [{ carrier: 'FBA運賃', amount: 1 }, { carrier: 'ヤマト', amount: 2 }] });
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.json.error, 'auto_carrier');
+  assert.deepEqual(rejected.json.carriers, ['FBA運賃']);
+  assert.equal(freightRows('2026-06').find(x => x.carrier === 'FBA運賃').amount, 2000); // 変わっていない
+  // 既存 (別ユーザー) の手入力行を更新すると entered_by も更新される
+  const ok = await postFreight({ year_month: '2026-06', items: [{ carrier: 'ヤマト', amount: 500, cost_scope: 'shared', note: '訂正' }] }, 'second@example.com');
+  assert.equal(ok.status, 200);
+  const yamato = freightRows('2026-06').find(x => x.carrier === 'ヤマト');
+  assert.deepEqual([yamato.amount, yamato.note, yamato.entered_by], [500, '訂正', 'second@example.com']);
+  // items が配列でなければ 400
+  assert.equal((await postFreight({ year_month: '2026-06', items: 'x' })).status, 400);
 });
 
 test('確定済み月の再同期: Easy Ship運賃 が shared 運賃として PL に按分され、粗利が更新される (confirmed 維持)', () => {
@@ -137,4 +178,14 @@ test('確定済み月の再同期: Easy Ship運賃 が shared 運賃として PL
   assert.equal(closing.status, 'confirmed');
   assert.equal(closing.freight_total, 8000);
   assert.equal(closing.confirmed_at, '2026-08-05 09:00:00'); // 人が確定した日時は保持
+});
+
+test('自動同期スケジューラ: スキップは例外にならず件数と月×carrier を集約して返す (凍結月はスキップ)', () => {
+  // 2026-06 には手入力の Easy Ship運賃 が残っている (上のテスト) → 1件スキップ。2026-02 (凍結) は同期されない
+  putAmazonSummary('2026-02', { other: seg({ [EASY]: -1100 }) });
+  const r = runMgmtAutoSync(db);
+  assert.ok(r.months >= 4);
+  assert.equal(r.freight_skipped, 1);
+  assert.deepEqual(r.freight_skipped_detail, ['2026-06 Easy Ship運賃']);
+  assert.deepEqual(freightRows('2026-02'), []); // 凍結月には自動運賃を作らない
 });
